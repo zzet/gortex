@@ -155,7 +155,7 @@ Review a diff through the graph instead of hand-walking each gate. ` + "`analyze
 
 For list-shaped responses (` + "`search_symbols`" + `, ` + "`find_usages`" + `, ` + "`analyze`" + `, ` + "`batch_symbols`" + `, ` + "`get_callers`" + `, ` + "`get_call_chain`" + `, ` + "`get_dependencies`" + `, ` + "`get_dependents`" + `, ` + "`find_implementations`" + `, ` + "`get_file_summary`" + `, ` + "`get_editing_context`" + `, ` + "`smart_context`" + `, ` + "`contracts`" + `), pick a wire format. Order of preference: **gcx > toon > json**.
 
-- ` + "`format: \"gcx\"`" + ` — GCX1 compact wire format. Round-trippable, ~27% fewer tokens. Decode with ` + "`@gortex/wire`" + ` (npm) or ` + "`github.com/gortexhq/gcx-go`" + ` (Go). **Default for known clients (claude-code, cursor, vscode, zed, aider, kilocode, opencode, openclaw, codex)** when the request omits ` + "`format`" + `.
+- ` + "`format: \"gcx\"`" + ` — GCX1 compact wire format. Round-trippable, ~27% fewer tokens. Decode with ` + "`@gortex/wire`" + ` (npm) or ` + "`github.com/gortexhq/gcx-go`" + ` (Go). **Default for known clients (claude-code, cursor, vscode, zed, aider, kilocode, opencode, openclaw, codex, omp-coding-agent)** when the request omits ` + "`format`" + `.
 - ` + "`format: \"toon\"`" + ` — TOON tabular text. Lossy but compact; useful for clients without a GCX decoder.
 - ` + "`format: \"json\"`" + ` — verbose legacy default. Falls back automatically for unknown clients.
 
@@ -271,7 +271,7 @@ If ` + "`ask`" + ` isn't in ` + "`tools/list`" + `, no provider could construct 
 
 ### Token Economy (wire format)
 
-Order of preference: **gcx > toon > json**. For known clients (claude-code, cursor, vscode, zed, aider, kilocode, opencode, openclaw, codex) Gortex serves ` + "`gcx`" + ` automatically when a request omits the ` + "`format`" + ` arg — explicit ` + "`format`" + ` always wins.
+Order of preference: **gcx > toon > json**. For known clients (claude-code, cursor, vscode, zed, aider, kilocode, opencode, openclaw, codex, omp-coding-agent) Gortex serves ` + "`gcx`" + ` automatically when a request omits the ` + "`format`" + ` arg — explicit ` + "`format`" + ` always wins.
 
 | Instead of...                         | You MUST use...                          |
 |---------------------------------------|------------------------------------------|

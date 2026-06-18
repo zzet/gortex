@@ -64,6 +64,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/home/.config/zed"
           # Aider
           touch "$RUNNER_TEMP/repo/.aider.conf.yml"
+          # Oh My Pi
+          mkdir -p "$RUNNER_TEMP/repo/.omp"
           # OpenClaw
           mkdir -p "$RUNNER_TEMP/home/.openclaw"
 
@@ -86,7 +88,7 @@ jobs:
           agents = {a["name"]: a for a in data["agents"]}
           expected = [
               "claude-code", "aider", "cline", "codex", "continue",
-              "cursor", "gemini", "kilocode", "kiro", "opencode",
+              "cursor", "gemini", "kilocode", "kiro", "oh-my-pi", "opencode",
               "openclaw", "vscode", "windsurf", "zed",
               # "antigravity" always true when HOME is set; not a detection test.
           ]

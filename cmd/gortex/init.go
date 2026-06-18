@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/agents/gemini"
 	"github.com/zzet/gortex/internal/agents/hermes"
 	"github.com/zzet/gortex/internal/agents/kilocode"
+	"github.com/zzet/gortex/internal/agents/ohmypi"
 	"github.com/zzet/gortex/internal/agents/kiro"
 	"github.com/zzet/gortex/internal/agents/openclaw"
 	"github.com/zzet/gortex/internal/agents/opencode"
@@ -124,6 +125,7 @@ func buildRegistry() *agents.Registry {
 	r.Register(hermes.New())
 	r.Register(kilocode.New())
 	r.Register(kiro.New())
+	r.Register(ohmypi.New())
 	r.Register(opencode.New())
 	r.Register(openclaw.New())
 	r.Register(vscode.New())
