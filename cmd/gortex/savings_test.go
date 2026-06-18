@@ -161,7 +161,7 @@ func TestEmitSavingsDashboard_RendersThreeBuckets(t *testing.T) {
 
 	for _, want := range []string{
 		"Gortex Token Savings",
-		"Cost avoided:",
+		"Cost avoided per model (all time):",
 		"Today",
 		"Last 7 days",
 		"All time",
