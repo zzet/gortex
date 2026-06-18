@@ -261,10 +261,8 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 		}
 	}
 
-	// USD header — total avoided, headlined by the model we want to
-	// feature (or the most-expensive one when --model is unset).
 	costs := savings.CostAvoidedAll(snap.Totals.TokensSaved)
-	headline, headlineModel := pickHeadlineCost(costs, savingsModel)
+	_, headlineModel := pickHeadlineCost(costs, savingsModel)
 	fmt.Println()
 	if snap.Totals.CallsCounted == 0 {
 		hint := "savings record when the agent reads code through gortex (read_file, get_file_summary, get_editing_context, get_symbol_source, smart_context, …)"
@@ -277,19 +275,6 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 			fmt.Println("Savings record when the agent reads code through gortex (read_file, get_file_summary, get_editing_context, get_symbol_source, smart_context, ...).")
 		}
 		return
-	}
-	if tty {
-		stats := []string{
-			progress.Stat(formatUSD(headline), headlineModel, progress.StatGood),
-			progress.Stat(humanInt(snap.Totals.CallsCounted), "calls", progress.StatNeutral),
-			progress.Stat(humanInt(snap.Totals.TokensSaved), "tokens saved", progress.StatGood),
-		}
-		fmt.Println("  " + progress.StyleOK.Render("$") + "  " + progress.StyleStrong.Render("cost avoided"))
-		fmt.Println("     " + progress.StatStrip(stats...))
-	} else {
-		fmt.Printf("Cost avoided:   %s (%s) across %s calls · %s tokens saved\n",
-			formatUSD(headline), headlineModel,
-			humanInt(snap.Totals.CallsCounted), humanInt(snap.Totals.TokensSaved))
 	}
 
 	// Per-bucket bar rows.
@@ -304,32 +289,22 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 		renderBucketRow(b, labelWidth, headlineModel)
 	}
 
-	// USD-per-model table — same data the original CLI printed, kept
-	// because it lets agents see opus vs sonnet vs haiku side-by-side.
+	// Per-model attribution — only models the host actually surfaced via the
+	// hook model hint. Tokens are rescaled into each model's own tokenizer
+	// and priced at that model's real rate.
 	fmt.Println()
-	fmt.Println("Cost avoided per model (all time):")
-	if savingsModel != "" {
-		amount := savings.CostAvoided(snap.Totals.TokensSaved, savingsModel)
-		fmt.Printf("  %-20s %s\n", savingsModel, formatUSD(amount))
+	if tty {
+		fmt.Println("  " + progress.Heading("cost avoided per model (all time)"))
 	} else {
-		names := make([]string, 0, len(costs))
-		for n := range costs {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		for _, n := range names {
-			fmt.Printf("  %-20s %s\n", n, formatUSD(costs[n]))
-		}
+		fmt.Println("Cost avoided per model (all time):")
 	}
-
-	// Per-model ACTUAL attribution — only the models the host actually
-	// surfaced (via the hook model hint). Unlike the counterfactual table
-	// above, these tokens are rescaled into each model's own tokenizer and
-	// priced at that model's real rate, so the dollar figure reflects the
-	// model the agent truly ran on.
-	if len(modelTotals) > 0 {
-		fmt.Println()
-		fmt.Println("Cost avoided per model (actual — attributed via host model hint):")
+	if len(modelTotals) == 0 {
+		if tty {
+			fmt.Println("     " + progress.Caption("(none — no model hint captured yet)"))
+		} else {
+			fmt.Println("  (none — no model hint captured yet)")
+		}
+	} else {
 		nameWidth := 0
 		for _, m := range modelTotals {
 			if l := len(m.Name); l > nameWidth {
@@ -338,9 +313,19 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 		}
 		for _, m := range modelTotals {
 			adj := tokens.ScaleFromCL100K(m.Name, m.TokensSaved)
-			fmt.Printf("  %-*s %s   (%s calls · %s tokens saved)\n",
-				nameWidth, m.Name, formatUSD(savings.CostAvoided(adj, m.Name)),
-				humanInt(m.CallsCounted), humanInt(adj))
+			if tty {
+				cost := savings.CostAvoided(adj, m.Name)
+				stats := []string{
+					progress.Stat(formatUSD(cost), "", progress.StatGood),
+					progress.Stat(humanInt(m.CallsCounted), "calls", progress.StatNeutral),
+					progress.Stat(humanInt(adj), "tokens saved", progress.StatNeutral),
+				}
+				fmt.Printf("     %-*s  %s\n", nameWidth, m.Name, progress.StatStrip(stats...))
+			} else {
+				fmt.Printf("  %-*s %s   (%s calls · %s tokens saved)\n",
+					nameWidth, m.Name, formatUSD(savings.CostAvoided(adj, m.Name)),
+					humanInt(m.CallsCounted), humanInt(adj))
+			}
 		}
 	}
 
@@ -348,7 +333,11 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 	// / cursor / …), captured from the MCP initialize handshake.
 	if len(clientTotals) > 0 {
 		fmt.Println()
-		fmt.Println("Savings by client:")
+		if tty {
+			fmt.Println("  " + progress.Heading("savings by client (all time)"))
+		} else {
+			fmt.Println("Savings by client (all time):")
+		}
 		nameWidth := 0
 		for _, c := range clientTotals {
 			if l := len(c.Name); l > nameWidth {
@@ -356,8 +345,18 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 			}
 		}
 		for _, c := range clientTotals {
-			fmt.Printf("  %-*s  %s calls · %s tokens saved\n",
-				nameWidth, c.Name, humanInt(c.CallsCounted), humanInt(c.TokensSaved))
+			if tty {
+				cost := savings.CostAvoided(c.TokensSaved, headlineModel)
+				stats := []string{
+					progress.Stat(formatUSD(cost), "", progress.StatGood),
+					progress.Stat(humanInt(c.CallsCounted), "calls", progress.StatNeutral),
+					progress.Stat(humanInt(c.TokensSaved), "tokens saved", progress.StatNeutral),
+				}
+				fmt.Printf("     %-*s  %s\n", nameWidth, c.Name, progress.StatStrip(stats...))
+			} else {
+				fmt.Printf("  %-*s  %s calls · %s tokens saved\n",
+					nameWidth, c.Name, humanInt(c.CallsCounted), humanInt(c.TokensSaved))
+			}
 		}
 	}
 
@@ -389,8 +388,8 @@ func emitSavingsDashboard(snap savings.File, buckets []savings.Bucket, modelTota
 
 	// Per-repo and per-language rollups (carried over from the original
 	// dashboard — agents still find these useful at the bottom).
-	printBucket("Per-repo totals (all time)", snap.PerRepo)
-	printBucket("Per-language totals (all time)", snap.PerLanguage)
+	printBucket("Per-repo totals (all time)", snap.PerRepo, tty, headlineModel)
+	printBucket("Per-language totals (all time)", snap.PerLanguage, tty, headlineModel)
 }
 
 func renderBucketRow(b savings.Bucket, labelWidth int, headlineModel string) {
@@ -463,12 +462,10 @@ func formatUSD(usd float64) string {
 // printBucket renders a sorted breakdown of name → Totals. Skipped when
 // the bucket is empty so older savings files (with no per_language data)
 // don't produce a noisy "Per-language totals: (none)" line.
-func printBucket(title string, bucket map[string]*savings.Totals) {
+func printBucket(title string, bucket map[string]*savings.Totals, tty bool, headlineModel string) {
 	if len(bucket) == 0 {
 		return
 	}
-	fmt.Println()
-	fmt.Println(title + ":")
 	keys := make([]string, 0, len(bucket))
 	for k := range bucket {
 		keys = append(keys, k)
@@ -480,10 +477,32 @@ func printBucket(title string, bucket map[string]*savings.Totals) {
 		}
 		return keys[i] < keys[j]
 	})
+	nameWidth := 0
+	for _, k := range keys {
+		if l := len(k); l > nameWidth {
+			nameWidth = l
+		}
+	}
+	fmt.Println()
+	if tty {
+		fmt.Println("  " + progress.Heading(title))
+	} else {
+		fmt.Println(title + ":")
+	}
 	for _, k := range keys {
 		t := bucket[k]
-		fmt.Printf("  %-24s tokens_saved=%-12s calls=%d\n",
-			k, humanInt(t.TokensSaved), t.CallsCounted)
+		if tty {
+			cost := savings.CostAvoided(t.TokensSaved, headlineModel)
+			stats := []string{
+				progress.Stat(formatUSD(cost), "", progress.StatGood),
+				progress.Stat(humanInt(t.TokensSaved), "tokens saved", progress.StatNeutral),
+				progress.Stat(fmt.Sprintf("%d", t.CallsCounted), "calls", progress.StatNeutral),
+			}
+			fmt.Printf("     %-*s  %s\n", nameWidth, k, progress.StatStrip(stats...))
+		} else {
+			fmt.Printf("  %-24s tokens_saved=%-12s calls=%d\n",
+				k, humanInt(t.TokensSaved), t.CallsCounted)
+		}
 	}
 }
 
