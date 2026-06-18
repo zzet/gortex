@@ -11,7 +11,6 @@ terms (Apache 2.0, Section 5).
 | Name | GitHub | Added |
 |------|--------|-------|
 | Andrey Kumanyaev | [@zzet](https://github.com/zzet) | 2024-01-01 |
-| Zachary Kent | [@ztkent](https://github.com/ztkent) | 2026-06-18 |
 
 ## Past Contributors
 
