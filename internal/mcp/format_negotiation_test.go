@@ -31,6 +31,7 @@ func TestDefaultFormatForClient(t *testing.T) {
 		{"opencode", "gcx"},
 		{"openclaw", "gcx"},
 		{"codex", "gcx"},
+		{"omp-coding-agent", "gcx"},
 
 		// Unknown / unset → JSON fallback.
 		{"", ""},

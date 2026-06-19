@@ -36,6 +36,9 @@ func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
+	if env.Mode == agents.ModeGlobal {
+		return false, nil
+	}
 	if _, err := os.Stat(filepath.Join(env.Root, ".omp")); err == nil {
 		return true, nil
 	}
@@ -46,6 +49,9 @@ func (a *Adapter) Detect(env agents.Env) (bool, error) {
 }
 
 func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
+	if env.Mode == agents.ModeGlobal {
+		return &agents.Plan{}, nil
+	}
 	return &agents.Plan{Files: []agents.FileAction{
 		{Path: filepath.Join(env.Root, ".omp", "mcp.json"), Action: agents.ActionWouldMerge, Keys: []string{"mcpServers"}},
 	}}, nil
@@ -53,6 +59,9 @@ func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {
 	res := &agents.Result{Name: Name, DocsURL: DocsURL}
+	if env.Mode == agents.ModeGlobal {
+		return res, nil
+	}
 	detected, _ := a.Detect(env)
 	res.Detected = detected
 	if !detected && !opts.ForceDetect {
