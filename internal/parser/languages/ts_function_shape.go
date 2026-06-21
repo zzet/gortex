@@ -807,3 +807,113 @@ func isTSPrimitive(t string) bool {
 	}
 	return false
 }
+
+// emitTSTypeRefEdges emits one EdgeTypedAs per named type in typeText
+// from ownerID to unresolved::<name>, tagged with use_kind so a
+// traversal can tell a cast (`x as Foo`) from an alias body
+// (`type Bar = Foo`) from an annotation. Decomposition is delegated to
+// tsTypeRefs (unions / intersections / arrays / generics handled,
+// primitives + container generics dropped). De-duplicated per name so a
+// position firing twice can't double-emit.
+func emitTSTypeRefEdges(ownerID, typeText, filePath string, line int, useKind string, result *parser.ExtractionResult) {
+	if ownerID == "" || typeText == "" {
+		return
+	}
+	for _, name := range tsTypeRefs(typeText) {
+		result.Edges = append(result.Edges, &graph.Edge{
+			From:     ownerID,
+			To:       "unresolved::" + name,
+			Kind:     graph.EdgeTypedAs,
+			FilePath: filePath,
+			Line:     line,
+			Origin:   graph.OriginASTInferred,
+			Meta:     map[string]any{"use_kind": useKind},
+		})
+	}
+}
+
+// emitTSCastTypeRefs walks a parsed TS/TSX file and emits a cast
+// type-reference edge for every type assertion:
+//
+//   - as_expression       — `x as Foo`, `x as Foo[]`, `x as NonDeleted<Foo>`
+//   - satisfies_expression — `x satisfies Foo`
+//   - type_assertion      — `<Foo>x` (plain .ts only; the TSX grammar
+//     never produces this node because `<Foo>` is a JSX opening element)
+//
+// Each names the asserted type(s); the edge is EdgeTypedAs to
+// unresolved::<name> with use_kind:"cast", attributed to the enclosing
+// function (fallback: the file node). Decomposition (unions, generics,
+// arrays, primitive/container dropping) is delegated to tsTypeRefs via
+// emitTSTypeRefEdges. De-duplicated per (owner, name, line) so an
+// expression that a future query might also match elsewhere can't
+// double-emit.
+func emitTSCastTypeRefs(root *sitter.Node, src []byte, filePath, fileID string, funcRanges []funcRange, result *parser.ExtractionResult) {
+	if root == nil {
+		return
+	}
+	seen := map[string]bool{}
+	emit := func(typeText string, line int) {
+		typeText = strings.TrimSpace(typeText)
+		if typeText == "" {
+			return
+		}
+		ownerID := findEnclosingFunc(funcRanges, line)
+		if ownerID == "" {
+			ownerID = fileID
+		}
+		for _, name := range tsTypeRefs(typeText) {
+			key := ownerID + "\x00" + name + "\x00" + strconv.Itoa(line)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     ownerID,
+				To:       "unresolved::" + name,
+				Kind:     graph.EdgeTypedAs,
+				FilePath: filePath,
+				Line:     line,
+				Origin:   graph.OriginASTInferred,
+				Meta:     map[string]any{"use_kind": "cast"},
+			})
+		}
+	}
+	walkTSNodes(root, func(n *sitter.Node) bool {
+		switch n.Type() {
+		case "as_expression", "satisfies_expression":
+			// Shape: (as_expression <value> <type>) — the asserted type
+			// is the last named child (the first is the value expression).
+			if tn := tsCastTypeNode(n); tn != nil {
+				emit(tn.Content(src), int(n.StartPoint().Row)+1)
+			}
+		case "type_assertion":
+			// Shape: (type_assertion (type_arguments <type>) <value>) —
+			// the angle-bracket `<Foo>x` form, plain .ts only. The
+			// type_arguments text carries the surrounding `<…>`; the
+			// inner type_identifier(s) are the real reference, so trim
+			// the brackets before decomposing.
+			for i := 0; i < int(n.NamedChildCount()); i++ {
+				c := n.NamedChild(i)
+				if c != nil && c.Type() == "type_arguments" {
+					inner := strings.TrimSpace(c.Content(src))
+					inner = strings.TrimPrefix(inner, "<")
+					inner = strings.TrimSuffix(inner, ">")
+					emit(inner, int(n.StartPoint().Row)+1)
+					break
+				}
+			}
+		}
+		return true
+	})
+}
+
+// tsCastTypeNode returns the asserted-type node of an as_expression or
+// satisfies_expression — the last named child, since the value
+// expression precedes it. Returns nil for a malformed node.
+func tsCastTypeNode(n *sitter.Node) *sitter.Node {
+	count := int(n.NamedChildCount())
+	if count == 0 {
+		return nil
+	}
+	return n.NamedChild(count - 1)
+}

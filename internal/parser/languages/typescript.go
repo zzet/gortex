@@ -370,6 +370,15 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		emitTSTypeUseEdges(ownerID, tu.typeText, filePath, tu.line, result)
 	}
 
+	// Cast / assertion type references: `x as Foo`, `x as Foo[]`,
+	// `x as NonDeleted<Foo>`, `x satisfies Foo`, and (plain .ts only)
+	// the angle-bracket assertion `<Foo>x`. Each names the type(s) it
+	// asserts, so find_usages(Foo) should surface the cast site. The
+	// angle-bracket form is intentionally skipped on .tsx, where the
+	// TSX grammar parses `<Foo>` as a JSX opening element, not a type
+	// assertion. Attributed to the enclosing function (fallback: file).
+	emitTSCastTypeRefs(root, src, filePath, fileID, funcRanges, result)
+
 	// Instantiation edges: `new Foo(...)` constructs Foo. Emitted as a typed
 	// EdgeInstantiates (not a flat call) attributed to the enclosing function,
 	// so the resolver lands it on the class and impact/trace see construction.
@@ -973,6 +982,16 @@ func (e *TypeScriptExtractor) emitTypeAlias(m parser.QueryResult, filePath, file
 		From: fileID, To: id, Kind: graph.EdgeDefines,
 		FilePath: filePath, Line: def.StartLine + 1,
 	})
+	// Alias-body type references: `type Bar = Foo | Baz` references Foo
+	// and Baz; `type Qux = NonDeleted<Foo>` references NonDeleted and
+	// Foo. Emit one EdgeTypedAs per named type on the RHS (the alias's
+	// own name is never a self-edge — it's not in the value text), so
+	// find_usages(Foo) surfaces the alias without an LSP.
+	if def.Node != nil {
+		if rhs := def.Node.ChildByFieldName("value"); rhs != nil {
+			emitTSTypeRefEdges(id, strings.TrimSpace(rhs.Content(src)), filePath, def.StartLine+1, "type_annotation", result)
+		}
+	}
 }
 
 func (e *TypeScriptExtractor) emitEnum(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult) {
