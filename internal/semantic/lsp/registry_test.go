@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -176,6 +177,27 @@ func TestPyreflyAndTsgoSpecs(t *testing.T) {
 	}
 	if !have["pyrefly"] || !have["tsgo"] {
 		t.Errorf("pyrefly/tsgo missing from DefaultConfig providers")
+	}
+}
+
+// TestClangdSpecUsesSafeEnrichmentDefaults pins clangd's built-in
+// enrichment argv. Gortex needs request-driven graph signal from
+// clangd, not repo clang-tidy diagnostics or a persistent background
+// project index.
+func TestClangdSpecUsesSafeEnrichmentDefaults(t *testing.T) {
+	clangd := SpecByName("clangd")
+	if clangd == nil {
+		t.Fatal("clangd spec not registered")
+	}
+
+	want := []string{
+		"--background-index=false",
+		"--clang-tidy=false",
+		"--header-insertion=never",
+		"-j=1",
+	}
+	if got := clangd.Args; !slices.Equal(got, want) {
+		t.Fatalf("clangd args = %v, want %v", got, want)
 	}
 }
 
