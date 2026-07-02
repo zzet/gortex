@@ -27,7 +27,7 @@ Sixteen servers ship in the registry today
 | `typescript-language-server` | `typescript-language-server`     | typescript, javascript      | 5                |
 | `pyright`                    | `pyright-langserver`             | python                      | 5                |
 | `rust-analyzer`              | `rust-analyzer`                  | rust                        | 5                |
-| `clangd`                     | `clangd --background-index`      | c, c++, objc, objc++        | 5                |
+| `clangd`                     | `clangd --background-index=false --clang-tidy=false --header-insertion=never -j=1` | c, c++, objc, objc++ | 5                |
 | `jdtls`                      | `jdtls`                          | java                        | 6                |
 | `kotlin-language-server`     | `kotlin-language-server`         | kotlin                      | 6                |
 | `omnisharp`                  | `omnisharp -lsp`                 | csharp                      | 5                |
@@ -46,6 +46,12 @@ binary on `PATH`:
 - `pyright` → falls back to `jedi-language-server` or `pylsp`.
 - `ruby-lsp` → falls back to `solargraph stdio`.
 - `phpactor` → falls back to `intelephense --stdio`.
+
+The built-in `clangd` spec disables background indexing and clang-tidy by
+default because semantic enrichment needs request-driven graph evidence,
+not lint diagnostics or a persistent project index. Repositories that want
+those clangd features can override the `clangd` provider args in
+`.gortex.yaml`.
 
 Lower priority numbers win when more than one provider serves the same
 language. `gopls` is `3` so it beats SCIP-based providers (`5`) for Go;
