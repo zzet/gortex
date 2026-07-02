@@ -319,11 +319,18 @@ var Servers = []ServerSpec{
 	{
 		Name:    "clangd",
 		Command: "clangd",
-		// `--background-index` keeps a project-wide symbol index hot in
-		// the daemon, which is essential for type-hierarchy precision in
-		// large C++ trees. `--header-insertion=never` avoids tactical
-		// edits when we only want graph signal.
-		Args:      []string{"--background-index", "--header-insertion=never"},
+		// Gortex uses clangd for request-driven graph evidence during
+		// enrichment, not lint diagnostics or a persistent project index.
+		// Keep clang-tidy and background indexing off by default so broad
+		// repo .clang-tidy configs and large C++ trees do not dominate CPU
+		// or crash-loop the enrichment subprocess. Users can opt back in via
+		// a semantic.providers override in .gortex.yaml.
+		Args: []string{
+			"--background-index=false",
+			"--clang-tidy=false",
+			"--header-insertion=never",
+			"-j=1",
+		},
 		Languages: []string{"c", "cpp", "objc", "objcpp"},
 		Extensions: []string{
 			".c", ".h",
