@@ -374,13 +374,14 @@ func runInitHooksOnly(cmd *cobra.Command, absRoot string) error {
 		return nil
 	}
 	env := agents.Env{
-		Root:         absRoot,
-		Home:         home,
-		HookCommand:  claudecode.ResolveHookCommand(cmd.ErrOrStderr()),
-		Mode:         agents.ModeProject,
-		InstallHooks: true,
-		HookMode:     initHookMode,
-		Stderr:       cmd.ErrOrStderr(),
+		Root:          absRoot,
+		Home:          home,
+		HookCommand:   claudecode.ResolveHookCommand(cmd.ErrOrStderr()),
+		Mode:          agents.ModeProject,
+		InstallHooks:  true,
+		HookMode:      initHookMode,
+		CodexHookMode: initCodexHookMode,
+		Stderr:        cmd.ErrOrStderr(),
 	}
 	detected, _ := codex.New().Detect(env)
 	if !detected {
