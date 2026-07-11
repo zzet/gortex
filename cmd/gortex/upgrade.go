@@ -196,9 +196,8 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	if !upgradeRun {
 		fmt.Fprintf(out, "Run:\n  %s\n", command)
 	} else {
-		parts := strings.Fields(command)
 		fmt.Fprintf(out, "$ %s\n", command)
-		ex := exec.CommandContext(cmd.Context(), parts[0], parts[1:]...) //nolint:gosec // command is one of the fixed install-method templates
+		ex := upgradeExecCommand(cmd, command)
 		ex.Stdout, ex.Stderr, ex.Stdin = out, cmd.ErrOrStderr(), os.Stdin
 		if rerr := ex.Run(); rerr != nil {
 			return fmt.Errorf("upgrade command failed: %w", rerr)
@@ -210,6 +209,18 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	// reindexed. F2 enriches this with the exact stale languages per repo.
 	fmt.Fprintln(out, "\nAfter upgrading, reindex so the graph picks up any extractor changes:\n  gortex index .")
 	return nil
+}
+
+func upgradeExecCommand(cmd *cobra.Command, command string) *exec.Cmd {
+	if upgradeCommandNeedsShell(command) {
+		return exec.CommandContext(cmd.Context(), "sh", "-c", command) //nolint:gosec // fixed installer template, needs shell for pipe
+	}
+	parts := strings.Fields(command)
+	return exec.CommandContext(cmd.Context(), parts[0], parts[1:]...) //nolint:gosec // command is one of the fixed install-method templates
+}
+
+func upgradeCommandNeedsShell(command string) bool {
+	return strings.ContainsAny(command, "|&;<>()$`\\\"'")
 }
 
 // goBinDir returns the directory `go install` drops binaries into — $GOBIN, or

@@ -46,6 +46,24 @@ func TestUpgradeInstallMethodDetection(t *testing.T) {
 	}
 }
 
+func TestUpgradeRunCommandUsesShellOnlyForPipelines(t *testing.T) {
+	cmd := upgradeExecCommand(rootCmd, "curl -fsSL https://get.gortex.dev | sh")
+	if got := cmd.Path; got != "sh" {
+		t.Fatalf("script installer should run through sh, got path %q args %v", got, cmd.Args)
+	}
+	if len(cmd.Args) != 3 || cmd.Args[1] != "-c" || cmd.Args[2] != "curl -fsSL https://get.gortex.dev | sh" {
+		t.Fatalf("script installer command args = %#v", cmd.Args)
+	}
+
+	cmd = upgradeExecCommand(rootCmd, "go install github.com/zzet/gortex/cmd/gortex@latest")
+	if got := cmd.Path; got != "go" {
+		t.Fatalf("plain argv command should exec directly, got path %q args %v", got, cmd.Args)
+	}
+	if len(cmd.Args) != 3 || cmd.Args[1] != "install" || cmd.Args[2] != "github.com/zzet/gortex/cmd/gortex@latest" {
+		t.Fatalf("go install command args = %#v", cmd.Args)
+	}
+}
+
 // TestUpgradeReleaseTagParse covers the /releases/latest redirect tag parse.
 func TestUpgradeReleaseTagParse(t *testing.T) {
 	cases := map[string]string{
