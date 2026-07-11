@@ -6,7 +6,6 @@ command = 'gortex'
 
 [mcp_servers.gortex.env]
 GORTEX_INDEX_WORKERS = '8'
-GORTEX_TOOLS = 'agent,+read_file'
 === root/AGENTS.md ===
 <!-- gortex:communities:start -->
 - [example-community](.claude/skills/example/SKILL.md) — example routing block

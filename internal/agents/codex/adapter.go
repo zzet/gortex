@@ -35,7 +35,6 @@ const codexPreToolUseMatcher = "^Bash$"
 const codexMCPReadPreToolUseMatcher = "^mcp__gortex__(read_file|get_editing_context)$"
 const codexPostToolUseMatcher = "^(Bash|apply_patch)$"
 const codexHookTimeoutSeconds = 5
-const codexToolsEnvValue = "agent,+read_file"
 
 type Adapter struct{}
 
@@ -99,37 +98,16 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 		if !ok {
 			servers = make(map[string]any)
 		}
-		server, exists := servers["gortex"].(map[string]any)
-		if !exists || opts.Force {
+		if _, exists := servers["gortex"]; !exists || opts.Force {
 			servers["gortex"] = map[string]any{
 				"command": "gortex",
 				"args":    []string{"mcp"},
 				"env": map[string]any{
 					"GORTEX_INDEX_WORKERS": "8",
-					// Pin the agent surface explicitly: some MCP hosts defer
-					// tools before clientInfo is available, but read_file is a
-					// mandatory Codex source-reading primitive.
-					"GORTEX_TOOLS": codexToolsEnvValue,
 				},
 			}
 			root["mcp_servers"] = servers
 			changed = true
-		} else {
-			// Preserve an operator's explicit surface choice, but make fresh
-			// and older Gortex-owned entries deterministic: without this pin a
-			// host that delays/omits clientInfo can fall back to a deferred
-			// catalogue and strand read_file behind tools_search.
-			envMap, ok := server["env"].(map[string]any)
-			if !ok {
-				envMap = make(map[string]any)
-			}
-			if _, pinned := envMap["GORTEX_TOOLS"]; !pinned {
-				envMap["GORTEX_TOOLS"] = codexToolsEnvValue
-				server["env"] = envMap
-				servers["gortex"] = server
-				root["mcp_servers"] = servers
-				changed = true
-			}
 		}
 
 		if env.InstallHooks {

@@ -205,11 +205,6 @@ That posture blocks indexed fallback search/source reads and directs the agent
 to the already-configured Gortex MCP tools; it does not require a shell CLI
 fallback.
 
-The adapter pins `GORTEX_TOOLS=agent,+read_file` for its own MCP server entry
-unless that environment key was already set by the operator. This makes
-`read_file` eager even when a host delays or omits Codex client identity during
-MCP initialization; it must never require `tools_search` discovery.
-
 Current Codex hook coverage:
 
 | Surface | Coverage |
