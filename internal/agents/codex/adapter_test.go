@@ -44,8 +44,13 @@ func TestCodexWritesMcpServersTOMLTable(t *testing.T) {
 	if !strings.Contains(got, "gortex") {
 		t.Fatalf("expected gortex entry: %s", got)
 	}
-
 	cfg := readCodexConfig(t, env)
+	servers := cfg["mcp_servers"].(map[string]any)
+	gortex := servers["gortex"].(map[string]any)
+	envVars := gortex["env"].(map[string]any)
+	if envVars["GORTEX_TOOLS"] != codexToolsEnvValue {
+		t.Fatalf("GORTEX_TOOLS=%v want %q", envVars["GORTEX_TOOLS"], codexToolsEnvValue)
+	}
 	if count := gortexSessionStartHookCount(t, cfg); count != 1 {
 		t.Fatalf("expected one Gortex SessionStart hook, got %d: %#v", count, cfg["hooks"])
 	}

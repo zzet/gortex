@@ -13,6 +13,7 @@ func TestAgentPreset_Membership(t *testing.T) {
 	require.Equal(t, "agent", p.preset)
 	require.True(t, p.lean, "the agent preset is lean")
 	require.True(t, p.allows("search_symbols"))
+	require.True(t, p.allows("read_file"), "source reads must never require deferred discovery")
 	require.True(t, p.allows("edit_file"))
 	require.True(t, p.allows("tool_profile")) // always kept
 	require.True(t, p.allows(LazyToolsSearchName))
@@ -39,6 +40,7 @@ func TestAgentPreset_ClientAwareDefault(t *testing.T) {
 	cc := listToolNamesForSession(t, srv, "sess_cc")
 	require.True(t, cc["search_symbols"])
 	require.True(t, cc["edit_file"])
+	require.True(t, cc["read_file"], "Codex's agent surface must publish read_file eagerly")
 	require.False(t, cc["analyze"], "analyze is not in the lean agent surface")
 
 	// Editor / unknown client → the server's global core default (analyze in).
