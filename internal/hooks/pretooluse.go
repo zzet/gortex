@@ -75,14 +75,14 @@ const gortexMCPToolPrefix = "mcp__gortex__"
 // to an additionalContext message — the agent is informed about the graph
 // alternative but the original call still runs and PostToolUse can layer
 // graph context on the actual output.
-func runPreToolUse(data []byte, gortexPort int, mode Mode) {
+func runPreToolUse(data []byte, gortexPort int, mode Mode) bool {
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
-		return
+		return false
 	}
 
 	if input.HookEventName != "PreToolUse" {
-		return
+		return false
 	}
 
 	isGortexMCP := strings.HasPrefix(input.ToolName, gortexMCPToolPrefix)
@@ -106,8 +106,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		if adv := gortexReadNudge(input.ToolName, input.ToolInput); adv != "" {
 			hso.AdditionalContext = adv
 		}
-		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
-		return
+		return emitPreToolUse(HookOutput{HookSpecificOutput: hso})
 	}
 
 	// Consult-unlock handshake: any Gortex MCP tool call records that
@@ -116,13 +115,13 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	// call itself is a no-op pass-through — nothing to enrich.
 	if mode == ModeConsultUnlock && isGortexMCP {
 		markGraphConsulted(input.SessionID)
-		return
+		return false
 	}
 
 	result := applyMode(input, isGortexMCP, mode, enrich(input, gortexPort))
 
 	if result.context == "" && !result.deny {
-		return
+		return false
 	}
 
 	output := HookOutput{
@@ -138,7 +137,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 		output.HookSpecificOutput.AdditionalContext = result.context
 	}
 
-	emitPreToolUse(output)
+	return emitPreToolUse(output)
 }
 
 // applyMode adjusts a raw enrich result according to the active posture.
@@ -188,12 +187,13 @@ func markGraphConsulted(sessionID string) {
 
 // emitPreToolUse marshals a PreToolUse HookOutput to stdout. A marshal
 // failure is swallowed — a hook must never block Claude Code's flow.
-func emitPreToolUse(output HookOutput) {
+func emitPreToolUse(output HookOutput) bool {
 	out, err := json.Marshal(output)
 	if err != nil {
-		return
+		return false
 	}
 	fmt.Print(string(out))
+	return true
 }
 
 // downgradeReason picks the human text to surface when a deny is

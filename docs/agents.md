@@ -206,9 +206,9 @@ Current Codex hook coverage:
 | Surface | Coverage |
 | ------- | -------- |
 | `SessionStart` | Matches `startup|resume|clear|compact` and emits graph-tools orientation for new, resumed, cleared, and compacted sessions. |
-| Bash `PreToolUse` | Soft graph guidance for shell search/read/list shapes. |
+| Bash `PreToolUse` | Soft graph guidance for shell search and source-read shapes. |
 | Gortex MCP read-tool `PreToolUse` | `read_file` and `get_editing_context` guidance that nudges source reads toward `compress_bodies`. |
-| Bash `PostToolUse` | Output graph enrichment for Bash-wrapped grep/search, source-read, and file-list shapes. |
+| Bash `PostToolUse` | Output graph enrichment for Bash-wrapped grep/search, source-read (`cat`/`head`/`tail`/`sed`/`awk`), and file-list (`find`/`fd`/`ls`/`tree`/`git ls-files`) shapes. Unknown Bash remains a no-op. |
 | `gortex init --hooks-only` | Refreshes Codex hooks without rewriting the MCP server config, `AGENTS.md`, or other adapter surfaces. |
 
 We do not install separate Codex `PreCompact` or `PostCompact` hooks
@@ -218,6 +218,21 @@ after compaction. We also intentionally do not install `Stop`; Codex
 `Stop` can continue a turn, which expands the behavior surface and
 should be tracked separately if needed. `apply_patch` remains out of
 scope for Codex hooks and should be handled by a dedicated follow-up.
+
+### Codex hook follow-ups
+
+The intentionally unsupported Codex surfaces are tracked as follow-up work:
+
+- `Stop`, `PreCompact`, and `PostCompact` lifecycle behavior;
+- `apply_patch` and other mutation-aware post-tool handling;
+- hard deny, input rewrite, and output suppression modes.
+
+Codex hook effectiveness is written as privacy-safe JSONL alongside hook
+decisions (`~/.gortex/cache/hook-decisions.jsonl`): one record per Codex event
+with event/tool, whether context was emitted, daemon-check status, alternation
+segment count, and latency. Commands, prompts, paths, and tool output are not
+recorded. Aggregate by `event` and `emitted_context` to detect adoption or
+daemon-connectivity regressions.
 
 ### continue
 

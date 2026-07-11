@@ -1,6 +1,9 @@
 package hooks
 
 import (
+	"bufio"
+	"encoding/json"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -57,6 +60,43 @@ func TestRunCodexPreToolUseBashSoftAdditionalContext(t *testing.T) {
 	}
 	if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
 		t.Fatalf("Codex soft nudge must not deny: %#v", hso)
+	}
+}
+
+func TestRunCodexLogsEffectivenessWithoutCommandContent(t *testing.T) {
+	logPath := redirectTelemetry(t)
+	stubProbe(t, nil, errDaemonUnreachable)
+
+	data := codexBashPayload("rg 'place_edges|location_edge|normalize'")
+	_ = captureStdout(t, func() { runCodex(data, 0) })
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open telemetry: %v", err)
+	}
+	defer f.Close()
+	var found *codexHookEffect
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		var rec codexHookEffect
+		if json.Unmarshal(s.Bytes(), &rec) == nil && rec.Kind == "codex_hook_effectiveness" {
+			found = &rec
+		}
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("scan telemetry: %v", err)
+	}
+	if found == nil {
+		t.Fatal("missing Codex hook effectiveness record")
+	}
+	if found.Event != "PreToolUse" || found.Tool != "Bash" || !found.EmittedContext {
+		t.Fatalf("unexpected effectiveness record: %#v", found)
+	}
+	if (found.DaemonReachability != "reachable" && found.DaemonReachability != "unreachable") || found.AlternationSegments != 3 {
+		t.Fatalf("missing daemon/alternation dimensions: %#v", found)
+	}
+	if found.DurationMS < 0 {
+		t.Fatalf("negative latency: %#v", found)
 	}
 }
 
@@ -273,11 +313,12 @@ func TestRunCodexPostToolUseBashReadSourceAdditionalContext(t *testing.T) {
 
 func TestRunCodexPostToolUseBashFindNameFileListAdditionalContext(t *testing.T) {
 	tests := []struct {
-		name     string
-		command  string
-		response string
-		indexed  map[string]int
-		want     []string
+		name        string
+		command     string
+		response    string
+		wantContext bool
+		indexed     map[string]int
+		want        []string
 	}{
 		{
 			name:     "find name",
@@ -343,9 +384,10 @@ func TestRunCodexPostToolUseBashFindNameFileListAdditionalContext(t *testing.T) 
 
 func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 	tests := []struct {
-		name     string
-		command  string
-		response string
+		name        string
+		command     string
+		response    string
+		wantContext bool
 	}{
 		{
 			name:     "grep with no path line output stays quiet",
@@ -373,9 +415,10 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 			response: "internal/a.go:7:type MyType struct{}\n",
 		},
 		{
-			name:     "sed source read stays quiet",
-			command:  `sed -n '1,20p' internal/a.go`,
-			response: "package hooks\n",
+			name:        "sed source read is enriched",
+			command:     `sed -n '1,20p' internal/a.go`,
+			response:    "package hooks\n",
+			wantContext: true,
 		},
 		{
 			name:     "unsupported awk source scan stays quiet",
@@ -383,29 +426,34 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 			response: "internal/a.go:7:type MyType struct{}\n",
 		},
 		{
-			name:     "awk source read stays quiet",
-			command:  `awk '{print}' internal/a.go`,
-			response: "package hooks\n",
+			name:        "awk source read is enriched",
+			command:     `awk '{print}' internal/a.go`,
+			response:    "package hooks\n",
+			wantContext: true,
 		},
 		{
-			name:     "ls stays quiet",
-			command:  "ls /repo",
-			response: "internal/a.go\n",
+			name:        "ls file list is enriched",
+			command:     "ls /repo",
+			response:    "internal/a.go\n",
+			wantContext: true,
 		},
 		{
-			name:     "fd stays quiet",
-			command:  `fd '\.go$' internal`,
-			response: "internal/a.go\n",
+			name:        "fd file list is enriched",
+			command:     `fd '\.go$' internal`,
+			response:    "internal/a.go\n",
+			wantContext: true,
 		},
 		{
-			name:     "tree stays quiet",
-			command:  "tree internal",
-			response: "internal/a.go\n",
+			name:        "tree file list is enriched",
+			command:     "tree internal",
+			response:    "internal/a.go\n",
+			wantContext: true,
 		},
 		{
-			name:     "git ls-files stays quiet",
-			command:  "git ls-files '*.go'",
-			response: "internal/a.go\n",
+			name:        "git ls-files is enriched",
+			command:     "git ls-files '*.go'",
+			response:    "internal/a.go\n",
+			wantContext: true,
 		},
 	}
 
@@ -418,6 +466,12 @@ func TestRunCodexPostToolUseBashCommandShapes(t *testing.T) {
 
 			data := codexPostBashPayload(tt.command, tt.response)
 			out := captureStdout(t, func() { runCodex(data, port) })
+			if tt.wantContext {
+				if out == "" {
+					t.Fatal("expected graph context, got empty output")
+				}
+				return
+			}
 			if out != "" {
 				t.Fatalf("expected silent no-op, got %q", out)
 			}

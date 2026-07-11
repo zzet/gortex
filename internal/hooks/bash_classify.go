@@ -17,6 +17,9 @@ const (
 	// BashActionReadSource means the command reads an indexed-looking source
 	// file (cat/head/tail of .go/.ts/…). Path holds the file path.
 	BashActionReadSource
+	// BashActionFileList is a primary command whose stdout is a file list. It
+	// is used only for PostToolUse enrichment; PreToolUse remains silent.
+	BashActionFileList
 )
 
 // BashClassification is the result of classifyBashCommand.
@@ -71,6 +74,16 @@ func classifyBashCommand(cmd string) BashClassification {
 		case "cat", "head", "tail":
 			if path, ok := extractReadFile(tokens); ok {
 				return BashClassification{Action: BashActionReadSource, Path: path, Primary: tokens[0]}
+			}
+		case "sed", "awk":
+			if path, ok := extractReadFile(tokens); ok {
+				return BashClassification{Action: BashActionReadSource, Path: path, Primary: tokens[0]}
+			}
+		case "fd", "fdfind", "ls", "tree":
+			return BashClassification{Action: BashActionFileList, Primary: tokens[0]}
+		case "git":
+			if len(tokens) >= 2 && tokens[1] == "ls-files" {
+				return BashClassification{Action: BashActionFileList, Primary: "git ls-files"}
 			}
 		}
 	}

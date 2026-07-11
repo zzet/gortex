@@ -31,6 +31,22 @@ type hookDecision struct {
 	DurationMS int64        `json:"duration_ms,omitempty"`
 }
 
+// codexHookEffect records one Codex lifecycle-hook invocation without
+// retaining the prompt, command, paths, or source output.  Keeping this
+// separate from hookDecision makes it possible to calculate an emitted-context
+// rate per event and spot a regression before it becomes another large bucket
+// of skipped probes.
+type codexHookEffect struct {
+	Timestamp           string `json:"ts"`
+	Kind                string `json:"kind"`
+	Event               string `json:"event"`
+	Tool                string `json:"tool,omitempty"`
+	EmittedContext      bool   `json:"emitted_context"`
+	DaemonReachability  string `json:"daemon_reachability"`
+	AlternationSegments int    `json:"alternation_segments,omitempty"`
+	DurationMS          int64  `json:"duration_ms"`
+}
+
 // hookDecisionsPath returns the telemetry file path. Respects GORTEX_HOOK_LOG
 // so tests can redirect writes. Defaults to ~/.gortex/cache (or the
 // $XDG_CACHE_HOME equivalent when that variable is set).
@@ -63,6 +79,34 @@ func logHookDecision(tool, pattern string, decision DecisionKind, hits int, dur 
 		Decision:   decision,
 		Hits:       hits,
 		DurationMS: dur.Milliseconds(),
+	}
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(line, '\n'))
+}
+
+func logCodexHookEffect(event, tool string, emitted bool, reachability string, alternations int, dur time.Duration) {
+	path := hookDecisionsPath()
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	if reachability == "" {
+		reachability = "not_checked"
+	}
+	rec := codexHookEffect{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Kind: "codex_hook_effectiveness",
+		Event: event, Tool: tool, EmittedContext: emitted, DaemonReachability: reachability,
+		AlternationSegments: alternations, DurationMS: dur.Milliseconds(),
 	}
 	line, err := json.Marshal(rec)
 	if err != nil {

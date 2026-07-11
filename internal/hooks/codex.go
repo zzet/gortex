@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"time"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 // RunCodex handles the Codex hook wire shape. Codex support is deliberately
@@ -27,21 +30,37 @@ func runCodex(data []byte, port int) {
 		return
 	}
 
+	started := time.Now()
+	emitted, reachability, alternations := false, "not_checked", 0
 	switch {
 	case peek.HookEventName == "PreToolUse" && peek.ToolName == "Bash":
-		runPreToolUse(data, port, ModeEnrich)
+		emitted = runPreToolUse(data, port, ModeEnrich)
+		reachability = codexDaemonReachability()
+		alternations = codexAlternationSegments(data)
 	case peek.HookEventName == "PreToolUse" && codexMCPReadPreToolUseTool(peek.ToolName):
-		runCodexMCPReadPreToolUse(data)
+		emitted = runCodexMCPReadPreToolUse(data)
 	case peek.HookEventName == "PostToolUse" && peek.ToolName == "Bash":
-		runCodexPostToolUse(data)
+		emitted = runCodexPostToolUse(data)
+		reachability = codexDaemonReachability()
 	case peek.HookEventName == "UserPromptSubmit":
 		// Re-surface graph symbols relevant to the prompt on every turn.
 		// Codex forgets MCP tools as context grows, so a SessionStart
 		// orientation alone fades; this lands a fresh, prompt-specific
 		// nudge at the top of each turn (the wire shape is shared with
 		// Claude Code — hookSpecificOutput.additionalContext).
-		runUserPromptSubmit(data)
+		emitted = runUserPromptSubmit(data)
+		reachability = codexDaemonReachability()
+	default:
+		return
 	}
+	logCodexHookEffect(peek.HookEventName, peek.ToolName, emitted, reachability, alternations, time.Since(started))
+}
+
+func codexDaemonReachability() string {
+	if daemon.IsRunning() {
+		return "reachable"
+	}
+	return "unreachable"
 }
 
 func codexMCPReadPreToolUseTool(toolName string) bool {
@@ -53,20 +72,20 @@ func codexMCPReadPreToolUseTool(toolName string) bool {
 	}
 }
 
-func runCodexMCPReadPreToolUse(data []byte) {
+func runCodexMCPReadPreToolUse(data []byte) bool {
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
-		return
+		return false
 	}
 	if input.HookEventName != "PreToolUse" || !codexMCPReadPreToolUseTool(input.ToolName) {
-		return
+		return false
 	}
 
 	ctx := gortexReadNudge(input.ToolName, input.ToolInput)
 	if ctx == "" {
-		return
+		return false
 	}
-	emitPreToolUse(HookOutput{
+	return emitPreToolUse(HookOutput{
 		HookSpecificOutput: &HookSpecificOutput{
 			HookEventName:     "PreToolUse",
 			AdditionalContext: ctx,
@@ -74,13 +93,13 @@ func runCodexMCPReadPreToolUse(data []byte) {
 	})
 }
 
-func runCodexPostToolUse(data []byte) {
+func runCodexPostToolUse(data []byte) bool {
 	var input postHookInput
 	if err := json.Unmarshal(data, &input); err != nil {
-		return
+		return false
 	}
 	if input.HookEventName != "PostToolUse" || input.ToolName != "Bash" {
-		return
+		return false
 	}
 
 	cmd, _ := input.ToolInput["command"].(string)
@@ -95,20 +114,39 @@ func runCodexPostToolUse(data []byte) {
 		input.ToolName = "Glob"
 	case BashActionReadSource:
 		if classification.Path == "" {
-			return
+			return false
 		}
 		if input.ToolInput == nil {
 			input.ToolInput = make(map[string]any)
 		}
 		input.ToolName = "Read"
 		input.ToolInput["file_path"] = classification.Path
+	case BashActionFileList:
+		input.ToolName = "Glob"
 	default:
-		return
+		return false
 	}
 
 	normalized, err := json.Marshal(input)
 	if err != nil {
-		return
+		return false
 	}
-	runPostToolUse(normalized)
+	return runPostToolUse(normalized)
+}
+
+func codexAlternationSegments(data []byte) int {
+	var input HookInput
+	if json.Unmarshal(data, &input) != nil {
+		return 0
+	}
+	command, _ := input.ToolInput["command"].(string)
+	c := classifyBashCommand(command)
+	if c.Action != BashActionGrepLike {
+		return 0
+	}
+	segments := splitAlternation(c.Pattern)
+	if len(segments) <= 1 {
+		return 0
+	}
+	return len(segments)
 }

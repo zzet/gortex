@@ -36,14 +36,14 @@ var userPromptProbe grepProbeFn = probeViaDaemon
 // trivial / non-code prompt) is a silent no-op so the turn is never blocked or
 // polluted, and no warning is emitted (SessionStart already warns once when the
 // daemon is down; doing so every turn would be noise).
-func runUserPromptSubmit(data []byte) {
+func runUserPromptSubmit(data []byte) bool {
 	var input UserPromptSubmitInput
 	if err := json.Unmarshal(data, &input); err != nil {
-		return
+		return false
 	}
 	block := buildUserPromptSubmitContext(input.HookEventName, input.Prompt)
 	if block == "" {
-		return
+		return false
 	}
 	out, err := json.Marshal(HookOutput{
 		HookSpecificOutput: &HookSpecificOutput{
@@ -52,9 +52,10 @@ func runUserPromptSubmit(data []byte) {
 		},
 	})
 	if err != nil {
-		return
+		return false
 	}
 	fmt.Print(string(out))
+	return true
 }
 
 func buildUserPromptSubmitContext(eventName, prompt string) string {

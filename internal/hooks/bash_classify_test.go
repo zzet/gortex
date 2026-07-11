@@ -52,7 +52,12 @@ func TestClassifyBashCommand(t *testing.T) {
 		// --- passthroughs ---
 		{"empty", ``, BashActionPassthrough, ""},
 		{"whitespace only", `   `, BashActionPassthrough, ""},
-		{"ls", `ls /repo`, BashActionPassthrough, ""},
+		{"ls file list", `ls /repo`, BashActionFileList, ""},
+		{"fd file list", `fd '\\.go$' internal`, BashActionFileList, ""},
+		{"tree file list", `tree internal`, BashActionFileList, ""},
+		{"git ls-files", `git ls-files '*.go'`, BashActionFileList, ""},
+		{"sed source", `sed -n '1,20p' internal/a.go`, BashActionReadSource, "internal/a.go"},
+		{"awk source", `awk '{print}' internal/a.go`, BashActionReadSource, "internal/a.go"},
 		{"go build", `go build ./...`, BashActionPassthrough, ""},
 		{"echo", `echo hello`, BashActionPassthrough, ""},
 	}

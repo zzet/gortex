@@ -43,13 +43,13 @@ type postHookInput struct {
 // probe uses. An earlier revision hit an HTTP :8765 /api/graph/* API that
 // was removed when the web surface migrated to the daemon, so these
 // lookups silently returned nothing regardless of configuration (#241).
-func runPostToolUse(data []byte) {
+func runPostToolUse(data []byte) bool {
 	var input postHookInput
 	if err := json.Unmarshal(data, &input); err != nil {
-		return
+		return false
 	}
 	if input.HookEventName != "PostToolUse" {
-		return
+		return false
 	}
 
 	var ctx string
@@ -62,7 +62,7 @@ func runPostToolUse(data []byte) {
 		ctx = postRead(input)
 	}
 	if ctx == "" {
-		return
+		return false
 	}
 
 	output := HookOutput{
@@ -73,9 +73,10 @@ func runPostToolUse(data []byte) {
 	}
 	out, err := json.Marshal(output)
 	if err != nil {
-		return
+		return false
 	}
 	fmt.Print(string(out))
+	return true
 }
 
 // grepHitLineRe matches the leading "<path>:<line>" of a ripgrep-style
