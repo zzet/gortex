@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -9,38 +10,46 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 )
 
-// RunCodex handles the Codex hook wire shape. Codex support is deliberately
-// soft-only: PreToolUse is forced through ModeEnrich, PostToolUse only emits
-// additionalContext, and UserPromptSubmit re-surfaces prompt-relevant graph
-// symbols on every turn. No branch ever denies a tool call.
-func RunCodex(port int) {
+// RunCodex handles the Codex hook wire shape. Codex defaults to ModeEnrich,
+// but callers may explicitly opt into a stricter posture.
+func RunCodex(port int, mode Mode) {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return
 	}
-	runCodex(data, port)
+	runCodexWithMode(data, port, mode)
 }
 
 func runCodex(data []byte, port int) {
+	runCodexWithMode(data, port, ModeEnrich)
+}
+
+func runCodexWithMode(data []byte, port int, mode Mode) {
 	var peek struct {
 		HookEventName string `json:"hook_event_name"`
 		ToolName      string `json:"tool_name"`
+		CWD           string `json:"cwd"`
 	}
 	if err := json.Unmarshal(data, &peek); err != nil {
 		return
 	}
+	setHookCWD(peek.CWD)
+	defer setHookCWD("")
 
 	started := time.Now()
 	emitted, reachability, alternations := false, "not_checked", 0
 	switch {
 	case peek.HookEventName == "PreToolUse" && peek.ToolName == "Bash":
-		emitted = runPreToolUse(data, port, ModeEnrich)
+		emitted = runPreToolUse(data, port, mode)
 		reachability = codexDaemonReachability()
 		alternations = codexAlternationSegments(data)
 	case peek.HookEventName == "PreToolUse" && codexMCPReadPreToolUseTool(peek.ToolName):
-		emitted = runCodexMCPReadPreToolUse(data)
+		emitted = runCodexMCPReadPreToolUse(data, mode)
 	case peek.HookEventName == "PostToolUse" && peek.ToolName == "Bash":
 		emitted = runCodexPostToolUse(data)
+		reachability = codexDaemonReachability()
+	case peek.HookEventName == "PostToolUse" && peek.ToolName == "apply_patch":
+		emitted = runCodexMutationPostToolUse(data, port)
 		reachability = codexDaemonReachability()
 	case peek.HookEventName == "UserPromptSubmit":
 		// Re-surface graph symbols relevant to the prompt on every turn.
@@ -54,6 +63,29 @@ func runCodex(data []byte, port int) {
 		return
 	}
 	logCodexHookEffect(peek.HookEventName, peek.ToolName, emitted, reachability, alternations, time.Since(started))
+}
+
+// runCodexMutationPostToolUse runs the same graph diagnostics as a terminal
+// post-task check after Codex's native apply_patch tool succeeds. It is
+// advisory-only: a failed/empty daemon response is silent and never changes
+// the applied patch or asks Codex to repeat it.
+func runCodexMutationPostToolUse(data []byte, port int) bool {
+	var input postHookInput
+	if json.Unmarshal(data, &input) != nil || input.HookEventName != "PostToolUse" || input.ToolName != "apply_patch" {
+		return false
+	}
+	briefing := buildPostTaskBriefing(port)
+	if briefing == "" {
+		return false
+	}
+	out, err := json.Marshal(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+		HookEventName: "PostToolUse", AdditionalContext: briefing,
+	}})
+	if err != nil {
+		return false
+	}
+	fmt.Print(string(out))
+	return true
 }
 
 func codexDaemonReachability() string {
@@ -72,7 +104,7 @@ func codexMCPReadPreToolUseTool(toolName string) bool {
 	}
 }
 
-func runCodexMCPReadPreToolUse(data []byte) bool {
+func runCodexMCPReadPreToolUse(data []byte, mode Mode) bool {
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return false
@@ -85,12 +117,12 @@ func runCodexMCPReadPreToolUse(data []byte) bool {
 	if ctx == "" {
 		return false
 	}
-	return emitPreToolUse(HookOutput{
-		HookSpecificOutput: &HookSpecificOutput{
-			HookEventName:     "PreToolUse",
-			AdditionalContext: ctx,
-		},
-	})
+	hso := &HookSpecificOutput{HookEventName: "PreToolUse", AdditionalContext: ctx}
+	if mode == ModeDeny {
+		hso.PermissionDecision = "deny"
+		hso.PermissionDecisionReason = "[Gortex] BLOCKED: use the already-available Gortex MCP read tools with compress_bodies:true instead of a full-body source read."
+	}
+	return emitPreToolUse(HookOutput{HookSpecificOutput: hso})
 }
 
 func runCodexPostToolUse(data []byte) bool {

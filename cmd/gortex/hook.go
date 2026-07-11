@@ -35,10 +35,9 @@ var hookCmd = &cobra.Command{
 			hooks.RunPi(hookPort, hooks.ParseMode(hookMode))
 			return
 		case "codex":
-			// Codex support is intentionally soft-only: the adapter installs
-			// Bash PreToolUse/PostToolUse plus a UserPromptSubmit hook that emit
-			// additionalContext without ever denying the tool call.
-			hooks.RunCodex(hookPort)
+			// Codex defaults to advisory-only enrichment. An explicit
+			// --codex-hook-mode=deny installation opts into enforcement.
+			hooks.RunCodex(hookPort, hooks.ParseMode(hookMode))
 			return
 		case "kimi":
 			// Kimi Code CLI: UserPromptSubmit / PreToolUse / Stop /
@@ -62,6 +61,6 @@ func init() {
 	hookCmd.Flags().StringVar(&hookMode, "mode", "deny",
 		"hook posture: 'deny' (redirect Grep/Glob/Read of indexed source), 'enrich' (never deny; PostToolUse appends graph context), 'consult-unlock' (deny fallback reads until the graph is queried once this session), or 'nudge' (soft-deny once per burst of non-symbolic calls)")
 	hookCmd.Flags().StringVar(&hookAgent, "agent", "",
-		"hook wire protocol: empty/'claude' (Claude Code PreToolUse/UserPromptSubmit), 'codex' (Codex Bash PreToolUse/PostToolUse + UserPromptSubmit soft context), 'kimi' (Kimi Code CLI UserPromptSubmit/PreToolUse/Stop/SubagentStart; plain-stdout context, permissionDecision deny for indexed reads), 'hermes' (NousResearch hermes-agent pre_tool_call/pre_llm_call), 'pi' (earendil-works/pi extension bridge — normalized PiEvent envelope in, PiDecision out), or 'gemini'/'antigravity' (emits hookSpecificOutput.additionalContext). Default (empty) is the Claude Code format.")
+		"hook wire protocol: empty/'claude' (Claude Code PreToolUse/UserPromptSubmit), 'codex' (Codex Bash PreToolUse/PostToolUse + UserPromptSubmit; advisory by default, enforcement when installed with --codex-hook-mode=deny), 'kimi' (Kimi Code CLI UserPromptSubmit/PreToolUse/Stop/SubagentStart; plain-stdout context, permissionDecision deny for indexed reads), 'hermes' (NousResearch hermes-agent pre_tool_call/pre_llm_call), 'pi' (earendil-works/pi extension bridge — normalized PiEvent envelope in, PiDecision out), or 'gemini'/'antigravity' (emits hookSpecificOutput.additionalContext). Default (empty) is the Claude Code format.")
 	rootCmd.AddCommand(hookCmd)
 }

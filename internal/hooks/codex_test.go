@@ -42,7 +42,7 @@ func TestRunCodexPreToolUseBashSoftAdditionalContext(t *testing.T) {
 
 	data := codexBashPayload("rg Foo")
 	out := captureStdout(t, func() {
-		withStdin(t, data, func() { RunCodex(0) })
+		withStdin(t, data, func() { RunCodex(0, ModeEnrich) })
 	})
 	if out == "" {
 		t.Fatal("expected Codex Bash PreToolUse guidance, got empty output")
@@ -139,6 +139,19 @@ func TestRunCodexPreToolUseGortexMCPReadSoftAdditionalContext(t *testing.T) {
 				t.Fatalf("Codex MCP read nudge must not deny: %#v", hso)
 			}
 		})
+	}
+}
+
+func TestRunCodexDenyModeBlocksUncompressedMCPRead(t *testing.T) {
+	withForceCompress(t, false)
+	data := codexPreToolPayload(gortexReadFileTool, `{"path":"internal/a.go"}`)
+	out := captureStdout(t, func() { runCodexWithMode(data, 0, ModeDeny) })
+	hso := decodeHookOutput(t, out).HookSpecificOutput
+	if hso == nil || hso.PermissionDecision != "deny" {
+		t.Fatalf("deny posture must block the uncompressed MCP source read: %#v", hso)
+	}
+	if !strings.Contains(hso.PermissionDecisionReason, "MCP read tools") {
+		t.Fatalf("deny must direct the agent back to MCP, got %q", hso.PermissionDecisionReason)
 	}
 }
 
@@ -257,6 +270,25 @@ func TestRunCodexPostToolUseBashGrepOutputAdditionalContext(t *testing.T) {
 	}
 	if hso.PermissionDecision != "" || hso.PermissionDecisionReason != "" {
 		t.Fatalf("Codex PostToolUse enrichment must not deny: %#v", hso)
+	}
+}
+
+func TestRunCodexPostToolUseApplyPatchRunsAdvisoryDiagnostics(t *testing.T) {
+	changedJSON := `{"changed_files":["internal/foo.go"],"changed_symbols":[{"id":"internal/foo.go::Foo","name":"Foo","kind":"function"}],"risk":"MEDIUM"}`
+	srv := newFakeServer(map[string]string{
+		"detect_changes":   changedJSON,
+		"get_test_targets": "internal/foo_test.go::TestFoo",
+		"check_guards":     "no guard violations\n",
+		"analyze":          "no dead code\n",
+		"contracts":        "no contract mismatches\n",
+	})
+	defer srv.Close()
+
+	data := []byte(`{"hook_event_name":"PostToolUse","tool_name":"apply_patch","cwd":"/repo","tool_input":{},"tool_response":"Done"}`)
+	out := captureStdout(t, func() { runCodex(data, portFromURL(t, srv.URL)) })
+	hso := decodeHookOutput(t, out).HookSpecificOutput
+	if hso == nil || hso.HookEventName != "PostToolUse" || !strings.Contains(hso.AdditionalContext, "Post-Task Diagnostics") {
+		t.Fatalf("apply_patch should receive advisory graph diagnostics, got %q", out)
 	}
 }
 

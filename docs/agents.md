@@ -197,9 +197,13 @@ directory that exists. Auto-approval field is `alwaysAllow` (not
 
 OpenAI Codex CLI stores config in `~/.codex/config.toml`. We
 upsert a `[mcp_servers.gortex]` table there. When hooks are enabled
-(the default), Codex receives user-level hooks that keep the integration
-soft-only: they add graph context or read-shaping guidance without
-denying tools, rewriting input, or suppressing output.
+(the default), Codex receives user-level hooks in the soft `enrich` posture:
+they add graph context or read-shaping guidance without denying tools,
+rewriting input, or suppressing output. Opt into enforcement with
+`gortex install --codex-hook-mode=deny` (or the corresponding `init` flag).
+That posture blocks indexed fallback search/source reads and directs the agent
+to the already-configured Gortex MCP tools; it does not require a shell CLI
+fallback.
 
 Current Codex hook coverage:
 
@@ -209,6 +213,7 @@ Current Codex hook coverage:
 | Bash `PreToolUse` | Soft graph guidance for shell search and source-read shapes. |
 | Gortex MCP read-tool `PreToolUse` | `read_file` and `get_editing_context` guidance that nudges source reads toward `compress_bodies`. |
 | Bash `PostToolUse` | Output graph enrichment for Bash-wrapped grep/search, source-read (`cat`/`head`/`tail`/`sed`/`awk`), and file-list (`find`/`fd`/`ls`/`tree`/`git ls-files`) shapes. Unknown Bash remains a no-op. |
+| `apply_patch` `PostToolUse` | Advisory post-change diagnostics: changed symbols, test targets, guards, dead-code and contract checks. The patch is never rewritten, suppressed, or rolled back. |
 | `gortex init --hooks-only` | Refreshes Codex hooks without rewriting the MCP server config, `AGENTS.md`, or other adapter surfaces. |
 
 We do not install separate Codex `PreCompact` or `PostCompact` hooks
@@ -224,7 +229,6 @@ scope for Codex hooks and should be handled by a dedicated follow-up.
 The intentionally unsupported Codex surfaces are tracked as follow-up work:
 
 - `Stop`, `PreCompact`, and `PostCompact` lifecycle behavior;
-- `apply_patch` and other mutation-aware post-tool handling;
 - hard deny, input rewrite, and output suppression modes.
 
 Codex hook effectiveness is written as privacy-safe JSONL alongside hook

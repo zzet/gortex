@@ -423,6 +423,17 @@ func TestCodexPreToolUseCommandFallsBackToGortexHook(t *testing.T) {
 	}
 }
 
+func TestCodexHookModeDefaultsSoftAndHonoursExplicitDeny(t *testing.T) {
+	env := codexGlobalEnv(t)
+	if got := codexHookCommand(env); !strings.Contains(got, "--mode=enrich") {
+		t.Fatalf("default Codex hook command=%q, want soft enrich", got)
+	}
+	env.CodexHookMode = "deny"
+	if got := codexHookCommand(env); !strings.Contains(got, "--mode=deny") {
+		t.Fatalf("explicit Codex deny command=%q", got)
+	}
+}
+
 func TestCodexSessionStartHookIdempotent(t *testing.T) {
 	env := codexGlobalEnv(t)
 	a := New()

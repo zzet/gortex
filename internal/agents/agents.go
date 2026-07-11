@@ -88,6 +88,11 @@ type Env struct {
 	// adapter currently honours it; other adapters ignore the field.
 	HookMode string
 
+	// CodexHookMode is the Codex-specific posture. Empty defaults to
+	// "enrich" even when HookMode is "deny", preserving Codex's historical
+	// advisory-only behavior until an operator explicitly opts into deny.
+	CodexHookMode string
+
 	// InstallGlobalInstructions toggles whether `gortex install`
 	// merges the rule block into ~/.claude/CLAUDE.md. Only honoured
 	// in ModeGlobal; ignored elsewhere. Default true so a fresh

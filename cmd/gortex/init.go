@@ -51,11 +51,12 @@ import (
 // the wizard and the orchestrator read them without cross-pollution.
 var (
 	// Core behaviour
-	initAnalyze      bool
-	initInstallHooks = true
-	initNoHooks      bool
-	initHooksOnly    bool
-	initHookMode     string
+	initAnalyze       bool
+	initInstallHooks  = true
+	initNoHooks       bool
+	initHooksOnly     bool
+	initHookMode      string
+	initCodexHookMode string
 
 	// Community skills generation (replaces the old `gortex skills`).
 	initSkills          = true
@@ -95,6 +96,8 @@ func init() {
 	initCmd.Flags().StringVar(&initHookMode, "hook-mode", "deny",
 		"hook posture: 'deny' (PreToolUse redirects Grep/Glob/Read of indexed source) or 'enrich' "+
 			"(PreToolUse never denies; PostToolUse appends graph context after the tool runs)")
+	initCmd.Flags().StringVar(&initCodexHookMode, "codex-hook-mode", "enrich",
+		"Codex hook posture: 'enrich' (default, advisory only), 'deny', 'consult-unlock', or 'nudge'")
 
 	initCmd.Flags().BoolVar(&initSkills, "skills", true, "generate per-community routing + SKILL.md files; use --no-skills to skip")
 	initCmd.Flags().BoolVar(&initNoSkills, "no-skills", false, "skip community-skill generation (inverse of --skills)")
@@ -228,14 +231,15 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 
 	home, _ := os.UserHomeDir()
 	env := agents.Env{
-		Root:         absRoot,
-		Home:         home,
-		HookCommand:  claudecode.ResolveHookCommand(cmd.ErrOrStderr()),
-		Mode:         agents.ModeProject,
-		InstallHooks: initInstallHooks,
-		HookMode:     initHookMode,
-		AnalyzeRepo:  initAnalyze,
-		Stderr:       cmd.ErrOrStderr(),
+		Root:          absRoot,
+		Home:          home,
+		HookCommand:   claudecode.ResolveHookCommand(cmd.ErrOrStderr()),
+		Mode:          agents.ModeProject,
+		InstallHooks:  initInstallHooks,
+		HookMode:      initHookMode,
+		CodexHookMode: initCodexHookMode,
+		AnalyzeRepo:   initAnalyze,
+		Stderr:        cmd.ErrOrStderr(),
 	}
 	defer func() {
 		if err != nil {

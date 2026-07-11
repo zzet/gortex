@@ -35,6 +35,7 @@ var (
 	installHooks           = true
 	installNoHooks         bool
 	installHookMode        string
+	installCodexHookMode   string
 	installClaudeMd        = true
 	installNoClaudeMd      bool
 	installClaudeConfigDir string
@@ -72,6 +73,8 @@ func init() {
 			"(PreToolUse never denies; PostToolUse appends graph context after the tool runs — easier onboarding), "+
 			"'consult-unlock' (deny fallback reads until the Gortex graph is queried once this session, then downgrade to soft context), "+
 			"or 'nudge' (soft-deny once per burst of consecutive non-symbolic calls, then let the next call proceed)")
+	installCmd.Flags().StringVar(&installCodexHookMode, "codex-hook-mode", "enrich",
+		"Codex hook posture: 'enrich' (default, advisory only), 'deny', 'consult-unlock', or 'nudge'")
 	installCmd.Flags().BoolVar(&installClaudeMd, "claude-md", true, "merge Gortex rule block into ~/.claude/CLAUDE.md; use --no-claude-md to skip")
 	installCmd.Flags().BoolVar(&installNoClaudeMd, "no-claude-md", false, "skip the ~/.claude/CLAUDE.md rule block (inverse of --claude-md)")
 	installCmd.Flags().StringVar(&installClaudeConfigDir, "claude-config-dir", "", "Claude Code config root to write into (skills/commands/agents/settings/CLAUDE.md/.claude.json); overrides $CLAUDE_CONFIG_DIR, defaults to ~/.claude. Useful for installing into a non-active profile or CI sandbox")
@@ -211,6 +214,7 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 		Mode:                      agents.ModeGlobal,
 		InstallHooks:              installHooks,
 		HookMode:                  installHookMode,
+		CodexHookMode:             installCodexHookMode,
 		InstallGlobalInstructions: installClaudeMd,
 		Stderr:                    cmd.ErrOrStderr(),
 	}

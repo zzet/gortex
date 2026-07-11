@@ -33,7 +33,7 @@ const codexSessionStartCommand = "printf '%s\\n' '" + codexSessionStartMessage +
 const codexSessionStartWindowsCommand = "powershell -NoProfile -Command \"Write-Output '" + codexSessionStartMessage + "'\""
 const codexPreToolUseMatcher = "^Bash$"
 const codexMCPReadPreToolUseMatcher = "^mcp__gortex__(read_file|get_editing_context)$"
-const codexPostToolUseMatcher = "^Bash$"
+const codexPostToolUseMatcher = "^(Bash|apply_patch)$"
 const codexHookTimeoutSeconds = 5
 
 type Adapter struct{}
@@ -201,10 +201,10 @@ func upsertCodexHook(root map[string]any, event string, isGortex func(any) bool,
 	kept := make([]any, 0, len(entries)+1)
 	for _, entry := range entries {
 		if isGortex(entry) {
-			found = true
-			if opts.Force {
+			if opts.Force || !codexHookEntryMatchesDesired(entry, desired) {
 				continue
 			}
+			found = true
 		}
 		kept = append(kept, entry)
 	}
@@ -244,6 +244,12 @@ func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bo
 					break
 				}
 			}
+			// This is a Gortex-owned entry whose matcher is no longer one
+			// of the desired entries (for example, its hook mode changed).
+			// Reconcile it rather than preserving stale posture forever.
+			if !codexHookEntryMatchesAnyDesired(entry, desired) {
+				continue
+			}
 		}
 		kept = append(kept, entry)
 	}
@@ -266,7 +272,36 @@ func upsertCodexHookSet(root map[string]any, event string, isGortex func(any) bo
 
 func codexHookEntryMatchesDesired(entry any, desired map[string]any) bool {
 	matcher, _ := desired["matcher"].(string)
-	return codexHookEntryHasMatcher(entry, matcher) && codexHookEntryInvokesCodexHook(entry)
+	if !codexHookEntryHasMatcher(entry, matcher) {
+		return false
+	}
+	return codexHookEntryCommand(entry) == codexHookEntryCommand(desired)
+}
+
+func codexHookEntryMatchesAnyDesired(entry any, desired []map[string]any) bool {
+	for _, want := range desired {
+		if codexHookEntryMatchesDesired(entry, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexHookEntryCommand(entry any) string {
+	group, ok := entry.(map[string]any)
+	if !ok {
+		return ""
+	}
+	handlers, ok := codexHookList(group["hooks"])
+	if !ok || len(handlers) != 1 {
+		return ""
+	}
+	handler, ok := handlers[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	cmd, _ := handler["command"].(string)
+	return cmd
 }
 
 func codexHookEntryHasMatcher(entry any, matcher string) bool {
@@ -449,5 +484,14 @@ func codexHookCommand(env agents.Env) string {
 	if base == "" {
 		base = "gortex hook"
 	}
-	return base + " --agent=codex --mode=enrich"
+	return base + " --agent=codex --mode=" + codexHookMode(env)
+}
+
+func codexHookMode(env agents.Env) string {
+	switch strings.TrimSpace(env.CodexHookMode) {
+	case "deny", "consult-unlock", "nudge", "adaptive-nudge":
+		return strings.TrimSpace(env.CodexHookMode)
+	default:
+		return "enrich"
+	}
 }
