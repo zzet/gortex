@@ -26,7 +26,7 @@ func TestRefinementRouteConcreteReadCompletesInOneCall(t *testing.T) {
 	if reserved {
 		t.Fatal("read after concrete completion reserved a handler")
 	}
-	requireLocalizationTerminalError(t, result, "read", "source")
+	requireLocalizationTerminalReplay(t, result, "read", "source")
 }
 
 func TestRefinementRouteUsesActuallySelectedAlternateGenericCandidate(t *testing.T) {
@@ -58,7 +58,7 @@ func TestRefinementRouteUsesActuallySelectedAlternateGenericCandidate(t *testing
 	if reserved {
 		t.Fatal("third read reserved a handler")
 	}
-	requireLocalizationTerminalError(t, result, "read", "source")
+	requireLocalizationTerminalReplay(t, result, "read", "source")
 }
 
 func TestRefinementRouteGenericReadFailureRestoresFirstAllowance(t *testing.T) {
@@ -193,7 +193,7 @@ func TestWeakPreferredReadOffersOnePrecomputedCorrection(t *testing.T) {
 	if result, reserved := state.authorize("read", "source", refinementSourceArgs(third)); reserved {
 		t.Fatal("third read reserved a handler")
 	} else {
-		requireLocalizationTerminalError(t, result, "read", "source")
+		requireLocalizationTerminalReplay(t, result, "read", "source")
 	}
 }
 
@@ -224,7 +224,7 @@ func TestStrongPreferredReadRemainsOneReadTerminal(t *testing.T) {
 	if result, reserved := state.authorize("read", "source", refinementSourceArgs(alternate)); reserved {
 		t.Fatal("strong route opened a corrective read")
 	} else {
-		requireLocalizationTerminalError(t, result, "read", "source")
+		requireLocalizationTerminalReplay(t, result, "read", "source")
 	}
 }
 
@@ -279,7 +279,7 @@ func TestWeakPreferredReadExecutesGenericCorrectionRoute(t *testing.T) {
 	if result, reserved := state.authorize("read", "source", refinementSourceArgs(generic)); reserved {
 		t.Fatal("fourth route read reserved a handler")
 	} else {
-		requireLocalizationTerminalError(t, result, "read", "source")
+		requireLocalizationTerminalReplay(t, result, "read", "source")
 	}
 }
 
@@ -342,7 +342,7 @@ func TestGenericCorrectionSharesOneRetryAcrossRouteHops(t *testing.T) {
 	if result, reserved := state.authorize("read", "source", refinementSourceArgs(implementation)); reserved {
 		t.Fatal("implementation hop received a second route-level retry")
 	} else {
-		requireLocalizationTerminalError(t, result, "read", "source")
+		requireLocalizationTerminalReplay(t, result, "read", "source")
 	}
 }
 
@@ -375,7 +375,7 @@ func TestInitialRefinementFailureRestoresOnlyOnce(t *testing.T) {
 	if result, reserved := state.authorize("read", "source", refinementSourceArgs(preferred)); reserved {
 		t.Fatal("initial refinement failure restored more than once")
 	} else {
-		requireLocalizationTerminalError(t, result, "read", "source")
+		requireLocalizationTerminalReplay(t, result, "read", "source")
 	}
 }
 
@@ -424,7 +424,7 @@ func TestWeakCorrectionFailureRestoresOnlyOnce(t *testing.T) {
 	if result, reserved := state.authorize("read", "source", refinementSourceArgs(alternate)); reserved {
 		t.Fatal("correction was restored more than once")
 	} else {
-		requireLocalizationTerminalError(t, result, "read", "source")
+		requireLocalizationTerminalReplay(t, result, "read", "source")
 	}
 }
 

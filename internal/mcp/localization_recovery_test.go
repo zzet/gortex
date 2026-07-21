@@ -57,7 +57,7 @@ func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-recovery call returned transport error: %v", err)
 	}
-	requireLocalizationTerminalError(t, extra, "search", "text")
+	requireLocalizationTerminalReplay(t, extra, "search", "text")
 	if searchCalls != 1 {
 		t.Fatalf("post-recovery search reached handler: calls=%d", searchCalls)
 	}
@@ -204,7 +204,7 @@ func TestRecoveryFailureRestoresOnceAndTerminalizesSameResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-exhaustion search returned transport error: %v", err)
 	}
-	requireLocalizationTerminalError(t, third, "search", "symbols")
+	requireLocalizationTerminalReplay(t, third, "search", "symbols")
 	if calls != 2 {
 		t.Fatalf("recovery allowance restored more than once: calls=%d", calls)
 	}
@@ -233,7 +233,7 @@ func TestEnforceableAnswerReadyLocksBeforeHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("strong terminal search returned transport error: %v", err)
 	}
-	requireLocalizationTerminalError(t, result, "search", "text")
+	requireLocalizationTerminalReplay(t, result, "search", "text")
 	if calls != 0 {
 		t.Fatalf("enforceable answer_ready reached handler: calls=%d", calls)
 	}
@@ -258,7 +258,7 @@ func TestUnsupportedRecoveryAttemptTerminatesBeforeSchemaDispatch(t *testing.T) 
 	if err != nil {
 		t.Fatalf("post-rejection recovery returned transport error: %v", err)
 	}
-	requireLocalizationTerminalError(t, valid, "search", "text")
+	requireLocalizationTerminalReplay(t, valid, "search", "text")
 }
 
 func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
@@ -294,7 +294,7 @@ func TestSchemaInvalidAllowedRecoveryTerminatesBeforeHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-invalid recovery returned transport error: %v", err)
 	}
-	requireLocalizationTerminalError(t, valid, "search", "text")
+	requireLocalizationTerminalReplay(t, valid, "search", "text")
 	if calls != 0 {
 		t.Fatalf("recovery allowance survived invalid schema: calls=%d", calls)
 	}
@@ -348,7 +348,7 @@ func TestStaleRecoveryCannotConsumeNewTaskState(t *testing.T) {
 	if blocked, reserved := state.authorize("search", "text", map[string]any{"query": "new anchor"}); reserved {
 		t.Fatal("new strong task reserved a recovery call")
 	} else {
-		requireLocalizationTerminalError(t, blocked, "search", "text")
+		requireLocalizationTerminalReplay(t, blocked, "search", "text")
 	}
 }
 

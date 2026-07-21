@@ -23,8 +23,9 @@ const (
 	localizationTerminalAgentHardCap    = 64
 	localizationTerminalJanitorDeletes  = 32
 
-	localizationTerminalContext    = "Gortex localization is complete. Respond to the user now; do not call another tool in this turn."
-	localizationTerminalDenyReason = "[Gortex] Localization is complete. Respond to the user now; no further tool calls are allowed in this turn."
+	localizationTerminalContext         = "Gortex localization is complete. Respond to the user now; do not call another tool in this turn."
+	localizationTerminalDenyReason      = "[Gortex] Localization is complete. Respond to the user now; no further tool calls are allowed in this turn."
+	localizationTerminalReplayDirective = "You already hold the localization answer — respond now using final_response. Do not call another tool."
 	gortexPluginMCPToolPrefix      = "mcp__plugin_gortex_gortex__"
 	localizationHostMetaKey        = "gortex/localization"
 )
@@ -98,6 +99,8 @@ type localizationTerminalCompletion struct {
 	State            string `json:"state"`
 	Scope            string `json:"scope"`
 	RequiredAction   string `json:"required_action"`
+	Instruction      string `json:"instruction"`
+	FinalResponse    string `json:"final_response"`
 	AllowedToolCalls *int   `json:"allowed_tool_calls"`
 	ContractVersion  int    `json:"contract_version"`
 	Enforceable      bool   `json:"enforceable"`
@@ -126,6 +129,12 @@ type localizationHostEnvelope struct {
 	Version  int                          `json:"version"`
 	Contract localizationTerminalContract `json:"contract"`
 	Evidence json.RawMessage              `json:"evidence"`
+	Replay   bool                         `json:"replay"`
+}
+
+type localizationCompactReplay struct {
+	Directive     string `json:"directive"`
+	FinalResponse string `json:"final_response"`
 }
 
 func observeLocalizationTerminal(data []byte) (localizationTerminalHookInput, bool) {
@@ -167,7 +176,8 @@ func exactLocalizationTerminalContract(raw json.RawMessage) (localizationTermina
 	if len(visible) == 0 {
 		visible = response.StructuredContentSnake
 	}
-	if len(visible) > 0 {
+	structured := len(visible) > 0
+	if structured {
 		visible, ok = unwrapJSONString(visible)
 	} else {
 		visible, ok = exactLocalizationContractContent(response.Content)
@@ -176,14 +186,66 @@ func exactLocalizationTerminalContract(raw json.RawMessage) (localizationTermina
 		return localizationTerminalContract{}, false
 	}
 	var contract localizationTerminalContract
-	if err := json.Unmarshal(visible, &contract); err != nil {
+	if err := json.Unmarshal(visible, &contract); err == nil {
+		hostContract, hostOK := localizationHostContract(response.Meta)
+		if hostOK && sameLocalizationTerminalContract(contract, hostContract) {
+			return contract, true
+		}
+	}
+	if !structured {
 		return localizationTerminalContract{}, false
 	}
-	hostContract, ok := localizationHostContract(response.Meta)
-	if !ok || !sameLocalizationTerminalContract(contract, hostContract) {
+	compact, ok := exactLocalizationCompactReplay(visible)
+	if !ok {
 		return localizationTerminalContract{}, false
 	}
-	return contract, true
+	envelope, ok := localizationCompactReplayHostEnvelope(response.Meta)
+	if !ok || compact.FinalResponse != envelope.Contract.Completion.FinalResponse {
+		return localizationTerminalContract{}, false
+	}
+	return envelope.Contract, true
+}
+
+func exactLocalizationCompactReplay(raw json.RawMessage) (localizationCompactReplay, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || len(fields) != 2 {
+		return localizationCompactReplay{}, false
+	}
+	if _, ok := fields["directive"]; !ok {
+		return localizationCompactReplay{}, false
+	}
+	if _, ok := fields["final_response"]; !ok {
+		return localizationCompactReplay{}, false
+	}
+	var compact localizationCompactReplay
+	if err := json.Unmarshal(raw, &compact); err != nil ||
+		compact.Directive != localizationTerminalReplayDirective || compact.FinalResponse == "" {
+		return localizationCompactReplay{}, false
+	}
+	return compact, true
+}
+
+func localizationCompactReplayHostEnvelope(meta map[string]json.RawMessage) (localizationHostEnvelope, bool) {
+	raw, ok := meta[localizationHostMetaKey]
+	if !ok {
+		return localizationHostEnvelope{}, false
+	}
+	raw, ok = unwrapJSONString(raw)
+	if !ok {
+		return localizationHostEnvelope{}, false
+	}
+	var envelope localizationHostEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil ||
+		envelope.Version != localizationTerminalHostMetaVersion || !envelope.Replay ||
+		!enforceableLocalizationTerminalContract(envelope.Contract) {
+		return localizationHostEnvelope{}, false
+	}
+	completion := envelope.Contract.Completion
+	if completion.ContractVersion != localizationTerminalContractV2 ||
+		completion.Instruction != localizationTerminalReplayDirective || completion.FinalResponse == "" {
+		return localizationHostEnvelope{}, false
+	}
+	return envelope, true
 }
 
 func localizationHostContract(meta map[string]json.RawMessage) (localizationTerminalContract, bool) {

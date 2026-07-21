@@ -105,6 +105,12 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	// by permissive permission modes. A new user prompt clears the marker.
 	terminalIdentity, terminalTurnReady := currentLocalizationTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
 	if terminalTurnReady && hasLocalizationTerminal(terminalIdentity) {
+		// Let only Gortex navigation reach the engine's immutable successful
+		// replay. Native Read/Grep/Glob and every other tool remain denied here,
+		// so the host cannot turn terminal localization into unrestricted work.
+		if localizationNavigationTool(input.ToolName) {
+			return
+		}
 		emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
 			HookEventName:            "PreToolUse",
 			PermissionDecision:       "deny",

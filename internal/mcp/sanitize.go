@@ -168,6 +168,15 @@ func (s *Server) sanitizeToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.Tool
 			return res, err
 		}
 		resHits := scanResult(res)
+		if isLocalizationTerminalReplay(res) {
+			// Replay rows originate in repository/index data. Scan only the
+			// canonical result so attempted-call arguments cannot make otherwise
+			// identical replays diverge across facades.
+			if len(resHits) > 0 {
+				annotateSecurityMeta(res, nil, resHits)
+			}
+			return res, nil
+		}
 		if len(argHits) > 0 || len(resHits) > 0 {
 			annotateSecurityMeta(res, argHits, resHits)
 		}

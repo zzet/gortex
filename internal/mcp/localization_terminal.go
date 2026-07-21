@@ -32,6 +32,7 @@ type localizationCompletion struct {
 	Scope             string   `json:"scope"`
 	RequiredAction    string   `json:"required_action"`
 	Instruction       string   `json:"instruction,omitempty"`
+	FinalResponse     string   `json:"final_response,omitempty"`
 	AllowedToolCalls  int      `json:"allowed_tool_calls"`
 	ContractVersion   int      `json:"contract_version"`
 	Enforceable       bool     `json:"enforceable"`
@@ -56,10 +57,10 @@ type localizationCompletion struct {
 	enforceableOnAnswerReady bool
 
 	// digest is the bounded evidence projection carried session-only through
-	// reservation staging (see localization_digest.go). Post-terminal results
-	// expose it only through host-only MCP _meta. It rides the
-	// completion through reservation staging into commitLocalizationLocked,
-	// which covers the direct-arm and facade finishLocalize paths alike.
+	// reservation staging (see localization_digest.go). It rides the completion
+	// through reservation staging into commitLocalizationLocked, which covers
+	// the direct-arm and facade finishLocalize paths alike. Wire contracts expose
+	// only a deep-cloned projection and its deterministic final response.
 	digest *localizationEvidenceDigest
 }
 
@@ -91,7 +92,16 @@ func localizationContractFor(completion localizationCompletion) localizationTerm
 	}
 	if completion.State != localizationStateAnswerReady {
 		completion.Enforceable = false
+		completion.FinalResponse = ""
+	} else {
+		completion.Instruction = localizationReplayDirective
+		if completion.digest != nil || completion.FinalResponse == "" {
+			completion.FinalResponse = buildLocalizationFinalResponse(completion.digest)
+		}
 	}
+	// The digest is state-only. Its stable, bounded wire projections are
+	// FinalResponse and the typed evidence_digest payload.
+	completion.digest = nil
 	return localizationTerminalContract{
 		Completion: completion,
 		Terminal:   completion.State == localizationStateAnswerReady,
@@ -409,7 +419,7 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	s.taskFingerprint = fingerprint
 	// The digest follows the contract: an inactive commit (keepOpenForTask)
 	// carries nil and clears it; every localize commit replaces it.
-	s.digest = completion.digest
+	s.digest = cloneLocalizationEvidenceDigest(completion.digest)
 }
 
 func (s *localizationTerminalState) completionLocked() localizationCompletion {
@@ -441,8 +451,29 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 	if completion.State == localizationStateAnswerReady {
 		completion.Enforceable = s.enforceableOnAnswerReady
 	}
-	completion.digest = s.digest
+	completion.digest = cloneLocalizationEvidenceDigest(s.digest)
+	if completion.State == localizationStateAnswerReady {
+		digest := completion.digest
+		completion = localizationContractFor(completion).Completion
+		completion.digest = digest
+	}
 	return completion
+}
+
+// replayAnswerReady handles malformed boundary metadata without changing a
+// pre-terminal recovery/refinement state. Once terminal, every navigation shape
+// receives the same successful replay before argument validation can emit an
+// error.
+func (s *localizationTerminalState) replayAnswerReady(facade, operation string) *mcpgo.CallToolResult {
+	if s == nil || !localizationNavigationFacade(facade) {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != localizationStateAnswerReady {
+		return nil
+	}
+	return localizationTerminalResult(s.completionLocked(), facade, operation)
 }
 
 // interceptAnswerReady is the cheap pre-validation gate used by facade
@@ -940,23 +971,14 @@ func (s *localizationTerminalState) finishReservedReadToken(token uint64, succes
 	return s.completionLocked()
 }
 
-// localizationTerminalResult is the compact, typed suppression returned only
-// after a successful localization response established answer_ready. It never
-// replays evidence and is non-retriable by default.
+// localizationTerminalResult is the successful, idempotent replay returned
+// after a localization response established answer_ready. Route details are
+// intentionally omitted so every post-terminal navigation call receives the
+// same actionable payload.
 func localizationTerminalResult(completion localizationCompletion, facade, operation string) *mcpgo.CallToolResult {
-	data := map[string]any{"contract": localizationContractFor(completion)}
-	if facade != "" {
-		data["facade"] = facade
-	}
-	if operation != "" {
-		data["operation"] = operation
-	}
-	return newStructuredErrorResult(StructuredError{
-		ErrorCode: ErrCodeLocalizationTerminal,
-		Message:   "localization is terminal for this user request; respond using the evidence already returned",
-		Retriable: false,
-		Data:      data,
-	}, true)
+	_ = facade
+	_ = operation
+	return localizationAnswerReadyResult(completion)
 }
 
 func cloneLocalizationRefinementRoutes(routes map[string]localizationRefinementRoute) map[string]localizationRefinementRoute {

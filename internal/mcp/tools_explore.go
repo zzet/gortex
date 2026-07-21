@@ -2805,6 +2805,15 @@ func localizationEnvelopeFits(envelope localizationExploreEnvelope, maxBytes int
 	return err == nil && len(body) <= maxBytes
 }
 
+func finalizeLocalizationEnvelopeContract(envelope localizationExploreEnvelope) (localizationExploreEnvelope, *localizationEvidenceDigest) {
+	digest := newLocalizationEvidenceDigest(envelope)
+	envelope.Completion.digest = digest
+	contract := localizationContractFor(envelope.Completion)
+	envelope.Completion = contract.Completion
+	envelope.Terminal = contract.Terminal
+	return envelope, digest
+}
+
 func newLocalizationExploreResultForTask(completion localizationCompletion, task string, targets []exploreTarget, budget int) *mcp.CallToolResult {
 	result, _, _ := buildLocalizationExploreResultForTask(completion, task, targets, budget)
 	return result
@@ -3076,15 +3085,25 @@ func buildLocalizationExploreResultForTaskFinalized(
 	// byte-budget packing. Visible text, retained state, and host metadata then
 	// share this one normalized completion value.
 	envelope.Completion = localizationFinalizeCompletionEvidence(envelope.Completion, acceptedTargets, envelope)
-	contract = localizationContractFor(envelope.Completion)
-	envelope.Completion = contract.Completion
-	envelope.Terminal = contract.Terminal
+	envelope, digest := finalizeLocalizationEnvelopeContract(envelope)
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		return mcp.NewToolResultError("encode localization result: " + err.Error()), nil, nil, envelope.Completion
 	}
-	digest := newLocalizationEvidenceDigest(envelope)
 	result := attachLocalizationHostEnvelope(mcp.NewToolResultText(string(body)), envelope.Completion, digest)
+	if envelope.Terminal {
+		terminalCompletion := envelope.Completion
+		terminalCompletion.digest = digest
+		structured := localizationTerminalStructuredFields(terminalCompletion)
+		// The initial terminal envelope already carries the full ranked evidence.
+		// Keep the compact digest for later replay and host metadata instead of
+		// duplicating it in this model-visible result.
+		delete(structured, "evidence_digest")
+		structured["files"] = append([]string(nil), envelope.Files...)
+		structured["symbols"] = append([]string(nil), envelope.Symbols...)
+		structured["evidence"] = append([]localizationEvidence(nil), envelope.Evidence...)
+		result.StructuredContent = structured
+	}
 	return result, append([]string(nil), envelope.Symbols...), digest, envelope.Completion
 }
 

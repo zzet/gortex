@@ -345,6 +345,11 @@ func decorateLocalizationReadResult(result *mcpgo.CallToolResult, completion loc
 			"terminal":   terminalContract.Terminal,
 		}
 	}
+	if terminalContract.Terminal {
+		if structured, ok := result.StructuredContent.(map[string]any); ok {
+			result.StructuredContent = mergeLocalizationTerminalStructuredFields(structured, completion)
+		}
+	}
 	return attachLocalizationHostEnvelope(result, completion, completion.digest)
 }
 
@@ -437,6 +442,10 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	freshLocalizeFlow := facade == "explore" && operation == "localize"
 	newUserTask, invalidBoundary := parseLocalizationNewUserBoundary(facade, operation, req.GetArguments())
 	if invalidBoundary != nil {
+		if replay := terminal.replayAnswerReady(facade, operation); replay != nil {
+			s.recordFacadeTelemetry(facade, operation, facadeOutcomeBlocked, time.Since(started))
+			return replay, nil
+		}
 		s.recordFacadeTelemetry(facade, operation, facadeOutcomeInvalidArgument, time.Since(started))
 		return invalidBoundary, nil
 	}

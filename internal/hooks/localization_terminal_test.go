@@ -131,7 +131,99 @@ func TestObserveLocalizationTerminalRequiresMatchingAuthoritativeMeta(t *testing
 	}
 }
 
-func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
+func TestObserveLocalizationTerminalAcceptsOnlyAuthenticatedCompactReplay(t *testing.T) {
+	configureLocalizationTerminalTestHome(t)
+	newResponse := func(t *testing.T) map[string]any {
+		t.Helper()
+		const finalResponse = "FILES:\n- repo/source.go\n\nSYMBOLS:\n- repo/source.go::Target\n\nEVIDENCE:\n- #1 repo/source.go — repo/source.go::Target"
+		contract := terminalContractMap()
+		completion := completionMap(contract)
+		completion["instruction"] = localizationTerminalReplayDirective
+		completion["final_response"] = finalResponse
+		response := terminalToolResponse(t, contract, true, false)
+		response["structuredContent"] = map[string]any{
+			"directive":      localizationTerminalReplayDirective,
+			"final_response": finalResponse,
+		}
+		meta := response["_meta"].(map[string]any)
+		envelope := meta[localizationHostMetaKey].(map[string]any)
+		envelope["replay"] = true
+		return response
+	}
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+		want   bool
+	}{
+		{name: "authentic compact replay", want: true},
+		{
+			name: "tampered directive",
+			mutate: func(response map[string]any) {
+				response["structuredContent"].(map[string]any)["directive"] = "respond after another tool call"
+			},
+		},
+		{
+			name: "tampered final response",
+			mutate: func(response map[string]any) {
+				response["structuredContent"].(map[string]any)["final_response"] = "FILES:\n- repo/tampered.go"
+			},
+		},
+		{
+			name: "extra visible field",
+			mutate: func(response map[string]any) {
+				response["structuredContent"].(map[string]any)["completion"] = terminalContractMap()["completion"]
+			},
+		},
+		{
+			name: "replay flag false",
+			mutate: func(response map[string]any) {
+				meta := response["_meta"].(map[string]any)
+				meta[localizationHostMetaKey].(map[string]any)["replay"] = false
+			},
+		},
+		{
+			name: "advisory metadata contract",
+			mutate: func(response map[string]any) {
+				meta := response["_meta"].(map[string]any)
+				envelope := meta[localizationHostMetaKey].(map[string]any)
+				completionMap(envelope["contract"].(map[string]any))["enforceable"] = false
+			},
+		},
+		{
+			name: "non v2 metadata contract",
+			mutate: func(response map[string]any) {
+				meta := response["_meta"].(map[string]any)
+				envelope := meta[localizationHostMetaKey].(map[string]any)
+				completionMap(envelope["contract"].(map[string]any))["contract_version"] = 3
+			},
+		},
+		{
+			name: "tampered metadata directive",
+			mutate: func(response map[string]any) {
+				meta := response["_meta"].(map[string]any)
+				envelope := meta[localizationHostMetaKey].(map[string]any)
+				completionMap(envelope["contract"].(map[string]any))["instruction"] = "respond later"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := newResponse(t)
+			if tt.mutate != nil {
+				tt.mutate(response)
+			}
+			identity := beginTestLocalizationTurn(t, t.Name(), "prompt", t.TempDir())
+			snapshotTestLocalizationTool(t, identity, gortexMCPToolPrefix+"read", "tool")
+			data := localizationPostToolPayload(t, gortexMCPToolPrefix+"read", "tool", identity, response)
+			_, observed := observeLocalizationTerminal(data)
+			if observed != tt.want {
+				t.Fatalf("observed = %v, want %v", observed, tt.want)
+			}
+		})
+	}
+}
+
+func TestLocalizationTerminalHookForwardsGortexReplayDeniesNativeThenPromptRotatesTurn(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	sessionID := "terminal-flow"
 	cwd := t.TempDir()
@@ -144,14 +236,40 @@ func TestLocalizationTerminalHookFlowDeniesThenPromptRotatesTurn(t *testing.T) {
 		t.Fatalf("PostToolUse output %q does not contain fixed terminal context", postOutput)
 	}
 
-	pre := preToolPayload(t, "WebSearch", "", identity, nil)
-	preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
-	var output HookOutput
-	if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
-		t.Fatalf("decode PreToolUse output %q: %v", preOutput, err)
+	for _, tool := range []string{
+		gortexMCPToolPrefix + "search",
+		gortexPluginMCPToolPrefix + "search",
+	} {
+		pre := preToolPayload(t, tool, "replay-tool", identity, map[string]any{
+			"operation": "symbols",
+			"query":     "Target",
+		})
+		if got := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) }); got != "" {
+			t.Fatalf("%s should pass through to the MCP replay, got %q", tool, got)
+		}
 	}
-	if output.HookSpecificOutput == nil || output.HookSpecificOutput.PermissionDecision != "deny" {
-		t.Fatalf("expected all-tool terminal deny, got %#v", output)
+
+	native := []struct {
+		tool  string
+		input map[string]any
+	}{
+		{tool: "Read", input: map[string]any{"file_path": "/repo/source.go"}},
+		{tool: "Grep", input: map[string]any{"pattern": "Target", "path": "/repo"}},
+		{tool: "Glob", input: map[string]any{"pattern": "**/*.go", "path": "/repo"}},
+		{tool: gortexMCPToolPrefix + "edit", input: map[string]any{"operation": "file"}},
+	}
+	for _, test := range native {
+		pre := preToolPayload(t, test.tool, "", identity, test.input)
+		preOutput := captureHookStdout(t, func() { runPreToolUse(pre, 0, ModeDeny) })
+		var output HookOutput
+		if err := json.Unmarshal([]byte(preOutput), &output); err != nil {
+			t.Fatalf("decode %s PreToolUse output %q: %v", test.tool, preOutput, err)
+		}
+		if output.HookSpecificOutput == nil ||
+			output.HookSpecificOutput.PermissionDecision != "deny" ||
+			output.HookSpecificOutput.PermissionDecisionReason != localizationTerminalDenyReason {
+			t.Fatalf("expected terminal deny for %s, got %#v", test.tool, output)
+		}
 	}
 
 	beginTestLocalizationTurn(t, sessionID, "prompt-2", cwd)

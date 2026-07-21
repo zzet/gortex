@@ -166,6 +166,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if logQuery {
 			s.queryLog.record(s, ctx, req, res, hErr, qStart)
 		}
+		// Terminal evidence replay is an immutable response contract. Dynamic
+		// warming, freshness, response-capture, and momentum riders would make
+		// identical post-terminal calls diverge and invite further navigation.
+		if hErr == nil && isLocalizationTerminalReplay(res) {
+			return res, nil
+		}
 		if warming && hErr == nil {
 			res = decorateResultWithWarming(res, env)
 		}
