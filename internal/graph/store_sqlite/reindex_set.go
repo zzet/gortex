@@ -72,12 +72,22 @@ func (s *Store) reindexEdgesSetOriented(batch []graph.EdgeReindex) (sqliteReinde
 		return stats, nil
 	}
 
-	gateCtx, cancelGate := context.WithTimeout(context.Background(), s.sqliteBusyRetryWindow())
-	gateErr := s.writeMu.LockContext(gateCtx)
-	cancelGate()
-	if gateErr != nil {
-		return stats, fmt.Errorf("store_sqlite: reindex writer gate: %w", gateErr)
-	}
+	// A resolver reindex is a mandatory graph mutation: the graph.Store
+	// interface has no error channel (it mirrors the in-memory store's
+	// "everything succeeds" contract), so ReindexEdges routes any failure here
+	// through panicOnFatal. Acquire the writer gate with an UNBOUNDED Lock,
+	// exactly like the single-edge ReindexEdge and the sibling
+	// setEdgeProvenanceBatchSetOriented. A bounded LockContext(sqliteBusyRetryWindow)
+	// abandons the batch when a sibling writer -- a warmup checkpoint, or a
+	// deferred-enrich mutation -- holds writeMu past the window; that surfaces as
+	// context.DeadlineExceeded, which is NOT one of panicOnFatal's swallowed
+	// teardown races, so it crashes the whole daemon over a recoverable
+	// lock-wait. The gate is only ever held by short sibling writers plus
+	// context-bounded maintenance (Compact's unbounded VACUUM is a dedicated
+	// daemon path, never concurrent with warmup resolve), so waiting cannot
+	// hang. Per-transaction SQLITE_BUSY contention is still bounded by
+	// withSQLiteBusyRetry below.
+	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	for txStart := 0; txStart < len(batch); txStart += reindexChunkSize {
