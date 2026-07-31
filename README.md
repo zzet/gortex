@@ -114,6 +114,23 @@ Measured on an Apple Silicon laptop with the default CGO build.
 
 Parsing dominates wall time (65–80 %); reference resolution and search-index build scale sub-linearly.
 
+## Comparison with CodeGraph
+
+Both tools turn a codebase into a queryable graph, but they target different workflows: CodeGraph centres on visualizing and chatting with a code graph stored in an external graph database, while Gortex is a zero-dependency engine built for the full agent development cycle (read → edit → verify) over MCP and CLI.
+
+| | Gortex | [CodeGraph](https://github.com/FalkorDB/code-graph) |
+| --- | --- | --- |
+| **Deployment** | Single static binary, everything in-process, no external services | Web app backed by a FalkorDB graph database (Docker / hosted DB) |
+| **Languages** | 257 tree-sitter grammars; compiler-grade resolution for Python, TypeScript / JavaScript, Go, Java, C#, Rust, and [others](docs/languages.md) | Tree-sitter analyzers for a small language set (Python, Java, C, …) |
+| **Graph storage** | In-memory graph with gob+gzip snapshots; provenance-tiered edges with a confidence model | Persisted in FalkorDB; queried via its graph query layer |
+| **Scope** | Multi-repo by default — cross-repo contracts, references, and call chains in one graph | Per-repository graph |
+| **Agent interface** | MCP server (175 configurable tools), CLI verbs, versioned HTTP API | Web UI visualization plus a chat interface |
+| **Editing & safety** | Graph-aware edits (`edit_symbol`, `batch_edit`) with a pre-write parse gate, `verify_change`, blast-radius analysis | Read / explore / visualize — no editing surface |
+| **LLM dependency** | Optional — 9 pluggable providers; every core tool works without one | OpenAI API key required for natural-language querying |
+| **Token efficiency** | Up to 50× fewer tokens per response; GCX1 wire format (−27% vs JSON) | Not a design goal (human-facing UI) |
+
+Feature sets move fast — this reflects both projects as of mid-2026; check each repo for the current state.
+
 ## Token savings dashboard
 
 `gortex savings` reports tokens saved vs naive file reads — per-call, per-session, and cumulative across restarts, priced in USD against the headline model.
