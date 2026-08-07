@@ -127,9 +127,28 @@ const (
 	// cache — so `gortex proxy on/off/add/remove` apply to a running
 	// daemon without a restart. Distinct from ControlReload, which runs
 	// a full repo track/untrack reconcile and never touches the router.
-	ControlProxy         = "proxy"
-	ControlStatus        = "status"
+	ControlProxy  = "proxy"
+	ControlStatus = "status"
+	// ControlProbe is the liveness/scope answer a short-lived caller needs
+	// — is the daemon up, is it ready, and which repos does it track — with
+	// none of the aggregation ControlStatus performs.
+	//
+	// It exists because ControlStatus cannot serve that question reliably.
+	// Status computes per-repo memory estimates, whole-store node/edge
+	// counts, a stop-the-world runtime.ReadMemStats, and a stat of every
+	// configured repo path, then takes the controller mutex — which is held
+	// for the entire duration of a track / reload / enrichment. Measured on
+	// a 44-repo workspace, serial calls with no concurrent load returned the
+	// identical payload in anywhere from 156 ms to 11.5 s depending only on
+	// what the indexer happened to be doing.
+	//
+	// Callers that budget in hundreds of milliseconds — the agent hooks —
+	// therefore timed out against a perfectly healthy daemon and rendered
+	// their "daemon unreachable" fallback. Probe touches no store, no
+	// MemStats, no filesystem, and no mutex: it reads atomics and the config
+	// registry, so an in-flight reindex cannot delay it.
 	ControlShutdown      = "shutdown"
+	ControlProbe         = "probe"
 	ControlSearchSymbols = "search_symbols"
 	// ControlEnrichChurn dispatches to Controller.EnrichChurn — the daemon
 	// runs the churn enricher against its in-process graph so the CLI
@@ -210,6 +229,39 @@ type TrackParams struct {
 // UntrackParams is the payload for ControlUntrack.
 type UntrackParams struct {
 	PathOrPrefix string `json:"path_or_prefix"`
+}
+
+// ProbeResponse is the payload returned under Result on a successful
+// ControlProbe call: enough to decide whether the daemon can answer and
+// which repos it owns, and nothing that costs a store read.
+//
+// Deliberately not a subset-typed StatusResponse. Sharing the type would
+// leave every aggregate field present but zero, and a caller cannot tell a
+// real zero from an unpopulated one — which is the same ambiguity that made
+// a timed-out status read as "nothing is tracked".
+type ProbeResponse struct {
+	Version       string `json:"version"`
+	PID           int    `json:"pid"`
+	UptimeSeconds int64  `json:"uptime_seconds"`
+	// Ready reports resolved references and a queryable graph; Enriched
+	// reports the slow semantic passes finished on top of that. A caller
+	// deciding whether to trust a graph answer wants Ready.
+	Ready    bool `json:"ready"`
+	Enriched bool `json:"enriched"`
+	// TrackedRepos carries identity only — path, prefix, and the workspace
+	// grouping. No counts, no byte estimates, and no on-disk liveness stat:
+	// each of those is a scan, and identity is what a scope decision needs.
+	TrackedRepos []ProbeRepo `json:"tracked_repos"`
+	Sessions     int         `json:"sessions"`
+}
+
+// ProbeRepo is one tracked repo as ControlProbe reports it.
+type ProbeRepo struct {
+	Path      string `json:"path"`
+	Prefix    string `json:"prefix"`
+	Name      string `json:"name,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+	Project   string `json:"project,omitempty"`
 }
 
 // StatusResponse is the payload returned under Result on a successful

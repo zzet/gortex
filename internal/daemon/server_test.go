@@ -23,17 +23,18 @@ var osStat = os.Stat
 // canned responses — lets the daemon lifecycle tests run without wiring
 // in the real MultiIndexer.
 type fakeController struct {
-	mu            sync.Mutex
-	trackCalls    []TrackParams
-	untrackCalls  []UntrackParams
+	mu                 sync.Mutex
+	trackCalls         []TrackParams
+	untrackCalls       []UntrackParams
 	reloadCalls        int
 	reloadServersCalls int
 	statusCalls        int
-	shutdownCalls int
-	shutdownErr   error
-	searchCalls   []SearchSymbolsParams
-	searchHits    []SymbolHit
-	searchErr     error
+	probeCalls         int
+	shutdownCalls      int
+	shutdownErr        error
+	searchCalls        []SearchSymbolsParams
+	searchHits         []SymbolHit
+	searchErr          error
 
 	enrichChurnCalls    []EnrichChurnParams
 	enrichReleasesCalls []EnrichReleasesParams
@@ -77,6 +78,18 @@ func (f *fakeController) Status(_ context.Context) (StatusResponse, error) {
 	return StatusResponse{
 		TrackedRepos: []TrackedRepoStatus{
 			{Prefix: "myrepo", Path: "/tmp/myrepo", Files: 42, Nodes: 100, Edges: 200},
+		},
+	}, nil
+}
+
+func (f *fakeController) Probe(_ context.Context) (ProbeResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probeCalls++
+	return ProbeResponse{
+		Ready: true,
+		TrackedRepos: []ProbeRepo{
+			{Prefix: "myrepo", Path: "/tmp/myrepo"},
 		},
 	}, nil
 }

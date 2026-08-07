@@ -133,6 +133,12 @@ type Controller interface {
 	// restart. Distinct from Reload, which reconciles tracked repos.
 	ReloadServers(ctx context.Context) (json.RawMessage, error)
 	Status(ctx context.Context) (StatusResponse, error)
+	// Probe answers liveness + tracked scope without the aggregation
+	// Status performs, and — critically — without taking the controller
+	// mutex, which a track / reload / enrichment holds for minutes. It is
+	// the call a short-lived client on a sub-second budget should make;
+	// see ControlProbe for the measurements that motivated it.
+	Probe(ctx context.Context) (ProbeResponse, error)
 	// SearchSymbols is the cheap probe path used by external clients
 	// (Claude Code's Grep-redirect hook) that need a single short answer
 	// without setting up a full MCP session.
@@ -662,6 +668,19 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
+
+	case ControlProbe:
+		pr, err := s.Controller.Probe(ctx)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		// Daemon-level fields the controller cannot see, matching Status.
+		pr.Version = s.Version
+		pr.PID = os.Getpid()
+		pr.UptimeSeconds = int64(time.Since(s.started).Seconds())
+		pr.Sessions = s.sessions.Count()
+		buf, _ := json.Marshal(pr)
+		return ControlResponse{OK: true, Result: buf}
 
 	case ControlStatus:
 		st, err := s.Controller.Status(ctx)
