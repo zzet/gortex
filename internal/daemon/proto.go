@@ -284,6 +284,15 @@ type StatusResponse struct {
 	// the daemon — while SearchBackend above may simultaneously report
 	// the symbol index as disk-resident. Nil when no indexer is wired.
 	TrigramCache *TrigramCacheStats `json:"trigram_cache,omitempty"`
+	// CountsUnknown marks a response assembled without the aggregate pass —
+	// the per-repo and whole-store counters are zero because they were never
+	// computed, not because the graph is empty. Set when a caller fell back
+	// to ControlProbe after ControlStatus exceeded its budget.
+	//
+	// Without this a consumer cannot tell "no nodes" from "did not ask", and
+	// rendering an unasked zero as a real one is the same class of mistake as
+	// reading a timed-out status as "nothing is tracked".
+	CountsUnknown bool `json:"counts_unknown,omitempty"`
 	// PProfAddr is set when the daemon has opened an HTTP pprof
 	// listener (via the GORTEX_DAEMON_PPROF_ADDR env var). Empty
 	// string means pprof is not enabled on this daemon.

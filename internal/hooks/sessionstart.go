@@ -76,7 +76,7 @@ func runSessionStart(data []byte) {
 // sessionStartStatusFn is the seam tests use to inject a fake daemon
 // status without spinning up a real socket. Production reads the
 // default (queries the daemon socket directly via Control RPC).
-var sessionStartStatusFn = fetchDaemonStatus
+var sessionStartStatusFn = sessionStartStatus
 
 // fetchDaemonStatus dials the daemon's control socket and asks for
 // status. Returns errDaemonUnreachable when the socket is missing —
@@ -109,6 +109,91 @@ func fetchDaemonStatus() (*daemon.StatusResponse, error) {
 		return nil, err
 	}
 	return &status, nil
+}
+
+// fetchDaemonProbeAsStatus asks ControlProbe and shapes the answer as a
+// StatusResponse so the briefing renderers need no second code path.
+//
+// This is the fallback for a status call that ran out of budget. Status takes
+// the controller mutex, which a track / reload / enrichment holds for minutes,
+// so its timeout carries no information about daemon health — measured over
+// 233 real fires, 81.5% of sessions exceeded the 2s budget and rendered
+// "status query failed" against a daemon that was fine. Probe cannot queue
+// behind indexing, so it can distinguish "busy" from "down" where the status
+// timeout cannot.
+//
+// The aggregate counters are left zero and CountsUnknown is set: the probe
+// deliberately computes none of them, and presenting an unasked zero as a real
+// one would trade one wrong briefing for another.
+func fetchDaemonProbeAsStatus() (*daemon.StatusResponse, error) {
+	client, err := daemon.Dial(daemon.Handshake{
+		Mode:       daemon.ModeControl,
+		ClientName: "gortex-hook-sessionstart",
+	})
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonUnavailable) {
+			return nil, errDaemonUnreachable
+		}
+		return nil, err
+	}
+	defer client.Close()
+
+	resp, err := client.ControlWithTimeout(daemon.ControlProbe, nil, sessionStartProbeBudget)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("daemon rejected probe: %s", resp.ErrorMsg)
+	}
+
+	var probe daemon.ProbeResponse
+	if err := unmarshalResult(resp.Result, &probe); err != nil {
+		return nil, err
+	}
+
+	status := &daemon.StatusResponse{
+		Version:            probe.Version,
+		PID:                probe.PID,
+		UptimeSeconds:      probe.UptimeSeconds,
+		Sessions:           probe.Sessions,
+		Ready:              probe.Ready,
+		EnrichmentComplete: probe.Enriched,
+		CountsUnknown:      true,
+	}
+	for _, r := range probe.TrackedRepos {
+		status.TrackedRepos = append(status.TrackedRepos, daemon.TrackedRepoStatus{
+			Path:      r.Path,
+			Prefix:    r.Prefix,
+			Name:      r.Name,
+			Workspace: r.Workspace,
+			Project:   r.Project,
+		})
+	}
+	return status, nil
+}
+
+// sessionStartProbeBudget bounds the fallback. Probe touches no store, no
+// mutex and no filesystem, so anything it cannot answer inside this is a
+// genuinely unreachable daemon rather than a busy one.
+const sessionStartProbeBudget = 500 * time.Millisecond
+
+// sessionStartStatus resolves the daemon state the briefing renders: the full
+// status when it answers inside its budget, otherwise the probe. Only when
+// both fail is the daemon actually unreachable.
+func sessionStartStatus() (*daemon.StatusResponse, error) {
+	status, err := fetchDaemonStatus()
+	if err == nil {
+		return status, nil
+	}
+	if errors.Is(err, errDaemonUnreachable) {
+		return nil, err
+	}
+	// Status overran its budget. That says nothing about health — ask the
+	// call that indexing cannot delay before declaring enforcement degraded.
+	if probe, probeErr := fetchDaemonProbeAsStatus(); probeErr == nil {
+		return probe, nil
+	}
+	return nil, err
 }
 
 // buildSessionStartBriefing assembles the additionalContext block. It
@@ -164,8 +249,14 @@ func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
 	if !s.Ready {
 		state = "warming up — enforcement partial"
 	}
+	// A probe-sourced response carries no counters. Printing its zero as a
+	// node count would state something untrue about the graph.
 	line := fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s), %d nodes.",
 		state, strings.TrimPrefix(s.Version, "v"), len(s.TrackedRepos), totalNodes)
+	if s.CountsUnknown {
+		line = fmt.Sprintf("✓ Gortex %s (v%s): %d repo(s).",
+			state, strings.TrimPrefix(s.Version, "v"), len(s.TrackedRepos))
+	}
 
 	abs := cwd
 	if cwd != "" {
@@ -204,6 +295,12 @@ func renderDaemonReadiness(s *daemon.StatusResponse) string {
 		fmt.Fprintf(&sb, "⏳ Gortex daemon warming up (v%s, %s elapsed). Enforcement is partial until ready. ",
 			s.Version, formatDuration(s.WarmupSeconds))
 	}
+	// A probe-sourced response never computed the aggregates; reporting its
+	// zeros as real totals would say the graph is empty when it is not.
+	if s.CountsUnknown {
+		fmt.Fprintf(&sb, "%d tracked repo(s); graph totals not queried (the daemon was mid-index).\n\n", totalRepos)
+		return sb.String()
+	}
 	fmt.Fprintf(&sb, "%d tracked repo(s), %d nodes, %d edges across %d workspace(s).\n\n",
 		totalRepos, totalNodes, totalEdges, len(s.Workspaces))
 	return sb.String()
@@ -225,6 +322,13 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 	exact, contained := classifyCwd(abs, s.TrackedRepos)
 	switch {
 	case exact != nil:
+		// Coverage is the load-bearing claim here and the probe can answer it;
+		// the node count is colour, and an uncomputed zero would misreport an
+		// indexed repo as empty.
+		if s.CountsUnknown {
+			return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`). Enforcement is active.\n",
+				abs, exact.Name, exact.Workspace)
+		}
 		return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`, %d nodes). Enforcement is active.\n",
 			abs, exact.Name, exact.Workspace, exact.Nodes)
 	case len(contained) > 0:

@@ -37,6 +37,9 @@ func (f *fakeController) ReloadServers(_ context.Context) (json.RawMessage, erro
 func (f *fakeController) Status(_ context.Context) (daemon.StatusResponse, error) {
 	return daemon.StatusResponse{}, nil
 }
+func (f *fakeController) Probe(_ context.Context) (daemon.ProbeResponse, error) {
+	return daemon.ProbeResponse{Ready: true}, nil
+}
 func (f *fakeController) Shutdown(_ context.Context) error { return nil }
 func (f *fakeController) SearchSymbols(_ context.Context, _ daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
 	return daemon.SearchSymbolsResult{Hits: f.hits}, nil
