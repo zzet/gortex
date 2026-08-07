@@ -37,8 +37,19 @@ import (
 // Methods are serialized via a mutex — track/reload can race with status
 // otherwise. The mutex is coarse; finer locking is a later optimization.
 type realController struct {
-	mu            sync.Mutex
-	graph         graph.Store
+	mu sync.Mutex
+	// graph is assigned once when the controller is constructed and never
+	// reassigned, so reading it requires no synchronisation — and must not
+	// take mu. Taking mu for a handle that cannot change bought nothing and
+	// cost everything: mu is held for the entire duration of a track /
+	// reload / enrichment, so the "cheap probe path" the hooks depend on
+	// (SearchSymbols) queued behind minutes of indexing. Measured, the
+	// UserPromptSubmit probe exceeded its 800ms budget on 82.6% of turns.
+	//
+	// Mutating operations still take mu; they serialise indexer work, not
+	// this pointer. If this field ever becomes reassignable, it needs an
+	// atomic — not mu — for the same reason multiWatcher already uses one.
+	graph graph.Store
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
@@ -770,9 +781,7 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	// advisory counts and byte estimates intentionally remain zero. Once
 	// enriched, snapshot the graph handle under a brief lock and run the
 	// exact (store-memoised) estimates without holding the controller mutex.
-	c.mu.Lock()
-	g := c.graph
-	c.mu.Unlock()
+	g := c.graph // write-once at construction; see the field comment
 	enriched := c.enriched.Load()
 	var memEstimates map[string]graph.RepoMemoryEstimate
 	var wholeStoreNodes, wholeStoreEdges int
@@ -1269,9 +1278,10 @@ const (
 // shard writers and blew past the hook's 200ms budget. The hook then logged
 // probed_miss / timed_out and never once produced a hit.
 func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
-	c.mu.Lock()
+	// No mu: graph is write-once at construction (see the field comment), and
+	// this is the probe path a hook calls on a sub-second budget. Taking mu
+	// here is what made it wait out an in-flight reindex.
 	g := c.graph
-	c.mu.Unlock()
 
 	if g == nil || p.Query == "" {
 		return daemon.SearchSymbolsResult{}, nil
