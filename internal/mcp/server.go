@@ -1589,6 +1589,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	s.registerScopeTools()
 	s.registerAnalysisTools()
 	s.registerEnhancementTools()
+	s.registerWebSearchTool()
 	s.registerLSPTools()
 	s.registerLintTools()
 	s.registerAgentRegistryTools()
