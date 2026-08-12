@@ -1399,6 +1399,32 @@ func validateFacadeInput(spec facadeOperationSpec, input map[string]any) *mcpgo.
 			})
 		}
 	}
+	if spec.Facade == "change" && spec.Operation == "detect" {
+		if source, ok := input["source"].(map[string]any); ok {
+			for _, field := range sortedSelectorKeys(source) {
+				if field == "scope" {
+					continue
+				}
+				data := map[string]any{
+					"field":          "source." + field,
+					"reason":         "unsupported_field",
+					"domain":         spec.Facade,
+					"operation":      spec.Operation,
+					"allowed_fields": []string{"scope"},
+				}
+				message := fmt.Sprintf("change.detect does not accept source.%s", field)
+				if field == "repo_path" {
+					data["supported_field"] = "options.repo"
+					message += "; use options.repo to select a repository"
+				}
+				return NewStructuredErrorResult(StructuredError{
+					ErrorCode: ErrCodeInvalidArgument,
+					Message:   message,
+					Data:      data,
+				})
+			}
+		}
+	}
 	for _, field := range []string{"target", "to"} {
 		if raw, present := input[field]; present && raw != nil {
 			if invalid := validateFacadeSelector(field, raw); invalid != nil {
