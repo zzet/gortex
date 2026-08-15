@@ -3203,6 +3203,10 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		mi.mu.Unlock()
 		return 0, 0
 	}
+	// Snapshot the exact derived-contract frontier before deleting the repo.
+	// Cross-repo bridge nodes can be owned by a surviving repo, so purge alone
+	// cannot remove every dangling derived edge.
+	contractPlan := mi.contractInvalidationPlanForRepo(idx)
 	delete(mi.repos, repoPrefix)
 	delete(mi.indexers, repoPrefix)
 	mi.mu.Unlock()
@@ -3266,7 +3270,9 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 		}
 	}
 
-	mi.ReconcileContractEdges()
+	if !contractPlan.Empty() {
+		mi.ReconcileContractEdgesForFrontier(contractPlan)
+	}
 
 	// Keep the closed slot installed until every purge/config side effect is
 	// complete, then remove only the exact generation drained above. A stale
