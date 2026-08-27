@@ -398,7 +398,7 @@ func (f *lifecycleFixture) assertRegistered(prefix, root string, source store_sq
 	require.NoError(f.t, err)
 	assert.True(f.t, present, "the removal test needs a stored sample of the root")
 
-	assert.True(f.t, f.watcher.isAttached(prefix), "the watcher follows a tracked repo")
+	assert.False(f.t, f.watcher.isAttached(prefix), "a route-owned dedicated repo bypasses the legacy watcher")
 	assert.Contains(f.t, f.configPaths(), root, "the tracked set is persisted")
 	assert.NotNil(f.t, f.mi.GetMetadata(prefix), "the repo is in the corpus")
 }
@@ -491,7 +491,8 @@ func TestCheckoutLifecycleUntrackSurfaceParity(t *testing.T) {
 			assert.Equal(t, familyID, retracked.FamilyID, "the family survives its checkouts")
 			assert.NotEqual(t, tracked.CheckoutID, retracked.CheckoutID)
 			assert.NotEqual(t, tracked.Incarnation, retracked.Incarnation)
-			assert.True(t, f.watcher.isAttached(retracked.Prefix))
+			assert.False(t, f.watcher.isAttached(retracked.Prefix),
+				"retracking recreates a route-owned dedicated corpus without a legacy watcher")
 		})
 	}
 }
@@ -525,14 +526,16 @@ func TestCheckoutLifecycleReloadDiff(t *testing.T) {
 	require.False(t, f.familyOf("reload-wt").IsPrimaryBase)
 
 	// The worktree is a live non-primary checkout of a family that has a
-	// ready primary, so dropping it from the config retires it.
+	// ready primary, so dropping explicit intent demotes it to an automatic
+	// overlay instead of making the live checkout disappear.
 	require.NoError(t, gc.RemoveRepo(worktree))
 	require.NoError(t, gc.Save())
 	removed, err := f.lc.ApplyReload(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, removed.Removed)
+	assert.Equal(t, 0, removed.Removed)
 	assert.Equal(t, 0, removed.Pending)
-	assert.Nil(t, f.mi.GetMetadata("reload-wt"))
+	assert.NotNil(t, f.mi.GetMetadata("reload-wt"),
+		"revoking explicit intent leaves the live checkout as an automatic overlay")
 	assert.False(t, f.watcher.isAttached("reload-wt"))
 
 	// The main checkout owns the family's primary base: nothing is left to
@@ -579,8 +582,10 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 	wtTracked, err := f.lc.Register(ctx, config.RepoEntry{Path: worktree, Name: "sweep-wt"}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, wtTracked.CatalogErr)
-	require.NotEmpty(t, f.store.GetFileNodes("sweep-wt/sweep-wt.go"),
-		"the worktree's file is indexed before it vanishes")
+	worktreeView := f.materialize(wtTracked.CheckoutID)
+	require.NotEmpty(t, contentIdentities(worktreeView.Reader, wtTracked.Prefix),
+		"the worktree's routed view is indexed before it vanishes")
+	worktreeView.Close()
 
 	// Nothing has vanished yet: a sweep changes nothing.
 	report, err := f.lc.Sweep(ctx)
@@ -628,7 +633,9 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, swept.Removed)
 	assert.Nil(t, f.mi.GetMetadata("sweep-wt"), "the vanished worktree leaves the corpus")
-	assert.Empty(t, f.store.GetFileNodes("sweep-wt/sweep-wt.go"), "its nodes are evicted")
+	_, graphStillPresent, graphErr := f.catalog.GetDedicatedGraph(ctx, wtTracked.GraphID)
+	require.NoError(t, graphErr)
+	assert.False(t, graphStillPresent, "its logical graph is forgotten")
 	assert.False(t, f.watcher.isAttached("sweep-wt"), "its watcher is detached")
 	assert.NotContains(t, f.configPaths(), worktree, "the removal is persisted")
 
@@ -867,8 +874,8 @@ func TestCheckoutLifecycleRegistrationBringsUpCoordinators(t *testing.T) {
 		"an explicit track adopts the observed identity rather than minting a second one")
 	assert.Equal(t, store_sqlite.CheckoutModeDedicated, f.checkoutOf(retracked.Prefix).EffectiveMode,
 		"tracking a worktree explicitly gives it a corpus of its own")
-	assert.False(t, f.lc.SignalCheckout(automatic.CheckoutID, "test"),
-		"a dedicated checkout is read from its own corpus, so it keeps no coordinator")
+	assert.True(t, f.lc.SignalCheckout(automatic.CheckoutID, "test"),
+		"a dedicated checkout is served by its own graph-bound coordinator")
 }
 
 // coordinatorReported reads one checkout's coordinator flag off the
@@ -904,23 +911,26 @@ func TestCoordinatorLivenessFollowsTheLoopNotTheRegistry(t *testing.T) {
 
 	// The daemon's restart path: a fresh stack over the same store, the tracked
 	// set re-registered the way warmup re-tracks it, and the seeding that
-	// reconciles every family it touched — which is what brings the automatic
-	// checkouts' coordinators back up.
+	// reconciles every family it touched — which brings both the dedicated
+	// primary and the automatic checkout's coordinators back up.
 	f.restart()
 	_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
 	require.NoError(t, err)
 	require.NoError(t, f.lc.Seed(ctx))
+	owner := f.checkoutOf(f.mainPrefix)
 	require.True(t, f.coordinatorReported(f.automatic.CheckoutID),
-		"the restart's own reconciliation brought no coordinator back")
-	require.Equal(t, 1, f.lc.liveCoordinators(""))
+		"the restart's own reconciliation brought no automatic coordinator back")
+	require.True(t, f.coordinatorReported(owner.CheckoutID),
+		"the restart's own reconciliation brought no dedicated coordinator back")
+	require.Equal(t, 2, f.lc.liveCoordinators(""))
 
-	// The window every transition opens: the registered coordinator is dropped
-	// first, and nothing is running for the checkout until the replacement is
-	// built.
+	// The window every automatic transition opens: that checkout's registered
+	// coordinator is dropped first. The independent dedicated loop remains.
 	f.lc.dropCoordinator(f.automatic.CheckoutID)
 	require.False(t, f.coordinatorReported(f.automatic.CheckoutID),
 		"a dropped coordinator is still reported live")
-	require.Zero(t, f.lc.liveCoordinators(""))
+	require.True(t, f.coordinatorReported(owner.CheckoutID))
+	require.Equal(t, 1, f.lc.liveCoordinators(""))
 
 	checkout, found, err := f.catalog.GetCheckout(ctx, f.automatic.CheckoutID)
 	require.NoError(t, err)
@@ -931,16 +941,18 @@ func TestCoordinatorLivenessFollowsTheLoopNotTheRegistry(t *testing.T) {
 
 	assert.True(t, f.coordinatorReported(f.automatic.CheckoutID),
 		"a running build loop is reported as no coordinator at all")
-	assert.Equal(t, 1, f.lc.liveCoordinators(""),
-		"the reconcile verb counts a running build loop as none")
-	assert.Equal(t, 1, f.lc.liveCoordinators(f.familyID))
+	assert.True(t, f.coordinatorReported(owner.CheckoutID))
+	assert.Equal(t, 2, f.lc.liveCoordinators(""),
+		"the reconcile verb omitted one of two running build loops")
+	assert.Equal(t, 2, f.lc.liveCoordinators(f.familyID))
 	assert.Zero(t, f.lc.liveCoordinators("another-family"),
 		"a family that runs nothing is counted a coordinator")
 
 	require.NoError(t, coordinator.Close())
 	assert.False(t, f.coordinatorReported(f.automatic.CheckoutID),
 		"a stopped coordinator is reported live")
-	assert.Zero(t, f.lc.liveCoordinators(""))
+	assert.True(t, f.coordinatorReported(owner.CheckoutID))
+	assert.Equal(t, 1, f.lc.liveCoordinators(""))
 }
 
 // TestCheckoutLifecycleAdminNameIdentity states the identity rule the whole

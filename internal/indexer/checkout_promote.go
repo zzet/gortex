@@ -11,7 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/indexer/source"
 )
 
 // ErrCheckoutMoved reports that a checkout changed state under an operation
@@ -182,7 +182,13 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 				fmt.Errorf("indexer: no dedicated prefix is bound to %s", checkout.CheckoutID))
 		}
 		out.GraphID = GraphIDFor(out.Prefix)
-		l.attachWatcher(out.Prefix)
+		if err := l.requireDedicatedRoute(ctx, checkout.CheckoutID, out.GraphID); err != nil {
+			return out, l.promotionFailed(ctx, &out, transition, err)
+		}
+		if err := l.installDedicatedCoordinator(ctx, out.GraphID, checkout); err != nil {
+			return out, l.promotionFailed(ctx, &out, transition, err)
+		}
+		l.detachWatcher(out.Prefix)
 		l.saveConfig("promote-resume")
 		l.notifyTrackedSetChanged()
 		if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID, transition.TransitionID); err != nil {
@@ -199,35 +205,41 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 
 	out.Prefix = l.dedicatedPrefixFor(ctx, checkout.RootPath)
 	if out.Prefix == "" {
+		// Main worktrees intentionally have no derived @instance name. Their
+		// explicit registration already bound the base prefix to the owned graph,
+		// so recover that stable name from the catalog before building the first
+		// immutable corpus.
+		out.Prefix = l.prefixForCheckout(ctx, checkout.CheckoutID)
+	}
+	if out.Prefix == "" {
 		return out, l.promotionFailed(ctx, &out, transition,
 			fmt.Errorf("indexer: no dedicated prefix can be derived for %s", checkout.RootPath))
 	}
-	index, resampled, err := l.indexPromotedCorpus(ctx, checkout, out.Prefix)
+	out.GraphID, err = l.bindDedicatedGraph(ctx, checkout.FamilyID, checkout.CheckoutID, out.Prefix)
+	if err != nil {
+		return out, l.promotionFailed(ctx, &out, transition, err)
+	}
+	index, baseGenerationID, sample, resampled, err := l.buildPromotedCorpus(ctx, out.GraphID, checkout, out.Prefix)
 	out.Index, out.Resampled = index, resampled
 	if err != nil {
-		l.rollbackPromotion(ctx, out.Prefix, "")
-		return out, l.promotionFailed(ctx, &out, transition, err)
-	}
-
-	out.GraphID = GraphIDFor(out.Prefix)
-	row := store_sqlite.DedicatedGraph{
-		GraphID:         out.GraphID,
-		OwnerCheckoutID: checkout.CheckoutID,
-		RepoPrefix:      out.Prefix,
-		FamilyID:        checkout.FamilyID,
-		IsPrimaryBase:   false,
-		State:           reconcile.GraphStateReady,
-	}
-	if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
-		l.rollbackPromotion(ctx, out.Prefix, "")
-		return out, l.promotionFailed(ctx, &out, transition, err)
-	}
-	if err := l.serveFromOwnCorpus(ctx, checkout); err != nil {
 		l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
+	err = nil
+	if err != nil {
+		l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
+		return out, l.promotionFailed(ctx, &out, transition, err)
+	}
+	if _, err := l.prepareAndPublishPromotion(ctx, checkout, transition,
+		out.GraphID, baseGenerationID, sample); err != nil {
+		current, currentErr := l.checkoutStateOf(ctx, checkout.CheckoutID)
+		if currentErr == nil && current.EffectiveMode != store_sqlite.CheckoutModeDedicated {
+			l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
+		}
+		return out, l.promotionFailed(ctx, &out, transition, err)
+	}
 
-	l.attachWatcher(out.Prefix)
+	l.detachWatcher(out.Prefix)
 	l.saveConfig("promote")
 	l.notifyTrackedSetChanged()
 	if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID, transition.TransitionID); err != nil {
@@ -273,35 +285,47 @@ func sampleCheckout(ctx context.Context, root string) (checkoutSample, error) {
 // automatic view is still there to fall back on.
 func (l *CheckoutLifecycle) indexPromotedCorpus(
 	ctx context.Context, checkout store_sqlite.Checkout, prefix string,
-) (*IndexResult, int, error) {
+) (*IndexResult, checkoutSample, int, error) {
 	resampled := 0
 	for attempt := 0; attempt < 2; attempt++ {
 		before, err := sampleCheckout(ctx, checkout.RootPath)
 		if err != nil {
-			return nil, resampled, err
+			return nil, checkoutSample{}, resampled, err
+		}
+		content, err := source.NewGitTreeSource(ctx, checkout.RootPath, before.tree)
+		if err != nil {
+			return nil, checkoutSample{}, resampled, err
 		}
 		if l.indexBarrier != nil {
 			l.indexBarrier()
 		}
-		result, err := l.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: checkout.RootPath, Name: prefix})
-		if err != nil {
-			return nil, resampled, err
+		if l.mi.GetMetadata(prefix) != nil {
+			l.mi.UntrackRepo(prefix)
+		}
+		result, indexErr := l.mi.trackRepoSourceCtx(ctx,
+			config.RepoEntry{Path: checkout.RootPath, Name: prefix}, content)
+		closeErr := content.Close()
+		if indexErr != nil {
+			return nil, checkoutSample{}, resampled, indexErr
+		}
+		if closeErr != nil {
+			return nil, checkoutSample{}, resampled, closeErr
 		}
 		if result == nil && l.mi.GetMetadata(prefix) == nil {
-			return nil, resampled, fmt.Errorf(
+			return nil, checkoutSample{}, resampled, fmt.Errorf(
 				"indexer: %s could not be indexed under prefix %s", checkout.RootPath, prefix)
 		}
 		after, err := sampleCheckout(ctx, checkout.RootPath)
 		if err != nil {
-			return nil, resampled, err
+			return nil, checkoutSample{}, resampled, err
 		}
-		if after == before {
-			return result, resampled, nil
+		if after.tree == before.tree && after.commit == before.commit {
+			return result, before, resampled, nil
 		}
 		resampled++
 		l.mi.UntrackRepo(prefix)
 	}
-	return nil, resampled, fmt.Errorf("%w: %s moved under two full indexes",
+	return nil, checkoutSample{}, resampled, fmt.Errorf("%w: %s moved under two full indexes",
 		ErrCheckoutMoved, checkout.RootPath)
 }
 

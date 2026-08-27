@@ -43,6 +43,18 @@ type ViewBuildGate struct {
 	interactiveBurst int
 }
 
+// IsOpen reports whether builds may proceed. The gate is monotonic: once open,
+// it never closes, so callers may safely decide whether waiting would violate
+// an asynchronous API contract.
+func (g *ViewBuildGate) IsOpen() bool {
+	if g == nil {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.open
+}
+
 // WaitUntilOpen waits for daemon warmup without entering the derived-build
 // queue or consuming its single active slot.
 func (g *ViewBuildGate) WaitUntilOpen(ctx context.Context) error {

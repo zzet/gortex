@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -55,7 +56,8 @@ func newFamilyFixture(t *testing.T, name string) *familyFixture {
 
 	report, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 1, report.Coordinators, "the observed worktree has no coordinator")
+	require.Equal(t, 2, report.Coordinators,
+		"the dedicated primary and observed automatic worktree each own a coordinator")
 
 	out := &familyFixture{
 		lifecycleFixture: f,
@@ -223,7 +225,7 @@ func TestDedicatedWorktreePrefixCollisionIsReproducible(t *testing.T) {
 
 // TestPromoteGivesAnAutomaticCheckoutItsOwnCorpus walks the whole flow: the
 // journalled intent, the new corpus under the admin-name prefix, the mode
-// flip, and the automatic route and coordinator coming down behind it.
+// flip, and the dedicated route and coordinator replacing the automatic pair.
 func TestPromoteGivesAnAutomaticCheckoutItsOwnCorpus(t *testing.T) {
 	f := newFamilyFixture(t, "promote")
 	defer f.close()
@@ -253,13 +255,17 @@ func TestPromoteGivesAnAutomaticCheckoutItsOwnCorpus(t *testing.T) {
 	assert.False(t, graph.IsPrimaryBase, "a promotion never moves the family's base")
 	assert.Equal(t, f.familyID, graph.FamilyID)
 
-	_, routed := f.routeOf(f.automatic.CheckoutID)
-	assert.False(t, routed, "the automatic route came down with the mode")
-	assert.False(t, f.lc.SignalCheckout(f.automatic.CheckoutID, "test"),
-		"a dedicated checkout keeps no coordinator")
+	route, routed := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, routed, "the dedicated route replaces the automatic route")
+	assert.Equal(t, result.GraphID, route.GraphID)
+	assert.NotZero(t, route.CommitGenerationID)
+	assert.NotZero(t, route.DirtyGenerationID)
+	assert.True(t, f.lc.SignalCheckout(f.automatic.CheckoutID, "test"),
+		"a dedicated checkout retains its own coordinator")
 	assert.NotNil(t, f.mi.GetMetadata(result.Prefix), "the new corpus is served")
 	assert.True(t, f.configLists(f.worktree), "the promotion is persisted")
-	assert.True(t, f.watcher.isAttached(result.Prefix))
+	assert.False(t, f.watcher.isAttached(result.Prefix),
+		"the route-owned immutable corpus is not watched as a live filesystem base")
 
 	intents, err := f.catalog.ListTrackingIntents(ctx, f.automatic.CheckoutID)
 	require.NoError(t, err)
@@ -295,11 +301,16 @@ func TestPromoteRollsBackWhenTheCheckoutMovesUnderIt(t *testing.T) {
 		moves++
 		writeFile(t, filepath.Join(worktree, "moved.go"),
 			"package a\n\nfunc Moved"+string(rune('A'+moves))+"() {}\n")
+		require.NoError(t, exec.Command("git", "-C", worktree, "add", "moved.go").Run())
+		require.NoError(t, exec.Command(
+			"git", "-C", worktree, "commit", "-m", "move-"+strconv.Itoa(moves),
+		).Run())
 	}
 
 	report, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 1, report.Coordinators)
+	require.Equal(t, 2, report.Coordinators,
+		"the dedicated primary and observed automatic worktree each own a coordinator")
 	automatic := store_sqlite.Checkout{}
 	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
 	require.NoError(t, err)
@@ -319,7 +330,8 @@ func TestPromoteRollsBackWhenTheCheckoutMovesUnderIt(t *testing.T) {
 	result, err := f.lc.PromoteCheckout(ctx, automatic.CheckoutID, TrackSourceCLI)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrCheckoutMoved), "got %v", err)
-	assert.Equal(t, 2, result.Resampled, "the build is taken again exactly once before it fails")
+	assert.Equal(t, 2, result.Resampled,
+		"both unstable samples are rejected before the retry budget is exhausted")
 	assert.True(t, result.Retryable, "nothing moved, so the same call is the whole of the recovery")
 
 	still, found, err := f.catalog.GetCheckout(ctx, automatic.CheckoutID)
@@ -349,9 +361,10 @@ func TestPromoteRollsBackWhenTheCheckoutMovesUnderIt(t *testing.T) {
 	assert.NotEmpty(t, transition.LastError)
 }
 
-// TestPromoteRetriesOnceWhenTheCheckoutSettles is the other side of the same
-// rule: one move under the index costs a second build, not the promotion.
-func TestPromoteRetriesOnceWhenTheCheckoutSettles(t *testing.T) {
+// TestPromoteCapturesASettledDirtyChange is the other side of the same rule:
+// a dirty-only move does not invalidate the immutable HEAD base, and is instead
+// captured by the dirty layer built over it.
+func TestPromoteCapturesASettledDirtyChange(t *testing.T) {
 	f := newFamilyFixture(t, "resample")
 	defer f.close()
 	ctx := context.Background()
@@ -367,10 +380,16 @@ func TestPromoteRetriesOnceWhenTheCheckoutSettles(t *testing.T) {
 
 	result, err := f.lc.PromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceCLI)
 	require.NoError(t, err)
-	assert.Equal(t, 1, result.Resampled, "the first corpus described a state the checkout had left")
+	assert.Zero(t, result.Resampled,
+		"a dirty-only change does not invalidate the captured HEAD tree")
 	assert.NotNil(t, f.mi.GetMetadata(result.Prefix))
 	assert.Equal(t, store_sqlite.CheckoutModeDedicated,
 		f.checkoutOf(result.Prefix).EffectiveMode)
+	view := f.materialize(f.automatic.CheckoutID)
+	defer view.Close()
+	identities := contentIdentities(view.Reader, result.Prefix)
+	assert.Contains(t, identities, "late.go")
+	assert.Contains(t, identities, "late.go::Late")
 }
 
 // --- demotion -----------------------------------------------------------
@@ -391,7 +410,9 @@ func TestUntrackDemotesADedicatedWorktree(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tracked.CatalogErr)
 	require.Equal(t, f.automatic.CheckoutID, tracked.CheckoutID)
-	dedicatedContent := contentIdentities(f.store, tracked.Prefix)
+	dedicatedView := f.materialize(tracked.CheckoutID)
+	dedicatedContent := contentIdentities(dedicatedView.Reader, tracked.Prefix)
+	dedicatedView.Close()
 	require.NotEmpty(t, dedicatedContent)
 
 	preview, err := f.lc.PreviewUntrack(ctx, f.worktree)
@@ -517,8 +538,8 @@ func TestDemoteRefusesAStaleIncarnation(t *testing.T) {
 	_, routed := f.routeOf(tracked.CheckoutID)
 	assert.False(t, routed, "the route the rebuild installed was withdrawn again")
 	assert.NotNil(t, f.mi.GetMetadata(tracked.Prefix), "its corpus is untouched")
-	assert.False(t, f.lc.SignalCheckout(tracked.CheckoutID, "test"),
-		"no coordinator was left behind for a checkout that is still dedicated")
+	assert.True(t, f.lc.SignalCheckout(tracked.CheckoutID, "test"),
+		"rollback did not preserve the coordinator for the still-dedicated checkout")
 }
 
 func modeTransitionRunFor(t *testing.T, lifecycle *CheckoutLifecycle, transitionID string) *modeTransitionRun {
@@ -643,6 +664,12 @@ func TestSeedResumesDemotionWithoutRestoringRevokedConfigIntent(t *testing.T) {
 		config.RepoEntry{Path: f.main, Name: f.mainPrefix}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, restored.CatalogErr)
+	require.False(t, restored.Pending, "a ready dedicated route requires no replacement build")
+	require.Empty(t, restored.TransitionID)
+	require.NotNil(t, f.mi.GetMetadata(restored.Prefix),
+		"register did not restore the route-owned repository shell after restart")
+	require.True(t, f.lc.hasCoordinator(restored.CheckoutID),
+		"register did not restore the ready dedicated coordinator after restart")
 	gate.Open()
 
 	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -878,15 +905,26 @@ func TestPreviewUntrackListsThePrimaryClosure(t *testing.T) {
 	assert.Equal(t, []string{f.primaryGraph}, kinds[reconcile.DependentGraph],
 		"the primary graph itself is in the closure")
 	owner := f.checkoutOf(f.mainPrefix)
-	assert.Equal(t, []string{f.automatic.CheckoutID, owner.CheckoutID},
+	assert.ElementsMatch(t, []string{f.automatic.CheckoutID, owner.CheckoutID},
 		kinds[reconcile.DependentCheckout],
-		"the automatic checkouts and the owner identity the saga forgets; the dedicated sibling is not one")
-	assert.Equal(t, []string{f.automatic.CheckoutID}, kinds[reconcile.DependentRoute])
-	route, routed := f.routeOf(f.automatic.CheckoutID)
+		"the automatic checkout and owner identity the saga forgets; the dedicated sibling is not one")
+	assert.ElementsMatch(t, []string{f.automatic.CheckoutID, owner.CheckoutID},
+		kinds[reconcile.DependentRoute],
+		"both live routes owned by the primary closure are named")
+	automaticRoute, routed := f.routeOf(f.automatic.CheckoutID)
 	require.True(t, routed)
-	assert.Subset(t, kinds[reconcile.DependentLayer],
-		[]string{layerID(route.CommitGenerationID), layerID(route.DirtyGenerationID)},
-		"both routed layers are named")
+	ownerRoute, routed := f.routeOf(owner.CheckoutID)
+	require.True(t, routed)
+	primary, found, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.ElementsMatch(t, []string{
+		layerID(primary.ActiveGenerationID),
+		layerID(automaticRoute.CommitGenerationID),
+		layerID(automaticRoute.DirtyGenerationID),
+		layerID(ownerRoute.CommitGenerationID),
+		layerID(ownerRoute.DirtyGenerationID),
+	}, kinds[reconcile.DependentLayer], "the immutable base and every routed layer are named")
 
 	require.Len(t, preview.Preserved, 1)
 	assert.Equal(t, tracked.GraphID, preview.Preserved[0].ID,
@@ -1007,16 +1045,10 @@ func liveCoordinatorOrNil(l *CheckoutLifecycle, checkoutID string) *CheckoutCoor
 	return l.coordinators[checkoutID]
 }
 
-// TestPromoteReportsSuccessWhenTheRouteWithdrawalFails pins where a promotion
-// commits.
-//
-// The mode flip is the point of no return: every reader consults the mode, so
-// once it has landed the checkout is served from its own corpus whatever else
-// the catalog still holds. A route withdrawal that fails after it is cleanup,
-// not a promotion to undo — rolling back there would evict the corpus the
-// catalog has already pointed every reader at, and would journal a retry that
-// finds the checkout dedicated and rebuilds nothing.
-func TestPromoteReportsSuccessWhenTheRouteWithdrawalFails(t *testing.T) {
+// TestPromotionDoesNotUseTheLegacyRouteWithdrawal proves the dedicated route,
+// graph marker, and mode flip are one publication. A failure injected at the
+// retired automatic-route cleanup seam cannot split that transaction.
+func TestPromotionDoesNotUseTheLegacyRouteWithdrawal(t *testing.T) {
 	f := newFamilyFixture(t, "routefail")
 	defer f.close()
 	ctx := context.Background()
@@ -1046,18 +1078,21 @@ func TestPromoteReportsSuccessWhenTheRouteWithdrawalFails(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, pending, "a promotion that happened journals no retry")
 
-	stale, routed := f.routeOf(f.automatic.CheckoutID)
-	require.True(t, routed, "the route the withdrawal could not remove is still there")
-	assert.Equal(t, before.GraphID, stale.GraphID)
+	dedicated, routed := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, routed, "the atomic publication installs the dedicated route")
+	assert.NotEqual(t, before.GraphID, dedicated.GraphID)
+	assert.Equal(t, result.GraphID, dedicated.GraphID)
+	assert.NotZero(t, dedicated.CommitGenerationID)
+	assert.NotZero(t, dedicated.DirtyGenerationID)
 
-	// It is the sweep's to finish, and the sweep finishes it.
 	f.lc.routeBarrier = nil
 	_, err = f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	_, routed = f.routeOf(f.automatic.CheckoutID)
-	assert.False(t, routed, "the sweep withdrew the orphan route")
+	stillDedicated, routed := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, routed, "reconciliation retains the dedicated route")
+	assert.Equal(t, dedicated, stillDedicated)
 	assert.Equal(t, store_sqlite.CheckoutModeDedicated,
-		f.checkoutOf(result.Prefix).EffectiveMode, "and left the promotion where it was")
+		f.checkoutOf(result.Prefix).EffectiveMode)
 }
 
 // TestApplyUntrackRefusesARekeyedCheckout is the identity half of the
@@ -1171,7 +1206,8 @@ func TestSetPrimaryDropsDependentCoordinatorsBeforeTheEpochMoves(t *testing.T) {
 	f.worktreeOf(f.main, "coorddrop-second")
 	report, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 2, report.Coordinators, "the family needs two automatic checkouts")
+	require.Equal(t, 3, report.Coordinators,
+		"the family needs a dedicated primary plus two automatic checkout coordinators")
 
 	candidate := f.worktreeOf(f.main, "coorddrop-alt")
 	runGit(t, candidate, "add", "-A")

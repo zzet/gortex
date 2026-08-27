@@ -15,6 +15,19 @@ var errRepositoryMutationCoordinatorClosed = errors.New("repository mutation coo
 
 type repositoryMutationExecutor func(paths []string) (*IndexResult, error)
 
+type repositoryMutationGuard func() (skip bool, err error)
+
+type immutableRepositoryMutationKey struct{}
+
+func authorizeImmutableRepositoryMutation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, immutableRepositoryMutationKey{}, true)
+}
+
+func immutableRepositoryMutationAuthorized(ctx context.Context) bool {
+	authorized, _ := ctx.Value(immutableRepositoryMutationKey{}).(bool)
+	return authorized
+}
+
 type repositoryMutationScope struct {
 	full  bool
 	paths map[string]struct{}
@@ -96,6 +109,7 @@ type repositoryMutationCoordinator struct {
 	// coordinators leave it nil; tests set it before admitting concurrent work.
 	batchAdmissionHook func()
 	executor           repositoryMutationExecutor
+	guard              repositoryMutationGuard
 	closed             bool
 	running            bool
 
@@ -181,9 +195,20 @@ func (c *repositoryMutationCoordinator) drain() {
 		waiters := c.waiters
 		c.waiters = nil
 		executor := c.executor
+		guard := c.guard
 		c.mu.Unlock()
 
-		outcome := executeRepositoryMutation(executor, paths)
+		var outcome repositoryMutationOutcome
+		if guard != nil {
+			skip, err := guard()
+			if err != nil {
+				outcome.err = err
+			} else if !skip {
+				outcome = executeRepositoryMutation(executor, paths)
+			}
+		} else {
+			outcome = executeRepositoryMutation(executor, paths)
+		}
 		c.lane <- struct{}{}
 		if batchMutationGate != nil {
 			batchMutationGate.RUnlock()
@@ -277,6 +302,24 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Topology operations deliberately use runExclusiveLaneOnly: promotion
+	// must be able to install an immutable Git-tree corpus while its intent
+	// guard is armed. Ordinary watcher, janitor, point, and explicit reindex
+	// work takes the batch gate and is suppressed while that corpus is owned.
+	if acquireBatchGate && !immutableRepositoryMutationAuthorized(ctx) {
+		c.mu.Lock()
+		guard := c.guard
+		c.mu.Unlock()
+		if guard != nil {
+			skip, err := guard()
+			if err != nil {
+				return err
+			}
+			if skip {
+				return nil
+			}
+		}
+	}
 	return fn()
 }
 
@@ -349,6 +392,9 @@ func (mi *MultiIndexer) repositoryMutationCoordinator(repoPrefix string) *reposi
 		// Attach before publishing the slot: every execution through this stable
 		// lane must participate in the owning MultiIndexer's batch transition.
 		coordinator.batchMutationGate = &mi.batchMutationGate
+		coordinator.guard = func() (bool, error) {
+			return mi.routeOwnsDedicatedCorpus(context.Background(), repoPrefix)
+		}
 		mi.repositoryMutations[repoPrefix] = coordinator
 	}
 	return coordinator

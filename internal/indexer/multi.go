@@ -2054,11 +2054,26 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 					// the loop via the shared global-pass pipeline.
 					idx.SetDeferResolve(true)
 
-					result, err := idx.indexCtxRaw(context.Background(), r.absPath)
-					if err != nil {
+					owned, guardErr := mi.routeOwnsDedicatedCorpus(context.Background(), r.prefix)
+					if guardErr != nil {
 						idx.Close()
-						resultCh <- repoResult{prefix: r.prefix, err: fmt.Errorf("indexing %s: %w", r.absPath, err)}
+						resultCh <- repoResult{prefix: r.prefix, err: guardErr}
 						return
+					}
+					var result *IndexResult
+					if owned {
+						// The catalog route already owns this prefix's immutable base.
+						// Build only the process-local shell for the batch registry.
+						idx.SetRootPath(r.absPath)
+						result = &IndexResult{RepoPrefix: r.prefix}
+					} else {
+						var err error
+						result, err = idx.indexCtxRaw(context.Background(), r.absPath)
+						if err != nil {
+							idx.Close()
+							resultCh <- repoResult{prefix: r.prefix, err: fmt.Errorf("indexing %s: %w", r.absPath, err)}
+							return
+						}
 					}
 					if result == nil {
 						idx.Close()
@@ -2715,6 +2730,29 @@ func (mi *MultiIndexer) trackRepoSourceCtx(
 		hook(prefix, absPath)
 	}
 
+	// A committed dedicated route owns an immutable HEAD corpus. On restart,
+	// restore only the process-local indexer shell; walking the live checkout
+	// here would rewrite that captured base with whichever branch is checked out
+	// now. Promotion's Git tree source deliberately bypasses this nil-source
+	// warm-start path.
+	if content == nil {
+		owned, guardErr := mi.routeOwnsDedicatedCorpus(ctx, prefix)
+		if guardErr != nil {
+			return nil, guardErr
+		}
+		if owned {
+			result, restored, restoreErr := mi.restoreRouteOwnedRepoCtx(
+				ctx, entry, absPath, prefix, cfg, identity, nil,
+			)
+			if restoreErr != nil {
+				return nil, restoreErr
+			}
+			if restored {
+				return result, nil
+			}
+		}
+	}
+
 	// Every repo is prefixed, including the first one. There is no
 	// repo-count gate here any more: a lone repo is just the first tracked
 	// repo, so one ID scheme covers the whole graph whether the workspace
@@ -2738,7 +2776,11 @@ func (mi *MultiIndexer) trackRepoSourceCtx(
 
 	var result *IndexResult
 	installed := false
-	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
+	mutationCtx := ctx
+	if content != nil {
+		mutationCtx = authorizeImmutableRepositoryMutation(ctx)
+	}
+	err = mi.coordinateRepositoryTopologyMutation(mutationCtx, idx, func() error {
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
 		batchMode := mi.reapplyBatchModeForMutation(idx)
@@ -2865,6 +2907,25 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	mi.mu.RUnlock()
 	if exists {
 		return nil, nil
+	}
+
+	// A dedicated route already points at generation-owned payload. Recreate
+	// its in-memory repository shell from catalog state without comparing the
+	// immutable base to the live worktree.
+	owned, guardErr := mi.routeOwnsDedicatedCorpus(ctx, prefix)
+	if guardErr != nil {
+		return nil, guardErr
+	}
+	if owned {
+		result, restored, restoreErr := mi.restoreRouteOwnedRepoCtx(
+			ctx, entry, absPath, prefix, cfg, identity, priorMtimes,
+		)
+		if restoreErr != nil {
+			return nil, restoreErr
+		}
+		if restored {
+			return result, nil
+		}
 	}
 
 	// Fall back to full TrackRepoCtx when we have no prior mtimes:

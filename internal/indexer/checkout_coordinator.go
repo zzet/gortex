@@ -111,6 +111,10 @@ type CheckoutCoordinatorConfig struct {
 	// so a primary that moves — a new commit on the primary checkout, a
 	// promotion — is picked up on the next pass.
 	FamilyID string
+	// GraphID pins this coordinator to one logical base graph. Automatic
+	// checkouts receive the current family primary; dedicated checkouts receive
+	// their own graph. Empty preserves the legacy family-primary lookup.
+	GraphID string
 
 	// RepoPrefix, WorkspaceID and ProjectID are stamped onto the payload. They
 	// are the PRIMARY's, not the checkout's: the layers compose over the
@@ -193,6 +197,7 @@ type CheckoutCoordinator struct {
 	checkoutID  string
 	root        string
 	familyID    string
+	graphID     string
 	repoPrefix  string
 	workspaceID string
 	projectID   string
@@ -309,6 +314,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		checkoutID:     cfg.CheckoutID,
 		root:           cfg.CheckoutRoot,
 		familyID:       cfg.FamilyID,
+		graphID:        cfg.GraphID,
 		repoPrefix:     cfg.RepoPrefix,
 		workspaceID:    cfg.WorkspaceID,
 		projectID:      cfg.ProjectID,
@@ -819,6 +825,93 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	return out, nil
 }
 
+type checkoutStackPublisher func(
+	context.Context, store_sqlite.CheckoutRoute, bool, string, int64, int64,
+) error
+
+// preparePromotion builds a complete dedicated stack over an explicitly
+// captured immutable base. Publication is delegated to the caller so the
+// route and effective-mode flip can share one guarded catalog transaction.
+func (c *CheckoutCoordinator) preparePromotion(
+	ctx context.Context,
+	base primaryBase,
+	expectedHeadTree string,
+	publish checkoutStackPublisher,
+) (CheckoutCycle, error) {
+	var out CheckoutCycle
+	if c == nil {
+		return out, errors.New("indexer: no coordinator to prepare promotion")
+	}
+	if publish == nil {
+		return out, errors.New("indexer: promotion publisher is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stopLifetimeCancel := context.AfterFunc(c.lifetimeContext(), cancel)
+	defer func() {
+		stopLifetimeCancel()
+		cancel()
+	}()
+	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
+	if err != nil {
+		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
+	}
+	defer release()
+
+	c.cycleMu.Lock()
+	defer c.cycleMu.Unlock()
+
+	head, err := gitstate.SampleHEAD(ctx, c.root)
+	if err != nil {
+		return out, fmt.Errorf("indexer: sample HEAD of %s: %w", c.root, err)
+	}
+	if head.TreeOID == "" || head.TreeOID != expectedHeadTree {
+		return out, errCheckoutUnsettled
+	}
+	route, routed, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil {
+		return out, err
+	}
+
+	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, expectedHeadTree)
+	if err != nil {
+		return out, err
+	}
+	out.CommitGenerationID, out.CommitBuilt, out.CommitReused = commitGeneration, !reused, reused
+
+	dirtyGeneration, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	if err != nil {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		return out, err
+	}
+	if dirtyGeneration == 0 {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		out.Rescheduled = true
+		return out, errCheckoutUnsettled
+	}
+	out.DirtyGenerationID, out.DirtyBuilt = dirtyGeneration, true
+
+	if err := publish(ctx, route, routed, base.graphID, commitGeneration, dirtyGeneration); err != nil {
+		c.abandonBuild(ctx, dirtyGeneration, true)
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+			out.Rescheduled = true
+		}
+		return out, err
+	}
+
+	c.dropRetained(ctx, commitGeneration)
+	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, expectedHeadTree)), commitGeneration)
+	c.rememberRoutedDirty(dirtyGeneration)
+	if routed {
+		c.offerRetire(ctx, route.DirtyGenerationID)
+		c.offerRetire(ctx, route.CommitGenerationID)
+	}
+	return out, nil
+}
+
 // installStack points a checkout's route at a graph and both of its
 // generations in one write.
 func (c *CheckoutCoordinator) installStack(
@@ -875,6 +968,17 @@ func (c *CheckoutCoordinator) abandonBuild(ctx context.Context, generationID int
 // primary's working tree, and the difference between the two shows through at
 // exactly the paths the primary has edited and the checkout has not.
 func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, error) {
+	if c.graphID != "" {
+		dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, c.graphID)
+		if err != nil {
+			return primaryBase{}, err
+		}
+		if !found || dedicated.FamilyID != c.familyID {
+			return primaryBase{}, fmt.Errorf("%w: dedicated graph %s",
+				store_sqlite.ErrCatalogNotFound, c.graphID)
+		}
+		return graphBase(ctx, c.catalog, dedicated)
+	}
 	graphs, err := c.catalog.ListDedicatedGraphs(ctx, c.familyID)
 	if err != nil {
 		return primaryBase{}, err

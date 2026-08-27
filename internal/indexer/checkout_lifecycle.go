@@ -322,8 +322,8 @@ func (l *CheckoutLifecycle) Reconciler() *reconcile.Reconciler {
 type RegisterResult struct {
 	// Prefix is the repo prefix the checkout registered under.
 	Prefix string
-	// Index is the first index's result, nil when the repository was
-	// already tracked.
+	// Index is the first index's result. It is nil when the repository was
+	// already tracked or its dedicated promotion is still pending.
 	Index *IndexResult
 	// AlreadyTracked reports that the corpus already held this repository,
 	// so only the identity and the side effects were brought up to date.
@@ -334,6 +334,11 @@ type RegisterResult struct {
 	Incarnation string
 	FamilyID    string
 	GraphID     string
+	// TransitionID identifies a durable asynchronous promotion, when Pending.
+	TransitionID string
+	// Pending reports that registration succeeded but its immutable dedicated
+	// view is waiting for the daemon build gate.
+	Pending bool
 	// CatalogErr is a registration failure that left the index in place.
 	// It is reported rather than returned: the corpus is the user-visible
 	// product of a track, and a catalog that could not record the identity
@@ -356,7 +361,7 @@ type RegisterResult struct {
 func (l *CheckoutLifecycle) Register(
 	ctx context.Context,
 	entry config.RepoEntry,
-	source store_sqlite.IntentSourceKind,
+	sourceKind store_sqlite.IntentSourceKind,
 ) (RegisterResult, error) {
 	if l == nil || l.mi == nil {
 		return RegisterResult{}, errors.New("indexer: checkout lifecycle is not wired")
@@ -365,47 +370,101 @@ func (l *CheckoutLifecycle) Register(
 	if err != nil {
 		return RegisterResult{}, fmt.Errorf("resolve path %s: %w", entry.Path, err)
 	}
-	// One fan-out for the whole registration: the family reconciliation at the
-	// end drives the same cleanup hooks a sweep does, and each of them tells
-	// the sessions the tracked set moved.
 	defer l.beginBatch()()
 
-	// A linked worktree of a family that already has a corpus is named by the
-	// rule at the naming seam rather than by its basename or its branch. The
-	// name is pinned onto the entry, so the indexer persists it and every later
-	// pass reads the decision back instead of taking it again.
+	entry.Path = absPath
 	if entry.Name == "" {
 		if prefix := l.dedicatedPrefixFor(ctx, absPath); prefix != "" {
 			entry.Name = prefix
 		}
 	}
+	prefix := config.ResolvePrefix(entry)
 
-	result, err := l.mi.TrackRepoCtx(ctx, entry)
-	if err != nil {
-		return RegisterResult{}, err
-	}
-	out := RegisterResult{Index: result, AlreadyTracked: result == nil}
-	switch {
-	case result != nil && result.RepoPrefix != "":
-		out.Prefix = result.RepoPrefix
-	default:
-		out.Prefix = l.ResolvePrefix(absPath)
-	}
-	if out.Prefix == "" {
-		out.Prefix = config.ResolvePrefix(entry)
-	}
-
-	identity, catalogErr := l.recordCheckout(ctx, out.Prefix, absPath, source, false)
-	out.CheckoutID, out.Incarnation = identity.checkoutID, identity.incarnation
-	out.FamilyID, out.GraphID = identity.familyID, identity.graphID
-	if catalogErr != nil {
+	// Implicit registrations and non-Git directories retain the ordinary
+	// mutable corpus path. Explicit Git intent is recorded first so promotion
+	// can build the full corpus from the captured immutable HEAD and publish
+	// its own route without ever exposing a filesystem-backed base.
+	if sourceKind == TrackSourceImplicit {
+		result, trackErr := l.mi.TrackRepoCtx(ctx, entry)
+		if trackErr != nil {
+			return RegisterResult{}, trackErr
+		}
+		out := RegisterResult{Index: result, AlreadyTracked: result == nil, Prefix: prefix}
+		if result != nil && result.RepoPrefix != "" {
+			out.Prefix = result.RepoPrefix
+		}
+		identity, catalogErr := l.recordCheckout(ctx, out.Prefix, absPath, sourceKind, false)
+		out.CheckoutID, out.Incarnation = identity.checkoutID, identity.incarnation
+		out.FamilyID, out.GraphID = identity.familyID, identity.graphID
 		out.CatalogErr = catalogErr
-		l.logger.Warn("checkout lifecycle: could not record the tracked checkout",
-			zap.String("prefix", out.Prefix), zap.String("root", absPath), zap.Error(catalogErr))
+		l.attachWatcher(out.Prefix)
+		l.saveConfig("track")
+		l.reconcileFamilyNow(ctx, out.FamilyID, absPath)
+		l.notifyTrackedSetChanged()
+		return out, nil
 	}
 
-	l.attachWatcher(out.Prefix)
-	l.saveConfig("track")
+	identity, catalogErr := l.recordCheckout(ctx, prefix, absPath, sourceKind, false)
+	out := RegisterResult{
+		Prefix: prefix, CheckoutID: identity.checkoutID, Incarnation: identity.incarnation,
+		FamilyID: identity.familyID, GraphID: identity.graphID, CatalogErr: catalogErr,
+	}
+	if catalogErr != nil {
+		return out, catalogErr
+	}
+	if identity.checkoutID == "" {
+		result, trackErr := l.mi.TrackRepoCtx(ctx, entry)
+		if trackErr != nil {
+			return out, trackErr
+		}
+		out.Index, out.AlreadyTracked = result, result == nil
+		if result != nil && result.RepoPrefix != "" {
+			out.Prefix = result.RepoPrefix
+		}
+		l.attachWatcher(out.Prefix)
+		l.saveConfig("track")
+		l.notifyTrackedSetChanged()
+		return out, nil
+	}
+
+	promoted, run, promoteErr := l.startPromoteCheckout(ctx, identity.checkoutID, TrackSourceImplicit)
+	if promoteErr == nil && run == nil && promoted.GraphID != "" {
+		// A ready dedicated route survives daemon restart, but its process-local
+		// repository shell does not. Re-entering TrackRepoCtx restores only that
+		// shell because the durable route owns the immutable corpus.
+		entry.Name = promoted.Prefix
+		promoted.Index, promoteErr = l.mi.TrackRepoCtx(ctx, entry)
+	}
+	if promoteErr == nil && run != nil {
+		gate := l.buildGate()
+		if gate == nil || gate.IsOpen() {
+			outcome, waitErr := waitModeTransition(ctx, run)
+			if waitErr != nil {
+				promoted.Pending = true
+				promoteErr = waitErr
+			} else {
+				promoted = outcome.promotion
+				promoteErr = outcome.err
+			}
+		} else {
+			promoted.Pending = true
+		}
+	}
+	out.Index = promoted.Index
+	out.AlreadyTracked = promoted.Index == nil && !promoted.Pending
+	out.TransitionID, out.Pending = promoted.TransitionID, promoted.Pending
+	if promoted.Prefix != "" {
+		out.Prefix = promoted.Prefix
+	}
+	if promoted.GraphID != "" {
+		out.GraphID = promoted.GraphID
+	}
+	if promoteErr != nil {
+		return out, promoteErr
+	}
+	if promoted.Pending {
+		return out, nil
+	}
 	l.reconcileFamilyNow(ctx, out.FamilyID, absPath)
 	l.notifyTrackedSetChanged()
 	return out, nil
@@ -495,11 +554,6 @@ func (l *CheckoutLifecycle) recordCheckout(
 			if err := l.confirmPresent(ctx, *existing, record, inv, now); err != nil {
 				return identity, err
 			}
-			if source != TrackSourceImplicit {
-				if err := l.claimDedicated(ctx, *existing, now); err != nil {
-					return identity, err
-				}
-			}
 		}
 	default:
 		minted, err := l.allocateCheckout(ctx, familyID, root, record, inv, now)
@@ -507,13 +561,6 @@ func (l *CheckoutLifecycle) recordCheckout(
 			return identity, err
 		}
 		identity.checkoutID, identity.incarnation = minted.CheckoutID, minted.Incarnation
-		if source != TrackSourceImplicit {
-			// An allocation that lost its guard adopted another actor's row,
-			// which may be an automatic one.
-			if err := l.claimDedicated(ctx, minted, now); err != nil {
-				return identity, err
-			}
-		}
 	}
 
 	// A config entry may outlive an authorized demotion until its cleanup
@@ -605,8 +652,8 @@ func (l *CheckoutLifecycle) allocateCheckout(
 		GitDir:         gitDirFor(inv, record),
 		AdminName:      record.AdminName,
 		State:          store_sqlite.CheckoutStateReady,
-		DesiredMode:    store_sqlite.CheckoutModeDedicated,
-		EffectiveMode:  store_sqlite.CheckoutModeDedicated,
+		DesiredMode:    store_sqlite.CheckoutModeAutomatic,
+		EffectiveMode:  store_sqlite.CheckoutModeAutomatic,
 		Locked:         record.Locked,
 		Prunable:       record.Prunable,
 		HeadRef:        record.HEADRef,
@@ -715,6 +762,18 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 		return "", nil
 	}
 	graphID := GraphIDFor(prefix)
+	existing, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		if existing.OwnerCheckoutID != checkoutID || existing.FamilyID != familyID ||
+			existing.RepoPrefix != prefix {
+			return "", fmt.Errorf("%w: dedicated graph %s binding moved",
+				store_sqlite.ErrCatalogStaleGuard, graphID)
+		}
+		return graphID, nil
+	}
 	graphs, err := l.catalog.ListDedicatedGraphs(ctx, familyID)
 	if err != nil {
 		return "", err
@@ -1430,7 +1489,7 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
 		}
-		if report.PrimaryGraphID == "" || entry.State != store_sqlite.CheckoutStateReady {
+		if entry.State != store_sqlite.CheckoutStateReady {
 			l.dropCoordinator(entry.CheckoutID)
 			l.withdrawStaleRoute(ctx, entry.CheckoutID)
 			continue
@@ -1440,12 +1499,23 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 			l.dropCoordinator(entry.CheckoutID)
 			continue
 		}
-		if checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
+		graphID := report.PrimaryGraphID
+		if checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
+			prefix := l.prefixForCheckout(ctx, checkout.CheckoutID)
+			graphID = GraphIDFor(prefix)
+			graph, graphFound, graphErr := l.catalog.GetDedicatedGraph(ctx, graphID)
+			if graphErr != nil || !graphFound || graph.OwnerCheckoutID != checkout.CheckoutID {
+				l.dropCoordinator(entry.CheckoutID)
+				l.withdrawStaleRoute(ctx, entry.CheckoutID)
+				continue
+			}
+		}
+		if graphID == "" {
 			l.dropCoordinator(entry.CheckoutID)
 			l.withdrawStaleRoute(ctx, entry.CheckoutID)
 			continue
 		}
-		l.ensureCoordinator(ctx, report.PrimaryGraphID, checkout)
+		l.ensureCoordinator(ctx, graphID, checkout)
 	}
 }
 
@@ -1460,10 +1530,13 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
 ) {
 	l.coordMu.Lock()
-	_, live := l.coordinators[checkout.CheckoutID]
+	current := l.coordinators[checkout.CheckoutID]
 	l.coordMu.Unlock()
-	if live {
+	if current != nil && current.Running() && current.graphID == primaryGraphID {
 		return
+	}
+	if current != nil {
+		l.dropCoordinator(checkout.CheckoutID)
 	}
 	coordinator, err := l.buildCoordinator(ctx, primaryGraphID, checkout)
 	if err != nil {
@@ -1494,6 +1567,12 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 func (l *CheckoutLifecycle) buildCoordinator(
 	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
 ) (*CheckoutCoordinator, error) {
+	return l.buildCoordinatorWithPoll(ctx, primaryGraphID, checkout, 0)
+}
+
+func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
+	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout, poll time.Duration,
+) (*CheckoutCoordinator, error) {
 	if l.store == nil || l.catalog == nil {
 		return nil, nil
 	}
@@ -1519,6 +1598,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		CheckoutID:   checkout.CheckoutID,
 		CheckoutRoot: checkout.RootPath,
 		FamilyID:     checkout.FamilyID,
+		GraphID:      primaryGraphID,
 		RepoPrefix:   primary.RepoPrefix,
 		WorkspaceID:  idx.WorkspaceID(),
 		ProjectID:    idx.ProjectID(),
@@ -1542,7 +1622,8 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		// The watcher's own debounce is the quiet window: both coalesce the
 		// same event storms, and a checkout whose watch configuration says how
 		// long to wait means it for its views too.
-		Debounce: time.Duration(watch.DebounceMs) * time.Millisecond,
+		Debounce:     time.Duration(watch.DebounceMs) * time.Millisecond,
+		PollInterval: poll,
 	})
 	if err != nil {
 		return nil, err

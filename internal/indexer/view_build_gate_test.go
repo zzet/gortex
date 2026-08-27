@@ -193,16 +193,17 @@ func TestCoordinatorServesItsPublishedRouteWhileBuildsAreDeferred(t *testing.T) 
 	builderAssertReadersAgree(t, view.Reader, flat)
 }
 
-// TestLifecycleRegistersCheckoutsWhileBuildsAreDeferred pins what the gate
-// must NOT reach. Registration is how a checkout gets an identity, a route row
-// and a coordinator to signal, and a daemon that deferred any of that would
-// come back with no idea what it serves — the deferral is over build passes
-// alone.
+// TestLifecycleRegistersCheckoutsWhileBuildsAreDeferred pins the registration
+// boundary. Identity and the durable promotion claim are control-plane state,
+// so registration returns them immediately. The exact immutable base, active
+// route, and coordinators remain unavailable until the warmup gate admits the
+// build that makes them truthful.
 func TestLifecycleRegistersCheckoutsWhileBuildsAreDeferred(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
 	ctx := context.Background()
-	f.lc.SetBuildGate(NewViewBuildGate())
+	gate := NewViewBuildGate()
+	f.lc.SetBuildGate(gate)
 
 	main := f.gitRepo("gated-main")
 	f.worktreeOf(main, "gated-wt")
@@ -211,12 +212,46 @@ func TestLifecycleRegistersCheckoutsWhileBuildsAreDeferred(t *testing.T) {
 	if err != nil || tracked.CatalogErr != nil {
 		t.Fatalf("register the primary while builds are deferred: %v / %v", err, tracked.CatalogErr)
 	}
+	if !tracked.Pending || tracked.TransitionID == "" {
+		t.Fatalf("registration = %+v, want a durable pending promotion", tracked)
+	}
+	if tracked.AlreadyTracked {
+		t.Fatal("a newly admitted pending promotion reported an already-tracked corpus")
+	}
+	if _, found, err := f.catalog.GetCheckoutRoute(ctx, tracked.CheckoutID); err != nil {
+		t.Fatalf("read route before build admission: %v", err)
+	} else if found {
+		t.Fatal("registration published a route before its immutable base was built")
+	}
 	report, err := f.lc.Sweep(ctx)
 	if err != nil {
-		t.Fatalf("sweep: %v", err)
+		t.Fatalf("sweep while builds are deferred: %v", err)
 	}
-	if report.Coordinators != 1 {
-		t.Fatalf("%d coordinators while builds are deferred, want the automatic worktree's 1", report.Coordinators)
+	if report.Coordinators != 0 {
+		t.Fatalf("%d coordinators while builds are deferred, want none without a ready route", report.Coordinators)
+	}
+
+	run := modeTransitionRunFor(t, f.lc, tracked.TransitionID)
+	gate.Open()
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	outcome, err := waitModeTransition(waitCtx, run)
+	if err != nil {
+		t.Fatalf("wait for admitted promotion: %v", err)
+	}
+	if outcome.err != nil {
+		t.Fatalf("admitted promotion: %v", outcome.err)
+	}
+	if outcome.promotion.Pending {
+		t.Fatalf("admitted promotion remained pending: %+v", outcome.promotion)
+	}
+
+	report, err = f.lc.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("sweep after build admission: %v", err)
+	}
+	if report.Coordinators != 2 {
+		t.Fatalf("%d coordinators after build admission, want dedicated primary plus automatic worktree", report.Coordinators)
 	}
 
 	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
@@ -230,13 +265,16 @@ func TestLifecycleRegistersCheckoutsWhileBuildsAreDeferred(t *testing.T) {
 		}
 	}
 	if automatic == nil {
-		t.Fatal("the observed worktree got no catalog identity while builds were deferred")
+		t.Fatal("the observed worktree got no catalog identity after build admission")
 	}
 	if automatic.State != store_sqlite.CheckoutStateReady {
 		t.Fatalf("the observed worktree is %q, want a ready identity", automatic.State)
 	}
 	if !f.lc.SignalCheckout(automatic.CheckoutID, "test") {
 		t.Fatal("the automatic checkout has no coordinator listening for signals")
+	}
+	if !f.lc.SignalCheckout(tracked.CheckoutID, "test") {
+		t.Fatal("the dedicated primary has no coordinator listening for signals")
 	}
 }
 

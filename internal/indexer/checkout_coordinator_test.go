@@ -1364,8 +1364,8 @@ func Untracked() {
 // The worktree here is deliberately never tracked. That is what makes it
 // automatic: the reconciler observes it in a family that has a primary
 // dedicated graph, mints an identity for it, and the lifecycle gives that
-// identity a coordinator. The primary, being dedicated, gets none — its view
-// is the corpus.
+// identity a coordinator. The route-owned dedicated primary keeps its own
+// coordinator as well, so its immutable base can be composed with live layers.
 func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
@@ -1383,8 +1383,8 @@ func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if report.Coordinators != 1 {
-		t.Fatalf("%d coordinators after observing one automatic worktree, want 1", report.Coordinators)
+	if report.Coordinators != 2 {
+		t.Fatalf("%d coordinators after observing one automatic worktree and its dedicated primary, want 2", report.Coordinators)
 	}
 
 	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
@@ -1412,8 +1412,8 @@ func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 	if !f.lc.SignalCheckout(automatic.CheckoutID, "test") {
 		t.Fatal("the automatic checkout has no coordinator listening for signals")
 	}
-	if f.lc.SignalCheckout(tracked.CheckoutID, "test") {
-		t.Fatal("the primary checkout grew a coordinator — its view is the corpus")
+	if !f.lc.SignalCheckout(tracked.CheckoutID, "test") {
+		t.Fatal("the route-owned primary has no coordinator listening for signals")
 	}
 
 	// A second sweep is idempotent: the coordinator that is already running is
@@ -1422,8 +1422,8 @@ func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second sweep: %v", err)
 	}
-	if again.Coordinators != 1 {
-		t.Fatalf("%d coordinators after a second sweep, want the same 1", again.Coordinators)
+	if again.Coordinators != 2 {
+		t.Fatalf("%d coordinators after a second sweep, want the same 2", again.Coordinators)
 	}
 
 	// The worktree leaves. The removal clock has to expire before the identity
@@ -1439,11 +1439,14 @@ func TestCheckoutLifecycleRunsACoordinatorPerAutomaticCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep after the grace: %v", err)
 	}
-	if gone.Coordinators != 0 {
-		t.Fatalf("%d coordinators survived the checkout they served", gone.Coordinators)
+	if gone.Coordinators != 1 {
+		t.Fatalf("%d coordinators after automatic checkout removal, want the dedicated primary only", gone.Coordinators)
 	}
 	if f.lc.SignalCheckout(automatic.CheckoutID, "test") {
 		t.Fatal("a coordinator is still listening for a checkout that is gone")
+	}
+	if !f.lc.SignalCheckout(tracked.CheckoutID, "test") {
+		t.Fatal("removing the automatic checkout also stopped the dedicated primary")
 	}
 }
 
