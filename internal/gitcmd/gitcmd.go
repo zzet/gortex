@@ -20,8 +20,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/zzet/gortex/internal/platform"
@@ -78,6 +80,18 @@ func currentSem() *semaphore.Weighted {
 // fmt.Errorf("git %s: %w: %s", args[0], err, bytes.TrimSpace(stderr)).
 // The captured stdout is always returned, even on error.
 func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return run(ctx, dir, nil, args...)
+}
+
+// RunNoLazy has Run's semaphore, context, output, and error contract, but
+// forces Git's local-only read environment. It is for plumbing that walks
+// immutable object graphs where a promisor lookup must fail locally instead
+// of fetching from a remote.
+func RunNoLazy(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return run(ctx, dir, noLazyGitEnv(), args...)
+}
+
+func run(ctx context.Context, dir string, env []string, args ...string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -98,6 +112,9 @@ func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
 		full = append([]string{"-C", dir}, args...)
 	}
 	cmd := exec.CommandContext(ctx, "git", full...)
+	if env != nil {
+		cmd.Env = env
+	}
 	platform.ConfigureBackgroundCommand(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -110,6 +127,35 @@ func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
 		return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", name, err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return stdout.Bytes(), nil
+}
+
+var fixedNoLazyGitEnv = []string{
+	"GIT_NO_LAZY_FETCH=1",
+	"GIT_TERMINAL_PROMPT=0",
+	"GIT_OPTIONAL_LOCKS=0",
+}
+
+func noLazyGitEnv() []string {
+	base := os.Environ()
+	env := make([]string, 0, len(base)+len(fixedNoLazyGitEnv))
+	for _, entry := range base {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && isFixedNoLazyGitEnvKey(key) {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, fixedNoLazyGitEnv...)
+}
+
+func isFixedNoLazyGitEnvKey(key string) bool {
+	for _, entry := range fixedNoLazyGitEnv {
+		fixedKey, _, _ := strings.Cut(entry, "=")
+		if key == fixedKey {
+			return true
+		}
+	}
+	return false
 }
 
 // Output is the one-shot convenience: it runs Run and returns

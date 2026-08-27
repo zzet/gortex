@@ -90,38 +90,111 @@ var _ ContentSource = (*GitTreeSource)(nil)
 // blob gives later, and for the same reason: the source cannot serve
 // content it does not have, and must not pretend the content is empty.
 func NewGitTreeSource(ctx context.Context, repoDir, treeOID string) (*GitTreeSource, error) {
-	if !oidPattern.MatchString(treeOID) {
-		return nil, fmt.Errorf("git tree source: %q is not a full hexadecimal object id", treeOID)
-	}
-	if strings.TrimSpace(repoDir) == "" {
-		return nil, errors.New("git tree source: empty repository directory")
-	}
-	abs, err := filepath.Abs(repoDir)
+	abs, resolved, err := resolveGitTreeOID(ctx, repoDir, treeOID)
 	if err != nil {
-		return nil, fmt.Errorf("git tree source: resolve %s: %w", repoDir, err)
-	}
-
-	out, err := runGit(ctx, abs, "rev-parse", "--verify", "--quiet", treeOID+"^{tree}")
-	if err != nil {
-		if gitExitCode(err) == 1 {
-			return nil, fmt.Errorf("git tree source: %s in %s: %w", treeOID, abs, ErrObjectMissing)
-		}
-		return nil, fmt.Errorf("git tree source: verify %s: %w", treeOID, err)
-	}
-	resolved := strings.TrimSpace(string(out))
-	if !oidPattern.MatchString(resolved) {
-		return nil, fmt.Errorf("git tree source: rev-parse returned %q for %s", resolved, treeOID)
+		return nil, err
 	}
 
 	listing, err := runGit(ctx, abs, "ls-tree", "-r", "-l", "-z", "--full-tree", resolved)
 	if err != nil {
-		return nil, fmt.Errorf("git tree source: list %s: %w", resolved, err)
+		missing, probeErr := gitTreeHasMissingObjects(ctx, abs, resolved, true)
+		switch {
+		case probeErr != nil:
+			return nil, fmt.Errorf("git tree source: list %s: %w (local missing-tree probe failed: %v)", resolved, err, probeErr)
+		case missing:
+			return nil, fmt.Errorf("git tree source: list %s: %w", resolved, ErrObjectMissing)
+		default:
+			return nil, fmt.Errorf("git tree source: list %s: %w", resolved, err)
+		}
 	}
 	order, entries, err := parseTreeListing(listing)
 	if err != nil {
 		return nil, fmt.Errorf("git tree source: list %s: %w", resolved, err)
 	}
 	return &GitTreeSource{repoDir: abs, treeOID: resolved, order: order, entries: entries}, nil
+}
+
+// VerifyGitTreeObjectsLocal proves that every tree and blob reachable from
+// treeOID is available in repoDir without allowing Git to lazily fetch a
+// promised object. It is intended for deciding whether a degraded immutable
+// generation may be rebuilt from local data.
+func VerifyGitTreeObjectsLocal(ctx context.Context, repoDir, treeOID string) error {
+	abs, resolved, err := resolveGitTreeOID(ctx, repoDir, treeOID)
+	if err != nil {
+		return err
+	}
+	missing, err := gitTreeHasMissingObjects(ctx, abs, resolved, false)
+	if err != nil {
+		return fmt.Errorf("git tree source: verify local object closure for %s: %w", resolved, err)
+	}
+	if missing {
+		return fmt.Errorf("git tree source: object closure for %s in %s: %w", resolved, abs, ErrObjectMissing)
+	}
+	return nil
+}
+
+func resolveGitTreeOID(ctx context.Context, repoDir, treeOID string) (string, string, error) {
+	if !oidPattern.MatchString(treeOID) {
+		return "", "", fmt.Errorf("git tree source: %q is not a full hexadecimal object id", treeOID)
+	}
+	if strings.TrimSpace(repoDir) == "" {
+		return "", "", errors.New("git tree source: empty repository directory")
+	}
+	abs, err := filepath.Abs(repoDir)
+	if err != nil {
+		return "", "", fmt.Errorf("git tree source: resolve %s: %w", repoDir, err)
+	}
+
+	out, err := runGit(ctx, abs, "rev-parse", "--verify", "--quiet", treeOID+"^{tree}")
+	if err != nil {
+		if gitExitCode(err) == 1 {
+			return "", "", fmt.Errorf("git tree source: %s in %s: %w", treeOID, abs, ErrObjectMissing)
+		}
+		missing, probeErr := gitTreeHasMissingObjects(ctx, abs, treeOID, true)
+		switch {
+		case probeErr != nil:
+			return "", "", fmt.Errorf("git tree source: verify %s: %w (local missing-tree probe failed: %v)", treeOID, err, probeErr)
+		case missing:
+			return "", "", fmt.Errorf("git tree source: %s in %s: %w", treeOID, abs, ErrObjectMissing)
+		default:
+			return "", "", fmt.Errorf("git tree source: verify %s: %w", treeOID, err)
+		}
+	}
+	resolved := strings.TrimSpace(string(out))
+	if !oidPattern.MatchString(resolved) {
+		return "", "", fmt.Errorf("git tree source: rev-parse returned %q for %s", resolved, treeOID)
+	}
+	return abs, resolved, nil
+}
+
+func gitTreeHasMissingObjects(ctx context.Context, repoDir, treeOID string, treesOnly bool) (bool, error) {
+	args := []string{"rev-list", "--objects", "--missing=print", "--no-object-names"}
+	if treesOnly {
+		args = append(args, "--filter=blob:none")
+	}
+	args = append(args, treeOID)
+	out, err := runGit(ctx, repoDir, args...)
+	if err != nil {
+		return false, err
+	}
+	return parseMissingObjectList(out)
+}
+
+func parseMissingObjectList(out []byte) (bool, error) {
+	missing := false
+	for _, line := range bytes.Split(out, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		if line[0] == '?' {
+			missing = true
+			line = line[1:]
+		}
+		if !oidPattern.Match(line) {
+			return false, fmt.Errorf("git rev-list returned malformed object id %q", line)
+		}
+	}
+	return missing, nil
 }
 
 // parseTreeListing parses `ls-tree -r -l -z` output.

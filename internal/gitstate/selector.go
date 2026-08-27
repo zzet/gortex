@@ -84,9 +84,12 @@ func resolveRefSelector(ctx context.Context, dir, ref string) (ResolvedSelector,
 	if err := checkViewRefName(ref); err != nil {
 		return ResolvedSelector{}, err
 	}
-	out, err := runLocalGit(ctx, dir, "show-ref", "--verify", "--", ref)
+	out, err := runLocalGit(ctx, dir, "rev-parse", "--verify", "--quiet", ref)
 	if err != nil {
-		return ResolvedSelector{}, fmt.Errorf("gitstate: ref %s in %s: %w", ref, dir, ErrRefNotAvailableLocally)
+		if localGitExitCode(err) == 1 {
+			return ResolvedSelector{}, fmt.Errorf("gitstate: ref %s in %s: %w", ref, dir, ErrRefNotAvailableLocally)
+		}
+		return ResolvedSelector{}, fmt.Errorf("gitstate: resolve ref %s in %s: %w", ref, dir, err)
 	}
 	oid, ok := firstField(out)
 	if !ok || !isOID(oid) || isZeroOID(oid) {
@@ -112,7 +115,14 @@ func resolveCommitSelector(ctx context.Context, dir, oid string) (ResolvedSelect
 	}
 	kind, err := objectType(ctx, dir, oid)
 	if err != nil {
-		return ResolvedSelector{}, fmt.Errorf("gitstate: commit %s in %s: %w", oid, dir, ErrRefNotAvailableLocally)
+		unavailable, probeErr := localObjectUnavailable(ctx, dir, oid)
+		if probeErr == nil && unavailable {
+			return ResolvedSelector{}, fmt.Errorf("gitstate: commit %s in %s: %w", oid, dir, ErrRefNotAvailableLocally)
+		}
+		if probeErr != nil {
+			return ResolvedSelector{}, fmt.Errorf("gitstate: inspect commit %s in %s: %w (local availability probe failed: %v)", oid, dir, err, probeErr)
+		}
+		return ResolvedSelector{}, fmt.Errorf("gitstate: inspect commit %s in %s: %w", oid, dir, err)
 	}
 	if kind != "commit" {
 		return ResolvedSelector{}, fmt.Errorf("gitstate: object %s is a %s: %w", oid, kind, ErrRefNotCommit)
@@ -136,7 +146,14 @@ func peelToCommit(ctx context.Context, dir, oid string) (string, error) {
 		return commit, nil
 	}
 	if _, typeErr := objectType(ctx, dir, oid); typeErr != nil {
-		return "", fmt.Errorf("object %s: %w", oid, ErrRefNotAvailableLocally)
+		unavailable, probeErr := localObjectUnavailable(ctx, dir, oid)
+		if probeErr == nil && unavailable {
+			return "", fmt.Errorf("object %s: %w", oid, ErrRefNotAvailableLocally)
+		}
+		if probeErr != nil {
+			return "", fmt.Errorf("inspect object %s: %w (local availability probe failed: %v)", oid, typeErr, probeErr)
+		}
+		return "", fmt.Errorf("inspect object %s: %w", oid, typeErr)
 	}
 	return "", fmt.Errorf("object %s: %w", oid, ErrRefNotCommit)
 }
@@ -147,7 +164,10 @@ func peelToCommit(ctx context.Context, dir, oid string) (string, error) {
 func treeOfCommit(ctx context.Context, dir, commit string) (string, error) {
 	tree, err := revParseOID(ctx, dir, commit+"^{tree}")
 	if err != nil {
-		return "", fmt.Errorf("tree of %s: %w", commit, ErrRefNotAvailableLocally)
+		if localGitExitCode(err) == 1 {
+			return "", fmt.Errorf("tree of %s: %w", commit, ErrRefNotAvailableLocally)
+		}
+		return "", fmt.Errorf("resolve tree of %s: %w", commit, err)
 	}
 	return tree, nil
 }
@@ -174,6 +194,17 @@ func objectType(ctx context.Context, dir, oid string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func localObjectUnavailable(ctx context.Context, dir, oid string) (bool, error) {
+	_, err := runLocalGit(ctx, dir, "cat-file", "-e", oid)
+	if err == nil {
+		return false, nil
+	}
+	if localGitExitCode(err) == 1 {
+		return true, nil
+	}
+	return false, err
 }
 
 // firstField returns the first whitespace-delimited field of git's output.
@@ -238,12 +269,44 @@ func checkViewRefName(ref string) error {
 // GIT_TERMINAL_PROMPT=0 keeps a credential prompt from blocking a daemon with
 // no terminal, and GIT_OPTIONAL_LOCKS=0 keeps these read-only commands off the
 // index lock.
+var fixedLocalGitEnv = []string{
+	"GIT_NO_LAZY_FETCH=1",
+	"GIT_TERMINAL_PROMPT=0",
+	"GIT_OPTIONAL_LOCKS=0",
+}
+
 func localGitEnv() []string {
-	return append(os.Environ(),
-		"GIT_NO_LAZY_FETCH=1",
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_OPTIONAL_LOCKS=0",
-	)
+	return localGitEnvFrom(os.Environ())
+}
+
+func localGitEnvFrom(base []string) []string {
+	env := make([]string, 0, len(base)+len(fixedLocalGitEnv))
+	for _, entry := range base {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && isFixedLocalGitEnvKey(key) {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, fixedLocalGitEnv...)
+}
+
+func isFixedLocalGitEnvKey(key string) bool {
+	for _, entry := range fixedLocalGitEnv {
+		fixedKey, _, _ := strings.Cut(entry, "=")
+		if key == fixedKey {
+			return true
+		}
+	}
+	return false
+}
+
+func localGitExitCode(err error) int {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
 }
 
 // runLocalGit runs one plumbing command in dir and returns its stdout.
@@ -261,6 +324,9 @@ func runLocalGit(ctx context.Context, dir string, args ...string) ([]byte, error
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return stdout.Bytes(), fmt.Errorf("git %s: %w", args[0], ctxErr)
+		}
 		return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", args[0], err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return stdout.Bytes(), nil

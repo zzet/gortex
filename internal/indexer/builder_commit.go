@@ -66,6 +66,9 @@ func (b *SparseGenerationBuilder) BuildCommitLayer(
 	if err != nil {
 		return 0, BuildReport{}, err
 	}
+	if err := source.VerifyGitTreeObjectsLocal(ctx, req.RepoDir, req.TargetTreeOID); err != nil {
+		return 0, BuildReport{}, fmt.Errorf("indexer: verify tree %s: %w", req.TargetTreeOID, err)
+	}
 	target, err := source.NewGitTreeSource(ctx, req.RepoDir, req.TargetTreeOID)
 	if err != nil {
 		return 0, BuildReport{}, fmt.Errorf("indexer: open tree %s: %w", req.TargetTreeOID, err)
@@ -141,8 +144,8 @@ func validGitOID(s string) bool {
 // gone and a path that is new, and a generation's masks speak about paths;
 // carrying the rename as one record would say nothing the two halves do not.
 func diffTreeChanges(ctx context.Context, repoDir, baseTree, targetTree string) ([]LayerPathChange, error) {
-	out, err := gitcmd.Run(ctx, repoDir,
-		"diff", "--name-status", "-M", "-C", "-z", baseTree, targetTree)
+	out, err := gitcmd.RunNoLazy(ctx, repoDir,
+		"diff", "--name-status", "--no-renames", "-z", baseTree, targetTree)
 	if err != nil {
 		return nil, fmt.Errorf("indexer: diff %s..%s in %s: %w", baseTree, targetTree, repoDir, err)
 	}

@@ -46,12 +46,36 @@ const stderrCap = 4 << 10
 // fetch to disable. GIT_TERMINAL_PROMPT=0 keeps a credential prompt
 // from blocking a daemon that has no terminal, and GIT_OPTIONAL_LOCKS=0
 // keeps read-only commands from taking index locks.
+var fixedGitEnv = []string{
+	"GIT_NO_LAZY_FETCH=1",
+	"GIT_TERMINAL_PROMPT=0",
+	"GIT_OPTIONAL_LOCKS=0",
+}
+
 func gitEnv() []string {
-	return append(os.Environ(),
-		"GIT_NO_LAZY_FETCH=1",
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_OPTIONAL_LOCKS=0",
-	)
+	return gitEnvFrom(os.Environ())
+}
+
+func gitEnvFrom(base []string) []string {
+	env := make([]string, 0, len(base)+len(fixedGitEnv))
+	for _, entry := range base {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && isFixedGitEnvKey(key) {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, fixedGitEnv...)
+}
+
+func isFixedGitEnvKey(key string) bool {
+	for _, entry := range fixedGitEnv {
+		fixedKey, _, _ := strings.Cut(entry, "=")
+		if key == fixedKey {
+			return true
+		}
+	}
+	return false
 }
 
 // runGit runs one plumbing command in dir and returns its stdout. On
@@ -70,6 +94,9 @@ func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return stdout.Bytes(), fmt.Errorf("git %s: %w", args[0], ctxErr)
+		}
 		return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", args[0], err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return stdout.Bytes(), nil
