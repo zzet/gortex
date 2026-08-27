@@ -313,7 +313,11 @@ func configureConnectionPool(db *sql.DB) {
 		maxOpen = sqliteMaxOpenConns
 	}
 	db.SetMaxOpenConns(maxOpen)
-	db.SetMaxIdleConns(sqliteMaxIdleConns)
+	maxIdle := sqliteMaxIdleConns
+	if sqliteStableReadPoolMode() {
+		maxIdle = maxOpen
+	}
+	db.SetMaxIdleConns(maxIdle)
 }
 
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
@@ -512,6 +516,9 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		if err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite open read pool: %w", err)
+		}
+		if sqliteStableReadPoolMode() {
+			log.Printf("store_sqlite: stable read-pool mode enabled; connection shedding disabled")
 		}
 	}
 

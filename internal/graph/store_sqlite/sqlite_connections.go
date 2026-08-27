@@ -50,6 +50,20 @@ func sqliteMmapBytes() int64 {
 	return int64(mb) << 20
 }
 
+// sqliteStableReadPoolMode is an operational escape hatch for hosts where
+// SQLite's WAL-index shared-memory mapping is unreliable while the read pool
+// sheds physical connections. It retains every bounded read connection once
+// opened while preserving the concurrency required by store iterators whose
+// callbacks perform nested reads.
+func sqliteStableReadPoolMode() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GORTEX_SQLITE_STABLE_READ_POOL"))) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 func sqlitePerConnectionPragmas() string {
 	return fmt.Sprintf("%s&_pragma=mmap_size(%d)", sqlitePerConnectionPragmasBase, sqliteMmapBytes())
 }
