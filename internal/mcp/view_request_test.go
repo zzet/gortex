@@ -323,6 +323,23 @@ func (v *viewStack) setWorktreeState(t *testing.T, state store_sqlite.CheckoutSt
 	}
 }
 
+// seedRetiredWorktreeGraph leaves the disappearing checkout's former
+// dedicated ownership row beside the surviving family primary. Its prefix is
+// intentionally absent from the live workspace: grace must scope the primary
+// corpus it will serve, not this stale owner.
+func (v *viewStack) seedRetiredWorktreeGraph(t *testing.T) {
+	t.Helper()
+	if err := v.store.Catalog().UpsertDedicatedGraph(context.Background(), store_sqlite.DedicatedGraph{
+		GraphID:         "graph-retired-worktree",
+		OwnerCheckoutID: viewTestWorktree,
+		RepoPrefix:      "repo@worktree",
+		FamilyID:        viewTestFamily,
+		State:           reconcile.GraphStateReady,
+	}); err != nil {
+		t.Fatalf("UpsertDedicatedGraph(retired worktree): %v", err)
+	}
+}
+
 // setPrimaryGraphState rewrites the primary base graph's readiness state.
 func (v *viewStack) setPrimaryGraphState(t *testing.T, state string) {
 	t.Helper()
@@ -577,6 +594,7 @@ func worktreeViewArgs() map[string]any {
 func TestRemovalGraceFallsBackForEligibleGraphSearchWithoutBuffers(t *testing.T) {
 	stack := newViewStack(t)
 	stack.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
+	stack.seedRetiredWorktreeGraph(t)
 
 	manager := daemon.NewOverlayManager(time.Hour)
 	stack.srv.SetOverlayManager(manager)
@@ -591,7 +609,7 @@ func TestRemovalGraceFallsBackForEligibleGraphSearchWithoutBuffers(t *testing.T)
 	}
 
 	var reader graph.Reader
-	res, err := stack.callWithView(t, stack.worktreeRoot, "search_symbols", worktreeViewArgs(),
+	res, err := stack.callWithView(t, stack.repoRoot, "search_symbols", worktreeViewArgs(),
 		func(ctx context.Context) (*mcplib.CallToolResult, error) {
 			prepared, overlay, err := stack.srv.prepareOverlayRequest(ctx)
 			if err != nil {
@@ -652,11 +670,12 @@ func TestGraceFallbackRequiresAReadyPrimary(t *testing.T) {
 func TestGraceWorktreeSelectorKeepsExactFileAndWriteRequestsStrict(t *testing.T) {
 	stack := newViewStack(t)
 	stack.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
+	stack.seedRetiredWorktreeGraph(t)
 
 	for _, tool := range []string{"get_symbol", "read_file", "search_ast", "get_diagnostics", "edit_file", "change_contract"} {
 		t.Run(tool, func(t *testing.T) {
 			ran := false
-			res, err := stack.callWithView(t, stack.worktreeRoot, tool, worktreeViewArgs(),
+			res, err := stack.callWithView(t, stack.repoRoot, tool, worktreeViewArgs(),
 				func(context.Context) (*mcplib.CallToolResult, error) {
 					ran = true
 					return mcplib.NewToolResultText(`{"ok":true}`), nil
@@ -669,6 +688,106 @@ func TestGraceWorktreeSelectorKeepsExactFileAndWriteRequestsStrict(t *testing.T)
 				t.Errorf("%s reached its handler during removal grace", tool)
 			}
 		})
+	}
+}
+
+func TestGraceWorktreeSelectorScopesPrimaryBeforeReadiness(t *testing.T) {
+	for _, primaryState := range []string{reconcile.GraphStateReady, "graph_building"} {
+		t.Run(primaryState, func(t *testing.T) {
+			stack := newViewStack(t)
+			stack.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
+			stack.seedRetiredWorktreeGraph(t)
+			stack.setPrimaryGraphState(t, primaryState)
+
+			ran := false
+			res, err := stack.callWithView(t, stack.otherRoot, "search_symbols", worktreeViewArgs(),
+				func(context.Context) (*mcplib.CallToolResult, error) {
+					ran = true
+					return mcplib.NewToolResultText(`{"ok":true}`), nil
+				})
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			assertToolError(t, res, graphview.CodeSelectorOutOfScope)
+			if ran {
+				t.Error("foreign-scope grace selector reached its handler")
+			}
+		})
+	}
+}
+
+func BenchmarkGraceWorktreeSelectorPrimaryFallback(b *testing.B) {
+	store, err := store_sqlite.Open(filepath.Join(b.TempDir(), "grace-selector.sqlite"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	catalog := store.Catalog()
+	const (
+		familyID         = "bench-grace-family"
+		primaryCheckout  = "bench-grace-primary"
+		worktreeCheckout = "bench-grace-worktree"
+		primaryGraph     = "bench-grace-graph"
+	)
+	if err := catalog.UpsertRepositoryFamily(ctx, store_sqlite.RepositoryFamily{
+		FamilyID: familyID, CommonDirIdentity: "bench-grace-common", State: "family_ready",
+		CreatedAt: 1, LastSeen: 1,
+	}); err != nil {
+		b.Fatal(err)
+	}
+	for _, checkout := range []store_sqlite.Checkout{
+		{
+			CheckoutID: primaryCheckout, Incarnation: "bench-primary-inc", FamilyID: familyID,
+			RootPath: "/bench/primary", GitDir: "/bench/.git", AdminName: "main",
+			State: store_sqlite.CheckoutStateReady, DesiredMode: store_sqlite.CheckoutModeDedicated,
+			EffectiveMode: store_sqlite.CheckoutModeDedicated, LastSeen: 1,
+		},
+		{
+			CheckoutID: worktreeCheckout, Incarnation: "bench-worktree-inc", FamilyID: familyID,
+			RootPath: "/bench/worktree", GitDir: "/bench/.git/worktrees/worktree", AdminName: "worktree",
+			State: store_sqlite.CheckoutStateRemovalGrace, DesiredMode: store_sqlite.CheckoutModeAutomatic,
+			EffectiveMode: store_sqlite.CheckoutModeAutomatic, LastSeen: 1,
+		},
+	} {
+		if err := catalog.UpsertCheckout(ctx, checkout); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for _, dedicated := range []store_sqlite.DedicatedGraph{
+		{
+			GraphID: primaryGraph, OwnerCheckoutID: primaryCheckout, RepoPrefix: "bench-primary",
+			FamilyID: familyID, IsPrimaryBase: true, State: reconcile.GraphStateReady,
+		},
+		{
+			GraphID: "bench-retired-graph", OwnerCheckoutID: worktreeCheckout,
+			RepoPrefix: "bench-retired", FamilyID: familyID, State: reconcile.GraphStateReady,
+		},
+	} {
+		if err := catalog.UpsertDedicatedGraph(ctx, dedicated); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	engine := query.NewEngine(store)
+	srv := NewServer(engine, store, nil, nil, zap.NewNop(), nil, MultiRepoOptions{})
+	srv.SetMaterializer(&graphview.Materializer{
+		Store: store, Catalog: catalog, Leases: graphview.NewLeaseManager(),
+	})
+	selector := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: worktreeCheckout}
+	policy := requestViewPolicy{allowGraceBaseFallback: true}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		view, err := srv.viewForWorktreeSelector(ctx, selector, policy)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if view == nil || view.rider == nil || !view.suppressBufferOverlay {
+			b.Fatalf("grace selector returned %+v", view)
+		}
+		view.close()
 	}
 }
 

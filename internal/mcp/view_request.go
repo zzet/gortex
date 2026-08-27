@@ -571,20 +571,37 @@ func (s *Server) viewForWorktreeSelector(
 		return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("checkout %q is not registered", selector.CheckoutID))
 	}
-	if err := s.checkoutInSessionScope(ctx, checkout); err != nil {
-		return nil, err
-	}
 	if checkout.State != store_sqlite.CheckoutStateReady {
 		stateErr := graphview.NewViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("checkout %q is %s", checkout.CheckoutID, string(checkout.State)))
-		if !policy.allowGraceBaseFallback || !checkoutStateAllowsBaseFallback(checkout.State) {
-			return nil, stateErr
+		if checkoutStateAllowsBaseFallback(checkout.State) {
+			// The disappeared checkout may still own a dedicated graph row whose
+			// repository prefix is no longer in the live workspace. Grace serves
+			// the surviving family primary, so scope that answer by the primary
+			// rather than by stale checkout ownership before applying policy.
+			primary, primaryErr := s.familyPrimaryRegistration(ctx, checkout.FamilyID)
+			if primaryErr != nil {
+				return nil, primaryErr
+			}
+			if err := s.repoPrefixInSessionScope(ctx, primary.RepoPrefix, checkout.CheckoutID); err != nil {
+				return nil, err
+			}
+			if primary.State != reconcile.GraphStateReady {
+				return nil, graphview.NewViewError(graphview.CodePrimaryNotReady,
+					fmt.Sprintf("primary graph %q is %s", primary.GraphID, primary.State))
+			}
+			if !policy.allowGraceBaseFallback {
+				return nil, stateErr
+			}
+			return graceBaseFallback(selector, checkout, primary)
 		}
-		primary, primaryErr := s.familyPrimary(ctx, checkout.FamilyID)
-		if primaryErr != nil {
-			return nil, primaryErr
+		if err := s.checkoutInSessionScope(ctx, checkout); err != nil {
+			return nil, err
 		}
-		return graceBaseFallback(selector, checkout, primary)
+		return nil, stateErr
+	}
+	if err := s.checkoutInSessionScope(ctx, checkout); err != nil {
+		return nil, err
 	}
 	if _, err := s.familyPrimary(ctx, checkout.FamilyID); err != nil {
 		return nil, err
@@ -754,20 +771,30 @@ func (s *Server) viewFamilies(ctx context.Context) []string {
 // Automatic routes and grace fallbacks share this invariant: naming a primary
 // row is not enough when its graph cannot truthfully answer yet.
 func (s *Server) familyPrimary(ctx context.Context, familyID string) (store_sqlite.DedicatedGraph, error) {
+	primary, err := s.familyPrimaryRegistration(ctx, familyID)
+	if err != nil {
+		return store_sqlite.DedicatedGraph{}, err
+	}
+	if primary.State != reconcile.GraphStateReady {
+		return store_sqlite.DedicatedGraph{}, graphview.NewViewError(graphview.CodePrimaryNotReady,
+			fmt.Sprintf("primary graph %q is %s", primary.GraphID, primary.State))
+	}
+	return primary, nil
+}
+
+// familyPrimaryRegistration resolves primary identity without revealing its
+// readiness. Grace selectors first scope this registration's repository, then
+// report readiness only to sessions allowed to observe that primary.
+func (s *Server) familyPrimaryRegistration(ctx context.Context, familyID string) (store_sqlite.DedicatedGraph, error) {
 	graphs, err := s.materializer.Catalog.ListDedicatedGraphs(ctx, familyID)
 	if err != nil {
 		return store_sqlite.DedicatedGraph{}, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("list the graphs of family %q", familyID), err)
 	}
 	for _, dedicated := range graphs {
-		if !dedicated.IsPrimaryBase {
-			continue
+		if dedicated.IsPrimaryBase {
+			return dedicated, nil
 		}
-		if dedicated.State != reconcile.GraphStateReady {
-			return store_sqlite.DedicatedGraph{}, graphview.NewViewError(graphview.CodePrimaryNotReady,
-				fmt.Sprintf("primary graph %q is %s", dedicated.GraphID, dedicated.State))
-		}
-		return dedicated, nil
 	}
 	return store_sqlite.DedicatedGraph{}, graphview.NewViewError(graphview.CodeNoPrimary,
 		fmt.Sprintf("family %q has no primary base graph", familyID))
