@@ -995,3 +995,118 @@ func TestRefViewRecordsAnUnresolvableSelector(t *testing.T) {
 		t.Fatalf("a failed selection built %d generations: %+v", len(generations), generations)
 	}
 }
+
+// TestRefViewActiveGenerationSurvivesSourceWithdrawal pins the distinction
+// between continuing to serve an existing structural route and binding a new
+// route to a cached generation. Losing source.snapshot must not invalidate the
+// active graph, but a new ref view cannot adopt that source-incomplete payload.
+func TestRefViewActiveGenerationSurvivesSourceWithdrawal(t *testing.T) {
+	f := newRefViewFixture(t)
+	commitB, _ := f.commitTree(builderTreeB(), "B")
+	f.setRef("refs/heads/feature", commitB)
+	f.setRef("refs/heads/source-incomplete-alias", commitB)
+
+	var builds atomic.Int64
+	manager := f.manager(t, func() { builds.Add(1) })
+	ctx := context.Background()
+
+	first, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	if err != nil {
+		t.Fatalf("build the first view: %v", err)
+	}
+	if !first.Built || first.State != store_sqlite.RefViewReady || first.GenerationID == 0 {
+		t.Fatalf("first selection = %+v, want a newly built ready generation", first)
+	}
+	if err := f.catalog.WithdrawProducer(ctx, first.GenerationID, commitLayerSourceSnapshotCapability, "test: source object pruned"); err != nil {
+		t.Fatalf("withdraw source.snapshot: %v", err)
+	}
+
+	same, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	if err != nil {
+		t.Fatalf("serve the active view after source withdrawal: %v", err)
+	}
+	if same.Built || same.State != store_sqlite.RefViewReady || same.GenerationID != first.GenerationID {
+		t.Fatalf("selection after withdrawal = %+v, want active generation %d without a build", same, first.GenerationID)
+	}
+	if view := f.view(first.RefViewID); view.ActiveGenerationID != first.GenerationID {
+		t.Fatalf("active view after withdrawal = %+v, want generation %d unchanged", view, first.GenerationID)
+	}
+	if n := builds.Load(); n != 1 {
+		t.Fatalf("%d build passes ran while reusing the active structural view, want one", n)
+	}
+
+	alias, err := manager.EnsureRefView(ctx, f.request("refs/heads/source-incomplete-alias"))
+	if err != nil {
+		t.Fatalf("build an alias after source withdrawal: %v", err)
+	}
+	if !alias.Built || alias.State != store_sqlite.RefViewReady || alias.GenerationID == first.GenerationID {
+		t.Fatalf("alias selection = %+v, want a new source-complete generation instead of cached generation %d", alias, first.GenerationID)
+	}
+	if n := builds.Load(); n != 2 {
+		t.Fatalf("%d build passes ran, want the initial build and the source-safe alias build", n)
+	}
+}
+
+func BenchmarkRefViewCurrentReadyGeneration(b *testing.B) {
+	for _, tc := range []struct {
+		name     string
+		withdraw bool
+	}{
+		{name: "source-complete"},
+		{name: "source-unavailable", withdraw: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			f := newRefViewFixture(b)
+			commitB, _ := f.commitTree(builderTreeB(), "B")
+			f.setRef("refs/heads/feature", commitB)
+
+			var builds atomic.Int64
+			manager := f.manager(b, func() { builds.Add(1) })
+			ctx := context.Background()
+			first, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+			if err != nil {
+				b.Fatalf("build the benchmark view: %v", err)
+			}
+			if tc.withdraw {
+				if err := f.catalog.WithdrawProducer(ctx, first.GenerationID, commitLayerSourceSnapshotCapability, "benchmark: source object pruned"); err != nil {
+					b.Fatalf("withdraw source.snapshot: %v", err)
+				}
+			}
+			view := f.view(first.RefViewID)
+
+			b.Run("activeIsCurrent", func(b *testing.B) {
+				before := builds.Load()
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					current, err := manager.activeIsCurrent(ctx, view, view.ActiveBuildFingerprint)
+					if err != nil {
+						b.Fatalf("activeIsCurrent: %v", err)
+					}
+					if !current {
+						b.Fatal("ready active generation reported stale")
+					}
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(builds.Load()-before)/float64(b.N), "builds/op")
+			})
+
+			b.Run("EnsureRefView", func(b *testing.B) {
+				before := builds.Load()
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					result, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+					if err != nil {
+						b.Fatalf("EnsureRefView: %v", err)
+					}
+					if result.Built || result.GenerationID != first.GenerationID {
+						b.Fatalf("ready selection = %+v, want generation %d without a build", result, first.GenerationID)
+					}
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(builds.Load()-before)/float64(b.N), "builds/op")
+			})
+		})
+	}
+}

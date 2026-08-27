@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -590,17 +591,44 @@ func TestRefViewPrunedObjectWithdrawsTheSourceCapability(t *testing.T) {
 	}
 
 	// The graph half still answers out of rows the generation already holds.
-	var found bool
-	if _, err := stack.call(t, "get_symbol", refSelector("git_ref", "refs/heads/feature"), nil,
+	// Keep enough request evidence to distinguish selection refusal, a wrongly
+	// bound view, and genuine graph-data loss when this invariant regresses.
+	var (
+		found          bool
+		handlerReached bool
+		boundLayers    string
+		boundRider     string
+	)
+	graphResult, graphErr := stack.call(t, "get_symbol", refSelector("git_ref", "refs/heads/feature"), nil,
 		func(ctx context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+			handlerReached = true
+			view := requestViewFromContext(ctx)
+			boundLayers = fmt.Sprintf("%+v", view.candidateLayers())
+			boundRider = fmt.Sprintf("%+v", view.rider)
 			sg := stack.srv.engineFor(ctx).GetFileSymbols("repo/added.go")
 			found = sg != nil && len(sg.Nodes) > 0
 			return mcplib.NewToolResultText(`{"ok":true}`), nil
-		}); err != nil {
-		t.Fatalf("call: %v", err)
+		})
+	if graphErr != nil {
+		t.Fatalf("post-withdrawal get_symbol failed: error=%v result=%+v rider=%s layers=%s",
+			graphErr, graphResult, boundRider, boundLayers)
+	}
+	if !handlerReached {
+		t.Fatalf("post-withdrawal get_symbol was refused before its handler: result=%+v rider=%s layers=%s",
+			graphResult, boundRider, boundLayers)
+	}
+	responseRider := resultFreshness(t, graphResult)
+	if responseRider["exact"] != true || responseRider["resolved_tree"] != stack.featureTree {
+		t.Fatalf("post-withdrawal get_symbol bound the wrong view: rider=%+v request_rider=%s layers=%s result=%+v",
+			responseRider, boundRider, boundLayers, graphResult)
+	}
+	if got := stack.refViewGeneration(t); got != generationID {
+		t.Fatalf("post-withdrawal get_symbol replaced generation %d with %d: rider=%+v layers=%s result=%+v",
+			generationID, got, responseRider, boundLayers, graphResult)
 	}
 	if !found {
-		t.Error("the graph stopped answering after a source withdrawal")
+		t.Fatalf("the exact ref view reached get_symbol but its graph lost repo/added.go: rider=%+v layers=%s result=%+v",
+			responseRider, boundLayers, graphResult)
 	}
 }
 
