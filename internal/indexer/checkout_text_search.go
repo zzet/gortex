@@ -144,9 +144,18 @@ func (c *CheckoutCoordinator) releaseTextSearcher() {
 // The bytes still come from the checkout root, so the answer is about the right
 // working copy; what it cannot yet see is a path only the layers know about.
 func (c *CheckoutCoordinator) textCorpus(ctx context.Context) ([]string, error) {
-	rows, err := c.store.AtGeneration(0).FileMetasForRepo(c.repoPrefix)
+	base, err := c.primaryBase(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("indexer: read the base file inventory of %q: %w", c.repoPrefix, err)
+		return nil, fmt.Errorf("indexer: resolve the base file inventory of %q: %w", c.repoPrefix, err)
+	}
+	rows, err := c.store.AtGeneration(base.generationID).FileMetasForRepo(c.repoPrefix)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"indexer: read the base file inventory of %q at generation %d: %w",
+			c.repoPrefix,
+			base.generationID,
+			err,
+		)
 	}
 	paths := make(map[string]struct{}, len(rows))
 	for _, row := range rows {

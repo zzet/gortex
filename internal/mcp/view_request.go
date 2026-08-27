@@ -513,9 +513,9 @@ func (s *Server) selectRequestView(
 // viewForSessionCWD binds the session's working directory to a registered
 // checkout and routes the request to that checkout's composed view.
 //
-// Only an automatic checkout is routed here. A dedicated checkout and the
-// family's primary are served from the indexed corpus, which is exactly what
-// the base path already does for them.
+// A ready checkout is routed here whenever its view owns materialized
+// generations. Exact-HEAD dedicated graphs and automatic overlays both use
+// route-owned commit and dirty generations.
 func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 	cwd := SessionCWDFromContext(ctx)
 	if cwd == "" {
@@ -533,7 +533,15 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 		}
 		return viewFallback(false, graphview.NewViewRider(graphview.Selector{Kind: graphview.SelectorAuto}), err)
 	}
-	if !found || !graphview.ServesAutomaticView(checkout) {
+	if !found || checkout.State != store_sqlite.CheckoutStateReady {
+		return nil, nil
+	}
+	switch checkout.EffectiveMode {
+	case store_sqlite.CheckoutModeAutomatic, store_sqlite.CheckoutModeDedicated:
+		// Both modes have route-owned generations. Dedicated checkouts used to
+		// live directly in the legacy base corpus, but exact-HEAD anchoring now
+		// gives them a materialized route just like automatic worktrees.
+	default:
 		return nil, nil
 	}
 	requested := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID}
@@ -695,11 +703,29 @@ func viewFallback(strict bool, rider *graphview.ViewRider, err error) (*requestV
 	return &requestView{rider: rider}, nil
 }
 
-// viewFamilies lists the checkout families the indexed corpus reaches, one
-// per repository prefix it carries. The catalog indexes checkouts by family,
-// so this is what turns a working directory into a checkout row.
+// viewFamilies lists the checkout families in the live catalog. The graph can
+// predate checkout discovery, so its repository-prefix snapshot is only a
+// compatibility fallback for stores without family catalog rows.
 func (s *Server) viewFamilies(ctx context.Context) []string {
-	if s.graph == nil {
+	if s.materializer != nil && s.materializer.Catalog != nil {
+		families, err := s.materializer.Catalog.ListRepositoryFamilies(ctx)
+		if err == nil {
+			out := make([]string, 0, len(families))
+			for _, family := range families {
+				if family.FamilyID != "" {
+					out = append(out, family.FamilyID)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+
+	// Old stores can have indexed prefixes without family catalog rows. Keep
+	// this compatibility path off the normal request path: current stores use
+	// the authoritative, ordered family catalog above in one query.
+	if s.graph == nil || s.materializer == nil || s.materializer.Catalog == nil {
 		return nil
 	}
 	prefixes := s.graph.RepoPrefixes()

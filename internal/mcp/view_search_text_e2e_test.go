@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -121,6 +122,110 @@ func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
 	}
 	stack.checkoutID = stack.awaitRoutedCheckout(t)
 	return stack
+}
+
+func newViewFamiliesCatalogServer(tb testing.TB) (*Server, *indexer.MultiIndexer, *store_sqlite.Store) {
+	tb.Helper()
+	base := tb.TempDir()
+	store, err := store_sqlite.Open(filepath.Join(base, "store.sqlite"))
+	if err != nil {
+		tb.Fatalf("open catalog store: %v", err)
+	}
+	tb.Cleanup(func() { _ = store.Close() })
+
+	cfgPath := filepath.Join(base, "config.yaml")
+	gc := &config.GlobalConfig{}
+	gc.SetConfigPath(cfgPath)
+	if err := gc.Save(); err != nil {
+		tb.Fatalf("save empty catalog config: %v", err)
+	}
+	cm, err := config.NewConfigManager(cfgPath)
+	if err != nil {
+		tb.Fatalf("build catalog config manager: %v", err)
+	}
+
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	mi := indexer.NewMultiIndexer(store, reg, search.NewNull(), cm, zap.NewNop())
+	tb.Cleanup(func() { _ = mi.Close(context.Background()) })
+	eng := query.NewEngine(store)
+	srv := NewServer(eng, store, nil, nil, zap.NewNop(), nil, MultiRepoOptions{MultiIndexer: mi})
+	srv.SetMaterializer(&graphview.Materializer{
+		Store: store, Catalog: store.Catalog(), Leases: graphview.NewLeaseManager(),
+	})
+	return srv, mi, store
+}
+
+func upsertViewFamily(tb testing.TB, store *store_sqlite.Store, familyID string) {
+	tb.Helper()
+	now := time.Now().Unix()
+	if err := store.Catalog().UpsertRepositoryFamily(context.Background(), store_sqlite.RepositoryFamily{
+		FamilyID:          familyID,
+		CommonDirIdentity: filepath.Join(os.TempDir(), familyID+".git"),
+		State:             "family_ready",
+		CreatedAt:         now,
+		LastSeen:          now,
+	}); err != nil {
+		tb.Fatalf("upsert repository family %q: %v", familyID, err)
+	}
+}
+
+func requireViewFamilyIDs(tb testing.TB, got []string, want ...string) {
+	tb.Helper()
+	gotSet := make(map[string]struct{}, len(got))
+	for _, familyID := range got {
+		gotSet[familyID] = struct{}{}
+	}
+	if len(gotSet) != len(want) {
+		tb.Fatalf("view families = %v, want exactly %v", got, want)
+	}
+	for _, familyID := range want {
+		if _, found := gotSet[familyID]; !found {
+			tb.Fatalf("view families = %v, missing %q", got, familyID)
+		}
+	}
+}
+
+func TestViewFamiliesUsesCatalogBeforeRepoPrefixes(t *testing.T) {
+	srv, mi, store := newViewFamiliesCatalogServer(t)
+	if prefixes := mi.RepoPrefixes(); len(prefixes) != 0 {
+		t.Fatalf("new graph already has repo prefixes: %v", prefixes)
+	}
+
+	upsertViewFamily(t, store, "family-catalog-first")
+	requireViewFamilyIDs(t, srv.viewFamilies(context.Background()), "family-catalog-first")
+
+	// Re-read after another family arrives: the server must query the catalog,
+	// not cache the set captured when it was constructed or first called.
+	upsertViewFamily(t, store, "family-catalog-later")
+	requireViewFamilyIDs(t, srv.viewFamilies(context.Background()),
+		"family-catalog-first", "family-catalog-later")
+}
+
+func BenchmarkViewFamiliesCatalog(b *testing.B) {
+	for _, familyCount := range []int{1, 10, 100} {
+		b.Run(fmt.Sprintf("families=%d", familyCount), func(b *testing.B) {
+			srv, mi, store := newViewFamiliesCatalogServer(b)
+			if prefixes := mi.RepoPrefixes(); len(prefixes) != 0 {
+				b.Fatalf("new graph already has repo prefixes: %v", prefixes)
+			}
+			for i := 0; i < familyCount; i++ {
+				upsertViewFamily(b, store, fmt.Sprintf("family-bench-%03d", i))
+			}
+			ctx := context.Background()
+			if got := srv.viewFamilies(ctx); len(got) != familyCount {
+				b.Fatalf("warm view families count = %d, want %d", len(got), familyCount)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if got := srv.viewFamilies(ctx); len(got) != familyCount {
+					b.Fatalf("view families count = %d, want %d", len(got), familyCount)
+				}
+			}
+		})
+	}
 }
 
 // awaitRoutedCheckout waits for the worktree to become a checkout with a route
