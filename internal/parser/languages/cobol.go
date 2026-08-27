@@ -14,8 +14,15 @@ import (
 // area A) and the PERFORM / GO TO control-flow edges between them, which
 // form the intra-program call graph.
 var (
-	cobolProgIDRe  = regexp.MustCompile(`(?im)^\s*PROGRAM-ID\.\s*(\w[\w-]*)`)
-	cobolDivRe     = regexp.MustCompile(`(?im)^\s*([A-Z][\w-]*)\s+DIVISION\.`)
+	cobolProgIDRe = regexp.MustCompile(`(?im)^\s*PROGRAM-ID\.\s*(\w[\w-]*)`)
+	// A division header ends at a word boundary, not at a period: the
+	// PROCEDURE DIVISION takes an optional USING / CHAINING / RETURNING
+	// phrase, so the period lands after the parameter list --
+	// `PROCEDURE DIVISION USING LK-PARM.`. Requiring `DIVISION\.` missed
+	// every such header, and since extractProcedure gates on this regex to
+	// set inProcedure, the whole procedure division was skipped: no
+	// paragraphs, no PERFORM edges, no GO TO edges.
+	cobolDivRe     = regexp.MustCompile(`(?im)^\s*([A-Z][\w-]*)\s+DIVISION\b`)
 	cobolSectionRe = regexp.MustCompile(`(?im)^\s*([A-Z][\w-]*)\s+SECTION\.`)
 	cobolCallRe    = regexp.MustCompile(`(?im)\bCALL\s+["']([^"']+)["']`)
 	cobolCopyRe    = regexp.MustCompile(`(?im)\bCOPY\s+(\w[\w-]*)`)

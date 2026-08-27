@@ -106,6 +106,84 @@ func TestCobolExtractor_Paragraphs(t *testing.T) {
 	assert.True(t, goToEdge, "EdgeCalls MAIN-PARA -> EXIT-PARA (GO TO)")
 }
 
+func TestCobolExtractor_ProcedureDivisionUsing(t *testing.T) {
+	// A PROCEDURE DIVISION that takes parameters puts the period after the
+	// parameter list, not after DIVISION. Every fixture above uses the bare
+	// `PROCEDURE DIVISION.`, which is why a regex anchored on `DIVISION\.`
+	// passed its tests while skipping the procedure division of real
+	// programs -- and with it every paragraph and PERFORM edge.
+	src := []byte(`       IDENTIFICATION DIVISION.
+       PROGRAM-ID. USINGDEMO.
+       DATA DIVISION.
+       LINKAGE SECTION.
+       01  LK-PARM              PIC X(8).
+       PROCEDURE DIVISION USING LK-PARM.
+       0001-MAIN.
+           PERFORM 0002-WORK.
+       0002-WORK.
+           STOP RUN.
+`)
+	e := NewCobolExtractor()
+	res, err := e.Extract("USING.cob", src)
+	require.NoError(t, err)
+
+	var gotProcDiv bool
+	paras := map[string]bool{}
+	for _, n := range res.Nodes {
+		if n.Name == "PROCEDURE-DIVISION" {
+			gotProcDiv = true
+		}
+		if n.Kind == graph.KindFunction && n.Meta != nil && n.Meta["cobol_kind"] == "paragraph" {
+			paras[n.Name] = true
+		}
+	}
+	assert.True(t, gotProcDiv, "PROCEDURE-DIVISION node for a USING header")
+	assert.True(t, paras["0001-MAIN"], "paragraph after a USING header")
+	assert.True(t, paras["0002-WORK"], "second paragraph after a USING header")
+
+	var performEdge bool
+	for _, ed := range res.Edges {
+		if ed.Kind == graph.EdgeCalls &&
+			ed.From == "USING.cob::0001-MAIN" && ed.To == "USING.cob::0002-WORK" {
+			performEdge = true
+		}
+	}
+	assert.True(t, performEdge, "EdgeCalls 0001-MAIN -> 0002-WORK (PERFORM)")
+}
+
+func TestCobolExtractor_DivisionWordBoundary(t *testing.T) {
+	// `DIVISION\b` must not turn a data name containing DIVISION into a
+	// division header. WS-DIVISION-ID is a field, and DIVISIONS is not
+	// DIVISION.
+	src := []byte(`       IDENTIFICATION DIVISION.
+       PROGRAM-ID. BOUNDARY.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-DIVISION-ID       PIC X(3).
+       01  WS-DIVISIONS-COUNT   PIC 9(2).
+       PROCEDURE DIVISION.
+       0001-MAIN.
+           MOVE 'A' TO WS-DIVISION-ID.
+           STOP RUN.
+`)
+	e := NewCobolExtractor()
+	res, err := e.Extract("BOUND.cob", src)
+	require.NoError(t, err)
+
+	divs := map[string]bool{}
+	for _, n := range res.Nodes {
+		if n.Kind == graph.KindType {
+			divs[n.Name] = true
+		}
+	}
+	assert.True(t, divs["PROCEDURE-DIVISION"])
+	assert.True(t, divs["DATA-DIVISION"])
+	assert.False(t, divs["WS-DIVISIONS-COUNT-DIVISION"], "DIVISIONS is not DIVISION")
+	for name := range divs {
+		assert.NotContains(t, name, "WS-", "no data name became a division header")
+	}
+}
+
 func TestCobolExtractor_PerformThru(t *testing.T) {
 	src := []byte(`       PROGRAM-ID. THRUDEMO.
        PROCEDURE DIVISION.
