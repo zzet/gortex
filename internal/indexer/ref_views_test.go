@@ -39,7 +39,7 @@ import (
 // database writes for itself.
 
 type refViewFixture struct {
-	t *testing.T
+	t testing.TB
 
 	store   *store_sqlite.Store
 	catalog *store_sqlite.Catalog
@@ -56,7 +56,7 @@ type refViewFixture struct {
 	treeA string
 }
 
-func newRefViewFixture(t *testing.T) *refViewFixture {
+func newRefViewFixture(t testing.TB) *refViewFixture {
 	t.Helper()
 	builderIsolateGit(t)
 
@@ -163,7 +163,7 @@ func (f *refViewFixture) setRef(ref, oid string) {
 	builderGit(f.t, f.repo, "update-ref", ref, oid)
 }
 
-func (f *refViewFixture) manager(t *testing.T, barrier func()) *RefViewManager {
+func (f *refViewFixture) manager(t testing.TB, barrier func()) *RefViewManager {
 	t.Helper()
 	return f.managerTuned(t, barrier, nil)
 }
@@ -171,7 +171,7 @@ func (f *refViewFixture) manager(t *testing.T, barrier func()) *RefViewManager {
 // managerTuned builds a manager whose build timings the caller may narrow.
 // The production windows are minutes wide, which is exactly what a test that
 // drives them cannot wait for.
-func (f *refViewFixture) managerTuned(t *testing.T, barrier func(), tune func(*RefViewManagerConfig)) *RefViewManager {
+func (f *refViewFixture) managerTuned(t testing.TB, barrier func(), tune func(*RefViewManagerConfig)) *RefViewManager {
 	t.Helper()
 	cfg := RefViewManagerConfig{
 		Store:        f.store,
@@ -292,6 +292,7 @@ func TestRefViewBuildsOnceAndReusesThePayload(t *testing.T) {
 	f := newRefViewFixture(t)
 	commitB, treeB := f.commitTree(builderTreeB(), "B")
 	f.setRef("refs/heads/feature", commitB)
+	f.setRef("refs/heads/canceled-alias", commitB)
 
 	var builds atomic.Int64
 	manager := f.manager(t, func() { builds.Add(1) })
@@ -468,6 +469,7 @@ func TestRefViewBuildOutlivesACanceledRequest(t *testing.T) {
 	f := newRefViewFixture(t)
 	commitB, treeB := f.commitTree(builderTreeB(), "B")
 	f.setRef("refs/heads/feature", commitB)
+	f.setRef("refs/heads/canceled-alias", commitB)
 	viewID := f.viewID("refs/heads/feature")
 
 	parked, release := make(chan struct{}), make(chan struct{})
@@ -530,6 +532,13 @@ func TestRefViewBuildOutlivesACanceledRequest(t *testing.T) {
 	}
 	if view := f.view(viewID); view.ActiveGenerationID != next.GenerationID {
 		t.Fatalf("ref view = %+v, want it serving generation %d", view, next.GenerationID)
+	}
+	alias, err := manager.EnsureRefView(context.Background(), f.request("refs/heads/canceled-alias"))
+	if err != nil {
+		t.Fatalf("alias selection after canceled request: %v", err)
+	}
+	if alias.Built || alias.GenerationID != next.GenerationID {
+		t.Fatalf("alias = %+v, want cached winner %d without another build", alias, next.GenerationID)
 	}
 	if generations := f.generations(); len(generations) != 1 {
 		t.Fatalf("%d generations, want the detached build's one: %+v", len(generations), generations)
@@ -734,8 +743,8 @@ func TestRefViewReclaimedBuildDoesNotPublish(t *testing.T) {
 		t.Fatalf("a reclaimed pass published its generation: %+v", view)
 	}
 	generations := f.generations()
-	if len(generations) != 1 || generations[0].State != store_sqlite.ViewGenerationSuperseded {
-		t.Fatalf("generations = %+v, want the reclaimed pass's one superseded", generations)
+	if len(generations) != 1 || generations[0].State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("generations = %+v, want the reclaimed pass's shared candidate kept ready", generations)
 	}
 	byID := map[string]store_sqlite.RefViewBuild{}
 	for _, row := range f.builds(viewID) {
@@ -760,6 +769,7 @@ func TestRefViewReclaimsAnAbandonedClaim(t *testing.T) {
 	f := newRefViewFixture(t)
 	commitB, treeB := f.commitTree(builderTreeB(), "B")
 	f.setRef("refs/heads/feature", commitB)
+	f.setRef("refs/heads/original-tree", commitB)
 
 	manager := f.manager(t, nil)
 	ctx := context.Background()
@@ -847,6 +857,7 @@ func TestRefViewSupersedesABuildWhoseTreeMoved(t *testing.T) {
 	moved["late.go"] = "package fixture\n\nfunc Late() {\n}\n"
 	commitC, treeC := f.commitTree(moved, "C")
 	f.setRef("refs/heads/feature", commitB)
+	f.setRef("refs/heads/original-tree", commitB)
 
 	var builds atomic.Int64
 	manager := f.manager(t, func() {
@@ -875,12 +886,22 @@ func TestRefViewSupersedesABuildWhoseTreeMoved(t *testing.T) {
 		t.Fatalf("ref view flipped to a superseded build: %+v", view)
 	}
 	generations := f.generations()
-	if len(generations) != 1 || generations[0].State != store_sqlite.ViewGenerationSuperseded {
-		t.Fatalf("generations = %+v, want the one build's generation superseded", generations)
+	if len(generations) != 1 || generations[0].State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("generations = %+v, want the moved build's shared candidate kept ready", generations)
 	}
 	rows := f.builds(view.RefViewID)
-	if len(rows) != 1 || rows[0].State != store_sqlite.ViewGenerationSuperseded {
+	if len(rows) != 1 || rows[0].State != store_sqlite.ViewGenerationSuperseded || rows[0].GenerationID != 0 {
 		t.Fatalf("build rows = %+v, want the attempt recorded as superseded", rows)
+	}
+	reused, err := manager.EnsureRefView(ctx, f.request("refs/heads/original-tree"))
+	if err != nil {
+		t.Fatalf("reuse moved build's original tree: %v", err)
+	}
+	if reused.Built || reused.GenerationID != generations[0].GenerationID {
+		t.Fatalf("reuse = %+v, want cached generation %d", reused, generations[0].GenerationID)
+	}
+	if builds.Load() != 1 {
+		t.Fatalf("%d builds ran, want only the moved pass", builds.Load())
 	}
 }
 

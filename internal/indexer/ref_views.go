@@ -65,7 +65,7 @@ const (
 	// generations were built under. Raising it makes every stored ref-view
 	// generation miss, which is what a change in what resolution emits
 	// requires — the stored payload is not what this binary would produce.
-	refViewResolverVersion = "1"
+	refViewResolverVersion = commitLayerPipelineEpoch
 
 	// defaultEnrichmentProfile is the profile a request that names none is
 	// served under. The profile is part of the view's catalog key and part of
@@ -206,6 +206,9 @@ type RefViewManagerConfig struct {
 	// the publish step re-resolving the selector, which is exactly the window
 	// the revalidation exists to close. nil in production.
 	buildBarrier func()
+	// cacheMissBarrier is a deterministic test seam after a cache miss and
+	// before BuildCommitLayer. nil in production.
+	cacheMissBarrier func()
 
 	// buildGrace, buildHeartbeat, buildLiveness and writerBudget are test
 	// seams over the manager's four windows. Zero takes the package constant,
@@ -229,7 +232,8 @@ type RefViewManager struct {
 	configHash string
 	extractors string
 
-	buildBarrier func()
+	buildBarrier     func()
+	cacheMissBarrier func()
 
 	buildGrace     time.Duration
 	buildHeartbeat time.Duration
@@ -250,18 +254,19 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 		logger = zap.NewNop()
 	}
 	return &RefViewManager{
-		store:          cfg.Store,
-		catalog:        cfg.Store.Catalog(),
-		builder:        cfg.Builder,
-		logger:         logger,
-		gate:           cfg.Gate,
-		configHash:     indexConfigHash(cfg.Config),
-		extractors:     extractorVersionsFingerprint(),
-		buildBarrier:   cfg.buildBarrier,
-		buildGrace:     refViewWindow(cfg.buildGrace, refViewBuildGrace),
-		buildHeartbeat: refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
-		buildLiveness:  refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
-		writerBudget:   refViewWindow(cfg.writerBudget, refViewWriterBudget),
+		store:            cfg.Store,
+		catalog:          cfg.Store.Catalog(),
+		builder:          cfg.Builder,
+		logger:           logger,
+		gate:             cfg.Gate,
+		configHash:       indexConfigHash(cfg.Config),
+		extractors:       extractorVersionsFingerprint(),
+		buildBarrier:     cfg.buildBarrier,
+		cacheMissBarrier: cfg.cacheMissBarrier,
+		buildGrace:       refViewWindow(cfg.buildGrace, refViewBuildGrace),
+		buildHeartbeat:   refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
+		buildLiveness:    refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
+		writerBudget:     refViewWindow(cfg.writerBudget, refViewWriterBudget),
 	}, nil
 }
 
@@ -437,7 +442,14 @@ func (m *RefViewManager) activeIsCurrent(
 	if err != nil {
 		return false, err
 	}
-	return found && servableGeneration(row.State), nil
+	if !found || !servableGeneration(row.State) {
+		return false, nil
+	}
+	availability, err := m.catalog.ReadProducerAvailability(ctx, view.ActiveGenerationID, commitLayerSourceSnapshotCapability)
+	if err != nil {
+		return false, err
+	}
+	return availability.Declared && availability.State == store_sqlite.ProducerStateComplete, nil
 }
 
 // coalesced answers a selection whose build is already in flight, from the
@@ -753,85 +765,105 @@ func (m *RefViewManager) runBuild(
 	resolved gitstate.ResolvedSelector,
 	identity GenerationIdentity,
 ) (RefViewResult, error) {
-	generationID, report, buildErr := m.builder.BuildCommitLayer(ctx, CommitLayerRequest{
-		Identity:      identity,
-		Base:          m.store.AtGeneration(base.generationID),
-		RepoDir:       req.RepoDir,
-		BaseTreeOID:   base.treeOID,
-		TargetTreeOID: resolved.TreeOID,
-		RootPath:      req.RepoDir,
-		RepoPrefix:    req.RepoPrefix,
-		WorkspaceID:   req.WorkspaceID,
-		ProjectID:     req.ProjectID,
+	key := m.refReadyGenerationKey(base, resolved.TreeOID)
+	required := commitLayerRequiredCapabilities()
+	claim, found, err := m.catalog.ClaimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
+		Key: key, RequiredCapabilities: required,
 	})
-	if m.buildBarrier != nil {
-		m.buildBarrier()
-	}
-	if buildErr != nil {
-		failure := classifyRefViewBuildError(buildErr)
-		m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, failure.Error())
-		result, err := m.failed(ctx, view, failure)
-		result.Built = true
-		return result, err
-	}
-	if report.ClosureTruncated {
-		m.logger.Warn("ref view manager: build closure truncated",
-			zap.String("ref_view", view.RefViewID), zap.Int64("generation", generationID),
-			zap.Int("cap", report.ClosureCap))
+	if err != nil {
+		m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, err.Error())
+		return RefViewResult{}, err
 	}
 
-	// Revalidation, git side: what does the selector name now? A tree that
-	// moved means the payload describes a state the view has left.
+	built := false
+	candidateID := int64(0)
+	leaseToken := ""
+	buildIdentity := identity
+	if claim.CapabilityMiss {
+		// Keep the canonical content key unchanged, but avoid owner-identity
+		// dedup against the source-withdrawn generation being replaced.
+		buildIdentity.LayerID = identity.LayerID + ":source-recovery:" + build.BuildID
+	}
+	if found {
+		leaseToken = claim.LeaseToken
+	}
+	defer func() { m.releaseRefReadyLease(ctx, leaseToken) }()
+
+	if !found {
+		if m.cacheMissBarrier != nil {
+			m.cacheMissBarrier()
+		}
+		generationID, report, buildErr := m.builder.BuildCommitLayer(ctx, CommitLayerRequest{
+			Identity: buildIdentity, Base: m.store.AtGeneration(base.generationID), RepoDir: req.RepoDir,
+			BaseTreeOID: base.treeOID, TargetTreeOID: resolved.TreeOID, RootPath: req.RepoDir,
+			RepoPrefix: req.RepoPrefix, WorkspaceID: req.WorkspaceID, ProjectID: req.ProjectID,
+		})
+		candidateID = generationID
+		built = true
+		if m.buildBarrier != nil {
+			m.buildBarrier()
+		}
+		if buildErr != nil {
+			failure := classifyRefViewBuildError(buildErr)
+			m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, failure.Error())
+			result, failErr := m.failed(ctx, view, failure)
+			result.Built = true
+			return result, failErr
+		}
+		if report.ClosureTruncated {
+			m.logger.Warn("ref view manager: build closure truncated", zap.String("ref_view", view.RefViewID), zap.Int64("generation", candidateID), zap.Int("cap", report.ClosureCap))
+		}
+	}
+
 	published, err := gitstate.ResolveViewSelector(ctx, req.RepoDir, req.SelectorKind, req.SelectorValue)
 	if err != nil {
-		m.supersede(ctx, build, generationID)
+		m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, err.Error())
 		result, failErr := m.failed(ctx, view, err)
-		result.Built = true
+		result.Built = built
 		return result, failErr
 	}
 	if published.TreeOID != resolved.TreeOID {
-		return m.superseded(ctx, build, generationID, view, published), nil
+		return m.retryRefReadyBuild(ctx, build, view, published, built), nil
 	}
 
-	// Revalidation, catalog side: is the row still asking for what was built,
-	// at the epoch the build captured, and does this pass still hold the claim
-	// it started under? The ref and commit stamped beside the generation are
-	// the ones current AT PUBLISH, which is how a commit that moved over an
-	// unchanged tree lands without a second pass. The adoption closes the
-	// attempt in the same transaction, so a pass whose claim was reclaimed
-	// while it ran publishes nothing.
-	now := time.Now().Unix()
-	err = m.catalog.AdoptRefViewGeneration(ctx, store_sqlite.AdoptRefViewGenerationRequest{
-		RefViewID:                       view.RefViewID,
-		ExpectedRouteEpoch:              build.CapturedRouteEpoch,
-		ExpectedDesiredTree:             resolved.TreeOID,
-		ExpectedDesiredBuildFingerprint: build.BuildFingerprint,
-		BuildID:                         build.BuildID,
-		BuildToken:                      build.BuildToken,
-		LastProgress:                    now,
-		GenerationID:                    generationID,
-		ActiveRef:                       published.FullRef,
-		ActiveCommit:                    published.CommitOID,
-		ActiveTree:                      published.TreeOID,
-		ActiveBuildFingerprint:          build.BuildFingerprint,
-		ExactView:                       true,
-		LastResolved:                    now,
-		LastSelected:                    now,
+	if !found {
+		claim, found, err = m.catalog.ClaimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
+			Key: key, CandidateGenerationID: candidateID, RequiredCapabilities: required,
+		})
+		if err != nil {
+			m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, err.Error())
+			return RefViewResult{}, err
+		}
+		if !found {
+			err = fmt.Errorf("indexer: ready ref-view candidate %d disappeared before claim", candidateID)
+			m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, err.Error())
+			return RefViewResult{}, err
+		}
+		leaseToken = claim.LeaseToken
+	}
+
+	err = m.catalog.BindReadyGenerationLeaseToRefView(ctx, store_sqlite.BindReadyGenerationLeaseToRefViewRequest{
+		Key: key, LeaseToken: claim.LeaseToken, GenerationID: claim.WinnerGenerationID,
+		RefViewID: view.RefViewID, ExpectedRouteEpoch: build.CapturedRouteEpoch,
+		ExpectedDesiredTree: resolved.TreeOID, ExpectedDesiredBuildFingerprint: build.BuildFingerprint,
+		BuildID: build.BuildID, BuildToken: build.BuildToken,
+		ActiveRef: published.FullRef, ActiveCommit: published.CommitOID, ActiveTree: published.TreeOID,
+		ActiveBuildFingerprint: build.BuildFingerprint, ExactView: true,
 	})
 	if err != nil {
+		m.releaseRefReadyLease(ctx, leaseToken)
+		leaseToken = ""
+		m.retireRefReadyCandidate(ctx, candidateID, claim.WinnerGenerationID)
 		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-			return m.superseded(ctx, build, generationID, view, published), nil
+			return m.retryRefReadyBuild(ctx, build, view, published, built), nil
 		}
+		m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, err.Error())
 		return RefViewResult{}, err
 	}
+	leaseToken = "" // consumed atomically by bind
+	m.retireRefReadyCandidate(ctx, candidateID, claim.WinnerGenerationID)
 	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewAdopted)
-	return RefViewResult{
-		RefViewID:    view.RefViewID,
-		GenerationID: generationID,
-		Resolved:     published,
-		State:        store_sqlite.RefViewReady,
-		Built:        true,
-	}, nil
+	return RefViewResult{RefViewID: view.RefViewID, GenerationID: claim.WinnerGenerationID, Resolved: published, State: store_sqlite.RefViewReady, Built: built}, nil
 }
 
 // superseded takes a finished build out of the running and answers with a
@@ -999,8 +1031,7 @@ func refViewID(req RefViewRequest) string {
 // profile it is served at. Two selections that agree on it would produce the
 // same payload, which is what makes one able to wait on the other.
 func refViewBuildFingerprint(identity GenerationIdentity, profile string) string {
-	sum := sha256.Sum256([]byte(generationIdentityKey(identity) + profile))
-	return hex.EncodeToString(sum[:16])
+	return commitLayerRouteFingerprint(identity, profile)
 }
 
 // classifyRefViewBuildError re-types a build failure the local object store

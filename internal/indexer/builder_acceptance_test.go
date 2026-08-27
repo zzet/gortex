@@ -115,7 +115,7 @@ func Added() {
 // builderIsolateGit pins the git environment for the whole test: no user or
 // system config, fixed identity, no prompts. A developer's ~/.gitconfig must
 // not be able to change what the fixture commits.
-func builderIsolateGit(t *testing.T) {
+func builderIsolateGit(t testing.TB) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skipf("git not on PATH: %v", err)
@@ -133,7 +133,7 @@ func builderIsolateGit(t *testing.T) {
 // builderTempDir returns a temp directory with every symlink resolved. On
 // macOS t.TempDir() sits under /var, which is a symlink to /private/var, and
 // git reports the resolved spelling.
-func builderTempDir(t *testing.T, name string) string {
+func builderTempDir(t testing.TB, name string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -146,7 +146,7 @@ func builderTempDir(t *testing.T, name string) string {
 	return resolved
 }
 
-func builderGit(t *testing.T, dir string, args ...string) string {
+func builderGit(t testing.TB, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	out, err := cmd.CombinedOutput()
@@ -157,7 +157,7 @@ func builderGit(t *testing.T, dir string, args ...string) string {
 }
 
 // builderWriteTree replaces dir's contents with tree, leaving any .git alone.
-func builderWriteTree(t *testing.T, dir string, tree map[string]string) {
+func builderWriteTree(t testing.TB, dir string, tree map[string]string) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -182,7 +182,7 @@ func builderWriteTree(t *testing.T, dir string, tree map[string]string) {
 	}
 }
 
-func builderOpenStore(t *testing.T, name string) *store_sqlite.Store {
+func builderOpenStore(t testing.TB, name string) *store_sqlite.Store {
 	t.Helper()
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), name+".sqlite"))
 	if err != nil {
@@ -200,7 +200,7 @@ func builderRegistry() *parser.Registry {
 
 // builderIndex runs one plain whole index of dir into store — the reference
 // half of every differential below.
-func builderIndex(t *testing.T, store *store_sqlite.Store, dir string) {
+func builderIndex(t testing.TB, store *store_sqlite.Store, dir string) {
 	t.Helper()
 	idx := New(store, builderRegistry(), config.Default().Index, zap.NewNop())
 	defer idx.Close()

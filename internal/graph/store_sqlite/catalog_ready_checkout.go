@@ -80,7 +80,7 @@ func (c *Catalog) BindReadyGenerationLeaseToCheckout(
 	if leasedGeneration != req.GenerationID || leasedGraph != req.Key.GraphID || expiresAt <= now {
 		return fmt.Errorf("%w: ready generation lease is stale", ErrCatalogStaleGuard)
 	}
-	compatible, err := candidateMatchesReadyGenerationKey(ctx, tx, req.GenerationID, req.Key)
+	compatible, err := candidateMatchesReadyGenerationKey(ctx, tx, req.GenerationID, req.Key, []string{readyGenerationSourceSnapshotCapability})
 	if err != nil {
 		return err
 	}

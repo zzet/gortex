@@ -281,6 +281,130 @@ func TestReadyGenerationCacheConcurrentPublishersAdoptOneWinner(t *testing.T) {
 	}
 }
 
+func TestReadyGenerationClaimPrefersLiveLeasedWinner(t *testing.T) {
+	ctx := context.Background()
+	store := openCatalogStore(t)
+	catalog := store.Catalog()
+	key := readyCacheTestKey("graph-live-pinned", 0)
+	older := createBuildingReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "older-building", "older")
+	pinned := createReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "newer-ready", "newer")
+	pin := claimReadyCacheSourceGeneration(t, catalog, key, pinned)
+
+	publishReadyCacheGeneration(t, catalog, older)
+	claim := claimReadyCacheSourceGeneration(t, catalog, key, older)
+	if claim.WinnerGenerationID != pinned || !claim.Reused || !claim.RetiredCandidate {
+		t.Fatalf("claim = %+v, want leased winner %d and retired candidate %d", claim, pinned, older)
+	}
+	assertReadyCacheGenerationState(t, catalog, older, ViewGenerationSuperseded)
+	if err := catalog.ReleaseReadyGenerationLease(ctx, claim.LeaseToken); err != nil {
+		t.Fatalf("release adopted claim: %v", err)
+	}
+	if err := catalog.ReleaseReadyGenerationLease(ctx, pin.LeaseToken); err != nil {
+		t.Fatalf("release pinned claim: %v", err)
+	}
+}
+
+func TestReadyGenerationClaimPrefersDurablyBoundWinner(t *testing.T) {
+	ctx := context.Background()
+	store := openCatalogStore(t)
+	catalog := store.Catalog()
+	key := readyCacheTestKey("graph-durable-pinned", 0)
+	view, build := seedReadyCacheRefView(t, catalog, key, "durable-pinned")
+	older := createBuildingReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "older-building", "older")
+	pinned := createReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "newer-ready", "newer")
+	pin := claimReadyCacheSourceGeneration(t, catalog, key, pinned)
+	if err := catalog.BindReadyGenerationLeaseToRefView(ctx,
+		bindReadyCacheRefViewRequest(view, build, key, pin)); err != nil {
+		t.Fatalf("bind pinned generation: %v", err)
+	}
+
+	publishReadyCacheGeneration(t, catalog, older)
+	claim := claimReadyCacheSourceGeneration(t, catalog, key, older)
+	if claim.WinnerGenerationID != pinned || !claim.Reused || !claim.RetiredCandidate {
+		t.Fatalf("claim = %+v, want bound winner %d and retired candidate %d", claim, pinned, older)
+	}
+	assertReadyCacheGenerationState(t, catalog, older, ViewGenerationSuperseded)
+	stored, found, err := catalog.GetRefView(ctx, view.RefViewID)
+	if err != nil || !found {
+		t.Fatalf("read pinned ref view: found=%v err=%v", found, err)
+	}
+	if stored.ActiveGenerationID != pinned {
+		t.Fatalf("active generation=%d, want pinned winner %d", stored.ActiveGenerationID, pinned)
+	}
+	if err := catalog.ReleaseReadyGenerationLease(ctx, claim.LeaseToken); err != nil {
+		t.Fatalf("release adopted claim: %v", err)
+	}
+}
+
+func TestReadyGenerationClaimBypassesWithdrawnPinnedWinner(t *testing.T) {
+	ctx := context.Background()
+	store := openCatalogStore(t)
+	catalog := store.Catalog()
+	key := readyCacheTestKey("graph-withdrawn-pinned", 0)
+	view, build := seedReadyCacheRefView(t, catalog, key, "withdrawn-pinned")
+	older := createBuildingReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "older-building", "older")
+	pinned := createReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "newer-ready", "newer")
+	pin := claimReadyCacheSourceGeneration(t, catalog, key, pinned)
+	if err := catalog.BindReadyGenerationLeaseToRefView(ctx,
+		bindReadyCacheRefViewRequest(view, build, key, pin)); err != nil {
+		t.Fatalf("bind pinned generation: %v", err)
+	}
+	if err := catalog.WithdrawProducer(ctx, pinned,
+		readyGenerationSourceSnapshotCapability, "test withdrawal"); err != nil {
+		t.Fatalf("withdraw pinned source snapshot: %v", err)
+	}
+
+	publishReadyCacheGeneration(t, catalog, older)
+	claim := claimReadyCacheSourceGeneration(t, catalog, key, older)
+	if claim.WinnerGenerationID != older || claim.Reused || claim.CapabilityMiss {
+		t.Fatalf("claim = %+v, want compatible candidate %d", claim, older)
+	}
+	if err := catalog.ReleaseReadyGenerationLease(ctx, claim.LeaseToken); err != nil {
+		t.Fatalf("release replacement claim: %v", err)
+	}
+}
+
+func TestReadyGenerationClaimBypassesExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	store := openCatalogStore(t)
+	catalog := store.Catalog()
+	key := readyCacheTestKey("graph-expired-pinned", 0)
+	older := createBuildingReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "older-building", "older")
+	pinned := createReadyCacheGeneration(t, catalog, key,
+		"ref_view", "", "newer-ready", "newer")
+	pin := claimReadyCacheSourceGeneration(t, catalog, key, pinned)
+	core := store.storeCore
+	core.writeMu.Lock()
+	_, err := core.writerDB.ExecContext(ctx, `
+		UPDATE ready_generation_leases
+		SET expires_at = unixepoch() - 1
+		WHERE lease_token = ?
+	`, pin.LeaseToken)
+	core.writeMu.Unlock()
+	if err != nil {
+		t.Fatalf("expire pinned lease: %v", err)
+	}
+
+	publishReadyCacheGeneration(t, catalog, older)
+	claim := claimReadyCacheSourceGeneration(t, catalog, key, older)
+	if claim.WinnerGenerationID != older || claim.Reused {
+		t.Fatalf("claim = %+v, want oldest candidate %d after lease expiry", claim, older)
+	}
+	if err := catalog.ReleaseReadyGenerationLease(ctx, claim.LeaseToken); err != nil {
+		t.Fatalf("release replacement claim: %v", err)
+	}
+	if err := catalog.ReleaseReadyGenerationLease(ctx, pin.LeaseToken); err != nil {
+		t.Fatalf("release expired claim: %v", err)
+	}
+}
+
 func TestReadyGenerationCacheKeyUsesEveryCompatibilityField(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "store.db"))
@@ -353,6 +477,57 @@ func BenchmarkReadyGenerationCache(b *testing.B) {
 			b.StartTimer()
 		}
 	})
+	b.Run("PinnedWinner", func(b *testing.B) {
+		store, err := Open(filepath.Join(b.TempDir(), "store.db"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer store.Close()
+		catalog := store.Catalog()
+		key := readyCacheTestKey("graph-pinned-bench", 0)
+		older := make([]int64, 8)
+		for i := range older {
+			older[i] = createBuildingReadyCacheGeneration(b, catalog, key,
+				"ref_view", "", fmt.Sprintf("older-%d", i), "older")
+		}
+		pinned := createReadyCacheGeneration(b, catalog, key,
+			"ref_view", "", "pinned", "pinned")
+		pin, found, err := catalog.ClaimReadyGeneration(ctx, ClaimReadyGenerationRequest{
+			Key:                  key,
+			LeaseToken:           "benchmark-pin",
+			RequiredCapabilities: []string{readyGenerationSourceSnapshotCapability},
+		})
+		if err != nil || !found || pin.WinnerGenerationID != pinned {
+			b.Fatalf("pin claim = %+v found=%v err=%v, want %d", pin, found, err, pinned)
+		}
+		defer func() {
+			if err := catalog.ReleaseReadyGenerationLease(ctx, pin.LeaseToken); err != nil {
+				b.Errorf("release pin: %v", err)
+			}
+		}()
+		for _, generationID := range older {
+			publishReadyCacheGeneration(b, catalog, generationID)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			token := fmt.Sprintf("pinned-bench-%d", i)
+			claim, found, err := catalog.ClaimReadyGeneration(ctx, ClaimReadyGenerationRequest{
+				Key:                  key,
+				LeaseToken:           token,
+				RequiredCapabilities: []string{readyGenerationSourceSnapshotCapability},
+			})
+			if err != nil || !found || claim.WinnerGenerationID != pinned {
+				b.Fatalf("claim = %+v found=%v err=%v, want pinned winner %d", claim, found, err, pinned)
+			}
+			b.StopTimer()
+			if err := catalog.ReleaseReadyGenerationLease(ctx, claim.LeaseToken); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+		}
+	})
 	b.Run("ColdPayload100Nodes", func(b *testing.B) {
 		store, err := Open(filepath.Join(b.TempDir(), "store.db"))
 		if err != nil {
@@ -416,6 +591,19 @@ func createReadyCacheGeneration(
 	ownerKind, checkoutID, layerID, provenance string,
 ) int64 {
 	t.Helper()
+	generationID := createBuildingReadyCacheGeneration(t, catalog, key,
+		ownerKind, checkoutID, layerID, provenance)
+	publishReadyCacheGeneration(t, catalog, generationID)
+	return generationID
+}
+
+func createBuildingReadyCacheGeneration(
+	t testing.TB,
+	catalog *Catalog,
+	key ReadyGenerationCacheKey,
+	ownerKind, checkoutID, layerID, provenance string,
+) int64 {
+	t.Helper()
 	ctx := context.Background()
 	generationID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
 		OwnerKind:           ownerKind,
@@ -435,10 +623,31 @@ func createReadyCacheGeneration(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.PublishViewGeneration(ctx, generationID, 11); err != nil {
+	if err := catalog.store.AtGeneration(generationID).SetProducerState(ProducerCompleteness{
+		Producer: readyGenerationSourceSnapshotCapability,
+		State:    ProducerStateComplete,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return generationID
+}
+
+func publishReadyCacheGeneration(t testing.TB, catalog *Catalog, generationID int64) {
+	t.Helper()
+	if err := catalog.PublishViewGeneration(context.Background(), generationID, 11); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertReadyCacheGenerationState(t testing.TB, catalog *Catalog, generationID int64, want ViewGenerationState) {
+	t.Helper()
+	row, found, err := catalog.GetViewGeneration(context.Background(), generationID)
+	if err != nil || !found {
+		t.Fatalf("read generation %d: found=%v err=%v", generationID, found, err)
+	}
+	if row.State != want {
+		t.Fatalf("generation %d state=%q, want %q", generationID, row.State, want)
+	}
 }
 
 func assertReadyCacheWinner(t testing.TB, catalog *Catalog, key ReadyGenerationCacheKey, want int64, token string) {

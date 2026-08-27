@@ -42,6 +42,9 @@ type ClaimReadyGenerationRequest struct {
 	Key                   ReadyGenerationCacheKey
 	CandidateGenerationID int64
 	LeaseToken            string
+	// RequiredCapabilities limits adoption to winners whose named producer
+	// rows are complete. Missing or withdrawn capabilities are a cache miss.
+	RequiredCapabilities []string
 }
 
 // ReadyGenerationClaim pins WinnerGenerationID against deletion until the
@@ -55,6 +58,9 @@ type ReadyGenerationClaim struct {
 	ExpiresAt          int64
 	Reused             bool
 	RetiredCandidate   bool
+	// CapabilityMiss is true only on found=false when a structurally compatible
+	// ready generation exists but lacks at least one required capability.
+	CapabilityMiss bool
 }
 
 // ClaimReadyGeneration finds one canonical, reusable ready generation and
@@ -70,6 +76,10 @@ func (c *Catalog) ClaimReadyGeneration(
 	}
 	if req.CandidateGenerationID < 0 {
 		return ReadyGenerationClaim{}, false, fmt.Errorf("candidate generation id must not be negative")
+	}
+	requiredCapabilities, err := normalizeReadyGenerationCapabilities(req.RequiredCapabilities)
+	if err != nil {
+		return ReadyGenerationClaim{}, false, err
 	}
 	token := req.LeaseToken
 	if token == "" {
@@ -103,7 +113,7 @@ func (c *Catalog) ClaimReadyGeneration(
 	}
 
 	if req.CandidateGenerationID != 0 {
-		valid, err := candidateMatchesReadyGenerationKey(ctx, tx, req.CandidateGenerationID, req.Key)
+		valid, err := candidateMatchesReadyGenerationKey(ctx, tx, req.CandidateGenerationID, req.Key, requiredCapabilities)
 		if err != nil {
 			return ReadyGenerationClaim{}, false, err
 		}
@@ -115,15 +125,23 @@ func (c *Catalog) ClaimReadyGeneration(
 		}
 	}
 
-	winner, err := canonicalReadyGeneration(ctx, tx, req.Key)
+	winner, err := canonicalReadyGeneration(ctx, tx, req.Key, requiredCapabilities)
 	if err != nil {
 		return ReadyGenerationClaim{}, false, err
 	}
 	if winner == 0 {
+		capabilityMiss := false
+		if len(requiredCapabilities) > 0 {
+			compatible, err := canonicalReadyGeneration(ctx, tx, req.Key, nil)
+			if err != nil {
+				return ReadyGenerationClaim{}, false, err
+			}
+			capabilityMiss = compatible != 0
+		}
 		if err := tx.Commit(); err != nil {
 			return ReadyGenerationClaim{}, false, err
 		}
-		return ReadyGenerationClaim{}, false, nil
+		return ReadyGenerationClaim{CapabilityMiss: capabilityMiss}, false, nil
 	}
 
 	var leasedGeneration int64
@@ -179,8 +197,13 @@ func (c *Catalog) ClaimReadyGeneration(
 			  AND NOT EXISTS (
 				SELECT 1 FROM view_generations WHERE base_generation_id = ?
 			  )
+			  AND NOT EXISTS (
+				SELECT 1 FROM ready_generation_leases
+				WHERE generation_id = ? AND expires_at > ?
+			  )
 		`, req.CandidateGenerationID, req.CandidateGenerationID, req.CandidateGenerationID,
-			req.CandidateGenerationID, req.CandidateGenerationID, req.CandidateGenerationID)
+			req.CandidateGenerationID, req.CandidateGenerationID, req.CandidateGenerationID,
+			req.CandidateGenerationID, now)
 		if err != nil {
 			return ReadyGenerationClaim{}, false, fmt.Errorf("retire redundant ready generation: %w", err)
 		}
@@ -295,7 +318,12 @@ func ensureReadyGenerationCacheSchema(ctx context.Context, core *storeCore) erro
 	return nil
 }
 
-func canonicalReadyGeneration(ctx context.Context, tx *sql.Tx, key ReadyGenerationCacheKey) (int64, error) {
+func canonicalReadyGeneration(
+	ctx context.Context,
+	tx *sql.Tx,
+	key ReadyGenerationCacheKey,
+	requiredCapabilities []string,
+) (int64, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT generation_id
 		FROM view_generations
@@ -306,7 +334,29 @@ func canonicalReadyGeneration(ctx context.Context, tx *sql.Tx, key ReadyGenerati
 		  AND extractor_versions = ?
 		  AND resolver_version = ?
 		  AND state = 'ready'
-		ORDER BY generation_id ASC
+		ORDER BY
+		  CASE WHEN
+		    EXISTS (
+		      SELECT 1 FROM ready_generation_leases AS lease
+		      WHERE lease.generation_id = view_generations.generation_id
+		        AND lease.expires_at > unixepoch()
+		    )
+		    OR EXISTS (
+		      SELECT 1 FROM checkout_routes AS route
+		      WHERE route.commit_generation_id = view_generations.generation_id
+		         OR route.dirty_generation_id = view_generations.generation_id
+		    )
+		    OR EXISTS (
+		      SELECT 1 FROM ref_views AS ref_view
+		      WHERE ref_view.active_generation_id = view_generations.generation_id
+		    )
+		    OR EXISTS (
+		      SELECT 1 FROM dedicated_graphs AS dedicated
+		      WHERE dedicated.active_generation_id = view_generations.generation_id
+		    )
+		    THEN 0 ELSE 1
+		  END,
+		  generation_id ASC
 	`, key.GraphID, key.BaseGenerationID, key.TreeOID, key.IndexConfigHash,
 		key.ExtractorFingerprint, key.SchemaPipelineEpoch)
 	if err != nil {
@@ -332,7 +382,14 @@ func canonicalReadyGeneration(ctx context.Context, tx *sql.Tx, key ReadyGenerati
 		if err != nil {
 			return 0, err
 		}
-		if live {
+		if !live {
+			continue
+		}
+		supported, err := readyGenerationSupportsCapabilities(ctx, tx, generationID, requiredCapabilities)
+		if err != nil {
+			return 0, err
+		}
+		if supported {
 			return generationID, nil
 		}
 	}
@@ -344,6 +401,7 @@ func candidateMatchesReadyGenerationKey(
 	tx *sql.Tx,
 	generationID int64,
 	key ReadyGenerationCacheKey,
+	requiredCapabilities []string,
 ) (bool, error) {
 	var graphID, treeOID, configHash, extractorFingerprint, pipelineEpoch, state string
 	var baseGenerationID int64
@@ -366,7 +424,11 @@ func candidateMatchesReadyGenerationKey(
 		(state != string(ViewGenerationReady) && state != string(ViewGenerationSuperseded)) {
 		return false, nil
 	}
-	return readyGenerationAncestryLive(ctx, tx, generationID, key.GraphID, false)
+	live, err := readyGenerationAncestryLive(ctx, tx, generationID, key.GraphID, false)
+	if err != nil || !live {
+		return live, err
+	}
+	return readyGenerationSupportsCapabilities(ctx, tx, generationID, requiredCapabilities)
 }
 
 func readyGenerationAncestryLive(

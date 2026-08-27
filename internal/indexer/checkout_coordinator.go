@@ -83,7 +83,7 @@ const (
 	// generations were built under. Raising it makes every cached commit layer
 	// miss, which is what a change in what resolution emits requires — the
 	// stored payload is not what this binary would produce any more.
-	checkoutResolverVersion = "1"
+	checkoutResolverVersion = commitLayerPipelineEpoch
 )
 
 // errRouteMoved reports that a route flip lost its compare-and-set: another

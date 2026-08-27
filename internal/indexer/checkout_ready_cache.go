@@ -9,11 +9,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// checkoutReadyGenerationPipelineEpoch identifies every structural and derived
-// pass whose output is represented by a commit layer. It is intentionally
-// independent of checkout, branch, path, and route ownership.
-var checkoutReadyGenerationPipelineEpoch = checkoutResolverVersion
-
 type readyCommitLayer struct {
 	generationID int64
 	leaseToken   string
@@ -26,14 +21,13 @@ func (c *CheckoutCoordinator) readyCommitCacheKey(
 	base primaryBase,
 	targetTree string,
 ) store_sqlite.ReadyGenerationCacheKey {
-	return store_sqlite.ReadyGenerationCacheKey{
-		GraphID:              base.graphID,
-		BaseGenerationID:     base.generationID,
-		TreeOID:              targetTree,
-		IndexConfigHash:      c.configHash,
-		ExtractorFingerprint: c.extractors,
-		SchemaPipelineEpoch:  checkoutReadyGenerationPipelineEpoch,
-	}
+	return commitLayerReadyGenerationKey(
+		base.graphID,
+		base.generationID,
+		targetTree,
+		c.configHash,
+		c.extractors,
+	)
 }
 
 // resolveReadyCommitLayer adopts the graph-scoped canonical ready generation
@@ -47,8 +41,10 @@ func (c *CheckoutCoordinator) resolveReadyCommitLayer(
 	targetTree string,
 ) (readyCommitLayer, error) {
 	key := c.readyCommitCacheKey(base, targetTree)
+	required := commitLayerRequiredCapabilities()
 	claim, found, err := c.catalog.ClaimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
-		Key: key,
+		Key:                  key,
+		RequiredCapabilities: required,
 	})
 	if err != nil {
 		return readyCommitLayer{}, err
@@ -69,6 +65,7 @@ func (c *CheckoutCoordinator) resolveReadyCommitLayer(
 	claim, found, err = c.catalog.ClaimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
 		Key:                   key,
 		CandidateGenerationID: candidate,
+		RequiredCapabilities:  required,
 	})
 	if err != nil {
 		if !retained {
