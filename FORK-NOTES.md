@@ -92,11 +92,38 @@ your last fetch — it read "0 behind" while 1,304 commits behind.
 | | change | upstream? |
 |---|---|---|
 | 0 | `cobolDivRe`: `DIVISION\.` → `DIVISION\b` — **DONE**, `11e79383` | **yes** |
-| 1 | `COPY IDMS` multi-word form, `COPY REPLACING`, dynamic `CALL` | **yes** |
+| 1 | comment lines, `COPY IDMS` multi-word, dynamic `CALL` — **DONE**, `028ef49e` | **yes** |
 | 2 | DATA DIVISION extractor — levels, PIC, REDEFINES, OCCURS | fork-local |
 | 3 | `$CBAP` macro preprocessor (56 macros) | fork-local, site-specific |
 | 4 | JCL `SET` / `INCLUDE` / `JCLLIB ORDER` symbolic resolution | **yes** |
 | 5 | `.ctl` / `.bms` / `.ezt` extractors | later |
+
+**Item 1 is done** (`028ef49e`). Scope changed on measurement: **`COPY REPLACING`
+and `COPY x OF y` do not occur at all** in this estate, so neither was built.
+What did occur:
+
+* **comment lines were being scanned** — 2,242 of 3,768 `COPY` matches (59%) and
+  117 of 469 `CALL` matches came from commented-out code and prose (`TO`,
+  `FAILED`, `THIS`). Both regexes are unanchored and ran over raw source.
+* `COPY IDMS [RECORD] <name>` — 590 statements collapsed onto one `IDMS` import.
+* dynamic `CALL <identifier>` — **829 versus 352 quoted literals**, so most of
+  the inter-program call graph was absent. Lands in a `dyncall` namespace with
+  `OriginASTInferred`.
+
+Edges 90,404 → 88,874, exactly `-2,242 -117 +829`. Three fixtures, each verified
+to fail without its fix.
+
+### Known, not yet fixed: anchored patterns under-match
+
+The mirror of the comment bug. `PROGRAM-ID`, `DIVISION` and `SECTION` are
+anchored `^\s*`, and run over raw source where columns 1-6 may hold a change
+marker — `I0002  ENVIRONMENT DIVISION.` never matches. Stripping to the code
+area *raises* the counts: **+223 divisions, +457 sections** on this corpus. It
+also means some procedure divisions are still skipped for the item-0 reason via
+a different route. Fixing it properly needs fixed-vs-free-format detection,
+because `cobolStripLine` corrupts free-format source (it takes column 7 as the
+indicator on any line of 7+ characters), so it is deliberately left out of the
+item-1 change.
 
 **Item 0 is done** (`11e79383`, branch `fix/cobol-procedure-division-using`).
 Controlled measurement on the DCC corpus, same binary, regex the only change:
