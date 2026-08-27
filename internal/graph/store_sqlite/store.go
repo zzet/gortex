@@ -33,6 +33,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
 
@@ -88,6 +89,20 @@ type storeCore struct {
 	structuralIntegrity   graph.StructuralIntegrityMeter
 	structuralWriteWarned atomic.Bool
 	structuralReadWarned  atomic.Bool
+
+	// producerWithdrawals is the one asynchronous capability-withdrawal worker
+	// for this open database. It is installed only after Open has completed all
+	// fallible initialization, then shared by every generation handle through
+	// storeCore. The observer counters are atomics so the sole worker can never
+	// be delayed by telemetry.
+	producerWithdrawals             *producerWithdrawalManager
+	producerWithdrawalScheduled     atomic.Uint64
+	producerWithdrawalRejected      atomic.Uint64
+	producerWithdrawalAttempts      atomic.Uint64
+	producerWithdrawalSatisfied     atomic.Uint64
+	producerWithdrawalTransient     atomic.Uint64
+	producerWithdrawalPersistent    atomic.Uint64
+	producerWithdrawalFinalFailures atomic.Uint64
 
 	// preparedSQL registers every statement prepared at Open so the plan
 	// fence can EXPLAIN the entire prepared surface against a fixture and
@@ -278,6 +293,93 @@ type Store struct {
 // Now that the fields live on storeCore, those guards must also cover a nil
 // core or the very next field read panics.
 func (s *Store) coreless() bool { return s == nil || s.storeCore == nil }
+
+const maxProducerWithdrawalReasonBytes = 512
+
+// ProducerWithdrawalStats is lock-free process telemetry for asynchronous
+// generation-producer capability withdrawal. Scheduled includes coalesced and
+// already-satisfied keys; Rejected covers invalid keys and admission after
+// shutdown. Attempts and dispositions are emitted by the manager's sole
+// worker, and FinalFailures counts keys Close could not satisfy within its
+// bounded shutdown window.
+type ProducerWithdrawalStats struct {
+	Scheduled     uint64
+	Rejected      uint64
+	Attempts      uint64
+	Satisfied     uint64
+	Transient     uint64
+	Persistent    uint64
+	FinalFailures uint64
+}
+
+// ScheduleProducerWithdrawal records an eventual capability withdrawal and
+// returns immediately without acquiring the SQLite writer gate. Every Store
+// handle over this database shares the same manager and immutable completion
+// tombstones. false means the key is invalid or owning-store shutdown has
+// closed admission.
+func (s *Store) ScheduleProducerWithdrawal(generationID int64, producer, reason string) bool {
+	if s.coreless() || s.producerWithdrawals == nil {
+		return false
+	}
+	accepted := s.producerWithdrawals.schedule(
+		generationID,
+		producer,
+		boundedProducerWithdrawalReason(reason),
+	)
+	if accepted {
+		s.producerWithdrawalScheduled.Add(1)
+	} else {
+		s.producerWithdrawalRejected.Add(1)
+	}
+	return accepted
+}
+
+// ProducerWithdrawalStats returns a coherent-enough lock-free telemetry
+// snapshot. Counters are monotonic and intentionally do not synchronize with
+// the worker; diagnostics must never stall withdrawal progress.
+func (s *Store) ProducerWithdrawalStats() ProducerWithdrawalStats {
+	if s.coreless() {
+		return ProducerWithdrawalStats{}
+	}
+	return ProducerWithdrawalStats{
+		Scheduled:     s.producerWithdrawalScheduled.Load(),
+		Rejected:      s.producerWithdrawalRejected.Load(),
+		Attempts:      s.producerWithdrawalAttempts.Load(),
+		Satisfied:     s.producerWithdrawalSatisfied.Load(),
+		Transient:     s.producerWithdrawalTransient.Load(),
+		Persistent:    s.producerWithdrawalPersistent.Load(),
+		FinalFailures: s.producerWithdrawalFinalFailures.Load(),
+	}
+}
+
+func (s *Store) observeProducerWithdrawal(event producerWithdrawalEvent) {
+	s.producerWithdrawalAttempts.Add(1)
+	switch event.Disposition {
+	case producerWithdrawalSatisfied:
+		s.producerWithdrawalSatisfied.Add(1)
+	case producerWithdrawalTransient:
+		s.producerWithdrawalTransient.Add(1)
+	case producerWithdrawalPersistent:
+		s.producerWithdrawalPersistent.Add(1)
+	}
+	if event.Final && event.Disposition != producerWithdrawalSatisfied {
+		s.producerWithdrawalFinalFailures.Add(1)
+	}
+}
+
+func boundedProducerWithdrawalReason(reason string) string {
+	reason = strings.TrimSpace(strings.ToValidUTF8(reason, "\uFFFD"))
+	if len(reason) <= maxProducerWithdrawalReasonBytes {
+		return reason
+	}
+	// Cut at a UTF-8 boundary so diagnostics remain valid text while still
+	// enforcing a byte bound on the persisted catalog value.
+	cut := maxProducerWithdrawalReasonBytes
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
+}
 
 // Compile-time assertion: *Store satisfies graph.Store.
 var _ graph.Store = (*Store)(nil)
@@ -602,6 +704,15 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		s.checkpointDone = make(chan struct{})
 		go s.runCheckpointLoop(walCheckpointInterval)
 	}
+	// This worker is intentionally the final construction step: every earlier
+	// failure closes the pools without starting a goroutine, while every
+	// successfully returned handle has exactly one manager on its shared core.
+	catalog := s.Catalog()
+	s.producerWithdrawals = newProducerWithdrawalManager(
+		catalog.WithdrawProducer,
+		catalog.classifyProducerWithdrawal,
+		producerWithdrawalConfig{observe: s.observeProducerWithdrawal},
+	)
 	return s, nil
 }
 
@@ -841,6 +952,14 @@ func (s *Store) Close() error {
 		bulkErr = errors.Join(sealErr, s.closeBulkConnectionLocked())
 	}
 	s.writeMu.Unlock()
+
+	// Accepted withdrawals may need the writer, so drain only after releasing
+	// the bulk/write gate and while both pools are still live. close rejects new
+	// admission, cancels a normal attempt, and gives all pending keys one
+	// bounded final flush before checkpoint and pool teardown.
+	if s.producerWithdrawals != nil {
+		s.producerWithdrawals.close()
+	}
 
 	var checkpointErr error
 	if s.checkpointDone != nil { // on-disk store: drain the WAL one last time

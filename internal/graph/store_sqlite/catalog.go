@@ -3,9 +3,11 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	sqlite "modernc.org/sqlite"
 
@@ -1280,6 +1282,11 @@ UPDATE view_generations SET covered_files = ?, affected_files = ?, storage_bytes
 // against payload writes, and this has to go through on exactly such a
 // generation: the withdrawal is a statement about what the payload can no
 // longer produce, not a change to the payload.
+const (
+	producerWithdrawalSQLiteBusyQuantumMillis = 5
+	producerWithdrawalBusyRestoreBudget       = 25 * time.Millisecond
+)
+
 func (c *Catalog) WithdrawProducer(ctx context.Context, generationID int64, producer, reason string) error {
 	if generationID <= 0 {
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
@@ -1287,11 +1294,191 @@ func (c *Catalog) WithdrawProducer(ctx context.Context, generationID int64, prod
 	if err := requireCatalogID("producer", producer); err != nil {
 		return err
 	}
-	return c.execGuarded(ctx,
-		fmt.Sprintf("producer %s of generation %d is already unavailable or undeclared", producer, generationID), `
+	subject := fmt.Sprintf("producer %s of generation %d is already unavailable or undeclared", producer, generationID)
+	return c.withProducerWithdrawalBusyRetry(ctx, func(attemptCtx context.Context) error {
+		result, err := c.execProducerWithdrawalQuantum(attemptCtx, generationID, producer, reason)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 {
+			return fmt.Errorf("%w: %s", ErrCatalogStaleGuard, subject)
+		}
+		return nil
+	})
+}
+
+// withProducerWithdrawalBusyRetry is the quiet, context-aware retry loop for
+// best-effort withdrawal maintenance. The general store retry helper logs
+// recovery/exhaustion, which is useful for operator-initiated mutations but
+// would turn repeated missing-object reads into a synchronous log storm. The
+// manager emits one aggregate observer/stat event when each attempt finishes.
+func (c *Catalog) withProducerWithdrawalBusyRetry(
+	parent context.Context,
+	fn func(context.Context) error,
+) error {
+	retryDeadline := time.Now().Add(c.store.sqliteBusyRetryWindow())
+	delay := sqliteBusyRetryBaseDelay
+	var lastBusy error
+	for {
+		if err := parent.Err(); err != nil {
+			return err
+		}
+		err := fn(parent)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errSQLiteBusyRetryExhausted) {
+			return err
+		}
+		if !isSQLiteBusyErr(err) {
+			return err
+		}
+		lastBusy = err
+
+		remaining := time.Until(retryDeadline)
+		if remaining <= 0 {
+			return fmt.Errorf("withdraw producer: %w", errors.Join(errSQLiteBusyRetryExhausted, lastBusy, context.DeadlineExceeded))
+		}
+		wait := minDuration(delay, remaining)
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-parent.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("withdraw producer: %w", errors.Join(errSQLiteBusyRetryExhausted, lastBusy, parent.Err()))
+		}
+		if delay *= 2; delay > sqliteBusyRetryMaxDelay {
+			delay = sqliteBusyRetryMaxDelay
+		}
+	}
+}
+
+// execProducerWithdrawalQuantum gives this one best-effort maintenance write a
+// short connection-local SQLite busy wait. BUSY/LOCKED returns to Go quickly,
+// where withSQLiteBusyRetry can honor the manager attempt or shared shutdown
+// context between quanta. The store write gate is context-aware as well.
+func (c *Catalog) execProducerWithdrawalQuantum(
+	ctx context.Context,
+	generationID int64,
+	producer, reason string,
+) (sql.Result, error) {
+	if err := c.store.writeMu.LockContext(ctx); err != nil {
+		return nil, err
+	}
+	defer c.store.writeMu.Unlock()
+
+	conn, err := c.store.writerDB.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	var previousBusyTimeout int
+	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&previousBusyTimeout); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, producerWithdrawalSQLiteBusyQuantumMillis)); err != nil {
+		return nil, err
+	}
+	result, execErr := conn.ExecContext(ctx, `
 UPDATE generation_producer_completeness SET state = ?, reason = ?
  WHERE view_gen = ? AND producer = ? AND state != ?`,
 		string(ProducerStateUnavailable), reason, generationID, producer, string(ProducerStateUnavailable))
+
+	restoreCtx, cancel := context.WithTimeout(context.Background(), producerWithdrawalBusyRestoreBudget)
+	_, restoreErr := conn.ExecContext(restoreCtx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, previousBusyTimeout))
+	cancel()
+	if restoreErr != nil {
+		// Returning driver.ErrBadConn from Raw marks this physical connection
+		// unusable. Close then discards it instead of returning a connection with
+		// the withdrawal-only short timeout to unrelated writers.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		return nil, errors.Join(execErr, fmt.Errorf("restore producer withdrawal busy_timeout: %w", restoreErr))
+	}
+	return result, execErr
+}
+
+// ProducerAvailability is the narrow readback needed to classify one
+// asynchronous withdrawal attempt. Declared is false when either the
+// generation or producer row no longer exists; both mean the capability is
+// absent and the withdrawal invariant is already satisfied.
+type ProducerAvailability struct {
+	Declared bool
+	State    ProducerState
+}
+
+// ReadProducerAvailability reads exactly one generation-producer row without
+// acquiring the writer gate. It is context-bounded so classification shares
+// the manager attempt's deadline rather than introducing a second wait.
+func (c *Catalog) ReadProducerAvailability(ctx context.Context, generationID int64, producer string) (ProducerAvailability, error) {
+	if generationID <= 0 {
+		return ProducerAvailability{}, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	if err := requireCatalogID("producer", producer); err != nil {
+		return ProducerAvailability{}, err
+	}
+	var raw string
+	err := c.store.db.QueryRowContext(ctx, `
+SELECT state
+  FROM generation_producer_completeness
+ WHERE view_gen = ? AND producer = ?`, generationID, producer).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ProducerAvailability{}, nil
+	}
+	if err != nil {
+		return ProducerAvailability{}, err
+	}
+	state := ProducerState(raw)
+	switch state {
+	case ProducerStateComplete,
+		ProducerStateIncomplete,
+		ProducerStateBuilding,
+		ProducerStateUnavailable,
+		ProducerStateDisabledByConfig:
+		return ProducerAvailability{Declared: true, State: state}, nil
+	default:
+		return ProducerAvailability{}, fmt.Errorf("%w: producer %s of generation %d has state %q", ErrCatalogInvalidValue, producer, generationID, raw)
+	}
+}
+
+func (c *Catalog) classifyProducerWithdrawal(
+	ctx context.Context,
+	generationID int64,
+	producer string,
+	withdrawErr error,
+) (producerWithdrawalDisposition, error) {
+	// A direct BUSY/LOCKED result is transient without readback. Reading through
+	// the same attempt context can only turn a useful contention signal into a
+	// deadline error, and the producer row could not have changed on BUSY.
+	if isSQLiteBusyErr(withdrawErr) || errors.Is(withdrawErr, errSQLiteBusyRetryExhausted) {
+		return producerWithdrawalTransient, nil
+	}
+	// A timed-out/canceled withdrawal cannot usefully read back through the
+	// same attempt context. It is retryable by definition and must not be
+	// mislabeled persistent because the verification query sees that deadline.
+	if ctx.Err() != nil || errors.Is(withdrawErr, context.Canceled) || errors.Is(withdrawErr, context.DeadlineExceeded) {
+		return producerWithdrawalTransient, nil
+	}
+	availability, err := c.ReadProducerAvailability(ctx, generationID, producer)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSQLiteBusyErr(err) {
+			return producerWithdrawalTransient, nil
+		}
+		return producerWithdrawalPersistent, err
+	}
+	if !availability.Declared || availability.State == ProducerStateUnavailable {
+		return producerWithdrawalSatisfied, nil
+	}
+	if isSQLiteBusyErr(withdrawErr) {
+		return producerWithdrawalTransient, nil
+	}
+	return producerWithdrawalPersistent, nil
 }
 
 // ViewGenerationReferences is which kinds of pointer still name a generation.

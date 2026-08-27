@@ -8,7 +8,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
@@ -26,11 +25,7 @@ import (
 // go through the tree the view is pinned to, and a file location is reported
 // as a gortex-view:// identity rather than as a path that names nothing.
 
-// refViewWithdrawBudget bounds the one write a file read can make — the
-// withdrawal of the source capability when the object store no longer holds
-// the view's blobs. The record is best effort and the read's answer does not
-// depend on it, so waiting for a saturated writer buys nothing.
-const refViewWithdrawBudget = 2 * time.Second
+const refViewSourceWithdrawalReason = "the object store no longer holds this view's blobs"
 
 // refViewFiles serves file bytes out of one view's committed tree. It is built
 // per request and closed with it: the tree source spawns a git child on the
@@ -146,17 +141,16 @@ func (f *refViewFiles) withdrawLocked() {
 	if f.store == nil || f.generationID <= 0 {
 		return
 	}
-	// Bounded, because this is a write on a read path: the store's mutation
-	// gate is held for as long as a build's transactions run, and a read that
-	// queued there would turn a missing blob into a request that never
-	// answers. The next read of the same absent object withdraws again.
-	ctx, cancel := context.WithTimeout(context.Background(), refViewWithdrawBudget)
-	defer cancel()
-	// A repeat withdrawal reports a stale guard, which is the right answer and
-	// nothing to act on: the capability is already gone.
-	_ = f.store.Catalog().WithdrawProducer(ctx, f.generationID,
+	// This is deliberately scheduling-only: a missing Git object is discovered
+	// on a read path, and that answer must never queue behind SQLite's writer.
+	// The exact producer row is withdrawn asynchronously; structural producers
+	// remain untouched and duplicate misses coalesce in the store-lifetime
+	// manager.
+	_ = f.store.ScheduleProducerWithdrawal(
+		f.generationID,
 		string(graphview.CapSourceSnapshot),
-		"the object store no longer holds this view's blobs")
+		refViewSourceWithdrawalReason,
+	)
 }
 
 // relPath normalises a caller's path onto the tree's namespace.
