@@ -739,6 +739,77 @@ func TestCheckoutLifecycleSeedIsIdempotent(t *testing.T) {
 	assert.Len(t, intents, 1, "the intent is upserted on its source key, not duplicated")
 }
 
+// TestCheckoutLifecycleSeedReusesDedicatedGraphOwnedUnderPreviousPrefix covers
+// a restart whose config still names the same checkout but derives a different
+// repo prefix. The durable owner binding wins over the newly derived graph ID.
+func TestCheckoutLifecycleSeedReusesDedicatedGraphOwnedUnderPreviousPrefix(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+
+	root := f.gitRepo("seed-owner-replay")
+	gc := f.cm.Global()
+	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: root, Name: "seed-original"}))
+	require.NoError(t, gc.Save())
+	require.NoError(t, f.lc.Seed(ctx))
+
+	beforeCheckout := f.checkoutOf("seed-original")
+	beforeGraph := f.familyOf("seed-original")
+
+	require.NoError(t, gc.RemoveRepo(root))
+	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: root, Name: "seed-renamed"}))
+	require.NoError(t, gc.Save())
+	f.restart()
+	require.NoError(t, f.lc.Seed(ctx))
+
+	reused, found, err := f.catalog.GetDedicatedGraphByOwner(ctx, beforeCheckout.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, beforeGraph.GraphID, reused.GraphID)
+	assert.Equal(t, beforeGraph.RepoPrefix, reused.RepoPrefix)
+	assert.Equal(t, beforeGraph.FamilyID, reused.FamilyID)
+
+	_, found, err = f.catalog.GetDedicatedGraph(ctx, GraphIDFor("seed-renamed"))
+	require.NoError(t, err)
+	assert.False(t, found, "restart must not mint a graph for the newly derived prefix")
+	graphs, err := f.catalog.ListDedicatedGraphs(ctx, beforeGraph.FamilyID)
+	require.NoError(t, err)
+	assert.Len(t, graphs, 1, "the stable checkout owner keeps exactly one dedicated graph")
+
+	afterCheckout := f.checkoutOf("seed-original")
+	assert.Equal(t, beforeCheckout.CheckoutID, afterCheckout.CheckoutID)
+	assert.Equal(t, beforeCheckout.Incarnation, afterCheckout.Incarnation)
+}
+
+func TestCheckoutLifecycleBindDedicatedGraphRejectsOwnerFamilyMismatch(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+
+	root := f.gitRepo("seed-owner-family-guard")
+	gc := f.cm.Global()
+	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: root, Name: "family-owner"}))
+	require.NoError(t, gc.Save())
+	require.NoError(t, f.lc.Seed(ctx))
+
+	checkout := f.checkoutOf("family-owner")
+	owned := f.familyOf("family-owner")
+	graphID, err := f.lc.bindDedicatedGraph(ctx, "different-family", checkout.CheckoutID, "different-prefix")
+	require.ErrorIs(t, err, store_sqlite.ErrCatalogStaleGuard)
+	assert.Empty(t, graphID)
+
+	standing, found, lookupErr := f.catalog.GetDedicatedGraphByOwner(ctx, checkout.CheckoutID)
+	require.NoError(t, lookupErr)
+	require.True(t, found)
+	assert.Equal(t, owned.GraphID, standing.GraphID)
+	_, found, lookupErr = f.catalog.GetDedicatedGraph(ctx, GraphIDFor("different-prefix"))
+	require.NoError(t, lookupErr)
+	assert.False(t, found, "a family mismatch must not insert a second graph")
+	graphs, lookupErr := f.catalog.ListDedicatedGraphs(ctx, owned.FamilyID)
+	require.NoError(t, lookupErr)
+	assert.Len(t, graphs, 1)
+}
+
 // TestCheckoutLifecycleInaccessibleRootIsForgottenAfterGrace covers a checkout
 // whose root and Git directory disappear together. It receives one
 // availability grace and is then removed completely, including its persisted

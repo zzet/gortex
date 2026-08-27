@@ -761,6 +761,23 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 	if checkoutID == "" {
 		return "", nil
 	}
+	reuseOwner := func() (string, bool, error) {
+		existing, found, err := l.catalog.GetDedicatedGraphByOwner(ctx, checkoutID)
+		if err != nil || !found {
+			return "", found, err
+		}
+		if existing.FamilyID != familyID {
+			return "", true, fmt.Errorf(
+				"%w: checkout %s already owns dedicated graph %s in family %s",
+				store_sqlite.ErrCatalogStaleGuard, checkoutID, existing.GraphID, existing.FamilyID,
+			)
+		}
+		return existing.GraphID, true, nil
+	}
+	if graphID, found, err := reuseOwner(); found || err != nil {
+		return graphID, err
+	}
+
 	graphID := GraphIDFor(prefix)
 	existing, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
@@ -794,6 +811,9 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 		State:           reconcile.GraphStateReady,
 	}
 	if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
+		if boundGraphID, found, lookupErr := reuseOwner(); found || lookupErr != nil {
+			return boundGraphID, lookupErr
+		}
 		if !row.IsPrimaryBase {
 			return "", err
 		}
@@ -802,6 +822,9 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 		// ordinary dedicated graph instead.
 		row.IsPrimaryBase = false
 		if retryErr := l.catalog.UpsertDedicatedGraph(ctx, row); retryErr != nil {
+			if boundGraphID, found, lookupErr := reuseOwner(); found || lookupErr != nil {
+				return boundGraphID, lookupErr
+			}
 			return "", retryErr
 		}
 	}

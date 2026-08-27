@@ -54,7 +54,7 @@ func hasTable(t *testing.T, db *sql.DB, name string) bool {
 
 // seedFamilyAndCheckout installs the minimum control plane a lifecycle test
 // needs: one family and one ready checkout inside it.
-func seedFamilyAndCheckout(t *testing.T, catalog *Catalog, familyID, checkoutID, incarnation string) {
+func seedFamilyAndCheckout(t testing.TB, catalog *Catalog, familyID, checkoutID, incarnation string) {
 	t.Helper()
 	ctx := context.Background()
 	if err := catalog.UpsertRepositoryFamily(ctx, RepositoryFamily{
@@ -1683,6 +1683,33 @@ func TestCatalogAuthorizedDemotionPreservesTransitionUntilCleanupCompletes(t *te
 	}
 	if _, found, err := catalog.GetIntentTransition(ctx, "demoted-wt"); err != nil || found {
 		t.Fatalf("transition after completion: found=%v err=%v", found, err)
+	}
+}
+
+func BenchmarkGetDedicatedGraphByOwnerReadyHit(b *testing.B) {
+	store := openCatalogStore(b)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	const (
+		familyID   = "bench-owner-family"
+		checkoutID = "bench-owner-checkout"
+		graphID    = "bench-owner-graph"
+	)
+	seedFamilyAndCheckout(b, catalog, familyID, checkoutID, "bench-owner-incarnation")
+	if err := catalog.UpsertDedicatedGraph(ctx, DedicatedGraph{
+		GraphID: graphID, OwnerCheckoutID: checkoutID, RepoPrefix: "bench-owner",
+		FamilyID: familyID, IsPrimaryBase: true, State: "ready",
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		graph, found, err := catalog.GetDedicatedGraphByOwner(ctx, checkoutID)
+		if err != nil || !found || graph.GraphID != graphID {
+			b.Fatalf("GetDedicatedGraphByOwner = %+v, found=%v, err=%v", graph, found, err)
+		}
 	}
 }
 

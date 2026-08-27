@@ -875,6 +875,36 @@ SELECT owner_checkout_id, repo_prefix, family_id, is_primary_base, active_genera
 	return dedicated, true, nil
 }
 
+// GetDedicatedGraphByOwner returns the graph bound to one checkout owner.
+// owner_checkout_id is unique, so it is the stable lookup when a restart or
+// reload derives a different presentation prefix for an existing binding.
+func (c *Catalog) GetDedicatedGraphByOwner(
+	ctx context.Context, ownerCheckoutID string,
+) (DedicatedGraph, bool, error) {
+	if err := requireCatalogID("owner checkout", ownerCheckoutID); err != nil {
+		return DedicatedGraph{}, false, err
+	}
+	dedicated := DedicatedGraph{OwnerCheckoutID: ownerCheckoutID}
+	var (
+		activeGen     sql.NullInt64
+		isPrimaryBase int
+	)
+	err := c.store.db.QueryRowContext(ctx, `
+SELECT graph_id, repo_prefix, family_id, is_primary_base, active_generation_id, state
+  FROM dedicated_graphs WHERE owner_checkout_id = ?`, ownerCheckoutID).Scan(
+		&dedicated.GraphID, &dedicated.RepoPrefix, &dedicated.FamilyID, &isPrimaryBase,
+		&activeGen, &dedicated.State)
+	if err == sql.ErrNoRows {
+		return DedicatedGraph{}, false, nil
+	}
+	if err != nil {
+		return DedicatedGraph{}, false, err
+	}
+	dedicated.ActiveGenerationID = activeGen.Int64
+	dedicated.IsPrimaryBase = isPrimaryBase != 0
+	return dedicated, true, nil
+}
+
 // ListDedicatedGraphs returns one family's dedicated graphs, ordered by graph
 // id so two passes over an unchanged family see the same order. It is how a
 // caller finds the family's primary base and the graph a given checkout owns,
