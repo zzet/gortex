@@ -31,7 +31,7 @@ var catalogTables = []string{
 	"cleanup_journal",
 }
 
-func openCatalogStore(t *testing.T) *Store {
+func openCatalogStore(t testing.TB) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
 	if err != nil {

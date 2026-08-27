@@ -773,9 +773,9 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	if !errors.Is(err, errRouteMoved) {
 		t.Fatalf("the loser failed with %v, want a lost route flip", err)
 	}
-	if !out.CommitBuilt {
-		t.Fatalf("the loser did not build before losing the flip: %+v", out)
-	}
+	// The loser may resolve the winner's canonical generation from the ready
+	// cache before its guarded bind loses. Building is not required for the
+	// compare-and-set invariant; preserving the winning route is.
 
 	route := f.route()
 	if route.CommitGenerationID != won.CommitGenerationID {
@@ -1531,16 +1531,23 @@ func TestCheckoutLifecycleCollectsAForgottenCheckoutsPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep after the grace: %v", err)
 	}
-	// Entering removal grace withdraws the overlay route immediately so reads
-	// fall back to the base graph. That first sweep may therefore collect the
-	// payload before the checkout identity itself is forgotten at the deadline.
-	if retired := grace.Retired + gone.Retired; retired != 2 {
-		t.Fatalf("the sweeps collected %d generations, want both slots of the forgotten checkout exactly once", retired)
+	primaryRoute, primaryFound, primaryErr := f.catalog.GetCheckoutRoute(ctx, tracked.CheckoutID)
+	if primaryErr != nil || !primaryFound || primaryRoute.CommitGenerationID != routed.CommitGenerationID {
+		t.Fatalf("the surviving primary does not route the shared commit generation: found=%v err=%v primary=%+v forgotten=%+v", primaryFound, primaryErr, primaryRoute, routed)
 	}
-	for _, generationID := range []int64{routed.CommitGenerationID, routed.DirtyGenerationID} {
-		if _, found, err := f.catalog.GetViewGeneration(ctx, generationID); err != nil || found {
-			t.Fatalf("generation %d outlived the checkout it was built for (err=%v)", generationID, err)
-		}
+
+	// Entering removal grace withdraws the overlay route immediately so reads
+	// fall back to the base graph. Only the forgotten checkout's unique dirty
+	// layer is collectable: its commit layer is canonical and still routed by
+	// the surviving primary checkout.
+	if retired := grace.Retired + gone.Retired; retired != 1 {
+		t.Fatalf("the sweeps collected %d generations, want the forgotten checkout's unique dirty layer exactly once", retired)
+	}
+	if _, found, err := f.catalog.GetViewGeneration(ctx, routed.DirtyGenerationID); err != nil || found {
+		t.Fatalf("dirty generation %d outlived the checkout it was built for (err=%v)", routed.DirtyGenerationID, err)
+	}
+	if _, found, err := f.catalog.GetViewGeneration(ctx, routed.CommitGenerationID); err != nil || !found {
+		t.Fatalf("shared commit generation %d did not survive the primary route (err=%v)", routed.CommitGenerationID, err)
 	}
 }
 

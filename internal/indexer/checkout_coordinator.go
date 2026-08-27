@@ -1082,7 +1082,7 @@ func (c *CheckoutCoordinator) ensureRoute(ctx context.Context, base primaryBase)
 
 // reconcileCommitSlot points the commit slot at a generation describing the
 // checkout's HEAD tree over the primary's base, building one only when no
-// generation with that identity can be reached.
+// canonical ready generation with that content identity can be reached.
 func (c *CheckoutCoordinator) reconcileCommitSlot(
 	ctx context.Context,
 	base primaryBase,
@@ -1107,28 +1107,36 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 	}
 
 	previous := route.CommitGenerationID
-	generationID, reused, err := c.resolveCommitLayer(ctx, base, targetTree)
+	resolved, err := c.resolveReadyCommitLayer(ctx, base, targetTree)
 	if err != nil {
 		return 0, err
 	}
-	if !reused {
+	if resolved.built {
 		out.CommitBuilt = true
 	}
-	if err := c.moveCommitSlot(ctx, route, generationID); err != nil {
-		if !reused {
-			c.supersede(ctx, generationID)
-			c.offerRetire(ctx, generationID)
+	// A generation adopted from another checkout carries that checkout's
+	// catalog owner identity. Content identity, not owner identity, makes it
+	// settled; avoid needlessly advancing the route epoch on every poll.
+	if route.CommitGenerationID == resolved.generationID && route.DirtyGenerationID <= 0 {
+		c.releaseReadyCommitLease(resolved.leaseToken)
+		c.retainCommit(ctx, key, resolved.generationID)
+		if resolved.reused {
+			out.CommitReused = true
 		}
-		// A cached generation is another cycle's work, not this one's, so a
-		// lost flip leaves it exactly as it was.
+		return resolved.generationID, nil
+	}
+	if err := c.moveReadyCommitSlot(ctx, route, resolved); err != nil {
+		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+			return 0, fmt.Errorf("%w: %s slot", errRouteMoved, store_sqlite.RouteSlotCommit)
+		}
 		return 0, err
 	}
-	if reused {
+	if resolved.reused {
 		out.CommitReused = true
 	}
-	c.retainCommit(ctx, key, generationID)
+	c.retainCommit(ctx, key, resolved.generationID)
 	c.releaseCommit(ctx, previous)
-	return generationID, nil
+	return resolved.generationID, nil
 }
 
 // resolveCommitLayer reaches a commit generation describing one tree over one

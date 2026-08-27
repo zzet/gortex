@@ -447,6 +447,15 @@ var generationFTSDocidMaps = []ftsDocidMap{
 // delete is keyed by generation and idempotent, so a retire killed part way
 // leaves a retiring row whose next run simply continues.
 func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64, inUse func(int64) bool) error {
+	return s.retirePayloadGeneration(ctx, generationID, inUse, nil)
+}
+
+func (s *Store) retirePayloadGeneration(
+	ctx context.Context,
+	generationID int64,
+	inUse func(int64) bool,
+	beforeRetirementClaim func(),
+) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
@@ -475,7 +484,10 @@ func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64,
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
 	}
-	if err := catalog.SetViewGenerationState(ctx, generationID, ViewGenerationRetiring); err != nil {
+	if beforeRetirementClaim != nil {
+		beforeRetirementClaim()
+	}
+	if err := catalog.beginPayloadGenerationRetirement(ctx, generationID); err != nil {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return err
 	}

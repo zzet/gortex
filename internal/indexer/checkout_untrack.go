@@ -137,6 +137,28 @@ func (l *CheckoutLifecycle) resolveDestructivePrefix(ctx context.Context, pathOr
 // a preview and the confirm that follows it read the same evidence — the only
 // thing that can come between them is another actor moving the rows, which is
 // what the incarnation and epoch guards on the confirm are for.
+type untrackDependentKey struct {
+	kind string
+	id   string
+}
+
+func uniqueUntrackDependents(dependents []reconcile.Dependent) []reconcile.Dependent {
+	if len(dependents) < 2 {
+		return dependents
+	}
+	seen := make(map[untrackDependentKey]struct{}, len(dependents))
+	out := dependents[:0]
+	for _, dependent := range dependents {
+		key := untrackDependentKey{kind: string(dependent.Kind), id: dependent.ID}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, dependent)
+	}
+	return out
+}
+
 func (l *CheckoutLifecycle) PreviewUntrack(ctx context.Context, pathOrPrefix string) (UntrackPreview, error) {
 	if l == nil || l.mi == nil {
 		return UntrackPreview{}, errors.New("indexer: checkout lifecycle is not wired")
@@ -183,7 +205,7 @@ func (l *CheckoutLifecycle) PreviewUntrack(ctx context.Context, pathOrPrefix str
 		}
 		out.Plan = UntrackPlanPrimaryClosure
 		out.PrimaryEpoch = closure.PrimaryEpoch
-		out.Closure, out.Preserved = closure.Dependents, closure.Preserved
+		out.Closure, out.Preserved = uniqueUntrackDependents(closure.Dependents), closure.Preserved
 		out.SolePrimary = closure.SoleGraph
 		return out, nil
 	}
@@ -243,6 +265,7 @@ func (l *CheckoutLifecycle) PreviewUntrack(ctx context.Context, pathOrPrefix str
 		ID:     checkout.CheckoutID,
 		Detail: "checkout " + checkout.AdminName + " keeps its identity and is served from graph " + primary.GraphID,
 	})
+	out.Closure = uniqueUntrackDependents(out.Closure)
 	return out, nil
 }
 

@@ -918,13 +918,13 @@ func TestPreviewUntrackListsThePrimaryClosure(t *testing.T) {
 	primary, found, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph)
 	require.NoError(t, err)
 	require.True(t, found)
-	assert.ElementsMatch(t, []string{
-		layerID(primary.ActiveGenerationID),
-		layerID(automaticRoute.CommitGenerationID),
-		layerID(automaticRoute.DirtyGenerationID),
-		layerID(ownerRoute.CommitGenerationID),
-		layerID(ownerRoute.DirtyGenerationID),
-	}, kinds[reconcile.DependentLayer], "the immutable base and every routed layer are named")
+	assert.ElementsMatch(t, uniqueLayerIDs(
+		primary.ActiveGenerationID,
+		automaticRoute.CommitGenerationID,
+		automaticRoute.DirtyGenerationID,
+		ownerRoute.CommitGenerationID,
+		ownerRoute.DirtyGenerationID,
+	), previewClosureLayerIDs(preview.Closure), "the immutable base and every routed layer are named")
 
 	require.Len(t, preview.Preserved, 1)
 	assert.Equal(t, tracked.GraphID, preview.Preserved[0].ID,
