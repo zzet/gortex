@@ -426,10 +426,12 @@ func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase,
 }
 
 // activeIsCurrent reports whether the generation the view already serves was
-// built from exactly these inputs and is still readable. A fingerprint match
-// settles the tree, the base and the extraction rules in one comparison; what
-// it deliberately says nothing about is the ref or the commit, which is what
-// makes a moved ref on an unchanged tree a metadata update.
+// built from exactly these inputs and its structural payload is still servable.
+// A fingerprint match settles the tree, base, and extraction rules. Producer
+// capability degradation does not stale that identity: materialization keeps
+// the structural view and request capability evaluation refuses only operations
+// that need the degraded producer. Ref/commit metadata remains excluded so a
+// moved ref with an unchanged tree is a metadata-only update.
 func (m *RefViewManager) activeIsCurrent(
 	ctx context.Context,
 	view store_sqlite.RefView,
@@ -442,14 +444,7 @@ func (m *RefViewManager) activeIsCurrent(
 	if err != nil {
 		return false, err
 	}
-	if !found || !servableGeneration(row.State) {
-		return false, nil
-	}
-	availability, err := m.catalog.ReadProducerAvailability(ctx, view.ActiveGenerationID, commitLayerSourceSnapshotCapability)
-	if err != nil {
-		return false, err
-	}
-	return availability.Declared && availability.State == store_sqlite.ProducerStateComplete, nil
+	return found && servableGeneration(row.State), nil
 }
 
 // coalesced answers a selection whose build is already in flight, from the
