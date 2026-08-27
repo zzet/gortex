@@ -1,6 +1,9 @@
 # Binary
 ./gortex
 /gortex
+# Locally-built fork binary: 318 MB, rebuild with
+#   go build -o bin/gortex ./cmd/gortex
+/bin/
 /gortex-linux
 /specs/
 
