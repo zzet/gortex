@@ -50,7 +50,7 @@ type refStack struct {
 	featureTree   string
 }
 
-func refIsolateGit(t *testing.T) {
+func refIsolateGit(t testing.TB) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skipf("git not on PATH: %v", err)
@@ -65,7 +65,7 @@ func refIsolateGit(t *testing.T) {
 	t.Setenv("GIT_TERMINAL_PROMPT", "0")
 }
 
-func refGit(t *testing.T, dir string, args ...string) string {
+func refGit(t testing.TB, dir string, args ...string) string {
 	t.Helper()
 	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
 	if err != nil {
@@ -74,7 +74,7 @@ func refGit(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func refWriteFiles(t *testing.T, dir string, files map[string]string) {
+func refWriteFiles(t testing.TB, dir string, files map[string]string) {
 	t.Helper()
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
@@ -86,7 +86,7 @@ func refWriteFiles(t *testing.T, dir string, files map[string]string) {
 // newRefStack builds the repository, indexes main, writes the catalog identity
 // the reconciler would have written, and wires a server that can serve views
 // of committed state.
-func newRefStack(t *testing.T) *refStack {
+func newRefStack(t testing.TB) *refStack {
 	t.Helper()
 	refIsolateGit(t)
 
@@ -178,7 +178,7 @@ func newRefStack(t *testing.T) *refStack {
 	}
 }
 
-func seedRefCatalog(t *testing.T, store *store_sqlite.Store, graphID, repo, headTree string) {
+func seedRefCatalog(t testing.TB, store *store_sqlite.Store, graphID, repo, headTree string) {
 	t.Helper()
 	ctx := context.Background()
 	catalog := store.Catalog()

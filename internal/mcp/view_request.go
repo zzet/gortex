@@ -537,10 +537,15 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 		return nil, nil
 	}
 	switch checkout.EffectiveMode {
-	case store_sqlite.CheckoutModeAutomatic, store_sqlite.CheckoutModeDedicated:
-		// Both modes have route-owned generations. Dedicated checkouts used to
-		// live directly in the legacy base corpus, but exact-HEAD anchoring now
-		// gives them a materialized route just like automatic worktrees.
+	case store_sqlite.CheckoutModeAutomatic:
+	case store_sqlite.CheckoutModeDedicated:
+		// Legacy dedicated graphs are the canonical base corpus and have no
+		// checkout route. Exact-HEAD dedicated graphs publish a route; only
+		// those route-owned views should attach worktree freshness metadata.
+		_, routed, routeErr := s.materializer.Catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
+		if routeErr == nil && !routed {
+			return nil, nil
+		}
 	default:
 		return nil, nil
 	}

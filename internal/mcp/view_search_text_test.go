@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -76,6 +77,40 @@ func TestSearchTextRefusesAViewOfACommittedTree(t *testing.T) {
 	}
 	if rider := resultFreshness(t, plain); rider != nil {
 		t.Errorf("a base search_text answer carries a view rider: %v", rider)
+	}
+}
+
+// TestViewForSessionCWDLeavesLegacyDedicatedCheckoutOnBase isolates the
+// canonical-checkout control above. A ready dedicated graph created before
+// checkout routes existed remains the base corpus until it owns an explicit
+// route; merely finding its CWD must not manufacture a composed view.
+func TestViewForSessionCWDLeavesLegacyDedicatedCheckoutOnBase(t *testing.T) {
+	stack := newRefStack(t)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), refTestSession), stack.repo)
+
+	view, err := stack.srv.viewForSessionCWD(ctx)
+	if err != nil {
+		t.Fatalf("resolve the legacy dedicated checkout: %v", err)
+	}
+	if view != nil {
+		t.Fatalf("legacy dedicated checkout resolved to a composed view: %+v", view)
+	}
+}
+
+func BenchmarkViewForSessionCWDLegacyDedicatedBase(b *testing.B) {
+	stack := newRefStack(b)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), refTestSession), stack.repo)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		view, err := stack.srv.viewForSessionCWD(ctx)
+		if err != nil {
+			b.Fatalf("resolve the legacy dedicated checkout: %v", err)
+		}
+		if view != nil {
+			b.Fatalf("legacy dedicated checkout resolved to a composed view: %+v", view)
+		}
 	}
 }
 
