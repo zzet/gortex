@@ -32,6 +32,27 @@ the XDG spec mandates it — so they must be absolute.
 
 `GORTEX_DAEMON_SOCKET` overrides just the socket if that is all you need.
 
+### Two traps that cost real time on 2026-08-27
+
+**`daemon stop` is not XDG-scoped when a service supervisor owns the daemon.**
+It reported "stopped via service supervisor" and took down the *official*
+Homebrew daemon, not the isolated one, despite the XDG variables being set.
+Stop a specific daemon by pointing `GORTEX_DAEMON_SOCKET` at its socket, or
+check `daemon status` afterwards — do not assume the env scoped it.
+
+**This shell already exports `XDG_CONFIG_HOME=$HOME/.config`** (`.zshrc` line
+23). So `gortex daemon start` from an interactive shell resolves
+`ConfigDir()` to `~/.config/gortex`, which is empty, and the daemon comes up
+with **zero tracked repos** while `~/.gortex/config.yaml` still holds all 47.
+Nothing is lost, but it looks like total index loss. The launchd-started
+daemon has no such variable, which is why it worked for eight days. Start the
+official daemon with:
+
+    env -u XDG_CONFIG_HOME gortex daemon start --detach
+
+Since the wrapper sets all three variables explicitly, the fork is unaffected
+either way.
+
 ### Verified, not assumed
 
 Three fork-only commands (`daemon status`, `repos`, a `call get_file_summary`)
@@ -70,19 +91,17 @@ your last fetch — it read "0 behind" while 1,304 commits behind.
 
 | | change | upstream? |
 |---|---|---|
-| 0 | `cobolDivRe`: `DIVISION\.` → `DIVISION\b` | **yes** |
+| 0 | `cobolDivRe`: `DIVISION\.` → `DIVISION\b` — **DONE**, `11e79383` | **yes** |
 | 1 | `COPY IDMS` multi-word form, `COPY REPLACING`, dynamic `CALL` | **yes** |
 | 2 | DATA DIVISION extractor — levels, PIC, REDEFINES, OCCURS | fork-local |
 | 3 | `$CBAP` macro preprocessor (56 macros) | fork-local, site-specific |
 | 4 | JCL `SET` / `INCLUDE` / `JCLLIB ORDER` symbolic resolution | **yes** |
 | 5 | `.ctl` / `.bms` / `.ezt` extractors | later |
 
-**Item 0 is a one-character fix affecting 441 of 506 DCC programs.** It survived
-this long because all three fixtures in `cobol_test.go` use the bare
-`PROCEDURE DIVISION.`; real code writes `PROCEDURE DIVISION USING LK-PARM.`,
-which the regex misses, so `inProcedure` never flips and the whole procedure
-division is skipped — no paragraphs, no PERFORM, no GO TO. Add a `USING` fixture
-with the fix.
+**Item 0 is done** (`11e79383`, branch `fix/cobol-procedure-division-using`).
+Controlled measurement on the DCC corpus, same binary, regex the only change:
+**nodes 14,780 → 35,670 (+141%), edges 23,449 → 90,404 (+286%)**. Two new
+fixtures, both verified to fail without the fix. Ready to open upstream.
 
 ## Extension collisions decide fork-vs-plugin
 
