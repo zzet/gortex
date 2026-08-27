@@ -25,7 +25,17 @@ var (
 	cobolDivRe     = regexp.MustCompile(`(?im)^\s*([A-Z][\w-]*)\s+DIVISION\b`)
 	cobolSectionRe = regexp.MustCompile(`(?im)^\s*([A-Z][\w-]*)\s+SECTION\.`)
 	cobolCallRe    = regexp.MustCompile(`(?im)\bCALL\s+["']([^"']+)["']`)
-	cobolCopyRe    = regexp.MustCompile(`(?im)\bCOPY\s+(\w[\w-]*)`)
+	// `COPY <name>`, and the IDMS DML precompiler's own
+	// `COPY IDMS [RECORD] <name>` — where the copybook is the trailing name,
+	// not the literal IDMS. Capturing the first word collapsed 590 such
+	// statements in one corpus onto a single import named "IDMS".
+	cobolCopyRe = regexp.MustCompile(`(?im)\bCOPY\s+(?:IDMS\s+(?:RECORD\s+)?)?(\w[\w-]*)`)
+	// `CALL <identifier>` — a dynamic call through a data name holding the
+	// program name. Quoted literals cannot match here (a quote is not a
+	// letter), so this and cobolCallRe partition the CALL statements. In one
+	// corpus dynamic calls outnumbered literal ones 829 to 352, so omitting
+	// them hid the majority of the inter-program call graph.
+	cobolDynCallRe = regexp.MustCompile(`(?im)\bCALL\s+([A-Za-z][\w-]*)`)
 
 	// A paragraph header is a lone name (optionally a trailing period) on
 	// its own line in area A. We match it after stripping leading
@@ -115,19 +125,39 @@ func (e *CobolExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	}
 
 	for _, m := range cobolCopyRe.FindAllSubmatchIndex(src, -1) {
-		mod := string(src[m[2]:m[3]])
 		line := lineAt(src, m[0])
+		if cobolIsComment(lines, line) {
+			continue
+		}
+		mod := string(src[m[2]:m[3]])
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: "unresolved::import::" + mod,
 			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
 		})
 	}
 	for _, m := range cobolCallRe.FindAllSubmatchIndex(src, -1) {
-		target := string(src[m[2]:m[3]])
 		line := lineAt(src, m[0])
+		if cobolIsComment(lines, line) {
+			continue
+		}
+		target := string(src[m[2]:m[3]])
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: "unresolved::" + target,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
+		})
+	}
+	for _, m := range cobolDynCallRe.FindAllSubmatchIndex(src, -1) {
+		line := lineAt(src, m[0])
+		if cobolIsComment(lines, line) {
+			continue
+		}
+		// The target is the data name, not the program: resolving it to the
+		// program needs the VALUE clause, which means DATA DIVISION support.
+		// Naming the identifier keeps the edge honest and resolvable later.
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: "unresolved::dyncall::" + string(src[m[2]:m[3]]),
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
+			Origin: graph.OriginASTInferred,
 		})
 	}
 
@@ -215,6 +245,24 @@ func (e *CobolExtractor) addCall(result *parser.ExtractionResult, from, to, file
 		From: from, To: to, Kind: graph.EdgeCalls,
 		FilePath: filePath, Line: line,
 	})
+}
+
+// cobolIsComment reports whether 1-based line n is a fixed-format comment --
+// '*' or '/' in the indicator column (column 7).
+//
+// The COPY and CALL regexes are unanchored and run over the whole source, so
+// without this they match commented-out code and English prose. On a
+// 1,564-file COBOL corpus that was 2,242 of 3,768 COPY matches and 117 of 469
+// CALL matches: phantom imports to real member names that are no longer
+// compiled, and calls to words like TO and FAILED. Anchored patterns
+// (PROGRAM-ID, DIVISION, SECTION) cannot match a comment line, because '*' is
+// not a letter, and are left alone.
+func cobolIsComment(lines []string, n int) bool {
+	if n < 1 || n > len(lines) {
+		return false
+	}
+	line := lines[n-1]
+	return len(line) > 6 && (line[6] == '*' || line[6] == '/')
 }
 
 // cobolStripLine returns the meaningful content of a COBOL source line:
