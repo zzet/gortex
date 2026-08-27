@@ -3,12 +3,15 @@ package mcp
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -92,7 +95,7 @@ func TestReviewRulepackMatches_JoinsRepoRelativeChangedFiles(t *testing.T) {
 		"pkg/widget.go": reviewRulepackFixture,
 	})
 
-	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/widget.go"}, prefix, nil)
+	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/widget.go"}, analysis.RepoRelativePath, prefix, nil)
 	require.NotEmpty(t, matches,
 		"repo-relative changed file must join the prefixed graph path %q/pkg/widget.go", prefix)
 
@@ -114,8 +117,36 @@ func TestReviewRulepackMatches_IgnoresUnchangedFiles(t *testing.T) {
 		"pkg/other.go":  "package pkg\n\nfunc Other() {}\n",
 	})
 
-	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/other.go"}, prefix, nil)
+	matches := srv.reviewRulepackMatches(context.Background(), []string{"pkg/other.go"}, analysis.RepoRelativePath, prefix, nil)
 	require.Empty(t, matches, "a file outside the changeset must not be scanned")
+}
+
+// TestReviewRulepackMatches_PrefixShadowedPathScansOnlyTheChangedTarget pins
+// the case that makes inferring the path domain unsafe. The repo's own tree
+// carries a top-level directory named like the repo prefix, so the changed
+// git-relative path `repo-a/pkg/widget.go` is *also* a well-formed graph key
+// for the different, unchanged file `pkg/widget.go`.
+//
+// Guessing "this already looks prefixed" skips the real key
+// `repo-a/repo-a/pkg/widget.go` — the changed file is never scanned, and the
+// unchanged shadow is scanned in its place. Both files carry the detector
+// fixture, so a wrong-target scan still returns matches and only the reported
+// path distinguishes the two outcomes.
+func TestReviewRulepackMatches_PrefixShadowedPathScansOnlyTheChangedTarget(t *testing.T) {
+	srv, prefix := setupPrefixedReviewServer(t, map[string]string{
+		"pkg/widget.go":        reviewRulepackFixture,
+		"repo-a/pkg/widget.go": reviewRulepackFixture,
+	})
+	require.Equal(t, "repo-a", prefix, "the fixture's shadow directory must equal the repo prefix")
+
+	matches := srv.reviewRulepackMatches(context.Background(),
+		[]string{"repo-a/pkg/widget.go"}, analysis.RepoRelativePath, prefix, nil)
+
+	require.NotEmpty(t, matches, "the changed nested file must be scanned")
+	for _, m := range matches {
+		require.Equal(t, "repo-a/pkg/widget.go", m.File,
+			"only the changed target may be scanned; %q is the unchanged shadow", m.File)
+	}
 }
 
 // TestReviewRulepackMatches_AcceptsAlreadyPrefixedChangedFiles covers the
@@ -127,7 +158,7 @@ func TestReviewRulepackMatches_AcceptsAlreadyPrefixedChangedFiles(t *testing.T) 
 	})
 
 	matches := srv.reviewRulepackMatches(context.Background(),
-		[]string{prefix + "/pkg/widget.go"}, prefix, nil)
+		[]string{prefix + "/pkg/widget.go"}, analysis.GraphKeyedPath, prefix, nil)
 	require.NotEmpty(t, matches, "an already-prefixed changed file must still join")
 	require.Equal(t, "pkg/widget.go", matches[0].File)
 }
@@ -166,4 +197,138 @@ func TestReview_PrefixedGraphReportsRulepackFinding(t *testing.T) {
 	for _, fr := range out.FileRisk {
 		require.NotContains(t, fr.File, "svc-repo/", "risk rows stay repo-relative")
 	}
+}
+
+// reviewShadowGitRepo builds the prefix-shadow fixture end to end: a git repo
+// whose own tree carries a top-level directory named like the repo prefix, so
+// the changed git-relative path `repo-a/pkg/widget.go` is simultaneously a
+// well-formed graph key for the different, unchanged `pkg/widget.go`.
+//
+// Both files carry the flagged source at the base commit and only the nested
+// one is modified. A wrong-target join therefore still produces findings — only
+// the path they are attributed to separates a correct run from a broken one.
+func reviewShadowGitRepo(t *testing.T) (root, changed, shadow string) {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "repo-a")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(rel, src string) {
+		abs := filepath.Join(dir, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(abs), 0o755))
+		require.NoError(t, os.WriteFile(abs, []byte(src), 0o644))
+	}
+
+	run("init", "-b", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	run("config", "diff.noprefix", "false")
+
+	// Flat paths on purpose. The raw-lookup defect only manifests when the
+	// changed git path is byte-identical to the shadow's graph key, and a
+	// nested spelling would differ by separator on Windows ("repo-a/pkg\widget.go"
+	// stored vs "repo-a/pkg/widget.go" from git) — masking the defect on this
+	// platform. One segment makes the two coincide everywhere.
+	shadow = "widget.go"
+	changed = "repo-a/widget.go"
+
+	flagged := "package pkg\n\nimport \"errors\"\n\n" +
+		"func Load() error {\n" +
+		"\terr := errors.New(\"boom\")\n" +
+		"\tif err == nil {\n" +
+		"\t\treturn err\n" +
+		"\t}\n" +
+		"\treturn nil\n" +
+		"}\n"
+
+	write(shadow, flagged)
+	write(changed, flagged)
+	run("add", ".")
+	run("commit", "-m", "base")
+	run("tag", "base-ref")
+
+	// Only the nested file moves, and the edit lands INSIDE Load so the
+	// hunk overlaps the function's line range. A top-of-file edit would
+	// change the file without touching any symbol, and ChangedSymbols would
+	// come back empty for a reason unrelated to the join under test.
+	write(changed, strings.Replace(flagged, `"boom"`, `"boom-changed"`, 1))
+	run("add", ".")
+	run("commit", "-m", "change")
+	return dir, changed, shadow
+}
+
+// TestReview_PrefixShadowAttributesOnlyTheChangedFile is the end-to-end half of
+// the prefix-shadow regression: it drives `review` through MapGitDiff,
+// JoinFileNodes and rankFileRisk rather than calling the narrowing directly, so
+// a domain collision anywhere along that path surfaces here.
+func TestReview_PrefixShadowAttributesOnlyTheChangedFile(t *testing.T) {
+	dir, changed, shadow := reviewShadowGitRepo(t)
+	srv, prefix := prefixedServerOver(t, dir, "repo-a")
+	require.Equal(t, "repo-a", prefix)
+
+	out := decodeReview(t, callReview(t, srv, map[string]any{
+		"repo": dir,
+		"base": "base-ref",
+	}))
+
+	require.GreaterOrEqual(t, out.Total, 1, "the changed file's planted finding must surface: %+v", out)
+	require.Equal(t, "BLOCK", out.Verdict)
+
+	for _, c := range out.Comments {
+		require.Equal(t, changed, filepath.ToSlash(c.File),
+			"a finding was attributed to %q; only %q changed", c.File, changed)
+	}
+	// Exactly one row: NotEqual(shadow) would still pass if the run
+	// produced BOTH a graph-prefixed row and a repo-relative one for the
+	// same file, which is what a domain collision in rankFileRisk does.
+	require.Len(t, out.FileRisk, 1,
+		"exactly one risk row for the one changed file: %+v", out.FileRisk)
+	require.Equal(t, changed, filepath.ToSlash(out.FileRisk[0].File),
+		"the risk row must name the changed file, not the unchanged shadow %q", shadow)
+}
+
+// TestReviewPack_PrefixShadowAttributesOnlyTheChangedFile covers the packaged
+// envelope: changed symbols, per-file risk and findings must all name the
+// changed nested file, never the unchanged same-named shadow.
+func TestReviewPack_PrefixShadowAttributesOnlyTheChangedFile(t *testing.T) {
+	dir, changed, shadow := reviewShadowGitRepo(t)
+	srv, prefix := prefixedServerOver(t, dir, "repo-a")
+	require.Equal(t, "repo-a", prefix)
+
+	out := decodeReviewPack(t, callReviewPack(t, srv, map[string]any{
+		"repo": dir,
+		"base": "base-ref",
+	}))
+
+	require.GreaterOrEqual(t, out.Total, 1, "the changed file's planted finding must surface: %+v", out)
+
+	// ChangedSymbols are graph-keyed: the real key nests the prefix twice.
+	require.NotEmpty(t, out.ChangedSymbols, "the changed nested file must contribute symbols")
+	// The key is the graph's own spelling, not a '/'-joined guess: the
+	// remainder after the prefix carries native separators.
+	wantPrefix := analysis.GraphKey(prefix, changed, analysis.RepoRelativePath) + "::"
+	for _, cs := range out.ChangedSymbols {
+		require.Truef(t, strings.HasPrefix(cs.ID, wantPrefix),
+			"changed symbol %q is not under the changed file %q", cs.ID, wantPrefix)
+	}
+	for _, f := range out.Findings {
+		require.Equal(t, changed, filepath.ToSlash(f.File),
+			"a finding was attributed to %q; only %q changed", f.File, changed)
+	}
+	// Exactly one row: NotEqual(shadow) would still pass if the run
+	// produced BOTH a graph-prefixed row and a repo-relative one for the
+	// same file, which is what a domain collision in rankFileRisk does.
+	require.Len(t, out.FileRisk, 1,
+		"exactly one risk row for the one changed file: %+v", out.FileRisk)
+	require.Equal(t, changed, filepath.ToSlash(out.FileRisk[0].File),
+		"the risk row must name the changed file, not the unchanged shadow %q", shadow)
 }

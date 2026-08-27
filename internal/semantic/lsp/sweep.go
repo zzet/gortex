@@ -112,3 +112,64 @@ func sweepFile(mode string, demand int, dispatch bool) bool {
 		return demand > 0 || dispatch
 	}
 }
+
+// OpenDocsEnv is the environment variable that overrides whether the
+// enrichment pass sends the textDocument/didOpen / didClose document
+// lifecycle before querying a file. "1" / "true" forces the lifecycle on
+// even for a server whose spec opts out; "0" / "false" skips it for every
+// server. Empty falls through to the spec's NoDidOpen.
+const OpenDocsEnv = "GORTEX_LSP_OPEN_DOCS"
+
+// normalizeOnOff canonicalises an on/off override value ("on" / "1" /
+// "true", "off" / "0" / "false") — the shared vocabulary of the open-docs
+// and heavy-requests overrides. An empty or unrecognised value returns ""
+// so the caller falls through to the next precedence source.
+func normalizeOnOff(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "1", "true":
+		return "on"
+	case "off", "0", "false":
+		return "off"
+	default:
+		return ""
+	}
+}
+
+// resolveOpensDocs reports whether the enrichment pass should send the
+// didOpen / didClose lifecycle for this server, by precedence: the
+// GORTEX_LSP_OPEN_DOCS env override wins over the operator-configured
+// value (`semantic.lsp_open_docs`), which wins over the spec's NoDidOpen,
+// which wins over the open-by-default fallback. An unrecognised value at
+// any level is ignored (falls through) rather than failing the pass.
+func resolveOpensDocs(configured string, spec *ServerSpec) bool {
+	if env := normalizeOnOff(os.Getenv(OpenDocsEnv)); env != "" {
+		return env == "on"
+	}
+	if cfg := normalizeOnOff(configured); cfg != "" {
+		return cfg == "on"
+	}
+	if spec != nil && spec.NoDidOpen {
+		return false
+	}
+	return true
+}
+
+// HeavyRequestsEnv is the environment variable that overrides the
+// heavy-request opt-out (ServerSpec.NoHeavyRequests) in both directions:
+// "on" / "1" / "true" restores textDocument/references and
+// callHierarchy/incomingCalls for a server whose spec opts out — the
+// operator runs a build without the FindReferences leak — while "off" /
+// "0" / "false" disables them for every server. Empty falls through to
+// the spec.
+const HeavyRequestsEnv = "GORTEX_LSP_HEAVY"
+
+// resolveNoHeavyRequests reports whether the enrichment pass must skip the
+// heavy request classes for this server: the GORTEX_LSP_HEAVY env override
+// wins over the spec's NoHeavyRequests, which wins over the allow-by-default
+// fallback. Shares the on/off vocabulary of the open-docs override.
+func resolveNoHeavyRequests(spec *ServerSpec) bool {
+	if env := normalizeOnOff(os.Getenv(HeavyRequestsEnv)); env != "" {
+		return env == "off"
+	}
+	return spec != nil && spec.NoHeavyRequests
+}

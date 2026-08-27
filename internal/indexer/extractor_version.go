@@ -66,6 +66,7 @@ var extractorSaltExtLang = map[string]string{
 	".cxx":  "cpp",
 	".hpp":  "cpp",
 	".hh":   "cpp",
+	".hxx":  "cpp",
 	".cs":   "csharp",
 	// Razor templates are extracted by the C# extractor over their
 	// embedded code blocks, so a C# extraction fix has to re-flag them

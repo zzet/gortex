@@ -70,11 +70,17 @@ func TestStaleLangsDetection(t *testing.T) {
 		if got := merkleSaltFor("src/Handler.php"); got != "php@2" {
 			t.Errorf("PHP extractor salt = %q, want php@2", got)
 		}
+		if got := merkleSaltFor("include/widget.hxx"); got != "cpp@2" {
+			t.Errorf("C++ extractor salt for .hxx = %q, want cpp@2", got)
+		}
 	})
 
 	t.Run("lang_for_file", func(t *testing.T) {
 		if got := ExtractorLangForFile("internal/auth/token.go"); got != "go" {
 			t.Errorf("ExtractorLangForFile(.go) = %q, want go", got)
+		}
+		if got := ExtractorLangForFile("include/widget.hxx"); got != "cpp" {
+			t.Errorf("ExtractorLangForFile(.hxx) = %q, want cpp", got)
 		}
 		if got := ExtractorLangForFile("README.zzz"); got != "" {
 			t.Errorf("ExtractorLangForFile(unknown) = %q, want \"\"", got)

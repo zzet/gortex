@@ -142,6 +142,11 @@ func newPlanLockFixture(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("open fixture store: %v", err)
 	}
+	// Registered after t.TempDir() so LIFO cleanup closes the database
+	// before the directory is removed. Without it the sqlite handle
+	// outlives the test and TempDir's RemoveAll fails on Windows, where
+	// an open file cannot be unlinked.
+	t.Cleanup(func() { _ = s.Close() })
 	kinds := []graph.NodeKind{
 		graph.KindLocal, graph.KindLocal, graph.KindLocal, graph.KindLocal,
 		graph.KindParam, graph.KindParam, graph.KindVariable,

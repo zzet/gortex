@@ -13,10 +13,13 @@ import (
 // This is deliberately DISTINCT from dead-code analysis (FindDeadCode):
 //
 //   - Dead-code analysis reports symbols with zero *incoming usage*
-//     edges — genuinely unreachable code. Such a symbol is still a
-//     normally extracted node: its file `defines` it, a method is
-//     `member_of` its type. The finding is actionable — the code is
-//     unused and can be removed.
+//     edges. Such a symbol is still a normally extracted node: its file
+//     `defines` it, a method is `member_of` its type. That is a narrower
+//     signal than "unreachable", and it is not a removal verdict: a call
+//     site the resolver left unresolved — an ambiguous member call, a
+//     name-only match — leaves exactly the same zero-incoming shape as
+//     genuinely unused code. Confirm a dead-code row against the source
+//     before deleting anything.
 //
 //   - This analyzer reports *isolated* nodes — nodes with zero edges of
 //     *any* kind, structural edges included. A normally extracted
@@ -98,8 +101,11 @@ const connectivityNote = "Connectivity health is a graph-EXTRACTION diagnostic, 
 	"symbol always has at least a structural edge, so an isolated node " +
 	"signals the indexer mis-extracted the symbol, NOT that the code is " +
 	"unused. This is distinct from dead code (analyze kind=dead_code), " +
-	"which reports symbols with zero INCOMING usage edges — genuinely " +
-	"unreachable code that is safe to remove."
+	"which reports symbols with zero INCOMING usage edges. That is a " +
+	"narrower signal, not a removal verdict: a call site the resolver " +
+	"left unresolved — an ambiguous member call, a name-only match — " +
+	"leaves the same zero-incoming shape as genuinely unused code, so " +
+	"confirm a dead_code row against the source before removing anything."
 
 // GraphConnectivity computes the connectivity-health report over the
 // supplied nodes. The caller passes the node slice (e.g. a

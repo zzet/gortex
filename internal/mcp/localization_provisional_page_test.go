@@ -62,7 +62,9 @@ func TestAProvisionalPageCostsLittleBeyondItsIdentities(t *testing.T) {
 	digest := provisionalTestDigest(t, provisionalTestRow())
 	overhead := len(digest.provisionalResponse) -
 		len(provisionalTestRow().File) - len(provisionalTestRow().ID)
-	require.Less(t, overhead, 220,
+	// The leading answer-shape directive is fixed cost on every page: it is the
+	// only instruction placed where it is read before the answer is formed.
+	require.Less(t, overhead, 400,
 		"fixed page cost must stay a small fraction of the %d-byte envelope budget",
 		exploreDefaultBudgetTokens*localizationEnvelopeBytesPerToken)
 }

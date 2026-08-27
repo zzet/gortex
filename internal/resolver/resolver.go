@@ -4299,6 +4299,14 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		}
 	}
 
+	// Without receiver evidence, more than one reachable method is ambiguous.
+	// Preserve the unresolved placeholder instead of inventing a caller for an
+	// arbitrary same-named method.
+	if receiverType == "" && methodCount > 1 {
+		stats.Unresolved++
+		return
+	}
+
 	// Interface-dispatch annotation: when the receiver type names a
 	// graph interface and multiple reachable methods of this name
 	// exist, every candidate is a legal runtime target. Mark the edge

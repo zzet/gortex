@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -245,6 +246,47 @@ func TestGraphConnectivity_IsolatedIsNotDeadCode(t *testing.T) {
 	assert.NotEqual(t, graph.ZeroEdgePossibleExtractionGap,
 		graph.ClassifyZeroEdge(g, "a.go::Unused"),
 		"the structurally-linked dead-code node is NOT an extraction gap")
+}
+
+// TestConnectivityNote_MatchesSharedZeroEdgeStance pins the standing note
+// against the per-symbol caveat vocabulary this analyzer says it stays in
+// lockstep with. graph.ClassifyZeroEdge — reused here for the
+// isolated/leaf split — deliberately refuses to call a zero-incoming
+// symbol proof of anything, because an unresolved or name-only call site
+// leaves the same shape. The note describing kind=dead_code must not
+// contradict that by promising the row is safe to delete.
+func TestConnectivityNote_MatchesSharedZeroEdgeStance(t *testing.T) {
+	nodes := []connNode{
+		{"a.go", graph.KindFile, "a.go"},
+		// Zero incoming *usage* edges, one structural edge — exactly the
+		// shape kind=dead_code reports on.
+		{"a.go::Unused", graph.KindFunction, "a.go"},
+	}
+	g, allNodes := buildConnGraph(nodes, []connEdge{{"a.go", "a.go::Unused"}})
+
+	// Control: the shared classifier sees this very shape and still hedges.
+	caveat := graph.CaveatForZeroEdge(g, "a.go::Unused")
+	require.NotNil(t, caveat, "the dead-code shape carries a zero-edge caveat")
+	require.Equal(t, graph.ZeroEdgeLikelyUnused, caveat.Class)
+	require.Contains(t, caveat.Message, "not proof",
+		"the shared caveat refuses to call zero incoming usage edges proof")
+
+	report := GraphConnectivity(g, allNodes, 0)
+	require.Equal(t, connectivityNote, report.Note, "the report carries the standing note")
+
+	// The distinction the note exists to draw must survive any rewording.
+	assert.Contains(t, report.Note, "dead_code", "the note still names the analyzer it contrasts with")
+	assert.Contains(t, report.Note, "INCOMING", "the note still states the dead_code signal")
+
+	// What must never come back: a removal verdict the classifier withholds.
+	lowered := strings.ToLower(report.Note)
+	for _, verdict := range []string{
+		"safe to remove", "safe to delete",
+		"can be removed", "can be deleted",
+	} {
+		assert.NotContains(t, lowered, verdict,
+			"the note must not promise removal safety the shared classifier withholds")
+	}
 }
 
 // TestGraphConnectivity_NilGraph asserts a nil graph yields a zero

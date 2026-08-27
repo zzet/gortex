@@ -762,11 +762,10 @@ func TestResolveMethodCall_ImportReachabilityFilter(t *testing.T) {
 		"reachability filter should pick the imported package's method")
 }
 
-// TestResolveMethodCall_LocalityPrefersSamePackage covers the locality
-// fallback: when two methods named "Do" survive Pass 0 (both packages
-// imported), the same-package method beats any cross-package candidate
-// regardless of name order.
-func TestResolveMethodCall_LocalityPrefersSamePackage(t *testing.T) {
+// TestResolveMethodCall_AmbiguousUntypedStaysUnresolved covers the locality
+// fallback boundary: when multiple reachable methods survive but the call has
+// no receiver-type evidence, locality is not enough to invent a concrete edge.
+func TestResolveMethodCall_AmbiguousUntypedStaysUnresolved(t *testing.T) {
 	g := graph.New()
 
 	g.AddNode(&graph.Node{ID: "pkg/a/main.go", Kind: graph.KindFile, FilePath: "pkg/a/main.go", Language: "go"})
@@ -809,9 +808,10 @@ func TestResolveMethodCall_LocalityPrefersSamePackage(t *testing.T) {
 	r := New(g)
 	stats := r.ResolveAll()
 
-	assert.Equal(t, 1, stats.Resolved)
-	assert.Equal(t, "pkg/a/helpers.go::Helper.Do", callEdge.To,
-		"same-package candidate should win the locality fallback")
+	assert.Equal(t, 0, stats.Resolved)
+	assert.Equal(t, 1, stats.Unresolved)
+	assert.Equal(t, "unresolved::*.Do", callEdge.To,
+		"an untyped call with multiple viable methods must remain unresolved")
 }
 
 // TestResolveMethodCall_InterfaceDispatchFanOut verifies that when the

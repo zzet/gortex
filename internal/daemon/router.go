@@ -285,7 +285,16 @@ func (r *Router) callLocal(ctx context.Context, toolName string, body []byte) ([
 // only. The verbatim remote-route path is never federated (no fan-out
 // recursion).
 func (r *Router) callLocalFederated(ctx context.Context, toolName string, body []byte, route RouteContext) ([]byte, int, error) {
-	out, status, err := r.callLocal(ctx, toolName, body)
+	localBody := body
+	if r.federator != nil {
+		// A non-mergeable-format request gets its local budget shrunk by
+		// the local-only note's size, so the note the response must carry
+		// has headroom by construction. The fan-out and the annotation
+		// keep the ORIGINAL body — the caller's cap is what the combined
+		// response is held to.
+		localBody = r.federator.ReserveLocalNoteBudget(toolName, body, len(route.EnabledRemotes))
+	}
+	out, status, err := r.callLocal(ctx, toolName, localBody)
 	if err != nil || r.federator == nil {
 		return out, status, err
 	}

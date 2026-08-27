@@ -89,6 +89,13 @@ func clearBuffer(dir string) {
 // within ttl without an os.ReadFile per event. It is the live resolver a
 // long-lived process hands to NewRecorderFunc. Safe for concurrent use.
 func CachedConsentResolver(dir string, ttl time.Duration) func() bool {
+	return cachedConsentResolver(dir, ttl, time.Now)
+}
+
+// cachedConsentResolver is CachedConsentResolver with an injectable clock, so a
+// test can step across the TTL boundary instead of racing a real deadline
+// against a loaded machine's scheduler and disk.
+func cachedConsentResolver(dir string, ttl time.Duration, clock func() time.Time) func() bool {
 	var (
 		mu        sync.Mutex
 		enabled   bool
@@ -98,7 +105,7 @@ func CachedConsentResolver(dir string, ttl time.Duration) func() bool {
 	return func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		now := time.Now()
+		now := clock()
 		if !valid || now.Sub(checkedAt) >= ttl {
 			enabled = ResolveConsent(LoadConsentConfig(dir), os.Getenv).Enabled
 			checkedAt = now

@@ -162,7 +162,7 @@ func TestEncodeSubGraph_DistinctCallSitesNotDeduped(t *testing.T) {
 		},
 		TotalNodes: 2,
 	}
-	payload, err := encodeSubGraph("walk_graph", sg)
+	payload, err := encodeSubGraph("walk_graph", sg, nil)
 	require.NoError(t, err)
 	dec := wire.NewDecoder(strings.NewReader(string(payload)))
 	_, err = dec.Header()
@@ -193,7 +193,7 @@ func TestEncodeSubGraph_NodesAndEdgesSections(t *testing.T) {
 		},
 		TotalNodes: 2,
 	}
-	payload, err := encodeSubGraph("get_callers", sg)
+	payload, err := encodeSubGraph("get_callers", sg, nil)
 	require.NoError(t, err)
 	dec := wire.NewDecoder(strings.NewReader(string(payload)))
 

@@ -159,6 +159,15 @@ func (s *Server) readerFor(ctx context.Context) graph.Reader {
 	return s.graph
 }
 
+// nodeGetterFor returns the request-scoped node lookup: the session
+// overlay view when one rides the context, the base graph otherwise.
+// Output classification (is_test labels, usage summary, flavor
+// resolution) must read the same view engineFor's query ran on, or an
+// overlay-only owner classifies differently in the filter and the rows.
+func (s *Server) nodeGetterFor(ctx context.Context) graph.NodeGetter {
+	return s.readerFor(ctx)
+}
+
 // engineFor returns the query engine scoped to the calling request's
 // graph reader. For non-overlay calls this is `s.engine` unchanged;
 // for overlay-active calls the returned engine reads through the

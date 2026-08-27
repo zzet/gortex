@@ -205,6 +205,76 @@ func (v *lspGraphView) findDeclarationNode(filePath string, oneBasedLine int, na
 	return near
 }
 
+// findEnclosingTypeNamed returns the type / interface declaration named name
+// whose span contains oneBasedLine in filePath. This is the ctor shape:
+// definition on `new T(...)` answers the constructor's line — a member with
+// its own name — but the line sits inside the declaration of the very type
+// the site instantiates.
+func (v *lspGraphView) findEnclosingTypeNamed(filePath string, oneBasedLine int, name string) *graph.Node {
+	for _, n := range v.nodesByFile[viewPathKey(filePath)] {
+		if n == nil || n.Name != name {
+			continue
+		}
+		if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
+			continue
+		}
+		if n.StartLine <= oneBasedLine && oneBasedLine <= n.EndLine {
+			return n
+		}
+	}
+	return nil
+}
+
+// declaredDispatchMember reports whether n is a declared dispatch target — a
+// member of an interface, or an abstract-marked member. A definition landing
+// on one means the call site's static receiver is the declared surface, not
+// any concrete impl.
+func (v *lspGraphView) declaredDispatchMember(n *graph.Node) bool {
+	if n == nil {
+		return false
+	}
+	if isAbstractMarked(n) {
+		return true
+	}
+	parent := v.memberParentType(n)
+	return parent != nil && parent.Kind == graph.KindInterface
+}
+
+// implementsDeclaredMember reports whether impl is a concrete implementation
+// of the declared member decl: an explicit overrides edge, or membership in a
+// type that implements / extends decl's declaring type.
+func (v *lspGraphView) implementsDeclaredMember(impl, decl *graph.Node) bool {
+	if impl == nil || decl == nil {
+		return false
+	}
+	for _, e := range v.outByID[impl.ID] {
+		if e.Kind == graph.EdgeOverrides && e.To == decl.ID {
+			return true
+		}
+	}
+	implParent := v.memberParentType(impl)
+	declParent := v.memberParentType(decl)
+	if implParent == nil || declParent == nil {
+		return false
+	}
+	for _, e := range v.outByID[implParent.ID] {
+		if (e.Kind == graph.EdgeImplements || e.Kind == graph.EdgeExtends) && e.To == declParent.ID {
+			return true
+		}
+	}
+	return false
+}
+
+// memberParentType resolves n's declaring type through its member_of edge.
+func (v *lspGraphView) memberParentType(n *graph.Node) *graph.Node {
+	for _, e := range v.outByID[n.ID] {
+		if e.Kind == graph.EdgeMemberOf {
+			return v.nodesByID[e.To]
+		}
+	}
+	return nil
+}
+
 func (v *lspGraphView) findMatchingEdge(from, to string, kind graph.EdgeKind) *graph.Edge {
 	for _, e := range v.outByID[from] {
 		if e.To == to && e.Kind == kind {

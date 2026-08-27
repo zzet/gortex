@@ -141,6 +141,9 @@ const qCSharpAll = `
       (variable_declarator
         (identifier) @lvar.name))) @lvar.def
 
+  (assignment_expression
+    left: (identifier) @fassign.name) @fassign.expr
+
   (member_access_expression
     name: [
       (identifier) @maccess.name
@@ -317,6 +320,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	var locals []csharpDeferredLocal
 	var typeUses []csharpTypeUse
 	var accesses []csharpDeferredAccess
+	var fieldAssigns []csharpDeferredFieldAssign
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -400,6 +404,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				line:        expr.StartLine + 1,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
 			}, expr.Node))
+
+		case m.Captures["fassign.name"] != nil:
+			fieldAssigns = append(fieldAssigns, csharpDeferredFieldAssign{
+				name: m.Captures["fassign.name"].Text,
+				line: m.Captures["fassign.expr"].StartLine + 1,
+			})
 
 		case m.Captures["maccess.expr"] != nil:
 			accesses = append(accesses, csharpDeferredAccess{
@@ -740,6 +750,25 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	// receiver-typing ladder needs the finished tenv.
 	emitCSharpMemberAccesses(accesses, src, filePath, funcRanges,
 		tenvByOwner, builtinsByOwner, result)
+
+	// Field-identifier uses need the shadow indexes: every DECLARED
+	// local by name (typed or not — tenv alone holds only the typed
+	// ones), parameters, and builtin-typed locals.
+	localNamesByOwner := map[string]map[string]bool{}
+	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
+		m := localNamesByOwner[owner]
+		if m == nil {
+			m = map[string]bool{}
+			localNamesByOwner[owner] = m
+		}
+		m[l.name] = true
+	}
+	emitCSharpFieldIdentifierUses(calls, accesses, fieldAssigns, src,
+		filePath, funcRanges, localNamesByOwner, builtinsByOwner, result)
 
 	// .NET surfaces a symbol walk misses: DI registrations + COM
 	// interop. Stamped onto the file node.

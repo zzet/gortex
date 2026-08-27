@@ -197,6 +197,42 @@ func TestDocSession_LRUEvictsPairedAndBounded(t *testing.T) {
 	assert.Equal(t, 3, opens, "each of the three files was opened once")
 }
 
+// A session with the lifecycle off (sendOpens=false) still evicts to keep
+// the content cache bounded — and the evictions counter must record that
+// churn. Eviction telemetry tracks the cache, not the didClose traffic;
+// the lifecycle counters (didOpens, peak) stay honestly zero.
+func TestDocSession_NoSendOpens_EvictionsStillCounted(t *testing.T) {
+	repoRoot := t.TempDir()
+	files := []string{"a.go", "b.go", "c.go"}
+	for _, f := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(repoRoot, f), []byte("package main\n"), 0o644))
+	}
+
+	server := newInstrumentedServer()
+	p, cleanup := providerWithInstrumentedServer(t, server, []string{"go"}, 1)
+	defer cleanup()
+
+	session := newDocSession(p)
+	session.cap = 2
+	session.sendOpens = false
+
+	for _, f := range files {
+		_, release, err := session.acquire(p.client, filepath.Join(repoRoot, f))
+		require.NoError(t, err)
+		release()
+	}
+
+	didOpens, _, evictions, peakOpen := session.stats()
+	assert.Zero(t, didOpens, "no lifecycle — didOpen telemetry stays zero")
+	assert.Zero(t, peakOpen)
+	assert.Equal(t, 1, evictions,
+		"the third acquire evicted the oldest cache entry and must be counted")
+
+	_, opens, closes := server.stats()
+	assert.Zero(t, opens, "no didOpen is ever sent")
+	assert.Zero(t, closes, "no didClose is ever sent")
+}
+
 // Pinned entries are never evicted: holding refs on cap files and acquiring one
 // more overshoots cap (no didClose) rather than closing a pinned document.
 func TestDocSession_PinnedNeverEvicted(t *testing.T) {

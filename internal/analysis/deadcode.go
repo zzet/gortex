@@ -280,6 +280,7 @@ func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []str
 	}
 
 	var result []DeadCodeEntry
+	var resultNodes []*graph.Node
 	for _, n := range candidates {
 		// Skip kinds the analyzer never reports — structural,
 		// extracted metadata, infra, function-shape, and value-only
@@ -478,7 +479,58 @@ func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []str
 			FilePath: n.FilePath,
 			Line:     n.StartLine,
 		})
+		resultNodes = append(resultNodes, n)
 	}
+
+	// Resolve unresolved same-name evidence in one batched store query. These
+	// edges mean resolution coverage is incomplete, so zero concrete incoming
+	// edges is not proof that a same-named callable is dead.
+	placeholderSeen := make(map[string]struct{})
+	placeholderIDs := make([]string, 0, len(resultNodes)*4)
+	for _, n := range resultNodes {
+		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
+			continue
+		}
+		for _, id := range graph.UnresolvedNameCandidateIDs(n) {
+			if id == "" {
+				continue
+			}
+			if _, seen := placeholderSeen[id]; seen {
+				continue
+			}
+			placeholderSeen[id] = struct{}{}
+			placeholderIDs = append(placeholderIDs, id)
+		}
+	}
+
+	unresolvedInDegree := make(map[string]int)
+	if counter, ok := g.(graph.InDegreeForNodes); ok {
+		unresolvedInDegree = counter.InDegreeForNodes(placeholderIDs)
+	} else {
+		for _, id := range placeholderIDs {
+			if count := len(g.GetInEdges(id)); count > 0 {
+				unresolvedInDegree[id] = count
+			}
+		}
+	}
+
+	filtered := result[:0]
+	for i, entry := range result {
+		n := resultNodes[i]
+		incomplete := false
+		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+			for _, id := range graph.UnresolvedNameCandidateIDs(n) {
+				if unresolvedInDegree[id] > 0 {
+					incomplete = true
+					break
+				}
+			}
+		}
+		if !incomplete {
+			filtered = append(filtered, entry)
+		}
+	}
+	result = filtered
 
 	// Sort by file path then line for deterministic output
 	sort.Slice(result, func(i, j int) bool {

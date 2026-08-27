@@ -114,7 +114,7 @@ func (e *Engine) FindNameOnlyCandidates(node *graph.Node, bound []*graph.Edge, o
 			out.Total--
 			continue
 		}
-		if opts.ExcludeTests && isTestSource(from) {
+		if opts.ExcludeTests && e.isTestSource(from) {
 			out.Total--
 			continue
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,19 +25,37 @@ func testEvidenceDigest() *localizationEvidenceDigest {
 
 func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResult, _, _ string) localizationTerminalContract {
 	t.Helper()
-	if result == nil || result.IsError {
-		t.Fatalf("terminal replay = %#v, want successful MCP result", result)
-	}
-	text, ok := singleTextContent(result)
-	if !ok || !strings.Contains(text, localizationAnswerReadyDirective) {
-		t.Fatalf("terminal replay content = %#v", result.Content)
-	}
-	for _, required := range []string{
+	return requireLocalizationReplayClosing(t, result, localizationAnswerReadyDirective, []string{
 		"Localization for this task is complete",
 		"Answer now",
 		"naming the files and symbols you rely on",
 		"another navigation call is not",
-	} {
+	})
+}
+
+// A localization that spent its recovery allowances without corroborating
+// anything replays the same structure under the closing line that says so.
+func requireLocalizationUnconfirmedReplay(t *testing.T, result *mcpgo.CallToolResult) localizationTerminalContract {
+	t.Helper()
+	return requireLocalizationReplayClosing(t, result, localizationUnconfirmedAnswerDirective, []string{
+		"bounded localization allowance is spent",
+		"Answer now",
+		"say plainly that the match is unconfirmed",
+	})
+}
+
+func requireLocalizationReplayClosing(
+	t *testing.T, result *mcpgo.CallToolResult, directive string, required []string,
+) localizationTerminalContract {
+	t.Helper()
+	if result == nil || result.IsError {
+		t.Fatalf("terminal replay = %#v, want successful MCP result", result)
+	}
+	text, ok := singleTextContent(result)
+	if !ok || !strings.Contains(text, directive) {
+		t.Fatalf("terminal replay content = %#v", result.Content)
+	}
+	for _, required := range required {
 		if !strings.Contains(text, required) {
 			t.Fatalf("terminal replay text %q does not contain %q", text, required)
 		}
@@ -61,14 +80,14 @@ func requireLocalizationTerminalReplay(t *testing.T, result *mcpgo.CallToolResul
 	// The answer rides the completion once; the top level carries only the
 	// pointer to it, so the same block is never billed twice on the wire.
 	if _, duplicated := structured["final_response"]; duplicated ||
-		structured["directive"] != localizationAnswerReadyDirective ||
+		structured["directive"] != directive ||
 		contract.Completion.FinalResponse == "" {
 		t.Fatalf("terminal replay stable keys = %#v", structured)
 	}
 	if text != contract.Completion.FinalResponse {
 		t.Fatalf("terminal replay text diverged from final_response: %q", text)
 	}
-	if !strings.HasSuffix(contract.Completion.FinalResponse, localizationAnswerReadyDirective) {
+	if !strings.HasSuffix(contract.Completion.FinalResponse, directive) {
 		t.Fatalf("terminal convergence directive is outside final_response: %q", contract.Completion.FinalResponse)
 	}
 	return contract
@@ -174,9 +193,17 @@ func TestRefinementAllowsOneAlternateRankedCandidateRead(t *testing.T) {
 		testEvidenceDigest(),
 	)
 
-	if completion := state.completionLocked(); !strings.Contains(completion.RequiredAction, "recommended") ||
+	completion := state.completionLocked()
+	if !strings.Contains(completion.RequiredAction, preferred) ||
+		!strings.Contains(completion.RequiredAction, alternate) ||
 		!strings.Contains(completion.RequiredAction, "any returned candidate") {
-		t.Fatalf("required action does not explain alternate candidate authorization: %q", completion.RequiredAction)
+		t.Fatalf("required action does not name the ranked alternates it authorizes: %q", completion.RequiredAction)
+	}
+	// Obeying the directive has to stay productive when the top candidate is
+	// wrong, so it names what to do next instead of ending at one read.
+	if !strings.Contains(completion.RequiredAction, "does not match the task's anchor terms") ||
+		!strings.Contains(completion.RequiredAction, "one bounded search") {
+		t.Fatalf("required action ends at the first candidate: %q", completion.RequiredAction)
 	}
 	args := map[string]any{"target": map[string]any{"symbol": alternate}}
 	if blocked, reserved := state.authorize("read", "source", args); blocked != nil || !reserved {
@@ -1660,5 +1687,107 @@ func TestAnswerReadyNavigationDispatchNeverInvokesLegacyHandler(t *testing.T) {
 	}
 	if text, _ := singleTextContent(called.Result); strings.Contains(text, localizationAnswerReadyDirective) {
 		t.Fatalf("capabilities was incorrectly intercepted: %q", text)
+	}
+}
+
+// The instruction that says what an answer must look like is the one
+// instruction a closing line cannot deliver: by the time it is read, the
+// answer is already shaped. It leads every page instead.
+func TestAnswerPagesLeadWithTheAnswerShapeDirective(t *testing.T) {
+	digest := provisionalTestDigest(t, provisionalTestRow())
+	pages := map[string]string{
+		"proven":      digest.finalResponse,
+		"provisional": digest.provisionalResponse,
+	}
+	for name, page := range pages {
+		lines := strings.Split(page, "\n")
+		if len(lines) < 3 {
+			t.Fatalf("%s page is too short to carry a leading directive: %q", name, page)
+		}
+		if got := lines[1] + "\n" + lines[2]; got != localizationAnswerShapeDirective {
+			t.Fatalf("%s page does not lead with the answer shape: %q", name, got)
+		}
+		if strings.Index(page, localizationAnswerShapeDirective) > strings.Index(page, "- PRIMARY") {
+			t.Fatalf("%s page buried the answer shape below its rows: %q", name, page)
+		}
+	}
+	// Two lines is the whole budget: every byte here is a byte the rows lose.
+	if strings.Count(localizationAnswerShapeDirective, "\n") != 1 {
+		t.Fatalf("answer shape directive is not two lines: %q", localizationAnswerShapeDirective)
+	}
+	for _, required := range []string{"2-3 strongest candidates", "Class.method", "unconfirmed"} {
+		if !strings.Contains(localizationAnswerShapeDirective, required) {
+			t.Fatalf("answer shape directive is missing %q: %q", required, localizationAnswerShapeDirective)
+		}
+	}
+}
+
+// A caller repeating a keyword-indexed constructor or a positional tie-break
+// suffix is naming a symbol no reader recognizes. Presentation drops both; the
+// identities the graph and the host envelope carry keep their exact spelling.
+func TestPresentedIdentitiesDropSyntheticSpellings(t *testing.T) {
+	constructor := localizationDigestRow{
+		Rank: 1, ID: "src/Foo.java::Foo.<init>_L42", Name: "Foo.<init>",
+		QualName: "Foo.<init>", Kind: "method", File: "src/Foo.java", Line: 42,
+	}
+	positional := localizationDigestRow{
+		Rank: 2, ID: "src/app.ts::handleRequest@17", Name: "handleRequest",
+		Kind: "function", File: "src/app.ts", Line: 17,
+	}
+	digest := provisionalTestDigest(t, constructor, positional)
+
+	for _, page := range []string{digest.finalResponse, digest.provisionalResponse} {
+		for _, synthetic := range []string{"<init>", "_L42", "handleRequest@17"} {
+			if strings.Contains(page, synthetic) {
+				t.Fatalf("page presented the synthetic spelling %q: %q", synthetic, page)
+			}
+		}
+		for _, presented := range []string{"src/Foo.java::Foo constructor", "src/app.ts::handleRequest"} {
+			if !strings.Contains(page, presented) {
+				t.Fatalf("page does not present %q: %q", presented, page)
+			}
+		}
+	}
+	if digest.Evidence[0].ID != constructor.ID || digest.Evidence[1].ID != positional.ID {
+		t.Fatalf("presentation changed retained identities: %#v", digest.Evidence)
+	}
+	for _, id := range []string{constructor.ID, positional.ID} {
+		if !slices.Contains(digest.Symbols, id) {
+			t.Fatalf("machine symbol list lost %q: %#v", id, digest.Symbols)
+		}
+	}
+}
+
+// The suffix is stripped because it repeats the row's own line column. A name
+// that merely ends in a number is a different declaration and keeps it.
+func TestPositionalSuffixTrimRequiresTheRowsOwnLine(t *testing.T) {
+	tests := []struct {
+		name string
+		row  localizationDigestRow
+		want string
+	}{
+		{
+			name: "declaration named for a cache level",
+			row: localizationDigestRow{
+				Rank: 1, ID: "src/cache.go::CACHE_L2", Name: "CACHE_L2",
+				Kind: "field", File: "src/cache.go", Line: 87,
+			},
+			want: "src/cache.go::CACHE_L2",
+		},
+		{
+			name: "overload disambiguated by its line",
+			row: localizationDigestRow{
+				Rank: 1, ID: "src/Cache.java::Cache.get_L87", Name: "Cache.get",
+				Kind: "method", File: "src/Cache.java", Line: 87,
+			},
+			want: "src/Cache.java::Cache.get",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := localizationFinalResponseSymbolLabel(test.row, false); got != test.want {
+				t.Fatalf("presented identity = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

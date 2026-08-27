@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -142,10 +143,12 @@ type QueryOptions struct {
 	// soft breadth control inside any workspace boundary, not a
 	// replacement for caller-side workspace isolation.
 	RepoAllow map[string]bool `json:"repo_allow,omitempty"`
-	// ExcludeTests, when true, drops edges originating from a function
-	// flagged as a test (Node.Meta["is_test"] = true) — set by the
-	// indexer's test-edge pass. Lets find_usages / get_callers answer
-	// "who depends on X *in production*" without test-noise dilution.
+	// ExcludeTests, when true, drops edges originating in test code —
+	// nodes flagged by the indexer's test-edge pass (Node.Meta["is_test"]
+	// = true) plus unflagged node kinds whose file path matches the
+	// canonical test predicate (see isTestSource). Lets find_usages /
+	// get_callers answer "who depends on X *in production*" without
+	// test-noise dilution.
 	ExcludeTests bool `json:"exclude_tests,omitempty"`
 
 	// IncludeDispatch makes a forward call-graph walk (get_call_chain /
@@ -370,6 +373,81 @@ func (sg *SubGraph) FilterByMinTier(minTier string) {
 			MaxAvailableTier:  maxDroppedOrigin,
 		}
 	}
+}
+
+// SortEdgesForPage orders usage edges into the one stable global order
+// a row cap may consume: strongest evidence first (origin tier rank,
+// then confidence), with file/line/kind/from/to as deterministic
+// tie-breakers. Backends iterate in-edges differently (the memory
+// store by insertion, SQLite grouped by kind), so a page cut without
+// this sort would depend on which store served it and could evict an
+// lsp_resolved row in favor of an earlier weak one.
+func SortEdgesForPage(edges []*graph.Edge) {
+	sort.SliceStable(edges, func(i, j int) bool {
+		a, b := edges[i], edges[j]
+		ar, br := graph.OriginRank(effectiveOrigin(a)), graph.OriginRank(effectiveOrigin(b))
+		if ar != br {
+			return ar > br
+		}
+		if a.Confidence != b.Confidence {
+			return a.Confidence > b.Confidence
+		}
+		// Edge.Confidence is excluded from JSON, so rows that crossed a
+		// serialization boundary (federation peers) read zero and carry
+		// only the label — the sortable rank that survives the wire.
+		if ar, br := graph.ConfidenceLabelRank(a.ConfidenceLabel), graph.ConfidenceLabelRank(b.ConfidenceLabel); ar != br {
+			return ar > br
+		}
+		if a.FilePath != b.FilePath {
+			return a.FilePath < b.FilePath
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		return a.To < b.To
+	})
+}
+
+// UsageSummaryOf computes the completeness rollup over a usage
+// SubGraph: total references, distinct files (per-edge path with a
+// from-node fallback), and test-originated references via the shared
+// classifier (graph.NodeIsTest — the same authority order the
+// exclude_tests filter applies, so the rollup never disagrees with the
+// rows). g resolves child-node owners; nil skips only that hop. Nil
+// for an empty result — the zero-edge caveat explains that case.
+func UsageSummaryOf(sg *SubGraph, g graph.NodeGetter) *UsageSummary {
+	if sg == nil || len(sg.Edges) == 0 {
+		return nil
+	}
+	nodeByID := make(map[string]*graph.Node, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n != nil {
+			nodeByID[n.ID] = n
+		}
+	}
+	files := make(map[string]struct{}, len(sg.Edges))
+	testRefs := 0
+	for _, e := range sg.Edges {
+		from := nodeByID[e.From]
+		file := e.FilePath
+		if file == "" && from != nil {
+			file = from.FilePath
+		}
+		if file == "" {
+			file = "(unknown)"
+		}
+		files[file] = struct{}{}
+		if graph.NodeIsTest(g, from) {
+			testRefs++
+		}
+	}
+	return &UsageSummary{NRefs: len(sg.Edges), NFiles: len(files), NTestRefs: testRefs}
 }
 
 // effectiveOrigin returns the edge's origin tier, backfilled for edges

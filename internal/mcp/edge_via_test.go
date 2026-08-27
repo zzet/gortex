@@ -29,7 +29,7 @@ func TestEncodeSubGraphEmitsViaColumn(t *testing.T) {
 			{From: "a", To: "b", Kind: graph.EdgeCalls, Origin: graph.OriginASTInferred, Via: "observer channel"},
 		},
 	}
-	out, err := encodeSubGraph("walk_graph", sg)
+	out, err := encodeSubGraph("walk_graph", sg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

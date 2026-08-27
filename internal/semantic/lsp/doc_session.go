@@ -23,6 +23,14 @@ import (
 type docSession struct {
 	p   *Provider
 	cap int // simultaneously-open ceiling per client
+	// sendOpens gates the server-side lifecycle. When false (the provider's
+	// opensDocs resolved off — see ServerSpec.NoDidOpen) the session keeps
+	// its entry / LRU machinery purely as a bounded content cache: acquire
+	// still reads and caches file bytes, but no didOpen / didClose is ever
+	// sent, and the open-lifecycle telemetry (didOpens, curOpen, peakOpen)
+	// honestly reports zero. Evictions still count — they track the cache
+	// churn either way.
+	sendOpens bool
 
 	mu        sync.Mutex
 	perClient map[*Client]*clientDocs
@@ -65,6 +73,7 @@ func newDocSession(p *Provider) *docSession {
 	return &docSession{
 		p:          p,
 		cap:        cp,
+		sendOpens:  p.opensDocs,
 		perClient:  map[*Client]*clientDocs{},
 		openCounts: map[string]int{},
 	}
@@ -115,21 +124,28 @@ func (s *docSession) acquire(c *Client, absPath string) ([]byte, func(), error) 
 		evPath := front.Value.(string)
 		cd.lru.Remove(front)
 		delete(cd.open, evPath)
-		_ = s.p.enrichCloseDoc(c, evPath)
-		s.curOpen--
+		// Evictions count the cache churn, not the didClose traffic — a
+		// lifecycle-off session evicts entries all the same and hiding that
+		// would blind the content-cache telemetry.
 		s.evictions++
+		if s.sendOpens {
+			_ = s.p.enrichCloseDoc(c, evPath)
+			s.curOpen--
+		}
 	}
 
-	if err := s.p.enrichOpenDoc(c, absPath, content); err != nil {
-		return nil, func() {}, err
+	if s.sendOpens {
+		if err := s.p.enrichOpenDoc(c, absPath, content); err != nil {
+			return nil, func() {}, err
+		}
+		s.didOpens++
+		s.openCounts[absPath]++
+		s.curOpen++
+		if s.curOpen > s.peakOpen {
+			s.peakOpen = s.curOpen
+		}
 	}
 	cd.open[absPath] = &docEntry{refs: 1, content: content}
-	s.didOpens++
-	s.openCounts[absPath]++
-	s.curOpen++
-	if s.curOpen > s.peakOpen {
-		s.peakOpen = s.curOpen
-	}
 	return content, s.releaseFunc(c, absPath), nil
 }
 
@@ -162,9 +178,11 @@ func (s *docSession) closeAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for c, cd := range s.perClient {
-		for path := range cd.open {
-			_ = s.p.enrichCloseDoc(c, path)
-			s.curOpen--
+		if s.sendOpens {
+			for path := range cd.open {
+				_ = s.p.enrichCloseDoc(c, path)
+				s.curOpen--
+			}
 		}
 		cd.open = map[string]*docEntry{}
 		cd.lru.Init()

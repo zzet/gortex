@@ -359,10 +359,26 @@ func canonicalManifestKey(key string) string {
 // HOME / repo root and the resolved gortex binary path — with stable
 // placeholders so the manifest is identical on every machine.
 func normalizeRender(s, home, root string) string {
-	s = strings.ReplaceAll(s, home, "$HOME")
-	s = strings.ReplaceAll(s, root, "$ROOT")
+	// The values to scrub are native paths — os.Executable, exec.LookPath,
+	// the sandbox HOME — but a rendered manifest deliberately carries
+	// '/'-spelled paths even on Windows: shellSafeHookBinary normalises
+	// unconditionally, and an @-include is document content rather than a
+	// filesystem call. Replacing only the native spelling therefore leaves
+	// a machine-specific absolute in the manifest on Windows and the
+	// golden drifts for every developer who has gortex installed.
+	// filepath.ToSlash is a no-op on POSIX, so the second pass collapses
+	// into the first everywhere else.
+	scrub := func(s, from, to string) string {
+		if from == "" {
+			return s
+		}
+		s = strings.ReplaceAll(s, from, to)
+		return strings.ReplaceAll(s, filepath.ToSlash(from), to)
+	}
+	s = scrub(s, home, "$HOME")
+	s = scrub(s, root, "$ROOT")
 	for _, p := range gortexBinaryPaths() {
-		s = strings.ReplaceAll(s, p, "gortex")
+		s = scrub(s, p, "gortex")
 	}
 	return s
 }

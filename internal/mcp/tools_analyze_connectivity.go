@@ -7,10 +7,11 @@
 // leaf nodes.
 //
 // It is deliberately DISTINCT from kind=dead_code. dead_code reports
-// symbols with zero *incoming usage* edges — genuinely unreachable
-// code, a real finding to act on (delete it). This analyzer reports
-// isolated nodes — zero edges of *any* kind, structural edges
-// included — which a normally extracted symbol never has. An isolated
+// symbols with zero *incoming usage* edges — a narrower signal than
+// "unreachable", and not a removal verdict, since an unresolved or
+// name-only call site leaves the same zero-incoming shape. This
+// analyzer reports isolated nodes — zero edges of *any* kind, structural
+// edges included — which a normally extracted symbol never has. An isolated
 // node signals the indexer mis-extracted the symbol or its file, not
 // that the code is unused; the response carries a `note` spelling out
 // the distinction so a reader does not delete live code.

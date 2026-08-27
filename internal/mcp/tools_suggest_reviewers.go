@@ -73,7 +73,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	repo := strings.TrimSpace(req.GetString("repo", ""))
 	repoRoot, repoPrefix := s.diffRepoScope(ctx, repo)
 
-	changedFiles, _, err := s.resolveReviewerChangeset(ctx, req, repoRoot)
+	changedFiles, fileDomain, _, err := s.resolveReviewerChangeset(ctx, req, repoRoot)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -85,7 +85,13 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	codeownerFiles := map[string][]string{}
 	if coFound {
 		for _, f := range changedFiles {
-			owners := codeowners.MatchFile(relForRepo(f, repoRoot), coRules)
+			// CODEOWNERS rules are written against repo-relative paths, and a
+			// root-anchored rule (`/pkg/auth/`) only matches that spelling. In
+			// ids mode the changed files are graph keys, so relForRepo — which
+			// only strips an absolute repo root — would leave the repo prefix
+			// on and silently match nothing.
+			rel := analysis.RepoRelPath(repoPrefix, f, fileDomain)
+			owners := codeowners.MatchFile(relForRepo(rel, repoRoot), coRules)
 			for _, owner := range owners {
 				name := normalizeReviewer(owner)
 				if name == "" {
@@ -93,7 +99,9 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 				}
 				codeownerCounts[name]++
 				codeownerKinds[name] = classifyReviewer(owner)
-				codeownerFiles[name] = appendUnique(codeownerFiles[name], f)
+				// matched_files is reported to the caller, so it carries the
+				// repo-relative spelling too, not the graph key.
+				codeownerFiles[name] = appendUnique(codeownerFiles[name], rel)
 			}
 		}
 	}
@@ -104,7 +112,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	blame := blameRowsByID(s.graph)
 	authorCounts := map[string]int{}
 	for _, f := range changedFiles {
-		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f) {
+		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f, fileDomain) {
 			if la, ok := lastAuthoredFrom(blame, n); ok && la.Email != "" {
 				authorCounts[normalizeReviewer(la.Email)]++
 			}
@@ -116,7 +124,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	// candidate experts; the count is the number of co-change links.
 	coChangeCounts := map[string]int{}
 	for _, f := range changedFiles {
-		for partner := range s.coChangeScores(analysis.JoinFilePath(s.graph, repoPrefix, f)) {
+		for partner := range s.coChangeScores(analysis.GraphKey(repoPrefix, f, fileDomain)) {
 			for _, n := range s.graph.GetFileNodes(partner) {
 				if la, ok := lastAuthoredFrom(blame, n); ok && la.Email != "" {
 					coChangeCounts[normalizeReviewer(la.Email)]++
@@ -144,7 +152,13 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 // resolveReviewerChangeset turns the ids / base / number input into a set of
 // changed file paths (and, where available, the changed symbol IDs). Exactly
 // one input source is honoured, checked in ids → base → number order.
-func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolRequest, repoRoot string) (files []string, symbolIDs []string, err error) {
+//
+// The three sources do NOT share a path vocabulary, so the domain is returned
+// with the files rather than assumed by the caller: ids yields graph node
+// FilePaths, while base (git) and number (forge) yield repo-relative paths.
+// Forcing one domain on all three double-prefixes the ids branch on a prefixed
+// graph and silently drops the ownership and co-change signals.
+func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolRequest, repoRoot string) (files []string, domain analysis.PathDomain, symbolIDs []string, err error) {
 	idsStr := strings.TrimSpace(req.GetString("ids", ""))
 	base := strings.TrimSpace(req.GetString("base", ""))
 	number := req.GetInt("number", 0)
@@ -163,36 +177,37 @@ func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolR
 				files = append(files, n.FilePath)
 			}
 		}
-		return files, symbolIDs, nil
+		return files, analysis.GraphKeyedPath, symbolIDs, nil
 
 	case base != "":
 		if repoRoot == "" {
-			return nil, nil, fmt.Errorf("could not resolve a repository root for the base diff")
+			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("could not resolve a repository root for the base diff")
 		}
 		diff, derr := analysis.MapGitDiff(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), "compare", base)
 		if derr != nil {
-			return nil, nil, fmt.Errorf("git diff against %q failed: %v", base, derr)
+			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("git diff against %q failed: %v", base, derr)
 		}
 		for _, cs := range diff.ChangedSymbols {
 			symbolIDs = append(symbolIDs, cs.ID)
 		}
-		return diff.ChangedFiles, symbolIDs, nil
+		return diff.ChangedFiles, analysis.RepoRelativePath, symbolIDs, nil
 
 	case number > 0:
 		if !forge.Available(ctx) {
-			return nil, nil, fmt.Errorf("forge unavailable: set GH_TOKEN (or GITHUB_TOKEN) in the daemon environment to resolve PR files")
+			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("forge unavailable: set GH_TOKEN (or GITHUB_TOKEN) in the daemon environment to resolve PR files")
 		}
 		if repoRoot == "" {
-			return nil, nil, fmt.Errorf("could not resolve a repository root for the PR file fetch")
+			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("could not resolve a repository root for the PR file fetch")
 		}
 		prFiles, ferr := forge.PRFiles(ctx, repoRoot, number)
 		if ferr != nil {
-			return nil, nil, fmt.Errorf("fetching files for PR #%d failed: %v", number, ferr)
+			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("fetching files for PR #%d failed: %v", number, ferr)
 		}
-		return prFiles, nil, nil
+		// A forge file list is repo-relative.
+		return prFiles, analysis.RepoRelativePath, nil, nil
 
 	default:
-		return nil, nil, fmt.Errorf("one of ids, base, or number is required")
+		return nil, analysis.RepoRelativePath, nil, fmt.Errorf("one of ids, base, or number is required")
 	}
 }
 

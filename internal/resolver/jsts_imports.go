@@ -165,6 +165,13 @@ func probeJSTSFile(getNode func(string) *graph.Node, stem string) string {
 	// verbatim first, then — when it names an emitted JavaScript file —
 	// against the TypeScript sources that compile to it.
 	switch ext := jsTSExt(stem); ext {
+	case ".vue", ".svelte", ".astro":
+		// A single-file component is only ever imported by its full name
+		// (`./Foo.vue`); there is no extension probing on top of it.
+		if isFile(stem) {
+			return stem
+		}
+		return ""
 	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
 		if isFile(stem) {
 			return stem
@@ -218,10 +225,17 @@ func jsTSExt(p string) string {
 }
 
 // isJSTSPath reports whether a file path is a JavaScript / TypeScript
-// source file — the only importers whose specifiers this resolver expands.
+// source file - the only importers whose specifiers this resolver expands.
+//
+// Single-file components (.vue / .svelte / .astro) count too: their <script>
+// block is carved out and parsed by the JS/TS extractor, so the import edges
+// it emits carry the host .vue path as FilePath. Rejecting them here left
+// every relative import from a .vue script as an external stub, and calls
+// into the imported .ts symbol lost reachability and got reverted.
 func isJSTSPath(p string) bool {
 	switch jsTSExt(p) {
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs",
+		".vue", ".svelte", ".astro":
 		return true
 	}
 	return false

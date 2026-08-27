@@ -112,6 +112,78 @@ func doPOST(t *testing.T, tr *Transport, body []byte, headers map[string]string)
 	return rec
 }
 
+// The idle TTL is the transport's own policy, so the transport is the
+// one to advertise it: a client's first knowledge of session expiry
+// must not be the 404/-32001 after it already happened. Every response
+// carries the TTL as a header, and the initialize result additionally
+// carries it in `_meta` where typed MCP clients can reach it.
+func TestSessionIdleTTL_IsAdvertised(t *testing.T) {
+	store := NewMemoryStore(5 * time.Minute)
+	t.Cleanup(store.Close)
+	tr := New(Config{
+		Dispatcher: MCPServerDispatcher{Server: newTestMCPServer()},
+		Store:      store,
+		SessionTTL: 5 * time.Minute,
+	})
+
+	rec := doPOST(t, tr, initializeBody("claude", "1.0"), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(HeaderSessionIdleTTL); got != "300" {
+		t.Errorf("%s header = %q, want \"300\"", HeaderSessionIdleTTL, got)
+	}
+	var reply struct {
+		Result struct {
+			Meta       map[string]any `json:"_meta"`
+			ServerInfo map[string]any `json:"serverInfo"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+		t.Fatalf("unmarshal initialize reply: %v", err)
+	}
+	got, ok := reply.Result.Meta["gortex/session_idle_ttl_seconds"]
+	if !ok {
+		t.Fatalf("initialize result _meta missing gortex/session_idle_ttl_seconds: %s",
+			rec.Body.String())
+	}
+	if n, _ := got.(float64); n != 300 {
+		t.Errorf("_meta TTL = %v, want 300", got)
+	}
+	if len(reply.Result.ServerInfo) == 0 {
+		t.Error("meta injection dropped serverInfo from the initialize result")
+	}
+
+	// A follow-up request also carries the header, so a client that
+	// missed it at initialize can still learn the horizon later.
+	sid := rec.Header().Get(HeaderSessionID)
+	rec2 := doPOST(t, tr, jsonRPC(2, "tools/list", nil), map[string]string{HeaderSessionID: sid})
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("tools/list status = %d", rec2.Code)
+	}
+	if got := rec2.Header().Get(HeaderSessionIdleTTL); got != "300" {
+		t.Errorf("follow-up %s header = %q, want \"300\"", HeaderSessionIdleTTL, got)
+	}
+}
+
+// A transport with no known TTL (zero SessionTTL) must not advertise
+// one — a made-up horizon is worse than none.
+func TestSessionIdleTTL_ZeroAdvertisesNothing(t *testing.T) {
+	tr, cleanup := newTransport(t)
+	defer cleanup()
+
+	rec := doPOST(t, tr, initializeBody("claude", "1.0"), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(HeaderSessionIdleTTL); got != "" {
+		t.Errorf("%s header = %q, want absent when no TTL is known", HeaderSessionIdleTTL, got)
+	}
+	if strings.Contains(rec.Body.String(), "session_idle_ttl_seconds") {
+		t.Error("initialize result advertises a TTL that does not exist")
+	}
+}
+
 // TestInitializeMintsSessionID asserts the spec's headline behaviour:
 // an initialize POST returns a fresh `Mcp-Session-Id` header that
 // subsequent requests carry forward.

@@ -250,7 +250,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	github.com/tree-sitter-grammars/tree-sitter-hcl v1.2.0
 	github.com/tree-sitter-grammars/tree-sitter-lua v0.5.0
@@ -274,7 +274,7 @@ require (
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
 	github.com/tree-sitter/tree-sitter-scala v0.26.2
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
-	github.com/yalue/onnxruntime_go v1.32.1
+	github.com/yalue/onnxruntime_go v1.35.0
 	github.com/zeebo/blake3 v0.2.4
 	go.uber.org/zap v1.28.0
 	golang.org/x/image v0.45.0
@@ -285,7 +285,7 @@ require (
 	golang.org/x/text v0.41.0
 	golang.org/x/tools v0.49.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.56.0
+	modernc.org/sqlite v1.57.0
 	pgregory.net/rapid v1.3.0
 )
 
@@ -299,7 +299,6 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/daulet/tokenizers v1.27.0 // indirect
-	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect

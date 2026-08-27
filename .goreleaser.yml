@@ -13,11 +13,22 @@ version: 2
 #     release.yml once the darwin hashes exist — it is NOT generated here.
 #   - windows: the CGo tree-sitter bindings need a real mingw C/C++ toolchain.
 before:
-  hooks:
-    - go mod tidy
-    # Tests run in CI on every push. Re-running ./... inside
-    # goreleaser-cross slows the tag-to-artifact loop without catching
-    # anything new — the tag is already on a green commit.
+  hooks: []
+    # No before hooks, for the same reason in both cases: the tag is already
+    # on a green commit, so re-running work here costs tag-to-artifact time
+    # without catching anything new.
+    #
+    # Tests run in CI on every push, so `go test ./...` inside
+    # goreleaser-cross adds nothing.
+    #
+    # `go mod tidy` was worse than redundant. It walks the full module graph
+    # including the test dependencies of dependencies, so it spent ~5 minutes
+    # on the network and took v0.63.8 down when proxy.golang.org returned
+    # HTTP/2 INTERNAL_ERROR on six unrelated fetches. And because it MUTATES
+    # go.mod/go.sum in the container, a drifted module set would be silently
+    # rewritten at release time and the shipped binaries built against
+    # something no CI job had ever compiled. Tidiness is now asserted in the
+    # `lint` job of ci.yml, where drift fails the PR instead.
 
 builds:
   - id: main

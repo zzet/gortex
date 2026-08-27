@@ -5,233 +5,57 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/respbudget"
 )
 
-// defaultMaxBytes is the upper bound on a single tool response.
-// Empirically the agent harness (claude-code at the time of writing)
-// starts spilling responses to a side file around ~50 KB of wire
-// text. The MCP `tools/call` envelope wraps our payload as
-// `{"content":[{"type":"text","text":"<payload>"}]}`, then JSON-RPC
-// itself adds one more layer of escaping when serialised across the
-// stdio bridge — round-trip overhead averages 25–30 % on top of the
-// raw payload bytes for our shapes. Capping the inner payload at
-// 40 KB keeps the wire form comfortably under the 50 KB threshold,
-// leaving headroom for the rare row that has unusually heavy meta.
-//
-// Lower this number cautiously: every drop here means more rows get
-// trimmed across every list-shaped tool. Raise it only after
-// re-measuring the harness threshold; "no spill" beats "more rows"
-// because spilled output forces a cold re-read for the agent.
-const defaultMaxBytes = 40_000
+// The budget arithmetic (default cap, token ratio, opt-out semantics,
+// structural trim) lives in internal/respbudget so the daemon's
+// federation merge applies the exact same rules to the final merged
+// representation. The aliases below keep this package's call sites
+// unchanged.
+const defaultMaxBytes = respbudget.DefaultMaxBytes
 
-// avgBytesPerToken is the calibration constant used to translate the
-// `max_tokens` parameter into an effective byte cap. Empirically:
-//
-//   - dense JSON / TOON rows (`{"id":"...","kind":"function",...}`)
-//     tokenise at ~3.0–3.4 chars per BPE token on cl100k_base. The
-//     punctuation density (quotes, colons, braces) drags the ratio
-//     down vs. natural English.
-//   - GCX1 rows (`id\tkind\tname\t...`) tokenise at ~4.0–4.5 chars
-//     per token because tabs collapse into single tokens and the
-//     identifier-heavy payload tokenises more efficiently than JSON.
-//   - smart_context / get_editing_context source-bearing payloads
-//     average ~3.6 chars per token because the source lines push
-//     the ratio toward English text.
-//
-// 3.5 is the safe midpoint: it slightly UNDER-counts tokens for JSON
-// (so the resulting byte cap is tighter than strictly necessary —
-// erring on the side of "fits the budget") and approximately matches
-// the GCX row case. Token estimation is necessarily imperfect across
-// model tokenisers; the budget guard's job is to ride a safe margin,
-// not to count exactly. A caller who needs precise token-counting
-// should run their own tokenizer post-hoc.
-const avgBytesPerToken = 3.5
+const avgBytesPerToken = respbudget.AvgBytesPerToken
 
 // tokenBudgetParamDescription is the canonical description string
 // for the `max_tokens` parameter wired onto every list-shaped tool.
 // Centralised so the wording stays consistent across the registry.
 const tokenBudgetParamDescription = "Cap the marshaled response at approximately this many tokens (3.5 bytes/token heuristic; composable with max_bytes — tighter wins). Use when you have a token budget instead of a byte budget. Omit for no cap; pass 0 to opt out explicitly."
 
-// tokensToBytes converts a token budget into a byte cap using the
-// avgBytesPerToken ratio. Returns 0 for non-positive inputs so
-// `max_tokens: 0` is honoured as "opt out" with the same semantics
-// as `max_bytes: 0`.
+// tokensToBytes converts a token budget into a byte cap; see
+// respbudget.TokensToBytes for the ratio's calibration notes.
 func tokensToBytes(maxTokens int) int {
-	if maxTokens <= 0 {
-		return 0
-	}
-	return int(float64(maxTokens) * avgBytesPerToken)
+	return respbudget.TokensToBytes(maxTokens)
 }
 
-// bytesToTokens is the inverse of tokensToBytes. Used to render a
-// human-readable token-equivalent on the truncation meta so callers
-// see "kept ~N tokens" alongside the raw byte cap. Returns 0 for
-// non-positive inputs.
+// bytesToTokens is the inverse of tokensToBytes.
 func bytesToTokens(byteCount int) int {
-	if byteCount <= 0 {
-		return 0
-	}
-	return int(float64(byteCount) / avgBytesPerToken)
+	return respbudget.BytesToTokens(byteCount)
 }
 
-// numArgInt extracts an integer arg from the request arguments map.
-// JSON numbers arrive as float64; some test harnesses pass int.
-// Returns (value, present). When the arg is the wrong type, returns
-// (0, true) so callers can distinguish "absent" from "malformed
-// zero" — important because a zero value is meaningful here (it is
-// the opt-out signal for both max_bytes and max_tokens).
+// numArgInt extracts an integer arg from the request arguments map;
+// see respbudget.NumArgInt for the absent-vs-malformed semantics.
 func numArgInt(args map[string]any, key string) (int, bool) {
-	raw, ok := args[key]
-	if !ok {
-		return 0, false
-	}
-	switch n := raw.(type) {
-	case float64:
-		return int(n), true
-	case int:
-		return n, true
-	case int64:
-		return int(n), true
-	default:
-		return 0, true
-	}
+	return respbudget.NumArgInt(args, key)
 }
 
 // budgetTruncatedKey is the meta flag appended to a payload trimmed
 // by applyBudget so callers can branch on truncation without scanning
 // for shape-specific signals. Mirrored on the GCX path through the
 // `truncated_by_budget=true` header meta.
-const budgetTruncatedKey = "_truncated_by_budget"
+const budgetTruncatedKey = respbudget.TruncatedKey
 
 // applyBudget enforces a marshaled-size cap on payload by trimming
-// top-level lists in longest-first order until the result fits.
-// Returns the (possibly trimmed) payload and a flag indicating
-// whether trimming happened. The trimmed payload carries inline
-// metadata so callers can surface "narrow your filter" hints:
-//
-//   - _truncated_by_budget: true
-//   - _max_returned_<field>: N
-//   - _original_count_<field>: M (one pair per trimmed list)
-//
-// Multi-list payloads (`nodes` + `edges` for get_file_summary, etc.)
-// are trimmed iteratively: the longest list is binary-searched first;
-// if the result still exceeds the cap, the next-longest list is
-// trimmed too, and so on. We stop when the cap is met or every list
-// has been emptied (the second is a degraded fallback — extremely
-// large per-row payloads can still exceed the budget with zero
-// rows; that case is rare and the MCP transport's spill fallback
-// handles it).
-//
-// Best-effort: if no top-level list is found in the marshaled JSON,
-// the payload is returned unchanged.
+// top-level lists in longest-first order until the result fits; the
+// algorithm and its truncation-meta contract live in respbudget.Apply,
+// shared with the daemon's federation merge.
 func applyBudget(payload any, maxBytes int) (any, bool) {
-	if maxBytes <= 0 || payload == nil {
-		return payload, false
-	}
-	bytes, err := json.Marshal(payload)
-	if err != nil || len(bytes) <= maxBytes {
-		return payload, false
-	}
-
-	// Re-shape into a generic map so we can manipulate any payload
-	// type uniformly (struct, *query.SubGraph, map[string]any). The
-	// JSON round-trip costs one extra alloc — cheap given we already
-	// know we are over budget.
-	var generic map[string]any
-	if err := json.Unmarshal(bytes, &generic); err != nil {
-		return payload, false
-	}
-
-	trimmed := false
-	// Cap iteration count by the number of distinct top-level slices
-	// so we cannot loop forever on a payload whose non-list scalars
-	// alone exceed the cap.
-	for pass := 0; pass < 8; pass++ {
-		longestKey := findLongestSliceKey(generic)
-		if longestKey == "" {
-			break
-		}
-		longest := genericSlice(generic, longestKey)
-		if len(longest) == 0 {
-			// Already-empty list cannot shrink further; pick the
-			// next-longest in the next iteration. Mark this list
-			// completed by removing it from candidate set via length 0.
-			break
-		}
-		originalLen := len(longest)
-		// Binary search for the largest prefix that fits.
-		lo, hi := 0, originalLen
-		for lo < hi {
-			mid := (lo + hi + 1) / 2
-			generic[longestKey] = longest[:mid]
-			generic[budgetTruncatedKey] = true
-			generic["_max_returned_"+longestKey] = mid
-			generic["_original_count_"+longestKey] = originalLen
-			candidate, err := json.Marshal(generic)
-			if err != nil {
-				break
-			}
-			if len(candidate) <= maxBytes {
-				lo = mid
-			} else {
-				hi = mid - 1
-			}
-		}
-		generic[longestKey] = longest[:lo]
-		generic[budgetTruncatedKey] = true
-		generic["_max_returned_"+longestKey] = lo
-		generic["_original_count_"+longestKey] = originalLen
-		trimmed = true
-
-		final, _ := json.Marshal(generic)
-		if len(final) <= maxBytes {
-			return generic, true
-		}
-	}
-	if !trimmed {
-		// No slice candidate was actually trimmed — return the
-		// original payload type intact so callers comparing against
-		// concrete Go types (int vs json's float64, etc.) keep
-		// working unchanged.
-		return payload, false
-	}
-	return generic, trimmed
-}
-
-// findLongestSliceKey returns the top-level field name whose value is
-// the longest []any. Empty string when no slices are present. Used by
-// applyBudget to pick the trimming target without per-tool config.
-func findLongestSliceKey(m map[string]any) string {
-	var key string
-	maxLen := 0
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	// Stable iteration so ties resolve deterministically.
-	sort.Strings(keys)
-	for _, k := range keys {
-		arr, ok := m[k].([]any)
-		if !ok {
-			continue
-		}
-		if len(arr) > maxLen {
-			maxLen = len(arr)
-			key = k
-		}
-	}
-	return key
-}
-
-func genericSlice(m map[string]any, key string) []any {
-	if arr, ok := m[key].([]any); ok {
-		return arr
-	}
-	return nil
+	return respbudget.Apply(payload, maxBytes)
 }
 
 // applyFieldsFilter returns a copy of payload with only the fields
@@ -477,49 +301,7 @@ func trimGCXBytes(payload []byte, maxBytes int) ([]byte, bool) {
 // prefers a partial, inline answer over a spilled file the agent has
 // to re-read.
 func effectiveBudget(req mcp.CallToolRequest) int {
-	args := req.GetArguments()
-	rawBytes, bytesPresent := numArgInt(args, "max_bytes")
-	rawTokens, tokensPresent := numArgInt(args, "max_tokens")
-
-	if !bytesPresent && !tokensPresent {
-		return defaultMaxBytes
-	}
-
-	// Per-axis opt-out: a non-positive value means "skip THIS axis".
-	bytesOptOut := bytesPresent && rawBytes <= 0
-	tokensOptOut := tokensPresent && rawTokens <= 0
-
-	// Both axes opted out → no cap.
-	if bytesPresent && tokensPresent && bytesOptOut && tokensOptOut {
-		return 0
-	}
-	// Only one axis present and it opted out → no cap.
-	if bytesPresent && !tokensPresent && bytesOptOut {
-		return 0
-	}
-	if tokensPresent && !bytesPresent && tokensOptOut {
-		return 0
-	}
-
-	tokensBytes := tokensToBytes(rawTokens) // 0 when token axis absent or opt-out
-
-	switch {
-	case bytesPresent && tokensPresent:
-		switch {
-		case bytesOptOut:
-			return tokensBytes
-		case tokensOptOut:
-			return rawBytes
-		case rawBytes < tokensBytes:
-			return rawBytes
-		default:
-			return tokensBytes
-		}
-	case bytesPresent:
-		return rawBytes
-	default: // tokensPresent
-		return tokensBytes
-	}
+	return respbudget.EffectiveFromArgs(req.GetArguments())
 }
 
 // budgetSource describes which arg drove the resolved byte cap. Used
@@ -621,6 +403,21 @@ func decorateTokenBudgetJSON(payload any, req mcp.CallToolRequest) any {
 		m["_max_tokens"] = rawTokens
 	}
 	return m
+}
+
+// tokenBudgetDecorationReserve is the worst-case byte cost of the
+// token-budget decoration the JSON and GCX renderers append AFTER
+// their fit (the `_max_tokens` / `_truncated_by_tokens` fields, the
+// GCX `# max_tokens=…` comment). Reserving it from the effective
+// budget up front keeps the decorated payload inside the caller's cap
+// — the decoration must never be the bytes that break the contract it
+// documents. Zero when the caller did not pass max_tokens.
+func tokenBudgetDecorationReserve(req mcp.CallToolRequest) int {
+	rawTokens, present := numArgInt(req.GetArguments(), "max_tokens")
+	if !present || rawTokens <= 0 {
+		return 0
+	}
+	return 48 + len(strconv.Itoa(rawTokens))
 }
 
 // decorateTokenBudgetGCX appends a trailing comment to a GCX payload

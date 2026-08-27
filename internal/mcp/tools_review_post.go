@@ -145,7 +145,7 @@ func (s *Server) postReviewFindingsFor(ctx context.Context, req mcp.CallToolRequ
 		if err != nil {
 			return nil, err
 		}
-		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, repoPrefix, allowedRepos)
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, analysis.RepoRelativePath, repoPrefix, allowedRepos)
 		impact = s.reviewImpact(diff.ChangedSymbols)
 		changedFiles = diff.ChangedFiles
 	}

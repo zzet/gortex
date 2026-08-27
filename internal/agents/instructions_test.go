@@ -1,7 +1,7 @@
 package agents
 
 import (
-	"path/filepath"
+	"path"
 	"strings"
 	"testing"
 
@@ -82,7 +82,11 @@ func TestBashInstructionsBodyUsesOnlyExplicitCLIMirror(t *testing.T) {
 func TestGlobalPointerBody_ShapeAndSentinel(t *testing.T) {
 	const dir = "/home/user/.gortex/instructions"
 	body := GlobalPointerBody(dir)
-	activePath := filepath.Join(dir, "active.md")
+	// path.Join, not filepath.Join: the @-include is document content and
+	// stays '/'-spelled on every OS. Building the expectation with
+	// filepath.Join would assert the native mangling on Windows and pass
+	// there whether or not the renderer normalises.
+	activePath := path.Join(dir, "active.md")
 
 	if !strings.Contains(body, InstructionsSentinel) {
 		t.Error("pointer block lost the idempotency sentinel heading")
