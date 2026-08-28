@@ -587,6 +587,38 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 		"the worktree's routed view is indexed before it vanishes")
 	worktreeView.Close()
 
+	deletedRows, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: wtTracked.GraphID,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, deletedRows, "the dedicated worktree owns durable generations before removal")
+	deletedGenerationIDs := make([]int64, 0, len(deletedRows))
+	deletedGenerationSet := make(map[int64]struct{}, len(deletedRows))
+	for _, row := range deletedRows {
+		deletedGenerationSet[row.GenerationID] = struct{}{}
+	}
+	var (
+		populatedDeletedGeneration int64
+		hasDerivedChild            bool
+	)
+	for _, row := range deletedRows {
+		deletedGenerationIDs = append(deletedGenerationIDs, row.GenerationID)
+		_, hasOwnedBase := deletedGenerationSet[row.BaseGenerationID]
+		hasDerivedChild = hasDerivedChild || hasOwnedBase
+		if populatedDeletedGeneration == 0 && len(contentIdentities(f.store.AtGeneration(row.GenerationID), wtTracked.Prefix)) > 0 {
+			populatedDeletedGeneration = row.GenerationID
+		}
+	}
+	require.True(t, hasDerivedChild,
+		"the deleted graph includes a child generation that must retire before its base")
+	require.NotZero(t, populatedDeletedGeneration, "the retirement assertion starts with real generation payload")
+
+	primaryRowsBefore, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: mainTracked.GraphID,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, primaryRowsBefore, "the healthy primary sibling owns its own generations")
+
 	// Nothing has vanished yet: a sweep changes nothing.
 	report, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
@@ -636,6 +668,29 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 	_, graphStillPresent, graphErr := f.catalog.GetDedicatedGraph(ctx, wtTracked.GraphID)
 	require.NoError(t, graphErr)
 	assert.False(t, graphStillPresent, "its logical graph is forgotten")
+	deletedRowsAfter, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: wtTracked.GraphID,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, deletedRowsAfter, "a deleted graph leaves no generation catalog rows")
+	for _, generationID := range deletedGenerationIDs {
+		_, found, lookupErr := f.catalog.GetViewGeneration(ctx, generationID)
+		require.NoError(t, lookupErr)
+		assert.False(t, found, "generation %d survives its owning graph", generationID)
+		assert.Empty(t, contentIdentities(f.store.AtGeneration(generationID), wtTracked.Prefix),
+			"generation %d leaves no payload", generationID)
+	}
+	assert.Empty(t, contentIdentities(f.store.AtGeneration(populatedDeletedGeneration), wtTracked.Prefix),
+		"the known-populated generation payload is physically purged")
+
+	primaryRowsAfter, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: mainTracked.GraphID,
+	})
+	require.NoError(t, err)
+	require.Len(t, primaryRowsAfter, len(primaryRowsBefore), "the healthy primary sibling is untouched")
+	for i := range primaryRowsBefore {
+		assert.Equal(t, primaryRowsBefore[i].GenerationID, primaryRowsAfter[i].GenerationID)
+	}
 	assert.False(t, f.watcher.isAttached("sweep-wt"), "its watcher is detached")
 	assert.NotContains(t, f.configPaths(), worktree, "the removal is persisted")
 
@@ -651,6 +706,102 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, checkouts, 1, "only the surviving checkout is left")
 	assert.NotEqual(t, "sweep-wt", checkouts[0].RootPath)
+}
+
+// TestCheckoutLifecycleSweepRecoversDeletedGraphRetirement covers the crash
+// window after the catalog graph row is deleted but before the process-local
+// owed set can be drained. The surviving generation rows are the durable
+// backlog; a live materialized view still protects them until its lease ends.
+func TestCheckoutLifecycleSweepRecoversDeletedGraphRetirement(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+
+	targetRoot := f.gitRepo("orphaned-graph-target")
+	target, err := f.lc.Register(ctx, config.RepoEntry{
+		Path: targetRoot,
+		Name: "orphaned-graph-target",
+	}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, target.CatalogErr)
+	siblingRoot := f.gitRepo("orphaned-graph-sibling")
+	sibling, err := f.lc.Register(ctx, config.RepoEntry{
+		Path: siblingRoot,
+		Name: "orphaned-graph-sibling",
+	}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, sibling.CatalogErr)
+
+	targetView := f.materialize(target.CheckoutID)
+	viewClosed := false
+	t.Cleanup(func() {
+		if !viewClosed {
+			targetView.Close()
+		}
+	})
+	leasedGenerations := targetView.GenerationSources()
+	require.NotEmpty(t, leasedGenerations)
+	var populatedLeasedGeneration int64
+	for _, source := range leasedGenerations {
+		if len(contentIdentities(f.store.AtGeneration(source.Generation), target.Prefix)) > 0 {
+			populatedLeasedGeneration = source.Generation
+			break
+		}
+	}
+	require.NotZero(t, populatedLeasedGeneration, "the live lease protects real payload")
+
+	targetRows, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: target.GraphID,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, targetRows)
+	siblingRowsBefore, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: sibling.GraphID,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, siblingRowsBefore)
+
+	// This is the durable state a crash can leave after logical teardown has
+	// withdrawn the route and deleted graph ownership, but before the
+	// process-local owed set can drain. Clear that set to model the restart.
+	f.lc.withdrawStaleRoute(ctx, target.CheckoutID)
+	require.NoError(t, f.catalog.DeleteDedicatedGraph(ctx, target.GraphID))
+	f.lc.coordMu.Lock()
+	f.lc.owed = map[int64]struct{}{}
+	f.lc.coordMu.Unlock()
+	f.lc.sweepRetirements(ctx)
+	for _, source := range leasedGenerations {
+		_, found, lookupErr := f.catalog.GetViewGeneration(ctx, source.Generation)
+		require.NoError(t, lookupErr)
+		assert.True(t, found, "a live lease keeps generation %d", source.Generation)
+	}
+	assert.NotEmpty(t, contentIdentities(f.store.AtGeneration(populatedLeasedGeneration), target.Prefix),
+		"lease refusal preserves payload")
+
+	targetView.Close()
+	viewClosed = true
+	f.lc.sweepRetirements(ctx)
+	targetRowsAfter, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: target.GraphID,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, targetRowsAfter, "the durable orphan backlog drains after the lease")
+	for _, row := range targetRows {
+		_, found, lookupErr := f.catalog.GetViewGeneration(ctx, row.GenerationID)
+		require.NoError(t, lookupErr)
+		assert.False(t, found)
+		assert.Empty(t, contentIdentities(f.store.AtGeneration(row.GenerationID), target.Prefix))
+	}
+
+	siblingRowsAfter, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: sibling.GraphID,
+	})
+	require.NoError(t, err)
+	require.Len(t, siblingRowsAfter, len(siblingRowsBefore),
+		"an independent dedicated sibling remains healthy")
+	for i := range siblingRowsBefore {
+		assert.Equal(t, siblingRowsBefore[i].GenerationID, siblingRowsAfter[i].GenerationID)
+	}
 }
 
 // TestCheckoutLifecycleSweepReachesAConfiguredButUnindexedRepo covers the

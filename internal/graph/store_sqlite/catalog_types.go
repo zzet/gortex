@@ -400,9 +400,16 @@ type ViewGenerationFilter struct {
 	CheckoutID string
 	// GraphID restricts the scan to one graph. Empty accepts all of them.
 	GraphID string
+	// MissingGraph accepts only generations whose non-empty graph_id no
+	// longer names a dedicated graph. This is the durable retirement backlog
+	// left when graph deletion wins a race with process shutdown.
+	MissingGraph bool
 	// OwnerKind restricts the scan to one owner vocabulary. Empty accepts all
 	// of them.
 	OwnerKind string
+	// BeforeGenerationID restricts the scan to generations older than this
+	// exclusive cursor. Zero starts at the newest generation.
+	BeforeGenerationID int64
 	// Limit bounds the rows one call returns. 0 — and anything above the cap —
 	// takes maxViewGenerationListing.
 	Limit int

@@ -1114,6 +1114,12 @@ func (c *Catalog) ListViewGenerations(ctx context.Context, filter ViewGeneration
 	if filter.Limit < 0 {
 		return nil, fmt.Errorf("%w: limit %d", ErrCatalogInvalidValue, filter.Limit)
 	}
+	if filter.BeforeGenerationID < 0 {
+		return nil, fmt.Errorf("%w: before_generation_id %d", ErrCatalogInvalidValue, filter.BeforeGenerationID)
+	}
+	if filter.GraphID != "" && filter.MissingGraph {
+		return nil, fmt.Errorf("%w: graph_id and missing_graph are mutually exclusive", ErrCatalogInvalidValue)
+	}
 	limit := filter.Limit
 	if limit == 0 || limit > maxViewGenerationListing {
 		limit = maxViewGenerationListing
@@ -1126,6 +1132,15 @@ func (c *Catalog) ListViewGenerations(ctx context.Context, filter ViewGeneration
 	if filter.GraphID != "" {
 		clauses = append(clauses, `graph_id = ?`)
 		args = append(args, filter.GraphID)
+	}
+	if filter.MissingGraph {
+		clauses = append(clauses, `graph_id <> '' AND NOT EXISTS (`+
+			`SELECT 1 FROM dedicated_graphs WHERE dedicated_graphs.graph_id = view_generations.graph_id`+
+			`)`)
+	}
+	if filter.BeforeGenerationID > 0 {
+		clauses = append(clauses, `generation_id < ?`)
+		args = append(args, filter.BeforeGenerationID)
 	}
 	if len(filter.States) > 0 {
 		placeholders := make([]string, len(filter.States))

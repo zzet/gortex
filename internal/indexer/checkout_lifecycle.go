@@ -2024,6 +2024,33 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 		collect(row)
 	}
 
+	// A graph deletion removes the last durable owner pointer before payload
+	// retirement can necessarily finish (a live lease may refuse it). Recover
+	// that backlog directly from the surviving generation rows. Pagination is
+	// deliberate: healthy or still-referenced rows must not pin older orphaned
+	// generations behind the catalog listing bound.
+	const orphanedGraphPageSize = 512
+	var beforeGenerationID int64
+	for {
+		rows, scanErr := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+			States:             []store_sqlite.ViewGenerationState{store_sqlite.ViewGenerationReady},
+			MissingGraph:       true,
+			BeforeGenerationID: beforeGenerationID,
+			Limit:              orphanedGraphPageSize,
+		})
+		if scanErr != nil {
+			l.logger.Debug("checkout lifecycle: could not scan deleted-graph generations", zap.Error(scanErr))
+			break
+		}
+		for _, row := range rows {
+			collect(row)
+		}
+		if len(rows) < orphanedGraphPageSize {
+			break
+		}
+		beforeGenerationID = rows[len(rows)-1].GenerationID
+	}
+
 	// Ready checkout layers are the other half: a coordinator that stopped
 	// without draining leaves its commit cache published and unreferenced, and
 	// only the route can say whether a layer is still the one being served.
@@ -2168,7 +2195,14 @@ func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
 	if err != nil {
 		return err
 	}
-	if !ok || row.RepoPrefix == "" {
+	if !ok {
+		return nil
+	}
+	// The reconciler deletes the graph row after this hook returns. Capture
+	// every generation it owns while that durable ownership is still
+	// queryable; the retirement sweep runs after the graph reference is gone.
+	h.l.oweRetirement(h.l.graphGenerations(ctx, graphID)...)
+	if row.RepoPrefix == "" {
 		return nil
 	}
 	h.l.evictRepo(row.RepoPrefix)
