@@ -392,6 +392,98 @@ func TestPromoteCapturesASettledDirtyChange(t *testing.T) {
 	assert.Contains(t, identities, "late.go::Late")
 }
 
+// TestDedicatedBaseExcludesDirtyFilesystemContent proves promotion performs one
+// immutable HEAD pass, not a legacy live-filesystem index followed by the real
+// generation build. The worktree fixture already has an untracked Go file: it
+// belongs in the dirty layer, never in the dedicated base or generation zero.
+func TestDedicatedBaseExcludesDirtyFilesystemContent(t *testing.T) {
+	f := newFamilyFixture(t, "exact-head")
+	defer f.close()
+	ctx := context.Background()
+	dirtyPath := filepath.Base(f.worktree) + ".go"
+
+	result, err := f.lc.PromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	require.NotNil(t, result.Index)
+	assert.Equal(t, 1, result.Index.FileCount, "only the committed HEAD file builds the base")
+
+	dedicated, found, err := f.catalog.GetDedicatedGraph(ctx, result.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotZero(t, dedicated.ActiveGenerationID)
+	exactHead := contentIdentities(f.store.AtGeneration(dedicated.ActiveGenerationID), result.Prefix)
+	assert.NotContains(t, exactHead, dirtyPath)
+	assert.NotContains(t, exactHead, dirtyPath+"::B")
+	assert.Empty(t, contentIdentities(f.store, result.Prefix),
+		"promotion leaves no duplicate mutable payload in generation zero")
+
+	metadata := f.mi.GetMetadata(result.Prefix)
+	require.NotNil(t, metadata)
+	assert.Zero(t, metadata.FileCount, "the process shell is payload-free")
+	view := f.materialize(f.automatic.CheckoutID)
+	defer view.Close()
+	composed := contentIdentities(view.Reader, result.Prefix)
+	assert.Contains(t, composed, dirtyPath, "the dirty layer still exposes the worktree file")
+	assert.Contains(t, composed, dirtyPath+"::B")
+}
+
+// TestPromotionBuildAdmissionIsRetryable holds the shared physical lane while
+// a promotion is admitted. The base build must not bypass that lane; bounded
+// background overflow leaves the durable transition pending, and the identical
+// request completes it once capacity is available.
+func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
+	f := newFamilyFixture(t, "promote-admission")
+	defer f.close()
+	ctx := context.Background()
+
+	gate := newViewBuildGateWithLimits(1, 0)
+	gate.Open()
+	release, err := gate.Acquire(ctx, ViewBuildInteractive)
+	require.NoError(t, err)
+	defer release()
+	f.lc.SetBuildGate(gate)
+	indexed := make(chan struct{}, 1)
+	f.lc.indexBarrier = func() { indexed <- struct{}{} }
+
+	first, run, err := f.lc.startPromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	require.NotNil(t, run)
+	firstOutcome, waitErr := waitModeTransition(ctx, run)
+	require.NoError(t, waitErr)
+	require.Error(t, firstOutcome.err)
+	assert.ErrorIs(t, firstOutcome.err, ErrViewBuildQueueFull)
+	assert.True(t, firstOutcome.promotion.Pending)
+	assert.True(t, firstOutcome.promotion.Retryable)
+	assert.Equal(t, first.TransitionID, firstOutcome.promotion.TransitionID)
+	select {
+	case <-indexed:
+		t.Fatal("promotion reached the immutable tree walk without build admission")
+	default:
+	}
+	standing, found, err := f.catalog.GetIntentTransition(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "overload must retain the durable retry row")
+	assert.Equal(t, store_sqlite.IntentTransitionPending, standing.State)
+
+	release()
+	release = func() {}
+	retry, retryRun, err := f.lc.startPromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	require.NotNil(t, retryRun)
+	assert.Equal(t, first.TransitionID, retry.TransitionID)
+	retryOutcome, waitErr := waitModeTransition(ctx, retryRun)
+	require.NoError(t, waitErr)
+	require.NoError(t, retryOutcome.err)
+	select {
+	case <-indexed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("retried promotion never reached its admitted immutable tree walk")
+	}
+	_, found, err = f.catalog.GetIntentTransition(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	assert.False(t, found, "successful retry releases the durable row")
+}
+
 // --- demotion -----------------------------------------------------------
 
 // TestUntrackDemotesADedicatedWorktree is the untrack path for a working copy
@@ -717,6 +809,84 @@ func TestCloseCancelsAndJoinsModeTransitionWorker(t *testing.T) {
 		t.Fatal("Close returned before the transition worker joined")
 	}
 	assert.Error(t, run.outcome.err)
+}
+
+// TestModeTransitionSchedulerBoundsClosedWarmupWorkers pins startup admission:
+// one lifecycle worker executes, one transition waits, and every additional
+// durable row is rejected only from memory. Close must cancel and join both
+// admitted runs without having allocated a goroutine per rejected row.
+func TestModeTransitionSchedulerBoundsClosedWarmupWorkers(t *testing.T) {
+	transitionCtx, cancelTransitions := context.WithCancel(context.Background())
+	lifecycle := &CheckoutLifecycle{
+		transitionCtx:     transitionCtx,
+		cancelTransitions: cancelTransitions,
+		transitionRuns:    map[string]*modeTransitionRun{},
+		transitionQueue:   make(chan *modeTransitionRun, modeTransitionQueueLimit),
+		gate:              newViewBuildGateWithLimits(1, 1),
+	}
+
+	first := lifecycle.scheduleModeTransition(store_sqlite.IntentTransition{
+		TransitionID: "first", Cause: promotionTransitionCause,
+	})
+	require.Eventually(t, func() bool { return len(lifecycle.transitionQueue) == 0 },
+		time.Second, time.Millisecond, "the single worker never took its active run")
+	second := lifecycle.scheduleModeTransition(store_sqlite.IntentTransition{
+		TransitionID: "second", Cause: promotionTransitionCause,
+	})
+
+	for i := 0; i < 64; i++ {
+		rejected := lifecycle.scheduleModeTransition(store_sqlite.IntentTransition{
+			TransitionID: "overflow-" + strconv.Itoa(i), Cause: promotionTransitionCause,
+		})
+		select {
+		case <-rejected.done:
+			assert.ErrorIs(t, rejected.outcome.err, ErrViewBuildQueueFull)
+			assert.True(t, rejected.outcome.promotion.Pending)
+			assert.True(t, rejected.outcome.promotion.Retryable)
+		default:
+			t.Fatalf("overflow transition %d was admitted beyond the bounded queue", i)
+		}
+	}
+	lifecycle.transitionMu.Lock()
+	assert.Len(t, lifecycle.transitionRuns, 2, "only active and queued runs are retained")
+	lifecycle.transitionMu.Unlock()
+
+	require.NoError(t, lifecycle.Close())
+	for _, run := range []*modeTransitionRun{first, second} {
+		select {
+		case <-run.done:
+			assert.ErrorIs(t, run.outcome.err, context.Canceled)
+		case <-time.After(time.Second):
+			t.Fatal("Close did not join an admitted mode transition")
+		}
+	}
+}
+
+// BenchmarkModeTransitionSchedulingWhileBuildGateClosed measures startup-style
+// admission when durable transitions outnumber the physical build lane. The
+// gate deliberately remains closed for the timed section; cleanup cancels and
+// joins every admitted worker.
+func BenchmarkModeTransitionSchedulingWhileBuildGateClosed(b *testing.B) {
+	transitionCtx, cancelTransitions := context.WithCancel(context.Background())
+	lifecycle := &CheckoutLifecycle{
+		transitionCtx:     transitionCtx,
+		cancelTransitions: cancelTransitions,
+		transitionRuns:    map[string]*modeTransitionRun{},
+		transitionQueue:   make(chan *modeTransitionRun, modeTransitionQueueLimit),
+		gate:              newViewBuildGateWithLimits(1, 1),
+	}
+	b.Cleanup(func() { require.NoError(b, lifecycle.Close()) })
+	workersBefore := runtime.NumGoroutine()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lifecycle.scheduleModeTransition(store_sqlite.IntentTransition{
+			TransitionID: strconv.Itoa(i),
+			Cause:        promotionTransitionCause,
+		})
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(runtime.NumGoroutine()-workersBefore), "live-workers")
 }
 
 // --- set-primary --------------------------------------------------------

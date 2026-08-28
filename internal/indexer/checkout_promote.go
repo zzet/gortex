@@ -185,6 +185,9 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		if err := l.requireDedicatedRoute(ctx, checkout.CheckoutID, out.GraphID); err != nil {
 			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
+		if err := l.ensurePromotedRepoShell(ctx, checkout, out.Prefix); err != nil {
+			return out, l.promotionFailed(ctx, &out, transition, err)
+		}
 		if err := l.installDedicatedCoordinator(ctx, out.GraphID, checkout); err != nil {
 			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
@@ -225,17 +228,17 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
-	err = nil
-	if err != nil {
-		l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
-		return out, l.promotionFailed(ctx, &out, transition, err)
-	}
 	if _, err := l.prepareAndPublishPromotion(ctx, checkout, transition,
 		out.GraphID, baseGenerationID, sample); err != nil {
 		current, currentErr := l.checkoutStateOf(ctx, checkout.CheckoutID)
 		if currentErr == nil && current.EffectiveMode != store_sqlite.CheckoutModeDedicated {
 			l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
 		}
+		return out, l.promotionFailed(ctx, &out, transition, err)
+	}
+	if err := l.ensurePromotedRepoShell(ctx, checkout, out.Prefix); err != nil {
+		// Publication already committed. Keep the exact route and durable row;
+		// the dedicated-mode recovery arm above retries only this process shell.
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 

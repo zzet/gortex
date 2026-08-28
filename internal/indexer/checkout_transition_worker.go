@@ -16,6 +16,11 @@ import (
 const (
 	promotionTransitionCause = "promote_checkout"
 	demotionTransitionCause  = "explicit_untrack_demote"
+
+	// One worker may execute while one more durable transition waits in memory.
+	// The catalog remains the unbounded queue, so startup cost is independent of
+	// how many transitions survived a restart.
+	modeTransitionQueueLimit = 1
 )
 
 // modeTransitionRun is one daemon-owned execution of a durable transition.
@@ -33,14 +38,43 @@ type modeTransitionOutcome struct {
 	err       error
 }
 
-// scheduleModeTransition starts at most one worker for a durable transition.
-// The lifecycle context, rather than the request that admitted the work, owns
-// the worker. A client disconnect therefore changes only whether that client
-// waits; it cannot orphan the transition.
+// modeTransitionQueueFullError is the scheduler's retryable backpressure
+// signal. It shares ErrViewBuildQueueFull with the physical build gate so every
+// caller has one overload contract irrespective of which bounded lane filled.
+type modeTransitionQueueFullError struct {
+	Limit int
+}
+
+func (e *modeTransitionQueueFullError) Error() string {
+	return fmt.Sprintf("indexer: mode transition queue is full (limit %d)", e.Limit)
+}
+
+func (e *modeTransitionQueueFullError) Unwrap() error { return ErrViewBuildQueueFull }
+
+func failedModeTransitionOutcome(
+	transition store_sqlite.IntentTransition, cause error,
+) modeTransitionOutcome {
+	out := modeTransitionOutcome{err: cause}
+	if transition.Cause == promotionTransitionCause {
+		out.promotion = PromoteResult{
+			CheckoutID: transition.CheckoutID, TransitionID: transition.TransitionID,
+			Pending: true, Retryable: true,
+		}
+	}
+	return out
+}
+
+// scheduleModeTransition coalesces one durable row and admits it to the single
+// lifecycle worker without blocking the caller. Only one transition waits in
+// memory; overflow remains pending in the catalog and is retried by the next
+// successful drain, sweep, or explicit request.
 func (l *CheckoutLifecycle) scheduleModeTransition(
 	transition store_sqlite.IntentTransition,
 ) *modeTransitionRun {
 	l.transitionMu.Lock()
+	if l.transitionRuns == nil {
+		l.transitionRuns = map[string]*modeTransitionRun{}
+	}
 	if running := l.transitionRuns[transition.TransitionID]; running != nil {
 		select {
 		case <-running.done:
@@ -57,24 +91,89 @@ func (l *CheckoutLifecycle) scheduleModeTransition(
 			return running
 		}
 	}
+	run := &modeTransitionRun{transition: transition, done: make(chan struct{})}
 	if l.transitionClosed {
-		run := &modeTransitionRun{transition: transition, done: make(chan struct{})}
-		run.outcome.err = context.Canceled
+		run.outcome = failedModeTransitionOutcome(transition, context.Canceled)
 		close(run.done)
 		l.transitionMu.Unlock()
 		return run
 	}
-	run := &modeTransitionRun{transition: transition, done: make(chan struct{})}
-	l.transitionRuns[transition.TransitionID] = run
-	l.transitionWG.Add(1)
-	l.transitionMu.Unlock()
-
-	go func() {
-		defer l.transitionWG.Done()
-		run.outcome = l.executeModeTransition(l.transitionCtx, transition)
+	if l.transitionQueue == nil {
+		l.transitionQueue = make(chan *modeTransitionRun, modeTransitionQueueLimit)
+	}
+	select {
+	case l.transitionQueue <- run:
+		l.transitionRuns[transition.TransitionID] = run
+		startWorker := !l.transitionWorkerStarted
+		if startWorker {
+			l.transitionWorkerStarted = true
+			l.transitionWG.Add(1)
+		}
+		l.transitionMu.Unlock()
+		if startWorker {
+			go l.runModeTransitionWorker()
+		}
+		return run
+	default:
+		run.outcome = failedModeTransitionOutcome(transition, &modeTransitionQueueFullError{
+			Limit: modeTransitionQueueLimit,
+		})
 		close(run.done)
-	}()
-	return run
+		l.transitionMu.Unlock()
+		return run
+	}
+}
+
+// runModeTransitionWorker owns the only executing mode transition. A promotion
+// still acquires the shared build gate for its physical corpus pass and a
+// demotion's coordinator acquires it for rehoming; this queue prevents a boot
+// journal from allocating one waiting goroutine per row before either reaches
+// that common lane.
+func (l *CheckoutLifecycle) runModeTransitionWorker() {
+	defer l.transitionWG.Done()
+	for {
+		if err := l.transitionCtx.Err(); err != nil {
+			l.cancelQueuedModeTransitions(err)
+			return
+		}
+		select {
+		case <-l.transitionCtx.Done():
+			l.cancelQueuedModeTransitions(l.transitionCtx.Err())
+			return
+		case run := <-l.transitionQueue:
+			if run == nil {
+				continue
+			}
+			run.outcome = l.executeModeTransition(l.transitionCtx, run.transition)
+			close(run.done)
+			if run.outcome.err != nil {
+				continue
+			}
+			// Success removed the durable row and freed one bounded slot. Pull
+			// another standing transition immediately instead of waiting for the
+			// hourly janitor; failure stays pending and avoids a hot retry loop.
+			if err := l.resumeModeTransitions(l.transitionCtx); err != nil &&
+				!errors.Is(err, context.Canceled) && l.logger != nil {
+				l.logger.Warn("checkout lifecycle: could not refill mode transition queue",
+					zap.Error(err))
+			}
+		}
+	}
+}
+
+func (l *CheckoutLifecycle) cancelQueuedModeTransitions(cause error) {
+	for {
+		select {
+		case run := <-l.transitionQueue:
+			if run == nil {
+				continue
+			}
+			run.outcome = failedModeTransitionOutcome(run.transition, cause)
+			close(run.done)
+		default:
+			return
+		}
+	}
 }
 
 func (l *CheckoutLifecycle) executeModeTransition(
@@ -115,9 +214,11 @@ func waitModeTransition(ctx context.Context, run *modeTransitionRun) (modeTransi
 	}
 }
 
-// resumeModeTransitions schedules every transition this build knows how to
-// execute. Unknown causes are deliberately left standing: they may belong to a
+// resumeModeTransitions fills the bounded in-process queue from the durable
+// journal. Unknown causes are deliberately left standing: they may belong to a
 // newer binary, and guessing at a destructive mode change is never recovery.
+// Rows beyond admission capacity remain only in SQLite until a successful
+// transition drains a slot or a later sweep retries them.
 func (l *CheckoutLifecycle) resumeModeTransitions(ctx context.Context) error {
 	if l == nil || l.catalog == nil {
 		return nil
@@ -150,7 +251,17 @@ func (l *CheckoutLifecycle) resumeModeTransitions(ctx context.Context) error {
 	for _, transition := range transitions {
 		switch transition.Cause {
 		case promotionTransitionCause, demotionTransitionCause:
-			l.scheduleModeTransition(transition)
+			run := l.scheduleModeTransition(transition)
+			select {
+			case <-run.done:
+				if errors.Is(run.outcome.err, ErrViewBuildQueueFull) {
+					// Admission is intentionally lossy only in memory. The row is
+					// still standing, and continuing this scan would allocate one
+					// rejected run per remaining row for no useful work.
+					return nil
+				}
+			default:
+			}
 		}
 	}
 	return nil

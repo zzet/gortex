@@ -3,12 +3,34 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
 )
+
+// promotionShellSource gives TrackRepoCtx an authoritative empty snapshot. It
+// creates the configuration/indexer shell required by the generation builder
+// without walking, opening, or parsing a checkout file.
+type promotionShellSource struct{}
+
+func (promotionShellSource) Open(string) (io.ReadCloser, source.FileMeta, error) {
+	return nil, source.FileMeta{}, fs.ErrNotExist
+}
+
+func (promotionShellSource) Stat(string) (source.FileMeta, error) {
+	return source.FileMeta{}, fs.ErrNotExist
+}
+
+func (promotionShellSource) Walk(ctx context.Context, _ func(source.FileMeta) error) error {
+	return ctx.Err()
+}
+
+func (promotionShellSource) Identity() string { return "promotion-shell:empty" }
+func (promotionShellSource) Close() error     { return nil }
 
 // buildPromotedCorpus writes the captured HEAD tree into the immutable base
 // generation that the dedicated route will publish. The temporary coordinator
@@ -20,10 +42,23 @@ func (l *CheckoutLifecycle) buildPromotedCorpus(
 	checkout store_sqlite.Checkout,
 	prefix string,
 ) (*IndexResult, int64, checkoutSample, int, error) {
-	if l.mi.GetMetadata(prefix) != nil {
-		l.mi.UntrackRepo(prefix)
+	// This is the one physical full-tree pass a promotion requires. It is
+	// background work: interactive ref/checkout requests retain their bounded
+	// burst ahead of it in the shared gate, while the mode-transition scheduler
+	// prevents a restart journal from filling that background queue with one
+	// waiter per row.
+	release := func() {}
+	if gate := l.buildGate(); gate != nil {
+		var err error
+		release, err = gate.Acquire(ctx, ViewBuildBackground)
+		if err != nil {
+			return nil, 0, checkoutSample{}, 0, fmt.Errorf(
+				"indexer: wait for dedicated base build admission: %w", err)
+		}
 	}
-	if _, err := l.mi.trackRepoSourceCtx(ctx, config.RepoEntry{Path: checkout.RootPath, Name: prefix}, nil); err != nil {
+	defer release()
+
+	if err := l.ensurePromotedRepoShell(ctx, checkout, prefix); err != nil {
 		return nil, 0, checkoutSample{}, 0, err
 	}
 	coordinator, err := l.buildCoordinatorWithPoll(ctx, graphID, checkout, -1)
@@ -112,4 +147,33 @@ func (l *CheckoutLifecycle) buildPromotedCorpus(
 	return nil, 0, checkoutSample{}, resampled, fmt.Errorf(
 		"%w: %s moved under two full generation builds", ErrCheckoutMoved, checkout.RootPath,
 	)
+}
+
+// ensurePromotedRepoShell installs the process-local configuration/indexer
+// shell required by both the generation builder and the published route. Its
+// authoritative empty source makes this an O(1) topology admission, never a
+// live-filesystem index. The only full-tree pass remains the exact Git tree
+// generation built above.
+func (l *CheckoutLifecycle) ensurePromotedRepoShell(
+	ctx context.Context, checkout store_sqlite.Checkout, prefix string,
+) error {
+	if metadata := l.mi.GetMetadata(prefix); metadata != nil {
+		if metadata.FileCount == 0 && metadata.NodeCount == 0 && metadata.EdgeCount == 0 {
+			return nil
+		}
+		// A mutable pre-promotion registration may already occupy this prefix.
+		// Retire that generation-zero payload before replacing it with the
+		// payload-free shell used by the dedicated route.
+		l.mi.UntrackRepo(prefix)
+	}
+	shell := promotionShellSource{}
+	_, err := l.mi.trackRepoSourceCtx(ctx,
+		config.RepoEntry{Path: checkout.RootPath, Name: prefix}, shell)
+	if err != nil {
+		return fmt.Errorf("indexer: install dedicated repository shell: %w", err)
+	}
+	if l.mi.GetMetadata(prefix) == nil {
+		return fmt.Errorf("indexer: dedicated repository shell %s was not installed", prefix)
+	}
+	return nil
 }

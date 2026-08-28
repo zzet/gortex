@@ -188,12 +188,14 @@ type CheckoutLifecycle struct {
 	// rows outlive request contexts; this context instead lives for exactly as
 	// long as the lifecycle, so a disconnected caller cannot abandon work and
 	// daemon shutdown can still stop it deliberately.
-	transitionCtx     context.Context
-	cancelTransitions context.CancelFunc
-	transitionMu      sync.Mutex
-	transitionRuns    map[string]*modeTransitionRun
-	transitionWG      sync.WaitGroup
-	transitionClosed  bool
+	transitionCtx           context.Context
+	cancelTransitions       context.CancelFunc
+	transitionMu            sync.Mutex
+	transitionRuns          map[string]*modeTransitionRun
+	transitionQueue         chan *modeTransitionRun
+	transitionWorkerStarted bool
+	transitionWG            sync.WaitGroup
+	transitionClosed        bool
 }
 
 // NewCheckoutLifecycle builds the lifecycle. It fails only on a missing
@@ -226,6 +228,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		transitionCtx:     transitionCtx,
 		cancelTransitions: cancelTransitions,
 		transitionRuns:    map[string]*modeTransitionRun{},
+		transitionQueue:   make(chan *modeTransitionRun, modeTransitionQueueLimit),
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
