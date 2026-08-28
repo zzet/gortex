@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -12,12 +13,16 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // The probe fixture: one family with a dedicated primary and one automatic
@@ -569,4 +574,219 @@ func TestTopologyNudgeRunsImmediatelyAndKeepsATrailingEvent(t *testing.T) {
 		t.Fatalf("unexpected third reconciliation for %q", familyID)
 	case <-time.After(25 * time.Millisecond):
 	}
+}
+
+// TestAttachedWatcherDiscoversAndForgetsLinkedWorktree exercises the complete
+// topology-event path with a real, disposable Git family. Nothing calls a
+// reconciliation method directly: GitWatcher observes the administration
+// changes, AttachWatcher resolves the family, and the lifecycle owns both the
+// automatic route and its removal-grace cleanup.
+func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
+	testenv.Sandbox(t)
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+
+	controller, multi, catalog, dir := buildCatalogController(t)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, multi.Close(ctx))
+	})
+	store, ok := controller.graph.(*store_sqlite.Store)
+	require.True(t, ok, "the fixture opened a %T, not the sqlite store", controller.graph)
+
+	logger := zap.NewNop()
+	controller.logger = logger
+	lifecycle, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+		MultiIndexer:  multi,
+		ConfigManager: controller.configManager,
+		Graph:         store,
+		Logger:        logger,
+		Reconcile: reconcile.Config{
+			AvailabilityGrace: time.Second,
+			RemovalGrace:      5 * time.Second,
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, lifecycle.Close()) })
+	controller.lifecycle = lifecycle
+	controller.viewMaterializer = &graphview.Materializer{
+		Store:   store,
+		Catalog: catalog,
+		Leases:  lifecycle.ViewLeases(),
+	}
+
+	primaryRoot := filepath.Join(dir, "topology-primary")
+	worktreeRoot := filepath.Join(dir, "topology-linked")
+	require.NoError(t, os.MkdirAll(primaryRoot, 0o755))
+	runTopologyGitCommand(t, primaryRoot, "init", "-b", "main")
+	runTopologyGitCommand(t, primaryRoot, "config", "user.email", "topology@example.invalid")
+	runTopologyGitCommand(t, primaryRoot, "config", "user.name", "Topology Test")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(primaryRoot, "main.go"),
+		[]byte("package topology\n\nfunc TopologyBase() {}\n"),
+		0o644,
+	))
+	runTopologyGitCommand(t, primaryRoot, "add", "main.go")
+	runTopologyGitCommand(t, primaryRoot, "commit", "-m", "seed topology fixture")
+
+	ctx := context.Background()
+	registration, err := lifecycle.Register(ctx, config.RepoEntry{
+		Path: primaryRoot,
+		Name: "topology-event",
+	}, indexer.TrackSourceCLI)
+	require.NoError(t, err)
+	require.False(t, registration.Pending, "the tiny dedicated base should publish before watcher attachment")
+	require.NotEmpty(t, registration.CheckoutID)
+	require.NotEmpty(t, registration.FamilyID)
+	require.NotEmpty(t, registration.GraphID)
+
+	watcher, err := indexer.NewMultiWatcher(multi, map[string]config.WatchConfig{
+		registration.Prefix: {
+			Enabled:        true,
+			DebounceMs:     20,
+			StormThreshold: -1,
+		},
+	}, logger)
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start())
+	t.Cleanup(func() {
+		controller.AttachWatcher(nil)
+		require.NoError(t, watcher.Stop())
+	})
+	controller.AttachWatcher(watcher)
+
+	// AttachWatcher intentionally raises one startup reconciliation. Let it
+	// drain so the assertion below proves a later filesystem event, rather
+	// than the startup safety nudge, discovered the linked worktree.
+	require.Eventually(t, func() bool {
+		controller.topologyNudgeMu.Lock()
+		defer controller.topologyNudgeMu.Unlock()
+		return len(controller.topologyNudges) == 0
+	}, 5*time.Second, 10*time.Millisecond, "startup topology nudge did not drain")
+
+	runTopologyGitCommand(t, primaryRoot,
+		"worktree", "add", "-b", "topology-linked", worktreeRoot)
+	canonicalWorktreeRoot, err := filepath.EvalSymlinks(worktreeRoot)
+	require.NoError(t, err)
+	worktreeFile := filepath.Join(canonicalWorktreeRoot, "main.go")
+
+	var automaticCheckoutID string
+	var automaticCommitGenerationID, automaticDirtyGenerationID int64
+	require.Eventually(t, func() bool {
+		binding, explainErr := lifecycle.ExplainView(ctx, worktreeFile)
+		if explainErr != nil || !binding.Matched || !binding.Composed ||
+			binding.EffectiveMode != string(store_sqlite.CheckoutModeAutomatic) {
+			return false
+		}
+		route, found, routeErr := catalog.GetCheckoutRoute(ctx, binding.CheckoutID)
+		if routeErr != nil || !found || route.State != store_sqlite.RouteActive {
+			return false
+		}
+		automaticCheckoutID = binding.CheckoutID
+		automaticCommitGenerationID = route.CommitGenerationID
+		automaticDirtyGenerationID = route.DirtyGenerationID
+		return true
+	}, 20*time.Second, 20*time.Millisecond,
+		"the post-attachment worktree event did not publish an automatic route")
+	require.NotEmpty(t, automaticCheckoutID)
+	require.Greater(t, automaticCommitGenerationID, int64(0))
+	require.Greater(t, automaticDirtyGenerationID, int64(0))
+	require.NotEqual(t, automaticCommitGenerationID, automaticDirtyGenerationID)
+
+	checkout, found, err := catalog.GetCheckout(ctx, automaticCheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, store_sqlite.CheckoutModeAutomatic, checkout.DesiredMode)
+	assert.Equal(t, store_sqlite.CheckoutModeAutomatic, checkout.EffectiveMode)
+
+	routed, err := controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "TopologyBase",
+		Path:  worktreeFile,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, routed.View)
+	assert.Equal(t, daemon.ProbeViewWorktree, routed.View.Kind)
+	assert.Equal(t, automaticCheckoutID, routed.View.CheckoutID)
+	assert.True(t, routed.View.Exact)
+	assert.Equal(t, []string{"TopologyBase"}, symbolNames(routed.Hits))
+
+	runTopologyGitCommand(t, primaryRoot,
+		"worktree", "remove", "--force", worktreeRoot)
+
+	// The event-driven pass withdraws the exact route immediately and leaves
+	// only the explicitly labelled, read-only family-base fallback while the
+	// deliberately short grace is running.
+	require.Eventually(t, func() bool {
+		checkout, checkoutFound, checkoutErr := catalog.GetCheckout(ctx, automaticCheckoutID)
+		if checkoutErr != nil || !checkoutFound ||
+			checkout.State != store_sqlite.CheckoutStateRemovalGrace {
+			return false
+		}
+		route, routeFound, routeErr := catalog.GetCheckoutRoute(ctx, automaticCheckoutID)
+		return routeErr == nil && (!routeFound || route.State != store_sqlite.RouteActive)
+	}, 10*time.Second, 20*time.Millisecond,
+		"worktree removal did not withdraw its exact route into removal grace")
+
+	graceCheckout, graceFound, err := catalog.GetCheckout(ctx, automaticCheckoutID)
+	require.NoError(t, err)
+	require.True(t, graceFound)
+	graceBinding, err := lifecycle.ExplainView(ctx, worktreeFile)
+	require.NoError(t, err)
+	require.True(t, graceBinding.Matched,
+		"removal-grace checkout stopped owning its path; checkout=%+v binding=%+v",
+		graceCheckout, graceBinding)
+	assert.Equal(t, automaticCheckoutID, graceBinding.CheckoutID)
+	assert.Equal(t, string(store_sqlite.CheckoutStateRemovalGrace), graceBinding.CheckoutState)
+
+	fallback, err := controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "TopologyBase",
+		Path:  worktreeFile,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, fallback.View)
+	assert.Equal(t, daemon.ProbeViewBase, fallback.View.Kind)
+	assert.False(t, fallback.View.Exact)
+	assert.Equal(t, string(store_sqlite.CheckoutStateRemovalGrace), fallback.View.FallbackReason)
+
+	// ReconcileFamily scheduled its own deadline retry. Once it fires, both
+	// logical objects are gone without a janitor tick or a manual reconcile.
+	require.Eventually(t, func() bool {
+		_, checkoutFound, checkoutErr := catalog.GetCheckout(ctx, automaticCheckoutID)
+		_, routeFound, routeErr := catalog.GetCheckoutRoute(ctx, automaticCheckoutID)
+		return checkoutErr == nil && routeErr == nil && !checkoutFound && !routeFound
+	}, 10*time.Second, 20*time.Millisecond,
+		"removal-grace retry did not forget the checkout and route")
+
+	// Route removal is not enough: the checkout-unique dirty generation and
+	// every payload row it owns must be retired too. The canonical commit
+	// generation is family-shared cache state, so forgetting this one worktree
+	// must leave it available for a later checkout of the same tree.
+	require.Eventually(t, func() bool {
+		_, dirtyFound, generationErr := catalog.GetViewGeneration(ctx, automaticDirtyGenerationID)
+		return generationErr == nil && !dirtyFound
+	}, 5*time.Second, 20*time.Millisecond,
+		"forgotten worktree retained its dirty generation payload")
+	_, commitFound, err := catalog.GetViewGeneration(ctx, automaticCommitGenerationID)
+	require.NoError(t, err)
+	assert.True(t, commitFound, "forgetting one worktree removed the shared commit generation")
+
+	_, primaryFound, err := catalog.GetCheckout(ctx, registration.CheckoutID)
+	require.NoError(t, err)
+	assert.True(t, primaryFound, "forgetting an automatic worktree removed its dedicated primary")
+	primaryGraph, primaryGraphFound, err := catalog.GetDedicatedGraph(ctx, registration.GraphID)
+	require.NoError(t, err)
+	require.True(t, primaryGraphFound, "forgetting an automatic worktree removed its primary graph")
+	assert.Equal(t, registration.CheckoutID, primaryGraph.OwnerCheckoutID)
+}
+
+func runTopologyGitCommand(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "git %v in %s failed:\n%s", args, dir, output)
 }
