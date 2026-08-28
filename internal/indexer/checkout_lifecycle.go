@@ -1630,6 +1630,8 @@ func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
 		CheckoutRoot: checkout.RootPath,
 		FamilyID:     checkout.FamilyID,
 		GraphID:      primaryGraphID,
+		HeadCommit:   checkout.HeadCommit,
+		HeadTree:     checkout.HeadTree,
 		RepoPrefix:   primary.RepoPrefix,
 		WorkspaceID:  idx.WorkspaceID(),
 		ProjectID:    idx.ProjectID(),

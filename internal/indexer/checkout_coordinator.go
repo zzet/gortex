@@ -86,6 +86,21 @@ const (
 	checkoutResolverVersion = commitLayerPipelineEpoch
 )
 
+// initialCheckoutPollDelay assigns one stable point in the poll interval to a
+// checkout. The interval remains the hard staleness bound, but coordinators
+// created by one reconciliation no longer all wake and fork git at once.
+func initialCheckoutPollDelay(checkoutID string, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	sum := sha256.Sum256([]byte("gortex.checkout.poll.v1\x00" + checkoutID))
+	var slot uint64
+	for _, b := range sum[:8] {
+		slot = slot<<8 | uint64(b)
+	}
+	return time.Duration(slot%uint64(interval)) + 1
+}
+
 // errRouteMoved reports that a route flip lost its compare-and-set: another
 // actor repointed the route between the epoch this cycle read and the flip it
 // attempted. The cycle stops and reschedules; it never re-reads the epoch and
@@ -115,6 +130,11 @@ type CheckoutCoordinatorConfig struct {
 	// checkouts receive the current family primary; dedicated checkouts receive
 	// their own graph. Empty preserves the legacy family-primary lookup.
 	GraphID string
+	// HeadCommit and HeadTree seed the root-known dirty sampler from the last
+	// reconciled checkout row. Porcelain must report HeadCommit before HeadTree
+	// can be reused, so stale catalog state can only cause one extra resolution.
+	HeadCommit string
+	HeadTree   string
 
 	// RepoPrefix, WorkspaceID and ProjectID are stamped onto the payload. They
 	// are the PRIMARY's, not the checkout's: the layers compose over the
@@ -197,6 +217,7 @@ type CheckoutCycle struct {
 type CheckoutCoordinator struct {
 	checkoutID  string
 	root        string
+	sampler     *gitstate.DirtySampler
 	familyID    string
 	graphID     string
 	repoPrefix  string
@@ -310,10 +331,15 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	sampler, err := gitstate.NewDirtySampler(cfg.CheckoutRoot, cfg.HeadCommit, cfg.HeadTree)
+	if err != nil {
+		return nil, fmt.Errorf("indexer: create checkout sampler: %w", err)
+	}
 	lifetime, cancelLifetime := context.WithCancel(context.Background())
 	c := &CheckoutCoordinator{
 		checkoutID:     cfg.CheckoutID,
 		root:           cfg.CheckoutRoot,
+		sampler:        sampler,
 		familyID:       cfg.FamilyID,
 		graphID:        cfg.GraphID,
 		repoPrefix:     cfg.RepoPrefix,
@@ -439,10 +465,11 @@ func (c *CheckoutCoordinator) run() {
 	defer stopTimer(quiet)
 
 	var pollC <-chan time.Time
+	var pollTimer *time.Timer
 	if c.poll > 0 {
-		ticker := time.NewTicker(c.poll)
-		defer ticker.Stop()
-		pollC = ticker.C
+		pollTimer = time.NewTimer(initialCheckoutPollDelay(c.checkoutID, c.poll))
+		defer stopTimer(pollTimer)
+		pollC = pollTimer.C
 	}
 
 	// nil once builds are admitted: an open gate's channel is always ready,
@@ -464,6 +491,7 @@ func (c *CheckoutCoordinator) run() {
 			armed = quiet.C
 		case <-pollC:
 			c.Signal("poll")
+			pollTimer.Reset(c.poll)
 		case <-armed:
 			armed = nil
 			if admitted != nil {
@@ -605,7 +633,7 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	if err != nil {
 		return out, false
 	}
-	sample, err := gitstate.SampleDirty(ctx, c.root)
+	sample, err := c.sampler.Sample(ctx)
 	if err != nil || sample.HeadTree == "" {
 		return out, false
 	}
@@ -678,12 +706,12 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		out.Err = err
 		return out
 	}
-	head, err := gitstate.SampleHEAD(ctx, c.root)
+	head, err := c.sampler.Sample(ctx)
 	if err != nil {
-		out.Err = fmt.Errorf("indexer: sample HEAD of %s: %w", c.root, err)
+		out.Err = fmt.Errorf("indexer: sample checkout %s: %w", c.root, err)
 		return out
 	}
-	if head.TreeOID == "" {
+	if head.HeadTree == "" {
 		// An unborn branch has no tree to build a commit layer from, and a
 		// checkout with no commit generation has no view. There is nothing to
 		// reconcile to until it has one commit.
@@ -702,7 +730,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		return out
 	}
 
-	commitGeneration, err := c.reconcileCommitSlot(ctx, base, head.TreeOID, &route, &out)
+	commitGeneration, err := c.reconcileCommitSlot(ctx, base, head.HeadTree, &route, &out)
 	if err != nil {
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled = true
@@ -714,7 +742,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	}
 	out.CommitGenerationID = commitGeneration
 
-	if err := c.reconcileDirtySlot(ctx, commitGeneration, head.TreeOID, &route, &out); err != nil {
+	if err := c.reconcileDirtySlot(ctx, commitGeneration, head.HeadTree, &route, &out); err != nil {
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled = true
 			c.rescheduleOnLostRoute("route moved under the dirty flip")
@@ -1375,7 +1403,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	route *store_sqlite.CheckoutRoute,
 	out *CheckoutCycle,
 ) error {
-	sample, err := gitstate.SampleDirty(ctx, c.root)
+	sample, err := c.sampler.Sample(ctx)
 	if err != nil {
 		return fmt.Errorf("indexer: sample %s: %w", c.root, err)
 	}
@@ -1448,7 +1476,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
 	ctx context.Context, graphID string, commitGeneration int64,
 ) (int64, error) {
-	sample, err := gitstate.SampleDirty(ctx, c.root)
+	sample, err := c.sampler.Sample(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("indexer: sample %s: %w", c.root, err)
 	}
@@ -1494,7 +1522,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerOverSampled(
 			c.offerRetire(ctx, torn.GenerationID)
 		}
 		if attempt+1 < 2 {
-			sample, err = gitstate.SampleDirty(ctx, c.root)
+			sample, err = c.sampler.Sample(ctx)
 			if err != nil {
 				return 0, fmt.Errorf("indexer: sample %s: %w", c.root, err)
 			}

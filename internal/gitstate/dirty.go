@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/zzet/gortex/internal/gitcmd"
 )
@@ -100,67 +101,176 @@ const (
 	symlinkMode = "120000"
 )
 
+// dirtyCommandFunc is the command boundary behind DirtySampler. Production
+// uses gitcmd.Run; the seam keeps command-count and error tests deterministic.
+type dirtyCommandFunc func(context.Context, string, ...string) ([]byte, error)
+
+// DirtySampler samples a known worktree root without rediscovering it on every
+// poll. It retains only the immutable tree oid associated with the last
+// successfully resolved commit oid. Branch names are deliberately not cached:
+// two branches may point at the same commit, and porcelain is authoritative for
+// which one is checked out now.
+type DirtySampler struct {
+	root string
+	run  dirtyCommandFunc
+
+	mu        sync.Mutex
+	commitOID string
+	treeOID   string
+}
+
+// NewDirtySampler constructs a sampler for a path already known to be the
+// worktree root. seedCommit and seedTree may come from the checkout catalog;
+// they are used only when both are valid object ids, and are always checked
+// against porcelain's current commit before reuse.
+func NewDirtySampler(root, seedCommit, seedTree string) (*DirtySampler, error) {
+	abs, err := absDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("gitstate: resolve checkout root %q: %w: %w", root, ErrDirtyUnavailable, err)
+	}
+	return newDirtySampler(abs, seedCommit, seedTree, gitcmd.Run), nil
+}
+
+func newDirtySampler(root, seedCommit, seedTree string, run dirtyCommandFunc) *DirtySampler {
+	s := &DirtySampler{root: root, run: run}
+	if isOID(seedCommit) && !isZeroOID(seedCommit) && isOID(seedTree) && !isZeroOID(seedTree) {
+		s.commitOID = seedCommit
+		s.treeOID = seedTree
+	}
+	return s
+}
+
+// Sample reports the checkout's HEAD and dirty paths. An unchanged committed
+// checkout costs one git process: porcelain v2's branch headers carry the ref
+// and commit, and the tree is reused by exact commit oid. A changed commit costs
+// one additional rev-parse of that exact oid, never of the mutable HEAD name.
+func (s *DirtySampler) Sample(ctx context.Context) (DirtySnapshot, error) {
+	if s == nil || s.run == nil || strings.TrimSpace(s.root) == "" {
+		return DirtySnapshot{}, fmt.Errorf("gitstate: dirty sampler is not initialized: %w", ErrDirtyUnavailable)
+	}
+
+	// Serialize the command and cache update. Coordinators sample serially, but
+	// making the sampler safe on its own prevents two first samples from both
+	// resolving the same immutable tree.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
+	if err != nil {
+		return DirtySnapshot{}, fmt.Errorf("gitstate: read status in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
+	}
+	ref, commit, err := parseBranchStatusZ(out)
+	if err != nil {
+		return DirtySnapshot{}, fmt.Errorf("gitstate: read HEAD in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
+	}
+
+	var tree string
+	if commit != "" {
+		if commit == s.commitOID && s.treeOID != "" {
+			tree = s.treeOID
+		} else {
+			treeOut, treeErr := s.run(ctx, s.root, "rev-parse", "--verify", "-q", commit+"^{tree}")
+			if treeErr != nil {
+				// SampleHEAD historically treats an ordinary tree-resolution
+				// failure as an unresolved tree, but cancellation must remain an
+				// error so shutdown cannot publish a sample after its caller left.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return DirtySnapshot{}, fmt.Errorf("gitstate: resolve tree for %s in %s: %w: %w", commit, s.root, ErrDirtyUnavailable, ctxErr)
+				}
+			} else if candidate := strings.TrimSpace(string(treeOut)); isOID(candidate) && !isZeroOID(candidate) {
+				tree = candidate
+				s.commitOID = commit
+				s.treeOID = tree
+			}
+		}
+	}
+
+	snap := DirtySnapshot{
+		HeadRef:    ref,
+		HeadCommit: commit,
+		HeadTree:   tree,
+		Entries:    parseStatusZ(out),
+	}
+	slices.SortStableFunc(snap.Entries, compareDirtyEntries)
+	snap.Fingerprint = fingerprintDirty(s.root, snap.HeadCommit, snap.Entries)
+	return snap, nil
+}
+
+// parseBranchStatusZ extracts the two mandatory --branch headers from a
+// porcelain-v2 NUL stream. branch.head is short for normal local branches, so
+// it is expanded to the full symbolic ref SampleHEAD has always returned.
+func parseBranchStatusZ(out []byte) (ref, commit string, err error) {
+	var oid, head string
+	for _, chunk := range bytes.Split(out, []byte{0}) {
+		record := string(chunk)
+		switch {
+		case strings.HasPrefix(record, "# branch.oid "):
+			oid = strings.TrimPrefix(record, "# branch.oid ")
+		case strings.HasPrefix(record, "# branch.head "):
+			head = strings.TrimPrefix(record, "# branch.head ")
+		}
+	}
+	if oid == "" || head == "" {
+		return "", "", errors.New("porcelain v2 omitted branch.oid or branch.head")
+	}
+	if oid != "(initial)" {
+		if !isOID(oid) || isZeroOID(oid) {
+			return "", "", fmt.Errorf("porcelain v2 reported invalid branch oid %q", oid)
+		}
+		commit = oid
+	}
+	switch head {
+	case "(detached)":
+		if commit == "" {
+			return "", "", errors.New("porcelain v2 reported an unborn detached HEAD")
+		}
+	case "(unknown)":
+		return "", "", errors.New("porcelain v2 reported an unknown HEAD")
+	default:
+		if strings.HasPrefix(head, "refs/") {
+			ref = head
+		} else {
+			ref = "refs/heads/" + head
+		}
+	}
+	return ref, commit, nil
+}
+
 // SampleDirty reports how the working tree at dir differs from HEAD.
 //
-// HEAD is sampled with SampleHEAD, so an unborn branch is a valid
-// result rather than a failure: HeadCommit and HeadTree are empty and
-// every path git tracks shows up as an entry, which is exactly what
-// `git status` reports in that state.
+// The public sampler accepts any directory inside a checkout for compatibility.
+// It resolves the root once, then delegates to the root-known sampler used by
+// long-lived checkout coordinators. An unborn branch remains a valid result:
+// HeadCommit and HeadTree are empty and git reports every tracked path as added.
 //
-// The listing comes from `git status --porcelain=v2 -z`, with untracked
-// files expanded individually and rename detection on. -z is required,
-// not preferred: a path may legally contain spaces and newlines, and the
-// rename record spells its second path in its own NUL-terminated chunk.
-// Ignored paths are absent because --ignored is not passed — this
-// package never re-implements git's ignore rules. The status call runs
-// under --no-optional-locks so that observing a checkout never writes to
-// its index.
+// The listing comes from `git status --porcelain=v2 --branch -z`, with
+// untracked files expanded individually and rename detection on. -z is
+// required, not preferred: a path may legally contain spaces and newlines, and
+// the rename record spells its second path in its own NUL-terminated chunk.
+// Ignored paths are absent because --ignored is not passed. The status call
+// runs under --no-optional-locks so observation never writes to the index.
 //
-// Fingerprint is a hex sha256 over a canonical encoding of HeadCommit
-// and every entry (path, kind, staged, unstaged, old path) plus, for
-// every kind that has bytes behind it, the path's lstat size and
-// modification time in nanoseconds. Two samples taken with nothing
-// changed in between fingerprint identically; editing content, flipping
-// a mode, or staging a change all change it.
-//
-// The filesystem's modification-time granularity is the sensitivity
-// bound. A content change that lands within the same mtime tick and
-// leaves the size identical contributes no new stat evidence — such a
-// path is still reported, and still fingerprinted, but only through the
-// fields git itself reports.
+// Fingerprint is a hex sha256 over a canonical encoding of HeadCommit and every
+// entry plus the path's lstat size and modification time where bytes exist. The
+// filesystem's modification-time granularity remains the sensitivity bound.
 func SampleDirty(ctx context.Context, dir string) (DirtySnapshot, error) {
 	abs, err := absDir(dir)
 	if err != nil {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: resolve %q: %w: %w", dir, ErrDirtyUnavailable, err)
 	}
 
-	head, err := SampleHEAD(ctx, abs)
-	if err != nil {
-		return DirtySnapshot{}, fmt.Errorf("gitstate: read HEAD in %s: %w: %w", abs, ErrDirtyUnavailable, err)
-	}
-
 	// Porcelain paths are relative to the worktree root, which is not
-	// necessarily the directory that was queried, so the root is needed
-	// before any path can be statted.
+	// necessarily the directory that was queried, so compatibility callers
+	// still need this one discovery command. Coordinators already know root.
 	root, err := gitcmd.Output(ctx, abs, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: resolve worktree root for %s: %w: %w", abs, ErrDirtyUnavailable, err)
 	}
-
-	out, err := gitcmd.Run(ctx, abs, "--no-optional-locks", "status", "--porcelain=v2", "-z", "--untracked-files=all", "--renames")
+	sampler, err := NewDirtySampler(root, "", "")
 	if err != nil {
-		return DirtySnapshot{}, fmt.Errorf("gitstate: read status in %s: %w: %w", abs, ErrDirtyUnavailable, err)
+		return DirtySnapshot{}, err
 	}
-
-	snap := DirtySnapshot{
-		HeadRef:    head.Ref,
-		HeadCommit: head.CommitOID,
-		HeadTree:   head.TreeOID,
-		Entries:    parseStatusZ(out),
-	}
-	slices.SortStableFunc(snap.Entries, compareDirtyEntries)
-	snap.Fingerprint = fingerprintDirty(root, snap.HeadCommit, snap.Entries)
-	return snap, nil
+	return sampler.Sample(ctx)
 }
 
 // compareDirtyEntries orders entries by path, breaking ties on kind so
