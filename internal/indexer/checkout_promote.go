@@ -195,7 +195,6 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
 		l.detachWatcher(out.Prefix)
-		l.saveConfig("promote-resume")
 		l.notifyTrackedSetChanged()
 		if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID, transition.TransitionID); err != nil {
 			return out, err
@@ -251,7 +250,6 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	}
 
 	l.detachWatcher(out.Prefix)
-	l.saveConfig("promote")
 	l.notifyTrackedSetChanged()
 	if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID, transition.TransitionID); err != nil {
 		l.logger.Warn("checkout lifecycle: could not release the promotion journal",

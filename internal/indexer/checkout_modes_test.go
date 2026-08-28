@@ -655,6 +655,134 @@ func TestPromotionColdBootstrapDoesNotReplayUnpublishedShell(t *testing.T) {
 	assert.Contains(t, composed, dirtyPath+"::B")
 }
 
+// TestPromotionConfigSaveFailureRemainsRetryable makes the post-publication
+// config path an existing directory, so the route commit succeeds but the
+// durable config flush deterministically fails. Restart must replay only the
+// old configured primary, then resume the standing transition without another
+// base build or any mutable generation-zero payload.
+func TestPromotionConfigSaveFailureRemainsRetryable(t *testing.T) {
+	f := newFamilyFixture(t, "config-save-retry")
+	defer f.close()
+	ctx := context.Background()
+
+	blockedConfigPath := filepath.Join(f.dir, "config-save-blocker")
+	require.NoError(t, os.Mkdir(blockedConfigPath, 0o755))
+	f.cm.Global().SetConfigPath(blockedConfigPath)
+
+	result, err := f.lc.PromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "flush dedicated repository config")
+	assert.True(t, result.Pending)
+	assert.True(t, result.Retryable)
+	require.NotEmpty(t, result.TransitionID)
+	require.NotEmpty(t, result.Prefix)
+	require.NotEmpty(t, result.GraphID)
+
+	promoted, found, err := f.catalog.GetCheckout(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, store_sqlite.CheckoutModeDedicated, promoted.EffectiveMode,
+		"config failure must not roll back the already-safe route publication")
+	route, routed := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, routed)
+	assert.Equal(t, result.GraphID, route.GraphID)
+	standing, found, err := f.catalog.GetIntentTransition(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "config failure must retain a durable retry")
+	assert.Equal(t, result.TransitionID, standing.TransitionID)
+	assert.Equal(t, store_sqlite.IntentTransitionPending, standing.State)
+	assert.NotEmpty(t, standing.LastError)
+	assert.False(t, f.configLists(f.worktree),
+		"the failed flush must not appear in the on-disk configured set")
+
+	dedicated, found, err := f.catalog.GetDedicatedGraph(ctx, result.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotZero(t, dedicated.ActiveGenerationID)
+	baseGenerationID := dedicated.ActiveGenerationID
+	dirtyPath := filepath.Base(f.worktree) + ".go"
+	exactHeadBefore := contentIdentities(f.store.AtGeneration(baseGenerationID), result.Prefix)
+	assert.NotContains(t, exactHeadBefore, dirtyPath)
+	assert.NotContains(t, exactHeadBefore, dirtyPath+"::B")
+	commitLayerBefore := contentIdentities(f.store.AtGeneration(route.CommitGenerationID), result.Prefix)
+	dirtyLayerBefore := contentIdentities(f.store.AtGeneration(route.DirtyGenerationID), result.Prefix)
+	require.NotEmpty(t, dirtyLayerBefore, "promotion did not publish its dirty layer")
+	assert.Empty(t, contentIdentities(f.store, result.Prefix),
+		"post-route config failure must not create generation-zero payload")
+	metadata := f.mi.GetMetadata(result.Prefix)
+	require.NotNil(t, metadata)
+	assert.Zero(t, metadata.FileCount)
+
+	f.restart()
+	assert.Equal(t, exactHeadBefore,
+		contentIdentities(f.store.AtGeneration(baseGenerationID), result.Prefix),
+		"cold restart lost the already-published exact-HEAD generation")
+	assert.Equal(t, commitLayerBefore,
+		contentIdentities(f.store.AtGeneration(route.CommitGenerationID), result.Prefix),
+		"cold restart lost the already-published commit generation")
+	assert.Equal(t, dirtyLayerBefore,
+		contentIdentities(f.store.AtGeneration(route.DirtyGenerationID), result.Prefix),
+		"cold restart lost the already-published dirty generation")
+	saved, err := config.LoadGlobal(f.cfgPath)
+	require.NoError(t, err)
+	require.Len(t, saved.Repos, 1, "failed worktree config was not durable")
+	replayed := make([]string, 0, len(saved.Repos))
+	f.mi.SetOnRepoTracked(func(repoPrefix, _ string) {
+		replayed = append(replayed, repoPrefix)
+	})
+	for _, entry := range saved.Repos {
+		_, replayErr := f.mi.TrackRepoCtx(ctx, entry)
+		require.NoError(t, replayErr)
+	}
+	assert.NotContains(t, replayed, result.Prefix,
+		"cold config replay admitted the failed dedicated entry")
+	assert.Nil(t, f.mi.GetMetadata(result.Prefix))
+	assert.Empty(t, contentIdentities(f.store, result.Prefix),
+		"cold replay must not index the dedicated worktree mutably")
+
+	require.NoError(t, f.lc.Seed(ctx))
+	require.Eventually(t, func() bool {
+		_, pending, lookupErr := f.catalog.GetIntentTransition(ctx, f.automatic.CheckoutID)
+		require.NoError(t, lookupErr)
+		return !pending
+	}, 20*time.Second, 10*time.Millisecond,
+		"successful disk persistence did not release transition %s", result.TransitionID)
+	_, pending, err := f.catalog.GetIntentTransition(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	assert.False(t, pending, "successful disk persistence releases the transition")
+	assert.True(t, f.configLists(f.worktree), "retry did not persist the worktree")
+
+	after, found, err := f.catalog.GetDedicatedGraph(ctx, result.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, baseGenerationID, after.ActiveGenerationID,
+		"config-only retry must not replace the exact-HEAD generation")
+	assert.Equal(t, exactHeadBefore,
+		contentIdentities(f.store.AtGeneration(after.ActiveGenerationID), result.Prefix))
+	afterRoute, afterRouted := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, afterRouted)
+	assert.Equal(t, route.CommitGenerationID, afterRoute.CommitGenerationID,
+		"config-only retry must not replace the commit generation")
+	assert.Equal(t, route.DirtyGenerationID, afterRoute.DirtyGenerationID,
+		"config-only retry must not replace the dirty generation")
+	assert.Equal(t, commitLayerBefore,
+		contentIdentities(f.store.AtGeneration(afterRoute.CommitGenerationID), result.Prefix),
+		"route-owned shell restore evicted the commit payload")
+	assert.Equal(t, dirtyLayerBefore,
+		contentIdentities(f.store.AtGeneration(afterRoute.DirtyGenerationID), result.Prefix),
+		"route-owned shell restore evicted the dirty payload")
+	assert.Empty(t, contentIdentities(f.store, result.Prefix),
+		"successful retry must retain an empty generation zero")
+	metadata = f.mi.GetMetadata(result.Prefix)
+	require.NotNil(t, metadata)
+	assert.Zero(t, metadata.FileCount)
+	view := f.materialize(f.automatic.CheckoutID)
+	defer view.Close()
+	composed := contentIdentities(view.Reader, result.Prefix)
+	assert.Contains(t, composed, dirtyPath)
+	assert.Contains(t, composed, dirtyPath+"::B")
+}
+
 // --- demotion -----------------------------------------------------------
 
 // TestUntrackDemotesADedicatedWorktree is the untrack path for a working copy

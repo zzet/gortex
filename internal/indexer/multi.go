@@ -2758,7 +2758,7 @@ func (mi *MultiIndexer) trackRepoSourceWithPersistenceCtx(
 		}
 		if owned {
 			result, restored, restoreErr := mi.restoreRouteOwnedRepoCtx(
-				ctx, entry, absPath, prefix, cfg, identity, nil,
+				ctx, entry, absPath, prefix, cfg, identity, nil, persistConfig,
 			)
 			if restoreErr != nil {
 				return nil, restoreErr
@@ -2938,7 +2938,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	}
 	if owned {
 		result, restored, restoreErr := mi.restoreRouteOwnedRepoCtx(
-			ctx, entry, absPath, prefix, cfg, identity, priorMtimes,
+			ctx, entry, absPath, prefix, cfg, identity, priorMtimes, true,
 		)
 		if restoreErr != nil {
 			return nil, restoreErr

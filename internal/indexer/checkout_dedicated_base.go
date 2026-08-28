@@ -166,9 +166,21 @@ func (l *CheckoutLifecycle) ensurePromotedRepoShell(
 		// payload-free shell used by the dedicated route.
 		l.mi.UntrackRepo(prefix)
 	}
-	shell := promotionShellSource{}
-	_, err := l.mi.trackRepoSourceTransientCtx(ctx,
-		config.RepoEntry{Path: checkout.RootPath, Name: prefix}, shell)
+	// Before publication an explicit empty source is what prevents a mutable
+	// filesystem index. After publication, however, a cold process must use the
+	// route-owned restore arm: indexing even an empty source takes the cold
+	// shadow path, whose authoritative prefix eviction spans every generation
+	// and would erase the immutable corpus the route already owns.
+	content := source.ContentSource(promotionShellSource{})
+	owned, err := l.mi.routeOwnsDedicatedCorpus(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("indexer: inspect dedicated repository route: %w", err)
+	}
+	if owned {
+		content = nil
+	}
+	_, err = l.mi.trackRepoSourceTransientCtx(ctx,
+		config.RepoEntry{Path: checkout.RootPath, Name: prefix}, content)
 	if err != nil {
 		return fmt.Errorf("indexer: install transient dedicated repository shell: %w", err)
 	}
@@ -191,7 +203,10 @@ func (l *CheckoutLifecycle) persistPromotedRepoConfig(
 		Path: checkout.RootPath,
 		Name: prefix,
 	}); err != nil {
-		return fmt.Errorf("indexer: persist dedicated repository config: %w", err)
+		return fmt.Errorf("indexer: add dedicated repository config: %w", err)
+	}
+	if err := l.cfgMgr.Global().Save(); err != nil {
+		return fmt.Errorf("indexer: flush dedicated repository config: %w", err)
 	}
 	return nil
 }
