@@ -35,6 +35,12 @@ import (
 // whatever IndexCtx took.
 const indexWalkStage = "walking files"
 
+// topologyPassArrivalTimeout bounds setup and planning before IndexCtx emits
+// its first walk tick. It is deliberately much larger than the gate probe:
+// under a full or race-enabled package run, Git diffing, parsing, and SQLite
+// planning can be delayed without saying anything about topology ownership.
+const topologyPassArrivalTimeout = 30 * time.Second
+
 // topologyGateProbeWindow is how long the negative assertion waits before
 // concluding a held gate really is held.
 const topologyGateProbeWindow = 75 * time.Millisecond
@@ -66,13 +72,20 @@ func (r *passParkReporter) resume() {
 	r.resumeOnce.Do(func() { close(r.release) })
 }
 
-// waitParked blocks until the pass reaches its walk stage.
-func (r *passParkReporter) waitParked(t *testing.T) {
+// waitParked blocks until the pass reaches its walk stage, while reporting a
+// build that exits early instead of misdiagnosing it as a progress timeout.
+func (r *passParkReporter) waitParked(t *testing.T, ctx context.Context, done <-chan error) {
 	t.Helper()
 	select {
 	case <-r.parked:
-	case <-time.After(batchTransitionTestTimeout):
-		t.Fatal("the indexing pass never reached its walk stage")
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the indexing pass failed before its walk stage: %v", err)
+		}
+		t.Fatal("the indexing pass completed without reaching its walk stage")
+	case <-ctx.Done():
+		t.Fatalf("the indexing pass did not reach its walk stage within %s: %v",
+			topologyPassArrivalTimeout, ctx.Err())
 	}
 }
 
@@ -171,13 +184,15 @@ func TestSparseGenerationBuildDoesNotHoldTheTopologyWriter(t *testing.T) {
 	reporter := newPassParkReporter()
 	defer reporter.resume()
 
+	buildCtx, cancelBuild := context.WithTimeout(context.Background(), topologyPassArrivalTimeout)
+	defer cancelBuild()
 	buildErr := make(chan error, 1)
 	go func() {
 		_, _, err := builderNewBuilder(fixture.store).BuildCommitLayer(
-			progress.WithReporter(context.Background(), reporter), fixture.commitLayerRequest())
+			progress.WithReporter(buildCtx, reporter), fixture.commitLayerRequest())
 		buildErr <- err
 	}()
-	reporter.waitParked(t)
+	reporter.waitParked(t, buildCtx, buildErr)
 
 	probe := probeTopologyWriter(fixture.store)
 	defer probe.take(batchTransitionTestTimeout)
@@ -230,12 +245,14 @@ func TestBaseIndexHoldsTheTopologyWriter(t *testing.T) {
 	idx.SetWorkspaceID(builderRepoPrefix)
 	idx.SetProjectID(builderRepoPrefix)
 
+	indexCtx, cancelIndex := context.WithTimeout(context.Background(), topologyPassArrivalTimeout)
+	defer cancelIndex()
 	indexErr := make(chan error, 1)
 	go func() {
-		_, err := idx.IndexCtx(progress.WithReporter(context.Background(), reporter), fixture.dir)
+		_, err := idx.IndexCtx(progress.WithReporter(indexCtx, reporter), fixture.dir)
 		indexErr <- err
 	}()
-	reporter.waitParked(t)
+	reporter.waitParked(t, indexCtx, indexErr)
 
 	probe := probeTopologyWriter(fixture.store)
 	defer probe.take(batchTransitionTestTimeout)
