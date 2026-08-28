@@ -167,13 +167,31 @@ func (l *CheckoutLifecycle) ensurePromotedRepoShell(
 		l.mi.UntrackRepo(prefix)
 	}
 	shell := promotionShellSource{}
-	_, err := l.mi.trackRepoSourceCtx(ctx,
+	_, err := l.mi.trackRepoSourceTransientCtx(ctx,
 		config.RepoEntry{Path: checkout.RootPath, Name: prefix}, shell)
 	if err != nil {
-		return fmt.Errorf("indexer: install dedicated repository shell: %w", err)
+		return fmt.Errorf("indexer: install transient dedicated repository shell: %w", err)
 	}
 	if l.mi.GetMetadata(prefix) == nil {
 		return fmt.Errorf("indexer: dedicated repository shell %s was not installed", prefix)
+	}
+	return nil
+}
+
+// persistPromotedRepoConfig makes a successfully published dedicated route part
+// of the next configured-repository replay. It must never run while promotion
+// still owns only an off-route shell and an unfinished transition.
+func (l *CheckoutLifecycle) persistPromotedRepoConfig(
+	checkout store_sqlite.Checkout, prefix string,
+) error {
+	if l.cfgMgr == nil {
+		return nil
+	}
+	if err := l.cfgMgr.Global().AddRepo(config.RepoEntry{
+		Path: checkout.RootPath,
+		Name: prefix,
+	}); err != nil {
+		return fmt.Errorf("indexer: persist dedicated repository config: %w", err)
 	}
 	return nil
 }

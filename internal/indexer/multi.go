@@ -2662,9 +2662,25 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 
 // trackRepoSourceCtx is TrackRepoCtx with a borrowed immutable content source.
 // A nil source preserves the legacy filesystem-backed behavior. The caller owns
-// the source and must keep it open until this method returns.
+// the source and must keep it open until this method returns. Normal tracking is
+// persistent; promotion uses the transient wrapper until its route is published.
 func (mi *MultiIndexer) trackRepoSourceCtx(
 	ctx context.Context, entry config.RepoEntry, content source.ContentSource,
+) (*IndexResult, error) {
+	return mi.trackRepoSourceWithPersistenceCtx(ctx, entry, content, true)
+}
+
+// trackRepoSourceTransientCtx admits a process-local repository shell without
+// adding it to the configured tracked set. A caller must persist the entry only
+// after the catalog state that owns the shell has committed.
+func (mi *MultiIndexer) trackRepoSourceTransientCtx(
+	ctx context.Context, entry config.RepoEntry, content source.ContentSource,
+) (*IndexResult, error) {
+	return mi.trackRepoSourceWithPersistenceCtx(ctx, entry, content, false)
+}
+
+func (mi *MultiIndexer) trackRepoSourceWithPersistenceCtx(
+	ctx context.Context, entry config.RepoEntry, content source.ContentSource, persistConfig bool,
 ) (*IndexResult, error) {
 	absPath, err := filepath.Abs(entry.Path)
 	if err != nil {
@@ -2836,10 +2852,14 @@ func (mi *MultiIndexer) trackRepoSourceCtx(
 		mi.mu.Unlock()
 		installed = true
 
-		// Add to global config.
-		entry.Path = absPath
-		if err := mi.configMgr.Global().AddRepo(entry); err != nil {
-			mi.logger.Warn("failed to add repo to config", zap.Error(err))
+		// Add to global config only after the caller's authoritative ownership
+		// state exists. Promotion admits its pre-publication shell transiently;
+		// publishing that path here would let a crash replay it as a mutable repo.
+		if persistConfig {
+			entry.Path = absPath
+			if err := mi.configMgr.Global().AddRepo(entry); err != nil {
+				mi.logger.Warn("failed to add repo to config", zap.Error(err))
+			}
 		}
 
 		// Skip the per-repo contract reconcile when batching: it walks every

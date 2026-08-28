@@ -188,6 +188,9 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		if err := l.ensurePromotedRepoShell(ctx, checkout, out.Prefix); err != nil {
 			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
+		if err := l.persistPromotedRepoConfig(checkout, out.Prefix); err != nil {
+			return out, l.promotionFailed(ctx, &out, transition, err)
+		}
 		if err := l.installDedicatedCoordinator(ctx, out.GraphID, checkout); err != nil {
 			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
@@ -238,7 +241,12 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	}
 	if err := l.ensurePromotedRepoShell(ctx, checkout, out.Prefix); err != nil {
 		// Publication already committed. Keep the exact route and durable row;
-		// the dedicated-mode recovery arm above retries only this process shell.
+		// the dedicated-mode recovery arm retries this process shell.
+		return out, l.promotionFailed(ctx, &out, transition, err)
+	}
+	if err := l.persistPromotedRepoConfig(checkout, out.Prefix); err != nil {
+		// The route owns the corpus already, so a retry may safely persist the
+		// configured entry without rebuilding or exposing generation zero.
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 

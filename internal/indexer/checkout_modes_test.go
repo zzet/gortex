@@ -484,6 +484,177 @@ func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
 	assert.False(t, found, "successful retry releases the durable row")
 }
 
+const (
+	promotionColdBootstrapEnv           = "GORTEX_TEST_PROMOTION_COLD_BOOTSTRAP_DIR"
+	promotionColdBootstrapCrashExitCode = 86
+	promotionColdBootstrapSetupExitCode = 87
+)
+
+func openPromotionColdFixture(t *testing.T, dir string, initialize bool) *lifecycleFixture {
+	t.Helper()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if initialize {
+		gc := &config.GlobalConfig{}
+		gc.SetConfigPath(cfgPath)
+		require.NoError(t, gc.Save())
+	}
+	f := &lifecycleFixture{
+		t:       t,
+		dir:     dir,
+		dbPath:  filepath.Join(dir, "store.sqlite"),
+		cfgPath: cfgPath,
+		watcher: newFakeWatcher(),
+		notify:  &countingNotifier{},
+		clock:   newManualClock(),
+	}
+	f.open()
+	return f
+}
+
+func runPromotionColdBootstrapCrash(t *testing.T, dir string) {
+	t.Helper()
+	f := openPromotionColdFixture(t, dir, true)
+	ctx := context.Background()
+	main := f.gitRepo("cold-bootstrap-main")
+	f.worktreeOf(main, "cold-bootstrap-wt")
+	tracked, err := f.lc.Register(ctx,
+		config.RepoEntry{Path: main, Name: "cold-bootstrap-main"}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, tracked.CatalogErr)
+	_, err = f.lc.Sweep(ctx)
+	require.NoError(t, err)
+
+	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
+	require.NoError(t, err)
+	var automatic store_sqlite.Checkout
+	for i := range checkouts {
+		if checkouts[i].CheckoutID != tracked.CheckoutID {
+			automatic = checkouts[i]
+			break
+		}
+	}
+	require.NotEmpty(t, automatic.CheckoutID)
+
+	// Flush the in-memory tracked set at the exact pre-publication seam, then
+	// terminate without rollback or orderly Close. This models any config flush
+	// followed by a process crash while the durable transition is still running.
+	f.lc.indexBarrier = func() {
+		if err := f.cm.Global().Save(); err != nil {
+			os.Exit(promotionColdBootstrapSetupExitCode)
+		}
+		os.Exit(promotionColdBootstrapCrashExitCode)
+	}
+	started, err := f.lc.StartPromoteCheckout(ctx, automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	require.True(t, started.Pending)
+	_ = awaitModeTransition(t, f.lc, started.TransitionID)
+	t.Fatal("promotion crossed the crash barrier")
+}
+
+// TestPromotionColdBootstrapDoesNotReplayUnpublishedShell kills a real
+// promotion after its process shell exists but before CommitAuthorizedPromotion.
+// A fresh process then reopens the WAL-backed store and configuration, performs
+// normal configured-repository replay, and resumes the durable transition.
+func TestPromotionColdBootstrapDoesNotReplayUnpublishedShell(t *testing.T) {
+	if dir := os.Getenv(promotionColdBootstrapEnv); dir != "" {
+		runPromotionColdBootstrapCrash(t, dir)
+		return
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available in PATH")
+	}
+
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0],
+		"-test.run=^TestPromotionColdBootstrapDoesNotReplayUnpublishedShell$", "-test.v")
+	cmd.Env = append(os.Environ(), promotionColdBootstrapEnv+"="+dir)
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, string(output))
+	require.Equal(t, promotionColdBootstrapCrashExitCode, exitErr.ExitCode(), string(output))
+
+	f := openPromotionColdFixture(t, dir, false)
+	defer f.close()
+	ctx := context.Background()
+	main := filepath.Join(dir, "cold-bootstrap-main")
+	worktree := filepath.Join(dir, "cold-bootstrap-wt")
+	primary := f.familyOf("cold-bootstrap-main")
+	checkouts, err := f.catalog.ListCheckouts(ctx, primary.FamilyID)
+	require.NoError(t, err)
+	var automatic store_sqlite.Checkout
+	for i := range checkouts {
+		if checkouts[i].CheckoutID != primary.OwnerCheckoutID {
+			automatic = checkouts[i]
+			break
+		}
+	}
+	require.NotEmpty(t, automatic.CheckoutID)
+	unpublished, found, err := f.catalog.GetDedicatedGraphByOwner(ctx, automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "the crash retains the promotion's durable graph binding")
+	prefix := unpublished.RepoPrefix
+	require.NotEmpty(t, prefix)
+	transition, found, err := f.catalog.GetIntentTransition(ctx, automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "the crash retains the durable promotion transition")
+
+	// This is the daemon's cold configured-repository replay, before lifecycle
+	// seeding resumes transitions. The unpublished worktree must not be present
+	// in the config, admitted to the MultiIndexer, walked, or stored in gen zero.
+	saved, err := config.LoadGlobal(f.cfgPath)
+	require.NoError(t, err)
+	require.Len(t, saved.Repos, 1, "only the already-published primary is durable")
+	replayed := make([]string, 0, len(saved.Repos))
+	f.mi.SetOnRepoTracked(func(repoPrefix, _ string) {
+		replayed = append(replayed, repoPrefix)
+	})
+	for _, entry := range saved.Repos {
+		_, replayErr := f.mi.TrackRepoCtx(ctx, entry)
+		require.NoError(t, replayErr)
+	}
+	assert.True(t, f.configLists(main))
+	assert.False(t, f.configLists(worktree), "pre-publication shell leaked into config")
+	assert.NotContains(t, replayed, prefix, "cold startup admitted the unpublished shell")
+	assert.Nil(t, f.mi.GetMetadata(prefix), "cold startup indexed the unpublished worktree")
+	assert.Empty(t, contentIdentities(f.store, prefix),
+		"cold startup wrote mutable dedicated payload into generation zero")
+	assert.Zero(t, unpublished.ActiveGenerationID)
+	generations, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID: unpublished.GraphID,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, generations, "the crash happened before the exact-HEAD build")
+
+	require.NoError(t, f.lc.Seed(ctx))
+	outcome := awaitModeTransition(t, f.lc, transition.TransitionID)
+	require.NoError(t, outcome.err)
+	assert.Equal(t, prefix, outcome.promotion.Prefix)
+	promoted, found, err := f.catalog.GetCheckout(ctx, automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, store_sqlite.CheckoutModeDedicated, promoted.EffectiveMode)
+	assert.True(t, f.configLists(worktree), "published dedicated checkout was not persisted")
+	metadata := f.mi.GetMetadata(prefix)
+	require.NotNil(t, metadata)
+	assert.Zero(t, metadata.FileCount, "resumed promotion retains a payload-free process shell")
+	assert.Empty(t, contentIdentities(f.store, prefix),
+		"successful resume must not duplicate the base in generation zero")
+
+	dedicated, found, err := f.catalog.GetDedicatedGraph(ctx, unpublished.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotZero(t, dedicated.ActiveGenerationID)
+	dirtyPath := filepath.Base(worktree) + ".go"
+	exactHead := contentIdentities(f.store.AtGeneration(dedicated.ActiveGenerationID), prefix)
+	assert.NotContains(t, exactHead, dirtyPath)
+	assert.NotContains(t, exactHead, dirtyPath+"::B")
+	view := f.materialize(automatic.CheckoutID)
+	defer view.Close()
+	composed := contentIdentities(view.Reader, prefix)
+	assert.Contains(t, composed, dirtyPath, "dirty content remains in the overlay after resume")
+	assert.Contains(t, composed, dirtyPath+"::B")
+}
+
 // --- demotion -----------------------------------------------------------
 
 // TestUntrackDemotesADedicatedWorktree is the untrack path for a working copy
