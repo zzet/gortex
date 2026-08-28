@@ -83,6 +83,11 @@ type storeCore struct {
 	// int64 generation; values are *sync.Mutex. See ResolveMutex.
 	resolveLanes sync.Map
 
+	// payloadBuildFlights maps a catalog generation to its sole process-local
+	// physical writer. Every handle over this core joins the same rendezvous;
+	// entries vanish when the writer completes and are never persisted.
+	payloadBuildFlights sync.Map
+
 	// Structural integrity is owned by this logical store. Shadows forward
 	// rejected attempts into the same recorder; warnings are rate-limited per
 	// Store so independent workspaces never suppress each other's diagnostics.

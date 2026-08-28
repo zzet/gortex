@@ -233,6 +233,11 @@ type EnrichmentOutcome struct {
 type BuildReport struct {
 	GenerationID int64
 
+	// Coalesced reports that this call reused another caller's physical build
+	// or a generation that became ready before it joined. Only reports with
+	// Coalesced false represent physical payload work for metrics accounting.
+	Coalesced bool
+
 	// ChangedFiles, AddedFiles and DeletedFiles partition the request's change
 	// set after validation.
 	ChangedFiles int
@@ -337,12 +342,10 @@ const generationAbandonTimeout = 5 * time.Second
 // and belongs to the caller. A published-but-unrouted generation is a legal
 // resting state.
 //
-// Two builds naming the same layer and the same input fingerprints must not
-// run at once. The catalog coalesces such a begin onto the generation already
-// in flight and reports that adoption to the builder. Serialising identical
-// builds is still the caller's responsibility: the verdict distinguishes a
-// pristine generation from one that may already carry partial payload; it does
-// not transfer ownership away from a live writer.
+// Two builds naming the same layer and the same input fingerprints share one
+// physical writer. The catalog aligns them on one generation ID; the store
+// core's process-local flight gives exactly one caller runPass and publish
+// ownership while followers wait with independently cancelable contexts.
 func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (int64, BuildReport, error) {
 	started := time.Now()
 	if err := b.validate(ctx, &req); err != nil {
@@ -376,50 +379,79 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	}
 	report.GenerationID = generationID
 
-	// A build that dies part way must not leave a generation in the only
-	// mutable state forever: nothing would ever publish it, and the coalescing
-	// rule would hand it to the next build of the same inputs.
-	published := false
-	defer func() {
-		if !published {
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generationAbandonTimeout)
-			defer cancel()
-			b.abandon(cleanupCtx, generationID)
-		}
-	}()
+	flight, leader, ready, err := b.Store.JoinPayloadBuildFlight(ctx, generationID, adopted)
+	if err != nil {
+		report.Coalesced = adopted
+		report.Duration = time.Since(started)
+		return generationID, report, fmt.Errorf("indexer: join payload build flight %d: %w", generationID, err)
+	}
+	if ready {
+		report.Coalesced = true
+		report.Duration = time.Since(started)
+		return generationID, report, nil
+	}
+	if !leader {
+		report.Coalesced = true
+		err = flight.Wait(ctx)
+		report.Duration = time.Since(started)
+		return generationID, report, err
+	}
 
-	// A newly allocated generation cannot carry payload yet. When the plan has
-	// no files to index, the masks below completely describe a no-op or
-	// deletion-only layer, so constructing an Indexer would only run global
-	// passes over an empty graph. An adopted generation may contain rows from a
-	// build interrupted part way through and stays on the established recovery
-	// path instead of being assumed pristine.
-	if adopted || len(plan.indexed) > 0 {
-		if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
-			return generationID, report, err
+	report.Coalesced = false
+	var buildErr error
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			flight.Complete(fmt.Errorf("indexer: payload generation %d build panicked: %v", generationID, recovered))
+			panic(recovered)
 		}
-	}
-	// Enrichment runs before the masks so anything it adds to the payload is
-	// covered by the claims derived from it, and before the producer states so
-	// what it did is what they describe.
-	b.runEnrichment(req, handle, &report)
-	if err := b.writeMasks(req, plan, handle, &report); err != nil {
-		return generationID, report, err
-	}
-	if err := b.declareProducers(req, handle, &report); err != nil {
-		return generationID, report, err
-	}
-	if req.PrePublish != nil {
-		if err := req.PrePublish(ctx, generationID); err != nil {
-			return generationID, report, err
+		flight.Complete(buildErr)
+	}()
+	buildErr = func() error {
+		// A physical build that dies part way must not leave a generation in the
+		// only mutable state forever. Cleanup completes before followers wake, so
+		// a retry cannot re-adopt payload the failed writer left behind.
+		published := false
+		defer func() {
+			if !published {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generationAbandonTimeout)
+				defer cancel()
+				b.abandon(cleanupCtx, generationID)
+			}
+		}()
+
+		// A newly allocated generation cannot carry payload yet. When the plan
+		// has no files to index, the masks below completely describe a no-op or
+		// deletion-only layer. A recovered adopted generation may carry partial
+		// payload from a vanished writer, so it remains on the established
+		// recovery path and is re-derived in full.
+		if adopted || len(plan.indexed) > 0 {
+			if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
+				return err
+			}
 		}
-	}
-	if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
-		return generationID, report, fmt.Errorf("indexer: publish generation %d: %w", generationID, err)
-	}
-	published = true
+		// Enrichment runs before the masks so anything it adds to the payload is
+		// covered by the claims derived from it, and before the producer states
+		// so what it did is what they describe.
+		b.runEnrichment(req, handle, &report)
+		if err := b.writeMasks(req, plan, handle, &report); err != nil {
+			return err
+		}
+		if err := b.declareProducers(req, handle, &report); err != nil {
+			return err
+		}
+		if req.PrePublish != nil {
+			if err := req.PrePublish(ctx, generationID); err != nil {
+				return err
+			}
+		}
+		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
+			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)
+		}
+		published = true
+		return nil
+	}()
 	report.Duration = time.Since(started)
-	return generationID, report, nil
+	return generationID, report, buildErr
 }
 
 // validate refuses a request that cannot produce a composable generation, and
