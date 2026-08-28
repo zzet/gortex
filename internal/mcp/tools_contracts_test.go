@@ -101,6 +101,7 @@ func TestHandleContracts_ReflectsRuntimeTrackedRepos(t *testing.T) {
 		ConfigManager: cm,
 		MultiIndexer:  mi,
 	})
+	srv.PublishReadiness("ready", true, nil)
 
 	// Baseline: contracts from the provider repo are visible.
 	providerCount := contractsTotal(t, srv, nil)
