@@ -784,7 +784,22 @@ func (m *RefViewManager) runDetached(
 		defer stop()
 		release, err := m.gate.Acquire(buildCtx, ViewBuildInteractive)
 		if err != nil {
-			done <- outcome{err: fmt.Errorf("indexer: wait for ref-view build admission: %w", err)}
+			waitErr := fmt.Errorf("indexer: wait for ref-view build admission: %w", err)
+			m.completeBuild(buildCtx, build, store_sqlite.ViewGenerationFailed, 0, waitErr.Error())
+			if errors.Is(err, ErrViewBuildQueueFull) {
+				viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewDeferred)
+				m.logger.Debug("ref view manager: build deferred by admission capacity",
+					zap.String("ref_view", view.RefViewID),
+					zap.String("build_token", build.BuildToken),
+					zap.Error(err))
+				done <- outcome{result: RefViewResult{
+					RefViewID: view.RefViewID,
+					Resolved:  resolved,
+					State:     store_sqlite.RefViewBuilding,
+				}}
+				return
+			}
+			done <- outcome{err: waitErr}
 			return
 		}
 		defer release()

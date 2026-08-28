@@ -181,9 +181,10 @@ type CheckoutCycle struct {
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
 	Rescheduled bool
-	// Deferred reports that the cycle never ran: the warmup gate is holding
-	// build work, and the loop will run this cycle when it opens. Nothing was
-	// read and nothing was written, so every other field is zero.
+	// Deferred reports that the cycle never ran: either daemon warmup has not
+	// opened the build lane, or its bounded background queue was saturated.
+	// Opening the gate or the 15-second coordinator poll retries the demand.
+	// Nothing was read or written, so every other field is zero.
 	Deferred bool
 	// Err is what stopped the cycle, nil when it settled both slots.
 	Err error
@@ -540,6 +541,17 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 
 	release, err := c.gate.Acquire(ctx, ViewBuildBackground)
 	if err != nil {
+		if errors.Is(err, ErrViewBuildQueueFull) {
+			c.logger.Debug("checkout coordinator: build deferred by admission capacity",
+				zap.String("checkout", c.checkoutID),
+				zap.String("reason", reason),
+				zap.Error(err))
+			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeDeferred)
+			if c.cycleDone != nil {
+				c.cycleDone(CheckoutCycle{Deferred: true})
+			}
+			return
+		}
 		out := CheckoutCycle{Err: fmt.Errorf("indexer: wait for checkout build admission: %w", err)}
 		recordCoordinatorCycle(out)
 		if c.cycleDone != nil {

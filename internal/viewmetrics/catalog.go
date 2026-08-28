@@ -41,6 +41,12 @@ const (
 	CoordinatorCycleTotal = "views_coordinator_cycle_total"
 	// CoordinatorBuildSeconds is how long one slot's build took.
 	CoordinatorBuildSeconds = "views_coordinator_build_seconds"
+	// ViewBuildAdmissionTotal counts admissions by priority and terminal outcome.
+	ViewBuildAdmissionTotal = "views_build_admission_total"
+	// ViewBuildQueue is the number of callers waiting for the physical build lane.
+	ViewBuildQueue = "views_build_queue"
+	// ViewBuildWaitSeconds is how long a queued caller waited for admission or cancellation.
+	ViewBuildWaitSeconds = "views_build_wait_seconds"
 	// Coordinators is how many checkout coordinators the registry holds. A
 	// coordinator a transition is driving a rebuild with is running and not
 	// registered; the administrative surfaces count those, this level does not.
@@ -107,6 +113,7 @@ const (
 // Label names.
 const (
 	LabelOutcome  = "outcome"
+	LabelPriority = "priority"
 	LabelFrom     = "from"
 	LabelTo       = "to"
 	LabelEvidence = "evidence"
@@ -172,11 +179,21 @@ const (
 	OutcomeCASLost       = "cas_lost"
 	OutcomeHeadMoved     = "head_moved"
 	OutcomeFailed        = "failed"
-	// OutcomeDeferred counts the cycles the warmup gate held back. They are
-	// not skipped work: each one is a claim the coordinator runs once builds
-	// are admitted, so a count that keeps rising after warmup is a gate that
-	// never opened.
+	// OutcomeDeferred counts cycles held back by warmup or bounded admission
+	// capacity. They are not skipped work: opening the gate or the coordinator
+	// poll retries them. A sustained count after warmup indicates build-lane
+	// saturation rather than a permanently rejected checkout.
 	OutcomeDeferred = "deferred"
+)
+
+// Physical view-build admission priorities and outcomes. Both vocabularies
+// are fixed: no checkout, ref, repository, or path identity enters metrics.
+const (
+	BuildPriorityInteractive = "interactive"
+	BuildPriorityBackground  = "background"
+	BuildAdmissionAdmitted   = "admitted"
+	BuildAdmissionRejected   = "rejected"
+	BuildAdmissionCanceled   = "canceled"
 )
 
 // Build slots.
@@ -212,9 +229,10 @@ const (
 // note a selection makes when it took over a build claim a dead worker left
 // behind, and is followed by whichever of the six that selection went on to be.
 //
-// Deferred is a building answer with a cause: the pass the selection claimed
-// is waiting for the warmup gate rather than running, so the token is worth
-// polling but nothing is producing payload for it yet.
+// Deferred is a building answer with a cause: warmup has not admitted the pass,
+// or bounded admission closed its claim so the next selection can retry. A
+// warmup-deferred token is worth polling; a capacity-deferred result has no
+// token because that attempt is already closed.
 const (
 	RefViewReady     = "ready"
 	RefViewAdopted   = "adopted"
@@ -327,11 +345,23 @@ var catalog = map[string]spec{
 		{name: LabelOutcome, values: []string{
 			OutcomeBuiltCommit, OutcomeAdoptedCommit, OutcomeBuiltDirty,
 			OutcomeSkipped, OutcomeSuperseded, OutcomeRescheduled,
-			OutcomeCASLost, OutcomeHeadMoved, OutcomeFailed,
+			OutcomeCASLost, OutcomeHeadMoved, OutcomeFailed, OutcomeDeferred,
 		}},
 	}},
 	CoordinatorBuildSeconds: {kind: kindDuration, labels: []labelSpec{
 		{name: LabelSlot, values: []string{SlotCommit, SlotDirty}},
+	}},
+	ViewBuildAdmissionTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelPriority, values: []string{BuildPriorityInteractive, BuildPriorityBackground}},
+		{name: LabelOutcome, values: []string{
+			BuildAdmissionAdmitted, BuildAdmissionRejected, BuildAdmissionCanceled,
+		}},
+	}},
+	ViewBuildQueue: {kind: kindGauge, labels: []labelSpec{
+		{name: LabelPriority, values: []string{BuildPriorityInteractive, BuildPriorityBackground}},
+	}},
+	ViewBuildWaitSeconds: {kind: kindDuration, labels: []labelSpec{
+		{name: LabelPriority, values: []string{BuildPriorityInteractive, BuildPriorityBackground}},
 	}},
 	Coordinators: {kind: kindGauge},
 
@@ -355,7 +385,7 @@ var catalog = map[string]spec{
 
 	RefViewSelectionTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelOutcome, values: []string{
-			RefViewReady, RefViewAdopted, RefViewBuilding,
+			RefViewReady, RefViewAdopted, RefViewBuilding, RefViewDeferred,
 			RefViewCoalesced, RefViewReclaimed, RefViewFailed,
 		}},
 	}},
