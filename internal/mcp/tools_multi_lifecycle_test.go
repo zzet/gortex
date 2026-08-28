@@ -58,6 +58,7 @@ func newCatalogMCPServer(t *testing.T) (*Server, *indexer.MultiIndexer, *store_s
 			_ = srv.lifecycle.Close()
 		}
 	})
+	srv.PublishReadiness("ready", true, nil)
 	return srv, mi, store.Catalog(), dir
 }
 

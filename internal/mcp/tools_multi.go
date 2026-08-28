@@ -14,7 +14,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/reconcile"
 )
 
 // trackAcceptedHeadroom is how long before the MCP request deadline the
@@ -82,14 +84,149 @@ func (s *Server) registerMultiRepoTools() {
 	)
 }
 
+type trackRepositoryRuntime struct {
+	register   func(context.Context, config.RepoEntry, store_sqlite.IntentSourceKind) (indexer.RegisterResult, error)
+	indexerFor func(string) *indexer.Indexer
+	launch     func(func())
+}
+
+func trackRepositoryWarmupRefusal(state warmupState) *mcp.CallToolResult {
+	if !state.known {
+		return mcp.NewToolResultError(
+			"repository tracking is temporarily unavailable: daemon readiness is unknown; retry after workspace readiness reports ready")
+	}
+	if state.warming() {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"repository tracking is temporarily unavailable while daemon warmup is in phase %q (%d%% complete); retry after workspace readiness reports ready",
+			state.phase, state.percent))
+	}
+	return nil
+}
+
+func readyTrackGeneration(
+	ctx context.Context,
+	catalog *store_sqlite.Catalog,
+	graphID string,
+	generationID int64,
+) (bool, error) {
+	if generationID <= 0 {
+		return false, nil
+	}
+	generation, found, err := catalog.GetViewGeneration(ctx, generationID)
+	if err != nil || !found {
+		return false, err
+	}
+	return generation.GraphID == graphID && generation.State == store_sqlite.ViewGenerationReady, nil
+}
+
+// readyTrackedRepository is the mutation-free duplicate admission check. A
+// durable catalog row alone is insufficient after restart: Register restores
+// the process-local indexer shell for a ready route, so the no-op also requires
+// that shell to exist.
+func (s *Server) readyTrackedRepository(
+	ctx context.Context,
+	absPath string,
+	indexerFor func(string) *indexer.Indexer,
+) (bool, error) {
+	if s.materializer == nil || s.materializer.Catalog == nil || indexerFor == nil {
+		return false, nil
+	}
+	catalog := s.materializer.Catalog
+	families, err := catalog.ListRepositoryFamilies(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	var checkout store_sqlite.Checkout
+	cleanedPath := filepath.Clean(absPath)
+	for _, family := range families {
+		checkouts, listErr := catalog.ListCheckouts(ctx, family.FamilyID)
+		if listErr != nil {
+			return false, listErr
+		}
+		for _, candidate := range checkouts {
+			if filepath.Clean(candidate.RootPath) != cleanedPath {
+				continue
+			}
+			if checkout.CheckoutID != "" && checkout.CheckoutID != candidate.CheckoutID {
+				return false, fmt.Errorf("tracked path %q resolves to multiple checkouts", absPath)
+			}
+			checkout = candidate
+		}
+	}
+	if checkout.CheckoutID == "" || checkout.State != store_sqlite.CheckoutStateReady ||
+		checkout.DesiredMode != store_sqlite.CheckoutModeDedicated ||
+		checkout.EffectiveMode != store_sqlite.CheckoutModeDedicated {
+		return false, nil
+	}
+
+	intents, err := catalog.ListTrackingIntents(ctx, checkout.CheckoutID)
+	if err != nil {
+		return false, err
+	}
+	explicit := false
+	for _, intent := range intents {
+		if !intent.Active {
+			continue
+		}
+		switch intent.SourceKind {
+		case store_sqlite.IntentSourceCLITrack,
+			store_sqlite.IntentSourceMCPTrack,
+			store_sqlite.IntentSourceManualConfig,
+			store_sqlite.IntentSourceProjectMembership:
+			explicit = true
+		}
+	}
+	if !explicit {
+		return false, nil
+	}
+
+	dedicated, found, err := catalog.GetDedicatedGraphByOwner(ctx, checkout.CheckoutID)
+	if err != nil || !found {
+		return false, err
+	}
+	if dedicated.FamilyID != checkout.FamilyID {
+		return false, fmt.Errorf("checkout %s owns graph %s in another family", checkout.CheckoutID, dedicated.GraphID)
+	}
+	if dedicated.State != reconcile.GraphStateReady || indexerFor(dedicated.RepoPrefix) == nil {
+		return false, nil
+	}
+
+	route, found, err := catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
+	if err != nil || !found {
+		return false, err
+	}
+	if route.State != store_sqlite.RouteActive || route.GraphID != dedicated.GraphID {
+		return false, nil
+	}
+	commitReady, err := readyTrackGeneration(ctx, catalog, dedicated.GraphID, route.CommitGenerationID)
+	if err != nil || !commitReady {
+		return false, err
+	}
+	if route.DirtyGenerationID > 0 {
+		dirtyReady, dirtyErr := readyTrackGeneration(ctx, catalog, dedicated.GraphID, route.DirtyGenerationID)
+		if dirtyErr != nil || !dirtyReady {
+			return false, dirtyErr
+		}
+	}
+	return true, nil
+}
+
 // handleTrackRepository validates the path, indexes the repo, and persists to GlobalConfig.
 func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.handleTrackRepositoryWithRuntime(ctx, req, trackRepositoryRuntime{})
+}
+
+func (s *Server) handleTrackRepositoryWithRuntime(
+	ctx context.Context,
+	req mcp.CallToolRequest,
+	runtime trackRepositoryRuntime,
+) (*mcp.CallToolResult, error) {
 	path, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
 
-	// Validate path exists and is a directory.
 	info, statErr := os.Stat(path)
 	if statErr != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("invalid path: %s", path)), nil
@@ -97,12 +234,19 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 	if !info.IsDir() {
 		return mcp.NewToolResultError(fmt.Sprintf("invalid path: %s (not a directory)", path)), nil
 	}
-
 	if s.multiIndexer == nil {
 		return mcp.NewToolResultError("multi-repo indexing is not enabled"), nil
 	}
+	absPath, absErr := filepath.Abs(path)
+	if absErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("resolve repository path %q: %v", path, absErr)), nil
+	}
+	absPath = filepath.Clean(absPath)
+	if refusal := trackRepositoryWarmupRefusal(s.warmupSnapshot()); refusal != nil {
+		return refusal, nil
+	}
 
-	entry := config.RepoEntry{Path: path}
+	entry := config.RepoEntry{Path: absPath}
 	if name, ok := req.GetArguments()["name"].(string); ok && name != "" {
 		entry.Name = name
 	}
@@ -126,16 +270,30 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		entry.Force = true
 	}
 
-	// A fresh repo's first index routinely outruns the MCP request deadline,
-	// and registration only lands *after* TrackRepoCtx returns — so the
-	// cancelled index left the repo untracked and a retry just repeated the
-	// cycle (#326). Run the index on a context detached from the request and
-	// answer `accepted` before the deadline, so the work continues
-	// server-side the way boot indexing does.
-	absPath, absErr := filepath.Abs(path)
-	if absErr != nil {
-		absPath = path
+	if runtime.indexerFor == nil {
+		runtime.indexerFor = s.multiIndexer.GetIndexer
 	}
+	alreadyTracked, preflightErr := s.readyTrackedRepository(ctx, absPath, runtime.indexerFor)
+	if preflightErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("check existing repository registration: %v", preflightErr)), nil
+	}
+	if alreadyTracked {
+		return mcp.NewToolResultText("repository already tracked"), nil
+	}
+	if runtime.register == nil && s.lifecycle != nil {
+		runtime.register = s.lifecycle.Register
+	}
+	if runtime.register == nil {
+		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
+	}
+	if runtime.launch == nil {
+		runtime.launch = func(run func()) { go run() }
+	}
+
+	// A fresh repo's first index routinely outruns the MCP request deadline,
+	// and registration only lands *after* TrackRepoCtx returns. Admission is
+	// detached from the request, and the winner rechecks readiness plus the
+	// durable/live duplicate state before it creates any worker.
 	if _, busy := s.trackInFlight.LoadOrStore(absPath, struct{}{}); busy {
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"status": "accepted",
@@ -143,9 +301,18 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 			"detail": "an initial index for this path is already running; call track again later to read its result",
 		})
 	}
-
-	if s.lifecycle == nil {
-		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
+	if refusal := trackRepositoryWarmupRefusal(s.warmupSnapshot()); refusal != nil {
+		s.trackInFlight.Delete(absPath)
+		return refusal, nil
+	}
+	alreadyTracked, preflightErr = s.readyTrackedRepository(ctx, absPath, runtime.indexerFor)
+	if preflightErr != nil {
+		s.trackInFlight.Delete(absPath)
+		return mcp.NewToolResultError(fmt.Sprintf("recheck existing repository registration: %v", preflightErr)), nil
+	}
+	if alreadyTracked {
+		s.trackInFlight.Delete(absPath)
+		return mcp.NewToolResultText("repository already tracked"), nil
 	}
 
 	type trackOutcome struct {
@@ -153,29 +320,20 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		err    error
 	}
 	done := make(chan trackOutcome, 1)
-	go func() {
+	runtime.launch(func() {
 		defer s.trackInFlight.Delete(absPath)
 		// WithoutCancel keeps the request's values (progress token, session)
 		// while dropping its cancellation, so the daemon's request lifetime
 		// can no longer kill a half-written first index.
-		//
-		// Registration also persists the config, attaches the watcher and
-		// invalidates every session's cached workspace binding — the last of
-		// which is what stops the session that ran `track` to repair its own
-		// uncovered cwd from staying blind to the repo it just added. It
-		// happens inside the goroutine because the caller may already have
-		// answered `accepted` and returned.
-		res, trackErr := s.lifecycle.Register(
+		res, trackErr := runtime.register(
 			s.progressCtx(context.WithoutCancel(ctx), req), entry, indexer.TrackSourceMCP)
 		if trackErr == nil && res.CatalogErr != nil {
 			s.logger.Warn("track: recording the checkout identity failed",
 				zap.String("path", path), zap.Error(res.CatalogErr))
 		}
 		done <- trackOutcome{result: res, err: trackErr}
-	}()
+	})
 
-	// A nil channel blocks forever, so a request with no deadline (CLI, tests)
-	// keeps today's fully synchronous contract.
 	var answerBy <-chan time.Time
 	if deadline, ok := ctx.Deadline(); ok {
 		wait := max(time.Until(deadline)-trackAcceptedHeadroom, 0)
@@ -189,8 +347,6 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		if out.err != nil {
 			return mcp.NewToolResultError(out.err.Error()), nil
 		}
-		// Already tracked — the corpus held the repo, so only its identity
-		// and side effects were brought up to date.
 		if out.result.AlreadyTracked {
 			return mcp.NewToolResultText("repository already tracked"), nil
 		}

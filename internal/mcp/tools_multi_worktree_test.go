@@ -44,6 +44,7 @@ func newWorktreeMCPServer(t *testing.T, repos ...config.RepoEntry) (*Server, *in
 		ConfigManager: cm,
 		MultiIndexer:  mi,
 	})
+	srv.PublishReadiness("ready", true, nil)
 	return srv, mi
 }
 
