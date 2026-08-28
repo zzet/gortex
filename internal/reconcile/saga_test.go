@@ -441,7 +441,25 @@ func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
 	f := newFixture(t, Default())
 	f.seedCheckout("co-1", "inc-1", "wt", store_sqlite.CheckoutModeDedicated)
 	f.seedOwnedGraph("graph-1", "co-1")
-	target := sagaTarget{Kind: sagaRetireGraph, Phase: phaseReleaseGraph, GraphID: "graph-1"}
+	if err := f.catalog.BeginIntentTransition(ctx, store_sqlite.IntentTransition{
+		TransitionID:       "demote-1",
+		CheckoutID:         "co-1",
+		Cause:              explicitUntrackDemotionCause,
+		PriorDesiredMode:   store_sqlite.CheckoutModeDedicated,
+		PriorEffectiveMode: store_sqlite.CheckoutModeDedicated,
+		RequestedMode:      store_sqlite.CheckoutModeAutomatic,
+		PriorCheckoutState: store_sqlite.CheckoutStateReady,
+		SourceSnapshotHash: "graph-1:primary-graph:1",
+		State:              store_sqlite.IntentTransitionRunning,
+		CreatedAt:          1,
+		LastProgress:       1,
+	}); err != nil {
+		t.Fatalf("seed durable demotion ownership: %v", err)
+	}
+	target := sagaTarget{
+		Kind: sagaRetireGraph, Phase: phaseReleaseGraph, GraphID: "graph-1",
+		CheckoutID: "co-1", FamilyID: f.familyID,
+	}
 	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
 		t.Fatalf("persist legacy graph cleanup: %v", err)
 	}
@@ -506,6 +524,28 @@ func TestResumeKeepsUnverifiableLegacyRetireGraphTargetDurable(t *testing.T) {
 				return sagaTarget{
 					Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
 					GraphID: "graph-1", CheckoutID: "co-1", FamilyID: "another-family",
+				}
+			},
+		},
+		{
+			name: "matching rows have no durable demotion ownership",
+			seed: func(f *fixture) sagaTarget {
+				f.seedCheckout("co-1", "inc-1", "one", store_sqlite.CheckoutModeDedicated)
+				f.seedOwnedGraph("graph-1", "co-1")
+				return sagaTarget{
+					Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
+					GraphID: "graph-1", FamilyID: f.familyID,
+				}
+			},
+		},
+		{
+			name: "reused checkout and graph IDs have no old transition",
+			seed: func(f *fixture) sagaTarget {
+				f.seedCheckout("co-1", "inc-new", "one", store_sqlite.CheckoutModeDedicated)
+				f.seedOwnedGraph("graph-1", "co-1")
+				return sagaTarget{
+					Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
+					GraphID: "graph-1", CheckoutID: "co-1", FamilyID: f.familyID,
 				}
 			},
 		},
@@ -598,6 +638,39 @@ func TestResumeFinishesGraphReleaseAfterCatalogRowAlreadyGone(t *testing.T) {
 	}
 	if entries := f.journal(); len(entries) != 0 {
 		t.Fatalf("row-absent retry retained journal: %+v", entries)
+	}
+}
+
+func TestResumeSkipsRowAbsentGraphCleanupForReplacementCheckout(t *testing.T) {
+	for _, kind := range []sagaKind{sagaRetireGraph, sagaForgetCheckout} {
+		t.Run(string(kind), func(t *testing.T) {
+			ctx := context.Background()
+			f := newFixture(t, Default())
+			f.seedCheckout("co-1", "inc-new", "replacement", store_sqlite.CheckoutModeAutomatic)
+			target := sagaTarget{
+				Kind: kind, Phase: phaseReleaseGraph,
+				GraphID: "graph-gone", FamilyID: f.familyID,
+				CheckoutID: "co-1", Incarnation: "inc-old",
+				RepoPrefix: "durable-prefix", RootPath: "/repo/old",
+			}
+			if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+				t.Fatalf("persist stale row-absent graph release: %v", err)
+			}
+
+			if err := f.rec.Resume(ctx); err != nil {
+				t.Fatalf("Resume stale row-absent cleanup: %v", err)
+			}
+			if f.hooks.countPrefix("release:") != 0 {
+				t.Fatal("stale row-absent cleanup invoked graph release")
+			}
+			checkout, present, err := f.catalog.GetCheckout(ctx, "co-1")
+			if err != nil || !present || checkout.Incarnation != "inc-new" {
+				t.Fatalf("replacement checkout changed: %+v, present:%v err:%v", checkout, present, err)
+			}
+			if entries := f.journal(); len(entries) != 0 {
+				t.Fatalf("stale row-absent cleanup retained obsolete journal: %+v", entries)
+			}
+		})
 	}
 }
 

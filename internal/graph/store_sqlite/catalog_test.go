@@ -648,6 +648,75 @@ func TestCatalogDedicatedGraphDeleteGuardsCheckoutIncarnation(t *testing.T) {
 	}
 }
 
+func TestCatalogDedicatedGraphRestoreIsInsertOnlyAndIncarnationGuarded(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+	captured := DedicatedGraph{
+		GraphID: "graph-1", OwnerCheckoutID: "wt", RepoPrefix: "captured-prefix",
+		FamilyID: "fam", State: "graph_ready",
+	}
+	if err := catalog.UpsertDedicatedGraph(ctx, captured); err != nil {
+		t.Fatalf("seed captured graph: %v", err)
+	}
+	if deleted, err := catalog.DeleteDedicatedGraphForIncarnation(ctx, "graph-1", "wt", "inc-1"); err != nil || !deleted {
+		t.Fatalf("delete captured graph = %v, %v", deleted, err)
+	}
+
+	present, err := catalog.RestoreDedicatedGraphForIncarnation(ctx, captured, "wt", "inc-1")
+	if err != nil || !present {
+		t.Fatalf("restore current graph = %v, %v", present, err)
+	}
+	if got, ok, err := catalog.GetDedicatedGraph(ctx, captured.GraphID); err != nil || !ok || got != captured {
+		t.Fatalf("restored graph = %+v, present:%v err:%v", got, ok, err)
+	}
+	if deleted, err := catalog.DeleteDedicatedGraphForIncarnation(ctx, "graph-1", "wt", "inc-1"); err != nil || !deleted {
+		t.Fatalf("delete restored graph = %v, %v", deleted, err)
+	}
+
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-2")
+	present, err = catalog.RestoreDedicatedGraphForIncarnation(ctx, captured, "wt", "inc-1")
+	if err != nil {
+		t.Fatalf("stale restore without graph: %v", err)
+	}
+	if present {
+		t.Fatal("stale incarnation restored an absent graph")
+	}
+	if _, ok, err := catalog.GetDedicatedGraph(ctx, captured.GraphID); err != nil || ok {
+		t.Fatalf("stale restore created graph: present:%v err:%v", ok, err)
+	}
+
+	// Even an identical row is stale when its owner checkout ID now names a
+	// different incarnation. Identity is checked before row equality.
+	if err := catalog.UpsertDedicatedGraph(ctx, captured); err != nil {
+		t.Fatalf("seed identical replacement graph: %v", err)
+	}
+	present, err = catalog.RestoreDedicatedGraphForIncarnation(ctx, captured, "wt", "inc-1")
+	if err != nil {
+		t.Fatalf("stale restore over identical replacement: %v", err)
+	}
+	if present {
+		t.Fatal("stale restore accepted an identical row owned by a new incarnation")
+	}
+
+	replacement := captured
+	replacement.RepoPrefix = "replacement-prefix"
+	if err := catalog.UpsertDedicatedGraph(ctx, replacement); err != nil {
+		t.Fatalf("seed replacement graph: %v", err)
+	}
+	present, err = catalog.RestoreDedicatedGraphForIncarnation(ctx, captured, "wt", "inc-1")
+	if err != nil {
+		t.Fatalf("stale restore over replacement: %v", err)
+	}
+	if present {
+		t.Fatal("stale restore reported captured graph present")
+	}
+	if got, ok, err := catalog.GetDedicatedGraph(ctx, replacement.GraphID); err != nil || !ok || got != replacement {
+		t.Fatalf("stale restore overwrote replacement: %+v, present:%v err:%v", got, ok, err)
+	}
+}
+
 // TestCatalogIncarnationGuardRejectsStaleWrite proves a checkout state write
 // aimed at a previous incarnation of a recreated working copy changes nothing.
 func TestCatalogIncarnationGuardRejectsStaleWrite(t *testing.T) {

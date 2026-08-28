@@ -478,6 +478,31 @@ func (c *Catalog) DeleteCheckout(ctx context.Context, checkoutID string) error {
 		`DELETE FROM checkouts WHERE checkout_id = ?`, checkoutID)
 }
 
+// DeleteCheckoutForIncarnation removes a checkout only while its durable
+// identity still names the expected incarnation. The bool reports whether the
+// expected row was deleted; an absent or replacement row is a safe stale no-op.
+func (c *Catalog) DeleteCheckoutForIncarnation(
+	ctx context.Context, checkoutID, incarnation string,
+) (bool, error) {
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return false, err
+	}
+	if err := requireCatalogID("incarnation", incarnation); err != nil {
+		return false, err
+	}
+	result, err := c.exec(ctx,
+		`DELETE FROM checkouts WHERE checkout_id = ? AND incarnation = ?`,
+		checkoutID, incarnation)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed != 0, nil
+}
+
 // --- tracking intents --------------------------------------------------
 
 // UpsertTrackingIntent writes one tracking intent. A repeated request from the
@@ -984,6 +1009,98 @@ func (c *Catalog) DeleteDedicatedGraphForIncarnation(
 		return false, err
 	}
 	return changed != 0, nil
+}
+
+// RestoreDedicatedGraphForIncarnation restores a captured graph row after a
+// later cross-store cleanup step failed. The bool is true only when the
+// captured row is present when the transaction commits; false means the graph
+// or checkout identity has moved and the caller must treat the cleanup as
+// stale. Restoration is insert-only: it never updates a replacement row.
+func (c *Catalog) RestoreDedicatedGraphForIncarnation(
+	ctx context.Context, captured DedicatedGraph, checkoutID, incarnation string,
+) (bool, error) {
+	if err := captured.validate(); err != nil {
+		return false, err
+	}
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return false, err
+	}
+	if err := requireCatalogID("incarnation", incarnation); err != nil {
+		return false, err
+	}
+	if captured.OwnerCheckoutID != checkoutID {
+		return false, fmt.Errorf(
+			"%w: graph %s is owned by checkout %s, not %s",
+			ErrCatalogStaleGuard, captured.GraphID, captured.OwnerCheckoutID, checkoutID)
+	}
+
+	capturedPresent := false
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		var checkoutMatches int
+		if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM checkouts
+ WHERE checkout_id = ? AND incarnation = ? AND family_id = ?`,
+			checkoutID, incarnation, captured.FamilyID).Scan(&checkoutMatches); err != nil {
+			return err
+		}
+		if checkoutMatches == 0 {
+			return nil
+		}
+
+		current := DedicatedGraph{GraphID: captured.GraphID}
+		var (
+			owner         sql.NullString
+			activeGen     sql.NullInt64
+			isPrimaryBase int
+		)
+		err := tx.QueryRowContext(ctx, `
+SELECT owner_checkout_id, repo_prefix, family_id, is_primary_base, active_generation_id, state
+  FROM dedicated_graphs WHERE graph_id = ?`, captured.GraphID).Scan(
+			&owner, &current.RepoPrefix, &current.FamilyID, &isPrimaryBase,
+			&activeGen, &current.State)
+		switch {
+		case err == nil:
+			current.OwnerCheckoutID = owner.String
+			current.ActiveGenerationID = activeGen.Int64
+			current.IsPrimaryBase = isPrimaryBase != 0
+			capturedPresent = current == captured
+			return nil
+		case err != sql.ErrNoRows:
+			return err
+		}
+
+		// Owner and primary uniqueness are replacement signals, not errors a
+		// compensating cleanup should retry against indefinitely.
+		var conflicts int
+		if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM dedicated_graphs
+ WHERE owner_checkout_id = ?
+    OR (? = 1 AND family_id = ? AND is_primary_base = 1)`,
+			checkoutID, catalogBoolInt(captured.IsPrimaryBase), captured.FamilyID).Scan(&conflicts); err != nil {
+			return err
+		}
+		if conflicts != 0 {
+			return nil
+		}
+
+		result, err := tx.ExecContext(ctx, `
+INSERT INTO dedicated_graphs
+  (graph_id, owner_checkout_id, repo_prefix, family_id, is_primary_base, active_generation_id, state)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			captured.GraphID, catalogNullString(captured.OwnerCheckoutID), captured.RepoPrefix,
+			captured.FamilyID, catalogBoolInt(captured.IsPrimaryBase),
+			catalogNullInt(captured.ActiveGenerationID), captured.State)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		capturedPresent = changed == 1
+		return nil
+	})
+	return capturedPresent, err
 }
 
 // SetPrimaryDedicatedGraph moves the family's primary base to one graph. The

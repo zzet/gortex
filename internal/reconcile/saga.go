@@ -332,6 +332,27 @@ func (r *Reconciler) repairLegacyRetireGraphTarget(
 			"%w: legacy graph cleanup %s moved from family %s to %s",
 			ErrSagaTarget, target.GraphID, target.FamilyID, graph.FamilyID)
 	}
+
+	transition, transitionPresent, err := r.catalog.GetIntentTransition(ctx, checkout.CheckoutID)
+	if err != nil {
+		return target, err
+	}
+	stateOwnsCleanup := transition.State == store_sqlite.IntentTransitionPending ||
+		transition.State == store_sqlite.IntentTransitionRunning ||
+		transition.State == store_sqlite.IntentTransitionFailed
+	if checkout.ActiveIntentTransitionID == "" || !transitionPresent ||
+		transition.TransitionID != checkout.ActiveIntentTransitionID ||
+		transition.CheckoutID != checkout.CheckoutID ||
+		transition.Cause != explicitUntrackDemotionCause ||
+		transition.RequestedMode != store_sqlite.CheckoutModeAutomatic ||
+		transition.PriorEffectiveMode != store_sqlite.CheckoutModeDedicated ||
+		!stateOwnsCleanup ||
+		!strings.HasPrefix(transition.SourceSnapshotHash, target.GraphID+":") {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s has no active demotion ownership proof",
+			ErrSagaTarget, target.GraphID)
+	}
+
 	target.CheckoutID = checkout.CheckoutID
 	target.Incarnation = checkout.Incarnation
 	target.FamilyID = graph.FamilyID
@@ -539,6 +560,20 @@ func (r *Reconciler) releaseGraph(ctx context.Context, target sagaTarget) error 
 		if target.Kind != sagaRetireGraph && target.Kind != sagaForgetCheckout {
 			return nil
 		}
+		// A graph ID and repository prefix may be reused after re-tracking. If
+		// the checkout ID is live again at a different positive incarnation,
+		// this journal belongs to the old binding and must stop before its
+		// prefix or config are touched. A matching row, or a genuinely absent
+		// checkout, is the interrupted-finalizer recovery case.
+		if release.CheckoutID != "" && release.Incarnation != "" {
+			checkout, checkoutPresent, err := r.catalog.GetCheckout(ctx, release.CheckoutID)
+			if err != nil {
+				return err
+			}
+			if checkoutPresent && checkout.Incarnation != release.Incarnation {
+				return nil
+			}
+		}
 		if release.RepoPrefix == "" {
 			// Legacy journals written before the durable address existed reached
 			// this state only after the old finalizer had already removed config.
@@ -607,7 +642,13 @@ func (r *Reconciler) deleteCheckoutRow(ctx context.Context, target sagaTarget) e
 	if target.CheckoutID == "" {
 		return nil
 	}
-	if err := ignoreNotFound(r.catalog.DeleteCheckout(ctx, target.CheckoutID)); err != nil {
+	if target.Incarnation == "" {
+		return fmt.Errorf("%w: checkout cleanup %s has no incarnation",
+			ErrSagaTarget, target.CheckoutID)
+	}
+	if _, err := r.catalog.DeleteCheckoutForIncarnation(
+		ctx, target.CheckoutID, target.Incarnation,
+	); err != nil {
 		return err
 	}
 	return ignoreNotFound(r.catalog.DeleteCleanupEntry(ctx, target.purgeCleanupID()))
@@ -624,8 +665,12 @@ func (r *Reconciler) verifyCheckoutGone(ctx context.Context, target sagaTarget) 
 		return nil
 	}
 	var leftover []string
-	if _, present, err := r.catalog.GetCheckout(ctx, target.CheckoutID); err != nil {
+	if checkout, present, err := r.catalog.GetCheckout(ctx, target.CheckoutID); err != nil {
 		return err
+	} else if present && target.Incarnation != "" && checkout.Incarnation != target.Incarnation {
+		// The old identity is gone and this stable checkout ID has been reused.
+		// None of the replacement's rows are postconditions of the stale saga.
+		return nil
 	} else if present {
 		leftover = append(leftover, "checkouts")
 	}

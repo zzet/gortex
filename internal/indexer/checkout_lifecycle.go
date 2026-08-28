@@ -2401,22 +2401,17 @@ func (l *CheckoutLifecycle) restoreGraphAfterFailedRelease(
 	if cause == nil {
 		return nil
 	}
-	if _, present, err := l.catalog.GetDedicatedGraph(ctx, row.GraphID); err != nil {
-		return errors.Join(cause, err)
-	} else if present {
-		return cause
-	}
-	checkout, present, err := l.catalog.GetCheckout(ctx, checkoutID)
+	present, err := l.catalog.RestoreDedicatedGraphForIncarnation(
+		ctx, row, checkoutID, incarnation,
+	)
 	if err != nil {
-		return errors.Join(cause, err)
-	}
-	if !present || checkout.Incarnation != incarnation {
 		return errors.Join(cause, fmt.Errorf(
-			"%w: cannot restore graph %s for stale checkout incarnation",
-			store_sqlite.ErrCatalogStaleGuard, row.GraphID))
+			"restore graph %s after failed release: %w", row.GraphID, err))
 	}
-	if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
-		return errors.Join(cause, fmt.Errorf("restore graph %s after failed release: %w", row.GraphID, err))
+	if !present {
+		return errors.Join(cause, fmt.Errorf(
+			"%w: cannot restore graph %s for stale checkout incarnation or replacement graph",
+			store_sqlite.ErrCatalogStaleGuard, row.GraphID))
 	}
 	return cause
 }

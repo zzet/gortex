@@ -379,6 +379,73 @@ func TestRepositoryCleanupSagaRetriesConfigWriteWithoutRepeatingPayloadPurge(t *
 	assertCleanupReleased(t, f.mi, f.mainPrefix)
 }
 
+func TestRepositoryCleanupCompensationDoesNotOverwriteConcurrentReplacement(t *testing.T) {
+	f := newFamilyFixture(t, "cleanup-compensation-replacement")
+	defer f.close()
+	ctx := context.Background()
+
+	captured, present, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph)
+	if err != nil || !present {
+		t.Fatalf("read captured graph = present:%v err:%v", present, err)
+	}
+	configPath := f.cm.Global().ConfigPath()
+	f.cm.Global().SetConfigPath(t.TempDir()) // force failure after guarded graph deletion
+	defer f.cm.Global().SetConfigPath(configPath)
+
+	replacement := captured
+	replacement.RepoPrefix = captured.RepoPrefix + "-replacement"
+	replacement.ActiveGenerationID = 0
+	f.lc.releaseGraphBarrier = func(barrierCtx context.Context, _ string, finalize func() error) error {
+		if err := finalize(); err != nil {
+			return err
+		}
+		replaced := make(chan error, 1)
+		go func() {
+			checkout, checkoutPresent, err := f.catalog.GetCheckout(barrierCtx, captured.OwnerCheckoutID)
+			if err != nil {
+				replaced <- err
+				return
+			}
+			if !checkoutPresent {
+				replaced <- fmt.Errorf("checkout %s disappeared before replacement", captured.OwnerCheckoutID)
+				return
+			}
+			checkout.Incarnation = "replacement-incarnation"
+			checkout.ActiveIntentTransitionID = ""
+			if err := f.catalog.UpsertCheckout(barrierCtx, checkout); err != nil {
+				replaced <- err
+				return
+			}
+			replaced <- f.catalog.UpsertDedicatedGraph(barrierCtx, replacement)
+		}()
+		return <-replaced
+	}
+
+	_, err = f.lc.Untrack(ctx, f.main)
+	if err == nil || !strings.Contains(err.Error(), "writing global config") {
+		t.Fatalf("untrack config error = %v", err)
+	}
+	if !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		t.Fatalf("untrack error = %v, want stale compensation guard", err)
+	}
+	got, present, readErr := f.catalog.GetDedicatedGraph(ctx, replacement.GraphID)
+	if readErr != nil || !present || got != replacement {
+		t.Fatalf("replacement graph changed: %+v, present:%v err:%v", got, present, readErr)
+	}
+	checkout, present, readErr := f.catalog.GetCheckout(ctx, captured.OwnerCheckoutID)
+	if readErr != nil || !present || checkout.Incarnation != "replacement-incarnation" {
+		t.Fatalf("replacement checkout changed: %+v, present:%v err:%v", checkout, present, readErr)
+	}
+	if !f.configLists(f.main) {
+		t.Fatal("failed stale compensation removed durable config intent")
+	}
+	state, phases := cleanupStateSnapshot(t, f.mi, captured.RepoPrefix)
+	if !phases.payloadPurged || !phases.vectorPublished || phases.configFinalized {
+		t.Fatalf("cleanup phases after stale compensation = %+v", phases)
+	}
+	assertSingleClosedCleanupLane(t, f.mi, captured.RepoPrefix, state)
+}
+
 func TestRepositoryCleanupSagaRetainsGraphAndConfigThenResumesWithoutLiveRegistry(t *testing.T) {
 	f := newFamilyFixture(t, "cleanup-saga-retry")
 	defer f.close()
