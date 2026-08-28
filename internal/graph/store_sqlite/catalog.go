@@ -1712,6 +1712,93 @@ SELECT graph_id, commit_generation_id, dirty_generation_id, route_epoch, state
 	return route, true, nil
 }
 
+// checkoutRouteLookupBatchSize stays below SQLite's host-parameter ceiling and
+// bounds both the generated statement and the rows one read can materialize.
+const checkoutRouteLookupBatchSize = 512
+
+type checkoutRouteBatchReader func(context.Context, []string) (map[string]CheckoutRoute, error)
+
+// GetCheckoutRoutes returns the existing routes among checkoutIDs, keyed by
+// checkout id. Missing and empty ids are omitted. Input is de-duplicated before
+// the read and large requests are split into bounded batches.
+func (c *Catalog) GetCheckoutRoutes(ctx context.Context, checkoutIDs []string) (map[string]CheckoutRoute, error) {
+	return getCheckoutRoutesBatched(ctx, checkoutIDs, c.getCheckoutRouteBatch)
+}
+
+func getCheckoutRoutesBatched(
+	ctx context.Context,
+	checkoutIDs []string,
+	readBatch checkoutRouteBatchReader,
+) (map[string]CheckoutRoute, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	unique := make([]string, 0, len(checkoutIDs))
+	seen := make(map[string]struct{}, len(checkoutIDs))
+	for _, checkoutID := range checkoutIDs {
+		if checkoutID == "" {
+			continue
+		}
+		if _, duplicate := seen[checkoutID]; duplicate {
+			continue
+		}
+		seen[checkoutID] = struct{}{}
+		unique = append(unique, checkoutID)
+	}
+	routes := make(map[string]CheckoutRoute)
+	for first := 0; first < len(unique); first += checkoutRouteLookupBatchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		last := min(first+checkoutRouteLookupBatchSize, len(unique))
+		batch, err := readBatch(ctx, unique[first:last])
+		if err != nil {
+			return nil, err
+		}
+		for checkoutID, route := range batch {
+			routes[checkoutID] = route
+		}
+	}
+	return routes, nil
+}
+
+func (c *Catalog) getCheckoutRouteBatch(ctx context.Context, checkoutIDs []string) (map[string]CheckoutRoute, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(checkoutIDs)), ",")
+	args := make([]any, len(checkoutIDs))
+	for i, checkoutID := range checkoutIDs {
+		args[i] = checkoutID
+	}
+	rows, err := c.store.db.QueryContext(ctx, `
+SELECT checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state
+  FROM checkout_routes WHERE checkout_id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	routes := make(map[string]CheckoutRoute)
+	for rows.Next() {
+		var (
+			route               CheckoutRoute
+			commitGen, dirtyGen sql.NullInt64
+			state               string
+		)
+		if err := rows.Scan(
+			&route.CheckoutID, &route.GraphID, &commitGen, &dirtyGen, &route.RouteEpoch, &state,
+		); err != nil {
+			return nil, err
+		}
+		route.CommitGenerationID = commitGen.Int64
+		route.DirtyGenerationID = dirtyGen.Int64
+		route.State = RouteState(state)
+		routes[route.CheckoutID] = route
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return routes, nil
+}
+
 // DeleteCheckoutRoute withdraws a checkout's route. The route row is the one
 // child of a checkout that does not cascade, so removing it is what unblocks
 // DeleteCheckout.

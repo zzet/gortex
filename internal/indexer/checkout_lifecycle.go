@@ -218,22 +218,22 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	}
 	transitionCtx, cancelTransitions := context.WithCancel(context.Background())
 	l := &CheckoutLifecycle{
-		mi:                cfg.MultiIndexer,
-		cfgMgr:            cfg.ConfigManager,
+		mi:                     cfg.MultiIndexer,
+		cfgMgr:                 cfg.ConfigManager,
 		logger:                 logger,
 		now:                    now,
 		buildingRecoveryCutoff: now().Unix(),
 		leases:                 cfg.ViewLeases,
-		coordinators:      map[string]*CheckoutCoordinator{},
-		started:           map[string][]*CheckoutCoordinator{},
-		owed:              map[int64]struct{}{},
-		familyRetries:     map[string]familyRetry{},
-		refViewRetention:  cfg.RefViews.withDefaults(),
-		indexBarrier:      cfg.indexBarrier,
-		transitionCtx:     transitionCtx,
-		cancelTransitions: cancelTransitions,
-		transitionRuns:    map[string]*modeTransitionRun{},
-		transitionQueue:   make(chan *modeTransitionRun, modeTransitionQueueLimit),
+		coordinators:           map[string]*CheckoutCoordinator{},
+		started:                map[string][]*CheckoutCoordinator{},
+		owed:                   map[int64]struct{}{},
+		familyRetries:          map[string]familyRetry{},
+		refViewRetention:       cfg.RefViews.withDefaults(),
+		indexBarrier:           cfg.indexBarrier,
+		transitionCtx:          transitionCtx,
+		cancelTransitions:      cancelTransitions,
+		transitionRuns:         map[string]*modeTransitionRun{},
+		transitionQueue:        make(chan *modeTransitionRun, modeTransitionQueueLimit),
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -2130,32 +2130,16 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			l.logger.Debug("checkout lifecycle: could not scan checkout layers", zap.Error(scanErr))
 			break
 		}
-		for _, row := range layers {
-			if row.CheckoutID == "" {
-				// A layer that names no checkout has no route to check it
-				// against, so nothing here can tell whether it is still served.
-				continue
-			}
-			if _, live := served[row.CheckoutID]; live {
-				continue
-			}
-			switch row.GenerationKind {
-			case CommitLayerGenerationKind, DirtyLayerGenerationKind:
-			default:
-				continue
-			}
-			route, cached := routes[row.CheckoutID]
-			if !cached {
-				// A checkout with no route row names nothing, which is what the
-				// zero route already says.
-				if current, found, err := l.catalog.GetCheckoutRoute(ctx, row.CheckoutID); err == nil && found {
-					route = current
-				}
-				routes[row.CheckoutID] = route
-			}
-			if route.CommitGenerationID == row.GenerationID || route.DirtyGenerationID == row.GenerationID {
-				continue
-			}
+		candidates, routeErr := readyLayerRetirementCandidates(
+			ctx, layers, served, routes, l.catalog.GetCheckoutRoutes,
+		)
+		if routeErr != nil {
+			// A failed catalog read is not evidence that every route is absent.
+			// Stop this cohort conservatively; a later sweep can retry it.
+			l.logger.Debug("checkout lifecycle: could not batch checkout routes", zap.Error(routeErr))
+			break
+		}
+		for _, row := range candidates {
 			collect(row)
 		}
 		if len(layers) < retirementScanPageSize {
@@ -2164,6 +2148,70 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 		layerBeforeGenerationID = layers[len(layers)-1].GenerationID
 	}
 	return out
+}
+
+func readyLayerRetirementCandidates(
+	ctx context.Context,
+	layers []store_sqlite.ViewGeneration,
+	served map[string]struct{},
+	routes map[string]store_sqlite.CheckoutRoute,
+	lookup func(context.Context, []string) (map[string]store_sqlite.CheckoutRoute, error),
+) ([]store_sqlite.ViewGeneration, error) {
+	eligible := make([]store_sqlite.ViewGeneration, 0, len(layers))
+	unresolved := make([]string, 0, len(layers))
+	for _, row := range layers {
+		if row.CheckoutID == "" {
+			// A layer that names no checkout has no route to check it
+			// against, so nothing here can tell whether it is still served.
+			continue
+		}
+		if _, live := served[row.CheckoutID]; live {
+			continue
+		}
+		switch row.GenerationKind {
+		case CommitLayerGenerationKind, DirtyLayerGenerationKind:
+		default:
+			continue
+		}
+		eligible = append(eligible, row)
+		if _, cached := routes[row.CheckoutID]; cached {
+			continue
+		}
+		// Install the missing-route value before the batch so it also acts as
+		// this page's de-duplication marker.
+		routes[row.CheckoutID] = store_sqlite.CheckoutRoute{}
+		unresolved = append(unresolved, row.CheckoutID)
+	}
+	if len(unresolved) > 0 {
+		resolved, err := lookup(ctx, unresolved)
+		if err != nil {
+			for _, checkoutID := range unresolved {
+				delete(routes, checkoutID)
+			}
+			return nil, err
+		}
+		for _, checkoutID := range unresolved {
+			// A checkout with no route row names nothing. Its zero route is
+			// already cached, so a repeat on a later page is never re-read.
+			if route, found := resolved[checkoutID]; found {
+				routes[checkoutID] = route
+			}
+		}
+	}
+
+	candidates := eligible[:0]
+	for _, row := range eligible {
+		route := routes[row.CheckoutID]
+		if route.CommitGenerationID == row.GenerationID || route.DirtyGenerationID == row.GenerationID {
+			continue
+		}
+		candidates = append(candidates, row)
+	}
+	// This batch is a retirement hint, not delete authorization. A route that
+	// starts protecting a candidate after the read is caught by the catalog's
+	// transactional retirement guard; one withdrawn after the read can wait for
+	// the next sweep without compromising correctness.
+	return candidates, nil
 }
 
 // --- startup ------------------------------------------------------------
