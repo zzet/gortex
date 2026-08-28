@@ -152,6 +152,38 @@ func newRefStack(t testing.TB) *refStack {
 	graphID := indexer.GraphIDFor(refTestPrefix)
 	seedRefCatalog(t, store, graphID, repo, headTree)
 
+	ctx := context.Background()
+	generationID, payload, err := store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        graphID,
+		LayerID:        "test-primary-base",
+		CheckoutID:     refTestCheckout,
+		GenerationKind: "dedicated",
+		TreeOID:        headTree,
+		CreatedAt:      102,
+	})
+	if err != nil {
+		t.Fatalf("begin primary payload generation: %v", err)
+	}
+	payloadMI := indexer.NewMultiIndexer(payload, reg, search.NewNull(), cm, zap.NewNop())
+	if _, err := payloadMI.IndexScoped("", ""); err != nil {
+		t.Fatalf("index primary payload generation: %v", err)
+	}
+	if err := store.PublishPayloadGeneration(ctx, generationID, 103); err != nil {
+		t.Fatalf("publish primary payload generation: %v", err)
+	}
+	dedicated, found, err := store.Catalog().GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		t.Fatalf("get dedicated graph: %v", err)
+	}
+	if !found {
+		t.Fatal("seeded dedicated graph is missing")
+	}
+	dedicated.ActiveGenerationID = generationID
+	if err := store.Catalog().UpsertDedicatedGraph(ctx, dedicated); err != nil {
+		t.Fatalf("activate primary payload generation: %v", err)
+	}
+
 	leases := graphview.NewLeaseManager()
 	lifecycle, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
 		MultiIndexer:  mi,
@@ -430,8 +462,8 @@ func TestRefViewGraphServesTheBranchSymbols(t *testing.T) {
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
-	if candidates != 1 {
-		t.Errorf("the search stack has %d layers, want the ref generation", candidates)
+	if candidates != 2 {
+		t.Errorf("the search stack has %d layers, want the ref generation over its primary base", candidates)
 	}
 	if !hasContent {
 		t.Error("content search found no corpus for the ref view")
