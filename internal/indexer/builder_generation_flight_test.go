@@ -357,11 +357,169 @@ func TestSparseGenerationBuilderPanicCompletesFlightBeforePropagating(t *testing
 	}
 }
 
+func TestSparseGenerationCoalescesPlanningBeforePhysicalPass(t *testing.T) {
+	fixture := newSparseBuildFlightFixture(t)
+	request := fixture.request
+	request.Identity.CreatedAt = time.Now().Unix()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	counting := &countingWalkSource{
+		ContentSource: request.Target,
+		entered:       entered,
+		release:       release,
+	}
+	request.Target = counting
+
+	const callers = 16
+	var preparations atomic.Int64
+	start := make(chan struct{})
+	results := make(chan sparseBuildFlightResult, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			<-start
+			generationID, report, err := fixture.builder.buildPrepared(
+				context.Background(), time.Now(), request.Identity,
+				func(_ context.Context, identity GenerationIdentity) (BuildRequest, func(), error) {
+					preparations.Add(1)
+					prepared := request
+					prepared.Identity = identity
+					return prepared, nil, nil
+				},
+			)
+			results <- sparseBuildFlightResult{generationID: generationID, report: report, err: err}
+		}()
+	}
+	close(start)
+	select {
+	case <-entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("physical sparse build did not reach its index pass")
+	}
+	generationID, _, adopted, err := fixture.store.BeginPayloadGenerationWithStatus(
+		context.Background(), payloadRequestForBuild(request),
+	)
+	if err != nil || !adopted {
+		t.Fatalf("observe building generation: adopted=%t err=%v", adopted, err)
+	}
+	awaitSparseBuildFlightWaiters(t, fixture.store, generationID, callers-1)
+	if got := preparations.Load(); got != 1 {
+		t.Fatalf("preparations before release = %d, want 1", got)
+	}
+	if got := counting.walks.Load(); got != 1 {
+		t.Fatalf("physical index walks before release = %d, want 1", got)
+	}
+	close(release)
+
+	physicalReports := 0
+	for i := 0; i < callers; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("build %d: %v", i, result.err)
+		}
+		if result.generationID != generationID {
+			t.Fatalf("build %d generation = %d, want shared %d", i, result.generationID, generationID)
+		}
+		if !result.report.Coalesced {
+			physicalReports++
+		}
+	}
+	if physicalReports != 1 {
+		t.Fatalf("physical reports = %d, want 1", physicalReports)
+	}
+
+	readyFixture := newSparseBuildFlightFixture(t)
+	readyRequest := readyFixture.request
+	readyRequest.Identity.CreatedAt = time.Now().Unix()
+	readyEntered := make(chan struct{})
+	readyRelease := make(chan struct{})
+	readyReleased := false
+	defer func() {
+		if !readyReleased {
+			close(readyRelease)
+		}
+	}()
+	readyCounting := &countingWalkSource{
+		ContentSource: readyRequest.Target,
+		entered:       readyEntered,
+		release:       readyRelease,
+	}
+	readyRequest.Target = readyCounting
+
+	adoptedBeforeJoin := make(chan struct{})
+	allowReadyJoin := make(chan struct{})
+	readyJoinAllowed := false
+	defer func() {
+		if !readyJoinAllowed {
+			close(allowReadyJoin)
+		}
+	}()
+	var blockedReadyJoin atomic.Bool
+	readyFixture.builder.beforePayloadFlightJoin = func(_ int64, adopted bool) {
+		if adopted && blockedReadyJoin.CompareAndSwap(false, true) {
+			close(adoptedBeforeJoin)
+			<-allowReadyJoin
+		}
+	}
+	var readyPreparations atomic.Int64
+	readyResults := make(chan sparseBuildFlightResult, 2)
+	buildReadyRace := func() {
+		generationID, report, err := readyFixture.builder.buildPrepared(
+			context.Background(), time.Now(), readyRequest.Identity,
+			func(_ context.Context, identity GenerationIdentity) (BuildRequest, func(), error) {
+				readyPreparations.Add(1)
+				prepared := readyRequest
+				prepared.Identity = identity
+				return prepared, nil, nil
+			},
+		)
+		readyResults <- sparseBuildFlightResult{generationID: generationID, report: report, err: err}
+	}
+	go buildReadyRace()
+	select {
+	case <-readyEntered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("ready-race leader did not reach its index pass")
+	}
+	go buildReadyRace()
+	select {
+	case <-adoptedBeforeJoin:
+	case <-time.After(20 * time.Second):
+		t.Fatal("ready-race follower did not adopt the building generation")
+	}
+	close(readyRelease)
+	readyReleased = true
+	leaderResult := <-readyResults
+	if leaderResult.err != nil {
+		t.Fatalf("ready-race leader: %v", leaderResult.err)
+	}
+	if leaderResult.report.Coalesced {
+		t.Fatal("ready-race leader reported coalesced")
+	}
+	close(allowReadyJoin)
+	readyJoinAllowed = true
+	readyResult := <-readyResults
+	if readyResult.err != nil {
+		t.Fatalf("ready reuse: %v", readyResult.err)
+	}
+	if readyResult.generationID != leaderResult.generationID || !readyResult.report.Coalesced {
+		t.Fatalf(
+			"ready reuse = generation %d coalesced=%t, want %d true",
+			readyResult.generationID, readyResult.report.Coalesced, leaderResult.generationID,
+		)
+	}
+	if got := readyPreparations.Load(); got != 1 {
+		t.Fatalf("ready-race preparations = %d, want 1", got)
+	}
+	if got := readyCounting.walks.Load(); got != 1 {
+		t.Fatalf("ready-race physical index walks = %d, want 1", got)
+	}
+}
+
 func benchmarkSparseGenerationBuilderFlightIteration(
 	b *testing.B,
 	fixture sparseBuildFlightFixture,
 	callers, iteration int,
-) int64 {
+) (int64, int64) {
 	b.Helper()
 	request := fixture.request
 	request.Identity.LayerID = fmt.Sprintf("%s-bench-%d", request.Identity.LayerID, iteration)
@@ -380,12 +538,21 @@ func benchmarkSparseGenerationBuilderFlightIteration(
 	}
 	request.Target = counting
 
+	var preparations atomic.Int64
 	start := make(chan struct{})
 	results := make(chan sparseBuildFlightResult, callers)
 	for i := 0; i < callers; i++ {
 		go func() {
 			<-start
-			generationID, report, err := fixture.builder.Build(context.Background(), request)
+			generationID, report, err := fixture.builder.buildPrepared(
+				context.Background(), time.Now(), request.Identity,
+				func(_ context.Context, identity GenerationIdentity) (BuildRequest, func(), error) {
+					preparations.Add(1)
+					prepared := request
+					prepared.Identity = identity
+					return prepared, nil, nil
+				},
+			)
 			results <- sparseBuildFlightResult{generationID: generationID, report: report, err: err}
 		}()
 	}
@@ -424,20 +591,23 @@ func benchmarkSparseGenerationBuilderFlightIteration(
 	if walks := counting.walks.Load(); walks != 1 {
 		b.Fatalf("physical index walks = %d, want 1", walks)
 	}
-	return counting.walks.Load()
+	return counting.walks.Load(), preparations.Load()
 }
 
 func BenchmarkSparseGenerationBuilderCoalescedPhysicalPass(b *testing.B) {
 	for _, callers := range []int{1, 8, 64} {
 		b.Run(fmt.Sprintf("%d_callers", callers), func(b *testing.B) {
 			fixture := newSparseBuildFlightFixture(b)
-			var physicalPasses int64
+			var physicalPasses, preparations int64
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				physicalPasses += benchmarkSparseGenerationBuilderFlightIteration(b, fixture, callers, i)
+				physical, prepared := benchmarkSparseGenerationBuilderFlightIteration(b, fixture, callers, i)
+				physicalPasses += physical
+				preparations += prepared
 			}
 			b.ReportMetric(float64(physicalPasses)/float64(b.N), "physical-builds/op")
+			b.ReportMetric(float64(preparations)/float64(b.N), "preparations/op")
 		})
 	}
 }

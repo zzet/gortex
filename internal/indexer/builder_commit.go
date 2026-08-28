@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"time"
 
 	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/indexer/source"
@@ -59,35 +60,41 @@ func (b *SparseGenerationBuilder) BuildCommitLayer(
 	ctx context.Context,
 	req CommitLayerRequest,
 ) (int64, BuildReport, error) {
+	started := time.Now()
 	if err := b.validateCommitLayer(&req); err != nil {
 		return 0, BuildReport{}, err
 	}
-	changes, err := diffTreeChanges(ctx, req.RepoDir, req.BaseTreeOID, req.TargetTreeOID)
-	if err != nil {
-		return 0, BuildReport{}, err
-	}
-	if err := source.VerifyGitTreeObjectsLocal(ctx, req.RepoDir, req.TargetTreeOID); err != nil {
-		return 0, BuildReport{}, fmt.Errorf("indexer: verify tree %s: %w", req.TargetTreeOID, err)
-	}
-	target, err := source.NewGitTreeSource(ctx, req.RepoDir, req.TargetTreeOID)
-	if err != nil {
-		return 0, BuildReport{}, fmt.Errorf("indexer: open tree %s: %w", req.TargetTreeOID, err)
-	}
-	defer target.Close() //nolint:errcheck // the source is read-only; a close failure cannot lose work
-
 	identity := req.Identity
 	identity.GenerationKind = CommitLayerGenerationKind
 	identity.TreeOID = req.TargetTreeOID
 
-	return b.Build(ctx, BuildRequest{
-		Identity:    identity,
-		Base:        req.Base,
-		Target:      target,
-		Changes:     changes,
-		RootPath:    req.RootPath,
-		RepoPrefix:  req.RepoPrefix,
-		WorkspaceID: req.WorkspaceID,
-		ProjectID:   req.ProjectID,
+	return b.buildPrepared(ctx, started, identity, func(
+		ctx context.Context, identity GenerationIdentity,
+	) (BuildRequest, func(), error) {
+		changes, err := diffTreeChanges(ctx, req.RepoDir, req.BaseTreeOID, req.TargetTreeOID)
+		if err != nil {
+			return BuildRequest{}, nil, err
+		}
+		if err := source.VerifyGitTreeObjectsLocal(ctx, req.RepoDir, req.TargetTreeOID); err != nil {
+			return BuildRequest{}, nil, fmt.Errorf("indexer: verify tree %s: %w", req.TargetTreeOID, err)
+		}
+		target, err := source.NewGitTreeSource(ctx, req.RepoDir, req.TargetTreeOID)
+		if err != nil {
+			return BuildRequest{}, nil, fmt.Errorf("indexer: open tree %s: %w", req.TargetTreeOID, err)
+		}
+		cleanup := func() {
+			_ = target.Close() // the source is read-only; a close failure cannot lose work
+		}
+		return BuildRequest{
+			Identity:    identity,
+			Base:        req.Base,
+			Target:      target,
+			Changes:     changes,
+			RootPath:    req.RootPath,
+			RepoPrefix:  req.RepoPrefix,
+			WorkspaceID: req.WorkspaceID,
+			ProjectID:   req.ProjectID,
+		}, cleanup, nil
 	})
 }
 

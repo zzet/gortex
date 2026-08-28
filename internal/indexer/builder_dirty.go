@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"time"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/indexer/source"
@@ -87,58 +88,86 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	ctx context.Context,
 	req DirtyLayerRequest,
 ) (int64, BuildReport, error) {
+	started := time.Now()
 	if req.CheckoutRoot == "" {
 		return 0, BuildReport{}, errors.New("indexer: dirty layer build needs a checkout root")
 	}
-	before, err := gitstate.SampleDirty(ctx, req.CheckoutRoot)
-	if err != nil {
-		return 0, BuildReport{}, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
-	}
-	target, err := source.NewFilesystemSource(req.CheckoutRoot)
-	if err != nil {
-		return 0, BuildReport{}, fmt.Errorf("indexer: open checkout %s: %w", req.CheckoutRoot, err)
-	}
-	defer target.Close() //nolint:errcheck // the source is read-only; a close failure cannot lose work
-
 	identity := req.Identity
 	identity.GenerationKind = DirtyLayerGenerationKind
-	identity.TreeOID = before.HeadTree
-	identity.ProvenanceCommitOID = before.HeadCommit
-	identity.LowerViewFingerprint = before.Fingerprint
-
-	changes, err := dirtyLayerChangesContext(ctx, before)
-	if err != nil {
-		return 0, BuildReport{}, err
+	// Coordinators supply the sampled snapshot identity. Keep the compatibility
+	// path for direct callers that predate that contract; routed builds never
+	// pay for this sample before ready adoption or flight coalescing.
+	if identity.LowerViewFingerprint == "" {
+		before, err := gitstate.SampleDirty(ctx, req.CheckoutRoot)
+		if err != nil {
+			return 0, BuildReport{}, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
+		}
+		identity.TreeOID = before.HeadTree
+		identity.ProvenanceCommitOID = before.HeadCommit
+		identity.LowerViewFingerprint = before.Fingerprint
 	}
-	changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
-	if err != nil {
-		return 0, BuildReport{}, err
-	}
 
-	return b.Build(ctx, BuildRequest{
-		Identity:    identity,
-		Base:        req.Base,
-		Target:      target,
-		Changes:     changes,
-		RootPath:    req.CheckoutRoot,
-		RepoPrefix:  req.RepoPrefix,
-		WorkspaceID: req.WorkspaceID,
-		ProjectID:   req.ProjectID,
-		// The working-tree layer is the one generation whose root is a
-		// directory a language server can be rooted at, and the one whose
-		// content nothing else on disk holds. Whether the stage actually runs
-		// is the enrichment manager's call — the build only says it has a
-		// working copy to offer.
-		Enrich: &EnrichmentStage{
-			CheckoutID:  identity.CheckoutID,
-			Fingerprint: before.Fingerprint,
-		},
-		PrePublish: func(ctx context.Context, generationID int64) error {
-			if req.buildBarrier != nil {
-				req.buildBarrier()
-			}
-			return b.confirmDirtySnapshot(ctx, req.CheckoutRoot, generationID, before.Fingerprint)
-		},
+	return b.buildPrepared(ctx, started, identity, func(
+		ctx context.Context, identity GenerationIdentity,
+	) (BuildRequest, func(), error) {
+		before, err := gitstate.SampleDirty(ctx, req.CheckoutRoot)
+		if err != nil {
+			return BuildRequest{}, nil, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
+		}
+		preparedIdentity := identity
+		preparedIdentity.TreeOID = before.HeadTree
+		preparedIdentity.ProvenanceCommitOID = before.HeadCommit
+		preparedIdentity.LowerViewFingerprint = before.Fingerprint
+		if preparedIdentity != identity {
+			return BuildRequest{}, nil, fmt.Errorf(
+				"indexer: dirty snapshot changed before sparse build preparation: %w",
+				ErrDirtySnapshotChanged,
+			)
+		}
+
+		target, err := source.NewFilesystemSource(req.CheckoutRoot)
+		if err != nil {
+			return BuildRequest{}, nil, fmt.Errorf("indexer: open checkout %s: %w", req.CheckoutRoot, err)
+		}
+		cleanup := func() {
+			_ = target.Close() // the source is read-only; a close failure cannot lose work
+		}
+		changes, err := dirtyLayerChangesContext(ctx, before)
+		if err != nil {
+			cleanup()
+			return BuildRequest{}, nil, err
+		}
+		changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
+		if err != nil {
+			cleanup()
+			return BuildRequest{}, nil, err
+		}
+
+		return BuildRequest{
+			Identity:    identity,
+			Base:        req.Base,
+			Target:      target,
+			Changes:     changes,
+			RootPath:    req.CheckoutRoot,
+			RepoPrefix:  req.RepoPrefix,
+			WorkspaceID: req.WorkspaceID,
+			ProjectID:   req.ProjectID,
+			// The working-tree layer is the one generation whose root is a
+			// directory a language server can be rooted at, and the one whose
+			// content nothing else on disk holds. Whether the stage actually runs
+			// is the enrichment manager's call — the build only says it has a
+			// working copy to offer.
+			Enrich: &EnrichmentStage{
+				CheckoutID:  identity.CheckoutID,
+				Fingerprint: before.Fingerprint,
+			},
+			PrePublish: func(ctx context.Context, generationID int64) error {
+				if req.buildBarrier != nil {
+					req.buildBarrier()
+				}
+				return b.confirmDirtySnapshot(ctx, req.CheckoutRoot, generationID, before.Fingerprint)
+			},
+		}, cleanup, nil
 	})
 }
 

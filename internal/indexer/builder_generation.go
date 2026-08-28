@@ -331,6 +331,12 @@ type SparseGenerationBuilder struct {
 	// ask for one. nil declares the lsp.* capabilities disabled for the
 	// generation rather than leaving them unstated.
 	Semantic *semantic.Manager
+
+	// beforePayloadFlightJoin is a deterministic test barrier for the narrow
+	// race where a caller adopts a building catalog generation after its leader
+	// publishes but before joining the process-local flight. Production builders
+	// leave it nil.
+	beforePayloadFlightJoin func(generationID int64, adopted bool)
 }
 
 const (
@@ -420,38 +426,85 @@ func (b *SparseGenerationBuilder) logSparsePhysicalBuildTerminal(report BuildRep
 // physical writer. The catalog aligns them on one generation ID; the store
 // core's process-local flight gives exactly one caller runPass and publish
 // ownership while followers wait with independently cancelable contexts.
+type sparseBuildPreparation func(
+	ctx context.Context, identity GenerationIdentity,
+) (BuildRequest, func(), error)
+
+type sparseBuildPreflightError struct {
+	err error
+}
+
+func (e *sparseBuildPreflightError) Error() string { return e.err.Error() }
+func (e *sparseBuildPreflightError) Unwrap() error { return e.err }
+
+func markSparseBuildPreflightError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var marked *sparseBuildPreflightError
+	if errors.As(err, &marked) {
+		return err
+	}
+	return &sparseBuildPreflightError{err: err}
+}
+
+func isSparseBuildPreflightError(err error) bool {
+	var marked *sparseBuildPreflightError
+	return errors.As(err, &marked)
+}
+
 func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (int64, BuildReport, error) {
 	started := time.Now()
 	if err := b.validate(ctx, &req); err != nil {
 		return 0, BuildReport{}, err
 	}
+	return b.buildPrepared(ctx, started, req.Identity, func(
+		_ context.Context, identity GenerationIdentity,
+	) (BuildRequest, func(), error) {
+		req.Identity = identity
+		return req, nil, nil
+	})
+}
 
-	planningStarted := time.Now()
-	plan, report, err := b.planFileSetContext(ctx, req)
-	report.PlanningDuration = time.Since(planningStarted)
-	if err != nil {
-		return 0, report, err
+// buildPrepared adopts or allocates a payload generation before invoking
+// prepare. Exactly one flight leader pays for source construction, diffing and
+// sparse planning; ready reusers return immediately and followers only wait.
+func (b *SparseGenerationBuilder) buildPrepared(
+	ctx context.Context,
+	started time.Time,
+	identity GenerationIdentity,
+	prepare sparseBuildPreparation,
+) (int64, BuildReport, error) {
+	if prepare == nil {
+		return 0, BuildReport{}, errors.New("indexer: sparse generation build needs preparation")
+	}
+	if err := b.validateBuildPrelude(ctx, &identity); err != nil {
+		return 0, BuildReport{}, err
 	}
 
+	report := BuildReport{}
 	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:            req.Identity.OwnerKind,
-		GraphID:              req.Identity.GraphID,
-		LayerID:              req.Identity.LayerID,
-		CheckoutID:           req.Identity.CheckoutID,
-		GenerationKind:       req.Identity.GenerationKind,
-		BaseGenerationID:     req.Identity.BaseGenerationID,
-		LowerViewFingerprint: req.Identity.LowerViewFingerprint,
-		TreeOID:              req.Identity.TreeOID,
-		ProvenanceCommitOID:  req.Identity.ProvenanceCommitOID,
-		ConfigHash:           req.Identity.ConfigHash,
-		ExtractorVersions:    req.Identity.ExtractorVersions,
-		ResolverVersion:      req.Identity.ResolverVersion,
-		CreatedAt:            req.Identity.CreatedAt,
+		OwnerKind:            identity.OwnerKind,
+		GraphID:              identity.GraphID,
+		LayerID:              identity.LayerID,
+		CheckoutID:           identity.CheckoutID,
+		GenerationKind:       identity.GenerationKind,
+		BaseGenerationID:     identity.BaseGenerationID,
+		LowerViewFingerprint: identity.LowerViewFingerprint,
+		TreeOID:              identity.TreeOID,
+		ProvenanceCommitOID:  identity.ProvenanceCommitOID,
+		ConfigHash:           identity.ConfigHash,
+		ExtractorVersions:    identity.ExtractorVersions,
+		ResolverVersion:      identity.ResolverVersion,
+		CreatedAt:            identity.CreatedAt,
 	})
 	if err != nil {
 		return 0, BuildReport{}, fmt.Errorf("indexer: begin payload generation: %w", err)
 	}
 	report.GenerationID = generationID
+	if b.beforePayloadFlightJoin != nil {
+		b.beforePayloadFlightJoin(generationID, adopted)
+	}
 
 	flight, leader, ready, err := b.Store.JoinPayloadBuildFlight(ctx, generationID, adopted)
 	if err != nil {
@@ -472,24 +525,35 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		waitDuration := time.Since(waitStarted)
 		report.Duration = time.Since(started)
 		b.logSparseBuildReuse(sparseFollowerReuseMessage, generationID, "in_flight", waitDuration, true, err == nil)
+		if isSparseBuildPreflightError(err) {
+			return 0, report, err
+		}
 		return generationID, report, err
 	}
 
 	report.Coalesced = false
-	var buildErr error
+	var (
+		buildErr            error
+		physicalStartLogged bool
+	)
 	defer func() {
 		terminalReport := report
 		terminalReport.Duration = time.Since(started)
 		if recovered := recover(); recovered != nil {
+			if !physicalStartLogged {
+				b.logSparsePhysicalBuildStart(terminalReport, adopted)
+			}
 			panicErr := fmt.Errorf("indexer: payload generation %d build panicked: %v", generationID, recovered)
 			b.logSparsePhysicalBuildTerminal(terminalReport, false)
 			flight.Complete(panicErr)
 			panic(recovered)
 		}
+		if !physicalStartLogged {
+			b.logSparsePhysicalBuildStart(terminalReport, adopted)
+		}
 		b.logSparsePhysicalBuildTerminal(terminalReport, buildErr == nil)
 		flight.Complete(buildErr)
 	}()
-	b.logSparsePhysicalBuildStart(report, adopted)
 	buildErr = func() error {
 		// A physical build that dies part way must not leave a generation in the
 		// only mutable state forever. Cleanup completes before followers wake, so
@@ -502,6 +566,32 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 				b.abandon(cleanupCtx, generationID)
 			}
 		}()
+
+		req, cleanup, err := prepare(ctx, identity)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if err != nil {
+			return markSparseBuildPreflightError(err)
+		}
+		if err := b.validate(ctx, &req); err != nil {
+			return markSparseBuildPreflightError(err)
+		}
+		if req.Identity != identity {
+			return markSparseBuildPreflightError(errors.New("indexer: sparse generation preparation changed its identity"))
+		}
+
+		planningStarted := time.Now()
+		plan, plannedReport, err := b.planFileSetContext(ctx, req)
+		plannedReport.PlanningDuration = time.Since(planningStarted)
+		plannedReport.GenerationID = generationID
+		plannedReport.Coalesced = false
+		report = plannedReport
+		if err != nil {
+			return markSparseBuildPreflightError(err)
+		}
+		b.logSparsePhysicalBuildStart(report, adopted)
+		physicalStartLogged = true
 
 		// A newly allocated generation cannot carry payload yet. When the plan
 		// has no files to index, the masks below completely describe a no-op or
@@ -535,7 +625,38 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		return nil
 	}()
 	report.Duration = time.Since(started)
+	if isSparseBuildPreflightError(buildErr) {
+		return 0, report, buildErr
+	}
 	return generationID, report, buildErr
+}
+
+// validateBuildPrelude refuses malformed build identities before they can
+// allocate a catalog generation or occupy a payload flight. The leader still
+// validates the complete prepared request before planning.
+func (b *SparseGenerationBuilder) validateBuildPrelude(
+	ctx context.Context, identity *GenerationIdentity,
+) error {
+	switch {
+	case b == nil || b.Store == nil:
+		return errors.New("indexer: sparse generation builder needs a store")
+	case b.Registry == nil:
+		return errors.New("indexer: sparse generation builder needs a parser registry")
+	case b.Logger == nil:
+		return errors.New("indexer: sparse generation builder needs a logger")
+	case ctx == nil:
+		return errors.New("indexer: sparse generation build needs a context")
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case identity.OwnerKind == "":
+		return errors.New("indexer: sparse generation build needs an owner kind")
+	case identity.GenerationKind == "":
+		return errors.New("indexer: sparse generation build needs a generation kind")
+	}
+	if identity.CreatedAt == 0 {
+		identity.CreatedAt = time.Now().Unix()
+	}
+	return nil
 }
 
 // validate refuses a request that cannot produce a composable generation, and
