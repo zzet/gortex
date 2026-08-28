@@ -1991,8 +1991,8 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 // coordinator owns everything built for it — backlog, reuse cache and both
 // route slots — so its generations are skipped entirely; and a ready checkout
 // layer is a candidate only once its checkout's route has stopped naming it.
-// The listings are capped, so one sweep costs a bounded read and at most one
-// route lookup per distinct checkout in the results.
+// Every individual listing is capped; exclusive cursors continue until each
+// cohort is exhausted. Routes are still read at most once per distinct checkout.
 func (l *CheckoutLifecycle) orphanedGenerations(
 	ctx context.Context,
 	served map[string]struct{},
@@ -2017,22 +2017,36 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 		out = append(out, row.GenerationID)
 	}
 
+	const retirementScanPageSize = 512
+
 	// The states a supersede, a failed publish or an interrupted retire leaves
-	// behind. Whoever built one, nothing is meant to still be reading it.
-	discarded, err := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
-		States: []store_sqlite.ViewGenerationState{
-			store_sqlite.ViewGenerationSuperseded,
-			store_sqlite.ViewGenerationRetiring,
-		},
-	})
-	if err != nil {
-		l.logger.Debug("checkout lifecycle: could not scan discarded generations", zap.Error(err))
-	}
-	for _, row := range discarded {
-		if _, live := served[row.CheckoutID]; live {
-			continue
+	// behind. Whoever built one, nothing is meant to still be reading it. Walk
+	// every page: newer rows protected by a live checkout must not hide an older
+	// orphan behind the catalog listing bound.
+	var discardedBeforeGenerationID int64
+	for {
+		discarded, scanErr := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+			States: []store_sqlite.ViewGenerationState{
+				store_sqlite.ViewGenerationSuperseded,
+				store_sqlite.ViewGenerationRetiring,
+			},
+			BeforeGenerationID: discardedBeforeGenerationID,
+			Limit:              retirementScanPageSize,
+		})
+		if scanErr != nil {
+			l.logger.Debug("checkout lifecycle: could not scan discarded generations", zap.Error(scanErr))
+			break
 		}
-		collect(row)
+		for _, row := range discarded {
+			if _, live := served[row.CheckoutID]; live {
+				continue
+			}
+			collect(row)
+		}
+		if len(discarded) < retirementScanPageSize {
+			break
+		}
+		discardedBeforeGenerationID = discarded[len(discarded)-1].GenerationID
 	}
 
 	// A graph deletion removes the last durable owner pointer before payload
@@ -2040,7 +2054,6 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 	// that backlog directly from the surviving generation rows. Pagination is
 	// deliberate: healthy or still-referenced rows must not pin older orphaned
 	// generations behind the catalog listing bound.
-	const retirementScanPageSize = 512
 	const abandonedBuildingGrace = time.Minute
 	abandonedBuildingBefore := l.now().Add(-abandonedBuildingGrace).Unix()
 	scanRetirementState := func(state store_sqlite.ViewGenerationState, label string) {
@@ -2102,41 +2115,53 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 	// Ready checkout layers are the other half: a coordinator that stopped
 	// without draining leaves its commit cache published and unreferenced, and
 	// only the route can say whether a layer is still the one being served.
-	layers, err := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
-		States:    []store_sqlite.ViewGenerationState{store_sqlite.ViewGenerationReady},
-		OwnerKind: checkoutLayerOwnerKind,
-	})
-	if err != nil {
-		l.logger.Debug("checkout lifecycle: could not scan checkout layers", zap.Error(err))
-	}
+	// Cursor through every page so newer routed or served layers cannot hide an
+	// older orphan behind the catalog listing bound.
 	routes := map[string]store_sqlite.CheckoutRoute{}
-	for _, row := range layers {
-		if row.CheckoutID == "" {
-			// A layer that names no checkout has no route to check it
-			// against, so nothing here can tell whether it is still served.
-			continue
+	var layerBeforeGenerationID int64
+	for {
+		layers, scanErr := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+			States:             []store_sqlite.ViewGenerationState{store_sqlite.ViewGenerationReady},
+			OwnerKind:          checkoutLayerOwnerKind,
+			BeforeGenerationID: layerBeforeGenerationID,
+			Limit:              retirementScanPageSize,
+		})
+		if scanErr != nil {
+			l.logger.Debug("checkout lifecycle: could not scan checkout layers", zap.Error(scanErr))
+			break
 		}
-		if _, live := served[row.CheckoutID]; live {
-			continue
-		}
-		switch row.GenerationKind {
-		case CommitLayerGenerationKind, DirtyLayerGenerationKind:
-		default:
-			continue
-		}
-		route, cached := routes[row.CheckoutID]
-		if !cached {
-			// A checkout with no route row names nothing, which is what the
-			// zero route already says.
-			if current, found, err := l.catalog.GetCheckoutRoute(ctx, row.CheckoutID); err == nil && found {
-				route = current
+		for _, row := range layers {
+			if row.CheckoutID == "" {
+				// A layer that names no checkout has no route to check it
+				// against, so nothing here can tell whether it is still served.
+				continue
 			}
-			routes[row.CheckoutID] = route
+			if _, live := served[row.CheckoutID]; live {
+				continue
+			}
+			switch row.GenerationKind {
+			case CommitLayerGenerationKind, DirtyLayerGenerationKind:
+			default:
+				continue
+			}
+			route, cached := routes[row.CheckoutID]
+			if !cached {
+				// A checkout with no route row names nothing, which is what the
+				// zero route already says.
+				if current, found, err := l.catalog.GetCheckoutRoute(ctx, row.CheckoutID); err == nil && found {
+					route = current
+				}
+				routes[row.CheckoutID] = route
+			}
+			if route.CommitGenerationID == row.GenerationID || route.DirtyGenerationID == row.GenerationID {
+				continue
+			}
+			collect(row)
 		}
-		if route.CommitGenerationID == row.GenerationID || route.DirtyGenerationID == row.GenerationID {
-			continue
+		if len(layers) < retirementScanPageSize {
+			break
 		}
-		collect(row)
+		layerBeforeGenerationID = layers[len(layers)-1].GenerationID
 	}
 	return out
 }
