@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -239,6 +240,12 @@ type RefViewManager struct {
 	buildHeartbeat time.Duration
 	buildLiveness  time.Duration
 	writerBudget   time.Duration
+
+	// sourceRecoveryAfter bounds local-object preflights for structurally
+	// current generations whose source snapshot was withdrawn. A missing Git
+	// object must not turn every structural query into another whole-tree probe.
+	sourceRecoveryMu    sync.Mutex
+	sourceRecoveryAfter map[int64]time.Time
 }
 
 // NewRefViewManager builds a manager over one store.
@@ -325,9 +332,28 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 
 	identity := m.identity(viewID, base, resolved.TreeOID)
 	fingerprint := refViewBuildFingerprint(identity, req.EnrichmentProfile)
-	current, err := m.activeIsCurrent(ctx, view, fingerprint)
+	structural, sourceComplete, err := m.activeStatus(ctx, view, fingerprint)
 	if err != nil {
 		return RefViewResult{}, err
+	}
+	current := structural && sourceComplete
+	if structural && !sourceComplete {
+		now := time.Now()
+		if !m.sourceRecoveryDue(view.ActiveGenerationID, now) {
+			current = true
+		} else if verifyErr := source.VerifyGitTreeObjectsLocal(ctx, req.RepoDir, resolved.TreeOID); verifyErr != nil {
+			if ctx.Err() != nil {
+				return RefViewResult{}, ctx.Err()
+			}
+			m.deferSourceRecovery(view.ActiveGenerationID, now)
+			m.logger.Debug("ref view manager: source recovery deferred; serving exact structural generation",
+				zap.String("ref_view", view.RefViewID),
+				zap.Int64("generation", view.ActiveGenerationID),
+				zap.Error(verifyErr))
+			current = true
+		} else {
+			m.clearSourceRecovery(view.ActiveGenerationID)
+		}
 	}
 	if !current {
 		coalesced, onto, err := m.coalesced(ctx, view, base, resolved, fingerprint)
@@ -346,7 +372,24 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 	if current {
 		return m.adoptMetadata(ctx, view, resolved)
 	}
-	return m.startBuild(ctx, req, view, base, resolved, identity, fingerprint)
+	result, buildErr := m.startBuild(ctx, req, view, base, resolved, identity, fingerprint)
+	if buildErr == nil || !structural || ctx.Err() != nil {
+		return result, buildErr
+	}
+
+	// The active payload still describes this exact tree. A failed source
+	// recovery narrows file-reading capability; it must not refuse structural
+	// graph/search requests that the immutable payload can still answer.
+	m.deferSourceRecovery(view.ActiveGenerationID, time.Now())
+	m.logger.Debug("ref view manager: source recovery failed; restoring exact structural generation",
+		zap.String("ref_view", view.RefViewID),
+		zap.Int64("generation", view.ActiveGenerationID),
+		zap.Error(buildErr))
+	fallback, fallbackErr := m.desire(ctx, view, resolved, fingerprint, true)
+	if fallbackErr != nil {
+		return result, buildErr
+	}
+	return m.adoptMetadata(ctx, fallback, resolved)
 }
 
 // row finds the view's catalog row, reading before it writes.
@@ -426,25 +469,98 @@ func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase,
 }
 
 // activeIsCurrent reports whether the generation the view already serves was
-// built from exactly these inputs and its structural payload is still servable.
-// A fingerprint match settles the tree, base, and extraction rules. Producer
-// capability degradation does not stale that identity: materialization keeps
-// the structural view and request capability evaluation refuses only operations
+// built from exactly these inputs and remains a complete ready candidate.
+// A fingerprint match settles the tree, base, and extraction rules. Optional
+// producer degradation does not stale that identity: materialization keeps the
+// structural view and request capability evaluation refuses only operations
 // that need the degraded producer. Ref/commit metadata remains excluded so a
 // moved ref with an unchanged tree is a metadata-only update.
+//
+// The source snapshot is different from optional enrichment. It is the local
+// closure needed to recover commit-only file reads. A withdrawal leaves the
+// structural payload and active pointer intact, but the generation is no longer
+// current: the next selection may build a source-complete replacement while
+// readers keep using the old structural graph until that replacement publishes.
 func (m *RefViewManager) activeIsCurrent(
 	ctx context.Context,
 	view store_sqlite.RefView,
 	fingerprint string,
 ) (bool, error) {
+	structural, sourceComplete, err := m.activeStatus(ctx, view, fingerprint)
+	return structural && sourceComplete, err
+}
+
+// activeStatus separates exact structural currency from source durability.
+// A source-withdrawn generation still describes the requested tree exactly;
+// only operations that need committed bytes are unavailable until recovery.
+func (m *RefViewManager) activeStatus(
+	ctx context.Context,
+	view store_sqlite.RefView,
+	fingerprint string,
+) (structural, sourceComplete bool, err error) {
 	if view.ActiveGenerationID <= 0 || view.ActiveBuildFingerprint != fingerprint {
-		return false, nil
+		return false, false, nil
 	}
 	row, found, err := m.catalog.GetViewGeneration(ctx, view.ActiveGenerationID)
-	if err != nil {
-		return false, err
+	if err != nil || !found || row.State != store_sqlite.ViewGenerationReady {
+		return false, false, err
 	}
-	return found && servableGeneration(row.State), nil
+	availability, err := m.catalog.ReadProducerAvailability(
+		ctx, view.ActiveGenerationID, commitLayerSourceSnapshotCapability,
+	)
+	if err != nil {
+		return false, false, err
+	}
+	return true, availability.Declared && availability.State == store_sqlite.ProducerStateComplete, nil
+}
+
+const (
+	refViewSourceRecoveryRetry        = 30 * time.Second
+	maxRefViewSourceRecoveryDeferrals = 1024
+)
+
+func (m *RefViewManager) sourceRecoveryDue(generationID int64, now time.Time) bool {
+	m.sourceRecoveryMu.Lock()
+	defer m.sourceRecoveryMu.Unlock()
+	until, deferred := m.sourceRecoveryAfter[generationID]
+	if !deferred {
+		return true
+	}
+	if now.Before(until) {
+		return false
+	}
+	delete(m.sourceRecoveryAfter, generationID)
+	return true
+}
+
+func (m *RefViewManager) deferSourceRecovery(generationID int64, now time.Time) {
+	m.sourceRecoveryMu.Lock()
+	defer m.sourceRecoveryMu.Unlock()
+	if m.sourceRecoveryAfter == nil {
+		m.sourceRecoveryAfter = make(map[int64]time.Time)
+	}
+	for id, until := range m.sourceRecoveryAfter {
+		if !now.Before(until) {
+			delete(m.sourceRecoveryAfter, id)
+		}
+	}
+	if len(m.sourceRecoveryAfter) >= maxRefViewSourceRecoveryDeferrals {
+		var evictID int64
+		var earliest time.Time
+		for id, until := range m.sourceRecoveryAfter {
+			if evictID == 0 || until.Before(earliest) {
+				evictID, earliest = id, until
+			}
+		}
+		delete(m.sourceRecoveryAfter, evictID)
+	}
+	m.sourceRecoveryAfter[generationID] = now.Add(refViewSourceRecoveryRetry)
+}
+
+func (m *RefViewManager) clearSourceRecovery(generationID int64) {
+	m.sourceRecoveryMu.Lock()
+	defer m.sourceRecoveryMu.Unlock()
+	delete(m.sourceRecoveryAfter, generationID)
 }
 
 // coalesced answers a selection whose build is already in flight, from the

@@ -1017,11 +1017,11 @@ func TestRefViewRecordsAnUnresolvableSelector(t *testing.T) {
 	}
 }
 
-// TestRefViewActiveGenerationSurvivesSourceWithdrawal pins the distinction
-// between continuing to serve an existing structural route and binding a new
-// route to a cached generation. Losing source.snapshot must not invalidate the
-// active graph, but a new ref view cannot adopt that source-incomplete payload.
-func TestRefViewActiveGenerationSurvivesSourceWithdrawal(t *testing.T) {
+// TestRefViewRebuildsActiveGenerationAfterSourceWithdrawal pins the recovery
+// contract. Losing source.snapshot leaves the published structural graph and
+// active pointer available as a labeled fallback, but it makes that generation
+// non-current so the next selection can replace it with a source-complete one.
+func TestRefViewRebuildsActiveGenerationAfterSourceWithdrawal(t *testing.T) {
 	f := newRefViewFixture(t)
 	commitB, _ := f.commitTree(builderTreeB(), "B")
 	f.setRef("refs/heads/feature", commitB)
@@ -1042,29 +1042,41 @@ func TestRefViewActiveGenerationSurvivesSourceWithdrawal(t *testing.T) {
 		t.Fatalf("withdraw source.snapshot: %v", err)
 	}
 
-	same, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	viewBeforeRecovery := f.view(first.RefViewID)
+	if viewBeforeRecovery.ActiveGenerationID != first.GenerationID {
+		t.Fatalf("active view before recovery = %+v, want structural fallback generation %d", viewBeforeRecovery, first.GenerationID)
+	}
+	current, err := manager.activeIsCurrent(ctx, viewBeforeRecovery, viewBeforeRecovery.ActiveBuildFingerprint)
 	if err != nil {
-		t.Fatalf("serve the active view after source withdrawal: %v", err)
+		t.Fatalf("check withdrawn active generation: %v", err)
 	}
-	if same.Built || same.State != store_sqlite.RefViewReady || same.GenerationID != first.GenerationID {
-		t.Fatalf("selection after withdrawal = %+v, want active generation %d without a build", same, first.GenerationID)
-	}
-	if view := f.view(first.RefViewID); view.ActiveGenerationID != first.GenerationID {
-		t.Fatalf("active view after withdrawal = %+v, want generation %d unchanged", view, first.GenerationID)
-	}
-	if n := builds.Load(); n != 1 {
-		t.Fatalf("%d build passes ran while reusing the active structural view, want one", n)
+	if current {
+		t.Fatal("source-incomplete active generation still reported current")
 	}
 
-	alias, err := manager.EnsureRefView(ctx, f.request("refs/heads/source-incomplete-alias"))
+	recovered, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
 	if err != nil {
-		t.Fatalf("build an alias after source withdrawal: %v", err)
+		t.Fatalf("recover the active view after source withdrawal: %v", err)
 	}
-	if !alias.Built || alias.State != store_sqlite.RefViewReady || alias.GenerationID == first.GenerationID {
-		t.Fatalf("alias selection = %+v, want a new source-complete generation instead of cached generation %d", alias, first.GenerationID)
+	if !recovered.Built || recovered.State != store_sqlite.RefViewReady || recovered.GenerationID == 0 || recovered.GenerationID == first.GenerationID {
+		t.Fatalf("recovery selection = %+v, want a newly built source-complete generation after %d", recovered, first.GenerationID)
+	}
+	if view := f.view(first.RefViewID); view.ActiveGenerationID != recovered.GenerationID {
+		t.Fatalf("active view after recovery = %+v, want generation %d", view, recovered.GenerationID)
 	}
 	if n := builds.Load(); n != 2 {
-		t.Fatalf("%d build passes ran, want the initial build and the source-safe alias build", n)
+		t.Fatalf("%d build passes ran, want the initial build and one recovery", n)
+	}
+
+	reused, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	if err != nil {
+		t.Fatalf("reuse the recovered active view: %v", err)
+	}
+	if reused.Built || reused.State != store_sqlite.RefViewReady || reused.GenerationID != recovered.GenerationID {
+		t.Fatalf("selection after recovery = %+v, want generation %d without another build", reused, recovered.GenerationID)
+	}
+	if n := builds.Load(); n != 2 {
+		t.Fatalf("%d build passes ran after recovery reuse, want two", n)
 	}
 }
 
@@ -1104,8 +1116,8 @@ func BenchmarkRefViewCurrentReadyGeneration(b *testing.B) {
 					if err != nil {
 						b.Fatalf("activeIsCurrent: %v", err)
 					}
-					if !current {
-						b.Fatal("ready active generation reported stale")
+					if current == tc.withdraw {
+						b.Fatalf("active current = %t, want %t", current, !tc.withdraw)
 					}
 				}
 				b.StopTimer()
@@ -1114,6 +1126,7 @@ func BenchmarkRefViewCurrentReadyGeneration(b *testing.B) {
 
 			b.Run("EnsureRefView", func(b *testing.B) {
 				before := builds.Load()
+				previousGeneration := first.GenerationID
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
@@ -1121,7 +1134,15 @@ func BenchmarkRefViewCurrentReadyGeneration(b *testing.B) {
 					if err != nil {
 						b.Fatalf("EnsureRefView: %v", err)
 					}
-					if result.Built || result.GenerationID != first.GenerationID {
+					if tc.withdraw {
+						if !result.Built || result.GenerationID == 0 || result.GenerationID == previousGeneration {
+							b.Fatalf("recovery selection = %+v, want a new generation after %d", result, previousGeneration)
+						}
+						previousGeneration = result.GenerationID
+						if err := f.catalog.WithdrawProducer(ctx, result.GenerationID, commitLayerSourceSnapshotCapability, "benchmark: repeat source withdrawal"); err != nil {
+							b.Fatalf("withdraw recovered source.snapshot: %v", err)
+						}
+					} else if result.Built || result.GenerationID != first.GenerationID {
 						b.Fatalf("ready selection = %+v, want generation %d without a build", result, first.GenerationID)
 					}
 				}
