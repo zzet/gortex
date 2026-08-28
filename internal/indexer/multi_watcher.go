@@ -15,10 +15,35 @@ import (
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
+type topologyDispatchEpoch struct {
+	number        uint64
+	owner         string
+	watcher       *GitWatcher
+	accepting     bool
+	inFlight      int
+	drained       chan struct{}
+	drainedClosed bool
+}
+
+type admittedTopologyDispatch struct {
+	mw       *MultiWatcher
+	epoch    *topologyDispatchEpoch
+	callback func(repoPrefix, rootPath string)
+	prefix   string
+	rootPath string
+}
+
+func (dispatch admittedTopologyDispatch) invoke() {
+	defer dispatch.mw.releaseTopologyDispatch(dispatch.epoch)
+	dispatch.callback(dispatch.prefix, dispatch.rootPath)
+}
+
 type topologyWatchFamily struct {
 	commonDir string
 	owner     string
 	members   map[string]*GitWatcher
+	nextEpoch uint64
+	dispatch  *topologyDispatchEpoch
 }
 
 // MultiWatcher manages file watchers across multiple repositories.
@@ -32,20 +57,25 @@ type MultiWatcher struct {
 	// every health surface and the daemon reports it watched. This is the
 	// only record that it is not.
 	startFailures        map[string]string
-	topologyFamilies     map[string]*topologyWatchFamily // canonical common dir → family
-	topologyFamilyByRepo map[string]string               // repo prefix → canonical common dir
+	topologyFamilies     map[string]*topologyWatchFamily     // canonical common dir → family
+	topologyFamilyByRepo map[string]string                   // repo prefix → canonical common dir
+	topologyDispatches   map[*topologyDispatchEpoch]struct{} // accepting or draining epochs
 	multi                *MultiIndexer
 	logger               *zap.Logger
 	events               chan GraphChangeEvent
 	done                 chan struct{}
 	mu                   sync.Mutex
 	stopped              bool
+	stopDone             chan struct{}
+	stopErr              error
 
 	// symbolChangeCb is the OnSymbolChange callback registered by the
 	// MCP server (or any other consumer). It's fanned out to every
 	// per-repo Watcher and re-applied at AddRepo time so newly-tracked
 	// repos pick it up without a second registration call. Guarded by
-	// callbackMu so registration and per-repo apply don't race.
+	// callbackMu so registration and per-repo apply don't race. The
+	// topology callback is instead guarded by mu because it is captured
+	// atomically with an ownership-epoch dispatch admission.
 	callbackMu     sync.Mutex
 	symbolChangeCb SymbolChangeCallback
 	// degradedCb is fanned out to every per-repo Watcher (and re-applied at
@@ -69,6 +99,7 @@ func NewMultiWatcher(
 		startFailures:        make(map[string]string),
 		topologyFamilies:     make(map[string]*topologyWatchFamily),
 		topologyFamilyByRepo: make(map[string]string),
+		topologyDispatches:   make(map[*topologyDispatchEpoch]struct{}),
 		multi:                mi,
 		logger:               logger,
 		events:               make(chan GraphChangeEvent, 128),
@@ -144,22 +175,122 @@ func (mw *MultiWatcher) configureGitWatcher(prefix string, gw *GitWatcher) {
 // debounce/refresh window. A callback already queued by a removed owner is
 // therefore dropped instead of racing the newly promoted owner and delivering
 // the same family event twice.
-func (mw *MultiWatcher) dispatchWorktreeTopologyChange(prefix string, gw *GitWatcher, rootPath string) {
-	mw.mu.Lock()
-	key, exists := mw.topologyFamilyByRepo[prefix]
-	family := mw.topologyFamilies[key]
-	current := !mw.stopped && exists && family != nil && family.owner == prefix && family.members[prefix] == gw
-	mw.mu.Unlock()
-	if !current {
+func (mw *MultiWatcher) beginTopologyDispatchEpochLocked(family *topologyWatchFamily, prefix string, gw *GitWatcher) *topologyDispatchEpoch {
+	if family == nil || gw == nil || mw.stopped {
+		return nil
+	}
+	family.nextEpoch++
+	epoch := &topologyDispatchEpoch{
+		number:    family.nextEpoch,
+		owner:     prefix,
+		watcher:   gw,
+		accepting: true,
+		drained:   make(chan struct{}),
+	}
+	family.dispatch = epoch
+	if mw.topologyDispatches == nil {
+		mw.topologyDispatches = make(map[*topologyDispatchEpoch]struct{})
+	}
+	mw.topologyDispatches[epoch] = struct{}{}
+	gw.OnWorktreeChange(func(rootPath string) {
+		mw.dispatchWorktreeTopologyChange(prefix, gw, epoch, rootPath)
+	})
+	return epoch
+}
+
+func (mw *MultiWatcher) finishTopologyDispatchEpochLocked(epoch *topologyDispatchEpoch) {
+	if epoch == nil || epoch.drainedClosed {
 		return
 	}
+	epoch.drainedClosed = true
+	close(epoch.drained)
+	delete(mw.topologyDispatches, epoch)
+}
 
-	mw.callbackMu.Lock()
-	callback := mw.worktreeChangeCb
-	mw.callbackMu.Unlock()
-	if callback != nil {
-		callback(prefix, rootPath)
+func (mw *MultiWatcher) invalidateTopologyDispatchEpochLocked(family *topologyWatchFamily) <-chan struct{} {
+	if family == nil || family.dispatch == nil {
+		return nil
 	}
+	epoch := family.dispatch
+	family.dispatch = nil
+	epoch.accepting = false
+	if epoch.inFlight == 0 {
+		mw.finishTopologyDispatchEpochLocked(epoch)
+	}
+	return epoch.drained
+}
+
+func (mw *MultiWatcher) admitWorktreeTopologyChange(prefix string, gw *GitWatcher, epoch *topologyDispatchEpoch, rootPath string) (admittedTopologyDispatch, bool) {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+
+	key, exists := mw.topologyFamilyByRepo[prefix]
+	family := mw.topologyFamilies[key]
+	current := !mw.stopped && exists && family != nil && family.owner == prefix &&
+		family.members[prefix] == gw && family.dispatch == epoch && epoch != nil &&
+		epoch.accepting && epoch.owner == prefix && epoch.watcher == gw
+	callback := mw.worktreeChangeCb
+	if !current || callback == nil {
+		return admittedTopologyDispatch{}, false
+	}
+	epoch.inFlight++
+	return admittedTopologyDispatch{
+		mw:       mw,
+		epoch:    epoch,
+		callback: callback,
+		prefix:   prefix,
+		rootPath: rootPath,
+	}, true
+}
+
+func (mw *MultiWatcher) releaseTopologyDispatch(epoch *topologyDispatchEpoch) {
+	if epoch == nil {
+		return
+	}
+	mw.mu.Lock()
+	if epoch.inFlight > 0 {
+		epoch.inFlight--
+	}
+	if !epoch.accepting && epoch.inFlight == 0 {
+		mw.finishTopologyDispatchEpochLocked(epoch)
+	}
+	mw.mu.Unlock()
+}
+
+func (mw *MultiWatcher) topologyDispatchDrainsLocked() []<-chan struct{} {
+	drains := make([]<-chan struct{}, 0, len(mw.topologyDispatches))
+	for epoch := range mw.topologyDispatches {
+		drains = append(drains, epoch.drained)
+	}
+	return drains
+}
+
+func waitTopologyDispatchDrains(drains ...<-chan struct{}) {
+	var seen map[<-chan struct{}]struct{}
+	for _, drain := range drains {
+		if drain == nil {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[<-chan struct{}]struct{}, len(drains))
+		}
+		if _, exists := seen[drain]; exists {
+			continue
+		}
+		seen[drain] = struct{}{}
+		<-drain
+	}
+}
+
+func (mw *MultiWatcher) dispatchWorktreeTopologyChange(prefix string, gw *GitWatcher, epoch *topologyDispatchEpoch, rootPath string) {
+	dispatch, admitted := mw.admitWorktreeTopologyChange(prefix, gw, epoch, rootPath)
+	if !admitted {
+		return
+	}
+	// The lease remains active through the external callback. Removal and Stop
+	// invalidate its epoch under mw.mu, then wait without mw.mu, so callbacks
+	// can safely re-enter ordinary MultiWatcher methods without lock inversion.
+	dispatch.invoke()
 }
 
 func canonicalGitCommonDir(path string) string {
@@ -188,7 +319,11 @@ func (mw *MultiWatcher) electTopologyOwnerLocked(family *topologyWatchFamily) {
 	if family == nil || len(family.members) == 0 {
 		return
 	}
-	if _, exists := family.members[family.owner]; exists {
+	if gw, exists := family.members[family.owner]; exists {
+		if family.dispatch == nil {
+			mw.beginTopologyDispatchEpochLocked(family, family.owner, gw)
+			gw.setTopologyOwner(true)
+		}
 		return
 	}
 	prefixes := make([]string, 0, len(family.members))
@@ -197,22 +332,25 @@ func (mw *MultiWatcher) electTopologyOwnerLocked(family *topologyWatchFamily) {
 	}
 	sort.Strings(prefixes)
 	family.owner = prefixes[0]
-	family.members[family.owner].setTopologyOwner(true)
+	gw := family.members[family.owner]
+	mw.beginTopologyDispatchEpochLocked(family, family.owner, gw)
+	gw.setTopologyOwner(true)
 }
 
-func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatcher) {
+func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatcher) <-chan struct{} {
 	if gw == nil || mw.stopped {
-		return
+		return nil
 	}
 	commonDir := gw.commonDirectory()
 	if commonDir == "" {
-		return
+		return nil
 	}
+	var drain <-chan struct{}
 	if prior, exists := mw.topologyFamilyByRepo[prefix]; exists {
 		if family := mw.topologyFamilies[prior]; family != nil && family.members[prefix] == gw {
-			return
+			return nil
 		}
-		mw.unregisterTopologyWatcherLocked(prefix)
+		drain = mw.unregisterTopologyWatcherLocked(prefix)
 	}
 
 	key := mw.topologyFamilyKeyLocked(commonDir)
@@ -224,54 +362,63 @@ func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatc
 		}
 		mw.topologyFamilies[key] = family
 	}
+	gw.OnWorktreeChange(nil)
 	gw.setTopologyOwner(false)
 	family.members[prefix] = gw
 	mw.topologyFamilyByRepo[prefix] = key
 	mw.electTopologyOwnerLocked(family)
+	return drain
 }
 
-func (mw *MultiWatcher) installStartedGitWatcherLocked(prefix string, gw *GitWatcher) {
+func (mw *MultiWatcher) installStartedGitWatcherLocked(prefix string, gw *GitWatcher) <-chan struct{} {
 	if gw == nil {
-		return
+		return nil
 	}
-	gw.OnWorktreeChange(func(rootPath string) {
-		mw.dispatchWorktreeTopologyChange(prefix, gw, rootPath)
-	})
 	mw.gitWatchers[prefix] = gw
-	mw.registerTopologyWatcherLocked(prefix, gw)
+	return mw.registerTopologyWatcherLocked(prefix, gw)
 }
 
-func (mw *MultiWatcher) unregisterTopologyWatcherLocked(prefix string) {
+func (mw *MultiWatcher) unregisterTopologyWatcherLocked(prefix string) <-chan struct{} {
 	key, exists := mw.topologyFamilyByRepo[prefix]
 	if !exists {
-		return
+		return nil
 	}
 	delete(mw.topologyFamilyByRepo, prefix)
 	family := mw.topologyFamilies[key]
 	if family == nil {
-		return
+		return nil
 	}
 	gw := family.members[prefix]
 	wasOwner := family.owner == prefix
+	var drain <-chan struct{}
+	if wasOwner {
+		drain = mw.invalidateTopologyDispatchEpochLocked(family)
+		family.owner = ""
+	}
 	delete(family.members, prefix)
 	if gw != nil {
+		gw.OnWorktreeChange(nil)
 		gw.setTopologyOwner(false)
 	}
 	if len(family.members) == 0 {
 		delete(mw.topologyFamilies, key)
-		return
+		return drain
 	}
 	if wasOwner {
-		family.owner = ""
 		mw.electTopologyOwnerLocked(family)
 	}
+	return drain
 }
 
 // Start begins watching all configured repos. Events from per-repo watchers
 // are merged into the single Events() channel.
 func (mw *MultiWatcher) Start() error {
 	mw.mu.Lock()
-	defer mw.mu.Unlock()
+	var topologyDrains []<-chan struct{}
+	defer func() {
+		mw.mu.Unlock()
+		waitTopologyDispatchDrains(topologyDrains...)
+	}()
 	if mw.stopped {
 		return fmt.Errorf("multi-watcher is stopped")
 	}
@@ -375,7 +522,9 @@ func (mw *MultiWatcher) Start() error {
 		}
 		delete(mw.startFailures, res.prefix)
 		mw.started[res.prefix] = true
-		mw.installStartedGitWatcherLocked(res.prefix, res.gw)
+		if drain := mw.installStartedGitWatcherLocked(res.prefix, res.gw); drain != nil {
+			topologyDrains = append(topologyDrains, drain)
+		}
 		// Forward events from this watcher and trigger cross-repo resolution.
 		go mw.forwardEvents(res.prefix, res.w)
 	}
@@ -408,33 +557,71 @@ func (mw *MultiWatcher) forwardEvents(_ string, w *Watcher) {
 // Stop halts all per-repo watchers and cleans up resources.
 func (mw *MultiWatcher) Stop() error {
 	mw.mu.Lock()
-	defer mw.mu.Unlock()
 	if mw.stopped {
-		return nil
+		completed := mw.stopDone
+		mw.mu.Unlock()
+		if completed != nil {
+			<-completed
+		}
+		mw.mu.Lock()
+		err := mw.stopErr
+		mw.mu.Unlock()
+		return err
 	}
 	mw.stopped = true
+	mw.stopDone = make(chan struct{})
 	close(mw.done)
 
-	var firstErr error
+	for _, family := range mw.topologyFamilies {
+		mw.invalidateTopologyDispatchEpochLocked(family)
+	}
+	drains := mw.topologyDispatchDrainsLocked()
+
+	type watcherStop struct {
+		prefix string
+		w      *Watcher
+	}
+	watchers := make([]watcherStop, 0, len(mw.watchers))
 	for prefix, w := range mw.watchers {
-		// Only stop watchers that were actually started.
-		if !mw.started[prefix] {
+		if mw.started[prefix] {
+			watchers = append(watchers, watcherStop{prefix: prefix, w: w})
+		}
+	}
+	gitWatchers := make([]*GitWatcher, 0, len(mw.gitWatchers))
+	for _, gw := range mw.gitWatchers {
+		if gw == nil {
 			continue
 		}
-		if err := w.Stop(); err != nil && firstErr == nil {
-			firstErr = err
-			mw.logger.Warn("error stopping watcher",
-				zap.String("prefix", prefix),
-				zap.Error(err),
-			)
-		}
-		if gw, ok := mw.gitWatchers[prefix]; ok {
-			_ = gw.Stop()
-		}
+		gw.OnWorktreeChange(nil)
+		gw.setTopologyOwner(false)
+		gitWatchers = append(gitWatchers, gw)
 	}
 	mw.topologyFamilies = make(map[string]*topologyWatchFamily)
 	mw.topologyFamilyByRepo = make(map[string]string)
+	mw.mu.Unlock()
 
+	// Do not hold mw.mu while an admitted external callback or a watcher Stop
+	// runs. Invalidation prevents new admissions; draining supplies the return
+	// boundary promised by Stop, including for concurrent idempotent callers.
+	waitTopologyDispatchDrains(drains...)
+	var firstErr error
+	for _, entry := range watchers {
+		if err := entry.w.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+			mw.logger.Warn("error stopping watcher",
+				zap.String("prefix", entry.prefix),
+				zap.Error(err),
+			)
+		}
+	}
+	for _, gw := range gitWatchers {
+		_ = gw.Stop()
+	}
+
+	mw.mu.Lock()
+	mw.stopErr = firstErr
+	close(mw.stopDone)
+	mw.mu.Unlock()
 	return firstErr
 }
 
@@ -526,26 +713,24 @@ func (mw *MultiWatcher) OnDegraded(cb func(reason string)) {
 // checkout topology. Existing Git watchers are updated and nudged once so the
 // inventory-to-watch startup window cannot lose an addition.
 func (mw *MultiWatcher) OnWorktreeChange(cb func(repoPrefix, rootPath string)) {
-	mw.callbackMu.Lock()
-	mw.worktreeChangeCb = cb
-	mw.callbackMu.Unlock()
-
 	type registered struct {
 		prefix string
 		gw     *GitWatcher
+		epoch  *topologyDispatchEpoch
 	}
 	mw.mu.Lock()
+	mw.worktreeChangeCb = cb
 	owners := make([]registered, 0, len(mw.topologyFamilies))
 	for _, family := range mw.topologyFamilies {
-		if gw := family.members[family.owner]; gw != nil {
-			owners = append(owners, registered{prefix: family.owner, gw: gw})
+		if gw := family.members[family.owner]; gw != nil && family.dispatch != nil {
+			owners = append(owners, registered{prefix: family.owner, gw: gw, epoch: family.dispatch})
 		}
 	}
 	mw.mu.Unlock()
 
 	if cb != nil {
 		for _, owner := range owners {
-			go mw.dispatchWorktreeTopologyChange(owner.prefix, owner.gw, owner.gw.repoPath)
+			go mw.dispatchWorktreeTopologyChange(owner.prefix, owner.gw, owner.epoch, owner.gw.repoPath)
 		}
 	}
 }
@@ -631,7 +816,11 @@ func (mw *MultiWatcher) WatchedRepos() (live, configured int) {
 // AddRepo creates and starts a watcher for a newly tracked repo.
 func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error {
 	mw.mu.Lock()
-	defer mw.mu.Unlock()
+	var topologyDrain <-chan struct{}
+	defer func() {
+		mw.mu.Unlock()
+		waitTopologyDispatchDrains(topologyDrain)
+	}()
 	if mw.stopped {
 		return fmt.Errorf("multi-watcher is stopped")
 	}
@@ -666,7 +855,7 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 			gw.setTopologyOwner(false)
 			mw.configureGitWatcher(repoPrefix, gw)
 			if err := gw.Start(); err == nil {
-				mw.installStartedGitWatcherLocked(repoPrefix, gw)
+				topologyDrain = mw.installStartedGitWatcherLocked(repoPrefix, gw)
 			} else {
 				_ = gw.Stop()
 			}
@@ -694,24 +883,43 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 // RemoveRepo stops and removes the watcher for a repo.
 func (mw *MultiWatcher) RemoveRepo(repoPrefix string) error {
 	mw.mu.Lock()
-	defer mw.mu.Unlock()
-
 	w, exists := mw.watchers[repoPrefix]
 	if !exists {
+		mw.mu.Unlock()
 		return fmt.Errorf("no watcher for repo: %s", repoPrefix)
 	}
-
-	var err error
-	if mw.started[repoPrefix] {
-		err = w.Stop()
+	stopping := mw.stopped
+	stopDone := mw.stopDone
+	started := mw.started[repoPrefix]
+	gw := mw.gitWatchers[repoPrefix]
+	var drain <-chan struct{}
+	if !stopping && gw != nil {
+		drain = mw.unregisterTopologyWatcherLocked(repoPrefix)
 	}
-	if gw, ok := mw.gitWatchers[repoPrefix]; ok {
-		mw.unregisterTopologyWatcherLocked(repoPrefix)
-		_ = gw.Stop()
-		delete(mw.gitWatchers, repoPrefix)
-	}
+	delete(mw.gitWatchers, repoPrefix)
 	delete(mw.watchers, repoPrefix)
 	delete(mw.started, repoPrefix)
 	delete(mw.startFailures, repoPrefix)
+	mw.mu.Unlock()
+
+	if stopping {
+		// Stop captured this watcher before publishing stopped. It owns teardown;
+		// waiting avoids a concurrent second close of Watcher's done channel.
+		if stopDone != nil {
+			<-stopDone
+		}
+		return nil
+	}
+
+	// An owner transfer is already visible, but the removed epoch's admitted
+	// callback must finish before this removal boundary returns.
+	waitTopologyDispatchDrains(drain)
+	var err error
+	if started {
+		err = w.Stop()
+	}
+	if gw != nil {
+		_ = gw.Stop()
+	}
 	return err
 }
