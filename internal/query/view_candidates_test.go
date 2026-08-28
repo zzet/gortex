@@ -254,6 +254,44 @@ func gatherIDs(e *Engine, query string, limit int) []string {
 	return candidateIDs(e.GatherSymbolCandidates(query, limit, QueryOptions{}, nil))
 }
 
+type rankedMergeFixture struct {
+	id     string
+	origin string
+}
+
+// TestMergeRankedSourcesPreservesRankAcrossUniqueResults pins the distinction
+// between duplicate ownership and blanket layer priority. A unique rank-zero
+// base result still outranks a unique rank-one overlay result, while the
+// overlay copy is the only copy retained for an identity both sources carry.
+func TestMergeRankedSourcesPreservesRankAcrossUniqueResults(t *testing.T) {
+	base := []rankedMergeFixture{
+		{id: "a-base", origin: "base-unique"},
+		{id: "m-shared", origin: "base-shared"},
+	}
+	overlay := []rankedMergeFixture{
+		{id: "m-shared", origin: "overlay-shared"},
+		{id: "z-overlay", origin: "overlay-unique"},
+	}
+
+	got := MergeRankedSources(
+		[][]rankedMergeFixture{base, overlay},
+		func(item rankedMergeFixture) string { return item.id },
+	)
+	want := []rankedMergeFixture{
+		{id: "a-base", origin: "base-unique"},
+		{id: "m-shared", origin: "overlay-shared"},
+		{id: "z-overlay", origin: "overlay-unique"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("merged results = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("merged results = %+v, want %+v", got, want)
+		}
+	}
+}
+
 // TestViewSearchFindsAGenerationOnlySymbol is the defining case: Dirty exists
 // in the working-tree generation and nowhere else, and the query names neither
 // its identifier nor a substring of one, so only that generation's corpus can
