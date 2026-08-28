@@ -196,10 +196,11 @@ func (r *Reconciler) CommitAuthorizedDemotion(
 	var cleanup *store_sqlite.CleanupEntry
 	if authorization.OwnedGraphID != "" {
 		target := sagaTarget{
-			Kind:       sagaRetireGraph,
-			GraphID:    authorization.OwnedGraphID,
-			FamilyID:   checkout.FamilyID,
-			CheckoutID: checkout.CheckoutID,
+			Kind:        sagaRetireGraph,
+			GraphID:     authorization.OwnedGraphID,
+			FamilyID:    checkout.FamilyID,
+			CheckoutID:  checkout.CheckoutID,
+			Incarnation: checkout.Incarnation,
 		}
 		entry, err := r.pendingCleanupEntry(target)
 		if err != nil {

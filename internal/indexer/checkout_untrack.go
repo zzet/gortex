@@ -366,24 +366,16 @@ func (l *CheckoutLifecycle) demote(
 	l.installCoordinator(checkout.CheckoutID, coordinator)
 
 	if commitErr != nil {
-		// The mode flip and graph-retirement journal committed together.
-		// Queries already use the primary; Resume or the next retry finishes the
-		// graph cleanup without replaying the demotion.
+		// The mode flip and graph-retirement journal committed together. Keep
+		// the transition standing until the retryable graph saga has deleted
+		// both the corpus and its durable binding under one admission tombstone.
 		l.logger.Warn("checkout lifecycle: demoted graph cleanup remains journalled",
 			zap.String("checkout", checkout.CheckoutID),
 			zap.String("graph", authorization.OwnedGraphID), zap.Error(commitErr))
+		l.sweepRetirements(ctx)
+		return fmt.Errorf("indexer: retire demoted graph: %w", commitErr)
 	}
 
-	prefix := ""
-	if owned != nil {
-		prefix = owned.RepoPrefix
-	}
-	if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
-		// Publication already committed. Keep the automatic route live and the
-		// transition standing so restart can retry only the external cleanup.
-		l.sweepRetirements(ctx)
-		return fmt.Errorf("indexer: persist demoted checkout configuration: %w", err)
-	}
 	if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID,
 		authorization.Transition.TransitionID); err != nil {
 		l.sweepRetirements(ctx)

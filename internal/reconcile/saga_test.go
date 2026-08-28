@@ -436,6 +436,171 @@ func TestPurgeLayersJournalStopsASecondPurge(t *testing.T) {
 	}
 }
 
+func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	f.seedCheckout("co-1", "inc-1", "wt", store_sqlite.CheckoutModeDedicated)
+	f.seedOwnedGraph("graph-1", "co-1")
+	target := sagaTarget{Kind: sagaRetireGraph, Phase: phaseReleaseGraph, GraphID: "graph-1"}
+	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+		t.Fatalf("persist legacy graph cleanup: %v", err)
+	}
+	f.hooks.failRelease = 1
+
+	if err := f.rec.Resume(ctx); !errors.Is(err, errHookFailed) {
+		t.Fatalf("first Resume = %v, want injected release failure", err)
+	}
+	repaired, found, err := f.rec.loadSagaTarget(ctx, target.cleanupID())
+	if err != nil || !found {
+		t.Fatalf("load repaired graph cleanup = found:%v err:%v", found, err)
+	}
+	if repaired.CheckoutID != "co-1" || repaired.Incarnation != "inc-1" ||
+		repaired.FamilyID != f.familyID || repaired.GraphID != "graph-1" ||
+		repaired.RepoPrefix != "prefix-graph-1" || repaired.RootPath != "/repo/wt" {
+		t.Fatalf("repaired target = %+v", repaired)
+	}
+	if !f.graphExists("graph-1") {
+		t.Fatal("failed release deleted the graph")
+	}
+
+	if err := f.rec.Resume(ctx); err != nil {
+		t.Fatalf("second Resume: %v", err)
+	}
+	if f.graphExists("graph-1") {
+		t.Fatal("successful repaired cleanup retained the graph")
+	}
+	if entries := f.journal(); len(entries) != 0 {
+		t.Fatalf("successful repaired cleanup retained journal: %+v", entries)
+	}
+}
+
+func TestResumeKeepsUnverifiableLegacyRetireGraphTargetDurable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(*fixture) sagaTarget
+	}{
+		{
+			name: "graph has no owner",
+			seed: func(f *fixture) sagaTarget {
+				f.seedPrimaryGraph("graph-1")
+				return sagaTarget{Kind: sagaRetireGraph, Phase: phaseReleaseGraph, GraphID: "graph-1"}
+			},
+		},
+		{
+			name: "target names another checkout",
+			seed: func(f *fixture) sagaTarget {
+				f.seedCheckout("co-1", "inc-1", "one", store_sqlite.CheckoutModeDedicated)
+				f.seedCheckout("co-2", "inc-2", "two", store_sqlite.CheckoutModeDedicated)
+				f.seedOwnedGraph("graph-1", "co-1")
+				return sagaTarget{
+					Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
+					GraphID: "graph-1", CheckoutID: "co-2",
+				}
+			},
+		},
+		{
+			name: "target names another family",
+			seed: func(f *fixture) sagaTarget {
+				f.seedCheckout("co-1", "inc-1", "one", store_sqlite.CheckoutModeDedicated)
+				f.seedOwnedGraph("graph-1", "co-1")
+				return sagaTarget{
+					Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
+					GraphID: "graph-1", CheckoutID: "co-1", FamilyID: "another-family",
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newFixture(t, Default())
+			target := tc.seed(f)
+			if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+				t.Fatalf("persist ambiguous legacy cleanup: %v", err)
+			}
+			before, found, err := f.catalog.GetCleanupEntry(ctx, target.cleanupID())
+			if err != nil || !found {
+				t.Fatalf("read seeded cleanup = found:%v err:%v", found, err)
+			}
+
+			if err := f.rec.Resume(ctx); !errors.Is(err, ErrSagaTarget) {
+				t.Fatalf("Resume = %v, want ErrSagaTarget", err)
+			}
+			after, found, err := f.catalog.GetCleanupEntry(ctx, target.cleanupID())
+			if err != nil || !found {
+				t.Fatalf("read retained cleanup = found:%v err:%v", found, err)
+			}
+			if after.Phase != before.Phase || after.OpaqueTargetIDs != before.OpaqueTargetIDs {
+				t.Fatalf("ambiguous cleanup changed from %+v to %+v", before, after)
+			}
+			if f.hooks.countPrefix("release:") != 0 {
+				t.Fatal("ambiguous legacy cleanup invoked graph release")
+			}
+			if !f.graphExists("graph-1") {
+				t.Fatal("ambiguous legacy cleanup deleted the graph")
+			}
+		})
+	}
+}
+
+func TestResumeSkipsStalePositiveRetireGraphIdentity(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	f.seedCheckout("co-1", "inc-old", "wt", store_sqlite.CheckoutModeDedicated)
+	f.seedOwnedGraph("graph-1", "co-1")
+	target := sagaTarget{
+		Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
+		GraphID: "graph-1", FamilyID: f.familyID,
+		CheckoutID: "co-1", Incarnation: "inc-old",
+	}
+	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+		t.Fatalf("persist stale cleanup: %v", err)
+	}
+	f.rekey("co-1", "inc-new")
+
+	if err := f.rec.Resume(ctx); err != nil {
+		t.Fatalf("Resume stale cleanup: %v", err)
+	}
+	if !f.graphExists("graph-1") {
+		t.Fatal("stale cleanup deleted the replacement graph")
+	}
+	if f.hooks.countPrefix("release:") != 0 {
+		t.Fatal("stale cleanup invoked graph release")
+	}
+	if entries := f.journal(); len(entries) != 0 {
+		t.Fatalf("stale cleanup retained obsolete journal: %+v", entries)
+	}
+}
+
+func TestResumeFinishesGraphReleaseAfterCatalogRowAlreadyGone(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	target := sagaTarget{
+		Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
+		GraphID: "graph-gone", FamilyID: f.familyID,
+		CheckoutID: "co-gone", Incarnation: "inc-gone",
+		RepoPrefix: "durable-prefix", RootPath: "/repo/durable-root",
+	}
+	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+		t.Fatalf("persist partially committed graph release: %v", err)
+	}
+
+	if err := f.rec.Resume(ctx); err != nil {
+		t.Fatalf("Resume row-absent graph release: %v", err)
+	}
+	released := f.hooks.releasedTargets()
+	if len(released) != 1 {
+		t.Fatalf("release targets = %+v, want one", released)
+	}
+	if released[0].GraphID != target.GraphID || released[0].CheckoutID != target.CheckoutID ||
+		released[0].Incarnation != target.Incarnation || released[0].RepoPrefix != target.RepoPrefix ||
+		released[0].RootPath != target.RootPath {
+		t.Fatalf("row-absent retry lost durable address: %+v", released[0])
+	}
+	if entries := f.journal(); len(entries) != 0 {
+		t.Fatalf("row-absent retry retained journal: %+v", entries)
+	}
+}
+
 // TestPostconditionsRefuseALeftoverRow drives the two verification phases
 // against state they must reject, which is the only way they fire: a finished
 // saga leaves nothing for them to find.

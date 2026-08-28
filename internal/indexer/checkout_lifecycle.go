@@ -171,6 +171,10 @@ type CheckoutLifecycle struct {
 	// the mode flip, which is the one write no fixture can make the catalog
 	// refuse. A test seam; nil in production.
 	routeBarrier func(context.Context, string) error
+	// releaseGraphBarrier wraps the guarded catalog delete while repository
+	// admission is closed. Tests use it to stop or fail at the final durable
+	// commit; nil in production.
+	releaseGraphBarrier func(context.Context, string, func() error) error
 
 	// mu guards only the late-bound collaborators. None of them is held
 	// across a saga: the hooks re-enter the lifecycle, and holding a lock
@@ -700,6 +704,19 @@ func (l *CheckoutLifecycle) confirmPresent(
 	inv *gitstate.FamilyInventory,
 	now time.Time,
 ) error {
+	headRef := record.HEADRef
+	headCommit := record.HEADOID
+	headTree := existing.HeadTree
+	if headCommit != existing.HeadCommit || headTree == "" {
+		// Inventory gives us the commit but not its tree. Never publish the new
+		// commit beside the old tree: promotion treats that pair as one guarded
+		// snapshot and would correctly refuse the incoherent identity.
+		head, err := gitstate.SampleHEAD(ctx, record.Path)
+		if err != nil {
+			return fmt.Errorf("indexer: sample HEAD of %s: %w", record.Path, err)
+		}
+		headRef, headCommit, headTree = head.Ref, head.CommitOID, head.TreeOID
+	}
 	req := store_sqlite.UpdateCheckoutObservationRequest{
 		CheckoutID:     existing.CheckoutID,
 		Incarnation:    existing.Incarnation,
@@ -708,9 +725,9 @@ func (l *CheckoutLifecycle) confirmPresent(
 		GitDir:         gitDirFor(inv, record),
 		Locked:         record.Locked,
 		Prunable:       record.Prunable,
-		HeadRef:        record.HEADRef,
-		HeadCommit:     record.HEADOID,
-		HeadTree:       existing.HeadTree,
+		HeadRef:        headRef,
+		HeadCommit:     headCommit,
+		HeadTree:       headTree,
 		LastAccessible: now.Unix(),
 		LastSeen:       now.Unix(),
 	}
@@ -2334,33 +2351,74 @@ func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ str
 // is the repository eviction the untrack path has always run — in the order
 // that path established: detach the watcher before evicting, so a late
 // filesystem event cannot re-index files whose nodes are already gone.
-func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
-	row, ok, err := h.l.catalog.GetDedicatedGraph(ctx, graphID)
+func (h cleanupHooks) ReleaseGraph(
+	ctx context.Context, target reconcile.GraphReleaseTarget, finalize func() error,
+) error {
+	row, graphPresent, err := h.l.catalog.GetDedicatedGraph(ctx, target.GraphID)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return nil
-	}
-	// The reconciler deletes the graph row after this hook returns. Capture
-	// every generation it owns while that durable ownership is still
-	// queryable; the retirement sweep runs after the graph reference is gone.
-	h.l.oweRetirement(h.l.graphGenerations(ctx, graphID)...)
-	if row.RepoPrefix == "" {
-		return nil
-	}
-	rootPath := ""
-	if row.OwnerCheckoutID != "" {
-		checkout, found, checkoutErr := h.l.catalog.GetCheckout(ctx, row.OwnerCheckoutID)
-		if checkoutErr != nil {
-			return checkoutErr
+	if graphPresent {
+		// Capture every generation while durable ownership remains queryable.
+		h.l.oweRetirement(h.l.graphGenerations(ctx, target.GraphID)...)
+		if target.RepoPrefix == "" {
+			target.RepoPrefix = row.RepoPrefix
 		}
-		if found {
-			rootPath = checkout.RootPath
+		if target.RootPath == "" && row.OwnerCheckoutID != "" {
+			checkout, found, checkoutErr := h.l.catalog.GetCheckout(ctx, row.OwnerCheckoutID)
+			if checkoutErr != nil {
+				return checkoutErr
+			}
+			if found {
+				target.RootPath = checkout.RootPath
+			}
 		}
 	}
-	_, _, err = h.l.evictRepoChecked(ctx, row.RepoPrefix, rootPath)
+	if target.RepoPrefix == "" {
+		return finalize()
+	}
+	guardedFinalize := finalize
+	if barrier := h.l.releaseGraphBarrier; barrier != nil {
+		guardedFinalize = func() error { return barrier(ctx, target.GraphID, finalize) }
+	}
+	_, _, err = h.l.evictRepoCheckedFinalized(
+		ctx, target.RepoPrefix, target.RootPath, guardedFinalize)
+	if err != nil && graphPresent {
+		err = h.l.restoreGraphAfterFailedRelease(
+			ctx, row, target.CheckoutID, target.Incarnation, err)
+	}
 	return err
+}
+
+// restoreGraphAfterFailedRelease compensates the catalog half of the
+// cross-store finalizer when config persistence fails after the guarded graph
+// delete. It never overwrites an extant replacement and only restores while
+// the checkout incarnation that authorized deletion is still current.
+func (l *CheckoutLifecycle) restoreGraphAfterFailedRelease(
+	ctx context.Context, row store_sqlite.DedicatedGraph,
+	checkoutID, incarnation string, cause error,
+) error {
+	if cause == nil {
+		return nil
+	}
+	if _, present, err := l.catalog.GetDedicatedGraph(ctx, row.GraphID); err != nil {
+		return errors.Join(cause, err)
+	} else if present {
+		return cause
+	}
+	checkout, present, err := l.catalog.GetCheckout(ctx, checkoutID)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	if !present || checkout.Incarnation != incarnation {
+		return errors.Join(cause, fmt.Errorf(
+			"%w: cannot restore graph %s for stale checkout incarnation",
+			store_sqlite.ErrCatalogStaleGuard, row.GraphID))
+	}
+	if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
+		return errors.Join(cause, fmt.Errorf("restore graph %s after failed release: %w", row.GraphID, err))
+	}
+	return cause
 }
 
 // --- side effects -------------------------------------------------------
@@ -2371,27 +2429,44 @@ func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
 func (l *CheckoutLifecycle) evictRepoChecked(
 	ctx context.Context, prefix, rootPath string,
 ) (nodesRemoved, edgesRemoved int, err error) {
+	return l.evictRepoCheckedFinalized(ctx, prefix, rootPath, nil)
+}
+
+func (l *CheckoutLifecycle) evictRepoCheckedFinalized(
+	ctx context.Context, prefix, rootPath string, finalizeGraph func() error,
+) (nodesRemoved, edgesRemoved int, err error) {
 	if prefix == "" {
+		if finalizeGraph != nil {
+			return 0, 0, finalizeGraph()
+		}
 		return 0, 0, nil
 	}
 	l.detachWatcher(prefix)
 	finalize := func(meta *RepoMetadata) error {
-		if l.cfgMgr == nil {
-			return nil
+		// Commit the guarded catalog delete before removing durable tracking
+		// intent. A delete failure therefore leaves config untouched; if the
+		// following config write fails, ReleaseGraph restores the captured row.
+		if finalizeGraph != nil {
+			if err := finalizeGraph(); err != nil {
+				return err
+			}
 		}
-		path := rootPath
-		if meta != nil && meta.RootPath != "" {
-			// Prefer the original configured spelling while this process still
-			// has it. A vanished macOS path can no longer resolve /var through
-			// /private/var, while the catalog deliberately keeps the canonical
-			// spelling; the configured spelling remains the exact durable key.
-			path = meta.RootPath
+		if l.cfgMgr != nil {
+			path := rootPath
+			if meta != nil && meta.RootPath != "" {
+				// Prefer the original configured spelling while this process still
+				// has it. A vanished macOS path can no longer resolve /var through
+				// /private/var, while the catalog deliberately keeps the canonical
+				// spelling; the configured spelling remains the exact durable key.
+				path = meta.RootPath
+			}
+			if path != "" {
+				if _, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path); err != nil {
+					return err
+				}
+			}
 		}
-		if path == "" {
-			return nil
-		}
-		_, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path)
-		return err
+		return nil
 	}
 	nodesRemoved, edgesRemoved, err = l.mi.purgeRepoChecked(ctx, prefix, finalize)
 	if l.mi.GetMetadata(prefix) == nil {

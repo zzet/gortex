@@ -36,10 +36,11 @@ var (
 // so a test can assert the sequence a saga ran, and can be told to fail a
 // bounded number of times to stand in for a process dying mid-phase.
 type recordingHooks struct {
-	mu          sync.Mutex
-	calls       []string
-	failPurge   int
-	failRelease int
+	mu             sync.Mutex
+	calls          []string
+	releaseTargets []GraphReleaseTarget
+	failPurge      int
+	failRelease    int
 	// onPurge runs inside the purge, which is where the layer owner stops the
 	// builder that has been routing for this checkout. The cycle that builder
 	// was already running finishes during the stop, so this is the one place a
@@ -61,15 +62,19 @@ func (h *recordingHooks) PurgeCheckoutLayers(_ context.Context, checkoutID, inca
 	return nil
 }
 
-func (h *recordingHooks) ReleaseGraph(_ context.Context, graphID string) error {
+func (h *recordingHooks) ReleaseGraph(
+	_ context.Context, target GraphReleaseTarget, finalize func() error,
+) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.calls = append(h.calls, "release:"+graphID)
+	h.calls = append(h.calls, "release:"+target.GraphID)
+	h.releaseTargets = append(h.releaseTargets, target)
 	if h.failRelease > 0 {
 		h.failRelease--
+		h.mu.Unlock()
 		return errHookFailed
 	}
-	return nil
+	h.mu.Unlock()
+	return finalize()
 }
 
 // snapshot returns the calls recorded so far.
@@ -77,6 +82,12 @@ func (h *recordingHooks) snapshot() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return slices.Clone(h.calls)
+}
+
+func (h *recordingHooks) releasedTargets() []GraphReleaseTarget {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.releaseTargets)
 }
 
 // countPrefix counts recorded calls starting with prefix.

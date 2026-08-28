@@ -211,12 +211,34 @@ func (r *Reconciler) RetireDedicatedGraph(ctx context.Context, graphID string) e
 	if err != nil {
 		return err
 	}
-	if ok {
-		if dedicated.IsPrimaryBase {
-			return fmt.Errorf("%w: graph %s is the primary base of family %s",
-				ErrSagaTarget, graphID, dedicated.FamilyID)
+	if !ok {
+		// An existing journal may still need to advance after its graph was
+		// durably deleted. enterSaga reloads its original identity; with no
+		// journal there is simply nothing left to retire.
+		if _, pending, loadErr := r.loadSagaTarget(ctx, target.cleanupID()); loadErr != nil {
+			return loadErr
+		} else if !pending {
+			return nil
 		}
-		target.FamilyID = dedicated.FamilyID
+		return r.enterSaga(ctx, target)
 	}
+	if dedicated.IsPrimaryBase {
+		return fmt.Errorf("%w: graph %s is the primary base of family %s",
+			ErrSagaTarget, graphID, dedicated.FamilyID)
+	}
+	if dedicated.OwnerCheckoutID == "" {
+		return fmt.Errorf("%w: graph %s has no checkout owner", ErrSagaTarget, graphID)
+	}
+	checkout, present, err := r.catalog.GetCheckout(ctx, dedicated.OwnerCheckoutID)
+	if err != nil {
+		return err
+	}
+	if !present || checkout.Incarnation == "" || checkout.FamilyID != dedicated.FamilyID {
+		return fmt.Errorf("%w: graph %s has no verifiable checkout incarnation",
+			ErrSagaTarget, graphID)
+	}
+	target.FamilyID = dedicated.FamilyID
+	target.CheckoutID = checkout.CheckoutID
+	target.Incarnation = checkout.Incarnation
 	return r.enterSaga(ctx, target)
 }

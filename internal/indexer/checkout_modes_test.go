@@ -361,6 +361,48 @@ func TestPromoteRollsBackWhenTheCheckoutMovesUnderIt(t *testing.T) {
 	assert.NotEmpty(t, transition.LastError)
 }
 
+// TestRollbackPromotionIgnoresStaleIncarnationBeforeTouchingReplacement pins
+// the graph-incarnation guard at the destructive rollback seam. Graph IDs and
+// prefixes are deterministic and can be reused, so an old rollback must not
+// detach, purge, or untrack a replacement that now owns the same names.
+func TestRollbackPromotionIgnoresStaleIncarnationBeforeTouchingReplacement(t *testing.T) {
+	f := newFamilyFixture(t, "rollback-stale-incarnation")
+	defer f.close()
+	ctx := context.Background()
+
+	graph, found, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph)
+	require.NoError(t, err)
+	require.True(t, found)
+	checkout, found, err := f.catalog.GetCheckout(ctx, graph.OwnerCheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	beforeMetadata := f.mi.GetMetadata(f.mainPrefix)
+	require.NotNil(t, beforeMetadata)
+	require.True(t, f.configLists(f.main))
+
+	err = f.lc.rollbackPromotion(
+		ctx, f.mainPrefix, graph.GraphID, checkout.CheckoutID, "stale-"+checkout.Incarnation,
+	)
+	require.NoError(t, err)
+
+	assert.Same(t, beforeMetadata, f.mi.GetMetadata(f.mainPrefix),
+		"a stale rollback leaves the replacement corpus admitted")
+	assert.True(t, f.configLists(f.main),
+		"a stale rollback leaves the replacement tracking intent intact")
+	afterGraph, found, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, graph, afterGraph)
+	afterCheckout, found, err := f.catalog.GetCheckout(ctx, checkout.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, checkout, afterCheckout)
+	f.mi.mu.RLock()
+	pending := f.mi.pendingRepositoryUntracks[f.mainPrefix]
+	f.mi.mu.RUnlock()
+	assert.Nil(t, pending, "a stale rollback never installs a teardown tombstone")
+}
+
 // TestPromoteCapturesASettledDirtyChange is the other side of the same rule:
 // a dirty-only move does not invalidate the immutable HEAD base, and is instead
 // captured by the dirty layer built over it.

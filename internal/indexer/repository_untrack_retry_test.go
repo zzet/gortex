@@ -7,9 +7,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
@@ -517,6 +519,127 @@ func TestRepositoryCleanupSagaRetainsGraphAndConfigThenResumesWithoutLiveRegistr
 		t.Fatal("successful retry retained failed cleanup entry")
 	}
 	assertCleanupReleased(t, restarted, f.mainPrefix)
+}
+
+func TestRepositoryCleanupKeepsPrefixClosedThroughGraphDelete(t *testing.T) {
+	f := newFamilyFixture(t, "cleanup-finalize-barrier")
+	defer f.close()
+	ctx := context.Background()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	f.lc.releaseGraphBarrier = func(_ context.Context, _ string, finalize func() error) error {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return finalize()
+	}
+
+	untrackDone := make(chan error, 1)
+	go func() {
+		_, err := f.lc.Untrack(ctx, f.main)
+		untrackDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("cleanup did not reach guarded graph finalization")
+	}
+
+	f.mi.mu.RLock()
+	state := f.mi.pendingRepositoryUntracks[f.mainPrefix]
+	f.mi.mu.RUnlock()
+	if state == nil {
+		close(release)
+		t.Fatal("cleanup barrier has no pending repository continuation")
+	}
+	assertSingleClosedCleanupLane(t, f.mi, f.mainPrefix, state)
+	retrackDone := make(chan error, 1)
+	go func() {
+		_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
+		retrackDone <- err
+	}()
+	select {
+	case err := <-retrackDone:
+		if err == nil {
+			close(release)
+			t.Fatal("retrack crossed a cleanup whose graph delete had not committed")
+		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("retrack waited indefinitely on the closed cleanup lane")
+	}
+	if f.mi.GetMetadata(f.mainPrefix) != nil {
+		close(release)
+		t.Fatal("retrack made the repository visible before graph deletion")
+	}
+
+	close(release)
+	if err := <-untrackDone; err != nil {
+		t.Fatalf("finish untrack: %v", err)
+	}
+	if _, present, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph); err != nil {
+		t.Fatalf("read graph after finalization: %v", err)
+	} else if present {
+		t.Fatal("guarded finalization retained the old graph row")
+	}
+	assertCleanupReleased(t, f.mi, f.mainPrefix)
+}
+
+func TestRepositoryCleanupRetriesGraphDeleteWithoutRepeatingPayload(t *testing.T) {
+	f := newFamilyFixture(t, "cleanup-graph-delete-retry")
+	defer f.close()
+	ctx := context.Background()
+
+	counting := &retryableRepositoryCleanupStore{Store: f.store}
+	f.mi.graph = counting
+	errGraphDelete := errors.New("injected guarded graph deletion failure")
+	attempts := 0
+	f.lc.releaseGraphBarrier = func(_ context.Context, _ string, finalize func() error) error {
+		attempts++
+		if attempts == 1 {
+			return errGraphDelete
+		}
+		return finalize()
+	}
+
+	_, err := f.lc.Untrack(ctx, f.main)
+	if !errors.Is(err, errGraphDelete) {
+		t.Fatalf("untrack error = %v, want guarded graph deletion failure", err)
+	}
+	state, phases := cleanupStateSnapshot(t, f.mi, f.mainPrefix)
+	if !phases.payloadPurged || !phases.vectorPublished || phases.configFinalized {
+		t.Fatalf("cleanup phases after graph delete failure = %+v", phases)
+	}
+	assertSingleClosedCleanupLane(t, f.mi, f.mainPrefix, state)
+	if purge, vector := counting.calls(); purge != 1 || vector != 1 {
+		t.Fatalf("destructive phases before graph retry = purge:%d vector:%d, want 1/1", purge, vector)
+	}
+	if _, present, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph); err != nil {
+		t.Fatalf("read retained graph: %v", err)
+	} else if !present {
+		t.Fatal("failed guarded delete removed the graph row")
+	}
+	if !f.configLists(f.main) {
+		t.Fatal("failed guarded delete removed durable config intent")
+	}
+
+	if err := f.lc.rec.Resume(ctx); err != nil {
+		t.Fatalf("resume graph deletion: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("guarded graph delete attempts = %d, want 2", attempts)
+	}
+	if purge, vector := counting.calls(); purge != 1 || vector != 1 {
+		t.Fatalf("graph retry repeated destructive phases: purge:%d vector:%d", purge, vector)
+	}
+	if _, present, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph); err != nil {
+		t.Fatalf("read graph after retry: %v", err)
+	} else if present {
+		t.Fatal("successful retry retained the graph row")
+	}
+	assertCleanupReleased(t, f.mi, f.mainPrefix)
 }
 
 func BenchmarkRepositoryCleanupFailureRetry(b *testing.B) {

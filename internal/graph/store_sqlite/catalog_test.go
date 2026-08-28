@@ -594,6 +594,60 @@ func TestCatalogPrimaryBaseIsUniquePerFamily(t *testing.T) {
 	}
 }
 
+// TestCatalogDedicatedGraphDeleteGuardsCheckoutIncarnation proves graph IDs can
+// be reused without letting a stale teardown delete the replacement binding.
+// The DELETE must match the graph owner and the owner's current incarnation in
+// one SQL statement; a stale token changes no row.
+func TestCatalogDedicatedGraphDeleteGuardsCheckoutIncarnation(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+	graph := DedicatedGraph{
+		GraphID: "graph-1", OwnerCheckoutID: "wt", RepoPrefix: "prefix-1",
+		FamilyID: "fam", State: "graph_ready",
+	}
+	if err := catalog.UpsertDedicatedGraph(ctx, graph); err != nil {
+		t.Fatalf("UpsertDedicatedGraph: %v", err)
+	}
+
+	deleted, err := catalog.DeleteDedicatedGraphForIncarnation(ctx, "graph-1", "wt", "stale-inc")
+	if err != nil {
+		t.Fatalf("stale delete: %v", err)
+	}
+	if deleted {
+		t.Fatal("stale incarnation deleted the graph")
+	}
+	if got, ok, err := catalog.GetDedicatedGraph(ctx, "graph-1"); err != nil || !ok || got != graph {
+		t.Fatalf("stale delete changed graph: %+v, %v, %v", got, ok, err)
+	}
+
+	deleted, err = catalog.DeleteDedicatedGraphForIncarnation(ctx, "graph-1", "wt", "inc-1")
+	if err != nil || !deleted {
+		t.Fatalf("current delete = %v, %v", deleted, err)
+	}
+	if _, ok, err := catalog.GetDedicatedGraph(ctx, "graph-1"); err != nil || ok {
+		t.Fatalf("deleted graph remains: %v, %v", ok, err)
+	}
+
+	// Recreate the same checkout and deterministic graph IDs under a fresh
+	// incarnation. Replaying the old cleanup token must preserve them.
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-2")
+	if err := catalog.UpsertDedicatedGraph(ctx, graph); err != nil {
+		t.Fatalf("UpsertDedicatedGraph replacement: %v", err)
+	}
+	deleted, err = catalog.DeleteDedicatedGraphForIncarnation(ctx, "graph-1", "wt", "inc-1")
+	if err != nil {
+		t.Fatalf("replacement stale delete: %v", err)
+	}
+	if deleted {
+		t.Fatal("old incarnation deleted the replacement graph")
+	}
+	if got, ok, err := catalog.GetDedicatedGraph(ctx, "graph-1"); err != nil || !ok || got != graph {
+		t.Fatalf("replacement graph changed: %+v, %v, %v", got, ok, err)
+	}
+}
+
 // TestCatalogIncarnationGuardRejectsStaleWrite proves a checkout state write
 // aimed at a previous incarnation of a recreated working copy changes nothing.
 func TestCatalogIncarnationGuardRejectsStaleWrite(t *testing.T) {

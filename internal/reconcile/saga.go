@@ -113,6 +113,8 @@ type sagaTarget struct {
 	Incarnation  string    `json:"incarnation,omitempty"`
 	FamilyID     string    `json:"family_id,omitempty"`
 	GraphID      string    `json:"graph_id,omitempty"`
+	RepoPrefix   string    `json:"repo_prefix,omitempty"`
+	RootPath     string    `json:"root_path,omitempty"`
 	PrimaryEpoch int64     `json:"primary_epoch,omitempty"`
 }
 
@@ -274,21 +276,113 @@ func (r *Reconciler) enterSaga(ctx context.Context, target sagaTarget) error {
 		return err
 	}
 	if found {
-		// The journal is the authority on progress. Ids the caller supplied
-		// still win, because the rows the entry was written against may since
-		// have been deleted and re-created.
+		// The journal is the authority on both progress and identity. In
+		// particular, never replace its incarnation with one read from a row
+		// that may have been deleted and re-created under the same stable IDs.
 		target.Phase = resumed.Phase
-		if target.FamilyID == "" {
+		if resumed.FamilyID != "" {
 			target.FamilyID = resumed.FamilyID
 		}
-		if target.GraphID == "" {
+		if resumed.GraphID != "" {
 			target.GraphID = resumed.GraphID
 		}
-		if target.CheckoutID == "" {
+		if resumed.CheckoutID != "" {
 			target.CheckoutID = resumed.CheckoutID
 		}
+		target.Incarnation = resumed.Incarnation
+		target.RepoPrefix = resumed.RepoPrefix
+		target.RootPath = resumed.RootPath
+		target.PrimaryEpoch = resumed.PrimaryEpoch
 	}
 	return r.runSaga(ctx, target)
+}
+
+// repairLegacyRetireGraphTarget upgrades cleanup rows written before graph
+// retirement carried the checkout incarnation. Repair is allowed only while
+// the graph binding and its live owner row agree; ambiguity remains durable and
+// retryable instead of authorizing a prefix purge with a guessed identity.
+func (r *Reconciler) repairLegacyRetireGraphTarget(
+	ctx context.Context, target sagaTarget,
+) (sagaTarget, error) {
+	graph, present, err := r.catalog.GetDedicatedGraph(ctx, target.GraphID)
+	if err != nil {
+		return target, err
+	}
+	if !present || graph.OwnerCheckoutID == "" {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s has no verifiable owner binding",
+			ErrSagaTarget, target.GraphID)
+	}
+	if target.CheckoutID != "" && target.CheckoutID != graph.OwnerCheckoutID {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s names checkout %s but is owned by %s",
+			ErrSagaTarget, target.GraphID, target.CheckoutID, graph.OwnerCheckoutID)
+	}
+	checkout, present, err := r.catalog.GetCheckout(ctx, graph.OwnerCheckoutID)
+	if err != nil {
+		return target, err
+	}
+	if !present || checkout.Incarnation == "" || checkout.FamilyID != graph.FamilyID {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s has no verifiable checkout incarnation",
+			ErrSagaTarget, target.GraphID)
+	}
+	if target.FamilyID != "" && target.FamilyID != graph.FamilyID {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s moved from family %s to %s",
+			ErrSagaTarget, target.GraphID, target.FamilyID, graph.FamilyID)
+	}
+	target.CheckoutID = checkout.CheckoutID
+	target.Incarnation = checkout.Incarnation
+	target.FamilyID = graph.FamilyID
+	target.RepoPrefix = graph.RepoPrefix
+	target.RootPath = checkout.RootPath
+	return target, nil
+}
+
+// hydrateGraphReleaseAddress copies the filesystem address of a positively
+// identified graph binding into its durable saga target. A token mismatch is
+// intentionally left untouched: releaseGraph will treat that journal entry as
+// stale instead of borrowing the replacement's prefix or root.
+func (r *Reconciler) hydrateGraphReleaseAddress(
+	ctx context.Context, target sagaTarget,
+) (sagaTarget, error) {
+	if target.GraphID == "" || (target.RepoPrefix != "" && target.RootPath != "") {
+		return target, nil
+	}
+	graph, present, err := r.catalog.GetDedicatedGraph(ctx, target.GraphID)
+	if err != nil || !present {
+		return target, err
+	}
+	if target.FamilyID != "" && target.FamilyID != graph.FamilyID {
+		return target, nil
+	}
+	if target.CheckoutID != "" && target.CheckoutID != graph.OwnerCheckoutID {
+		return target, nil
+	}
+	checkout, present, err := r.catalog.GetCheckout(ctx, graph.OwnerCheckoutID)
+	if err != nil || !present {
+		return target, err
+	}
+	if target.Incarnation != "" && target.Incarnation != checkout.Incarnation {
+		return target, nil
+	}
+	if target.FamilyID == "" {
+		target.FamilyID = graph.FamilyID
+	}
+	if target.CheckoutID == "" {
+		target.CheckoutID = checkout.CheckoutID
+	}
+	if target.Incarnation == "" {
+		target.Incarnation = checkout.Incarnation
+	}
+	if target.RepoPrefix == "" {
+		target.RepoPrefix = graph.RepoPrefix
+	}
+	if target.RootPath == "" {
+		target.RootPath = checkout.RootPath
+	}
+	return target, nil
 }
 
 // runSaga walks a plan from its persisted phase to the end.
@@ -299,6 +393,20 @@ func (r *Reconciler) enterSaga(ctx context.Context, target sagaTarget) error {
 // the teardown completed — except for a layer purge, whose entry is kept in
 // the done phase so nothing ever purges the same incarnation twice.
 func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
+	if target.Kind == sagaRetireGraph && target.Incarnation == "" {
+		repaired, err := r.repairLegacyRetireGraphTarget(ctx, target)
+		if err != nil {
+			return err
+		}
+		target = repaired
+	}
+	if target.GraphID != "" {
+		hydrated, err := r.hydrateGraphReleaseAddress(ctx, target)
+		if err != nil {
+			return err
+		}
+		target = hydrated
+	}
 	plan := sagaPhases[target.Kind]
 	if len(plan) == 0 {
 		return fmt.Errorf("%w: unknown saga kind %q", ErrSagaTarget, target.Kind)
@@ -341,7 +449,7 @@ func (r *Reconciler) runPhase(ctx context.Context, target sagaTarget) error {
 	case phaseDeleteRefViews:
 		return r.deleteRefViews(ctx, target.GraphID)
 	case phaseReleaseGraph:
-		return r.releaseGraph(ctx, target.GraphID)
+		return r.releaseGraph(ctx, target)
 	case phaseDeleteCheckoutRow:
 		return r.deleteCheckoutRow(ctx, target)
 	case phaseVerifyCheckoutGone:
@@ -406,22 +514,86 @@ func (r *Reconciler) deleteRefViews(ctx context.Context, graphID string) error {
 	return nil
 }
 
-// releaseGraph hands the graph back to its owner and drops its row.
-func (r *Reconciler) releaseGraph(ctx context.Context, graphID string) error {
-	if graphID == "" {
+// releaseGraph hands the graph back to its owner and drops its row while the
+// repository prefix is still closed to new index admission. Stable graph and
+// checkout IDs are reusable, so the durable checkout incarnation is the ABA
+// guard for both the hook and the catalog delete.
+func (r *Reconciler) releaseGraph(ctx context.Context, target sagaTarget) error {
+	if target.GraphID == "" {
 		return nil
 	}
-	_, present, err := r.catalog.GetDedicatedGraph(ctx, graphID)
+	release := GraphReleaseTarget{
+		GraphID: target.GraphID, CheckoutID: target.CheckoutID,
+		Incarnation: target.Incarnation, RepoPrefix: target.RepoPrefix, RootPath: target.RootPath,
+	}
+	graph, present, err := r.catalog.GetDedicatedGraph(ctx, target.GraphID)
 	if err != nil {
 		return err
 	}
 	if !present {
+		// Only the saga that directly owned the graph finalizer may need to
+		// finish config after a crash between the two cross-store commits. A
+		// parent primary-closure saga reaches the same absent row after its
+		// nested checkout saga already completed and must not purge the prefix
+		// a second time.
+		if target.Kind != sagaRetireGraph && target.Kind != sagaForgetCheckout {
+			return nil
+		}
+		if release.RepoPrefix == "" {
+			// Legacy journals written before the durable address existed reached
+			// this state only after the old finalizer had already removed config.
+			return nil
+		}
+		return r.hooks.ReleaseGraph(ctx, release, func() error { return nil })
+	}
+	if target.CheckoutID == "" || target.Incarnation == "" {
+		return fmt.Errorf("%w: graph cleanup %s has no checkout incarnation",
+			ErrSagaTarget, target.GraphID)
+	}
+	if graph.OwnerCheckoutID != target.CheckoutID ||
+		(target.FamilyID != "" && graph.FamilyID != target.FamilyID) {
+		// A positive token names an older binding. The stale cleanup is done;
+		// it must not touch the replacement graph or its repository payload.
 		return nil
 	}
-	if err := r.hooks.ReleaseGraph(ctx, graphID); err != nil {
+	checkout, present, err := r.catalog.GetCheckout(ctx, target.CheckoutID)
+	if err != nil {
 		return err
 	}
-	return ignoreNotFound(r.catalog.DeleteDedicatedGraph(ctx, graphID))
+	if !present {
+		return fmt.Errorf("%w: graph cleanup %s cannot verify checkout %s",
+			ErrSagaTarget, target.GraphID, target.CheckoutID)
+	}
+	if checkout.Incarnation != target.Incarnation {
+		return nil
+	}
+	if release.RepoPrefix == "" {
+		release.RepoPrefix = graph.RepoPrefix
+	}
+	if release.RootPath == "" {
+		release.RootPath = checkout.RootPath
+	}
+	finalize := func() error {
+		deleted, err := r.catalog.DeleteDedicatedGraphForIncarnation(
+			ctx, target.GraphID, target.CheckoutID, target.Incarnation)
+		if err != nil {
+			return err
+		}
+		if deleted {
+			return nil
+		}
+		_, replacementPresent, err := r.catalog.GetDedicatedGraph(ctx, target.GraphID)
+		if err != nil {
+			return err
+		}
+		if !replacementPresent {
+			// A concurrent completion already removed the expected row.
+			return nil
+		}
+		return fmt.Errorf("%w: graph %s was replaced before guarded deletion",
+			store_sqlite.ErrCatalogStaleGuard, target.GraphID)
+	}
+	return r.hooks.ReleaseGraph(ctx, release, finalize)
 }
 
 // deleteCheckoutRow drops the checkout, taking its intents, its in-flight
@@ -534,10 +706,13 @@ func (r *Reconciler) forgetPrimaryOwner(ctx context.Context, target sagaTarget) 
 			return err
 		}
 		if present {
+			if target.Incarnation != "" && owner.Incarnation != target.Incarnation {
+				return nil
+			}
 			return r.ForgetCheckout(ctx, owner.CheckoutID, owner.Incarnation)
 		}
 	}
-	return r.releaseGraph(ctx, target.GraphID)
+	return r.releaseGraph(ctx, target)
 }
 
 // verifyClosureGone checks the family really has no primary left, and carries

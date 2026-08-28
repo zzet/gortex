@@ -951,6 +951,41 @@ func (c *Catalog) DeleteDedicatedGraph(ctx context.Context, graphID string) erro
 		`DELETE FROM dedicated_graphs WHERE graph_id = ?`, graphID)
 }
 
+// DeleteDedicatedGraphForIncarnation removes a graph only while its owner is
+// still the checkout incarnation that authorized the cleanup. Graph IDs are
+// deterministic from repository prefixes and can be reused after re-tracking;
+// a stale saga must therefore treat a replacement binding as already released.
+// The bool reports whether this call deleted the expected row.
+func (c *Catalog) DeleteDedicatedGraphForIncarnation(
+	ctx context.Context, graphID, checkoutID, incarnation string,
+) (bool, error) {
+	if err := requireCatalogID("graph_id", graphID); err != nil {
+		return false, err
+	}
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return false, err
+	}
+	if err := requireCatalogID("incarnation", incarnation); err != nil {
+		return false, err
+	}
+	result, err := c.exec(ctx, `
+		DELETE FROM dedicated_graphs
+		WHERE graph_id = ?
+		  AND owner_checkout_id = ?
+		  AND EXISTS (
+			SELECT 1 FROM checkouts
+			WHERE checkout_id = ? AND incarnation = ?
+		  )`, graphID, checkoutID, checkoutID, incarnation)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed != 0, nil
+}
+
 // SetPrimaryDedicatedGraph moves the family's primary base to one graph. The
 // family's primary_epoch is the compare-and-set token: a promotion carrying a
 // stale epoch changes nothing and reports ErrCatalogStaleGuard, so two

@@ -317,6 +317,12 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 	if err != nil {
 		return l.deferModeTransition(ctx, transition, err)
 	}
+	parts := strings.SplitN(transition.SourceSnapshotHash, ":", 3)
+	if len(parts) != 3 {
+		return l.deferModeTransition(ctx, transition, fmt.Errorf(
+			"indexer: demotion transition %s has invalid source snapshot",
+			transition.TransitionID))
+	}
 	if checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic {
 		if checkout.CheckoutID != transition.CheckoutID ||
 			checkout.ActiveIntentTransitionID != transition.TransitionID {
@@ -324,22 +330,23 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 				"%w: demotion transition %s no longer owns checkout %s",
 				store_sqlite.ErrCatalogStaleGuard, transition.TransitionID, checkout.CheckoutID))
 		}
-		prefix := l.ResolvePrefix(checkout.RootPath)
-		if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
-			return l.deferModeTransition(ctx, transition, fmt.Errorf(
-				"indexer: persist cleanup-pending demotion configuration: %w", err))
+		if parts[0] != "" {
+			if err := l.rec.RetireDedicatedGraph(ctx, parts[0]); err != nil {
+				return l.deferModeTransition(ctx, transition, fmt.Errorf(
+					"indexer: finish cleanup-pending demotion: %w", err))
+			}
+		} else {
+			prefix := l.ResolvePrefix(checkout.RootPath)
+			if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
+				return l.deferModeTransition(ctx, transition, fmt.Errorf(
+					"indexer: persist cleanup-pending demotion configuration: %w", err))
+			}
 		}
 		if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID,
 			transition.TransitionID); err != nil {
 			return l.deferModeTransition(ctx, transition, err)
 		}
 		return nil
-	}
-	parts := strings.SplitN(transition.SourceSnapshotHash, ":", 3)
-	if len(parts) != 3 {
-		return l.deferModeTransition(ctx, transition, fmt.Errorf(
-			"indexer: demotion transition %s has invalid source snapshot",
-			transition.TransitionID))
 	}
 	epoch, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {

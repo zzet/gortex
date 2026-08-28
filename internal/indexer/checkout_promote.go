@@ -227,7 +227,8 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	index, baseGenerationID, sample, resampled, err := l.buildPromotedCorpus(ctx, out.GraphID, checkout, out.Prefix)
 	out.Index, out.Resampled = index, resampled
 	if err != nil {
-		rollbackErr := l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
+		rollbackErr := l.rollbackPromotion(ctx, out.Prefix, out.GraphID,
+			checkout.CheckoutID, checkout.Incarnation)
 		return out, l.promotionFailed(ctx, &out, transition, errors.Join(err, rollbackErr))
 	}
 	if _, err := l.prepareAndPublishPromotion(ctx, checkout, transition,
@@ -235,7 +236,8 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		var rollbackErr error
 		current, currentErr := l.checkoutStateOf(ctx, checkout.CheckoutID)
 		if currentErr == nil && current.EffectiveMode != store_sqlite.CheckoutModeDedicated {
-			rollbackErr = l.rollbackPromotion(ctx, out.Prefix, out.GraphID)
+			rollbackErr = l.rollbackPromotion(ctx, out.Prefix, out.GraphID,
+				checkout.CheckoutID, checkout.Incarnation)
 		}
 		return out, l.promotionFailed(ctx, &out, transition, errors.Join(err, rollbackErr))
 	}
@@ -406,18 +408,53 @@ func (l *CheckoutLifecycle) withdrawAutomaticRoute(ctx context.Context, checkout
 // rollbackPromotion undoes what a failed promotion built. The automatic view
 // was never touched, so putting the corpus and the graph row back the way they
 // were is the whole of it.
-func (l *CheckoutLifecycle) rollbackPromotion(ctx context.Context, prefix, graphID string) error {
-	if prefix != "" {
+func (l *CheckoutLifecycle) rollbackPromotion(
+	ctx context.Context, prefix, graphID, checkoutID, incarnation string,
+) error {
+	if graphID == "" {
+		if prefix == "" {
+			return nil
+		}
 		l.detachWatcher(prefix)
-		if _, _, err := l.mi.purgeRepoChecked(ctx, prefix, nil); err != nil {
-			return fmt.Errorf("indexer: purge rolled-back repository %q: %w", prefix, err)
-		}
+		_, _, err := l.mi.purgeRepoChecked(ctx, prefix, nil)
+		return err
 	}
-	if graphID != "" {
-		if err := l.catalog.DeleteDedicatedGraph(ctx, graphID); err != nil &&
-			!errors.Is(err, store_sqlite.ErrCatalogNotFound) {
-			return fmt.Errorf("indexer: drop rolled-back graph binding %q: %w", graphID, err)
+	if checkoutID == "" || incarnation == "" {
+		return fmt.Errorf("indexer: rolled-back graph %q has no checkout incarnation", graphID)
+	}
+	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		return err
+	}
+	if !found || graph.OwnerCheckoutID != checkoutID {
+		return nil
+	}
+	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	if err != nil {
+		return err
+	}
+	if !found || checkout.Incarnation != incarnation {
+		return nil
+	}
+	finalize := func(*RepoMetadata) error {
+		deleted, err := l.catalog.DeleteDedicatedGraphForIncarnation(
+			ctx, graphID, checkoutID, incarnation)
+		if err != nil {
+			return err
 		}
+		if !deleted {
+			return fmt.Errorf("%w: rolled-back graph %s was replaced before deletion",
+				store_sqlite.ErrCatalogStaleGuard, graphID)
+		}
+		return nil
+	}
+	if prefix == "" {
+		return finalize(nil)
+	}
+	l.detachWatcher(prefix)
+	if _, _, err := l.mi.purgeRepoChecked(ctx, prefix, finalize); err != nil {
+		err = l.restoreGraphAfterFailedRelease(ctx, graph, checkoutID, incarnation, err)
+		return fmt.Errorf("indexer: purge rolled-back repository %q: %w", prefix, err)
 	}
 	return nil
 }

@@ -87,14 +87,29 @@ func (c Config) Validate() error {
 //
 // Both methods must be idempotent. A saga resumes from its last durable phase,
 // which can re-enter the phase that was already running when the process died.
+// GraphReleaseTarget is the durable identity and filesystem address of one
+// graph cleanup. RepoPrefix and RootPath deliberately survive deletion of the
+// graph row: a restart between the guarded catalog delete and config commit
+// must still be able to finish the same teardown without rediscovering them
+// from the row it just removed.
+type GraphReleaseTarget struct {
+	GraphID     string
+	CheckoutID  string
+	Incarnation string
+	RepoPrefix  string
+	RootPath    string
+}
+
 type CleanupHooks interface {
 	// PurgeCheckoutLayers drops everything built for one incarnation of a
 	// checkout. It is called when an unreachable checkout's availability
 	// grace expires, and again as a phase of forgetting it.
 	PurgeCheckoutLayers(ctx context.Context, checkoutID, incarnation string) error
-	// ReleaseGraph gives up whatever holds a dedicated graph open, so its
-	// catalog row can be deleted.
-	ReleaseGraph(ctx context.Context, graphID string) error
+	// ReleaseGraph gives up whatever holds a dedicated graph open and invokes
+	// finalize while the external repository admission remains closed. The
+	// finalizer performs the guarded catalog delete; a returned error leaves
+	// both the saga and the admission tombstone retryable.
+	ReleaseGraph(ctx context.Context, target GraphReleaseTarget, finalize func() error) error
 }
 
 // InventoryFunc enumerates a checkout family. It has gitstate.Inventory's
