@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -906,23 +907,196 @@ func TestRefViewSupersedesABuildWhoseTreeMoved(t *testing.T) {
 	if view.ActiveGenerationID != 0 || view.ActiveCommit != "" {
 		t.Fatalf("ref view flipped to a superseded build: %+v", view)
 	}
-	generations := f.generations()
-	if len(generations) != 1 || generations[0].State != store_sqlite.ViewGenerationReady {
-		t.Fatalf("generations = %+v, want the moved build's shared candidate kept ready", generations)
+	if generations := f.generations(); len(generations) != 0 {
+		t.Fatalf("generations = %+v, want the moved build's unclaimed candidate retired", generations)
 	}
 	rows := f.builds(view.RefViewID)
 	if len(rows) != 1 || rows[0].State != store_sqlite.ViewGenerationSuperseded || rows[0].GenerationID != 0 {
 		t.Fatalf("build rows = %+v, want the attempt recorded as superseded", rows)
 	}
-	reused, err := manager.EnsureRefView(ctx, f.request("refs/heads/original-tree"))
+	rebuilt, err := manager.EnsureRefView(ctx, f.request("refs/heads/original-tree"))
 	if err != nil {
-		t.Fatalf("reuse moved build's original tree: %v", err)
+		t.Fatalf("rebuild the moved build's original tree: %v", err)
 	}
-	if reused.Built || reused.GenerationID != generations[0].GenerationID {
-		t.Fatalf("reuse = %+v, want cached generation %d", reused, generations[0].GenerationID)
+	if !rebuilt.Built || rebuilt.GenerationID == 0 || rebuilt.State != store_sqlite.RefViewReady {
+		t.Fatalf("rebuild = %+v, want a fresh ready generation", rebuilt)
 	}
-	if builds.Load() != 1 {
-		t.Fatalf("%d builds ran, want only the moved pass", builds.Load())
+	if builds.Load() != 2 {
+		t.Fatalf("%d builds ran, want the moved pass and the later requested tree", builds.Load())
+	}
+}
+
+func TestRefViewRetiresCandidateWhenPublishResolutionFails(t *testing.T) {
+	f := newRefViewFixture(t)
+	commitB, _ := f.commitTree(builderTreeB(), "B")
+	const ref = "refs/heads/feature"
+	f.setRef(ref, commitB)
+
+	manager := f.manager(t, func() {
+		builderGit(t, f.repo, "update-ref", "-d", ref)
+	})
+	result, err := manager.EnsureRefView(context.Background(), f.request(ref))
+	if err == nil {
+		t.Fatalf("selection = %+v, want publish-time resolution failure", result)
+	}
+	if result.State != store_sqlite.RefViewFailed || !result.Built {
+		t.Fatalf("selection = %+v, want a failed result after a completed build", result)
+	}
+	if generations := f.generations(); len(generations) != 0 {
+		t.Fatalf("generations = %+v, want the unclaimed candidate retired", generations)
+	}
+	view := f.view(result.RefViewID)
+	if view.ActiveGenerationID != 0 {
+		t.Fatalf("failed publish changed the active generation: %+v", view)
+	}
+	rows := f.builds(result.RefViewID)
+	if len(rows) != 1 || rows[0].State != store_sqlite.ViewGenerationFailed || rows[0].GenerationID != 0 {
+		t.Fatalf("build rows = %+v, want one failed attempt without a generation", rows)
+	}
+}
+
+func TestRefViewRetiresCandidateWhenReadyClaimDoesNotComplete(t *testing.T) {
+	claimErr := errors.New("forced second ready claim failure")
+	for _, tc := range []struct {
+		name   string
+		second func() (store_sqlite.ReadyGenerationClaim, bool, error)
+		want   error
+	}{
+		{
+			name: "error",
+			second: func() (store_sqlite.ReadyGenerationClaim, bool, error) {
+				return store_sqlite.ReadyGenerationClaim{}, false, claimErr
+			},
+			want: claimErr,
+		},
+		{
+			name: "not_found",
+			second: func() (store_sqlite.ReadyGenerationClaim, bool, error) {
+				return store_sqlite.ReadyGenerationClaim{}, false, nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRefViewFixture(t)
+			commitB, _ := f.commitTree(builderTreeB(), "B")
+			const ref = "refs/heads/feature"
+			f.setRef(ref, commitB)
+
+			manager := f.manager(t, nil)
+			realClaim := manager.claimReadyGeneration
+			var calls atomic.Int64
+			manager.claimReadyGeneration = func(
+				ctx context.Context,
+				req store_sqlite.ClaimReadyGenerationRequest,
+			) (store_sqlite.ReadyGenerationClaim, bool, error) {
+				if calls.Add(1) == 2 {
+					return tc.second()
+				}
+				return realClaim(ctx, req)
+			}
+
+			result, err := manager.EnsureRefView(context.Background(), f.request(ref))
+			if err == nil {
+				t.Fatalf("selection = %+v, want the injected second-claim failure", result)
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("selection error = %v, want %v", err, tc.want)
+			}
+			if calls.Load() != 2 {
+				t.Fatalf("ready claims = %d, want the miss and post-build claim", calls.Load())
+			}
+			if generations := f.generations(); len(generations) != 0 {
+				t.Fatalf("generations = %+v, want the unclaimed candidate retired", generations)
+			}
+			view := f.view(f.viewID(ref))
+			if view.ActiveGenerationID != 0 {
+				t.Fatalf("failed claim changed the active generation: %+v", view)
+			}
+			rows := f.builds(view.RefViewID)
+			if len(rows) != 1 || rows[0].State != store_sqlite.ViewGenerationFailed || rows[0].GenerationID != 0 {
+				t.Fatalf("build rows = %+v, want one failed attempt without a generation", rows)
+			}
+		})
+	}
+}
+
+func TestRefViewRetiresCandidateThatLosesCanonicalClaim(t *testing.T) {
+	f := newRefViewFixture(t)
+	commitB, treeB := f.commitTree(builderTreeB(), "B")
+	const ref = "refs/heads/feature"
+	f.setRef(ref, commitB)
+
+	ctx := context.Background()
+	manager := f.manager(t, nil)
+	base, err := manager.base(ctx, f.graphID)
+	if err != nil {
+		t.Fatalf("resolve primary base: %v", err)
+	}
+	identity := manager.identity("ref-view-cache-competitor", base, treeB)
+	var (
+		winnerID  int64
+		winnerErr error
+	)
+	manager.cacheMissBarrier = func() {
+		winnerID, _, winnerErr = manager.builder.BuildCommitLayer(ctx, CommitLayerRequest{
+			Identity: identity, Base: f.store.AtGeneration(base.generationID), RepoDir: f.repo,
+			BaseTreeOID: base.treeOID, TargetTreeOID: treeB, RootPath: f.repo,
+			RepoPrefix: builderRepoPrefix, WorkspaceID: builderRepoPrefix, ProjectID: builderRepoPrefix,
+		})
+	}
+
+	result, err := manager.EnsureRefView(ctx, f.request(ref))
+	if winnerErr != nil {
+		t.Fatalf("build canonical competitor: %v", winnerErr)
+	}
+	if err != nil {
+		t.Fatalf("selection: %v", err)
+	}
+	if !result.Built || result.State != store_sqlite.RefViewReady || result.GenerationID != winnerID {
+		t.Fatalf("selection = %+v, want canonical competitor %d", result, winnerID)
+	}
+	generations := f.generations()
+	if len(generations) != 1 || generations[0].GenerationID != winnerID || generations[0].State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("generations = %+v, want only canonical winner %d", generations, winnerID)
+	}
+	if view := f.view(result.RefViewID); view.ActiveGenerationID != winnerID {
+		t.Fatalf("active view = %+v, want canonical winner %d", view, winnerID)
+	}
+}
+
+func TestRefViewRepeatedMovesRetainNoCandidates(t *testing.T) {
+	f := newRefViewFixture(t)
+	const attempts = 100
+	commits := f.movingRefHistory(attempts + 1)
+	const ref = "refs/heads/feature"
+	f.setRef(ref, commits[0])
+
+	next := 1
+	manager := f.manager(t, func() {
+		f.setRef(ref, commits[next])
+		next++
+	})
+	ctx := context.Background()
+	for attempt := 0; attempt < attempts; attempt++ {
+		result, err := manager.EnsureRefView(ctx, f.request(ref))
+		if err != nil {
+			t.Fatalf("retry %d: %v", attempt, err)
+		}
+		if result.State != store_sqlite.RefViewBuilding || !result.Built || result.GenerationID != 0 {
+			t.Fatalf("retry %d = %+v, want a finished superseded build", attempt, result)
+		}
+	}
+	if generations := f.generations(); len(generations) != 0 {
+		t.Fatalf("generations after %d retries = %+v, want no unclaimed payload", attempts, generations)
+	}
+	rows := f.builds(f.viewID(ref))
+	if len(rows) != attempts {
+		t.Fatalf("build rows = %d, want %d completed retry records", len(rows), attempts)
+	}
+	for _, row := range rows {
+		if row.State != store_sqlite.ViewGenerationSuperseded || row.GenerationID != 0 {
+			t.Fatalf("retry build retained a generation: %+v", row)
+		}
 	}
 }
 
@@ -1077,6 +1251,56 @@ func TestRefViewRebuildsActiveGenerationAfterSourceWithdrawal(t *testing.T) {
 	}
 	if n := builds.Load(); n != 2 {
 		t.Fatalf("%d build passes ran after recovery reuse, want two", n)
+	}
+}
+
+func (f *refViewFixture) movingRefHistory(count int) []string {
+	f.t.Helper()
+	commits := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		tree := builderTreeB()
+		tree["retry.go"] = "package fixture\n\nconst Retry = " + strconv.Itoa(i) + "\n"
+		commit, _ := f.commitTree(tree, "retry-"+strconv.Itoa(i))
+		commits = append(commits, commit)
+	}
+	return commits
+}
+
+// BenchmarkRefViewCandidateRetirementOnMovedRef measures the expensive retry
+// boundary itself. retained/op makes the resource behavior visible beside
+// latency and allocations: a moved selector must not leave its finished but
+// unclaimed candidate behind.
+func BenchmarkRefViewCandidateRetirementOnMovedRef(b *testing.B) {
+	for _, attempts := range []int{1, 10, 100} {
+		b.Run(strconv.Itoa(attempts), func(b *testing.B) {
+			var retained int
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				f := newRefViewFixture(b)
+				commits := f.movingRefHistory(attempts + 1)
+				f.setRef("refs/heads/feature", commits[0])
+				next := 1
+				manager := f.manager(b, func() {
+					f.setRef("refs/heads/feature", commits[next])
+					next++
+				})
+				ctx := context.Background()
+				b.StartTimer()
+				for attempt := 0; attempt < attempts; attempt++ {
+					result, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+					if err != nil {
+						b.Fatalf("retry %d: %v", attempt, err)
+					}
+					if result.State != store_sqlite.RefViewBuilding || !result.Built {
+						b.Fatalf("retry %d = %+v, want a finished superseded build", attempt, result)
+					}
+				}
+				b.StopTimer()
+				retained += len(f.generations())
+			}
+			b.ReportMetric(float64(retained)/float64(b.N*attempts), "retained/op")
+		})
 	}
 }
 

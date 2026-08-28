@@ -236,6 +236,10 @@ type RefViewManager struct {
 	buildBarrier     func()
 	cacheMissBarrier func()
 
+	// claimReadyGeneration is a deterministic test seam over the two-phase
+	// ready-cache claim. Production always installs the catalog method.
+	claimReadyGeneration func(context.Context, store_sqlite.ClaimReadyGenerationRequest) (store_sqlite.ReadyGenerationClaim, bool, error)
+
 	buildGrace     time.Duration
 	buildHeartbeat time.Duration
 	buildLiveness  time.Duration
@@ -261,19 +265,20 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 		logger = zap.NewNop()
 	}
 	return &RefViewManager{
-		store:            cfg.Store,
-		catalog:          cfg.Store.Catalog(),
-		builder:          cfg.Builder,
-		logger:           logger,
-		gate:             cfg.Gate,
-		configHash:       indexConfigHash(cfg.Config),
-		extractors:       extractorVersionsFingerprint(),
-		buildBarrier:     cfg.buildBarrier,
-		cacheMissBarrier: cfg.cacheMissBarrier,
-		buildGrace:       refViewWindow(cfg.buildGrace, refViewBuildGrace),
-		buildHeartbeat:   refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
-		buildLiveness:    refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
-		writerBudget:     refViewWindow(cfg.writerBudget, refViewWriterBudget),
+		store:                cfg.Store,
+		catalog:              cfg.Store.Catalog(),
+		builder:              cfg.Builder,
+		logger:               logger,
+		gate:                 cfg.Gate,
+		configHash:           indexConfigHash(cfg.Config),
+		extractors:           extractorVersionsFingerprint(),
+		buildBarrier:         cfg.buildBarrier,
+		cacheMissBarrier:     cfg.cacheMissBarrier,
+		claimReadyGeneration: cfg.Store.Catalog().ClaimReadyGeneration,
+		buildGrace:           refViewWindow(cfg.buildGrace, refViewBuildGrace),
+		buildHeartbeat:       refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
+		buildLiveness:        refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
+		writerBudget:         refViewWindow(cfg.writerBudget, refViewWriterBudget),
 	}, nil
 }
 
@@ -893,7 +898,7 @@ func (m *RefViewManager) runBuild(
 ) (RefViewResult, error) {
 	key := m.refReadyGenerationKey(base, resolved.TreeOID)
 	required := commitLayerRequiredCapabilities()
-	claim, found, err := m.catalog.ClaimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
+	claim, found, err := m.claimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
 		Key: key, RequiredCapabilities: required,
 	})
 	if err != nil {
@@ -903,6 +908,7 @@ func (m *RefViewManager) runBuild(
 
 	built := false
 	candidateID := int64(0)
+	retainedGenerationID := int64(0)
 	leaseToken := ""
 	buildIdentity := identity
 	if claim.CapabilityMiss {
@@ -912,7 +918,11 @@ func (m *RefViewManager) runBuild(
 	}
 	if found {
 		leaseToken = claim.LeaseToken
+		retainedGenerationID = claim.WinnerGenerationID
 	}
+	// Register retirement first so the later lease defer releases the
+	// handoff before cleanup tries to retire an unretained candidate.
+	defer func() { m.retireRefReadyCandidate(ctx, candidateID, retainedGenerationID) }()
 	defer func() { m.releaseRefReadyLease(ctx, leaseToken) }()
 
 	if !found {
@@ -953,7 +963,7 @@ func (m *RefViewManager) runBuild(
 	}
 
 	if !found {
-		claim, found, err = m.catalog.ClaimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
+		claim, found, err = m.claimReadyGeneration(ctx, store_sqlite.ClaimReadyGenerationRequest{
 			Key: key, CandidateGenerationID: candidateID, RequiredCapabilities: required,
 		})
 		if err != nil {
@@ -966,6 +976,7 @@ func (m *RefViewManager) runBuild(
 			return RefViewResult{}, err
 		}
 		leaseToken = claim.LeaseToken
+		retainedGenerationID = claim.WinnerGenerationID
 	}
 
 	err = m.catalog.BindReadyGenerationLeaseToRefView(ctx, store_sqlite.BindReadyGenerationLeaseToRefViewRequest{
@@ -979,7 +990,6 @@ func (m *RefViewManager) runBuild(
 	if err != nil {
 		m.releaseRefReadyLease(ctx, leaseToken)
 		leaseToken = ""
-		m.retireRefReadyCandidate(ctx, candidateID, claim.WinnerGenerationID)
 		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
 			return m.retryRefReadyBuild(ctx, build, view, published, built), nil
 		}
@@ -987,7 +997,6 @@ func (m *RefViewManager) runBuild(
 		return RefViewResult{}, err
 	}
 	leaseToken = "" // consumed atomically by bind
-	m.retireRefReadyCandidate(ctx, candidateID, claim.WinnerGenerationID)
 	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewAdopted)
 	return RefViewResult{RefViewID: view.RefViewID, GenerationID: claim.WinnerGenerationID, Resolved: published, State: store_sqlite.RefViewReady, Built: built}, nil
 }
