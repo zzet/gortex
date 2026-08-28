@@ -1931,16 +1931,38 @@ func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 // only the synthetic global externals, which no caller should ever bulk
 // evict, and this can refuse "" the way PurgeRepo already does.
 //
-// Generation-unscoped by design: a repository leaving the store leaves every
-// payload view generation with it, the same rule PurgeRepo follows.
+// EvictRepo follows the graph.Store contract: it removes rows only from the
+// calling handle's logical generation. Repository administration must call
+// EvictRepoAllGenerations (or the sidecar-aware PurgeRepo) explicitly.
 func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	return s.EvictRepoCurrentGeneration(repoPrefix)
+}
+
+// EvictRepoCurrentGeneration replaces one generation without invalidating
+// immutable base/commit/dirty/ref payloads that share the repository prefix.
+func (s *Store) EvictRepoCurrentGeneration(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	return s.evictRepoScope(repoPrefix, evictThisGeneration)
+}
+
+// EvictRepoAllGenerations is the destructive fallback for authoritative
+// repository removal. Prefer PurgeRepo when the backend sidecars must go too.
+// Like PurgeRepo, it refuses an empty prefix because that scope can contain
+// shared global externals and solo-repository data.
+func (s *Store) EvictRepoAllGenerations(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	if repoPrefix == "" {
+		return 0, 0
+	}
+	return s.evictRepoScope(repoPrefix, evictAllGenerations)
+}
+
+func (s *Store) evictRepoScope(repoPrefix string, scope evictScope) (nodesRemoved, edgesRemoved int) {
 	predicate := evictRepoPredicate
 	if repoPrefix != "" {
 		// Make the partial nodes_by_repo predicate explicit so SQLite can use
 		// that compact index for ordinary named repositories.
 		predicate = evictNonEmptyRepoPredicate
 	}
-	return s.evictByPredicate(predicate, repoPrefix, evictAllGenerations)
+	return s.evictByPredicate(predicate, repoPrefix, scope)
 }
 
 // -- reads ---------------------------------------------------------------

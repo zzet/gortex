@@ -134,6 +134,19 @@ type UnresolvedEdgePager interface {
 //     graph-wide resolveMu, disk backends keep a dedicated mutex
 //     alongside their own write serialisation. The returned pointer
 //     is owned by the store and must not be Unlocked when not held.
+//
+// CurrentGenerationRepoEvicter makes replacement scope explicit for stores
+// that multiplex multiple immutable graph generations in one backend.
+type CurrentGenerationRepoEvicter interface {
+	EvictRepoCurrentGeneration(repoPrefix string) (nodesRemoved, edgesRemoved int)
+}
+
+// AllGenerationsRepoEvicter is the destructive repository-administration
+// surface. Callers must use it only when the repository is being forgotten.
+type AllGenerationsRepoEvicter interface {
+	EvictRepoAllGenerations(repoPrefix string) (nodesRemoved, edgesRemoved int)
+}
+
 type Store interface {
 	// --- Writes -----------------------------------------------------
 
@@ -160,6 +173,9 @@ type Store interface {
 	SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (changed int)
 	RemoveEdge(from, to string, kind EdgeKind) bool
 	EvictFile(filePath string) (nodesRemoved, edgesRemoved int)
+	// EvictRepo removes the repository only from this handle's logical
+	// generation. Backends without generations have one logical generation.
+	// Administrative deletion must opt in through AllGenerationsRepoEvicter.
 	EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int)
 
 	// --- Point lookups ---------------------------------------------

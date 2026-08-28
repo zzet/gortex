@@ -2770,11 +2770,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			finishDrainPressure := drainPressure.begin()
 			defer finishDrainPressure()
 			// BulkLoad is INSERT-only. A fresh per-repository Indexer also has
-			// firstIndex=true on warm restart, so remove any persisted rows for
-			// this prefix after the replacement parse succeeds and before its
-			// first disk write. EvictRepo is a no-op on a genuine cold/new repo.
-			if n, e := diskTarget.EvictRepo(idx.RepoPrefix()); n > 0 || e > 0 {
-				idx.logger.Info("indexer: evicted stale repo rows before shadow drain",
+			// firstIndex=true on warm restart, so remove persisted rows only from
+			// this handle's generation after the replacement parse succeeds and
+			// before its first disk write. Immutable payload generations sharing
+			// the prefix remain queryable through their catalog pointers.
+			if n, e := evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix()); n > 0 || e > 0 {
+				idx.logger.Info("indexer: evicted stale generation rows before shadow drain",
 					zap.String("repo", idx.RepoPrefix()),
 					zap.Int("nodes", n), zap.Int("edges", e))
 			}

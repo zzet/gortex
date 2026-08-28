@@ -26,12 +26,12 @@ import (
 // Every method here refuses or excludes ''.
 
 // GENERATION SCOPE — every statement driven by the four table lists in this
-// file is deliberately generation-UNSCOPED, and so is the EvictRepo path in
-// store.go. Untracking or re-keying a repository removes it from the store
-// entirely, not from one payload view of it: a row left behind in another
-// generation would be residue no later call could reach, which is exactly what
-// these sweeps exist to prevent. Ordinary per-repo reads and writes carry the
-// caller's view_gen; these do not.
+// file is deliberately generation-UNSCOPED, as are PurgeRepo and the explicit
+// EvictRepoAllGenerations path in store.go. Untracking or re-keying a repository
+// removes it from the store entirely, not from one payload view of it: a row
+// left behind in another generation would be residue no later call could reach,
+// which is exactly what these sweeps exist to prevent. Ordinary EvictRepo and
+// per-repo reads and writes carry the caller's view_gen; these do not.
 //
 // purgeSidecarTables are the repo_prefix-keyed sidecar tables PurgeRepo
 // clears for a prefix, alongside nodes+edges. Each carries a repo_prefix
@@ -63,12 +63,12 @@ var purgeSidecarTables = []string{
 	"content_fts_rowid",
 }
 
-// PurgeRepo deletes EVERY row a repo owns — nodes, edges, all fifteen
-// repo_prefix-keyed sidecar tables, and vectors — in one
-// transaction. It is the complete form of EvictRepo (which drops only
-// nodes+edges), wired into UntrackRepo so removing a repo from config leaves
-// no residue. Refuses prefix=="" (shared global externals / solo-mode live
-// data — see the file-level INVARIANT).
+// PurgeRepo deletes EVERY row a repo owns — nodes, edges, every
+// repo_prefix-keyed sidecar table, and vectors — across all generations in one
+// transaction. It is the sidecar-complete form of EvictRepoAllGenerations,
+// wired into UntrackRepo so removing a repo from config leaves no residue.
+// Refuses prefix=="" (shared global externals / solo-mode live data — see the
+// file-level INVARIANT).
 func (s *Store) PurgeRepo(prefix string) error {
 	if prefix == "" {
 		return fmt.Errorf("store_sqlite: PurgeRepo refuses empty repo prefix (would delete shared global externals / solo-repo data)")

@@ -14,11 +14,9 @@ const (
 )
 
 // evictScope selects whether an eviction is bound to the handle's payload view
-// generation. A file eviction is a per-checkout operation — it retires the rows
-// the calling handle indexed and must leave every other generation's copy of
-// the same path alone. A repository eviction is administration: the repository
-// leaves the store entirely, so it reaches every generation, exactly like the
-// sweeps in store_purge.go.
+// generation. File replacement and ordinary repository reindexing retire only
+// rows written through the calling handle. Authoritative untrack is the sole
+// repository path that selects every generation, matching store_purge.go.
 type evictScope bool
 
 const (
@@ -144,4 +142,8 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	return nodesRemoved, edgesRemoved, nil
 }
 
-var _ graph.FileBatchEvicter = (*Store)(nil)
+var (
+	_ graph.FileBatchEvicter             = (*Store)(nil)
+	_ graph.CurrentGenerationRepoEvicter = (*Store)(nil)
+	_ graph.AllGenerationsRepoEvicter    = (*Store)(nil)
+)

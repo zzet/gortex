@@ -2236,10 +2236,10 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		return nil, fmt.Errorf("repository not found: %s", repoPrefix)
 	}
 
-	// Evict existing data for this repo before re-indexing. Always — a lone
-	// repo is now stored prefixed (see SetRepoPrefix below), so the eviction
-	// must clear the prefixed slice regardless of repo count.
-	mi.graph.EvictRepo(repoPrefix)
+	// Replace only the base handle's generation before re-indexing. A lone repo
+	// is stored prefixed from its first index, but immutable commit/dirty/ref
+	// payload generations may carry the same prefix and must remain intact.
+	evictRepoCurrentGeneration(mi.graph, repoPrefix)
 
 	mi.configMgr.LoadWorkspaceConfig(repoPrefix, meta.RootPath)
 	cfg := mi.configMgr.GetRepoConfig(repoPrefix)
@@ -3322,23 +3322,35 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 	// corpus commit. The callback holds no mi.mu and releases every SQLite write
 	// transaction before ReplaceHybridVector waits for pinned search readers.
 	var nodesRemoved, edgesRemoved int
+	evictAllGenerations := func() {
+		removedNodes, removedEdges, err := evictRepoAllGenerations(mi.graph, repoPrefix)
+		if err != nil {
+			mi.logger.Error("authoritative repository eviction unavailable",
+				zap.String("prefix", repoPrefix), zap.Error(err))
+			return
+		}
+		nodesRemoved, edgesRemoved = removedNodes, removedEdges
+	}
 	purgeRepo := func() {
 		if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
 			// Prefer the full sidecar-aware purge. It returns no counts, so report
-			// the last-index metadata as the estimate; fall back to EvictRepo on
-			// error. The subsequent empty corpus replacement also cleans legacy
-			// synthetic chunk rows that are not graph node IDs.
+			// the last-index metadata as the estimate; fall back to the explicit
+			// all-generation node/edge removal on error. The subsequent empty
+			// corpus replacement also cleans legacy synthetic chunk rows that are
+			// not graph node IDs.
 			if err := purger.PurgeRepo(repoPrefix); err != nil {
-				mi.logger.Warn("purge repo failed; falling back to node/edge eviction",
+				mi.logger.Warn("purge repo failed; falling back to all-generation node/edge eviction",
 					zap.String("prefix", repoPrefix), zap.Error(err))
-				nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
+				evictAllGenerations()
 			} else {
 				nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
 			}
 			return
 		}
-		// Backends without sidecars are complete after ordinary eviction.
-		nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
+		// A backend without sidecars must still expose the explicit destructive
+		// capability. Falling back to Store.EvictRepo could remove only the active
+		// generation and falsely report an authoritative untrack.
+		evictAllGenerations()
 	}
 	refresh := func(sw *search.Swappable) error {
 		purgeRepo()
