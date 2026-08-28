@@ -139,9 +139,10 @@ func TestDirtySamplerSameCommitDifferentBranchReusesTree(t *testing.T) {
 }
 
 func TestDirtySamplerDetachedAndUnbornHeads(t *testing.T) {
-	t.Run("detached", func(t *testing.T) {
+	t.Run("marker-shaped attached branch", func(t *testing.T) {
 		commands := &scriptedDirtyCommands{results: []dirtyCommandResult{
 			{out: porcelainBranch(testCommitA, "(detached)")},
+			{out: []byte("refs/heads/(detached)\n")},
 			{out: []byte(testTreeA + "\n")},
 		}}
 		sampler := newDirtySampler(t.TempDir(), "", "", commands.run)
@@ -149,8 +150,12 @@ func TestDirtySamplerDetachedAndUnbornHeads(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Sample: %v", err)
 		}
-		if snap.HeadRef != "" || snap.HeadCommit != testCommitA || snap.HeadTree != testTreeA {
-			t.Fatalf("detached head = %+v", snap)
+		if snap.HeadRef != "refs/heads/(detached)" || snap.HeadCommit != testCommitA || snap.HeadTree != testTreeA {
+			t.Fatalf("marker-shaped attached head = %+v", snap)
+		}
+		calls := commands.snapshotCalls()
+		if len(calls) != 3 || !reflect.DeepEqual(calls[1].args, []string{"symbolic-ref", "-q", "HEAD"}) {
+			t.Fatalf("commands = %#v, want status + symbolic-ref + tree", calls)
 		}
 	})
 

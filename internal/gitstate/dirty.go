@@ -160,6 +160,24 @@ func (s *DirtySampler) Sample(ctx context.Context) (DirtySnapshot, error) {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: read status in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
 	}
 	ref, commit, err := parseBranchStatusZ(out)
+	if err == nil && (ref == "(detached)" || ref == "(unknown)") {
+		var symbolic []byte
+		symbolic, err = s.run(ctx, s.root, "symbolic-ref", "-q", "HEAD")
+		switch {
+		case err == nil:
+			ref = strings.TrimSpace(string(symbolic))
+			if ref == "" {
+				err = fmt.Errorf("%w: git symbolic-ref returned an empty HEAD", ErrDirtyUnavailable)
+			}
+		case exitCode(err) == 1 && commit != "":
+			ref = ""
+			err = nil
+		case exitCode(err) == 1:
+			err = fmt.Errorf("%w: detached HEAD without a commit", ErrDirtyUnavailable)
+		default:
+			err = fmt.Errorf("%w: git symbolic-ref HEAD: %w", ErrDirtyUnavailable, err)
+		}
+	}
 	if err != nil {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: read HEAD in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
 	}
@@ -203,6 +221,9 @@ func parseBranchStatusZ(out []byte) (ref, commit string, err error) {
 	var oid, head string
 	for _, chunk := range bytes.Split(out, []byte{0}) {
 		record := string(chunk)
+		if !strings.HasPrefix(record, "# ") {
+			break
+		}
 		switch {
 		case strings.HasPrefix(record, "# branch.oid "):
 			oid = strings.TrimPrefix(record, "# branch.oid ")
@@ -220,20 +241,11 @@ func parseBranchStatusZ(out []byte) (ref, commit string, err error) {
 		commit = oid
 	}
 	switch head {
-	case "(detached)":
-		if commit == "" {
-			return "", "", errors.New("porcelain v2 reported an unborn detached HEAD")
-		}
-	case "(unknown)":
-		return "", "", errors.New("porcelain v2 reported an unknown HEAD")
+	case "(detached)", "(unknown)":
+		return head, commit, nil
 	default:
-		if strings.HasPrefix(head, "refs/") {
-			ref = head
-		} else {
-			ref = "refs/heads/" + head
-		}
+		return "refs/heads/" + head, commit, nil
 	}
-	return ref, commit, nil
 }
 
 // SampleDirty reports how the working tree at dir differs from HEAD.
