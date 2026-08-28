@@ -121,16 +121,37 @@ func (f *refViewFixture) writeCatalogIdentity() {
 		f.t.Fatalf("allocate the checkout: %v", err)
 	}
 
-	err = f.catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
+	dedicated := store_sqlite.DedicatedGraph{
 		GraphID:         f.graphID,
 		OwnerCheckoutID: f.checkoutID,
 		RepoPrefix:      builderRepoPrefix,
 		FamilyID:        f.familyID,
 		IsPrimaryBase:   true,
 		State:           reconcile.GraphStateReady,
+	}
+	if err := f.catalog.UpsertDedicatedGraph(ctx, dedicated); err != nil {
+		f.t.Fatalf("bind the dedicated graph: %v", err)
+	}
+
+	generationID, payload, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      checkoutLayerOwnerKind,
+		GraphID:        f.graphID,
+		LayerID:        "test-primary-base",
+		CheckoutID:     f.checkoutID,
+		GenerationKind: "dedicated",
+		TreeOID:        f.treeA,
+		CreatedAt:      now,
 	})
 	if err != nil {
-		f.t.Fatalf("bind the dedicated graph: %v", err)
+		f.t.Fatalf("begin the primary generation: %v", err)
+	}
+	builderIndex(f.t, payload, f.repo)
+	if err := f.store.PublishPayloadGeneration(ctx, generationID, now+1); err != nil {
+		f.t.Fatalf("publish the primary generation: %v", err)
+	}
+	dedicated.ActiveGenerationID = generationID
+	if err := f.catalog.UpsertDedicatedGraph(ctx, dedicated); err != nil {
+		f.t.Fatalf("activate the primary generation: %v", err)
 	}
 }
 

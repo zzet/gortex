@@ -253,8 +253,8 @@ func TestViewsHealthCountsTheCatalogsPopulation(t *testing.T) {
 	if got := health.Checkouts["checkout_ready"]; got != 2 {
 		t.Fatalf("ready checkouts = %d, want 2 (primary + worktree): %v", got, health.Checkouts)
 	}
-	if got := health.Generations["ready"]; got != 2 {
-		t.Fatalf("ready generations = %d, want 2 (commit + dirty): %v", got, health.Generations)
+	if got := health.Generations["ready"]; got != 3 {
+		t.Fatalf("ready generations = %d, want 3 (dedicated base + commit + dirty): %v", got, health.Generations)
 	}
 	if health.Leases != 0 {
 		t.Fatalf("leases = %d, want 0 with no view materialized", health.Leases)

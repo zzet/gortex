@@ -968,32 +968,87 @@ func (c *CheckoutCoordinator) abandonBuild(ctx context.Context, generationID int
 // primary's working tree, and the difference between the two shows through at
 // exactly the paths the primary has edited and the checkout has not.
 func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, error) {
-	if c.graphID != "" {
-		dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, c.graphID)
-		if err != nil {
-			return primaryBase{}, err
-		}
-		if !found || dedicated.FamilyID != c.familyID {
-			return primaryBase{}, fmt.Errorf("%w: dedicated graph %s",
-				store_sqlite.ErrCatalogNotFound, c.graphID)
-		}
-		return graphBase(ctx, c.catalog, dedicated)
+	if c.graphID == "" {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"family %s has no designated primary graph", c.familyID)
 	}
-	graphs, err := c.catalog.ListDedicatedGraphs(ctx, c.familyID)
+
+	designated, found, err := c.catalog.GetDedicatedGraph(ctx, c.graphID)
 	if err != nil {
-		return primaryBase{}, err
+		return primaryBase{}, newPrimaryBaseUnavailable(err,
+			"load designated graph %s", c.graphID)
 	}
-	var primary *store_sqlite.DedicatedGraph
-	for i := range graphs {
-		if graphs[i].IsPrimaryBase {
-			primary = &graphs[i]
-			break
-		}
+	if !found {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"designated graph %s does not exist", c.graphID)
 	}
-	if primary == nil {
-		return primaryBase{}, fmt.Errorf("indexer: family %s has no primary dedicated graph", c.familyID)
+	if designated.FamilyID != c.familyID {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"designated graph %s belongs to family %s, not %s",
+			c.graphID, designated.FamilyID, c.familyID)
 	}
-	return graphBase(ctx, c.catalog, *primary)
+	requiresFamilyPrimary := designated.OwnerCheckoutID != c.checkoutID
+	if requiresFamilyPrimary && !designated.IsPrimaryBase {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"designated graph %s is not the family primary", c.graphID)
+	}
+	if designated.OwnerCheckoutID == "" {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"designated graph %s has no owner checkout", c.graphID)
+	}
+
+	owned, found, err := c.catalog.GetDedicatedGraphByOwner(ctx, designated.OwnerCheckoutID)
+	if err != nil {
+		return primaryBase{}, newPrimaryBaseUnavailable(err,
+			"load graph owned by checkout %s", designated.OwnerCheckoutID)
+	}
+	if !found {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"owner checkout %s has no dedicated graph", designated.OwnerCheckoutID)
+	}
+	if owned.GraphID != designated.GraphID {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"owner checkout %s resolves graph %s, not %s",
+			designated.OwnerCheckoutID, owned.GraphID, designated.GraphID)
+	}
+	if owned.FamilyID != c.familyID {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"owned graph %s belongs to family %s, not %s",
+			owned.GraphID, owned.FamilyID, c.familyID)
+	}
+	if owned.OwnerCheckoutID != designated.OwnerCheckoutID {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"owned graph %s names checkout %s, not %s",
+			owned.GraphID, owned.OwnerCheckoutID, designated.OwnerCheckoutID)
+	}
+	if requiresFamilyPrimary && !owned.IsPrimaryBase {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"owned graph %s is not the family primary", owned.GraphID)
+	}
+	return graphBase(ctx, c.catalog, owned)
+}
+
+type primaryBaseUnavailableError struct {
+	reason string
+	cause  error
+}
+
+func (e *primaryBaseUnavailableError) Error() string {
+	if e.cause == nil {
+		return "indexer: primary base unavailable: " + e.reason
+	}
+	return fmt.Sprintf("indexer: primary base unavailable: %s: %v", e.reason, e.cause)
+}
+
+func (e *primaryBaseUnavailableError) Unwrap() error { return e.cause }
+
+func (*primaryBaseUnavailableError) Temporary() bool { return true }
+
+func newPrimaryBaseUnavailable(cause error, format string, args ...any) error {
+	return &primaryBaseUnavailableError{
+		reason: fmt.Sprintf(format, args...),
+		cause:  cause,
+	}
 }
 
 // graphBase resolves the corpus state a layer over one dedicated graph sits
@@ -1006,28 +1061,51 @@ func graphBase(
 	catalog *store_sqlite.Catalog,
 	dedicated store_sqlite.DedicatedGraph,
 ) (primaryBase, error) {
-	out := primaryBase{graphID: dedicated.GraphID}
-	if dedicated.ActiveGenerationID > 0 {
-		row, found, err := catalog.GetViewGeneration(ctx, dedicated.ActiveGenerationID)
-		if err != nil {
-			return primaryBase{}, err
-		}
-		if found {
-			out.generationID = row.GenerationID
-			out.treeOID = row.TreeOID
-			return out, nil
-		}
+	if dedicated.GraphID == "" {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"dedicated graph has no graph ID")
 	}
-	owner, found, err := catalog.GetCheckout(ctx, dedicated.OwnerCheckoutID)
+	if dedicated.ActiveGenerationID <= 0 {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"primary graph %s has no active generation", dedicated.GraphID)
+	}
+
+	row, found, err := catalog.GetViewGeneration(ctx, dedicated.ActiveGenerationID)
 	if err != nil {
-		return primaryBase{}, err
+		return primaryBase{}, newPrimaryBaseUnavailable(err,
+			"load active generation %d for graph %s",
+			dedicated.ActiveGenerationID, dedicated.GraphID)
 	}
-	if !found || owner.HeadTree == "" {
-		return primaryBase{}, fmt.Errorf(
-			"indexer: primary graph %s names no committed tree to build over", dedicated.GraphID)
+	if !found {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"primary graph %s points to missing generation %d",
+			dedicated.GraphID, dedicated.ActiveGenerationID)
 	}
-	out.treeOID = owner.HeadTree
-	return out, nil
+	if row.GenerationID != dedicated.ActiveGenerationID {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"primary graph %s points to generation %d, catalog returned %d",
+			dedicated.GraphID, dedicated.ActiveGenerationID, row.GenerationID)
+	}
+	if row.GraphID != dedicated.GraphID {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"active generation %d belongs to graph %s, not %s",
+			row.GenerationID, row.GraphID, dedicated.GraphID)
+	}
+	if !servableGeneration(row.State) {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"active generation %d for graph %s is %s",
+			row.GenerationID, dedicated.GraphID, row.State)
+	}
+	if row.TreeOID == "" {
+		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+			"active generation %d for graph %s has no immutable tree",
+			row.GenerationID, dedicated.GraphID)
+	}
+	return primaryBase{
+		graphID:      dedicated.GraphID,
+		generationID: row.GenerationID,
+		treeOID:      row.TreeOID,
+	}, nil
 }
 
 // ensureRoute reads the checkout's route, installing one when the checkout has

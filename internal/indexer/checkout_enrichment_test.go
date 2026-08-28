@@ -122,6 +122,7 @@ func (f *coordinatorFixture) secondWorktree(
 		CheckoutID:   checkout.CheckoutID,
 		CheckoutRoot: root,
 		FamilyID:     f.familyID,
+		GraphID:      f.graphID,
 		RepoPrefix:   builderRepoPrefix,
 		WorkspaceID:  builderRepoPrefix,
 		ProjectID:    builderRepoPrefix,

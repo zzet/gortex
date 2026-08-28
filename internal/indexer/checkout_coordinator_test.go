@@ -145,16 +145,37 @@ func (f *coordinatorFixture) writeCatalogIdentity() {
 		f.t.Fatalf("allocate the automatic checkout: %v", err)
 	}
 
-	err = f.catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
+	dedicated := store_sqlite.DedicatedGraph{
 		GraphID:         f.graphID,
 		OwnerCheckoutID: f.primaryID,
 		RepoPrefix:      builderRepoPrefix,
 		FamilyID:        f.familyID,
 		IsPrimaryBase:   true,
 		State:           reconcile.GraphStateReady,
+	}
+	if err := f.catalog.UpsertDedicatedGraph(ctx, dedicated); err != nil {
+		f.t.Fatalf("bind the primary dedicated graph: %v", err)
+	}
+
+	generationID, payload, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      checkoutLayerOwnerKind,
+		GraphID:        f.graphID,
+		LayerID:        "test-primary-base",
+		CheckoutID:     f.primaryID,
+		GenerationKind: "dedicated",
+		TreeOID:        f.treeA,
+		CreatedAt:      now,
 	})
 	if err != nil {
-		f.t.Fatalf("bind the primary dedicated graph: %v", err)
+		f.t.Fatalf("begin the primary generation: %v", err)
+	}
+	builderIndex(f.t, payload, f.primary)
+	if err := f.store.PublishPayloadGeneration(ctx, generationID, now+1); err != nil {
+		f.t.Fatalf("publish the primary generation: %v", err)
+	}
+	dedicated.ActiveGenerationID = generationID
+	if err := f.catalog.UpsertDedicatedGraph(ctx, dedicated); err != nil {
+		f.t.Fatalf("activate the primary generation: %v", err)
 	}
 }
 
@@ -166,6 +187,7 @@ func (f *coordinatorFixture) coordinator(t *testing.T, cfg CheckoutCoordinatorCo
 	cfg.CheckoutID = f.checkoutID
 	cfg.CheckoutRoot = f.worktree
 	cfg.FamilyID = f.familyID
+	cfg.GraphID = f.graphID
 	cfg.RepoPrefix = builderRepoPrefix
 	cfg.WorkspaceID = builderRepoPrefix
 	cfg.ProjectID = builderRepoPrefix
@@ -262,17 +284,20 @@ func (f *coordinatorFixture) generation(id int64) (store_sqlite.ViewGeneration, 
 	return row, found
 }
 
-// generations enumerates every generation the catalog holds. Generation ids
-// are a dense autoincrement sequence and a retired one leaves a hole, so the
-// walk covers a fixed range rather than stopping at the first gap. No test
-// here builds anywhere near that many.
+// generations enumerates every generation the checkout coordinator owns. The
+// primary's immutable dedicated generation is fixture infrastructure, not an
+// attempt or routed layer produced by the coordinator, so it is excluded from
+// assertions about coordinator output. Generation ids are a dense autoincrement
+// sequence and a retired one leaves a hole, so the walk covers a fixed range.
 func (f *coordinatorFixture) generations() []store_sqlite.ViewGeneration {
 	f.t.Helper()
 	var out []store_sqlite.ViewGeneration
 	for id := int64(1); id <= 64; id++ {
-		if row, found := f.generation(id); found {
-			out = append(out, row)
+		row, found := f.generation(id)
+		if !found || (row.GenerationKind == "dedicated" && row.CheckoutID == f.primaryID) {
+			continue
 		}
+		out = append(out, row)
 	}
 	return out
 }
