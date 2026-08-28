@@ -531,22 +531,28 @@ func TestControllerAnswersTheFileCoverageVerb(t *testing.T) {
 }
 
 func TestTopologyNudgeRunsImmediatelyAndKeepsATrailingEvent(t *testing.T) {
+	testenv.Sandbox(t)
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	calls := make(chan string, 3)
+	releases := make(chan string, 4)
+	callOrdinal := 0
 	controller := &realController{
 		// A recent probe nudge must not suppress a filesystem event.
 		probeNudgedAt: map[string]time.Time{"family": time.Now()},
 	}
 	controller.probeReconcile = func(familyID string) {
+		callOrdinal++
 		calls <- familyID
-		if len(calls) == 1 {
+		if callOrdinal == 1 {
 			close(firstStarted)
 			<-releaseFirst
 		}
 	}
 
-	controller.nudgeFamilyTopology("family")
+	controller.nudgeFamilyTopologyRequest(context.Background(), "family", func() {
+		releases <- "running"
+	})
 	select {
 	case <-firstStarted:
 	case <-time.After(time.Second):
@@ -554,9 +560,34 @@ func TestTopologyNudgeRunsImmediatelyAndKeepsATrailingEvent(t *testing.T) {
 	}
 
 	// A burst during the active pass is coalesced to exactly one trailing
-	// reconciliation rather than discarded by the probe debounce.
-	controller.nudgeFamilyTopology("family")
-	controller.nudgeFamilyTopology("family")
+	// reconciliation rather than discarded by the probe debounce. The latest
+	// event's values survive cancellation so teardown reached by that trailing
+	// pass can still identify its exact MultiWatcher dispatch.
+	type topologyContextKey struct{}
+	firstPending, cancel := context.WithCancel(context.WithValue(
+		context.Background(), topologyContextKey{}, "first-pending"))
+	controller.nudgeFamilyTopologyRequest(firstPending, "family", func() {
+		releases <- "superseded"
+	})
+	cancel()
+	controller.nudgeFamilyTopologyRequest(context.WithValue(
+		context.Background(), topologyContextKey{}, "latest-pending"), "family", func() {
+		releases <- "trailing"
+	})
+	select {
+	case released := <-releases:
+		assert.Equal(t, "superseded", released)
+	case <-time.After(time.Second):
+		t.Fatal("superseded pending lease was not released promptly")
+	}
+	controller.topologyNudgeMu.Lock()
+	pendingRequest := controller.topologyNudges["family"].pending
+	controller.topologyNudgeMu.Unlock()
+	require.NotNil(t, pendingRequest)
+	pendingContext := pendingRequest.ctx
+	require.NotNil(t, pendingContext)
+	assert.NoError(t, pendingContext.Err())
+	assert.Equal(t, "latest-pending", pendingContext.Value(topologyContextKey{}))
 	close(releaseFirst)
 
 	for want := 0; want < 2; want++ {
@@ -569,11 +600,63 @@ func TestTopologyNudgeRunsImmediatelyAndKeepsATrailingEvent(t *testing.T) {
 			t.Fatalf("received %d reconciliation calls, want two", want)
 		}
 	}
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case released := <-releases:
+			seen[released] = true
+		case <-time.After(time.Second):
+			t.Fatalf("completed releases = %v, want running and trailing", seen)
+		}
+	}
+	assert.True(t, seen["running"])
+	assert.True(t, seen["trailing"])
 	select {
 	case familyID := <-calls:
 		t.Fatalf("unexpected third reconciliation for %q", familyID)
+	case released := <-releases:
+		t.Fatalf("lease %q released more than once", released)
 	case <-time.After(25 * time.Millisecond):
 	}
+}
+
+func TestTopologyNudgeReleasesRejectedRequest(t *testing.T) {
+	controller := &realController{}
+	released := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	controller.nudgeFamilyTopologyRequest(ctx, "family", func() { released <- struct{}{} })
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("rejected topology request retained its lease")
+	}
+}
+
+func TestTopologyNudgePanicReleasesCurrentAndPending(t *testing.T) {
+	controller := &realController{topologyNudges: make(map[string]*topologyNudgeState)}
+	released := make(chan string, 2)
+	current := newTopologyNudgeRequest(context.Background(), func() { released <- "current" })
+	pending := newTopologyNudgeRequest(context.Background(), func() { released <- "pending" })
+	controller.topologyNudges["family"] = &topologyNudgeState{pending: &pending}
+
+	assert.Panics(t, func() {
+		controller.runTopologyNudgeLoop(func(context.Context, string) {
+			panic("topology reconcile panic")
+		}, "family", current)
+	})
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-released:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatalf("panic releases = %v, want current and pending", seen)
+		}
+	}
+	assert.True(t, seen["current"])
+	assert.True(t, seen["pending"])
+	assert.Empty(t, controller.topologyNudges)
 }
 
 // TestAttachedWatcherDiscoversAndForgetsLinkedWorktree exercises the complete
@@ -779,6 +862,43 @@ func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, primaryGraphFound, "forgetting an automatic worktree removed its primary graph")
 	assert.Equal(t, registration.CheckoutID, primaryGraph.OwnerCheckoutID)
+
+	// The linked watcher is gone, so the primary is again this family's sole
+	// topology owner. Make its authoritative disappearance already eligible
+	// for cleanup, then re-register the real controller callback to raise a
+	// deterministic startup dispatch. Reconciliation removes the current owner
+	// through its retained async lease; losing that context deadlocks here.
+	primaryCheckout, found, err := catalog.GetCheckout(ctx, registration.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	now := time.Now().Unix()
+	primaryCheckout.State = store_sqlite.CheckoutStateRemovalGrace
+	primaryCheckout.RemovalDetectedAt = now - 2
+	primaryCheckout.RemovalDeadline = now - 1
+	primaryCheckout.RemovalEvidence = "test: authoritative primary disappearance"
+	require.NoError(t, catalog.UpsertCheckout(ctx, primaryCheckout))
+	require.NoError(t, os.Rename(primaryRoot, primaryRoot+"-vanished"))
+	controller.AttachWatcher(watcher)
+
+	require.Eventually(t, func() bool {
+		_, checkoutFound, checkoutErr := catalog.GetCheckout(ctx, registration.CheckoutID)
+		_, graphFound, graphErr := catalog.GetDedicatedGraph(ctx, registration.GraphID)
+		return checkoutErr == nil && graphErr == nil && !checkoutFound && !graphFound
+	}, 15*time.Second, 20*time.Millisecond,
+		"current-owner topology reconciliation did not forget the vanished primary")
+	require.Eventually(t, func() bool {
+		controller.topologyNudgeMu.Lock()
+		defer controller.topologyNudgeMu.Unlock()
+		return len(controller.topologyNudges) == 0
+	}, 5*time.Second, 10*time.Millisecond,
+		"current-owner topology reconciliation did not release its retained lease")
+
+	// Quiesce in production teardown order before testing.TempDir starts
+	// removing config and store paths. Registered cleanups repeat these
+	// idempotent stops, then detach the already-stopped watcher pointer.
+	controller.StopWatcher()
+	require.NoError(t, lifecycle.Close())
+	controller.AttachWatcher(nil)
 }
 
 func runTopologyGitCommand(t *testing.T, dir string, args ...string) {

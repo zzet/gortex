@@ -285,6 +285,84 @@ func TestCheckoutLifecycleCloseToleratesUninitializedTransitionOwner(t *testing.
 	require.NoError(t, lifecycle.Close(), "Close remains idempotent")
 }
 
+func TestCheckoutLifecycleCloseWaitsForAdmittedFamilyRetry(t *testing.T) {
+	fixture := newLifecycleFixture(t)
+	t.Cleanup(fixture.close)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+
+	fixture.lc.retryMu.Lock()
+	fixture.lc.familyRetryBarrier = func() {
+		close(entered)
+		<-release
+	}
+	deadline := fixture.lc.now().Add(time.Hour).Unix()
+	fixture.lc.familyRetries["admitted-family-retry"] = familyRetry{
+		deadline: deadline,
+		timer:    time.NewTimer(time.Hour),
+	}
+	fixture.lc.retryMu.Unlock()
+
+	retryDone := make(chan struct{})
+	go func() {
+		defer close(retryDone)
+		fixture.lc.runFamilyRetry("admitted-family-retry", deadline)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("family retry was not admitted")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- fixture.lc.Close() }()
+	require.Eventually(t, func() bool {
+		fixture.lc.retryMu.Lock()
+		defer fixture.lc.retryMu.Unlock()
+		return fixture.lc.retryClosing
+	}, 2*time.Second, time.Millisecond, "Close did not close retry admission")
+
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the admitted retry completed: %v", err)
+	default:
+	}
+	fixture.lc.scheduleFamilyRetryAt("during-close", fixture.lc.now().Add(time.Hour).Unix())
+	fixture.lc.retryMu.Lock()
+	_, scheduledDuringClose := fixture.lc.familyRetries["during-close"]
+	fixture.lc.retryMu.Unlock()
+	require.False(t, scheduledDuringClose, "Close must reject new family retries")
+
+	unblock()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after the admitted retry completed")
+	}
+	select {
+	case <-retryDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("family retry did not finish")
+	}
+
+	fixture.lc.retryMu.Lock()
+	fixture.lc.familyRetryBarrier = nil
+	fixture.lc.retryMu.Unlock()
+	afterCloseDeadline := fixture.lc.now().Add(time.Hour).Unix()
+	fixture.lc.scheduleFamilyRetryAt("after-close", afterCloseDeadline)
+	fixture.lc.retryMu.Lock()
+	afterClose, scheduledAfterClose := fixture.lc.familyRetries["after-close"]
+	fixture.lc.retryMu.Unlock()
+	require.True(t, scheduledAfterClose, "Close must restore retry admission for lifecycle reuse")
+	require.Equal(t, afterCloseDeadline, afterClose.deadline)
+	require.NoError(t, fixture.lc.Close())
+}
+
 // volumeEvidenceUsable reports whether this platform's path evidence carries
 // the volume identity that separates "this root was deleted" from "the volume
 // it lived on is not mounted right now".

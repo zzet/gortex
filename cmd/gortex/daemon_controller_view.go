@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -56,9 +57,36 @@ func noopRelease() {}
 // reconciliation dozens of times a minute while the first one still runs.
 const probeReconcileDebounce = 30 * time.Second
 
+type topologyNudgeLease struct {
+	once    sync.Once
+	release func()
+}
+
+type topologyNudgeRequest struct {
+	ctx   context.Context
+	lease *topologyNudgeLease
+}
+
+func newTopologyNudgeRequest(ctx context.Context, release func()) topologyNudgeRequest {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	request := topologyNudgeRequest{ctx: context.WithoutCancel(ctx)}
+	if release != nil {
+		request.lease = &topologyNudgeLease{release: release}
+	}
+	return request
+}
+
+func (request *topologyNudgeRequest) finish() {
+	if request == nil || request.lease == nil {
+		return
+	}
+	request.lease.once.Do(request.lease.release)
+}
+
 type topologyNudgeState struct {
-	running bool
-	pending bool
+	pending *topologyNudgeRequest
 }
 
 // resolveProbeView decides which graph answers a probe about path.
@@ -382,15 +410,31 @@ func (c *realController) nudgeFamily(familyID string) {
 // the watched administration directory, so there may be no later event to
 // recover a dropped nudge.
 func (c *realController) nudgeFamilyTopology(familyID string) {
+	c.nudgeFamilyTopologyContext(context.Background(), familyID)
+}
+
+func (c *realController) nudgeFamilyTopologyContext(ctx context.Context, familyID string) {
+	c.nudgeFamilyTopologyRequest(ctx, familyID, nil)
+}
+
+func (c *realController) nudgeFamilyTopologyRequest(ctx context.Context, familyID string, release func()) {
+	request := newTopologyNudgeRequest(ctx, release)
 	if c == nil || familyID == "" {
+		request.finish()
 		return
 	}
-	run := c.probeReconcile
-	if run == nil {
-		if c.lifecycle == nil {
+	run := func(runCtx context.Context, id string) {
+		if c.probeReconcile != nil {
+			c.probeReconcile(id)
 			return
 		}
-		run = c.reconcileFamilyForProbe
+		if c.lifecycle != nil {
+			c.reconcileFamilyForProbeContext(runCtx, id)
+		}
+	}
+	if c.probeReconcile == nil && c.lifecycle == nil {
+		request.finish()
+		return
 	}
 
 	c.topologyNudgeMu.Lock()
@@ -398,29 +442,54 @@ func (c *realController) nudgeFamilyTopology(familyID string) {
 		c.topologyNudges = make(map[string]*topologyNudgeState)
 	}
 	if state := c.topologyNudges[familyID]; state != nil {
-		state.pending = true
+		superseded := state.pending
+		state.pending = &request
+		c.topologyNudgeMu.Unlock()
+		superseded.finish()
+		return
+	}
+	c.topologyNudges[familyID] = &topologyNudgeState{}
+	c.topologyNudgeMu.Unlock()
+
+	go c.runTopologyNudgeLoop(run, familyID, request)
+}
+
+func (c *realController) runTopologyNudgeLoop(
+	run func(context.Context, string), familyID string, current topologyNudgeRequest,
+) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			c.topologyNudgeMu.Lock()
+			state := c.topologyNudges[familyID]
+			var pending *topologyNudgeRequest
+			if state != nil {
+				pending = state.pending
+				delete(c.topologyNudges, familyID)
+			}
+			c.topologyNudgeMu.Unlock()
+			pending.finish()
+			panic(recovered)
+		}
+	}()
+
+	for {
+		func() {
+			defer current.finish()
+			run(current.ctx, familyID)
+		}()
+
+		c.topologyNudgeMu.Lock()
+		state := c.topologyNudges[familyID]
+		if state != nil && state.pending != nil {
+			current = *state.pending
+			state.pending = nil
+			c.topologyNudgeMu.Unlock()
+			continue
+		}
+		delete(c.topologyNudges, familyID)
 		c.topologyNudgeMu.Unlock()
 		return
 	}
-	c.topologyNudges[familyID] = &topologyNudgeState{running: true}
-	c.topologyNudgeMu.Unlock()
-
-	go func() {
-		for {
-			run(familyID)
-
-			c.topologyNudgeMu.Lock()
-			state := c.topologyNudges[familyID]
-			if state != nil && state.pending {
-				state.pending = false
-				c.topologyNudgeMu.Unlock()
-				continue
-			}
-			delete(c.topologyNudges, familyID)
-			c.topologyNudgeMu.Unlock()
-			return
-		}
-	}()
 }
 
 // claimFamilyNudge reports whether this caller won the right to reconcile the
@@ -442,7 +511,14 @@ func (c *realController) claimFamilyNudge(familyID string) bool {
 // failure is logged and dropped: the janitor asks the same question on its own
 // schedule, and a probe must not turn a reconciliation failure into an answer.
 func (c *realController) reconcileFamilyForProbe(familyID string) {
-	if _, err := c.lifecycle.ReconcileFamily(context.Background(), familyID); err != nil && c.logger != nil {
+	c.reconcileFamilyForProbeContext(context.Background(), familyID)
+}
+
+func (c *realController) reconcileFamilyForProbeContext(ctx context.Context, familyID string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := c.lifecycle.ReconcileFamily(ctx, familyID); err != nil && c.logger != nil {
 		c.logger.Debug("probe view: reconciling the family failed",
 			zap.String("family", familyID), zap.Error(err))
 	}

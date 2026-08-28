@@ -1763,16 +1763,17 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 	if mw == nil {
 		return
 	}
-	mw.OnWorktreeChange(func(repoPrefix, _ string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		familyID, err := c.lifecycle.ResolveFamilyID(ctx, repoPrefix)
+	mw.OnWorktreeChangeContext(func(dispatchCtx context.Context, repoPrefix, _ string) {
+		resolveCtx, cancel := context.WithTimeout(dispatchCtx, 10*time.Second)
+		familyID, err := c.lifecycle.ResolveFamilyID(resolveCtx, repoPrefix)
 		cancel()
 		if err != nil {
 			c.logger.Debug("worktree topology event could not resolve family",
 				zap.String("repo", repoPrefix), zap.Error(err))
 			return
 		}
-		c.nudgeFamilyTopology(familyID)
+		retainedCtx, release := mw.RetainTopologyDispatch(dispatchCtx)
+		c.nudgeFamilyTopologyRequest(retainedCtx, familyID, release)
 	})
 }
 

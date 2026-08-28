@@ -67,6 +67,14 @@ type RepoWatcher interface {
 	RemoveRepo(repoPrefix string) error
 }
 
+// contextRepoWatcher lets topology reconciliation propagate its exact dispatch
+// lease into watcher teardown. Ordinary RepoWatcher implementations retain the
+// synchronous legacy contract.
+type contextRepoWatcher interface {
+	AddRepoContext(ctx context.Context, repoPrefix string, cfg config.WatchConfig) error
+	RemoveRepoContext(ctx context.Context, repoPrefix string) error
+}
+
 // CheckoutLifecycleConfig is what the lifecycle needs to own its side effects.
 type CheckoutLifecycleConfig struct {
 	// MultiIndexer is the corpus the lifecycle indexes into and evicts from.
@@ -134,9 +142,16 @@ type CheckoutLifecycle struct {
 
 	// retryMu owns one deadline timer per family. Filesystem events start the
 	// grace; these timers guarantee its expiry is reconciled even when Git is
-	// otherwise quiet.
+	// otherwise quiet. retryClosing rejects new timer and callback admission
+	// while Close joins callbacks that fired before the gate closed.
+	retryCloseMu  sync.Mutex
 	retryMu       sync.Mutex
+	retryClosing  bool
+	retryWG       sync.WaitGroup
 	familyRetries map[string]familyRetry
+	// familyRetryBarrier runs after a fired retry is admitted and counted.
+	// It is a deterministic shutdown test seam; nil in production.
+	familyRetryBarrier func()
 
 	// coordMu guards the coordinator registry alone. It is separate from mu
 	// because dropping a coordinator waits for its in-flight build, and
@@ -409,7 +424,7 @@ func (l *CheckoutLifecycle) Register(
 		out.CheckoutID, out.Incarnation = identity.checkoutID, identity.incarnation
 		out.FamilyID, out.GraphID = identity.familyID, identity.graphID
 		out.CatalogErr = catalogErr
-		l.attachWatcher(out.Prefix)
+		l.attachWatcherContext(ctx, out.Prefix)
 		l.saveConfig("track")
 		l.reconcileFamilyNow(ctx, out.FamilyID, absPath)
 		l.notifyTrackedSetChanged()
@@ -433,7 +448,7 @@ func (l *CheckoutLifecycle) Register(
 		if result != nil && result.RepoPrefix != "" {
 			out.Prefix = result.RepoPrefix
 		}
-		l.attachWatcher(out.Prefix)
+		l.attachWatcherContext(ctx, out.Prefix)
 		l.saveConfig("track")
 		l.notifyTrackedSetChanged()
 		return out, nil
@@ -507,7 +522,7 @@ func (l *CheckoutLifecycle) RecordImplicit(ctx context.Context, root string) err
 	defer l.beginBatch()()
 
 	identity, err := l.recordCheckout(ctx, prefix, root, TrackSourceImplicit, false)
-	l.attachWatcher(prefix)
+	l.attachWatcherContext(ctx, prefix)
 	l.reconcileFamilyNow(ctx, identity.familyID, root)
 	l.notifyTrackedSetChanged()
 	return err
@@ -1358,6 +1373,9 @@ func (l *CheckoutLifecycle) scheduleFamilyRetryAt(familyID string, deadline int6
 	}
 	l.retryMu.Lock()
 	defer l.retryMu.Unlock()
+	if l.retryClosing {
+		return
+	}
 	if current, ok := l.familyRetries[familyID]; ok {
 		if current.deadline == deadline {
 			return
@@ -1381,13 +1399,19 @@ func (l *CheckoutLifecycle) scheduleFamilyRetryAt(familyID string, deadline int6
 func (l *CheckoutLifecycle) runFamilyRetry(familyID string, deadline int64) {
 	l.retryMu.Lock()
 	current, ok := l.familyRetries[familyID]
-	if !ok || current.deadline != deadline {
+	if !ok || current.deadline != deadline || l.retryClosing {
 		l.retryMu.Unlock()
 		return
 	}
 	delete(l.familyRetries, familyID)
+	l.retryWG.Add(1)
+	barrier := l.familyRetryBarrier
 	l.retryMu.Unlock()
+	defer l.retryWG.Done()
 
+	if barrier != nil {
+		barrier()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	_, err := l.ReconcileFamily(ctx, familyID)
 	cancel()
@@ -1890,12 +1914,24 @@ func (l *CheckoutLifecycle) Close() error {
 	l.transitionMu.Unlock()
 	l.transitionWG.Wait()
 
+	// Serialize the retry phase of concurrent Close calls. The admission gate
+	// and WaitGroup share retryMu, so no callback can Add after this goroutine
+	// starts waiting, and no new timer can be published until Close returns.
+	l.retryCloseMu.Lock()
+	defer l.retryCloseMu.Unlock()
 	l.retryMu.Lock()
+	l.retryClosing = true
 	for familyID, retry := range l.familyRetries {
 		retry.timer.Stop()
 		delete(l.familyRetries, familyID)
 	}
 	l.retryMu.Unlock()
+	l.retryWG.Wait()
+	defer func() {
+		l.retryMu.Lock()
+		l.retryClosing = false
+		l.retryMu.Unlock()
+	}()
 
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
@@ -2341,7 +2377,7 @@ func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ str
 	if prefix == "" {
 		return nil
 	}
-	h.l.detachWatcher(prefix)
+	h.l.detachWatcherContext(ctx, prefix)
 	return nil
 }
 
@@ -2436,7 +2472,7 @@ func (l *CheckoutLifecycle) evictRepoCheckedFinalized(
 		}
 		return 0, 0, nil
 	}
-	l.detachWatcher(prefix)
+	l.detachWatcherContext(ctx, prefix)
 	finalize := func(meta *RepoMetadata) error {
 		// Commit the guarded catalog delete before removing durable tracking
 		// intent. A delete failure therefore leaves config untouched; if the
@@ -2492,11 +2528,25 @@ func (l *CheckoutLifecycle) evictRepo(
 // leaves an indexed but unwatched repository, which is queryable and only
 // goes stale on edit — not a reason to fail the track.
 func (l *CheckoutLifecycle) attachWatcher(prefix string) {
+	l.attachWatcherContext(context.Background(), prefix)
+}
+
+func (l *CheckoutLifecycle) attachWatcherContext(ctx context.Context, prefix string) {
 	watcher := l.watcher()
 	if watcher == nil || prefix == "" || l.cfgMgr == nil {
 		return
 	}
-	if err := watcher.AddRepo(prefix, l.cfgMgr.GetRepoConfig(prefix).Watch); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cfg := l.cfgMgr.GetRepoConfig(prefix).Watch
+	var err error
+	if contextWatcher, ok := watcher.(contextRepoWatcher); ok {
+		err = contextWatcher.AddRepoContext(ctx, prefix, cfg)
+	} else {
+		err = watcher.AddRepo(prefix, cfg)
+	}
+	if err != nil {
 		l.logger.Warn("checkout lifecycle: attach watcher failed",
 			zap.String("prefix", prefix), zap.Error(err))
 	}
@@ -2506,11 +2556,24 @@ func (l *CheckoutLifecycle) attachWatcher(prefix string) {
 // is not an error worth reporting: every teardown path calls it, and the
 // second call is the idempotent one.
 func (l *CheckoutLifecycle) detachWatcher(prefix string) {
+	l.detachWatcherContext(context.Background(), prefix)
+}
+
+func (l *CheckoutLifecycle) detachWatcherContext(ctx context.Context, prefix string) {
 	watcher := l.watcher()
 	if watcher == nil || prefix == "" {
 		return
 	}
-	if err := watcher.RemoveRepo(prefix); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var err error
+	if contextWatcher, ok := watcher.(contextRepoWatcher); ok {
+		err = contextWatcher.RemoveRepoContext(ctx, prefix)
+	} else {
+		err = watcher.RemoveRepo(prefix)
+	}
+	if err != nil {
 		l.logger.Debug("checkout lifecycle: detach watcher",
 			zap.String("prefix", prefix), zap.Error(err))
 	}

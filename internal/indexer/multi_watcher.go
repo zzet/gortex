@@ -25,17 +25,66 @@ type topologyDispatchEpoch struct {
 	drainedClosed bool
 }
 
+type topologyDispatchContextKey struct{}
+
+type topologyDispatchToken struct {
+	mw     *MultiWatcher
+	epoch  *topologyDispatchEpoch
+	active bool
+}
+
+// WorktreeChangeCallback receives a private dispatch context. Teardown reached
+// synchronously from the callback must propagate this context so MultiWatcher
+// can defer only that callback's exact lease without weakening ordinary Stop
+// and RemoveRepo completion boundaries.
+type WorktreeChangeCallback func(ctx context.Context, repoPrefix, rootPath string)
+
 type admittedTopologyDispatch struct {
 	mw       *MultiWatcher
 	epoch    *topologyDispatchEpoch
-	callback func(repoPrefix, rootPath string)
+	token    *topologyDispatchToken
+	callback WorktreeChangeCallback
 	prefix   string
 	rootPath string
 }
 
 func (dispatch admittedTopologyDispatch) invoke() {
-	defer dispatch.mw.releaseTopologyDispatch(dispatch.epoch)
-	dispatch.callback(dispatch.prefix, dispatch.rootPath)
+	ctx := context.WithValue(context.Background(), topologyDispatchContextKey{}, dispatch.token)
+	defer dispatch.mw.releaseTopologyDispatch(dispatch.epoch, dispatch.token)
+	dispatch.callback(ctx, dispatch.prefix, dispatch.rootPath)
+}
+
+type watcherForwarder struct {
+	cancel chan struct{}
+	done   chan struct{}
+}
+
+type watcherRetirement struct {
+	prefix        string
+	watcher       *Watcher
+	gitWatcher    *GitWatcher
+	forwarder     *watcherForwarder
+	started       bool
+	topologyDrain <-chan struct{}
+	done          chan struct{}
+	err           error
+}
+
+type pendingWatcherAdd struct {
+	cfg config.WatchConfig
+}
+
+type watcherStopTarget struct {
+	prefix  string
+	watcher *Watcher
+}
+
+type multiWatcherStopPlan struct {
+	topologyDrains []<-chan struct{}
+	forwarders     []*watcherForwarder
+	watchers       []watcherStopTarget
+	gitWatchers    []*GitWatcher
+	retirements    []*watcherRetirement
 }
 
 type topologyWatchFamily struct {
@@ -60,6 +109,9 @@ type MultiWatcher struct {
 	topologyFamilies     map[string]*topologyWatchFamily     // canonical common dir → family
 	topologyFamilyByRepo map[string]string                   // repo prefix → canonical common dir
 	topologyDispatches   map[*topologyDispatchEpoch]struct{} // accepting or draining epochs
+	forwarders           map[string]*watcherForwarder        // repo prefix → joined event forwarder
+	retiringWatchers     map[string]*watcherRetirement       // repo prefix → removal tombstone
+	pendingWatcherAdds   map[string]*pendingWatcherAdd       // coalesced reentrant replacement intent
 	multi                *MultiIndexer
 	logger               *zap.Logger
 	events               chan GraphChangeEvent
@@ -82,7 +134,7 @@ type MultiWatcher struct {
 	// AddRepo) so a watcher entering a degraded state — inotify / FD
 	// exhaustion — pushes a single health notice through the daemon.
 	degradedCb       func(reason string)
-	worktreeChangeCb func(repoPrefix, rootPath string)
+	worktreeChangeCb WorktreeChangeCallback
 }
 
 // NewMultiWatcher creates a MultiWatcher that watches all configured repos.
@@ -100,6 +152,9 @@ func NewMultiWatcher(
 		topologyFamilies:     make(map[string]*topologyWatchFamily),
 		topologyFamilyByRepo: make(map[string]string),
 		topologyDispatches:   make(map[*topologyDispatchEpoch]struct{}),
+		forwarders:           make(map[string]*watcherForwarder),
+		retiringWatchers:     make(map[string]*watcherRetirement),
+		pendingWatcherAdds:   make(map[string]*pendingWatcherAdd),
 		multi:                mi,
 		logger:               logger,
 		events:               make(chan GraphChangeEvent, 128),
@@ -233,21 +288,30 @@ func (mw *MultiWatcher) admitWorktreeTopologyChange(prefix string, gw *GitWatche
 	if !current || callback == nil {
 		return admittedTopologyDispatch{}, false
 	}
+	token := &topologyDispatchToken{mw: mw, epoch: epoch, active: true}
 	epoch.inFlight++
 	return admittedTopologyDispatch{
 		mw:       mw,
 		epoch:    epoch,
+		token:    token,
 		callback: callback,
 		prefix:   prefix,
 		rootPath: rootPath,
 	}, true
 }
 
-func (mw *MultiWatcher) releaseTopologyDispatch(epoch *topologyDispatchEpoch) {
+func (mw *MultiWatcher) releaseTopologyDispatch(epoch *topologyDispatchEpoch, token *topologyDispatchToken) {
 	if epoch == nil {
 		return
 	}
 	mw.mu.Lock()
+	if token != nil {
+		if !token.active {
+			mw.mu.Unlock()
+			return
+		}
+		token.active = false
+	}
 	if epoch.inFlight > 0 {
 		epoch.inFlight--
 	}
@@ -255,6 +319,46 @@ func (mw *MultiWatcher) releaseTopologyDispatch(epoch *topologyDispatchEpoch) {
 		mw.finishTopologyDispatchEpochLocked(epoch)
 	}
 	mw.mu.Unlock()
+}
+
+// RetainTopologyDispatch transfers one exact admitted callback lease to
+// asynchronous reconciliation. The returned release is idempotent and must be
+// called after that reconciliation is run, rejected, or superseded.
+func (mw *MultiWatcher) RetainTopologyDispatch(ctx context.Context) (context.Context, func()) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	retainedContext := context.WithoutCancel(ctx)
+
+	mw.mu.Lock()
+	token := mw.activeTopologyDispatchTokenLocked(ctx)
+	if token == nil {
+		mw.mu.Unlock()
+		return retainedContext, func() {}
+	}
+	retained := &topologyDispatchToken{mw: mw, epoch: token.epoch, active: true}
+	retained.epoch.inFlight++
+	mw.mu.Unlock()
+
+	retainedContext = context.WithValue(retainedContext, topologyDispatchContextKey{}, retained)
+	var once sync.Once
+	return retainedContext, func() {
+		once.Do(func() { mw.releaseTopologyDispatch(retained.epoch, retained) })
+	}
+}
+
+func (mw *MultiWatcher) activeTopologyDispatchTokenLocked(ctx context.Context) *topologyDispatchToken {
+	if ctx == nil {
+		return nil
+	}
+	token, _ := ctx.Value(topologyDispatchContextKey{}).(*topologyDispatchToken)
+	if token == nil || token.mw != mw || token.epoch == nil || !token.active {
+		return nil
+	}
+	if _, exists := mw.topologyDispatches[token.epoch]; !exists {
+		return nil
+	}
+	return token
 }
 
 func (mw *MultiWatcher) topologyDispatchDrainsLocked() []<-chan struct{} {
@@ -406,6 +510,12 @@ func (mw *MultiWatcher) unregisterTopologyWatcherLocked(prefix string) <-chan st
 	}
 	if wasOwner {
 		mw.electTopologyOwnerLocked(family)
+		if promoted := family.members[family.owner]; promoted != nil {
+			// Demotion cancels the retired owner's debounce timer. Always queue
+			// one coalesced new-epoch nudge so a pending topology mutation is not
+			// lost merely because ownership moved during its debounce window.
+			promoted.scheduleTopologyChange("owner-transfer")
+		}
 	}
 	return drain
 }
@@ -526,19 +636,168 @@ func (mw *MultiWatcher) Start() error {
 			topologyDrains = append(topologyDrains, drain)
 		}
 		// Forward events from this watcher and trigger cross-repo resolution.
-		go mw.forwardEvents(res.prefix, res.w)
+		mw.startForwarderLocked(res.prefix, res.w)
 	}
 
 	return nil
 }
 
+func (mw *MultiWatcher) startForwarderLocked(prefix string, w *Watcher) *watcherForwarder {
+	if w == nil || mw.stopped {
+		return nil
+	}
+	forwarder := &watcherForwarder{cancel: make(chan struct{}), done: make(chan struct{})}
+	if mw.forwarders == nil {
+		mw.forwarders = make(map[string]*watcherForwarder)
+	}
+	mw.forwarders[prefix] = forwarder
+	go mw.forwardEvents(prefix, w, forwarder)
+	return forwarder
+}
+
+func (mw *MultiWatcher) cancelForwarderLocked(prefix string) *watcherForwarder {
+	forwarder := mw.forwarders[prefix]
+	if forwarder == nil {
+		return nil
+	}
+	delete(mw.forwarders, prefix)
+	close(forwarder.cancel)
+	return forwarder
+}
+
+func waitWatcherForwarders(forwarders ...*watcherForwarder) {
+	for _, forwarder := range forwarders {
+		if forwarder != nil {
+			<-forwarder.done
+		}
+	}
+}
+
+func (mw *MultiWatcher) finishWatcherRetirement(retirement *watcherRetirement, err error) {
+	mw.mu.Lock()
+	retirement.err = err
+	if current := mw.retiringWatchers[retirement.prefix]; current == retirement {
+		delete(mw.retiringWatchers, retirement.prefix)
+	}
+	close(retirement.done)
+	mw.mu.Unlock()
+}
+
+func (mw *MultiWatcher) completeWatcherRetirement(retirement *watcherRetirement) error {
+	if retirement == nil {
+		return nil
+	}
+	waitTopologyDispatchDrains(retirement.topologyDrain)
+	waitWatcherForwarders(retirement.forwarder)
+
+	var firstErr error
+	if retirement.started && retirement.watcher != nil {
+		if err := retirement.watcher.Stop(); err != nil {
+			firstErr = err
+			if mw.logger != nil {
+				mw.logger.Warn("error stopping retired watcher",
+					zap.String("prefix", retirement.prefix),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+	if retirement.gitWatcher != nil {
+		if err := retirement.gitWatcher.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	mw.finishWatcherRetirement(retirement, firstErr)
+	return firstErr
+}
+
+func waitWatcherRetirements(retirements ...*watcherRetirement) {
+	for _, retirement := range retirements {
+		if retirement != nil {
+			<-retirement.done
+		}
+	}
+}
+
+func (mw *MultiWatcher) queuePendingWatcherAddLocked(repoPrefix string, cfg config.WatchConfig) {
+	if pending := mw.pendingWatcherAdds[repoPrefix]; pending != nil {
+		pending.cfg = cfg
+		return
+	}
+	pending := &pendingWatcherAdd{cfg: cfg}
+	mw.pendingWatcherAdds[repoPrefix] = pending
+	go mw.runPendingWatcherAdd(repoPrefix, pending)
+}
+
+func (mw *MultiWatcher) runPendingWatcherAdd(repoPrefix string, pending *pendingWatcherAdd) {
+	backoff := 25 * time.Millisecond
+	for {
+		mw.mu.Lock()
+		if mw.stopped || mw.pendingWatcherAdds[repoPrefix] != pending {
+			mw.mu.Unlock()
+			return
+		}
+		if retirement := mw.retiringWatchers[repoPrefix]; retirement != nil {
+			done := retirement.done
+			mw.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-mw.done:
+				return
+			}
+		}
+		if _, exists := mw.watchers[repoPrefix]; exists {
+			delete(mw.pendingWatcherAdds, repoPrefix)
+			mw.mu.Unlock()
+			return
+		}
+		cfg := pending.cfg
+		mw.mu.Unlock()
+
+		if err := mw.AddRepoContext(context.Background(), repoPrefix, cfg); err == nil {
+			mw.mu.Lock()
+			if mw.pendingWatcherAdds[repoPrefix] == pending {
+				delete(mw.pendingWatcherAdds, repoPrefix)
+			}
+			mw.mu.Unlock()
+			return
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+			if backoff < time.Second {
+				backoff *= 2
+				if backoff > time.Second {
+					backoff = time.Second
+				}
+			}
+		case <-mw.done:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
+}
+
 // forwardEvents reads events from a per-repo watcher and forwards them to the
-// merged events channel. Cross-repository resolution already completed inside
-// the originating watcher's coordinated mutation tail.
-func (mw *MultiWatcher) forwardEvents(_ string, w *Watcher) {
+// merged events channel. Each registration has an explicit cancel/join pair;
+// Watcher.Stop does not close its events channel, so relying on that channel
+// retained removed watchers and their indexers until global Stop.
+func (mw *MultiWatcher) forwardEvents(_ string, w *Watcher, forwarder *watcherForwarder) {
+	defer close(forwarder.done)
 	for {
 		select {
 		case <-mw.done:
+			return
+		case <-forwarder.cancel:
+			return
+		case <-w.done:
 			return
 		case ev, ok := <-w.Events():
 			if !ok {
@@ -548,6 +807,10 @@ func (mw *MultiWatcher) forwardEvents(_ string, w *Watcher) {
 			case mw.events <- ev:
 			case <-mw.done:
 				return
+			case <-forwarder.cancel:
+				return
+			case <-w.done:
+				return
 			default:
 			}
 		}
@@ -556,9 +819,24 @@ func (mw *MultiWatcher) forwardEvents(_ string, w *Watcher) {
 
 // Stop halts all per-repo watchers and cleans up resources.
 func (mw *MultiWatcher) Stop() error {
+	return mw.StopContext(context.Background())
+}
+
+// StopContext preserves the synchronous Stop boundary for ordinary callers.
+// A topology callback carrying this MultiWatcher's exact private dispatch token
+// cannot wait on its own lease; it hands completion to one joinable worker and
+// returns only for that reentrant path. Every external and concurrent caller
+// still waits for callback drain plus all physical watcher stops.
+func (mw *MultiWatcher) StopContext(ctx context.Context) error {
 	mw.mu.Lock()
+	token := mw.activeTopologyDispatchTokenLocked(ctx)
 	if mw.stopped {
 		completed := mw.stopDone
+		if token != nil {
+			err := mw.stopErr
+			mw.mu.Unlock()
+			return err
+		}
 		mw.mu.Unlock()
 		if completed != nil {
 			<-completed
@@ -575,47 +853,82 @@ func (mw *MultiWatcher) Stop() error {
 	for _, family := range mw.topologyFamilies {
 		mw.invalidateTopologyDispatchEpochLocked(family)
 	}
-	drains := mw.topologyDispatchDrainsLocked()
-
-	type watcherStop struct {
-		prefix string
-		w      *Watcher
+	plan := multiWatcherStopPlan{
+		topologyDrains: mw.topologyDispatchDrainsLocked(),
+		watchers:       make([]watcherStopTarget, 0, len(mw.watchers)),
+		gitWatchers:    make([]*GitWatcher, 0, len(mw.gitWatchers)),
+		forwarders:     make([]*watcherForwarder, 0, len(mw.forwarders)),
+		retirements:    make([]*watcherRetirement, 0, len(mw.retiringWatchers)),
 	}
-	watchers := make([]watcherStop, 0, len(mw.watchers))
 	for prefix, w := range mw.watchers {
 		if mw.started[prefix] {
-			watchers = append(watchers, watcherStop{prefix: prefix, w: w})
+			plan.watchers = append(plan.watchers, watcherStopTarget{prefix: prefix, watcher: w})
 		}
 	}
-	gitWatchers := make([]*GitWatcher, 0, len(mw.gitWatchers))
 	for _, gw := range mw.gitWatchers {
 		if gw == nil {
 			continue
 		}
 		gw.OnWorktreeChange(nil)
 		gw.setTopologyOwner(false)
-		gitWatchers = append(gitWatchers, gw)
+		plan.gitWatchers = append(plan.gitWatchers, gw)
 	}
+	for prefix, forwarder := range mw.forwarders {
+		delete(mw.forwarders, prefix)
+		close(forwarder.cancel)
+		plan.forwarders = append(plan.forwarders, forwarder)
+	}
+	for _, retirement := range mw.retiringWatchers {
+		plan.retirements = append(plan.retirements, retirement)
+	}
+	mw.pendingWatcherAdds = make(map[string]*pendingWatcherAdd)
 	mw.topologyFamilies = make(map[string]*topologyWatchFamily)
 	mw.topologyFamilyByRepo = make(map[string]string)
+	reentrant := token != nil
 	mw.mu.Unlock()
 
-	// Do not hold mw.mu while an admitted external callback or a watcher Stop
-	// runs. Invalidation prevents new admissions; draining supplies the return
-	// boundary promised by Stop, including for concurrent idempotent callers.
-	waitTopologyDispatchDrains(drains...)
+	if reentrant {
+		go mw.completeStop(plan)
+		return nil
+	}
+	return mw.completeStop(plan)
+}
+
+func (mw *MultiWatcher) completeStop(plan multiWatcherStopPlan) error {
+	// Callback drain precedes every physical stop so an already-admitted
+	// reconciliation cannot touch a stopped watcher or stale controller state.
+	waitTopologyDispatchDrains(plan.topologyDrains...)
+	waitWatcherForwarders(plan.forwarders...)
+
 	var firstErr error
-	for _, entry := range watchers {
-		if err := entry.w.Stop(); err != nil && firstErr == nil {
+	for _, entry := range plan.watchers {
+		if err := entry.watcher.Stop(); err != nil && firstErr == nil {
 			firstErr = err
-			mw.logger.Warn("error stopping watcher",
-				zap.String("prefix", entry.prefix),
-				zap.Error(err),
-			)
+			if mw.logger != nil {
+				mw.logger.Warn("error stopping watcher",
+					zap.String("prefix", entry.prefix),
+					zap.Error(err),
+				)
+			}
 		}
 	}
-	for _, gw := range gitWatchers {
-		_ = gw.Stop()
+	for _, gw := range plan.gitWatchers {
+		if err := gw.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// Removals that won the mutex before Stop own their physical watchers.
+	// Their tombstones remain registered until both Watcher.Stop and
+	// GitWatcher.Stop finish, making them part of the global Stop boundary.
+	waitWatcherRetirements(plan.retirements...)
+	if firstErr == nil {
+		for _, retirement := range plan.retirements {
+			if retirement != nil && retirement.err != nil {
+				firstErr = retirement.err
+				break
+			}
+		}
 	}
 
 	mw.mu.Lock()
@@ -709,10 +1022,23 @@ func (mw *MultiWatcher) OnDegraded(cb func(reason string)) {
 	}
 }
 
-// OnWorktreeChange registers a callback for changes to a Git family's
-// checkout topology. Existing Git watchers are updated and nudged once so the
-// inventory-to-watch startup window cannot lose an addition.
+// OnWorktreeChange registers a legacy callback for changes to a Git family's
+// checkout topology. Callbacks that can reach teardown must instead use
+// OnWorktreeChangeContext and propagate its context.
 func (mw *MultiWatcher) OnWorktreeChange(cb func(repoPrefix, rootPath string)) {
+	if cb == nil {
+		mw.OnWorktreeChangeContext(nil)
+		return
+	}
+	mw.OnWorktreeChangeContext(func(_ context.Context, repoPrefix, rootPath string) {
+		cb(repoPrefix, rootPath)
+	})
+}
+
+// OnWorktreeChangeContext registers a context-aware topology callback. The
+// context carries a private exact-dispatch token used only to break teardown
+// cycles caused by that callback; ordinary callers retain synchronous drains.
+func (mw *MultiWatcher) OnWorktreeChangeContext(cb WorktreeChangeCallback) {
 	type registered struct {
 		prefix string
 		gw     *GitWatcher
@@ -815,111 +1141,207 @@ func (mw *MultiWatcher) WatchedRepos() (live, configured int) {
 
 // AddRepo creates and starts a watcher for a newly tracked repo.
 func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error {
-	mw.mu.Lock()
-	var topologyDrain <-chan struct{}
-	defer func() {
-		mw.mu.Unlock()
-		waitTopologyDispatchDrains(topologyDrain)
-	}()
-	if mw.stopped {
-		return fmt.Errorf("multi-watcher is stopped")
-	}
+	return mw.AddRepoContext(context.Background(), repoPrefix, cfg)
+}
 
-	if _, exists := mw.watchers[repoPrefix]; exists {
-		return fmt.Errorf("watcher already exists for repo: %s", repoPrefix)
-	}
+// AddRepoContext serializes replacement with authoritative removal. Ordinary
+// callers join the retiring prefix and retry. An exact topology callback cannot
+// join a retirement that is waiting for that callback's lease, so it records a
+// coalesced replacement intent that is completed immediately after retirement.
+func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, cfg config.WatchConfig) error {
+	waitedForRetirement := false
+	for {
+		mw.mu.Lock()
+		if mw.stopped {
+			mw.mu.Unlock()
+			return fmt.Errorf("multi-watcher is stopped")
+		}
+		token := mw.activeTopologyDispatchTokenLocked(ctx)
+		if retirement := mw.retiringWatchers[repoPrefix]; retirement != nil {
+			if token != nil && retirement.topologyDrain == token.epoch.drained {
+				mw.queuePendingWatcherAddLocked(repoPrefix, cfg)
+				mw.mu.Unlock()
+				return nil
+			}
+			done := retirement.done
+			mw.mu.Unlock()
+			// Replacement intent is a state transition, not a best-effort
+			// request. Once accepted it survives caller cancellation.
+			<-done
+			waitedForRetirement = true
+			continue
+		}
+		if _, exists := mw.watchers[repoPrefix]; exists {
+			mw.mu.Unlock()
+			if waitedForRetirement {
+				// A coalesced callback replacement or another waiter won the race.
+				// The requested post-retirement state already exists.
+				return nil
+			}
+			return fmt.Errorf("watcher already exists for repo: %s", repoPrefix)
+		}
 
-	if err := mw.createWatcher(repoPrefix, cfg); err != nil {
-		mw.logger.Warn("failed to add watcher for repo",
-			zap.String("prefix", repoPrefix),
-			zap.Error(err),
-		)
-		return err
-	}
+		var topologyDrain <-chan struct{}
+		if err := mw.createWatcher(repoPrefix, cfg); err != nil {
+			if mw.logger != nil {
+				mw.logger.Warn("failed to add watcher for repo",
+					zap.String("prefix", repoPrefix),
+					zap.Error(err),
+				)
+			}
+			mw.mu.Unlock()
+			return err
+		}
 
-	w := mw.watchers[repoPrefix]
-	meta := mw.multi.GetMetadata(repoPrefix)
-	if meta == nil {
-		return fmt.Errorf("repository metadata not found: %s", repoPrefix)
-	}
+		w := mw.watchers[repoPrefix]
+		meta := mw.multi.GetMetadata(repoPrefix)
+		if meta == nil {
+			delete(mw.watchers, repoPrefix)
+			mw.mu.Unlock()
+			return fmt.Errorf("repository metadata not found: %s", repoPrefix)
+		}
 
-	if err := w.Start([]string{meta.RootPath}); err != nil {
-		delete(mw.watchers, repoPrefix)
-		return fmt.Errorf("starting watcher for %s: %w", repoPrefix, err)
-	}
+		if err := w.Start([]string{meta.RootPath}); err != nil {
+			delete(mw.watchers, repoPrefix)
+			mw.mu.Unlock()
+			return fmt.Errorf("starting watcher for %s: %w", repoPrefix, err)
+		}
 
-	mw.started[repoPrefix] = true
-	delete(mw.startFailures, repoPrefix)
-	if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
-		if gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", repoPrefix))); err == nil {
-			gw.setTopologyOwner(false)
-			mw.configureGitWatcher(repoPrefix, gw)
-			if err := gw.Start(); err == nil {
-				topologyDrain = mw.installStartedGitWatcherLocked(repoPrefix, gw)
-			} else {
-				_ = gw.Stop()
+		mw.started[repoPrefix] = true
+		delete(mw.startFailures, repoPrefix)
+		if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
+			logger := mw.logger
+			if logger == nil {
+				logger = zap.NewNop()
+			}
+			if gw, err := NewGitWatcher(meta.RootPath, idx, logger.With(zap.String("repo", repoPrefix))); err == nil {
+				gw.setTopologyOwner(false)
+				mw.configureGitWatcher(repoPrefix, gw)
+				if err := gw.Start(); err == nil {
+					topologyDrain = mw.installStartedGitWatcherLocked(repoPrefix, gw)
+				} else {
+					_ = gw.Stop()
+				}
 			}
 		}
-	}
 
-	// Apply any previously-registered symbol-change callback so a repo
-	// added at runtime contributes to get_symbol_history just like the
-	// repos created at MultiWatcher construction time.
-	mw.callbackMu.Lock()
-	cb := mw.symbolChangeCb
-	degradedCb := mw.degradedCb
-	mw.callbackMu.Unlock()
-	if cb != nil {
-		w.OnSymbolChange(cb)
+		// Apply any previously-registered callbacks so a runtime replacement
+		// contributes exactly like a watcher created at construction time.
+		mw.callbackMu.Lock()
+		cb := mw.symbolChangeCb
+		degradedCb := mw.degradedCb
+		mw.callbackMu.Unlock()
+		if cb != nil {
+			w.OnSymbolChange(cb)
+		}
+		if degradedCb != nil {
+			w.OnDegraded(degradedCb)
+		}
+		mw.startForwarderLocked(repoPrefix, w)
+		mw.mu.Unlock()
+		waitTopologyDispatchDrains(topologyDrain)
+		return nil
 	}
-	if degradedCb != nil {
-		w.OnDegraded(degradedCb)
-	}
-
-	go mw.forwardEvents(repoPrefix, w)
-	return nil
 }
 
 // RemoveRepo stops and removes the watcher for a repo.
 func (mw *MultiWatcher) RemoveRepo(repoPrefix string) error {
+	return mw.RemoveRepoContext(context.Background(), repoPrefix)
+}
+
+// RemoveRepoContext publishes a per-prefix tombstone before removing active
+// map entries. That tombstone spans callback drain, forwarder join, and both
+// physical watcher stops, preventing a replacement from overlapping teardown.
+func (mw *MultiWatcher) RemoveRepoContext(ctx context.Context, repoPrefix string) error {
 	mw.mu.Lock()
+	token := mw.activeTopologyDispatchTokenLocked(ctx)
+	_, canceledPendingAdd := mw.pendingWatcherAdds[repoPrefix]
+	if canceledPendingAdd {
+		// A later remove supersedes an accepted but not-yet-installed
+		// replacement. The worker checks pointer identity under this mutex, so
+		// deleting the intent prevents resurrection after this call returns.
+		delete(mw.pendingWatcherAdds, repoPrefix)
+	}
 	w, exists := mw.watchers[repoPrefix]
 	if !exists {
+		retirement := mw.retiringWatchers[repoPrefix]
+		stopping := mw.stopped
+		stopDone := mw.stopDone
+		if retirement != nil {
+			if token != nil && retirement.topologyDrain == token.epoch.drained {
+				mw.mu.Unlock()
+				return nil
+			}
+			done := retirement.done
+			mw.mu.Unlock()
+			<-done
+			return retirement.err
+		}
+		if stopping {
+			if token != nil {
+				mw.mu.Unlock()
+				return nil
+			}
+			mw.mu.Unlock()
+			if stopDone != nil {
+				<-stopDone
+			}
+			return nil
+		}
 		mw.mu.Unlock()
+		if canceledPendingAdd {
+			return nil
+		}
 		return fmt.Errorf("no watcher for repo: %s", repoPrefix)
 	}
-	stopping := mw.stopped
-	stopDone := mw.stopDone
-	started := mw.started[repoPrefix]
-	gw := mw.gitWatchers[repoPrefix]
-	var drain <-chan struct{}
-	if !stopping && gw != nil {
-		drain = mw.unregisterTopologyWatcherLocked(repoPrefix)
-	}
-	delete(mw.gitWatchers, repoPrefix)
-	delete(mw.watchers, repoPrefix)
-	delete(mw.started, repoPrefix)
-	delete(mw.startFailures, repoPrefix)
-	mw.mu.Unlock()
 
-	if stopping {
-		// Stop captured this watcher before publishing stopped. It owns teardown;
-		// waiting avoids a concurrent second close of Watcher's done channel.
+	if mw.stopped {
+		stopDone := mw.stopDone
+		delete(mw.gitWatchers, repoPrefix)
+		delete(mw.watchers, repoPrefix)
+		delete(mw.started, repoPrefix)
+		delete(mw.startFailures, repoPrefix)
+		if token != nil {
+			mw.mu.Unlock()
+			return nil
+		}
+		mw.mu.Unlock()
 		if stopDone != nil {
 			<-stopDone
 		}
 		return nil
 	}
 
-	// An owner transfer is already visible, but the removed epoch's admitted
-	// callback must finish before this removal boundary returns.
-	waitTopologyDispatchDrains(drain)
-	var err error
-	if started {
-		err = w.Stop()
-	}
+	started := mw.started[repoPrefix]
+	gw := mw.gitWatchers[repoPrefix]
+	var drain <-chan struct{}
 	if gw != nil {
-		_ = gw.Stop()
+		drain = mw.unregisterTopologyWatcherLocked(repoPrefix)
 	}
-	return err
+	forwarder := mw.cancelForwarderLocked(repoPrefix)
+	retirement := &watcherRetirement{
+		prefix:        repoPrefix,
+		watcher:       w,
+		gitWatcher:    gw,
+		forwarder:     forwarder,
+		started:       started,
+		topologyDrain: drain,
+		done:          make(chan struct{}),
+	}
+	if mw.retiringWatchers == nil {
+		mw.retiringWatchers = make(map[string]*watcherRetirement)
+	}
+	mw.retiringWatchers[repoPrefix] = retirement
+	delete(mw.gitWatchers, repoPrefix)
+	delete(mw.watchers, repoPrefix)
+	delete(mw.started, repoPrefix)
+	delete(mw.startFailures, repoPrefix)
+	reentrant := token != nil && drain == token.epoch.drained
+	mw.mu.Unlock()
+
+	if reentrant {
+		go mw.completeWatcherRetirement(retirement)
+		return nil
+	}
+	return mw.completeWatcherRetirement(retirement)
 }
