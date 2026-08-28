@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/google/renameio"
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/llm"
@@ -20,6 +21,9 @@ var (
 	// globalConfigMu serialises in-memory repository-list mutations with Save,
 	// so concurrent tracker workers cannot race each other or YAML snapshots.
 	globalConfigMu sync.Mutex
+	// globalConfigWriteFile is a test seam around atomic replacement. Production
+	// always points at renameio.WriteFile.
+	globalConfigWriteFile = renameio.WriteFile
 
 	// projectNameRe matches valid project names: alphanumeric, hyphens, underscores.
 	projectNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -293,23 +297,22 @@ func (gc *GlobalConfig) ConfigPath() string {
 func (gc *GlobalConfig) Save() error {
 	globalConfigMu.Lock()
 	defer globalConfigMu.Unlock()
+	return saveGlobalConfigLocked(gc)
+}
 
+func saveGlobalConfigLocked(gc *GlobalConfig) error {
 	path := gc.ConfigPath()
-
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("creating config directory %s: %w", dir, err)
 	}
-
 	data, err := yaml.Marshal(gc)
 	if err != nil {
 		return fmt.Errorf("marshaling global config: %w", err)
 	}
-
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := globalConfigWriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("writing global config to %s: %w", path, err)
 	}
-
 	return nil
 }
 
@@ -516,6 +519,77 @@ func (gc *GlobalConfig) RemoveRepoIfPresent(path string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// RemoveRepoAndSaveIfPresent removes a repository from a candidate copy,
+// atomically replaces the config file, and publishes the in-memory list only
+// after that durable write succeeds. A failed write therefore retains both
+// control-plane representations for an idempotent cleanup retry.
+func (gc *GlobalConfig) RemoveRepoAndSaveIfPresent(path string) (bool, error) {
+	globalConfigMu.Lock()
+	defer globalConfigMu.Unlock()
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false, fmt.Errorf("resolving path %s: %w", path, err)
+	}
+	targetInfo, targetStatErr := os.Stat(absPath)
+	matches := func(entry RepoEntry) bool {
+		entryAbs := normalizePath(entry.Path)
+		if pathkey.SamePathIdentity(entryAbs, absPath) {
+			return true
+		}
+		if targetStatErr != nil {
+			return false
+		}
+		entryInfo, statErr := os.Stat(entryAbs)
+		return statErr == nil && os.SameFile(entryInfo, targetInfo)
+	}
+	removeMatches := func(entries []RepoEntry) ([]RepoEntry, bool) {
+		if entries == nil {
+			return nil, false
+		}
+		kept := make([]RepoEntry, 0, len(entries))
+		removed := false
+		for _, entry := range entries {
+			if matches(entry) {
+				removed = true
+				continue
+			}
+			kept = append(kept, entry)
+		}
+		return kept, removed
+	}
+
+	// Build a fully detached candidate: project values contain slices, and a
+	// shallow map copy would let a failed write mutate the live intent anyway.
+	candidate := *gc
+	candidate.Repos, _ = removeMatches(gc.Repos)
+	if gc.Projects != nil {
+		candidate.Projects = make(map[string]ProjectConfig, len(gc.Projects))
+		for name, project := range gc.Projects {
+			project.Repos, _ = removeMatches(project.Repos)
+			candidate.Projects[name] = project
+		}
+	}
+	removed := len(candidate.Repos) != len(gc.Repos)
+	if !removed {
+		for name, project := range gc.Projects {
+			if len(candidate.Projects[name].Repos) != len(project.Repos) {
+				removed = true
+				break
+			}
+		}
+	}
+	if !removed {
+		return false, nil
+	}
+	if err := saveGlobalConfigLocked(&candidate); err != nil {
+		return false, err
+	}
+	gc.Repos = candidate.Repos
+	gc.Projects = candidate.Projects
+	return true, nil
 }
 
 // DedupeRepos removes tracked-repo entries that name the same directory as

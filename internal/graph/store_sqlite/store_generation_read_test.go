@@ -1680,6 +1680,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		// names one so the checklist stays uniform.
 		{iface: (*graph.Store)(nil), probe: "AllNodes"},
 		{iface: (*graph.AllGenerationsRepoEvicter)(nil), skip: skipAdmin},
+		{iface: (*graph.CheckedAllGenerationsRepoEvicter)(nil), skip: skipAdmin},
 		{iface: (*graph.AnalysisGenerationStore)(nil), skip: skipSidecar},
 		{iface: (*graph.AnalysisQueryStore)(nil), skip: skipSidecar},
 		{iface: (*graph.AtomicVectorCorpusInstaller)(nil), skip: skipSidecar},

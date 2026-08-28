@@ -24,6 +24,9 @@ func evictRepoAllGenerations(target graph.Store, repoPrefix string) (nodesRemove
 	if repoPrefix == "" {
 		return 0, 0, fmt.Errorf("all-generation repository eviction refuses an empty repo prefix")
 	}
+	if checked, ok := target.(graph.CheckedAllGenerationsRepoEvicter); ok {
+		return checked.EvictRepoAllGenerationsChecked(repoPrefix)
+	}
 	destructive, ok := target.(graph.AllGenerationsRepoEvicter)
 	if !ok {
 		return 0, 0, fmt.Errorf("store %T does not expose all-generation repository eviction", target)

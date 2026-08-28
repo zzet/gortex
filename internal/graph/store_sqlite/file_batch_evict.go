@@ -143,7 +143,8 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 }
 
 var (
-	_ graph.FileBatchEvicter             = (*Store)(nil)
-	_ graph.CurrentGenerationRepoEvicter = (*Store)(nil)
-	_ graph.AllGenerationsRepoEvicter    = (*Store)(nil)
+	_ graph.FileBatchEvicter                 = (*Store)(nil)
+	_ graph.CurrentGenerationRepoEvicter     = (*Store)(nil)
+	_ graph.AllGenerationsRepoEvicter        = (*Store)(nil)
+	_ graph.CheckedAllGenerationsRepoEvicter = (*Store)(nil)
 )

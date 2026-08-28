@@ -53,6 +53,28 @@ type RepoMetadata struct {
 	IsWorktree bool
 }
 
+// repositoryUntrackState is the process-local continuation for one
+// authoritative teardown. The catalog cleanup saga and the still-persisted
+// configuration are the restart authority; this state keeps same-process
+// retries from repeating successful payload/vector phases and keeps the stable
+// mutation lane closed until every external side effect commits.
+type repositoryUntrackState struct {
+	mu          sync.Mutex
+	metadata    *RepoMetadata
+	indexer     *Indexer
+	coordinator *repositoryMutationCoordinator
+	contract    DerivedInvalidationPlan
+	finalize    func(*RepoMetadata) error
+
+	indexerClosed   bool
+	payloadPurged   bool
+	vectorPublished bool
+	configFinalized bool
+	completed       bool
+	nodesRemoved    int
+	edgesRemoved    int
+}
+
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
 	graph     graph.Store
@@ -68,6 +90,10 @@ type MultiIndexer struct {
 	// it to New; every per-repository construction flows through this factory.
 	newIndexer func(graph.Store, *parser.Registry, config.IndexConfig, *zap.Logger) *Indexer
 	mu         sync.RWMutex
+	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
+	// a live repo is hidden and removed only after payload, vector, config, and
+	// derived-contract cleanup have all succeeded.
+	pendingRepositoryUntracks map[string]*repositoryUntrackState
 
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
@@ -3243,145 +3269,20 @@ func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexRe
 
 // UntrackRepo evicts a repo from the graph and removes it from config.
 func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
-	if mi.isClosed() {
-		return 0, 0
-	}
-	// Snapshot the exact live registry generation first. Legacy restores and
-	// direct-map fixtures may not have a stable lane yet; backfill one only
-	// while both metadata and Indexer pointers still match this generation.
-	mi.mu.RLock()
-	metaSnapshot, tracked := mi.repos[repoPrefix]
-	idx := mi.indexers[repoPrefix]
-	mi.mu.RUnlock()
-	if !tracked {
-		return 0, 0
-	}
-	coordinator, current := mi.repositoryMutationCoordinatorForTeardownSnapshot(
-		repoPrefix, metaSnapshot, idx,
-	)
-	if !current {
-		return 0, 0
-	}
-
-	// Close admission before removing the live Indexer or purging its graph.
-	// Waiting outside mi.mu lets the in-flight mutation tail finish without
-	// lock inversion; every later admission observes the closed stable lane.
-	if err := coordinator.closeAndWait(context.Background()); err != nil {
-		mi.logger.Warn("failed to drain repository mutation coordinator",
-			zap.String("prefix", repoPrefix), zap.Error(err))
-		return 0, 0
-	}
-
-	// The lane is now closed and drained, so no new admission can cross this
-	// teardown while it takes the transition read side. Retain that admission
-	// through exact-generation validation, graph/config purge, contract
-	// reconciliation, and conditional detach; EndBatch and direct global passes
-	// see either the complete repository or its complete absence.
-	mi.batchMutationGate.RLock()
-	defer mi.batchMutationGate.RUnlock()
-	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
-	defer finishTopologyMutation(true)
-
-	mi.mu.Lock()
-	meta, ok := mi.repos[repoPrefix]
-	idx = mi.indexers[repoPrefix]
-	// A concurrent teardown may have removed the old generation and a later
-	// track may already have installed a fresh Indexer/slot for this prefix.
-	// Delete metadata only when both live objects still belong to the exact
-	// coordinator generation drained above.
-	if !ok ||
-		mi.existingRepositoryMutationCoordinator(repoPrefix) != coordinator ||
-		(idx != nil && !idx.hasRepositoryMutationCoordinator(coordinator)) {
-		mi.mu.Unlock()
-		return 0, 0
-	}
-	// Snapshot the exact derived-contract frontier before deleting the repo.
-	// Cross-repo bridge nodes can be owned by a surviving repo, so purge alone
-	// cannot remove every dangling derived edge.
-	contractPlan := mi.contractInvalidationPlanForRepo(idx)
-	delete(mi.repos, repoPrefix)
-	delete(mi.indexers, repoPrefix)
-	mi.mu.Unlock()
-
-	// The stable mutation lane is drained and this exact generation is detached;
-	// now wait for any overlay/direct extraction before terminating its workers.
-	if idx != nil {
-		idx.Close()
-	}
-
-	// The process-wide trigram budget otherwise retains the removed Indexer
-	// (and its full-text cache) until an unrelated search happens to evict it.
-	if idx != nil {
-		idx.releaseTrigramSearcher()
-		idx.trigramBudget().forget(idx)
-	}
-
-	// Every repo's nodes live in its byRepo bucket. Serialize the complete
-	// sidecar/vector purge and aggregate vector publication with sibling repo
-	// installs; otherwise an older stats snapshot can be published after a newer
-	// corpus commit. The callback holds no mi.mu and releases every SQLite write
-	// transaction before ReplaceHybridVector waits for pinned search readers.
-	var nodesRemoved, edgesRemoved int
-	evictAllGenerations := func() {
-		removedNodes, removedEdges, err := evictRepoAllGenerations(mi.graph, repoPrefix)
-		if err != nil {
-			mi.logger.Error("authoritative repository eviction unavailable",
-				zap.String("prefix", repoPrefix), zap.Error(err))
-			return
-		}
-		nodesRemoved, edgesRemoved = removedNodes, removedEdges
-	}
-	purgeRepo := func() {
-		if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
-			// Prefer the full sidecar-aware purge. It returns no counts, so report
-			// the last-index metadata as the estimate; fall back to the explicit
-			// all-generation node/edge removal on error. The subsequent empty
-			// corpus replacement also cleans legacy synthetic chunk rows that are
-			// not graph node IDs.
-			if err := purger.PurgeRepo(repoPrefix); err != nil {
-				mi.logger.Warn("purge repo failed; falling back to all-generation node/edge eviction",
-					zap.String("prefix", repoPrefix), zap.Error(err))
-				evictAllGenerations()
-			} else {
-				nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
+	nodesRemoved, edgesRemoved, err := mi.untrackRepoChecked(
+		context.Background(), repoPrefix, false,
+		func(meta *RepoMetadata) error {
+			if meta == nil || meta.RootPath == "" || mi.configMgr == nil {
+				return nil
 			}
-			return
-		}
-		// A backend without sidecars must still expose the explicit destructive
-		// capability. Falling back to Store.EvictRepo could remove only the active
-		// generation and falsely report an authoritative untrack.
-		evictAllGenerations()
-	}
-	refresh := func(sw *search.Swappable) error {
-		purgeRepo()
-		return mi.publishVectorCorpusAfterRepoRemoval(context.Background(), repoPrefix, sw)
-	}
-	if sw, ok := mi.search.(*search.Swappable); ok {
-		if err := sw.SerializeVectorUpdate(func() error { return refresh(sw) }); err != nil {
-			mi.logger.Warn("refresh vector corpus after untrack failed",
-				zap.String("prefix", repoPrefix), zap.Error(err))
-		}
-	} else if err := refresh(nil); err != nil {
-		mi.logger.Warn("remove vector corpus after untrack failed",
+			_, err := mi.configMgr.Global().RemoveRepoAndSaveIfPresent(meta.RootPath)
+			return err
+		},
+	)
+	if err != nil {
+		mi.logger.Error("repository untrack remains pending",
 			zap.String("prefix", repoPrefix), zap.Error(err))
 	}
-
-	// Remove from global config.
-	if meta.RootPath != "" {
-		if err := mi.configMgr.Global().RemoveRepo(meta.RootPath); err != nil {
-			mi.logger.Warn("failed to remove repo from config",
-				zap.String("prefix", repoPrefix), zap.Error(err))
-		}
-	}
-
-	if !contractPlan.Empty() {
-		mi.ReconcileContractEdgesForFrontier(contractPlan)
-	}
-
-	// Keep the closed slot installed until every purge/config side effect is
-	// complete, then remove only the exact generation drained above. A stale
-	// teardown racing a retrack must leave the replacement lane installed.
-	mi.detachRepositoryMutationCoordinator(repoPrefix, coordinator)
 	return nodesRemoved, edgesRemoved
 }
 

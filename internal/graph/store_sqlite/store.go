@@ -1952,7 +1952,26 @@ func (s *Store) EvictRepoAllGenerations(repoPrefix string) (nodesRemoved, edgesR
 	if repoPrefix == "" {
 		return 0, 0
 	}
-	return s.evictRepoScope(repoPrefix, evictAllGenerations)
+	nodesRemoved, edgesRemoved, err := s.EvictRepoAllGenerationsChecked(repoPrefix)
+	if err != nil {
+		panicOnFatal(err)
+		return 0, 0
+	}
+	return nodesRemoved, edgesRemoved
+}
+
+// EvictRepoAllGenerationsChecked is the error-returning administrative path.
+// It shares the same transaction as the compatibility method but lets durable
+// cleanup retain its saga and retry instead of converting a write failure into
+// empty counts or a process panic.
+func (s *Store) EvictRepoAllGenerationsChecked(
+	repoPrefix string,
+) (nodesRemoved, edgesRemoved int, err error) {
+	if repoPrefix == "" {
+		return 0, 0, fmt.Errorf("store_sqlite: all-generation eviction refuses empty repo prefix")
+	}
+	predicate := evictNonEmptyRepoPredicate
+	return s.evictByPredicateResult(predicate, repoPrefix, evictAllGenerations)
 }
 
 func (s *Store) evictRepoScope(repoPrefix string, scope evictScope) (nodesRemoved, edgesRemoved int) {

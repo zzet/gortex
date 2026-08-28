@@ -294,7 +294,7 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 			checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic &&
 			checkout.ActiveIntentTransitionID == "" {
 			prefix := l.ResolvePrefix(checkout.RootPath)
-			if _, _, err := l.evictRepoChecked(prefix, checkout.RootPath); err != nil {
+			if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
 				return fmt.Errorf("indexer: recover demotion configuration: %w", err)
 			}
 			return nil
@@ -325,7 +325,7 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 				store_sqlite.ErrCatalogStaleGuard, transition.TransitionID, checkout.CheckoutID))
 		}
 		prefix := l.ResolvePrefix(checkout.RootPath)
-		if _, _, err := l.evictRepoChecked(prefix, checkout.RootPath); err != nil {
+		if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
 			return l.deferModeTransition(ctx, transition, fmt.Errorf(
 				"indexer: persist cleanup-pending demotion configuration: %w", err))
 		}

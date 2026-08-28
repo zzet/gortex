@@ -617,7 +617,19 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 		GraphID: mainTracked.GraphID,
 	})
 	require.NoError(t, err)
-	require.NotEmpty(t, primaryRowsBefore, "the healthy primary sibling owns its own generations")
+	var healthyPrimaryGenerationIDs []int64
+	for _, row := range primaryRowsBefore {
+		if row.CheckoutID != wtTracked.CheckoutID {
+			healthyPrimaryGenerationIDs = append(healthyPrimaryGenerationIDs, row.GenerationID)
+		}
+	}
+	require.NotEmpty(t, healthyPrimaryGenerationIDs, "the healthy primary sibling owns its own generations")
+	targetCheckoutRowsBefore, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		CheckoutID: wtTracked.CheckoutID,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, targetCheckoutRowsBefore,
+		"all generations owned by the vanished worktree are cleanup targets, even if an early layer was built under the primary graph")
 
 	// Nothing has vanished yet: a sweep changes nothing.
 	report, err := f.lc.Sweep(ctx)
@@ -687,10 +699,20 @@ func TestCheckoutLifecycleSweepRemovesVanishedWorktree(t *testing.T) {
 		GraphID: mainTracked.GraphID,
 	})
 	require.NoError(t, err)
-	require.Len(t, primaryRowsAfter, len(primaryRowsBefore), "the healthy primary sibling is untouched")
-	for i := range primaryRowsBefore {
-		assert.Equal(t, primaryRowsBefore[i].GenerationID, primaryRowsAfter[i].GenerationID)
+	var healthyPrimaryGenerationIDsAfter []int64
+	for _, row := range primaryRowsAfter {
+		if row.CheckoutID != wtTracked.CheckoutID {
+			healthyPrimaryGenerationIDsAfter = append(healthyPrimaryGenerationIDsAfter, row.GenerationID)
+		}
 	}
+	assert.Equal(t, healthyPrimaryGenerationIDs, healthyPrimaryGenerationIDsAfter,
+		"the healthy primary sibling is untouched")
+	targetCheckoutRowsAfter, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		CheckoutID: wtTracked.CheckoutID,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, targetCheckoutRowsAfter,
+		"the vanished worktree leaves no owned generation behind in any graph")
 	assert.False(t, f.watcher.isAttached("sweep-wt"), "its watcher is detached")
 	assert.NotContains(t, f.configPaths(), worktree, "the removal is persisted")
 

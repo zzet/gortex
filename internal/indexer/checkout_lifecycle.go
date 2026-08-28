@@ -947,7 +947,11 @@ func (l *CheckoutLifecycle) applyUntrack(
 		// No catalog identity: a store without a catalog, or a directory git
 		// does not administer. The side effects are the same ones the hooks
 		// run, in the same order.
-		out.NodesRemoved, out.EdgesRemoved = l.evictRepo(preview.Prefix)
+		var err error
+		out.NodesRemoved, out.EdgesRemoved, err = l.evictRepo(ctx, preview.Prefix)
+		if err != nil {
+			return out, err
+		}
 		return out, nil
 	}
 	if preview.Plan == UntrackPlanBlocked {
@@ -1045,7 +1049,12 @@ func (l *CheckoutLifecycle) applyUntrack(
 	// The sagas evict through ReleaseGraph. A checkout that never had a
 	// graph binding still has to leave the corpus.
 	if l.mi.GetMetadata(preview.Prefix) != nil {
-		out.NodesRemoved, out.EdgesRemoved = l.evictRepo(preview.Prefix)
+		removedNodes, removedEdges, err := l.evictRepo(ctx, preview.Prefix)
+		out.NodesRemoved = removedNodes
+		out.EdgesRemoved = removedEdges
+		if err != nil {
+			return out, err
+		}
 	}
 	return out, nil
 }
@@ -1197,7 +1206,9 @@ func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (
 		// directory git does not administer. Keeping the pre-catalog
 		// behaviour is what stops such a repository from becoming
 		// impossible to remove.
-		l.evictRepo(prefix)
+		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
+			return "", err
+		}
 		return reconcile.OutcomeForgotten, nil
 	}
 	outcome, err := l.rec.RetireCheckout(ctx, checkout.CheckoutID, checkout.Incarnation, "reload_removed_from_config")
@@ -1205,7 +1216,9 @@ func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (
 		return "", err
 	}
 	if outcome == reconcile.OutcomeForgotten && l.mi.GetMetadata(prefix) != nil {
-		l.evictRepo(prefix)
+		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
+			return outcome, err
+		}
 	}
 	return outcome, nil
 }
@@ -2336,8 +2349,18 @@ func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
 	if row.RepoPrefix == "" {
 		return nil
 	}
-	h.l.evictRepo(row.RepoPrefix)
-	return nil
+	rootPath := ""
+	if row.OwnerCheckoutID != "" {
+		checkout, found, checkoutErr := h.l.catalog.GetCheckout(ctx, row.OwnerCheckoutID)
+		if checkoutErr != nil {
+			return checkoutErr
+		}
+		if found {
+			rootPath = checkout.RootPath
+		}
+	}
+	_, _, err = h.l.evictRepoChecked(ctx, row.RepoPrefix, rootPath)
+	return err
 }
 
 // --- side effects -------------------------------------------------------
@@ -2345,36 +2368,54 @@ func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
 // evictRepoChecked removes a repository from the live tracked set and persists
 // that removal. Durable transitions use the returned save error to stay
 // retryable instead of completing with stale explicit configuration.
-func (l *CheckoutLifecycle) evictRepoChecked(prefix, rootPath string) (nodesRemoved, edgesRemoved int, err error) {
-	if prefix != "" {
-		l.detachWatcher(prefix)
-		nodesRemoved, edgesRemoved = l.mi.UntrackRepo(prefix)
+func (l *CheckoutLifecycle) evictRepoChecked(
+	ctx context.Context, prefix, rootPath string,
+) (nodesRemoved, edgesRemoved int, err error) {
+	if prefix == "" {
+		return 0, 0, nil
 	}
-	if l.cfgMgr != nil {
-		if rootPath != "" {
-			if _, err := l.cfgMgr.Global().RemoveRepoIfPresent(rootPath); err != nil {
-				return nodesRemoved, edgesRemoved, err
-			}
+	l.detachWatcher(prefix)
+	finalize := func(meta *RepoMetadata) error {
+		if l.cfgMgr == nil {
+			return nil
 		}
-		if err := l.cfgMgr.Global().Save(); err != nil {
-			return nodesRemoved, edgesRemoved, err
+		path := rootPath
+		if meta != nil && meta.RootPath != "" {
+			// Prefer the original configured spelling while this process still
+			// has it. A vanished macOS path can no longer resolve /var through
+			// /private/var, while the catalog deliberately keeps the canonical
+			// spelling; the configured spelling remains the exact durable key.
+			path = meta.RootPath
 		}
+		if path == "" {
+			return nil
+		}
+		_, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path)
+		return err
 	}
-	l.notifyTrackedSetChanged()
-	return nodesRemoved, edgesRemoved, nil
+	nodesRemoved, edgesRemoved, err = l.mi.purgeRepoChecked(ctx, prefix, finalize)
+	if l.mi.GetMetadata(prefix) == nil {
+		// The registry is hidden even when a later payload/vector/config phase
+		// fails. Invalidate cached scopes now; the closed mutation lane prevents
+		// the retained config intent from retracking in this process.
+		l.notifyTrackedSetChanged()
+	}
+	return nodesRemoved, edgesRemoved, err
 }
 
 // evictRepo runs the repository teardown every caller shares: watcher first,
 // then the graph, then the persisted configuration, then the sessions.
-func (l *CheckoutLifecycle) evictRepo(prefix string) (nodesRemoved, edgesRemoved int) {
+func (l *CheckoutLifecycle) evictRepo(
+	ctx context.Context, prefix string,
+) (nodesRemoved, edgesRemoved int, err error) {
 	if prefix == "" {
-		return 0, 0
+		return 0, 0, nil
 	}
-	l.detachWatcher(prefix)
-	nodesRemoved, edgesRemoved = l.mi.UntrackRepo(prefix)
-	l.saveConfig("untrack")
-	l.notifyTrackedSetChanged()
-	return nodesRemoved, edgesRemoved
+	rootPath := ""
+	if meta := l.mi.GetMetadata(prefix); meta != nil {
+		rootPath = meta.RootPath
+	}
+	return l.evictRepoChecked(ctx, prefix, rootPath)
 }
 
 // attachWatcher wires a tracked prefix into the live file watcher. A failure

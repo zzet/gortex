@@ -164,7 +164,9 @@ func (l *CheckoutLifecycle) ensurePromotedRepoShell(
 		// A mutable pre-promotion registration may already occupy this prefix.
 		// Retire that generation-zero payload before replacing it with the
 		// payload-free shell used by the dedicated route.
-		l.mi.UntrackRepo(prefix)
+		if _, _, err := l.mi.UntrackRepoChecked(ctx, prefix); err != nil {
+			return fmt.Errorf("indexer: retire mutable pre-promotion repository: %w", err)
+		}
 	}
 	// Before publication an explicit empty source is what prevents a mutable
 	// filesystem index. After publication, however, a cold process must use the

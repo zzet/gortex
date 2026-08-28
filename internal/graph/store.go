@@ -147,6 +147,13 @@ type AllGenerationsRepoEvicter interface {
 	EvictRepoAllGenerations(repoPrefix string) (nodesRemoved, edgesRemoved int)
 }
 
+// CheckedAllGenerationsRepoEvicter is the retryable form used by
+// authoritative repository cleanup. Implementations return storage failures
+// instead of converting them to empty counts or a process panic.
+type CheckedAllGenerationsRepoEvicter interface {
+	EvictRepoAllGenerationsChecked(repoPrefix string) (nodesRemoved, edgesRemoved int, err error)
+}
+
 type Store interface {
 	// --- Writes -----------------------------------------------------
 
