@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -267,6 +268,112 @@ func TestRoutedDirtyIdentitySkipsPreflightSampling(t *testing.T) {
 			t.Fatalf("leader samples = %d, want 1", got)
 		}
 	})
+}
+
+func TestRoutedDirtyIdentityRejectsLeaderPreparationDrift(t *testing.T) {
+	fixture := newRoutedDirtyBuildFixture(t)
+	if err := os.WriteFile(
+		filepath.Join(fixture.request.CheckoutRoot, "routed_dirty.go"),
+		[]byte("package fixture\n\nfunc RoutedDirtyChangedBeforePreparation() {}\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("change dirty fixture before leader preparation: %v", err)
+	}
+	changed, err := gitstate.SampleDirty(context.Background(), fixture.request.CheckoutRoot)
+	if err != nil {
+		t.Fatalf("sample changed dirty fixture: %v", err)
+	}
+	if changed.Fingerprint == fixture.sample.Fingerprint {
+		t.Fatalf("changed fingerprint = original %q", changed.Fingerprint)
+	}
+
+	var identitySamples atomic.Int64
+	var buildSamples atomic.Int64
+	request := fixture.request
+	request.identitySampler = func(ctx context.Context, root string) (gitstate.DirtySnapshot, error) {
+		identitySamples.Add(1)
+		return gitstate.SampleDirty(ctx, root)
+	}
+	request.buildSampler = func(ctx context.Context, root string) (gitstate.DirtySnapshot, error) {
+		buildSamples.Add(1)
+		return gitstate.SampleDirty(ctx, root)
+	}
+
+	assertDrift := func(attempt int, staleRequest DirtyLayerRequest) int64 {
+		generationID, report, buildErr := fixture.sparse.builder.BuildDirtyLayer(context.Background(), staleRequest)
+		if buildErr == nil {
+			t.Fatalf("dirty build %d unexpectedly published the stale identity", attempt)
+		}
+		if !errors.Is(buildErr, ErrDirtySnapshotChanged) {
+			t.Fatalf("dirty build %d error = %T %v, want ErrDirtySnapshotChanged in its chain", attempt, buildErr, buildErr)
+		}
+		if !isSparseBuildPreflightError(buildErr) {
+			t.Fatalf("dirty build %d error = %T %v, want a retryable preflight outcome", attempt, buildErr, buildErr)
+		}
+		if generationID != 0 {
+			t.Fatalf("dirty build %d returned generation = %d, want no publishable generation", attempt, generationID)
+		}
+		if report.GenerationID <= 0 {
+			t.Fatalf("dirty build %d report generation = %d, want the abandoned flight generation", attempt, report.GenerationID)
+		}
+		if report.Coalesced {
+			t.Fatalf("dirty build %d unexpectedly reused generation %d", attempt, report.GenerationID)
+		}
+		return report.GenerationID
+	}
+
+	firstGenerationID := assertDrift(1, request)
+	if got := identitySamples.Load(); got != 0 {
+		t.Fatalf("preflight identity samples after first drift = %d, want 0", got)
+	}
+	if got := buildSamples.Load(); got != 1 {
+		t.Fatalf("leader preparation samples after first drift = %d, want 1", got)
+	}
+
+	retryRequest := request
+	coordinator := &CheckoutCoordinator{
+		checkoutID: request.Identity.CheckoutID,
+		configHash: request.Identity.ConfigHash,
+		extractors: request.Identity.ExtractorVersions,
+	}
+	retryRequest.Identity = coordinator.dirtyIdentity(
+		request.Identity.GraphID,
+		request.Identity.BaseGenerationID,
+		changed,
+	)
+	generationID, report, err := fixture.sparse.builder.BuildDirtyLayer(context.Background(), retryRequest)
+	if err != nil {
+		t.Fatalf("retry changed dirty identity: %v", err)
+	}
+	if generationID <= 0 || report.GenerationID != generationID {
+		t.Fatalf("retry generation = %d report=%d, want one published generation", generationID, report.GenerationID)
+	}
+	if generationID == firstGenerationID {
+		t.Fatalf("retry reused abandoned generation %d", generationID)
+	}
+	if report.Coalesced {
+		t.Fatalf("retry unexpectedly coalesced onto generation %d", generationID)
+	}
+	if got := identitySamples.Load(); got != 0 {
+		t.Fatalf("preflight identity samples after retry = %d, want 0", got)
+	}
+	if got := buildSamples.Load(); got != 2 {
+		t.Fatalf("leader preparation samples after retry = %d, want 2", got)
+	}
+
+	thirdGenerationID := assertDrift(3, request)
+	if thirdGenerationID == firstGenerationID {
+		t.Fatalf("stale identity reused abandoned generation %d", thirdGenerationID)
+	}
+	if thirdGenerationID == generationID {
+		t.Fatalf("stale identity reused changed generation %d", thirdGenerationID)
+	}
+	if got := identitySamples.Load(); got != 0 {
+		t.Fatalf("preflight identity samples = %d, want 0", got)
+	}
+	if got := buildSamples.Load(); got != 3 {
+		t.Fatalf("leader preparation samples = %d, want 3", got)
+	}
 }
 
 func BenchmarkRoutedDirtyIdentitySampling(b *testing.B) {
