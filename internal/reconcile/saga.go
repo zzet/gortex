@@ -313,10 +313,15 @@ func (r *Reconciler) repairLegacyRetireGraphTarget(
 			"%w: legacy graph cleanup %s has no verifiable owner binding",
 			ErrSagaTarget, target.GraphID)
 	}
-	if target.CheckoutID != "" && target.CheckoutID != graph.OwnerCheckoutID {
+	if target.CheckoutID == "" || target.CheckoutID != graph.OwnerCheckoutID {
 		return target, fmt.Errorf(
-			"%w: legacy graph cleanup %s names checkout %s but is owned by %s",
-			ErrSagaTarget, target.GraphID, target.CheckoutID, graph.OwnerCheckoutID)
+			"%w: legacy graph cleanup %s has no authorized checkout owner",
+			ErrSagaTarget, target.GraphID)
+	}
+	if target.FamilyID == "" || target.FamilyID != graph.FamilyID {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s has no authorized family ownership",
+			ErrSagaTarget, target.GraphID)
 	}
 	checkout, present, err := r.catalog.GetCheckout(ctx, graph.OwnerCheckoutID)
 	if err != nil {
@@ -327,10 +332,30 @@ func (r *Reconciler) repairLegacyRetireGraphTarget(
 			"%w: legacy graph cleanup %s has no verifiable checkout incarnation",
 			ErrSagaTarget, target.GraphID)
 	}
-	if target.FamilyID != "" && target.FamilyID != graph.FamilyID {
+	if checkout.DesiredMode != store_sqlite.CheckoutModeAutomatic ||
+		checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
 		return target, fmt.Errorf(
-			"%w: legacy graph cleanup %s moved from family %s to %s",
-			ErrSagaTarget, target.GraphID, target.FamilyID, graph.FamilyID)
+			"%w: legacy graph cleanup %s has not committed its demotion",
+			ErrSagaTarget, target.GraphID)
+	}
+
+	cleanup, cleanupPresent, err := r.catalog.GetCleanupEntry(ctx, target.cleanupID())
+	if err != nil {
+		return target, err
+	}
+	if !cleanupPresent || cleanup.Reason != string(sagaRetireGraph) {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s has no standing retire-graph journal",
+			ErrSagaTarget, target.GraphID)
+	}
+	persistedTarget, err := decodeSagaTarget(cleanup)
+	if err != nil {
+		return target, err
+	}
+	if persistedTarget != target {
+		return target, fmt.Errorf(
+			"%w: legacy graph cleanup %s changed while proving ownership",
+			ErrSagaTarget, target.GraphID)
 	}
 
 	transition, transitionPresent, err := r.catalog.GetIntentTransition(ctx, checkout.CheckoutID)
@@ -353,9 +378,7 @@ func (r *Reconciler) repairLegacyRetireGraphTarget(
 			ErrSagaTarget, target.GraphID)
 	}
 
-	target.CheckoutID = checkout.CheckoutID
 	target.Incarnation = checkout.Incarnation
-	target.FamilyID = graph.FamilyID
 	target.RepoPrefix = graph.RepoPrefix
 	target.RootPath = checkout.RootPath
 	return target, nil

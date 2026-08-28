@@ -439,6 +439,9 @@ func TestPurgeLayersJournalStopsASecondPurge(t *testing.T) {
 func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, Default())
+	f.seedCheckout("co-primary", "inc-primary", "main", store_sqlite.CheckoutModeDedicated)
+	f.seedOwnedGraph("primary-graph", "co-primary")
+	f.promoteToPrimary("primary-graph")
 	f.seedCheckout("co-1", "inc-1", "wt", store_sqlite.CheckoutModeDedicated)
 	f.seedOwnedGraph("graph-1", "co-1")
 	if err := f.catalog.BeginIntentTransition(ctx, store_sqlite.IntentTransition{
@@ -460,8 +463,34 @@ func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
 		Kind: sagaRetireGraph, Phase: phaseReleaseGraph, GraphID: "graph-1",
 		CheckoutID: "co-1", FamilyID: f.familyID,
 	}
-	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhasePending); err != nil {
 		t.Fatalf("persist legacy graph cleanup: %v", err)
+	}
+	cleanup, found, err := f.catalog.GetCleanupEntry(ctx, target.cleanupID())
+	if err != nil || !found {
+		t.Fatalf("read legacy graph cleanup = found:%v err:%v", found, err)
+	}
+	family, found, err := f.catalog.GetRepositoryFamily(ctx, f.familyID)
+	if err != nil || !found {
+		t.Fatalf("read repository family = found:%v err:%v", found, err)
+	}
+	if err := f.catalog.CommitAuthorizedDemotion(ctx, store_sqlite.CommitAuthorizedDemotionRequest{
+		CheckoutID:           "co-1",
+		Incarnation:          "inc-1",
+		FamilyID:             f.familyID,
+		TransitionID:         "demote-1",
+		OwnedGraphID:         "graph-1",
+		PrimaryGraphID:       "primary-graph",
+		ExpectedPrimaryEpoch: family.PrimaryEpoch,
+		RequiredPrimaryState: GraphStateReady,
+		State:                store_sqlite.CheckoutStateReady,
+		LastSeen:             1,
+		Cleanup:              &cleanup,
+	}); err != nil {
+		t.Fatalf("commit durable demotion ownership: %v", err)
+	}
+	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+		t.Fatalf("record interrupted legacy cleanup: %v", err)
 	}
 	f.hooks.failRelease = 1
 
@@ -535,6 +564,32 @@ func TestResumeKeepsUnverifiableLegacyRetireGraphTargetDurable(t *testing.T) {
 				return sagaTarget{
 					Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
 					GraphID: "graph-1", FamilyID: f.familyID,
+				}
+			},
+		},
+		{
+			name: "demotion transition has not committed",
+			seed: func(f *fixture) sagaTarget {
+				f.seedCheckout("co-1", "inc-1", "one", store_sqlite.CheckoutModeDedicated)
+				f.seedOwnedGraph("graph-1", "co-1")
+				if err := f.catalog.BeginIntentTransition(context.Background(), store_sqlite.IntentTransition{
+					TransitionID:       "demote-1",
+					CheckoutID:         "co-1",
+					Cause:              explicitUntrackDemotionCause,
+					PriorDesiredMode:   store_sqlite.CheckoutModeDedicated,
+					PriorEffectiveMode: store_sqlite.CheckoutModeDedicated,
+					RequestedMode:      store_sqlite.CheckoutModeAutomatic,
+					PriorCheckoutState: store_sqlite.CheckoutStateReady,
+					SourceSnapshotHash: "graph-1:primary-graph:1",
+					State:              store_sqlite.IntentTransitionRunning,
+					CreatedAt:          1,
+					LastProgress:       1,
+				}); err != nil {
+					f.t.Fatalf("begin uncommitted demotion: %v", err)
+				}
+				return sagaTarget{
+					Kind: sagaRetireGraph, Phase: phaseReleaseGraph,
+					GraphID: "graph-1", CheckoutID: "co-1", FamilyID: f.familyID,
 				}
 			},
 		},
