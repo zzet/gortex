@@ -1371,6 +1371,7 @@ func builderRelPath(repoPrefix, graphPath string) (string, bool) {
 type fileSetSource struct {
 	inner source.ContentSource
 	keep  map[string]struct{}
+	paths []string
 }
 
 var _ source.ContentSource = (*fileSetSource)(nil)
@@ -1378,10 +1379,17 @@ var _ source.ContentSource = (*fileSetSource)(nil)
 // newFileSetSource returns src narrowed to paths.
 func newFileSetSource(src source.ContentSource, paths []string) *fileSetSource {
 	keep := make(map[string]struct{}, len(paths))
+	canonical := make([]string, 0, len(paths))
 	for _, p := range paths {
+		p = path.Clean(p)
+		if _, exists := keep[p]; exists {
+			continue
+		}
 		keep[p] = struct{}{}
+		canonical = append(canonical, p)
 	}
-	return &fileSetSource{inner: src, keep: keep}
+	sort.Strings(canonical)
+	return &fileSetSource{inner: src, keep: keep, paths: canonical}
 }
 
 // Identity distinguishes the narrowed source from the whole one, so two builds
@@ -1415,10 +1423,26 @@ func (s *fileSetSource) Open(p string) (io.ReadCloser, source.FileMeta, error) {
 }
 
 func (s *fileSetSource) Walk(ctx context.Context, fn func(source.FileMeta) error) error {
-	return s.inner.Walk(ctx, func(meta source.FileMeta) error {
-		if !s.holds(meta.Path) {
-			return nil
+	if fn == nil {
+		return errors.New("indexer: file set source needs a walk function")
+	}
+	for _, p := range s.paths {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		return fn(meta)
-	})
+		meta, err := s.inner.Stat(p)
+		if err != nil {
+			if errors.Is(err, source.ErrNotInSource) {
+				continue
+			}
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(meta); err != nil {
+			return err
+		}
+	}
+	return nil
 }
