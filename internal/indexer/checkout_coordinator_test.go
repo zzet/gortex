@@ -505,6 +505,111 @@ func TestCoordinatorReusesACommitLayerOnTheWayBack(t *testing.T) {
 	}
 }
 
+// TestCoordinatorReusesCommitAcrossIsolatedDirtyStates combines the cache and
+// composition contracts across a real A -> B -> A transition. Each checkout
+// state has a distinct tracked edit and non-ignored untracked file; every
+// routed stack must equal a flat index of disk, and returning to A must reuse
+// A's original commit generation without leaking either dirty state.
+func TestCoordinatorReusesCommitAcrossIsolatedDirtyStates(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	commitA := builderGit(t, f.worktree, "rev-parse", "HEAD")
+
+	assertState := func(label string, cycle CheckoutCycle, present, absent []string) {
+		t.Helper()
+		if cycle.CommitGenerationID == 0 || cycle.DirtyGenerationID == 0 {
+			t.Fatalf("%s did not route both layers: %+v", label, cycle)
+		}
+		reader := coordinatorComposedReader(t, f, cycle.CommitGenerationID, cycle.DirtyGenerationID)
+		flat := builderOpenStore(t, "flat-"+label)
+		builderIndex(t, flat, f.worktree)
+		builderAssertReadersAgree(t, reader, flat)
+		builderAssertMasksValidate(t, f.store, cycle.CommitGenerationID)
+		builderAssertMasksValidate(t, f.store, cycle.DirtyGenerationID)
+
+		ids := builderNodeIDs(reader)
+		for _, id := range present {
+			if !slices.Contains(ids, id) {
+				t.Errorf("%s view lost %s; ids=%v", label, id, ids)
+			}
+		}
+		for _, id := range absent {
+			if slices.Contains(ids, id) {
+				t.Errorf("%s view leaked %s; ids=%v", label, id, ids)
+			}
+		}
+	}
+	graphID := func(file, symbol string) string {
+		return builderRepoPrefix + "/" + file + "::" + symbol
+	}
+
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc AWorkingEdit() {}\n")
+	builderWriteFile(t, f.worktree, "a_untracked.go", "package fixture\n\nfunc AUntracked() {}\n")
+	if got := builderGit(t, f.worktree, "ls-files", "--others", "--exclude-standard"); got != "a_untracked.go" {
+		t.Fatalf("A non-ignored untracked files = %q, want a_untracked.go", got)
+	}
+	first := coordinatorReconcile(t, c)
+	if !first.CommitBuilt || !first.DirtyBuilt {
+		t.Fatalf("A did not build its initial pair: %+v", first)
+	}
+	generationA, dirtyA := first.CommitGenerationID, first.DirtyGenerationID
+	assertState("a-first", first,
+		[]string{graphID("helper.go", "AWorkingEdit"), graphID("a_untracked.go", "AUntracked")},
+		[]string{graphID("helper.go", "BWorkingEdit"), graphID("b_untracked.go", "BUntracked")})
+
+	builderGit(t, f.worktree, "checkout", "--", ".")
+	if err := os.Remove(filepath.Join(f.worktree, "a_untracked.go")); err != nil {
+		t.Fatalf("remove A's untracked file: %v", err)
+	}
+	f.commitTreeB()
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc BWorkingEdit() {}\n")
+	builderWriteFile(t, f.worktree, "b_untracked.go", "package fixture\n\nfunc BUntracked() {}\n")
+	if got := builderGit(t, f.worktree, "ls-files", "--others", "--exclude-standard"); got != "b_untracked.go" {
+		t.Fatalf("B non-ignored untracked files = %q, want b_untracked.go", got)
+	}
+	second := coordinatorReconcile(t, c)
+	if !second.CommitBuilt || second.CommitGenerationID == generationA {
+		t.Fatalf("B did not build a distinct commit generation: %+v", second)
+	}
+	if !second.DirtyBuilt || second.DirtyGenerationID == dirtyA {
+		t.Fatalf("B did not build a distinct dirty generation: %+v", second)
+	}
+	assertState("b", second,
+		[]string{graphID("helper.go", "BWorkingEdit"), graphID("b_untracked.go", "BUntracked")},
+		[]string{graphID("helper.go", "AWorkingEdit"), graphID("a_untracked.go", "AUntracked")})
+
+	builderGit(t, f.worktree, "checkout", "--", ".")
+	if err := os.Remove(filepath.Join(f.worktree, "b_untracked.go")); err != nil {
+		t.Fatalf("remove B's untracked file: %v", err)
+	}
+	builderGit(t, f.worktree, "checkout", "--detach", commitA)
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc AReturnEdit() {}\n")
+	builderWriteFile(t, f.worktree, "a_return_untracked.go", "package fixture\n\nfunc AReturnUntracked() {}\n")
+	if got := builderGit(t, f.worktree, "ls-files", "--others", "--exclude-standard"); got != "a_return_untracked.go" {
+		t.Fatalf("returned-A non-ignored untracked files = %q, want a_return_untracked.go", got)
+	}
+	third := coordinatorReconcile(t, c)
+	if third.CommitBuilt || !third.CommitReused || third.CommitGenerationID != generationA {
+		t.Fatalf("return to A did not reuse commit generation %d: %+v", generationA, third)
+	}
+	if !third.DirtyBuilt || third.DirtyGenerationID == dirtyA || third.DirtyGenerationID == second.DirtyGenerationID {
+		t.Fatalf("returned A did not build an isolated dirty generation: %+v", third)
+	}
+	assertState("a-return", third,
+		[]string{graphID("helper.go", "AReturnEdit"), graphID("a_return_untracked.go", "AReturnUntracked")},
+		[]string{graphID("helper.go", "BWorkingEdit"), graphID("b_untracked.go", "BUntracked")})
+
+	commits := 0
+	for _, row := range f.generations() {
+		if row.GenerationKind == CommitLayerGenerationKind {
+			commits++
+		}
+	}
+	if commits != 2 {
+		t.Fatalf("%d commit generations exist for two trees visited three times", commits)
+	}
+}
+
 // TestCoordinatorLeavesASettledRouteAlone pins the cheapest outcome: a cycle
 // on a checkout nobody has touched builds nothing and flips nothing.
 func TestCoordinatorLeavesASettledRouteAlone(t *testing.T) {
