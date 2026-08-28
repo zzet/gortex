@@ -1665,7 +1665,7 @@ type capabilityCase struct {
 const (
 	skipWrite    = "mutating surface: its generation scoping is proved by the write-side fence in store_generation_write_test.go, not by a read"
 	skipSidecar  = "reads a v15 generation-keyed payload sidecar rather than nodes/edges; the leading view_gen primary key is its isolation and the sidecar schema fences assert it"
-	skipAdmin    = "repository administration or store lifecycle, generation-unscoped by design (see EvictRepo / PurgeRepo)"
+	skipAdmin    = "repository administration or store lifecycle, generation-unscoped by design (see EvictRepoAllGenerations / PurgeRepo)"
 	skipInMemory = "answers from in-process state, not from a SQL read"
 )
 
@@ -1679,6 +1679,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		// graph.Store's read methods each have their own probe above; the entry
 		// names one so the checklist stays uniform.
 		{iface: (*graph.Store)(nil), probe: "AllNodes"},
+		{iface: (*graph.AllGenerationsRepoEvicter)(nil), skip: skipAdmin},
 		{iface: (*graph.AnalysisGenerationStore)(nil), skip: skipSidecar},
 		{iface: (*graph.AnalysisQueryStore)(nil), skip: skipSidecar},
 		{iface: (*graph.AtomicVectorCorpusInstaller)(nil), skip: skipSidecar},
@@ -1720,6 +1721,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.CrossRepoCandidates)(nil), probe: "CrossRepoCandidates"},
 		{iface: (*graph.CrossRepoEdgeAggregator)(nil), probe: "CrossRepoEdgeCounts"},
 		{iface: (*graph.CrossRepoFlagMarker)(nil), skip: skipWrite, writeFence: writerFamilyFence("cross_repo_flags")},
+		{iface: (*graph.CurrentGenerationRepoEvicter)(nil), skip: skipWrite, writeFence: "TestGenerationScopedFileEvict"},
 		{iface: (*graph.DeadCodeCandidator)(nil), probe: "DeadCodeCandidates"},
 		{iface: (*graph.DerivedContractReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("derived_contract_replace")},
 		{iface: (*graph.EdgeAdjacencyForKinds)(nil), probe: "EdgeAdjacencyForKinds"},

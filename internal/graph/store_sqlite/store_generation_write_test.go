@@ -282,9 +282,9 @@ func TestGenerationScopedExactEdgeDelete(t *testing.T) {
 	}
 }
 
-// TestGenerationScopedFileEvict pins both halves of the eviction split: a file
-// eviction is per-checkout and scopes, a repository eviction is administration
-// and does not.
+// TestGenerationScopedFileEvict pins both halves of the eviction split: ordinary
+// file and repository replacement is generation-scoped, while the explicit
+// all-generation repository capability is reserved for administration.
 func TestGenerationScopedFileEvict(t *testing.T) {
 	base, derived := openGenerationWritePair(t)
 
@@ -313,16 +313,37 @@ func TestGenerationScopedFileEvict(t *testing.T) {
 		t.Fatalf("a derived-handle batch eviction removed the base corpus's node: %d rows left", got)
 	}
 
-	// Repository eviction is deliberately generation-blind: the repository
-	// leaves the store, so nothing of it may survive in another generation.
-	base.EvictRepo(genWriteRepo)
-	for _, gen := range []int64{baseViewGeneration, 1} {
+	// Ordinary repository replacement follows the calling handle exactly like
+	// file eviction. The base corpus is removed while the derived generation's
+	// one untouched type node survives.
+	nodes, edges = base.EvictRepo(genWriteRepo)
+	if nodes != len(generationWriteNodes()) || edges != len(generationWriteEdges()) {
+		t.Fatalf("EvictRepo removed (%d nodes, %d edges), want (%d, %d)",
+			nodes, edges, len(generationWriteNodes()), len(generationWriteEdges()))
+	}
+	for gen, want := range map[int64]int{baseViewGeneration: 0, 1: 1} {
 		var count int
 		if err := base.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`, gen).Scan(&count); err != nil {
 			t.Fatalf("count nodes at generation %d: %v", gen, err)
 		}
+		if count != want {
+			t.Fatalf("EvictRepo left %d nodes at generation %d, want %d", count, gen, want)
+		}
+	}
+
+	// Authoritative repository removal opts into the destructive capability and
+	// clears the surviving payload from every generation.
+	nodes, edges = base.EvictRepoAllGenerations(genWriteRepo)
+	if nodes != 1 || edges != 0 {
+		t.Fatalf("EvictRepoAllGenerations removed (%d nodes, %d edges), want (1, 0)", nodes, edges)
+	}
+	for _, gen := range []int64{baseViewGeneration, 1} {
+		var count int
+		if err := base.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`, gen).Scan(&count); err != nil {
+			t.Fatalf("count nodes after all-generation eviction at generation %d: %v", gen, err)
+		}
 		if count != 0 {
-			t.Fatalf("EvictRepo left %d nodes at generation %d; repo administration must reach every generation", count, gen)
+			t.Fatalf("EvictRepoAllGenerations left %d nodes at generation %d", count, gen)
 		}
 	}
 }
