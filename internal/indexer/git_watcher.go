@@ -59,9 +59,13 @@ type GitWatcher struct {
 	topologyTimer     *time.Timer
 	topologyChange    func(string)
 	topologyRefreshMu sync.Mutex
+	topologyOwned     bool
 	topologyPaths     map[string]struct{}
 	worktreeRoots     map[string]struct{}
 	worktreeAdminDirs map[string]struct{}
+	inventory         func(context.Context, string) (*gitstate.FamilyInventory, error)
+	topologyAdd       func(string) error
+	topologyRemove    func(string) error
 
 	// reconciling single-flights reconcile: a ref event landing while
 	// one is in flight sets rerun instead of spawning a second
@@ -98,9 +102,11 @@ func NewGitWatcher(repoPath string, idx *Indexer, logger *zap.Logger) (*GitWatch
 		debounce:          300 * time.Millisecond,
 		done:              make(chan struct{}),
 		stopped:           make(chan struct{}),
+		topologyOwned:     true,
 		topologyPaths:     make(map[string]struct{}),
 		worktreeRoots:     make(map[string]struct{}),
 		worktreeAdminDirs: make(map[string]struct{}),
+		inventory:         gitstate.Inventory,
 	}, nil
 }
 
@@ -111,6 +117,59 @@ func (gw *GitWatcher) OnWorktreeChange(callback func(string)) {
 	gw.mu.Lock()
 	gw.topologyChange = callback
 	gw.mu.Unlock()
+}
+
+// setTopologyOwner enables or disables the family-wide worktree topology
+// watch on this checkout. MultiWatcher elects exactly one owner per Git common
+// directory; direct GitWatcher users retain the historical owner-by-default
+// behavior. The refresh mutex closes the disable-vs-refresh race so a demoted
+// watcher cannot re-register paths after ownership moves.
+func (gw *GitWatcher) setTopologyOwner(owner bool) {
+	gw.topologyRefreshMu.Lock()
+	defer gw.topologyRefreshMu.Unlock()
+
+	gw.mu.Lock()
+	if gw.stopCalled {
+		gw.mu.Unlock()
+		return
+	}
+	if gw.topologyOwned == owner {
+		gw.mu.Unlock()
+		return
+	}
+	gw.topologyOwned = owner
+	commonDir := gw.commonDir
+	if !owner {
+		if gw.topologyTimer != nil {
+			gw.topologyTimer.Stop()
+			gw.topologyTimer = nil
+		}
+		paths := clonePathSet(gw.topologyPaths)
+		gw.topologyPaths = make(map[string]struct{})
+		gw.worktreeRoots = make(map[string]struct{})
+		gw.worktreeAdminDirs = make(map[string]struct{})
+		gw.mu.Unlock()
+		for path := range paths {
+			if gw.topologyRemove != nil {
+				_ = gw.topologyRemove(path)
+			} else {
+				_ = gw.fsw.Remove(path)
+			}
+		}
+		return
+	}
+	gw.mu.Unlock()
+
+	if commonDir != "" {
+		gw.addTopologyPath(commonDir)
+		gw.refreshTopologyWatchesLocked()
+	}
+}
+
+func (gw *GitWatcher) commonDirectory() string {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	return gw.commonDir
 }
 
 func (gw *GitWatcher) registeredIndexer() *Indexer {
@@ -177,9 +236,15 @@ func (gw *GitWatcher) Start() error {
 	}
 
 	// Watching the common dir catches creation of its worktrees directory.
-	// The refresh adds that directory, each admin child, and each checkout root.
-	gw.addTopologyPath(commonDir)
-	gw.refreshTopologyWatches()
+	// MultiWatcher disables this on followers before Start and elects one owner
+	// after all successfully started family members are known.
+	gw.mu.Lock()
+	topologyOwned := gw.topologyOwned
+	gw.mu.Unlock()
+	if topologyOwned {
+		gw.addTopologyPath(commonDir)
+		gw.refreshTopologyWatches()
+	}
 
 	gw.lastSHA, _ = gw.currentSHA(context.Background())
 	gw.mu.Lock()
@@ -227,7 +292,10 @@ func (gw *GitWatcher) loop() {
 				return
 			}
 			if gw.isTopologyEvent(event) {
-				gw.refreshTopologyWatches()
+				// Debounce the refresh itself, not only the callback. A single
+				// worktree mutation fans out across the common dir, admin dir,
+				// and root watches; inventorying on every raw fsnotify record
+				// recreates the family N+1 storm inside the elected owner.
 				gw.scheduleTopologyChange(event.Name)
 			}
 			if gw.isRefEvent(event.Name) {
@@ -263,7 +331,7 @@ func (gw *GitWatcher) scheduleReconcile(trigger string) {
 func (gw *GitWatcher) scheduleTopologyChange(trigger string) {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
-	if gw.stopCalled {
+	if gw.stopCalled || !gw.topologyOwned {
 		return
 	}
 	if gw.topologyTimer != nil {
@@ -276,8 +344,9 @@ func (gw *GitWatcher) scheduleTopologyChange(trigger string) {
 		gw.mu.Lock()
 		callback := gw.topologyChange
 		stopped := gw.stopCalled
+		owner := gw.topologyOwned
 		gw.mu.Unlock()
-		if stopped || callback == nil {
+		if stopped || !owner || callback == nil {
 			return
 		}
 		gw.logger.Debug("git-watcher: worktree topology changed", zap.String("trigger", trigger))
@@ -299,9 +368,13 @@ func (gw *GitWatcher) isRefEvent(name string) bool {
 func (gw *GitWatcher) isTopologyEvent(event fsnotify.Event) bool {
 	name := filepath.Clean(event.Name)
 	gw.mu.Lock()
+	owned := gw.topologyOwned
 	worktreesDir := gw.worktreesDir
 	_, root := gw.worktreeRoots[name]
 	gw.mu.Unlock()
+	if !owned {
+		return false
+	}
 	if root && event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		return true
 	}
@@ -360,7 +433,13 @@ func (gw *GitWatcher) addTopologyPath(path string) {
 	if _, exists := gw.topologyPaths[path]; exists {
 		return
 	}
-	if err := gw.fsw.Add(path); err != nil {
+	var err error
+	if gw.topologyAdd != nil {
+		err = gw.topologyAdd(path)
+	} else {
+		err = gw.fsw.Add(path)
+	}
+	if err != nil {
 		gw.logger.Warn("git-watcher: failed to watch worktree topology",
 			zap.String("path", path), zap.Error(err))
 		return
@@ -377,25 +456,40 @@ func (gw *GitWatcher) removeTopologyPath(path string) {
 	}
 	delete(gw.topologyPaths, path)
 	gw.mu.Unlock()
-	_ = gw.fsw.Remove(path)
+	if gw.topologyRemove != nil {
+		_ = gw.topologyRemove(path)
+	} else {
+		_ = gw.fsw.Remove(path)
+	}
 }
 
 func (gw *GitWatcher) refreshTopologyWatches() {
 	gw.topologyRefreshMu.Lock()
 	defer gw.topologyRefreshMu.Unlock()
+	gw.refreshTopologyWatchesLocked()
+}
 
+func (gw *GitWatcher) refreshTopologyWatchesLocked() {
 	gw.mu.Lock()
+	if !gw.topologyOwned || gw.stopCalled {
+		gw.mu.Unlock()
+		return
+	}
 	worktreesDir := gw.worktreesDir
 	previousRoots := clonePathSet(gw.worktreeRoots)
 	previousAdmins := clonePathSet(gw.worktreeAdminDirs)
+	inventoryFn := gw.inventory
 	gw.mu.Unlock()
 	if worktreesDir == "" {
 		return
 	}
+	if inventoryFn == nil {
+		inventoryFn = gitstate.Inventory
+	}
 
 	desiredRoots := previousRoots
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	inventory, err := gitstate.Inventory(ctx, gw.repoPath)
+	inventory, err := inventoryFn(ctx, gw.repoPath)
 	cancel()
 	if err == nil {
 		desiredRoots = make(map[string]struct{}, len(inventory.Records))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -11,7 +12,14 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/pathkey"
 )
+
+type topologyWatchFamily struct {
+	commonDir string
+	owner     string
+	members   map[string]*GitWatcher
+}
 
 // MultiWatcher manages file watchers across multiple repositories.
 type MultiWatcher struct {
@@ -23,12 +31,15 @@ type MultiWatcher struct {
 	// running state at all — so without this the repo is simply absent from
 	// every health surface and the daemon reports it watched. This is the
 	// only record that it is not.
-	startFailures map[string]string
-	multi         *MultiIndexer
-	logger        *zap.Logger
-	events        chan GraphChangeEvent
-	done          chan struct{}
-	mu            sync.Mutex
+	startFailures        map[string]string
+	topologyFamilies     map[string]*topologyWatchFamily // canonical common dir → family
+	topologyFamilyByRepo map[string]string               // repo prefix → canonical common dir
+	multi                *MultiIndexer
+	logger               *zap.Logger
+	events               chan GraphChangeEvent
+	done                 chan struct{}
+	mu                   sync.Mutex
+	stopped              bool
 
 	// symbolChangeCb is the OnSymbolChange callback registered by the
 	// MCP server (or any other consumer). It's fanned out to every
@@ -52,14 +63,16 @@ func NewMultiWatcher(
 	logger *zap.Logger,
 ) (*MultiWatcher, error) {
 	mw := &MultiWatcher{
-		watchers:      make(map[string]*Watcher),
-		gitWatchers:   make(map[string]*GitWatcher),
-		started:       make(map[string]bool),
-		startFailures: make(map[string]string),
-		multi:         mi,
-		logger:        logger,
-		events:        make(chan GraphChangeEvent, 128),
-		done:          make(chan struct{}),
+		watchers:             make(map[string]*Watcher),
+		gitWatchers:          make(map[string]*GitWatcher),
+		started:              make(map[string]bool),
+		startFailures:        make(map[string]string),
+		topologyFamilies:     make(map[string]*topologyWatchFamily),
+		topologyFamilyByRepo: make(map[string]string),
+		multi:                mi,
+		logger:               logger,
+		events:               make(chan GraphChangeEvent, 128),
+		done:                 make(chan struct{}),
 	}
 
 	for prefix, cfg := range configs {
@@ -125,13 +138,132 @@ func (mw *MultiWatcher) configureGitWatcher(prefix string, gw *GitWatcher) {
 	gw.batchReindex = func(paths []string) (*IndexResult, error) {
 		return mw.multi.IncrementalReindexRepo(prefix, paths)
 	}
+}
+
+// dispatchWorktreeTopologyChange revalidates ownership after GitWatcher's
+// debounce/refresh window. A callback already queued by a removed owner is
+// therefore dropped instead of racing the newly promoted owner and delivering
+// the same family event twice.
+func (mw *MultiWatcher) dispatchWorktreeTopologyChange(prefix string, gw *GitWatcher, rootPath string) {
+	mw.mu.Lock()
+	key, exists := mw.topologyFamilyByRepo[prefix]
+	family := mw.topologyFamilies[key]
+	current := !mw.stopped && exists && family != nil && family.owner == prefix && family.members[prefix] == gw
+	mw.mu.Unlock()
+	if !current {
+		return
+	}
+
 	mw.callbackMu.Lock()
 	callback := mw.worktreeChangeCb
 	mw.callbackMu.Unlock()
 	if callback != nil {
-		gw.OnWorktreeChange(func(rootPath string) {
-			callback(prefix, rootPath)
-		})
+		callback(prefix, rootPath)
+	}
+}
+
+func canonicalGitCommonDir(path string) string {
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = filepath.Clean(resolved)
+	}
+	return path
+}
+
+// topologyFamilyKeyLocked returns the already-established spelling for a Git
+// common directory. SamePathIdentity handles case-folding and filesystem
+// identity at this cold add/remove boundary without weakening distinct paths
+// on case-sensitive volumes.
+func (mw *MultiWatcher) topologyFamilyKeyLocked(commonDir string) string {
+	canonical := canonicalGitCommonDir(commonDir)
+	for key := range mw.topologyFamilies {
+		if pathkey.SamePathIdentity(key, canonical) {
+			return key
+		}
+	}
+	return canonical
+}
+
+func (mw *MultiWatcher) electTopologyOwnerLocked(family *topologyWatchFamily) {
+	if family == nil || len(family.members) == 0 {
+		return
+	}
+	if _, exists := family.members[family.owner]; exists {
+		return
+	}
+	prefixes := make([]string, 0, len(family.members))
+	for prefix := range family.members {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Strings(prefixes)
+	family.owner = prefixes[0]
+	family.members[family.owner].setTopologyOwner(true)
+}
+
+func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatcher) {
+	if gw == nil || mw.stopped {
+		return
+	}
+	commonDir := gw.commonDirectory()
+	if commonDir == "" {
+		return
+	}
+	if prior, exists := mw.topologyFamilyByRepo[prefix]; exists {
+		if family := mw.topologyFamilies[prior]; family != nil && family.members[prefix] == gw {
+			return
+		}
+		mw.unregisterTopologyWatcherLocked(prefix)
+	}
+
+	key := mw.topologyFamilyKeyLocked(commonDir)
+	family := mw.topologyFamilies[key]
+	if family == nil {
+		family = &topologyWatchFamily{
+			commonDir: key,
+			members:   make(map[string]*GitWatcher),
+		}
+		mw.topologyFamilies[key] = family
+	}
+	gw.setTopologyOwner(false)
+	family.members[prefix] = gw
+	mw.topologyFamilyByRepo[prefix] = key
+	mw.electTopologyOwnerLocked(family)
+}
+
+func (mw *MultiWatcher) installStartedGitWatcherLocked(prefix string, gw *GitWatcher) {
+	if gw == nil {
+		return
+	}
+	gw.OnWorktreeChange(func(rootPath string) {
+		mw.dispatchWorktreeTopologyChange(prefix, gw, rootPath)
+	})
+	mw.gitWatchers[prefix] = gw
+	mw.registerTopologyWatcherLocked(prefix, gw)
+}
+
+func (mw *MultiWatcher) unregisterTopologyWatcherLocked(prefix string) {
+	key, exists := mw.topologyFamilyByRepo[prefix]
+	if !exists {
+		return
+	}
+	delete(mw.topologyFamilyByRepo, prefix)
+	family := mw.topologyFamilies[key]
+	if family == nil {
+		return
+	}
+	gw := family.members[prefix]
+	wasOwner := family.owner == prefix
+	delete(family.members, prefix)
+	if gw != nil {
+		gw.setTopologyOwner(false)
+	}
+	if len(family.members) == 0 {
+		delete(mw.topologyFamilies, key)
+		return
+	}
+	if wasOwner {
+		family.owner = ""
+		mw.electTopologyOwnerLocked(family)
 	}
 }
 
@@ -140,6 +272,9 @@ func (mw *MultiWatcher) configureGitWatcher(prefix string, gw *GitWatcher) {
 func (mw *MultiWatcher) Start() error {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
+	if mw.stopped {
+		return fmt.Errorf("multi-watcher is stopped")
+	}
 
 	// Per-repo watcher startup is independent, and each w.Start blocks
 	// ~150ms on macOS draining the FSEvents initial-replay storm (plus
@@ -161,8 +296,11 @@ func (mw *MultiWatcher) Start() error {
 	}
 	prefixes := make([]string, 0, len(mw.watchers))
 	for prefix := range mw.watchers {
-		prefixes = append(prefixes, prefix)
+		if !mw.started[prefix] {
+			prefixes = append(prefixes, prefix)
+		}
 	}
+	sort.Strings(prefixes)
 	results := make([]startResult, len(prefixes))
 	var wg sync.WaitGroup
 	for i, prefix := range prefixes {
@@ -209,6 +347,7 @@ func (mw *MultiWatcher) Start() error {
 			if idx := mw.multi.GetIndexer(prefix); idx != nil {
 				gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
 				if err == nil {
+					gw.setTopologyOwner(false)
 					mw.configureGitWatcher(prefix, gw)
 				}
 				if err != nil {
@@ -236,9 +375,7 @@ func (mw *MultiWatcher) Start() error {
 		}
 		delete(mw.startFailures, res.prefix)
 		mw.started[res.prefix] = true
-		if res.gw != nil {
-			mw.gitWatchers[res.prefix] = res.gw
-		}
+		mw.installStartedGitWatcherLocked(res.prefix, res.gw)
 		// Forward events from this watcher and trigger cross-repo resolution.
 		go mw.forwardEvents(res.prefix, res.w)
 	}
@@ -270,10 +407,13 @@ func (mw *MultiWatcher) forwardEvents(_ string, w *Watcher) {
 
 // Stop halts all per-repo watchers and cleans up resources.
 func (mw *MultiWatcher) Stop() error {
-	close(mw.done)
-
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
+	if mw.stopped {
+		return nil
+	}
+	mw.stopped = true
+	close(mw.done)
 
 	var firstErr error
 	for prefix, w := range mw.watchers {
@@ -292,6 +432,8 @@ func (mw *MultiWatcher) Stop() error {
 			_ = gw.Stop()
 		}
 	}
+	mw.topologyFamilies = make(map[string]*topologyWatchFamily)
+	mw.topologyFamilyByRepo = make(map[string]string)
 
 	return firstErr
 }
@@ -393,22 +535,18 @@ func (mw *MultiWatcher) OnWorktreeChange(cb func(repoPrefix, rootPath string)) {
 		gw     *GitWatcher
 	}
 	mw.mu.Lock()
-	watchers := make([]registered, 0, len(mw.gitWatchers))
-	for prefix, gw := range mw.gitWatchers {
-		watchers = append(watchers, registered{prefix: prefix, gw: gw})
+	owners := make([]registered, 0, len(mw.topologyFamilies))
+	for _, family := range mw.topologyFamilies {
+		if gw := family.members[family.owner]; gw != nil {
+			owners = append(owners, registered{prefix: family.owner, gw: gw})
+		}
 	}
 	mw.mu.Unlock()
 
-	for _, watcher := range watchers {
-		prefix, gw := watcher.prefix, watcher.gw
-		if cb == nil {
-			gw.OnWorktreeChange(nil)
-			continue
+	if cb != nil {
+		for _, owner := range owners {
+			go mw.dispatchWorktreeTopologyChange(owner.prefix, owner.gw, owner.gw.repoPath)
 		}
-		gw.OnWorktreeChange(func(rootPath string) {
-			cb(prefix, rootPath)
-		})
-		go cb(prefix, gw.repoPath)
 	}
 }
 
@@ -494,6 +632,9 @@ func (mw *MultiWatcher) WatchedRepos() (live, configured int) {
 func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
+	if mw.stopped {
+		return fmt.Errorf("multi-watcher is stopped")
+	}
 
 	if _, exists := mw.watchers[repoPrefix]; exists {
 		return fmt.Errorf("watcher already exists for repo: %s", repoPrefix)
@@ -522,9 +663,10 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 	delete(mw.startFailures, repoPrefix)
 	if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
 		if gw, err := NewGitWatcher(meta.RootPath, idx, mw.logger.With(zap.String("repo", repoPrefix))); err == nil {
+			gw.setTopologyOwner(false)
 			mw.configureGitWatcher(repoPrefix, gw)
 			if err := gw.Start(); err == nil {
-				mw.gitWatchers[repoPrefix] = gw
+				mw.installStartedGitWatcherLocked(repoPrefix, gw)
 			} else {
 				_ = gw.Stop()
 			}
@@ -564,6 +706,7 @@ func (mw *MultiWatcher) RemoveRepo(repoPrefix string) error {
 		err = w.Stop()
 	}
 	if gw, ok := mw.gitWatchers[repoPrefix]; ok {
+		mw.unregisterTopologyWatcherLocked(repoPrefix)
 		_ = gw.Stop()
 		delete(mw.gitWatchers, repoPrefix)
 	}

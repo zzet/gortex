@@ -63,6 +63,7 @@ func TestGitWatcherIgnoresWorktreeIndexWritesButKeepsAdministrativeChanges(t *te
 	adminDir := filepath.Join(worktreesDir, "linked")
 	root := filepath.Join(t.TempDir(), "linked-root")
 	watcher := &GitWatcher{
+		topologyOwned: true,
 		worktreesDir:  worktreesDir,
 		worktreeRoots: map[string]struct{}{filepath.Clean(root): {}},
 	}
