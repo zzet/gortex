@@ -333,7 +333,81 @@ type SparseGenerationBuilder struct {
 	Semantic *semantic.Manager
 }
 
-const generationAbandonTimeout = 5 * time.Second
+const (
+	generationAbandonTimeout = 5 * time.Second
+
+	sparsePhysicalBuildStartedMessage   = "sparse generation physical build started"
+	sparsePhysicalBuildCompletedMessage = "sparse generation physical build completed"
+	sparsePhysicalBuildFailedMessage    = "sparse generation physical build failed"
+	sparseReadyReuseMessage             = "sparse generation reused ready payload"
+	sparseFollowerReuseMessage          = "sparse generation joined physical build"
+)
+
+func (b *SparseGenerationBuilder) logSparseBuildReuse(
+	message string,
+	generationID int64,
+	reuseKind string,
+	duration time.Duration,
+	includeSuccess bool,
+	success bool,
+) {
+	checked := b.Logger.Check(zap.DebugLevel, message)
+	if checked == nil {
+		return
+	}
+	fields := []zap.Field{
+		zap.Int64("generation_id", generationID),
+		zap.Bool("coalesced", true),
+		zap.String("reuse_kind", reuseKind),
+		zap.Duration("duration", duration),
+	}
+	if includeSuccess {
+		fields = append(fields, zap.Bool("success", success))
+	}
+	checked.Write(fields...)
+}
+
+func (b *SparseGenerationBuilder) logSparsePhysicalBuildStart(report BuildReport, recovery bool) {
+	if checked := b.Logger.Check(zap.InfoLevel, sparsePhysicalBuildStartedMessage); checked != nil {
+		checked.Write(
+			zap.Int64("generation_id", report.GenerationID),
+			zap.Bool("coalesced", false),
+			zap.Bool("adopted", recovery),
+			zap.Bool("recovery", recovery),
+			zap.Int("changed_files", report.ChangedFiles),
+			zap.Int("added_files", report.AddedFiles),
+			zap.Int("deleted_files", report.DeletedFiles),
+			zap.Int("closure_files", report.ClosureFiles),
+			zap.Bool("closure_truncated", report.ClosureTruncated),
+			zap.Int("indexed_files", len(report.IndexedPaths)),
+			zap.Int64("source_bytes", report.SourceBytes),
+			zap.Duration("planning_duration", report.PlanningDuration),
+		)
+	}
+}
+
+func (b *SparseGenerationBuilder) logSparsePhysicalBuildTerminal(report BuildReport, success bool) {
+	level := zap.InfoLevel
+	message := sparsePhysicalBuildCompletedMessage
+	if !success {
+		level = zap.ErrorLevel
+		message = sparsePhysicalBuildFailedMessage
+	}
+	if checked := b.Logger.Check(level, message); checked != nil {
+		checked.Write(
+			zap.Int64("generation_id", report.GenerationID),
+			zap.Bool("coalesced", false),
+			zap.Bool("success", success),
+			zap.Duration("duration", report.Duration),
+			zap.Int("node_count", report.NodeCount),
+			zap.Int("edge_count", report.EdgeCount),
+			zap.Int("replace_masks", report.ReplaceMasks),
+			zap.Int("delete_masks", report.DeleteMasks),
+			zap.Int("node_tombstones", report.NodeTombstones),
+			zap.Int("edge_source_markers", report.EdgeSourceMarkers),
+		)
+	}
+}
 
 // Build produces one sparse payload generation and publishes it.
 //
@@ -388,24 +462,34 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	if ready {
 		report.Coalesced = true
 		report.Duration = time.Since(started)
+		b.logSparseBuildReuse(sparseReadyReuseMessage, generationID, "ready", report.Duration, false, true)
 		return generationID, report, nil
 	}
 	if !leader {
 		report.Coalesced = true
+		waitStarted := time.Now()
 		err = flight.Wait(ctx)
+		waitDuration := time.Since(waitStarted)
 		report.Duration = time.Since(started)
+		b.logSparseBuildReuse(sparseFollowerReuseMessage, generationID, "in_flight", waitDuration, true, err == nil)
 		return generationID, report, err
 	}
 
 	report.Coalesced = false
 	var buildErr error
 	defer func() {
+		terminalReport := report
+		terminalReport.Duration = time.Since(started)
 		if recovered := recover(); recovered != nil {
-			flight.Complete(fmt.Errorf("indexer: payload generation %d build panicked: %v", generationID, recovered))
+			panicErr := fmt.Errorf("indexer: payload generation %d build panicked: %v", generationID, recovered)
+			b.logSparsePhysicalBuildTerminal(terminalReport, false)
+			flight.Complete(panicErr)
 			panic(recovered)
 		}
+		b.logSparsePhysicalBuildTerminal(terminalReport, buildErr == nil)
 		flight.Complete(buildErr)
 	}()
+	b.logSparsePhysicalBuildStart(report, adopted)
 	buildErr = func() error {
 		// A physical build that dies part way must not leave a generation in the
 		// only mutable state forever. Cleanup completes before followers wake, so
