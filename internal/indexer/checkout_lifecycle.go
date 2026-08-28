@@ -127,6 +127,10 @@ type CheckoutLifecycle struct {
 	rec     *reconcile.Reconciler
 	logger  *zap.Logger
 	now     func() time.Time
+	// buildingRecoveryCutoff is this lifecycle process's start. A building
+	// generation older than it cannot have been created by this process and is
+	// crash residue unless a process-local payload flight has adopted it.
+	buildingRecoveryCutoff int64
 
 	// retryMu owns one deadline timer per family. Filesystem events start the
 	// grace; these timers guarantee its expiry is reconciled even when Git is
@@ -216,9 +220,10 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	l := &CheckoutLifecycle{
 		mi:                cfg.MultiIndexer,
 		cfgMgr:            cfg.ConfigManager,
-		logger:            logger,
-		now:               now,
-		leases:            cfg.ViewLeases,
+		logger:                 logger,
+		now:                    now,
+		buildingRecoveryCutoff: now().Unix(),
+		leases:                 cfg.ViewLeases,
 		coordinators:      map[string]*CheckoutCoordinator{},
 		started:           map[string][]*CheckoutCoordinator{},
 		owed:              map[int64]struct{}{},
@@ -1948,8 +1953,11 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 	owed = append(owed, l.orphanedGenerations(ctx, served, owed)...)
 	retireNewestFirst(owed)
 
+	inUse := func(generationID int64) bool {
+		return l.leases.InUse(generationID) || l.store.PayloadBuildFlightActive(generationID)
+	}
 	for _, generationID := range owed {
-		err := l.store.RetirePayloadGeneration(ctx, generationID, l.leases.InUse)
+		err := l.store.RetirePayloadGeneration(ctx, generationID, inUse)
 		if err != nil && !errors.Is(err, store_sqlite.ErrCatalogNotFound) {
 			continue
 		}
@@ -2032,6 +2040,43 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 	// that backlog directly from the surviving generation rows. Pagination is
 	// deliberate: healthy or still-referenced rows must not pin older orphaned
 	// generations behind the catalog listing bound.
+	const retirementScanPageSize = 512
+	const abandonedBuildingGrace = time.Minute
+	abandonedBuildingBefore := l.now().Add(-abandonedBuildingGrace).Unix()
+	scanRetirementState := func(state store_sqlite.ViewGenerationState, label string) {
+		var beforeGenerationID int64
+		for {
+			rows, scanErr := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+				States:             []store_sqlite.ViewGenerationState{state},
+				BeforeGenerationID: beforeGenerationID,
+				Limit:              retirementScanPageSize,
+			})
+			if scanErr != nil {
+				l.logger.Warn("indexer: could not scan retirement generations",
+					zap.String("state", label), zap.Error(scanErr))
+				return
+			}
+			for _, row := range rows {
+				if state == store_sqlite.ViewGenerationBuilding &&
+					row.CreatedAt >= l.buildingRecoveryCutoff &&
+					row.CreatedAt > abandonedBuildingBefore {
+					continue
+				}
+				if state == store_sqlite.ViewGenerationBuilding &&
+					l.store.PayloadBuildFlightActive(row.GenerationID) {
+					continue
+				}
+				collect(row)
+			}
+			if len(rows) < retirementScanPageSize {
+				return
+			}
+			beforeGenerationID = rows[len(rows)-1].GenerationID
+		}
+	}
+	scanRetirementState(store_sqlite.ViewGenerationFailed, "failed")
+	scanRetirementState(store_sqlite.ViewGenerationBuilding, "building")
+
 	const orphanedGraphPageSize = 512
 	var beforeGenerationID int64
 	for {
@@ -2112,7 +2157,11 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 // mean every restart costs a worktree its view for a whole reconcile interval
 // — an hour, by default.
 func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
-	if l == nil || l.rec == nil {
+	if l == nil {
+		return nil
+	}
+	if l.rec == nil {
+		l.sweepRetirements(ctx)
 		return nil
 	}
 	var errs []error
@@ -2124,6 +2173,10 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	if err := l.rec.Resume(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	// A crash can leave a populated generation in building state before any
+	// cleanup journal exists. Drain prior-process residue during boot instead
+	// of leaving it for the hourly janitor.
+	l.sweepRetirements(ctx)
 
 	seeded := map[string]string{}
 	if l.cfgMgr != nil {

@@ -140,3 +140,16 @@ func (s *Store) PayloadBuildFlightWaiters(generationID int64) int64 {
 	}
 	return value.(*payloadBuildFlightState).waiters.Load()
 }
+
+// PayloadBuildFlightActive reports whether this process currently owns the
+// physical writer rendezvous for a generation. Retirement uses it as a
+// process-local lease: a catalog row may be old because it was adopted after a
+// restart, but it is not abandoned while a recovery leader is actively
+// building it.
+func (s *Store) PayloadBuildFlightActive(generationID int64) bool {
+	if s == nil || s.storeCore == nil || generationID <= 0 {
+		return false
+	}
+	_, ok := s.payloadBuildFlights.Load(generationID)
+	return ok
+}
