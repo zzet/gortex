@@ -1409,7 +1409,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		}
 	}
 
-	generationID, err := c.buildDirtyLayerOver(ctx, route.GraphID, commitGeneration)
+	generationID, err := c.buildDirtyLayerOverSampled(ctx, route.GraphID, commitGeneration, sample)
 	if err != nil {
 		return err
 	}
@@ -1448,11 +1448,24 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
 	ctx context.Context, graphID string, commitGeneration int64,
 ) (int64, error) {
+	sample, err := gitstate.SampleDirty(ctx, c.root)
+	if err != nil {
+		return 0, fmt.Errorf("indexer: sample %s: %w", c.root, err)
+	}
+	return c.buildDirtyLayerOverSampled(ctx, graphID, commitGeneration, sample)
+}
+
+func (c *CheckoutCoordinator) buildDirtyLayerOverSampled(
+	ctx context.Context,
+	graphID string,
+	commitGeneration int64,
+	sample gitstate.DirtySnapshot,
+) (int64, error) {
 	dirtyBase, err := c.commitLayerReader(ctx, commitGeneration)
 	if err != nil {
 		return 0, err
 	}
-	identity := c.dirtyIdentity(graphID, commitGeneration)
+	identity := c.dirtyIdentity(graphID, commitGeneration, sample)
 	for attempt := 0; attempt < 2; attempt++ {
 		started := time.Now()
 		generationID, _, err := c.builder.BuildDirtyLayer(ctx, DirtyLayerRequest{
@@ -1479,6 +1492,13 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 		var torn *DirtySnapshotChangedError
 		if errors.As(err, &torn) {
 			c.offerRetire(ctx, torn.GenerationID)
+		}
+		if attempt+1 < 2 {
+			sample, err = gitstate.SampleDirty(ctx, c.root)
+			if err != nil {
+				return 0, fmt.Errorf("indexer: sample %s: %w", c.root, err)
+			}
+			identity = c.dirtyIdentity(graphID, commitGeneration, sample)
 		}
 	}
 	return 0, nil
@@ -1835,21 +1855,28 @@ func (c *CheckoutCoordinator) commitIdentity(base primaryBase, targetTree string
 	}
 }
 
-// dirtyIdentity is the catalog identity of the working-tree layer. The three
-// fields that identify WHICH working-tree state it describes — the tree, the
-// commit and the content fingerprint — are stamped by BuildDirtyLayer from its
-// own sample, so a caller cannot name one state and build another.
-func (c *CheckoutCoordinator) dirtyIdentity(graphID string, commitGeneration int64) GenerationIdentity {
+// dirtyIdentity is the catalog identity of the working-tree layer. The
+// coordinator's authoritative sample names the requested working-tree state.
+// BuildDirtyLayer samples once more inside the payload flight and rejects drift
+// before it opens or publishes the filesystem source.
+func (c *CheckoutCoordinator) dirtyIdentity(
+	graphID string,
+	commitGeneration int64,
+	sample gitstate.DirtySnapshot,
+) GenerationIdentity {
 	return GenerationIdentity{
-		OwnerKind:         checkoutLayerOwnerKind,
-		GraphID:           graphID,
-		LayerID:           dirtyLayerID(c.checkoutID),
-		CheckoutID:        c.checkoutID,
-		GenerationKind:    DirtyLayerGenerationKind,
-		BaseGenerationID:  commitGeneration,
-		ConfigHash:        c.configHash,
-		ExtractorVersions: c.extractors,
-		ResolverVersion:   checkoutResolverVersion,
+		OwnerKind:            checkoutLayerOwnerKind,
+		GraphID:              graphID,
+		LayerID:              dirtyLayerID(c.checkoutID),
+		CheckoutID:           c.checkoutID,
+		GenerationKind:       DirtyLayerGenerationKind,
+		BaseGenerationID:     commitGeneration,
+		TreeOID:              sample.HeadTree,
+		ProvenanceCommitOID:  sample.HeadCommit,
+		LowerViewFingerprint: sample.Fingerprint,
+		ConfigHash:           c.configHash,
+		ExtractorVersions:    c.extractors,
+		ResolverVersion:      checkoutResolverVersion,
 	}
 }
 

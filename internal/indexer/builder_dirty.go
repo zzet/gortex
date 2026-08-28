@@ -71,7 +71,9 @@ type DirtyLayerRequest struct {
 	// buildBarrier is a test seam: it runs after the payload is written and
 	// before the checkout is re-sampled, which is exactly the window the
 	// fingerprint check exists to close. nil in production.
-	buildBarrier func()
+	buildBarrier    func()
+	identitySampler func(context.Context, string) (gitstate.DirtySnapshot, error)
+	buildSampler    func(context.Context, string) (gitstate.DirtySnapshot, error)
 }
 
 // BuildDirtyLayer builds the sparse generation that turns a checkout's
@@ -92,13 +94,21 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	if req.CheckoutRoot == "" {
 		return 0, BuildReport{}, errors.New("indexer: dirty layer build needs a checkout root")
 	}
+	identitySampler := req.identitySampler
+	if identitySampler == nil {
+		identitySampler = gitstate.SampleDirty
+	}
+	buildSampler := req.buildSampler
+	if buildSampler == nil {
+		buildSampler = gitstate.SampleDirty
+	}
 	identity := req.Identity
 	identity.GenerationKind = DirtyLayerGenerationKind
 	// Coordinators supply the sampled snapshot identity. Keep the compatibility
 	// path for direct callers that predate that contract; routed builds never
 	// pay for this sample before ready adoption or flight coalescing.
 	if identity.LowerViewFingerprint == "" {
-		before, err := gitstate.SampleDirty(ctx, req.CheckoutRoot)
+		before, err := identitySampler(ctx, req.CheckoutRoot)
 		if err != nil {
 			return 0, BuildReport{}, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
 		}
@@ -110,7 +120,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	return b.buildPrepared(ctx, started, identity, func(
 		ctx context.Context, identity GenerationIdentity,
 	) (BuildRequest, func(), error) {
-		before, err := gitstate.SampleDirty(ctx, req.CheckoutRoot)
+		before, err := buildSampler(ctx, req.CheckoutRoot)
 		if err != nil {
 			return BuildRequest{}, nil, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
 		}
