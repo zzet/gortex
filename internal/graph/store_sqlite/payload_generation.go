@@ -181,6 +181,20 @@ func (s *Store) BeginPayloadGenerationWithStatus(
 	if ctx == nil {
 		return 0, nil, false, fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
+	if s == nil || s.storeCore == nil {
+		return 0, nil, false, fmt.Errorf("%w: payload generation needs an open store", ErrCatalogInvalidValue)
+	}
+	s.payloadLifecycleMu.Lock()
+	defer s.payloadLifecycleMu.Unlock()
+	return s.beginPayloadGenerationWithStatus(ctx, req)
+}
+
+// beginPayloadGenerationWithStatus runs with payloadLifecycleMu held. The
+// lifecycle mutex precedes the catalog write gate acquired by adoption.
+func (s *Store) beginPayloadGenerationWithStatus(
+	ctx context.Context,
+	req PayloadGenerationRequest,
+) (generationID int64, handle *Store, adopted bool, err error) {
 	generationID, adopted, err = s.Catalog().AdoptOrCreateViewGeneration(ctx, ViewGeneration{
 		OwnerKind:            req.OwnerKind,
 		GraphID:              req.GraphID,
@@ -480,16 +494,30 @@ func (s *Store) retirePayloadGeneration(
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, refusalReason(refs))
 		return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
 	}
-	if inUse != nil && inUse(generationID) {
-		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
-		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
-	}
-	if beforeRetirementClaim != nil {
-		beforeRetirementClaim()
-	}
-	if err := catalog.beginPayloadGenerationRetirement(ctx, generationID); err != nil {
-		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
-		return err
+	claimErr := func() error {
+		// Lock order is payloadLifecycleMu then the catalog write gate acquired
+		// by beginPayloadGenerationRetirement. A recovery join uses the same
+		// lifecycle mutex, so exactly one side can cross its durable boundary.
+		s.payloadLifecycleMu.Lock()
+		defer s.payloadLifecycleMu.Unlock()
+		if s.payloadBuildFlightActiveLocked(generationID) {
+			return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
+		}
+		if inUse != nil && inUse(generationID) {
+			return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
+		}
+		if beforeRetirementClaim != nil {
+			beforeRetirementClaim()
+		}
+		return catalog.beginPayloadGenerationRetirement(ctx, generationID)
+	}()
+	if claimErr != nil {
+		if errors.Is(claimErr, ErrPayloadGenerationInUse) {
+			viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
+		} else {
+			viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
+		}
+		return claimErr
 	}
 	s.setPayloadSeal(generationID, payloadSealSealed)
 	// A write admitted before the seal closed would otherwise commit rows into

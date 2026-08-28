@@ -29,6 +29,48 @@ type PayloadBuildFlight struct {
 	leader       bool
 }
 
+// PayloadBuildFlightStart is the atomic allocation/adoption and flight-join
+// verdict for one physical payload build.
+type PayloadBuildFlightStart struct {
+	GenerationID int64
+	Handle       *Store
+	Adopted      bool
+	Flight       *PayloadBuildFlight
+	Leader       bool
+	Ready        bool
+}
+
+// BeginPayloadBuildFlight keeps generation adoption and process-local flight
+// installation in one lifecycle critical section. beforeJoin is an observer
+// invoked while that section is held; it must not start another payload
+// lifecycle transition on this store.
+func (s *Store) BeginPayloadBuildFlight(
+	ctx context.Context,
+	req PayloadGenerationRequest,
+	beforeJoin func(generationID int64, adopted bool),
+) (start PayloadBuildFlightStart, err error) {
+	if ctx == nil {
+		return start, fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
+	}
+	if s == nil || s.storeCore == nil {
+		return start, fmt.Errorf("%w: payload build flight needs an open store", ErrCatalogInvalidValue)
+	}
+
+	s.payloadLifecycleMu.Lock()
+	defer s.payloadLifecycleMu.Unlock()
+	start.GenerationID, start.Handle, start.Adopted, err = s.beginPayloadGenerationWithStatus(ctx, req)
+	if err != nil {
+		return start, err
+	}
+	if beforeJoin != nil {
+		beforeJoin(start.GenerationID, start.Adopted)
+	}
+	start.Flight, start.Leader, start.Ready, err = s.joinPayloadBuildFlightLocked(
+		ctx, start.GenerationID, start.Adopted,
+	)
+	return start, err
+}
+
 // JoinPayloadBuildFlight coalesces physical payload construction by catalog
 // generation ID. The returned booleans are mutually exclusive:
 //
@@ -55,6 +97,19 @@ func (s *Store) JoinPayloadBuildFlight(
 		return nil, false, false, fmt.Errorf("%w: payload build flight generation %d", ErrCatalogInvalidValue, generationID)
 	}
 
+	s.payloadLifecycleMu.Lock()
+	defer s.payloadLifecycleMu.Unlock()
+	return s.joinPayloadBuildFlightLocked(ctx, generationID, adopted)
+}
+
+// joinPayloadBuildFlightLocked runs with payloadLifecycleMu held, so retirement
+// cannot claim an adopted generation between flight installation and state
+// validation.
+func (s *Store) joinPayloadBuildFlightLocked(
+	ctx context.Context,
+	generationID int64,
+	adopted bool,
+) (flight *PayloadBuildFlight, leader, ready bool, err error) {
 	candidate := &payloadBuildFlightState{done: make(chan struct{})}
 	actual, loaded := s.payloadBuildFlights.LoadOrStore(generationID, candidate)
 	state := actual.(*payloadBuildFlightState)
@@ -150,6 +205,13 @@ func (s *Store) PayloadBuildFlightActive(generationID int64) bool {
 	if s == nil || s.storeCore == nil || generationID <= 0 {
 		return false
 	}
+	return s.payloadBuildFlightActiveLocked(generationID)
+}
+
+// payloadBuildFlightActiveLocked is the lifecycle-decision form. Callers that
+// use the answer to mutate durable state hold payloadLifecycleMu across this
+// load and their catalog claim.
+func (s *Store) payloadBuildFlightActiveLocked(generationID int64) bool {
 	_, ok := s.payloadBuildFlights.Load(generationID)
 	return ok
 }

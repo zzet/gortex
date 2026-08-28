@@ -83,6 +83,11 @@ type storeCore struct {
 	// int64 generation; values are *sync.Mutex. See ResolveMutex.
 	resolveLanes sync.Map
 
+	// payloadLifecycleMu makes flight installation and durable retirement claims
+	// one atomic lifecycle transition. It must always be acquired before writeMu;
+	// no catalog mutation may acquire it while already holding writeMu.
+	payloadLifecycleMu sync.Mutex
+
 	// payloadBuildFlights maps a catalog generation to its sole process-local
 	// physical writer. Every handle over this core joins the same rendezvous;
 	// entries vanish when the writer completes and are never persisted.

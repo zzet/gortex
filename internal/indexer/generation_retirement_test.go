@@ -218,6 +218,114 @@ func TestCheckoutLifecycleRetirementRetriesAfterActiveBuildFlight(t *testing.T) 
 	requireGenerationRetired(t, fixture.store, id)
 }
 
+func TestCheckoutLifecycleSeedCannotRetireJoiningRecoveryFlight(t *testing.T) {
+	fixture := newSparseBuildFlightFixture(t)
+	ctx := context.Background()
+	started := time.Now()
+	request := fixture.request
+	request.Identity.CreatedAt = started.Add(-time.Hour).Unix()
+	fixtureErr := errors.New("leave populated generation for recovery race")
+	request.PrePublish = func(context.Context, int64) error { return fixtureErr }
+
+	generationID, _, err := fixture.builder.Build(ctx, request)
+	if !errors.Is(err, fixtureErr) {
+		t.Fatalf("seed failed payload generation: got %v, want %v", err, fixtureErr)
+	}
+	if err := fixture.store.Catalog().SetViewGenerationState(ctx, generationID, store_sqlite.ViewGenerationBuilding, store_sqlite.ViewGenerationFailed); err != nil {
+		t.Fatalf("reset failed generation %d to building: %v", generationID, err)
+	}
+	requireGenerationStateWithPayload(t, fixture.store, generationID, store_sqlite.ViewGenerationBuilding)
+
+	joinEntered := make(chan struct{})
+	releaseJoin := make(chan struct{})
+	joinReleased := false
+	defer func() {
+		if !joinReleased {
+			close(releaseJoin)
+		}
+	}()
+	fixture.builder.beforePayloadFlightJoin = func(id int64, adopted bool) {
+		if id != generationID || !adopted {
+			return
+		}
+		close(joinEntered)
+		<-releaseJoin
+	}
+	buildEntered := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	buildReleased := false
+	defer func() {
+		if !buildReleased {
+			close(releaseBuild)
+		}
+	}()
+	request.PrePublish = func(_ context.Context, id int64) error {
+		if id != generationID {
+			return fmt.Errorf("recovery generation = %d, want %d", id, generationID)
+		}
+		close(buildEntered)
+		<-releaseBuild
+		return nil
+	}
+
+	built := make(chan sparseBuildFlightResult, 1)
+	go func() {
+		id, report, buildErr := fixture.builder.Build(ctx, request)
+		built <- sparseBuildFlightResult{generationID: id, report: report, err: buildErr}
+	}()
+	select {
+	case <-joinEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for recovery flight join")
+	}
+
+	lifecycle := newGenerationRetirementLifecycle(fixture.store, started)
+	seeded := make(chan error, 1)
+	go func() { seeded <- lifecycle.Seed(ctx) }()
+	select {
+	case seedErr := <-seeded:
+		t.Fatalf("Seed returned before recovery flight was installed: %v", seedErr)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseJoin)
+	joinReleased = true
+	select {
+	case <-buildEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for recovered physical build")
+	}
+	select {
+	case seedErr := <-seeded:
+		if seedErr != nil {
+			t.Fatalf("Seed: %v", seedErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Seed to observe recovery flight")
+	}
+	requireGenerationStateWithPayload(t, fixture.store, generationID, store_sqlite.ViewGenerationBuilding)
+
+	close(releaseBuild)
+	buildReleased = true
+	select {
+	case result := <-built:
+		if result.err != nil {
+			t.Fatalf("recovered build: %v", result.err)
+		}
+		if result.generationID != generationID {
+			t.Fatalf("recovered generation = %d, want %d", result.generationID, generationID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for recovered build")
+	}
+	requireGenerationStateWithPayload(t, fixture.store, generationID, store_sqlite.ViewGenerationReady)
+
+	if retired := lifecycle.sweepRetirements(ctx); retired != 1 {
+		t.Fatalf("retired generations = %d, want 1", retired)
+	}
+	requireGenerationRetired(t, fixture.store, generationID)
+}
+
 func BenchmarkCheckoutLifecycleRetirementCandidateScan(b *testing.B) {
 	fixture := newSparseBuildFlightFixture(b)
 	ctx := context.Background()

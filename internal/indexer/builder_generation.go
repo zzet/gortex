@@ -483,7 +483,7 @@ func (b *SparseGenerationBuilder) buildPrepared(
 	}
 
 	report := BuildReport{}
-	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
+	flightStart, err := b.Store.BeginPayloadBuildFlight(ctx, store_sqlite.PayloadGenerationRequest{
 		OwnerKind:            identity.OwnerKind,
 		GraphID:              identity.GraphID,
 		LayerID:              identity.LayerID,
@@ -497,21 +497,23 @@ func (b *SparseGenerationBuilder) buildPrepared(
 		ExtractorVersions:    identity.ExtractorVersions,
 		ResolverVersion:      identity.ResolverVersion,
 		CreatedAt:            identity.CreatedAt,
-	})
+	}, b.beforePayloadFlightJoin)
+	generationID := flightStart.GenerationID
 	if err != nil {
-		return 0, BuildReport{}, fmt.Errorf("indexer: begin payload generation: %w", err)
-	}
-	report.GenerationID = generationID
-	if b.beforePayloadFlightJoin != nil {
-		b.beforePayloadFlightJoin(generationID, adopted)
-	}
-
-	flight, leader, ready, err := b.Store.JoinPayloadBuildFlight(ctx, generationID, adopted)
-	if err != nil {
-		report.Coalesced = adopted
+		if generationID == 0 {
+			return 0, BuildReport{}, fmt.Errorf("indexer: begin payload generation: %w", err)
+		}
+		report.GenerationID = generationID
+		report.Coalesced = flightStart.Adopted
 		report.Duration = time.Since(started)
 		return generationID, report, fmt.Errorf("indexer: join payload build flight %d: %w", generationID, err)
 	}
+	handle := flightStart.Handle
+	adopted := flightStart.Adopted
+	flight := flightStart.Flight
+	leader := flightStart.Leader
+	ready := flightStart.Ready
+	report.GenerationID = generationID
 	if ready {
 		report.Coalesced = true
 		report.Duration = time.Since(started)

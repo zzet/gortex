@@ -174,6 +174,158 @@ func TestPayloadBuildFlightRechecksReadyAdoptionAfterFlightRemoval(t *testing.T)
 	}
 }
 
+func payloadLifecycleRaceStore(t testing.TB, suffix string) (*Store, PayloadGenerationRequest) {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), suffix+".sqlite"))
+	if err != nil {
+		t.Fatalf("open payload lifecycle store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store, PayloadGenerationRequest{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        "graph-" + suffix,
+		LayerID:        "layer-" + suffix,
+		CheckoutID:     "checkout-" + suffix,
+		GenerationKind: "commit",
+		TreeOID:        "tree-" + suffix,
+		CreatedAt:      time.Now().Unix(),
+	}
+}
+
+func TestPayloadBuildFlightStartExcludesRetirementClaim(t *testing.T) {
+	store, request := payloadLifecycleRaceStore(t, "flight-wins")
+	ctx := context.Background()
+	generationID, _, adopted, err := store.BeginPayloadGenerationWithStatus(ctx, request)
+	if err != nil || adopted {
+		t.Fatalf("seed building generation: adopted=%t err=%v", adopted, err)
+	}
+
+	joinEntered := make(chan struct{})
+	releaseJoin := make(chan struct{})
+	type startResult struct {
+		start PayloadBuildFlightStart
+		err   error
+	}
+	started := make(chan startResult, 1)
+	go func() {
+		start, startErr := store.BeginPayloadBuildFlight(ctx, request, func(id int64, wasAdopted bool) {
+			if id != generationID || !wasAdopted {
+				return
+			}
+			close(joinEntered)
+			<-releaseJoin
+		})
+		started <- startResult{start: start, err: startErr}
+	}()
+	select {
+	case <-joinEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("recovery join did not enter lifecycle critical section")
+	}
+
+	retired := make(chan error, 1)
+	go func() { retired <- store.RetirePayloadGeneration(ctx, generationID, nil) }()
+	select {
+	case err := <-retired:
+		t.Fatalf("retirement crossed an in-progress recovery join: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseJoin)
+	var result startResult
+	select {
+	case result = <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("recovery join did not finish")
+	}
+	if result.err != nil || !result.start.Adopted || !result.start.Leader || result.start.Ready {
+		t.Fatalf("recovery start = (%+v, %v)", result.start, result.err)
+	}
+	select {
+	case err := <-retired:
+		if !errors.Is(err, ErrPayloadGenerationInUse) {
+			t.Fatalf("retirement after recovery flight = %v, want in use", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("retirement did not observe installed recovery flight")
+	}
+	row, found, err := store.Catalog().GetViewGeneration(ctx, generationID)
+	if err != nil || !found || row.State != ViewGenerationBuilding {
+		t.Fatalf("protected generation = (%+v, %t, %v)", row, found, err)
+	}
+
+	result.start.Flight.Complete(nil)
+	if err := store.RetirePayloadGeneration(ctx, generationID, nil); err != nil {
+		t.Fatalf("retire after flight completion: %v", err)
+	}
+}
+
+func TestPayloadRetirementClaimExcludesRecoveryFlightJoin(t *testing.T) {
+	store, request := payloadLifecycleRaceStore(t, "retirement-wins")
+	ctx := context.Background()
+	generationID, _, adopted, err := store.BeginPayloadGenerationWithStatus(ctx, request)
+	if err != nil || adopted {
+		t.Fatalf("seed building generation: adopted=%t err=%v", adopted, err)
+	}
+
+	claimEntered := make(chan struct{})
+	releaseClaim := make(chan struct{})
+	retired := make(chan error, 1)
+	go func() {
+		retired <- store.retirePayloadGeneration(ctx, generationID, nil, func() {
+			close(claimEntered)
+			<-releaseClaim
+		})
+	}()
+	select {
+	case <-claimEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("retirement did not enter lifecycle critical section")
+	}
+
+	type joinResult struct {
+		flight *PayloadBuildFlight
+		leader bool
+		ready  bool
+		err    error
+	}
+	joined := make(chan joinResult, 1)
+	go func() {
+		flight, leader, ready, joinErr := store.JoinPayloadBuildFlight(ctx, generationID, true)
+		joined <- joinResult{flight: flight, leader: leader, ready: ready, err: joinErr}
+	}()
+	select {
+	case result := <-joined:
+		t.Fatalf("recovery join crossed an in-progress retirement claim: %+v", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseClaim)
+	select {
+	case err := <-retired:
+		if err != nil {
+			t.Fatalf("retire generation: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("retirement did not finish")
+	}
+	select {
+	case result := <-joined:
+		if result.err == nil || result.flight != nil || result.leader || result.ready {
+			t.Fatalf("join after retirement claim = %+v", result)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("recovery join did not classify retired generation")
+	}
+	if store.PayloadBuildFlightActive(generationID) {
+		t.Fatalf("retired generation %d retained a recovery flight", generationID)
+	}
+	_, found, err := store.Catalog().GetViewGeneration(ctx, generationID)
+	if err != nil || found {
+		t.Fatalf("retired generation row found=%t err=%v", found, err)
+	}
+}
+
 func BenchmarkPayloadBuildFlight(b *testing.B) {
 	for _, callers := range []int{1, 8, 64} {
 		b.Run(fmt.Sprintf("%d_callers", callers), func(b *testing.B) {
