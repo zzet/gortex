@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -41,6 +42,12 @@ func newTopologyWatchFixture(tb testing.TB, worktrees int) *topologyWatchFixture
 	commonDir := filepath.Join(base, "common.git")
 	worktreesDir := filepath.Join(commonDir, "worktrees")
 	if err := os.MkdirAll(worktreesDir, 0o755); err != nil {
+		tb.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(commonDir, "refs", "heads"), 0o755); err != nil {
+		tb.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(commonDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		tb.Fatal(err)
 	}
 
@@ -83,8 +90,13 @@ func (fixture *topologyWatchFixture) watcher(index int) *GitWatcher {
 		repoPath:          root,
 		logger:            zap.NewNop(),
 		debounce:          5 * time.Millisecond,
+		gitDir:            fixture.commonDir,
 		commonDir:         fixture.commonDir,
 		worktreesDir:      fixture.worktreesDir,
+		topologyRetryBase: 5 * time.Millisecond,
+		topologyRetryMax:  20 * time.Millisecond,
+		refPaths:          make(map[string]struct{}),
+		refAdd:            func(string) error { return nil },
 		topologyPaths:     make(map[string]struct{}),
 		worktreeRoots:     make(map[string]struct{}),
 		worktreeAdminDirs: make(map[string]struct{}),
@@ -154,8 +166,11 @@ func newTopologyRegistry() *MultiWatcher {
 
 func installTopologyWatcher(mw *MultiWatcher, prefix string, watcher *GitWatcher) {
 	mw.mu.Lock()
-	drain := mw.installStartedGitWatcherLocked(prefix, watcher)
+	drain, err := mw.installStartedGitWatcherLocked(prefix, watcher)
 	mw.mu.Unlock()
+	if err != nil {
+		panic(err)
+	}
 	if drain != nil {
 		waitTopologyDispatchDrains(drain)
 	}
@@ -255,6 +270,506 @@ func assertOneTopologyCallback(t *testing.T, count *atomic.Int64, debounce time.
 	if got := count.Load(); got != 1 {
 		t.Fatalf("topology callback count = %d, want exactly 1", got)
 	}
+}
+
+func TestMultiWatcherTopologyInitialAddFailureRejectsOwner(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 1)
+	watcher := fixture.watcher(0)
+	makeTopologyWatcherStopSafe(t, watcher)
+	originalAdd := watcher.topologyAdd
+	fail := true
+	watcher.topologyAdd = func(path string) error {
+		if fail {
+			fail = false
+			return errors.New("injected topology registration failure")
+		}
+		return originalAdd(path)
+	}
+	mw := newTopologyRegistry()
+
+	mw.mu.Lock()
+	drain, err := mw.installStartedGitWatcherLocked("repo-000", watcher)
+	mw.mu.Unlock()
+	waitTopologyDispatchDrains(drain)
+	if err == nil || !strings.Contains(err.Error(), "injected topology registration failure") {
+		t.Fatalf("initial topology admission error = %v", err)
+	}
+	families, owner, members := topologyFamilySnapshot(mw)
+	if families != 0 || owner != "" || members != 0 {
+		t.Fatalf("failed admission published family = families:%d owner:%q members:%d", families, owner, members)
+	}
+	mw.mu.Lock()
+	_, hasGit := mw.gitWatchers["repo-000"]
+	_, hasFamily := mw.topologyFamilyByRepo["repo-000"]
+	mw.mu.Unlock()
+	if hasGit || hasFamily {
+		t.Fatalf("failed admission published watcher membership = git:%t family:%t", hasGit, hasFamily)
+	}
+	if owned, paths := watcherTopologySnapshot(watcher); owned || paths != 0 {
+		t.Fatalf("failed owner state = owned:%t paths:%d, want false/0", owned, paths)
+	}
+	if unique, duplicates, active := fixture.activeStats(); unique != 0 || duplicates != 0 || active != 0 {
+		t.Fatalf("failed admission registrations = %d/%d/%d, want 0/0/0", unique, duplicates, active)
+	}
+
+	// The same exact admission is retryable once the external watch service
+	// recovers; exactly one owner and one copy of each path are published.
+	installTopologyWatcher(mw, "repo-000", watcher)
+	families, owner, members = topologyFamilySnapshot(mw)
+	if families != 1 || owner != "repo-000" || members != 1 {
+		t.Fatalf("retried family = families:%d owner:%q members:%d", families, owner, members)
+	}
+	unique, duplicates, active := fixture.activeStats()
+	expected := 2*len(fixture.roots) + 2
+	if unique != expected || duplicates != 0 || active != expected {
+		t.Fatalf("retried registrations = %d/%d/%d, want %d/0/%d", unique, duplicates, active, expected, expected)
+	}
+	removeTopologyWatcher(mw, "repo-000")
+}
+
+func TestMultiWatcherTopologyRefreshFailureRetriesWithoutDroppingWatcher(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 1)
+	watcher := fixture.watcher(0)
+	makeTopologyWatcherStopSafe(t, watcher)
+	mw := newTopologyRegistry()
+	mw.watchers["repo-000"] = &Watcher{}
+	installTopologyWatcher(mw, "repo-000", watcher)
+	var topologyCallbacks atomic.Int64
+	mw.OnWorktreeChange(func(string, string) { topologyCallbacks.Add(1) })
+	// Drain the owner-election synthetic nudge; the assertion below measures
+	// only the nudge caused by recovery from the injected degraded state.
+	assertOneTopologyCallback(t, &topologyCallbacks, watcher.debounce)
+	topologyCallbacks.Store(0)
+
+	target := fixture.roots[0]
+	watcher.removeTopologyPath(target)
+	originalAdd := watcher.topologyAdd
+	var attempts atomic.Int64
+	watcher.topologyAdd = func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(target) && attempts.Add(1) == 1 {
+			return errors.New("injected refresh registration failure")
+		}
+		return originalAdd(path)
+	}
+
+	watcher.refreshTopologyWatches()
+	if reason := watcher.topologyDegradedReason(); !strings.Contains(reason, "injected refresh registration failure") {
+		t.Fatalf("degraded reason = %q", reason)
+	}
+	if reason := mw.DegradedReason(); !strings.Contains(reason, "Git worktree topology watcher is degraded") {
+		t.Fatalf("multi-watcher degraded reason = %q", reason)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if watcher.topologyDegradedReason() == "" && attempts.Load() >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if reason := watcher.topologyDegradedReason(); reason != "" {
+		t.Fatalf("topology retry did not recover: %s", reason)
+	}
+	assertOneTopologyCallback(t, &topologyCallbacks, watcher.debounce)
+	mw.mu.Lock()
+	published := mw.gitWatchers["repo-000"] == watcher && mw.topologyFamilyByRepo["repo-000"] != ""
+	mw.mu.Unlock()
+	if !published {
+		t.Fatal("refresh failure removed the established watcher")
+	}
+	unique, duplicates, active := fixture.activeStats()
+	expected := 2*len(fixture.roots) + 2
+	if unique != expected || duplicates != 0 || active != expected {
+		t.Fatalf("recovered registrations = %d/%d/%d, want %d/0/%d", unique, duplicates, active, expected, expected)
+	}
+	removeTopologyWatcher(mw, "repo-000")
+}
+
+func TestGitWatcherStopWaitsForTopologyRetry(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 1)
+	watcher := fixture.watcher(0)
+	makeTopologyWatcherStopSafe(t, watcher)
+	mw := newTopologyRegistry()
+	installTopologyWatcher(mw, "repo-000", watcher)
+
+	target := fixture.roots[0]
+	watcher.removeTopologyPath(target)
+	originalAdd := watcher.topologyAdd
+	var attempts atomic.Int64
+	retryEntered := make(chan struct{})
+	retryRelease := make(chan struct{})
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(retryRelease) }) })
+	watcher.topologyAdd = func(path string) error {
+		if filepath.Clean(path) != filepath.Clean(target) {
+			return originalAdd(path)
+		}
+		switch attempts.Add(1) {
+		case 1:
+			return errors.New("injected retryable topology failure")
+		case 2:
+			close(retryEntered)
+			<-retryRelease
+		}
+		return originalAdd(path)
+	}
+
+	watcher.refreshTopologyWatches()
+	select {
+	case <-retryEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("topology retry did not enter the injected registration barrier")
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- watcher.Stop() }()
+	assertTopologyLifecycleBlocked(t, stopped, "GitWatcher.Stop during topology retry")
+	release.Do(func() { close(retryRelease) })
+	if err := <-stopped; err != nil {
+		t.Fatalf("GitWatcher.Stop: %v", err)
+	}
+	attemptsAfterStop := attempts.Load()
+	time.Sleep(4 * watcher.debounce)
+	if got := attempts.Load(); got != attemptsAfterStop {
+		t.Fatalf("topology registration attempts after Stop = %d, want %d", got, attemptsAfterStop)
+	}
+	watcher.topologyRetryMu.Lock()
+	closing := watcher.topologyRetryClosing
+	timer := watcher.topologyRetryTimer
+	watcher.topologyRetryMu.Unlock()
+	if !closing || timer != nil {
+		t.Fatalf("retry teardown = closing:%t timer:%v, want true/nil", closing, timer != nil)
+	}
+	removeTopologyWatcher(mw, "repo-000")
+}
+
+func TestGitWatcherStartRejectsRefWatchFailure(t *testing.T) {
+	for _, relativePath := range []string{"HEAD", "packed-refs", filepath.Join("refs", "heads")} {
+		relativePath := relativePath
+		t.Run(strings.ReplaceAll(relativePath, string(filepath.Separator), "_"), func(t *testing.T) {
+			watcher := newGitRefWatcherFixture(t)
+			watcher.refAdd = func(path string) error {
+				if strings.HasSuffix(filepath.ToSlash(filepath.Clean(path)), filepath.ToSlash(relativePath)) {
+					return fmt.Errorf("injected %s registration failure", relativePath)
+				}
+				return nil
+			}
+
+			err := watcher.Start()
+			if err == nil || !strings.Contains(err.Error(), "injected "+relativePath+" registration failure") {
+				t.Fatalf("GitWatcher.Start error = %v, want injected ref registration failure", err)
+			}
+			watcher.mu.Lock()
+			loopStarted := watcher.loopStarted
+			watcher.mu.Unlock()
+			if loopStarted {
+				t.Fatal("failed ref admission launched the Git watcher loop")
+			}
+		})
+	}
+}
+
+func TestGitWatcherRefRefreshFailureUsesSharedRetry(t *testing.T) {
+	watcher := newGitRefWatcherFixture(t)
+	watcher.refAdd = func(string) error { return nil }
+	if err := watcher.Start(); err != nil {
+		t.Fatalf("GitWatcher.Start: %v", err)
+	}
+
+	watcher.mu.Lock()
+	headPath := filepath.Join(watcher.gitDir, "HEAD")
+	watcher.mu.Unlock()
+	if !watcher.invalidateRefWatch(headPath) {
+		t.Fatal("HEAD ref watch was not registered")
+	}
+	var attempts atomic.Int64
+	watcher.refAdd = func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(headPath) && attempts.Add(1) == 1 {
+			return errors.New("injected runtime HEAD registration failure")
+		}
+		return nil
+	}
+
+	err := watcher.refreshRequiredWatchesChecked()
+	watcher.recordTopologyRefresh(err)
+	if reason := watcher.topologyDegradedReason(); !strings.Contains(reason, "injected runtime HEAD registration failure") {
+		t.Fatalf("degraded reason = %q", reason)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if watcher.topologyDegradedReason() == "" && attempts.Load() >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if reason := watcher.topologyDegradedReason(); reason != "" {
+		t.Fatalf("ref retry did not recover: %s", reason)
+	}
+	watcher.topologyRetryMu.Lock()
+	attemptCount := watcher.topologyRetryAttempts
+	timer := watcher.topologyRetryTimer
+	watcher.topologyRetryMu.Unlock()
+	if attemptCount != 0 || timer != nil {
+		t.Fatalf("successful ref refresh did not reset retry state: attempts=%d timer=%v", attemptCount, timer != nil)
+	}
+}
+
+func TestGitWatcherRefRecoveryReconcilesMissedHeadAdvance(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	runGitWatcherTestCommand(t, root, "init", "-q")
+	trackedPath := filepath.Join(root, "main.go")
+	if err := os.WriteFile(trackedPath, []byte("package main\n\nfunc Version() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatalf("write initial source: %v", err)
+	}
+	runGitWatcherTestCommand(t, root, "add", "main.go")
+	runGitWatcherTestCommand(t, root,
+		"-c", "user.name=Gortex Test", "-c", "user.email=gortex@example.invalid",
+		"commit", "-qm", "initial")
+
+	manager, err := config.NewConfigManager(filepath.Join(base, "config.yaml"))
+	if err != nil {
+		t.Fatalf("NewConfigManager: %v", err)
+	}
+	manager.Global().Repos = []config.RepoEntry{{Path: root, Name: "ref-recovery"}}
+	if err := manager.Global().Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	store := graph.New()
+	registry := parser.NewRegistry()
+	registry.Register(languages.NewGoExtractor())
+	multi := NewMultiIndexer(store, registry, search.NewNull(), manager, zap.NewNop())
+	if _, err := multi.IndexAll(); err != nil {
+		t.Fatalf("IndexAll: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := multi.Close(context.Background()); err != nil {
+			t.Errorf("MultiIndexer.Close: %v", err)
+		}
+	})
+	idx := multi.GetIndexer("ref-recovery")
+	if idx == nil {
+		t.Fatal("indexed repository is unavailable")
+	}
+
+	watcher, err := NewGitWatcher(root, idx, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewGitWatcher: %v", err)
+	}
+	watcher.setTopologyOwner(false)
+	watcher.debounce = 5 * time.Millisecond
+	watcher.topologyRetryBase = 5 * time.Millisecond
+	watcher.topologyRetryMax = 20 * time.Millisecond
+	watcher.currentIndexer = func() *Indexer { return multi.GetIndexer("ref-recovery") }
+	watcher.batchReindex = func(paths []string) (*IndexResult, error) {
+		return multi.IncrementalReindexRepo("ref-recovery", paths)
+	}
+	// The test drives ref registration explicitly; no real fsnotify event can
+	// mask the missed-event recovery assertion.
+	watcher.refAdd = func(string) error { return nil }
+	var topologyNudges atomic.Int64
+	watcher.topologyChange = func(string) { topologyNudges.Add(1) }
+	reconciled := make(chan struct{})
+	var reconcileOnce sync.Once
+	watcher.drained = func(int) { reconcileOnce.Do(func() { close(reconciled) }) }
+	if err := watcher.Start(); err != nil {
+		t.Fatalf("GitWatcher.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := watcher.Stop(); err != nil {
+			t.Errorf("GitWatcher.Stop: %v", err)
+		}
+	})
+
+	watcher.mu.Lock()
+	oldSHA := watcher.lastSHA
+	headPath := filepath.Join(watcher.gitDir, "HEAD")
+	watcher.mu.Unlock()
+	if oldSHA == "" {
+		t.Fatal("GitWatcher did not capture initial HEAD")
+	}
+	if !watcher.invalidateRefWatch(headPath) {
+		t.Fatal("HEAD watch was not present before injected outage")
+	}
+	var registrationAttempts atomic.Int64
+	watcher.refAdd = func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(headPath) && registrationAttempts.Add(1) == 1 {
+			return errors.New("injected HEAD watch outage")
+		}
+		return nil
+	}
+
+	if err := os.WriteFile(trackedPath, []byte("package main\n\nfunc Version() int { return 2 }\n"), 0o644); err != nil {
+		t.Fatalf("write advanced source: %v", err)
+	}
+	runGitWatcherTestCommand(t, root, "add", "main.go")
+	runGitWatcherTestCommand(t, root,
+		"-c", "user.name=Gortex Test", "-c", "user.email=gortex@example.invalid",
+		"commit", "-qm", "advance-during-outage")
+	newSHA := strings.TrimSpace(runGitWatcherTestOutput(t, root, "rev-parse", "HEAD"))
+	if newSHA == "" || newSHA == oldSHA {
+		t.Fatalf("advanced HEAD = %q, initial = %q", newSHA, oldSHA)
+	}
+
+	err = watcher.refreshRequiredWatchesChecked()
+	if err == nil || !strings.Contains(err.Error(), "injected HEAD watch outage") {
+		t.Fatalf("outage refresh error = %v", err)
+	}
+	watcher.recordTopologyRefresh(err)
+	select {
+	case <-reconciled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovered ref watch did not reconcile the missed HEAD advance")
+	}
+	watcher.mu.Lock()
+	caughtUpSHA := watcher.lastSHA
+	watcher.mu.Unlock()
+	if caughtUpSHA != newSHA {
+		t.Fatalf("recovered watcher HEAD = %q, want %q", caughtUpSHA, newSHA)
+	}
+	if attempts := registrationAttempts.Load(); attempts < 2 {
+		t.Fatalf("HEAD registration attempts = %d, want failure plus retry", attempts)
+	}
+	time.Sleep(4 * watcher.debounce)
+	if got := topologyNudges.Load(); got != 0 {
+		t.Fatalf("follower recovery emitted %d family topology nudges, want 0", got)
+	}
+}
+
+func runGitWatcherTestCommand(t testing.TB, dir string, args ...string) {
+	t.Helper()
+	_ = runGitWatcherTestOutput(t, dir, args...)
+}
+
+func runGitWatcherTestOutput(t testing.TB, dir string, args ...string) string {
+	t.Helper()
+	commandArgs := append([]string{"-C", dir}, args...)
+	command := exec.Command("git", commandArgs...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return string(output)
+}
+
+func TestTopologyRetryDelayBacksOffCapsAndCoalesces(t *testing.T) {
+	base := 10 * time.Millisecond
+	maximum := 40 * time.Millisecond
+	for attempt, want := range []time.Duration{base, 2 * base, maximum, maximum, maximum} {
+		if got := topologyRetryDelay(base, maximum, uint32(attempt)); got != want {
+			t.Fatalf("topologyRetryDelay attempt %d = %s, want %s", attempt, got, want)
+		}
+	}
+
+	watcher := &GitWatcher{
+		topologyOwned:     true,
+		topologyRetryBase: time.Hour,
+		topologyRetryMax:  time.Hour,
+	}
+	for i := 0; i < 32; i++ {
+		watcher.recordTopologyRefresh(errors.New("persistent registration failure"))
+	}
+	watcher.topologyRetryMu.Lock()
+	attempts := watcher.topologyRetryAttempts
+	timer := watcher.topologyRetryTimer
+	watcher.topologyRetryMu.Unlock()
+	if attempts != 1 || timer == nil {
+		t.Fatalf("coalesced retry state = attempts:%d timer:%v, want 1/true", attempts, timer != nil)
+	}
+	watcher.cancelTopologyRetry()
+}
+
+func newGitRefWatcherFixture(t *testing.T) *GitWatcher {
+	t.Helper()
+	root := t.TempDir()
+	command := exec.Command("git", "-C", root, "init", "-q")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "packed-refs"), []byte("# pack-refs with: peeled fully-peeled sorted\n"), 0o644); err != nil {
+		t.Fatalf("write packed-refs: %v", err)
+	}
+	watcher, err := NewGitWatcher(root, nil, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewGitWatcher: %v", err)
+	}
+	watcher.setTopologyOwner(false)
+	if reason := watcher.topologyDegradedReason(); reason != "" {
+		t.Fatalf("pre-start follower demotion degraded watcher: %s", reason)
+	}
+	watcher.topologyRetryBase = 5 * time.Millisecond
+	watcher.topologyRetryMax = 20 * time.Millisecond
+	t.Cleanup(func() {
+		if err := watcher.Stop(); err != nil {
+			t.Errorf("GitWatcher.Stop: %v", err)
+		}
+	})
+	return watcher
+}
+
+func BenchmarkGitWatcherRecoveryScheduling(b *testing.B) {
+	for _, owner := range []bool{false, true} {
+		name := "follower"
+		if owner {
+			name = "owner"
+		}
+		b.Run(name, func(b *testing.B) {
+			watcher := &GitWatcher{
+				logger:        zap.NewNop(),
+				debounce:      time.Hour,
+				topologyOwned: owner,
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				watcher.scheduleReconcile("git-watch-recovered")
+				watcher.scheduleTopologyChange("topology-watch-recovered")
+			}
+			b.StopTimer()
+			watcher.mu.Lock()
+			fireTimer := watcher.fireTimer
+			topologyTimer := watcher.topologyTimer
+			watcher.mu.Unlock()
+			if fireTimer == nil {
+				b.Fatal("recovery did not retain a per-watcher reconcile timer")
+			}
+			fireTimer.Stop()
+			if owner && topologyTimer == nil {
+				b.Fatal("owner recovery did not retain a topology timer")
+			}
+			if !owner && topologyTimer != nil {
+				b.Fatal("follower recovery retained a family topology timer")
+			}
+			if topologyTimer != nil {
+				topologyTimer.Stop()
+			}
+		})
+	}
+}
+
+func BenchmarkGitWatcherPersistentFailureCoalescing(b *testing.B) {
+	watcher := &GitWatcher{
+		topologyOwned:     true,
+		topologyRetryBase: time.Hour,
+		topologyRetryMax:  time.Hour,
+	}
+	failure := errors.New("persistent registration failure")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		watcher.recordTopologyRefresh(failure)
+	}
+	b.StopTimer()
+	watcher.topologyRetryMu.Lock()
+	attempts := watcher.topologyRetryAttempts
+	timer := watcher.topologyRetryTimer
+	watcher.topologyRetryMu.Unlock()
+	if attempts != 1 || timer == nil {
+		b.Fatalf("coalesced retry state = attempts:%d timer:%v, want 1/true", attempts, timer != nil)
+	}
+	watcher.cancelTopologyRetry()
 }
 
 func TestMultiWatcherTopologyFamilySharesInventoryAndRegistrations(t *testing.T) {
@@ -1725,6 +2240,109 @@ func BenchmarkMultiWatcherTopologyFamilyRealInventory(b *testing.B) {
 			b.ReportMetric(float64(inventories)/float64(b.N), "inventory/op")
 			b.ReportMetric(float64(paths), "topology-paths/op")
 			b.ReportMetric(0, "duplicate-paths/op")
+		})
+	}
+}
+
+func BenchmarkMultiWatcherEnsureMissingFamily(b *testing.B) {
+	for _, prefixes := range []int{1, 8, 64} {
+		b.Run(fmt.Sprintf("prefixes_%d", prefixes), func(b *testing.B) {
+			_, roots := newRealTopologyFamilyBenchmark(b, prefixes)
+			base := b.TempDir()
+			cm, err := config.NewConfigManager(filepath.Join(base, "config.yaml"))
+			if err != nil {
+				b.Fatalf("create config manager: %v", err)
+			}
+			entries := make([]config.RepoEntry, prefixes)
+			watchConfigs := make(map[string]config.WatchConfig, prefixes)
+			for i, root := range roots {
+				prefix := fmt.Sprintf("repo-%03d", i)
+				entries[i] = config.RepoEntry{Path: root, Name: prefix}
+				watchConfigs[prefix] = config.WatchConfig{
+					Enabled: true, DebounceMs: 50, StormThreshold: -1,
+				}
+			}
+			cm.Global().Repos = entries
+			if err := cm.Global().Save(); err != nil {
+				b.Fatalf("save benchmark config: %v", err)
+			}
+			g := graph.New()
+			registry := parser.NewRegistry()
+			registry.Register(languages.NewGoExtractor())
+			mi := NewMultiIndexer(g, registry, search.NewNull(), cm, zap.NewNop())
+			if _, err := mi.IndexAll(); err != nil {
+				b.Fatalf("index benchmark family: %v", err)
+			}
+			b.Cleanup(func() { _ = mi.Close(context.Background()) })
+
+			expectedPaths := 2 * prefixes
+			if prefixes > 1 {
+				expectedPaths++ // the shared worktrees directory exists only with linked worktrees
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				mw, err := NewMultiWatcher(mi, map[string]config.WatchConfig{}, zap.NewNop())
+				if err != nil {
+					b.Fatalf("create empty multi-watcher: %v", err)
+				}
+				if err := mw.Start(); err != nil {
+					b.Fatalf("start empty multi-watcher: %v", err)
+				}
+				for i := 0; i < prefixes; i++ {
+					prefix := fmt.Sprintf("repo-%03d", i)
+					if err := mw.EnsureRepoContext(context.Background(), prefix, watchConfigs[prefix]); err != nil {
+						b.Fatalf("ensure %s: %v", prefix, err)
+					}
+				}
+				b.StopTimer()
+
+				families, owner, members := topologyFamilySnapshot(mw)
+				if families != 1 || owner == "" || members != prefixes {
+					b.Fatalf("family state = families:%d owner:%q members:%d, want 1/nonempty/%d",
+						families, owner, members, prefixes)
+				}
+				mw.mu.Lock()
+				ownerWatcher := mw.gitWatchers[owner]
+				liveWatchers := len(mw.watchers)
+				liveGitWatchers := len(mw.gitWatchers)
+				liveForwarders := len(mw.forwarders)
+				mw.mu.Unlock()
+				owned, paths := watcherTopologySnapshot(ownerWatcher)
+				if !owned || paths != expectedPaths || liveWatchers != prefixes ||
+					liveGitWatchers != prefixes || liveForwarders != prefixes {
+					b.Fatalf("live state = owned:%t paths:%d watchers:%d git:%d forwarders:%d, want true/%d/%d/%d/%d",
+						owned, paths, liveWatchers, liveGitWatchers, liveForwarders,
+						expectedPaths, prefixes, prefixes, prefixes)
+				}
+				for i := 0; i < prefixes; i++ {
+					prefix := fmt.Sprintf("repo-%03d", i)
+					if err := mw.RemoveRepoContext(context.Background(), prefix); err != nil {
+						b.Fatalf("remove %s: %v", prefix, err)
+					}
+				}
+				if err := mw.Stop(); err != nil {
+					b.Fatalf("stop multi-watcher: %v", err)
+				}
+				mw.mu.Lock()
+				leakedWatchers := len(mw.watchers)
+				leakedGitWatchers := len(mw.gitWatchers)
+				leakedForwarders := len(mw.forwarders)
+				leakedRetirements := len(mw.retiringWatchers)
+				leakedPending := len(mw.pendingWatcherAdds)
+				leakedFamilies := len(mw.topologyFamilies)
+				mw.mu.Unlock()
+				if leakedWatchers+leakedGitWatchers+leakedForwarders+leakedRetirements+leakedPending+leakedFamilies != 0 {
+					b.Fatalf("teardown leaks = watchers:%d git:%d forwarders:%d retirements:%d pending:%d families:%d",
+						leakedWatchers, leakedGitWatchers, leakedForwarders,
+						leakedRetirements, leakedPending, leakedFamilies)
+				}
+				b.StartTimer()
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(prefixes), "watchers/op")
+			b.ReportMetric(float64(expectedPaths), "topology-paths/op")
+			b.ReportMetric(0, "teardown-leaks/op")
 		})
 	}
 }

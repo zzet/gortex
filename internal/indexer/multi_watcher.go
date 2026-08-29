@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,11 @@ type topologyDispatchEpoch struct {
 
 type topologyDispatchContextKey struct{}
 type pendingWatcherAddContextKey struct{}
+
+// boundedWatcherRepairContextKey marks controller attachment repair. Unlike an
+// admitted Add/Ensure intent, this snapshot repair may return at its deadline;
+// durable config and lifecycle retries will re-admit it later.
+type boundedWatcherRepairContextKey struct{}
 
 type topologyDispatchToken struct {
 	mw     *MultiWatcher
@@ -454,39 +460,75 @@ func (mw *MultiWatcher) topologyFamilyKeyLocked(commonDir string) string {
 }
 
 func (mw *MultiWatcher) electTopologyOwnerLocked(family *topologyWatchFamily) {
+	err := mw.electTopologyOwnerCheckedLocked(family)
+	if err == nil {
+		return
+	}
+	if mw.logger != nil {
+		mw.logger.Warn("git-watcher: topology owner is degraded", zap.Error(err))
+	}
+
+	// Established-family handoff cannot roll back the surviving file watcher.
+	// Keep one non-conflicting owner epoch and let GitWatcher retry its required
+	// topology paths; initial admission uses the checked method directly.
 	if family == nil || family.handoff != nil || len(family.members) == 0 {
 		return
 	}
+	if _, exists := family.members[family.owner]; !exists {
+		prefixes := make([]string, 0, len(family.members))
+		for prefix := range family.members {
+			prefixes = append(prefixes, prefix)
+		}
+		sort.Strings(prefixes)
+		family.owner = prefixes[0]
+	}
+	gw := family.members[family.owner]
+	if family.dispatch == nil {
+		mw.beginTopologyDispatchEpochLocked(family, family.owner, gw)
+	}
+	gw.recordTopologyRefresh(err)
+}
+
+func (mw *MultiWatcher) electTopologyOwnerCheckedLocked(family *topologyWatchFamily) error {
+	if family == nil || family.handoff != nil || len(family.members) == 0 {
+		return nil
+	}
 	if gw, exists := family.members[family.owner]; exists {
 		if family.dispatch == nil {
+			if err := gw.setTopologyOwnerChecked(true); err != nil {
+				return fmt.Errorf("activate topology owner %s: %w", family.owner, err)
+			}
 			mw.beginTopologyDispatchEpochLocked(family, family.owner, gw)
-			gw.setTopologyOwner(true)
 		}
-		return
+		return nil
 	}
 	prefixes := make([]string, 0, len(family.members))
 	for prefix := range family.members {
 		prefixes = append(prefixes, prefix)
 	}
 	sort.Strings(prefixes)
-	family.owner = prefixes[0]
-	gw := family.members[family.owner]
-	mw.beginTopologyDispatchEpochLocked(family, family.owner, gw)
-	gw.setTopologyOwner(true)
+	prefix := prefixes[0]
+	gw := family.members[prefix]
+	if err := gw.setTopologyOwnerChecked(true); err != nil {
+		return fmt.Errorf("activate topology owner %s: %w", prefix, err)
+	}
+	family.owner = prefix
+	mw.beginTopologyDispatchEpochLocked(family, prefix, gw)
+	return nil
 }
 
-func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatcher) <-chan struct{} {
+func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatcher) (<-chan struct{}, error) {
 	if gw == nil || mw.stopped {
-		return nil
+		return nil, nil
 	}
 	commonDir := gw.commonDirectory()
 	if commonDir == "" {
-		return nil
+		return nil, fmt.Errorf("Git common directory is unavailable for %s", prefix)
 	}
 	var drain <-chan struct{}
 	if prior, exists := mw.topologyFamilyByRepo[prefix]; exists {
 		if family := mw.topologyFamilies[prior]; family != nil && family.members[prefix] == gw {
-			return nil
+			return nil, nil
 		}
 		drain = mw.unregisterTopologyWatcherLocked(prefix)
 	}
@@ -504,16 +546,29 @@ func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatc
 	gw.setTopologyOwner(false)
 	family.members[prefix] = gw
 	mw.topologyFamilyByRepo[prefix] = key
-	mw.electTopologyOwnerLocked(family)
-	return drain
+	if err := mw.electTopologyOwnerCheckedLocked(family); err != nil {
+		delete(family.members, prefix)
+		delete(mw.topologyFamilyByRepo, prefix)
+		gw.OnWorktreeChange(nil)
+		gw.setTopologyOwner(false)
+		if len(family.members) == 0 && family.handoff == nil {
+			delete(mw.topologyFamilies, key)
+		}
+		return drain, err
+	}
+	return drain, nil
 }
 
-func (mw *MultiWatcher) installStartedGitWatcherLocked(prefix string, gw *GitWatcher) <-chan struct{} {
+func (mw *MultiWatcher) installStartedGitWatcherLocked(prefix string, gw *GitWatcher) (<-chan struct{}, error) {
 	if gw == nil {
-		return nil
+		return nil, nil
+	}
+	drain, err := mw.registerTopologyWatcherLocked(prefix, gw)
+	if err != nil {
+		return drain, err
 	}
 	mw.gitWatchers[prefix] = gw
-	return mw.registerTopologyWatcherLocked(prefix, gw)
+	return drain, nil
 }
 
 func (mw *MultiWatcher) unregisterTopologyWatcherLocked(prefix string) <-chan struct{} {
@@ -596,11 +651,12 @@ func (mw *MultiWatcher) Start() error {
 	// held for the whole call so Start/Stop can't interleave; the
 	// concurrency here is purely within one Start.
 	type startResult struct {
-		prefix  string
-		w       *Watcher
-		gw      *GitWatcher
-		ok      bool
-		failure string
+		prefix     string
+		w          *Watcher
+		gw         *GitWatcher
+		ok         bool
+		failure    string
+		gitFailure string
 	}
 	prefixes := make([]string, 0, len(mw.watchers))
 	for prefix := range mw.watchers {
@@ -649,24 +705,32 @@ func (mw *MultiWatcher) Start() error {
 			}
 			res := startResult{prefix: prefix, w: w, ok: true}
 
-			// Start the .git/HEAD watcher alongside the file watcher.
-			// It's best-effort — repos without a .git dir (uninitialised
-			// worktrees, tarball checkouts) simply skip it.
-			if idx := mw.multi.GetIndexer(prefix); idx != nil {
-				gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
-				if err == nil {
-					gw.setTopologyOwner(false)
-					mw.configureGitWatcher(prefix, gw)
-				}
-				if err != nil {
-					mw.logger.Debug("git-watcher: init failed",
-						zap.String("prefix", prefix), zap.Error(err))
-				} else if err := gw.Start(); err != nil {
-					mw.logger.Debug("git-watcher: start failed",
-						zap.String("prefix", prefix), zap.Error(err))
-					_ = gw.Stop()
+			// Plain directories remain file-only. A present .git marker makes Git
+			// topology required: failure is surfaced and repaired without taking
+			// down the already-live file watcher.
+			_, gitStatErr := os.Stat(filepath.Join(rootPath, ".git"))
+			gitRequired := gitStatErr == nil
+			if gitStatErr != nil && !errors.Is(gitStatErr, os.ErrNotExist) {
+				res.gitFailure = fmt.Sprintf("checking Git metadata: %v", gitStatErr)
+			}
+			if gitRequired {
+				idx := mw.multi.GetIndexer(prefix)
+				if idx == nil {
+					res.gitFailure = "repository indexer not found"
 				} else {
-					res.gw = gw
+					gw, err := NewGitWatcher(rootPath, idx, mw.logger.With(zap.String("repo", prefix)))
+					if err == nil {
+						gw.setTopologyOwner(false)
+						mw.configureGitWatcher(prefix, gw)
+					}
+					if err != nil {
+						res.gitFailure = err.Error()
+					} else if err := gw.Start(); err != nil {
+						res.gitFailure = err.Error()
+						_ = gw.Stop()
+					} else {
+						res.gw = gw
+					}
 				}
 			}
 			results[slot] = res
@@ -681,10 +745,25 @@ func (mw *MultiWatcher) Start() error {
 			}
 			continue
 		}
-		delete(mw.startFailures, res.prefix)
 		mw.started[res.prefix] = true
-		if drain := mw.installStartedGitWatcherLocked(res.prefix, res.gw); drain != nil {
-			topologyDrains = append(topologyDrains, drain)
+		drain, topologyErr := mw.installStartedGitWatcherLocked(res.prefix, res.gw)
+		gitFailure := res.gitFailure
+		if topologyErr != nil {
+			if res.gw != nil {
+				_ = res.gw.Stop()
+			}
+			if gitFailure != "" {
+				gitFailure += "; "
+			}
+			gitFailure += topologyErr.Error()
+		}
+		if gitFailure != "" {
+			mw.startFailures[res.prefix] = gitFailure
+		} else {
+			delete(mw.startFailures, res.prefix)
+			if drain != nil {
+				topologyDrains = append(topologyDrains, drain)
+			}
 		}
 		// Forward events from this watcher and trigger cross-repo resolution.
 		mw.startForwarderLocked(res.prefix, res.w)
@@ -1182,6 +1261,14 @@ func (mw *MultiWatcher) DegradedReason() string {
 			return qualifyRepoReason(prefix, r)
 		}
 	}
+	for _, prefix := range prefixes {
+		if gw := mw.gitWatchers[prefix]; gw != nil {
+			if r := gw.topologyDegradedReason(); r != "" {
+				return qualifyRepoReason(prefix,
+					"the Git worktree topology watcher is degraded — automatic worktree discovery is retrying ("+r+")")
+			}
+		}
+	}
 	return ""
 }
 
@@ -1217,9 +1304,70 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 // join a retirement that is waiting for that callback's lease, so it records a
 // coalesced replacement intent that is completed immediately after retirement.
 func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, cfg config.WatchConfig) error {
+	return mw.addRepoContext(ctx, repoPrefix, cfg, false)
+}
+
+// EnsureRepoContext idempotently installs a missing live watcher. Unlike
+// AddRepoContext, an already-active watcher satisfies this ensure operation.
+// All retirement, callback-token, and stopped-state ordering remains shared
+// with strict admission in addRepoContext.
+func (mw *MultiWatcher) EnsureRepoContext(ctx context.Context, repoPrefix string, cfg config.WatchConfig) error {
+	return mw.addRepoContext(ctx, repoPrefix, cfg, true)
+}
+
+// startGitTopologyWatcherLocked starts and publishes only the Git topology
+// layer for an already-live file watcher. mw.mu must be held by the caller.
+func (mw *MultiWatcher) startGitTopologyWatcherLocked(repoPrefix string) (<-chan struct{}, error) {
+	if mw.multi == nil {
+		return nil, fmt.Errorf("multi-indexer is unavailable")
+	}
+	meta := mw.multi.GetMetadata(repoPrefix)
+	if meta == nil {
+		return nil, fmt.Errorf("repository metadata not found: %s", repoPrefix)
+	}
+	idx := mw.multi.GetIndexer(repoPrefix)
+	if idx == nil {
+		return nil, fmt.Errorf("repository indexer not found: %s", repoPrefix)
+	}
+	logger := mw.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	gitWatcher, err := NewGitWatcher(meta.RootPath, idx,
+		logger.With(zap.String("repo", repoPrefix)))
+	if err != nil {
+		return nil, err
+	}
+	gitWatcher.setTopologyOwner(false)
+	mw.configureGitWatcher(repoPrefix, gitWatcher)
+	if err := gitWatcher.Start(); err != nil {
+		_ = gitWatcher.Stop()
+		return nil, err
+	}
+	drain, err := mw.installStartedGitWatcherLocked(repoPrefix, gitWatcher)
+	if err != nil {
+		_ = gitWatcher.Stop()
+		return drain, err
+	}
+	return drain, nil
+}
+
+func (mw *MultiWatcher) addRepoContext(ctx context.Context, repoPrefix string, cfg config.WatchConfig, ensureExisting bool) error {
 	var pendingClaim *pendingWatcherAdd
 	if ctx != nil {
 		pendingClaim, _ = ctx.Value(pendingWatcherAddContextKey{}).(*pendingWatcherAdd)
+	}
+	gitTopologyRequired := false
+	if mw.multi != nil {
+		if meta := mw.multi.GetMetadata(repoPrefix); meta != nil {
+			_, statErr := os.Stat(filepath.Join(meta.RootPath, ".git"))
+			switch {
+			case statErr == nil:
+				gitTopologyRequired = true
+			case !errors.Is(statErr, os.ErrNotExist):
+				return fmt.Errorf("checking Git metadata for %s: %w", repoPrefix, statErr)
+			}
+		}
 	}
 	waitedForRetirement := false
 	for {
@@ -1246,26 +1394,77 @@ func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, c
 			}
 			done := retirement.done
 			mw.mu.Unlock()
-			// Replacement intent is a state transition, not a best-effort
-			// request. Once accepted it survives caller cancellation.
-			<-done
+			// Replacement intent is normally a durable state transition and
+			// survives caller cancellation. Controller attachment is only a
+			// bounded snapshot repair; durable config/retry state re-admits it.
+			if ctx != nil && ctx.Value(boundedWatcherRepairContextKey{}) != nil {
+				select {
+				case <-done:
+				case <-ctx.Done():
+					return fmt.Errorf("waiting for watcher retirement for %s: %w", repoPrefix, ctx.Err())
+				}
+			} else {
+				<-done
+			}
 			waitedForRetirement = true
 			continue
 		}
 		if _, exists := mw.watchers[repoPrefix]; exists {
+			_, startFailed := mw.startFailures[repoPrefix]
+			_, hasGitWatcher := mw.gitWatchers[repoPrefix]
+			_, hasTopologyFamily := mw.topologyFamilyByRepo[repoPrefix]
+			baseLive := mw.started[repoPrefix]
+			gitLive := hasGitWatcher && hasTopologyFamily
+			live := baseLive && !startFailed && (!gitTopologyRequired || gitLive)
 			if pendingClaim != nil {
 				pendingClaim.claimed = false
 				delete(mw.pendingWatcherAdds, repoPrefix)
+				if live || !ensureExisting {
+					mw.mu.Unlock()
+					return nil
+				}
+				// The exact queued intent is now an admitted ordinary repair. This
+				// prevents RemoveRepoContext from canceling the replacement while
+				// the stale watcher is retired below.
+				pendingClaim = nil
+			}
+			if !ensureExisting {
+				mw.mu.Unlock()
+				if waitedForRetirement {
+					// A coalesced callback replacement or another waiter won the race.
+					// The requested post-retirement state already exists.
+					return nil
+				}
+				return fmt.Errorf("watcher already exists for repo: %s", repoPrefix)
+			}
+			if live {
 				mw.mu.Unlock()
 				return nil
 			}
-			mw.mu.Unlock()
-			if waitedForRetirement {
-				// A coalesced callback replacement or another waiter won the race.
-				// The requested post-retirement state already exists.
+			if baseLive && gitTopologyRequired {
+				if hasGitWatcher != hasTopologyFamily {
+					err := fmt.Errorf("inconsistent Git topology membership for %s", repoPrefix)
+					mw.startFailures[repoPrefix] = err.Error()
+					mw.mu.Unlock()
+					return err
+				}
+				topologyDrain, err := mw.startGitTopologyWatcherLocked(repoPrefix)
+				if err != nil {
+					mw.startFailures[repoPrefix] = err.Error()
+					mw.mu.Unlock()
+					return fmt.Errorf("repairing Git topology watcher for %s: %w", repoPrefix, err)
+				}
+				delete(mw.startFailures, repoPrefix)
+				mw.mu.Unlock()
+				waitTopologyDispatchDrains(topologyDrain)
 				return nil
 			}
-			return fmt.Errorf("watcher already exists for repo: %s", repoPrefix)
+			mw.mu.Unlock()
+			if err := mw.RemoveRepoContext(ctx, repoPrefix); err != nil {
+				return fmt.Errorf("retiring stale watcher for %s: %w", repoPrefix, err)
+			}
+			waitedForRetirement = true
+			continue
 		}
 
 		if pendingClaim != nil {
@@ -1301,29 +1500,28 @@ func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, c
 		}
 
 		if err := w.Start([]string{meta.RootPath}); err != nil {
+			_ = w.Stop()
 			delete(mw.watchers, repoPrefix)
+			delete(mw.started, repoPrefix)
+			mw.startFailures[repoPrefix] = err.Error()
 			mw.restorePendingWatcherAddClaimLocked(repoPrefix, pendingClaim)
 			mw.mu.Unlock()
 			return fmt.Errorf("starting watcher for %s: %w", repoPrefix, err)
 		}
 
+		topologyDrain, gitWatcherErr := mw.startGitTopologyWatcherLocked(repoPrefix)
+		if gitWatcherErr != nil && gitTopologyRequired {
+			_ = w.Stop()
+			delete(mw.watchers, repoPrefix)
+			delete(mw.started, repoPrefix)
+			mw.startFailures[repoPrefix] = gitWatcherErr.Error()
+			mw.restorePendingWatcherAddClaimLocked(repoPrefix, pendingClaim)
+			mw.mu.Unlock()
+			return fmt.Errorf("starting Git topology watcher for %s: %w", repoPrefix, gitWatcherErr)
+		}
+
 		mw.started[repoPrefix] = true
 		delete(mw.startFailures, repoPrefix)
-		if idx := mw.multi.GetIndexer(repoPrefix); idx != nil {
-			logger := mw.logger
-			if logger == nil {
-				logger = zap.NewNop()
-			}
-			if gw, err := NewGitWatcher(meta.RootPath, idx, logger.With(zap.String("repo", repoPrefix))); err == nil {
-				gw.setTopologyOwner(false)
-				mw.configureGitWatcher(repoPrefix, gw)
-				if err := gw.Start(); err == nil {
-					topologyDrain = mw.installStartedGitWatcherLocked(repoPrefix, gw)
-				} else {
-					_ = gw.Stop()
-				}
-			}
-		}
 
 		// Apply any previously-registered callbacks so a runtime replacement
 		// contributes exactly like a watcher created at construction time.
