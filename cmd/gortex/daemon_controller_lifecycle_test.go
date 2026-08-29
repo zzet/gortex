@@ -60,6 +60,14 @@ func buildCatalogController(t *testing.T) (*realController, *indexer.MultiIndexe
 		lifecycle:     lifecycle,
 		logger:        zap.NewNop(),
 	}
+	watcher, err := indexer.NewMultiWatcher(mi, map[string]config.WatchConfig{}, zap.NewNop())
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start())
+	c.AttachWatcher(watcher)
+	t.Cleanup(func() {
+		c.AttachWatcher(nil)
+		require.NoError(t, watcher.Stop())
+	})
 	return c, mi, store.Catalog(), dir
 }
 
