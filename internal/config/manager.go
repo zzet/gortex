@@ -79,6 +79,59 @@ func (cm *ConfigManager) Global() *GlobalConfig {
 	return global
 }
 
+// RepoEntries returns a lock-protected snapshot of every durable explicit
+// repository entry. Top-level repositories take precedence over duplicate
+// project entries; projects are traversed by name so repeated snapshots are
+// deterministic even though Projects is map-backed.
+func (cm *ConfigManager) RepoEntries() []RepoEntry {
+	if cm == nil {
+		return nil
+	}
+
+	// Snapshot the active revision pointer without nesting cm.mu and
+	// globalConfigMu. A concurrent reload may replace the pointer afterward,
+	// but this selected revision remains internally consistent while copied.
+	cm.mu.RLock()
+	global := cm.global
+	cm.mu.RUnlock()
+	if global == nil {
+		return nil
+	}
+
+	globalConfigMu.Lock()
+	defer globalConfigMu.Unlock()
+
+	projectNames := make([]string, 0, len(global.Projects))
+	for name := range global.Projects {
+		projectNames = append(projectNames, name)
+	}
+	sort.Strings(projectNames)
+
+	entries := make([]RepoEntry, 0, len(global.Repos))
+	seenPaths := make(map[string]struct{}, len(global.Repos))
+	appendEntry := func(entry RepoEntry) {
+		identity := filepath.Clean(entry.Path)
+		if absolute, err := filepath.Abs(identity); err == nil {
+			identity = absolute
+		}
+		if _, exists := seenPaths[identity]; exists {
+			return
+		}
+		seenPaths[identity] = struct{}{}
+		entry.Exclude = append([]string(nil), entry.Exclude...)
+		entries = append(entries, entry)
+	}
+	for _, entry := range global.Repos {
+		appendEntry(entry)
+	}
+	for _, name := range projectNames {
+		for _, entry := range global.Projects[name].Repos {
+			appendEntry(entry)
+		}
+	}
+	return entries
+}
+
 // Revision returns the current configuration epoch. It changes after every
 // successful global reload and whenever LoadWorkspaceConfig changes cached
 // per-repo state.
