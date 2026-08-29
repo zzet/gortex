@@ -155,6 +155,15 @@ type watcherRetry struct {
 	cancel context.CancelFunc
 }
 
+// checkoutHeadIdentity is the accepted durable HEAD identity last handed to a
+// live checkout coordinator. It deliberately excludes the tree: branch/ref
+// wake-up semantics are about a ref or commit transition, even when two commits
+// happen to resolve to the same tree.
+type checkoutHeadIdentity struct {
+	ref    string
+	commit string
+}
+
 type CheckoutLifecycle struct {
 	mi      *MultiIndexer
 	cfgMgr  *config.ConfigManager
@@ -187,8 +196,9 @@ type CheckoutLifecycle struct {
 	// because dropping a coordinator waits for its in-flight build, and
 	// holding the collaborator lock across that wait would block every
 	// watcher and notifier lookup for the length of an index pass.
-	coordMu      sync.Mutex
-	coordinators map[string]*CheckoutCoordinator
+	coordMu          sync.Mutex
+	coordinators     map[string]*CheckoutCoordinator
+	coordinatorHeads map[string]checkoutHeadIdentity
 	// started holds every coordinator this process has started and not yet
 	// seen stop, keyed by checkout. The registry is what can be handed a
 	// cycle; this is what is running. They come apart for the length of a
@@ -274,6 +284,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		buildingRecoveryCutoff: now().Unix(),
 		leases:                 cfg.ViewLeases,
 		coordinators:           map[string]*CheckoutCoordinator{},
+		coordinatorHeads:       map[string]checkoutHeadIdentity{},
 		started:                map[string][]*CheckoutCoordinator{},
 		owed:                   map[int64]struct{}{},
 		familyRetries:          map[string]familyRetry{},
@@ -1752,12 +1763,26 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 func (l *CheckoutLifecycle) ensureCoordinator(
 	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
 ) {
+	nextHead := checkoutHeadIdentity{ref: checkout.HeadRef, commit: checkout.HeadCommit}
 	l.coordMu.Lock()
 	current := l.coordinators[checkout.CheckoutID]
-	l.coordMu.Unlock()
 	if current != nil && current.Running() && current.graphID == primaryGraphID {
+		if l.coordinatorHeads == nil {
+			l.coordinatorHeads = map[string]checkoutHeadIdentity{}
+		}
+		previousHead, tracked := l.coordinatorHeads[checkout.CheckoutID]
+		l.coordinatorHeads[checkout.CheckoutID] = nextHead
+		if tracked && previousHead != nextHead &&
+			checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic {
+			// Signal while the registry lock still proves this is the live
+			// coordinator for the accepted row. Signal is buffered to one and
+			// non-blocking, so a burst of ref events remains coalescible.
+			current.Signal("checkout HEAD changed")
+		}
+		l.coordMu.Unlock()
 		return
 	}
+	l.coordMu.Unlock()
 	if current != nil {
 		l.dropCoordinator(checkout.CheckoutID)
 	}
@@ -1771,7 +1796,7 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 	if coordinator == nil {
 		return
 	}
-	if !l.installCoordinator(checkout.CheckoutID, coordinator) {
+	if !l.installCoordinatorAtHead(checkout, coordinator) {
 		return
 	}
 	coordinator.Signal("checkout registered")
@@ -1895,6 +1920,30 @@ func stillRunning(coordinators []*CheckoutCoordinator) []*CheckoutCoordinator {
 // it got the slot. A coordinator that lost a race is closed here rather than
 // handed back, so a caller cannot leak the goroutine it just lost.
 func (l *CheckoutLifecycle) installCoordinator(checkoutID string, coordinator *CheckoutCoordinator) bool {
+	return l.installCoordinatorWithHead(checkoutID, coordinator, checkoutHeadIdentity{}, false)
+}
+
+// installCoordinatorAtHead atomically publishes a coordinator and the durable
+// HEAD identity it was built from. A reconciliation can therefore never see a
+// newly installed coordinator without its baseline and mistake first discovery
+// for a branch switch.
+func (l *CheckoutLifecycle) installCoordinatorAtHead(
+	checkout store_sqlite.Checkout, coordinator *CheckoutCoordinator,
+) bool {
+	return l.installCoordinatorWithHead(
+		checkout.CheckoutID,
+		coordinator,
+		checkoutHeadIdentity{ref: checkout.HeadRef, commit: checkout.HeadCommit},
+		true,
+	)
+}
+
+func (l *CheckoutLifecycle) installCoordinatorWithHead(
+	checkoutID string,
+	coordinator *CheckoutCoordinator,
+	head checkoutHeadIdentity,
+	rememberHead bool,
+) bool {
 	l.coordMu.Lock()
 	if _, raced := l.coordinators[checkoutID]; raced {
 		l.coordMu.Unlock()
@@ -1902,6 +1951,14 @@ func (l *CheckoutLifecycle) installCoordinator(checkoutID string, coordinator *C
 		return false
 	}
 	l.coordinators[checkoutID] = coordinator
+	if rememberHead {
+		if l.coordinatorHeads == nil {
+			l.coordinatorHeads = map[string]checkoutHeadIdentity{}
+		}
+		l.coordinatorHeads[checkoutID] = head
+	} else {
+		delete(l.coordinatorHeads, checkoutID)
+	}
 	// Published under coordMu, so the gauge write is ordered with the
 	// registry mutation it reports. Emitting it after the unlock lets two
 	// racing transitions apply their levels in the opposite order and leave
@@ -1926,6 +1983,7 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 	l.coordMu.Lock()
 	coordinator := l.coordinators[checkoutID]
 	delete(l.coordinators, checkoutID)
+	delete(l.coordinatorHeads, checkoutID)
 	// Under coordMu for the same reason as the install side: the level and
 	// the registry it counts move together.
 	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
