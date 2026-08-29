@@ -75,27 +75,6 @@ func newSparseBuildFlightFixture(t testing.TB) sparseBuildFlightFixture {
 	}
 }
 
-type countingWalkSource struct {
-	source.ContentSource
-	walks   atomic.Int64
-	entered chan struct{}
-	release <-chan struct{}
-}
-
-func (s *countingWalkSource) Walk(ctx context.Context, fn func(source.FileMeta) error) error {
-	if s.walks.Add(1) == 1 && s.entered != nil {
-		close(s.entered)
-	}
-	if s.release != nil {
-		select {
-		case <-s.release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return s.ContentSource.Walk(ctx, fn)
-}
-
 type sparseBuildFlightResult struct {
 	generationID int64
 	report       BuildReport
@@ -154,12 +133,14 @@ func TestSparseGenerationBuilderCoalescesConcurrentPhysicalPasses(t *testing.T) 
 			close(release)
 		}
 	}()
-	counting := &countingWalkSource{
-		ContentSource: fixture.request.Target,
-		entered:       entered,
-		release:       release,
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		if physicalPasses.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
 	}
-	fixture.request.Target = counting
 
 	start := make(chan struct{})
 	results := make(chan sparseBuildFlightResult, callers)
@@ -206,8 +187,8 @@ func TestSparseGenerationBuilderCoalescesConcurrentPhysicalPasses(t *testing.T) 
 	if physical != 1 || coalesced != callers-1 {
 		t.Fatalf("physical=%d coalesced=%d, want 1 and %d", physical, coalesced, callers-1)
 	}
-	if got := counting.walks.Load(); got != 1 {
-		t.Fatalf("physical index walks = %d, want 1", got)
+	if got := physicalPasses.Load(); got != 1 {
+		t.Fatalf("physical index passes = %d, want 1", got)
 	}
 }
 
@@ -221,12 +202,14 @@ func TestSparseGenerationBuilderFollowerCancellationLeavesLeaderRunning(t *testi
 			close(release)
 		}
 	}()
-	counting := &countingWalkSource{
-		ContentSource: fixture.request.Target,
-		entered:       entered,
-		release:       release,
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		if physicalPasses.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
 	}
-	fixture.request.Target = counting
 
 	leaderResult := make(chan sparseBuildFlightResult, 1)
 	go func() {
@@ -277,15 +260,18 @@ func TestSparseGenerationBuilderFollowerCancellationLeavesLeaderRunning(t *testi
 		t.Fatalf("leader generation=%d coalesced=%t, want %d and false",
 			leader.generationID, leader.report.Coalesced, generationID)
 	}
-	if got := counting.walks.Load(); got != 1 {
-		t.Fatalf("physical index walks = %d, want 1", got)
+	if got := physicalPasses.Load(); got != 1 {
+		t.Fatalf("physical index passes = %d, want 1", got)
 	}
 }
 
 func TestSparseGenerationBuilderFailureCompletesFlightBeforeRetry(t *testing.T) {
 	fixture := newSparseBuildFlightFixture(t)
-	counting := &countingWalkSource{ContentSource: fixture.request.Target}
-	fixture.request.Target = counting
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		physicalPasses.Add(1)
+		return nil
+	}
 	wantErr := errors.New("reject first publish")
 	var attempts atomic.Int64
 	fixture.request.PrePublish = func(context.Context, int64) error {
@@ -313,15 +299,18 @@ func TestSparseGenerationBuilderFailureCompletesFlightBeforeRetry(t *testing.T) 
 	if retryID == failedID {
 		t.Fatalf("retry reused failed generation %d", retryID)
 	}
-	if got := counting.walks.Load(); got != 2 {
-		t.Fatalf("physical index walks = %d, want failed pass plus retry", got)
+	if got := physicalPasses.Load(); got != 2 {
+		t.Fatalf("physical index passes = %d, want failed pass plus retry", got)
 	}
 }
 
 func TestSparseGenerationBuilderPanicCompletesFlightBeforePropagating(t *testing.T) {
 	fixture := newSparseBuildFlightFixture(t)
-	counting := &countingWalkSource{ContentSource: fixture.request.Target}
-	fixture.request.Target = counting
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		physicalPasses.Add(1)
+		return nil
+	}
 	wantPanic := errors.New("panic before publish")
 	var failedID atomic.Int64
 	var attempts atomic.Int64
@@ -352,8 +341,8 @@ func TestSparseGenerationBuilderPanicCompletesFlightBeforePropagating(t *testing
 	if retryID == failedID.Load() {
 		t.Fatalf("retry reused panicked generation %d", retryID)
 	}
-	if got := counting.walks.Load(); got != 2 {
-		t.Fatalf("physical index walks = %d, want panicked pass plus retry", got)
+	if got := physicalPasses.Load(); got != 2 {
+		t.Fatalf("physical index passes = %d, want panicked pass plus retry", got)
 	}
 }
 
@@ -363,12 +352,14 @@ func TestSparseGenerationCoalescesPlanningBeforePhysicalPass(t *testing.T) {
 	request.Identity.CreatedAt = time.Now().Unix()
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	counting := &countingWalkSource{
-		ContentSource: request.Target,
-		entered:       entered,
-		release:       release,
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		if physicalPasses.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
 	}
-	request.Target = counting
 
 	const callers = 16
 	var preparations atomic.Int64
@@ -405,8 +396,8 @@ func TestSparseGenerationCoalescesPlanningBeforePhysicalPass(t *testing.T) {
 	if got := preparations.Load(); got != 1 {
 		t.Fatalf("preparations before release = %d, want 1", got)
 	}
-	if got := counting.walks.Load(); got != 1 {
-		t.Fatalf("physical index walks before release = %d, want 1", got)
+	if got := physicalPasses.Load(); got != 1 {
+		t.Fatalf("physical index passes before release = %d, want 1", got)
 	}
 	close(release)
 
@@ -438,12 +429,14 @@ func TestSparseGenerationCoalescesPlanningBeforePhysicalPass(t *testing.T) {
 			close(readyRelease)
 		}
 	}()
-	readyCounting := &countingWalkSource{
-		ContentSource: readyRequest.Target,
-		entered:       readyEntered,
-		release:       readyRelease,
+	var readyPhysicalPasses atomic.Int64
+	readyFixture.builder.beforePhysicalPass = func(int64) error {
+		if readyPhysicalPasses.Add(1) == 1 {
+			close(readyEntered)
+		}
+		<-readyRelease
+		return nil
 	}
-	readyRequest.Target = readyCounting
 
 	adoptedBeforeJoin := make(chan struct{})
 	allowReadyJoin := make(chan struct{})
@@ -510,8 +503,8 @@ func TestSparseGenerationCoalescesPlanningBeforePhysicalPass(t *testing.T) {
 	if got := readyPreparations.Load(); got != 1 {
 		t.Fatalf("ready-race preparations = %d, want 1", got)
 	}
-	if got := readyCounting.walks.Load(); got != 1 {
-		t.Fatalf("ready-race physical index walks = %d, want 1", got)
+	if got := readyPhysicalPasses.Load(); got != 1 {
+		t.Fatalf("ready-race physical index passes = %d, want 1", got)
 	}
 }
 
@@ -531,12 +524,14 @@ func benchmarkSparseGenerationBuilderFlightIteration(
 			close(release)
 		}
 	}()
-	counting := &countingWalkSource{
-		ContentSource: request.Target,
-		entered:       entered,
-		release:       release,
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		if physicalPasses.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
 	}
-	request.Target = counting
 
 	var preparations atomic.Int64
 	start := make(chan struct{})
@@ -588,10 +583,10 @@ func benchmarkSparseGenerationBuilderFlightIteration(
 	if physicalReports != 1 {
 		b.Fatalf("physical reports = %d, want 1", physicalReports)
 	}
-	if walks := counting.walks.Load(); walks != 1 {
-		b.Fatalf("physical index walks = %d, want 1", walks)
+	if passes := physicalPasses.Load(); passes != 1 {
+		b.Fatalf("physical index passes = %d, want 1", passes)
 	}
-	return counting.walks.Load(), preparations.Load()
+	return physicalPasses.Load(), preparations.Load()
 }
 
 func BenchmarkSparseGenerationBuilderCoalescedPhysicalPass(b *testing.B) {

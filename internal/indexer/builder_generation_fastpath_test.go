@@ -190,15 +190,23 @@ func TestSparseGenerationBuilderAdoptedEmptyPlanRunsRecoveryPass(t *testing.T) {
 		t.Fatalf("seed building generation: %v", err)
 	}
 	walkErr := errors.New("adopted generation recovery walk")
-	target := &poisonGenerationSource{walkErr: walkErr}
+	target := &poisonGenerationSource{}
 	req := fastPathBuildRequest(t, store, target, identity.LayerID)
+	physicalPasses := 0
+	builder.beforePhysicalPass = func(gotGenerationID int64) error {
+		physicalPasses++
+		if gotGenerationID != generationID {
+			t.Errorf("physical pass generation = %d, want %d", gotGenerationID, generationID)
+		}
+		return walkErr
+	}
 
 	gotID, report, err := builder.Build(context.Background(), req)
 	if !errors.Is(err, walkErr) {
 		t.Fatalf("build error = %v, want %v", err, walkErr)
 	}
-	if !target.walked {
-		t.Fatal("adopted generation skipped the recovery index pass")
+	if physicalPasses != 1 {
+		t.Fatalf("adopted generation physical passes = %d, want 1", physicalPasses)
 	}
 	if gotID != generationID || report.GenerationID != generationID {
 		t.Fatalf("generation = (%d, %d), want adopted %d", gotID, report.GenerationID, generationID)

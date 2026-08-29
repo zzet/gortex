@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -140,10 +141,13 @@ func TestSparseGenerationPhysicalBuildLogsOneLeaderAndCoalescedFollowers(t *test
 			close(release)
 		}
 	}()
-	fixture.request.Target = &countingWalkSource{
-		ContentSource: fixture.request.Target,
-		entered:       entered,
-		release:       release,
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		if physicalPasses.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
 	}
 
 	start := make(chan struct{})
@@ -313,12 +317,12 @@ func TestSparseGenerationPhysicalBuildFailureLogDoesNotLeakPaths(t *testing.T) {
 func TestSparseGenerationPhysicalBuildCancellationLogsOneTerminal(t *testing.T) {
 	fixture, logs := newSparseBuildLoggingFixture(t)
 	entered := make(chan struct{})
-	fixture.request.Target = &countingWalkSource{
-		ContentSource: fixture.request.Target,
-		entered:       entered,
-		release:       make(chan struct{}),
-	}
 	ctx, cancel := context.WithCancel(context.Background())
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	result := make(chan error, 1)
 	go func() {
 		_, _, err := fixture.builder.Build(ctx, fixture.request)
@@ -381,10 +385,13 @@ func TestSparseGenerationFollowerCancellationLogReportsWaitOutcome(t *testing.T)
 			close(release)
 		}
 	}()
-	fixture.request.Target = &countingWalkSource{
-		ContentSource: fixture.request.Target,
-		entered:       entered,
-		release:       release,
+	var physicalPasses atomic.Int64
+	fixture.builder.beforePhysicalPass = func(int64) error {
+		if physicalPasses.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
 	}
 
 	leaderResult := make(chan sparseBuildFlightResult, 1)

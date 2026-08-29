@@ -337,6 +337,9 @@ type SparseGenerationBuilder struct {
 	// publishes but before joining the process-local flight. Production builders
 	// leave it nil.
 	beforePayloadFlightJoin func(generationID int64, adopted bool)
+	// beforePhysicalPass is a deterministic test seam at the physical-flight
+	// leader boundary. Production builders leave it nil.
+	beforePhysicalPass func(generationID int64) error
 }
 
 const (
@@ -601,6 +604,11 @@ func (b *SparseGenerationBuilder) buildPrepared(
 		// payload from a vanished writer, so it remains on the established
 		// recovery path and is re-derived in full.
 		if adopted || len(plan.indexed) > 0 {
+			if b.beforePhysicalPass != nil {
+				if err := b.beforePhysicalPass(generationID); err != nil {
+					return err
+				}
+			}
 			if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
 				return err
 			}
