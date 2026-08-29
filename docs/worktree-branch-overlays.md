@@ -50,12 +50,12 @@ Delivery is foundational and staged: first define and enforce the view contract,
 | `INTENT-1` | CLI track, MCP track, manual persisted entries, and explicit project membership are explicit intent. CWD auto-indexing and Git discovery are implicit. | **DECIDED** |
 | `BASE-1` | A family has at most one designated primary; every automatic route requires exactly one ready primary. A dedicated-only family may temporarily have no primary after primary loss. | **DECIDED** |
 | `BASE-2` | Initial full indexing is anchored to the exact HEAD tree; staged, unstaged, and untracked state is layered above it. A configured ref may advance the base later. | **DECIDED** |
-| `INACCESSIBLE-1` | Inaccessibility is not disappearance. Exact routing is withdrawn and rebuildable checkout overlays are purged after grace, but explicit intent/config/identity and dedicated full graphs are not forgotten without authoritative removal/untrack. | **DECIDED** |
+| `INACCESSIBLE-1` | Inaccessibility is not authoritative disappearance for explicit ownership. Exact routing is withdrawn and rebuildable checkout overlays are purged after grace, but explicit intent/config/identity and dedicated full graphs are not forgotten without authoritative removal/untrack. This retention does not extend a disposable automatic checkout identity beyond its availability deadline. | **DECIDED** |
 | `REMOVE-2` | After authoritative disappearance/removal grace and reader drain, Gortex forgets the checkout completely: graph, checkout/graph identity, intent/provenance, persisted membership, route, caches, and completed cleanup state are removed. | **DECIDED** |
 | `ERASURE-1` | “As if never tracked” means no logical Gortex graph/config/queryable state. Logs, SQLite free pages/WAL, metrics, backups, and snapshots are outside cleanup. | **DECIDED** |
 | `PRIMARY-LOSS-1` | Authoritative removal or untrack of the primary erases that primary and every dependent automatic overlay without electing a replacement; healthy independently dedicated graphs are preserved. | **DECIDED** |
 | `LAST-PRIMARY-UNTRACK-1` | Live untrack of the last primary is a clearly previewed family forget, not demotion to an impossible base-less overlay. | **DECIDED** |
-| `GRACE-ACCESS-1` | Once absence/inaccessibility is confirmed, new exact queries cannot pin the checkout; eligible read-only graph/search requests receive a labeled base fallback without dirty/buffer content, while exact/file/edit requests fail and old exact leases alone may finish. | **DECIDED** |
+| `GRACE-ACCESS-1` | Once absence/inaccessibility is confirmed, new exact queries cannot pin the checkout; while the requested checkout identity remains registered during grace, eligible read-only graph/search requests receive a labeled base fallback without dirty/buffer content, while exact/file/edit requests fail and old exact leases alone may finish. | **DECIDED** |
 | `BRANCH-1` | Automatically index checked-out worktrees only. Build an inactive ref only on explicit selection/prewarm; V1 view construction never fetches or lazy-fetches objects. | **DECIDED** |
 | `BRANCH-2` | Explicit, non-checked-out locally resolvable ref/commit views are included in V1, despite not being implemented end-to-end today. | **DECIDED** |
 | `FIDELITY-1` | V1 inactive-ref views implement the named `inactive_ref_structural_v1` profile. LSP/workspace-only capabilities are unavailable and MUST be reported as such; no hidden worktree is created. | **DECIDED** |
@@ -64,7 +64,7 @@ Delivery is foundational and staged: first define and enforce the view contract,
 | `BUILD-1` | A cold build serves a clearly labeled lower-view fallback; a previous ready view may be served with stale/building metadata. | **DECIDED** |
 | `PROMOTION-1` | Live non-primary untrack demotes to an automatic overlay over the surviving primary. Primary untrack follows the destructive preview/cascade rules above; last-primary untrack forgets the family. | **DECIDED** |
 | `REMOVAL-EVIDENCE-1` | Removal is proven only by explicit `forget`, validated common-directory inventory omission, or a `prunable` record plus positive path/mount evidence; every ambiguous case remains `inaccessible`. | **DECIDED** |
-| `POST-GRACE-FALLBACK-1` | Labeled read-only primary-base fallback continues after availability-grace expiry while a retained ready primary exists, and ends immediately if the primary is removed. | **DECIDED** |
+| `AUTOMATIC-GRACE-EXPIRY-1` | An automatic checkout identity is retained only through its availability deadline. Expiry forgets that checkout completely; a stale explicit checkout selector then fails `checkout_inaccessible`, while selector-free/default and explicit-base requests continue against the surviving primary. | **DECIDED** |
 | `PRIMARY-DESIGNATION-1` | After primary loss, a new primary requires explicit previewed `set-primary <graph-id>`; Gortex never elects by path, age, or discovery order. | **DECIDED** |
 | `PRIMARY-LIVE-IDENTITY-1` | Primary closure forgets dependent automatic checkouts entirely — identity, incarnation, and clocks included; a `no_primary` family holds no durable automatic checkout identities, and later designation observes worktrees as new incarnations. | **DECIDED** |
 | `UNTRACK-BLOCKED-1` | Explicit untrack of an accessible non-primary with no different ready primary fails with the exact blocker and rolls back; `intent_change_pending` is reserved for passive config/project reload. | **DECIDED** |
@@ -148,8 +148,8 @@ A worktree discovered in a known Git family is automatic when its canonical path
 - have a distinct dirty layer for its filesystem state;
 - be indexed and searchable;
 - be persisted as a rebuildable cache across daemon restarts;
-- enter durable availability grace on confirmed inaccessibility and purge its rebuildable overlay generations after grace plus lease drain without treating the checkout as removed;
-- retain an already-known inaccessible automatic checkout's `CheckoutID`, incarnation, root/admin identity, and `checkout_unavailable` state; recovery reuses that ID, while a newly observed record that has never been accessible may remain ephemeral rather than creating durable identity;
+- enter durable availability grace on confirmed inaccessibility, retaining its identity only until the availability deadline so eligible read-only requests can receive labeled primary fallback;
+- reuse the same `CheckoutID` and incarnation if the same checkout recovers before expiry; at expiry, forget the automatic checkout identity, route, clocks, and rebuildable layers after lease drain, so later discovery creates a new incarnation;
 - enter `removal_grace` only when automatically observed authoritative Git/path evidence proves that its administrative checkout incarnation disappeared; configuration/intent changes are `intent_transition`s, and explicit `forget` runs its typed administrative transaction without discovery grace;
 - treat Git lock status as diagnostic rather than an indefinite-retention exemption;
 - never create or remove a global explicit repository entry through discovery itself.
@@ -238,12 +238,12 @@ There MUST be no interval in which the path is routed to two graph identities an
 
 ### Inaccessibility
 
-1. A path/read/permission/device failure without authoritative removal evidence starts durable `availability_grace`; it is not disappearance.
-2. Gortex immediately withdraws exact path/CWD selection for new requests. Eligible read-only graph/search calls receive a labeled primary-base fallback with no dirty/buffer content; exact, missing-root file, and edit requests fail. Existing exact-view leases may finish.
+1. A path/read/permission/device failure without authoritative removal evidence starts durable `availability_grace`; it is not authoritative disappearance of explicit ownership.
+2. Gortex immediately withdraws exact path/CWD selection for new requests. While the requested checkout identity remains registered during grace, eligible read-only graph/search calls receive a labeled primary-base fallback with no dirty/buffer content; exact, missing-root file, and edit requests fail. Existing exact-view leases may finish.
 3. Same-incarnation recovery before expiry cancels grace and revalidates routing.
-4. At grace expiry, Gortex stops checkout watchers/builders and deletes unvalidated/rebuildable automatic, commit, dirty, and buffer-layer state after leases drain.
-5. Explicit intent/config, checkout/graph identities, and sealed dedicated full generations remain. If the inaccessible checkout owns the primary, its sealed primary can continue as the labeled main fallback; no family cascade occurs.
-6. Recovery later rebuilds checkout-specific layers under the same retained identity. Lock status is diagnostic, not proof of removal.
+4. At grace expiry, an automatic checkout enters terminal `forgetting_checkout`: Gortex stops its watchers/builders and deletes its route, `CheckoutID`, incarnation, clocks, and rebuildable commit/dirty/buffer state after leases drain. A stale explicit selector then fails `checkout_inaccessible`; selector-free/default and explicit-base requests remain on the surviving primary. Later discovery creates a new incarnation.
+5. An explicitly owned dedicated checkout follows the distinct retention rule: intent/config, checkout/graph identities, and sealed dedicated full generations remain, while rebuildable checkout layers may be discarded. If it owns the primary, its sealed primary can continue as the labeled main fallback; no family cascade occurs.
+6. Dedicated recovery rebuilds checkout-specific layers under the retained identity; automatic recovery reuses its identity only before expiry. Lock status is diagnostic, not proof of removal.
 
 ### Authoritative disappearance/removal
 
@@ -311,6 +311,7 @@ Implementation MUST add isolated, deterministic benchmarks named or equivalently
 
 - `BenchmarkViewBuildGateHandoff`: mixed priority, cancellation, queue-depth and starvation cases;
 - `BenchmarkCheckoutCoordinatorCycle`: settled no-op, dirty edit, cold switch, cached return, and many-checkout contention;
+- `BenchmarkGitWatcherTopologyProbeStableTick` (`files_1`/`files_2000`), `BenchmarkGitWatcherTopologyProbeTransition`, and `BenchmarkGitWatcherBoundedRegistrationByCheckoutSize` (`files_1`/`files_2000`): report attributable descriptors/RSS, inventory/probe work, transition latency, and teardown leakage;
 - `BenchmarkSparseGenerationBuild`: 32/512-file PR fixtures and a 4,096-file manual/nightly fixture with closure sizes 0/20/200;
 - `BenchmarkRefViewEnsure`: ready reuse, in-flight coalescing, cold local ref, and admission behind other work;
 - `BenchmarkCheckoutModeTransition`: promotion/demotion, clean/dirty, and route-fallback interval;
@@ -324,6 +325,7 @@ The initial implementation gates are:
 
 - queued coordinator cancellation below 250 ms and cooperative active-build cancellation below 1 s;
 - event-driven worktree discovery/route withdrawal p95 below 2 s, with grace semantics still enforced;
+- topology observation remains independent of source-file count and uses at most 128 attributable descriptors for the 2,000-file fixture; repeated dynamic admission, promotion, recovery, and teardown return descriptor/watch registrations to baseline;
 - no-op checkout cycles never acquire payload-build admission;
 - a one-file derived build scales with changed/affected rows rather than total base-store size; a 100x unchanged-base increase causes at most 2x latency;
 - 512-file/one-change derived publication below 5 s p95 and Gortex-sized/one-change publication below 10 s p95 on the benchmark host;
@@ -1031,6 +1033,8 @@ An MCP handshake CWD that resolves to a known family but a not-yet-reconciled wo
 
 ### Watchers plus reconciliation
 
+Topology observation MUST use a bounded control-plane watch/probe set whose size does not grow with repository source-file count. Git worktree inventory remains authoritative; bounded probes only accelerate reconciliation. Probe registration failure, event overflow, or a missed event MUST enter one coalesced authoritative-inventory fallback rather than widening the watched source tree. Dynamic admission, promotion, recovery, owner handoff, removal, and daemon teardown MUST release every watch registration and leave no stale family observer.
+
 No filesystem watch is authoritative by itself. The subsystem uses:
 
 - a family-level trigger for common Git worktree/ref administration changes;
@@ -1045,16 +1049,26 @@ Gortex MUST NOT install or overwrite Git hooks. Existing hooks such as `post-che
 
 ### Checkout state machine
 
+Availability expiry is mode-specific. An automatic checkout follows `availability_grace -> forgetting_checkout -> ∅`: its identity is retained only through the deadline, then its route, incarnation, clocks, and layers are terminally forgotten while the family primary survives. Only explicitly retained ownership may follow `availability_grace -> checkout_unavailable` after `purge_inaccessible_layers`, preserving intent/config/identity/sealed full generations. Any generic `checkout_unavailable` wording below is constrained by this branch and MUST NOT retain a disposable automatic identity after expiry.
+
 ```text
-checkout_ready
-  -- access failure, removal unproven --> availability_grace
+checkout_ready(automatic)
+  -- access failure, removal unproven --> availability_grace(automatic)
+       (exact route withdrawn; labeled read-only base fallback while identity is registered)
+availability_grace(automatic)
+  -- same checkout becomes accessible before deadline --> reconciling --> checkout_ready(automatic)
+  -- availability deadline --> forgetting_checkout --> ∅ automatic checkout
+       (route, identity, incarnation, clocks, and rebuildable layers absent; family primary retained)
+
+checkout_ready(dedicated)
+  -- access failure, removal unproven --> availability_grace(dedicated)
        (exact route withdrawn; labeled read-only base fallback)
-availability_grace
-  -- same checkout becomes accessible --> reconciling --> checkout_ready
-  -- availability deadline --> checkout_unavailable
-       (rebuildable checkout layers absent; identity/intent/full graph retained)
-checkout_unavailable
-  -- later accessible --> reconciling/rebuild --> checkout_ready
+availability_grace(dedicated)
+  -- same checkout becomes accessible --> reconciling --> checkout_ready(dedicated)
+  -- availability deadline --> checkout_unavailable(dedicated)
+       (rebuildable checkout layers absent; explicit identity/intent/full graph retained)
+checkout_unavailable(dedicated)
+  -- later accessible --> reconciling/rebuild --> checkout_ready(dedicated)
 
 checkout_ready | availability_grace | checkout_unavailable
   -- first positive automatically detected removal at t --> removal_grace(t)
@@ -1091,6 +1105,8 @@ any off-route build may fail/supersede while the previous ready lease remains va
 
 ### Removal and inaccessibility policy
 
+Availability expiry is not one uniform cleanup action: automatic mode runs terminal `forget_checkout`, after which a stale explicit selector fails and selector-free/default or explicit-base selection remains on the surviving primary; retained explicit ownership alone runs `purge_inaccessible_layers` and may remain `checkout_unavailable`.
+
 **DECIDED REMOVAL-EVIDENCE-1:** The following conservative evidence classifier is normative. Git distinguishes explicit removal, successful authoritative inventory, prunable administration after manual deletion, locked worktrees on removable media, and ordinary access failures:
 
 - `authoritatively_removed`: an explicit confirmed Gortex `forget`, successfully observed external Git removal, or successful access to the common Git administration followed by authoritative inventory that proves the checkout administrative identity is gone. A prunable record counts only when independent path/mount evidence confirms disappearance.
@@ -1104,12 +1120,12 @@ The routing/cleanup contract is:
 
 1. Either state immediately withdraws the exact path/CWD route for new requests. Eligible read-only graph/search requests select a ready family primary base and carry the standard fallback rider: `requested_view` naming the checkout, the actual view/revision fields, `fallback_reason`, the applicable deadline/`retry_after`, and `exact=false`. Missing dirty and checkout-rooted buffer data is excluded.
 2. `require_exact`/`require_fresh`, filesystem reads requiring the unavailable root, and every edit/mutation operation fail explicitly. Writes are never redirected. Existing exact-view leases may finish.
-3. Inaccessibility starts durable `availability_grace`. Same-incarnation recovery revalidates and restores the route. At expiry, unvalidated/rebuildable checkout layers are deleted after leases drain, but explicit intent/config/identity and sealed dedicated full generations remain. Labeled read-only fallback continues after expiry while a retained ready primary generation exists and ends immediately if the primary is removed. **DECIDED POST-GRACE-FALLBACK-1.**
+3. Inaccessibility starts durable `availability_grace`. Same-incarnation automatic recovery before the deadline revalidates and restores the route. At automatic expiry, `forget_checkout` removes the route, identity, incarnation, clocks, and rebuildable layers after leases drain; that checkout's fallback ends, a stale explicit selector fails, and selector-free/default or explicit-base requests continue against the surviving primary. Explicitly retained dedicated ownership instead deletes only rebuildable checkout layers and preserves intent/config/identity/sealed full generations; any applicable labeled fallback follows that retained explicit view. **DECIDED AUTOMATIC-GRACE-EXPIRY-1 / INACCESSIBLE-1.**
 4. Automatically detected authoritative removal starts durable `removal_grace`. Same-incarnation recovery before expiry may cancel it. At expiry, terminal forgetting removes all logical checkout graph/config state and the cleanup journal.
 5. Explicit confirmed `untrack` or `forget` does not wait through discovery grace. The administrative transaction selects its documented demotion/forget/primary-closure branch, journals config changes, and drains affected readers.
 6. Authoritative primary removal/untrack deletes the primary dependency closure—primary graph plus every automatic/ref/dirty route, layer, alias, cache, and buffer session binding whose lower chain depends on it, including dependent automatic checkout identities. Independent sibling identities/intents/config/full generations/routes/unrelated payload survive; only bridge/cross-view/derived rows referencing the retired primary are invalidated/rebuilt.
 7. If independent dedicated graphs survive, the family enters `no_primary`; automatic checkout routing/building is disabled until explicit designation. Ref views rooted in the lost primary are deleted/refused, but an explicit ref view may still select a surviving ready dedicated `graph_id`. If no dedicated graph survives, family identity is deleted.
-8. Reappearance after authoritative terminal forgetting is a new incarnation. Recovery after mere inaccessibility reuses the retained identity and rebuilds discarded layers.
+8. Reappearance after authoritative terminal forgetting or automatic availability-deadline forgetting is a new incarnation. Automatic recovery reuses the retained identity only before its deadline; explicitly retained dedicated recovery may reuse its preserved identity afterward and rebuild discarded layers.
 9. Gortex never runs `git worktree prune`, remove, repair, or another mutating Git command.
 
 If no ready designated primary exists, no fallback is synthesized from an independent dedicated sibling. Return `no_primary` for a family with no designation, or `primary_not_ready` (carrying the primary's build error) when a designation exists but has no ready generation; the response still names the requested view and `exact=false`.
@@ -1127,11 +1143,13 @@ The default availability/removal discovery grace is 30 seconds. Timestamps/deadl
 
 When an inaccessible checkout first gains positive removal evidence at time `t`, Gortex sets `removal_detected_at=t` and a fresh removal deadline; elapsed availability grace never counts toward removal grace. If the same administrative incarnation reappears before that deadline, automatic removal cleanup is cancelled: accessible roots reconcile to ready, while still-inaccessible roots return to their persisted `availability_grace` or `checkout_unavailable` state. Only an explicitly confirmed administrative `forget`/destructive untrack branch is non-cancellable.
 
-Total forgetting requires a recoverable saga because SQLite and external config/project files cannot commit together. It is used for authoritative removal/forget and the explicitly previewed destructive untrack branches (inaccessible-checkout forget or primary closure), never merely because access failed. Live non-primary demotion uses its separate route/config transaction. Gortex removes every owned intent/config source with compare-and-swap guards, resumes idempotently after crashes, verifies the operation-specific residual-state postcondition, and deletes the journal last. A source-write failure remains visibly `retiring/retrying`; it MUST NOT claim completion.
+Total forgetting that removes explicit intent or external config requires a recoverable saga because SQLite and external config/project files cannot commit together. It is used for authoritative removal/forget and the explicitly previewed destructive untrack branches (inaccessible-checkout forget or primary closure), never to erase explicitly retained ownership merely because access failed. Automatic availability-deadline expiry is a separate config-free disposable-checkout cleanup; live non-primary demotion uses its separate route/config transaction. Gortex removes every owned intent/config source with compare-and-swap guards, resumes idempotently after crashes, verifies the operation-specific residual-state postcondition, and deletes the journal last. A source-write failure remains visibly `retiring/retrying`; it MUST NOT claim completion.
 
 No generation may outlive its lower base. Primary-closure deletion explicitly preserves independent dedicated graphs. **DECIDED INACCESSIBLE-1 / REMOVE-2 / PRIMARY-LOSS-1 / ERASURE-1.**
 
 ### Startup recovery
+
+Recovery MUST resume the mode-specific deadline branch. An expired automatic availability deadline resumes terminal automatic-checkout forgetting; an explicitly retained checkout resumes rebuildable-layer purge while preserving its intent/config/identity and sealed dedicated corpus. Startup MUST NOT convert an expired automatic checkout into a durable `checkout_unavailable` identity.
 
 Startup MUST reconcile catalog, two distinct durable grace classes, intent sources, and authoritative Git inventory before declaring warmup complete:
 
@@ -1140,7 +1158,7 @@ Startup MUST reconcile catalog, two distinct durable grace classes, intent sourc
 - Persisted automatic routes and checkout layers are rebuildable cache, not explicit intent. Sealed dedicated full generations are retained across inaccessibility.
 - `unavailable_since`/`availability_deadline` and `removal_detected_at`/`removal_deadline` survive daemon downtime and MUST NOT be conflated. Restart does not reset either clock.
 - If common-directory inventory, checkout-root access, or mount evidence is unavailable, startup classifies the checkout as inaccessible; it does not infer removal from `ENOENT`, lock, permission, I/O, or a prunable flag alone.
-- Availability expiry resumes only `purge_inaccessible_layers`: exact routing stays withdrawn, rebuildable checkout layers disappear after lease drain, and retained intent/config/identity/full-generation rows remain. Later validated access restores the same checkout/graph IDs and rebuilds discarded layers.
+- Automatic availability expiry resumes terminal `forget_checkout`: route, checkout identity, incarnation, clocks, and rebuildable layers disappear after lease drain while the family primary remains. Explicitly retained dedicated expiry resumes `purge_inaccessible_layers`: exact routing stays withdrawn and rebuildable layers disappear, but intent/config/checkout/graph IDs and sealed full generations remain for later validated recovery.
 - Authoritative-removal expiry resumes `forget_checkout` or `retire_primary_closure` before any affected route is advertised. Once terminal row/config absence is committed, later discovery creates a new incarnation even if an old lease briefly delayed physical row deletion.
 - Worktrees authoritatively removed while the daemon was stopped are collected even when stale prefixes would otherwise have registered them; uncertainty remains inaccessible until authoritative evidence is available.
 - A ready generation is reusable only if all fingerprints, enrichment profile, and lower generations remain valid.
@@ -1353,6 +1371,8 @@ The existing session “overlay branch” terminology should be renamed internal
 
 ### Cleanup completeness
 
+`purge_inaccessible_layers` applies only when explicit ownership is intentionally retained. Automatic availability-grace expiry uses `forget_checkout` and reaches zero route/layer/checkout-identity/clock state while preserving the family primary and its unrelated state.
+
 Cleanup is operation-typed; a generic “purge everything with this path” API is forbidden:
 
 - `purge_inaccessible_layers(checkout_id, incarnation)` withdraws exact routing, unregisters checkout watchers/LSP/session bindings (including buffer-overlay sessions), and cancels builders. It detaches the checkout from shared commit generations; after lease drain it deletes checkout-owned dirty generations and their masks/search/sidecars. A commit generation is garbage-collected only when no checkout route, ref view, lower-layer reference, cache retention pin, or lease remains. The operation preserves checkout/graph identities, every explicit intent/config record, and sealed dedicated full generations, and proves that no surviving reference was invalidated.
@@ -1430,7 +1450,7 @@ A layer whose affected closure approaches the whole repository may legitimately 
 
 Decision round 4 (2026-08-15) resolved every previously open item; the gate now records which decisions each phase implements rather than blocking on them:
 
-- Phase 1/4 lifecycle publication implements `REMOVAL-EVIDENCE-1`, `POST-GRACE-FALLBACK-1`, `PRIMARY-DESIGNATION-1`, `PRIMARY-LIVE-IDENTITY-1`, and `UNTRACK-BLOCKED-1`;
+- Phase 1/4 lifecycle publication implements `REMOVAL-EVIDENCE-1`, `AUTOMATIC-GRACE-EXPIRY-1`, `PRIMARY-DESIGNATION-1`, `PRIMARY-LIVE-IDENTITY-1`, and `UNTRACK-BLOCKED-1`;
 - Phase 2 request precedence implements `API-1`, the session-scope composition rules, and the hook front door (`HOOKS-VIEW-1`);
 - Phase 3 source schema/migration publication implements `SOURCE-DURABILITY-1` (no persisted bytes) and benchmark-gates `SEARCH-AUTHORITY-1`;
 - Phase 5 profile/security publication implements `REF-CONFIG-TRUST-1`, `REF-SCOPE-1`, `RETENTION-1`, `UNBORN-1`, and the V1 `CROSSREPO-1` pinning/bridge contract;
@@ -1446,7 +1466,7 @@ If implementation evidence contradicts a decided branch, this specification must
 - Add distinct durable availability/removal evidence and deadlines plus cleanup/publication sagas that coordinate SQLite with external config files.
 - Introduce one daemon-owned `CheckoutReconciler`, conservative removal-evidence classification, operation-typed cleanup, family retirement, and integrity checks.
 - Route CLI, MCP, reload, startup, auto-index, and GC through it.
-- Preserve explicit identity/config/full generations across inaccessibility; prevent uncertain/prunable evidence from deleting them; prevent authoritative-removal cleanup or stale epochs from recreating/deleting the wrong incarnation.
+- Preserve explicit identity/config/full generations across inaccessibility; retain automatic checkout identity only through its availability deadline and then forget it; prevent uncertain/prunable evidence from deleting explicit ownership; prevent authoritative-removal cleanup or stale epochs from recreating/deleting the wrong incarnation.
 
 **Gate:** every lifecycle entry point has identical watcher/config/cache cleanup behavior.
 
@@ -1480,8 +1500,8 @@ If implementation evidence contradicts a decided branch, this specification must
 - Implement CWD view selection and correct filesystem paths.
 - Build/rebuild dirty layers.
 - Build per-checkout trigram searchers and per-checkout LSP workspaces under the global concurrency cap (**DECIDED TEXT-SEARCH-VIEW-1 / LSP-SCOPE-1**).
-- Implement distinct availability/removal grace, immediate exact-route withdrawal, labeled read-only base fallback (continuing post-grace while a ready primary exists), and explicit failure for exact/filesystem/mutating operations.
-- Persist both clocks/evidence through restart; recover the same identity after mere inaccessibility and assign new identities only after authoritative terminal forgetting.
+- Implement distinct availability/removal grace, immediate exact-route withdrawal, labeled read-only base fallback only while the requested checkout identity remains registered during grace, and explicit failure for exact/filesystem/mutating operations.
+- Persist both clocks/evidence through restart; recover an automatic identity only before its availability deadline, forget it at expiry, and create a new incarnation on later discovery. Retained explicit/dedicated ownership follows `INACCESSIBLE-1` instead.
 - Implement `purge_inaccessible_layers`, `forget_checkout`, `retire_primary_closure`, and `forget_family` with their distinct postconditions, external-config saga recovery, and stale incarnation/primary-epoch guards.
 - Preserve independent dedicated siblings and their ref views on primary loss, forget dependent automatic checkout identities with the closure, enter `no_primary` without auto-election, disable automatic checkout routes, and reject only ref views rooted in the lost primary.
 - Implement promotion, all-intent-source non-primary demotion, previewed primary/sole-primary untrack transactions, and previewed `set-primary` designation (**DECIDED PRIMARY-DESIGNATION-1**).
@@ -1560,13 +1580,16 @@ For an inactive-ref oracle, both sides use the exact `inactive_ref_structural_v1
 
 ### Required lifecycle tests
 
+- topology resource coverage includes `TestGitWatcherTopologyProbeStableTickDoesNotReinventory`, `TestGitWatcherTopologyProbeDetectsFirstDirectoryTransitionsPromptly`, `TestGitWatcherTopologyProbeStopCancelsAndJoinsInventory`, `TestGitWatcherTopologyRegistrationsStayBoundedWithLargeCheckout`, and `TestGitWatcherRefWatchesUseOnlyExactFiles`;
+- a 2,000-file source tree is exercised under repeated worktree add/remove/move, dynamic admission, promotion, owner recovery/handoff, missed-event/overflow fallback, and teardown; descriptor/watch counts remain independent of file count, authoritative inventory converges every change, and teardown leaks zero registrations;
+
 - `git worktree add`, `remove`, `move`, `lock`, `unlock`, `prune`, and manual directory deletion;
 - an evidence/action matrix separately covers authoritative inventory omission, still-listed/prunable records, inaccessible common directory, deleted local path, unavailable mount, permission denial, I/O failure, explicit `forget`, and each `untrack` branch;
 - ambiguous evidence and `ENOENT` without trustworthy mount/inventory context classify as inaccessible, never removed;
 - dedicated inaccessibility immediately withdraws exact routing, preserves intent/config/`CheckoutID`/`GraphID`/sealed full generation, and after deadline deletes only rebuildable checkout layers;
-- automatic inaccessibility immediately withdraws exact routing and after deadline deletes its rebuildable layers without fabricating authoritative removal;
+- automatic inaccessibility immediately withdraws exact routing, serves eligible labeled fallback only during grace, and at the deadline forgets the checkout identity, route, clocks, and rebuildable layers without deleting the surviving primary;
 - inaccessible-primary behavior causes no family cascade; its sealed base may serve only the labeled read-only fallback, and independent dedicated siblings remain unchanged;
-- recovery after inaccessibility reuses the same checkout/graph identities, revalidates state, rebuilds discarded layers, and restores exact routing;
+- recovery before expiry reuses an automatic checkout identity, revalidates state, rebuilds discarded layers, and restores exact routing; after automatic expiry the stale ID fails and later discovery creates a new incarnation, while explicitly retained dedicated ownership continues to reuse its preserved checkout/graph identities;
 - authoritative non-primary removal/`forget` and previewed inaccessible-non-primary untrack leave zero checkout graph/identity/intent/config/cache/journal rows and later discovery creates new identities; live accessible non-primary untrack is tested separately as demotion;
 - primary removal/untrack deletes exactly the primary dependency closure when an independent dedicated sibling survives, preserves that sibling's identities/config/intents/full generations/routes/unrelated payload, and invalidates only bridge/cross-view/derived rows that reference the retired primary; sole-primary authoritative removal is separately verified to run terminal family forgetting;
 - primary loss with surviving dedicated siblings enters `no_primary`, elects nobody, rejects automatic checkout and lost-primary ref routing, but preserves/selects ref views rooted in surviving ready dedicated graphs;
@@ -1575,7 +1598,7 @@ For an inactive-ref oracle, both sides use the exact `inactive_ref_structural_v1
 - inaccessible cleanup detaches shared commit generations, deletes checkout-owned dirty/buffer state, and never invalidates another route/ref/lower-layer/cache/lease;
 - sole-primary untrack shows a family-forget preview and leaves zero logical family/config state after lease-aware saga completion;
 - live accessible non-primary untrack demotes after all intent sources are revoked; inaccessible non-primary untrack uses previewed `forget_checkout` rather than demotion; untrack of an accessible non-primary with no different ready primary fails with the exact blocker and leaves intent and routing unchanged (**UNTRACK-BLOCKED-1**);
-- a long-inaccessible checkout that later gains positive removal evidence receives a fresh removal clock; reappearance before that deadline cancels automatic removal and restores ready or prior availability state;
+- an explicitly retained long-inaccessible checkout, or an automatic checkout that gains positive removal evidence before its availability deadline, receives a fresh removal clock; reappearance before that removal deadline cancels automatic removal and restores ready or prior availability state;
 - daemon restart preserves distinct availability/removal evidence and deadlines and resumes the correct cleanup mode;
 - a common-directory inventory failure applies family availability handling, a root-only failure affects one checkout, and neither is absence; a pending zero-source family remains inventory-scoped through restart;
 - missed filesystem events are repaired by periodic authoritative inventory without treating a failed inventory as absence;
@@ -1588,7 +1611,7 @@ For an inactive-ref oracle, both sides use the exact `inactive_ref_structural_v1
 - primary closure while a dependent automatic checkout has unexpired independent removal grace deletes that identity with the closure; a `no_primary` family allocates no durable automatic identities, and later designation observes surviving worktrees as new incarnations;
 - non-revocable intent or config-write failure leaves intent and routing in the prior coherent state;
 - each cleanup mode performs its exact watcher/LSP/search/analysis/session/config/payload postcondition, including canonical search tables;
-- labeled fallback excludes dirty/buffer content, reports requested versus actual view and `exact=false`, rejects exact/root-file/write requests, and continues after availability expiry only while a retained ready primary exists; no ready primary returns a stable error and never borrows an independent sibling;
+- labeled fallback excludes dirty/buffer content, reports requested versus actual view and `exact=false`, and rejects exact/root-file/write requests while the requested checkout identity remains registered during grace; after automatic forgetting a stale explicit ID fails without capturing selector-free/default or explicit-base requests, which continue against the surviving primary; no ready primary returns a stable error and never borrows an independent sibling;
 - a hook probe naming a file in a known family's unreconciled worktree triggers immediate reconciliation and fails open until the view is ready, then enforces; during grace, hook probes follow labeled-fallback rules and never present fallback evidence as exact;
 - cleanup crash/restart at every SQLite/external-config saga phase;
 - stale checkout incarnation/`primary_epoch` cannot delete recovered, preserved-sibling, or newly tracked state;
@@ -1598,6 +1621,7 @@ For an inactive-ref oracle, both sides use the exact `inactive_ref_structural_v1
 ### Required Git/ref tests
 
 - A→B→A cache reuse and zero work for updating/adding/deleting/moving an unrelated inactive ref;
+- repeated settled reconciliation after canonical commit adoption preserves both the dirty generation ID and route epoch; one real dirty edit rebuilds exactly once and subsequent settled polls stabilize;
 - existing metadata `ref` filtering remains byte-for-byte compatible; combining it with structured `view` either selects a graph in the filtered set or returns `selector_conflict`, never reinterprets either field;
 - the structured `view` selector applies `REF-SCOPE-1`, rejects short names/revision expressions, peels tags only to commits, validates exact OIDs/object format, returns stable selector errors, and accepts any ready dedicated `graph_id` including a surviving non-primary graph in `no_primary`;
 - explicit selection/prewarm creates only `ref_view`/evictable generation state—no tracking intent, checkout, dedicated graph, project/global config, hidden worktree, HEAD/index change, hook execution, or Git ref/object/promisor network access; vector enrichment, when enabled by trusted policy, uses only an approved local provider (**REF-CONFIG-TRUST-1**);
@@ -1656,6 +1680,8 @@ For an inactive-ref oracle, both sides use the exact `inactive_ref_structural_v1
 
 ## Acceptance criteria
 
+Availability acceptance is mode-specific: explicit/dedicated inaccessibility preserves intent/config/identity/sealed full generations while withdrawing exact routing; a disposable automatic identity provides labeled fallback only during grace and is forgotten at the deadline. After forgetting, its stale explicit ID MUST fail `checkout_inaccessible` and MUST NOT capture selector-free/default or explicit-base requests, all of which continue against the surviving primary. Topology observation MUST also stay independent of source-file count, remain at or below 128 attributable descriptors for the 2,000-file fixture, and return registrations to baseline after admission/recovery/teardown.
+
 The feature is complete when all of these are true:
 
 1. Explicit tracking creates a full logical graph identity for a main or linked worktree while that checkout state exists.
@@ -1669,8 +1695,8 @@ The feature is complete when all of these are true:
 9. Cached A→B→A returns to A with zero reparsing when fingerprints remain valid, while unrelated inactive refs cause zero work.
 10. A new generation is published atomically and old requests remain consistent.
 11. Authoritative disappearance/`forget` (and destructive inaccessible non-primary checkout untrack) plus lease drain leave zero logical checkout graph/identity/intent/config/cache/journal state; later discovery gets new identities. Live accessible non-primary untrack instead retains `CheckoutID` and demotes. Logs, WAL/free pages, metrics history, backups, and snapshots are outside logical erasure.
-12. Availability and removal evidence/deadlines remain distinct across restart. Mere inaccessibility preserves explicit intent/config/identity/sealed dedicated generations and later recovers the same IDs; only authoritative terminal forgetting creates a new incarnation.
-13. New inaccessible/removal-grace reads receive a truthful read-only primary fallback with requested/actual view and `exact=false`; dirty/buffer/root content is excluded, exact/filesystem/mutating requests fail, and existing exact leases alone may finish.
+12. Availability and removal evidence/deadlines remain distinct across restart. Mere inaccessibility preserves explicit intent/config/identity/sealed dedicated generations and later recovers the same IDs. Automatic availability-deadline forgetting and authoritative terminal forgetting both create a new incarnation on later discovery.
+13. While the requested checkout identity remains registered during availability/removal grace, eligible new reads receive a truthful read-only primary fallback with requested/actual view and `exact=false`; dirty/buffer/root content is excluded, exact/filesystem/mutating requests fail, and existing exact leases alone may finish. Automatic fallback ends when its identity is forgotten; any post-grace fallback for explicitly retained ownership is governed separately by `INACCESSIBLE-1`.
 14. Primary loss elects no replacement and deletes exactly the primary dependency closure — including every dependent automatic checkout identity, incarnation, and clock (**PRIMARY-LIVE-IDENTITY-1**). Independent sibling identities/intents/config/full generations/routes/unrelated payload survive; bridge/derived references to the lost primary are invalidated. A new primary exists only after explicit previewed `set-primary` (**PRIMARY-DESIGNATION-1**). Sole-primary authoritative removal/untrack runs family forgetting, so the family and all remaining identities disappear.
 15. Explicit untrack atomically demotes a live accessible non-primary checkout after revoking all intent sources only when a different ready primary exists; otherwise it fails with the exact blocker and leaves intent and routing unchanged (**UNTRACK-BLOCKED-1**). Last-intent loss observed by config reload enters `intent_change_pending` only for a primary, an inaccessible checkout, or a non-primary without a different ready primary; otherwise reload demotes it safely. Primary untrack requires a cascade preview; sole-primary untrack is family forget, with no partial mutation.
 16. Every lifecycle entry point invokes the correct typed cleanup and proves its watcher/intent/config/search/LSP/analysis/session/payload postcondition.
@@ -1737,7 +1763,7 @@ Mutually exclusive symbol versions would coexist and graph paths could traverse 
 | Search/analyzer bypasses produce mixed revisions. | One request-pinned view, static audit, cache key enforcement, differential tests. |
 | Cross-repository derived edges become stale. | Source ownership, workspace view fingerprints, bridge generations or explicit incomplete status. |
 | Filesystem/Git events race publication. | State re-sampling, immutable builds, incarnation tokens, single coordinator. |
-| Transient access failure causes premature data loss. | Treat uncertain evidence as inaccessibility, use a distinct durable availability clock, preserve explicit intent/config/identity/sealed full generations, and purge only rebuildable checkout layers after grace. |
+| Transient access failure causes premature data loss. | Treat uncertain evidence as inaccessibility and use a distinct durable availability clock. Preserve explicit intent/config/identity/sealed full generations; retain disposable automatic identity only through grace, then forget it while preserving the family primary. |
 | Several intent sources reassert dedicated mode after untrack. | Store provenance per source, treat explicitness as a union, preflight/revoke all sources, and roll back on any durable-write failure. |
 | Primary deletion surprises users or damages independent graphs. | Preview the exact dependency closure, guard it with `primary_epoch`, preserve independent dedicated siblings, never auto-elect, and expose `no_primary` until explicit designation. |
 | Logical deletion is mistaken for forensic erasure. | State the decided boundary explicitly: queryable graph/config/catalog state is removed; free pages/WAL/logs/metrics/backups/snapshots follow their own retention/security policies. |
@@ -1749,7 +1775,8 @@ Mutually exclusive symbol versions would coexist and graph paths could traverse 
 
 Rounds 1–3 are recorded near the top. Round 4 (2026-08-15) resolved every remaining item; the decisions table is the authoritative record. Outcomes, noting where the previous recommendation was rejected:
 
-- `REMOVAL-EVIDENCE-1`, `POST-GRACE-FALLBACK-1`, `PRIMARY-DESIGNATION-1`, `API-1`, `REF-SCOPE-1`, `BASE-3`, `RETENTION-1`, `ANALYSIS-1`, `UNBORN-1`, `SLO-1`: accepted as recommended.
+- `REMOVAL-EVIDENCE-1`, `PRIMARY-DESIGNATION-1`, `API-1`, `REF-SCOPE-1`, `BASE-3`, `RETENTION-1`, `ANALYSIS-1`, `UNBORN-1`, `SLO-1`: accepted as recommended.
+- `AUTOMATIC-GRACE-EXPIRY-1`: clarified on 2026-08-29 from isolated validation; it supersedes the earlier `POST-GRACE-FALLBACK-1` wording by making automatic checkout identity/fallback expire at the availability deadline while default/base selection survives.
 - `PRIMARY-LIVE-IDENTITY-1`: recommendation **rejected** — dependents are forgotten entirely with the primary; no `discovered_no_primary` identity exists.
 - `SOURCE-DURABILITY-1`: recommendation **rejected** — no persisted source bytes; commit-only file reads use the local object database with atomic capability withdrawal.
 - `REF-CONFIG-TRUST-1`: recommendation **rejected** — inactive-ref indexing is fully offline; no remote provider ever receives inactive-ref source text.
@@ -1806,3 +1833,187 @@ Names are illustrative; package-cycle analysis is required before final placemen
 - [`git symbolic-ref`](https://git-scm.com/docs/git-symbolic-ref.html) distinguishes attached symbolic HEAD from detached state; an unresolved OID must also represent an unborn branch.
 - [Git refs](https://git-scm.com/docs/git-refs.html) and [reftable](https://git-scm.com/docs/reftable) show why loose-ref directory watches cannot be the authoritative ref-change mechanism.
 - [Git hooks](https://git-scm.com/docs/githooks) documents `post-checkout` and `reference-transaction`; they are optional signals, not the authoritative lifecycle mechanism.
+
+## Implementation audit and validation (2026-08-27)
+
+This section records the implementation and measurements on `feat/worktree-branch-views` after post-implementation validation. It is evidence, not a second semantic contract: the decisions and acceptance criteria above remain authoritative, and a discrepancy is a defect rather than an implicit specification change. The audited repair series runs from the lifecycle correction in `eebe4c4a` through the degraded-ref regression coverage in `0bf03d62`.
+
+### Findings closed during validation
+
+| Finding | Failure mode | Implemented invariant and evidence | Atomic commit(s) |
+| --- | --- | --- | --- |
+| Topology discovery was not event-driven | A linked worktree added after startup could wait for manual reconciliation or the hourly janitor. | The Git watcher observes common-directory worktree topology, schedules an authoritative family census, and treats the janitor as a correctness backstop. Add/remove events are coalesced; reconciliation performs one authoritative walk, not the previous double walk. Covered by topology-event, real-Git reconciliation, disappearance, and grace tests. | `eebe4c4a` |
+| Removal and grace routing were fragmented | An inaccessible checkout could retain a route long enough for new requests to read dirty/worktree state, and cleanup differed by entry point. | Inaccessibility withdraws the exact route immediately. New requests receive only the labeled, read-only primary fallback; exact, file, and mutation operations refuse. Existing pinned readers may drain. Authoritative disappearance purges logical checkout/graph/intent/config/cache/journal state after grace. | `eebe4c4a` |
+| Dedicated bases followed the mutable checkout | A full dedicated graph could accidentally absorb dirty filesystem state instead of representing the tracked revision. | A dedicated graph is anchored to the exact initial HEAD tree. Staged, unstaged, and eligible untracked files are a distinct dirty generation. Unborn HEAD uses an empty committed lower tree. | `bb0ae5d3` |
+| Identical view builds churned generations | Settled checkout cycles and A→B→A ref selection could parse and publish content that already existed. Concurrent builders could also publish duplicate compatible winners. | A shared ready-generation catalog keys immutable content by tree/base/build fingerprint and capability profile. Checkout and ref routes lease and bind a compatible canonical generation; retirement invalidates the cache. Cache hits report zero builds. | `13658405`, `dccd98cf`, `e65db8a5` |
+| Canonical selection could converge on the wrong winner | A lower generation ID finishing late could replace a newer generation already protected by a live lease or durable checkout/ref/dedicated binding. | Compatible ready generations with a live lease or durable binding outrank unbound candidates; canonical selection then uses a stable oldest-winner rule. Withdrawn or expired candidates cannot become new bindings. Normal 100× and race 20× convergence stress passed. | `e65db8a5` |
+| Source withdrawal could be lost under SQLite contention | A pruned Git object had to withdraw `source.snapshot`, but a direct writer could block, fail, or leave capability state indefinitely optimistic. | Withdrawal is a durable, canonical, coalescing queue. The catalog writer persists producer unavailability, retry is quiet and bounded, and store close drains pending work. Only the named producer changes; generation readiness and structural producers remain intact. | `d868d0bc`, `89bd56b7` |
+| Immutable Git reads could lazy-fetch promisor objects | Revision verification, tree construction, batch blob reads, diffing, or MCP file reads could contact a remote merely because an object was missing locally. `ls-tree` alone also did not prove its listed blobs existed locally. | Every immutable-ref path uses the no-lazy Git execution contract and verifies required objects locally. Missing commit/tree/blob objects return the stable local-unavailability/source-withdrawal behavior; no hidden fetch, checkout, hook, or protective ref is created. Instrumented tests observed zero `upload-pack` invocations. | `d3dd4cc5` |
+| MCP family routing used a stale graph snapshot | `Server.viewFamilies` derived scope from `Graph.RepoPrefixes()` captured before a newly discovered family existed. A fully built automatic route therefore waited for a 60-second fallback timeout even though catalog state was ready. | The live repository-family catalog is authoritative and ordered. Repository-prefix lookup remains only a compatibility fallback for old stores without family rows. Families added after server construction and after the first lookup route without restart. | `55bf8f03` |
+| Exact-HEAD dedicated search seeded the wrong base | Checkout text search always seeded file inventory from generation 0. Exact-HEAD dedicated payload lives at the graph's active generation, so unchanged files disappeared from primary search. | `CheckoutCoordinator.textCorpus` resolves the checkout's logical `primaryBase` and seeds from that generation before applying commit and dirty claims. Both automatic and route-owned dedicated CWDs materialize coherently. | `55bf8f03` |
+| Legacy dedicated bases were mistaken for routed views | Routing every ready dedicated checkout manufactured `view_building` freshness for legacy graphs whose canonical corpus intentionally has no checkout route. | Route existence is the compatibility boundary: a ready dedicated checkout with no route remains the ordinary base corpus; exact-HEAD dedicated checkouts with a route retain worktree freshness and labeled fallback semantics. | `9834dddb` |
+| Source degradation incorrectly invalidated structural ref currency | After a pruned blob withdrew only `source.snapshot`, `activeIsCurrent` treated the whole generation as stale. The next `get_symbol` entered rebuild/cache-adoption and stopped seeing otherwise-valid graph data. | Active-route currency is payload identity plus a servable generation state. Producer degradation is evaluated per operation: graph/search stay on the same generation, source reads refuse, and a new route still cannot adopt a source-degraded generation. | `247a3339`, `0bf03d62` |
+
+### Verified implementation invariants
+
+1. Logical isolation uses one shared SQLite database and one canonical generation-keyed payload/search schema. `family_id`, `graph_id`, `generation_id`, route epochs, owner bindings, and producer state provide the distinct attributes; there is no database per graph, worktree, branch, or revision.
+2. CLI track, MCP track, durable manual configuration, and explicit project membership are explicit intent and create a dedicated logical graph. CWD discovery alone is implicit and creates an automatic route over the designated family primary.
+3. Initial dedicated payload is exact HEAD. Checkout dirty state, including eligible non-ignored untracked source, is composed above it and never mutates the lower generation.
+4. A coherent request selects one base plus its route-owned layers. Overlay data replaces the same logical identity from lower layers; unrelated overlay and base matches share the normal relevance ordering. Normal search never unions incompatible branches or unrelated cached views.
+5. A non-primary dedicated worktree that is explicitly untracked loses its dedicated graph and, while still present, can be rediscovered as an automatic overlay over a different ready primary. Last-primary untrack is a previewed family forget; primary loss deletes only the primary dependency closure and preserves healthy independently dedicated siblings.
+6. Authoritative disappearance means logical forgetting. Queryable graph/catalog/intent/config/cache/journal state for that checkout is removed; WAL/free pages, logs, metrics, backups, and snapshots follow their separate retention policies.
+7. Inaccessibility and authoritative disappearance are distinct evidence states. During the accepted 30-second grace, new requests get only labeled read-only primary fallback; dirty/buffer/root bytes are excluded and exact/file/edit operations refuse.
+8. Inactive local refs are V1 structural/read-only views. They are selected explicitly, never fetched, never create a hidden worktree or tracking intent, and report LSP-only capabilities unavailable.
+9. Existing active routes may retain structural graph/search after an optional producer such as `source.snapshot` degrades. A new binding must satisfy its requested capability profile and cannot borrow that degraded generation as a source-complete view.
+
+### Benchmark protocol and results
+
+Measurements used macOS/arm64 on an Apple M1 Pro. Unless noted otherwise, Go benchmarks ran with `-benchmem -count=5`; ranges are the five samples and are engineering evidence, not yet production SLOs. The daemon and filesystem cache were live, so latency ranges intentionally report observed variation instead of false precision.
+
+| Path | Result | Allocation/build/network signal |
+| --- | --- | --- |
+| Authoritative clean worktree census | 14.68–17.24 ms/op | 654–656 KB, 5,168 allocs |
+| Legacy double worktree walk (comparison) | 30.08–48.92 ms/op | about 1.31 MB, 10,340 allocs |
+| Settled checkout coordinator cycle | 85.84–90.17 ns/op | 96 B, 2 allocs |
+| Contended producer-withdrawal scheduling | 183.2–188.9 ns/op | 0 B, 0 allocs |
+| Catalog producer-withdrawal drain | 102.6–109.8 µs/op | about 3.16 KB, 66 allocs |
+| Store close while writer is held | 9.91–10.46 ms/op | about 4.75 KB, 101–106 allocs |
+| Canonical checkout-generation adoption | 0.674–1.457 ms/op | zero builds; about 11.9 KB, 371–372 allocs |
+| Begin generation retirement | 210.6–313.0 µs/op | about 1.84 KB, 49 allocs |
+| Canonical ref-view warm hit | 57.6–121.2 ms/op | zero builds; 176–181 KB, 1,555–1,559 allocs |
+| Ready-cache hit with live lease | 376–429 µs/op | compatible ready generation retained |
+| Ready-cache pinned-winner selection | 923–956 µs/op | live/durable winner retained |
+| Ref file read, complete local object | 15.95–43.82 µs/op | zero `upload-pack`; 848 B, 7 allocs |
+| Ref file read, missing local blob | 42.13–107.64 µs/op | zero `upload-pack`; 744 B, 16 allocs |
+| Catalog-backed family enumeration: 1 / 10 / 100 families | 14.4–19.3 / 23.4–24.2 / 98.2–102.6 µs/op | 1.26 / 6.68 / 54.3 KB; 36 / 121 / 934 allocs |
+| Routed worktree text-search lifecycle | 3.14 s/cycle over 20 cycles | previous behavior deterministically timed out at about 61 s |
+| Legacy dedicated CWD selection | 61.8–67.4 µs/op | 6.62 KB, 155 allocs |
+| `activeIsCurrent`, source complete / unavailable | 26.9–28.4 / 27.2–28.1 µs/op | identical 3.35 KB, 85 allocs, zero builds |
+| Full `EnsureRefView`, source complete / unavailable | 28.0–29.9 / 27.8–31.3 ms/op | about 86 KB, 790–791 allocs, zero builds |
+
+The no-lazy closure was also measured at each Git boundary: revision closure verification 17.75–48.03 ms, tree construction 18.02–41.62 ms, batch object reads 27.0–94.7 µs, generic no-lazy command execution 8.52–34.81 ms, and tree diff 9.59–32.38 ms. Every variant recorded zero `upload-pack` operations.
+
+### Focused validation completed
+
+- Topology discovery, disappearance, grace fallback, untrack authorization, exact-HEAD anchoring, checkout/ref cache reuse, generation retirement, producer withdrawal, and no-lazy promisor fixtures pass their focused normal and race suites.
+- Routed text search plus catalog-family routing passed normal `count=20` in 62.775 seconds and race `count=10` in 51.931 seconds before the legacy compatibility addition; the combined routed/legacy/catalog race matrix then passed `count=10` in 76.755 seconds.
+- Ref-generation convergence passed normal `count=100` and race `count=20`; tests cover live lease, durable ref/checkout binding, withdrawn pinned bypass, expired lease, and concurrent winner ordering.
+- Source withdrawal retained the same structural ref generation and graph visibility for 20 isolated MCP cycles after the fix. The direct indexer regression passed normal `count=20` and race `count=10`, while a new alias correctly rejected the degraded cache and built a source-complete generation.
+- Broad normal `internal/graph/store_sqlite` and `internal/indexer` suites passed in 98.025 and 399.049 seconds respectively on the audited branch. Final full MCP, full indexer race, and rebuilt-daemon lifecycle validation are recorded in the final validation addendum before push.
+
+### Final isolated validation addendum (2026-08-29)
+
+This addendum records the final implementation evidence. `CONFIRMED` means the behavior passed either a deterministic regression/benchmark or the complete isolated-daemon replay at the named code revision. There are no remaining implementation or replay items marked `TBD` in this addendum.
+
+#### Isolation and revision identity
+
+The final lifecycle run used an environment-scrubbed foreground daemon with independent `HOME`, `TMPDIR`, every XDG directory, socket, PID, log, configuration, and SQLite store. The process environment was built from an allowlist, telemetry and Git prompts/global configuration were disabled, `GORTEX_RECONCILE_INTERVAL=0`, and only disposable Git repositories under the sandbox were tracked. The production daemon, its socket, configuration, store, repositories, and agent worktrees were not stopped, restarted, reconfigured, or contacted.
+
+- Final validated code revision: `a1794604f6a55515789e163063fc5b67379c588b`.
+- Final branch-built binary SHA-256: `81dcef8ff91dec1e7356a388e8e505bc99b1cc5a4a350d5d692a4b2e78dd7860`.
+- Final schema version: `18` (`PRAGMA user_version` in the isolated store).
+- Final passing sandbox: `/private/tmp/gortex-overlay-e2e.e1BCgQ` (retained with `PASS.json`, logs, JSON responses, descriptor snapshots, idle samples, and SQLite state).
+- Diagnostic ABA-failure sandbox: `/private/tmp/gortex-overlay-e2e.KL3hyC` (retained to preserve the pre-fix failure evidence).
+- The final replay source status contained only this specification edit and pre-existing user-owned untracked notes; all production and test changes were committed before the binary was built.
+
+#### Findings resolved during final closure
+
+| Finding | Resolution and evidence | Atomic commit |
+| --- | --- | --- |
+| Automatic grace semantics in the draft exceeded implemented identity lifetime | The prior isolated 30-second lifecycle run proves deadline-driven automatic forgetting. The focused request regression proves the routing boundary: during grace, the automatic checkout ID remains in the rider and eligible graph/search receives labeled primary fallback; exact/file/edit policies remain strict. After explicit catalog forgetting in the fixture, a stale explicit ID fails `checkout_inaccessible` before the handler executes, while selector-free/default plus explicit-base requests still read the surviving primary. This was a specification mismatch, not a production grace-routing defect. | Prior isolated lifecycle plus `336e6456` |
+| Settled adopted commits rebuilt dirty state repeatedly | When a checkout adopted another checkout's canonical commit generation while retaining a valid nonzero dirty generation, the unchanged reconcile path moved the ready commit slot, cleared the dirty route, rebuilt it, and advanced the route epoch on every poll. The fixed path returns early when the validated ready generation already equals the routed commit, releases the transient lease, and leaves dirty base/fingerprint validation to the independent dirty slot. A real edit still rebuilds once and then stabilizes. The old predicate failed on its first unchanged poll; the regression passed `-count=5` in 8.735 s and the focused set passed in 9.014 s. | `3b2b05df` |
+| Git topology observation opened source-count-proportional descriptors on Darwin | The isolated 2,000-file/two-checkout fixture recorded 4,108 open entries, about 4,031 attributable to the stress family. `e5964687` replaced recursive control-plane registrations with one cheap family probe and bounded exact ref observation; `3910f17d` added linked-worktree HEAD identity; `d08fc8c4` joined reconcile callbacks during teardown. The final 2,000-file E2E measured only 3 descriptors rooted at the base, 1 at the linked worktree, and a total worktree delta of 9. | `e5964687`, `3910f17d`, `d08fc8c4` |
+| Persisted automatic worktrees had no recursive source signal after cold restore | Catalog routes/coordinators were restored, but newly created dirty or untracked files could wait for the 15-second safety poll because only explicitly configured bases reattached ordinary watchers. The lifecycle now owns one signal-only recursive watcher per ready automatic checkout, repairs it with bounded joined retry, fences callbacks by checkout/incarnation/family/root/epoch, and tears it down on grace, promotion, disappearance, family loss, or close. Real Darwin resource tests prove descriptor cost is independent of files per root and teardown returns to baseline. | `99c6749a` |
+| Removal-grace fallback was labeled but did not search the primary base | The selector built a base rider around a nil legacy reader, so a real `search_symbols` returned no base results and emitted no base-scoped capability list. Grace fallback now pins and opens the primary graph's exact sealed `dedicated_base` generation, suppresses commit/dirty/filesystem/buffer layers, and fails closed on wrong graph, owner, layer, ancestry, tree, state, or checkout identity. A production-shaped search regression proves base-only and masked base symbols are returned while commit/dirty symbols are excluded. | `07659e59` |
+| A rapid linked-worktree A→B→A transition could be missed between 1-second topology samples | The final replay first exposed this as a 15-second timeout: a source signal published the transient ref, while the topology probe compared only equal pre/post HEAD contents and missed the return. HEAD and active loose-ref identities now include stable modification time and size, preserving a bounded probe while detecting sampled ABA. Deterministic HEAD/ref regressions pass normal `count=50` and race `count=20`; the formerly failing final E2E transition settled in 1 second. | `a1794604` |
+
+#### End-to-end lifecycle matrix
+
+| Scenario | Final isolated evidence | Status |
+| --- | --- | --- |
+| Isolation and zero-config start | Foreground scrubbed environment, private store/socket/config, exact child PID stop/reap; production daemon untouched. | `CONFIRMED` |
+| Explicit base tracking | One family and dedicated primary graph `graph-a493649b09564d87fb643d356642175e` were created. Initial full payload was generation 1 and checkout routing composed commit/dirty layers above it. | `CONFIRMED` |
+| Dynamic linked-worktree discovery | A worktree added after daemon start was discovered and ready in 2 seconds with automatic mode, the same primary graph, its own route/coordinator, and no explicit config entry. No janitor/manual reconciliation was used. | `CONFIRMED` |
+| Overlay composition and precedence | One logical replacement symbol resolved to overlay data without a base duplicate; unchanged/base-only data fell through; a non-ignored untracked source appeared only in the overlay; a deletion tombstone suppressed the base symbol; an ignored file remained absent. | `CONFIRMED` |
+| A→B→A and dirty stability | A selected generation 4, B selected generation 8, and return to A reused generation 4 without reparsing. Signaling completed in 1 second and the route was ready within 2 seconds. The settled adopted-commit regression separately proves idle polls do not rebuild dirty state or advance the route epoch. | `CONFIRMED` |
+| Rapid missing-ref creation and A→B→A ABA | The first commit on a previously missing active loose ref was observed, and return to branch A settled in 1 second with the revision-aware probe. | `CONFIRMED` |
+| Promotion and demotion | The automatic worktree promoted to an independent dedicated graph; explicit untrack removed that graph/CLI intent and restored the same checkout as an automatic overlay without manual discovery. | `CONFIRMED` |
+| Explicit worktree disappearance | A still-dedicated worktree disappeared; its checkout, dedicated graph, config intent, generations, and cleanup state were logically erased while the healthy primary survived. | `CONFIRMED` |
+| Inactive local ref | Structured local-ref selection resolved the requested commit/tree into a persisted read-only structural view, returned branch-specific source, created no hidden worktree, performed no fetch, and rejected mutation as `view_read_only`. | `CONFIRMED` |
+| 75-second idle stability | Zero physical builds, stable route/generation identity, bounded descriptors and DB/WAL, and no monotonic RSS growth were observed. | `CONFIRMED` |
+| Cold isolated restart | Family/graph/base checkout, automatic route generations, and inactive-ref identity survived restart; startup recorded zero sparse rebuilds. A new dirty/untracked marker was then indexed, proving automatic source-watch reattachment. | `CONFIRMED` |
+| Removal grace and expiry | Removal entered labeled `removal_grace` immediately. Read-only search returned the sealed primary base with `search.symbols` listed in `base_scoped`; dirty/untracked data was absent and exact-source access was rejected. The checkout was logically forgotten after 30 seconds; its stale explicit ID failed while ordinary base search survived. | `CONFIRMED` |
+| 2,000-file topology resource bound | The final fixture measured base-root descriptors 3, linked-worktree-root descriptors 1, and total worktree FD delta 9, independent of the 2,000 tracked files. | `CONFIRMED` |
+
+#### Resource and performance measurements
+
+| Measurement | Confirmed result | Interpretation |
+| --- | --- | --- |
+| Explicit-membership snapshot | 42.6–43.6 µs/op, 25,016 B/op, 81 allocs/op | Canonical-path-deduplicated top-level/project membership union. |
+| Coalesced watcher retry scheduling | 64.17–106.7 ns/op, reported 1 B/op and 0 allocs/op; independent review measured 21.14 ns/op, 0 B/op, 0 allocs/op | Retry admission itself is negligible and coalesced. |
+| Existing watcher ensure | 24.64–30.0 ns/op, 0 allocs/op | Idempotent dynamic admission fast path. |
+| Topology registration, 1/8/64 worktrees | 63.7–64.5 µs / 253.0–255.5 µs / 1.780–1.860 ms | One inventory per operation and no duplicate registrations in the measured implementation. |
+| Real missing-path ensure, 1/8/64 | 198.6–209.8 ms / 1.561–1.706 s / 13.990–14.230 s | Exact watcher/path counts were 1/2, 8/17, and 64/129; teardown leaked none in that admission fixture. |
+| Recovery scheduling, follower/owner | 166.2–215.4 ns/op, 144 B/op, 2 allocs/op / 311.2–353.3 ns/op, 288 B/op, 4 allocs/op | Owner-only topology nudge remains bounded. |
+| Dedicated point-update guard | 35,707 ns/op, 2,136 B/op, 24 allocs/op over 31,196 calls | Zero base/generation-zero mutation and zero fallback results/errors. |
+| Stable adopted-commit dirty reconciliation | `BenchmarkCoordinatorStableAdoptedCommitDirtyReconcile`: 30,676,637 ns/op, 71,469 B/op, 892 allocs/op | 0 physical builds/op and 0 route-epoch advances/op. |
+| Pre-fix 2,000-file daemon footprint | RSS 131,568 KiB (about 128.5 MiB) with 4,108 open entries, about 4,031 attributable to the stress family | Memory remained modest while descriptor growth was unacceptable; descriptor count, not RSS, exposed this defect. |
+| Activity Monitor incident evidence | Process-list memory rose from 14.29 GB to 43.17 GB, while the inspector reported real/private memory of 333.5/272.0 MiB and later 1.02/1.01 GiB; virtual memory moved from 433.06 to 461.49 GB | The list-column figures document a serious operational symptom but are not evidence of a 43 GB Go heap. Acceptance uses process RSS/private memory, Go heap, descriptors, WAL/store growth, build count, and route churn separately. |
+| Automatic source-watcher Darwin resource contract | 1-file and 10,000-file roots both consumed exactly 12 descriptors; `StopAll` returned to the exact baseline. A 10,000-write settled burst emitted at most 2 signals; one-file readiness/signal latency remained below 2 seconds. At 64 roots RSS delta stayed below 64 MiB and repeated cleanup slope below 2 MiB/cycle. | Recursive signal cost is per root, not per source file; teardown is joined and leak-free. |
+| Final isolated daemon resource envelope | Automatic discovery 2 s; total worktree FD delta 9; base-root descriptors 3; worktree-root descriptors 1; 75-second idle zero builds/stable route; maximum idle RSS 359,024 KiB; final RSS 155,536 KiB; final DB+WAL 5,575,416 bytes; final sandbox 353,436 KiB. | The former O(files) descriptor and repeated-build failure modes were absent. |
+| Exact grace base materialization | `BenchmarkMaterializeBase`, five 1-second samples: median 161,245 ns/op (range 160,785–161,536), 17,632 B/op, 432 allocs/op. | Opens, validates, pins, assembles, and closes one sealed generation per request; no commit/dirty/filesystem/buffer layer is admitted. |
+| Revision-aware linked-worktree HEAD probe | `BenchmarkAppendWorktreeHeadIdentityStable`, five 1-second samples: median 41,292 ns/op (range 39,825–41,769), 3,752 B/op, 26 allocs/op. | Two bounded control files are read/statted; worktree source count does not affect cost. |
+
+#### Full test matrix
+
+The earlier rows preserve pre-fix audit evidence. The final rows are the post-fix gates run against code revision `a1794604` (or, for the grace-only package gates, its immediately preceding atomic commit `07659e59` with identical package code):
+
+| Command/scope | Result |
+| --- | --- |
+| `go test ./internal/config` | PASS, 0.932 s |
+| `go test ./cmd/gortex` | PASS, 46.275 s after lifecycle fixtures attached a watcher |
+| `go test ./internal/indexer` | PASS, 492.997 s |
+| `go test -race ./internal/config` | PASS, 2.457 s |
+| `go test -race ./cmd/gortex` | PASS, 80.374 s |
+| `go test -race -timeout 30m ./internal/indexer` | PASS, 1,148.955 s; the prior 10-minute test timeout was raised because the process was still in unrelated SQLite/FTS fixture setup rather than a demonstrated race failure |
+| Grace fallback/expiry regression at `336e6456` | PASS: fallback before deadline, strict exact/file/edit policies, stale-ID refusal after forgetting, default/base survival |
+| Dirty reconciliation regression at `3b2b05df` | PASS `-count=5` in 8.735 s; focused set PASS in 9.014 s |
+| Automatic checkout source-watcher focused normal/race/resource suites | PASS; real Darwin back-end covered readiness, file-count-independent descriptors, burst coalescing, 64-root RSS bounds, retry repair, identity/epoch fences, and exact teardown. |
+| Grace materialization focused repetitions | `TestMaterializeBase*` PASS normal `count=20` in 2.125 s; `TestRemovalGraceSearchUsesPrimaryGenerationStack` PASS normal `count=20` in 11.666 s and race `count=10` in 19.813 s. |
+| Worktree HEAD/ref ABA focused repetitions | Two regressions PASS normal `count=50` in 0.456 s and race `count=20` in 1.710 s. |
+| Final graphview + MCP build/normal suite | PASS: graphview 7.189 s; MCP 157.976 s; streamable 0.471 s. |
+| Final graphview + MCP race suite | PASS: graphview 44.035 s; MCP 417.148 s; streamable passed/cached as applicable. |
+| Final full indexer normal suite | PASS: indexer 492.311 s; merkle 0.087 s; source 2.633 s. |
+| Final full indexer race suite (`-timeout 30m`) | PASS: indexer 1,010.460 s; merkle/source cached. |
+| Final clean isolated-daemon lifecycle replay | PASS 42/42 at code revision `a1794604`; binary SHA-256 `81dcef8ff91dec1e7356a388e8e505bc99b1cc5a4a350d5d692a4b2e78dd7860`; evidence `/private/tmp/gortex-overlay-e2e.e1BCgQ`. |
+
+#### Atomic commit ledger
+
+The earlier audit covers `eebe4c4a` through `0bf03d62`. Subsequent atomic history is grouped here by contiguous responsibility and was verified against the local branch before push:
+
+- Routing, cache, and readiness: `cb766166` through `b0b8ada2` (inclusive).
+- Retirement, promotion, and build lifecycle: `d9e398b8` through `607834c4` (inclusive).
+- Cleanup, sparse recovery, and topology handoff: `d83bdaf7` through `7fba6338` (inclusive).
+- Dedicated point guard and dynamic watcher admission:
+  - `43727a39` — guard dedicated route-owned corpora from point mutation;
+  - `fa9eb8b3` — snapshot all explicit repository memberships;
+  - `144c78ba` — make dynamic watcher admission authoritative;
+  - `6901aabb` — keep promoted repositories attached to watchers;
+  - `3fd40597` — reconcile watchers after dynamic tracking;
+  - `baab0067` — attach watchers in lifecycle fixtures.
+- Final regressions:
+  - `336e6456` — prove mode-specific grace fallback/forgetting behavior and default/base survival;
+  - `3b2b05df` — keep an adopted commit's settled dirty generation and route epoch stable.
+- Bounded and reliable observation:
+  - `e5964687` — bound Git family topology monitoring independently of source count;
+  - `0c3fcc95` — normalize unborn Git baselines;
+  - `d08fc8c4` — join Git reconcile callbacks on stop;
+  - `3910f17d` — include linked-worktree HEAD/ref contents in the family probe;
+  - `99c6749a` — attach lifecycle-owned recursive signal watchers to automatic checkout sources;
+  - `a1794604` — include HEAD/ref revision metadata so sampled A→B→A transitions cannot collapse to equality.
+- Final MCP and graph-view closure:
+  - `7fd23a3a` — align routed MCP fixture identities with production generations;
+  - `07659e59` — materialize and capability-label the exact primary base during removal/availability grace.
+- Specification/addendum: this commit records the final evidence; its own hash is intentionally not self-referential.
+
+The push gate is satisfied: final binary identity, bounded topology/source-watch measurements, focused and broad normal/race suites, and the clean 42-assertion isolated lifecycle replay are all recorded above.
