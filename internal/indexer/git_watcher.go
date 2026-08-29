@@ -115,9 +115,10 @@ type GitWatcher struct {
 	batchReindex watcherBatchReindex // MultiWatcher installs shared resolver + derived catch-up
 }
 
-// NewGitWatcher creates a watcher for repoPath/.git/HEAD. repoPath is
-// the absolute path to the worktree root; the .git dir is discovered
-// by looking at the HEAD file (handles worktrees, submodules via the
+// NewGitWatcher creates a watcher for repoPath/.git/HEAD. idx is the already
+// warmed repository indexer: GitWatcher reconciles commit movement and does
+// not replace initial source discovery. repoPath is the absolute worktree
+// root; the .git dir is discovered from HEAD (including worktree/submodule
 // `gitdir:` indirection).
 func NewGitWatcher(repoPath string, idx *Indexer, logger *zap.Logger) (*GitWatcher, error) {
 	absRepo, err := filepath.Abs(repoPath)
@@ -285,7 +286,13 @@ func (gw *GitWatcher) Start() error {
 		return fmt.Errorf("start git state watcher: %w", err)
 	}
 
-	initialSHA, _ := gw.currentSHA(context.Background())
+	initialSHA, err := gw.currentSHA(context.Background())
+	if err != nil {
+		// An unborn symbolic HEAD makes git print the token "HEAD" while
+		// returning an error. Do not publish that unresolved token as a commit
+		// baseline: the already-warm first observation is intentionally empty.
+		initialSHA = ""
+	}
 	gw.mu.Lock()
 	gw.lastSHA = initialSHA
 	gw.loopStarted = true

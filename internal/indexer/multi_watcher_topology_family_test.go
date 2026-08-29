@@ -35,6 +35,26 @@ type topologyWatchFixture struct {
 	watchers       []*GitWatcher
 }
 
+type recordingRepoIndexStateStore struct {
+	graph.Store
+	mu     sync.Mutex
+	states map[string]graph.RepoIndexState
+}
+
+func (store *recordingRepoIndexStateStore) SetRepoIndexState(state graph.RepoIndexState) error {
+	store.mu.Lock()
+	store.states[state.RepoPrefix] = state
+	store.mu.Unlock()
+	return nil
+}
+
+func (store *recordingRepoIndexStateStore) GetRepoIndexState(prefix string) (graph.RepoIndexState, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	state, found := store.states[prefix]
+	return state, found, nil
+}
+
 func newTopologyWatchFixture(tb testing.TB, worktrees int) *topologyWatchFixture {
 	tb.Helper()
 	base := tb.TempDir()
@@ -626,6 +646,173 @@ func TestGitWatcherRefRecoveryReconcilesMissedHeadAdvance(t *testing.T) {
 	time.Sleep(4 * watcher.debounce)
 	if got := topologyNudges.Load(); got != 0 {
 		t.Fatalf("follower recovery emitted %d family topology nudges, want 0", got)
+	}
+}
+
+func TestMultiWatcherUnbornFirstCommitUsesWarmGraphWithoutReindex(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	runGitWatcherTestCommand(t, root, "init", "-q")
+	sourcePath := filepath.Join(root, "warm.go")
+	if err := os.WriteFile(sourcePath, []byte("package warm\n\nfunc WarmBeforeFirstCommit() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatalf("write warm source: %v", err)
+	}
+
+	manager, err := config.NewConfigManager(filepath.Join(base, "config.yaml"))
+	if err != nil {
+		t.Fatalf("NewConfigManager: %v", err)
+	}
+	const prefix = "unborn-warm"
+	manager.Global().Repos = []config.RepoEntry{{Path: root, Name: prefix}}
+	if err := manager.Global().Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	store := &recordingRepoIndexStateStore{
+		Store:  graph.New(),
+		states: make(map[string]graph.RepoIndexState),
+	}
+	registry := parser.NewRegistry()
+	registry.Register(languages.NewGoExtractor())
+	multi := NewMultiIndexer(store, registry, search.NewNull(), manager, zap.NewNop())
+	if _, err := multi.IndexAll(); err != nil {
+		t.Fatalf("IndexAll unborn worktree: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := multi.Close(context.Background()); err != nil {
+			t.Errorf("MultiIndexer.Close: %v", err)
+		}
+	})
+	if nodes := store.FindNodesByName("WarmBeforeFirstCommit"); len(nodes) == 0 {
+		t.Fatal("unborn worktree was not warm-indexed before GitWatcher startup")
+	}
+	baselineState, found, err := store.GetRepoIndexState(prefix)
+	if err != nil || !found {
+		t.Fatalf("unborn freshness baseline = found:%t err:%v", found, err)
+	}
+	if baselineState.IndexedSHA != "" {
+		t.Fatalf("unborn persisted freshness SHA = %q, want empty", baselineState.IndexedSHA)
+	}
+
+	mw, err := NewMultiWatcher(multi, map[string]config.WatchConfig{
+		prefix: {Enabled: true, Paths: []string{root}, DebounceMs: 5},
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewMultiWatcher: %v", err)
+	}
+	if err := mw.Start(); err != nil {
+		t.Fatalf("MultiWatcher.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := mw.Stop(); err != nil {
+			t.Errorf("MultiWatcher.Stop: %v", err)
+		}
+	})
+	mw.mu.Lock()
+	gitWatcher := mw.gitWatchers[prefix]
+	sourceWatcher := mw.watchers[prefix]
+	mw.mu.Unlock()
+	if gitWatcher == nil || sourceWatcher == nil {
+		t.Fatalf("composed watchers = git:%t source:%t, want both", gitWatcher != nil, sourceWatcher != nil)
+	}
+	gitWatcher.mu.Lock()
+	baselineSHA := gitWatcher.lastSHA
+	commonDir := gitWatcher.commonDir
+	gitWatcher.mu.Unlock()
+	if baselineSHA != "" {
+		t.Fatalf("unborn watcher baseline SHA = %q, want empty", baselineSHA)
+	}
+	headRef := strings.TrimSpace(runGitWatcherTestOutput(t, root, "symbolic-ref", "HEAD"))
+	if headRef == "" {
+		t.Fatal("unborn symbolic HEAD is empty")
+	}
+
+	// Make the transition deterministic: both production watchers are already
+	// live and drained, then the control probe restarts below at a short cadence.
+	gitWatcher.stopTopologyProbe()
+	gitWatcher.mu.Lock()
+	gitWatcher.topologyProbeInterval = 5 * time.Millisecond
+	gitWatcher.debounce = 5 * time.Millisecond
+	originalInventory := gitWatcher.inventory
+	originalGitBatch := gitWatcher.batchReindex
+	gitWatcher.mu.Unlock()
+	var inventoryCalls atomic.Int64
+	var gitBatchCalls atomic.Int64
+	var sourceBatchCalls atomic.Int64
+	gitWatcher.inventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
+		inventoryCalls.Add(1)
+		return originalInventory(ctx, path)
+	}
+	gitWatcher.batchReindex = func(paths []string) (*IndexResult, error) {
+		gitBatchCalls.Add(1)
+		return originalGitBatch(paths)
+	}
+	originalSourceBatch := sourceWatcher.batchReindex
+	sourceWatcher.batchReindex = func(paths []string) (*IndexResult, error) {
+		sourceBatchCalls.Add(1)
+		return originalSourceBatch(paths)
+	}
+	gitWatcher.startTopologyProbe()
+
+	activeRef := filepath.Join(commonDir, filepath.FromSlash(headRef))
+	gitWatcher.mu.Lock()
+	_, activeBeforeCommit := gitWatcher.refPaths[filepath.Clean(activeRef)]
+	gitWatcher.mu.Unlock()
+	if activeBeforeCommit {
+		t.Fatal("unborn active loose ref was watched before it existed")
+	}
+	runGitWatcherTestCommand(t, root, "add", "warm.go")
+	runGitWatcherTestCommand(t, root,
+		"-c", "user.name=Gortex Test", "-c", "user.email=gortex@example.invalid",
+		"commit", "-qm", "first")
+	firstSHA := strings.TrimSpace(runGitWatcherTestOutput(t, root, "rev-parse", "HEAD"))
+	if firstSHA == "" {
+		t.Fatal("first commit SHA is empty")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		gitWatcher.mu.Lock()
+		observedSHA := gitWatcher.lastSHA
+		_, activeAfterCommit := gitWatcher.refPaths[filepath.Clean(activeRef)]
+		gitWatcher.mu.Unlock()
+		if observedSHA == firstSHA && activeAfterCommit {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	gitWatcher.mu.Lock()
+	observedSHA := gitWatcher.lastSHA
+	_, activeAfterCommit := gitWatcher.refPaths[filepath.Clean(activeRef)]
+	gitWatcher.mu.Unlock()
+	if observedSHA != firstSHA {
+		t.Fatalf("first-commit freshness SHA = %q, want %q", observedSHA, firstSHA)
+	}
+	if !activeAfterCommit {
+		t.Fatal("first active loose ref was not registered")
+	}
+	freshState, found, err := store.GetRepoIndexState(prefix)
+	if err != nil || !found {
+		t.Fatalf("first-commit freshness = found:%t err:%v", found, err)
+	}
+	if freshState.IndexedSHA != firstSHA {
+		t.Fatalf("first-commit persisted freshness SHA = %q, want %q", freshState.IndexedSHA, firstSHA)
+	}
+	if freshState.WorkspaceFP != baselineState.WorkspaceFP {
+		t.Fatalf("first-commit freshness changed warm workspace fingerprint: %q -> %q", baselineState.WorkspaceFP, freshState.WorkspaceFP)
+	}
+	if nodes := store.FindNodesByName("WarmBeforeFirstCommit"); len(nodes) == 0 {
+		t.Fatal("warm graph content disappeared across first-commit reconcile")
+	}
+	if got := gitBatchCalls.Load(); got != 0 {
+		t.Fatalf("GitWatcher batch reindexes = %d, want 0 for warm first commit", got)
+	}
+	if got := sourceBatchCalls.Load(); got != 0 {
+		t.Fatalf("source-watcher batch reindexes = %d, want 0 for unchanged source", got)
+	}
+	if got := inventoryCalls.Load(); got != 0 {
+		t.Fatalf("topology inventories = %d, want 0 for ref-only first commit", got)
 	}
 }
 
