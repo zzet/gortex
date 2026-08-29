@@ -199,6 +199,12 @@ type CheckoutLifecycle struct {
 	coordMu          sync.Mutex
 	coordinators     map[string]*CheckoutCoordinator
 	coordinatorHeads map[string]checkoutHeadIdentity
+
+	checkoutSignalWatchMu        sync.Mutex
+	checkoutSignalWatchers       *checkoutSourceSignalWatcherSet
+	checkoutSignalWatchClosing   bool
+	checkoutSignalWatchCloseDone chan struct{}
+
 	// started holds every coordinator this process has started and not yet
 	// seen stop, keyed by checkout. The registry is what can be handed a
 	// cycle; this is what is running. They come apart for the length of a
@@ -1780,6 +1786,7 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 			current.Signal("checkout HEAD changed")
 		}
 		l.coordMu.Unlock()
+		l.ensureCheckoutSourceSignalWatcher(checkout, primaryGraphID)
 		return
 	}
 	l.coordMu.Unlock()
@@ -1799,6 +1806,7 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 	if !l.installCoordinatorAtHead(checkout, coordinator) {
 		return
 	}
+	l.ensureCheckoutSourceSignalWatcher(checkout, primaryGraphID)
 	coordinator.Signal("checkout registered")
 }
 
@@ -1988,6 +1996,7 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 	// the registry it counts move together.
 	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
 	l.coordMu.Unlock()
+	l.dropCheckoutSourceSignalWatcher(checkoutID)
 	if coordinator != nil {
 		_ = coordinator.Close()
 		l.oweRetirement(coordinator.DrainRetirements()...)
@@ -2100,6 +2109,8 @@ func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	l.beginCheckoutSourceSignalClose()
+	defer l.finishCheckoutSourceSignalClose()
 	l.transitionMu.Lock()
 	if !l.transitionClosed {
 		l.transitionClosed = true
@@ -2145,6 +2156,7 @@ func (l *CheckoutLifecycle) Close() error {
 	}
 	l.coordinators = map[string]*CheckoutCoordinator{}
 	l.coordMu.Unlock()
+	l.stopCheckoutSourceSignalWatchers()
 
 	var errs []error
 	for _, coordinator := range coordinators {
