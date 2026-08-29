@@ -604,11 +604,6 @@ func (b *SparseGenerationBuilder) buildPrepared(
 		// payload from a vanished writer, so it remains on the established
 		// recovery path and is re-derived in full.
 		if adopted || len(plan.indexed) > 0 {
-			if b.beforePhysicalPass != nil {
-				if err := b.beforePhysicalPass(generationID); err != nil {
-					return err
-				}
-			}
 			if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
 				return err
 			}
@@ -855,6 +850,11 @@ func (b *SparseGenerationBuilder) runPass(
 	handle *store_sqlite.Store,
 	report *BuildReport,
 ) error {
+	if b.beforePhysicalPass != nil {
+		if err := b.beforePhysicalPass(report.GenerationID); err != nil {
+			return err
+		}
+	}
 	idx := New(handle, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
 

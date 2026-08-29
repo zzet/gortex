@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap"
@@ -108,6 +109,11 @@ func TestSparseGenerationBuilderFreshEmptyPlanSkipsPassAndPublishes(t *testing.T
 	walkErr := errors.New("content source walk must not run")
 	target := &poisonGenerationSource{walkErr: walkErr}
 	req := fastPathBuildRequest(t, store, target, "empty")
+	physicalPasses := 0
+	builder.beforePhysicalPass = func(int64) error {
+		physicalPasses++
+		return errors.New("fresh empty plan must not run a physical pass")
+	}
 	prePublished := false
 	req.PrePublish = func(context.Context, int64) error {
 		prePublished = true
@@ -119,7 +125,10 @@ func TestSparseGenerationBuilderFreshEmptyPlanSkipsPassAndPublishes(t *testing.T
 		t.Fatalf("build empty generation: %v", err)
 	}
 	if target.walked {
-		t.Fatal("fresh empty plan ran the index pass")
+		t.Fatal("fresh empty plan walked its target source")
+	}
+	if physicalPasses != 0 {
+		t.Fatalf("fresh empty plan physical passes = %d, want 0", physicalPasses)
 	}
 	if !prePublished {
 		t.Fatal("fresh empty plan skipped PrePublish")
@@ -162,13 +171,21 @@ func TestSparseGenerationBuilderFreshDeletionOnlyPlanSkipsPass(t *testing.T) {
 	target := &poisonGenerationSource{walkErr: errors.New("content source walk must not run")}
 	req := fastPathBuildRequest(t, store, target, "deletion-only")
 	req.Changes = []LayerPathChange{{Path: "gone.go", Kind: LayerPathDeleted}}
+	physicalPasses := 0
+	builder.beforePhysicalPass = func(int64) error {
+		physicalPasses++
+		return errors.New("fresh deletion-only plan must not run a physical pass")
+	}
 
 	generationID, report, err := builder.Build(context.Background(), req)
 	if err != nil {
 		t.Fatalf("build deletion-only generation: %v", err)
 	}
 	if target.walked {
-		t.Fatal("fresh deletion-only plan ran the index pass")
+		t.Fatal("fresh deletion-only plan walked its target source")
+	}
+	if physicalPasses != 0 {
+		t.Fatalf("fresh deletion-only plan physical passes = %d, want 0", physicalPasses)
 	}
 	if report.DeletedFiles != 1 || report.DeleteMasks != 1 || len(report.IndexedPaths) != 0 {
 		t.Fatalf("deletion report = %+v", report)
@@ -189,21 +206,26 @@ func TestSparseGenerationBuilderAdoptedEmptyPlanRunsRecoveryPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed building generation: %v", err)
 	}
-	walkErr := errors.New("adopted generation recovery walk")
 	target := &poisonGenerationSource{}
 	req := fastPathBuildRequest(t, store, target, identity.LayerID)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	physicalPasses := 0
 	builder.beforePhysicalPass = func(gotGenerationID int64) error {
 		physicalPasses++
 		if gotGenerationID != generationID {
 			t.Errorf("physical pass generation = %d, want %d", gotGenerationID, generationID)
 		}
-		return walkErr
+		cancel()
+		return nil
 	}
 
-	gotID, report, err := builder.Build(context.Background(), req)
-	if !errors.Is(err, walkErr) {
-		t.Fatalf("build error = %v, want %v", err, walkErr)
+	gotID, report, err := builder.Build(ctx, req)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("build error = %v, want context canceled", err)
+	}
+	if !strings.Contains(err.Error(), "indexer: index generation payload:") {
+		t.Fatalf("build error = %v, want failure from the real index pass", err)
 	}
 	if physicalPasses != 1 {
 		t.Fatalf("adopted generation physical passes = %d, want 1", physicalPasses)
@@ -217,6 +239,49 @@ func TestSparseGenerationBuilderAdoptedEmptyPlanRunsRecoveryPass(t *testing.T) {
 	}
 	if row.State != store_sqlite.ViewGenerationFailed {
 		t.Fatalf("abandoned generation state = %q, want %q", row.State, store_sqlite.ViewGenerationFailed)
+	}
+}
+
+func TestSparseGenerationBuilderAdoptedNonEmptyPlanRunsRealPass(t *testing.T) {
+	fixture := newSparseBuildFlightFixture(t)
+	generationID, _, err := fixture.store.BeginPayloadGeneration(
+		context.Background(), payloadRequestForBuild(fixture.request),
+	)
+	if err != nil {
+		t.Fatalf("seed building generation: %v", err)
+	}
+	physicalPasses := 0
+	fixture.builder.beforePhysicalPass = func(gotGenerationID int64) error {
+		physicalPasses++
+		if gotGenerationID != generationID {
+			t.Errorf("physical pass generation = %d, want %d", gotGenerationID, generationID)
+		}
+		return nil
+	}
+
+	gotID, report, err := fixture.builder.Build(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatalf("build adopted non-empty generation: %v", err)
+	}
+	if physicalPasses != 1 {
+		t.Fatalf("adopted non-empty generation physical passes = %d, want 1", physicalPasses)
+	}
+	if gotID != generationID || report.GenerationID != generationID {
+		t.Fatalf("generation = (%d, %d), want adopted %d", gotID, report.GenerationID, generationID)
+	}
+	if len(report.IndexedPaths) == 0 {
+		t.Fatal("adopted non-empty generation planned no indexed paths")
+	}
+	if report.NodeCount == 0 || report.ReplaceMasks == 0 {
+		t.Fatalf("real pass payload = nodes %d replace masks %d, want both non-zero",
+			report.NodeCount, report.ReplaceMasks)
+	}
+	row, found, getErr := fixture.store.Catalog().GetViewGeneration(context.Background(), generationID)
+	if getErr != nil || !found {
+		t.Fatalf("get published generation: found=%v err=%v", found, getErr)
+	}
+	if row.State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("generation state = %q, want %q", row.State, store_sqlite.ViewGenerationReady)
 	}
 }
 
