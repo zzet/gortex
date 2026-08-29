@@ -88,7 +88,7 @@ func TestViewForSessionCWDLeavesLegacyDedicatedCheckoutOnBase(t *testing.T) {
 	stack := newRefStack(t)
 	ctx := WithSessionCWD(WithSessionID(context.Background(), refTestSession), stack.repo)
 
-	view, err := stack.srv.viewForSessionCWD(ctx)
+	view, err := stack.srv.viewForSessionCWD(ctx, requestViewPolicy{})
 	if err != nil {
 		t.Fatalf("resolve the legacy dedicated checkout: %v", err)
 	}
@@ -104,7 +104,7 @@ func BenchmarkViewForSessionCWDLegacyDedicatedBase(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		view, err := stack.srv.viewForSessionCWD(ctx)
+		view, err := stack.srv.viewForSessionCWD(ctx, requestViewPolicy{})
 		if err != nil {
 			b.Fatalf("resolve the legacy dedicated checkout: %v", err)
 		}

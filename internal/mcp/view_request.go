@@ -289,13 +289,18 @@ func takeViewSelector(req *mcp.CallToolRequest) (graphview.Selector, error) {
 // requestViewPolicy carries the operation-level guarantees that affect view
 // selection. It is derived after parameter reconciliation, from the same
 // facade operation/effect registry that dispatch and mutation authorization
-// use, so a spelling alias cannot accidentally widen grace access.
+// use, so a spelling alias cannot accidentally widen base-fallback access.
 type requestViewPolicy struct {
-	allowGraceBaseFallback bool
+	allowGraceBaseFallback    bool
+	allowBuildingBaseFallback bool
 }
 
 func (s *Server) requestViewPolicy(req *mcp.CallToolRequest) requestViewPolicy {
-	return requestViewPolicy{allowGraceBaseFallback: s.requestAllowsGraceBaseFallback(req)}
+	allowBaseFallback := s.requestAllowsGraceBaseFallback(req)
+	return requestViewPolicy{
+		allowGraceBaseFallback:    allowBaseFallback,
+		allowBuildingBaseFallback: allowBaseFallback,
+	}
 }
 
 // requestAllowsGraceBaseFallback admits only read-effect graph/search
@@ -497,7 +502,7 @@ func (s *Server) selectRequestView(
 	}
 	switch selector.Kind {
 	case graphview.SelectorAuto:
-		return s.viewForSessionCWD(ctx)
+		return s.viewForSessionCWD(ctx, policy)
 	case graphview.SelectorWorktree:
 		return s.viewForWorktreeSelector(ctx, selector, policy)
 	case graphview.SelectorBase:
@@ -516,7 +521,7 @@ func (s *Server) selectRequestView(
 // A ready checkout is routed here whenever its view owns materialized
 // generations. Exact-HEAD dedicated graphs and automatic overlays both use
 // route-owned commit and dirty generations.
-func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
+func (s *Server) viewForSessionCWD(ctx context.Context, policy requestViewPolicy) (*requestView, error) {
 	cwd := SessionCWDFromContext(ctx)
 	if cwd == "" {
 		return nil, nil
@@ -550,7 +555,7 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 		return nil, nil
 	}
 	requested := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID}
-	return s.materializeRequestView(ctx, requested, checkout, false)
+	return s.materializeRequestView(ctx, requested, checkout, !policy.allowBuildingBaseFallback)
 }
 
 // viewForWorktreeSelector serves an explicitly named checkout. Every refusal
@@ -692,6 +697,11 @@ func (s *Server) materializeRequestView(
 		return viewFallback(strict, rider, graphview.NewViewError(graphview.CodeViewBuilding,
 			fmt.Sprintf("checkout %q is not fully routed yet", checkout.CheckoutID)))
 	}
+
+	if err := s.checkoutRouteHeadError(ctx, checkout, route); err != nil {
+		return viewFallback(strict, rider, err)
+	}
+
 	view, err := s.materializer.MaterializeCheckout(ctx, checkout.CheckoutID)
 	if err != nil {
 		return viewFallback(strict, rider, err)
@@ -707,6 +717,29 @@ func (s *Server) materializeRequestView(
 	}
 	routed.bindSources(view.GenerationSources(), s.graph)
 	return routed, nil
+}
+
+// checkoutRouteHeadError keeps a ready-but-stale route internal until its
+// replacement atomically publishes without serving it as the checkout's HEAD.
+func (s *Server) checkoutRouteHeadError(
+	ctx context.Context,
+	checkout store_sqlite.Checkout,
+	route store_sqlite.CheckoutRoute,
+) error {
+	routedCommit, found, err := s.materializer.Catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	switch {
+	case err != nil:
+		return graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+			fmt.Sprintf("read commit generation %d routed to checkout %q", route.CommitGenerationID, checkout.CheckoutID), err)
+	case !found:
+		return graphview.NewViewError(graphview.CodeViewBuilding,
+			fmt.Sprintf("commit generation %d routed to checkout %q is not available", route.CommitGenerationID, checkout.CheckoutID))
+	case routedCommit.TreeOID != checkout.HeadTree:
+		return graphview.NewViewError(graphview.CodeViewBuilding,
+			fmt.Sprintf("checkout %q is still building tree %q; routed tree %q is stale", checkout.CheckoutID, checkout.HeadTree, routedCommit.TreeOID))
+	default:
+		return nil
+	}
 }
 
 // viewFallback either propagates the failure (an explicit selector) or serves
