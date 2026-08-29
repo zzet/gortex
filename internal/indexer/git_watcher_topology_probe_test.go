@@ -14,6 +14,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/zzet/gortex/internal/gitstate"
+	"go.uber.org/zap"
 )
 
 func TestGitWatcherRefWatchesUseOnlyExactFiles(t *testing.T) {
@@ -321,6 +322,66 @@ func TestGitWatcherTopologyProbeAndRetrySerializeInventory(t *testing.T) {
 	}
 }
 
+func TestGitWatcherStopJoinsEnteredReconcileCallbackAndConcurrentCallers(t *testing.T) {
+	watcher := newGitRefWatcherFixture(t)
+	watcher.topologyProbeInterval = time.Hour
+	watcher.debounce = time.Millisecond
+	if err := watcher.Start(); err != nil {
+		t.Fatalf("GitWatcher.Start: %v", err)
+	}
+	watcher.mu.Lock()
+	headPath := filepath.Join(watcher.gitDir, "HEAD")
+	watcher.mu.Unlock()
+	if !watcher.invalidateRefWatch(headPath) {
+		t.Fatal("HEAD watch was not registered before callback test")
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var attempts atomic.Int64
+	watcher.refAdd = func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(headPath) {
+			attempts.Add(1)
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	watcher.scheduleReconcile("joined-stop-test")
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile callback did not enter ref refresh")
+	}
+
+	firstStop := make(chan error, 1)
+	secondStop := make(chan error, 1)
+	go func() { firstStop <- watcher.Stop() }()
+	go func() { secondStop <- watcher.Stop() }()
+	for _, result := range []<-chan error{firstStop, secondStop} {
+		select {
+		case err := <-result:
+			t.Fatalf("Stop returned before entered callback released: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	close(release)
+	for _, result := range []<-chan error{firstStop, secondStop} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("GitWatcher.Stop: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Stop did not join entered reconcile callback")
+		}
+	}
+	attemptsAfterStop := attempts.Load()
+	time.Sleep(10 * time.Millisecond)
+	if got := attempts.Load(); got != attemptsAfterStop {
+		t.Fatalf("ref registration continued after Stop: %d -> %d", attemptsAfterStop, got)
+	}
+}
+
 func TestGitWatcherTopologyRefreshDoesNotStartControlProbeBeforeStart(t *testing.T) {
 	fixture := newTopologyWatchFixture(t, 1)
 	watcher := fixture.watcher(0)
@@ -410,6 +471,102 @@ func TestGitWatcherStopSuppressesQueuedTopologyCallback(t *testing.T) {
 	time.Sleep(2 * watcher.debounce)
 	if got := callbacks.Load(); got != 0 {
 		t.Fatalf("queued topology callbacks after Stop = %d, want 0", got)
+	}
+}
+
+func TestGitWatcherStopJoinsAdmittedCoalescedReconcileContinuation(t *testing.T) {
+	root := t.TempDir()
+	runGitWatcherTestCommand(t, root, "init", "-q")
+	sourcePath := filepath.Join(root, "coalesced.go")
+	if err := os.WriteFile(sourcePath, []byte("package coalesced\n\nfunc Value() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatalf("write initial source: %v", err)
+	}
+	runGitWatcherTestCommand(t, root, "add", "coalesced.go")
+	runGitWatcherTestCommand(t, root,
+		"-c", "user.name=Gortex Test", "-c", "user.email=gortex@example.invalid",
+		"commit", "-qm", "initial")
+	initialSHA := strings.TrimSpace(runGitWatcherTestOutput(t, root, "rev-parse", "HEAD"))
+	if err := os.WriteFile(sourcePath, []byte("package coalesced\n\nfunc Value() int { return 2 }\n"), 0o644); err != nil {
+		t.Fatalf("write changed source: %v", err)
+	}
+	runGitWatcherTestCommand(t, root, "add", "coalesced.go")
+	runGitWatcherTestCommand(t, root,
+		"-c", "user.name=Gortex Test", "-c", "user.email=gortex@example.invalid",
+		"commit", "-qm", "changed")
+
+	watcher, err := NewGitWatcher(root, nil, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewGitWatcher: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := watcher.Stop(); err != nil {
+			t.Errorf("GitWatcher.Stop: %v", err)
+		}
+	})
+	watcher.mu.Lock()
+	watcher.lastSHA = initialSHA
+	watcher.mu.Unlock()
+	batchEntered := make(chan struct{})
+	batchRelease := make(chan struct{})
+	var batchCalls atomic.Int64
+	watcher.batchReindex = func([]string) (*IndexResult, error) {
+		if batchCalls.Add(1) == 1 {
+			close(batchEntered)
+			<-batchRelease
+		}
+		return nil, errors.New("intentional batch stop barrier")
+	}
+	continuationAdmitted := make(chan struct{})
+	continuationRelease := make(chan struct{})
+	watcher.reconcileContinuationAdmitted = func() {
+		close(continuationAdmitted)
+		<-continuationRelease
+	}
+	initialDone := make(chan struct{})
+	go func() {
+		watcher.reconcile("initial")
+		close(initialDone)
+	}()
+	select {
+	case <-batchEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial reconcile did not enter batch reindex")
+	}
+	watcher.reconcile("coalesce-request")
+	close(batchRelease)
+	select {
+	case <-continuationAdmitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("coalesced continuation was not admitted")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- watcher.Stop() }()
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop returned before the admitted continuation launched: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(continuationRelease)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("GitWatcher.Stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not join the admitted coalesced continuation")
+	}
+	select {
+	case <-initialDone:
+	case <-time.After(time.Second):
+		t.Fatal("initial reconcile did not return after continuation admission")
+	}
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("batch reindexes after Stop = %d, want only the admitted initial run", got)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("post-Stop coalesced reconcile mutated the graph: batch calls=%d", got)
 	}
 }
 

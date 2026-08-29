@@ -37,23 +37,40 @@ const defaultGitTopologyProbeInterval = time.Second
 
 var errGitTopologyProbeUnstable = errors.New("git topology changed while inventory was sampled")
 
+type gitWatcherTimerLease struct {
+	once sync.Once
+	wg   *sync.WaitGroup
+}
+
+func (lease *gitWatcherTimerLease) release() {
+	if lease == nil || lease.wg == nil {
+		return
+	}
+	lease.once.Do(lease.wg.Done)
+}
+
 type GitWatcher struct {
 	repoPath string
 	// indexer is the construction-time stable repository-lane carrier.
 	// MultiWatcher installs currentIndexer so the freshness tail resolves the
 	// currently registered Indexer only after that lane admits it.
-	indexer        *Indexer
-	currentIndexer func() *Indexer
-	logger         *zap.Logger
-	fsw            *fsnotify.Watcher
-	debounce       time.Duration
-	done           chan struct{}
-	stopped        chan struct{}
-	mu             sync.Mutex
-	lastSHA        string
-	fireTimer      *time.Timer
-	loopStarted    bool
-	stopCalled     bool
+	indexer                       *Indexer
+	currentIndexer                func() *Indexer
+	logger                        *zap.Logger
+	fsw                           *fsnotify.Watcher
+	debounce                      time.Duration
+	done                          chan struct{}
+	stopped                       chan struct{}
+	mu                            sync.Mutex
+	lastSHA                       string
+	fireTimer                     *time.Timer
+	fireTimerLease                *gitWatcherTimerLease
+	reconcileTimerWG              sync.WaitGroup
+	reconcileTimerEntered         func() // deterministic lifecycle hook; nil in production
+	reconcileContinuationAdmitted func() // deterministic lifecycle hook; nil in production
+	loopStarted                   bool
+	stopCalled                    bool
+	stopComplete                  chan struct{}
 
 	// Worktree topology belongs to the shared git common directory, not to
 	// this checkout's private gitdir. Every watcher runs one bounded control
@@ -137,6 +154,7 @@ func NewGitWatcher(repoPath string, idx *Indexer, logger *zap.Logger) (*GitWatch
 		debounce:              300 * time.Millisecond,
 		done:                  make(chan struct{}),
 		stopped:               make(chan struct{}),
+		stopComplete:          make(chan struct{}),
 		topologyOwned:         true,
 		topologyOwnerEpoch:    1,
 		topologyProbeInterval: defaultGitTopologyProbeInterval,
@@ -310,20 +328,29 @@ func (gw *GitWatcher) Start() error {
 // on a channel nobody's going to close.
 func (gw *GitWatcher) Stop() error {
 	gw.mu.Lock()
+	if gw.stopComplete == nil {
+		gw.stopComplete = make(chan struct{})
+	}
+	stopComplete := gw.stopComplete
+	if gw.stopCalled {
+		gw.mu.Unlock()
+		<-stopComplete
+		return nil
+	}
 	started := gw.loopStarted
-	already := gw.stopCalled
 	gw.stopCalled = true
 	gw.topologyOwnerEpoch++
-	if gw.fireTimer != nil {
-		gw.fireTimer.Stop()
+	if gw.fireTimer != nil && gw.fireTimer.Stop() {
+		gw.fireTimerLease.release()
 	}
+	gw.fireTimer = nil
+	gw.fireTimerLease = nil
 	if gw.topologyTimer != nil {
 		gw.topologyTimer.Stop()
 	}
 	gw.mu.Unlock()
-	if already {
-		return nil
-	}
+	defer close(stopComplete)
+
 	gw.stopTopologyProbe()
 
 	gw.topologyRetryMu.Lock()
@@ -335,6 +362,10 @@ func (gw *GitWatcher) Stop() error {
 	}
 	gw.topologyRetryMu.Unlock()
 	gw.topologyRetryWG.Wait()
+	// A timer that has entered its callback owns a lease until ref-watch
+	// refresh and reconcile return. Stop cannot close fsnotify or return while
+	// that old callback can still mutate or overlap a replacement watcher.
+	gw.reconcileTimerWG.Wait()
 
 	close(gw.done)
 	_ = gw.fsw.Close()
@@ -379,14 +410,41 @@ func (gw *GitWatcher) loop() {
 // timer on every event and lets the last one win.
 func (gw *GitWatcher) scheduleReconcile(trigger string) {
 	gw.mu.Lock()
-	defer gw.mu.Unlock()
 	if gw.stopCalled {
+		gw.mu.Unlock()
 		return
 	}
-	if gw.fireTimer != nil {
-		gw.fireTimer.Stop()
+	if gw.fireTimer != nil && gw.fireTimer.Stop() {
+		gw.fireTimerLease.release()
 	}
+	gw.reconcileTimerWG.Add(1)
+	lease := &gitWatcherTimerLease{wg: &gw.reconcileTimerWG}
+	gw.fireTimerLease = lease
 	gw.fireTimer = time.AfterFunc(gw.debounce, func() {
+		defer lease.release()
+		gw.mu.Lock()
+		if gw.fireTimerLease == lease {
+			gw.fireTimer = nil
+			gw.fireTimerLease = nil
+		}
+		stopped := gw.stopCalled
+		entered := gw.reconcileTimerEntered
+		gw.mu.Unlock()
+		if stopped {
+			return
+		}
+		if entered != nil {
+			entered()
+		}
+		// Stop may begin while an entered callback is blocked on admission.
+		// Recheck immediately before touching watches; if it begins later, its
+		// Wait below keeps the callback leased until all mutation returns.
+		gw.mu.Lock()
+		stopped = gw.stopCalled
+		gw.mu.Unlock()
+		if stopped {
+			return
+		}
 		gw.topologyRefreshMu.Lock()
 		err := gw.refreshRefWatchesLocked()
 		gw.topologyRefreshMu.Unlock()
@@ -395,6 +453,7 @@ func (gw *GitWatcher) scheduleReconcile(trigger string) {
 		}
 		gw.reconcile(trigger)
 	})
+	gw.mu.Unlock()
 }
 
 func (gw *GitWatcher) scheduleTopologyChange(trigger string) {
@@ -1224,6 +1283,10 @@ func (gw *GitWatcher) reconcile(trigger string) {
 	// up — so we always converge on the latest state without ever
 	// running two whole-graph passes concurrently.
 	gw.mu.Lock()
+	if gw.stopCalled {
+		gw.mu.Unlock()
+		return
+	}
 	if gw.reconciling {
 		gw.rerun = true
 		gw.mu.Unlock()
@@ -1236,9 +1299,25 @@ func (gw *GitWatcher) reconcile(trigger string) {
 		gw.reconciling = false
 		again := gw.rerun && !gw.stopCalled
 		gw.rerun = false
+		var continuationLease *gitWatcherTimerLease
+		var continuationAdmitted func()
+		if again {
+			// Admit the coalesced continuation under the same mutex that closes
+			// timer admission in Stop. Stop therefore cannot observe a zero
+			// WaitGroup count and return before this goroutine starts.
+			gw.reconcileTimerWG.Add(1)
+			continuationLease = &gitWatcherTimerLease{wg: &gw.reconcileTimerWG}
+			continuationAdmitted = gw.reconcileContinuationAdmitted
+		}
 		gw.mu.Unlock()
 		if again {
-			go gw.reconcile("coalesced")
+			if continuationAdmitted != nil {
+				continuationAdmitted()
+			}
+			go func() {
+				defer continuationLease.release()
+				gw.reconcile("coalesced")
+			}()
 		}
 	}()
 
