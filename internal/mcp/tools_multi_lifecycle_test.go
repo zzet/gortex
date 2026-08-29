@@ -58,6 +58,16 @@ func newCatalogMCPServer(t *testing.T) (*Server, *indexer.MultiIndexer, *store_s
 			_ = srv.lifecycle.Close()
 		}
 	})
+
+	watcher, err := indexer.NewMultiWatcher(mi, map[string]config.WatchConfig{}, zap.NewNop())
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start())
+	srv.lifecycle.SetWatcherSource(func() indexer.RepoWatcher { return watcher })
+	t.Cleanup(func() {
+		srv.lifecycle.SetWatcherSource(nil)
+		require.NoError(t, watcher.Stop())
+	})
+
 	srv.PublishReadiness("ready", true, nil)
 	return srv, mi, store.Catalog(), dir
 }
