@@ -54,6 +54,7 @@ var probeFileKey = probePrefix + "/" + filepath.FromSlash(probeFile)
 // a caller probes with.
 type probeFixture struct {
 	controller   *realController
+	multi        *indexer.MultiIndexer
 	store        *store_sqlite.Store
 	catalog      *store_sqlite.Catalog
 	primaryRoot  string
@@ -69,7 +70,6 @@ func newProbeFixture(t *testing.T) *probeFixture {
 	c, mi, catalog, dir := buildCatalogController(t)
 	store, ok := c.graph.(*store_sqlite.Store)
 	require.True(t, ok, "the fixture opened a %T, not the sqlite store", c.graph)
-	_ = mi
 
 	primaryRoot := filepath.Join(dir, "primary")
 	worktreeRoot := filepath.Join(dir, "worktree")
@@ -147,6 +147,7 @@ func newProbeFixture(t *testing.T) *probeFixture {
 	}
 	return &probeFixture{
 		controller:   c,
+		multi:        mi,
 		store:        store,
 		catalog:      catalog,
 		primaryRoot:  primaryRoot,
@@ -660,6 +661,87 @@ func TestTopologyNudgePanicReleasesCurrentAndPending(t *testing.T) {
 	assert.Empty(t, controller.topologyNudges)
 }
 
+func TestAttachWatcherSchedulesPendingPromotionWithoutWaitingForBuildGate(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "context"
+		if legacy {
+			name = "legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			testenv.Sandbox(t)
+			fixture := newProbeFixture(t)
+			gate := indexer.NewViewBuildGate()
+			fixture.controller.lifecycle.SetBuildGate(gate)
+			ctx := context.Background()
+			transitionID := "attach-promotion-" + name
+			require.NoError(t, fixture.catalog.BeginIntentTransition(ctx, store_sqlite.IntentTransition{
+				TransitionID:       transitionID,
+				CheckoutID:         probeWorktreeID,
+				Cause:              "promote_checkout",
+				PriorDesiredMode:   store_sqlite.CheckoutModeAutomatic,
+				PriorEffectiveMode: store_sqlite.CheckoutModeAutomatic,
+				RequestedMode:      store_sqlite.CheckoutModeDedicated,
+				PriorCheckoutState: store_sqlite.CheckoutStateReady,
+				State:              store_sqlite.IntentTransitionPending,
+				CreatedAt:          100,
+				LastProgress:       100,
+			}))
+
+			watcher, err := indexer.NewMultiWatcher(fixture.multi, map[string]config.WatchConfig{}, zap.NewNop())
+			require.NoError(t, err)
+			require.NoError(t, watcher.Start())
+			t.Cleanup(func() {
+				_ = fixture.controller.AttachWatcherContext(context.Background(), nil)
+				require.NoError(t, watcher.Stop())
+			})
+
+			attached := make(chan error, 1)
+			go func() {
+				if legacy {
+					fixture.controller.AttachWatcher(watcher)
+					attached <- nil
+					return
+				}
+				attached <- fixture.controller.AttachWatcherContext(ctx, watcher)
+			}()
+			select {
+			case err := <-attached:
+				require.NoError(t, err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("AttachWatcher waited for the closed view-build gate")
+			}
+			require.False(t, gate.IsOpen(), "attachment must not open the daemon warmup gate")
+			transitions, err := fixture.catalog.ListIntentTransitions(ctx)
+			require.NoError(t, err)
+			var pending *store_sqlite.IntentTransition
+			for i := range transitions {
+				if transitions[i].TransitionID == transitionID {
+					pending = &transitions[i]
+					break
+				}
+			}
+			require.NotNil(t, pending, "durable transition disappeared before the gate opened")
+			assert.Equal(t, store_sqlite.IntentTransitionPending, pending.State)
+			assert.EqualValues(t, 100, pending.LastProgress)
+
+			gate.Open()
+			require.Eventually(t, func() bool {
+				rows, listErr := fixture.catalog.ListIntentTransitions(ctx)
+				if listErr != nil {
+					return false
+				}
+				for _, row := range rows {
+					if row.TransitionID == transitionID {
+						return row.State != store_sqlite.IntentTransitionPending || row.LastProgress > 100
+					}
+				}
+				return true
+			}, 3*time.Second, 10*time.Millisecond,
+				"opening the gate must let the transition admitted by AttachWatcher progress")
+		})
+	}
+}
+
 // TestAttachedWatcherDiscoversAndForgetsLinkedWorktree exercises the complete
 // topology-event path with a real, disposable Git family. Nothing calls a
 // reconciliation method directly: GitWatcher observes the administration
@@ -715,31 +797,95 @@ func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
 	runTopologyGitCommand(t, primaryRoot, "add", "main.go")
 	runTopologyGitCommand(t, primaryRoot, "commit", "-m", "seed topology fixture")
 
-	ctx := context.Background()
-	registration, err := lifecycle.Register(ctx, config.RepoEntry{
-		Path: primaryRoot,
-		Name: "topology-event",
-	}, indexer.TrackSourceCLI)
-	require.NoError(t, err)
-	require.False(t, registration.Pending, "the tiny dedicated base should publish before watcher attachment")
-	require.NotEmpty(t, registration.CheckoutID)
-	require.NotEmpty(t, registration.FamilyID)
-	require.NotEmpty(t, registration.GraphID)
-
-	watcher, err := indexer.NewMultiWatcher(multi, map[string]config.WatchConfig{
-		registration.Prefix: {
-			Enabled:        true,
-			DebounceMs:     20,
-			StormThreshold: -1,
-		},
-	}, logger)
+	// Start from the stale startup snapshot: the watcher saw no configured
+	// repositories when it was built. A Track racing this warmup must persist
+	// its durable state, report the process-local gap, and let attachment repair
+	// that exact prefix synchronously.
+	watcher, err := indexer.NewMultiWatcher(multi, map[string]config.WatchConfig{}, logger)
 	require.NoError(t, err)
 	require.NoError(t, watcher.Start())
 	t.Cleanup(func() {
 		controller.AttachWatcher(nil)
 		require.NoError(t, watcher.Stop())
 	})
-	controller.AttachWatcher(watcher)
+
+	ctx := context.Background()
+	payload, err := controller.Track(ctx, daemon.TrackParams{
+		Path: primaryRoot,
+		Name: "topology-event",
+	})
+	require.ErrorIs(t, err, indexer.ErrWatcherUnavailable)
+	assert.Empty(t, payload, "Track must not report success before its watcher is live")
+
+	metadata := multi.AllMetadata()
+	require.Len(t, metadata, 1, "failed watcher attachment must retain the indexed repository")
+	var trackedPrefix string
+	for prefix := range metadata {
+		trackedPrefix = prefix
+	}
+	require.NotEmpty(t, trackedPrefix)
+	global := controller.configManager.Global()
+	require.NotNil(t, global)
+	require.Len(t, global.Repos, 1, "failed watcher attachment must retain durable config")
+	var configuredPath string
+	for _, repo := range global.Repos {
+		configuredPath = repo.Path
+	}
+	assert.Equal(t, primaryRoot, configuredPath)
+
+	graphRow, found, err := catalog.GetDedicatedGraph(ctx, indexer.GraphIDFor(trackedPrefix))
+	require.NoError(t, err)
+	require.True(t, found, "failed watcher attachment must retain the dedicated graph")
+	registration := indexer.RegisterResult{
+		Prefix:     trackedPrefix,
+		GraphID:    graphRow.GraphID,
+		CheckoutID: graphRow.OwnerCheckoutID,
+		FamilyID:   graphRow.FamilyID,
+	}
+	liveWatchers, _ := watcher.WatchedRepos()
+	require.Zero(t, liveWatchers, "the stale startup snapshot must remain empty before AttachWatcher")
+
+	require.NoError(t, controller.AttachWatcherContext(ctx, watcher))
+	require.Eventually(t, func() bool {
+		count, _ := watcher.WatchedRepos()
+		return count == 1
+	}, 5*time.Second, 10*time.Millisecond,
+		"AttachWatcher must repair the durable configured prefix")
+	require.NoError(t, controller.AttachWatcherContext(ctx, watcher))
+	require.Eventually(t, func() bool {
+		count, _ := watcher.WatchedRepos()
+		return count == 1
+	}, 5*time.Second, 10*time.Millisecond,
+		"attaching the same watcher twice must converge idempotently")
+
+	alreadyPayload, err := controller.Track(ctx, daemon.TrackParams{
+		Path: primaryRoot,
+		Name: "topology-event",
+	})
+	require.NoError(t, err)
+	var already struct {
+		Status string `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal(alreadyPayload, &already))
+	assert.Equal(t, "already_tracked", already.Status)
+
+	// AlreadyTracked is also a repair path: a lost process-local membership must
+	// be restored without rebuilding or requiring another filesystem event.
+	require.NoError(t, watcher.RemoveRepo(trackedPrefix))
+	liveWatchers, _ = watcher.WatchedRepos()
+	require.Zero(t, liveWatchers)
+	repairedPayload, err := controller.Track(ctx, daemon.TrackParams{
+		Path: primaryRoot,
+		Name: "topology-event",
+	})
+	require.NoError(t, err)
+	var repaired struct {
+		Status string `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal(repairedPayload, &repaired))
+	assert.Equal(t, "already_tracked", repaired.Status)
+	liveWatchers, _ = watcher.WatchedRepos()
+	require.Equal(t, 1, liveWatchers, "AlreadyTracked must repair missing watcher membership")
 
 	// AttachWatcher intentionally raises one startup reconciliation. Let it
 	// drain so the assertion below proves a later filesystem event, rather
@@ -957,6 +1103,21 @@ func TestRetainedTopologyReconcileRemovesWholeWatcherFamilyWithoutCycle(t *testi
 	runTopologyGitCommand(t, primaryRoot, "add", "main.go")
 	runTopologyGitCommand(t, primaryRoot, "commit", "-m", "seed topology cycle fixture")
 
+	// Runtime tracking now requires the already-published watcher registry.
+	// Start it from the same stale-empty warmup snapshot as daemon startup;
+	// each Register call below must dynamically ensure its own live member.
+	watcher, err := indexer.NewMultiWatcher(multi, map[string]config.WatchConfig{}, logger)
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start())
+	t.Cleanup(func() {
+		controller.AttachWatcher(nil)
+		require.NoError(t, watcher.Stop())
+	})
+	// Register through the real watcher source before enabling topology
+	// callbacks. Creating B emits Git admin events; reconciling them while B's
+	// explicit promotion is publishing would make the fixture race itself.
+	lifecycle.SetWatcherSource(func() indexer.RepoWatcher { return watcher })
+
 	ctx := context.Background()
 	registration, err := lifecycle.Register(ctx, config.RepoEntry{
 		Path: primaryRoot,
@@ -966,9 +1127,9 @@ func TestRetainedTopologyReconcileRemovesWholeWatcherFamilyWithoutCycle(t *testi
 	require.False(t, registration.Pending)
 	require.NotEmpty(t, registration.FamilyID)
 
-	// Explicitly register B before watcher attachment. Automatic worktrees use
-	// the primary corpus prefix; this regression needs two physical watcher
-	// members in one family so ownership can transfer from A to B.
+	// Explicitly register B through the attached dynamic registry. Automatic
+	// worktrees use the primary corpus prefix; this regression needs two
+	// physical watcher members in one family so ownership can transfer A to B.
 	runTopologyGitCommand(t, primaryRoot,
 		"worktree", "add", "-b", "topology-cycle-linked", worktreeRoot)
 	linkedRegistration, err := lifecycle.Register(ctx, config.RepoEntry{
@@ -979,25 +1140,6 @@ func TestRetainedTopologyReconcileRemovesWholeWatcherFamilyWithoutCycle(t *testi
 	require.False(t, linkedRegistration.Pending)
 	require.Equal(t, registration.FamilyID, linkedRegistration.FamilyID)
 	require.NotEqual(t, registration.Prefix, linkedRegistration.Prefix)
-
-	watcher, err := indexer.NewMultiWatcher(multi, map[string]config.WatchConfig{
-		registration.Prefix: {
-			Enabled:        true,
-			DebounceMs:     20,
-			StormThreshold: -1,
-		},
-		linkedRegistration.Prefix: {
-			Enabled:        true,
-			DebounceMs:     20,
-			StormThreshold: -1,
-		},
-	}, logger)
-	require.NoError(t, err)
-	require.NoError(t, watcher.Start())
-	t.Cleanup(func() {
-		controller.AttachWatcher(nil)
-		require.NoError(t, watcher.Stop())
-	})
 
 	ownerPrefix, survivorPrefix := registration.Prefix, linkedRegistration.Prefix
 	if survivorPrefix < ownerPrefix {

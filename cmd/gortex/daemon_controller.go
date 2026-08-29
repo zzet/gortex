@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -186,6 +187,9 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 			zap.String("path", absPath), zap.Error(result.CatalogErr))
 	}
 	if result.AlreadyTracked {
+		if err := c.lifecycle.EnsureTrackedWatcher(ctx, result.Prefix); err != nil {
+			return nil, fmt.Errorf("repairing watcher for already tracked repository: %w", err)
+		}
 		// Already tracked — idempotent.
 		return json.RawMessage(fmt.Sprintf(`{"status":"already_tracked","path":%q}`, absPath)), nil
 	}
@@ -1755,7 +1759,21 @@ func probeSymbolHit(n *graph.Node) daemon.SymbolHit {
 // The lifecycle reads the watcher through this same pointer, so every
 // surface's attach and detach hit the one live watcher.
 func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
-	c.multiWatcher.Store(mw)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := c.AttachWatcherContext(ctx, mw); err != nil {
+		c.logger.Warn("daemon: watcher attachment reconciliation was incomplete", zap.Error(err))
+	}
+}
+
+// AttachWatcherContext publishes a live watcher and repairs every durable
+// explicit repository that may have been tracked after the warmup snapshot.
+// Per-prefix failures are returned for observability after all healthy prefixes
+// have been attempted; the durable transition journal remains retryable.
+func (c *realController) AttachWatcherContext(ctx context.Context, mw *indexer.MultiWatcher) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.lifecycle.SetWatcherSource(func() indexer.RepoWatcher {
 		// A typed nil in an interface is not nil; return the untyped one so
 		// the lifecycle's "is there a watcher yet" test stays honest.
@@ -1765,8 +1783,11 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 		return nil
 	})
 	if mw == nil {
-		return
+		c.multiWatcher.Store(nil)
+		return nil
 	}
+	// Install the topology consumer before publication. A concurrent Track
+	// that observes the pointer can then safely start and dispatch a watcher.
 	mw.OnWorktreeChangeContext(func(dispatchCtx context.Context, repoPrefix, _ string) {
 		resolveCtx, cancel := context.WithTimeout(dispatchCtx, 10*time.Second)
 		familyID, err := c.lifecycle.ResolveFamilyID(resolveCtx, repoPrefix)
@@ -1779,6 +1800,11 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 		retainedCtx, release := mw.RetainTopologyDispatch(dispatchCtx)
 		c.nudgeFamilyTopologyRequest(retainedCtx, familyID, release)
 	})
+	c.multiWatcher.Store(mw)
+
+	attachErr := c.lifecycle.EnsureConfiguredWatchers(ctx)
+	resumeErr := c.lifecycle.ResumePendingTransitions(ctx)
+	return errors.Join(attachErr, resumeErr)
 }
 
 // watcher reads the attached MultiWatcher without touching the coarse mutex.
