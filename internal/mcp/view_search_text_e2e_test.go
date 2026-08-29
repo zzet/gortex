@@ -100,6 +100,21 @@ func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
 	}
 	t.Cleanup(func() { _ = lifecycle.Close() })
 
+	watcher, err := indexer.NewMultiWatcher(mi, map[string]config.WatchConfig{}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("build the repository watcher: %v", err)
+	}
+	if err := watcher.Start(); err != nil {
+		t.Fatalf("start the repository watcher: %v", err)
+	}
+	lifecycle.SetWatcherSource(func() indexer.RepoWatcher { return watcher })
+	t.Cleanup(func() {
+		lifecycle.SetWatcherSource(nil)
+		if err := watcher.Stop(); err != nil {
+			t.Errorf("stop the repository watcher: %v", err)
+		}
+	})
+
 	// Registering the primary is what gives the worktree beside it a view: the
 	// family reconciliation at the end of a track starts a coordinator for
 	// every automatic checkout it finds.
