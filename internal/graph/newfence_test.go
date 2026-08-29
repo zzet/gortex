@@ -23,7 +23,11 @@ import (
 // stagingCallers lists the non-test files allowed to construct it. Keeping the
 // list this short is the point: a new entry means some production path is about
 // to hold graph data that no restart can recover.
-var stagingCallers []string
+var stagingCallers = []string{
+	// Promotion builds an exact-HEAD corpus into the durable generation store.
+	// This Store is only the empty lower layer for that build and is never routed.
+	"internal/indexer/checkout_dedicated_base.go",
+}
 
 // harnessCallers lists the non-test files that construct it for a test and are
 // only reachable from one.
