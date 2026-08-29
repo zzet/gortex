@@ -33,7 +33,7 @@ import (
 const coordinatorAdminName = "worktree"
 
 type coordinatorFixture struct {
-	t *testing.T
+	t testing.TB
 
 	store   *store_sqlite.Store
 	catalog *store_sqlite.Catalog
@@ -55,7 +55,7 @@ type coordinatorFixture struct {
 
 // newCoordinatorFixture builds the family, indexes the primary and writes the
 // catalog identity a coordinator needs to exist.
-func newCoordinatorFixture(t *testing.T) *coordinatorFixture {
+func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 	t.Helper()
 	builderIsolateGit(t)
 
@@ -182,7 +182,7 @@ func (f *coordinatorFixture) writeCatalogIdentity() {
 // coordinator builds one over the fixture, with the self-signal off: the tests
 // decide when a cycle runs, either by signalling inside a synctest bubble or by
 // calling the cycle directly.
-func (f *coordinatorFixture) coordinator(t *testing.T, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
+func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
 	t.Helper()
 	cfg.CheckoutID = f.checkoutID
 	cfg.CheckoutRoot = f.worktree
@@ -221,7 +221,7 @@ func (f *coordinatorFixture) coordinator(t *testing.T, cfg CheckoutCoordinatorCo
 // the struct rather than in the loop. Stopping the loop is what lets a test
 // assert on that self-signal — a running loop would consume it and arm a window
 // of its own, which is a second cycle the test did not ask for.
-func (f *coordinatorFixture) inertCoordinator(t *testing.T, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
+func (f *coordinatorFixture) inertCoordinator(t testing.TB, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
 	t.Helper()
 	coordinator := f.coordinator(t, cfg)
 	if err := coordinator.Close(); err != nil {
@@ -608,6 +608,68 @@ func TestCoordinatorReusesCommitAcrossIsolatedDirtyStates(t *testing.T) {
 	if commits != 2 {
 		t.Fatalf("%d commit generations exist for two trees visited three times", commits)
 	}
+}
+
+func BenchmarkCoordinatorStableAdoptedCommitDirtyReconcile(b *testing.B) {
+	f := newCoordinatorFixture(b)
+	ctx := context.Background()
+
+	const siblingName = "benchmark-sibling"
+	siblingRoot := filepath.Join(filepath.Dir(f.worktree), siblingName)
+	builderGit(b, f.primary, "worktree", "add", "-b", siblingName, siblingRoot)
+	siblingID := f.siblingCheckout(siblingName)
+
+	checkoutID, worktree := f.checkoutID, f.worktree
+	f.checkoutID, f.worktree = siblingID, siblingRoot
+	sibling := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	siblingCycle := sibling.reconcile(ctx)
+	if siblingCycle.Err != nil {
+		b.Fatalf("build sibling commit layer: %v", siblingCycle.Err)
+	}
+	siblingRoute := f.route()
+	if siblingRoute.CommitGenerationID <= 0 {
+		b.Fatal("sibling routed no commit generation")
+	}
+
+	f.checkoutID, f.worktree = checkoutID, worktree
+	dirtyPath := filepath.Join(f.worktree, "benchmark_dirty.go")
+	if err := os.WriteFile(dirtyPath, []byte("package fixture\n\nfunc BenchmarkDirty() {}\n"), 0o644); err != nil {
+		b.Fatalf("write dirty benchmark file: %v", err)
+	}
+	coordinator := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	adopted := coordinator.reconcile(ctx)
+	if adopted.Err != nil {
+		b.Fatalf("adopt sibling commit layer: %v", adopted.Err)
+	}
+	initialRoute := f.route()
+	if initialRoute.CommitGenerationID != siblingRoute.CommitGenerationID || initialRoute.DirtyGenerationID <= 0 {
+		b.Fatalf("route did not adopt commit %d with a dirty layer: %+v", siblingRoute.CommitGenerationID, initialRoute)
+	}
+
+	physicalBuilds := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		cycle := coordinator.reconcile(ctx)
+		if cycle.Err != nil {
+			b.Fatalf("stable reconcile: %v", cycle.Err)
+		}
+		if cycle.CommitBuilt {
+			physicalBuilds++
+		}
+		if cycle.DirtyBuilt {
+			physicalBuilds++
+		}
+	}
+	b.StopTimer()
+
+	finalRoute := f.route()
+	if finalRoute.CommitGenerationID != initialRoute.CommitGenerationID ||
+		finalRoute.DirtyGenerationID != initialRoute.DirtyGenerationID {
+		b.Fatalf("stable reconcile moved generations: before=%+v after=%+v", initialRoute, finalRoute)
+	}
+	b.ReportMetric(float64(physicalBuilds)/float64(b.N), "physical-builds/op")
+	b.ReportMetric(float64(finalRoute.RouteEpoch-initialRoute.RouteEpoch)/float64(b.N), "route-epoch-advances/op")
 }
 
 // TestCoordinatorLeavesASettledRouteAlone pins the cheapest outcome: a cycle

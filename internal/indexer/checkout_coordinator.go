@@ -1234,8 +1234,10 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 	}
 	// A generation adopted from another checkout carries that checkout's
 	// catalog owner identity. Content identity, not owner identity, makes it
-	// settled; avoid needlessly advancing the route epoch on every poll.
-	if route.CommitGenerationID == resolved.generationID && route.DirtyGenerationID <= 0 {
+	// settled; avoid needlessly advancing the route epoch on every poll. A
+	// valid dirty layer belongs to this unchanged commit slot and must survive;
+	// reconcileDirtySlot independently validates its sampled identity.
+	if route.CommitGenerationID == resolved.generationID {
 		c.releaseReadyCommitLease(resolved.leaseToken)
 		c.retainCommit(ctx, key, resolved.generationID)
 		if resolved.reused {

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -45,6 +46,78 @@ func TestCoordinatorSharesCanonicalCommitGenerationAcrossAutomaticWorktrees(t *t
 		"the second checkout must not rebuild a compatible ready payload")
 	if firstCycle.CommitBuilt {
 		require.True(t, secondCycle.CommitReused)
+	}
+}
+
+func TestCoordinatorKeepsAdoptedCommitDirtyGenerationStableAcrossPolls(t *testing.T) {
+	f := newFamilyFixture(t, "ready-cache-dirty-polls")
+	defer f.close()
+	ctx := context.Background()
+
+	firstCycle := f.runCoordinator(f.automatic.CheckoutID)
+	firstRoute, ok := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, ok)
+	require.Positive(t, firstRoute.CommitGenerationID)
+
+	secondRoot := f.worktreeOf(f.main, "ready-cache-dirty-second")
+	secondRoot, err := filepath.EvalSymlinks(secondRoot)
+	require.NoError(t, err)
+	_, err = f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	checkouts, err := f.catalog.ListCheckouts(ctx, f.familyID)
+	require.NoError(t, err)
+	var second store_sqlite.Checkout
+	for _, checkout := range checkouts {
+		if checkout.RootPath == secondRoot {
+			second = checkout
+			break
+		}
+	}
+	require.NotEmpty(t, second.CheckoutID, "second root=%q checkouts=%+v", secondRoot, checkouts)
+
+	dirtyPath := filepath.Join(secondRoot, "poll_dirty.go")
+	require.NoError(t, os.WriteFile(dirtyPath, []byte("package fixture\n\nfunc PollDirtyOne() {}\n"), 0o644))
+	initial := f.runCoordinator(second.CheckoutID)
+	initialRoute, ok := f.routeOf(second.CheckoutID)
+	require.True(t, ok)
+	require.Equal(t, firstRoute.CommitGenerationID, initialRoute.CommitGenerationID)
+	require.Positive(t, initialRoute.DirtyGenerationID)
+	require.True(t, initial.DirtyBuilt)
+	if firstCycle.CommitBuilt {
+		require.True(t, initial.CommitReused)
+	}
+
+	const unchangedPolls = 8
+	for range unchangedPolls {
+		cycle := f.runCoordinator(second.CheckoutID)
+		route, exists := f.routeOf(second.CheckoutID)
+		require.True(t, exists)
+		require.False(t, cycle.CommitBuilt)
+		require.False(t, cycle.DirtyBuilt)
+		require.Equal(t, initialRoute.CommitGenerationID, route.CommitGenerationID)
+		require.Equal(t, initialRoute.DirtyGenerationID, route.DirtyGenerationID)
+		require.Equal(t, initialRoute.RouteEpoch, route.RouteEpoch)
+	}
+
+	require.NoError(t, os.WriteFile(dirtyPath, []byte("package fixture\n\nfunc PollDirtyTwo() {}\n"), 0o644))
+	changed := f.runCoordinator(second.CheckoutID)
+	changedRoute, ok := f.routeOf(second.CheckoutID)
+	require.True(t, ok)
+	require.False(t, changed.CommitBuilt)
+	require.True(t, changed.DirtyBuilt)
+	require.Equal(t, initialRoute.CommitGenerationID, changedRoute.CommitGenerationID)
+	require.NotEqual(t, initialRoute.DirtyGenerationID, changedRoute.DirtyGenerationID)
+	require.Equal(t, initialRoute.RouteEpoch+1, changedRoute.RouteEpoch)
+
+	for range unchangedPolls {
+		cycle := f.runCoordinator(second.CheckoutID)
+		route, exists := f.routeOf(second.CheckoutID)
+		require.True(t, exists)
+		require.False(t, cycle.CommitBuilt)
+		require.False(t, cycle.DirtyBuilt)
+		require.Equal(t, changedRoute.CommitGenerationID, route.CommitGenerationID)
+		require.Equal(t, changedRoute.DirtyGenerationID, route.DirtyGenerationID)
+		require.Equal(t, changedRoute.RouteEpoch, route.RouteEpoch)
 	}
 }
 
