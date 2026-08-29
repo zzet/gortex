@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -54,6 +55,113 @@ func TestAvailabilityGraceRetainsIdentityForEligiblePrimaryFallback(t *testing.T
 	}
 	if rider["graph_id"] != stack.graphID || rider["checkout_id"] != viewTestWorktree {
 		t.Errorf("rider identity = %v, want graph %q checkout %q", rider, stack.graphID, viewTestWorktree)
+	}
+}
+
+func writeSearchBaseGeneration(t *testing.T, store *store_sqlite.Store, graphID string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	_, found, err := store.Catalog().GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		t.Fatalf("GetDedicatedGraph(base): %v", err)
+	}
+	if !found {
+		t.Fatalf("GetDedicatedGraph(base): graph %q not found", graphID)
+	}
+	generationID, handle, err := store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:        "dedicated_base",
+		GraphID:          graphID,
+		LayerID:          graphID + ":base",
+		CheckoutID:       viewTestPrimary,
+		GenerationKind:   "dedicated_base",
+		BaseGenerationID: 0,
+		TreeOID:          "tree-search-base",
+		CreatedAt:        3000,
+	})
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration(base): %v", err)
+	}
+	handle.AddBatch([]*graph.Node{
+		viewFileNode("repo/edit.go", 8),
+		viewFileNode("repo/hidden.go", 6),
+		searchNode(searchOldID, "Old", "repo/edit.go", 3),
+		searchNode(searchHiddenID, "Hidden", "repo/hidden.go", 3),
+	}, nil)
+	indexSearchSymbols(t, handle, map[string]string{
+		searchOldID:    "old zephyr scheduler",
+		searchHiddenID: "hidden zephyr scheduler",
+	})
+	if err := handle.SetFileMasks([]store_sqlite.FileMask{
+		{RepoPrefix: "repo", FilePath: "repo/edit.go", Mode: store_sqlite.OwnershipReplace},
+		{RepoPrefix: "repo", FilePath: "repo/hidden.go", Mode: store_sqlite.OwnershipReplace},
+	}); err != nil {
+		t.Fatalf("SetFileMasks(base): %v", err)
+	}
+	if err := store.PublishPayloadGeneration(ctx, generationID, 4000); err != nil {
+		t.Fatalf("PublishPayloadGeneration(base): %v", err)
+	}
+	return generationID
+}
+
+func TestRemovalGraceSearchUsesPrimaryGenerationStack(t *testing.T) {
+	v := newSearchViewStack(t)
+	baseGenerationID := writeSearchBaseGeneration(t, v.store, v.graphID)
+	dedicated, found, err := v.store.Catalog().GetDedicatedGraph(context.Background(), v.graphID)
+	if err != nil {
+		t.Fatalf("GetDedicatedGraph(activate base): %v", err)
+	}
+	if !found {
+		t.Fatalf("GetDedicatedGraph(activate base): graph %q not found", v.graphID)
+	}
+	dedicated.ActiveGenerationID = baseGenerationID
+	if err := v.store.Catalog().UpsertDedicatedGraph(context.Background(), dedicated); err != nil {
+		t.Fatalf("UpsertDedicatedGraph(activate base): %v", err)
+	}
+	v.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
+
+	res, err := v.callWithView(t, v.repoRoot, "search_symbols", routedArgs(),
+		func(ctx context.Context) (*mcplib.CallToolResult, error) {
+			return v.srv.handleSearchSymbols(ctx, searchToolRequest(searchProseQuery))
+		})
+	if err != nil {
+		t.Fatalf("removal-grace search: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("removal-grace search was refused: %s", viewResultText(t, res))
+	}
+	body := singleTextOrFail(t, res)
+	for _, id := range []string{searchOldID, searchHiddenID} {
+		if !strings.Contains(body, id) {
+			t.Errorf("removal-grace primary fallback omitted base symbol %q: %s", id, body)
+		}
+	}
+	for _, id := range []string{searchNewID, searchFreshID, searchDirtyID} {
+		if strings.Contains(body, id) {
+			t.Errorf("removal-grace primary fallback leaked worktree symbol %q: %s", id, body)
+		}
+	}
+
+	freshness := resultFreshness(t, res)
+	wantActual := "base:" + v.graphID
+	if freshness["requested_view"] != "worktree:"+viewTestWorktree || freshness["actual_view"] != wantActual {
+		t.Errorf("freshness = %v, want retained worktree request and %q answer", freshness, wantActual)
+	}
+	if freshness["fallback_reason"] != string(store_sqlite.CheckoutStateRemovalGrace) {
+		t.Errorf("freshness = %v, want labeled removal-grace fallback", freshness)
+	}
+	baseScoped, ok := freshness["base_scoped"].([]any)
+	if !ok {
+		t.Fatalf("freshness = %v, want base_scoped capability list", freshness)
+	}
+	searchScoped := false
+	for _, capability := range baseScoped {
+		if capability == string(graphview.CapSearchSymbols) {
+			searchScoped = true
+			break
+		}
+	}
+	if !searchScoped {
+		t.Errorf("freshness = %v, want %q marked base-scoped", freshness, graphview.CapSearchSymbols)
 	}
 }
 

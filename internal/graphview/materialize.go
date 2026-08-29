@@ -326,6 +326,79 @@ func (m *Materializer) generationAncestry(ctx context.Context, generations []int
 // Everything else is what MaterializeCheckout does: the lease is taken before
 // the generation is inspected, so the sweep cannot run between the check and
 // the pin, and completeness comes from the generation's own producer states.
+// MaterializeBase builds the sealed generation that backs one dedicated graph.
+// It intentionally accepts an explicit generation instead of a checkout route:
+// grace fallback must exclude every commit, dirty, filesystem, and buffer layer
+// above the family's primary base.
+func (m *Materializer) MaterializeBase(
+	ctx context.Context, graphID string, generationID int64,
+) (view *RepoView, err error) {
+	var generations []int64
+	defer func() {
+		m.recordMaterialization(viewmetrics.ViewBase, graphID, "", view, generations, err)
+	}()
+
+	if err = m.validate(); err != nil {
+		return nil, err
+	}
+	switch {
+	case ctx == nil:
+		return nil, NewViewError(CodeInvalidViewSelector, "materialization needs a context")
+	case graphID == "":
+		return nil, NewViewError(CodeInvalidViewSelector, "materialization needs a graph id")
+	case generationID <= 0:
+		return nil, NewViewError(CodePrimaryNotReady, "the base graph has no published generation")
+	}
+	generation, found, readErr := m.Catalog.GetViewGeneration(ctx, generationID)
+	switch {
+	case readErr != nil:
+		return nil, WrapViewError(CodeViewBuilding,
+			fmt.Sprintf("read base generation %d", generationID), readErr)
+	case !found:
+		return nil, NewViewError(CodeViewBuilding,
+			fmt.Sprintf("base generation %d is not registered", generationID))
+	case generation.GraphID != graphID:
+		return nil, NewViewError(CodeInvalidViewSelector,
+			fmt.Sprintf("generation %d belongs to graph %q, not %q", generationID, generation.GraphID, graphID))
+	case generation.OwnerKind != "dedicated_base" ||
+		generation.GenerationKind != "dedicated_base" ||
+		generation.LayerID != graphID+":base" ||
+		generation.BaseGenerationID != 0 ||
+		generation.CheckoutID == "" ||
+		generation.TreeOID == "":
+		return nil, NewViewError(CodeInvalidViewSelector,
+			fmt.Sprintf("generation %d is not a sealed dedicated base", generationID))
+	case generation.State != store_sqlite.ViewGenerationReady:
+		return nil, NewViewError(CodeViewBuilding,
+			fmt.Sprintf("base generation %d is %s", generationID, generation.State))
+	}
+	dedicated, found, readErr := m.Catalog.GetDedicatedGraph(ctx, graphID)
+	switch {
+	case readErr != nil:
+		return nil, WrapViewError(CodeCheckoutInaccessible,
+			fmt.Sprintf("read graph %q", graphID), readErr)
+	case !found:
+		return nil, NewViewError(CodeCheckoutInaccessible,
+			fmt.Sprintf("graph %q has no catalog row", graphID))
+	case generation.CheckoutID != dedicated.OwnerCheckoutID:
+		return nil, NewViewError(CodeInvalidViewSelector,
+			fmt.Sprintf("generation %d is owned by checkout %q, not graph owner %q",
+				generationID, generation.CheckoutID, dedicated.OwnerCheckoutID))
+	}
+	repoPrefix := dedicated.RepoPrefix
+	generations = []int64{generationID}
+	lease, err := m.pinGenerationAncestry(ctx, generations)
+	if err != nil {
+		return nil, err
+	}
+	view, err = m.assemble(ctx, graphID, repoPrefix, generations, lease)
+	if err != nil {
+		lease.Release()
+		return nil, err
+	}
+	return view, nil
+}
+
 func (m *Materializer) MaterializeRefView(
 	ctx context.Context, graphID string, generationID int64,
 ) (view *RepoView, err error) {

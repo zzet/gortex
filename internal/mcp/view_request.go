@@ -52,6 +52,11 @@ type requestView struct {
 	// state and session buffers; a normal cold-build fallback may still compose
 	// the caller's live editor buffers over its lower view.
 	suppressBufferOverlay bool
+	// baseFallback distinguishes a labeled primary-base fallback from an
+	// ordinary explicit base request. It lets capability annotations report
+	// which operations were answered by the base without pretending that the
+	// nil base reader is a composed checkout route.
+	baseFallback bool
 
 	// mu guards the annotations the request collects while it runs. The
 	// capability evaluation writes before the handler starts, but a handler
@@ -598,7 +603,7 @@ func (s *Server) viewForWorktreeSelector(
 			if !policy.allowGraceBaseFallback {
 				return nil, stateErr
 			}
-			return graceBaseFallback(selector, checkout, primary)
+			return s.materializeGraceBaseFallback(ctx, selector, checkout, primary)
 		}
 		if err := s.checkoutInSessionScope(ctx, checkout); err != nil {
 			return nil, err
@@ -643,6 +648,32 @@ func graceBaseFallback(
 	rider.RequestedState = string(store_sqlite.CheckoutStateReady)
 	rider.ActualState = string(checkout.State)
 	return &requestView{rider: rider, suppressBufferOverlay: true}, nil
+}
+
+func (s *Server) materializeGraceBaseFallback(
+	ctx context.Context,
+	selector graphview.Selector,
+	checkout store_sqlite.Checkout,
+	primary store_sqlite.DedicatedGraph,
+) (*requestView, error) {
+	fallback, err := graceBaseFallback(selector, checkout, primary)
+	if err != nil {
+		return nil, err
+	}
+	fallback.baseFallback = true
+	if primary.ActiveGenerationID <= 0 {
+		// Legacy dedicated graphs predate generation-backed bases. They still
+		// read from the sealed corpus, but have no generation lease to bind.
+		return fallback, nil
+	}
+	base, err := s.materializer.MaterializeBase(ctx, primary.GraphID, primary.ActiveGenerationID)
+	if err != nil {
+		return nil, err
+	}
+	fallback.reader = base.Reader
+	fallback.materialized = base
+	fallback.bindSources(base.GenerationSources(), s.graph)
+	return fallback, nil
 }
 
 // viewForBaseSelector pins the request to a named base graph. A dedicated

@@ -302,7 +302,7 @@ func (s *Server) evaluateRequestCapabilities(
 	want capabilityRequest,
 ) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
-	if !view.routed() {
+	if view == nil || (!view.routed() && !view.baseFallback) {
 		return nil
 	}
 	defaults := capabilityDefaultsFor(s.capabilityToolName(req))
@@ -315,6 +315,10 @@ func (s *Server) evaluateRequestCapabilities(
 	}
 	required = mergeCapabilities(required, nil)
 	annotate = withoutCapabilities(mergeCapabilities(annotate, nil), required)
+	if view.baseFallback {
+		view.noteBaseScoped(mergeCapabilities(required, annotate))
+		return nil
+	}
 
 	completeness := view.completeness()
 	if err := completeness.Evaluate(required, annotate); err != nil {
@@ -371,7 +375,7 @@ func withoutCapabilities(caps, exclude []graphview.CapabilityID) []graphview.Cap
 // It is a no-op on a base request, where reading the base IS the answer.
 func annotateBaseScoped(ctx context.Context, caps ...graphview.CapabilityID) {
 	view := requestViewFromContext(ctx)
-	if !view.routed() {
+	if view == nil || (!view.routed() && !view.baseFallback) {
 		return
 	}
 	view.noteBaseScoped(caps)
