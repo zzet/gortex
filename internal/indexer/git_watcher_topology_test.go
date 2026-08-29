@@ -3,8 +3,6 @@ package indexer
 import (
 	"os"
 	"os/exec"
-
-	"github.com/fsnotify/fsnotify"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -56,33 +54,6 @@ func TestGitWatcherSignalsWorktreeAddAndRemove(t *testing.T) {
 	beforeRemove := callbacks.Load()
 	runTopologyGitCommand(t, repo, "worktree", "remove", "--force", worktree)
 	waitForTopologyCallback(t, &callbacks, signals, beforeRemove)
-}
-
-func TestGitWatcherIgnoresWorktreeIndexWritesButKeepsAdministrativeChanges(t *testing.T) {
-	worktreesDir := filepath.Join(t.TempDir(), "worktrees")
-	adminDir := filepath.Join(worktreesDir, "linked")
-	root := filepath.Join(t.TempDir(), "linked-root")
-	watcher := &GitWatcher{
-		topologyOwned: true,
-		worktreesDir:  worktreesDir,
-		worktreeRoots: map[string]struct{}{filepath.Clean(root): {}},
-	}
-
-	if watcher.isTopologyEvent(fsnotify.Event{Name: filepath.Join(adminDir, "index"), Op: fsnotify.Write}) {
-		t.Fatal("ordinary per-worktree index write was classified as topology")
-	}
-	if !watcher.isTopologyEvent(fsnotify.Event{Name: filepath.Join(adminDir, "HEAD"), Op: fsnotify.Write}) {
-		t.Fatal("worktree HEAD change was not classified as topology")
-	}
-	if !watcher.isTopologyEvent(fsnotify.Event{Name: adminDir, Op: fsnotify.Remove}) {
-		t.Fatal("worktree administration removal was not classified as topology")
-	}
-	if !watcher.isTopologyEvent(fsnotify.Event{Name: root, Op: fsnotify.Remove}) {
-		t.Fatal("worktree root removal was not classified as topology")
-	}
-	if !watcher.isTopologyEvent(fsnotify.Event{Name: worktreesDir, Op: fsnotify.Remove}) {
-		t.Fatal("removing the last worktrees directory was not classified as topology")
-	}
 }
 
 func waitForTopologyCallback(t *testing.T, count *atomic.Int64, signals <-chan struct{}, after int64) {

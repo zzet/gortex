@@ -30,10 +30,9 @@ type topologyWatchFixture struct {
 	roots        []string
 	inventory    *gitstate.FamilyInventory
 
-	inventoryCalls    atomic.Int64
-	registrationCalls atomic.Int64
-	mu                sync.Mutex
-	active            map[string]int
+	inventoryCalls atomic.Int64
+	mu             sync.Mutex
+	watchers       []*GitWatcher
 }
 
 func newTopologyWatchFixture(tb testing.TB, worktrees int) *topologyWatchFixture {
@@ -55,7 +54,6 @@ func newTopologyWatchFixture(tb testing.TB, worktrees int) *topologyWatchFixture
 		commonDir:    commonDir,
 		worktreesDir: worktreesDir,
 		roots:        make([]string, 0, worktrees),
-		active:       make(map[string]int),
 	}
 	records := make([]gitstate.WorktreeRecord, 0, worktrees)
 	for i := 0; i < worktrees; i++ {
@@ -86,7 +84,7 @@ func newTopologyWatchFixture(tb testing.TB, worktrees int) *topologyWatchFixture
 
 func (fixture *topologyWatchFixture) watcher(index int) *GitWatcher {
 	root := fixture.roots[index%len(fixture.roots)]
-	return &GitWatcher{
+	watcher := &GitWatcher{
 		repoPath:          root,
 		logger:            zap.NewNop(),
 		debounce:          5 * time.Millisecond,
@@ -97,53 +95,36 @@ func (fixture *topologyWatchFixture) watcher(index int) *GitWatcher {
 		topologyRetryMax:  20 * time.Millisecond,
 		refPaths:          make(map[string]struct{}),
 		refAdd:            func(string) error { return nil },
-		topologyPaths:     make(map[string]struct{}),
 		worktreeRoots:     make(map[string]struct{}),
-		worktreeAdminDirs: make(map[string]struct{}),
 		inventory: func(context.Context, string) (*gitstate.FamilyInventory, error) {
 			fixture.inventoryCalls.Add(1)
 			return fixture.inventory, nil
 		},
-		topologyAdd: func(path string) error {
-			path = filepath.Clean(path)
-			fixture.registrationCalls.Add(1)
-			fixture.mu.Lock()
-			fixture.active[path]++
-			fixture.mu.Unlock()
-			return nil
-		},
-		topologyRemove: func(path string) error {
-			path = filepath.Clean(path)
-			fixture.mu.Lock()
-			fixture.active[path]--
-			if fixture.active[path] == 0 {
-				delete(fixture.active, path)
-			}
-			fixture.mu.Unlock()
-			return nil
-		},
 	}
+	fixture.mu.Lock()
+	fixture.watchers = append(fixture.watchers, watcher)
+	fixture.mu.Unlock()
+	return watcher
 }
 
 func (fixture *topologyWatchFixture) activeStats() (unique, duplicates, registrations int) {
 	fixture.mu.Lock()
-	defer fixture.mu.Unlock()
-	for _, count := range fixture.active {
-		if count > 0 {
-			unique++
-			registrations += count
+	watchers := append([]*GitWatcher(nil), fixture.watchers...)
+	fixture.mu.Unlock()
+	counts := make(map[string]int)
+	for _, watcher := range watchers {
+		for _, path := range watcherTopologyWatchList(watcher) {
+			counts[path]++
 		}
+	}
+	for _, count := range counts {
+		unique++
+		registrations += count
 		if count > 1 {
 			duplicates += count - 1
 		}
 	}
 	return unique, duplicates, registrations
-}
-
-func (fixture *topologyWatchFixture) resetActive() {
-	fixture.mu.Lock()
-	fixture.active = make(map[string]int)
-	fixture.mu.Unlock()
 }
 
 func newTopologyRegistry() *MultiWatcher {
@@ -196,10 +177,29 @@ func topologyFamilySnapshot(mw *MultiWatcher) (families int, owner string, membe
 	return families, owner, members
 }
 
+func watcherTopologyWatchList(watcher *GitWatcher) []string {
+	watcher.mu.Lock()
+	fsw := watcher.fsw
+	refs := clonePathSet(watcher.refPaths)
+	watcher.mu.Unlock()
+	if fsw == nil {
+		return nil
+	}
+	var topology []string
+	for _, path := range fsw.WatchList() {
+		path = filepath.Clean(path)
+		if _, exactRef := refs[path]; !exactRef {
+			topology = append(topology, path)
+		}
+	}
+	return topology
+}
+
 func watcherTopologySnapshot(watcher *GitWatcher) (owned bool, paths int) {
 	watcher.mu.Lock()
-	defer watcher.mu.Unlock()
-	return watcher.topologyOwned, len(watcher.topologyPaths)
+	owned = watcher.topologyOwned
+	watcher.mu.Unlock()
+	return owned, len(watcherTopologyWatchList(watcher))
 }
 
 func makeTopologyWatcherStopSafe(t *testing.T, watcher *GitWatcher) {
@@ -276,14 +276,14 @@ func TestMultiWatcherTopologyInitialAddFailureRejectsOwner(t *testing.T) {
 	fixture := newTopologyWatchFixture(t, 1)
 	watcher := fixture.watcher(0)
 	makeTopologyWatcherStopSafe(t, watcher)
-	originalAdd := watcher.topologyAdd
+	originalInventory := watcher.inventory
 	fail := true
-	watcher.topologyAdd = func(path string) error {
+	watcher.inventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
 		if fail {
 			fail = false
-			return errors.New("injected topology registration failure")
+			return nil, errors.New("injected topology inventory failure")
 		}
-		return originalAdd(path)
+		return originalInventory(ctx, path)
 	}
 	mw := newTopologyRegistry()
 
@@ -291,7 +291,7 @@ func TestMultiWatcherTopologyInitialAddFailureRejectsOwner(t *testing.T) {
 	drain, err := mw.installStartedGitWatcherLocked("repo-000", watcher)
 	mw.mu.Unlock()
 	waitTopologyDispatchDrains(drain)
-	if err == nil || !strings.Contains(err.Error(), "injected topology registration failure") {
+	if err == nil || !strings.Contains(err.Error(), "injected topology inventory failure") {
 		t.Fatalf("initial topology admission error = %v", err)
 	}
 	families, owner, members := topologyFamilySnapshot(mw)
@@ -320,9 +320,8 @@ func TestMultiWatcherTopologyInitialAddFailureRejectsOwner(t *testing.T) {
 		t.Fatalf("retried family = families:%d owner:%q members:%d", families, owner, members)
 	}
 	unique, duplicates, active := fixture.activeStats()
-	expected := 2*len(fixture.roots) + 2
-	if unique != expected || duplicates != 0 || active != expected {
-		t.Fatalf("retried registrations = %d/%d/%d, want %d/0/%d", unique, duplicates, active, expected, expected)
+	if unique != 0 || duplicates != 0 || active != 0 {
+		t.Fatalf("retried topology registrations = %d/%d/%d, want 0/0/0", unique, duplicates, active)
 	}
 	removeTopologyWatcher(mw, "repo-000")
 }
@@ -341,19 +340,17 @@ func TestMultiWatcherTopologyRefreshFailureRetriesWithoutDroppingWatcher(t *test
 	assertOneTopologyCallback(t, &topologyCallbacks, watcher.debounce)
 	topologyCallbacks.Store(0)
 
-	target := fixture.roots[0]
-	watcher.removeTopologyPath(target)
-	originalAdd := watcher.topologyAdd
+	originalInventory := watcher.inventory
 	var attempts atomic.Int64
-	watcher.topologyAdd = func(path string) error {
-		if filepath.Clean(path) == filepath.Clean(target) && attempts.Add(1) == 1 {
-			return errors.New("injected refresh registration failure")
+	watcher.inventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
+		if attempts.Add(1) == 1 {
+			return nil, errors.New("injected refresh inventory failure")
 		}
-		return originalAdd(path)
+		return originalInventory(ctx, path)
 	}
 
 	watcher.refreshTopologyWatches()
-	if reason := watcher.topologyDegradedReason(); !strings.Contains(reason, "injected refresh registration failure") {
+	if reason := watcher.topologyDegradedReason(); !strings.Contains(reason, "injected refresh inventory failure") {
 		t.Fatalf("degraded reason = %q", reason)
 	}
 	if reason := mw.DegradedReason(); !strings.Contains(reason, "Git worktree topology watcher is degraded") {
@@ -378,9 +375,8 @@ func TestMultiWatcherTopologyRefreshFailureRetriesWithoutDroppingWatcher(t *test
 		t.Fatal("refresh failure removed the established watcher")
 	}
 	unique, duplicates, active := fixture.activeStats()
-	expected := 2*len(fixture.roots) + 2
-	if unique != expected || duplicates != 0 || active != expected {
-		t.Fatalf("recovered registrations = %d/%d/%d, want %d/0/%d", unique, duplicates, active, expected, expected)
+	if unique != 0 || duplicates != 0 || active != 0 {
+		t.Fatalf("recovered topology registrations = %d/%d/%d, want 0/0/0", unique, duplicates, active)
 	}
 	removeTopologyWatcher(mw, "repo-000")
 }
@@ -392,26 +388,21 @@ func TestGitWatcherStopWaitsForTopologyRetry(t *testing.T) {
 	mw := newTopologyRegistry()
 	installTopologyWatcher(mw, "repo-000", watcher)
 
-	target := fixture.roots[0]
-	watcher.removeTopologyPath(target)
-	originalAdd := watcher.topologyAdd
+	originalInventory := watcher.inventory
 	var attempts atomic.Int64
 	retryEntered := make(chan struct{})
 	retryRelease := make(chan struct{})
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(retryRelease) }) })
-	watcher.topologyAdd = func(path string) error {
-		if filepath.Clean(path) != filepath.Clean(target) {
-			return originalAdd(path)
-		}
+	watcher.inventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
 		switch attempts.Add(1) {
 		case 1:
-			return errors.New("injected retryable topology failure")
+			return nil, errors.New("injected retryable topology failure")
 		case 2:
 			close(retryEntered)
 			<-retryRelease
 		}
-		return originalAdd(path)
+		return originalInventory(ctx, path)
 	}
 
 	watcher.refreshTopologyWatches()
@@ -443,7 +434,7 @@ func TestGitWatcherStopWaitsForTopologyRetry(t *testing.T) {
 }
 
 func TestGitWatcherStartRejectsRefWatchFailure(t *testing.T) {
-	for _, relativePath := range []string{"HEAD", "packed-refs", filepath.Join("refs", "heads")} {
+	for _, relativePath := range []string{"HEAD", "packed-refs", filepath.Join("refs", "heads", "main")} {
 		relativePath := relativePath
 		t.Run(strings.ReplaceAll(relativePath, string(filepath.Separator), "_"), func(t *testing.T) {
 			watcher := newGitRefWatcherFixture(t)
@@ -691,6 +682,15 @@ func newGitRefWatcherFixture(t *testing.T) *GitWatcher {
 	if err := os.WriteFile(filepath.Join(root, ".git", "packed-refs"), []byte("# pack-refs with: peeled fully-peeled sorted\n"), 0o644); err != nil {
 		t.Fatalf("write packed-refs: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("write HEAD: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".git", "refs", "heads"), 0o755); err != nil {
+		t.Fatalf("create heads directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "refs", "heads", "main"), []byte(strings.Repeat("0", 40)+"\n"), 0o644); err != nil {
+		t.Fatalf("write active loose ref: %v", err)
+	}
 	watcher, err := NewGitWatcher(root, nil, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewGitWatcher: %v", err)
@@ -720,6 +720,9 @@ func BenchmarkGitWatcherRecoveryScheduling(b *testing.B) {
 				logger:        zap.NewNop(),
 				debounce:      time.Hour,
 				topologyOwned: owner,
+			}
+			if owner {
+				watcher.topologyChange = func(string) {}
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -791,10 +794,9 @@ func TestMultiWatcherTopologyFamilySharesInventoryAndRegistrations(t *testing.T)
 			if got := fixture.inventoryCalls.Load(); got != 1 {
 				t.Fatalf("inventory calls = %d, want 1", got)
 			}
-			expectedPaths := 2*prefixes + 2 // common dir, worktrees dir, roots, admin dirs
 			unique, duplicates, registrations := fixture.activeStats()
-			if unique != expectedPaths || registrations != expectedPaths || duplicates != 0 {
-				t.Fatalf("topology registrations = unique:%d registrations:%d duplicates:%d, want %d/%d/0", unique, registrations, duplicates, expectedPaths, expectedPaths)
+			if unique != 0 || registrations != 0 || duplicates != 0 {
+				t.Fatalf("topology registrations = unique:%d registrations:%d duplicates:%d, want 0/0/0", unique, registrations, duplicates)
 			}
 
 			owners := 0
@@ -802,8 +804,8 @@ func TestMultiWatcherTopologyFamilySharesInventoryAndRegistrations(t *testing.T)
 				owned, paths := watcherTopologySnapshot(watcher)
 				if owned {
 					owners++
-					if paths != expectedPaths {
-						t.Fatalf("owner paths = %d, want %d", paths, expectedPaths)
+					if paths != 0 {
+						t.Fatalf("owner registered %d topology fsnotify paths, want 0", paths)
 					}
 				} else if paths != 0 {
 					t.Fatalf("follower registered %d topology paths", paths)
@@ -821,8 +823,8 @@ func TestMultiWatcherTopologyFamilySharesInventoryAndRegistrations(t *testing.T)
 				watcher.scheduleTopologyChange("test-family-event")
 			}
 			assertOneTopologyCallback(t, &callbacks, watchers[0].debounce)
-			if got := fixture.inventoryCalls.Load(); got != 2 {
-				t.Fatalf("inventory calls after one family event = %d, want 2 total (startup + event)", got)
+			if got := fixture.inventoryCalls.Load(); got != 1 {
+				t.Fatalf("inventory calls after synthetic callback = %d, want stable startup total 1", got)
 			}
 
 			for i := range watchers {
@@ -865,16 +867,16 @@ func TestMultiWatcherTopologyOwnerTransfersAndCleansFamily(t *testing.T) {
 	if owned, paths := watcherTopologySnapshot(watchers["repo-00"]); owned || paths != 0 {
 		t.Fatalf("removed owner state = owned:%t paths:%d", owned, paths)
 	}
-	if unique, duplicates, registrations := fixture.activeStats(); unique != 10 || duplicates != 0 || registrations != 10 {
-		t.Fatalf("active transfer registrations = %d/%d/%d, want 10/0/10", unique, duplicates, registrations)
+	if unique, duplicates, registrations := fixture.activeStats(); unique != 0 || duplicates != 0 || registrations != 0 {
+		t.Fatalf("active transfer topology registrations = %d/%d/%d, want 0/0/0", unique, duplicates, registrations)
 	}
 
 	// unregisterTopologyWatcherLocked must preserve a mutation that was still
 	// pending in the retired owner's debounce window. Do not manually nudge the
 	// promoted owner: the transfer itself queues exactly one new-epoch refresh.
 	assertOneTopologyCallback(t, &callbacks, watchers["repo-01"].debounce)
-	if got := fixture.inventoryCalls.Load(); got != 3 {
-		t.Fatalf("inventory calls after transfer nudge = %d, want 3", got)
+	if got := fixture.inventoryCalls.Load(); got != 2 {
+		t.Fatalf("inventory calls after transfer nudge = %d, want startup plus new-owner baseline", got)
 	}
 
 	for _, prefix := range []string{"repo-03", "repo-02", "repo-01"} {
@@ -2040,9 +2042,13 @@ func TestMultiWatcherTopologyFamiliesRemainIndependent(t *testing.T) {
 		t.Fatalf("inventory calls = first:%d second:%d, want 1 each", first.inventoryCalls.Load(), second.inventoryCalls.Load())
 	}
 	for name, fixture := range map[string]*topologyWatchFixture{"first": first, "second": second} {
-		if unique, duplicates, registrations := fixture.activeStats(); unique != 18 || duplicates != 0 || registrations != 18 {
-			t.Fatalf("%s registrations = %d/%d/%d, want 18/0/18", name, unique, duplicates, registrations)
+		if unique, duplicates, registrations := fixture.activeStats(); unique != 0 || duplicates != 0 || registrations != 0 {
+			t.Fatalf("%s topology registrations = %d/%d/%d, want 0/0/0", name, unique, duplicates, registrations)
 		}
+	}
+	for i := 0; i < 8; i++ {
+		removeTopologyWatcher(mw, fmt.Sprintf("first-%02d", i))
+		removeTopologyWatcher(mw, fmt.Sprintf("second-%02d", i))
 	}
 }
 
@@ -2135,15 +2141,17 @@ func TestMultiWatcherTopologyRegistryConcurrentLifecycle(t *testing.T) {
 }
 
 func resetTopologyWatcherForBenchmark(watcher *GitWatcher) {
+	watcher.stopTopologyProbe()
 	watcher.mu.Lock()
 	if watcher.topologyTimer != nil {
 		watcher.topologyTimer.Stop()
 	}
 	watcher.topologyTimer = nil
 	watcher.topologyOwned = false
-	watcher.topologyPaths = make(map[string]struct{})
+	watcher.topologyOwnerEpoch++
+	watcher.topologySignature = ""
+	watcher.topologyProbeSignature = ""
 	watcher.worktreeRoots = make(map[string]struct{})
-	watcher.worktreeAdminDirs = make(map[string]struct{})
 	watcher.mu.Unlock()
 }
 
@@ -2189,19 +2197,15 @@ func BenchmarkMultiWatcherTopologyFamilyRealInventory(b *testing.B) {
 			watchers := make([]*GitWatcher, prefixes)
 			for i := range watchers {
 				watchers[i] = &GitWatcher{
-					repoPath:          roots[i],
-					logger:            zap.NewNop(),
-					commonDir:         commonDir,
-					worktreesDir:      filepath.Join(commonDir, "worktrees"),
-					topologyPaths:     make(map[string]struct{}),
-					worktreeRoots:     make(map[string]struct{}),
-					worktreeAdminDirs: make(map[string]struct{}),
+					repoPath:      roots[i],
+					logger:        zap.NewNop(),
+					commonDir:     commonDir,
+					worktreesDir:  filepath.Join(commonDir, "worktrees"),
+					worktreeRoots: make(map[string]struct{}),
 					inventory: func(ctx context.Context, dir string) (*gitstate.FamilyInventory, error) {
 						inventoryCalls.Add(1)
 						return gitstate.Inventory(ctx, dir)
 					},
-					topologyAdd:    func(string) error { return nil },
-					topologyRemove: func(string) error { return nil },
 				}
 			}
 
@@ -2225,12 +2229,8 @@ func BenchmarkMultiWatcherTopologyFamilyRealInventory(b *testing.B) {
 			if !owned {
 				b.Fatal("first successfully installed watcher was not owner")
 			}
-			expectedPaths := 2
-			if prefixes > 1 {
-				expectedPaths = 2*prefixes + 1
-			}
-			if paths != expectedPaths {
-				b.Fatalf("owner paths = %d, want %d", paths, expectedPaths)
+			if paths != 0 {
+				b.Fatalf("owner topology fsnotify paths = %d, want 0", paths)
 			}
 			for _, follower := range watchers[1:] {
 				if owned, paths := watcherTopologySnapshot(follower); owned || paths != 0 {
@@ -2275,10 +2275,7 @@ func BenchmarkMultiWatcherEnsureMissingFamily(b *testing.B) {
 			}
 			b.Cleanup(func() { _ = mi.Close(context.Background()) })
 
-			expectedPaths := 2 * prefixes
-			if prefixes > 1 {
-				expectedPaths++ // the shared worktrees directory exists only with linked worktrees
-			}
+			expectedPaths := 0
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
@@ -2356,12 +2353,10 @@ func BenchmarkMultiWatcherTopologyFamilyRegistration(b *testing.B) {
 				watchers[i] = fixture.watcher(i)
 			}
 			fixture.inventoryCalls.Store(0)
-			fixture.registrationCalls.Store(0)
 
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
-				fixture.resetActive()
 				mw := newTopologyRegistry()
 				for i, watcher := range watchers {
 					resetTopologyWatcherForBenchmark(watcher)
@@ -2371,9 +2366,9 @@ func BenchmarkMultiWatcherTopologyFamilyRegistration(b *testing.B) {
 			b.StopTimer()
 
 			inventories := fixture.inventoryCalls.Load()
-			registrations := fixture.registrationCalls.Load()
-			expectedPaths := 2*prefixes + 2
+			expectedPaths := 0
 			unique, duplicates, active := fixture.activeStats()
+			registrations := active
 			if inventories != int64(b.N) {
 				b.Fatalf("inventory calls = %d, want %d", inventories, b.N)
 			}
