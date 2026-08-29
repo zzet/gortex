@@ -438,6 +438,51 @@ func TestPromoteCapturesASettledDirtyChange(t *testing.T) {
 // immutable HEAD pass, not a legacy live-filesystem index followed by the real
 // generation build. The worktree fixture already has an untracked Go file: it
 // belongs in the dirty layer, never in the dedicated base or generation zero.
+func TestIncrementalPointRepoRawSkipsActiveDedicatedRoute(t *testing.T) {
+	f := newFamilyFixture(t, "point-dedicated")
+	defer f.close()
+	ctx := context.Background()
+	dirtyPath := filepath.Base(f.worktree) + ".go"
+
+	result, err := f.lc.PromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
+	require.NoError(t, err)
+	require.NotNil(t, result.Index)
+
+	dedicatedBefore, found, err := f.catalog.GetDedicatedGraph(ctx, result.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotZero(t, dedicatedBefore.ActiveGenerationID)
+	baseBefore := contentIdentities(f.store.AtGeneration(dedicatedBefore.ActiveGenerationID), result.Prefix)
+	shellBefore := contentIdentities(f.store, result.Prefix)
+	assert.Empty(t, shellBefore, "the dedicated coordination shell starts payload-free")
+	metadataBefore := f.mi.GetMetadata(result.Prefix)
+	require.NotNil(t, metadataBefore)
+	assert.Zero(t, metadataBefore.FileCount)
+	routeBefore, routed := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, routed)
+
+	pointResult, err := f.mi.incrementalPointRepoRaw(result.Prefix, filepath.Join(f.worktree, dirtyPath))
+	require.NoError(t, err)
+	assert.Nil(t, pointResult, "dedicated point events are handled by checkout generations")
+
+	dedicatedAfter, found, err := f.catalog.GetDedicatedGraph(ctx, result.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, dedicatedBefore.ActiveGenerationID, dedicatedAfter.ActiveGenerationID)
+	assert.Equal(t, baseBefore, contentIdentities(f.store.AtGeneration(dedicatedAfter.ActiveGenerationID), result.Prefix),
+		"a point callback must not mutate the immutable exact-HEAD base generation")
+	assert.Equal(t, shellBefore, contentIdentities(f.store, result.Prefix),
+		"a point callback must not populate generation zero")
+	metadataAfter := f.mi.GetMetadata(result.Prefix)
+	require.NotNil(t, metadataAfter)
+	assert.Zero(t, metadataAfter.FileCount, "the dedicated coordination shell stays payload-free")
+	routeAfter, routed := f.routeOf(f.automatic.CheckoutID)
+	require.True(t, routed)
+	assert.Equal(t, routeBefore.GraphID, routeAfter.GraphID)
+	assert.Equal(t, routeBefore.CommitGenerationID, routeAfter.CommitGenerationID)
+	assert.Equal(t, routeBefore.DirtyGenerationID, routeAfter.DirtyGenerationID)
+}
+
 func TestDedicatedBaseExcludesDirtyFilesystemContent(t *testing.T) {
 	f := newFamilyFixture(t, "exact-head")
 	defer f.close()
