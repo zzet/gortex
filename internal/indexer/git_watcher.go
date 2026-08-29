@@ -790,6 +790,49 @@ func topologyBool(value bool) string {
 	return "0"
 }
 
+// appendWorktreeHeadIdentity adds one linked worktree's accepted HEAD identity
+// to the bounded topology signature. A symbolic HEAD is incomplete without the
+// active loose ref: advancing the branch changes only that common-dir file.
+// Missing files are valid transient/unborn states and get stable sentinels;
+// every other read or validation failure enters the existing topology retry.
+func appendWorktreeHeadIdentity(builder *strings.Builder, adminDir, commonDir string) error {
+	headPath := filepath.Clean(filepath.Join(adminDir, "HEAD"))
+	head, err := os.ReadFile(headPath)
+	if errors.Is(err, os.ErrNotExist) {
+		appendTopologyField(builder, "HEAD:absent")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read worktree HEAD %s: %w", headPath, err)
+	}
+	appendTopologyField(builder, "HEAD:"+string(head))
+
+	headValue := strings.TrimSpace(string(head))
+	if !strings.HasPrefix(headValue, "ref:") {
+		appendTopologyField(builder, "HEAD:detached")
+		return nil
+	}
+	refName := strings.TrimSpace(strings.TrimPrefix(headValue, "ref:"))
+	if !strings.HasPrefix(refName, "refs/") || filepath.IsAbs(refName) {
+		return fmt.Errorf("invalid worktree symbolic HEAD ref %q", refName)
+	}
+	refPath := filepath.Clean(filepath.Join(commonDir, filepath.FromSlash(refName)))
+	if !pathWithin(commonDir, refPath) {
+		return fmt.Errorf("worktree symbolic HEAD ref escapes common directory: %q", refName)
+	}
+	appendTopologyField(builder, "active-ref:"+refName)
+	contents, err := os.ReadFile(refPath)
+	if errors.Is(err, os.ErrNotExist) {
+		appendTopologyField(builder, "active-ref:absent")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read worktree active loose ref %s: %w", refPath, err)
+	}
+	appendTopologyField(builder, "active-ref:"+string(contents))
+	return nil
+}
+
 // observeGitTopologyProbe is the steady-state path. It reads only the bounded
 // Git worktree administration inventory and stats known roots for reachability;
 // it never walks a checkout and never spawns Git.
@@ -798,6 +841,7 @@ func observeGitTopologyProbe(worktreesDir string, roots map[string]struct{}) (gi
 		rootAccessible: make(map[string]bool, len(roots)),
 	}
 	var admin strings.Builder
+	commonDir := filepath.Clean(filepath.Dir(worktreesDir))
 	entries, err := os.ReadDir(worktreesDir)
 	if errors.Is(err, os.ErrNotExist) {
 		appendTopologyField(&admin, "worktrees:absent")
@@ -823,6 +867,9 @@ func observeGitTopologyProbe(worktreesDir string, roots map[string]struct{}) (gi
 					return observation, fmt.Errorf("read worktree admin metadata %s: %w", path, readErr)
 				}
 				appendTopologyField(&admin, name+":"+strings.TrimSpace(string(contents)))
+			}
+			if err := appendWorktreeHeadIdentity(&admin, adminDir, commonDir); err != nil {
+				return observation, err
 			}
 			lockedPath := filepath.Join(adminDir, "locked")
 			if _, statErr := os.Stat(lockedPath); statErr == nil {

@@ -606,6 +606,150 @@ func assertOnlyExactRefWatches(tb testing.TB, watcher *GitWatcher) int {
 	return len(watchList)
 }
 
+func writeTopologyProbeFile(tb testing.TB, path, contents string) {
+	tb.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		tb.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+func prepareLinkedWorktreeHead(
+	tb testing.TB, fixture *topologyWatchFixture, index int, branch, commit string,
+) (headPath, refPath string) {
+	tb.Helper()
+	name := fmt.Sprintf("worktree-%03d", index)
+	adminDir := filepath.Join(fixture.worktreesDir, name)
+	refName := "refs/heads/" + branch
+	headPath = filepath.Join(adminDir, "HEAD")
+	refPath = filepath.Join(fixture.commonDir, filepath.FromSlash(refName))
+	writeTopologyProbeFile(tb, filepath.Join(adminDir, "gitdir"), filepath.Join(fixture.roots[index], ".git")+"\n")
+	writeTopologyProbeFile(tb, filepath.Join(adminDir, "commondir"), "../..\n")
+	writeTopologyProbeFile(tb, headPath, "ref: "+refName+"\n")
+	writeTopologyProbeFile(tb, refPath, commit)
+	return headPath, refPath
+}
+
+func topologyFixtureRoots(fixture *topologyWatchFixture) map[string]struct{} {
+	roots := make(map[string]struct{}, len(fixture.roots))
+	for _, root := range fixture.roots {
+		roots[filepath.Clean(root)] = struct{}{}
+	}
+	return roots
+}
+
+func TestGitWatcherTopologyProbeDispatchesLinkedWorktreeHeadTransitions(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *topologyWatchFixture, string, string)
+	}{
+		{
+			name: "symbolic branch switch",
+			mutate: func(t *testing.T, fixture *topologyWatchFixture, headPath, _ string) {
+				featureRef := filepath.Join(fixture.commonDir, "refs", "heads", "feature")
+				writeTopologyProbeFile(t, featureRef, strings.Repeat("a", 40)+"\n")
+				writeTopologyProbeFile(t, headPath, "ref: refs/heads/feature\n")
+			},
+		},
+		{
+			name: "detached HEAD move",
+			mutate: func(t *testing.T, _ *topologyWatchFixture, headPath, _ string) {
+				writeTopologyProbeFile(t, headPath, strings.Repeat("b", 40)+"\n")
+			},
+		},
+		{
+			name: "same branch loose ref advance",
+			mutate: func(t *testing.T, _ *topologyWatchFixture, _, refPath string) {
+				writeTopologyProbeFile(t, refPath, strings.Repeat("c", 40)+"\n")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newTopologyWatchFixture(t, 1)
+			headPath, refPath := prepareLinkedWorktreeHead(
+				t, fixture, 0, "worktree-000", strings.Repeat("a", 40)+"\n",
+			)
+			watcher := fixture.watcher(0)
+			watcher.topologyOwned = true
+			watcher.topologyOwnerEpoch = 1
+			watcher.topologyProbeInterval = time.Hour
+			watcher.debounce = 2 * time.Millisecond
+			callbacks := make(chan time.Time, 2)
+			watcher.OnWorktreeChange(func(string) { callbacks <- time.Now() })
+			if err := watcher.refreshTopologyWatchesChecked(); err != nil {
+				t.Fatalf("baseline topology refresh: %v", err)
+			}
+			t.Cleanup(watcher.stopTopologyProbe)
+			epoch := topologyProbeEpochSnapshot(t, watcher)
+			baselineInventories := fixture.inventoryCalls.Load()
+
+			started := time.Now()
+			tt.mutate(t, fixture, headPath, refPath)
+			if err := watcher.probeTopologyOnce(context.Background(), epoch); err != nil {
+				t.Fatalf("probe linked-worktree HEAD transition: %v", err)
+			}
+			waitForPromptTopologyCallback(t, callbacks, started)
+			if got := fixture.inventoryCalls.Load(); got != baselineInventories+1 {
+				t.Fatalf("transition inventories = %d, want baseline + 1 (%d)", got, baselineInventories+1)
+			}
+
+			// The accepted bytes are the new gate. Stable ticks do no inventory
+			// and publish no second callback, even under a burst of reconciles.
+			for i := 0; i < 64; i++ {
+				if err := watcher.probeTopologyOnce(context.Background(), epoch); err != nil {
+					t.Fatalf("stable probe %d: %v", i, err)
+				}
+			}
+			if got := fixture.inventoryCalls.Load(); got != baselineInventories+1 {
+				t.Fatalf("stable inventories = %d, want %d", got, baselineInventories+1)
+			}
+			select {
+			case <-callbacks:
+				t.Fatal("stable linked-worktree HEAD bytes dispatched a second callback")
+			case <-time.After(5 * watcher.debounce):
+			}
+		})
+	}
+}
+
+func TestGitWatcherTopologyRefreshRejectsMidInventoryWorktreeHeadAdvance(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 1)
+	_, refPath := prepareLinkedWorktreeHead(
+		t, fixture, 0, "worktree-000", strings.Repeat("a", 40)+"\n",
+	)
+	watcher := fixture.watcher(0)
+	watcher.topologyOwned = true
+	watcher.topologyOwnerEpoch = 1
+	watcher.topologyProbeInterval = time.Hour
+	originalInventory := watcher.inventory
+	var calls atomic.Int64
+	watcher.inventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
+		if calls.Add(1) == 1 {
+			writeTopologyProbeFile(t, refPath, strings.Repeat("b", 40)+"\n")
+		}
+		return originalInventory(ctx, path)
+	}
+	if err := watcher.refreshTopologyWatchesChecked(); !errors.Is(err, errGitTopologyProbeUnstable) {
+		t.Fatalf("mid-inventory HEAD advance error = %v, want unstable", err)
+	}
+	watcher.mu.Lock()
+	publishedAfterTorn := watcher.topologySignature
+	watcher.mu.Unlock()
+	if publishedAfterTorn != "" {
+		t.Fatal("torn linked-worktree HEAD inventory was published")
+	}
+	if err := watcher.refreshTopologyWatchesChecked(); err != nil {
+		t.Fatalf("stable HEAD recovery refresh: %v", err)
+	}
+	t.Cleanup(watcher.stopTopologyProbe)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("HEAD recovery inventories = %d, want torn + stable", got)
+	}
+}
+
 func TestGitWatcherTopologyProbeStableTickDoesNotReinventory(t *testing.T) {
 	fixture := newTopologyWatchFixture(t, 1)
 	watcher := fixture.watcher(0)
@@ -796,6 +940,78 @@ func topologyProbeEpochSnapshot(tb testing.TB, watcher *GitWatcher) uint64 {
 		tb.Fatal("topology probe is not running")
 	}
 	return watcher.topologyProbeEpoch
+}
+
+func BenchmarkGitWatcherLinkedWorktreeHeadProbe(b *testing.B) {
+	for _, worktrees := range []int{1, 8, 64} {
+		b.Run(fmt.Sprintf("stable/worktrees_%d", worktrees), func(b *testing.B) {
+			fixture := newTopologyWatchFixture(b, worktrees)
+			for i := 0; i < worktrees; i++ {
+				prepareLinkedWorktreeHead(
+					b, fixture, i, fmt.Sprintf("worktree-%03d", i), fmt.Sprintf("%040x\n", i+1),
+				)
+			}
+			roots := topologyFixtureRoots(fixture)
+			baseline, err := observeGitTopologyProbe(fixture.worktreesDir, roots)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				observed, err := observeGitTopologyProbe(fixture.worktreesDir, roots)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if observed.signature != baseline.signature {
+					b.Fatal("stable linked-worktree HEAD signature changed")
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(worktrees), "worktrees")
+			b.ReportMetric(0, "inventory/op")
+			b.ReportMetric(0, "topology-watch-paths")
+		})
+
+		b.Run(fmt.Sprintf("transition/worktrees_%d", worktrees), func(b *testing.B) {
+			fixture := newTopologyWatchFixture(b, worktrees)
+			var firstRef string
+			for i := 0; i < worktrees; i++ {
+				_, refPath := prepareLinkedWorktreeHead(
+					b, fixture, i, fmt.Sprintf("worktree-%03d", i), fmt.Sprintf("%040x\n", i+1),
+				)
+				if i == 0 {
+					firstRef = refPath
+				}
+			}
+			roots := topologyFixtureRoots(fixture)
+			previous, err := observeGitTopologyProbe(fixture.worktreesDir, roots)
+			if err != nil {
+				b.Fatal(err)
+			}
+			next := 2
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				writeTopologyProbeFile(b, firstRef, fmt.Sprintf("%040x\n", next))
+				next = 3 - next
+				b.StartTimer()
+				observed, err := observeGitTopologyProbe(fixture.worktreesDir, roots)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if observed.signature == previous.signature {
+					b.Fatal("linked-worktree HEAD transition kept the stable signature")
+				}
+				previous = observed
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(worktrees), "worktrees")
+			b.ReportMetric(0, "inventory/op")
+			b.ReportMetric(0, "topology-watch-paths")
+		})
+	}
 }
 
 func BenchmarkGitWatcherControlProbeStableTick(b *testing.B) {
