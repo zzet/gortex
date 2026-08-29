@@ -68,6 +68,7 @@ func newSearchViewStack(t *testing.T) *viewStack {
 
 	commit := writeSearchCommitGeneration(t, v.store, v.graphID)
 	dirty := writeSearchDirtyGeneration(t, v.store, v.graphID, commit)
+	v.setWorktreeHeadTree(t, "tree-search-commit")
 	routeViewCheckout(t, v.store, v.graphID, commit, dirty, store_sqlite.RouteActive)
 	v.commit, v.dirty = commit, dirty
 	return v

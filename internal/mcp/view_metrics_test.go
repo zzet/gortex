@@ -62,7 +62,7 @@ func TestHalfRoutedRequestCountsABuildingFallback(t *testing.T) {
 
 	var reader graph.Reader
 	before := viewmetrics.Read()
-	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil, captureReader(stack.srv, &reader)); err != nil {
+	if _, err := stack.callWithView(t, stack.worktreeRoot, "search_symbols", nil, captureReader(stack.srv, &reader)); err != nil {
 		t.Fatalf("call: %v", err)
 	}
 	after := viewmetrics.Read()
