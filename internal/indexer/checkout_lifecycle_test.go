@@ -56,9 +56,11 @@ func (c *manualClock) advance(d time.Duration) {
 // fakeWatcher records the attach / detach calls the lifecycle makes, which
 // is what "the watcher followed the tracked set" means from outside.
 type fakeWatcher struct {
-	mu       sync.Mutex
-	attached map[string]bool
-	calls    []string
+	mu            sync.Mutex
+	attached      map[string]bool
+	calls         []string
+	ensureErrOnce error
+	ensureCalls   int
 }
 
 func newFakeWatcher() *fakeWatcher {
@@ -71,6 +73,32 @@ func (w *fakeWatcher) AddRepo(prefix string, _ config.WatchConfig) error {
 	w.attached[prefix] = true
 	w.calls = append(w.calls, "add:"+prefix)
 	return nil
+}
+
+func (w *fakeWatcher) EnsureRepoContext(_ context.Context, prefix string, _ config.WatchConfig) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.ensureCalls++
+	w.calls = append(w.calls, "ensure:"+prefix)
+	if w.ensureErrOnce != nil {
+		err := w.ensureErrOnce
+		w.ensureErrOnce = nil
+		return err
+	}
+	w.attached[prefix] = true
+	return nil
+}
+
+func (w *fakeWatcher) failNextEnsure(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.ensureErrOnce = err
+}
+
+func (w *fakeWatcher) ensureCallCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ensureCalls
 }
 
 func (w *fakeWatcher) RemoveRepo(prefix string) error {
@@ -476,7 +504,7 @@ func (f *lifecycleFixture) assertRegistered(prefix, root string, source store_sq
 	require.NoError(f.t, err)
 	assert.True(f.t, present, "the removal test needs a stored sample of the root")
 
-	assert.False(f.t, f.watcher.isAttached(prefix), "a route-owned dedicated repo bypasses the legacy watcher")
+	assert.True(f.t, f.watcher.isAttached(prefix), "the published dedicated repository remains attached for file and topology watching")
 	assert.Contains(f.t, f.configPaths(), root, "the tracked set is persisted")
 	assert.NotNil(f.t, f.mi.GetMetadata(prefix), "the repo is in the corpus")
 }
@@ -569,8 +597,8 @@ func TestCheckoutLifecycleUntrackSurfaceParity(t *testing.T) {
 			assert.Equal(t, familyID, retracked.FamilyID, "the family survives its checkouts")
 			assert.NotEqual(t, tracked.CheckoutID, retracked.CheckoutID)
 			assert.NotEqual(t, tracked.Incarnation, retracked.Incarnation)
-			assert.False(t, f.watcher.isAttached(retracked.Prefix),
-				"retracking recreates a route-owned dedicated corpus without a legacy watcher")
+			assert.True(t, f.watcher.isAttached(retracked.Prefix),
+				"retracking recreates the dedicated corpus and repairs its process-local watcher")
 		})
 	}
 }
@@ -614,7 +642,8 @@ func TestCheckoutLifecycleReloadDiff(t *testing.T) {
 	assert.Equal(t, 0, removed.Pending)
 	assert.NotNil(t, f.mi.GetMetadata("reload-wt"),
 		"revoking explicit intent leaves the live checkout as an automatic overlay")
-	assert.False(t, f.watcher.isAttached("reload-wt"))
+	assert.True(t, f.watcher.isAttached("reload-wt"),
+		"revoking explicit intent keeps the live automatic overlay watched")
 
 	// The main checkout owns the family's primary base: nothing is left to
 	// serve it from, so its removal is recorded and NOT applied.

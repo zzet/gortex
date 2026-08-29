@@ -264,8 +264,8 @@ func TestPromoteGivesAnAutomaticCheckoutItsOwnCorpus(t *testing.T) {
 		"a dedicated checkout retains its own coordinator")
 	assert.NotNil(t, f.mi.GetMetadata(result.Prefix), "the new corpus is served")
 	assert.True(t, f.configLists(f.worktree), "the promotion is persisted")
-	assert.False(t, f.watcher.isAttached(result.Prefix),
-		"the route-owned immutable corpus is not watched as a live filesystem base")
+	assert.True(t, f.watcher.isAttached(result.Prefix),
+		"the published dedicated repository remains attached for file and topology watching")
 
 	intents, err := f.catalog.ListTrackingIntents(ctx, f.automatic.CheckoutID)
 	require.NoError(t, err)
@@ -740,6 +740,45 @@ func TestPromotionColdBootstrapDoesNotReplayUnpublishedShell(t *testing.T) {
 	composed := contentIdentities(view.Reader, prefix)
 	assert.Contains(t, composed, dirtyPath, "dirty content remains in the overlay after resume")
 	assert.Contains(t, composed, dirtyPath+"::B")
+}
+
+// TestPromotionWatcherEnsureFailureRemainsRetryableWithoutRebuild proves that
+// post-publication watcher admission failures retry against the same immutable base.
+func TestPromotionWatcherEnsureFailureRemainsRetryableWithoutRebuild(t *testing.T) {
+	f := newFamilyFixture(t, "watcher-ensure-retry")
+	defer f.close()
+	ctx := context.Background()
+
+	baselineEnsures := f.watcher.ensureCallCount()
+	f.watcher.failNextEnsure(errors.New("injected watcher ensure failure"))
+	first, err := f.lc.PromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
+	require.ErrorContains(t, err, "injected watcher ensure failure")
+	assert.True(t, first.Pending)
+	assert.True(t, first.Retryable)
+	require.NotEmpty(t, first.TransitionID)
+	require.NotEmpty(t, first.Prefix)
+	require.NotEmpty(t, first.GraphID)
+
+	before, found, err := f.catalog.GetDedicatedGraph(ctx, first.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotEmpty(t, before.ActiveGenerationID)
+	assert.False(t, f.watcher.isAttached(first.Prefix))
+	assert.Equal(t, baselineEnsures+1, f.watcher.ensureCallCount())
+
+	require.NoError(t, f.lc.Seed(ctx))
+	require.Eventually(t, func() bool {
+		_, standing, transitionErr := f.catalog.GetIntentTransition(ctx, f.automatic.CheckoutID)
+		return transitionErr == nil && !standing && f.watcher.isAttached(first.Prefix)
+	}, 5*time.Second, 10*time.Millisecond, "standing promotion should repair watcher membership")
+
+	after, found, err := f.catalog.GetDedicatedGraph(ctx, first.GraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, before.ActiveGenerationID, after.ActiveGenerationID,
+		"retry must repair watcher membership without rebuilding the dedicated base")
+	assert.True(t, f.configLists(f.worktree))
+	assert.Equal(t, baselineEnsures+2, f.watcher.ensureCallCount())
 }
 
 // TestPromotionConfigSaveFailureRemainsRetryable makes the post-publication

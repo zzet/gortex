@@ -75,6 +75,29 @@ type contextRepoWatcher interface {
 	RemoveRepoContext(ctx context.Context, repoPrefix string) error
 }
 
+type contextRepoWatcherEnsurer interface {
+	EnsureRepoContext(ctx context.Context, repoPrefix string, cfg config.WatchConfig) error
+}
+
+// ErrWatcherUnavailable identifies a derived watcher admission that could not
+// run because no process-local watcher registry is attached yet. Durable graph,
+// configuration, and transition state remain committed and retryable.
+var ErrWatcherUnavailable = errors.New("repository watcher unavailable")
+
+// WatcherUnavailableError preserves the affected prefix while supporting
+// errors.Is(err, ErrWatcherUnavailable).
+type WatcherUnavailableError struct {
+	Prefix string
+}
+
+func (e *WatcherUnavailableError) Error() string {
+	return fmt.Sprintf("%s for %q", ErrWatcherUnavailable, e.Prefix)
+}
+
+func (e *WatcherUnavailableError) Unwrap() error {
+	return ErrWatcherUnavailable
+}
+
 // CheckoutLifecycleConfig is what the lifecycle needs to own its side effects.
 type CheckoutLifecycleConfig struct {
 	// MultiIndexer is the corpus the lifecycle indexes into and evicts from.
@@ -126,6 +149,12 @@ type familyRetry struct {
 	timer    *time.Timer
 }
 
+type watcherRetry struct {
+	root   string
+	timer  *time.Timer
+	cancel context.CancelFunc
+}
+
 type CheckoutLifecycle struct {
 	mi      *MultiIndexer
 	cfgMgr  *config.ConfigManager
@@ -144,11 +173,12 @@ type CheckoutLifecycle struct {
 	// grace; these timers guarantee its expiry is reconciled even when Git is
 	// otherwise quiet. retryClosing rejects new timer and callback admission
 	// while Close joins callbacks that fired before the gate closed.
-	retryCloseMu  sync.Mutex
-	retryMu       sync.Mutex
-	retryClosing  bool
-	retryWG       sync.WaitGroup
-	familyRetries map[string]familyRetry
+	retryCloseMu   sync.Mutex
+	retryMu        sync.Mutex
+	retryClosing   bool
+	retryWG        sync.WaitGroup
+	familyRetries  map[string]familyRetry
+	watcherRetries map[string]*watcherRetry
 	// familyRetryBarrier runs after a fired retry is admitted and counted.
 	// It is a deterministic shutdown test seam; nil in production.
 	familyRetryBarrier func()
@@ -247,6 +277,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		started:                map[string][]*CheckoutCoordinator{},
 		owed:                   map[int64]struct{}{},
 		familyRetries:          map[string]familyRetry{},
+		watcherRetries:         map[string]*watcherRetry{},
 		refViewRetention:       cfg.RefViews.withDefaults(),
 		indexBarrier:           cfg.indexBarrier,
 		transitionCtx:          transitionCtx,
@@ -1357,6 +1388,113 @@ func recordSweepGauges(report SweepReport) {
 // scheduleFamilyRetry arms the earliest grace deadline in one family. A later
 // report replaces or cancels the timer, so filesystem events and scheduled
 // expiry share the same single reconciliation path.
+const watcherRetryDelay = 5 * time.Second
+
+func watcherRootIdentity(root string) string {
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
+	return filepath.Clean(root)
+}
+
+func (l *CheckoutLifecycle) configuredWatcherRoot(prefix string) (string, bool) {
+	if l == nil || l.cfgMgr == nil || l.mi == nil || prefix == "" {
+		return "", false
+	}
+	metadata := l.mi.GetMetadata(prefix)
+	if metadata == nil {
+		return "", false
+	}
+	root := watcherRootIdentity(metadata.RootPath)
+	for _, entry := range l.cfgMgr.RepoEntries() {
+		entryPrefix := strings.TrimPrefix(EffectiveRepoPrefix(l.cfgMgr, entry), "/")
+		if entryPrefix == prefix && pathkey.SamePathIdentity(entry.Path, metadata.RootPath) {
+			return root, true
+		}
+	}
+	return "", false
+}
+
+func (l *CheckoutLifecycle) scheduleWatcherRetry(prefix string) {
+	root, configured := l.configuredWatcherRoot(prefix)
+	if !configured {
+		return
+	}
+	retry := &watcherRetry{root: root}
+	l.retryMu.Lock()
+	if l.retryClosing {
+		l.retryMu.Unlock()
+		return
+	}
+	if current := l.watcherRetries[prefix]; current != nil {
+		if current.root == root {
+			l.retryMu.Unlock()
+			return
+		}
+		if current.timer != nil {
+			current.timer.Stop()
+		}
+		if current.cancel != nil {
+			current.cancel()
+		}
+	}
+	retry.timer = time.AfterFunc(watcherRetryDelay, func() {
+		l.runWatcherRetry(prefix, retry)
+	})
+	l.watcherRetries[prefix] = retry
+	l.retryMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) runWatcherRetry(prefix string, retry *watcherRetry) {
+	l.retryMu.Lock()
+	if l.retryClosing || l.watcherRetries[prefix] != retry {
+		l.retryMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	retry.cancel = cancel
+	retry.timer = nil
+	l.retryWG.Add(1)
+	l.retryMu.Unlock()
+	defer l.retryWG.Done()
+
+	root, configured := l.configuredWatcherRoot(prefix)
+	var err error
+	if configured && root == retry.root {
+		err = l.ensureTrackedWatcherOnce(ctx, prefix)
+	}
+	cancel()
+
+	l.retryMu.Lock()
+	current := l.watcherRetries[prefix] == retry
+	if current {
+		delete(l.watcherRetries, prefix)
+	}
+	retry.cancel = nil
+	l.retryMu.Unlock()
+	if current && configured && root == retry.root && err != nil {
+		l.scheduleWatcherRetry(prefix)
+	}
+}
+
+func (l *CheckoutLifecycle) cancelWatcherRetry(prefix string) {
+	if l == nil || prefix == "" {
+		return
+	}
+	l.retryMu.Lock()
+	retry := l.watcherRetries[prefix]
+	if retry != nil {
+		delete(l.watcherRetries, prefix)
+		if retry.timer != nil {
+			retry.timer.Stop()
+		}
+		if retry.cancel != nil {
+			retry.cancel()
+		}
+	}
+	l.retryMu.Unlock()
+}
+
 func (l *CheckoutLifecycle) scheduleFamilyRetry(report reconcile.FamilyReport) {
 	deadline := int64(0)
 	for _, checkout := range report.Checkouts {
@@ -1924,6 +2062,15 @@ func (l *CheckoutLifecycle) Close() error {
 	for familyID, retry := range l.familyRetries {
 		retry.timer.Stop()
 		delete(l.familyRetries, familyID)
+	}
+	for prefix, retry := range l.watcherRetries {
+		if retry.timer != nil {
+			retry.timer.Stop()
+		}
+		if retry.cancel != nil {
+			retry.cancel()
+		}
+		delete(l.watcherRetries, prefix)
 	}
 	l.retryMu.Unlock()
 	l.retryWG.Wait()
@@ -2527,6 +2674,98 @@ func (l *CheckoutLifecycle) evictRepo(
 // attachWatcher wires a tracked prefix into the live file watcher. A failure
 // leaves an indexed but unwatched repository, which is queryable and only
 // goes stale on edit — not a reason to fail the track.
+// EnsureTrackedWatcher idempotently repairs process-local watcher membership for
+// an already-published repository. Missing configuration remains a construction
+// no-op, while a missing process-local registry is a retryable runtime gap.
+func (l *CheckoutLifecycle) EnsureTrackedWatcher(ctx context.Context, prefix string) error {
+	err := l.ensureTrackedWatcherOnce(ctx, prefix)
+	if err != nil {
+		l.scheduleWatcherRetry(prefix)
+		return err
+	}
+	l.cancelWatcherRetry(prefix)
+	return nil
+}
+
+func (l *CheckoutLifecycle) ensureTrackedWatcherOnce(ctx context.Context, prefix string) error {
+	if prefix == "" || l.cfgMgr == nil {
+		return nil
+	}
+	watcher := l.watcher()
+	if watcher == nil {
+		return &WatcherUnavailableError{Prefix: prefix}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cfg := l.cfgMgr.GetRepoConfig(prefix).Watch
+	if ensurer, ok := watcher.(contextRepoWatcherEnsurer); ok {
+		if err := ensurer.EnsureRepoContext(ctx, prefix, cfg); err != nil {
+			return fmt.Errorf("ensuring watcher for %s: %w", prefix, err)
+		}
+		return nil
+	}
+	if contextual, ok := watcher.(contextRepoWatcher); ok {
+		if err := contextual.AddRepoContext(ctx, prefix, cfg); err != nil {
+			return fmt.Errorf("adding watcher for %s: %w", prefix, err)
+		}
+		return nil
+	}
+	if err := watcher.AddRepo(prefix, cfg); err != nil {
+		return fmt.Errorf("adding watcher for %s: %w", prefix, err)
+	}
+	return nil
+}
+
+// ResumePendingTransitions requeues durable promotion and demotion work after
+// process-local dependencies, such as the watcher registry, become available.
+func (l *CheckoutLifecycle) ResumePendingTransitions(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Admission is intentionally non-blocking. The transition worker owns the
+	// durable work and is joined by Close; AttachWatcher must not wait for a
+	// view-build gate that daemon startup opens only after attachment returns.
+	return l.resumeModeTransitions(ctx)
+}
+
+// EnsureConfiguredWatchers repairs only durable explicit repositories that
+// are also present in the process-local indexer registry. Automatic checkout
+// overlays and transient shells are deliberately excluded.
+func (l *CheckoutLifecycle) EnsureConfiguredWatchers(ctx context.Context) error {
+	if l == nil || l.cfgMgr == nil || l.mi == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithValue(ctx, boundedWatcherRepairContextKey{}, struct{}{})
+	metadata := l.mi.AllMetadata()
+	seen := make(map[string]struct{})
+	var failures []error
+	for _, entry := range l.cfgMgr.RepoEntries() {
+		prefix := strings.TrimPrefix(EffectiveRepoPrefix(l.cfgMgr, entry), "/")
+		if prefix == "" {
+			continue
+		}
+		if _, duplicate := seen[prefix]; duplicate {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		meta := metadata[prefix]
+		if meta == nil || !pathkey.SamePathIdentity(entry.Path, meta.RootPath) {
+			continue
+		}
+		if err := l.EnsureTrackedWatcher(ctx, prefix); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
 func (l *CheckoutLifecycle) attachWatcher(prefix string) {
 	l.attachWatcherContext(context.Background(), prefix)
 }
@@ -2560,8 +2799,12 @@ func (l *CheckoutLifecycle) detachWatcher(prefix string) {
 }
 
 func (l *CheckoutLifecycle) detachWatcherContext(ctx context.Context, prefix string) {
+	if prefix == "" {
+		return
+	}
+	l.cancelWatcherRetry(prefix)
 	watcher := l.watcher()
-	if watcher == nil || prefix == "" {
+	if watcher == nil {
 		return
 	}
 	if ctx == nil {
