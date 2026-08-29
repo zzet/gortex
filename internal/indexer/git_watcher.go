@@ -806,6 +806,15 @@ func appendWorktreeHeadIdentity(builder *strings.Builder, adminDir, commonDir st
 		return fmt.Errorf("read worktree HEAD %s: %w", headPath, err)
 	}
 	appendTopologyField(builder, "HEAD:"+string(head))
+	headInfo, err := os.Stat(headPath)
+	if err != nil {
+		return fmt.Errorf("stat worktree HEAD %s: %w", headPath, err)
+	}
+	// Content alone cannot observe a complete A -> B -> A transition between
+	// two probe ticks. Git replaces HEAD through its lockfile protocol, so its
+	// stable modification time is a bounded revision token for that ABA case.
+	appendTopologyField(builder, "HEAD:mtime:"+strconv.FormatInt(headInfo.ModTime().UnixNano(), 10))
+	appendTopologyField(builder, "HEAD:size:"+strconv.FormatInt(headInfo.Size(), 10))
 
 	headValue := strings.TrimSpace(string(head))
 	if !strings.HasPrefix(headValue, "ref:") {
@@ -830,6 +839,12 @@ func appendWorktreeHeadIdentity(builder *strings.Builder, adminDir, commonDir st
 		return fmt.Errorf("read worktree active loose ref %s: %w", refPath, err)
 	}
 	appendTopologyField(builder, "active-ref:"+string(contents))
+	refInfo, err := os.Stat(refPath)
+	if err != nil {
+		return fmt.Errorf("stat worktree active loose ref %s: %w", refPath, err)
+	}
+	appendTopologyField(builder, "active-ref:mtime:"+strconv.FormatInt(refInfo.ModTime().UnixNano(), 10))
+	appendTopologyField(builder, "active-ref:size:"+strconv.FormatInt(refInfo.Size(), 10))
 	return nil
 }
 
