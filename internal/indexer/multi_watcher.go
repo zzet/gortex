@@ -19,6 +19,7 @@ type topologyDispatchEpoch struct {
 	number        uint64
 	owner         string
 	watcher       *GitWatcher
+	family        *topologyWatchFamily
 	accepting     bool
 	inFlight      int
 	drained       chan struct{}
@@ -26,6 +27,7 @@ type topologyDispatchEpoch struct {
 }
 
 type topologyDispatchContextKey struct{}
+type pendingWatcherAddContextKey struct{}
 
 type topologyDispatchToken struct {
 	mw     *MultiWatcher
@@ -71,7 +73,9 @@ type watcherRetirement struct {
 }
 
 type pendingWatcherAdd struct {
-	cfg config.WatchConfig
+	cfg     config.WatchConfig
+	claimed bool
+	done    chan struct{}
 }
 
 type watcherStopTarget struct {
@@ -93,6 +97,7 @@ type topologyWatchFamily struct {
 	members   map[string]*GitWatcher
 	nextEpoch uint64
 	dispatch  *topologyDispatchEpoch
+	handoff   *topologyDispatchEpoch
 }
 
 // MultiWatcher manages file watchers across multiple repositories.
@@ -112,14 +117,20 @@ type MultiWatcher struct {
 	forwarders           map[string]*watcherForwarder        // repo prefix → joined event forwarder
 	retiringWatchers     map[string]*watcherRetirement       // repo prefix → removal tombstone
 	pendingWatcherAdds   map[string]*pendingWatcherAdd       // coalesced reentrant replacement intent
-	multi                *MultiIndexer
-	logger               *zap.Logger
-	events               chan GraphChangeEvent
-	done                 chan struct{}
-	mu                   sync.Mutex
-	stopped              bool
-	stopDone             chan struct{}
-	stopErr              error
+	// pendingAddClaimed is a deterministic test seam after a retry worker
+	// claims an intent but before Add revalidates it; nil in production.
+	pendingAddClaimed func()
+	// pendingAddAdmitted is a non-reentrant test seam after exact claim
+	// consumption and before watcher publication, while mu remains held.
+	pendingAddAdmitted func()
+	multi              *MultiIndexer
+	logger             *zap.Logger
+	events             chan GraphChangeEvent
+	done               chan struct{}
+	mu                 sync.Mutex
+	stopped            bool
+	stopDone           chan struct{}
+	stopErr            error
 
 	// symbolChangeCb is the OnSymbolChange callback registered by the
 	// MCP server (or any other consumer). It's fanned out to every
@@ -239,6 +250,7 @@ func (mw *MultiWatcher) beginTopologyDispatchEpochLocked(family *topologyWatchFa
 		number:    family.nextEpoch,
 		owner:     prefix,
 		watcher:   gw,
+		family:    family,
 		accepting: true,
 		drained:   make(chan struct{}),
 	}
@@ -260,6 +272,28 @@ func (mw *MultiWatcher) finishTopologyDispatchEpochLocked(epoch *topologyDispatc
 	epoch.drainedClosed = true
 	close(epoch.drained)
 	delete(mw.topologyDispatches, epoch)
+
+	// Owner transfer is level-triggered only after the retired epoch has no
+	// admitted or retained callbacks. Revalidate both pointers so a removed
+	// shell or same-key replacement cannot inherit this epoch's activation.
+	family := epoch.family
+	if family == nil || family.handoff != epoch {
+		return
+	}
+	family.handoff = nil
+	if mw.stopped || mw.topologyFamilies[family.commonDir] != family {
+		return
+	}
+	if len(family.members) == 0 {
+		delete(mw.topologyFamilies, family.commonDir)
+		return
+	}
+	mw.electTopologyOwnerLocked(family)
+	if promoted := family.members[family.owner]; promoted != nil {
+		// The synthetic nudge covers every topology mutation observed while
+		// the family deliberately had no accepting owner epoch.
+		promoted.scheduleTopologyChange("owner-transfer")
+	}
 }
 
 func (mw *MultiWatcher) invalidateTopologyDispatchEpochLocked(family *topologyWatchFamily) <-chan struct{} {
@@ -420,7 +454,7 @@ func (mw *MultiWatcher) topologyFamilyKeyLocked(commonDir string) string {
 }
 
 func (mw *MultiWatcher) electTopologyOwnerLocked(family *topologyWatchFamily) {
-	if family == nil || len(family.members) == 0 {
+	if family == nil || family.handoff != nil || len(family.members) == 0 {
 		return
 	}
 	if gw, exists := family.members[family.owner]; exists {
@@ -494,30 +528,47 @@ func (mw *MultiWatcher) unregisterTopologyWatcherLocked(prefix string) <-chan st
 	}
 	gw := family.members[prefix]
 	wasOwner := family.owner == prefix
-	var drain <-chan struct{}
+	var retiredEpoch *topologyDispatchEpoch
 	if wasOwner {
-		drain = mw.invalidateTopologyDispatchEpochLocked(family)
+		// Publish the non-accepting handoff and final membership before
+		// invalidation. invalidate may synchronously finish a zero-flight
+		// epoch, which must never re-elect the owner being removed.
+		retiredEpoch = family.dispatch
 		family.owner = ""
+		family.handoff = retiredEpoch
 	}
 	delete(family.members, prefix)
 	if gw != nil {
 		gw.OnWorktreeChange(nil)
 		gw.setTopologyOwner(false)
 	}
-	if len(family.members) == 0 {
-		delete(mw.topologyFamilies, key)
-		return drain
-	}
+
 	if wasOwner {
+		drain := mw.invalidateTopologyDispatchEpochLocked(family)
+		if retiredEpoch != nil {
+			// finishTopologyDispatchEpochLocked owns both immediate and delayed
+			// activation, including deletion of an empty family shell.
+			return drain
+		}
+		// A defensive owner-without-epoch state has nothing to drain.
+		if len(family.members) == 0 {
+			delete(mw.topologyFamilies, key)
+			return drain
+		}
 		mw.electTopologyOwnerLocked(family)
 		if promoted := family.members[family.owner]; promoted != nil {
-			// Demotion cancels the retired owner's debounce timer. Always queue
-			// one coalesced new-epoch nudge so a pending topology mutation is not
-			// lost merely because ownership moved during its debounce window.
 			promoted.scheduleTopologyChange("owner-transfer")
 		}
+		return drain
 	}
-	return drain
+
+	// A handoff shell remains addressable by canonical family key while its
+	// prior epoch drains. Registration may add a survivor, but cannot elect it
+	// until the exact handoff completes.
+	if len(family.members) == 0 && family.handoff == nil {
+		delete(mw.topologyFamilies, key)
+	}
+	return nil
 }
 
 // Start begins watching all configured repos. Events from per-repo watchers
@@ -724,12 +775,22 @@ func (mw *MultiWatcher) queuePendingWatcherAddLocked(repoPrefix string, cfg conf
 		pending.cfg = cfg
 		return
 	}
-	pending := &pendingWatcherAdd{cfg: cfg}
+	pending := &pendingWatcherAdd{cfg: cfg, done: make(chan struct{})}
 	mw.pendingWatcherAdds[repoPrefix] = pending
 	go mw.runPendingWatcherAdd(repoPrefix, pending)
 }
 
+func (mw *MultiWatcher) restorePendingWatcherAddClaimLocked(repoPrefix string, pending *pendingWatcherAdd) {
+	if pending == nil || mw.stopped || mw.pendingWatcherAdds[repoPrefix] != nil {
+		return
+	}
+	pending.claimed = false
+	mw.pendingWatcherAdds[repoPrefix] = pending
+}
+
 func (mw *MultiWatcher) runPendingWatcherAdd(repoPrefix string, pending *pendingWatcherAdd) {
+	defer close(pending.done)
+
 	backoff := 25 * time.Millisecond
 	for {
 		mw.mu.Lock()
@@ -748,14 +809,21 @@ func (mw *MultiWatcher) runPendingWatcherAdd(repoPrefix string, pending *pending
 			}
 		}
 		if _, exists := mw.watchers[repoPrefix]; exists {
+			pending.claimed = false
 			delete(mw.pendingWatcherAdds, repoPrefix)
 			mw.mu.Unlock()
 			return
 		}
+		pending.claimed = true
 		cfg := pending.cfg
+		barrier := mw.pendingAddClaimed
 		mw.mu.Unlock()
+		if barrier != nil {
+			barrier()
+		}
 
-		if err := mw.AddRepoContext(context.Background(), repoPrefix, cfg); err == nil {
+		claimCtx := context.WithValue(context.Background(), pendingWatcherAddContextKey{}, pending)
+		if err := mw.AddRepoContext(claimCtx, repoPrefix, cfg); err == nil {
 			mw.mu.Lock()
 			if mw.pendingWatcherAdds[repoPrefix] == pending {
 				delete(mw.pendingWatcherAdds, repoPrefix)
@@ -1149,9 +1217,22 @@ func (mw *MultiWatcher) AddRepo(repoPrefix string, cfg config.WatchConfig) error
 // join a retirement that is waiting for that callback's lease, so it records a
 // coalesced replacement intent that is completed immediately after retirement.
 func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, cfg config.WatchConfig) error {
+	var pendingClaim *pendingWatcherAdd
+	if ctx != nil {
+		pendingClaim, _ = ctx.Value(pendingWatcherAddContextKey{}).(*pendingWatcherAdd)
+	}
 	waitedForRetirement := false
 	for {
 		mw.mu.Lock()
+		if pendingClaim != nil {
+			current := mw.pendingWatcherAdds[repoPrefix]
+			if current != pendingClaim || !pendingClaim.claimed {
+				mw.mu.Unlock()
+				return nil
+			}
+			// Coalesced replacement requests update the live claim in place.
+			cfg = pendingClaim.cfg
+		}
 		if mw.stopped {
 			mw.mu.Unlock()
 			return fmt.Errorf("multi-watcher is stopped")
@@ -1172,6 +1253,12 @@ func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, c
 			continue
 		}
 		if _, exists := mw.watchers[repoPrefix]; exists {
+			if pendingClaim != nil {
+				pendingClaim.claimed = false
+				delete(mw.pendingWatcherAdds, repoPrefix)
+				mw.mu.Unlock()
+				return nil
+			}
 			mw.mu.Unlock()
 			if waitedForRetirement {
 				// A coalesced callback replacement or another waiter won the race.
@@ -1181,6 +1268,16 @@ func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, c
 			return fmt.Errorf("watcher already exists for repo: %s", repoPrefix)
 		}
 
+		if pendingClaim != nil {
+			// Claim validation and consumption are one admission transaction.
+			// A later Remove therefore either canceled the claim above or sees
+			// the watcher installed while this same mutex remains held.
+			pendingClaim.claimed = false
+			delete(mw.pendingWatcherAdds, repoPrefix)
+			if mw.pendingAddAdmitted != nil {
+				mw.pendingAddAdmitted()
+			}
+		}
 		var topologyDrain <-chan struct{}
 		if err := mw.createWatcher(repoPrefix, cfg); err != nil {
 			if mw.logger != nil {
@@ -1189,6 +1286,7 @@ func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, c
 					zap.Error(err),
 				)
 			}
+			mw.restorePendingWatcherAddClaimLocked(repoPrefix, pendingClaim)
 			mw.mu.Unlock()
 			return err
 		}
@@ -1197,12 +1295,14 @@ func (mw *MultiWatcher) AddRepoContext(ctx context.Context, repoPrefix string, c
 		meta := mw.multi.GetMetadata(repoPrefix)
 		if meta == nil {
 			delete(mw.watchers, repoPrefix)
+			mw.restorePendingWatcherAddClaimLocked(repoPrefix, pendingClaim)
 			mw.mu.Unlock()
 			return fmt.Errorf("repository metadata not found: %s", repoPrefix)
 		}
 
 		if err := w.Start([]string{meta.RootPath}); err != nil {
 			delete(mw.watchers, repoPrefix)
+			mw.restorePendingWatcherAddClaimLocked(repoPrefix, pendingClaim)
 			mw.mu.Unlock()
 			return fmt.Errorf("starting watcher for %s: %w", repoPrefix, err)
 		}

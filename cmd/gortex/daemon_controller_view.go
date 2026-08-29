@@ -424,6 +424,10 @@ func (c *realController) nudgeFamilyTopologyRequest(ctx context.Context, familyI
 		return
 	}
 	run := func(runCtx context.Context, id string) {
+		if c.topologyReconcile != nil {
+			c.topologyReconcile(runCtx, id)
+			return
+		}
 		if c.probeReconcile != nil {
 			c.probeReconcile(id)
 			return
@@ -432,7 +436,7 @@ func (c *realController) nudgeFamilyTopologyRequest(ctx context.Context, familyI
 			c.reconcileFamilyForProbeContext(runCtx, id)
 		}
 	}
-	if c.probeReconcile == nil && c.lifecycle == nil {
+	if c.topologyReconcile == nil && c.probeReconcile == nil && c.lifecycle == nil {
 		request.finish()
 		return
 	}

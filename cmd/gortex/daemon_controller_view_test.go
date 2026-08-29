@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -897,6 +898,208 @@ func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
 	// removing config and store paths. Registered cleanups repeat these
 	// idempotent stops, then detach the already-stopped watcher pointer.
 	controller.StopWatcher()
+	require.NoError(t, lifecycle.Close())
+	controller.AttachWatcher(nil)
+}
+
+// TestRetainedTopologyReconcileRemovesWholeWatcherFamilyWithoutCycle pins the
+// controller/indexer ownership seam. The controller retains owner A's dispatch
+// while its reconcile removes A and then B. Promoting B before A releases would
+// enqueue a B request behind this same family single-flight; removing B would
+// then wait for a lease that only this blocked reconcile can release.
+func TestRetainedTopologyReconcileRemovesWholeWatcherFamilyWithoutCycle(t *testing.T) {
+	testenv.Sandbox(t)
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+
+	controller, multi, catalog, dir := buildCatalogController(t)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, multi.Close(ctx))
+	})
+	store, ok := controller.graph.(*store_sqlite.Store)
+	require.True(t, ok, "the fixture opened a %T, not the sqlite store", controller.graph)
+
+	logger := zap.NewNop()
+	controller.logger = logger
+	lifecycle, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+		MultiIndexer:  multi,
+		ConfigManager: controller.configManager,
+		Graph:         store,
+		Logger:        logger,
+		Reconcile: reconcile.Config{
+			AvailabilityGrace: time.Second,
+			RemovalGrace:      5 * time.Second,
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, lifecycle.Close()) })
+	controller.lifecycle = lifecycle
+	controller.viewMaterializer = &graphview.Materializer{
+		Store:   store,
+		Catalog: catalog,
+		Leases:  lifecycle.ViewLeases(),
+	}
+
+	primaryRoot := filepath.Join(dir, "topology-cycle-primary")
+	worktreeRoot := filepath.Join(dir, "topology-cycle-linked")
+	require.NoError(t, os.MkdirAll(primaryRoot, 0o755))
+	runTopologyGitCommand(t, primaryRoot, "init", "-b", "main")
+	runTopologyGitCommand(t, primaryRoot, "config", "user.email", "topology@example.invalid")
+	runTopologyGitCommand(t, primaryRoot, "config", "user.name", "Topology Test")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(primaryRoot, "main.go"),
+		[]byte("package topology\n\nfunc TopologyCycle() {}\n"),
+		0o644,
+	))
+	runTopologyGitCommand(t, primaryRoot, "add", "main.go")
+	runTopologyGitCommand(t, primaryRoot, "commit", "-m", "seed topology cycle fixture")
+
+	ctx := context.Background()
+	registration, err := lifecycle.Register(ctx, config.RepoEntry{
+		Path: primaryRoot,
+		Name: "topology-cycle",
+	}, indexer.TrackSourceCLI)
+	require.NoError(t, err)
+	require.False(t, registration.Pending)
+	require.NotEmpty(t, registration.FamilyID)
+
+	// Explicitly register B before watcher attachment. Automatic worktrees use
+	// the primary corpus prefix; this regression needs two physical watcher
+	// members in one family so ownership can transfer from A to B.
+	runTopologyGitCommand(t, primaryRoot,
+		"worktree", "add", "-b", "topology-cycle-linked", worktreeRoot)
+	linkedRegistration, err := lifecycle.Register(ctx, config.RepoEntry{
+		Path: worktreeRoot,
+		Name: "topology-cycle-linked",
+	}, indexer.TrackSourceCLI)
+	require.NoError(t, err)
+	require.False(t, linkedRegistration.Pending)
+	require.Equal(t, registration.FamilyID, linkedRegistration.FamilyID)
+	require.NotEqual(t, registration.Prefix, linkedRegistration.Prefix)
+
+	watcher, err := indexer.NewMultiWatcher(multi, map[string]config.WatchConfig{
+		registration.Prefix: {
+			Enabled:        true,
+			DebounceMs:     20,
+			StormThreshold: -1,
+		},
+		linkedRegistration.Prefix: {
+			Enabled:        true,
+			DebounceMs:     20,
+			StormThreshold: -1,
+		},
+	}, logger)
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start())
+	t.Cleanup(func() {
+		controller.AttachWatcher(nil)
+		require.NoError(t, watcher.Stop())
+	})
+
+	ownerPrefix, survivorPrefix := registration.Prefix, linkedRegistration.Prefix
+	if survivorPrefix < ownerPrefix {
+		ownerPrefix, survivorPrefix = survivorPrefix, ownerPrefix
+	}
+
+	firstRemoval := make(chan error, 1)
+	removeSurvivor := make(chan struct{})
+	type transferResult struct {
+		familyID string
+		err      error
+	}
+	results := make(chan transferResult, 1)
+	var reconcileCalls atomic.Int32
+	controller.topologyReconcile = func(runCtx context.Context, familyID string) {
+		if reconcileCalls.Add(1) != 1 {
+			return
+		}
+		firstErr := watcher.RemoveRepoContext(runCtx, ownerPrefix)
+		firstRemoval <- firstErr
+		if firstErr != nil {
+			results <- transferResult{familyID: familyID, err: firstErr}
+			return
+		}
+		<-removeSurvivor
+		results <- transferResult{
+			familyID: familyID,
+			err:      watcher.RemoveRepoContext(runCtx, survivorPrefix),
+		}
+	}
+	controller.AttachWatcher(watcher)
+
+	select {
+	case firstErr := <-firstRemoval:
+		require.NoError(t, firstErr, "retained reconcile could not remove its owner")
+	case <-time.After(10 * time.Second):
+		t.Fatal("retained reconcile did not remove its owner")
+	}
+
+	// GitWatcher debounces a promoted-owner nudge for 300ms. Hold A's request
+	// for five windows. A legacy immediate transfer deterministically installs
+	// B as this family's pending request; take and finish that request before
+	// failing so the regression cannot wedge the rest of the test process.
+	var legacyPending *topologyNudgeRequest
+	deadline := time.NewTimer(1500 * time.Millisecond)
+	ticker := time.NewTicker(5 * time.Millisecond)
+observePending:
+	for {
+		select {
+		case <-ticker.C:
+			controller.topologyNudgeMu.Lock()
+			if state := controller.topologyNudges[registration.FamilyID]; state != nil && state.pending != nil {
+				legacyPending = state.pending
+				state.pending = nil
+			}
+			controller.topologyNudgeMu.Unlock()
+			if legacyPending != nil {
+				break observePending
+			}
+		case <-deadline.C:
+			break observePending
+		}
+	}
+	if !deadline.Stop() {
+		select {
+		case <-deadline.C:
+		default:
+		}
+	}
+	ticker.Stop()
+	if legacyPending != nil {
+		legacyPending.finish()
+	}
+	close(removeSurvivor)
+
+	select {
+	case result := <-results:
+		require.Equal(t, registration.FamilyID, result.familyID)
+		require.NoError(t, result.err, "same retained reconcile could not remove the survivor")
+	case <-time.After(10 * time.Second):
+		t.Fatal("removing the survivor deadlocked behind its own pending controller request")
+	}
+	require.Nil(t, legacyPending,
+		"owner transfer queued the survivor behind the retained family reconcile")
+	require.Equal(t, int32(1), reconcileCalls.Load(),
+		"removing the whole family should not start a descendant reconcile")
+	require.Eventually(t, func() bool {
+		controller.topologyNudgeMu.Lock()
+		defer controller.topologyNudgeMu.Unlock()
+		return len(controller.topologyNudges) == 0
+	}, 5*time.Second, 10*time.Millisecond, "controller retained stale topology nudge state")
+
+	stopDone := make(chan struct{})
+	go func() {
+		controller.StopWatcher()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("controller watcher stop blocked after whole-family topology removal")
+	}
 	require.NoError(t, lifecycle.Close())
 	controller.AttachWatcher(nil)
 }

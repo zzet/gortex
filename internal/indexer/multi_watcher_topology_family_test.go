@@ -17,6 +17,10 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/search"
 )
 
 type topologyWatchFixture struct {
@@ -478,6 +482,195 @@ func TestMultiWatcherTopologyStopDrainsAdmittedCallback(t *testing.T) {
 	}
 }
 
+func TestMultiWatcherTopologyZeroFlightTransferActivatesOneNudge(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 2)
+	mw := newTopologyRegistry()
+	var callbacks atomic.Int64
+	mw.OnWorktreeChange(func(prefix, _ string) {
+		if prefix == "repo-01" {
+			callbacks.Add(1)
+		}
+	})
+
+	oldOwner := fixture.watcher(0)
+	newOwner := fixture.watcher(1)
+	installTopologyWatcher(mw, "repo-00", oldOwner)
+	installTopologyWatcher(mw, "repo-01", newOwner)
+
+	mw.mu.Lock()
+	oldEpoch := mw.topologyFamilies[canonicalGitCommonDir(fixture.commonDir)].dispatch
+	if oldEpoch == nil {
+		mw.mu.Unlock()
+		t.Fatal("old owner has no topology dispatch epoch")
+	}
+	if oldEpoch.inFlight != 0 {
+		mw.mu.Unlock()
+		t.Fatalf("old epoch in-flight = %d, want zero", oldEpoch.inFlight)
+	}
+	drain := mw.unregisterTopologyWatcherLocked("repo-00")
+	delete(mw.gitWatchers, "repo-00")
+	mw.mu.Unlock()
+	waitTopologyDispatchDrains(drain)
+
+	families, owner, members := topologyFamilySnapshot(mw)
+	if families != 1 || owner != "repo-01" || members != 1 {
+		t.Fatalf("transferred family = families:%d owner:%q members:%d", families, owner, members)
+	}
+	assertOneTopologyCallback(t, &callbacks, newOwner.debounce)
+	removeTopologyWatcher(mw, "repo-01")
+}
+
+func TestMultiWatcherTopologyHandoffDefersSurvivorChurnUntilDrain(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 3)
+	mw := newTopologyRegistry()
+	var survivorCallbacks atomic.Int64
+	mw.OnWorktreeChange(func(prefix, _ string) {
+		if prefix == "repo-01" {
+			survivorCallbacks.Add(1)
+		}
+	})
+
+	oldOwner := fixture.watcher(0)
+	survivor := fixture.watcher(1)
+	transient := fixture.watcher(2)
+	installTopologyWatcher(mw, "repo-00", oldOwner)
+	installTopologyWatcher(mw, "repo-01", survivor)
+	oldEpoch := topologyDispatchEpochSnapshot(t, mw, "repo-00")
+	oldDispatch, admitted := mw.admitWorktreeTopologyChange("repo-00", oldOwner, oldEpoch, oldOwner.repoPath)
+	if !admitted {
+		t.Fatal("old owner callback was not admitted")
+	}
+
+	mw.mu.Lock()
+	drain := mw.unregisterTopologyWatcherLocked("repo-00")
+	delete(mw.gitWatchers, "repo-00")
+	family := mw.topologyFamilies[canonicalGitCommonDir(fixture.commonDir)]
+	mw.mu.Unlock()
+	if family == nil || family.handoff != oldEpoch {
+		t.Fatal("old epoch was not published as family handoff")
+	}
+
+	installTopologyWatcher(mw, "repo-02", transient)
+	families, owner, members := topologyFamilySnapshot(mw)
+	if families != 1 || owner != "" || members != 2 {
+		t.Fatalf("family after registration during handoff = families:%d owner:%q members:%d", families, owner, members)
+	}
+	removeTopologyWatcher(mw, "repo-02")
+	families, owner, members = topologyFamilySnapshot(mw)
+	if families != 1 || owner != "" || members != 1 {
+		t.Fatalf("family after removal during handoff = families:%d owner:%q members:%d", families, owner, members)
+	}
+
+	oldDispatch.invoke()
+	waitTopologyDispatchDrains(drain)
+	families, owner, members = topologyFamilySnapshot(mw)
+	if families != 1 || owner != "repo-01" || members != 1 {
+		t.Fatalf("family after handoff drain = families:%d owner:%q members:%d", families, owner, members)
+	}
+	assertOneTopologyCallback(t, &survivorCallbacks, survivor.debounce)
+	removeTopologyWatcher(mw, "repo-01")
+}
+
+func TestMultiWatcherTopologyStopDuringHandoffSuppressesElection(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 2)
+	mw := newTopologyRegistry()
+	var survivorCallbacks atomic.Int64
+	mw.OnWorktreeChange(func(prefix, _ string) {
+		if prefix == "repo-01" {
+			survivorCallbacks.Add(1)
+		}
+	})
+
+	oldOwner := fixture.watcher(0)
+	survivor := fixture.watcher(1)
+	makeTopologyWatcherStopSafe(t, oldOwner)
+	makeTopologyWatcherStopSafe(t, survivor)
+	installTopologyWatcher(mw, "repo-00", oldOwner)
+	installTopologyWatcher(mw, "repo-01", survivor)
+	oldEpoch := topologyDispatchEpochSnapshot(t, mw, "repo-00")
+	oldDispatch, admitted := mw.admitWorktreeTopologyChange("repo-00", oldOwner, oldEpoch, oldOwner.repoPath)
+	if !admitted {
+		t.Fatal("old owner callback was not admitted")
+	}
+
+	mw.mu.Lock()
+	drain := mw.unregisterTopologyWatcherLocked("repo-00")
+	delete(mw.gitWatchers, "repo-00")
+	mw.mu.Unlock()
+	stopped := make(chan error, 1)
+	go func() { stopped <- mw.Stop() }()
+	assertTopologyLifecycleBlocked(t, stopped, "stop during topology handoff")
+
+	oldDispatch.invoke()
+	waitTopologyDispatchDrains(drain)
+	if err := <-stopped; err != nil {
+		t.Fatalf("stop multi-watcher: %v", err)
+	}
+	if got := survivorCallbacks.Load(); got != 0 {
+		t.Fatalf("survivor callbacks after stop = %d, want 0", got)
+	}
+	mw.mu.Lock()
+	families := len(mw.topologyFamilies)
+	dispatches := len(mw.topologyDispatches)
+	reverse := len(mw.topologyFamilyByRepo)
+	mw.mu.Unlock()
+	if families != 0 || dispatches != 0 || reverse != 0 {
+		t.Fatalf("topology state after stop = families:%d dispatches:%d reverse:%d", families, dispatches, reverse)
+	}
+}
+
+func TestMultiWatcherTopologyEmptyShellReusesFamilyDuringHandoff(t *testing.T) {
+	fixture := newTopologyWatchFixture(t, 2)
+	mw := newTopologyRegistry()
+	var replacementCallbacks atomic.Int64
+	mw.OnWorktreeChange(func(prefix, _ string) {
+		if prefix == "repo-01" {
+			replacementCallbacks.Add(1)
+		}
+	})
+
+	oldOwner := fixture.watcher(0)
+	replacement := fixture.watcher(1)
+	installTopologyWatcher(mw, "repo-00", oldOwner)
+	oldEpoch := topologyDispatchEpochSnapshot(t, mw, "repo-00")
+	oldDispatch, admitted := mw.admitWorktreeTopologyChange("repo-00", oldOwner, oldEpoch, oldOwner.repoPath)
+	if !admitted {
+		t.Fatal("old owner callback was not admitted")
+	}
+
+	mw.mu.Lock()
+	key := canonicalGitCommonDir(fixture.commonDir)
+	family := mw.topologyFamilies[key]
+	drain := mw.unregisterTopologyWatcherLocked("repo-00")
+	delete(mw.gitWatchers, "repo-00")
+	mw.mu.Unlock()
+	installTopologyWatcher(mw, "repo-01", replacement)
+
+	mw.mu.Lock()
+	current := mw.topologyFamilies[key]
+	if current == nil {
+		mw.mu.Unlock()
+		t.Fatal("topology family shell disappeared during handoff")
+	}
+	owner := current.owner
+	dispatch := current.dispatch
+	handoff := current.handoff
+	members := len(current.members)
+	mw.mu.Unlock()
+	if current != family || owner != "" || dispatch != nil || handoff != oldEpoch || members != 1 {
+		t.Fatalf("family shell replaced during handoff: same:%t owner:%q dispatch:%v handoff:%p members:%d", current == family, owner, dispatch, handoff, members)
+	}
+
+	oldDispatch.invoke()
+	waitTopologyDispatchDrains(drain)
+	families, owner, members := topologyFamilySnapshot(mw)
+	if families != 1 || owner != "repo-01" || members != 1 {
+		t.Fatalf("replacement family after drain = families:%d owner:%q members:%d", families, owner, members)
+	}
+	assertOneTopologyCallback(t, &replacementCallbacks, replacement.debounce)
+	removeTopologyWatcher(mw, "repo-01")
+}
+
 func TestMultiWatcherTopologyOwnerTransferDrainsOnlyOldEpoch(t *testing.T) {
 	fixture := newTopologyWatchFixture(t, 2)
 	mw := newTopologyRegistry()
@@ -515,26 +708,23 @@ func TestMultiWatcherTopologyOwnerTransferDrainsOnlyOldEpoch(t *testing.T) {
 	assertTopologyLifecycleBlocked(t, transferred, "owner transfer")
 
 	families, owner, members := topologyFamilySnapshot(mw)
-	if families != 1 || owner != "repo-01" || members != 1 {
-		t.Fatalf("transferred family = families:%d owner:%q members:%d", families, owner, members)
+	if families != 1 || owner != "" || members != 1 {
+		t.Fatalf("handoff family = families:%d owner:%q members:%d", families, owner, members)
 	}
-	newEpoch := topologyDispatchEpochSnapshot(t, mw, "repo-01")
-	if newEpoch == oldEpoch || newEpoch.number <= oldEpoch.number {
-		t.Fatalf("owner transfer did not advance epoch: old=%d new=%d", oldEpoch.number, newEpoch.number)
+	mw.mu.Lock()
+	family := mw.topologyFamilies[canonicalGitCommonDir(fixture.commonDir)]
+	if family == nil {
+		mw.mu.Unlock()
+		t.Fatal("topology family disappeared during handoff")
 	}
-
-	mw.dispatchWorktreeTopologyChange("repo-00", oldOwner, oldEpoch, oldOwner.repoPath)
-	if got := oldCallbacks.Load(); got != 0 {
-		t.Fatalf("stale old-owner dispatch invoked %d callbacks", got)
+	dispatch := family.dispatch
+	handoff := family.handoff
+	mw.mu.Unlock()
+	if dispatch != nil || handoff != oldEpoch {
+		t.Fatalf("handoff state = dispatch:%v handoff:%p, want old epoch %p", dispatch, handoff, oldEpoch)
 	}
-	newDispatch, admitted := mw.admitWorktreeTopologyChange("repo-01", newOwner, newEpoch, newOwner.repoPath)
-	if !admitted {
-		t.Fatal("new owner callback was not admitted while old epoch drained")
-	}
-	beforeNew := newCallbacks.Load()
-	newDispatch.invoke()
-	if got := newCallbacks.Load(); got < beforeNew+1 {
-		t.Fatalf("new owner callback count = %d, want at least %d", got, beforeNew+1)
+	if _, admitted := mw.admitWorktreeTopologyChange("repo-01", newOwner, oldEpoch, newOwner.repoPath); admitted {
+		t.Fatal("new owner callback admitted before old epoch drained")
 	}
 
 	oldDispatch.invoke()
@@ -544,6 +734,16 @@ func TestMultiWatcherTopologyOwnerTransferDrainsOnlyOldEpoch(t *testing.T) {
 	if err := <-transferred; err != nil {
 		t.Fatalf("owner transfer: %v", err)
 	}
+
+	families, owner, members = topologyFamilySnapshot(mw)
+	if families != 1 || owner != "repo-01" || members != 1 {
+		t.Fatalf("transferred family = families:%d owner:%q members:%d", families, owner, members)
+	}
+	newEpoch := topologyDispatchEpochSnapshot(t, mw, "repo-01")
+	if newEpoch == oldEpoch || newEpoch.number <= oldEpoch.number {
+		t.Fatalf("owner transfer did not advance epoch: old=%d new=%d", oldEpoch.number, newEpoch.number)
+	}
+	assertOneTopologyCallback(t, &newCallbacks, newOwner.debounce)
 	removeTopologyWatcher(mw, "repo-01")
 }
 
@@ -731,8 +931,8 @@ func TestMultiWatcherTopologyReentrantOwnerTransfer(t *testing.T) {
 	}()
 	select {
 	case owner := <-transferred:
-		if owner != "repo-01" {
-			t.Fatalf("owner visible inside callback = %q, want repo-01", owner)
+		if owner != "" {
+			t.Fatalf("owner visible inside callback = %q, want empty handoff", owner)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("callback-triggered owner transfer deadlocked")
@@ -741,6 +941,10 @@ func TestMultiWatcherTopologyReentrantOwnerTransfer(t *testing.T) {
 	case <-invoked:
 	case <-time.After(2 * time.Second):
 		t.Fatal("owner-transfer callback did not return")
+	}
+	families, owner, members := topologyFamilySnapshot(mw)
+	if families != 1 || owner != "repo-01" || members != 1 {
+		t.Fatalf("family after callback release = families:%d owner:%q members:%d", families, owner, members)
 	}
 	waitForTopologyCondition(t, "old owner retirement did not finish", func() bool {
 		mw.mu.Lock()
@@ -1044,6 +1248,184 @@ func TestMultiWatcherTopologyRemoveCancelsRetryingIntentWithoutWatcher(t *testin
 	}
 	if err := mw.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func waitPendingWatcherAddDone(t *testing.T, pending *pendingWatcherAdd) {
+	t.Helper()
+	select {
+	case <-pending.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending watcher add did not finish")
+	}
+}
+
+func assertWatcherPrefixAbsent(t *testing.T, mw *MultiWatcher, prefix string) {
+	t.Helper()
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	if mw.watchers[prefix] != nil || mw.gitWatchers[prefix] != nil || mw.forwarders[prefix] != nil || mw.retiringWatchers[prefix] != nil || mw.pendingWatcherAdds[prefix] != nil {
+		t.Fatalf("prefix %q survived removal: watcher=%v git=%v forwarder=%v retirement=%v pending=%v", prefix, mw.watchers[prefix] != nil, mw.gitWatchers[prefix] != nil, mw.forwarders[prefix] != nil, mw.retiringWatchers[prefix] != nil, mw.pendingWatcherAdds[prefix] != nil)
+	}
+}
+
+func TestMultiWatcherPendingAddRemoveBeforeAdmissionDoesNotResurrect(t *testing.T) {
+	mw, _, _, _ := setupMultiWatcherTest(t)
+	if err := mw.Start(); err != nil {
+		t.Fatalf("start multi-watcher: %v", err)
+	}
+	defer func() { _ = mw.Stop() }()
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		t.Fatalf("remove initial watcher: %v", err)
+	}
+
+	claimed := make(chan struct{})
+	release := make(chan struct{})
+	mw.mu.Lock()
+	mw.pendingAddClaimed = func() {
+		close(claimed)
+		<-release
+	}
+	mw.queuePendingWatcherAddLocked("repo-a", config.WatchConfig{Enabled: true, DebounceMs: 50})
+	pending := mw.pendingWatcherAdds["repo-a"]
+	mw.mu.Unlock()
+
+	select {
+	case <-claimed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending watcher add was not claimed")
+	}
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		t.Fatalf("cancel pending watcher add: %v", err)
+	}
+	close(release)
+	waitPendingWatcherAddDone(t, pending)
+	assertWatcherPrefixAbsent(t, mw, "repo-a")
+}
+
+func TestMultiWatcherPendingAddStopBeforeAdmissionDoesNotResurrect(t *testing.T) {
+	mw, _, _, _ := setupMultiWatcherTest(t)
+	if err := mw.Start(); err != nil {
+		t.Fatalf("start multi-watcher: %v", err)
+	}
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		t.Fatalf("remove initial watcher: %v", err)
+	}
+
+	claimed := make(chan struct{})
+	release := make(chan struct{})
+	mw.mu.Lock()
+	mw.pendingAddClaimed = func() {
+		close(claimed)
+		<-release
+	}
+	mw.queuePendingWatcherAddLocked("repo-a", config.WatchConfig{Enabled: true, DebounceMs: 50})
+	pending := mw.pendingWatcherAdds["repo-a"]
+	mw.mu.Unlock()
+
+	select {
+	case <-claimed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending watcher add was not claimed")
+	}
+	if err := mw.Stop(); err != nil {
+		t.Fatalf("stop multi-watcher: %v", err)
+	}
+	close(release)
+	waitPendingWatcherAddDone(t, pending)
+	assertWatcherPrefixAbsent(t, mw, "repo-a")
+}
+
+func TestMultiWatcherPendingAddRemoveAfterAdmissionJoinsPublication(t *testing.T) {
+	mw, _, _, _ := setupMultiWatcherTest(t)
+	if err := mw.Start(); err != nil {
+		t.Fatalf("start multi-watcher: %v", err)
+	}
+	defer func() { _ = mw.Stop() }()
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		t.Fatalf("remove initial watcher: %v", err)
+	}
+
+	admitted := make(chan struct{})
+	release := make(chan struct{})
+	mw.mu.Lock()
+	mw.pendingAddAdmitted = func() {
+		close(admitted)
+		<-release
+	}
+	mw.queuePendingWatcherAddLocked("repo-a", config.WatchConfig{Enabled: true, DebounceMs: 50})
+	pending := mw.pendingWatcherAdds["repo-a"]
+	mw.mu.Unlock()
+
+	select {
+	case <-admitted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending watcher add was not admitted")
+	}
+	removed := make(chan error, 1)
+	go func() { removed <- mw.RemoveRepo("repo-a") }()
+	assertTopologyLifecycleBlocked(t, removed, "remove during watcher publication")
+	close(release)
+	if err := <-removed; err != nil {
+		t.Fatalf("remove published watcher: %v", err)
+	}
+	waitPendingWatcherAddDone(t, pending)
+	assertWatcherPrefixAbsent(t, mw, "repo-a")
+}
+
+func TestMultiWatcherPendingAddGenerationReplacementSurvivesOldWorker(t *testing.T) {
+	mw, _, _, _ := setupMultiWatcherTest(t)
+	if err := mw.Start(); err != nil {
+		t.Fatalf("start multi-watcher: %v", err)
+	}
+	defer func() { _ = mw.Stop() }()
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		t.Fatalf("remove initial watcher: %v", err)
+	}
+
+	firstClaimed := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var claims atomic.Int64
+	mw.mu.Lock()
+	mw.pendingAddClaimed = func() {
+		if claims.Add(1) == 1 {
+			close(firstClaimed)
+			<-releaseFirst
+		}
+	}
+	cfg := config.WatchConfig{Enabled: true, DebounceMs: 50}
+	mw.queuePendingWatcherAddLocked("repo-a", cfg)
+	oldPending := mw.pendingWatcherAdds["repo-a"]
+	mw.mu.Unlock()
+
+	select {
+	case <-firstClaimed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old pending watcher add was not claimed")
+	}
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		t.Fatalf("cancel old generation: %v", err)
+	}
+	mw.mu.Lock()
+	mw.queuePendingWatcherAddLocked("repo-a", cfg)
+	newPending := mw.pendingWatcherAdds["repo-a"]
+	mw.mu.Unlock()
+	if newPending == oldPending {
+		t.Fatal("replacement reused canceled pending generation")
+	}
+	close(releaseFirst)
+	waitPendingWatcherAddDone(t, oldPending)
+	waitPendingWatcherAddDone(t, newPending)
+
+	mw.mu.Lock()
+	watcher := mw.watchers["repo-a"]
+	pending := mw.pendingWatcherAdds["repo-a"]
+	mw.mu.Unlock()
+	if watcher == nil || pending != nil {
+		t.Fatalf("replacement state = watcher:%v pending:%v, want one live watcher", watcher != nil, pending != nil)
+	}
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		t.Fatalf("remove replacement watcher: %v", err)
 	}
 }
 
@@ -1385,6 +1767,277 @@ func BenchmarkMultiWatcherTopologyFamilyRegistration(b *testing.B) {
 			b.ReportMetric(0, "duplicate-paths/op")
 		})
 	}
+}
+
+func setupMultiWatcherBenchmark(b *testing.B) *MultiWatcher {
+	b.Helper()
+	base := b.TempDir()
+	repoADir := filepath.Join(base, "repo-a")
+	repoBDir := filepath.Join(base, "repo-b")
+	for _, dir := range []string{repoADir, repoBDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			b.Fatalf("create repo dir: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoADir, "main.go"), []byte("package main\n\nfunc HelloA() {}\n"), 0o644); err != nil {
+		b.Fatalf("write repo-a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoBDir, "main.go"), []byte("package main\n\nfunc HelloB() {}\n"), 0o644); err != nil {
+		b.Fatalf("write repo-b: %v", err)
+	}
+
+	cm, err := config.NewConfigManager(filepath.Join(base, "config.yaml"))
+	if err != nil {
+		b.Fatalf("create config manager: %v", err)
+	}
+	cm.Global().Repos = []config.RepoEntry{
+		{Path: repoADir, Name: "repo-a"},
+		{Path: repoBDir, Name: "repo-b"},
+	}
+	if err := cm.Global().Save(); err != nil {
+		b.Fatalf("save benchmark config: %v", err)
+	}
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	mi := NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
+	if _, err := mi.IndexAll(); err != nil {
+		b.Fatalf("index benchmark repos: %v", err)
+	}
+	configs := map[string]config.WatchConfig{
+		"repo-a": {Enabled: true, DebounceMs: 50, Exclude: []string{"**/*.tmp"}},
+		"repo-b": {Enabled: true, DebounceMs: 50, Exclude: []string{"**/*.tmp"}},
+	}
+	mw, err := NewMultiWatcher(mi, configs, zap.NewNop())
+	if err != nil {
+		b.Fatalf("create multi-watcher: %v", err)
+	}
+	return mw
+}
+
+func BenchmarkMultiWatcherPendingAddAdmission(b *testing.B) {
+	mw := setupMultiWatcherBenchmark(b)
+	if err := mw.Start(); err != nil {
+		b.Fatalf("start multi-watcher: %v", err)
+	}
+	if err := mw.RemoveRepo("repo-a"); err != nil {
+		b.Fatalf("remove initial watcher: %v", err)
+	}
+	admitted := make(chan struct{})
+	release := make(chan struct{})
+	removed := make(chan error, 1)
+	mw.pendingAddAdmitted = func() {
+		admitted <- struct{}{}
+		<-release
+	}
+	cfg := config.WatchConfig{Enabled: true, DebounceMs: 50, Exclude: []string{"**/*.tmp"}}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mw.mu.Lock()
+		mw.queuePendingWatcherAddLocked("repo-a", cfg)
+		pending := mw.pendingWatcherAdds["repo-a"]
+		mw.mu.Unlock()
+		<-admitted
+		go func() { removed <- mw.RemoveRepo("repo-a") }()
+		release <- struct{}{}
+		if err := <-removed; err != nil {
+			b.Fatalf("remove admitted watcher: %v", err)
+		}
+		<-pending.done
+	}
+	b.StopTimer()
+
+	mw.mu.Lock()
+	watcher := mw.watchers["repo-a"]
+	gitWatcher := mw.gitWatchers["repo-a"]
+	pending := mw.pendingWatcherAdds["repo-a"]
+	forwarder := mw.forwarders["repo-a"]
+	retirement := mw.retiringWatchers["repo-a"]
+	started := mw.started["repo-a"]
+	mw.mu.Unlock()
+	if watcher != nil || gitWatcher != nil || pending != nil || forwarder != nil || retirement != nil || started {
+		b.Fatalf("admission lifecycle leaked repo-a state: watcher:%v git:%v pending:%v forwarder:%v retirement:%v started:%v", watcher != nil, gitWatcher != nil, pending != nil, forwarder != nil, retirement != nil, started)
+	}
+	if err := mw.Stop(); err != nil {
+		b.Fatalf("stop multi-watcher: %v", err)
+	}
+	b.ReportMetric(1, "pending-admit-remove/op")
+}
+
+func BenchmarkMultiWatcherPendingAddCancellation(b *testing.B) {
+	mw := newTopologyRegistry()
+	claimed := make(chan struct{})
+	release := make(chan struct{})
+	mw.pendingAddClaimed = func() {
+		claimed <- struct{}{}
+		<-release
+	}
+	cfg := config.WatchConfig{Enabled: true, DebounceMs: 50}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mw.mu.Lock()
+		mw.queuePendingWatcherAddLocked("repo-00", cfg)
+		pending := mw.pendingWatcherAdds["repo-00"]
+		mw.mu.Unlock()
+		<-claimed
+		if err := mw.RemoveRepo("repo-00"); err != nil {
+			b.Fatalf("cancel pending watcher add: %v", err)
+		}
+		release <- struct{}{}
+		<-pending.done
+	}
+	b.StopTimer()
+
+	mw.mu.Lock()
+	watchers := len(mw.watchers)
+	gitWatchers := len(mw.gitWatchers)
+	pending := len(mw.pendingWatcherAdds)
+	forwarders := len(mw.forwarders)
+	retirements := len(mw.retiringWatchers)
+	mw.mu.Unlock()
+	if watchers != 0 || gitWatchers != 0 || pending != 0 || forwarders != 0 || retirements != 0 {
+		b.Fatalf("pending cancellation leaked state: watchers:%d git:%d pending:%d forwarders:%d retirements:%d", watchers, gitWatchers, pending, forwarders, retirements)
+	}
+	b.ReportMetric(1, "pending-cancel/op")
+}
+
+func BenchmarkMultiWatcherTopologyHandoffCompletion(b *testing.B) {
+	b.Run("zero_flight", func(b *testing.B) {
+		fixture := newTopologyWatchFixture(b, 2)
+		mw := newTopologyRegistry()
+		oldOwner := fixture.watcher(0)
+		newOwner := fixture.watcher(1)
+		oldOwner.debounce = 0
+		newOwner.debounce = 0
+		nudged := make(chan struct{}, 1)
+		var nudges atomic.Int64
+		mw.OnWorktreeChange(func(prefix, _ string) {
+			if prefix == "repo-01" {
+				nudges.Add(1)
+				nudged <- struct{}{}
+			}
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			installTopologyWatcher(mw, "repo-00", oldOwner)
+			installTopologyWatcher(mw, "repo-01", newOwner)
+			mw.mu.Lock()
+			family := mw.topologyFamilies[canonicalGitCommonDir(fixture.commonDir)]
+			if family == nil || family.dispatch == nil || family.dispatch.inFlight != 0 {
+				mw.mu.Unlock()
+				b.Fatal("zero-flight owner epoch was not ready")
+			}
+			drain := mw.unregisterTopologyWatcherLocked("repo-00")
+			delete(mw.gitWatchers, "repo-00")
+			mw.mu.Unlock()
+			waitTopologyDispatchDrains(drain)
+			<-nudged
+			removeTopologyWatcher(mw, "repo-01")
+		}
+		b.StopTimer()
+
+		wantInventory := int64(3 * b.N)
+		if got := fixture.inventoryCalls.Load(); got != wantInventory {
+			b.Fatalf("inventory calls = %d, want %d", got, wantInventory)
+		}
+		if got := nudges.Load(); got != int64(b.N) {
+			b.Fatalf("owner-transfer nudges = %d, want %d", got, b.N)
+		}
+		mw.mu.Lock()
+		families := len(mw.topologyFamilies)
+		reverse := len(mw.topologyFamilyByRepo)
+		dispatches := len(mw.topologyDispatches)
+		watchers := len(mw.gitWatchers)
+		mw.mu.Unlock()
+		if families != 0 || reverse != 0 || dispatches != 0 || watchers != 0 {
+			b.Fatalf("topology state leaked: families:%d reverse:%d dispatches:%d watchers:%d", families, reverse, dispatches, watchers)
+		}
+		if unique, duplicates, registrations := fixture.activeStats(); unique != 0 || duplicates != 0 || registrations != 0 {
+			b.Fatalf("topology paths leaked: unique:%d duplicates:%d registrations:%d", unique, duplicates, registrations)
+		}
+		b.ReportMetric(3, "inventory/op")
+		b.ReportMetric(1, "owner-transfer-nudge/op")
+	})
+
+	b.Run("retained", func(b *testing.B) {
+		fixture := newTopologyWatchFixture(b, 2)
+		mw := newTopologyRegistry()
+		oldOwner := fixture.watcher(0)
+		newOwner := fixture.watcher(1)
+		oldOwner.debounce = 0
+		newOwner.debounce = 0
+		retained := make(chan func(), 1)
+		nudged := make(chan struct{}, 1)
+		var nudges atomic.Int64
+		mw.OnWorktreeChangeContext(func(ctx context.Context, prefix, _ string) {
+			switch prefix {
+			case "repo-00":
+				_, release := mw.RetainTopologyDispatch(ctx)
+				retained <- release
+			case "repo-01":
+				nudges.Add(1)
+				nudged <- struct{}{}
+			}
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			installTopologyWatcher(mw, "repo-00", oldOwner)
+			installTopologyWatcher(mw, "repo-01", newOwner)
+			oldEpoch := topologyDispatchEpochSnapshot(b, mw, "repo-00")
+			dispatch, admitted := mw.admitWorktreeTopologyChange("repo-00", oldOwner, oldEpoch, oldOwner.repoPath)
+			if !admitted {
+				b.Fatal("old owner callback was not admitted")
+			}
+			dispatch.invoke()
+			release := <-retained
+
+			mw.mu.Lock()
+			drain := mw.unregisterTopologyWatcherLocked("repo-00")
+			delete(mw.gitWatchers, "repo-00")
+			family := mw.topologyFamilies[canonicalGitCommonDir(fixture.commonDir)]
+			if family == nil || family.owner != "" || family.dispatch != nil || family.handoff != oldEpoch {
+				mw.mu.Unlock()
+				b.Fatal("retained epoch did not enter topology handoff")
+			}
+			mw.mu.Unlock()
+			release()
+			waitTopologyDispatchDrains(drain)
+			<-nudged
+			removeTopologyWatcher(mw, "repo-01")
+		}
+		b.StopTimer()
+
+		wantInventory := int64(3 * b.N)
+		if got := fixture.inventoryCalls.Load(); got != wantInventory {
+			b.Fatalf("inventory calls = %d, want %d", got, wantInventory)
+		}
+		if got := nudges.Load(); got != int64(b.N) {
+			b.Fatalf("owner-transfer nudges = %d, want %d", got, b.N)
+		}
+		mw.mu.Lock()
+		families := len(mw.topologyFamilies)
+		reverse := len(mw.topologyFamilyByRepo)
+		dispatches := len(mw.topologyDispatches)
+		watchers := len(mw.gitWatchers)
+		mw.mu.Unlock()
+		if families != 0 || reverse != 0 || dispatches != 0 || watchers != 0 {
+			b.Fatalf("topology state leaked: families:%d reverse:%d dispatches:%d watchers:%d", families, reverse, dispatches, watchers)
+		}
+		if unique, duplicates, registrations := fixture.activeStats(); unique != 0 || duplicates != 0 || registrations != 0 {
+			b.Fatalf("topology paths leaked: unique:%d duplicates:%d registrations:%d", unique, duplicates, registrations)
+		}
+		b.ReportMetric(3, "inventory/op")
+		b.ReportMetric(1, "owner-transfer-nudge/op")
+	})
 }
 
 func BenchmarkMultiWatcherTopologyRetainedDispatch(b *testing.B) {

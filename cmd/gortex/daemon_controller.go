@@ -85,6 +85,10 @@ type realController struct {
 	// copy has no composed view. nil routes to the lifecycle's own per-family
 	// path; tests substitute it to observe the debounce.
 	probeReconcile func(familyID string)
+	// topologyReconcile is the context-aware reconciliation a topology nudge
+	// runs. Production leaves it nil and uses lifecycle; tests substitute it
+	// to exercise retained dispatch teardown without replacing that context.
+	topologyReconcile func(context.Context, string)
 	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
 	// teardown hook reads it, and reading it under mu is what kept `daemon
 	// stop` queued behind a running track / reload / enrichment. One writer
