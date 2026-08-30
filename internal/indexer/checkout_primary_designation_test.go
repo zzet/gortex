@@ -3,15 +3,18 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // TestExplicitRetrackDoesNotReelectPrimaryAfterClosure covers the durable
@@ -150,4 +153,154 @@ func TestConcurrentFirstDedicatedBindingsChooseExactlyOnePrimary(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, primaries)
+}
+
+func BenchmarkDedicatedPrimaryDesignation(b *testing.B) {
+	b.Run("first_empty_family", func(b *testing.B) {
+		lc, catalog := newPrimaryDesignationBenchmarkLifecycle(b)
+		const familyID = "benchmark-empty-family"
+		benchmarkPrimaryFamily(b, catalog, familyID, 0, false)
+		benchmarkPrimaryCheckout(b, catalog, familyID, "candidate")
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			graphID, err := lc.bindDedicatedGraph(
+				context.Background(), familyID, "candidate", "candidate",
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			if err := catalog.DeleteDedicatedGraph(context.Background(), graphID); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+		}
+	})
+
+	b.Run("surviving_family_256_graphs", func(b *testing.B) {
+		lc, catalog := newPrimaryDesignationBenchmarkLifecycle(b)
+		const familyID = "benchmark-surviving-family"
+		benchmarkPrimaryFamily(b, catalog, familyID, 256, false)
+		benchmarkPrimaryCheckout(b, catalog, familyID, "candidate")
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			graphID, err := lc.bindDedicatedGraph(
+				context.Background(), familyID, "candidate", "candidate",
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			if err := catalog.DeleteDedicatedGraph(context.Background(), graphID); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+		}
+	})
+
+	b.Run("idempotent_primary", func(b *testing.B) {
+		lc, catalog := newPrimaryDesignationBenchmarkLifecycle(b)
+		const familyID = "benchmark-idempotent-family"
+		benchmarkPrimaryFamily(b, catalog, familyID, 0, false)
+		benchmarkPrimaryCheckout(b, catalog, familyID, "candidate")
+		if _, err := lc.bindDedicatedGraph(
+			context.Background(), familyID, "candidate", "candidate",
+		); err != nil {
+			b.Fatal(err)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := lc.bindDedicatedGraph(
+				context.Background(), familyID, "candidate", "candidate",
+			); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func newPrimaryDesignationBenchmarkLifecycle(
+	b *testing.B,
+) (*CheckoutLifecycle, *store_sqlite.Catalog) {
+	b.Helper()
+	dir := b.TempDir()
+	global := &config.GlobalConfig{}
+	global.SetConfigPath(filepath.Join(dir, "config.yaml"))
+	if err := global.Save(); err != nil {
+		b.Fatal(err)
+	}
+	manager, err := config.NewConfigManager(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	store, err := store_sqlite.Open(filepath.Join(dir, "store.sqlite"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	mi := NewMultiIndexer(store, newTestRegistry(), search.NewNull(), manager, zap.NewNop())
+	lifecycle, err := NewCheckoutLifecycle(CheckoutLifecycleConfig{
+		MultiIndexer: mi, ConfigManager: manager, Graph: store, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		_ = lifecycle.Close()
+		_ = mi.Close(context.Background())
+		_ = store.Close()
+	})
+	return lifecycle, store.Catalog()
+}
+
+func benchmarkPrimaryFamily(
+	b *testing.B,
+	catalog *store_sqlite.Catalog,
+	familyID string,
+	graphs int,
+	withPrimary bool,
+) {
+	b.Helper()
+	ctx := context.Background()
+	if err := catalog.UpsertRepositoryFamily(ctx, store_sqlite.RepositoryFamily{
+		FamilyID: familyID, CommonDirIdentity: "common/" + familyID,
+		State: reconcile.FamilyStateReady, CreatedAt: 1, LastSeen: 1,
+	}); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < graphs; i++ {
+		checkoutID := fmt.Sprintf("existing-checkout-%03d", i)
+		prefix := fmt.Sprintf("existing-repo-%03d", i)
+		benchmarkPrimaryCheckout(b, catalog, familyID, checkoutID)
+		if err := catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
+			GraphID: GraphIDFor(prefix), OwnerCheckoutID: checkoutID,
+			RepoPrefix: prefix, FamilyID: familyID,
+			IsPrimaryBase: withPrimary && i == 0, State: reconcile.GraphStateReady,
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkPrimaryCheckout(
+	b *testing.B,
+	catalog *store_sqlite.Catalog,
+	familyID, checkoutID string,
+) {
+	b.Helper()
+	if err := catalog.UpsertCheckout(context.Background(), store_sqlite.Checkout{
+		CheckoutID: checkoutID, Incarnation: "incarnation-" + checkoutID,
+		FamilyID: familyID, RootPath: "/tmp/" + checkoutID,
+		GitDir: "/tmp/" + checkoutID + "/.git", AdminName: checkoutID,
+		State:         store_sqlite.CheckoutStateReady,
+		DesiredMode:   store_sqlite.CheckoutModeDedicated,
+		EffectiveMode: store_sqlite.CheckoutModeDedicated, LastSeen: 1,
+	}); err != nil {
+		b.Fatal(err)
+	}
 }
