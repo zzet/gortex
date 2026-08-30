@@ -642,7 +642,12 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		return nil, fmt.Errorf("sqlite content fts rowid backfill: %w", err)
 	}
 
-	// Apply any in-place migration steps, then stamp the current schema version.
+	// Apply any in-place migration steps. The version stamp is deliberately
+	// deferred until every migration-dependent postcondition below succeeds:
+	// core/sidecar indexes exist and an analysis snapshot produced against the
+	// old graph shape is durably invalidated. PRAGMA user_version is the next
+	// Open's sole completion marker; publishing it earlier would let a crash or
+	// failure in that tail suppress the required repair forever.
 	// Fresh and pre-versioning (stored==0) stores run the in-place steps too —
 	// they are idempotent and no-op on an empty or already-clean store — so the
 	// first in-place migration ships without forcing every non-daemon Open to
@@ -652,10 +657,6 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		if err := applyInPlaceMigrations(db, plan.inPlace, observe); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite schema migrate: %w", err)
-		}
-		if err := setUserVersion(db, current); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
 	}
 	// Both index sets are created after the pending steps, for two different
@@ -682,6 +683,15 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		if _, err := db.Exec(`DELETE FROM analysis_active_generation`); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite clear active analysis generation after migration: %w", err)
+		}
+	}
+	// The stamp is the final durable schema-transition success marker. Every
+	// preceding operation is idempotent, so an interruption before this point
+	// leaves the old version and safely retries the transition on the next Open.
+	if plan.stamp {
+		if err := setUserVersion(db, current); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
 		}
 	}
 

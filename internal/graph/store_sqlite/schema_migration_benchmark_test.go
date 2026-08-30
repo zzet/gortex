@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"testing"
 )
 
@@ -67,6 +68,51 @@ func BenchmarkRealV13ToV19StepsOnCurrentShape(b *testing.B) {
 			b.Fatal(err)
 		}
 		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkOpenV18MigrationSuccessBoundary measures the exact Open tail whose
+// ordering protects the version stamp: run v19, repair indexes, invalidate one
+// active analysis generation, and only then publish user_version=19.
+func BenchmarkOpenV18MigrationSuccessBoundary(b *testing.B) {
+	dir := b.TempDir()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		path := filepath.Join(dir, fmt.Sprintf("success-boundary-%d.sqlite", i))
+		store, err := Open(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			b.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := db.Exec(`
+INSERT INTO analysis_generations (
+    format_version, build_revision, created_at_unix, state,
+    node_count, community_count, process_count, concept_count
+) VALUES (1, 1, 1, 1, 0, 0, 0, 0);
+INSERT INTO analysis_active_generation(slot, generation_id)
+VALUES (1, last_insert_rowid());
+PRAGMA user_version = 18;`); err != nil {
+			_ = db.Close()
+			b.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
+
+		b.StartTimer()
+		migrated, err := Open(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := migrated.Close(); err != nil {
 			b.Fatal(err)
 		}
 	}

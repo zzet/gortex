@@ -601,6 +601,81 @@ func TestOpenWithInPlaceFailureDoesNotStamp(t *testing.T) {
 	})
 }
 
+// A schema version is the durable completion marker for the entire migration
+// tail, not just for its table rewrites. Inject a failure in the mandatory
+// analysis invalidation after the v19 step commits: Open must leave v18 stamped
+// so the next process retries instead of trusting an old-shape analysis cache.
+func TestOpenMigrationDoesNotStampBeforeAnalysisInvalidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("create current store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	withRawDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`
+INSERT INTO analysis_generations (
+    format_version, build_revision, created_at_unix, state,
+    node_count, community_count, process_count, concept_count
+) VALUES (1, 1, 1, 1, 0, 0, 0, 0);
+INSERT INTO analysis_active_generation(slot, generation_id)
+VALUES (1, last_insert_rowid());
+CREATE TRIGGER fail_schema_migration_analysis_invalidation
+BEFORE UPDATE OF state ON analysis_generations
+WHEN NEW.state = 2
+BEGIN
+    SELECT RAISE(ABORT, 'injected analysis invalidation failure');
+END;
+PRAGMA user_version = 18;`); err != nil {
+			t.Fatalf("seed v18 crash-boundary fixture: %v", err)
+		}
+	})
+
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "injected analysis invalidation failure") {
+		t.Fatalf("Open error = %v, want injected analysis invalidation failure", err)
+	}
+	withRawDB(t, path, func(db *sql.DB) {
+		var version, active, ready int
+		if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT COUNT(*) FROM analysis_active_generation`).Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT COUNT(*) FROM analysis_generations WHERE state = 1`).Scan(&ready); err != nil {
+			t.Fatal(err)
+		}
+		if version != 18 || active != 1 || ready != 1 {
+			t.Fatalf("failed tail left version=%d active=%d ready=%d, want 18/1/1", version, active, ready)
+		}
+		if _, err := db.Exec(`DROP TRIGGER fail_schema_migration_analysis_invalidation`); err != nil {
+			t.Fatalf("remove injected failure: %v", err)
+		}
+	})
+
+	retried, err := Open(path)
+	if err != nil {
+		t.Fatalf("retry migration: %v", err)
+	}
+	defer retried.Close()
+	var version, active, stale int
+	if err := retried.writerDB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := retried.writerDB.QueryRow(`SELECT COUNT(*) FROM analysis_active_generation`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if err := retried.writerDB.QueryRow(`SELECT COUNT(*) FROM analysis_generations WHERE state = 2`).Scan(&stale); err != nil {
+		t.Fatal(err)
+	}
+	if version != currentSchemaVersion || active != 0 || stale != 1 {
+		t.Fatalf("retry left version=%d active=%d stale=%d, want %d/0/1", version, active, stale, currentSchemaVersion)
+	}
+}
+
 // TestOpenWithMemoryUnderWipePlanStampsWithoutError: an in-memory store under a
 // plan that would wipe an on-disk DB must not attempt a file removal — it is
 // always fresh and simply stamps the current version.
