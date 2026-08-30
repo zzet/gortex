@@ -533,7 +533,7 @@ func TestStaleIncarnationCannotAdvanceOrDelete(t *testing.T) {
 	// must be refused rather than silently reverting the other actor.
 	stale := observationFrom(store_sqlite.Checkout{
 		CheckoutID: first.CheckoutID, Incarnation: first.Incarnation,
-		State: store_sqlite.CheckoutStateUnavailable,
+		RootPath: "/repo/wt", State: store_sqlite.CheckoutStateUnavailable,
 	})
 	if err := f.catalog.UpdateCheckoutObservation(ctx, stale); !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
 		t.Fatalf("stale observation = %v, want a stale guard", err)

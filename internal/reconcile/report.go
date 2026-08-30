@@ -55,6 +55,12 @@ type CheckoutReport struct {
 	AdminName string
 	// RootPath is the worktree root the pass looked at.
 	RootPath string
+	// PreviousRootPath is the catalog root this pass compared against. It is
+	// the source address runtime/config convergence must retire after a move.
+	PreviousRootPath string
+	// RootMoved is true only when this pass committed a different root under
+	// the checkout's incarnation-and-root compare-and-set guard.
+	RootMoved bool
 	// Main is true for the family's main worktree.
 	Main bool
 	// CheckoutID is the durable identity, empty for an ephemeral observation.

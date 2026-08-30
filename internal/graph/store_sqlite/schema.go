@@ -509,6 +509,26 @@ CREATE TABLE IF NOT EXISTS analysis_blobs (
 // Timestamp columns are unix seconds supplied by the caller, like
 // repo_index_state.indexed_at — no helper here reads the clock, so a guarded
 // transition is reproducible in a test.
+const checkoutRootMoveSchemaSQL = `
+-- Durable, bounded recovery marker for git-worktree root moves. Publication is in
+-- the same transaction as the checkout root CAS; deletion happens only after
+-- process runtime, configuration, and intent locators all converge.
+CREATE TABLE IF NOT EXISTS checkout_root_moves (
+    checkout_id       TEXT PRIMARY KEY
+        REFERENCES checkouts(checkout_id) ON DELETE CASCADE,
+	incarnation       TEXT NOT NULL,
+	previous_root_path TEXT NOT NULL,
+	latest_previous_root_path TEXT NOT NULL,
+	config_root_path   TEXT NOT NULL,
+	config_prepared_from_path TEXT NOT NULL DEFAULT '',
+	config_prepared_to_path TEXT NOT NULL DEFAULT '',
+	config_prepared_before_hash TEXT NOT NULL DEFAULT '',
+	config_prepared_after_hash TEXT NOT NULL DEFAULT '',
+	current_root_path  TEXT NOT NULL,
+    observed_at        INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+`
+
 const checkoutCatalogSchemaSQL = `
 CREATE TABLE IF NOT EXISTS repository_families (
     family_id           TEXT PRIMARY KEY,
@@ -552,6 +572,8 @@ CREATE TABLE IF NOT EXISTS checkouts (
     last_error                  TEXT NOT NULL DEFAULT '',
     UNIQUE (family_id, admin_name, incarnation)
 ) WITHOUT ROWID;
+
+` + checkoutRootMoveSchemaSQL + `
 
 -- Why the daemon tracks a checkout at all. Several sources may independently
 -- ask for the same checkout; the UNIQUE key makes a repeated request from one

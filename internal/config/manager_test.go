@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,7 +12,58 @@ import (
 	"pgregory.net/rapid"
 
 	"github.com/zzet/gortex/internal/excludes"
+	"github.com/zzet/gortex/internal/pathkey"
 )
+
+func TestReloadDoesNotPublishConfigReadBeforeRelocation(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	oldRoot := filepath.Join(dir, "worktree-a")
+	newRoot := filepath.Join(dir, "worktree-b")
+	require.NoError(t, os.MkdirAll(oldRoot, 0o755))
+	gc := &GlobalConfig{Repos: []RepoEntry{{Path: oldRoot, Name: "stable"}}}
+	gc.SetConfigPath(configPath)
+	require.NoError(t, gc.Save())
+
+	cm, err := NewConfigManager(configPath)
+	require.NoError(t, err)
+	require.NoError(t, os.Rename(oldRoot, newRoot))
+
+	reloadRead := make(chan struct{})
+	allowReloadPublish := make(chan struct{})
+	var blockFirst sync.Once
+	cm.reloadAfterRead = func() {
+		blockFirst.Do(func() {
+			close(reloadRead)
+			<-allowReloadPublish
+		})
+	}
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- cm.Reload() }()
+	<-reloadRead
+
+	moved, err := cm.RelocateRepoAndSaveIfPresent(
+		[]string{oldRoot}, newRoot, "stable",
+		RepoRelocationSources{TopLevel: true},
+	)
+	require.NoError(t, err)
+	require.True(t, moved)
+	close(allowReloadPublish)
+	require.NoError(t, <-reloadDone)
+
+	require.Len(t, cm.Global().Repos, 1)
+	require.True(t, pathkey.EqualPaths(
+		canonicalConfiguredPath(cm.Global().Repos[0].Path),
+		canonicalConfiguredPath(newRoot),
+	))
+	reloaded, err := LoadGlobal(configPath)
+	require.NoError(t, err)
+	require.Len(t, reloaded.Repos, 1)
+	require.True(t, pathkey.EqualPaths(
+		canonicalConfiguredPath(reloaded.Repos[0].Path),
+		canonicalConfiguredPath(newRoot),
+	))
+}
 
 // --- Unit Tests ---
 

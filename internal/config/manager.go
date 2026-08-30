@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,7 +40,12 @@ type ConfigManager struct {
 	// exclude list so EffectiveExclude — called on every indexer walk and
 	// per-file reconcile — does not re-read and re-merge on every call.
 	excludeCache *excludeCache
+	// reloadAfterRead is a deterministic test seam at the only publication
+	// race boundary in Reload. Production leaves it nil.
+	reloadAfterRead func()
 }
+
+var ErrConfigReloadSuperseded = errors.New("config: reload repeatedly superseded by a newer revision")
 
 // NewConfigManager creates a ConfigManager by loading the GlobalConfig
 // from the given path. If globalPath is empty, the default path is used.
@@ -108,6 +114,20 @@ type RepoRegistration struct {
 	Entry         RepoEntry
 	CanonicalPath string
 	Sources       []RepoEntrySource
+}
+
+// NamesAnyPath applies the same nearest-existing-ancestor canonicalization as
+// durable relocation. That matters after the leaf has moved through a macOS
+// alias: RepoRegistrations cannot resolve a vanished /tmp child by itself,
+// while the surviving /tmp ancestor still resolves to /private/tmp.
+func (registration RepoRegistration) NamesAnyPath(paths []string) bool {
+	entryRoot := canonicalConfiguredPath(registration.Entry.Path)
+	for _, candidate := range paths {
+		if pathkey.EqualPaths(entryRoot, canonicalConfiguredPath(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 // RepoRegistrations returns a lock-protected, provenance-bearing snapshot of
@@ -218,6 +238,38 @@ func (cm *ConfigManager) RepoEntries() []RepoEntry {
 	return entries
 }
 
+// RelocateRepoAndSaveIfPresent persists a worktree root move and advances the
+// manager revision only after the atomic config replacement succeeds.
+func (cm *ConfigManager) RelocateRepoAndSaveIfPresent(
+	previousRoots []string,
+	currentRoot, prefix string,
+	sources RepoRelocationSources,
+) (bool, error) {
+	if cm == nil {
+		return false, nil
+	}
+	// Keep pointer selection, atomic YAML replacement, in-memory publication,
+	// and revision advancement in one manager critical section. Otherwise a
+	// Reload that read the old file can publish its stale pointer after the move
+	// has committed and later write the dead root back to disk.
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	global := cm.global
+	if global == nil {
+		return false, nil
+	}
+	moved, err := global.RelocateRepoAndSaveIfPresent(
+		previousRoots, currentRoot, prefix, sources,
+	)
+	if err != nil {
+		return false, err
+	}
+	if moved {
+		cm.revision.Add(1)
+	}
+	return moved, nil
+}
+
 // Revision returns the current configuration epoch. It changes after every
 // successful global reload and whenever LoadWorkspaceConfig changes cached
 // per-repo state.
@@ -246,56 +298,76 @@ func (cm *ConfigManager) Revision() uint64 {
 // Every file is read before anything is published, so a concurrent
 // indexer walk never observes a config-less window.
 func (cm *ConfigManager) Reload() error {
-	cm.mu.Lock()
-	path := cm.global.ConfigPath()
-	known := make(map[string]string, len(cm.workspacePaths))
-	for prefix, repoPath := range cm.workspacePaths {
-		known[prefix] = repoPath
-	}
-	cm.mu.Unlock()
-
-	var fresh *GlobalConfig
-	var err error
-	if path != "" {
-		fresh, err = LoadGlobal(path)
-	} else {
-		fresh, err = LoadGlobal()
-	}
-	if err != nil {
-		return fmt.Errorf("reload global config: %w", err)
-	}
-
-	reread := make(map[string]*Config, len(known))
-	var dropped []string
-	for prefix, repoPath := range known {
-		cfg, authoritative := cm.readWorkspaceConfig(prefix, repoPath)
-		switch {
-		case !authoritative:
-			// Present but unreadable / malformed — keep the last good
-			// parse rather than silently downgrading the repo to global
-			// defaults on a transient I/O error or a half-saved edit.
-		case cfg == nil:
-			// The `.gortex.yaml` is gone; so are its overrides.
-			dropped = append(dropped, prefix)
-		default:
-			reread[prefix] = cfg
+	const maxReloadPublicationAttempts = 8
+	for attempt := 0; attempt < maxReloadPublicationAttempts; attempt++ {
+		cm.mu.RLock()
+		global := cm.global
+		if global == nil {
+			cm.mu.RUnlock()
+			return nil
 		}
-	}
+		path := global.ConfigPath()
+		baseRevision := cm.revision.Load()
+		known := make(map[string]string, len(cm.workspacePaths))
+		for prefix, repoPath := range cm.workspacePaths {
+			known[prefix] = repoPath
+		}
+		afterRead := cm.reloadAfterRead
+		cm.mu.RUnlock()
 
-	// Apply per prefix rather than swapping the whole map: a repo tracked
-	// concurrently with this reload must not be erased by a map snapshot
-	// taken before it existed.
-	cm.mu.Lock()
-	cm.global = fresh
-	for prefix, cfg := range reread {
-		cm.workspace[prefix] = cfg
+		var fresh *GlobalConfig
+		var err error
+		if path != "" {
+			fresh, err = LoadGlobal(path)
+		} else {
+			fresh, err = LoadGlobal()
+		}
+		if err != nil {
+			return fmt.Errorf("reload global config: %w", err)
+		}
+		if afterRead != nil {
+			afterRead()
+		}
+
+		reread := make(map[string]*Config, len(known))
+		var dropped []string
+		for prefix, repoPath := range known {
+			cfg, authoritative := cm.readWorkspaceConfig(prefix, repoPath)
+			switch {
+			case !authoritative:
+				// Present but unreadable / malformed — keep the last good
+				// parse rather than silently downgrading the repo to global
+				// defaults on a transient I/O error or a half-saved edit.
+			case cfg == nil:
+				// The `.gortex.yaml` is gone; so are its overrides.
+				dropped = append(dropped, prefix)
+			default:
+				reread[prefix] = cfg
+			}
+		}
+
+		// Apply per prefix rather than swapping the whole map: a repo tracked
+		// concurrently with this reload must not be erased by a map snapshot
+		// taken before it existed. A move that committed after our read wins;
+		// retry from its newer disk image instead of publishing stale YAML.
+		cm.mu.Lock()
+		if cm.revision.Load() != baseRevision || cm.global != global ||
+			cm.global.ConfigPath() != path {
+			cm.mu.Unlock()
+			continue
+		}
+		cm.global = fresh
+		for prefix, cfg := range reread {
+			cm.workspace[prefix] = cfg
+		}
+		for _, prefix := range dropped {
+			delete(cm.workspace, prefix)
+		}
+		cm.revision.Add(1)
+		cm.mu.Unlock()
+		return nil
 	}
-	for _, prefix := range dropped {
-		delete(cm.workspace, prefix)
-	}
-	cm.revision.Add(1)
-	cm.mu.Unlock()
-	return nil
+	return ErrConfigReloadSuperseded
 }
 
 // LoadWorkspaceConfig loads a .gortex.yaml from the given repo root

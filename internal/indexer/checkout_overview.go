@@ -706,14 +706,13 @@ func (l *CheckoutLifecycle) ReconcileFamily(ctx context.Context, familyID string
 	if err != nil {
 		return reconcile.FamilyReport{}, err
 	}
-	l.applyCoordinators(ctx, report)
-	l.scheduleFamilyRetry(report)
+	convergeErr := l.applyReconcileReport(ctx, report)
 	l.sweepRetirements(ctx)
 	if familyReportRemoved(report) {
 		l.saveConfig("reconcile")
 		l.notifyTrackedSetChanged()
 	}
-	return report, nil
+	return report, convergeErr
 }
 
 // ResolveFamilyID exposes the selector resolution the administrative surfaces

@@ -37,6 +37,7 @@ import (
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -355,14 +356,15 @@ func (r *Reconciler) reconcileKnown(
 	r.recordClassification(pass, existing, record, fresh, class)
 
 	entry := CheckoutReport{
-		AdminName:      existing.AdminName,
-		RootPath:       root,
-		Main:           existing.AdminName == gitstate.MainAdminName,
-		CheckoutID:     existing.CheckoutID,
-		Incarnation:    existing.Incarnation,
-		Durable:        true,
-		State:          existing.State,
-		Classification: class,
+		AdminName:        existing.AdminName,
+		RootPath:         root,
+		PreviousRootPath: existing.RootPath,
+		Main:             existing.AdminName == gitstate.MainAdminName,
+		CheckoutID:       existing.CheckoutID,
+		Incarnation:      existing.Incarnation,
+		Durable:          true,
+		State:            existing.State,
+		Classification:   class,
 	}
 
 	// The request starts as a copy of what is stored, so any axis a branch
@@ -426,6 +428,11 @@ func (r *Reconciler) reconcileKnown(
 		return entry, err
 	}
 	entry.State = req.State
+	entry.RootMoved = class.Disposition == DispositionPresent &&
+		!pathkey.EqualPaths(
+			pathkey.CanonicalExistingRoot(existing.RootPath),
+			pathkey.CanonicalExistingRoot(req.RootPath),
+		)
 	recordTransition(existing.State, req.State, class)
 
 	if class.Disposition == DispositionPresent {
@@ -791,6 +798,7 @@ func observationFrom(c store_sqlite.Checkout) store_sqlite.UpdateCheckoutObserva
 	return store_sqlite.UpdateCheckoutObservationRequest{
 		CheckoutID:           c.CheckoutID,
 		Incarnation:          c.Incarnation,
+		ExpectedRootPath:     c.RootPath,
 		State:                c.State,
 		RootPath:             c.RootPath,
 		GitDir:               c.GitDir,

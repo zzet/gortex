@@ -345,6 +345,28 @@ type CheckoutPathEvidence struct {
 	SampleGeneration            int64
 }
 
+// CheckoutRootMove is the O(1) recovery marker published atomically with a
+// checkout root observation. PreviousRootPath is the earliest uncompleted
+// source in one incarnation, LatestPreviousRootPath is the root displaced by
+// the newest observation, ConfigRootPath is the last atomically acknowledged
+// durable config address. ConfigPreparedFromPath/ConfigPreparedToPath bracket
+// the cross-store atomic YAML replacement: while populated, config may be at
+// either exact path and no unrelated target entry may be accepted. CurrentRootPath
+// advances across A -> B -> C independently of that prepared transition.
+type CheckoutRootMove struct {
+	CheckoutID               string
+	Incarnation              string
+	PreviousRootPath         string
+	LatestPreviousRootPath   string
+	ConfigRootPath           string
+	ConfigPreparedFromPath   string
+	ConfigPreparedToPath     string
+	ConfigPreparedBeforeHash string
+	ConfigPreparedAfterHash  string
+	CurrentRootPath          string
+	ObservedAt               int64
+}
+
 // DedicatedGraphStateReady is the persisted catalog spelling for a dedicated
 // graph that may serve queries. The catalog owns the vocabulary because SQL
 // guards must compare the same value lifecycle writers persist.
@@ -632,6 +654,11 @@ type UpdateCheckoutStateRequest struct {
 type UpdateCheckoutObservationRequest struct {
 	CheckoutID  string
 	Incarnation string
+	// ExpectedRootPath is the root spelling read with Incarnation. Git may
+	// move a worktree without changing either durable identity, so the root is
+	// a second compare-and-set token: an older A -> B observation must not
+	// overwrite a newer B -> C observation.
+	ExpectedRootPath string
 
 	State CheckoutState
 
@@ -661,6 +688,9 @@ func (r UpdateCheckoutObservationRequest) validate() error {
 	}
 	if err := requireCatalogID("incarnation", r.Incarnation); err != nil {
 		return err
+	}
+	if r.ExpectedRootPath == "" {
+		return fmt.Errorf("%w: expected_root_path is required", ErrCatalogInvalidValue)
 	}
 	return requireCatalogValue("state", r.State, checkoutStates)
 }

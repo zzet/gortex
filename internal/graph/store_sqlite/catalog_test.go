@@ -19,6 +19,7 @@ import (
 var catalogTables = []string{
 	"repository_families",
 	"checkouts",
+	"checkout_root_moves",
 	"tracking_intents",
 	"intent_transitions",
 	"checkout_path_evidence",
@@ -2125,6 +2126,7 @@ func TestCatalogObservationWriteMovesBothClocks(t *testing.T) {
 	req := UpdateCheckoutObservationRequest{
 		CheckoutID:           "wt",
 		Incarnation:          "inc-1",
+		ExpectedRootPath:     "/tmp/wt",
 		State:                CheckoutStateAvailabilityGrace,
 		RootPath:             "/moved/wt",
 		GitDir:               "/moved/wt/.git",
@@ -2182,7 +2184,8 @@ func TestCatalogObservationWriteMovesBothClocks(t *testing.T) {
 	for name, bad := range map[string]UpdateCheckoutObservationRequest{
 		"no checkout id": {Incarnation: "inc-1", State: CheckoutStateReady},
 		"no incarnation": {CheckoutID: "wt", State: CheckoutStateReady},
-		"unknown state":  {CheckoutID: "wt", Incarnation: "inc-1", State: "invented"},
+		"unknown state": {CheckoutID: "wt", Incarnation: "inc-1", ExpectedRootPath: "/tmp/wt",
+			RootPath: "/tmp/wt", State: "invented"},
 	} {
 		if err := catalog.UpdateCheckoutObservation(ctx, bad); !errors.Is(err, ErrCatalogInvalidValue) {
 			t.Errorf("%s = %v, want ErrCatalogInvalidValue", name, err)
@@ -2225,13 +2228,14 @@ func TestCatalogObservationLeavesTheModeAxisAlone(t *testing.T) {
 	// The pass writes what it observed, under an incarnation that is still
 	// current, so the write lands.
 	err = catalog.UpdateCheckoutObservation(ctx, UpdateCheckoutObservationRequest{
-		CheckoutID:     "wt",
-		Incarnation:    "inc-1",
-		State:          CheckoutStateReady,
-		RootPath:       observed.RootPath,
-		GitDir:         observed.GitDir,
-		LastAccessible: 77,
-		LastSeen:       77,
+		CheckoutID:       "wt",
+		Incarnation:      "inc-1",
+		ExpectedRootPath: observed.RootPath,
+		State:            CheckoutStateReady,
+		RootPath:         observed.RootPath,
+		GitDir:           observed.GitDir,
+		LastAccessible:   77,
+		LastSeen:         77,
 	})
 	if err != nil {
 		t.Fatalf("UpdateCheckoutObservation: %v", err)

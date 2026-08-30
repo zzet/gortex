@@ -11,6 +11,7 @@ import (
 
 	sqlite "modernc.org/sqlite"
 
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -449,7 +450,7 @@ func (c *Catalog) UpdateCheckoutObservation(ctx context.Context, req UpdateCheck
 	if err := req.validate(); err != nil {
 		return err
 	}
-	return c.execGuarded(ctx, fmt.Sprintf("checkout %s incarnation %s", req.CheckoutID, req.Incarnation), `
+	const update = `
 UPDATE checkouts
    SET state = ?,
        root_path = ?, git_dir = ?, locked = ?, prunable = ?,
@@ -457,13 +458,305 @@ UPDATE checkouts
        last_accessible = ?, unavailable_since = ?, availability_deadline = ?,
        removal_detected_at = ?, removal_deadline = ?, removal_evidence = ?,
        last_seen = ?, last_error = ?
- WHERE checkout_id = ? AND incarnation = ?`,
+	WHERE checkout_id = ? AND incarnation = ? AND root_path = ?`
+	rootMoved := !pathkey.EqualPaths(
+		pathkey.CanonicalExistingRoot(req.RootPath),
+		pathkey.CanonicalExistingRoot(req.ExpectedRootPath),
+	)
+	observedRoot := req.RootPath
+	if !rootMoved {
+		// Keep the catalog's established spelling for one physical root. An
+		// alias-only observation must not make a pending move journal's exact
+		// current-root guard impossible to complete.
+		observedRoot = req.ExpectedRootPath
+	}
+	args := []any{
 		string(req.State),
-		req.RootPath, req.GitDir, catalogBoolInt(req.Locked), catalogBoolInt(req.Prunable),
+		observedRoot, req.GitDir, catalogBoolInt(req.Locked), catalogBoolInt(req.Prunable),
 		req.HeadRef, req.HeadCommit, req.HeadTree,
 		req.LastAccessible, req.UnavailableSince, req.AvailabilityDeadline,
 		req.RemovalDetectedAt, req.RemovalDeadline, req.RemovalEvidence,
-		req.LastSeen, req.LastError, req.CheckoutID, req.Incarnation)
+		req.LastSeen, req.LastError, req.CheckoutID, req.Incarnation, req.ExpectedRootPath,
+	}
+	subject := fmt.Sprintf("checkout %s incarnation %s root %s",
+		req.CheckoutID, req.Incarnation, req.ExpectedRootPath)
+	if !rootMoved {
+		return c.execGuarded(ctx, subject, update, args...)
+	}
+
+	// A changed root and its recovery marker are one commit. Preserving the
+	// earliest displaced root across A -> B -> C lets a restart repair config
+	// still at A. Active path-bearing intents retain any partially advanced
+	// address, while current_root_path keeps stale completion from deleting the
+	// marker for C.
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := execGuardedTx(ctx, tx, subject, update, args...); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO checkout_root_moves
+  (checkout_id, incarnation, previous_root_path, latest_previous_root_path,
+	 config_root_path, config_prepared_from_path, config_prepared_to_path,
+	 config_prepared_before_hash, config_prepared_after_hash,
+	 current_root_path, observed_at)
+VALUES (?, ?, ?, ?, ?, '', '', '', '', ?, ?)
+ON CONFLICT(checkout_id) DO UPDATE SET
+  incarnation = excluded.incarnation,
+  previous_root_path = CASE
+    WHEN checkout_root_moves.incarnation = excluded.incarnation
+      THEN checkout_root_moves.previous_root_path
+    ELSE excluded.previous_root_path
+  END,
+	latest_previous_root_path = excluded.latest_previous_root_path,
+	config_root_path = CASE
+	  WHEN checkout_root_moves.incarnation = excluded.incarnation
+	    THEN checkout_root_moves.config_root_path
+	  ELSE excluded.config_root_path
+	END,
+	config_prepared_from_path = CASE
+	  WHEN checkout_root_moves.incarnation = excluded.incarnation
+	    THEN checkout_root_moves.config_prepared_from_path
+	  ELSE ''
+	END,
+	config_prepared_to_path = CASE
+	  WHEN checkout_root_moves.incarnation = excluded.incarnation
+	    THEN checkout_root_moves.config_prepared_to_path
+	  ELSE ''
+	END,
+	config_prepared_before_hash = CASE
+	  WHEN checkout_root_moves.incarnation = excluded.incarnation
+	    THEN checkout_root_moves.config_prepared_before_hash
+	  ELSE ''
+	END,
+	config_prepared_after_hash = CASE
+	  WHEN checkout_root_moves.incarnation = excluded.incarnation
+	    THEN checkout_root_moves.config_prepared_after_hash
+	  ELSE ''
+	END,
+  current_root_path = excluded.current_root_path,
+  observed_at = excluded.observed_at`,
+			req.CheckoutID, req.Incarnation, req.ExpectedRootPath,
+			req.ExpectedRootPath, req.ExpectedRootPath, req.RootPath, req.LastSeen)
+		return err
+	})
+}
+
+// GetCheckoutRootMove returns the uncompleted move marker for one checkout.
+func (c *Catalog) GetCheckoutRootMove(
+	ctx context.Context,
+	checkoutID string,
+) (CheckoutRootMove, bool, error) {
+	move := CheckoutRootMove{CheckoutID: checkoutID}
+	err := c.store.db.QueryRowContext(ctx, `
+SELECT incarnation, previous_root_path, latest_previous_root_path, config_root_path,
+       config_prepared_from_path, config_prepared_to_path,
+       config_prepared_before_hash, config_prepared_after_hash,
+       current_root_path, observed_at
+  FROM checkout_root_moves WHERE checkout_id = ?`, checkoutID).Scan(
+		&move.Incarnation, &move.PreviousRootPath, &move.LatestPreviousRootPath,
+		&move.ConfigRootPath, &move.ConfigPreparedFromPath, &move.ConfigPreparedToPath,
+		&move.ConfigPreparedBeforeHash, &move.ConfigPreparedAfterHash,
+		&move.CurrentRootPath, &move.ObservedAt)
+	if err == sql.ErrNoRows {
+		return CheckoutRootMove{}, false, nil
+	}
+	if err != nil {
+		return CheckoutRootMove{}, false, err
+	}
+	return move, true, nil
+}
+
+// ListCheckoutRootMoves returns every uncompleted root relocation. There is
+// at most one row per checkout, so startup recovery is bounded by the number
+// of live checkouts and never scans graph payload.
+func (c *Catalog) ListCheckoutRootMoves(ctx context.Context) ([]CheckoutRootMove, error) {
+	rows, err := c.store.db.QueryContext(ctx, `
+SELECT checkout_id, incarnation, previous_root_path, latest_previous_root_path,
+	   config_root_path, config_prepared_from_path, config_prepared_to_path,
+	   config_prepared_before_hash, config_prepared_after_hash,
+       current_root_path, observed_at
+  FROM checkout_root_moves ORDER BY checkout_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []CheckoutRootMove
+	for rows.Next() {
+		var move CheckoutRootMove
+		if err := rows.Scan(
+			&move.CheckoutID, &move.Incarnation, &move.PreviousRootPath,
+			&move.LatestPreviousRootPath, &move.ConfigRootPath,
+			&move.ConfigPreparedFromPath, &move.ConfigPreparedToPath,
+			&move.ConfigPreparedBeforeHash, &move.ConfigPreparedAfterHash,
+			&move.CurrentRootPath, &move.ObservedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, move)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PrepareCheckoutRootMoveConfig publishes the exact cross-store transition
+// before the YAML file is atomically replaced. A crash can therefore prove
+// that config at the target belongs to this checkout rather than an unrelated
+// entry which happened to occupy the same root. An unresolved earlier prepare
+// must be acknowledged or cleared before a newer target can replace it.
+func (c *Catalog) PrepareCheckoutRootMoveConfig(
+	ctx context.Context,
+	checkoutID, incarnation, expectedConfigRoot, targetRoot,
+	beforeHash, afterHash string,
+) error {
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("incarnation", incarnation); err != nil {
+		return err
+	}
+	if expectedConfigRoot == "" || targetRoot == "" ||
+		beforeHash == "" || afterHash == "" {
+		return fmt.Errorf("%w: prepared config root paths are required", ErrCatalogInvalidValue)
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("checkout %s prepare root move config", checkoutID), `
+UPDATE checkout_root_moves
+   SET config_prepared_from_path = ?, config_prepared_to_path = ?,
+       config_prepared_before_hash = ?, config_prepared_after_hash = ?
+ WHERE checkout_id = ? AND incarnation = ?
+   AND config_root_path = ? AND current_root_path = ?
+	   AND (config_prepared_from_path = '' OR
+	        (config_prepared_from_path = ? AND config_prepared_to_path = ?
+	         AND config_prepared_before_hash = ? AND config_prepared_after_hash = ?))`,
+		expectedConfigRoot, targetRoot, beforeHash, afterHash,
+		checkoutID, incarnation, expectedConfigRoot, targetRoot,
+		expectedConfigRoot, targetRoot, beforeHash, afterHash)
+}
+
+// ClearCheckoutRootMoveConfigPreparation records that inspection found the
+// atomic replacement did not happen. The exact prepared tuple is a CAS, so a
+// delayed recovery cannot erase a later transition.
+func (c *Catalog) ClearCheckoutRootMoveConfigPreparation(
+	ctx context.Context,
+	checkoutID, incarnation, expectedConfigRoot, preparedTarget,
+	beforeHash, afterHash string,
+) error {
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("incarnation", incarnation); err != nil {
+		return err
+	}
+	if expectedConfigRoot == "" || preparedTarget == "" ||
+		beforeHash == "" || afterHash == "" {
+		return fmt.Errorf("%w: prepared config root paths are required", ErrCatalogInvalidValue)
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("checkout %s clear root move config prepare", checkoutID), `
+UPDATE checkout_root_moves
+   SET config_prepared_from_path = '', config_prepared_to_path = '',
+       config_prepared_before_hash = '', config_prepared_after_hash = ''
+ WHERE checkout_id = ? AND incarnation = ? AND config_root_path = ?
+	   AND config_prepared_from_path = ? AND config_prepared_to_path = ?
+	   AND config_prepared_before_hash = ? AND config_prepared_after_hash = ?`,
+		checkoutID, incarnation, expectedConfigRoot,
+		expectedConfigRoot, preparedTarget, beforeHash, afterHash)
+}
+
+// AcknowledgeCheckoutRootMoveConfig records the exact root an atomic config
+// save published and clears its prepared transition. It deliberately does not
+// guard current_root_path: a later filesystem observation may advance B -> C
+// while the A -> B save is waiting to acknowledge B. The prepared tuple keeps
+// that delayed acknowledgement from overwriting newer config ownership.
+func (c *Catalog) AcknowledgeCheckoutRootMoveConfig(
+	ctx context.Context,
+	checkoutID, incarnation, expectedConfigRoot, savedConfigRoot,
+	beforeHash, afterHash string,
+) error {
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("incarnation", incarnation); err != nil {
+		return err
+	}
+	if expectedConfigRoot == "" || savedConfigRoot == "" ||
+		beforeHash == "" || afterHash == "" {
+		return fmt.Errorf("%w: config root paths are required", ErrCatalogInvalidValue)
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("checkout %s root move config", checkoutID), `
+UPDATE checkout_root_moves
+   SET config_root_path = ?,
+       config_prepared_from_path = '', config_prepared_to_path = '',
+       config_prepared_before_hash = '', config_prepared_after_hash = ''
+ WHERE checkout_id = ? AND incarnation = ? AND config_root_path = ?
+	   AND config_prepared_from_path = ? AND config_prepared_to_path = ?
+	   AND config_prepared_before_hash = ? AND config_prepared_after_hash = ?`,
+		savedConfigRoot, checkoutID, incarnation, expectedConfigRoot,
+		expectedConfigRoot, savedConfigRoot, beforeHash, afterHash)
+}
+
+// CompleteCheckoutRootMove clears only the exact marker whose current root is
+// still the checkout's durable root. Runtime convergence of B cannot clear a
+// newer B -> C marker even if it finishes later.
+func (c *Catalog) CompleteCheckoutRootMove(
+	ctx context.Context,
+	move CheckoutRootMove,
+) error {
+	if err := requireCatalogID("checkout_id", move.CheckoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("incarnation", move.Incarnation); err != nil {
+		return err
+	}
+	if move.PreviousRootPath == "" || move.LatestPreviousRootPath == "" ||
+		move.ConfigRootPath == "" ||
+		move.CurrentRootPath == "" {
+		return fmt.Errorf("%w: checkout root move paths are required", ErrCatalogInvalidValue)
+	}
+	if move.ConfigPreparedFromPath != "" || move.ConfigPreparedToPath != "" ||
+		move.ConfigPreparedBeforeHash != "" || move.ConfigPreparedAfterHash != "" {
+		return fmt.Errorf("%w: checkout root move config is still prepared", ErrCatalogInvalidValue)
+	}
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		var currentRoot, effectiveMode string
+		err := tx.QueryRowContext(ctx, `
+SELECT root_path, effective_mode FROM checkouts
+ WHERE checkout_id = ? AND incarnation = ?`,
+			move.CheckoutID, move.Incarnation).Scan(&currentRoot, &effectiveMode)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: checkout %s root move completion",
+				ErrCatalogStaleGuard, move.CheckoutID)
+		}
+		if err != nil {
+			return err
+		}
+		if currentRoot != move.CurrentRootPath {
+			return fmt.Errorf("%w: checkout %s root move completion",
+				ErrCatalogStaleGuard, move.CheckoutID)
+		}
+		if CheckoutMode(effectiveMode) == CheckoutModeDedicated && !pathkey.EqualPaths(
+			pathkey.CanonicalExistingRoot(move.ConfigRootPath),
+			pathkey.CanonicalExistingRoot(move.CurrentRootPath),
+		) {
+			return fmt.Errorf("%w: dedicated checkout %s config root %s is not current %s",
+				ErrCatalogStaleGuard, move.CheckoutID,
+				move.ConfigRootPath, move.CurrentRootPath)
+		}
+		return execGuardedTx(ctx, tx, fmt.Sprintf("checkout %s root move", move.CheckoutID), `
+DELETE FROM checkout_root_moves
+ WHERE checkout_id = ? AND incarnation = ?
+	 AND previous_root_path = ? AND latest_previous_root_path = ?
+	 AND config_root_path = ?
+	 AND config_prepared_from_path = ? AND config_prepared_to_path = ?
+	 AND config_prepared_before_hash = ? AND config_prepared_after_hash = ?
+	 AND current_root_path = ?`,
+			move.CheckoutID, move.Incarnation, move.PreviousRootPath,
+			move.LatestPreviousRootPath, move.ConfigRootPath,
+			move.ConfigPreparedFromPath, move.ConfigPreparedToPath,
+			move.ConfigPreparedBeforeHash, move.ConfigPreparedAfterHash,
+			move.CurrentRootPath)
+	})
 }
 
 // DeleteCheckout removes a checkout. Its tracking intents, in-flight intent
@@ -554,6 +847,121 @@ SELECT intent_id, source_kind, source_locator, active, created_at, revoked_at, l
 		return nil, err
 	}
 	return out, nil
+}
+
+// RelocateActiveTrackingIntentLocators moves the path-bearing intent sources
+// to a checkout's current root. Project membership locators are logical names
+// ("project:<name>"), so they deliberately stay unchanged. The checkout root
+// and incarnation are checked in the same write transaction as the intent
+// updates: an A -> B repair racing a later B -> C observation cannot stamp B
+// back into the newer checkout's intent rows.
+//
+// If repeated track calls already left an intent at currentRoot, the older
+// locator is merged into that row rather than tripping the catalog's unique
+// (checkout, source kind, locator) key. The returned count is the number of
+// stale locator rows updated or removed.
+func (c *Catalog) RelocateActiveTrackingIntentLocators(
+	ctx context.Context,
+	checkoutID, incarnation, currentRoot string,
+) (int, error) {
+	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
+		return 0, err
+	}
+	if err := requireCatalogID("incarnation", incarnation); err != nil {
+		return 0, err
+	}
+	if currentRoot == "" {
+		return 0, fmt.Errorf("%w: current_root is required", ErrCatalogInvalidValue)
+	}
+
+	moved := 0
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		var guarded int
+		err := tx.QueryRowContext(ctx, `
+SELECT 1 FROM checkouts
+ WHERE checkout_id = ? AND incarnation = ? AND root_path = ?`,
+			checkoutID, incarnation, currentRoot).Scan(&guarded)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: checkout %s incarnation %s root %s",
+				ErrCatalogStaleGuard, checkoutID, incarnation, currentRoot)
+		}
+		if err != nil {
+			return err
+		}
+
+		rows, err := tx.QueryContext(ctx, `
+SELECT intent_id, source_kind, source_locator
+  FROM tracking_intents
+ WHERE checkout_id = ? AND active = 1
+   AND source_kind IN (?, ?, ?)
+ ORDER BY source_kind, source_locator`,
+			checkoutID, string(IntentSourceCLITrack), string(IntentSourceMCPTrack),
+			string(IntentSourceManualConfig))
+		if err != nil {
+			return err
+		}
+		type staleLocator struct {
+			id, kind, locator string
+		}
+		var stale []staleLocator
+		for rows.Next() {
+			var row staleLocator
+			if err := rows.Scan(&row.id, &row.kind, &row.locator); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if row.locator != currentRoot {
+				stale = append(stale, row)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+
+		for _, row := range stale {
+			var (
+				targetID     string
+				targetActive int
+			)
+			err := tx.QueryRowContext(ctx, `
+SELECT intent_id, active FROM tracking_intents
+ WHERE checkout_id = ? AND source_kind = ? AND source_locator = ?`,
+				checkoutID, row.kind, currentRoot).Scan(&targetID, &targetActive)
+			switch {
+			case err == nil:
+				// A revoked historical row at the target is not ownership. Make
+				// it the active union member before retiring the stale source so
+				// relocation can never silently drop the explicit intent.
+				if targetActive == 0 {
+					if _, err := tx.ExecContext(ctx, `
+UPDATE tracking_intents
+   SET active = 1, revoked_at = 0, last_error = ''
+ WHERE intent_id = ?`, targetID); err != nil {
+						return err
+					}
+				}
+				if _, err := tx.ExecContext(ctx,
+					`DELETE FROM tracking_intents WHERE intent_id = ?`, row.id); err != nil {
+					return err
+				}
+			case err == sql.ErrNoRows:
+				if _, err := tx.ExecContext(ctx, `
+UPDATE tracking_intents SET source_locator = ? WHERE intent_id = ?`,
+					currentRoot, row.id); err != nil {
+					return err
+				}
+			default:
+				return err
+			}
+			moved++
+		}
+		return nil
+	})
+	return moved, err
 }
 
 // RevokeTrackingIntents atomically withdraws every active intent when, and

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,17 @@ import (
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
 )
+
+// ErrRepoRelocationSourceMissing means an authorized durable config source
+// names neither a recovery token nor the checkout's current root. Callers must
+// keep the move journal and fail closed instead of guessing by repo name.
+var ErrRepoRelocationSourceMissing = errors.New("config: moved repository source is missing")
+
+// ErrRepoRelocationTargetOccupied means an authorized source was found, but
+// another configured repository already names its destination. Relocation
+// must not collapse or overwrite that entry: a valid multi-worktree swap is
+// handled by the batch relocation API, while a lone move fails closed.
+var ErrRepoRelocationTargetOccupied = errors.New("config: moved repository target is occupied")
 
 var (
 	// globalConfigMu serialises in-memory repository-list mutations with Save,
@@ -603,6 +615,234 @@ func (gc *GlobalConfig) RemoveRepoAndSaveIfPresent(path string) (bool, error) {
 	gc.Repos = candidate.Repos
 	gc.Projects = candidate.Projects
 	return true, nil
+}
+
+// RepoRelocationSources authorizes which independent configuration
+// collections belong to a checkout. Path identity still selects the concrete
+// member; a project locator never authorizes another same-named repository.
+type RepoRelocationSources struct {
+	TopLevel bool
+	Projects map[string]struct{}
+}
+
+// RelocateRepoAndSaveIfPresent rewrites every authorized top-level and project
+// membership that names one moved physical repository. The candidate is
+// detached from the live config and atomically saved before publication, so a
+// failed write leaves the old paths intact for a later lifecycle repair.
+//
+// prefix is the already-published graph namespace. A blank Name is pinned to
+// it while the path moves, preventing a basename-changing `git worktree move`
+// from silently rotating node IDs on restart. Duplicate entries inside one
+// source collection collapse to the first moved entry; memberships in
+// different projects remain independent sources.
+func (gc *GlobalConfig) RelocateRepoAndSaveIfPresent(
+	previousRoots []string,
+	currentRoot, prefix string,
+	sources RepoRelocationSources,
+) (bool, error) {
+	if gc == nil {
+		return false, nil
+	}
+	globalConfigMu.Lock()
+	defer globalConfigMu.Unlock()
+
+	currentRoot = canonicalConfiguredPath(currentRoot)
+	if currentRoot == "" {
+		return false, fmt.Errorf("relocating repository: current root is required")
+	}
+	canonicalPrevious := make([]string, 0, len(previousRoots))
+	for _, root := range previousRoots {
+		if root = canonicalConfiguredPath(root); root != "" {
+			canonicalPrevious = append(canonicalPrevious, root)
+		}
+	}
+
+	candidate := *gc
+	var (
+		changed bool
+		err     error
+	)
+	if sources.TopLevel {
+		var converged bool
+		candidate.Repos, changed, converged, err = relocateRepoEntriesVerified(
+			gc.Repos, canonicalPrevious, currentRoot, prefix,
+		)
+		if err != nil {
+			return false, fmt.Errorf("top-level repository: %w", err)
+		}
+		if !converged {
+			return false, fmt.Errorf("%w: top-level repository", ErrRepoRelocationSourceMissing)
+		}
+	} else {
+		candidate.Repos = cloneRepoEntries(gc.Repos)
+	}
+	if gc.Projects != nil {
+		candidate.Projects = make(map[string]ProjectConfig, len(gc.Projects))
+		for name, project := range gc.Projects {
+			var projectChanged bool
+			if _, authorized := sources.Projects[name]; authorized {
+				var converged bool
+				project.Repos, projectChanged, converged, err = relocateRepoEntriesVerified(
+					project.Repos, canonicalPrevious, currentRoot, prefix,
+				)
+				if err != nil {
+					return false, fmt.Errorf("project %s: %w", name, err)
+				}
+				if !converged {
+					return false, fmt.Errorf(
+						"%w: project %s", ErrRepoRelocationSourceMissing, name,
+					)
+				}
+			} else {
+				project.Repos = cloneRepoEntries(project.Repos)
+			}
+			changed = changed || projectChanged
+			candidate.Projects[name] = project
+		}
+	}
+	for name := range sources.Projects {
+		if _, exists := gc.Projects[name]; !exists {
+			return false, fmt.Errorf(
+				"%w: project %s", ErrRepoRelocationSourceMissing, name,
+			)
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	if err := saveGlobalConfigLocked(&candidate); err != nil {
+		return false, err
+	}
+	gc.Repos = candidate.Repos
+	gc.Projects = candidate.Projects
+	return true, nil
+}
+
+func cloneRepoEntries(entries []RepoEntry) []RepoEntry {
+	if entries == nil {
+		return nil
+	}
+	out := make([]RepoEntry, len(entries))
+	copy(out, entries)
+	for i := range out {
+		out[i].Exclude = append([]string(nil), out[i].Exclude...)
+	}
+	return out
+}
+
+func relocateRepoEntries(
+	entries []RepoEntry,
+	previousRoots []string,
+	currentRoot, prefix string,
+) ([]RepoEntry, bool) {
+	out, changed, _, _ := relocateRepoEntriesVerified(
+		entries, previousRoots, currentRoot, prefix,
+	)
+	return out, changed
+}
+
+func relocateRepoEntriesVerified(
+	entries []RepoEntry,
+	previousRoots []string,
+	currentRoot, prefix string,
+) ([]RepoEntry, bool, bool, error) {
+	if entries == nil {
+		return nil, false, false, nil
+	}
+	matches := func(entry RepoEntry) bool {
+		entryRoot := canonicalConfiguredPath(entry.Path)
+		for _, previous := range previousRoots {
+			if pathkey.EqualPaths(entryRoot, previous) {
+				return true
+			}
+		}
+		return false
+	}
+
+	match := -1
+	for i, entry := range entries {
+		if matches(entry) {
+			match = i
+			break
+		}
+	}
+	if match < 0 {
+		out := cloneRepoEntries(entries)
+		return out, false, false, nil
+	}
+	for i, entry := range entries {
+		if i != match && !matches(entry) &&
+			pathkey.EqualPaths(canonicalConfiguredPath(entry.Path), currentRoot) {
+			return cloneRepoEntries(entries), false, false,
+				ErrRepoRelocationTargetOccupied
+		}
+	}
+
+	relocated := entries[match]
+	relocated.Exclude = append([]string(nil), relocated.Exclude...)
+	relocated.Path = currentRoot
+	if relocated.Name == "" && prefix != "" {
+		relocated.Name = prefix
+	}
+	changed := entries[match].Path != relocated.Path || entries[match].Name != relocated.Name
+	out := make([]RepoEntry, 0, len(entries))
+	inserted := false
+	for _, entry := range entries {
+		if matches(entry) {
+			if inserted {
+				changed = true
+				continue
+			}
+			out = append(out, relocated)
+			inserted = true
+			if entry.Path != relocated.Path || entry.Name != relocated.Name {
+				changed = true
+			}
+			continue
+		}
+		entry.Exclude = append([]string(nil), entry.Exclude...)
+		out = append(out, entry)
+	}
+	return out, changed, true, nil
+}
+
+// canonicalConfiguredPath resolves aliases even after the leaf was moved by
+// resolving the nearest surviving ancestor and appending the missing suffix.
+// This is the macOS /tmp -> /private/tmp case: once /tmp/wt-a is gone,
+// EvalSymlinks on the full old path fails, but /tmp remains authoritative.
+func canonicalConfiguredPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	abs = pathkey.NormalizeVolume(filepath.Clean(abs))
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return pathkey.NormalizeVolume(filepath.Clean(resolved))
+	}
+
+	probe := abs
+	var suffix []string
+	for {
+		if _, err := os.Stat(probe); err == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(probe)
+			if resolveErr != nil {
+				resolved = probe
+			}
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return pathkey.NormalizeVolume(filepath.Clean(resolved))
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return abs
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
+	}
 }
 
 // DedupeRepos removes tracked-repo entries that name the same directory as

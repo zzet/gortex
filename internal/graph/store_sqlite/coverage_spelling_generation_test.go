@@ -10,13 +10,13 @@ import (
 )
 
 func TestSchemaV13LineagesConvergeAtV14(t *testing.T) {
-	require.Equal(t, 19, currentSchemaVersion)
+	require.Equal(t, 20, currentSchemaVersion)
 	plan := planSchemaMigrationWith(13, currentSchemaVersion, schemaMigrations)
 	var pending []int
 	for _, migration := range plan.inPlace {
 		pending = append(pending, migration.version)
 	}
-	require.Equal(t, []int{14, 15, 16, 17, 18, 19}, pending)
+	require.Equal(t, []int{14, 15, 16, 17, 18, 19, 20}, pending)
 
 	for _, tc := range []struct {
 		name       string
@@ -357,7 +357,7 @@ func TestOpenReplaysGenerationScopedCoveragePurgeFromFeatureV18(t *testing.T) {
 		assertSQLCount(t, db, 0, `SELECT COUNT(*) FROM nodes WHERE view_gen = ? AND id = ?`, generation, doomed)
 		var version int
 		require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-		require.Equal(t, 19, version)
+		require.Equal(t, currentSchemaVersion, version)
 	})
 }
 

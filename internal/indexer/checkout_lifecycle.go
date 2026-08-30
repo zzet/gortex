@@ -228,6 +228,21 @@ type CheckoutLifecycle struct {
 	refViewRetention RefViewRetention
 	// indexBarrier is the promotion's test seam; nil in production.
 	indexBarrier func()
+	// moveMu serializes root-component quiescence through coordinator
+	// reinstallation. Without one process-wide cut, reports for two families in
+	// the same path-swap component can re-admit a watcher between another
+	// participant's stop and publication.
+	moveMu sync.Mutex
+	// moveComponentBarrier observes component transaction phases in tests. It
+	// runs with moveMu held and must not call lifecycle entry points.
+	moveComponentBarrier func(phase string, checkoutIDs []string)
+	// moveShellPublishBarrier injects a dedicated-shell publication failure in
+	// component recovery tests. Production leaves it nil.
+	moveShellPublishBarrier func(checkoutID string) error
+	// moveRebindBarrier runs after a replacement coordinator is constructed
+	// and before its final catalog guard. It is nil outside deterministic move
+	// race tests.
+	moveRebindBarrier func()
 	// baseRefreshExecute/baseRefreshDone are deterministic refresh-worker test
 	// seams. Production executes refreshDedicatedBase and records no callback.
 	baseRefreshExecute func(context.Context, dedicatedBaseRefreshRequest) error
@@ -1033,18 +1048,19 @@ func (l *CheckoutLifecycle) confirmPresent(
 		headRef, headCommit, headTree = head.Ref, head.CommitOID, head.TreeOID
 	}
 	req := store_sqlite.UpdateCheckoutObservationRequest{
-		CheckoutID:     existing.CheckoutID,
-		Incarnation:    existing.Incarnation,
-		State:          store_sqlite.CheckoutStateReady,
-		RootPath:       record.Path,
-		GitDir:         gitDirFor(inv, record),
-		Locked:         record.Locked,
-		Prunable:       record.Prunable,
-		HeadRef:        headRef,
-		HeadCommit:     headCommit,
-		HeadTree:       headTree,
-		LastAccessible: now.Unix(),
-		LastSeen:       now.Unix(),
+		CheckoutID:       existing.CheckoutID,
+		Incarnation:      existing.Incarnation,
+		ExpectedRootPath: existing.RootPath,
+		State:            store_sqlite.CheckoutStateReady,
+		RootPath:         record.Path,
+		GitDir:           gitDirFor(inv, record),
+		Locked:           record.Locked,
+		Prunable:         record.Prunable,
+		HeadRef:          headRef,
+		HeadCommit:       headCommit,
+		HeadTree:         headTree,
+		LastAccessible:   now.Unix(),
+		LastSeen:         now.Unix(),
 	}
 	if err := l.catalog.UpdateCheckoutObservation(ctx, req); err != nil {
 		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
@@ -1652,14 +1668,15 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 		}
 		out.Families++
 		out.Reports = append(out.Reports, report)
-		l.scheduleFamilyRetry(report)
+		if err := l.applyReconcileReport(ctx, report); err != nil {
+			errs = append(errs, fmt.Errorf("family %s root convergence: %w", fam.familyID, err))
+		}
 		for _, checkout := range report.Checkouts {
 			switch checkout.Action {
 			case reconcile.ActionForgotten, reconcile.ActionPrimaryClosureRetired:
 				out.Removed++
 			}
 		}
-		l.applyCoordinators(ctx, report)
 	}
 	out.Coordinators = l.liveCoordinators("")
 	out.Retired = l.sweepRetirements(ctx)
@@ -1899,8 +1916,10 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 			zap.String("family", familyID), zap.Error(err))
 		return
 	}
-	l.applyCoordinators(ctx, report)
-	l.scheduleFamilyRetry(report)
+	if err := l.applyReconcileReport(ctx, report); err != nil {
+		l.logger.Debug("checkout lifecycle: family root convergence remains pending",
+			zap.String("family", familyID), zap.Error(err))
+	}
 	if familyReportRemoved(report) {
 		l.saveConfig("reconcile")
 		l.notifyTrackedSetChanged()
@@ -3003,6 +3022,14 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	// cleanup journal exists. Drain prior-process residue during boot instead
 	// of leaving it for the hourly janitor.
 	l.sweepRetirements(ctx)
+	// A root move is catalog-authoritative before configuration is durable.
+	// Repair that address first; if the save fails, the returned stale roots
+	// make the registration pass fail closed instead of seeding a phantom
+	// checkout at the vanished pre-move path.
+	pendingMoveRoots, movePrepareErr := l.preparePendingRootMovesForSeed(ctx)
+	if movePrepareErr != nil {
+		errs = append(errs, movePrepareErr)
+	}
 
 	seeded := map[string]string{}
 	configuredRoots := map[string]struct{}{}
@@ -3010,20 +3037,30 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	unresolvedGlobalSource := false
 	if l.cfgMgr != nil {
 		registrations := l.cfgMgr.RepoRegistrations()
-		for _, registration := range registrations {
-			configuredRoots[registration.CanonicalPath] = struct{}{}
-			if _, statErr := os.Stat(registration.CanonicalPath); statErr != nil {
-				for _, source := range registration.Sources {
-					switch source.Kind {
-					case config.RepoEntrySourceGlobal:
-						unresolvedGlobalSource = true
-					case config.RepoEntrySourceProject:
-						unresolvedProjectSources[source.Locator] = struct{}{}
-					}
+		markUnresolved := func(registration config.RepoRegistration) {
+			for _, source := range registration.Sources {
+				switch source.Kind {
+				case config.RepoEntrySourceGlobal:
+					unresolvedGlobalSource = true
+				case config.RepoEntrySourceProject:
+					unresolvedProjectSources[source.Locator] = struct{}{}
 				}
 			}
 		}
 		for _, registration := range registrations {
+			if registration.NamesAnyPath(pendingMoveRoots) {
+				markUnresolved(registration)
+				continue
+			}
+			configuredRoots[registration.CanonicalPath] = struct{}{}
+			if _, statErr := os.Stat(registration.CanonicalPath); statErr != nil {
+				markUnresolved(registration)
+			}
+		}
+		for _, registration := range registrations {
+			if registration.NamesAnyPath(pendingMoveRoots) {
+				continue
+			}
 			entry := registration.Entry
 			abs := registration.CanonicalPath
 			entry.Path = abs
@@ -3089,6 +3126,13 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			}
 			seeded[identity.familyID] = abs
 		}
+	}
+	moveSeeded, moveRecoveryErr := l.recoverPendingRootMoves(ctx)
+	if moveRecoveryErr != nil {
+		errs = append(errs, moveRecoveryErr)
+	}
+	for familyID, root := range moveSeeded {
+		seeded[familyID] = root
 	}
 	if err := l.reconcileRemovedConfiguredIntents(
 		ctx, configuredRoots, unresolvedProjectSources, unresolvedGlobalSource, seeded,
@@ -3263,6 +3307,10 @@ func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ str
 // is the repository eviction the untrack path has always run — in the order
 // that path established: detach the watcher before evicting, so a late
 // filesystem event cannot re-index files whose nodes are already gone.
+type repoMoveConfigCleanup struct {
+	root string
+}
+
 func (h cleanupHooks) ReleaseGraph(
 	ctx context.Context, target reconcile.GraphReleaseTarget, finalize func() error,
 ) error {
@@ -3270,6 +3318,7 @@ func (h cleanupHooks) ReleaseGraph(
 	if err != nil {
 		return err
 	}
+	var moveCleanup *repoMoveConfigCleanup
 	if graphPresent {
 		// Capture every generation while durable ownership remains queryable.
 		h.l.oweRetirement(h.l.graphGenerations(ctx, target.GraphID)...)
@@ -3286,6 +3335,27 @@ func (h cleanupHooks) ReleaseGraph(
 			}
 		}
 	}
+	ownerCheckoutID := target.CheckoutID
+	if ownerCheckoutID == "" && graphPresent {
+		ownerCheckoutID = row.OwnerCheckoutID
+	}
+	// Capture and resolve the journal before the checkout cleanup saga can
+	// cascade-delete it. Removal uses its exact acknowledged/prepared config
+	// owner; deleting every historical path would erase a peer during a
+	// worktree swap.
+	if ownerCheckoutID != "" {
+		move, pending, moveErr := h.l.catalog.GetCheckoutRootMove(ctx, ownerCheckoutID)
+		if moveErr != nil {
+			return moveErr
+		}
+		if pending {
+			move, moveErr = h.l.resolvePreparedMoveConfigForCleanup(ctx, move)
+			if moveErr != nil {
+				return moveErr
+			}
+			moveCleanup = &repoMoveConfigCleanup{root: move.ConfigRootPath}
+		}
+	}
 	if target.RepoPrefix == "" {
 		return finalize()
 	}
@@ -3293,8 +3363,8 @@ func (h cleanupHooks) ReleaseGraph(
 	if barrier := h.l.releaseGraphBarrier; barrier != nil {
 		guardedFinalize = func() error { return barrier(ctx, target.GraphID, finalize) }
 	}
-	_, _, err = h.l.evictRepoCheckedFinalized(
-		ctx, target.RepoPrefix, target.RootPath, guardedFinalize)
+	_, _, err = h.l.evictRepoCheckedFinalizedRoots(
+		ctx, target.RepoPrefix, target.RootPath, moveCleanup, guardedFinalize)
 	if err != nil && graphPresent {
 		err = h.l.restoreGraphAfterFailedRelease(
 			ctx, row, target.CheckoutID, target.Incarnation, err)
@@ -3342,6 +3412,15 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 func (l *CheckoutLifecycle) evictRepoCheckedFinalized(
 	ctx context.Context, prefix, rootPath string, finalizeGraph func() error,
 ) (nodesRemoved, edgesRemoved int, err error) {
+	return l.evictRepoCheckedFinalizedRoots(ctx, prefix, rootPath, nil, finalizeGraph)
+}
+
+func (l *CheckoutLifecycle) evictRepoCheckedFinalizedRoots(
+	ctx context.Context,
+	prefix, rootPath string,
+	moveCleanup *repoMoveConfigCleanup,
+	finalizeGraph func() error,
+) (nodesRemoved, edgesRemoved int, err error) {
 	if prefix == "" {
 		if finalizeGraph != nil {
 			return 0, 0, finalizeGraph()
@@ -3367,7 +3446,16 @@ func (l *CheckoutLifecycle) evictRepoCheckedFinalized(
 				// spelling; the configured spelling remains the exact durable key.
 				path = meta.RootPath
 			}
-			if path != "" {
+			if moveCleanup != nil {
+				// Prepared resolution proves the one exact path currently owned by
+				// this checkout. Removing all memberships at that path tolerates
+				// revoked historical sources; a swap peer owns the opposite path.
+				if _, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(
+					moveCleanup.root,
+				); err != nil {
+					return err
+				}
+			} else if path != "" {
 				if _, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path); err != nil {
 					return err
 				}

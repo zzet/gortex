@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 19
+const currentSchemaVersion = 20
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -125,6 +125,12 @@ var schemaMigrations = []schemaMigration{
 	// Replay it after the generation re-key; the purge dispatches on schema
 	// shape and isolates every decision and delete by view_gen.
 	{version: 19, name: "replay generation-scoped legacy coverage purge", inPlace: purgeLegacyCoverageSpellings},
+	{version: 20, name: "add checkout root move recovery journal", inPlace: createCheckoutRootMoveJournal},
+}
+
+func createCheckoutRootMoveJournal(tx *sql.Tx) error {
+	_, err := tx.Exec(checkoutRootMoveSchemaSQL)
+	return err
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are
