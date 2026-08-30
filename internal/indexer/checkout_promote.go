@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"uuid"
 
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // ErrCheckoutMoved reports that a checkout changed state under an operation
@@ -186,7 +189,7 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		if err := l.ensurePromotedRepoShell(ctx, checkout, out.Prefix); err != nil {
 			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
-		if err := l.persistPromotedRepoConfig(checkout, out.Prefix); err != nil {
+		if err := l.ensurePromotionConfig(checkout, out.Prefix); err != nil {
 			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
 		if err := l.installDedicatedCoordinator(ctx, out.GraphID, checkout); err != nil {
@@ -222,6 +225,14 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		out.Prefix = l.prefixForCheckout(ctx, checkout.CheckoutID)
 	}
 	if out.Prefix == "" {
+		// A pre-publication rollback removes both the transient graph binding and
+		// its process-local repository shell. The explicit config entry is the
+		// remaining durable authority for a main worktree's stable prefix; recover
+		// it by canonical root identity so the standing transition can recreate
+		// the exact graph instead of becoming permanently un-retryable.
+		out.Prefix = l.configuredPrefixForRoot(checkout.RootPath)
+	}
+	if out.Prefix == "" {
 		return out, l.promotionFailed(ctx, &out, transition,
 			fmt.Errorf("indexer: no dedicated prefix can be derived for %s", checkout.RootPath))
 	}
@@ -251,7 +262,7 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		// the dedicated-mode recovery arm retries this process shell.
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
-	if err := l.persistPromotedRepoConfig(checkout, out.Prefix); err != nil {
+	if err := l.ensurePromotionConfig(checkout, out.Prefix); err != nil {
 		// The route owns the corpus already, so a retry may safely persist the
 		// configured entry without rebuilding or exposing generation zero.
 		return out, l.promotionFailed(ctx, &out, transition, err)
@@ -270,6 +281,99 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	// automatic siblings begin composing layers over the family's primary.
 	l.reconcileFamilyNow(ctx, checkout.FamilyID, checkout.RootPath)
 	return out, nil
+}
+
+// configuredPrefixForRoot resolves the exact durable config entry for one
+// checkout root. It is deliberately a fallback, not the primary naming path:
+// an existing graph binding remains authoritative, while this scan repairs the
+// narrow state where rollback removed that binding but retained the explicit
+// intent and config that authorize its recreation.
+func (l *CheckoutLifecycle) configuredPrefixForRoot(root string) string {
+	if l == nil || l.cfgMgr == nil || root == "" {
+		return ""
+	}
+	entries := l.cfgMgr.RepoEntries()
+	want, err := filepath.Abs(root)
+	if err != nil {
+		want = filepath.Clean(root)
+	}
+	prefixOf := func(i int) string {
+		prefix := EffectiveRepoPrefix(l.cfgMgr, entries[i])
+		if prefix != "" && prefix != "." {
+			return prefix
+		}
+		return ""
+	}
+
+	// The normal case is byte-equal or fold-equal and needs no filesystem
+	// traversal. Keep it as a first pass: this fallback may scan hundreds of
+	// configured repositories, but it should not resolve hundreds of unrelated
+	// symlink chains merely to find the exact path stored by the user.
+	for i, entry := range entries {
+		if entry.Path == "" {
+			continue
+		}
+		candidate, absErr := filepath.Abs(entry.Path)
+		if absErr != nil {
+			candidate = filepath.Clean(entry.Path)
+		}
+		if pathkey.EqualPaths(candidate, want) {
+			if prefix := prefixOf(i); prefix != "" {
+				return prefix
+			}
+		}
+	}
+
+	// Git commonly reports a canonical spelling that differs lexically from
+	// config (macOS /var -> /private/var). SameFile is the authoritative
+	// canonical-root comparison and avoids allocating full resolved paths for
+	// every non-matching entry.
+	wantInfo, statErr := os.Stat(want)
+	if statErr == nil {
+		for i, entry := range entries {
+			if entry.Path == "" {
+				continue
+			}
+			candidateInfo, candidateErr := os.Stat(entry.Path)
+			if candidateErr == nil && os.SameFile(wantInfo, candidateInfo) {
+				if prefix := prefixOf(i); prefix != "" {
+					return prefix
+				}
+			}
+		}
+		return ""
+	}
+
+	// Promotion requires an accessible root, so this is defensive support for
+	// callers inspecting an offline entry: preserve canonical lexical matching
+	// when file identity cannot be sampled.
+	want = pathkey.CanonicalExistingRoot(want)
+	for i, entry := range entries {
+		if entry.Path == "" {
+			continue
+		}
+		if pathkey.EqualPaths(pathkey.CanonicalExistingRoot(entry.Path), want) {
+			if prefix := prefixOf(i); prefix != "" {
+				return prefix
+			}
+		}
+	}
+	return ""
+}
+
+// ensurePromotionConfig persists a newly explicit checkout but leaves an
+// already-authoritative entry untouched. In particular, a configured root may
+// be stored through a filesystem alias (/var on macOS) while Git reports its
+// canonical spelling (/private/var); adding the latter would duplicate one
+// logical repository even though the retry is merely restoring its graph.
+func (l *CheckoutLifecycle) ensurePromotionConfig(
+	checkout store_sqlite.Checkout,
+	prefix string,
+) error {
+	if l.configuredPrefixForRoot(checkout.RootPath) == prefix {
+		return nil
+	}
+	return l.persistPromotedRepoConfig(checkout, prefix)
 }
 
 // checkoutSample is the state a promotion has to describe: what the checkout
