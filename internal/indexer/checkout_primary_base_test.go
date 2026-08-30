@@ -219,10 +219,66 @@ func requirePrimaryBaseUnavailable(tb testing.TB, err error) *primaryBaseUnavail
 	if !errors.As(err, &unavailable) {
 		tb.Fatalf("error type = %T (%v), want *primaryBaseUnavailableError", err, err)
 	}
-	if !unavailable.Temporary() {
-		tb.Fatalf("primary-base-unavailable error is not temporary: %v", err)
-	}
 	return unavailable
+}
+
+func TestPrimaryBaseUnavailableClassifiesStructuralLoss(t *testing.T) {
+	f := newPrimaryBaseTestFixture(t, 1)
+
+	missing := requirePrimaryBaseUnavailable(t,
+		func() error {
+			_, err := f.coordinator("graph-does-not-exist").primaryBase(f.ctx)
+			return err
+		}())
+	if missing.Temporary() || !missing.Terminal() {
+		t.Fatalf("missing graph classification = temporary:%v terminal:%v, want terminal",
+			missing.Temporary(), missing.Terminal())
+	}
+
+	graph := f.graph
+	graph.ActiveGenerationID = 0
+	f.upsertGraph(graph)
+	unpublished := requirePrimaryBaseUnavailable(t,
+		func() error {
+			_, err := f.coordinator(f.graphID).primaryBase(f.ctx)
+			return err
+		}())
+	if !unpublished.Temporary() || unpublished.Terminal() {
+		t.Fatalf("unpublished graph classification = temporary:%v terminal:%v, want temporary",
+			unpublished.Temporary(), unpublished.Terminal())
+	}
+}
+
+func BenchmarkPrimaryBaseUnavailableClassification(b *testing.B) {
+	b.Run("missing_graph_terminal", func(b *testing.B) {
+		f := newPrimaryBaseTestFixture(b, 1)
+		coordinator := f.coordinator("graph-does-not-exist")
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, err := coordinator.primaryBase(f.ctx)
+			var unavailable *primaryBaseUnavailableError
+			if !errors.As(err, &unavailable) || !unavailable.Terminal() {
+				b.Fatalf("classification = %v", err)
+			}
+		}
+	})
+	b.Run("zero_generation_temporary", func(b *testing.B) {
+		f := newPrimaryBaseTestFixture(b, 1)
+		graph := f.graph
+		graph.ActiveGenerationID = 0
+		f.upsertGraph(graph)
+		coordinator := f.coordinator(f.graphID)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, err := coordinator.primaryBase(f.ctx)
+			var unavailable *primaryBaseUnavailableError
+			if !errors.As(err, &unavailable) || !unavailable.Temporary() {
+				b.Fatalf("classification = %v", err)
+			}
+		}
+	})
 }
 
 func TestPrimaryBaseUsesDesignatedOwnerReadyGeneration(t *testing.T) {

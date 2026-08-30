@@ -875,6 +875,13 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		c.logger.Warn("checkout coordinator: reconcile failed",
 			zap.String("checkout", c.checkoutID), zap.String("root", c.root),
 			zap.String("reason", reason), zap.Error(out.Err))
+		var unavailable *primaryBaseUnavailableError
+		if errors.As(out.Err, &unavailable) && unavailable.Terminal() && c.cancelLifetime != nil {
+			// The graph identity this loop was constructed for is gone. Let the
+			// lifecycle own recovery by constructing a fresh coordinator; polling
+			// this stale identity forever only produces a warning storm.
+			c.cancelLifetime()
+		}
 	case out.CommitBuilt || out.DirtyBuilt || out.CommitReused:
 		c.logger.Debug("checkout coordinator: route updated",
 			zap.String("checkout", c.checkoutID), zap.String("reason", reason),
@@ -1294,7 +1301,7 @@ func (c *CheckoutCoordinator) abandonBuild(ctx context.Context, generationID int
 // exactly the paths the primary has edited and the checkout has not.
 func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, error) {
 	if c.graphID == "" {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"family %s has no designated primary graph", c.familyID)
 	}
 
@@ -1304,21 +1311,21 @@ func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, err
 			"load designated graph %s", c.graphID)
 	}
 	if !found {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"designated graph %s does not exist", c.graphID)
 	}
 	if designated.FamilyID != c.familyID {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"designated graph %s belongs to family %s, not %s",
 			c.graphID, designated.FamilyID, c.familyID)
 	}
 	requiresFamilyPrimary := designated.OwnerCheckoutID != c.checkoutID
 	if requiresFamilyPrimary && !designated.IsPrimaryBase {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"designated graph %s is not the family primary", c.graphID)
 	}
 	if designated.OwnerCheckoutID == "" {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"designated graph %s has no owner checkout", c.graphID)
 	}
 
@@ -1328,34 +1335,35 @@ func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, err
 			"load graph owned by checkout %s", designated.OwnerCheckoutID)
 	}
 	if !found {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"owner checkout %s has no dedicated graph", designated.OwnerCheckoutID)
 	}
 	if owned.GraphID != designated.GraphID {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"owner checkout %s resolves graph %s, not %s",
 			designated.OwnerCheckoutID, owned.GraphID, designated.GraphID)
 	}
 	if owned.FamilyID != c.familyID {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"owned graph %s belongs to family %s, not %s",
 			owned.GraphID, owned.FamilyID, c.familyID)
 	}
 	if owned.OwnerCheckoutID != designated.OwnerCheckoutID {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"owned graph %s names checkout %s, not %s",
 			owned.GraphID, owned.OwnerCheckoutID, designated.OwnerCheckoutID)
 	}
 	if requiresFamilyPrimary && !owned.IsPrimaryBase {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"owned graph %s is not the family primary", owned.GraphID)
 	}
 	return graphBase(ctx, c.catalog, owned, c.dedicatedBaseIdentity())
 }
 
 type primaryBaseUnavailableError struct {
-	reason string
-	cause  error
+	reason   string
+	cause    error
+	terminal bool
 }
 
 func (e *primaryBaseUnavailableError) Error() string {
@@ -1367,12 +1375,25 @@ func (e *primaryBaseUnavailableError) Error() string {
 
 func (e *primaryBaseUnavailableError) Unwrap() error { return e.cause }
 
-func (*primaryBaseUnavailableError) Temporary() bool { return true }
+func (e *primaryBaseUnavailableError) Temporary() bool { return e != nil && !e.terminal }
+
+// Terminal reports that the catalog identity this coordinator was built
+// against no longer exists or now describes another graph. Waiting cannot
+// repair that coordinator: lifecycle reconciliation must construct a new one
+// against the new durable identity.
+func (e *primaryBaseUnavailableError) Terminal() bool { return e != nil && e.terminal }
 
 func newPrimaryBaseUnavailable(cause error, format string, args ...any) error {
 	return &primaryBaseUnavailableError{
 		reason: fmt.Sprintf(format, args...),
 		cause:  cause,
+	}
+}
+
+func newTerminalPrimaryBaseUnavailable(format string, args ...any) error {
+	return &primaryBaseUnavailableError{
+		reason:   fmt.Sprintf(format, args...),
+		terminal: true,
 	}
 }
 
@@ -1388,7 +1409,7 @@ func graphBase(
 	desired dedicatedBaseIdentity,
 ) (primaryBase, error) {
 	if dedicated.GraphID == "" {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"dedicated graph has no graph ID")
 	}
 	if dedicated.State != reconcile.GraphStateReady {
@@ -1407,17 +1428,17 @@ func graphBase(
 			dedicated.ActiveGenerationID, dedicated.GraphID)
 	}
 	if !found {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"primary graph %s points to missing generation %d",
 			dedicated.GraphID, dedicated.ActiveGenerationID)
 	}
 	if row.GenerationID != dedicated.ActiveGenerationID {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"primary graph %s points to generation %d, catalog returned %d",
 			dedicated.GraphID, dedicated.ActiveGenerationID, row.GenerationID)
 	}
 	if row.GraphID != dedicated.GraphID {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"active generation %d belongs to graph %s, not %s",
 			row.GenerationID, row.GraphID, dedicated.GraphID)
 	}
@@ -1426,7 +1447,7 @@ func graphBase(
 		row.LayerID != dedicated.GraphID+":base" ||
 		row.CheckoutID != dedicated.OwnerCheckoutID ||
 		row.BaseGenerationID != 0 {
-		return primaryBase{}, newPrimaryBaseUnavailable(nil,
+		return primaryBase{}, newTerminalPrimaryBaseUnavailable(
 			"active generation %d for graph %s is not its full dedicated base",
 			row.GenerationID, dedicated.GraphID)
 	}

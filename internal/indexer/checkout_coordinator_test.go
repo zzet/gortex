@@ -201,7 +201,9 @@ func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorCo
 	}
 	cfg.Leases = f.leases
 	cfg.Config = config.Default().Index
-	cfg.Logger = zap.NewNop()
+	if cfg.Logger == nil {
+		cfg.Logger = zap.NewNop()
+	}
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = -1
 	}

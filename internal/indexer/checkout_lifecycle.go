@@ -1743,6 +1743,54 @@ func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback 
 // automatic lane it came from is withdrawn here. Only a coordinator ever writes
 // one, so a route under a dedicated checkout routes nothing and holds two
 // generations out of the retirement scan until it goes.
+type coordinatorGraphAdmission uint8
+
+const (
+	coordinatorGraphInvalid coordinatorGraphAdmission = iota
+	coordinatorGraphWaiting
+	coordinatorGraphPublished
+)
+
+// coordinatorGraphState distinguishes an unpublished graph that an existing
+// coordinator may safely wait for from a structurally invalid identity that
+// can never become valid for that coordinator. Most importantly, a transient
+// graph shell created during promotion is not a readable base until its exact
+// full-corpus generation has been published.
+func (l *CheckoutLifecycle) coordinatorGraphState(
+	ctx context.Context,
+	graphID string,
+	checkout store_sqlite.Checkout,
+) (coordinatorGraphAdmission, error) {
+	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		return coordinatorGraphWaiting, err
+	}
+	if !found || graph.FamilyID != checkout.FamilyID || graph.OwnerCheckoutID == "" {
+		return coordinatorGraphInvalid, nil
+	}
+	if graph.OwnerCheckoutID != checkout.CheckoutID && !graph.IsPrimaryBase {
+		return coordinatorGraphInvalid, nil
+	}
+	if graph.State != reconcile.GraphStateReady || graph.ActiveGenerationID <= 0 {
+		return coordinatorGraphWaiting, nil
+	}
+	generation, found, err := l.catalog.GetViewGeneration(ctx, graph.ActiveGenerationID)
+	if err != nil {
+		return coordinatorGraphWaiting, err
+	}
+	if !found || generation.GenerationID != graph.ActiveGenerationID ||
+		generation.GraphID != graph.GraphID || generation.CheckoutID != graph.OwnerCheckoutID ||
+		generation.OwnerKind != dedicatedBaseGenerationKind ||
+		generation.GenerationKind != dedicatedBaseGenerationKind ||
+		generation.LayerID != graph.GraphID+":base" || generation.BaseGenerationID != 0 {
+		return coordinatorGraphInvalid, nil
+	}
+	if !servableGeneration(generation.State) {
+		return coordinatorGraphWaiting, nil
+	}
+	return coordinatorGraphPublished, nil
+}
+
 func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconcile.FamilyReport) {
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
@@ -1781,6 +1829,24 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 		if graphID == "" {
 			l.dropCoordinator(entry.CheckoutID)
 			l.withdrawStaleRoute(ctx, entry.CheckoutID)
+			continue
+		}
+		admission, admissionErr := l.coordinatorGraphState(ctx, graphID, checkout)
+		if admissionErr != nil {
+			l.logger.Warn("checkout lifecycle: could not validate coordinator graph publication",
+				zap.String("checkout", checkout.CheckoutID), zap.String("graph", graphID),
+				zap.Error(admissionErr))
+			continue
+		}
+		switch admission {
+		case coordinatorGraphInvalid:
+			l.dropCoordinator(entry.CheckoutID)
+			l.withdrawStaleRoute(ctx, entry.CheckoutID)
+			continue
+		case coordinatorGraphWaiting:
+			// Keep a previously published route and its coordinator while the
+			// same graph is refreshing, but never start a new coordinator over a
+			// generation-zero promotion shell.
 			continue
 		}
 		l.ensureCoordinator(ctx, graphID, checkout)
@@ -2069,6 +2135,31 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 		l.oweRetirement(coordinator.DrainRetirements()...)
 		l.stopCheckoutWorkspaces(coordinator.root)
 	}
+}
+
+// dropCoordinatorForGraph stops only the coordinator built against graphID.
+// Promotion rollback uses the guard because the checkout may still have a
+// healthy automatic coordinator against another family primary; an old
+// rollback must never tear down that replacement.
+func (l *CheckoutLifecycle) dropCoordinatorForGraph(checkoutID, graphID string) {
+	if l == nil || checkoutID == "" || graphID == "" {
+		return
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	if coordinator == nil || coordinator.graphID != graphID {
+		l.coordMu.Unlock()
+		return
+	}
+	delete(l.coordinators, checkoutID)
+	delete(l.coordinatorHeads, checkoutID)
+	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
+	l.coordMu.Unlock()
+
+	l.dropCheckoutSourceSignalWatcher(checkoutID)
+	_ = coordinator.Close()
+	l.oweRetirement(coordinator.DrainRetirements()...)
+	l.stopCheckoutWorkspaces(coordinator.root)
 }
 
 // stopCheckoutWorkspaces stops the language servers a checkout's enrichment

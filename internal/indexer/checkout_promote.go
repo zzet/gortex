@@ -451,6 +451,11 @@ func (l *CheckoutLifecycle) rollbackPromotion(
 	if !found || checkout.Incarnation != incarnation {
 		return nil
 	}
+	// A topology reconciliation can race between transient graph binding and
+	// full-corpus publication. Stop only a coordinator admitted against this
+	// provisional graph before deleting its identity; otherwise it would poll a
+	// graph that can never return and warn forever.
+	l.dropCoordinatorForGraph(checkoutID, graphID)
 	finalize := func(*RepoMetadata) error {
 		deleted, err := l.catalog.DeleteDedicatedGraphForIncarnation(
 			ctx, graphID, checkoutID, incarnation)
