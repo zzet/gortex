@@ -453,14 +453,15 @@ func Open(path string, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return openWith(path, currentSchemaVersion, schemaMigrations, o.allowRebuild)
+	return openWithObserver(path, currentSchemaVersion, schemaMigrations, o.allowRebuild, o.migrationObserver)
 }
 
 // Option configures Open.
 type Option func(*openOptions)
 
 type openOptions struct {
-	allowRebuild bool
+	allowRebuild      bool
+	migrationObserver MigrationObserver
 }
 
 // WithRebuild permits Open to drop and recreate an on-disk database whose
@@ -475,6 +476,13 @@ type openOptions struct {
 // plan yields ErrSchemaRebuildRequired and the file is left intact, so a
 // caller that does not hold the lock cannot corrupt a live store.
 func WithRebuild() Option { return func(o *openOptions) { o.allowRebuild = true } }
+
+// WithMigrationObserver reports in-place schema migration boundaries while
+// Open is reconciling an existing store. The callback is synchronous and must
+// return promptly. It is not called when the store is already current.
+func WithMigrationObserver(observer MigrationObserver) Option {
+	return func(o *openOptions) { o.migrationObserver = observer }
+}
 
 // ErrSchemaRebuildRequired is returned by Open when an on-disk database needs a
 // destructive rebuild but the caller did not pass WithRebuild (i.e. cannot
@@ -506,6 +514,10 @@ func configureConnectionPool(db *sql.DB) {
 }
 
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
+	return openWithObserver(path, current, migrations, allowRebuild, nil)
+}
+
+func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
 	// embedded tradeoff. cache_size(-32768) gives each pooled connection a
 	// 32 MiB page cache; temp_store(MEMORY) keeps GROUP BY / ORDER BY scratch
@@ -637,7 +649,7 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
 	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
-		if err := applyInPlaceMigrations(db, plan.inPlace); err != nil {
+		if err := applyInPlaceMigrations(db, plan.inPlace, observe); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite schema migrate: %w", err)
 		}

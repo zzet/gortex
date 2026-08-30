@@ -204,6 +204,8 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		return spawnDetachedDaemon(detachedDaemonArgs(cmd.Flags(), daemonStartAcceptedFlags()))
 	}
 	logger := newLogger()
+	startupReporter := newDaemonStartupReporter(logger)
+	defer startupReporter.Stop()
 
 	// Raise the per-process file-descriptor cap as early as possible.
 	// fsnotify holds one FD per watched directory on Linux and one FD
@@ -232,8 +234,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// warmupDaemonState below so the socket opens immediately instead
 	// of waiting 30–60s for contract re-extraction across every tracked
 	// repo.
-	state, err := buildDaemonState(logger)
+	state, err := buildDaemonState(logger, startupReporter.ObserveMigration)
 	if err != nil {
+		startupReporter.Fail(err)
 		return fmt.Errorf("build daemon state: %w", err)
 	}
 
@@ -505,17 +508,14 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	defer stopJanitor()
 
 	if err := srv.Listen(); err != nil {
+		startupReporter.Fail(err)
 		return err
 	}
-	// Publish the choices an out-of-band CLI cannot otherwise discover. The
-	// store path is the one that matters: `gortex repos` reads the freshness
-	// rows straight out of the store file, and a daemon started with
-	// --backend-path put them somewhere the platform default does not name.
-	// Advisory — a daemon that cannot write its record still serves, callers
-	// just fall back to the default path.
-	if err := daemon.WriteRuntimeState(daemon.RuntimeState{BackendPath: state.backendPath}); err != nil {
-		logger.Warn("daemon: could not record runtime state", zap.Error(err))
-	}
+	// The socket remains the authoritative readiness signal. The runtime
+	// record now transitions from pre-socket progress to serving only after
+	// Listen succeeds, and keeps the resolved backend path for out-of-band
+	// readers such as `gortex repos`.
+	startupReporter.Serving(state.backendPath)
 	fmt.Fprintf(cmd.ErrOrStderr(),
 		"[gortex daemon] listening on %s (pid %d)\n",
 		daemon.SocketPath(), os.Getpid())
@@ -876,15 +876,15 @@ func spawnDetachedDaemon(childArgs []string) error {
 		sp.Start("Waiting for daemon socket")
 	}
 
-	// Wait until the socket is live or a timeout hits, so we fail fast
-	// if the child died on startup. The socket opens after buildDaemonState
-	// finishes opening the store, which on a large workspace can take
-	// 10–20 s — 5 s used to time out a perfectly healthy daemon mid-load.
-	// 60 s comfortably covers the biggest stores we see while still
-	// failing fast on a child that crashed outright (those die in well
-	// under a second).
+	// Wait until the socket is live or startup stops making progress. Store
+	// migrations run before Listen and can legitimately exceed a minute on a
+	// large existing database. The child publishes a PID-bound heartbeat while
+	// opening/migrating, so fresh progress extends the inactivity deadline;
+	// missing or stale progress still fails in 60 seconds.
 	start := time.Now()
-	deadline := start.Add(60 * time.Second)
+	const startupInactivityTimeout = 60 * time.Second
+	const startupProgressFreshness = 10 * time.Second
+	deadline := start.Add(startupInactivityTimeout)
 	for time.Now().Before(deadline) {
 		if daemon.IsRunning() {
 			elapsed := time.Since(start).Truncate(10 * time.Millisecond)
@@ -898,8 +898,15 @@ func spawnDetachedDaemon(childArgs []string) error {
 			}
 			return nil
 		}
+		st, stateOK := daemon.ReadRuntimeState()
+		if phase, active := daemonStartupProgress(st, stateOK, child.Process.Pid, time.Now(), startupProgressFreshness); active {
+			deadline = time.Now().Add(startupInactivityTimeout)
+			if sp != nil {
+				sp.Set("", fmt.Sprintf("%s · %s", phase, time.Since(start).Truncate(100*time.Millisecond)))
+			}
+		}
 		// Bail out early if the child has already exited — no point
-		// waiting another 59 seconds for a corpse.
+		// waiting for an exited process's heartbeat to expire.
 		select {
 		case werr := <-exited:
 			failMsg := fmt.Errorf("daemon exited during startup (%v); check %s",
@@ -910,16 +917,23 @@ func spawnDetachedDaemon(childArgs []string) error {
 			return failMsg
 		default:
 		}
-		if sp != nil {
-			sp.Set("", fmt.Sprintf("opening store · %s", time.Since(start).Truncate(100*time.Millisecond)))
-		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	timeoutErr := fmt.Errorf("daemon did not come up within 60s; check %s", daemon.LogFilePath())
+	timeoutErr := fmt.Errorf("daemon startup made no progress for 60s; check %s", daemon.LogFilePath())
 	if sp != nil {
 		sp.Fail(timeoutErr)
 	}
 	return timeoutErr
+}
+
+func daemonStartupProgress(st daemon.RuntimeState, ok bool, childPID int, now time.Time, freshness time.Duration) (string, bool) {
+	if !ok || st.PID != childPID || !st.StartupProgressFresh(now, freshness) {
+		return "", false
+	}
+	if st.StartupPhase == daemon.StartupMigrating {
+		return fmt.Sprintf("migrating schema v%d (%s)", st.MigrationVersion, st.MigrationName), true
+	}
+	return "opening store", true
 }
 
 // newDaemonSpawnSpinner returns a spinner bound to w when it's a TTY (and the

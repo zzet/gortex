@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // Schema versioning for the graph store.
@@ -49,6 +50,33 @@ type schemaMigration struct {
 	inPlace func(tx *sql.Tx) error
 	rebuild bool
 }
+
+// MigrationPhase identifies one observable boundary in an in-place schema
+// migration. Observers are advisory: they must not block the migration or
+// mutate the graph database.
+type MigrationPhase string
+
+const (
+	MigrationStarted  MigrationPhase = "started"
+	MigrationFinished MigrationPhase = "finished"
+	MigrationFailed   MigrationPhase = "failed"
+)
+
+// MigrationProgress describes one schema migration step. Elapsed is measured
+// from the start of the current step and Error is populated only for a failed
+// step. The error is intended for logs and transient startup state; callers
+// should avoid persisting it as durable graph data.
+type MigrationProgress struct {
+	Version int
+	Name    string
+	Phase   MigrationPhase
+	Elapsed time.Duration
+	Error   error
+}
+
+// MigrationObserver receives synchronous migration boundaries. It may be nil.
+// Implementations should return promptly; a slow observer delays store Open.
+type MigrationObserver func(MigrationProgress)
 
 // schemaMigrations is the ordered, forward-only registry. Version 1 is the
 // implicit baseline (no entry): a v1 store is reconciled entirely by schemaSQL's
@@ -923,9 +951,13 @@ func setUserVersion(db *sql.DB, v int) error {
 }
 
 // applyInPlaceMigrations runs the in-place steps in a single transaction.
-func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration) error {
+func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...MigrationObserver) error {
 	if len(steps) == 0 {
 		return nil
+	}
+	var observe MigrationObserver
+	if len(observers) > 0 {
+		observe = observers[0]
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -933,8 +965,29 @@ func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration) error {
 	}
 	defer func() { _ = tx.Rollback() }() // no-op once Commit succeeds
 	for _, m := range steps {
+		started := time.Now()
+		if observe != nil {
+			observe(MigrationProgress{Version: m.version, Name: m.name, Phase: MigrationStarted})
+		}
 		if err := m.inPlace(tx); err != nil {
+			if observe != nil {
+				observe(MigrationProgress{
+					Version: m.version,
+					Name:    m.name,
+					Phase:   MigrationFailed,
+					Elapsed: time.Since(started),
+					Error:   err,
+				})
+			}
 			return fmt.Errorf("schema migration v%d (%s): %w", m.version, m.name, err)
+		}
+		if observe != nil {
+			observe(MigrationProgress{
+				Version: m.version,
+				Name:    m.name,
+				Phase:   MigrationFinished,
+				Elapsed: time.Since(started),
+			})
 		}
 	}
 	return tx.Commit()

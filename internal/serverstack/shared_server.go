@@ -76,14 +76,15 @@ type SharedServerConfig struct {
 	Watch       bool   // filesystem watcher / incremental reindex
 
 	// Entry-point-resolved options (not part of the authoritative surface).
-	Config         *config.Config       // loaded .gortex.yaml (required)
-	Global         *config.GlobalConfig // loaded ~/.gortex/config.yaml
-	Logger         *zap.Logger
-	Version        string
-	Embedder       EmbedderRequest
-	SideStores     SideStores
-	ScopeWorkspace string
-	ScopeProject   string
+	Config            *config.Config       // loaded .gortex.yaml (required)
+	Global            *config.GlobalConfig // loaded ~/.gortex/config.yaml
+	Logger            *zap.Logger
+	Version           string
+	MigrationObserver store_sqlite.MigrationObserver
+	Embedder          EmbedderRequest
+	SideStores        SideStores
+	ScopeWorkspace    string
+	ScopeProject      string
 	// ActiveProject names the project the MCP server should start scoped
 	// to (multi-repo mode hint). Empty leaves it unset.
 	ActiveProject string
@@ -291,7 +292,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 	// allowRebuild is gated on actually holding the store lock: only then may
 	// the sqlite backend drop and recreate an incompatible-schema DB.
-	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, logger, storeLockHeld)
+	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, logger, storeLockHeld, cfg.MigrationObserver)
 	if err != nil {
 		return nil, err
 	}
