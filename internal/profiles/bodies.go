@@ -63,6 +63,17 @@ var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work. Call
 
 `)
 
+// sectionWorktreeViews teaches agents the ownership boundary that keeps
+// ordinary linked-worktree use cheap. It is shared by every profile so a lean
+// session cannot accidentally turn an automatic overlay into a dedicated graph.
+var sectionWorktreeViews = bt(`## Worktree views
+
+- CWD selects one coherent view. Implicit linked worktrees become overlays automatically; use §track§ only for a user-requested dedicated graph.
+- An overlay shadows matching primary symbols; it does not union incompatible branches.
+- A labeled §view_building§ fallback is read-only; exact-file and edit operations await a ready route. Never restart the daemon, delete its store, or re-track merely to expose a worktree.
+
+`)
+
 var sectionFullRuleTable = bt(`| Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|
 | Explicitly named file to read / review / summarize | First new-task read: §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§ |
@@ -142,6 +153,7 @@ func coreBody() string {
 	return sectionHeader(false) +
 		sectionCompactWorkflow +
 		sectionCompactMemory +
+		sectionWorktreeViews +
 		sectionDiscovery("core", compactSurfaceLine)
 }
 
@@ -155,6 +167,7 @@ func fullBody() string {
 		sectionMCPRequired +
 		sectionReadDiscipline +
 		sectionMemoryFull +
+		sectionWorktreeViews +
 		sectionDiscovery("full", fullSurfaceLine)
 }
 
@@ -195,6 +208,7 @@ func localizationBody() string {
 	return sectionHeader(true) +
 		sectionCompactWorkflow +
 		sectionCompactMemory +
+		sectionWorktreeViews +
 		bt(`**Reference:** call §capabilities§ for an exact operation schema; use §gortex://guide§ only for deeper background.
 `) + switchBullet("localization", true)
 }

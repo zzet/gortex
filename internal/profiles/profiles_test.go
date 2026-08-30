@@ -16,9 +16,9 @@ import (
 // gets slack for its longer surface description only; localization is
 // the diet profile and must stay under 2 KiB (~0.45k tokens).
 var bodyByteCeilings = map[string]int{
-	"core":         3072,
+	"core":         3584,
 	"full":         6912,
-	"localization": 2304,
+	"localization": 2688,
 }
 
 func TestProfileBodyByteCeilings(t *testing.T) {
@@ -52,6 +52,10 @@ var positioningCues = []string{
 	"explore",
 	"Gortex MCP integration failure",
 	"Do not start a daemon",
+	"Implicit linked worktrees become overlays automatically",
+	"user-requested dedicated graph",
+	"view_building",
+	"Never restart the daemon, delete its store, or re-track",
 	"gortex instructions switch",
 	"NEW sessions only",
 }
