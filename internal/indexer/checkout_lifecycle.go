@@ -2650,20 +2650,63 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			identity, err := l.recordCheckout(ctx, prefix, abs, TrackSourceConfig, true)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("seed %s: %w", abs, err))
+				continue
 			}
-			if identity.familyID != "" {
-				if _, present := seeded[identity.familyID]; !present {
-					seeded[identity.familyID] = abs
+			if identity.familyID == "" || identity.checkoutID == "" {
+				continue
+			}
+
+			// Config entries are explicit intent. Replay the same promotion path
+			// Register uses instead of publishing an empty graph_ready shell and
+			// starting its automatic siblings against a missing primary base.
+			// TrackSourceImplicit is deliberate: recordCheckout restored the one
+			// config intent above, so promotion must not mint a duplicate intent.
+			promoted, run, promoteErr := l.startPromoteCheckout(
+				ctx, identity.checkoutID, TrackSourceImplicit,
+			)
+			if promoteErr == nil && run != nil {
+				gate := l.buildGate()
+				if gate == nil || gate.IsOpen() {
+					outcome, waitErr := waitModeTransition(ctx, run)
+					if waitErr != nil {
+						promoteErr = waitErr
+					} else {
+						promoted = outcome.promotion
+						promoteErr = outcome.err
+					}
 				}
 			}
+			if promoteErr != nil {
+				errs = append(errs, fmt.Errorf("seed promotion %s: %w", abs, promoteErr))
+				continue
+			}
+			if run != nil && promoted.GraphID == "" {
+				// The closed startup gate owns this pending promotion. Its worker
+				// reconciles the family after atomically publishing the base and
+				// route; doing it here would start every automatic coordinator in
+				// an unservable `no active generation` retry loop.
+				continue
+			}
+			if run == nil && promoted.GraphID != "" {
+				// A durable dedicated route survived the restart. Restore only its
+				// process-local shell; TrackRepoCtx recognizes route ownership and
+				// performs no physical corpus build on the warm path.
+				entry.Path = abs
+				entry.Name = promoted.Prefix
+				if _, restoreErr := l.mi.TrackRepoCtx(ctx, entry); restoreErr != nil {
+					errs = append(errs, fmt.Errorf("seed restore %s: %w", abs, restoreErr))
+					continue
+				}
+			}
+			seeded[identity.familyID] = abs
 		}
 	}
 	if err := l.resumeModeTransitions(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	// The seeded families are reconciled once here rather than at the janitor's
-	// first tick, so a restart's automatic checkouts get their coordinators
-	// back within the boot rather than within the hour.
+	// Only families whose primary route is already servable reconcile here.
+	// Pending cold promotions reconcile from their transition worker after the
+	// active base publication, never against an empty graph_ready shell.
 	for familyID, probeDir := range seeded {
 		l.reconcileFamilyNow(ctx, familyID, probeDir)
 	}

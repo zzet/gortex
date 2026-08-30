@@ -994,14 +994,9 @@ func TestCheckoutLifecycleSweepReachesAConfiguredButUnindexedRepo(t *testing.T) 
 	assert.Zero(t, held.RemovalDetectedAt, "an outage never starts the removal clock")
 }
 
-// TestCheckoutLifecycleSeedIsIdempotent runs the startup path twice and
-// asserts the second pass mints nothing the first already minted.
-//
-// Seeding is a migration followed by the boot reconciliation. The migration
-// half must leave an existing identity exactly as it found it — a re-keyed
-// checkout or a second intent per restart is the bug this guards — while the
-// reconciliation half is an observation and moves the clocks and the path
-// sample it takes, exactly as the janitor's pass does an hour later.
+// TestCheckoutLifecycleSeedIsIdempotent covers both halves of configured
+// startup: a cold seed publishes exactly one immutable primary corpus, while a
+// warm seed restores the durable route without another physical build.
 func TestCheckoutLifecycleSeedIsIdempotent(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
@@ -1012,36 +1007,126 @@ func TestCheckoutLifecycleSeedIsIdempotent(t *testing.T) {
 	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: root, Name: "seed-repo"}))
 	require.NoError(t, gc.Save())
 
+	coldBuilds := make(chan struct{}, 4)
+	f.lc.indexBarrier = func() { coldBuilds <- struct{}{} }
 	require.NoError(t, f.lc.Seed(ctx))
+	require.Len(t, coldBuilds, 1,
+		"cold configured startup performs one physical immutable corpus build")
+
 	first := f.checkoutOf("seed-repo")
 	firstEvidence, present, err := f.catalog.GetCheckoutPathEvidence(ctx, first.CheckoutID)
 	require.NoError(t, err)
 	require.True(t, present)
-	assert.Nil(t, f.mi.GetMetadata("seed-repo"), "seeding records identity, it does not index")
+	require.Equal(t, store_sqlite.CheckoutModeDedicated, first.EffectiveMode)
+	firstGraph := f.familyOf("seed-repo")
+	require.Positive(t, firstGraph.ActiveGenerationID,
+		"the primary graph is not servable until its immutable base is published")
+	firstRoute, routed, err := f.catalog.GetCheckoutRoute(ctx, first.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, routed)
+	require.Equal(t, firstGraph.GraphID, firstRoute.GraphID)
+	require.NotNil(t, f.mi.GetMetadata("seed-repo"),
+		"seeding restores the process-local shell for the published route")
 
+	intents, err := f.catalog.ListTrackingIntents(ctx, first.CheckoutID)
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "promotion reuses the config intent instead of duplicating it")
+	require.Equal(t, TrackSourceConfig, intents[0].SourceKind)
+
+	// A real warm restart rebuilds every process-local object over the same
+	// store and config. The durable base and route must be reused as-is.
+	f.restart()
+	warmBuilds := make(chan struct{}, 4)
+	f.lc.indexBarrier = func() { warmBuilds <- struct{}{} }
 	f.clock.advance(time.Hour)
 	require.NoError(t, f.lc.Seed(ctx))
+	require.Empty(t, warmBuilds,
+		"unchanged warm startup performs zero physical corpus builds")
+
 	second := f.checkoutOf("seed-repo")
-	secondEvidence, _, err := f.catalog.GetCheckoutPathEvidence(ctx, second.CheckoutID)
+	secondGraph := f.familyOf("seed-repo")
+	secondRoute, routed, err := f.catalog.GetCheckoutRoute(ctx, second.CheckoutID)
 	require.NoError(t, err)
+	require.True(t, routed)
+	secondEvidence, present, err := f.catalog.GetCheckoutPathEvidence(ctx, second.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, present)
 
 	assert.Equal(t, first.CheckoutID, second.CheckoutID, "the identity is reused, not minted again")
 	assert.Equal(t, first.Incarnation, second.Incarnation, "the row is not re-keyed")
+	assert.Equal(t, firstGraph.ActiveGenerationID, secondGraph.ActiveGenerationID,
+		"warm startup keeps the published immutable base")
+	assert.Equal(t, firstRoute, secondRoute, "warm startup keeps the exact route epoch and layers")
 	assert.Equal(t, first.AdminName, second.AdminName)
 	assert.Equal(t, first.RootPath, second.RootPath)
-	assert.Equal(t, first.State, second.State)
-	assert.Equal(t, first.DesiredMode, second.DesiredMode)
-	assert.Equal(t, first.EffectiveMode, second.EffectiveMode)
 	assert.Zero(t, second.UnavailableSince, "a reachable root starts no availability clock")
 	assert.Zero(t, second.RemovalDetectedAt, "a reachable root starts no removal clock")
-
 	assert.Equal(t, firstEvidence.CheckoutID, secondEvidence.CheckoutID)
 	assert.Equal(t, firstEvidence.RootPathIdentity, secondEvidence.RootPathIdentity,
 		"the sample still describes the same root")
 
-	intents, err := f.catalog.ListTrackingIntents(ctx, first.CheckoutID)
+	intents, err = f.catalog.ListTrackingIntents(ctx, second.CheckoutID)
 	require.NoError(t, err)
 	assert.Len(t, intents, 1, "the intent is upserted on its source key, not duplicated")
+}
+
+func TestCheckoutLifecycleSeedDefersAutomaticWorktreesUntilPrimaryPublication(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+
+	main := f.gitRepo("seed-gated-main")
+	linked := f.worktreeOf(main, "seed-gated-linked")
+	gc := f.cm.Global()
+	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: main, Name: "seed-gated-main"}))
+	require.NoError(t, gc.Save())
+	// Model watcher discovery that raced ahead of cold primary publication.
+	// Discovery owns Git topology scanning; this test starts after that boundary
+	// with an already-durable automatic checkout and exercises publication only.
+	inv, err := gitstate.Inventory(ctx, linked)
+	require.NoError(t, err)
+	familyID := FamilyIDFor(inv.CommonDir)
+	require.NoError(t, f.lc.upsertFamily(ctx, familyID, inv.CommonDir, f.clock.Now().Unix()))
+	record := recordForRoot(inv, linked)
+	require.NotNil(t, record)
+	automatic, err := f.lc.allocateCheckout(ctx, familyID, linked, record, inv, f.clock.Now())
+	require.NoError(t, err)
+	require.Equal(t, store_sqlite.CheckoutModeAutomatic, automatic.EffectiveMode)
+
+	gate := NewViewBuildGate()
+	f.lc.SetBuildGate(gate)
+	builds := make(chan struct{}, 4)
+	f.lc.indexBarrier = func() { builds <- struct{}{} }
+
+	require.NoError(t, f.lc.Seed(ctx))
+	primary := f.familyOf("seed-gated-main")
+	require.Zero(t, primary.ActiveGenerationID)
+	require.Empty(t, builds, "the closed startup gate admits no physical build")
+	require.Zero(t, f.lc.LiveCoordinators(primary.FamilyID),
+		"automatic worktrees must not start against an unpublished primary")
+	checkouts, err := f.catalog.ListCheckouts(ctx, primary.FamilyID)
+	require.NoError(t, err)
+	require.Len(t, checkouts, 2,
+		"the discovered automatic identity is retained while its coordinator waits")
+
+	gate.Open()
+	require.Eventually(t, func() bool {
+		graph, found, graphErr := f.catalog.GetDedicatedGraph(ctx, primary.GraphID)
+		return graphErr == nil && found && graph.ActiveGenerationID > 0
+	}, 5*time.Second, 10*time.Millisecond, "primary promotion did not publish")
+	require.Len(t, builds, 1, "opening startup admits exactly one primary corpus build")
+
+	retained, found, err := f.catalog.GetCheckout(ctx, automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, linked, retained.RootPath)
+	require.Equal(t, store_sqlite.CheckoutModeAutomatic, retained.EffectiveMode,
+		"publication must route the pre-discovered checkout without changing its ownership mode")
+	require.Eventually(t, func() bool {
+		route, routed, routeErr := f.catalog.GetCheckoutRoute(ctx, automatic.CheckoutID)
+		return routeErr == nil && routed && route.GraphID == primary.GraphID && route.State == store_sqlite.RouteActive
+	}, 5*time.Second, 10*time.Millisecond,
+		"automatic worktree never received a composed primary route")
 }
 
 // TestCheckoutLifecycleSeedReusesDedicatedGraphOwnedUnderPreviousPrefix covers

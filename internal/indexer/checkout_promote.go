@@ -200,6 +200,10 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID, transition.TransitionID); err != nil {
 			return out, err
 		}
+		// Cold Seed deliberately withholds automatic siblings until the
+		// primary graph is servable. A recovered promotion owns the handoff:
+		// publish first, then admit the rest of the family.
+		l.reconcileFamilyNow(ctx, checkout.FamilyID, checkout.RootPath)
 		return out, nil
 	}
 	if checkout.State != store_sqlite.CheckoutStateReady {
@@ -262,6 +266,9 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		l.logger.Warn("checkout lifecycle: could not release the promotion journal",
 			zap.String("checkout", checkout.CheckoutID), zap.Error(err))
 	}
+	// The active base and owner route are durable now. Only at this point may
+	// automatic siblings begin composing layers over the family's primary.
+	l.reconcileFamilyNow(ctx, checkout.FamilyID, checkout.RootPath)
 	return out, nil
 }
 

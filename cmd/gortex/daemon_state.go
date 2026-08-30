@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
@@ -416,6 +417,29 @@ func rotateColdInternGeneration(logger *zap.Logger, phase string) int {
 	return released
 }
 
+// legacyWarmupRepos partitions configured repositories by startup owner.
+// Reachable Git checkouts are explicit lifecycle intent: Seed has already
+// queued or restored their dedicated promotion, so sending them through the
+// legacy generation-0 TrackRepoCtx/ReconcileRepoCtx loop would parse the same
+// corpus twice and retain both copies. Non-Git roots keep the historical
+// warmup path unchanged. An inaccessible or malformed Git checkout also stays
+// on the legacy side so a failed inventory cannot silently suppress its only
+// indexing attempt.
+func legacyWarmupRepos(ctx context.Context, lifecycle *indexer.CheckoutLifecycle, repos []config.RepoEntry) (legacy []config.RepoEntry, lifecycleManaged int) {
+	if lifecycle == nil {
+		return repos, 0
+	}
+	legacy = make([]config.RepoEntry, 0, len(repos))
+	for _, entry := range repos {
+		if _, err := gitstate.Inventory(ctx, entry.Path); err == nil {
+			lifecycleManaged++
+			continue
+		}
+		legacy = append(legacy, entry)
+	}
+	return legacy, lifecycleManaged
+}
+
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state == nil {
@@ -533,6 +557,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.Int("python_repos", pythonRepos),
 			zap.Int("pool_size", poolSize))
 	}
+	configuredRepos := len(repos)
+	var lifecycleManaged int
+	repos, lifecycleManaged = legacyWarmupRepos(ctx, state.lifecycle, repos)
+	logger.Info("daemon: warmup ownership partition",
+		zap.Int("configured_repos", configuredRepos),
+		zap.Int("lifecycle_managed_git", lifecycleManaged),
+		zap.Int("legacy_jobs", len(repos)))
+
 	// Bounded worker pool — disk I/O dominates parsing for most repos,
 	// but a few CPU-heavy ones overlap with disk waits on others. NumCPU
 	// gives good throughput on local SSDs without thrashing slow
