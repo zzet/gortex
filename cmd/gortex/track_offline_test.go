@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // TestTrack_OfflineSucceeds asserts the offline-safe guarantee: with
@@ -38,7 +39,7 @@ func TestTrack_OfflineSucceeds(t *testing.T) {
 	}
 	found := false
 	for _, r := range gc.Repos {
-		if abs, _ := filepath.Abs(r.Path); abs == repo {
+		if pathkey.SamePathIdentity(r.Path, repo) {
 			found = true
 		}
 	}
@@ -69,7 +70,7 @@ func TestTrack_OfflineIdempotent(t *testing.T) {
 	gc, _ := config.LoadGlobal()
 	count := 0
 	for _, r := range gc.Repos {
-		if abs, _ := filepath.Abs(r.Path); abs == repo {
+		if pathkey.SamePathIdentity(r.Path, repo) {
 			count++
 		}
 	}
