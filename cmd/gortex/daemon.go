@@ -1862,7 +1862,9 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	// so it stays hidden.
 	showState := false
 	for _, r := range rows {
-		if r.Missing || r.Unloaded || repoIndexIsEmpty(r) {
+		if r.Missing || r.Unloaded || r.ViewState == daemon.RepoViewStateBuilding ||
+			r.ViewState == daemon.RepoViewStateDegraded || !repoStatusCountsKnown(r) ||
+			repoIndexIsEmpty(r) {
 			showState = true
 			break
 		}
@@ -1890,7 +1892,9 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 
 	var attributed uint64
 	for _, r := range rows {
-		attributed += r.Memory.TotalBytes
+		if repoStatusMemoryKnown(r) {
+			attributed += r.Memory.TotalBytes
+		}
 		row := table.Row{r.Prefix}
 		if showWS {
 			ws := r.Workspace
@@ -1902,16 +1906,26 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		if showState {
 			row = append(row, repoStateLabel(r))
 		}
-		row = append(row,
-			formatBytes(r.Memory.TotalBytes),
-			r.Files,
-			r.Nodes,
-			r.Edges,
-			formatBytes(r.Memory.NodesBytes),
-			formatBytes(r.Memory.EdgesBytes),
-			formatBytes(r.Memory.SearchBytes),
-			formatBytes(r.Memory.VectorsBytes),
-		)
+		if repoStatusMemoryKnown(r) {
+			row = append(row, formatBytes(r.Memory.TotalBytes))
+		} else {
+			row = append(row, "?")
+		}
+		if repoStatusCountsKnown(r) {
+			row = append(row, r.Files, r.Nodes, r.Edges)
+		} else {
+			row = append(row, "?", "?", "?")
+		}
+		if repoStatusMemoryKnown(r) {
+			row = append(row,
+				formatBytes(r.Memory.NodesBytes),
+				formatBytes(r.Memory.EdgesBytes),
+				formatBytes(r.Memory.SearchBytes),
+				formatBytes(r.Memory.VectorsBytes),
+			)
+		} else {
+			row = append(row, "?", "?", "?", "?")
+		}
 		row = append(row, r.Path)
 		t.AppendRow(row)
 	}
@@ -1943,6 +1957,12 @@ func repoStateLabel(r daemon.TrackedRepoStatus) string {
 	switch {
 	case r.Missing:
 		return "MISSING"
+	case r.ViewState == daemon.RepoViewStateBuilding:
+		return "view building"
+	case r.ViewState == daemon.RepoViewStateDegraded:
+		return "view degraded"
+	case !repoStatusCountsKnown(r):
+		return "view counts unavailable"
 	case r.Unloaded:
 		return "not indexed"
 	case repoIndexIsEmpty(r):
@@ -1959,7 +1979,8 @@ func repoStateLabel(r daemon.TrackedRepoStatus) string {
 // it answered "no callers" with full confidence. A repo still waiting for
 // its first index (LastIndex unset) is not yet empty, only pending.
 func repoIndexIsEmpty(r daemon.TrackedRepoStatus) bool {
-	return !r.Missing && !r.Unloaded && r.Files == 0 && r.LastIndex > 0
+	return !r.Missing && !r.Unloaded && repoStatusCountsKnown(r) &&
+		r.Files == 0 && r.LastIndex > 0
 }
 
 // renderEmptyIndexWarning prints the remediation block for every tracked
@@ -2071,7 +2092,11 @@ func renderDaemonWorkspaces(w io.Writer, st daemon.StatusResponse) {
 		if len(projects) > 50 {
 			projects = projects[:47] + "..."
 		}
-		t.AppendRow(table.Row{ws.Slug, len(ws.Repos), projects, ws.Files, ws.Nodes, ws.Edges})
+		if workspaceStatusCountsKnown(ws) {
+			t.AppendRow(table.Row{ws.Slug, len(ws.Repos), projects, ws.Files, ws.Nodes, ws.Edges})
+		} else {
+			t.AppendRow(table.Row{ws.Slug, len(ws.Repos), projects, "?", "?", "?"})
+		}
 	}
 	t.Render()
 }

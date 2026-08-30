@@ -154,6 +154,12 @@ type realController struct {
 	// Atomic, deliberately not guarded by mu: the entire point of the cache
 	// is to be readable while a minutes-long track holds mu.
 	lastAggregate atomic.Pointer[statusAggregate]
+	// lastRoutedRepos retains only the last successfully catalogued checkout
+	// identities and their immutable status projection. A later catalog read
+	// failure uses those identities to degrade routed rows without falsely
+	// degrading unrelated legacy/non-Git rows. Snapshots are immutable after
+	// publication, so concurrent status calls need no controller lock.
+	lastRoutedRepos atomic.Pointer[routedRepoStatusSnapshot]
 }
 
 // startupViewReadiness is the frozen configured-Git cohort captured after
@@ -997,6 +1003,11 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// graphs and generations, so it belongs in the slow half rather than
 	// under the mutex the coordinators contend for.
 	views := c.collectViewsStatus(ctx)
+	// The per-repo routed projection is the row-level companion to the census:
+	// it selects the exact checkout stack and reads only persisted generation
+	// counters/ownership metadata. It must happen outside c.mu for the same
+	// reason, and it never recounts graph rows.
+	routedRepos := c.collectRoutedRepoStatuses(ctx)
 
 	// Everything above is the slow half and c.mu below is the contended half.
 	// Re-check between them: a caller whose budget expired during the scans
@@ -1031,7 +1042,21 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// The copy keeps the cached slice immutable — it is shared by every
 	// subsequent busy pass.
 	tracked := append([]daemon.TrackedRepoStatus(nil), agg.tracked...)
-	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked)...)
+	projected := projectRoutedRepoRows(tracked, routedRepos)
+	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, tracked, routedRepos)...)
+	// Workspace totals must be reduced after routed rows replace generation-zero
+	// shells. Otherwise the repo table would say "counts unavailable" while its
+	// workspace silently published the shell's zero as an exact total.
+	workspaces := workspaceSummaries(tracked)
+	searchBackend := agg.searchBackend
+	if projected > 0 || (routedRepos.enabled && len(routedRepos.rows) > 0) {
+		// The process search backend is pinned to one physical generation. It
+		// cannot report a coherent document count across several selected
+		// checkout views, so omit the number instead of presenting gen-0's count
+		// as the routed corpus size.
+		searchBackend.DocCount = 0
+		searchBackend.DocCountKnown = false
+	}
 
 	// mem was sampled before the mutex was taken — see the note at the top
 	// of status.
@@ -1039,7 +1064,7 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	resp := daemon.StatusResponse{
 		TrackedRepos:   tracked,
 		MemoryBytes:    mem.Alloc,
-		SearchBackend:  agg.searchBackend,
+		SearchBackend:  searchBackend,
 		TrigramCache:   trigramCacheForResponse(),
 		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
 		Runtime: daemon.RuntimeStats{
@@ -1057,7 +1082,7 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 		WarmupSeconds:      c.warmupSeconds.Load(),
 		EnrichmentComplete: enriched,
 		EnrichSeconds:      c.enrichSeconds.Load(),
-		Workspaces:         agg.workspaces,
+		Workspaces:         workspaces,
 		ConfiguredServers:  agg.configuredServers,
 		LocalServerSlug:    agg.localServerSlug,
 		LSPRouter:          agg.lspRouter,
@@ -1484,7 +1509,12 @@ func lookupRepoMissing(missing map[string]bool, root string) bool {
 // track resolves and persists) and by resolved prefix second, so a repo
 // registered under a derived worktree-instance prefix still matches its
 // config entry.
-func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool, loaded []daemon.TrackedRepoStatus) []daemon.TrackedRepoStatus {
+func reconcileUnloadedRepos(
+	entries []config.RepoEntry,
+	missing map[string]bool,
+	loaded []daemon.TrackedRepoStatus,
+	routed routedRepoStatusSnapshot,
+) []daemon.TrackedRepoStatus {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -1501,7 +1531,7 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 		if isLoaded {
 			continue
 		}
-		out = append(out, daemon.TrackedRepoStatus{
+		row := daemon.TrackedRepoStatus{
 			Prefix:           prefix,
 			Path:             e.Path,
 			Name:             e.Name,
@@ -1510,7 +1540,15 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 			Ref:              e.Ref,
 			Unloaded:         true,
 			Missing:          lookupRepoMissing(missing, e.Path),
-		})
+		}
+		if view, found := matchRoutedRepoStatus(e.Path, prefix, routed.rows); found {
+			if routed.available {
+				applyRoutedRepoStatus(&row, view)
+			} else {
+				applyUnavailableRoutedRepoStatus(&row)
+			}
+		}
+		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Prefix < out[j].Prefix })
 	return out

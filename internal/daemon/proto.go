@@ -840,6 +840,26 @@ type TrackedRepoStatus struct {
 	Edges            int             `json:"edges"`
 	LastIndex        int64           `json:"last_index_unix"`
 	Memory           MemoryBreakdown `json:"memory"`
+	// ViewState is set when this row is served through the checkout-view
+	// catalog rather than generation zero. The values are the bounded
+	// RepoViewState* vocabulary below. Empty keeps status responses from older
+	// daemons, and ordinary non-Git repositories, backward compatible.
+	ViewState string `json:"view_state,omitempty"`
+	// CountsKnown says whether Files, Nodes and Edges describe the selected
+	// routed view. nil means the legacy generation-zero counters are
+	// authoritative; a non-nil false value is the important case: the route is
+	// known, but exact composed totals would require scanning graph rows.
+	CountsKnown *bool `json:"counts_known,omitempty"`
+	// MemoryKnown says whether every field in Memory is attributable to the
+	// selected view. nil preserves the legacy generation-zero contract. Routed
+	// views commonly know exact structural counts while their process-wide
+	// search/vector heap share is unavailable; those rows set this false and
+	// render every memory column as unknown rather than manufacturing zeros.
+	MemoryKnown *bool `json:"memory_known,omitempty"`
+	// ViewGenerations is the selected stack bottom-first. It is bounded by the
+	// routed generation ancestry and gives operators evidence for the counts
+	// decision without exposing graph rows or triggering a recount.
+	ViewGenerations []int64 `json:"view_generations,omitempty"`
 	// Missing is true when Path no longer names a directory on disk —
 	// the checkout was deleted, renamed, or unmounted while the entry
 	// stayed in `~/.gortex/config.yaml`. Such a repo can never be
@@ -854,6 +874,15 @@ type TrackedRepoStatus struct {
 	Unloaded bool `json:"unloaded,omitempty"`
 }
 
+// The bounded checkout-view states carried by TrackedRepoStatus.ViewState.
+// They intentionally describe route availability, independently from whether
+// exact composed counters are available cheaply.
+const (
+	RepoViewStateReady    = "ready"
+	RepoViewStateBuilding = "building"
+	RepoViewStateDegraded = "degraded"
+)
+
 // WorkspaceSummary aggregates per-workspace stats so `gortex daemon
 // status` can render a "workspaces" block above the per-repo table.
 // Reflects the workspace hard boundary: counts roll up across every
@@ -865,6 +894,10 @@ type WorkspaceSummary struct {
 	Files    int      `json:"files"`
 	Nodes    int      `json:"nodes"`
 	Edges    int      `json:"edges"`
+	// CountsKnown is false when any routed repository in this rollup has no
+	// cheap exact composed totals. nil preserves the legacy meaning that the
+	// numeric fields are authoritative.
+	CountsKnown *bool `json:"counts_known,omitempty"`
 }
 
 // MCPSessionStatus is one row in the sessions list. Reports the

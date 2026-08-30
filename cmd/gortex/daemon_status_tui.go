@@ -62,8 +62,8 @@ func (r repoItem) FilterValue() string {
 
 type repoDelegate struct{ width int }
 
-func (d repoDelegate) Height() int                         { return 1 }
-func (d repoDelegate) Spacing() int                        { return 0 }
+func (d repoDelegate) Height() int                             { return 1 }
+func (d repoDelegate) Spacing() int                            { return 0 }
 func (d repoDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
 func (d repoDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
 	r, ok := listItem.(repoItem)
@@ -117,6 +117,12 @@ func repoItemState(r daemon.TrackedRepoStatus) string {
 	switch {
 	case r.Missing:
 		return "MISSING — path deleted"
+	case r.ViewState == daemon.RepoViewStateBuilding:
+		return "view building"
+	case r.ViewState == daemon.RepoViewStateDegraded:
+		return "view degraded"
+	case !repoStatusCountsKnown(r):
+		return "ready — view counts unavailable"
 	case r.Unloaded:
 		return "not indexed"
 	case repoIndexIsEmpty(r):
@@ -211,11 +217,17 @@ func (m statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastUpdate = time.Now()
 		items := make([]list.Item, 0, len(m.status.TrackedRepos))
 		for _, r := range m.status.TrackedRepos {
+			memory := humanizeBytes(r.Memory.TotalBytes)
+			memoryBytes := r.Memory.TotalBytes
+			if !repoStatusMemoryKnown(r) {
+				memory = "?"
+				memoryBytes = 0
+			}
 			items = append(items, repoItem{
 				name:      firstNonEmpty(r.Prefix, r.Name),
 				workspace: workspaceLabel(r),
-				memory:    humanizeBytes(r.Memory.TotalBytes),
-				memBytes:  r.Memory.TotalBytes,
+				memory:    memory,
+				memBytes:  memoryBytes,
 				files:     r.Files,
 				nodes:     r.Nodes,
 				edges:     r.Edges,
@@ -275,9 +287,9 @@ func (m statusTUI) View() string {
 		}
 	}
 
-	gap(1)               // top breathing room
+	gap(1) // top breathing room
 	push(m.renderHeader())
-	gap(2)               // logo gets extra space below
+	gap(2) // logo gets extra space below
 	if w := m.renderWorkspaces(); w != "" {
 		push(w)
 		gap(1)
@@ -386,9 +398,12 @@ func (m statusTUI) renderWorkspaces() string {
 		if len(ws.Projects) > 0 {
 			projects = "  " + tuiHint.Render(strings.Join(ws.Projects, " · "))
 		}
+		files, nodes, edges := humanizeInt(ws.Files), humanizeInt(ws.Nodes), humanizeInt(ws.Edges)
+		if !workspaceStatusCountsKnown(ws) {
+			files, nodes, edges = "?", "?", "?"
+		}
 		stats := fmt.Sprintf("%2d %s · %s files · %s nodes · %s edges",
-			len(ws.Repos), pluralize(len(ws.Repos), "repo", "repos"),
-			humanizeInt(ws.Files), humanizeInt(ws.Nodes), humanizeInt(ws.Edges))
+			len(ws.Repos), pluralize(len(ws.Repos), "repo", "repos"), files, nodes, edges)
 		line := "  " + tuiKey.Render(padRight(ws.Slug, 12)) + "  " + tuiVal.Render(stats) + projects
 		lines = append(lines, line)
 	}
