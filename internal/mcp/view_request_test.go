@@ -176,7 +176,7 @@ func newViewStack(t *testing.T) *viewStack {
 // exists in no other layer, so a reader can be asked both "did the layer
 // replace the corpus?" and "does the layer's own content show up at all?".
 func writeViewCommitGeneration(
-	t *testing.T,
+	t testing.TB,
 	store *store_sqlite.Store,
 	graphID, layerID, treeOID string,
 	publish bool,
@@ -220,7 +220,7 @@ func writeViewCommitGeneration(
 // writeViewDirtyGeneration is the working-tree slot: keep.go re-derived with
 // one extra symbol, so a route with both slots ready has something to prove.
 func writeViewDirtyGeneration(
-	t *testing.T,
+	t testing.TB,
 	store *store_sqlite.Store,
 	graphID string,
 	baseGeneration int64,
@@ -259,7 +259,7 @@ func writeViewDirtyGeneration(
 	return generationID
 }
 
-func seedViewCatalog(t *testing.T, store *store_sqlite.Store, graphID, repoRoot, worktreeRoot string) {
+func seedViewCatalog(t testing.TB, store *store_sqlite.Store, graphID, repoRoot, worktreeRoot string) {
 	t.Helper()
 	ctx := context.Background()
 	catalog := store.Catalog()
@@ -314,7 +314,7 @@ func seedViewCatalog(t *testing.T, store *store_sqlite.Store, graphID, repoRoot,
 	}
 }
 
-func routeViewCheckout(t *testing.T, store *store_sqlite.Store, graphID string, commit, dirty int64, state store_sqlite.RouteState) {
+func routeViewCheckout(t testing.TB, store *store_sqlite.Store, graphID string, commit, dirty int64, state store_sqlite.RouteState) {
 	t.Helper()
 	if err := store.Catalog().UpsertCheckoutRoute(context.Background(), store_sqlite.CheckoutRoute{
 		CheckoutID:         viewTestWorktree,
@@ -621,6 +621,69 @@ func TestBuildingRouteFallsBackToTheBase(t *testing.T) {
 	}
 }
 
+func TestPendingRouteWithRetainedPointersNeverServesStaleOverlay(t *testing.T) {
+	t.Run("implicit graph search gets labeled base fallback", func(t *testing.T) {
+		stack := newViewStack(t)
+		routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
+
+		var reader graph.Reader
+		res, err := stack.callWithView(t, stack.worktreeRoot, "search_symbols", nil, captureReader(stack.srv, &reader))
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if hasNode(reader, "repo/added.go::Fresh") || hasNode(reader, "repo/keep.go::Dirty") {
+			t.Error("pending route served retained checkout generations as a stale overlay")
+		}
+		if !hasNode(reader, "repo/edit.go::Old") {
+			t.Error("pending route fallback did not land on the base corpus")
+		}
+		rider := resultFreshness(t, res)
+		if rider == nil || rider["exact"] != false ||
+			rider["fallback_reason"] != graphview.CodeViewBuilding ||
+			rider["actual_view"] != string(graphview.SelectorBase) {
+			t.Fatalf("pending route fallback was not labeled precisely: %v", rider)
+		}
+	})
+
+	t.Run("explicit selector remains strict", func(t *testing.T) {
+		stack := newViewStack(t)
+		routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
+		ran := false
+		res, err := stack.callWithView(t, stack.repoRoot, "search_symbols", worktreeViewArgs(),
+			func(context.Context) (*mcplib.CallToolResult, error) {
+				ran = true
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			})
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		assertToolError(t, res, graphview.CodeViewBuilding)
+		if ran {
+			t.Error("explicit worktree selector reached its handler through a pending route")
+		}
+	})
+
+	for _, tool := range []string{"get_symbol", "read_file", "edit_file"} {
+		t.Run("implicit "+tool+" rejects fallback", func(t *testing.T) {
+			stack := newViewStack(t)
+			routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
+			ran := false
+			res, err := stack.callWithView(t, stack.worktreeRoot, tool, nil,
+				func(context.Context) (*mcplib.CallToolResult, error) {
+					ran = true
+					return mcplib.NewToolResultText(`{"ok":true}`), nil
+				})
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			assertToolError(t, res, graphview.CodeViewBuilding)
+			if ran {
+				t.Errorf("%s reached its handler through a pending-route fallback", tool)
+			}
+		})
+	}
+}
+
 func TestStaleRoutedCommitFallsBackUntilHeadTreeRouteSwap(t *testing.T) {
 	stack := newViewStack(t)
 	targetCommit := writeViewCommitGeneration(
@@ -734,6 +797,66 @@ func TestStaleRoutedCommitFallsBackUntilHeadTreeRouteSwap(t *testing.T) {
 	}
 	if !found || route.CommitGenerationID != targetCommit {
 		t.Fatalf("route after swap = %+v, found %v; want commit generation %d", route, found, targetCommit)
+	}
+}
+
+func BenchmarkRoutedMutationSyntaxHealth(b *testing.B) {
+	ctx := context.Background()
+	store, err := store_sqlite.Open(filepath.Join(b.TempDir(), "mutation-syntax-health.sqlite"))
+	if err != nil {
+		b.Fatalf("open store: %v", err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+
+	const graphID = "bench-mutation-syntax-health-graph"
+	commit := writeViewCommitGeneration(
+		b, store, graphID, "bench-mutation-syntax-health-commit", "bench-mutation-syntax-health-tree", true,
+	)
+	dirty := writeViewDirtyGeneration(
+		b, store, graphID, commit, "bench-mutation-syntax-health-dirty", "bench-mutation-syntax-health-dirty-tree",
+	)
+	repoRoot := filepath.Join(b.TempDir(), "repo")
+	worktreeRoot := filepath.Join(b.TempDir(), "worktree")
+	seedViewCatalog(b, store, graphID, repoRoot, worktreeRoot)
+	routeViewCheckout(b, store, graphID, commit, dirty, store_sqlite.RouteActive)
+	if err := store.Catalog().UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
+		CheckoutID:         viewTestWorktree,
+		GraphID:            graphID,
+		CommitGenerationID: commit,
+		DirtyGenerationID:  dirty,
+		RouteEpoch:         1,
+		State:              store_sqlite.RouteActive,
+	}); err != nil {
+		b.Fatalf("stamp benchmark route epoch: %v", err)
+	}
+	route, found, err := store.Catalog().GetCheckoutRoute(ctx, viewTestWorktree)
+	if err != nil || !found || !graphview.RouteReady(route) || route.RouteEpoch <= 0 {
+		b.Fatalf("ready routed checkout: found=%v route=%+v err=%v", found, route, err)
+	}
+
+	srv := &Server{graph: store}
+	srv.SetMaterializer(&graphview.Materializer{
+		Store:   store,
+		Catalog: store.Catalog(),
+		Leases:  graphview.NewLeaseManager(),
+	})
+	outcome := mutationReindexOutcome{
+		Reindexed:           true,
+		CheckoutID:          viewTestWorktree,
+		PublishedRouteEpoch: route.RouteEpoch,
+	}
+	check := func() {
+		if health := srv.fileSyntaxHealth(
+			ctx, "repo/edit.go", filepath.Join(worktreeRoot, "edit.go"), outcome,
+		); health != nil {
+			b.Fatalf("clean routed fixture returned syntax health: %v", health)
+		}
+	}
+	check()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		check()
 	}
 }
 

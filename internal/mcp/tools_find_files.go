@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"sort"
 	"strings"
@@ -29,7 +30,7 @@ func (s *Server) registerFindFilesTool() {
 				"kind:file (which cannot return file nodes). Returns repo-relative paths with the repo prefix and "+
 				"language, ready to hand to get_file_summary / read_file. Pass format:\"gcx\" for the compact wire format."),
 			mcp.WithString("query", mcp.Description("Filename or path substring to match (case-insensitive). Ranked basename-exact > prefix > substring > path-substring.")),
-			mcp.WithString("glob", mcp.Description("Path glob over the repo-relative path. `*` stays within a segment, `**` crosses segments, a bare basename pattern like `*_test.go` matches basenames. ANDed with `query` when both are given.")),
+			mcp.WithString("glob", mcp.Description("Path glob over the repo-relative path. `*` stays within a segment, `**` crosses segments anywhere, `dir/*` is a directory prefix (whole subtree), a bare basename pattern like `*_test.go` matches basenames. ANDed with `query` when both are given.")),
 			mcp.WithBoolean("fuzzy", mcp.Description("Also accept fuzzy subsequence matches of `query` against the basename (e.g. \"tcgo\" matches \"tools_coding.go\"). Lowest-ranked. Default false.")),
 			mcp.WithString("path", mcp.Description("Restrict to one or more anchored sub-path prefixes (comma-separated), repo-root-relative — the monorepo-service slice.")),
 			mcp.WithString("repo", mcp.Description("Restrict to a single repository prefix.")),
@@ -62,6 +63,18 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 	glob := strings.TrimSpace(req.GetString("glob", ""))
 	if query == "" && glob == "" {
 		return mcp.NewToolResultError("find_files: pass `query` (a filename/path substring) and/or `glob` (a path glob)"), nil
+	}
+	// Compile and bound the glob before anything walks the file set: the
+	// matcher runs per candidate, ahead of `limit`, so pattern size is a
+	// multiplier on the whole scan rather than on one call. The counts come
+	// off the normalised pattern, because that is what the matcher sees —
+	// reading them off the raw string let a native-separator glob count as
+	// one segment here and expand to many at match time.
+	compiledGlob := compileGlob(glob)
+	if compiledGlob.tooComplex() {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"find_files: `glob` is too large (%d bytes, %d segments); the limits are %d bytes and %d segments",
+			len(compiledGlob.pattern), compiledGlob.segmentCount(), maxGlobBytes, maxGlobSegments)), nil
 	}
 	fuzzy := req.GetBool("fuzzy", false)
 	resolved, errResult := s.resolveScope(ctx, req, IntentLocate)
@@ -101,7 +114,7 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 
 		score := 0
 		if glob != "" {
-			if !matchFidelityGlob(glob, rel) {
+			if !compiledGlob.match(rel) {
 				continue
 			}
 			score += 5

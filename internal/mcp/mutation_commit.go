@@ -107,10 +107,13 @@ type mutationCommitRecord struct {
 	disk  string
 	graph string
 
-	newSHA         string
-	bytesWritten   int
-	reindexReceipt string
-	errText        string
+	newSHA              string
+	bytesWritten        int
+	reindexReceipt      string
+	checkoutID          string
+	observedRouteEpoch  int64
+	publishedRouteEpoch int64
+	errText             string
 
 	startedAt   time.Time
 	committedAt time.Time
@@ -122,32 +125,38 @@ type mutationCommitRecord struct {
 }
 
 type mutationCommitSnapshot struct {
-	Receipt      string `json:"receipt"`
-	Tool         string `json:"tool,omitempty"`
-	MutationID   string `json:"mutation_id,omitempty"`
-	Path         string `json:"path,omitempty"`
-	DiskStatus   string `json:"disk_status"`
-	GraphStatus  string `json:"graph_status"`
-	NewSHA       string `json:"new_sha,omitempty"`
-	BytesWritten int    `json:"bytes_written,omitempty"`
-	Error        string `json:"error,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CommittedAt  string `json:"committed_at,omitempty"`
+	Receipt             string `json:"receipt"`
+	Tool                string `json:"tool,omitempty"`
+	MutationID          string `json:"mutation_id,omitempty"`
+	Path                string `json:"path,omitempty"`
+	DiskStatus          string `json:"disk_status"`
+	GraphStatus         string `json:"graph_status"`
+	NewSHA              string `json:"new_sha,omitempty"`
+	BytesWritten        int    `json:"bytes_written,omitempty"`
+	CheckoutID          string `json:"checkout_id,omitempty"`
+	ObservedRouteEpoch  int64  `json:"observed_route_epoch,omitempty"`
+	PublishedRouteEpoch int64  `json:"published_route_epoch,omitempty"`
+	Error               string `json:"error,omitempty"`
+	StartedAt           string `json:"started_at,omitempty"`
+	CommittedAt         string `json:"committed_at,omitempty"`
 }
 
 func (r *mutationCommitRecord) snapshot() mutationCommitSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	snap := mutationCommitSnapshot{
-		Receipt:      r.id,
-		Tool:         r.tool,
-		MutationID:   r.key,
-		Path:         r.relPath,
-		DiskStatus:   r.disk,
-		GraphStatus:  r.graph,
-		NewSHA:       r.newSHA,
-		BytesWritten: r.bytesWritten,
-		Error:        r.errText,
+		Receipt:             r.id,
+		Tool:                r.tool,
+		MutationID:          r.key,
+		Path:                r.relPath,
+		DiskStatus:          r.disk,
+		GraphStatus:         r.graph,
+		NewSHA:              r.newSHA,
+		BytesWritten:        r.bytesWritten,
+		CheckoutID:          r.checkoutID,
+		ObservedRouteEpoch:  r.observedRouteEpoch,
+		PublishedRouteEpoch: r.publishedRouteEpoch,
+		Error:               r.errText,
 	}
 	if !r.startedAt.IsZero() {
 		snap.StartedAt = r.startedAt.UTC().Format(time.RFC3339Nano)
@@ -205,6 +214,9 @@ func (r *mutationCommitRecord) recordGraph(outcome mutationReindexOutcome) {
 	defer r.mu.Unlock()
 	r.graph = graphStatusFor(outcome)
 	r.reindexReceipt = outcome.Receipt
+	r.checkoutID = outcome.CheckoutID
+	r.observedRouteEpoch = outcome.ObservedRouteEpoch
+	r.publishedRouteEpoch = outcome.PublishedRouteEpoch
 }
 
 // retainResponse stores the successful payload for idempotent replay. Only

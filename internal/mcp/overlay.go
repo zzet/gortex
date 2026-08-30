@@ -142,6 +142,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if blocked := s.checkToolGate(ctx, req.Params.Name); blocked != nil {
 			return blocked, nil
 		}
+		// Reject bounded-input violations before resolving a view. Resolving a
+		// cold ref can start an extraction, so leaving these checks only in the
+		// leaf file handlers lets an invalid request consume indexing work.
+		if admissionErr := s.validateRequestBeforeView(&req); admissionErr != nil {
+			return mcp.NewToolResultError(admissionErr.Error()), nil
+		}
 		// Opt-in zero-config: background-index an untracked cwd on the first
 		// tool call (GORTEX_AUTOINDEX=1). Cheap getenv + sync.Once on the
 		// request path; all real work runs on a background goroutine.
@@ -168,9 +174,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withRequestView(ctx, view)
 			defer view.close()
 		}
-		// A write issued while reading a routed view would land in the
-		// canonical checkout, not the one the answer came from.
-		if refused := s.refuseRoutedViewMutation(ctx, req.Params.Name); refused != nil {
+		// Routed source writes are admitted only for handlers that confine bytes
+		// and publish freshness through this exact checkout's coordinator.
+		if refused := s.refuseRoutedViewMutation(ctx, &req); refused != nil {
 			return refused, nil
 		}
 		// What the view can answer, checked against what this operation
@@ -226,12 +232,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// small `freshness` block so the agent knows the graph view may lag
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
-			if rider := s.freshnessRiderFor(req.Params.Name, req); rider != nil {
+			if rider := s.freshnessRiderFor(ctx, req.Params.Name, req); rider != nil {
 				res = decorateResultWithFreshness(res, rider)
 			} else if isFreshnessListTool(req.Params.Name) {
 				// List tools get a per-file sweep: any hit whose file drifted
 				// or vanished on disk is flagged with per-repo provenance.
-				res = s.decorateListResultWithFreshness(res)
+				res = s.decorateListResultWithFreshness(ctx, res)
 			}
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —

@@ -15,7 +15,6 @@ package todos
 import (
 	"bufio"
 	"bytes"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -211,13 +210,16 @@ func parseRest(rest string) (assignee, due, text string) {
 // unique.
 //
 // filePath is the unprefixed (per-file extractor) path; the indexer
-// adds the repo prefix downstream via applyRepoPrefix.
+// adds the repo prefix downstream via applyRepoPrefix. Its spelling
+// is preserved verbatim — eviction and incremental replacement key
+// nodes and edges by the exact relPath spelling the indexer uses
+// (OS-native separators on Windows), so a re-spelled artifact would
+// never be swept and goes stale.
 func BuildGraphArtifacts(filePath string, findings []Finding, language string) ([]*graph.Node, []*graph.Edge) {
 	if len(findings) == 0 {
 		return nil, nil
 	}
 
-	filePath = filepath.ToSlash(filePath)
 	fileID := filePath
 	nodes := make([]*graph.Node, 0, len(findings))
 	edges := make([]*graph.Edge, 0, len(findings))

@@ -153,14 +153,19 @@ func newRefStack(t testing.TB) *refStack {
 	seedRefCatalog(t, store, graphID, repo, headTree)
 
 	ctx := context.Background()
+	pipeline := indexer.DedicatedBasePipelineFor(cm.GetRepoConfig(refTestPrefix).Index)
 	generationID, payload, err := store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:      "dedicated_graph",
-		GraphID:        graphID,
-		LayerID:        "test-primary-base",
-		CheckoutID:     refTestCheckout,
-		GenerationKind: "dedicated",
-		TreeOID:        headTree,
-		CreatedAt:      102,
+		OwnerKind:         "dedicated_base",
+		GraphID:           graphID,
+		LayerID:           graphID + ":base",
+		CheckoutID:        refTestCheckout,
+		GenerationKind:    "dedicated_base",
+		BaseGenerationID:  0,
+		TreeOID:           headTree,
+		ConfigHash:        pipeline.ConfigHash,
+		ExtractorVersions: pipeline.ExtractorVersions,
+		ResolverVersion:   pipeline.ResolverVersion,
+		CreatedAt:         102,
 	})
 	if err != nil {
 		t.Fatalf("begin primary payload generation: %v", err)

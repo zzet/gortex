@@ -581,7 +581,10 @@ END`)
 	analysisRevision := store.AnalysisMutationRevision()
 	edgeRevision := store.EdgeMutationRevision()
 	token := store.BeginMutationReceipt()
-	nodes, edges, evictErr := store.evictByPredicateResult(evictFilePredicate, evictFixtureFile, evictThisGeneration)
+	nodes, edges, evictErr := store.evictByPredicateResult(evictFilePredicate, evictFixtureFile, evictOptions{
+		scope:        evictThisGeneration,
+		exactReceipt: true,
+	})
 	require.ErrorContains(t, evictErr, "forced atomic eviction rollback")
 	require.Zero(t, nodes)
 	require.Zero(t, edges)
@@ -605,7 +608,12 @@ END`)
 	require.Equal(t, 2, nodes)
 	require.Equal(t, 3, edges)
 	receipt = store.EndMutationReceipt(token)
-	require.False(t, receipt.Complete)
+	// The fixture keeps a RESOLVED surviving caller (Keep -> A). The evict
+	// destroys that edge rather than parking it, and no resolution pass
+	// reconstructs a deleted edge, so the eviction's resolution delta is
+	// still exactly describable and the receipt stays complete.
+	require.True(t, receipt.Complete,
+		"an eviction that destroys a surviving caller edge still describes its resolution delta exactly")
 	require.False(t, store.analysisGenerationPresent)
 	require.Greater(t, store.AnalysisMutationRevision(), analysisRevision)
 	require.Greater(t, store.EdgeMutationRevision(), edgeRevision)

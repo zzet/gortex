@@ -216,23 +216,37 @@ func IsUnresolvedTarget(id string) bool {
 // not; conflating the two would let a name coincidence masquerade as an
 // import-grounded reference.
 func UnresolvedNameCandidateIDs(n *Node) []string {
-	if n == nil || n.Name == "" {
+	if n == nil {
 		return nil
-	}
-	ids := []string{
-		UnresolvedMarker + n.Name,
-		UnresolvedMarker + "*." + n.Name,
 	}
 	prefix := n.RepoPrefix
 	if prefix == "" {
 		prefix = RepoPrefixOfID(n.ID)
 	}
-	if prefix == "" {
+	return UnresolvedNameCandidateIDsForName(n.Name, prefix)
+}
+
+// UnresolvedNameCandidateIDsForName is the name-owned expansion behind
+// UnresolvedNameCandidateIDs for callers that hold a bare name and repo
+// prefix instead of a node. Every consumer that enumerates the stubs a name
+// may be parked under must go through one of these two helpers: the four
+// forms (bare, wildcard member, and their repo-prefixed twins) are a single
+// contract, and a path that hand-builds a subset silently strands the
+// missing forms as permanently pending.
+func UnresolvedNameCandidateIDsForName(name, repoPrefix string) []string {
+	if name == "" {
+		return nil
+	}
+	ids := []string{
+		UnresolvedMarker + name,
+		UnresolvedMarker + "*." + name,
+	}
+	if repoPrefix == "" {
 		return ids
 	}
 	return append(ids,
-		prefix+"::"+UnresolvedMarker+n.Name,
-		prefix+"::"+UnresolvedMarker+"*."+n.Name,
+		repoPrefix+"::"+UnresolvedMarker+name,
+		repoPrefix+"::"+UnresolvedMarker+"*."+name,
 	)
 }
 
@@ -333,4 +347,83 @@ func IsReferenceableSymbol(k NodeKind) bool {
 		return true
 	}
 	return false
+}
+
+// ImportStubNamePrefix is the name-space of import-resolution pending
+// stubs: an unresolved import edge targets
+// `unresolved::import::<path>` (or the repo-prefixed COPY-rewrite form),
+// so the receipt name that reaches that stub through
+// UnresolvedNameCandidateIDsForName is `import::<path>`.
+const ImportStubNamePrefix = "import::"
+
+// ReceiptNamesForEvictedSymbol maps one evicted node to the receipt
+// target names under which pending references to it may be parked, and
+// reports whether that mapping is exact. This is the single authority
+// for the eviction side of mutation receipts on every backend:
+//
+//   - a referenceable definition's pending references park under its
+//     bare name and qualified name;
+//   - a package is an import-resolution candidate (the resolver's
+//     qualified-name tier considers it), so its pending references park
+//     under the import-prefixed stub of its qualified name (and of its
+//     bare name, for stem-form specifiers);
+//   - any other kind carrying a qualified name also participates in the
+//     resolver's qualified-name candidate lookup but has no exact stub
+//     mapping yet — the receipt must fail closed rather than certify
+//     the eviction as resolution-irrelevant.
+//
+// Extractors set QualName almost exclusively on referenceable symbols
+// and packages, so the fail-closed branch is rare in practice.
+//
+// The remaining fall-through — a kind carrying no qualified name —
+// reports (nil, exact), i.e. resolution-neutral. That is deliberate, and
+// it is an approximation rather than a proof: import stubs can bind to a
+// KindFile node (relative imports, Lua requires, Godot res:// paths), and
+// a file node has no qualified name to derive a stub key from, so an
+// eviction that collapses an import ambiguity onto a surviving candidate
+// is not described here. Failing closed instead is not available: every
+// file reindex evicts its own file node, so that branch would retire the
+// exact path altogether. The residual gap is a pre-existing resolver
+// ambiguity, and it is bounded by the same rule as every other name — a
+// pending stub that could rebind is only reachable by name, never by the
+// file frontier.
+// EvictedNodeNeedsResolutionFrontier reports whether evicting a node of this
+// kind can change resolution even though ReceiptNamesForEvictedSymbol offers
+// no stub key for it. Exactly one kind qualifies: a file node is an import
+// candidate - relative imports, Lua requires and Godot res:// paths all bind
+// to one - so removing it can collapse an ambiguity for a pending import
+// elsewhere, while the import specifier it would be parked under is not
+// derivable from the file. Its file still has to reach the definition
+// frontier, because ResolutionRelevant=false is the one verdict that skips
+// the catch-up pass outright.
+//
+// Every other nameless kind really is neutral. Nothing binds by name to an
+// import, param, local or module node, so an eviction that touches only those
+// creates no resolution work.
+func EvictedNodeNeedsResolutionFrontier(kind NodeKind) bool {
+	return kind == KindFile
+}
+
+func ReceiptNamesForEvictedSymbol(kind NodeKind, name, qualName string) (names []string, exact bool) {
+	switch {
+	case IsReferenceableSymbol(kind):
+		if name != "" {
+			names = append(names, name)
+		}
+		if qualName != "" && qualName != name {
+			names = append(names, qualName)
+		}
+		return names, true
+	case kind == KindPackage:
+		if qualName != "" {
+			names = append(names, ImportStubNamePrefix+qualName)
+		}
+		if name != "" && name != qualName {
+			names = append(names, ImportStubNamePrefix+name)
+		}
+		return names, true
+	case qualName != "":
+		return nil, false
+	}
+	return nil, true
 }

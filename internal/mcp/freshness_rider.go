@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -23,7 +24,10 @@ import (
 //
 // The check is O(1): one map lookup + one stat on the single file the
 // tool targets, only for the handful of read/source tools.
-func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map[string]any {
+func (s *Server) freshnessRiderFor(ctx context.Context, toolName string, req mcp.CallToolRequest) map[string]any {
+	if !requestUsesCanonicalFreshness(ctx) {
+		return nil
+	}
 	if s.indexer == nil && s.multiIndexer == nil {
 		return nil
 	}
@@ -52,11 +56,22 @@ func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map
 	// names the exact languages to reindex rather than implying a full rebuild.
 	var indexState graph.RepoIndexState
 	var haveState bool
+	// Extractor-version staleness, narrowed to THIS file's language. The
+	// advisory rides on a per-file response, so a language the file is not
+	// written in is noise the reader cannot act on: the reindex it asks
+	// for would not touch the file in hand. Narrowing also keeps the
+	// banner off repositories that hold no file of the stale language at
+	// all — the comparison is against the baseline version every language
+	// implicitly carries, so a bumped language is "behind" in every
+	// repository indexed by an older binary, Go-only ones included.
 	var staleLangs []string
 	if r, ok := graph.Store(s.graph).(graph.RepoIndexStateReader); ok {
 		if st, found, _ := r.GetRepoIndexState(owner.RepoPrefix()); found {
 			indexState, haveState = st, true
-			staleLangs = indexer.ExtractorVersionStaleLangs(st.ExtractorVersions)
+			if fileLang := indexer.ExtractorLangForFile(repoRel); fileLang != "" &&
+				slices.Contains(indexer.ExtractorVersionStaleLangs(st.ExtractorVersions), fileLang) {
+				staleLangs = []string{fileLang}
+			}
 		}
 	}
 
@@ -95,9 +110,7 @@ func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map
 	}
 	if len(staleLangs) > 0 {
 		out["extractor_stale_langs"] = staleLangs
-		if fileLang := indexer.ExtractorLangForFile(repoRel); fileLang != "" && slices.Contains(staleLangs, fileLang) {
-			out["extractor_stale_hint"] = "this file's language extractor was upgraded since indexing; reindex to pick up the newer extraction (gortex index .)"
-		}
+		out["extractor_stale_hint"] = "this file's language extractor was upgraded since indexing; reindex to pick up the newer extraction (gortex index .)"
 	}
 	if mismatch {
 		out["worktree_mismatch"] = true
@@ -265,7 +278,10 @@ const maxFreshnessSweep = 256
 // flat workspace banner. Only JSON-object payloads are touched; GCX / TOON /
 // array wire formats the caller opted into pass through unchanged, and a clean
 // sweep adds nothing.
-func (s *Server) decorateListResultWithFreshness(res *mcp.CallToolResult) *mcp.CallToolResult {
+func (s *Server) decorateListResultWithFreshness(ctx context.Context, res *mcp.CallToolResult) *mcp.CallToolResult {
+	if !requestUsesCanonicalFreshness(ctx) {
+		return res
+	}
 	if res == nil || (s.indexer == nil && s.multiIndexer == nil) {
 		return res
 	}
@@ -315,6 +331,19 @@ func (s *Server) decorateListResultWithFreshness(res *mcp.CallToolResult) *mcp.C
 		return res
 	}
 	return rebuildTextResult(res, string(body))
+}
+
+// requestUsesCanonicalFreshness reports whether the legacy indexer/disk
+// freshness signal describes the view that answered. A routed worktree has a
+// different working copy, a ref has no working copy, and a grace fallback is a
+// deliberately sealed primary snapshot. Reading canonical TrackedFileState for
+// any of them produces warnings about a checkout the response did not serve.
+//
+// Exact base requests and ordinary labeled cold-build fallbacks still read the
+// canonical corpus, so they retain the existing rider.
+func requestUsesCanonicalFreshness(ctx context.Context) bool {
+	view := requestViewFromContext(ctx)
+	return view == nil || (!view.routed() && !view.baseFallback)
 }
 
 // freshFileProvenance builds one stale/missing entry: the repo-relative file,

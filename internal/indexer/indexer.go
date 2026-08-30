@@ -1833,11 +1833,21 @@ func applyMigrationExtraction(relPath string, src []byte, result *parser.Extract
 // defaults off because string-literal pattern matching against
 // db.Get / db.Query / db.Exec produces false positives when
 // domain code shares method names (cache.Get, etc.).
+//
+// Two table-node origins survive the gate, because neither is the
+// noisy code-side matching the gate exists for: migration-origin DDL
+// (unambiguous CREATE TABLE — see applyMigrationExtraction), and
+// ORM-origin model attribution (declaration-anchored: @Entity/@Table
+// annotations, [Table] attributes, ActiveRecord bases, DbSet
+// properties). Stripping the ORM nodes would leave the models_table
+// layer silently empty for every ORM ecosystem under the default
+// config.
 func stripSQLArtifacts(result *parser.ExtractionResult) {
 	stripped := make(map[string]struct{})
 	keptNodes := result.Nodes[:0]
 	for _, n := range result.Nodes {
-		if (n.Kind == graph.KindTable || n.Kind == graph.KindMigration) && !isMigrationOriginNode(n) {
+		if (n.Kind == graph.KindTable || n.Kind == graph.KindMigration) &&
+			!isMigrationOriginNode(n) && !isORMOriginTableNode(n) {
 			stripped[n.ID] = struct{}{}
 			continue
 		}
@@ -1916,6 +1926,18 @@ func isMigrationOriginNode(n *graph.Node) bool {
 	}
 	o, _ := n.Meta["origin"].(string)
 	return o == "migration"
+}
+
+// isORMOriginTableNode reports whether a KindTable node was minted by
+// an ORM model-attribution extractor (go/java/python/ruby/ts/elixir/
+// csharp *_orm paths). They all stamp Meta["dialect"] = "orm" on the
+// shared db::orm:: table nodes.
+func isORMOriginTableNode(n *graph.Node) bool {
+	if n == nil || n.Kind != graph.KindTable || n.Meta == nil {
+		return false
+	}
+	d, _ := n.Meta["dialect"].(string)
+	return d == "orm"
 }
 
 // isInfraOriginConfigKey reports whether a KindConfigKey node was

@@ -1976,13 +1976,33 @@ func (c *Catalog) FlipCheckoutRoute(ctx context.Context, req FlipCheckoutRouteRe
 	if err := requireCatalogValue("state", req.State, routeStates); err != nil {
 		return err
 	}
-	return c.execGuarded(ctx, fmt.Sprintf("route for checkout %s at epoch %d", req.CheckoutID, req.ExpectedRouteEpoch), `
+	const query = `
 UPDATE checkout_routes
    SET graph_id = ?, commit_generation_id = ?, dirty_generation_id = ?,
        route_epoch = route_epoch + 1, state = ?
- WHERE checkout_id = ? AND route_epoch = ?`,
+ WHERE checkout_id = ? AND route_epoch = ?`
+	subject := fmt.Sprintf("route for checkout %s at epoch %d", req.CheckoutID, req.ExpectedRouteEpoch)
+	args := []any{
 		req.GraphID, catalogNullInt(req.CommitGenerationID), catalogNullInt(req.DirtyGenerationID),
-		string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
+		string(req.State), req.CheckoutID, req.ExpectedRouteEpoch,
+	}
+	if !req.RequireActiveGraphBase {
+		return c.execGuarded(ctx, subject, query, args...)
+	}
+	if req.ExpectedBaseGenerationID <= 0 {
+		return fmt.Errorf("expected base generation id must be positive")
+	}
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		active, err := graphBaseGenerationIsActiveTx(
+			ctx, tx, req.GraphID, req.ExpectedBaseGenerationID)
+		if err != nil {
+			return err
+		}
+		if !active {
+			return fmt.Errorf("%w: dedicated graph %s base moved", ErrCatalogStaleGuard, req.GraphID)
+		}
+		return execGuardedTx(ctx, tx, subject, query, args...)
+	})
 }
 
 // flipRouteSlotSQL is one guarded statement per slot. Naming a single column
@@ -2014,10 +2034,25 @@ func (c *Catalog) FlipCheckoutRouteSlot(ctx context.Context, req FlipCheckoutRou
 	if err := requireCatalogValue("state", req.State, routeStates); err != nil {
 		return err
 	}
-	return c.execGuarded(ctx,
-		fmt.Sprintf("%s slot of route for checkout %s at epoch %d", req.Slot, req.CheckoutID, req.ExpectedRouteEpoch),
-		flipRouteSlotSQL[req.Slot],
-		catalogNullInt(req.GenerationID), string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
+	subject := fmt.Sprintf("%s slot of route for checkout %s at epoch %d", req.Slot, req.CheckoutID, req.ExpectedRouteEpoch)
+	args := []any{catalogNullInt(req.GenerationID), string(req.State), req.CheckoutID, req.ExpectedRouteEpoch}
+	if !req.RequireActiveGraphBase {
+		return c.execGuarded(ctx, subject, flipRouteSlotSQL[req.Slot], args...)
+	}
+	if req.ExpectedBaseGenerationID <= 0 {
+		return fmt.Errorf("expected base generation id must be positive")
+	}
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		active, err := checkoutRouteBaseGenerationIsActiveTx(
+			ctx, tx, req.CheckoutID, req.ExpectedBaseGenerationID)
+		if err != nil {
+			return err
+		}
+		if !active {
+			return fmt.Errorf("%w: checkout %s dedicated base moved", ErrCatalogStaleGuard, req.CheckoutID)
+		}
+		return execGuardedTx(ctx, tx, subject, flipRouteSlotSQL[req.Slot], args...)
+	})
 }
 
 // --- ref views ----------------------------------------------------------

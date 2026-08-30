@@ -264,14 +264,15 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	pipeline := DedicatedBasePipelineFor(cfg.Config)
 	return &RefViewManager{
 		store:                cfg.Store,
 		catalog:              cfg.Store.Catalog(),
 		builder:              cfg.Builder,
 		logger:               logger,
 		gate:                 cfg.Gate,
-		configHash:           indexConfigHash(cfg.Config),
-		extractors:           extractorVersionsFingerprint(),
+		configHash:           pipeline.ConfigHash,
+		extractors:           pipeline.ExtractorVersions,
 		buildBarrier:         cfg.buildBarrier,
 		cacheMissBarrier:     cfg.cacheMissBarrier,
 		claimReadyGeneration: cfg.Store.Catalog().ClaimReadyGeneration,
@@ -470,7 +471,11 @@ func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase,
 	if !found {
 		return primaryBase{}, fmt.Errorf("indexer: graph %s has no dedicated-graph row to build over", graphID)
 	}
-	return graphBase(ctx, m.catalog, dedicated)
+	return graphBase(ctx, m.catalog, dedicated, dedicatedBaseIdentity{
+		configHash:        m.configHash,
+		extractorVersions: m.extractors,
+		resolverVersion:   refViewResolverVersion,
+	})
 }
 
 // activeIsCurrent reports whether the generation the view already serves was
@@ -986,11 +991,18 @@ func (m *RefViewManager) runBuild(
 		BuildID: build.BuildID, BuildToken: build.BuildToken,
 		ActiveRef: published.FullRef, ActiveCommit: published.CommitOID, ActiveTree: published.TreeOID,
 		ActiveBuildFingerprint: build.BuildFingerprint, ExactView: true,
+		RequireActiveGraphBase: true,
 	})
 	if err != nil {
 		m.releaseRefReadyLease(ctx, leaseToken)
 		leaseToken = ""
 		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+			m.logger.Debug("ref view manager: ready generation lost its publication guard",
+				zap.String("ref_view", view.RefViewID),
+				zap.String("graph", key.GraphID),
+				zap.Int64("base_generation", key.BaseGenerationID),
+				zap.Int64("generation", claim.WinnerGenerationID),
+				zap.Error(err))
 			return m.retryRefReadyBuild(ctx, build, view, published, built), nil
 		}
 		m.completeBuild(ctx, build, store_sqlite.ViewGenerationFailed, 0, err.Error())

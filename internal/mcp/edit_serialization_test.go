@@ -281,7 +281,7 @@ func TestMutationReindexStateFailureBlocksSafetyReads(t *testing.T) {
 func TestAttachMutationFreshnessPendingOmitsStaleSyntaxHealth(t *testing.T) {
 	resp := map[string]any{}
 	outcome := mutationReindexOutcome{Pending: true, Receipt: "mutation-7", Generation: 7}
-	(&Server{}).attachMutationFreshness(resp, "pending.go", "/tmp/pending.go", outcome)
+	(&Server{}).attachMutationFreshness(context.Background(), resp, "pending.go", "/tmp/pending.go", outcome)
 	if got := resp["reindexed"]; got != false {
 		t.Fatalf("reindexed = %#v, want false", got)
 	}

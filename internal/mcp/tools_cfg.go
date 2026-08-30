@@ -87,7 +87,7 @@ func (s *Server) handleGetCFG(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFresh([]string{parts[0]})
+		s.ensureFreshForRequest(ctx, []string{parts[0]})
 	}
 
 	sc, buildErr := s.buildSymbolCFG(ctx, id)

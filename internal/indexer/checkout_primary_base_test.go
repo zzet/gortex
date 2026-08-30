@@ -130,28 +130,84 @@ func (f *primaryBaseTestFixture) createGeneration(
 	state store_sqlite.ViewGenerationState,
 	treeOID string,
 ) int64 {
+	return f.createGenerationWith(graphID, checkoutID, state, treeOID, nil)
+}
+
+func (f *primaryBaseTestFixture) createGenerationWith(
+	graphID, checkoutID string,
+	state store_sqlite.ViewGenerationState,
+	treeOID string,
+	mutate func(*store_sqlite.ViewGeneration),
+) int64 {
 	f.tb.Helper()
 	f.sequence++
 	now := time.Now().Unix()
-	generationID, err := f.catalog.CreateViewGeneration(f.ctx, store_sqlite.ViewGeneration{
-		OwnerKind:      checkoutLayerOwnerKind,
-		GraphID:        graphID,
-		LayerID:        fmt.Sprintf("primary-base-%d", f.sequence),
-		CheckoutID:     checkoutID,
-		GenerationKind: "dedicated",
-		TreeOID:        treeOID,
-		State:          state,
-		CreatedAt:      now,
-		PublishedAt:    now,
-	})
+	generation := store_sqlite.ViewGeneration{
+		OwnerKind:         dedicatedBaseGenerationKind,
+		GraphID:           graphID,
+		LayerID:           graphID + ":base",
+		CheckoutID:        checkoutID,
+		GenerationKind:    dedicatedBaseGenerationKind,
+		TreeOID:           treeOID,
+		ConfigHash:        "config-primary-base",
+		ExtractorVersions: "extractors-primary-base",
+		ResolverVersion:   checkoutResolverVersion,
+		State:             state,
+		CreatedAt:         now,
+		PublishedAt:       now,
+	}
+	if mutate != nil {
+		mutate(&generation)
+	}
+	generationID, err := f.catalog.CreateViewGeneration(f.ctx, generation)
 	if err != nil {
 		f.tb.Fatalf("create %s generation: %v", state, err)
 	}
 	return generationID
 }
 
+func TestGraphBaseRejectsStalePipelineIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*store_sqlite.ViewGeneration)
+	}{
+		{name: "config", mutate: func(row *store_sqlite.ViewGeneration) { row.ConfigHash = "old-config" }},
+		{name: "extractors", mutate: func(row *store_sqlite.ViewGeneration) { row.ExtractorVersions = "old-extractors" }},
+		{name: "resolver", mutate: func(row *store_sqlite.ViewGeneration) { row.ResolverVersion = "old-resolver" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newPrimaryBaseTestFixture(t, 1)
+			generationID := f.createGenerationWith(
+				f.graphID, f.ownerID, store_sqlite.ViewGenerationReady, f.treeOID, tt.mutate,
+			)
+			graph := f.graph
+			graph.ActiveGenerationID = generationID
+			f.upsertGraph(graph)
+
+			_, err := f.coordinator(f.graphID).primaryBase(f.ctx)
+			requirePrimaryBaseUnavailable(t, err)
+		})
+	}
+}
+
+func TestGraphBaseRejectsRefreshingGraphBeforeSparseComposition(t *testing.T) {
+	f := newPrimaryBaseTestFixture(t, 1)
+	f.graph.State = store_sqlite.DedicatedGraphStateRefreshing
+	f.upsertGraph(f.graph)
+	_, err := graphBase(f.ctx, f.catalog, f.graph, f.desiredIdentity())
+	requirePrimaryBaseUnavailable(t, err)
+}
+
 func (f *primaryBaseTestFixture) coordinator(graphID string) *CheckoutCoordinator {
-	return &CheckoutCoordinator{catalog: f.catalog, familyID: f.familyID, graphID: graphID}
+	return &CheckoutCoordinator{
+		catalog: f.catalog, familyID: f.familyID, graphID: graphID,
+		configHash: "config-primary-base", extractors: "extractors-primary-base",
+	}
+}
+
+func (f *primaryBaseTestFixture) desiredIdentity() dedicatedBaseIdentity {
+	return f.coordinator(f.graphID).dedicatedBaseIdentity()
 }
 
 func requirePrimaryBaseUnavailable(tb testing.TB, err error) *primaryBaseUnavailableError {
@@ -230,7 +286,7 @@ func TestGraphBaseAcceptsCanonicalServableStates(t *testing.T) {
 			generationID := f.createGeneration(f.graphID, f.ownerID, state, wantTree)
 			graph := f.graph
 			graph.ActiveGenerationID = generationID
-			base, err := graphBase(f.ctx, f.catalog, graph)
+			base, err := graphBase(f.ctx, f.catalog, graph, f.desiredIdentity())
 			if err != nil {
 				t.Fatalf("graphBase: %v", err)
 			}
@@ -315,7 +371,7 @@ func TestGraphBaseRejectsNonServableAndInvalidActiveGenerations(t *testing.T) {
 			if err != nil || !found || owner.HeadTree == "" {
 				t.Fatalf("owner should retain a mutable head: found=%v row=%+v err=%v", found, owner, err)
 			}
-			_, err = graphBase(f.ctx, f.catalog, tt.setup(f))
+			_, err = graphBase(f.ctx, f.catalog, tt.setup(f), f.desiredIdentity())
 			requirePrimaryBaseUnavailable(t, err)
 		})
 	}
@@ -444,7 +500,7 @@ func BenchmarkGraphBaseReadyHit(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := graphBase(f.ctx, f.catalog, f.graph); err != nil {
+		if _, err := graphBase(f.ctx, f.catalog, f.graph, f.desiredIdentity()); err != nil {
 			b.Fatal(err)
 		}
 	}

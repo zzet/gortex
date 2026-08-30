@@ -362,7 +362,13 @@ func ResolveCSharpInterfaceDispatchScoped(g graph.Store, scope map[string]bool) 
 			}
 			f := families[fi]
 			for _, member := range f.members {
-				if member == e.To {
+				// Skip the member the call already reaches — and the CALLER
+				// itself: a family member forwarding through its own
+				// interface (decorator/facade shape) must not gain a
+				// synthesized from==to edge that find_usages consumers read
+				// as "the symbol is its own caller". Real recursion is the
+				// binder's edge to mint, never this synthesizer's.
+				if member == e.To || member == e.From {
 					continue
 				}
 				k := csharpCallSiteKey(e.From, member, e.FilePath, e.Line)

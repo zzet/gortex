@@ -2017,3 +2017,118 @@ The earlier audit covers `eebe4c4a` through `0bf03d62`. Subsequent atomic histor
 - Specification/addendum: this commit records the final evidence; its own hash is intentionally not self-referential.
 
 The push gate is satisfied: final binary identity, bounded topology/source-watch measurements, focused and broad normal/race suites, and the clean 42-assertion isolated lifecycle replay are all recorded above.
+
+### Mainline merge and epoch-safety addendum (2026-08-30)
+
+This addendum supersedes only the revision and schema-number facts in the
+2026-08-29 snapshot. That snapshot remains historical evidence for its named
+revision. The feature branch was subsequently merged with main at
+`f9e3f442`, and the five textual conflicts were resolved as one semantic
+integration rather than by choosing either side wholesale.
+
+#### Conflict resolutions
+
+| Conflict | Integrated contract |
+| --- | --- |
+| `file_batch_evict.go` | Main's exact mutation-receipt accounting is retained, while every node, edge, binding, candidate, and receipt deletion is scoped by `view_gen`. Ordinary file/repository replacement affects the current generation; authoritative forgetting can remove every generation and invalidates every receipt because an all-generation broadcast cannot be represented as one exact bounded receipt. |
+| `schema_version.go` | The current schema is version 19. Shipped-main version 13 retains its coverage-spelling purge; version 14 is the idempotent convergence point for the two former version-13 lineages; versions 15–18 retain generation keys, enumeration indexes, and masks; version 19 replays the coverage purge after generation re-keying so databases upgraded through either lineage converge. |
+| `sqlite_busy_test.go` | Main's writer-contention and rollback assertions remain, with eviction invoked through current-generation exact-receipt semantics. A rolled-back eviction leaves both graph rows and its receipt unchanged. |
+| `store.go` | Main's pool, checkpoint, bulk-mode, and index-creation behavior remains in the shared core. Generation-aware graph/sidecar helpers create the main indexes only after their corresponding migrations. |
+| `tools_fileops.go` | Main's fidelity admission, physical evidence, symlink/TOCTOU confinement, and file-dependents behavior is preserved. Worktree requests additionally use their selected physical root and routed reader; committed ref views use `GitTreeSource` and remain read-only. |
+
+An independent four-way audit compared merge base, feature side, main side, and
+the resolved working tree for all five files. It found no dropped mainline
+behavior in the four SQLite files. Its one MCP integration finding led to the
+post-publication syntax-health correction described below.
+
+#### Base refresh and publication epoch invariants
+
+- A dedicated base is current only when its owner/kind/layer/checkout/tree and
+  config, extractor, and resolver pipeline identities are all canonical.
+- A stale base is admitted into one serialized/coalesced background refresh.
+  Admission atomically marks the graph `graph_refreshing`, retains old pointers
+  solely for labeled fallback/pinned readers, advances every non-retired
+  checkout route epoch (including an already-pending route), and makes ref
+  views inexact.
+- Every normal checkout publication now proves both `graph_ready` and the exact
+  base generation captured by its build. This fence applies to active rows,
+  pending rows, slot flips, and the formerly uncovered case where a coordinator
+  observed no route before refresh admission and attempted to insert one
+  afterward.
+- Refresh rebuilds the exact immutable old base tree under the current pipeline,
+  atomically swaps the base, invalidates dependent checkout/ref generations,
+  and retires old generations after readers drain. Failure leaves the sealed
+  old base available only as labeled fallback and does not create retry storms.
+
+Focused regressions cover active, already-pending, and absent-route races.
+Store and indexer race suites passed in 11.731 s and 109.332 s. Guarded route
+publication measured a median of about 33.2 µs/op (1.61 KB, 42 allocations),
+refresh coalescing about 14 ns/op with zero allocations, and the ready
+`graphBase` path about 25.3 µs/op (3,048 B, 83 allocations).
+
+#### Routed mutation and fallback invariants
+
+- Only `edit_file`, `write_file`, and single-file `edit_symbol` are admitted on
+  a ready mutable checkout. Multi-file `rename_symbol` and every other mutator
+  fail before planning until they can publish through all affected checkout
+  coordinators atomically.
+- Mutation tickets bind checkout ID, mutation generation, observed route epoch,
+  and published route epoch. Disk commit is followed by detached publication,
+  so request cancellation cannot strand the graph; a timed-out request receives
+  a route-bound pending receipt. A receipt cannot heal another checkout or be
+  consumed through a different generation handle.
+- Absolute paths are attributed relative to the selected graph. Primary/sibling
+  paths and symlinks escaping into another checkout are rejected for reads and
+  writes. Primary bytes, graph health, generation pointers, and route epoch are
+  unchanged by a selected-worktree mutation.
+- A pending route may retain old generation pointers for pinned readers, but an
+  implicit new request receives only a labeled base fallback. It never composes
+  the retained overlay. Explicit worktree selection and exact/file/edit
+  operations reject the fallback as `view_building`.
+- The request reader is deliberately pinned to its pre-mutation generation.
+  Therefore completed routed mutations obtain syntax health from a short-lived
+  materialization of the exact published route epoch, verify the same ready
+  epoch before and after materialization, and release the lease immediately.
+  If the route moves, health is unknown rather than being reported from the
+  wrong generation. This mutation-only check measured a median 347.7 µs/op,
+  about 39.8 KB and 991 allocations.
+
+The routed mutation normal/race suites passed in 15.187/32.416 s; the final
+syntax-health and retained-pointer fallback subset passed in 7.387/17.228 s.
+
+#### Merge regression discovered by confinement
+
+The strict absolute-path guard initially caused 16 analyzer/AST tests to return
+zero matches. Production behavior was correct: those tests created source files
+in a second `TempDir`, outside the repository root already returned by
+`setupTestServer`, so `buildASTTargets` correctly discarded them before parsing.
+The fixtures now write beneath the registered indexed root; the production
+guard was not weakened. All 16 regressions pass normally and under the race
+detector.
+
+#### Post-merge isolated package evidence
+
+No machine daemon was stopped, restarted, reconfigured, or mutated for these
+tests. Package fixtures use temporary repositories and SQLite stores. The
+isolated lifecycle gate used a freshly built binary, disposable HOME/XDG
+directories, an explicit private socket/config/backend, and a disposable CWD;
+every lifecycle CLI operation was bound to that socket. Mandatory preflight
+graph inspection made two read-only calls to the configured daemon but no
+control, tracking, configuration, or mutation call.
+
+| Scope | Result |
+| --- | --- |
+| Full `internal/graph/store_sqlite` | PASS, 52.791 s |
+| Full `internal/indexer` | PASS, 585.803 s |
+| Full `internal/mcp` after fixture and routed-health corrections | PASS, 172.922 s |
+| Detector/AST regression matrix | PASS normal in 0.983 s; PASS race in 2.704 s |
+| SQLite schema/eviction focused race suites | PASS; migration and rollback repetitions covered both version-13 lineages and generation-scoped receipts |
+| Repository-wide bounded gate | `go test -p=2 ./... -count=1 -timeout=30m` PASS; within that run SQLite was 53.464 s, indexer 562.623 s, MCP 187.861 s, and every other package passed |
+| Contract race gate | `go test -race -p=2 ./internal/graph/store_sqlite/... ./internal/mcp/... -count=1 -timeout=30m` PASS; SQLite 935.971 s, MCP 492.156 s, streamable MCP 1.773 s; observed test-process RSS stayed bounded rather than growing with generations |
+| Isolated daemon lifecycle | PASS with dedicated base plus automatically discovered linked-worktree overlay; same-symbol search deduplicated and selected the overlay payload, dirty tracked and non-ignored untracked symbols appeared only in the overlay, removal first returned labeled `removal_grace` fallback and then purged the checkout in about 8.602 s |
+| Isolated daemon resources | Automatic discovery reached ready in 357 ms, dirty/untracked refresh in 541 ms, daemon peak RSS was 198,574,080 bytes, final SQLite store was 577,536 bytes, shutdown removed the private socket; binary SHA-256 `8e3de6c63ca3b734877adf8ecfffd3a12302828df42bfe0550a08d21e4f8e8ee` |
+
+The repository-wide, contract-race, and isolated lifecycle gates were run on
+the fully resolved staged source tree immediately before commit; the only later
+change was this documentation-only evidence update. The retained isolated
+artifact is `/private/tmp/gortex-isolated-lifecycle.Bbs031/PASS.json`.

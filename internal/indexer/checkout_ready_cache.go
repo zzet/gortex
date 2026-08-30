@@ -117,12 +117,13 @@ func (c *CheckoutCoordinator) moveReadyCommitSlot(
 	}
 	err := c.catalog.BindReadyGenerationLeaseToCheckout(ctx,
 		store_sqlite.BindReadyGenerationLeaseToCheckoutRequest{
-			Key:                resolved.cacheKey,
-			LeaseToken:         resolved.leaseToken,
-			CheckoutID:         c.checkoutID,
-			ExpectedRouteEpoch: route.RouteEpoch,
-			GenerationID:       resolved.generationID,
-			State:              state,
+			Key:                    resolved.cacheKey,
+			LeaseToken:             resolved.leaseToken,
+			CheckoutID:             c.checkoutID,
+			ExpectedRouteEpoch:     route.RouteEpoch,
+			GenerationID:           resolved.generationID,
+			State:                  state,
+			RequireActiveGraphBase: true,
 		})
 	if err != nil {
 		c.releaseReadyCommitLease(resolved.leaseToken)

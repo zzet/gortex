@@ -35,12 +35,13 @@ func callAnalyzeUnsafe(t *testing.T, srv *Server, extra map[string]any) map[stri
 	return out
 }
 
-// writeUnsafeFixture drops a fixture file into a temp dir and
-// registers a KindFile node for it so the AST engine can discover
-// and parse the file via buildASTTargets.
+// writeUnsafeFixture drops a fixture file into the indexed test repository and
+// registers a KindFile node for it so buildASTTargets exercises production
+// path confinement rather than an unregistered absolute temp path.
 func writeUnsafeFixture(t *testing.T, srv *Server, name, lang, src string) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := srv.indexer.RootPath()
+	require.NotEmpty(t, dir, "test server has no indexed repository root")
 	abs := filepath.Join(dir, name)
 	require.NoError(t, os.WriteFile(abs, []byte(src), 0o644))
 	srv.graph.AddNode(&graph.Node{

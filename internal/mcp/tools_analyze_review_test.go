@@ -34,13 +34,14 @@ func callAnalyzeReview(t *testing.T, srv *Server, extra map[string]any) map[stri
 	return out
 }
 
-// writeReviewFixture drops a fixture file + a KindFile node so the AST
-// engine can discover it. fnNodes lets the caller register enclosing
-// function nodes (with optional loop_depth metadata) so the symbol
-// lookup resolves and the grounding post-pass has graph evidence.
+// writeReviewFixture drops a fixture file under the indexed test repository
+// and adds a KindFile node so production path confinement can resolve it.
+// fnNodes lets the caller register enclosing function nodes (with optional
+// loop_depth metadata) for graph-grounded post-processing.
 func writeReviewFixture(t *testing.T, srv *Server, name, lang, src string) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := srv.indexer.RootPath()
+	require.NotEmpty(t, dir, "test server has no indexed repository root")
 	abs := filepath.Join(dir, name)
 	require.NoError(t, os.WriteFile(abs, []byte(src), 0o644))
 	srv.graph.AddNode(&graph.Node{

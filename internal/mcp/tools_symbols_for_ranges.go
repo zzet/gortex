@@ -72,7 +72,7 @@ func (s *Server) lowerRangesDetailedContext(ctx context.Context, specs []rangeSp
 			unresolved = append(unresolved, sp.File)
 			continue
 		}
-		gp := s.resolveOverlayGraphPath(relPath, absPath)
+		gp := s.resolveOverlayGraphPathForRequest(ctx, relPath, absPath)
 		byGraphPath[gp] = append(byGraphPath[gp], sp)
 		displayOf[gp] = relPath
 	}

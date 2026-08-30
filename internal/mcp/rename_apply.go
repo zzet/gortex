@@ -444,7 +444,7 @@ func (s *Server) commitRenameWrites(ctx context.Context, writes []*renameFileWri
 		if outcome.Err != nil {
 			entry["reindex_error"] = outcome.Err.Error()
 		}
-		s.attachMutationFreshness(entry, w.RelPath, w.AbsPath, outcome)
+		s.attachMutationFreshness(ctx, entry, w.RelPath, w.AbsPath, outcome)
 		attachMutationCommit(entry, commit)
 		results = append(results, entry)
 	}

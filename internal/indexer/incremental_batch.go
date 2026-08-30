@@ -913,6 +913,14 @@ func restubIncomingRefsFromView(
 
 func evictFilesBatched(g graph.Store, paths []string) (int, int) {
 	paths = appendUniqueSorted(nil, paths...)
+	// Only the caller's own spellings are evicted. Rows a pre-fix binary
+	// wrote under a re-spelled path are healed once, by schema migration
+	// v13 (purgeLegacyCoverageSpellings): sweeping a twin spelling here
+	// would route it through endpoint-touch eviction, which cannot tell a
+	// shared coverage target (a license, a team, a module) from a
+	// per-file artifact and so would take other files' valid edges with
+	// it — or miss the stale ones, depending on which file the shared
+	// node happened to be anchored to.
 	if len(paths) == 0 {
 		return 0, 0
 	}

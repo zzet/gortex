@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
@@ -129,6 +130,7 @@ func (f *coordinatorFixture) secondWorktree(
 		Store:        f.store,
 		Builder:      builder,
 		Leases:       f.leases,
+		Config:       config.Default().Index,
 		Logger:       zap.NewNop(),
 		PollInterval: -1,
 	})

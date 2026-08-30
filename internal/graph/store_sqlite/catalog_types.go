@@ -167,7 +167,10 @@ var refViewStates = []RefViewState{
 type RouteState string
 
 const (
-	// RoutePending has no generation to serve from yet.
+	// RoutePending is not an exact checkout view. A new route has no generation
+	// yet; a dedicated-base refresh may retain the previous sealed pointers so
+	// pinned readers and labeled base fallback remain available while exact
+	// routing is fenced by the pending state and advanced route epoch.
 	RoutePending RouteState = "pending"
 	// RouteActive is serving.
 	RouteActive RouteState = "active"
@@ -341,6 +344,15 @@ type CheckoutPathEvidence struct {
 	SampledAt                   int64 // unix seconds
 	SampleGeneration            int64
 }
+
+// DedicatedGraphStateReady is the persisted catalog spelling for a dedicated
+// graph that may serve queries. The catalog owns the vocabulary because SQL
+// guards must compare the same value lifecycle writers persist.
+const DedicatedGraphStateReady = "graph_ready"
+
+// DedicatedGraphStateRefreshing keeps the previous sealed base readable as a
+// labeled fallback while a replacement pipeline generation builds off-route.
+const DedicatedGraphStateRefreshing = "graph_refreshing"
 
 // DedicatedGraph is a graph built for one checkout. ActiveGenerationID is 0
 // when no generation is published yet.
@@ -663,6 +675,13 @@ type FlipCheckoutRouteRequest struct {
 	CommitGenerationID int64
 	DirtyGenerationID  int64
 	State              RouteState
+	// RequireActiveGraphBase closes publication against a concurrent
+	// dedicated-base refresh. Zero preserves catalog-only/legacy callers.
+	RequireActiveGraphBase bool
+	// ExpectedBaseGenerationID is the immutable base epoch captured before
+	// building the route's sparse generations. It is required when
+	// RequireActiveGraphBase is true.
+	ExpectedBaseGenerationID int64
 }
 
 // FlipCheckoutRouteSlotRequest repoints one slot of a checkout's route.
@@ -675,6 +694,13 @@ type FlipCheckoutRouteSlotRequest struct {
 	GenerationID       int64
 	ExpectedRouteEpoch int64
 	State              RouteState
+	// RequireActiveGraphBase closes publication against a concurrent
+	// dedicated-base refresh. Zero preserves catalog-only/legacy callers.
+	RequireActiveGraphBase bool
+	// ExpectedBaseGenerationID is the immutable base epoch captured before
+	// building the slot's sparse generation. It is required when
+	// RequireActiveGraphBase is true.
+	ExpectedBaseGenerationID int64
 }
 
 // SetPrimaryDedicatedGraphRequest promotes one graph to its family's primary

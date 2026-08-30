@@ -20,6 +20,7 @@ import (
 
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/tokens"
 )
@@ -86,6 +87,13 @@ func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, 
 
 	if filepath.IsAbs(rawPath) {
 		abs := filepath.Clean(rawPath)
+		view := requestViewPathRoot(ctx)
+		if viewErr := view.validateAbsolute(abs); viewErr != nil {
+			return "", "", viewErr
+		}
+		if rel, ok := view.graphRelative(abs); ok {
+			return abs, rel, nil
+		}
 		return abs, s.repoRelative(abs), nil
 	}
 
@@ -396,17 +404,42 @@ func (s *Server) guardSymlinkWithinRepo(ctx context.Context, absPath string) err
 // hashed, even if a symlink is retargeted out of the repo and restored before
 // the request returns.
 func (s *Server) guardResolvedPathWithinRepo(ctx context.Context, requestedPath, resolvedPath string) error {
+	real := filepath.Clean(resolvedPath)
+	if view := requestViewPathRoot(ctx); view.root != "" {
+		// A routed worktree is a single coherent filesystem view. A symlink
+		// may be lexically inside it while resolving into the primary or a
+		// sibling checkout; accepting the union of all tracked roots here
+		// would then expose or mutate bytes from a different graph view.
+		physicalRoot, err := filepath.EvalSymlinks(view.root)
+		if err != nil || physicalRoot == "" {
+			physicalRoot = resolveNearestExistingAncestor(view.root)
+		}
+		physicalRoot = filepath.Clean(physicalRoot)
+		if pathContainedIn(real, physicalRoot) {
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: %q resolves to %q, outside the selected checkout root %q",
+			errPathEscape, requestedPath, real, physicalRoot)
+	}
+
 	roots := s.guardRepoRoots(ctx)
 	if len(roots) == 0 {
 		return nil // no known roots (control client / unindexed) — nothing to enforce
 	}
-	real := filepath.Clean(resolvedPath)
 	for _, root := range roots {
 		if pathContainedIn(real, root) {
 			return nil
 		}
 	}
 	return fmt.Errorf("%w: %q resolves to %q, outside every indexed repository root", errPathEscape, requestedPath, real)
+}
+
+func (s *Server) guardedResolvedPath(ctx context.Context, absPath string) (string, error) {
+	if err := s.guardSymlinkWithinRepo(ctx, absPath); err != nil {
+		return "", err
+	}
+	return absPath, nil
 }
 
 // resolveNearestExistingAncestor symlink-resolves the longest existing prefix
@@ -482,7 +515,7 @@ func (s *Server) resolveNodePath(ctx context.Context, node *graph.Node) (string,
 		return "", fmt.Errorf("node %q has no file path", node.ID)
 	}
 	if filepath.IsAbs(node.FilePath) {
-		return filepath.Clean(node.FilePath), nil
+		return s.guardedResolvedPath(ctx, filepath.Clean(node.FilePath))
 	}
 	if s.multiIndexer != nil {
 		if root, ok := s.multiIndexer.RepoRoot(node.RepoPrefix); ok {
@@ -503,14 +536,14 @@ func (s *Server) resolveNodePath(ctx context.Context, node *graph.Node) (string,
 			// same reasoning as resolveFilePath: worktrees of one repo
 			// share an index identity, so a node's resolved path can
 			// land on a sibling checkout.
-			return s.checkoutRootedPath(ctx, abs, root, node.RepoPrefix), nil
+			return s.guardedResolvedPath(ctx, s.checkoutRootedPath(ctx, abs, root, node.RepoPrefix))
 		}
 		return "", fmt.Errorf("could not resolve repo root for node %q (repo_prefix=%q)", node.ID, node.RepoPrefix)
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
 			abs := filepath.Clean(filepath.Join(root, node.FilePath))
-			return requestViewPathRoot(ctx).rooted(abs, root), nil
+			return s.guardedResolvedPath(ctx, requestViewPathRoot(ctx).rooted(abs, root))
 		}
 	}
 	return "", fmt.Errorf("%w: node=%q file=%q", errPathUnresolved, node.ID, node.FilePath)
@@ -558,7 +591,11 @@ func (s *Server) resolveGraphPath(ctx context.Context, graphPath string) (string
 		return "", errViewHasNoWorkingCopy
 	}
 	if filepath.IsAbs(graphPath) {
-		return filepath.Clean(graphPath), nil
+		abs := filepath.Clean(graphPath)
+		if viewErr := requestViewPathRoot(ctx).validateAbsolute(abs); viewErr != nil {
+			return "", viewErr
+		}
+		return s.guardedResolvedPath(ctx, abs)
 	}
 	if s.multiIndexer != nil {
 		if abs := s.multiIndexer.ResolveFilePath(graphPath); abs != "" {
@@ -576,14 +613,14 @@ func (s *Server) resolveGraphPath(ctx context.Context, graphPath string) (string
 				// view still has to move the path into its own checkout.
 				abs = requestViewPathRoot(ctx).rooted(abs, root)
 			}
-			return abs, nil
+			return s.guardedResolvedPath(ctx, abs)
 		}
 		return "", fmt.Errorf("could not resolve repo root for path %q", graphPath)
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
 			abs := filepath.Clean(filepath.Join(root, graphPath))
-			return requestViewPathRoot(ctx).rooted(abs, root), nil
+			return s.guardedResolvedPath(ctx, requestViewPathRoot(ctx).rooted(abs, root))
 		}
 	}
 	return "", fmt.Errorf("%w: path=%q", errPathUnresolved, graphPath)
@@ -601,6 +638,12 @@ func (s *Server) resolveGraphPath(ctx context.Context, graphPath string) (string
 // / FileEditingContext so a repo-relative path doesn't silently miss the
 // prefixed nodes in multi-repo mode.
 func (s *Server) graphRelPath(ctx context.Context, fp string) string {
+	if files := refViewFilesFor(ctx); files != nil {
+		if rel, err := files.relPath(fp); err == nil {
+			return files.graphPath(rel)
+		}
+		return fp
+	}
 	if _, rel, err := s.resolveFilePath(ctx, fp); err == nil && rel != "" {
 		return s.graphPathSpelling(rel)
 	}
@@ -738,14 +781,40 @@ func (s *Server) reindexFile(absPath string) bool {
 // clean edit stays quiet. This lets an agent notice immediately that an edit
 // left the file syntactically broken, before it trusts graph queries against
 // it. Returns nil when the file parsed cleanly or its health is unknown.
-func (s *Server) fileSyntaxHealth(relPath, absPath string) map[string]any {
-	if s.graph == nil {
+func (s *Server) fileSyntaxHealth(
+	ctx context.Context,
+	relPath, absPath string,
+	outcome mutationReindexOutcome,
+) map[string]any {
+	reader := s.requestBaseReader(ctx)
+	if outcome.CheckoutID != "" {
+		materializer := s.Materializer()
+		if materializer == nil || materializer.Catalog == nil || outcome.PublishedRouteEpoch <= 0 {
+			return nil
+		}
+		route, found, err := materializer.Catalog.GetCheckoutRoute(ctx, outcome.CheckoutID)
+		if err != nil || !found || !graphview.RouteReady(route) || route.RouteEpoch != outcome.PublishedRouteEpoch {
+			return nil
+		}
+		view, err := materializer.MaterializeCheckout(ctx, outcome.CheckoutID)
+		if err != nil || view == nil {
+			return nil
+		}
+		defer view.Close()
+		route, found, err = materializer.Catalog.GetCheckoutRoute(ctx, outcome.CheckoutID)
+		if err != nil || !found || !graphview.RouteReady(route) || route.RouteEpoch != outcome.PublishedRouteEpoch {
+			return nil
+		}
+		reader = view.Reader
+	}
+	if reader == nil {
 		return nil
 	}
 	graphPath := s.resolveOverlayGraphPath(relPath, absPath)
-	// Base read on purpose: the parse-error stamp this reads back is written
-	// by the indexer after the file lands on disk.
-	for _, n := range s.graph.GetFileNodes(graphPath) {
+	// Read the request-scoped published generation: routed mutations stamp
+	// syntax health in the selected checkout, while canonical requests retain
+	// the canonical graph reader.
+	for _, n := range reader.GetFileNodes(graphPath) {
 		if n == nil || n.Kind != graph.KindFile || n.Meta == nil {
 			continue
 		}
@@ -953,7 +1022,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if reindexOutcome.Err != nil {
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
-	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	s.attachMutationFreshness(ctx, resp, relPath, absPath, reindexOutcome)
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}
@@ -1112,7 +1181,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if reindexOutcome.Err != nil {
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
-	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	s.attachMutationFreshness(ctx, resp, relPath, absPath, reindexOutcome)
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, priorContent, fileExists)
 	}
@@ -1368,6 +1437,17 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
+	// Admission before any work: a fidelity_globs value that breaks a size
+	// bound refuses the request. Dropping the offending rule would rewrite
+	// a first-match policy silently — an over-budget `omit` disappearing
+	// lets a later `full` win, and the content the caller asked to hide
+	// comes back in a response that looks like a normal success. Parsed
+	// here rather than at the point of use so a malformed request cannot
+	// be served by a path that happens not to reach the compressor.
+	fidelityRules, fidelityErr := parseFidelityGlobs(req.GetString("fidelity_globs", ""))
+	if fidelityErr != nil {
+		return mcp.NewToolResultError("read_file: " + fidelityErr.Error()), nil
+	}
 	physicalEvidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
 	if evidenceErr != nil {
 		return mcp.NewToolResultError(evidenceErr.Error()), nil
@@ -1485,7 +1565,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			symbols = sg.Nodes
 		}
 		keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), symbols)
-		decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), relPath)
+		decide := fidelityDecideForPath(fidelityRules, relPath)
 		if out, eerr := elide.CompressWith(content, language, elide.Options{Keep: keepPred, Decide: decide}); eerr == nil && len(out) != len(content) {
 			content = out
 			bodiesElided = true

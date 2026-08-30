@@ -337,14 +337,16 @@ func (mi *MultiIndexer) backfillWorkspaceSlugsWithImpact() (nodesStamped, contra
 	// Map each repo prefix to its global-config RepoEntry so we honour
 	// the user-level workspace/project override even on backfill.
 	entryByPrefix := make(map[string]config.RepoEntry, len(repoMeta))
-	if mi.configMgr.Global() != nil {
-		for _, e := range mi.configMgr.Global().Repos {
-			p := config.ResolvePrefix(e)
-			if p == "" || p == "." {
-				continue
-			}
-			entryByPrefix[p] = e
+	// ReposSnapshot copies the list under the config mutation mutex, the same
+	// reason the crossWorkspaceLookup path below takes it: the deferred
+	// receipt tail reaches this backfill through RunPreEnrichResolve while
+	// UntrackRepo and TrackRepoCtx edit the live Repos slice in place.
+	for _, e := range mi.configMgr.Global().ReposSnapshot() {
+		p := config.ResolvePrefix(e)
+		if p == "" || p == "." {
+			continue
 		}
+		entryByPrefix[p] = e
 	}
 	for prefix, root := range repoMeta {
 		// Make sure the per-repo `.gortex.yaml` is loaded — at warmup
@@ -567,15 +569,16 @@ func (mi *MultiIndexer) collectCrossWorkspaceRules() (map[string][]resolver.Cros
 	// Per-repo crossWorkspaceLookup needs the same precedence as the
 	// stamp path: a global-config Workspace override changes which
 	// source-workspace bucket receives the repo's dependency rules.
+	// ReposSnapshot copies the list under the config mutation mutex — the
+	// deferred receipt tail runs this concurrently with UntrackRepo, which
+	// edits the live Repos slice in place.
 	entryByPrefix := make(map[string]config.RepoEntry)
-	if global := mi.configMgr.Global(); global != nil {
-		for _, e := range global.Repos {
-			p := config.ResolvePrefix(e)
-			if p == "" || p == "." {
-				continue
-			}
-			entryByPrefix[p] = e
+	for _, e := range mi.configMgr.Global().ReposSnapshot() {
+		p := config.ResolvePrefix(e)
+		if p == "" || p == "." {
+			continue
 		}
+		entryByPrefix[p] = e
 	}
 	for _, prefix := range repoPrefixes {
 		cfg := mi.configMgr.GetRepoConfig(prefix)

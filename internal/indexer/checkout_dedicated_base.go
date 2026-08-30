@@ -76,54 +76,11 @@ func (l *CheckoutLifecycle) buildPromotedCorpus(
 		if err != nil {
 			return nil, 0, checkoutSample{}, resampled, err
 		}
-		content, err := source.NewGitTreeSource(ctx, checkout.RootPath, before.tree)
+		index, generationID, err := l.buildDedicatedCorpusSnapshot(
+			ctx, graphID, checkout, prefix, coordinator, before,
+		)
 		if err != nil {
 			return nil, 0, checkoutSample{}, resampled, err
-		}
-		if l.indexBarrier != nil {
-			l.indexBarrier()
-		}
-
-		changes := make([]LayerPathChange, 0)
-		walkErr := content.Walk(ctx, func(file source.FileMeta) error {
-			changes = append(changes, LayerPathChange{Path: file.Path, Kind: LayerPathAdded})
-			return nil
-		})
-		if walkErr != nil {
-			_ = content.Close()
-			return nil, 0, checkoutSample{}, resampled, walkErr
-		}
-
-		generationID, report, buildErr := coordinator.builder.Build(ctx, BuildRequest{
-			Identity: GenerationIdentity{
-				OwnerKind:            dedicatedBaseGenerationKind,
-				GraphID:              graphID,
-				LayerID:              graphID + ":base",
-				CheckoutID:           checkout.CheckoutID,
-				GenerationKind:       dedicatedBaseGenerationKind,
-				LowerViewFingerprint: before.tree,
-				TreeOID:              before.tree,
-				ProvenanceCommitOID:  before.commit,
-				ConfigHash:           coordinator.configHash,
-				ExtractorVersions:    coordinator.extractors,
-				ResolverVersion:      checkoutResolverVersion,
-				CreatedAt:            l.now().Unix(),
-			},
-			Base:        graph.New(),
-			Target:      content,
-			Changes:     changes,
-			RootPath:    coordinator.root,
-			RepoPrefix:  coordinator.repoPrefix,
-			WorkspaceID: coordinator.workspaceID,
-			ProjectID:   coordinator.projectID,
-		})
-		closeErr := content.Close()
-		if buildErr != nil {
-			return nil, 0, checkoutSample{}, resampled, buildErr
-		}
-		if closeErr != nil {
-			coordinator.abandonBuild(ctx, generationID, true)
-			return nil, 0, checkoutSample{}, resampled, closeErr
 		}
 
 		after, err := sampleCheckout(ctx, checkout.RootPath)
@@ -132,13 +89,7 @@ func (l *CheckoutLifecycle) buildPromotedCorpus(
 			return nil, 0, checkoutSample{}, resampled, err
 		}
 		if after.tree == before.tree && after.commit == before.commit {
-			return &IndexResult{
-				NodeCount:  report.NodeCount,
-				EdgeCount:  report.EdgeCount,
-				FileCount:  len(report.IndexedPaths),
-				DurationMs: report.Duration.Milliseconds(),
-				RepoPrefix: prefix,
-			}, generationID, before, resampled, nil
+			return index, generationID, before, resampled, nil
 		}
 
 		resampled++
@@ -147,6 +98,75 @@ func (l *CheckoutLifecycle) buildPromotedCorpus(
 	return nil, 0, checkoutSample{}, resampled, fmt.Errorf(
 		"%w: %s moved under two full generation builds", ErrCheckoutMoved, checkout.RootPath,
 	)
+}
+
+// buildDedicatedCorpusSnapshot performs one full immutable-tree pass. Both
+// initial promotion and pipeline refresh use it so the generation identity and
+// parser configuration cannot drift between the two paths.
+func (l *CheckoutLifecycle) buildDedicatedCorpusSnapshot(
+	ctx context.Context,
+	graphID string,
+	checkout store_sqlite.Checkout,
+	prefix string,
+	coordinator *CheckoutCoordinator,
+	snapshot checkoutSample,
+) (*IndexResult, int64, error) {
+	content, err := source.NewGitTreeSource(ctx, checkout.RootPath, snapshot.tree)
+	if err != nil {
+		return nil, 0, err
+	}
+	if l.indexBarrier != nil {
+		l.indexBarrier()
+	}
+
+	changes := make([]LayerPathChange, 0)
+	walkErr := content.Walk(ctx, func(file source.FileMeta) error {
+		changes = append(changes, LayerPathChange{Path: file.Path, Kind: LayerPathAdded})
+		return nil
+	})
+	if walkErr != nil {
+		_ = content.Close()
+		return nil, 0, walkErr
+	}
+
+	generationID, report, buildErr := coordinator.builder.Build(ctx, BuildRequest{
+		Identity: GenerationIdentity{
+			OwnerKind:            dedicatedBaseGenerationKind,
+			GraphID:              graphID,
+			LayerID:              graphID + ":base",
+			CheckoutID:           checkout.CheckoutID,
+			GenerationKind:       dedicatedBaseGenerationKind,
+			LowerViewFingerprint: snapshot.tree,
+			TreeOID:              snapshot.tree,
+			ProvenanceCommitOID:  snapshot.commit,
+			ConfigHash:           coordinator.configHash,
+			ExtractorVersions:    coordinator.extractors,
+			ResolverVersion:      checkoutResolverVersion,
+			CreatedAt:            l.now().Unix(),
+		},
+		Base:        graph.New(),
+		Target:      content,
+		Changes:     changes,
+		RootPath:    coordinator.root,
+		RepoPrefix:  coordinator.repoPrefix,
+		WorkspaceID: coordinator.workspaceID,
+		ProjectID:   coordinator.projectID,
+	})
+	closeErr := content.Close()
+	if buildErr != nil {
+		return nil, 0, buildErr
+	}
+	if closeErr != nil {
+		coordinator.abandonBuild(ctx, generationID, true)
+		return nil, 0, closeErr
+	}
+	return &IndexResult{
+		NodeCount:  report.NodeCount,
+		EdgeCount:  report.EdgeCount,
+		FileCount:  len(report.IndexedPaths),
+		DurationMs: report.Duration.Milliseconds(),
+		RepoPrefix: prefix,
+	}, generationID, nil
 }
 
 // ensurePromotedRepoShell installs the process-local configuration/indexer

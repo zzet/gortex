@@ -1,0 +1,21 @@
+# Line endings are a property of the repository, not of the checkout.
+#
+# Several text assets are consumed byte-for-byte rather than line-by-line:
+# `internal/agents/opencode/plugin/gortex.js` and
+# `internal/agents/pi/extension/index.ts` are compiled into the binary with
+# go:embed and written verbatim into a user's project, and the golden files
+# under `cmd/gortex/testdata/` are compared against rendered output. Git for
+# Windows installs with `core.autocrlf=true` — the GitHub windows runner
+# included — so without this file a Windows checkout rewrites those assets to
+# CRLF, which both changes what the binary ships and breaks the comparisons.
+#
+# The committed blobs are already LF, so this pins the checkout; it does not
+# rewrite history or content.
+* text=auto eol=lf
+
+# PowerShell is the one place a CRLF checkout is still the convention.
+*.ps1 text eol=crlf
+
+# Never guess at these.
+*.png binary
+*.gz binary

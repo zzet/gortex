@@ -289,7 +289,7 @@ func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *g
 	if view := OverlayViewFromContext(ctx); view != nil && !snapshot.canonical {
 		return ctx, nil, fmt.Errorf("overlay view has a non-canonical request snapshot")
 	}
-	if err := s.canonicalizeOverlayRequestSnapshot(snapshot); err != nil {
+	if err := s.canonicalizeOverlayRequestSnapshot(ctx, snapshot); err != nil {
 		return ctx, nil, err
 	}
 	ctx = withOverlayRequestSnapshot(ctx, snapshot)
@@ -323,7 +323,7 @@ func canonicalOverlayGraphPath(candidate string) string {
 // only when their replacement state is identical. SnapshotFor does not retain
 // push chronology, so conflicting aliases fail closed instead of guessing
 // which editor state is newer.
-func (s *Server) canonicalizeOverlayRequestSnapshot(snapshot *overlayRequestSnapshot) error {
+func (s *Server) canonicalizeOverlayRequestSnapshot(ctx context.Context, snapshot *overlayRequestSnapshot) error {
 	if snapshot == nil || snapshot.canonical {
 		return nil
 	}
@@ -342,18 +342,18 @@ func (s *Server) canonicalizeOverlayRequestSnapshot(snapshot *overlayRequestSnap
 	byPath := make(map[string]canonicalRecord, len(snapshot.files))
 	for _, file := range snapshot.files {
 		rawPath := file.Path
-		absPath, err := s.resolveOverlayAbsPath(rawPath)
+		absPath, err := s.resolveOverlayAbsPathForRequest(ctx, rawPath)
 		if err != nil {
 			return err
 		}
-		owner := s.pickIndexerForPath(absPath)
+		owner := s.pickIndexerForRequestPath(ctx, absPath)
 		if absPath == "" || owner == nil {
 			return fmt.Errorf("overlay path %q is outside the registered workspace", rawPath)
 		}
 		if snapshot.workspace != "" && owner.WorkspaceID() != snapshot.workspace {
 			return fmt.Errorf("overlay path %q belongs to workspace %q, not registered workspace %q", rawPath, owner.WorkspaceID(), snapshot.workspace)
 		}
-		graphPath := canonicalOverlayGraphPath(s.resolveOverlayGraphPath(rawPath, absPath))
+		graphPath := canonicalOverlayGraphPath(s.resolveOverlayGraphPathForRequest(ctx, rawPath, absPath))
 		if graphPath == "" {
 			return fmt.Errorf("overlay path %q has no canonical graph path", rawPath)
 		}
@@ -401,7 +401,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 		if ov.BaseSHA == "" {
 			continue
 		}
-		abs, resolveErr := s.resolveOverlayAbsPath(ov.Path)
+		abs, resolveErr := s.resolveOverlayAbsPathForRequest(ctx, ov.Path)
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
@@ -482,6 +482,28 @@ func (s *Server) resolveOverlayAbsPath(p string) (string, error) {
 	return "", nil
 }
 
+// resolveOverlayAbsPathForRequest resolves an editor path against the working
+// copy selected for this request. The legacy helper above remains for
+// view-independent administrative callers; buffer canonicalization, BaseSHA
+// checks, parsing, and raw substitution must all use this one coherent root.
+func (s *Server) resolveOverlayAbsPathForRequest(ctx context.Context, p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("overlay path is empty")
+	}
+	if filepath.IsAbs(p) {
+		abs := filepath.Clean(p)
+		if err := requestViewPathRoot(ctx).validateAbsolute(abs); err != nil {
+			return "", err
+		}
+		return abs, nil
+	}
+	abs, _, err := s.resolveFilePath(ctx, p)
+	if err != nil {
+		return "", err
+	}
+	return abs, nil
+}
+
 // resolveOverlayGraphPath turns the overlay path into the
 // `graph_path` form (repo-prefixed in multi-repo mode, repo-relative
 // in single-repo mode) — the form `GetFileNodes` and friends use.
@@ -509,6 +531,24 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 	return filepath.ToSlash(p)
 }
 
+// resolveOverlayGraphPathForRequest maps a file beneath the selected checkout
+// back to the shared graph spelling. A routed worktree is intentionally not a
+// registered MultiIndexer root, so the legacy owner lookup cannot derive this
+// identity from the absolute path alone.
+func (s *Server) resolveOverlayGraphPathForRequest(ctx context.Context, p, absPath string) string {
+	view := requestViewPathRoot(ctx)
+	if view.root != "" && view.contains(absPath) {
+		if rel, err := filepath.Rel(view.root, absPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+			rel = filepath.ToSlash(rel)
+			if view.repoPrefix != "" {
+				return path.Join(view.repoPrefix, rel)
+			}
+			return rel
+		}
+	}
+	return s.resolveOverlayGraphPath(p, absPath)
+}
+
 // pickIndexerForPath chooses the per-repo Indexer (multi-repo) or
 // the single Indexer (single-repo) that owns absPath. Returns nil
 // when no Indexer owns the path (the overlay is silently skipped
@@ -527,6 +567,26 @@ func (s *Server) pickIndexerForPath(absPath string) *indexer.Indexer {
 		}
 	}
 	return nil
+}
+
+// pickIndexerForRequestPath returns the canonical indexer that owns a file in
+// the selected worktree. The indexer supplies parser/config identity; the file
+// bytes still come from the routed checkout resolved above.
+func (s *Server) pickIndexerForRequestPath(ctx context.Context, absPath string) *indexer.Indexer {
+	view := requestViewPathRoot(ctx)
+	if view.root != "" && view.contains(absPath) {
+		if s.multiIndexer != nil && view.repoPrefix != "" {
+			if root, ok := s.multiIndexer.RepoRoot(view.repoPrefix); ok {
+				if idx, _ := s.multiIndexer.IndexerForFile(root); idx != nil {
+					return idx
+				}
+			}
+		}
+		if s.indexer != nil {
+			return s.indexer
+		}
+	}
+	return s.pickIndexerForPath(absPath)
 }
 
 // constructOverlayLayer is the parse-and-resolve pass. For each
@@ -579,14 +639,14 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		absPath, err := s.resolveOverlayAbsPath(ov.Path)
+		absPath, err := s.resolveOverlayAbsPathForRequest(ctx, ov.Path)
 		if err != nil {
 			return nil, nil, err
 		}
 		if absPath == "" {
 			continue // untracked file — silent skip, matches disk path
 		}
-		graphPath := s.resolveOverlayGraphPath(ov.Path, absPath)
+		graphPath := s.resolveOverlayGraphPathForRequest(ctx, ov.Path, absPath)
 		coveredPaths = append(coveredPaths, graphPath)
 
 		if ov.Deleted {
@@ -602,7 +662,7 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 			continue
 		}
 
-		idx := s.pickIndexerForPath(absPath)
+		idx := s.pickIndexerForRequestPath(ctx, absPath)
 		if idx == nil {
 			continue
 		}
@@ -1233,7 +1293,7 @@ func (s *Server) overlayContentFor(ctx context.Context, absPath string) (string,
 		if ov.Deleted {
 			continue
 		}
-		ovAbs, _ := s.resolveOverlayAbsPath(ov.Path)
+		ovAbs, _ := s.resolveOverlayAbsPathForRequest(ctx, ov.Path)
 		if ovAbs == "" {
 			continue
 		}

@@ -147,7 +147,12 @@ func (s *Server) materializeRefView(
 	rider.MarkExact(fingerprint)
 	rider.ViewFingerprint = fingerprint
 
-	routed := &requestView{reader: view.Reader, materialized: view, rider: rider}
+	routed := &requestView{
+		reader:                view.Reader,
+		materialized:          view,
+		rider:                 rider,
+		suppressBufferOverlay: true,
+	}
 	routed.bindSources(view.GenerationSources(), s.graph)
 	routed.files = &refViewFiles{
 		store:        s.viewStore(),

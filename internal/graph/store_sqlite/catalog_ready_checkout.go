@@ -18,6 +18,10 @@ type BindReadyGenerationLeaseToCheckoutRequest struct {
 	ExpectedRouteEpoch int64
 	GenerationID       int64
 	State              RouteState
+	// RequireActiveGraphBase rejects publication when the dedicated graph no
+	// longer names Key.BaseGenerationID. Zero preserves catalog-only callers
+	// that intentionally have no dedicated-graph row.
+	RequireActiveGraphBase bool
 }
 
 // BindReadyGenerationLeaseToCheckout validates a ready-generation cache lease
@@ -86,6 +90,15 @@ func (c *Catalog) BindReadyGenerationLeaseToCheckout(
 	}
 	if !compatible {
 		return fmt.Errorf("%w: ready generation is no longer compatible", ErrCatalogStaleGuard)
+	}
+	if req.RequireActiveGraphBase {
+		active, err := graphBaseGenerationIsActiveTx(ctx, tx, req.Key.GraphID, req.Key.BaseGenerationID)
+		if err != nil {
+			return err
+		}
+		if !active {
+			return fmt.Errorf("%w: dedicated graph %s base moved", ErrCatalogStaleGuard, req.Key.GraphID)
+		}
 	}
 
 	result, err := tx.ExecContext(ctx, `

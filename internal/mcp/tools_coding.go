@@ -78,7 +78,7 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("batch_symbols",
-			mcp.WithDescription("Returns signatures, source code, callers, and callees for multiple symbols in one call. Use instead of calling get_symbol_source or get_symbol multiple times — saves 60% round-trip overhead."),
+			mcp.WithDescription("Returns signatures, source, and capped 1-hop callers/callees for multiple symbols; truncation flags mark cuts. Use get_callers/get_call_chain for the full neighbourhood. Replaces repeated get_symbol or get_symbol_source calls."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs")),
 			mcp.WithBoolean("include_source", mcp.Description("Include source code for each symbol (default: false)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below source (default: 3, only if include_source)")),
@@ -348,13 +348,24 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
+	// Admission before any work: a fidelity_globs value that breaks a size
+	// bound refuses the request. Dropping the offending rule would rewrite
+	// a first-match policy silently — an over-budget `omit` disappearing
+	// lets a later `full` win, and the content the caller asked to hide
+	// comes back in a response that looks like a normal success. Parsed
+	// here rather than at the point of use so a malformed request cannot
+	// be served by a path that happens not to reach the compressor.
+	fidelityRules, fidelityErr := parseFidelityGlobs(req.GetString("fidelity_globs", ""))
+	if fidelityErr != nil {
+		return mcp.NewToolResultError("get_editing_context: " + fidelityErr.Error()), nil
+	}
 	// Normalise to the graph's stored path form so a repo-relative path
 	// (internal/x.go) doesn't miss the repo-prefixed nodes in multi-repo
 	// mode — the cause of spurious "no symbols found for file" misses.
 	fp = s.graphRelPath(ctx, fp)
 
 	// Auto re-index stale file before querying.
-	s.ensureFresh([]string{fp})
+	s.ensureFreshForRequest(ctx, []string{fp})
 
 	s.sessionFor(ctx).recordFile(fp)
 	// Tool-call observer: credit the recent search for the symbols in
@@ -593,7 +604,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 				keepNodes := s.editingContextSymbolNodes(ctx, fp, out.Defines)
 				keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), keepNodes)
 				keptSymbols = resolved
-				decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), fp)
+				decide := fidelityDecideForPath(fidelityRules, fp)
 				if compressed, cerr := elide.CompressWith(fileBytes, language, elide.Options{Keep: keepPred, Decide: decide}); cerr == nil {
 					sourceCompressed = string(compressed)
 				}
@@ -937,7 +948,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 
 	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFresh([]string{parts[0]})
+		s.ensureFreshForRequest(ctx, []string{parts[0]})
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
@@ -1288,6 +1299,11 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 			if len(callerIDs) > 0 {
 				entry["callers"] = callerIDs
 			}
+			// Stamp the cut. Do not emit a total: TotalNodes is the
+			// capped subgraph (seed+9), not the neighbourhood.
+			if callers.Truncated {
+				entry["callers_truncated"] = true
+			}
 
 			// Callees (depth 1).
 			callees := s.engineFor(ctx).GetCallChain(node.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief", WorkspaceID: sessWS})
@@ -1299,6 +1315,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 			}
 			if len(calleeIDs) > 0 {
 				entry["callees"] = calleeIDs
+			}
+			if callees.Truncated {
+				entry["callees_truncated"] = true
 			}
 		}
 
@@ -3111,7 +3130,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if reindexOutcome.Err != nil {
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
-	s.attachMutationFreshness(resp, node.FilePath, absPath, reindexOutcome)
+	s.attachMutationFreshness(ctx, resp, node.FilePath, absPath, reindexOutcome)
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}

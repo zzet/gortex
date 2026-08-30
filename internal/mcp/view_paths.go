@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -51,6 +52,82 @@ func (v viewPathRoot) serves(repoPrefix string) bool {
 		return false
 	}
 	return v.repoPrefix == "" || repoPrefix == "" || v.repoPrefix == repoPrefix
+}
+
+// contains reports whether an absolute path belongs to the selected checkout,
+// accepting the physical spelling of a symlinked temp/root path as well as its
+// lexical spelling. A symlink beneath the checkout is still checked by the
+// existing repository confinement guard after resolution.
+func (v viewPathRoot) contains(abs string) bool {
+	if v.root == "" || abs == "" {
+		return false
+	}
+	if pathContainedIn(filepath.Clean(abs), filepath.Clean(v.root)) {
+		return true
+	}
+	realRoot, err := filepath.EvalSymlinks(v.root)
+	if err != nil || realRoot == "" {
+		realRoot = filepath.Clean(v.root)
+	}
+	realAbs, err := filepath.EvalSymlinks(abs)
+	if err != nil || realAbs == "" {
+		realAbs = resolveNearestExistingAncestor(abs)
+	}
+	return realAbs != "" && pathContainedIn(filepath.Clean(realAbs), filepath.Clean(realRoot))
+}
+
+// validateAbsolute refuses a path that names another checkout while the
+// request reads a selected worktree. Accepting it would combine graph rows from
+// one view with bytes from a sibling checkout merely because both roots are
+// registered and therefore pass the general repository confinement guard.
+func (v viewPathRoot) validateAbsolute(abs string) error {
+	if v.root == "" || !filepath.IsAbs(abs) || v.contains(abs) {
+		return nil
+	}
+	return fmt.Errorf(
+		"absolute path %q belongs to a different checkout than the selected view rooted at %q; name the file relative to the selected checkout",
+		abs, v.root)
+}
+
+// graphRelative renders an absolute path inside the selected checkout using
+// the spelling stored in the graph. Linked worktree roots are not canonical
+// MultiIndexer roots, so Server.repoRelative cannot attribute them and would
+// otherwise leak the absolute checkout path into mutation responses, sessions,
+// syntax checks, and graph lookups.
+//
+// Prefer the lexical spelling so a symlinked file inside the checkout keeps
+// its own graph identity. When the caller used the physical spelling of a
+// symlinked checkout root (for example /private/tmp for /tmp on macOS), fall
+// back to physical root and target spellings solely to compute the same
+// checkout-relative suffix.
+func (v viewPathRoot) graphRelative(abs string) (string, bool) {
+	if v.root == "" || abs == "" || !filepath.IsAbs(abs) {
+		return "", false
+	}
+	root := filepath.Clean(v.root)
+	target := filepath.Clean(abs)
+	if !pathContainedIn(target, root) {
+		realRoot, err := filepath.EvalSymlinks(root)
+		if err != nil || realRoot == "" {
+			return "", false
+		}
+		realTarget, err := filepath.EvalSymlinks(target)
+		if err != nil || realTarget == "" {
+			realTarget = resolveNearestExistingAncestor(target)
+		}
+		root, target = filepath.Clean(realRoot), filepath.Clean(realTarget)
+		if !pathContainedIn(target, root) {
+			return "", false
+		}
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || rel == "" {
+		return "", false
+	}
+	if v.repoPrefix != "" {
+		rel = filepath.Join(v.repoPrefix, rel)
+	}
+	return rel, true
 }
 
 // rooted moves an absolute path that resolved against root into the checkout

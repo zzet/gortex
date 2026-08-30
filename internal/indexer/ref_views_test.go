@@ -134,14 +134,18 @@ func (f *refViewFixture) writeCatalogIdentity() {
 		f.t.Fatalf("bind the dedicated graph: %v", err)
 	}
 
+	pipeline := DedicatedBasePipelineFor(config.Default().Index)
 	generationID, payload, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:      checkoutLayerOwnerKind,
-		GraphID:        f.graphID,
-		LayerID:        "test-primary-base",
-		CheckoutID:     f.checkoutID,
-		GenerationKind: "dedicated",
-		TreeOID:        f.treeA,
-		CreatedAt:      now,
+		OwnerKind:         dedicatedBaseGenerationKind,
+		GraphID:           f.graphID,
+		LayerID:           f.graphID + ":base",
+		CheckoutID:        f.checkoutID,
+		GenerationKind:    dedicatedBaseGenerationKind,
+		TreeOID:           f.treeA,
+		ConfigHash:        pipeline.ConfigHash,
+		ExtractorVersions: pipeline.ExtractorVersions,
+		ResolverVersion:   pipeline.ResolverVersion,
+		CreatedAt:         now,
 	})
 	if err != nil {
 		f.t.Fatalf("begin the primary generation: %v", err)

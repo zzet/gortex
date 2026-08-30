@@ -17,6 +17,9 @@ type sqliteMutationReceiptState struct {
 }
 
 type sqliteMutationReceiptAccumulator struct {
+	// viewGen pins an active receipt to the Store handle that opened it. Delta
+	// accumulators are never installed in active and leave this at zero.
+	viewGen            int64
 	complete           bool
 	incompleteReason   string
 	resolutionRelevant bool
@@ -24,6 +27,7 @@ type sqliteMutationReceiptAccumulator struct {
 	unresolvedFiles    map[string]struct{}
 	definitionFiles    map[string]struct{}
 	targetNames        map[string]struct{}
+	evictedNames       map[string]struct{}
 	targetIDs          map[string]struct{}
 	importCandidates   map[string]struct{}
 }
@@ -51,6 +55,7 @@ func newSQLiteMutationReceiptAccumulator() *sqliteMutationReceiptAccumulator {
 		unresolvedFiles:  make(map[string]struct{}),
 		definitionFiles:  make(map[string]struct{}),
 		targetNames:      make(map[string]struct{}),
+		evictedNames:     make(map[string]struct{}),
 		targetIDs:        make(map[string]struct{}),
 		importCandidates: make(map[string]struct{}),
 	}
@@ -65,6 +70,7 @@ func (a *sqliteMutationReceiptAccumulator) receipt() graph.MutationReceipt {
 		UnresolvedFiles:    sortedSQLiteReceiptKeys(a.unresolvedFiles),
 		DefinitionFiles:    sortedSQLiteReceiptKeys(a.definitionFiles),
 		TargetNames:        sortedSQLiteReceiptKeys(a.targetNames),
+		EvictedNames:       sortedSQLiteReceiptKeys(a.evictedNames),
 		TargetIDs:          sortedSQLiteReceiptKeys(a.targetIDs),
 		ImportCandidates:   sortedSQLiteReceiptKeys(a.importCandidates),
 	}
@@ -99,7 +105,9 @@ func (s *Store) BeginMutationReceipt() graph.MutationReceiptToken {
 		s.mutationReceipts.active = make(map[graph.MutationReceiptToken]*sqliteMutationReceiptAccumulator)
 	}
 	token := s.mutationReceipts.next
-	s.mutationReceipts.active[token] = newSQLiteMutationReceiptAccumulator()
+	acc := newSQLiteMutationReceiptAccumulator()
+	acc.viewGen = s.viewGen
+	s.mutationReceipts.active[token] = acc
 	return token
 }
 
@@ -113,18 +121,37 @@ func (s *Store) EndMutationReceipt(token graph.MutationReceiptToken) graph.Mutat
 	if acc == nil {
 		return graph.MutationReceipt{Complete: false, IncompleteReason: "unknown_receipt_token"}
 	}
+	if acc.viewGen != s.viewGen {
+		return graph.MutationReceipt{Complete: false, IncompleteReason: "receipt_generation_mismatch"}
+	}
 	delete(s.mutationReceipts.active, token)
 	return acc.receipt()
 }
 
 func (s *Store) hasActiveMutationReceiptsLocked() bool {
-	return len(s.mutationReceipts.active) != 0
+	for _, acc := range s.mutationReceipts.active {
+		if acc.viewGen == s.viewGen {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) markMutationReceiptsIncompleteLocked() {
-	if len(s.mutationReceipts.active) == 0 {
-		return
+	reason := graph.ReceiptIncompleteCallerReason()
+	for _, acc := range s.mutationReceipts.active {
+		if acc.viewGen == s.viewGen {
+			acc.noteIncomplete(reason)
+		}
 	}
+}
+
+// markAllMutationReceiptsIncompleteLocked is reserved for administrative
+// mutations that deliberately cross payload generations (repository purge,
+// rekey, or explicit all-generation eviction). Ordinary Store methods must use
+// markMutationReceiptsIncompleteLocked so an overlay write cannot poison a
+// sibling view's resolver window.
+func (s *Store) markAllMutationReceiptsIncompleteLocked() {
 	reason := graph.ReceiptIncompleteCallerReason()
 	for _, acc := range s.mutationReceipts.active {
 		acc.noteIncomplete(reason)
@@ -136,6 +163,9 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 		return
 	}
 	for _, acc := range s.mutationReceipts.active {
+		if acc.viewGen != s.viewGen {
+			continue
+		}
 		if !delta.complete {
 			reason := delta.incompleteReason
 			if reason == "" {
@@ -148,6 +178,7 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 		mergeSQLiteReceiptSet(acc.unresolvedFiles, delta.unresolvedFiles)
 		mergeSQLiteReceiptSet(acc.definitionFiles, delta.definitionFiles)
 		mergeSQLiteReceiptSet(acc.targetNames, delta.targetNames)
+		mergeSQLiteReceiptSet(acc.evictedNames, delta.evictedNames)
 		mergeSQLiteReceiptSet(acc.targetIDs, delta.targetIDs)
 		mergeSQLiteReceiptSet(acc.importCandidates, delta.importCandidates)
 	}
@@ -211,6 +242,27 @@ func recordSQLiteChangedNodeIdentity(
 			acc.targetNames[name] = struct{}{}
 		}
 	}
+	// The old identity's names vanished with it: the file still enters the
+	// definition frontier, but it no longer declares those names, so nothing
+	// in the file pass enumerates their stubs. They belong to the name
+	// frontier for the same reason an evicted definition's names do.
+	//
+	// The one name that does NOT need the name pass is a name the final
+	// identity still declares in the form the file frontier enumerates, and
+	// that form is narrow: UnresolvedNameCandidateIDs reads Name only, and
+	// collectIncrementalFileFrontierMode visits referenceable kinds only. So
+	// matching final.QualName is not grounds to skip (that form is never
+	// enumerated), and neither is matching final.Name when the final kind is
+	// no longer referenceable (that node is never visited).
+	for _, name := range []string{old.name, old.qualName} {
+		if name == "" {
+			continue
+		}
+		if finalReferenceable && name == final.Name {
+			continue
+		}
+		acc.evictedNames[name] = struct{}{}
+	}
 	for _, filePath := range []string{old.filePath, final.FilePath} {
 		if filePath != "" {
 			acc.definitionFiles[filePath] = struct{}{}
@@ -248,6 +300,13 @@ func recordSQLiteAddedEdge(acc *sqliteMutationReceiptAccumulator, e *graph.Edge,
 		return
 	}
 	acc.resolutionRelevant = true
+	if graph.HasRestubProvenance(e) {
+		// A restubbed surviving edge is rebound by the incoming/name
+		// frontier, which restores its stashed provenance; its source file
+		// must not join UnresolvedFiles, or the forward file pass
+		// re-resolves it first and the restored tier is lost.
+		return
+	}
 	if exactFile != "" {
 		acc.unresolvedFiles[exactFile] = struct{}{}
 	} else {

@@ -56,12 +56,13 @@ func IsFixturePath(filePath string) bool {
 // the file. Keeping a single ID keeps cross-referencing simple
 // (any edge that lands on the file path also lands on the fixture
 // classification) and avoids the de-dup gymnastics that emitting a
-// twin synthetic ID would require.
+// twin synthetic ID would require. That sharing only holds when the
+// spelling matches the extractor's relPath exactly (OS-native
+// separators on Windows), so filePath is preserved verbatim.
 func BuildGraphArtifacts(filePath, language string) []*graph.Node {
 	if !IsFixturePath(filePath) {
 		return nil
 	}
-	filePath = filepath.ToSlash(filePath)
 	return []*graph.Node{{
 		ID:       filePath,
 		Kind:     graph.KindFixture,

@@ -26,9 +26,38 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"sync"
 	"time"
 )
+
+// DefaultSessionIdleTTL is the idle horizon after which the sweeper
+// evicts an MCP session. Thirty minutes matches the value the daemon
+// has always run with (previously borrowed from the overlay
+// subsystem's DefaultOverlayIdleTTL); owning it here makes session
+// lifetime an MCP policy with its own configuration.
+const DefaultSessionIdleTTL = 30 * time.Minute
+
+// SessionIdleTTLFromEnv resolves the MCP session idle TTL: an explicit
+// positive override wins, then GORTEX_MCP_SESSION_IDLE_TTL (any
+// time.ParseDuration string), then DefaultSessionIdleTTL. A negative
+// value clamps to 0, which disables expiry entirely; garbage env
+// values fall back to the default — we deliberately don't fail
+// startup over a typo'd duration.
+func SessionIdleTTLFromEnv(override time.Duration) time.Duration {
+	if override > 0 {
+		return override
+	}
+	if raw := os.Getenv("GORTEX_MCP_SESSION_IDLE_TTL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			if d < 0 {
+				d = 0
+			}
+			return d
+		}
+	}
+	return DefaultSessionIdleTTL
+}
 
 // SessionState is everything the transport needs to replay an MCP
 // session on a fresh worker. It is captured at `initialize` time and

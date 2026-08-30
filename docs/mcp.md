@@ -282,7 +282,7 @@ over a very large tree, or `ask` against a slow local model.
 | Tool | Description |
 |------|-------------|
 | `get_symbol_source` | Source code of a single symbol (80% fewer tokens than Read). Returns `tokens_saved` per call. `compress_bodies` stubs bodies (with an optional `keep` subset); `max_lines` salience-truncates to a control-flow skeleton |
-| `batch_symbols` | Multiple symbols with source/callers/callees in one call |
+| `batch_symbols` | Multiple symbols with source and a capped 1-hop callers/callees sample (`callers_truncated` / `callees_truncated` mark a cut; full neighbourhood is `get_callers` / `get_call_chain`) |
 | `find_import_path` | Correct import path for a symbol |
 | `explain_change_impact` | Risk-tiered blast radius with affected processes. A zero-edge target carries the same per-symbol `likely_unused` / `possible_extraction_gap` / `coverage_incomplete` caveat as `get_callers` |
 | `get_recent_changes` | Files/symbols changed since timestamp. Rows are clamped to the session workspace and narrowed further by `repo`/`project`/`scope`; each multi-repo row names its `repo` |

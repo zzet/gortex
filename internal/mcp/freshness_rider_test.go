@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -120,23 +121,44 @@ func TestMultiRepoRiderAndMissingFileFlag(t *testing.T) {
 
 	// Baseline: freshly indexed multi-repo files draw no rider (no false
 	// positives now that the bail is gone — only genuine drift flags).
-	require.Nil(t, srv.freshnessRiderFor("read_file", readReq("repo-a/main.go")),
+	require.Nil(t, srv.freshnessRiderFor(context.Background(), "read_file", readReq("repo-a/main.go")),
 		"a fresh multi-repo file must not be flagged")
 
 	// Make repo-a/main.go stale (mtime drift) — the rider must now fire in
 	// multi-repo mode and carry the OWNING repo prefix.
 	future := time.Now().Add(2 * time.Second)
 	require.NoError(t, os.Chtimes(filepath.Join(repoA, "main.go"), future, future))
-	staleRider := srv.freshnessRiderFor("read_file", readReq("repo-a/main.go"))
+	staleRider := srv.freshnessRiderFor(context.Background(), "read_file", readReq("repo-a/main.go"))
 	require.NotNil(t, staleRider, "stale multi-repo file must be flagged (hard-bail removed)")
 	require.Equal(t, true, staleRider["stale"])
 	require.Equal(t, "main.go", staleRider["file"])
 	require.Equal(t, "repo-a", staleRider["repo"], "stale verdict must name the owning repo")
 
+	// The same canonical drift must not ride on a response served by another
+	// checkout/ref, nor may the read trigger canonical self-healing. Those views
+	// have their own publication lifecycle; this indexer's mtime map describes
+	// only repo-a's canonical root.
+	owner, _ := mi.IndexerForFile(filepath.Join(repoA, "main.go"))
+	require.NotNil(t, owner)
+	require.True(t, owner.IsTrackedStale("main.go"))
+	for name, view := range map[string]*requestView{
+		"worktree": {reader: g, viewRoot: filepath.Join(t.TempDir(), "worktree")},
+		"ref":      {reader: g, files: &refViewFiles{repoDir: repoA, treeOID: "tree"}},
+		"grace":    {baseFallback: true},
+	} {
+		t.Run("routed "+name+" ignores canonical drift", func(t *testing.T) {
+			ctx := withRequestView(context.Background(), view)
+			require.Nil(t, srv.freshnessRiderFor(ctx, "read_file", readReq("repo-a/main.go")))
+			require.Empty(t, srv.ensureFreshForRequest(ctx, []string{"repo-a/main.go"}))
+			require.True(t, owner.IsTrackedStale("main.go"),
+				"a routed read must not mutate the canonical checkout's freshness state")
+		})
+	}
+
 	// Delete repo-b/main.go — a tracked file gone from disk must read as the
 	// distinct `missing` verdict, not silently fold into not-stale.
 	require.NoError(t, os.Remove(filepath.Join(repoB, "main.go")))
-	missingRider := srv.freshnessRiderFor("read_file", readReq("repo-b/main.go"))
+	missingRider := srv.freshnessRiderFor(context.Background(), "read_file", readReq("repo-b/main.go"))
 	require.NotNil(t, missingRider, "deleted multi-repo file must be flagged")
 	require.Equal(t, true, missingRider["missing"])
 	require.Equal(t, "repo-b", missingRider["repo"])
@@ -146,7 +168,17 @@ func TestMultiRepoRiderAndMissingFileFlag(t *testing.T) {
 	// gets a freshness block splitting stale vs missing, each with its repo.
 	listRes := mcp.NewToolResultText(
 		`{"results":[{"name":"Hello","file":"repo-a/main.go"},{"name":"Hi","file":"repo-b/main.go"},{"name":"Ok","file":"repo-a/main.go"}]}`)
-	decorated := srv.decorateListResultWithFreshness(listRes)
+	for name, view := range map[string]*requestView{
+		"worktree": {reader: g, viewRoot: filepath.Join(t.TempDir(), "worktree")},
+		"ref":      {reader: g, files: &refViewFiles{repoDir: repoA, treeOID: "tree"}},
+		"grace":    {baseFallback: true},
+	} {
+		t.Run("list "+name+" ignores canonical drift", func(t *testing.T) {
+			ctx := withRequestView(context.Background(), view)
+			require.Equal(t, listRes, srv.decorateListResultWithFreshness(ctx, listRes))
+		})
+	}
+	decorated := srv.decorateListResultWithFreshness(context.Background(), listRes)
 	text, ok := singleTextContent(decorated)
 	require.True(t, ok)
 	var obj map[string]any
@@ -170,5 +202,5 @@ func TestMultiRepoRiderAndMissingFileFlag(t *testing.T) {
 
 	// A GCX/TOON (non-JSON-object) payload the caller opted into is untouched.
 	gcx := mcp.NewToolResultText("GCX1 tool=search_symbols\nrow1")
-	require.Equal(t, gcx, srv.decorateListResultWithFreshness(gcx))
+	require.Equal(t, gcx, srv.decorateListResultWithFreshness(context.Background(), gcx))
 }

@@ -1913,7 +1913,10 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 // that touches one of those nodes. Returns (nodesRemoved,
 // edgesRemoved).
 func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
-	return s.evictByPredicate(evictFilePredicate, filePath, evictThisGeneration)
+	return s.evictByPredicate(evictFilePredicate, filePath, evictOptions{
+		scope:        evictThisGeneration,
+		exactReceipt: true,
+	})
 }
 
 // EvictRepo removes every node in repoPrefix and every edge that
@@ -1971,7 +1974,9 @@ func (s *Store) EvictRepoAllGenerationsChecked(
 		return 0, 0, fmt.Errorf("store_sqlite: all-generation eviction refuses empty repo prefix")
 	}
 	predicate := evictNonEmptyRepoPredicate
-	return s.evictByPredicateResult(predicate, repoPrefix, evictAllGenerations)
+	return s.evictByPredicateResult(predicate, repoPrefix, evictOptions{
+		scope: evictAllGenerations,
+	})
 }
 
 func (s *Store) evictRepoScope(repoPrefix string, scope evictScope) (nodesRemoved, edgesRemoved int) {
@@ -1981,7 +1986,7 @@ func (s *Store) evictRepoScope(repoPrefix string, scope evictScope) (nodesRemove
 		// that compact index for ordinary named repositories.
 		predicate = evictNonEmptyRepoPredicate
 	}
-	return s.evictByPredicate(predicate, repoPrefix, scope)
+	return s.evictByPredicate(predicate, repoPrefix, evictOptions{scope: scope})
 }
 
 // -- reads ---------------------------------------------------------------

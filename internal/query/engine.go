@@ -1880,6 +1880,13 @@ func isUsageEdgeKind(k graph.EdgeKind) bool {
 		// nodes only where extractors bind them (Python, JS/TS); Go
 		// imports target package nodes, so Go results are unaffected.
 		graph.EdgeImports, graph.EdgeReExports,
+		// Value-side uses of variables and fields ARE usages: a field
+		// provably read inside its own class answered find_usages empty
+		// while the store held its resolved reads/writes edges (the C#
+		// field-identifier emitter's whole point). EdgeAccessesField is
+		// deliberately absent — it is the synthesized union of these two
+		// riding the same sites and would double-count every one.
+		graph.EdgeReads, graph.EdgeWrites,
 		graph.EdgeProvides, graph.EdgeConsumes,
 		graph.EdgeReadsConfig, graph.EdgeWritesConfig,
 		graph.EdgeUsesEnv, graph.EdgeConfigures,

@@ -228,6 +228,10 @@ type CheckoutLifecycle struct {
 	refViewRetention RefViewRetention
 	// indexBarrier is the promotion's test seam; nil in production.
 	indexBarrier func()
+	// baseRefreshExecute/baseRefreshDone are deterministic refresh-worker test
+	// seams. Production executes refreshDedicatedBase and records no callback.
+	baseRefreshExecute func(context.Context, dedicatedBaseRefreshRequest) error
+	baseRefreshDone    func(dedicatedBaseRefreshRequest, error)
 	// routeBarrier stands in for the route withdrawal a promotion runs after
 	// the mode flip, which is the one write no fixture can make the catalog
 	// refuse. A test seam; nil in production.
@@ -263,8 +267,16 @@ type CheckoutLifecycle struct {
 	transitionRuns          map[string]*modeTransitionRun
 	transitionQueue         chan *modeTransitionRun
 	transitionWorkerStarted bool
-	transitionWG            sync.WaitGroup
-	transitionClosed        bool
+	// Dedicated-base refreshes share the transition lifetime and wait group,
+	// but use one coalesced worker of their own. A map entry is one graph, so a
+	// binary-wide extractor bump cannot enqueue one full rebuild per dependent
+	// worktree or grow an unbounded waiter list.
+	baseRefreshPending       map[string]dedicatedBaseRefreshRequest
+	baseRefreshInFlight      map[string]struct{}
+	baseRefreshWake          chan struct{}
+	baseRefreshWorkerStarted bool
+	transitionWG             sync.WaitGroup
+	transitionClosed         bool
 }
 
 // NewCheckoutLifecycle builds the lifecycle. It fails only on a missing
@@ -301,6 +313,9 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		cancelTransitions:      cancelTransitions,
 		transitionRuns:         map[string]*modeTransitionRun{},
 		transitionQueue:        make(chan *modeTransitionRun, modeTransitionQueueLimit),
+		baseRefreshPending:     map[string]dedicatedBaseRefreshRequest{},
+		baseRefreshInFlight:    map[string]struct{}{},
+		baseRefreshWake:        make(chan struct{}, 1),
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -1749,6 +1764,12 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 				l.withdrawStaleRoute(ctx, entry.CheckoutID)
 				continue
 			}
+			if l.scheduleDedicatedBaseRefreshIfNeeded(ctx, graph, checkout) {
+				// Keep the last coherent route in place while the replacement
+				// corpus builds off-route. The guarded refresh publication either
+				// replaces the owner stack atomically or changes nothing.
+				continue
+			}
 		}
 		if graphID == "" {
 			l.dropCoordinator(entry.CheckoutID)
@@ -2090,6 +2111,41 @@ func (l *CheckoutLifecycle) SignalCheckout(checkoutID, reason string) bool {
 	}
 	coordinator.Signal(reason)
 	return true
+}
+
+// CheckoutMutationReady reports whether an exact checked-out route has a live
+// coordinator rooted at the same working copy the request selected. It is the
+// admission check mutating MCP tools use before touching disk; a catalog route
+// without its publisher is read-only because no component can truthfully
+// report when the graph catches up.
+func (l *CheckoutLifecycle) CheckoutMutationReady(checkoutID, root string) bool {
+	if l == nil || checkoutID == "" || root == "" {
+		return false
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	return coordinator != nil && coordinator.Running() &&
+		filepath.Clean(coordinator.root) == filepath.Clean(root)
+}
+
+// EnqueueCheckoutMutation signals the selected checkout's own coordinator and
+// returns a publication ticket. The registry lock is released before ticket
+// admission and is never held while callers wait for publication.
+func (l *CheckoutLifecycle) EnqueueCheckoutMutation(
+	ctx context.Context,
+	checkoutID, absPath string,
+) (*MutationTicket, error) {
+	if l == nil {
+		return nil, errors.New("indexer: checkout lifecycle is unavailable")
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	if coordinator == nil {
+		return nil, fmt.Errorf("indexer: checkout %q has no live coordinator", checkoutID)
+	}
+	return coordinator.enqueueFileMutation(ctx, absPath)
 }
 
 // ViewLeases is the lease manager every coordinator hands to retirement. A

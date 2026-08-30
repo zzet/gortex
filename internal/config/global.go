@@ -366,6 +366,19 @@ func ResolvePrefix(entry RepoEntry) string {
 	return filepath.Base(entry.Path)
 }
 
+// ReposSnapshot returns a copy of the top-level tracked-repo list taken
+// under the same mutex that serialises AddRepo / RemoveRepo / Save, for
+// readers that may run concurrently with repository removal (UntrackRepo
+// edits the live slice in place).
+func (gc *GlobalConfig) ReposSnapshot() []RepoEntry {
+	if gc == nil {
+		return nil
+	}
+	globalConfigMu.Lock()
+	defer globalConfigMu.Unlock()
+	return append([]RepoEntry(nil), gc.Repos...)
+}
+
 // FindRepoByPrefix searches top-level Repos and all Projects for an entry
 // whose ResolvePrefix matches. Returns nil when no entry matches.
 func (gc *GlobalConfig) FindRepoByPrefix(prefix string) *RepoEntry {

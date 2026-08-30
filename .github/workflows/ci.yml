@@ -58,8 +58,16 @@ jobs:
       - name: Build all packages
         run: go build ./...
 
+      # ./internal/agents is one package and does not recurse, so the
+      # opencode adapter is named explicitly. Its plugin asset is embedded
+      # verbatim with go:embed and TestPluginFailsOpen parses it by
+      # splitting on "\n}\n", which is the closest thing the suite has to a
+      # detector for a CRLF checkout of an embedded file — and it can only
+      # fire on a runner that converts line endings.
       - name: Test Windows agent integrations
-        run: go test -timeout=5m -count=1 ./internal/agents
+        run: >
+          go test -timeout=5m -count=1
+          ./internal/agents ./internal/agents/opencode
 
       # Symlink confinement keeps out-of-repo files out of the index, and it
       # reads differently on Windows: a symlink reparse point maps to
@@ -119,11 +127,20 @@ jobs:
       # per-domain normalization only diverge once '/' and the native
       # separator differ — every one of them passes on the linux/macos
       # matrix whatever the code does. internal/review joins the list
-      # because the file-risk normalizer lives there.
+      # because the file-risk normalizer lives there. FidelityGlob is the
+      # same asymmetry once more: filepath.Match's separator is the
+      # platform's, so on Windows '*' crosses a '/' that POSIX already
+      # protects, and `internal/*.go` matching `internal/sub/x.go` is a
+      # Windows-only verdict. Linux and macOS return the same answer from
+      # filepath.Match and path.Match, so this runner is the only one that
+      # can tell the two apart. FindFiles_Glob is the handler-level half of
+      # the same contract: `internal/**/*_test.go` is the schema's own
+      # example, and the two matchers disagree about how deep it reaches
+      # only where '/' is not the separator.
       - name: Test native-separator store path comparisons
         run: >
           go test -timeout=10m -count=1
-          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir|ReviewRulepack|PrefixedGraphReportsRulepack|GraphKey|JoinFileNodes|ChangedSymbolsForFiles|PrefixShadow|IdsOnPrefixedGraph|RankFileRisk|PrefixedDeleteAndRename'
+          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir|ReviewRulepack|PrefixedGraphReportsRulepack|GraphKey|JoinFileNodes|ChangedSymbolsForFiles|PrefixShadow|IdsOnPrefixedGraph|RankFileRisk|PrefixedDeleteAndRename|FidelityGlob|FindFiles_Glob'
           ./internal/analysis ./internal/graph/store_sqlite
           ./internal/mcp ./internal/resolver ./internal/persistence
           ./internal/review

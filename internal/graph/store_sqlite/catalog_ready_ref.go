@@ -27,6 +27,9 @@ type BindReadyGenerationLeaseToRefViewRequest struct {
 	ActiveTree             string
 	ActiveBuildFingerprint string
 	ExactView              bool
+	// RequireActiveGraphBase closes publication against a concurrent
+	// dedicated-base epoch replacement. Zero preserves catalog-only callers.
+	RequireActiveGraphBase bool
 }
 
 // BindReadyGenerationLeaseToRefView consumes a DB-clocked handoff lease in the
@@ -111,6 +114,15 @@ func (c *Catalog) BindReadyGenerationLeaseToRefView(
 	}
 	if !compatible {
 		return fmt.Errorf("%w: ready generation is no longer compatible or source-complete", ErrCatalogStaleGuard)
+	}
+	if req.RequireActiveGraphBase {
+		active, err := graphBaseGenerationIsActiveTx(ctx, tx, req.Key.GraphID, req.Key.BaseGenerationID)
+		if err != nil {
+			return err
+		}
+		if !active {
+			return fmt.Errorf("%w: dedicated graph %s base moved", ErrCatalogStaleGuard, req.Key.GraphID)
+		}
 	}
 
 	result, err := tx.ExecContext(ctx, `

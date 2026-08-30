@@ -20,14 +20,14 @@ type CommitAuthorizedPromotionRequest struct {
 	RequiredGraphState string
 
 	BaseGenerationID   int64
-	BaseTreeOID         string
+	BaseTreeOID        string
 	CommitGenerationID int64
 	DirtyGenerationID  int64
 
 	RouteExists        bool
 	ExpectedRouteEpoch int64
-	State               CheckoutState
-	LastSeen            int64
+	State              CheckoutState
+	LastSeen           int64
 }
 
 // CommitAuthorizedPromotion atomically makes a prepared dedicated stack
@@ -253,10 +253,16 @@ SELECT graph_id, COALESCE(commit_generation_id, 0), COALESCE(dirty_generation_id
 }
 
 type promotionGeneration struct {
+	ownerKind        string
 	graphID          string
+	layerID          string
 	checkoutID       string
+	generationKind   string
 	baseGenerationID int64
 	treeOID          string
+	configHash       string
+	extractors       string
+	resolver         string
 	state            ViewGenerationState
 }
 
@@ -264,10 +270,15 @@ func promotionGenerationTx(ctx context.Context, tx *sql.Tx, generationID int64) 
 	var out promotionGeneration
 	var state string
 	err := tx.QueryRowContext(ctx, `
-SELECT COALESCE(graph_id, ''), COALESCE(checkout_id, ''),
-       COALESCE(base_generation_id, 0), COALESCE(tree_oid, ''), state
+SELECT COALESCE(owner_kind, ''), COALESCE(graph_id, ''), COALESCE(layer_id, ''),
+       COALESCE(checkout_id, ''), COALESCE(generation_kind, ''),
+       COALESCE(base_generation_id, 0), COALESCE(tree_oid, ''),
+       COALESCE(config_hash, ''), COALESCE(extractor_versions, ''),
+       COALESCE(resolver_version, ''), state
   FROM view_generations WHERE generation_id = ?`, generationID).Scan(
-		&out.graphID, &out.checkoutID, &out.baseGenerationID, &out.treeOID, &state)
+		&out.ownerKind, &out.graphID, &out.layerID, &out.checkoutID,
+		&out.generationKind, &out.baseGenerationID, &out.treeOID,
+		&out.configHash, &out.extractors, &out.resolver, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return promotionGeneration{}, fmt.Errorf("%w: view generation %d", ErrCatalogStaleGuard, generationID)
 	}

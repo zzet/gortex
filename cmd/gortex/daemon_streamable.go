@@ -187,13 +187,20 @@ func (s *observingStore) Len() int { return s.inner.Len() }
 // returns the handler ready to assign to daemon.Server.HTTPHandler.
 func buildDaemonStreamableHandler(disp daemon.MCPDispatcher, reg *daemon.SessionRegistry, router *daemon.Router, logger *zap.Logger, tokenFn func() string) http.Handler {
 	bridge := newDaemonStreamableDispatcher(disp, reg, logger)
-	store := streamable.NewMemoryStore(daemon.DefaultOverlayIdleTTL)
+	// The MCP session TTL is its own policy knob (default 30m,
+	// GORTEX_MCP_SESSION_IDLE_TTL to tune) — it used to borrow the
+	// overlay subsystem's constant, which dodged even that knob's env
+	// override. The resolved value rides Config.SessionTTL so the
+	// transport can advertise it to clients.
+	sessionTTL := streamable.SessionIdleTTLFromEnv(0)
+	store := streamable.NewMemoryStore(sessionTTL)
 	wrapped := wrapStreamableStoreWithCleanup(store, bridge.onSessionEnded)
 	transport := streamable.New(streamable.Config{
 		Dispatcher: bridge,
 		Store:      wrapped,
 		Logger:     logger,
 		Router:     router,
+		SessionTTL: sessionTTL,
 		InitializeHook: func(_ context.Context, state *streamable.SessionState) {
 			// Bridge the new streamable session into the daemon's
 			// session registry up-front so the daemon-status block

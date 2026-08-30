@@ -141,6 +141,9 @@ const qCSharpAll = `
       (variable_declarator
         (identifier) @lvar.name))) @lvar.def
 
+  (assignment_expression
+    left: (identifier) @fassign.name) @fassign.expr
+
   (member_access_expression
     name: [
       (identifier) @maccess.name
@@ -301,6 +304,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
 	stampCSharpUsings(root, src, fileNode)
+	stampCSharpEFFluent(root, src, fileNode)
 
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
@@ -317,6 +321,7 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	var locals []csharpDeferredLocal
 	var typeUses []csharpTypeUse
 	var accesses []csharpDeferredAccess
+	var fieldAssigns []csharpDeferredFieldAssign
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -400,6 +405,12 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 				line:        expr.StartLine + 1,
 				returnUsage: classifyReturnUsage(expr.Node, src, csharpReturnUsageSpec),
 			}, expr.Node))
+
+		case m.Captures["fassign.name"] != nil:
+			fieldAssigns = append(fieldAssigns, csharpDeferredFieldAssign{
+				name: m.Captures["fassign.name"].Text,
+				line: m.Captures["fassign.expr"].StartLine + 1,
+			})
 
 		case m.Captures["maccess.expr"] != nil:
 			accesses = append(accesses, csharpDeferredAccess{
@@ -741,6 +752,25 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 	emitCSharpMemberAccesses(accesses, src, filePath, funcRanges,
 		tenvByOwner, builtinsByOwner, result)
 
+	// Field-identifier uses need the shadow indexes: every DECLARED
+	// local by name (typed or not — tenv alone holds only the typed
+	// ones), parameters, and builtin-typed locals.
+	localNamesByOwner := map[string]map[string]bool{}
+	for _, l := range locals {
+		owner := localOwner(l)
+		if owner == "" {
+			continue
+		}
+		m := localNamesByOwner[owner]
+		if m == nil {
+			m = map[string]bool{}
+			localNamesByOwner[owner] = m
+		}
+		m[l.name] = true
+	}
+	emitCSharpFieldIdentifierUses(calls, accesses, fieldAssigns, src,
+		filePath, funcRanges, localNamesByOwner, builtinsByOwner, result)
+
 	// .NET surfaces a symbol walk misses: DI registrations + COM
 	// interop. Stamped onto the file node.
 	detectDotNetSurfaces(src, result)
@@ -812,6 +842,13 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 	if doc := extractCSharpDoc(src, def.StartLine); doc != "" {
 		meta["doc"] = doc
 	}
+	// EF Core fluent mapping: a class implementing
+	// IEntityTypeConfiguration<T> carries facts the resolver joins to
+	// the entity class later — the entity lives in another file.
+	if kind == "class" || kind == "record" {
+		stampCSharpEFAttribute(def.Node, src, meta)
+		stampCSharpEFConfig(def.Node, src, meta)
+	}
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: nodeKind, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
@@ -822,6 +859,11 @@ func (e *CSharpExtractor) emitContainer(m parser.QueryResult, kind string, nodeK
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitCSharpAnnotationEdges(csharpCollectAttributes(def.Node, src), id, filePath, result, annotationSeen)
+	// EF Core model attribution: [Table] → EdgeModelsTable. Classes and
+	// records only — EF entities are reference types.
+	if kind == "class" || kind == "record" {
+		emitCSharpORMEdges(def.Node, src, id, filePath, result)
+	}
 	emitCSharpGenericParamNodes(id, def.Node, src, filePath, def.StartLine+1, result)
 	// Classes, structs, records, and interfaces carry a base list;
 	// emitCSharpBaseList derives each entry's edge kind from the

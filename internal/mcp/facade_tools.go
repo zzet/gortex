@@ -1112,7 +1112,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	forwarded.Params.RawArguments = nil
 	result, err = legacy.handler(ctx, forwarded)
 	if err == nil {
-		result = s.decorateFacadeFreshness(spec.Legacy, forwarded, result)
+		result = s.decorateFacadeFreshness(ctx, spec.Legacy, forwarded, result)
 	}
 	result = decorateFacadeResultIdentity(result, spec)
 	return result, err
@@ -1380,12 +1380,12 @@ func blockedAnalyzeKindResult(kind string) *mcpgo.CallToolResult {
 // The outer facade middleware only sees compact names/targets (read,
 // relations, target.file, ...), so applying the policy there would miss the
 // legacy path/id fields the rider is deliberately keyed to.
-func (s *Server) decorateFacadeFreshness(legacy string, req mcpgo.CallToolRequest, result *mcpgo.CallToolResult) *mcpgo.CallToolResult {
-	if rider := s.freshnessRiderFor(legacy, req); rider != nil {
+func (s *Server) decorateFacadeFreshness(ctx context.Context, legacy string, req mcpgo.CallToolRequest, result *mcpgo.CallToolResult) *mcpgo.CallToolResult {
+	if rider := s.freshnessRiderFor(ctx, legacy, req); rider != nil {
 		return decorateResultWithFreshness(result, rider)
 	}
 	if isFreshnessListTool(legacy) {
-		return s.decorateListResultWithFreshness(result)
+		return s.decorateListResultWithFreshness(ctx, result)
 	}
 	return result
 }

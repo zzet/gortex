@@ -35,13 +35,16 @@ func callSearchAST(t *testing.T, srv *Server, args map[string]any) map[string]an
 	return out
 }
 
-// writeTempGoFile drops fixture content into a temp dir and returns
-// the absolute path. Tests register a KindFile node pointing at the
-// returned path so the engine can find and parse it.
-func writeTempGoFile(t *testing.T, name, src string) string {
+// writeTempGoFile drops fixture content into the indexed test repository and
+// returns the absolute path. Keeping fixtures beneath root exercises the same
+// path-confinement contract as production instead of relying on unregistered
+// absolute graph paths.
+func writeTempGoFile(t *testing.T, root, name, src string) string {
 	t.Helper()
-	dir := t.TempDir()
-	abs := filepath.Join(dir, name)
+	abs := filepath.Join(root, name)
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatalf("create fixture directory: %v", err)
+	}
 	if err := os.WriteFile(abs, []byte(src), 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
@@ -49,8 +52,8 @@ func writeTempGoFile(t *testing.T, name, src string) string {
 }
 
 func TestSearchAST_RawPattern_GoPanic(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	abs := writeTempGoFile(t, "lib.go", `package x
+	srv, root := setupTestServer(t)
+	abs := writeTempGoFile(t, root, "lib.go", `package x
 
 func F() {
 	panic("boom")
@@ -86,14 +89,14 @@ func F() {
 }
 
 func TestSearchASTUsesBoundedEnclosingProjection(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	abs := writeTempGoFile(t, "bounded.go", `package x
+	srv, root := setupTestServer(t)
+	abs := writeTempGoFile(t, root, "bounded.go", `package x
 
 func Bounded() {
 	panic("boom")
 }
 `)
-	quietAbs := writeTempGoFile(t, "quiet.go", `package x
+	quietAbs := writeTempGoFile(t, root, "quiet.go", `package x
 
 func Quiet() {}
 `)
@@ -135,8 +138,8 @@ func Quiet() {}
 }
 
 func TestSearchAST_BundledDetector_HardcodedSecret(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	abs := writeTempGoFile(t, "creds.go", `package x
+	srv, root := setupTestServer(t)
+	abs := writeTempGoFile(t, root, "creds.go", `package x
 
 func F() {
 	password := "hunter2hunter2hunter"
@@ -164,11 +167,11 @@ func F() {
 }
 
 func TestSearchAST_PathPrefixFilter(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	matched := writeTempGoFile(t, "match.go", `package x
+	srv, root := setupTestServer(t)
+	matched := writeTempGoFile(t, root, "matched/match.go", `package x
 func F() { panic("hit") }
 `)
-	excluded := writeTempGoFile(t, "skip.go", `package x
+	excluded := writeTempGoFile(t, root, "excluded/skip.go", `package x
 func G() { panic("skip") }
 `)
 	for _, p := range []string{matched, excluded} {
@@ -255,8 +258,8 @@ func TestSearchAST_RejectsBadInputs(t *testing.T) {
 }
 
 func TestSearchAST_MinFanInOfEnclosingFunc(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	abs := writeTempGoFile(t, "two.go", `package x
+	srv, root := setupTestServer(t)
+	abs := writeTempGoFile(t, root, "two.go", `package x
 
 func Hot() { panic("a") }
 func Cold() { panic("b") }

@@ -539,7 +539,7 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 		resolvedGraphPath := ""
 		resolvedRepoPrefix := ""
 		if err == nil {
-			resolvedGraphPath = s.resolveOverlayGraphPath(relPath, absPath)
+			resolvedGraphPath = s.resolveOverlayGraphPathForRequest(ctx, relPath, absPath)
 			if s.multiIndexer != nil {
 				resolvedRepoPrefix = matchedRepoPrefix(s.multiIndexer, relPath)
 			}

@@ -96,6 +96,15 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	if snap.BytesWritten > 0 {
 		payload["bytes_written"] = snap.BytesWritten
 	}
+	if snap.CheckoutID != "" {
+		payload["checkout_id"] = snap.CheckoutID
+	}
+	if snap.ObservedRouteEpoch > 0 {
+		payload["observed_route_epoch"] = snap.ObservedRouteEpoch
+	}
+	if snap.PublishedRouteEpoch > 0 {
+		payload["published_route_epoch"] = snap.PublishedRouteEpoch
+	}
 	if snap.Error != "" {
 		payload["error"] = snap.Error
 	}

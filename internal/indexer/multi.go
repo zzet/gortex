@@ -853,6 +853,10 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 
 		if receipt.ResolutionRelevant {
 			mi.runMasterResolveFiles(resolutionFiles, false)
+			// Evicted definitions' pending references live outside the file
+			// frontier (their name is no longer declared in any frontier
+			// file); rebind them by the names the receipt recorded.
+			mi.runMasterResolveNames(receipt.EvictedNames)
 		}
 		// Resolve only files that can create or bind unresolved edges. Resolved
 		// edge sources still materialise their cross_repo_* generation without
@@ -963,6 +967,41 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 		zap.Int("files", len(files)),
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter))
+}
+
+// runMasterResolveNames rebinds pending references parked under the given
+// symbol names' unresolved stubs, across every tracked repo prefix plus the
+// bare single-repo form. Companion to runMasterResolveFiles for the
+// receipt-exact path: an evicted definition's pending references are reachable
+// by name only, never by file frontier.
+func (mi *MultiIndexer) runMasterResolveNames(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	master := mi.newMasterResolver(false)
+	if master == nil {
+		return
+	}
+	// Snapshot the prefixes under the registry lock and release it before
+	// resolver work: the deferred receipt tail runs concurrently with
+	// UntrackRepo, and an unlocked iteration of mi.indexers races its
+	// registry write (concurrent map iteration and mutation can crash the
+	// daemon, not just trip the detector).
+	mi.mu.RLock()
+	prefixes := make([]string, 0, len(mi.indexers))
+	for prefix := range mi.indexers {
+		if prefix != "" {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	mi.mu.RUnlock()
+	sort.Strings(prefixes)
+	mt := time.Now()
+	stats := master.ResolveIncomingForNames(names, prefixes)
+	mi.logger.Info("DEFERRED-TIMING master.ResolveIncomingForNames",
+		zap.Duration("elapsed", time.Since(mt)),
+		zap.Int("names", len(names)),
+		zap.Int("resolved", stats.Resolved))
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable

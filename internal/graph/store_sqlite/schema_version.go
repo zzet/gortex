@@ -33,7 +33,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 18
+const currentSchemaVersion = 19
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -81,12 +81,22 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
-	{version: 13, name: "add checkout lifecycle catalog", inPlace: createCheckoutCatalogTables},
-	{version: 14, name: "add edges view generation column", inPlace: addEdgeViewGenerationColumn},
+	// v13 shipped on main before the overlay lineage merged. Never renumber or
+	// replace it: old flat stores must run the original purge before any payload
+	// table gains a generation key.
+	{version: 13, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
+	// Feature-lineage v13 stores already have the catalog, while main-lineage
+	// v13 stores have neither it nor edges.view_gen. Both operations are
+	// idempotent, so one v14 step safely converges both histories.
+	{version: 14, name: "add checkout catalog and edges view generation", inPlace: addCheckoutCatalogAndEdgeViewGeneration},
 	{version: 15, name: "key payload sidecars by view generation", inPlace: addSidecarViewGenerationKeys},
 	{version: 16, name: "key nodes and edges by view generation", inPlace: keyGraphCoreByViewGeneration},
 	{version: 17, name: "add sparse view-generation enumeration indexes", inPlace: addGenerationEnumerationIndexes},
 	{version: 18, name: "add sparse generation ownership masks", inPlace: createGenerationMaskTables},
+	// Feature-lineage stores reached v18 without main's v13 coverage purge.
+	// Replay it after the generation re-key; the purge dispatches on schema
+	// shape and isolates every decision and delete by view_gen.
+	{version: 19, name: "replay generation-scoped legacy coverage purge", inPlace: purgeLegacyCoverageSpellings},
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are
@@ -416,6 +426,18 @@ func addEdgeViewGenerationColumn(tx *sql.Tx) error {
 func createCheckoutCatalogTables(tx *sql.Tx) error {
 	_, err := tx.Exec(checkoutCatalogSchemaSQL)
 	return err
+}
+
+// addCheckoutCatalogAndEdgeViewGeneration is the convergence point for the
+// two schema-v13 lineages. Main-v13 stores need both additions; feature-v13
+// stores already have the catalog. Each operation is idempotent and the schema
+// runner wraps this helper in one transaction, so either lineage reaches the
+// exact same v14 shape atomically.
+func addCheckoutCatalogAndEdgeViewGeneration(tx *sql.Tx) error {
+	if err := createCheckoutCatalogTables(tx); err != nil {
+		return err
+	}
+	return addEdgeViewGenerationColumn(tx)
 }
 
 // normalizeDirColumnSeparators rebuilds the two generated dir columns whose

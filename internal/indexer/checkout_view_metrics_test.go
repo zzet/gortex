@@ -154,7 +154,7 @@ func TestCommittedUnderTheCycleIsCountedAsHeadMoved(t *testing.T) {
 	f.commitTreeB()
 
 	before := viewmetrics.Read()
-	if err := c.reconcileDirtySlot(ctx, commitGeneration, treeA, &route, &out); err != nil {
+	if err := c.reconcileDirtySlot(ctx, base.generationID, commitGeneration, treeA, &route, &out); err != nil {
 		t.Fatalf("reconcileDirtySlot: %v", err)
 	}
 	after := viewmetrics.Read()

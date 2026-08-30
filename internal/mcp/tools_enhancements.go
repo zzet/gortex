@@ -83,6 +83,17 @@ func (s *Server) ensureFresh(filePaths []string) []string {
 	return refreshed
 }
 
+// ensureFreshForRequest applies the canonical checkout's self-heal only when
+// that checkout is the request's source of truth. Re-indexing canonical files
+// while a ref or routed worktree answers would mutate the wrong graph lane and
+// can make a read-only view trigger unrelated publication work.
+func (s *Server) ensureFreshForRequest(ctx context.Context, filePaths []string) []string {
+	if !requestUsesCanonicalFreshness(ctx) {
+		return nil
+	}
+	return s.ensureFresh(filePaths)
+}
+
 // freshnessIndexer resolves a repo-prefixed, repo-relative, or absolute path to
 // the indexer that owns it and the file's absolute path, for both single- and
 // multi-repo daemons. In single-repo mode an active file watcher already owns

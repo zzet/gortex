@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -39,23 +40,28 @@ type mutationPathLock struct {
 // mutation. A receipt is present only when the bounded request-path wait ended
 // before the watcher ticket did.
 type mutationReindexOutcome struct {
-	Reindexed         bool
-	Pending           bool
-	Receipt           string
-	Generation        uint64
-	AppliedGeneration uint64
-	Err               error
+	Reindexed           bool
+	Pending             bool
+	Receipt             string
+	Generation          uint64
+	AppliedGeneration   uint64
+	CheckoutID          string
+	ObservedRouteEpoch  int64
+	PublishedRouteEpoch int64
+	Err                 error
 }
 
 type mutationReceipt struct {
-	id         string
-	repo       string
-	path       string
-	generation uint64
-	done       chan struct{}
-	mu         sync.RWMutex
-	result     indexer.MutationResult
-	completed  bool
+	id                 string
+	repo               string
+	path               string
+	generation         uint64
+	checkoutID         string
+	observedRouteEpoch int64
+	done               chan struct{}
+	mu                 sync.RWMutex
+	result             indexer.MutationResult
+	completed          bool
 }
 
 type mutationScheduler interface {
@@ -152,11 +158,13 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 		repo = s.multiIndexer.RepoForFile(ticket.Path)
 	}
 	receipt := &mutationReceipt{
-		id:         fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
-		repo:       repo,
-		path:       ticket.Path,
-		generation: ticket.Generation,
-		done:       make(chan struct{}),
+		id:                 fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
+		repo:               repo,
+		path:               ticket.Path,
+		generation:         ticket.Generation,
+		checkoutID:         ticket.CheckoutID,
+		observedRouteEpoch: ticket.ObservedRouteEpoch,
+		done:               make(chan struct{}),
 	}
 	s.mutationReceipts.Store(receipt.id, receipt)
 	go func() {
@@ -171,6 +179,9 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 		receipt.result = result
 		receipt.completed = true
 		receipt.mu.Unlock()
+		if result.Err == nil && result.Reindexed {
+			s.resolveSupersededFailedReceipts(receipt.path, receipt.generation, result)
+		}
 		close(receipt.done)
 		time.AfterFunc(mutationReceiptRetention, func() {
 			s.mutationReceipts.Delete(receipt.id)
@@ -179,17 +190,62 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 	return receipt
 }
 
+// resolveSupersededFailedReceipts resolves terminally failed receipts for a
+// path and checkout once a later generation of the same path has been applied
+// successfully. The graph then reflects newer bytes than the failed
+// generation ever wrote, so the stale failure no longer describes a real
+// freshness gap — keeping it would only fail freshness barriers that waiting
+// cannot heal, because a terminal error never completes differently.
+//
+// The failed receipt is resolved in place rather than deleted: the
+// mutation-commit ledger refreshes its graph half through
+// mutationReceiptState, and a deleted receipt would leave that record
+// reading "pending" forever. Stamping the superseding apply mirrors how
+// completeMutationWaiters resolves earlier waiters with the later apply's
+// result. Pending receipts and failures at or above the succeeded
+// generation are left untouched. The succeeded result is passed by value so
+// the sweep holds no lock besides the receipt it is stamping.
+func (s *Server) resolveSupersededFailedReceipts(succeededPath string, succeededGeneration uint64, applied indexer.MutationResult) {
+	cleanPath := filepath.Clean(succeededPath)
+	s.mutationReceipts.Range(func(_, value any) bool {
+		other, ok := value.(*mutationReceipt)
+		if !ok {
+			return true
+		}
+		if other.generation >= succeededGeneration ||
+			filepath.Clean(other.path) != cleanPath ||
+			other.checkoutID != applied.CheckoutID {
+			return true
+		}
+		other.mu.Lock()
+		if other.completed && (other.result.Err != nil || !other.result.Reindexed) {
+			other.result = indexer.MutationResult{
+				RequestedGeneration: other.generation,
+				AppliedGeneration:   applied.AppliedGeneration,
+				CheckoutID:          applied.CheckoutID,
+				PublishedRouteEpoch: applied.PublishedRouteEpoch,
+				Reindexed:           true,
+			}
+		}
+		other.mu.Unlock()
+		return true
+	})
+}
+
 func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	outcome := mutationReindexOutcome{
-		Pending:    pending,
-		Receipt:    r.id,
-		Generation: r.generation,
+		Pending:            pending,
+		Receipt:            r.id,
+		Generation:         r.generation,
+		CheckoutID:         r.checkoutID,
+		ObservedRouteEpoch: r.observedRouteEpoch,
 	}
 	if r.completed {
 		outcome.Reindexed = r.result.Reindexed
 		outcome.AppliedGeneration = r.result.AppliedGeneration
+		outcome.PublishedRouteEpoch = r.result.PublishedRouteEpoch
 		outcome.Err = r.result.Err
 		outcome.Pending = false
 	}
@@ -216,6 +272,21 @@ func (s *Server) mutationSafetyWaitDuration() time.Duration {
 // the request path both blocks the response and races the watcher. Embedded
 // servers have no watcher and retain the synchronous freshness contract.
 func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
+	if view := requestViewFromContext(ctx); view != nil && view.mutableCheckout() {
+		if s.lifecycle == nil {
+			return mutationReindexOutcome{
+				CheckoutID: view.checkoutID,
+				Err:        fmt.Errorf("checkout %q has no route publisher", view.checkoutID),
+			}
+		}
+		// The bytes are already committed. Detach publication from the client
+		// deadline so cancellation cannot strand the selected checkout's graph.
+		ticket, err := s.lifecycle.EnqueueCheckoutMutation(context.WithoutCancel(ctx), view.checkoutID, absPath)
+		if err != nil {
+			return mutationReindexOutcome{CheckoutID: view.checkoutID, Err: err}
+		}
+		return s.awaitMutationTicket(ctx, ticket)
+	}
 	if watcher := s.currentWatcher(); watcher != nil {
 		// Admission is path-scoped and authoritative. Scheduling uses a detached
 		// context because the disk commit already happened; client cancellation
@@ -226,19 +297,7 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 				return mutationReindexOutcome{Err: scheduleErr}
 			}
 			if ticket != nil {
-				receipt := s.trackMutationTicket(ticket)
-				timer := time.NewTimer(s.mutationWaitDuration())
-				defer timer.Stop()
-				select {
-				case <-receipt.done:
-					outcome := receipt.outcome(false)
-					outcome.Receipt = ""
-					return outcome
-				case <-timer.C:
-					return receipt.outcome(true)
-				case <-ctx.Done():
-					return receipt.outcome(true)
-				}
+				return s.awaitMutationTicket(ctx, ticket)
 			}
 		}
 	}
@@ -246,6 +305,25 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 		return mutationReindexOutcome{Err: err}
 	}
 	return mutationReindexOutcome{Reindexed: s.reindexFile(absPath)}
+}
+
+func (s *Server) awaitMutationTicket(ctx context.Context, ticket *indexer.MutationTicket) mutationReindexOutcome {
+	if ticket == nil {
+		return mutationReindexOutcome{Err: errors.New("mutation scheduler returned no ticket")}
+	}
+	receipt := s.trackMutationTicket(ticket)
+	timer := time.NewTimer(s.mutationWaitDuration())
+	defer timer.Stop()
+	select {
+	case <-receipt.done:
+		outcome := receipt.outcome(false)
+		outcome.Receipt = ""
+		return outcome
+	case <-timer.C:
+		return receipt.outcome(true)
+	case <-ctx.Done():
+		return receipt.outcome(true)
+	}
 }
 
 // awaitMutationFreshness is the conservative all-repository safety barrier.
@@ -313,16 +391,19 @@ waitLoop:
 	}
 
 	issues := make([]string, 0, len(receipts))
+	hasTerminalFailure := false
 	for _, receipt := range receipts {
 		select {
 		case <-receipt.done:
 			outcome := receipt.outcome(false)
 			switch {
 			case outcome.Err != nil:
+				hasTerminalFailure = true
 				issues = append(issues, fmt.Sprintf(
 					"failed receipt=%s repo=%q path=%q generation=%d error=%q",
 					receipt.id, receipt.repo, receipt.path, receipt.generation, outcome.Err.Error()))
 			case !outcome.Reindexed:
+				hasTerminalFailure = true
 				issues = append(issues, fmt.Sprintf(
 					"failed receipt=%s repo=%q path=%q generation=%d error=%q",
 					receipt.id, receipt.repo, receipt.path, receipt.generation, "reindex not confirmed"))
@@ -351,6 +432,11 @@ waitLoop:
 			message += "; "
 		}
 		message += issue
+	}
+	if hasTerminalFailure {
+		message += "; terminally failed generations do not recover by waiting — " +
+			"they clear when a later mutation of the same path succeeds or when " +
+			"the receipt retention lapses"
 	}
 	return fmt.Errorf("%s", message)
 }
@@ -396,7 +482,7 @@ func (s *Server) mutationReceiptState(id string) (mutationReindexOutcome, bool) 
 // health is only authoritative after completed reindex; reading it while a
 // watcher patch is pending would surface stale parse errors and provoke an
 // unnecessary source re-read.
-func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath string, outcome mutationReindexOutcome) {
+func (s *Server) attachMutationFreshness(ctx context.Context, resp map[string]any, relPath, absPath string, outcome mutationReindexOutcome) {
 	resp["reindexed"] = outcome.Reindexed
 	// graph_status is the freshness half of the mutation contract, named so it
 	// reads next to disk_status (mutation_commit.go) rather than having to be
@@ -408,6 +494,15 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 	if outcome.AppliedGeneration > 0 {
 		resp["applied_generation"] = outcome.AppliedGeneration
 	}
+	if outcome.CheckoutID != "" {
+		resp["checkout_id"] = outcome.CheckoutID
+	}
+	if outcome.ObservedRouteEpoch > 0 {
+		resp["observed_route_epoch"] = outcome.ObservedRouteEpoch
+	}
+	if outcome.PublishedRouteEpoch > 0 {
+		resp["published_route_epoch"] = outcome.PublishedRouteEpoch
+	}
 	if outcome.Receipt != "" {
 		resp["reindex_receipt"] = outcome.Receipt
 	}
@@ -416,7 +511,7 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 		return
 	}
 	if outcome.Reindexed {
-		if health := s.fileSyntaxHealth(relPath, absPath); health != nil {
+		if health := s.fileSyntaxHealth(ctx, relPath, absPath, outcome); health != nil {
 			resp["syntax_health"] = health
 		}
 	}

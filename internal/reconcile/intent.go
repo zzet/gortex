@@ -18,7 +18,7 @@ const (
 	// FamilyStateReady is a family whose common-dir identity is known.
 	FamilyStateReady = "family_ready"
 	// GraphStateReady is a dedicated graph that can serve queries.
-	GraphStateReady = "graph_ready"
+	GraphStateReady = store_sqlite.DedicatedGraphStateReady
 )
 
 // ErrIntentNotRevocable reports that a checkout is still wanted by a tracking

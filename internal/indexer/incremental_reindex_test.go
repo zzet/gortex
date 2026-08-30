@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // TestIncrementalReindex_EvictsExcludedFiles is the regression for #321:
@@ -202,6 +203,83 @@ func TestIncrementalReindex_FailedFileSurfacedAndRetried(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, res2.FailedFiles, "the file indexes cleanly once readable")
 	assert.NotEmpty(t, g.FindNodesByName("Bad"))
+}
+
+// TestEvictFilesBatched_EvictsOnlyTheCallerSpelling pins the eviction
+// contract both storage backends must honour: a file's eviction touches
+// that file's own spelling and nothing else.
+//
+// The shape is the one a Windows store written by a pre-fix binary has:
+// native `src\a.go` and `src\b.go` both hold a licensed_as edge into the
+// SHARED `license::MIT` node, and a legacy `src/a.go` edge lingers beside
+// them. Sweeping a's forward-slash twin through file eviction would
+// delete every edge touching whichever node that sweep evicts — so with
+// the shared node anchored to the legacy path it takes b's valid edge
+// down with it, and with it anchored elsewhere the legacy edge survives
+// anyway. Legacy rows are healed once by schema migration v13
+// (purgeLegacyCoverageSpellings), which deletes by edge kind + FilePath
+// and drops a shared target only when nothing references it.
+func TestEvictFilesBatched_EvictsOnlyTheCallerSpelling(t *testing.T) {
+	// Both anchoring orders are present: a shared target whose
+	// first-sighting FilePath is the legacy spelling, and one anchored to
+	// a surviving file. Neither anchor may decide what an eviction of a
+	// removes — the FilePath of a shared coverage target is a breadcrumb,
+	// not ownership.
+	const (
+		nativeA    = `src\a.go`
+		nativeB    = `src\b.go`
+		legacyA    = `src/a.go`
+		licAnchorA = "license::MIT"
+		licAnchorB = "license::Apache-2.0"
+	)
+	nodes := []*graph.Node{
+		{ID: nativeA, Kind: graph.KindFile, Name: "a.go", FilePath: nativeA},
+		{ID: nativeB, Kind: graph.KindFile, Name: "b.go", FilePath: nativeB},
+		{ID: licAnchorA, Kind: graph.KindLicense, Name: "MIT", FilePath: legacyA},
+		{ID: licAnchorB, Kind: graph.KindLicense, Name: "Apache-2.0", FilePath: nativeB},
+	}
+	edges := []*graph.Edge{
+		{From: nativeA, To: licAnchorA, Kind: graph.EdgeLicensedAs, FilePath: nativeA},
+		{From: nativeB, To: licAnchorA, Kind: graph.EdgeLicensedAs, FilePath: nativeB},
+		{From: legacyA, To: licAnchorA, Kind: graph.EdgeLicensedAs, FilePath: legacyA},
+		{From: nativeB, To: licAnchorB, Kind: graph.EdgeLicensedAs, FilePath: nativeB},
+		{From: legacyA, To: licAnchorB, Kind: graph.EdgeLicensedAs, FilePath: legacyA},
+	}
+
+	for _, backend := range []struct {
+		name string
+		open func(t *testing.T) graph.Store
+	}{
+		{"graph", func(t *testing.T) graph.Store { return graph.New() }},
+		{"sqlite", func(t *testing.T) graph.Store {
+			s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+			return s
+		}},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			g := backend.open(t)
+			g.AddBatch(nodes, edges)
+
+			evictFilesBatched(g, []string{nativeA})
+
+			for _, shared := range []string{licAnchorA, licAnchorB} {
+				var froms []string
+				for _, e := range g.GetInEdges(shared) {
+					if e != nil {
+						froms = append(froms, e.From)
+					}
+				}
+				want := []string{nativeB, legacyA}
+				assert.ElementsMatch(t, want, froms,
+					"%s: only a's own spelling is evicted — b keeps its valid "+
+						"edge, and the legacy row is the migration's business", shared)
+				assert.NotNil(t, g.GetNode(shared),
+					"%s: the shared license node outlives one of its files", shared)
+			}
+		})
+	}
 }
 
 // TestIncrementalReindex_MerkleMode exercises the BLAKE3 Merkle change

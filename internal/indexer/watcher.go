@@ -58,13 +58,23 @@ type GraphChangeEvent struct {
 type MutationTicket struct {
 	Path       string
 	Generation uint64
-	Done       <-chan MutationResult
+	// CheckoutID is set only for a mutation routed through a checked-out
+	// worktree. Canonical watcher tickets leave it empty.
+	CheckoutID string
+	// ObservedRouteEpoch is the checkout route epoch current when the disk
+	// mutation was admitted. Completion reports the epoch whose publication
+	// was confirmed; the two may be equal when a concurrent cycle had already
+	// incorporated the bytes before admission completed.
+	ObservedRouteEpoch int64
+	Done               <-chan MutationResult
 }
 
 // MutationResult is the terminal graph-freshness result for a ticket.
 type MutationResult struct {
 	RequestedGeneration uint64
 	AppliedGeneration   uint64
+	CheckoutID          string
+	PublishedRouteEpoch int64
 	Reindexed           bool
 	Err                 error
 }

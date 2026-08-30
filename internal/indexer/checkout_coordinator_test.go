@@ -157,14 +157,18 @@ func (f *coordinatorFixture) writeCatalogIdentity() {
 		f.t.Fatalf("bind the primary dedicated graph: %v", err)
 	}
 
+	pipeline := DedicatedBasePipelineFor(config.Default().Index)
 	generationID, payload, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:      checkoutLayerOwnerKind,
-		GraphID:        f.graphID,
-		LayerID:        "test-primary-base",
-		CheckoutID:     f.primaryID,
-		GenerationKind: "dedicated",
-		TreeOID:        f.treeA,
-		CreatedAt:      now,
+		OwnerKind:         dedicatedBaseGenerationKind,
+		GraphID:           f.graphID,
+		LayerID:           f.graphID + ":base",
+		CheckoutID:        f.primaryID,
+		GenerationKind:    dedicatedBaseGenerationKind,
+		TreeOID:           f.treeA,
+		ConfigHash:        pipeline.ConfigHash,
+		ExtractorVersions: pipeline.ExtractorVersions,
+		ResolverVersion:   pipeline.ResolverVersion,
+		CreatedAt:         now,
 	})
 	if err != nil {
 		f.t.Fatalf("begin the primary generation: %v", err)
@@ -294,7 +298,7 @@ func (f *coordinatorFixture) generations() []store_sqlite.ViewGeneration {
 	var out []store_sqlite.ViewGeneration
 	for id := int64(1); id <= 64; id++ {
 		row, found := f.generation(id)
-		if !found || (row.GenerationKind == "dedicated" && row.CheckoutID == f.primaryID) {
+		if !found || (row.GenerationKind == dedicatedBaseGenerationKind && row.CheckoutID == f.primaryID) {
 			continue
 		}
 		out = append(out, row)
@@ -1114,7 +1118,7 @@ func TestCoordinatorRefusesAWorkingTreeLayerOverAStaleHead(t *testing.T) {
 	// dirty half takes says that the tree underneath it has moved.
 	f.commitTreeB()
 
-	if err := c.reconcileDirtySlot(ctx, commitGeneration, treeA, &route, &out); err != nil {
+	if err := c.reconcileDirtySlot(ctx, base.generationID, commitGeneration, treeA, &route, &out); err != nil {
 		t.Fatalf("reconcileDirtySlot: %v", err)
 	}
 	if !out.Rescheduled {

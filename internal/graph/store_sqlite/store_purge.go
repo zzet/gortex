@@ -136,7 +136,7 @@ func (s *Store) PurgeRepo(prefix string) error {
 	}
 	s.finishAnalysisMutationLocked(len(ids) > 0)
 	if changed {
-		s.markMutationReceiptsIncompleteLocked()
+		s.markAllMutationReceiptsIncompleteLocked()
 	}
 	return nil
 }
@@ -340,7 +340,7 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 		return err
 	}
 	if changed {
-		s.markMutationReceiptsIncompleteLocked()
+		s.markAllMutationReceiptsIncompleteLocked()
 	}
 	return nil
 }

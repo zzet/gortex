@@ -208,3 +208,36 @@ func TestNewSessionID_IsRandomAndHex(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionIdleTTLFromEnv(t *testing.T) {
+	t.Run("default when nothing is set", func(t *testing.T) {
+		t.Setenv("GORTEX_MCP_SESSION_IDLE_TTL", "")
+		if got := SessionIdleTTLFromEnv(0); got != DefaultSessionIdleTTL {
+			t.Errorf("got %v, want %v", got, DefaultSessionIdleTTL)
+		}
+	})
+	t.Run("explicit override wins over env", func(t *testing.T) {
+		t.Setenv("GORTEX_MCP_SESSION_IDLE_TTL", "5m")
+		if got := SessionIdleTTLFromEnv(time.Hour); got != time.Hour {
+			t.Errorf("got %v, want %v", got, time.Hour)
+		}
+	})
+	t.Run("env is honored", func(t *testing.T) {
+		t.Setenv("GORTEX_MCP_SESSION_IDLE_TTL", "45m")
+		if got := SessionIdleTTLFromEnv(0); got != 45*time.Minute {
+			t.Errorf("got %v, want %v", got, 45*time.Minute)
+		}
+	})
+	t.Run("negative env clamps to no-expiry", func(t *testing.T) {
+		t.Setenv("GORTEX_MCP_SESSION_IDLE_TTL", "-1m")
+		if got := SessionIdleTTLFromEnv(0); got != 0 {
+			t.Errorf("got %v, want 0 (no expiry)", got)
+		}
+	})
+	t.Run("garbage env falls back to the default", func(t *testing.T) {
+		t.Setenv("GORTEX_MCP_SESSION_IDLE_TTL", "not-a-duration")
+		if got := SessionIdleTTLFromEnv(0); got != DefaultSessionIdleTTL {
+			t.Errorf("got %v, want %v", got, DefaultSessionIdleTTL)
+		}
+	})
+}

@@ -145,12 +145,12 @@ func (s *Server) snapshotExploreSourceLiteralOverlays(
 		if err := ctx.Err(); err != nil {
 			return nil, covered, incomplete, false, err
 		}
-		absPath, resolveErr := s.resolveOverlayAbsPath(overlay.Path)
+		absPath, resolveErr := s.resolveOverlayAbsPathForRequest(ctx, overlay.Path)
 		if resolveErr != nil || absPath == "" {
 			incomplete = true
 			continue
 		}
-		owner := s.pickIndexerForPath(absPath)
+		owner := s.pickIndexerForRequestPath(ctx, absPath)
 		if owner == nil {
 			incomplete = true
 			continue

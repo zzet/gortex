@@ -47,10 +47,15 @@ type requestView struct {
 	// routed checkout's root. Empty for a view of a committed tree, which is
 	// the whole difference a filesystem-backed capability turns on.
 	viewRoot string
-	// suppressBufferOverlay is set only for an unavailable checkout's
-	// primary-base fallback. Grace answers must exclude both persisted dirty
-	// state and session buffers; a normal cold-build fallback may still compose
-	// the caller's live editor buffers over its lower view.
+	// checkoutID names the publisher of a filesystem-backed routed view. It is
+	// populated only by an exact ready checkout route; ref and base fallbacks
+	// deliberately leave it empty so source mutations remain read-only.
+	checkoutID string
+	// suppressBufferOverlay marks immutable or deliberately sealed answers.
+	// Every ref view is committed state by definition, and a grace answer must
+	// exclude both persisted dirty state and session buffers. A normal cold-build
+	// base fallback may still compose the caller's live buffers over its lower
+	// view.
 	suppressBufferOverlay bool
 	// baseFallback distinguishes a labeled primary-base fallback from an
 	// ordinary explicit base request. It lets capability annotations report
@@ -115,10 +120,18 @@ func (v *requestView) annotations() ([]graphview.CapabilityStatus, []graphview.C
 // corpus — answers this request.
 func (v *requestView) routed() bool { return v != nil && v.reader != nil }
 
+// mutableCheckout reports that the request is bound to a real checkout whose
+// bytes and graph route can move together. Lifecycle admission separately
+// proves that the route still has a live publisher before any handler writes.
+func (v *requestView) mutableCheckout() bool {
+	return v != nil && v.routed() && v.checkoutID != "" && v.viewRoot != "" &&
+		v.files == nil && !v.baseFallback
+}
+
 // acceptsBufferOverlay reports whether session-local editor buffers may layer
-// over this answer. A grace fallback deliberately returns the stable primary
-// graph only: composing the disappeared checkout's buffers would make the
-// response look inexact while still leaking the unavailable working copy.
+// over this answer. Ref views are immutable committed trees. A grace fallback
+// deliberately returns only the stable primary graph. Neither may inherit an
+// editor buffer from the session that happens to issue the request.
 func (v *requestView) acceptsBufferOverlay() bool {
 	return v == nil || !v.suppressBufferOverlay
 }
@@ -745,6 +758,7 @@ func (s *Server) materializeRequestView(
 		materialized: view,
 		rider:        rider,
 		viewRoot:     checkout.RootPath,
+		checkoutID:   checkout.CheckoutID,
 	}
 	routed.bindSources(view.GenerationSources(), s.graph)
 	return routed, nil
@@ -906,23 +920,61 @@ func (s *Server) repoPrefixForCheckout(ctx context.Context, checkout store_sqlit
 	return primary
 }
 
-// refuseRoutedViewMutation blocks a source-mutating tool whose request reads
-// through a routed view.
-//
-// Path resolution follows the view, but nothing else on the write path does:
-// the view is a leased snapshot of generations, and a write beneath it leaves
-// the stack this request read describing content that is no longer there.
-// Refusing is the honest answer until the write path can invalidate the route
-// it wrote through; editing an automatic worktree comes with that.
-func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp.CallToolResult {
+// routedCheckoutMutationTools are the source writers whose entire disk and
+// publication path is checkout-aware. Every other edit/refactor operation is
+// refused against a routed view until it uses requestView.viewRoot and reports
+// publication through the selected checkout's coordinator.
+var routedCheckoutMutationTools = map[string]bool{
+	"edit_file":   true,
+	"edit_symbol": true,
+	"write_file":  true,
+	// rename_symbol can plan writes across several repositories. It remains
+	// read-only until planning proves every target is selected-checkout-bound
+	// and one route publication ticket can truthfully cover the whole commit.
+}
+
+func (s *Server) routedMutationLegacy(req *mcp.CallToolRequest) string {
+	if req == nil {
+		return ""
+	}
+	if spec, ok := s.viewFacadeOperation(req); ok && sourceMutatingFacades[spec.Facade] {
+		return spec.Legacy
+	}
+	return req.Params.Name
+}
+
+// refuseRoutedViewMutation admits only a source writer whose selected checkout
+// still has a live exact publisher. Ref/tree/fallback views have no writable
+// working copy. Routed handlers outside routedCheckoutMutationTools may still
+// cache canonical paths or refresh the canonical watcher, so they fail closed
+// even when the selected checkout itself is healthy.
+func (s *Server) refuseRoutedViewMutation(ctx context.Context, req *mcp.CallToolRequest) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
+	tool := ""
+	if req != nil {
+		tool = req.Params.Name
+	}
 	if !view.routed() || !s.facades.mutatesSource(tool) {
 		return nil
 	}
+	legacy := s.routedMutationLegacy(req)
+	publisherReady := view.mutableCheckout() && s.lifecycle != nil &&
+		s.lifecycle.CheckoutMutationReady(view.checkoutID, view.viewRoot)
+	if publisherReady && routedCheckoutMutationTools[legacy] {
+		return nil
+	}
+	actualView := "the selected routed view"
+	if view.rider != nil && view.rider.ActualView != "" {
+		actualView = view.rider.ActualView
+	}
+	detail := "no exact writable checkout publisher is available"
+	if publisherReady {
+		detail = fmt.Sprintf("%s does not yet publish mutations through the selected checkout route", legacy)
+	}
 	return mcp.NewToolResultError(fmt.Sprintf(
-		"%s: this request reads through %s, and %s would write the canonical checkout instead of that one. "+
-			"Read through the view; edit from the checkout's own working copy.",
-		graphview.CodeViewReadOnly, view.rider.ActualView, tool))
+		"%s: this request reads through %s, but %s. "+
+			"Committed refs and fallback views are read-only; routed mutation handlers must confine bytes and publish through the selected checkout coordinator.",
+		graphview.CodeViewReadOnly, actualView, detail))
 }
 
 // attachViewRider puts the view fields on the response, inside the freshness
