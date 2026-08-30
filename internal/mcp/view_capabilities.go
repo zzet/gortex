@@ -316,7 +316,13 @@ func (s *Server) evaluateRequestCapabilities(
 	required = mergeCapabilities(required, nil)
 	annotate = withoutCapabilities(mergeCapabilities(annotate, nil), required)
 	if view.baseFallback {
-		view.noteBaseScoped(mergeCapabilities(required, annotate))
+		// search_text is allowed to resolve the sealed grace identity only so
+		// its handler can return a labeled capability refusal. It reads no base
+		// corpus, so reporting search.text as base-scoped would claim an answer
+		// that never happened.
+		if !s.requestNeedsGraceRefusalView(req) {
+			view.noteBaseScoped(mergeCapabilities(required, annotate))
+		}
 		return nil
 	}
 

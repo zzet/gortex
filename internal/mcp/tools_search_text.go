@@ -70,10 +70,15 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	scopedMultiGrep := s.multiIndexer != nil && (resolved.RepoAllow != nil || len(pathFilter) > 0)
 	var matches []trigram.Match
 	needsFinalLimit := false
-	if view := requestViewFromContext(ctx); view.routed() {
-		// A request reading through a view answers out of that view's own
-		// working copy, or not at all. The canonical searchers below are built
-		// over a different tree.
+	if view := requestViewFromContext(ctx); view != nil && view.baseFallback {
+		// Grace is a sealed graph fallback, not a selected working copy. Literal
+		// text search is filesystem-backed, so neither the removed checkout nor
+		// the primary checkout's possibly dirty bytes are a truthful corpus.
+		return viewTextUnavailable(view, "the labeled primary fallback has no selected working copy"), nil
+	} else if view.routed() {
+		// A request reading through a concrete view answers out of that view's
+		// own working copy, or not at all. The canonical searchers below are
+		// built over a different tree.
 		viewMatches, refusal := s.searchTextInView(ctx, view, query, useRegexp, limit)
 		if refusal != nil {
 			return refusal, nil

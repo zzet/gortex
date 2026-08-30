@@ -310,6 +310,7 @@ func takeViewSelector(req *mcp.CallToolRequest) (graphview.Selector, error) {
 // use, so a spelling alias cannot accidentally widen base-fallback access.
 type requestViewPolicy struct {
 	allowGraceBaseFallback    bool
+	allowGraceRefusalView     bool
 	allowBuildingBaseFallback bool
 }
 
@@ -317,8 +318,33 @@ func (s *Server) requestViewPolicy(req *mcp.CallToolRequest) requestViewPolicy {
 	allowBaseFallback := s.requestAllowsGraceBaseFallback(req)
 	return requestViewPolicy{
 		allowGraceBaseFallback:    allowBaseFallback,
+		allowGraceRefusalView:     s.requestNeedsGraceRefusalView(req),
 		allowBuildingBaseFallback: allowBaseFallback,
 	}
+}
+
+// requestNeedsGraceRefusalView identifies a filesystem operation that still
+// needs the sealed fallback identity long enough to return its own truthful,
+// labeled capability refusal. It does not authorize the operation to read the
+// base: search_text's handler refuses before selecting any text corpus.
+func (s *Server) requestNeedsGraceRefusalView(req *mcp.CallToolRequest) bool {
+	if s == nil || s.facades == nil || req == nil || requestTargetsFile(req) {
+		return false
+	}
+	if isFacadeToolName(req.Params.Name) {
+		spec, ok := s.viewFacadeOperation(req)
+		return ok && spec.Effect == facadeEffectRead && spec.Legacy == "search_text"
+	}
+	specs := s.facades.byLegacy[req.Params.Name]
+	if len(specs) == 0 {
+		return false
+	}
+	for _, spec := range specs {
+		if spec.Effect != facadeEffectRead || spec.Legacy != "search_text" {
+			return false
+		}
+	}
+	return true
 }
 
 // requestAllowsGraceBaseFallback admits only read-effect graph/search
@@ -613,7 +639,7 @@ func (s *Server) viewForWorktreeSelector(
 				return nil, graphview.NewViewError(graphview.CodePrimaryNotReady,
 					fmt.Sprintf("primary graph %q is %s", primary.GraphID, primary.State))
 			}
-			if !policy.allowGraceBaseFallback {
+			if !policy.allowGraceBaseFallback && !policy.allowGraceRefusalView {
 				return nil, stateErr
 			}
 			return s.materializeGraceBaseFallback(ctx, selector, checkout, primary)
