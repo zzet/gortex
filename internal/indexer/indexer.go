@@ -2379,6 +2379,13 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
+	// Pin the destination's reachability scope before the cold-index shadow can
+	// replace idx.graph with its plain in-memory staging graph. The staging graph
+	// deliberately has no view-generation identity; asking it at the end of the
+	// pass would therefore misclassify a derived-generation build as a base
+	// mutation and retire the base corpus's reach records even though the drain
+	// writes only the generation-pinned target.
+	writesBaseReachTopology := reach.WritesBaseTopology(idx.graph)
 
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -4045,7 +4052,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// corpus those stamps describe, and runs outside the
 			// topology writer, so retiring them here would move the
 			// counter under a concurrent reader for nothing.
-			if reach.WritesBaseTopology(idx.graph) {
+			if writesBaseReachTopology {
 				reach.InvalidateIndex()
 			}
 		}

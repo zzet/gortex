@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -217,17 +219,53 @@ func TestSparseGenerationBuildDoesNotHoldTheTopologyWriter(t *testing.T) {
 // it must not retire them, and now that it runs outside the writer it must not
 // bump the generation under a reader's feet either.
 func TestSparseGenerationBuildDoesNotInvalidateBaseReach(t *testing.T) {
-	fixture := newTopologyGateFixture(t)
+	for _, strategy := range []struct {
+		name           string
+		shadowMaxFiles string
+		wantShadow     bool
+	}{
+		{name: "direct_sqlite", shadowMaxFiles: "0", wantShadow: false},
+		{name: "bounded_shadow", shadowMaxFiles: "1000000", wantShadow: true},
+	} {
+		t.Run(strategy.name, func(t *testing.T) {
+			t.Setenv("GORTEX_SHADOW_MAX_FILES", strategy.shadowMaxFiles)
+			t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
+			fixture := newTopologyGateFixture(t)
+			base := fixture.store.AtGeneration(0)
+			baseNodes, baseEdges := base.NodeCount(), base.EdgeCount()
+			if stats := reach.BuildIndex(base); stats.NodesIndexed == 0 {
+				t.Fatal("base fixture produced no persisted reachability records")
+			}
 
-	before := reach.BuildCounter()
-	_, _, err := builderNewBuilder(fixture.store).BuildCommitLayer(
-		context.Background(), fixture.commitLayerRequest())
-	if err != nil {
-		t.Fatalf("BuildCommitLayer: %v", err)
-	}
-	if after := reach.BuildCounter(); after != before {
-		t.Errorf("a sparse generation build moved the reach build counter from %d to %d",
-			before, after)
+			core, logs := observer.New(zapcore.InfoLevel)
+			builder := builderNewBuilder(fixture.store)
+			builder.Logger = zap.New(core)
+			before := reach.BuildCounter()
+			generationID, report, err := builder.BuildCommitLayer(
+				context.Background(), fixture.commitLayerRequest())
+			if err != nil {
+				t.Fatalf("BuildCommitLayer: %v", err)
+			}
+			if taken := observedShadowDecision(t, logs); taken != strategy.wantShadow {
+				t.Fatalf("shadow_taken = %t, want %t", taken, strategy.wantShadow)
+			}
+			if after := reach.BuildCounter(); after != before {
+				t.Errorf("a sparse generation build moved the reach build counter from %d to %d",
+					before, after)
+			}
+			if nodes, edges := base.NodeCount(), base.EdgeCount(); nodes != baseNodes || edges != baseEdges {
+				t.Errorf("base topology changed from %d/%d nodes/edges to %d/%d",
+					baseNodes, baseEdges, nodes, edges)
+			}
+
+			generation := fixture.store.AtGeneration(generationID)
+			if got := generation.NodeCount(); got == 0 || got != report.NodeCount {
+				t.Errorf("generation nodes = %d, report = %d", got, report.NodeCount)
+			}
+			if got := generation.EdgeCount(); got == 0 || got != report.EdgeCount {
+				t.Errorf("generation edges = %d, report = %d", got, report.EdgeCount)
+			}
+		})
 	}
 }
 
