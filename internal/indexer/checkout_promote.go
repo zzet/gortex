@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -292,7 +293,12 @@ func (l *CheckoutLifecycle) configuredPrefixForRoot(root string) string {
 	if l == nil || l.cfgMgr == nil || root == "" {
 		return ""
 	}
-	entries := l.cfgMgr.RepoEntries()
+	registrations := l.cfgMgr.RepoRegistrations()
+	entries := make([]config.RepoEntry, len(registrations))
+	for i := range registrations {
+		entries[i] = registrations[i].Entry
+		entries[i].Path = registrations[i].CanonicalPath
+	}
 	want, err := filepath.Abs(root)
 	if err != nil {
 		want = filepath.Clean(root)

@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/excludes"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // ConfigManager merges GlobalConfig + per-repo WorkspaceConfig.
@@ -79,11 +80,42 @@ func (cm *ConfigManager) Global() *GlobalConfig {
 	return global
 }
 
-// RepoEntries returns a lock-protected snapshot of every durable explicit
-// repository entry. Top-level repositories take precedence over duplicate
-// project entries; projects are traversed by name so repeated snapshots are
-// deterministic even though Projects is map-backed.
-func (cm *ConfigManager) RepoEntries() []RepoEntry {
+// RepoEntrySourceKind identifies the configuration collection that asserts a
+// durable repository membership. It is deliberately independent of the graph
+// catalog's intent vocabulary: config snapshots are also used by startup code
+// that does not own a catalog.
+type RepoEntrySourceKind string
+
+const (
+	RepoEntrySourceGlobal  RepoEntrySourceKind = "global"
+	RepoEntrySourceProject RepoEntrySourceKind = "project"
+)
+
+// RepoEntrySource is one independent configured reason to keep a physical
+// repository. Locator is the canonical root for a top-level entry and
+// "project:<name>" for a project membership, making it stable across path
+// aliases and config reloads.
+type RepoEntrySource struct {
+	Kind    RepoEntrySourceKind
+	Locator string
+}
+
+// RepoRegistration is one physical checkout together with every independent
+// config source that names it. Entry is the deterministic configuration that
+// wins for indexing (top-level first, then projects by name); CanonicalPath is
+// the alias-resolved identity used to coalesce physical work.
+type RepoRegistration struct {
+	Entry         RepoEntry
+	CanonicalPath string
+	Sources       []RepoEntrySource
+}
+
+// RepoRegistrations returns a lock-protected, provenance-bearing snapshot of
+// every durable explicit repository. Canonical aliases share one physical
+// registration without losing their top-level or per-project source intents.
+// Projects are traversed by name so both physical precedence and source order
+// are deterministic even though Projects is map-backed.
+func (cm *ConfigManager) RepoRegistrations() []RepoRegistration {
 	if cm == nil {
 		return nil
 	}
@@ -107,27 +139,81 @@ func (cm *ConfigManager) RepoEntries() []RepoEntry {
 	}
 	sort.Strings(projectNames)
 
-	entries := make([]RepoEntry, 0, len(global.Repos))
-	seenPaths := make(map[string]struct{}, len(global.Repos))
-	appendEntry := func(entry RepoEntry) {
-		identity := filepath.Clean(entry.Path)
-		if absolute, err := filepath.Abs(identity); err == nil {
-			identity = absolute
+	totalSources := len(global.Repos)
+	for _, name := range projectNames {
+		totalSources += len(global.Projects[name].Repos)
+	}
+	registrations := make([]RepoRegistration, 0, totalSources)
+	canonicalBySpelling := make(map[string]string, totalSources)
+	// A folded key normally has one candidate. The slice preserves correctness
+	// on an unusual case-sensitive volume when the host default is
+	// case-insensitive: SamePathIdentity refuses to merge two live directories
+	// that merely collide after folding.
+	byCanonicalKey := make(map[string][]int, totalSources)
+	appendSource := func(entry RepoEntry, source RepoEntrySource) {
+		spelling := filepath.Clean(entry.Path)
+		if absolute, err := filepath.Abs(spelling); err == nil {
+			spelling = absolute
 		}
-		if _, exists := seenPaths[identity]; exists {
+		spelling = pathkey.Normalize(spelling)
+		canonical, cached := canonicalBySpelling[spelling]
+		if !cached {
+			canonical = pathkey.CanonicalExistingRoot(entry.Path)
+			canonicalBySpelling[spelling] = canonical
+		}
+		if source.Kind == RepoEntrySourceGlobal && source.Locator == "" {
+			source.Locator = canonical
+		}
+		key := pathkey.Normalize(canonical)
+		if pathkey.CaseInsensitivePaths {
+			key = strings.ToLower(key)
+		}
+		for _, candidate := range byCanonicalKey[key] {
+			registration := &registrations[candidate]
+			if !pathkey.SamePathIdentity(registration.CanonicalPath, canonical) {
+				continue
+			}
+			for _, existing := range registration.Sources {
+				if existing == source {
+					return
+				}
+			}
+			registration.Sources = append(registration.Sources, source)
 			return
 		}
-		seenPaths[identity] = struct{}{}
+
 		entry.Exclude = append([]string(nil), entry.Exclude...)
-		entries = append(entries, entry)
+		registrations = append(registrations, RepoRegistration{
+			Entry:         entry,
+			CanonicalPath: canonical,
+			Sources:       []RepoEntrySource{source},
+		})
+		byCanonicalKey[key] = append(byCanonicalKey[key], len(registrations)-1)
 	}
 	for _, entry := range global.Repos {
-		appendEntry(entry)
+		appendSource(entry, RepoEntrySource{
+			Kind: RepoEntrySourceGlobal,
+		})
 	}
 	for _, name := range projectNames {
 		for _, entry := range global.Projects[name].Repos {
-			appendEntry(entry)
+			appendSource(entry, RepoEntrySource{
+				Kind:    RepoEntrySourceProject,
+				Locator: "project:" + name,
+			})
 		}
+	}
+	return registrations
+}
+
+// RepoEntries is the compatibility projection of RepoRegistrations for
+// consumers that only schedule physical work. Code that creates or retires
+// durable intent must use RepoRegistrations so it cannot discard provenance.
+func (cm *ConfigManager) RepoEntries() []RepoEntry {
+	registrations := cm.RepoRegistrations()
+	entries := make([]RepoEntry, len(registrations))
+	for i := range registrations {
+		entries[i] = registrations[i].Entry
 	}
 	return entries
 }

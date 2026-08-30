@@ -34,6 +34,11 @@ func TestWarmupDefersConfiguredGitCorpusToLifecyclePromotion(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "one.go"), []byte("package one\n\nfunc One() {}\n"), 0o644))
 	runCheckoutWarmupGit(t, repo, "add", ".")
 	runCheckoutWarmupGit(t, repo, "commit", "-q", "-m", "init")
+	alias := filepath.Join(dir, "project-only-alias")
+	if err := os.Symlink(repo, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	expectedPrefix := filepath.Base(repo)
 
 	nonGit := filepath.Join(dir, "plain-source")
 	require.NoError(t, os.MkdirAll(nonGit, 0o755))
@@ -42,9 +47,10 @@ func TestWarmupDefersConfiguredGitCorpusToLifecyclePromotion(t *testing.T) {
 	require.Equal(t, []config.RepoEntry{{Path: nonGit}}, legacy, "non-Git roots retain the historical warmup path")
 
 	cfgPath := filepath.Join(dir, "config.yaml")
-	gc := &config.GlobalConfig{}
+	gc := &config.GlobalConfig{Projects: map[string]config.ProjectConfig{
+		"only-project": {Repos: []config.RepoEntry{{Path: alias}}},
+	}}
 	gc.SetConfigPath(cfgPath)
-	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: repo, Name: "warmup-checkout"}))
 	require.NoError(t, gc.Save())
 	dbPath := filepath.Join(dir, "store.sqlite")
 
@@ -89,7 +95,7 @@ func TestWarmupDefersConfiguredGitCorpusToLifecyclePromotion(t *testing.T) {
 	require.Zero(t, cold.reposChanged, "configured Git checkout must produce no legacy generation-0 warmup job")
 	require.Empty(t, store.AllNodes(), "managed Git checkout must leave generation-0 nodes empty")
 	require.Empty(t, store.AllEdges(), "managed Git checkout must leave generation-0 edges empty")
-	require.Empty(t, store.LoadFileMtimes("warmup-checkout"), "managed Git checkout must leave generation-0 mtimes empty")
+	require.Empty(t, store.LoadFileMtimes(expectedPrefix), "managed Git checkout must leave generation-0 mtimes empty")
 	promotionStarted := time.Now()
 	gate.Open()
 	require.Eventually(t, func() bool {
@@ -101,6 +107,8 @@ func TestWarmupDefersConfiguredGitCorpusToLifecyclePromotion(t *testing.T) {
 	runtime.ReadMemStats(&coldPromotionMemAfter)
 	coldOverview, err := lc.FamiliesOverview(ctx, "")
 	require.NoError(t, err)
+	require.Equal(t, expectedPrefix, coldOverview.Families[0].Graphs[0].RepoPrefix,
+		"cold startup derives the graph prefix from the canonical physical root")
 	coldGeneration := coldOverview.Families[0].Graphs[0].ActiveGenerationID
 	require.Positive(t, coldGeneration)
 	coldGenerations, err := store.Catalog().ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{GraphID: coldOverview.Families[0].Graphs[0].GraphID})
@@ -115,6 +123,9 @@ func TestWarmupDefersConfiguredGitCorpusToLifecyclePromotion(t *testing.T) {
 	require.Equal(t, 1, baseBuilds, "cold startup performs exactly one physical immutable corpus build")
 	require.Empty(t, store.LoadFileMtimes(coldOverview.Families[0].Graphs[0].RepoPrefix),
 		"managed Git checkout must leave no generation-0 mtime payload")
+	require.Empty(t, state.configManager.Global().Repos,
+		"publishing a project-only corpus must not manufacture a top-level config source")
+	require.NoError(t, store.SetFileMtime(expectedPrefix, "orphan-protection-sentinel", 1))
 	closeState(store, mi, lc)
 
 	store, mi, lc, state = open()
@@ -133,11 +144,17 @@ func TestWarmupDefersConfiguredGitCorpusToLifecyclePromotion(t *testing.T) {
 	require.Zero(t, warm.reposChanged, "unchanged warm startup must perform zero physical corpus builds")
 	warmOverview, err := lc.FamiliesOverview(ctx, "")
 	require.NoError(t, err)
+	require.Equal(t, expectedPrefix, warmOverview.Families[0].Graphs[0].RepoPrefix,
+		"warm startup retains the canonical physical prefix across the symlink alias")
 	require.Equal(t, coldGeneration, warmOverview.Families[0].Graphs[0].ActiveGenerationID)
 	require.True(t, warmOverview.Families[0].Graphs[0].Served, "warm Seed restores the published route-owned shell")
 	warmGenerations, err := store.Catalog().ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{GraphID: warmOverview.Families[0].Graphs[0].GraphID})
 	require.NoError(t, err)
 	require.Equal(t, coldGenerations, warmGenerations, "unchanged warm startup reuses the exact base/commit/dirty generations without another build")
+	require.Equal(t, int64(1), store.LoadFileMtimes(expectedPrefix)["orphan-protection-sentinel"],
+		"orphan protection must recognize the canonical prefix behind a blank-name alias")
+	require.Empty(t, state.configManager.Global().Repos,
+		"warm route restoration must preserve project-only provenance")
 	t.Logf("bounded warmup benchmark: cold_legacy=%s cold_promotion=%s cold_total_allocs=%d cold_total_alloc_bytes=%d legacy_allocs=%d legacy_alloc_bytes=%d warm=%s warm_allocs=%d warm_alloc_bytes=%d physical_base_builds=%d cold_repos_changed=%d warm_repos_changed=%d",
 		coldWarmupElapsed, coldPromotionElapsed,
 		coldPromotionMemAfter.Mallocs-coldMemBefore.Mallocs, coldPromotionMemAfter.TotalAlloc-coldMemBefore.TotalAlloc,

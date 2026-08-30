@@ -2,9 +2,14 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 func TestConfigManagerRepoEntriesReturnsDefensiveSnapshot(t *testing.T) {
@@ -116,27 +121,108 @@ func TestConfigManagerRepoEntriesIncludesProjectsDeterministically(t *testing.T)
 	}
 }
 
-func BenchmarkConfigManagerRepoEntriesProjects(b *testing.B) {
+func TestConfigManagerRepoRegistrationsRetainsCanonicalAliasProvenance(t *testing.T) {
+	manager, err := NewConfigManager(filepath.Join(t.TempDir(), "config.yaml"))
+	require.NoError(t, err)
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real")
+	require.NoError(t, os.MkdirAll(realRoot, 0o755))
+	aliasRoot := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	globalConfigMu.Lock()
+	global := manager.Global()
+	global.Repos = []RepoEntry{{Path: aliasRoot, Name: "global-wins", Exclude: []string{"global/**"}}}
+	global.Projects = map[string]ProjectConfig{
+		"zeta":  {Repos: []RepoEntry{{Path: realRoot, Name: "zeta-loses"}}},
+		"alpha": {Repos: []RepoEntry{{Path: filepath.Join(realRoot, "."), Name: "alpha-loses"}}},
+	}
+	globalConfigMu.Unlock()
+
+	registrations := manager.RepoRegistrations()
+	require.Len(t, registrations, 1, "aliases must schedule one physical corpus")
+	registration := registrations[0]
+	require.Equal(t, aliasRoot, registration.Entry.Path, "top-level entry keeps physical precedence")
+	require.Equal(t, "global-wins", registration.Entry.Name)
+	require.Equal(t, pathkey.CanonicalExistingRoot(realRoot), registration.CanonicalPath)
+	require.Equal(t, []RepoEntrySource{
+		{Kind: RepoEntrySourceGlobal, Locator: pathkey.CanonicalExistingRoot(realRoot)},
+		{Kind: RepoEntrySourceProject, Locator: "project:alpha"},
+		{Kind: RepoEntrySourceProject, Locator: "project:zeta"},
+	}, registration.Sources, "each independent reference survives physical deduplication")
+
+	registrations[0].Entry.Exclude[0] = "caller/**"
+	registrations[0].CanonicalPath = "caller"
+	registrations[0].Sources[0].Locator = "caller"
+	fresh := manager.RepoRegistrations()
+	require.Equal(t, "global/**", fresh[0].Entry.Exclude[0])
+	require.Equal(t, pathkey.CanonicalExistingRoot(realRoot), fresh[0].CanonicalPath)
+	require.Equal(t, pathkey.CanonicalExistingRoot(realRoot), fresh[0].Sources[0].Locator)
+}
+
+func TestConfigManagerRepoRegistrationsDeduplicatesRepeatedProjectSource(t *testing.T) {
+	manager, err := NewConfigManager(filepath.Join(t.TempDir(), "config.yaml"))
+	require.NoError(t, err)
+	root := t.TempDir()
+
+	globalConfigMu.Lock()
+	global := manager.Global()
+	global.Projects = map[string]ProjectConfig{
+		"same": {Repos: []RepoEntry{{Path: root}, {Path: filepath.Join(root, ".")}}},
+	}
+	globalConfigMu.Unlock()
+
+	registrations := manager.RepoRegistrations()
+	require.Len(t, registrations, 1)
+	require.Equal(t, []RepoEntrySource{{Kind: RepoEntrySourceProject, Locator: "project:same"}}, registrations[0].Sources,
+		"one project membership is one provenance source even when its path is repeated")
+}
+
+func BenchmarkConfigManagerRepoRegistrations(b *testing.B) {
+	for _, physical := range []int{256, 1000} {
+		b.Run(fmt.Sprintf("physical_%d_sources_%d", physical, physical*3), func(b *testing.B) {
+			benchmarkConfigManagerRepoRegistrations(b, physical)
+		})
+	}
+}
+
+func benchmarkConfigManagerRepoRegistrations(b *testing.B, physical int) {
 	manager, err := NewConfigManager(filepath.Join(b.TempDir(), "config.yaml"))
 	if err != nil {
 		b.Fatalf("NewConfigManager: %v", err)
 	}
+	base := b.TempDir()
 	global := manager.Global()
 	globalConfigMu.Lock()
-	global.Projects = make(map[string]ProjectConfig, 64)
-	for i := 0; i < 64; i++ {
-		name := fmt.Sprintf("project-%03d", i)
-		global.Projects[name] = ProjectConfig{Repos: []RepoEntry{{
-			Path: filepath.Join(b.TempDir(), name), Name: name, Exclude: []string{"generated/**"},
-		}}}
+	global.Repos = make([]RepoEntry, 0, physical)
+	global.Projects = map[string]ProjectConfig{
+		"alpha": {Repos: make([]RepoEntry, 0, physical)},
+		"zeta":  {Repos: make([]RepoEntry, 0, physical)},
+	}
+	for i := 0; i < physical; i++ {
+		name := fmt.Sprintf("repo-%04d", i)
+		entry := RepoEntry{Path: filepath.Join(base, name), Name: name, Exclude: []string{"generated/**"}}
+		global.Repos = append(global.Repos, entry)
+		alpha := global.Projects["alpha"]
+		alpha.Repos = append(alpha.Repos, RepoEntry{Path: entry.Path, Name: name})
+		global.Projects["alpha"] = alpha
+		zeta := global.Projects["zeta"]
+		zeta.Repos = append(zeta.Repos, RepoEntry{Path: entry.Path, Name: name})
+		global.Projects["zeta"] = zeta
 	}
 	globalConfigMu.Unlock()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if entries := manager.RepoEntries(); len(entries) != 64 {
-			b.Fatalf("RepoEntries length = %d, want 64", len(entries))
+		registrations := manager.RepoRegistrations()
+		if len(registrations) != physical {
+			b.Fatalf("RepoRegistrations length = %d, want %d", len(registrations), physical)
+		}
+		if len(registrations[physical-1].Sources) != 3 {
+			b.Fatalf("last registration sources = %d, want 3", len(registrations[physical-1].Sources))
 		}
 	}
 }

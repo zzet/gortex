@@ -240,6 +240,9 @@ type CheckoutLifecycle struct {
 	// admission is closed. Tests use it to stop or fail at the final durable
 	// commit; nil in production.
 	releaseGraphBarrier func(context.Context, string, func() error) error
+	// checkoutForPrefixHook injects catalog lookup failures into reload tests;
+	// nil in production.
+	checkoutForPrefixHook func(context.Context, string) (*store_sqlite.Checkout, error)
 
 	// mu guards only the late-bound collaborators. None of them is held
 	// across a saga: the hooks re-enter the lifecycle, and holding a lock
@@ -497,6 +500,28 @@ func (l *CheckoutLifecycle) Register(
 	entry config.RepoEntry,
 	sourceKind store_sqlite.IntentSourceKind,
 ) (RegisterResult, error) {
+	return l.register(ctx, entry, sourceKind, nil)
+}
+
+// registerConfigured is the provenance-preserving registration path used by
+// startup and reload. A nil registration on register retains the public
+// CLI/MCP semantics; a non-nil one synchronizes the exact set of config-owned
+// intents and never rewrites a project-only membership as a top-level repo.
+func (l *CheckoutLifecycle) registerConfigured(
+	ctx context.Context,
+	registration config.RepoRegistration,
+) (RegisterResult, error) {
+	entry := registration.Entry
+	entry.Path = registration.CanonicalPath
+	return l.register(ctx, entry, TrackSourceConfig, &registration)
+}
+
+func (l *CheckoutLifecycle) register(
+	ctx context.Context,
+	entry config.RepoEntry,
+	sourceKind store_sqlite.IntentSourceKind,
+	configured *config.RepoRegistration,
+) (RegisterResult, error) {
 	if l == nil || l.mi == nil {
 		return RegisterResult{}, errors.New("indexer: checkout lifecycle is not wired")
 	}
@@ -538,7 +563,15 @@ func (l *CheckoutLifecycle) Register(
 		return out, nil
 	}
 
-	identity, catalogErr := l.recordCheckout(ctx, prefix, absPath, sourceKind, false)
+	var identity checkoutIdentity
+	var catalogErr error
+	if configured != nil {
+		identity, catalogErr = l.recordConfiguredCheckout(
+			ctx, prefix, absPath, configured.Sources, false,
+		)
+	} else {
+		identity, catalogErr = l.recordCheckout(ctx, prefix, absPath, sourceKind, false)
+	}
 	out := RegisterResult{
 		Prefix: prefix, CheckoutID: identity.checkoutID, Incarnation: identity.incarnation,
 		FamilyID: identity.familyID, GraphID: identity.graphID, CatalogErr: catalogErr,
@@ -547,7 +580,13 @@ func (l *CheckoutLifecycle) Register(
 		return out, catalogErr
 	}
 	if identity.checkoutID == "" {
-		result, trackErr := l.mi.TrackRepoCtx(ctx, entry)
+		var result *IndexResult
+		var trackErr error
+		if configured != nil {
+			result, trackErr = l.mi.trackRepoSourceTransientCtx(ctx, entry, nil)
+		} else {
+			result, trackErr = l.mi.TrackRepoCtx(ctx, entry)
+		}
 		if trackErr != nil {
 			return out, trackErr
 		}
@@ -567,7 +606,11 @@ func (l *CheckoutLifecycle) Register(
 		// repository shell does not. Re-entering TrackRepoCtx restores only that
 		// shell because the durable route owns the immutable corpus.
 		entry.Name = promoted.Prefix
-		promoted.Index, promoteErr = l.mi.TrackRepoCtx(ctx, entry)
+		if configured != nil {
+			promoted.Index, promoteErr = l.mi.trackRepoSourceTransientCtx(ctx, entry, nil)
+		} else {
+			promoted.Index, promoteErr = l.mi.TrackRepoCtx(ctx, entry)
+		}
 	}
 	if promoteErr == nil && run != nil {
 		gate := l.buildGate()
@@ -643,6 +686,37 @@ type checkoutIdentity struct {
 	graphID     string
 }
 
+type checkoutIntentSpec struct {
+	kind    store_sqlite.IntentSourceKind
+	locator string
+}
+
+func configuredIntentSpecs(
+	sources []config.RepoEntrySource,
+	root string,
+) ([]checkoutIntentSpec, error) {
+	specs := make([]checkoutIntentSpec, 0, len(sources))
+	for _, source := range sources {
+		switch source.Kind {
+		case config.RepoEntrySourceGlobal:
+			locator := source.Locator
+			if locator == "" {
+				locator = root
+			}
+			specs = append(specs, checkoutIntentSpec{
+				kind: TrackSourceConfig, locator: locator,
+			})
+		case config.RepoEntrySourceProject:
+			specs = append(specs, checkoutIntentSpec{
+				kind: store_sqlite.IntentSourceProjectMembership, locator: source.Locator,
+			})
+		default:
+			return nil, fmt.Errorf("indexer: unsupported configured repository source %q", source.Kind)
+		}
+	}
+	return specs, nil
+}
+
 // recordCheckout writes the catalog rows one tracked root implies.
 //
 // seeding narrows it to a migration: an identity that already exists is left
@@ -652,6 +726,35 @@ func (l *CheckoutLifecycle) recordCheckout(
 	ctx context.Context,
 	prefix, root string,
 	source store_sqlite.IntentSourceKind,
+	seeding bool,
+) (checkoutIdentity, error) {
+	root = pathkey.CanonicalExistingRoot(root)
+	var intents []checkoutIntentSpec
+	if source != TrackSourceImplicit {
+		intents = []checkoutIntentSpec{{kind: source, locator: root}}
+	}
+	return l.recordCheckoutWithIntents(ctx, prefix, root, intents, false, seeding)
+}
+
+func (l *CheckoutLifecycle) recordConfiguredCheckout(
+	ctx context.Context,
+	prefix, root string,
+	sources []config.RepoEntrySource,
+	seeding bool,
+) (checkoutIdentity, error) {
+	root = pathkey.CanonicalExistingRoot(root)
+	intents, err := configuredIntentSpecs(sources, root)
+	if err != nil {
+		return checkoutIdentity{}, err
+	}
+	return l.recordCheckoutWithIntents(ctx, prefix, root, intents, true, seeding)
+}
+
+func (l *CheckoutLifecycle) recordCheckoutWithIntents(
+	ctx context.Context,
+	prefix, root string,
+	intents []checkoutIntentSpec,
+	exactConfiguredIntents bool,
 	seeding bool,
 ) (checkoutIdentity, error) {
 	if l.catalog == nil || prefix == "" {
@@ -701,18 +804,12 @@ func (l *CheckoutLifecycle) recordCheckout(
 	// A config entry may outlive an authorized demotion until its cleanup
 	// worker removes the dedicated corpus. On restart that stale entry must not
 	// resurrect the intent the durable transition already revoked.
-	restoreExplicitIntent := source != TrackSourceImplicit &&
+	restoreExplicitIntent := len(intents) != 0 &&
 		(!seeding || existing == nil || existing.ActiveIntentTransitionID == "")
 	if restoreExplicitIntent {
-		intent := store_sqlite.TrackingIntent{
-			IntentID:      uuid.NewV7().String(),
-			CheckoutID:    identity.checkoutID,
-			SourceKind:    source,
-			SourceLocator: root,
-			Active:        true,
-			CreatedAt:     now.Unix(),
-		}
-		if err := l.catalog.UpsertTrackingIntent(ctx, intent); err != nil {
+		if err := l.syncCheckoutIntents(
+			ctx, identity.checkoutID, intents, exactConfiguredIntents, now,
+		); err != nil {
 			return identity, err
 		}
 	}
@@ -727,6 +824,101 @@ func (l *CheckoutLifecycle) recordCheckout(
 		return identity, err
 	}
 	return identity, nil
+}
+
+// syncCheckoutIntents publishes the desired sources before withdrawing stale
+// config-owned sources. That ordering degrades toward retaining a corpus if a
+// catalog write is interrupted. CLI/MCP intents are never withdrawn here.
+func (l *CheckoutLifecycle) syncCheckoutIntents(
+	ctx context.Context,
+	checkoutID string,
+	expected []checkoutIntentSpec,
+	exactConfigured bool,
+	now time.Time,
+) error {
+	type intentKey struct {
+		kind    store_sqlite.IntentSourceKind
+		locator string
+	}
+	expectedKeys := make(map[intentKey]struct{}, len(expected))
+	for _, spec := range expected {
+		key := intentKey{kind: spec.kind, locator: spec.locator}
+		if _, duplicate := expectedKeys[key]; duplicate {
+			continue
+		}
+		expectedKeys[key] = struct{}{}
+		if err := l.catalog.UpsertTrackingIntent(ctx, store_sqlite.TrackingIntent{
+			IntentID:      uuid.NewV7().String(),
+			CheckoutID:    checkoutID,
+			SourceKind:    spec.kind,
+			SourceLocator: spec.locator,
+			Active:        true,
+			CreatedAt:     now.Unix(),
+		}); err != nil {
+			return err
+		}
+	}
+	if !exactConfigured {
+		return nil
+	}
+
+	current, err := l.catalog.ListTrackingIntents(ctx, checkoutID)
+	if err != nil {
+		return err
+	}
+	for _, intent := range current {
+		if !intent.Active || !configuredIntentKind(intent.SourceKind) {
+			continue
+		}
+		if _, keep := expectedKeys[intentKey{kind: intent.SourceKind, locator: intent.SourceLocator}]; keep {
+			continue
+		}
+		intent.Active = false
+		intent.RevokedAt = now.Unix()
+		intent.LastError = ""
+		if err := l.catalog.UpsertTrackingIntent(ctx, intent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func configuredIntentKind(kind store_sqlite.IntentSourceKind) bool {
+	return kind == TrackSourceConfig || kind == store_sqlite.IntentSourceProjectMembership
+}
+
+func (l *CheckoutLifecycle) hasActiveTrackingIntent(
+	ctx context.Context,
+	checkoutID string,
+) (bool, error) {
+	if l.catalog == nil || checkoutID == "" {
+		return false, nil
+	}
+	intents, err := l.catalog.ListTrackingIntents(ctx, checkoutID)
+	if err != nil {
+		return false, err
+	}
+	for _, intent := range intents {
+		if intent.Active {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (l *CheckoutLifecycle) syncConfiguredTrackingIntents(
+	ctx context.Context,
+	checkoutID, root string,
+	sources []config.RepoEntrySource,
+) error {
+	if l.catalog == nil || checkoutID == "" {
+		return nil
+	}
+	intents, err := configuredIntentSpecs(sources, pathkey.CanonicalExistingRoot(root))
+	if err != nil {
+		return err
+	}
+	return l.syncCheckoutIntents(ctx, checkoutID, intents, true, l.now())
 }
 
 // upsertFamily writes the family row, preserving the creation timestamp of
@@ -1262,35 +1454,81 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 	trackedByRoot := map[string]string{}
 	for prefix, meta := range l.mi.AllMetadata() {
 		if meta != nil {
-			trackedByRoot[meta.RootPath] = prefix
+			trackedByRoot[pathkey.CanonicalExistingRoot(meta.RootPath)] = prefix
 		}
 	}
 
 	wanted := map[string]bool{}
-	for _, entry := range l.cfgMgr.Global().Repos {
-		abs, err := filepath.Abs(entry.Path)
-		if err != nil {
-			abs = entry.Path
-		}
+	for _, registration := range l.cfgMgr.RepoRegistrations() {
+		abs := registration.CanonicalPath
 		if prefix, ok := trackedByRoot[abs]; ok {
+			// Physical config membership is authoritative even when the catalog
+			// lookup or intent synchronization below is temporarily unavailable.
+			// Mark it before fallible work so the removal pass fails closed.
 			wanted[prefix] = true
+			checkout, checkoutErr := l.checkoutForPrefix(ctx, prefix)
+			if checkoutErr != nil {
+				l.logger.Warn("reload: configured intent lookup failed",
+					zap.String("path", abs), zap.Error(checkoutErr))
+				continue
+			}
+			if checkout != nil {
+				if syncErr := l.syncConfiguredTrackingIntents(
+					ctx, checkout.CheckoutID, abs, registration.Sources,
+				); syncErr != nil {
+					l.logger.Warn("reload: configured intent sync failed",
+						zap.String("path", abs), zap.Error(syncErr))
+					continue
+				}
+			}
 			continue
 		}
-		res, err := l.Register(ctx, entry, TrackSourceConfig)
+		res, err := l.registerConfigured(ctx, registration)
+		// Registration publishes config intent before promotion. If a later
+		// promotion step fails after creating the process-local shell, retain
+		// that shell for this reload rather than immediately treating the same
+		// configured root as stale.
+		if res.Prefix != "" {
+			if meta := l.mi.GetMetadata(res.Prefix); meta != nil &&
+				pathkey.CanonicalExistingRoot(meta.RootPath) == abs {
+				wanted[res.Prefix] = true
+			}
+		}
 		if err != nil {
 			l.logger.Warn("reload: track failed",
-				zap.String("path", entry.Path), zap.Error(err))
+				zap.String("path", registration.Entry.Path), zap.Error(err))
 			continue
 		}
 		out.Added++
-		if res.Prefix != "" {
-			wanted[res.Prefix] = true
-		}
 	}
 
 	for prefix := range l.mi.AllMetadata() {
 		if wanted[prefix] {
 			continue
+		}
+		checkout, checkoutErr := l.checkoutForPrefix(ctx, prefix)
+		if checkoutErr != nil {
+			l.logger.Warn("reload: stale configured intent lookup failed",
+				zap.String("prefix", prefix), zap.Error(checkoutErr))
+			continue
+		}
+		if checkout != nil {
+			if syncErr := l.syncConfiguredTrackingIntents(
+				ctx, checkout.CheckoutID, checkout.RootPath, nil,
+			); syncErr != nil {
+				l.logger.Warn("reload: stale configured intent sync failed",
+					zap.String("prefix", prefix), zap.Error(syncErr))
+				continue
+			}
+			stillWanted, activeErr := l.hasActiveTrackingIntent(ctx, checkout.CheckoutID)
+			if activeErr != nil {
+				l.logger.Warn("reload: remaining intent lookup failed",
+					zap.String("prefix", prefix), zap.Error(activeErr))
+				continue
+			}
+			if stillWanted {
+				continue
+			}
 		}
 		outcome, err := l.retireOnReload(ctx, prefix)
 		if err != nil {
@@ -1485,9 +1723,11 @@ func (l *CheckoutLifecycle) configuredWatcherRoot(prefix string) (string, bool) 
 		return "", false
 	}
 	root := watcherRootIdentity(metadata.RootPath)
-	for _, entry := range l.cfgMgr.RepoEntries() {
+	for _, registration := range l.cfgMgr.RepoRegistrations() {
+		entry := registration.Entry
+		entry.Path = registration.CanonicalPath
 		entryPrefix := strings.TrimPrefix(EffectiveRepoPrefix(l.cfgMgr, entry), "/")
-		if entryPrefix == prefix && pathkey.SamePathIdentity(entry.Path, metadata.RootPath) {
+		if entryPrefix == prefix && pathkey.SamePathIdentity(registration.CanonicalPath, metadata.RootPath) {
 			return root, true
 		}
 	}
@@ -1719,11 +1959,10 @@ func (l *CheckoutLifecycle) knownFamilies(ctx context.Context) []familyProbe {
 	if l.cfgMgr == nil {
 		return out
 	}
-	for _, entry := range l.cfgMgr.Global().Repos {
-		abs, err := filepath.Abs(entry.Path)
-		if err != nil {
-			abs = entry.Path
-		}
+	for _, registration := range l.cfgMgr.RepoRegistrations() {
+		entry := registration.Entry
+		abs := registration.CanonicalPath
+		entry.Path = abs
 		prefix := l.ResolvePrefix(abs)
 		if prefix == "" {
 			prefix = EffectiveRepoPrefix(l.cfgMgr, entry)
@@ -2770,12 +3009,28 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	l.sweepRetirements(ctx)
 
 	seeded := map[string]string{}
+	configuredRoots := map[string]struct{}{}
+	unresolvedProjectSources := map[string]struct{}{}
+	unresolvedGlobalSource := false
 	if l.cfgMgr != nil {
-		for _, entry := range l.cfgMgr.Global().Repos {
-			abs, err := filepath.Abs(entry.Path)
-			if err != nil {
-				abs = entry.Path
+		registrations := l.cfgMgr.RepoRegistrations()
+		for _, registration := range registrations {
+			configuredRoots[registration.CanonicalPath] = struct{}{}
+			if _, statErr := os.Stat(registration.CanonicalPath); statErr != nil {
+				for _, source := range registration.Sources {
+					switch source.Kind {
+					case config.RepoEntrySourceGlobal:
+						unresolvedGlobalSource = true
+					case config.RepoEntrySourceProject:
+						unresolvedProjectSources[source.Locator] = struct{}{}
+					}
+				}
 			}
+		}
+		for _, registration := range registrations {
+			entry := registration.Entry
+			abs := registration.CanonicalPath
+			entry.Path = abs
 			prefix := l.ResolvePrefix(abs)
 			if prefix == "" {
 				prefix = EffectiveRepoPrefix(l.cfgMgr, entry)
@@ -2783,7 +3038,9 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			if prefix == "" {
 				continue
 			}
-			identity, err := l.recordCheckout(ctx, prefix, abs, TrackSourceConfig, true)
+			identity, err := l.recordConfiguredCheckout(
+				ctx, prefix, abs, registration.Sources, true,
+			)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("seed %s: %w", abs, err))
 				continue
@@ -2795,8 +3052,8 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			// Config entries are explicit intent. Replay the same promotion path
 			// Register uses instead of publishing an empty graph_ready shell and
 			// starting its automatic siblings against a missing primary base.
-			// TrackSourceImplicit is deliberate: recordCheckout restored the one
-			// config intent above, so promotion must not mint a duplicate intent.
+			// TrackSourceImplicit is deliberate: recordConfiguredCheckout restored
+			// every config-owned intent above, so promotion must not mint another.
 			promoted, run, promoteErr := l.startPromoteCheckout(
 				ctx, identity.checkoutID, TrackSourceImplicit,
 			)
@@ -2829,13 +3086,18 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 				// performs no physical corpus build on the warm path.
 				entry.Path = abs
 				entry.Name = promoted.Prefix
-				if _, restoreErr := l.mi.TrackRepoCtx(ctx, entry); restoreErr != nil {
+				if _, restoreErr := l.mi.trackRepoSourceTransientCtx(ctx, entry, nil); restoreErr != nil {
 					errs = append(errs, fmt.Errorf("seed restore %s: %w", abs, restoreErr))
 					continue
 				}
 			}
 			seeded[identity.familyID] = abs
 		}
+	}
+	if err := l.reconcileRemovedConfiguredIntents(
+		ctx, configuredRoots, unresolvedProjectSources, unresolvedGlobalSource, seeded,
+	); err != nil {
+		errs = append(errs, err)
 	}
 	if err := l.resumeModeTransitions(ctx); err != nil {
 		errs = append(errs, err)
@@ -2845,6 +3107,131 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	// active base publication, never against an empty graph_ready shell.
 	for familyID, probeDir := range seeded {
 		l.reconcileFamilyNow(ctx, familyID, probeDir)
+	}
+	return errors.Join(errs...)
+}
+
+// reconcileRemovedConfiguredIntents closes the offline-edit half of Seed.
+// Current config roots were synchronized above; catalog checkouts outside that
+// set may still carry manual/project intents from the previous daemon run, or
+// independent CLI/MCP ownership that has no config membership. Withdraw only
+// stale config-owned reasons, restore independently owned process-local shells,
+// and apply ordinary reload retirement only after no active reason remains.
+func (l *CheckoutLifecycle) reconcileRemovedConfiguredIntents(
+	ctx context.Context,
+	configuredRoots map[string]struct{},
+	unresolvedProjectSources map[string]struct{},
+	unresolvedGlobalSource bool,
+	seeded map[string]string,
+) error {
+	if l == nil || l.catalog == nil {
+		return nil
+	}
+	families, err := l.catalog.ListRepositoryFamilies(ctx)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, family := range families {
+		checkouts, listErr := l.catalog.ListCheckouts(ctx, family.FamilyID)
+		if listErr != nil {
+			errs = append(errs, listErr)
+			continue
+		}
+		for _, checkout := range checkouts {
+			if _, current := configuredRoots[pathkey.CanonicalExistingRoot(checkout.RootPath)]; current {
+				continue
+			}
+			// Resume owns an in-flight transition. Do not recreate or withdraw its
+			// intent while its cleanup/promotion journal is still authoritative.
+			if checkout.ActiveIntentTransitionID != "" {
+				continue
+			}
+			intents, intentErr := l.catalog.ListTrackingIntents(ctx, checkout.CheckoutID)
+			if intentErr != nil {
+				errs = append(errs, intentErr)
+				continue
+			}
+			hasStaleConfiguredIntent := false
+			hasIndependentActiveIntent := false
+			ownershipUncertain := false
+			for _, intent := range intents {
+				if !intent.Active {
+					continue
+				}
+				if !configuredIntentKind(intent.SourceKind) {
+					hasIndependentActiveIntent = true
+					continue
+				}
+				hasStaleConfiguredIntent = true
+				switch intent.SourceKind {
+				case TrackSourceConfig:
+					ownershipUncertain = unresolvedGlobalSource
+				case store_sqlite.IntentSourceProjectMembership:
+					_, ownershipUncertain = unresolvedProjectSources[intent.SourceLocator]
+				}
+				if ownershipUncertain {
+					break
+				}
+			}
+			// Intent-less automatic checkouts are outside this explicit-ownership
+			// repair. Independently owned CLI/MCP checkouts, however, still need
+			// their process-local shell and watcher restored after a cold restart
+			// even when they have never carried a config-owned intent.
+			if !hasStaleConfiguredIntent && !hasIndependentActiveIntent {
+				continue
+			}
+			if ownershipUncertain && !hasIndependentActiveIntent {
+				continue
+			}
+			if hasStaleConfiguredIntent && !ownershipUncertain {
+				if syncErr := l.syncConfiguredTrackingIntents(
+					ctx, checkout.CheckoutID, checkout.RootPath, nil,
+				); syncErr != nil {
+					errs = append(errs, fmt.Errorf(
+						"seed withdraw configured intents for %s: %w", checkout.RootPath, syncErr))
+					continue
+				}
+			}
+			stillWanted, activeErr := l.hasActiveTrackingIntent(ctx, checkout.CheckoutID)
+			if activeErr != nil {
+				errs = append(errs, activeErr)
+				continue
+			}
+			prefix := l.prefixForCheckout(ctx, checkout.CheckoutID)
+			if stillWanted {
+				if prefix == "" {
+					errs = append(errs, fmt.Errorf(
+						"seed restore independently owned checkout %s: no repo prefix", checkout.CheckoutID))
+					continue
+				}
+				entry := config.RepoEntry{Path: checkout.RootPath, Name: prefix}
+				if _, restoreErr := l.mi.trackRepoSourceTransientCtx(ctx, entry, nil); restoreErr != nil {
+					errs = append(errs, fmt.Errorf(
+						"seed restore independently owned checkout %s: %w", checkout.CheckoutID, restoreErr))
+					continue
+				}
+				l.attachWatcherContext(ctx, prefix)
+				seeded[checkout.FamilyID] = checkout.RootPath
+				continue
+			}
+			if !hasStaleConfiguredIntent || ownershipUncertain {
+				// This pass never retires a checkout merely because an independent
+				// intent raced with startup, nor while config ownership is uncertain.
+				continue
+			}
+			if prefix == "" {
+				errs = append(errs, fmt.Errorf(
+					"seed retire removed configured checkout %s: no repo prefix", checkout.CheckoutID))
+				continue
+			}
+			if _, retireErr := l.retireOnReload(ctx, prefix); retireErr != nil {
+				errs = append(errs, fmt.Errorf(
+					"seed retire removed configured checkout %s: %w", checkout.CheckoutID, retireErr))
+				continue
+			}
+			seeded[checkout.FamilyID] = checkout.RootPath
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -3092,7 +3479,9 @@ func (l *CheckoutLifecycle) EnsureConfiguredWatchers(ctx context.Context) error 
 	metadata := l.mi.AllMetadata()
 	seen := make(map[string]struct{})
 	var failures []error
-	for _, entry := range l.cfgMgr.RepoEntries() {
+	for _, registration := range l.cfgMgr.RepoRegistrations() {
+		entry := registration.Entry
+		entry.Path = registration.CanonicalPath
 		prefix := strings.TrimPrefix(EffectiveRepoPrefix(l.cfgMgr, entry), "/")
 		if prefix == "" {
 			continue
@@ -3102,7 +3491,7 @@ func (l *CheckoutLifecycle) EnsureConfiguredWatchers(ctx context.Context) error 
 		}
 		seen[prefix] = struct{}{}
 		meta := metadata[prefix]
-		if meta == nil || !pathkey.SamePathIdentity(entry.Path, meta.RootPath) {
+		if meta == nil || !pathkey.SamePathIdentity(registration.CanonicalPath, meta.RootPath) {
 			continue
 		}
 		if err := l.EnsureTrackedWatcher(ctx, prefix); err != nil {
@@ -3265,6 +3654,9 @@ func (l *CheckoutLifecycle) ResolvePrefix(pathOrPrefix string) string {
 // checkoutForPrefix reads the checkout a repo prefix is bound to, nil when
 // the prefix has no catalog identity.
 func (l *CheckoutLifecycle) checkoutForPrefix(ctx context.Context, prefix string) (*store_sqlite.Checkout, error) {
+	if l != nil && l.checkoutForPrefixHook != nil {
+		return l.checkoutForPrefixHook(ctx, prefix)
+	}
 	if l.catalog == nil || prefix == "" {
 		return nil, nil
 	}

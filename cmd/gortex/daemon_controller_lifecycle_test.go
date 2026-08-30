@@ -141,17 +141,13 @@ func TestControllerTrackUntrackDrivesTheCheckoutLifecycle(t *testing.T) {
 
 	saved, err := config.LoadGlobal(filepath.Join(dir, "config.yaml"))
 	require.NoError(t, err)
-	for _, entry := range saved.Repos {
-		assert.NotEqual(t, repo, entry.Path, "the untrack is persisted")
-	}
+	require.Empty(t, saved.Repos, "the only configured repository is removed")
 }
 
 // TestControllerReloadDrivesTheCheckoutLifecycle pins the reload half of the
-// control socket to the shared lifecycle. Dropping the only servable checkout
-// from the config file must not delete its corpus: the removal is recorded as
-// a pending transition and reported as one. A reload that evicted whatever
-// left the config — the inline diff this converged on the lifecycle — passes
-// every other reload test and fails here.
+// control socket to the shared lifecycle. Config membership and an explicit
+// CLI track are independent ownership reasons: dropping the config source must
+// preserve the checkout, graph and shell while the CLI intent remains active.
 func TestControllerReloadDrivesTheCheckoutLifecycle(t *testing.T) {
 	ctx := context.Background()
 	c, mi, catalog, dir := buildCatalogController(t)
@@ -176,21 +172,30 @@ func TestControllerReloadDrivesTheCheckoutLifecycle(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, binding.IsPrimaryBase, "the only checkout owns the family's primary base")
 
-	// Nothing else can serve the family, so the entry leaving the config is
-	// recorded rather than applied.
+	// Removing config membership withdraws only that source. The CLI track is
+	// still authoritative, so reload must neither retire nor demote anything.
 	require.NoError(t, c.configManager.Global().RemoveRepo(repo))
 	require.NoError(t, c.configManager.Global().Save())
 
-	pending := reloadCounts(t, c)
-	assert.Equal(t, 1, pending.Pending, "the removal surfaces as a pending transition")
-	assert.Equal(t, 0, pending.Removed)
+	reloaded := reloadCounts(t, c)
+	assert.Zero(t, reloaded.Pending)
+	assert.Zero(t, reloaded.Removed)
 	assert.NotNil(t, mi.GetMetadata(tracked.Prefix),
-		"a config edit must not silently delete the only servable checkout")
+		"the independently CLI-owned shell remains registered")
 
-	transition, ok, err := catalog.GetIntentTransition(ctx, binding.OwnerCheckoutID)
+	retained, ok, err := catalog.GetDedicatedGraph(ctx, binding.GraphID)
 	require.NoError(t, err)
-	require.True(t, ok, "the removal is durable, not just reported")
-	assert.Equal(t, store_sqlite.IntentTransitionPending, transition.State)
+	require.True(t, ok, "the independently CLI-owned graph remains published")
+	assert.Equal(t, binding, retained)
+	intents, err := catalog.ListTrackingIntents(ctx, binding.OwnerCheckoutID)
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	assert.Equal(t, store_sqlite.IntentSourceCLITrack, intents[0].SourceKind)
+	assert.True(t, intents[0].Active, "removing config does not revoke CLI ownership")
+
+	_, ok, err = catalog.GetIntentTransition(ctx, binding.OwnerCheckoutID)
+	require.NoError(t, err)
+	require.False(t, ok, "retained independent ownership creates no retirement transition")
 }
 
 // reloadPayload is what the controller's reload reports over the socket.

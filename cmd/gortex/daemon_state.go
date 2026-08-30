@@ -473,7 +473,16 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// multi-repo mode, desyncing the unprefixed graph (#270).
 	healDuplicateRepos(state.configManager.Global(), logger)
 
-	repos := state.configManager.Global().Repos
+	// Physical startup work is deduplicated across top-level and project
+	// memberships. Use each registration's canonical physical path so a
+	// blank-name symlink alias derives the same prefix here as lifecycle
+	// promotion does. The source provenance itself is consumed by Seed.
+	registrations := state.configManager.RepoRegistrations()
+	repos := make([]config.RepoEntry, len(registrations))
+	for i := range registrations {
+		repos[i] = registrations[i].Entry
+		repos[i].Path = registrations[i].CanonicalPath
+	}
 
 	// Purge orphaned repo prefixes BEFORE the warmup loop re-registers the
 	// tracked repos, while the store still reflects the prior run's state. A
