@@ -613,6 +613,7 @@ func (l *CheckoutLifecycle) recordCheckout(
 	if l.catalog == nil || prefix == "" {
 		return checkoutIdentity{}, nil
 	}
+	root = pathkey.CanonicalExistingRoot(root)
 	inv, err := gitstate.Inventory(ctx, root)
 	if err != nil {
 		// A directory git does not administer has no family to belong to.

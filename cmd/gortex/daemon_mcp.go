@@ -390,7 +390,7 @@ func (d *mcpDispatcher) isCWDTracked(cwd string) bool {
 	// `c:\repo` vs the config's `C:\repo`). A byte compare would reject
 	// it and publish zero tools; HasPathPrefix folds both first (#277).
 	for _, meta := range d.multiIndexer.AllMetadata() {
-		if pathkey.HasPathPrefix(cwd, meta.RootPath) {
+		if pathkey.CanonicalHasPathPrefix(cwd, meta.RootPath) {
 			return true
 		}
 	}

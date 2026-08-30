@@ -286,7 +286,7 @@ func probeCWDReach(abs string) cwdVerdict {
 // trackedRootContains reports whether p lies inside a tracked repo root.
 func trackedRootContains(st daemon.StatusResponse, p string) bool {
 	for _, repo := range st.TrackedRepos {
-		if repo.Path != "" && pathkey.HasPathPrefix(p, repo.Path) {
+		if repo.Path != "" && pathkey.CanonicalHasPathPrefix(p, repo.Path) {
 			return true
 		}
 	}
@@ -303,7 +303,7 @@ func trackedReposReach(st daemon.StatusResponse, p string) bool {
 		return true
 	}
 	for _, repo := range st.TrackedRepos {
-		if repo.Path != "" && pathkey.HasPathPrefix(repo.Path, p) {
+		if repo.Path != "" && pathkey.CanonicalHasPathPrefix(repo.Path, p) {
 			return true
 		}
 	}

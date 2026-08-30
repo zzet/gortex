@@ -139,6 +139,30 @@ func SamePathIdentity(a, b string) bool {
 	return os.SameFile(ai, bi)
 }
 
+// CanonicalExistingRoot returns a stable absolute identity for an existing
+// filesystem root. It resolves aliases such as macOS's /tmp -> /private/tmp,
+// while retaining the clean absolute spelling when symlink resolution is not
+// possible (for example, when a previously configured root is offline).
+func CanonicalExistingRoot(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return filepath.Clean(root)
+	}
+	abs = NormalizeVolume(filepath.Clean(abs))
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs
+	}
+	return NormalizeVolume(filepath.Clean(resolved))
+}
+
+// CanonicalHasPathPrefix is HasPathPrefix after canonicalizing both operands.
+// It is intended for routing boundaries where roots may come from an older
+// config that persisted a filesystem alias.
+func CanonicalHasPathPrefix(path, prefix string) bool {
+	return HasPathPrefix(CanonicalExistingRoot(path), CanonicalExistingRoot(prefix))
+}
+
 // volumeNameLen returns the length of the leading Windows-style volume
 // component of p — a drive letter ("c:") or a UNC root ("\\host\share").
 // It uses Windows semantics regardless of the host OS so that path

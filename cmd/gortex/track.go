@@ -117,6 +117,7 @@ func runTrack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving path %s: %w", rawPath, err)
 	}
 	absPath = pathkey.NormalizeVolume(absPath)
+	absPath = pathkey.CanonicalExistingRoot(absPath)
 
 	// Validate path exists and is a directory.
 	info, err := os.Stat(absPath)

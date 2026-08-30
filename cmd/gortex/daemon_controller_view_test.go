@@ -22,6 +22,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/testenv"
 )
@@ -977,7 +978,7 @@ func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
 	for _, repo := range global.Repos {
 		configuredPath = repo.Path
 	}
-	assert.Equal(t, primaryRoot, configuredPath)
+	assert.Equal(t, pathkey.CanonicalExistingRoot(primaryRoot), configuredPath)
 
 	graphRow, found, err := catalog.GetDedicatedGraph(ctx, indexer.GraphIDFor(trackedPrefix))
 	require.NoError(t, err)
