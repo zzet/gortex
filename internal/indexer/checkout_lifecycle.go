@@ -267,6 +267,10 @@ type CheckoutLifecycle struct {
 	transitionRuns          map[string]*modeTransitionRun
 	transitionQueue         chan *modeTransitionRun
 	transitionWorkerStarted bool
+	// transitionExecute is a deterministic worker test seam. Production uses
+	// executeModeTransition; tests can complete or fail durable rows without
+	// building repository payloads.
+	transitionExecute func(context.Context, store_sqlite.IntentTransition) modeTransitionOutcome
 	// Dedicated-base refreshes share the transition lifetime and wait group,
 	// but use one coalesced worker of their own. A map entry is one graph, so a
 	// binary-wide extractor bump cannot enqueue one full rebuild per dependent

@@ -131,6 +131,11 @@ func (l *CheckoutLifecycle) scheduleModeTransition(
 // that common lane.
 func (l *CheckoutLifecycle) runModeTransitionWorker() {
 	defer l.transitionWG.Done()
+	// A failed durable row must not immediately win the next creation-ordered
+	// scan and starve every unrelated row behind it. Keep failures out of this
+	// worker's current drain; an explicit resume, a later sweep, or a restart
+	// may retry them because the catalog row remains pending.
+	failedThisDrain := make(map[string]struct{})
 	for {
 		if err := l.transitionCtx.Err(); err != nil {
 			l.cancelQueuedModeTransitions(err)
@@ -144,15 +149,28 @@ func (l *CheckoutLifecycle) runModeTransitionWorker() {
 			if run == nil {
 				continue
 			}
-			run.outcome = l.executeModeTransition(l.transitionCtx, run.transition)
+			execute := l.executeModeTransition
+			if l.transitionExecute != nil {
+				execute = l.transitionExecute
+			}
+			run.outcome = execute(l.transitionCtx, run.transition)
 			close(run.done)
 			if run.outcome.err != nil {
-				continue
+				failedThisDrain[run.transition.TransitionID] = struct{}{}
+				if l.logger != nil && !errors.Is(run.outcome.err, context.Canceled) {
+					l.logger.Warn("checkout lifecycle: mode transition failed",
+						zap.String("transition", run.transition.TransitionID),
+						zap.String("checkout", run.transition.CheckoutID),
+						zap.String("cause", run.transition.Cause),
+						zap.Error(run.outcome.err))
+				}
+			} else {
+				delete(failedThisDrain, run.transition.TransitionID)
 			}
-			// Success removed the durable row and freed one bounded slot. Pull
-			// another standing transition immediately instead of waiting for the
-			// hourly janitor; failure stays pending and avoids a hot retry loop.
-			if err := l.resumeModeTransitions(l.transitionCtx); err != nil &&
+			// Every terminal outcome frees one bounded slot. Pull another durable
+			// row immediately, excluding failures from this drain so one broken
+			// repository cannot stop healthy repositories behind it or hot-loop.
+			if err := l.resumeModeTransitionsExcept(l.transitionCtx, failedThisDrain); err != nil &&
 				!errors.Is(err, context.Canceled) && l.logger != nil {
 				l.logger.Warn("checkout lifecycle: could not refill mode transition queue",
 					zap.Error(err))
@@ -217,9 +235,19 @@ func waitModeTransition(ctx context.Context, run *modeTransitionRun) (modeTransi
 // resumeModeTransitions fills the bounded in-process queue from the durable
 // journal. Unknown causes are deliberately left standing: they may belong to a
 // newer binary, and guessing at a destructive mode change is never recovery.
-// Rows beyond admission capacity remain only in SQLite until a successful
-// transition drains a slot or a later sweep retries them.
+// Rows beyond admission capacity remain only in SQLite until an admitted
+// transition finishes and drains a slot, or a later sweep retries them.
 func (l *CheckoutLifecycle) resumeModeTransitions(ctx context.Context) error {
+	return l.resumeModeTransitionsExcept(ctx, nil)
+}
+
+// resumeModeTransitionsExcept fills the bounded process queue while skipping
+// rows a worker already failed in its current drain. The exclusion is
+// deliberately process-local: durability stays in SQLite and an independent
+// ResumePendingTransitions or later sweep is allowed to try the row again.
+func (l *CheckoutLifecycle) resumeModeTransitionsExcept(
+	ctx context.Context, excluded map[string]struct{},
+) error {
 	if l == nil || l.catalog == nil {
 		return nil
 	}
@@ -249,6 +277,9 @@ func (l *CheckoutLifecycle) resumeModeTransitions(ctx context.Context) error {
 	l.transitionMu.Unlock()
 
 	for _, transition := range transitions {
+		if _, skip := excluded[transition.TransitionID]; skip {
+			continue
+		}
 		switch transition.Cause {
 		case promotionTransitionCause, demotionTransitionCause:
 			run := l.scheduleModeTransition(transition)
