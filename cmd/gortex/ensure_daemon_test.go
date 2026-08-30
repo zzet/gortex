@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"sync"
@@ -10,6 +11,46 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 )
+
+type testSpawnLock struct {
+	mu   sync.Mutex
+	held bool
+}
+
+func (l *testSpawnLock) TryLock() (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.held {
+		return false, nil
+	}
+	l.held = true
+	return true, nil
+}
+
+func (l *testSpawnLock) release() {
+	l.mu.Lock()
+	l.held = false
+	l.mu.Unlock()
+}
+
+type virtualSpawnClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *virtualSpawnClock) current() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *virtualSpawnClock) advance(d time.Duration) time.Time {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	now := c.now
+	c.mu.Unlock()
+	return now
+}
 
 func restoreSeams() {
 	isDaemonRunning = daemon.IsRunning
@@ -143,4 +184,142 @@ func TestEnsureDaemon_SpawnFailure_SingleAttempt(t *testing.T) {
 	if got := spawnCount.Load(); got != 1 {
 		t.Fatalf("a broken spawn must be attempted exactly once within the cooldown, got %d", got)
 	}
+}
+
+func TestWaitForSpawnLockFreshHeartbeatOutlivesLegacy65SecondCeiling(t *testing.T) {
+	lock := &testSpawnLock{held: true} // another caller owns the spawn
+	clock := &virtualSpawnClock{now: time.Unix(1_000, 0)}
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	var reachedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	done := make(chan struct {
+		locked bool
+		err    error
+	}, 1)
+	go func() {
+		locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+			now: clock.current,
+			wait: func(ctx context.Context, pause time.Duration) error {
+				now := clock.advance(pause)
+				if now.Sub(time.Unix(1_000, 0)) >= 70*time.Second {
+					reachedOnce.Do(func() { close(reached) })
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-release:
+					}
+				}
+				return nil
+			},
+			startupProgress: func(time.Time) bool { return true },
+			inactivity:      60 * time.Second,
+			poll:            time.Second,
+		})
+		done <- struct {
+			locked bool
+			err    error
+		}{locked: locked, err: err}
+	}()
+
+	select {
+	case <-reached:
+	case result := <-done:
+		t.Fatalf("wait returned before 70 virtual seconds: locked=%v err=%v", result.locked, result.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not reach 70 virtual seconds")
+	}
+	lock.release()
+	releaseOnce.Do(func() { close(release) })
+	result := <-done
+	if result.err != nil || !result.locked {
+		t.Fatalf("fresh-heartbeat loser failed after 70 virtual seconds: locked=%v err=%v", result.locked, result.err)
+	}
+}
+
+func TestWaitForSpawnLockStaleHeartbeatTimesOutAndCancellationWins(t *testing.T) {
+	t.Run("stale", func(t *testing.T) {
+		lock := &testSpawnLock{held: true}
+		clock := &virtualSpawnClock{now: time.Unix(2_000, 0)}
+		locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+			now: clock.current,
+			wait: func(_ context.Context, pause time.Duration) error {
+				clock.advance(pause)
+				return nil
+			},
+			startupProgress: func(time.Time) bool { return false },
+			inactivity:      60 * time.Second,
+			poll:            time.Second,
+		})
+		if locked || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("stale heartbeat: locked=%v err=%v", locked, err)
+		}
+		if elapsed := clock.current().Sub(time.Unix(2_000, 0)); elapsed != 60*time.Second {
+			t.Fatalf("stale heartbeat waited %s, want exactly the inactivity budget", elapsed)
+		}
+	})
+
+	t.Run("cancelled", func(t *testing.T) {
+		lock := &testSpawnLock{held: true}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		locked, err := waitForSpawnLock(ctx, lock, spawnLockWaitOptions{})
+		if locked || !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled wait: locked=%v err=%v", locked, err)
+		}
+	})
+
+	t.Run("lock holder exits", func(t *testing.T) {
+		lock := &testSpawnLock{held: true}
+		clock := &virtualSpawnClock{now: time.Unix(3_000, 0)}
+		waits := 0
+		locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+			now: clock.current,
+			wait: func(_ context.Context, pause time.Duration) error {
+				clock.advance(pause)
+				waits++
+				if waits == 2 {
+					lock.release()
+				}
+				return nil
+			},
+			startupProgress: func(time.Time) bool { return false },
+			inactivity:      60 * time.Second,
+			poll:            time.Second,
+		})
+		if err != nil || !locked {
+			t.Fatalf("released lock was not acquired promptly: locked=%v err=%v", locked, err)
+		}
+		if elapsed := clock.current().Sub(time.Unix(3_000, 0)); elapsed != 2*time.Second {
+			t.Fatalf("released lock was acquired after %s, want two poll intervals", elapsed)
+		}
+	})
+}
+
+func BenchmarkWaitForSpawnLockContendedHeartbeat(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		lock := &testSpawnLock{held: true}
+		clock := &virtualSpawnClock{now: time.Unix(4_000, 0)}
+		waits := 0
+		locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+			now: clock.current,
+			wait: func(_ context.Context, pause time.Duration) error {
+				clock.advance(pause)
+				waits++
+				if waits == 700 { // 70 virtual seconds: beyond the old 65s ceiling.
+					lock.release()
+				}
+				return nil
+			},
+			startupProgress: func(time.Time) bool { return true },
+			inactivity:      60 * time.Second,
+			poll:            100 * time.Millisecond,
+		})
+		if err != nil || !locked {
+			b.Fatalf("wait: locked=%v err=%v", locked, err)
+		}
+	}
+	b.ReportMetric(700, "polls/op")
+	b.ReportMetric(70, "virtual-s/op")
 }
