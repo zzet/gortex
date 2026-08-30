@@ -3088,6 +3088,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		contentRecordFile    func(filePath string)
 		contentStreamedMu    sync.Mutex
 		contentStreamedFiles map[string]struct{}
+		contentWalkComplete  bool
 	)
 	if cs := idx.contentSearcher(); cs != nil {
 		repoPrefix := idx.RepoPrefix()
@@ -3713,6 +3714,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			return nil, err
 		}
 	}
+	// Reaching this boundary means the ContentSource Walk and every dispatched
+	// parse worker completed without cancellation. IndexCtx is the authoritative
+	// full-build API for its target handle: for a narrowed fileSetSource that
+	// means the exact sparse generation payload, not the repository's other
+	// generations. Incremental/partial mutation APIs never cross this boundary.
+	contentWalkComplete = true
 
 	// A pressure-sized shadow reserves its drain turn as soon as parsing has
 	// produced the graph. The later deferred drain marks this reservation ready
@@ -3836,37 +3843,31 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}
 
-		// Crash-safe content path: reap every content row this walk did NOT
-		// re-stream. keep is contentStreamedFiles — the files that actually
-		// produced content sections this run — NOT the surviving-file mtime
-		// set: a file can survive on disk yet stop yielding content (doc
-		// emptied, classification changed), and keying keep off mtimes would
-		// protect its stale rows forever. Recorded keys are the wipe's own
-		// argument (the node FilePath content_fts carries), so the comparison
-		// matches the stored rows in single- and multi-repo form alike. A walk
-		// that streamed NO content falls back to the repo-wide wipe: the repo
-		// has zero content files now, and the sweep's empty-keep guard (a
-		// never-wipe-from-empty safety net) would otherwise no-op and leave
-		// every stale row behind. Only when the per-file wipe path is active;
-		// on the repo-wide-wipe fallback the up-front pre-wipe already cleared
-		// both transitions. Runs only under the completed-walk guard above
-		// (len(mtimeSnapshot) > 0), so a killed parse never triggers it.
-		if contentWipeFile != nil {
-			contentStreamedMu.Lock()
-			keep := contentStreamedFiles
-			contentStreamedMu.Unlock()
-			if len(keep) == 0 {
-				if cs := idx.contentSearcher(); cs != nil {
-					if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
-						idx.logger.Warn("indexer: content wipe of contentless repo failed", zap.Error(err))
-					}
+	}
+
+	// Crash-safe content finalization is coupled to the completed authoritative
+	// walk above, not to mtimes. Snapshot ContentSources deliberately have no
+	// mtime field, so using len(mtimeSnapshot) as the completion proxy skipped
+	// this sweep for every git/file-set generation build. keep is the exact set
+	// of files that produced content in this target handle. An empty keep set is
+	// authoritative too: it means this payload has no content now. Cancellation
+	// and Walk failures return before contentWalkComplete, retaining old rows for
+	// retry; generation-scoped store handles isolate base and sibling payloads.
+	if contentWipeFile != nil && contentWalkComplete {
+		contentStreamedMu.Lock()
+		keep := contentStreamedFiles
+		contentStreamedMu.Unlock()
+		if len(keep) == 0 {
+			if cs := idx.contentSearcher(); cs != nil {
+				if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
+					idx.logger.Warn("indexer: content wipe of contentless repo failed", zap.Error(err))
 				}
-			} else if sw, ok := idx.contentSearcher().(interface {
-				DeleteContentFilesForRepoNotIn(repoPrefix string, keep map[string]struct{}) error
-			}); ok {
-				if err := sw.DeleteContentFilesForRepoNotIn(idx.repoPrefix, keep); err != nil {
-					idx.logger.Warn("indexer: content sweep of stale files failed", zap.Error(err))
-				}
+			}
+		} else if sw, ok := idx.contentSearcher().(interface {
+			DeleteContentFilesForRepoNotIn(repoPrefix string, keep map[string]struct{}) error
+		}); ok {
+			if err := sw.DeleteContentFilesForRepoNotIn(idx.repoPrefix, keep); err != nil {
+				idx.logger.Warn("indexer: content sweep of stale files failed", zap.Error(err))
 			}
 		}
 	}
