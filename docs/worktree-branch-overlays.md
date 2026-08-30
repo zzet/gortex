@@ -2132,3 +2132,92 @@ The repository-wide, contract-race, and isolated lifecycle gates were run on
 the fully resolved staged source tree immediately before commit; the only later
 change was this documentation-only evidence update. The retained isolated
 artifact is `/private/tmp/gortex-isolated-lifecycle.Bbs031/PASS.json`.
+
+### CI follow-up: reload demotion atomicity (2026-08-30)
+
+The first CI run after the mainline merge found 30 deterministic lint issues
+and two failures that appeared only in Linux's repository-wide `-race` job.
+macOS and the narrower local suites passed, so both failing tests were
+reproduced with the exact race/coverage shape before their contracts changed.
+
+#### Reload removal is a guarded demotion
+
+`CheckoutLifecycle.ApplyReload` previously sent a configured checkout that
+left the config through `Reconciler.RetireCheckout`. That path predates sparse
+worktree views and deliberately forgot a demotable non-primary checkout. The
+reload result therefore reported one removal and lost the automatic checkout,
+route, coordinator, and prompt source monitoring. The test also saved config
+without reloading its `ConfigManager`, unlike the real controller, which made
+the stale behavior filesystem/mtime dependent.
+
+Reload now resolves the checkout, previews untrack, and uses the same guarded
+demotion transaction as explicit untrack only for `UntrackPlanDemote`.
+Primary, inaccessible, and otherwise non-demotable cases keep their existing
+pending transition. A successful demotion counts as neither removed nor
+pending because the checkout remains live as an automatic overlay.
+
+Demotion publication has the following atomic contract:
+
+1. A dormant coordinator prepares the primary commit and dirty generations
+   off-route while capturing the complete old route.
+2. `CommitAuthorizedDemotion` revalidates checkout/incarnation, intent,
+   primary epoch, active primary base, candidate generation chain, and the old
+   route's graph, commit, dirty, epoch, and state in one SQLite transaction.
+3. That transaction publishes the primary stack with the next route epoch,
+   flips effective mode to automatic, and journals retirement of the owned
+   graph. A concurrent old-coordinator write makes the transaction stale and
+   leaves mode, route, and cleanup unchanged.
+4. Automatic checkout route writers may name only their family's designated
+   primary. This fences an old dedicated coordinator after commit across route
+   install, full-stack commit, route flip, and slot/lease publication.
+5. Only after durable commit does a pointer-CAS replace the registered
+   coordinator. The old coordinator is closed and drained, so its mutation
+   tickets fail truthfully rather than transferring to another generation.
+   Exactly one lifecycle source watcher is then attached to the new
+   primary-bound coordinator.
+
+Idempotent replay recognizes the exact committed route/mode before requiring
+the retired owned graph to still exist. A lost response can therefore replay
+after cleanup without advancing the route twice. Pre-commit failure admits no
+watcher and preserves the old coordinator/route; post-commit cleanup failure
+still preserves the coherent automatic coordinator and route.
+
+The regression writes a new non-ignored source file, injects only a filesystem
+watcher event, and requires publication within five seconds, below the
+coordinator's 15-second polling interval. It also proves repeated admission
+keeps one backend and removal synchronously stops and unregisters it.
+
+#### Inactive-ref withdrawal remains asynchronous
+
+`TestRefViewPrunedObjectWithdrawsTheSourceCapability` asserted producer state
+immediately after `ScheduleProducerWithdrawal`. The file read correctly
+returned `source_object_missing`, but under Linux race scheduling the worker
+had not always changed `source.snapshot` from `complete`. The production path
+remains intentionally non-blocking. The test now polls the public producer
+state with a bounded timeout, then still verifies the same generation/tree,
+the withdrawn source capability, and the surviving structural graph. It does
+not call or drain the worker itself, so a rejected or failed withdrawal still
+fails visibly.
+
+#### Lint reconciliation
+
+The 30 merge-era findings comprised eight unchecked errors, one ineffective
+cleanup assignment, eight staticcheck simplifications, and thirteen unused
+helpers. Asynchronous watcher stop/retirement errors are now recorded and
+logged. The unused production methods were zero-caller compatibility wrappers;
+their guarded/context-aware replacements remain. No lint suppression was
+added.
+
+#### Final evidence
+
+| Scope | Result |
+| --- | --- |
+| Exact lint | `golangci-lint run --timeout=10m` PASS, 0 issues |
+| Reload/demotion repetitions | Normal `-count=20` PASS in 114.562 s; race `-count=10` PASS in 115.263 s; race+coverage `-count=5` PASS in 59.199 s |
+| Atomic catalog matrix | Success/epoch-once/cleanup-completed replay, route/base staleness, injected route/mode rollback, and stale Flip/stack/slot/upsert writers all PASS; normal `-count=20` 4.292 s, race `-count=10` 45.065 s |
+| Ref withdrawal | Target normal `-count=50` PASS in 57.794 s; race `-count=30` PASS in 92.409 s; exact race+coverage `-count=10` PASS in 28.217 s |
+| Full contract race | SQLite PASS 941.664 s; indexer PASS 1104.686 s; reconcile PASS 41.975 s |
+| Repository-wide bounded gate | `go test -p=2 ./... -count=1 -timeout=30m` PASS; SQLite 53.878 s, indexer 553.052 s, MCP 207.555 s, every package green |
+
+No machine daemon was stopped, restarted, reconfigured, tracked, untracked, or
+mutated during this follow-up.
