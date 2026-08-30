@@ -86,6 +86,12 @@ If the Gortex server is configured but these tools are missing from the callable
 
 Use `recall` before revisiting prior work. Call `remember` immediately for a durable decision, invariant, constraint, or gotcha.
 
+## Worktree views
+
+- CWD selects one coherent view. Implicit linked worktrees become overlays automatically; use `track` only for a user-requested dedicated graph.
+- An overlay shadows matching primary symbols; it does not union incompatible branches.
+- A labeled `view_building` fallback is read-only; exact-file and edit operations await a ready route. Never restart the daemon, delete its store, or re-track merely to expose a worktree.
+
 ## Reference and discovery
 
 - **`gortex://guide` resource** (or the `gortex guide [topic]` CLI) is the full reference: LLM-provider matrix, capabilities catalog, analyze / search_ast catalogs, token-economy detail, MCP resources, session-start checklist. Read it on demand — it is not pre-paid here.
