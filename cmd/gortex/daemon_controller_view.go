@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -258,6 +261,160 @@ func fallbackProbeView(kind, checkoutID, repoPrefix, reason string) *daemon.Prob
 		RepoPrefix:     repoPrefix,
 		Exact:          false,
 		FallbackReason: reason,
+	}
+}
+
+// TrackReadiness proves that the exact routed view for path can be opened now.
+// It deliberately reads only the checkout catalog and generation metadata;
+// unlike the legacy status heuristic, no node or edge scan is part of a poll.
+func (c *realController) TrackReadiness(ctx context.Context, path string) (daemon.TrackReadiness, error) {
+	legacy := daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}
+	if c == nil || c.lifecycle == nil || c.viewMaterializer == nil || c.viewMaterializer.Catalog == nil {
+		return legacy, nil
+	}
+
+	binding, err := c.lifecycle.ExplainView(ctx, path)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("resolve track readiness for %q: %w", path, err)
+	}
+	if !binding.Matched {
+		// A configured non-Git root has no checkout identity or route. It is
+		// the one case that still needs the historical stable node-count poll.
+		if binding.RepoPrefix != "" {
+			return legacy, nil
+		}
+		return trackViewBuilding("", "", "repository is not registered in the checkout catalog yet"), nil
+	}
+
+	building := func(reason string) daemon.TrackReadiness {
+		return trackViewBuilding(binding.CheckoutID, binding.RepoPrefix, reason)
+	}
+	failed := func(reason string) daemon.TrackReadiness {
+		if reason == "" {
+			reason = "the checkout promotion failed"
+		}
+		return daemon.TrackReadiness{
+			State: daemon.TrackReadinessFailed,
+			View:  fallbackProbeView(daemon.ProbeViewUnrouted, binding.CheckoutID, binding.RepoPrefix, daemon.FallbackViewBuilding),
+			Error: reason,
+		}
+	}
+
+	if binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {
+		return building("checkout state is " + binding.CheckoutState), nil
+	}
+
+	catalog := c.viewMaterializer.Catalog
+	transition, transitioning, err := catalog.GetIntentTransition(ctx, binding.CheckoutID)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read checkout transition %q: %w", binding.CheckoutID, err)
+	}
+	if transitioning {
+		if transition.State == store_sqlite.IntentTransitionFailed {
+			return failed(transition.LastError), nil
+		}
+		return building("checkout promotion is " + string(transition.State)), nil
+	}
+
+	checkout, found, err := catalog.GetCheckout(ctx, binding.CheckoutID)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read checkout %q: %w", binding.CheckoutID, err)
+	}
+	if !found {
+		return building("checkout catalog row is not published yet"), nil
+	}
+
+	route, found, err := catalog.GetCheckoutRoute(ctx, binding.CheckoutID)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read checkout route %q: %w", binding.CheckoutID, err)
+	}
+	if !found || route.State != store_sqlite.RouteActive || route.GraphID == "" || route.CommitGenerationID <= 0 {
+		return building("checkout route is not active and complete"), nil
+	}
+	if binding.GraphID == "" || route.GraphID != binding.GraphID {
+		return building("checkout route does not target the graph selected for this path"), nil
+	}
+
+	graphRow, found, err := catalog.GetDedicatedGraph(ctx, route.GraphID)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read dedicated graph %q: %w", route.GraphID, err)
+	}
+	if !found || graphRow.State != store_sqlite.DedicatedGraphStateReady || graphRow.ActiveGenerationID <= 0 {
+		return building("dedicated graph has no active ready generation"), nil
+	}
+	active, found, err := catalog.GetViewGeneration(ctx, graphRow.ActiveGenerationID)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read active generation %d: %w", graphRow.ActiveGenerationID, err)
+	}
+	if !found || active.State != store_sqlite.ViewGenerationReady {
+		if found && active.State == store_sqlite.ViewGenerationFailed {
+			return failed(active.Error), nil
+		}
+		return building("dedicated graph generation is not ready"), nil
+	}
+
+	// This is the exact HEAD fence request routing applies before exposing a
+	// ready-looking route. A stale commit generation remains view_building.
+	routedCommit, found, err := catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read routed commit generation %d: %w", route.CommitGenerationID, err)
+	}
+	if !found {
+		return building("routed commit generation is not published"), nil
+	}
+	if routedCommit.State == store_sqlite.ViewGenerationFailed {
+		return failed(routedCommit.Error), nil
+	}
+	if routedCommit.State != store_sqlite.ViewGenerationReady && routedCommit.State != store_sqlite.ViewGenerationSuperseded {
+		return building("routed commit generation is not servable"), nil
+	}
+	if routedCommit.TreeOID != checkout.HeadTree {
+		return building("routed commit generation is stale for checkout HEAD"), nil
+	}
+	if route.DirtyGenerationID > 0 {
+		dirty, dirtyFound, dirtyErr := catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+		if dirtyErr != nil {
+			return daemon.TrackReadiness{}, fmt.Errorf("read routed dirty generation %d: %w", route.DirtyGenerationID, dirtyErr)
+		}
+		if !dirtyFound {
+			return building("routed dirty generation is not published"), nil
+		}
+		if dirty.State == store_sqlite.ViewGenerationFailed {
+			return failed(dirty.Error), nil
+		}
+		if dirty.State != store_sqlite.ViewGenerationReady && dirty.State != store_sqlite.ViewGenerationSuperseded {
+			return building("routed dirty generation is not servable"), nil
+		}
+	}
+
+	// MaterializeCheckout is the final query gate: it revalidates the route
+	// around a generation lease, opens every routed/base generation, and
+	// refuses a moving, incomplete, or unservable stack.
+	view, err := c.viewMaterializer.MaterializeCheckout(ctx, binding.CheckoutID)
+	if err != nil {
+		var coded interface{ ErrorCode() string }
+		if errors.As(err, &coded) && coded.ErrorCode() == graphview.CodeViewBuilding {
+			return building(err.Error()), nil
+		}
+		return failed(err.Error()), nil
+	}
+	view.Close()
+
+	kind := daemon.ProbeViewBase
+	if binding.EffectiveMode == string(store_sqlite.CheckoutModeAutomatic) {
+		kind = daemon.ProbeViewWorktree
+	}
+	return daemon.TrackReadiness{
+		State: daemon.TrackReadinessReady,
+		View:  exactProbeView(kind, binding.CheckoutID, binding.RepoPrefix),
+	}, nil
+}
+
+func trackViewBuilding(checkoutID, repoPrefix, reason string) daemon.TrackReadiness {
+	return daemon.TrackReadiness{
+		State: daemon.TrackReadinessBuilding,
+		View:  fallbackProbeView(daemon.ProbeViewUnrouted, checkoutID, repoPrefix, daemon.FallbackViewBuilding),
+		Error: reason,
 	}
 }
 

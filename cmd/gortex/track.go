@@ -40,6 +40,7 @@ var untrackDaemonTool = requireDaemonTool
 // the control round trip consume one shared budget.
 var (
 	trackStatusFn            = fetchDaemonStatusForCLI
+	trackReadinessFn         = fetchDaemonTrackReadiness
 	trackEnsureDaemonReadyFn = ensureDaemonReady
 	trackNotifyDaemonTrackFn = notifyDaemonTrack
 )
@@ -290,9 +291,45 @@ func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) erro
 	return waitForRepoIndexedUntil(w, absPath, deadline, timeout)
 }
 
+// fetchDaemonTrackReadiness asks the cheap control probe for the exact view
+// serving absPath. A daemon predating the field yields legacy so mixed-version
+// upgrades retain the old stable-count behavior instead of hanging forever.
+func fetchDaemonTrackReadiness(absPath string) (daemon.TrackReadiness, error) {
+	legacy := daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}
+	c, err := daemonControlClient()
+	if err != nil {
+		return legacy, err
+	}
+	defer c.Close()
+	resp, err := c.ControlWithTimeout(
+		daemon.ControlProbe,
+		daemon.ProbeParams{Path: absPath},
+		daemon.ControlTimeoutFor(daemon.ControlProbe),
+	)
+	if err != nil {
+		return legacy, err
+	}
+	if !resp.OK {
+		return legacy, fmt.Errorf("track readiness rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
+	}
+	var probe daemon.ProbeResponse
+	if err := json.Unmarshal(resp.Result, &probe); err != nil {
+		return legacy, fmt.Errorf("parse track readiness: %w", err)
+	}
+	if probe.Track == nil {
+		return legacy, nil
+	}
+	return *probe.Track, nil
+}
+
 type trackStatusResult struct {
 	status daemon.StatusResponse
 	err    error
+}
+
+type trackReadinessResult struct {
+	readiness daemon.TrackReadiness
+	err       error
 }
 
 // waitForRepoIndexedUntil is the runTrack form: deadline was created before
@@ -314,25 +351,55 @@ func waitForRepoIndexedUntil(w io.Writer, absPath string, deadline time.Time, ti
 	}
 	prevNodes := -1
 	statusFn := trackStatusFn
+	readinessFn := trackReadinessFn
 	for {
-		statusResult, timedOut := beforeTrackDeadline(deadline, func() trackStatusResult {
-			st, err := statusFn()
-			return trackStatusResult{status: st, err: err}
+		readinessResult, timedOut := beforeTrackDeadline(deadline, func() trackReadinessResult {
+			readiness, err := readinessFn(absPath)
+			return trackReadinessResult{readiness: readiness, err: err}
 		})
 		if timedOut || trackDeadlineExpired(deadline) {
 			return failTimeout()
 		}
-		if statusResult.err == nil {
-			settled, nodes := indexSettled(statusResult.status, absPath, prevNodes)
-			if nodes > 0 {
-				step.Progress(int64(nodes), 0)
+		if readinessResult.err == nil {
+			switch readinessResult.readiness.State {
+			case daemon.TrackReadinessReady:
+				view := readinessResult.readiness.View
+				if view != nil && view.Exact && view.FallbackReason == "" {
+					step.DoneAs("exact view ready")
+					tr.Done("indexed", "exact routed view ready")
+					return nil
+				}
+			case daemon.TrackReadinessFailed:
+				reason := readinessResult.readiness.Error
+				if reason == "" {
+					reason = "the checkout promotion failed"
+				}
+				err := fmt.Errorf("--wait: indexing %s failed: %s", absPath, reason)
+				tr.Fail(err)
+				return err
+			case daemon.TrackReadinessLegacy:
+				// Only roots without checkout/view identity retain the historical
+				// two-poll count heuristic. Routed graphs settle from catalog facts.
+				statusResult, statusTimedOut := beforeTrackDeadline(deadline, func() trackStatusResult {
+					st, err := statusFn()
+					return trackStatusResult{status: st, err: err}
+				})
+				if statusTimedOut || trackDeadlineExpired(deadline) {
+					return failTimeout()
+				}
+				if statusResult.err == nil {
+					settled, nodes := indexSettled(statusResult.status, absPath, prevNodes)
+					if nodes > 0 {
+						step.Progress(int64(nodes), 0)
+					}
+					if settled {
+						step.DoneAs("index settled")
+						tr.Done("indexed", humanizeInt(nodes)+" nodes")
+						return nil
+					}
+					prevNodes = nodes
+				}
 			}
-			if settled {
-				step.DoneAs("index settled")
-				tr.Done("indexed", humanizeInt(nodes)+" nodes")
-				return nil
-			}
-			prevNodes = nodes
 		}
 		if trackDeadlineExpired(deadline) {
 			return failTimeout()

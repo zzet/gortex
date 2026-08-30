@@ -258,6 +258,34 @@ type UntrackParams struct {
 	Confirm bool `json:"confirm,omitempty"`
 }
 
+// ProbeParams is the optional payload for ControlProbe. Path asks for the
+// readiness of the exact graph view that serves that filesystem location.
+// Empty preserves the lock-free liveness/scope probe and its wire shape.
+type ProbeParams struct {
+	Path string `json:"path,omitempty"`
+}
+
+// Track readiness states form a small stable wire vocabulary. Ready means an
+// exact routed view can be opened now; building is retryable; failed is
+// terminal for the current promotion; legacy asks old corpus-backed callers to
+// retain their stable-count heuristic.
+const (
+	TrackReadinessLegacy   = "legacy"
+	TrackReadinessBuilding = "building"
+	TrackReadinessReady    = "ready"
+	TrackReadinessFailed   = "failed"
+)
+
+// TrackReadiness is the path-scoped result used by `gortex track --wait`.
+// It contains catalog and materialization facts only: polling it never scans
+// graph nodes. View is present for routed-view daemons so a labeled fallback
+// cannot be mistaken for exact readiness.
+type TrackReadiness struct {
+	State string     `json:"state"`
+	View  *ProbeView `json:"view,omitempty"`
+	Error string     `json:"error,omitempty"`
+}
+
 // ProbeResponse is the payload returned under Result on a successful
 // ControlProbe call: enough to decide whether the daemon can answer and
 // which repos it owns, and nothing that costs a store read.
@@ -280,6 +308,9 @@ type ProbeResponse struct {
 	// each of those is a scan, and identity is what a scope decision needs.
 	TrackedRepos []ProbeRepo `json:"tracked_repos"`
 	Sessions     int         `json:"sessions"`
+	// Track is present only when ProbeParams.Path was supplied and the
+	// controller can resolve routed checkout views. Nil preserves old probes.
+	Track *TrackReadiness `json:"track,omitempty"`
 }
 
 // ProbeRepo is one tracked repo as ControlProbe reports it.

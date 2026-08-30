@@ -175,6 +175,16 @@ func (f *probeFixture) routeWorktree(t *testing.T) {
 	require.NoError(t, err)
 	_ = commitHandle
 	require.NoError(t, f.store.PublishPayloadGeneration(ctx, commitID, 2000))
+	graphRow, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	graphRow.ActiveGenerationID = commitID
+	require.NoError(t, f.catalog.UpsertDedicatedGraph(ctx, graphRow))
+	checkout, found, err := f.catalog.GetCheckout(ctx, probeWorktreeID)
+	require.NoError(t, err)
+	require.True(t, found)
+	checkout.HeadTree = "tree-probe-commit"
+	require.NoError(t, f.catalog.UpsertCheckout(ctx, checkout))
 
 	dirtyID, dirtyHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
 		OwnerKind:        "dedicated_graph",
@@ -279,6 +289,130 @@ func TestProbeOfRoutedWorktreeReadsTheComposedView(t *testing.T) {
 	base, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{Query: "BaseOnly"})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"BaseOnly"}, symbolNames(base.Hits))
+}
+
+func TestTrackReadinessWaitsForExactRoutedView(t *testing.T) {
+	testenv.Sandbox(t)
+	f := newProbeFixture(t)
+	ctx := context.Background()
+	probed := filepath.Join(f.worktreeRoot, probeFile)
+
+	building, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, building.State)
+	require.NotNil(t, building.View)
+	assert.False(t, building.View.Exact)
+	assert.Equal(t, daemon.FallbackViewBuilding, building.View.FallbackReason)
+
+	f.routeWorktree(t)
+	ready, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, ready.State)
+	require.NotNil(t, ready.View)
+	assert.True(t, ready.View.Exact)
+	assert.Equal(t, daemon.ProbeViewWorktree, ready.View.Kind)
+
+	// The same exact gate a following path-scoped query uses now succeeds.
+	coverage, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+	require.NoError(t, err)
+	assert.True(t, coverage.Covered)
+	assert.Equal(t, 1, coverage.Symbols)
+	require.NotNil(t, coverage.View)
+	assert.True(t, coverage.View.Exact)
+
+	// A warm routed checkout is ready on the first metadata/materialization
+	// pass; no coordinator or corpus build is started by this read.
+	warm, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, warm.State)
+	binding, err := f.controller.lifecycle.ExplainView(ctx, probed)
+	require.NoError(t, err)
+	assert.False(t, binding.CoordinatorLive, "readiness polling must not start a build coordinator")
+}
+
+func TestTrackReadinessHeldPromotionDoesNotTrustStableEmptyShell(t *testing.T) {
+	f := newProbeFixture(t)
+	ctx := context.Background()
+	const transitionID = "track-wait-held-promotion"
+	require.NoError(t, f.catalog.BeginIntentTransition(ctx, store_sqlite.IntentTransition{
+		TransitionID:       transitionID,
+		CheckoutID:         probeWorktreeID,
+		Cause:              "promote_checkout",
+		PriorDesiredMode:   store_sqlite.CheckoutModeAutomatic,
+		PriorEffectiveMode: store_sqlite.CheckoutModeAutomatic,
+		RequestedMode:      store_sqlite.CheckoutModeDedicated,
+		PriorCheckoutState: store_sqlite.CheckoutStateReady,
+		State:              store_sqlite.IntentTransitionPending,
+		CreatedAt:          100,
+		LastProgress:       100,
+	}))
+
+	// Publish a complete route underneath the held transition, just as the
+	// empty process-local shell can look stable while promotion is gated.
+	f.routeWorktree(t)
+	checkout, found, err := f.catalog.GetCheckout(ctx, probeWorktreeID)
+	require.NoError(t, err)
+	require.True(t, found)
+	checkout.DesiredMode = store_sqlite.CheckoutModeDedicated
+	checkout.EffectiveMode = store_sqlite.CheckoutModeDedicated
+	require.NoError(t, f.catalog.UpsertCheckout(ctx, checkout))
+	graphRow, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	graphRow.OwnerCheckoutID = probeWorktreeID
+	require.NoError(t, f.catalog.UpsertDedicatedGraph(ctx, graphRow))
+	f.controller.ready.Store(true)
+
+	// The old heuristic would return success here: globally ready, zero nodes,
+	// and the same zero on the previous poll. The routed gate must still block.
+	settled, _ := indexSettled(statusWithRepo(f.worktreeRoot, 0, true), f.worktreeRoot, 0)
+	assert.True(t, settled, "fixture must reproduce the old false-ready signal")
+	building, err := f.controller.TrackReadiness(ctx, f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, building.State)
+
+	require.NoError(t, f.catalog.CompleteIntentTransition(ctx, probeWorktreeID, transitionID))
+	ready, err := f.controller.TrackReadiness(ctx, f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, ready.State)
+	require.NotNil(t, ready.View)
+	assert.True(t, ready.View.Exact)
+	assert.Equal(t, daemon.ProbeViewBase, ready.View.Kind)
+}
+
+func TestTrackReadinessSurfacesPromotionFailure(t *testing.T) {
+	f := newProbeFixture(t)
+	ctx := context.Background()
+	require.NoError(t, f.catalog.BeginIntentTransition(ctx, store_sqlite.IntentTransition{
+		TransitionID:       "track-wait-failed-promotion",
+		CheckoutID:         probeWorktreeID,
+		Cause:              "promote_checkout",
+		PriorDesiredMode:   store_sqlite.CheckoutModeAutomatic,
+		PriorEffectiveMode: store_sqlite.CheckoutModeAutomatic,
+		RequestedMode:      store_sqlite.CheckoutModeDedicated,
+		PriorCheckoutState: store_sqlite.CheckoutStateReady,
+		State:              store_sqlite.IntentTransitionFailed,
+		CreatedAt:          100,
+		LastProgress:       101,
+		LastError:          "synthetic promotion failure",
+	}))
+
+	readiness, err := f.controller.TrackReadiness(ctx, f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessFailed, readiness.State)
+	assert.Equal(t, "synthetic promotion failure", readiness.Error)
+}
+
+func TestTrackReadinessRejectsGraceFallback(t *testing.T) {
+	f := newProbeFixture(t)
+	f.routeWorktree(t)
+	f.upsertWorktree(t, f.worktreeRoot, store_sqlite.CheckoutStateAvailabilityGrace)
+
+	readiness, err := f.controller.TrackReadiness(context.Background(), f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, readiness.State)
+	require.NotNil(t, readiness.View)
+	assert.False(t, readiness.View.Exact)
 }
 
 // TestProbeOfRoutedWorktreeReleasesItsLease proves the lease a probe takes is

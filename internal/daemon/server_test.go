@@ -23,18 +23,21 @@ var osStat = os.Stat
 // canned responses — lets the daemon lifecycle tests run without wiring
 // in the real MultiIndexer.
 type fakeController struct {
-	mu                 sync.Mutex
-	trackCalls         []TrackParams
-	untrackCalls       []UntrackParams
-	reloadCalls        int
-	reloadServersCalls int
-	statusCalls        int
-	probeCalls         int
-	shutdownCalls      int
-	shutdownErr        error
-	searchCalls        []SearchSymbolsParams
-	searchHits         []SymbolHit
-	searchErr          error
+	mu                  sync.Mutex
+	trackCalls          []TrackParams
+	untrackCalls        []UntrackParams
+	reloadCalls         int
+	reloadServersCalls  int
+	statusCalls         int
+	probeCalls          int
+	trackReadinessCalls []string
+	trackReadiness      TrackReadiness
+	trackReadinessErr   error
+	shutdownCalls       int
+	shutdownErr         error
+	searchCalls         []SearchSymbolsParams
+	searchHits          []SymbolHit
+	searchErr           error
 
 	enrichChurnCalls    []EnrichChurnParams
 	enrichReleasesCalls []EnrichReleasesParams
@@ -92,6 +95,13 @@ func (f *fakeController) Probe(_ context.Context) (ProbeResponse, error) {
 			{Prefix: "myrepo", Path: "/tmp/myrepo"},
 		},
 	}, nil
+}
+
+func (f *fakeController) TrackReadiness(_ context.Context, path string) (TrackReadiness, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.trackReadinessCalls = append(f.trackReadinessCalls, path)
+	return f.trackReadiness, f.trackReadinessErr
 }
 
 func (f *fakeController) Shutdown(_ context.Context) error {
@@ -197,6 +207,39 @@ func TestDaemon_ControlStatus(t *testing.T) {
 	assert.Equal(t, socket, st.SocketPath)
 	require.Len(t, st.TrackedRepos, 1)
 	assert.Equal(t, "myrepo", st.TrackedRepos[0].Prefix)
+}
+
+func TestDaemon_ControlProbePathReadiness(t *testing.T) {
+	ctrl := &fakeController{trackReadiness: TrackReadiness{
+		State: TrackReadinessReady,
+		View:  &ProbeView{Kind: ProbeViewBase, CheckoutID: "co-ready", Exact: true},
+	}}
+	_, socket := newDaemon(t, ctrl)
+
+	c, err := DialTo(socket, Handshake{Mode: ModeControl, ClientName: "cli"})
+	require.NoError(t, err)
+	defer c.Close()
+
+	legacyResp, err := c.Control(ControlProbe, nil)
+	require.NoError(t, err)
+	require.True(t, legacyResp.OK)
+	var legacy ProbeResponse
+	require.NoError(t, json.Unmarshal(legacyResp.Result, &legacy))
+	assert.Nil(t, legacy.Track, "pathless probe must keep its legacy wire shape")
+
+	resp, err := c.Control(ControlProbe, ProbeParams{Path: "/tmp/myrepo"})
+	require.NoError(t, err)
+	require.True(t, resp.OK, "probe: %+v", resp)
+	var probe ProbeResponse
+	require.NoError(t, json.Unmarshal(resp.Result, &probe))
+	require.NotNil(t, probe.Track)
+	assert.Equal(t, TrackReadinessReady, probe.Track.State)
+	require.NotNil(t, probe.Track.View)
+	assert.True(t, probe.Track.View.Exact)
+
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	assert.Equal(t, []string{"/tmp/myrepo"}, ctrl.trackReadinessCalls)
 }
 
 func TestDaemon_ControlTrackUntrack(t *testing.T) {

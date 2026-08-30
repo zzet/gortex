@@ -752,9 +752,22 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		return ControlResponse{OK: true, Result: result}
 
 	case ControlProbe:
+		var p ProbeParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
 		pr, err := s.Controller.Probe(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
+		}
+		if p.Path != "" {
+			if readiness, ok := s.Controller.(TrackReadinessController); ok {
+				track, trackErr := readiness.TrackReadiness(ctx, p.Path)
+				if trackErr != nil {
+					return controlErr(ErrInternal, trackErr.Error())
+				}
+				pr.Track = &track
+			}
 		}
 		// Daemon-level fields the controller cannot see, matching Status.
 		pr.Version = s.Version
@@ -1056,6 +1069,14 @@ func unmarshalParams(raw json.RawMessage, v any) error {
 
 func controlErr(code, msg string) ControlResponse {
 	return ControlResponse{ErrorCode: code, ErrorMsg: msg}
+}
+
+// TrackReadinessController is the optional path-scoped extension of Probe.
+// The ordinary Probe remains lock-free and store-free; only callers that name
+// a path pay for the bounded catalog/materialization checks needed to prove an
+// exact routed view is queryable.
+type TrackReadinessController interface {
+	TrackReadiness(ctx context.Context, path string) (TrackReadiness, error)
 }
 
 // FileCoverageController is the opt-in view-scoped coverage answer behind

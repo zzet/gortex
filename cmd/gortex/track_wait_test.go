@@ -7,6 +7,8 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,15 @@ func statusWithRepo(absPath string, nodes int, ready bool) daemon.StatusResponse
 		Ready:        ready,
 		TrackedRepos: []daemon.TrackedRepoStatus{{Path: absPath, Nodes: nodes}},
 	}
+}
+
+func useLegacyTrackReadiness(t *testing.T) {
+	t.Helper()
+	original := trackReadinessFn
+	trackReadinessFn = func(string) (daemon.TrackReadiness, error) {
+		return daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}, nil
+	}
+	t.Cleanup(func() { trackReadinessFn = original })
 }
 
 func TestRepoNodeCount(t *testing.T) {
@@ -56,6 +67,7 @@ func TestIndexSettled(t *testing.T) {
 }
 
 func TestWaitForRepoIndexed_Settles(t *testing.T) {
+	useLegacyTrackReadiness(t)
 	abs := t.TempDir()
 	origFn, origInterval := trackStatusFn, trackPollInterval
 	t.Cleanup(func() { trackStatusFn, trackPollInterval = origFn, origInterval })
@@ -84,6 +96,7 @@ func TestWaitForRepoIndexed_Settles(t *testing.T) {
 }
 
 func TestWaitForRepoIndexed_EmptyRepoSettles(t *testing.T) {
+	useLegacyTrackReadiness(t)
 	abs := t.TempDir()
 	origFn, origInterval := trackStatusFn, trackPollInterval
 	t.Cleanup(func() { trackStatusFn, trackPollInterval = origFn, origInterval })
@@ -100,6 +113,7 @@ func TestWaitForRepoIndexed_EmptyRepoSettles(t *testing.T) {
 }
 
 func TestWaitForRepoIndexed_Timeout(t *testing.T) {
+	useLegacyTrackReadiness(t)
 	abs := t.TempDir()
 	origFn, origInterval := trackStatusFn, trackPollInterval
 	t.Cleanup(func() { trackStatusFn, trackPollInterval = origFn, origInterval })
@@ -112,5 +126,133 @@ func TestWaitForRepoIndexed_Timeout(t *testing.T) {
 	var buf bytes.Buffer
 	if err := waitForRepoIndexed(&buf, abs, 5*time.Millisecond); err == nil {
 		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestWaitForRepoIndexed_RoutedReadySettlesWithoutStatus(t *testing.T) {
+	abs := t.TempDir()
+	originalReadiness, originalStatus := trackReadinessFn, trackStatusFn
+	t.Cleanup(func() {
+		trackReadinessFn, trackStatusFn = originalReadiness, originalStatus
+	})
+	calls := 0
+	trackReadinessFn = func(path string) (daemon.TrackReadiness, error) {
+		calls++
+		if path != abs {
+			t.Fatalf("readiness path = %q, want %q", path, abs)
+		}
+		return daemon.TrackReadiness{
+			State: daemon.TrackReadinessReady,
+			View:  &daemon.ProbeView{Kind: daemon.ProbeViewBase, Exact: true},
+		}, nil
+	}
+	trackStatusFn = func() (daemon.StatusResponse, error) {
+		t.Fatal("routed readiness must not scan status counters")
+		return daemon.StatusResponse{}, nil
+	}
+
+	var buf bytes.Buffer
+	if err := waitForRepoIndexed(&buf, abs, time.Second); err != nil {
+		t.Fatalf("ready routed view should settle: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("readiness calls = %d, want immediate first-poll success", calls)
+	}
+}
+
+func TestWaitForRepoIndexed_BuildingAndFallbackDoNotSettle(t *testing.T) {
+	abs := t.TempDir()
+	originalReadiness, originalStatus, originalInterval := trackReadinessFn, trackStatusFn, trackPollInterval
+	t.Cleanup(func() {
+		trackReadinessFn, trackStatusFn, trackPollInterval = originalReadiness, originalStatus, originalInterval
+	})
+	trackPollInterval = time.Millisecond
+	calls := 0
+	trackReadinessFn = func(string) (daemon.TrackReadiness, error) {
+		calls++
+		if calls == 1 {
+			return daemon.TrackReadiness{
+				State: daemon.TrackReadinessBuilding,
+				View:  &daemon.ProbeView{Kind: daemon.ProbeViewUnrouted, Exact: false, FallbackReason: daemon.FallbackViewBuilding},
+			}, nil
+		}
+		if calls == 2 {
+			// Even an inconsistent `ready` label cannot override the honesty bit.
+			return daemon.TrackReadiness{
+				State: daemon.TrackReadinessReady,
+				View:  &daemon.ProbeView{Kind: daemon.ProbeViewBase, Exact: false, FallbackReason: daemon.FallbackViewBuilding},
+			}, nil
+		}
+		return daemon.TrackReadiness{
+			State: daemon.TrackReadinessReady,
+			View:  &daemon.ProbeView{Kind: daemon.ProbeViewWorktree, Exact: true},
+		}, nil
+	}
+	trackStatusFn = func() (daemon.StatusResponse, error) {
+		t.Fatal("building routed view must not use legacy status counters")
+		return daemon.StatusResponse{}, nil
+	}
+
+	var buf bytes.Buffer
+	if err := waitForRepoIndexed(&buf, abs, time.Second); err != nil {
+		t.Fatalf("wait for routed publication: %v", err)
+	}
+	if calls < 3 {
+		t.Fatalf("readiness calls = %d, want building and fallback polls before ready", calls)
+	}
+}
+
+func TestWaitForRepoIndexed_PromotionFailureExitsImmediately(t *testing.T) {
+	abs := t.TempDir()
+	originalReadiness, originalStatus := trackReadinessFn, trackStatusFn
+	t.Cleanup(func() {
+		trackReadinessFn, trackStatusFn = originalReadiness, originalStatus
+	})
+	calls := 0
+	trackReadinessFn = func(string) (daemon.TrackReadiness, error) {
+		calls++
+		return daemon.TrackReadiness{
+			State: daemon.TrackReadinessFailed,
+			Error: "synthetic promotion failure",
+		}, nil
+	}
+	trackStatusFn = func() (daemon.StatusResponse, error) {
+		t.Fatal("failed promotion must not use legacy status counters")
+		return daemon.StatusResponse{}, nil
+	}
+
+	var buf bytes.Buffer
+	err := waitForRepoIndexed(&buf, abs, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "synthetic promotion failure") {
+		t.Fatalf("failure = %v, want promotion error", err)
+	}
+	if calls != 1 {
+		t.Fatalf("readiness calls = %d, want immediate failure", calls)
+	}
+}
+
+func BenchmarkWaitForRepoIndexed_RoutedReady(b *testing.B) {
+	abs := b.TempDir()
+	originalReadiness, originalStatus := trackReadinessFn, trackStatusFn
+	b.Cleanup(func() {
+		trackReadinessFn, trackStatusFn = originalReadiness, originalStatus
+	})
+	trackReadinessFn = func(string) (daemon.TrackReadiness, error) {
+		return daemon.TrackReadiness{
+			State: daemon.TrackReadinessReady,
+			View:  &daemon.ProbeView{Kind: daemon.ProbeViewBase, Exact: true},
+		}, nil
+	}
+	trackStatusFn = func() (daemon.StatusResponse, error) {
+		b.Fatal("routed readiness benchmark reached the graph-count status path")
+		return daemon.StatusResponse{}, nil
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := waitForRepoIndexed(io.Discard, abs, time.Second); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
