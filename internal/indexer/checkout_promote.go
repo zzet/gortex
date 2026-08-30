@@ -286,11 +286,15 @@ func sampleCheckout(ctx context.Context, root string) (checkoutSample, error) {
 	if err != nil {
 		return checkoutSample{}, fmt.Errorf("indexer: sample HEAD of %s: %w", root, err)
 	}
+	tree, err := gitstate.CanonicalHeadTreeOID(ctx, root, head.CommitOID, head.TreeOID)
+	if err != nil {
+		return checkoutSample{}, fmt.Errorf("indexer: resolve HEAD tree of %s: %w", root, err)
+	}
 	dirty, err := gitstate.SampleDirty(ctx, root)
 	if err != nil {
 		return checkoutSample{}, fmt.Errorf("indexer: sample %s: %w", root, err)
 	}
-	return checkoutSample{tree: head.TreeOID, commit: head.CommitOID, fingerprint: dirty.Fingerprint}, nil
+	return checkoutSample{tree: tree, commit: head.CommitOID, fingerprint: dirty.Fingerprint}, nil
 }
 
 // withdrawAutomaticRoute takes down the route a checkout was served through in

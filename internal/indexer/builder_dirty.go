@@ -74,6 +74,10 @@ type DirtyLayerRequest struct {
 	buildBarrier    func()
 	identitySampler func(context.Context, string) (gitstate.DirtySnapshot, error)
 	buildSampler    func(context.Context, string) (gitstate.DirtySnapshot, error)
+	// unbornTreeOID is the coordinator's already-resolved canonical empty tree.
+	// Direct callers leave it empty and take the one object-format lookup only
+	// when their sample is actually unborn.
+	unbornTreeOID string
 }
 
 // BuildDirtyLayer builds the sparse generation that turns a checkout's
@@ -112,6 +116,10 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		if err != nil {
 			return 0, BuildReport{}, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
 		}
+		before, err = canonicalDirtySnapshot(ctx, req.CheckoutRoot, before, req.unbornTreeOID)
+		if err != nil {
+			return 0, BuildReport{}, err
+		}
 		identity.TreeOID = before.HeadTree
 		identity.ProvenanceCommitOID = before.HeadCommit
 		identity.LowerViewFingerprint = before.Fingerprint
@@ -123,6 +131,10 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		before, err := buildSampler(ctx, req.CheckoutRoot)
 		if err != nil {
 			return BuildRequest{}, nil, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
+		}
+		before, err = canonicalDirtySnapshot(ctx, req.CheckoutRoot, before, req.unbornTreeOID)
+		if err != nil {
+			return BuildRequest{}, nil, err
 		}
 		preparedIdentity := identity
 		preparedIdentity.TreeOID = before.HeadTree
@@ -179,6 +191,32 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 			},
 		}, cleanup, nil
 	})
+}
+
+// canonicalDirtySnapshot gives an unborn working tree the canonical empty
+// tree for its repository object format. DirtySampler deliberately preserves
+// Git's public representation (no HEAD tree before the first commit); sparse
+// generation identities instead need one immutable lower tree so they can use
+// the ordinary commit/dirty pipeline and transition cleanly to the first real
+// tree.
+func canonicalDirtySnapshot(
+	ctx context.Context,
+	root string,
+	snapshot gitstate.DirtySnapshot,
+	unbornTreeOID string,
+) (gitstate.DirtySnapshot, error) {
+	if snapshot.HeadTree == "" && snapshot.HeadCommit == "" && unbornTreeOID != "" {
+		snapshot.HeadTree = unbornTreeOID
+		return snapshot, nil
+	}
+	tree, err := gitstate.CanonicalHeadTreeOID(ctx, root, snapshot.HeadCommit, snapshot.HeadTree)
+	if err != nil {
+		return gitstate.DirtySnapshot{}, fmt.Errorf(
+			"indexer: resolve sampled HEAD tree of %s: %w", root, err,
+		)
+	}
+	snapshot.HeadTree = tree
+	return snapshot, nil
 }
 
 // confirmDirtySnapshot re-samples the checkout and refuses the publish when the

@@ -217,14 +217,16 @@ type CheckoutCycle struct {
 // reconciliation reports an accessible automatic checkout, and closed when
 // that checkout leaves.
 type CheckoutCoordinator struct {
-	checkoutID  string
-	root        string
-	sampler     *gitstate.DirtySampler
-	familyID    string
-	graphID     string
-	repoPrefix  string
-	workspaceID string
-	projectID   string
+	checkoutID    string
+	root          string
+	sampler       *gitstate.DirtySampler
+	unbornTreeMu  sync.Mutex
+	unbornTreeOID string
+	familyID      string
+	graphID       string
+	repoPrefix    string
+	workspaceID   string
+	projectID     string
 
 	store   *store_sqlite.Store
 	catalog *store_sqlite.Catalog
@@ -369,6 +371,35 @@ func (c *CheckoutCoordinator) dedicatedBaseIdentity() dedicatedBaseIdentity {
 		extractorVersions: c.extractors,
 		resolverVersion:   checkoutResolverVersion,
 	}
+}
+
+// canonicalDirtySnapshot normalizes Git's unborn-HEAD representation once per
+// coordinator. The checkout's object format cannot change during the
+// coordinator's lifetime, so every later poll and build can reuse the same
+// canonical empty-tree oid without spawning another Git process.
+func (c *CheckoutCoordinator) canonicalDirtySnapshot(
+	ctx context.Context,
+	snapshot gitstate.DirtySnapshot,
+) (gitstate.DirtySnapshot, error) {
+	if snapshot.HeadTree != "" || snapshot.HeadCommit != "" {
+		return canonicalDirtySnapshot(ctx, c.root, snapshot, "")
+	}
+	c.unbornTreeMu.Lock()
+	defer c.unbornTreeMu.Unlock()
+	normalized, err := canonicalDirtySnapshot(ctx, c.root, snapshot, c.unbornTreeOID)
+	if err != nil {
+		return gitstate.DirtySnapshot{}, err
+	}
+	if c.unbornTreeOID == "" {
+		c.unbornTreeOID = normalized.HeadTree
+	}
+	return normalized, nil
+}
+
+func (c *CheckoutCoordinator) cachedUnbornTreeOID() string {
+	c.unbornTreeMu.Lock()
+	defer c.unbornTreeMu.Unlock()
+	return c.unbornTreeOID
 }
 
 // NewCheckoutCoordinator builds a coordinator and starts its loop. The caller
@@ -869,7 +900,11 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 		return out, false
 	}
 	sample, err := c.sampler.Sample(ctx)
-	if err != nil || sample.HeadTree == "" {
+	if err != nil {
+		return out, false
+	}
+	sample, err = c.canonicalDirtySnapshot(ctx, sample)
+	if err != nil {
 		return out, false
 	}
 	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
@@ -946,11 +981,9 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		out.Err = fmt.Errorf("indexer: sample checkout %s: %w", c.root, err)
 		return out
 	}
-	if head.HeadTree == "" {
-		// An unborn branch has no tree to build a commit layer from, and a
-		// checkout with no commit generation has no view. There is nothing to
-		// reconcile to until it has one commit.
-		out.Err = fmt.Errorf("indexer: checkout %s has no HEAD tree", c.root)
+	head, err = c.canonicalDirtySnapshot(ctx, head)
+	if err != nil {
+		out.Err = err
 		return out
 	}
 
@@ -1071,21 +1104,22 @@ func (c *CheckoutCoordinator) prepareRehomeTo(
 	if err != nil {
 		return out, fmt.Errorf("indexer: sample HEAD of %s: %w", c.root, err)
 	}
-	if head.TreeOID == "" {
-		return out, fmt.Errorf("indexer: checkout %s has no HEAD tree", c.root)
+	targetTree, err := gitstate.CanonicalHeadTreeOID(ctx, c.root, head.CommitOID, head.TreeOID)
+	if err != nil {
+		return out, fmt.Errorf("indexer: resolve HEAD tree of %s: %w", c.root, err)
 	}
 	route, routed, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
 	if err != nil {
 		return out, err
 	}
 
-	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, head.TreeOID)
+	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, targetTree)
 	if err != nil {
 		return out, err
 	}
 	out.CommitGenerationID, out.CommitBuilt, out.CommitReused = commitGeneration, !reused, reused
 
-	dirtyGeneration, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	dirtyGeneration, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration, targetTree)
 	if err != nil {
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return out, err
@@ -1110,7 +1144,7 @@ func (c *CheckoutCoordinator) prepareRehomeTo(
 	// left, so none of it can ever be routed here again — except the layer
 	// this transition routed, which the cache may have supplied.
 	c.dropRetained(ctx, commitGeneration)
-	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, head.TreeOID)), commitGeneration)
+	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, targetTree)), commitGeneration)
 	c.rememberRoutedDirty(dirtyGeneration)
 	if routed {
 		c.offerRetire(ctx, route.DirtyGenerationID)
@@ -1161,7 +1195,11 @@ func (c *CheckoutCoordinator) preparePromotion(
 	if err != nil {
 		return out, fmt.Errorf("indexer: sample HEAD of %s: %w", c.root, err)
 	}
-	if head.TreeOID == "" || head.TreeOID != expectedHeadTree {
+	targetTree, err := gitstate.CanonicalHeadTreeOID(ctx, c.root, head.CommitOID, head.TreeOID)
+	if err != nil {
+		return out, fmt.Errorf("indexer: resolve HEAD tree of %s: %w", c.root, err)
+	}
+	if targetTree != expectedHeadTree {
 		return out, errCheckoutUnsettled
 	}
 	route, routed, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
@@ -1175,7 +1213,7 @@ func (c *CheckoutCoordinator) preparePromotion(
 	}
 	out.CommitGenerationID, out.CommitBuilt, out.CommitReused = commitGeneration, !reused, reused
 
-	dirtyGeneration, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	dirtyGeneration, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration, expectedHeadTree)
 	if err != nil {
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return out, err
@@ -1651,6 +1689,10 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	if err != nil {
 		return fmt.Errorf("indexer: sample %s: %w", c.root, err)
 	}
+	sample, err = c.canonicalDirtySnapshot(ctx, sample)
+	if err != nil {
+		return err
+	}
 	c.noteDirtyFingerprint(sample.Fingerprint)
 	if sample.HeadTree != targetTree {
 		out.Rescheduled = true
@@ -1718,11 +1760,18 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 // Like resolveCommitLayer it writes nothing to the route: what the checkout
 // reads is the caller's decision.
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
-	ctx context.Context, graphID string, commitGeneration int64,
+	ctx context.Context, graphID string, commitGeneration int64, targetTree string,
 ) (int64, error) {
 	sample, err := c.sampler.Sample(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("indexer: sample %s: %w", c.root, err)
+	}
+	sample, err = c.canonicalDirtySnapshot(ctx, sample)
+	if err != nil {
+		return 0, err
+	}
+	if sample.HeadTree != targetTree {
+		return 0, errCheckoutUnsettled
 	}
 	return c.buildDirtyLayerOverSampled(ctx, graphID, commitGeneration, sample)
 }
@@ -1733,6 +1782,12 @@ func (c *CheckoutCoordinator) buildDirtyLayerOverSampled(
 	commitGeneration int64,
 	sample gitstate.DirtySnapshot,
 ) (int64, error) {
+	var err error
+	sample, err = c.canonicalDirtySnapshot(ctx, sample)
+	if err != nil {
+		return 0, err
+	}
+	targetTree := sample.HeadTree
 	dirtyBase, err := c.commitLayerReader(ctx, commitGeneration)
 	if err != nil {
 		return 0, err
@@ -1741,13 +1796,14 @@ func (c *CheckoutCoordinator) buildDirtyLayerOverSampled(
 	for attempt := 0; attempt < 2; attempt++ {
 		started := time.Now()
 		generationID, _, err := c.builder.BuildDirtyLayer(ctx, DirtyLayerRequest{
-			Identity:     identity,
-			Base:         dirtyBase,
-			CheckoutRoot: c.root,
-			RepoPrefix:   c.repoPrefix,
-			WorkspaceID:  c.workspaceID,
-			ProjectID:    c.projectID,
-			buildBarrier: c.dirtyBarrier,
+			Identity:      identity,
+			Base:          dirtyBase,
+			CheckoutRoot:  c.root,
+			RepoPrefix:    c.repoPrefix,
+			WorkspaceID:   c.workspaceID,
+			ProjectID:     c.projectID,
+			buildBarrier:  c.dirtyBarrier,
+			unbornTreeOID: c.cachedUnbornTreeOID(),
 		})
 		viewmetrics.Observe(viewmetrics.CoordinatorBuildSeconds, time.Since(started), viewmetrics.SlotDirty)
 		if err == nil {
@@ -1769,6 +1825,13 @@ func (c *CheckoutCoordinator) buildDirtyLayerOverSampled(
 			sample, err = c.sampler.Sample(ctx)
 			if err != nil {
 				return 0, fmt.Errorf("indexer: sample %s: %w", c.root, err)
+			}
+			sample, err = c.canonicalDirtySnapshot(ctx, sample)
+			if err != nil {
+				return 0, err
+			}
+			if sample.HeadTree != targetTree {
+				return 0, nil
 			}
 			identity = c.dirtyIdentity(graphID, commitGeneration, sample)
 		}

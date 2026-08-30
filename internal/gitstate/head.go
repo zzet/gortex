@@ -9,6 +9,11 @@ import (
 	"github.com/zzet/gortex/internal/gitcmd"
 )
 
+const (
+	emptyTreeOIDSHA1   = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	emptyTreeOIDSHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+)
+
 // HEADState is a point-in-time sample of what HEAD points at in one
 // working tree.
 type HEADState struct {
@@ -75,6 +80,53 @@ func SampleHEAD(ctx context.Context, dir string) (HEADState, error) {
 		}
 	}
 	return state, nil
+}
+
+// CanonicalHeadTreeOID turns a sampled HEAD tree into the immutable tree oid
+// lifecycle generations use as their content identity.
+//
+// A repository before its first commit has no HEAD tree object, but Git still
+// defines one canonical empty-tree oid for each object format. Git's revision
+// and diff plumbing accepts that oid without the object being materialized in
+// the object database, which lets an unborn checkout use the same immutable
+// base/commit/dirty pipeline as every other checkout. A non-empty tree is
+// returned unchanged. An empty tree paired with a real commit remains an
+// error: that is an unresolved committed HEAD, not an unborn repository.
+func CanonicalHeadTreeOID(
+	ctx context.Context,
+	dir string,
+	commitOID string,
+	treeOID string,
+) (string, error) {
+	if treeOID != "" {
+		return treeOID, nil
+	}
+	if commitOID != "" {
+		return "", fmt.Errorf(
+			"gitstate: commit %s in %s has no resolvable tree: %w",
+			commitOID, dir, ErrHEADUnavailable,
+		)
+	}
+
+	abs, err := absDir(dir)
+	if err != nil {
+		return "", fmt.Errorf("gitstate: resolve %q: %w: %w", dir, ErrHEADUnavailable, err)
+	}
+	format, err := gitcmd.Output(ctx, abs, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", fmt.Errorf("gitstate: read object format in %s: %w: %w", abs, ErrHEADUnavailable, err)
+	}
+	switch format {
+	case "sha1":
+		return emptyTreeOIDSHA1, nil
+	case "sha256":
+		return emptyTreeOIDSHA256, nil
+	default:
+		return "", fmt.Errorf(
+			"gitstate: unsupported object format %q in %s: %w",
+			format, abs, ErrHEADUnavailable,
+		)
+	}
 }
 
 // exitCode returns the process exit status behind a git error, or -1
