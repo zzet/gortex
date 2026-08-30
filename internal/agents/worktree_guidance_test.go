@@ -1,13 +1,14 @@
 package agents
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
 
-func worktreeGuidanceGit(t *testing.T, dir string, args ...string) {
+func worktreeGuidanceGit(t testing.TB, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
@@ -17,6 +18,71 @@ func worktreeGuidanceGit(t *testing.T, dir string, args ...string) {
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+func BenchmarkPendingAutomaticCheckout(b *testing.B) {
+	if _, err := exec.LookPath("git"); err != nil {
+		b.Skip("git not available")
+	}
+	main := filepath.Join(b.TempDir(), "main")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	worktreeGuidanceGit(b, main, "init", "-q", "-b", "main")
+	worktreeGuidanceGit(b, main, "config", "user.email", "test@example.com")
+	worktreeGuidanceGit(b, main, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(main, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	worktreeGuidanceGit(b, main, "add", ".")
+	worktreeGuidanceGit(b, main, "commit", "-q", "-m", "initial")
+
+	linked := filepath.Join(b.TempDir(), "linked")
+	worktreeGuidanceGit(b, main, "worktree", "add", "-q", "-b", "feature", linked)
+	linkedNested := filepath.Join(linked, "internal", "pkg")
+	if err := os.MkdirAll(linkedNested, 0o755); err != nil {
+		b.Fatal(err)
+	}
+
+	unrelated := filepath.Join(b.TempDir(), "unrelated")
+	if err := os.MkdirAll(unrelated, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	worktreeGuidanceGit(b, unrelated, "init", "-q")
+	unrelatedNested := filepath.Join(unrelated, "nested")
+	if err := os.MkdirAll(unrelatedNested, 0o755); err != nil {
+		b.Fatal(err)
+	}
+
+	for _, count := range []int{1, 32, 256} {
+		roots := make([]string, count)
+		for i := range roots {
+			roots[i] = unrelated
+		}
+		matching := append([]string(nil), roots...)
+		matching[len(matching)-1] = main
+		noMatch := make([]string, count)
+		for i := range noMatch {
+			noMatch[i] = main
+		}
+
+		b.Run(fmt.Sprintf("match_last/tracked_roots_%d", count), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if !PendingAutomaticCheckout(linkedNested, matching) {
+					b.Fatal("same-family checkout was not recognized")
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("unrelated/tracked_roots_%d", count), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if PendingAutomaticCheckout(unrelatedNested, noMatch) {
+					b.Fatal("unrelated checkout was recognized")
+				}
+			}
+		})
 	}
 }
 
