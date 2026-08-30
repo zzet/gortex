@@ -1472,11 +1472,15 @@ func (c *realController) trackedRepoLiveness() ([]config.RepoEntry, map[string]b
 	if c.configManager == nil {
 		return nil, nil
 	}
-	gc := c.configManager.Global()
-	if gc == nil {
-		return nil, nil
+	registrations := c.configManager.RepoRegistrations()
+	entries := make([]config.RepoEntry, len(registrations))
+	for i := range registrations {
+		// Status and warmup must agree on physical identity. In particular, a
+		// project-only alias is one durable registration, not an absent global
+		// repo plus a synthetic row under the alias spelling.
+		entries[i] = registrations[i].Entry
+		entries[i].Path = registrations[i].CanonicalPath
 	}
-	entries := append([]config.RepoEntry(nil), gc.Repos...)
 	missing := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		missing[e.Path] = config.RepoPathMissing(e.Path)
