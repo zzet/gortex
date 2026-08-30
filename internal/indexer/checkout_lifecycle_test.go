@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -163,7 +164,7 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not available in PATH")
 	}
-	dir := t.TempDir()
+	dir := pathkey.CanonicalExistingRoot(t.TempDir())
 	f := &lifecycleFixture{
 		t:       t,
 		dir:     dir,
@@ -973,10 +974,28 @@ func TestCheckoutLifecycleSweepReachesAConfiguredButUnindexedRepo(t *testing.T) 
 	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: root, Name: "unindexed-repo"}))
 	require.NoError(t, gc.Save())
 
-	// Seeding records the identity without indexing — the state a boot that
-	// skipped an unreachable root leaves behind.
-	require.NoError(t, f.lc.Seed(ctx))
-	tracked := f.checkoutOf("unindexed-repo")
+	// Record only the configured catalog identity. A normal open-gate Seed now
+	// publishes the configured repository's corpus, so it cannot model the
+	// startup state left when indexing never admitted this root.
+	registrations := f.cm.RepoRegistrations()
+	require.Len(t, registrations, 1)
+	registration := registrations[0]
+	prefix := EffectiveRepoPrefix(f.cm, registration.Entry)
+	require.Equal(t, "unindexed-repo", prefix)
+	identity, err := f.lc.recordConfiguredCheckout(
+		ctx, prefix, registration.CanonicalPath, registration.Sources, true,
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, identity.familyID)
+	require.NotEmpty(t, identity.checkoutID)
+	require.NotEmpty(t, identity.incarnation)
+	require.NotEmpty(t, identity.graphID)
+
+	tracked := f.checkoutOf(prefix)
+	require.Equal(t, identity.familyID, tracked.FamilyID)
+	require.Equal(t, identity.checkoutID, tracked.CheckoutID)
+	require.Equal(t, identity.incarnation, tracked.Incarnation)
+	require.Equal(t, identity.graphID, f.familyOf(prefix).GraphID)
 	require.Nil(t, f.mi.GetMetadata("unindexed-repo"), "nothing of it is in the corpus")
 
 	require.NoError(t, os.RemoveAll(root))

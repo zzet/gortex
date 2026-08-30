@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 func TestBeforeTrackDeadlineBoundsDaemonReadiness(t *testing.T) {
@@ -120,8 +121,9 @@ func TestRunTrackWaitTimeoutIncludesControlTrackAndKeepsConfig(t *testing.T) {
 	if loadErr != nil {
 		t.Fatalf("load global config: %v", loadErr)
 	}
+	wantRepo := pathkey.CanonicalExistingRoot(repo)
 	for _, entry := range gc.Repos {
-		if abs, absErr := filepath.Abs(entry.Path); absErr == nil && abs == repo {
+		if pathkey.CanonicalExistingRoot(entry.Path) == wantRepo {
 			return
 		}
 	}

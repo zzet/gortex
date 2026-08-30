@@ -138,9 +138,7 @@ func TestTrackUntrackRepositoryDrivesTheCheckoutLifecycle(t *testing.T) {
 
 	saved, err := config.LoadGlobal(filepath.Join(dir, "config.yaml"))
 	require.NoError(t, err)
-	for _, entry := range saved.Repos {
-		assert.NotEqual(t, repo, entry.Path, "the untrack is persisted")
-	}
+	require.Empty(t, saved.Repos, "the only configured repository is removed")
 	_, err = os.Stat(repo)
 	require.NoError(t, err, "untracking never touches the working tree")
 }
