@@ -1059,7 +1059,10 @@ func (l *CheckoutLifecycle) confirmPresent(
 }
 
 // bindDedicatedGraph binds a checkout to the repo prefix its nodes live
-// under, and makes it the family's primary base when the family has none.
+// under. Only the first graph ever admitted to an empty family becomes its
+// primary automatically. A family that still owns independent dedicated
+// graphs after primary retirement deliberately stays without a primary until
+// an explicit primary selection moves that role.
 func (l *CheckoutLifecycle) bindDedicatedGraph(
 	ctx context.Context, familyID, checkoutID, prefix string,
 ) (string, error) {
@@ -1100,19 +1103,12 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 	if err != nil {
 		return "", err
 	}
-	primaryHeld := false
-	for _, g := range graphs {
-		if g.IsPrimaryBase && g.GraphID != graphID {
-			primaryHeld = true
-			break
-		}
-	}
 	row := store_sqlite.DedicatedGraph{
 		GraphID:         graphID,
 		OwnerCheckoutID: checkoutID,
 		RepoPrefix:      prefix,
 		FamilyID:        familyID,
-		IsPrimaryBase:   !primaryHeld,
+		IsPrimaryBase:   len(graphs) == 0,
 		State:           reconcile.GraphStateReady,
 	}
 	if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
