@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // TestSubAgentToolPropagation locks in the invariant that every Gortex
@@ -44,6 +46,8 @@ func TestSubAgentBodiesUseOnlyCompactVocabulary(t *testing.T) {
 			require.NotContainsf(t, def, legacy, "%s contains legacy MCP tool %q", name, legacy)
 		}
 		require.NotContains(t, def, "facade-v1")
+		require.Equalf(t, 1, strings.Count(def, profiles.WorktreeBranchRoutingPolicy),
+			"%s must embed the canonical worktree/branch policy exactly once", name)
 	}
 }
 

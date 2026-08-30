@@ -18,7 +18,10 @@
 // of the pre-refactor behaviour is trivially verifiable.
 package claudecode
 
-import "github.com/zzet/gortex/internal/agents"
+import (
+	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/profiles"
+)
 
 // ProjectMCPJSON is the starter content for a project's .mcp.json
 // when no file exists yet.
@@ -224,6 +227,11 @@ description: "Coding-agent review verdict via the gortex review verb."
 	"gortex-cli": skillGortexCLI,
 }
 
+const worktreeBranchRoutingRules = `
+## Worktree and branch routing
+
+` + profiles.WorktreeBranchRoutingPolicy
+
 const nativeMCPRules = `
 ## Required behavior
 
@@ -233,7 +241,7 @@ const nativeMCPRules = `
 - Use ` + "`change`" + ` before a mutation and again after it. Write only through ` + "`edit`" + ` or ` + "`refactor`" + `.
 - Call ` + "`capabilities({domain: \"<tool>\", operation: \"<operation>\", detail: \"schema\"})`" + ` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
-`
+` + worktreeBranchRoutingRules
 
 const commandGuide = `# Gortex Guide
 
@@ -416,7 +424,7 @@ gortex review --audience agent --format json
 ` + "```" + `
 
 In either mode, return ` + "`VERDICT: clean`" + ` or ` + "`VERDICT: findings`" + ` followed by actionable findings with severity and ` + "`file:line`" + `. Do not replace graph-backed review with ad-hoc ` + "`git diff`" + ` inspection.
-`
+` + worktreeBranchRoutingRules
 
 const skillGortexCLI = `---
 name: gortex-cli
@@ -445,4 +453,4 @@ gortex call capabilities --arg domain=read --arg operation=source --arg detail=s
 ` + "```" + `
 
 The required order is ` + "`explore`" + ` → targeted ` + "`search/read/relations/trace`" + ` → pre-change ` + "`change`" + ` → ` + "`edit/refactor`" + ` → post-change ` + "`change`" + `. Do not use shell file reads or search as a substitute.
-`
+` + worktreeBranchRoutingRules

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/profiles"
@@ -380,9 +381,22 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 			"(e.g. `%s/path/to/file.go`) or pass an explicit `repo:` filter.\n",
 			abs, len(contained), summary, len(contained), example)
 	default:
+		if pendingAutomaticCheckout(abs, s.TrackedRepos) {
+			return fmt.Sprintf("⏳ **cwd `%s` is a Git checkout awaiting automatic discovery.** Its Git family is already tracked, but the overlay route is not published yet. Do not run `gortex track`; wait for reconciliation and reconnect. Explicit tracking is only for a user-requested dedicated graph.\n", abs)
+		}
 		return fmt.Sprintf("⚠️  **cwd `%s` is not covered by any tracked repo.** Read/Grep/Glob/Bash will fall through to soft guidance only — graph tools won't be available for this directory.\n\nTo enable enforcement: `gortex track %s`\n",
 			abs, abs)
 	}
+}
+
+func pendingAutomaticCheckout(cwd string, repos []daemon.TrackedRepoStatus) bool {
+	roots := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		if strings.TrimSpace(repo.Path) != "" {
+			roots = append(roots, repo.Path)
+		}
+	}
+	return agents.PendingAutomaticCheckout(cwd, roots)
 }
 
 // classifyCwd partitions the relationship between cwd and the daemon's
@@ -432,7 +446,8 @@ func rulePreamble() string {
 		"Mutate with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; " +
 		"use the returned symbol IDs with `change` operations `tests`, `guards`, and `contract`. " +
 		"Call `capabilities` only when exact operation fields are unknown.\n" +
-		toolref.MCPRequiredLine()
+		toolref.MCPRequiredLine() +
+		"\n### Worktree and branch routing\n\n" + profiles.WorktreeBranchRoutingPolicy
 }
 
 // formatDuration renders a number of seconds as "1h7m" or "45s".

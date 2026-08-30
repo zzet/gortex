@@ -63,16 +63,24 @@ var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work. Call
 
 `)
 
+// WorktreeBranchRoutingPolicy is the single agent-facing contract for graph
+// ownership, composition, fallback, and lifecycle. Keep this compact: it is
+// reused verbatim by profiles, adapter instructions, initialize guidance,
+// lifecycle hooks, skills, and sub-agents. Those surfaces must concatenate
+// this constant rather than paraphrase it; routing is safety policy, and two
+// almost-equivalent copies eventually teach agents different destructive
+// actions.
+const WorktreeBranchRoutingPolicy = "- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.\n" +
+	"- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.\n" +
+	"- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.\n" +
+	"- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.\n" +
+	"- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.\n"
+
 // sectionWorktreeViews teaches agents the ownership boundary that keeps
 // ordinary linked-worktree use cheap. It is shared by every profile so a lean
 // session cannot accidentally turn an automatic overlay into a dedicated graph.
-var sectionWorktreeViews = bt(`## Worktree views
-
-- CWD selects one coherent view. Implicit linked worktrees become overlays automatically; use §track§ only for a user-requested dedicated graph.
-- An overlay shadows matching primary symbols; it does not union incompatible branches.
-- A labeled §view_building§ fallback is read-only; exact-file and edit operations await a ready route. Never restart the daemon, delete its store, or re-track merely to expose a worktree.
-
-`)
+const sectionWorktreeViews = "## Worktree and branch routing\n\n" + WorktreeBranchRoutingPolicy +
+	"Never restart the daemon, delete its store, or re-track merely to expose a worktree.\n\n"
 
 var sectionFullRuleTable = bt(`| Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|

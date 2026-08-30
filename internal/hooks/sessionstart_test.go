@@ -3,10 +3,14 @@ package hooks
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 func withFakeStatus(t *testing.T, fn func() (*daemon.StatusResponse, error)) {
@@ -26,6 +30,9 @@ func TestRunSessionStart_RejectsWrongEvent(t *testing.T) {
 
 func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
 	briefing := rulePreamble()
+	if got := strings.Count(briefing, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+		t.Fatalf("rule preamble embeds canonical worktree policy %d times, want once", got)
+	}
 	for _, required := range []string{
 		"For an explicitly named file",
 		"options:{new_user_task:true}",
@@ -61,6 +68,59 @@ func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
 		if strings.Contains(briefing, forced) {
 			t.Fatalf("rule preamble contains forced-localize wording %q: %s", forced, briefing)
 		}
+	}
+}
+
+func sessionGuidanceGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_SYSTEM="+os.DevNull,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+func TestRenderCwdCoverageWaitsForAutomaticFamilyCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	main := filepath.Join(t.TempDir(), "main")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionGuidanceGit(t, main, "init", "-q", "-b", "main")
+	sessionGuidanceGit(t, main, "config", "user.email", "test@example.com")
+	sessionGuidanceGit(t, main, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(main, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionGuidanceGit(t, main, "add", ".")
+	sessionGuidanceGit(t, main, "commit", "-q", "-m", "initial")
+	linked := filepath.Join(t.TempDir(), "linked")
+	sessionGuidanceGit(t, main, "worktree", "add", "-q", "-b", "feature", linked)
+
+	status := &daemon.StatusResponse{TrackedRepos: []daemon.TrackedRepoStatus{{Name: "main", Path: main}}}
+	got := renderCwdCoverage(linked, status)
+	if !strings.Contains(got, "awaiting automatic discovery") || !strings.Contains(got, "Do not run `gortex track`") {
+		t.Fatalf("linked worktree received no neutral discovery guidance:\n%s", got)
+	}
+	if strings.Contains(got, "`gortex track "+linked+"`") {
+		t.Fatalf("linked worktree was told to become a dedicated graph:\n%s", got)
+	}
+	reverse := &daemon.StatusResponse{TrackedRepos: []daemon.TrackedRepoStatus{{Name: "linked", Path: linked}}}
+	reverseGuidance := renderCwdCoverage(main, reverse)
+	if !strings.Contains(reverseGuidance, "awaiting automatic discovery") || strings.Contains(reverseGuidance, "`gortex track "+main+"`") {
+		t.Fatalf("primary checkout was not treated as automatic when a linked family member is tracked:\n%s", reverseGuidance)
+	}
+
+	unrelated := t.TempDir()
+	unrelatedGuidance := renderCwdCoverage(unrelated, status)
+	if !strings.Contains(unrelatedGuidance, "gortex track "+unrelated) {
+		t.Fatalf("truly unrelated directory lost explicit-track guidance:\n%s", unrelatedGuidance)
 	}
 }
 

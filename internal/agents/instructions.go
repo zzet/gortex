@@ -138,7 +138,10 @@ Common calls:
 - ` + "`" + `relations({operation:"usages", target:{symbol:"<id>"}})` + "`" + `
 - ` + "`" + `edit({target:{file:"<path>"}, match:"<old>", replacement:"<new>"})` + "`" + `
 
-Worktrees: the current working directory selects one coherent view. Implicit linked worktrees are automatic overlays; call ` + "`" + `track` + "`" + ` only when the user explicitly requests a dedicated graph. Overlay data shadows the same logical primary symbol rather than unioning incompatible branches. A labeled ` + "`" + `view_building` + "`" + ` / primary fallback is read-only; exact-file and edit operations wait for a ready route. Do not restart the daemon, delete its store, or re-track merely to expose a worktree.
+## Worktree and branch routing
+
+` + profiles.WorktreeBranchRoutingPolicy + `
+Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
 If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback.
 
@@ -156,6 +159,11 @@ This harness has no native MCP transport. Invoke public Gortex tools only as ` +
 2. Inspect with ` + "`" + `gortex call search` + "`" + `, ` + "`" + `gortex call read` + "`" + `, ` + "`" + `gortex call relations` + "`" + `, or ` + "`" + `gortex call trace` + "`" + ` instead of Read/Grep/Glob or shell equivalents.
 3. Before mutation call ` + "`" + `gortex call change --arg operation=impact` + "`" + `. Mutate only through ` + "`" + `gortex call edit` + "`" + ` or ` + "`" + `gortex call refactor` + "`" + `; afterward run change operations ` + "`" + `detect` + "`" + `, ` + "`" + `tests` + "`" + `, ` + "`" + `guards` + "`" + `, and ` + "`" + `contract` + "`" + `.
 4. Use ` + "`" + `gortex call capabilities` + "`" + ` only when exact operation fields are unknown.
+
+## Worktree and branch routing
+
+` + profiles.WorktreeBranchRoutingPolicy + `
+Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 `
 
 // UpsertMarkedBlock is the only supported way to put a Gortex block into

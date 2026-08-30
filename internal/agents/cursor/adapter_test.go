@@ -8,6 +8,7 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/agentstest"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 func TestWorkflowRuleUsesCompactMCPTools(t *testing.T) {
@@ -23,6 +24,9 @@ func TestWorkflowRuleUsesCompactMCPTools(t *testing.T) {
 	}
 	if strings.Contains(workflowRuleBody, "facade-v1") {
 		t.Error("workflow rule should not expose an implementation version")
+	}
+	if got := strings.Count(workflowRuleBody, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+		t.Fatalf("workflow rule embeds canonical worktree policy %d times, want once", got)
 	}
 }
 

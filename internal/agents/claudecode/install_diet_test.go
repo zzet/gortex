@@ -12,15 +12,17 @@ import (
 )
 
 // Byte ceilings for the installed ambient layer. Approximated at ~4.4 B/token:
-//   - 4 KiB global section (pointer block + the @-included default
-//     profile body) ≈ 0.9k tokens
+//   - 5 KiB global section (pointer block + the @-included default
+//     profile body) ≈ 1.2k tokens. The extra 1 KiB is reserved for the
+//     shared worktree/branch safety contract; it must not be spent on tool
+//     catalog detail.
 //   - 2.5 KiB skills-eager total ≈ 0.57k tokens
 //
 // Blowing either (a future rule-block or description balloon) fails loudly
 // instead of silently re-inflating the per-session tax. Per-profile body
 // ceilings live in internal/profiles.
 const (
-	globalSectionByteCeiling = 4096 // 4 KiB
+	globalSectionByteCeiling = 5120 // 5 KiB
 	skillsEagerByteCeiling   = 2560 // 2.5 KiB
 )
 

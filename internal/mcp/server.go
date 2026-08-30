@@ -18,6 +18,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/artifacts"
 	"github.com/zzet/gortex/internal/config"
@@ -31,6 +32,7 @@ import (
 	"github.com/zzet/gortex/internal/llm/svc"
 	"github.com/zzet/gortex/internal/modelhint"
 	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
 	"github.com/zzet/gortex/internal/runtimeactivity"
@@ -1408,12 +1410,20 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 - The cold tools/list shows a core set — call tools_search to discover the rest of the catalogue on demand.
 - Pass format:"gcx" to list-shaped tools for a compact, round-trippable wire format (~27% fewer tokens).
 
+Worktree and branch routing:
+
+` + profiles.WorktreeBranchRoutingPolicy + `
+
 ` + sharedParamLegend
 
 // codingAgentInstructions is intentionally terse because some MCP hosts repeat
 // initialize instructions beside every rendered tool. It describes what to do,
 // not how the server versions or implements its tool surface.
-const codingAgentInstructions = `MUST use Gortex MCP. First explicit-file read per new user request: read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true}); do not localize. Unknown file/symbol/evidence: explore(operation:"localize"); obey completion.required_action; stop at answer_ready. Diagnosis/change: explore(operation:"task"); 1 follow-up. Pre-edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only via edit/refactor. Post-edit: change(operation:"detect"), tests/guards/contract. capabilities only if fields unknown.`
+const codingAgentInstructions = `MUST use Gortex MCP. First explicit-file read per new user request: read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true}); do not localize. Unknown file/symbol/evidence: explore(operation:"localize"); obey completion.required_action; stop at answer_ready. Diagnosis/change: explore(operation:"task"); 1 follow-up. Pre-edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only via edit/refactor. Post-edit: change(operation:"detect"), tests/guards/contract. capabilities only if fields unknown.
+
+Worktree and branch routing:
+
+` + profiles.WorktreeBranchRoutingPolicy
 
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
@@ -1443,6 +1453,34 @@ func ServerInstructionsUntracked(cwd string, roots ...string) string {
 			"under a different letter case, that is the mismatch.", strings.Join(quoted, ", "), target)
 	}
 	return msg
+}
+
+// ServerInstructionsPendingAutomaticCheckout is the inactive initialize
+// variant for a checkout whose Git family is already tracked. The
+// checkout reconciler owns this transition; recommending `track` here would
+// turn a transient discovery lag into an unintended dedicated graph.
+func ServerInstructionsPendingAutomaticCheckout(cwd string, roots ...string) string {
+	target := strings.TrimSpace(cwd)
+	if target == "" {
+		target = "."
+	}
+	msg := fmt.Sprintf("Gortex is connected but this Git checkout is still awaiting automatic discovery: %q belongs to an already tracked Git family, but its overlay route is not published yet.\n\n"+
+		"Do not run `gortex track` for this state: implicit/session checkouts are automatic overlays. Wait for reconciliation and reconnect; if it remains unavailable, report the discovery lag. Explicit tracking is only for a user-requested dedicated graph.\n\n"+
+		"Until its route is published, graph calls may return repo_not_tracked rather than silently reading another checkout.\n\n"+
+		"Worktree and branch routing:\n\n%s", target, profiles.WorktreeBranchRoutingPolicy)
+	return appendTrackedRootsDiagnostic(msg, roots)
+}
+
+func appendTrackedRootsDiagnostic(msg string, roots []string) string {
+	if len(roots) == 0 {
+		return msg
+	}
+	quoted := make([]string, len(roots))
+	for i, root := range roots {
+		quoted[i] = fmt.Sprintf("%q", root)
+	}
+	return msg + fmt.Sprintf("\n\nTracked repository roots: [%s]. The worktree shares a Git common directory with one of these roots.",
+		strings.Join(quoted, ", "))
 }
 
 // afterInitializeInstructions is the server's OnAfterInitialize hook. It
@@ -1509,7 +1547,11 @@ func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
 		_, _, _, inside := s.multiIndexer.ScopeForCWD(cwd)
 		_, _, contains := s.multiIndexer.ContainedReposScope(cwd)
 		if !inside && !contains {
-			return ServerInstructionsUntracked(cwd, s.trackedRepoRoots()...)
+			roots := s.trackedRepoRoots()
+			if agents.PendingAutomaticCheckout(cwd, roots) {
+				return ServerInstructionsPendingAutomaticCheckout(cwd, roots...)
+			}
+			return ServerInstructionsUntracked(cwd, roots...)
 		}
 	}
 	if facts := s.liveInstructionFacts(cwd); facts != "" {

@@ -197,6 +197,14 @@ Convert the delegated change into a concise, graph-grounded impact report. Do no
 5. Call `capabilities` with `detail: "schema"` if an operation's exact arguments are not visible.
 
 Return: one-line safe/risky/breaking verdict; broken callers, contracts, or guards with file:line; then exact tests to run.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/agents/gortex-search.md ===
 ---
 name: gortex-search
@@ -214,6 +222,14 @@ Answer the delegated code-navigation question using only Gortex.
 6. Call `capabilities` with `detail: "schema"` if an operation's exact arguments are not visible.
 
 Return the answer first, then symbol IDs and file:line evidence, then caveats. Do not dump raw tool output.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-add-test.md ===
 # Add Tests with Gortex
 
@@ -231,6 +247,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-architecture-review.md ===
 # Review Architecture with Gortex
 
@@ -247,6 +271,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-co-change.md ===
 # Analyze Co-Change with Gortex
 
@@ -263,6 +295,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-cross-repo-usage.md ===
 # Find Cross-Repository Usage with Gortex
 
@@ -280,6 +320,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-dataflow-trace.md ===
 # Trace Data Flow with Gortex
 
@@ -297,6 +345,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-debug.md ===
 # Debug with Gortex
 
@@ -314,6 +370,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-episode-replay.md ===
 # Replay a Change Episode with Gortex
 
@@ -331,6 +395,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-explore.md ===
 # Explore a Codebase with Gortex
 
@@ -347,6 +419,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-extract-function.md ===
 # Extract a Function with Gortex
 
@@ -364,6 +444,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-fix-all.md ===
 # Fix Diagnostics with Gortex
 
@@ -380,6 +468,14 @@ Return the answer first, then symbol IDs and file:line evidence, then caveats. D
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-guide.md ===
 # Gortex Guide
 
@@ -400,6 +496,14 @@ Use this sequence for codebase work:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-impact.md ===
 # Assess Change Impact with Gortex
 
@@ -417,6 +521,14 @@ Use this sequence for codebase work:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-incident-investigation.md ===
 # Investigate an Incident with Gortex
 
@@ -434,6 +546,14 @@ Use this sequence for codebase work:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-onboarding.md ===
 # Onboard to a Repository with Gortex
 
@@ -450,6 +570,14 @@ Use this sequence for codebase work:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-pr-review-agent.md ===
 # Review a Change as a Sub-Agent
 
@@ -466,6 +594,14 @@ gortex review --audience agent --format json
 ```
 
 In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actionable findings with severity and `file:line`. Do not replace graph-backed review with ad-hoc `git diff` inspection.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-pr-review.md ===
 # Review a Change with Gortex
 
@@ -483,6 +619,14 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-quality-audit.md ===
 # Audit Repository Quality with Gortex
 
@@ -499,6 +643,14 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-refactor.md ===
 # Refactor with Gortex
 
@@ -515,6 +667,14 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-rename.md ===
 # Rename a Symbol with Gortex
 
@@ -532,6 +692,14 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/commands/gortex-safe-edit.md ===
 # Make a Safe Edit with Gortex
 
@@ -548,6 +716,14 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/settings.json ===
 {
   "permissions": {
@@ -690,6 +866,14 @@ description: "Add tests for under-tested code and coverage gaps."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-architecture-review/SKILL.md ===
 ---
 name: gortex-architecture-review
@@ -710,6 +894,14 @@ description: "Graph-grounded architectural read of a repo."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-cli/SKILL.md ===
 ---
 name: gortex-cli
@@ -738,6 +930,14 @@ gortex call capabilities --arg domain=read --arg operation=source --arg detail=s
 ```
 
 The required order is `explore` → targeted `search/read/relations/trace` → pre-change `change` → `edit/refactor` → post-change `change`. Do not use shell file reads or search as a substitute.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-co-change/SKILL.md ===
 ---
 name: gortex-co-change
@@ -758,6 +958,14 @@ description: "Find what changes together and hidden coupling."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-cross-repo-usage/SKILL.md ===
 ---
 name: gortex-cross-repo-usage
@@ -779,6 +987,14 @@ description: "Find who uses a symbol across all consumer repos."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-dataflow-trace/SKILL.md ===
 ---
 name: gortex-dataflow-trace
@@ -800,6 +1016,14 @@ description: "Trace where a value flows through the code."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-debug/SKILL.md ===
 ---
 name: gortex-debug
@@ -821,6 +1045,14 @@ description: "Debug a bug, trace an error, or find why something fails."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-episode-replay/SKILL.md ===
 ---
 name: gortex-episode-replay
@@ -842,6 +1074,14 @@ description: "Reconstruct what changed in a window (postmortem, release, PR)."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-explore/SKILL.md ===
 ---
 name: gortex-explore
@@ -862,6 +1102,14 @@ description: "Understand how code works or trace an execution flow."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-extract-function/SKILL.md ===
 ---
 name: gortex-extract-function
@@ -883,6 +1131,14 @@ description: "Extract code into a function or method via LSP refactor."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-fix-all/SKILL.md ===
 ---
 name: gortex-fix-all
@@ -903,6 +1159,14 @@ description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-guide/SKILL.md ===
 ---
 name: gortex-guide
@@ -927,6 +1191,14 @@ Use this sequence for codebase work:
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-impact/SKILL.md ===
 ---
 name: gortex-impact
@@ -948,6 +1220,14 @@ description: "Assess what breaks if you change X before editing it."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-incident-investigation/SKILL.md ===
 ---
 name: gortex-incident-investigation
@@ -969,6 +1249,14 @@ description: "Walk a production symptom back to its root cause."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-onboarding/SKILL.md ===
 ---
 name: gortex-onboarding
@@ -989,6 +1277,14 @@ description: "Structured tour of an unfamiliar repo."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-pr-review-agent/SKILL.md ===
 ---
 name: gortex-pr-review-agent
@@ -1009,6 +1305,14 @@ gortex review --audience agent --format json
 ```
 
 In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actionable findings with severity and `file:line`. Do not replace graph-backed review with ad-hoc `git diff` inspection.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-pr-review/SKILL.md ===
 ---
 name: gortex-pr-review
@@ -1030,6 +1334,14 @@ description: "Graph-grounded review of a pending change or PR."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-quality-audit/SKILL.md ===
 ---
 name: gortex-quality-audit
@@ -1050,6 +1362,14 @@ description: "Repo-scale quality scan — dead code, hotspots, clones."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-refactor/SKILL.md ===
 ---
 name: gortex-refactor
@@ -1070,6 +1390,14 @@ description: "Rename, extract, split, or restructure code safely."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-rename/SKILL.md ===
 ---
 name: gortex-rename
@@ -1091,6 +1419,14 @@ description: "Rename a symbol and update every reference atomically."
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/skills/gortex-safe-edit/SKILL.md ===
 ---
 name: gortex-safe-edit
@@ -1111,6 +1447,14 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
 - Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.gortex/instructions/active.md ===
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
@@ -1129,11 +1473,14 @@ If the Gortex server is configured but these tools are missing from the callable
 
 Use `recall` before revisiting prior work. Call `remember` immediately for a durable decision, invariant, constraint, or gotcha.
 
-## Worktree views
+## Worktree and branch routing
 
-- CWD selects one coherent view. Implicit linked worktrees become overlays automatically; use `track` only for a user-requested dedicated graph.
-- An overlay shadows matching primary symbols; it does not union incompatible branches.
-- A labeled `view_building` fallback is read-only; exact-file and edit operations await a ready route. Never restart the daemon, delete its store, or re-track merely to expose a worktree.
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
 ## Reference and discovery
 
@@ -1159,11 +1506,14 @@ If the Gortex server is configured but these tools are missing from the callable
 
 Use `recall` before revisiting prior work. Call `remember` immediately for a durable decision, invariant, constraint, or gotcha.
 
-## Worktree views
+## Worktree and branch routing
 
-- CWD selects one coherent view. Implicit linked worktrees become overlays automatically; use `track` only for a user-requested dedicated graph.
-- An overlay shadows matching primary symbols; it does not union incompatible branches.
-- A labeled `view_building` fallback is read-only; exact-file and edit operations await a ready route. Never restart the daemon, delete its store, or re-track merely to expose a worktree.
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
 ## Reference and discovery
 
@@ -1210,11 +1560,14 @@ The graph remembers code; these tools remember **why you made a call**. They are
 
 **Save / store:** decisions, non-obvious constraints, invariants, follow-ups, incident learnings, bug reproductions. **Skip:** play-by-play the diff already shows, anything derivable from the graph, content already in CLAUDE.md.
 
-## Worktree views
+## Worktree and branch routing
 
-- CWD selects one coherent view. Implicit linked worktrees become overlays automatically; use `track` only for a user-requested dedicated graph.
-- An overlay shadows matching primary symbols; it does not union incompatible branches.
-- A labeled `view_building` fallback is read-only; exact-file and edit operations await a ready route. Never restart the daemon, delete its store, or re-track merely to expose a worktree.
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
 ## Reference and discovery
 
@@ -1240,11 +1593,14 @@ If the Gortex server is configured but these tools are missing from the callable
 
 Use `recall` before revisiting prior work. Call `remember` immediately for a durable decision, invariant, constraint, or gotcha.
 
-## Worktree views
+## Worktree and branch routing
 
-- CWD selects one coherent view. Implicit linked worktrees become overlays automatically; use `track` only for a user-requested dedicated graph.
-- An overlay shadows matching primary symbols; it does not union incompatible branches.
-- A labeled `view_building` fallback is read-only; exact-file and edit operations await a ready route. Never restart the daemon, delete its store, or re-track merely to expose a worktree.
+- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
+- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
+- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
+- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
 **Reference:** call `capabilities` for an exact operation schema; use `gortex://guide` only for deeper background.
 - **Profiles:** active `localization`. Broader guidance: `gortex instructions switch core` (or `full`; `list` shows all) — NEW sessions only.
