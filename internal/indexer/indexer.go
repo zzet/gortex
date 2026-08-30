@@ -2596,13 +2596,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
-	// A handle pinned to a derived payload generation is disqualified outright.
-	// The drain evicts the repository's persisted rows before its INSERT-only
-	// bulk load, and that eviction spans every generation — right for a
-	// re-track of the base corpus, and a wipe of the very corpus a sparse
-	// generation exists to leave alone. See derivedGenerationTarget.
-	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes &&
-		!derivedGenerationTarget(idx.graph)
+	// The drain replaces only the target handle's logical generation (see
+	// evictRepoCurrentGeneration), so a derived payload can take the same
+	// bounded in-memory path as generation zero without disturbing its base or
+	// sibling layers. This matters most for derived builds: keeping resolution
+	// and the repository-wide synthesis passes in the shadow avoids turning
+	// each edge lookup into a SQLite round trip before the one bounded drain.
+	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes
 
 	// Acquire a queued shadow slot before the shared repository-memory envelope.
 	// Waiting candidates therefore hold no general memory reservation. Every
@@ -2638,6 +2638,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		zap.Int64("total_file_bytes", totalFileBytes),
 		zap.Int64("shadow_max_bytes", maxShadowBytes),
 		zap.Bool("below_shadow_bytes", belowShadowBytes),
+		zap.Bool("derived_generation", derivedGenerationTarget(idx.graph)),
 		zap.Int64("shadow_weight_bytes", shadowWeight),
 		zap.Int64("shadow_process_budget_bytes", shadowStats.capacity),
 		zap.Int64("shadow_process_used_bytes", shadowStats.used),
@@ -2831,7 +2832,32 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 			}
 
+			// Edge batches can make the durable store lazily materialise a
+			// minimal builtin stub after its richer resolver-owned node was drained.
+			// Retain that finite synthetic set and replay it once after the edges so
+			// the final row has the same shape as the direct SQLite path.
+			var shadowBuiltins []*graph.Node
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
+				// Graph.AddBatch lazily materialises builtin targets. A later edge
+				// reindex can therefore replace a resolver-stamped builtin with the
+				// intentionally minimal lazy-stub shape while the payload lives in
+				// memory. The SQLite path retains the resolver's boundary fields, so
+				// restore the Indexer's boundary invariant at the shadow boundary
+				// before persisting any synthetic node.
+				for _, node := range nodes {
+					if node == nil {
+						continue
+					}
+					if node.WorkspaceID == "" {
+						node.WorkspaceID = idx.workspaceID
+					}
+					if node.ProjectID == "" {
+						node.ProjectID = idx.projectID
+					}
+					if node.Kind == graph.KindBuiltin {
+						shadowBuiltins = append(shadowBuiltins, node)
+					}
+				}
 				diskTarget.AddBatch(nodes, nil)
 				if !ftsReady || retErr != nil {
 					nodeRows := len(nodes)
@@ -2885,6 +2911,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				diskTarget.AddBatch(nil, edges)
 				edgeRows := len(edges)
 				drainPressure.afterEdgeBatch(edgeRows)
+			}
+			if len(shadowBuiltins) > 0 {
+				diskTarget.AddBatch(shadowBuiltins, nil)
+				shadowBuiltins = nil
 			}
 
 			flushStart := time.Now()
