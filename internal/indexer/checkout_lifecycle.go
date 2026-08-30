@@ -247,6 +247,12 @@ type CheckoutLifecycle struct {
 	mu        sync.RWMutex
 	watcherFn func() RepoWatcher
 	notifier  LifecycleNotifier
+	// transitionObserver is a cheap, process-local edge notification. The
+	// durable transition journal remains authoritative; the daemon uses this
+	// only to refresh its frozen startup-readiness cohort after a worker
+	// outcome instead of polling SQLite. It is copied under mu and invoked
+	// after every lifecycle lock has been released.
+	transitionObserver func(ModeTransitionEvent)
 	// gate defers build work while the daemon warms up. nil admits every
 	// build, which is what every surface that has no warmup runs with.
 	gate *ViewBuildGate
@@ -372,6 +378,40 @@ func (l *CheckoutLifecycle) SetNotifier(n LifecycleNotifier) {
 	l.mu.Lock()
 	l.notifier = n
 	l.mu.Unlock()
+}
+
+// ModeTransitionEvent is the bounded process-local fact emitted after one
+// durable promotion or demotion attempt. Error text remains in the catalog
+// and structured log; readiness only needs to know which checkout failed.
+type ModeTransitionEvent struct {
+	TransitionID string
+	CheckoutID   string
+	Failed       bool
+}
+
+// SetModeTransitionObserver installs a process-local notification for durable
+// promotion/demotion outcomes. The callback must return quickly; callers that
+// need catalog reads should coalesce the edge onto their own goroutine.
+// Passing nil detaches the observer.
+func (l *CheckoutLifecycle) SetModeTransitionObserver(observer func(ModeTransitionEvent)) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.transitionObserver = observer
+	l.mu.Unlock()
+}
+
+func (l *CheckoutLifecycle) notifyModeTransitionChanged(event ModeTransitionEvent) {
+	if l == nil {
+		return
+	}
+	l.mu.RLock()
+	observer := l.transitionObserver
+	l.mu.RUnlock()
+	if observer != nil {
+		observer(event)
+	}
 }
 
 // SetBuildGate installs the gate that holds view build work while the daemon

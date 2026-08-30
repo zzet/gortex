@@ -60,8 +60,13 @@ var warmupPhaseProgress = map[string]int{
 	"end_batch":                90,
 	"end_batch_done":           95,
 	"watcher_started":          98,
-	"ready":                    100,
-	"enrichment_complete":      100,
+	// Exact configured-Git views build after the legacy warmup gate opens.
+	// They are nearly complete but deliberately remain non-ready so zero or
+	// partial results keep their structured warming label.
+	"checkout_builds_pending": 99,
+	"degraded":                99,
+	"ready":                   100,
+	"enrichment_complete":     100,
 }
 
 // warmupExemptTools is the set of MCP tools that do NOT depend on the

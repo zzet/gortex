@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,6 +64,287 @@ var (
 	// cache via a pragma, so there is no advisory cap to honour.
 	daemonBackendBufferPoolMBIgnored uint64
 )
+
+type startupViewReadinessProbe func(context.Context, string) (daemon.TrackReadiness, error)
+
+// startupViewReadinessMonitor owns the daemon's frozen configured-Git startup
+// cohort. The first snapshot runs after Seed: paths that resolve to the legacy
+// lane are excluded, and every routed/catalog-backed path is then retained for
+// the rest of this startup even if a later probe temporarily loses its row.
+// Worker callbacks only update a tiny failure map and coalesce an edge;
+// catalog/materialization reads stay off the lifecycle worker (one explicit
+// post-Seed snapshot, then the one monitor goroutine).
+type startupViewReadinessMonitor struct {
+	paths       []string
+	changed     chan struct{}
+	initialized chan struct{}
+	initOnce    sync.Once
+	watching    chan struct{}
+	watchOnce   sync.Once
+
+	mu          sync.Mutex
+	cohort      []string
+	checkoutIDs map[string]string
+	cohortIDs   map[string]struct{}
+	frozen      bool
+	failures    map[string]struct{}
+	revision    uint64
+}
+
+func newStartupViewReadinessMonitor(paths []string) *startupViewReadinessMonitor {
+	return &startupViewReadinessMonitor{
+		paths:       append([]string(nil), paths...),
+		changed:     make(chan struct{}, 1),
+		initialized: make(chan struct{}),
+		watching:    make(chan struct{}),
+		checkoutIDs: make(map[string]string),
+		cohortIDs:   make(map[string]struct{}),
+		failures:    make(map[string]struct{}),
+	}
+}
+
+func (m *startupViewReadinessMonitor) requestRefresh() {
+	if m == nil {
+		return
+	}
+	select {
+	case m.changed <- struct{}{}:
+	default:
+	}
+}
+
+// finishInitialSnapshot is the only admission edge for the watcher. Seed and
+// the first snapshot run before it; transition events that arrive earlier are
+// retained in failures and coalesced in changed. The unconditional confirming
+// refresh closes the race with an event arriving during the initial probe.
+func (m *startupViewReadinessMonitor) finishInitialSnapshot() {
+	if m == nil {
+		return
+	}
+	m.initOnce.Do(func() { close(m.initialized) })
+	m.requestRefresh()
+}
+
+func (m *startupViewReadinessMonitor) observe(event indexer.ModeTransitionEvent) {
+	if m == nil {
+		return
+	}
+	if event.CheckoutID != "" {
+		m.mu.Lock()
+		if m.frozen {
+			_, belongs := m.cohortIDs[event.CheckoutID]
+			allIDsKnown := len(m.checkoutIDs) >= len(m.cohort)
+			if !belongs && allIDsKnown {
+				m.mu.Unlock()
+				return
+			}
+		}
+		if event.Failed {
+			m.failures[event.CheckoutID] = struct{}{}
+		} else {
+			delete(m.failures, event.CheckoutID)
+		}
+		m.revision++
+		m.mu.Unlock()
+	}
+	m.requestRefresh()
+}
+
+func (m *startupViewReadinessMonitor) snapshot(
+	ctx context.Context, probe startupViewReadinessProbe,
+) startupViewReadiness {
+	if m == nil || probe == nil {
+		return startupViewReadiness{}
+	}
+	m.mu.Lock()
+	paths := m.paths
+	if m.frozen {
+		paths = m.cohort
+	}
+	paths = append([]string(nil), paths...)
+	failures := make(map[string]struct{}, len(m.failures))
+	for checkoutID := range m.failures {
+		failures[checkoutID] = struct{}{}
+	}
+	checkoutIDs := make(map[string]string, len(m.checkoutIDs))
+	for path, checkoutID := range m.checkoutIDs {
+		checkoutIDs[path] = checkoutID
+	}
+	frozen := m.frozen
+	m.mu.Unlock()
+
+	result := startupViewReadiness{}
+	cohort := make([]string, 0, len(paths))
+	needsIDBackfill := frozen && len(checkoutIDs) < len(paths)
+	var cohortCheckoutIDs map[string]string
+	if !frozen || needsIDBackfill {
+		cohortCheckoutIDs = make(map[string]string, len(paths))
+	}
+	for _, path := range paths {
+		readiness, err := probe(ctx, path)
+		if !frozen && err == nil && readiness.State == daemon.TrackReadinessLegacy {
+			continue
+		}
+		cohort = append(cohort, path)
+		result.Expected++
+		if err != nil {
+			result.Failed++
+			continue
+		}
+		checkoutID := ""
+		if readiness.View != nil {
+			checkoutID = readiness.View.CheckoutID
+		}
+		if checkoutID == "" {
+			checkoutID = checkoutIDs[path]
+		}
+		if checkoutID != "" && cohortCheckoutIDs != nil {
+			cohortCheckoutIDs[path] = checkoutID
+		}
+		if _, failed := failures[checkoutID]; checkoutID != "" && failed {
+			result.Failed++
+			continue
+		}
+		switch readiness.State {
+		case daemon.TrackReadinessReady:
+			result.Ready++
+		case daemon.TrackReadinessFailed:
+			result.Failed++
+		default:
+			result.Building++
+		}
+	}
+	if !frozen {
+		m.mu.Lock()
+		if !m.frozen {
+			m.cohort = append([]string(nil), cohort...)
+			m.checkoutIDs = cohortCheckoutIDs
+			m.cohortIDs = make(map[string]struct{}, len(cohortCheckoutIDs))
+			for _, checkoutID := range cohortCheckoutIDs {
+				m.cohortIDs[checkoutID] = struct{}{}
+			}
+			for checkoutID := range m.failures {
+				if _, belongs := m.cohortIDs[checkoutID]; !belongs {
+					delete(m.failures, checkoutID)
+				}
+			}
+			m.frozen = true
+		}
+		m.mu.Unlock()
+	} else if needsIDBackfill && len(cohortCheckoutIDs) > 0 {
+		// A path that was catalog-pending at the post-Seed snapshot may not
+		// have exposed its checkout ID yet. Backfill it once available so later
+		// transition edges can be filtered without losing this cohort member.
+		m.mu.Lock()
+		for path, checkoutID := range cohortCheckoutIDs {
+			m.checkoutIDs[path] = checkoutID
+		}
+		m.cohortIDs = make(map[string]struct{}, len(m.checkoutIDs))
+		for _, checkoutID := range m.checkoutIDs {
+			if checkoutID != "" {
+				m.cohortIDs[checkoutID] = struct{}{}
+			}
+		}
+		m.mu.Unlock()
+	}
+	return result
+}
+
+func (m *startupViewReadinessMonitor) currentRevision() uint64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.revision
+}
+
+func configuredStartupPaths(state *daemonState) []string {
+	if state == nil || state.configManager == nil {
+		return nil
+	}
+	entries := state.configManager.RepoEntries()
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		path := entry.Path
+		if absolute, err := filepath.Abs(path); err == nil {
+			path = absolute
+		}
+		paths = append(paths, filepath.Clean(path))
+	}
+	return paths
+}
+
+func publishStartupViewReadiness(
+	state *daemonState, controller *realController,
+) {
+	if controller == nil || !controller.referenceReady.Load() {
+		return
+	}
+	phase := "ready"
+	extra := map[string]any{"queryable": controller.IsReady()}
+	if controller.IsEnriched() {
+		phase = "enrichment_complete"
+		extra["enriched"] = true
+	}
+	// publishReadinessPhase applies the same controller filter used by every
+	// warmup phase, converting this candidate into pending/degraded until the
+	// exact-view cohort is complete.
+	publishReadinessPhase(state, phase, true, extra)
+}
+
+func watchStartupViewReadiness(
+	ctx context.Context,
+	state *daemonState,
+	controller *realController,
+	monitor *startupViewReadinessMonitor,
+	probe startupViewReadinessProbe,
+) {
+	if monitor == nil || controller == nil || probe == nil {
+		return
+	}
+	monitor.watchOnce.Do(func() { close(monitor.watching) })
+	select {
+	case <-ctx.Done():
+		return
+	case <-monitor.initialized:
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-monitor.changed:
+			for {
+				revision := monitor.currentRevision()
+				snapshot := monitor.snapshot(ctx, probe)
+				controller.setStartupViewReadiness(snapshot)
+				publishStartupViewReadiness(state, controller)
+				if !snapshot.complete() {
+					break
+				}
+				if monitor.currentRevision() != revision {
+					continue
+				}
+				// An event that landed while the confirming probe ran already
+				// updated failures before it queued this edge. Consume it before
+				// choosing the completion linearization point, and re-probe now
+				// rather than waiting for a third event that may never arrive.
+				select {
+				case <-monitor.changed:
+					continue
+				default:
+				}
+				if monitor.currentRevision() != revision {
+					continue
+				}
+				if state != nil && state.lifecycle != nil {
+					state.lifecycle.SetModeTransitionObserver(nil)
+				}
+				return
+			}
+		}
+	}
+}
 
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
@@ -271,6 +553,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		lifecycle:     state.lifecycle,
 		logger:        logger,
 	}
+	state.readinessFilter = controller.filterReadinessPhase
+	startupReadiness := newStartupViewReadinessMonitor(configuredStartupPaths(state))
+	startupReadinessCtx, cancelStartupReadiness := context.WithCancel(context.Background())
+	state.lifecycle.SetModeTransitionObserver(startupReadiness.observe)
+	var startupReadinessWG sync.WaitGroup
 	if state.mcpServer != nil {
 		srv := state.mcpServer
 		controller.toolSurface = func() (string, string, int) {
@@ -309,6 +596,18 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		return nil
 	})
 	defer runTeardown()
+	startupReadinessWG.Add(1)
+	go func() {
+		defer startupReadinessWG.Done()
+		watchStartupViewReadiness(
+			startupReadinessCtx, state, controller, startupReadiness, controller.TrackReadiness,
+		)
+	}()
+	defer func() {
+		state.lifecycle.SetModeTransitionObserver(nil)
+		cancelStartupReadiness()
+		startupReadinessWG.Wait()
+	}()
 	srv.Controller = controller
 	// Surface warmup state on the handshake ack: a proxy / CLI that connects
 	// during the (minutes-long) warmup should know the graph is still filling
@@ -548,6 +847,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				logger.Warn("daemon: seeding the checkout catalog was incomplete", zap.Error(err))
 			}
 		}
+		startupSnapshot := startupReadiness.snapshot(startupReadinessCtx, controller.TrackReadiness)
+		controller.setStartupViewReadiness(startupSnapshot)
+		startupReadiness.finishInitialSnapshot()
 		// markReady fires once references are resolved and the graph is
 		// queryable — ahead of the slow enrichment pass — so clients can
 		// start issuing find_usages / get_callers immediately. Enrichment

@@ -135,10 +135,16 @@ type realController struct {
 	// Background timers that must not fight the enrichment pipeline for
 	// shard locks (the periodic snapshotter) gate on enriched, not ready.
 	// enrichSeconds records the full warmup duration.
-	ready         atomic.Bool
-	warmupSeconds atomic.Int64
-	enriched      atomic.Bool
-	enrichSeconds atomic.Int64
+	// referenceReady is the legacy parse/resolve half of readiness. A cold
+	// daemon may finish that half with zero legacy jobs while configured Git
+	// repositories are still building their exact dedicated views, so ready is
+	// the conjunction of this bit and startupViews.complete().
+	referenceReady atomic.Bool
+	startupViews   atomic.Pointer[startupViewReadiness]
+	ready          atomic.Bool
+	warmupSeconds  atomic.Int64
+	enriched       atomic.Bool
+	enrichSeconds  atomic.Int64
 
 	// lastAggregate is the mutex-guarded half of the last status pass that
 	// managed to take mu: the repo table, the workspace rollup and the rest
@@ -148,6 +154,81 @@ type realController struct {
 	// Atomic, deliberately not guarded by mu: the entire point of the cache
 	// is to be readable while a minutes-long track holds mu.
 	lastAggregate atomic.Pointer[statusAggregate]
+}
+
+// startupViewReadiness is the frozen configured-Git cohort captured after
+// checkout catalog seeding. Counts describe exact routed views, never corpus
+// node counts; Failed is an exclusive terminal-attempt subset of Expected.
+type startupViewReadiness struct {
+	Expected int
+	Ready    int
+	Building int
+	Failed   int
+}
+
+func (s startupViewReadiness) complete() bool {
+	return s.Expected == 0 || s.Ready >= s.Expected
+}
+
+func (c *realController) startupViewReadiness() startupViewReadiness {
+	if c == nil {
+		return startupViewReadiness{}
+	}
+	if snapshot := c.startupViews.Load(); snapshot != nil {
+		return *snapshot
+	}
+	// No daemon startup cohort was installed. This is the legacy/controller
+	// unit-test path and is equivalent to an expected cohort of zero.
+	return startupViewReadiness{}
+}
+
+func (c *realController) setStartupViewReadiness(snapshot startupViewReadiness) {
+	if c == nil {
+		return
+	}
+	copy := snapshot
+	c.startupViews.Store(&copy)
+	c.recomputeReady()
+}
+
+func (c *realController) recomputeReady() {
+	if c == nil {
+		return
+	}
+	c.ready.Store(c.referenceReady.Load() && c.startupViewReadiness().complete())
+}
+
+// filterReadinessPhase keeps every workspace-readiness publisher honest. The
+// warmup pipeline has several post-resolve phases that historically carried a
+// hard-coded ready=true; a pending exact-view cohort must downgrade all of
+// them until the transition worker publishes every configured Git route.
+func (c *realController) filterReadinessPhase(
+	phase string, ready bool, extra map[string]any,
+) (string, bool, map[string]any) {
+	if c == nil || !ready {
+		return phase, ready, extra
+	}
+	snapshot := c.startupViewReadiness()
+	if snapshot.complete() {
+		return phase, c.IsReady(), extra
+	}
+	filtered := make(map[string]any, len(extra)+4)
+	for key, value := range extra {
+		filtered[key] = value
+	}
+	filtered["startup_views_expected"] = snapshot.Expected
+	filtered["startup_views_ready"] = snapshot.Ready
+	filtered["startup_views_building"] = snapshot.Building
+	filtered["startup_views_failed"] = snapshot.Failed
+	// Several legacy warmup callers supplied these facts before exact startup
+	// views existed. At the combined workspace boundary they are false until
+	// the frozen cohort is complete.
+	filtered["queryable"] = false
+	filtered["enriched"] = false
+	if snapshot.Failed > 0 {
+		return "degraded", false, filtered
+	}
+	return "checkout_builds_pending", false, filtered
 }
 
 // Track indexes a new repository and persists it to the global config.
@@ -1856,7 +1937,8 @@ func (c *realController) StopWatcher() {
 // call concurrently with Status (atomic loads on the read side).
 func (c *realController) MarkReady(d time.Duration) {
 	c.warmupSeconds.Store(int64(d.Seconds()))
-	c.ready.Store(true)
+	c.referenceReady.Store(true)
+	c.recomputeReady()
 }
 
 // IsReady reports whether the graph is resolved and queryable. The socket
@@ -1868,12 +1950,14 @@ func (c *realController) IsReady() bool {
 
 // MarkEnriched flips the enrichment-complete flag once semantic enrichment
 // and the graph-wide derivation passes finish in the background, recording
-// the full warmup duration. It also sets ready, so the degenerate path where
-// MarkReady was skipped still reports a usable daemon.
+// the full warmup duration. It also completes the reference half of readiness,
+// so the degenerate path where MarkReady was skipped remains usable; it cannot
+// bypass a configured-Git startup cohort whose exact views are still building.
 func (c *realController) MarkEnriched(d time.Duration) {
 	c.enrichSeconds.Store(int64(d.Seconds()))
 	c.enriched.Store(true)
-	c.ready.Store(true)
+	c.referenceReady.Store(true)
+	c.recomputeReady()
 }
 
 // IsEnriched reports whether the background enrichment + derivation passes

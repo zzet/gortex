@@ -46,6 +46,8 @@ func TestWarmupStateFromSnapshot_PhaseProgress(t *testing.T) {
 		"end_batch",
 		"end_batch_done",
 		"watcher_started",
+		"checkout_builds_pending",
+		"degraded",
 	}
 	prev := 0
 	for _, phase := range order {

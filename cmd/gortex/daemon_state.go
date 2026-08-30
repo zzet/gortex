@@ -43,6 +43,10 @@ type daemonState struct {
 	// tools and the janitor all drive this one instance.
 	lifecycle *indexer.CheckoutLifecycle
 	mcpServer *gortexmcp.Server
+	// readinessFilter composes the legacy/reference warmup phases with the
+	// daemon's frozen configured-Git exact-view cohort. nil preserves the
+	// single-process and test paths that have no daemon controller.
+	readinessFilter func(string, bool, map[string]any) (string, bool, map[string]any)
 	// proxyHydrator lazily fills cross-daemon proxy-edge nodes from the
 	// owning remote's /v1/subgraph. nil unless federation.edges is on;
 	// the read path hydrates a proxy target before traversing it.
@@ -1257,6 +1261,9 @@ func logRepoOwnershipAudit(g graph.Store, logger *zap.Logger) {
 func publishReadinessPhase(state *daemonState, phase string, ready bool, extra map[string]any) {
 	if state == nil || state.mcpServer == nil {
 		return
+	}
+	if state.readinessFilter != nil {
+		phase, ready, extra = state.readinessFilter(phase, ready, extra)
 	}
 	state.mcpServer.PublishReadiness(phase, ready, extra)
 }

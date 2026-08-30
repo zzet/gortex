@@ -175,6 +175,11 @@ func (l *CheckoutLifecycle) runModeTransitionWorker() {
 				l.logger.Warn("checkout lifecycle: could not refill mode transition queue",
 					zap.Error(err))
 			}
+			l.notifyModeTransitionChanged(ModeTransitionEvent{
+				TransitionID: run.transition.TransitionID,
+				CheckoutID:   run.transition.CheckoutID,
+				Failed:       run.outcome.err != nil,
+			})
 		}
 	}
 }
