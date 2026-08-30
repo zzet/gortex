@@ -474,6 +474,48 @@ func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("read repository family = found:%v err:%v", found, err)
 	}
+	baseGenerationID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: "primary-graph",
+		LayerID: "legacy-demotion-base", CheckoutID: "co-primary",
+		GenerationKind: "dedicated_base", TreeOID: "legacy-base-tree",
+		State: store_sqlite.ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed demotion base: %v", err)
+	}
+	primary, found, err := f.catalog.GetDedicatedGraph(ctx, "primary-graph")
+	if err != nil || !found {
+		t.Fatalf("read primary graph = found:%v err:%v", found, err)
+	}
+	primary.ActiveGenerationID = baseGenerationID
+	if err := f.catalog.UpsertDedicatedGraph(ctx, primary); err != nil {
+		t.Fatalf("activate demotion base: %v", err)
+	}
+	commitGenerationID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: "primary-graph",
+		LayerID: "legacy-demotion-commit", CheckoutID: "co-1",
+		GenerationKind: "checkout_commit", BaseGenerationID: baseGenerationID,
+		TreeOID: "legacy-head-tree", State: store_sqlite.ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed demotion commit: %v", err)
+	}
+	dirtyGenerationID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: "primary-graph",
+		LayerID: "legacy-demotion-dirty", CheckoutID: "co-1",
+		GenerationKind: "checkout_dirty", BaseGenerationID: commitGenerationID,
+		State: store_sqlite.ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed demotion dirty: %v", err)
+	}
+	expectedRoute := store_sqlite.CheckoutRoute{
+		CheckoutID: "co-1", GraphID: "graph-1", RouteEpoch: 3,
+		State: store_sqlite.RouteActive,
+	}
+	if err := f.catalog.UpsertCheckoutRoute(ctx, expectedRoute); err != nil {
+		t.Fatalf("seed demotion route: %v", err)
+	}
 	if err := f.catalog.CommitAuthorizedDemotion(ctx, store_sqlite.CommitAuthorizedDemotionRequest{
 		CheckoutID:           "co-1",
 		Incarnation:          "inc-1",
@@ -483,6 +525,10 @@ func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
 		PrimaryGraphID:       "primary-graph",
 		ExpectedPrimaryEpoch: family.PrimaryEpoch,
 		RequiredPrimaryState: GraphStateReady,
+		ExpectedRoute:        expectedRoute,
+		RouteExists:          true,
+		CommitGenerationID:   commitGenerationID,
+		DirtyGenerationID:    dirtyGenerationID,
 		State:                store_sqlite.CheckoutStateReady,
 		LastSeen:             1,
 		Cleanup:              &cleanup,

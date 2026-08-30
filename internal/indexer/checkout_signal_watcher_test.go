@@ -376,6 +376,43 @@ func TestCheckoutLifecycleSourceSignalWatcherAttachDropAndReusableClose(t *testi
 	}
 }
 
+func TestCheckoutLifecycleSourceSignalWatcherAdmissionFailureDoesNotLeak(t *testing.T) {
+	root := t.TempDir()
+	missingRoot := filepath.Join(root, "missing")
+	factory := &fakeCheckoutSourceSignalFactory{}
+	coordinator := &CheckoutCoordinator{root: missingRoot, graphID: "primary"}
+	watchers := newCheckoutSourceSignalWatcherSet(factory.New, func(checkoutSourceSignalIdentity) bool {
+		return true
+	}, func(string, string) bool { return true }, zap.NewNop())
+	lifecycle := &CheckoutLifecycle{
+		logger:                 zap.NewNop(),
+		coordinators:           map[string]*CheckoutCoordinator{"automatic-checkout": coordinator},
+		checkoutSignalWatchers: watchers,
+	}
+	checkout := store_sqlite.Checkout{
+		CheckoutID:    "automatic-checkout",
+		FamilyID:      "family",
+		RootPath:      missingRoot,
+		State:         store_sqlite.CheckoutStateReady,
+		EffectiveMode: store_sqlite.CheckoutModeAutomatic,
+	}
+
+	lifecycle.ensureCheckoutSourceSignalWatcher(checkout, "primary")
+	if got := watchers.Len(); got != 0 {
+		t.Fatalf("live source watchers after failed admission = %d, want 0", got)
+	}
+	if got := factory.Count(); got != 0 {
+		t.Fatalf("backend creations after failed admission = %d, want 0", got)
+	}
+	lifecycle.coordMu.Lock()
+	retained := lifecycle.coordinators[checkout.CheckoutID]
+	lifecycle.coordMu.Unlock()
+	if retained != coordinator {
+		t.Fatal("source watcher admission failure rolled back the polling coordinator")
+	}
+	watchers.StopAll()
+}
+
 func BenchmarkCheckoutSourceSignalWatcherStableEnsure(b *testing.B) {
 	for _, roots := range []int{1, 8, 64} {
 		b.Run(fmt.Sprintf("roots_%d", roots), func(b *testing.B) {

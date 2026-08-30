@@ -657,7 +657,7 @@ func (l *CheckoutLifecycle) recordCheckout(
 	// worker removes the dedicated corpus. On restart that stale entry must not
 	// resurrect the intent the durable transition already revoked.
 	restoreExplicitIntent := source != TrackSourceImplicit &&
-		!(seeding && existing != nil && existing.ActiveIntentTransitionID != "")
+		(!seeding || existing == nil || existing.ActiveIntentTransitionID == "")
 	if restoreExplicitIntent {
 		intent := store_sqlite.TrackingIntent{
 			IntentID:      uuid.NewV7().String(),
@@ -819,41 +819,6 @@ func (l *CheckoutLifecycle) confirmPresent(
 		return err
 	}
 	return nil
-}
-
-// claimDedicated makes an identity somebody has just tracked explicitly a
-// dedicated checkout.
-//
-// A worktree the reconciler observed before anyone asked for it is minted
-// automatic: it is served from the family's primary corpus through a composed
-// view. An explicit track says the opposite — this working copy is to have a
-// corpus of its own — and the mode is what the rest of the daemon reads to
-// decide which of the two a checkout gets. Registering over an adopted
-// identity without moving the mode would index the repository and then keep
-// serving it from someone else's graph.
-//
-// A lost incarnation guard is not an error: another actor re-keyed the row, so
-// the identity this registration read is not the current one and the next pass
-// records the mode against the row that is.
-func (l *CheckoutLifecycle) claimDedicated(
-	ctx context.Context, existing store_sqlite.Checkout, now time.Time,
-) error {
-	if existing.DesiredMode == store_sqlite.CheckoutModeDedicated &&
-		existing.EffectiveMode == store_sqlite.CheckoutModeDedicated {
-		return nil
-	}
-	err := l.catalog.UpdateCheckoutState(ctx, store_sqlite.UpdateCheckoutStateRequest{
-		CheckoutID:    existing.CheckoutID,
-		Incarnation:   existing.Incarnation,
-		State:         store_sqlite.CheckoutStateReady,
-		DesiredMode:   store_sqlite.CheckoutModeDedicated,
-		EffectiveMode: store_sqlite.CheckoutModeDedicated,
-		LastSeen:      now.Unix(),
-	})
-	if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-		return nil
-	}
-	return err
 }
 
 // bindDedicatedGraph binds a checkout to the repo prefix its nodes live
@@ -1218,14 +1183,23 @@ type ReloadResult struct {
 	Refreshed int
 }
 
+type reloadRetireDisposition uint8
+
+const (
+	reloadRetireRemoved reloadRetireDisposition = iota + 1
+	reloadRetireDemoted
+	reloadRetirePending
+)
+
 // ApplyReload brings the tracked set in line with the configuration file.
 //
 // Additions go through the registration helper, so a repository added by
 // editing the config gets the same identity, watcher and invalidation an
-// explicit track would have given it. Removals go through the reconciler's
-// retirement rule rather than a direct eviction: an entry that cannot be
-// dropped safely records a pending transition and stays, which is what stops
-// a configuration edit from silently deleting a corpus.
+// explicit track would have given it. Removals use the same guarded demotion
+// transaction as explicit untrack when a family primary can serve the live
+// checkout. An entry that cannot be dropped safely records a pending
+// transition and stays, which is what stops a configuration edit from silently
+// deleting a corpus.
 func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, error) {
 	if l == nil || l.mi == nil || l.cfgMgr == nil {
 		return ReloadResult{}, errors.New("indexer: checkout lifecycle is not wired for reload")
@@ -1280,21 +1254,24 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 			continue
 		}
 		switch outcome {
-		case reconcile.OutcomeTransitionPending:
+		case reloadRetirePending:
 			out.Pending++
-		default:
+		case reloadRetireRemoved:
 			out.Removed++
+		case reloadRetireDemoted:
+			// A live checkout remains tracked as an automatic overlay. It
+			// therefore counts as neither a removal nor pending work.
 		}
 	}
 	return out, nil
 }
 
-// retireOnReload applies the reconciler's retirement rule to one prefix that
+// retireOnReload applies the overlay-aware retirement rule to one prefix that
 // left the configuration.
-func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (reconcile.RetireOutcome, error) {
+func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (reloadRetireDisposition, error) {
 	checkout, err := l.checkoutForPrefix(ctx, prefix)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	if checkout == nil {
 		// No identity to reason about — a store without a catalog, or a
@@ -1302,20 +1279,45 @@ func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (
 		// behaviour is what stops such a repository from becoming
 		// impossible to remove.
 		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
-			return "", err
+			return 0, err
 		}
-		return reconcile.OutcomeForgotten, nil
+		return reloadRetireRemoved, nil
+	}
+	// RetireCheckout predates automatic overlay views: its demotable branch
+	// intentionally forgets a non-primary checkout. Reload must instead use
+	// the same guarded demotion transaction as explicit untrack so removing a
+	// config entry revokes dedicated intent without deleting the live
+	// worktree, its watcher, or its automatic route.
+	preview, err := l.PreviewUntrack(ctx, checkout.RootPath)
+	if err != nil {
+		return 0, err
+	}
+	if preview.Plan == UntrackPlanDemote {
+		result, err := l.ApplyUntrack(ctx, preview)
+		if err != nil {
+			return 0, err
+		}
+		if result.Pending {
+			return reloadRetirePending, nil
+		}
+		if !result.Demoted {
+			return 0, fmt.Errorf("indexer: reload demotion of %s completed without changing mode", prefix)
+		}
+		return reloadRetireDemoted, nil
 	}
 	outcome, err := l.rec.RetireCheckout(ctx, checkout.CheckoutID, checkout.Incarnation, "reload_removed_from_config")
 	if err != nil {
-		return "", err
+		return 0, err
 	}
-	if outcome == reconcile.OutcomeForgotten && l.mi.GetMetadata(prefix) != nil {
+	if outcome == reconcile.OutcomeTransitionPending {
+		return reloadRetirePending, nil
+	}
+	if l.mi.GetMetadata(prefix) != nil {
 		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
-			return outcome, err
+			return 0, err
 		}
 	}
-	return outcome, nil
+	return reloadRetireRemoved, nil
 }
 
 // --- periodic sweep -----------------------------------------------------
@@ -1994,6 +1996,45 @@ func (l *CheckoutLifecycle) installCoordinatorWithHead(
 	// the gauge stale until the next install or drop.
 	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
 	l.coordMu.Unlock()
+	return true
+}
+
+// replaceCoordinator publishes coordinator in place of the exact coordinator
+// captured by a transition. Demotion builds and routes the replacement before
+// its catalog flip, so dropping the old
+// coordinator first would both create an avoidable publication gap and stop
+// language-server workspaces the replacement still uses.
+//
+// Any other current coordinator wins the race. It was published by a newer
+// transition; the stale replacement is closed without disturbing it.
+func (l *CheckoutLifecycle) replaceCoordinator(
+	checkoutID string,
+	expected, coordinator *CheckoutCoordinator,
+) bool {
+	if l == nil || coordinator == nil {
+		return false
+	}
+
+	l.coordMu.Lock()
+	previous := l.coordinators[checkoutID]
+	if previous != expected {
+		l.coordMu.Unlock()
+		_ = coordinator.Close()
+		l.oweRetirement(coordinator.DrainRetirements()...)
+		return false
+	}
+	l.coordinators[checkoutID] = coordinator
+	delete(l.coordinatorHeads, checkoutID)
+	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
+	l.coordMu.Unlock()
+
+	// Source-watcher admission validates the currently published coordinator,
+	// so retire the old registration before the caller publishes the new one.
+	l.dropCheckoutSourceSignalWatcher(checkoutID)
+	if previous != nil {
+		_ = previous.Close()
+		l.oweRetirement(previous.DrainRetirements()...)
+	}
 	return true
 }
 
@@ -2890,10 +2931,6 @@ func (l *CheckoutLifecycle) EnsureConfiguredWatchers(ctx context.Context) error 
 		}
 	}
 	return errors.Join(failures...)
-}
-
-func (l *CheckoutLifecycle) attachWatcher(prefix string) {
-	l.attachWatcherContext(context.Background(), prefix)
 }
 
 func (l *CheckoutLifecycle) attachWatcherContext(ctx context.Context, prefix string) {

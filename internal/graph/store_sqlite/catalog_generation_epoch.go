@@ -50,6 +50,9 @@ func (c *Catalog) InstallCheckoutRouteForBase(
 	}
 
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkoutRouteGraphAuthorizedTx(ctx, tx, req.CheckoutID, req.GraphID); err != nil {
+			return err
+		}
 		active, err := graphBaseGenerationIsActiveTx(
 			ctx, tx, req.GraphID, req.ExpectedBaseGenerationID)
 		if err != nil {
@@ -90,6 +93,9 @@ func (c *Catalog) CommitCheckoutStack(ctx context.Context, req CommitCheckoutSta
 	}
 
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkoutRouteGraphAuthorizedTx(ctx, tx, req.CheckoutID, req.GraphID); err != nil {
+			return err
+		}
 		active, err := graphBaseGenerationIsActiveTx(ctx, tx, req.GraphID, req.ExpectedBaseGenerationID)
 		if err != nil {
 			return err
@@ -157,6 +163,51 @@ VALUES (?, ?, ?, ?, 0, ?)`, req.CheckoutID, req.GraphID,
 		}
 		return err
 	})
+}
+
+// checkoutRouteGraphAuthorizedTx prevents a coordinator left behind by a mode
+// transition from moving an automatic checkout back onto its retired private
+// graph. Dedicated checkouts may still route to their own graph; automatic
+// checkouts may only name the family's designated primary.
+func checkoutRouteGraphAuthorizedTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	checkoutID, graphID string,
+) error {
+	var effectiveMode, familyID string
+	err := tx.QueryRowContext(ctx, `
+SELECT effective_mode, family_id FROM checkouts WHERE checkout_id = ?`, checkoutID).Scan(
+		&effectiveMode, &familyID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: checkout %s cannot be routed", ErrCatalogStaleGuard, checkoutID)
+	}
+	if err != nil {
+		return err
+	}
+	if CheckoutMode(effectiveMode) != CheckoutModeAutomatic {
+		return nil
+	}
+
+	var primaryGraphID string
+	err = tx.QueryRowContext(ctx, `
+SELECT graph_id
+  FROM dedicated_graphs
+	 WHERE family_id = ? AND is_primary_base = 1`, familyID).Scan(&primaryGraphID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Legacy/unscoped catalog fixtures can predate family-primary rows. Once
+		// a family has a designation, every automatic writer below is fenced to
+		// it; without one there is no primary identity to compare against.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if graphID != primaryGraphID {
+		return fmt.Errorf("%w: automatic checkout %s cannot route to non-primary graph %s",
+			ErrCatalogStaleGuard, checkoutID, graphID)
+	}
+	return nil
 }
 
 func graphBaseGenerationIsActiveTx(

@@ -1759,13 +1759,52 @@ func TestCatalogAuthorizedDemotionPreservesTransitionUntilCleanupCompletes(t *te
 	}
 	for _, graph := range []DedicatedGraph{
 		{GraphID: "primary-graph", OwnerCheckoutID: "primary-wt", RepoPrefix: "/tmp/primary-wt",
-			FamilyID: "fam-demote", IsPrimaryBase: true, State: "ready"},
+			FamilyID: "fam-demote", IsPrimaryBase: true, State: DedicatedGraphStateReady},
 		{GraphID: "demoted-graph", OwnerCheckoutID: "demoted-wt", RepoPrefix: "/tmp/demoted-wt",
-			FamilyID: "fam-demote", State: "ready"},
+			FamilyID: "fam-demote", State: DedicatedGraphStateReady},
 	} {
 		if err := catalog.UpsertDedicatedGraph(ctx, graph); err != nil {
 			t.Fatal(err)
 		}
+	}
+	baseGenerationID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind: checkoutGenerationOwnerKind, GraphID: "primary-graph",
+		LayerID: "demotion-primary-base", CheckoutID: "primary-wt",
+		GenerationKind: "dedicated_base", TreeOID: "7ee7", State: ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.UpsertDedicatedGraph(ctx, DedicatedGraph{
+		GraphID: "primary-graph", OwnerCheckoutID: "primary-wt", RepoPrefix: "/tmp/primary-wt",
+		FamilyID: "fam-demote", IsPrimaryBase: true, ActiveGenerationID: baseGenerationID,
+		State: DedicatedGraphStateReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	commitGenerationID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind: checkoutGenerationOwnerKind, GraphID: "primary-graph",
+		LayerID: "demotion-commit", CheckoutID: "demoted-wt",
+		GenerationKind: "checkout_commit", BaseGenerationID: baseGenerationID,
+		TreeOID: "7ee7", State: ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirtyGenerationID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind: checkoutGenerationOwnerKind, GraphID: "primary-graph",
+		LayerID: "demotion-dirty", CheckoutID: "demoted-wt",
+		GenerationKind: "checkout_dirty", BaseGenerationID: commitGenerationID,
+		State: ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRoute := CheckoutRoute{
+		CheckoutID: "demoted-wt", GraphID: "demoted-graph", RouteEpoch: 4, State: RouteActive,
+	}
+	if err := catalog.UpsertCheckoutRoute(ctx, expectedRoute); err != nil {
+		t.Fatal(err)
 	}
 	transition := IntentTransition{
 		TransitionID: "demotion-transition", CheckoutID: "demoted-wt",
@@ -1780,7 +1819,10 @@ func TestCatalogAuthorizedDemotionPreservesTransitionUntilCleanupCompletes(t *te
 	if err := catalog.CommitAuthorizedDemotion(ctx, CommitAuthorizedDemotionRequest{
 		CheckoutID: "demoted-wt", Incarnation: "demoted-inc", FamilyID: "fam-demote",
 		TransitionID: transition.TransitionID, OwnedGraphID: "demoted-graph",
-		PrimaryGraphID: "primary-graph", ExpectedPrimaryEpoch: 7, RequiredPrimaryState: "ready",
+		PrimaryGraphID: "primary-graph", ExpectedPrimaryEpoch: 7,
+		RequiredPrimaryState: DedicatedGraphStateReady,
+		ExpectedRoute:        expectedRoute, RouteExists: true,
+		CommitGenerationID: commitGenerationID, DirtyGenerationID: dirtyGenerationID,
 		State: CheckoutStateReady, LastSeen: 3,
 	}); err != nil {
 		t.Fatal(err)

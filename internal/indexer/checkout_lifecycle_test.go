@@ -620,6 +620,7 @@ func TestCheckoutLifecycleReloadDiff(t *testing.T) {
 	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: main, Name: "reload-main"}))
 	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: worktree, Name: "reload-wt"}))
 	require.NoError(t, gc.Save())
+	require.NoError(t, f.cm.Reload())
 
 	added, err := f.lc.ApplyReload(ctx)
 	require.NoError(t, err)
@@ -627,29 +628,48 @@ func TestCheckoutLifecycleReloadDiff(t *testing.T) {
 	assert.Equal(t, 0, added.Removed)
 	f.assertRegistered("reload-main", main, TrackSourceConfig)
 	f.assertRegistered("reload-wt", worktree, TrackSourceConfig)
-	require.True(t, f.familyOf("reload-main").IsPrimaryBase,
+	mainGraph := f.familyOf("reload-main")
+	require.True(t, mainGraph.IsPrimaryBase,
 		"the first checkout registered holds the family's primary base")
 	require.False(t, f.familyOf("reload-wt").IsPrimaryBase)
+	worktreeCheckout := f.checkoutOf("reload-wt")
 
 	// The worktree is a live non-primary checkout of a family that has a
 	// ready primary, so dropping explicit intent demotes it to an automatic
 	// overlay instead of making the live checkout disappear.
 	require.NoError(t, gc.RemoveRepo(worktree))
 	require.NoError(t, gc.Save())
+	require.NoError(t, f.cm.Reload())
 	removed, err := f.lc.ApplyReload(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, removed.Removed)
 	assert.Equal(t, 0, removed.Pending)
-	assert.NotNil(t, f.mi.GetMetadata("reload-wt"),
-		"revoking explicit intent leaves the live checkout as an automatic overlay")
-	assert.True(t, f.watcher.isAttached("reload-wt"),
-		"revoking explicit intent keeps the live automatic overlay watched")
+	assert.Nil(t, f.mi.GetMetadata("reload-wt"),
+		"the retired dedicated coordination shell leaves the ordinary tracked set")
+	assert.False(t, f.watcher.isAttached("reload-wt"),
+		"the dedicated watcher is detached; the automatic coordinator owns source watching")
+	demoted, found, err := f.catalog.GetCheckout(ctx, worktreeCheckout.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "revoking explicit intent keeps the automatic checkout identity")
+	assert.Equal(t, store_sqlite.CheckoutModeAutomatic, demoted.DesiredMode)
+	assert.Equal(t, store_sqlite.CheckoutModeAutomatic, demoted.EffectiveMode)
+	_, ownsDedicatedGraph, err := f.catalog.GetDedicatedGraphByOwner(ctx, demoted.CheckoutID)
+	require.NoError(t, err)
+	assert.False(t, ownsDedicatedGraph,
+		"the automatic overlay no longer owns the retired dedicated graph")
+	route, routed, err := f.catalog.GetCheckoutRoute(ctx, demoted.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, routed, "the automatic checkout remains queryable through a composed route")
+	assert.Equal(t, mainGraph.GraphID, route.GraphID)
+	assert.True(t, f.lc.SignalCheckout(demoted.CheckoutID, "reload-test"),
+		"the automatic checkout keeps its coordinator")
 
 	// The main checkout owns the family's primary base: nothing is left to
 	// serve it from, so its removal is recorded and NOT applied.
 	mainCheckout := f.checkoutOf("reload-main")
 	require.NoError(t, gc.RemoveRepo(main))
 	require.NoError(t, gc.Save())
+	require.NoError(t, f.cm.Reload())
 	pending, err := f.lc.ApplyReload(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, pending.Removed)
@@ -669,6 +689,11 @@ func TestCheckoutLifecycleReloadDiff(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, repeat.Pending)
 	assert.NotNil(t, f.mi.GetMetadata("reload-main"))
+	_, found, err = f.catalog.GetCheckout(ctx, worktreeCheckout.CheckoutID)
+	require.NoError(t, err)
+	assert.True(t, found,
+		"later reloads do not retire an automatic overlay merely because it is absent from config")
+	assert.True(t, f.lc.SignalCheckout(worktreeCheckout.CheckoutID, "reload-repeat"))
 }
 
 // TestCheckoutLifecycleSweepRemovesVanishedWorktree is the janitor path: a

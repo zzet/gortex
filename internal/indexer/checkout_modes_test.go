@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sgtdi/fswatcher"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -527,7 +528,11 @@ func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
 	gate.Open()
 	release, err := gate.Acquire(ctx, ViewBuildInteractive)
 	require.NoError(t, err)
-	defer release()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	f.lc.SetBuildGate(gate)
 	indexed := make(chan struct{}, 1)
 	f.lc.indexBarrier = func() { indexed <- struct{}{} }
@@ -553,7 +558,7 @@ func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
 	assert.Equal(t, store_sqlite.IntentTransitionPending, standing.State)
 
 	release()
-	release = func() {}
+	release = nil
 	retry, retryRun, err := f.lc.startPromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
 	require.NoError(t, err)
 	require.NotNil(t, retryRun)
@@ -923,6 +928,33 @@ func TestUntrackDemotesADedicatedWorktree(t *testing.T) {
 	defer f.close()
 	ctx := context.Background()
 
+	// Replace the automatically discovered worktree's live backend with a
+	// deterministic source watcher. The ready notification is recorded but not
+	// forwarded, so the later source event is the only signal that can publish
+	// the new dirty file before the 15-second polling fallback.
+	f.lc.stopCheckoutSourceSignalWatchers()
+	factory := &fakeCheckoutSourceSignalFactory{}
+	signals := make(chan checkoutSourceSignalRecord, 16)
+	watchers := newCheckoutSourceSignalWatcherSet(
+		factory.New,
+		f.lc.checkoutSourceSignalCurrent,
+		func(checkoutID, reason string) bool {
+			select {
+			case signals <- checkoutSourceSignalRecord{checkoutID: checkoutID, reason: reason, at: time.Now()}:
+			default:
+			}
+			if reason == "source-watch-ready" {
+				return true
+			}
+			return f.lc.SignalCheckout(checkoutID, reason)
+		},
+		f.lc.logger,
+	)
+	watchers.quietWindow = 10 * time.Millisecond
+	f.lc.checkoutSignalWatchMu.Lock()
+	f.lc.checkoutSignalWatchers = watchers
+	f.lc.checkoutSignalWatchMu.Unlock()
+
 	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: f.worktree}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, tracked.CatalogErr)
@@ -944,6 +976,9 @@ func TestUntrackDemotesADedicatedWorktree(t *testing.T) {
 	assert.True(t, result.Demoted)
 	assert.Equal(t, UntrackPlanDemote, result.Plan)
 	assert.Equal(t, []string{string(TrackSourceCLI)}, result.Revoked)
+	waitCheckoutSourceSignal(t, signals, "source-watch-ready", time.Second)
+	assert.Equal(t, 1, factory.Count(), "demotion publishes one source watcher")
+	assert.Equal(t, 1, watchers.Len(), "the automatic checkout has one live source watcher")
 
 	demoted, found, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
 	require.NoError(t, err)
@@ -963,13 +998,38 @@ func TestUntrackDemotesADedicatedWorktree(t *testing.T) {
 	assert.False(t, bound, "the corpus it left is retired")
 	assert.Nil(t, f.mi.GetMetadata(tracked.Prefix))
 	assert.False(t, f.configLists(f.worktree), "the demoted worktree left the tracked set")
-	assert.True(t, f.lc.SignalCheckout(tracked.CheckoutID, "test"),
+	assert.True(t, f.lc.hasCoordinator(tracked.CheckoutID),
 		"an automatic checkout has a coordinator listening")
 
 	view := f.materialize(tracked.CheckoutID)
-	defer view.Close()
 	assert.Equal(t, dedicatedContent, contentIdentities(view.Reader, f.mainPrefix),
 		"the composed stack carries what the dedicated corpus carried")
+	view.Close()
+
+	changedPath := filepath.Join(f.worktree, "watcher-driven.go")
+	writeFile(t, changedPath, "package a\n\nfunc WatcherDriven() {}\n")
+	factory.Backend(0).events <- fswatcher.WatchEvent{Path: changedPath}
+	waitCheckoutSourceSignal(t, signals, "source-event", time.Second)
+	require.Eventually(t, func() bool {
+		updated := f.materialize(tracked.CheckoutID)
+		identities := contentIdentities(updated.Reader, f.mainPrefix)
+		updated.Close()
+		return slices.Contains(identities, "watcher-driven.go::WatcherDriven")
+	}, 5*time.Second, 10*time.Millisecond,
+		"the source watcher event did not publish the new dirty file before polling fallback")
+
+	// Reconciliation is idempotent, and removing the coordinator synchronously
+	// drops and joins the source watcher rather than leaking a backend.
+	f.lc.ensureCheckoutSourceSignalWatcher(demoted, f.primaryGraph)
+	assert.Equal(t, 1, factory.Count(), "repeat ensure does not start another backend")
+	assert.Equal(t, 1, watchers.Len())
+	f.lc.dropCoordinator(tracked.CheckoutID)
+	assert.Equal(t, 0, watchers.Len(), "coordinator removal drops the source watcher")
+	select {
+	case <-factory.Backend(0).stopped:
+	default:
+		t.Fatal("coordinator removal returned before the source watcher stopped")
+	}
 }
 
 // TestUntrackIsBlockedWithoutAnotherReadyPrimary states the rule that stops an
@@ -1015,9 +1075,8 @@ func TestUntrackIsBlockedWithoutAnotherReadyPrimary(t *testing.T) {
 // for: the checkout was re-keyed while the demotion was building its layers,
 // so the identity the flip names is not the one the catalog holds.
 //
-// The route the rebuild installed describes a checkout that is still dedicated
-// and is therefore withdrawn again — a failure before the flip leaves the
-// dedicated state exactly as it was.
+// The prepared replacement is never published: a failure before the atomic
+// route-and-mode flip leaves the dedicated state and its exact route unchanged.
 func TestDemoteRefusesAStaleIncarnation(t *testing.T) {
 	f := newFamilyFixture(t, "stale")
 	defer f.close()
@@ -1041,6 +1100,7 @@ func TestDemoteRefusesAStaleIncarnation(t *testing.T) {
 	authorization, err := f.lc.Reconciler().AuthorizeDemotion(
 		ctx, checkout, owned.GraphID, primary.GraphID, family.PrimaryEpoch)
 	require.NoError(t, err)
+	heldRoute, heldRouted := f.routeOf(tracked.CheckoutID)
 
 	stale := checkout
 	stale.Incarnation = "incarnation-that-was-replaced"
@@ -1052,8 +1112,9 @@ func TestDemoteRefusesAStaleIncarnation(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, store_sqlite.CheckoutModeDedicated, held.EffectiveMode)
-	_, routed := f.routeOf(tracked.CheckoutID)
-	assert.False(t, routed, "the route the rebuild installed was withdrawn again")
+	route, routed := f.routeOf(tracked.CheckoutID)
+	assert.Equal(t, heldRouted, routed, "a refused publication does not add or remove the route")
+	assert.Equal(t, heldRoute, route, "a refused publication preserves the exact dedicated route")
 	assert.NotNil(t, f.mi.GetMetadata(tracked.Prefix), "its corpus is untouched")
 	assert.True(t, f.lc.SignalCheckout(tracked.CheckoutID, "test"),
 		"rollback did not preserve the coordinator for the still-dedicated checkout")

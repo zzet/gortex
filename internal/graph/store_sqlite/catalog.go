@@ -1826,7 +1826,11 @@ func (c *Catalog) UpsertCheckoutRoute(ctx context.Context, route CheckoutRoute) 
 	if err := route.validate(); err != nil {
 		return err
 	}
-	_, err := c.exec(ctx, `
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkoutRouteGraphAuthorizedTx(ctx, tx, route.CheckoutID, route.GraphID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `
 INSERT INTO checkout_routes
   (checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state)
 VALUES (?, ?, ?, ?, ?, ?)
@@ -1836,9 +1840,10 @@ ON CONFLICT(checkout_id) DO UPDATE SET
   dirty_generation_id  = excluded.dirty_generation_id,
   route_epoch          = excluded.route_epoch,
   state                = excluded.state`,
-		route.CheckoutID, route.GraphID, catalogNullInt(route.CommitGenerationID),
-		catalogNullInt(route.DirtyGenerationID), route.RouteEpoch, string(route.State))
-	return err
+			route.CheckoutID, route.GraphID, catalogNullInt(route.CommitGenerationID),
+			catalogNullInt(route.DirtyGenerationID), route.RouteEpoch, string(route.State))
+		return err
+	})
 }
 
 // GetCheckoutRoute returns one checkout's route.
@@ -1986,20 +1991,22 @@ UPDATE checkout_routes
 		req.GraphID, catalogNullInt(req.CommitGenerationID), catalogNullInt(req.DirtyGenerationID),
 		string(req.State), req.CheckoutID, req.ExpectedRouteEpoch,
 	}
-	if !req.RequireActiveGraphBase {
-		return c.execGuarded(ctx, subject, query, args...)
-	}
-	if req.ExpectedBaseGenerationID <= 0 {
+	if req.RequireActiveGraphBase && req.ExpectedBaseGenerationID <= 0 {
 		return fmt.Errorf("expected base generation id must be positive")
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
-		active, err := graphBaseGenerationIsActiveTx(
-			ctx, tx, req.GraphID, req.ExpectedBaseGenerationID)
-		if err != nil {
+		if err := checkoutRouteGraphAuthorizedTx(ctx, tx, req.CheckoutID, req.GraphID); err != nil {
 			return err
 		}
-		if !active {
-			return fmt.Errorf("%w: dedicated graph %s base moved", ErrCatalogStaleGuard, req.GraphID)
+		if req.RequireActiveGraphBase {
+			active, err := graphBaseGenerationIsActiveTx(
+				ctx, tx, req.GraphID, req.ExpectedBaseGenerationID)
+			if err != nil {
+				return err
+			}
+			if !active {
+				return fmt.Errorf("%w: dedicated graph %s base moved", ErrCatalogStaleGuard, req.GraphID)
+			}
 		}
 		return execGuardedTx(ctx, tx, subject, query, args...)
 	})

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -327,7 +328,10 @@ func (l *CheckoutLifecycle) demote(
 	owned *store_sqlite.DedicatedGraph,
 	authorization reconcile.DemotionAuthorization,
 ) error {
-	coordinator, err := l.buildCoordinator(ctx, authorization.PrimaryGraphID, checkout)
+	expectedCoordinator := l.coordinatorFor(checkout.CheckoutID)
+	coordinator, err := l.buildCoordinatorWithPoll(
+		ctx, authorization.PrimaryGraphID, checkout, -time.Nanosecond,
+	)
 	if err != nil {
 		return err
 	}
@@ -335,10 +339,15 @@ func (l *CheckoutLifecycle) demote(
 		return fmt.Errorf("indexer: the primary graph %s cannot serve checkout %s yet",
 			authorization.PrimaryGraphID, checkout.CheckoutID)
 	}
-	if _, err := coordinator.RehomeTo(ctx, authorization.PrimaryGraphID); err != nil {
+	finishPrepared := func() {
+		if coordinator == nil {
+			return
+		}
 		_ = coordinator.Close()
-		return err
+		l.oweRetirement(coordinator.DrainRetirements()...)
+		coordinator = nil
 	}
+	defer finishPrepared()
 
 	// Offer the private graph's payload before the catalog transaction journals
 	// its retirement. The journal is the crash-recovery authority; this in-memory
@@ -346,24 +355,84 @@ func (l *CheckoutLifecycle) demote(
 	if owned != nil {
 		l.oweRetirement(l.graphGenerations(ctx, owned.GraphID)...)
 	}
-	commit, commitErr := l.rec.CommitAuthorizedDemotion(ctx, checkout, authorization)
-	if commitErr != nil && !commit.Committed {
-		// The route the rehome installed describes a checkout that is still
-		// dedicated, so it is withdrawn again and the payload it named is
-		// offered back. Intent revocation is not lost: the durable transition
-		// remains and a retry adopts it.
-		l.oweRetirement(coordinator.DrainRetirements()...)
-		l.oweRoutedGenerations(ctx, checkout.CheckoutID)
-		if deleteErr := l.catalog.DeleteCheckoutRoute(ctx, checkout.CheckoutID); deleteErr != nil &&
-			!errors.Is(deleteErr, store_sqlite.ErrCatalogNotFound) {
-			l.logger.Warn("checkout lifecycle: could not withdraw a rolled-back route",
-				zap.String("checkout", checkout.CheckoutID), zap.Error(deleteErr))
-		}
-		_ = coordinator.Close()
+	var commit reconcile.DemotionCommitResult
+	var commitErr error
+	_, prepareErr := coordinator.prepareRehomeTo(
+		ctx,
+		authorization.PrimaryGraphID,
+		func(
+			ctx context.Context,
+			route store_sqlite.CheckoutRoute,
+			routed bool,
+			_ primaryBase,
+			commitGeneration, dirtyGeneration int64,
+		) error {
+			commit, commitErr = l.rec.CommitAuthorizedDemotion(
+				ctx,
+				checkout,
+				authorization,
+				reconcile.DemotionPublication{
+					ExpectedRoute:    route,
+					RouteExists:      routed,
+					CommitGeneration: commitGeneration,
+					DirtyGeneration:  dirtyGeneration,
+				},
+			)
+			if commit.Committed {
+				// Graph cleanup is outside the publication transaction. Its error
+				// keeps the durable transition standing, but the prepared stack is
+				// now the route and must be adopted by the automatic coordinator.
+				return nil
+			}
+			if commitErr == nil {
+				return fmt.Errorf("%w: demotion publication did not commit",
+					store_sqlite.ErrCatalogStaleGuard)
+			}
+			return commitErr
+		},
+	)
+	if prepareErr != nil {
+		finishPrepared()
 		l.sweepRetirements(ctx)
-		return commitErr
+		return prepareErr
 	}
-	l.installCoordinator(checkout.CheckoutID, coordinator)
+
+	replacement, err := l.buildCoordinator(ctx, authorization.PrimaryGraphID, checkout)
+	if err != nil {
+		finishPrepared()
+		l.sweepRetirements(ctx)
+		return fmt.Errorf("indexer: start demoted checkout coordinator: %w", err)
+	}
+	if replacement == nil {
+		finishPrepared()
+		l.sweepRetirements(ctx)
+		return fmt.Errorf("indexer: the primary graph %s cannot keep serving checkout %s",
+			authorization.PrimaryGraphID, checkout.CheckoutID)
+	}
+	installed := l.replaceCoordinator(
+		checkout.CheckoutID,
+		expectedCoordinator,
+		replacement,
+	)
+	// The catalog flip above made this checkout automatic. Publish its source
+	// watcher at the same boundary as the coordinator so filesystem events can
+	// drive prompt dirty-layer rebuilds instead of waiting for the coordinator's
+	// polling fallback. Watcher admission is deliberately best-effort: Ensure
+	// owns retries and cleanup, while the already-published route remains
+	// queryable if the filesystem backend is temporarily unavailable.
+	demoted := checkout
+	demoted.State = store_sqlite.CheckoutStateReady
+	demoted.DesiredMode = store_sqlite.CheckoutModeAutomatic
+	demoted.EffectiveMode = store_sqlite.CheckoutModeAutomatic
+	if installed {
+		l.ensureCheckoutSourceSignalWatcher(demoted, authorization.PrimaryGraphID)
+	} else {
+		finishPrepared()
+		l.sweepRetirements(ctx)
+		return fmt.Errorf("%w: checkout %s coordinator moved during demotion",
+			store_sqlite.ErrCatalogStaleGuard, checkout.CheckoutID)
+	}
+	finishPrepared()
 
 	if commitErr != nil {
 		// The mode flip and graph-retirement journal committed together. Keep

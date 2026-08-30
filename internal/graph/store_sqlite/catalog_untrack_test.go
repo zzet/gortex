@@ -17,6 +17,11 @@ type catalogUntrackFixture struct {
 	targetCheckoutID   string
 	targetIncarnation  string
 	targetGraphID      string
+	primaryBaseID      int64
+	targetBaseID       int64
+	commitGenerationID int64
+	dirtyGenerationID  int64
+	expectedRoute      CheckoutRoute
 }
 
 func newCatalogUntrackFixture(t *testing.T) *catalogUntrackFixture {
@@ -69,6 +74,83 @@ func newCatalogUntrackFixture(t *testing.T) *catalogUntrackFixture {
 			t.Fatalf("seed graph %s: %v", graph.GraphID, err)
 		}
 	}
+	baseID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind:      checkoutGenerationOwnerKind,
+		GraphID:        f.primaryGraphID,
+		LayerID:        "primary-base",
+		CheckoutID:     f.primaryCheckoutID,
+		GenerationKind: "dedicated_base",
+		TreeOID:        "tree-primary-base",
+		State:          ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed primary base: %v", err)
+	}
+	if err := catalog.UpsertDedicatedGraph(ctx, DedicatedGraph{
+		GraphID: f.primaryGraphID, OwnerCheckoutID: f.primaryCheckoutID,
+		RepoPrefix: "primary", FamilyID: f.familyID, IsPrimaryBase: true,
+		ActiveGenerationID: baseID, State: "graph_ready",
+	}); err != nil {
+		t.Fatalf("activate primary base: %v", err)
+	}
+	targetBaseID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind:      checkoutGenerationOwnerKind,
+		GraphID:        f.targetGraphID,
+		LayerID:        "target-base",
+		CheckoutID:     f.targetCheckoutID,
+		GenerationKind: "dedicated_base",
+		TreeOID:        "tree-target-base",
+		State:          ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed target base: %v", err)
+	}
+	if err := catalog.UpsertDedicatedGraph(ctx, DedicatedGraph{
+		GraphID: f.targetGraphID, OwnerCheckoutID: f.targetCheckoutID,
+		RepoPrefix: "target", FamilyID: f.familyID,
+		ActiveGenerationID: targetBaseID, State: "graph_ready",
+	}); err != nil {
+		t.Fatalf("activate target base: %v", err)
+	}
+	commitID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind:        checkoutGenerationOwnerKind,
+		GraphID:          f.primaryGraphID,
+		LayerID:          "target-commit",
+		CheckoutID:       f.targetCheckoutID,
+		GenerationKind:   "checkout_commit",
+		BaseGenerationID: baseID,
+		TreeOID:          "tree-target-head",
+		State:            ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed automatic commit generation: %v", err)
+	}
+	dirtyID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind:        checkoutGenerationOwnerKind,
+		GraphID:          f.primaryGraphID,
+		LayerID:          "target-dirty",
+		CheckoutID:       f.targetCheckoutID,
+		GenerationKind:   "checkout_dirty",
+		BaseGenerationID: commitID,
+		State:            ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed automatic dirty generation: %v", err)
+	}
+	route := CheckoutRoute{
+		CheckoutID: f.targetCheckoutID,
+		GraphID:    f.targetGraphID,
+		RouteEpoch: 7,
+		State:      RouteActive,
+	}
+	if err := catalog.UpsertCheckoutRoute(ctx, route); err != nil {
+		t.Fatalf("seed dedicated route: %v", err)
+	}
+	f.primaryBaseID = baseID
+	f.targetBaseID = targetBaseID
+	f.commitGenerationID = commitID
+	f.dirtyGenerationID = dirtyID
+	f.expectedRoute = route
 	return f
 }
 
@@ -182,6 +264,10 @@ func (f *catalogUntrackFixture) demotionCommit(
 		PrimaryGraphID:       f.primaryGraphID,
 		ExpectedPrimaryEpoch: epoch,
 		RequiredPrimaryState: "graph_ready",
+		ExpectedRoute:        f.expectedRoute,
+		RouteExists:          true,
+		CommitGenerationID:   f.commitGenerationID,
+		DirtyGenerationID:    f.dirtyGenerationID,
 		State:                CheckoutStateReady,
 		LastSeen:             40,
 		Cleanup:              &cleanup,
@@ -425,4 +511,260 @@ func TestCommitAuthorizedDemotionRevalidatesBeforePublication(t *testing.T) {
 			t.Fatalf("cleanup collision moved checkout = %+v", checkout)
 		}
 	})
+}
+
+func (f *catalogUntrackFixture) assertDemotionUnpublished(
+	expected CheckoutRoute, transitionID, cleanupID string,
+) {
+	f.t.Helper()
+	ctx := context.Background()
+	checkout, found, err := f.catalog.GetCheckout(ctx, f.targetCheckoutID)
+	if err != nil || !found {
+		f.t.Fatalf("GetCheckout = %+v, found %v, err %v", checkout, found, err)
+	}
+	if checkout.EffectiveMode != CheckoutModeDedicated ||
+		checkout.ActiveIntentTransitionID != transitionID {
+		f.t.Fatalf("failed publication moved checkout = %+v", checkout)
+	}
+	route, routed, err := f.catalog.GetCheckoutRoute(ctx, f.targetCheckoutID)
+	if err != nil || !routed || route != expected {
+		f.t.Fatalf("failed publication route = %+v, routed %v, err %v; want %+v",
+			route, routed, err, expected)
+	}
+	if _, found, err := f.catalog.GetCleanupEntry(ctx, cleanupID); err != nil || found {
+		f.t.Fatalf("failed publication cleanup = found %v, err %v", found, err)
+	}
+}
+
+func TestCommitAuthorizedDemotionPublishesOneAtomicStack(t *testing.T) {
+	f := newCatalogUntrackFixture(t)
+	f.seedIntent("intent-cli", f.targetCheckoutID, IntentSourceCLITrack)
+	ctx := context.Background()
+	authorized, err := f.catalog.AuthorizeUntrack(ctx, f.demotionAuthorization())
+	if err != nil {
+		t.Fatalf("AuthorizeUntrack: %v", err)
+	}
+	cleanup := pendingCleanup("cleanup-demote-atomic", "retire_graph", 0)
+	req := f.demotionCommit(authorized.Transition.TransitionID, 0, cleanup)
+
+	if err := f.catalog.CommitAuthorizedDemotion(ctx, req); err != nil {
+		t.Fatalf("CommitAuthorizedDemotion: %v", err)
+	}
+	checkout, found, err := f.catalog.GetCheckout(ctx, f.targetCheckoutID)
+	if err != nil || !found || checkout.DesiredMode != CheckoutModeAutomatic ||
+		checkout.EffectiveMode != CheckoutModeAutomatic {
+		t.Fatalf("published checkout = %+v, found %v, err %v", checkout, found, err)
+	}
+	wantRoute := CheckoutRoute{
+		CheckoutID:         f.targetCheckoutID,
+		GraphID:            f.primaryGraphID,
+		CommitGenerationID: f.commitGenerationID,
+		DirtyGenerationID:  f.dirtyGenerationID,
+		RouteEpoch:         f.expectedRoute.RouteEpoch + 1,
+		State:              RouteActive,
+	}
+	route, routed, err := f.catalog.GetCheckoutRoute(ctx, f.targetCheckoutID)
+	if err != nil || !routed || route != wantRoute {
+		t.Fatalf("published route = %+v, routed %v, err %v; want %+v", route, routed, err, wantRoute)
+	}
+	if stored, found, err := f.catalog.GetCleanupEntry(ctx, cleanup.CleanupID); err != nil ||
+		!found || stored.Reason != cleanup.Reason {
+		t.Fatalf("published cleanup = %+v, found %v, err %v", stored, found, err)
+	}
+
+	// A lost response retries the exact transaction without advancing the
+	// route epoch or duplicating publication. It remains recognizable after
+	// cleanup has already removed the checkout's former graph.
+	if err := f.catalog.CommitAuthorizedDemotion(ctx, req); err != nil {
+		t.Fatalf("idempotent CommitAuthorizedDemotion: %v", err)
+	}
+	deleted, err := f.catalog.DeleteDedicatedGraphForIncarnation(
+		ctx, f.targetGraphID, f.targetCheckoutID, f.targetIncarnation,
+	)
+	if err != nil || !deleted {
+		t.Fatalf("delete retired graph = %v, %v", deleted, err)
+	}
+	if err := f.catalog.CommitAuthorizedDemotion(ctx, req); err != nil {
+		t.Fatalf("cleanup-completed CommitAuthorizedDemotion: %v", err)
+	}
+	route, routed, err = f.catalog.GetCheckoutRoute(ctx, f.targetCheckoutID)
+	if err != nil || !routed || route != wantRoute {
+		t.Fatalf("idempotent route = %+v, routed %v, err %v; want %+v", route, routed, err, wantRoute)
+	}
+}
+
+func TestCommitAuthorizedDemotionRollsBackEveryPartialWrite(t *testing.T) {
+	t.Run("route moved", func(t *testing.T) {
+		f := newCatalogUntrackFixture(t)
+		f.seedIntent("intent-cli", f.targetCheckoutID, IntentSourceCLITrack)
+		ctx := context.Background()
+		authorized, err := f.catalog.AuthorizeUntrack(ctx, f.demotionAuthorization())
+		if err != nil {
+			t.Fatalf("AuthorizeUntrack: %v", err)
+		}
+		if _, err := f.catalog.exec(ctx, `
+UPDATE checkout_routes SET route_epoch = route_epoch + 1 WHERE checkout_id = ?`,
+			f.targetCheckoutID); err != nil {
+			t.Fatalf("move route: %v", err)
+		}
+		moved, _, err := f.catalog.GetCheckoutRoute(ctx, f.targetCheckoutID)
+		if err != nil {
+			t.Fatalf("GetCheckoutRoute: %v", err)
+		}
+		cleanup := pendingCleanup("cleanup-demote-route-moved", "retire_graph", 0)
+		err = f.catalog.CommitAuthorizedDemotion(ctx,
+			f.demotionCommit(authorized.Transition.TransitionID, 0, cleanup))
+		if !errors.Is(err, ErrCatalogStaleGuard) {
+			t.Fatalf("CommitAuthorizedDemotion = %v, want ErrCatalogStaleGuard", err)
+		}
+		f.assertDemotionUnpublished(moved, authorized.Transition.TransitionID, cleanup.CleanupID)
+	})
+
+	t.Run("primary base moved", func(t *testing.T) {
+		f := newCatalogUntrackFixture(t)
+		f.seedIntent("intent-cli", f.targetCheckoutID, IntentSourceCLITrack)
+		ctx := context.Background()
+		authorized, err := f.catalog.AuthorizeUntrack(ctx, f.demotionAuthorization())
+		if err != nil {
+			t.Fatalf("AuthorizeUntrack: %v", err)
+		}
+		newBase, err := f.catalog.CreateViewGeneration(ctx, ViewGeneration{
+			OwnerKind: checkoutGenerationOwnerKind, GraphID: f.primaryGraphID,
+			LayerID: "primary-base-moved", CheckoutID: f.primaryCheckoutID,
+			GenerationKind: "dedicated_base", TreeOID: "tree-primary-base-moved",
+			State: ViewGenerationReady,
+		})
+		if err != nil {
+			t.Fatalf("seed replacement base: %v", err)
+		}
+		if _, err := f.catalog.exec(ctx, `
+UPDATE dedicated_graphs SET active_generation_id = ? WHERE graph_id = ?`,
+			newBase, f.primaryGraphID); err != nil {
+			t.Fatalf("move primary base: %v", err)
+		}
+		cleanup := pendingCleanup("cleanup-demote-base-moved", "retire_graph", 0)
+		err = f.catalog.CommitAuthorizedDemotion(ctx,
+			f.demotionCommit(authorized.Transition.TransitionID, 0, cleanup))
+		if !errors.Is(err, ErrCatalogStaleGuard) {
+			t.Fatalf("CommitAuthorizedDemotion = %v, want ErrCatalogStaleGuard", err)
+		}
+		f.assertDemotionUnpublished(
+			f.expectedRoute, authorized.Transition.TransitionID, cleanup.CleanupID,
+		)
+	})
+
+	for _, tc := range []struct {
+		name    string
+		trigger string
+	}{
+		{
+			name: "route write fails",
+			trigger: `CREATE TRIGGER fail_demotion_route BEFORE UPDATE ON checkout_routes
+WHEN OLD.checkout_id = 'checkout-target'
+BEGIN SELECT RAISE(ABORT, 'injected route failure'); END`,
+		},
+		{
+			name: "mode write fails after route",
+			trigger: `CREATE TRIGGER fail_demotion_mode BEFORE UPDATE ON checkouts
+WHEN OLD.checkout_id = 'checkout-target' AND NEW.effective_mode = 'automatic'
+BEGIN SELECT RAISE(ABORT, 'injected mode failure'); END`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCatalogUntrackFixture(t)
+			f.seedIntent("intent-cli", f.targetCheckoutID, IntentSourceCLITrack)
+			ctx := context.Background()
+			authorized, err := f.catalog.AuthorizeUntrack(ctx, f.demotionAuthorization())
+			if err != nil {
+				t.Fatalf("AuthorizeUntrack: %v", err)
+			}
+			if _, err := f.catalog.exec(ctx, tc.trigger); err != nil {
+				t.Fatalf("install failure trigger: %v", err)
+			}
+			cleanup := pendingCleanup("cleanup-demote-trigger", "retire_graph", 0)
+			if err := f.catalog.CommitAuthorizedDemotion(ctx,
+				f.demotionCommit(authorized.Transition.TransitionID, 0, cleanup)); err == nil {
+				t.Fatal("CommitAuthorizedDemotion unexpectedly succeeded")
+			}
+			f.assertDemotionUnpublished(
+				f.expectedRoute, authorized.Transition.TransitionID, cleanup.CleanupID,
+			)
+		})
+	}
+}
+
+func TestAutomaticCheckoutRejectsStaleDedicatedRouteWriters(t *testing.T) {
+	f := newCatalogUntrackFixture(t)
+	f.seedIntent("intent-cli", f.targetCheckoutID, IntentSourceCLITrack)
+	ctx := context.Background()
+	authorized, err := f.catalog.AuthorizeUntrack(ctx, f.demotionAuthorization())
+	if err != nil {
+		t.Fatalf("AuthorizeUntrack: %v", err)
+	}
+	cleanup := pendingCleanup("cleanup-demote-writer-fence", "retire_graph", 0)
+	if err := f.catalog.CommitAuthorizedDemotion(ctx,
+		f.demotionCommit(authorized.Transition.TransitionID, 0, cleanup)); err != nil {
+		t.Fatalf("CommitAuthorizedDemotion: %v", err)
+	}
+	want, _, err := f.catalog.GetCheckoutRoute(ctx, f.targetCheckoutID)
+	if err != nil {
+		t.Fatalf("GetCheckoutRoute: %v", err)
+	}
+
+	writes := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "whole route flip",
+			run: func() error {
+				return f.catalog.FlipCheckoutRoute(ctx, FlipCheckoutRouteRequest{
+					CheckoutID: f.targetCheckoutID, GraphID: f.targetGraphID,
+					ExpectedRouteEpoch: want.RouteEpoch, State: RoutePending,
+					RequireActiveGraphBase: true, ExpectedBaseGenerationID: f.targetBaseID,
+				})
+			},
+		},
+		{
+			name: "whole stack commit",
+			run: func() error {
+				return f.catalog.CommitCheckoutStack(ctx, CommitCheckoutStackRequest{
+					CheckoutID: f.targetCheckoutID, GraphID: f.targetGraphID,
+					ExpectedBaseGenerationID: f.targetBaseID,
+					CommitGenerationID:       f.commitGenerationID, DirtyGenerationID: f.dirtyGenerationID,
+					RouteExists: true, ExpectedRouteEpoch: want.RouteEpoch, State: RouteActive,
+				})
+			},
+		},
+		{
+			name: "in-flight slot flip",
+			run: func() error {
+				return f.catalog.FlipCheckoutRouteSlot(ctx, FlipCheckoutRouteSlotRequest{
+					CheckoutID: f.targetCheckoutID, Slot: RouteSlotDirty,
+					GenerationID: 0, ExpectedRouteEpoch: want.RouteEpoch, State: RoutePending,
+					RequireActiveGraphBase: true, ExpectedBaseGenerationID: f.targetBaseID,
+				})
+			},
+		},
+		{
+			name: "unguarded upsert",
+			run: func() error {
+				stale := want
+				stale.GraphID = f.targetGraphID
+				return f.catalog.UpsertCheckoutRoute(ctx, stale)
+			},
+		},
+	}
+	for _, write := range writes {
+		t.Run(write.name, func(t *testing.T) {
+			if err := write.run(); !errors.Is(err, ErrCatalogStaleGuard) {
+				t.Fatalf("stale writer = %v, want ErrCatalogStaleGuard", err)
+			}
+			after, routed, err := f.catalog.GetCheckoutRoute(ctx, f.targetCheckoutID)
+			if err != nil || !routed || after != want {
+				t.Fatalf("stale writer changed route = %+v, routed %v, err %v; want %+v",
+					after, routed, err, want)
+			}
+		})
+	}
 }

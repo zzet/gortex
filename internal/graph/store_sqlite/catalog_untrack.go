@@ -73,6 +73,10 @@ type CommitAuthorizedDemotionRequest struct {
 	PrimaryGraphID       string
 	ExpectedPrimaryEpoch int64
 	RequiredPrimaryState string
+	ExpectedRoute        CheckoutRoute
+	RouteExists          bool
+	CommitGenerationID   int64
+	DirtyGenerationID    int64
 
 	State    CheckoutState
 	LastSeen int64
@@ -224,9 +228,6 @@ func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthor
 			return fmt.Errorf("%w: transition %s on checkout %s", ErrCatalogStaleGuard,
 				req.TransitionID, req.CheckoutID)
 		}
-		if err := verifyOwnedNonPrimaryTx(ctx, tx, req.CheckoutID, req.FamilyID, req.OwnedGraphID); err != nil {
-			return err
-		}
 		authorization := AuthorizeUntrackRequest{
 			CheckoutID:           req.CheckoutID,
 			FamilyID:             req.FamilyID,
@@ -245,6 +246,57 @@ func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthor
 			return fmt.Errorf("%w: checkout %s gained %d active intent(s) during demotion",
 				ErrCatalogStaleGuard, req.CheckoutID, active)
 		}
+		if err := verifyDemotionGenerationsTx(ctx, tx, req); err != nil {
+			return err
+		}
+		route, routed, err := checkoutRouteTx(ctx, tx, req.CheckoutID)
+		if err != nil {
+			return err
+		}
+
+		// A commit whose response was lost is idempotent only when the route is
+		// already the exact stack this request prepared. A different automatic
+		// route belongs to a later cycle and must not be republished by the retry.
+		if checkout.effectiveMode == CheckoutModeAutomatic {
+			publishedEpoch := int64(0)
+			if req.RouteExists {
+				publishedEpoch = req.ExpectedRoute.RouteEpoch + 1
+			}
+			if checkout.desiredMode == CheckoutModeAutomatic && routed &&
+				route.GraphID == req.PrimaryGraphID &&
+				route.CommitGenerationID == req.CommitGenerationID &&
+				route.DirtyGenerationID == req.DirtyGenerationID &&
+				route.RouteEpoch == publishedEpoch &&
+				route.State == RouteActive {
+				if req.Cleanup != nil {
+					entry, exists, err := cleanupEntryTx(ctx, tx, req.Cleanup.CleanupID)
+					if err != nil {
+						return err
+					}
+					if exists && entry.Reason != req.Cleanup.Reason {
+						return fmt.Errorf("%w: cleanup %s is %q, not %q", ErrCatalogStaleGuard,
+							req.Cleanup.CleanupID, entry.Reason, req.Cleanup.Reason)
+					}
+				}
+				return nil
+			}
+			return fmt.Errorf("%w: checkout %s demotion publication moved",
+				ErrCatalogStaleGuard, req.CheckoutID)
+		}
+		if err := verifyOwnedNonPrimaryTx(
+			ctx, tx, req.CheckoutID, req.FamilyID, req.OwnedGraphID,
+		); err != nil {
+			return err
+		}
+		if checkout.state != standing.PriorCheckoutState ||
+			checkout.desiredMode != standing.PriorDesiredMode ||
+			checkout.effectiveMode != standing.PriorEffectiveMode {
+			return fmt.Errorf("%w: checkout %s is not awaiting demotion",
+				ErrCatalogStaleGuard, req.CheckoutID)
+		}
+		if routed != req.RouteExists || (routed && route != req.ExpectedRoute) {
+			return fmt.Errorf("%w: checkout %s route moved", ErrCatalogStaleGuard, req.CheckoutID)
+		}
 		if req.Cleanup != nil {
 			entry, exists, err := cleanupEntryTx(ctx, tx, req.Cleanup.CleanupID)
 			if err != nil {
@@ -258,6 +310,36 @@ func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthor
 				if err := insertCleanupEntryTx(ctx, tx, *req.Cleanup); err != nil {
 					return err
 				}
+			}
+		}
+
+		if routed {
+			result, err := tx.ExecContext(ctx, `
+UPDATE checkout_routes
+   SET graph_id = ?, commit_generation_id = ?, dirty_generation_id = ?,
+       route_epoch = route_epoch + 1, state = ?
+ WHERE checkout_id = ? AND route_epoch = ?`,
+				req.PrimaryGraphID, req.CommitGenerationID, req.DirtyGenerationID,
+				string(RouteActive), req.CheckoutID, req.ExpectedRoute.RouteEpoch)
+			if err != nil {
+				return err
+			}
+			if changed, changedErr := result.RowsAffected(); changedErr != nil {
+				return changedErr
+			} else if changed != 1 {
+				return fmt.Errorf("%w: checkout %s route moved", ErrCatalogStaleGuard, req.CheckoutID)
+			}
+		} else {
+			_, err := tx.ExecContext(ctx, `
+INSERT INTO checkout_routes
+  (checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state)
+VALUES (?, ?, ?, ?, 0, ?)`, req.CheckoutID, req.PrimaryGraphID,
+				req.CommitGenerationID, req.DirtyGenerationID, string(RouteActive))
+			if err != nil {
+				if isSQLiteUniqueViolation(err) {
+					return fmt.Errorf("%w: checkout %s route appeared", ErrCatalogStaleGuard, req.CheckoutID)
+				}
+				return err
 			}
 		}
 
@@ -342,6 +424,37 @@ func validateAuthorizeUntrackRequest(req AuthorizeUntrackRequest) error {
 	return nil
 }
 
+func verifyDemotionGenerationsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	req CommitAuthorizedDemotionRequest,
+) error {
+	commit, err := promotionGenerationTx(ctx, tx, req.CommitGenerationID)
+	if err != nil {
+		return err
+	}
+	dirty, err := promotionGenerationTx(ctx, tx, req.DirtyGenerationID)
+	if err != nil {
+		return err
+	}
+	active, err := graphBaseGenerationIsActiveTx(
+		ctx, tx, req.PrimaryGraphID, commit.baseGenerationID,
+	)
+	if err != nil {
+		return err
+	}
+	if !active || commit.graphID != req.PrimaryGraphID || commit.state != ViewGenerationReady {
+		return fmt.Errorf("%w: automatic commit generation %d moved",
+			ErrCatalogStaleGuard, req.CommitGenerationID)
+	}
+	if dirty.graphID != req.PrimaryGraphID || dirty.checkoutID != req.CheckoutID ||
+		dirty.baseGenerationID != req.CommitGenerationID || dirty.state != ViewGenerationReady {
+		return fmt.Errorf("%w: automatic dirty generation %d moved",
+			ErrCatalogStaleGuard, req.DirtyGenerationID)
+	}
+	return nil
+}
+
 func validateCommitAuthorizedDemotionRequest(req CommitAuthorizedDemotionRequest) error {
 	for name, value := range map[string]string{
 		"checkout_id":      req.CheckoutID,
@@ -356,6 +469,18 @@ func validateCommitAuthorizedDemotionRequest(req CommitAuthorizedDemotionRequest
 	}
 	if req.RequiredPrimaryState == "" {
 		return fmt.Errorf("%w: required primary state is empty", ErrCatalogInvalidValue)
+	}
+	if req.CommitGenerationID <= 0 || req.DirtyGenerationID <= 0 {
+		return fmt.Errorf("demotion generation ids must be positive")
+	}
+	if req.RouteExists {
+		if err := req.ExpectedRoute.validate(); err != nil {
+			return err
+		}
+		if req.ExpectedRoute.CheckoutID != req.CheckoutID {
+			return fmt.Errorf("%w: expected route belongs to checkout %s, not %s",
+				ErrCatalogInvalidValue, req.ExpectedRoute.CheckoutID, req.CheckoutID)
+		}
 	}
 	if err := requireCatalogValue("state", req.State, checkoutStates); err != nil {
 		return err

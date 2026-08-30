@@ -31,6 +31,17 @@ type DemotionCommitResult struct {
 	Committed bool
 }
 
+// DemotionPublication is the prepared automatic stack and the exact route
+// snapshot it replaces. The catalog publishes it in the same transaction as
+// the effective-mode flip, so an old dedicated coordinator moving the route
+// makes the whole demotion stale rather than exposing a split view.
+type DemotionPublication struct {
+	ExpectedRoute    store_sqlite.CheckoutRoute
+	RouteExists      bool
+	CommitGeneration int64
+	DirtyGeneration  int64
+}
+
 // ForgetCheckoutExplicit atomically revokes explicit tracking intent and starts
 // the existing forget saga. Automatic disappearance callers keep using
 // ForgetCheckout and therefore do not participate in intent authorization.
@@ -192,6 +203,7 @@ func (r *Reconciler) CommitAuthorizedDemotion(
 	ctx context.Context,
 	checkout store_sqlite.Checkout,
 	authorization DemotionAuthorization,
+	publication DemotionPublication,
 ) (DemotionCommitResult, error) {
 	var cleanup *store_sqlite.CleanupEntry
 	if authorization.OwnedGraphID != "" {
@@ -217,6 +229,10 @@ func (r *Reconciler) CommitAuthorizedDemotion(
 		PrimaryGraphID:       authorization.PrimaryGraphID,
 		ExpectedPrimaryEpoch: authorization.PrimaryEpoch,
 		RequiredPrimaryState: GraphStateReady,
+		ExpectedRoute:        publication.ExpectedRoute,
+		RouteExists:          publication.RouteExists,
+		CommitGenerationID:   publication.CommitGeneration,
+		DirtyGenerationID:    publication.DirtyGeneration,
 		State:                store_sqlite.CheckoutStateReady,
 		LastSeen:             r.now().Unix(),
 		Cleanup:              cleanup,

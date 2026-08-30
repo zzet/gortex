@@ -1015,9 +1015,28 @@ func (c *CheckoutCoordinator) rescheduleOnLostRoute(reason string) {
 // that case: only a coordinator writes a checkout's route, and a checkout that
 // has none has no coordinator either.
 func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (CheckoutCycle, error) {
+	return c.prepareRehomeTo(ctx, graphID, c.installStack)
+}
+
+type checkoutRehomePublisher func(
+	context.Context, store_sqlite.CheckoutRoute, bool, primaryBase, int64, int64,
+) error
+
+// prepareRehomeTo builds a complete stack over graphID and delegates the
+// publication write to the caller. Ordinary primary moves publish only the
+// route; demotion uses the same prepared stack in the transaction that flips
+// the checkout mode and journals retirement of its old graph.
+func (c *CheckoutCoordinator) prepareRehomeTo(
+	ctx context.Context,
+	graphID string,
+	publish checkoutRehomePublisher,
+) (CheckoutCycle, error) {
 	var out CheckoutCycle
 	if c == nil {
 		return out, errors.New("indexer: no coordinator to rehome")
+	}
+	if publish == nil {
+		return out, errors.New("indexer: rehome publisher is required")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -1078,10 +1097,10 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	}
 	out.DirtyGenerationID, out.DirtyBuilt = dirtyGeneration, true
 
-	if err := c.installStack(ctx, route, routed, base, commitGeneration, dirtyGeneration); err != nil {
+	if err := publish(ctx, route, routed, base, commitGeneration, dirtyGeneration); err != nil {
 		c.abandonBuild(ctx, dirtyGeneration, true)
 		c.abandonBuild(ctx, commitGeneration, !reused)
-		if errors.Is(err, errRouteMoved) {
+		if errors.Is(err, errRouteMoved) || errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
 			out.Rescheduled = true
 		}
 		return out, err
@@ -1557,55 +1576,6 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 			zap.Int("cap", report.ClosureCap))
 	}
 	return generationID, false, nil
-}
-
-// moveCommitSlot points the commit slot at a different generation, dropping
-// the working-tree slot in the same write.
-//
-// A routed dirty generation describes the working tree over the commit layer
-// it was built against. Once the commit slot names a different layer, that
-// generation over the new one is a state of the world the checkout was never
-// in — one branch's uncommitted edits laid over another branch's tree — and
-// the route would still report itself ready to serve it for the whole of the
-// rebuild that follows. Clearing both pointers in one compare-and-set makes
-// the route say what is true instead: it is mid-build, and the reader takes
-// its base-corpus fallback until the working-tree layer has been rebuilt.
-//
-// The slot-at-a-time flip is kept for the case it is safe in: a route with no
-// dirty generation has nothing to tear.
-func (c *CheckoutCoordinator) moveCommitSlot(
-	ctx context.Context,
-	expectedBaseGenerationID int64,
-	route *store_sqlite.CheckoutRoute,
-	generationID int64,
-) error {
-	if route.DirtyGenerationID <= 0 {
-		return c.flip(ctx, expectedBaseGenerationID, route, store_sqlite.RouteSlotCommit, generationID)
-	}
-	err := c.catalog.FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
-		CheckoutID:               c.checkoutID,
-		ExpectedRouteEpoch:       route.RouteEpoch,
-		GraphID:                  route.GraphID,
-		CommitGenerationID:       generationID,
-		DirtyGenerationID:        0,
-		State:                    store_sqlite.RoutePending,
-		RequireActiveGraphBase:   true,
-		ExpectedBaseGenerationID: expectedBaseGenerationID,
-	})
-	if err != nil {
-		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-			return fmt.Errorf("%w: %s slot", errRouteMoved, store_sqlite.RouteSlotCommit)
-		}
-		return err
-	}
-	dropped := route.DirtyGenerationID
-	route.RouteEpoch++
-	route.State = store_sqlite.RoutePending
-	route.CommitGenerationID = generationID
-	route.DirtyGenerationID = 0
-	c.rememberRoutedDirty(0)
-	c.offerRetire(ctx, dropped)
-	return nil
 }
 
 // clearDirtySlot withdraws the working-tree slot and offers what it named for
