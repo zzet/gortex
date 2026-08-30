@@ -8,10 +8,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/indexer/source"
 )
 
 // ErrCheckoutMoved reports that a checkout changed state under an operation
@@ -286,110 +284,6 @@ func sampleCheckout(ctx context.Context, root string) (checkoutSample, error) {
 		return checkoutSample{}, fmt.Errorf("indexer: sample %s: %w", root, err)
 	}
 	return checkoutSample{tree: head.TreeOID, commit: head.CommitOID, fingerprint: dirty.Fingerprint}, nil
-}
-
-// indexPromotedCorpus builds the checkout's own base corpus, and insists that
-// the corpus describes the checkout as it was when the index finished.
-//
-// A full index of a working tree takes as long as it takes, and a checkout
-// under an agent's hands can commit or save part way through it. The result
-// would be a corpus that is a mixture of two states, published as generation 0
-// of a prefix and never diffed against anything — nothing downstream could
-// ever notice. So the state is sampled on both sides of the index and the
-// build is taken again when it moved.
-//
-// Twice, and no more. A checkout that will not hold still for one index will
-// not hold still for a third, and the promotion has to fail while the
-// automatic view is still there to fall back on.
-func (l *CheckoutLifecycle) indexPromotedCorpus(
-	ctx context.Context, checkout store_sqlite.Checkout, prefix string,
-) (*IndexResult, checkoutSample, int, error) {
-	resampled := 0
-	for attempt := 0; attempt < 2; attempt++ {
-		before, err := sampleCheckout(ctx, checkout.RootPath)
-		if err != nil {
-			return nil, checkoutSample{}, resampled, err
-		}
-		content, err := source.NewGitTreeSource(ctx, checkout.RootPath, before.tree)
-		if err != nil {
-			return nil, checkoutSample{}, resampled, err
-		}
-		if l.indexBarrier != nil {
-			l.indexBarrier()
-		}
-		if l.mi.GetMetadata(prefix) != nil {
-			if _, _, err := l.mi.UntrackRepoChecked(ctx, prefix); err != nil {
-				return nil, checkoutSample{}, resampled, errors.Join(err, content.Close())
-			}
-		}
-		result, indexErr := l.mi.trackRepoSourceCtx(ctx,
-			config.RepoEntry{Path: checkout.RootPath, Name: prefix}, content)
-		closeErr := content.Close()
-		if indexErr != nil {
-			return nil, checkoutSample{}, resampled, indexErr
-		}
-		if closeErr != nil {
-			return nil, checkoutSample{}, resampled, closeErr
-		}
-		if result == nil && l.mi.GetMetadata(prefix) == nil {
-			return nil, checkoutSample{}, resampled, fmt.Errorf(
-				"indexer: %s could not be indexed under prefix %s", checkout.RootPath, prefix)
-		}
-		after, err := sampleCheckout(ctx, checkout.RootPath)
-		if err != nil {
-			return nil, checkoutSample{}, resampled, err
-		}
-		if after.tree == before.tree && after.commit == before.commit {
-			return result, before, resampled, nil
-		}
-		resampled++
-		if _, _, err := l.mi.UntrackRepoChecked(ctx, prefix); err != nil {
-			return nil, checkoutSample{}, resampled, err
-		}
-	}
-	return nil, checkoutSample{}, resampled, fmt.Errorf("%w: %s moved under two full indexes",
-		ErrCheckoutMoved, checkout.RootPath)
-}
-
-// serveFromOwnCorpus is the flip: the checkout becomes dedicated and stops
-// being served through the family's automatic lane.
-//
-// The coordinator is stopped first, because it is the one thing that would
-// rebuild the route this is about to withdraw. Then the mode moves under the
-// incarnation guard — it is what every other surface reads to decide which
-// lane a checkout is in — and only then does the route come down.
-//
-// A flip that loses its guard leaves the route and both of its generations
-// exactly where they were, so the automatic view keeps serving; what it loses
-// is the coordinator, which the next sweep brings back for a checkout the
-// catalog still calls automatic.
-//
-// The mode flip is the commit point. Everything after it is cleanup, and is
-// reported as such: a dedicated checkout is read from its own corpus whatever
-// the route says, so a withdrawal that fails leaves a row nothing consults —
-// not a promotion to undo. Returning the failure would run the rollback over a
-// corpus every reader has already been pointed at, and would journal a retry
-// that finds the checkout dedicated and does nothing.
-func (l *CheckoutLifecycle) serveFromOwnCorpus(ctx context.Context, checkout store_sqlite.Checkout) error {
-	l.dropCoordinator(checkout.CheckoutID)
-	err := l.catalog.UpdateCheckoutState(ctx, store_sqlite.UpdateCheckoutStateRequest{
-		CheckoutID:    checkout.CheckoutID,
-		Incarnation:   checkout.Incarnation,
-		State:         store_sqlite.CheckoutStateReady,
-		DesiredMode:   store_sqlite.CheckoutModeDedicated,
-		EffectiveMode: store_sqlite.CheckoutModeDedicated,
-		LastSeen:      l.now().Unix(),
-	})
-	if err != nil {
-		return err
-	}
-	// Read before the withdrawal: the route row is the only thing in the
-	// catalog that names a checkout's two generations, so once it is gone the
-	// payload has no id anything could offer for collection.
-	l.oweRoutedGenerations(ctx, checkout.CheckoutID)
-	l.withdrawAutomaticRoute(ctx, checkout.CheckoutID)
-	l.sweepRetirements(ctx)
-	return nil
 }
 
 // withdrawAutomaticRoute takes down the route a checkout was served through in

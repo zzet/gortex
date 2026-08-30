@@ -523,7 +523,7 @@ func (mw *MultiWatcher) registerTopologyWatcherLocked(prefix string, gw *GitWatc
 	}
 	commonDir := gw.commonDirectory()
 	if commonDir == "" {
-		return nil, fmt.Errorf("Git common directory is unavailable for %s", prefix)
+		return nil, fmt.Errorf("git common directory is unavailable for %s", prefix)
 	}
 	var drain <-chan struct{}
 	if prior, exists := mw.topologyFamilyByRepo[prefix]; exists {
@@ -1035,7 +1035,11 @@ func (mw *MultiWatcher) StopContext(ctx context.Context) error {
 	mw.mu.Unlock()
 
 	if reentrant {
-		go mw.completeStop(plan)
+		go func() {
+			if err := mw.completeStop(plan); err != nil && mw.logger != nil {
+				mw.logger.Warn("error completing asynchronous multi-watcher stop", zap.Error(err))
+			}
+		}()
 		return nil
 	}
 	return mw.completeStop(plan)
@@ -1638,7 +1642,12 @@ func (mw *MultiWatcher) RemoveRepoContext(ctx context.Context, repoPrefix string
 	mw.mu.Unlock()
 
 	if reentrant {
-		go mw.completeWatcherRetirement(retirement)
+		go func() {
+			if err := mw.completeWatcherRetirement(retirement); err != nil && mw.logger != nil {
+				mw.logger.Warn("error completing asynchronous watcher retirement",
+					zap.String("prefix", retirement.prefix), zap.Error(err))
+			}
+		}()
 		return nil
 	}
 	return mw.completeWatcherRetirement(retirement)

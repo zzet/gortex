@@ -90,22 +90,6 @@ func (b *SparseGenerationBuilder) builderClosureCap() int {
 	return defaultAffectedByMax
 }
 
-// affectedClosure returns the repo-relative files that must join the changed
-// set for the generation to resolve as a whole index of the same tree would.
-//
-// present is the changed and added set, deleted the removed set; both are
-// repo-relative. The result excludes every path in either, so the caller's
-// union is a disjoint one. report receives the cap and, when the closure was
-// cut, the truncation fact.
-func (b *SparseGenerationBuilder) affectedClosure(
-	req BuildRequest,
-	present, deleted map[string]struct{},
-	report *BuildReport,
-) []string {
-	closure, _ := b.affectedClosureContext(context.Background(), req, present, deleted, report)
-	return closure
-}
-
 func (b *SparseGenerationBuilder) affectedClosureContext(
 	ctx context.Context,
 	req BuildRequest,

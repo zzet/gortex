@@ -679,9 +679,7 @@ func (gw *GitWatcher) refreshRefWatchesLocked() error {
 				continue
 			}
 			gw.mu.Lock()
-			if _, current := gw.refPaths[path]; current {
-				delete(gw.refPaths, path)
-			}
+			delete(gw.refPaths, path)
 			gw.mu.Unlock()
 			gw.removeRefWatch(path)
 		}

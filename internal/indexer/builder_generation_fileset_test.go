@@ -445,9 +445,9 @@ func TestFileSetSourceWalkWorkScalesWithKeepSet(t *testing.T) {
 
 type fileSetTestExtractor struct{}
 
-func (_ fileSetTestExtractor) Language() string     { return "file-set-test" }
-func (_ fileSetTestExtractor) Extensions() []string { return []string{".sparse"} }
-func (_ fileSetTestExtractor) Extract(filePath string, body []byte) (*parser.ExtractionResult, error) {
+func (fileSetTestExtractor) Language() string     { return "file-set-test" }
+func (fileSetTestExtractor) Extensions() []string { return []string{".sparse"} }
+func (fileSetTestExtractor) Extract(filePath string, body []byte) (*parser.ExtractionResult, error) {
 	name := string(bytes.TrimSpace(body))
 	return &parser.ExtractionResult{Nodes: []*graph.Node{
 		{

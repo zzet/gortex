@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -11,45 +10,6 @@ import (
 )
 
 const dedicatedBaseGenerationKind = "dedicated_base"
-
-func (l *CheckoutLifecycle) publishDedicatedBase(
-	ctx context.Context,
-	checkout store_sqlite.Checkout,
-	graphID string,
-	sample checkoutSample,
-) (int64, error) {
-	generation := store_sqlite.ViewGeneration{
-		OwnerKind:            dedicatedBaseGenerationKind,
-		GraphID:              graphID,
-		LayerID:              graphID + ":base",
-		CheckoutID:           checkout.CheckoutID,
-		GenerationKind:       dedicatedBaseGenerationKind,
-		LowerViewFingerprint: sample.tree,
-		TreeOID:              sample.tree,
-		ProvenanceCommitOID:  sample.commit,
-		State:                store_sqlite.ViewGenerationBuilding,
-		CreatedAt:            l.now().Unix(),
-	}
-	generationID, _, err := l.catalog.AdoptOrCreateViewGeneration(ctx, generation)
-	if err != nil {
-		return 0, err
-	}
-	if err := l.catalog.PublishViewGeneration(ctx, generationID, l.now().Unix()); err != nil {
-		if !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-			return 0, err
-		}
-		row, found, readErr := l.catalog.GetViewGeneration(ctx, generationID)
-		if readErr != nil {
-			return 0, readErr
-		}
-		if !found || row.State != store_sqlite.ViewGenerationReady ||
-			row.GraphID != graphID || row.CheckoutID != checkout.CheckoutID ||
-			row.TreeOID != sample.tree {
-			return 0, err
-		}
-	}
-	return generationID, nil
-}
 
 func (l *CheckoutLifecycle) prepareAndPublishPromotion(
 	ctx context.Context,

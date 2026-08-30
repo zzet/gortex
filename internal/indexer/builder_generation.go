@@ -711,18 +711,6 @@ type buildPlan struct {
 	deleted []string
 }
 
-// planFileSet turns the change set into the file set the pass walks: the
-// changed and added paths the target still holds, plus the affected closure of
-// the whole change set, minus anything the change deleted.
-//
-// A path the change calls modified or added but the target source does not
-// hold is a contradiction between the caller's diff and the content it handed
-// over, and is refused: silently dropping it would produce a generation that
-// masks nothing at a path the caller believes it replaced.
-func (b *SparseGenerationBuilder) planFileSet(req BuildRequest) (buildPlan, BuildReport, error) {
-	return b.planFileSetContext(context.Background(), req)
-}
-
 func (b *SparseGenerationBuilder) planFileSetContext(
 	ctx context.Context,
 	req BuildRequest,

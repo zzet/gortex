@@ -186,7 +186,7 @@ func TestGraphBaseRejectsStalePipelineIdentity(t *testing.T) {
 			f.upsertGraph(graph)
 
 			_, err := f.coordinator(f.graphID).primaryBase(f.ctx)
-			requirePrimaryBaseUnavailable(t, err)
+			_ = requirePrimaryBaseUnavailable(t, err)
 		})
 	}
 }
@@ -196,7 +196,7 @@ func TestGraphBaseRejectsRefreshingGraphBeforeSparseComposition(t *testing.T) {
 	f.graph.State = store_sqlite.DedicatedGraphStateRefreshing
 	f.upsertGraph(f.graph)
 	_, err := graphBase(f.ctx, f.catalog, f.graph, f.desiredIdentity())
-	requirePrimaryBaseUnavailable(t, err)
+	_ = requirePrimaryBaseUnavailable(t, err)
 }
 
 func (f *primaryBaseTestFixture) coordinator(graphID string) *CheckoutCoordinator {
@@ -242,7 +242,7 @@ func TestPrimaryBaseRejectsAdversarialSameFamilyGraphBeforeBuild(t *testing.T) {
 	coordinator := f.coordinator(f.graphs[1].GraphID)
 	coordinator.builder = nil
 	out := coordinator.reconcile(f.ctx)
-	requirePrimaryBaseUnavailable(t, out.Err)
+	_ = requirePrimaryBaseUnavailable(t, out.Err)
 }
 
 func TestPrimaryBaseAcceptsTheDedicatedOwnersOwnGraph(t *testing.T) {
@@ -270,7 +270,7 @@ func TestPrimaryBaseRequiresDesignatedGraph(t *testing.T) {
 	for _, graphID := range []string{"", "graph-missing"} {
 		t.Run(fmt.Sprintf("graph=%q", graphID), func(t *testing.T) {
 			_, err := f.coordinator(graphID).primaryBase(f.ctx)
-			requirePrimaryBaseUnavailable(t, err)
+			_ = requirePrimaryBaseUnavailable(t, err)
 		})
 	}
 }
@@ -372,7 +372,7 @@ func TestGraphBaseRejectsNonServableAndInvalidActiveGenerations(t *testing.T) {
 				t.Fatalf("owner should retain a mutable head: found=%v row=%+v err=%v", found, owner, err)
 			}
 			_, err = graphBase(f.ctx, f.catalog, tt.setup(f), f.desiredIdentity())
-			requirePrimaryBaseUnavailable(t, err)
+			_ = requirePrimaryBaseUnavailable(t, err)
 		})
 	}
 }

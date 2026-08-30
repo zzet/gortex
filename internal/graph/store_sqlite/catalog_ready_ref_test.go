@@ -203,7 +203,7 @@ func TestBindReadyGenerationLeaseToRefViewRejectsStaleHandoffs(t *testing.T) {
 		{
 			name: "expired lease",
 			stale: func(t *testing.T, catalog *Catalog, _ RefView, _ RefViewBuild, claim ReadyGenerationClaim) {
-				if _, err := catalog.store.storeCore.writerDB.ExecContext(context.Background(), `
+				if _, err := catalog.store.writerDB.ExecContext(context.Background(), `
 					UPDATE ready_generation_leases SET expires_at = unixepoch() - 1 WHERE lease_token = ?
 				`, claim.LeaseToken); err != nil {
 					t.Fatalf("expire lease: %v", err)

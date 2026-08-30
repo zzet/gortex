@@ -1382,9 +1382,10 @@ func TestMultiWatcherTopologyOwnerTransferDrainsOnlyOldEpoch(t *testing.T) {
 	var newCallbacks atomic.Int64
 	mw.OnWorktreeChange(func(prefix, _ string) {
 		mw.WatchedRepos()
-		if prefix == "repo-00" {
+		switch prefix {
+		case "repo-00":
 			oldCallbacks.Add(1)
-		} else if prefix == "repo-01" {
+		case "repo-01":
 			newCallbacks.Add(1)
 		}
 	})
@@ -1696,7 +1697,10 @@ func TestMultiWatcherTopologyRetiringPhysicalStopsJoinGlobalStop(t *testing.T) {
 	mw.watchers["repo-00"] = w
 	mw.started["repo-00"] = true
 	mw.startForwarderLocked("repo-00", w)
-	mw.installStartedGitWatcherLocked("repo-00", gw)
+	if _, err := mw.installStartedGitWatcherLocked("repo-00", gw); err != nil {
+		mw.mu.Unlock()
+		t.Fatalf("install started git watcher: %v", err)
+	}
 	mw.mu.Unlock()
 
 	removed := make(chan error, 1)
@@ -2266,7 +2270,10 @@ func TestMultiWatcherTopologyStartFailureCannotClaimOwnership(t *testing.T) {
 	fixture := newTopologyWatchFixture(t, 2)
 	mw := newTopologyRegistry()
 	mw.mu.Lock()
-	mw.installStartedGitWatcherLocked("repo-00-failed", nil)
+	if _, err := mw.installStartedGitWatcherLocked("repo-00-failed", nil); err != nil {
+		mw.mu.Unlock()
+		t.Fatalf("install failed git watcher: %v", err)
+	}
 	mw.mu.Unlock()
 	installTopologyWatcher(mw, "repo-01", fixture.watcher(0))
 	installTopologyWatcher(mw, "repo-02", fixture.watcher(1))

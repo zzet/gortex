@@ -499,7 +499,11 @@ func BenchmarkCatalogWithdrawProducerContendedSynchronous(b *testing.B) {
 	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
 		b.Fatalf("begin writer lock: %v", err)
 	}
-	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	defer func() {
+		if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+			b.Errorf("rollback writer lock: %v", err)
+		}
+	}()
 
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -1876,10 +1876,6 @@ func (w *Watcher) mutationAdmissionStopped() bool {
 	return w.stopping
 }
 
-func (w *Watcher) completeMutationWaiters(path string, appliedGeneration uint64, err error) {
-	w.completeMutationWaitersGuarded(path, appliedGeneration, err, false)
-}
-
 func (w *Watcher) completeMutationWaitersIfCurrent(path string, appliedGeneration uint64, err error) bool {
 	return w.completeMutationWaitersGuarded(path, appliedGeneration, err, true)
 }
