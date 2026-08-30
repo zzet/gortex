@@ -783,19 +783,31 @@ func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
 		Leases:  lifecycle.ViewLeases(),
 	}
 
+	seedRoot := filepath.Join(dir, "topology-seed")
+	commonDir := filepath.Join(dir, "topology.git")
 	primaryRoot := filepath.Join(dir, "topology-primary")
 	worktreeRoot := filepath.Join(dir, "topology-linked")
-	require.NoError(t, os.MkdirAll(primaryRoot, 0o755))
-	runTopologyGitCommand(t, primaryRoot, "init", "-b", "main")
-	runTopologyGitCommand(t, primaryRoot, "config", "user.email", "topology@example.invalid")
-	runTopologyGitCommand(t, primaryRoot, "config", "user.name", "Topology Test")
+
+	// Keep the physical Git common directory outside the tracked worktree.
+	// Removing the tracked primary can then erase its root while leaving a
+	// durable family probe that authoritatively reports the worktree omission.
+	require.NoError(t, os.MkdirAll(seedRoot, 0o755))
+	runTopologyGitCommand(t, seedRoot, "init", "-b", "main")
+	runTopologyGitCommand(t, seedRoot, "config", "user.email", "topology@example.invalid")
+	runTopologyGitCommand(t, seedRoot, "config", "user.name", "Topology Test")
 	require.NoError(t, os.WriteFile(
-		filepath.Join(primaryRoot, "main.go"),
+		filepath.Join(seedRoot, "main.go"),
 		[]byte("package topology\n\nfunc TopologyBase() {}\n"),
 		0o644,
 	))
-	runTopologyGitCommand(t, primaryRoot, "add", "main.go")
-	runTopologyGitCommand(t, primaryRoot, "commit", "-m", "seed topology fixture")
+	runTopologyGitCommand(t, seedRoot, "add", "main.go")
+	runTopologyGitCommand(t, seedRoot, "commit", "-m", "seed topology fixture")
+	require.NoError(t, os.MkdirAll(commonDir, 0o755))
+	runTopologyGitCommand(t, commonDir, "init", "--bare")
+	runTopologyGitCommand(t, seedRoot, "remote", "add", "origin", commonDir)
+	runTopologyGitCommand(t, seedRoot, "push", "origin", "main")
+	runTopologyGitCommand(t, commonDir, "symbolic-ref", "HEAD", "refs/heads/main")
+	runTopologyGitCommand(t, commonDir, "worktree", "add", primaryRoot, "main")
 
 	// Start from the stale startup snapshot: the watcher saw no configured
 	// repositories when it was built. A Track racing this warmup must persist
@@ -1011,21 +1023,50 @@ func TestAttachedWatcherDiscoversAndForgetsLinkedWorktree(t *testing.T) {
 	assert.Equal(t, registration.CheckoutID, primaryGraph.OwnerCheckoutID)
 
 	// The linked watcher is gone, so the primary is again this family's sole
-	// topology owner. Make its authoritative disappearance already eligible
-	// for cleanup, then re-register the real controller callback to raise a
-	// deterministic startup dispatch. Reconciliation removes the current owner
-	// through its retained async lease; losing that context deadlocks here.
-	primaryCheckout, found, err := catalog.GetCheckout(ctx, registration.CheckoutID)
-	require.NoError(t, err)
-	require.True(t, found)
-	now := time.Now().Unix()
-	primaryCheckout.State = store_sqlite.CheckoutStateRemovalGrace
-	primaryCheckout.RemovalDetectedAt = now - 2
-	primaryCheckout.RemovalDeadline = now - 1
-	primaryCheckout.RemovalEvidence = "test: authoritative primary disappearance"
-	require.NoError(t, catalog.UpsertCheckout(ctx, primaryCheckout))
-	require.NoError(t, os.Rename(primaryRoot, primaryRoot+"-vanished"))
+	// topology owner. Remove that source too, and let its last event drain while
+	// the root is still healthy. The subsequent attachment therefore has an
+	// empty watcher snapshot and can discover the family only from durable
+	// catalog ownership.
+	require.NoError(t, watcher.RemoveRepo(trackedPrefix))
+	liveWatchers, _ = watcher.WatchedRepos()
+	require.Zero(t, liveWatchers)
+	require.Eventually(t, func() bool {
+		controller.topologyNudgeMu.Lock()
+		defer controller.topologyNudgeMu.Unlock()
+		return len(controller.topologyNudges) == 0
+	}, 5*time.Second, 10*time.Millisecond,
+		"source-removal topology reconciliation did not drain while the primary was healthy")
+
+	// Remove the primary through Git's own administration, then re-register the
+	// real controller callback. Reconciliation must seed from the catalog even
+	// though registration can no longer snapshot a filesystem source. The
+	// durable common directory authoritatively omits the worktree; the ordinary
+	// removal grace and its scheduled retry then remove the current owner through
+	// the retained async lease.
+	runTopologyGitCommand(t, commonDir, "worktree", "remove", "--force", primaryRoot)
+	type topologyResult struct {
+		report reconcile.FamilyReport
+		err    error
+	}
+	topologyResults := make(chan topologyResult, 4)
+	controller.topologyReconcile = func(runCtx context.Context, familyID string) {
+		report, reconcileErr := lifecycle.ReconcileFamily(runCtx, familyID)
+		select {
+		case topologyResults <- topologyResult{report: report, err: reconcileErr}:
+		default:
+		}
+	}
 	controller.AttachWatcher(watcher)
+
+	select {
+	case result := <-topologyResults:
+		require.NoError(t, result.err)
+		assert.Equal(t, registration.FamilyID, result.report.FamilyID)
+		assert.True(t, result.report.InventoryUsable,
+			"catalog-seeded reconciliation did not use the durable Git common directory")
+	case <-time.After(5 * time.Second):
+		t.Fatal("catalog-owned family was not submitted to topology reconciliation")
+	}
 
 	require.Eventually(t, func() bool {
 		_, checkoutFound, checkoutErr := catalog.GetCheckout(ctx, registration.CheckoutID)

@@ -1788,7 +1788,8 @@ func (c *realController) AttachWatcherContext(ctx context.Context, mw *indexer.M
 	}
 	// Install the topology consumer before publication. A concurrent Track
 	// that observes the pointer can then safely start and dispatch a watcher.
-	mw.OnWorktreeChangeContext(func(dispatchCtx context.Context, repoPrefix, _ string) {
+	mw.OnWorktreeChangeContext(func(dispatchCtx context.Context, repoPrefix, rootPath string) {
+		dispatchCtx = withTopologyReconcileSource(dispatchCtx, rootPath)
 		resolveCtx, cancel := context.WithTimeout(dispatchCtx, 10*time.Second)
 		familyID, err := c.lifecycle.ResolveFamilyID(resolveCtx, repoPrefix)
 		cancel()
@@ -1802,9 +1803,27 @@ func (c *realController) AttachWatcherContext(ctx context.Context, mw *indexer.M
 	})
 	c.multiWatcher.Store(mw)
 
+	// Repair durable watcher sources before catalog seeding. Healthy sources
+	// then contribute their exact dispatch context, while families whose source
+	// truly disappeared are still covered by the durable catalog pass below.
 	attachErr := c.lifecycle.EnsureConfiguredWatchers(ctx)
+
+	// Registration snapshots only contain sources that still exist. Seed the
+	// same single-flight from durable catalog ownership as well, so a primary
+	// that disappeared before attachment is reconciled and forgotten rather
+	// than surviving until a janitor pass. Reconciliation resolves the probe
+	// source at execution time, after watcher repair has converged.
+	familyIDs, familyErr := c.lifecycle.KnownFamilyIDs(ctx)
+	if familyErr == nil {
+		for _, familyID := range familyIDs {
+			seedCtx := withTopologyReconcileSource(ctx, "catalog")
+			retainedCtx, release := mw.RetainTopologyDispatch(seedCtx)
+			c.nudgeFamilyTopologyRequest(retainedCtx, familyID, release)
+		}
+	}
+
 	resumeErr := c.lifecycle.ResumePendingTransitions(ctx)
-	return errors.Join(attachErr, resumeErr)
+	return errors.Join(attachErr, familyErr, resumeErr)
 }
 
 // watcher reads the attached MultiWatcher without touching the coarse mutex.

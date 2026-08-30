@@ -67,6 +67,26 @@ type topologyNudgeRequest struct {
 	lease *topologyNudgeLease
 }
 
+type topologyReconcileSourceContextKey struct{}
+
+func withTopologyReconcileSource(ctx context.Context, source string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if source == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, topologyReconcileSourceContextKey{}, source)
+}
+
+func topologyReconcileSource(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	source, _ := ctx.Value(topologyReconcileSourceContextKey{}).(string)
+	return source
+}
+
 func newTopologyNudgeRequest(ctx context.Context, release func()) topologyNudgeRequest {
 	if ctx == nil {
 		ctx = context.Background()
@@ -508,6 +528,8 @@ func (c *realController) reconcileFamilyForProbeContext(ctx context.Context, fam
 	}
 	if _, err := c.lifecycle.ReconcileFamily(ctx, familyID); err != nil && c.logger != nil {
 		c.logger.Debug("probe view: reconciling the family failed",
-			zap.String("family", familyID), zap.Error(err))
+			zap.String("family", familyID),
+			zap.String("source", topologyReconcileSource(ctx)),
+			zap.Error(err))
 	}
 }
