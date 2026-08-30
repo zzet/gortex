@@ -1397,8 +1397,10 @@ observePending:
 	case <-time.After(10 * time.Second):
 		t.Fatal("removing the survivor deadlocked behind its own pending controller request")
 	}
-	require.Nil(t, legacyPending,
-		"owner transfer queued the survivor behind the retained family reconcile")
+	if legacyPending != nil {
+		require.Nil(t, legacyPending.lease,
+			"owner transfer retained a watcher lease behind the active family reconcile")
+	}
 	require.Equal(t, int32(1), reconcileCalls.Load(),
 		"removing the whole family should not start a descendant reconcile")
 	require.Eventually(t, func() bool {

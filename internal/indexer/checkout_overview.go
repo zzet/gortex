@@ -204,11 +204,11 @@ func (l *CheckoutLifecycle) FamiliesOverview(ctx context.Context, familyFilter s
 	return out, nil
 }
 
-// KnownFamilyIDs returns every family the catalog currently owns. It is the
-// durable startup-reconciliation source: watcher membership can already be
-// gone when the filesystem root disappears, but the catalog must still be
-// reconciled so its checkout and graph can be retired.
-func (l *CheckoutLifecycle) KnownFamilyIDs(ctx context.Context) ([]string, error) {
+// CatalogSeedFamilyIDs returns every family the catalog currently owns. It is
+// the durable startup-reconciliation source: watcher membership can already be
+// gone when the filesystem root disappears, but the catalog must still submit
+// the family so its checkout and graph can be retired.
+func (l *CheckoutLifecycle) CatalogSeedFamilyIDs(ctx context.Context) ([]string, error) {
 	if l == nil {
 		return nil, fmt.Errorf("indexer: checkout lifecycle is not wired")
 	}

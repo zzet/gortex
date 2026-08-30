@@ -90,6 +90,23 @@ func topologyReconcileSource(ctx context.Context) string {
 	return source
 }
 
+type topologyReconcileFamilyContextKey struct{}
+
+func withTopologyReconcileFamily(ctx context.Context, familyID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, topologyReconcileFamilyContextKey{}, familyID)
+}
+
+func topologyReconcileFamily(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	familyID, _ := ctx.Value(topologyReconcileFamilyContextKey{}).(string)
+	return familyID
+}
+
 func newTopologyNudgeRequest(ctx context.Context, release func()) topologyNudgeRequest {
 	if ctx == nil {
 		ctx = context.Background()
@@ -109,7 +126,8 @@ func (request *topologyNudgeRequest) finish() {
 }
 
 type topologyNudgeState struct {
-	pending *topologyNudgeRequest
+	currentSource string
+	pending       *topologyNudgeRequest
 }
 
 // resolveProbeView decides which graph answers a probe about path.
@@ -584,6 +602,14 @@ func (c *realController) nudgeFamilyTopologyRequest(ctx context.Context, familyI
 		request.finish()
 		return
 	}
+	// A watcher removal can synchronously promote another member and emit a
+	// callback using this reconcile's context. That callback is an effect of
+	// the current authoritative pass, not new external evidence; queueing it
+	// behind itself retains a watcher lease the same pass may need to drain.
+	if topologyReconcileFamily(ctx) == familyID {
+		request.finish()
+		return
+	}
 	run := func(runCtx context.Context, id string) {
 		if c.topologyReconcile != nil {
 			c.topologyReconcile(runCtx, id)
@@ -607,13 +633,30 @@ func (c *realController) nudgeFamilyTopologyRequest(ctx context.Context, familyI
 		c.topologyNudges = make(map[string]*topologyNudgeState)
 	}
 	if state := c.topologyNudges[familyID]; state != nil {
+		// The attachment catalog pass is a durable backstop, not newer
+		// filesystem evidence. If a watcher request already owns this family,
+		// that pass covers the same inventory and must not become trailing.
+		if topologyReconcileSource(request.ctx) == "catalog" {
+			c.topologyNudgeMu.Unlock()
+			request.finish()
+			return
+		}
+		// A watcher event arriving during any active pass is real trailing
+		// evidence and must still run, but its dispatch lease cannot wait behind
+		// that pass: the active reconcile may synchronously retire the same
+		// watcher and wait for admitted dispatches to drain. Detach the queued
+		// request from that lease while preserving its context and execution.
+		request.finish()
+		request.lease = nil
 		superseded := state.pending
 		state.pending = &request
 		c.topologyNudgeMu.Unlock()
 		superseded.finish()
 		return
 	}
-	c.topologyNudges[familyID] = &topologyNudgeState{}
+	c.topologyNudges[familyID] = &topologyNudgeState{
+		currentSource: topologyReconcileSource(request.ctx),
+	}
 	c.topologyNudgeMu.Unlock()
 
 	go c.runTopologyNudgeLoop(run, familyID, request)
@@ -640,7 +683,7 @@ func (c *realController) runTopologyNudgeLoop(
 	for {
 		func() {
 			defer current.finish()
-			run(current.ctx, familyID)
+			run(withTopologyReconcileFamily(current.ctx, familyID), familyID)
 		}()
 
 		c.topologyNudgeMu.Lock()
@@ -648,6 +691,7 @@ func (c *realController) runTopologyNudgeLoop(
 		if state != nil && state.pending != nil {
 			current = *state.pending
 			state.pending = nil
+			state.currentSource = topologyReconcileSource(current.ctx)
 			c.topologyNudgeMu.Unlock()
 			continue
 		}

@@ -1813,12 +1813,16 @@ func (c *realController) AttachWatcherContext(ctx context.Context, mw *indexer.M
 	// that disappeared before attachment is reconciled and forgotten rather
 	// than surviving until a janitor pass. Reconciliation resolves the probe
 	// source at execution time, after watcher repair has converged.
-	familyIDs, familyErr := c.lifecycle.KnownFamilyIDs(ctx)
+	familyIDs, familyErr := c.lifecycle.CatalogSeedFamilyIDs(ctx)
 	if familyErr == nil {
 		for _, familyID := range familyIDs {
+			// Catalog seeding is not an admitted watcher callback and must not
+			// retain a watcher dispatch lease. Its handler can remove the last
+			// watcher in this family, which synchronously waits for those leases
+			// to drain. The nudge request detaches seedCtx itself, so discovery
+			// survives the attachment call without creating that self-cycle.
 			seedCtx := withTopologyReconcileSource(ctx, "catalog")
-			retainedCtx, release := mw.RetainTopologyDispatch(seedCtx)
-			c.nudgeFamilyTopologyRequest(retainedCtx, familyID, release)
+			c.nudgeFamilyTopologyRequest(seedCtx, familyID, nil)
 		}
 	}
 
