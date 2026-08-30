@@ -1013,44 +1013,6 @@ func (m *RefViewManager) runBuild(
 	return RefViewResult{RefViewID: view.RefViewID, GenerationID: claim.WinnerGenerationID, Resolved: published, State: store_sqlite.RefViewReady, Built: built}, nil
 }
 
-// superseded takes a finished build out of the running and answers with a
-// retry. The view's active pointer is untouched: whatever it was serving is
-// still a legal thing to serve, and the next selection resolves the state the
-// selector actually moved to.
-func (m *RefViewManager) superseded(
-	ctx context.Context,
-	build store_sqlite.RefViewBuild,
-	generationID int64,
-	view store_sqlite.RefView,
-	published gitstate.ResolvedSelector,
-) RefViewResult {
-	m.supersede(ctx, build, generationID)
-	viewmetrics.Count(viewmetrics.RefViewSelectionTotal, viewmetrics.RefViewBuilding)
-	return RefViewResult{
-		RefViewID: view.RefViewID,
-		Resolved:  published,
-		State:     store_sqlite.RefViewBuilding,
-		Built:     true,
-	}
-}
-
-// supersede retires a generation nothing will adopt and closes its build.
-// Both writes are best effort: the caller's answer is "retry" either way, and
-// failing the selection because the bookkeeping failed would turn a retryable
-// answer into an error. Both are detached from the request for the reason
-// completeBuild gives — a cancellation is exactly when they matter most.
-func (m *RefViewManager) supersede(ctx context.Context, build store_sqlite.RefViewBuild, generationID int64) {
-	ctx = closingContext(ctx)
-	if generationID > 0 {
-		if err := m.store.MarkPayloadGenerationSuperseded(ctx, generationID); err != nil {
-			m.logger.Debug("ref view manager: could not supersede an unadopted generation",
-				zap.String("ref_view", build.RefViewID),
-				zap.Int64("generation", generationID), zap.Error(err))
-		}
-	}
-	m.completeBuild(ctx, build, store_sqlite.ViewGenerationSuperseded, generationID, "")
-}
-
 // completeBuild ends one attempt that will not publish — it failed, or it was
 // overtaken. The attempt that DOES publish is closed by the adoption itself,
 // in the same transaction that points the view at its generation.

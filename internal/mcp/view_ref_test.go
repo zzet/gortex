@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
@@ -585,6 +586,31 @@ func refProducerStates(t *testing.T, stack *refStack, generationID int64) map[st
 	return out
 }
 
+// awaitRefProducerState observes the asynchronous withdrawal worker's public
+// contract. Object-missing reads schedule producer withdrawal without waiting
+// behind SQLite's writer, so the catalog row is deliberately eventual rather
+// than synchronized with the tool response.
+func awaitRefProducerState(
+	t *testing.T,
+	stack *refStack,
+	generationID int64,
+	producer string,
+	want store_sqlite.ProducerState,
+) map[string]store_sqlite.ProducerState {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		states := refProducerStates(t, stack, generationID)
+		if states[producer] == want {
+			return states
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("producer %s did not reach %s: %+v", producer, want, states)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestRefViewPrunedObjectWithdrawsTheSourceCapability pins the withdrawal: a
 // read that finds the blob gone answers source_object_missing, the view stops
 // claiming it can serve bytes, and everything the generation already holds
@@ -614,10 +640,8 @@ func TestRefViewPrunedObjectWithdrawsTheSourceCapability(t *testing.T) {
 	// The withdrawal moves exactly one producer. Comparing against what the
 	// build declared is what makes that a claim about the withdrawal rather
 	// than about which states a ref view happens to be born in.
-	after := refProducerStates(t, stack, generationID)
-	if after[string(graphview.CapSourceSnapshot)] != store_sqlite.ProducerStateUnavailable {
-		t.Fatalf("the source snapshot capability was not withdrawn: %+v", after)
-	}
+	after := awaitRefProducerState(t, stack, generationID,
+		string(graphview.CapSourceSnapshot), store_sqlite.ProducerStateUnavailable)
 	for producer, state := range after {
 		if producer == string(graphview.CapSourceSnapshot) {
 			continue
