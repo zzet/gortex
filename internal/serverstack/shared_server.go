@@ -615,10 +615,17 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		s.CheckoutLifecycle = lifecycle
 	}
 	// Appended after backendCleanup but before MCP background drain. LIFO
-	// teardown therefore drains background work first, then closes per-repo
-	// parser workers, then the standalone Indexer, and only then the graph and
-	// store lock.
+	// teardown therefore drains detached MCP work first, then cancels and joins
+	// every checkout transition/coordinator, then closes per-repo parser
+	// workers and the standalone Indexer, and only then closes the graph and
+	// store lock. Closing MultiIndexer/backend before the lifecycle was joined
+	// let a cold promotion keep writing into an already-closing SQLite store.
 	s.cleanup = append(s.cleanup, func() {
+		if s.CheckoutLifecycle != nil {
+			if err := s.CheckoutLifecycle.Close(); err != nil {
+				logger.Warn("serverstack: checkout lifecycle shutdown failed", zap.Error(err))
+			}
+		}
 		if mi != nil {
 			if err := mi.Close(context.Background()); err != nil {
 				logger.Warn("serverstack: multi-indexer shutdown failed", zap.Error(err))

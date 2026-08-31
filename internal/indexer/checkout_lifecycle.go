@@ -199,9 +199,12 @@ type CheckoutLifecycle struct {
 	// because dropping a coordinator waits for its in-flight build, and
 	// holding the collaborator lock across that wait would block every
 	// watcher and notifier lookup for the length of an index pass.
-	coordMu          sync.Mutex
-	coordinators     map[string]*CheckoutCoordinator
-	coordinatorHeads map[string]checkoutHeadIdentity
+	closeMu            sync.Mutex
+	coordMu            sync.Mutex
+	coordinatorClosing bool
+	coordinatorStartWG sync.WaitGroup
+	coordinators       map[string]*CheckoutCoordinator
+	coordinatorHeads   map[string]checkoutHeadIdentity
 
 	checkoutSignalWatchMu        sync.Mutex
 	checkoutSignalWatchers       *checkoutSourceSignalWatcherSet
@@ -2221,6 +2224,15 @@ func (l *CheckoutLifecycle) buildCoordinator(
 func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
 	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout, poll time.Duration,
 ) (*CheckoutCoordinator, error) {
+	// Reserve the whole construction path before touching the catalog,
+	// MultiIndexer, or a per-repo Indexer. Close may retire all three after its
+	// construction wait; taking the token later leaves a pre-Close caller able
+	// to resume against those stale objects after admission reopens.
+	if !l.beginCoordinatorStart() {
+		return nil, nil
+	}
+	defer l.coordinatorStartWG.Done()
+
 	if l.store == nil || l.catalog == nil {
 		return nil, nil
 	}
@@ -2284,7 +2296,9 @@ func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
 	// Recorded here rather than at registration: the loop is already running
 	// when the constructor returns, and the transitions register only once the
 	// rebuild they drive with it has landed.
-	l.trackStarted(checkout.CheckoutID, coordinator)
+	if !l.trackStarted(checkout.CheckoutID, coordinator) {
+		return nil, nil
+	}
 	return coordinator, nil
 }
 
@@ -2311,10 +2325,26 @@ func (l *CheckoutLifecycle) RecordCheckoutBuildFailure(checkoutID string, genera
 
 // trackStarted records a coordinator whose loop is running, and forgets the
 // ones started earlier for the same checkout that have since stopped.
-func (l *CheckoutLifecycle) trackStarted(checkoutID string, coordinator *CheckoutCoordinator) {
+func (l *CheckoutLifecycle) trackStarted(checkoutID string, coordinator *CheckoutCoordinator) bool {
+	l.coordMu.Lock()
+	if l.coordinatorClosing || !coordinator.Running() {
+		l.coordMu.Unlock()
+		_ = coordinator.Close()
+		return false
+	}
+	l.started[checkoutID] = append(stillRunning(l.started[checkoutID]), coordinator)
+	l.coordMu.Unlock()
+	return true
+}
+
+func (l *CheckoutLifecycle) beginCoordinatorStart() bool {
 	l.coordMu.Lock()
 	defer l.coordMu.Unlock()
-	l.started[checkoutID] = append(stillRunning(l.started[checkoutID]), coordinator)
+	if l.coordinatorClosing {
+		return false
+	}
+	l.coordinatorStartWG.Add(1)
+	return true
 }
 
 // runningLocked reports whether a coordinator started for one checkout is
@@ -2369,6 +2399,11 @@ func (l *CheckoutLifecycle) installCoordinatorWithHead(
 	rememberHead bool,
 ) bool {
 	l.coordMu.Lock()
+	if l.coordinatorClosing || !coordinator.Running() {
+		l.coordMu.Unlock()
+		_ = coordinator.Close()
+		return false
+	}
 	if _, raced := l.coordinators[checkoutID]; raced {
 		l.coordMu.Unlock()
 		_ = coordinator.Close()
@@ -2410,6 +2445,12 @@ func (l *CheckoutLifecycle) replaceCoordinator(
 
 	l.coordMu.Lock()
 	previous := l.coordinators[checkoutID]
+	if l.coordinatorClosing || !coordinator.Running() {
+		l.coordMu.Unlock()
+		_ = coordinator.Close()
+		l.oweRetirement(coordinator.DrainRetirements()...)
+		return false
+	}
 	if previous != expected {
 		l.coordMu.Unlock()
 		_ = coordinator.Close()
@@ -2624,6 +2665,21 @@ func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	// Close is reusable, but one close window must be exclusive: otherwise an
+	// overlapping caller could reopen coordinator admission while the first is
+	// still joining workers.
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
+
+	l.coordMu.Lock()
+	l.coordinatorClosing = true
+	l.coordMu.Unlock()
+	defer func() {
+		l.coordMu.Lock()
+		l.coordinatorClosing = false
+		l.coordMu.Unlock()
+	}()
+
 	l.beginCheckoutSourceSignalClose()
 	defer l.finishCheckoutSourceSignalClose()
 	l.transitionMu.Lock()
@@ -2664,14 +2720,48 @@ func (l *CheckoutLifecycle) Close() error {
 		l.retryMu.Unlock()
 	}()
 
+	// Every admitted constructor has now either registered its running worker
+	// in started or rejected and joined it. Add is fenced by coordMu and the
+	// closing gate, so it cannot race this Wait.
+	l.coordinatorStartWG.Wait()
+
 	l.coordMu.Lock()
+	unique := make(map[*CheckoutCoordinator]struct{}, len(l.coordinators))
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
 	for _, coordinator := range l.coordinators {
+		if coordinator == nil {
+			continue
+		}
+		unique[coordinator] = struct{}{}
 		coordinators = append(coordinators, coordinator)
 	}
+	for _, started := range l.started {
+		for _, coordinator := range started {
+			if coordinator == nil {
+				continue
+			}
+			if _, duplicate := unique[coordinator]; duplicate {
+				continue
+			}
+			unique[coordinator] = struct{}{}
+			coordinators = append(coordinators, coordinator)
+		}
+	}
 	l.coordinators = map[string]*CheckoutCoordinator{}
+	l.coordinatorHeads = map[string]checkoutHeadIdentity{}
+	l.started = map[string][]*CheckoutCoordinator{}
+	viewmetrics.SetGauge(viewmetrics.Coordinators, 0)
 	l.coordMu.Unlock()
 	l.stopCheckoutSourceSignalWatchers()
+
+	// Signal every worker before joining any one of them. A sequential
+	// cancel-and-wait lets later coordinators continue indexing into teardown
+	// for as long as the first slow build takes to unwind.
+	stopCtx, cancelStop := context.WithCancel(context.Background())
+	cancelStop()
+	for _, coordinator := range coordinators {
+		_ = coordinator.CloseContext(stopCtx)
+	}
 
 	var errs []error
 	for _, coordinator := range coordinators {

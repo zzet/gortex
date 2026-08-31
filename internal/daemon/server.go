@@ -93,6 +93,25 @@ type Server struct {
 	doneOnce sync.Once
 	conns    map[net.Conn]struct{}
 	connsMu  sync.Mutex
+
+	// processStateOwned is set only after this server successfully publishes
+	// its PID file. Shutdown closes transport, but deliberately leaves the PID
+	// and runtime records in place: they are the cross-process exclusion guard
+	// while the outer daemon owner drains graph producers and closes SQLite.
+	// ReleaseProcessState removes them only after that teardown has finished.
+	processStateMu    sync.Mutex
+	processStateOwned bool
+	processStateOnce  sync.Once
+
+	// handlerMu fences positive WaitGroup admission against Serve's terminal
+	// wait. Shutdown closes admission before listeners and connections, so the
+	// graph owner can safely tear down only after Serve returns.
+	handlerMu      sync.Mutex
+	handlers       sync.WaitGroup
+	handlerClosing bool
+	// maintenanceInterval is captured per server so focused tests can shorten
+	// it without racing maintenance loops owned by other server fixtures.
+	maintenanceInterval time.Duration
 }
 
 // MCPDispatcher is implemented by whichever layer runs the MCP tool
@@ -187,14 +206,15 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 		logger = zap.NewNop()
 	}
 	s := &Server{
-		SocketPath:   socketPath,
-		Version:      version,
-		Logger:       logger,
-		instanceID:   newSessionID(),
-		sessions:     NewSessionRegistry(),
-		shutdown:     make(chan struct{}),
-		conns:        make(map[net.Conn]struct{}),
-		binaryStatFn: osStatIdentity,
+		SocketPath:          socketPath,
+		Version:             version,
+		Logger:              logger,
+		instanceID:          newSessionID(),
+		sessions:            NewSessionRegistry(),
+		shutdown:            make(chan struct{}),
+		maintenanceInterval: deadPeerSweepInterval,
+		conns:               make(map[net.Conn]struct{}),
+		binaryStatFn:        osStatIdentity,
 	}
 	// Capture the running image's identity so status requests can detect
 	// a later on-disk replace. Best-effort: a failure here leaves
@@ -286,7 +306,7 @@ func (s *Server) Listen() error {
 	lc := &net.ListenConfig{}
 	l, err := lc.Listen(context.Background(), "unix", s.SocketPath)
 	if err != nil {
-		_ = os.Remove(PIDFilePath())
+		s.releasePIDFileAfterListenFailure()
 		return fmt.Errorf("listen: %w", err)
 	}
 	// chmod the socket to user-only on Unix. Windows has no POSIX mode
@@ -295,6 +315,8 @@ func (s *Server) Listen() error {
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(s.SocketPath, 0o600); err != nil {
 			_ = l.Close()
+			_ = os.Remove(s.SocketPath)
+			s.releasePIDFileAfterListenFailure()
 			return fmt.Errorf("chmod socket: %w", err)
 		}
 	}
@@ -312,12 +334,19 @@ func (s *Server) Listen() error {
 		httpLn, herr := net.Listen("tcp", s.HTTPAddr)
 		if herr != nil {
 			_ = l.Close()
-			_ = os.Remove(PIDFilePath())
+			s.releasePIDFileAfterListenFailure()
 			return fmt.Errorf("listen http: %w", herr)
 		}
 		s.httpListener = httpLn
 		s.httpServer = &http.Server{
-			Handler:           s.HTTPHandler,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !s.beginHandler() {
+					http.Error(w, "daemon is shutting down", http.StatusServiceUnavailable)
+					return
+				}
+				defer s.handlers.Done()
+				s.HTTPHandler.ServeHTTP(w, r)
+			}),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 	}
@@ -342,6 +371,10 @@ func (s *Server) Serve() error {
 	if s.listener == nil {
 		return errors.New("daemon: Listen must be called before Serve")
 	}
+	defer func() {
+		_ = s.Shutdown()
+		s.handlers.Wait()
+	}()
 	if s.httpListener != nil && s.httpServer != nil {
 		go func() {
 			if err := s.httpServer.Serve(s.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -354,7 +387,12 @@ func (s *Server) Serve() error {
 	s.Logger.Info("daemon: serving", zap.String("socket", s.SocketPath))
 	// Background hygiene: reap sessions whose client process died without a
 	// clean disconnect, and (opt-in) auto-exit after an idle window.
-	go s.runMaintenance()
+	if s.beginHandler() {
+		go func() {
+			defer s.handlers.Done()
+			s.runMaintenance()
+		}()
+	}
 	var emfileBackoff time.Duration
 	for {
 		conn, err := s.listener.Accept()
@@ -393,7 +431,15 @@ func (s *Server) Serve() error {
 		}
 		emfileBackoff = 0
 		s.trackConn(conn)
-		go s.handle(conn)
+		if !s.beginHandler() {
+			_ = conn.Close()
+			s.untrackConn(conn)
+			continue
+		}
+		go func() {
+			defer s.handlers.Done()
+			s.handle(conn)
+		}()
 	}
 }
 
@@ -408,7 +454,7 @@ var deadPeerSweepInterval = 30 * time.Second
 // shutdown signal.
 func (s *Server) runMaintenance() {
 	idle := IdleTimeoutFromEnv()
-	tick := deadPeerSweepInterval
+	tick := s.maintenanceInterval
 	if idle > 0 && idle/4 < tick {
 		tick = idle / 4 // sample often enough to honour a short idle window
 	}
@@ -604,6 +650,10 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		},
 	}
 	serveMCPConnectionWithHooks(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
+		if !s.beginHandler() {
+			return nil, errors.New("daemon is shutting down")
+		}
+		defer s.handlers.Done()
 		reply, _, err := sess.dispatchMCPOnceContext(ctx, line, func() ([]byte, error) {
 			reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -658,11 +708,10 @@ func (s *Server) serveControl(conn net.Conn, reader *bufio.Reader, sess *Session
 		writeErr := WriteJSONLine(conn, resp)
 		if req.Kind == ControlShutdown && resp.OK {
 			// Scheduled regardless of whether the ack reached the client. The
-			// controller flushes and closes the store before answering, so a
-			// client that gave up waiting (or died) has already left by the
-			// time we get here — and skipping the teardown on a failed write
-			// would leave a daemon that flushed its store and then kept
-			// running, holding the on-disk lock the next start needs.
+			// teardown must happen even when a client gives up waiting (or dies).
+			// Transport closes here; Serve joins admitted handlers and returns to
+			// the owner, which then closes the graph stack. Never close the store
+			// inside Controller.Shutdown while request handlers are still live.
 			//
 			// The short delay gives a client that IS still listening a moment
 			// to read the ack before the listener goes away.
@@ -693,13 +742,23 @@ func (s *Server) handleControlBounded(sess *Session, req ControlRequest) Control
 		budget = s.ControlTimeout
 	}
 	if budget <= 0 {
+		if !s.beginHandler() {
+			return controlErr(ErrInternal, "daemon is shutting down")
+		}
+		defer s.handlers.Done()
 		return s.handleControl(context.Background(), sess, req)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
 	done := make(chan ControlResponse, 1)
-	go func() { done <- s.handleControl(ctx, sess, req) }()
+	if !s.beginHandler() {
+		return controlErr(ErrInternal, "daemon is shutting down")
+	}
+	go func() {
+		defer s.handlers.Done()
+		done <- s.handleControl(ctx, sess, req)
+	}()
 
 	select {
 	case resp := <-done:
@@ -953,15 +1012,29 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 	return controlErr(ErrInternal, "unknown control kind: "+req.Kind)
 }
 
-// Shutdown stops the accept loop, closes outstanding connections, and
-// removes the socket and PID files. Safe to call multiple times.
+// Shutdown stops transport admission, closes outstanding connections, and
+// removes the socket. Safe to call multiple times.
+//
+// It intentionally retains the PID and runtime files. The process can still
+// own graph workers and an open SQLite store after Serve returns; the outer
+// daemon owner must call ReleaseProcessState only after those resources have
+// drained. Keeping the PID visible closes the restart race in that interval.
 func (s *Server) Shutdown() error {
 	var first error
 	s.doneOnce.Do(func() {
+		s.closeHandlerAdmission()
 		close(s.shutdown)
 		if s.listener != nil {
 			first = s.listener.Close()
 		}
+		// Close Unix sessions before the HTTP grace wait. Otherwise an
+		// established control/MCP connection can admit more work throughout
+		// that two-second window even though listener admission is closed.
+		s.connsMu.Lock()
+		for c := range s.conns {
+			_ = c.Close()
+		}
+		s.connsMu.Unlock()
 		// Tear down the HTTP listener with a short grace window so
 		// in-flight Streamable responses can finish flushing. We
 		// don't propagate the http error unless the unix-socket
@@ -974,20 +1047,61 @@ func (s *Server) Shutdown() error {
 			}
 			cancel()
 		}
-		// Close all live conns so per-conn goroutines exit their read loops.
-		s.connsMu.Lock()
-		for c := range s.conns {
-			_ = c.Close()
-		}
-		s.connsMu.Unlock()
 		_ = os.Remove(s.SocketPath)
-		_ = os.Remove(PIDFilePath())
-		// The runtime record describes THIS daemon's resolved choices, so it
-		// shares the PID file's lifetime — a survivor would point readers at
-		// a store no daemon has open.
-		RemoveRuntimeState()
 	})
 	return first
+}
+
+// ReleaseProcessState relinquishes this daemon's cross-process ownership
+// marker after graph teardown has completed. It is separate from Shutdown so
+// closing the transport cannot let another start race a store that is still
+// open. Servers that successfully called Listen must call this at the end of
+// their owner-level teardown; repeated calls are harmless.
+func (s *Server) ReleaseProcessState() {
+	s.processStateOnce.Do(func() {
+		s.processStateMu.Lock()
+		owned := s.processStateOwned
+		s.processStateOwned = false
+		s.processStateMu.Unlock()
+		if !owned {
+			return
+		}
+		// The runtime record describes THIS daemon's resolved choices, so it
+		// shares the PID file's lifetime. Remove it first and the PID guard
+		// last: once the PID disappears a successor may start and publish its
+		// own runtime state, which this process must never delete.
+		RemoveRuntimeState()
+		_ = os.Remove(PIDFilePath())
+	})
+}
+
+// releasePIDFileAfterListenFailure relinquishes the PID without deleting the
+// startup runtime record. Detached starters use that record to report why the
+// listener failed.
+func (s *Server) releasePIDFileAfterListenFailure() {
+	s.processStateMu.Lock()
+	owned := s.processStateOwned
+	s.processStateOwned = false
+	s.processStateMu.Unlock()
+	if owned {
+		_ = os.Remove(PIDFilePath())
+	}
+}
+
+func (s *Server) beginHandler() bool {
+	s.handlerMu.Lock()
+	defer s.handlerMu.Unlock()
+	if s.handlerClosing {
+		return false
+	}
+	s.handlers.Add(1)
+	return true
+}
+
+func (s *Server) closeHandlerAdmission() {
+	s.handlerMu.Lock()
+	s.handlerClosing = true
+	s.handlerMu.Unlock()
 }
 
 // writePIDFile fails if a live daemon is already running, so starting
@@ -1006,7 +1120,13 @@ func (s *Server) writePIDFile() error {
 			_ = os.Remove(path)
 		}
 	}
-	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600)
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		return err
+	}
+	s.processStateMu.Lock()
+	s.processStateOwned = true
+	s.processStateMu.Unlock()
+	return nil
 }
 
 // RunningPID reports the PID of a live daemon recorded in the PID file, or

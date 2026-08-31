@@ -169,6 +169,7 @@ func newDaemon(t *testing.T, ctrl Controller) (*Server, string) {
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(dir, "state.json"))
 
 	srv := New(socket, "test-0.0.0", zap.NewNop())
 	srv.Controller = ctrl
@@ -181,7 +182,10 @@ func newDaemon(t *testing.T, ctrl Controller) (*Server, string) {
 		return IsRunningAt(socket)
 	}, 2*time.Second, 10*time.Millisecond, "daemon socket never came up")
 
-	t.Cleanup(func() { _ = srv.Shutdown() })
+	t.Cleanup(func() {
+		_ = srv.Shutdown()
+		srv.ReleaseProcessState()
+	})
 	return srv, socket
 }
 
@@ -416,17 +420,24 @@ func TestDaemon_ConcurrentSessions(t *testing.T) {
 		"sessions should drain after clients close")
 }
 
-func TestDaemon_ShutdownRemovesSocketAndPIDFile(t *testing.T) {
+func TestDaemon_ShutdownRetainsPIDUntilProcessStateRelease(t *testing.T) {
 	srv, socket := newDaemon(t, &fakeController{})
 	pidFile := PIDFilePath()
+	require.NoError(t, WriteRuntimeState(RuntimeState{PID: os.Getpid()}))
 
 	require.True(t, fileExists(socket))
 	require.True(t, fileExists(pidFile))
 
 	require.NoError(t, srv.Shutdown())
+	require.False(t, fileExists(socket), "transport socket must close first")
+	require.True(t, fileExists(pidFile), "PID must guard graph teardown after transport shutdown")
+	_, runtimeVisible := ReadRuntimeState()
+	require.True(t, runtimeVisible, "runtime state must remain visible while PID owns the store")
+
+	srv.ReleaseProcessState()
 
 	require.Eventually(t, func() bool {
-		return !fileExists(socket) && !fileExists(pidFile)
+		return !fileExists(socket) && !fileExists(pidFile) && !fileExists(RuntimeStatePath())
 	}, 2*time.Second, 10*time.Millisecond)
 }
 

@@ -540,6 +540,18 @@ func warmupDaemonStateWithOwnership(
 	markReady func(),
 	ownership *startupOwnershipPlan,
 ) (*indexer.MultiWatcher, *warmupTimings) {
+	return warmupDaemonStateWithOwnershipContext(
+		context.Background(), state, logger, markReady, ownership,
+	)
+}
+
+func warmupDaemonStateWithOwnershipContext(
+	ctx context.Context,
+	state *daemonState,
+	logger *zap.Logger,
+	markReady func(),
+	ownership *startupOwnershipPlan,
+) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state == nil {
 		return nil, timings
@@ -548,7 +560,10 @@ func warmupDaemonStateWithOwnership(
 		return nil, timings
 	}
 
-	ctx := progress.WithReporter(context.Background(), progress.Nop{})
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = progress.WithReporter(ctx, progress.Nop{})
 	// BeginParallelBatch / EndBatch tells every per-repo Indexer
 	// constructed inside the loop to skip both the graph-wide
 	// derivation passes (InferImplements / InferOverrides /
@@ -560,6 +575,12 @@ func warmupDaemonStateWithOwnership(
 	// per-repo passes serially before the global resolve. Without this
 	// batch wrapper, a 100+ repo warmup is O(R · global_size).
 	state.multiIndexer.BeginParallelBatch()
+	batchFinished := false
+	defer func() {
+		if !batchFinished {
+			state.multiIndexer.ResetBatch()
+		}
+	}()
 
 	// Production passes the post-Seed frozen split shared with startup
 	// readiness. Standalone/test callers compute the same split here.
@@ -849,8 +870,13 @@ func warmupDaemonStateWithOwnership(
 				}
 			}()
 		}
+	feedJobs:
 		for _, entry := range repos {
-			jobs <- entry
+			select {
+			case jobs <- entry:
+			case <-ctx.Done():
+				break feedJobs
+			}
 		}
 		close(jobs)
 		wg.Wait()
@@ -897,6 +923,10 @@ func warmupDaemonStateWithOwnership(
 	rotateColdInternGeneration(logger, "parallel_parse")
 	timings.parse = time.Since(phaseStart)
 	timings.filesReindexed = int(filesReindexed.Load())
+	if err := ctx.Err(); err != nil {
+		logger.Info("daemon: warmup cancelled after repository producers joined", zap.Error(err))
+		return nil, timings
+	}
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "parallel_parse"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
@@ -1222,6 +1252,7 @@ func warmupDaemonStateWithOwnership(
 	default:
 		state.multiIndexer.EndBatch()
 	}
+	batchFinished = true
 	postBatchNodes, postBatchContracts, postBatchResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
 	if postBatchNodes+postBatchContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs after derived passes",
@@ -1247,7 +1278,10 @@ func warmupDaemonStateWithOwnership(
 	publishReadinessPhase(state, "end_batch_done", true, map[string]any{
 		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 	})
-
+	if err := ctx.Err(); err != nil {
+		logger.Info("daemon: warmup cancelled before watcher publication", zap.Error(err))
+		return nil, timings
+	}
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
 		watchCfgs[prefix] = state.configManager.GetRepoConfig(prefix).Watch

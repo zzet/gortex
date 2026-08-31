@@ -636,7 +636,7 @@ func init() {
 // (when --detach is passed). Detach does a self-exec: re-runs this binary
 // with GORTEX_DAEMON_CHILD=1 set, which the inner exec picks up and runs
 // the actual serve loop.
-func runDaemonStart(cmd *cobra.Command, _ []string) error {
+func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 	// An explicit start (user or supervisor) supersedes a prior `daemon stop` —
 	// clear the stay-down mark so autostart works again. The autostart-spawned
 	// child (GORTEX_DAEMON_CHILD=1) must NOT clear it: that would let an
@@ -733,9 +733,12 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// The monitor must observe Seed transitions, but its exact cohort is frozen
 	// only after Seed from the one ownership plan shared with legacy warmup.
 	startupReadiness := newStartupViewReadinessMonitor(nil)
-	startupReadinessCtx, cancelStartupReadiness := context.WithCancel(context.Background())
+	warmupCtx, cancelWarmup := context.WithCancel(context.Background())
+	startupReadinessCtx, cancelStartupReadiness := context.WithCancel(warmupCtx)
 	state.lifecycle.SetModeTransitionObserver(startupReadiness.observe)
-	var startupReadinessWG sync.WaitGroup
+	var startupReadinessWG, warmupWG, eventHubWG sync.WaitGroup
+	stopJanitor := func() {}
+	stopEventHub := func() {}
 	if state.mcpServer != nil {
 		srv := state.mcpServer
 		controller.toolSurface = func() (string, string, int) {
@@ -748,32 +751,6 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// sweep the coordinators run.
 		controller.viewMaterializer = srv.Materializer()
 	}
-	// Teardown is wired into every exit path, not just the control-socket
-	// one. A SIGINT/SIGTERM is handled inside the daemon server: it calls
-	// Server.Shutdown directly, Serve returns, and the controller's hook is
-	// never reached — so installing the chain only on the hook meant a
-	// signalled daemon skipped watcher shutdown, the savings flush, and the
-	// final WAL checkpoint entirely. Both paths now run the same
-	// once-guarded func, and the deferred call covers whichever exit
-	// actually happens.
-	runTeardown := installDaemonTeardown(controller, controller.StopWatcher, func() error {
-		// Nothing has to be serialized here: per-file mtimes live in the
-		// FileMtime sidecar table, contract records ride on
-		// KindContract.Meta, and the vector index is persisted by the
-		// backend itself. Warm restart reads everything it needs straight
-		// from the on-disk store.
-		//
-		// The shared stack's teardown chain flushes the savings store and
-		// closes the backend handle, checkpointing the sqlite WAL.
-		if state.shared != nil {
-			return state.shared.Close()
-		}
-		if state.mcpServer != nil {
-			return state.mcpServer.FlushSavings()
-		}
-		return nil
-	})
-	defer runTeardown()
 	startupReadinessWG.Add(1)
 	go func() {
 		defer startupReadinessWG.Done()
@@ -781,10 +758,55 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			startupReadinessCtx, state, controller, startupReadiness, controller.TrackReadiness,
 		)
 	}()
-	defer func() {
+	stopStartupProducers := sync.OnceFunc(func() {
 		state.lifecycle.SetModeTransitionObserver(nil)
+		cancelWarmup()
 		cancelStartupReadiness()
+		stopJanitor()
+		warmupWG.Wait()
 		startupReadinessWG.Wait()
+		// Warmup is the only event-hub Run producer. Join it before stopping
+		// and waiting the hub so Add can never race Wait.
+		stopEventHub()
+		eventHubWG.Wait()
+	})
+
+	// Teardown is wired into every exit path, not just the control-socket
+	// one. The strict order is startup/readiness producer cancellation+join,
+	// filesystem watcher drain, then the shared stack (which joins checkout
+	// lifecycle workers before it closes the MultiIndexer and backend). Handler
+	// drain happens inside Serve before this chain begins.
+	runTeardown := installDaemonTeardown(
+		controller.StopWatcher, stopStartupProducers, func() error {
+			// Nothing has to be serialized here: per-file mtimes live in the
+			// FileMtime sidecar table, contract records ride on
+			// KindContract.Meta, and the vector index is persisted by the
+			// backend itself. Warm restart reads everything it needs straight
+			// from the on-disk store.
+			//
+			// The shared stack's teardown chain flushes the savings store and
+			// closes the backend handle, checkpointing the sqlite WAL.
+			if state.shared != nil {
+				return state.shared.Close()
+			}
+			if state.mcpServer != nil {
+				return state.mcpServer.FlushSavings()
+			}
+			return nil
+		})
+	teardownComplete := false
+	defer func() {
+		if teardownComplete {
+			return
+		}
+		// An abnormal exit still drains in-process ownership, but deliberately
+		// retains the PID/runtime marker. If teardown itself panics or the
+		// process aborts, advertising the store as free would be unsafe; a
+		// successor will treat the marker as stale once this PID is dead.
+		if teardownErr := runTeardown(); teardownErr != nil {
+			logger.Error("daemon: shutdown teardown failed", zap.Error(teardownErr))
+			retErr = errors.Join(retErr, teardownErr)
+		}
 	}()
 	srv.Controller = controller
 	// Surface warmup state on the handshake ack: a proxy / CLI that connects
@@ -925,6 +947,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// The hub is fed from the MultiWatcher once warmup attaches it
 		// below; until then it has no source and /v1/events keepalives.
 		v1EventHub = hub.New()
+		stopEventHub = v1EventHub.Stop
 		v1.SetEventHub(v1EventHub)
 		// Conversation-log inspector. The /v1/conversations* routes read
 		// the opt-in sink's JSONL (raw LLM I/O), so they carry a
@@ -980,9 +1003,8 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// event-queue overflow). Default interval 1 h; override via
 	// GORTEX_RECONCILE_INTERVAL (a Go duration string, e.g. "15m").
 	// Set to "0" to disable.
-	stopJanitor := startReconcileJanitor(
+	stopJanitor = startReconcileJanitor(
 		state.multiIndexer, state.lifecycle, reconcileInterval(), logger)
-	defer stopJanitor()
 
 	if err := srv.Listen(); err != nil {
 		startupReporter.Fail(err)
@@ -1004,7 +1026,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// not-yet-re-indexed repos are served from the persisted store — they
 	// just won't reflect files that changed since the daemon last shut
 	// down until warmup gets to that repo.
+	warmupWG.Add(1)
 	go func() {
+		defer warmupWG.Done()
 		runtimeactivity.Begin("warmup")
 		defer func() {
 			runtimeactivity.End("warmup")
@@ -1021,11 +1045,19 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// stopped resumes where it was, it does not restart the wait), and
 		// any teardown interrupted by the stop is resumed.
 		if state.lifecycle != nil {
-			if err := state.lifecycle.Seed(context.Background()); err != nil {
+			if err := state.lifecycle.Seed(warmupCtx); err != nil && warmupCtx.Err() == nil {
 				logger.Warn("daemon: seeding the checkout catalog was incomplete", zap.Error(err))
 			}
 		}
-		ownership := daemonStartupOwnershipPlan(context.Background(), state, logger)
+		if err := warmupCtx.Err(); err != nil {
+			logger.Info("daemon: warmup cancelled after catalog seed", zap.Error(err))
+			return
+		}
+		ownership := daemonStartupOwnershipPlan(warmupCtx, state, logger)
+		if err := warmupCtx.Err(); err != nil {
+			logger.Info("daemon: warmup cancelled after ownership planning", zap.Error(err))
+			return
+		}
 		startupReadiness.setPaths(ownership.managedPaths)
 		startupSnapshot := startupReadiness.snapshot(startupReadinessCtx, controller.TrackReadiness)
 		controller.setStartupViewReadiness(startupSnapshot)
@@ -1039,6 +1071,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// unconditional post-resolve fallback, whichever comes first.
 		var queryableElapsed time.Duration
 		markReady := sync.OnceFunc(func() {
+			if warmupCtx.Err() != nil {
+				return
+			}
 			elapsed := time.Since(start)
 			queryableElapsed = elapsed
 			controller.MarkReady(elapsed)
@@ -1049,14 +1084,32 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
 		})
-		mw, warmup := warmupDaemonStateWithOwnership(state, logger, markReady, &ownership)
-		controller.AttachWatcher(mw)
+		mw, warmup := warmupDaemonStateWithOwnershipContext(
+			warmupCtx, state, logger, markReady, &ownership,
+		)
+		if err := warmupCtx.Err(); err != nil {
+			if mw != nil {
+				_ = mw.Stop()
+			}
+			logger.Info("daemon: warmup cancelled before watcher attachment", zap.Error(err))
+			return
+		}
+		if err := controller.AttachWatcherContext(warmupCtx, mw); err != nil {
+			if warmupCtx.Err() != nil || errors.Is(err, indexer.ErrIndexerClosed) {
+				return
+			}
+			logger.Warn("daemon: watcher attachment reconciliation was incomplete", zap.Error(err))
+		}
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is
 		// the only consumer of mw.Events() (SetWatcher reads History(), not
 		// the channel), so this can't starve any other reader. No-op when
 		// the HTTP surface is disabled (v1EventHub stays nil).
 		if v1EventHub != nil && mw != nil {
-			go v1EventHub.Run(mw.Events())
+			eventHubWG.Add(1)
+			go func() {
+				defer eventHubWG.Done()
+				v1EventHub.Run(mw.Events())
+			}()
 		}
 		referenceElapsed := time.Since(start)
 		logger.Info("daemon: reference enrichment complete; admitting exact startup views",
@@ -1069,6 +1122,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// health, snapshots and agents must not observe full enrichment before
 		// the routed exact corpus and all graph-dependent finalizers exist.
 		finalizeEnrichment := func() {
+			if warmupCtx.Err() != nil {
+				return
+			}
 			runtimeactivity.Begin("startup_finalize")
 			defer func() {
 				runtimeactivity.End("startup_finalize")
@@ -1120,46 +1176,64 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	return srv.Serve()
+	retErr = srv.Serve()
+	stopRuntimePublishers := func() {
+		startupReporter.Stop()
+		if state.mcpServer != nil {
+			state.mcpServer.StopHealthBroadcaster()
+		}
+	}
+	teardownErr := completeDaemonShutdown(stopRuntimePublishers, runTeardown, srv.ReleaseProcessState)
+	teardownComplete = true
+	if teardownErr != nil {
+		logger.Error("daemon: shutdown teardown failed", zap.Error(teardownErr))
+		retErr = errors.Join(retErr, teardownErr)
+	}
+	return retErr
 }
 
-// installDaemonTeardown wires one once-guarded teardown into both of the
-// daemon's exit paths and returns the func the caller must defer.
+// installDaemonTeardown builds the once-guarded teardown the caller defers
+// around Server.Serve.
 //
-// The two paths never meet on their own. A `gortex daemon stop` arrives over
-// the control socket and reaches the controller's shutdown hook; a
-// SIGINT/SIGTERM is handled inside the daemon server, which shuts the listener
-// down directly and lets Serve return without the controller hearing about it.
-// Whichever fires, the same func runs — and sync.Once makes the second call a
-// no-op, so a signalled daemon whose controller shutdown also lands does not
-// close the store twice.
+// Both exit paths close transport first. A `gortex daemon stop` is acknowledged
+// by the control handler before Server.Shutdown closes its listeners; a signal
+// closes them directly. Server.Serve joins admitted handlers before returning,
+// and only then may this function stop producers and close the store. Running
+// teardown from Controller.Shutdown instead closes SQLite beneath the handler
+// that is still writing the acknowledgement and beneath every other session.
 //
-// stopWatcher runs first so no late event races the close — the backend should
-// be quiescent when it closes, not being mutated by an in-flight re-index. It
-// is passed explicitly rather than reached through the controller so the
-// ordering contract is visible at the call site. The controller's StopWatcher
-// is lock-free by design: this is the first thing a stop does, and reading the
-// watcher under the coarse controller mutex would queue it behind the
-// long-running track / reload / enrichment the user is trying to end.
+// Producer cancellation/join runs first while the store is still open. Warmup
+// is itself the publisher of the MultiWatcher, so a blocking StopWatcher ahead
+// of cancellation can deadlock inside attachment and can miss a later publish.
+// Once producers have joined the pointer is stable; StopWatcher then drains its
+// callbacks before the shared stack closes.
 //
 // closeShared is the stack teardown: the savings flush and the backend close
 // that checkpoints the sqlite WAL.
-func installDaemonTeardown(controller *realController, stopWatcher func(), closeShared func() error) func() {
-	teardown := newDaemonTeardown(stopWatcher, closeShared)
-	controller.setShutdownHook(teardown)
-	return func() { _ = teardown() }
+func installDaemonTeardown(
+	stopWatcher func(),
+	stopProducers func(),
+	closeShared func() error,
+) func() error {
+	teardown := newDaemonTeardown(stopWatcher, stopProducers, closeShared)
+	return teardown
 }
 
 // newDaemonTeardown returns the once-guarded teardown itself. Split from the
 // wiring so the exactly-once contract can be exercised on both call paths
 // without standing up a daemon.
-func newDaemonTeardown(stopWatcher func(), closeShared func() error) func() error {
+func newDaemonTeardown(
+	stopWatcher func(), stopProducers func(), closeShared func() error,
+) func() error {
 	var (
 		once sync.Once
 		err  error
 	)
 	return func() error {
 		once.Do(func() {
+			if stopProducers != nil {
+				stopProducers()
+			}
 			if stopWatcher != nil {
 				stopWatcher()
 			}
@@ -1171,6 +1245,29 @@ func newDaemonTeardown(stopWatcher func(), closeShared func() error) func() erro
 		// misleading nil: whoever exits second is often the one reporting.
 		return err
 	}
+}
+
+// completeDaemonShutdown is the normal-exit ownership handoff. Runtime-state
+// publishing stops before graph teardown, and the process marker is released
+// only after the store has closed. The final release still runs when Close
+// reports an error because the process is about to exit; it is intentionally
+// not used by the abnormal/panic defer above.
+func completeDaemonShutdown(
+	stopRuntimePublishers func(),
+	runTeardown func() error,
+	releaseProcessState func(),
+) error {
+	if stopRuntimePublishers != nil {
+		stopRuntimePublishers()
+	}
+	var err error
+	if runTeardown != nil {
+		err = runTeardown()
+	}
+	if releaseProcessState != nil {
+		releaseProcessState()
+	}
+	return err
 }
 
 // reconcileInterval returns the janitor tick interval, defaulting to 1
@@ -1219,51 +1316,68 @@ func startReconcileJanitor(
 		logger.Info("daemon: reconcile janitor disabled")
 		return func() {}
 	}
-	stop := make(chan struct{})
+	logger.Info("daemon: reconcile janitor running", zap.Duration("interval", interval))
+	return startJoinedReconcileLoop(interval, func(ctx context.Context) {
+		gcedCount, reconciled := func() (int, int) {
+			runtimeactivity.Begin("reconcile")
+			defer runtimeactivity.End("reconcile")
+
+			swept := 0
+			if lifecycle != nil {
+				report, err := lifecycle.Sweep(ctx)
+				if err != nil {
+					logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
+				}
+				swept = report.Removed
+				if swept > 0 {
+					logger.Info("janitor: pruned vanished checkouts",
+						zap.Int("count", swept),
+						zap.Int("families", report.Families))
+				}
+			}
+			results := mi.ReconcileAllCtx(ctx)
+			reconciled := 0
+			for _, r := range results {
+				if r != nil {
+					reconciled += r.StaleFileCount + r.DeletedFileCount
+				}
+			}
+			return swept, reconciled
+		}()
+		// Only a tick that changed the graph schedules reclamation. The
+		// process-wide quiet gate postpones it if another subsystem is busy.
+		if reconciled > 0 || gcedCount > 0 {
+			releaseMemoryToOS(logger, "reconcile_janitor")
+		}
+	})
+}
+
+func startJoinedReconcileLoop(interval time.Duration, tick func(context.Context)) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var joined sync.WaitGroup
+	joined.Add(1)
 	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		logger.Info("daemon: reconcile janitor running", zap.Duration("interval", interval))
+		defer joined.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-t.C:
-				gcedCount, reconciled := func() (int, int) {
-					runtimeactivity.Begin("reconcile")
-					defer runtimeactivity.End("reconcile")
-
-					swept := 0
-					if lifecycle != nil {
-						report, err := lifecycle.Sweep(context.Background())
-						if err != nil {
-							logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
-						}
-						swept = report.Removed
-						if swept > 0 {
-							logger.Info("janitor: pruned vanished checkouts",
-								zap.Int("count", swept),
-								zap.Int("families", report.Families))
-						}
-					}
-					results := mi.ReconcileAll()
-					reconciled := 0
-					for _, r := range results {
-						if r != nil {
-							reconciled += r.StaleFileCount + r.DeletedFileCount
-						}
-					}
-					return swept, reconciled
-				}()
-				// Only a tick that changed the graph schedules reclamation. The
-				// process-wide quiet gate postpones it if another subsystem is busy.
-				if reconciled > 0 || gcedCount > 0 {
-					releaseMemoryToOS(logger, "reconcile_janitor")
+			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
 				}
-			case <-stop:
+				if tick != nil {
+					tick(ctx)
+				}
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-	return func() { close(stop) }
+	return sync.OnceFunc(func() {
+		cancel()
+		joined.Wait()
+	})
 }
 
 // daemonStartAcceptedFlags returns every flag the re-exec'd `daemon start`
@@ -1529,28 +1643,21 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 		// the daemon hasn't cleaned up. Fall back to killing by PID.
 		return killByPID()
 	}
-	// Explicit budget: the daemon flushes and closes its store before acking,
-	// so the ack is unbounded by policy on the server side (abandoning a
-	// half-done flush is worse than a slow stop). The wait belongs here
-	// instead, where giving up is safe — the daemon is already on its way
-	// down and the exit wait below finishes the job.
+	// The acknowledgement only accepts the stop. The server then closes its
+	// transports, joins active request handlers, and tears down the graph stack
+	// after Serve returns. Keep this budget for an unresponsive control socket;
+	// it is not a store-flush deadline.
 	resp, err := c.ControlWithTimeout(daemon.ControlShutdown, nil, daemonShutdownAckTimeout)
 	_ = c.Close()
-	// A daemon that accepted the request but hasn't acked is not a reason to
-	// abandon the stop. The ack is synchronous with the controller's
-	// flush-and-close, so on a large workspace — or behind a track / reload
-	// holding the controller — it can legitimately overrun the budget while
-	// the process is still on its way down. Returning an error here left the
-	// user with a daemon they could only `kill -9`. Fall through to the exit
-	// wait instead: it force-kills and cleans up if the daemon really is
-	// wedged, so `daemon stop` always terminates and always leaves the socket
-	// and PID file in a startable state.
-	grace := daemonExitGrace
+	// Whether or not the ack arrived, teardown may still be joining a cold
+	// generation and checkpointing its WAL. Use the long graceful window in
+	// both cases: a successful ack means shutdown started, not that persistence
+	// has already completed.
+	grace := daemonGracefulExitGrace
 	switch {
 	case errors.Is(err, daemon.ErrDaemonUnresponsive),
 		err == nil && !resp.OK && resp.ErrorCode == daemon.ErrTimeout:
 		fmt.Fprintln(w, "[gortex daemon] no shutdown ack yet — the daemon is busy; waiting for it to exit")
-		grace = daemonBusyExitGrace
 	case err != nil:
 		return err
 	case !resp.OK:
@@ -1564,19 +1671,17 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 }
 
 const (
-	// daemonExitGrace is how long a normal stop waits for the process to go
-	// away after a successful ack — the flush has already happened by then.
-	daemonExitGrace = 15 * time.Second
-	// daemonBusyExitGrace applies when the daemon never acked. The flush is
-	// presumed still running, so force-killing on the normal schedule would
-	// interrupt exactly the store write we want to complete.
-	daemonBusyExitGrace = 2 * time.Minute
+	// daemonGracefulExitGrace applies after both an accepted shutdown and an
+	// unresponsive control request. In either case lifecycle workers and the WAL
+	// may still be draining, so force-killing on the old 15-second schedule can
+	// corrupt exactly the publication shutdown is trying to finish safely.
+	daemonGracefulExitGrace = 2 * time.Minute
 	// daemonStatusCardTimeout bounds the advisory Status lookups that only
 	// decorate output. They must never be the reason a command hangs.
 	daemonStatusCardTimeout = 3 * time.Second
 	// daemonShutdownAckTimeout is how long the stop command waits for the
-	// shutdown ack before switching to watching the process itself. Generous,
-	// because the ack trails a real store flush.
+	// shutdown ack before switching to watching the process itself. The ack is
+	// normally immediate and precedes transport/graph teardown.
 	daemonShutdownAckTimeout = 30 * time.Second
 )
 
@@ -1587,11 +1692,9 @@ const (
 // restart` stands on. Polls cheaply; the common case (a clean flush) clears in
 // well under a second.
 //
-// grace is the caller's, not a constant, because how long to wait depends on
-// what the ack told us: daemonExitGrace after a successful ack (the flush has
-// already happened), daemonBusyExitGrace when none arrived (it probably has
-// not, and force-killing on the normal schedule would interrupt the store
-// write we want to complete).
+// grace is supplied by the caller so tests and future explicit force modes can
+// choose a different policy. A normal acknowledged stop uses the same long
+// window as an unacknowledged one because the ack now precedes teardown.
 func waitForDaemonExitWithin(pid int, grace time.Duration) {
 	deadline := time.Now().Add(grace)
 	for time.Now().Before(deadline) {

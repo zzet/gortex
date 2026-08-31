@@ -1200,6 +1200,15 @@ func (l *CheckoutLifecycle) rebindCheckoutCoordinatorRoot(
 	}
 
 	l.coordMu.Lock()
+	if l.coordinatorClosing || !replacement.Running() {
+		l.coordMu.Unlock()
+		_ = replacement.Close()
+		l.oweRetirement(replacement.DrainRetirements()...)
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return false, ErrIndexerClosed
+	}
 	if l.coordinators[checkout.CheckoutID] != previous {
 		l.coordMu.Unlock()
 		_ = replacement.Close()

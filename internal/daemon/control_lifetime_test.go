@@ -24,6 +24,20 @@ type blockingController struct {
 	entered chan struct{}
 }
 
+type blockingSessionEndDispatcher struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (d *blockingSessionEndDispatcher) Dispatch(context.Context, *Session, []byte) ([]byte, error) {
+	return nil, nil
+}
+
+func (d *blockingSessionEndDispatcher) SessionEnded(*Session) {
+	close(d.entered)
+	<-d.release
+}
+
 func newBlockingController() *blockingController {
 	return &blockingController{
 		release: make(chan struct{}),
@@ -81,6 +95,84 @@ func TestShutdownTearsDownEvenWhenTheAckCannotBeDelivered(t *testing.T) {
 		5*time.Second, 20*time.Millisecond,
 		"the daemon must tear down even when the shutdown ack could not be delivered")
 	_ = srv
+}
+
+func TestServeJoinsActiveUnixHandlersBeforeReturning(t *testing.T) {
+	ctrl := newBlockingController()
+	srv, socket := newDaemonNoServe(t, ctrl)
+	srv.ControlTimeout = time.Hour
+	require.NoError(t, srv.Listen())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve() }()
+
+	client, err := DialTo(socket, Handshake{Mode: ModeControl, ClientName: "blocking-status"})
+	require.NoError(t, err)
+	requestDone := make(chan error, 1)
+	go func() {
+		_, requestErr := client.ControlWithTimeout(ControlStatus, nil, time.Minute)
+		requestDone <- requestErr
+	}()
+	select {
+	case <-ctrl.entered:
+	case <-time.After(time.Second):
+		t.Fatal("blocking status handler was not admitted")
+	}
+
+	require.NoError(t, srv.Shutdown())
+	select {
+	case err := <-serveDone:
+		t.Fatalf("Serve returned while a control handler still owned graph work: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(ctrl.release)
+	select {
+	case err := <-serveDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after the admitted handler completed")
+	}
+	_ = client.Close()
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("client request did not finish after handler release")
+	}
+}
+
+func TestServeJoinsAdmittedMaintenanceSweepBeforeReturning(t *testing.T) {
+	dispatcher := &blockingSessionEndDispatcher{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	srv, _ := newDaemonNoServe(t, &fakeController{})
+	srv.maintenanceInterval = time.Millisecond
+	srv.MCPDispatcher = dispatcher
+	srv.sessions.RegisterDetached("dead-client", Handshake{
+		Mode: ModeMCP,
+		PID:  1 << 30,
+	})
+	require.NoError(t, srv.Listen())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve() }()
+	select {
+	case <-dispatcher.entered:
+	case <-time.After(time.Second):
+		t.Fatal("maintenance sweep did not enter the session-ended hook")
+	}
+
+	require.NoError(t, srv.Shutdown())
+	select {
+	case err := <-serveDone:
+		t.Fatalf("Serve returned while maintenance still owned its callback: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(dispatcher.release)
+	select {
+	case err := <-serveDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after maintenance callback completed")
+	}
 }
 
 // TestControlRequestTimesOutInsteadOfHanging is the #370 server-side contract:

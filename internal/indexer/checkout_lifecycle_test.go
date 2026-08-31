@@ -314,6 +314,137 @@ func TestCheckoutLifecycleCloseToleratesUninitializedTransitionOwner(t *testing.
 	require.NoError(t, lifecycle.Close(), "Close remains idempotent")
 }
 
+func TestCheckoutLifecycleCloseJoinsStartedAndCancelsAllBeforeWaiting(t *testing.T) {
+	release := make(chan struct{})
+	registered, registeredCanceled := newLifecycleCloseProbe(release)
+	preRegistration, preRegistrationCanceled := newLifecycleCloseProbe(release)
+	publicationCandidate, publicationCandidateCanceled := newLifecycleCloseProbe(closedLifecycleRelease())
+	lifecycle := &CheckoutLifecycle{
+		coordinators: map[string]*CheckoutCoordinator{"registered": registered},
+		coordinatorHeads: map[string]checkoutHeadIdentity{
+			"registered": {ref: "refs/heads/main", commit: "head"},
+		},
+		started: map[string][]*CheckoutCoordinator{
+			"registered":       {registered},
+			"pre-registration": {preRegistration},
+			"late-publication": {publicationCandidate},
+		},
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- lifecycle.Close() }()
+	for name, canceled := range map[string]<-chan struct{}{
+		"registered":       registeredCanceled,
+		"pre-registration": preRegistrationCanceled,
+		"late-publication": publicationCandidateCanceled,
+	} {
+		select {
+		case <-canceled:
+		case <-time.After(time.Second):
+			t.Fatalf("%s coordinator was not canceled before Close began waiting", name)
+		}
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before started coordinators stopped: %v", err)
+	default:
+	}
+
+	late, lateCanceled := newLifecycleCloseProbe(closedLifecycleRelease())
+	if lifecycle.trackStarted("late", late) {
+		t.Fatal("coordinator admitted while Close was joining the existing fleet")
+	}
+	select {
+	case <-lateCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator rejected during Close was not stopped")
+	}
+	if lifecycle.installCoordinator("late-publication", publicationCandidate) {
+		t.Fatal("pre-registration coordinator published after Close cleared the registry")
+	}
+	lifecycle.coordMu.Lock()
+	_, published := lifecycle.coordinators["late-publication"]
+	lifecycle.coordMu.Unlock()
+	require.False(t, published)
+
+	close(release)
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after every coordinator stopped")
+	}
+	require.Zero(t, lifecycle.LiveCoordinators(""))
+	require.Empty(t, lifecycle.coordinatorHeads)
+	if lifecycle.installCoordinator("stopped-after-close", preRegistration) {
+		t.Fatal("stopped pre-registration coordinator published after Close reopened admission")
+	}
+}
+
+func TestCheckoutLifecycleCloseFencesConstructorHandoff(t *testing.T) {
+	lifecycle := &CheckoutLifecycle{}
+	require.True(t, lifecycle.beginCoordinatorStart())
+
+	closed := make(chan error, 1)
+	go func() { closed <- lifecycle.Close() }()
+	require.Eventually(t, func() bool {
+		lifecycle.coordMu.Lock()
+		defer lifecycle.coordMu.Unlock()
+		return lifecycle.coordinatorClosing
+	}, time.Second, time.Millisecond)
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before the admitted constructor handoff: %v", err)
+	default:
+	}
+	require.False(t, lifecycle.beginCoordinatorStart(), "constructor admitted inside Close window")
+
+	lifecycle.coordinatorStartWG.Done()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after constructor handoff drained")
+	}
+	require.True(t, lifecycle.beginCoordinatorStart(), "constructor admission did not reopen after Close")
+	lifecycle.coordinatorStartWG.Done()
+}
+
+func BenchmarkCheckoutLifecycleCloseEmpty(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		lifecycle := &CheckoutLifecycle{}
+		if err := lifecycle.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func newLifecycleCloseProbe(release <-chan struct{}) (*CheckoutCoordinator, <-chan struct{}) {
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	canceled := make(chan struct{})
+	coordinator := &CheckoutCoordinator{
+		familyID:       "family",
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
+		lifetime:       lifetime,
+		cancelLifetime: cancelLifetime,
+	}
+	go func() {
+		<-lifetime.Done()
+		close(canceled)
+		<-release
+		close(coordinator.done)
+	}()
+	return coordinator, canceled
+}
+
+func closedLifecycleRelease() <-chan struct{} {
+	release := make(chan struct{})
+	close(release)
+	return release
+}
+
 func TestCheckoutLifecycleCloseWaitsForAdmittedFamilyRetry(t *testing.T) {
 	fixture := newLifecycleFixture(t)
 	t.Cleanup(fixture.close)

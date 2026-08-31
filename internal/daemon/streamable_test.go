@@ -28,10 +28,14 @@ func newDaemonNoServe(t *testing.T, ctrl Controller) (*Server, string) {
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(dir, "state.json"))
 
 	srv := New(socket, "test-0.0.0", zap.NewNop())
 	srv.Controller = ctrl
-	t.Cleanup(func() { _ = srv.Shutdown() })
+	t.Cleanup(func() {
+		_ = srv.Shutdown()
+		srv.ReleaseProcessState()
+	})
 	return srv, socket
 }
 
@@ -74,6 +78,74 @@ func TestDaemon_HTTPListenerServesAttachedHandler(t *testing.T) {
 		_, err := http.Get("http://" + addr + "/anything")
 		return err != nil
 	}, 2*time.Second, 10*time.Millisecond, "http listener stayed up after Shutdown")
+}
+
+func TestServeJoinsActiveHTTPHandlersBeforeReturning(t *testing.T) {
+	srv, _ := newDaemonNoServe(t, &fakeController{})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	srv.HTTPHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv.HTTPAddr = "127.0.0.1:0"
+	require.NoError(t, srv.Listen())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve() }()
+
+	requestDone := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + srv.httpListener.Addr().String() + "/blocking")
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		requestDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("blocking HTTP handler was not admitted")
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown() }()
+	select {
+	case err := <-serveDone:
+		t.Fatalf("Serve returned while an HTTP handler still owned graph work: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-shutdownDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not finish after HTTP handler release")
+	}
+	select {
+	case err := <-serveDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not return after HTTP handler release")
+	}
+	select {
+	case err := <-requestDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request did not finish after handler release")
+	}
+}
+
+func BenchmarkServerHandlerAdmission(b *testing.B) {
+	srv := New("benchmark.sock", "benchmark", zap.NewNop())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !srv.beginHandler() {
+			b.Fatal("handler admission unexpectedly closed")
+		}
+		srv.handlers.Done()
+	}
 }
 
 // TestSessionRegistry_RegisterDetached covers the detached-session

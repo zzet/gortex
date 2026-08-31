@@ -94,8 +94,10 @@ type realController struct {
 	// teardown hook reads it, and reading it under mu is what kept `daemon
 	// stop` queued behind a running track / reload / enrichment. One writer
 	// (AttachWatcher, during warmup); read via watcher().
-	multiWatcher atomic.Pointer[indexer.MultiWatcher]
-	logger       *zap.Logger
+	multiWatcher   atomic.Pointer[indexer.MultiWatcher]
+	watcherGateMu  sync.Mutex
+	watcherClosing bool
+	logger         *zap.Logger
 
 	// liveRouter is the multi-server Router currently wired into the
 	// dispatch path (nil for a local-only daemon with no roster).
@@ -106,18 +108,6 @@ type realController struct {
 	liveRouter    *daemon.Router
 	localExecute  daemon.LocalExecutor
 	publishRouter func(*daemon.Router)
-
-	// onShutdown is invoked by the Shutdown method. Used by the daemon
-	// main to flush savings, close the snapshot store, etc.
-	//
-	// Guarded by its own mutex, deliberately NOT by mu. Shutdown is the
-	// one control RPC that has to work when the daemon is at its least
-	// healthy, and mu is held for the entire duration of a track / reload /
-	// enrichment — minutes on a large workspace. Reading this field under
-	// mu made `gortex daemon stop` queue behind exactly the condition it
-	// exists to escape.
-	shutdownMu sync.Mutex
-	onShutdown func() error
 
 	// toolSurface reports the active tool-surface preset + mode and the
 	// per-workspace learned-promotion count for `gortex daemon status`.
@@ -852,7 +842,8 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 //
 // This is the whole point of the call. Status takes c.mu, and c.mu is held
 // for the entire duration of a track / reload / enrichment — the same
-// reasoning that already keeps multiWatcher and onShutdown off that mutex.
+// reasoning that already keeps multiWatcher off that mutex and keeps Shutdown
+// as a lock-free acknowledgement.
 // Measured on a 44-repo workspace, serial Status calls with no concurrent
 // load returned the identical payload in 156 ms to 11.5 s depending only on
 // what the indexer was doing. Callers on a sub-second budget therefore
@@ -1928,7 +1919,11 @@ func (c *realController) AttachWatcherContext(ctx context.Context, mw *indexer.M
 		return nil
 	})
 	if mw == nil {
-		c.multiWatcher.Store(nil)
+		c.watcherGateMu.Lock()
+		if !c.watcherClosing {
+			c.multiWatcher.Store(nil)
+		}
+		c.watcherGateMu.Unlock()
 		return nil
 	}
 	// Install the topology consumer before publication. A concurrent Track
@@ -1946,7 +1941,14 @@ func (c *realController) AttachWatcherContext(ctx context.Context, mw *indexer.M
 		retainedCtx, release := mw.RetainTopologyDispatch(dispatchCtx)
 		c.nudgeFamilyTopologyRequest(retainedCtx, familyID, release)
 	})
+	c.watcherGateMu.Lock()
+	if c.watcherClosing {
+		c.watcherGateMu.Unlock()
+		_ = mw.StopContext(ctx)
+		return indexer.ErrIndexerClosed
+	}
 	c.multiWatcher.Store(mw)
+	c.watcherGateMu.Unlock()
 
 	// Repair durable watcher sources before catalog seeding. Healthy sources
 	// then contribute their exact dispatch context, while families whose source
@@ -1982,16 +1984,19 @@ func (c *realController) watcher() *indexer.MultiWatcher {
 	return c.multiWatcher.Load()
 }
 
-// StopWatcher halts filesystem watching. Called first during teardown so no
-// late event races the snapshot write — we want the snapshot to reflect a
-// quiescent graph, not one being mutated by an in-flight re-index.
+// StopWatcher seals watcher publication, detaches the stable pointer, and
+// synchronously drains filesystem/topology callbacks. Daemon teardown calls it
+// after warmup/readiness producers join (warmup is the pointer's publisher)
+// and before lifecycle/backend close.
 //
-// Deliberately lock-free: this is the first statement of the daemon's shutdown
-// hook, and it used to take the coarse controller mutex just to read the
-// watcher pointer, which meant `gortex daemon stop` queued behind whatever
-// long operation was holding it.
+// It never takes the coarse controller mutex: doing so would put daemon stop
+// behind the long track/reload/enrichment operation it is trying to end.
 func (c *realController) StopWatcher() {
-	if mw := c.watcher(); mw != nil {
+	c.watcherGateMu.Lock()
+	c.watcherClosing = true
+	mw := c.multiWatcher.Swap(nil)
+	c.watcherGateMu.Unlock()
+	if mw != nil {
 		_ = mw.Stop()
 	}
 }
@@ -2033,24 +2038,13 @@ func (c *realController) IsEnriched() bool {
 	return c.enriched.Load()
 }
 
-// Shutdown gives the caller (the daemon main) a chance to flush any
-// per-instance stores. The actual socket teardown is the Server's job.
+// Shutdown acknowledges the control request without taking the controller's
+// coarse mutex. The daemon server writes that acknowledgement, closes its
+// transports, and joins request handlers before runDaemonStart tears down the
+// graph stack after Serve returns.
 //
-// Takes shutdownMu, never mu: a stop request must not queue behind the
-// long-running work it is trying to end.
+// Doing graph teardown here is unsafe: this method itself runs in a request
+// handler, and other handlers can still be using the store.
 func (c *realController) Shutdown(_ context.Context) error {
-	c.shutdownMu.Lock()
-	hook := c.onShutdown
-	c.shutdownMu.Unlock()
-	if hook != nil {
-		return hook()
-	}
 	return nil
-}
-
-// setShutdownHook installs the flush-and-close hook Shutdown invokes.
-func (c *realController) setShutdownHook(hook func() error) {
-	c.shutdownMu.Lock()
-	c.onShutdown = hook
-	c.shutdownMu.Unlock()
 }
