@@ -430,10 +430,6 @@ func TestReadyDedicatedCheckoutMutationPublishesItsOwnRoute(t *testing.T) {
 		"path":       "keep.go",
 		"old_string": "func Keeper() {}",
 		"new_string": "func DedicatedKeeper() {}",
-		"view": map[string]any{
-			"kind":        "worktree",
-			"checkout_id": primaryID,
-		},
 	}, stack.srv.handleEditFile)
 	exactCheckoutMutationResult(t, result, primaryID)
 
@@ -444,6 +440,74 @@ func TestReadyDedicatedCheckoutMutationPublishesItsOwnRoute(t *testing.T) {
 	worktreeAfter, readErr := os.ReadFile(worktreePath)
 	if readErr != nil || string(worktreeAfter) != string(worktreeBefore) {
 		t.Fatalf("dedicated edit changed automatic sibling bytes: before=%q after=%q err=%v", worktreeBefore, worktreeAfter, readErr)
+	}
+}
+
+func TestRouteFreeDedicatedCheckoutMutationRefusesBeforeDisk(t *testing.T) {
+	stack := newWorktreeSearchStack(t)
+	automatic, found, err := stack.store.Catalog().GetCheckout(context.Background(), stack.checkoutID)
+	if err != nil || !found {
+		t.Fatalf("read automatic checkout: found=%v err=%v", found, err)
+	}
+	checkouts, err := stack.store.Catalog().ListCheckouts(context.Background(), automatic.FamilyID)
+	if err != nil {
+		t.Fatalf("list family checkouts: %v", err)
+	}
+	primaryID := ""
+	for _, checkout := range checkouts {
+		if filepath.Clean(checkout.RootPath) == filepath.Clean(stack.primary) {
+			primaryID = checkout.CheckoutID
+			break
+		}
+	}
+	if primaryID == "" {
+		t.Fatal("family has no dedicated primary checkout")
+	}
+
+	// Withdraw the published route without stopping its coordinator. The CWD
+	// still has a sealed base fallback to read, but no publisher can yet promise
+	// that a disk mutation and graph route will move together.
+	if err := stack.store.Catalog().DeleteCheckoutRoute(context.Background(), primaryID); err != nil {
+		t.Fatalf("withdraw dedicated checkout route: %v", err)
+	}
+	selectionCtx := WithSessionCWD(WithSessionID(context.Background(), wtSearchSession), stack.primary)
+	selected, err := stack.srv.viewForSessionCWD(selectionCtx, requestViewPolicy{
+		allowBuildingBaseFallback: true,
+	})
+	if err != nil {
+		t.Fatalf("select route-free dedicated checkout: %v", err)
+	}
+	if selected == nil || selected.materialized == nil || selected.rider == nil || !selected.baseFallback {
+		if selected != nil {
+			selected.close()
+		}
+		t.Fatalf("route-free dedicated checkout view = %+v, want labeled materialized fallback", selected)
+	}
+	selected.close()
+	if stack.lifecycle.CheckoutMutationReady(primaryID, stack.primary) {
+		t.Fatal("route-free dedicated checkout was admitted for mutation")
+	}
+
+	primaryPath := filepath.Join(stack.primary, "keep.go")
+	before, err := os.ReadFile(primaryPath)
+	if err != nil {
+		t.Fatalf("read primary keep.go: %v", err)
+	}
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "edit_file"
+	req.Params.Arguments = map[string]any{
+		"path":       "keep.go",
+		"old_string": "func Keeper() {}",
+		"new_string": "func MustNotReachDisk() {}",
+	}
+	result, err := stack.srv.wrapToolHandler(stack.srv.handleEditFile)(selectionCtx, req)
+	if err != nil {
+		t.Fatalf("call route-free edit_file: %v", err)
+	}
+	assertToolError(t, result, graphview.CodeViewBuilding)
+	after, err := os.ReadFile(primaryPath)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("refused route-free mutation changed disk: before=%q after=%q err=%v", before, after, err)
 	}
 }
 

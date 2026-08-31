@@ -109,20 +109,62 @@ func TestAutomaticCheckoutScope_UnknownCWDStaysUnresolved(t *testing.T) {
 	assert.Contains(t, wsSibling, unresolvedWorkspacePrefix)
 }
 
-// TestAutomaticCheckoutScope_OnlyLiveAutomaticCheckoutsBind covers the two
-// states the shared lane does not answer for. A dedicated checkout is read
-// from the indexed corpus under its own repository entry, and a checkout that
-// is not ready has no view to occupy — neither may borrow the primary's scope.
-func TestAutomaticCheckoutScope_OnlyLiveAutomaticCheckoutsBind(t *testing.T) {
-	t.Run("a checkout that is not live falls back to unresolved", func(t *testing.T) {
-		v := newViewStack(t)
-		v.setWorktreeState(t, store_sqlite.CheckoutStateUnavailable)
+// TestAutomaticCheckoutScope_GraceBindsTheFamilyPrimary proves both halves of
+// the grace contract: the checkout cwd remains admitted while its eligible
+// reads use the sealed base fallback, and its scope comes from the surviving
+// family primary rather than a stale graph formerly owned by the checkout.
+func TestAutomaticCheckoutScope_GraceBindsTheFamilyPrimary(t *testing.T) {
+	for _, state := range []store_sqlite.CheckoutState{
+		store_sqlite.CheckoutStateAvailabilityGrace,
+		store_sqlite.CheckoutStateRemovalGrace,
+		store_sqlite.CheckoutStateUnavailable,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			v := newViewStack(t)
+			v.seedRetiredWorktreeGraph(t)
+			v.setWorktreeState(t, state)
+			ctx := sessionCtx("s-"+string(state), v.worktreeRoot)
 
-		ws, _, bound := v.srv.sessionScope(sessionCtx("s-unavailable", v.worktreeRoot))
-		require.True(t, bound)
-		assert.Contains(t, ws, unresolvedWorkspacePrefix)
-	})
+			ws, project, bound := v.srv.sessionScope(ctx)
+			require.True(t, bound)
+			assert.Equal(t, "main-ws", ws)
+			assert.Equal(t, "repo", project)
+			assert.True(t, v.srv.CheckoutServesCWD(ctx, v.worktreeRoot),
+				"the dispatcher admission gate must agree with the scope it fronts")
 
+			_, _, prefix, ok := v.srv.scopeForAutomaticCheckout(ctx, v.worktreeRoot)
+			require.True(t, ok)
+			assert.Equal(t, "repo", prefix,
+				"grace must scope the primary corpus, not the retired checkout owner")
+		})
+	}
+}
+
+// TestAutomaticCheckoutScope_TransitionalStatesStayUnresolved protects the
+// fail-closed side of admission. These states neither serve an exact checkout
+// nor authorize the read-only primary fallback, so they must not borrow the
+// family's scope merely because the old root remains in the catalog.
+func TestAutomaticCheckoutScope_TransitionalStatesStayUnresolved(t *testing.T) {
+	for _, state := range []store_sqlite.CheckoutState{
+		store_sqlite.CheckoutStateReconciling,
+		store_sqlite.CheckoutStateDemoting,
+		store_sqlite.CheckoutStateForgetting,
+		store_sqlite.CheckoutStatePrimaryClosureRetiring,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			v := newViewStack(t)
+			v.setWorktreeState(t, state)
+			ctx := sessionCtx("s-"+string(state), v.worktreeRoot)
+
+			ws, _, bound := v.srv.sessionScope(ctx)
+			require.True(t, bound)
+			assert.Contains(t, ws, unresolvedWorkspacePrefix)
+			assert.False(t, v.srv.CheckoutServesCWD(ctx, v.worktreeRoot))
+		})
+	}
+}
+
+func TestAutomaticCheckoutScope_NoCatalogKeepsPreviousBehaviour(t *testing.T) {
 	t.Run("no view catalog keeps the previous behaviour", func(t *testing.T) {
 		v := newViewStack(t)
 		v.srv.SetMaterializer(nil)
@@ -142,13 +184,13 @@ func TestAutomaticCheckoutScope_CachedAndInvalidated(t *testing.T) {
 	const id = "s-lifecycle"
 	ctx := sessionCtx(id, v.worktreeRoot)
 
-	// Bind while the checkout is live, then take it away: the cached binding
-	// survives until something invalidates it.
+	// Bind while the checkout is live, then move it into a non-serving
+	// transition: the cached binding survives until something invalidates it.
 	ws, _, bound := v.srv.sessionScope(ctx)
 	require.True(t, bound)
 	require.Equal(t, "main-ws", ws)
 
-	v.setWorktreeState(t, store_sqlite.CheckoutStateUnavailable)
+	v.setWorktreeState(t, store_sqlite.CheckoutStateReconciling)
 	ws, _, _ = v.srv.sessionScope(ctx)
 	assert.Equal(t, "main-ws", ws, "precondition: the binding is cached, not re-read per call")
 

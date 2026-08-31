@@ -30,7 +30,7 @@ import (
 // a git worktree of a tracked repo takes. The worktree root is deliberately
 // OUTSIDE the tracked root: that is what makes it invisible to the repository
 // registry and visible only to the view catalog.
-func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot string) {
+func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot string, catalog *store_sqlite.Catalog) {
 	t.Helper()
 	dir := t.TempDir()
 	primaryRoot = filepath.Join(dir, "repos", "app")
@@ -69,7 +69,7 @@ func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot
 		EndLine:    3,
 	}}, nil)
 
-	catalog := store.Catalog()
+	catalog = store.Catalog()
 	const familyID = "family-checkout-cwd"
 	require.NoError(t, catalog.UpsertRepositoryFamily(ctx, store_sqlite.RepositoryFamily{
 		FamilyID:          familyID,
@@ -115,7 +115,18 @@ func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot
 		gortexmcp.MultiRepoOptions{MultiIndexer: mi, ConfigManager: cm})
 	srv.SetMaterializer(&graphview.Materializer{Store: store, Catalog: catalog})
 
-	return newMCPDispatcher(srv, mi, zap.NewNop()), primaryRoot, worktreeRoot
+	return newMCPDispatcher(srv, mi, zap.NewNop()), primaryRoot, worktreeRoot, catalog
+}
+
+func setCheckoutCWDState(t *testing.T, catalog *store_sqlite.Catalog, state store_sqlite.CheckoutState) {
+	t.Helper()
+	require.NoError(t, catalog.UpdateCheckoutState(context.Background(), store_sqlite.UpdateCheckoutStateRequest{
+		CheckoutID:    "chk-worktree",
+		Incarnation:   "inc-worktree",
+		State:         state,
+		DesiredMode:   store_sqlite.CheckoutModeAutomatic,
+		EffectiveMode: store_sqlite.CheckoutModeAutomatic,
+	}))
 }
 
 // TestDispatcher_RegisteredCheckoutCWDPasses covers the session cwd that lies
@@ -128,7 +139,7 @@ func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot
 // as a second repository.
 func TestDispatcher_RegisteredCheckoutCWDPasses(t *testing.T) {
 	ctx := context.Background()
-	d, _, worktree := checkoutCWDSetup(t)
+	d, _, worktree, _ := checkoutCWDSetup(t)
 
 	assert.True(t, d.cwdReachable(ctx, worktree),
 		"a cwd inside a registered automatic checkout must be reachable")
@@ -149,12 +160,54 @@ func TestDispatcher_RegisteredCheckoutCWDPasses(t *testing.T) {
 	}
 }
 
+// TestDispatcher_GraceCheckoutCWDPasses keeps the daemon admission gate in
+// lockstep with selector-free MCP scope resolution. During grace the exact
+// worktree is unavailable, but eligible requests are still served from the
+// labeled, read-only family-primary fallback; rejecting the cwd here would
+// prevent that policy from running at all.
+func TestDispatcher_GraceCheckoutCWDPasses(t *testing.T) {
+	for _, state := range []store_sqlite.CheckoutState{
+		store_sqlite.CheckoutStateAvailabilityGrace,
+		store_sqlite.CheckoutStateRemovalGrace,
+		store_sqlite.CheckoutStateUnavailable,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			d, _, worktree, catalog := checkoutCWDSetup(t)
+			setCheckoutCWDState(t, catalog, state)
+
+			assert.True(t, d.cwdReachable(ctx, worktree),
+				"a checkout in %s must reach the MCP fallback policy", state)
+		})
+	}
+}
+
+// TestDispatcher_TransitionalCheckoutCWDStaysRejected ensures retained
+// catalog identity alone cannot admit a cwd. These lifecycle states authorize
+// neither an exact view nor the sealed-primary grace fallback.
+func TestDispatcher_TransitionalCheckoutCWDStaysRejected(t *testing.T) {
+	for _, state := range []store_sqlite.CheckoutState{
+		store_sqlite.CheckoutStateReconciling,
+		store_sqlite.CheckoutStateDemoting,
+		store_sqlite.CheckoutStateForgetting,
+		store_sqlite.CheckoutStatePrimaryClosureRetiring,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			d, _, worktree, catalog := checkoutCWDSetup(t)
+			setCheckoutCWDState(t, catalog, state)
+
+			assert.False(t, d.cwdReachable(context.Background(), worktree),
+				"a checkout in %s must stay outside daemon admission", state)
+		})
+	}
+}
+
 // TestDispatcher_UnregisteredWorktreeCWDStillRejected guards the widening. A
 // directory the view catalog does not know stays refused — the catalog arm
 // admits registered checkouts, not every path that happens to sit beside one.
 func TestDispatcher_UnregisteredWorktreeCWDStillRejected(t *testing.T) {
 	ctx := context.Background()
-	d, _, worktree := checkoutCWDSetup(t)
+	d, _, worktree, _ := checkoutCWDSetup(t)
 
 	stranger := filepath.Join(filepath.Dir(worktree), "not-registered")
 	assert.False(t, d.cwdReachable(ctx, stranger),

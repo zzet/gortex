@@ -69,12 +69,14 @@ func TestSearchTextRemovalGraceRefusesWithoutReadingAnyWorkingCopy(t *testing.T)
 		t.Fatalf("put checkout in removal grace: %v", err)
 	}
 
-	call := func(query string) *mcplib.CallToolResult {
+	call := func(query string, explicitSelector bool) *mcplib.CallToolResult {
 		t.Helper()
 		req := newSearchTextRequest(query)
-		req.Params.Arguments.(map[string]any)["view"] = map[string]any{
-			"kind":        "worktree",
-			"checkout_id": stack.checkoutID,
+		if explicitSelector {
+			req.Params.Arguments.(map[string]any)["view"] = map[string]any{
+				"kind":        "worktree",
+				"checkout_id": stack.checkoutID,
+			}
 		}
 		callCtx := WithSessionCWD(WithSessionID(context.Background(), wtSearchSession), stack.worktree)
 		res, err := stack.srv.wrapToolHandler(stack.srv.handleSearchText)(callCtx, req)
@@ -85,28 +87,38 @@ func TestSearchTextRemovalGraceRefusesWithoutReadingAnyWorkingCopy(t *testing.T)
 	}
 
 	wantActual := (graphview.Selector{Kind: graphview.SelectorBase, GraphID: checkoutFamilyPrimaryGraphID(t, stack)}).String()
-	for _, query := range []string{"func Keeper", "zephyr-checkout-only-marker"} {
-		result := call(query)
-		assertNamesTextCapability(t, result)
-		body := viewResultText(t, result)
-		if !strings.Contains(body, wantActual) {
-			t.Errorf("grace refusal for %q did not name sealed fallback %q: %s", query, wantActual, body)
-		}
-		if strings.Contains(body, "GraceBufferMustNotLeak") || strings.Contains(body, "zephyr-checkout-only-marker") {
-			t.Errorf("grace refusal for %q leaked checkout/buffer content: %s", query, body)
-		}
+	for _, selector := range []struct {
+		name     string
+		explicit bool
+	}{
+		{name: "explicit selector", explicit: true},
+		{name: "session CWD"},
+	} {
+		t.Run(selector.name, func(t *testing.T) {
+			for _, query := range []string{"func Keeper", "zephyr-checkout-only-marker"} {
+				result := call(query, selector.explicit)
+				assertNamesTextCapability(t, result)
+				body := viewResultText(t, result)
+				if !strings.Contains(body, wantActual) {
+					t.Errorf("grace refusal for %q did not name sealed fallback %q: %s", query, wantActual, body)
+				}
+				if strings.Contains(body, "GraceBufferMustNotLeak") || strings.Contains(body, "zephyr-checkout-only-marker") {
+					t.Errorf("grace refusal for %q leaked checkout/buffer content: %s", query, body)
+				}
 
-		freshness := metaFreshness(t, result)
-		if freshness["exact"] != false || freshness["actual_view"] != wantActual {
-			t.Errorf("freshness = %v, want labeled base refusal %q", freshness, wantActual)
-		}
-		if freshness["actual_state"] != string(store_sqlite.CheckoutStateRemovalGrace) ||
-			freshness["fallback_reason"] != string(store_sqlite.CheckoutStateRemovalGrace) {
-			t.Errorf("freshness = %v, want removal-grace state and reason", freshness)
-		}
-		if _, claimed := freshness["base_scoped"]; claimed {
-			t.Errorf("freshness = %v, refused search.text must not claim a base-scoped answer", freshness)
-		}
+				freshness := metaFreshness(t, result)
+				if freshness["exact"] != false || freshness["actual_view"] != wantActual {
+					t.Errorf("freshness = %v, want labeled base refusal %q", freshness, wantActual)
+				}
+				if freshness["actual_state"] != string(store_sqlite.CheckoutStateRemovalGrace) ||
+					freshness["fallback_reason"] != string(store_sqlite.CheckoutStateRemovalGrace) {
+					t.Errorf("freshness = %v, want removal-grace state and reason", freshness)
+				}
+				if _, claimed := freshness["base_scoped"]; claimed {
+					t.Errorf("freshness = %v, refused search.text must not claim a base-scoped answer", freshness)
+				}
+			}
+		})
 	}
 
 	// The compact facade is the agent-facing path. It must resolve the same
@@ -117,43 +129,53 @@ func TestSearchTextRemovalGraceRefusesWithoutReadingAnyWorkingCopy(t *testing.T)
 	}
 	facadeSession := wtSearchSession + "-facade"
 	stack.srv.NoteSessionClient(facadeSession, "codex", "1")
-	facade := mcplib.CallToolRequest{}
-	facade.Params.Name = "search"
-	facade.Params.Arguments = map[string]any{
-		"operation": "text",
-		"query":     "func Keeper",
-		"view":      map[string]any{"kind": "worktree", "checkout_id": stack.checkoutID},
-	}
-	facadeResult, err := registered.Handler(
-		WithSessionCWD(WithSessionID(context.Background(), facadeSession), stack.worktree), facade)
-	if err != nil {
-		t.Fatalf("facade grace search: %v", err)
-	}
-	assertNamesTextCapability(t, facadeResult)
-	if freshness := metaFreshness(t, facadeResult); freshness["actual_view"] != wantActual || freshness["exact"] != false {
-		t.Errorf("facade freshness = %v, want labeled base refusal %q", freshness, wantActual)
+	for _, explicitSelector := range []bool{true, false} {
+		facade := mcplib.CallToolRequest{}
+		facade.Params.Name = "search"
+		facade.Params.Arguments = map[string]any{
+			"operation": "text",
+			"query":     "func Keeper",
+		}
+		if explicitSelector {
+			facade.Params.Arguments.(map[string]any)["view"] = map[string]any{
+				"kind": "worktree", "checkout_id": stack.checkoutID,
+			}
+		}
+		facadeResult, err := registered.Handler(
+			WithSessionCWD(WithSessionID(context.Background(), facadeSession), stack.worktree), facade)
+		if err != nil {
+			t.Fatalf("facade grace search (explicit selector=%v): %v", explicitSelector, err)
+		}
+		assertNamesTextCapability(t, facadeResult)
+		if freshness := metaFreshness(t, facadeResult); freshness["actual_view"] != wantActual || freshness["exact"] != false {
+			t.Errorf("facade freshness = %v, want labeled base refusal %q", freshness, wantActual)
+		}
 	}
 
 	// The text-search exception is intentionally narrow. A neighboring
 	// filesystem read with the same selector remains strict and must be
 	// rejected before its handler can observe the retired checkout.
-	strict := mcplib.CallToolRequest{}
-	strict.Params.Name = "read_file"
-	strict.Params.Arguments = map[string]any{
-		"path": "repo/keep.go",
-		"view": map[string]any{"kind": "worktree", "checkout_id": stack.checkoutID},
-	}
-	strictRan := false
-	strictResult, err := stack.srv.wrapToolHandler(func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-		strictRan = true
-		return mcplib.NewToolResultText(`{"unexpected":true}`), nil
-	})(WithSessionCWD(WithSessionID(context.Background(), wtSearchSession), stack.worktree), strict)
-	if err != nil {
-		t.Fatalf("strict neighbor read: %v", err)
-	}
-	assertToolError(t, strictResult, graphview.CodeCheckoutInaccessible)
-	if strictRan {
-		t.Fatal("read_file reached its handler during removal grace")
+	for _, explicitSelector := range []bool{true, false} {
+		strict := mcplib.CallToolRequest{}
+		strict.Params.Name = "read_file"
+		strict.Params.Arguments = map[string]any{"path": "repo/keep.go"}
+		if explicitSelector {
+			strict.Params.Arguments.(map[string]any)["view"] = map[string]any{
+				"kind": "worktree", "checkout_id": stack.checkoutID,
+			}
+		}
+		strictRan := false
+		strictResult, err := stack.srv.wrapToolHandler(func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+			strictRan = true
+			return mcplib.NewToolResultText(`{"unexpected":true}`), nil
+		})(WithSessionCWD(WithSessionID(context.Background(), wtSearchSession), stack.worktree), strict)
+		if err != nil {
+			t.Fatalf("strict neighbor read (explicit selector=%v): %v", explicitSelector, err)
+		}
+		assertToolError(t, strictResult, graphview.CodeCheckoutInaccessible)
+		if strictRan {
+			t.Fatalf("read_file reached its handler during removal grace (explicit selector=%v)", explicitSelector)
+		}
 	}
 }
 

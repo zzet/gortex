@@ -599,18 +599,44 @@ func (s *Server) viewForSessionCWD(ctx context.Context, policy requestViewPolicy
 		}
 		return viewFallback(false, graphview.NewViewRider(graphview.Selector{Kind: graphview.SelectorAuto}), err)
 	}
-	if !found || checkout.State != store_sqlite.CheckoutStateReady {
+	if !found {
+		return nil, nil
+	}
+	if checkout.State != store_sqlite.CheckoutStateReady {
+		if checkoutStateAllowsBaseFallback(checkout.State) {
+			requested := graphview.Selector{
+				Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID,
+			}
+			return s.viewForWorktreeSelector(ctx, requested, policy)
+		}
 		return nil, nil
 	}
 	switch checkout.EffectiveMode {
 	case store_sqlite.CheckoutModeAutomatic:
 	case store_sqlite.CheckoutModeDedicated:
 		// Legacy dedicated graphs are the canonical base corpus and have no
-		// checkout route. Exact-HEAD dedicated graphs publish a route; only
-		// those route-owned views should attach worktree freshness metadata.
+		// checkout route. Exact-HEAD dedicated graphs are exact only after their
+		// coordinator publishes the commit/dirty route; until then the common
+		// path below serves the active primary as a labeled building fallback.
 		_, routed, routeErr := s.materializer.Catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
 		if routeErr == nil && !routed {
-			return nil, nil
+			dedicated, graphFound, graphErr := s.materializer.Catalog.GetDedicatedGraphByOwner(
+				ctx, checkout.CheckoutID,
+			)
+			switch {
+			case graphErr != nil:
+				return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+					fmt.Sprintf("read graph owned by checkout %q", checkout.CheckoutID), graphErr)
+			case !graphFound:
+				return nil, nil
+			case dedicated.State != reconcile.GraphStateReady:
+				return nil, graphview.NewViewError(graphview.CodeViewBuilding,
+					fmt.Sprintf("graph %q is %s", dedicated.GraphID, dedicated.State))
+			case dedicated.ActiveGenerationID <= 0:
+				// Compatibility for dedicated graphs created before sealed base
+				// generations: their canonical corpus remains generation zero.
+				return nil, nil
+			}
 		}
 	default:
 		return nil, nil
@@ -722,7 +748,7 @@ func (s *Server) materializeGraceBaseFallback(
 		// read from the sealed corpus, but have no generation lease to bind.
 		return fallback, nil
 	}
-	base, err := s.materializer.MaterializeBase(ctx, primary.GraphID, primary.ActiveGenerationID)
+	base, err := s.materializeSelectedBase(ctx, primary)
 	if err != nil {
 		return nil, err
 	}
@@ -730,6 +756,44 @@ func (s *Server) materializeGraceBaseFallback(
 	fallback.materialized = base
 	fallback.bindSources(base.GenerationSources(), s.graph)
 	return fallback, nil
+}
+
+// materializeSelectedBase pins the generation a dedicated-graph catalog row
+// selected and then rechecks that row while the lease is held. The second read
+// is the request's snapshot linearization point: a refresh may publish a new
+// active base concurrently, but an answer must never label the superseded one
+// as the graph selected for this request.
+func (s *Server) materializeSelectedBase(
+	ctx context.Context, selected store_sqlite.DedicatedGraph,
+) (*graphview.RepoView, error) {
+	base, err := s.materializer.MaterializeBase(
+		ctx, selected.GraphID, selected.ActiveGenerationID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	current, found, readErr := s.materializer.Catalog.GetDedicatedGraph(ctx, selected.GraphID)
+	switch {
+	case readErr != nil:
+		base.Close()
+		return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+			fmt.Sprintf("revalidate graph %q", selected.GraphID), readErr)
+	case !found:
+		base.Close()
+		return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible,
+			fmt.Sprintf("graph %q disappeared while its base was selected", selected.GraphID))
+	case current.OwnerCheckoutID != selected.OwnerCheckoutID ||
+		current.RepoPrefix != selected.RepoPrefix ||
+		current.FamilyID != selected.FamilyID ||
+		current.IsPrimaryBase != selected.IsPrimaryBase ||
+		current.State != selected.State ||
+		current.ActiveGenerationID != selected.ActiveGenerationID:
+		base.Close()
+		return nil, graphview.NewViewError(graphview.CodeViewBuilding,
+			fmt.Sprintf("graph %q changed while its base was selected", selected.GraphID))
+	default:
+		return base, nil
+	}
 }
 
 // viewForBaseSelector pins the request to a named base graph. A dedicated
@@ -764,7 +828,7 @@ func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Sel
 		// in generation zero.
 		return selected, nil
 	}
-	base, err := s.materializer.MaterializeBase(ctx, dedicated.GraphID, dedicated.ActiveGenerationID)
+	base, err := s.materializeSelectedBase(ctx, dedicated)
 	if err != nil {
 		return nil, err
 	}
@@ -788,23 +852,26 @@ func (s *Server) materializeRequestView(
 	strict bool,
 ) (*requestView, error) {
 	rider := graphview.NewViewRider(requested)
+	fallback := func(cause error) (*requestView, error) {
+		return s.materializeBuildingBaseFallback(ctx, strict, rider, checkout, cause)
+	}
 	route, found, err := s.materializer.Catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
 	switch {
 	case err != nil:
-		return viewFallback(strict, rider, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+		return fallback(graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("read the route of checkout %q", checkout.CheckoutID), err))
 	case !found || !graphview.RouteReady(route):
-		return viewFallback(strict, rider, graphview.NewViewError(graphview.CodeViewBuilding,
+		return fallback(graphview.NewViewError(graphview.CodeViewBuilding,
 			fmt.Sprintf("checkout %q is not fully routed yet", checkout.CheckoutID)))
 	}
 
 	if err := s.checkoutRouteHeadError(ctx, checkout, route); err != nil {
-		return viewFallback(strict, rider, err)
+		return fallback(err)
 	}
 
 	view, err := s.materializer.MaterializeCheckout(ctx, checkout.CheckoutID)
 	if err != nil {
-		return viewFallback(strict, rider, err)
+		return fallback(err)
 	}
 	rider.MarkExact(requested.String())
 	rider.GraphID = view.ID.BaseGraphID
@@ -819,6 +886,49 @@ func (s *Server) materializeRequestView(
 	}
 	routed.bindSources(view.GenerationSources(), s.graph)
 	return routed, nil
+}
+
+// materializeBuildingBaseFallback serves the family's selected sealed base
+// while an automatic/dedicated route is incomplete. It preserves the existing
+// labeled fallback policy, but generation-backed graphs must read their active
+// base rather than silently dropping to generation zero.
+func (s *Server) materializeBuildingBaseFallback(
+	ctx context.Context,
+	strict bool,
+	rider *graphview.ViewRider,
+	checkout store_sqlite.Checkout,
+	cause error,
+) (*requestView, error) {
+	if strict {
+		return nil, cause
+	}
+	fallback, err := viewFallback(false, rider, cause)
+	if err != nil {
+		return nil, err
+	}
+	primary, err := s.familyPrimaryRegistration(ctx, checkout.FamilyID)
+	if err != nil {
+		return nil, err
+	}
+	fallback.kind = viewmetrics.ViewBase
+	fallback.rider.GraphID = primary.GraphID
+	fallback.rider.CheckoutID = checkout.CheckoutID
+	if primary.ActiveGenerationID <= 0 {
+		return fallback, nil
+	}
+	if primary.State != reconcile.GraphStateReady {
+		return nil, graphview.NewViewError(graphview.CodePrimaryNotReady,
+			fmt.Sprintf("primary graph %q is %s", primary.GraphID, primary.State))
+	}
+	base, err := s.materializeSelectedBase(ctx, primary)
+	if err != nil {
+		return nil, err
+	}
+	fallback.reader = base.Reader
+	fallback.materialized = base
+	fallback.baseFallback = true
+	fallback.bindSources(base.GenerationSources(), s.graph)
+	return fallback, nil
 }
 
 // checkoutRouteHeadError keeps a ready-but-stale route internal until its

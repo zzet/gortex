@@ -125,49 +125,70 @@ func TestRemovalGraceSearchUsesPrimaryGenerationStack(t *testing.T) {
 	}
 	v.setWorktreeState(t, store_sqlite.CheckoutStateRemovalGrace)
 
-	res, err := v.callWithView(t, v.repoRoot, "search_symbols", routedArgs(),
-		func(ctx context.Context) (*mcplib.CallToolResult, error) {
-			return v.srv.handleSearchSymbols(ctx, searchToolRequest(searchProseQuery))
-		})
-	if err != nil {
-		t.Fatalf("removal-grace search: %v", err)
-	}
-	if res.IsError {
-		t.Fatalf("removal-grace search was refused: %s", viewResultText(t, res))
-	}
-	body := singleTextOrFail(t, res)
-	for _, id := range []string{searchOldID, searchHiddenID} {
-		if !strings.Contains(body, id) {
-			t.Errorf("removal-grace primary fallback omitted base symbol %q: %s", id, body)
-		}
-	}
-	for _, id := range []string{searchNewID, searchFreshID, searchDirtyID} {
-		if strings.Contains(body, id) {
-			t.Errorf("removal-grace primary fallback leaked worktree symbol %q: %s", id, body)
-		}
-	}
+	for _, selection := range []struct {
+		name string
+		cwd  string
+		args func() map[string]any
+	}{
+		{name: "explicit selector", cwd: v.repoRoot, args: routedArgs},
+		{name: "session cwd", cwd: v.worktreeRoot, args: func() map[string]any { return nil }},
+	} {
+		t.Run(selection.name, func(t *testing.T) {
+			res, err := v.callWithView(t, selection.cwd, "search_symbols", selection.args(),
+				func(ctx context.Context) (*mcplib.CallToolResult, error) {
+					view := requestViewFromContext(ctx)
+					if view == nil || view.materialized == nil || !view.baseFallback {
+						t.Fatalf("removal grace did not materialize the labeled primary base: %+v", view)
+					}
+					if !v.leases.InUse(baseGenerationID) {
+						t.Fatal("primary base lease is not held during grace request")
+					}
+					return v.srv.handleSearchSymbols(ctx, searchToolRequest(searchProseQuery))
+				})
+			if err != nil {
+				t.Fatalf("removal-grace search: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("removal-grace search was refused: %s", viewResultText(t, res))
+			}
+			if v.leases.InUse(baseGenerationID) {
+				t.Fatal("primary base lease survived grace request completion")
+			}
+			body := singleTextOrFail(t, res)
+			for _, id := range []string{searchOldID, searchHiddenID} {
+				if !strings.Contains(body, id) {
+					t.Errorf("removal-grace primary fallback omitted base symbol %q: %s", id, body)
+				}
+			}
+			for _, id := range []string{searchNewID, searchFreshID, searchDirtyID} {
+				if strings.Contains(body, id) {
+					t.Errorf("removal-grace primary fallback leaked worktree symbol %q: %s", id, body)
+				}
+			}
 
-	freshness := resultFreshness(t, res)
-	wantActual := "base:" + v.graphID
-	if freshness["requested_view"] != "worktree:"+viewTestWorktree || freshness["actual_view"] != wantActual {
-		t.Errorf("freshness = %v, want retained worktree request and %q answer", freshness, wantActual)
-	}
-	if freshness["fallback_reason"] != string(store_sqlite.CheckoutStateRemovalGrace) {
-		t.Errorf("freshness = %v, want labeled removal-grace fallback", freshness)
-	}
-	baseScoped, ok := freshness["base_scoped"].([]any)
-	if !ok {
-		t.Fatalf("freshness = %v, want base_scoped capability list", freshness)
-	}
-	searchScoped := false
-	for _, capability := range baseScoped {
-		if capability == string(graphview.CapSearchSymbols) {
-			searchScoped = true
-			break
-		}
-	}
-	if !searchScoped {
-		t.Errorf("freshness = %v, want %q marked base-scoped", freshness, graphview.CapSearchSymbols)
+			freshness := resultFreshness(t, res)
+			wantActual := "base:" + v.graphID
+			if freshness["requested_view"] != "worktree:"+viewTestWorktree || freshness["actual_view"] != wantActual {
+				t.Errorf("freshness = %v, want retained worktree request and %q answer", freshness, wantActual)
+			}
+			if freshness["fallback_reason"] != string(store_sqlite.CheckoutStateRemovalGrace) {
+				t.Errorf("freshness = %v, want labeled removal-grace fallback", freshness)
+			}
+			baseScoped, ok := freshness["base_scoped"].([]any)
+			if !ok {
+				t.Fatalf("freshness = %v, want base_scoped capability list", freshness)
+			}
+			searchScoped := false
+			for _, capability := range baseScoped {
+				if capability == string(graphview.CapSearchSymbols) {
+					searchScoped = true
+					break
+				}
+			}
+			if !searchScoped {
+				t.Errorf("freshness = %v, want %q marked base-scoped", freshness, graphview.CapSearchSymbols)
+			}
+		})
 	}
 }
 
@@ -175,20 +196,31 @@ func TestAvailabilityGraceKeepsExactFileAndEditPoliciesStrict(t *testing.T) {
 	stack := newViewStack(t)
 	putViewWorktreeInAvailabilityGrace(t, stack)
 
-	for _, tool := range []string{"get_symbol", "read_file", "edit_file"} {
-		t.Run(tool, func(t *testing.T) {
-			ran := false
-			res, err := stack.callWithView(t, stack.repoRoot, tool, worktreeViewArgs(),
-				func(context.Context) (*mcplib.CallToolResult, error) {
-					ran = true
-					return mcplib.NewToolResultText(`{"ok":true}`), nil
+	for _, selection := range []struct {
+		name string
+		cwd  string
+		args func() map[string]any
+	}{
+		{name: "explicit selector", cwd: stack.repoRoot, args: worktreeViewArgs},
+		{name: "session cwd", cwd: stack.worktreeRoot, args: func() map[string]any { return nil }},
+	} {
+		t.Run(selection.name, func(t *testing.T) {
+			for _, tool := range []string{"get_symbol", "read_file", "edit_file"} {
+				t.Run(tool, func(t *testing.T) {
+					ran := false
+					res, err := stack.callWithView(t, selection.cwd, tool, selection.args(),
+						func(context.Context) (*mcplib.CallToolResult, error) {
+							ran = true
+							return mcplib.NewToolResultText(`{"ok":true}`), nil
+						})
+					if err != nil {
+						t.Fatalf("call: %v", err)
+					}
+					assertToolError(t, res, graphview.CodeCheckoutInaccessible)
+					if ran {
+						t.Errorf("%s reached its handler during availability grace", tool)
+					}
 				})
-			if err != nil {
-				t.Fatalf("call: %v", err)
-			}
-			assertToolError(t, res, graphview.CodeCheckoutInaccessible)
-			if ran {
-				t.Errorf("%s reached its handler during availability grace", tool)
 			}
 		})
 	}

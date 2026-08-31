@@ -84,10 +84,13 @@ func viewTextUnavailable(view *requestView, because string) *mcp.CallToolResult 
 // viewCheckoutID and viewRepoPrefix read the two identities the checkout
 // searcher is addressed by, tolerating a view that carries neither.
 func viewCheckoutID(view *requestView) string {
-	if view == nil || view.rider == nil {
+	if view == nil {
 		return ""
 	}
-	return view.rider.CheckoutID
+	if view.rider != nil && view.rider.CheckoutID != "" {
+		return view.rider.CheckoutID
+	}
+	return view.checkoutID
 }
 
 func viewRepoPrefix(view *requestView) string {

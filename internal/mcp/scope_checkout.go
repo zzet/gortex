@@ -24,10 +24,18 @@ import (
 // (graphview.CheckoutForPath over the same families), so a session cannot bind
 // its scope to one checkout and read through another.
 //
+// During availability/removal grace, the checkout no longer has an exact
+// routed view, but eligible reads deliberately fall back to the sealed family
+// primary. Those states therefore bind through the primary registration too.
+// In particular, they must not use repoPrefixForCheckout: a disappearing
+// checkout can still own a stale dedicated graph row, while the answer being
+// served belongs to the surviving primary corpus.
+//
 // ok is false when no view catalog is wired, when the path lies in no
-// registered checkout, when the checkout is not one the shared lane answers
-// for, or when its family's primary is not a tracked repository. Every one of
-// those leaves the caller on the fail-closed path it took before.
+// registered checkout, when the checkout is neither a live automatic checkout
+// nor one of the grace states served from the primary, or when the selected
+// repository is not tracked. Every one of those leaves the caller on the
+// fail-closed path it took before.
 func (s *Server) scopeForAutomaticCheckout(ctx context.Context, cwd string) (workspaceID, projectID, repoPrefix string, ok bool) {
 	if s == nil || s.multiIndexer == nil || s.materializer == nil || s.materializer.Catalog == nil {
 		return "", "", "", false
@@ -41,10 +49,26 @@ func (s *Server) scopeForAutomaticCheckout(ctx context.Context, cwd string) (wor
 		}
 		return "", "", "", false
 	}
-	if !found || !graphview.ServesAutomaticView(checkout) {
+	if !found {
 		return "", "", "", false
 	}
-	prefix := s.repoPrefixForCheckout(ctx, checkout)
+
+	var prefix string
+	switch {
+	case checkoutStateAllowsBaseFallback(checkout.State):
+		primary, primaryErr := s.familyPrimaryRegistration(ctx, checkout.FamilyID)
+		if primaryErr != nil {
+			if s.logger != nil {
+				s.logger.Debug("session scope: could not resolve the checkout's family primary", zap.Error(primaryErr))
+			}
+			return "", "", "", false
+		}
+		prefix = primary.RepoPrefix
+	case graphview.ServesAutomaticView(checkout):
+		prefix = s.repoPrefixForCheckout(ctx, checkout)
+	default:
+		return "", "", "", false
+	}
 	if prefix == "" {
 		return "", "", "", false
 	}

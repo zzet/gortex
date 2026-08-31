@@ -10,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // newSearchTextRequest is one search_text call with nothing but a query on it.
@@ -48,6 +49,21 @@ func assertNamesTextCapability(t *testing.T, res *mcplib.CallToolResult) {
 	}
 }
 
+func setRefActiveBaseGeneration(t testing.TB, stack *refStack, generationID int64) {
+	t.Helper()
+	dedicated, found, err := stack.store.Catalog().GetDedicatedGraph(context.Background(), stack.graphID)
+	if err != nil {
+		t.Fatalf("get dedicated graph: %v", err)
+	}
+	if !found {
+		t.Fatalf("dedicated graph %q is missing", stack.graphID)
+	}
+	dedicated.ActiveGenerationID = generationID
+	if err := stack.store.Catalog().UpsertDedicatedGraph(context.Background(), dedicated); err != nil {
+		t.Fatalf("set active base generation: %v", err)
+	}
+}
+
 // TestSearchTextRefusesAViewOfACommittedTree is the defining claim for a view
 // with no working copy: there is nothing on disk holding that tree, so the
 // search is refused rather than answered out of the canonical checkout — whose
@@ -63,7 +79,10 @@ func TestSearchTextRefusesAViewOfACommittedTree(t *testing.T) {
 	assertNamesTextCapability(t, res)
 
 	// The control: the canonical checkout really does hold the query, so the
-	// refusal above is a refusal to answer and not an empty corpus.
+	// refusal above is a refusal to answer and not an empty corpus. Force the
+	// true legacy path: a generation-backed base intentionally has no working
+	// copy file surface and is therefore not this filesystem-search control.
+	setRefActiveBaseGeneration(t, stack, 0)
 	plain, err := stack.call(t, "search_text", nil,
 		map[string]any{"query": "func Keeper"}, stack.srv.handleSearchText)
 	if err != nil {
@@ -86,6 +105,7 @@ func TestSearchTextRefusesAViewOfACommittedTree(t *testing.T) {
 // route; merely finding its CWD must not manufacture a composed view.
 func TestViewForSessionCWDLeavesLegacyDedicatedCheckoutOnBase(t *testing.T) {
 	stack := newRefStack(t)
+	setRefActiveBaseGeneration(t, stack, 0)
 	ctx := WithSessionCWD(WithSessionID(context.Background(), refTestSession), stack.repo)
 
 	view, err := stack.srv.viewForSessionCWD(ctx, requestViewPolicy{})
@@ -97,8 +117,30 @@ func TestViewForSessionCWDLeavesLegacyDedicatedCheckoutOnBase(t *testing.T) {
 	}
 }
 
+func BenchmarkViewForSessionCWDRouteFreeDedicatedFallback(b *testing.B) {
+	stack := newRefStack(b)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), refTestSession), stack.repo)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		view, err := stack.srv.viewForSessionCWD(ctx, requestViewPolicy{
+			allowBuildingBaseFallback: true,
+		})
+		if err != nil {
+			b.Fatalf("resolve the generation-backed dedicated checkout: %v", err)
+		}
+		if view == nil || view.materialized == nil || !view.baseFallback ||
+			requestViewKind(view) != viewmetrics.ViewBase {
+			b.Fatalf("route-free dedicated checkout resolved to %+v", view)
+		}
+		view.close()
+	}
+}
+
 func BenchmarkViewForSessionCWDLegacyDedicatedBase(b *testing.B) {
 	stack := newRefStack(b)
+	setRefActiveBaseGeneration(b, stack, 0)
 	ctx := WithSessionCWD(WithSessionID(context.Background(), refTestSession), stack.repo)
 
 	b.ReportAllocs()
@@ -109,7 +151,7 @@ func BenchmarkViewForSessionCWDLegacyDedicatedBase(b *testing.B) {
 			b.Fatalf("resolve the legacy dedicated checkout: %v", err)
 		}
 		if view != nil {
-			b.Fatalf("legacy dedicated checkout resolved to a composed view: %+v", view)
+			b.Fatalf("legacy dedicated checkout resolved to a materialized view: %+v", view)
 		}
 	}
 }

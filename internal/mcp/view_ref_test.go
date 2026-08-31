@@ -343,14 +343,17 @@ func TestRefViewServesTheCommittedTreeNotTheWorkingCopy(t *testing.T) {
 		t.Errorf("the base corpus's content answered instead of the branch's:\n%s", content)
 	}
 
-	// The control: the same read with no view still reads the working copy,
-	// so the difference above is the view and nothing else.
-	plain, err := stack.readFile(t, nil, "repo/edit.go")
+	// The control is deliberately a direct disk read. This fixture registers a
+	// generation-backed dedicated checkout without publishing its exact route,
+	// so an automatic exact file request must answer view_building rather than
+	// bypassing the route and reading mutable bytes. The disk read proves those
+	// bytes nevertheless existed while the committed ref view answered above.
+	workingCopy, err := os.ReadFile(filepath.Join(stack.repo, "edit.go"))
 	if err != nil {
 		t.Fatalf("read the working copy: %v", err)
 	}
-	if content := refResultString(t, refResultObject(t, plain), "content"); !strings.Contains(content, "Dirty") {
-		t.Errorf("the working-copy read did not see the uncommitted edit:\n%s", content)
+	if content := string(workingCopy); !strings.Contains(content, "Dirty") {
+		t.Errorf("the working copy does not contain the uncommitted control edit:\n%s", content)
 	}
 }
 

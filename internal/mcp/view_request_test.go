@@ -1097,6 +1097,30 @@ func BenchmarkGraceWorktreeSelectorPrimaryFallback(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+	baseGenerationID, basePayload, err := store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      "dedicated_base",
+		GraphID:        primaryGraph,
+		LayerID:        primaryGraph + ":base",
+		CheckoutID:     primaryCheckout,
+		GenerationKind: "dedicated_base",
+		TreeOID:        "bench-primary-tree",
+		CreatedAt:      2,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	_ = basePayload
+	if err := store.PublishPayloadGeneration(ctx, baseGenerationID, 3); err != nil {
+		b.Fatal(err)
+	}
+	primary, found, err := catalog.GetDedicatedGraph(ctx, primaryGraph)
+	if err != nil || !found {
+		b.Fatalf("read primary graph: found=%v err=%v", found, err)
+	}
+	primary.ActiveGenerationID = baseGenerationID
+	if err := catalog.UpsertDedicatedGraph(ctx, primary); err != nil {
+		b.Fatal(err)
+	}
 
 	engine := query.NewEngine(store)
 	srv := NewServer(engine, store, nil, nil, zap.NewNop(), nil, MultiRepoOptions{})
@@ -1106,18 +1130,33 @@ func BenchmarkGraceWorktreeSelectorPrimaryFallback(b *testing.B) {
 	selector := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: worktreeCheckout}
 	policy := requestViewPolicy{allowGraceBaseFallback: true}
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		view, err := srv.viewForWorktreeSelector(ctx, selector, policy)
-		if err != nil {
-			b.Fatal(err)
+	b.Run("explicit_selector", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			view, err := srv.viewForWorktreeSelector(ctx, selector, policy)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if view == nil || view.rider == nil || !view.suppressBufferOverlay {
+				b.Fatalf("grace selector returned %+v", view)
+			}
+			view.close()
 		}
-		if view == nil || view.rider == nil || !view.suppressBufferOverlay {
-			b.Fatalf("grace selector returned %+v", view)
+	})
+	b.Run("session_cwd", func(b *testing.B) {
+		cwdCtx := WithSessionCWD(ctx, "/bench/worktree/internal/file.go")
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			view, err := srv.viewForSessionCWD(cwdCtx, policy)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if view == nil || view.rider == nil || !view.suppressBufferOverlay {
+				b.Fatalf("grace CWD returned %+v", view)
+			}
+			view.close()
 		}
-		view.close()
-	}
+	})
 }
 
 func TestGraceFallbackPolicyUsesResolvedOperationEffects(t *testing.T) {
