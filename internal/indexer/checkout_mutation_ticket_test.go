@@ -96,6 +96,35 @@ func TestCheckoutMutationTicketPublishesSelectedRoute(t *testing.T) {
 	}
 }
 
+func TestCheckoutMutationReadyRequiresLiveReadyRoute(t *testing.T) {
+	coordinator, route := newCheckoutMutationTicketHarness(t)
+	lifecycle := &CheckoutLifecycle{
+		catalog:      coordinator.catalog,
+		coordinators: map[string]*CheckoutCoordinator{coordinator.checkoutID: coordinator},
+	}
+	if !lifecycle.CheckoutMutationReady(coordinator.checkoutID, coordinator.root) {
+		t.Fatal("live coordinator with a ready exact route was not mutation-ready")
+	}
+	if lifecycle.CheckoutMutationReady(coordinator.checkoutID, filepath.Join(coordinator.root, "sibling")) {
+		t.Fatal("coordinator admitted a different checkout root")
+	}
+
+	if err := coordinator.catalog.DeleteCheckoutRoute(context.Background(), coordinator.checkoutID); err != nil {
+		t.Fatalf("delete checkout route: %v", err)
+	}
+	if lifecycle.CheckoutMutationReady(coordinator.checkoutID, coordinator.root) {
+		t.Fatal("route-free checkout was admitted for a disk mutation")
+	}
+
+	route.State = store_sqlite.RoutePending
+	if err := coordinator.catalog.UpsertCheckoutRoute(context.Background(), route); err != nil {
+		t.Fatalf("restore pending checkout route: %v", err)
+	}
+	if lifecycle.CheckoutMutationReady(coordinator.checkoutID, coordinator.root) {
+		t.Fatal("pending checkout route was admitted for a disk mutation")
+	}
+}
+
 func TestCheckoutMutationTicketDoesNotLetOlderCycleCoverLaterEdit(t *testing.T) {
 	coordinator, route := newCheckoutMutationTicketHarness(t)
 	first, err := coordinator.enqueueFileMutation(context.Background(), filepath.Join(coordinator.root, "first.go"))
@@ -253,4 +282,32 @@ func BenchmarkCheckoutMutationTicketAdmissionPublication(b *testing.B) {
 			b.Fatalf("publication failed: %+v", result)
 		}
 	}
+}
+
+func BenchmarkCheckoutMutationReady(b *testing.B) {
+	coordinator, _ := newCheckoutMutationTicketHarness(b)
+	lifecycle := &CheckoutLifecycle{
+		catalog:      coordinator.catalog,
+		coordinators: map[string]*CheckoutCoordinator{coordinator.checkoutID: coordinator},
+	}
+
+	b.Run("coordinator_only_baseline", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			lifecycle.coordMu.Lock()
+			current := lifecycle.coordinators[coordinator.checkoutID]
+			lifecycle.coordMu.Unlock()
+			if current == nil || !current.Running() || filepath.Clean(current.root) != filepath.Clean(coordinator.root) {
+				b.Fatal("ready coordinator was refused")
+			}
+		}
+	})
+	b.Run("ready_route_guard", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if !lifecycle.CheckoutMutationReady(coordinator.checkoutID, coordinator.root) {
+				b.Fatal("ready checkout was refused")
+			}
+		}
+	})
 }

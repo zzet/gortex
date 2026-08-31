@@ -2693,14 +2693,18 @@ func (l *CheckoutLifecycle) SignalCheckout(checkoutID, reason string) bool {
 // without its publisher is read-only because no component can truthfully
 // report when the graph catches up.
 func (l *CheckoutLifecycle) CheckoutMutationReady(checkoutID, root string) bool {
-	if l == nil || checkoutID == "" || root == "" {
+	if l == nil || l.catalog == nil || checkoutID == "" || root == "" {
 		return false
 	}
 	l.coordMu.Lock()
 	coordinator := l.coordinators[checkoutID]
 	l.coordMu.Unlock()
-	return coordinator != nil && coordinator.Running() &&
-		filepath.Clean(coordinator.root) == filepath.Clean(root)
+	if coordinator == nil || !coordinator.Running() ||
+		filepath.Clean(coordinator.root) != filepath.Clean(root) {
+		return false
+	}
+	route, found, err := l.catalog.GetCheckoutRoute(context.Background(), checkoutID)
+	return err == nil && found && graphview.RouteReady(route)
 }
 
 // EnqueueCheckoutMutation signals the selected checkout's own coordinator and
