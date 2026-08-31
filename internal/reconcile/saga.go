@@ -166,6 +166,7 @@ func (r *Reconciler) ForgetCheckout(ctx context.Context, checkoutID, incarnation
 				store_sqlite.ErrCatalogStaleGuard, checkoutID, existing.Incarnation, incarnation)
 		}
 		target.FamilyID = existing.FamilyID
+		target.RootPath = existing.RootPath
 		owned, err := r.ownedGraph(ctx, existing.FamilyID, checkoutID)
 		if err != nil {
 			return err
@@ -479,6 +480,12 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 	}
 	if err := r.catalog.DeleteCleanupEntry(ctx, id); err != nil && !errors.Is(err, store_sqlite.ErrCatalogNotFound) {
 		return err
+	}
+	if target.Kind == sagaForgetCheckout {
+		r.hooks.CheckoutRemovalCompleted(CheckoutRemovalTarget{
+			CheckoutID: target.CheckoutID, Incarnation: target.Incarnation,
+			RootPath: target.RootPath,
+		})
 	}
 	return nil
 }

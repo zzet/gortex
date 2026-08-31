@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/runtimeactivity"
@@ -66,6 +67,16 @@ var (
 
 type startupViewReadinessProbe func(context.Context, string) (daemon.TrackReadiness, error)
 
+type startupViewCohortMember struct {
+	Path        string
+	CheckoutID  string
+	Incarnation string
+}
+
+func startupTopologyKey(checkoutID, incarnation string) string {
+	return checkoutID + "\x00" + incarnation
+}
+
 // startupViewReadinessMonitor owns the daemon's frozen configured-Git startup
 // cohort. Its paths come from the same post-Seed startupOwnershipPlan consumed
 // by legacy warmup, so a probe that temporarily says "legacy" is retained as
@@ -85,18 +96,17 @@ type startupViewReadinessMonitor struct {
 	retryInitial time.Duration
 	retryMax     time.Duration
 
-	mu          sync.Mutex
-	cohort      []string
-	checkoutIDs map[string]string
-	cohortIDs   map[string]struct{}
-	frozen      bool
-	failures    map[string]struct{}
-	revision    uint64
-	latest      startupViewReadiness
-	hasLatest   bool
-	confirmed   bool
-	finalized   bool
-	onComplete  func()
+	mu         sync.Mutex
+	cohort     []startupViewCohortMember
+	frozen     bool
+	failures   map[string]struct{}
+	topology   map[string]indexer.CheckoutTopologyEvent
+	revision   uint64
+	latest     startupViewReadiness
+	hasLatest  bool
+	confirmed  bool
+	finalized  bool
+	onComplete func()
 }
 
 func newStartupViewReadinessMonitor(paths []string) *startupViewReadinessMonitor {
@@ -106,9 +116,8 @@ func newStartupViewReadinessMonitor(paths []string) *startupViewReadinessMonitor
 		snapshots:    make(chan struct{}, 1),
 		initialized:  make(chan struct{}),
 		watching:     make(chan struct{}),
-		checkoutIDs:  make(map[string]string),
-		cohortIDs:    make(map[string]struct{}),
 		failures:     make(map[string]struct{}),
+		topology:     make(map[string]indexer.CheckoutTopologyEvent),
 		retryInitial: 250 * time.Millisecond,
 		retryMax:     15 * time.Second,
 	}
@@ -259,8 +268,15 @@ func (m *startupViewReadinessMonitor) observe(event indexer.ModeTransitionEvent)
 	if event.CheckoutID != "" {
 		m.mu.Lock()
 		if m.frozen {
-			_, belongs := m.cohortIDs[event.CheckoutID]
-			allIDsKnown := len(m.checkoutIDs) >= len(m.cohort)
+			belongs, allIDsKnown := false, true
+			for _, member := range m.cohort {
+				if member.CheckoutID == "" {
+					allIDsKnown = false
+				}
+				if member.CheckoutID == event.CheckoutID {
+					belongs = true
+				}
+			}
 			if !belongs && allIDsKnown {
 				m.mu.Unlock()
 				return
@@ -277,6 +293,61 @@ func (m *startupViewReadinessMonitor) observe(event indexer.ModeTransitionEvent)
 	m.requestRefresh()
 }
 
+func (m *startupViewReadinessMonitor) observeTopology(event indexer.CheckoutTopologyEvent) {
+	if m == nil || event.CheckoutID == "" || event.Incarnation == "" {
+		return
+	}
+	m.mu.Lock()
+	key := startupTopologyKey(event.CheckoutID, event.Incarnation)
+	standing, exists := m.topology[key]
+	if !exists || standing.Kind != indexer.CheckoutTopologyForgetFinalized {
+		if event.Kind == indexer.CheckoutTopologyRootMoveCompleted &&
+			exists && standing.Kind == indexer.CheckoutTopologyRootMoveCompleted {
+			// Collapse A→B→C to A→C. A pre-freeze cohort knows A, not B.
+			event.PreviousRoot = standing.PreviousRoot
+		}
+		m.topology[key] = event
+	}
+	m.revision++
+	m.mu.Unlock()
+	m.requestRefresh()
+}
+
+func topologyMatchesMember(
+	event indexer.CheckoutTopologyEvent, member startupViewCohortMember,
+) bool {
+	if member.CheckoutID != "" {
+		return member.CheckoutID == event.CheckoutID &&
+			(member.Incarnation == "" || member.Incarnation == event.Incarnation)
+	}
+	return event.PreviousRoot != "" && pathkey.EqualPaths(member.Path, event.PreviousRoot)
+}
+
+func applyStartupTopology(
+	member startupViewCohortMember,
+	events map[string]indexer.CheckoutTopologyEvent,
+) (startupViewCohortMember, bool, bool) {
+	for _, event := range events {
+		if !topologyMatchesMember(event, member) {
+			continue
+		}
+		switch event.Kind {
+		case indexer.CheckoutTopologyForgetFinalized:
+			return member, false, false
+		case indexer.CheckoutTopologyRootMoveCompleted:
+			if event.CurrentRoot == "" {
+				continue
+			}
+			changed := !pathkey.EqualPaths(member.Path, event.CurrentRoot)
+			member.Path = event.CurrentRoot
+			member.CheckoutID = event.CheckoutID
+			member.Incarnation = event.Incarnation
+			return member, true, changed
+		}
+	}
+	return member, true, false
+}
+
 func (m *startupViewReadinessMonitor) snapshot(
 	ctx context.Context, probe startupViewReadinessProbe,
 ) startupViewReadiness {
@@ -284,52 +355,84 @@ func (m *startupViewReadinessMonitor) snapshot(
 		return startupViewReadiness{}
 	}
 	m.mu.Lock()
-	paths := m.paths
+	members := make([]startupViewCohortMember, 0, len(m.paths))
 	if m.frozen {
-		paths = m.cohort
+		members = append(members, m.cohort...)
+	} else {
+		for _, path := range m.paths {
+			members = append(members, startupViewCohortMember{Path: path})
+		}
 	}
-	paths = append([]string(nil), paths...)
 	failures := make(map[string]struct{}, len(m.failures))
 	for checkoutID := range m.failures {
 		failures[checkoutID] = struct{}{}
 	}
-	checkoutIDs := make(map[string]string, len(m.checkoutIDs))
-	for path, checkoutID := range m.checkoutIDs {
-		checkoutIDs[path] = checkoutID
+	topology := make(map[string]indexer.CheckoutTopologyEvent, len(m.topology))
+	for key, event := range m.topology {
+		topology[key] = event
 	}
-	frozen := m.frozen
 	m.mu.Unlock()
 
 	result := startupViewReadiness{}
-	cohort := make([]string, 0, len(paths))
-	needsIDBackfill := frozen && len(checkoutIDs) < len(paths)
-	var cohortCheckoutIDs map[string]string
-	if !frozen || needsIDBackfill {
-		cohortCheckoutIDs = make(map[string]string, len(paths))
-	}
-	for _, path := range paths {
-		readiness, err := probe(ctx, path)
-		cohort = append(cohort, path)
-		result.Expected++
+	cohort := make([]startupViewCohortMember, 0, len(members))
+	for _, member := range members {
+		// Once identity is known, apply terminal topology before probing so a
+		// completed move reads its new root and a finalized forget performs no
+		// stale lookup. Identity-free members are probed first to preserve ABA:
+		// a newly recreated checkout at the old path must beat an older event.
+		if member.CheckoutID != "" {
+			var keep bool
+			member, keep, _ = applyStartupTopology(member, topology)
+			if !keep {
+				continue
+			}
+		}
+
+		readiness, err := probe(ctx, member.Path)
 		if err != nil {
 			// Catalog/materialization reads are transient evidence. Retain the
 			// member as building and let the monitor's one bounded timer retry;
 			// only an explicit lifecycle/generation failure is terminal.
+			cohort = append(cohort, member)
+			result.Expected++
 			result.Building++
 			result.ProbeErrors++
 			continue
 		}
-		checkoutID := ""
 		if readiness.View != nil {
-			checkoutID = readiness.View.CheckoutID
+			if readiness.View.CheckoutID != "" {
+				member.CheckoutID = readiness.View.CheckoutID
+			}
+			if readiness.View.Incarnation != "" {
+				member.Incarnation = readiness.View.Incarnation
+			}
 		}
-		if checkoutID == "" {
-			checkoutID = checkoutIDs[path]
+		var keep, pathChanged bool
+		member, keep, pathChanged = applyStartupTopology(member, topology)
+		if !keep {
+			continue
 		}
-		if checkoutID != "" && cohortCheckoutIDs != nil {
-			cohortCheckoutIDs[path] = checkoutID
+		if pathChanged {
+			readiness, err = probe(ctx, member.Path)
+			if err != nil {
+				cohort = append(cohort, member)
+				result.Expected++
+				result.Building++
+				result.ProbeErrors++
+				continue
+			}
+			if readiness.View != nil {
+				if readiness.View.CheckoutID != "" {
+					member.CheckoutID = readiness.View.CheckoutID
+				}
+				if readiness.View.Incarnation != "" {
+					member.Incarnation = readiness.View.Incarnation
+				}
+			}
 		}
-		if _, failed := failures[checkoutID]; checkoutID != "" && failed {
+		cohort = append(cohort, member)
+		result.Expected++
+		if _, failed := failures[member.CheckoutID]; member.CheckoutID != "" && failed {
 			result.Failed++
 			continue
 		}
@@ -342,39 +445,26 @@ func (m *startupViewReadinessMonitor) snapshot(
 			result.Building++
 		}
 	}
-	if !frozen {
-		m.mu.Lock()
-		if !m.frozen {
-			m.cohort = append([]string(nil), cohort...)
-			m.checkoutIDs = cohortCheckoutIDs
-			m.cohortIDs = make(map[string]struct{}, len(cohortCheckoutIDs))
-			for _, checkoutID := range cohortCheckoutIDs {
-				m.cohortIDs[checkoutID] = struct{}{}
-			}
-			for checkoutID := range m.failures {
-				if _, belongs := m.cohortIDs[checkoutID]; !belongs {
-					delete(m.failures, checkoutID)
-				}
-			}
-			m.frozen = true
+	m.mu.Lock()
+	m.cohort = append(m.cohort[:0], cohort...)
+	m.frozen = true
+	cohortIDs := make(map[string]struct{}, len(cohort))
+	allIDsKnown := true
+	for _, member := range cohort {
+		if member.CheckoutID == "" {
+			allIDsKnown = false
+			continue
 		}
-		m.mu.Unlock()
-	} else if needsIDBackfill && len(cohortCheckoutIDs) > 0 {
-		// A path that was catalog-pending at the post-Seed snapshot may not
-		// have exposed its checkout ID yet. Backfill it once available so later
-		// transition edges can be filtered without losing this cohort member.
-		m.mu.Lock()
-		for path, checkoutID := range cohortCheckoutIDs {
-			m.checkoutIDs[path] = checkoutID
-		}
-		m.cohortIDs = make(map[string]struct{}, len(m.checkoutIDs))
-		for _, checkoutID := range m.checkoutIDs {
-			if checkoutID != "" {
-				m.cohortIDs[checkoutID] = struct{}{}
-			}
-		}
-		m.mu.Unlock()
+		cohortIDs[member.CheckoutID] = struct{}{}
 	}
+	if allIDsKnown {
+		for checkoutID := range m.failures {
+			if _, belongs := cohortIDs[checkoutID]; !belongs {
+				delete(m.failures, checkoutID)
+			}
+		}
+	}
+	m.mu.Unlock()
 	m.retainSnapshot(result)
 	return result
 }
@@ -516,6 +606,7 @@ func watchStartupViewReadiness(
 			}
 			if state != nil && state.lifecycle != nil {
 				state.lifecycle.SetModeTransitionObserver(nil)
+				state.lifecycle.SetCheckoutTopologyObserver(nil)
 			}
 			return
 		}
@@ -736,6 +827,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 	warmupCtx, cancelWarmup := context.WithCancel(context.Background())
 	startupReadinessCtx, cancelStartupReadiness := context.WithCancel(warmupCtx)
 	state.lifecycle.SetModeTransitionObserver(startupReadiness.observe)
+	state.lifecycle.SetCheckoutTopologyObserver(startupReadiness.observeTopology)
 	var startupReadinessWG, warmupWG, eventHubWG sync.WaitGroup
 	stopJanitor := func() {}
 	stopEventHub := func() {}
@@ -760,6 +852,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 	}()
 	stopStartupProducers := sync.OnceFunc(func() {
 		state.lifecycle.SetModeTransitionObserver(nil)
+		state.lifecycle.SetCheckoutTopologyObserver(nil)
 		cancelWarmup()
 		cancelStartupReadiness()
 		stopJanitor()

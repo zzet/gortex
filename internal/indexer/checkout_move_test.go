@@ -2,11 +2,13 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -68,6 +70,157 @@ func TestAutomaticWorktreeMoveRebindsWithoutWritingGenerations(t *testing.T) {
 	require.Equal(t, primaryBefore.ActiveGenerationID, primaryAfter.ActiveGenerationID)
 	require.Zero(t, buildAdmissions.Load(), "root-only convergence admitted a physical build")
 	requireNoRootMoveJournal(t, f.catalog, checkout.CheckoutID)
+}
+
+func TestRootMoveTopologyEventFollowsSuccessfulJournalRelease(t *testing.T) {
+	f := newFamilyFixture(t, "move-readiness-event")
+	defer f.close()
+	ctx := context.Background()
+
+	type observedEvent struct {
+		event       CheckoutTopologyEvent
+		outsideMove bool
+	}
+	events := make(chan observedEvent, 2)
+	f.lc.SetCheckoutTopologyObserver(func(event CheckoutTopologyEvent) {
+		outside := f.lc.moveMu.TryLock()
+		if outside {
+			f.lc.moveMu.Unlock()
+		}
+		events <- observedEvent{event: event, outsideMove: outside}
+	})
+	defer f.lc.SetCheckoutTopologyObserver(nil)
+
+	oldRoot := f.worktree
+	newRoot := filepath.Join(f.dir, "move-readiness-event-renamed")
+	runGit(t, f.main, "worktree", "move", oldRoot, newRoot)
+	report, err := f.lc.Reconciler().ReconcileFamily(ctx, f.familyID, f.main)
+	require.NoError(t, err)
+	requireMoveReport(t, report, f.automatic.CheckoutID, oldRoot, newRoot)
+
+	raw, err := sql.Open("sqlite", f.dbPath+"?_pragma=busy_timeout(5000)")
+	require.NoError(t, err)
+	defer raw.Close()
+	_, err = raw.ExecContext(ctx, fmt.Sprintf(`
+CREATE TRIGGER fail_root_move_completion
+BEFORE DELETE ON checkout_root_moves
+WHEN OLD.checkout_id = '%s'
+BEGIN
+  SELECT RAISE(ABORT, 'injected root move completion failure');
+END`, f.automatic.CheckoutID))
+	require.NoError(t, err)
+
+	err = f.lc.applyReconcileReport(ctx, report)
+	require.ErrorContains(t, err, "injected root move completion failure")
+	select {
+	case got := <-events:
+		t.Fatalf("failed root-move journal release emitted terminal event: %+v", got)
+	default:
+	}
+	_, pending, err := f.catalog.GetCheckoutRootMove(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, pending)
+
+	_, err = raw.ExecContext(ctx, `DROP TRIGGER fail_root_move_completion`)
+	require.NoError(t, err)
+	require.NoError(t, f.lc.applyReconcileReport(ctx, report))
+	select {
+	case got := <-events:
+		require.True(t, got.outsideMove, "topology observer ran while moveMu was held")
+		require.Equal(t, CheckoutTopologyEvent{
+			Kind:         CheckoutTopologyRootMoveCompleted,
+			CheckoutID:   f.automatic.CheckoutID,
+			Incarnation:  f.automatic.Incarnation,
+			PreviousRoot: oldRoot,
+			CurrentRoot:  newRoot,
+		}, got.event)
+	case <-time.After(5 * time.Second):
+		t.Fatal("successful root-move journal release emitted no topology event")
+	}
+	requireNoRootMoveJournal(t, f.catalog, f.automatic.CheckoutID)
+}
+
+func TestRootMoveTopologyEventsCannotOvertakeDurableMoveOrder(t *testing.T) {
+	f := newFamilyFixture(t, "move-readiness-order")
+	defer f.close()
+	ctx := context.Background()
+
+	events := make(chan CheckoutTopologyEvent, 2)
+	firstObserverEntered := make(chan struct{})
+	releaseFirstObserver := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseFirstObserver:
+		default:
+			close(releaseFirstObserver)
+		}
+	}()
+	var observed atomic.Int64
+	f.lc.SetCheckoutTopologyObserver(func(event CheckoutTopologyEvent) {
+		events <- event
+		if observed.Add(1) == 1 {
+			close(firstObserverEntered)
+			<-releaseFirstObserver
+		}
+	})
+	defer f.lc.SetCheckoutTopologyObserver(nil)
+
+	rootA := f.worktree
+	rootB := filepath.Join(f.dir, "move-readiness-order-b")
+	rootC := filepath.Join(f.dir, "move-readiness-order-c")
+	runGit(t, f.main, "worktree", "move", rootA, rootB)
+	reportAB, err := f.lc.Reconciler().ReconcileFamily(ctx, f.familyID, f.main)
+	require.NoError(t, err)
+	requireMoveReport(t, reportAB, f.automatic.CheckoutID, rootA, rootB)
+
+	applyABDone := make(chan error, 1)
+	go func() { applyABDone <- f.lc.applyReconcileReport(ctx, reportAB) }()
+	select {
+	case <-firstObserverEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("A-to-B topology observer did not start")
+	}
+	secondPublicationAttempted := make(chan struct{})
+	var publicationAttempted atomic.Bool
+	f.lc.topologyPublishWaitBarrier = func() {
+		if publicationAttempted.CompareAndSwap(false, true) {
+			close(secondPublicationAttempted)
+		}
+	}
+	defer func() { f.lc.topologyPublishWaitBarrier = nil }()
+	runGit(t, f.main, "worktree", "move", rootB, rootC)
+	reportBC, err := f.lc.Reconciler().ReconcileFamily(ctx, f.familyID, f.main)
+	require.NoError(t, err)
+	requireMoveReport(t, reportBC, f.automatic.CheckoutID, rootB, rootC)
+
+	applyBCDone := make(chan error, 1)
+	go func() { applyBCDone <- f.lc.applyReconcileReport(ctx, reportBC) }()
+	select {
+	case <-secondPublicationAttempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("B-to-C convergence did not reach the publication fence")
+	}
+	select {
+	case err := <-applyBCDone:
+		t.Fatalf("B-to-C convergence overtook the blocked A-to-B publication: %v", err)
+	default:
+	}
+	pending, found, err := f.catalog.GetCheckoutRootMove(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "B-to-C journal must remain until A-to-B is published")
+	require.True(t, coordinatorRootEqual(pending.PreviousRootPath, rootB))
+	require.True(t, coordinatorRootEqual(pending.CurrentRootPath, rootC))
+
+	close(releaseFirstObserver)
+	require.NoError(t, <-applyABDone)
+	require.NoError(t, <-applyBCDone)
+	first := <-events
+	second := <-events
+	require.Equal(t, rootA, first.PreviousRoot)
+	require.Equal(t, rootB, first.CurrentRoot)
+	require.Equal(t, rootB, second.PreviousRoot)
+	require.Equal(t, rootC, second.CurrentRoot)
+	requireNoRootMoveJournal(t, f.catalog, f.automatic.CheckoutID)
 }
 
 func TestAutomaticMoveRebindRejectsRootThatAdvancesDuringBuild(t *testing.T) {

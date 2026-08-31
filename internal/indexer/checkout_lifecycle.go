@@ -239,6 +239,15 @@ type CheckoutLifecycle struct {
 	// the same path-swap component can re-admit a watcher between another
 	// participant's stop and publication.
 	moveMu sync.Mutex
+	// topologyPublishMu orders terminal topology callbacks with the durable
+	// root-move/forget operation that produced them. Root convergence acquires
+	// it before moveMu and holds it until callbacks have been delivered outside
+	// moveMu, so a later B-to-C move cannot overtake an A-to-B notification.
+	topologyPublishMu sync.Mutex
+	// topologyPublishWaitBarrier runs immediately before topologyPublishMu is
+	// acquired. It is a deterministic concurrency-test seam; production leaves
+	// it nil.
+	topologyPublishWaitBarrier func()
 	// moveComponentBarrier observes component transaction phases in tests. It
 	// runs with moveMu held and must not call lifecycle entry points.
 	moveComponentBarrier func(phase string, checkoutIDs []string)
@@ -277,6 +286,12 @@ type CheckoutLifecycle struct {
 	// outcome instead of polling SQLite. It is copied under mu and invoked
 	// after every lifecycle lock has been released.
 	transitionObserver func(ModeTransitionEvent)
+	// topologyObserver reports only terminal durable topology changes: a root
+	// move journal was released, or a forget-checkout saga released its final
+	// cleanup row. It is deliberately separate from transitionObserver because
+	// topology changes alter startup-cohort membership/path identity while mode
+	// transitions only alter readiness/failure state.
+	topologyObserver func(CheckoutTopologyEvent)
 	// gate defers build work while the daemon warms up. nil admits every
 	// build, which is what every surface that has no warmup runs with.
 	gate *ViewBuildGate
@@ -414,6 +429,30 @@ type ModeTransitionEvent struct {
 	Failed       bool
 }
 
+// CheckoutTopologyEventKind identifies a terminal durable change to one
+// checkout's physical topology.
+type CheckoutTopologyEventKind string
+
+const (
+	// CheckoutTopologyRootMoveCompleted means CurrentRootPath is authoritative:
+	// runtime, config, intent locators, and the root-move journal converged.
+	CheckoutTopologyRootMoveCompleted CheckoutTopologyEventKind = "root_move_completed"
+	// CheckoutTopologyForgetFinalized means the checkout and its logical
+	// Gortex state are gone and the final forget-checkout journal was released.
+	CheckoutTopologyForgetFinalized CheckoutTopologyEventKind = "forget_finalized"
+)
+
+// CheckoutTopologyEvent is a bounded process-local edge emitted only after
+// the durable journal named by Kind is successfully deleted. The incarnation
+// is the ABA guard when a stable checkout ID or filesystem path is reused.
+type CheckoutTopologyEvent struct {
+	Kind         CheckoutTopologyEventKind
+	CheckoutID   string
+	Incarnation  string
+	PreviousRoot string
+	CurrentRoot  string
+}
+
 // SetModeTransitionObserver installs a process-local notification for durable
 // promotion/demotion outcomes. The callback must return quickly; callers that
 // need catalog reads should coalesce the edge onto their own goroutine.
@@ -437,6 +476,41 @@ func (l *CheckoutLifecycle) notifyModeTransitionChanged(event ModeTransitionEven
 	if observer != nil {
 		observer(event)
 	}
+}
+
+// SetCheckoutTopologyObserver installs a process-local notification for
+// terminal root moves and authoritative checkout removal. The callback must
+// return quickly and must not perform lifecycle work. Passing nil detaches it.
+func (l *CheckoutLifecycle) SetCheckoutTopologyObserver(observer func(CheckoutTopologyEvent)) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.topologyObserver = observer
+	l.mu.Unlock()
+}
+
+func (l *CheckoutLifecycle) notifyCheckoutTopologyChanged(event CheckoutTopologyEvent) {
+	if l == nil {
+		return
+	}
+	l.mu.RLock()
+	observer := l.topologyObserver
+	l.mu.RUnlock()
+	if observer != nil {
+		observer(event)
+	}
+}
+
+// lockCheckoutTopologyPublication establishes the only lock order involving
+// terminal topology publication: topologyPublishMu before moveMu. Callers must
+// release moveMu before invoking an observer, but keep topologyPublishMu held
+// until every event from that durable cut has been delivered.
+func (l *CheckoutLifecycle) lockCheckoutTopologyPublication() {
+	if l.topologyPublishWaitBarrier != nil {
+		l.topologyPublishWaitBarrier()
+	}
+	l.topologyPublishMu.Lock()
 }
 
 // SetBuildGate installs the gate that holds view build work while the daemon
@@ -3399,6 +3473,17 @@ func (l *CheckoutLifecycle) reconcileRemovedConfiguredIntents(
 // cleanupHooks binds the reconciler's two extension points to what the
 // daemon actually owns today.
 type cleanupHooks struct{ l *CheckoutLifecycle }
+
+func (h cleanupHooks) CheckoutRemovalCompleted(target reconcile.CheckoutRemovalTarget) {
+	h.l.lockCheckoutTopologyPublication()
+	defer h.l.topologyPublishMu.Unlock()
+	h.l.notifyCheckoutTopologyChanged(CheckoutTopologyEvent{
+		Kind:         CheckoutTopologyForgetFinalized,
+		CheckoutID:   target.CheckoutID,
+		Incarnation:  target.Incarnation,
+		PreviousRoot: target.RootPath,
+	})
+}
 
 // PurgeCheckoutLayers drops what has been built for one incarnation.
 //

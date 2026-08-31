@@ -472,6 +472,7 @@ type ViewBinding struct {
 
 	FamilyID      string `json:"family_id,omitempty"`
 	CheckoutID    string `json:"checkout_id,omitempty"`
+	Incarnation   string `json:"incarnation,omitempty"`
 	AdminName     string `json:"admin_name,omitempty"`
 	RootPath      string `json:"root_path,omitempty"`
 	CheckoutState string `json:"checkout_state,omitempty"`
@@ -535,6 +536,7 @@ func (l *CheckoutLifecycle) ExplainView(ctx context.Context, path string) (ViewB
 	out.Matched = true
 	out.FamilyID = checkout.FamilyID
 	out.CheckoutID = checkout.CheckoutID
+	out.Incarnation = checkout.Incarnation
 	out.AdminName = checkout.AdminName
 	out.RootPath = checkout.RootPath
 	out.CheckoutState = string(checkout.State)

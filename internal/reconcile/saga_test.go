@@ -2,8 +2,10 @@ package reconcile
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/gitstate"
@@ -54,6 +56,57 @@ func TestForgetCheckoutRunsItsPhasesInOrder(t *testing.T) {
 	// The family itself is not a forget-checkout's business.
 	if !f.familyExists() {
 		t.Error("forgetting a checkout deleted its family")
+	}
+}
+
+func TestForgetCheckoutNotifiesOnlyAfterFinalJournalRelease(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	seedForgettableCheckout(f, "co-1", "inc-1", "wt", "graph-1")
+
+	raw, err := sql.Open("sqlite", f.dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw catalog: %v", err)
+	}
+	defer raw.Close()
+	_, err = raw.ExecContext(ctx, `
+CREATE TRIGGER fail_forget_journal_release
+BEFORE DELETE ON cleanup_journal
+WHEN OLD.cleanup_id = 'forget-checkout:co-1:inc-1'
+BEGIN
+  SELECT RAISE(ABORT, 'injected forget journal release failure');
+END`)
+	if err != nil {
+		t.Fatalf("install journal trigger: %v", err)
+	}
+
+	err = f.rec.ForgetCheckout(ctx, "co-1", "inc-1")
+	if err == nil || !strings.Contains(err.Error(), "injected forget journal release failure") {
+		t.Fatalf("ForgetCheckout error = %v, want injected final-delete failure", err)
+	}
+	if got := f.hooks.removedTargets(); len(got) != 0 {
+		t.Fatalf("failed journal release emitted terminal removal: %+v", got)
+	}
+	if entries := f.journal(); len(entries) != 1 {
+		t.Fatalf("failed final delete did not retain one cleanup journal: %+v", entries)
+	}
+
+	if _, err := raw.ExecContext(ctx, `DROP TRIGGER fail_forget_journal_release`); err != nil {
+		t.Fatalf("drop journal trigger: %v", err)
+	}
+	if err := f.rec.Resume(ctx); err != nil {
+		t.Fatalf("resume final journal release: %v", err)
+	}
+	removed := f.hooks.removedTargets()
+	if len(removed) != 1 {
+		t.Fatalf("successful retry removal events = %+v, want one", removed)
+	}
+	want := CheckoutRemovalTarget{CheckoutID: "co-1", Incarnation: "inc-1", RootPath: "/repo/wt"}
+	if removed[0] != want {
+		t.Fatalf("removal event = %+v, want %+v", removed[0], want)
+	}
+	if entries := f.journal(); len(entries) != 0 {
+		t.Fatalf("successful final release retained journal: %+v", entries)
 	}
 }
 

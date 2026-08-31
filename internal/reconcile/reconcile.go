@@ -101,6 +101,15 @@ type GraphReleaseTarget struct {
 	RootPath    string
 }
 
+// CheckoutRemovalTarget is the durable identity released by a completed
+// forget-checkout saga. RootPath is copied into the saga before the checkout
+// row can disappear, so consumers never have to infer it from missing state.
+type CheckoutRemovalTarget struct {
+	CheckoutID  string
+	Incarnation string
+	RootPath    string
+}
+
 type CleanupHooks interface {
 	// PurgeCheckoutLayers drops everything built for one incarnation of a
 	// checkout. It is called when an unreachable checkout's availability
@@ -111,6 +120,10 @@ type CleanupHooks interface {
 	// finalizer performs the guarded catalog delete; a returned error leaves
 	// both the saga and the admission tombstone retryable.
 	ReleaseGraph(ctx context.Context, target GraphReleaseTarget, finalize func() error) error
+	// CheckoutRemovalCompleted is a non-blocking process-local edge. It is
+	// invoked only after the forget-checkout saga's final cleanup journal row
+	// has been successfully released; implementations must be idempotent.
+	CheckoutRemovalCompleted(target CheckoutRemovalTarget)
 }
 
 // InventoryFunc enumerates a checkout family. It has gitstate.Inventory's

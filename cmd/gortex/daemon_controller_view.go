@@ -308,11 +308,13 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 		if reason == "" {
 			reason = "the checkout promotion failed"
 		}
-		return daemon.TrackReadiness{
+		result := daemon.TrackReadiness{
 			State: daemon.TrackReadinessFailed,
 			View:  fallbackProbeView(daemon.ProbeViewUnrouted, binding.CheckoutID, binding.RepoPrefix, daemon.FallbackViewBuilding),
 			Error: reason,
 		}
+		result.View.Incarnation = binding.Incarnation
+		return result
 	}
 
 	catalog := c.viewMaterializer.Catalog
@@ -336,7 +338,9 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 				return failed(processReason)
 			}
 		}
-		return trackViewBuilding(binding.CheckoutID, binding.RepoPrefix, reason)
+		result := trackViewBuilding(binding.CheckoutID, binding.RepoPrefix, reason)
+		result.View.Incarnation = binding.Incarnation
+		return result
 	}
 
 	if binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {
@@ -447,10 +451,12 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 	if binding.EffectiveMode == string(store_sqlite.CheckoutModeAutomatic) {
 		kind = daemon.ProbeViewWorktree
 	}
-	return daemon.TrackReadiness{
+	result := daemon.TrackReadiness{
 		State: daemon.TrackReadinessReady,
 		View:  exactProbeView(kind, binding.CheckoutID, binding.RepoPrefix),
-	}, nil
+	}
+	result.View.Incarnation = binding.Incarnation
+	return result, nil
 }
 
 func trackViewBuilding(checkoutID, repoPrefix, reason string) daemon.TrackReadiness {

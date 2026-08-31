@@ -674,8 +674,11 @@ const (
 type ProbeView struct {
 	Kind       string `json:"kind"`
 	CheckoutID string `json:"checkout_id,omitempty"`
-	RepoPrefix string `json:"repo_prefix,omitempty"`
-	Exact      bool   `json:"exact"`
+	// Incarnation distinguishes a recreated checkout that reused the same
+	// stable ID and root from the topology event that removed its predecessor.
+	Incarnation string `json:"incarnation,omitempty"`
+	RepoPrefix  string `json:"repo_prefix,omitempty"`
+	Exact       bool   `json:"exact"`
 	// FallbackReason is set exactly when Exact is false.
 	FallbackReason string `json:"fallback_reason,omitempty"`
 }

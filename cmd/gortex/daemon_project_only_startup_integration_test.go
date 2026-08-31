@@ -96,6 +96,7 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 
 	monitor := newStartupViewReadinessMonitor(nil)
 	lifecycle.SetModeTransitionObserver(monitor.observe)
+	lifecycle.SetCheckoutTopologyObserver(monitor.observeTopology)
 	monitorCtx, cancelMonitor := context.WithCancel(ctx)
 	var monitorWG sync.WaitGroup
 	monitorWG.Add(1)
@@ -164,6 +165,7 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 	t.Cleanup(func() {
 		releaseGateOnce.Do(func() { close(releaseGate) })
 		lifecycle.SetModeTransitionObserver(nil)
+		lifecycle.SetCheckoutTopologyObserver(nil)
 		cancelMonitor()
 		monitorWG.Wait()
 		controller.StopWatcher()

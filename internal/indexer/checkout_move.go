@@ -35,8 +35,10 @@ func (l *CheckoutLifecycle) applyReconcileReport(
 	// Keep coordinator admission inside the same component cut as root
 	// convergence. A report from another family must not reinstall a watcher
 	// while a collision-connected swap is quiesced.
+	l.lockCheckoutTopologyPublication()
+	defer l.topologyPublishMu.Unlock()
 	l.moveMu.Lock()
-	moveErr := l.convergeCheckoutRootsLocked(ctx, report)
+	topologyEvents, moveErr := l.convergeCheckoutRootsLocked(ctx, report)
 	blocked, blockedErr := l.unresolvedCheckoutRootMoveIDs(ctx)
 	if blockedErr != nil {
 		moveErr = errors.Join(moveErr, fmt.Errorf(
@@ -45,6 +47,9 @@ func (l *CheckoutLifecycle) applyReconcileReport(
 		l.applyCoordinators(ctx, checkoutMoveAdmissionReport(report, blocked))
 	}
 	l.moveMu.Unlock()
+	for _, event := range topologyEvents {
+		l.notifyCheckoutTopologyChanged(event)
+	}
 	if moveErr != nil {
 		l.scheduleFamilyRetryAt(report.FamilyID, l.now().Add(checkoutMoveRetryDelay).Unix())
 	}
@@ -90,9 +95,15 @@ func (l *CheckoutLifecycle) convergeCheckoutRoots(
 	if l == nil || l.catalog == nil {
 		return nil
 	}
+	l.lockCheckoutTopologyPublication()
+	defer l.topologyPublishMu.Unlock()
 	l.moveMu.Lock()
-	defer l.moveMu.Unlock()
-	return l.convergeCheckoutRootsLocked(ctx, report)
+	events, err := l.convergeCheckoutRootsLocked(ctx, report)
+	l.moveMu.Unlock()
+	for _, event := range events {
+		l.notifyCheckoutTopologyChanged(event)
+	}
+	return err
 }
 
 // convergeCheckoutRootsLocked widens one report-local edge to every durable
@@ -103,13 +114,13 @@ func (l *CheckoutLifecycle) convergeCheckoutRoots(
 func (l *CheckoutLifecycle) convergeCheckoutRootsLocked(
 	ctx context.Context,
 	_ reconcile.FamilyReport,
-) error {
+) ([]CheckoutTopologyEvent, error) {
 	if l == nil || l.catalog == nil {
-		return nil
+		return nil, nil
 	}
 	moves, blocked, resolveErr := l.resolvePendingPreparedMoveConfigs(ctx)
 	if moves == nil && resolveErr != nil {
-		return resolveErr
+		return nil, resolveErr
 	}
 	participants := make([]checkoutRootMoveParticipant, 0, len(moves))
 	for _, move := range moves {
@@ -177,13 +188,15 @@ func (l *CheckoutLifecycle) convergeCheckoutRootsLocked(
 	}
 
 	var failures []error
+	var topologyEvents []CheckoutTopologyEvent
 	if resolveErr != nil {
 		failures = append(failures, resolveErr)
 	}
 	changed := false
 	for _, component := range partitionCheckoutRootMoveComponents(participants) {
-		componentChanged, err := l.convergeCheckoutRootMoveComponent(ctx, component)
+		componentChanged, componentEvents, err := l.convergeCheckoutRootMoveComponent(ctx, component)
 		changed = changed || componentChanged
+		topologyEvents = append(topologyEvents, componentEvents...)
 		if err == nil {
 			continue
 		}
@@ -195,7 +208,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootsLocked(
 	if changed {
 		l.notifyTrackedSetChanged()
 	}
-	return errors.Join(failures...)
+	return topologyEvents, errors.Join(failures...)
 }
 
 type checkoutRootMoveParticipant struct {
@@ -296,14 +309,14 @@ func checkoutRootMoveCollisionRoots(move store_sqlite.CheckoutRootMove) []string
 func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 	ctx context.Context,
 	component []checkoutRootMoveParticipant,
-) (bool, error) {
+) (bool, []CheckoutTopologyEvent, error) {
 	for _, participant := range component {
 		if participant.discoveryErr != nil {
-			return false, participant.discoveryErr
+			return false, nil, participant.discoveryErr
 		}
 	}
 	if err := l.validateCheckoutRootMoveComponentOccupants(ctx, component); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	l.observeCheckoutMoveComponentPhase("discovered", component)
 
@@ -322,7 +335,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 					restoreFailures = append(restoreFailures, restoreErr)
 				}
 			}
-			return false, errors.Join(err, errors.Join(restoreFailures...))
+			return false, nil, errors.Join(err, errors.Join(restoreFailures...))
 		}
 		removedWatchers = append(removedWatchers, participant)
 	}
@@ -332,7 +345,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 	}
 	l.observeCheckoutMoveComponentPhase("quiesced", component)
 	if err := l.validateCheckoutRootMoveComponentOccupants(ctx, component); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	for i := range component {
@@ -347,7 +360,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 				err = store_sqlite.ErrCatalogStaleGuard
 			}
 			_, _ = l.reinstallCheckoutRootMoveComponent(ctx, component)
-			return false, fmt.Errorf("checkout %s changed while quiesced: %w",
+			return false, nil, fmt.Errorf("checkout %s changed while quiesced: %w",
 				participant.checkout.CheckoutID, err)
 		}
 		move, found, err := l.catalog.GetCheckoutRootMove(ctx, checkout.CheckoutID)
@@ -359,7 +372,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 				err = store_sqlite.ErrCatalogStaleGuard
 			}
 			_, _ = l.reinstallCheckoutRootMoveComponent(ctx, component)
-			return false, fmt.Errorf("checkout %s move changed while quiesced: %w",
+			return false, nil, fmt.Errorf("checkout %s move changed while quiesced: %w",
 				checkout.CheckoutID, err)
 		}
 		participant.checkout = checkout
@@ -371,7 +384,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 				if graphErr == nil {
 					graphErr = store_sqlite.ErrCatalogStaleGuard
 				}
-				return false, fmt.Errorf("checkout %s primary changed while quiesced: %w",
+				return false, nil, fmt.Errorf("checkout %s primary changed while quiesced: %w",
 					checkout.CheckoutID, graphErr)
 			}
 		}
@@ -385,7 +398,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 		if err != nil {
 			reinstalled, reinstallErr := l.reinstallCheckoutRootMoveComponent(ctx, component)
 			changed = changed || reinstalled
-			return changed, errors.Join(
+			return changed, nil, errors.Join(
 				fmt.Errorf("publish checkout %s shell: %w",
 					participant.checkout.CheckoutID, err),
 				reinstallErr,
@@ -397,7 +410,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 	reinstalled, reinstallErr := l.reinstallCheckoutRootMoveComponent(ctx, component)
 	changed = changed || reinstalled
 	if reinstallErr != nil {
-		return changed, reinstallErr
+		return changed, nil, reinstallErr
 	}
 	l.observeCheckoutMoveComponentPhase("reinstalled", component)
 
@@ -419,10 +432,11 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 		configChanged, err := l.convergeDedicatedMoveConfigBatch(ctx, dedicated)
 		changed = changed || configChanged
 		if err != nil {
-			return changed, err
+			return changed, nil, err
 		}
 	}
 
+	topologyEvents := make([]CheckoutTopologyEvent, 0, len(component))
 	for _, participant := range component {
 		locatorsMoved, err := l.catalog.RelocateActiveTrackingIntentLocators(
 			ctx, participant.checkout.CheckoutID,
@@ -430,7 +444,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 		)
 		changed = changed || locatorsMoved != 0
 		if err != nil {
-			return changed, fmt.Errorf("checkout %s intent locators: %w",
+			return changed, topologyEvents, fmt.Errorf("checkout %s intent locators: %w",
 				participant.checkout.CheckoutID, err)
 		}
 		move, found, err := l.catalog.GetCheckoutRootMove(
@@ -440,16 +454,33 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 			if err == nil {
 				err = store_sqlite.ErrCatalogStaleGuard
 			}
-			return changed, fmt.Errorf("checkout %s move disappeared before completion: %w",
+			return changed, topologyEvents, fmt.Errorf("checkout %s move disappeared before completion: %w",
 				participant.checkout.CheckoutID, err)
 		}
-		if err := l.catalog.CompleteCheckoutRootMove(ctx, move); err != nil {
-			return changed, fmt.Errorf("checkout %s complete move: %w",
+		event, err := l.completeCheckoutRootMove(ctx, move)
+		if err != nil {
+			return changed, topologyEvents, fmt.Errorf("checkout %s complete move: %w",
 				participant.checkout.CheckoutID, err)
 		}
+		topologyEvents = append(topologyEvents, event)
 	}
 	l.observeCheckoutMoveComponentPhase("completed", component)
-	return changed, nil
+	return changed, topologyEvents, nil
+}
+
+func (l *CheckoutLifecycle) completeCheckoutRootMove(
+	ctx context.Context, move store_sqlite.CheckoutRootMove,
+) (CheckoutTopologyEvent, error) {
+	if err := l.catalog.CompleteCheckoutRootMove(ctx, move); err != nil {
+		return CheckoutTopologyEvent{}, err
+	}
+	return CheckoutTopologyEvent{
+		Kind:         CheckoutTopologyRootMoveCompleted,
+		CheckoutID:   move.CheckoutID,
+		Incarnation:  move.Incarnation,
+		PreviousRoot: move.PreviousRootPath,
+		CurrentRoot:  move.CurrentRootPath,
+	}, nil
 }
 
 func (l *CheckoutLifecycle) validateCheckoutRootMoveComponentOccupants(
@@ -677,10 +708,13 @@ func (l *CheckoutLifecycle) convergeCheckoutRootsLegacy(
 	if l == nil || l.catalog == nil {
 		return nil
 	}
+	l.lockCheckoutTopologyPublication()
+	defer l.topologyPublishMu.Unlock()
 	var (
 		failures       []error
 		changed        bool
 		dedicatedMoves []dedicatedCheckoutMove
+		topologyEvents []CheckoutTopologyEvent
 	)
 	for _, observed := range report.Checkouts {
 		if !observed.Durable || observed.CheckoutID == "" ||
@@ -760,9 +794,12 @@ func (l *CheckoutLifecycle) convergeCheckoutRootsLegacy(
 				checkout.CheckoutID, checkout.EffectiveMode))
 			continue
 		}
-		if err := l.catalog.CompleteCheckoutRootMove(ctx, move); err != nil {
+		event, completeErr := l.completeCheckoutRootMove(ctx, move)
+		if completeErr != nil {
 			failures = append(failures, fmt.Errorf(
-				"checkout %s complete move: %w", checkout.CheckoutID, err))
+				"checkout %s complete move: %w", checkout.CheckoutID, completeErr))
+		} else {
+			topologyEvents = append(topologyEvents, event)
 		}
 	}
 	if len(dedicatedMoves) != 0 {
@@ -797,14 +834,18 @@ func (l *CheckoutLifecycle) convergeCheckoutRootsLegacy(
 					dedicated.checkout.CheckoutID, locatorErr))
 				continue
 			}
-			if completeErr := l.catalog.CompleteCheckoutRootMove(
-				ctx, dedicated.move,
-			); completeErr != nil {
+			event, completeErr := l.completeCheckoutRootMove(ctx, dedicated.move)
+			if completeErr != nil {
 				failures = append(failures, fmt.Errorf(
 					"checkout %s complete move: %w",
 					dedicated.checkout.CheckoutID, completeErr))
+			} else {
+				topologyEvents = append(topologyEvents, event)
 			}
 		}
+	}
+	for _, event := range topologyEvents {
+		l.notifyCheckoutTopologyChanged(event)
 	}
 	if changed {
 		l.notifyTrackedSetChanged()

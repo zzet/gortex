@@ -366,7 +366,9 @@ func TestStartupViewReadinessBackfillsCheckoutIDAfterFreeze(t *testing.T) {
 		t.Fatal("watcher did not finish after backfilling the checkout identity")
 	}
 	monitor.mu.Lock()
-	assert.Equal(t, "late-checkout", monitor.checkoutIDs["/late-catalog-row"])
+	require.Len(t, monitor.cohort, 1)
+	assert.Equal(t, "late-checkout", monitor.cohort[0].CheckoutID)
+	assert.Equal(t, "/late-catalog-row", monitor.cohort[0].Path)
 	monitor.mu.Unlock()
 }
 
@@ -509,6 +511,176 @@ func TestStartupViewReadinessInitialSnapshotRetainsRacingTransitionEdges(t *test
 	cancel()
 }
 
+func TestStartupViewReadinessTopologyMoveReplacesFrozenPath(t *testing.T) {
+	const (
+		oldRoot = "/repo/old"
+		newRoot = "/repo/new"
+	)
+	monitor := newStartupViewReadinessMonitor([]string{oldRoot})
+	probe := func(_ context.Context, path string) (daemon.TrackReadiness, error) {
+		switch path {
+		case oldRoot:
+			return daemon.TrackReadiness{
+				State: daemon.TrackReadinessBuilding,
+				View: &daemon.ProbeView{
+					CheckoutID: "checkout-1", Incarnation: "inc-1",
+				},
+			}, nil
+		case newRoot:
+			return daemon.TrackReadiness{
+				State: daemon.TrackReadinessReady,
+				View: &daemon.ProbeView{
+					CheckoutID: "checkout-1", Incarnation: "inc-1", Exact: true,
+				},
+			}, nil
+		default:
+			return daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}, nil
+		}
+	}
+	controller := &realController{}
+	controller.setStartupViewReadiness(monitor.snapshot(context.Background(), probe))
+	controller.MarkEnriched(time.Second)
+	monitor.onConfirmedComplete(func() {})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watchStartupViewReadiness(ctx, nil, controller, monitor, probe)
+	}()
+	monitor.finishInitialSnapshot()
+	monitor.observeTopology(indexer.CheckoutTopologyEvent{
+		Kind:         indexer.CheckoutTopologyRootMoveCompleted,
+		CheckoutID:   "checkout-1",
+		Incarnation:  "inc-1",
+		PreviousRoot: oldRoot,
+		CurrentRoot:  newRoot,
+	})
+
+	require.Eventually(t, controller.IsReady, time.Second, time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("root-move completion did not release startup readiness")
+	}
+	monitor.mu.Lock()
+	require.Equal(t, []startupViewCohortMember{{
+		Path: newRoot, CheckoutID: "checkout-1", Incarnation: "inc-1",
+	}}, monitor.cohort)
+	monitor.mu.Unlock()
+}
+
+func TestStartupViewReadinessTopologyForgetPrunesFrozenMember(t *testing.T) {
+	monitor := newStartupViewReadinessMonitor([]string{"/repo/removed"})
+	probe := func(context.Context, string) (daemon.TrackReadiness, error) {
+		return daemon.TrackReadiness{
+			State: daemon.TrackReadinessBuilding,
+			View: &daemon.ProbeView{
+				CheckoutID: "checkout-1", Incarnation: "inc-1",
+			},
+		}, nil
+	}
+	controller := &realController{}
+	controller.setStartupViewReadiness(monitor.snapshot(context.Background(), probe))
+	controller.MarkEnriched(time.Second)
+	monitor.onConfirmedComplete(func() {})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watchStartupViewReadiness(ctx, nil, controller, monitor, probe)
+	}()
+	monitor.finishInitialSnapshot()
+	monitor.observeTopology(indexer.CheckoutTopologyEvent{
+		Kind:         indexer.CheckoutTopologyForgetFinalized,
+		CheckoutID:   "checkout-1",
+		Incarnation:  "inc-1",
+		PreviousRoot: "/repo/removed",
+	})
+
+	require.Eventually(t, controller.IsReady, time.Second, time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("authoritative checkout removal did not release startup readiness")
+	}
+	require.Equal(t, startupViewReadiness{}, controller.startupViewReadiness())
+	monitor.mu.Lock()
+	require.Empty(t, monitor.cohort)
+	monitor.mu.Unlock()
+}
+
+func TestStartupViewReadinessRetainsPreFreezeTopologyWithABAGuard(t *testing.T) {
+	t.Run("chained move", func(t *testing.T) {
+		monitor := newStartupViewReadinessMonitor([]string{"/repo/a"})
+		monitor.observeTopology(indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyRootMoveCompleted, CheckoutID: "checkout-1",
+			Incarnation: "inc-1", PreviousRoot: "/repo/a", CurrentRoot: "/repo/b",
+		})
+		monitor.observeTopology(indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyRootMoveCompleted, CheckoutID: "checkout-1",
+			Incarnation: "inc-1", PreviousRoot: "/repo/b", CurrentRoot: "/repo/c",
+		})
+		snapshot := monitor.snapshot(context.Background(), func(_ context.Context, path string) (daemon.TrackReadiness, error) {
+			if path == "/repo/c" {
+				return daemon.TrackReadiness{State: daemon.TrackReadinessReady, View: &daemon.ProbeView{
+					CheckoutID: "checkout-1", Incarnation: "inc-1", Exact: true,
+				}}, nil
+			}
+			return daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}, nil
+		})
+		require.Equal(t, startupViewReadiness{Expected: 1, Ready: 1}, snapshot)
+		require.Equal(t, "/repo/c", monitor.cohort[0].Path)
+	})
+
+	t.Run("forget", func(t *testing.T) {
+		monitor := newStartupViewReadinessMonitor([]string{"/repo/old"})
+		monitor.observeTopology(indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyForgetFinalized, CheckoutID: "checkout-1",
+			Incarnation: "inc-1", PreviousRoot: "/repo/old",
+		})
+		snapshot := monitor.snapshot(context.Background(), func(context.Context, string) (daemon.TrackReadiness, error) {
+			return daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}, nil
+		})
+		require.Equal(t, startupViewReadiness{}, snapshot)
+		require.Empty(t, monitor.cohort)
+	})
+
+	t.Run("replacement incarnation", func(t *testing.T) {
+		monitor := newStartupViewReadinessMonitor([]string{"/repo/reused"})
+		monitor.observeTopology(indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyForgetFinalized, CheckoutID: "checkout-1",
+			Incarnation: "inc-old", PreviousRoot: "/repo/reused",
+		})
+		snapshot := monitor.snapshot(context.Background(), func(context.Context, string) (daemon.TrackReadiness, error) {
+			return daemon.TrackReadiness{State: daemon.TrackReadinessReady, View: &daemon.ProbeView{
+				CheckoutID: "checkout-1", Incarnation: "inc-new", Exact: true,
+			}}, nil
+		})
+		require.Equal(t, startupViewReadiness{Expected: 1, Ready: 1}, snapshot)
+		require.Equal(t, "inc-new", monitor.cohort[0].Incarnation)
+	})
+
+	t.Run("forget dominates late move", func(t *testing.T) {
+		monitor := newStartupViewReadinessMonitor([]string{"/repo/old"})
+		monitor.observeTopology(indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyForgetFinalized, CheckoutID: "checkout-1",
+			Incarnation: "inc-1", PreviousRoot: "/repo/old",
+		})
+		monitor.observeTopology(indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyRootMoveCompleted, CheckoutID: "checkout-1",
+			Incarnation: "inc-1", PreviousRoot: "/repo/old", CurrentRoot: "/repo/new",
+		})
+		snapshot := monitor.snapshot(context.Background(), func(context.Context, string) (daemon.TrackReadiness, error) {
+			return daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}, nil
+		})
+		require.Equal(t, startupViewReadiness{}, snapshot)
+	})
+}
+
 func BenchmarkStartupViewReadinessSnapshot256(b *testing.B) {
 	paths := make([]string, 256)
 	states := make(map[string]daemon.TrackReadiness, len(paths))
@@ -531,6 +703,80 @@ func BenchmarkStartupViewReadinessSnapshot256(b *testing.B) {
 	for range b.N {
 		if snapshot := monitor.snapshot(context.Background(), probe); !snapshot.complete() {
 			b.Fatal("ready cohort regressed")
+		}
+	}
+}
+
+func BenchmarkStartupViewReadinessTopologyEdge256(b *testing.B) {
+	paths := make([]string, 256)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("/repo/%03d", i)
+	}
+	bench := func(b *testing.B, event indexer.CheckoutTopologyEvent) {
+		monitor := newStartupViewReadinessMonitor(paths)
+		monitor.cohort = make([]startupViewCohortMember, len(paths))
+		for i, path := range paths {
+			monitor.cohort[i] = startupViewCohortMember{
+				Path: path, CheckoutID: fmt.Sprintf("checkout-%03d", i), Incarnation: "inc-1",
+			}
+		}
+		monitor.frozen = true
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			monitor.observeTopology(event)
+		}
+	}
+	b.Run("root_move", func(b *testing.B) {
+		bench(b, indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyRootMoveCompleted, CheckoutID: "checkout-127",
+			Incarnation: "inc-1", PreviousRoot: "/repo/127", CurrentRoot: "/repo/moved",
+		})
+	})
+	b.Run("forget_finalized", func(b *testing.B) {
+		bench(b, indexer.CheckoutTopologyEvent{
+			Kind: indexer.CheckoutTopologyForgetFinalized, CheckoutID: "checkout-127",
+			Incarnation: "inc-1", PreviousRoot: "/repo/127",
+		})
+	})
+}
+
+func BenchmarkStartupViewReadinessSnapshot256Topology256(b *testing.B) {
+	paths := make([]string, 256)
+	states := make(map[string]daemon.TrackReadiness, len(paths)*2)
+	for i := range paths {
+		oldPath := fmt.Sprintf("/repo/%03d", i)
+		newPath := fmt.Sprintf("/repo/moved/%03d", i)
+		checkoutID := fmt.Sprintf("checkout-%03d", i)
+		paths[i] = oldPath
+		readiness := daemon.TrackReadiness{
+			State: daemon.TrackReadinessReady,
+			View: &daemon.ProbeView{
+				CheckoutID: checkoutID, Incarnation: "inc-1", Exact: true,
+			},
+		}
+		states[oldPath] = readiness
+		states[newPath] = readiness
+	}
+	monitor := newStartupViewReadinessMonitor(paths)
+	probe := func(_ context.Context, path string) (daemon.TrackReadiness, error) {
+		return states[path], nil
+	}
+	require.True(b, monitor.snapshot(context.Background(), probe).complete())
+	for i, oldPath := range paths {
+		monitor.observeTopology(indexer.CheckoutTopologyEvent{
+			Kind:       indexer.CheckoutTopologyRootMoveCompleted,
+			CheckoutID: fmt.Sprintf("checkout-%03d", i), Incarnation: "inc-1",
+			PreviousRoot: oldPath, CurrentRoot: fmt.Sprintf("/repo/moved/%03d", i),
+		})
+	}
+	require.True(b, monitor.snapshot(context.Background(), probe).complete())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if snapshot := monitor.snapshot(context.Background(), probe); !snapshot.complete() {
+			b.Fatal("ready topology cohort regressed")
 		}
 	}
 }

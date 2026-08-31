@@ -45,7 +45,8 @@ type recordingHooks struct {
 	// builder that has been routing for this checkout. The cycle that builder
 	// was already running finishes during the stop, so this is the one place a
 	// test can put the catalog write that stop is racing.
-	onPurge func(checkoutID string)
+	onPurge  func(checkoutID string)
+	removals []CheckoutRemovalTarget
 }
 
 func (h *recordingHooks) PurgeCheckoutLayers(_ context.Context, checkoutID, incarnation string) error {
@@ -77,6 +78,12 @@ func (h *recordingHooks) ReleaseGraph(
 	return finalize()
 }
 
+func (h *recordingHooks) CheckoutRemovalCompleted(target CheckoutRemovalTarget) {
+	h.mu.Lock()
+	h.removals = append(h.removals, target)
+	h.mu.Unlock()
+}
+
 // snapshot returns the calls recorded so far.
 func (h *recordingHooks) snapshot() []string {
 	h.mu.Lock()
@@ -88,6 +95,12 @@ func (h *recordingHooks) releasedTargets() []GraphReleaseTarget {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return slices.Clone(h.releaseTargets)
+}
+
+func (h *recordingHooks) removedTargets() []CheckoutRemovalTarget {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.removals)
 }
 
 // countPrefix counts recorded calls starting with prefix.
@@ -192,6 +205,7 @@ func gitSampleAbsent(token string) gitstate.PathEvidence {
 // fixture is one test's store, catalog, fakes and reconciler.
 type fixture struct {
 	t        *testing.T
+	dbPath   string
 	store    *store_sqlite.Store
 	catalog  *store_sqlite.Catalog
 	hooks    *recordingHooks
@@ -206,7 +220,8 @@ type fixture struct {
 // against this package's own idea of them.
 func newFixture(t *testing.T, cfg Config, opts ...Option) *fixture {
 	t.Helper()
-	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "catalog.sqlite")
+	store, err := store_sqlite.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -214,6 +229,7 @@ func newFixture(t *testing.T, cfg Config, opts ...Option) *fixture {
 
 	f := &fixture{
 		t:        t,
+		dbPath:   dbPath,
 		store:    store,
 		catalog:  store.Catalog(),
 		hooks:    &recordingHooks{},
