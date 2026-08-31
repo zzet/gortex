@@ -555,7 +555,7 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 	}
 
 	var cands []*rerank.Candidate
-	if s := e.getSearch(); s != nil && e.backendHasCorpus(s) {
+	if s := e.getSearch(); s != nil && (e.viewLayersActive() || e.backendHasCorpus(s)) {
 		cands = e.gatherBackendCandidates(query, fetchLimit, opts, gatherCtx)
 	} else {
 		start := time.Now()

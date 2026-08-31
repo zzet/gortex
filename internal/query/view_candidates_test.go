@@ -73,7 +73,7 @@ func viewFileNode(path string) *graph.Node {
 // indexViewSymbols writes the FTS rows for one generation's nodes. It runs
 // before the generation is published, since a published generation refuses
 // every payload write.
-func indexViewSymbols(t *testing.T, handle *store_sqlite.Store, tokensByID map[string]string) {
+func indexViewSymbols(t testing.TB, handle *store_sqlite.Store, tokensByID map[string]string) {
 	t.Helper()
 	for id, tokens := range tokensByID {
 		if err := handle.UpsertSymbolFTS(id, tokens); err != nil {
@@ -93,6 +93,10 @@ type viewStack struct {
 }
 
 func newViewStack(t *testing.T) *viewStack {
+	return newViewStackWithBase(t, true)
+}
+
+func newViewStackWithBase(t testing.TB, seedBase bool) *viewStack {
 	t.Helper()
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "view.sqlite"))
 	if err != nil {
@@ -100,21 +104,23 @@ func newViewStack(t *testing.T) *viewStack {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	// The indexed corpus.
-	store.AddBatch([]*graph.Node{
-		viewFileNode(viewStayFile), viewFileNode(viewKeepFile),
-		viewFileNode(viewEditFile), viewFileNode(viewGoneFile),
-		viewSymbolNode(viewStayerID, "Stayer", viewStayFile, 4),
-		viewSymbolNode(viewKeeperID, "Keeper", viewKeepFile, 10),
-		viewSymbolNode(viewOldID, "Old", viewEditFile, 20),
-		viewSymbolNode(viewDoomedID, "Doomed", viewGoneFile, 6),
-	}, nil)
-	indexViewSymbols(t, store, map[string]string{
-		viewStayerID: "stayer zephyr scheduler",
-		viewKeeperID: "keeper zephyr scheduler",
-		viewOldID:    "old zephyr scheduler",
-		viewDoomedID: "doomed zephyr scheduler",
-	})
+	if seedBase {
+		// The indexed corpus.
+		store.AddBatch([]*graph.Node{
+			viewFileNode(viewStayFile), viewFileNode(viewKeepFile),
+			viewFileNode(viewEditFile), viewFileNode(viewGoneFile),
+			viewSymbolNode(viewStayerID, "Stayer", viewStayFile, 4),
+			viewSymbolNode(viewKeeperID, "Keeper", viewKeepFile, 10),
+			viewSymbolNode(viewOldID, "Old", viewEditFile, 20),
+			viewSymbolNode(viewDoomedID, "Doomed", viewGoneFile, 6),
+		}, nil)
+		indexViewSymbols(t, store, map[string]string{
+			viewStayerID: "stayer zephyr scheduler",
+			viewKeeperID: "keeper zephyr scheduler",
+			viewOldID:    "old zephyr scheduler",
+			viewDoomedID: "doomed zephyr scheduler",
+		})
+	}
 
 	stack := &viewStack{store: store}
 	stack.commit = writeViewCommit(t, store)
@@ -141,7 +147,7 @@ func newViewStack(t *testing.T) *viewStack {
 
 // writeViewCommit publishes the commit generation: edit.go re-derived with Old
 // renamed to New, added.go new, gone.go deleted.
-func writeViewCommit(t *testing.T, store *store_sqlite.Store) int64 {
+func writeViewCommit(t testing.TB, store *store_sqlite.Store) int64 {
 	t.Helper()
 	generationID, handle, err := store.BeginPayloadGeneration(context.Background(), store_sqlite.PayloadGenerationRequest{
 		OwnerKind:      "dedicated_graph",
@@ -180,7 +186,7 @@ func writeViewCommit(t *testing.T, store *store_sqlite.Store) int64 {
 // writeViewDirty publishes the working-tree generation: keep.go re-derived
 // with Keeper moved and Dirty added, and edit.go claimed a second time so the
 // same identity is carried by two generations at once.
-func writeViewDirty(t *testing.T, store *store_sqlite.Store, base int64) int64 {
+func writeViewDirty(t testing.TB, store *store_sqlite.Store, base int64) int64 {
 	t.Helper()
 	generationID, handle, err := store.BeginPayloadGeneration(context.Background(), store_sqlite.PayloadGenerationRequest{
 		OwnerKind:        "dedicated_graph",
@@ -314,6 +320,41 @@ func TestViewSearchFindsAGenerationOnlySymbol(t *testing.T) {
 
 	if base := gatherIDs(stack.baseEngine(), viewProseQuery, 20); containsID(base, viewDirtyID) {
 		t.Fatalf("the base corpus answered with a generation's symbol; got %v", base)
+	}
+}
+
+// TestViewSearchUsesGenerationCorpusWhenBaseCorpusIsEmpty is the cold-vNext
+// shape: every repository row lives in a published generation and generation
+// zero has no FTS documents. Candidate admission must therefore consider the
+// selected view's corpora instead of treating the empty compatibility corpus
+// as proof that no searchable corpus exists.
+func TestViewSearchUsesGenerationCorpusWhenBaseCorpusIsEmpty(t *testing.T) {
+	stack := newViewStackWithBase(t, false)
+	if docs, known := search.NewSymbolSearcherBackend(stack.store).DocCount(); !known || docs != 0 {
+		t.Fatalf("generation-zero documents = %d, known=%v, want an authoritative empty corpus", docs, known)
+	}
+
+	got := gatherIDs(stack.viewEngine(), viewProseQuery, 20)
+	for _, want := range []string{viewFreshID, viewDirtyID, viewNewID} {
+		if !containsID(got, want) {
+			t.Errorf("generation-only symbol %q is absent from cold view search: %v", want, got)
+		}
+	}
+	if base := gatherIDs(stack.baseEngine(), viewProseQuery, 20); len(base) != 0 {
+		t.Fatalf("empty generation-zero corpus returned candidates: %v", base)
+	}
+}
+
+func BenchmarkViewSearchEmptyBaseCorpus(b *testing.B) {
+	stack := newViewStackWithBase(b, false)
+	engine := stack.viewEngine()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if got := engine.GatherSymbolCandidates(viewProseQuery, 20, QueryOptions{}, nil); len(got) == 0 {
+			b.Fatal("generation-backed search returned no candidates")
+		}
 	}
 }
 
