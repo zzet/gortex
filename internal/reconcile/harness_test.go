@@ -45,8 +45,11 @@ type recordingHooks struct {
 	// builder that has been routing for this checkout. The cycle that builder
 	// was already running finishes during the stop, so this is the one place a
 	// test can put the catalog write that stop is racing.
-	onPurge  func(checkoutID string)
-	removals []CheckoutRemovalTarget
+	onPurge        func(checkoutID string)
+	removals       []CheckoutRemovalTarget
+	graphRemovals  []GraphRemovalTarget
+	familyRemovals []FamilyRemovalTarget
+	terminalCalls  []string
 }
 
 func (h *recordingHooks) PurgeCheckoutLayers(_ context.Context, checkoutID, incarnation string) error {
@@ -81,6 +84,23 @@ func (h *recordingHooks) ReleaseGraph(
 func (h *recordingHooks) CheckoutRemovalCompleted(target CheckoutRemovalTarget) {
 	h.mu.Lock()
 	h.removals = append(h.removals, target)
+	h.terminalCalls = append(h.terminalCalls,
+		"checkout-remove:"+target.CheckoutID+":"+target.Incarnation)
+	h.mu.Unlock()
+}
+
+func (h *recordingHooks) GraphRemovalCompleted(target GraphRemovalTarget) {
+	h.mu.Lock()
+	h.graphRemovals = append(h.graphRemovals, target)
+	h.terminalCalls = append(h.terminalCalls,
+		"graph-remove:"+target.GraphID+":"+target.Incarnation)
+	h.mu.Unlock()
+}
+
+func (h *recordingHooks) FamilyRemovalCompleted(target FamilyRemovalTarget) {
+	h.mu.Lock()
+	h.familyRemovals = append(h.familyRemovals, target)
+	h.terminalCalls = append(h.terminalCalls, "family-remove:"+target.FamilyID)
 	h.mu.Unlock()
 }
 
@@ -101,6 +121,24 @@ func (h *recordingHooks) removedTargets() []CheckoutRemovalTarget {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return slices.Clone(h.removals)
+}
+
+func (h *recordingHooks) removedGraphTargets() []GraphRemovalTarget {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.graphRemovals)
+}
+
+func (h *recordingHooks) removedFamilyTargets() []FamilyRemovalTarget {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.familyRemovals)
+}
+
+func (h *recordingHooks) terminalSnapshot() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.terminalCalls)
 }
 
 // countPrefix counts recorded calls starting with prefix.

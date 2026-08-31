@@ -118,6 +118,47 @@ type sagaTarget struct {
 	PrimaryEpoch int64     `json:"primary_epoch,omitempty"`
 }
 
+type sagaRemovalPublicationKind uint8
+
+const (
+	sagaCheckoutRemovalPublication sagaRemovalPublicationKind = iota + 1
+	sagaGraphRemovalPublication
+	sagaFamilyRemovalPublication
+)
+
+type sagaRemovalPublication struct {
+	kind     sagaRemovalPublicationKind
+	checkout CheckoutRemovalTarget
+	graph    GraphRemovalTarget
+	family   FamilyRemovalTarget
+}
+
+type checkoutRemovalIdentity struct {
+	checkoutID  string
+	incarnation string
+}
+
+type graphRemovalIdentity struct {
+	graphID     string
+	familyID    string
+	checkoutID  string
+	incarnation string
+}
+
+// sagaRemovalPublications collects terminal removal edges for one outer saga
+// call. Nested sagas inherit the collector through their context so callbacks
+// cannot publish while an outer family or checkout topology guard is held.
+// Seen sets deduplicate the same durable identity when both a child saga and
+// its parent closure prove its removal.
+type sagaRemovalPublications struct {
+	events    []sagaRemovalPublication
+	checkouts map[checkoutRemovalIdentity]struct{}
+	graphs    map[graphRemovalIdentity]struct{}
+	families  map[string]struct{}
+}
+
+type sagaRemovalPublicationsContextKey struct{}
+
 // cleanupID is the journal key. It is derived from the target rather than
 // generated, so re-entering a teardown finds the entry the interrupted attempt
 // left behind instead of starting a second one beside it.
@@ -210,20 +251,32 @@ func (r *Reconciler) RetirePrimaryClosure(ctx context.Context, graphID string, p
 		return r.runSaga(ctx, resumed)
 	}
 
-	family, ok, err := r.catalog.GetRepositoryFamily(ctx, graph.FamilyID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("%w: family %s", store_sqlite.ErrCatalogNotFound, graph.FamilyID)
-	}
-	if family.PrimaryEpoch != primaryEpoch {
-		return fmt.Errorf("%w: family %s is at primary epoch %d, not %d",
-			store_sqlite.ErrCatalogStaleGuard, family.FamilyID, family.PrimaryEpoch, primaryEpoch)
-	}
-	target.FamilyID = graph.FamilyID
-	target.CheckoutID = graph.OwnerCheckoutID
-	return r.enterSaga(ctx, target)
+	return r.withSagaRemovalPublications(ctx, func(publicationCtx context.Context) error {
+		return r.withFamilyTopology(publicationCtx, []string{graph.FamilyID}, func(guarded context.Context) error {
+			currentGraph, present, readErr := r.catalog.GetDedicatedGraph(guarded, graphID)
+			if readErr != nil {
+				return readErr
+			}
+			if !present || currentGraph.FamilyID != graph.FamilyID || !currentGraph.IsPrimaryBase {
+				return fmt.Errorf("%w: graph %s is no longer the primary of family %s",
+					store_sqlite.ErrCatalogStaleGuard, graphID, graph.FamilyID)
+			}
+			family, present, readErr := r.catalog.GetRepositoryFamily(guarded, graph.FamilyID)
+			if readErr != nil {
+				return readErr
+			}
+			if !present {
+				return fmt.Errorf("%w: family %s", store_sqlite.ErrCatalogNotFound, graph.FamilyID)
+			}
+			if family.PrimaryEpoch != primaryEpoch {
+				return fmt.Errorf("%w: family %s is at primary epoch %d, not %d",
+					store_sqlite.ErrCatalogStaleGuard, family.FamilyID, family.PrimaryEpoch, primaryEpoch)
+			}
+			target.FamilyID = currentGraph.FamilyID
+			target.CheckoutID = currentGraph.OwnerCheckoutID
+			return r.enterSaga(guarded, target)
+		})
+	})
 }
 
 // ForgetFamily removes what is left of a family, its own row included.
@@ -438,6 +491,12 @@ func (r *Reconciler) hydrateGraphReleaseAddress(
 // the teardown completed — except for a layer purge, whose entry is kept in
 // the done phase so nothing ever purges the same incarnation twice.
 func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
+	return r.withSagaRemovalPublications(ctx, func(publicationCtx context.Context) error {
+		return r.runSagaWithRemovalPublications(publicationCtx, target)
+	})
+}
+
+func (r *Reconciler) runSagaWithRemovalPublications(ctx context.Context, target sagaTarget) error {
 	if target.Kind == sagaRetireGraph && target.Incarnation == "" {
 		repaired, err := r.repairLegacyRetireGraphTarget(ctx, target)
 		if err != nil {
@@ -452,6 +511,302 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 		}
 		target = hydrated
 	}
+	run := func(guarded context.Context) error {
+		return r.runSagaWithinFamily(guarded, &target)
+	}
+	var err error
+	if target.FamilyID != "" {
+		err = r.withFamilyTopology(ctx, []string{target.FamilyID}, run)
+	} else {
+		err = run(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	switch target.Kind {
+	case sagaForgetCheckout:
+		if target.GraphID != "" {
+			r.queueGraphRemovalPublication(ctx, graphRemovalTarget(target))
+		}
+		r.queueCheckoutRemovalPublication(ctx, CheckoutRemovalTarget{
+			CheckoutID: target.CheckoutID, Incarnation: target.Incarnation,
+			RootPath: target.RootPath,
+		})
+	case sagaRetireGraph, sagaRetirePrimaryClosure:
+		if target.GraphID != "" {
+			r.queueGraphRemovalPublication(ctx, graphRemovalTarget(target))
+		}
+	case sagaForgetFamily:
+		r.queueFamilyRemovalPublication(ctx, FamilyRemovalTarget{FamilyID: target.FamilyID})
+	}
+	return nil
+}
+
+func (r *Reconciler) runSagaWithinFamily(ctx context.Context, target *sagaTarget) error {
+	if target == nil {
+		return fmt.Errorf("%w: nil saga target", ErrSagaTarget)
+	}
+	switch target.Kind {
+	case sagaRetirePrimaryClosure:
+		checkoutIDs, err := r.familyCheckoutTopologyCohort(
+			ctx, target.FamilyID, target.CheckoutID,
+		)
+		if err != nil {
+			return err
+		}
+		// A context that owns only part of the cohort cannot safely acquire
+		// the rest: sorting only the missing IDs does not establish a global
+		// order relative to the locks it inherited. The reconciliation caller
+		// pre-acquires the same complete cohort before entering this saga.
+		if held, _ := ctx.Value(topologyGuardContextKey{}).(map[string]struct{}); len(held) > 0 {
+			for _, checkoutID := range checkoutIDs {
+				if _, present := held[checkoutID]; !present {
+					return fmt.Errorf(
+						"%w: primary closure for family %s inherited a partial checkout cohort",
+						ErrSagaTarget, target.FamilyID,
+					)
+				}
+			}
+		}
+		return r.withCheckoutTopology(
+			ctx,
+			checkoutIDs,
+			func(guarded context.Context) error { return r.runPreparedSaga(guarded, *target) },
+		)
+	case sagaPurgeLayers, sagaForgetCheckout, sagaRetireGraph:
+		if target.CheckoutID != "" {
+			return r.withCheckoutTopology(
+				ctx,
+				[]string{target.CheckoutID},
+				func(guarded context.Context) error {
+					if target.Kind == sagaForgetCheckout {
+						refreshed, refreshErr := r.refreshForgetCheckoutTarget(guarded, *target)
+						if refreshErr != nil {
+							return refreshErr
+						}
+						*target = refreshed
+					}
+					return r.runPreparedSaga(guarded, *target)
+				},
+			)
+		}
+	case sagaForgetFamily:
+		checkouts, err := r.catalog.ListCheckouts(ctx, target.FamilyID)
+		if err != nil {
+			return err
+		}
+		checkoutIDs := make([]string, 0, len(checkouts))
+		for _, checkout := range checkouts {
+			checkoutIDs = append(checkoutIDs, checkout.CheckoutID)
+		}
+		slices.Sort(checkoutIDs)
+		return r.withCheckoutTopology(
+			ctx,
+			checkoutIDs,
+			func(guarded context.Context) error { return r.runPreparedSaga(guarded, *target) },
+		)
+	}
+	return r.runPreparedSaga(ctx, *target)
+}
+
+func (r *Reconciler) familyCheckoutTopologyCohort(
+	ctx context.Context,
+	familyID string,
+	include ...string,
+) ([]string, error) {
+	seen := make(map[string]struct{}, len(include))
+	checkoutIDs := make([]string, 0, len(include))
+	appendID := func(checkoutID string) {
+		if checkoutID == "" {
+			return
+		}
+		if _, present := seen[checkoutID]; present {
+			return
+		}
+		seen[checkoutID] = struct{}{}
+		checkoutIDs = append(checkoutIDs, checkoutID)
+	}
+	for _, checkoutID := range include {
+		appendID(checkoutID)
+	}
+	if familyID != "" {
+		checkouts, err := r.catalog.ListCheckouts(ctx, familyID)
+		if err != nil {
+			return nil, err
+		}
+		for _, checkout := range checkouts {
+			appendID(checkout.CheckoutID)
+		}
+	}
+	slices.Sort(checkoutIDs)
+	return checkoutIDs, nil
+}
+
+// withSagaRemovalPublications establishes the outermost publication boundary.
+// A primary closure enters runSaga with its family guard already held, and its
+// phases invoke nested forget-checkout sagas. Publishing those terminal edges
+// from a nested run would invert root convergence's topologyPublish -> family
+// -> checkout order. The callback is therefore treated as a potentially
+// blocking external call and flushed only after the outer operation unwinds
+// every topology guard. Completed nested removals are flushed even when a
+// later parent phase fails, because their journal rows are already gone and no
+// resume would otherwise reproduce the notification.
+func (r *Reconciler) withSagaRemovalPublications(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	if fn == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if pending, _ := ctx.Value(sagaRemovalPublicationsContextKey{}).(*sagaRemovalPublications); pending != nil {
+		return fn(ctx)
+	}
+
+	pending := &sagaRemovalPublications{}
+	err := fn(context.WithValue(ctx, sagaRemovalPublicationsContextKey{}, pending))
+	for _, event := range pending.events {
+		switch event.kind {
+		case sagaCheckoutRemovalPublication:
+			r.hooks.CheckoutRemovalCompleted(event.checkout)
+		case sagaGraphRemovalPublication:
+			r.hooks.GraphRemovalCompleted(event.graph)
+		case sagaFamilyRemovalPublication:
+			r.hooks.FamilyRemovalCompleted(event.family)
+		}
+	}
+	return err
+}
+
+func (r *Reconciler) queueCheckoutRemovalPublication(
+	ctx context.Context,
+	target CheckoutRemovalTarget,
+) {
+	if ctx != nil {
+		if pending, _ := ctx.Value(sagaRemovalPublicationsContextKey{}).(*sagaRemovalPublications); pending != nil {
+			identity := checkoutRemovalIdentity{
+				checkoutID: target.CheckoutID, incarnation: target.Incarnation,
+			}
+			if pending.checkouts == nil {
+				pending.checkouts = make(map[checkoutRemovalIdentity]struct{})
+			}
+			if _, present := pending.checkouts[identity]; present {
+				return
+			}
+			pending.checkouts[identity] = struct{}{}
+			pending.events = append(pending.events, sagaRemovalPublication{
+				kind: sagaCheckoutRemovalPublication, checkout: target,
+			})
+			return
+		}
+	}
+	// Defensive fallback for an internal caller that bypasses runSaga. Normal
+	// saga entry always installs a collector before reaching this point.
+	r.hooks.CheckoutRemovalCompleted(target)
+}
+
+func (r *Reconciler) queueGraphRemovalPublication(
+	ctx context.Context,
+	target GraphRemovalTarget,
+) {
+	if target.GraphID == "" {
+		return
+	}
+	if ctx != nil {
+		if pending, _ := ctx.Value(sagaRemovalPublicationsContextKey{}).(*sagaRemovalPublications); pending != nil {
+			identity := graphRemovalIdentity{
+				graphID: target.GraphID, familyID: target.FamilyID,
+				checkoutID: target.CheckoutID, incarnation: target.Incarnation,
+			}
+			if pending.graphs == nil {
+				pending.graphs = make(map[graphRemovalIdentity]struct{})
+			}
+			if _, present := pending.graphs[identity]; present {
+				return
+			}
+			pending.graphs[identity] = struct{}{}
+			pending.events = append(pending.events, sagaRemovalPublication{
+				kind: sagaGraphRemovalPublication, graph: target,
+			})
+			return
+		}
+	}
+	r.hooks.GraphRemovalCompleted(target)
+}
+
+func (r *Reconciler) queueFamilyRemovalPublication(
+	ctx context.Context,
+	target FamilyRemovalTarget,
+) {
+	if target.FamilyID == "" {
+		return
+	}
+	if ctx != nil {
+		if pending, _ := ctx.Value(sagaRemovalPublicationsContextKey{}).(*sagaRemovalPublications); pending != nil {
+			if pending.families == nil {
+				pending.families = make(map[string]struct{})
+			}
+			if _, present := pending.families[target.FamilyID]; present {
+				return
+			}
+			pending.families[target.FamilyID] = struct{}{}
+			pending.events = append(pending.events, sagaRemovalPublication{
+				kind: sagaFamilyRemovalPublication, family: target,
+			})
+			return
+		}
+	}
+	r.hooks.FamilyRemovalCompleted(target)
+}
+
+func graphRemovalTarget(target sagaTarget) GraphRemovalTarget {
+	return GraphRemovalTarget{
+		GraphID: target.GraphID, FamilyID: target.FamilyID,
+		CheckoutID: target.CheckoutID, Incarnation: target.Incarnation,
+		RepoPrefix: target.RepoPrefix, RootPath: target.RootPath,
+	}
+}
+
+func (r *Reconciler) refreshForgetCheckoutTarget(
+	ctx context.Context, target sagaTarget,
+) (sagaTarget, error) {
+	checkout, found, err := r.catalog.GetCheckout(ctx, target.CheckoutID)
+	if err != nil || !found {
+		return target, err
+	}
+	if checkout.Incarnation != target.Incarnation {
+		if target.Phase != "" {
+			// A resumed journal belongs to the old incarnation. Its guarded
+			// phases know how to skip replacement-owned rows while still
+			// retiring the old durable payload and deleting the journal.
+			return target, nil
+		}
+		return target, fmt.Errorf("%w: checkout %s is at incarnation %s, not %s",
+			store_sqlite.ErrCatalogStaleGuard, checkout.CheckoutID,
+			checkout.Incarnation, target.Incarnation)
+	}
+	target.FamilyID = checkout.FamilyID
+	target.RootPath = checkout.RootPath
+	// A persisted cleanup target remains the crash-recovery authority after
+	// graph rows disappear. Only a brand-new target may fill a missing graph
+	// address from live catalog state; never erase or rewrite a journaled one.
+	if target.Phase == "" && target.GraphID == "" {
+		owned, ownedErr := r.ownedGraph(ctx, checkout.FamilyID, checkout.CheckoutID)
+		if ownedErr != nil {
+			return target, ownedErr
+		}
+		if owned != nil {
+			target.GraphID = owned.GraphID
+		}
+	}
+	return target, nil
+}
+
+// runPreparedSaga walks a hydrated target while its checkout topology guard,
+// when required, remains held across every durable phase and cleanup hook.
+func (r *Reconciler) runPreparedSaga(ctx context.Context, target sagaTarget) error {
 	plan := sagaPhases[target.Kind]
 	if len(plan) == 0 {
 		return fmt.Errorf("%w: unknown saga kind %q", ErrSagaTarget, target.Kind)
@@ -480,12 +835,6 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 	}
 	if err := r.catalog.DeleteCleanupEntry(ctx, id); err != nil && !errors.Is(err, store_sqlite.ErrCatalogNotFound) {
 		return err
-	}
-	if target.Kind == sagaForgetCheckout {
-		r.hooks.CheckoutRemovalCompleted(CheckoutRemovalTarget{
-			CheckoutID: target.CheckoutID, Incarnation: target.Incarnation,
-			RootPath: target.RootPath,
-		})
 	}
 	return nil
 }

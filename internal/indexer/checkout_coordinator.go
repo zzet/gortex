@@ -308,6 +308,7 @@ type checkoutMutationWaiter struct {
 	generation         uint64
 	observedRouteEpoch int64
 	done               chan MutationResult
+	release            func()
 }
 
 // retainedCommitLayer is one commit generation kept for re-routing, keyed by
@@ -522,11 +523,39 @@ func (c *CheckoutCoordinator) enqueueFileMutation(
 	if !found || !graphview.RouteReady(route) {
 		return nil, fmt.Errorf("indexer: checkout %q has no ready mutation route", c.checkoutID)
 	}
+	return c.enqueueAdmittedFileMutation(ctx, absPath, route.RouteEpoch, nil)
+}
+
+// enqueueAdmittedFileMutation admits a mutation whose caller already holds a
+// topology token for this exact coordinator. Normal coordinator route
+// publication remains free to advance the epoch while the token is held.
+func (c *CheckoutCoordinator) enqueueAdmittedFileMutation(
+	ctx context.Context,
+	absPath string,
+	observedRouteEpoch int64,
+	release func(),
+) (*MutationTicket, error) {
+	if c == nil {
+		return nil, errors.New("indexer: checkout mutation has no coordinator")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cleanRoot := filepath.Clean(c.root)
+	cleanPath := filepath.Clean(absPath)
+	rel, err := filepath.Rel(cleanRoot, cleanPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return nil, fmt.Errorf("indexer: mutation path %q is outside checkout root %q", cleanPath, cleanRoot)
+	}
 
 	waiter := &checkoutMutationWaiter{
 		path:               cleanPath,
-		observedRouteEpoch: route.RouteEpoch,
+		observedRouteEpoch: observedRouteEpoch,
 		done:               make(chan MutationResult, 1),
+		release:            release,
 	}
 	c.mutationMu.Lock()
 	if c.mutationClosed {
@@ -624,6 +653,9 @@ func (c *CheckoutCoordinator) completeMutationClaim(
 		}
 		waiter.done <- resolved
 		close(waiter.done)
+		if waiter.release != nil {
+			waiter.release()
+		}
 	}
 }
 
@@ -646,6 +678,9 @@ func (c *CheckoutCoordinator) failMutationWaiters(err error) {
 			Err:                 err,
 		}
 		close(waiter.done)
+		if waiter.release != nil {
+			waiter.release()
+		}
 	}
 }
 

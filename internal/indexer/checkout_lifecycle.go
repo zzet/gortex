@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -194,6 +195,9 @@ type CheckoutLifecycle struct {
 	// familyRetryBarrier runs after a fired retry is admitted and counted.
 	// It is a deterministic shutdown test seam; nil in production.
 	familyRetryBarrier func()
+	// familyRetryExecute replaces reconciliation after the barrier in tests.
+	// Production leaves it nil.
+	familyRetryExecute func(context.Context, string) (reconcile.FamilyReport, error)
 
 	// coordMu guards the coordinator registry alone. It is separate from mu
 	// because dropping a coordinator waits for its in-flight build, and
@@ -205,6 +209,17 @@ type CheckoutLifecycle struct {
 	coordinatorStartWG sync.WaitGroup
 	coordinators       map[string]*CheckoutCoordinator
 	coordinatorHeads   map[string]checkoutHeadIdentity
+	mutationFencesOnce sync.Once
+	mutationFences     *checkoutMutationFences
+	// topologyFenceRetireMu protects the process-local retry sets populated by
+	// terminal reconcile/rollback edges. The separate sweep mutex prevents two
+	// callbacks from retiring the same registry entry concurrently while the
+	// map lock remains free for new terminal publications.
+	topologyFenceRetireMu      sync.Mutex
+	topologyFenceRetireSweepMu sync.Mutex
+	pendingCheckoutFences      map[string]string
+	pendingFamilyFences        map[string]struct{}
+	pendingGraphFences         map[string]struct{}
 
 	checkoutSignalWatchMu        sync.Mutex
 	checkoutSignalWatchers       *checkoutSourceSignalWatcherSet
@@ -254,6 +269,13 @@ type CheckoutLifecycle struct {
 	// moveShellPublishBarrier injects a dedicated-shell publication failure in
 	// component recovery tests. Production leaves it nil.
 	moveShellPublishBarrier func(checkoutID string) error
+	// coordinatorApplyBarrier runs after root-move publication locks are
+	// released and immediately before ordinary coordinator convergence. It is a
+	// deterministic lock-order test seam; production leaves it nil.
+	coordinatorApplyBarrier func()
+	// checkoutCloseDrainBarrier observes an individually drained checkout gate
+	// during deterministic shutdown lock-order tests. Production leaves it nil.
+	checkoutCloseDrainBarrier func(string)
 	// moveRebindBarrier runs after a replacement coordinator is constructed
 	// and before its final catalog guard. It is nil outside deterministic move
 	// race tests.
@@ -353,6 +375,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		leases:                 cfg.ViewLeases,
 		coordinators:           map[string]*CheckoutCoordinator{},
 		coordinatorHeads:       map[string]checkoutHeadIdentity{},
+		mutationFences:         newCheckoutMutationFences(),
 		started:                map[string][]*CheckoutCoordinator{},
 		owed:                   map[int64]struct{}{},
 		familyRetries:          map[string]familyRetry{},
@@ -389,7 +412,9 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		rcfg = reconcile.Default()
 	}
 	rec, err := reconcile.New(l.catalog, cleanupHooks{l: l}, rcfg,
-		reconcile.WithClock(now), reconcile.WithLogger(l.logger))
+		reconcile.WithClock(now), reconcile.WithLogger(l.logger),
+		reconcile.WithFamilyTopologyGuard(l.reconcileCheckoutFamilyTopologyGuard),
+		reconcile.WithCheckoutTopologyGuard(l.reconcileCheckoutTopologyGuard))
 	if err != nil {
 		return nil, fmt.Errorf("indexer: build checkout reconciler: %w", err)
 	}
@@ -872,6 +897,12 @@ func (l *CheckoutLifecycle) recordCheckoutWithIntents(
 
 	now := l.now()
 	familyID := FamilyIDFor(inv.CommonDir)
+	guarded, releaseFamily, err := l.reconcileCheckoutFamilyTopologyGuard(ctx, familyID)
+	if err != nil {
+		return checkoutIdentity{}, err
+	}
+	defer releaseFamily()
+	ctx = guarded
 	if err := l.upsertFamily(ctx, familyID, inv.CommonDir, now.Unix()); err != nil {
 		return checkoutIdentity{}, err
 	}
@@ -884,17 +915,30 @@ func (l *CheckoutLifecycle) recordCheckoutWithIntents(
 	switch {
 	case existing != nil:
 		identity.checkoutID, identity.incarnation = existing.CheckoutID, existing.Incarnation
-		if !seeding {
-			if err := l.confirmPresent(ctx, *existing, record, inv, now); err != nil {
-				return identity, err
-			}
-		}
 	default:
 		minted, err := l.allocateCheckout(ctx, familyID, root, record, inv, now)
 		if err != nil {
 			return identity, err
 		}
 		identity.checkoutID, identity.incarnation = minted.CheckoutID, minted.Incarnation
+	}
+	guarded, releaseCheckout, err := l.reconcileCheckoutTopologyGuard(ctx, identity.checkoutID)
+	if err != nil {
+		return identity, err
+	}
+	defer releaseCheckout()
+	ctx = guarded
+	if existing != nil && !seeding {
+		current, found, readErr := l.catalog.GetCheckout(ctx, identity.checkoutID)
+		if readErr != nil {
+			return identity, readErr
+		}
+		if !found || current.Incarnation != identity.incarnation {
+			return identity, store_sqlite.ErrCatalogStaleGuard
+		}
+		if err := l.confirmPresent(ctx, current, record, inv, now); err != nil {
+			return identity, err
+		}
 	}
 
 	// A config entry may outlive an authorized demotion until its cleanup
@@ -938,7 +982,7 @@ func (l *CheckoutLifecycle) syncCheckoutIntents(
 	}
 	expectedKeys := make(map[intentKey]struct{}, len(expected))
 	for _, spec := range expected {
-		key := intentKey{kind: spec.kind, locator: spec.locator}
+		key := intentKey(spec)
 		if _, duplicate := expectedKeys[key]; duplicate {
 			continue
 		}
@@ -1762,6 +1806,7 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 	out.Coordinators = l.liveCoordinators("")
 	out.Retired = l.sweepRetirements(ctx)
 	out.RefViewsRetired = l.sweepRefViewRetention(ctx)
+	l.sweepTopologyFenceRetirements(ctx)
 	recordSweepGauges(out)
 	if out.Removed > 0 {
 		// The cleanup hooks drop the removed repositories from the in-memory
@@ -1964,7 +2009,11 @@ func (l *CheckoutLifecycle) runFamilyRetry(familyID string, deadline int64) {
 		barrier()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	_, err := l.ReconcileFamily(ctx, familyID)
+	execute := l.ReconcileFamily
+	if l.familyRetryExecute != nil {
+		execute = l.familyRetryExecute
+	}
+	_, err := execute(ctx, familyID)
 	cancel()
 	if err == nil || errors.Is(err, store_sqlite.ErrCatalogNotFound) {
 		return
@@ -2174,68 +2223,135 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
 		}
-		if entry.State != store_sqlite.CheckoutStateReady {
-			l.dropCoordinator(entry.CheckoutID)
-			l.withdrawStaleRoute(ctx, entry.CheckoutID)
-			continue
-		}
-		checkout, found, err := l.catalog.GetCheckout(ctx, entry.CheckoutID)
-		if err != nil || !found {
-			l.dropCoordinator(entry.CheckoutID)
-			continue
-		}
-		graphID := report.PrimaryGraphID
-		if checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
-			prefix := l.prefixForCheckout(ctx, checkout.CheckoutID)
-			graphID = GraphIDFor(prefix)
-			graph, graphFound, graphErr := l.catalog.GetDedicatedGraph(ctx, graphID)
-			if graphErr != nil || !graphFound || graph.OwnerCheckoutID != checkout.CheckoutID {
-				l.dropCoordinator(entry.CheckoutID)
-				l.withdrawStaleRoute(ctx, entry.CheckoutID)
-				continue
-			}
-			if l.scheduleDedicatedBaseRefreshIfNeeded(ctx, graph, checkout) {
-				// Keep the last coherent route in place while the replacement
-				// corpus builds off-route. The guarded refresh publication either
-				// replaces the owner stack atomically or changes nothing.
-				continue
-			}
-		}
-		if graphID == "" {
-			l.dropCoordinator(entry.CheckoutID)
-			l.withdrawStaleRoute(ctx, entry.CheckoutID)
-			continue
-		}
-		admission, admissionErr := l.coordinatorGraphState(ctx, graphID, checkout)
-		if admissionErr != nil {
-			l.logger.Warn("checkout lifecycle: could not validate coordinator graph publication",
-				zap.String("checkout", checkout.CheckoutID), zap.String("graph", graphID),
-				zap.Error(admissionErr))
-			continue
-		}
-		switch admission {
-		case coordinatorGraphInvalid:
-			l.dropCoordinator(entry.CheckoutID)
-			l.withdrawStaleRoute(ctx, entry.CheckoutID)
-			continue
-		case coordinatorGraphWaiting:
-			// Keep a previously published route and its coordinator while the
-			// same graph is refreshing, but never start a new coordinator over a
-			// generation-zero promotion shell.
-			continue
-		}
-		l.ensureCoordinator(ctx, graphID, checkout)
+		l.applyCoordinatorReport(ctx, report.FamilyID, entry)
 	}
 }
 
-// ensureCoordinator brings up the coordinator for one automatic checkout, or
-// leaves the running one alone.
-//
-// Everything the coordinator stamps on its payload is the PRIMARY's: the repo
-// prefix, the workspace and project slugs, and the index configuration. The
-// layers compose over the primary's corpus, so a generation stamped with
-// anything else would land beside that corpus instead of over it.
+// applyCoordinatorReport treats the report as a wake-up, never as teardown
+// authority. Root moves, recovery, promotion and primary changes may all have
+// committed after the report was produced. The family+checkout fence followed
+// by a fresh catalog read is the decision's linearization point.
+func (l *CheckoutLifecycle) applyCoordinatorReport(
+	ctx context.Context,
+	reportFamilyID string,
+	entry reconcile.CheckoutReport,
+) {
+	checkout, found, err := l.catalog.GetCheckout(ctx, entry.CheckoutID)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not preflight coordinator identity",
+			zap.String("checkout", entry.CheckoutID), zap.Error(err))
+		return
+	}
+	familyID := reportFamilyID
+	if found && checkout.FamilyID != "" {
+		familyID = checkout.FamilyID
+	}
+	guarded, release, err := l.reconcileFamilyCheckoutTopologyGuard(
+		ctx, []string{familyID}, []string{entry.CheckoutID},
+	)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not fence coordinator convergence",
+			zap.String("checkout", entry.CheckoutID), zap.Error(err))
+		return
+	}
+	defer release()
+
+	checkout, found, err = l.catalog.GetCheckout(guarded, entry.CheckoutID)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not revalidate coordinator identity",
+			zap.String("checkout", entry.CheckoutID), zap.Error(err))
+		return
+	}
+	if found && ((familyID != "" && checkout.FamilyID != familyID) ||
+		(reportFamilyID != "" && checkout.FamilyID != reportFamilyID) ||
+		(entry.Incarnation != "" && checkout.Incarnation != entry.Incarnation)) {
+		return
+	}
+	if _, pending, moveErr := l.catalog.GetCheckoutRootMove(guarded, entry.CheckoutID); moveErr != nil {
+		l.logger.Warn("checkout lifecycle: could not revalidate coordinator root move",
+			zap.String("checkout", entry.CheckoutID), zap.Error(moveErr))
+		return
+	} else if pending {
+		return
+	}
+	if !found || checkout.State != store_sqlite.CheckoutStateReady {
+		l.dropCoordinatorFenced(entry.CheckoutID)
+		l.withdrawStaleRoute(guarded, entry.CheckoutID)
+		return
+	}
+
+	owned, primary, err := l.familyGraphsFor(guarded, checkout)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not resolve coordinator graph",
+			zap.String("checkout", checkout.CheckoutID), zap.Error(err))
+		return
+	}
+	var graph *store_sqlite.DedicatedGraph
+	switch checkout.EffectiveMode {
+	case store_sqlite.CheckoutModeAutomatic:
+		graph = primary
+	case store_sqlite.CheckoutModeDedicated:
+		graph = owned
+	default:
+		l.dropCoordinatorFenced(entry.CheckoutID)
+		l.withdrawStaleRoute(guarded, entry.CheckoutID)
+		return
+	}
+	if graph == nil || graph.GraphID == "" {
+		l.dropCoordinatorFenced(entry.CheckoutID)
+		l.withdrawStaleRoute(guarded, entry.CheckoutID)
+		return
+	}
+	if checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
+		if l.scheduleDedicatedBaseRefreshIfNeeded(guarded, *graph, checkout) {
+			// Keep the last coherent route in place while the replacement corpus
+			// builds off-route. Publication either replaces the owner stack
+			// atomically or changes nothing.
+			return
+		}
+	}
+
+	admission, admissionErr := l.coordinatorGraphState(guarded, graph.GraphID, checkout)
+	if admissionErr != nil {
+		l.logger.Warn("checkout lifecycle: could not validate coordinator graph publication",
+			zap.String("checkout", checkout.CheckoutID), zap.String("graph", graph.GraphID),
+			zap.Error(admissionErr))
+		return
+	}
+	switch admission {
+	case coordinatorGraphInvalid:
+		l.dropCoordinatorFenced(entry.CheckoutID)
+		l.withdrawStaleRoute(guarded, entry.CheckoutID)
+		return
+	case coordinatorGraphWaiting:
+		// Keep a previously published route and coordinator while the same graph
+		// refreshes, but never start one over a generation-zero shell.
+		return
+	default:
+		l.ensureCoordinatorFenced(guarded, graph.GraphID, checkout)
+	}
+}
+
+// ensureCoordinator brings up the coordinator for one checkout, or leaves a
+// compatible running one alone. The full construction/publication window is
+// fenced so a root, family primary or mode transition cannot invalidate the
+// row it was built from.
 func (l *CheckoutLifecycle) ensureCoordinator(
+	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
+) {
+	guarded, release, err := l.reconcileFamilyCheckoutTopologyGuard(
+		ctx, []string{checkout.FamilyID}, []string{checkout.CheckoutID},
+	)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not fence coordinator admission",
+			zap.String("checkout", checkout.CheckoutID), zap.Error(err))
+		return
+	}
+	defer release()
+	l.ensureCoordinatorFenced(guarded, primaryGraphID, checkout)
+}
+
+func (l *CheckoutLifecycle) ensureCoordinatorFenced(
 	ctx context.Context, primaryGraphID string, checkout store_sqlite.Checkout,
 ) {
 	nextHead := checkoutHeadIdentity{ref: checkout.HeadRef, commit: checkout.HeadCommit}
@@ -2249,9 +2365,6 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 		l.coordinatorHeads[checkout.CheckoutID] = nextHead
 		if tracked && previousHead != nextHead &&
 			checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic {
-			// Signal while the registry lock still proves this is the live
-			// coordinator for the accepted row. Signal is buffered to one and
-			// non-blocking, so a burst of ref events remains coalescible.
 			current.Signal("checkout HEAD changed")
 		}
 		l.coordMu.Unlock()
@@ -2260,7 +2373,7 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 	}
 	l.coordMu.Unlock()
 	if current != nil {
-		l.dropCoordinator(checkout.CheckoutID)
+		l.dropCoordinatorFenced(checkout.CheckoutID)
 	}
 	coordinator, err := l.buildCoordinator(ctx, primaryGraphID, checkout)
 	if err != nil {
@@ -2272,7 +2385,12 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 	if coordinator == nil {
 		return
 	}
-	if !l.installCoordinatorAtHead(checkout, coordinator) {
+	if !l.installCoordinatorWithHeadFenced(
+		checkout.CheckoutID,
+		coordinator,
+		checkoutHeadIdentity{ref: checkout.HeadRef, commit: checkout.HeadCommit},
+		true,
+	) {
 		return
 	}
 	l.ensureCheckoutSourceSignalWatcher(checkout, primaryGraphID)
@@ -2448,7 +2566,15 @@ func stillRunning(coordinators []*CheckoutCoordinator) []*CheckoutCoordinator {
 // it got the slot. A coordinator that lost a race is closed here rather than
 // handed back, so a caller cannot leak the goroutine it just lost.
 func (l *CheckoutLifecycle) installCoordinator(checkoutID string, coordinator *CheckoutCoordinator) bool {
-	return l.installCoordinatorWithHead(checkoutID, coordinator, checkoutHeadIdentity{}, false)
+	topology, err := l.AcquireCheckoutTopology(context.Background(), checkoutID)
+	if err != nil {
+		if coordinator != nil {
+			_ = coordinator.Close()
+		}
+		return false
+	}
+	defer topology.Release()
+	return l.installCoordinatorWithHeadFenced(checkoutID, coordinator, checkoutHeadIdentity{}, false)
 }
 
 // installCoordinatorAtHead atomically publishes a coordinator and the durable
@@ -2458,7 +2584,15 @@ func (l *CheckoutLifecycle) installCoordinator(checkoutID string, coordinator *C
 func (l *CheckoutLifecycle) installCoordinatorAtHead(
 	checkout store_sqlite.Checkout, coordinator *CheckoutCoordinator,
 ) bool {
-	return l.installCoordinatorWithHead(
+	topology, err := l.AcquireCheckoutTopology(context.Background(), checkout.CheckoutID)
+	if err != nil {
+		if coordinator != nil {
+			_ = coordinator.Close()
+		}
+		return false
+	}
+	defer topology.Release()
+	return l.installCoordinatorWithHeadFenced(
 		checkout.CheckoutID,
 		coordinator,
 		checkoutHeadIdentity{ref: checkout.HeadRef, commit: checkout.HeadCommit},
@@ -2466,7 +2600,7 @@ func (l *CheckoutLifecycle) installCoordinatorAtHead(
 	)
 }
 
-func (l *CheckoutLifecycle) installCoordinatorWithHead(
+func (l *CheckoutLifecycle) installCoordinatorWithHeadFenced(
 	checkoutID string,
 	coordinator *CheckoutCoordinator,
 	head checkoutHeadIdentity,
@@ -2501,15 +2635,14 @@ func (l *CheckoutLifecycle) installCoordinatorWithHead(
 	return true
 }
 
-// replaceCoordinator publishes coordinator in place of the exact coordinator
-// captured by a transition. Demotion builds and routes the replacement before
-// its catalog flip, so dropping the old
-// coordinator first would both create an avoidable publication gap and stop
-// language-server workspaces the replacement still uses.
-//
-// Any other current coordinator wins the race. It was published by a newer
-// transition; the stale replacement is closed without disturbing it.
-func (l *CheckoutLifecycle) replaceCoordinator(
+// replaceCoordinatorFenced publishes coordinator in place of the exact
+// coordinator captured by a transition while its caller holds checkoutID's
+// exclusive topology token. Demotion builds and routes the replacement before
+// its catalog flip, so dropping the old coordinator first would both create an
+// avoidable publication gap and stop language-server workspaces the replacement
+// still uses. Any other current coordinator wins the race: a newer transition
+// published it, so the stale replacement is closed without disturbing it.
+func (l *CheckoutLifecycle) replaceCoordinatorFenced(
 	checkoutID string,
 	expected, coordinator *CheckoutCoordinator,
 ) bool {
@@ -2558,6 +2691,17 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 	if l == nil {
 		return
 	}
+	topology, err := l.AcquireCheckoutTopology(context.Background(), checkoutID)
+	if err != nil {
+		return
+	}
+	defer topology.Release()
+	l.dropCoordinatorFenced(checkoutID)
+}
+
+// dropCoordinatorFenced stops a coordinator after admitted mutations for the
+// checkout have drained. Its caller holds checkoutID's topology token.
+func (l *CheckoutLifecycle) dropCoordinatorFenced(checkoutID string) {
 	l.coordMu.Lock()
 	coordinator := l.coordinators[checkoutID]
 	delete(l.coordinators, checkoutID)
@@ -2582,6 +2726,15 @@ func (l *CheckoutLifecycle) dropCoordinatorForGraph(checkoutID, graphID string) 
 	if l == nil || checkoutID == "" || graphID == "" {
 		return
 	}
+	topology, err := l.AcquireCheckoutTopology(context.Background(), checkoutID)
+	if err != nil {
+		return
+	}
+	defer topology.Release()
+	l.dropCoordinatorForGraphFenced(checkoutID, graphID)
+}
+
+func (l *CheckoutLifecycle) dropCoordinatorForGraphFenced(checkoutID, graphID string) {
 	l.coordMu.Lock()
 	coordinator := l.coordinators[checkoutID]
 	if coordinator == nil || coordinator.graphID != graphID {
@@ -2707,23 +2860,30 @@ func (l *CheckoutLifecycle) CheckoutMutationReady(checkoutID, root string) bool 
 	return err == nil && found && graphview.RouteReady(route)
 }
 
-// EnqueueCheckoutMutation signals the selected checkout's own coordinator and
-// returns a publication ticket. The registry lock is released before ticket
-// admission and is never held while callers wait for publication.
+// EnqueueCheckoutMutation transfers an exact pre-disk topology token to the
+// selected checkout's captured coordinator and returns its publication ticket.
+// It deliberately does not resolve the registry or route again: destructive
+// topology waits on the token until the ticket reaches a terminal result.
 func (l *CheckoutLifecycle) EnqueueCheckoutMutation(
 	ctx context.Context,
-	checkoutID, absPath string,
+	token *CheckoutMutationToken,
+	absPath string,
 ) (*MutationTicket, error) {
 	if l == nil {
 		return nil, errors.New("indexer: checkout lifecycle is unavailable")
 	}
-	l.coordMu.Lock()
-	coordinator := l.coordinators[checkoutID]
-	l.coordMu.Unlock()
-	if coordinator == nil {
-		return nil, fmt.Errorf("indexer: checkout %q has no live coordinator", checkoutID)
+	release, err := token.transfer(l)
+	if err != nil {
+		return nil, err
 	}
-	return coordinator.enqueueFileMutation(ctx, absPath)
+	ticket, err := token.coordinator.enqueueAdmittedFileMutation(
+		ctx, absPath, token.observedRouteEpoch, release,
+	)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return ticket, nil
 }
 
 // ViewLeases is the lease manager every coordinator hands to retirement. A
@@ -2751,7 +2911,36 @@ func (l *CheckoutLifecycle) Close() error {
 
 	l.coordMu.Lock()
 	l.coordinatorClosing = true
+	checkoutIDSet := make(map[string]struct{}, len(l.coordinators)+len(l.started))
+	unique := make(map[*CheckoutCoordinator]struct{}, len(l.coordinators))
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for checkoutID, coordinator := range l.coordinators {
+		checkoutIDSet[checkoutID] = struct{}{}
+		if coordinator == nil {
+			continue
+		}
+		unique[coordinator] = struct{}{}
+		coordinators = append(coordinators, coordinator)
+	}
+	for checkoutID, started := range l.started {
+		checkoutIDSet[checkoutID] = struct{}{}
+		for _, coordinator := range started {
+			if coordinator == nil {
+				continue
+			}
+			if _, duplicate := unique[coordinator]; duplicate {
+				continue
+			}
+			unique[coordinator] = struct{}{}
+			coordinators = append(coordinators, coordinator)
+		}
+	}
 	l.coordMu.Unlock()
+	checkoutIDs := make([]string, 0, len(checkoutIDSet))
+	for checkoutID := range checkoutIDSet {
+		checkoutIDs = append(checkoutIDs, checkoutID)
+	}
+	slices.Sort(checkoutIDs)
 	defer func() {
 		l.coordMu.Lock()
 		l.coordinatorClosing = false
@@ -2768,7 +2957,6 @@ func (l *CheckoutLifecycle) Close() error {
 		}
 	}
 	l.transitionMu.Unlock()
-	l.transitionWG.Wait()
 
 	// Serialize the retry phase of concurrent Close calls. The admission gate
 	// and WaitGroup share retryMu, so no callback can Add after this goroutine
@@ -2791,55 +2979,57 @@ func (l *CheckoutLifecycle) Close() error {
 		delete(l.watcherRetries, prefix)
 	}
 	l.retryMu.Unlock()
-	l.retryWG.Wait()
 	defer func() {
 		l.retryMu.Lock()
 		l.retryClosing = false
 		l.retryMu.Unlock()
 	}()
 
+	// Transferred mutation tokens can be the resource an admitted transition or
+	// retry is waiting to drain. Terminate those tickets and cancel coordinator
+	// loops before joining either worker class, otherwise Close itself is the
+	// only actor capable of releasing the token it is waiting behind.
+	shutdownErr := errors.New("indexer: checkout lifecycle closed before mutation publication")
+	for _, coordinator := range coordinators {
+		coordinator.failMutationWaiters(shutdownErr)
+	}
+	stopCtx, cancelStop := context.WithCancel(context.Background())
+	cancelStop()
+	for _, coordinator := range coordinators {
+		_ = coordinator.CloseContext(stopCtx)
+	}
+
+	l.transitionWG.Wait()
+	l.retryWG.Wait()
+
 	// Every admitted constructor has now either registered its running worker
 	// in started or rejected and joined it. Add is fenced by coordMu and the
 	// closing gate, so it cannot race this Wait.
 	l.coordinatorStartWG.Wait()
 
+	// Drain one checkout at a time. Holding a partial cohort while waiting for
+	// another ID can invert with a primary-closure saga that already owns that
+	// other ID and is extending to the first. Admission is closed, so releasing
+	// each drain before acquiring the next preserves shutdown's quiescence
+	// without ever participating in that AB/BA shape.
+	for _, checkoutID := range checkoutIDs {
+		topology, err := l.AcquireCheckoutTopology(context.Background(), checkoutID)
+		if err != nil {
+			return err
+		}
+		topology.Release()
+		if l.checkoutCloseDrainBarrier != nil {
+			l.checkoutCloseDrainBarrier(checkoutID)
+		}
+	}
+
 	l.coordMu.Lock()
-	unique := make(map[*CheckoutCoordinator]struct{}, len(l.coordinators))
-	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
-	for _, coordinator := range l.coordinators {
-		if coordinator == nil {
-			continue
-		}
-		unique[coordinator] = struct{}{}
-		coordinators = append(coordinators, coordinator)
-	}
-	for _, started := range l.started {
-		for _, coordinator := range started {
-			if coordinator == nil {
-				continue
-			}
-			if _, duplicate := unique[coordinator]; duplicate {
-				continue
-			}
-			unique[coordinator] = struct{}{}
-			coordinators = append(coordinators, coordinator)
-		}
-	}
 	l.coordinators = map[string]*CheckoutCoordinator{}
 	l.coordinatorHeads = map[string]checkoutHeadIdentity{}
 	l.started = map[string][]*CheckoutCoordinator{}
 	viewmetrics.SetGauge(viewmetrics.Coordinators, 0)
 	l.coordMu.Unlock()
 	l.stopCheckoutSourceSignalWatchers()
-
-	// Signal every worker before joining any one of them. A sequential
-	// cancel-and-wait lets later coordinators continue indexing into teardown
-	// for as long as the first slow build takes to unwind.
-	stopCtx, cancelStop := context.WithCancel(context.Background())
-	cancelStop()
-	for _, coordinator := range coordinators {
-		_ = coordinator.CloseContext(stopCtx)
-	}
 
 	var errs []error
 	for _, coordinator := range coordinators {
@@ -2884,6 +3074,185 @@ func (l *CheckoutLifecycle) liveCoordinators(familyID string) int {
 		}
 	}
 	return len(live)
+}
+
+const topologyFenceRetirementBudget = time.Second
+
+type topologyFenceRetirementSnapshot struct {
+	checkouts map[string]string
+	families  []string
+	graphs    []string
+}
+
+func (l *CheckoutLifecycle) queueCheckoutFenceRetirement(checkoutID, incarnation string) {
+	if l == nil || checkoutID == "" {
+		return
+	}
+	l.topologyFenceRetireMu.Lock()
+	if l.pendingCheckoutFences == nil {
+		l.pendingCheckoutFences = make(map[string]string)
+	}
+	l.pendingCheckoutFences[checkoutID] = incarnation
+	l.topologyFenceRetireMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) queueFamilyFenceRetirement(familyID string) {
+	if l == nil || familyID == "" {
+		return
+	}
+	l.topologyFenceRetireMu.Lock()
+	if l.pendingFamilyFences == nil {
+		l.pendingFamilyFences = make(map[string]struct{})
+	}
+	l.pendingFamilyFences[familyID] = struct{}{}
+	l.topologyFenceRetireMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) queueGraphFenceRetirement(graphID string) {
+	if l == nil || graphID == "" {
+		return
+	}
+	l.topologyFenceRetireMu.Lock()
+	if l.pendingGraphFences == nil {
+		l.pendingGraphFences = make(map[string]struct{})
+	}
+	l.pendingGraphFences[graphID] = struct{}{}
+	l.topologyFenceRetireMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) topologyFenceRetirementSnapshot() topologyFenceRetirementSnapshot {
+	l.topologyFenceRetireMu.Lock()
+	defer l.topologyFenceRetireMu.Unlock()
+
+	snapshot := topologyFenceRetirementSnapshot{
+		checkouts: make(map[string]string, len(l.pendingCheckoutFences)),
+		families:  make([]string, 0, len(l.pendingFamilyFences)),
+		graphs:    make([]string, 0, len(l.pendingGraphFences)),
+	}
+	for checkoutID, incarnation := range l.pendingCheckoutFences {
+		snapshot.checkouts[checkoutID] = incarnation
+	}
+	for familyID := range l.pendingFamilyFences {
+		snapshot.families = append(snapshot.families, familyID)
+	}
+	for graphID := range l.pendingGraphFences {
+		snapshot.graphs = append(snapshot.graphs, graphID)
+	}
+	slices.Sort(snapshot.families)
+	slices.Sort(snapshot.graphs)
+	return snapshot
+}
+
+// sweepTopologyFenceRetirements reclaims only process-local semaphore
+// identities whose durable owners are gone. Terminal callbacks make the first
+// attempt; a sweep retries graph entries that were still referenced by leased
+// generations or ref views. One shared deadline bounds the entire pass, so a
+// leaked holder cannot multiply the janitor delay by the number of entries.
+func (l *CheckoutLifecycle) sweepTopologyFenceRetirements(ctx context.Context) {
+	if l == nil || l.catalog == nil {
+		return
+	}
+	l.ensureMutationFences()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	l.topologyFenceRetireSweepMu.Lock()
+	defer l.topologyFenceRetireSweepMu.Unlock()
+
+	snapshot := l.topologyFenceRetirementSnapshot()
+	if len(snapshot.checkouts) == 0 && len(snapshot.families) == 0 && len(snapshot.graphs) == 0 {
+		return
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, topologyFenceRetirementBudget)
+	defer cancel()
+
+	checkoutIDs := make([]string, 0, len(snapshot.checkouts))
+	for checkoutID := range snapshot.checkouts {
+		checkoutIDs = append(checkoutIDs, checkoutID)
+	}
+	slices.Sort(checkoutIDs)
+	for _, checkoutID := range checkoutIDs {
+		incarnation := snapshot.checkouts[checkoutID]
+		_, err := l.retireCheckoutMutationFence(
+			attemptCtx, checkoutID,
+			func(guardCtx context.Context) (bool, error) {
+				checkout, found, guardErr := l.catalog.GetCheckout(guardCtx, checkoutID)
+				return !found || checkout.Incarnation != incarnation, guardErr
+			},
+		)
+		if err != nil {
+			l.logTopologyFenceRetirementFailure("checkout", checkoutID, err)
+			continue
+		}
+		// A successful retirement or the same incarnation's restoration both
+		// settle this terminal edge. A later removal publishes a new edge.
+		l.topologyFenceRetireMu.Lock()
+		if current, pending := l.pendingCheckoutFences[checkoutID]; pending && current == incarnation {
+			delete(l.pendingCheckoutFences, checkoutID)
+		}
+		l.topologyFenceRetireMu.Unlock()
+	}
+
+	for _, graphID := range snapshot.graphs {
+		retired, err := l.retireGraphMutationFence(
+			attemptCtx, graphID,
+			func(guardCtx context.Context) (bool, error) {
+				inUse, guardErr := l.catalog.GraphTopologyFenceInUse(guardCtx, graphID)
+				return !inUse, guardErr
+			},
+		)
+		if err != nil {
+			l.logTopologyFenceRetirementFailure("graph", graphID, err)
+			continue
+		}
+		settled := retired
+		if !settled {
+			_, graphPresent, graphErr := l.catalog.GetDedicatedGraph(attemptCtx, graphID)
+			if graphErr != nil {
+				l.logTopologyFenceRetirementFailure("graph", graphID, graphErr)
+				continue
+			}
+			// A graph row means the identity was recreated/restored. Remaining
+			// generation/ref-view rows without a graph keep the old edge pending.
+			settled = graphPresent
+		}
+		if settled {
+			l.topologyFenceRetireMu.Lock()
+			delete(l.pendingGraphFences, graphID)
+			l.topologyFenceRetireMu.Unlock()
+		}
+	}
+
+	for _, familyID := range snapshot.families {
+		_, err := l.retireFamilyMutationFence(
+			attemptCtx, familyID,
+			func(guardCtx context.Context) (bool, error) {
+				_, found, guardErr := l.catalog.GetRepositoryFamily(guardCtx, familyID)
+				return !found, guardErr
+			},
+		)
+		if err != nil {
+			l.logTopologyFenceRetirementFailure("family", familyID, err)
+			continue
+		}
+		// false means this family ID was recreated. The new row owns the
+		// reactivated gate and its eventual removal will publish another edge.
+		l.topologyFenceRetireMu.Lock()
+		delete(l.pendingFamilyFences, familyID)
+		l.topologyFenceRetireMu.Unlock()
+	}
+}
+
+func (l *CheckoutLifecycle) logTopologyFenceRetirementFailure(kind, id string, err error) {
+	if l == nil || l.logger == nil || err == nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	level := l.logger.Warn
+	if errors.Is(err, context.DeadlineExceeded) {
+		level = l.logger.Debug
+	}
+	level("checkout lifecycle: topology fence retirement remains pending",
+		zap.String("kind", kind), zap.String("id", id), zap.Error(err))
 }
 
 // sweepRetirements retries the generations whose retirement was refused when
@@ -3480,13 +3849,35 @@ type cleanupHooks struct{ l *CheckoutLifecycle }
 
 func (h cleanupHooks) CheckoutRemovalCompleted(target reconcile.CheckoutRemovalTarget) {
 	h.l.lockCheckoutTopologyPublication()
-	defer h.l.topologyPublishMu.Unlock()
 	h.l.notifyCheckoutTopologyChanged(CheckoutTopologyEvent{
 		Kind:         CheckoutTopologyForgetFinalized,
 		CheckoutID:   target.CheckoutID,
 		Incarnation:  target.Incarnation,
 		PreviousRoot: target.RootPath,
 	})
+	h.l.topologyPublishMu.Unlock()
+
+	// The reconciler invokes this edge only after its family/checkout guards
+	// unwind. Reclaim after publishing, and never while holding the global
+	// publication mutex: retirement may wait for a pre-existing lookup lease.
+	h.l.queueCheckoutFenceRetirement(target.CheckoutID, target.Incarnation)
+	h.l.sweepTopologyFenceRetirements(context.Background())
+}
+
+func (h cleanupHooks) GraphRemovalCompleted(target reconcile.GraphRemovalTarget) {
+	if h.l == nil {
+		return
+	}
+	h.l.queueGraphFenceRetirement(target.GraphID)
+	h.l.sweepTopologyFenceRetirements(context.Background())
+}
+
+func (h cleanupHooks) FamilyRemovalCompleted(target reconcile.FamilyRemovalTarget) {
+	if h.l == nil {
+		return
+	}
+	h.l.queueFamilyFenceRetirement(target.FamilyID)
+	h.l.sweepTopologyFenceRetirements(context.Background())
 }
 
 // PurgeCheckoutLayers drops what has been built for one incarnation.
@@ -3499,7 +3890,11 @@ func (h cleanupHooks) CheckoutRemovalCompleted(target reconcile.CheckoutRemovalT
 // identity and any dedicated corpus it owns.
 func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ string) error {
 	h.l.oweRoutedGenerations(ctx, checkoutID)
-	h.l.dropCoordinator(checkoutID)
+	if checkoutTopologyHeld(ctx, checkoutID) {
+		h.l.dropCoordinatorFenced(checkoutID)
+	} else {
+		h.l.dropCoordinator(checkoutID)
+	}
 	prefix := h.l.prefixForCheckout(ctx, checkoutID)
 	if prefix == "" {
 		return nil

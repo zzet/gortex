@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/reconcile"
 )
 
 func newCheckoutMutationTicketHarness(t testing.TB) (*CheckoutCoordinator, store_sqlite.CheckoutRoute) {
@@ -33,15 +34,33 @@ func newCheckoutMutationTicketHarness(t testing.TB) (*CheckoutCoordinator, store
 	coordinator := &CheckoutCoordinator{
 		checkoutID: fixture.checkoutID,
 		root:       fixture.worktree,
+		graphID:    fixture.graphID,
 		catalog:    fixture.catalog,
 		signal:     make(chan struct{}, 1),
 		done:       make(chan struct{}),
 	}
 	t.Cleanup(func() {
 		coordinator.failMutationWaiters(errors.New("test cleanup"))
-		close(coordinator.done)
+		select {
+		case <-coordinator.done:
+		default:
+			close(coordinator.done)
+		}
 	})
 	return coordinator, route
+}
+
+func checkoutMutationLifecycleHarness(
+	t testing.TB, coordinator *CheckoutCoordinator,
+) *CheckoutLifecycle {
+	t.Helper()
+	return &CheckoutLifecycle{
+		catalog: coordinator.catalog,
+		coordinators: map[string]*CheckoutCoordinator{
+			coordinator.checkoutID: coordinator,
+		},
+		mutationFences: newCheckoutMutationFences(),
+	}
 }
 
 func publishCheckoutMutationRoute(
@@ -98,10 +117,7 @@ func TestCheckoutMutationTicketPublishesSelectedRoute(t *testing.T) {
 
 func TestCheckoutMutationReadyRequiresLiveReadyRoute(t *testing.T) {
 	coordinator, route := newCheckoutMutationTicketHarness(t)
-	lifecycle := &CheckoutLifecycle{
-		catalog:      coordinator.catalog,
-		coordinators: map[string]*CheckoutCoordinator{coordinator.checkoutID: coordinator},
-	}
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
 	if !lifecycle.CheckoutMutationReady(coordinator.checkoutID, coordinator.root) {
 		t.Fatal("live coordinator with a ready exact route was not mutation-ready")
 	}
@@ -123,6 +139,457 @@ func TestCheckoutMutationReadyRequiresLiveReadyRoute(t *testing.T) {
 	if lifecycle.CheckoutMutationReady(coordinator.checkoutID, coordinator.root) {
 		t.Fatal("pending checkout route was admitted for a disk mutation")
 	}
+}
+
+func TestCheckoutMutationTokenDrainsBeforeTopology(t *testing.T) {
+	coordinator, _ := newCheckoutMutationTicketHarness(t)
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	token, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("acquire mutation token: %v", err)
+	}
+
+	attempted := make(chan struct{})
+	acquired := make(chan *CheckoutTopologyToken, 1)
+	go func() {
+		close(attempted)
+		topology, acquireErr := lifecycle.AcquireCheckoutTopology(
+			context.Background(), coordinator.checkoutID,
+		)
+		if acquireErr != nil {
+			acquired <- nil
+			return
+		}
+		acquired <- topology
+	}()
+	<-attempted
+	select {
+	case topology := <-acquired:
+		if topology != nil {
+			topology.Release()
+		}
+		t.Fatal("topology advanced while an unused mutation token was held")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	token.Release()
+	token.Release()
+	select {
+	case topology := <-acquired:
+		if topology == nil {
+			t.Fatal("topology acquisition failed after mutation token release")
+		}
+		topology.Release()
+	case <-time.After(time.Second):
+		t.Fatal("topology did not resume after mutation token release")
+	}
+}
+
+func TestCheckoutMutationTokenTransfersUntilPublication(t *testing.T) {
+	coordinator, route := newCheckoutMutationTicketHarness(t)
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	token, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("acquire mutation token: %v", err)
+	}
+	ticket, err := lifecycle.EnqueueCheckoutMutation(
+		context.Background(), token, filepath.Join(coordinator.root, "transferred.go"),
+	)
+	if err != nil {
+		t.Fatalf("transfer mutation token: %v", err)
+	}
+	// Request cleanup after admission must not release the transferred lease.
+	token.Release()
+
+	attempted := make(chan struct{})
+	acquired := make(chan *CheckoutTopologyToken, 1)
+	go func() {
+		close(attempted)
+		topology, _ := lifecycle.AcquireCheckoutTopology(context.Background(), coordinator.checkoutID)
+		acquired <- topology
+	}()
+	<-attempted
+	select {
+	case topology := <-acquired:
+		if topology != nil {
+			topology.Release()
+		}
+		t.Fatal("topology advanced before mutation publication terminated")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	claim := coordinator.mutationClaim()
+	publishCheckoutMutationRoute(t, coordinator, &route)
+	coordinator.completeMutationClaim(context.Background(), claim, CheckoutCycle{
+		CommitGenerationID: route.CommitGenerationID,
+		DirtyGenerationID:  route.DirtyGenerationID,
+	})
+	if result := awaitCheckoutMutationResult(t, ticket); result.Err != nil || !result.Reindexed {
+		t.Fatalf("transferred mutation did not publish: %+v", result)
+	}
+	select {
+	case topology := <-acquired:
+		if topology == nil {
+			t.Fatal("topology acquisition failed after publication")
+		}
+		topology.Release()
+	case <-time.After(time.Second):
+		t.Fatal("topology did not resume after publication")
+	}
+}
+
+func TestCheckoutLifecycleCloseTerminatesTransferredMutationAndReleasesTopology(t *testing.T) {
+	coordinator, _ := newCheckoutMutationTicketHarness(t)
+	coordinator.stop = make(chan struct{})
+	go func() {
+		<-coordinator.stop
+		select {
+		case <-coordinator.done:
+		default:
+			close(coordinator.done)
+		}
+	}()
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	token, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("acquire mutation token: %v", err)
+	}
+	ticket, err := lifecycle.EnqueueCheckoutMutation(
+		context.Background(), token, filepath.Join(coordinator.root, "never-published.go"),
+	)
+	if err != nil {
+		t.Fatalf("transfer mutation token: %v", err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- lifecycle.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close lifecycle with transferred ticket: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle close waited for a publication cycle that can never run")
+	}
+
+	result := awaitCheckoutMutationResult(t, ticket)
+	if result.Err == nil || result.Reindexed {
+		t.Fatalf("shutdown did not terminate the unpublished ticket: %+v", result)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	topology, err := lifecycle.AcquireCheckoutTopology(ctx, coordinator.checkoutID)
+	if err != nil {
+		t.Fatalf("shutdown leaked the transferred mutation topology lease: %v", err)
+	}
+	topology.Release()
+}
+
+func TestCheckoutLifecycleCloseUnblocksFamilyRetryWaitingOnTransferredMutation(t *testing.T) {
+	coordinator, _ := newCheckoutMutationTicketHarness(t)
+	coordinator.stop = make(chan struct{})
+	go func() {
+		<-coordinator.stop
+		select {
+		case <-coordinator.done:
+		default:
+			close(coordinator.done)
+		}
+	}()
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	token, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("acquire mutation token: %v", err)
+	}
+	ticket, err := lifecycle.EnqueueCheckoutMutation(
+		context.Background(), token, filepath.Join(coordinator.root, "retry-blocked.go"),
+	)
+	if err != nil {
+		t.Fatalf("transfer mutation token: %v", err)
+	}
+
+	const (
+		familyID = "family-retry-blocked"
+		deadline = int64(17)
+	)
+	lifecycle.familyRetries = map[string]familyRetry{
+		familyID: {deadline: deadline},
+	}
+	retryEntered := make(chan struct{})
+	retryDrained := make(chan struct{})
+	lifecycle.familyRetryExecute = func(ctx context.Context, _ string) (reconcile.FamilyReport, error) {
+		close(retryEntered)
+		topology, acquireErr := lifecycle.AcquireCheckoutTopology(ctx, coordinator.checkoutID)
+		if acquireErr != nil {
+			return reconcile.FamilyReport{}, acquireErr
+		}
+		topology.Release()
+		close(retryDrained)
+		return reconcile.FamilyReport{}, nil
+	}
+	go lifecycle.runFamilyRetry(familyID, deadline)
+	select {
+	case <-retryEntered:
+	case <-time.After(time.Second):
+		t.Fatal("family retry did not enter topology convergence")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- lifecycle.Close() }()
+	result := awaitCheckoutMutationResult(t, ticket)
+	if result.Err == nil || result.Reindexed {
+		t.Fatalf("shutdown did not terminate the retry-blocking ticket: %+v", result)
+	}
+	select {
+	case <-retryDrained:
+	case <-time.After(time.Second):
+		t.Fatal("family retry remained blocked behind the terminated mutation")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close lifecycle with blocked family retry: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle close waited for a retry whose token only close could release")
+	}
+}
+
+func TestCheckoutLifecycleCloseDrainsCheckoutGatesIndividually(t *testing.T) {
+	lifecycle := &CheckoutLifecycle{
+		coordinators:     map[string]*CheckoutCoordinator{"checkout-a": nil, "checkout-b": nil},
+		coordinatorHeads: map[string]checkoutHeadIdentity{},
+		started:          map[string][]*CheckoutCoordinator{},
+		familyRetries:    map[string]familyRetry{},
+		watcherRetries:   map[string]*watcherRetry{},
+		mutationFences:   newCheckoutMutationFences(),
+	}
+	outerB, err := lifecycle.AcquireCheckoutTopology(context.Background(), "checkout-b")
+	if err != nil {
+		t.Fatalf("hold outer checkout B: %v", err)
+	}
+	var releaseOuterB sync.Once
+	releaseB := func() { releaseOuterB.Do(outerB.Release) }
+	defer releaseB()
+
+	aDrained := make(chan struct{})
+	continueClose := make(chan struct{})
+	lifecycle.checkoutCloseDrainBarrier = func(checkoutID string) {
+		if checkoutID == "checkout-a" {
+			close(aDrained)
+			<-continueClose
+		}
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- lifecycle.Close() }()
+	select {
+	case <-aDrained:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain checkout A before waiting on checkout B")
+	}
+
+	nestedDone := make(chan error, 1)
+	go func() {
+		nestedA, acquireErr := lifecycle.AcquireCheckoutTopology(context.Background(), "checkout-a")
+		if acquireErr == nil {
+			nestedA.Release()
+			releaseB()
+		}
+		nestedDone <- acquireErr
+	}()
+	close(continueClose)
+	select {
+	case err := <-nestedDone:
+		if err != nil {
+			t.Fatalf("nested topology could not acquire released checkout A: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close retained checkout A while waiting for checkout B")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close after nested topology release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not resume after checkout B was released")
+	}
+}
+
+func TestCheckoutTopologyHasNoCrossCheckoutHeadOfLineBlocking(t *testing.T) {
+	coordinator, _ := newCheckoutMutationTicketHarness(t)
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	token, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("acquire checkout A mutation token: %v", err)
+	}
+	defer token.Release()
+
+	aWaiting := make(chan struct{})
+	aDone := make(chan *CheckoutTopologyToken, 1)
+	go func() {
+		close(aWaiting)
+		topology, _ := lifecycle.AcquireCheckoutTopology(context.Background(), coordinator.checkoutID)
+		aDone <- topology
+	}()
+	<-aWaiting
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	bTopology, err := lifecycle.AcquireCheckoutTopology(ctx, "unrelated-checkout-b")
+	if err != nil {
+		t.Fatalf("unrelated checkout B was blocked behind checkout A: %v", err)
+	}
+	bTopology.Release()
+	select {
+	case topology := <-aDone:
+		if topology != nil {
+			topology.Release()
+		}
+		t.Fatal("checkout A topology unexpectedly acquired while its mutation was held")
+	default:
+	}
+
+	token.Release()
+	select {
+	case topology := <-aDone:
+		if topology != nil {
+			topology.Release()
+		}
+	case <-time.After(time.Second):
+		t.Fatal("checkout A topology did not resume")
+	}
+}
+
+func TestCheckoutFamilyTopologySerializesOnlyItsOwnFamily(t *testing.T) {
+	coordinator, _ := newCheckoutMutationTicketHarness(t)
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	checkout, found, err := coordinator.catalog.GetCheckout(
+		context.Background(), coordinator.checkoutID,
+	)
+	if err != nil || !found {
+		t.Fatalf("read mutation checkout family: found=%v err=%v", found, err)
+	}
+	familyB := checkout.FamilyID
+	familyA := familyB + "-independent"
+
+	heldA, err := lifecycle.AcquireCheckoutFamilyTopology(context.Background(), familyA)
+	if err != nil {
+		t.Fatalf("acquire family A topology: %v", err)
+	}
+	defer heldA.Release()
+
+	mutationB, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("family A topology blocked family B mutation: %v", err)
+	}
+	mutationB.Release()
+	topologyB, err := lifecycle.AcquireCheckoutFamilyTopology(context.Background(), familyB)
+	if err != nil {
+		t.Fatalf("family A topology blocked family B topology: %v", err)
+	}
+	topologyB.Release()
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelBlocked()
+	if topology, err := lifecycle.AcquireCheckoutFamilyTopology(blockedCtx, familyA); !errors.Is(err, context.DeadlineExceeded) {
+		if topology != nil {
+			topology.Release()
+		}
+		t.Fatalf("same-family topology was not serialized: %v", err)
+	}
+
+	heldA.Release()
+	resumedCtx, cancelResumed := context.WithTimeout(context.Background(), time.Second)
+	defer cancelResumed()
+	resumed, err := lifecycle.AcquireCheckoutFamilyTopology(resumedCtx, familyA)
+	if err != nil {
+		t.Fatalf("same-family topology did not resume after release: %v", err)
+	}
+	resumed.Release()
+}
+
+func TestCheckoutGraphTopologyDrainsOnlyItsBaseGraph(t *testing.T) {
+	coordinator, _ := newCheckoutMutationTicketHarness(t)
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	token, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("acquire graph-bound mutation token: %v", err)
+	}
+
+	sameGraph := make(chan *CheckoutGraphTopologyToken, 1)
+	go func() {
+		topology, _ := lifecycle.AcquireCheckoutGraphTopology(context.Background(), coordinator.graphID)
+		sameGraph <- topology
+	}()
+	select {
+	case topology := <-sameGraph:
+		if topology != nil {
+			topology.Release()
+		}
+		t.Fatal("base graph topology advanced while a composed mutation was held")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	unrelated, err := lifecycle.AcquireCheckoutGraphTopology(ctx, "unrelated-graph")
+	if err != nil {
+		t.Fatalf("unrelated graph topology was blocked: %v", err)
+	}
+	unrelated.Release()
+
+	token.Release()
+	select {
+	case topology := <-sameGraph:
+		if topology == nil {
+			t.Fatal("same-graph topology acquisition failed after release")
+		}
+		topology.Release()
+	case <-time.After(time.Second):
+		t.Fatal("same-graph topology did not resume")
+	}
+}
+
+func TestCheckoutMutationAdmissionFailureReleasesTransferredToken(t *testing.T) {
+	coordinator, _ := newCheckoutMutationTicketHarness(t)
+	lifecycle := checkoutMutationLifecycleHarness(t, coordinator)
+	token, err := lifecycle.AcquireCheckoutMutation(
+		context.Background(), coordinator.checkoutID, coordinator.root,
+	)
+	if err != nil {
+		t.Fatalf("acquire mutation token: %v", err)
+	}
+	coordinator.mutationMu.Lock()
+	coordinator.mutationClosed = true
+	coordinator.mutationMu.Unlock()
+	if _, err := lifecycle.EnqueueCheckoutMutation(
+		context.Background(), token, filepath.Join(coordinator.root, "closed.go"),
+	); err == nil {
+		t.Fatal("closed coordinator admitted a transferred mutation token")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	topology, err := lifecycle.AcquireCheckoutTopology(ctx, coordinator.checkoutID)
+	if err != nil {
+		t.Fatalf("failed admission leaked mutation token: %v", err)
+	}
+	topology.Release()
 }
 
 func TestCheckoutMutationTicketDoesNotLetOlderCycleCoverLaterEdit(t *testing.T) {
@@ -286,10 +753,7 @@ func BenchmarkCheckoutMutationTicketAdmissionPublication(b *testing.B) {
 
 func BenchmarkCheckoutMutationReady(b *testing.B) {
 	coordinator, _ := newCheckoutMutationTicketHarness(b)
-	lifecycle := &CheckoutLifecycle{
-		catalog:      coordinator.catalog,
-		coordinators: map[string]*CheckoutCoordinator{coordinator.checkoutID: coordinator},
-	}
+	lifecycle := checkoutMutationLifecycleHarness(b, coordinator)
 
 	b.Run("coordinator_only_baseline", func(b *testing.B) {
 		b.ReportAllocs()
@@ -308,6 +772,28 @@ func BenchmarkCheckoutMutationReady(b *testing.B) {
 			if !lifecycle.CheckoutMutationReady(coordinator.checkoutID, coordinator.root) {
 				b.Fatal("ready checkout was refused")
 			}
+		}
+	})
+	b.Run("topology_token_acquire_release", func(b *testing.B) {
+		ctx := context.Background()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			token, err := lifecycle.AcquireCheckoutMutation(ctx, coordinator.checkoutID, coordinator.root)
+			if err != nil {
+				b.Fatal(err)
+			}
+			token.Release()
+		}
+	})
+	b.Run("family_topology_acquire_release", func(b *testing.B) {
+		ctx := context.Background()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			topology, err := lifecycle.AcquireCheckoutFamilyTopology(ctx, "benchmark-family")
+			if err != nil {
+				b.Fatal(err)
+			}
+			topology.Release()
 		}
 	})
 }

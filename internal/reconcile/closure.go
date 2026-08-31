@@ -222,23 +222,33 @@ func (r *Reconciler) RetireDedicatedGraph(ctx context.Context, graphID string) e
 		}
 		return r.enterSaga(ctx, target)
 	}
-	if dedicated.IsPrimaryBase {
-		return fmt.Errorf("%w: graph %s is the primary base of family %s",
-			ErrSagaTarget, graphID, dedicated.FamilyID)
-	}
-	if dedicated.OwnerCheckoutID == "" {
-		return fmt.Errorf("%w: graph %s has no checkout owner", ErrSagaTarget, graphID)
-	}
-	checkout, present, err := r.catalog.GetCheckout(ctx, dedicated.OwnerCheckoutID)
-	if err != nil {
-		return err
-	}
-	if !present || checkout.Incarnation == "" || checkout.FamilyID != dedicated.FamilyID {
-		return fmt.Errorf("%w: graph %s has no verifiable checkout incarnation",
-			ErrSagaTarget, graphID)
-	}
-	target.FamilyID = dedicated.FamilyID
-	target.CheckoutID = checkout.CheckoutID
-	target.Incarnation = checkout.Incarnation
-	return r.enterSaga(ctx, target)
+	return r.withFamilyTopology(ctx, []string{dedicated.FamilyID}, func(guarded context.Context) error {
+		current, present, readErr := r.catalog.GetDedicatedGraph(guarded, graphID)
+		if readErr != nil {
+			return readErr
+		}
+		if !present || current.FamilyID != dedicated.FamilyID {
+			return fmt.Errorf("%w: graph %s moved before retirement",
+				store_sqlite.ErrCatalogStaleGuard, graphID)
+		}
+		if current.IsPrimaryBase {
+			return fmt.Errorf("%w: graph %s is the primary base of family %s",
+				ErrSagaTarget, graphID, current.FamilyID)
+		}
+		if current.OwnerCheckoutID == "" {
+			return fmt.Errorf("%w: graph %s has no checkout owner", ErrSagaTarget, graphID)
+		}
+		checkout, present, readErr := r.catalog.GetCheckout(guarded, current.OwnerCheckoutID)
+		if readErr != nil {
+			return readErr
+		}
+		if !present || checkout.Incarnation == "" || checkout.FamilyID != current.FamilyID {
+			return fmt.Errorf("%w: graph %s has no verifiable checkout incarnation",
+				ErrSagaTarget, graphID)
+		}
+		target.FamilyID = current.FamilyID
+		target.CheckoutID = checkout.CheckoutID
+		target.Incarnation = checkout.Incarnation
+		return r.enterSaga(guarded, target)
+	})
 }

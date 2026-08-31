@@ -32,23 +32,29 @@ func (l *CheckoutLifecycle) applyReconcileReport(
 	// replaces that timer with the nearer repair deadline instead of having a
 	// deadline-free report accidentally cancel the repair.
 	l.scheduleFamilyRetry(report)
-	// Keep coordinator admission inside the same component cut as root
-	// convergence. A report from another family must not reinstall a watcher
-	// while a collision-connected swap is quiesced.
+	// Root-move publication has one global ordering cut, but ordinary
+	// coordinator convergence must not wait for a checkout mutation while it
+	// owns that global cut. Each coordinator decision takes its own family and
+	// checkout fence below after re-reading the catalog; a collision-connected
+	// move therefore excludes only its participants.
 	l.lockCheckoutTopologyPublication()
-	defer l.topologyPublishMu.Unlock()
 	l.moveMu.Lock()
 	topologyEvents, moveErr := l.convergeCheckoutRootsLocked(ctx, report)
 	blocked, blockedErr := l.unresolvedCheckoutRootMoveIDs(ctx)
 	if blockedErr != nil {
 		moveErr = errors.Join(moveErr, fmt.Errorf(
 			"resolve checkout move admission fence: %w", blockedErr))
-	} else {
-		l.applyCoordinators(ctx, checkoutMoveAdmissionReport(report, blocked))
 	}
 	l.moveMu.Unlock()
 	for _, event := range topologyEvents {
 		l.notifyCheckoutTopologyChanged(event)
+	}
+	l.topologyPublishMu.Unlock()
+	if blockedErr == nil {
+		if l.coordinatorApplyBarrier != nil {
+			l.coordinatorApplyBarrier()
+		}
+		l.applyCoordinators(ctx, checkoutMoveAdmissionReport(report, blocked))
 	}
 	if moveErr != nil {
 		l.scheduleFamilyRetryAt(report.FamilyID, l.now().Add(checkoutMoveRetryDelay).Unix())
@@ -315,6 +321,22 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 			return false, nil, participant.discoveryErr
 		}
 	}
+	familyIDs := make([]string, 0, len(component))
+	checkoutIDs := make([]string, 0, len(component))
+	for _, participant := range component {
+		familyIDs = append(familyIDs, participant.checkout.FamilyID)
+		checkoutIDs = append(checkoutIDs, participant.checkout.CheckoutID)
+	}
+	familyTopology, err := l.AcquireCheckoutFamilyTopology(ctx, familyIDs...)
+	if err != nil {
+		return false, nil, err
+	}
+	defer familyTopology.Release()
+	topology, err := l.AcquireCheckoutTopology(ctx, checkoutIDs...)
+	if err != nil {
+		return false, nil, err
+	}
+	defer topology.Release()
 	if err := l.validateCheckoutRootMoveComponentOccupants(ctx, component); err != nil {
 		return false, nil, err
 	}
@@ -341,7 +363,7 @@ func (l *CheckoutLifecycle) convergeCheckoutRootMoveComponent(
 	}
 	for _, participant := range component {
 		l.dropCheckoutSourceSignalWatcher(participant.checkout.CheckoutID)
-		l.dropCoordinator(participant.checkout.CheckoutID)
+		l.dropCoordinatorFenced(participant.checkout.CheckoutID)
 	}
 	l.observeCheckoutMoveComponentPhase("quiesced", component)
 	if err := l.validateCheckoutRootMoveComponentOccupants(ctx, component); err != nil {
@@ -699,213 +721,6 @@ func (l *CheckoutLifecycle) scheduleCheckoutMoveComponentRetries(
 	for familyID := range families {
 		l.scheduleFamilyRetryAt(familyID, deadline)
 	}
-}
-
-func (l *CheckoutLifecycle) convergeCheckoutRootsLegacy(
-	ctx context.Context,
-	report reconcile.FamilyReport,
-) error {
-	if l == nil || l.catalog == nil {
-		return nil
-	}
-	l.lockCheckoutTopologyPublication()
-	defer l.topologyPublishMu.Unlock()
-	var (
-		failures       []error
-		changed        bool
-		dedicatedMoves []dedicatedCheckoutMove
-		topologyEvents []CheckoutTopologyEvent
-	)
-	for _, observed := range report.Checkouts {
-		if !observed.Durable || observed.CheckoutID == "" ||
-			observed.State != store_sqlite.CheckoutStateReady {
-			continue
-		}
-		checkout, found, err := l.catalog.GetCheckout(ctx, observed.CheckoutID)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("checkout %s: %w", observed.CheckoutID, err))
-			continue
-		}
-		if !found || checkout.State != store_sqlite.CheckoutStateReady {
-			continue
-		}
-		move, pending, err := l.catalog.GetCheckoutRootMove(ctx, checkout.CheckoutID)
-		if err != nil {
-			failures = append(failures, fmt.Errorf(
-				"checkout %s move journal: %w", checkout.CheckoutID, err))
-			continue
-		}
-		if !pending {
-			// Every physical move publishes a journal in the same transaction as
-			// its root CAS. A report alone is not durable recovery authority.
-			continue
-		}
-		if move.Incarnation != checkout.Incarnation ||
-			!coordinatorRootEqual(move.CurrentRootPath, checkout.RootPath) {
-			failures = append(failures, fmt.Errorf(
-				"%w: checkout %s move journal no longer names current root",
-				store_sqlite.ErrCatalogStaleGuard, checkout.CheckoutID))
-			continue
-		}
-		if checkout.ActiveIntentTransitionID != "" {
-			// A demotion/forget transition owns both graph retirement and durable
-			// config removal. Active intents may already be revoked at this cut, so
-			// move repair must not infer "no sources" and clear the journal ahead of
-			// that transaction.
-			failures = append(failures, fmt.Errorf(
-				"checkout %s move deferred behind intent transition %s",
-				checkout.CheckoutID, checkout.ActiveIntentTransitionID))
-			continue
-		}
-
-		switch checkout.EffectiveMode {
-		case store_sqlite.CheckoutModeAutomatic:
-			rebound, err := l.rebindCheckoutCoordinatorRoot(
-				ctx, report.PrimaryGraphID, checkout, true,
-			)
-			changed = changed || rebound
-			if err != nil {
-				failures = append(failures, fmt.Errorf("automatic checkout %s: %w", checkout.CheckoutID, err))
-				continue
-			}
-			locatorsMoved, err := l.catalog.RelocateActiveTrackingIntentLocators(
-				ctx, checkout.CheckoutID, checkout.Incarnation, checkout.RootPath,
-			)
-			changed = changed || locatorsMoved != 0
-			if err != nil {
-				failures = append(failures, fmt.Errorf(
-					"automatic checkout %s intent locators: %w", checkout.CheckoutID, err))
-				continue
-			}
-		case store_sqlite.CheckoutModeDedicated:
-			dedicated, rebound, err := l.convergeDedicatedCheckoutRuntime(
-				ctx, observed, checkout, move,
-			)
-			changed = changed || rebound
-			if err != nil {
-				failures = append(failures, fmt.Errorf("dedicated checkout %s: %w", checkout.CheckoutID, err))
-				continue
-			}
-			dedicatedMoves = append(dedicatedMoves, dedicated)
-			continue
-		default:
-			failures = append(failures, fmt.Errorf(
-				"checkout %s has unsupported move mode %q",
-				checkout.CheckoutID, checkout.EffectiveMode))
-			continue
-		}
-		event, completeErr := l.completeCheckoutRootMove(ctx, move)
-		if completeErr != nil {
-			failures = append(failures, fmt.Errorf(
-				"checkout %s complete move: %w", checkout.CheckoutID, completeErr))
-		} else {
-			topologyEvents = append(topologyEvents, event)
-		}
-	}
-	if len(dedicatedMoves) != 0 {
-		var expandChanged bool
-		var expandErr error
-		dedicatedMoves, expandChanged, expandErr =
-			l.convergeAllPendingDedicatedMoveRuntime(ctx, dedicatedMoves)
-		changed = changed || expandChanged
-		if expandErr != nil {
-			// Expansion failures are component-local. Healthy, disjoint move
-			// components still converge in this pass.
-			failures = append(failures, expandErr)
-		}
-	}
-	if len(dedicatedMoves) != 0 {
-		successful, configChanged, configErr :=
-			l.convergeDedicatedMoveConfigComponents(ctx, dedicatedMoves)
-		changed = changed || configChanged
-		if configErr != nil {
-			failures = append(failures, configErr)
-		}
-		for i := range successful {
-			dedicated := &successful[i]
-			locatorsMoved, locatorErr := l.catalog.RelocateActiveTrackingIntentLocators(
-				ctx, dedicated.checkout.CheckoutID,
-				dedicated.checkout.Incarnation, dedicated.checkout.RootPath,
-			)
-			changed = changed || locatorsMoved != 0
-			if locatorErr != nil {
-				failures = append(failures, fmt.Errorf(
-					"dedicated checkout %s intent locators: %w",
-					dedicated.checkout.CheckoutID, locatorErr))
-				continue
-			}
-			event, completeErr := l.completeCheckoutRootMove(ctx, dedicated.move)
-			if completeErr != nil {
-				failures = append(failures, fmt.Errorf(
-					"checkout %s complete move: %w",
-					dedicated.checkout.CheckoutID, completeErr))
-			} else {
-				topologyEvents = append(topologyEvents, event)
-			}
-		}
-	}
-	for _, event := range topologyEvents {
-		l.notifyCheckoutTopologyChanged(event)
-	}
-	if changed {
-		l.notifyTrackedSetChanged()
-	}
-	return errors.Join(failures...)
-}
-
-// convergeAllPendingDedicatedMoveRuntime widens a report-local trigger to all
-// pending dedicated moves, but it does not make them one transaction. Runtime
-// failures stay attached to their own collision component; healthy disjoint
-// components can still converge in the same pass.
-func (l *CheckoutLifecycle) convergeAllPendingDedicatedMoveRuntime(
-	ctx context.Context,
-	_ []dedicatedCheckoutMove,
-) ([]dedicatedCheckoutMove, bool, error) {
-	pending, blocked, resolveErr := l.resolvePendingPreparedMoveConfigs(ctx)
-	if pending == nil && resolveErr != nil {
-		return nil, false, resolveErr
-	}
-	changed := false
-	failures := []error{resolveErr}
-	ready := make([]dedicatedCheckoutMove, 0, len(pending))
-	for _, move := range pending {
-		if _, failed := blocked[move.CheckoutID]; failed {
-			continue
-		}
-		checkout, found, readErr := l.catalog.GetCheckout(ctx, move.CheckoutID)
-		if readErr != nil {
-			failures = append(failures, readErr)
-			continue
-		}
-		if !found || checkout.State != store_sqlite.CheckoutStateReady ||
-			checkout.EffectiveMode != store_sqlite.CheckoutModeDedicated {
-			continue
-		}
-		if checkout.ActiveIntentTransitionID != "" {
-			failures = append(failures, fmt.Errorf(
-				"checkout %s move deferred behind intent transition %s",
-				checkout.CheckoutID, checkout.ActiveIntentTransitionID))
-			continue
-		}
-		if checkout.Incarnation != move.Incarnation ||
-			!coordinatorRootEqual(checkout.RootPath, move.CurrentRootPath) {
-			failures = append(failures, fmt.Errorf(
-				"%w: checkout %s pending move identity changed",
-				store_sqlite.ErrCatalogStaleGuard, checkout.CheckoutID))
-			continue
-		}
-		state, rebound, convergeErr := l.convergeDedicatedCheckoutRuntime(
-			ctx, checkoutMoveReport(checkout, move), checkout, move,
-		)
-		changed = changed || rebound
-		if convergeErr != nil {
-			failures = append(failures, fmt.Errorf(
-				"dedicated checkout %s: %w", checkout.CheckoutID, convergeErr))
-			continue
-		}
-		ready = append(ready, state)
-	}
-	return ready, changed, errors.Join(failures...)
 }
 
 // resolvePendingPreparedMoveConfigs collapses every durable cross-store cut
@@ -1293,86 +1108,6 @@ type dedicatedCheckoutMove struct {
 	prefix        string
 	previousRoots []string
 	sources       config.RepoRelocationSources
-}
-
-func (l *CheckoutLifecycle) convergeDedicatedCheckoutRuntime(
-	ctx context.Context,
-	observed reconcile.CheckoutReport,
-	checkout store_sqlite.Checkout,
-	move store_sqlite.CheckoutRootMove,
-) (dedicatedCheckoutMove, bool, error) {
-	state := dedicatedCheckoutMove{observed: observed, checkout: checkout, move: move}
-	prefix := l.prefixForCheckout(ctx, checkout.CheckoutID)
-	if prefix == "" {
-		return state, false, fmt.Errorf("no dedicated prefix is bound")
-	}
-	state.prefix = prefix
-
-	previousRoots, sources, repairNeeded, err := l.dedicatedRootRepairState(
-		ctx, observed, checkout, move, prefix,
-	)
-	if err != nil {
-		return state, false, err
-	}
-	state.previousRoots = previousRoots
-	state.sources = sources
-	if !sources.TopLevel && len(sources.Projects) == 0 {
-		return state, false, fmt.Errorf(
-			"%w: checkout %s has no durable config source",
-			config.ErrRepoRelocationSourceMissing, checkout.CheckoutID,
-		)
-	}
-	changed := false
-	if repairNeeded {
-		meta := l.mi.GetMetadata(prefix)
-		if meta != nil && !coordinatorRootEqual(meta.RootPath, checkout.RootPath) {
-			if err := l.removeTrackedWatcherForMove(ctx, prefix); err != nil {
-				return state, changed, err
-			}
-		}
-		rebound, rebindErr := l.mi.RebindRouteOwnedRepoRoot(
-			ctx, checkout.CheckoutID, prefix, checkout.RootPath,
-		)
-		changed = changed || rebound
-		if rebindErr != nil {
-			return state, changed, rebindErr
-		}
-		coordinatorRebound, coordinatorErr := l.rebindCheckoutCoordinatorRoot(
-			ctx, GraphIDFor(prefix), checkout, true,
-		)
-		changed = changed || coordinatorRebound
-		if coordinatorErr != nil {
-			return state, changed, coordinatorErr
-		}
-		// Ensure runs after metadata changed, so both the file watcher and Git
-		// topology watcher are constructed against the new root.
-		if err := l.ensureTrackedWatcherOnce(ctx, prefix); err != nil {
-			return state, changed, err
-		}
-	}
-	return state, changed, nil
-}
-
-func (l *CheckoutLifecycle) convergeDedicatedMoveConfigComponents(
-	ctx context.Context,
-	moves []dedicatedCheckoutMove,
-) ([]dedicatedCheckoutMove, bool, error) {
-	components := partitionDedicatedMoveComponents(moves)
-	successful := make([]dedicatedCheckoutMove, 0, len(moves))
-	changed := false
-	var failures []error
-	for _, component := range components {
-		componentChanged, err := l.convergeDedicatedMoveConfigBatch(ctx, component)
-		changed = changed || componentChanged
-		if err != nil {
-			failures = append(failures, fmt.Errorf(
-				"checkout move component %s: %w",
-				component[0].checkout.CheckoutID, err))
-			continue
-		}
-		successful = append(successful, component...)
-	}
-	return successful, changed, errors.Join(failures...)
 }
 
 // partitionDedicatedMoveComponents returns the smallest atomic config groups.

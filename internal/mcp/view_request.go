@@ -67,6 +67,10 @@ type requestView struct {
 	// which operations were answered by the base without pretending that the
 	// nil base reader is a composed checkout route.
 	baseFallback bool
+	// mutationToken is the checkout-topology lease acquired before a routed
+	// source writer reaches its leaf handler. A successful publication-ticket
+	// admission consumes it; every earlier exit releases it with the view.
+	mutationToken *indexer.CheckoutMutationToken
 
 	// mu guards the annotations the request collects while it runs. The
 	// capability evaluation writes before the handler starts, but a handler
@@ -146,6 +150,10 @@ func (v *requestView) acceptsBufferOverlay() bool {
 func (v *requestView) close() {
 	if v == nil {
 		return
+	}
+	if v.mutationToken != nil {
+		v.mutationToken.Release()
+		v.mutationToken = nil
 	}
 	v.files.close()
 	v.materialized.Close()
@@ -993,10 +1001,13 @@ func (s *Server) routedMutationLegacy(req *mcp.CallToolRequest) string {
 }
 
 // refuseRoutedViewMutation admits only a source writer whose selected checkout
-// still has a live exact publisher. Ref/tree/fallback views have no writable
-// working copy. Routed handlers outside routedCheckoutMutationTools may still
-// cache canonical paths or refresh the canonical watcher, so they fail closed
-// even when the selected checkout itself is healthy.
+// still has a live exact publisher, and pins that publisher's topology before
+// the leaf handler can touch disk. The token transfers to the publication
+// ticket after the write; every earlier return releases it with requestView.
+// Ref/tree/fallback views have no writable working copy. Routed handlers
+// outside routedCheckoutMutationTools may still cache canonical paths or
+// refresh the canonical watcher, so they fail closed even when the selected
+// checkout itself is healthy.
 func (s *Server) refuseRoutedViewMutation(ctx context.Context, req *mcp.CallToolRequest) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
 	tool := ""
@@ -1007,18 +1018,23 @@ func (s *Server) refuseRoutedViewMutation(ctx context.Context, req *mcp.CallTool
 		return nil
 	}
 	legacy := s.routedMutationLegacy(req)
-	publisherReady := view.mutableCheckout() && s.lifecycle != nil &&
-		s.lifecycle.CheckoutMutationReady(view.checkoutID, view.viewRoot)
-	if publisherReady && routedCheckoutMutationTools[legacy] {
-		return nil
-	}
 	actualView := "the selected routed view"
 	if view.rider != nil && view.rider.ActualView != "" {
 		actualView = view.rider.ActualView
 	}
 	detail := "no exact writable checkout publisher is available"
-	if publisherReady {
+	if view.mutableCheckout() && !routedCheckoutMutationTools[legacy] {
 		detail = fmt.Sprintf("%s does not yet publish mutations through the selected checkout route", legacy)
+	} else if view.mutableCheckout() && s.lifecycle != nil {
+		if view.mutationToken != nil {
+			return nil
+		}
+		token, err := s.lifecycle.AcquireCheckoutMutation(ctx, view.checkoutID, view.viewRoot)
+		if err == nil {
+			view.mutationToken = token
+			return nil
+		}
+		detail = fmt.Sprintf("the selected checkout publisher could not be pinned: %v", err)
 	}
 	return mcp.NewToolResultError(fmt.Sprintf(
 		"%s: this request reads through %s, but %s. "+

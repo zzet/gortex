@@ -155,15 +155,20 @@ func TestDaemonTeardownRunsOnceAcrossBothExitPaths(t *testing.T) {
 	// A signal and control shutdown can race before Serve returns. Whichever
 	// deferred exit observes it, every phase still runs exactly once.
 	var exits sync.WaitGroup
+	teardownErrs := make(chan error, 2)
 	for i := 0; i < 2; i++ {
 		exits.Add(1)
 		go func() {
 			defer exits.Done()
-			runTeardown()
+			teardownErrs <- runTeardown()
 		}()
 	}
 	exits.Wait()
-	runTeardown()
+	close(teardownErrs)
+	for err := range teardownErrs {
+		require.NoError(t, err)
+	}
+	require.NoError(t, runTeardown())
 
 	assert.Equal(t, int32(1), probe.watcherStops.Load(), "the watcher must be stopped exactly once")
 	assert.Equal(t, int32(1), probe.producerStops.Load(), "startup producers must be stopped exactly once")
@@ -182,7 +187,7 @@ func TestControllerShutdownDoesNotCloseStackInsideRequestHandler(t *testing.T) {
 	assert.Zero(t, probe.producerStops.Load())
 	assert.Zero(t, probe.sharedCloses.Load())
 
-	runTeardown()
+	require.NoError(t, runTeardown())
 	assert.Equal(t, int32(1), probe.sharedCloses.Load())
 }
 

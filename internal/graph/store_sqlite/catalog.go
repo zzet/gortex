@@ -931,8 +931,8 @@ SELECT intent_id, source_kind, source_locator
 SELECT intent_id, active FROM tracking_intents
  WHERE checkout_id = ? AND source_kind = ? AND source_locator = ?`,
 				checkoutID, row.kind, currentRoot).Scan(&targetID, &targetActive)
-			switch {
-			case err == nil:
+			switch err {
+			case nil:
 				// A revoked historical row at the target is not ownership. Make
 				// it the active union member before retiring the stale source so
 				// relocation can never silently drop the explicit intent.
@@ -948,7 +948,7 @@ UPDATE tracking_intents
 					`DELETE FROM tracking_intents WHERE intent_id = ?`, row.id); err != nil {
 					return err
 				}
-			case err == sql.ErrNoRows:
+			case sql.ErrNoRows:
 				if _, err := tx.ExecContext(ctx, `
 UPDATE tracking_intents SET source_locator = ? WHERE intent_id = ?`,
 					currentRoot, row.id); err != nil {
@@ -1306,6 +1306,32 @@ SELECT owner_checkout_id, repo_prefix, family_id, is_primary_base, active_genera
 	dedicated.ActiveGenerationID = activeGen.Int64
 	dedicated.IsPrimaryBase = isPrimaryBase != 0
 	return dedicated, true, nil
+}
+
+// GraphTopologyFenceInUse reports whether any durable catalog identity can
+// still admit or serve work through graphID. Mutation-fence reclamation uses
+// this as its final guard after all process-local holders have drained. Keep
+// the four checks in one SQLite snapshot: independent reads could otherwise
+// observe a graph recreation between the last negative check and gate removal.
+//
+// view_layers are intentionally excluded. They are immutable composition
+// metadata, have no graph-level mutation users, and may outlive their graph;
+// including them would retain a process-local fence forever.
+func (c *Catalog) GraphTopologyFenceInUse(ctx context.Context, graphID string) (bool, error) {
+	if err := requireCatalogID("graph", graphID); err != nil {
+		return false, err
+	}
+	var inUse int
+	err := c.store.db.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM dedicated_graphs WHERE graph_id = ?)
+    OR EXISTS(SELECT 1 FROM checkout_routes WHERE graph_id = ?)
+    OR EXISTS(SELECT 1 FROM view_generations WHERE graph_id = ?)
+    OR EXISTS(SELECT 1 FROM ref_views WHERE graph_id = ?)`,
+		graphID, graphID, graphID, graphID).Scan(&inUse)
+	if err != nil {
+		return false, err
+	}
+	return inUse != 0, nil
 }
 
 // GetDedicatedGraphByOwner returns the graph bound to one checkout owner.

@@ -99,6 +99,89 @@ func TestReconcileFamilyRejectsUnknownFamily(t *testing.T) {
 	}
 }
 
+func TestReconcileObservationWaitsAtDurableTopologyBoundary(t *testing.T) {
+	entered := make(chan struct{})
+	allow := make(chan struct{})
+	f := newFixture(t, Default(), WithCheckoutTopologyGuard(
+		func(ctx context.Context, checkoutIDs ...string) (context.Context, func(), error) {
+			if len(checkoutIDs) != 1 || checkoutIDs[0] != "checkout-move" {
+				t.Fatalf("guarded checkout ids = %v, want checkout-move", checkoutIDs)
+			}
+			close(entered)
+			<-allow
+			return ctx, func() {}, nil
+		},
+	))
+	f.seedPrimaryGraph("graph-primary")
+	f.seedCheckout("checkout-move", "inc-move", "wt", store_sqlite.CheckoutModeAutomatic)
+	movedRoot := "/repo/moved-wt"
+	f.git.setRecords(presentRecord("wt", movedRoot))
+	f.git.samples[movedRoot] = gitSampleExisting(volumeA)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.rec.ReconcileFamily(context.Background(), f.familyID, "/repo")
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not reach the post-inventory topology boundary")
+	}
+	if checkout := f.checkout("checkout-move"); checkout.RootPath != "/repo/wt" {
+		t.Fatalf("root published before topology admission: %q", checkout.RootPath)
+	}
+	close(allow)
+	if err := <-done; err != nil {
+		t.Fatalf("reconcile moved checkout: %v", err)
+	}
+	if checkout := f.checkout("checkout-move"); checkout.RootPath != movedRoot {
+		t.Fatalf("root after topology release = %q, want %q", checkout.RootPath, movedRoot)
+	}
+	evidence, found, err := f.catalog.GetCheckoutPathEvidence(context.Background(), "checkout-move")
+	if err != nil || !found || evidence.RootPathIdentity == "" {
+		t.Fatalf("path evidence was not published under the same boundary: found=%v row=%+v err=%v",
+			found, evidence, err)
+	}
+}
+
+func TestReadyConfirmationDoesNotFenceSiblingDiscovery(t *testing.T) {
+	var guarded []string
+	f := newFixture(t, Default(), WithCheckoutTopologyGuard(
+		func(ctx context.Context, checkoutIDs ...string) (context.Context, func(), error) {
+			guarded = append(guarded, checkoutIDs...)
+			return ctx, func() {}, nil
+		},
+	))
+	f.seedPrimaryGraph("graph-primary")
+	f.seedCheckout("checkout-existing", "inc-existing", "existing", store_sqlite.CheckoutModeAutomatic)
+	existing := presentRecord("existing", "/repo/existing")
+	existingRow := f.checkout("checkout-existing")
+	existingRow.HeadRef = existing.HEADRef
+	existingRow.HeadCommit = existing.HEADOID
+	if err := f.catalog.UpsertCheckout(context.Background(), existingRow); err != nil {
+		t.Fatalf("seed unchanged HEAD identity: %v", err)
+	}
+	newSibling := presentRecord("new-sibling", "/repo/new-sibling")
+	f.git.setRecords(existing, newSibling)
+	f.git.samples[existing.Path] = gitSampleExisting(volumeA)
+	f.git.samples[newSibling.Path] = gitSampleExisting(volumeA)
+
+	report, err := f.rec.ReconcileFamily(context.Background(), f.familyID, "/repo")
+	if err != nil {
+		t.Fatalf("reconcile unchanged checkout plus sibling: %v", err)
+	}
+	if sibling := f.entry(report, "new-sibling"); sibling.Action != ActionIdentityAllocated || !sibling.Durable {
+		t.Fatalf("new sibling was not discovered behind unchanged checkout: %+v", sibling)
+	}
+	if slices.Contains(guarded, "checkout-existing") {
+		t.Fatalf("unchanged checkout unexpectedly fenced: %v", guarded)
+	}
+	if sibling := f.entry(report, "new-sibling"); !slices.Contains(guarded, sibling.CheckoutID) {
+		t.Fatalf("new sibling identity was not fenced during allocation: guarded=%v sibling=%+v", guarded, sibling)
+	}
+}
+
 // TestReconcileFamilyWithoutPrimaryStaysEphemeral proves the identity gate:
 // a perfectly healthy worktree in a family that has nowhere to serve it from
 // is reported and forgotten, not written down.
@@ -460,6 +543,84 @@ func TestRemovalCancelledBySameIncarnation(t *testing.T) {
 			t.Fatalf("after the cancelled deadline = %q", entry.Action)
 		}
 		f.checkout(allocated.CheckoutID)
+	})
+}
+
+// TestExpiredRemovalLosesGuardToSameIncarnationRecovery closes the narrow
+// window between an expired removal observation and checkout-topology
+// admission. A newer observer can restore the same incarnation to READY in
+// that window; the stale pass must re-read under the guard and leave it alone.
+func TestExpiredRemovalLosesGuardToSameIncarnationRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := Config{AvailabilityGrace: time.Minute, RemovalGrace: time.Minute}
+		var (
+			f          *fixture
+			armed      bool
+			restored   bool
+			checkoutID string
+		)
+		f = newFixture(t, cfg, WithCheckoutTopologyGuard(
+			func(ctx context.Context, checkoutIDs ...string) (context.Context, func(), error) {
+				if !armed {
+					return ctx, func() {}, nil
+				}
+				if len(checkoutIDs) != 1 || checkoutIDs[0] != checkoutID {
+					return ctx, nil, fmt.Errorf("guarded checkout ids = %v, want %s", checkoutIDs, checkoutID)
+				}
+				row, present, err := f.catalog.GetCheckout(ctx, checkoutID)
+				if err != nil {
+					return ctx, nil, err
+				}
+				if !present {
+					return ctx, nil, fmt.Errorf("checkout %s disappeared before topology admission", checkoutID)
+				}
+				row.State = store_sqlite.CheckoutStateReady
+				row.RemovalDetectedAt = 0
+				row.RemovalDeadline = 0
+				row.RemovalEvidence = ""
+				row.LastSeen = time.Now().Unix()
+				row.LastAccessible = time.Now().Unix()
+				if err := f.catalog.UpsertCheckout(ctx, row); err != nil {
+					return ctx, nil, err
+				}
+				armed = false
+				restored = true
+				return ctx, func() {}, nil
+			},
+		))
+		f.seedPrimaryGraph("graph-primary")
+		f.git.setRecords(presentRecord("wt", "/repo/wt"))
+		f.git.samples["/repo/wt"] = gitSampleExisting(volumeA)
+		allocated := f.entry(f.reconcile(), "wt")
+		checkoutID = allocated.CheckoutID
+
+		f.git.setRecords()
+		if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionRemovalGraceStarted {
+			t.Fatalf("removal detection = %q", entry.Action)
+		}
+		synctest.Sleep(cfg.RemovalGrace)
+		armed = true
+
+		entry := f.entry(f.reconcile(), "wt")
+		if !restored {
+			t.Fatal("test did not restore the checkout at topology admission")
+		}
+		if entry.Action != ActionGuardLost {
+			t.Fatalf("stale expired-removal action = %q, want guard_lost", entry.Action)
+		}
+		row := f.checkout(checkoutID)
+		if row.Incarnation != allocated.Incarnation || row.State != store_sqlite.CheckoutStateReady {
+			t.Fatalf("stale removal changed the recovered checkout: %+v", row)
+		}
+		if row.RemovalDetectedAt != 0 || row.RemovalDeadline != 0 || row.RemovalEvidence != "" {
+			t.Fatalf("recovered checkout retained removal evidence: %+v", row)
+		}
+		if got := f.hooks.snapshot(); len(got) != 0 {
+			t.Fatalf("stale removal ran cleanup hooks: %v", got)
+		}
+		if entries := f.journal(); len(entries) != 0 {
+			t.Fatalf("stale removal wrote a cleanup journal: %+v", entries)
+		}
 	})
 }
 

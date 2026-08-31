@@ -4,13 +4,43 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
+
+type removalObservingHooks struct {
+	*recordingHooks
+	onRemoval       func(CheckoutRemovalTarget)
+	onGraphRemoval  func(GraphRemovalTarget)
+	onFamilyRemoval func(FamilyRemovalTarget)
+}
+
+func (h *removalObservingHooks) CheckoutRemovalCompleted(target CheckoutRemovalTarget) {
+	if h.onRemoval != nil {
+		h.onRemoval(target)
+	}
+	h.recordingHooks.CheckoutRemovalCompleted(target)
+}
+
+func (h *removalObservingHooks) GraphRemovalCompleted(target GraphRemovalTarget) {
+	if h.onGraphRemoval != nil {
+		h.onGraphRemoval(target)
+	}
+	h.recordingHooks.GraphRemovalCompleted(target)
+}
+
+func (h *removalObservingHooks) FamilyRemovalCompleted(target FamilyRemovalTarget) {
+	if h.onFamilyRemoval != nil {
+		h.onFamilyRemoval(target)
+	}
+	h.recordingHooks.FamilyRemovalCompleted(target)
+}
 
 // seedForgettableCheckout builds the widest checkout a forget saga has to take
 // apart: a route, a dedicated graph of its own with two views rooted in it, a
@@ -56,6 +86,301 @@ func TestForgetCheckoutRunsItsPhasesInOrder(t *testing.T) {
 	// The family itself is not a forget-checkout's business.
 	if !f.familyExists() {
 		t.Error("forgetting a checkout deleted its family")
+	}
+}
+
+func TestForgetCheckoutWaitsForTopologyGuardBeforeTeardown(t *testing.T) {
+	entered := make(chan struct{})
+	allow := make(chan struct{})
+	f := newFixture(t, Default(), WithCheckoutTopologyGuard(
+		func(ctx context.Context, checkoutIDs ...string) (context.Context, func(), error) {
+			if len(checkoutIDs) != 1 || checkoutIDs[0] != "co-guarded" {
+				t.Fatalf("guarded checkout ids = %v, want co-guarded", checkoutIDs)
+			}
+			close(entered)
+			<-allow
+			return ctx, func() {}, nil
+		},
+	))
+	seedForgettableCheckout(f, "co-guarded", "inc-guarded", "guarded", "graph-guarded")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.rec.ForgetCheckout(context.Background(), "co-guarded", "inc-guarded")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("forget saga did not reach topology boundary")
+	}
+	if got := f.hooks.snapshot(); len(got) != 0 {
+		t.Fatalf("cleanup ran before topology admission: %v", got)
+	}
+	if _, found, err := f.catalog.GetCheckout(context.Background(), "co-guarded"); err != nil || !found {
+		t.Fatalf("checkout disappeared before topology admission: found=%v err=%v", found, err)
+	}
+
+	close(allow)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("forget checkout after topology release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forget checkout did not resume after topology release")
+	}
+	f.assertNoCheckoutRows("co-guarded")
+}
+
+// TestForgetCheckoutPublishesRemovalAfterTopologyGuardsRelease prevents a
+// topologyPublishMu -> family -> checkout / checkout -> family ->
+// topologyPublishMu inversion. The terminal callback may converge roots, so it
+// must run only after both saga admission guards have unwound.
+func TestForgetCheckoutPublishesRemovalAfterTopologyGuardsRelease(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	seedForgettableCheckout(f, "co-guarded", "inc-guarded", "guarded", "graph-guarded")
+
+	var (
+		events                           []string
+		familyHeld, checkoutHeld         bool
+		callbackFamily, callbackCheckout bool
+	)
+	hooks := &removalObservingHooks{recordingHooks: f.hooks}
+	observe := func(label string) {
+		callbackFamily = callbackFamily || familyHeld
+		callbackCheckout = callbackCheckout || checkoutHeld
+		events = append(events, label)
+	}
+	hooks.onGraphRemoval = func(GraphRemovalTarget) { observe("graph-callback") }
+	hooks.onRemoval = func(CheckoutRemovalTarget) { observe("checkout-callback") }
+	rec, err := New(f.catalog, hooks, Default(),
+		WithFamilyTopologyGuard(func(ctx context.Context, familyIDs ...string) (context.Context, func(), error) {
+			if !slices.Equal(familyIDs, []string{f.familyID}) {
+				return ctx, nil, errors.New("family guard received the wrong family")
+			}
+			familyHeld = true
+			events = append(events, "acquire-family")
+			return ctx, func() {
+				familyHeld = false
+				events = append(events, "release-family")
+			}, nil
+		}),
+		WithCheckoutTopologyGuard(func(ctx context.Context, checkoutIDs ...string) (context.Context, func(), error) {
+			if !slices.Equal(checkoutIDs, []string{"co-guarded"}) {
+				return ctx, nil, errors.New("checkout guard received the wrong checkout")
+			}
+			checkoutHeld = true
+			events = append(events, "acquire-checkout")
+			return ctx, func() {
+				checkoutHeld = false
+				events = append(events, "release-checkout")
+			}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New guarded reconciler: %v", err)
+	}
+
+	if err := rec.ForgetCheckout(ctx, "co-guarded", "inc-guarded"); err != nil {
+		t.Fatalf("ForgetCheckout: %v", err)
+	}
+	if callbackFamily || callbackCheckout {
+		t.Fatalf("terminal callback ran while guards were held: family=%v checkout=%v",
+			callbackFamily, callbackCheckout)
+	}
+	want := []string{
+		"acquire-family", "acquire-checkout", "release-checkout", "release-family",
+		"graph-callback", "checkout-callback",
+	}
+	if !slices.Equal(events, want) {
+		t.Fatalf("topology/callback order = %v, want %v", events, want)
+	}
+}
+
+// TestRetirePrimaryClosureDefersNestedRemovalPublicationUntilOuterGuardsRelease
+// models the real root-convergence order: topology publication is acquired
+// before the family gate. A nested forget-checkout callback that attempts
+// publication while the primary-closure saga still owns the family gate would
+// deadlock the two operations. The closure must also acquire its complete
+// checkout cohort in one sorted guard call; extending an inherited guard one
+// checkout at a time has no globally safe lock order.
+func TestRetirePrimaryClosureDefersNestedRemovalPublicationUntilOuterGuardsRelease(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	seedForgettableCheckout(f, "co-primary", "inc-primary", "primary", "graph-primary")
+	f.promoteToPrimary("graph-primary")
+	f.seedCheckout("co-auto", "inc-auto", "auto", store_sqlite.CheckoutModeAutomatic)
+	f.seedRoute("co-auto", "graph-primary")
+	f.seedIntent("co-auto")
+	family, present, err := f.catalog.GetRepositoryFamily(ctx, f.familyID)
+	if err != nil || !present {
+		t.Fatalf("GetRepositoryFamily = present:%v err:%v", present, err)
+	}
+	pass := &familyPass{family: family}
+	primary := f.checkout("co-primary")
+
+	familyGate := make(chan struct{}, 1)
+	familyGate <- struct{}{}
+	publicationGate := make(chan struct{}, 1)
+	publicationGate <- struct{}{}
+	cohortAdmitted := make(chan struct{})
+	rootWaitingForFamily := make(chan struct{})
+	rootDone := make(chan struct{})
+	abort := make(chan struct{})
+	aborted := false
+	defer func() {
+		if !aborted {
+			close(abort)
+		}
+	}()
+
+	callbacks := make(chan string, 4)
+	hooks := &removalObservingHooks{recordingHooks: f.hooks}
+	publish := func(label string) {
+		// The daemon callback currently serializes root convergence through
+		// topology publication. Model that potentially blocking terminal edge
+		// so the test exercises the production lock order.
+		select {
+		case <-publicationGate:
+			publicationGate <- struct{}{}
+		case <-abort:
+		}
+		callbacks <- label
+	}
+	hooks.onRemoval = func(target CheckoutRemovalTarget) { publish("checkout:" + target.CheckoutID) }
+	hooks.onGraphRemoval = func(target GraphRemovalTarget) { publish("graph:" + target.GraphID) }
+	hooks.onFamilyRemoval = func(target FamilyRemovalTarget) { publish("family:" + target.FamilyID) }
+
+	rec, err := New(f.catalog, hooks, Default(),
+		WithFamilyTopologyGuard(func(ctx context.Context, familyIDs ...string) (context.Context, func(), error) {
+			if !slices.Equal(familyIDs, []string{f.familyID}) {
+				return ctx, nil, errors.New("family guard received the wrong family")
+			}
+			select {
+			case <-familyGate:
+			case <-ctx.Done():
+				return ctx, nil, ctx.Err()
+			}
+			return ctx, func() {
+				select {
+				case familyGate <- struct{}{}:
+				default:
+				}
+			}, nil
+		}),
+		WithCheckoutTopologyGuard(func(ctx context.Context, checkoutIDs ...string) (context.Context, func(), error) {
+			want := []string{"co-auto", "co-primary"}
+			if !slices.Equal(checkoutIDs, want) {
+				return ctx, nil, fmt.Errorf("checkout guard received %v, want complete sorted cohort %v", checkoutIDs, want)
+			}
+			select {
+			case <-cohortAdmitted:
+				return ctx, nil, errors.New("primary closure extended its checkout guard")
+			default:
+				close(cohortAdmitted)
+			}
+			select {
+			case <-rootWaitingForFamily:
+				return ctx, func() {}, nil
+			case <-ctx.Done():
+				return ctx, nil, ctx.Err()
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New guarded reconciler: %v", err)
+	}
+
+	// Simulate root convergence holding topology publication and then waiting
+	// for the family. The saga may proceed only after that inversion has been
+	// established, making an early nested callback deterministically deadlock.
+	go func() {
+		select {
+		case <-cohortAdmitted:
+		case <-abort:
+			return
+		}
+		select {
+		case <-publicationGate:
+		case <-abort:
+			return
+		}
+		close(rootWaitingForFamily)
+		select {
+		case <-familyGate:
+			familyGate <- struct{}{}
+			publicationGate <- struct{}{}
+			close(rootDone)
+		case <-abort:
+			publicationGate <- struct{}{}
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- rec.withSagaRemovalPublications(ctx, func(publicationCtx context.Context) error {
+			return rec.withFamilyTopology(publicationCtx, []string{f.familyID}, func(familyCtx context.Context) error {
+				action, gone, retireErr := rec.retireCheckout(familyCtx, pass, primary)
+				if retireErr != nil {
+					return retireErr
+				}
+				if action != ActionPrimaryClosureRetired || !gone {
+					return fmt.Errorf("retireCheckout = action:%q gone:%v", action, gone)
+				}
+				return nil
+			})
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RetirePrimaryClosure: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(abort)
+		aborted = true
+		<-done
+		t.Fatal("nested removal publication deadlocked with root convergence")
+	}
+
+	select {
+	case <-rootDone:
+	case <-time.After(time.Second):
+		t.Fatal("root convergence did not pass the released family guard")
+	}
+	gotCallbacks := make([]string, 0, len(callbacks))
+	for len(callbacks) > 0 {
+		gotCallbacks = append(gotCallbacks, <-callbacks)
+	}
+	wantCallbacks := []string{
+		"checkout:co-auto", "graph:graph-primary", "checkout:co-primary", "family:" + f.familyID,
+	}
+	if !slices.Equal(gotCallbacks, wantCallbacks) {
+		t.Fatalf("nested removal callbacks = %v, want %v", gotCallbacks, wantCallbacks)
+	}
+}
+
+func TestRetirePrimaryClosureRefusesPartialInheritedCheckoutCohort(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	seedForgettableCheckout(f, "co-primary", "inc-primary", "primary", "graph-primary")
+	epoch := f.promoteToPrimary("graph-primary")
+	f.seedCheckout("co-auto", "inc-auto", "auto", store_sqlite.CheckoutModeAutomatic)
+
+	ctx = context.WithValue(ctx, familyTopologyGuardContextKey{}, map[string]struct{}{f.familyID: {}})
+	ctx = context.WithValue(ctx, topologyGuardContextKey{}, map[string]struct{}{"co-primary": {}})
+	err := f.rec.RetirePrimaryClosure(ctx, "graph-primary", epoch)
+	if !errors.Is(err, ErrSagaTarget) || !strings.Contains(err.Error(), "partial checkout cohort") {
+		t.Fatalf("partial inherited cohort error = %v, want ErrSagaTarget", err)
+	}
+	f.checkout("co-primary")
+	f.checkout("co-auto")
+	if !f.graphExists("graph-primary") {
+		t.Fatal("refused partial-cohort closure deleted the primary graph")
+	}
+	if entries := f.journal(); len(entries) != 0 {
+		t.Fatalf("refused partial-cohort closure wrote journal entries: %+v", entries)
 	}
 }
 
@@ -380,6 +705,95 @@ func TestRetirePrimaryClosureCascadesIntoFamilyForget(t *testing.T) {
 	}
 	if entries := f.journal(); len(entries) != 0 {
 		t.Fatalf("the cascade left journal entries: %+v", entries)
+	}
+}
+
+func TestPrimaryClosurePublishesTerminalRemovalsOnceInCompletionOrder(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	seedForgettableCheckout(f, "co-primary", "inc-primary", "primary", "graph-primary")
+	epoch := f.promoteToPrimary("graph-primary")
+	f.seedCheckout("co-auto", "inc-auto", "auto", store_sqlite.CheckoutModeAutomatic)
+	f.seedRoute("co-auto", "graph-primary")
+	f.seedIntent("co-auto")
+
+	if err := f.rec.RetirePrimaryClosure(ctx, "graph-primary", epoch); err != nil {
+		t.Fatalf("RetirePrimaryClosure: %v", err)
+	}
+	wantOrder := []string{
+		"checkout-remove:co-auto:inc-auto",
+		"graph-remove:graph-primary:inc-primary",
+		"checkout-remove:co-primary:inc-primary",
+		"family-remove:" + f.familyID,
+	}
+	if got := f.hooks.terminalSnapshot(); !slices.Equal(got, wantOrder) {
+		t.Fatalf("terminal removal order = %v, want %v", got, wantOrder)
+	}
+
+	graphs := f.hooks.removedGraphTargets()
+	if len(graphs) != 1 {
+		t.Fatalf("primary graph removal events = %+v, want exactly one", graphs)
+	}
+	wantGraph := GraphRemovalTarget{
+		GraphID: "graph-primary", FamilyID: f.familyID,
+		CheckoutID: "co-primary", Incarnation: "inc-primary",
+		RepoPrefix: "prefix-graph-primary", RootPath: "/repo/primary",
+	}
+	if graphs[0] != wantGraph {
+		t.Fatalf("primary graph removal = %+v, want %+v", graphs[0], wantGraph)
+	}
+	families := f.hooks.removedFamilyTargets()
+	if !slices.Equal(families, []FamilyRemovalTarget{{FamilyID: f.familyID}}) {
+		t.Fatalf("family removal events = %+v, want one family", families)
+	}
+}
+
+func TestCompletedNestedRemovalPublicationsSurviveLaterParentFailure(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	seedForgettableCheckout(f, "co-wt", "inc-wt", "wt", "graph-wt")
+	f.seedCheckout("co-main", "inc-main", gitstate.MainAdminName, store_sqlite.CheckoutModeAutomatic)
+	f.seedIntent("co-main")
+
+	f.hooks.onPurge = func(checkoutID string) {
+		if checkoutID == "co-main" {
+			f.hooks.failPurge = 1
+		}
+	}
+	err := f.rec.ForgetFamily(ctx, f.familyID)
+	if !errors.Is(err, errHookFailed) {
+		t.Fatalf("ForgetFamily error = %v, want later nested purge failure", err)
+	}
+	wantAfterFailure := []string{
+		"graph-remove:graph-wt:inc-wt",
+		"checkout-remove:co-wt:inc-wt",
+	}
+	if got := f.hooks.terminalSnapshot(); !slices.Equal(got, wantAfterFailure) {
+		t.Fatalf("terminal removals after parent failure = %v, want %v", got, wantAfterFailure)
+	}
+	if got := f.hooks.removedFamilyTargets(); len(got) != 0 {
+		t.Fatalf("failed forget-family published family removal: %+v", got)
+	}
+
+	f.hooks.onPurge = nil
+	f.hooks.failPurge = 0
+	if err := f.rec.Resume(ctx); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	wantCompleted := []string{
+		"graph-remove:graph-wt:inc-wt",
+		"checkout-remove:co-wt:inc-wt",
+		"checkout-remove:co-main:inc-main",
+		"family-remove:" + f.familyID,
+	}
+	if got := f.hooks.terminalSnapshot(); !slices.Equal(got, wantCompleted) {
+		t.Fatalf("terminal removals after resume = %v, want %v", got, wantCompleted)
+	}
+	if got := f.hooks.removedGraphTargets(); len(got) != 1 {
+		t.Fatalf("graph removal was not exactly once across resume: %+v", got)
+	}
+	if got := f.hooks.removedFamilyTargets(); !slices.Equal(got, []FamilyRemovalTarget{{FamilyID: f.familyID}}) {
+		t.Fatalf("family completion events = %+v, want exactly one", got)
 	}
 }
 
@@ -792,6 +1206,74 @@ func TestResumeFinishesGraphReleaseAfterCatalogRowAlreadyGone(t *testing.T) {
 	}
 	if entries := f.journal(); len(entries) != 0 {
 		t.Fatalf("row-absent retry retained journal: %+v", entries)
+	}
+}
+
+func TestResumeForgetKeepsDurableGraphAddressAcrossReplacementIncarnation(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, Default())
+	f.seedCheckout("co-1", "inc-new", "replacement", store_sqlite.CheckoutModeAutomatic)
+	target := sagaTarget{
+		Kind: sagaForgetCheckout, Phase: phaseReleaseGraph,
+		GraphID: "graph-gone", FamilyID: f.familyID,
+		CheckoutID: "co-1", Incarnation: "inc-old",
+		RepoPrefix: "durable-prefix", RootPath: "/repo/old",
+	}
+	if err := f.rec.persistPhase(ctx, target.cleanupID(), target, store_sqlite.CleanupPhaseFailed); err != nil {
+		t.Fatalf("persist interrupted forget: %v", err)
+	}
+
+	// Hold the completed journal in place so its target can be inspected after
+	// every resumed phase has re-persisted it in the presence of the ABA row.
+	raw, err := sql.Open("sqlite", f.dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw catalog: %v", err)
+	}
+	defer raw.Close()
+	_, err = raw.ExecContext(ctx, `
+CREATE TRIGGER fail_resumed_forget_journal_release
+BEFORE DELETE ON cleanup_journal
+WHEN OLD.cleanup_id = 'forget-checkout:co-1:inc-old'
+BEGIN
+  SELECT RAISE(ABORT, 'injected resumed forget journal release failure');
+END`)
+	if err != nil {
+		t.Fatalf("install journal trigger: %v", err)
+	}
+
+	err = f.rec.Resume(ctx)
+	if err == nil || !strings.Contains(err.Error(), "injected resumed forget journal release failure") {
+		t.Fatalf("Resume error = %v, want injected final-delete failure", err)
+	}
+	if got := f.hooks.releasedTargets(); len(got) != 0 {
+		t.Fatalf("stale cleanup released a replacement-owned graph address: %+v", got)
+	}
+	resumed, found, err := f.rec.loadSagaTarget(ctx, target.cleanupID())
+	if err != nil || !found {
+		t.Fatalf("load retained forget target = found:%v err:%v", found, err)
+	}
+	if resumed.GraphID != target.GraphID || resumed.RepoPrefix != target.RepoPrefix ||
+		resumed.CheckoutID != target.CheckoutID || resumed.Incarnation != target.Incarnation ||
+		resumed.RootPath != target.RootPath {
+		t.Fatalf("resumed forget lost its durable address: %+v", resumed)
+	}
+	checkout, present, err := f.catalog.GetCheckout(ctx, "co-1")
+	if err != nil || !present || checkout.Incarnation != "inc-new" {
+		t.Fatalf("replacement checkout changed: %+v, present:%v err:%v", checkout, present, err)
+	}
+
+	if _, err := raw.ExecContext(ctx, `DROP TRIGGER fail_resumed_forget_journal_release`); err != nil {
+		t.Fatalf("drop journal trigger: %v", err)
+	}
+	if err := f.rec.Resume(ctx); err != nil {
+		t.Fatalf("Resume after final-delete repair: %v", err)
+	}
+	if entries := f.journal(); len(entries) != 0 {
+		t.Fatalf("successful retry retained journal: %+v", entries)
+	}
+	checkout, present, err = f.catalog.GetCheckout(ctx, "co-1")
+	if err != nil || !present || checkout.Incarnation != "inc-new" {
+		t.Fatalf("successful retry changed replacement: %+v, present:%v err:%v", checkout, present, err)
 	}
 }
 

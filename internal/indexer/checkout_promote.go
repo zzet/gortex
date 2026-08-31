@@ -449,7 +449,12 @@ func (l *CheckoutLifecycle) rollbackPromotion(
 	if err != nil {
 		return err
 	}
-	if !found || graph.OwnerCheckoutID != checkoutID {
+	if !found {
+		l.queueGraphFenceRetirement(graphID)
+		l.sweepTopologyFenceRetirements(ctx)
+		return nil
+	}
+	if graph.OwnerCheckoutID != checkoutID {
 		return nil
 	}
 	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
@@ -464,6 +469,7 @@ func (l *CheckoutLifecycle) rollbackPromotion(
 	// provisional graph before deleting its identity; otherwise it would poll a
 	// graph that can never return and warn forever.
 	l.dropCoordinatorForGraph(checkoutID, graphID)
+	l.oweRetirement(l.graphGenerations(ctx, graphID)...)
 	finalize := func(*RepoMetadata) error {
 		deleted, err := l.catalog.DeleteDedicatedGraphForIncarnation(
 			ctx, graphID, checkoutID, incarnation)
@@ -477,13 +483,20 @@ func (l *CheckoutLifecycle) rollbackPromotion(
 		return nil
 	}
 	if prefix == "" {
-		return finalize(nil)
+		if err := finalize(nil); err != nil {
+			return err
+		}
+		l.queueGraphFenceRetirement(graphID)
+		l.sweepTopologyFenceRetirements(ctx)
+		return nil
 	}
 	l.detachWatcher(prefix)
 	if _, _, err := l.mi.purgeRepoChecked(ctx, prefix, finalize); err != nil {
 		err = l.restoreGraphAfterFailedRelease(ctx, graph, checkoutID, incarnation, err)
 		return fmt.Errorf("indexer: purge rolled-back repository %q: %w", prefix, err)
 	}
+	l.queueGraphFenceRetirement(graphID)
+	l.sweepTopologyFenceRetirements(ctx)
 	return nil
 }
 

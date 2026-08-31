@@ -357,6 +357,13 @@ func (l *CheckoutLifecycle) demote(
 	}
 	var commit reconcile.DemotionCommitResult
 	var commitErr error
+	var topologyCtx context.Context
+	var releaseTopology func()
+	defer func() {
+		if releaseTopology != nil {
+			releaseTopology()
+		}
+	}()
 	_, prepareErr := coordinator.prepareRehomeTo(
 		ctx,
 		authorization.PrimaryGraphID,
@@ -367,8 +374,23 @@ func (l *CheckoutLifecycle) demote(
 			_ primaryBase,
 			commitGeneration, dirtyGeneration int64,
 		) error {
+			// The build above is off-route and needs no mutation fence. Acquire
+			// only at the publication edge, while the old dedicated coordinator
+			// is still alive to finish every previously admitted ticket, and keep
+			// the checkout exclusive through the registry replacement below.
+			if releaseTopology == nil {
+				var topologyErr error
+				topologyCtx, releaseTopology, topologyErr = l.reconcileFamilyCheckoutTopologyGuard(
+					ctx,
+					[]string{checkout.FamilyID},
+					[]string{checkout.CheckoutID},
+				)
+				if topologyErr != nil {
+					return topologyErr
+				}
+			}
 			commit, commitErr = l.rec.CommitAuthorizedDemotion(
-				ctx,
+				topologyCtx,
 				checkout,
 				authorization,
 				reconcile.DemotionPublication{
@@ -392,6 +414,10 @@ func (l *CheckoutLifecycle) demote(
 		},
 	)
 	if prepareErr != nil {
+		if releaseTopology != nil {
+			releaseTopology()
+			releaseTopology = nil
+		}
 		finishPrepared()
 		l.sweepRetirements(ctx)
 		return prepareErr
@@ -399,17 +425,25 @@ func (l *CheckoutLifecycle) demote(
 
 	replacement, err := l.buildCoordinator(ctx, authorization.PrimaryGraphID, checkout)
 	if err != nil {
+		if releaseTopology != nil {
+			releaseTopology()
+			releaseTopology = nil
+		}
 		finishPrepared()
 		l.sweepRetirements(ctx)
 		return fmt.Errorf("indexer: start demoted checkout coordinator: %w", err)
 	}
 	if replacement == nil {
+		if releaseTopology != nil {
+			releaseTopology()
+			releaseTopology = nil
+		}
 		finishPrepared()
 		l.sweepRetirements(ctx)
 		return fmt.Errorf("indexer: the primary graph %s cannot keep serving checkout %s",
 			authorization.PrimaryGraphID, checkout.CheckoutID)
 	}
-	installed := l.replaceCoordinator(
+	installed := l.replaceCoordinatorFenced(
 		checkout.CheckoutID,
 		expectedCoordinator,
 		replacement,
@@ -425,8 +459,16 @@ func (l *CheckoutLifecycle) demote(
 	demoted.DesiredMode = store_sqlite.CheckoutModeAutomatic
 	demoted.EffectiveMode = store_sqlite.CheckoutModeAutomatic
 	if installed {
+		if releaseTopology != nil {
+			releaseTopology()
+			releaseTopology = nil
+		}
 		l.ensureCheckoutSourceSignalWatcher(demoted, authorization.PrimaryGraphID)
 	} else {
+		if releaseTopology != nil {
+			releaseTopology()
+			releaseTopology = nil
+		}
 		finishPrepared()
 		l.sweepRetirements(ctx)
 		return fmt.Errorf("%w: checkout %s coordinator moved during demotion",

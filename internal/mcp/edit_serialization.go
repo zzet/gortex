@@ -279,9 +279,20 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 				Err:        fmt.Errorf("checkout %q has no route publisher", view.checkoutID),
 			}
 		}
+		if view.mutationToken == nil {
+			return mutationReindexOutcome{
+				CheckoutID: view.checkoutID,
+				Err: fmt.Errorf(
+					"checkout %q mutation reached publication without a topology token",
+					view.checkoutID,
+				),
+			}
+		}
 		// The bytes are already committed. Detach publication from the client
 		// deadline so cancellation cannot strand the selected checkout's graph.
-		ticket, err := s.lifecycle.EnqueueCheckoutMutation(context.WithoutCancel(ctx), view.checkoutID, absPath)
+		ticket, err := s.lifecycle.EnqueueCheckoutMutation(
+			context.WithoutCancel(ctx), view.mutationToken, absPath,
+		)
 		if err != nil {
 			return mutationReindexOutcome{CheckoutID: view.checkoutID, Err: err}
 		}

@@ -2950,7 +2950,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				if err := graph.AddBatchChecked(diskTarget, shadowBuiltins, nil); err != nil {
 					retErr = fmt.Errorf("indexer: persist shadow builtin batch: %w", err)
 				}
-				shadowBuiltins = nil
 			}
 
 			flushStart := time.Now()

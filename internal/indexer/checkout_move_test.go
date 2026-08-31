@@ -140,6 +140,74 @@ END`, f.automatic.CheckoutID))
 	requireNoRootMoveJournal(t, f.catalog, f.automatic.CheckoutID)
 }
 
+func TestBlockedFamilyCoordinatorConvergenceDoesNotBlockTopologyPublication(t *testing.T) {
+	f := newFamilyFixture(t, "move-coordinator-lock-order")
+	defer f.close()
+	ctx := context.Background()
+
+	// Model an admitted mutation without depending on a coordinator cycle: a
+	// checkout topology writer must wait for this one-unit reader lease.
+	gate := f.lc.ensureMutationFences().checkout(f.automatic.CheckoutID)
+	require.NoError(t, gate.sem.Acquire(ctx, 1))
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			gate.sem.Release(1)
+		}
+	}()
+
+	reachedApply := make(chan struct{})
+	continueApply := make(chan struct{})
+	f.lc.coordinatorApplyBarrier = func() {
+		close(reachedApply)
+		<-continueApply
+	}
+	defer func() { f.lc.coordinatorApplyBarrier = nil }()
+
+	finished := make(chan error, 1)
+	go func() {
+		finished <- f.lc.applyReconcileReport(ctx, reconcile.FamilyReport{
+			FamilyID:       f.familyID,
+			PrimaryGraphID: f.primaryGraph,
+			Checkouts: []reconcile.CheckoutReport{{
+				CheckoutID:  f.automatic.CheckoutID,
+				Incarnation: f.automatic.Incarnation,
+				Durable:     true,
+				State:       f.automatic.State,
+			}},
+		})
+	}()
+	select {
+	case <-reachedApply:
+	case <-time.After(5 * time.Second):
+		t.Fatal("coordinator convergence did not reach its post-move boundary")
+	}
+
+	// Hold the global publication lock across the blocked coordinator phase.
+	// The report must still finish after its own checkout drains; otherwise it
+	// carried the old global-lock dependency beyond root-move publication.
+	publicationFree := f.lc.topologyPublishMu.TryLock()
+	if publicationFree {
+		defer f.lc.topologyPublishMu.Unlock()
+	}
+	close(continueApply)
+	gate.sem.Release(1)
+	gateHeld = false
+	select {
+	case err := <-finished:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("coordinator convergence waited on global topology publication")
+	}
+	if !publicationFree {
+		t.Error("coordinator convergence still owns the global publication lock")
+	}
+
+	// The deferred release must not release the same reader twice.
+	require.NoError(t, gate.sem.Acquire(ctx, 1))
+	gateHeld = true
+}
+
 func TestRootMoveTopologyEventsCannotOvertakeDurableMoveOrder(t *testing.T) {
 	f := newFamilyFixture(t, "move-readiness-order")
 	defer f.close()

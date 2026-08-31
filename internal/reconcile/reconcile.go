@@ -86,8 +86,10 @@ func (c Config) Validate() error {
 // graph owners, so the sagas call out at the two phases that need them and
 // stay ignorant of the rest.
 //
-// Both methods must be idempotent. A saga resumes from its last durable phase,
-// which can re-enter the phase that was already running when the process died.
+// Every hook must be idempotent. A saga resumes from its last durable phase,
+// which can re-enter the phase that was already running when the process died;
+// terminal edges are deduplicated within one outer saga operation but may be
+// replayed by a later, independently idempotent invocation.
 // GraphReleaseTarget is the durable identity and filesystem address of one
 // graph cleanup. RepoPrefix and RootPath deliberately survive deletion of the
 // graph row: a restart between the guarded catalog delete and config commit
@@ -110,6 +112,24 @@ type CheckoutRemovalTarget struct {
 	RootPath    string
 }
 
+// GraphRemovalTarget is the durable binding released by a completed
+// graph-removing saga. CheckoutID and Incarnation distinguish a retired
+// binding from a later graph that reuses the same stable GraphID.
+type GraphRemovalTarget struct {
+	GraphID     string
+	FamilyID    string
+	CheckoutID  string
+	Incarnation string
+	RepoPrefix  string
+	RootPath    string
+}
+
+// FamilyRemovalTarget is the stable identity released by a completed
+// forget-family saga.
+type FamilyRemovalTarget struct {
+	FamilyID string
+}
+
 type CleanupHooks interface {
 	// PurgeCheckoutLayers drops everything built for one incarnation of a
 	// checkout. It is called when an unreachable checkout's availability
@@ -120,10 +140,17 @@ type CleanupHooks interface {
 	// finalizer performs the guarded catalog delete; a returned error leaves
 	// both the saga and the admission tombstone retryable.
 	ReleaseGraph(ctx context.Context, target GraphReleaseTarget, finalize func() error) error
-	// CheckoutRemovalCompleted is a non-blocking process-local edge. It is
-	// invoked only after the forget-checkout saga's final cleanup journal row
-	// has been successfully released; implementations must be idempotent.
+	// CheckoutRemovalCompleted is a process-local terminal edge. It is invoked
+	// only after the forget-checkout saga's final cleanup journal row has been
+	// successfully released and every inherited topology guard has unwound.
+	// Implementations may serialize topology publication and must be idempotent.
 	CheckoutRemovalCompleted(target CheckoutRemovalTarget)
+	// GraphRemovalCompleted is the corresponding terminal edge for one durable
+	// graph binding. It is ordered before the checkout removal that owned it.
+	GraphRemovalCompleted(target GraphRemovalTarget)
+	// FamilyRemovalCompleted is emitted only after forget-family has completed
+	// and is ordered after all nested graph and checkout removals.
+	FamilyRemovalCompleted(target FamilyRemovalTarget)
 }
 
 // InventoryFunc enumerates a checkout family. It has gitstate.Inventory's
@@ -137,6 +164,22 @@ type PathSamplerFunc func(root string) gitstate.PathEvidence
 // HEADSamplerFunc samples what HEAD points at in one working tree, with
 // gitstate.SampleHEAD's signature.
 type HEADSamplerFunc func(ctx context.Context, dir string) (gitstate.HEADState, error)
+
+// CheckoutTopologyGuard excludes an already-admitted source mutation from the
+// small durable publication tail that changes a checkout's root, serving
+// state, route ownership, or identity. Inventory and filesystem sampling run
+// before the guard. The returned context carries implementation-specific held
+// state into cleanup hooks; release must be idempotent.
+type CheckoutTopologyGuard func(
+	ctx context.Context, checkoutIDs ...string,
+) (context.Context, func(), error)
+
+// FamilyTopologyGuard serializes membership and primary-designation changes
+// within the named Git families. Family IDs are sorted by the lifecycle before
+// acquisition so multi-family root moves cannot deadlock.
+type FamilyTopologyGuard func(
+	ctx context.Context, familyIDs ...string,
+) (context.Context, func(), error)
 
 // Option overrides a Reconciler dependency.
 type Option func(*Reconciler)
@@ -190,6 +233,25 @@ func WithLogger(logger *zap.Logger) Option {
 	}
 }
 
+// WithCheckoutTopologyGuard installs the daemon's mutation/topology fence.
+// Embedded and catalog-only reconcilers retain a no-op guard.
+func WithCheckoutTopologyGuard(guard CheckoutTopologyGuard) Option {
+	return func(r *Reconciler) {
+		if guard != nil {
+			r.guardTopology = guard
+		}
+	}
+}
+
+// WithFamilyTopologyGuard installs the daemon's family-scoped topology fence.
+func WithFamilyTopologyGuard(guard FamilyTopologyGuard) Option {
+	return func(r *Reconciler) {
+		if guard != nil {
+			r.guardFamilyTopology = guard
+		}
+	}
+}
+
 // Reconciler drives the checkout lifecycle against one catalog.
 //
 // It holds no state of its own: everything durable lives in catalog rows, so
@@ -200,11 +262,13 @@ type Reconciler struct {
 	hooks   CleanupHooks
 	cfg     Config
 
-	now        func() time.Time
-	inventory  InventoryFunc
-	samplePath PathSamplerFunc
-	sampleHEAD HEADSamplerFunc
-	logger     *zap.Logger
+	now                 func() time.Time
+	inventory           InventoryFunc
+	samplePath          PathSamplerFunc
+	sampleHEAD          HEADSamplerFunc
+	logger              *zap.Logger
+	guardTopology       CheckoutTopologyGuard
+	guardFamilyTopology FamilyTopologyGuard
 }
 
 // New builds a Reconciler over a catalog handle.
@@ -227,6 +291,12 @@ func New(catalog *store_sqlite.Catalog, hooks CleanupHooks, cfg Config, opts ...
 		samplePath: gitstate.SamplePathEvidence,
 		sampleHEAD: gitstate.SampleHEAD,
 		logger:     zap.NewNop(),
+		guardTopology: func(ctx context.Context, _ ...string) (context.Context, func(), error) {
+			return ctx, func() {}, nil
+		},
+		guardFamilyTopology: func(ctx context.Context, _ ...string) (context.Context, func(), error) {
+			return ctx, func() {}, nil
+		},
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -234,6 +304,95 @@ func New(catalog *store_sqlite.Catalog, hooks CleanupHooks, cfg Config, opts ...
 		}
 	}
 	return r, nil
+}
+
+type topologyGuardContextKey struct{}
+type familyTopologyGuardContextKey struct{}
+
+func (r *Reconciler) withFamilyTopology(
+	ctx context.Context,
+	familyIDs []string,
+	fn func(context.Context) error,
+) error {
+	if fn == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	held, _ := ctx.Value(familyTopologyGuardContextKey{}).(map[string]struct{})
+	missing := make([]string, 0, len(familyIDs))
+	for _, familyID := range familyIDs {
+		if familyID == "" {
+			continue
+		}
+		if _, ok := held[familyID]; !ok {
+			missing = append(missing, familyID)
+		}
+	}
+	if len(missing) == 0 {
+		return fn(ctx)
+	}
+	guarded, release, err := r.guardFamilyTopology(ctx, missing...)
+	if err != nil {
+		return err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	defer release()
+	nextHeld := make(map[string]struct{}, len(held)+len(missing))
+	for familyID := range held {
+		nextHeld[familyID] = struct{}{}
+	}
+	for _, familyID := range missing {
+		nextHeld[familyID] = struct{}{}
+	}
+	guarded = context.WithValue(guarded, familyTopologyGuardContextKey{}, nextHeld)
+	return fn(guarded)
+}
+
+func (r *Reconciler) withCheckoutTopology(
+	ctx context.Context,
+	checkoutIDs []string,
+	fn func(context.Context) error,
+) error {
+	if fn == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	held, _ := ctx.Value(topologyGuardContextKey{}).(map[string]struct{})
+	missing := make([]string, 0, len(checkoutIDs))
+	for _, checkoutID := range checkoutIDs {
+		if checkoutID == "" {
+			continue
+		}
+		if _, ok := held[checkoutID]; !ok {
+			missing = append(missing, checkoutID)
+		}
+	}
+	if len(missing) == 0 {
+		return fn(ctx)
+	}
+	guarded, release, err := r.guardTopology(ctx, missing...)
+	if err != nil {
+		return err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	defer release()
+	nextHeld := make(map[string]struct{}, len(held)+len(missing))
+	for checkoutID := range held {
+		nextHeld[checkoutID] = struct{}{}
+	}
+	for _, checkoutID := range missing {
+		nextHeld[checkoutID] = struct{}{}
+	}
+	guarded = context.WithValue(guarded, topologyGuardContextKey{}, nextHeld)
+	return fn(guarded)
 }
 
 // familyPass is one ReconcileFamily call's shared context. The clock is read
@@ -259,6 +418,16 @@ type familyPass struct {
 // removal clock expires, which runs a saga, or when a caller enters one of
 // the saga entry points directly.
 func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir string) (FamilyReport, error) {
+	var report FamilyReport
+	err := r.withSagaRemovalPublications(ctx, func(publicationCtx context.Context) error {
+		var reconcileErr error
+		report, reconcileErr = r.reconcileFamily(publicationCtx, familyID, probeDir)
+		return reconcileErr
+	})
+	return report, err
+}
+
+func (r *Reconciler) reconcileFamily(ctx context.Context, familyID, probeDir string) (FamilyReport, error) {
 	family, ok, err := r.catalog.GetRepositoryFamily(ctx, familyID)
 	if err != nil {
 		return FamilyReport{}, err
@@ -284,6 +453,19 @@ func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir str
 		inventoryOutcome = viewmetrics.OutcomeError
 	}
 	viewmetrics.Observe(viewmetrics.FamilyInventorySeconds, elapsed, inventoryOutcome)
+	guarded, releaseFamily, err := r.guardFamilyTopology(ctx, familyID)
+	if err != nil {
+		return FamilyReport{}, err
+	}
+	if releaseFamily == nil {
+		releaseFamily = func() {}
+	}
+	defer releaseFamily()
+	ctx = context.WithValue(
+		guarded,
+		familyTopologyGuardContextKey{},
+		map[string]struct{}{familyID: {}},
+	)
 
 	graphs, err := r.catalog.ListDedicatedGraphs(ctx, familyID)
 	if err != nil {
@@ -430,15 +612,36 @@ func (r *Reconciler) reconcileKnown(
 		entry.RetryAt = req.RemovalDeadline
 	}
 
-	if err := r.catalog.UpdateCheckoutObservation(ctx, req); err != nil {
-		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-			// Another actor moved this row first. Its write is the one that
-			// counts; re-reading and overwriting would undo it.
-			entry.Action = ActionGuardLost
-			entry.State = existing.State
-			return entry, nil
+	guardLost := false
+	var guardedCheckoutIDs []string
+	if observationChangesCheckoutTopology(existing, req) {
+		guardedCheckoutIDs = []string{existing.CheckoutID}
+	}
+	err = r.withCheckoutTopology(ctx, guardedCheckoutIDs, func(guarded context.Context) error {
+		if updateErr := r.catalog.UpdateCheckoutObservation(guarded, req); updateErr != nil {
+			if errors.Is(updateErr, store_sqlite.ErrCatalogStaleGuard) {
+				// Another actor moved this row first. Its write is the one that
+				// counts; re-reading and overwriting would undo it.
+				guardLost = true
+				return nil
+			}
+			return updateErr
 		}
+		if class.Disposition == DispositionPresent {
+			row := fresh.CatalogRow(existing.CheckoutID, pass.now.Unix(), storedRow.SampleGeneration+1)
+			if evidenceErr := r.catalog.UpsertCheckoutPathEvidence(guarded, row); evidenceErr != nil {
+				return evidenceErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return entry, err
+	}
+	if guardLost {
+		entry.Action = ActionGuardLost
+		entry.State = existing.State
+		return entry, nil
 	}
 	entry.State = req.State
 	entry.RootMoved = class.Disposition == DispositionPresent &&
@@ -447,14 +650,28 @@ func (r *Reconciler) reconcileKnown(
 			pathkey.CanonicalExistingRoot(req.RootPath),
 		)
 	recordTransition(existing.State, req.State, class)
-
-	if class.Disposition == DispositionPresent {
-		row := fresh.CatalogRow(existing.CheckoutID, pass.now.Unix(), storedRow.SampleGeneration+1)
-		if err := r.catalog.UpsertCheckoutPathEvidence(ctx, row); err != nil {
-			return entry, err
-		}
-	}
 	return entry, nil
+}
+
+// observationChangesCheckoutTopology excludes the high-frequency confirmation
+// write (timestamps and path evidence only) from the mutation fence. A slow
+// publication in one worktree must not delay discovery of a new sibling in the
+// same family. State, root, git administration, and HEAD changes still take the
+// exclusive cut because they can change which route and coordinator describe
+// bytes written at that root.
+func observationChangesCheckoutTopology(
+	existing store_sqlite.Checkout,
+	req store_sqlite.UpdateCheckoutObservationRequest,
+) bool {
+	return existing.State != req.State ||
+		!pathkey.EqualPaths(
+			pathkey.CanonicalExistingRoot(existing.RootPath),
+			pathkey.CanonicalExistingRoot(req.RootPath),
+		) ||
+		existing.GitDir != req.GitDir ||
+		existing.HeadRef != req.HeadRef ||
+		existing.HeadCommit != req.HeadCommit ||
+		existing.HeadTree != req.HeadTree
 }
 
 // applyPresent puts a reachable checkout back in the ready state and clears
@@ -557,26 +774,86 @@ func (r *Reconciler) retireCheckout(
 	pass *familyPass,
 	existing store_sqlite.Checkout,
 ) (CheckoutAction, bool, error) {
-	owned, err := r.ownedGraph(ctx, existing.FamilyID, existing.CheckoutID)
+	action := CheckoutAction("")
+	gone := false
+	guardLost := false
+
+	ownedBeforeAdmission, err := r.ownedGraph(ctx, existing.FamilyID, existing.CheckoutID)
 	if err != nil {
 		return "", false, err
 	}
-	if owned != nil && owned.IsPrimaryBase {
-		if err := r.RetirePrimaryClosure(ctx, owned.GraphID, pass.family.PrimaryEpoch); err != nil {
-			if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-				return ActionGuardLost, false, nil
-			}
+	primaryGraphID := ""
+	guardedCheckoutIDs := []string{existing.CheckoutID}
+	if ownedBeforeAdmission != nil && ownedBeforeAdmission.IsPrimaryBase {
+		primaryGraphID = ownedBeforeAdmission.GraphID
+		guardedCheckoutIDs, err = r.familyCheckoutTopologyCohort(
+			ctx, existing.FamilyID, existing.CheckoutID,
+		)
+		if err != nil {
 			return "", false, err
 		}
-		return ActionPrimaryClosureRetired, true, nil
 	}
-	if err := r.ForgetCheckout(ctx, existing.CheckoutID, existing.Incarnation); err != nil {
-		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-			return ActionGuardLost, false, nil
+
+	err = r.withCheckoutTopology(ctx, guardedCheckoutIDs, func(guarded context.Context) error {
+		current, found, readErr := r.catalog.GetCheckout(guarded, existing.CheckoutID)
+		if readErr != nil {
+			return readErr
 		}
+		// Classification happened before mutation admission drained. A newer
+		// pass may have recovered or otherwise advanced the same incarnation in
+		// that interval; retirement must not turn that fresh observation into a
+		// deletion merely because the incarnation itself is unchanged.
+		if !found || current != existing {
+			guardLost = true
+			return nil
+		}
+		owned, ownedErr := r.ownedGraph(guarded, existing.FamilyID, existing.CheckoutID)
+		if ownedErr != nil {
+			return ownedErr
+		}
+		if primaryGraphID != "" {
+			if owned == nil || !owned.IsPrimaryBase || owned.GraphID != primaryGraphID {
+				guardLost = true
+				return nil
+			}
+			if retireErr := r.RetirePrimaryClosure(
+				guarded, owned.GraphID, pass.family.PrimaryEpoch,
+			); retireErr != nil {
+				if errors.Is(retireErr, store_sqlite.ErrCatalogStaleGuard) {
+					guardLost = true
+					return nil
+				}
+				return retireErr
+			}
+			action, gone = ActionPrimaryClosureRetired, true
+			return nil
+		}
+		if owned != nil && owned.IsPrimaryBase {
+			// The pre-admission read did not identify a primary closure, so this
+			// operation owns only one checkout guard. Extending it here would
+			// violate the family -> complete sorted cohort lock order.
+			guardLost = true
+			return nil
+		}
+		if forgetErr := r.ForgetCheckout(
+			guarded, existing.CheckoutID, existing.Incarnation,
+		); forgetErr != nil {
+			if errors.Is(forgetErr, store_sqlite.ErrCatalogStaleGuard) {
+				guardLost = true
+				return nil
+			}
+			return forgetErr
+		}
+		action, gone = ActionForgotten, true
+		return nil
+	})
+	if err != nil {
 		return "", false, err
 	}
-	return ActionForgotten, true, nil
+	if guardLost {
+		return ActionGuardLost, false, nil
+	}
+	return action, gone, nil
 }
 
 // observeNew decides what to do with a worktree no identity matched.
@@ -638,21 +915,29 @@ func (r *Reconciler) observeNew(
 		LastSeen:       pass.now.Unix(),
 	}
 	checkout.HeadRef, checkout.HeadCommit, checkout.HeadTree = r.headFor(ctx, record)
-	if err := r.catalog.AllocateCheckout(ctx, checkout); err != nil {
-		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
-			// Another actor allocated this administrative name between this
-			// pass's listing and its insert. Its identity is the one that
-			// counts; the next pass matches the record to that row instead of
-			// leaving the family with two identities for one working copy.
-			entry.Action = ActionGuardLost
-			entry.Detail = "another actor allocated this administrative name first"
-			return entry, nil
+	guardLost := false
+	err := r.withCheckoutTopology(ctx, []string{checkout.CheckoutID}, func(guarded context.Context) error {
+		if allocateErr := r.catalog.AllocateCheckout(guarded, checkout); allocateErr != nil {
+			if errors.Is(allocateErr, store_sqlite.ErrCatalogStaleGuard) {
+				// Another actor allocated this administrative name between this
+				// pass's listing and its insert. Its identity is the one that
+				// counts; the next pass matches the record to that row instead of
+				// leaving the family with two identities for one working copy.
+				guardLost = true
+				return nil
+			}
+			return allocateErr
 		}
+		row := fresh.CatalogRow(checkout.CheckoutID, pass.now.Unix(), 1)
+		return r.catalog.UpsertCheckoutPathEvidence(guarded, row)
+	})
+	if err != nil {
 		return entry, err
 	}
-	row := fresh.CatalogRow(checkout.CheckoutID, pass.now.Unix(), 1)
-	if err := r.catalog.UpsertCheckoutPathEvidence(ctx, row); err != nil {
-		return entry, err
+	if guardLost {
+		entry.Action = ActionGuardLost
+		entry.Detail = "another actor allocated this administrative name first"
+		return entry, nil
 	}
 
 	entry.CheckoutID = checkout.CheckoutID

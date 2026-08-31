@@ -36,10 +36,28 @@ func (l *CheckoutLifecycle) prepareAndPublishPromotion(
 	defer coordinator.Close()
 
 	base := primaryBase{graphID: graphID, generationID: baseGenerationID, treeOID: sample.tree}
+	var publicationCtx context.Context
+	var releaseTopology func()
+	defer func() {
+		if releaseTopology != nil {
+			releaseTopology()
+		}
+	}()
 	cycle, err := coordinator.preparePromotion(ctx, base, sample.tree,
 		func(ctx context.Context, route store_sqlite.CheckoutRoute, routed bool, routeGraphID string,
 			commitGeneration, dirtyGeneration int64) error {
-			return l.catalog.CommitAuthorizedPromotion(ctx, store_sqlite.CommitAuthorizedPromotionRequest{
+			if releaseTopology == nil {
+				var topologyErr error
+				publicationCtx, releaseTopology, topologyErr = l.reconcileFamilyCheckoutTopologyGuard(
+					ctx,
+					[]string{checkout.FamilyID},
+					[]string{checkout.CheckoutID},
+				)
+				if topologyErr != nil {
+					return topologyErr
+				}
+			}
+			return l.catalog.CommitAuthorizedPromotion(publicationCtx, store_sqlite.CommitAuthorizedPromotionRequest{
 				CheckoutID:         checkout.CheckoutID,
 				Incarnation:        checkout.Incarnation,
 				FamilyID:           checkout.FamilyID,
@@ -58,16 +76,31 @@ func (l *CheckoutLifecycle) prepareAndPublishPromotion(
 			})
 		})
 	if err != nil {
+		if releaseTopology != nil {
+			releaseTopology()
+			releaseTopology = nil
+		}
 		l.restoreAutomaticCoordinator(ctx, checkout)
 		return cycle, err
 	}
-	if err := l.installDedicatedCoordinator(ctx, graphID, checkout); err != nil {
+	if err := l.installDedicatedCoordinatorFenced(ctx, graphID, checkout); err != nil {
 		return cycle, err
 	}
 	return cycle, nil
 }
 
 func (l *CheckoutLifecycle) installDedicatedCoordinator(
+	ctx context.Context, graphID string, checkout store_sqlite.Checkout,
+) error {
+	topology, err := l.AcquireCheckoutTopology(ctx, checkout.CheckoutID)
+	if err != nil {
+		return err
+	}
+	defer topology.Release()
+	return l.installDedicatedCoordinatorFenced(ctx, graphID, checkout)
+}
+
+func (l *CheckoutLifecycle) installDedicatedCoordinatorFenced(
 	ctx context.Context, graphID string, checkout store_sqlite.Checkout,
 ) error {
 	l.coordMu.Lock()
@@ -77,7 +110,7 @@ func (l *CheckoutLifecycle) installDedicatedCoordinator(
 		return nil
 	}
 	if current != nil {
-		l.dropCoordinator(checkout.CheckoutID)
+		l.dropCoordinatorFenced(checkout.CheckoutID)
 	}
 	coordinator, err := l.buildCoordinator(ctx, graphID, checkout)
 	if err != nil {
@@ -86,7 +119,9 @@ func (l *CheckoutLifecycle) installDedicatedCoordinator(
 	if coordinator == nil {
 		return fmt.Errorf("indexer: dedicated graph %s cannot start checkout coordinator", graphID)
 	}
-	if !l.installCoordinator(checkout.CheckoutID, coordinator) {
+	if !l.installCoordinatorWithHeadFenced(
+		checkout.CheckoutID, coordinator, checkoutHeadIdentity{}, false,
+	) {
 		if existing := l.coordinatorFor(checkout.CheckoutID); existing != nil &&
 			existing.Running() && existing.graphID == graphID {
 			return nil

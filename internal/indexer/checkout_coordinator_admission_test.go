@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/reconcile"
 )
 
@@ -104,4 +105,32 @@ func TestRollbackStopsOnlyCoordinatorBoundToProvisionalGraph(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, found)
 	assert.Nil(t, f.mi.GetMetadata(prefix))
+}
+
+func TestApplyCoordinatorsLosesStaleReportToReadyRecovery(t *testing.T) {
+	f := newFamilyFixture(t, "coordinator-stale-report")
+	defer f.close()
+	ctx := context.Background()
+
+	before := liveCoordinatorOrNil(f.lc, f.automatic.CheckoutID)
+	require.NotNil(t, before)
+	require.True(t, before.Running())
+
+	// This report was produced while the checkout was unavailable. Recovery
+	// has already restored the catalog row by the time runtime convergence sees
+	// it, so the report is only a wake-up and must lose to current catalog truth.
+	f.lc.applyCoordinators(ctx, reconcile.FamilyReport{
+		FamilyID:       f.familyID,
+		PrimaryGraphID: f.primaryGraph,
+		Checkouts: []reconcile.CheckoutReport{{
+			CheckoutID:  f.automatic.CheckoutID,
+			Incarnation: f.automatic.Incarnation,
+			Durable:     true,
+			State:       store_sqlite.CheckoutStateAvailabilityGrace,
+		}},
+	})
+
+	after := liveCoordinatorOrNil(f.lc, f.automatic.CheckoutID)
+	require.Same(t, before, after, "a stale non-ready report retired the recovered coordinator")
+	require.True(t, after.Running())
 }

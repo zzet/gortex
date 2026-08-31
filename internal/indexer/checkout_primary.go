@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -177,25 +178,77 @@ func (l *CheckoutLifecycle) PreviewSetPrimary(ctx context.Context, graphID strin
 // both slots for the length of a full build, which is the window this whole
 // flow exists to close.
 func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (SetPrimaryResult, error) {
-	preview, err := l.PreviewSetPrimary(ctx, graphID)
+	initial, err := l.PreviewSetPrimary(ctx, graphID)
 	if err != nil {
 		return SetPrimaryResult{}, err
 	}
+	familyTopology, err := l.AcquireCheckoutFamilyTopology(ctx, initial.FamilyID)
+	if err != nil {
+		return SetPrimaryResult{FamilyID: initial.FamilyID, GraphID: graphID}, err
+	}
+	defer familyTopology.Release()
+
+	var preview SetPrimaryPreview
+	var topology *CheckoutTopologyToken
+	for {
+		candidate, err := l.PreviewSetPrimary(ctx, graphID)
+		if err != nil {
+			return SetPrimaryResult{}, err
+		}
+		out := SetPrimaryResult{FamilyID: candidate.FamilyID, GraphID: graphID}
+		if !candidate.Ready {
+			return out, fmt.Errorf("%w: %s: %s", ErrPrimaryNotReady, graphID,
+				strings.Join(candidate.Blockers, "; "))
+		}
+		if candidate.CurrentGraphID == graphID {
+			return out, nil
+		}
+
+		topology, err = l.AcquireCheckoutTopology(ctx, primaryDependentIDs(candidate)...)
+		if err != nil {
+			return out, err
+		}
+		confirmed, confirmErr := l.PreviewSetPrimary(ctx, graphID)
+		if confirmErr != nil {
+			topology.Release()
+			return out, confirmErr
+		}
+		if confirmed.CurrentGraphID == graphID {
+			topology.Release()
+			return out, nil
+		}
+		if !confirmed.Ready {
+			topology.Release()
+			return out, fmt.Errorf("%w: %s: %s", ErrPrimaryNotReady, graphID,
+				strings.Join(confirmed.Blockers, "; "))
+		}
+		if !samePrimaryPreview(candidate, confirmed) {
+			topology.Release()
+			if err := ctx.Err(); err != nil {
+				return out, err
+			}
+			continue
+		}
+		preview = confirmed
+		break
+	}
+	defer topology.Release()
 	out := SetPrimaryResult{FamilyID: preview.FamilyID, GraphID: graphID}
-	if !preview.Ready {
-		return out, fmt.Errorf("%w: %s: %s", ErrPrimaryNotReady, graphID,
-			strings.Join(preview.Blockers, "; "))
-	}
-	if preview.CurrentGraphID == graphID {
-		return out, nil
-	}
-	defer l.beginBatch()()
+	endBatch := l.beginBatch()
+	defer func() {
+		// Session invalidation may synchronously trigger reconciliation. Release
+		// topology first so the coalesced notification cannot re-enter this
+		// family's own primary-switch fence.
+		topology.Release()
+		familyTopology.Release()
+		endBatch()
+	}()
 
 	// A move that then fails the compare-and-set leaves every dependent
 	// coordinator-less with its route untouched, so the automatic views keep
 	// serving exactly what they served and the next sweep starts them again.
 	for _, dependent := range preview.Dependents {
-		l.dropCoordinator(dependent.ID)
+		l.dropCoordinatorFenced(dependent.ID)
 	}
 
 	err = l.catalog.SetPrimaryDedicatedGraph(ctx, store_sqlite.SetPrimaryDedicatedGraphRequest{
@@ -213,7 +266,7 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 		if err != nil || !found {
 			continue
 		}
-		if err := l.rehomeCheckout(ctx, checkout, graphID); err != nil {
+		if err := l.rehomeCheckoutFenced(ctx, checkout, graphID); err != nil {
 			out.Stale = append(out.Stale, checkout.CheckoutID)
 			out.Errors = append(out.Errors, fmt.Errorf("checkout %s: %w", checkout.AdminName, err))
 			l.logger.Warn("checkout lifecycle: a checkout could not rebuild onto the new primary",
@@ -227,6 +280,26 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 	return out, nil
 }
 
+func primaryDependentIDs(preview SetPrimaryPreview) []string {
+	ids := make([]string, 0, len(preview.Dependents))
+	for _, dependent := range preview.Dependents {
+		if dependent.ID != "" {
+			ids = append(ids, dependent.ID)
+		}
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids)
+}
+
+func samePrimaryPreview(left, right SetPrimaryPreview) bool {
+	return left.FamilyID == right.FamilyID &&
+		left.GraphID == right.GraphID &&
+		left.RepoPrefix == right.RepoPrefix &&
+		left.CurrentGraphID == right.CurrentGraphID &&
+		left.PrimaryEpoch == right.PrimaryEpoch &&
+		slices.Equal(primaryDependentIDs(left), primaryDependentIDs(right))
+}
+
 // rehomeCheckout rebuilds one automatic checkout's stack over a new base and
 // installs it in one route write.
 //
@@ -237,10 +310,10 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 // rebuild to the route with a cycle that clears both slots. The drop is
 // repeated here rather than left to the caller's sweep of the dependents,
 // because a reconciliation running beside the move can put one back.
-func (l *CheckoutLifecycle) rehomeCheckout(
+func (l *CheckoutLifecycle) rehomeCheckoutFenced(
 	ctx context.Context, checkout store_sqlite.Checkout, graphID string,
 ) error {
-	l.dropCoordinator(checkout.CheckoutID)
+	l.dropCoordinatorFenced(checkout.CheckoutID)
 	coordinator, err := l.buildCoordinator(ctx, graphID, checkout)
 	if err != nil {
 		return err
@@ -255,7 +328,11 @@ func (l *CheckoutLifecycle) rehomeCheckout(
 		l.oweRetirement(coordinator.DrainRetirements()...)
 		return err
 	}
-	l.installCoordinator(checkout.CheckoutID, coordinator)
+	if !l.installCoordinatorWithHeadFenced(
+		checkout.CheckoutID, coordinator, checkoutHeadIdentity{}, false,
+	) {
+		return fmt.Errorf("indexer: checkout %s coordinator moved during primary switch", checkout.CheckoutID)
+	}
 	return nil
 }
 

@@ -78,6 +78,21 @@ func (l *CheckoutLifecycle) desiredDedicatedBaseIdentity(repoPrefix string) dedi
 	}
 }
 
+// beginDedicatedBaseRefresh drains mutations composed over the old base before
+// making every route on that graph visibly pending. The exclusive graph token
+// is released immediately after the catalog transaction; new mutation
+// admission then rejects the pending routes while the off-route build runs.
+func (l *CheckoutLifecycle) beginDedicatedBaseRefresh(
+	ctx context.Context, graphID string, expectedBaseGenerationID int64,
+) error {
+	topology, err := l.AcquireCheckoutGraphTopology(ctx, graphID)
+	if err != nil {
+		return err
+	}
+	defer topology.Release()
+	return l.catalog.BeginDedicatedBaseRefresh(ctx, graphID, expectedBaseGenerationID)
+}
+
 // scheduleDedicatedBaseRefreshIfNeeded reports whether graph cannot currently
 // admit sparse builds. Pipeline-stale bases are queued once per graph; broken
 // or half-published catalog identities remain fail-closed for the normal
@@ -100,7 +115,7 @@ func (l *CheckoutLifecycle) scheduleDedicatedBaseRefreshIfNeeded(
 	desired := l.desiredDedicatedBaseIdentity(graph.RepoPrefix)
 	refreshable := dedicatedBaseGenerationRefreshable(row, graph)
 	if refreshable && !dedicatedBaseGenerationCurrent(row, graph, desired) {
-		if err := l.catalog.BeginDedicatedBaseRefresh(ctx, graph.GraphID, row.GenerationID); err != nil {
+		if err := l.beginDedicatedBaseRefresh(ctx, graph.GraphID, row.GenerationID); err != nil {
 			l.logger.Warn("checkout lifecycle: could not mark dedicated base refresh pending",
 				zap.String("graph", graph.GraphID), zap.Error(err))
 			return true
@@ -235,7 +250,7 @@ func (l *CheckoutLifecycle) refreshDedicatedBase(
 	if dedicatedBaseGenerationCurrent(oldBase, graph, desired) {
 		return nil
 	}
-	if err := l.catalog.BeginDedicatedBaseRefresh(ctx, graph.GraphID, oldBase.GenerationID); err != nil {
+	if err := l.beginDedicatedBaseRefresh(ctx, graph.GraphID, oldBase.GenerationID); err != nil {
 		return err
 	}
 
@@ -284,6 +299,11 @@ func (l *CheckoutLifecycle) refreshDedicatedBase(
 	_, err = coordinator.preparePromotion(ctx, newBase, head.tree,
 		func(ctx context.Context, route store_sqlite.CheckoutRoute, routed bool, graphID string,
 			commitGeneration, dirtyGeneration int64) error {
+			topology, topologyErr := l.AcquireCheckoutGraphTopology(ctx, graphID)
+			if topologyErr != nil {
+				return topologyErr
+			}
+			defer topology.Release()
 			var commitErr error
 			committed, commitErr = l.catalog.CommitDedicatedBaseRefresh(ctx,
 				store_sqlite.CommitDedicatedBaseRefreshRequest{
