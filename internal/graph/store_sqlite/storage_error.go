@@ -15,6 +15,42 @@ type StorageError struct {
 	err error
 }
 
+// CommittedStorageError marks an error discovered after a SQLite transaction
+// committed. Retrying the same batch is unsafe; generation builders must abort
+// the unpublished generation. Errors from transaction begin/write/commit do
+// not carry this marker.
+type CommittedStorageError struct {
+	err error
+}
+
+func (e *CommittedStorageError) Error() string {
+	if e == nil || e.err == nil {
+		return "storage error detected after transaction commit"
+	}
+	return e.err.Error()
+}
+
+func (e *CommittedStorageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+// Committed implements the partial-success error contract.
+func (e *CommittedStorageError) Committed() bool { return e != nil }
+
+func markStorageErrorCommitted(err error) error {
+	if err == nil {
+		return nil
+	}
+	var committed interface{ Committed() bool }
+	if errors.As(err, &committed) && committed.Committed() {
+		return err
+	}
+	return &CommittedStorageError{err: err}
+}
+
 func (e *StorageError) Error() string {
 	if e == nil || e.err == nil {
 		return "store_sqlite: storage operation failed"
@@ -58,6 +94,10 @@ func SafeStorageFailureReason(err error) string {
 	var storageErr *StorageError
 	if !errors.As(err, &storageErr) {
 		return "graph generation build failed; see daemon log"
+	}
+	var pressureErr *BulkLoadWALPressureError
+	if errors.As(storageErr, &pressureErr) {
+		return "graph storage stopped before disk exhaustion; release long-running graph readers or free disk space, then retry"
 	}
 	var sqliteErr *sqlite.Error
 	if !errors.As(storageErr, &sqliteErr) {

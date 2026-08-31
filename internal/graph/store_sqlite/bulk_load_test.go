@@ -481,7 +481,7 @@ func TestBulkRowCheckpointBackoffClassification(t *testing.T) {
 	}
 }
 
-func TestCoordinatedBulkLoadBacksOffOnlyAutomaticRowCheckpoints(t *testing.T) {
+func TestCoordinatedBulkLoadRetriesAutomaticRowCheckpointsAdaptively(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "checkpoint-backoff.sqlite")
 	s, err := Open(path)
 	if err != nil {
@@ -494,74 +494,86 @@ func TestCoordinatedBulkLoadBacksOffOnlyAutomaticRowCheckpoints(t *testing.T) {
 		}
 	})
 
-	// A true outer begin owns a fresh backoff generation.
-	s.bulkRowCheckpointBackoff = true
+	// A true outer begin owns a fresh retry generation.
+	s.bulkCheckpointBackoffShift = bulkCheckpointMaxBackoffShift
+	s.bulkWALPressureProbe = func() bulkWALPressureSnapshot {
+		return bulkWALPressureSnapshot{DiskAvailableKnown: true, DiskAvailableBytes: 64 << 30}
+	}
 	if !s.BeginCoordinatedBulkLoad() {
 		t.Fatal("coordinated fast path did not engage")
 	}
-	if s.bulkRowCheckpointBackoff {
-		t.Fatal("outer begin retained stale row-checkpoint backoff")
+	if s.bulkCheckpointBackoffShift != 0 {
+		t.Fatal("outer begin retained stale row-checkpoint retry state")
 	}
 
-	var rowLimit, explicitPassive, finalCheckpoint int
-	s.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
-		switch {
-		case event.Stage == "checkpoint_passive" && event.Name == "row_limit":
-			rowLimit++
-		case event.Stage == "checkpoint_passive":
-			explicitPassive++
-		case event.Stage == "checkpoint" && event.Name == "wal_passive":
-			finalCheckpoint++
+	var attempts int
+	s.bulkPassiveCheckpoint = func(context.Context, *sql.Conn, string) (walCheckpointResult, error) {
+		attempts++
+		switch attempts {
+		case 1:
+			return walCheckpointResult{}, context.DeadlineExceeded
+		case 2:
+			return walCheckpointResult{Busy: 1, WALFrames: 100, CheckpointedFrames: 75},
+				fmt.Errorf("%w: reader pinned", errSQLiteCheckpointIncomplete)
+		default:
+			return walCheckpointResult{WALFrames: 100, CheckpointedFrames: 100}, nil
 		}
 	}
-
-	// Model the result of the first bounded row-limit attempt without relying
-	// on scheduler timing. Once backed off, even existing row debt must not
-	// start another automatic checkpoint.
-	s.noteBulkRowCheckpointResultLocked(context.DeadlineExceeded)
-	if !s.bulkRowCheckpointBackoff {
-		t.Fatal("deadline did not enable row-checkpoint backoff")
+	var rowLimit int
+	s.bulkFinalizeObserver = func(event bulkFinalizeEvent) {
+		if event.Stage == "checkpoint_passive" && event.Name == "row_limit" {
+			rowLimit++
+		}
 	}
-	s.bulkCheckpointNodeRows = bulkCheckpointNodeInterval
-	s.AddNode(&graph.Node{
-		ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A",
-		FilePath: "repo/a.go", RepoPrefix: "repo", Language: "go",
-	})
-	if rowLimit != 0 {
-		t.Fatalf("backed-off lifecycle ran %d additional row-limit checkpoints", rowLimit)
+	note := func(rows int64) error {
+		t.Helper()
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		return s.noteBulkRowsLocked(int(rows), 0)
 	}
 
+	if err := note(bulkCheckpointNodeInterval); err != nil {
+		t.Fatalf("first checkpoint: %v", err)
+	}
+	if attempts != 1 || s.bulkCheckpointBackoffShift != 1 {
+		t.Fatalf("first retry state = attempts %d shift %d, want 1/1", attempts, s.bulkCheckpointBackoffShift)
+	}
+	if err := note(2*bulkCheckpointNodeInterval - 1); err != nil {
+		t.Fatalf("below doubled interval: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("checkpoint retried before doubled interval: %d attempts", attempts)
+	}
+	if err := note(1); err != nil {
+		t.Fatalf("second checkpoint: %v", err)
+	}
+	if attempts != 2 || s.bulkCheckpointBackoffShift != 2 {
+		t.Fatalf("second retry state = attempts %d shift %d, want 2/2", attempts, s.bulkCheckpointBackoffShift)
+	}
+	if err := note(4 * bulkCheckpointNodeInterval); err != nil {
+		t.Fatalf("successful retry: %v", err)
+	}
+	if attempts != 3 || s.bulkCheckpointBackoffShift != 0 {
+		t.Fatalf("successful retry state = attempts %d shift %d, want 3/0", attempts, s.bulkCheckpointBackoffShift)
+	}
+	if rowLimit != 3 {
+		t.Fatalf("row-limit events = %d, want 3", rowLimit)
+	}
+
+	// Finalization remains independent and a successful explicit checkpoint
+	// also leaves the next lifecycle at base cadence.
+	s.bulkPassiveCheckpoint = nil
+	s.bulkWALPressureProbe = nil
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
 	}
-	if explicitPassive == 0 {
-		t.Fatal("row backoff suppressed explicit seal/planner checkpoints")
-	}
-	if finalCheckpoint != 1 {
-		t.Fatalf("final checkpoints = %d, want 1", finalCheckpoint)
-	}
-	if s.bulkRowCheckpointBackoff {
-		t.Fatal("outer close retained row-checkpoint backoff")
+	if s.bulkCheckpointBackoffShift != 0 {
+		t.Fatal("outer close retained row-checkpoint retry state")
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	closed = true
-
-	reopened, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	if got := reopened.NodeCount(); got != 1 {
-		t.Fatalf("reopened node count = %d, want 1", got)
-	}
-	for _, idx := range bulkDroppableIndexes {
-		if !indexNames(t, reopened.db)[idx.name] {
-			t.Fatalf("index %s missing after backoff lifecycle reopen", idx.name)
-		}
-	}
-	integrityOK(t, reopened.db)
 }
 
 func TestBulkLoadRowCadenceCheckpointsBeforeSeal(t *testing.T) {

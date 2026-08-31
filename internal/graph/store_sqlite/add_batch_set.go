@@ -548,6 +548,9 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// transaction later rolls back and omit the corresponding stub.
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.bulkTerminalErr != nil && (s.bulkConn != nil || s.bulkTerminalViewGen == s.viewGen) {
+		return stats, s.bulkTerminalErr
+	}
 	var freshBuiltinKeys []string
 	builtinKeysCommitted := false
 	defer func() {
@@ -766,5 +769,8 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// The transaction is durable before index sealing. If the bounded cold
 	// threshold was reached, build the dense indexes now on the same pinned
 	// connection; a failure remains retryable at the repository/final boundary.
-	return stats, s.noteBulkRowsLocked(stats.nodeRowsChanged, stats.edgeRowsInserted)
+	if err := s.noteBulkRowsLocked(stats.nodeRowsChanged, stats.edgeRowsInserted); err != nil {
+		return stats, markStorageErrorCommitted(err)
+	}
+	return stats, nil
 }
