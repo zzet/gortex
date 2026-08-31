@@ -60,7 +60,8 @@ func TestPassiveCheckpointPinnedWriterIsDeferredNotIncomplete(t *testing.T) {
 
 	store.passiveCheckpointTimeout = 100 * time.Millisecond
 	started := time.Now()
-	out := captureLog(t, store.checkpointWALPassive)
+	var retry bool
+	out := captureLog(t, func() { retry = store.checkpointWALPassive() })
 
 	assert.Less(t, time.Since(started), 2*time.Second,
 		"the periodic checkpoint must give up on the window, not block")
@@ -70,6 +71,7 @@ func TestPassiveCheckpointPinnedWriterIsDeferredNotIncomplete(t *testing.T) {
 		"a checkpoint that never executed must not be reported as incomplete")
 	assert.NotContains(t, out, "wal_frames=",
 		"zero-value result fields must not be printed as measurements")
+	assert.True(t, retry, "writer-pool deferral must schedule a prompt retry")
 }
 
 // The opposite case must keep its warning. Here the PRAGMA does run, returns
@@ -98,10 +100,12 @@ func TestPassiveCheckpointReaderLimitedStillWarns(t *testing.T) {
 	// while the read transaction is open.
 	store.AddNode(&graph.Node{ID: "repo/b.go::B", Kind: graph.KindFunction, Name: "B"})
 
-	out := captureLog(t, store.checkpointWALPassive)
+	var retry bool
+	out := captureLog(t, func() { retry = store.checkpointWALPassive() })
 
 	assert.Contains(t, out, "incomplete",
 		"a checkpoint that ran and left frames behind must still warn")
+	assert.True(t, retry, "measured incomplete checkpoint must schedule a prompt retry")
 }
 
 // The classification order is the substance of the fix, and a real deadline

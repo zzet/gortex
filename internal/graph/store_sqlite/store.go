@@ -795,6 +795,11 @@ const (
 	// non-blocking TryLock; this context only protects an unexpected writer-pool
 	// wait or a slow driver call.
 	walPassiveCheckpointTimeout = 1 * time.Second
+	// A deferred periodic checkpoint must not disappear for another five-minute
+	// interval. Retry promptly, then exponentially cap contention traffic so a
+	// long bulk writer or read snapshot cannot create a polling storm.
+	walCheckpointRetryInitial = 1 * time.Second
+	walCheckpointRetryMax     = 30 * time.Second
 )
 
 var errWALCheckpointDeferredBulk = errors.New("store_sqlite: WAL checkpoint deferred while bulk writer is pinned")
@@ -810,21 +815,64 @@ func (r walCheckpointResult) incomplete() bool {
 }
 
 // runCheckpointLoop attempts one non-blocking PASSIVE checkpoint per interval.
-// It never queues behind graph mutation or a pinned bulk writer. An incomplete
-// reader-limited checkpoint is logged with SQLite's counters and retried at the
-// next interval; it is never reported as a completed drain.
+// Transient deferrals retry on a bounded 1s..30s exponential cadence rather
+// than disappearing until the next five-minute tick. One reusable timer and
+// goroutine-local state prevent retry goroutine/timer storms.
 func (s *Store) runCheckpointLoop(interval time.Duration) {
+	s.runCheckpointLoopWithAttempt(
+		interval,
+		walCheckpointRetryInitial,
+		walCheckpointRetryMax,
+		s.checkpointWALPassive,
+	)
+}
+
+func (s *Store) runCheckpointLoopWithAttempt(
+	interval, retryInitial, retryMax time.Duration,
+	attempt func() bool,
+) {
 	defer close(s.checkpointDone)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	if retryInitial <= 0 {
+		retryInitial = walCheckpointRetryInitial
+	}
+	if retryMax < retryInitial {
+		retryMax = retryInitial
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	retryDelay := retryInitial
 	for {
 		select {
 		case <-s.stopCheckpoint:
 			return
-		case <-ticker.C:
-			s.checkpointWALPassive()
+		case <-timer.C:
+			// If shutdown and the timer become ready together, prefer shutdown
+			// before starting another bounded SQLite call.
+			select {
+			case <-s.stopCheckpoint:
+				return
+			default:
+			}
+			delay := interval
+			if attempt() {
+				delay = retryDelay
+				retryDelay = growWALCheckpointRetry(retryDelay, retryMax)
+			} else {
+				retryDelay = retryInitial
+			}
+			timer.Reset(delay)
 		}
 	}
+}
+
+func growWALCheckpointRetry(current, maximum time.Duration) time.Duration {
+	if current <= 0 {
+		return maximum
+	}
+	if current >= maximum || current > maximum-current {
+		return maximum
+	}
+	return current * 2
 }
 
 func (s *Store) passiveCheckpointWindow() time.Duration {
@@ -834,15 +882,19 @@ func (s *Store) passiveCheckpointWindow() time.Duration {
 	return walPassiveCheckpointTimeout
 }
 
-func (s *Store) checkpointWALPassive() {
+// checkpointWALPassive returns true only when the next periodic attempt should
+// happen on the prompt retry cadence. Permanent driver/I/O errors remain on the
+// ordinary interval; contention, deadlines and measured incomplete drains do
+// not silently wait five minutes.
+func (s *Store) checkpointWALPassive() bool {
 	if !s.writeMu.TryLock() {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_gate")
-		return
+		return true
 	}
 	defer s.writeMu.Unlock()
 	if s.bulkConn != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=bulk_writer")
-		return
+		return true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
@@ -856,15 +908,23 @@ func (s *Store) checkpointWALPassive() {
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy error=%q", err)
-		return
+		return shouldRetryPassiveCheckpoint(err, ctx.Err())
 	}
 	defer func() { _ = conn.Close() }()
 
 	result, err := checkpointWALOnceOn(ctx, conn, "PASSIVE")
 	if err == nil {
-		return
+		return false
 	}
 	log.Print(passiveCheckpointReport(result, err, ctx.Err()))
+	return shouldRetryPassiveCheckpoint(err, ctx.Err())
+}
+
+func shouldRetryPassiveCheckpoint(err, ctxErr error) bool {
+	return errors.Is(err, errSQLiteCheckpointIncomplete) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		ctxErr != nil ||
+		isSQLiteBusyErr(err)
 }
 
 // passiveCheckpointReport renders the log line for a periodic checkpoint that
