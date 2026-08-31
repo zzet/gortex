@@ -143,8 +143,14 @@ type realController struct {
 	startupViews   atomic.Pointer[startupViewReadiness]
 	ready          atomic.Bool
 	warmupSeconds  atomic.Int64
-	enriched       atomic.Bool
-	enrichSeconds  atomic.Int64
+	// referenceEnriched is the legacy parse/resolve/enrichment tail. The
+	// externally visible enriched bit is its conjunction with the frozen exact
+	// startup-view cohort, just like ready is the conjunction above. Keeping
+	// the two facts separate prevents a future caller of MarkEnriched from
+	// reintroducing the old false-complete window.
+	referenceEnriched atomic.Bool
+	enriched          atomic.Bool
+	enrichSeconds     atomic.Int64
 
 	// lastAggregate is the mutex-guarded half of the last status pass that
 	// managed to take mu: the repo table, the workspace rollup and the rest
@@ -166,14 +172,19 @@ type realController struct {
 // checkout catalog seeding. Counts describe exact routed views, never corpus
 // node counts; Failed is an exclusive terminal-attempt subset of Expected.
 type startupViewReadiness struct {
-	Expected int
-	Ready    int
-	Building int
-	Failed   int
+	Expected    int
+	Ready       int
+	Building    int
+	Failed      int
+	ProbeErrors int
 }
 
 func (s startupViewReadiness) complete() bool {
 	return s.Expected == 0 || s.Ready >= s.Expected
+}
+
+func (s startupViewReadiness) terminal() bool {
+	return s.complete() || (s.Expected > 0 && s.Ready+s.Failed >= s.Expected)
 }
 
 func (c *realController) startupViewReadiness() startupViewReadiness {
@@ -195,6 +206,7 @@ func (c *realController) setStartupViewReadiness(snapshot startupViewReadiness) 
 	copy := snapshot
 	c.startupViews.Store(&copy)
 	c.recomputeReady()
+	c.recomputeEnriched()
 }
 
 func (c *realController) recomputeReady() {
@@ -202,6 +214,13 @@ func (c *realController) recomputeReady() {
 		return
 	}
 	c.ready.Store(c.referenceReady.Load() && c.startupViewReadiness().complete())
+}
+
+func (c *realController) recomputeEnriched() {
+	if c == nil {
+		return
+	}
+	c.enriched.Store(c.referenceEnriched.Load() && c.startupViewReadiness().complete())
 }
 
 // filterReadinessPhase keeps every workspace-readiness publisher honest. The
@@ -226,6 +245,9 @@ func (c *realController) filterReadinessPhase(
 	filtered["startup_views_ready"] = snapshot.Ready
 	filtered["startup_views_building"] = snapshot.Building
 	filtered["startup_views_failed"] = snapshot.Failed
+	if snapshot.ProbeErrors > 0 {
+		filtered["startup_views_probe_errors"] = snapshot.ProbeErrors
+	}
 	// Several legacy warmup callers supplied these facts before exact startup
 	// views existed. At the combined workspace boundary they are false until
 	// the frozen cohort is complete.
@@ -1997,9 +2019,10 @@ func (c *realController) IsReady() bool {
 // bypass a configured-Git startup cohort whose exact views are still building.
 func (c *realController) MarkEnriched(d time.Duration) {
 	c.enrichSeconds.Store(int64(d.Seconds()))
-	c.enriched.Store(true)
+	c.referenceEnriched.Store(true)
 	c.referenceReady.Store(true)
 	c.recomputeReady()
+	c.recomputeEnriched()
 }
 
 // IsEnriched reports whether the background enrichment + derivation passes

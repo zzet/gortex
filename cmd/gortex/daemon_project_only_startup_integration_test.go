@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,10 +143,21 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 			startupDone <- attachErr
 			return
 		}
-		controller.MarkEnriched(time.Since(started))
 		checkpoint <- projectOnlyStartupCheckpoint{timings: timings}
 		<-releaseGate
+		monitor.onConfirmedComplete(func() {
+			controller.MarkEnriched(time.Since(started))
+		})
 		gate.Open()
+		terminal, waitErr := monitor.waitTerminal(monitorCtx)
+		if waitErr != nil {
+			startupDone <- waitErr
+			return
+		}
+		if !terminal.complete() {
+			startupDone <- fmt.Errorf("startup view terminal failure: %+v", terminal)
+			return
+		}
 		startupDone <- nil
 	}()
 
@@ -175,8 +187,8 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 	}, 5*time.Second, 10*time.Millisecond)
 	require.True(t, controller.referenceReady.Load(),
 		"legacy/reference warmup should have completed")
-	require.True(t, controller.IsEnriched(),
-		"the real warmup tail should have completed before the gate opens")
+	require.False(t, controller.IsEnriched(),
+		"legacy enrichment must not publish full enrichment before the exact view")
 	require.False(t, controller.IsReady(),
 		"reference warmup must not expose ready while the exact view is gated")
 
@@ -220,6 +232,8 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 	}
 	require.Eventually(t, controller.IsReady, 20*time.Second, 10*time.Millisecond,
 		"exact-view transition did not publish daemon readiness")
+	require.True(t, controller.IsEnriched(),
+		"full enrichment must publish only after the exact route is ready")
 
 	statusCtx, cancelStatus = context.WithTimeout(ctx, 5*time.Second)
 	readyStatus, err := controller.Status(statusCtx)

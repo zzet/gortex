@@ -74,12 +74,16 @@ type startupViewReadinessProbe func(context.Context, string) (daemon.TrackReadin
 // catalog/materialization reads stay off the lifecycle worker (one explicit
 // post-Seed snapshot, then the one monitor goroutine).
 type startupViewReadinessMonitor struct {
-	paths       []string
-	changed     chan struct{}
-	initialized chan struct{}
-	initOnce    sync.Once
-	watching    chan struct{}
-	watchOnce   sync.Once
+	paths        []string
+	changed      chan struct{}
+	snapshots    chan struct{}
+	initialized  chan struct{}
+	initOnce     sync.Once
+	watching     chan struct{}
+	watchOnce    sync.Once
+	completeOnce sync.Once
+	retryInitial time.Duration
+	retryMax     time.Duration
 
 	mu          sync.Mutex
 	cohort      []string
@@ -88,17 +92,126 @@ type startupViewReadinessMonitor struct {
 	frozen      bool
 	failures    map[string]struct{}
 	revision    uint64
+	latest      startupViewReadiness
+	hasLatest   bool
+	confirmed   bool
+	finalized   bool
+	onComplete  func()
 }
 
 func newStartupViewReadinessMonitor(paths []string) *startupViewReadinessMonitor {
 	return &startupViewReadinessMonitor{
-		paths:       append([]string(nil), paths...),
-		changed:     make(chan struct{}, 1),
-		initialized: make(chan struct{}),
-		watching:    make(chan struct{}),
-		checkoutIDs: make(map[string]string),
-		cohortIDs:   make(map[string]struct{}),
-		failures:    make(map[string]struct{}),
+		paths:        append([]string(nil), paths...),
+		changed:      make(chan struct{}, 1),
+		snapshots:    make(chan struct{}, 1),
+		initialized:  make(chan struct{}),
+		watching:     make(chan struct{}),
+		checkoutIDs:  make(map[string]string),
+		cohortIDs:    make(map[string]struct{}),
+		failures:     make(map[string]struct{}),
+		retryInitial: 250 * time.Millisecond,
+		retryMax:     15 * time.Second,
+	}
+}
+
+func (m *startupViewReadinessMonitor) notifySnapshot() {
+	if m == nil {
+		return
+	}
+	select {
+	case m.snapshots <- struct{}{}:
+	default:
+	}
+}
+
+func (m *startupViewReadinessMonitor) retainSnapshot(snapshot startupViewReadiness) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.latest = snapshot
+	m.hasLatest = true
+	if !snapshot.complete() {
+		m.confirmed = false
+		m.finalized = false
+	}
+	m.mu.Unlock()
+	m.notifySnapshot()
+}
+
+// onConfirmedComplete registers the post-publication continuation. It never
+// invokes user work in the caller: a retained completion only wakes the joined
+// readiness watcher, which owns finalization and therefore cannot race daemon
+// teardown even when the cohort completed before registration.
+func (m *startupViewReadinessMonitor) onConfirmedComplete(fn func()) {
+	if m == nil || fn == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.onComplete == nil {
+		m.onComplete = fn
+	}
+	m.mu.Unlock()
+	m.requestRefresh()
+}
+
+func (m *startupViewReadinessMonitor) runCompleteCallback(callback func()) {
+	if m == nil || callback == nil {
+		return
+	}
+	m.completeOnce.Do(callback)
+	m.mu.Lock()
+	m.finalized = true
+	m.mu.Unlock()
+	m.notifySnapshot()
+}
+
+func (m *startupViewReadinessMonitor) finalizationComplete() bool {
+	if m == nil {
+		return true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.finalized
+}
+
+func (m *startupViewReadinessMonitor) confirmComplete(snapshot startupViewReadiness) {
+	if m == nil || !snapshot.complete() {
+		return
+	}
+	m.mu.Lock()
+	m.latest = snapshot
+	m.hasLatest = true
+	m.confirmed = true
+	callback := m.onComplete
+	m.mu.Unlock()
+	// Keep post-publication work inside the startup activity window: terminal
+	// waiters are notified only after the continuation finishes.
+	if callback != nil {
+		m.runCompleteCallback(callback)
+		return
+	}
+	m.notifySnapshot()
+}
+
+func (m *startupViewReadinessMonitor) waitTerminal(
+	ctx context.Context,
+) (startupViewReadiness, error) {
+	if m == nil {
+		return startupViewReadiness{}, nil
+	}
+	for {
+		m.mu.Lock()
+		snapshot, hasLatest, finalized := m.latest, m.hasLatest, m.finalized
+		m.mu.Unlock()
+		if hasLatest && (finalized || (snapshot.terminal() && !snapshot.complete())) {
+			return snapshot, nil
+		}
+		select {
+		case <-ctx.Done():
+			return startupViewReadiness{}, ctx.Err()
+		case <-m.snapshots:
+		}
 	}
 }
 
@@ -199,7 +312,11 @@ func (m *startupViewReadinessMonitor) snapshot(
 		cohort = append(cohort, path)
 		result.Expected++
 		if err != nil {
-			result.Failed++
+			// Catalog/materialization reads are transient evidence. Retain the
+			// member as building and let the monitor's one bounded timer retry;
+			// only an explicit lifecycle/generation failure is terminal.
+			result.Building++
+			result.ProbeErrors++
 			continue
 		}
 		checkoutID := ""
@@ -258,6 +375,7 @@ func (m *startupViewReadinessMonitor) snapshot(
 		}
 		m.mu.Unlock()
 	}
+	m.retainSnapshot(result)
 	return result
 }
 
@@ -288,6 +406,19 @@ func publishStartupViewReadiness(
 	publishReadinessPhase(state, phase, true, extra)
 }
 
+func nextStartupViewReadinessRetry(delay, maximum time.Duration) time.Duration {
+	if delay <= 0 {
+		delay = time.Millisecond
+	}
+	if maximum < delay {
+		maximum = delay
+	}
+	if delay >= maximum || delay > maximum/2 {
+		return maximum
+	}
+	return delay * 2
+}
+
 func watchStartupViewReadiness(
 	ctx context.Context,
 	state *daemonState,
@@ -304,39 +435,89 @@ func watchStartupViewReadiness(
 		return
 	case <-monitor.initialized:
 	}
+	retryDelay := monitor.retryInitial
+	if retryDelay <= 0 {
+		retryDelay = 250 * time.Millisecond
+	}
+	retryMax := monitor.retryMax
+	if retryMax < retryDelay {
+		retryMax = retryDelay
+	}
+	var retryTimer *time.Timer
+	var retryC <-chan time.Time
+	stopRetry := func() {
+		if retryTimer != nil && !retryTimer.Stop() {
+			select {
+			case <-retryTimer.C:
+			default:
+			}
+		}
+		retryC = nil
+	}
+	defer stopRetry()
+	scheduleRetry := func() {
+		if retryC != nil {
+			return
+		}
+		if retryTimer == nil {
+			retryTimer = time.NewTimer(retryDelay)
+		} else {
+			retryTimer.Reset(retryDelay)
+		}
+		retryC = retryTimer.C
+		retryDelay = nextStartupViewReadinessRetry(retryDelay, retryMax)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-monitor.changed:
-			for {
-				revision := monitor.currentRevision()
-				snapshot := monitor.snapshot(ctx, probe)
-				controller.setStartupViewReadiness(snapshot)
-				publishStartupViewReadiness(state, controller)
-				if !snapshot.complete() {
-					break
+		case <-retryC:
+			retryC = nil
+		}
+		for {
+			revision := monitor.currentRevision()
+			snapshot := monitor.snapshot(ctx, probe)
+			controller.setStartupViewReadiness(snapshot)
+			publishStartupViewReadiness(state, controller)
+			if snapshot.ProbeErrors > 0 {
+				scheduleRetry()
+			} else {
+				stopRetry()
+				retryDelay = monitor.retryInitial
+				if retryDelay <= 0 {
+					retryDelay = 250 * time.Millisecond
 				}
-				if monitor.currentRevision() != revision {
-					continue
-				}
-				// An event that landed while the confirming probe ran already
-				// updated failures before it queued this edge. Consume it before
-				// choosing the completion linearization point, and re-probe now
-				// rather than waiting for a third event that may never arrive.
-				select {
-				case <-monitor.changed:
-					continue
-				default:
-				}
-				if monitor.currentRevision() != revision {
-					continue
-				}
-				if state != nil && state.lifecycle != nil {
-					state.lifecycle.SetModeTransitionObserver(nil)
-				}
-				return
 			}
+			if !snapshot.complete() {
+				break
+			}
+			if monitor.currentRevision() != revision {
+				continue
+			}
+			// An event that landed while the confirming probe ran already
+			// updated failures before it queued this edge. Consume it before
+			// choosing the completion linearization point, and re-probe now
+			// rather than waiting for a third event that may never arrive.
+			select {
+			case <-monitor.changed:
+				continue
+			default:
+			}
+			if monitor.currentRevision() != revision {
+				continue
+			}
+			monitor.confirmComplete(snapshot)
+			if !monitor.finalizationComplete() {
+				// Completion outran callback registration. The level state is
+				// retained; registration queues the one edge that brings this
+				// joined watcher back to run the continuation.
+				break
+			}
+			if state != nil && state.lifecycle != nil {
+				state.lifecycle.SetModeTransitionObserver(nil)
+			}
+			return
 		}
 	}
 }
@@ -877,52 +1058,65 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		if v1EventHub != nil && mw != nil {
 			go v1EventHub.Run(mw.Events())
 		}
-		// Community detection and process discovery are a whole-graph pass
-		// costing minutes on a large workspace, and most sessions never ask
-		// for them. Running it here delayed readiness and kept the result
-		// resident for every daemon whether or not anything read it, so the
-		// pass is now started by the first consumer that needs it: those
-		// tools answer with a retry hint while it runs in the background
-		// instead of the old "run index_repository first", which was
-		// misleading against a fully populated graph.
-		if state.mcpServer != nil {
-			publishReadinessPhase(state, "analysis_deferred", true, map[string]any{
-				"reason": "analysis runs on first use",
+		referenceElapsed := time.Since(start)
+		logger.Info("daemon: reference enrichment complete; admitting exact startup views",
+			zap.Duration("warmup", referenceElapsed),
+			zap.Int("startup_views_expected", startupSnapshot.Expected))
+
+		// This continuation is registered before the build gate opens and is
+		// level-triggered by the monitor, so an empty/warm cohort and a very fast
+		// transition cannot outrun it. MarkEnriched is deliberately last: status,
+		// health, snapshots and agents must not observe full enrichment before
+		// the routed exact corpus and all graph-dependent finalizers exist.
+		finalizeEnrichment := func() {
+			runtimeactivity.Begin("startup_finalize")
+			defer func() {
+				runtimeactivity.End("startup_finalize")
+				releaseMemoryToOS(logger, "startup_views_complete")
+			}()
+
+			// Community detection and process discovery remain first-use work.
+			// Co-change mining is merely pre-warmed after the final corpus is
+			// published, so it cannot race cold generation construction.
+			if state.mcpServer != nil {
+				publishReadinessPhase(state, "analysis_deferred", false, map[string]any{
+					"reason": "analysis runs on first use",
+				})
+				state.mcpServer.PrewarmCoChange()
+			}
+			// These readers must observe the settled routed graph, not generation
+			// zero or a partially published dedicated stack.
+			logRepoOwnershipAudit(state.graph, logger)
+			if state.mcpServer != nil {
+				state.mcpServer.MigrateSymbolAnchors(logger)
+			}
+
+			elapsed := time.Since(start)
+			controller.MarkEnriched(elapsed)
+			logger.Info("daemon: enrichment complete", zap.Duration("warmup", elapsed))
+			publishReadinessPhase(state, "enrichment_complete", true, map[string]any{
+				"enriched":       true,
+				"warmup_seconds": int64(elapsed.Seconds()),
+				"warmup_ms":      elapsed.Milliseconds(),
 			})
-			// Co-change pre-warm: fire the git-history mine in the
-			// background so the first user-visible
-			// find_co_changing_symbols / search-rerank call sees a
-			// populated cache. On a persistent backend the mine is
-			// dominated by the AllNodes + per-pair AddEdge disk-persist
-			// step that mineCoChange already defers into its own
-			// goroutine — but even the git log itself can take 10–30s
-			// on a large history, and we want that off every request
-			// path.
-			state.mcpServer.PrewarmCoChange()
+			logWarmupSummary(logger, warmup, queryableElapsed, elapsed)
 		}
-		elapsed := time.Since(start)
-		controller.MarkEnriched(elapsed)
-		// The warmup tail is done, so the view builds that were competing with
-		// it are admitted. Every coordinator holding a cycle and every ref-view
-		// build parked on a claim starts here, without being asked again.
+		startupReadiness.onConfirmedComplete(finalizeEnrichment)
+
+		// The reference tail is done, so the exact view builds that were
+		// competing with it are admitted. The level-triggered waiter below was
+		// armed above; opening the gate before waiting is the progress edge.
 		viewBuilds.Open()
-		logger.Info("daemon: enrichment complete", zap.Duration("warmup", elapsed))
-		publishReadinessPhase(state, "enrichment_complete", true, map[string]any{
-			"enriched":       true,
-			"warmup_seconds": int64(elapsed.Seconds()),
-			"warmup_ms":      elapsed.Milliseconds(),
-		})
-		logWarmupSummary(logger, warmup, queryableElapsed, elapsed)
-		// Audit repo ownership once the graph has settled. Runs here, after
-		// every reconcile and derived pass, so it observes the state the
-		// daemon will actually serve rather than a mid-warmup transient.
-		logRepoOwnershipAudit(state.graph, logger)
-		// Carry stored note / memory symbol anchors onto prefixed node ids.
-		// Also here, and for the same reason: the rewrite decides by asking
-		// the graph which ids resolve, so it needs the settled graph. Marked
-		// per repo in the sidecar, so this is a no-op on every later start.
-		if state.mcpServer != nil {
-			state.mcpServer.MigrateSymbolAnchors(logger)
+		terminal, waitErr := startupReadiness.waitTerminal(startupReadinessCtx)
+		if waitErr != nil {
+			logger.Info("daemon: exact startup-view wait cancelled", zap.Error(waitErr))
+			return
+		}
+		if !terminal.complete() {
+			logger.Error("daemon: exact startup-view publication failed",
+				zap.Int("expected", terminal.Expected),
+				zap.Int("ready", terminal.Ready),
+				zap.Int("failed", terminal.Failed))
 		}
 	}()
 
