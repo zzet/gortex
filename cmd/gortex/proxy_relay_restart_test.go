@@ -238,16 +238,50 @@ func stopProxyRestartDaemon(t *testing.T, server *daemon.Server, done <-chan err
 	if server == nil {
 		return
 	}
-	if err := server.Shutdown(); err != nil {
-		t.Fatal(err)
-	}
+	shutdownErr := server.Shutdown()
 	select {
 	case err := <-done:
+		server.ReleaseProcessState()
+		if shutdownErr != nil {
+			t.Fatal(shutdownErr)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(2 * time.Second):
+		if shutdownErr != nil {
+			t.Errorf("daemon shutdown: %v", shutdownErr)
+		}
 		t.Fatal("daemon did not stop")
+	}
+}
+
+func BenchmarkProxyRestartDaemonLifecycle(b *testing.B) {
+	dir, err := os.MkdirTemp("/tmp", "gxpb")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = os.RemoveAll(dir) })
+	b.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
+	b.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
+	socket := filepath.Join(dir, "s")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		server := daemon.New(socket, "benchmark", zap.NewNop())
+		if err := server.Listen(); err != nil {
+			b.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- server.Serve() }()
+		if err := server.Shutdown(); err != nil {
+			b.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			b.Fatal(err)
+		}
+		server.ReleaseProcessState()
 	}
 }
 

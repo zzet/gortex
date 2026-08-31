@@ -105,8 +105,20 @@ func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot strin
 	d.MCPDispatcher = newMCPDispatcher(srv, mi, zap.NewNop())
 
 	require.NoError(t, d.Listen())
-	go func() { _ = d.Serve() }()
-	t.Cleanup(func() { _ = d.Shutdown() })
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- d.Serve() }()
+	t.Cleanup(func() {
+		shutdownErr := d.Shutdown()
+		select {
+		case err := <-serveDone:
+			d.ReleaseProcessState()
+			require.NoError(t, shutdownErr)
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			require.NoError(t, shutdownErr)
+			t.Error("daemon did not stop")
+		}
+	})
 
 	require.Eventually(t, func() bool { return daemon.IsRunningAt(socket) },
 		2*time.Second, 10*time.Millisecond)
