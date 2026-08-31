@@ -149,6 +149,9 @@ func RegisterAll(reg *parser.Registry) {
 	// Scientific / enterprise
 	reg.Register(NewApexExtractor())
 	reg.Register(NewABAPExtractor())
+	// Qik Basic (.qik) — QBasic-shaped dialect; regex only (no upstream
+	// tree-sitter grammar). Claims .qik exclusively.
+	reg.Register(NewQikBasicExtractor())
 	reg.Register(NewMatlabExtractor())
 	reg.Register(NewMathematicaExtractor())
 	reg.Register(NewSASExtractor())

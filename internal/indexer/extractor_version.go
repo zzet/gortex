@@ -86,6 +86,7 @@ var extractorSaltExtLang = map[string]string{
 	".exs":    "elixir",
 	".sh":     "bash",
 	".bash":   "bash",
+	".qik":    "qikbasic",
 }
 
 // ExtractorLangForFile returns the extractor-staleness language key for a

@@ -1,6 +1,6 @@
 # Supported Languages
 
-Gortex currently indexes **256 languages**. Each language has an extractor that
+Gortex currently indexes **257 languages**. Each language has an extractor that
 walks the source, emits symbols (functions, methods, types, interfaces,
 variables) into the graph, and records `imports` / `calls` edges.
 
@@ -42,7 +42,7 @@ server matrix, install commands, lifecycle knobs, and config schema.
 | Scripting & shell | 10 | Bash, PowerShell, Batch, Perl, Raku, Lua, Tcl, VimScript, AutoHotkey, CoffeeScript |
 | Functional | 8 | Haskell, OCaml, Elixir, Clojure, Erlang, Racket, Gleam, Emacs Lisp |
 | Systems / emerging | 8 | Nim, Crystal, Mojo, Odin, V, Hare, Carbon, ReScript |
-| Scientific & enterprise | 12 | Julia, R, MATLAB, Mathematica, SAS, Stata, Fortran, COBOL, Ada, Pascal, ABAP, Apex |
+| Scientific & enterprise | 13 | Julia, R, MATLAB, Mathematica, SAS, Stata, Fortran, COBOL, Ada, Pascal, ABAP, Apex, Qik Basic |
 | Mobile & game | 4 | Dart, GDScript, Verse, ActionScript |
 | Blockchain / smart contracts | 6 | Solidity, Move, Cairo, Noir, Tact, Ballerina |
 | Template engines | 8 | Blade, EJS, Handlebars, Jinja, Twig, ERB, Liquid, Pug |
@@ -57,7 +57,7 @@ server matrix, install commands, lifecycle knobs, and config schema.
 | Forest — DB / query | 8 | SPARQL, SurrealQL, PromQL, Kusto, SOQL, SOSL, PRQL, Turtle |
 | Forest — data / lockfiles / shells / configs | ~28 | TSV, PSV, textproto, .po, PGN, todo.txt, go.mod / go.sum / go.work, Fish, Nushell, jq, Awk, Elvish, gitconfig / gitattributes / gitcommit / gitignore, Hyprlang, nftables, passwd, PEM, PoE filter, Puppet, ssh_config, sxhkdrc, tmux |
 | Forest — misc | ~14 | DOT, gnuplot, GPG, Strace, VRL, Zeek, Ziggy + Schema, Starlark, SourcePawn, SCSS, RBS, OCamllex, DataWeave, USD, WIT |
-| **Total** | **256** | |
+| **Total** | **257** | |
 
 ## Core programming — deep extraction
 
@@ -199,6 +199,7 @@ What is **not** covered:
 | Ada | `.ada`, `.adb`, `.ads` | Packages, procedures, functions, `with` |
 | Pascal / Delphi | `.pas`, `.pp`, `.dpr` | Units, procedures, functions, classes |
 | ABAP (SAP) | `.abap` | `FORM` / `FUNCTION` / `METHOD` / `CLASS…DEFINITION`, `INCLUDE` |
+| Qik Basic | `.qik` | `SUB` / `FUNCTION` / `DEF FN` / `TYPE`, labels, `DECLARE`, `CALL` / `GOSUB`, `$INCLUDE` |
 | Apex (Salesforce) | `.cls`, `.trigger`, `.apex` | Classes, triggers, methods |
 
 ## Emerging languages
