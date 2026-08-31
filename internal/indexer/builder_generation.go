@@ -19,8 +19,11 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 	"github.com/zzet/gortex/internal/semantic"
 )
+
+const sparseGenerationBuildActivity = "sparse_generation_build"
 
 // The sparse generation builder.
 //
@@ -542,6 +545,15 @@ func (b *SparseGenerationBuilder) buildPrepared(
 		}
 		return generationID, report, err
 	}
+
+	// Only the physical flight leader owns process activity. Ready reuse and
+	// followers do no payload work; counting them would unnecessarily suppress
+	// runtime maintenance. This guard spans preparation, planning, every store
+	// write, publication/abandonment and terminal flight completion, and its
+	// defer balances success, ordinary error, converted storage panic and
+	// re-panicked programmer faults alike.
+	runtimeactivity.Begin(sparseGenerationBuildActivity)
+	defer runtimeactivity.End(sparseGenerationBuildActivity)
 
 	report.Coalesced = false
 	b.buildFailures.start(identity.CheckoutID, generationID)

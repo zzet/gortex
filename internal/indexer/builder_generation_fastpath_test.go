@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 type poisonGenerationSource struct {
@@ -310,5 +312,110 @@ func TestSparseGenerationBuilderAbandonSurvivesCanceledBuildContext(t *testing.T
 	}
 	if row.State != store_sqlite.ViewGenerationFailed {
 		t.Fatalf("abandoned generation state = %q, want %q", row.State, store_sqlite.ViewGenerationFailed)
+	}
+}
+
+func TestSparseGenerationBuilderTracksRuntimeActivityThroughPublish(t *testing.T) {
+	builder, store := newFastPathTestBuilder(t)
+	req := fastPathBuildRequest(t, store, &poisonGenerationSource{}, "activity-success")
+	before := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
+	req.PrePublish = func(context.Context, int64) error {
+		active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
+		if active != before+1 {
+			t.Fatalf("activity during publication = %d, want %d", active, before+1)
+		}
+		return nil
+	}
+
+	if _, _, err := builder.Build(context.Background(), req); err != nil {
+		t.Fatalf("build generation: %v", err)
+	}
+	if active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]; active != before {
+		t.Fatalf("activity after publication = %d, want baseline %d", active, before)
+	}
+}
+
+func TestSparseGenerationBuilderReleasesRuntimeActivityOnError(t *testing.T) {
+	builder, store := newFastPathTestBuilder(t)
+	req := fastPathBuildRequest(t, store, &poisonGenerationSource{}, "activity-error")
+	before := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
+	wantErr := errors.New("reject publication")
+	req.PrePublish = func(context.Context, int64) error {
+		active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
+		if active != before+1 {
+			t.Fatalf("activity during failed publication = %d, want %d", active, before+1)
+		}
+		return wantErr
+	}
+
+	if _, _, err := builder.Build(context.Background(), req); !errors.Is(err, wantErr) {
+		t.Fatalf("build error = %v, want %v", err, wantErr)
+	}
+	if active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]; active != before {
+		t.Fatalf("activity after failed publication = %d, want baseline %d", active, before)
+	}
+}
+
+func TestSparseGenerationBuilderReleasesRuntimeActivityOnPanic(t *testing.T) {
+	builder, store := newFastPathTestBuilder(t)
+	req := fastPathBuildRequest(t, store, &poisonGenerationSource{}, "activity-panic")
+	before := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
+	req.PrePublish = func(context.Context, int64) error {
+		panic("injected publication panic")
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("build did not propagate injected panic")
+			}
+		}()
+		_, _, _ = builder.Build(context.Background(), req)
+	}()
+	if active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]; active != before {
+		t.Fatalf("activity after panicked publication = %d, want baseline %d", active, before)
+	}
+}
+
+func BenchmarkSparseGenerationRuntimeActivityGuard(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		runtimeactivity.Begin(sparseGenerationBuildActivity)
+		runtimeactivity.End(sparseGenerationBuildActivity)
+	}
+}
+
+func BenchmarkSparseGenerationEmptyPhysicalBuild(b *testing.B) {
+	store, err := store_sqlite.Open(filepath.Join(b.TempDir(), "graph.db"))
+	if err != nil {
+		b.Fatalf("open store: %v", err)
+	}
+	b.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			b.Errorf("close store: %v", err)
+		}
+	})
+	builder := &SparseGenerationBuilder{
+		Store: store, Registry: parser.NewRegistry(), Config: config.IndexConfig{}, Logger: zap.NewNop(),
+	}
+	root := b.TempDir()
+	requests := make([]BuildRequest, b.N)
+	for i := range requests {
+		requests[i] = BuildRequest{
+			Identity:    fastPathGenerationIdentity("benchmark-" + strconv.Itoa(i)),
+			Base:        store.AtGeneration(0),
+			Target:      &poisonGenerationSource{},
+			RootPath:    root,
+			RepoPrefix:  "repo",
+			WorkspaceID: "workspace",
+			ProjectID:   "project",
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		if _, _, err := builder.Build(context.Background(), requests[i]); err != nil {
+			b.Fatalf("build %d: %v", i, err)
+		}
 	}
 }
