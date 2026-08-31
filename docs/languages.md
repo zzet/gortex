@@ -42,7 +42,7 @@ server matrix, install commands, lifecycle knobs, and config schema.
 | Scripting & shell | 10 | Bash, PowerShell, Batch, Perl, Raku, Lua, Tcl, VimScript, AutoHotkey, CoffeeScript |
 | Functional | 8 | Haskell, OCaml, Elixir, Clojure, Erlang, Racket, Gleam, Emacs Lisp |
 | Systems / emerging | 8 | Nim, Crystal, Mojo, Odin, V, Hare, Carbon, ReScript |
-| Scientific & enterprise | 13 | Julia, R, MATLAB, Mathematica, SAS, Stata, Fortran, COBOL, Ada, Pascal, ABAP, Apex, Qik Basic |
+| Scientific & enterprise | 13 | Julia, R, MATLAB, Mathematica, SAS, Stata, Fortran, COBOL, Ada, Pascal, ABAP, Apex, Qik (ABA) |
 | Mobile & game | 4 | Dart, GDScript, Verse, ActionScript |
 | Blockchain / smart contracts | 6 | Solidity, Move, Cairo, Noir, Tact, Ballerina |
 | Template engines | 8 | Blade, EJS, Handlebars, Jinja, Twig, ERB, Liquid, Pug |
@@ -199,7 +199,7 @@ What is **not** covered:
 | Ada | `.ada`, `.adb`, `.ads` | Packages, procedures, functions, `with` |
 | Pascal / Delphi | `.pas`, `.pp`, `.dpr` | Units, procedures, functions, classes |
 | ABAP (SAP) | `.abap` | `FORM` / `FUNCTION` / `METHOD` / `CLASS…DEFINITION`, `INCLUDE` |
-| Qik Basic | `.qik` | `SUB` / `FUNCTION` / `DEF FN` / `TYPE`, labels, `DECLARE`, `CALL` / `GOSUB`, `$INCLUDE` |
+| Qik (ABA/Sabre) | `.qik` | script unit, `label` / `goto`, `call` (other scripts), `build_local_data_item` |
 | Apex (Salesforce) | `.cls`, `.trigger`, `.apex` | Classes, triggers, methods |
 
 ## Emerging languages

@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -8,55 +9,41 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 )
 
-// Qik Basic is a QBasic/QuickBASIC-shaped dialect stored under the
-// `.qik` extension. Keyword-delimited, case-insensitive. Procedures
-// are `SUB name ... END SUB`, value-returning procedures are
-// `FUNCTION name ... END FUNCTION`, legacy one-liners are `DEF FN`,
-// user types are `TYPE name ... END TYPE`, forward decls are
-// `DECLARE {SUB|FUNCTION}`, and modules are pulled in via
-// `$INCLUDE 'path'` / `INCLUDE "path"`. Calls are `CALL name`, bare
-// `name args` after DECLARE, and `GOSUB label`.
+// Qik / ABA QIK is the Sabre mid-office scripting dialect used under
+// `.qik` (e.g. ITS.ABA.QIK SCRIPT trees). It is NOT classic QBasic.
 //
-// No upstream tree-sitter grammar exists for this dialect, so
-// extraction is regex-only (signature + import + call edges).
+// Scripts are imperative command lists. Each file is one script.
+// Structural surface worth indexing:
+//
+//	label  'name'                 jump targets
+//	goto   'name'                 jumps → call-like edge to a label
+//	call   'script'               invoke another .qik script
+//	build_local_data_item  name   local data slot
+//	; comment / ' comment
+//
+// Control keywords (if / end_if / while / …) are flow, not symbols.
+// No upstream tree-sitter grammar — regex only.
 var (
-	qikSubRe = regexp.MustCompile(
-		`(?im)^\s*SUB\s+([A-Za-z][\w.]*)\s*(?:\(|STATIC\b|$)`)
-	qikFunctionRe = regexp.MustCompile(
-		`(?im)^\s*FUNCTION\s+([A-Za-z][\w.%&!#$]*)\s*(?:\(|STATIC\b|$)`)
-	qikDefFnRe = regexp.MustCompile(
-		`(?im)^\s*DEF\s+FN([A-Za-z][\w.%&!#$]*)`)
-	qikTypeRe = regexp.MustCompile(
-		`(?im)^\s*TYPE\s+([A-Za-z][\w.]*)`)
-	qikDeclareRe = regexp.MustCompile(
-		`(?im)^\s*DECLARE\s+(?:SUB|FUNCTION)\s+([A-Za-z][\w.%&!#$]*)`)
-	qikIncludeRe = regexp.MustCompile(
-		`(?im)^\s*(?:\$?INCLUDE)\s+['"]([^'"]+)['"]`)
-	// CALL name[(...)] — classic explicit call form.
-	qikCallRe = regexp.MustCompile(
-		`(?im)^\s*CALL\s+([A-Za-z][\w.]*)`)
-	// GOSUB label — legacy subroutine jump; treated as a call edge.
-	qikGosubRe = regexp.MustCompile(
-		`(?im)^\s*GOSUB\s+([A-Za-z][\w.]*)`)
-	// Line label definitions: Label: at column start (not SUB/FUNCTION).
-	qikLabelRe = regexp.MustCompile(
-		`(?im)^\s*([A-Za-z][\w.]*)\s*:`)
+	// label 'foo'  |  label foo
+	qikLabelCmdRe = regexp.MustCompile(
+		`(?im)^\s*label\s+('([^']+)'|"([^"]+)"|([A-Za-z_][\w.]*))`)
+	// goto 'foo'   |  goto foo
+	qikGotoRe = regexp.MustCompile(
+		`(?im)^\s*goto\s+('([^']+)'|"([^"]+)"|([A-Za-z_][\w.]*))`)
+	// call 'script' | call script  (optional trailing args ignored)
+	qikCallScriptRe = regexp.MustCompile(
+		`(?im)^\s*call\s+('([^']+)'|"([^"]+)"|([A-Za-z_][\w.]*))`)
+	// build_local_data_item name …
+	qikBuildLocalRe = regexp.MustCompile(
+		`(?im)^\s*build_local_data_item\s+('([^']+)'|"([^"]+)"|([A-Za-z_][\w.]*))`)
+	// Script header: ;* Script Name  : foo
+	qikScriptNameRe = regexp.MustCompile(
+		`(?im)^\s*;\*\s*Script\s+Name\s*:\s*(\S+)`)
 )
 
-// reservedQikLabels are statement keywords that can look like labels
-// when a trailing colon is used as a statement separator (e.g. IF x THEN:).
-var reservedQikLabels = map[string]bool{
-	"if": true, "for": true, "do": true, "while": true, "select": true,
-	"case": true, "else": true, "elseif": true, "end": true, "next": true,
-	"loop": true, "wend": true, "sub": true, "function": true, "type": true,
-	"declare": true, "def": true, "dim": true, "const": true, "static": true,
-	"shared": true, "common": true, "call": true, "gosub": true, "goto": true,
-	"return": true, "exit": true, "print": true, "input": true, "let": true,
-	"rem": true, "data": true, "read": true, "restore": true, "on": true,
-	"error": true, "resume": true, "open": true, "close": true, "with": true,
-}
-
-// QikBasicExtractor extracts Qik Basic (.qik) source using regex.
+// QikBasicExtractor extracts ABA/Sabre QIK (.qik) scripts using regex.
+// Language id stays "qikbasic" for registry stability with the first
+// registration; the dialect is ABA QIK, not Microsoft QBasic.
 type QikBasicExtractor struct{}
 
 func NewQikBasicExtractor() *QikBasicExtractor { return &QikBasicExtractor{} }
@@ -68,16 +55,41 @@ func (e *QikBasicExtractor) Extract(filePath string, src []byte) (*parser.Extrac
 	lines := strings.Split(string(src), "\n")
 	result := &parser.ExtractionResult{}
 
+	endLine := len(lines)
+	if endLine < 1 {
+		endLine = 1
+	}
+
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,
-		FilePath: filePath, StartLine: 1, EndLine: len(lines),
+		FilePath: filePath, StartLine: 1, EndLine: endLine,
 		Language: "qikbasic",
 	}
 	result.Nodes = append(result.Nodes, fileNode)
 
+	// Prefer header Script Name; else basename without extension.
+	scriptName := qikHeaderScriptName(src)
+	if scriptName == "" {
+		base := filepath.Base(filePath)
+		scriptName = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	if scriptName != "" {
+		sid := filePath + "::script:" + scriptName
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: sid, Kind: graph.KindFunction, Name: scriptName,
+			FilePath: filePath, StartLine: 1, EndLine: endLine,
+			Language: "qikbasic",
+			Meta:     map[string]any{"qik_role": "script"},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: sid, Kind: graph.EdgeDefines,
+			FilePath: filePath, Line: 1,
+		})
+	}
+
 	seen := make(map[string]bool)
-	add := func(name string, kind graph.NodeKind, start, end int) {
-		name = stripQikTypeSuffix(name)
+	add := func(name string, kind graph.NodeKind, start int, role string) {
+		name = strings.TrimSpace(name)
 		if name == "" {
 			return
 		}
@@ -86,120 +98,100 @@ func (e *QikBasicExtractor) Extract(filePath string, src []byte) (*parser.Extrac
 			return
 		}
 		seen[id] = true
-		result.Nodes = append(result.Nodes, &graph.Node{
+		n := &graph.Node{
 			ID: id, Kind: kind, Name: name,
-			FilePath: filePath, StartLine: start, EndLine: end,
+			FilePath: filePath, StartLine: start, EndLine: start,
 			Language: "qikbasic",
-		})
+		}
+		if role != "" {
+			n.Meta = map[string]any{"qik_role": role}
+		}
+		result.Nodes = append(result.Nodes, n)
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileNode.ID, To: id, Kind: graph.EdgeDefines,
 			FilePath: filePath, Line: start,
 		})
 	}
 
-	for _, m := range qikSubRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
+	for _, m := range qikLabelCmdRe.FindAllSubmatchIndex(src, -1) {
+		name := qikQuotedGroup(src, m)
 		line := lineAt(src, m[0])
-		end := findKeywordBlockEnd(lines, line, "end sub")
-		add(name, graph.KindFunction, line, end)
+		add(name, graph.KindVariable, line, "label")
 	}
-	for _, m := range qikFunctionRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
+	for _, m := range qikBuildLocalRe.FindAllSubmatchIndex(src, -1) {
+		name := qikQuotedGroup(src, m)
 		line := lineAt(src, m[0])
-		end := findKeywordBlockEnd(lines, line, "end function")
-		add(name, graph.KindFunction, line, end)
-	}
-	for _, m := range qikDefFnRe.FindAllSubmatchIndex(src, -1) {
-		name := "FN" + string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		// DEF FN is often one line; END DEF closes multi-line forms.
-		end := findKeywordBlockEnd(lines, line, "end def")
-		add(name, graph.KindFunction, line, end)
-	}
-	for _, m := range qikTypeRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		end := findKeywordBlockEnd(lines, line, "end type")
-		add(name, graph.KindType, line, end)
-	}
-	// DECLARE is a forward signature only — record as a variable so the
-	// name is searchable without inventing a second function body node
-	// when the real SUB/FUNCTION also lives in this file.
-	for _, m := range qikDeclareRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		line := lineAt(src, m[0])
-		idName := stripQikTypeSuffix(name)
-		if idName == "" {
-			continue
-		}
-		// Skip when the body already defines the same name.
-		if seen[filePath+"::"+idName] {
-			continue
-		}
-		add(name, graph.KindVariable, line, line)
-	}
-	for _, m := range qikLabelRe.FindAllSubmatchIndex(src, -1) {
-		name := string(src[m[2]:m[3]])
-		if reservedQikLabels[strings.ToLower(name)] {
-			continue
-		}
-		line := lineAt(src, m[0])
-		// Labels are jump targets, not full procedures — variable kind.
-		add(name, graph.KindVariable, line, line)
+		add(name, graph.KindVariable, line, "local_data_item")
 	}
 
-	for _, m := range qikIncludeRe.FindAllSubmatchIndex(src, -1) {
-		mod := string(src[m[2]:m[3]])
+	// call → EdgeCalls to unresolved script (+ EdgeImports so cross-file
+	// script graphs light up the same way includes do elsewhere).
+	for _, m := range qikCallScriptRe.FindAllSubmatchIndex(src, -1) {
+		target := qikQuotedGroup(src, m)
+		if target == "" {
+			continue
+		}
 		line := lineAt(src, m[0])
+		caller := filePath + "::script:" + scriptName
+		if scriptName == "" {
+			caller = fileNode.ID
+		}
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileNode.ID, To: "unresolved::import::" + mod,
+			From: caller, To: "unresolved::" + target,
+			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: fileNode.ID, To: "unresolved::import::" + target,
 			Kind: graph.EdgeImports, FilePath: filePath, Line: line,
 		})
 	}
 
-	funcRanges := buildFuncRanges(result)
-	emitCall := func(name string, pos int) {
-		name = stripQikTypeSuffix(name)
-		if name == "" {
-			return
+	// goto → EdgeCalls toward a label name (same-file jump).
+	for _, m := range qikGotoRe.FindAllSubmatchIndex(src, -1) {
+		target := qikQuotedGroup(src, m)
+		if target == "" {
+			continue
 		}
-		line := lineAt(src, pos)
-		callerID := findEnclosingFunc(funcRanges, line)
-		if callerID == "" || strings.HasSuffix(callerID, "::"+name) {
-			// Attribute module-level calls to the file node.
-			if callerID == "" {
-				callerID = fileNode.ID
-			} else {
-				return
-			}
+		line := lineAt(src, m[0])
+		caller := filePath + "::script:" + scriptName
+		if scriptName == "" {
+			caller = fileNode.ID
 		}
 		result.Edges = append(result.Edges, &graph.Edge{
-			From: callerID, To: "unresolved::" + name,
+			From: caller, To: "unresolved::" + target,
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
 		})
-	}
-	for _, m := range qikCallRe.FindAllSubmatchIndex(src, -1) {
-		emitCall(string(src[m[2]:m[3]]), m[0])
-	}
-	for _, m := range qikGosubRe.FindAllSubmatchIndex(src, -1) {
-		emitCall(string(src[m[2]:m[3]]), m[0])
 	}
 
 	return result, nil
 }
 
-// stripQikTypeSuffix drops BASIC type-declaration characters
-// (%, &, !, #, $) so FUNCTION Foo$ and CALL Foo share one symbol id.
-func stripQikTypeSuffix(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
+// qikQuotedGroup returns the first non-empty capture among the
+// quote/bare alternatives used by the QIK command regexes. Match index
+// layout: 0-1 full, 2-3 group1 (whole token), 4-5 single-quoted, 6-7
+// double-quoted, 8-9 bare.
+func qikQuotedGroup(src []byte, m []int) string {
+	if len(m) < 10 {
+		if len(m) >= 4 && m[2] >= 0 {
+			return strings.TrimSpace(string(src[m[2]:m[3]]))
+		}
 		return ""
 	}
-	switch name[len(name)-1] {
-	case '%', '&', '!', '#', '$':
-		return name[:len(name)-1]
+	for _, pair := range [][2]int{{4, 5}, {6, 7}, {8, 9}, {2, 3}} {
+		a, b := m[pair[0]], m[pair[1]]
+		if a >= 0 && b > a {
+			return strings.TrimSpace(string(src[a:b]))
+		}
 	}
-	return name
+	return ""
+}
+
+func qikHeaderScriptName(src []byte) string {
+	m := qikScriptNameRe.FindSubmatch(src)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(string(m[1]))
 }
 
 var _ parser.Extractor = (*QikBasicExtractor)(nil)
