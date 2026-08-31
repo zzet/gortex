@@ -12,6 +12,8 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 )
 
+const searchBaseOnlyID = "repo/base_only.go::BaseOnly"
+
 func putViewWorktreeInAvailabilityGrace(t *testing.T, stack *viewStack) {
 	t.Helper()
 	stack.setWorktreeState(t, store_sqlite.CheckoutStateAvailabilityGrace)
@@ -84,16 +86,20 @@ func writeSearchBaseGeneration(t *testing.T, store *store_sqlite.Store, graphID 
 	handle.AddBatch([]*graph.Node{
 		viewFileNode("repo/edit.go", 8),
 		viewFileNode("repo/hidden.go", 6),
+		viewFileNode("repo/base_only.go", 6),
 		searchNode(searchOldID, "Old", "repo/edit.go", 3),
 		searchNode(searchHiddenID, "Hidden", "repo/hidden.go", 3),
+		searchNode(searchBaseOnlyID, "BaseOnly", "repo/base_only.go", 3),
 	}, nil)
 	indexSearchSymbols(t, handle, map[string]string{
-		searchOldID:    "old zephyr scheduler",
-		searchHiddenID: "hidden zephyr scheduler",
+		searchOldID:      "old zephyr scheduler",
+		searchHiddenID:   "hidden zephyr scheduler",
+		searchBaseOnlyID: "base-only zephyr scheduler",
 	})
 	if err := handle.SetFileMasks([]store_sqlite.FileMask{
 		{RepoPrefix: "repo", FilePath: "repo/edit.go", Mode: store_sqlite.OwnershipReplace},
 		{RepoPrefix: "repo", FilePath: "repo/hidden.go", Mode: store_sqlite.OwnershipReplace},
+		{RepoPrefix: "repo", FilePath: "repo/base_only.go", Mode: store_sqlite.OwnershipReplace},
 	}); err != nil {
 		t.Fatalf("SetFileMasks(base): %v", err)
 	}

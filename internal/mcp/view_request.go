@@ -27,6 +27,11 @@ type requestViewCtxKey struct{}
 // requestView is what one request reads through, plus what the response says
 // about it.
 type requestView struct {
+	// kind names the logical surface that answered. A nonzero generation-backed
+	// base has a composed reader just like a worktree, so reader presence alone
+	// cannot classify the answer. Empty preserves structural inference for old
+	// tests and callers that construct a requestView directly.
+	kind string
 	// reader is the composed routed stack. Nil means the base corpus serves,
 	// which is what every request read before routed views existed.
 	reader graph.Reader
@@ -521,7 +526,11 @@ func (s *Server) recordRequestView(view *requestView, err error) {
 // the object store.
 func requestViewKind(view *requestView) string {
 	switch {
-	case view == nil || view.reader == nil:
+	case view == nil:
+		return viewmetrics.ViewBase
+	case view.kind != "":
+		return view.kind
+	case view.reader == nil:
 		return viewmetrics.ViewBase
 	case view.files != nil:
 		return viewmetrics.ViewRef
@@ -686,7 +695,7 @@ func graceBaseFallback(
 	rider.CheckoutID = checkout.CheckoutID
 	rider.RequestedState = string(store_sqlite.CheckoutStateReady)
 	rider.ActualState = string(checkout.State)
-	return &requestView{rider: rider, suppressBufferOverlay: true}, nil
+	return &requestView{kind: viewmetrics.ViewBase, rider: rider, suppressBufferOverlay: true}, nil
 }
 
 func (s *Server) materializeGraceBaseFallback(
@@ -741,7 +750,20 @@ func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Sel
 	rider := graphview.NewViewRider(selector)
 	rider.MarkExact(selector.String())
 	rider.GraphID = dedicated.GraphID
-	return &requestView{rider: rider}, nil
+	selected := &requestView{kind: viewmetrics.ViewBase, rider: rider}
+	if dedicated.ActiveGenerationID <= 0 {
+		// Legacy dedicated graphs predate generation-backed bases and still live
+		// in generation zero.
+		return selected, nil
+	}
+	base, err := s.materializer.MaterializeBase(ctx, dedicated.GraphID, dedicated.ActiveGenerationID)
+	if err != nil {
+		return nil, err
+	}
+	selected.reader = base.Reader
+	selected.materialized = base
+	selected.bindSources(base.GenerationSources(), s.graph)
+	return selected, nil
 }
 
 // materializeRequestView turns a routed checkout into the reader that answers
@@ -780,6 +802,7 @@ func (s *Server) materializeRequestView(
 	rider.GraphID = view.ID.BaseGraphID
 	rider.CheckoutID = checkout.CheckoutID
 	routed := &requestView{
+		kind:         viewmetrics.ViewWorktree,
 		reader:       view.Reader,
 		materialized: view,
 		rider:        rider,
@@ -826,7 +849,7 @@ func viewFallback(strict bool, rider *graphview.ViewRider, err error) (*requestV
 	if markErr := rider.MarkFallback(string(graphview.SelectorBase), reason); markErr != nil {
 		return nil, markErr
 	}
-	return &requestView{rider: rider}, nil
+	return &requestView{kind: viewmetrics.ViewBase, rider: rider}, nil
 }
 
 // viewFamilies lists the checkout families in the live catalog. The graph can

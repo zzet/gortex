@@ -11,6 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // A git_ref or commit selector names committed state nobody has checked out.
@@ -148,6 +149,7 @@ func (s *Server) materializeRefView(
 	rider.ViewFingerprint = fingerprint
 
 	routed := &requestView{
+		kind:                  viewmetrics.ViewRef,
 		reader:                view.Reader,
 		materialized:          view,
 		rider:                 rider,
