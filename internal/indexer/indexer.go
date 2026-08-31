@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
-	"errors"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +28,7 @@ import (
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/fixtures"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/intern"
 	"github.com/zzet/gortex/internal/licenses"
 	"github.com/zzet/gortex/internal/modules"
@@ -2319,9 +2320,20 @@ func clampParseWeight(size, budget int64) int64 {
 // progress.WithReporter to receive stage updates. If no reporter is attached,
 // stage calls are silently dropped. Full-tree indexing shares the repository
 // mutation lane with watcher, polling, reconciliation, and MCP edits.
-func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, error) {
-	var result *IndexResult
-	err := idx.coordinateRepositoryMutation(ctx, func() error {
+func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexResult, err error) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+		if !ok {
+			panic(recovered)
+		}
+		result = nil
+		err = fmt.Errorf("indexer: graph storage failure: %w", storageErr)
+	}()
+	err = idx.coordinateRepositoryMutation(ctx, func() error {
 		current, currentErr := idx.currentRepositoryMutationIndexer()
 		if currentErr != nil {
 			return currentErr
@@ -2341,7 +2353,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 			return rawErr
 		}
 		if result == nil {
-			return errors.New("full-tree indexing returned a nil result")
+			return stderrors.New("full-tree indexing returned a nil result")
 		}
 
 		// Keep the owning MultiIndexer generation consistent with the graph
@@ -2844,83 +2856,100 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// Retain that finite synthetic set and replay it once after the edges so
 			// the final row has the same shape as the direct SQLite path.
 			var shadowBuiltins []*graph.Node
-			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
-				// Graph.AddBatch lazily materialises builtin targets. A later edge
-				// reindex can therefore replace a resolver-stamped builtin with the
-				// intentionally minimal lazy-stub shape while the payload lives in
-				// memory. The SQLite path retains the resolver's boundary fields, so
-				// restore the Indexer's boundary invariant at the shadow boundary
-				// before persisting any synthetic node.
-				for _, node := range nodes {
-					if node == nil {
+			if retErr == nil {
+				for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
+					// Graph.AddBatch lazily materialises builtin targets. A later edge
+					// reindex can therefore replace a resolver-stamped builtin with the
+					// intentionally minimal lazy-stub shape while the payload lives in
+					// memory. The SQLite path retains the resolver's boundary fields, so
+					// restore the Indexer's boundary invariant at the shadow boundary
+					// before persisting any synthetic node.
+					for _, node := range nodes {
+						if node == nil {
+							continue
+						}
+						if node.WorkspaceID == "" {
+							node.WorkspaceID = idx.workspaceID
+						}
+						if node.ProjectID == "" {
+							node.ProjectID = idx.projectID
+						}
+						if node.Kind == graph.KindBuiltin {
+							shadowBuiltins = append(shadowBuiltins, node)
+						}
+					}
+					if err := graph.AddBatchChecked(diskTarget, nodes, nil); err != nil {
+						retErr = fmt.Errorf("indexer: persist shadow node batch: %w", err)
+						nodeRows := len(nodes)
+						nodes = nil
+						drainPressure.afterNodeBatch(nodeRows)
+						break
+					}
+					if !ftsReady || retErr != nil {
+						nodeRows := len(nodes)
+						nodes = nil
+						drainPressure.afterNodeBatch(nodeRows)
 						continue
 					}
-					if node.WorkspaceID == "" {
-						node.WorkspaceID = idx.workspaceID
+					ftsItems := make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
+					var ftsBytes uint64
+					flushFTS := func() bool {
+						if len(ftsItems) == 0 {
+							return true
+						}
+						if err := ftsBatcher.BatchUpsertSymbolFTS(ftsItems); err != nil {
+							retErr = fmt.Errorf("indexer: append symbol FTS batch: %w", err)
+							ftsReady = false
+							return false
+						}
+						ftsItemCount += len(ftsItems)
+						ftsItems = make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
+						ftsBytes = 0
+						return true
 					}
-					if node.ProjectID == "" {
-						node.ProjectID = idx.projectID
+					for _, node := range nodes {
+						if !idx.shouldIndexForSearch(node) {
+							continue
+						}
+						tokens := ftsTokensFor(node, idx.projectName)
+						nextBytes := uint64(len(node.ID) + len(tokens) + 32)
+						if len(ftsItems) > 0 && (len(ftsItems) >= persistFTSChunkRows || ftsBytes+nextBytes > persistFTSChunkBytes) {
+							if !flushFTS() {
+								break
+							}
+						}
+						ftsItems = append(ftsItems, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
+						ftsBytes += nextBytes
+						if len(ftsItems) >= persistFTSChunkRows || ftsBytes >= persistFTSChunkBytes {
+							if !flushFTS() {
+								break
+							}
+						}
 					}
-					if node.Kind == graph.KindBuiltin {
-						shadowBuiltins = append(shadowBuiltins, node)
+					if ftsReady {
+						flushFTS()
 					}
-				}
-				diskTarget.AddBatch(nodes, nil)
-				if !ftsReady || retErr != nil {
 					nodeRows := len(nodes)
 					nodes = nil
 					drainPressure.afterNodeBatch(nodeRows)
-					continue
 				}
-				ftsItems := make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
-				var ftsBytes uint64
-				flushFTS := func() bool {
-					if len(ftsItems) == 0 {
-						return true
-					}
-					if err := ftsBatcher.BatchUpsertSymbolFTS(ftsItems); err != nil {
-						retErr = fmt.Errorf("indexer: append symbol FTS batch: %w", err)
-						ftsReady = false
-						return false
-					}
-					ftsItemCount += len(ftsItems)
-					ftsItems = make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
-					ftsBytes = 0
-					return true
-				}
-				for _, node := range nodes {
-					if !idx.shouldIndexForSearch(node) {
-						continue
-					}
-					tokens := ftsTokensFor(node, idx.projectName)
-					nextBytes := uint64(len(node.ID) + len(tokens) + 32)
-					if len(ftsItems) > 0 && (len(ftsItems) >= persistFTSChunkRows || ftsBytes+nextBytes > persistFTSChunkBytes) {
-						if !flushFTS() {
-							break
-						}
-					}
-					ftsItems = append(ftsItems, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
-					ftsBytes += nextBytes
-					if len(ftsItems) >= persistFTSChunkRows || ftsBytes >= persistFTSChunkBytes {
-						if !flushFTS() {
-							break
-						}
-					}
-				}
-				if ftsReady {
-					flushFTS()
-				}
-				nodeRows := len(nodes)
-				nodes = nil
-				drainPressure.afterNodeBatch(nodeRows)
 			}
-			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
-				diskTarget.AddBatch(nil, edges)
-				edgeRows := len(edges)
-				drainPressure.afterEdgeBatch(edgeRows)
+			if retErr == nil {
+				for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
+					if err := graph.AddBatchChecked(diskTarget, nil, edges); err != nil {
+						retErr = fmt.Errorf("indexer: persist shadow edge batch: %w", err)
+						edgeRows := len(edges)
+						drainPressure.afterEdgeBatch(edgeRows)
+						break
+					}
+					edgeRows := len(edges)
+					drainPressure.afterEdgeBatch(edgeRows)
+				}
 			}
-			if len(shadowBuiltins) > 0 {
-				diskTarget.AddBatch(shadowBuiltins, nil)
+			if retErr == nil && len(shadowBuiltins) > 0 {
+				if err := graph.AddBatchChecked(diskTarget, shadowBuiltins, nil); err != nil {
+					retErr = fmt.Errorf("indexer: persist shadow builtin batch: %w", err)
+				}
 				shadowBuiltins = nil
 			}
 
@@ -3291,10 +3320,34 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// times — once for the non-streaming path, repeatedly for the
 	// streaming-flush large-repo path where each call processes a
 	// bounded slice into a per-chunk in-memory shadow.
-	parseChunk := func(chunkFiles []walkedFile) {
+	parseChunk := func(chunkFiles []walkedFile) error {
+		parseCtx, cancelParse := context.WithCancel(ctx)
+		defer cancelParse()
+		var (
+			persistErrMu sync.Mutex
+			persistErr   error
+		)
+		failPersist := func(err error) {
+			if err == nil {
+				return
+			}
+			persistErrMu.Lock()
+			if persistErr == nil {
+				persistErr = err
+				cancelParse()
+			}
+			persistErrMu.Unlock()
+		}
+		getPersistErr := func() error {
+			persistErrMu.Lock()
+			defer persistErrMu.Unlock()
+			return persistErr
+		}
 		sidecars := newParseSidecarBatch(idx)
 		contentBatch := newParseContentBatch(idx)
 		graphBatch := newParseGraphBatch(idx.graph)
+		contentBatch.setErrorHandler(failPersist)
+		graphBatch.setErrorHandler(failPersist)
 		nativePressure := newNativeParsePressureRelief()
 		fileCh := make(chan walkedFile, workers*4)
 		var wg sync.WaitGroup
@@ -3304,6 +3357,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				defer wg.Done()
 				var localContracts []contracts.Contract
 				for wf := range fileCh {
+					if parseCtx.Err() != nil {
+						return
+					}
 					path := wf.path
 					p := atomic.AddInt64(&processed, 1)
 					if p == 1 || p%parseReportEvery == 0 {
@@ -3316,7 +3372,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// materialising whole files at once.
 					semStart := time.Now()
 					parseLease, aerr := acquireParseAdmission(
-						ctx, wf.size,
+						parseCtx, wf.size,
 						localParseBudget, localParseSem, sharedParseAdmission,
 					)
 					if aerr != nil {
@@ -3431,7 +3487,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 
 					extractStart := time.Now()
 					result, skipped, err := idx.extractFileCtxWithRawLease(
-						ctx, nativeParseAdmission, parseLease,
+						parseCtx, nativeParseAdmission, parseLease,
 						parsePool, quarantine, path, relPath, lang, ext, src,
 					)
 					atomic.AddInt64(&parseExtractNS, int64(time.Since(extractStart)))
@@ -3586,7 +3642,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		for _, f := range chunkFiles {
 			select {
 			case fileCh <- f:
-			case <-ctx.Done():
+			case <-parseCtx.Done():
 				break dispatch
 			}
 		}
@@ -3604,9 +3660,22 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// while another worker waited for admission. This preserves the old
 		// per-file durability boundary and makes the next cold attempt resume
 		// from the mtimes whose callbacks run after this commit.
-		graphBatch.flush()
-		contentBatch.flush()
-		sidecars.flush()
+		parsePersistErr := getPersistErr()
+		if parsePersistErr == nil {
+			parsePersistErr = graphBatch.flush()
+		}
+		if parsePersistErr == nil {
+			parsePersistErr = contentBatch.flush()
+		} else {
+			contentBatch.discard()
+		}
+		if parsePersistErr != nil {
+			graphBatch.discard()
+			contentBatch.discard()
+		}
+		if parsePersistErr == nil {
+			sidecars.flush()
+		}
 
 		// All parse workers have joined, their native trees are released, and
 		// every direct-store graph/content/sidecar batch is durable. Only now
@@ -3619,6 +3688,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		maybeReleaseHeapAfterLargeDirectParse(
 			graphBatch != nil, idx.repoPrefix, len(chunkFiles), chunkInputBytes, idx.logger,
 		)
+		return parsePersistErr
 	}
 
 	// Dispatch the largest files first. Both dispatch paths below
@@ -3653,12 +3723,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			chunkEnd := min(chunkStart+chunkSize, len(files))
 			chunkShadow := idx.newStructuralIntegrityShadow(streamingDisk, graph.StructuralPathShadowStreaming)
 			idx.graph = chunkShadow
-			parseChunk(files[chunkStart:chunkEnd])
+			if err := parseChunk(files[chunkStart:chunkEnd]); err != nil {
+				idx.graph = streamingDisk
+				return nil, fmt.Errorf("indexer: streaming-flush parse chunk %d..%d: %w", chunkStart, chunkEnd, err)
+			}
+			// Parsing for this chunk is complete; restore the durable graph before
+			// any persistence error can return from the function.
+			idx.graph = streamingDisk
 			if err := ctx.Err(); err != nil {
 				// This chunk has not crossed the durable boundary yet. Drop it
 				// and retain only prior fully-flushed chunks; never stamp mtimes
 				// for files the cancelled dispatch did not parse.
-				idx.graph = streamingDisk
 				return nil, err
 			}
 			// Flush the chunk to disk through the same explicit caps as the
@@ -3669,13 +3744,23 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				streamPersistRows  = 8192
 				streamPersistBytes = 16 << 20
 			)
+			var streamPersistErr error
 			for nodes := range chunkShadow.DrainNodeBatches(streamPersistRows, streamPersistBytes) {
-				streamingDisk.AddBatch(nodes, nil)
+				if err := graph.AddBatchChecked(streamingDisk, nodes, nil); err != nil {
+					streamPersistErr = fmt.Errorf("persist nodes: %w", err)
+					break
+				}
 			}
-			for edges := range chunkShadow.DrainEdgeBatches(streamPersistRows, streamPersistBytes) {
-				streamingDisk.AddBatch(nil, edges)
+			if streamPersistErr == nil {
+				for edges := range chunkShadow.DrainEdgeBatches(streamPersistRows, streamPersistBytes) {
+					if err := graph.AddBatchChecked(streamingDisk, nil, edges); err != nil {
+						streamPersistErr = fmt.Errorf("persist edges: %w", err)
+						break
+					}
+				}
 			}
-			if err := bl.FlushBulk(); err != nil {
+			flushErr := bl.FlushBulk()
+			if err := stderrors.Join(streamPersistErr, flushErr); err != nil {
 				return nil, fmt.Errorf("indexer: streaming-flush chunk %d..%d: %w", chunkStart, chunkEnd, err)
 			}
 			if err := persistShadowCompactSidecarChunk(
@@ -3710,7 +3795,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// the resolver and subpasses read/mutate the merged state.
 		idx.graph = streamingDisk
 	} else {
-		parseChunk(files)
+		if err := parseChunk(files); err != nil {
+			flushStreamedMtimes()
+			return nil, fmt.Errorf("indexer: persist parsed graph: %w", err)
+		}
 		if err := ctx.Err(); err != nil {
 			// Direct SQLite batches have committed all completed files at this
 			// point. Persist their under-threshold mtime tail before returning;
@@ -4249,7 +4337,7 @@ func (idx *Indexer) IndexFileNoResolve(filePath string) error {
 // that stale instance.
 func (idx *Indexer) currentRepositoryMutationIndexer() (*Indexer, error) {
 	if idx == nil {
-		return nil, errors.New("repository mutation indexer is nil")
+		return nil, stderrors.New("repository mutation indexer is nil")
 	}
 	if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
 		current := owner.GetIndexer(idx.repoPrefix)
@@ -4278,7 +4366,7 @@ func (idx *Indexer) reindexPointMutationRaw(path string) (*IndexResult, error) {
 		return nil, err
 	}
 	if current.rootPath == "" {
-		return nil, errors.New("repository mutation root is unavailable")
+		return nil, stderrors.New("repository mutation root is unavailable")
 	}
 	return current.incrementalWatcherPaths(current.rootPath, []string{path}, mode)
 }
@@ -6022,7 +6110,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			// A path that no longer exists is not an error: it may be
 			// a deleted file the caller still wants evicted. Deletion
 			// detection below handles it via scopeRels.
-			if errors.Is(statErr, os.ErrNotExist) {
+			if stderrors.Is(statErr, os.ErrNotExist) {
 				if mode.forceExplicitFiles && idx.incrementalPathOwned(absPath) {
 					forcedDeletedFiles = append(forcedDeletedFiles, idx.relKey(absPath))
 				}
@@ -6160,7 +6248,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				}
 				continue
 			}
-			if errors.Is(statErr, os.ErrNotExist) {
+			if stderrors.Is(statErr, os.ErrNotExist) {
 				deletedFiles = append(deletedFiles, relPath)
 				continue
 			}
@@ -8798,7 +8886,7 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 	idx.storeRootPath(absRoot)
 
 	diskFiles := make(map[string]bool)
-	errStop := errors.New("stop-walk")
+	errStop := stderrors.New("stop-walk")
 	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, werr error) error {
 		if werr != nil {
 			return nil
@@ -8822,7 +8910,7 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 		}
 		return nil
 	})
-	if errors.Is(walkErr, errStop) {
+	if stderrors.Is(walkErr, errStop) {
 		return true
 	}
 	if walkErr != nil {
@@ -8840,7 +8928,7 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 	}
 	idx.mtimeMu.RUnlock()
 	for _, rel := range candidates {
-		if _, err := os.Stat(filepath.Join(absRoot, filepath.FromSlash(rel))); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(filepath.Join(absRoot, filepath.FromSlash(rel))); stderrors.Is(err, os.ErrNotExist) {
 			return true
 		}
 	}
@@ -8937,7 +9025,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		switch {
 		case statErr == nil && idx.shouldExclude(absPath, absRoot, false):
 			deleted = append(deleted, rel)
-		case errors.Is(statErr, os.ErrNotExist):
+		case stderrors.Is(statErr, os.ErrNotExist):
 			deleted = append(deleted, rel)
 		}
 	}

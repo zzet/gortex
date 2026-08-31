@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -2096,6 +2097,11 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 				if coordinatedBulkActive {
 					if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
 						mi.logger.Error("multi-repo bulk-load cleanup failed", zap.Error(err))
+						if aborter, ok := coordinatedBulk.(graph.CoordinatedBulkAborter); ok {
+							if abortErr := aborter.AbortCoordinatedBulkLoad(); abortErr != nil {
+								mi.logger.Error("multi-repo bulk-load abort failed", zap.Error(abortErr))
+							}
+						}
 					}
 				}
 			}()
@@ -2202,6 +2208,14 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			}
 			if coordinatedBulkActive {
 				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+					if aborter, ok := coordinatedBulk.(graph.CoordinatedBulkAborter); ok {
+						if abortErr := aborter.AbortCoordinatedBulkLoad(); abortErr != nil {
+							return nil, errors.Join(
+								fmt.Errorf("multi-repo bulk-load finalize: %w", err),
+								fmt.Errorf("multi-repo bulk-load abort: %w", abortErr),
+							)
+						}
+					}
 					return nil, fmt.Errorf("multi-repo bulk-load finalize: %w", err)
 				}
 				coordinatedBulkActive = false

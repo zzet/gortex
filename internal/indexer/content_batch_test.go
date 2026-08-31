@@ -15,6 +15,22 @@ type recordingContentReplacer struct {
 	calls [][]graph.ContentFTSFileReplacement
 }
 
+type failingCheckedContentGraph struct {
+	graph.Store
+	err          error
+	checkedCalls int
+	legacyCalls  int
+}
+
+func (s *failingCheckedContentGraph) AddBatch([]*graph.Node, []*graph.Edge) {
+	s.legacyCalls++
+}
+
+func (s *failingCheckedContentGraph) AddBatchChecked([]*graph.Node, []*graph.Edge) error {
+	s.checkedCalls++
+	return s.err
+}
+
 func (r *recordingContentReplacer) WipeContent(string) error     { return nil }
 func (r *recordingContentReplacer) WipeContentFile(string) error { return nil }
 func (r *recordingContentReplacer) AppendContent(string, []graph.ContentFTSItem) error {
@@ -86,6 +102,38 @@ func TestParseContentBatchRetainsFullGraphBodyWhenSidecarFails(t *testing.T) {
 	batch.flush()
 	require.Equal(t, body, contentBody(g.GetNode(node.ID)))
 	require.NotEqual(t, true, g.GetNode(node.ID).Meta["content_indexed"])
+}
+
+func TestParseContentBatchGraphFailureSuppressesDurabilityCallbacks(t *testing.T) {
+	wantErr := errors.New("graph write failed")
+	sink := &recordingContentReplacer{}
+	store := &failingCheckedContentGraph{Store: graph.New(), err: wantErr}
+	idx := &Indexer{graph: store, contentSink: sink, repoPrefix: "repo", logger: zap.NewNop()}
+	batch := newParseContentBatch(idx)
+	body := "full body " + string(make([]byte, contentSnippetCap+50))
+	callbacks := 0
+	require.True(t, batch.add(
+		[]*graph.Node{testContentNode("repo/a.md::0", "a.md", body)}, nil,
+		func() { callbacks++ },
+	))
+	require.ErrorIs(t, batch.flush(), wantErr)
+	require.Len(t, sink.calls, 1)
+	require.Equal(t, 1, store.checkedCalls)
+	require.Zero(t, store.legacyCalls)
+	require.Zero(t, callbacks)
+	require.Zero(t, store.NodeCount())
+	require.Empty(t, batch.pending)
+	require.Zero(t, batch.itemCount)
+	require.Zero(t, batch.bodyBytes)
+
+	require.True(t, batch.add(
+		[]*graph.Node{testContentNode("repo/b.md::0", "b.md", body)}, nil,
+		func() { callbacks++ },
+	))
+	require.ErrorIs(t, batch.flush(), wantErr)
+	require.Len(t, sink.calls, 1, "sticky graph error must not repeat the sidecar write")
+	require.Equal(t, 1, store.checkedCalls)
+	require.Zero(t, callbacks)
 }
 
 func TestReplaceContentSectionsSendsAuthoritativeEmptyFile(t *testing.T) {

@@ -404,6 +404,94 @@ func TestTrackReadinessSurfacesPromotionFailure(t *testing.T) {
 	assert.Equal(t, "synthetic promotion failure", readiness.Error)
 }
 
+func TestTrackReadinessSurfacesNewestUnroutedGenerationFailure(t *testing.T) {
+	f := newProbeFixture(t)
+	ctx := context.Background()
+	reason := "graph storage volume is full (SQLite code 13); free disk space and retry"
+	failedID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        probeGraphID,
+		LayerID:        "failed-unrouted",
+		CheckoutID:     probeWorktreeID,
+		GenerationKind: "commit",
+		TreeOID:        "failed-tree",
+		State:          store_sqlite.ViewGenerationBuilding,
+		CreatedAt:      500,
+	})
+	require.NoError(t, err)
+	require.NoError(t, f.catalog.FailViewGeneration(ctx, failedID, reason))
+	_, routed, err := f.catalog.GetCheckoutRoute(ctx, probeWorktreeID)
+	require.NoError(t, err)
+	require.False(t, routed)
+
+	readiness, err := f.controller.TrackReadiness(ctx, f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessFailed, readiness.State)
+	assert.Equal(t, reason, readiness.Error)
+	require.NotNil(t, readiness.View)
+	assert.Equal(t, daemon.ProbeViewUnrouted, readiness.View.Kind)
+	assert.False(t, readiness.View.Exact)
+	assert.Equal(t, daemon.FallbackViewBuilding, readiness.View.FallbackReason)
+
+	// A newer attempt supersedes the in-memory/status meaning of the older
+	// failure even before it publishes. Ordering is by generation id, not wall
+	// clock, so a retry whose clock moved backwards still wins.
+	_, err = f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        probeGraphID,
+		LayerID:        "retry-building",
+		CheckoutID:     probeWorktreeID,
+		GenerationKind: "commit",
+		TreeOID:        "retry-tree",
+		State:          store_sqlite.ViewGenerationBuilding,
+		CreatedAt:      1,
+	})
+	require.NoError(t, err)
+	retrying, err := f.controller.TrackReadiness(ctx, f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, retrying.State)
+}
+
+func TestTrackReadinessSurfacesInProcessFailureWhenCatalogVerdictCannotPersist(t *testing.T) {
+	f := newProbeFixture(t)
+	ctx := context.Background()
+	reason := "graph storage volume is full (SQLite code 13); free disk space and retry"
+	generationID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        probeGraphID,
+		LayerID:        "catalog-failure-fallback",
+		CheckoutID:     probeWorktreeID,
+		GenerationKind: "commit",
+		TreeOID:        "fallback-tree",
+		State:          store_sqlite.ViewGenerationBuilding,
+		CreatedAt:      700,
+	})
+	require.NoError(t, err)
+	f.controller.lifecycle.RecordCheckoutBuildFailure(probeWorktreeID, generationID, reason)
+
+	readiness, err := f.controller.TrackReadiness(ctx, f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessFailed, readiness.State)
+	assert.Equal(t, reason, readiness.Error)
+
+	newerID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        probeGraphID,
+		LayerID:        "catalog-failure-retry",
+		CheckoutID:     probeWorktreeID,
+		GenerationKind: "commit",
+		TreeOID:        "fallback-retry-tree",
+		State:          store_sqlite.ViewGenerationBuilding,
+		CreatedAt:      701,
+	})
+	require.NoError(t, err)
+	require.Greater(t, newerID, generationID)
+	retrying, err := f.controller.TrackReadiness(ctx, f.worktreeRoot)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, retrying.State,
+		"an older in-process failure must not mask a newer durable attempt")
+}
+
 func TestTrackReadinessRejectsGraceFallback(t *testing.T) {
 	f := newProbeFixture(t)
 	f.routeWorktree(t)

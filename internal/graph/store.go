@@ -154,6 +154,28 @@ type CheckedAllGenerationsRepoEvicter interface {
 	EvictRepoAllGenerationsChecked(repoPrefix string) (nodesRemoved, edgesRemoved int, err error)
 }
 
+// CheckedBatchAdder is the retryable durable-write form of Store.AddBatch.
+//
+// Store predates persistent backends and deliberately has a no-error mutation
+// surface. Durable implementations opt into this companion capability so
+// long-running index builds can abort cleanly on disk-full, I/O, or WAL
+// pressure instead of converting the storage failure into a process panic.
+// Callers that need a durability boundary should prefer AddBatchChecked below.
+type CheckedBatchAdder interface {
+	AddBatchChecked(nodes []*Node, edges []*Edge) error
+}
+
+// AddBatchChecked writes one batch and returns durable-backend failures when
+// the store supports them. In-memory and compatibility stores retain their
+// established AddBatch contract.
+func AddBatchChecked(store Store, nodes []*Node, edges []*Edge) error {
+	if checked, ok := store.(CheckedBatchAdder); ok {
+		return checked.AddBatchChecked(nodes, edges)
+	}
+	store.AddBatch(nodes, edges)
+	return nil
+}
+
 type Store interface {
 	// --- Writes -----------------------------------------------------
 
@@ -524,6 +546,14 @@ type BulkLoader interface {
 type CoordinatedBulkLoader interface {
 	BeginCoordinatedBulkLoad() bool
 	EndCoordinatedBulkLoad() error
+}
+
+// CoordinatedBulkAborter is the terminal cleanup companion for a coordinated
+// load whose final index seal could not complete. End remains retryable; a
+// production owner that will not retry must abort so connection-local unsafe
+// pragmas and the pinned writer cannot leak into the running daemon.
+type CoordinatedBulkAborter interface {
+	AbortCoordinatedBulkLoad() error
 }
 
 // SymbolHit is a single full-text-search result: the matched node ID

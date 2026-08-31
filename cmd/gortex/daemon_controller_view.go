@@ -304,9 +304,6 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 		return trackViewBuilding("", "", "repository is not registered in the checkout catalog yet"), nil
 	}
 
-	building := func(reason string) daemon.TrackReadiness {
-		return trackViewBuilding(binding.CheckoutID, binding.RepoPrefix, reason)
-	}
 	failed := func(reason string) daemon.TrackReadiness {
 		if reason == "" {
 			reason = "the checkout promotion failed"
@@ -318,11 +315,34 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 		}
 	}
 
+	catalog := c.viewMaterializer.Catalog
+	latest, err := catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		CheckoutID: binding.CheckoutID,
+		Limit:      1,
+	})
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read latest generation for checkout %q: %w", binding.CheckoutID, err)
+	}
+	building := func(reason string) daemon.TrackReadiness {
+		// A failed unpublished generation has no route to inspect below. Prefer
+		// the newest attempt only: an older failure must not mask a newer retry.
+		if len(latest) == 1 && latest[0].State == store_sqlite.ViewGenerationFailed {
+			return failed(latest[0].Error)
+		}
+		if len(latest) == 1 && latest[0].State == store_sqlite.ViewGenerationBuilding {
+			if processReason, failedInProcess := c.lifecycle.CheckoutBuildFailure(
+				binding.CheckoutID, latest[0].GenerationID,
+			); failedInProcess {
+				return failed(processReason)
+			}
+		}
+		return trackViewBuilding(binding.CheckoutID, binding.RepoPrefix, reason)
+	}
+
 	if binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {
 		return building("checkout state is " + binding.CheckoutState), nil
 	}
 
-	catalog := c.viewMaterializer.Catalog
 	transition, transitioning, err := catalog.GetIntentTransition(ctx, binding.CheckoutID)
 	if err != nil {
 		return daemon.TrackReadiness{}, fmt.Errorf("read checkout transition %q: %w", binding.CheckoutID, err)

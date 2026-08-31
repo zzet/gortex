@@ -513,6 +513,20 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	return errors.Join(sealErr, statsErr, closeErr)
 }
 
+// AbortCoordinatedBulkLoad gives up retryable finalization and restores the
+// writer connection unconditionally. It is for terminal owners only: dense
+// indexes whose rebuild failed may remain absent until normal schema repair or
+// restart, but the store no longer holds synchronous=OFF, disabled automatic
+// checkpoints, or a pinned writer indefinitely.
+func (s *Store) AbortCoordinatedBulkLoad() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.coordinatedBulkLoad = false
+	err := s.closeBulkConnectionLocked()
+	s.jsonbIngestBuffers.release()
+	return err
+}
+
 // noteBulkRowsLocked advances independent index-seal and WAL-checkpoint budgets
 // after a committed AddBatch. The caller holds writeMu. A failed seal remains
 // pending and is retried by the next repository/final boundary.

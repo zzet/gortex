@@ -543,21 +543,34 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// generation: the set is shared by every handle over one core, so a stub
 	// the base corpus already holds must not suppress the same stub in a
 	// derived generation that has never had it written.
+	// builtinSeen is shared by every generation handle over one store. Pair its
+	// admission with the writer lock so another batch cannot observe a key whose
+	// transaction later rolls back and omit the corresponding stub.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var freshBuiltinKeys []string
+	builtinKeysCommitted := false
+	defer func() {
+		if builtinKeysCommitted {
+			return
+		}
+		for _, key := range freshBuiltinKeys {
+			s.builtinSeen.Delete(key)
+		}
+	}()
 	if stubs := graph.BuiltinStubNodes(edges); len(stubs) > 0 {
 		var fresh []*graph.Node
 		for _, stub := range stubs {
 			key := builtinSeenKey(s.viewGen, stub.ID)
 			if _, dup := s.builtinSeen.LoadOrStore(key, struct{}{}); !dup {
 				fresh = append(fresh, stub)
+				freshBuiltinKeys = append(freshBuiltinKeys, key)
 			}
 		}
 		if len(fresh) > 0 {
 			nodes = append(append(make([]*graph.Node, 0, len(nodes)+len(fresh)), nodes...), fresh...)
 		}
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
 	hasGraphInput := false
 	for _, node := range nodes {
 		if node != nil && node.ID != "" && !graph.IsProxyNode(node) {
@@ -744,6 +757,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 		return stats, err
 	}
 	committed = true
+	builtinKeysCommitted = true
 	changed := stats.nodeRowsChanged > 0 || stats.edgeRowsInserted > 0
 	s.finishAnalysisMutationLocked(changed)
 	if changed {

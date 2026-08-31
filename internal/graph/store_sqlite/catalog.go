@@ -1861,6 +1861,29 @@ func (c *Catalog) SetViewGenerationState(ctx context.Context, generationID int64
 	return c.execGuarded(ctx, fmt.Sprintf("view generation %d cannot become %s", generationID, next), query, args...)
 }
 
+// FailViewGeneration atomically records why an unpublished build failed. The
+// building-state guard prevents a late error from rewriting an immutable ready
+// generation or a superseded input-movement verdict.
+func (c *Catalog) FailViewGeneration(ctx context.Context, generationID int64, reason string) error {
+	if generationID <= 0 {
+		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "graph generation build failed; see daemon log"
+	}
+	// Catalog failure state is surfaced by readiness probes. Bound it so an
+	// accidental oversized downstream error cannot inflate every status reply.
+	const maxGenerationFailureBytes = 512
+	if len(reason) > maxGenerationFailureBytes {
+		reason = reason[:maxGenerationFailureBytes]
+	}
+	return c.execGuarded(ctx, fmt.Sprintf("view generation %d is not building", generationID), `
+UPDATE view_generations SET state = ?, error = ?
+ WHERE generation_id = ? AND state = ?`,
+		string(ViewGenerationFailed), reason, generationID, string(ViewGenerationBuilding))
+}
+
 // UpdateViewGenerationRollup records the payload measurements taken just
 // before a publish. It is guarded on the building state for the same reason
 // PublishViewGeneration is: a published generation's row is immutable.

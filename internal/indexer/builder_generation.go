@@ -331,6 +331,9 @@ type SparseGenerationBuilder struct {
 	// ask for one. nil declares the lsp.* capabilities disabled for the
 	// generation rather than leaving them unstated.
 	Semantic *semantic.Manager
+	// buildFailures is the lifecycle-owned fallback for the narrow case where
+	// SQLite cannot persist the failed verdict after a storage failure.
+	buildFailures *checkoutBuildFailures
 
 	// beforePayloadFlightJoin is a deterministic test barrier for the narrow
 	// race where a caller adopts a building catalog generation after its leader
@@ -340,6 +343,9 @@ type SparseGenerationBuilder struct {
 	// beforePhysicalPass is a deterministic test seam at the physical-flight
 	// leader boundary. Production builders leave it nil.
 	beforePhysicalPass func(generationID int64) error
+	// failViewGeneration injects the terminal catalog write in tests. nil uses
+	// Catalog.FailViewGeneration.
+	failViewGeneration func(context.Context, int64, string) error
 }
 
 const (
@@ -518,6 +524,7 @@ func (b *SparseGenerationBuilder) buildPrepared(
 	ready := flightStart.Ready
 	report.GenerationID = generationID
 	if ready {
+		b.buildFailures.clearThrough(identity.CheckoutID, generationID)
 		report.Coalesced = true
 		report.Duration = time.Since(started)
 		b.logSparseBuildReuse(sparseReadyReuseMessage, generationID, "ready", report.Duration, false, true)
@@ -537,6 +544,7 @@ func (b *SparseGenerationBuilder) buildPrepared(
 	}
 
 	report.Coalesced = false
+	b.buildFailures.start(identity.CheckoutID, generationID)
 	var (
 		buildErr            error
 		physicalStartLogged bool
@@ -559,7 +567,7 @@ func (b *SparseGenerationBuilder) buildPrepared(
 		b.logSparsePhysicalBuildTerminal(terminalReport, buildErr == nil)
 		flight.Complete(buildErr)
 	}()
-	buildErr = func() error {
+	buildErr = func() (innerErr error) {
 		// A physical build that dies part way must not leave a generation in the
 		// only mutable state forever. Cleanup completes before followers wake, so
 		// a retry cannot re-adopt payload the failed writer left behind.
@@ -568,8 +576,19 @@ func (b *SparseGenerationBuilder) buildPrepared(
 			if !published {
 				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generationAbandonTimeout)
 				defer cancel()
-				b.abandon(cleanupCtx, generationID)
+				b.abandon(cleanupCtx, generationID, identity.CheckoutID, innerErr)
 			}
+		}()
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				return
+			}
+			storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+			if !ok {
+				panic(recovered)
+			}
+			innerErr = fmt.Errorf("indexer: payload generation %d storage failure: %w", generationID, storageErr)
 		}()
 
 		req, cleanup, err := prepare(ctx, identity)
@@ -626,6 +645,7 @@ func (b *SparseGenerationBuilder) buildPrepared(
 		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)
 		}
+		b.buildFailures.clearThrough(identity.CheckoutID, generationID)
 		published = true
 		return nil
 	}()
@@ -1227,10 +1247,19 @@ func (b *SparseGenerationBuilder) declareProducers(
 // step supersedes the one it refuses, and re-stating that verdict as a failure
 // would lose the distinction between "this build broke" and "this build's
 // inputs moved".
-func (b *SparseGenerationBuilder) abandon(ctx context.Context, generationID int64) {
-	err := b.Store.Catalog().SetViewGenerationState(
-		ctx, generationID, store_sqlite.ViewGenerationFailed, store_sqlite.ViewGenerationBuilding)
-	if err != nil && !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+func (b *SparseGenerationBuilder) abandon(ctx context.Context, generationID int64, checkoutID string, cause error) {
+	reason := store_sqlite.SafeStorageFailureReason(cause)
+	fail := b.Store.Catalog().FailViewGeneration
+	if b.failViewGeneration != nil {
+		fail = b.failViewGeneration
+	}
+	err := fail(ctx, generationID, reason)
+	if err == nil || errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		b.buildFailures.clearThrough(checkoutID, generationID)
+		return
+	}
+	b.buildFailures.record(checkoutID, generationID, reason)
+	if err != nil {
 		b.Logger.Warn("indexer: could not mark an abandoned generation failed",
 			zap.Int64("generation", generationID), zap.Error(err))
 	}

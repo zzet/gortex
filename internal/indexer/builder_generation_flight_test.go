@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
 )
@@ -343,6 +344,89 @@ func TestSparseGenerationBuilderPanicCompletesFlightBeforePropagating(t *testing
 	}
 	if got := physicalPasses.Load(); got != 2 {
 		t.Fatalf("physical index passes = %d, want panicked pass plus retry", got)
+	}
+}
+
+func TestSparseGenerationBuilderConvertsOnlyStorePanicToFailure(t *testing.T) {
+	fixture := newSparseBuildFlightFixture(t)
+	storageErr := fixture.store.AddBatchChecked([]*graph.Node{{
+		ID: "invalid-meta", Kind: graph.KindFunction,
+		Meta: map[string]any{"unsupported": make(chan int)},
+	}}, nil)
+	if storageErr == nil {
+		t.Fatal("unsupported metadata unexpectedly produced no storage error")
+	}
+	var typed *store_sqlite.StorageError
+	if !errors.As(storageErr, &typed) {
+		t.Fatalf("storage error = %T %v, want *StorageError", storageErr, storageErr)
+	}
+	fixture.request.PrePublish = func(context.Context, int64) error {
+		panic(storageErr)
+	}
+
+	generationID, _, err := fixture.builder.Build(context.Background(), fixture.request)
+	if err == nil || !errors.As(err, &typed) {
+		t.Fatalf("Build error = %T %v, want returned StorageError", err, err)
+	}
+	row, found, getErr := fixture.store.Catalog().GetViewGeneration(context.Background(), generationID)
+	if getErr != nil || !found {
+		t.Fatalf("failed generation: found=%v err=%v", found, getErr)
+	}
+	if row.State != store_sqlite.ViewGenerationFailed ||
+		row.Error != "graph storage write failed; see daemon log" {
+		t.Fatalf("failed generation = %+v", row)
+	}
+
+	fixture.request.PrePublish = nil
+	retryID, _, retryErr := fixture.builder.Build(context.Background(), fixture.request)
+	if retryErr != nil {
+		t.Fatalf("retry after storage failure: %v", retryErr)
+	}
+	if retryID == generationID {
+		t.Fatalf("retry reused failed generation %d", retryID)
+	}
+}
+
+func TestSparseGenerationBuilderRetainsProcessFailureWhenCatalogFailureWriteFails(t *testing.T) {
+	fixture := newSparseBuildFlightFixture(t)
+	storageErr := fixture.store.AddBatchChecked([]*graph.Node{{
+		ID: "invalid-meta-fallback", Kind: graph.KindFunction,
+		Meta: map[string]any{"unsupported": make(chan int)},
+	}}, nil)
+	if storageErr == nil {
+		t.Fatal("unsupported metadata unexpectedly produced no storage error")
+	}
+	failures := newCheckoutBuildFailures()
+	fixture.builder.buildFailures = failures
+	fixture.builder.beforePhysicalPass = func(int64) error { return storageErr }
+	fixture.builder.failViewGeneration = func(context.Context, int64, string) error {
+		return errors.New("catalog cannot grow")
+	}
+
+	generationID, _, err := fixture.builder.Build(context.Background(), fixture.request)
+	if err == nil {
+		t.Fatal("Build unexpectedly succeeded")
+	}
+	reason, ok := failures.failure(fixture.request.Identity.CheckoutID, generationID)
+	if !ok || reason != "graph storage write failed; see daemon log" {
+		t.Fatalf("process failure = (%q, %t)", reason, ok)
+	}
+	row, found, getErr := fixture.store.Catalog().GetViewGeneration(context.Background(), generationID)
+	if getErr != nil || !found || row.State != store_sqlite.ViewGenerationBuilding {
+		t.Fatalf("durable generation = found=%v err=%v row=%+v, want building residue", found, getErr, row)
+	}
+
+	fixture.builder.beforePhysicalPass = nil
+	fixture.builder.failViewGeneration = nil
+	retryID, _, retryErr := fixture.builder.Build(context.Background(), fixture.request)
+	if retryErr != nil {
+		t.Fatalf("retry after catalog failure: %v", retryErr)
+	}
+	if retryID != generationID {
+		t.Fatalf("retry generation = %d, want adopted building generation %d", retryID, generationID)
+	}
+	if _, stillFailed := failures.failure(fixture.request.Identity.CheckoutID, retryID); stillFailed {
+		t.Fatal("successful retry retained process-local failure")
 	}
 }
 

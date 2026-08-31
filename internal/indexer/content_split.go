@@ -212,6 +212,8 @@ type parseContentBatch struct {
 	pending   []stagedContentFile
 	itemCount int
 	bodyBytes int
+	err       error
+	onError   func(error)
 }
 
 func newParseContentBatch(idx *Indexer) *parseContentBatch {
@@ -224,6 +226,12 @@ func newParseContentBatch(idx *Indexer) *parseContentBatch {
 		return nil
 	}
 	return &parseContentBatch{idx: idx, replacer: replacer}
+}
+
+func (b *parseContentBatch) setErrorHandler(onError func(error)) {
+	if b != nil {
+		b.onError = onError
+	}
 }
 
 func (b *parseContentBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDurable func()) bool {
@@ -242,10 +250,15 @@ func (b *parseContentBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDura
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err != nil {
+		return true
+	}
 	if len(b.pending) > 0 && (len(b.pending) >= parseContentBatchFiles ||
 		b.itemCount+len(items) > parseContentBatchItems ||
 		b.bodyBytes+bytes > parseContentBatchBytes) {
-		b.flushLocked()
+		if err := b.flushLocked(); err != nil {
+			return true
+		}
 	}
 	b.pending = append(b.pending, stagedContentFile{
 		replacement: graph.ContentFTSFileReplacement{FilePath: filePath, Items: items},
@@ -257,23 +270,26 @@ func (b *parseContentBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDura
 	b.bodyBytes += bytes
 	if len(b.pending) >= parseContentBatchFiles ||
 		b.itemCount >= parseContentBatchItems || b.bodyBytes >= parseContentBatchBytes {
-		b.flushLocked()
+		_ = b.flushLocked()
 	}
 	return true
 }
 
-func (b *parseContentBatch) flush() {
+func (b *parseContentBatch) flush() error {
 	if b == nil {
-		return
+		return nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.flushLocked()
+	if b.err != nil {
+		return b.err
+	}
+	return b.flushLocked()
 }
 
-func (b *parseContentBatch) flushLocked() {
+func (b *parseContentBatch) flushLocked() error {
 	if len(b.pending) == 0 {
-		return
+		return b.err
 	}
 	replacements := make([]graph.ContentFTSFileReplacement, len(b.pending))
 	nodeCount, edgeCount := 0, 0
@@ -310,12 +326,33 @@ func (b *parseContentBatch) flushLocked() {
 		b.idx.logger.Warn("indexer: batched content replacement failed; retaining full section text on nodes",
 			zap.Int("files", len(b.pending)), zap.Error(err))
 	}
-	b.idx.graph.AddBatch(nodes, edges)
-	for _, file := range b.pending {
-		if file.onDurable != nil {
-			file.onDurable()
+	graphErr := graph.AddBatchChecked(b.idx.graph, nodes, edges)
+	if graphErr == nil {
+		for _, file := range b.pending {
+			if file.onDurable != nil {
+				file.onDurable()
+			}
+		}
+	} else if b.err == nil {
+		b.err = graphErr
+		if b.onError != nil {
+			b.onError(graphErr)
 		}
 	}
+	clear(b.pending)
+	b.pending = b.pending[:0]
+	b.itemCount = 0
+	b.bodyBytes = 0
+	return b.err
+}
+
+func (b *parseContentBatch) discard() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	clear(b.pending)
 	b.pending = b.pending[:0]
 	b.itemCount = 0
 	b.bodyBytes = 0

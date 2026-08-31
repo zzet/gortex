@@ -175,6 +175,49 @@ func seedBuildingGeneration(t *testing.T, catalog *Catalog, graphID string) int6
 	return id
 }
 
+func TestCatalogFailViewGenerationPersistsBoundedReason(t *testing.T) {
+	store := openCatalogStore(t)
+	catalog := store.Catalog()
+	ctx := context.Background()
+	reason := "graph storage volume is full (SQLite code 13); free disk space and retry"
+
+	id := seedBuildingGeneration(t, catalog, "graph-failed")
+	if err := catalog.FailViewGeneration(ctx, id, reason); err != nil {
+		t.Fatalf("FailViewGeneration: %v", err)
+	}
+	row, found, err := catalog.GetViewGeneration(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("GetViewGeneration: found=%v err=%v", found, err)
+	}
+	if row.State != ViewGenerationFailed || row.Error != reason || row.PublishedAt != 0 {
+		t.Fatalf("failed generation = %+v", row)
+	}
+	if err := catalog.FailViewGeneration(ctx, id, "second verdict"); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("second FailViewGeneration = %v, want stale guard", err)
+	}
+	if err := catalog.PublishViewGeneration(ctx, id, 300); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("publish failed generation = %v, want stale guard", err)
+	}
+
+	emptyID := seedBuildingGeneration(t, catalog, "graph-empty-reason")
+	if err := catalog.FailViewGeneration(ctx, emptyID, "  "); err != nil {
+		t.Fatalf("FailViewGeneration empty reason: %v", err)
+	}
+	empty, _, _ := catalog.GetViewGeneration(ctx, emptyID)
+	if empty.Error != "graph generation build failed; see daemon log" {
+		t.Fatalf("empty failure reason = %q", empty.Error)
+	}
+
+	longID := seedBuildingGeneration(t, catalog, "graph-long-reason")
+	if err := catalog.FailViewGeneration(ctx, longID, strings.Repeat("x", 700)); err != nil {
+		t.Fatalf("FailViewGeneration long reason: %v", err)
+	}
+	long, _, _ := catalog.GetViewGeneration(ctx, longID)
+	if len(long.Error) != 512 {
+		t.Fatalf("bounded failure reason length = %d, want 512", len(long.Error))
+	}
+}
+
 // TestCatalogSchemaAppliesOnFreshStore proves Open creates the whole control
 // plane on a brand-new database, and that a round trip through the accessors
 // preserves every column — including the nullable ones whose empty Go value

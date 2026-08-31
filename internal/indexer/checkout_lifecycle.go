@@ -177,6 +177,9 @@ type CheckoutLifecycle struct {
 	// generation older than it cannot have been created by this process and is
 	// crash residue unless a process-local payload flight has adopted it.
 	buildingRecoveryCutoff int64
+	// buildFailures is the generation-fenced process-local fallback used only
+	// when a terminal generation verdict cannot itself be persisted.
+	buildFailures *checkoutBuildFailures
 
 	// retryMu owns one deadline timer per family. Filesystem events start the
 	// grace; these timers guarantee its expiry is reconciled even when Git is
@@ -328,6 +331,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		logger:                 logger,
 		now:                    now,
 		buildingRecoveryCutoff: now().Unix(),
+		buildFailures:          newCheckoutBuildFailures(),
 		leases:                 cfg.ViewLeases,
 		coordinators:           map[string]*CheckoutCoordinator{},
 		coordinatorHeads:       map[string]checkoutHeadIdentity{},
@@ -2260,6 +2264,9 @@ func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
 			// language servers are admitted against the same global cap
 			// rather than one cap per coordinator.
 			Semantic: l.mi.semanticMgr,
+			// Shared with TrackReadiness through the lifecycle. Durable catalog
+			// failure state wins whenever SQLite can record it.
+			buildFailures: l.buildFailures,
 		},
 		Leases: l.leases,
 		Config: index,
@@ -2279,6 +2286,27 @@ func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
 	// rebuild they drive with it has landed.
 	l.trackStarted(checkout.CheckoutID, coordinator)
 	return coordinator, nil
+}
+
+// CheckoutBuildFailure returns a terminal process-local verdict only for the
+// exact durable generation still marked building. It is intentionally narrow:
+// callers must supply the catalog row they are about to represent.
+func (l *CheckoutLifecycle) CheckoutBuildFailure(checkoutID string, generationID int64) (string, bool) {
+	if l == nil {
+		return "", false
+	}
+	return l.buildFailures.failure(checkoutID, generationID)
+}
+
+// RecordCheckoutBuildFailure records a terminal attempt that could not be
+// written to the catalog. It is also the narrow integration seam for other
+// checkout build owners that encounter the same storage-unavailable boundary.
+func (l *CheckoutLifecycle) RecordCheckoutBuildFailure(checkoutID string, generationID int64, reason string) {
+	if l == nil {
+		return
+	}
+	l.buildFailures.start(checkoutID, generationID)
+	l.buildFailures.record(checkoutID, generationID, reason)
 }
 
 // trackStarted records a coordinator whose loop is running, and forgets the

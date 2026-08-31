@@ -1514,9 +1514,17 @@ func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) (bool, error) {
 // statements. This preserves single-row UPSERT/IGNORE semantics while avoiding
 // one SQLite execution per corpus row.
 func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
-	if _, err := s.addBatchSetOriented(nodes, edges); err != nil {
+	if err := s.AddBatchChecked(nodes, edges); err != nil {
 		panicOnFatal(err)
 	}
+}
+
+// AddBatchChecked is the durable, error-returning sibling of AddBatch. It
+// preserves the historical Store interface while allowing long-running index
+// builds to stop on storage pressure without taking down the daemon.
+func (s *Store) AddBatchChecked(nodes []*graph.Node, edges []*graph.Edge) error {
+	_, err := s.addBatchSetOriented(nodes, edges)
+	return wrapStorageError(err)
 }
 
 // SetEdgeProvenance mutates an existing edge's origin in-place and
@@ -2725,7 +2733,7 @@ func panicOnFatal(err error) {
 	if errors.Is(err, sql.ErrConnDone) || isStoreClosedErr(err) {
 		return
 	}
-	panic(fmt.Errorf("store_sqlite: %w", err))
+	panic(wrapStorageError(err))
 }
 
 // isStoreClosedErr reports whether err is the database/sql sentinel for a

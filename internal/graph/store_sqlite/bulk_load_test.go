@@ -795,6 +795,42 @@ func TestCoordinatedBulkFinalSealFailureRemainsRetryable(t *testing.T) {
 	integrityOK(t, s.db)
 }
 
+func TestAbortCoordinatedBulkLoadRestoresPinnedWriterAfterTerminalSealFailure(t *testing.T) {
+	s, _ := openTempStore(t)
+	originalIndexes := bulkDroppableIndexes
+	bulkDroppableIndexes = append(append([]bulkDroppableIndex(nil), originalIndexes...), bulkDroppableIndex{
+		name: "forced_bad_index_abort",
+		ddl:  `CREATE INDEX forced_bad_index_abort ON definitely_missing_table(id)`,
+	})
+	defer func() { bulkDroppableIndexes = originalIndexes }()
+
+	if !s.BeginCoordinatedBulkLoad() {
+		t.Fatal("coordinated fast path did not engage")
+	}
+	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+	if err := s.EndCoordinatedBulkLoad(); err == nil {
+		t.Fatal("forced final seal unexpectedly succeeded")
+	}
+	if err := s.AbortCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("AbortCoordinatedBulkLoad: %v", err)
+	}
+	if s.bulkConn != nil || s.coordinatedBulkLoad || s.bulkIndexesDeferred {
+		t.Fatalf("abort retained bulk state: conn=%v coordinated=%v deferred=%v",
+			s.bulkConn != nil, s.coordinatedBulkLoad, s.bulkIndexesDeferred)
+	}
+	// The ordinary writer is no longer blocked behind the leaked pinned
+	// connection. Restore the test-only index list before exercising it.
+	bulkDroppableIndexes = originalIndexes
+	if err := s.AddBatchChecked([]*graph.Node{{
+		ID: "repo/b.go::B", Kind: graph.KindFunction, Name: "B",
+	}}, nil); err != nil {
+		t.Fatalf("ordinary write after abort: %v", err)
+	}
+	if s.GetNode("repo/b.go::B") == nil {
+		t.Fatal("ordinary writer did not persist after abort")
+	}
+}
+
 func TestUncoordinatedBulkSealFailureRetriesAtFlushBoundary(t *testing.T) {
 	s, _ := openTempStore(t)
 	originalIndexes := bulkDroppableIndexes

@@ -647,6 +647,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			if coordinatedBulkActive {
 				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
 					logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
+					if aborter, ok := coordinatedBulk.(graph.CoordinatedBulkAborter); ok {
+						if abortErr := aborter.AbortCoordinatedBulkLoad(); abortErr != nil {
+							logger.Error("daemon: coordinated cold bulk-load abort failed", zap.Error(abortErr))
+						}
+					}
 				}
 			}
 		}()
@@ -788,6 +793,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		if coordinatedBulkActive {
 			if finalizeErr != nil {
 				logger.Error("daemon: coordinated cold bulk-load finalize failed", zap.Error(finalizeErr))
+				if aborter, ok := coordinatedBulk.(graph.CoordinatedBulkAborter); ok {
+					if abortErr := aborter.AbortCoordinatedBulkLoad(); abortErr != nil {
+						logger.Error("daemon: coordinated cold bulk-load abort failed", zap.Error(abortErr))
+					}
+				}
 			} else {
 				logger.Info("daemon: coordinated cold bulk-load complete",
 					zap.Duration("elapsed", flushElapsed))

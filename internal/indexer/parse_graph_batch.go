@@ -49,6 +49,8 @@ type parseGraphBatch struct {
 	nodeCount int
 	edgeCount int
 	bytes     int64
+	err       error
+	onError   func(error)
 }
 
 // newParseGraphBatch enables the accumulator only for the direct durable path.
@@ -72,6 +74,12 @@ func newParseGraphBatchWithLimits(store graph.Store, limits parseGraphBatchLimit
 	return &parseGraphBatch{store: store, limits: limits}
 }
 
+func (b *parseGraphBatch) setErrorHandler(onError func(error)) {
+	if b != nil {
+		b.onError = onError
+	}
+}
+
 func (b *parseGraphBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDurable func()) bool {
 	if b == nil {
 		return false
@@ -79,8 +87,16 @@ func (b *parseGraphBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDurabl
 	entryBytes := estimateParseGraphBytes(nodes, edges)
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err != nil {
+		// The caller uses true to mean that this durable path owns the rows.
+		// Do not fall back to another write after the first failed transaction;
+		// the enclosing index pass will return b.err after workers join.
+		return true
+	}
 	if len(b.pending) > 0 && b.wouldExceed(len(nodes), len(edges), entryBytes) {
-		b.flushLocked()
+		if err := b.flushLocked(); err != nil {
+			return true
+		}
 	}
 	b.pending = append(b.pending, stagedParseGraph{
 		nodes: nodes, edges: edges, onDurable: onDurable,
@@ -89,18 +105,21 @@ func (b *parseGraphBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDurabl
 	b.edgeCount += len(edges)
 	b.bytes += entryBytes
 	if b.atLimit() {
-		b.flushLocked()
+		_ = b.flushLocked()
 	}
 	return true
 }
 
-func (b *parseGraphBatch) flush() {
+func (b *parseGraphBatch) flush() error {
 	if b == nil {
-		return
+		return nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.flushLocked()
+	if b.err != nil {
+		return b.err
+	}
+	return b.flushLocked()
 }
 
 func (b *parseGraphBatch) wouldExceed(nodes, edges int, bytes int64) bool {
@@ -117,9 +136,9 @@ func (b *parseGraphBatch) atLimit() bool {
 		b.bytes >= b.limits.bytes
 }
 
-func (b *parseGraphBatch) flushLocked() {
+func (b *parseGraphBatch) flushLocked() error {
 	if len(b.pending) == 0 {
-		return
+		return b.err
 	}
 	nodes := make([]*graph.Node, 0, b.nodeCount)
 	edges := make([]*graph.Edge, 0, b.edgeCount)
@@ -127,12 +146,33 @@ func (b *parseGraphBatch) flushLocked() {
 		nodes = append(nodes, entry.nodes...)
 		edges = append(edges, entry.edges...)
 	}
-	b.store.AddBatch(nodes, edges)
-	for _, entry := range b.pending {
-		if entry.onDurable != nil {
-			entry.onDurable()
+	err := graph.AddBatchChecked(b.store, nodes, edges)
+	if err == nil {
+		for _, entry := range b.pending {
+			if entry.onDurable != nil {
+				entry.onDurable()
+			}
+		}
+	} else if b.err == nil {
+		b.err = err
+		if b.onError != nil {
+			b.onError(err)
 		}
 	}
+	clear(b.pending)
+	b.pending = b.pending[:0]
+	b.nodeCount = 0
+	b.edgeCount = 0
+	b.bytes = 0
+	return b.err
+}
+
+func (b *parseGraphBatch) discard() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	clear(b.pending)
 	b.pending = b.pending[:0]
 	b.nodeCount = 0

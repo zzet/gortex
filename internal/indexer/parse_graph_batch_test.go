@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -223,5 +224,56 @@ func TestParseGraphBatchFlushClearsStagedPointers(t *testing.T) {
 func TestNewParseGraphBatchFallsBackWithoutDurableStore(t *testing.T) {
 	if batch := newParseGraphBatch(graph.New()); batch != nil {
 		t.Fatal("in-memory store unexpectedly enabled direct-disk graph batching")
+	}
+}
+
+type failingCheckedParseGraphStore struct {
+	*recordingParseGraphStore
+	err          error
+	checkedCalls int
+}
+
+func (s *failingCheckedParseGraphStore) AddBatchChecked([]*graph.Node, []*graph.Edge) error {
+	s.mu.Lock()
+	s.checkedCalls++
+	s.mu.Unlock()
+	return s.err
+}
+
+func TestParseGraphBatchCheckedFailureIsStickyAndSuppressesDurabilityCallbacks(t *testing.T) {
+	wantErr := errors.New("durable graph unavailable")
+	recording := newRecordingParseGraphStore()
+	store := &failingCheckedParseGraphStore{recordingParseGraphStore: recording, err: wantErr}
+	batch := newParseGraphBatchWithLimits(store, parseGraphBatchLimits{
+		files: 4, nodes: 10, edges: 10, bytes: 1 << 20,
+	})
+	callbacks := 0
+	batch.add([]*graph.Node{{ID: "a", Kind: graph.KindFunction}}, nil, func() { callbacks++ })
+	batch.add([]*graph.Node{{ID: "b", Kind: graph.KindFunction}}, nil, func() { callbacks++ })
+	if err := batch.flush(); !errors.Is(err, wantErr) {
+		t.Fatalf("flush error = %v, want %v", err, wantErr)
+	}
+	if store.checkedCalls != 1 || recording.batchCalls != 0 || callbacks != 0 {
+		t.Fatalf("checked/legacy/callbacks = %d/%d/%d, want 1/0/0",
+			store.checkedCalls, recording.batchCalls, callbacks)
+	}
+	if len(batch.pending) != 0 || batch.nodeCount != 0 || batch.edgeCount != 0 || batch.bytes != 0 {
+		t.Fatalf("failed batch retained state: pending=%d nodes=%d edges=%d bytes=%d",
+			len(batch.pending), batch.nodeCount, batch.edgeCount, batch.bytes)
+	}
+	for i, entry := range batch.pending[:cap(batch.pending)] {
+		if entry.nodes != nil || entry.edges != nil || entry.onDurable != nil {
+			t.Fatalf("failed batch backing entry %d retained pointers: %+v", i, entry)
+		}
+	}
+
+	if !batch.add([]*graph.Node{{ID: "c", Kind: graph.KindFunction}}, nil, func() { callbacks++ }) {
+		t.Fatal("failed durable batch unexpectedly requested legacy fallback")
+	}
+	if err := batch.flush(); !errors.Is(err, wantErr) {
+		t.Fatalf("sticky flush error = %v, want %v", err, wantErr)
+	}
+	if store.checkedCalls != 1 || callbacks != 0 {
+		t.Fatalf("sticky failure retried write or callback: calls=%d callbacks=%d", store.checkedCalls, callbacks)
 	}
 }
