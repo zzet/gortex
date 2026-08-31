@@ -38,8 +38,9 @@ func TestTrack_OfflineSucceeds(t *testing.T) {
 		t.Fatalf("reload global config: %v", err)
 	}
 	found := false
+	canonicalRepo := pathkey.CanonicalExistingRoot(repo)
 	for _, r := range gc.Repos {
-		if pathkey.SamePathIdentity(r.Path, repo) {
+		if pathkey.EqualPaths(r.Path, canonicalRepo) {
 			found = true
 		}
 	}
@@ -69,8 +70,9 @@ func TestTrack_OfflineIdempotent(t *testing.T) {
 	}
 	gc, _ := config.LoadGlobal()
 	count := 0
+	canonicalRepo := pathkey.CanonicalExistingRoot(repo)
 	for _, r := range gc.Repos {
-		if pathkey.SamePathIdentity(r.Path, repo) {
+		if pathkey.EqualPaths(r.Path, canonicalRepo) {
 			count++
 		}
 	}

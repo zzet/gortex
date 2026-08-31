@@ -156,10 +156,16 @@ func CanonicalExistingRoot(root string) string {
 	return NormalizeVolume(filepath.Clean(resolved))
 }
 
-// CanonicalHasPathPrefix is HasPathPrefix after canonicalizing both operands.
-// It is intended for routing boundaries where roots may come from an older
-// config that persisted a filesystem alias.
+// CanonicalHasPathPrefix reports lexical containment first, then retries after
+// canonicalizing both operands. The lexical fast path is not only cheaper for
+// the ordinary same-spelling case: it preserves containment when a configured
+// child has gone offline and therefore cannot be symlink-resolved while its
+// still-existing parent can. The canonical fallback keeps routing across
+// aliases such as macOS's /tmp -> /private/tmp.
 func CanonicalHasPathPrefix(path, prefix string) bool {
+	if HasPathPrefix(path, prefix) {
+		return true
+	}
 	return HasPathPrefix(CanonicalExistingRoot(path), CanonicalExistingRoot(prefix))
 }
 

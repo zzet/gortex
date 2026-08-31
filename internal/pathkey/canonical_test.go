@@ -57,6 +57,33 @@ func TestCanonicalExistingRootFallsBackForMissingRoot(t *testing.T) {
 	}
 }
 
+func TestCanonicalHasPathPrefixRetainsOfflineChildOfAlias(t *testing.T) {
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	// EvalSymlinks succeeds for aliasRoot but fails for its absent child. A
+	// canonicalize-first comparison therefore mixes realRoot with aliasRoot
+	// and loses a checkout precisely when disappearance cleanup needs to find
+	// it. Lexical containment remains authoritative for the same spelling.
+	offlineChild := filepath.Join(aliasRoot, "removed-worktree")
+	if _, err := os.Stat(offlineChild); !os.IsNotExist(err) {
+		t.Fatalf("offline fixture unexpectedly exists: %v", err)
+	}
+	if !CanonicalHasPathPrefix(offlineChild, aliasRoot) {
+		t.Fatalf("offline child %q escaped aliased root %q", offlineChild, aliasRoot)
+	}
+	if CanonicalHasPathPrefix(filepath.Join(base, "alias-sibling"), aliasRoot) {
+		t.Fatal("lexical fast path ignored the path-component boundary")
+	}
+}
+
 func TestCanonicalExistingRootDarwinTmpAlias(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS /tmp alias regression")
@@ -110,6 +137,27 @@ func BenchmarkCanonicalHasPathPrefixAlias(b *testing.B) {
 	for range b.N {
 		if !CanonicalHasPathPrefix(aliasCWD, realRepo) {
 			b.Fatal("alias unexpectedly escaped root")
+		}
+	}
+}
+
+func BenchmarkCanonicalHasPathPrefixOfflineAliasChild(b *testing.B) {
+	base := b.TempDir()
+	realRoot := filepath.Join(base, "real")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	aliasRoot := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		b.Skipf("symlinks unavailable: %v", err)
+	}
+	offlineChild := filepath.Join(aliasRoot, "removed-worktree")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if !CanonicalHasPathPrefix(offlineChild, aliasRoot) {
+			b.Fatal("offline alias child unexpectedly escaped root")
 		}
 	}
 }
