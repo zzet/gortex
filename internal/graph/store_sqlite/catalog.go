@@ -2300,6 +2300,46 @@ SELECT graph_id, commit_generation_id, dirty_generation_id, route_epoch, state
 	return route, true, nil
 }
 
+// GetCheckoutRouteSnapshot reads one route and the presence of its root-move
+// completion fence in the same SQLite statement. Materialization uses this as
+// its preflight linearization point: a standing move must refuse the route,
+// while two independent reads could observe the route before a concurrent
+// move and the move state after it (or vice versa) without one coherent
+// snapshot.
+func (c *Catalog) GetCheckoutRouteSnapshot(
+	ctx context.Context, checkoutID string,
+) (CheckoutRoute, bool, bool, error) {
+	route := CheckoutRoute{CheckoutID: checkoutID}
+	var (
+		moving                          int
+		graphID, state                  sql.NullString
+		commitGen, dirtyGen, routeEpoch sql.NullInt64
+	)
+	err := c.store.db.QueryRowContext(ctx, `
+SELECT EXISTS(
+         SELECT 1 FROM checkout_root_moves AS move
+          WHERE move.checkout_id = requested.checkout_id
+       ),
+       route.graph_id, route.commit_generation_id, route.dirty_generation_id,
+       route.route_epoch, route.state
+  FROM (SELECT ? AS checkout_id) AS requested
+  LEFT JOIN checkout_routes AS route
+    ON route.checkout_id = requested.checkout_id`, checkoutID).Scan(
+		&moving, &graphID, &commitGen, &dirtyGen, &routeEpoch, &state)
+	if err != nil {
+		return CheckoutRoute{}, false, false, err
+	}
+	if !graphID.Valid {
+		return CheckoutRoute{}, false, moving != 0, nil
+	}
+	route.GraphID = graphID.String
+	route.CommitGenerationID = commitGen.Int64
+	route.DirtyGenerationID = dirtyGen.Int64
+	route.RouteEpoch = routeEpoch.Int64
+	route.State = RouteState(state.String)
+	return route, true, moving != 0, nil
+}
+
 // checkoutRouteLookupBatchSize stays below SQLite's host-parameter ceiling and
 // bounds both the generated statement and the rows one read can materialize.
 const checkoutRouteLookupBatchSize = 512

@@ -86,6 +86,70 @@ func routeStack(t testing.TB, store *store_sqlite.Store, commit, dirty int64, st
 	}
 }
 
+func publishStackRootMove(
+	t testing.TB, store *store_sqlite.Store, targetRoot string,
+) store_sqlite.CheckoutRootMove {
+	t.Helper()
+	ctx := context.Background()
+	catalog := store.Catalog()
+	checkout, found, err := catalog.GetCheckout(ctx, testCheckoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckout(root move) = found %v, err %v", found, err)
+	}
+	if err := catalog.UpdateCheckoutObservation(ctx, store_sqlite.UpdateCheckoutObservationRequest{
+		CheckoutID:           checkout.CheckoutID,
+		Incarnation:          checkout.Incarnation,
+		ExpectedRootPath:     checkout.RootPath,
+		State:                checkout.State,
+		RootPath:             targetRoot,
+		GitDir:               targetRoot + "/.git",
+		Locked:               checkout.Locked,
+		Prunable:             checkout.Prunable,
+		HeadRef:              checkout.HeadRef,
+		HeadCommit:           checkout.HeadCommit,
+		HeadTree:             checkout.HeadTree,
+		LastAccessible:       checkout.LastAccessible,
+		UnavailableSince:     checkout.UnavailableSince,
+		AvailabilityDeadline: checkout.AvailabilityDeadline,
+		RemovalDetectedAt:    checkout.RemovalDetectedAt,
+		RemovalDeadline:      checkout.RemovalDeadline,
+		RemovalEvidence:      checkout.RemovalEvidence,
+		LastSeen:             checkout.LastSeen + 1,
+		LastError:            checkout.LastError,
+	}); err != nil {
+		t.Fatalf("UpdateCheckoutObservation(root move): %v", err)
+	}
+	move, found, err := catalog.GetCheckoutRootMove(ctx, testCheckoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckoutRootMove = found %v, err %v", found, err)
+	}
+	return move
+}
+
+func completeStackRootMove(
+	t *testing.T, store *store_sqlite.Store, move store_sqlite.CheckoutRootMove,
+) {
+	t.Helper()
+	ctx := context.Background()
+	catalog := store.Catalog()
+	const beforeHash, afterHash = "before-root-move", "after-root-move"
+	if err := catalog.PrepareCheckoutRootMoveConfig(ctx, move.CheckoutID, move.Incarnation,
+		move.ConfigRootPath, move.CurrentRootPath, beforeHash, afterHash); err != nil {
+		t.Fatalf("PrepareCheckoutRootMoveConfig: %v", err)
+	}
+	if err := catalog.AcknowledgeCheckoutRootMoveConfig(ctx, move.CheckoutID, move.Incarnation,
+		move.ConfigRootPath, move.CurrentRootPath, beforeHash, afterHash); err != nil {
+		t.Fatalf("AcknowledgeCheckoutRootMoveConfig: %v", err)
+	}
+	move, found, err := catalog.GetCheckoutRootMove(ctx, move.CheckoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckoutRootMove(acknowledged) = found %v, err %v", found, err)
+	}
+	if err := catalog.CompleteCheckoutRootMove(ctx, move); err != nil {
+		t.Fatalf("CompleteCheckoutRootMove: %v", err)
+	}
+}
+
 func newTestMaterializer(store *store_sqlite.Store) *Materializer {
 	return &Materializer{Store: store, Catalog: store.Catalog(), Leases: NewLeaseManager()}
 }
@@ -241,6 +305,35 @@ func TestMaterializeCheckoutReadsTheRoutedStack(t *testing.T) {
 	}
 
 	assertReadersAgree(t, view.Reader, flat)
+}
+
+func TestMaterializeCheckoutFencesPendingRootMove(t *testing.T) {
+	store := openStackStore(t, "pending-root-move")
+	commit, dirty := seedRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+	move := publishStackRootMove(t, store, "/tmp/wt-1-moved")
+
+	view, err := materializer.MaterializeCheckout(context.Background(), testCheckoutID)
+	if view != nil {
+		view.Close()
+		t.Fatal("pending root move returned an exact checkout view")
+	}
+	if CodeOf(err) != CodeViewBuilding {
+		t.Fatalf("MaterializeCheckout(pending move) = %v, want %s", err, CodeViewBuilding)
+	}
+	if held := materializer.Leases.Held(); held != 0 {
+		t.Fatalf("pending root move held %d generation leases, want 0", held)
+	}
+
+	completeStackRootMove(t, store, move)
+	view, err = materializer.MaterializeCheckout(context.Background(), testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout(after move): %v", err)
+	}
+	defer view.Close()
+	if got, want := view.Generations(), []int64{commit, dirty}; !slicesEqualInt64(got, want) {
+		t.Fatalf("Generations() = %v, want unchanged route %v", got, want)
+	}
 }
 
 // TestPinCheckoutRouteRejectsASnapshotThatMovedBeforeLease makes the
@@ -783,6 +876,47 @@ func BenchmarkMaterializeCheckoutBaseGeneration(b *testing.B) {
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
 				view, err := materializer.MaterializeCheckout(context.Background(), testCheckoutID)
+				if err != nil {
+					b.Fatalf("MaterializeCheckout: %v", err)
+				}
+				view.Close()
+			}
+		})
+	}
+}
+
+func BenchmarkMaterializeCheckoutRootMoveFence(b *testing.B) {
+	for _, test := range []struct {
+		name    string
+		pending bool
+	}{
+		{name: "ready_miss"},
+		{name: "pending_hit", pending: true},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			store := openStackStore(b, "root-move-"+test.name)
+			commit := writeBenchmarkGeneration(b, store, "commit", "bench-commit", 0)
+			dirty := writeBenchmarkGeneration(b, store, "dirty", "bench-dirty", commit)
+			seedStackControlPlane(b, store)
+			routeStack(b, store, commit, dirty, store_sqlite.RouteActive)
+			if test.pending {
+				publishStackRootMove(b, store, "/tmp/wt-1-moved")
+			}
+			materializer := newTestMaterializer(store)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				view, err := materializer.MaterializeCheckout(context.Background(), testCheckoutID)
+				if test.pending {
+					if view != nil || CodeOf(err) != CodeViewBuilding {
+						b.Fatalf("pending materialization = view %v, err %v", view, err)
+					}
+					if materializer.Leases.Held() != 0 {
+						b.Fatal("pending move acquired a generation lease")
+					}
+					continue
+				}
 				if err != nil {
 					b.Fatalf("MaterializeCheckout: %v", err)
 				}

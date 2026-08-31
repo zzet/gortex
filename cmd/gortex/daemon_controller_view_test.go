@@ -331,6 +331,99 @@ func TestTrackReadinessWaitsForExactRoutedView(t *testing.T) {
 	assert.False(t, binding.CoordinatorLive, "readiness polling must not start a build coordinator")
 }
 
+func TestTrackReadinessFencesPendingRootMove(t *testing.T) {
+	testenv.Sandbox(t)
+	f := newProbeFixture(t)
+	f.routeWorktree(t)
+	ctx := context.Background()
+
+	routeBefore, found, err := f.catalog.GetCheckoutRoute(ctx, probeWorktreeID)
+	require.NoError(t, err)
+	require.True(t, found)
+	graphBefore, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	checkout, found, err := f.catalog.GetCheckout(ctx, probeWorktreeID)
+	require.NoError(t, err)
+	require.True(t, found)
+	movedRoot := filepath.Join(filepath.Dir(f.worktreeRoot), "worktree-moved")
+	require.NoError(t, f.catalog.UpdateCheckoutObservation(ctx,
+		store_sqlite.UpdateCheckoutObservationRequest{
+			CheckoutID:           checkout.CheckoutID,
+			Incarnation:          checkout.Incarnation,
+			ExpectedRootPath:     checkout.RootPath,
+			State:                checkout.State,
+			RootPath:             movedRoot,
+			GitDir:               checkout.GitDir,
+			Locked:               checkout.Locked,
+			Prunable:             checkout.Prunable,
+			HeadRef:              checkout.HeadRef,
+			HeadCommit:           checkout.HeadCommit,
+			HeadTree:             checkout.HeadTree,
+			LastAccessible:       checkout.LastAccessible,
+			UnavailableSince:     checkout.UnavailableSince,
+			AvailabilityDeadline: checkout.AvailabilityDeadline,
+			RemovalDetectedAt:    checkout.RemovalDetectedAt,
+			RemovalDeadline:      checkout.RemovalDeadline,
+			RemovalEvidence:      checkout.RemovalEvidence,
+			LastSeen:             checkout.LastSeen + 1,
+			LastError:            checkout.LastError,
+		}))
+	move, found, err := f.catalog.GetCheckoutRootMove(ctx, probeWorktreeID)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	// A terminal mode failure remains the more specific verdict even when a
+	// root move is also standing.
+	const failedTransitionID = "root-move-failed-transition"
+	require.NoError(t, f.catalog.BeginIntentTransition(ctx, store_sqlite.IntentTransition{
+		TransitionID:       failedTransitionID,
+		CheckoutID:         probeWorktreeID,
+		Cause:              "promote_checkout",
+		PriorDesiredMode:   store_sqlite.CheckoutModeAutomatic,
+		PriorEffectiveMode: store_sqlite.CheckoutModeAutomatic,
+		RequestedMode:      store_sqlite.CheckoutModeDedicated,
+		PriorCheckoutState: store_sqlite.CheckoutStateReady,
+		State:              store_sqlite.IntentTransitionFailed,
+		LastError:          "synthetic transition failure",
+		CreatedAt:          200,
+		LastProgress:       200,
+	}))
+	failed, err := f.controller.TrackReadiness(ctx, filepath.Join(movedRoot, probeFile))
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessFailed, failed.State)
+	assert.Contains(t, failed.Error, "synthetic transition failure")
+	require.NoError(t, f.catalog.CompleteIntentTransition(ctx, probeWorktreeID, failedTransitionID))
+
+	building, err := f.controller.TrackReadiness(ctx, filepath.Join(movedRoot, probeFile))
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, building.State)
+	require.NotNil(t, building.View)
+	assert.False(t, building.View.Exact)
+	assert.Equal(t, daemon.ProbeViewUnrouted, building.View.Kind)
+	assert.Equal(t, daemon.FallbackViewBuilding, building.View.FallbackReason)
+	assert.Contains(t, building.Error, "root move")
+	assert.Zero(t, f.controller.viewMaterializer.Leases.Held(),
+		"pending move readiness acquired generation leases")
+
+	require.NoError(t, f.catalog.CompleteCheckoutRootMove(ctx, move))
+	ready, err := f.controller.TrackReadiness(ctx, filepath.Join(movedRoot, probeFile))
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, ready.State)
+	require.NotNil(t, ready.View)
+	assert.True(t, ready.View.Exact)
+
+	routeAfter, found, err := f.catalog.GetCheckoutRoute(ctx, probeWorktreeID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, routeBefore, routeAfter)
+	graphAfter, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, graphBefore.ActiveGenerationID, graphAfter.ActiveGenerationID)
+}
+
 func TestTrackReadinessHeldPromotionDoesNotTrustStableEmptyShell(t *testing.T) {
 	f := newProbeFixture(t)
 	ctx := context.Background()

@@ -361,6 +361,11 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 	if !found {
 		return building("checkout catalog row is not published yet"), nil
 	}
+	if _, moving, moveErr := catalog.GetCheckoutRootMove(ctx, binding.CheckoutID); moveErr != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read checkout root move %q: %w", binding.CheckoutID, moveErr)
+	} else if moving {
+		return building("checkout root move recovery is pending"), nil
+	}
 
 	route, found, err := catalog.GetCheckoutRoute(ctx, binding.CheckoutID)
 	if err != nil {

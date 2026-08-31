@@ -164,14 +164,13 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 	if checkoutID == "" {
 		return nil, NewViewError(CodeInvalidViewSelector, "materialization needs a checkout id")
 	}
-
 	// The route read and generation lease cannot be one SQLite/in-memory
 	// transaction. Pin the generations named by one route snapshot, then read
 	// the route again while those pins are held. If it moved, none of the old
 	// payload is opened and the current route gets another bounded attempt.
 	const routeSnapshotAttempts = 3
 	for attempt := 0; attempt < routeSnapshotAttempts; attempt++ {
-		route, routeErr := m.route(ctx, checkoutID)
+		route, routeErr := m.routeSnapshot(ctx, checkoutID)
 		if routeErr != nil {
 			return nil, routeErr
 		}
@@ -203,10 +202,62 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 			lease.Release()
 			return nil, err
 		}
+		// The checkout root may move while the route is being opened. Recheck
+		// after assembly so an exact reader is never handed out across a move
+		// journal that began during materialization. Closing releases every
+		// generation lease before the building verdict escapes.
+		if fenceErr := m.checkoutRootMoveFence(ctx, checkoutID); fenceErr != nil {
+			view.Close()
+			view = nil
+			return nil, fenceErr
+		}
 		return view, nil
 	}
 	return nil, NewViewError(CodeViewBuilding,
 		fmt.Sprintf("the route of checkout %q kept changing while materializing", checkoutID))
+}
+
+// routeSnapshot is the materialization preflight: route identity and the
+// root-move fence come from one SQLite statement, avoiding an extra catalog
+// round trip on every ready request without weakening the move linearization.
+func (m *Materializer) routeSnapshot(
+	ctx context.Context, checkoutID string,
+) (store_sqlite.CheckoutRoute, error) {
+	route, found, moving, err := m.Catalog.GetCheckoutRouteSnapshot(ctx, checkoutID)
+	switch {
+	case err != nil:
+		return route, WrapViewError(CodeCheckoutInaccessible,
+			fmt.Sprintf("read the route of checkout %q", checkoutID), err)
+	case moving:
+		return route, NewViewError(CodeViewBuilding,
+			fmt.Sprintf("checkout %q is completing a root move", checkoutID))
+	case !found:
+		return route, NewViewError(CodeCheckoutInaccessible,
+			fmt.Sprintf("checkout %q is not routed", checkoutID))
+	case route.State == store_sqlite.RouteRetired:
+		return route, NewViewError(CodeCheckoutInaccessible,
+			fmt.Sprintf("the route of checkout %q has retired", checkoutID))
+	default:
+		return route, nil
+	}
+}
+
+// checkoutRootMoveFence refuses checkout-specific exactness while its durable
+// relocation journal is standing. The route and graph generations may already
+// be valid, but runtime shells, watchers, configuration and intent locators do
+// not become one coherent working-copy view until that journal is removed.
+func (m *Materializer) checkoutRootMoveFence(ctx context.Context, checkoutID string) error {
+	_, pending, err := m.Catalog.GetCheckoutRootMove(ctx, checkoutID)
+	switch {
+	case err != nil:
+		return WrapViewError(CodeCheckoutInaccessible,
+			fmt.Sprintf("read pending root move for checkout %q", checkoutID), err)
+	case pending:
+		return NewViewError(CodeViewBuilding,
+			fmt.Sprintf("checkout %q is completing a root move", checkoutID))
+	default:
+		return nil
+	}
 }
 
 // pinCheckoutRoute closes the gap between reading a route and leasing its
