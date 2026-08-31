@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,9 +67,9 @@ var (
 type startupViewReadinessProbe func(context.Context, string) (daemon.TrackReadiness, error)
 
 // startupViewReadinessMonitor owns the daemon's frozen configured-Git startup
-// cohort. The first snapshot runs after Seed: paths that resolve to the legacy
-// lane are excluded, and every routed/catalog-backed path is then retained for
-// the rest of this startup even if a later probe temporarily loses its row.
+// cohort. Its paths come from the same post-Seed startupOwnershipPlan consumed
+// by legacy warmup, so a probe that temporarily says "legacy" is retained as
+// building rather than silently removing the repository from both owners.
 // Worker callbacks only update a tiny failure map and coalesce an edge;
 // catalog/materialization reads stay off the lifecycle worker (one explicit
 // post-Seed snapshot, then the one monitor goroutine).
@@ -101,6 +100,21 @@ func newStartupViewReadinessMonitor(paths []string) *startupViewReadinessMonitor
 		cohortIDs:   make(map[string]struct{}),
 		failures:    make(map[string]struct{}),
 	}
+}
+
+// setPaths installs the authoritative startup ownership plan before the first
+// snapshot freezes it. The monitor is constructed before Seed so transition
+// events cannot be lost; Seed and ownership planning finish before this write.
+func (m *startupViewReadinessMonitor) setPaths(paths []string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.frozen {
+		return
+	}
+	m.paths = append([]string(nil), paths...)
 }
 
 func (m *startupViewReadinessMonitor) requestRefresh() {
@@ -182,9 +196,6 @@ func (m *startupViewReadinessMonitor) snapshot(
 	}
 	for _, path := range paths {
 		readiness, err := probe(ctx, path)
-		if !frozen && err == nil && readiness.State == daemon.TrackReadinessLegacy {
-			continue
-		}
 		cohort = append(cohort, path)
 		result.Expected++
 		if err != nil {
@@ -257,22 +268,6 @@ func (m *startupViewReadinessMonitor) currentRevision() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.revision
-}
-
-func configuredStartupPaths(state *daemonState) []string {
-	if state == nil || state.configManager == nil {
-		return nil
-	}
-	entries := state.configManager.RepoEntries()
-	paths := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		path := entry.Path
-		if absolute, err := filepath.Abs(path); err == nil {
-			path = absolute
-		}
-		paths = append(paths, filepath.Clean(path))
-	}
-	return paths
 }
 
 func publishStartupViewReadiness(
@@ -554,7 +549,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		logger:        logger,
 	}
 	state.readinessFilter = controller.filterReadinessPhase
-	startupReadiness := newStartupViewReadinessMonitor(configuredStartupPaths(state))
+	// The monitor must observe Seed transitions, but its exact cohort is frozen
+	// only after Seed from the one ownership plan shared with legacy warmup.
+	startupReadiness := newStartupViewReadinessMonitor(nil)
 	startupReadinessCtx, cancelStartupReadiness := context.WithCancel(context.Background())
 	state.lifecycle.SetModeTransitionObserver(startupReadiness.observe)
 	var startupReadinessWG sync.WaitGroup
@@ -847,6 +844,8 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				logger.Warn("daemon: seeding the checkout catalog was incomplete", zap.Error(err))
 			}
 		}
+		ownership := daemonStartupOwnershipPlan(context.Background(), state, logger)
+		startupReadiness.setPaths(ownership.managedPaths)
 		startupSnapshot := startupReadiness.snapshot(startupReadinessCtx, controller.TrackReadiness)
 		controller.setStartupViewReadiness(startupSnapshot)
 		startupReadiness.finishInitialSnapshot()
@@ -869,7 +868,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
 		})
-		mw, warmup := warmupDaemonState(state, logger, markReady)
+		mw, warmup := warmupDaemonStateWithOwnership(state, logger, markReady, &ownership)
 		controller.AttachWatcher(mw)
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is
 		// the only consumer of mw.Events() (SetWatcher reads History(), not

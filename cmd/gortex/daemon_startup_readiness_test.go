@@ -54,18 +54,19 @@ func TestControllerReadinessExpectedZeroPreservesLegacy(t *testing.T) {
 }
 
 func TestStartupViewReadinessMonitorFreezesCohortAndCoalesces(t *testing.T) {
-	monitor := newStartupViewReadinessMonitor([]string{"/legacy", "/ready", "/building"})
+	monitor := newStartupViewReadinessMonitor([]string{"/catalog-gap", "/ready", "/building"})
 	states := map[string]daemon.TrackReadiness{
-		"/legacy":   {State: daemon.TrackReadinessLegacy},
-		"/ready":    {State: daemon.TrackReadinessReady, View: &daemon.ProbeView{CheckoutID: "ready-id", Exact: true}},
-		"/building": {State: daemon.TrackReadinessBuilding, View: &daemon.ProbeView{CheckoutID: "building-id"}},
+		"/catalog-gap": {State: daemon.TrackReadinessLegacy},
+		"/ready":       {State: daemon.TrackReadinessReady, View: &daemon.ProbeView{CheckoutID: "ready-id", Exact: true}},
+		"/building":    {State: daemon.TrackReadinessBuilding, View: &daemon.ProbeView{CheckoutID: "building-id"}},
 	}
 	probe := func(_ context.Context, path string) (daemon.TrackReadiness, error) {
 		return states[path], nil
 	}
 
 	initial := monitor.snapshot(context.Background(), probe)
-	assert.Equal(t, startupViewReadiness{Expected: 2, Ready: 1, Building: 1}, initial)
+	assert.Equal(t, startupViewReadiness{Expected: 3, Ready: 1, Building: 2}, initial,
+		"a Git root assigned to the exact lane must not disappear because its catalog row is temporarily unmatched")
 
 	// Once frozen, a legacy-looking answer cannot silently shrink the cohort.
 	states["/building"] = daemon.TrackReadiness{State: daemon.TrackReadinessLegacy}
@@ -75,15 +76,19 @@ func TestStartupViewReadinessMonitorFreezesCohortAndCoalesces(t *testing.T) {
 	}
 	assert.Len(t, monitor.changed, 1, "transition bursts must coalesce to one refresh edge")
 	failed := monitor.snapshot(context.Background(), probe)
-	assert.Equal(t, startupViewReadiness{Expected: 2, Ready: 1, Failed: 1}, failed)
+	assert.Equal(t, startupViewReadiness{Expected: 3, Ready: 1, Building: 1, Failed: 1}, failed)
 
 	monitor.observe(indexer.ModeTransitionEvent{CheckoutID: "building-id", Failed: false})
 	states["/building"] = daemon.TrackReadiness{
 		State: daemon.TrackReadinessReady,
 		View:  &daemon.ProbeView{CheckoutID: "building-id", Exact: true},
 	}
+	states["/catalog-gap"] = daemon.TrackReadiness{
+		State: daemon.TrackReadinessReady,
+		View:  &daemon.ProbeView{CheckoutID: "catalog-gap-id", Exact: true},
+	}
 	complete := monitor.snapshot(context.Background(), probe)
-	assert.Equal(t, startupViewReadiness{Expected: 2, Ready: 2}, complete)
+	assert.Equal(t, startupViewReadiness{Expected: 3, Ready: 3}, complete)
 	assert.True(t, complete.complete())
 }
 

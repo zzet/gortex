@@ -93,7 +93,7 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 	}
 	state.readinessFilter = controller.filterReadinessPhase
 
-	monitor := newStartupViewReadinessMonitor(configuredStartupPaths(state))
+	monitor := newStartupViewReadinessMonitor(nil)
 	lifecycle.SetModeTransitionObserver(monitor.observe)
 	monitorCtx, cancelMonitor := context.WithCancel(ctx)
 	var monitorWG sync.WaitGroup
@@ -121,6 +121,8 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 			startupDone <- seedErr
 			return
 		}
+		ownership := daemonStartupOwnershipPlan(ctx, state, zap.NewNop())
+		monitor.setPaths(ownership.managedPaths)
 		initial := monitor.snapshot(monitorCtx, controller.TrackReadiness)
 		controller.setStartupViewReadiness(initial)
 		monitor.finishInitialSnapshot()
@@ -129,7 +131,9 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 			markReadyCalls.Add(1)
 			controller.MarkReady(time.Since(started))
 		})
-		watcher, timings := warmupDaemonState(state, zap.NewNop(), markReady)
+		watcher, timings := warmupDaemonStateWithOwnership(
+			state, zap.NewNop(), markReady, &ownership,
+		)
 		attachCtx, cancelAttach := context.WithTimeout(ctx, 10*time.Second)
 		attachErr := controller.AttachWatcherContext(attachCtx, watcher)
 		cancelAttach()

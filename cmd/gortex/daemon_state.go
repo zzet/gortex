@@ -421,30 +421,125 @@ func rotateColdInternGeneration(logger *zap.Logger, phase string) int {
 	return released
 }
 
-// legacyWarmupRepos partitions configured repositories by startup owner.
-// Reachable Git checkouts are explicit lifecycle intent: Seed has already
-// queued or restored their dedicated promotion, so sending them through the
-// legacy generation-0 TrackRepoCtx/ReconcileRepoCtx loop would parse the same
-// corpus twice and retain both copies. Non-Git roots keep the historical
-// warmup path unchanged. An inaccessible or malformed Git checkout also stays
-// on the legacy side so a failed inventory cannot silently suppress its only
-// indexing attempt.
-func legacyWarmupRepos(ctx context.Context, lifecycle *indexer.CheckoutLifecycle, repos []config.RepoEntry) (legacy []config.RepoEntry, lifecycleManaged int) {
-	if lifecycle == nil {
-		return repos, 0
+// startupOwnershipPlan is the one authoritative split of configured physical
+// repositories for one daemon start. A path appears in exactly one lane:
+// lifecycle-managed Git roots build an exact nonzero view, while legacy roots
+// retain generation-zero warmup. Keeping both consumers on this frozen plan is
+// what prevents a Seed/catalog gap from making a reachable Git root disappear
+// from both lanes or be indexed twice.
+type startupOwnershipPlan struct {
+	configured             []config.RepoEntry
+	legacy                 []config.RepoEntry
+	managedPaths           []string
+	legacyGitFallbackPaths []string
+}
+
+type startupGitInventoryProbe func(context.Context, string) bool
+type startupCatalogOwnershipProbe func(context.Context, string) bool
+
+func configuredStartupRepos(state *daemonState, logger *zap.Logger) []config.RepoEntry {
+	if state == nil || state.configManager == nil {
+		return nil
 	}
-	legacy = make([]config.RepoEntry, 0, len(repos))
+	// Heal aliases before freezing physical ownership. RepoRegistrations then
+	// deduplicates top-level and project provenance onto one canonical path.
+	healDuplicateRepos(state.configManager.Global(), logger)
+	registrations := state.configManager.RepoRegistrations()
+	repos := make([]config.RepoEntry, len(registrations))
+	for i := range registrations {
+		repos[i] = registrations[i].Entry
+		repos[i].Path = registrations[i].CanonicalPath
+	}
+	return repos
+}
+
+func buildStartupOwnershipPlan(
+	ctx context.Context,
+	repos []config.RepoEntry,
+	catalogOwns startupCatalogOwnershipProbe,
+	inventory startupGitInventoryProbe,
+) startupOwnershipPlan {
+	plan := startupOwnershipPlan{
+		configured: append([]config.RepoEntry(nil), repos...),
+		legacy:     make([]config.RepoEntry, 0, len(repos)),
+	}
+	if catalogOwns == nil && inventory == nil {
+		plan.legacy = append(plan.legacy, repos...)
+		return plan
+	}
 	for _, entry := range repos {
-		if _, err := gitstate.Inventory(ctx, entry.Path); err == nil {
-			lifecycleManaged++
+		managed := catalogOwns != nil && catalogOwns(ctx, entry.Path)
+		// A row Seed already published remains lifecycle-owned even if the
+		// checkout disappears between Seed and this freeze. Its lifecycle,
+		// not a duplicate legacy parse, owns removal/grace handling. Inventory
+		// alone is deliberately not an ownership claim: if Seed failed before
+		// publishing a catalog row, no coordinator exists to finish that exact
+		// view. Give the root one legacy job for this boot instead of omitting it
+		// from both lanes and leaving startup permanently building.
+		if managed {
+			plan.managedPaths = append(plan.managedPaths, entry.Path)
 			continue
 		}
-		legacy = append(legacy, entry)
+		plan.legacy = append(plan.legacy, entry)
+		if inventory != nil && inventory(ctx, entry.Path) {
+			plan.legacyGitFallbackPaths = append(plan.legacyGitFallbackPaths, entry.Path)
+		}
 	}
-	return legacy, lifecycleManaged
+	return plan
+}
+
+func daemonStartupOwnershipPlan(
+	ctx context.Context, state *daemonState, logger *zap.Logger,
+) startupOwnershipPlan {
+	repos := configuredStartupRepos(state, logger)
+	if state == nil || state.lifecycle == nil {
+		return buildStartupOwnershipPlan(ctx, repos, nil, nil)
+	}
+	plan := buildStartupOwnershipPlan(ctx, repos,
+		func(ctx context.Context, path string) bool {
+			binding, err := state.lifecycle.ExplainView(ctx, path)
+			return err == nil && binding.Matched
+		},
+		func(ctx context.Context, path string) bool {
+			_, err := gitstate.Inventory(ctx, path)
+			return err == nil
+		})
+	if logger != nil && len(plan.legacyGitFallbackPaths) > 0 {
+		logger.Warn("daemon: configured Git roots have no lifecycle owner; using legacy warmup for this start",
+			zap.Strings("paths", plan.legacyGitFallbackPaths))
+	}
+	return plan
+}
+
+// legacyWarmupRepos remains the small compatibility surface used by focused
+// partition tests. Production warmup and startup readiness consume the same
+// startupOwnershipPlan instead of independently repeating this decision.
+func legacyWarmupRepos(ctx context.Context, lifecycle *indexer.CheckoutLifecycle, repos []config.RepoEntry) (legacy []config.RepoEntry, lifecycleManaged int) {
+	if lifecycle == nil {
+		return append([]config.RepoEntry(nil), repos...), 0
+	}
+	// This compatibility helper predates the post-Seed production plan and is
+	// intentionally an inventory partition. Production never uses it to claim
+	// coordinator ownership; warmupDaemonStateWithOwnership consumes the
+	// catalog-backed daemonStartupOwnershipPlan instead.
+	plan := buildStartupOwnershipPlan(ctx, repos,
+		func(ctx context.Context, path string) bool {
+			_, err := gitstate.Inventory(ctx, path)
+			return err == nil
+		}, nil)
+	return plan.legacy, len(plan.managedPaths)
 }
 
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
+	return warmupDaemonStateWithOwnership(state, logger, markReady, nil)
+}
+
+func warmupDaemonStateWithOwnership(
+	state *daemonState,
+	logger *zap.Logger,
+	markReady func(),
+	ownership *startupOwnershipPlan,
+) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state == nil {
 		return nil, timings
@@ -466,23 +561,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// batch wrapper, a 100+ repo warmup is O(R · global_size).
 	state.multiIndexer.BeginParallelBatch()
 
-	// Heal any duplicate tracked-repo entries that name the same directory
-	// under a different path spelling (case, or Unicode normalisation)
-	// BEFORE the warmup loop registers them. Two spellings of one directory
-	// would otherwise both reach the indexer and flip the daemon into
-	// multi-repo mode, desyncing the unprefixed graph (#270).
-	healDuplicateRepos(state.configManager.Global(), logger)
-
-	// Physical startup work is deduplicated across top-level and project
-	// memberships. Use each registration's canonical physical path so a
-	// blank-name symlink alias derives the same prefix here as lifecycle
-	// promotion does. The source provenance itself is consumed by Seed.
-	registrations := state.configManager.RepoRegistrations()
-	repos := make([]config.RepoEntry, len(registrations))
-	for i := range registrations {
-		repos[i] = registrations[i].Entry
-		repos[i].Path = registrations[i].CanonicalPath
+	// Production passes the post-Seed frozen split shared with startup
+	// readiness. Standalone/test callers compute the same split here.
+	if ownership == nil {
+		planned := daemonStartupOwnershipPlan(ctx, state, logger)
+		ownership = &planned
 	}
+	configuredRepos := append([]config.RepoEntry(nil), ownership.configured...)
+	repos := append([]config.RepoEntry(nil), ownership.legacy...)
 
 	// Purge orphaned repo prefixes BEFORE the warmup loop re-registers the
 	// tracked repos, while the store still reflects the prior run's state. A
@@ -500,8 +586,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		OrphanRepoPrefixes(known []string) []string
 	}); ok {
 		if purger, ok := state.graph.(interface{ PurgeRepo(string) error }); ok {
-			known := make([]string, 0, len(repos))
-			for _, entry := range repos {
+			known := make([]string, 0, len(configuredRepos))
+			for _, entry := range configuredRepos {
 				p := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
 				if p != "" {
 					known = append(known, p)
@@ -541,7 +627,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if state.resolverLSPRegistry != nil && state.lspRouter != nil {
 		poolSize := lsp.ResolverPoolSizeFromEnv(1)
 		registered, skipped, tsRepos, pythonRepos := 0, 0, 0, 0
-		for _, entry := range repos {
+		for _, entry := range configuredRepos {
 			absRoot, err := filepath.Abs(entry.Path)
 			if err != nil {
 				continue
@@ -570,12 +656,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.Int("python_repos", pythonRepos),
 			zap.Int("pool_size", poolSize))
 	}
-	configuredRepos := len(repos)
-	var lifecycleManaged int
-	repos, lifecycleManaged = legacyWarmupRepos(ctx, state.lifecycle, repos)
 	logger.Info("daemon: warmup ownership partition",
-		zap.Int("configured_repos", configuredRepos),
-		zap.Int("lifecycle_managed_git", lifecycleManaged),
+		zap.Int("configured_repos", len(configuredRepos)),
+		zap.Int("lifecycle_managed_git", len(ownership.managedPaths)),
 		zap.Int("legacy_jobs", len(repos)))
 
 	// Bounded worker pool — disk I/O dominates parsing for most repos,
