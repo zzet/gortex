@@ -202,7 +202,7 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		}
 		l.notifyTrackedSetChanged()
 		if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID, transition.TransitionID); err != nil {
-			return out, err
+			return out, l.promotionFailed(ctx, &out, transition, err)
 		}
 		// Cold Seed deliberately withholds automatic siblings until the
 		// primary graph is servable. A recovered promotion owns the handoff:
@@ -275,8 +275,10 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	}
 	l.notifyTrackedSetChanged()
 	if err := l.catalog.CompleteIntentTransition(ctx, checkout.CheckoutID, transition.TransitionID); err != nil {
-		l.logger.Warn("checkout lifecycle: could not release the promotion journal",
-			zap.String("checkout", checkout.CheckoutID), zap.Error(err))
+		// Publication is durable, but the transition is the completion fence.
+		// Reporting success while it remains would strand startup readiness with
+		// no failed worker edge and no reason recorded for the retry.
+		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 	// The active base and owner route are durable now. Only at this point may
 	// automatic siblings begin composing layers over the family's primary.
