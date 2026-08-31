@@ -479,9 +479,13 @@ type ViewBinding struct {
 	DesiredMode   string `json:"desired_mode,omitempty"`
 	EffectiveMode string `json:"effective_mode,omitempty"`
 
-	// GraphID / RepoPrefix name the corpus that answers.
-	GraphID    string `json:"graph_id,omitempty"`
-	RepoPrefix string `json:"repo_prefix,omitempty"`
+	// GraphID / RepoPrefix name the selected corpus. GraphState and
+	// ActiveGenerationID carry the exact sealed base snapshot that readers
+	// must open instead of silently falling through to generation zero.
+	GraphID            string `json:"graph_id,omitempty"`
+	GraphState         string `json:"graph_state,omitempty"`
+	ActiveGenerationID int64  `json:"active_generation_id,omitempty"`
+	RepoPrefix         string `json:"repo_prefix,omitempty"`
 	// PrimaryGraphID is the family's base corpus, which is what an automatic
 	// checkout's layers compose over.
 	PrimaryGraphID string `json:"primary_graph_id,omitempty"`
@@ -562,6 +566,15 @@ func (l *CheckoutLifecycle) ExplainView(ctx context.Context, path string) (ViewB
 	if primary != nil {
 		out.PrimaryGraphID = primary.GraphID
 	}
+	selectGraph := func(selected *store_sqlite.DedicatedGraph) {
+		if selected == nil {
+			return
+		}
+		out.GraphID = selected.GraphID
+		out.GraphState = selected.State
+		out.ActiveGenerationID = selected.ActiveGenerationID
+		out.RepoPrefix = selected.RepoPrefix
+	}
 
 	if checkout.State != store_sqlite.CheckoutStateReady {
 		// Grace is read-only and never exact. Prefer the family's primary even
@@ -572,44 +585,50 @@ func (l *CheckoutLifecycle) ExplainView(ctx context.Context, path string) (ViewB
 		if fallback == nil {
 			fallback = owned
 		}
-		if fallback != nil {
-			out.GraphID, out.RepoPrefix = fallback.GraphID, fallback.RepoPrefix
-		}
+		selectGraph(fallback)
 		out.Reason = "the checkout is " + string(checkout.State) + ", so its graph is available only as a read-only fallback"
 		out.Chain = append(out.Chain, "state is "+string(checkout.State)+": no checkout-specific layers are composed")
 		return out, nil
 	}
 
-	if checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
-		out.Reason = "the checkout is dedicated, so its own corpus answers directly"
-		out.Chain = append(out.Chain, "mode is "+string(checkout.EffectiveMode)+": no layers are composed")
-		if owned != nil {
-			out.GraphID, out.RepoPrefix = owned.GraphID, owned.RepoPrefix
-			out.Chain = append(out.Chain, "corpus "+owned.RepoPrefix+" holds its nodes")
+	selected := owned
+	if checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic {
+		selected = primary
+		out.Chain = append(out.Chain, "mode is automatic: the family's primary corpus is the base")
+	} else {
+		out.Chain = append(out.Chain, "mode is "+string(checkout.EffectiveMode)+": its owned corpus is the base")
+	}
+	if selected == nil {
+		if checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic {
+			out.Reason = "the family has no primary corpus to compose over"
+		} else {
+			out.Reason = "the dedicated checkout has no owned corpus"
 		}
 		return out, nil
 	}
-	out.Chain = append(out.Chain, "mode is automatic: the family's primary corpus is the base")
-
-	if primary == nil {
-		out.Reason = "the family has no primary corpus to compose over"
-		return out, nil
-	}
-	out.GraphID, out.RepoPrefix = primary.GraphID, primary.RepoPrefix
+	selectGraph(selected)
+	out.Chain = append(out.Chain, "corpus "+selected.RepoPrefix+" is selected at generation "+fmt.Sprint(selected.ActiveGenerationID))
 
 	route, routed, err := l.catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
 	if err != nil {
 		return out, err
 	}
 	if !routed {
-		out.Reason = "the checkout has no route, so the base corpus answers"
+		if checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic {
+			out.Reason = "the checkout has no route, so no exact working-copy view is ready"
+		} else {
+			out.Reason = "the checkout has no route, so its sealed base corpus answers directly"
+		}
 		return out, nil
 	}
 	out.Route = routeOverviewOf(route)
-	out.GraphID = route.GraphID
 	out.Chain = append(out.Chain, fmt.Sprintf(
 		"route points at graph %s with commit generation %d and dirty generation %d",
 		route.GraphID, route.CommitGenerationID, route.DirtyGenerationID))
+	if route.GraphID != selected.GraphID {
+		out.Reason = fmt.Sprintf("the route targets graph %s instead of selected graph %s", route.GraphID, selected.GraphID)
+		return out, nil
+	}
 	if !graphview.RouteReady(route) {
 		out.Reason = "the route is " + string(route.State) + " and does not name both generations yet"
 		return out, nil

@@ -86,6 +86,11 @@ type realController struct {
 	// copy has no composed view. nil routes to the lifecycle's own per-family
 	// path; tests substitute it to observe the debounce.
 	probeReconcile func(familyID string)
+	// probeViewRevalidateBarrier is a deterministic test seam between leasing
+	// a generation-backed view and re-reading its catalog binding. Production
+	// leaves it nil. Keeping the seam here lets race regressions move a graph
+	// or route at the exact boundary without sleeps or scheduler assumptions.
+	probeViewRevalidateBarrier func()
 	// topologyReconcile is the context-aware reconciliation a topology nudge
 	// runs. Production leaves it nil and uses lifecycle; tests substitute it
 	// to exercise retained dispatch teardown without replacing that context.

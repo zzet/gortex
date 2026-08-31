@@ -145,9 +145,9 @@ func TestListCheckoutsReportsTheFamilyItsGraphsAndItsCheckouts(t *testing.T) {
 	assert.Equal(t, family.FamilyID, byPath.Families[0].FamilyID)
 }
 
-// TestExplainViewWalksTheBindingChain covers the three answers the diagnostic
-// has to tell apart: a routed worktree, a checkout served from its own corpus,
-// and a path no checkout contains.
+// TestExplainViewWalksTheBindingChain covers the answers the diagnostic has to
+// tell apart: routed automatic and dedicated checkouts, a dedicated checkout
+// served directly from its sealed base, and a path no checkout contains.
 func TestExplainViewWalksTheBindingChain(t *testing.T) {
 	f := newCheckoutAdminFixture(t)
 	// What is under test is the chain the binding walks, not the builder that
@@ -156,6 +156,7 @@ func TestExplainViewWalksTheBindingChain(t *testing.T) {
 	ctx := context.Background()
 	family := f.families(t, map[string]any{}).Families[0]
 	linked := checkoutNamed(t, family, "wt")
+	primary := checkoutNamed(t, family, gitstate.MainAdminName)
 
 	// A route with both slots filled is what makes a composed view answer.
 	// The generations are seeded rather than built.
@@ -182,13 +183,38 @@ func TestExplainViewWalksTheBindingChain(t *testing.T) {
 	assert.True(t, routed.Route.Ready)
 	assert.Equal(t, family.PrimaryGraphID, routed.PrimaryGraphID)
 
-	dedicated := explainView(t, f.srv, f.main)
-	assert.True(t, dedicated.Matched)
-	assert.Equal(t, string(store_sqlite.CheckoutModeDedicated), dedicated.EffectiveMode)
-	assert.False(t, dedicated.Composed)
-	assert.Contains(t, dedicated.Reason, "dedicated")
-	assert.Equal(t, family.PrimaryGraphID, dedicated.GraphID)
-	assert.Nil(t, dedicated.Route)
+	dedicatedRouted := explainView(t, f.srv, f.main)
+	assert.True(t, dedicatedRouted.Matched)
+	assert.Equal(t, string(store_sqlite.CheckoutModeDedicated), dedicatedRouted.EffectiveMode)
+	assert.True(t, dedicatedRouted.Composed)
+	assert.Empty(t, dedicatedRouted.Reason)
+	assert.Equal(t, family.PrimaryGraphID, dedicatedRouted.GraphID)
+	assert.Equal(t, family.Graphs[0].State, dedicatedRouted.GraphState)
+	assert.Equal(t, family.Graphs[0].ActiveGenerationID, dedicatedRouted.ActiveGenerationID)
+	require.NotNil(t, dedicatedRouted.Route)
+	assert.True(t, dedicatedRouted.Route.Ready)
+
+	require.NoError(t, f.catalog.DeleteCheckoutRoute(ctx, primary.CheckoutID))
+	dedicatedDirect := explainView(t, f.srv, f.main)
+	assert.True(t, dedicatedDirect.Matched)
+	assert.Equal(t, string(store_sqlite.CheckoutModeDedicated), dedicatedDirect.EffectiveMode)
+	assert.False(t, dedicatedDirect.Composed)
+	assert.Contains(t, dedicatedDirect.Reason, "sealed base")
+	assert.Equal(t, family.PrimaryGraphID, dedicatedDirect.GraphID)
+	assert.Equal(t, family.Graphs[0].State, dedicatedDirect.GraphState)
+	assert.Equal(t, family.Graphs[0].ActiveGenerationID, dedicatedDirect.ActiveGenerationID)
+	assert.Nil(t, dedicatedDirect.Route)
+
+	commitOnly := seedGeneration(t, f.catalog, family.PrimaryGraphID, primary.CheckoutID, "commit")
+	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
+		CheckoutID: primary.CheckoutID, GraphID: family.PrimaryGraphID,
+		CommitGenerationID: commitOnly, State: store_sqlite.RouteActive,
+	}))
+	dedicatedIncomplete := explainView(t, f.srv, f.main)
+	assert.False(t, dedicatedIncomplete.Composed)
+	require.NotNil(t, dedicatedIncomplete.Route)
+	assert.False(t, dedicatedIncomplete.Route.Ready)
+	assert.Contains(t, dedicatedIncomplete.Reason, "does not name both generations")
 
 	unknown := explainView(t, f.srv, t.TempDir())
 	assert.False(t, unknown.Matched)

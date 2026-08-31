@@ -650,8 +650,9 @@ const (
 	// ProbeViewWorktree is an automatic checkout's composed view — the
 	// primary's corpus with that working copy's routed generations on top.
 	ProbeViewWorktree = "worktree"
-	// ProbeViewUnrouted is a registered automatic checkout with no composed
-	// view yet. Nothing can answer for it truthfully, so nothing does.
+	// ProbeViewUnrouted is a registered checkout whose composed route or
+	// generation-backed dedicated base is not ready. Nothing can answer for it
+	// truthfully, so nothing does.
 	ProbeViewUnrouted = "unrouted"
 )
 

@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -43,9 +44,9 @@ type probeView struct {
 	// checkout owns it.
 	root string
 	// servable reports that something can answer for this path at all. It is
-	// false only for a registered automatic checkout with no composed view
-	// yet: nothing has been built that describes that working copy, and the
-	// primary's content describes a different one.
+	// false for a registered checkout whose exact route or generation-backed
+	// base is not ready: answering from generation zero would describe a
+	// different state while looking authoritative.
 	servable bool
 	// release drops the lease a materialized view holds. Never nil.
 	release func()
@@ -132,11 +133,10 @@ type topologyNudgeState struct {
 
 // resolveProbeView decides which graph answers a probe about path.
 //
-// The order is the catalog's: a path no checkout owns and a checkout served
-// from its own corpus both read the base, exactly as they did before routed
-// views existed. Only an automatic checkout — one served from its family's
-// shared lane — has a composed view, and only when its route names both
-// generations. Anything short of that is reported rather than approximated.
+// The order is the catalog's: a path no checkout owns reads generation zero;
+// a generation-backed dedicated checkout opens its sealed active base; and a
+// ready route for either mode opens the composed checkout view. Anything short
+// of the catalog-selected view is reported rather than approximated.
 func (c *realController) resolveProbeView(ctx context.Context, path string) probeView {
 	view := c.selectProbeView(ctx, path)
 	recordProbeAnswer(view.answer)
@@ -183,12 +183,22 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 		return base
 	}
 
+	unrouted := func() probeView {
+		c.nudgeFamily(binding.FamilyID)
+		return probeView{
+			answer:   fallbackProbeView(daemon.ProbeViewUnrouted, binding.CheckoutID, binding.RepoPrefix, daemon.FallbackViewBuilding),
+			root:     binding.RootPath,
+			servable: false,
+			release:  noopRelease,
+		}
+	}
+
 	if binding.Matched && binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {
 		// Availability and removal grace are read-only fallbacks even for a
 		// checkout that was dedicated. The path is not live, so presenting its
 		// retained corpus as an exact working-copy view would make stale data
 		// indistinguishable from the checkout itself.
-		return probeView{
+		fallback := probeView{
 			answer:      fallbackProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix, binding.CheckoutState),
 			repoPrefix:  binding.RepoPrefix,
 			searchScope: binding.RepoPrefix,
@@ -196,12 +206,47 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 			servable:    true,
 			release:     noopRelease,
 		}
+		if binding.ActiveGenerationID <= 0 {
+			if !c.probeBindingStillCurrent(ctx, path, binding) {
+				fallback.servable = false
+				c.nudgeFamily(binding.FamilyID)
+			}
+			return fallback
+		}
+		if binding.GraphID == "" ||
+			(binding.GraphState != store_sqlite.DedicatedGraphStateReady &&
+				binding.GraphState != store_sqlite.DedicatedGraphStateRefreshing) {
+			fallback.servable = false
+			c.nudgeFamily(binding.FamilyID)
+			return fallback
+		}
+		view, viewErr := c.viewMaterializer.MaterializeBase(
+			ctx, binding.GraphID, binding.ActiveGenerationID,
+		)
+		if viewErr != nil {
+			if c.logger != nil {
+				c.logger.Debug("probe view: could not materialize the grace base",
+					zap.String("checkout", binding.CheckoutID), zap.Error(viewErr))
+			}
+			fallback.servable = false
+			c.nudgeFamily(binding.FamilyID)
+			return fallback
+		}
+		if !materializedBaseMatchesBinding(view, binding) ||
+			!c.probeBindingStillCurrent(ctx, path, binding) {
+			view.Close()
+			fallback.servable = false
+			c.nudgeFamily(binding.FamilyID)
+			return fallback
+		}
+		fallback.reader = view.Reader
+		fallback.release = view.Close
+		return fallback
 	}
 
-	if !binding.Matched || binding.EffectiveMode != string(store_sqlite.CheckoutModeAutomatic) {
-		// A live dedicated checkout, the family primary, and every untracked
-		// path are read from the indexed corpus directly, unscoped, exactly as
-		// they were before routed views existed.
+	if !binding.Matched {
+		// An ordinary tracked path with no checkout identity remains on the
+		// legacy corpus.
 		base.answer = exactProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix)
 		base.repoPrefix = binding.RepoPrefix
 		base.root = binding.RootPath
@@ -211,8 +256,22 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	if binding.Composed {
 		view, viewErr := c.viewMaterializer.MaterializeCheckout(ctx, binding.CheckoutID)
 		if viewErr == nil {
+			if binding.Route == nil ||
+				!materializedCheckoutMatchesRoute(
+					view, binding,
+					binding.Route.CommitGenerationID,
+					binding.Route.DirtyGenerationID,
+					binding.ActiveGenerationID,
+				) || !c.probeBindingStillCurrent(ctx, path, binding) {
+				view.Close()
+				return unrouted()
+			}
+			kind := daemon.ProbeViewBase
+			if binding.EffectiveMode == string(store_sqlite.CheckoutModeAutomatic) {
+				kind = daemon.ProbeViewWorktree
+			}
 			return probeView{
-				answer:      exactProbeView(daemon.ProbeViewWorktree, binding.CheckoutID, binding.RepoPrefix),
+				answer:      exactProbeView(kind, binding.CheckoutID, binding.RepoPrefix),
 				reader:      view.Reader,
 				repoPrefix:  binding.RepoPrefix,
 				searchScope: binding.RepoPrefix,
@@ -225,38 +284,51 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 			c.logger.Debug("probe view: could not materialize the checkout's view",
 				zap.String("checkout", binding.CheckoutID), zap.Error(viewErr))
 		}
+		return unrouted()
 	}
 
-	// Nothing composed answers this working copy. Ask for a reconciliation so
-	// a later probe can, and answer without waiting on it — a probe that
-	// blocked on a build would cost the agent the latency the hook exists to
-	// save.
-	c.nudgeFamily(binding.FamilyID)
+	if binding.EffectiveMode == string(store_sqlite.CheckoutModeAutomatic) || binding.Route != nil {
+		// Automatic checkouts always require both routed layers. A dedicated
+		// checkout with a standing incomplete route also cannot fall back to its
+		// base: that would hide the state the route is publishing.
+		return unrouted()
+	}
 
-	if binding.CheckoutState == string(store_sqlite.CheckoutStateReady) {
-		// Registered, live, and unrouted: the view is still being built (or
-		// has not been asked for yet). Reporting the primary's content here
-		// would describe a different working copy, so nothing is reported.
-		return probeView{
-			answer:   fallbackProbeView(daemon.ProbeViewUnrouted, binding.CheckoutID, binding.RepoPrefix, daemon.FallbackViewBuilding),
-			root:     binding.RootPath,
-			servable: false,
-			release:  noopRelease,
+	if binding.GraphID == "" || binding.GraphState != store_sqlite.DedicatedGraphStateReady {
+		return unrouted()
+	}
+	direct := probeView{
+		answer:     exactProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix),
+		repoPrefix: binding.RepoPrefix,
+		root:       binding.RootPath,
+		servable:   true,
+		release:    noopRelease,
+	}
+	if binding.ActiveGenerationID <= 0 {
+		// Compatibility for graphs created before generation-backed bases.
+		if !c.probeBindingStillCurrent(ctx, path, binding) {
+			return unrouted()
 		}
+		return direct
 	}
-
-	// Availability or removal grace: the working copy itself stopped
-	// answering, and the family primary serves it by the same fallback rule a
-	// read-only query follows. The checkout state is the reason, so a caller
-	// logging it sees which grace window is running.
-	return probeView{
-		answer:      fallbackProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix, binding.CheckoutState),
-		repoPrefix:  binding.RepoPrefix,
-		searchScope: binding.RepoPrefix,
-		root:        binding.RootPath,
-		servable:    true,
-		release:     noopRelease,
+	view, viewErr := c.viewMaterializer.MaterializeBase(
+		ctx, binding.GraphID, binding.ActiveGenerationID,
+	)
+	if viewErr != nil {
+		if c.logger != nil {
+			c.logger.Debug("probe view: could not materialize the dedicated base",
+				zap.String("checkout", binding.CheckoutID), zap.Error(viewErr))
+		}
+		return unrouted()
 	}
+	if !materializedBaseMatchesBinding(view, binding) ||
+		!c.probeBindingStillCurrent(ctx, path, binding) {
+		view.Close()
+		return unrouted()
+	}
+	direct.reader = view.Reader
+	direct.release = view.Close
+	return direct
 }
 
 // exactProbeView names a graph that is the path's own.
@@ -280,6 +352,74 @@ func fallbackProbeView(kind, checkoutID, repoPrefix, reason string) *daemon.Prob
 		Exact:          false,
 		FallbackReason: reason,
 	}
+}
+
+func sameProbeBinding(left, right indexer.ViewBinding) bool {
+	if left.Matched != right.Matched || left.FamilyID != right.FamilyID ||
+		left.CheckoutID != right.CheckoutID || left.Incarnation != right.Incarnation ||
+		left.RootPath != right.RootPath || left.CheckoutState != right.CheckoutState ||
+		left.EffectiveMode != right.EffectiveMode || left.GraphID != right.GraphID ||
+		left.GraphState != right.GraphState ||
+		left.ActiveGenerationID != right.ActiveGenerationID ||
+		left.RepoPrefix != right.RepoPrefix || left.PrimaryGraphID != right.PrimaryGraphID ||
+		left.Composed != right.Composed {
+		return false
+	}
+	if left.Route == nil || right.Route == nil {
+		return left.Route == nil && right.Route == nil
+	}
+	return *left.Route == *right.Route
+}
+
+func (c *realController) probeBindingStillCurrent(
+	ctx context.Context, path string, expected indexer.ViewBinding,
+) bool {
+	if c == nil || c.lifecycle == nil {
+		return false
+	}
+	if c.probeViewRevalidateBarrier != nil {
+		c.probeViewRevalidateBarrier()
+	}
+	current, err := c.lifecycle.ExplainView(ctx, path)
+	return err == nil && sameProbeBinding(expected, current)
+}
+
+func materializedBaseMatchesBinding(view *graphview.RepoView, binding indexer.ViewBinding) bool {
+	if view == nil || binding.ActiveGenerationID <= 0 ||
+		view.ID.BaseGraphID != binding.GraphID ||
+		view.ID.RepoPrefix != binding.RepoPrefix ||
+		view.ID.BaseGeneration != binding.ActiveGenerationID {
+		return false
+	}
+	generations := view.Generations()
+	return len(generations) == 1 && generations[0] == binding.ActiveGenerationID
+}
+
+func materializedCheckoutMatchesRoute(
+	view *graphview.RepoView,
+	binding indexer.ViewBinding,
+	commitGenerationID, dirtyGenerationID int64,
+	activeGenerationID int64,
+) bool {
+	if view == nil || activeGenerationID <= 0 ||
+		view.ID.BaseGraphID != binding.GraphID ||
+		view.ID.RepoPrefix != binding.RepoPrefix ||
+		view.ID.BaseGeneration != commitGenerationID {
+		return false
+	}
+	generations := view.Generations()
+	return len(generations) == 3 && generations[0] == activeGenerationID &&
+		generations[len(generations)-2] == commitGenerationID &&
+		generations[len(generations)-1] == dirtyGenerationID
+}
+
+func checkoutRouteMatchesBinding(route store_sqlite.CheckoutRoute, binding indexer.ViewBinding) bool {
+	return binding.Route != nil && binding.Route.GraphID == route.GraphID &&
+		binding.Route.CommitGenerationID == route.CommitGenerationID &&
+		binding.Route.DirtyGenerationID == route.DirtyGenerationID &&
+		binding.Route.RouteEpoch == route.RouteEpoch &&
+		binding.Route.State == string(route.State) &&
+		binding.Route.Ready == graphview.RouteReady(route)
 }
 
 // TrackReadiness proves that the exact routed view for path can be opened now.
@@ -342,6 +482,14 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 		result.View.Incarnation = binding.Incarnation
 		return result
 	}
+	ready := func(kind string) daemon.TrackReadiness {
+		result := daemon.TrackReadiness{
+			State: daemon.TrackReadinessReady,
+			View:  exactProbeView(kind, binding.CheckoutID, binding.RepoPrefix),
+		}
+		result.View.Incarnation = binding.Incarnation
+		return result
+	}
 
 	if binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {
 		return building("checkout state is " + binding.CheckoutState), nil
@@ -371,33 +519,80 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 		return building("checkout root move recovery is pending"), nil
 	}
 
-	route, found, err := catalog.GetCheckoutRoute(ctx, binding.CheckoutID)
+	route, routed, err := catalog.GetCheckoutRoute(ctx, binding.CheckoutID)
 	if err != nil {
 		return daemon.TrackReadiness{}, fmt.Errorf("read checkout route %q: %w", binding.CheckoutID, err)
 	}
-	if !found || route.State != store_sqlite.RouteActive || route.GraphID == "" || route.CommitGenerationID <= 0 {
+	if routed && !graphview.RouteReady(route) {
 		return building("checkout route is not active and complete"), nil
 	}
-	if binding.GraphID == "" || route.GraphID != binding.GraphID {
+	if routed && !checkoutRouteMatchesBinding(route, binding) {
+		return building("checkout route changed while readiness was being checked"), nil
+	}
+	if !routed && binding.Route != nil {
+		return building("checkout route changed while readiness was being checked"), nil
+	}
+	if routed && (binding.GraphID == "" || route.GraphID != binding.GraphID) {
 		return building("checkout route does not target the graph selected for this path"), nil
 	}
-
-	graphRow, found, err := catalog.GetDedicatedGraph(ctx, route.GraphID)
-	if err != nil {
-		return daemon.TrackReadiness{}, fmt.Errorf("read dedicated graph %q: %w", route.GraphID, err)
+	if !routed && binding.EffectiveMode == string(store_sqlite.CheckoutModeAutomatic) {
+		return building("checkout route is not active and complete"), nil
 	}
-	if !found || graphRow.State != store_sqlite.DedicatedGraphStateReady || graphRow.ActiveGenerationID <= 0 {
+	if binding.GraphID == "" {
+		return building("checkout has no selected dedicated graph"), nil
+	}
+
+	graphRow, found, err := catalog.GetDedicatedGraph(ctx, binding.GraphID)
+	if err != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read dedicated graph %q: %w", binding.GraphID, err)
+	}
+	if !found || graphRow.State != store_sqlite.DedicatedGraphStateReady {
 		return building("dedicated graph has no active ready generation"), nil
 	}
-	active, found, err := catalog.GetViewGeneration(ctx, graphRow.ActiveGenerationID)
-	if err != nil {
-		return daemon.TrackReadiness{}, fmt.Errorf("read active generation %d: %w", graphRow.ActiveGenerationID, err)
+	if graphRow.GraphID != binding.GraphID || graphRow.RepoPrefix != binding.RepoPrefix ||
+		graphRow.State != binding.GraphState ||
+		graphRow.ActiveGenerationID != binding.ActiveGenerationID {
+		return building("dedicated graph changed while readiness was being checked"), nil
 	}
-	if !found || active.State != store_sqlite.ViewGenerationReady {
-		if found && active.State == store_sqlite.ViewGenerationFailed {
-			return failed(active.Error), nil
+	if graphRow.ActiveGenerationID > 0 {
+		active, activeFound, activeErr := catalog.GetViewGeneration(ctx, graphRow.ActiveGenerationID)
+		if activeErr != nil {
+			return daemon.TrackReadiness{}, fmt.Errorf("read active generation %d: %w", graphRow.ActiveGenerationID, activeErr)
 		}
-		return building("dedicated graph generation is not ready"), nil
+		if !activeFound || active.State != store_sqlite.ViewGenerationReady {
+			if activeFound && active.State == store_sqlite.ViewGenerationFailed {
+				return failed(active.Error), nil
+			}
+			return building("dedicated graph generation is not ready"), nil
+		}
+	} else if routed {
+		return building("dedicated graph has no active ready generation"), nil
+	}
+
+	if !routed {
+		if graphRow.ActiveGenerationID > 0 {
+			view, materializeErr := c.viewMaterializer.MaterializeBase(
+				ctx, graphRow.GraphID, graphRow.ActiveGenerationID,
+			)
+			if materializeErr != nil {
+				var coded interface{ ErrorCode() string }
+				if errors.As(materializeErr, &coded) &&
+					(coded.ErrorCode() == graphview.CodeViewBuilding ||
+						coded.ErrorCode() == graphview.CodePrimaryNotReady) {
+					return building(materializeErr.Error()), nil
+				}
+				return failed(materializeErr.Error()), nil
+			}
+			if !materializedBaseMatchesBinding(view, binding) ||
+				!c.probeBindingStillCurrent(ctx, path, binding) {
+				view.Close()
+				return building("dedicated graph changed while readiness was being checked"), nil
+			}
+			view.Close()
+		} else if !c.probeBindingStillCurrent(ctx, path, binding) {
+			return building("dedicated graph changed while readiness was being checked"), nil
+		}
+		return ready(daemon.ProbeViewBase), nil
 	}
 
 	// This is the exact HEAD fence request routing applies before exposing a
@@ -418,20 +613,18 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 	if routedCommit.TreeOID != checkout.HeadTree {
 		return building("routed commit generation is stale for checkout HEAD"), nil
 	}
-	if route.DirtyGenerationID > 0 {
-		dirty, dirtyFound, dirtyErr := catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
-		if dirtyErr != nil {
-			return daemon.TrackReadiness{}, fmt.Errorf("read routed dirty generation %d: %w", route.DirtyGenerationID, dirtyErr)
-		}
-		if !dirtyFound {
-			return building("routed dirty generation is not published"), nil
-		}
-		if dirty.State == store_sqlite.ViewGenerationFailed {
-			return failed(dirty.Error), nil
-		}
-		if dirty.State != store_sqlite.ViewGenerationReady && dirty.State != store_sqlite.ViewGenerationSuperseded {
-			return building("routed dirty generation is not servable"), nil
-		}
+	dirty, dirtyFound, dirtyErr := catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+	if dirtyErr != nil {
+		return daemon.TrackReadiness{}, fmt.Errorf("read routed dirty generation %d: %w", route.DirtyGenerationID, dirtyErr)
+	}
+	if !dirtyFound {
+		return building("routed dirty generation is not published"), nil
+	}
+	if dirty.State == store_sqlite.ViewGenerationFailed {
+		return failed(dirty.Error), nil
+	}
+	if dirty.State != store_sqlite.ViewGenerationReady && dirty.State != store_sqlite.ViewGenerationSuperseded {
+		return building("routed dirty generation is not servable"), nil
 	}
 
 	// MaterializeCheckout is the final query gate: it revalidates the route
@@ -445,18 +638,24 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 		}
 		return failed(err.Error()), nil
 	}
+	if !materializedCheckoutMatchesRoute(
+		view, binding, route.CommitGenerationID, route.DirtyGenerationID,
+		graphRow.ActiveGenerationID,
+	) {
+		view.Close()
+		return building("checkout route does not compose over the selected active base"), nil
+	}
+	if !c.probeBindingStillCurrent(ctx, path, binding) {
+		view.Close()
+		return building("checkout route changed while readiness was being checked"), nil
+	}
 	view.Close()
 
 	kind := daemon.ProbeViewBase
 	if binding.EffectiveMode == string(store_sqlite.CheckoutModeAutomatic) {
 		kind = daemon.ProbeViewWorktree
 	}
-	result := daemon.TrackReadiness{
-		State: daemon.TrackReadinessReady,
-		View:  exactProbeView(kind, binding.CheckoutID, binding.RepoPrefix),
-	}
-	result.View.Incarnation = binding.Incarnation
-	return result, nil
+	return ready(kind), nil
 }
 
 func trackViewBuilding(checkoutID, repoPrefix, reason string) daemon.TrackReadiness {

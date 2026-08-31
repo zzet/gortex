@@ -66,7 +66,7 @@ type probeFixture struct {
 // corpus, and registers a family whose primary is dedicated and whose worktree
 // is automatic. The worktree is left unrouted; the routing helpers below add
 // the generations a test needs.
-func newProbeFixture(t *testing.T) *probeFixture {
+func newProbeFixture(t testing.TB) *probeFixture {
 	t.Helper()
 	c, mi, catalog, dir := buildCatalogController(t)
 	store, ok := c.graph.(*store_sqlite.Store)
@@ -156,72 +156,158 @@ func newProbeFixture(t *testing.T) *probeFixture {
 	}
 }
 
-// routeWorktree publishes the two generations the worktree's route names and
-// activates the route. The dirty generation claims the probed file and emits
-// one symbol of its own, so a composed answer is distinguishable from a base
-// one by content rather than by shape.
-func (f *probeFixture) routeWorktree(t *testing.T) {
+// publishDedicatedBase installs the production-shaped sealed generation that
+// backs probeGraphID. Generation zero deliberately contains different symbols
+// so tests catch any silent fallback to the legacy corpus.
+func (f *probeFixture) publishDedicatedBase(t testing.TB) int64 {
 	t.Helper()
 	ctx := context.Background()
-
-	commitID, commitHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:      "dedicated_graph",
-		GraphID:        probeGraphID,
-		LayerID:        "layer-probe-commit",
-		CheckoutID:     probeWorktreeID,
-		GenerationKind: "commit",
-		TreeOID:        "tree-probe-commit",
-		CreatedAt:      1000,
-	})
-	require.NoError(t, err)
-	_ = commitHandle
-	require.NoError(t, f.store.PublishPayloadGeneration(ctx, commitID, 2000))
 	graphRow, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
 	require.NoError(t, err)
 	require.True(t, found)
-	graphRow.ActiveGenerationID = commitID
-	require.NoError(t, f.catalog.UpsertDedicatedGraph(ctx, graphRow))
-	checkout, found, err := f.catalog.GetCheckout(ctx, probeWorktreeID)
+	if graphRow.ActiveGenerationID > 0 {
+		return graphRow.ActiveGenerationID
+	}
+	baseID := f.buildDedicatedBase(t, "tree-probe-base", "SnapshotOnly", 900)
+	f.activateDedicatedBase(t, baseID)
+	return baseID
+}
+
+func (f *probeFixture) activateDedicatedBase(t testing.TB, generationID int64) {
+	t.Helper()
+	ctx := context.Background()
+	graphRow, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
 	require.NoError(t, err)
 	require.True(t, found)
-	checkout.HeadTree = "tree-probe-commit"
-	require.NoError(t, f.catalog.UpsertCheckout(ctx, checkout))
+	graphRow.ActiveGenerationID = generationID
+	require.NoError(t, f.catalog.UpsertDedicatedGraph(ctx, graphRow))
+}
 
-	dirtyID, dirtyHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:        "dedicated_graph",
-		GraphID:          probeGraphID,
-		LayerID:          "layer-probe-dirty",
-		CheckoutID:       probeWorktreeID,
-		GenerationKind:   "dirty",
-		BaseGenerationID: commitID,
-		TreeOID:          "tree-probe-dirty",
-		CreatedAt:        1001,
+// buildDedicatedBase publishes a sealed base without selecting it. Tests use
+// this to prepare the next active snapshot before moving the graph row at the
+// exact post-materialization revalidation boundary.
+func (f *probeFixture) buildDedicatedBase(
+	t testing.TB, treeOID, firstSymbol string, createdAt int64,
+) int64 {
+	t.Helper()
+	ctx := context.Background()
+	graphRow, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	baseID, baseHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      "dedicated_base",
+		GraphID:        probeGraphID,
+		LayerID:        probeGraphID + ":base",
+		CheckoutID:     graphRow.OwnerCheckoutID,
+		GenerationKind: "dedicated_base",
+		TreeOID:        treeOID,
+		CreatedAt:      createdAt,
 	})
 	require.NoError(t, err)
-	dirtyHandle.AddBatch([]*graph.Node{{
-		ID:         probeFileKey + "::GenerationOnly",
-		Kind:       graph.KindFunction,
-		Name:       "GenerationOnly",
-		FilePath:   probeFileKey,
-		RepoPrefix: probePrefix,
-		Language:   "go",
-		StartLine:  3,
-		EndLine:    6,
-	}}, nil)
-	require.NoError(t, dirtyHandle.SetFileMasks([]store_sqlite.FileMask{{
+	baseHandle.AddBatch([]*graph.Node{
+		{
+			ID: probeFileKey + "::" + firstSymbol, Kind: graph.KindFunction,
+			Name: firstSymbol, FilePath: probeFileKey, RepoPrefix: probePrefix,
+			Language: "go", StartLine: 3, EndLine: 5,
+		},
+		{
+			ID: probeFileKey + "::SnapshotSecond", Kind: graph.KindFunction,
+			Name: "SnapshotSecond", FilePath: probeFileKey, RepoPrefix: probePrefix,
+			Language: "go", StartLine: 7, EndLine: 9,
+		},
+	}, nil)
+	require.NoError(t, baseHandle.SetFileMasks([]store_sqlite.FileMask{{
 		RepoPrefix: probePrefix,
 		FilePath:   probeFileKey,
 		Mode:       store_sqlite.OwnershipReplace,
 	}}))
-	require.NoError(t, f.store.PublishPayloadGeneration(ctx, dirtyID, 2001))
+	require.NoError(t, f.store.PublishPayloadGeneration(ctx, baseID, createdAt+1000))
+	return baseID
+}
+
+// routeCheckout publishes the commit and optional dirty generations one
+// checkout's route names. Every layer sits on the selected sealed base, which
+// matches the ancestry the production materializer validates.
+func (f *probeFixture) routeCheckout(t testing.TB, checkoutID string, complete bool) (int64, int64) {
+	t.Helper()
+	baseID := f.publishDedicatedBase(t)
+	return f.routeCheckoutFromBase(t, checkoutID, baseID, complete)
+}
+
+// routeCheckoutFromBase installs a route with explicit ancestry. Production
+// routes must name the graph's selected active base; tests pass zero to prove
+// that a syntactically complete but stale legacy stack is never served exact.
+func (f *probeFixture) routeCheckoutFromBase(
+	t testing.TB, checkoutID string, baseID int64, complete bool,
+) (int64, int64) {
+	t.Helper()
+	ctx := context.Background()
+
+	commitID, commitHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:        "dedicated_graph",
+		GraphID:          probeGraphID,
+		LayerID:          "layer-probe-commit-" + checkoutID,
+		CheckoutID:       checkoutID,
+		GenerationKind:   "commit",
+		BaseGenerationID: baseID,
+		TreeOID:          "tree-probe-commit-" + checkoutID,
+		CreatedAt:        1000,
+	})
+	require.NoError(t, err)
+	_ = commitHandle
+	require.NoError(t, f.store.PublishPayloadGeneration(ctx, commitID, 2000))
+	checkout, found, err := f.catalog.GetCheckout(ctx, checkoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	checkout.HeadTree = "tree-probe-commit-" + checkoutID
+	require.NoError(t, f.catalog.UpsertCheckout(ctx, checkout))
+
+	var dirtyID int64
+	if complete {
+		dirtyGenerationID, dirtyHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+			OwnerKind:        "dedicated_graph",
+			GraphID:          probeGraphID,
+			LayerID:          "layer-probe-dirty-" + checkoutID,
+			CheckoutID:       checkoutID,
+			GenerationKind:   "dirty",
+			BaseGenerationID: commitID,
+			TreeOID:          "tree-probe-dirty-" + checkoutID,
+			CreatedAt:        1001,
+		})
+		require.NoError(t, err)
+		dirtyID = dirtyGenerationID
+		dirtyHandle.AddBatch([]*graph.Node{{
+			ID:         probeFileKey + "::GenerationOnly",
+			Kind:       graph.KindFunction,
+			Name:       "GenerationOnly",
+			FilePath:   probeFileKey,
+			RepoPrefix: probePrefix,
+			Language:   "go",
+			StartLine:  3,
+			EndLine:    6,
+		}}, nil)
+		require.NoError(t, dirtyHandle.SetFileMasks([]store_sqlite.FileMask{{
+			RepoPrefix: probePrefix,
+			FilePath:   probeFileKey,
+			Mode:       store_sqlite.OwnershipReplace,
+		}}))
+		require.NoError(t, f.store.PublishPayloadGeneration(ctx, dirtyID, 2001))
+	}
 
 	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
-		CheckoutID:         probeWorktreeID,
+		CheckoutID:         checkoutID,
 		GraphID:            probeGraphID,
 		CommitGenerationID: commitID,
 		DirtyGenerationID:  dirtyID,
 		State:              store_sqlite.RouteActive,
 	}))
+	return commitID, dirtyID
+}
+
+// routeWorktree publishes a complete automatic-checkout route.
+func (f *probeFixture) routeWorktree(t testing.TB) {
+	t.Helper()
+	f.routeCheckout(t, probeWorktreeID, true)
 }
 
 // upsertWorktree rewrites the automatic checkout's row with the given root and
@@ -733,10 +819,360 @@ func TestProbeOfDedicatedCheckoutReadsTheBaseCorpus(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"BaseOnly"}, symbolNames(found.Hits))
+	readiness, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, readiness.State)
+	assert.Equal(t, daemon.ProbeViewBase, readiness.View.Kind)
+}
+
+func TestProbeOfGenerationBackedDedicatedCheckoutReadsActiveBase(t *testing.T) {
+	f := newProbeFixture(t)
+	baseID := f.publishDedicatedBase(t)
+	ctx := context.Background()
+	probed := filepath.Join(f.primaryRoot, probeFile)
+
+	coverage, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+	require.NoError(t, err)
+	assert.True(t, coverage.Covered)
+	assert.Equal(t, 2, coverage.Symbols)
+	require.NotNil(t, coverage.View)
+	assert.Equal(t, daemon.ProbeViewBase, coverage.View.Kind)
+	assert.True(t, coverage.View.Exact)
+
+	found, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "SnapshotOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"SnapshotOnly"}, symbolNames(found.Hits))
+	legacy, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "BaseOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, legacy.Hits, "generation zero must not leak through an active base")
+
+	readiness, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, readiness.State)
+	require.NotNil(t, readiness.View)
+	assert.Equal(t, daemon.ProbeViewBase, readiness.View.Kind)
+	assert.True(t, readiness.View.Exact)
+	assert.Equal(t, "inc-primary", readiness.View.Incarnation)
+	assert.False(t, f.controller.lifecycle.ViewLeases().InUse(baseID),
+		"the direct-base probe retained its generation lease")
+
+	binding, err := f.controller.lifecycle.ExplainView(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, probeGraphID, binding.GraphID)
+	assert.Equal(t, store_sqlite.DedicatedGraphStateReady, binding.GraphState)
+	assert.Equal(t, baseID, binding.ActiveGenerationID)
+	assert.Nil(t, binding.Route)
+	assert.False(t, binding.Composed)
+}
+
+func TestProbeOfRoutedDedicatedCheckoutReadsComposedView(t *testing.T) {
+	f := newProbeFixture(t)
+	_, dirtyID := f.routeCheckout(t, probePrimaryID, true)
+	ctx := context.Background()
+	probed := filepath.Join(f.primaryRoot, probeFile)
+
+	found, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "GenerationOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"GenerationOnly"}, symbolNames(found.Hits))
+	require.NotNil(t, found.View)
+	assert.Equal(t, daemon.ProbeViewBase, found.View.Kind)
+	assert.True(t, found.View.Exact)
+	hidden, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "SnapshotOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, hidden.Hits, "the dedicated dirty layer owns the file")
+
+	readiness, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, readiness.State)
+	assert.Equal(t, daemon.ProbeViewBase, readiness.View.Kind)
+	binding, err := f.controller.lifecycle.ExplainView(ctx, probed)
+	require.NoError(t, err)
+	assert.True(t, binding.Composed)
+	require.NotNil(t, binding.Route)
+	assert.False(t, f.controller.lifecycle.ViewLeases().InUse(dirtyID),
+		"the dedicated routed probe retained its dirty lease")
+}
+
+func TestProbeOfCommitOnlyDedicatedRouteRefusesEveryFallback(t *testing.T) {
+	f := newProbeFixture(t)
+	f.controller.probeReconcile = func(string) {}
+	baseID := f.publishDedicatedBase(t)
+	commitID, dirtyID := f.routeCheckout(t, probePrimaryID, false)
+	require.Zero(t, dirtyID)
+	ctx := context.Background()
+	probed := filepath.Join(f.primaryRoot, probeFile)
+
+	coverage, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+	require.NoError(t, err)
+	assert.False(t, coverage.Covered)
+	require.NotNil(t, coverage.View)
+	assert.Equal(t, daemon.ProbeViewUnrouted, coverage.View.Kind)
+	assert.False(t, coverage.View.Exact)
+	assert.Equal(t, daemon.FallbackViewBuilding, coverage.View.FallbackReason)
+	for _, query := range []string{"BaseOnly", "SnapshotOnly"} {
+		found, searchErr := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+			Query: query, Path: probed,
+		})
+		require.NoError(t, searchErr)
+		assert.Empty(t, found.Hits, "%s leaked through an incomplete route", query)
+	}
+
+	readiness, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, readiness.State)
+	binding, err := f.controller.lifecycle.ExplainView(ctx, probed)
+	require.NoError(t, err)
+	require.NotNil(t, binding.Route)
+	assert.False(t, binding.Composed)
+	assert.False(t, f.controller.lifecycle.ViewLeases().InUse(baseID))
+	assert.False(t, f.controller.lifecycle.ViewLeases().InUse(commitID))
+}
+
+func TestProbeOfMalformedDedicatedBaseRefusesGenerationZero(t *testing.T) {
+	f := newProbeFixture(t)
+	f.controller.probeReconcile = func(string) {}
+	ctx := context.Background()
+	invalidID, handle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        probeGraphID,
+		LayerID:        "not-a-sealed-base",
+		CheckoutID:     probePrimaryID,
+		GenerationKind: "commit",
+		TreeOID:        "tree-invalid-active-base",
+		CreatedAt:      1200,
+	})
+	require.NoError(t, err)
+	_ = handle
+	require.NoError(t, f.store.PublishPayloadGeneration(ctx, invalidID, 2200))
+	graphRow, found, err := f.catalog.GetDedicatedGraph(ctx, probeGraphID)
+	require.NoError(t, err)
+	require.True(t, found)
+	graphRow.ActiveGenerationID = invalidID
+	require.NoError(t, f.catalog.UpsertDedicatedGraph(ctx, graphRow))
+	probed := filepath.Join(f.primaryRoot, probeFile)
+
+	coverage, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+	require.NoError(t, err)
+	assert.False(t, coverage.Covered)
+	require.NotNil(t, coverage.View)
+	assert.Equal(t, daemon.ProbeViewUnrouted, coverage.View.Kind)
+	legacy, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "BaseOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, legacy.Hits)
+	readiness, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessFailed, readiness.State)
+	assert.Contains(t, readiness.Error, "not a sealed dedicated base")
+	assert.False(t, f.controller.lifecycle.ViewLeases().InUse(invalidID))
+}
+
+func TestProbeRejectsDedicatedRouteRootedAtGenerationZero(t *testing.T) {
+	f := newProbeFixture(t)
+	f.controller.probeReconcile = func(string) {}
+	activeBaseID := f.publishDedicatedBase(t)
+	commitID, dirtyID := f.routeCheckoutFromBase(t, probePrimaryID, 0, true)
+	ctx := context.Background()
+	probed := filepath.Join(f.primaryRoot, probeFile)
+	commit, found, err := f.catalog.GetViewGeneration(ctx, commitID)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Zero(t, commit.BaseGenerationID,
+		"the regression fixture must exercise a complete legacy route rooted at generation zero")
+
+	coverage, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+	require.NoError(t, err)
+	assert.False(t, coverage.Covered)
+	require.NotNil(t, coverage.View)
+	assert.Equal(t, daemon.ProbeViewUnrouted, coverage.View.Kind)
+	assert.False(t, coverage.View.Exact)
+	for _, query := range []string{"BaseOnly", "SnapshotOnly", "GenerationOnly"} {
+		found, searchErr := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+			Query: query, Path: probed,
+		})
+		require.NoError(t, searchErr)
+		assert.Empty(t, found.Hits, "%s leaked through a route rooted at generation zero", query)
+	}
+
+	readiness, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, readiness.State)
+	assert.Contains(t, readiness.Error, "does not compose over the selected active base")
+	for _, generationID := range []int64{activeBaseID, commitID, dirtyID} {
+		assert.False(t, f.controller.lifecycle.ViewLeases().InUse(generationID),
+			"generation %d retained a rejected route lease", generationID)
+	}
+}
+
+func TestDedicatedBaseRefreshAtRevalidationBoundaryIsNeverExact(t *testing.T) {
+	t.Run("probe", func(t *testing.T) {
+		f := newProbeFixture(t)
+		f.controller.probeReconcile = func(string) {}
+		oldBaseID := f.publishDedicatedBase(t)
+		newBaseID := f.buildDedicatedBase(t, "tree-probe-refreshed", "RefreshedOnly", 901)
+		var moved atomic.Bool
+		f.controller.probeViewRevalidateBarrier = func() {
+			if moved.CompareAndSwap(false, true) {
+				f.activateDedicatedBase(t, newBaseID)
+			}
+		}
+
+		ctx := context.Background()
+		probed := filepath.Join(f.primaryRoot, probeFile)
+		result, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+			Query: "SnapshotOnly", Path: probed,
+		})
+		require.NoError(t, err)
+		assert.Empty(t, result.Hits)
+		require.NotNil(t, result.View)
+		assert.Equal(t, daemon.ProbeViewUnrouted, result.View.Kind)
+		assert.False(t, result.View.Exact)
+		assert.True(t, moved.Load(), "the deterministic refresh boundary was not reached")
+		assert.False(t, f.controller.lifecycle.ViewLeases().InUse(oldBaseID))
+
+		f.controller.probeViewRevalidateBarrier = nil
+		refreshed, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+			Query: "RefreshedOnly", Path: probed,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"RefreshedOnly"}, symbolNames(refreshed.Hits))
+		require.NotNil(t, refreshed.View)
+		assert.True(t, refreshed.View.Exact)
+		assert.False(t, f.controller.lifecycle.ViewLeases().InUse(newBaseID))
+	})
+
+	t.Run("readiness", func(t *testing.T) {
+		f := newProbeFixture(t)
+		oldBaseID := f.publishDedicatedBase(t)
+		newBaseID := f.buildDedicatedBase(t, "tree-readiness-refreshed", "ReadinessOnly", 902)
+		var moved atomic.Bool
+		f.controller.probeViewRevalidateBarrier = func() {
+			if moved.CompareAndSwap(false, true) {
+				f.activateDedicatedBase(t, newBaseID)
+			}
+		}
+
+		readiness, err := f.controller.TrackReadiness(
+			context.Background(), filepath.Join(f.primaryRoot, probeFile),
+		)
+		require.NoError(t, err)
+		assert.Equal(t, daemon.TrackReadinessBuilding, readiness.State)
+		assert.Contains(t, readiness.Error, "dedicated graph changed")
+		assert.True(t, moved.Load(), "the deterministic readiness boundary was not reached")
+		assert.False(t, f.controller.lifecycle.ViewLeases().InUse(oldBaseID))
+		assert.False(t, f.controller.lifecycle.ViewLeases().InUse(newBaseID))
+	})
+}
+
+func TestDedicatedRouteMoveAtRevalidationBoundaryIsNeverExact(t *testing.T) {
+	f := newProbeFixture(t)
+	f.controller.probeReconcile = func(string) {}
+	baseID := f.publishDedicatedBase(t)
+	oldCommitID, oldDirtyID := f.routeCheckoutFromBase(t, probePrimaryID, baseID, true)
+	ctx := context.Background()
+	oldCheckout, found, err := f.catalog.GetCheckout(ctx, probePrimaryID)
+	require.NoError(t, err)
+	require.True(t, found)
+	oldRoute, found, err := f.catalog.GetCheckoutRoute(ctx, probePrimaryID)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	newCommitID, newDirtyID := f.routeCheckoutFromBase(t, probePrimaryID, baseID, true)
+	newCheckout, found, err := f.catalog.GetCheckout(ctx, probePrimaryID)
+	require.NoError(t, err)
+	require.True(t, found)
+	newRoute, found, err := f.catalog.GetCheckoutRoute(ctx, probePrimaryID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NoError(t, f.catalog.UpsertCheckout(ctx, oldCheckout))
+	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, oldRoute))
+
+	var moved atomic.Bool
+	f.controller.probeViewRevalidateBarrier = func() {
+		if moved.CompareAndSwap(false, true) {
+			require.NoError(t, f.catalog.UpsertCheckout(ctx, newCheckout))
+			require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, newRoute))
+		}
+	}
+	probed := filepath.Join(f.primaryRoot, probeFile)
+	result, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "GenerationOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, result.Hits)
+	require.NotNil(t, result.View)
+	assert.Equal(t, daemon.ProbeViewUnrouted, result.View.Kind)
+	assert.False(t, result.View.Exact)
+	assert.True(t, moved.Load(), "the deterministic route-move boundary was not reached")
+	for _, generationID := range []int64{
+		baseID, oldCommitID, oldDirtyID, newCommitID, newDirtyID,
+	} {
+		assert.False(t, f.controller.lifecycle.ViewLeases().InUse(generationID),
+			"generation %d retained a lease after route movement", generationID)
+	}
+
+	// Readiness has its own catalog walk and materialization gate. Move the
+	// same route at that gate as well so it cannot publish Ready for route A
+	// after route B became current.
+	require.NoError(t, f.catalog.UpsertCheckout(ctx, oldCheckout))
+	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, oldRoute))
+	moved.Store(false)
+	readiness, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, readiness.State)
+	assert.Contains(t, readiness.Error, "route changed")
+	assert.True(t, moved.Load(), "the readiness route-move boundary was not reached")
+	for _, generationID := range []int64{
+		baseID, oldCommitID, oldDirtyID, newCommitID, newDirtyID,
+	} {
+		assert.False(t, f.controller.lifecycle.ViewLeases().InUse(generationID),
+			"generation %d retained a readiness lease after route movement", generationID)
+	}
+}
+
+func BenchmarkSelectProbeViewGenerationBackedDedicated(b *testing.B) {
+	f := newProbeFixture(b)
+	f.publishDedicatedBase(b)
+	ctx := context.Background()
+	probed := filepath.Join(f.primaryRoot, probeFile)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		view := f.controller.selectProbeView(ctx, probed)
+		if !view.servable || view.reader == nil || view.answer == nil || !view.answer.Exact {
+			b.Fatalf("unexpected dedicated base view: %+v", view)
+		}
+		view.release()
+	}
+}
+
+func BenchmarkTrackReadinessGenerationBackedDedicated(b *testing.B) {
+	f := newProbeFixture(b)
+	f.publishDedicatedBase(b)
+	ctx := context.Background()
+	probed := filepath.Join(f.primaryRoot, probeFile)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		readiness, err := f.controller.TrackReadiness(ctx, probed)
+		if err != nil || readiness.State != daemon.TrackReadinessReady {
+			b.Fatalf("readiness=%+v err=%v", readiness, err)
+		}
+	}
 }
 
 func TestProbeOfDedicatedCheckoutInRemovalGraceIsLabeledFallback(t *testing.T) {
 	f := newProbeFixture(t)
+	baseID := f.publishDedicatedBase(t)
 	ctx := context.Background()
 	checkout, found, err := f.catalog.GetCheckout(ctx, probePrimaryID)
 	require.NoError(t, err)
@@ -745,14 +1181,21 @@ func TestProbeOfDedicatedCheckoutInRemovalGraceIsLabeledFallback(t *testing.T) {
 	require.NoError(t, f.catalog.UpsertCheckout(ctx, checkout))
 
 	result, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
-		Query: "BaseOnly", Path: filepath.Join(f.primaryRoot, probeFile),
+		Query: "SnapshotOnly", Path: filepath.Join(f.primaryRoot, probeFile),
 	})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"BaseOnly"}, symbolNames(result.Hits))
+	assert.Equal(t, []string{"SnapshotOnly"}, symbolNames(result.Hits))
 	require.NotNil(t, result.View)
 	assert.Equal(t, daemon.ProbeViewBase, result.View.Kind)
 	assert.False(t, result.View.Exact)
 	assert.Equal(t, string(store_sqlite.CheckoutStateRemovalGrace), result.View.FallbackReason)
+	legacy, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "BaseOnly", Path: filepath.Join(f.primaryRoot, probeFile),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, legacy.Hits, "generation zero leaked through a generation-backed grace fallback")
+	assert.False(t, f.controller.lifecycle.ViewLeases().InUse(baseID),
+		"the grace fallback retained its active-base lease")
 }
 
 // TestProbeOfUntrackedPathIsUnchanged pins that a path no checkout owns still

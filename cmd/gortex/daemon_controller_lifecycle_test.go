@@ -23,7 +23,7 @@ import (
 
 // buildCatalogController builds a controller over a real sqlite store, which
 // is what gives the lifecycle a checkout catalog to record identities in.
-func buildCatalogController(t *testing.T) (*realController, *indexer.MultiIndexer, *store_sqlite.Catalog, string) {
+func buildCatalogController(t testing.TB) (*realController, *indexer.MultiIndexer, *store_sqlite.Catalog, string) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not available in PATH")

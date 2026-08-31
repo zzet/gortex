@@ -38,8 +38,8 @@ func TestViewsStatusCountsTheCatalogByState(t *testing.T) {
 	assert.Equal(t, 1, views.Families)
 	assert.Equal(t, 2, views.Checkouts[string(store_sqlite.CheckoutStateReady)],
 		"the primary and the worktree are both ready: %v", views.Checkouts)
-	assert.Equal(t, 2, views.Generations[string(store_sqlite.ViewGenerationReady)],
-		"the route names a published commit and dirty generation: %v", views.Generations)
+	assert.Equal(t, 3, views.Generations[string(store_sqlite.ViewGenerationReady)],
+		"the active base plus route commit and dirty generations are published: %v", views.Generations)
 	assert.Equal(t, 0, views.Leases, "no view is materialized")
 	assert.Empty(t, views.RefViews, "this family has no ref views")
 	assert.NotEmpty(t, views.Counters, "the metric registry is not reaching the status block")
