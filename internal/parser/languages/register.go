@@ -56,6 +56,10 @@ func RegisterAll(reg *parser.Registry) {
 	// detect_content.go.
 	reg.Register(NewMyBatisExtractor())
 	reg.Register(NewSpringContextExtractor())
+	// ABA/Sabre QIK LocalDescRef DATAITEM/TABLE descriptors share .xml with
+	// MyBatis/Spring/generic XML; content-sniffed via detect_content.go
+	// (Extensions empty — never claims the bare extension).
+	reg.Register(NewQikXMLExtractor())
 	reg.Register(NewMarkdownExtractor())
 	reg.Register(NewQuartoExtractor())
 	// Multimodal assets — image files and PDF documents become graph
