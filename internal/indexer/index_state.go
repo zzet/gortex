@@ -112,7 +112,10 @@ func repoHeadAndDirty(rootAbs string) (sha string, dirty bool) {
 	if err != nil {
 		return "", false
 	}
-	status, err := gitcmd.Output(ctx, rootAbs, "status", "--porcelain")
+	// Status may otherwise refresh Git's cached stat data by taking the
+	// worktree index lock. Indexing is a read-only observer and can run beside
+	// user commands such as git add, so it must not compete for index.lock.
+	status, err := gitcmd.Output(ctx, rootAbs, "--no-optional-locks", "status", "--porcelain")
 	if err != nil {
 		return sha, false
 	}
