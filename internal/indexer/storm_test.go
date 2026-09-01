@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgtdi/fswatcher"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/thirdparty/fswatcher"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"

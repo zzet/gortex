@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgtdi/fswatcher"
+	"github.com/zzet/gortex/internal/thirdparty/fswatcher"
 
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"

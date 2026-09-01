@@ -4,8 +4,8 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/sgtdi/fswatcher"
 	"github.com/stretchr/testify/assert"
+	"github.com/zzet/gortex/internal/thirdparty/fswatcher"
 )
 
 func TestPickKind_Priority(t *testing.T) {

@@ -183,6 +183,7 @@ func TestCheckoutSourceSignalWatcherRealBackendFiniteBurst(t *testing.T) {
 	warmCheckoutSignalResourceBackend(t, parent)
 	stabilizeCheckoutSignalResourceProcess()
 	baseline := mustCheckoutSignalResourceSnapshot(t)
+	baselineWatcherStacks := checkoutSignalResourceWatcherStackCount(checkoutSignalResourceGoroutineProfile())
 	recorder := newCheckoutSignalResourceRecorder()
 	watchers := newCheckoutSourceSignalWatcherSet(
 		nil,
@@ -242,7 +243,7 @@ func TestCheckoutSourceSignalWatcherRealBackendFiniteBurst(t *testing.T) {
 
 	active := mustCheckoutSignalResourceSnapshot(t)
 	watchers.StopAll()
-	cleanup := waitCheckoutSignalResourceCleanup(t, baseline)
+	cleanup := waitCheckoutSignalResourceCleanup(t, baseline, baselineWatcherStacks)
 	t.Logf("burst metrics: syscalls=%d syscall_duration=%s ready=%s settled_latency=%s signals=%d fd_delta=%d goroutine_delta=%d rss_delta=%d thread_delta=%d cleanup_fd_delta=%d cleanup_goroutine_delta=%d",
 		syscalls,
 		burstFinished.Sub(burstStarted),
@@ -282,6 +283,7 @@ func runCheckoutSignalResourceCase(t *testing.T, rootCount, filesPerRoot int, ta
 	warmCheckoutSignalResourceBackend(t, parent)
 	stabilizeCheckoutSignalResourceProcess()
 	baseline := mustCheckoutSignalResourceSnapshot(t)
+	baselineWatcherStacks := checkoutSignalResourceWatcherStackCount(checkoutSignalResourceGoroutineProfile())
 	recorder := newCheckoutSignalResourceRecorder()
 	watchers := newCheckoutSourceSignalWatcherSet(
 		nil,
@@ -342,7 +344,7 @@ func runCheckoutSignalResourceCase(t *testing.T, rootCount, filesPerRoot int, ta
 	if got := watchers.Len(); got != 0 {
 		t.Fatalf("watcher registrations after StopAll=%d; want 0", got)
 	}
-	result.cleanup = waitCheckoutSignalResourceCleanup(t, baseline)
+	result.cleanup = waitCheckoutSignalResourceCleanup(t, baseline, baselineWatcherStacks)
 	t.Logf("watcher resource metrics: roots=%d files_per_root=%d race=%t ready_max=%s event_max=%s fd_delta=%d goroutine_delta=%d rss_delta=%d bytes (%.2f MiB) thread_delta=%d cleanup_fd_delta=%d cleanup_goroutine_delta=%d cleanup_rss_delta=%d cleanup_thread_delta=%d",
 		rootCount,
 		filesPerRoot,
@@ -551,7 +553,11 @@ func assertCheckoutSignalResourceBounds(t *testing.T, result checkoutSignalResou
 	}
 }
 
-func waitCheckoutSignalResourceCleanup(t *testing.T, baseline checkoutSignalResourceSnapshot) checkoutSignalResourceSnapshot {
+func waitCheckoutSignalResourceCleanup(
+	t *testing.T,
+	baseline checkoutSignalResourceSnapshot,
+	baselineWatcherStacks int,
+) checkoutSignalResourceSnapshot {
 	t.Helper()
 	debug.FreeOSMemory()
 	deadline := time.Now().Add(checkoutSignalResourceCleanupWait)
@@ -561,13 +567,14 @@ func waitCheckoutSignalResourceCleanup(t *testing.T, baseline checkoutSignalReso
 		snapshot = mustCheckoutSignalResourceSnapshot(t)
 		profile = checkoutSignalResourceGoroutineProfile()
 		fdClean := runtime.GOOS != "darwin" || snapshot.fds == baseline.fds
-		watcherStacksClean := !checkoutSignalResourceHasLiveWatcherStack(profile)
+		watcherStacks := checkoutSignalResourceWatcherStackCount(profile)
+		watcherStacksClean := watcherStacks <= baselineWatcherStacks
 		if fdClean && watcherStacksClean {
 			return snapshot
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("watcher resources remained live after StopAll: baseline=%+v current=%+v fd_exact=%t watcher_stacks_clean=%t\n%s",
-				baseline, snapshot, fdClean, watcherStacksClean, profile)
+			t.Errorf("watcher resources remained live after StopAll: baseline=%+v current=%+v fd_exact=%t watcher_stacks=%d baseline_watcher_stacks=%d\n%s",
+				baseline, snapshot, fdClean, watcherStacks, baselineWatcherStacks, profile)
 			return snapshot
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -582,18 +589,23 @@ func checkoutSignalResourceGoroutineProfile() string {
 	return profile.String()
 }
 
-func checkoutSignalResourceHasLiveWatcherStack(profile string) bool {
-	for _, needle := range []string{
+func checkoutSignalResourceWatcherStackCount(profile string) int {
+	needles := []string{
 		"checkoutSourceSignalWatcherSet",
 		"checkoutSourceSignalBackend",
 		"checkoutSourceSignalAggregator",
-		"github.com/sgtdi/fswatcher",
-	} {
-		if strings.Contains(profile, needle) {
-			return true
+		"github.com/zzet/gortex/internal/thirdparty/fswatcher",
+	}
+	count := 0
+	for _, stack := range strings.Split(profile, "\n\n") {
+		for _, needle := range needles {
+			if strings.Contains(stack, needle) {
+				count++
+				break
+			}
 		}
 	}
-	return false
+	return count
 }
 
 func stabilizeCheckoutSignalResourceProcess() {

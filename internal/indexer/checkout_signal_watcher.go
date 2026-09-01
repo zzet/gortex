@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sgtdi/fswatcher"
+	"github.com/zzet/gortex/internal/thirdparty/fswatcher"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
