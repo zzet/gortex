@@ -104,8 +104,27 @@ func (v viewPathRoot) graphRelative(abs string) (string, bool) {
 	if v.root == "" || abs == "" || !filepath.IsAbs(abs) {
 		return "", false
 	}
-	root := filepath.Clean(v.root)
-	target := filepath.Clean(abs)
+	rel, ok := relativeWithinRoot(v.root, abs)
+	if !ok {
+		return "", false
+	}
+	if v.repoPrefix != "" {
+		rel = filepath.Join(v.repoPrefix, rel)
+	}
+	return rel, true
+}
+
+// relativeWithinRoot renders target beneath root without letting a filesystem
+// alias change the relative suffix. The lexical fast path is allocation-light;
+// the canonical fallback handles /tmp versus /private/tmp and symlinked
+// workspace roots. A missing target resolves through its nearest existing
+// ancestor so newly-created files keep working too.
+func relativeWithinRoot(root, target string) (string, bool) {
+	if root == "" || target == "" {
+		return "", false
+	}
+	root = filepath.Clean(root)
+	target = filepath.Clean(target)
 	if !pathContainedIn(target, root) {
 		realRoot, err := filepath.EvalSymlinks(root)
 		if err != nil || realRoot == "" {
@@ -121,11 +140,8 @@ func (v viewPathRoot) graphRelative(abs string) (string, bool) {
 		}
 	}
 	rel, err := filepath.Rel(root, target)
-	if err != nil || rel == "." || rel == "" {
+	if err != nil || rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", false
-	}
-	if v.repoPrefix != "" {
-		rel = filepath.Join(v.repoPrefix, rel)
 	}
 	return rel, true
 }
@@ -141,8 +157,8 @@ func (v viewPathRoot) rooted(abs, root string) string {
 	if pathContainedIn(abs, v.root) {
 		return abs
 	}
-	rel, err := filepath.Rel(root, abs)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+	rel, ok := relativeWithinRoot(root, abs)
+	if !ok {
 		return abs
 	}
 	return filepath.Clean(filepath.Join(v.root, rel))

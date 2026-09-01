@@ -60,8 +60,8 @@ func (s *Server) ensureFresh(filePaths []string) []string {
 		if root == "" {
 			continue
 		}
-		rel, err := filepath.Rel(root, absPath)
-		if err != nil || strings.HasPrefix(rel, "..") {
+		rel, ok := relativeWithinRoot(root, absPath)
+		if !ok {
 			continue
 		}
 		// IsTrackedStale is false for untracked / new / current files, so

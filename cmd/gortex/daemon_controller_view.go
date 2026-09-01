@@ -17,7 +17,6 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
-	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -783,22 +782,12 @@ func (c *realController) trackedRoot(abs string) (prefix, root string, ok bool) 
 	if c.multiIndexer == nil {
 		return "", "", false
 	}
-	for candidate, meta := range c.multiIndexer.AllMetadata() {
-		if meta == nil || meta.RootPath == "" {
-			continue
-		}
-		metaRoot, err := filepath.Abs(meta.RootPath)
-		if err != nil {
-			continue
-		}
-		if !pathkey.HasPathPrefix(abs, metaRoot) {
-			continue
-		}
-		if len(metaRoot) > len(root) {
-			prefix, root = candidate, metaRoot
-		}
+	prefix = c.multiIndexer.RepoForFile(abs)
+	if prefix == "" {
+		return "", "", false
 	}
-	return prefix, root, root != ""
+	root, ok = c.multiIndexer.RepoRoot(prefix)
+	return prefix, root, ok && root != ""
 }
 
 // nudgeFamily asks for one family's reconciliation on a probe's behalf,

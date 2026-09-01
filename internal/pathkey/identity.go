@@ -156,6 +156,43 @@ func CanonicalExistingRoot(root string) string {
 	return NormalizeVolume(filepath.Clean(resolved))
 }
 
+// CanonicalPath returns the physical spelling of path while preserving a
+// suffix that does not exist yet. It is the request-path counterpart to
+// CanonicalExistingRoot: editor buffers and disappeared worktrees routinely
+// name a missing leaf, but their nearest existing ancestor still carries the
+// alias (/tmp versus /private/tmp, or a symlinked workspace) that routing must
+// resolve. If no ancestor can be resolved, the clean absolute spelling is
+// retained.
+func CanonicalPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	abs = NormalizeVolume(filepath.Clean(abs))
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return NormalizeVolume(filepath.Clean(resolved))
+	}
+
+	current := abs
+	missing := make([]string, 0, 4)
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return abs
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+		resolved, err := filepath.EvalSymlinks(current)
+		if err != nil {
+			continue
+		}
+		for i := len(missing) - 1; i >= 0; i-- {
+			resolved = filepath.Join(resolved, missing[i])
+		}
+		return NormalizeVolume(filepath.Clean(resolved))
+	}
+}
+
 // CanonicalHasPathPrefix reports lexical containment first, then retries after
 // canonicalizing both operands. The lexical fast path is not only cheaper for
 // the ordinary same-spelling case: it preserves containment when a configured
@@ -166,7 +203,7 @@ func CanonicalHasPathPrefix(path, prefix string) bool {
 	if HasPathPrefix(path, prefix) {
 		return true
 	}
-	return HasPathPrefix(CanonicalExistingRoot(path), CanonicalExistingRoot(prefix))
+	return HasPathPrefix(CanonicalPath(path), CanonicalPath(prefix))
 }
 
 // volumeNameLen returns the length of the leading Windows-style volume

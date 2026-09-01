@@ -28,10 +28,7 @@ func CheckoutForPath(
 		return store_sqlite.Checkout{}, false, nil
 	}
 	cleaned := filepath.Clean(path)
-	var (
-		best  store_sqlite.Checkout
-		found bool
-	)
+	var candidates []store_sqlite.Checkout
 	for _, familyID := range familyIDs {
 		if familyID == "" {
 			continue
@@ -41,20 +38,37 @@ func CheckoutForPath(
 			return store_sqlite.Checkout{}, false, WrapViewError(CodeCheckoutInaccessible,
 				fmt.Sprintf("list the checkouts of family %q", familyID), err)
 		}
-		for _, checkout := range checkouts {
-			if checkout.RootPath == "" {
-				continue
-			}
-			root := filepath.Clean(checkout.RootPath)
-			if !pathkey.HasPathPrefix(cleaned, root) {
-				continue
-			}
-			if !found || len(root) > len(filepath.Clean(best.RootPath)) {
-				best, found = checkout, true
-			}
+		candidates = append(candidates, checkouts...)
+	}
+	// Keep the ordinary request path filesystem-free. Only a complete lexical
+	// miss enters the alias-aware pass; there the candidate is canonicalized
+	// once and roots are ranked by canonical length, not by the arbitrary
+	// length of their symlink spelling.
+	if best, found := checkoutForPathSpelling(candidates, cleaned, false); found {
+		return best, true, nil
+	}
+	best, found := checkoutForPathSpelling(candidates, pathkey.CanonicalPath(cleaned), true)
+	return best, found, nil
+}
+
+func checkoutForPathSpelling(checkouts []store_sqlite.Checkout, path string, canonicalRoots bool) (store_sqlite.Checkout, bool) {
+	var (
+		best    store_sqlite.Checkout
+		bestLen = -1
+	)
+	for _, checkout := range checkouts {
+		if checkout.RootPath == "" {
+			continue
+		}
+		root := filepath.Clean(checkout.RootPath)
+		if canonicalRoots {
+			root = pathkey.CanonicalPath(root)
+		}
+		if pathkey.HasPathPrefix(path, root) && len(root) > bestLen {
+			best, bestLen = checkout, len(root)
 		}
 	}
-	return best, found, nil
+	return best, bestLen >= 0
 }
 
 // ServesAutomaticView reports whether a checkout is one the shared lane

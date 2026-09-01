@@ -521,7 +521,7 @@ func (s *Server) workspaceRootFor(absPath string) (string, error) {
 	if s.indexer != nil {
 		// Component-boundary containment: a plain string prefix would let
 		// the root /src/repo claim a file under /src/repo-old.
-		if root := s.indexer.RootPath(); root != "" && pathkey.HasPathPrefix(absPath, root) {
+		if root := s.indexer.RootPath(); root != "" && pathkey.CanonicalHasPathPrefix(absPath, root) {
 			return root, nil
 		}
 	}

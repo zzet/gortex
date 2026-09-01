@@ -84,6 +84,28 @@ func TestCanonicalHasPathPrefixRetainsOfflineChildOfAlias(t *testing.T) {
 	}
 }
 
+func TestCanonicalHasPathPrefixResolvesMissingAliasLeaf(t *testing.T) {
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real")
+	realRepo := filepath.Join(realRoot, "repo")
+	if err := os.MkdirAll(realRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	missing := filepath.Join(aliasRoot, "repo", "new", "buffer.go")
+	if !CanonicalHasPathPrefix(missing, realRepo) {
+		t.Fatalf("missing aliased leaf %q escaped canonical root %q", missing, realRepo)
+	}
+	want := CanonicalPath(filepath.Join(realRepo, "new", "buffer.go"))
+	if got := CanonicalPath(missing); got != want {
+		t.Fatalf("CanonicalPath(%q) = %q, want %q", missing, got, want)
+	}
+}
+
 func TestCanonicalExistingRootDarwinTmpAlias(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS /tmp alias regression")
@@ -158,6 +180,28 @@ func BenchmarkCanonicalHasPathPrefixOfflineAliasChild(b *testing.B) {
 	for range b.N {
 		if !CanonicalHasPathPrefix(offlineChild, aliasRoot) {
 			b.Fatal("offline alias child unexpectedly escaped root")
+		}
+	}
+}
+
+func BenchmarkCanonicalHasPathPrefixMissingAliasLeaf(b *testing.B) {
+	base := b.TempDir()
+	realRoot := filepath.Join(base, "real")
+	realRepo := filepath.Join(realRoot, "repo")
+	if err := os.MkdirAll(realRepo, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	aliasRoot := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		b.Skipf("symlinks unavailable: %v", err)
+	}
+	missing := filepath.Join(aliasRoot, "repo", "new", "buffer.go")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if !CanonicalHasPathPrefix(missing, realRepo) {
+			b.Fatal("missing alias leaf unexpectedly escaped root")
 		}
 	}
 }

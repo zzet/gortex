@@ -432,7 +432,7 @@ func TestDispatcher_GateMatchesSessionScope(t *testing.T) {
 
 	stranger := t.TempDir()
 
-	for _, tc := range []struct {
+	cases := []struct {
 		name string
 		cwd  string
 		want bool
@@ -441,7 +441,19 @@ func TestDispatcher_GateMatchesSessionScope(t *testing.T) {
 		{"subdirectory of a tracked repo", filepath.Join(repoA, "internal", "deep"), true},
 		{"parent containing two tracked repos", parent, true},
 		{"unrelated directory", stranger, false},
-	} {
+	}
+	aliasParent := filepath.Join(t.TempDir(), "parent-alias")
+	if err := os.Symlink(parent, aliasParent); err == nil {
+		cases = append(cases,
+			struct {
+				name string
+				cwd  string
+				want bool
+			}{"canonical alias of a tracked repo", filepath.Join(aliasParent, "a"), true},
+		)
+	}
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			gate := d.cwdReachable(context.Background(), tc.cwd)
 			assert.Equal(t, tc.want, gate, "gate verdict")

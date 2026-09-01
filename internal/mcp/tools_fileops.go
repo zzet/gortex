@@ -267,8 +267,8 @@ func worktreeRootedPath(abs, root string, mi multiRepoLookup) string {
 	if _, err := os.Stat(abs); err == nil {
 		return abs
 	}
-	rel, err := filepath.Rel(root, abs)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+	rel, ok := relativeWithinRoot(root, abs)
+	if !ok {
 		return abs
 	}
 	match := ""
@@ -368,7 +368,7 @@ func pathContainedIn(abs, root string) bool {
 	if rel == "." {
 		return true
 	}
-	if strings.HasPrefix(rel, "..") {
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
 	return true
@@ -730,7 +730,7 @@ func (s *Server) repoRelative(absPath string) string {
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
 			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil {
-				if rel, err := filepath.Rel(idx.RootPath(), absPath); err == nil {
+				if rel, ok := relativeWithinRoot(idx.RootPath(), absPath); ok {
 					return filepath.ToSlash(filepath.Join(prefix, rel))
 				}
 			}
@@ -739,7 +739,7 @@ func (s *Server) repoRelative(absPath string) string {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+			if rel, ok := relativeWithinRoot(root, absPath); ok {
 				return filepath.ToSlash(rel)
 			}
 		}
@@ -764,7 +764,7 @@ func (s *Server) reindexFile(absPath string) bool {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+			if _, ok := relativeWithinRoot(root, absPath); ok {
 				result, reindexErr := s.indexer.IncrementalReindexPaths(root, []string{absPath})
 				if incrementalReindexSucceeded(result, reindexErr) {
 					return true

@@ -376,6 +376,7 @@ func TestPathContainedIn(t *testing.T) {
 		{"/repo-other/x.go", "/repo", false},
 		{"/etc/passwd", "/repo", false},
 		{"/repo/../etc/passwd", "/repo", false},
+		{"/repo/..hidden/file.go", "/repo", true},
 		{"", "/repo", false},
 		{"/repo/x.go", "", false},
 	}

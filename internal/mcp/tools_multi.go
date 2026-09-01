@@ -535,32 +535,14 @@ func (s *Server) resolveRepoPrefix(pathOrPrefix string) string {
 	}
 
 	// Files and working directories inside a tracked repository are valid
-	// selectors too. Prefer the longest containing root so nested repositories
-	// resolve deterministically to their own graph instead of the parent repo.
+	// selectors too. RepoForFile owns the longest-root and canonical-alias
+	// rules shared with every request path; duplicating them here previously
+	// made administrative selectors disagree with graph routing.
 	absInput, err := filepath.Abs(pathOrPrefix)
 	if err != nil {
 		return ""
 	}
-	bestPrefix := ""
-	bestRootLen := -1
-	for prefix, meta := range s.multiIndexer.AllMetadata() {
-		if meta == nil || meta.RootPath == "" {
-			continue
-		}
-		root, err := filepath.Abs(meta.RootPath)
-		if err != nil {
-			continue
-		}
-		rel, err := filepath.Rel(root, absInput)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			continue
-		}
-		if len(root) > bestRootLen {
-			bestPrefix = prefix
-			bestRootLen = len(root)
-		}
-	}
-	return bestPrefix
+	return s.multiIndexer.RepoForFile(absInput)
 }
 
 // diffJoinPrefix resolves the graph repo prefix used to join repo-relative

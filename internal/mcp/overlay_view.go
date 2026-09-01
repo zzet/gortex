@@ -512,7 +512,7 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
 			if idx, _ := s.multiIndexer.IndexerForFile(absPath); idx != nil {
 				if root := idx.RootPath(); root != "" {
-					if rel, err := filepath.Rel(root, absPath); err == nil {
+					if rel, ok := relativeWithinRoot(root, absPath); ok {
 						return prefix + "/" + filepath.ToSlash(rel)
 					}
 				}
@@ -521,7 +521,7 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil {
+			if rel, ok := relativeWithinRoot(root, absPath); ok {
 				return filepath.ToSlash(rel)
 			}
 		}
@@ -538,7 +538,7 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 func (s *Server) resolveOverlayGraphPathForRequest(ctx context.Context, p, absPath string) string {
 	view := requestViewPathRoot(ctx)
 	if view.root != "" && view.contains(absPath) {
-		if rel, err := filepath.Rel(view.root, absPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		if rel, ok := relativeWithinRoot(view.root, absPath); ok {
 			rel = filepath.ToSlash(rel)
 			if view.repoPrefix != "" {
 				return path.Join(view.repoPrefix, rel)
@@ -561,7 +561,7 @@ func (s *Server) pickIndexerForPath(absPath string) *indexer.Indexer {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+			if _, ok := relativeWithinRoot(root, absPath); ok {
 				return s.indexer
 			}
 		}
@@ -680,7 +680,7 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if idx.RepoPrefix() != "" {
 			relPath = strings.TrimPrefix(graphPath, idx.RepoPrefix()+"/")
 		} else if root != "" {
-			if r, err := filepath.Rel(root, absPath); err == nil {
+			if r, ok := relativeWithinRoot(root, absPath); ok {
 				relPath = filepath.ToSlash(r)
 			}
 		}

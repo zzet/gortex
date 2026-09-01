@@ -2,6 +2,7 @@ package graphview
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -68,6 +69,77 @@ func TestCheckoutForPathPicksTheInnermostCheckout(t *testing.T) {
 	sibling := outer + "-fork"
 	if _, found, _ := CheckoutForPath(ctx, store.Catalog(), families, sibling); found {
 		t.Errorf("CheckoutForPath(%s) matched a root it only shares a prefix with", sibling)
+	}
+}
+
+func TestCheckoutForPathResolvesCanonicalAlias(t *testing.T) {
+	store := openStackStore(t, "binding-alias")
+	seedStackControlPlane(t, store)
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real")
+	realRoot := filepath.Join(realParent, "repo")
+	realNested := filepath.Join(realRoot, "internal")
+	if err := os.MkdirAll(realNested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(base, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	seedBindingCheckout(t, store, "co-real", realRoot,
+		store_sqlite.CheckoutModeAutomatic, store_sqlite.CheckoutStateReady)
+
+	checkout, found, err := CheckoutForPath(context.Background(), store.Catalog(),
+		[]string{testFamilyID}, filepath.Join(aliasParent, "repo", "internal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || checkout.CheckoutID != "co-real" {
+		t.Fatalf("aliased checkout = %q (found %v), want co-real", checkout.CheckoutID, found)
+	}
+
+	if err := os.RemoveAll(realRoot); err != nil {
+		t.Fatal(err)
+	}
+	checkout, found, err = CheckoutForPath(context.Background(), store.Catalog(),
+		[]string{testFamilyID}, filepath.Join(aliasParent, "repo", "internal", "missing.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || checkout.CheckoutID != "co-real" {
+		t.Fatalf("removed aliased checkout = %q (found %v), want co-real", checkout.CheckoutID, found)
+	}
+}
+
+func TestCheckoutForPathRanksCanonicalNestedAliases(t *testing.T) {
+	store := openStackStore(t, "binding-nested-alias")
+	seedStackControlPlane(t, store)
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real")
+	inner := filepath.Join(realParent, "outer", "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	longAlias := filepath.Join(base, "a-very-long-alias-spelling")
+	shortAlias := filepath.Join(base, "x")
+	queryAlias := filepath.Join(base, "query")
+	for _, alias := range []string{longAlias, shortAlias, queryAlias} {
+		if err := os.Symlink(realParent, alias); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	seedBindingCheckout(t, store, "co-outer", filepath.Join(longAlias, "outer"),
+		store_sqlite.CheckoutModeDedicated, store_sqlite.CheckoutStateReady)
+	seedBindingCheckout(t, store, "co-inner", filepath.Join(shortAlias, "outer", "inner"),
+		store_sqlite.CheckoutModeAutomatic, store_sqlite.CheckoutStateReady)
+
+	checkout, found, err := CheckoutForPath(context.Background(), store.Catalog(),
+		[]string{testFamilyID}, filepath.Join(queryAlias, "outer", "inner", "file.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || checkout.CheckoutID != "co-inner" {
+		t.Fatalf("canonical nested checkout = %q (found %v), want co-inner", checkout.CheckoutID, found)
 	}
 }
 

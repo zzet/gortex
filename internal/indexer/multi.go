@@ -3402,24 +3402,10 @@ func (mi *MultiIndexer) RepoForFile(filePath string) string {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 
-	var bestPrefix string
-	var bestLen int
-
-	for prefix, meta := range mi.repos {
-		// Fold-aware containment so a case-variant file path still maps
-		// to its repo on a case-insensitive filesystem. Longest-root-wins
-		// breaks ties by nesting depth; nested roots share a prefix, so
-		// the raw RootPath length orders them the same as their folded
-		// forms would.
-		if pathkey.HasPathPrefix(absPath, meta.RootPath) {
-			if len(meta.RootPath) > bestLen {
-				bestLen = len(meta.RootPath)
-				bestPrefix = prefix
-			}
-		}
-	}
-
-	return bestPrefix
+	// The shared resolver does one complete lexical pass before its
+	// canonical fallback, so the common path performs no filesystem I/O even
+	// when many unrelated repositories precede the matching one.
+	return mi.bestRepoPrefixForPathLocked(absPath)
 }
 
 // GetIndexer returns the Indexer for a specific repo prefix, or nil.
