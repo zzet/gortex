@@ -53,22 +53,45 @@ func TestViewSelectorPublishedOnEveryToolSchema(t *testing.T) {
 	for _, name := range legacyNames {
 		t.Run("legacy/"+name, func(t *testing.T) {
 			require.Equal(t, compactViewSelectorSchema(), requirePublishedViewSelector(t, legacyTools[name].InputSchema.Properties))
+			requirePublishedViewConsistency(t, legacyTools[name].InputSchema.Properties)
 		})
 	}
 
 	for _, name := range facadeToolNames() {
 		t.Run("facade/"+name, func(t *testing.T) {
-			require.Equal(t, compactViewSelectorSchema(), requirePublishedViewSelector(t, facadeToolDefinition(name).InputSchema.Properties))
+			properties := facadeToolDefinition(name).InputSchema.Properties
+			require.Equal(t, compactViewSelectorSchema(), requirePublishedViewSelector(t, properties))
+			requirePublishedViewConsistency(t, properties)
 		})
 		for _, spec := range srv.facades.availableOperations(name) {
 			spec := spec
 			t.Run("capability/"+name+"."+spec.Operation, func(t *testing.T) {
 				capability := srv.facadeCapability(spec, true)
 				schema := facadeSchemaMapForTest(t, capability["input_schema"])
-				published := requirePublishedViewSelector(t, schema["properties"].(map[string]any))
+				properties := schema["properties"].(map[string]any)
+				published := requirePublishedViewSelector(t, properties)
 				require.Len(t, published["oneOf"], 5, "capability must publish every selector shape")
 				require.Equal(t, facadeSchemaMapForTest(t, viewSelectorSchema()), facadeSchemaMapForTest(t, published))
+				requirePublishedViewConsistency(t, properties)
 			})
+		}
+	}
+}
+
+func requirePublishedViewConsistency(t testing.TB, properties map[string]any) {
+	t.Helper()
+	for name, wantType := range map[string]string{
+		requireExactArgName: "boolean",
+		requireFreshArgName: "boolean",
+		waitDeadlineArgName: "string",
+	} {
+		raw, ok := properties[name]
+		require.True(t, ok, "schema omitted universal %q", name)
+		schema, ok := raw.(map[string]any)
+		require.True(t, ok, "schema published %q as %T", name, raw)
+		require.Equal(t, wantType, schema["type"])
+		if name == waitDeadlineArgName {
+			require.Equal(t, "date-time", schema["format"])
 		}
 	}
 }

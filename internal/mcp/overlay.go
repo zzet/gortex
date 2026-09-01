@@ -127,6 +127,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if selectorErr != nil {
 			return mcp.NewToolResultError(selectorErr.Error()), nil
 		}
+		consistency, consistencyErr := takeViewConsistencyRequest(&req)
+		if consistencyErr != nil {
+			return mcp.NewToolResultError(consistencyErr.Error()), nil
+		}
 		// The capability contract travels on the same seam and for the same
 		// reason: what a caller needs the view to be able to answer is a
 		// property of the request, not a parameter of any one tool.
@@ -166,9 +170,19 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// overlay so a session's editor buffers layer on top of whatever
 		// answers here. The lease the materialized view holds is released
 		// with the request, on the same lifecycle that discards the overlay.
-		view, viewErr := s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req))
+		view, viewErr := s.resolveRequestViewConsistently(ctx, selector, s.requestViewPolicy(&req), consistency)
 		if viewErr != nil {
-			return mcp.NewToolResultError(viewErr.Error()), nil
+			if view != nil {
+				defer view.close()
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			result := mcp.NewToolResultError(viewErr.Error())
+			if view != nil {
+				result = s.attachViewRider(withRequestView(ctx, view), result)
+			}
+			return result, nil
 		}
 		if view != nil {
 			ctx = withRequestView(ctx, view)

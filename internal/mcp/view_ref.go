@@ -75,8 +75,10 @@ func (s *Server) viewForRefSelector(ctx context.Context, selector graphview.Sele
 	rider.ResolvedRef = result.Resolved.FullRef
 	rider.ResolvedCommit = result.Resolved.CommitOID
 	rider.ResolvedTree = result.Resolved.TreeOID
+	rider.ViewID = result.RefViewID
 
 	if result.State == store_sqlite.RefViewReady && result.GenerationID > 0 {
+		rider.ActiveGenerationID = result.GenerationID
 		return s.materializeRefView(ctx, dedicated, result.GenerationID, result.Resolved.TreeOID, rider)
 	}
 	return s.refViewBuilding(ctx, dedicated, result, rider)
@@ -95,13 +97,17 @@ func (s *Server) refViewBuilding(
 	result indexer.RefViewResult,
 	rider *graphview.ViewRider,
 ) (*requestView, error) {
+	rider.ViewID = result.RefViewID
 	rider.BuildToken = result.BuildToken
 	rider.RetryAfter = refViewRetryAfterSeconds
+	rider.RequestedState = "building"
 
 	stored, found, err := s.lifecycle.RefViewGeneration(ctx, result.RefViewID)
 	if err == nil && found && stored.ActiveGenerationID > 0 {
+		rider.ActiveGenerationID = stored.ActiveGenerationID
 		fallback, ferr := s.materializeRefView(ctx, dedicated, stored.ActiveGenerationID, stored.ActiveTree, rider)
 		if ferr == nil {
+			fallback.rider.ActualState = "stale"
 			fallback.rider.ResolvedRef = stored.ActiveRef
 			fallback.rider.ResolvedCommit = stored.ActiveCommit
 			fallback.rider.ResolvedTree = stored.ActiveTree
@@ -115,9 +121,14 @@ func (s *Server) refViewBuilding(
 			return fallback, nil
 		}
 	}
-	return nil, graphview.NewViewError(graphview.CodeViewBuilding, fmt.Sprintf(
+	err = graphview.NewViewError(graphview.CodeViewBuilding, fmt.Sprintf(
 		"ref view %s is building as build %s; retry after %ds",
 		result.RefViewID, buildTokenOrUnknown(result.BuildToken), refViewRetryAfterSeconds))
+	rider.Exact = false
+	rider.FallbackReason = graphview.CodeViewBuilding
+	rider.ActualState = "none"
+	rider.Error = err.Error()
+	return &requestView{kind: viewmetrics.ViewRef, rider: rider, suppressBufferOverlay: true}, err
 }
 
 // buildTokenOrUnknown names the build a caller polls. An empty token means the

@@ -19,6 +19,14 @@ type ViewRider struct {
 	// ViewFingerprint is the identity of the content that answered. It is the
 	// authority half of every gortex-view:// file URI in the same response.
 	ViewFingerprint string `json:"view_fingerprint,omitempty"`
+	// ViewID is the catalog identity selected: graph id for a base, checkout
+	// id for a worktree, and ref-view id for committed state.
+	ViewID string `json:"view_id,omitempty"`
+	// ActiveGenerationID is the top published payload generation that actually
+	// answered. BuildingGenerationID is present only when the producer exposes
+	// the claimed generation before publication.
+	ActiveGenerationID   int64 `json:"active_generation_id,omitempty"`
+	BuildingGenerationID int64 `json:"building_generation_id,omitempty"`
 	// RequestedRef is the ref or object id the caller's selector named,
 	// verbatim. ResolvedRef, ResolvedCommit and ResolvedTree are what it
 	// resolved to when the request was served — the ref is empty for a commit
@@ -40,6 +48,9 @@ type ViewRider struct {
 	BuildToken string `json:"build_token,omitempty"`
 	// RetryAfter is a hint in whole seconds; 0 means no hint.
 	RetryAfter int64 `json:"retry_after,omitempty"`
+	// Error carries the stable coded refusal rendered for a cold or rejected
+	// selection. Successful answers omit it.
+	Error string `json:"error,omitempty"`
 }
 
 // NewViewRider starts a rider for a request, exact until something says

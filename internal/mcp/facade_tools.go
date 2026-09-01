@@ -2698,7 +2698,7 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 			for name, property := range schemaProperties {
 				publishedProperties[name] = property
 			}
-			publishedProperties[viewArgName] = viewSelectorSchema()
+			publishViewRequestProperties(publishedProperties, viewSelectorSchema())
 			schema["properties"] = publishedProperties
 			if spec.Facade == "read" && spec.Operation == "symbols" {
 				if schema, ok := inputSchema.(map[string]any); ok {

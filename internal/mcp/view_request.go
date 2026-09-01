@@ -269,7 +269,7 @@ func publishViewSelectorSchema(tool *mcp.Tool) {
 	if tool.InputSchema.Properties == nil {
 		tool.InputSchema.Properties = make(map[string]any)
 	}
-	tool.InputSchema.Properties[viewArgName] = compactViewSelectorSchema()
+	publishViewRequestProperties(tool.InputSchema.Properties, compactViewSelectorSchema())
 }
 
 // takeViewSelector pulls the structured view argument off the request and
@@ -683,7 +683,12 @@ func (s *Server) viewForWorktreeSelector(
 					fmt.Sprintf("primary graph %q is %s", primary.GraphID, primary.State))
 			}
 			if !policy.allowGraceBaseFallback && !policy.allowGraceRefusalView {
-				return nil, stateErr
+				refusal, refusalErr := graceBaseFallback(selector, checkout, primary)
+				if refusalErr != nil {
+					return nil, refusalErr
+				}
+				markRequestViewRefusal(refusal, stateErr)
+				return refusal, stateErr
 			}
 			return s.materializeGraceBaseFallback(ctx, selector, checkout, primary)
 		}
@@ -727,6 +732,8 @@ func graceBaseFallback(
 	}
 	rider.GraphID = primary.GraphID
 	rider.CheckoutID = checkout.CheckoutID
+	rider.ViewID = primary.GraphID
+	rider.ActiveGenerationID = primary.ActiveGenerationID
 	rider.RequestedState = string(store_sqlite.CheckoutStateReady)
 	rider.ActualState = string(checkout.State)
 	return &requestView{kind: viewmetrics.ViewBase, rider: rider, suppressBufferOverlay: true}, nil
@@ -754,6 +761,7 @@ func (s *Server) materializeGraceBaseFallback(
 	}
 	fallback.reader = base.Reader
 	fallback.materialized = base
+	fallback.rider.ViewFingerprint = base.ID.Fingerprint()
 	fallback.bindSources(base.GenerationSources(), s.graph)
 	return fallback, nil
 }
@@ -822,6 +830,8 @@ func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Sel
 	rider := graphview.NewViewRider(selector)
 	rider.MarkExact(selector.String())
 	rider.GraphID = dedicated.GraphID
+	rider.ViewID = dedicated.GraphID
+	rider.ActiveGenerationID = dedicated.ActiveGenerationID
 	selected := &requestView{kind: viewmetrics.ViewBase, rider: rider}
 	if dedicated.ActiveGenerationID <= 0 {
 		// Legacy dedicated graphs predate generation-backed bases and still live
@@ -834,6 +844,7 @@ func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Sel
 	}
 	selected.reader = base.Reader
 	selected.materialized = base
+	selected.rider.ViewFingerprint = base.ID.Fingerprint()
 	selected.bindSources(base.GenerationSources(), s.graph)
 	return selected, nil
 }
@@ -878,6 +889,11 @@ func (s *Server) materializeRequestView(
 	rider.MarkExact(requested.String())
 	rider.GraphID = view.ID.BaseGraphID
 	rider.CheckoutID = checkout.CheckoutID
+	rider.ViewID = checkout.CheckoutID
+	rider.ViewFingerprint = view.ID.Fingerprint()
+	if generations := view.Generations(); len(generations) > 0 {
+		rider.ActiveGenerationID = generations[len(generations)-1]
+	}
 	routed := &requestView{
 		kind:         viewmetrics.ViewWorktree,
 		reader:       view.Reader,
@@ -913,7 +929,10 @@ func (s *Server) materializeBuildingBaseFallback(
 	cause error,
 ) (*requestView, error) {
 	if strict {
-		return nil, cause
+		rider.CheckoutID = checkout.CheckoutID
+		refusal := &requestView{kind: viewmetrics.ViewWorktree, rider: rider, suppressBufferOverlay: true}
+		markRequestViewRefusal(refusal, cause)
+		return refusal, cause
 	}
 	fallback, err := viewFallback(false, rider, cause)
 	if err != nil {
@@ -926,6 +945,8 @@ func (s *Server) materializeBuildingBaseFallback(
 	fallback.kind = viewmetrics.ViewBase
 	fallback.rider.GraphID = primary.GraphID
 	fallback.rider.CheckoutID = checkout.CheckoutID
+	fallback.rider.ViewID = primary.GraphID
+	fallback.rider.ActiveGenerationID = primary.ActiveGenerationID
 	if primary.ActiveGenerationID <= 0 {
 		return fallback, nil
 	}
@@ -939,6 +960,7 @@ func (s *Server) materializeBuildingBaseFallback(
 	}
 	fallback.reader = base.Reader
 	fallback.materialized = base
+	fallback.rider.ViewFingerprint = base.ID.Fingerprint()
 	fallback.baseFallback = true
 	fallback.bindSources(base.GenerationSources(), s.graph)
 	return fallback, nil
@@ -1268,6 +1290,8 @@ func viewRiderFields(view *requestView) map[string]any {
 		"resolved_commit":  view.rider.ResolvedCommit,
 		"resolved_tree":    view.rider.ResolvedTree,
 		"build_token":      view.rider.BuildToken,
+		"error":            view.rider.Error,
+		"view_id":          view.rider.ViewID,
 	} {
 		if value != "" {
 			fields[name] = value
@@ -1275,6 +1299,12 @@ func viewRiderFields(view *requestView) map[string]any {
 	}
 	if view.rider.RetryAfter > 0 {
 		fields["retry_after"] = view.rider.RetryAfter
+	}
+	if view.rider.ActiveGenerationID > 0 {
+		fields["active_generation_id"] = view.rider.ActiveGenerationID
+	}
+	if view.rider.BuildingGenerationID > 0 {
+		fields["building_generation_id"] = view.rider.BuildingGenerationID
 	}
 	// The capability annotations: what the view served thinly, and what a
 	// base-scoped engine answered instead of the view. Both are omitted when

@@ -816,11 +816,63 @@ func TestRefViewBuildingServesTheOlderGenerationAsAFallback(t *testing.T) {
 	if view.rider.BuildToken != "build-token-1" {
 		t.Errorf("build_token = %q, want the build to poll", view.rider.BuildToken)
 	}
+	if view.rider.ViewID != views[0].RefViewID || view.rider.ActiveGenerationID <= 0 {
+		t.Errorf("fallback identity = view %q generation %d, want %q and an active generation",
+			view.rider.ViewID, view.rider.ActiveGenerationID, views[0].RefViewID)
+	}
 	if view.rider.RetryAfter <= 0 {
 		t.Error("a building answer carries no retry hint")
 	}
 	if view.reader == nil {
 		t.Error("the labelled fallback served nothing at all")
+	}
+}
+
+func TestColdRefViewBuildingRefusalCarriesBuildIdentity(t *testing.T) {
+	stack := newRefStack(t)
+	ctx := context.Background()
+	dedicated, found, err := stack.store.Catalog().GetDedicatedGraph(ctx, stack.graphID)
+	if err != nil || !found {
+		t.Fatalf("read dedicated graph: found=%v err=%v", found, err)
+	}
+	selector, err := graphview.ParseSelector("git_ref", stack.graphID, "", "refs/heads/feature")
+	if err != nil {
+		t.Fatalf("selector: %v", err)
+	}
+	rider := graphview.NewViewRider(selector)
+	view, err := stack.srv.refViewBuilding(ctx, dedicated, indexer.RefViewResult{
+		RefViewID: "ref-view-cold", State: store_sqlite.RefViewBuilding, BuildToken: "build-cold-1",
+	}, rider)
+	if graphview.CodeOf(err) != graphview.CodeViewBuilding {
+		t.Fatalf("cold building error = %v", err)
+	}
+	if view == nil || view.rider == nil {
+		t.Fatal("cold building refusal omitted its rider")
+	}
+	defer view.close()
+	if view.rider.ViewID != "ref-view-cold" || view.rider.BuildToken != "build-cold-1" ||
+		view.rider.RetryAfter <= 0 || view.rider.ActualState != "none" || view.rider.Exact {
+		t.Fatalf("cold build rider = %+v", view.rider)
+	}
+	if view.rider.BuildingGenerationID != 0 {
+		t.Fatalf("invented building generation id %d for a producer that exposes only a build token",
+			view.rider.BuildingGenerationID)
+	}
+}
+
+func TestMissingRefRemainsTerminalWithLongFreshDeadline(t *testing.T) {
+	stack := newRefStack(t)
+	started := time.Now()
+	res, err := stack.call(t, "read_file", refSelector("git_ref", "refs/heads/never"), map[string]any{
+		"path": "repo/edit.go", requireFreshArgName: true,
+		waitDeadlineArgName: time.Now().Add(30 * time.Second).Format(time.RFC3339Nano),
+	}, stack.srv.handleReadFile)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	assertToolError(t, res, graphview.CodeRefNotAvailableLocally)
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("deterministically missing ref waited on a build deadline")
 	}
 }
 

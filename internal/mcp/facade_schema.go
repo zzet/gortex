@@ -256,7 +256,7 @@ func facadePublicCapabilitySchema(
 	// View selection is universal request context, so it is absent from legacy
 	// handler schemas and operation examples. Publish it explicitly here just
 	// as facadeToolDefinition does for the static tools/list contract.
-	properties[viewArgName] = viewSelectorSchema()
+	publishViewRequestProperties(properties, viewSelectorSchema())
 
 	schema := map[string]any{
 		"type":                 "object",
