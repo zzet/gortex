@@ -501,7 +501,7 @@ A graph-grounded pull-request review surface. The forge-data tools self-serve PR
 
 ## Worktree views and checkouts
 
-A **view** is what one request reads through. By default that is the base corpus — the index built from a repository's canonical checkout. A session whose working directory sits inside a registered linked worktree reads that worktree's composed view instead, and any request may name a view explicitly. See [multi-repo.md](multi-repo.md#checkout-families-and-worktree-views) for what a checkout family is and how views are built and retained.
+A **view** is what one request reads through. The session CWD automatically selects its checkout: an ordinary linked worktree is discovered and represented as an overlay over the family's designated primary, without an explicit `track_repository` call. Explicit tracking is reserved for a user-requested dedicated logical graph. Any request may name a different view explicitly. See [multi-repo.md](multi-repo.md#checkout-families-and-worktree-views) for the storage and lifecycle model.
 
 ### The `view` selector
 
@@ -532,8 +532,8 @@ Rules worth knowing before a client builds selectors:
 - **Full names only.** Short refs (`main`), `HEAD`, revision expressions (`main~1`, `a..b`, `x@{1}`) and abbreviated object ids are rejected — they resolve against ambient state, and a pinned view may not. Values are never trimmed: surrounding whitespace is a malformed value, not a typo.
 - **Multi-repo disambiguation.** A `git_ref` / `commit` selector with no `graph_id` resolves only when the session reaches exactly one repository; reaching several fails with `invalid_view_selector` naming them, so name one with `graph_id`.
 - **Scope still applies.** A `base` or `worktree` selector naming a graph or checkout outside the session's workspace is refused with `selector_out_of_scope`, and the scope check runs before the readiness check so a session cannot probe a sibling workspace's build state.
-- **A named view is never silently substituted.** An explicit selector that cannot be served fails; only the automatic (cwd) binding falls back to the base corpus, and it says so on the rider rather than passing for an exact answer. The one substitution an explicit selector can get is a ref view still building over a generation it is already serving — labelled, never as the requested tree (see below).
-- **Views are read-only.** A source-mutating tool — the `edit` / `refactor` facades and the legacy tools behind them — is refused with `view_read_only` while the request reads a routed view, because the write would land in the canonical checkout rather than the one the answer came from.
+- **Substitution is always labelled.** `exact: false` means the requested view was not served. Every fallback is read-only. Set `require_exact: true` when substitution is unacceptable.
+- **Exact worktree edits are supported through the coordinator-backed write path.** Fallback, inactive ref, and commit views remain read-only and return `view_read_only` for mutation.
 - A view of a committed tree has no working copy, so its files are served out of the object store and a file location is reported as a `gortex-view://<view-fingerprint>/<repo-prefix>/<path>` identity instead of an on-disk path.
 
 The view is resolved before the session's overlay is prepared, so pushed editor buffers layer on top of whatever answers.
@@ -564,6 +564,8 @@ A view is rarely complete all at once: source bytes are readable long before the
 | `require_complete` | bool (a `"true"` / `"false"` string is accepted) | promotes the calling operation's own default capabilities to required |
 | `required_capabilities` | array of names, or one comma-separated string | adds to whatever `require_complete` produced; the request fails if the view cannot serve them |
 | `optional_capabilities` | same shapes | annotates only — never fails a request |
+
+The schemas also publish three consistency controls on every view-aware tool: `require_exact` rejects substitution, `require_fresh` waits until the selected worktree reflects current filesystem state, and `wait_deadline` is the absolute RFC3339 deadline bounding that wait. A deadline without a wait requirement is rejected rather than ignored.
 
 Defaults that were not required are still evaluated and reported under `degraded_capabilities`. A request the base corpus serves is exempt: the base is a plain whole index with no producer rows to read.
 

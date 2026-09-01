@@ -689,6 +689,7 @@ func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.Ap
 	skillsDir := filepath.Join(userClaudeConfigDir(home), "skills")
 	known := make(map[string][]string, len(GlobalSkills))
 	preWorktree := skillpack.PreWorktreeClaudeSkillHashes()
+	preWorktree = skillpack.AddWorktreeV1Hashes(GlobalSkills, profiles.WorktreeBranchRoutingPolicy, preWorktree)
 	for name := range GlobalSkills {
 		known[name] = append(known[name], v060GlobalSkillHashes[name])
 		known[name] = append(known[name], preWorktree[name]...)
@@ -706,7 +707,7 @@ func installGlobalSlashCommands(w io.Writer, home string, opts agents.ApplyOpts)
 	dir := filepath.Join(userClaudeConfigDir(home), "commands")
 	for name, content := range SlashCommands {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, []string{v060SlashCommandHashes[name], preWorktreeSlashCommandHashes[name]}, opts)
+		action, err := writeAgentArtifact(w, path, content, []string{v060SlashCommandHashes[name], preWorktreeSlashCommandHashes[name], skillpack.WorktreeV1BodyHash(content, profiles.WorktreeBranchRoutingPolicy)}, opts)
 		if err != nil {
 			return out, err
 		}
@@ -724,7 +725,7 @@ func installGlobalSubAgents(w io.Writer, home string, opts agents.ApplyOpts) ([]
 	dir := filepath.Join(userClaudeConfigDir(home), "agents")
 	for name, content := range SubAgents {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, []string{v060SubAgentHashes[name], preWorktreeSubAgentHashes[name]}, opts)
+		action, err := writeAgentArtifact(w, path, content, []string{v060SubAgentHashes[name], preWorktreeSubAgentHashes[name], skillpack.WorktreeV1BodyHash(content, profiles.WorktreeBranchRoutingPolicy)}, opts)
 		if err != nil {
 			return out, err
 		}

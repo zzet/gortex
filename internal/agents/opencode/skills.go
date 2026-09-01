@@ -54,6 +54,7 @@ import (
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/internalutil"
 	"github.com/zzet/gortex/internal/agents/skillpack"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // skillFileName is the file OpenCode loads inside each skill directory.
@@ -231,7 +232,7 @@ func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.A
 		Dir:         root,
 		FileName:    skillFileName,
 		Rendered:    rendered,
-		KnownHashes: skillpack.PreWorktreeAgentSkillHashes(),
+		KnownHashes: skillpack.AddWorktreeV1Hashes(rendered, profiles.WorktreeBranchRoutingPolicy, skillpack.PreWorktreeAgentSkillHashes()),
 	}, allowed, opts)
 }
 

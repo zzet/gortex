@@ -120,6 +120,16 @@ const guideWorkflow = `## Session-start checklist
 
 The behavior-critical memory triggers (distill_session, surface_memories, save_note, store_memory) live in the installed policy core (~/.claude/CLAUDE.md). This checklist is the fuller reference.`
 
+const guideViews = `## Worktree and branch views
+
+The session CWD selects an automatically discovered checkout overlay. Do not call track for an ordinary worktree: explicit tracking means the user requested a dedicated logical graph. Overall is one coherent view—the selected overlay plus its designated primary—not a union of branches. Overlay data only wins for duplicate logical identities; tombstones hide deleted base identities.
+
+Every response carries freshness metadata. ` + "`exact:false`" + ` means the requested view was not served, and every fallback is read-only. Set ` + "`require_exact:true`" + ` to reject fallback, ` + "`require_fresh:true`" + ` to wait for current filesystem state, and bound waiting with an absolute RFC3339 ` + "`wait_deadline`" + `.
+
+When CWD is not the target, select it explicitly: ` + "`view:{kind:\"worktree\",checkout_id:\"…\"}`" + ` or ` + "`view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`" + `. Inactive ref/commit views have committed source and structural graph only—no working-copy LSP, ` + "`search.text`" + `, or edits. Exact worktree edits are allowed only through the approved coordinator-backed path; fallback and ref/commit views are read-only.
+
+Checkout administration previews destructive effects by default. Before primary closure, family forget, or set-primary, inspect the preview and obtain explicit user confirmation before sending confirm.`
+
 // guideSection maps a topic keyword to its rendered section. Section bodies
 // that need a live catalog (analyze / search_ast) are rendered from the same
 // source functions that back kind:"help" / detector:"help", so the catalog
@@ -136,6 +146,8 @@ func guideSection(topic string) (string, bool) {
 		return guideResources, true
 	case "workflow", "session", "checklist", "session-start":
 		return guideWorkflow, true
+	case "views", "view", "worktrees", "branches":
+		return guideViews, true
 	case "analyze", "analyzers", "kinds":
 		// Point at the single-source catalog rather than re-inlining it: the
 		// full per-kind reference lives in `analyze kind:"help"` and the
@@ -151,7 +163,7 @@ func guideSection(topic string) (string, bool) {
 
 // guideTopicOrder is the canonical section order for the full render and the
 // topic list.
-var guideTopicOrder = []string{"providers", "capabilities", "tokens", "analyze", "search_ast", "resources", "workflow"}
+var guideTopicOrder = []string{"providers", "capabilities", "tokens", "views", "analyze", "search_ast", "resources", "workflow"}
 
 // GuideTopics returns the addressable guide topic keywords, sorted.
 func GuideTopics() []string {

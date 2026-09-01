@@ -1,5 +1,13 @@
 package skillpack
 
+import "strings"
+
+const worktreeV1Policy = "- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.\n" +
+	"- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.\n" +
+	"- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.\n" +
+	"- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.\n" +
+	"- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.\n"
+
 // PreWorktreeAgentSkillHashes are the last Agent Skills bodies shipped
 // before worktree/branch routing guidance was added. Codex and OpenCode
 // share this rendering.
@@ -75,4 +83,26 @@ func PreWorktreeClaudeSkillHashes() map[string][]string {
 // PreWorktreeHermesSkillHashes returns a defensive copy of the Hermes hashes.
 func PreWorktreeHermesSkillHashes() map[string][]string {
 	return cloneHashes(preWorktreeHermesSkillHashes)
+}
+
+// AddWorktreeV1Hashes retains ownership of the immediately previous policy
+// rendering while keeping the historical digest catalog immutable to callers.
+func AddWorktreeV1Hashes(rendered map[string]string, currentPolicy string, known map[string][]string) map[string][]string {
+	out := cloneHashes(known)
+	for id, body := range rendered {
+		old := strings.Replace(body, currentPolicy, worktreeV1Policy, 1)
+		if old != body {
+			out[id] = append(out[id], bodyHash([]byte(old)))
+		}
+	}
+	return out
+}
+
+// WorktreeV1BodyHash returns the immediately previous policy rendering hash.
+func WorktreeV1BodyHash(body, currentPolicy string) string {
+	old := strings.Replace(body, currentPolicy, worktreeV1Policy, 1)
+	if old == body {
+		return ""
+	}
+	return bodyHash([]byte(old))
 }

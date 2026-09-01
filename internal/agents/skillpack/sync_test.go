@@ -445,6 +445,21 @@ func TestHistoricalHashSetsAreDefensiveAndComplete(t *testing.T) {
 	}
 }
 
+func TestAddWorktreeV1HashesAddsOwnershipWithoutMutatingPriorCatalog(t *testing.T) {
+	prior := skillpack.PreWorktreeClaudeSkillHashes()
+	rendered := map[string]string{"gortex-guide": "before\n" + profiles.WorktreeBranchRoutingPolicy + "after\n"}
+	got := skillpack.AddWorktreeV1Hashes(rendered, profiles.WorktreeBranchRoutingPolicy, prior)
+	if len(got["gortex-guide"]) != 2 {
+		t.Fatalf("hashes = %v, want pre-worktree + worktree-v1", got["gortex-guide"])
+	}
+	if len(prior["gortex-guide"]) != 1 {
+		t.Fatal("prior catalog was mutated")
+	}
+	if got["gortex-guide"][1] != skillpack.WorktreeV1BodyHash(rendered["gortex-guide"], profiles.WorktreeBranchRoutingPolicy) {
+		t.Fatal("catalog and single-body worktree-v1 hashes disagree")
+	}
+}
+
 func TestPreWorktreeHashesMatchImmediatelyPriorShippedBodies(t *testing.T) {
 	policy := "\n## Worktree and branch routing\n\n" + profiles.WorktreeBranchRoutingPolicy
 	assertHashes := func(name string, current map[string]string, hashes map[string][]string) {

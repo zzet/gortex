@@ -7,6 +7,7 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/skillpack"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // SyncSkills reconciles the installed routing skills with the active
@@ -38,10 +39,11 @@ func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpt
 	if _, err := os.Stat(root); err != nil {
 		return nil, nil
 	}
+	rendered := RoutingSkills()
 	return skillpack.Sync(w, skillpack.SyncSpec{
 		Dir:         root,
-		Rendered:    RoutingSkills(),
-		KnownHashes: skillpack.PreWorktreeHermesSkillHashes(),
+		Rendered:    rendered,
+		KnownHashes: skillpack.AddWorktreeV1Hashes(rendered, profiles.WorktreeBranchRoutingPolicy, skillpack.PreWorktreeHermesSkillHashes()),
 		DirFor:      func(id string) string { return filepath.Dir(skillPath(home, id)) },
 	}, allowed, opts)
 }

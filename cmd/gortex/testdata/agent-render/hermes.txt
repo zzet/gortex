@@ -47,8 +47,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/analysis/gortex-co-change/SKILL.md ===
 ---
@@ -82,8 +82,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/analysis/gortex-episode-replay/SKILL.md ===
 ---
@@ -118,8 +118,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/analysis/gortex-impact/SKILL.md ===
 ---
@@ -154,8 +154,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/analysis/gortex-pr-review-agent/SKILL.md ===
 ---
@@ -189,8 +189,8 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/analysis/gortex-pr-review/SKILL.md ===
 ---
@@ -225,8 +225,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/analysis/gortex-quality-audit/SKILL.md ===
 ---
@@ -260,8 +260,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/code-intelligence/gortex-cli/SKILL.md ===
 ---
@@ -303,8 +303,8 @@ The required order is `explore` → targeted `search/read/relations/trace` → p
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/code-intelligence/gortex/SKILL.md ===
 ---
@@ -391,8 +391,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/debugging/gortex-incident-investigation/SKILL.md ===
 ---
@@ -427,8 +427,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/navigation/gortex-cross-repo-usage/SKILL.md ===
 ---
@@ -463,8 +463,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/navigation/gortex-dataflow-trace/SKILL.md ===
 ---
@@ -499,8 +499,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/navigation/gortex-explore/SKILL.md ===
 ---
@@ -534,8 +534,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/navigation/gortex-onboarding/SKILL.md ===
 ---
@@ -569,8 +569,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/refactoring/gortex-extract-function/SKILL.md ===
 ---
@@ -605,8 +605,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/refactoring/gortex-fix-all/SKILL.md ===
 ---
@@ -640,8 +640,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/refactoring/gortex-refactor/SKILL.md ===
 ---
@@ -675,8 +675,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/refactoring/gortex-rename/SKILL.md ===
 ---
@@ -711,8 +711,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/refactoring/gortex-safe-edit/SKILL.md ===
 ---
@@ -746,8 +746,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === project/home/.hermes/skills/testing/gortex-add-test/SKILL.md ===
 ---
@@ -782,8 +782,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/config.yaml ===
 mcp_servers:
@@ -834,8 +834,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/analysis/gortex-co-change/SKILL.md ===
 ---
@@ -869,8 +869,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/analysis/gortex-episode-replay/SKILL.md ===
 ---
@@ -905,8 +905,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/analysis/gortex-impact/SKILL.md ===
 ---
@@ -941,8 +941,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/analysis/gortex-pr-review-agent/SKILL.md ===
 ---
@@ -976,8 +976,8 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/analysis/gortex-pr-review/SKILL.md ===
 ---
@@ -1012,8 +1012,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/analysis/gortex-quality-audit/SKILL.md ===
 ---
@@ -1047,8 +1047,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/code-intelligence/gortex-cli/SKILL.md ===
 ---
@@ -1090,8 +1090,8 @@ The required order is `explore` → targeted `search/read/relations/trace` → p
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/code-intelligence/gortex/SKILL.md ===
 ---
@@ -1178,8 +1178,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/debugging/gortex-incident-investigation/SKILL.md ===
 ---
@@ -1214,8 +1214,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/navigation/gortex-cross-repo-usage/SKILL.md ===
 ---
@@ -1250,8 +1250,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/navigation/gortex-dataflow-trace/SKILL.md ===
 ---
@@ -1286,8 +1286,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/navigation/gortex-explore/SKILL.md ===
 ---
@@ -1321,8 +1321,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/navigation/gortex-onboarding/SKILL.md ===
 ---
@@ -1356,8 +1356,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/refactoring/gortex-extract-function/SKILL.md ===
 ---
@@ -1392,8 +1392,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/refactoring/gortex-fix-all/SKILL.md ===
 ---
@@ -1427,8 +1427,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/refactoring/gortex-refactor/SKILL.md ===
 ---
@@ -1462,8 +1462,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/refactoring/gortex-rename/SKILL.md ===
 ---
@@ -1498,8 +1498,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/refactoring/gortex-safe-edit/SKILL.md ===
 ---
@@ -1533,8 +1533,8 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.hermes/skills/testing/gortex-add-test/SKILL.md ===
 ---
@@ -1569,6 +1569,6 @@ metadata:
 
 - The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.
 - **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Follow each response's freshness and capability metadata. A building overlay may return a labeled base fallback for eligible graph reads. During removal or availability grace the fallback is sealed primary-only: no dirty state or editor buffers. Exact source/symbol/file reads, AST or filesystem text search, LSP, and edits may refuse when the selected view cannot provide their required capability; never bypass that refusal through another checkout.
-- An inactive ref/commit view is an immutable committed structural/source snapshot: it has no working-copy LSP, `search.text`, or edits.
+- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.
+- Select explicitly when CWD is not the target, for example `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
 - Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
