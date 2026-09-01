@@ -361,7 +361,7 @@ func BenchmarkCheckoutLifecycleRetirementCandidateScan(b *testing.B) {
 	b.ResetTimer()
 	var candidates int
 	for i := 0; i < b.N; i++ {
-		candidates = len(lifecycle.orphanedGenerations(ctx, served, nil))
+		candidates = len(lifecycle.orphanedGenerations(ctx, served, nil, true))
 	}
 	b.ReportMetric(float64(candidates), "candidates/op")
 }

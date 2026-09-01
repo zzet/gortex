@@ -74,7 +74,7 @@ func TestCheckoutLifecyclePaginatesDiscardedPastServedRows(t *testing.T) {
 	}
 
 	lifecycle := newGenerationRetirementLifecycle(fixture.store, time.Now())
-	candidates := lifecycle.orphanedGenerations(ctx, map[string]struct{}{"served-discarded": {}}, nil)
+	candidates := lifecycle.orphanedGenerations(ctx, map[string]struct{}{"served-discarded": {}}, nil, true)
 	requireOnlyRetirementCandidate(t, candidates, orphan)
 }
 
@@ -96,8 +96,45 @@ func TestCheckoutLifecyclePaginatesReadyLayersPastServedRows(t *testing.T) {
 	}
 
 	lifecycle := newGenerationRetirementLifecycle(fixture.store, time.Now())
-	candidates := lifecycle.orphanedGenerations(ctx, map[string]struct{}{"served-ready-layer": {}}, nil)
+	candidates := lifecycle.orphanedGenerations(ctx, map[string]struct{}{"served-ready-layer": {}}, nil, true)
 	requireOnlyRetirementCandidate(t, candidates, orphan)
+}
+
+func TestCheckoutLifecycleRuntimeSweepDefersUnqueuedReadyPublicationCandidateToSeed(t *testing.T) {
+	for _, generationKind := range []string{CommitLayerGenerationKind, DirtyLayerGenerationKind} {
+		t.Run(generationKind, func(t *testing.T) {
+			fixture := newSparseBuildFlightFixture(t)
+			ctx := context.Background()
+			request := payloadRequestForBuild(fixture.request)
+			request.GraphID = ""
+			request.OwnerKind = checkoutLayerOwnerKind
+			request.CheckoutID = "publication-window-" + generationKind
+			request.GenerationKind = generationKind
+			request.LayerID = "publication-window-" + generationKind
+			generationID := seedLifecycleListingGeneration(
+				t, fixture.store, request, store_sqlite.ViewGenerationReady,
+			)
+
+			lifecycle := newGenerationRetirementLifecycle(fixture.store, time.Now())
+			if retired := lifecycle.sweepRetirements(ctx); retired != 0 {
+				t.Fatalf("runtime sweep retired %d generation(s), want publication candidate deferred", retired)
+			}
+			if _, found, err := fixture.store.Catalog().GetViewGeneration(ctx, generationID); err != nil {
+				t.Fatal(err)
+			} else if !found {
+				t.Fatalf("runtime sweep collected ready publication candidate %d", generationID)
+			}
+
+			if retired := lifecycle.sweepStartupRetirements(ctx); retired != 1 {
+				t.Fatalf("startup sweep retired %d generation(s), want 1 prior-process orphan", retired)
+			}
+			if _, found, err := fixture.store.Catalog().GetViewGeneration(ctx, generationID); err != nil {
+				t.Fatal(err)
+			} else if found {
+				t.Fatalf("startup sweep retained prior-process ready orphan %d", generationID)
+			}
+		})
+	}
 }
 
 func TestCheckoutLifecycleRetirementPreservesRouteRefBaseAndLease(t *testing.T) {
@@ -421,7 +458,7 @@ func BenchmarkCheckoutLifecycleRetirementPagination(b *testing.B) {
 			b.ResetTimer()
 			var candidates int
 			for i := 0; i < b.N; i++ {
-				candidates = len(lifecycle.orphanedGenerations(context.Background(), served, nil))
+				candidates = len(lifecycle.orphanedGenerations(context.Background(), served, nil, true))
 			}
 			b.ReportMetric(float64(candidates), "candidates/op")
 			b.ReportMetric(float64(listingQueries), "queries/op")
@@ -449,10 +486,33 @@ func BenchmarkCheckoutLifecycleReadyLayerRouteBatching(b *testing.B) {
 			b.ResetTimer()
 			var candidates int
 			for i := 0; i < b.N; i++ {
-				candidates = len(lifecycle.orphanedGenerations(context.Background(), nil, nil))
+				candidates = len(lifecycle.orphanedGenerations(context.Background(), nil, nil, true))
 			}
 			b.ReportMetric(float64(candidates), "candidates/op")
 			b.ReportMetric(float64(routeBatches), "route_batches/op")
 		})
 	}
+}
+
+func BenchmarkCheckoutLifecycleRuntimeRetirementScanWith10000Ready(b *testing.B) {
+	fixture := newSparseBuildFlightFixture(b)
+	request := payloadRequestForBuild(fixture.request)
+	request.GraphID = ""
+	request.OwnerKind = checkoutLayerOwnerKind
+	request.GenerationKind = CommitLayerGenerationKind
+	for i := 0; i < 10_000; i++ {
+		request.CheckoutID = fmt.Sprintf("runtime-ready-checkout-%05d", i)
+		request.LayerID = fmt.Sprintf("runtime-ready-layer-%05d", i)
+		seedLifecycleListingGeneration(b, fixture.store, request, store_sqlite.ViewGenerationReady)
+	}
+
+	lifecycle := newGenerationRetirementLifecycle(fixture.store, time.Now())
+	b.ReportAllocs()
+	b.ResetTimer()
+	var candidates int
+	for i := 0; i < b.N; i++ {
+		candidates = len(lifecycle.orphanedGenerations(context.Background(), nil, nil, false))
+	}
+	b.ReportMetric(float64(candidates), "candidates/op")
+	b.ReportMetric(4, "queries/op")
 }

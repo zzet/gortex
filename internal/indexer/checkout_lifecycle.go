@@ -3267,6 +3267,18 @@ func (l *CheckoutLifecycle) logTopologyFenceRetirementFailure(kind, id string, e
 // refused while the route still names them and collectable the moment the
 // teardown removes it.
 func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
+	return l.sweepRetirementsMode(ctx, false)
+}
+
+// sweepStartupRetirements additionally discovers unqueued ready checkout
+// layers left by an earlier process. It is only valid during Seed, before this
+// lifecycle admits coordinator builds; runtime publication can temporarily
+// have a ready generation that is not routed or pinned yet.
+func (l *CheckoutLifecycle) sweepStartupRetirements(ctx context.Context) int {
+	return l.sweepRetirementsMode(ctx, true)
+}
+
+func (l *CheckoutLifecycle) sweepRetirementsMode(ctx context.Context, scanReadyOrphans bool) int {
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
 	served := make(map[string]struct{}, len(l.coordinators))
@@ -3304,7 +3316,7 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 	if l.store == nil {
 		return retired
 	}
-	owed = append(owed, l.orphanedGenerations(ctx, served, owed)...)
+	owed = append(owed, l.orphanedGenerations(ctx, served, owed, scanReadyOrphans)...)
 	owed = append(owed, l.queuedCheckoutCommitCacheRetirements(ctx)...)
 	if l.catalog != nil {
 		pinned, err := l.catalog.CheckoutCommitCachePinnedGenerations(ctx, owed)
@@ -3398,15 +3410,22 @@ func (l *CheckoutLifecycle) queuedCheckoutCommitCacheRetirements(ctx context.Con
 // the next sweep.
 //
 // Two rules keep it off work that is not its own. A checkout with a live
-// coordinator owns everything built for it — backlog, reuse cache and both
-// route slots — so its generations are skipped entirely; and a ready checkout
-// layer is a candidate only once its checkout's route has stopped naming it.
-// Every individual listing is capped; exclusive cursors continue until each
-// cohort is exhausted. Routes are still read at most once per distinct checkout.
+// coordinator owns everything built for it while publication may still be in
+// flight, so its generations are skipped by the generic catalog scan; explicit
+// retirement handoffs (including the durable commit-cache retirement queue)
+// remain eligible through known. Ready checkout layers are otherwise scanned
+// only during Seed, before this process admits coordinator builds, and are
+// candidates only once their checkout's route has stopped naming it.
+// Runtime sweeps never infer ownership from a momentary route gap: temporary
+// transition coordinators are not in the live registry, and even a registered
+// coordinator may publish after the sweep captured that registry. Every
+// individual listing is capped; exclusive cursors continue until each cohort
+// is exhausted. Routes are still read at most once per distinct checkout.
 func (l *CheckoutLifecycle) orphanedGenerations(
 	ctx context.Context,
 	served map[string]struct{},
 	known []int64,
+	scanReadyOrphans bool,
 ) []int64 {
 	if l.catalog == nil {
 		return nil
@@ -3522,8 +3541,12 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 		beforeGenerationID = rows[len(rows)-1].GenerationID
 	}
 
-	// Ready checkout layers are the other half: a coordinator that stopped
-	// without draining leaves its commit cache published and unreferenced, and
+	if !scanReadyOrphans {
+		return out
+	}
+
+	// Ready checkout layers are the other half: a prior process whose
+	// coordinator stopped without draining leaves its commit cache published and unreferenced, and
 	// only the route can say whether a layer is still the one being served.
 	// Cursor through every page so newer routed or served layers cannot hide an
 	// older orphan behind the catalog listing bound.
@@ -3644,7 +3667,7 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 		return nil
 	}
 	if l.rec == nil {
-		l.sweepRetirements(ctx)
+		l.sweepStartupRetirements(ctx)
 		return nil
 	}
 	var errs []error
@@ -3656,10 +3679,17 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	if err := l.rec.Resume(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	cachePinsReady := true
+	if err := l.catalog.BackfillRoutedCheckoutCommitCachePins(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("backfill routed checkout commit cache: %w", err))
+		cachePinsReady = false
+	}
 	// A crash can leave a populated generation in building state before any
 	// cleanup journal exists. Drain prior-process residue during boot instead
 	// of leaving it for the hourly janitor.
-	l.sweepRetirements(ctx)
+	if cachePinsReady {
+		l.sweepStartupRetirements(ctx)
+	}
 	// A root move is catalog-authoritative before configuration is durable.
 	// Repair that address first; if the save fails, the returned stale roots
 	// make the registration pass fail closed instead of seeding a phantom

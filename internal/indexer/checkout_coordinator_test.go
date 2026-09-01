@@ -454,6 +454,58 @@ func TestCoordinatorSignalDuringACycleSchedulesTheNextOne(t *testing.T) {
 
 // --- the branch-switch cache --------------------------------------------
 
+func TestRuntimeRetirementCannotCollectUnregisteredTransitionPublication(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	coordinator := f.coordinator(t, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+	base, err := coordinator.primaryBase(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := newGenerationRetirementLifecycle(f.store, time.Now())
+
+	cycle, err := coordinator.preparePromotion(
+		ctx,
+		base,
+		f.treeA,
+		func(
+			ctx context.Context,
+			route store_sqlite.CheckoutRoute,
+			routed bool,
+			_ string,
+			commitGeneration, dirtyGeneration int64,
+		) error {
+			// This coordinator intentionally is not registered in lifecycle.
+			// Both generations are ready and off-route here: the exact window a
+			// periodic generic READY scan used to collect from under promotion.
+			if retired := lifecycle.sweepRetirements(ctx); retired != 0 {
+				t.Fatalf("runtime sweep retired %d transition generation(s)", retired)
+			}
+			for _, generationID := range []int64{commitGeneration, dirtyGeneration} {
+				if _, found, readErr := f.catalog.GetViewGeneration(ctx, generationID); readErr != nil {
+					return readErr
+				} else if !found {
+					t.Fatalf("runtime sweep collected transition generation %d", generationID)
+				}
+			}
+			return coordinator.installStack(
+				ctx, route, routed, base, commitGeneration, dirtyGeneration,
+			)
+		},
+	)
+	if err != nil {
+		t.Fatalf("publish transition stack after runtime sweep: %v", err)
+	}
+	route, found, err := f.catalog.GetCheckoutRoute(ctx, f.checkoutID)
+	if err != nil || !found {
+		t.Fatalf("read published transition route: found=%v err=%v", found, err)
+	}
+	if route.CommitGenerationID != cycle.CommitGenerationID ||
+		route.DirtyGenerationID != cycle.DirtyGenerationID {
+		t.Fatalf("published route=%+v, cycle=%+v", route, cycle)
+	}
+}
+
 // TestCoordinatorReusesACommitLayerOnTheWayBack is the cache assertion.
 //
 // A -> B -> A. The switch back must route the generation the first cycle built
@@ -2244,20 +2296,28 @@ func TestSweepCollectsCrashOrphanedGenerations(t *testing.T) {
 		t.Fatalf("seed the stranded commit layer: %v", err)
 	}
 
-	report, err := newSweepLifecycle(t, f.store).Sweep(ctx)
+	lifecycle := newSweepLifecycle(t, f.store)
+	report, err := lifecycle.Sweep(ctx)
 	if err != nil {
-		t.Fatalf("sweep: %v", err)
+		t.Fatalf("runtime sweep: %v", err)
 	}
-	if report.Retired != 2 {
-		t.Fatalf("the sweep collected %d generations, want the two the crash orphaned", report.Retired)
+	if report.Retired != 1 {
+		t.Fatalf("runtime sweep collected %d generations, want only the explicitly discarded one", report.Retired)
 	}
-	for name, generationID := range map[string]int64{
-		"superseded": superseded,
-		"stranded":   orphan,
-	} {
-		if _, found, err := f.catalog.GetViewGeneration(ctx, generationID); err != nil || found {
-			t.Fatalf("the %s generation %d survived the sweep (err=%v)", name, generationID, err)
-		}
+	if _, found, err := f.catalog.GetViewGeneration(ctx, superseded); err != nil || found {
+		t.Fatalf("the superseded generation %d survived runtime sweep (err=%v)", superseded, err)
+	}
+	if _, found, err := f.catalog.GetViewGeneration(ctx, orphan); err != nil || !found {
+		t.Fatalf("runtime sweep collected the READY publication candidate %d (err=%v)", orphan, err)
+	}
+
+	// Generic READY orphan inference is recovery work and is safe only during
+	// Seed, before a live process admits a build-to-publication window.
+	if retired := lifecycle.sweepStartupRetirements(ctx); retired != 1 {
+		t.Fatalf("startup sweep collected %d generations, want the stranded READY generation", retired)
+	}
+	if _, found, err := f.catalog.GetViewGeneration(ctx, orphan); err != nil || found {
+		t.Fatalf("the stranded generation %d survived startup recovery (err=%v)", orphan, err)
 	}
 	for name, generationID := range map[string]int64{
 		"commit": routed.CommitGenerationID,
