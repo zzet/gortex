@@ -154,13 +154,11 @@ func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.A
 	for _, s := range skills {
 		rendered[s.ID] = renderSkill(s)
 	}
-	// KnownHashes stays unset: this pack has only ever shipped one
-	// rendering, so the byte compare against `rendered` is the complete
-	// definition of "still ours".
 	return skillpack.Sync(w, skillpack.SyncSpec{
-		Dir:      root,
-		FileName: skillFileName,
-		Rendered: rendered,
+		Dir:         root,
+		FileName:    skillFileName,
+		Rendered:    rendered,
+		KnownHashes: skillpack.PreWorktreeAgentSkillHashes(),
 	}, allowed, opts)
 }
 

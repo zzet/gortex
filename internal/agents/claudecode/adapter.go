@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/skillpack"
 	"github.com/zzet/gortex/internal/profiles"
 )
 
@@ -685,48 +686,14 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 // Also used by `gortex instructions switch` to re-shape the installed
 // skill surface when the active profile changes.
 func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
-	var allowedSet map[string]bool
-	if allowed != nil {
-		allowedSet = make(map[string]bool, len(allowed))
-		for _, name := range allowed {
-			allowedSet[name] = true
-		}
-	}
-	out := make([]agents.FileAction, 0, len(GlobalSkills))
 	skillsDir := filepath.Join(userClaudeConfigDir(home), "skills")
-	for name, content := range GlobalSkills {
-		dir := filepath.Join(skillsDir, name)
-		path := filepath.Join(dir, "SKILL.md")
-		if allowedSet != nil && !allowedSet[name] {
-			existing, err := os.ReadFile(path)
-			if err != nil {
-				// Not installed (or unreadable): nothing to prune.
-				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "outside-profile"})
-				continue
-			}
-			if !isShippedAgentArtifact(existing, content, v060GlobalSkillHashes[name]) {
-				logWarn(w, "keeping customised skill %s (outside the active profile)", path)
-				out = append(out, agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "customised"})
-				continue
-			}
-			if opts.DryRun {
-				out = append(out, agents.FileAction{Path: path, Action: agents.ActionWouldDelete, Keys: []string{"skill"}})
-				continue
-			}
-			if err := os.RemoveAll(dir); err != nil {
-				return out, err
-			}
-			logf(w, "[gortex] removed skill %s (outside the active profile)", path)
-			out = append(out, agents.FileAction{Path: path, Action: agents.ActionDelete, Keys: []string{"skill"}})
-			continue
-		}
-		action, err := writeAgentArtifact(w, path, content, v060GlobalSkillHashes[name], opts)
-		if err != nil {
-			return out, err
-		}
-		out = append(out, action)
+	known := make(map[string][]string, len(GlobalSkills))
+	preWorktree := skillpack.PreWorktreeClaudeSkillHashes()
+	for name := range GlobalSkills {
+		known[name] = append(known[name], v060GlobalSkillHashes[name])
+		known[name] = append(known[name], preWorktree[name]...)
 	}
-	return out, nil
+	return skillpack.Sync(w, skillpack.SyncSpec{Dir: skillsDir, Rendered: GlobalSkills, KnownHashes: known}, allowed, opts)
 }
 
 // installGlobalSlashCommands writes ~/.claude/commands/gortex-*.md

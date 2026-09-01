@@ -39,8 +39,9 @@ func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpt
 		return nil, nil
 	}
 	return skillpack.Sync(w, skillpack.SyncSpec{
-		Dir:      root,
-		Rendered: RoutingSkills(),
-		DirFor:   func(id string) string { return filepath.Dir(skillPath(home, id)) },
+		Dir:         root,
+		Rendered:    RoutingSkills(),
+		KnownHashes: skillpack.PreWorktreeHermesSkillHashes(),
+		DirFor:      func(id string) string { return filepath.Dir(skillPath(home, id)) },
 	}, allowed, opts)
 }
