@@ -551,16 +551,36 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	// the local executor's nested-arguments unmarshal path (see
 	// cmd/gortex/server_router.go newLocalToolExecutor) finds them.
 	// This matches cmd/gortex/daemon_mcp.go:tryProxyToolCall exactly.
+	// A missing `arguments` key AND an explicit JSON `null` both mean
+	// "no arguments" at the MCP layer (params.arguments is optional);
+	// normalize both to `{}` so the executor's "arguments must be an
+	// object when present" check (added for reviewer concern #2) never
+	// rejects a legitimate no-arg call.
 	rawArgs := envelope.Params.Arguments
-	if len(rawArgs) == 0 {
+	if len(rawArgs) == 0 || strings.TrimSpace(string(rawArgs)) == "null" {
 		rawArgs = json.RawMessage(`{}`)
 	}
 	body, err := json.Marshal(map[string]json.RawMessage{"arguments": rawArgs})
 	if err != nil {
 		return nil, 0, false
 	}
+	// Attach the session id AND cwd to ctx before the routing decision —
+	// the local-fast path (Decide -> RouteToolCall -> callLocal ->
+	// newLocalToolExecutor) threads this ctx straight into the
+	// session-policy gate and the handler itself. Session id alone
+	// isn't enough: localDispatch below (and the daemon dispatcher's
+	// tryProxyToolCall) also attach WithSessionCWD, because handlers
+	// use it as a workspace boundary — without it, a session in
+	// workspace A could see workspace B's nodes on this routed path.
+	ctx := r.Context()
+	if state.ID != "" {
+		ctx = gortexmcp.WithSessionID(ctx, state.ID)
+	}
+	if cwd != "" {
+		ctx = gortexmcp.WithSessionCWD(ctx, cwd)
+	}
 	decision := daemon.NewProxyDecision(func() *daemon.Router { return t.router })
-	outcome := decision.Decide(r.Context(), daemon.RouteInputs{
+	outcome := decision.Decide(ctx, daemon.RouteInputs{
 		ToolName: envelope.Params.Name,
 		Body:     body,
 		Cwd:      cwd,

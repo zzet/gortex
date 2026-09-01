@@ -158,6 +158,50 @@ type CrossRepoResolver struct {
 	edgesEnabled bool
 	prober       RemoteDeclarationProber
 	proxyBudget  int
+
+	// retargetedTestCallFiles mirrors Resolver.retargetedTestCallFiles for
+	// the cross-repository pass: caller files of test-classified calls this
+	// pass bound, drained via TakeRetargetedTestCallFiles so the indexer
+	// can reconcile their tests projections.
+	retargetedMu            sync.Mutex
+	retargetedTestCallFiles map[string]struct{}
+}
+
+// noteRetargetedCall mirrors Resolver.noteRetargetedCall for the
+// cross-repository pass.
+func (cr *CrossRepoResolver) noteRetargetedCall(e *graph.Edge) {
+	if e == nil || e.Kind != graph.EdgeCalls || e.FilePath == "" {
+		return
+	}
+	if graph.IsUnresolvedTarget(e.To) {
+		return
+	}
+	if !isTestFilePath(e.FilePath) && !nodeStampedTest(cr.cachedGetNode(e.From)) {
+		return
+	}
+	cr.retargetedMu.Lock()
+	if cr.retargetedTestCallFiles == nil {
+		cr.retargetedTestCallFiles = make(map[string]struct{})
+	}
+	cr.retargetedTestCallFiles[e.FilePath] = struct{}{}
+	cr.retargetedMu.Unlock()
+}
+
+// TakeRetargetedTestCallFiles drains the accumulated test-caller frontier,
+// sorted for determinism.
+func (cr *CrossRepoResolver) TakeRetargetedTestCallFiles() []string {
+	cr.retargetedMu.Lock()
+	defer cr.retargetedMu.Unlock()
+	if len(cr.retargetedTestCallFiles) == 0 {
+		return nil
+	}
+	files := make([]string, 0, len(cr.retargetedTestCallFiles))
+	for file := range cr.retargetedTestCallFiles {
+		files = append(files, file)
+	}
+	cr.retargetedTestCallFiles = nil
+	sort.Strings(files)
+	return files
 }
 
 // NewCrossRepo creates a CrossRepoResolver for the given graph.
@@ -1043,6 +1087,12 @@ func (cr *CrossRepoResolver) cachedFindNodesByQualName(qualName string) []*graph
 
 func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
 	oldTo := e.To
+	// Shared with the master resolver: a derived tests clone is never
+	// bound independently on any path (see resolutionExempt).
+	if resolutionExempt(e) {
+		stats.Unresolved++
+		return
+	}
 	// UnresolvedName handles BOTH the bare `unresolved::X` and the
 	// multi-repo `<repo>::unresolved::X` forms; a plain TrimPrefix only
 	// strips the bare form, leaving prefixed stubs (which fix-1's widened
@@ -1082,6 +1132,7 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 
 	if e.To != oldTo {
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+		cr.noteRetargetedCall(e)
 	}
 }
 

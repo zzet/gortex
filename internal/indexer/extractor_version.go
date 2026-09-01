@@ -40,7 +40,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 13,                                     // EF Core ORM facts: [Table] models_table edges, ef_config_* and ef_fluent stamps (was: receiverless calls carry arg_count / type_arg_count for #559)
+	"csharp": 19,                                     // verbatim-identifier canonicalization unified across type refs, the base-list prescan, and partial identity (was: accessor bodies, property/field initializers, and the typed value parameter own their calls)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges

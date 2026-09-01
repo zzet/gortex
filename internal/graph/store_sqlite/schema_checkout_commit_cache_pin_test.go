@@ -21,12 +21,12 @@ func downgradeCheckoutCommitCacheFixture(t testing.TB, path string) {
 	if _, err := db.Exec(`
 DROP TABLE checkout_commit_cache_pins;
 DROP TABLE checkout_commit_cache_retirements;
-PRAGMA user_version = 20`); err != nil {
+PRAGMA user_version = 21`); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestSchemaV21CheckoutCommitCachePinsMigrateInPlaceAndBackfill(t *testing.T) {
+func TestSchemaV22CheckoutCommitCachePinsMigrateInPlaceAndBackfill(t *testing.T) {
 	ctx := context.Background()
 	freshPath := filepath.Join(t.TempDir(), "fresh.sqlite")
 	fresh, err := Open(freshPath)
@@ -98,12 +98,14 @@ func TestSchemaV21CheckoutCommitCachePinsMigrateInPlaceAndBackfill(t *testing.T)
 	if migrated.NodeCount() != 1 {
 		t.Fatalf("node count after additive migration=%d, want sentinel preserved", migrated.NodeCount())
 	}
-	if version, err := readUserVersion(migrated.writerDB); err != nil || version != 21 {
-		t.Fatalf("user_version after migration=%d err=%v, want 21", version, err)
+	if version, err := readUserVersion(migrated.writerDB); err != nil || version != currentSchemaVersion {
+		t.Fatalf("user_version after migration=%d err=%v, want %d", version, err, currentSchemaVersion)
 	}
-	if len(events) != 2 || events[0].Version != 21 || events[0].Phase != MigrationStarted ||
-		events[1].Version != 21 || events[1].Phase != MigrationFinished {
-		t.Fatalf("v21 migration events=%+v, want started/finished only", events)
+	if len(events) != 4 || events[0].Version != 22 || events[0].Phase != MigrationStarted ||
+		events[1].Version != 22 || events[1].Phase != MigrationFinished ||
+		events[2].Version != 23 || events[2].Phase != MigrationStarted ||
+		events[3].Version != 23 || events[3].Phase != MigrationFinished {
+		t.Fatalf("v22-v23 migration events=%+v, want ordered started/finished pairs", events)
 	}
 	if got := sqliteSchemaObject(t, migrated.writerDB, "table", "checkout_commit_cache_pins"); got != freshTable {
 		t.Fatalf("fresh/migrated pin table differ:\nfresh: %s\nmigrated: %s", freshTable, got)

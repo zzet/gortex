@@ -26,9 +26,15 @@ type MutationReceipt struct {
 	// ChangedFiles contains exact source files for added edges. Resolved edges
 	// belong here so cross-repository materialization still observes them, but
 	// they must not trigger another same-repository unresolved-edge pass.
-	ChangedFiles     []string `json:"changed_files,omitempty"`
-	UnresolvedFiles  []string `json:"unresolved_files,omitempty"`
-	DefinitionFiles  []string `json:"definition_files,omitempty"`
+	ChangedFiles    []string `json:"changed_files,omitempty"`
+	UnresolvedFiles []string `json:"unresolved_files,omitempty"`
+	DefinitionFiles []string `json:"definition_files,omitempty"`
+	// TargetNames is descriptive only: it records the Name/QualName of every
+	// added node for observability, and nothing in resolution consumes it —
+	// the name frontier reads EvictedNames, the file frontier reads
+	// DefinitionFiles. The backends deliberately diverge on its contents (the
+	// graph accumulator records non-referenceable added-node names, SQLite
+	// does not); keep that divergence out of any correctness contract.
 	TargetNames      []string `json:"target_names,omitempty"`
 	TargetIDs        []string `json:"target_ids,omitempty"`
 	ImportCandidates []string `json:"import_candidates,omitempty"`

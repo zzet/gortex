@@ -215,7 +215,7 @@ func emitCSharpMemberAccesses(accesses []csharpDeferredAccess, src []byte,
 		if a.node == nil || csharpAccessInCallPosition(a.node) {
 			continue
 		}
-		callerID := funcRanges.enclosing(a.line)
+		callerID := funcRanges.enclosingAt(a.line, int(a.node.StartByte()))
 		if callerID == "" {
 			continue
 		}

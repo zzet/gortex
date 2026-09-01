@@ -4072,6 +4072,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Int("edges", emitted),
 				)
 			}
+			// The graph-wide projection above already covers every test
+			// caller ResolveAll noted on the retarget frontier; discard it
+			// so the first warm save does not re-project the whole test
+			// corpus under ResolveMutex for nothing.
+			idx.resolver.TakeRetargetedTestCallFiles()
 			if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
 				idx.logger.Info("entry-point hierarchy stamped", zap.Int("stamped", ctrl))
 			}

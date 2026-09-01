@@ -58,6 +58,54 @@ func writeTestFile(t *testing.T, path, content string) {
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 }
 
+// TestWatcher_ShippedDefaultStillWatches drives config.Default().Watch —
+// Enabled: false, exactly what every repo under `gortex daemon` gets with
+// no override — through Start() and asserts a file change still reaches
+// the graph. Every other watcher test in this package hardcodes
+// Enabled: true, so none of them exercise the daemon's actual default;
+// that gap once let Enabled: false silently disable fsnotify itself
+// (not just the adaptive poller) without any test catching it.
+func TestWatcher_ShippedDefaultStillWatches(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "main.go"), `package main
+
+func Original() {}
+`)
+
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	cfg := config.Default()
+	cfg.Index.Workers = 1
+
+	idx := New(g, reg, cfg.Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	wcfg := cfg.Watch
+	require.False(t, wcfg.Enabled, "config.Default().Watch must ship Enabled: false")
+	wcfg.Paths = []string{dir}
+	wcfg.DebounceMs = 50 // short debounce for tests
+
+	w, err := NewWatcher(idx, wcfg, zap.NewNop())
+	require.NoError(t, err)
+	require.NoError(t, w.Start([]string{dir}))
+	t.Cleanup(func() { _ = w.Stop() })
+
+	assert.Nil(t, w.poller,
+		"the shipped default disables the adaptive poller only, not fsnotify")
+
+	writeTestFile(t, filepath.Join(dir, "main.go"), `package main
+
+func Modified() {}
+`)
+
+	ev := waitForEvent(t, w, 2*time.Second)
+	assert.Equal(t, ChangeModified, ev.Kind)
+	assert.NotEmpty(t, idx.graph.FindNodesByName("Modified"),
+		"a file change under the shipped watch default must reach the graph via fsnotify")
+}
+
 func waitForEvent(t *testing.T, w *Watcher, timeout time.Duration) GraphChangeEvent {
 	t.Helper()
 	select {

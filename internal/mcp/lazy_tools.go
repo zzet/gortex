@@ -341,14 +341,20 @@ func (r *lazyToolRegistry) QueryWithTotal(query string, max int) ([]*deferredToo
 }
 
 // Promote registers each named tool with the live MCP server and
-// marks it promoted so future Query calls skip it. Idempotent.
-// Returns the slice of names that actually transitioned to promoted
-// state.
+// marks it promoted so future Query calls skip it. Idempotent and
+// atomic: the promoted mark and the live AddTool happen under the
+// same lock, so a concurrent caller can never observe a tool marked
+// promoted but not yet registered — it either sees the tool already
+// live (GetTool succeeds) or transitions it itself. Returns the slice
+// of names that actually transitioned to promoted state in THIS call;
+// callers must treat a false return as "already promoted or absent"
+// and re-check GetTool rather than concluding the tool is missing.
 func (r *lazyToolRegistry) Promote(names ...string) []string {
 	if r == nil {
 		return nil
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	var newly []*deferredTool
 	var promotedNames []string
 	for _, name := range names {
@@ -363,12 +369,9 @@ func (r *lazyToolRegistry) Promote(names ...string) []string {
 		newly = append(newly, dt)
 		promotedNames = append(promotedNames, name)
 	}
-	promoteFn := r.promote
-	r.mu.Unlock()
-
-	if promoteFn != nil {
+	if r.promote != nil {
 		for _, dt := range newly {
-			promoteFn(dt)
+			r.promote(dt)
 		}
 	}
 	return promotedNames

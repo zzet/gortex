@@ -220,7 +220,11 @@ func canonicalizeCSharpTypeRef(t string) string {
 	if idx := strings.LastIndex(t, "."); idx >= 0 {
 		t = t[idx+1:]
 	}
-	return strings.TrimSpace(t)
+	// Same canonical identifier domain the DECLARATION side mints its
+	// node IDs in: `@event` is the only legal spelling of a
+	// keyword-named type, so a reference must reduce to the identifier
+	// the declaration registered or it can never bind.
+	return csharpCanonBaseIdent(strings.TrimSpace(t))
 }
 
 func isCSharpPrimitive(t string) bool {

@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 21
+const currentSchemaVersion = 23
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -114,19 +114,24 @@ var schemaMigrations = []schemaMigration{
 	// table gains a generation key.
 	{version: 13, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
 	// Feature-lineage v13 stores already have the catalog, while main-lineage
-	// v13 stores have neither it nor edges.view_gen. Both operations are
-	// idempotent, so one v14 step safely converges both histories.
-	{version: 14, name: "add checkout catalog and edges view generation", inPlace: addCheckoutCatalogAndEdgeViewGeneration},
-	{version: 15, name: "key payload sidecars by view generation", inPlace: addSidecarViewGenerationKeys},
-	{version: 16, name: "key nodes and edges by view generation", inPlace: keyGraphCoreByViewGeneration},
-	{version: 17, name: "add sparse view-generation enumeration indexes", inPlace: addGenerationEnumerationIndexes},
-	{version: 18, name: "add sparse generation ownership masks", inPlace: createGenerationMaskTables},
+	// v13 stores have neither it nor edges.view_gen. Main already shipped v14,
+	// so the feature lineage begins at v15 and every step remains idempotent for
+	// stores that were stamped with the feature's former v14-v21 numbering.
+	{version: 14, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
+	{version: 15, name: "add checkout catalog and edges view generation", inPlace: addCheckoutCatalogAndEdgeViewGeneration},
+	{version: 16, name: "key payload sidecars by view generation", inPlace: addSidecarViewGenerationKeys},
+	{version: 17, name: "key nodes and edges by view generation", inPlace: keyGraphCoreByViewGeneration},
+	{version: 18, name: "add sparse view-generation enumeration indexes", inPlace: addGenerationEnumerationIndexes},
+	{version: 19, name: "add sparse generation ownership masks", inPlace: createGenerationMaskTables},
 	// Feature-lineage stores reached v18 without main's v13 coverage purge.
 	// Replay it after the generation re-key; the purge dispatches on schema
 	// shape and isolates every decision and delete by view_gen.
-	{version: 19, name: "replay generation-scoped legacy coverage purge", inPlace: purgeLegacyCoverageSpellings},
-	{version: 20, name: "add checkout root move recovery journal", inPlace: createCheckoutRootMoveJournal},
-	{version: 21, name: "add durable checkout commit cache pins", inPlace: createCheckoutCommitCachePins},
+	{version: 20, name: "replay generation-scoped legacy coverage purge", inPlace: purgeLegacyCoverageSpellings},
+	{version: 21, name: "add checkout root move recovery journal", inPlace: createCheckoutRootMoveJournal},
+	{version: 22, name: "add durable checkout commit cache pins", inPlace: createCheckoutCommitCachePins},
+	// Feature-lineage stores may already be stamped through v21 and therefore
+	// cannot observe main's v14 purge. Replay it idempotently at the tip.
+	{version: 23, name: "replay unresolved derived tests edges purge", inPlace: purgeUnresolvedTestsEdges},
 }
 
 func createCheckoutRootMoveJournal(tx *sql.Tx) error {
@@ -488,6 +493,22 @@ func addCheckoutCatalogAndEdgeViewGeneration(tx *sql.Tx) error {
 		return err
 	}
 	return addEdgeViewGenerationColumn(tx)
+}
+
+// purgeUnresolvedTestsEdges removes derived EdgeTests rows whose target is
+// an unresolved stub, in both spellings (`unresolved::X` and the multi-repo
+// `<repo>::unresolved::X` COPY-rewrite form). The test-linkage pass cloned
+// them from unresolved calls before the emission guard existed; stripped of
+// the call's receiver evidence they are naked stubs the resolver now
+// refuses to bind, new emission never re-creates them, and warm startup may
+// skip file-scoped reconciliation entirely — so an old store keeps paying
+// their resolver-scan cost forever without this explicit purge. Idempotent
+// and bounded to the tests kind: pending calls and resolved projections are
+// untouched.
+func purgeUnresolvedTestsEdges(tx *sql.Tx) error {
+	_, err := tx.Exec(`DELETE FROM edges WHERE kind = 'tests'
+		AND (to_id LIKE 'unresolved::%' OR to_id LIKE '%::unresolved::%')`)
+	return err
 }
 
 // normalizeDirColumnSeparators rebuilds the two generated dir columns whose

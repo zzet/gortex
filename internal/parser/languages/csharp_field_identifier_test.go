@@ -213,3 +213,47 @@ func TestCSharpExtractor_FieldIdentifierUsesAcrossCtorShapes(t *testing.T) {
 	require.Len(t, prim, 1, "primary-ctor class: method call-receiver read")
 	assert.Equal(t, graph.EdgeReads, prim[0].Kind)
 }
+
+// The shadow refusal must not delete a GENUINE field read because a
+// coinciding binder exists somewhere else in the method. Every body
+// below reads the field `_box` as a call receiver first, then binds a
+// different `_box` in a scope the read never touches - the read edge
+// has to survive. (The pre-existing declared-local shape stays
+// function-wide by design: the emitter's other input buffers carry no
+// byte coordinate, so the local case keeps the conservative answer.)
+func TestCSharpExtractor_FieldReadSurvivesLaterCoincidingBinder(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		binder string
+	}{
+		// Block-scoped binders (declaration patterns, out vars) are NOT
+		// here: their name is in scope for the whole block, so a bare
+		// `_box` before them is CS0841 and refusing it is correct.
+		{"foreach variable", `foreach (var _box in xs) { System.Console.WriteLine(_box); }`},
+		{"expression lambda parameter", `System.Linq.Enumerable.Any(xs, _box => _box > 0);`},
+		{"parenthesized using", `using (var _box = System.IO.File.OpenRead("x")) { }`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := []byte(`namespace App {
+    public class Bag { public void Touch() { } }
+    public class Flow {
+        private readonly Bag _box;
+        public Flow(Bag b) { _box = b; }
+        public void M(int[] xs, System.Collections.Generic.Dictionary<int,int> map) {
+            _box.Touch();
+            ` + tc.binder + `
+        }
+    }
+}
+`)
+			e := NewCSharpExtractor()
+			result, err := e.Extract("F.cs", src)
+			require.NoError(t, err)
+
+			reads := accessEdges(result.Edges, "F.cs::Flow.M", "_box")
+			require.Len(t, reads, 1,
+				"the pre-binder call-receiver read of the field must survive")
+			assert.Equal(t, graph.EdgeReads, reads[0].Kind)
+		})
+	}
+}

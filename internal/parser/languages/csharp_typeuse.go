@@ -61,11 +61,16 @@ import (
 // `local.X` are the same shape — see csharpStaticReceiverEligible, which
 // accepts an uppercase receiver outright and falls back to "is this name
 // bound to a value in this file" for scripts that have no case at all.
-func emitCSharpReferenceForms(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult) {
+func emitCSharpReferenceForms(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, funcBytes, funcLines map[string][2]int) {
 	if root == nil {
 		return
 	}
-	funcRanges := buildFuncRanges(result)
+	// The widened owner set, not the methods-only one: an accessor or
+	// initializer body must attribute its type references to the same
+	// member that owns its calls, or one line of code splits its
+	// evidence between two owners (and the fileID fallback below is for
+	// top-level positions, not for code inside a member).
+	funcRanges := csharpOwnerRanges(result, funcBytes, funcLines)
 
 	// Dedup across the whole file on (owner, type, line, ref_context) so a
 	// type referenced twice in the same role on the same line emits one edge.

@@ -327,6 +327,16 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 		// straight to the legacy handler, which has no target to read — the
 		// caller got a repo-wide ranking that looks like an answer.
 		if !facadeSession && !explicitOperation && !usesFacadeVocabulary(args) {
+			// A bare analyze(kind=…) call with no facade vocabulary still
+			// needs the facade when the kind is an aliased operation
+			// (processes, communities, contracts, …): the facade holds the
+			// captured legacy handler directly, so the call works under the
+			// core/defer surface without promoting the legacy tool into the
+			// live registry. Native dispatcher kinds (hotspots, dead_code,
+			// cycles, …) are not aliased and fall through to the dispatcher.
+			if name == "analyze" && s.facadeAnalyzeKindAliased(ctx, req) {
+				return s.handleFacade(ctx, name, req)
+			}
 			return raw(ctx, req)
 		}
 		if name == "analyze" {
@@ -336,6 +346,25 @@ func (s *Server) wrapLegacyFacade(name string, raw server.ToolHandlerFunc) serve
 		}
 		return s.handleFacade(ctx, name, req)
 	}
+}
+
+// facadeAnalyzeKindAliased reports whether an analyze call's requested kind
+// is a facade-aliased operation — one that routes to a captured legacy tool
+// other than the analyze dispatcher (e.g. processes → get_processes,
+// communities → get_communities). Aliased kinds are reachable through the
+// facade without promoting the legacy tool into the live registry, so a
+// plain analyze(kind=processes) call from a legacy or HTTP session must not
+// fall through to the dispatcher's "unknown analyze kind" error.
+func (s *Server) facadeAnalyzeKindAliased(ctx context.Context, req mcpgo.CallToolRequest) bool {
+	if s == nil || s.facades == nil {
+		return false
+	}
+	operation := requestedAnalyzeKind(req.GetArguments())
+	if operation == "" {
+		return false
+	}
+	spec, ok := s.capabilityOperation("analyze", operation)
+	return ok && spec.Legacy != "analyze"
 }
 
 // decorateLocalizationReadResult makes a reserved localization read carry its
@@ -1112,6 +1141,11 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	forwarded.Params.RawArguments = nil
 	result, err = legacy.handler(ctx, forwarded)
 	if err == nil {
+		// Book the retrieval half of the savings ledger under the LEGACY tool
+		// name, so a facade call and a direct legacy call land in the same
+		// per-tool bucket. Runs before decoration: the baseline is what the
+		// handler actually retrieved, not the riders bolted on afterwards.
+		s.recordRetrievalSavings(ctx, spec.Legacy, result)
 		result = s.decorateFacadeFreshness(ctx, spec.Legacy, forwarded, result)
 	}
 	result = decorateFacadeResultIdentity(result, spec)

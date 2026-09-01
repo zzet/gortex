@@ -37,6 +37,67 @@ func TestCallToolStrict_MissingTool(t *testing.T) {
 	assert.Contains(t, err.Error(), "not registered")
 }
 
+// TestCallToolStrict_AnalyzeAliasedKindRoutesThroughFacade pins the
+// dashboard fix: a deferred legacy tool (get_processes under the core/defer
+// surface) is reachable via the eager `analyze` facade's aliased kind
+// (processes → get_processes). CallToolStrict must dispatch the analyze
+// handler, whose facade wrapper routes the aliased kind to the captured
+// legacy handler — no registry promotion involved.
+func TestCallToolStrict_AnalyzeAliasedKindRoutesThroughFacade(t *testing.T) {
+	g := graph.New()
+	srv := mcpserver.NewMCPServer("gortex-test", "0.0.1-test",
+		mcpserver.WithToolCapabilities(false),
+	)
+	h := NewHandler(srv, g, "0.0.1-test", zap.NewNop())
+
+	// Register an eager `analyze` tool whose handler is the facade
+	// wrapper. The wrapper must route kind=processes to the captured
+	// legacy handler even though the legacy tool is NOT in the live
+	// registry (deferred under core/defer).
+	legacyCalled := false
+	srv.AddTool(
+		mcp.NewTool("analyze", mcp.WithDescription("dispatcher"),
+			mcp.WithString("kind", mcp.Required())),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			kind, _ := req.GetArguments()["kind"].(string)
+			if kind == "processes" {
+				legacyCalled = true
+				return mcp.NewToolResultText(`{"processes":[]}`), nil
+			}
+			return mcp.NewToolResultError("unknown analyze kind: " + kind), nil
+		},
+	)
+
+	text, err := h.CallToolStrict(context.Background(), "analyze", map[string]any{"kind": "processes"})
+	require.NoError(t, err)
+	assert.True(t, legacyCalled, "analyze kind=processes must reach the legacy handler")
+	assert.Contains(t, text, `"processes"`)
+}
+
+// TestCallToolStrict_UnknownKindStillErrors keeps the dispatcher's
+// unknown-kind error for non-aliased kinds — the facade must not swallow
+// them into a silent empty result.
+func TestCallToolStrict_UnknownKindStillErrors(t *testing.T) {
+	g := graph.New()
+	srv := mcpserver.NewMCPServer("gortex-test", "0.0.1-test",
+		mcpserver.WithToolCapabilities(false),
+	)
+	h := NewHandler(srv, g, "0.0.1-test", zap.NewNop())
+
+	srv.AddTool(
+		mcp.NewTool("analyze", mcp.WithDescription("dispatcher"),
+			mcp.WithString("kind", mcp.Required())),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			kind, _ := req.GetArguments()["kind"].(string)
+			return mcp.NewToolResultError("unknown analyze kind: " + kind), nil
+		},
+	)
+
+	_, err := h.CallToolStrict(context.Background(), "analyze", map[string]any{"kind": "bogus_kind"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown analyze kind")
+}
+
 // TestCallToolStrict_ToolErrorResult promotes an MCP IsError=true result to
 // a Go error. This is the contract that handleContracts depends on to surface
 // 5xx instead of pretending the call succeeded with empty content.
@@ -117,8 +178,13 @@ func TestHandleContracts_ToolError_500(t *testing.T) {
 		mcpserver.WithToolCapabilities(false),
 	)
 	srv.AddTool(
-		mcp.NewTool("contracts", mcp.WithDescription("contracts stub")),
-		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		mcp.NewTool("analyze", mcp.WithDescription("dispatcher"),
+			mcp.WithString("kind", mcp.Required())),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			kind, _ := req.GetArguments()["kind"].(string)
+			if kind != "contracts" {
+				return mcp.NewToolResultError("unknown analyze kind: " + kind), nil
+			}
 			return mcp.NewToolResultError(`project not found: "gortex" (available: )`), nil
 		},
 	)
@@ -147,8 +213,13 @@ func TestHandleContracts_Success_200(t *testing.T) {
 		mcpserver.WithToolCapabilities(false),
 	)
 	srv.AddTool(
-		mcp.NewTool("contracts", mcp.WithDescription("contracts stub")),
-		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		mcp.NewTool("analyze", mcp.WithDescription("dispatcher"),
+			mcp.WithString("kind", mcp.Required())),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			kind, _ := req.GetArguments()["kind"].(string)
+			if kind != "contracts" {
+				return mcp.NewToolResultError("unknown analyze kind: " + kind), nil
+			}
 			payload := `{"by_repo":{"alpha":{"contracts":{"http":[{"id":"GET /foo","type":"http","role":"provider","symbol_id":"alpha/x.go::H","file_path":"alpha/x.go","line":10,"repo_prefix":"alpha"}]},"total":1}}}`
 			return mcp.NewToolResultText(payload), nil
 		},

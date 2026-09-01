@@ -521,6 +521,9 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
 	}
+	// Bounded by the calls this pass actually bound; the deferred
+	// fallback lane runs with no global test-edges pass behind it.
+	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 	return nil
 }
 
@@ -545,6 +548,7 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, ed
 		return
 	}
 	cr.ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles)
+	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from

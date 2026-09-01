@@ -595,13 +595,58 @@ type fileIndex struct {
 	// spec doesn't widen.
 	superTypes map[string]*graph.Node
 	funcs      []*graph.Node // function/method nodes, for line containment
+	// stubsByLine indexes the file's calls-edges by call line, snapshotted
+	// before this file's calls phase applies. The extractor attributes a
+	// call to its owner precisely (byte extents where the language has
+	// them), so the stub's From is the ground truth a line-keyed caller
+	// lookup can only approximate — and disagree with, when the owner
+	// is a node kind outside idx.funcs (a C# property owning its
+	// accessor-body calls) or shares its line with another member.
+	// The snapshot stays sound in the paged driver too, where indexes are
+	// rebuilt per phase after earlier pages mutated the graph: applyCall
+	// only touches edges whose From is a node of the applying file, and
+	// the fact spool keys one row per (class, file), so no other file's
+	// apply can have disturbed this file's calls-edges first.
+	stubsByLine map[int][]stubRef
+}
+
+// stubRef is one snapshotted calls-edge under stubsByLine: the owning
+// file node plus the edge's target id at snapshot time (the authored
+// callee name survives there across the unresolved / resolved shapes).
+type stubRef struct {
+	owner *graph.Node
+	to    string
+}
+
+// stubOwnersAt returns the distinct file nodes owning a snapshotted call
+// of the given trailing name at line — the callers the extractor already
+// attributed sites there to.
+func (idx *fileIndex) stubOwnersAt(line int, method string) []*graph.Node {
+	var owners []*graph.Node
+	for _, s := range idx.stubsByLine[line] {
+		if !trailingNameMatches(s.to, method) {
+			continue
+		}
+		seen := false
+		for _, o := range owners {
+			if o.ID == s.owner.ID {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			owners = append(owners, s.owner)
+		}
+	}
+	return owners
 }
 
 func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 	idx := &fileIndex{
-		facts:   facts,
-		imports: make(map[string]string, len(facts.imports)),
-		types:   make(map[string]*graph.Node),
+		facts:       facts,
+		imports:     make(map[string]string, len(facts.imports)),
+		types:       make(map[string]*graph.Node),
+		stubsByLine: make(map[int][]stubRef),
 	}
 	idx.superTypes = idx.types
 	superKinds := a.supertypeKinds()
@@ -626,6 +671,27 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 		}
 		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 			idx.funcs = append(idx.funcs, n)
+		}
+		if n.Kind == graph.KindFile {
+			// Some languages park top-level calls on the file node; it is
+			// never an adoptable caller (and the paged compatibility
+			// branch loads file nodes a kind-filtered store would not).
+			continue
+		}
+		for _, e := range a.outEdges(n.ID) {
+			if e == nil || e.Kind != graph.EdgeCalls || e.Line == 0 {
+				continue
+			}
+			if e.FilePath != "" && e.FilePath != facts.file {
+				continue
+			}
+			if e.Line < n.StartLine || e.Line > n.EndLine {
+				// Framework-dispatch synthesis (Rails callbacks, Laravel
+				// middleware) parks an owner's edge on a line outside the
+				// owner's own span — not site evidence at that line.
+				continue
+			}
+			idx.stubsByLine[e.Line] = append(idx.stubsByLine[e.Line], stubRef{owner: n, to: e.To})
 		}
 	}
 	return idx
@@ -1064,7 +1130,36 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	if target == nil {
 		return
 	}
-	caller := idx.enclosingCallable(cf.line)
+	// The extractor already attributed this site to its owner — adopt
+	// that attribution when a stub of the authored name exists at the
+	// call line, so the engine can never land its resolution on a
+	// different node than extraction chose (a shared line would
+	// otherwise mint a duplicate edge nothing dedupes, From being part
+	// of every edge identity). The line-keyed containment lookup stays
+	// as the fallback for sites the extractor recorded no stub for
+	// (desugared operator calls carry no authored-name stub). On a
+	// multi-owner tie, containment may still break it — but only WITHIN
+	// the tied set: a callable that merely shares the line never
+	// collects a call it did not author (it has no stub to claim, so it
+	// would mint), and when no tied owner contains the line the site is
+	// refused outright.
+	var caller *graph.Node
+	owners := idx.stubOwnersAt(cf.line, cf.method)
+	switch len(owners) {
+	case 0:
+		caller = idx.enclosingCallable(cf.line)
+	case 1:
+		caller = owners[0]
+	default:
+		if enc := idx.enclosingCallable(cf.line); enc != nil {
+			for _, o := range owners {
+				if o.ID == enc.ID {
+					caller = enc
+					break
+				}
+			}
+		}
+	}
 	if caller == nil {
 		return
 	}

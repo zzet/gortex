@@ -356,6 +356,30 @@ func IsReferenceableSymbol(k NodeKind) bool {
 // UnresolvedNameCandidateIDsForName is `import::<path>`.
 const ImportStubNamePrefix = "import::"
 
+// EvictedNodeNeedsResolutionFrontier reports whether evicting a node of this
+// kind can change resolution even though ReceiptNamesForEvictedSymbol offers
+// no stub key for it. Exactly one kind qualifies: a file node is an import
+// candidate - relative imports, Lua requires and Godot res:// paths all bind
+// to one - so removing it can collapse an ambiguity for a pending import
+// elsewhere, while the import specifier it would be parked under is not
+// derivable from the file. Its file still has to reach the definition
+// frontier, because ResolutionRelevant=false is the one verdict that skips
+// the catch-up pass outright.
+//
+// Every other nameless kind really is neutral. Nothing binds by name to an
+// import, param, local or module node, so an eviction that touches only those
+// creates no resolution work.
+//
+// In production the neutral branch is a per-node skip, never a receipt-level
+// verdict: ResolutionRelevant=false is unreachable for a real eviction,
+// because every file reindex evicts its own file node and that node lands in
+// the KindFile branch above. The
+// Test*MutationReceiptEvictFilesNonreferenceableOnlyStaysNeutral pair pins a
+// receipt shape production never produces.
+func EvictedNodeNeedsResolutionFrontier(kind NodeKind) bool {
+	return kind == KindFile
+}
+
 // ReceiptNamesForEvictedSymbol maps one evicted node to the receipt
 // target names under which pending references to it may be parked, and
 // reports whether that mapping is exact. This is the single authority
@@ -387,23 +411,6 @@ const ImportStubNamePrefix = "import::"
 // ambiguity, and it is bounded by the same rule as every other name — a
 // pending stub that could rebind is only reachable by name, never by the
 // file frontier.
-// EvictedNodeNeedsResolutionFrontier reports whether evicting a node of this
-// kind can change resolution even though ReceiptNamesForEvictedSymbol offers
-// no stub key for it. Exactly one kind qualifies: a file node is an import
-// candidate - relative imports, Lua requires and Godot res:// paths all bind
-// to one - so removing it can collapse an ambiguity for a pending import
-// elsewhere, while the import specifier it would be parked under is not
-// derivable from the file. Its file still has to reach the definition
-// frontier, because ResolutionRelevant=false is the one verdict that skips
-// the catch-up pass outright.
-//
-// Every other nameless kind really is neutral. Nothing binds by name to an
-// import, param, local or module node, so an eviction that touches only those
-// creates no resolution work.
-func EvictedNodeNeedsResolutionFrontier(kind NodeKind) bool {
-	return kind == KindFile
-}
-
 func ReceiptNamesForEvictedSymbol(kind NodeKind, name, qualName string) (names []string, exact bool) {
 	switch {
 	case IsReferenceableSymbol(kind):

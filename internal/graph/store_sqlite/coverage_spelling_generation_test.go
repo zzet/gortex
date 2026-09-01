@@ -9,14 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSchemaV13LineagesConvergeAtV14(t *testing.T) {
-	require.Equal(t, 21, currentSchemaVersion)
+func TestSchemaV13LineagesConvergeThroughV23(t *testing.T) {
+	require.Equal(t, 23, currentSchemaVersion)
 	plan := planSchemaMigrationWith(13, currentSchemaVersion, schemaMigrations)
 	var pending []int
 	for _, migration := range plan.inPlace {
 		pending = append(pending, migration.version)
 	}
-	require.Equal(t, []int{14, 15, 16, 17, 18, 19, 20, 21}, pending)
+	require.Equal(t, []int{14, 15, 16, 17, 18, 19, 20, 21, 22, 23}, pending)
 
 	for _, tc := range []struct {
 		name       string

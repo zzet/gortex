@@ -836,6 +836,44 @@ type tokenStats struct {
 	repoPath       string      // forwarded to savings for per-repo aggregation
 	sessionID      string      // rides on persisted events; "" for the shared default
 	clientName     string      // MCP client app (claude-code / cursor / …) from initialize; rides on events
+	// creditedFiles is the set of absolute file paths whose whole-file
+	// baseline this session has already claimed, so a retrieval page can
+	// never bill the same file twice (see savings_retrieval.go). The
+	// counterfactual agent that already opened a file does not pay to open
+	// it again; without this set, N searches over the same hot file would
+	// mint N whole-file baselines. Bounded by maxCreditedFiles: a session
+	// that has been shown that many distinct files has already been credited
+	// for more than any real counterfactual would have read.
+	creditedFiles map[string]struct{}
+}
+
+// maxCreditedFiles bounds the per-session credited-file set. Well above any
+// plausible session's working set, and small enough that the map stays
+// negligible next to the graph the same daemon holds.
+const maxCreditedFiles = 8192
+
+// creditFile claims a file's whole-file baseline for this session. absPath is
+// the RESOLVED absolute path, so a repo-prefixed citation ("repo/util.go") and
+// the bare relative path a direct read used ("util.go") collapse to the same
+// key. Returns true when the caller may count the file, false when this
+// session has already been credited for it (or the set is full).
+func (ts *tokenStats) creditFile(absPath string) bool {
+	if ts == nil || absPath == "" {
+		return false
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.creditedFiles == nil {
+		ts.creditedFiles = make(map[string]struct{})
+	}
+	if _, done := ts.creditedFiles[absPath]; done {
+		return false
+	}
+	if len(ts.creditedFiles) >= maxCreditedFiles {
+		return false
+	}
+	ts.creditedFiles[absPath] = struct{}{}
+	return true
 }
 
 // setClientName records the MCP client app on the session's tokenStats so
@@ -3286,6 +3324,11 @@ func (s *Server) attachLazyRegistry() {
 // without a discovery round-trip. It is a no-op (returns false) when there is
 // no lazy registry or the tool is live, absent, or already promoted; a hidden
 // (hide-mode) tool is never deferred, so this never bypasses the hide gate.
+//
+// The return value reports whether the tool is now live in the registry —
+// promoted by this call OR already promoted by a concurrent caller. It is
+// false only when the name is absent or not deferred. Callers must treat a
+// true return as "re-check GetTool", never as "I transitioned it".
 func (s *Server) EnsureToolPromoted(name string) bool {
 	if s == nil || s.lazy == nil || name == "" {
 		return false
@@ -3293,7 +3336,8 @@ func (s *Server) EnsureToolPromoted(name string) bool {
 	if !s.lazy.IsDeferred(name) {
 		return false
 	}
-	return len(s.lazy.Promote(name)) > 0
+	s.lazy.Promote(name)
+	return s.MCPServer().GetTool(name) != nil
 }
 
 // EnsureToolPromotedForSession is the per-connection promote-on-demand entry

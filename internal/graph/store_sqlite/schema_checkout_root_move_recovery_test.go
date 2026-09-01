@@ -62,12 +62,16 @@ func TestOpenV19CheckoutRootMoveJournalAlreadyPresentIsIdempotent(t *testing.T) 
 		t.Fatalf("first Open of v19 fixture: %v", err)
 	}
 	assertCheckoutRootMoveMigrationFixture(t, migrated, wantMove, wantSchema)
-	if len(firstEvents) != 4 ||
-		firstEvents[0].Version != 20 || firstEvents[0].Phase != MigrationStarted ||
-		firstEvents[1].Version != 20 || firstEvents[1].Phase != MigrationFinished ||
-		firstEvents[2].Version != 21 || firstEvents[2].Phase != MigrationStarted ||
-		firstEvents[3].Version != 21 || firstEvents[3].Phase != MigrationFinished {
-		t.Fatalf("first Open migration events = %+v, want v20 then v21 started/finished", firstEvents)
+	wantVersions := []int{20, 21, 22, 23}
+	if len(firstEvents) != 2*len(wantVersions) {
+		t.Fatalf("first Open migration events = %+v, want v20-v23 started/finished", firstEvents)
+	}
+	for i, version := range wantVersions {
+		started, finished := firstEvents[2*i], firstEvents[2*i+1]
+		if started.Version != version || started.Phase != MigrationStarted ||
+			finished.Version != version || finished.Phase != MigrationFinished {
+			t.Fatalf("first Open migration events = %+v, want v20-v23 started/finished", firstEvents)
+		}
 	}
 	if err := migrated.Close(); err != nil {
 		t.Fatalf("close migrated store: %v", err)

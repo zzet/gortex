@@ -316,6 +316,10 @@ func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []str
 			if edge == nil || edge.Kind != graph.EdgeCalls || isTestTarget(edge.To) {
 				continue
 			}
+			// Unresolved calls never clone — see emitTestEdgesAndPersistLocked.
+			if graph.IsUnresolvedTarget(edge.To) {
+				continue
+			}
 			key := edge.From + "\x00" + edge.To
 			if seenEdges[key] {
 				continue
@@ -704,6 +708,13 @@ func emitTestEdgesAndPersistLocked(g graph.Store, testNodes map[string]bool, cha
 		}
 		if testNodes[to] {
 			return // test → test calls are infrastructure, not subject coverage
+		}
+		// An unresolved call clones into a tests edge that can never say
+		// what is tested — and, stripped of the call's receiver evidence,
+		// it is a naked stub a later resolve pass would bind without the
+		// guards that protect the calls edge. Only resolved subjects link.
+		if graph.IsUnresolvedTarget(to) {
+			return
 		}
 		key := graph.EdgeEndpoint{From: from, To: to}
 		if _, duplicate := seen[key]; duplicate {

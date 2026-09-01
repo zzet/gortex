@@ -72,6 +72,48 @@ func (idx *Indexer) runStandaloneIncrementalDerivedPasses(plan DerivedInvalidati
 	})
 }
 
+// drainRetargetedTestCallFiles collects, from each named repo's resolver,
+// the caller files of test-classified calls the resolution step just bound
+// (see resolver.Resolver.TakeRetargetedTestCallFiles). Destructive: the
+// per-resolver frontier is cleared.
+func (mi *MultiIndexer) drainRetargetedTestCallFiles(prefixSet map[string]struct{}) []string {
+	mi.mu.RLock()
+	resolvers := make([]*resolver.Resolver, 0, len(prefixSet))
+	for prefix := range prefixSet {
+		if idx := mi.indexers[prefix]; idx != nil && idx.resolver != nil {
+			resolvers = append(resolvers, idx.resolver)
+		}
+	}
+	mi.mu.RUnlock()
+	var files []string
+	for _, r := range resolvers {
+		files = append(files, r.TakeRetargetedTestCallFiles()...)
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	return appendUniqueSorted(nil, files...)
+}
+
+// discardRetargetedTestCallFiles drops the per-repo retarget frontiers a
+// graph-wide (or repo-scoped) test projection has just superseded. A nil
+// prefix set discards every tracked repo's frontier. Destructive by
+// design: the callers noted there are already covered by the projection
+// that just ran, so draining them later would only re-project them.
+func (mi *MultiIndexer) discardRetargetedTestCallFiles(prefixes map[string]bool) {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	for prefix, idx := range mi.indexers {
+		if idx == nil || idx.resolver == nil {
+			continue
+		}
+		if prefixes != nil && !prefixes[prefix] {
+			continue
+		}
+		idx.resolver.TakeRetargetedTestCallFiles()
+	}
+}
+
 // RunIncrementalDerivedPasses executes only the derived families invalidated
 // by the exact per-file plans. A legacy database without persisted fingerprints
 // takes the old scoped-global path once; ordinary body/metadata edits never do.
@@ -189,8 +231,21 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 		report.Overrides = r.InferOverridesScoped(typeFrontier)
 	}
 
+	// The resolution step of this same apply may have bound pending calls
+	// whose TEST callers live outside merged.Files (the definition-side
+	// plan never names the caller file, and its flags may be declaration-
+	// only). Drain that retargeted frontier and reconcile those callers
+	// regardless of plan flags — without it a call that resolves later
+	// than its projection pass never gains its EdgeTests.
+	retargeted := mi.drainRetargetedTestCallFiles(prefixSet)
 	if merged.Flags.Has(DerivedInvalidatesRuntime) || merged.Flags.Has(DerivedInvalidatesTests) {
-		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
+		files := merged.Files
+		if len(files) > 0 && len(retargeted) > 0 {
+			files = appendUniqueSorted(append([]string(nil), files...), retargeted...)
+		}
+		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, files...)
+	} else if len(retargeted) > 0 {
+		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, retargeted...)
 	}
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) && len(merged.TypeIDs) > 0 {
 		// A save that adds/re-parents a type can hang a new derived type

@@ -229,7 +229,7 @@ func TestStaleLangsDetection(t *testing.T) {
 		}
 
 		for _, path := range []string{"src/Handler.cs", "Views/Page.razor", "Views/Page.cshtml"} {
-			want := policySalt + "|csharp@13"
+			want := policySalt + "|csharp@19"
 			if got := merkleSaltFor(path); got != want {
 				t.Errorf("C# extractor salt for %s = %q, want %q", path, got, want)
 			}

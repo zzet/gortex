@@ -47,7 +47,7 @@ func (s *Server) handleCompareWithOverlay(ctx context.Context, req mcp.CallToolR
 	if s.overlays == nil {
 		return mcp.NewToolResultError("overlay support is not enabled on this server"), nil
 	}
-	if SessionIDFromContext(ctx) == "" {
+	if OverlayCohortIDFromContext(ctx) == "" {
 		return mcp.NewToolResultError("compare_with_overlay requires an MCP session; connect via the daemon or set Mcp-Session-Id"), nil
 	}
 	ctx, view, viewErr := s.prepareOverlayRequest(ctx)

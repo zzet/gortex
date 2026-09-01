@@ -218,6 +218,18 @@ type Resolver struct {
 	// (filepathlite.Dir/Clean dominate). Read-only after build, so the
 	// workers share it lock-free.
 	dirByFilePath map[string]string
+	// retargetedTestCallFiles accumulates the caller files of EdgeCalls
+	// edges a resolution pass bound where the caller is test-classified
+	// (test file path, or an is_test-stamped source symbol). The test
+	// projection skips unresolved calls, so a call that resolves LATER
+	// needs its caller reconciled — but the definition-side derived plan
+	// never names the caller file. Consumers drain this frontier via
+	// TakeRetargetedTestCallFiles after resolution and re-run the scoped
+	// test projection over it. Guarded by retargetedMu: the parallel
+	// apply loop holds r.mu, but single-file passes and the deferred LSP
+	// apply note entries on their own paths.
+	retargetedMu            sync.Mutex
+	retargetedTestCallFiles map[string]struct{}
 	// importEdgeGen counts imports-kind edge writes noted while a resolve
 	// pass may hold pass-scoped import-adjacency retention. Write-site
 	// verdicts live at noteImportEdgeWrite's callers.
@@ -1057,6 +1069,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				placeholderStart := time.Now()
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 				applyPlaceholderElapsed += time.Since(placeholderStart)
+				for _, ri := range reindexBatch {
+					r.noteRetargetedCall(ri.Edge)
+				}
 				reindexTotal += len(reindexBatch)
 				if pageRevisionKnown {
 					// Ignore this pass's own committed mutations. A later delta
@@ -2754,6 +2769,9 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
 		reconcilePlaceholderSources(r.graph, nil, reindexBatch)
+		for _, ri := range reindexBatch {
+			r.noteRetargetedCall(ri.Edge)
+		}
 	}
 	// Cross-package name-match guard — same contract as in ResolveAll.
 	if len(jobs) == 0 {
@@ -3140,8 +3158,24 @@ func releaseResolverClone(clone *graph.Edge) {
 // caller decides whether to call graph.ReindexEdge immediately
 // (single-threaded ResolveFile) or to defer the reindex (parallel
 // ResolveAll). When nothing changed the returned bool is false.
+// resolutionExempt reports whether the resolver must never bind this edge
+// independently, on ANY path — the heuristic cascade, the inline LSP
+// hot-path, the deferred bulk LSP batch, and the cross-repository pass all
+// consult it. A tests edge is DERIVED: the test-linkage pass clones a test
+// caller's calls edges, meta-free. Re-running the bind WITHOUT the
+// original's receiver evidence bypasses every receiver-gated guard (a
+// List<int> site's clone bound a `this List<string>` extension the guarded
+// calls edge itself refuses). The tests layer follows its calls edge; the
+// resolver never binds it.
+func resolutionExempt(e *graph.Edge) bool {
+	return e != nil && e.Kind == graph.EdgeTests
+}
+
 func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string, changed bool) {
 	oldTo = e.To
+	if resolutionExempt(e) {
+		return oldTo, false
+	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
 	// strings.TrimPrefix only stripped the bare form, leaving every

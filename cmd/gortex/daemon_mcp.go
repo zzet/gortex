@@ -455,7 +455,18 @@ func (d *mcpDispatcher) tryProxyToolCall(ctx context.Context, sess *daemon.Sessi
 		return nil, false
 	}
 	scope, _ := peek.Params.Arguments["workspace"].(string)
-	body, err := json.Marshal(map[string]any{"arguments": peek.Params.Arguments})
+	// A no-arguments call (MCP allows omitting params.arguments) leaves
+	// peek.Params.Arguments nil, which json.Marshal renders as literal
+	// `"arguments":null` — indistinguishable, to a body-shape validator,
+	// from a malformed caller-sent null. Normalize to an empty object so
+	// the executor's "arguments must be an object when present" check
+	// (added for reviewer concern #2) never rejects a legitimate no-arg
+	// call.
+	args := peek.Params.Arguments
+	if args == nil {
+		args = map[string]any{}
+	}
+	body, err := json.Marshal(map[string]any{"arguments": args})
 	if err != nil {
 		return nil, false
 	}
