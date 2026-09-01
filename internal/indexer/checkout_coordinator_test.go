@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
@@ -509,6 +510,104 @@ func TestCoordinatorReusesACommitLayerOnTheWayBack(t *testing.T) {
 	if commits != 2 {
 		t.Fatalf("%d commit generations exist for two trees visited three times", commits)
 	}
+}
+
+func TestCoordinatorPublishesCheckoutHeadBeforeTheSwitchedRoute(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	coordinatorReconcile(t, c)
+
+	treeB := f.commitTreeB()
+	cycle := coordinatorReconcile(t, c)
+	if cycle.CommitGenerationID == 0 || cycle.DirtyGenerationID == 0 {
+		t.Fatalf("switched checkout did not publish both route slots: %+v", cycle)
+	}
+
+	sample, err := gitstate.SampleDirty(context.Background(), f.worktree)
+	if err != nil {
+		t.Fatalf("SampleDirty: %v", err)
+	}
+	checkout, found, err := f.catalog.GetCheckout(context.Background(), f.checkoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckout: found=%v err=%v", found, err)
+	}
+	if checkout.HeadRef != sample.HeadRef || checkout.HeadCommit != sample.HeadCommit ||
+		checkout.HeadTree != sample.HeadTree || checkout.HeadTree != treeB {
+		t.Fatalf("catalog HEAD = %q/%q/%q, sampled %q/%q/%q treeB=%q",
+			checkout.HeadRef, checkout.HeadCommit, checkout.HeadTree,
+			sample.HeadRef, sample.HeadCommit, sample.HeadTree, treeB)
+	}
+	route := f.route()
+	if !graphview.RouteReady(route) {
+		t.Fatalf("switched route is not ready: %+v", route)
+	}
+	commit, found := f.generation(route.CommitGenerationID)
+	if !found || commit.TreeOID != checkout.HeadTree {
+		t.Fatalf("routed commit generation tree = %q, checkout HEAD tree = %q",
+			commit.TreeOID, checkout.HeadTree)
+	}
+}
+
+func TestCoordinatorPersistsSameCommitRefSwitchWithoutMovingRoute(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	coordinatorReconcile(t, c)
+	before := f.route()
+
+	builderGit(t, f.worktree, "checkout", "-b", "same-commit-alias")
+	cycle, settled := c.settledWithoutBuild(context.Background())
+	if !settled {
+		t.Fatal("same-commit ref switch did not settle in the read-only preflight")
+	}
+	if cycle.CommitBuilt || cycle.DirtyBuilt || cycle.CommitReused {
+		t.Fatalf("same-commit ref switch did physical work: %+v", cycle)
+	}
+	after := f.route()
+	if after.RouteEpoch != before.RouteEpoch ||
+		after.CommitGenerationID != before.CommitGenerationID ||
+		after.DirtyGenerationID != before.DirtyGenerationID {
+		t.Fatalf("same-commit ref switch moved route: before=%+v after=%+v", before, after)
+	}
+	checkout, found, err := f.catalog.GetCheckout(context.Background(), f.checkoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckout: found=%v err=%v", found, err)
+	}
+	if checkout.HeadRef != "refs/heads/same-commit-alias" {
+		t.Fatalf("catalog HEAD ref = %q, want same-commit alias", checkout.HeadRef)
+	}
+}
+
+func BenchmarkCoordinatorStableHeadObservation(b *testing.B) {
+	f := newCoordinatorFixture(b)
+	c := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+	cycle := c.reconcile(ctx)
+	if cycle.Err != nil {
+		b.Fatalf("initial reconcile: %v", cycle.Err)
+	}
+	sample, err := c.sampler.Sample(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	sample, err = c.canonicalDirtySnapshot(ctx, sample)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	writes := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		changed, err := c.updateCheckoutHead(ctx, sample)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if changed {
+			writes++
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(writes)/float64(b.N), "head-writes/op")
 }
 
 // TestCoordinatorReusesCommitAcrossIsolatedDirtyStates combines the cache and

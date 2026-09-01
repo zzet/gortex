@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/search/trigram"
 	"github.com/zzet/gortex/internal/viewmetrics"
@@ -395,6 +396,83 @@ func (c *CheckoutCoordinator) canonicalDirtySnapshot(
 		c.unbornTreeOID = normalized.HeadTree
 	}
 	return normalized, nil
+}
+
+// updateCheckoutHead publishes the Git identity sampled from the same checkout
+// that this coordinator is about to route. It runs before any route flip, so a
+// branch switch is represented as a labeled building view until the new route
+// is ready; a route can never become exact while the checkout row still names
+// the branch it left.
+//
+// Stable polls read and compare before taking the catalog writer gate. The
+// compare-and-set itself names the exact incarnation, stored root spelling and
+// previous HEAD triple. If another observer wins with the same sample, that is
+// success; a different winner remains a stale observation and this cycle must
+// not publish over it.
+func (c *CheckoutCoordinator) updateCheckoutHead(
+	ctx context.Context,
+	sample gitstate.DirtySnapshot,
+) (bool, error) {
+	checkout, found, err := c.catalog.GetCheckout(ctx, c.checkoutID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("%w: checkout %s", store_sqlite.ErrCatalogNotFound, c.checkoutID)
+	}
+	if checkout.State != store_sqlite.CheckoutStateReady ||
+		!pathkey.EqualPaths(checkout.RootPath, c.root) {
+		return false, fmt.Errorf(
+			"%w: checkout %s moved from ready root %s to state %s root %s",
+			store_sqlite.ErrCatalogStaleGuard,
+			c.checkoutID, c.root, checkout.State, checkout.RootPath,
+		)
+	}
+	if checkoutHeadMatches(checkout, sample) {
+		return false, nil
+	}
+
+	err = c.catalog.UpdateCheckoutHead(ctx, store_sqlite.UpdateCheckoutHeadRequest{
+		CheckoutID:         checkout.CheckoutID,
+		Incarnation:        checkout.Incarnation,
+		ExpectedRootPath:   checkout.RootPath,
+		ExpectedHeadRef:    checkout.HeadRef,
+		ExpectedHeadCommit: checkout.HeadCommit,
+		ExpectedHeadTree:   checkout.HeadTree,
+		HeadRef:            sample.HeadRef,
+		HeadCommit:         sample.HeadCommit,
+		HeadTree:           sample.HeadTree,
+	})
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		return false, err
+	}
+
+	// A lifecycle inventory pass may have published this same observation
+	// after our read. Accept only that idempotent winner; a different identity
+	// means this sample is stale and must not advance the route.
+	current, currentFound, readErr := c.catalog.GetCheckout(ctx, c.checkoutID)
+	if readErr != nil {
+		return false, readErr
+	}
+	if currentFound && current.Incarnation == checkout.Incarnation &&
+		current.State == store_sqlite.CheckoutStateReady &&
+		pathkey.EqualPaths(current.RootPath, c.root) &&
+		checkoutHeadMatches(current, sample) {
+		return false, nil
+	}
+	return false, err
+}
+
+func checkoutHeadMatches(
+	checkout store_sqlite.Checkout,
+	sample gitstate.DirtySnapshot,
+) bool {
+	return checkout.HeadRef == sample.HeadRef &&
+		checkout.HeadCommit == sample.HeadCommit &&
+		checkout.HeadTree == sample.HeadTree
 }
 
 func (c *CheckoutCoordinator) cachedUnbornTreeOID() string {
@@ -949,6 +1027,9 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	if err != nil {
 		return out, false
 	}
+	if _, err := c.updateCheckoutHead(ctx, sample); err != nil {
+		return out, false
+	}
 	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
 	if err != nil || !found || route.State != store_sqlite.RouteActive ||
 		route.GraphID != base.graphID || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
@@ -1026,6 +1107,10 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	head, err = c.canonicalDirtySnapshot(ctx, head)
 	if err != nil {
 		out.Err = err
+		return out
+	}
+	if _, err := c.updateCheckoutHead(ctx, head); err != nil {
+		out.Err = fmt.Errorf("indexer: publish checkout %s HEAD: %w", c.checkoutID, err)
 		return out
 	}
 
@@ -1748,6 +1833,9 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	sample, err = c.canonicalDirtySnapshot(ctx, sample)
 	if err != nil {
 		return err
+	}
+	if _, err := c.updateCheckoutHead(ctx, sample); err != nil {
+		return fmt.Errorf("indexer: publish checkout %s HEAD: %w", c.checkoutID, err)
 	}
 	c.noteDirtyFingerprint(sample.Fingerprint)
 	if sample.HeadTree != targetTree {

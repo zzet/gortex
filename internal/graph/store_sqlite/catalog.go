@@ -541,6 +541,30 @@ ON CONFLICT(checkout_id) DO UPDATE SET
 	})
 }
 
+// UpdateCheckoutHead advances only the sampled Git identity of a ready
+// checkout. The exact incarnation, root spelling and previous HEAD triple are
+// compare-and-set guards: a coordinator built for an older checkout/root or a
+// sample that lost to a newer observation changes nothing.
+func (c *Catalog) UpdateCheckoutHead(ctx context.Context, req UpdateCheckoutHeadRequest) error {
+	if err := req.validate(); err != nil {
+		return err
+	}
+	const update = `
+UPDATE checkouts
+   SET head_ref = ?, head_commit = ?, head_tree = ?
+ WHERE checkout_id = ? AND incarnation = ? AND root_path = ?
+   AND state = ?
+   AND head_ref = ? AND head_commit = ? AND head_tree = ?`
+	subject := fmt.Sprintf("HEAD of checkout %s incarnation %s root %s",
+		req.CheckoutID, req.Incarnation, req.ExpectedRootPath)
+	return c.execGuarded(ctx, subject, update,
+		req.HeadRef, req.HeadCommit, req.HeadTree,
+		req.CheckoutID, req.Incarnation, req.ExpectedRootPath,
+		string(CheckoutStateReady),
+		req.ExpectedHeadRef, req.ExpectedHeadCommit, req.ExpectedHeadTree,
+	)
+}
+
 // GetCheckoutRootMove returns the uncompleted move marker for one checkout.
 func (c *Catalog) GetCheckoutRootMove(
 	ctx context.Context,

@@ -695,6 +695,41 @@ func (r UpdateCheckoutObservationRequest) validate() error {
 	return requireCatalogValue("state", r.State, checkoutStates)
 }
 
+// UpdateCheckoutHeadRequest is the narrow compare-and-set used by a checkout
+// coordinator after sampling Git. It deliberately owns only the three HEAD
+// columns: availability, removal, root and mode state belong to their
+// respective lifecycle writers and must not be replayed from a stale read.
+//
+// The previous HEAD triple is part of the guard so a slow coordinator cannot
+// overwrite a newer inventory observation. Empty ref/commit values are valid
+// for detached and unborn HEADs.
+type UpdateCheckoutHeadRequest struct {
+	CheckoutID       string
+	Incarnation      string
+	ExpectedRootPath string
+
+	ExpectedHeadRef    string
+	ExpectedHeadCommit string
+	ExpectedHeadTree   string
+
+	HeadRef    string
+	HeadCommit string
+	HeadTree   string
+}
+
+func (r UpdateCheckoutHeadRequest) validate() error {
+	if err := requireCatalogID("checkout_id", r.CheckoutID); err != nil {
+		return err
+	}
+	if err := requireCatalogID("incarnation", r.Incarnation); err != nil {
+		return err
+	}
+	if r.ExpectedRootPath == "" {
+		return fmt.Errorf("%w: expected_root_path is required", ErrCatalogInvalidValue)
+	}
+	return nil
+}
+
 // FlipCheckoutRouteRequest repoints one checkout's route. ExpectedRouteEpoch
 // is the compare-and-set token; a successful flip stores epoch+1. Generation
 // pointers of 0 clear the corresponding column.
