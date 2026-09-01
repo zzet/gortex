@@ -259,21 +259,30 @@ func (gw *GitWatcher) registeredIndexer() *Indexer {
 
 // finalizeReconcile publishes commit freshness only while holding the stable
 // repository lane. IndexRepo replacement uses the same lane, so the registry
-// lookup and state restamp cannot land on a retired Indexer. lastSHA advances
-// after the restamp; failed lane admission therefore leaves the prior SHA for
-// the next ref notification to retry.
+// lookup and state restamp cannot land on a retired Indexer.
+//
+// The watcher baseline is acknowledged after successful lane admission, not
+// inside the callback. A dedicated immutable corpus can intentionally suppress
+// ordinary repository mutations through the lane guard; that is a successful
+// handoff, but the callback does not run. Keeping lastSHA inside the callback
+// made every later ref notification replay and log the same transition. A real
+// lane or callback error still leaves the prior SHA for the next notification
+// to retry.
 func (gw *GitWatcher) finalizeReconcile(ctx context.Context, newSHA string) error {
-	return gw.indexer.coordinateRepositoryMutation(ctx, func() error {
+	if err := gw.indexer.coordinateRepositoryMutation(ctx, func() error {
 		idx := gw.registeredIndexer()
 		if idx == nil {
 			return fmt.Errorf("git-watcher: repository indexer is no longer registered")
 		}
 		idx.reconcileRepoIndexState(gw.repoPath)
-		gw.mu.Lock()
-		gw.lastSHA = newSHA
-		gw.mu.Unlock()
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	gw.mu.Lock()
+	gw.lastSHA = newSHA
+	gw.mu.Unlock()
+	return nil
 }
 
 // Start sets up fsnotify watches on the repo's git control files and

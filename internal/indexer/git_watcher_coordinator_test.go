@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,7 +41,7 @@ func (store *gitWatcherStateStore) snapshotStates() []graph.RepoIndexState {
 	return append([]graph.RepoIndexState(nil), store.states...)
 }
 
-func gitWatcherBoundaryIndexer(t *testing.T, store graph.Store, repoPath, prefix string) *Indexer {
+func gitWatcherBoundaryIndexer(t testing.TB, store graph.Store, repoPath, prefix string) *Indexer {
 	t.Helper()
 	registry := parser.NewRegistry()
 	registry.Register(languages.NewGoExtractor())
@@ -52,7 +53,7 @@ func gitWatcherBoundaryIndexer(t *testing.T, store graph.Store, repoPath, prefix
 	return idx
 }
 
-func runGitWatcherGit(t *testing.T, repoPath string, args ...string) string {
+func runGitWatcherGit(t testing.TB, repoPath string, args ...string) string {
 	t.Helper()
 	commandArgs := append([]string{"-C", repoPath}, args...)
 	cmd := exec.Command("git", commandArgs...)
@@ -61,7 +62,7 @@ func runGitWatcherGit(t *testing.T, repoPath string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
-func initGitWatcherRepo(t *testing.T) (string, string) {
+func initGitWatcherRepo(t testing.TB) (string, string) {
 	t.Helper()
 	repoPath := t.TempDir()
 	runGitWatcherGit(t, repoPath, "init")
@@ -153,4 +154,121 @@ func TestGitWatcherEmptyCommitFinalizesWithoutFullReindex(t *testing.T) {
 	assert.Equal(t, newSHA, watcher.lastSHA)
 	watcher.mu.Unlock()
 	require.Len(t, store.snapshotStates(), 1, "empty commit must still restamp repository freshness")
+}
+
+func TestGitWatcherGuardedZeroPatchTransitionAcknowledgesOnce(t *testing.T) {
+	repoPath, oldSHA := initGitWatcherRepo(t)
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package main\n\nfunc First() {}\n"), 0o644))
+	runGitWatcherGit(t, repoPath, "add", "main.go")
+	runGitWatcherGit(t, repoPath, "commit", "-m", "first change")
+	firstSHA := runGitWatcherGit(t, repoPath, "rev-parse", "HEAD")
+	require.NotEqual(t, oldSHA, firstSHA)
+
+	store := &gitWatcherStateStore{Store: graph.New()}
+	idx := gitWatcherBoundaryIndexer(t, store, repoPath, "repo")
+	var executorCalls atomic.Int32
+	var guardCalls atomic.Int32
+	coordinator := newRepositoryMutationCoordinator(func([]string) (*IndexResult, error) {
+		executorCalls.Add(1)
+		return &IndexResult{}, nil
+	})
+	coordinator.guard = func() (bool, error) {
+		guardCalls.Add(1)
+		return true, nil
+	}
+	idx.attachRepositoryMutationCoordinator(coordinator)
+	watcher, err := NewGitWatcher(repoPath, idx, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = watcher.Stop() })
+	watcher.lastSHA = oldSHA
+
+	var drainedPaths []int
+	watcher.drained = func(paths int) { drainedPaths = append(drainedPaths, paths) }
+
+	watcher.reconcile("guarded-zero-patch-first")
+	for range 100 {
+		watcher.reconcile("guarded-zero-patch-replay")
+	}
+
+	watcher.mu.Lock()
+	assert.Equal(t, firstSHA, watcher.lastSHA)
+	watcher.mu.Unlock()
+	assert.Zero(t, executorCalls.Load(), "the dedicated-corpus guard must suppress changed-path mutation")
+	assert.Equal(t, int32(2), guardCalls.Load(), "the first transition must guard its batch and freshness tail exactly once")
+	assert.Equal(t, []int{0}, drainedPaths, "one guarded transition must emit exactly one zero-patch reconcile")
+	assert.Empty(t, store.snapshotStates(), "the dedicated-corpus guard must still suppress the freshness write")
+
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package main\n\nfunc Second() {}\n"), 0o644))
+	runGitWatcherGit(t, repoPath, "add", "main.go")
+	runGitWatcherGit(t, repoPath, "commit", "-m", "second change")
+	secondSHA := runGitWatcherGit(t, repoPath, "rev-parse", "HEAD")
+	require.NotEqual(t, firstSHA, secondSHA)
+	watcher.reconcile("guarded-zero-patch-second")
+
+	watcher.mu.Lock()
+	assert.Equal(t, secondSHA, watcher.lastSHA)
+	watcher.mu.Unlock()
+	assert.Equal(t, int32(4), guardCalls.Load(), "a genuinely later transition must run through both guards")
+	assert.Equal(t, []int{0, 0}, drainedPaths, "a genuinely later ref transition must still reconcile")
+}
+
+func TestGitWatcherFinalizationErrorDoesNotAcknowledgeTransition(t *testing.T) {
+	repoPath, oldSHA := initGitWatcherRepo(t)
+	runGitWatcherGit(t, repoPath, "commit", "--allow-empty", "-m", "empty")
+	newSHA := runGitWatcherGit(t, repoPath, "rev-parse", "HEAD")
+	require.NotEqual(t, oldSHA, newSHA)
+
+	idx := gitWatcherBoundaryIndexer(t, graph.New(), repoPath, "repo")
+	coordinator := newRepositoryMutationCoordinator(nil)
+	coordinator.guard = func() (bool, error) {
+		return false, errors.New("intentional finalization failure")
+	}
+	idx.attachRepositoryMutationCoordinator(coordinator)
+	watcher, err := NewGitWatcher(repoPath, idx, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = watcher.Stop() })
+	watcher.lastSHA = oldSHA
+
+	var drains atomic.Int32
+	watcher.drained = func(int) { drains.Add(1) }
+	watcher.reconcile("finalization-error")
+
+	watcher.mu.Lock()
+	assert.Equal(t, oldSHA, watcher.lastSHA, "a failed finalization must retain the retry baseline")
+	watcher.mu.Unlock()
+	assert.Zero(t, drains.Load(), "a failed transition must not emit a successful reconcile")
+
+	coordinator.mu.Lock()
+	coordinator.guard = func() (bool, error) { return true, nil }
+	coordinator.mu.Unlock()
+	watcher.reconcile("finalization-retry")
+	watcher.mu.Lock()
+	assert.Equal(t, newSHA, watcher.lastSHA, "the retained transition must succeed on retry")
+	watcher.mu.Unlock()
+	assert.Equal(t, int32(1), drains.Load())
+}
+
+func BenchmarkGitWatcherAcknowledgedZeroPatchReplay(b *testing.B) {
+	repoPath, oldSHA := initGitWatcherRepo(b)
+	require.NoError(b, os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package main\n\nfunc Changed() {}\n"), 0o644))
+	runGitWatcherGit(b, repoPath, "add", "main.go")
+	runGitWatcherGit(b, repoPath, "commit", "-m", "changed")
+
+	idx := gitWatcherBoundaryIndexer(b, graph.New(), repoPath, "repo")
+	coordinator := newRepositoryMutationCoordinator(nil)
+	coordinator.guard = func() (bool, error) { return true, nil }
+	idx.attachRepositoryMutationCoordinator(coordinator)
+	watcher, err := NewGitWatcher(repoPath, idx, zap.NewNop())
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = watcher.Stop() })
+	watcher.lastSHA = oldSHA
+
+	var drains atomic.Int32
+	watcher.drained = func(int) { drains.Add(1) }
+	b.ResetTimer()
+	for range b.N {
+		watcher.reconcile("acknowledged-zero-patch-replay")
+	}
+	b.StopTimer()
+	require.Equal(b, int32(1), drains.Load(), "the transition must be emitted once across all replay attempts")
 }
