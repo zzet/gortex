@@ -706,7 +706,7 @@ func installGlobalSlashCommands(w io.Writer, home string, opts agents.ApplyOpts)
 	dir := filepath.Join(userClaudeConfigDir(home), "commands")
 	for name, content := range SlashCommands {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, v060SlashCommandHashes[name], opts)
+		action, err := writeAgentArtifact(w, path, content, []string{v060SlashCommandHashes[name], preWorktreeSlashCommandHashes[name]}, opts)
 		if err != nil {
 			return out, err
 		}
@@ -724,7 +724,7 @@ func installGlobalSubAgents(w io.Writer, home string, opts agents.ApplyOpts) ([]
 	dir := filepath.Join(userClaudeConfigDir(home), "agents")
 	for name, content := range SubAgents {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, v060SubAgentHashes[name], opts)
+		action, err := writeAgentArtifact(w, path, content, []string{v060SubAgentHashes[name], preWorktreeSubAgentHashes[name]}, opts)
 		if err != nil {
 			return out, err
 		}
