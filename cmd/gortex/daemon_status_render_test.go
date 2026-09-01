@@ -183,6 +183,22 @@ func TestRenderDaemonHeader_WarmupLabel(t *testing.T) {
 	assert.NotContains(t, out, "(resolve ")
 }
 
+func TestRenderDaemonHeader_ExactStartupViewProgressAndBacklog(t *testing.T) {
+	st := sampleStatus()
+	st.Ready = false
+	st.WarmupPhase = "checkout_builds_pending"
+	st.StartupViews = &daemon.StartupViewsStatus{Expected: 29, Ready: 4, Building: 25}
+	st.Views = &daemon.ViewsStatus{BuildQueue: &daemon.ViewBuildQueueStatus{
+		Open: true, Active: true, BackgroundQueued: 239,
+	}}
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	out := buf.String()
+	assert.Contains(t, out, "exact startup views 4/29 ready, 25 building")
+	assert.Contains(t, out, "view builds active, 239 background queued")
+	assert.NotContains(t, out, "resolving references")
+}
+
 func TestRenderDaemonHeader_EnrichmentProgress_NoSummary(t *testing.T) {
 	st := sampleStatus()
 	st.Ready = true

@@ -33,6 +33,10 @@ type ViewsHealth struct {
 	Checkouts map[string]int `json:"checkouts,omitempty"`
 	// Coordinators is how many checkout build loops this process runs.
 	Coordinators int `json:"coordinators"`
+	// BuildQueue is the fixed-cardinality admission snapshot for physical
+	// view construction. It makes a serialized backlog visible without
+	// naming any checkout, repository, or generation.
+	BuildQueue ViewBuildGateStats `json:"build_queue"`
 	// Generations counts payload generations by state — the direct answer to
 	// "how much derived payload is this store holding, and why".
 	Generations map[string]int `json:"generations,omitempty"`
@@ -62,6 +66,7 @@ func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error
 		return out, errNoCatalog
 	}
 	out.Coordinators = l.liveCoordinators("")
+	out.BuildQueue = l.buildGate().Stats()
 	out.Leases = l.leases.Held()
 
 	families, err := l.catalog.ListRepositoryFamilies(ctx)

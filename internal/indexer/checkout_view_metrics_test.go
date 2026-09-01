@@ -259,6 +259,10 @@ func TestViewsHealthCountsTheCatalogsPopulation(t *testing.T) {
 	if health.Leases != 0 {
 		t.Fatalf("leases = %d, want 0 with no view materialized", health.Leases)
 	}
+	if !health.BuildQueue.Open || health.BuildQueue.Active ||
+		health.BuildQueue.BackgroundQueued != 0 || health.BuildQueue.InteractiveQueued != 0 {
+		t.Fatalf("unexpected idle build admission snapshot: %+v", health.BuildQueue)
+	}
 	if len(health.Counters) == 0 {
 		t.Fatal("the census carries no counters, so the metric registry is not reaching the status block")
 	}

@@ -57,6 +57,21 @@ func TestControllerReadinessExpectedZeroPreservesLegacy(t *testing.T) {
 	assert.Equal(t, map[string]any{"queryable": true}, extra)
 }
 
+func TestControllerStatusWarmupNamesExactViewBlocker(t *testing.T) {
+	c := &realController{}
+	c.referenceReady.Store(true)
+	c.setStartupViewReadiness(startupViewReadiness{Expected: 29, Ready: 4, Building: 25})
+	phase, views := c.statusWarmup()
+	assert.Equal(t, "checkout_builds_pending", phase)
+	require.NotNil(t, views)
+	assert.Equal(t, &daemon.StartupViewsStatus{Expected: 29, Ready: 4, Building: 25}, views)
+
+	c.setStartupViewReadiness(startupViewReadiness{Expected: 29, Ready: 4, Building: 24, Failed: 1})
+	phase, views = c.statusWarmup()
+	assert.Equal(t, "degraded", phase)
+	assert.Equal(t, 1, views.Failed)
+}
+
 func TestStartupViewReadinessMonitorFreezesCohortAndCoalesces(t *testing.T) {
 	monitor := newStartupViewReadinessMonitor([]string{"/catalog-gap", "/ready", "/building"})
 	states := map[string]daemon.TrackReadiness{

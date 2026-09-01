@@ -204,6 +204,33 @@ func (c *realController) setStartupViewReadiness(snapshot startupViewReadiness) 
 	c.recomputeEnriched()
 }
 
+func (c *realController) statusWarmup() (string, *daemon.StartupViewsStatus) {
+	if c == nil {
+		return "", nil
+	}
+	snapshot := c.startupViewReadiness()
+	var views *daemon.StartupViewsStatus
+	if snapshot.Expected > 0 {
+		views = &daemon.StartupViewsStatus{
+			Expected: snapshot.Expected, Ready: snapshot.Ready,
+			Building: snapshot.Building, Failed: snapshot.Failed,
+			ProbeErrors: snapshot.ProbeErrors,
+		}
+	}
+	switch {
+	case c.ready.Load():
+		return "ready", views
+	case !c.referenceReady.Load():
+		return "resolving_references", views
+	case snapshot.Failed > 0:
+		return "degraded", views
+	case !snapshot.complete():
+		return "checkout_builds_pending", views
+	default:
+		return "finalizing", views
+	}
+}
+
 func (c *realController) recomputeReady() {
 	if c == nil {
 		return
@@ -1110,6 +1137,7 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 		ToolPresetMode:     agg.toolPresetMode,
 		LearnedTools:       agg.learnedTools,
 	}
+	resp.WarmupPhase, resp.StartupViews = c.statusWarmup()
 	if cached {
 		// Say which half is a snapshot. Without the marker a stale repo
 		// table is indistinguishable from a current one, and an empty one
@@ -1673,10 +1701,21 @@ func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsSt
 		Families:     health.Families,
 		Checkouts:    health.Checkouts,
 		Coordinators: health.Coordinators,
-		Generations:  health.Generations,
-		Leases:       health.Leases,
-		RefViews:     health.RefViews,
-		Counters:     health.Counters,
+		BuildQueue: &daemon.ViewBuildQueueStatus{
+			Open: health.BuildQueue.Open, Active: health.BuildQueue.Active,
+			InteractiveQueued: health.BuildQueue.InteractiveQueued,
+			BackgroundQueued:  health.BuildQueue.BackgroundQueued,
+			InteractiveLimit:  health.BuildQueue.InteractiveLimit,
+			BackgroundLimit:   health.BuildQueue.BackgroundLimit,
+			InteractiveHigh:   health.BuildQueue.InteractiveHighWater,
+			BackgroundHigh:    health.BuildQueue.BackgroundHighWater,
+			MaxWaitMillis:     health.BuildQueue.MaxWait.Milliseconds(),
+			WaitSamples:       health.BuildQueue.WaitSamples,
+		},
+		Generations: health.Generations,
+		Leases:      health.Leases,
+		RefViews:    health.RefViews,
+		Counters:    health.Counters,
 	}
 }
 

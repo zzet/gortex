@@ -382,6 +382,14 @@ type StatusResponse struct {
 	// EnrichmentComplete. The socket is reachable even when Ready=false.
 	Ready         bool  `json:"ready"`
 	WarmupSeconds int64 `json:"warmup_seconds"`
+	// WarmupPhase names the work actually holding readiness. Older daemons
+	// omit it; clients must retain their generic warming-up fallback for that
+	// case. Current values are resolving_references, checkout_builds_pending,
+	// degraded, finalizing, and ready.
+	WarmupPhase string `json:"warmup_phase,omitempty"`
+	// StartupViews is the frozen exact-view cohort that must publish before a
+	// configured Git repository is ready. Nil means no cohort was installed.
+	StartupViews *StartupViewsStatus `json:"startup_views,omitempty"`
 
 	// EnrichmentComplete is false while semantic enrichment and the
 	// graph-wide derivation passes are still running in the background.
@@ -567,6 +575,10 @@ type ViewsStatus struct {
 	Checkouts map[string]int `json:"checkouts,omitempty"`
 	// Coordinators is how many checkout build loops this daemon runs.
 	Coordinators int `json:"coordinators"`
+	// BuildQueue reports the one physical view-build lane and its two bounded
+	// queues. It carries no identities and is therefore safe on every status
+	// poll, even for a family with thousands of worktrees.
+	BuildQueue *ViewBuildQueueStatus `json:"build_queue,omitempty"`
 	// Generations counts payload generations by state.
 	Generations map[string]int `json:"generations,omitempty"`
 	// Leases is how many generations live views currently pin. A generation
@@ -580,6 +592,32 @@ type ViewsStatus struct {
 	// a fixed vocabulary, so the map's size is a property of the build rather
 	// than of the workload.
 	Counters map[string]int64 `json:"counters,omitempty"`
+}
+
+// StartupViewsStatus is the exact configured-Git startup cohort. Counts are
+// mutually exclusive except ProbeErrors, which is a transient subset of
+// Building.
+type StartupViewsStatus struct {
+	Expected    int `json:"expected"`
+	Ready       int `json:"ready"`
+	Building    int `json:"building"`
+	Failed      int `json:"failed"`
+	ProbeErrors int `json:"probe_errors,omitempty"`
+}
+
+// ViewBuildQueueStatus is a fixed-cardinality snapshot of physical build
+// admission. Queue depths exclude the active build.
+type ViewBuildQueueStatus struct {
+	Open              bool   `json:"open"`
+	Active            bool   `json:"active"`
+	InteractiveQueued int    `json:"interactive_queued"`
+	BackgroundQueued  int    `json:"background_queued"`
+	InteractiveLimit  int    `json:"interactive_limit"`
+	BackgroundLimit   int    `json:"background_limit"`
+	InteractiveHigh   int    `json:"interactive_high_water"`
+	BackgroundHigh    int    `json:"background_high_water"`
+	MaxWaitMillis     int64  `json:"max_wait_millis,omitempty"`
+	WaitSamples       uint64 `json:"wait_samples,omitempty"`
 }
 
 // SearchBackendStats identifies which search backend is currently

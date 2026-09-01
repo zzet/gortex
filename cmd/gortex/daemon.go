@@ -535,6 +535,8 @@ func watchStartupViewReadiness(
 	}
 	var retryTimer *time.Timer
 	var retryC <-chan time.Time
+	var lastLogged startupViewReadiness
+	hasLogged := false
 	stopRetry := func() {
 		if retryTimer != nil && !retryTimer.Stop() {
 			select {
@@ -570,6 +572,17 @@ func watchStartupViewReadiness(
 			snapshot := monitor.snapshot(ctx, probe)
 			controller.setStartupViewReadiness(snapshot)
 			publishStartupViewReadiness(state, controller)
+			if !hasLogged || snapshot != lastLogged {
+				if controller.logger != nil {
+					controller.logger.Info("daemon: startup exact-view progress",
+						zap.Int("expected", snapshot.Expected),
+						zap.Int("ready", snapshot.Ready),
+						zap.Int("building", snapshot.Building),
+						zap.Int("failed", snapshot.Failed),
+						zap.Int("probe_errors", snapshot.ProbeErrors))
+				}
+				lastLogged, hasLogged = snapshot, true
+			}
 			// Transition observers cover explicit promotion/demotion workers, but
 			// ordinary checkout route construction is owned by the coordinator and
 			// has no mode-transition edge. Keep one bounded safety poll armed while
@@ -2046,7 +2059,7 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 				formatEnrichmentProgress(st.Enrichment)),
 		})
 	default:
-		t.AppendRow(table.Row{"state", "warming up (socket reachable, resolving references)"})
+		t.AppendRow(table.Row{"state", formatDaemonWarmupState(st)})
 	}
 	t.AppendRow(table.Row{"sessions", st.Sessions})
 	if st.MemoryBytes > 0 {
@@ -2131,6 +2144,57 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			st.PProfAddr, st.PProfAddr)})
 	}
 	t.Render()
+}
+
+func formatDaemonWarmupState(st daemon.StatusResponse) string {
+	switch st.WarmupPhase {
+	case "checkout_builds_pending", "degraded", "finalizing":
+		state := "warming up"
+		if st.WarmupPhase == "degraded" {
+			state = "degraded"
+		}
+		if views := st.StartupViews; views != nil {
+			state += fmt.Sprintf(" — exact startup views %d/%d ready", views.Ready, views.Expected)
+			if views.Building > 0 {
+				state += fmt.Sprintf(", %d building", views.Building)
+			}
+			if views.Failed > 0 {
+				state += fmt.Sprintf(", %d failed", views.Failed)
+			}
+			if views.ProbeErrors > 0 {
+				state += fmt.Sprintf(", %d probe errors", views.ProbeErrors)
+			}
+		} else if st.WarmupPhase == "finalizing" {
+			state += " — finalizing startup"
+		}
+		if st.Views != nil && st.Views.BuildQueue != nil {
+			queue := st.Views.BuildQueue
+			parts := make([]string, 0, 2)
+			if queue.InteractiveQueued > 0 {
+				parts = append(parts, fmt.Sprintf("%d interactive queued", queue.InteractiveQueued))
+			}
+			if queue.BackgroundQueued > 0 {
+				parts = append(parts, fmt.Sprintf("%d background queued", queue.BackgroundQueued))
+			}
+			if queue.Active || len(parts) > 0 {
+				builds := "view builds"
+				if queue.Active {
+					builds += " active"
+				}
+				if len(parts) > 0 {
+					builds += ", " + strings.Join(parts, ", ")
+				}
+				state += "; " + builds
+			}
+		}
+		return state
+	case "resolving_references":
+		return "warming up (socket reachable, resolving references)"
+	default:
+		// Compatibility with an older daemon whose status payload predates the
+		// explicit phase and exact-view progress fields.
+		return "warming up (socket reachable, resolving references)"
+	}
 }
 
 // formatLSPRouterRows renders the daemon's LSP-router state into the
