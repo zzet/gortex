@@ -209,8 +209,13 @@ type CheckoutLifecycle struct {
 	coordinatorStartWG sync.WaitGroup
 	coordinators       map[string]*CheckoutCoordinator
 	coordinatorHeads   map[string]checkoutHeadIdentity
-	mutationFencesOnce sync.Once
-	mutationFences     *checkoutMutationFences
+	// coordinatorActivating coalesces request-selected admission before a
+	// coordinator reaches the registry. Physical generation work remains in
+	// the coordinator goroutine; this set only prevents simultaneous requests
+	// from constructing duplicate publishers for the same checkout.
+	coordinatorActivating map[string]struct{}
+	mutationFencesOnce    sync.Once
+	mutationFences        *checkoutMutationFences
 	// topologyFenceRetireMu protects the process-local retry sets populated by
 	// terminal reconcile/rollback edges. The separate sweep mutex prevents two
 	// callbacks from retiring the same registry entry concurrently while the
@@ -220,6 +225,17 @@ type CheckoutLifecycle struct {
 	pendingCheckoutFences      map[string]string
 	pendingFamilyFences        map[string]struct{}
 	pendingGraphFences         map[string]struct{}
+	// startupAdmissionFamilies holds families whose cold promotion worker must
+	// perform one catalog-only/routed-only inventory pass after publishing the
+	// primary. It closes the deferred-publication window where that first pass
+	// would otherwise classify every pre-existing worktree as runtime-new and
+	// start all of their coordinators at once.
+	startupAdmissionMu sync.Mutex
+	// The nested key is the explicitly configured checkout whose cold
+	// promotion still owns the first post-publication inventory. Keeping owners
+	// distinct prevents a warm sibling or one failed promotion from clearing
+	// another promotion's admission fence in the same Git family.
+	startupAdmissionFamilies map[string]map[string]struct{}
 
 	checkoutSignalWatchMu        sync.Mutex
 	checkoutSignalWatchers       *checkoutSourceSignalWatcherSet
@@ -366,29 +382,31 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	}
 	transitionCtx, cancelTransitions := context.WithCancel(context.Background())
 	l := &CheckoutLifecycle{
-		mi:                     cfg.MultiIndexer,
-		cfgMgr:                 cfg.ConfigManager,
-		logger:                 logger,
-		now:                    now,
-		buildingRecoveryCutoff: now().Unix(),
-		buildFailures:          newCheckoutBuildFailures(),
-		leases:                 cfg.ViewLeases,
-		coordinators:           map[string]*CheckoutCoordinator{},
-		coordinatorHeads:       map[string]checkoutHeadIdentity{},
-		mutationFences:         newCheckoutMutationFences(),
-		started:                map[string][]*CheckoutCoordinator{},
-		owed:                   map[int64]struct{}{},
-		familyRetries:          map[string]familyRetry{},
-		watcherRetries:         map[string]*watcherRetry{},
-		refViewRetention:       cfg.RefViews.withDefaults(),
-		indexBarrier:           cfg.indexBarrier,
-		transitionCtx:          transitionCtx,
-		cancelTransitions:      cancelTransitions,
-		transitionRuns:         map[string]*modeTransitionRun{},
-		transitionQueue:        make(chan *modeTransitionRun, modeTransitionQueueLimit),
-		baseRefreshPending:     map[string]dedicatedBaseRefreshRequest{},
-		baseRefreshInFlight:    map[string]struct{}{},
-		baseRefreshWake:        make(chan struct{}, 1),
+		mi:                       cfg.MultiIndexer,
+		cfgMgr:                   cfg.ConfigManager,
+		logger:                   logger,
+		now:                      now,
+		buildingRecoveryCutoff:   now().Unix(),
+		buildFailures:            newCheckoutBuildFailures(),
+		leases:                   cfg.ViewLeases,
+		coordinators:             map[string]*CheckoutCoordinator{},
+		coordinatorHeads:         map[string]checkoutHeadIdentity{},
+		coordinatorActivating:    map[string]struct{}{},
+		mutationFences:           newCheckoutMutationFences(),
+		started:                  map[string][]*CheckoutCoordinator{},
+		owed:                     map[int64]struct{}{},
+		familyRetries:            map[string]familyRetry{},
+		watcherRetries:           map[string]*watcherRetry{},
+		refViewRetention:         cfg.RefViews.withDefaults(),
+		indexBarrier:             cfg.indexBarrier,
+		transitionCtx:            transitionCtx,
+		cancelTransitions:        cancelTransitions,
+		transitionRuns:           map[string]*modeTransitionRun{},
+		transitionQueue:          make(chan *modeTransitionRun, modeTransitionQueueLimit),
+		baseRefreshPending:       map[string]dedicatedBaseRefreshRequest{},
+		baseRefreshInFlight:      map[string]struct{}{},
+		baseRefreshWake:          make(chan struct{}, 1),
+		startupAdmissionFamilies: map[string]map[string]struct{}{},
 	}
 	if l.leases == nil {
 		l.leases = graphview.NewLeaseManager()
@@ -2033,27 +2051,170 @@ func familyReportRemoved(report reconcile.FamilyReport) bool {
 	return false
 }
 
+type coordinatorAdmissionPolicy uint8
+
+const (
+	coordinatorAdmissionRuntime coordinatorAdmissionPolicy = iota
+	coordinatorAdmissionStartupRoutedOnly
+)
+
+type coordinatorAdmissionPolicyContextKey struct{}
+
+func withCoordinatorAdmissionPolicy(
+	ctx context.Context, policy coordinatorAdmissionPolicy,
+) context.Context {
+	return context.WithValue(ctx, coordinatorAdmissionPolicyContextKey{}, policy)
+}
+
+func coordinatorAdmissionPolicyFrom(ctx context.Context) coordinatorAdmissionPolicy {
+	if ctx == nil {
+		return coordinatorAdmissionRuntime
+	}
+	if policy, ok := ctx.Value(coordinatorAdmissionPolicyContextKey{}).(coordinatorAdmissionPolicy); ok {
+		return policy
+	}
+	return coordinatorAdmissionRuntime
+}
+
+func (l *CheckoutLifecycle) markStartupFamilyAdmission(familyID, checkoutID string) {
+	if l == nil || familyID == "" || checkoutID == "" {
+		return
+	}
+	l.startupAdmissionMu.Lock()
+	if l.startupAdmissionFamilies == nil {
+		l.startupAdmissionFamilies = map[string]map[string]struct{}{}
+	}
+	owners := l.startupAdmissionFamilies[familyID]
+	if owners == nil {
+		owners = map[string]struct{}{}
+		l.startupAdmissionFamilies[familyID] = owners
+	}
+	owners[checkoutID] = struct{}{}
+	l.startupAdmissionMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) startupFamilyAdmissionPending(familyID string) bool {
+	if l == nil || familyID == "" {
+		return false
+	}
+	l.startupAdmissionMu.Lock()
+	pending := len(l.startupAdmissionFamilies[familyID]) > 0
+	l.startupAdmissionMu.Unlock()
+	return pending
+}
+
+func (l *CheckoutLifecycle) releaseStartupFamilyAdmission(familyID, checkoutID string) {
+	if l == nil || familyID == "" || checkoutID == "" {
+		return
+	}
+	l.startupAdmissionMu.Lock()
+	owners := l.startupAdmissionFamilies[familyID]
+	delete(owners, checkoutID)
+	if len(owners) == 0 {
+		delete(l.startupAdmissionFamilies, familyID)
+	}
+	l.startupAdmissionMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) releaseTerminalStartupFamilyAdmissions(
+	ctx context.Context, familyID string,
+) {
+	if l == nil || l.catalog == nil || familyID == "" {
+		return
+	}
+	l.startupAdmissionMu.Lock()
+	owners := make([]string, 0, len(l.startupAdmissionFamilies[familyID]))
+	for checkoutID := range l.startupAdmissionFamilies[familyID] {
+		owners = append(owners, checkoutID)
+	}
+	l.startupAdmissionMu.Unlock()
+
+	terminal := make([]string, 0, len(owners))
+	for _, checkoutID := range owners {
+		transition, found, err := l.catalog.GetIntentTransition(ctx, checkoutID)
+		if err != nil {
+			continue
+		}
+		if !found || transition.State == store_sqlite.IntentTransitionFailed {
+			terminal = append(terminal, checkoutID)
+		}
+	}
+	if len(terminal) == 0 {
+		return
+	}
+	l.startupAdmissionMu.Lock()
+	ownersByID := l.startupAdmissionFamilies[familyID]
+	for _, checkoutID := range terminal {
+		delete(ownersByID, checkoutID)
+	}
+	if len(ownersByID) == 0 {
+		delete(l.startupAdmissionFamilies, familyID)
+	}
+	l.startupAdmissionMu.Unlock()
+}
+
+// watchStartupFamilyAdmission releases a cold-start owner when its admitted
+// transition attempt terminates without publication. The durable transition
+// remains retryable, but this failed run must not leave a process-local marker
+// capable of misclassifying the next genuinely runtime-discovered worktree as
+// startup inventory. A later Seed/retry marks the owner again before it runs.
+func (l *CheckoutLifecycle) watchStartupFamilyAdmission(
+	familyID, checkoutID string, run *modeTransitionRun,
+) {
+	if l == nil || familyID == "" || checkoutID == "" || run == nil {
+		return
+	}
+	go func() {
+		<-run.done
+		if run.outcome.err != nil {
+			l.releaseStartupFamilyAdmission(familyID, checkoutID)
+		}
+	}()
+}
+
 // reconcileFamilyNow reconciles one family and applies its coordinator
 // dispositions immediately. Failures stay best-effort for registration and
 // startup; the next topology event or scheduled sweep asks again.
 func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fallbackDir string) {
+	policy := coordinatorAdmissionRuntime
+	startupPending := l.startupFamilyAdmissionPending(familyID)
+	if startupPending {
+		policy = coordinatorAdmissionStartupRoutedOnly
+	}
+	if l.reconcileFamilyNowWithAdmission(ctx, familyID, fallbackDir, policy) && startupPending {
+		// One Git family may own several configured promotions. Release only
+		// owners whose durable transition is terminal; a first successful
+		// publication must not turn the remaining cold owners into runtime eager
+		// inventory.
+		l.releaseTerminalStartupFamilyAdmissions(ctx, familyID)
+	}
+}
+
+func (l *CheckoutLifecycle) reconcileFamilyNowWithAdmission(
+	ctx context.Context,
+	familyID, fallbackDir string,
+	policy coordinatorAdmissionPolicy,
+) bool {
 	if l == nil || l.rec == nil || familyID == "" {
-		return
+		return false
 	}
 	report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, fallbackDir))
 	if err != nil {
 		l.logger.Debug("checkout lifecycle: could not reconcile the family",
 			zap.String("family", familyID), zap.Error(err))
-		return
+		return false
 	}
+	ctx = withCoordinatorAdmissionPolicy(ctx, policy)
 	if err := l.applyReconcileReport(ctx, report); err != nil {
 		l.logger.Debug("checkout lifecycle: family root convergence remains pending",
 			zap.String("family", familyID), zap.Error(err))
+		return false
 	}
 	if familyReportRemoved(report) {
 		l.saveConfig("reconcile")
 		l.notifyTrackedSetChanged()
 	}
+	return true
 }
 
 // familyProbe is one family and the directory to read its inventory from.
@@ -2219,11 +2380,83 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
 	}
+	checkoutIDs := make([]string, 0, len(report.Checkouts))
 	for _, entry := range report.Checkouts {
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
 		}
+		checkoutIDs = append(checkoutIDs, entry.CheckoutID)
+	}
+	if len(checkoutIDs) == 0 {
+		return
+	}
+
+	checkouts, err := l.catalog.ListCheckouts(ctx, report.FamilyID)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not batch coordinator checkout admission",
+			zap.String("family", report.FamilyID), zap.Error(err))
+		return
+	}
+	checkoutByID := make(map[string]store_sqlite.Checkout, len(checkouts))
+	for _, checkout := range checkouts {
+		checkoutByID[checkout.CheckoutID] = checkout
+	}
+	routes, err := l.catalog.GetCheckoutRoutes(ctx, checkoutIDs)
+	if err != nil {
+		l.logger.Warn("checkout lifecycle: could not batch coordinator route admission",
+			zap.String("family", report.FamilyID), zap.Error(err))
+		return
+	}
+
+	policy := coordinatorAdmissionPolicyFrom(ctx)
+	if l.startupFamilyAdmissionPending(report.FamilyID) {
+		policy = coordinatorAdmissionStartupRoutedOnly
+	}
+	for _, entry := range report.Checkouts {
+		if entry.CheckoutID == "" || !entry.Durable {
+			continue
+		}
+		checkout, found := checkoutByID[entry.CheckoutID]
+		_, routed := routes[entry.CheckoutID]
+		if !coordinatorReportAdmitted(policy, entry, checkout, found, routed,
+			l.hasCoordinator(entry.CheckoutID)) {
+			continue
+		}
 		l.applyCoordinatorReport(ctx, report.FamilyID, entry)
+	}
+}
+
+func coordinatorReportAdmitted(
+	policy coordinatorAdmissionPolicy,
+	entry reconcile.CheckoutReport,
+	checkout store_sqlite.Checkout,
+	found, routed, live bool,
+) bool {
+	// Missing and non-ready rows still converge so stale coordinators and
+	// routes are withdrawn. The fresh catalog row, not a possibly stale report,
+	// decides whether a ready checkout may start work.
+	if !found || checkout.State != store_sqlite.CheckoutStateReady {
+		return true
+	}
+	if checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
+		return true
+	}
+	if live || routed || checkout.ActiveIntentTransitionID != "" {
+		return true
+	}
+	if policy == coordinatorAdmissionStartupRoutedOnly {
+		return false
+	}
+	if entry.RootMoved {
+		return true
+	}
+	switch entry.Action {
+	case reconcile.ActionIdentityAllocated,
+		reconcile.ActionAvailabilityRecovered,
+		reconcile.ActionRemovalCancelled:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2840,6 +3073,84 @@ func (l *CheckoutLifecycle) SignalCheckout(checkoutID, reason string) bool {
 	return true
 }
 
+// ActivateCheckout schedules admission of one cataloged automatic checkout on demand
+// without waiting for coordinator construction or generation publication.
+// Concurrent selectors coalesce before the goroutine is launched, so they
+// cannot create one publisher goroutine apiece. The lifecycle context, rather
+// than the selecting request, owns the work: an immediate base fallback may
+// end the request while admission continues, but Close still cancels and joins
+// it before retiring the catalog and indexers it reads.
+func (l *CheckoutLifecycle) ActivateCheckout(
+	checkoutID, reason string,
+) bool {
+	if l == nil || l.catalog == nil || checkoutID == "" {
+		return false
+	}
+	if l.SignalCheckout(checkoutID, reason) {
+		return true
+	}
+	admitted, active := l.beginCheckoutActivation(checkoutID)
+	if !admitted {
+		return active
+	}
+	go l.activateCheckout(checkoutID, reason)
+	return true
+}
+
+func (l *CheckoutLifecycle) activateCheckout(checkoutID, reason string) {
+	defer l.finishCheckoutActivation(checkoutID)
+	ctx := l.transitionCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	if err != nil || !found || checkout.State != store_sqlite.CheckoutStateReady ||
+		checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
+		return
+	}
+	l.applyCoordinatorReport(ctx, checkout.FamilyID, reconcile.CheckoutReport{
+		AdminName:   checkout.AdminName,
+		RootPath:    checkout.RootPath,
+		CheckoutID:  checkout.CheckoutID,
+		Incarnation: checkout.Incarnation,
+		Durable:     true,
+		State:       checkout.State,
+		Action:      reconcile.ActionReadyConfirmed,
+	})
+	l.SignalCheckout(checkoutID, reason)
+}
+
+func (l *CheckoutLifecycle) beginCheckoutActivation(checkoutID string) (admitted, active bool) {
+	l.coordMu.Lock()
+	defer l.coordMu.Unlock()
+	if l.coordinatorClosing {
+		return false, false
+	}
+	if coordinator := l.coordinators[checkoutID]; coordinator != nil && coordinator.Running() {
+		return false, true
+	}
+	if l.runningLocked(checkoutID) {
+		return false, true
+	}
+	if l.coordinatorActivating == nil {
+		l.coordinatorActivating = map[string]struct{}{}
+	}
+	if _, exists := l.coordinatorActivating[checkoutID]; exists {
+		return false, true
+	}
+	l.coordinatorActivating[checkoutID] = struct{}{}
+	l.coordinatorStartWG.Add(1)
+	return true, true
+}
+
+func (l *CheckoutLifecycle) finishCheckoutActivation(checkoutID string) {
+	l.coordMu.Lock()
+	delete(l.coordinatorActivating, checkoutID)
+	l.coordMu.Unlock()
+	l.coordinatorStartWG.Done()
+}
+
 // CheckoutMutationReady reports whether an exact checked-out route has a live
 // coordinator rooted at the same working copy the request selected. It is the
 // admission check mutating MCP tools use before touching disk; a catalog route
@@ -3026,6 +3337,7 @@ func (l *CheckoutLifecycle) Close() error {
 	l.coordMu.Lock()
 	l.coordinators = map[string]*CheckoutCoordinator{}
 	l.coordinatorHeads = map[string]checkoutHeadIdentity{}
+	l.coordinatorActivating = map[string]struct{}{}
 	l.started = map[string][]*CheckoutCoordinator{}
 	viewmetrics.SetGauge(viewmetrics.Coordinators, 0)
 	l.coordMu.Unlock()
@@ -3755,9 +4067,18 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			// starting its automatic siblings against a missing primary base.
 			// TrackSourceImplicit is deliberate: recordConfiguredCheckout restored
 			// every config-owned intent above, so promotion must not mint another.
+			// A cold promotion may finish after Seed returns because the startup
+			// gate owns its physical build. Mark the family before scheduling the
+			// worker so its publication callback cannot race ahead and classify
+			// every pre-existing sibling as runtime discovery.
+			l.markStartupFamilyAdmission(identity.familyID, identity.checkoutID)
 			promoted, run, promoteErr := l.startPromoteCheckout(
 				ctx, identity.checkoutID, TrackSourceImplicit,
 			)
+			l.watchStartupFamilyAdmission(identity.familyID, identity.checkoutID, run)
+			if run == nil {
+				l.releaseStartupFamilyAdmission(identity.familyID, identity.checkoutID)
+			}
 			if promoteErr == nil && run != nil {
 				gate := l.buildGate()
 				if gate == nil || gate.IsOpen() {
@@ -3814,7 +4135,9 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	// Pending cold promotions reconcile from their transition worker after the
 	// active base publication, never against an empty graph_ready shell.
 	for familyID, probeDir := range seeded {
-		l.reconcileFamilyNow(ctx, familyID, probeDir)
+		l.reconcileFamilyNowWithAdmission(
+			ctx, familyID, probeDir, coordinatorAdmissionStartupRoutedOnly,
+		)
 	}
 	return errors.Join(errs...)
 }

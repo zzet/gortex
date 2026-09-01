@@ -861,11 +861,13 @@ func (s *Server) materializeRequestView(
 		return fallback(graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("read the route of checkout %q", checkout.CheckoutID), err))
 	case !found || !graphview.RouteReady(route):
+		s.activateSelectedCheckout(checkout.CheckoutID, "checkout selected while route is building")
 		return fallback(graphview.NewViewError(graphview.CodeViewBuilding,
 			fmt.Sprintf("checkout %q is not fully routed yet", checkout.CheckoutID)))
 	}
 
 	if err := s.checkoutRouteHeadError(ctx, checkout, route); err != nil {
+		s.activateSelectedCheckout(checkout.CheckoutID, "checkout selected with a stale HEAD route")
 		return fallback(err)
 	}
 
@@ -886,6 +888,17 @@ func (s *Server) materializeRequestView(
 	}
 	routed.bindSources(view.GenerationSources(), s.graph)
 	return routed, nil
+}
+
+func (s *Server) activateSelectedCheckout(checkoutID, reason string) {
+	if s == nil || s.lifecycle == nil || checkoutID == "" {
+		return
+	}
+	// ActivateCheckout publishes no route synchronously. It only coalesces
+	// coordinator construction and signals its background loop, so the request
+	// keeps the existing immediate labeled fallback (or strict refusal) while
+	// the exact checkout view catches up.
+	s.lifecycle.ActivateCheckout(checkoutID, reason)
 }
 
 // materializeBuildingBaseFallback serves the family's selected sealed base

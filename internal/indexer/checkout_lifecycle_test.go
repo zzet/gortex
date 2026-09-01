@@ -1230,18 +1230,6 @@ func TestCheckoutLifecycleSeedDefersAutomaticWorktreesUntilPrimaryPublication(t 
 	gc := f.cm.Global()
 	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: main, Name: "seed-gated-main"}))
 	require.NoError(t, gc.Save())
-	// Model watcher discovery that raced ahead of cold primary publication.
-	// Discovery owns Git topology scanning; this test starts after that boundary
-	// with an already-durable automatic checkout and exercises publication only.
-	inv, err := gitstate.Inventory(ctx, linked)
-	require.NoError(t, err)
-	familyID := FamilyIDFor(inv.CommonDir)
-	require.NoError(t, f.lc.upsertFamily(ctx, familyID, inv.CommonDir, f.clock.Now().Unix()))
-	record := recordForRoot(inv, linked)
-	require.NotNil(t, record)
-	automatic, err := f.lc.allocateCheckout(ctx, familyID, linked, record, inv, f.clock.Now())
-	require.NoError(t, err)
-	require.Equal(t, store_sqlite.CheckoutModeAutomatic, automatic.EffectiveMode)
 
 	gate := NewViewBuildGate()
 	f.lc.SetBuildGate(gate)
@@ -1256,8 +1244,8 @@ func TestCheckoutLifecycleSeedDefersAutomaticWorktreesUntilPrimaryPublication(t 
 		"automatic worktrees must not start against an unpublished primary")
 	checkouts, err := f.catalog.ListCheckouts(ctx, primary.FamilyID)
 	require.NoError(t, err)
-	require.Len(t, checkouts, 2,
-		"the discovered automatic identity is retained while its coordinator waits")
+	require.Len(t, checkouts, 1,
+		"cold worktree inventory waits for a servable primary before allocating siblings")
 
 	gate.Open()
 	require.Eventually(t, func() bool {
@@ -1266,17 +1254,112 @@ func TestCheckoutLifecycleSeedDefersAutomaticWorktreesUntilPrimaryPublication(t 
 	}, 5*time.Second, 10*time.Millisecond, "primary promotion did not publish")
 	require.Len(t, builds, 1, "opening startup admits exactly one primary corpus build")
 
-	retained, found, err := f.catalog.GetCheckout(ctx, automatic.CheckoutID)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, linked, retained.RootPath)
-	require.Equal(t, store_sqlite.CheckoutModeAutomatic, retained.EffectiveMode,
-		"publication must route the pre-discovered checkout without changing its ownership mode")
 	require.Eventually(t, func() bool {
-		route, routed, routeErr := f.catalog.GetCheckoutRoute(ctx, automatic.CheckoutID)
-		return routeErr == nil && routed && route.GraphID == primary.GraphID && route.State == store_sqlite.RouteActive
+		checkouts, listErr := f.catalog.ListCheckouts(ctx, primary.FamilyID)
+		return listErr == nil && len(checkouts) == 2
 	}, 5*time.Second, 10*time.Millisecond,
-		"automatic worktree never received a composed primary route")
+		"cold inventory did not retain the linked worktree as a catalog row")
+	checkouts, err = f.catalog.ListCheckouts(ctx, primary.FamilyID)
+	require.NoError(t, err)
+	var automatic store_sqlite.Checkout
+	for _, checkout := range checkouts {
+		if checkout.CheckoutID != primary.OwnerCheckoutID {
+			automatic = checkout
+		}
+	}
+	require.NotEmpty(t, automatic.CheckoutID)
+	require.Equal(t, pathkey.CanonicalExistingRoot(linked),
+		pathkey.CanonicalExistingRoot(automatic.RootPath))
+	require.Equal(t, store_sqlite.CheckoutModeAutomatic, automatic.EffectiveMode)
+	_, routed, err := f.catalog.GetCheckoutRoute(ctx, automatic.CheckoutID)
+	require.NoError(t, err)
+	require.False(t, routed, "cold route-free worktree must remain catalog-only")
+	require.False(t, f.lc.SignalCheckout(automatic.CheckoutID, "cold-start probe"),
+		"cold route-free worktree unexpectedly owns a coordinator")
+	require.Zero(t, checkoutSignalWatcherCount(f.lc),
+		"cold route-free worktree unexpectedly owns a source watcher")
+	require.Equal(t, 1, f.lc.LiveCoordinators(primary.FamilyID),
+		"only the explicitly configured primary may run after cold publication")
+
+	require.True(t, f.lc.ActivateCheckout(automatic.CheckoutID, "selected by test"),
+		"selected catalog checkout was not admitted")
+	require.Eventually(t, func() bool {
+		route, found, routeErr := f.catalog.GetCheckoutRoute(ctx, automatic.CheckoutID)
+		return routeErr == nil && found && route.GraphID == primary.GraphID &&
+			route.State == store_sqlite.RouteActive
+	}, 5*time.Second, 10*time.Millisecond,
+		"selected automatic worktree never received a composed primary route")
+	require.Positive(t, checkoutSignalWatcherCount(f.lc),
+		"selected automatic worktree did not attach its source watcher")
+
+	// A durable route is the warm-start activation record. Restart restores
+	// this checkout, while any route-free siblings would remain catalog-only.
+	f.restart()
+	require.NoError(t, f.lc.Seed(ctx))
+	require.True(t, f.lc.SignalCheckout(automatic.CheckoutID, "warm restore probe"),
+		"warm startup did not restore the previously routed automatic checkout")
+}
+
+func TestCheckoutLifecycleSeedResumedPrimaryPromotionKeepsAutomaticWorktreesDormant(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+
+	main := f.gitRepo("seed-resumed-main")
+	linked := f.worktreeOf(main, "seed-resumed-linked")
+	gc := f.cm.Global()
+	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: main, Name: "seed-resumed-main"}))
+	require.NoError(t, gc.Save())
+
+	gate := NewViewBuildGate()
+	f.lc.SetBuildGate(gate)
+	require.NoError(t, f.lc.Seed(ctx))
+	primary := f.familyOf("seed-resumed-main")
+	require.Zero(t, primary.ActiveGenerationID)
+	_, pending, err := f.catalog.GetIntentTransition(ctx, primary.OwnerCheckoutID)
+	require.NoError(t, err)
+	require.True(t, pending, "closed startup gate did not retain a resumable promotion")
+
+	// Closing cancels only the process-local attempt. The next lifecycle must
+	// recover the durable journal and carry the same routed-only startup policy
+	// through the promotion's post-publication family inventory.
+	f.restart()
+	require.NoError(t, f.lc.Seed(ctx))
+	primary = f.familyOf("seed-resumed-main")
+	require.Positive(t, primary.ActiveGenerationID)
+
+	checkouts, err := f.catalog.ListCheckouts(ctx, primary.FamilyID)
+	require.NoError(t, err)
+	require.Len(t, checkouts, 2)
+	var automatic store_sqlite.Checkout
+	for _, checkout := range checkouts {
+		if checkout.CheckoutID != primary.OwnerCheckoutID {
+			automatic = checkout
+		}
+	}
+	require.NotEmpty(t, automatic.CheckoutID)
+	require.Equal(t, pathkey.CanonicalExistingRoot(linked),
+		pathkey.CanonicalExistingRoot(automatic.RootPath))
+	_, routed, err := f.catalog.GetCheckoutRoute(ctx, automatic.CheckoutID)
+	require.NoError(t, err)
+	require.False(t, routed, "resumed cold promotion eagerly routed its automatic sibling")
+	require.False(t, f.lc.SignalCheckout(automatic.CheckoutID, "resumed cold-start probe"),
+		"resumed cold promotion eagerly started its automatic sibling")
+	require.Zero(t, checkoutSignalWatcherCount(f.lc))
+	require.Equal(t, 1, f.lc.LiveCoordinators(primary.FamilyID))
+}
+
+func checkoutSignalWatcherCount(lifecycle *CheckoutLifecycle) int {
+	if lifecycle == nil {
+		return 0
+	}
+	lifecycle.checkoutSignalWatchMu.Lock()
+	watchers := lifecycle.checkoutSignalWatchers
+	lifecycle.checkoutSignalWatchMu.Unlock()
+	if watchers == nil {
+		return 0
+	}
+	return watchers.Len()
 }
 
 // TestCheckoutLifecycleSeedReusesDedicatedGraphOwnedUnderPreviousPrefix covers
@@ -1519,13 +1602,21 @@ func TestCoordinatorLivenessFollowsTheLoopNotTheRegistry(t *testing.T) {
 	f := newFamilyFixture(t, "liveness")
 	defer f.close()
 	ctx := context.Background()
+	// Warm startup restores only automatic checkouts that have already
+	// published a durable route. Route-free automatic rows are intentionally
+	// catalog-only after the lazy-admission change, so make this liveness test's
+	// precondition explicit instead of depending on a quiet-window timer.
+	f.runCoordinator(f.automatic.CheckoutID)
+	_, routed, err := f.catalog.GetCheckoutRoute(ctx, f.automatic.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, routed)
 
 	// The daemon's restart path: a fresh stack over the same store, the tracked
 	// set re-registered the way warmup re-tracks it, and the seeding that
 	// reconciles every family it touched — which brings both the dedicated
 	// primary and the automatic checkout's coordinators back up.
 	f.restart()
-	_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
+	_, err = f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
 	require.NoError(t, err)
 	require.NoError(t, f.lc.Seed(ctx))
 	owner := f.checkoutOf(f.mainPrefix)

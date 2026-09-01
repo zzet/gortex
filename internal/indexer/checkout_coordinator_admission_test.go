@@ -2,6 +2,8 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -133,4 +135,181 @@ func TestApplyCoordinatorsLosesStaleReportToReadyRecovery(t *testing.T) {
 	after := liveCoordinatorOrNil(f.lc, f.automatic.CheckoutID)
 	require.Same(t, before, after, "a stale non-ready report retired the recovered coordinator")
 	require.True(t, after.Running())
+}
+
+func TestCoordinatorReportAdmissionPolicy(t *testing.T) {
+	automatic := store_sqlite.Checkout{
+		CheckoutID:    "automatic",
+		EffectiveMode: store_sqlite.CheckoutModeAutomatic,
+		State:         store_sqlite.CheckoutStateReady,
+	}
+	dedicated := automatic
+	dedicated.EffectiveMode = store_sqlite.CheckoutModeDedicated
+	transitioning := automatic
+	transitioning.ActiveIntentTransitionID = "transition"
+
+	tests := []struct {
+		name     string
+		policy   coordinatorAdmissionPolicy
+		entry    reconcile.CheckoutReport
+		checkout store_sqlite.Checkout
+		found    bool
+		routed   bool
+		live     bool
+		want     bool
+	}{
+		{
+			name:     "cold route-free automatic remains catalog-only",
+			policy:   coordinatorAdmissionStartupRoutedOnly,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionIdentityAllocated},
+			checkout: automatic, found: true,
+		},
+		{
+			name:     "cold routed automatic is restored",
+			policy:   coordinatorAdmissionStartupRoutedOnly,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed},
+			checkout: automatic, found: true, routed: true, want: true,
+		},
+		{
+			name:     "cold live automatic is retained",
+			policy:   coordinatorAdmissionStartupRoutedOnly,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed},
+			checkout: automatic, found: true, live: true, want: true,
+		},
+		{
+			name:     "cold required transition is admitted",
+			policy:   coordinatorAdmissionStartupRoutedOnly,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed},
+			checkout: transitioning, found: true, want: true,
+		},
+		{
+			name:     "runtime discovery is admitted",
+			policy:   coordinatorAdmissionRuntime,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionIdentityAllocated},
+			checkout: automatic, found: true, want: true,
+		},
+		{
+			name:     "runtime recovery is admitted",
+			policy:   coordinatorAdmissionRuntime,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionAvailabilityRecovered},
+			checkout: automatic, found: true, want: true,
+		},
+		{
+			name:     "runtime removal cancellation is admitted",
+			policy:   coordinatorAdmissionRuntime,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionRemovalCancelled},
+			checkout: automatic, found: true, want: true,
+		},
+		{
+			name:     "runtime root move is admitted",
+			policy:   coordinatorAdmissionRuntime,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed, RootMoved: true},
+			checkout: automatic, found: true, want: true,
+		},
+		{
+			name:     "routine runtime inventory does not wake dormant automatic",
+			policy:   coordinatorAdmissionRuntime,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed},
+			checkout: automatic, found: true,
+		},
+		{
+			name:     "dedicated checkout always converges",
+			policy:   coordinatorAdmissionStartupRoutedOnly,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed},
+			checkout: dedicated, found: true, want: true,
+		},
+		{
+			name:     "missing checkout always converges teardown",
+			policy:   coordinatorAdmissionStartupRoutedOnly,
+			entry:    reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed},
+			checkout: automatic, want: true,
+		},
+		{
+			name:   "non-ready checkout always converges teardown",
+			policy: coordinatorAdmissionStartupRoutedOnly,
+			entry:  reconcile.CheckoutReport{Action: reconcile.ActionReadyConfirmed},
+			checkout: func() store_sqlite.Checkout {
+				checkout := automatic
+				checkout.State = store_sqlite.CheckoutStateAvailabilityGrace
+				return checkout
+			}(),
+			found: true, want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, coordinatorReportAdmitted(
+				tt.policy, tt.entry, tt.checkout, tt.found, tt.routed, tt.live,
+			))
+		})
+	}
+	assert.Equal(t, coordinatorAdmissionRuntime, coordinatorAdmissionPolicyFrom(nil),
+		"a defensive nil context retains runtime admission semantics")
+}
+
+func TestCheckoutActivationAdmissionCoalesces(t *testing.T) {
+	lifecycle := &CheckoutLifecycle{
+		coordinators:          map[string]*CheckoutCoordinator{},
+		coordinatorHeads:      map[string]checkoutHeadIdentity{},
+		coordinatorActivating: map[string]struct{}{},
+		started:               map[string][]*CheckoutCoordinator{},
+	}
+
+	admitted, active := lifecycle.beginCheckoutActivation("checkout")
+	require.True(t, admitted)
+	require.True(t, active)
+	admitted, active = lifecycle.beginCheckoutActivation("checkout")
+	assert.False(t, admitted)
+	assert.True(t, active, "a coalesced selector observes scheduled activation")
+
+	lifecycle.finishCheckoutActivation("checkout")
+	admitted, active = lifecycle.beginCheckoutActivation("checkout")
+	assert.True(t, admitted, "a completed failed attempt may be retried")
+	assert.True(t, active)
+	lifecycle.finishCheckoutActivation("checkout")
+}
+
+func TestFailedStartupPromotionReleasesAdmissionMarker(t *testing.T) {
+	lifecycle := &CheckoutLifecycle{
+		startupAdmissionFamilies: map[string]map[string]struct{}{},
+	}
+	run := &modeTransitionRun{done: make(chan struct{})}
+	lifecycle.markStartupFamilyAdmission("family", "checkout")
+	lifecycle.watchStartupFamilyAdmission("family", "checkout", run)
+	require.True(t, lifecycle.startupFamilyAdmissionPending("family"))
+
+	run.outcome.err = errors.New("terminal attempt failure")
+	close(run.done)
+	require.Eventually(t, func() bool {
+		return !lifecycle.startupFamilyAdmissionPending("family")
+	}, time.Second, time.Millisecond,
+		"a failed cold promotion left runtime discovery under startup policy")
+}
+
+func BenchmarkStartupCoordinatorAdmissionRouteFreeAutomatic(b *testing.B) {
+	entry := reconcile.CheckoutReport{Action: reconcile.ActionIdentityAllocated}
+	checkout := store_sqlite.Checkout{
+		CheckoutID:    "automatic",
+		EffectiveMode: store_sqlite.CheckoutModeAutomatic,
+		State:         store_sqlite.CheckoutStateReady,
+	}
+	for _, checkouts := range []int{256, 10_000} {
+		b.Run(strconv.Itoa(checkouts), func(b *testing.B) {
+			for iteration := 0; iteration < b.N; iteration++ {
+				admitted := 0
+				for checkoutIndex := 0; checkoutIndex < checkouts; checkoutIndex++ {
+					if coordinatorReportAdmitted(
+						coordinatorAdmissionStartupRoutedOnly,
+						entry, checkout, true, false, false,
+					) {
+						admitted++
+					}
+				}
+				if admitted != 0 {
+					b.Fatalf("admitted %d route-free automatic checkouts", admitted)
+				}
+			}
+		})
+	}
 }
