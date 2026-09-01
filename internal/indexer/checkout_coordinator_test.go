@@ -1834,17 +1834,31 @@ func TestCheckoutLifecycleCollectsAForgottenCheckoutsPayload(t *testing.T) {
 	}
 
 	// Entering removal grace withdraws the overlay route immediately so reads
-	// fall back to the base graph. Only the forgotten checkout's unique dirty
-	// layer is collectable: its commit layer is canonical and still routed by
-	// the surviving primary checkout.
-	if retired := grace.Retired + gone.Retired; retired != 1 {
-		t.Fatalf("the sweeps collected %d generations, want the forgotten checkout's unique dirty layer exactly once", retired)
+	// fall back to the base graph. The forgotten checkout's routed dirty layer
+	// must be collected, while its canonical commit layer remains routed by the
+	// surviving primary. A coordinator canceled just before this test takes it
+	// over may also leave a failed/building attempt for the same sweeps; the
+	// report is global, so count identities below instead of assuming that no
+	// canceled attempt existed.
+	if retired := grace.Retired + gone.Retired; retired < 1 {
+		t.Fatal("the sweeps reported no retired generation for the forgotten checkout")
 	}
 	if _, found, err := f.catalog.GetViewGeneration(ctx, routed.DirtyGenerationID); err != nil || found {
 		t.Fatalf("dirty generation %d outlived the checkout it was built for (err=%v)", routed.DirtyGenerationID, err)
 	}
 	if _, found, err := f.catalog.GetViewGeneration(ctx, routed.CommitGenerationID); err != nil || !found {
 		t.Fatalf("shared commit generation %d did not survive the primary route (err=%v)", routed.CommitGenerationID, err)
+	}
+	owned, err := f.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{CheckoutID: automatic})
+	if err != nil {
+		t.Fatalf("list forgotten checkout generations: %v", err)
+	}
+	for _, generation := range owned {
+		if generation.GenerationID != routed.CommitGenerationID {
+			t.Fatalf("generation %d (%s/%s) outlived forgotten checkout; shared commit is %d",
+				generation.GenerationID, generation.GenerationKind, generation.State,
+				routed.CommitGenerationID)
+		}
 	}
 }
 
