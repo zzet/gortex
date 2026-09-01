@@ -2389,6 +2389,8 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (result *IndexRes
 // indexCtxRaw performs full-tree indexing while the caller holds the
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
+	defer recoverIndexCtxRawStoragePanic(&result, &retErr)
+
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
 	// Pin the destination's reachability scope before the cold-index shadow can
@@ -2780,17 +2782,23 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			idx.resolver.SetGraph(inMemShadow)
 		}
 		defer func() {
-			if retErr != nil {
-				if deferredVectorPlan != nil {
-					deferredVectorPlan.Release()
-					deferredVectorPlan = nil
-				}
+			// Restore the durable graph and every shadow-routed sink even when a
+			// legacy store mutation panics from inside this drain. This defer is
+			// registered before the drain does any work, so it also releases a
+			// vector plan whose ownership was never transferred to installation.
+			defer func() {
 				idx.graph = diskTarget
 				idx.contentSink = nil
 				idx.contractStateSink = nil
 				if idx.resolver != nil {
 					idx.resolver.SetGraph(diskTarget)
 				}
+				if deferredVectorPlan != nil {
+					deferredVectorPlan.Release()
+					deferredVectorPlan = nil
+				}
+			}()
+			if retErr != nil {
 				return
 			}
 			reporter.Report("persisting bulk graph", 0, 0)
@@ -4197,6 +4205,26 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		idx.fullReindexed.Store(true)
 	}
 	return result, nil
+}
+
+// recoverIndexCtxRawStoragePanic contains operational SQLite failures at the
+// lowest synchronous full-index boundary. indexCtxRaw is also called directly
+// by cold-start, track, reindex, and reconciliation workers, so the public
+// IndexCtx recovery boundary alone cannot protect those goroutines. Registering
+// this defer at method entry makes every later cleanup defer run first. Only the
+// store's typed legacy panic payload is converted; parser, runtime, and
+// programmer panics must retain their established propagation semantics.
+func recoverIndexCtxRawStoragePanic(result **IndexResult, retErr *error) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+	if !ok {
+		panic(recovered)
+	}
+	*result = nil
+	*retErr = fmt.Errorf("indexer: graph storage failure: %w", storageErr)
 }
 
 // repoNodeEdgeCount returns this indexer's contribution to the graph,

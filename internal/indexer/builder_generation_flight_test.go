@@ -387,6 +387,71 @@ func TestSparseGenerationBuilderConvertsOnlyStorePanicToFailure(t *testing.T) {
 	}
 }
 
+func TestSparseGenerationBuilderAbandonsWithDetachedContextAfterCanceledStoragePanic(t *testing.T) {
+	fixture := newSparseBuildFlightFixture(t)
+	storageErr := fixture.store.AddBatchChecked([]*graph.Node{{
+		ID: "invalid-meta-canceled-cleanup", Kind: graph.KindFunction,
+		Meta: map[string]any{"unsupported": make(chan int)},
+	}}, nil)
+	if storageErr == nil {
+		t.Fatal("unsupported metadata unexpectedly produced no storage error")
+	}
+	var typed *store_sqlite.StorageError
+	if !errors.As(storageErr, &typed) {
+		t.Fatalf("storage error = %T %v, want *StorageError", storageErr, storageErr)
+	}
+
+	buildCtx, cancelBuild := context.WithCancel(context.Background())
+	defer cancelBuild()
+	fixture.request.PrePublish = func(context.Context, int64) error {
+		cancelBuild()
+		panic(storageErr)
+	}
+
+	var (
+		cleanupCalled      bool
+		cleanupContextErr  error
+		cleanupRemaining   time.Duration
+		cleanupHasDeadline bool
+	)
+	fixture.builder.failViewGeneration = func(cleanupCtx context.Context, generationID int64, reason string) error {
+		cleanupCalled = true
+		cleanupContextErr = cleanupCtx.Err()
+		deadline, ok := cleanupCtx.Deadline()
+		cleanupHasDeadline = ok
+		if ok {
+			cleanupRemaining = time.Until(deadline)
+		}
+		return fixture.store.Catalog().FailViewGeneration(cleanupCtx, generationID, reason)
+	}
+
+	generationID, _, err := fixture.builder.Build(buildCtx, fixture.request)
+	if err == nil || !errors.As(err, &typed) {
+		t.Fatalf("Build error = %T %v, want returned StorageError", err, err)
+	}
+	if !errors.Is(buildCtx.Err(), context.Canceled) {
+		t.Fatalf("build context error = %v, want context canceled", buildCtx.Err())
+	}
+	if !cleanupCalled {
+		t.Fatal("abandoned generation did not attempt durable cleanup")
+	}
+	if cleanupContextErr != nil {
+		t.Fatalf("cleanup context was already canceled: %v", cleanupContextErr)
+	}
+	if !cleanupHasDeadline || cleanupRemaining <= 0 || cleanupRemaining > generationAbandonTimeout {
+		t.Fatalf("cleanup deadline remaining = %v present=%t, want live deadline within %v",
+			cleanupRemaining, cleanupHasDeadline, generationAbandonTimeout)
+	}
+	row, found, getErr := fixture.store.Catalog().GetViewGeneration(context.Background(), generationID)
+	if getErr != nil || !found {
+		t.Fatalf("failed generation: found=%v err=%v", found, getErr)
+	}
+	if row.State != store_sqlite.ViewGenerationFailed ||
+		row.Error != "graph storage write failed; see daemon log" {
+		t.Fatalf("failed generation = %+v", row)
+	}
+}
+
 func TestSparseGenerationBuilderRetainsProcessFailureWhenCatalogFailureWriteFails(t *testing.T) {
 	fixture := newSparseBuildFlightFixture(t)
 	storageErr := fixture.store.AddBatchChecked([]*graph.Node{{
