@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -1335,9 +1336,73 @@ func localizationFinalResponseSymbolLabel(row localizationDigestRow, qualify boo
 	id := localizationFinalResponseField(row.ID)
 	file := localizationFinalResponseField(row.File)
 	if !qualify || id == "" || file == "" || strings.Contains(id, file) {
-		return id
+		return localizationDisplayIdentity(id, row.Line)
 	}
-	return file + "::" + id
+	return file + "::" + localizationDisplayIdentity(id, row.Line)
+}
+
+// localizationDisplayIdentity renders one retained identity for prose. A graph
+// ID carries two spellings no answer can say: the keyword a constructor is
+// indexed under, and the positional suffix that separates same-named
+// declarations. Both are presentation-only. The row's ID, the graph, and every
+// machine field keep their exact spelling — only this label changes.
+func localizationDisplayIdentity(identity string, line int) string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return identity
+	}
+	prefix := ""
+	member := identity
+	if cut := strings.LastIndex(identity, "::"); cut >= 0 {
+		prefix, member = identity[:cut+2], identity[cut+2:]
+	}
+	member = localizationConstructorProse(localizationTrimPositionalSuffix(member, line))
+	if member == "" {
+		return identity
+	}
+	return prefix + member
+}
+
+// localizationTrimPositionalSuffix drops the `_L<line>` / `@<line>` tie-break
+// extractors append when one file declares the same name twice. The rendered
+// row already carries the line in its own column. The trailing number must be
+// that line: a declaration genuinely named `CACHE_L2` cannot satisfy it, and
+// emitters disagree by one on where a declaration starts.
+func localizationTrimPositionalSuffix(member string, line int) string {
+	digits := len(member)
+	for digits > 0 && member[digits-1] >= '0' && member[digits-1] <= '9' {
+		digits--
+	}
+	if digits == len(member) {
+		return member
+	}
+	suffix, err := strconv.Atoi(member[digits:])
+	if err != nil || (line > 0 && suffix != line && suffix != line-1 && suffix != line+1) {
+		return member
+	}
+	switch {
+	case digits >= 2 && member[digits-2] == '_' && member[digits-1] == 'L':
+		return member[:digits-2]
+	case digits >= 1 && member[digits-1] == '@':
+		return member[:digits-1]
+	}
+	return member
+}
+
+// localizationConstructorProse spells a keyword-indexed constructor the way an
+// answer has to say it. The extractor names it `<Type>.<init>` across Java, C#
+// and Swift; a caller repeating that back is naming a symbol no reader
+// recognizes.
+func localizationConstructorProse(member string) string {
+	const keyword = "<init>"
+	switch {
+	case member == keyword:
+		return "constructor"
+	case strings.HasSuffix(member, "."+keyword):
+		return strings.TrimSuffix(member, "."+keyword) + " constructor"
+	default:
+		return member
+	}
 }
 
 func renderLocalizationAnswerPage(
@@ -1352,6 +1417,8 @@ func renderLocalizationAnswerPage(
 	}
 	var response strings.Builder
 	response.WriteString(heading)
+	response.WriteString("\n")
+	response.WriteString(localizationAnswerShapeDirective)
 	response.WriteString("\n")
 	excerpted := 0
 	for _, item := range presented {
@@ -1421,6 +1488,20 @@ const localizationAnswerClaimDiscipline = "Name only symbols this page lists or 
 // name what the answer should carry, and leave the caller free to disagree —
 // its disagreement is right more often than not.
 const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not. " + localizationAnswerClaimDiscipline
+
+// The same instruction as a closing line is read after the answer is already
+// shaped, which is why it is obeyed at a rate indistinguishable from absence.
+// It leads the page instead, and it names the shape rather than describing it:
+// how many candidates, what each row must carry, and the one thing a caller
+// must not leave out when nothing corroborated the match. Two lines is the
+// budget — every byte here is a byte the evidence rows do not get.
+const localizationAnswerShapeDirective = "ANSWER WITH: the 2-3 strongest candidates below, each as its file plus a bare qualified identifier (Class.method), nothing trailing it.\n" +
+	"If the match is unconfirmed, say so in the answer."
+
+// localizationUnconfirmedAnswerDirective closes a page that terminates without
+// corroboration. It must not read as the proven directive: the caller has to
+// know the bounded allowance ran out and the candidates were never confirmed.
+const localizationUnconfirmedAnswerDirective = "The bounded localization allowance is spent and nothing corroborated these candidates. Answer now from them, naming the files and symbols you rely on, and say plainly that the match is unconfirmed. " + localizationAnswerClaimDiscipline
 
 const (
 	localizationAnswerHeading      = "LOCALIZATION:"
@@ -1649,12 +1730,36 @@ func localizationCompletionWithDigest(completion localizationCompletion, digest 
 		}
 		return completion
 	}
+	if completion.provisionalAnswer {
+		// A terminal state reached without corroboration keeps the unconfirmed
+		// heading it earned — including when it retained nothing at all, which is
+		// the one case a proven page would be furthest from true. Only the closing
+		// line changes: no step remains to prefer, so the page says the allowance
+		// is spent.
+		var rows []localizationDigestRow
+		page := ""
+		if digest != nil {
+			rows, page = digest.Evidence, digest.provisionalResponse
+		}
+		if page == "" {
+			page = renderLocalizationProvisionalResponseForTask("", nil, rows)
+		}
+		completion.FinalResponse = localizationUnconfirmedTerminalPage(page)
+		return completion
+	}
 	if digest != nil && digest.finalResponse != "" {
 		completion.FinalResponse = digest.finalResponse
 	} else if completion.FinalResponse == "" {
 		completion.FinalResponse = renderLocalizationFinalResponse(nil)
 	}
 	return completion
+}
+
+func localizationUnconfirmedTerminalPage(page string) string {
+	if !strings.HasSuffix(page, localizationProvisionalDirective) {
+		return page
+	}
+	return strings.TrimSuffix(page, localizationProvisionalDirective) + localizationUnconfirmedAnswerDirective
 }
 
 func localizationTerminalStructuredContent(payload any, contract localizationTerminalContract) map[string]any {
@@ -1678,6 +1783,9 @@ func localizationTerminalStructuredContent(payload any, contract localizationTer
 		// cache-write rate, which is the most expensive place to repeat oneself:
 		// point at it instead.
 		structured["directive"] = localizationAnswerReadyDirective
+		if contract.Completion.provisionalAnswer {
+			structured["directive"] = localizationUnconfirmedAnswerDirective
+		}
 	}
 	return structured
 }
@@ -1751,7 +1859,8 @@ func localizationAnswerReadyResult(completion localizationCompletion) *mcpgo.Cal
 	// Older retained completions may predate the in-response convergence cue.
 	// Preserve their successful replay shape without duplicating the directive
 	// for newly rendered terminal evidence.
-	if !strings.HasSuffix(visible, localizationAnswerReadyDirective) {
+	if !strings.HasSuffix(visible, localizationAnswerReadyDirective) &&
+		!strings.HasSuffix(visible, localizationUnconfirmedAnswerDirective) {
 		visible += "\n\n" + localizationAnswerReadyDirective
 	}
 	result := mcpgo.NewToolResultText(visible)

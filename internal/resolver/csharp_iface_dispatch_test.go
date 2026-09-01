@@ -402,3 +402,56 @@ func TestResolveCSharpInterfaceDispatch_FanoutTierAndCap(t *testing.T) {
 			"a fan-out wider than the cap is dropped as noise")
 	})
 }
+
+// TestResolveCSharpInterfaceDispatch_DecoratorForwardingNeverSelfEdges pins
+// the decorator/facade shape: a class that implements the SAME interface it
+// wraps and forwards the same-named member through an injected inner
+// instance. The forwarding call binds to the interface member, and the
+// caller is itself a family member — the fan-out must reach the sibling
+// implementation but must NEVER fan back onto the caller: a synthesized
+// from==to edge reads as "the symbol is its own caller" in find_usages
+// consumers. Real recursion is the binder's edge to mint, never this
+// synthesizer's.
+func TestResolveCSharpInterfaceDispatch_DecoratorForwardingNeverSelfEdges(t *testing.T) {
+	g := buildCSharpResolverGraph(t, map[string]string{
+		"IConverter.cs": `namespace App {
+    public interface IConverter {
+        string Convert(int n);
+    }
+}`,
+		"English.cs": `namespace App {
+    public class EnglishConverter : IConverter {
+        public string Convert(int n) { return "en"; }
+    }
+}`,
+		"Caching.cs": `namespace App {
+    public class CachingConverter : IConverter {
+        private readonly IConverter _inner;
+        public CachingConverter(IConverter inner) { _inner = inner; }
+        public string Convert(int n) {
+            IConverter inner = _inner;
+            return inner.Convert(n);
+        }
+    }
+}`,
+	})
+	New(g).ResolveAll()
+
+	callerID := "Caching.cs::CachingConverter.Convert"
+	require.Contains(t, callTargetsFrom(g, callerID), "IConverter.cs::IConverter.Convert",
+		"the forwarding call should bind to the interface member")
+
+	ResolveCSharpInterfaceDispatch(g)
+
+	var fanoutTargets []string
+	for _, e := range g.GetOutEdges(callerID) {
+		if !isIfaceDispatchEdge(e) {
+			continue
+		}
+		require.NotEqual(t, callerID, e.To,
+			"a dispatch fan-out must never claim the caller dispatches to itself (from==to)")
+		fanoutTargets = append(fanoutTargets, e.To)
+	}
+	assert.Contains(t, fanoutTargets, "English.cs::EnglishConverter.Convert",
+		"the legitimate fan-out to the sibling implementation must survive the self guard")
+}

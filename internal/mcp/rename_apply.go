@@ -2,13 +2,13 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/indexer"
 )
 
@@ -422,19 +422,30 @@ func (s *Server) commitRenameWrites(ctx context.Context, writes []*renameFileWri
 		if info, err := os.Stat(w.AbsPath); err == nil {
 			perm = info.Mode().Perm()
 		}
-		if err := agents.AtomicWriteFile(w.AbsPath, w.New, perm); err != nil {
+		// A multi-file rename stops at the first cancelled write rather than
+		// grinding through the rest: every remaining file would be refused
+		// anyway, and the receipts already recorded say exactly how far the
+		// rename got.
+		commit, err := s.commitFileMutation(ctx, "rename_symbol", "", "", w.RelPath, w.AbsPath, w.New, perm)
+		if err != nil {
 			entry["status"] = "failed"
 			entry["error"] = err.Error()
+			attachMutationCommit(entry, commit)
 			results = append(results, entry)
+			if errors.Is(err, errMutationNotApplied) {
+				return results
+			}
 			continue
 		}
 		entry["status"] = "applied"
 		sess.recordModified(w.RelPath)
 		outcome := s.mutationReindexState(ctx, w.AbsPath)
+		commit.recordGraph(outcome)
 		if outcome.Err != nil {
 			entry["reindex_error"] = outcome.Err.Error()
 		}
 		s.attachMutationFreshness(entry, w.RelPath, w.AbsPath, outcome)
+		attachMutationCommit(entry, commit)
 		results = append(results, entry)
 	}
 	return results

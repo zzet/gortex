@@ -34,7 +34,7 @@ func TestFacadeRegistryCoversRegisteredLegacyCatalog(t *testing.T) {
 		}
 	}
 	require.Empty(t, missing, "every registered legacy tool must map into facade-v1")
-	require.Len(t, srv.facades.byLegacy, 178, "facade-v1 migration table must cover the full legacy catalog")
+	require.Len(t, srv.facades.byLegacy, 179, "facade-v1 migration table must cover the full legacy catalog")
 	require.Len(t, facadeToolNames(), 21)
 	for _, name := range facadeToolNames() {
 		if name == "capabilities" {

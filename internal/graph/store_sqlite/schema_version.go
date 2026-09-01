@@ -32,7 +32,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 12
+const currentSchemaVersion = 14
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -80,6 +80,24 @@ var schemaMigrations = []schemaMigration{
 	{version: 10, name: "rebuild vector corpus ownership and parents", inPlace: rebuildVectorCorpusSchema},
 	{version: 11, name: "add symbol FTS normalization state", inPlace: createSymbolFTSNormalizationStateTable},
 	{version: 12, name: "normalize dir column separators", inPlace: normalizeDirColumnSeparators},
+	{version: 13, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
+	{version: 14, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
+}
+
+// purgeUnresolvedTestsEdges removes derived EdgeTests rows whose target is
+// an unresolved stub, in both spellings (`unresolved::X` and the multi-repo
+// `<repo>::unresolved::X` COPY-rewrite form). The test-linkage pass cloned
+// them from unresolved calls before the emission guard existed; stripped of
+// the call's receiver evidence they are naked stubs the resolver now
+// refuses to bind, new emission never re-creates them, and warm startup may
+// skip file-scoped reconciliation entirely — so an old store keeps paying
+// their resolver-scan cost forever without this explicit purge. Idempotent
+// and bounded to the tests kind: pending calls and resolved projections are
+// untouched.
+func purgeUnresolvedTestsEdges(tx *sql.Tx) error {
+	_, err := tx.Exec(`DELETE FROM edges WHERE kind = 'tests'
+		AND (to_id LIKE 'unresolved::%' OR to_id LIKE '%::unresolved::%')`)
+	return err
 }
 
 // normalizeDirColumnSeparators rebuilds the two generated dir columns whose

@@ -93,14 +93,6 @@ func TestSweepFile(t *testing.T) {
 	assert.False(t, sweepFile("bogus", 0, false))
 }
 
-func TestEnrichNodeIsDispatchRelevant(t *testing.T) {
-	assert.True(t, enrichNodeIsDispatchRelevant(&graph.Node{Kind: graph.KindType}))
-	assert.True(t, enrichNodeIsDispatchRelevant(&graph.Node{Kind: graph.KindInterface}))
-	assert.False(t, enrichNodeIsDispatchRelevant(&graph.Node{Kind: graph.KindFunction}))
-	assert.False(t, enrichNodeIsDispatchRelevant(&graph.Node{Kind: graph.KindMethod}))
-	assert.False(t, enrichNodeIsDispatchRelevant(nil))
-}
-
 func TestNodeHasSemanticType(t *testing.T) {
 	assert.False(t, nodeHasSemanticType(nil))
 	assert.False(t, nodeHasSemanticType(&graph.Node{}))
@@ -275,10 +267,15 @@ func TestLSP_Enrich_SweepDispatchRelevantRecoversHierarchyByDefault(t *testing.T
 
 	g := graph.New()
 	// Only type declarations — no functions, so demand == 0 for this file.
+	// The extends clause is syntax, so the extractor emitted its edge even
+	// though it could not resolve the target — the unresolvable-base shape
+	// that keeps the file dispatch-relevant (see typeIsDispatchRelevant).
 	g.AddNode(&graph.Node{ID: "h.ts::Animal", Kind: graph.KindType, Name: "Animal",
 		FilePath: "h.ts", StartLine: 1, EndLine: 1, Language: "typescript"})
 	g.AddNode(&graph.Node{ID: "h.ts::Dog", Kind: graph.KindType, Name: "Dog",
 		FilePath: "h.ts", StartLine: 2, EndLine: 2, Language: "typescript"})
+	g.AddEdge(&graph.Edge{From: "h.ts::Dog", To: graph.UnresolvedMarker + "Animal",
+		Kind: graph.EdgeExtends, FilePath: "h.ts", Line: 2})
 
 	done := make(chan error, 1)
 	go func() {

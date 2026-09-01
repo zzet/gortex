@@ -198,30 +198,31 @@ func TestFinishReservedReadWithDigestMergesOnlyOnAnswerReady(t *testing.T) {
 	}
 }
 
-func TestFinishReservedReadWithDigestEmptySuccessReleasesAdvisoryAndPreservesCurrentTaskDigest(t *testing.T) {
+func TestFinishReservedReadWithDigestEmptySuccessSpendsOneAllowanceAndPreservesCurrentTaskDigest(t *testing.T) {
 	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
 		captureTestRow("repo/storage/base.go::Storage.Load", "repo/storage/base.go"),
 	}, nil)
 	state := &localizationTerminalState{
-		state:                    localizationStateRecoveryInFlight,
-		generation:               5,
-		readReservationToken:     21,
-		readReservationGen:       5,
-		recoveryRetriesRemaining: 1,
-		digest:                   retained,
+		state:                       localizationStateRecoveryInFlight,
+		generation:                  5,
+		readReservationToken:        21,
+		readReservationGen:          5,
+		recoveryRetriesRemaining:    1,
+		recoveryAllowancesRemaining: localizationRecoveryAllowanceCap,
+		digest:                      retained,
 	}
 	completion := state.finishReservedReadTokenWithDigest(21, true, nil, true)
-	if completion.State != localizationStateLocalized || completion.AllowedToolCalls != 0 || completion.Enforceable {
-		t.Fatalf("empty accepted recovery did not release an advisory result: %#v", completion)
+	if completion.State != localizationStateNeedsRecovery || completion.AllowedToolCalls != 1 || completion.Enforceable {
+		t.Fatalf("empty accepted recovery did not keep one further allowance: %#v", completion)
 	}
-	if state.state != localizationStateInactive {
-		t.Fatalf("empty accepted recovery left state restricted: %q", state.state)
+	if state.recoveryAllowancesRemaining != localizationRecoveryAllowanceCap-1 {
+		t.Fatalf("empty accepted recovery spent %d allowances", localizationRecoveryAllowanceCap-state.recoveryAllowancesRemaining)
 	}
-	if state.digest != nil || completion.digest != retained {
-		t.Fatalf("advisory release did not return retained evidence and clear internal authorization: state=%#v completion=%#v", state.digest, completion.digest)
+	if state.digest != retained || completion.digest != retained {
+		t.Fatalf("uncorroborated recovery dropped retained evidence: state=%#v completion=%#v", state.digest, completion.digest)
 	}
 	if got := completion.digest.Evidence[0].ID; got != "repo/storage/base.go::Storage.Load" {
-		t.Fatalf("same-task advisory release changed retained identity: %q", got)
+		t.Fatalf("same-task recovery changed retained identity: %q", got)
 	}
 }
 

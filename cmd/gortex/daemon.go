@@ -409,6 +409,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// handler needs — the MCP server, graph, config manager, overlay
 		// manager, and federation router — so this is pure composition.
 		v1 := server.NewHandler(state.mcpServer.MCPServer(), state.graph, version, logger)
+
 		if state.configManager != nil {
 			v1.SetConfigManager(state.configManager)
 		}
@@ -1250,6 +1251,20 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 	})
 	t.AppendRow(table.Row{"daemon", st.Version})
 	t.AppendRow(table.Row{"pid", st.PID})
+	// Upgrade-skew facts belong next to the daemon version they qualify.
+	// The cli row appears only when this binary's build differs from the
+	// daemon's — the same compare runProxy warns on at connect time — so
+	// a matching pair keeps the table exactly as terse as before. The
+	// binary row surfaces the daemon's own on-disk drift probe and only
+	// when it actually ran: an unchecked binary is unknown, not fresh,
+	// and must not be reported as either.
+	local := canonicalVersion()
+	if warn := daemonSkewWarning(st.Version, local); warn != "" {
+		t.AppendRow(table.Row{"cli", local + " (differs from daemon)"})
+	}
+	if st.BinaryChecked && st.BinaryStale {
+		t.AppendRow(table.Row{"binary", "stale — on-disk image newer than running image; run 'gortex daemon restart'"})
+	}
 	t.AppendRow(table.Row{"socket", st.SocketPath})
 	t.AppendRow(table.Row{"uptime", formatDuration(time.Duration(st.UptimeSeconds) * time.Second)})
 	switch {
@@ -1465,11 +1480,12 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 	}
 
 	// The state column appears only once a repo is in trouble — its
-	// directory is gone, or the daemon holds no index for it. On a
-	// healthy workspace every row would read "ok", so it stays hidden.
+	// directory is gone, the daemon holds no index for it, or it indexed
+	// nothing at all. On a healthy workspace every row would read "ok",
+	// so it stays hidden.
 	showState := false
 	for _, r := range rows {
-		if r.Missing || r.Unloaded {
+		if r.Missing || r.Unloaded || repoIndexIsEmpty(r) {
 			showState = true
 			break
 		}
@@ -1539,6 +1555,7 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 
 	t.Render()
 	renderMissingRepoWarning(w, rows)
+	renderEmptyIndexWarning(w, rows)
 }
 
 // repoStateLabel names a tracked repo's inventory state for the status
@@ -1551,9 +1568,48 @@ func repoStateLabel(r daemon.TrackedRepoStatus) string {
 		return "MISSING"
 	case r.Unloaded:
 		return "not indexed"
+	case repoIndexIsEmpty(r):
+		return "EMPTY"
 	default:
 		return "ok"
 	}
+}
+
+// repoIndexIsEmpty reports whether a repo finished indexing and came back
+// with no files at all. That state used to render as an ordinary
+// zero-count row, which is how a repo of 1,519 Python files could report
+// as healthy while holding nothing (#624) — and why every query against
+// it answered "no callers" with full confidence. A repo still waiting for
+// its first index (LastIndex unset) is not yet empty, only pending.
+func repoIndexIsEmpty(r daemon.TrackedRepoStatus) bool {
+	return !r.Missing && !r.Unloaded && r.Files == 0 && r.LastIndex > 0
+}
+
+// renderEmptyIndexWarning prints the remediation block for every tracked
+// repo that indexed zero files. The daemon log names the exact ignore
+// pattern responsible; this points the operator at it.
+func renderEmptyIndexWarning(w io.Writer, rows []daemon.TrackedRepoStatus) {
+	var empty []daemon.TrackedRepoStatus
+	for _, r := range rows {
+		if repoIndexIsEmpty(r) {
+			empty = append(empty, r)
+		}
+	}
+	if len(empty) == 0 {
+		return
+	}
+	subject := "repo indexed no files"
+	if len(empty) > 1 {
+		subject = "repos indexed no files"
+	}
+	fmt.Fprintf(w, "\n!! %d tracked %s — queries against them return empty answers, not missing ones:\n",
+		len(empty), subject)
+	for _, r := range empty {
+		fmt.Fprintf(w, "     %-24s %s\n", r.Prefix, r.Path)
+	}
+	fmt.Fprintln(w, "   Either the path holds no source Gortex can parse, or an ignore rule excluded all of it.")
+	fmt.Fprintln(w, "   The daemon log names the pattern:")
+	fmt.Fprintln(w, "     gortex daemon logs | grep 'no source files were indexed'")
 }
 
 // renderMissingRepoWarning prints the remediation block below the repos

@@ -48,17 +48,26 @@ func NewHierarchical(root string, filenames ...string) *Hierarchical {
 // slash patterns prune the whole subtree. A path outside the root is
 // never excluded.
 func (h *Hierarchical) Match(absPath string, isDir bool) bool {
+	matched, _, _ := h.Explain(absPath, isDir)
+	return matched
+}
+
+// Explain is Match plus attribution: the absolute directory whose ignore
+// file excluded the path, and the pattern that did it. Both are "" when
+// nothing matched. Used to name the culprit when an over-broad ignore
+// leaves a repo with nothing to index.
+func (h *Hierarchical) Explain(absPath string, isDir bool) (bool, string, string) {
 	if h == nil || len(h.filenames) == 0 {
-		return false
+		return false, "", ""
 	}
 	absPath = filepath.Clean(absPath)
 	rel, err := filepath.Rel(h.root, absPath)
 	if err != nil {
-		return false
+		return false, "", ""
 	}
 	rel = filepath.ToSlash(rel)
 	if rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, "../") {
-		return false
+		return false, "", ""
 	}
 
 	// Test the path against the root's ignore matcher and that of every
@@ -66,17 +75,17 @@ func (h *Hierarchical) Match(absPath string, isDir bool) bool {
 	// level that excludes the path wins; a file's own directory cannot
 	// exclude the file from itself.
 	dir := h.root
-	if h.dirMatcher(dir).MatchAbsDir(absPath, dir, isDir) {
-		return true
+	if matched, pat := h.dirMatcher(dir).ExplainAbsDir(absPath, dir, isDir); matched {
+		return true, dir, pat
 	}
 	segs := strings.Split(rel, "/")
 	for _, seg := range segs[:len(segs)-1] {
 		dir = filepath.Join(dir, seg)
-		if h.dirMatcher(dir).MatchAbsDir(absPath, dir, isDir) {
-			return true
+		if matched, pat := h.dirMatcher(dir).ExplainAbsDir(absPath, dir, isDir); matched {
+			return true, dir, pat
 		}
 	}
-	return false
+	return false, "", ""
 }
 
 // HasNegatedDescendant reports whether any per-directory ignore file

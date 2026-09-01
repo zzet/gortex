@@ -365,6 +365,20 @@ type StatusResponse struct {
 	// every alive (spec, workspace) subprocess. Empty when no LSP
 	// router is wired (`semantic.enabled: false` in `.gortex.yaml`).
 	LSPRouter *LSPRouterStatus `json:"lsp_router,omitempty"`
+
+	// BinaryStale is true when the file at the daemon's os.Executable()
+	// path no longer matches the image the daemon is running (size or
+	// mtime differ) — the signature of a package-manager upgrade that
+	// replaced the binary under a running daemon. Stat failures leave
+	// this false and BinaryChecked false (unknown, not fresh).
+	BinaryStale bool `json:"binary_stale,omitempty"`
+	// BinaryChecked reports whether the binary-drift probe actually ran:
+	// false means the daemon could not establish the on-disk state (no
+	// captured start identity, or the status-time stat failed) and the
+	// binary is unknown — not fresh.
+	BinaryChecked bool `json:"binary_checked,omitempty"`
+	// BinaryReplacedAtUnix is the on-disk file's mtime when stale.
+	BinaryReplacedAtUnix int64 `json:"binary_replaced_at_unix,omitempty"`
 }
 
 // LSPRouterStatus reflects one daemon's LSP-router state for the

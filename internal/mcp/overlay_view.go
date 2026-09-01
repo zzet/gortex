@@ -159,6 +159,15 @@ func (s *Server) readerFor(ctx context.Context) graph.Reader {
 	return s.graph
 }
 
+// nodeGetterFor returns the request-scoped node lookup: the session
+// overlay view when one rides the context, the base graph otherwise.
+// Output classification (is_test labels, usage summary, flavor
+// resolution) must read the same view engineFor's query ran on, or an
+// overlay-only owner classifies differently in the filter and the rows.
+func (s *Server) nodeGetterFor(ctx context.Context) graph.NodeGetter {
+	return s.readerFor(ctx)
+}
+
 // engineFor returns the query engine scoped to the calling request's
 // graph reader. For non-overlay calls this is `s.engine` unchanged;
 // for overlay-active calls the returned engine reads through the
@@ -196,7 +205,7 @@ func (s *Server) snapshotOverlayRequestForCtx(ctx context.Context) (*overlayRequ
 	if s == nil || s.overlays == nil {
 		return nil, nil
 	}
-	sessionID := SessionIDFromContext(ctx)
+	sessionID := OverlayCohortIDFromContext(ctx)
 	if sessionID == "" {
 		return nil, nil
 	}
@@ -230,8 +239,8 @@ func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *g
 		return ctx, nil, nil
 	}
 	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
-	if ok && snapshot.sessionID != SessionIDFromContext(ctx) {
-		return ctx, nil, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, SessionIDFromContext(ctx))
+	if ok && snapshot.sessionID != OverlayCohortIDFromContext(ctx) {
+		return ctx, nil, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, OverlayCohortIDFromContext(ctx))
 	}
 	if !ok {
 		if OverlayViewFromContext(ctx) != nil {
@@ -352,7 +361,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 		return nil, fmt.Errorf("overlay request snapshot is not canonical")
 	}
 	files := snapshot.files
-	sessID := SessionIDFromContext(ctx)
+	sessID := OverlayCohortIDFromContext(ctx)
 
 	// Drift check up front for every overlay that carries a BaseSHA.
 	// We do it here, before parsing, so a stale overlay never costs

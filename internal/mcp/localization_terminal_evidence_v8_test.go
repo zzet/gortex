@@ -254,8 +254,8 @@ func TestRecoveryAllowsInferredConcreteIdentifierOnlyForScopedSymbolEvidence(t *
 		t.Fatalf("inferred exact identifier authorization = (%#v, %d)", blocked, firstToken)
 	}
 	zero := state.finishReservedReadTokenWithDigest(firstToken, true, nil, true)
-	if zero.State != localizationStateLocalized || zero.AllowedToolCalls != 0 || zero.Enforceable {
-		t.Fatalf("empty typed page did not release an advisory completion: %#v", zero)
+	if zero.State != localizationStateNeedsRecovery || zero.AllowedToolCalls != 1 || zero.Enforceable {
+		t.Fatalf("empty typed page did not keep one further allowance: %#v", zero)
 	}
 
 	positiveState := newLocalizationTerminalState()

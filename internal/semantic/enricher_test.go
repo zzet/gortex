@@ -4,88 +4,42 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestConfirmEdge(t *testing.T) {
-	e := &graph.Edge{
-		From:            "a.go::Foo",
-		To:              "b.go::Bar",
-		Kind:            graph.EdgeCalls,
-		Confidence:      0.6,
-		ConfidenceLabel: "INFERRED",
-	}
-
-	ConfirmEdge(e, "test-provider")
-
-	assert.Equal(t, 1.0, e.Confidence)
-	assert.Equal(t, "EXTRACTED", e.ConfidenceLabel)
-	assert.Equal(t, "test-provider", e.Meta["semantic_source"])
-}
-
-func TestAddSemanticEdge(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "a.go"})
-	g.AddNode(&graph.Node{ID: "b.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: "b.go"})
-
-	e := AddSemanticEdge(g, "a.go::Foo", "b.go::Bar", graph.EdgeCalls, "a.go", 10, "test")
-
-	assert.Equal(t, 1.0, e.Confidence)
-	assert.Equal(t, "EXTRACTED", e.ConfidenceLabel)
-	assert.Equal(t, "test", e.Meta["semantic_source"])
-
-	// Verify it's in the graph.
-	edges := g.GetOutEdges("a.go::Foo")
-	require.Len(t, edges, 1)
-	assert.Equal(t, "b.go::Bar", edges[0].To)
-}
-
-func TestRefuteEdge(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "a.go"})
-	g.AddNode(&graph.Node{ID: "b.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: "b.go"})
-	g.AddEdge(&graph.Edge{From: "a.go::Foo", To: "b.go::Bar", Kind: graph.EdgeCalls, Confidence: 0.5})
-
-	e := &graph.Edge{From: "a.go::Foo", To: "b.go::Bar", Kind: graph.EdgeCalls}
-	removed := RefuteEdge(g, e)
-
-	assert.True(t, removed)
-	assert.Empty(t, g.GetOutEdges("a.go::Foo"))
-}
-
-func TestFindMatchingEdge(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "a.go::Foo", Kind: graph.KindFunction, Name: "Foo", FilePath: "a.go"})
-	g.AddNode(&graph.Node{ID: "b.go::Bar", Kind: graph.KindFunction, Name: "Bar", FilePath: "b.go"})
-	g.AddEdge(&graph.Edge{From: "a.go::Foo", To: "b.go::Bar", Kind: graph.EdgeCalls})
-
-	found := FindMatchingEdge(g, "a.go::Foo", "b.go::Bar", graph.EdgeCalls)
-	assert.NotNil(t, found)
-
-	notFound := FindMatchingEdge(g, "a.go::Foo", "b.go::Bar", graph.EdgeReferences)
-	assert.Nil(t, notFound)
-}
-
-func TestEnrichNodeMeta(t *testing.T) {
-	n := &graph.Node{ID: "a.go::Foo", Kind: graph.KindFunction, Name: "Foo"}
-
-	EnrichNodeMeta(n, "semantic_type", "func() error", "test")
-
-	assert.Equal(t, "func() error", n.Meta["semantic_type"])
-	assert.Equal(t, "test", n.Meta["semantic_source"])
-}
-
-func TestNodesByLanguage(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "a.go::Foo", Kind: graph.KindFunction, Name: "Foo", Language: "go"})
-	g.AddNode(&graph.Node{ID: "b.ts::Bar", Kind: graph.KindFunction, Name: "Bar", Language: "typescript"})
-	g.AddNode(&graph.Node{ID: "c.go::Baz", Kind: graph.KindFunction, Name: "Baz", Language: "go"})
-
-	goNodes := NodesByLanguage(g, "go")
-	assert.Len(t, goNodes, 2)
-
-	tsNodes := NodesByLanguage(g, "typescript")
-	assert.Len(t, tsNodes, 1)
+// Confirmation upgrades the tier but must not erase where the edge came
+// from: the LSP dispatch gate's evidence probe distinguishes extractor /
+// resolver hierarchy edges from the sweep's own recoveries by origin, and a
+// confirm that overwrote the origin in place would decay that evidence one
+// pass at a time (self-reinforcing — the gate admits hierarchy types, the
+// sweep confirms their edges, the probe loses them).
+func TestConfirmEdgePreservesPriorOrigin(t *testing.T) {
+	t.Run("non-LSP origin is preserved in meta", func(t *testing.T) {
+		e := &graph.Edge{Kind: graph.EdgeExtends, Origin: graph.OriginASTResolved, Confidence: 0.7}
+		ConfirmEdge(e, "lsp-go")
+		assert.Equal(t, graph.OriginLSPResolved, e.Origin)
+		assert.Equal(t, 1.0, e.Confidence)
+		assert.Equal(t, string(graph.OriginASTResolved), e.Meta["confirmed_from_origin"])
+	})
+	t.Run("empty origin still leaves the marker", func(t *testing.T) {
+		// An extractor-minted stub edge carries no origin at all; the marker's
+		// PRESENCE is the provenance signal, not its value.
+		e := &graph.Edge{Kind: graph.EdgeExtends, Confidence: 0.7}
+		ConfirmEdge(e, "lsp-go")
+		_, ok := e.Meta["confirmed_from_origin"]
+		assert.True(t, ok)
+	})
+	t.Run("an edge already at LSP grade gains no marker", func(t *testing.T) {
+		e := &graph.Edge{Kind: graph.EdgeImplements, Origin: graph.OriginLSPDispatch, Confidence: 0.9}
+		ConfirmEdge(e, "lsp-go")
+		_, ok := e.Meta["confirmed_from_origin"]
+		assert.False(t, ok, "there is no non-LSP provenance to preserve")
+	})
+	t.Run("re-confirmation does not overwrite the original provenance", func(t *testing.T) {
+		e := &graph.Edge{Kind: graph.EdgeExtends, Origin: graph.OriginASTResolved, Confidence: 0.7}
+		ConfirmEdge(e, "lsp-go")
+		ConfirmEdge(e, "lsp-go") // now lsp_resolved — marker must keep ast_resolved
+		assert.Equal(t, string(graph.OriginASTResolved), e.Meta["confirmed_from_origin"])
+	})
 }

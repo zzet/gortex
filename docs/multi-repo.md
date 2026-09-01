@@ -180,6 +180,28 @@ it: `daemon status` reconciles the live indexer registry against
 `not indexed` rather than dropping out of one view while the other keeps
 listing it.
 
+### Empty indexes
+
+A repo that finished indexing with no files at all is reported as
+`EMPTY`, not as an ordinary zero-count row. It is the one failure that
+otherwise reads as success everywhere: the repo is tracked, loaded, and
+answering — with an empty graph, so `find_usages` returns "no callers"
+and `analyze` returns "likely unused" with full confidence.
+
+`gortex status` and `gortex daemon status` mark the row `EMPTY` and print
+the affected paths below the table; `index_health` reports
+`repos_hold_files_ok: false` with the prefixes under `empty_repos`. The
+daemon log names the exact cause, including the ignore pattern
+responsible and one file it excluded:
+
+```
+gortex daemon logs | grep 'no source files were indexed'
+```
+
+The usual cause is an ignore rule that matches more than intended — a
+`.gitignore`, `.gortexignore`, or `.gortex.yaml` `excludes` entry. A repo
+that genuinely holds no source Gortex can parse is not flagged.
+
 ## MCP tools
 
 Agents can manage repos at runtime without CLI access:

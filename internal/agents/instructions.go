@@ -63,7 +63,13 @@ const (
 // CLAUDE.md. The heading stays here as the idempotency sentinel and as
 // a functional minimum for readers that do not expand @-includes.
 func GlobalPointerBody(instructionsDir string) string {
-	active := filepath.Join(instructionsDir, profiles.ActiveFileName)
+	// The @-include is document content, not a filesystem call: it is
+	// written into ~/.claude/CLAUDE.md and read back as markdown. Native
+	// separators would leak a `@C:\Users\me\.gortex\...` line into a file
+	// whose every other path is '/'-spelled, and the same rendered body
+	// is compared against a golden that cannot be platform-specific. This
+	// mirrors shellSafeHookBinary, which normalises for the same reason.
+	active := filepath.ToSlash(filepath.Join(instructionsDir, profiles.ActiveFileName))
 	return "## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob\n\n" +
 		"The machine-wide Gortex rules load from the active instruction profile, imported below:\n\n" +
 		"@" + active + "\n\n" +

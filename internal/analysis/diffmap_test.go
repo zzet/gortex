@@ -55,10 +55,16 @@ func TestParseDiffHunksEqualsInternal(t *testing.T) {
 	}
 }
 
+// diffKey spells a repo-relative path the way parseDiffLines keys its map and
+// DiffHunk.FilePath is cleaned: filepath.Clean, so the key carries the running
+// platform's separators. Writing the '/' form directly reads fine on POSIX and
+// misses on Windows, where the map key is `pkg\foo.go`.
+func diffKey(p string) string { return filepath.Clean(p) }
+
 func TestParseDiffLinesNewSide(t *testing.T) {
 	lines := parseDiffLines(sampleDiff)
 
-	foo := lines["pkg/foo.go"]
+	foo := lines[diffKey("pkg/foo.go")]
 	if len(foo) == 0 {
 		t.Fatalf("expected new-side lines for pkg/foo.go")
 	}
@@ -86,7 +92,7 @@ func TestParseDiffLinesNewSide(t *testing.T) {
 	}
 
 	// New-file lines all carry "+", numbered 1..3.
-	baz := lines["pkg/baz.go"]
+	baz := lines[diffKey("pkg/baz.go")]
 	if len(baz) != 3 {
 		t.Fatalf("expected 3 new-side lines for pkg/baz.go, got %d (%#v)", len(baz), baz)
 	}
@@ -294,43 +300,76 @@ func TestMapGitDiffMnemonicPrefixConfig(t *testing.T) {
 }
 
 func TestJoinFileNodes(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "myrepo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "myrepo/a.go"})
-	g.AddNode(&graph.Node{ID: "b.go::B", Kind: graph.KindFunction, Name: "B", FilePath: "b.go"})
+	// Graph keys are "<prefix>/" + the remainder in native separators, so the
+	// fixture is built the same way the indexer would build it. Writing the
+	// '/'-joined form here would pass on POSIX and describe a key that does not
+	// exist on Windows.
+	key := func(rel string) string { return "myrepo/" + filepath.FromSlash(rel) }
 
-	// Raw hit wins (single-repo / unprefixed graph).
-	if nodes := JoinFileNodes(g, "myrepo", "b.go"); len(nodes) != 1 || nodes[0].ID != "b.go::B" {
-		t.Fatalf("raw lookup should win: %#v", nodes)
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: key("a.go") + "::A", Kind: graph.KindFunction, Name: "A", FilePath: key("a.go")})
+	// The shadow: the repo's own tree carries a top-level directory named like
+	// the repo prefix, so "myrepo/a.go" is a well-formed path in BOTH domains —
+	// the git-relative spelling of this nested file, and the graph key of the
+	// top-level a.go above.
+	g.AddNode(&graph.Node{ID: key("myrepo/a.go") + "::Nested", Kind: graph.KindFunction, Name: "Nested", FilePath: key("myrepo/a.go")})
+
+	// A repo-relative path is prefixed unconditionally.
+	if nodes := JoinFileNodes(g, "myrepo", "a.go", RepoRelativePath); len(nodes) != 1 || nodes[0].ID != key("a.go")+"::A" {
+		t.Fatalf("repo-relative path must resolve through the prefix: %#v", nodes)
 	}
-	// Relative path retries with the prefix.
-	if nodes := JoinFileNodes(g, "myrepo", "a.go"); len(nodes) != 1 || nodes[0].ID != "myrepo/a.go::A" {
-		t.Fatalf("prefixed retry should hit: %#v", nodes)
+	// The shadow case: a repo-relative path that merely LOOKS prefixed still
+	// gets prefixed, so it resolves to the nested file it names — not to the
+	// same-named top-level file it would collide with.
+	if nodes := JoinFileNodes(g, "myrepo", "myrepo/a.go", RepoRelativePath); len(nodes) != 1 || nodes[0].ID != key("myrepo/a.go")+"::Nested" {
+		t.Fatalf("prefix-shadowed repo-relative path must resolve to the nested file: %#v", nodes)
 	}
-	// Already-prefixed input does not double-prefix.
-	if nodes := JoinFileNodes(g, "myrepo", "myrepo/a.go"); len(nodes) != 1 || nodes[0].ID != "myrepo/a.go::A" {
-		t.Fatalf("already-prefixed input should hit raw: %#v", nodes)
+	// A caller already holding a graph key says so, and it is used as-is.
+	if nodes := JoinFileNodes(g, "myrepo", key("a.go"), GraphKeyedPath); len(nodes) != 1 || nodes[0].ID != key("a.go")+"::A" {
+		t.Fatalf("graph-keyed path must be used verbatim: %#v", nodes)
 	}
-	// No prefix → raw only.
-	if nodes := JoinFileNodes(g, "", "a.go"); len(nodes) != 0 {
-		t.Fatalf("no-prefix miss should stay a miss: %#v", nodes)
+	// A graph key is used verbatim whether or not a prefix is supplied.
+	if nodes := JoinFileNodes(g, "", key("a.go"), GraphKeyedPath); len(nodes) != 1 || nodes[0].ID != key("a.go")+"::A" {
+		t.Fatalf("a graph key must be used verbatim with no prefix: %#v", nodes)
+	}
+	if nodes := JoinFileNodes(g, "myrepo", "missing.go", RepoRelativePath); len(nodes) != 0 {
+		t.Fatalf("a miss must stay a miss: %#v", nodes)
+	}
+
+	// Standalone indexer: no repo prefix, but the keys are still native. A
+	// forge or git path arrives '/'-spelled and must still resolve.
+	standalone := graph.New()
+	nested := filepath.FromSlash("pkg/auth/x.go")
+	standalone.AddNode(&graph.Node{ID: nested + "::Login", Kind: graph.KindFunction, Name: "Login", FilePath: nested})
+	if nodes := JoinFileNodes(standalone, "", "pkg/auth/x.go", RepoRelativePath); len(nodes) != 1 || nodes[0].ID != nested+"::Login" {
+		t.Fatalf("empty prefix must still convert separators: %#v", nodes)
 	}
 }
 
-func TestJoinFilePath(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{ID: "myrepo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "myrepo/a.go"})
-
-	if got := JoinFilePath(g, "myrepo", "a.go"); got != "myrepo/a.go" {
-		t.Fatalf("expected prefixed path, got %q", got)
-	}
-	if got := JoinFilePath(g, "myrepo", "myrepo/a.go"); got != "myrepo/a.go" {
-		t.Fatalf("already-prefixed path should pass through, got %q", got)
-	}
-	if got := JoinFilePath(g, "myrepo", "missing.go"); got != "missing.go" {
-		t.Fatalf("unresolvable path should pass through raw, got %q", got)
-	}
-	if got := JoinFilePath(g, "", "a.go"); got != "a.go" {
-		t.Fatalf("no prefix should pass through, got %q", got)
+func TestGraphKey(t *testing.T) {
+	native := func(rel string) string { return "myrepo/" + filepath.FromSlash(rel) }
+	for _, tc := range []struct {
+		name         string
+		prefix, path string
+		domain       PathDomain
+		want         string
+	}{
+		{"repo-relative gains the prefix", "myrepo", "a.go", RepoRelativePath, native("a.go")},
+		{"prefix-shadowed path still gains it", "myrepo", "myrepo/a.go", RepoRelativePath, native("myrepo/a.go")},
+		{"graph-keyed path is untouched", "myrepo", "myrepo/a.go", GraphKeyedPath, "myrepo/a.go"},
+		{"no prefix is a no-op", "", "a.go", RepoRelativePath, "a.go"},
+		// Multi-segment with no prefix: the standalone indexer's keys still
+		// carry native separators, so a '/'-spelled forge path must be
+		// converted even though there is nothing to prefix. A single-segment
+		// fixture cannot show this — there is no separator to get wrong.
+		{"no prefix still converts separators", "", "pkg/auth/x.go", RepoRelativePath, filepath.FromSlash("pkg/auth/x.go")},
+		{"no prefix, graph-keyed stays verbatim", "", "pkg/auth/x.go", GraphKeyedPath, "pkg/auth/x.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := GraphKey(tc.prefix, tc.path, tc.domain); got != tc.want {
+				t.Fatalf("GraphKey(%q, %q, %v) = %q, want %q", tc.prefix, tc.path, tc.domain, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -682,8 +721,14 @@ func TestParseDiffGitPaths(t *testing.T) {
 		{`diff --git "a/od\td.go" "b/od\td.go"`, ""},
 		{"diff --git nonsense", ""},
 	} {
-		if got := parseDiffGitPaths(tc.line); got != tc.want {
-			t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tc.line, got, tc.want)
+		// The recovered path is cleaned, so it carries native separators;
+		// the '/' spelling above is the diff's, not the result's.
+		want := tc.want
+		if want != "" {
+			want = filepath.Clean(want)
+		}
+		if got := parseDiffGitPaths(tc.line); got != want {
+			t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tc.line, got, want)
 		}
 	}
 }
@@ -727,5 +772,54 @@ func TestMapGitDiffUntrackedStaysUnobserved(t *testing.T) {
 	}
 	if hasFile(res.ChangedFiles, "new.go") {
 		t.Fatalf("git diff cannot observe untracked files; ChangedFiles = %#v", res.ChangedFiles)
+	}
+}
+
+// TestJoinHunksToSymbolsPrefixedDeleteAndRename binds the old-side join for the
+// two change kinds that carry no usable hunk: a delete (no new side) and a
+// rename (PreviousPath). Both resolve through the same RepoRelativePath
+// contract as a hunk path, and both were previously covered only with an empty
+// prefix, where the contract cannot be observed.
+//
+// The fixture is prefix-shadowed: the repo's own tree carries a top-level
+// directory named like the repo prefix, so each old-side git path is also a
+// well-formed graph key for a different, untouched file.
+func TestJoinHunksToSymbolsPrefixedDeleteAndRename(t *testing.T) {
+	const prefix = "repo-a"
+	key := func(rel string) string { return prefix + "/" + filepath.FromSlash(rel) }
+
+	g := graph.New()
+	add := func(rel, sym string) {
+		g.AddNode(&graph.Node{
+			ID: key(rel) + "::" + sym, Kind: graph.KindFunction, Name: sym,
+			FilePath: key(rel), StartLine: 1, EndLine: 10, Language: "go",
+		})
+	}
+	// Shadows: what a repo-relative old-side path would resolve to if it were
+	// mistaken for a graph key.
+	add("pkg/gone.go", "ShadowGone")
+	add("pkg/old.go", "ShadowOld")
+	// The real old-side files, nested under the prefix-named directory.
+	add("repo-a/pkg/gone.go", "Gone")
+	add("repo-a/pkg/old.go", "Old")
+
+	res := joinHunksToSymbols(g, prefix, nil, []FileChange{
+		{Path: "repo-a/pkg/gone.go", Kind: FileDeleted},
+		{Path: "repo-a/pkg/new.go", PreviousPath: "repo-a/pkg/old.go", Kind: FileRenamed},
+	})
+
+	got := map[string]bool{}
+	for _, cs := range res.ChangedSymbols {
+		got[cs.ID] = true
+	}
+	for _, want := range []string{key("repo-a/pkg/gone.go") + "::Gone", key("repo-a/pkg/old.go") + "::Old"} {
+		if !got[want] {
+			t.Fatalf("old-side symbol %q missing: %#v", want, res.ChangedSymbols)
+		}
+	}
+	for _, shadow := range []string{key("pkg/gone.go") + "::ShadowGone", key("pkg/old.go") + "::ShadowOld"} {
+		if got[shadow] {
+			t.Fatalf("unchanged shadow %q was taken as changed: %#v", shadow, res.ChangedSymbols)
+		}
 	}
 }

@@ -118,7 +118,7 @@ func NewCppExtractor() *CppExtractor {
 }
 
 func (e *CppExtractor) Language() string     { return "cpp" }
-func (e *CppExtractor) Extensions() []string { return []string{".cpp", ".cc", ".cxx", ".hpp"} }
+func (e *CppExtractor) Extensions() []string { return []string{".cpp", ".cc", ".cxx", ".hpp", ".hxx"} }
 
 // --- Deferred call buffer ----------------------------------------
 

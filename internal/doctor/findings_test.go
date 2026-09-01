@@ -493,3 +493,50 @@ func TestHooksTurnedOffSuppressesThePerEventTrustRemedy(t *testing.T) {
 		}
 	}
 }
+
+// TestPostToolUseSilenceUnderDenyPostureIsExpected is #630: the deny posture
+// narrows the PostToolUse matcher to the Gortex MCP tools, so the enrichment
+// path can never fire and zero injections is the designed steady state.
+// Warning on it permanently accuses every healthy deny-mode install.
+func TestPostToolUseSilenceUnderDenyPostureIsExpected(t *testing.T) {
+	agent := codexAgent()
+	agent.Agent = "claude-code"
+	agent.PostToolUseDenyPosture = true
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart":     {Runs: 4, Emitted: 4, DaemonKnown: 4, DaemonUp: 4},
+		"UserPromptSubmit": {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+		"PreToolUse":       {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+		"PostToolUse":      {Runs: 9, Emitted: 0, DaemonKnown: 9, DaemonUp: 9},
+	}), Adoption{GortexCalls: 20, ShellCalls: 2}, time.Now())
+
+	got := findingWith(t, findings, "PostToolUse ran 9 time(s) and injected context 0 times")
+	if got.Severity != SeverityInfo {
+		t.Errorf("severity=%s want INFO — deny-posture silence is expected, not a fault", got.Severity)
+	}
+	if !strings.Contains(got.Summary, "deny posture") {
+		t.Errorf("summary should name the posture so the reader learns why: %q", got.Summary)
+	}
+	assertNoFindingWith(t, findings, "nothing to say")
+}
+
+// TestPostToolUseSilenceStillWarnsUnderEnrich is the guard the downgrade
+// must not swallow: under enrich the matcher names the native read-shaped
+// tools, so zero emissions genuinely means the enrichment path broke.
+func TestPostToolUseSilenceStillWarnsUnderEnrich(t *testing.T) {
+	agent := codexAgent()
+	agent.Agent = "claude-code"
+	agent.PostToolUseDenyPosture = false
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart":     {Runs: 4, Emitted: 4, DaemonKnown: 4, DaemonUp: 4},
+		"UserPromptSubmit": {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+		"PreToolUse":       {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+		"PostToolUse":      {Runs: 9, Emitted: 0, DaemonKnown: 9, DaemonUp: 9},
+	}), Adoption{GortexCalls: 20, ShellCalls: 2}, time.Now())
+
+	got := findingWith(t, findings, "nothing to say")
+	if got.Severity != SeverityWarn {
+		t.Errorf("severity=%s want WARN — enrich-mode silence is real breakage", got.Severity)
+	}
+}

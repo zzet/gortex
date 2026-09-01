@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -102,5 +103,8 @@ func TestRepoCacheKey_DifferentRepos(t *testing.T) {
 func TestFeedbackDir(t *testing.T) {
 	dir := FeedbackDir("/home/user/.cache/gortex", "/tmp/my-repo")
 	assert.Contains(t, dir, "_latest")
-	assert.Contains(t, dir, ".cache/gortex")
+	// FeedbackDir filepath.Joins, so the result carries native separators and
+	// feeds os.Open directly. The '/' spelling is the caller's input, not the
+	// result's: on Windows this reads `\home\user\.cache\gortex\<key>`.
+	assert.Contains(t, dir, filepath.Join(".cache", "gortex"))
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -258,4 +259,94 @@ func TestSuggestReviewers_GCXAndTOONAndBudget(t *testing.T) {
 	toon := callSuggestReviewers(t, srv, map[string]any{"ids": authID, "format": "toon"})
 	require.False(t, toon.IsError)
 	require.Contains(t, toon.Content[0].(mcplib.TextContent).Text, "reviewer")
+}
+
+// TestSuggestReviewers_IdsOnPrefixedGraphKeepsAllSignals pins the path domain
+// of the ids branch. resolveReviewerChangeset's ids case returns graph node
+// FilePaths, which are already graph-keyed; base and number return
+// repo-relative paths. Forcing one domain on all three prefixes the ids
+// entries a second time on a multi-repo graph — `repo-a/pkg/auth/login.go`
+// looked up as `repo-a/repo-a/pkg/auth/login.go` — and the ownership and
+// co-change signals silently disappear while CODEOWNERS (which matches on the
+// repo-relative spelling) still answers, so the tool looks healthy.
+//
+// The existing ids tests build an unprefixed graph, where both domains
+// coincide and the regression is invisible.
+func TestSuggestReviewers_IdsOnPrefixedGraphKeepsAllSignals(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "repo-a")
+	write := func(rel, src string) {
+		abs := filepath.Join(dir, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(abs), 0o755))
+		require.NoError(t, os.WriteFile(abs, []byte(src), 0o644))
+	}
+	write("pkg/auth/login.go", "package auth\n\nfunc Login() error { return nil }\n")
+	write("pkg/util/util.go", "package util\n\nfunc Helper() error { return nil }\n")
+	// Root-anchored on purpose: `/pkg/auth/` matches only the repo-relative
+	// spelling. An unanchored `pkg/auth/` rule would also match
+	// `repo-a/pkg/auth/login.go`, masking a graph-keyed path reaching
+	// CODEOWNERS in ids mode.
+	write(".github/CODEOWNERS", "/pkg/auth/ @org/secteam\n")
+
+	srv, prefix := prefixedServerOver(t, dir, "repo-a")
+	require.Equal(t, "repo-a", prefix)
+
+	nodeIDNamed := func(name string) (id, file string) {
+		t.Helper()
+		for _, n := range srv.graph.FindNodesByName(name) {
+			if n != nil && n.Kind == graph.KindFunction {
+				return n.ID, n.FilePath
+			}
+		}
+		t.Fatalf("fixture did not index %q", name)
+		return "", ""
+	}
+	loginID, loginFile := nodeIDNamed("Login")
+	helperID, helperFile := nodeIDNamed("Helper")
+
+	// Both file paths are graph keys, so they carry the repo prefix. That is
+	// exactly what the ids branch hands on.
+	require.True(t, strings.HasPrefix(loginFile, prefix+"/"), "fixture must be prefixed, got %q", loginFile)
+
+	stampAuthor := func(id, email string, ts int64) {
+		n := srv.graph.GetNode(id)
+		require.NotNil(t, n, "node %q missing", id)
+		if n.Meta == nil {
+			n.Meta = map[string]any{}
+		}
+		n.Meta["last_authored"] = map[string]any{
+			"email": email, "timestamp": ts, "commit": "deadbee",
+		}
+	}
+	stampAuthor(loginID, "alice@example.com", 1_700_000_000)
+	stampAuthor(helperID, "bob@example.com", 1_700_000_100)
+
+	// login.go historically changes with util.go, so util.go's author is a
+	// co-change expert. The co-change index is keyed by graph path.
+	srv.cochangeByFile = map[string]map[string]float64{
+		loginFile: {helperFile: 0.8},
+	}
+
+	res := callSuggestReviewers(t, srv, map[string]any{"ids": loginID, "repo": dir})
+	require.False(t, res.IsError, "errored: %v", res)
+
+	var out struct {
+		Reviewers []struct {
+			Reviewer string   `json:"reviewer"`
+			Kind     string   `json:"kind"`
+			Reasons  []string `json:"reasons"`
+		} `json:"reviewers"`
+		CodeownersFound bool `json:"codeowners_found"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &out))
+
+	seen := map[string]bool{}
+	for _, r := range out.Reviewers {
+		seen[r.Reviewer] = true
+	}
+	require.True(t, out.CodeownersFound, "CODEOWNERS must still resolve: %+v", out)
+	require.True(t, seen["org/secteam"], "codeowner signal missing: %+v", out.Reviewers)
+	require.True(t, seen["alice@example.com"],
+		"recent-author signal missing — the ids branch is graph-keyed and must not be prefixed twice: %+v", out.Reviewers)
+	require.True(t, seen["bob@example.com"],
+		"co-change signal missing — the ids branch is graph-keyed and must not be prefixed twice: %+v", out.Reviewers)
 }

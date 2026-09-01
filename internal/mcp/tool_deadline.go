@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"fmt"
@@ -108,7 +109,7 @@ func boundHandler[Req, Res any](
 	kind, name string,
 	h func(context.Context, Req) (Res, error),
 	busy func(stuck int64, timeout time.Duration) (Res, error),
-	expired func(timeout time.Duration) (Res, error),
+	expired func(timeout time.Duration, note *mutationCommitNote) (Res, error),
 	panicked func(recovered any) (Res, error),
 ) func(context.Context, Req) (Res, error) {
 	return func(ctx context.Context, req Req) (Res, error) {
@@ -134,6 +135,11 @@ func boundHandler[Req, Res any](
 
 		callCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		// Every call carries a commit note. A read handler never writes to it
+		// and pays one context value; a mutating handler stamps its disk commit
+		// there, which is the only way this frame can say what landed after it
+		// has stopped waiting for the handler.
+		callCtx, commitNote := withMutationCommitNote(callCtx)
 
 		type outcome struct {
 			res Res
@@ -193,7 +199,7 @@ func boundHandler[Req, Res any](
 					zap.Duration("elapsed", time.Since(started)),
 					zap.Int64("abandoned_in_flight", stuck))
 			}
-			return expired(timeout)
+			return expired(timeout, commitNote)
 		}
 	}
 }
@@ -220,6 +226,48 @@ func abandonedMessage(what, name string, timeout time.Duration) string {
 		what, name, timeout)
 }
 
+// abandonedToolMessage is abandonedMessage plus what the handler managed to do
+// to the filesystem before this frame gave up on it.
+//
+// The generic "treat any side effect as unknown" wording is correct only when
+// nothing is known. Once a disk commit has been confirmed it is actively
+// harmful: a client that reads it as "nothing happened" retries, or falls back
+// to its own editor, and applies the same logical change twice. So the three
+// states are reported separately and the JSON tail is machine-readable.
+func abandonedToolMessage(name string, timeout time.Duration, verdict mutationCommitVerdict) string {
+	base := abandonedMessage("tool", name, timeout)
+	switch verdict.Status {
+	case "":
+		// No mutating handler registered a commit, so nothing was written by
+		// this call. Read tools land here, and so does a write refused during
+		// validation.
+		return base
+	case mutationDiskNotApplied:
+		base = fmt.Sprintf(
+			"tool %q exceeded its %s deadline and was abandoned so the session stays responsive. "+
+				"No filesystem change was applied — the handler stopped at its cancellation gate before the disk commit, "+
+				"so retrying is safe. This usually means the graph is busy (indexing, enrichment, or a slow store) — "+
+				"retry, or check `gortex daemon status`.",
+			name, timeout)
+	case mutationDiskCommitted:
+		base = fmt.Sprintf(
+			"tool %q exceeded its %s deadline, but its filesystem change WAS COMMITTED before the deadline fired. "+
+				"Do NOT retry this edit and do NOT apply it by another route — you would duplicate it. "+
+				"Only the graph refresh is still outstanding; the files below are already on disk with the listed SHAs.",
+			name, timeout)
+	case mutationDiskInFlight:
+		base = fmt.Sprintf(
+			"tool %q exceeded its %s deadline while a filesystem write was in progress, so the outcome is genuinely unknown. "+
+				"Do not retry blindly: query the receipt below (`mutation_status`, or `edit` with operation:\"receipt\") "+
+				"to learn whether the bytes landed.",
+			name, timeout)
+	}
+	if encoded, err := json.Marshal(verdict); err == nil {
+		base += "\nmutation_commit=" + string(encoded)
+	}
+	return base
+}
+
 func (s *Server) boundToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		name := req.Params.Name
@@ -227,8 +275,8 @@ func (s *Server) boundToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHan
 			func(stuck int64, timeout time.Duration) (*mcp.CallToolResult, error) {
 				return mcp.NewToolResultError(busyMessage("tool calls", stuck, timeout)), nil
 			},
-			func(timeout time.Duration) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(abandonedMessage("tool", name, timeout)), nil
+			func(timeout time.Duration, note *mutationCommitNote) (*mcp.CallToolResult, error) {
+				return mcp.NewToolResultError(abandonedToolMessage(name, timeout, note.verdict())), nil
 			},
 			func(r any) (*mcp.CallToolResult, error) {
 				return mcp.NewToolResultError(fmt.Sprintf("tool %q internal error: %v", name, r)), nil
@@ -270,7 +318,7 @@ func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFun
 		func(stuck int64, timeout time.Duration) ([]mcp.ResourceContents, error) {
 			return nil, errors.New(busyMessage("resource reads", stuck, timeout))
 		},
-		func(timeout time.Duration) ([]mcp.ResourceContents, error) {
+		func(timeout time.Duration, _ *mutationCommitNote) ([]mcp.ResourceContents, error) {
 			return nil, errors.New(abandonedMessage("resource", uri, timeout))
 		},
 		func(r any) ([]mcp.ResourceContents, error) {
@@ -301,7 +349,7 @@ func (s *Server) boundPromptHandler(name string, h mcpserver.PromptHandlerFunc) 
 		func(stuck int64, timeout time.Duration) (*mcp.GetPromptResult, error) {
 			return nil, errors.New(busyMessage("prompt requests", stuck, timeout))
 		},
-		func(timeout time.Duration) (*mcp.GetPromptResult, error) {
+		func(timeout time.Duration, _ *mutationCommitNote) (*mcp.GetPromptResult, error) {
 			return nil, errors.New(abandonedMessage("prompt", name, timeout))
 		},
 		func(r any) (*mcp.GetPromptResult, error) {

@@ -101,36 +101,65 @@ func MapGitDiff(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*Di
 	return joinHunksToSymbols(g, repoPrefix, hunks, files), nil
 }
 
-// JoinFileNodes maps one repo-relative changed-file path to the graph nodes
-// its file defines. Indexed file paths carry the repo prefix in multi-repo
-// mode ("<prefix>/<rel>") while git and forge APIs emit repo-relative paths,
-// so the raw lookup is tried first (single-repo / already-prefixed input)
-// and the prefixed form second.
-func JoinFileNodes(g graph.Store, repoPrefix, path string) []*graph.Node {
-	if nodes := g.GetFileNodes(path); len(nodes) > 0 {
-		return nodes
+// PathDomain names the vocabulary a file path is spelled in. The two overlap,
+// so the domain has to travel with the path rather than be recovered from it:
+// in a repo whose tree carries a top-level directory named like the repo
+// prefix, "repo-a/pkg/widget.go" is a well-formed path in BOTH domains — a
+// git-relative path naming the nested file, and the graph key of the entirely
+// different top-level "pkg/widget.go".
+type PathDomain int
+
+const (
+	// RepoRelativePath is git's and a forge's spelling, relative to the work
+	// tree. Every changed-file list in this package is this domain.
+	RepoRelativePath PathDomain = iota
+	// GraphKeyedPath is the graph's own node key: "<prefix>/<rel>" in
+	// multi-repo mode, the bare relative path when no prefix applies.
+	GraphKeyedPath
+)
+
+// GraphKey renders path as the graph keys it. A repo-relative path is prefixed
+// unconditionally — never conditionally on how it happens to be spelled — so a
+// path that merely looks prefixed cannot be resolved against the wrong file.
+func GraphKey(repoPrefix, path string, domain PathDomain) string {
+	if domain == GraphKeyedPath {
+		return path
 	}
-	if repoPrefix == "" || strings.HasPrefix(path, repoPrefix+"/") {
-		return nil
+	// A repo-relative path is always converted, prefix or not. The key's shape
+	// is "<prefix>/" + the remainder in the indexing machine's native
+	// separators (see internal/graphpath); with no prefix the remainder IS the
+	// key, and a '/'-spelled git or forge path still misses a key stored with
+	// native separators on Windows. FromSlash is the identity on POSIX.
+	key := filepath.FromSlash(path)
+	if repoPrefix == "" {
+		return key
 	}
-	return g.GetFileNodes(repoPrefix + "/" + path)
+	return repoPrefix + "/" + key
 }
 
-// JoinFilePath returns the graph-keyed variant of a repo-relative file path:
-// the raw path when it resolves (or no prefix applies), otherwise the prefixed
-// form when that resolves. Falls back to the raw path when neither does, so
-// the caller's downstream lookup misses exactly as it would have anyway.
-func JoinFilePath(g graph.Store, repoPrefix, path string) string {
-	if repoPrefix == "" || strings.HasPrefix(path, repoPrefix+"/") {
-		return path
+// RepoRelPath is GraphKey's inverse: the repo-relative '/' spelling that
+// CODEOWNERS rules, forge comment APIs and report rows speak. Stripping the
+// prefix is safe here and only here, because a GraphKeyedPath carries it by
+// construction — the same strip applied to a repo-relative path is the
+// prefix-shadow bug.
+func RepoRelPath(repoPrefix, path string, domain PathDomain) string {
+	rel := filepath.ToSlash(path)
+	if domain == GraphKeyedPath && repoPrefix != "" {
+		rel = strings.TrimPrefix(rel, repoPrefix+"/")
 	}
-	if len(g.GetFileNodes(path)) > 0 {
-		return path
-	}
-	if prefixed := repoPrefix + "/" + path; len(g.GetFileNodes(prefixed)) > 0 {
-		return prefixed
-	}
-	return path
+	return rel
+}
+
+// JoinFileNodes maps one changed-file path to the graph nodes its file
+// defines. domain states which vocabulary path is in; see PathDomain for why
+// it cannot be inferred.
+//
+// The previous contract tried the raw key first and the prefixed key second,
+// which resolved a legitimate git-relative "<prefix>/<rel>" against the
+// same-named top-level file instead — and returned nil when that shadow did
+// not exist, never trying the real key.
+func JoinFileNodes(g graph.Store, repoPrefix, path string, domain PathDomain) []*graph.Node {
+	return g.GetFileNodes(GraphKey(repoPrefix, path, domain))
 }
 
 // joinHunksToSymbols builds the hunk→symbol/file join shared by MapGitDiff
@@ -162,7 +191,7 @@ func joinHunksToSymbols(g graph.Store, repoPrefix string, hunks []DiffHunk, file
 		fileSet[hunk.FilePath] = true
 
 		// Find symbols whose line range overlaps the hunk
-		for _, n := range JoinFileNodes(g, repoPrefix, hunk.FilePath) {
+		for _, n := range JoinFileNodes(g, repoPrefix, hunk.FilePath, RepoRelativePath) {
 			// Check if symbol's line range overlaps with the hunk
 			if n.StartLine <= hunk.EndLine && n.EndLine >= hunk.StartLine {
 				addSymbol(n)
@@ -187,7 +216,7 @@ func joinHunksToSymbols(g graph.Store, repoPrefix string, hunks []DiffHunk, file
 			continue
 		}
 		fileSet[vanished] = true
-		for _, n := range JoinFileNodes(g, repoPrefix, vanished) {
+		for _, n := range JoinFileNodes(g, repoPrefix, vanished, RepoRelativePath) {
 			addSymbol(n)
 		}
 	}

@@ -1122,6 +1122,22 @@ func ReturnUsageOf(e *Edge) string {
 	return s
 }
 
+// ConfidenceLabelRank orders the labels ConfidenceLabelFor produces,
+// strongest first, for tie-breaking sorts; an unrecognized or empty
+// label ranks lowest. Lives beside its producer so a new or renamed
+// label cannot silently rank below the ones it outranks.
+func ConfidenceLabelRank(label string) int {
+	switch label {
+	case "EXTRACTED":
+		return 3
+	case "INFERRED":
+		return 2
+	case "AMBIGUOUS":
+		return 1
+	}
+	return 0
+}
+
 // ConfidenceLabelFor returns EXTRACTED, INFERRED, or AMBIGUOUS for an edge
 // based on its kind and confidence value.
 //

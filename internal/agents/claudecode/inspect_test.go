@@ -3,6 +3,7 @@ package claudecode
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
@@ -90,5 +91,54 @@ func TestInspectSurvivesBrokenConfig(t *testing.T) {
 
 	if got := Inspect(""); got.ConfigPresent {
 		t.Errorf("empty home should report nothing, got %+v", got)
+	}
+}
+
+// TestInspectDetectsPostToolUsePosture — the PostToolUse matcher is the
+// deny/enrich tell: InstallHookWithMode joins the native read-shaped tools
+// into it only under enrich, leaving deny watching Gortex tool calls alone.
+// doctor keys its "ran but never injected" severity off this flag (#630), so
+// a misread posture either hides real enrich-mode breakage or warns forever
+// on a healthy deny install.
+func TestInspectDetectsPostToolUsePosture(t *testing.T) {
+	hookWithMatcher := func(matcher string) string {
+		return `{"hooks":{"PostToolUse":[{"matcher":` + strconv.Quote(matcher) +
+			`,"hooks":[{"type":"command","command":"/opt/homebrew/bin/gortex hook"}]}]}}`
+	}
+
+	cases := []struct {
+		name    string
+		matcher string
+		want    bool
+	}{
+		// The deny posture: only Gortex MCP tools. The lowercase
+		// mcp__gortex__read alternative must never read as native Read.
+		{"deny matcher watches only gortex tools",
+			"mcp__gortex__explore|mcp__gortex__search|mcp__gortex__read", true},
+		// Enrich joins CurrentPostToolUseMatcher into the localization set.
+		{"enrich matcher includes native tools",
+			"Read|Grep|Glob|mcp__gortex__explore|mcp__gortex__read", false},
+		// An empty matcher matches every tool, so enrichment is possible.
+		{"empty matcher is not deny", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _ := agentstest.NewEnv(t)
+			path := userSettingsLocalPath(env.Home)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(hookWithMatcher(tc.matcher)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			state := Inspect(env.Home)
+			if state.Hooks["PostToolUse"] != 1 {
+				t.Fatalf("fixture not recognised as a gortex hook: %+v", state.Hooks)
+			}
+			if state.PostToolUseDenyPosture != tc.want {
+				t.Errorf("PostToolUseDenyPosture=%v want %v (matcher %q)",
+					state.PostToolUseDenyPosture, tc.want, tc.matcher)
+			}
+		})
 	}
 }

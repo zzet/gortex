@@ -146,6 +146,39 @@ func TestToolCallUnknownTool(t *testing.T) {
 	assert.Contains(t, available, "echo")
 }
 
+// TestToolCallAnalyzeAliasedKindRoutesThroughFacade pins the HTTP-facing
+// contract: POST /v1/tools/analyze with kind=processes reaches the facade
+// (which routes to the captured legacy handler) without any registry
+// promotion. This is the dashboard's /v1/processes path under core/defer.
+func TestToolCallAnalyzeAliasedKindRoutesThroughFacade(t *testing.T) {
+	h := newTestHandler(t)
+	legacyCalled := false
+	h.mcpServer.AddTool(
+		mcp.NewTool("analyze", mcp.WithDescription("dispatcher"),
+			mcp.WithString("kind", mcp.Required())),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			kind, _ := req.GetArguments()["kind"].(string)
+			if kind == "processes" {
+				legacyCalled = true
+				return mcp.NewToolResultText(`{"processes":[]}`), nil
+			}
+			return mcp.NewToolResultError("unknown analyze kind: " + kind), nil
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/tools/analyze",
+		strings.NewReader(`{"arguments":{"kind":"processes"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, legacyCalled, "analyze kind=processes must reach the legacy handler")
+	var resp ToolResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+	require.Len(t, resp.Content, 1)
+	assert.Contains(t, resp.Content[0].Text, `"processes"`)
+}
+
 func TestToolCallMalformedJSON(t *testing.T) {
 	h := newTestHandler(t)
 	req := httptest.NewRequest(http.MethodPost, "/v1/tools/echo", strings.NewReader("{bad"))

@@ -2925,6 +2925,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		prod, maxSymbols,
 		exploreFinalReservedCandidateIDs(prod, protectedSyntacticAnchors, protectedImplementationID),
 	)
+	if localize {
+		// Last chance to keep an editable declaration from the file: once the cut
+		// drops a candidate, no later reordering can bring it back. Trades happen
+		// inside one file's own competition, so the per-file and cross-file
+		// allocation the lanes above settled is carried through unchanged.
+		prod = liftLocalizationSiblingCallables(task, prod, maxSymbols, protectedSyntacticAnchors)
+	}
 	cands := selectFinalExploreCandidates(prod, test, maxSymbols)
 	if len(protectedSyntacticAnchors) > 0 {
 		// Source-literal selection owns its own final-slot guarantees. Re-union
@@ -2948,6 +2955,13 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 			ctx, task, cands, eng.Reader(), opts, maxSymbols,
 			protectedSyntacticAnchors, protectedImplementationID,
 		)
+	}
+	if localize {
+		// Presentation ordering for the localization page only, applied after the
+		// final window is fixed so membership cannot change: each file's own slots
+		// are permuted, cross-file rank is untouched, and every member remains
+		// searchable and readable through every other lane.
+		cands = demoteLocalizationFileMembers(cands)
 	}
 	protectedFinalCandidateIDs := exploreFinalReservedCandidateIDs(
 		cands, protectedSyntacticAnchors, protectedImplementationID,
@@ -4334,6 +4348,10 @@ func buildLocalizationExploreResultForTaskFinalizedWithOutlineAndDeclarations(
 		requiredSymbol = completion.refinementSymbol
 	}
 	targets = localizationEvidenceTargetsFromDraft(task, requiredSymbol, targets, draft)
+	// The draft's selection is final here; only its presentation order is not.
+	// Applying the tiers before the relation, refinement, and complement lanes
+	// leaves each of them authoritative over the seats they claim.
+	targets = demoteLocalizationEvidenceMembers(task, requiredSymbol, targets)
 	if refinementFirst {
 		targets = prioritizeLocalizationEvidenceTarget(requiredSymbol, targets)
 		// A divergent-default refinement is one causal unit: keep the prescribed
@@ -4951,6 +4969,317 @@ func diversifyRepeatedExploreNames(cands []*rerank.Candidate, class rerank.Query
 		head = append(head, cand)
 	}
 	return append(head, duplicates...)
+}
+
+// Localization member tiers order one file's own candidate slots. Extracted
+// members inherit their owner type's name terms and win callable tie-breaks, so
+// without an explicit tier they seat above the sibling declaration a task is
+// actually about.
+const (
+	localizationMemberTierBehavioral = iota
+	localizationMemberTierConstructor
+	localizationMemberTierData
+	localizationMemberTierCount
+)
+
+// exploreConstructorSpelledName reports the cross-language spellings of a
+// declaration named by its keyword rather than by intent: `<Type>.<init>`
+// (Java, C#, Swift) and Swift's bare `deinit` / `subscript`. The comparison is
+// on the bare name after the last dot, so both the qualified and the bare
+// spelling classify identically.
+func exploreConstructorSpelledName(name string) bool {
+	bare := name
+	if dot := strings.LastIndexByte(bare, '.'); dot >= 0 {
+		bare = bare[dot+1:]
+	}
+	switch bare {
+	case "<init>", "deinit", "subscript":
+		return true
+	}
+	return false
+}
+
+// localizationMemberTier classifies one candidate for per-file ordering. Kinds
+// outside the classification stay in the leading tier so ranking they already
+// earned is preserved; types lead alongside ordinary callables because a type
+// declaration is the owner a task names, not a member of one.
+func localizationMemberTier(n *graph.Node) int {
+	switch n.Kind {
+	case graph.KindFunction, graph.KindMethod:
+		if exploreConstructorSpelledName(n.Name) {
+			return localizationMemberTierConstructor
+		}
+		return localizationMemberTierBehavioral
+	case graph.KindField, graph.KindEnumMember:
+		return localizationMemberTierData
+	default:
+		return localizationMemberTierBehavioral
+	}
+}
+
+// demoteLocalizationFileMembers reorders localization candidates inside the
+// index positions each file already occupies. Nothing is dropped, added, or
+// moved across files: a file's tiered candidates are written back into that
+// file's own slots in slot order, so the window keeps the same members at the
+// same count and every upstream reservation — including the typed-anchor
+// projection's field — survives. Relative order inside a tier is preserved, so
+// the reorder is stable and idempotent. Candidates without a node or a file
+// path cannot be attributed to a file and keep their position.
+func demoteLocalizationFileMembers(cands []*rerank.Candidate) []*rerank.Candidate {
+	if len(cands) < 2 {
+		return cands
+	}
+	slots := make(map[string][]int, len(cands))
+	files := make([]string, 0, len(cands))
+	demotable := false
+	for i, cand := range cands {
+		if cand == nil || cand.Node == nil || cand.Node.FilePath == "" {
+			continue
+		}
+		key := cand.Node.RepoPrefix + "\x00" + cand.Node.FilePath
+		if _, ok := slots[key]; !ok {
+			files = append(files, key)
+		}
+		slots[key] = append(slots[key], i)
+		if localizationMemberTier(cand.Node) != localizationMemberTierBehavioral {
+			demotable = true
+		}
+	}
+	if !demotable {
+		return cands
+	}
+	out := append([]*rerank.Candidate(nil), cands...)
+	for _, key := range files {
+		positions := slots[key]
+		if len(positions) < 2 {
+			continue
+		}
+		var tiers [localizationMemberTierCount][]*rerank.Candidate
+		for _, position := range positions {
+			cand := cands[position]
+			tier := localizationMemberTier(cand.Node)
+			tiers[tier] = append(tiers[tier], cand)
+		}
+		written := 0
+		for _, tier := range tiers {
+			for _, cand := range tier {
+				out[positions[written]] = cand
+				written++
+			}
+		}
+	}
+	return out
+}
+
+// localizationSiblingLiftReach bounds "comparable standing" to the tail
+// immediately past the cut: a sibling that lost by a wide margin lost on its own
+// merits, and lifting it would be a ranking change rather than a tie-break.
+const localizationSiblingLiftReach = 8
+
+// localizationMemberSlotGuard decides which member candidates may not be traded
+// out of the final window. Beyond the reserved-seat rule the projection uses,
+// this boundary also protects the inputs of the lanes that run after the cut:
+// dropping one of those is not a reordering, it silently disables a proof.
+type localizationMemberSlotGuard struct {
+	task    string
+	ids     map[string]struct{}
+	anchors []exploreSyntacticAnchor
+	active  []int
+}
+
+func newLocalizationMemberSlotGuard(task string, protectedAnchors map[int]string) localizationMemberSlotGuard {
+	guard := localizationMemberSlotGuard{task: task, ids: make(map[string]struct{}, len(protectedAnchors))}
+	for _, id := range protectedAnchors {
+		if id != "" {
+			guard.ids[id] = struct{}{}
+		}
+	}
+	if len(protectedAnchors) > 0 {
+		guard.anchors = exploreSyntacticAnchors(task)
+		guard.active = exploreTypedAnchorActiveIndexes(guard.anchors, protectedAnchors)
+	}
+	return guard
+}
+
+// protects keeps a member's slot when a proof lane identified it by something no
+// member inherits from its owner type — the task's own literal text, an exact
+// cited range, a graph proof, or the task naming that exact identifier — or when
+// the candidate is a typed field the anchor projection may still lower into its
+// owner/consumer/member proof.
+func (g localizationMemberSlotGuard) protects(candidate *rerank.Candidate) bool {
+	if candidate == nil || candidate.Node == nil {
+		return true
+	}
+	if _, anchored := g.ids[candidate.Node.ID]; anchored {
+		return true
+	}
+	for _, signal := range []string{
+		exploreSourceRangeSignal, exploreContentRecallExactSignal,
+		exploreSourceLiteralSignal, exploreSourceLiteralCalleeSignal,
+		exploreSourceLiteralTaskAlignSignal, exploreTypedAnchorProjectionSignal,
+		exploreSyntacticAnchorSignal,
+	} {
+		if candidate.Signals[signal] > 0 {
+			return true
+		}
+	}
+	if candidate.Node.Kind == graph.KindField && len(g.active) > 0 &&
+		len(exploreTypedAnchorMatchingIndexes(
+			g.anchors, g.active, candidate.Node, exploreTypedAnchorFieldType(candidate.Node),
+		)) > 0 {
+		return true
+	}
+	return localizationDirectAdjacencyNodeTaskCitationOffset(g.task, candidate.Node) >= 0
+}
+
+// liftLocalizationSiblingCallables trades a window slot a member won back to the
+// ordinary sibling declaration it displaced. A file's slot count is fixed: the
+// two candidates always come from the same file, one inside the cut and one in
+// the bounded tail just past it, so no file gains or loses a slot and no
+// cross-file allocation moves. The trade is a strict no-op when the file has no
+// ordinary sibling in that tail — an unretrieved sibling cannot be selected, and
+// this lane never widens retrieval to look for one.
+func liftLocalizationSiblingCallables(
+	task string,
+	candidates []*rerank.Candidate,
+	maxSymbols int,
+	protectedAnchors map[int]string,
+) []*rerank.Candidate {
+	if maxSymbols <= 0 || len(candidates) <= maxSymbols {
+		return candidates
+	}
+	guard := newLocalizationMemberSlotGuard(task, protectedAnchors)
+	reach := min(len(candidates), maxSymbols+localizationSiblingLiftReach)
+	lifted := candidates
+	copied := false
+	traded := make(map[int]struct{}, maxSymbols)
+	for index := 0; index < maxSymbols; index++ {
+		candidate := lifted[index]
+		if candidate == nil || candidate.Node == nil || candidate.Node.FilePath == "" {
+			continue
+		}
+		if localizationMemberTier(candidate.Node) == localizationMemberTierBehavioral {
+			continue
+		}
+		if guard.protects(candidate) {
+			continue
+		}
+		sibling := -1
+		for below := maxSymbols; below < reach; below++ {
+			if _, used := traded[below]; used {
+				continue
+			}
+			other := lifted[below]
+			if other == nil || other.Node == nil {
+				continue
+			}
+			if other.Node.FilePath != candidate.Node.FilePath ||
+				other.Node.RepoPrefix != candidate.Node.RepoPrefix {
+				continue
+			}
+			if localizationMemberTier(other.Node) != localizationMemberTierBehavioral {
+				continue
+			}
+			sibling = below
+			break
+		}
+		if sibling < 0 {
+			continue
+		}
+		if !copied {
+			lifted = append([]*rerank.Candidate(nil), candidates...)
+			copied = true
+		}
+		lifted[index], lifted[sibling] = lifted[sibling], lifted[index]
+		traded[sibling] = struct{}{}
+	}
+	return lifted
+}
+
+// localizationEvidenceSeatReserved reports whether an evidence row owes its seat
+// to a proof lane or to the task naming that exact identifier, rather than to
+// ranking. Such a row keeps its exact position: the reservation is a contract,
+// and presentation tiering is never allowed to overrule proven or explicitly
+// named evidence. Citation is deliberately identifier-level — a task that names
+// the file, or the type whose name every member inherits, has not asked for the
+// constructor over the method.
+func localizationEvidenceSeatReserved(task, requiredID string, target exploreTarget) bool {
+	if target.node == nil {
+		return true
+	}
+	if requiredID != "" && target.node.ID == requiredID {
+		return true
+	}
+	// Proof lanes: the task's own literal text, an exact cited range, or a graph
+	// proof. Each identifies a row by something a member cannot inherit.
+	if target.sourceRange || target.divergentDefaultOwner || target.divergentDefaultType ||
+		target.typedAnchorProjection || target.sourceLiteral || target.sourceLiteralCallee ||
+		target.sourceLiteralAligned || target.literalPrimaryEligible || target.exactContent ||
+		target.causalChangeOwner || target.causalChangeBridge || target.causalChangeLeaf ||
+		target.localizationRelation != "" {
+		return true
+	}
+	if localizationDirectAdjacencyNodeTaskCitationOffset(task, target.node) >= 0 {
+		return true
+	}
+	// The name-term lanes are the ones a member rides in on: a constructor or a
+	// field matches the task's wording only because its identifier carries the
+	// owner type's terms. They hold a seat for declarations named by intent.
+	return localizationMemberTier(target.node) == localizationMemberTierBehavioral &&
+		(target.conceptImplementation || target.conceptComplement || target.syntacticAnchor)
+}
+
+// demoteLocalizationEvidenceMembers applies the same member tiers to the
+// projection the draft already selected. Owner folding and draft ranking can
+// re-seat a member the ranked window demoted, because both read the owner type's
+// name terms off the member's own name. The reorder changes no selection: it
+// permutes only rows the draft chose, only inside the slots one file already
+// holds, and only among rows no lane reserved — so a constructor-spelled or data
+// member yields its seat exactly when an ordinary sibling callable from the same
+// file is already on the page, and otherwise keeps it.
+func demoteLocalizationEvidenceMembers(task, requiredID string, targets []exploreTarget) []exploreTarget {
+	if len(targets) < 2 {
+		return targets
+	}
+	slots := make(map[string][]int, len(targets))
+	files := make([]string, 0, len(targets))
+	demotable := false
+	for index, target := range targets {
+		if localizationEvidenceSeatReserved(task, requiredID, target) || target.node.FilePath == "" {
+			continue
+		}
+		key := target.node.RepoPrefix + "\x00" + target.node.FilePath
+		if _, ok := slots[key]; !ok {
+			files = append(files, key)
+		}
+		slots[key] = append(slots[key], index)
+		if localizationMemberTier(target.node) != localizationMemberTierBehavioral {
+			demotable = true
+		}
+	}
+	if !demotable {
+		return targets
+	}
+	out := append([]exploreTarget(nil), targets...)
+	for _, key := range files {
+		positions := slots[key]
+		if len(positions) < 2 {
+			continue
+		}
+		var tiers [localizationMemberTierCount][]exploreTarget
+		for _, position := range positions {
+			tier := localizationMemberTier(targets[position].node)
+			tiers[tier] = append(tiers[tier], targets[position])
+		}
+		written := 0
+		for _, tier := range tiers {
+			for _, target := range tier {
+				out[positions[written]] = target
+				written++
+			}
+		}
+	}
+	return out
 }
 
 // exploreLocalizableKind reports whether a node kind is a place a

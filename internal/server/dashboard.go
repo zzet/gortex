@@ -217,10 +217,12 @@ func (h *Handler) handleRepos(w http.ResponseWriter, _ *http.Request) {
 // When `session_id` is supplied, the session is registered under that
 // ID instead of a freshly minted one — this is how an MCP client binds
 // its overlay session to its MCP session ID, so subsequent tools/call
-// frames from the same MCP session automatically see the overlay
-// (the MCP tool middleware reads SessionIDFromContext and resolves the
-// overlay by that ID). Idempotent: registering twice with the same
-// (id, workspace) tuple is a no-op; mismatched workspaces return 409.
+// frames from the same MCP session automatically see the overlay (the
+// MCP tool middleware reads OverlayCohortIDFromContext, which resolves
+// to the real session id unless a caller explicitly overrides it via
+// X-Gortex-Overlay-Session). Idempotent: registering twice with the
+// same (id, workspace) tuple is a no-op; mismatched workspaces return
+// 409.
 //
 // Response: {"session_id": "...", "workspace_id": "..."}.
 func (h *Handler) handleOverlayRegister(w http.ResponseWriter, r *http.Request) {
@@ -493,7 +495,7 @@ func categorizeProcess(entry string) string {
 }
 
 func (h *Handler) handleProcesses(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "get_processes", map[string]any{})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "processes"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -636,7 +638,7 @@ type contractLocation struct {
 }
 
 func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "contracts", map[string]any{"action": "list"})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "contracts", "action": "list"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -746,7 +748,7 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 // counts and render a per-contract diff panel.
 
 func (h *Handler) handleContractsValidate(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "contracts", map[string]any{"action": "validate"})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "contracts", "action": "validate"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1138,7 +1140,7 @@ type communityEntry struct {
 }
 
 func (h *Handler) handleCommunities(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "get_communities", map[string]any{})
+	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "communities"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1596,7 +1598,7 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	// Top processes for the inline preview. The full list is on the
 	// Processes page; here we cap at 6 so the dashboard stays compact.
-	if raw, err := h.CallToolStrict(ctx, "get_processes", map[string]any{}); err != nil {
+	if raw, err := h.CallToolStrict(ctx, "analyze", map[string]any{"kind": "processes"}); err != nil {
 		h.logger.Warn("dashboard: get_processes failed; processes section will be empty",
 			zap.Error(err))
 	} else if raw != "" {

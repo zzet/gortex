@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	semver "github.com/zzet/gortex/internal/version"
 )
 
 // coldStartTools is the static core catalogue the proxy answers a cold-start
@@ -119,6 +120,9 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 	}
 
 	logProxyConnection(os.Stderr, client, false)
+	if warn := daemonSkewWarning(client.Ack.DaemonVersion, canonicalVersion()); warn != "" {
+		fmt.Fprintln(os.Stderr, "[gortex mcp] "+warn)
+	}
 	if surface != nil && surface.Active() {
 		fmt.Fprintf(os.Stderr, "[gortex mcp] tool surface restricted (preset %q)\n", surface.Preset())
 	}
@@ -138,6 +142,46 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 		return true, fmt.Errorf("proxy relay: %w", err)
 	}
 	return true, nil
+}
+
+// daemonSkewWarning returns a one-line stderr warning when the daemon
+// reports a different build than this binary, or "" when they match,
+// the daemon did not report a version, or either side is a dev build
+// (no injected identity — comparing against a dev build would noise
+// every dev run, and a dev-built daemon cannot be "upgraded" by a
+// restart, so the remedy advice would be wrong for it too).
+// The remedy is direction-aware: an older daemon should be restarted
+// (a restart respawns it from this newer binary), while a newer daemon
+// means this binary is the stale side and upgrading it is the fix —
+// restarting would downgrade the daemon to this older build. The
+// upgrade remedy is 'gortex upgrade' rather than a package-manager
+// specific command: it upgrades the way gortex was installed (brew,
+// scoop, go install, or the install script) and restarts the daemon
+// around the binary swap. When
+// either side does not parse as semver, or only the build metadata
+// differs (which SemVer precedence ignores), a generic remedy that
+// covers both directions is emitted. Implements the documented intent
+// in docs/versioning.md: the daemon exposes DaemonVersion so "clients
+// can feature-gate or warn on mismatch"; this warns and continues —
+// never gates.
+func daemonSkewWarning(daemonVer, localVer string) string {
+	if daemonVer == "" || localVer == "" || localVer == "v0.0.0-dev" || daemonVer == "v0.0.0-dev" || daemonVer == localVer {
+		return ""
+	}
+	base := fmt.Sprintf("warning: daemon %s != binary %s", daemonVer, localVer)
+	d, dErr := semver.Parse(daemonVer)
+	l, lErr := semver.Parse(localVer)
+	if dErr != nil || lErr != nil {
+		return base + " — run 'gortex daemon restart' or 'gortex upgrade'"
+	}
+	switch semver.Compare(d, l) {
+	case -1: // daemon older — restarting respawns it from this newer binary
+		return base + " — run 'gortex daemon restart' to upgrade the daemon"
+	case 1: // daemon newer — this binary is the stale side
+		return base + " — this binary is older than the running daemon — run 'gortex upgrade'"
+	default: // same precedence, different build metadata
+		return base + " — run 'gortex daemon restart' or 'gortex upgrade'"
+	}
 }
 
 func newProxyLogicalSessionID() string {

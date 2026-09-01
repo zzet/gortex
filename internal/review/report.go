@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/analysis"
+	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // ReviewReport is the output of the hybrid review flow: a worst-of verdict over
@@ -115,10 +116,11 @@ func worseVerdict(a, b Verdict) Verdict {
 // worst-first, then by file for determinism.
 //
 // repoPrefix normalizes the two path vocabularies onto one key: changed-symbol
-// (and finding) paths come from graph nodes, which multi-repo daemons key as
-// "<prefix>/<rel>", while the diff's changed files are repo-relative. Without
-// stripping the prefix every file would surface twice — once with its real
-// impact tier and once as a LOW diff-only row.
+// paths come from graph nodes, which multi-repo daemons key as "<prefix>/<rel>",
+// while findings and the diff's changed files are repo-relative. Without
+// stripping the prefix off the graph-keyed side every file would surface twice —
+// once with its real impact tier and once as a LOW diff-only row. The strip is
+// applied per domain, never to every input: see the normalizers below.
 //
 // coverageKnown gates the coverage evidence: when the graph indexes no test
 // symbols at all, "no covering test" is blindness, not a finding — the rows
@@ -127,13 +129,28 @@ func worseVerdict(a, b Verdict) Verdict {
 // a test function needs no test of its own, so counting one as missing is a
 // demand that can never be met.
 func rankFileRisk(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, findings []Finding, repoPrefix string, coverageKnown bool) []FileRisk {
-	norm := func(file string) string {
-		file = cleanPath(file)
+	// Two vocabularies reach this function and they overlap, so each input is
+	// normalized by its own domain instead of through one shared strip.
+	// ChangedSymbol.FilePath is a graph node key; findings and ChangedFiles are
+	// already repo-relative. Stripping the prefix off a repo-relative path that
+	// legitimately begins with the prefix name rewrites it onto a different
+	// file — `repo-a/pkg/widget.go` becomes `pkg/widget.go` — and attributes the
+	// risk to that unchanged shadow.
+	fromGraphKey := func(file string) string {
+		// Normalize to the '/' comparison form BEFORE removing the prefix.
+		// cleanPath ends in filepath.Clean, so on Windows the graph key
+		// "repo-a/repo-a\widget.go" becomes "repo-a\repo-a\widget.go" and the
+		// '/'-joined prefix no longer matches: the row keeps its prefix while
+		// the repo-relative side produces a second row for the same file.
+		file = graphpath.Norm(cleanPath(file))
 		if repoPrefix != "" {
 			file = strings.TrimPrefix(file, repoPrefix+"/")
 		}
 		return file
 	}
+	// Both domains leave here in the documented repo-relative '/' spelling —
+	// the one the rule globs, the risk rows and the forge comment API speak.
+	fromRepoRel := func(file string) string { return graphpath.Norm(cleanPath(file)) }
 
 	byFile := map[string]string{}
 	findingCount := map[string]int{}
@@ -146,13 +163,13 @@ func rankFileRisk(diff *analysis.DiffResult, impact map[string]*analysis.ImpactR
 
 	for _, f := range findings {
 		if f.File != "" {
-			findingCount[norm(f.File)]++
+			findingCount[fromRepoRel(f.File)]++
 		}
 	}
 
 	if diff != nil {
 		for _, cs := range diff.ChangedSymbols {
-			file := norm(cs.FilePath)
+			file := fromGraphKey(cs.FilePath)
 			if file == "" {
 				continue
 			}
@@ -192,7 +209,7 @@ func rankFileRisk(diff *analysis.DiffResult, impact map[string]*analysis.ImpactR
 			byFile[file] = worseRisk(byFile[file], risk)
 		}
 		for _, file := range diff.ChangedFiles {
-			file = norm(file)
+			file = fromRepoRel(file)
 			if file == "" {
 				continue
 			}

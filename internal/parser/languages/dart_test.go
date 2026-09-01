@@ -512,7 +512,8 @@ func TestDartExtractor_ConstructorVariants(t *testing.T) {
 }
 
 // A const constructor on an enum and a private named constructor are ordinary
-// members too; a plain field declaration next to them stays a non-symbol.
+// members too; a plain field declaration next to them is a field, never a
+// constructor.
 func TestDartExtractor_ConstructorsInEnumAndPrivate(t *testing.T) {
 	src := []byte(`enum Status {
   active,
@@ -543,7 +544,9 @@ class Cache {
 	assert.Equal(t, "private", internal.Meta["visibility"])
 
 	// `final int size;` is a field declaration, not a constructor.
-	assert.Nil(t, byID["status.dart::Cache.size"])
+	size := byID["status.dart::Cache.size"]
+	require.NotNil(t, size, "field declaration must be emitted")
+	assert.Equal(t, graph.KindField, size.Kind)
 	assert.Nil(t, byID["status.dart::Cache.Cache"])
 }
 

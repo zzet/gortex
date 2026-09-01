@@ -8,13 +8,28 @@ import (
 // semantic source. Origin is set to LSP-grade (lsp_dispatch for interface
 // implementations, lsp_resolved for everything else) since only compiler /
 // type-system providers call ConfirmEdge.
+//
+// A non-LSP prior origin is preserved under meta confirmed_from_origin
+// BEFORE the flip: the LSP dispatch gate's evidence probe tells extractor /
+// resolver hierarchy edges from the sweep's own recoveries by origin, and a
+// confirm that erased the origin in place would decay that evidence one
+// pass at a time — the gate admits hierarchy types, the sweep confirms
+// their edges, the probe loses them. Confirmation upgrades the tier; it
+// must not erase which lane produced the edge. The marker's presence is the
+// signal (an extractor stub's origin is legitimately empty) and it is
+// written once — a re-confirmation sees an LSP-grade origin and leaves it.
 func ConfirmEdge(e *graph.Edge, provider string) {
-	e.Confidence = 1.0
-	e.ConfidenceLabel = "EXTRACTED"
-	e.Origin = originForSemanticKind(e.Kind)
 	if e.Meta == nil {
 		e.Meta = make(map[string]any)
 	}
+	if e.Origin != graph.OriginLSPResolved && e.Origin != graph.OriginLSPDispatch {
+		if _, tagged := e.Meta["confirmed_from_origin"]; !tagged {
+			e.Meta["confirmed_from_origin"] = string(e.Origin)
+		}
+	}
+	e.Confidence = 1.0
+	e.ConfidenceLabel = "EXTRACTED"
+	e.Origin = originForSemanticKind(e.Kind)
 	e.Meta["semantic_source"] = provider
 }
 

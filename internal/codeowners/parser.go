@@ -16,7 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	gitignore "github.com/sabhiram/go-gitignore"
+	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -25,7 +25,7 @@ import (
 type Rule struct {
 	Pattern string
 	Owners  []string
-	matcher *gitignore.GitIgnore
+	matcher *excludes.Matcher
 }
 
 // matchPattern returns the rule's gitignore matcher. Parse precompiles
@@ -35,11 +35,17 @@ type Rule struct {
 // list). For a Rule hand-constructed outside Parse the field is nil;
 // compile a throwaway matcher rather than caching into r.matcher, so
 // concurrent callers still can't race on the field.
-func (r *Rule) matchPattern() *gitignore.GitIgnore {
+//
+// Compilation goes through excludes.New rather than go-gitignore
+// directly: the raw library splices pattern text into a regexp with
+// almost nothing escaped, so an owner rule as ordinary as "*$" would
+// claim every file in the repository (the same defect that emptied a
+// whole index in #624).
+func (r *Rule) matchPattern() *excludes.Matcher {
 	if r.matcher != nil {
 		return r.matcher
 	}
-	return gitignore.CompileIgnoreLines(r.Pattern)
+	return excludes.New([]string{r.Pattern})
 }
 
 // Parse reads a CODEOWNERS file's bytes and returns the rule list in
@@ -73,7 +79,7 @@ func Parse(source []byte) []Rule {
 		rule := Rule{Pattern: fields[0]}
 		// Precompile the matcher in this single-goroutine parse so the
 		// concurrent MatchFile hot path only reads rule.matcher.
-		rule.matcher = gitignore.CompileIgnoreLines(rule.Pattern)
+		rule.matcher = excludes.New([]string{rule.Pattern})
 		if len(fields) > 1 {
 			rule.Owners = append(rule.Owners, fields[1:]...)
 		}
@@ -90,7 +96,7 @@ func MatchFile(path string, rules []Rule) []string {
 	path = filepath.ToSlash(path)
 	for i := len(rules) - 1; i >= 0; i-- {
 		r := &rules[i]
-		if r.matchPattern().MatchesPath(path) {
+		if r.matchPattern().MatchRel(path) {
 			if len(r.Owners) == 0 {
 				return nil
 			}
@@ -136,12 +142,13 @@ func LoadFromRepo(repoRoot string) (rules []Rule, sourcePath string, ok bool) {
 // an email) is a person.
 //
 // filePath is the unprefixed path; applyRepoPrefix downstream
-// handles multi-repo namespacing.
+// handles multi-repo namespacing. Its spelling is preserved verbatim —
+// the edge endpoint must match the extractor's file-node ID spelling
+// (OS-native separators on Windows) or the edge dangles.
 func BuildGraphArtifacts(filePath string, owners []string, language string) ([]*graph.Node, []*graph.Edge) {
 	if len(owners) == 0 {
 		return nil, nil
 	}
-	filePath = filepath.ToSlash(filePath)
 	nodes := make([]*graph.Node, 0, len(owners))
 	edges := make([]*graph.Edge, 0, len(owners))
 	for _, owner := range owners {

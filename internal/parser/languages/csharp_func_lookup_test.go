@@ -18,7 +18,7 @@ func TestCSharpFuncLookup(t *testing.T) {
 		{id: "f.cs::A.M3", startLine: 40, endLine: 60},
 		{id: "f.cs::A.M3.Local", startLine: 45, endLine: 50},
 		{id: "f.cs::A.M4", startLine: 65, endLine: 65},
-	})
+	}, nil)
 
 	assert.Equal(t, "f.cs::A.M1", l.enclosing(10), "start boundary is inside")
 	assert.Equal(t, "f.cs::A.M1", l.enclosing(20), "end boundary is inside")
@@ -30,7 +30,7 @@ func TestCSharpFuncLookup(t *testing.T) {
 	assert.Equal(t, "f.cs::A.M4", l.enclosing(65), "a single-line method matches its own line")
 	assert.Equal(t, "", l.enclosing(5), "before every range")
 	assert.Equal(t, "", l.enclosing(100), "after every range")
-	assert.Equal(t, "", newCSharpFuncLookup(nil).enclosing(1), "empty set")
+	assert.Equal(t, "", newCSharpFuncLookup(nil, nil).enclosing(1), "empty set")
 }
 
 // Two expression-bodied members on one line produce identical ranges —
@@ -40,6 +40,6 @@ func TestCSharpFuncLookup_EqualRangeTieIsFirstInOrder(t *testing.T) {
 	l := newCSharpFuncLookup([]funcRange{
 		{id: "f.cs::A.First", startLine: 12, endLine: 12},
 		{id: "f.cs::A.Second", startLine: 12, endLine: 12},
-	})
+	}, nil)
 	assert.Equal(t, "f.cs::A.First", l.enclosing(12))
 }

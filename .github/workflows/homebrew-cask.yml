@@ -1,0 +1,41 @@
+# Load the generated Homebrew cask through a real `brew` on every PR that
+# touches it. The cask is the default macOS install path (scripts/install.sh
+# hands off to brew unless GORTEX_NO_BREW=1), and the tap it is published to
+# has no CI of its own — so without this the first machine to evaluate the
+# cask is a user's.
+#
+# Issue #639 is the reason this exists: a release shipped a cask using
+# `pre_install` / `post_install`, which are formula-only DSL methods. The file
+# was valid Ruby and valid YAML, so nothing in the Go suite, actionlint, or a
+# shell lint could see it, and `brew install`/`brew upgrade` failed for every
+# macOS user with "undefined method 'pre_install'". Only loading the DSL
+# catches that.
+#
+# macOS only — Homebrew on Linux cannot load casks at all.
+name: homebrew-cask
+
+on:
+  pull_request:
+    paths:
+      - ".github/homebrew/gortex.rb.tmpl"
+      - "scripts/render-cask.sh"
+      - "scripts/validate-cask.sh"
+      - ".github/workflows/homebrew-cask.yml"
+      - ".github/workflows/release.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/homebrew/gortex.rb.tmpl"
+      - "scripts/render-cask.sh"
+      - "scripts/validate-cask.sh"
+
+jobs:
+  validate:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Render and load the cask
+        run: bash scripts/validate-cask.sh

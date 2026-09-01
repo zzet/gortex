@@ -58,6 +58,11 @@ func (e *DartExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	// Methods inside class/mixin/enum/extension bodies.
 	e.extractMethods(root, src, filePath, fileNode, result, seen)
 
+	// Fields inside class/mixin/enum/extension bodies. Runs after
+	// extractMethods so an accessor keeps the unsuffixed `Type.name` id when a
+	// backing field of the same name exists.
+	e.extractFields(root, src, filePath, fileNode, result, seen)
+
 	// Top-level functions (function_signature + function_body at program level).
 	e.extractTopLevelFunctions(root, src, filePath, fileNode, result, seen)
 
@@ -167,7 +172,49 @@ func (e *DartExtractor) extractTypes(
 		if node.Type() == "class_definition" {
 			e.emitDartMixinEdges(node, src, id, filePath, result)
 		}
+		if node.Type() == "enum_declaration" {
+			e.emitDartEnumConstants(node, src, id, name, filePath, result, seen)
+		}
 	})
+}
+
+// emitDartEnumConstants emits one KindEnumMember per `enum_constant` in an
+// enum body, linked to the enum with EdgeMemberOf. A constant of an enhanced
+// enum carries an argument_part (`mercury(3.3e23, 2.44e6)`) after its name, so
+// only the constant's first identifier child names it.
+func (e *DartExtractor) emitDartEnumConstants(
+	enumNode *sitter.Node, src []byte, enumID, enumName, filePath string,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	body := dartFirstChildOfType(enumNode, "enum_body")
+	if body == nil {
+		return
+	}
+	for i, _nc := 0, int(body.ChildCount()); i < _nc; i++ {
+		constant := body.Child(i)
+		if constant == nil || constant.Type() != "enum_constant" {
+			continue
+		}
+		name := e.findChildIdentifier(constant, src)
+		if name == "" {
+			continue
+		}
+		startLine := int(constant.StartPoint().Row) + 1
+		id := enumID + "." + name
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		result.Nodes = append(result.Nodes, &graph.Node{
+			ID: id, Kind: graph.KindEnumMember, Name: name,
+			FilePath: filePath, StartLine: startLine, EndLine: int(constant.EndPoint().Row) + 1,
+			Language: "dart",
+			Meta:     map[string]any{"receiver": enumName, "enum": enumID},
+		})
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: id, To: enumID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine,
+		})
+	}
 }
 
 // dartSuperclassName returns the name of a class's `extends` base — the
@@ -324,6 +371,11 @@ func (e *DartExtractor) extractMethods(
 		if rt := dartMethodReturnType(node, src); rt != "" {
 			methodMeta["return_type"] = rt
 		}
+		// A getter and its setter share the bare property name, so the accessor
+		// role is the only thing that tells the two nodes apart.
+		if acc := dartAccessorKind(node); acc != "" {
+			methodMeta["accessor"] = acc
+		}
 		if doc := ExtractDocAbove(src, startLine, DocLangSlashSlash); doc != "" {
 			methodMeta["doc"] = doc
 		}
@@ -343,6 +395,119 @@ func (e *DartExtractor) extractMethods(
 			})
 		}
 	})
+}
+
+// extractFields emits one member node per name bound by a field declaration in
+// a class / mixin / enum / extension body. The grammar hangs a field off the
+// same `declaration` wrapper it gives a body-less constructor, binding the
+// names under initialized_identifier_list (instance, `var`, `final`) or
+// static_final_declaration_list (`static final`, `static const`); a
+// constructor-signature declaration carries neither and is left to
+// extractMethods. One declaration can bind several names (`String? a, b;`), so
+// each bound identifier becomes its own node.
+func (e *DartExtractor) extractFields(
+	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
+	result *parser.ExtractionResult, seen map[string]bool,
+) {
+	typeBodyRanges := e.collectTypeBodyRanges(root, src)
+
+	walkNodes(root, func(node *sitter.Node) {
+		if node.Type() != "declaration" {
+			return
+		}
+		parent := node.Parent()
+		if parent == nil {
+			return
+		}
+		switch parent.Type() {
+		case "class_body", "extension_body", "enum_body":
+		default:
+			return
+		}
+
+		typeName, ok := e.findEnclosingType(typeBodyRanges, int(node.StartPoint().Row))
+		if !ok {
+			return
+		}
+
+		fieldType := dartLeadingTypeText(node, src)
+		isStatic := e.hasChildType(node, "static")
+		// A `const` binding is immutable by grammar; kind it as KindConstant so
+		// value-reference impact analysis reaches its readers (mirrors the
+		// top-level static_final path and the C# const-field rule).
+		kind := graph.KindField
+		if e.hasChildType(node, "const_builtin") {
+			kind = graph.KindConstant
+		}
+
+		for _, bound := range dartFieldBindings(node) {
+			name := e.findChildIdentifier(bound, src)
+			if name == "" {
+				continue
+			}
+			startLine := int(bound.StartPoint().Row) + 1
+			id := filePath + "::" + typeName + "." + name
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+
+			meta := map[string]any{
+				"receiver":   typeName,
+				"visibility": VisibilityByUnderscore(name),
+			}
+			if fieldType != "" {
+				meta["field_type"] = fieldType
+			}
+			if isStatic {
+				meta["static"] = true
+			}
+			if doc := ExtractDocAbove(src, int(node.StartPoint().Row), DocLangSlashSlash); doc != "" {
+				meta["doc"] = doc
+			}
+			result.Nodes = append(result.Nodes, &graph.Node{
+				ID: id, Kind: kind, Name: name,
+				FilePath: filePath, StartLine: startLine, EndLine: int(bound.EndPoint().Row) + 1,
+				Language: "dart",
+				Meta:     meta,
+			})
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: fileNode.ID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: startLine,
+			})
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: id, To: filePath + "::" + typeName, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: startLine,
+			})
+		}
+	})
+}
+
+// dartFieldBindings returns the per-name binding nodes a field declaration
+// carries — `initialized_identifier` under an initialized_identifier_list, or
+// `static_final_declaration` under a static_final_declaration_list. Returns nil
+// for a declaration that binds no field (a constructor signature).
+func dartFieldBindings(decl *sitter.Node) []*sitter.Node {
+	var out []*sitter.Node
+	for i, _nc := 0, int(decl.ChildCount()); i < _nc; i++ {
+		list := decl.Child(i)
+		if list == nil {
+			continue
+		}
+		var want string
+		switch list.Type() {
+		case "initialized_identifier_list":
+			want = "initialized_identifier"
+		case "static_final_declaration_list":
+			want = "static_final_declaration"
+		default:
+			continue
+		}
+		for j, _nc := 0, int(list.ChildCount()); j < _nc; j++ {
+			if bound := list.Child(j); bound != nil && bound.Type() == want {
+				out = append(out, bound)
+			}
+		}
+	}
+	return out
 }
 
 // dartIsGenerated reports whether a Dart file path is a code-generator output
@@ -750,9 +915,13 @@ func (e *DartExtractor) extractMethodName(node *sitter.Node, src []byte) string 
 				return nameNode.Content(src)
 			}
 		case "setter_signature":
+			// The bare property name, not the `set foo` source spelling: a
+			// search or a `.foo = x` write site names the property. The
+			// getter/setter pair collides on `Type.foo`; the caller's
+			// line-suffix disambiguation separates the second one.
 			nameNode := child.ChildByFieldName("name")
 			if nameNode != nil {
-				return "set " + nameNode.Content(src)
+				return nameNode.Content(src)
 			}
 		case "constructor_signature", "constant_constructor_signature",
 			"factory_constructor_signature", "redirecting_factory_constructor_signature":
@@ -765,6 +934,24 @@ func (e *DartExtractor) extractMethodName(node *sitter.Node, src []byte) string 
 					return "operator " + strings.TrimSpace(c.Content(src))
 				}
 			}
+		}
+	}
+	return ""
+}
+
+// dartAccessorKind returns "getter" / "setter" when a method_signature wraps a
+// getter_signature / setter_signature, and "" for every other member shape.
+func dartAccessorKind(methodSig *sitter.Node) string {
+	for i, _nc := 0, int(methodSig.ChildCount()); i < _nc; i++ {
+		child := methodSig.Child(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type() {
+		case "getter_signature":
+			return "getter"
+		case "setter_signature":
+			return "setter"
 		}
 	}
 	return ""

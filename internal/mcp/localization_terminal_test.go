@@ -796,15 +796,21 @@ func TestHandleFacadeExactReadCommitsOnlyOnSuccess(t *testing.T) {
 		!strings.Contains(body, `"required_action":"recover_once"`) || !strings.Contains(body, `"terminal":false`) {
 		t.Fatalf("successful unproven exact-read retry omitted recovery completion: %q", body)
 	}
+	// The capture-free legacy handler corroborates nothing, so each accepted
+	// recovery spends one allowance and the second one terminalizes.
 	third, err := server.handleFacade(ctx, "read", req)
 	if err != nil || third == nil || third.IsError || calls != 3 {
 		t.Fatalf("bounded exact-read recovery = result=%#v err=%v calls=%d", third, err, calls)
 	}
 	fourth, err := server.handleFacade(ctx, "read", req)
-	if err != nil || calls != 3 {
-		t.Fatalf("post-recovery exact read = result=%#v err=%v calls=%d", fourth, err, calls)
+	if err != nil || fourth == nil || fourth.IsError || calls != 4 {
+		t.Fatalf("second bounded exact-read recovery = result=%#v err=%v calls=%d", fourth, err, calls)
 	}
-	requireLocalizationTerminalReplay(t, fourth, "read", "source")
+	fifth, err := server.handleFacade(ctx, "read", req)
+	if err != nil || calls != 4 {
+		t.Fatalf("post-recovery exact read = result=%#v err=%v calls=%d", fifth, err, calls)
+	}
+	requireLocalizationUnconfirmedReplay(t, fifth)
 }
 
 func TestHandleFacadeExhaustedCorrectionFailureCarriesAdvisoryCompletion(t *testing.T) {
@@ -1149,13 +1155,19 @@ func TestHandleFacadeExactReadPanicRestoresReservation(t *testing.T) {
 	if err != nil || third == nil || third.IsError {
 		t.Fatalf("third exact read recovery = (%v, %v), want success", third, err)
 	}
+	// Two recovery allowances, neither corroborated by the capture-free legacy
+	// handler: the second spends the last one and terminalizes.
 	fourth, err := server.handleFacade(ctx, "read", req)
-	if err != nil {
-		t.Fatalf("fourth exact read = (%v, %v), want terminal block", fourth, err)
+	if err != nil || fourth == nil || fourth.IsError {
+		t.Fatalf("fourth exact read recovery = (%v, %v), want success", fourth, err)
 	}
-	requireLocalizationTerminalReplay(t, fourth, "read", "source")
-	if calls != 3 {
-		t.Fatalf("legacy source calls = %d, want 3", calls)
+	fifth, err := server.handleFacade(ctx, "read", req)
+	if err != nil {
+		t.Fatalf("fifth exact read = (%v, %v), want terminal block", fifth, err)
+	}
+	requireLocalizationUnconfirmedReplay(t, fifth)
+	if calls != 4 {
+		t.Fatalf("legacy source calls = %d, want 4", calls)
 	}
 }
 
@@ -1227,7 +1239,9 @@ func TestLocalizationEnvelopeOmitsOversizedSource(t *testing.T) {
 	if len(envelope.Evidence) != 1 || envelope.Evidence[0].Source != "" {
 		t.Fatalf("oversized source leaked into compact envelope: %#v", envelope.Evidence)
 	}
-	if len(text) > 1500 {
+	// The guard proves the 32 KB source stayed out; the page's fixed cost now
+	// includes the leading answer-shape directive.
+	if len(text) > 1700 {
 		t.Fatalf("compact envelope exceeded size guard: %d bytes", len(text))
 	}
 }

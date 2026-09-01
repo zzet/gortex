@@ -85,11 +85,13 @@ const gortexToolGuidance = "### MUST use Gortex MCP tools instead of Read/Grep/G
 	"4. Call `capabilities` only when an operation's exact fields are unknown.\n"
 
 // renderTaskContext calls smart_context with the subagent task text and
-// returns a compacted body. Falls back to empty on any error.
+// returns a capped body. Falls back to empty on any error. Only declared
+// options ride the call — smart_context has no compact option, and an
+// undeclared key would draw the dispatch arg guard's rider into the
+// briefing text.
 func renderTaskContext(port int, task string) string {
 	raw := callServerTool(port, "smart_context", map[string]any{
-		"task":    task,
-		"compact": true,
+		"task": task,
 	})
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

@@ -102,13 +102,15 @@ func init() {
 // integration cannot check: that the `gortex` the editor will launch is the
 // one on PATH, and that the daemon it proxies to actually answers a handshake.
 type DoctorEnvironment struct {
-	BinaryOnPath  bool   `json:"binary_on_path"`
-	BinaryPath    string `json:"binary_path,omitempty"`
-	BinaryError   string `json:"binary_error,omitempty"`
-	DaemonRunning bool   `json:"daemon_running"`
-	DaemonSocket  string `json:"daemon_socket,omitempty"`
-	DaemonVersion string `json:"daemon_version,omitempty"`
-	DaemonError   string `json:"daemon_error,omitempty"`
+	BinaryOnPath       bool   `json:"binary_on_path"`
+	BinaryPath         string `json:"binary_path,omitempty"`
+	BinaryError        string `json:"binary_error,omitempty"`
+	CLIVersion         string `json:"cli_version,omitempty"`
+	DaemonRunning      bool   `json:"daemon_running"`
+	DaemonSocket       string `json:"daemon_socket,omitempty"`
+	DaemonVersion      string `json:"daemon_version,omitempty"`
+	DaemonError        string `json:"daemon_error,omitempty"`
+	VersionSkewWarning string `json:"version_skew_warning,omitempty"`
 }
 
 // DoctorAgentReport is one agent's slice of the doctor output.
@@ -211,6 +213,7 @@ func doctorExit(r doctorRuntime) error {
 // best-effort and never fail the command — doctor is a read-only diagnostic.
 func doctorEnvironment() DoctorEnvironment {
 	out := DoctorEnvironment{DaemonSocket: daemon.SocketPath()}
+	out.CLIVersion = canonicalVersion()
 	if p, err := exec.LookPath("gortex"); err == nil {
 		out.BinaryOnPath = true
 		out.BinaryPath = p
@@ -231,6 +234,10 @@ func doctorEnvironment() DoctorEnvironment {
 	defer c.Close()
 	out.DaemonRunning = true
 	out.DaemonVersion = c.Ack.DaemonVersion
+	// The same skew compare `gortex mcp` warns on at connect time and
+	// `daemon status` renders next to the daemon version — doctor is
+	// what a confused user runs first, so it must agree with both.
+	out.VersionSkewWarning = daemonSkewWarning(out.DaemonVersion, out.CLIVersion)
 	return out
 }
 
@@ -331,7 +338,17 @@ func printDoctorEnvironment(w io.Writer, env DoctorEnvironment) {
 		if ver == "" {
 			ver = "ok"
 		}
-		fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyphCheck, ver, doctorPath(env.DaemonSocket))
+		// A skewed pair downgrades the handshake row to a warning and
+		// appends the same one-line remedy the proxy prints — doctor,
+		// `daemon status`, and the MCP proxy must give one verdict.
+		glyph := glyphCheck
+		if env.VersionSkewWarning != "" {
+			glyph = glyphWarn
+		}
+		fmt.Fprintf(w, "  %s daemon handshake: %s (%s)\n", glyph, ver, doctorPath(env.DaemonSocket))
+		if env.VersionSkewWarning != "" {
+			fmt.Fprintf(w, "    %s\n", env.VersionSkewWarning)
+		}
 	} else {
 		fmt.Fprintf(w, "  %s daemon handshake: %s\n", glyphCross, env.DaemonError)
 	}

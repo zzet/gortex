@@ -84,6 +84,26 @@ func TestScan_Variants(t *testing.T) {
 	}
 }
 
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The indexer keys eviction and incremental replacement by the
+	// exact relPath spelling it hands the builder; a re-spelled edge
+	// endpoint dangles from a nonexistent file node on Windows.
+	// Written out, not composed with filepath.Join: on a POSIX runner
+	// Join yields exactly what the pre-fix ToSlash call returned, so
+	// the assertion would hold with or without the fix.
+	const rel = `src\gen\foo.pb.go`
+	edges := BuildGraphArtifacts(rel, Marker{Generated: true, Tool: "protoc-gen-go"})
+	if len(edges) != 1 {
+		t.Fatalf("edges = %d", len(edges))
+	}
+	if edges[0].From != rel {
+		t.Errorf("edge.From = %q, want %q", edges[0].From, rel)
+	}
+	if edges[0].FilePath != rel {
+		t.Errorf("edge file path = %q, want %q", edges[0].FilePath, rel)
+	}
+}
+
 func TestBuildGraphArtifacts(t *testing.T) {
 	t.Run("with source path", func(t *testing.T) {
 		edges := BuildGraphArtifacts("pkg/foo.pb.go", Marker{

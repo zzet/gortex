@@ -279,7 +279,7 @@ func TestAdvisoryReleaseCannotInvalidateConcurrentLocalizeReservation(t *testing
 	}
 }
 
-func TestAcceptedEmptyRecoveryReleasesAdvisorySession(t *testing.T) {
+func TestAcceptedEmptyRecoveryKeepsOneAllowanceThenTerminatesUnconfirmed(t *testing.T) {
 	state := newLocalizationTerminalState()
 	completion := newLocalizationRecoveryCompletion()
 	completion.digest = &localizationEvidenceDigest{Evidence: []localizationDigestRow{{
@@ -291,13 +291,26 @@ func TestAcceptedEmptyRecoveryReleasesAdvisorySession(t *testing.T) {
 	if blocked != nil || token == 0 {
 		t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
 	}
-	advisory := state.finishReservedReadTokenWithDigest(token, true, nil, true)
-	if advisory.State != localizationStateLocalized || advisory.AllowedToolCalls != 0 || advisory.Enforceable {
-		t.Fatalf("empty accepted recovery did not return advisory completion: %#v", advisory)
+	retry := state.finishReservedReadTokenWithDigest(token, true, nil, true)
+	if retry.State != localizationStateNeedsRecovery || retry.AllowedToolCalls != 1 || retry.Enforceable {
+		t.Fatalf("empty accepted recovery did not keep one further allowance: %#v", retry)
+	}
+
+	blocked, token = state.authorizeWithToken("search", "symbols", map[string]any{"query": "storage"})
+	if blocked != nil || token == 0 {
+		t.Fatalf("second recovery authorization = (%#v, %d)", blocked, token)
+	}
+	spent := state.finishReservedReadTokenWithDigest(token, true, nil, true)
+	if spent.State != localizationStateAnswerReady || spent.AllowedToolCalls != 0 || spent.Enforceable {
+		t.Fatalf("spent recovery allowance did not terminate the session: %#v", spent)
+	}
+	if !strings.HasPrefix(spent.FinalResponse, localizationProvisionalHeading) ||
+		!strings.HasSuffix(spent.FinalResponse, localizationUnconfirmedAnswerDirective) {
+		t.Fatalf("uncorroborated terminal page claimed proof: %q", spent.FinalResponse)
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.state != localizationStateInactive {
-		t.Fatalf("advisory wire completion left session restricted: %q", state.state)
+	if state.state != localizationStateAnswerReady {
+		t.Fatalf("terminal recovery left session navigable: %q", state.state)
 	}
 }

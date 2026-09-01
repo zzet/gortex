@@ -53,8 +53,16 @@ jobs:
       - name: Build all packages
         run: go build ./...
 
+      # ./internal/agents is one package and does not recurse, so the
+      # opencode adapter is named explicitly. Its plugin asset is embedded
+      # verbatim with go:embed and TestPluginFailsOpen parses it by
+      # splitting on "\n}\n", which is the closest thing the suite has to a
+      # detector for a CRLF checkout of an embedded file — and it can only
+      # fire on a runner that converts line endings.
       - name: Test Windows agent integrations
-        run: go test -timeout=5m -count=1 ./internal/agents
+        run: >
+          go test -timeout=5m -count=1
+          ./internal/agents ./internal/agents/opencode
 
       # Symlink confinement keeps out-of-repo files out of the index, and it
       # reads differently on Windows: a symlink reparse point maps to
@@ -71,6 +79,18 @@ jobs:
       # one test runs here rather than only there.
       - name: Test sidecar handle release
         run: go test -timeout=5m -count=1 -run TestCloseSidecar ./internal/persistence
+
+      # Same asymmetry, different holder: the plan-lock fixture opens an
+      # on-disk Store, so a missing Close pins plan_lock.sqlite and fails
+      # its t.TempDir() cleanup here while passing everywhere else. Every
+      # assertion in these tests is platform-neutral — only the cleanup
+      # distinguishes the runners — so nothing but this step can protect
+      # the fixture's Close from being dropped again.
+      - name: Test plan-lock fixture handle release
+        run: >
+          go test -timeout=10m -count=1
+          -run 'PlanLock|PlansLocked|PlansNeverScan'
+          ./internal/graph/store_sqlite
 
       # os.UserHomeDir reads %USERPROFILE% here and $HOME everywhere else, so
       # a test that isolates itself with HOME alone keeps resolving the real
@@ -90,12 +110,35 @@ jobs:
       - name: Test store path separator handling
         run: go test -timeout=5m -count=1 ./internal/graphpath
 
+      # The same asymmetry reaches the other direction too: a test that spells
+      # an expected path with '/' passes on POSIX whatever the code does, and
+      # only this runner can tell whether the value under test is a native
+      # filesystem path (filepath.Join / filepath.Clean) or a '/'-keyed store
+      # path. ParseDiffGitPaths, ParseDiffLinesNewSide and FeedbackDir all
+      # assert on native paths, so they belong here rather than nowhere.
+      # The path-domain contracts belong here for the same reason. A graph
+      # key is "<prefix>/" plus a native-separator remainder, so GraphKey,
+      # JoinFileNodes, the prefix-shadow end-to-end pair and RankFileRisk's
+      # per-domain normalization only diverge once '/' and the native
+      # separator differ — every one of them passes on the linux/macos
+      # matrix whatever the code does. internal/review joins the list
+      # because the file-risk normalizer lives there. FidelityGlob is the
+      # same asymmetry once more: filepath.Match's separator is the
+      # platform's, so on Windows '*' crosses a '/' that POSIX already
+      # protects, and `internal/*.go` matching `internal/sub/x.go` is a
+      # Windows-only verdict. Linux and macOS return the same answer from
+      # filepath.Match and path.Match, so this runner is the only one that
+      # can tell the two apart. FindFiles_Glob is the handler-level half of
+      # the same contract: `internal/**/*_test.go` is the schema's own
+      # example, and the two matchers disagree about how deep it reaches
+      # only where '/' is not the separator.
       - name: Test native-separator store path comparisons
         run: >
           go test -timeout=10m -count=1
-          -run 'NativeSeparator|MixedSeparator|ImportAdjacency'
+          -run 'NativeSeparator|MixedSeparator|ImportAdjacency|ParseDiffGitPaths|ParseDiffLinesNewSide|FeedbackDir|ReviewRulepack|PrefixedGraphReportsRulepack|GraphKey|JoinFileNodes|ChangedSymbolsForFiles|PrefixShadow|IdsOnPrefixedGraph|RankFileRisk|PrefixedDeleteAndRename|FidelityGlob|FindFiles_Glob'
           ./internal/analysis ./internal/graph/store_sqlite
-          ./internal/mcp ./internal/resolver
+          ./internal/mcp ./internal/resolver ./internal/persistence
+          ./internal/review
 
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any
@@ -161,6 +204,21 @@ jobs:
         with:
           version: v2.11.4
           args: --timeout=10m
+
+      # goreleaser used to run `go mod tidy` as a release before-hook, which
+      # meant an untidy go.mod was silently rewritten inside the release
+      # container — the shipped binaries could be built against a module set
+      # no CI job had ever compiled. That hook is gone; tidiness is asserted
+      # here instead, on the PR that introduces the drift, and it FAILS rather
+      # than rewrites.
+      - name: go.mod is tidy
+        run: |
+          set -euo pipefail
+          go mod tidy
+          if ! git diff --exit-code --stat go.mod go.sum; then
+            echo "FATAL: go.mod/go.sum are not tidy — run \`go mod tidy\` and commit the result" >&2
+            exit 1
+          fi
 
   build-onnx:
     runs-on: ubuntu-latest

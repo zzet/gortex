@@ -11,13 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -637,8 +637,20 @@ func (s *Server) recordFileBaselineSavings(ctx context.Context, tool, relPath, l
 		return
 	}
 	returned := tokens.CachedCountInt64(payload)
-	fullFile := int64(tokens.EstimateFromSample(int(info.Size()), payload))
-	s.tokenStatsFor(ctx).record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
+	// Calibrate the file's token count on the FILE, not on the response.
+	// EstimateFromSample scales a byte count by the chars-per-token ratio of
+	// its sample, and the sample is only meaningful when it is "a smaller
+	// chunk of the same content" (see its doc comment). The payload here is a
+	// marshalled node list or an editing-context bundle, whose ratio is
+	// nothing like the source it is standing in for, so calibrating on it
+	// mis-priced every summary and editing-context baseline.
+	fullFile := int64(tokens.EstimateFromSample(int(info.Size()), fileHeadSample(abs)))
+	stats := s.tokenStatsFor(ctx)
+	// This charges the whole file as the counterfactual, so claim it for the
+	// session: a later retrieval page that merely cites the file must not
+	// bill it a second time (savings_retrieval.go).
+	stats.creditFile(abs)
+	stats.record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
 }
 
 // repoRelative converts an absolute path to a repo-prefixed or root-relative
@@ -758,6 +770,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if evidenceRequested && dryRun {
 		return mcp.NewToolResultError(errEvidenceDryRun), nil
 	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -768,6 +781,17 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
 	defer releaseMutation()
+
+	// Replay before reading the file: a landed edit has already consumed
+	// old_string, so an un-replayed retry would fail the match check with a
+	// confusing "not found" instead of returning the original result.
+	fingerprint := mutationFingerprint("edit_file", absPath, oldString, newString, strconv.FormatBool(replaceAll))
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
@@ -870,14 +894,19 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
 	}
-	if err := agents.AtomicWriteFile(absPath, newContentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
 		"path":          relPath,
@@ -899,6 +928,10 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
 	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -920,6 +953,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if evidenceRequested && dryRun {
 		return mcp.NewToolResultError(errEvidenceDryRun), nil
 	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
@@ -930,6 +964,17 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError("write cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
 	defer releaseMutation()
+
+	// Idempotency runs under the path lock so a retry that races the original
+	// call waits for it and then sees a terminal record, rather than both
+	// deciding independently that they are the first.
+	fingerprint := mutationFingerprint("write_file", absPath, content)
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
 
 	status := "created"
 	perm := os.FileMode(0o644)
@@ -1012,14 +1057,19 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	if err := agents.AtomicWriteFile(absPath, contentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("write", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
 		"path":          relPath,
@@ -1037,6 +1087,10 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(resp, absPath, priorContent, fileExists)
 	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -1284,6 +1338,17 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
+	// Admission before any work: a fidelity_globs value that breaks a size
+	// bound refuses the request. Dropping the offending rule would rewrite
+	// a first-match policy silently — an over-budget `omit` disappearing
+	// lets a later `full` win, and the content the caller asked to hide
+	// comes back in a response that looks like a normal success. Parsed
+	// here rather than at the point of use so a malformed request cannot
+	// be served by a path that happens not to reach the compressor.
+	fidelityRules, fidelityErr := parseFidelityGlobs(req.GetString("fidelity_globs", ""))
+	if fidelityErr != nil {
+		return mcp.NewToolResultError("read_file: " + fidelityErr.Error()), nil
+	}
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
@@ -1374,7 +1439,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			symbols = sg.Nodes
 		}
 		keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), symbols)
-		decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), relPath)
+		decide := fidelityDecideForPath(fidelityRules, relPath)
 		if out, eerr := elide.CompressWith(content, language, elide.Options{Keep: keepPred, Decide: decide}); eerr == nil && len(out) != len(content) {
 			content = out
 			bodiesElided = true
@@ -1547,7 +1612,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		if bodiesElided || salienceTruncated || windowed || contentTruncated {
 			fullFile = int64(tokens.EstimateFromSample(originalBytes, contentStr))
 		}
-		s.tokenStatsFor(ctx).record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
+		stats := s.tokenStatsFor(ctx)
+		stats.creditFile(absPath)
+		stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
 	}
 
 	s.attachFileDependents(result, relPath)

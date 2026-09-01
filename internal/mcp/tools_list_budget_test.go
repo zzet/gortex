@@ -39,8 +39,15 @@ func serializeToolsList(t *testing.T, preset, mode string) (int, []string) {
 // Pre-diet baselines measured on this test harness (the same NewServer path
 // the gate uses), so "strictly smaller than today" is a real regression
 // assertion rather than a moving target.
+//
+// core re-based 95060 → 96500: the #597 `additionalProperties:false`
+// stamp (~27 bytes across every closed core tool) plus read_file's
+// max_chars declaration landed on top of main's receipt/idempotency
+// growth, which had already eaten most of the diet slack. Measured after
+// the stamp: 96168 bytes. The assertion still bites on description
+// creep; the stamp is contract, not creep.
 const (
-	corePresetBaselineBytes = 95060
+	corePresetBaselineBytes = 96500
 	fullPresetBaselineBytes = 289808
 )
 
@@ -62,7 +69,17 @@ const (
 // slack. Note the blurbs are shared constants and the schema compactor
 // is not monotonic in description length — a shorter blurb measured
 // *larger* here (28551), so shrink by measuring, never by eyeballing.
-const agentPresetByteCeiling = 28850
+//
+// The `mutation_id` idempotency key on the same two floor tools then took
+// another 148 bytes (28527 → 28675), sharing one blurb constant for the same
+// reason. The ceiling still holds; the remaining slack is ~175 bytes.
+//
+// Re-based 28850 → 29700 when every structured schema began publishing
+// `additionalProperties:false` (#597) — ~27 bytes per tool so the
+// contract states what dispatch now surfaces — and read_file declared its
+// handler-honored max_chars option. Measured after both, on top of the
+// receipt/idempotency growth: 29313 bytes; ~390 bytes of slack.
+const agentPresetByteCeiling = 29700
 
 // localizationPresetByteCeiling is the hard budget for the diet
 // localization preset (the `localization` instruction profile's tool
@@ -75,7 +92,12 @@ const agentPresetByteCeiling = 28850
 // session without a multi-symbol read). Measured after the growth:
 // 20432 bytes — still ~27% under the agent floor, with slack so any
 // further description creep fails loudly.
-const localizationPresetByteCeiling = 21000
+//
+// Re-based 21000 → 21350 alongside the #597 `additionalProperties:false`
+// stamp (~27 bytes per tool) and read_file's max_chars declaration:
+// measured 21020 bytes, restoring ~300 bytes of slack the stamp had
+// eaten.
+const localizationPresetByteCeiling = 21350
 
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset

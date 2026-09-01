@@ -403,7 +403,7 @@ func routeMethodAndPath(n *graph.Node) (string, string) {
 // persist?" queries.
 //
 // Filters:
-//   - orm:    orm flavour (gorm / sqlalchemy / django / activerecord / jpa / typeorm)
+//   - orm:    orm flavour (gorm / sqlalchemy / django / activerecord / jpa / typeorm / ecto / efcore)
 //   - table:  substring match on the table name
 //   - model:  substring match on the model class name
 func (s *Server) handleAnalyzeModels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

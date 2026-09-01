@@ -15,7 +15,6 @@ package licenses
 import (
 	"bufio"
 	"bytes"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -88,12 +87,13 @@ func Scan(source []byte) string {
 // out of scope for v1.
 //
 // filePath is the unprefixed path; applyRepoPrefix handles multi-
-// repo namespacing downstream.
+// repo namespacing downstream. Its spelling is preserved verbatim —
+// the edge endpoint must match the extractor's file-node ID spelling
+// (OS-native separators on Windows) or the edge dangles.
 func BuildGraphArtifacts(filePath, spdx, language string) ([]*graph.Node, []*graph.Edge) {
 	if spdx == "" {
 		return nil, nil
 	}
-	filePath = filepath.ToSlash(filePath)
 	licenseID := LicenseNodeID(spdx)
 	licenseNode := &graph.Node{
 		ID:       licenseID,

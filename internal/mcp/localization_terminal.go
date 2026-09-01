@@ -23,6 +23,11 @@ const (
 	localizationTerminalContractV2     = 2
 )
 
+// localizationRecoveryAllowanceCap bounds how many accepted recovery calls one
+// contract may spend. The first uncorroborated recovery buys one more attempt;
+// the second must terminate, so a session can never loop on recovery.
+const localizationRecoveryAllowanceCap = 2
+
 var localizationRecoveryOperations = []string{"search.text", "search.symbols", "read.source"}
 
 // localizationDirectedReadRelease names the exit on every refusal that would
@@ -66,6 +71,10 @@ type localizationCompletion struct {
 	// authorized read without claiming that the current response is terminal.
 	// It defaults false until the evidence policy explicitly opts in.
 	enforceableOnAnswerReady bool
+	// provisionalAnswer marks a terminal completion whose retained candidates
+	// were never corroborated. It is session-only: the wire carries the
+	// difference as the unconfirmed page and a false enforceable flag.
+	provisionalAnswer bool
 	// taskLead is the bounded, normalized first issue line used only to check
 	// whether an advisory read covers the task's primary claim. The full prompt
 	// is never retained here.
@@ -241,7 +250,7 @@ func newLocalizationRefinementCompletionForSymbols(preferredSymbol string, allow
 	return localizationCompletion{
 		State:             localizationStateNeedsRefinement,
 		Scope:             "localization",
-		RequiredAction:    fmt.Sprintf(localizationRefinementRequiredActionFormat, preferredSymbol),
+		RequiredAction:    localizationRefinementRequiredAction(preferredSymbol, allowedSymbols),
 		AllowedToolCalls:  1,
 		ContractVersion:   localizationTerminalContractV2,
 		AllowedSymbols:    allowedSymbols,
@@ -298,6 +307,18 @@ type localizationTerminalState struct {
 	correctionRetriesRemaining uint8
 	refinementRetriesRemaining uint8
 	recoveryRetriesRemaining   uint8
+	// recoveryAllowancesRemaining counts accepted recovery calls, not handler
+	// failures: an uncorroborated result spends one allowance, a failed handler
+	// spends none.
+	recoveryAllowancesRemaining uint8
+	// answerProvisional keeps an uncorroborated terminal state honest across
+	// every later replay.
+	answerProvisional bool
+	// recoveryBaseline is the evidence a recovery has to agree with. It is the
+	// page the localization ranked, frozen when the recovery contract is armed:
+	// rows an uncorroborated recovery contributed are retained for the caller
+	// but must never become the thing the next recovery corroborates against.
+	recoveryBaseline *localizationEvidenceDigest
 	// Read reservations are tokenized independently of localization calls. A
 	// reset or newly armed task invalidates an old token, so a late read cannot
 	// finish (or decorate itself with) a newer task's contract.
@@ -356,6 +377,9 @@ func (s *localizationTerminalState) reset() {
 	s.correctionRetriesRemaining = 0
 	s.refinementRetriesRemaining = 0
 	s.recoveryRetriesRemaining = 0
+	s.recoveryAllowancesRemaining = 0
+	s.answerProvisional = false
+	s.recoveryBaseline = nil
 	s.readReservationToken = 0
 	s.readReservationGen = 0
 	s.enforceableOnAnswerReady = false
@@ -490,6 +514,9 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	s.correctionRetriesRemaining = 0
 	s.refinementRetriesRemaining = 0
 	s.recoveryRetriesRemaining = 0
+	s.recoveryAllowancesRemaining = 0
+	s.answerProvisional = completion.provisionalAnswer
+	s.recoveryBaseline = nil
 	s.readReservationToken = 0
 	s.readReservationGen = 0
 	s.enforceableOnAnswerReady = completion.enforceableOnAnswerReady
@@ -509,6 +536,8 @@ func (s *localizationTerminalState) commitLocalizationLocked(completion localiza
 	}
 	if completion.State == localizationStateNeedsRecovery {
 		s.recoveryRetriesRemaining = 1
+		s.recoveryAllowancesRemaining = localizationRecoveryAllowanceCap
+		s.recoveryBaseline = completion.digest
 	}
 	if completion.State == localizationStateNeedsExactRead {
 		// A handler failure may be transient, but the exact-read contract must
@@ -549,6 +578,7 @@ func (s *localizationTerminalState) completionLocked() localizationCompletion {
 		completion = newLocalizationOpenCompletion()
 	default:
 		completion = newLocalizationCompletion(true, "")
+		completion.provisionalAnswer = s.answerProvisional
 	}
 	completion.enforceableOnAnswerReady = s.enforceableOnAnswerReady
 	completion.taskLead = s.taskLead
@@ -877,6 +907,84 @@ func localizationRecoveryEvidenceAlignedWithLead(task, lead, requested, operatio
 			continue
 		}
 		if localizationReservedReadEvidenceAlignedWithLead(task, lead, "", []localizationDigestRow{row}) {
+			return true
+		}
+	}
+	return false
+}
+
+// localizationRecoveryCorroborated is the terminality gate for an accepted
+// recovery call. Corroboration requires the recovery to have taught the page
+// something: at least one row the frozen baseline did not already hold by
+// symbol ID, and that novel row must land in a baseline file or carry the
+// request's anchor terms. A result that is a subset of the retained rows adds
+// no information whatever its overlap looks like — treating a same-page
+// sibling as proof stops a session on a candidate the page had already ranked
+// and rejected.
+func localizationRecoveryCorroborated(
+	task, lead, requested, operation string,
+	rows []localizationDigestRow,
+	baseline *localizationEvidenceDigest,
+) bool {
+	novel := localizationNovelRecoveryRows(rows, baseline)
+	if len(novel) == 0 {
+		return false
+	}
+	if localizationRowsShareBaselineFile(novel, baseline) {
+		return true
+	}
+	return localizationRecoveryEvidenceAlignedWithLead(task, lead, requested, operation, novel)
+}
+
+// localizationNovelRecoveryRows keeps the rows the frozen baseline did not
+// already carry. Identity is the symbol ID: a row the page already ranked is
+// not evidence the recovery produced.
+func localizationNovelRecoveryRows(
+	rows []localizationDigestRow, baseline *localizationEvidenceDigest,
+) []localizationDigestRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	if baseline == nil || len(baseline.Evidence) == 0 {
+		return rows
+	}
+	retained := make(map[string]struct{}, len(baseline.Evidence))
+	for _, row := range baseline.Evidence {
+		if id := strings.TrimSpace(row.ID); id != "" {
+			retained[id] = struct{}{}
+		}
+	}
+	novel := make([]localizationDigestRow, 0, len(rows))
+	for _, row := range rows {
+		if _, alreadyRanked := retained[strings.TrimSpace(row.ID)]; alreadyRanked {
+			continue
+		}
+		novel = append(novel, row)
+	}
+	return novel
+}
+
+// localizationRowsShareBaselineFile reports whether a novel row landed in a
+// file the ranked page already carried. The page located the file; the recovery
+// located a declaration in it that the page did not have.
+func localizationRowsShareBaselineFile(
+	rows []localizationDigestRow, baseline *localizationEvidenceDigest,
+) bool {
+	if len(rows) == 0 || baseline == nil || len(baseline.Evidence) == 0 {
+		return false
+	}
+	files := make(map[string]struct{}, len(baseline.Evidence))
+	for _, row := range baseline.Evidence {
+		if file := strings.TrimSpace(row.File); file != "" {
+			files[strings.ToLower(file)] = struct{}{}
+		}
+	}
+	for _, row := range rows {
+		file := strings.TrimSpace(row.File)
+		if file == "" {
+			continue
+		}
+		if _, exists := files[strings.ToLower(file)]; exists {
 			return true
 		}
 	}
@@ -1647,25 +1755,47 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 	case localizationStateRecoveryInFlight:
 		requested := s.inFlightRecoveryAnchor
 		operation := s.inFlightRecoveryOperation
+		baseline := s.recoveryBaseline
 		s.inFlightRecoveryAnchor = ""
 		s.inFlightRecoveryOperation = ""
-		legacyRecovery := !captureRequired || (wireSuccess && !evidenceRecorded) ||
-			(operation == "" && strings.TrimSpace(s.taskFingerprint) == "")
+		// A synthetic finisher carries no capture record and no task, so it
+		// cannot be judged on evidence. Every production recovery is.
+		legacyRecovery := !captureRequired || (operation == "" && strings.TrimSpace(s.taskFingerprint) == "")
 		confidentRecovery := legacyRecovery || (capturedResult && mergedDigest != nil && len(mergedDigest.Evidence) > 0 &&
-			localizationRecoveryEvidenceAlignedWithLead(s.taskFingerprint, s.taskLead, requested, operation, currentEvidence))
+			localizationRecoveryCorroborated(s.taskFingerprint, s.taskLead, requested, operation, currentEvidence, baseline))
 		if success && confidentRecovery {
 			s.recoveryOperation = ""
 			s.recoveryAnchor = ""
 			s.state = localizationStateAnswerReady
 			s.recoveryRetriesRemaining = 0
+			s.recoveryAllowancesRemaining = 0
+			s.recoveryBaseline = nil
 			return s.completionLocked()
 		}
 		if wireSuccess {
-			// The one accepted recovery call completed but did not prove a
-			// declaration aligned with the task. Preserve everything it surfaced,
-			// then release the contract as advisory instead of opening a loop or
-			// manufacturing terminal confidence.
-			return s.releaseLocalizationAdvisoryLocked(mergedDigest)
+			// The accepted recovery call completed without corroborating anything.
+			// Keep what it surfaced and spend one allowance: a second attempt is
+			// cheap next to an uncorroborated answer, and the cap keeps it bounded.
+			if capturedResult {
+				s.digest = mergedDigest
+			}
+			s.recoveryOperation = ""
+			s.recoveryAnchor = ""
+			if s.recoveryAllowancesRemaining > 1 {
+				s.recoveryAllowancesRemaining--
+				s.recoveryRetriesRemaining = 1
+				s.state = localizationStateNeedsRecovery
+				return s.completionLocked()
+			}
+			// The allowance is spent. Terminate rather than loop, under the
+			// unconfirmed heading the evidence actually earned.
+			s.recoveryAllowancesRemaining = 0
+			s.recoveryRetriesRemaining = 0
+			s.recoveryBaseline = nil
+			s.enforceableOnAnswerReady = false
+			s.answerProvisional = true
+			s.state = localizationStateAnswerReady
+			return s.completionLocked()
 		}
 		if s.recoveryRetriesRemaining > 0 {
 			s.recoveryRetriesRemaining--
@@ -1701,6 +1831,8 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 			if !wasCorrection && !s.enforceableOnAnswerReady && !confidentRead {
 				s.state = localizationStateNeedsRecovery
 				s.recoveryRetriesRemaining = 1
+				s.recoveryAllowancesRemaining = localizationRecoveryAllowanceCap
+				s.recoveryBaseline = s.digest
 				return s.completionLocked()
 			}
 			s.state = localizationStateAnswerReady
@@ -1756,6 +1888,8 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 				}
 				s.state = localizationStateNeedsRecovery
 				s.recoveryRetriesRemaining = 1
+				s.recoveryAllowancesRemaining = localizationRecoveryAllowanceCap
+				s.recoveryBaseline = s.digest
 				return s.completionLocked()
 			}
 			s.state = localizationStateAnswerReady

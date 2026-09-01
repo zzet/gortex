@@ -83,6 +83,31 @@ func TestBuildGraphArtifacts(t *testing.T) {
 	})
 }
 
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The standalone fixture node deliberately reuses the file path
+	// as its node ID so it merges with the file identity; that only
+	// works when the spelling matches the extractor's relPath exactly
+	// (OS-native separators for subdirectory files on Windows).
+	// The spelling is written out rather than composed with
+	// filepath.Join so a backslash is present on every runner. The
+	// qualifying `testdata/` segment keeps its forward slash because
+	// IsFixturePath normalizes through filepath.ToSlash, which is the
+	// identity on POSIX. Name is asserted by TestBuildGraphArtifacts:
+	// it comes from filepath.Base, whose separator set is the running
+	// platform's.
+	const rel = `testdata/sub\foo.bin`
+	nodes := BuildGraphArtifacts(rel, "binary")
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %d", len(nodes))
+	}
+	if nodes[0].ID != rel {
+		t.Errorf("node id = %q, want %q", nodes[0].ID, rel)
+	}
+	if nodes[0].FilePath != rel {
+		t.Errorf("node file path = %q, want %q", nodes[0].FilePath, rel)
+	}
+}
+
 func TestReclassifyFileToFixture(t *testing.T) {
 	t.Run("upgrades file to fixture", func(t *testing.T) {
 		n := &graph.Node{

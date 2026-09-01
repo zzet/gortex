@@ -147,10 +147,13 @@ func TestLSP_Enrich_IncomingSkippedForPlainStaticFunction(t *testing.T) {
 	defer cleanup()
 
 	g := graph.New()
-	// A type keeps the file in the demand-gated sweep (dispatch-relevant),
+	// A hierarchy-involved type keeps the file in the demand-gated sweep
+	// (its unresolvable base still counts — see typeIsDispatchRelevant),
 	// isolating the incoming decision from the file-level sweep gate.
 	g.AddNode(&graph.Node{ID: "svc.go::Marker", Kind: graph.KindType, Name: "Marker",
 		FilePath: "svc.go", StartLine: 3, EndLine: 3, Language: "go"})
+	g.AddEdge(&graph.Edge{From: "svc.go::Marker", To: graph.UnresolvedMarker + "VendorBase",
+		Kind: graph.EdgeExtends, FilePath: "svc.go", Line: 3})
 	g.AddNode(&graph.Node{ID: "svc.go::Plain", Kind: graph.KindFunction, Name: "Plain",
 		FilePath: "svc.go", StartLine: 5, EndLine: 5, Language: "go"})
 

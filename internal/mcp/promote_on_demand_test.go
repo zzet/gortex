@@ -35,9 +35,12 @@ func TestEnsureToolPromoted_MakesDeferredToolCallable(t *testing.T) {
 	// promotion is tracked separately and reflected by the live registry.)
 	require.Contains(t, srv.mcpServer.ListTools(), tool, "promoted tool must appear in the live tools/list")
 
-	// Idempotent: a second promote is a no-op — Promote returns only the names
-	// that newly transitioned, so an already-promoted tool yields false.
-	require.False(t, srv.EnsureToolPromoted(tool), "promoting an already-promoted tool must be a no-op")
+	// Idempotent: a second promote is a no-op on the registry, but the
+	// return value reports liveness — the tool is still live, so it
+	// returns true. Callers use this as "re-check GetTool", never as
+	// "I transitioned it" (the pre-race contract that caused false 404s
+	// when a concurrent caller did the transition).
+	require.True(t, srv.EnsureToolPromoted(tool), "an already-promoted tool is still live")
 }
 
 // TestEnsureToolPromoted_NoopCases covers the guards: a live tool, an unknown

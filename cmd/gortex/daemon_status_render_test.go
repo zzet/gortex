@@ -258,3 +258,100 @@ func TestRenderDaemonHeader_ReadyAndEnriched_NoWarmupLabelChange(t *testing.T) {
 	assert.Contains(t, out, "ready (warmup 5m0s)")
 	assert.NotContains(t, out, "enrichment in progress")
 }
+
+// stubBuildVersion rewrites the ldflags-injected build identity for the
+// duration of a subtest — the same `-X main.version` / `-X main.commit`
+// seam goreleaser populates — so canonicalVersion() reports a chosen
+// build and renderDaemonHeader's skew compare can be driven end-to-end.
+func stubBuildVersion(t *testing.T, v, c string) {
+	t.Helper()
+	oldV, oldC := version, commit
+	version, commit = v, c
+	t.Cleanup(func() { version, commit = oldV, oldC })
+}
+
+// TestRenderDaemonHeader_SkewRow — the local-version row appears only
+// when daemonSkewWarning(st.Version, canonicalVersion()) is non-empty,
+// the same compare runProxy applies at connect time. Matching versions
+// and dev builds (no injected identity, the v0.0.0-dev sentinel) must
+// keep the table exactly as terse as it was.
+func TestRenderDaemonHeader_SkewRow(t *testing.T) {
+	t.Run("skewed versions append the cli row", func(t *testing.T) {
+		stubBuildVersion(t, "0.63.3", "deadbee")
+		st := daemon.StatusResponse{Version: "v0.63.4+abc1234"}
+		// Precondition: the row is gated on this exact compare, so prove
+		// the gate is live before asserting the render honors it.
+		if daemonSkewWarning(st.Version, canonicalVersion()) == "" {
+			t.Fatalf("expected daemonSkewWarning(%q, %q) to be non-empty",
+				st.Version, canonicalVersion())
+		}
+		var buf bytes.Buffer
+		renderDaemonHeader(&buf, st)
+		out := buf.String()
+		assert.Contains(t, out, "cli")
+		assert.Contains(t, out, "v0.63.3+deadbee (differs from daemon)")
+	})
+
+	t.Run("matching versions omit the row", func(t *testing.T) {
+		stubBuildVersion(t, "0.63.4", "abc1234")
+		st := daemon.StatusResponse{Version: "v0.63.4+abc1234"}
+		if daemonSkewWarning(st.Version, canonicalVersion()) != "" {
+			t.Fatalf("expected daemonSkewWarning(%q, %q) to be empty",
+				st.Version, canonicalVersion())
+		}
+		var buf bytes.Buffer
+		renderDaemonHeader(&buf, st)
+		assert.NotContains(t, buf.String(), "cli")
+	})
+
+	t.Run("dev build omits the row", func(t *testing.T) {
+		// Plain `go build` identity: canonicalVersion() reports the
+		// v0.0.0-dev sentinel, which daemonSkewWarning deliberately
+		// ignores so dev binaries never nag about skew.
+		stubBuildVersion(t, "0.0.0", "")
+		assert.Equal(t, "v0.0.0-dev", canonicalVersion())
+		st := daemon.StatusResponse{Version: "v0.63.4+abc1234"}
+		var buf bytes.Buffer
+		renderDaemonHeader(&buf, st)
+		assert.NotContains(t, buf.String(), "cli")
+	})
+}
+
+// TestRenderDaemonHeader_BinaryRow — the daemon's self-reported
+// on-disk-binary drift row appears only when the drift probe ran
+// (BinaryChecked) and found the running image stale. An unchecked binary
+// must never render as stale — unknown is not stale.
+func TestRenderDaemonHeader_BinaryRow(t *testing.T) {
+	t.Run("stale binary appends the binary row", func(t *testing.T) {
+		st := daemon.StatusResponse{
+			Version:       "v0.63.4+abc1234",
+			BinaryChecked: true,
+			BinaryStale:   true,
+		}
+		var buf bytes.Buffer
+		renderDaemonHeader(&buf, st)
+		out := buf.String()
+		assert.Contains(t, out, "binary")
+		assert.Contains(t, out, "stale — on-disk image newer than running image")
+	})
+
+	t.Run("fresh binary omits the row", func(t *testing.T) {
+		st := daemon.StatusResponse{
+			Version:       "v0.63.4+abc1234",
+			BinaryChecked: true,
+		}
+		var buf bytes.Buffer
+		renderDaemonHeader(&buf, st)
+		assert.NotContains(t, buf.String(), "binary")
+	})
+
+	t.Run("unchecked binary omits the row even if BinaryStale is set", func(t *testing.T) {
+		st := daemon.StatusResponse{
+			Version:     "v0.63.4+abc1234",
+			BinaryStale: true,
+		}
+		var buf bytes.Buffer
+		renderDaemonHeader(&buf, st)
+		assert.NotContains(t, buf.String(), "binary")
+	})
+}

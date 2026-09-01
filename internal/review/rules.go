@@ -4,10 +4,10 @@ import (
 	"os"
 	"path/filepath"
 
-	gitignore "github.com/sabhiram/go-gitignore"
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -27,9 +27,14 @@ type RuleResolver struct {
 // compiledRule pairs a config rule with its precompiled gitignore
 // matcher so RuleFor never recompiles. The matcher is read-only after
 // construction, so RuleFor is safe to call concurrently.
+//
+// Compilation goes through excludes.New, which neutralises the regexp
+// metacharacters go-gitignore would otherwise splice into its pattern
+// verbatim — a rule path holding "$", "^" or "|" would otherwise govern
+// files it never named (#624).
 type compiledRule struct {
 	rule    config.ReviewRule
-	matcher *gitignore.GitIgnore
+	matcher *excludes.Matcher
 }
 
 // NewRuleResolver merges the four rule layers in precedence order,
@@ -93,7 +98,7 @@ func NewRuleResolver(customPath, repoRoot string) (*RuleResolver, error) {
 		}
 		compiled = append(compiled, compiledRule{
 			rule:    r,
-			matcher: gitignore.CompileIgnoreLines(r.Path),
+			matcher: excludes.New([]string{r.Path}),
 		})
 	}
 
@@ -108,7 +113,7 @@ func NewRuleResolver(customPath, repoRoot string) (*RuleResolver, error) {
 // callers should still check it.
 func (r *RuleResolver) RuleFor(filePath string) (config.ReviewRule, bool) {
 	for _, cr := range r.rules {
-		if cr.matcher.MatchesPath(filePath) {
+		if cr.matcher.MatchRel(filePath) {
 			return cr.rule, true
 		}
 	}

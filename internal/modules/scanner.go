@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -888,7 +887,10 @@ func ModuleNodeID(ecosystem, path, version string) string {
 // per (ecosystem, path, version) tuple is guaranteed even when the
 // caller appends from multiple manifest files.
 //
-// filePath is the unprefixed manifest path (typically "go.mod").
+// filePath is the unprefixed manifest path (typically "go.mod"),
+// preserved verbatim — the edge endpoint must match the synthetic
+// manifest file node the indexer mints from the same spelling
+// (OS-native separators on Windows) or the edge dangles.
 // applyRepoPrefix downstream handles multi-repo namespacing for
 // the file→module edge, but module IDs themselves do not get
 // prefixed — the synthetic `module::` prefix matches the existing
@@ -898,7 +900,6 @@ func BuildGraphArtifacts(filePath string, specs []Spec) ([]*graph.Node, []*graph
 	if len(specs) == 0 {
 		return nil, nil
 	}
-	filePath = filepath.ToSlash(filePath)
 	seen := make(map[string]struct{}, len(specs))
 	nodes := make([]*graph.Node, 0, len(specs))
 	edges := make([]*graph.Edge, 0, len(specs))

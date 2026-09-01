@@ -119,6 +119,8 @@ func repoItemState(r daemon.TrackedRepoStatus) string {
 		return "MISSING — path deleted"
 	case r.Unloaded:
 		return "not indexed"
+	case repoIndexIsEmpty(r):
+		return "EMPTY — 0 files indexed"
 	default:
 		return ""
 	}

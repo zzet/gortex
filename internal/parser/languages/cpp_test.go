@@ -136,6 +136,7 @@ func TestCppExtractor_Extensions(t *testing.T) {
 	assert.Contains(t, exts, ".cc")
 	assert.Contains(t, exts, ".cxx")
 	assert.Contains(t, exts, ".hpp")
+	assert.Contains(t, exts, ".hxx")
 	assert.NotContains(t, exts, ".h")
 }
 

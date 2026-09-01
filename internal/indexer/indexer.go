@@ -1809,11 +1809,21 @@ func applyMigrationExtraction(relPath string, src []byte, result *parser.Extract
 // defaults off because string-literal pattern matching against
 // db.Get / db.Query / db.Exec produces false positives when
 // domain code shares method names (cache.Get, etc.).
+//
+// Two table-node origins survive the gate, because neither is the
+// noisy code-side matching the gate exists for: migration-origin DDL
+// (unambiguous CREATE TABLE — see applyMigrationExtraction), and
+// ORM-origin model attribution (declaration-anchored: @Entity/@Table
+// annotations, [Table] attributes, ActiveRecord bases, DbSet
+// properties). Stripping the ORM nodes would leave the models_table
+// layer silently empty for every ORM ecosystem under the default
+// config.
 func stripSQLArtifacts(result *parser.ExtractionResult) {
 	stripped := make(map[string]struct{})
 	keptNodes := result.Nodes[:0]
 	for _, n := range result.Nodes {
-		if (n.Kind == graph.KindTable || n.Kind == graph.KindMigration) && !isMigrationOriginNode(n) {
+		if (n.Kind == graph.KindTable || n.Kind == graph.KindMigration) &&
+			!isMigrationOriginNode(n) && !isORMOriginTableNode(n) {
 			stripped[n.ID] = struct{}{}
 			continue
 		}
@@ -1892,6 +1902,18 @@ func isMigrationOriginNode(n *graph.Node) bool {
 	}
 	o, _ := n.Meta["origin"].(string)
 	return o == "migration"
+}
+
+// isORMOriginTableNode reports whether a KindTable node was minted by
+// an ORM model-attribution extractor (go/java/python/ruby/ts/elixir/
+// csharp *_orm paths). They all stamp Meta["dialect"] = "orm" on the
+// shared db::orm:: table nodes.
+func isORMOriginTableNode(n *graph.Node) bool {
+	if n == nil || n.Kind != graph.KindTable || n.Meta == nil {
+		return false
+	}
+	d, _ := n.Meta["dialect"].(string)
+	return d == "orm"
 }
 
 // isInfraOriginConfigKey reports whether a KindConfigKey node was
@@ -2443,6 +2465,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			zap.Int("count", len(skippedByContent)),
 			zap.Int64("total_bytes", skippedContentBytes))
 	}
+	idx.warnIfWalkAdmittedNothing(absRoot, len(files))
 	reporter.Report("walking files", len(files), len(files))
 	// Capture raw content identities while the parser already owns each source
 	// buffer. A nil collector keeps the disabled path allocation-free.
@@ -3849,6 +3872,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Int("edges", emitted),
 				)
 			}
+			// The graph-wide projection above already covers every test
+			// caller ResolveAll noted on the retarget frontier; discard it
+			// so the first warm save does not re-project the whole test
+			// corpus under ResolveMutex for nothing.
+			idx.resolver.TakeRetargetedTestCallFiles()
 			if ctrl := entrypoints.PropagateEntryPointsDownHierarchy(idx.graph); ctrl > 0 {
 				idx.logger.Info("entry-point hierarchy stamped", zap.Int("stamped", ctrl))
 			}
@@ -5334,6 +5362,115 @@ func (idx *Indexer) shouldExclude(path, root string, isDir bool) bool {
 		return true
 	}
 	return idx.dirIgnoreMatcher(root).Match(path, isDir)
+}
+
+// emptyWalkProbeCap bounds the diagnostic re-walk below. It only ever
+// runs on a repo that indexed nothing, and it stops at the first file it
+// can explain, so the cap is a backstop against a pathological tree, not
+// a budget anyone should hit.
+const emptyWalkProbeCap = 200000
+
+// emptyWalkCause names one file the walk could have indexed and the
+// reason it did not.
+type emptyWalkCause struct {
+	// RelPath is the repo-relative path of the first file whose language
+	// the indexer recognises.
+	RelPath string
+	// Source is where the responsible pattern came from, in words an
+	// operator can act on. Empty when nothing excluded the file.
+	Source string
+	// Pattern is the ignore pattern that excluded RelPath, in its
+	// original wording. Empty when nothing excluded the file.
+	Pattern string
+}
+
+// diagnoseEmptyWalk explains why an index walk admitted no files at all.
+//
+// A repo that indexes zero files is indistinguishable, from every
+// downstream surface, from a repo that genuinely has no code: queries
+// return "no callers" and "likely unused" with full confidence (#624).
+// The walk cannot tell the difference either — an over-broad ignore
+// prunes whole directories, so the excluded files are never even
+// enumerated. So when the walk comes back empty, re-walk without pruning
+// until the first file whose language is registered, and report what
+// excluded it. This runs only on the failure path; a healthy index never
+// pays for it.
+//
+// Returns a zero cause when the tree really does hold no indexable file.
+func (idx *Indexer) diagnoseEmptyWalk(absRoot string) emptyWalkCause {
+	var cause emptyWalkCause
+	visited := 0
+	_ = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if visited++; visited > emptyWalkProbeCap {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			// .git is excluded on every repo and is often the biggest
+			// directory in the tree; descending it would only slow the
+			// probe down and could never explain anything.
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if _, ok := idx.effectiveLanguage(path, nil); !ok {
+			return nil
+		}
+		rel, relErr := filepath.Rel(absRoot, path)
+		if relErr != nil {
+			return nil
+		}
+		cause.RelPath = filepath.ToSlash(rel)
+		if m := idx.excludeMatcher(); m != nil {
+			if matched, pattern := m.ExplainAbsDir(path, absRoot, false); matched {
+				cause.Source = "exclude list (.gitignore, .gortex.yaml, or global config)"
+				cause.Pattern = pattern
+				return filepath.SkipAll
+			}
+		}
+		if matched, dir, pattern := idx.dirIgnoreMatcher(absRoot).Explain(path, false); matched {
+			cause.Source = "per-directory ignore file in " + dir
+			cause.Pattern = pattern
+			return filepath.SkipAll
+		}
+		// Recognised and not excluded: the size cap or the content
+		// admission gate dropped it, and both already report themselves.
+		return filepath.SkipAll
+	})
+	return cause
+}
+
+// warnIfWalkAdmittedNothing logs a warning when an index walk produced no
+// files but the tree holds at least one file the indexer knows how to
+// parse. Silence is the failure mode being fixed here: without this, a
+// repo whose ignore rules swallowed everything reports success at every
+// layer and agents read the empty graph as an authoritative answer.
+func (idx *Indexer) warnIfWalkAdmittedNothing(absRoot string, admitted int) {
+	if admitted > 0 || idx.logger == nil {
+		return
+	}
+	cause := idx.diagnoseEmptyWalk(absRoot)
+	if cause.RelPath == "" {
+		// No registered language anywhere under the root — an empty index
+		// is the correct answer, not a failure.
+		return
+	}
+	if cause.Pattern == "" {
+		idx.logger.Warn("indexer: no source files were indexed, though the repo contains some",
+			zap.String("repo", idx.repoPrefix),
+			zap.String("root", absRoot),
+			zap.String("example_file", cause.RelPath))
+		return
+	}
+	idx.logger.Warn("indexer: no source files were indexed — an ignore pattern excludes the whole repo",
+		zap.String("repo", idx.repoPrefix),
+		zap.String("root", absRoot),
+		zap.String("example_file", cause.RelPath),
+		zap.String("excluded_by", cause.Source),
+		zap.String("pattern", cause.Pattern))
 }
 
 // shouldPruneDir reports whether the index walk may skip a directory

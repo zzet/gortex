@@ -342,6 +342,14 @@ func facadeOperationSpecs() []facadeOperationSpec {
 		"batch": "batch_edit", "docs": "generate_docs", "export_graph": "export_graph", "file": "edit_file", "scaffold": "scaffold",
 		"skill": "generate_skill", "symbol": "edit_symbol", "write": "write_file",
 	})
+	// mutation_status answers "did my edit land?", which is a read about
+	// change state — it cannot ride the edit facade, whose operations are all
+	// local_write (facades hold one effect class each, see
+	// TestFacadeEffectBoundaryParity).
+	specs = append(specs, facadeOperationSpec{
+		Facade: "change", Operation: "receipt", Legacy: "mutation_status",
+		Effect: facadeEffectRead,
+	})
 	// generate_wiki can call an LLM when enhance=true. Keep the ordinary edit
 	// authorization boundary local-only; enhanced generation remains available
 	// through the explicit legacy compatibility surface.

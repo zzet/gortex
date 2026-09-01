@@ -52,11 +52,22 @@ func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map
 	// names the exact languages to reindex rather than implying a full rebuild.
 	var indexState graph.RepoIndexState
 	var haveState bool
+	// Extractor-version staleness, narrowed to THIS file's language. The
+	// advisory rides on a per-file response, so a language the file is not
+	// written in is noise the reader cannot act on: the reindex it asks
+	// for would not touch the file in hand. Narrowing also keeps the
+	// banner off repositories that hold no file of the stale language at
+	// all — the comparison is against the baseline version every language
+	// implicitly carries, so a bumped language is "behind" in every
+	// repository indexed by an older binary, Go-only ones included.
 	var staleLangs []string
 	if r, ok := graph.Store(s.graph).(graph.RepoIndexStateReader); ok {
 		if st, found, _ := r.GetRepoIndexState(owner.RepoPrefix()); found {
 			indexState, haveState = st, true
-			staleLangs = indexer.ExtractorVersionStaleLangs(st.ExtractorVersions)
+			if fileLang := indexer.ExtractorLangForFile(repoRel); fileLang != "" &&
+				slices.Contains(indexer.ExtractorVersionStaleLangs(st.ExtractorVersions), fileLang) {
+				staleLangs = []string{fileLang}
+			}
 		}
 	}
 
@@ -95,9 +106,7 @@ func (s *Server) freshnessRiderFor(toolName string, req mcp.CallToolRequest) map
 	}
 	if len(staleLangs) > 0 {
 		out["extractor_stale_langs"] = staleLangs
-		if fileLang := indexer.ExtractorLangForFile(repoRel); fileLang != "" && slices.Contains(staleLangs, fileLang) {
-			out["extractor_stale_hint"] = "this file's language extractor was upgraded since indexing; reindex to pick up the newer extraction (gortex index .)"
-		}
+		out["extractor_stale_hint"] = "this file's language extractor was upgraded since indexing; reindex to pick up the newer extraction (gortex index .)"
 	}
 	if mismatch {
 		out["worktree_mismatch"] = true

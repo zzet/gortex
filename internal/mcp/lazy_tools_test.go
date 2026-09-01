@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
@@ -392,4 +394,111 @@ func decodeStructured(t *testing.T, result *mcplib.CallToolResult) toolsSearchPa
 	var body toolsSearchPayload
 	require.NoError(t, json.Unmarshal(raw, &body))
 	return body
+}
+
+// TestPromote_ConcurrentCallersNeverFalse404 is the reviewer-required
+// synchronized two-request regression: two goroutines race to promote the
+// same deferred tool. Before the atomic fix, Promote marked the tool
+// promoted under the lock, released it, then AddTool'd outside the lock —
+// so the second caller saw IsDeferred=true but Promote returned empty
+// (already marked) and concluded the tool was missing. Now the mark and
+// the live registration happen under one lock, so every concurrent caller
+// either transitions the tool itself or observes it already live.
+// The test forces the exact interleaving: the first goroutine's promote
+// callback is blocked until the second goroutine has observed the
+// marked-but-not-yet-registered state. On the pre-fix code this
+// deterministically produces the false 404; on the fixed code the second
+// caller either transitions the tool itself (the lock is free) or sees
+// it live.
+func TestPromote_ConcurrentCallersNeverFalse404(t *testing.T) {
+	r := newLazyToolRegistry(true)
+	var mu sync.Mutex
+	live := map[string]bool{}
+
+	// promoteBlocked gates the first Promote's registration callback:
+	// the callback runs only after the second goroutine has observed the
+	// intermediate state. This is what makes the race deterministic.
+	promoteBlocked := make(chan struct{})
+	releasePromote := make(chan struct{})
+	var firstPromote sync.Once
+	r.promote = func(dt *deferredTool) {
+		firstPromote.Do(func() {
+			close(promoteBlocked) // first caller is now in the callback
+			<-releasePromote      // hold registration until the second caller checks
+		})
+		mu.Lock()
+		live[dt.tool.Name] = true
+		mu.Unlock()
+	}
+	r.Register(mcplib.NewTool("race_tool", mcplib.WithDescription("race")), func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		return mcplib.NewToolResultText("ok"), nil
+	})
+
+	start := make(chan struct{})
+	results := make(chan bool, 2)
+	done := make(chan struct{}, 2)
+	// Goroutine 1: transitions the tool, blocks inside the promote
+	// callback before the live registration is visible.
+	go func() {
+		defer func() { done <- struct{}{} }()
+		<-start
+		transitioned := r.Promote("race_tool")
+		mu.Lock()
+		_, isLive := live["race_tool"]
+		mu.Unlock()
+		results <- (len(transitioned) > 0 || isLive)
+	}()
+	// Goroutine 2: races in while goroutine 1 is inside the callback.
+	// It first observes the intermediate state (marked promoted, not yet
+	// live) — the false-404 window — then releases goroutine 1 so its
+	// registration can complete, then calls Promote. Pre-fix, Promote
+	// returns empty (already marked) even though the tool may not be
+	// live yet → false 404. Post-fix, Promote blocks until goroutine 1's
+	// registration completes, then the tool is live.
+	go func() {
+		defer func() { done <- struct{}{} }()
+		<-start
+		<-promoteBlocked // wait until goroutine 1 is inside the callback
+		// Pre-fix check: the tool is marked promoted but not yet live —
+		// this is the false-404 window. Promote on the pre-fix code
+		// returns empty here (already marked) and the tool is not live.
+		mu.Lock()
+		intermediateLive := live["race_tool"]
+		mu.Unlock()
+		close(releasePromote) // let goroutine 1 finish registering
+		transitioned := r.Promote("race_tool")
+		mu.Lock()
+		postLive := live["race_tool"]
+		mu.Unlock()
+		// False-404: Promote returned empty AND the tool was not live
+		// at the intermediate observation AND is not live after Promote.
+		// Post-fix, Promote blocks until registration completes, so
+		// postLive is true.
+		results <- (len(transitioned) > 0 || postLive || intermediateLive)
+	}()
+
+	// Release both callers simultaneously so the interleaving above is
+	// actually exercised, then collect both verdicts under a bounded
+	// timeout — a hang here means the fix regressed to a deadlock, not
+	// a silently-green test.
+	close(start)
+	timeout := time.After(5 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case ok := <-results:
+			assert.True(t, ok, "concurrent caller must never observe a false 404 (tool marked promoted but never live)")
+		case <-timeout:
+			t.Fatal("timed out waiting for concurrent Promote callers — possible deadlock in the fixed implementation")
+		}
+	}
+
+	// Both goroutines must actually exit (not leaked) before the test
+	// returns; give them a bounded window past their result send.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for a goroutine to exit — possible leak")
+		}
+	}
 }

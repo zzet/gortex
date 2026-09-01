@@ -69,6 +69,15 @@ type AgentHooks struct {
 	// InstructionsShadowed is set when the agent will read a different file
 	// instead, making the block above dead text.
 	InstructionsShadowed string
+	// PostToolUseDenyPosture is set when the installed PostToolUse hook runs
+	// under the deny posture — its matcher names only the Gortex MCP tools,
+	// never the native read-shaped tools the enrichment path keys on. There
+	// the hook exists to watch localization receipts and is never expected
+	// to inject context (PreToolUse already redirects native reads), so
+	// "ran but never emitted" is the designed steady state, not a
+	// degradation. Agents without a posture concept leave it false and keep
+	// the original warning semantics.
+	PostToolUseDenyPosture bool
 	// HooksDisabled marks a harness whose configuration switches hook
 	// execution off wholesale. It explains an idle install completely, so it
 	// must pre-empt the trust and PATH remedies — both of which would send
@@ -197,6 +206,20 @@ func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Ado
 			continue
 		}
 		if stats.Emitted == 0 {
+			// Under the deny posture the PostToolUse hook only watches
+			// Gortex tool calls for localization receipts — its matcher
+			// never names the native read-shaped tools the enrichment
+			// path keys on, so zero injections is the designed steady
+			// state, and warning on it would fire permanently on every
+			// healthy deny-mode install (#630). Enrich-mode installs
+			// keep the warning: there, silence genuinely means the
+			// enrichment path broke.
+			if event == "PostToolUse" && agent.PostToolUseDenyPosture {
+				add(SeverityInfo, "",
+					"%s ran %d time(s) and injected context 0 times — expected under the deny posture: PreToolUse already redirects native reads, and this hook only watches Gortex tool calls.",
+					event, stats.Runs)
+				continue
+			}
 			add(SeverityWarn, "",
 				"%s ran %d time(s) and injected context 0 times — it fires but has nothing to say.", event, stats.Runs)
 		}

@@ -76,6 +76,19 @@ type Server struct {
 	started      time.Time
 	instanceID   string // unique to this daemon process; exposed in handshake acks
 
+	// Binary-drift detection: size+mtime of the daemon's own executable
+	// captured at construction, so each status request can cheaply tell
+	// whether the on-disk image was replaced (brew upgrade, cp over the
+	// binary) while this process keeps running the old code. An empty
+	// binaryPath means the identity was never captured and status reports
+	// the binary state as unknown. binaryStatFn is swappable for tests.
+	binaryMu          sync.Mutex
+	binaryPath        string
+	binaryStartSize   int64
+	binaryStartMod    int64
+	binaryStatFn      func(path string) (int64, int64, error) // size, mtime unix seconds, err
+	binaryLoggedStale bool
+
 	shutdown chan struct{}
 	doneOnce sync.Once
 	conns    map[net.Conn]struct{}
@@ -173,14 +186,83 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Server{
-		SocketPath: socketPath,
-		Version:    version,
-		Logger:     logger,
-		instanceID: newSessionID(),
-		sessions:   NewSessionRegistry(),
-		shutdown:   make(chan struct{}),
-		conns:      make(map[net.Conn]struct{}),
+	s := &Server{
+		SocketPath:   socketPath,
+		Version:      version,
+		Logger:       logger,
+		instanceID:   newSessionID(),
+		sessions:     NewSessionRegistry(),
+		shutdown:     make(chan struct{}),
+		conns:        make(map[net.Conn]struct{}),
+		binaryStatFn: osStatIdentity,
+	}
+	// Capture the running image's identity so status requests can detect
+	// a later on-disk replace. Best-effort: a failure here leaves
+	// binaryPath empty and status reports the binary state as unknown.
+	if exe, err := os.Executable(); err == nil {
+		s.captureBinaryIdentity(exe)
+	}
+	return s
+}
+
+// osStatIdentity is the production binary-identity probe: os.Stat reduced
+// to the (size, mtime) pair drift detection compares. A named func rather
+// than an inline closure so Server.binaryStatFn has a swappable default
+// and tests can substitute a fake.
+func osStatIdentity(path string) (int64, int64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	return fi.Size(), fi.ModTime().Unix(), nil
+}
+
+// captureBinaryIdentity stats path through binaryStatFn and records the
+// result as the start-of-life identity. Any error leaves the identity
+// uncaptured (binaryPath empty) — status then reports the binary state as
+// unknown rather than guessing fresh.
+func (s *Server) captureBinaryIdentity(path string) {
+	if s.binaryStatFn == nil {
+		s.binaryStatFn = osStatIdentity
+	}
+	size, mod, err := s.binaryStatFn(path)
+	if err != nil {
+		return
+	}
+	s.binaryMu.Lock()
+	s.binaryPath = path
+	s.binaryStartSize = size
+	s.binaryStartMod = mod
+	s.binaryMu.Unlock()
+}
+
+// populateBinaryStatus stamps the binary-drift fields onto a status
+// response: BinaryChecked reports whether the probe ran, BinaryStale
+// whether the on-disk image no longer matches the one this process
+// started from. The first stale detection logs the restart hint once —
+// every subsequent status stays quiet, so a monitoring loop polling status
+// cannot spam the daemon log. Stat failures (and a never-captured
+// identity) leave both flags false: unknown, not fresh.
+func (s *Server) populateBinaryStatus(st *StatusResponse) {
+	s.binaryMu.Lock()
+	defer s.binaryMu.Unlock()
+	if s.binaryPath == "" || s.binaryStatFn == nil {
+		return
+	}
+	size, mod, err := s.binaryStatFn(s.binaryPath)
+	if err != nil {
+		return
+	}
+	st.BinaryChecked = true
+	if size != s.binaryStartSize || mod != s.binaryStartMod {
+		st.BinaryStale = true
+		st.BinaryReplacedAtUnix = mod
+		if !s.binaryLoggedStale {
+			s.binaryLoggedStale = true
+			s.Logger.Warn(fmt.Sprintf(
+				"daemon: on-disk binary changed since start (%s) — run 'gortex daemon restart' to upgrade",
+				s.binaryPath))
+		}
 	}
 }
 
@@ -734,6 +816,9 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 			}
 			st.MCPSessions = rows
 		}
+		// Binary-drift self-report: did the on-disk daemon image get
+		// replaced under this running process? See populateBinaryStatus.
+		s.populateBinaryStatus(&st)
 		buf, _ := json.Marshal(st)
 		return ControlResponse{OK: true, Result: buf}
 

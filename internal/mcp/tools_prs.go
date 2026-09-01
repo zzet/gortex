@@ -450,7 +450,7 @@ func (s *Server) changedSymbolsForFiles(repoPrefix string, files []string) ([]st
 		}
 		fileSeen[f] = true
 		changedFiles = append(changedFiles, f)
-		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f) {
+		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f, analysis.RepoRelativePath) {
 			if n == nil || n.Kind == graph.KindFile {
 				continue
 			}

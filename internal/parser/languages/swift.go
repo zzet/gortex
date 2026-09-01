@@ -41,6 +41,16 @@ const qSwiftAll = `
   (property_declaration
     (pattern (simple_identifier) @property.name)) @property.def
 
+  ; init / deinit / subscript are their own grammar rules, not
+  ; function_declaration, so none of the patterns above reached them. Left
+  ; unmatched they are absent as symbols AND absent from the func-range table,
+  ; which silently drops every call edge made from inside their bodies.
+  (init_declaration) @init.def
+
+  (deinit_declaration) @deinit.def
+
+  (subscript_declaration) @subscript.def
+
   (import_declaration) @import.def
 
   (call_expression
@@ -162,6 +172,15 @@ func (e *SwiftExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 
 		case m.Captures["property.def"] != nil:
 			e.emitProperty(m, filePath, fileID, src, result, seen, annotationSeen, typeRanges)
+
+		case m.Captures["init.def"] != nil:
+			e.emitTypeMemberDecl(m.Captures["init.def"], "init", filePath, fileID, src, result, seen, annotationSeen, typeRanges)
+
+		case m.Captures["deinit.def"] != nil:
+			e.emitTypeMemberDecl(m.Captures["deinit.def"], "deinit", filePath, fileID, src, result, seen, annotationSeen, typeRanges)
+
+		case m.Captures["subscript.def"] != nil:
+			e.emitTypeMemberDecl(m.Captures["subscript.def"], "subscript", filePath, fileID, src, result, seen, annotationSeen, typeRanges)
 
 		case m.Captures["import.def"] != nil:
 			e.emitImport(m, filePath, fileID, result)
@@ -615,6 +634,74 @@ func (e *SwiftExtractor) emitProperty(m parser.QueryResult, filePath, fileID str
 		emitSwiftTypeUseEdges(id, fieldType, filePath, def.StartLine+1, result)
 	}
 	emitSwiftAnnotationEdges(def.Node, id, filePath, src, result, annotationSeen)
+}
+
+// emitTypeMemberDecl emits a nameless type member — `init`, `deinit`, or
+// `subscript`, named only by its declaring keyword — as a method of its
+// enclosing type (a type declaration or an `extension Foo { … }` block, both of
+// which seed typeRanges). A declaration with no enclosing type range is a
+// protocol requirement or a parse-error fragment and is dropped rather than
+// attributed to the file.
+//
+// An initializer takes the cross-language constructor spelling `<Type>.<init>`
+// that Java and C# already emit, so constructor-aware consumers need no Swift
+// special case. `deinit` and `subscript` are spelled as written, and two
+// subscripts on one type separate by the shared line-suffix disambiguation.
+func (e *SwiftExtractor) emitTypeMemberDecl(
+	def *parser.CapturedNode, keyword, filePath, fileID string, src []byte,
+	result *parser.ExtractionResult, seen, annotationSeen map[string]bool,
+	typeRanges []swiftTypeRange,
+) {
+	if def == nil || def.Node == nil {
+		return
+	}
+	tr, ok := findEnclosingSwiftTypeRange(typeRanges, def.StartLine)
+	if !ok {
+		return
+	}
+	name := keyword
+	member := tr.name + "." + keyword
+	if keyword == "init" {
+		name = tr.name + ".<init>"
+		member = name
+	}
+	id, idOK := disambiguateID(seen, filePath+"::"+member, def.StartLine+1)
+	if !idOK {
+		return
+	}
+
+	meta := map[string]any{
+		"receiver":   tr.name,
+		"kind":       keyword,
+		"signature":  swiftDeclHeader(def.Node, src),
+		"visibility": swiftVisibility(def.Node, src),
+	}
+	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+		meta["doc"] = doc
+	}
+	result.Nodes = append(result.Nodes, &graph.Node{
+		ID: id, Kind: graph.KindMethod, Name: name,
+		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
+		Language: "swift", Meta: meta,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	result.Edges = append(result.Edges, &graph.Edge{
+		From: id, To: filePath + "::" + tr.name, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
+	})
+	emitSwiftAnnotationEdges(def.Node, id, filePath, src, result, annotationSeen)
+}
+
+// swiftDeclHeader returns a declaration's source up to its body brace, folded
+// onto one line — the readable signature for a member the grammar gives no
+// name field (`init`, `deinit`, `subscript`).
+func swiftDeclHeader(decl *sitter.Node, src []byte) string {
+	header := decl.Content(src)
+	if i := strings.IndexByte(header, '{'); i >= 0 {
+		header = header[:i]
+	}
+	return strings.Join(strings.Fields(header), " ")
 }
 
 // swiftPropertyIsMutable reports whether a property is declared with `var`

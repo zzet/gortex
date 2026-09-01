@@ -133,9 +133,14 @@ func TestGlobalInstall_FatToSlimReplacement(t *testing.T) {
 
 	// The block is now the thin pointer: it @-includes the active
 	// profile copy from the hermetic instructions dir…
+	// Two spellings of one file, and the difference is the point: the
+	// @-include is document content and stays '/'-spelled on every OS,
+	// while the ReadFile below is a real filesystem call and needs the
+	// native path.
 	activePath := filepath.Join(env.InstructionsDir, profiles.ActiveFileName)
-	if !strings.Contains(text, "@"+activePath) {
-		t.Errorf("re-installed block does not @-include the active profile (%s)", activePath)
+	includedPath := filepath.ToSlash(activePath)
+	if !strings.Contains(text, "@"+includedPath) {
+		t.Errorf("re-installed block does not @-include the active profile (%s)", includedPath)
 	}
 	if !strings.Contains(text, "gortex instructions switch") {
 		t.Error("re-installed block lost the switch verb")

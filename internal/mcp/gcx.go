@@ -54,6 +54,15 @@ func (s *Server) isGCX(ctx context.Context, req mcp.CallToolRequest) bool {
 // (full result inline, transport-spilled if the harness cap fires).
 func (s *Server) gcxResponseWithBudget(req mcp.CallToolRequest) func([]byte, error) (*mcp.CallToolResult, error) {
 	budget := effectiveBudget(req)
+	// The token-budget comment lands after the row trim; reserve its
+	// bytes so the decorated payload stays in cap. A budget the reserve
+	// itself cannot fit inside drops the comment instead of letting it
+	// become the bytes that break the contract.
+	reserve := tokenBudgetDecorationReserve(req)
+	decorate := reserve == 0 || reserve < budget
+	if reserve > 0 && decorate {
+		budget -= reserve
+	}
 	return func(payload []byte, err error) (*mcp.CallToolResult, error) {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("wire encode failed: %v", err)), nil
@@ -61,7 +70,7 @@ func (s *Server) gcxResponseWithBudget(req mcp.CallToolRequest) func([]byte, err
 		if budget > 0 {
 			if trimmed, didTrim := trimGCXBytes(payload, budget); trimmed != nil {
 				payload = trimmed
-				if didTrim {
+				if didTrim && decorate {
 					payload = decorateTokenBudgetGCX(payload, req)
 				}
 			}
@@ -454,9 +463,17 @@ func tierFilteredCaveatMeta(c *graph.TierFilteredCaveat) []string {
 // encodeFindUsages emits one row per usage edge. Each row names the
 // caller symbol, its location, the edge kind, and the origin tier so
 // agents can filter without a second call.
-func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
+func encodeFindUsages(sg *query.SubGraph, g graph.NodeGetter) ([]byte, error) {
 	var buf bytes.Buffer
 	meta := []string{"edges", fmt.Sprintf("%d", len(sg.Edges))}
+	// Truncation meta rides only on a capped result so an uncapped
+	// response keeps its wire shape byte-for-byte.
+	if sg.Truncated {
+		meta = append(meta,
+			"truncated", "true",
+			"total_edges", fmt.Sprintf("%d", sg.TotalEdges),
+		)
+	}
 	meta = append(meta, zeroEdgeCaveatMeta(sg.Caveat)...)
 	meta = append(meta, tierFilteredCaveatMeta(sg.TierFiltered)...)
 	if sg.TextMatchedSuppressed > 0 {
@@ -505,7 +522,7 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 		ftf, fuc := usageFromFlavor(g, e.From, fn)
 		if err := enc.WriteRow(
 			e.From, e.To, string(e.Kind), e.Context, e.ReturnUsage, e.Origin, tier, e.Confidence,
-			fname, fpath, fline, nodeIsTest(fn), nodeTestRole(fn), nodeTestRunner(fn), ftf, fuc,
+			fname, fpath, fline, graph.NodeIsTest(g, fn), nodeTestRole(fn), nodeTestRunner(fn), ftf, fuc,
 		); err != nil {
 			return nil, err
 		}
@@ -525,7 +542,7 @@ func encodeFindUsages(sg *query.SubGraph, g graph.Store) ([]byte, error) {
 // third caller_notes section when get_callers attached concurrency
 // annotations. The third section is omitted entirely when empty so the
 // other traversal tools' wire output is byte-identical to before.
-func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
+func encodeSubGraph(tool string, sg *query.SubGraph, g graph.NodeGetter) ([]byte, error) {
 	var buf bytes.Buffer
 	nodes := make([]*graph.Node, 0, len(sg.Nodes))
 	for _, n := range sg.Nodes {
@@ -557,7 +574,7 @@ func encodeSubGraph(tool string, sg *query.SubGraph) ([]byte, error) {
 		nodeMeta...,
 	)
 	for _, n := range nodes {
-		if err := nodeEnc.WriteRow(n.ID, string(n.Kind), nodeShort(n), n.FilePath, n.AbsoluteFilePath, n.StartLine, nodeIsTest(n), nodeTestRole(n), nodeTestRunner(n)); err != nil {
+		if err := nodeEnc.WriteRow(n.ID, string(n.Kind), nodeShort(n), n.FilePath, n.AbsoluteFilePath, n.StartLine, graph.NodeIsTest(g, n), nodeTestRole(n), nodeTestRunner(n)); err != nil {
 			return nil, err
 		}
 	}

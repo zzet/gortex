@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +21,40 @@ func nameResolveServer(t *testing.T) *Server {
 	s.graph.AddNode(&graph.Node{ID: "pkg/foo.go::Bar#local", Name: "Bar", Kind: graph.KindLocal, FilePath: "pkg/foo.go"})
 	s.engine = query.NewEngine(s.graph)
 	return s
+}
+
+// TestResolveSymbolID_WithoutMultiIndexer_StillAnchorsThePath pins the rung
+// order inside resolveSymbolID: the cwd rung needs the multi-repo index to map
+// a directory to a repo prefix, the graphRelID rung does not. Returning early
+// on a nil multiIndexer skipped both, so a server built without
+// MultiRepoOptions — cmd/gortex's eval_recall.go and eval_server.go — lost path
+// anchoring entirely.
+//
+// The absolute-path spelling is deliberate: it exercises the rung on every
+// platform, so the linux/macos matrix protects this. On Windows the same rung
+// additionally reconciles the separator, which is what graphPathSpelling exists
+// for — the store holds `pkga\a.go::Foo` while every agent writes
+// `pkga/a.go::Foo`, and move_symbol answered "symbol not found" for an indexed
+// symbol.
+func TestResolveSymbolID_WithoutMultiIndexer_StillAnchorsThePath(t *testing.T) {
+	srv, dir := setupMoveInlineRepo(t, map[string]string{
+		"pkga/a.go": "package pkga\n\nfunc Foo() int { return 42 }\n",
+	})
+	require.Nil(t, srv.multiIndexer, "fixture must exercise the nil-multiIndexer path")
+
+	var stored string
+	for _, n := range srv.graph.FindNodesByName("Foo") {
+		if n != nil && n.Kind == graph.KindFunction {
+			stored = n.ID
+		}
+	}
+	require.NotEmpty(t, stored, "fixture must index Foo")
+
+	absID := filepath.Join(dir, "pkga", "a.go") + "::Foo"
+	require.Nil(t, srv.graph.GetNode(absID), "the absolute spelling must not be a stored id")
+
+	assert.Equal(t, stored, srv.resolveSymbolID(context.Background(), absID),
+		"an absolute-path id must anchor back to the stored id without a multiIndexer")
 }
 
 func TestResolveNameToIDs(t *testing.T) {

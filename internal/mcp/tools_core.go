@@ -113,17 +113,37 @@ type toonCallerNoteRow struct {
 }
 
 // toonSubGraphResult wraps nodes and edges for TOON tabular output.
+// toonZeroEdgeCaveat mirrors graph.ZeroEdgeCaveat with a plain string
+// class: toon-go rejects the named ZeroEdgeClass string type, and the
+// silent JSON fallback that error triggered meant a caveat-bearing
+// subgraph never actually rendered as TOON.
+type toonZeroEdgeCaveat struct {
+	Class   string `toon:"class"`
+	Message string `toon:"message"`
+}
+
+func toonCaveat(c *graph.ZeroEdgeCaveat) *toonZeroEdgeCaveat {
+	if c == nil {
+		return nil
+	}
+	return &toonZeroEdgeCaveat{Class: string(c.Class), Message: c.Message}
+}
+
 type toonSubGraphResult struct {
-	Nodes                 []toonNodeRow         `toon:"nodes"`
-	Edges                 []toonEdgeRow         `toon:"edges"`
-	Total                 int                   `toon:"total"`
-	Truncated             bool                  `toon:"truncated"`
-	Caveat                *graph.ZeroEdgeCaveat `toon:"caveat,omitempty"`
-	TextMatchedSuppressed int                   `toon:"text_matched_suppressed,omitempty"`
-	SuppressionCaveat     string                `toon:"suppression_caveat,omitempty"`
-	RelatedTools          string                `toon:"related_tools,omitempty"`
-	CallerNotes           []toonCallerNoteRow   `toon:"caller_notes,omitempty"`
-	UsageSummary          *query.UsageSummary   `toon:"usage_summary,omitempty"`
+	Nodes     []toonNodeRow `toon:"nodes"`
+	Edges     []toonEdgeRow `toon:"edges"`
+	Total     int           `toon:"total"`
+	Truncated bool          `toon:"truncated"`
+	// TotalEdges carries the full row count when a row cap cut the edge
+	// list; zero (and omitted) otherwise, so untrimmed responses and
+	// node-truncated BFS results keep their wire shape.
+	TotalEdges            int                 `toon:"total_edges,omitempty"`
+	Caveat                *toonZeroEdgeCaveat `toon:"caveat,omitempty"`
+	TextMatchedSuppressed int                 `toon:"text_matched_suppressed,omitempty"`
+	SuppressionCaveat     string              `toon:"suppression_caveat,omitempty"`
+	RelatedTools          string              `toon:"related_tools,omitempty"`
+	CallerNotes           []toonCallerNoteRow `toon:"caller_notes,omitempty"`
+	UsageSummary          *query.UsageSummary `toon:"usage_summary,omitempty"`
 }
 
 // toonSearchResult wraps search results for TOON tabular output.
@@ -201,26 +221,234 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 	// Diagram formats render the subgraph directly — one place serves
 	// every traversal tool (callers/dependencies/usages/...), so a
 	// `gortex query ... --format mermaid|dot` gets a real diagram.
+	// Every text renderer below keeps the same byte/token budget the
+	// JSON and GCX paths enforce: the budget is a contract on the
+	// response, not on one format. Structured grammars re-render over
+	// fewer rows instead of taking a byte-level cut — a sliced diagram
+	// or TOON table fails downstream parsers while looking successful.
 	switch req.GetString("format", "") {
 	case "mermaid":
-		return mcp.NewToolResultText(sg.ToMermaid()), nil
+		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
+			text := t.ToMermaid()
+			if note := subGraphBudgetNote(t, sg); note != "" {
+				text += "%% " + note + "\n"
+			}
+			return text
+		})), nil
 	case "dot":
-		return mcp.NewToolResultText(sg.ToDot()), nil
+		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
+			text := t.ToDot()
+			if note := subGraphBudgetNote(t, sg); note != "" {
+				text += "// " + note + "\n"
+			}
+			return text
+		})), nil
 	}
 	if isCompact(req) {
-		return mcp.NewToolResultText(compactSubGraph(sg)), nil
+		// Compact is a caller-facing renderer, not an escape hatch from
+		// the byte/token budget: a request routed here (including
+		// compact over a gcx session default) keeps the same
+		// effectiveBudget cap every other format path enforces.
+		return mcp.NewToolResultText(textWithinBudget(req, compactSubGraph(sg))), nil
 	}
 	if s.isGCX(ctx, req) {
 		tool := requestToolName(req)
 		if tool == "" {
 			tool = "subgraph"
 		}
-		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg))
+		return s.gcxResponseWithBudget(req)(encodeSubGraph(tool, sg, s.nodeGetterFor(ctx)))
 	}
 	if s.isTOON(ctx, req) {
-		return subGraphToTOON(sg)
+		getter := s.nodeGetterFor(ctx)
+		return mcp.NewToolResultText(renderSubGraphWithinBudget(req, sg, func(t *query.SubGraph) string {
+			return subGraphToTOON(t, getter)
+		})), nil
 	}
 	return s.respondJSONOrTOON(ctx, req, sg)
+}
+
+// trimBudgetMarker closes a budget-trimmed compact payload; package
+// level so the boundary tests exercise the exact marker the trimmer
+// emits.
+const trimBudgetMarker = "... trimmed to byte budget; pass max_bytes:0 for the full result\n"
+
+// trimTextToBudget cuts a line-oriented text payload to at most budget
+// bytes, breaking at a line boundary and closing with a marker line so
+// the cut is legible. The marker's own bytes count against the budget.
+func trimTextToBudget(text string, budget int) string {
+	// The budget is a hard ceiling at every size: a non-positive budget
+	// yields nothing, a budget below the marker's own size gets a
+	// truncated marker, never a payload above it.
+	if budget <= 0 {
+		return ""
+	}
+	if budget <= len(trimBudgetMarker) {
+		return trimBudgetMarker[:budget]
+	}
+	keep := budget - len(trimBudgetMarker)
+	if keep > len(text) {
+		keep = len(text)
+	}
+	cut := strings.LastIndexByte(text[:keep], '\n')
+	if cut < 0 {
+		cut = 0
+	} else {
+		cut++
+	}
+	return text[:cut] + trimBudgetMarker
+}
+
+// textWithinBudget applies the request's effective byte/token budget
+// to a rendered text payload, trimming only on overflow — the fitting
+// case passes through marker-free.
+func textWithinBudget(req mcp.CallToolRequest, text string) string {
+	if budget := effectiveBudget(req); budget > 0 && len(text) > budget {
+		return trimTextToBudget(text, budget)
+	}
+	return text
+}
+
+// renderSubGraphWithinBudget renders sg through render and, when the
+// full rendering overflows the caller's budget, re-renders over the
+// largest structural subset that fits, so the output stays
+// syntactically valid in grammars a byte-level cut would corrupt.
+// Two stages, both stamping Truncated plus the TotalEdges/TotalNodes
+// floors on the trial: first the largest edge prefix (nodes pruned to
+// the surviving rows), then — when no edge prefix fits, the shape a
+// node-heavy result with few or zero edges produces — the largest
+// node prefix over the rowless base. The page order each prefix
+// consumes is whatever the handler already established. Only the
+// degenerate case where even an empty rendering overflows falls back
+// to the plain-text trim.
+func renderSubGraphWithinBudget(req mcp.CallToolRequest, sg *query.SubGraph, render func(*query.SubGraph) string) string {
+	budget := effectiveBudget(req)
+	full := render(sg)
+	if budget <= 0 || len(full) <= budget {
+		return full
+	}
+	trial := *sg
+	trial.Truncated = true
+	trial.TotalEdges = max(sg.TotalEdges, len(sg.Edges))
+	trial.TotalNodes = max(sg.TotalNodes, len(sg.Nodes))
+	// One fit predicate for both stages: the largest prefix count whose
+	// rendering fits, with set() mutating the trial to the candidate.
+	largestFit := func(n int, set func(int)) string {
+		fit := ""
+		lo, hi := 0, n
+		for lo < hi {
+			mid := (lo + hi + 1) / 2
+			set(mid)
+			if text := render(&trial); len(text) <= budget {
+				lo, fit = mid, text
+			} else {
+				hi = mid - 1
+			}
+		}
+		return fit
+	}
+	if fit := largestFit(len(sg.Edges), func(m int) {
+		trial.Edges = sg.Edges[:m]
+		trial.Nodes = nodesForEdgePage(sg, trial.Edges)
+	}); fit != "" {
+		return fit
+	}
+	// No edge prefix fits — the shape a node-heavy result with few or
+	// zero edges produces. Cut a node prefix over the edge-touched
+	// nodes first (the queried subject is incident to its own rows),
+	// then the isolated remainder, so the subject survives any cut
+	// that keeps at least one node.
+	trial.Edges = nil
+	baseNodes := edgeIncidentFirst(sg)
+	if fit := largestFit(len(baseNodes), func(m int) {
+		trial.Nodes = baseNodes[:m]
+	}); fit != "" {
+		return fit
+	}
+	trial.Nodes = nil
+	if text := render(&trial); len(text) <= budget {
+		return text
+	}
+	return trimTextToBudget(full, budget)
+}
+
+// edgeIncidentFirst orders the subgraph's nodes with the ones its
+// edges touch ahead of the isolated remainder, keeping the handler's
+// relative order within each class. The node-prefix budget cut
+// consumes this order, so the result's structurally-connected nodes —
+// the queried subject among them — outlive the isolated tail.
+func edgeIncidentFirst(sg *query.SubGraph) []*graph.Node {
+	incident := make(map[string]bool, len(sg.Edges)*2)
+	for _, e := range sg.Edges {
+		if e != nil {
+			incident[e.From] = true
+			incident[e.To] = true
+		}
+	}
+	out := make([]*graph.Node, 0, len(sg.Nodes))
+	for _, n := range sg.Nodes {
+		if n != nil && incident[n.ID] {
+			out = append(out, n)
+		}
+	}
+	for _, n := range sg.Nodes {
+		if n != nil && !incident[n.ID] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// subGraphBudgetNote names what the BYTE-BUDGET cut left out — edges,
+// nodes, or both — in one grammar-neutral sentence the diagram
+// renderers wrap in their own comment syntax. The cut is measured
+// against base, the row set the handler returned: a handler-side
+// `limit` cap also stamps Truncated and pre-cut totals, and blaming
+// the byte budget for those rows would send the caller on a
+// `max_bytes:0` retry that cannot restore them. The denominators are
+// base's row counts for the same reason — they are what max_bytes:0
+// actually returns. Empty when the rendering was not byte-cut.
+func subGraphBudgetNote(t, base *query.SubGraph) string {
+	var parts []string
+	if len(t.Edges) < len(base.Edges) {
+		parts = append(parts, fmt.Sprintf("%d of %d edges", len(t.Edges), len(base.Edges)))
+	}
+	if len(t.Nodes) < len(base.Nodes) {
+		parts = append(parts, fmt.Sprintf("%d of %d nodes", len(t.Nodes), len(base.Nodes)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, ", ") + " shown (byte budget); pass max_bytes:0 for the full graph"
+}
+
+// nodesForEdgePage keeps the nodes a trimmed edge page references,
+// plus every node with no incident edge in the full result (the
+// queried seed among them), so the page cut never drops the subject.
+func nodesForEdgePage(sg *query.SubGraph, page []*graph.Edge) []*graph.Node {
+	incident := make(map[string]bool, len(sg.Edges)*2)
+	for _, e := range sg.Edges {
+		if e != nil {
+			incident[e.From] = true
+			incident[e.To] = true
+		}
+	}
+	keep := make(map[string]bool, len(page)*2)
+	for _, e := range page {
+		if e != nil {
+			keep[e.From] = true
+			keep[e.To] = true
+		}
+	}
+	out := make([]*graph.Node, 0, len(page)*2)
+	for _, n := range sg.Nodes {
+		if n == nil {
+			continue
+		}
+		if keep[n.ID] || !incident[n.ID] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // requestToolName extracts the MCP tool name from a CallToolRequest.
@@ -287,13 +515,22 @@ func returnTOON(payload any) (*mcp.CallToolResult, error) {
 func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest, payload any) (*mcp.CallToolResult, error) {
 	payload = applyFieldsFilter(payload, parseFields(req.GetString("fields", "")))
 	if budget := effectiveBudget(req); budget > 0 {
+		// The token-budget decoration lands after the fit; reserve its
+		// bytes so the decorated payload stays in cap. A budget the
+		// reserve itself cannot fit inside drops the decoration instead
+		// of letting it become the bytes that break the contract.
+		reserve := tokenBudgetDecorationReserve(req)
+		decorate := reserve == 0 || reserve < budget
+		if reserve > 0 && decorate {
+			budget -= reserve
+		}
 		var trimmed bool
 		if shape, ok := degradeShapes[req.Params.Name]; ok {
 			payload, trimmed = applyDegradation(payload, shape, budget)
 		} else {
 			payload, trimmed = applyBudget(payload, budget)
 		}
-		if trimmed {
+		if trimmed && decorate {
 			payload = decorateTokenBudgetJSON(payload, req)
 		}
 	}
@@ -317,8 +554,10 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 	return mcp.NewToolResultJSON(payload)
 }
 
-// subGraphToTOON converts a SubGraph to a TOON-encoded text result.
-func subGraphToTOON(sg *query.SubGraph) (*mcp.CallToolResult, error) {
+// subGraphToTOON renders a SubGraph as TOON text; a marshal failure
+// falls back to the JSON rendering so the caller always holds one
+// parseable document.
+func subGraphToTOON(sg *query.SubGraph, g graph.NodeGetter) string {
 	var edgeRows []toonEdgeRow
 	for _, e := range sg.Edges {
 		label := e.ConfidenceLabel
@@ -339,23 +578,41 @@ func subGraphToTOON(sg *query.SubGraph) (*mcp.CallToolResult, error) {
 			Label:      label,
 		})
 	}
+	nodeRows := nodesToTOONRows(sg.Nodes)
+	// Subgraph rows ride next to the exclude_tests filter, so their
+	// is_test column uses the same shared classifier (stamp → owner →
+	// path); pure listing tools keep the raw stamp. Joined by node ID —
+	// the row builder skips File/Import nodes, so row positions do not
+	// line up with sg.Nodes positions.
+	nodeByID := indexNodes(sg.Nodes)
+	for i := range nodeRows {
+		if n := nodeByID[nodeRows[i].ID]; n != nil {
+			nodeRows[i].IsTest = graph.NodeIsTest(g, n)
+		}
+	}
 	result := toonSubGraphResult{
-		Nodes:                 nodesToTOONRows(sg.Nodes),
+		Nodes:                 nodeRows,
 		Edges:                 edgeRows,
 		Total:                 sg.TotalNodes,
 		Truncated:             sg.Truncated,
-		Caveat:                sg.Caveat,
+		Caveat:                toonCaveat(sg.Caveat),
 		TextMatchedSuppressed: sg.TextMatchedSuppressed,
 		SuppressionCaveat:     sg.SuppressionCaveat,
 		RelatedTools:          sg.RelatedTools,
 		CallerNotes:           callerNotesToTOONRows(sg.CallerNotes),
 		UsageSummary:          sg.UsageSummary,
 	}
+	if sg.TotalEdges > len(sg.Edges) {
+		result.TotalEdges = sg.TotalEdges
+	}
 	data, err := toon.Marshal(result)
 	if err != nil {
-		return mcp.NewToolResultJSON(sg)
+		if j, jerr := json.Marshal(sg); jerr == nil {
+			return string(j)
+		}
+		return ""
 	}
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data)
 }
 
 // resolveRepoFilter resolves the optional repo/project/ref params into
@@ -859,7 +1116,14 @@ func compactSubGraph(sg *query.SubGraph) string {
 			}
 			counts[label]++
 		}
-		fmt.Fprintf(&b, "edges: %d total", len(sg.Edges))
+		// A row-capped page names both the page size and the full row
+		// count, so "total" never mislabels a partial result. The
+		// uncapped footer keeps its wire shape.
+		if sg.TotalEdges > len(sg.Edges) {
+			fmt.Fprintf(&b, "edges: %d of %d total", len(sg.Edges), sg.TotalEdges)
+		} else {
+			fmt.Fprintf(&b, "edges: %d total", len(sg.Edges))
+		}
 		for _, label := range []string{"EXTRACTED", "INFERRED", "AMBIGUOUS"} {
 			if c := counts[label]; c > 0 {
 				fmt.Fprintf(&b, ", %d %s", c, label)
@@ -1115,7 +1379,7 @@ func (s *Server) registerCoreTools() {
 		mcp.NewTool("find_usages",
 			mcp.WithDescription("Use instead of Grep to find every reference to a symbol across the codebase. Returns precise locations with zero false positives. For just the call sites of a function use get_callers; for the concrete types that implement an interface use find_implementations."),
 			mcp.WithString("id", mcp.Required(), mcp.Description("Node ID")),
-			mcp.WithNumber("limit", mcp.Description("Max nodes (default: 50)")),
+			mcp.WithNumber("limit", mcp.Description("Max usage rows returned (default: 50; 0 = no cap). A capped response is marked truncated and total_edges keeps the full count.")),
 			mcp.WithBoolean("compact", mcp.Description("One-line-per-symbol text output (saves 50-70% tokens)")),
 			mcp.WithString("format", mcp.Description("Output format: json (default), gcx (GCX1 compact wire format), or toon")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes. The longest list is trimmed; truncation metadata rides on the response. Omit for no cap.")),
@@ -2434,8 +2698,16 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// already recorded why, and the caller's own min_tier is what
 		// removed them. Classifying on top would double-report it, and
 		// now that classification weighs provenance it would report the
-		// very tier the caller asked to exclude.
-		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		// very tier the caller asked to exclude. A symbol the request's
+		// view resolved (overlay-served included) is never a mistyped id.
+		// Classification reads the same request-scoped view the query
+		// ran on: the base graph misreports overlay-only symbols and
+		// still counts callers an overlay tombstone removed.
+		if eng.GetSymbol(id) != nil {
+			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.readerFor(ctx), id)
+		} else {
+			sg.Caveat = graph.CaveatForZeroEdge(s.readerFor(ctx), id)
+		}
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every caller is a bare-name match — the shape a
 		// common method name (`Get`, `Run`, `Close`) produces. Left
@@ -2447,13 +2719,17 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	// Epistemic lower bound: a caller walk over in-edges cannot see callers
 	// that reach this symbol through interface dispatch the resolver left
 	// unbound. Flag the floor + name the interface so the agent can widen it.
-	if bs := graph.CallerBoundaries(s.graph, []string{id}, 0); len(bs) > 0 {
+	// Judged from the request-scoped view — the same graph the query ran
+	// on — so an overlay-added implements edge surfaces its floor and a
+	// tombstoned one stops reporting a stale one.
+	reader := s.readerFor(ctx)
+	if bs := graph.CallerBoundaries(reader, []string{id}, 0); len(bs) > 0 {
 		sg.Boundaries = bs
 		sg.LowerBound = graph.LowerBoundCaveat(bs)
 		// The reach is a floor because dispatch is dynamic — scan the seed's
 		// body for the exact runtime-dispatch sites so the agent gets
 		// {site, form, key, candidates} instead of a read-spiral.
-		if db := s.dynamicBoundariesForSymbol(s.graph.GetNode(id)); len(db) > 0 {
+		if db := s.dynamicBoundariesForSymbol(ctx, reader.GetNode(id)); len(db) > 0 {
 			sg.DynamicBoundaries = db
 		}
 	}
@@ -2657,6 +2933,10 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		return errResult, nil
 	}
 	eng := s.engineFor(ctx)
+	// One request-scoped node lookup, resolved once and handed to every
+	// classification/flavor surface below, so none can drift back to the
+	// base graph while the query runs on an overlay view.
+	getter := s.nodeGetterFor(ctx)
 	// Barrel re-export resolve-through: a public import path that names a
 	// forwarded binding (`src/middleware.ts::persist`) may have no node of its
 	// own (an unresolved / over-cap / wildcard barrel) — map it to the
@@ -2720,12 +3000,19 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// structural flavor (the enclosing owner type for a type flavor; the
 	// FROM node's own ui_component for `component`). Orphan nodes left
 	// with no incident edge are pruned.
-	s.filterUsagesByFlavor(sg, id, strings.TrimSpace(req.GetString("flavor", "")))
+	filterUsagesByFlavor(getter, sg, id, strings.TrimSpace(req.GetString("flavor", "")))
 	if len(sg.Edges) == 0 && sg.TierFiltered == nil {
 		// A tier_filtered emptiness is not "no usages" — FilterByMinTier
 		// already recorded why. Only reach for the extraction-gap / unused
 		// classification when the emptiness was NOT caused by min_tier.
-		sg.Caveat = graph.CaveatForZeroEdge(s.graph, id)
+		// A node the request's view resolved (an overlay-served symbol
+		// among them) is never a mistyped id. Classification reads the
+		// same request-scoped view the query ran on, never the base graph.
+		if node != nil {
+			sg.Caveat = graph.CaveatForZeroEdgeResolved(s.readerFor(ctx), id)
+		} else {
+			sg.Caveat = graph.CaveatForZeroEdge(s.readerFor(ctx), id)
+		}
 	} else if len(sg.Edges) > 0 && graph.WeakUsageEvidenceOnly(sg.Edges) {
 		// Populated, but every usage is a bare-name match — the shape a
 		// common symbol name produces. Left uncaveated this reads as proof
@@ -2737,11 +3024,15 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// tell at a glance whether the usage list already covers tests instead
 	// of re-grepping *_test.go files. Rides every wire format below; nil
 	// for an empty result (the Caveat above covers that case).
-	sg.UsageSummary = usageSummaryOf(sg)
+	sg.UsageSummary = query.UsageSummaryOf(sg, getter)
 	// Proactive discovery cue: when the target is dispatch-heavy, point at
 	// find_implementations (once per session). Additive — the only response
 	// content the diet adds.
 	s.attachRelatedToolsCue(ctx, sg, id)
+	// Row cap last, after every filter and after the completeness rollup —
+	// the summary stays a statement about the whole usage set while the
+	// page below it is bounded. limit:0 opts out, mirroring max_bytes.
+	truncateUsageRows(sg, req.GetInt("limit", 50), id)
 	// group_by:"file" buckets the usages by the file each reference
 	// originates in -- an opt-in shape for callers that want a
 	// per-file rollup. The flat SubGraph stays the default so
@@ -2749,8 +3040,10 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	if gb := strings.ToLower(strings.TrimSpace(req.GetString("group_by", ""))); gb == "file" {
 		return s.respondScopedJSONOrTOON(ctx, req, groupUsagesByFile(sg), resolved)
 	}
-	if s.isGCX(ctx, req) {
-		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, s.graph))
+	// compact is an explicit caller choice, so it beats the session's
+	// gcx default — the same precedence returnSubGraph applies.
+	if s.isGCX(ctx, req) && !isCompact(req) {
+		res, err := s.gcxResponseWithBudget(req)(encodeFindUsages(sg, getter))
 		return withScopeResult(res, err, resolved)
 	}
 	// Plain JSON gets curated usage rows that promote the resolved
@@ -2760,7 +3053,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	format := req.GetString("format", "")
 	if !s.isTOON(ctx, req) && !isCompact(req) && format != "mermaid" && format != "dot" {
 		sg.Nodes = s.withAbsPaths(sg.Nodes)
-		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, s.graph), resolved)
+		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, getter), resolved)
 	}
 	return s.returnScopedSubGraph(ctx, req, sg, resolved)
 }
@@ -2853,7 +3146,7 @@ func (s *Server) suppressionMayBeStale(id string) bool {
 
 // newUsageResponse resolves the from_* fields for each node (pure read
 // — never mutates the graph) and wraps the SubGraph for JSON output.
-func newUsageResponse(sg *query.SubGraph, g graph.Store) *usageResponse {
+func newUsageResponse(sg *query.SubGraph, g graph.NodeGetter) *usageResponse {
 	wrapped := make([]usageNode, 0, len(sg.Nodes))
 	for _, n := range sg.Nodes {
 		tf, uc := usageFromFlavor(g, n.ID, n)
@@ -2926,7 +3219,7 @@ func annotateAndFilterReturnUsage(sg *query.SubGraph, usageFilter string) {
 // node's enclosing owner type, because callers are functions / methods
 // that never carry type_flavor themselves. Nil-safe: a FROM node absent
 // from both the supplied lookup and the graph yields empty strings.
-func usageFromFlavor(g graph.Store, fromID string, fromNode *graph.Node) (typeFlavor, uiComponent string) {
+func usageFromFlavor(g graph.NodeGetter, fromID string, fromNode *graph.Node) (typeFlavor, uiComponent string) {
 	if fromNode == nil && g != nil {
 		fromNode = g.GetNode(fromID)
 	}
@@ -2952,7 +3245,7 @@ func usageFromFlavor(g graph.Store, fromID string, fromNode *graph.Node) (typeFl
 // resolve to a matching structural flavor, then prunes nodes left with
 // no incident edge (the queried target is always kept). An empty flavor
 // argument is a no-op.
-func (s *Server) filterUsagesByFlavor(sg *query.SubGraph, targetID, flavorArg string) {
+func filterUsagesByFlavor(g graph.NodeGetter, sg *query.SubGraph, targetID, flavorArg string) {
 	flavors := splitFlavors(flavorArg)
 	if sg == nil || len(flavors) == 0 {
 		return
@@ -2963,7 +3256,7 @@ func (s *Server) filterUsagesByFlavor(sg *query.SubGraph, targetID, flavorArg st
 	}
 	kept := sg.Edges[:0]
 	for _, e := range sg.Edges {
-		tf, uc := usageFromFlavor(s.graph, e.From, nodeByID[e.From])
+		tf, uc := usageFromFlavor(g, e.From, nodeByID[e.From])
 		if flavorMatchesResolved(tf, uc, flavors) {
 			kept = append(kept, e)
 		}
@@ -2985,25 +3278,6 @@ func (s *Server) filterUsagesByFlavor(sg *query.SubGraph, targetID, flavorArg st
 	sg.Nodes = keptNodes
 }
 
-// usageFileGroup is one file's worth of references from a
-// group_by:"file" find_usages response.
-type usageFileGroup struct {
-	File  string           `json:"file"`
-	Count int              `json:"count"`
-	Uses  []usageGroupItem `json:"uses"`
-}
-
-// usageGroupItem is one reference inside a usageFileGroup -- the
-// line it sits on plus the enclosing symbol.
-type usageGroupItem struct {
-	Line        int    `json:"line"`
-	EdgeKind    string `json:"edge_kind"`
-	Context     string `json:"context,omitempty"`
-	ReturnUsage string `json:"return_usage,omitempty"`
-	SymbolID    string `json:"symbol_id,omitempty"`
-	SymbolName  string `json:"symbol_name,omitempty"`
-}
-
 // groupUsagesByFile buckets a find_usages SubGraph by the file each
 // reference originates in. The `from` endpoint of every edge is the
 // usage site; its file path is the bucket key and the from-node's
@@ -3014,7 +3288,7 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 	for _, n := range sg.Nodes {
 		nodeByID[n.ID] = n
 	}
-	groups := map[string]*usageFileGroup{}
+	groups := map[string]*query.UsageFileGroup{}
 	for _, e := range sg.Edges {
 		from := nodeByID[e.From]
 		file := e.FilePath
@@ -3026,10 +3300,10 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 		}
 		g := groups[file]
 		if g == nil {
-			g = &usageFileGroup{File: file}
+			g = &query.UsageFileGroup{File: file}
 			groups[file] = g
 		}
-		item := usageGroupItem{Line: e.Line, EdgeKind: string(e.Kind), Context: e.Context, ReturnUsage: e.ReturnUsage}
+		item := query.UsageGroupItem{Line: e.Line, EdgeKind: string(e.Kind), Context: e.Context, ReturnUsage: e.ReturnUsage}
 		if from != nil {
 			item.SymbolID = from.ID
 			item.SymbolName = from.Name
@@ -3037,7 +3311,7 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 		g.Uses = append(g.Uses, item)
 		g.Count++
 	}
-	out := make([]*usageFileGroup, 0, len(groups))
+	out := make([]*query.UsageFileGroup, 0, len(groups))
 	for _, g := range groups {
 		out = append(out, g)
 	}
@@ -3047,52 +3321,50 @@ func groupUsagesByFile(sg *query.SubGraph) map[string]any {
 		}
 		return out[i].File < out[j].File
 	})
-	return map[string]any{
+	grouped := map[string]any{
 		"grouped_by": "file",
 		"file_count": len(out),
 		"total_uses": len(sg.Edges),
 		"groups":     out,
 		"truncated":  sg.Truncated,
 	}
+	// On a capped page total_uses counts only the rows below; carry the
+	// full row count alongside so the cut stays legible in this shape too.
+	if sg.Truncated {
+		grouped["total_edges"] = sg.TotalEdges
+	}
+	return grouped
 }
 
-// usageSummaryOf computes the compact completeness rollup attached to a
-// find_usages response: the total reference count, the number of
-// distinct files those references live in, and how many originate in
-// test files. It reuses the exact per-node test classification
-// (nodeIsTest — the from_is_test column) and file resolution as the
-// per-usage rows, so the rollup never disagrees with the edges it
-// summarizes. Returns nil for an empty result — the zero-edge Caveat
-// already explains that case, and an all-zero summary would be noise.
-func usageSummaryOf(sg *query.SubGraph) *query.UsageSummary {
-	if sg == nil || len(sg.Edges) == 0 {
-		return nil
+// truncateUsageRows enforces find_usages' advertised `limit` on the
+// usage rows (edges). Totals keep the full post-filter counts and
+// Truncated marks the cut, so a capped page is legible as partial
+// rather than complete. Nodes no longer referenced by a surviving edge
+// are pruned; the queried target always stays. A non-positive limit
+// opts out of the cap.
+func truncateUsageRows(sg *query.SubGraph, limit int, targetID string) {
+	if sg == nil || limit <= 0 || len(sg.Edges) <= limit {
+		return
 	}
-	nodeByID := make(map[string]*graph.Node, len(sg.Nodes))
-	for _, n := range sg.Nodes {
-		nodeByID[n.ID] = n
-	}
-	files := make(map[string]struct{}, len(sg.Edges))
-	testRefs := 0
+	sg.TotalEdges = len(sg.Edges)
+	sg.TotalNodes = len(sg.Nodes)
+	// One stable global order before the cut, so the kept subset is the
+	// strongest evidence and identical across store backends.
+	query.SortEdgesForPage(sg.Edges)
+	sg.Edges = sg.Edges[:limit]
+	referenced := map[string]struct{}{targetID: {}}
 	for _, e := range sg.Edges {
-		from := nodeByID[e.From]
-		file := e.FilePath
-		if file == "" && from != nil {
-			file = from.FilePath
-		}
-		if file == "" {
-			file = "(unknown)"
-		}
-		files[file] = struct{}{}
-		if nodeIsTest(from) {
-			testRefs++
+		referenced[e.From] = struct{}{}
+		referenced[e.To] = struct{}{}
+	}
+	nodes := make([]*graph.Node, 0, len(referenced))
+	for _, n := range sg.Nodes {
+		if _, ok := referenced[n.ID]; ok {
+			nodes = append(nodes, n)
 		}
 	}
-	return &query.UsageSummary{
-		NRefs:     len(sg.Edges),
-		NFiles:    len(files),
-		NTestRefs: testRefs,
-	}
+	sg.Nodes = nodes
+	sg.Truncated = true
 }
 
 func (s *Server) handleGetCluster(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

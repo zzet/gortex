@@ -96,6 +96,7 @@ var defaultToolScopes = map[string]ToolScope{
 	"edit_symbol":     ScopeRepo,
 	"edit_file":       ScopeRepo,
 	"write_file":      ScopeRepo,
+	"mutation_status": ScopeRepo,
 	"rename_symbol":   ScopeRepo,
 	"scaffold":        ScopeRepo,
 	"suggest_pattern": ScopeRepo,

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
@@ -77,7 +77,7 @@ func (s *Server) registerCodingTools() {
 
 	s.addTool(
 		mcp.NewTool("batch_symbols",
-			mcp.WithDescription("Returns signatures, source code, callers, and callees for multiple symbols in one call. Use instead of calling get_symbol_source or get_symbol multiple times — saves 60% round-trip overhead."),
+			mcp.WithDescription("Returns signatures, source code, and a capped 1-hop callers/callees sample for multiple symbols in one call. `callers_truncated` / `callees_truncated` mark a cut; use get_callers / get_call_chain for the full neighbourhood. Use instead of calling get_symbol_source or get_symbol multiple times — saves 60% round-trip overhead."),
 			mcp.WithString("ids", mcp.Required(), mcp.Description("Comma-separated list of symbol IDs")),
 			mcp.WithBoolean("include_source", mcp.Description("Include source code for each symbol (default: false)")),
 			mcp.WithNumber("context_lines", mcp.Description("Extra lines above/below source (default: 3, only if include_source)")),
@@ -127,6 +127,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("dry_run", mcp.Description("Validate the edit and return a unified-diff preview without writing (status: would_apply). Use to review the change before committing it.")),
 			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
 			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
+			mcp.WithString("mutation_id", mcp.Description(mutationIDParamDescription)),
 		),
 		s.handleEditSymbol,
 	)
@@ -145,6 +146,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithString("fidelity_globs", mcp.Description(fidelityGlobsParamDescription)),
 			mcp.WithNumber("max_lines", mcp.Description("When the file exceeds this many lines, collapse runs of leaf statements inside function bodies into `… N lines elided …` markers while keeping declarations and the control-flow skeleton. Falls back to a plain head cut for non-code files. Omit or 0 to disable.")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation flag rides on the response. Omit for no cap.")),
+			mcp.WithNumber("max_chars", mcp.Description("Cap the returned content at this many encoded bytes, cut at a valid UTF-8 boundary; a truncation note rides on the response. Omit or 0 to disable.")),
 			mcp.WithString("if_none_match", mcp.Description("ETag from a previous response — returns not_modified if content unchanged")),
 		),
 		s.handleReadFile,
@@ -163,6 +165,7 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default an edit that would introduce new tree-sitter parse errors (leaving the file more syntactically broken than before) is refused before the atomic write; set true to write anyway.")),
 			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
 			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
+			mcp.WithString("mutation_id", mcp.Description(mutationIDParamDescription)),
 		),
 		s.handleEditFile,
 	)
@@ -177,8 +180,19 @@ func (s *Server) registerCodingTools() {
 			mcp.WithBoolean("allow_parse_errors", mcp.Description("Bypass the pre-write parse gate. By default a write that would introduce new tree-sitter parse errors (relative to the prior content, or any error in a brand-new file) is refused before the atomic write; set true to write anyway.")),
 			mcp.WithBoolean("physical_evidence", mcp.Description(mutationEvidenceParamDescription)),
 			mcp.WithString("digest", mcp.Description(evidenceDigestParamDescription)),
+			mcp.WithString("mutation_id", mcp.Description(mutationIDParamDescription)),
 		),
 		s.handleWriteFile,
+	)
+
+	s.addTool(
+		mcp.NewTool("mutation_status",
+			mcp.WithDescription("Reports what a file mutation actually did, after the fact. Use it when an edit_file / write_file / edit_symbol call was abandoned at its deadline (\"the work may still complete in the background\"): instead of retrying blindly, ask here. Returns disk_status (committed / not_applied / failed / in_flight) separately from graph_status (fresh / pending / stale / failed), because the bytes reaching disk and the graph catching up are different questions. disk_status=committed means the edit is already applied — re-applying it by any route would duplicate it. Select a record by receipt, by mutation_id, or by path; with no argument it lists the most recent mutations. Receipts are retained for 30 minutes."),
+			mcp.WithString("receipt", mcp.Description("Mutation receipt id from an edit response (`mutation_receipt`) or from the `mutation_commit=` block on an abandoned-call error.")),
+			mcp.WithString("mutation_id", mcp.Description("Caller-chosen idempotency key passed to the original edit.")),
+			mcp.WithString("path", mcp.Description("File path — returns the most recent mutation recorded for it. Use when the response was lost entirely and no receipt id was ever seen.")),
+		),
+		s.handleMutationStatus,
 	)
 
 	s.addTool(
@@ -332,6 +346,17 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	fp, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
+	}
+	// Admission before any work: a fidelity_globs value that breaks a size
+	// bound refuses the request. Dropping the offending rule would rewrite
+	// a first-match policy silently — an over-budget `omit` disappearing
+	// lets a later `full` win, and the content the caller asked to hide
+	// comes back in a response that looks like a normal success. Parsed
+	// here rather than at the point of use so a malformed request cannot
+	// be served by a path that happens not to reach the compressor.
+	fidelityRules, fidelityErr := parseFidelityGlobs(req.GetString("fidelity_globs", ""))
+	if fidelityErr != nil {
+		return mcp.NewToolResultError("get_editing_context: " + fidelityErr.Error()), nil
 	}
 	// Normalise to the graph's stored path form so a repo-relative path
 	// (internal/x.go) doesn't miss the repo-prefixed nodes in multi-repo
@@ -548,7 +573,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 				keepNodes := s.editingContextSymbolNodes(fp, out.Defines)
 				keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), keepNodes)
 				keptSymbols = resolved
-				decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), fp)
+				decide := fidelityDecideForPath(fidelityRules, fp)
 				if compressed, cerr := elide.CompressWith(fileBytes, language, elide.Options{Keep: keepPred, Decide: decide}); cerr == nil {
 					sourceCompressed = string(compressed)
 				}
@@ -968,7 +993,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	// response). Aggregated stats remain available via the `savings` tool.
 	returned := tokens.CachedCountInt64(source)
 	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-	s.tokenStatsFor(ctx).record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
+	symStats := s.tokenStatsFor(ctx)
+	symStats.creditFile(absPath)
+	symStats.record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
 
 	result := map[string]any{
 		"id":         node.ID,
@@ -1211,6 +1238,11 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 			if len(callerIDs) > 0 {
 				entry["callers"] = callerIDs
 			}
+			// Stamp the cut. Do not emit a total: TotalNodes is the
+			// capped subgraph (seed+9), not the neighbourhood.
+			if callers.Truncated {
+				entry["callers_truncated"] = true
+			}
 
 			// Callees (depth 1).
 			callees := s.engineFor(ctx).GetCallChain(node.ID, query.QueryOptions{Depth: 1, Limit: 10, Detail: "brief", WorkspaceID: sessWS})
@@ -1223,6 +1255,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 			if len(calleeIDs) > 0 {
 				entry["callees"] = calleeIDs
 			}
+			if callees.Truncated {
+				entry["callees_truncated"] = true
+			}
 		}
 
 		// Source code (optional).
@@ -1233,7 +1268,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 					entry["from_line"] = fromLine
 					returned := tokens.CachedCountInt64(source)
 					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					s.tokenStatsFor(ctx).record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
+					batchStats := s.tokenStatsFor(ctx)
+					batchStats.creditFile(absPath)
+					batchStats.record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
 				}
 			}
 		}
@@ -2135,7 +2172,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 					sourcesEmbedded++
 					returned := tokens.CachedCountInt64(source)
 					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					s.tokenStatsFor(ctx).record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
+					ctxStats := s.tokenStatsFor(ctx)
+					ctxStats.creditFile(absPath)
+					ctxStats.record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
 				}
 			}
 		}
@@ -2824,6 +2863,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if evidenceRequested && dryRun {
 		return mcp.NewToolResultError(errEvidenceDryRun), nil
 	}
+	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
 	if oldSource == newSource {
 		return mcp.NewToolResultError("old_source and new_source are identical"), nil
@@ -2848,6 +2888,17 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
 	defer releaseMutation()
+
+	// Replay under the path lock, before the snapshot read: once the edit has
+	// landed old_source no longer matches, so an un-replayed retry would be
+	// refused rather than answered with the original result.
+	fingerprint := mutationFingerprint("edit_symbol", id, absPath, oldSource, newSource)
+	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+		if conflict != "" {
+			return mcp.NewToolResultError(conflict), nil
+		}
+		return s.respondJSONOrTOON(ctx, req, replay)
+	}
 
 	// Read the entire file ONCE — both the drift check and the
 	// patch operate on the same byte snapshot so a concurrent
@@ -2989,14 +3040,19 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if info, statErr := os.Stat(absPath); statErr == nil {
 		perm = info.Mode().Perm()
 	}
-	if err := agents.AtomicWriteFile(absPath, newContentBytes, perm); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", err)), nil
+	commit, writeErr := s.commitFileMutation(ctx, "edit_symbol", mutationID, fingerprint, node.FilePath, absPath, newContentBytes, perm)
+	if writeErr != nil {
+		if errors.Is(writeErr, errMutationNotApplied) {
+			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 	sess := s.sessionFor(ctx)
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)
 
 	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	commit.recordGraph(reindexOutcome)
 
 	// Count lines changed.
 	oldLines := strings.Count(oldSource, "\n") + 1
@@ -3021,6 +3077,10 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
 	}
+	attachMutationCommit(resp, commit)
+	// Retained last so a replayed retry returns the complete original payload,
+	// physical evidence included.
+	commit.retainResponse(resp)
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 

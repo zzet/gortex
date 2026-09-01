@@ -26,6 +26,14 @@ import (
 const (
 	HeaderSessionID       = "Mcp-Session-Id"
 	HeaderProtocolVersion = "Mcp-Protocol-Version"
+
+	// HeaderSessionIdleTTL advertises the session idle horizon in
+	// whole seconds. Not spec-defined (the spec leaves session
+	// lifetime to the server), but without it a client's first
+	// knowledge of the TTL is the 404/-32001 after its session
+	// already expired. Any request on a session resets the clock, so
+	// a client that keeps calls at least this frequent never expires.
+	HeaderSessionIdleTTL = "Mcp-Session-Idle-Ttl"
 )
 
 // DefaultProtocolVersion is what the transport advertises in
@@ -103,9 +111,13 @@ type Config struct {
 	// falls back to DefaultProtocolVersion.
 	ProtocolVersion string
 
-	// SessionTTL, when non-zero, sets the keep-alive horizon for
-	// the in-memory store the transport falls back to when Store
-	// is left nil. Has no effect when Store is explicitly supplied.
+	// SessionTTL, when non-zero, is the session idle horizon the
+	// transport advertises to clients (HeaderSessionIdleTTL on every
+	// POST response, plus `_meta` on the initialize result) and the TTL of
+	// the in-memory store the transport falls back to when Store is
+	// left nil. A caller supplying its own Store should pass that
+	// store's actual TTL here so the advertisement stays truthful;
+	// zero advertises nothing.
 	SessionTTL time.Duration
 
 	// MaxRequestBytes caps the inbound JSON-RPC body. Zero falls
@@ -142,6 +154,7 @@ type Transport struct {
 	allowedOrigins  map[string]struct{}
 	protocolVersion string
 	maxRequestBytes int64
+	sessionTTL      time.Duration
 	initializeHook  InitializeHook
 
 	streamsMu sync.Mutex
@@ -151,19 +164,19 @@ type Transport struct {
 // New builds a Transport from its Config. Panics when Dispatcher is
 // nil — that's a programmer error caught at startup, not an
 // operational failure to log and continue past. Store may be left
-// nil, in which case a process-local MemoryStore with a 30-minute TTL
-// is allocated.
+// nil, in which case a process-local MemoryStore is allocated with
+// the TTL resolved by SessionIdleTTLFromEnv(cfg.SessionTTL).
 func New(cfg Config) *Transport {
 	if cfg.Dispatcher == nil {
 		panic("streamable: Config.Dispatcher is nil")
 	}
 	store := cfg.Store
+	sessionTTL := cfg.SessionTTL
 	if store == nil {
-		ttl := cfg.SessionTTL
-		if ttl <= 0 {
-			ttl = 30 * time.Minute
-		}
-		store = NewMemoryStore(ttl)
+		// The fallback store owns its TTL, so the resolved value is
+		// also the one to advertise.
+		sessionTTL = SessionIdleTTLFromEnv(cfg.SessionTTL)
+		store = NewMemoryStore(sessionTTL)
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -193,6 +206,7 @@ func New(cfg Config) *Transport {
 		allowedOrigins:  allowed,
 		protocolVersion: version,
 		maxRequestBytes: maxBytes,
+		sessionTTL:      sessionTTL,
 		initializeHook:  cfg.InitializeHook,
 		streams:         make(map[string]*serverStream),
 	}
@@ -243,6 +257,57 @@ func (t *Transport) originAllowed(r *http.Request) bool {
 	return ok
 }
 
+// injectSessionTTLMeta stamps the session idle TTL into an initialize
+// result's `_meta` (key "gortex/session_idle_ttl_seconds") so typed
+// MCP clients — which never see response headers — can schedule
+// keep-alives under the horizon. Surgery is RawMessage-scoped: every
+// byte the transport did not add round-trips verbatim. Any parse
+// hiccup returns the reply unchanged — advertising is best-effort and
+// initialize must not fail over it.
+func (t *Transport) injectSessionTTLMeta(reply []byte) []byte {
+	if t.sessionTTL <= 0 || len(reply) == 0 {
+		return reply
+	}
+	var frame map[string]json.RawMessage
+	if err := json.Unmarshal(reply, &frame); err != nil {
+		return reply
+	}
+	resRaw, ok := frame["result"]
+	if !ok {
+		return reply // error reply — nothing to advertise
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(resRaw, &result); err != nil {
+		return reply
+	}
+	meta := map[string]json.RawMessage{}
+	if raw, ok := result["_meta"]; ok {
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return reply
+		}
+	}
+	seconds, err := json.Marshal(int64(t.sessionTTL / time.Second))
+	if err != nil {
+		return reply
+	}
+	meta["gortex/session_idle_ttl_seconds"] = seconds
+	metaRaw, err := json.Marshal(meta)
+	if err != nil {
+		return reply
+	}
+	result["_meta"] = metaRaw
+	resultRaw, err := json.Marshal(result)
+	if err != nil {
+		return reply
+	}
+	frame["result"] = resultRaw
+	out, err := json.Marshal(frame)
+	if err != nil {
+		return reply
+	}
+	return out
+}
+
 // handlePost is the workhorse: parses one or more JSON-RPC frames
 // from the body, resolves or mints a session, dispatches each frame
 // through the configured Dispatcher (or the multi-server Router), and
@@ -280,6 +345,13 @@ func (t *Transport) handlePost(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderProtocolVersion, clientVersion)
 	} else {
 		w.Header().Set(HeaderProtocolVersion, t.protocolVersion)
+	}
+	// Same up-front treatment for the idle horizon: every response —
+	// including the expiry 404 itself — tells the client how long an
+	// idle session lives, so late-attaching clients still learn it.
+	if t.sessionTTL > 0 {
+		w.Header().Set(HeaderSessionIdleTTL,
+			strconv.FormatInt(int64(t.sessionTTL/time.Second), 10))
 	}
 
 	// Resolve the session once for the whole request — every frame
@@ -378,8 +450,13 @@ func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, frame []
 		// Fall through to local dispatch — the initialize
 		// response is what tells the client the server's
 		// capabilities, and the underlying mcp-go server owns
-		// that payload.
-		return t.localDispatch(r, *state, frame)
+		// that payload. The transport adds the one fact only it
+		// knows: the session idle TTL.
+		reply, status, err := t.localDispatch(r, *state, frame)
+		if err == nil {
+			reply = t.injectSessionTTLMeta(reply)
+		}
+		return reply, status, err
 
 	case "notifications/initialized":
 		if state.ID != "" {
@@ -474,16 +551,36 @@ func (t *Transport) tryRouteToolCall(r *http.Request, state SessionState, frame 
 	// the local executor's nested-arguments unmarshal path (see
 	// cmd/gortex/server_router.go newLocalToolExecutor) finds them.
 	// This matches cmd/gortex/daemon_mcp.go:tryProxyToolCall exactly.
+	// A missing `arguments` key AND an explicit JSON `null` both mean
+	// "no arguments" at the MCP layer (params.arguments is optional);
+	// normalize both to `{}` so the executor's "arguments must be an
+	// object when present" check (added for reviewer concern #2) never
+	// rejects a legitimate no-arg call.
 	rawArgs := envelope.Params.Arguments
-	if len(rawArgs) == 0 {
+	if len(rawArgs) == 0 || strings.TrimSpace(string(rawArgs)) == "null" {
 		rawArgs = json.RawMessage(`{}`)
 	}
 	body, err := json.Marshal(map[string]json.RawMessage{"arguments": rawArgs})
 	if err != nil {
 		return nil, 0, false
 	}
+	// Attach the session id AND cwd to ctx before the routing decision —
+	// the local-fast path (Decide -> RouteToolCall -> callLocal ->
+	// newLocalToolExecutor) threads this ctx straight into the
+	// session-policy gate and the handler itself. Session id alone
+	// isn't enough: localDispatch below (and the daemon dispatcher's
+	// tryProxyToolCall) also attach WithSessionCWD, because handlers
+	// use it as a workspace boundary — without it, a session in
+	// workspace A could see workspace B's nodes on this routed path.
+	ctx := r.Context()
+	if state.ID != "" {
+		ctx = gortexmcp.WithSessionID(ctx, state.ID)
+	}
+	if cwd != "" {
+		ctx = gortexmcp.WithSessionCWD(ctx, cwd)
+	}
 	decision := daemon.NewProxyDecision(func() *daemon.Router { return t.router })
-	outcome := decision.Decide(r.Context(), daemon.RouteInputs{
+	outcome := decision.Decide(ctx, daemon.RouteInputs{
 		ToolName: envelope.Params.Name,
 		Body:     body,
 		Cwd:      cwd,

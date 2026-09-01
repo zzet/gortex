@@ -158,11 +158,13 @@ func Scan(source []byte) Marker {
 //
 // The returned edge slice is appended by the caller; the file node
 // has meta.generated stamped by the caller using the returned Marker.
+// filePath's spelling is preserved verbatim — the edge endpoint must
+// match the extractor's file-node ID spelling (OS-native separators
+// on Windows) or the edge dangles.
 func BuildGraphArtifacts(filePath string, marker Marker) []*graph.Edge {
 	if !marker.Generated {
 		return nil
 	}
-	filePath = filepath.ToSlash(filePath)
 	target := generatorNodeID(marker)
 	return []*graph.Edge{{
 		From:     filePath,

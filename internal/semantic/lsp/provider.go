@@ -47,6 +47,18 @@ type Provider struct {
 	// router from config when the provider is spawned. An empty value means
 	// the demand-gated default; the GORTEX_LSP_SWEEP env override wins over it.
 	sweepMode string
+	// opensDocs reports whether the enrichment pass sends the
+	// textDocument/didOpen / didClose lifecycle before querying a file.
+	// Resolved at construction from OpenDocsEnv and the spec's NoDidOpen;
+	// true for every server that has not opted out. See ServerSpec.NoDidOpen
+	// for why a barrier-scheduling server wants this off.
+	opensDocs bool
+	// noHeavyRequests disables the textDocument/references and
+	// callHierarchy/incomingCalls legs of the enrichment pass. Set from
+	// ServerSpec.NoHeavyRequests for servers whose FindReferences machinery
+	// leaks per request (csharp-ls); ambiguous edges are confirmed through
+	// the definition pass at their call sites instead.
+	noHeavyRequests bool
 	// spec is the ServerSpec this provider was built from (when the
 	// caller used NewProviderFromSpec). nil for legacy NewProvider
 	// invocations — those fall back to single-language routing.
@@ -207,6 +219,8 @@ func NewProvider(command string, args []string, languages []string, daemon bool,
 		languages:        languages,
 		daemon:           daemon,
 		maxParallel:      maxParallel,
+		opensDocs:        resolveOpensDocs("", nil),
+		noHeavyRequests:  resolveNoHeavyRequests(nil),
 		logger:           logger,
 		docVersions:      map[string]int{},
 		openDocs:         map[string]bool{},
@@ -216,6 +230,32 @@ func NewProvider(command string, args []string, languages []string, daemon bool,
 		dialBackoffStart: dialBackoffStart,
 		maxDialBackoff:   maxDialBackoff,
 	}
+}
+
+// MaxParallelEnv overrides every spawned server's concurrent-request cap,
+// winning over the spec default — the same operator-experiment shape as
+// GORTEX_LSP_SWEEP. The probe-measured levers differ per machine (a server
+// that multiplexes well takes a higher cap than its conservative spec
+// default), so the knob lets an operator try a value for one run without
+// editing the registry. Zero, negative, or unparseable values are ignored.
+const MaxParallelEnv = "GORTEX_LSP_MAX_PARALLEL"
+
+// resolveMaxParallel picks the effective concurrent-request cap by the
+// sweep-mode precedence: the GORTEX_LSP_MAX_PARALLEL env override wins
+// over the operator-configured value (`semantic.lsp_max_parallel`), which
+// wins over the spec default; 10 is the package fallback. Non-positive or
+// unparseable values at any level fall through to the next.
+func resolveMaxParallel(configured, specDefault int) int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(MaxParallelEnv))); err == nil && v > 0 {
+		return v
+	}
+	if configured > 0 {
+		return configured
+	}
+	if specDefault > 0 {
+		return specDefault
+	}
+	return 10
 }
 
 // NewProviderFromSpec builds a Provider directly from a ServerSpec.
@@ -238,10 +278,7 @@ func NewProviderFromSpec(spec *ServerSpec, logger *zap.Logger) *Provider {
 			}
 		}
 	}
-	maxParallel := spec.MaxParallel
-	if maxParallel <= 0 {
-		maxParallel = 10
-	}
+	maxParallel := resolveMaxParallel(0, spec.MaxParallel)
 	p := &Provider{
 		command:            cmd,
 		args:               args,
@@ -249,6 +286,8 @@ func NewProviderFromSpec(spec *ServerSpec, logger *zap.Logger) *Provider {
 		languages:          spec.Languages,
 		daemon:             spec.Daemon,
 		maxParallel:        maxParallel,
+		opensDocs:          resolveOpensDocs("", spec),
+		noHeavyRequests:    resolveNoHeavyRequests(spec),
 		logger:             logger,
 		spec:               spec,
 		docVersions:        map[string]int{},
@@ -330,21 +369,6 @@ func enrichNodeHasUnresolvedDemandFromView(view *lspGraphView, n *graph.Node) bo
 	return view.hasUnresolvedDemand(n)
 }
 
-// enrichNodeIsDispatchRelevant reports whether a declaration's super/subtype
-// hierarchy the per-file sweep must interrogate: a type or interface whose
-// extends / supertype / subtype edges the AST extractor commonly misses (they
-// are cross-file or resolved dynamically). Such declarations never contribute
-// unresolved-call demand — enrichNodeHasUnresolvedDemand only counts callables —
-// so a file whose only enrichable work is a type hierarchy would score zero
-// demand and be skipped under the demand default. Marking it dispatch-relevant
-// keeps that file in the sweep so its hierarchy edges are still recovered.
-func enrichNodeIsDispatchRelevant(n *graph.Node) bool {
-	if n == nil {
-		return false
-	}
-	return n.Kind == graph.KindType || n.Kind == graph.KindInterface
-}
-
 // enrichCallableIsDispatchRelevant reports whether a function or method takes
 // part in dynamic dispatch, so its incoming callers name concrete targets the
 // outgoing side of the sweep cannot reach. Every intra-repo static call is
@@ -381,6 +405,58 @@ func enrichCallableIsDispatchRelevant(g graph.Store, n *graph.Node) bool {
 
 func enrichCallableIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node) bool {
 	return view.callableIsDispatchRelevant(n)
+}
+
+// enrichTypeIsDispatchRelevantFromView is the type half of the per-file sweep
+// gate: an interface, or a class involved in a super/subtype hierarchy — see
+// lspGraphView.typeIsDispatchRelevant. Such declarations never contribute
+// unresolved-call demand (demand only counts callables), so a file whose only
+// enrichable work is a type hierarchy would score zero demand and be skipped
+// under the demand default; this signal keeps exactly those files in while a
+// bare data type no longer admits its whole file. hierarchyEvidence is the
+// per-language self-tuning switch computed by
+// enrichLanguageHasHierarchyEvidence: without it the strict check would be
+// circular and the gate stays permissive.
+func enrichTypeIsDispatchRelevantFromView(view *lspGraphView, n *graph.Node, hierarchyEvidence bool) bool {
+	return view.typeIsDispatchRelevant(n, hierarchyEvidence)
+}
+
+// enrichLanguageHasHierarchyEvidence reports whether the language's edge set
+// carries at least one extends / implements edge some non-LSP lane produced —
+// the AST extractor, the tstypes supplemental lane, or resolver inference.
+// The strict type gate is meaningful only where such a lane exists: in
+// languages with none (c, cpp, objc, swift — no base-list extraction, no
+// tstypes lane) the sweep's typeHierarchy hop is the ONLY producer of
+// hierarchy edges, so requiring an existing edge for admission would demand
+// as input exactly what the sweep exists to produce, and a class-only file's
+// hierarchy would never be recovered. Edges the sweep itself MINTED
+// (lsp_resolved / lsp_dispatch, no provenance marker) are excluded: counting
+// the sweep's own output would flip such a language onto the strict gate one
+// run later and silently drop every class added after that. An LSP-origin
+// edge carrying meta confirmed_from_origin still counts: ConfirmEdge flips
+// the origin in place when the sweep agrees with a non-LSP lane's edge, and
+// without the preserved provenance every confirm would decay exactly the
+// evidence this probe depends on. One pass over the repo's projected edges,
+// attributed to a language via the source node — no per-language table.
+func enrichLanguageHasHierarchyEvidence(view *lspGraphView, repoEdges []*graph.Edge, languageMatches func(string) bool) bool {
+	for _, e := range repoEdges {
+		if e == nil || (e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeExtends) {
+			continue
+		}
+		if e.Origin == graph.OriginLSPResolved || e.Origin == graph.OriginLSPDispatch {
+			confirmed := false
+			if e.Meta != nil {
+				_, confirmed = e.Meta["confirmed_from_origin"]
+			}
+			if !confirmed {
+				continue
+			}
+		}
+		if from := view.nodesByID[e.From]; from != nil && languageMatches(from.Language) {
+			return true
+		}
+	}
+	return false
 }
 
 // nodeHasSemanticType reports whether a node already carries a non-empty
@@ -478,7 +554,14 @@ func edgeExistsAt(view *lspGraphView, from, to string, kind graph.EdgeKind, line
 // from disk by the caller (via the shared document session). A nil content
 // yields a no-verdict, matching the pre-session behaviour when the site
 // file could not be opened.
-func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, cache map[string]*graph.Node) (*graph.Node, bool) {
+//
+// breaker (nilable) observes each definition round trip: under the heavy
+// opt-out this pass carries the whole confirm load, so a server that
+// errors every request must trip the failure streak instead of grinding
+// through every sited target at one timeout each. Only transport results
+// feed it — a cache hit or an identifier miss never reaches the server,
+// and an answered-but-empty response counts as success.
+func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, breaker *phaseBreaker, cache map[string]*graph.Node) (*graph.Node, bool) {
 	if siteRel == "" || siteLine <= 0 || name == "" {
 		return nil, false
 	}
@@ -493,6 +576,9 @@ func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot,
 		return nil, false
 	}
 	locs, err := p.FindDefinition(absRoot, siteRel, siteLine-1, col, lspCallTimeout())
+	if breaker != nil {
+		breaker.observe(err == nil)
+	}
 	if err != nil || len(locs) == 0 {
 		return nil, false
 	}
@@ -503,6 +589,14 @@ func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot,
 		return nil, true
 	}
 	node := findDeclarationNode(view, scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
+	if node == nil {
+		// A definition can land on a member declaration INSIDE the target
+		// type — `new T(...)` answers the constructor's line, not the type's,
+		// and the ctor node carries its own name. A type declaration named
+		// exactly `name` whose span contains the answered line is the same
+		// verdict: the site binds to that type.
+		node = view.findEnclosingTypeNamed(scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
+	}
 	cache[key] = node
 	return node, true
 }
@@ -949,6 +1043,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	targetedBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "targeted", repoPrefix)
 	hoverBreaker := newPhaseBreaker(lspPhaseFailureStreakLimit(), p.logger, "hover", repoPrefix)
 
+	// Phase boundary timestamps: the completion log breaks the pass wall time
+	// out per phase (phase_*_ms) — an aggregate duration cannot say which pass
+	// owns the minutes when a run needs speed forensics.
+	setupDone := time.Now()
+
 	// Query implementations for interface nodes. A degraded pass skips this:
 	// the query opens each interface's file, and a database-less clangd cannot
 	// resolve implementations across translation units regardless. Graph
@@ -1024,6 +1123,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		interfaceMutations.apply(g, nil)
 		rmu.Unlock()
 	}
+	implsDone := time.Now()
 
 	// Query references for AMBIGUOUS edges to confirm/refute. Promotion
 	// to the lsp tier is identity-anchored: the server's evidence must
@@ -1040,14 +1140,33 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// so each file is opened once (per-goroutine, via enrichOpenDoc) and
 	// serves every target sharing it — turning the ~7 edges/s sequential
 	// round-trip loop into maxParallel-wide throughput. The definition-rebind
-	// fallback opens arbitrary call-site files, so it runs serially afterward
-	// over the targets the sweep left unconfirmed, keeping document open/close
-	// from overlapping across goroutines.
-	confirmGroups := p.groupConfirmTargets(view.nodesByID, targets, degradedSkipFile)
+	// fallback that follows fans out the same way over the targets the sweep
+	// left unconfirmed, grouped by call-site file — each site file is owned
+	// by exactly one goroutine, so document open/close never overlaps on the
+	// same document.
 	var confirmMu sync.Mutex
 	confirmPromotions := make(map[*graph.Edge]struct{})
 	var fallback []enrichTarget
-	{
+	if p.noHeavyRequests {
+		// This server leaks per references request (ServerSpec.NoHeavyRequests)
+		// — the reference sweep never runs. Every sited target goes straight
+		// to the definition pass below, which reaches the same confirm /
+		// rebind verdicts from the call site at position-request cost.
+		// Built from the raw target list, not confirmGroups: the grouping
+		// drops targets on referent-side conditions (no position, unserved
+		// referent file) that exist only because findReferences opens the
+		// REFERENT's file, and a misbound edge with an unusable stored
+		// target is exactly what the rebind arm is for. The definition pass
+		// applies its own call-site filters when it groups. Targets without
+		// a recorded site line are left at their heuristic tier: there is
+		// no site to ask definition at.
+		for _, t := range targets {
+			if t.edge.Line > 0 {
+				fallback = append(fallback, t)
+			}
+		}
+	} else {
+		confirmGroups := p.groupConfirmTargets(view.nodesByID, targets, degradedSkipFile)
 		sem := make(chan struct{}, p.maxParallel)
 		var wg sync.WaitGroup
 		for _, grp := range confirmGroups {
@@ -1143,107 +1262,147 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		mutations.apply(g, nil)
 		rmu.Unlock()
 	}
+	confirmDone := time.Now()
 
-	// Serial definition-rebind fallback: for a site the reference sweep did
-	// not tie to the edge's target, ask the server what the site actually
-	// resolves to (textDocument/definition at the site identifier). When the
-	// definition lands back on the target we confirm anyway (reference lists
-	// can be incomplete); when it names a DIFFERENT known declaration we
-	// rebind the edge to the correct target instead of leaving a
-	// misattribution behind. Runs after the parallel sweep so arbitrary
-	// call-site document opens never overlap across goroutines.
+	// Definition-rebind pass: for a site the reference sweep did not tie to
+	// the edge's target, ask the server what the site actually resolves to
+	// (textDocument/definition at the site identifier). When the definition
+	// lands back on the target we confirm anyway (reference lists can be
+	// incomplete); when it names a DIFFERENT known declaration we rebind the
+	// edge to the correct target instead of leaving a misattribution behind.
 	//
-	// Sites are ordered by their call-site file so one session acquire
-	// serves every site in a file — a caller with many misbound sites in
-	// one file is opened once, not once per site. Stable so sites keep
-	// their relative order within a file.
+	// Sites are grouped by their call-site file — one session acquire and
+	// one definition cache serve every site in the file — and the groups fan
+	// out across maxParallel. The serial loop this replaces existed to keep
+	// call-site document opens from overlapping across goroutines; for a
+	// heavy-opt-out server this pass carries the whole confirm load (tens of
+	// thousands of definitions on a large solution), and a position request
+	// needs no such serialization. Stable sort so sites keep their relative
+	// order within a file.
 	sort.SliceStable(fallback, func(i, j int) bool {
 		return edgeSiteRelPath(fallback[i].edge, repoPrefix, nodeRelPath(fallback[i].node)) <
 			edgeSiteRelPath(fallback[j].edge, repoPrefix, nodeRelPath(fallback[j].node))
 	})
-	defSiteCache := map[string]*graph.Node{}
-	var (
-		curSiteRel string
-		curContent []byte
-		relSite    func()
-		siteOpen   bool
-	)
-	releaseSite := func() {
-		if siteOpen {
-			relSite()
-			siteOpen = false
-		}
-		curContent = nil
+	type defSiteGroup struct {
+		rel     string
+		targets []enrichTarget
 	}
-	fallbackMutations := newLSPMutationBatch()
+	var defGroups []defSiteGroup
 	for _, t := range fallback {
-		if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
-			break
-		}
-		toNode := view.nodesByID[t.edge.To]
-		if toNode == nil {
-			continue
-		}
-		callerRel := nodeRelPath(t.node)
-		siteRel := edgeSiteRelPath(t.edge, repoPrefix, callerRel)
+		siteRel := edgeSiteRelPath(t.edge, repoPrefix, nodeRelPath(t.node))
 		if !p.servesFile(siteRel) {
 			continue // never open a call-site file this server can't compile
 		}
 		if degradedSkipFile != nil && degradedSkipFile(siteRel) {
 			continue // degraded mode: never open this call-site (e.g. a header)
 		}
-		// Hold one open document per run of same-file sites: acquire on the
-		// first site of a file, release when the file changes (and once more
-		// after the loop). A failed acquire yields nil content, which
-		// definitionNodeAtSite treats as a no-verdict — the same outcome the
-		// per-site openDocument failure produced before.
-		if siteRel != curSiteRel {
-			releaseSite()
-			curSiteRel = siteRel
-			content, release, err := session.acquire(p.client, filepath.Join(absRoot, siteRel))
-			if err == nil {
-				curContent = content
-				relSite = release
-				siteOpen = true
-			}
+		if len(defGroups) == 0 || defGroups[len(defGroups)-1].rel != siteRel {
+			defGroups = append(defGroups, defSiteGroup{rel: siteRel})
 		}
-		siteLine := t.edge.Line
-		cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, siteRel, siteLine, toNode.Name, curContent, defSiteCache)
-		switch {
-		case !ok || cand == nil:
-			// No verdict — leave the edge at its heuristic tier so
-			// min_tier filtering excludes it.
-		case cand.ID == toNode.ID:
-			rmu.Lock()
-			semantic.ConfirmEdge(t.edge, p.Name())
-			fallbackMutations.stagePersist(t.edge)
-			rmu.Unlock()
-			result.EdgesConfirmed++
-			// Both fallback arms are yield the productivity checkpoint must
-			// see: on a degraded pass this loop can be the ONLY source of
-			// progress, and without these the checkpoint reads a pass that
-			// settles thousands of edges here as zero-yield and cancels it.
-			usefulYield.Add(1)
-		case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
-			rmu.Lock()
-			// Mutate the full edge state before staging the set-oriented
-			// reindex so the backend persists the complete confirmed payload.
-			oldTo := t.edge.To
-			t.edge.To = cand.ID
-			semantic.ConfirmEdge(t.edge, p.Name())
-			t.edge.Meta["rebound_from"] = oldTo
-			fallbackMutations.stageReindex(view, t.edge, oldTo)
-			rmu.Unlock()
-			result.EdgesRebound++
-			usefulYield.Add(1)
-		}
+		defGroups[len(defGroups)-1].targets = append(defGroups[len(defGroups)-1].targets, t)
 	}
-	releaseSite()
-	if len(fallbackMutations.reindexes) > 0 || len(fallbackMutations.persists) > 0 {
+	fallbackMutations := newLSPMutationBatch()
+	{
+		sem := make(chan struct{}, p.maxParallel)
+		var wg sync.WaitGroup
+		for i := range defGroups {
+			if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(grp *defSiteGroup) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+				if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
+					return
+				}
+				// The file is unique to this group, so no two goroutines
+				// open it. A failed acquire yields nil content, which
+				// definitionNodeAtSite treats as a no-verdict — the same
+				// outcome the per-site openDocument failure produced before.
+				var content []byte
+				if c, release, err := session.acquire(p.client, filepath.Join(absRoot, grp.rel)); err == nil {
+					content = c
+					defer release()
+				}
+				// Cache keys carry the site file, so the cache is
+				// group-local by construction — no sharing to guard.
+				cache := map[string]*graph.Node{}
+				for _, t := range grp.targets {
+					if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
+						return
+					}
+					toNode := view.nodesByID[t.edge.To]
+					if toNode == nil {
+						continue
+					}
+					cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, grp.rel, t.edge.Line, toNode.Name, content, targetedBreaker, cache)
+					// The verdict switch reads the view's edge indexes
+					// (edgeExistsAt, the dispatch-member helpers) that the
+					// staged mutations also update, so the whole switch —
+					// counters included — runs under rmu. The expensive
+					// part, the definition round trip above, stays outside.
+					rmu.Lock()
+					switch {
+					case !ok || cand == nil:
+						// No verdict — leave the edge at its heuristic tier
+						// so min_tier filtering excludes it.
+					case cand.ID == toNode.ID:
+						// Yield feeds the productivity checkpoint: under the
+						// heavy opt-out this pass is the only confirm source
+						// until the hover phase, and without these the
+						// checkpoint reads a pass that settles thousands of
+						// edges here as zero-yield and cancels it.
+						semantic.ConfirmEdge(t.edge, p.Name())
+						fallbackMutations.stagePersist(t.edge)
+						result.EdgesConfirmed++
+						usefulYield.Add(1)
+					case view.declaredDispatchMember(cand) && view.implementsDeclaredMember(toNode, cand):
+						// The compiler answers the DECLARED member — the site's static
+						// receiver is the interface / abstract base, so the stored edge
+						// to one of its concrete impls is a devirtualization inference
+						// definition cannot vouch for. Add the compiler-proven edge to
+						// the declared member and leave the inference exactly as it was
+						// (not retargeted, not promoted): impl reachability flows
+						// through the declared member's dispatch fan-out, and the
+						// heuristic tier keeps the guess honestly labeled. A target
+						// UNRELATED to the declared member is not this case — that is a
+						// plain misbind and falls through to the rebind below.
+						if !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line) {
+							declared := newLSPResolvedEdge(t.edge.From, cand.ID, t.edge.Kind,
+								t.edge.FilePath, t.edge.Line, p.Name(), graph.OriginLSPResolved)
+							if fallbackMutations.stageAdd(view, declared) {
+								result.EdgesAdded++
+								usefulYield.Add(1)
+							}
+						}
+					case rebindTargetAcceptable(cand.Kind) && !edgeExistsAt(view, t.edge.From, cand.ID, t.edge.Kind, t.edge.Line):
+						// Mutate the full edge state before staging the set-oriented
+						// reindex so the backend persists the complete confirmed payload.
+						oldTo := t.edge.To
+						t.edge.To = cand.ID
+						semantic.ConfirmEdge(t.edge, p.Name())
+						t.edge.Meta["rebound_from"] = oldTo
+						fallbackMutations.stageReindex(view, t.edge, oldTo)
+						result.EdgesRebound++
+						usefulYield.Add(1)
+					}
+					rmu.Unlock()
+				}
+			}(&defGroups[i])
+		}
+		wg.Wait()
+	}
+	if len(fallbackMutations.reindexes) > 0 || len(fallbackMutations.persists) > 0 ||
+		len(fallbackMutations.adds) > 0 {
 		rmu.Lock()
 		fallbackMutations.apply(g, nil)
 		rmu.Unlock()
 	}
+	defsDone := time.Now()
 
 	// Degraded finalisation: the interface pass, the references-add pass, and
 	// the per-file hover / hierarchy sweep are all skipped when a needed
@@ -1284,9 +1443,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// never ADDED. Ask textDocument/references per declaration and mint those
 	// call edges. Runs under the targeted budget (before the hover sweep) so
 	// a deadline cut sheds hover work, not the recall-bearing add.
-	if p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
+	if !p.noHeavyRequests &&
+		p.Supports("textDocument/references") && !p.Supports("textDocument/prepareCallHierarchy") {
 		p.referencesAddPass(targetedCtx, g, view, repoPrefix, absRoot, langNodes, rmu, session, result)
 	}
+	refsAddDone := time.Now()
 
 	// Per-file document lifecycle + bounded concurrency. The original
 	// implementation bulk-opened every target file up front and closed
@@ -1380,11 +1541,14 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// Demand/dispatch decisions are immutable during the concurrent sweep.
 	// Compute them once from the repo adjacency projection before any file
 	// goroutine starts staging new hierarchy edges into that projection.
+	langHierarchyEvidence := enrichLanguageHasHierarchyEvidence(view, repoEdges, p.languageMatches)
 	nodeDemand := make(map[string]bool, len(langNodes))
 	nodeDispatch := make(map[string]bool, len(langNodes))
+	nodeTypeDispatch := make(map[string]bool, len(langNodes))
 	for _, n := range langNodes {
 		nodeDemand[n.ID] = enrichNodeHasUnresolvedDemandFromView(view, n)
 		nodeDispatch[n.ID] = enrichCallableIsDispatchRelevantFromView(view, n)
+		nodeTypeDispatch[n.ID] = enrichTypeIsDispatchRelevantFromView(view, n, langHierarchyEvidence)
 	}
 
 	// Group enrichment targets by file so each file's open/close lifecycle
@@ -1394,7 +1558,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		rel      string
 		nodes    []*graph.Node
 		demand   int  // declarations still carrying unresolved same-name candidates
-		dispatch bool // carries a type / interface whose hierarchy the sweep interrogates
+		dispatch bool // carries a dispatch-relevant callable, or a type involved in a hierarchy
 	}
 	var fileList []*fileTargets
 	fileIndex := map[string]*fileTargets{}
@@ -1413,7 +1577,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if nodeDemand[n.ID] {
 			ft.demand++
 		}
-		if enrichNodeIsDispatchRelevant(n) {
+		if nodeDispatch[n.ID] || nodeTypeDispatch[n.ID] {
 			ft.dispatch = true
 		}
 	}
@@ -1584,8 +1748,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 						// (or under a full sweep). Demand-first file ordering
 						// sweeps the demand-bearing callers before any deadline
 						// cut, so a skipped incoming costs no reachable edge.
-						wantIncoming := sweepMode == sweepModeFull ||
-							nodeDispatch[n.ID] || nodeDemand[n.ID]
+						// incomingCalls rides the same FindReferences
+						// machinery as references — a NoHeavyRequests
+						// server never gets the round trip, whatever the
+						// sweep mode says.
+						wantIncoming := !p.noHeavyRequests &&
+							(sweepMode == sweepModeFull ||
+								nodeDispatch[n.ID] || nodeDemand[n.ID])
 						for _, item := range items {
 							if outs, oerr := p.outgoingCalls(item); oerr == nil {
 								for _, oc := range outs {
@@ -1769,6 +1938,12 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		zap.Int("reopened_files", reopenedFiles),
 		zap.Int("doc_evictions", docEvictions),
 		zap.Int("peak_open_docs", peakOpenDocs),
+		zap.Int64("phase_setup_ms", setupDone.Sub(start).Milliseconds()),
+		zap.Int64("phase_impls_ms", implsDone.Sub(setupDone).Milliseconds()),
+		zap.Int64("phase_confirm_ms", confirmDone.Sub(implsDone).Milliseconds()),
+		zap.Int64("phase_definitions_ms", defsDone.Sub(confirmDone).Milliseconds()),
+		zap.Int64("phase_refs_add_ms", refsAddDone.Sub(defsDone).Milliseconds()),
+		zap.Int64("phase_sweep_ms", time.Since(refsAddDone).Milliseconds()),
 		zap.Int64("req_references", p.reqStats.references.Load()),
 		zap.Int64("req_implementations", p.reqStats.implementations.Load()),
 		zap.Int64("req_definitions", p.reqStats.definitions.Load()),
@@ -2812,6 +2987,13 @@ func (p *Provider) EnsureFileOpen(repoRoot, relPath string) error {
 // unlocked; the graph mutations are batched under the resolve mutex.
 func (p *Provider) ConfirmSymbolRefs(g graph.Store, repoRoot string, n *graph.Node) (int, error) {
 	if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
+		return 0, nil
+	}
+	if p.noHeavyRequests {
+		// incomingCalls rides the same FindReferences machinery the sweep
+		// skips for this server (ServerSpec.NoHeavyRequests) — a long-lived
+		// daemon answering find_usages would accumulate the leak one query
+		// at a time.
 		return 0, nil
 	}
 	if !p.Supports("textDocument/prepareCallHierarchy") {

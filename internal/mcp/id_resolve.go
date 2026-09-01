@@ -91,14 +91,21 @@ func (s *Server) resolveSymbolID(ctx context.Context, id string) string {
 	if id == "" || s.graph == nil || s.graph.GetNode(id) != nil {
 		return id
 	}
-	if s.multiIndexer == nil {
-		return id
-	}
-	cwd := SessionCWDFromContext(ctx)
-	if cwd != "" {
-		if _, _, prefix, ok := s.multiIndexer.ScopeForCWD(cwd); ok && prefix != "" {
-			if cand := prefix + "/" + id; s.graph.GetNode(cand) != nil {
-				return cand
+	// The cwd rung needs the multi-repo index to map a directory to a repo
+	// prefix; the graphRelID rung below does not. Returning early on a nil
+	// multiIndexer skipped both, which cost a server built without
+	// MultiRepoOptions (cmd/gortex eval_recall.go, eval_server.go) the
+	// separator normalization graphPathSpelling exists to provide: on Windows
+	// the stored id is `pkga\a.go::Foo` while every agent writes
+	// `pkga/a.go::Foo`, and the tool answered "symbol not found" for an
+	// indexed symbol.
+	if s.multiIndexer != nil {
+		cwd := SessionCWDFromContext(ctx)
+		if cwd != "" {
+			if _, _, prefix, ok := s.multiIndexer.ScopeForCWD(cwd); ok && prefix != "" {
+				if cand := prefix + "/" + id; s.graph.GetNode(cand) != nil {
+					return cand
+				}
 			}
 		}
 	}

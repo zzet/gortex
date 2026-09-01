@@ -37,13 +37,16 @@ func (s *Store) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) 
 	if !ok {
 		return 0, 0
 	}
-	return s.evictByPredicate(evictFilesPredicate, pathsJSON)
+	return s.evictByPredicate(evictFilesPredicate, pathsJSON, true)
 }
 
 // evictByPredicate is the common SQLite-native scope eviction path. The
 // predicate is always one of the package constants above, never caller SQL.
-func (s *Store) evictByPredicate(predicate string, arg any) (nodesRemoved, edgesRemoved int) {
-	nodesRemoved, edgesRemoved, err := s.evictByPredicateResult(predicate, arg)
+// exactReceipt marks predicates whose evicted-node set is bounded enough to
+// describe exactly to active mutation receipts (the file predicates); scope
+// evictions without it fail the receipt closed as before.
+func (s *Store) evictByPredicate(predicate string, arg any, exactReceipt bool) (nodesRemoved, edgesRemoved int) {
+	nodesRemoved, edgesRemoved, err := s.evictByPredicateResult(predicate, arg, exactReceipt)
 	if err != nil {
 		panicOnFatal(err)
 		return 0, 0
@@ -54,8 +57,13 @@ func (s *Store) evictByPredicate(predicate string, arg any) (nodesRemoved, edges
 // evictByPredicateResult keeps the entire binding/edge/node change in one
 // IMMEDIATE transaction. Candidate node IDs remain in SQLite: the two indexed
 // edge deletes consume the same predicate subquery directly, so scope size
-// never creates a Go ID frontier or a DELETE-per-node loop.
-func (s *Store) evictByPredicateResult(predicate string, arg any) (nodesRemoved, edgesRemoved int, retErr error) {
+// never creates a Go ID frontier or a DELETE-per-node loop. The one exception
+// is the exact-receipt path: while a mutation receipt is active, a bounded
+// file-scoped eviction reads the doomed nodes' identities first (same
+// pattern as mutationNodeIdentitiesTx — paid only while receipts observe) so
+// the receipt can stay complete instead of forcing the whole-graph fallback
+// resolve.
+func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt bool) (nodesRemoved, edgesRemoved int, retErr error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -66,6 +74,46 @@ func (s *Store) evictByPredicateResult(predicate string, arg any) (nodesRemoved,
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	ctx := context.Background()
+	// A failure in this receipt-only read degrades the receipt to incomplete
+	// (receiptDelta stays nil, the post-commit branch marks the fallback)
+	// rather than blocking the eviction itself - the same choice
+	// prepareSQLiteReindexReceiptTx makes for its identity read.
+	var receiptDelta *sqliteMutationReceiptAccumulator
+	if exactReceipt && s.hasActiveMutationReceiptsLocked() {
+		// The DELETEs below remove every edge touching a doomed node,
+		// including edges whose SOURCE survives. restubIncomingRefs parks the
+		// IsResolvableRefEdge kinds under a stub first, so those stay
+		// described by the name and file frontiers; the rest -
+		// accesses_field, arg_of, tests, imports, contains - are destroyed.
+		//
+		// An earlier revision probed for exactly that and failed the receipt
+		// closed, forcing the whole-graph fallback resolve. The fallback
+		// cannot repair it: it retargets edges that still exist and are
+		// parked under a stub, and a deleted edge is neither. Both paths
+		// reach the same graph, so the probe bought only the cost of the
+		// larger pass, and on a real package it fired on nearly every
+		// reindex. The eviction still describes its RESOLUTION delta
+		// exactly, which is the only question a receipt answers; the
+		// destruction is a real pre-existing defect tracked separately.
+		delta := newSQLiteMutationReceiptAccumulator()
+		rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+predicate, arg)
+		if err == nil {
+			for rows.Next() {
+				var id, kind, name, qualName, filePath string
+				if err = rows.Scan(&id, &kind, &name, &qualName, &filePath); err != nil {
+					break
+				}
+				recordSQLiteEvictedNode(delta, id, kind, name, qualName, filePath)
+			}
+			if err == nil {
+				err = rows.Err()
+			}
+			_ = rows.Close()
+		}
+		if err == nil {
+			receiptDelta = delta
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+predicate, arg); err != nil {
 		return 0, 0, err
 	}
@@ -107,9 +155,56 @@ func (s *Store) evictByPredicateResult(predicate string, arg any) (nodesRemoved,
 	}
 	s.finishAnalysisMutationLocked(changed)
 	if changed {
-		s.markMutationReceiptsIncompleteLocked()
+		if receiptDelta != nil {
+			s.mergeMutationReceiptLocked(receiptDelta)
+		} else {
+			s.markMutationReceiptsIncompleteLocked()
+		}
 	}
 	return nodesRemoved, edgesRemoved, nil
+}
+
+// recordSQLiteEvictedNode describes one doomed node to a receipt delta. An
+// evicted resolver candidate is resolution-relevant the same way an added
+// one is: pending references naming it elsewhere may resolve differently
+// once it is gone (and, in the evict-then-readd reindex flow, the re-add
+// records the successor identity), so its file joins the definition
+// frontier and the stub names graph.ReceiptNamesForEvictedSymbol maps it to
+// join the target set — mirroring recordSQLiteChangedNodeIdentity's
+// treatment of a vanished old identity. A candidate kind without an exact
+// stub mapping fails the receipt closed.
+func recordSQLiteEvictedNode(acc *sqliteMutationReceiptAccumulator, id, kind, name, qualName, filePath string) {
+	if acc == nil {
+		return
+	}
+	if filePath != "" {
+		acc.changedFiles[filePath] = struct{}{}
+	}
+	names, exact := graph.ReceiptNamesForEvictedSymbol(graph.NodeKind(kind), name, qualName)
+	if !exact {
+		acc.resolutionRelevant = true
+		acc.noteIncomplete("evicted_import_candidate_kind")
+		return
+	}
+	// An empty name set is not always proof of neutrality: a file node has no
+	// stub key yet is an import candidate. See
+	// graph.EvictedNodeNeedsResolutionFrontier.
+	if len(names) == 0 && !graph.EvictedNodeNeedsResolutionFrontier(graph.NodeKind(kind)) {
+		return
+	}
+	acc.resolutionRelevant = true
+	if id != "" {
+		acc.targetIDs[id] = struct{}{}
+	}
+	for _, stubName := range names {
+		acc.targetNames[stubName] = struct{}{}
+		acc.evictedNames[stubName] = struct{}{}
+	}
+	if filePath != "" {
+		acc.definitionFiles[filePath] = struct{}{}
+	} else {
+		acc.noteIncomplete("evicted_node_without_exact_file")
+	}
 }
 
 var _ graph.FileBatchEvicter = (*Store)(nil)

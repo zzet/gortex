@@ -161,6 +161,8 @@ A spec whose first token isn't a known preset (`search_symbols,find_files,…`) 
 
 **Prompt-injection screening.** Every tool call is screened by middleware that scans arguments and result text for injection patterns. On a hit it attaches a non-blocking `_meta.gortex_security` advisory — the call still succeeds and the result body is never mutated. Disable with `GORTEX_MCP_SANITIZE=0`.
 
+**Unknown-option guard.** Tools published with a closed schema (`additionalProperties: false`) enforce it at dispatch. By default an unknown option still executes the call and the result carries an `_ignored_options` rider naming the unknown keys and the valid ones — the self-correct signal for a mistyped or hallucinated option (#597). `GORTEX_TOOL_ARG_GUARD=reject` upgrades that to a refusal before the handler runs; `GORTEX_TOOL_ARG_GUARD=0` / `false` / `off` / `no` disables enforcement. Response-shaping keys generic layers honor on any tool (`format`, `fields`, `max_bytes`, `max_tokens`, `cursor`) are always accepted, and facade tools are exempt — their compatibility wrappers deliberately take legacy call shapes.
+
 ## Core navigation
 
 | Tool | Description |
@@ -279,13 +281,14 @@ over a very large tree, or `ask` against a slow local model.
 | Tool | Description |
 |------|-------------|
 | `get_symbol_source` | Source code of a single symbol (80% fewer tokens than Read). Returns `tokens_saved` per call. `compress_bodies` stubs bodies (with an optional `keep` subset); `max_lines` salience-truncates to a control-flow skeleton |
-| `batch_symbols` | Multiple symbols with source/callers/callees in one call |
+| `batch_symbols` | Multiple symbols with source and a capped 1-hop callers/callees sample (`callers_truncated` / `callees_truncated` mark a cut; full neighbourhood is `get_callers` / `get_call_chain`) |
 | `find_import_path` | Correct import path for a symbol |
 | `explain_change_impact` | Risk-tiered blast radius with affected processes. A zero-edge target carries the same per-symbol `likely_unused` / `possible_extraction_gap` / `coverage_incomplete` caveat as `get_callers` |
 | `get_recent_changes` | Files/symbols changed since timestamp. Rows are clamped to the session workspace and narrowed further by `repo`/`project`/`scope`; each multi-repo row names its `repo` |
 | `edit_symbol` | Edit a symbol's source directly by ID — no Read needed. Line-ending tolerant: an LF-authored `old_source` matches a CRLF file (and vice versa) and the replacement adopts the file's endings (`eol_normalized: true` rides on the response). Optional `base_sha` content-hash guard refuses the write when the on-disk SHA has drifted; every success carries `new_sha` so the next edit can pipeline without re-reading |
 | `edit_file` | Edit any file (markdown, config, spec, template, source) by exact string replacement — accepts absolute paths or repo-rooted paths. Line-ending tolerant: an LF-authored `old_string` matches a CRLF file (and vice versa) and the replacement is written with the file's own endings (`eol_normalized: true` rides on the response). Same `base_sha` / `new_sha` drift guard. Kills Read-before-Edit for files not in the graph |
 | `write_file` | Create or overwrite any file — atomic temp+rename, re-indexes on write. Same `base_sha` / `new_sha` drift guard |
+| `mutation_status` | What a file mutation actually did, after the fact. Reports `disk_status` (`committed` / `not_applied` / `failed` / `in_flight`) separately from `graph_status` (`fresh` / `pending` / `stale` / `failed`), selected by `receipt`, `mutation_id`, or `path`. Use it instead of retrying when an edit call was abandoned at its deadline |
 | `rename_symbol` | Coordinated multi-file rename with all references — definition, graph usages, receiver lines, and test names that embed the old identifier. Replacement is whole-identifier, so renaming `Get` leaves `GetUser` intact. Every target line is re-verified against disk and every affected file is parse-gated before anything is written, so the rename lands completely or is refused; `dry_run: true` returns the identical edit list without writing. Successful responses carry `status` (`applied` / `would_apply` / `no_edits`) plus per-file `bytes_written` / `new_sha` / `reindexed`. An existing unindexed target returns a structured `symbol_not_indexed` error only when the configured extractor anchors the requested declaration. Its `safe_fallback.request` is a guarded exact edit of that declaration line (`scope: declaration_only`); same-file and cross-file references remain explicitly unproven, and the refusal itself writes no bytes |
 | `move_symbol` | Relocate a function / method / type / variable / const to another file. Cross-package moves rewrite every qualified reference, drop the source import, add the target import, synthesise the target file if missing. Go for now |
 | `inline_symbol` | Replace every callsite of a trivial single-statement / single-expression callee with the body — refuses cleanly on defer, spawn, close-over-scope, multi-return, or side-effecting arg. `delete_after: true` removes the declaration. Go for now |
@@ -355,8 +358,37 @@ Contract details that matter for an evidence workflow:
   disk observation.
 
 Whether the graph caught up with the write is a separate question, answered by
-the `reindexed` / `reindex_pending` / `reindex_generation` fields every mutation
-already returns.
+`graph_status` (and the `reindexed` / `reindex_pending` / `reindex_generation`
+fields behind it) on every mutation response. Whether the write happened *at
+all* is a third question — see the next section.
+
+### Mutating tools and the transport deadline
+
+A tool call is bounded (`GORTEX_MCP_TOOL_TIMEOUT`, default 60s). When a handler
+outruns that budget the transport is released and the handler keeps running, so
+a write can land *after* the client was answered. The mutating tools make that
+observable instead of leaving it unknown:
+
+- **Before the disk commit**, a cancelled request is refused and nothing is
+  written. The response says `disk_status=not_applied` and retrying is safe.
+- **After the disk commit**, the abandoned-call error names what landed —
+  path, `new_sha`, and a receipt id — and carries a machine-readable
+  `mutation_commit={...}` tail. Re-applying the edit would duplicate it.
+- **Either way**, the receipt is queryable for 30 minutes with
+  `mutation_status` (facade: `change` with `operation: "receipt"`), which
+  reports the disk state and the graph-freshness state independently.
+- `edit_file` / `write_file` / `edit_symbol` accept an optional `mutation_id`
+  idempotency key. Retrying with the same key and the identical edit replays
+  the original result without writing again; reusing it for a different edit is
+  refused. `batch_edit` has the equivalent `transaction_id`.
+
+Successful edit responses carry `disk_status`, `graph_status`, and
+`mutation_receipt` alongside the existing `new_sha` / `reindexed` fields.
+
+`physical_evidence` and `disk_status` answer different questions and compose:
+the first attests *what bytes* are on disk, the second whether the write
+happened at all. A call abandoned before its response returns no evidence block
+— only the receipt — which is exactly when `disk_status` is the field you need.
 
 ## Agent-optimized (token efficiency)
 
@@ -414,6 +446,8 @@ Gortex captures every large tool response into a bounded per-session ring; these
 | `find_clones` | Near-duplicate function/method clusters from the MinHash + LSH `similar_to` layer; `dead_only: true` finds dead duplicates of live code |
 | `index_health` | Health score, parse failures, stale files, language coverage, tracked-repo path liveness (`tracked_repo_paths_ok` + `missing_repo_paths` — a repo whose directory was deleted still holds its registration and silently drops out of workspace-wide answers), per-(repo, provider) semantic-enrichment lifecycle (`semantic_enrichment`: running / completed / partial / abandoned / failed with edge counts, plus a `semantic_enrichment_ok` rollup) — a green file count with a `partial` enrichment state means LSP-tier edges are incomplete. `path_liveness` asks the same question one level down, per file: it stats the paths the graph itself claims and reports how many indexed files no longer exist on disk (`orphan_files` / `orphan_rate` / `orphans_by_repo`, sampled with `truncated: true` past 20k files). `stale_files` only covers files the daemon still tracks, so a deletion it never witnessed shows up here and nowhere else; a non-zero `orphan_files` caps `health_score` |
 | `get_symbol_history` | Symbols modified this session with counts; flags churning (3+ edits) |
+The `analyze` dispatcher also accepts a set of **facade-aliased kinds** that route to the captured legacy handler instead of the dispatcher switch: `processes` → `get_processes`, `communities` → `get_communities`, `contracts` → `contracts`, `architecture` → `get_architecture`, `clones` → `find_clones`, `health` → `audit_health`, `inspections` → `run_inspections`, `recent_changes` → `get_recent_changes`, and the other entries of the facade analyze migration table (see `mcp-facade-v1.md`). These aliases are **surface-independent**: they work for named (facade-v1), unnamed (legacy), and session-less HTTP callers alike, with no `tools_search` promotion — the HTTP dashboard endpoints depend on this under the `core`/`defer` default.
+
 
 The in-graph coverage tools above (`analyze kind=coverage*`, `index_health` language coverage) have an offline, whole-corpus counterpart for regression testing: the `gortex eval parity` CLI benchmarks per-language *resolved cross-file-dependent* coverage against a frozen baseline and is CI-fenced three ways — a per-language coverage floor, a frozen at-or-beyond-parity language count, and per-feature extraction goldens. See [features.md](features.md#coverage-churn-ownership).
 
@@ -491,7 +525,7 @@ Editor extensions push in-flight (unsaved) buffers as **overlays**. Gortex compo
 | `overlay_drop_branch` | Delete a named branch — refuses to drop the active branch or the implicit `main` |
 | `compare_branches` | Run `find_usages` / `get_callers` / `get_call_chain` / `get_dependencies` / `get_dependents` against two branches and report each side plus the delta |
 
-HTTP transport mirrors the surface at `/v1/overlay/sessions/*`; the `/v1/tools/<name>` entry point reads the overlay session from `Mcp-Session-Id` (preferred), `X-Gortex-Overlay-Session`, or `?session_id=`. Overlays are bound to their MCP session — when the session ends the overlay is dropped synchronously. Idle TTL is a fail-safe (default 30 m, configurable via `GORTEX_OVERLAY_IDLE_TTL`); every tool call against a live overlay refreshes it.
+HTTP transport mirrors the surface at `/v1/overlay/sessions/*`. The `/v1/tools/<name>` entry point resolves the caller's real session identity from `Mcp-Session-Id` (preferred) or `?session_id=` — this identity drives every per-session subsystem: tool-policy gating, token-stats accounting, notes/memory scoping, and so on. `X-Gortex-Overlay-Session`, when present, is a narrower, independent override that scopes *only* overlay state to a different cohort id than the caller's own session (e.g. a CI harness orchestrating several overlay scopes from one connection) — it never substitutes for the real session identity anywhere else. Overlays are bound to their cohort id; the synchronous drop-on-disconnect only fires for a cohort that matches its own MCP transport session (`ReleaseSession` drops by session id) — a cohort explicitly named via `X-Gortex-Overlay-Session` lives until the idle TTL regardless of the owning connection's lifetime. Idle TTL is a fail-safe (default 30 m, configurable via `GORTEX_OVERLAY_IDLE_TTL`); every tool call against a live overlay refreshes it.
 
 ## Speculative execution
 

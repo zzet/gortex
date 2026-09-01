@@ -410,6 +410,7 @@ func genMultiRepoGraph(t *rapid.T) (*Graph, map[string][]string) {
 
 	expected := make(map[string][]string) // prefix → node IDs
 	var allNodeIDs []string
+	seenIDs := make(map[string]bool)
 	kinds := []NodeKind{KindFunction, KindType, KindMethod, KindVariable}
 
 	for _, prefix := range prefixes {
@@ -421,8 +422,13 @@ func genMultiRepoGraph(t *rapid.T) (*Graph, map[string][]string) {
 			kind := kinds[rapid.IntRange(0, len(kinds)-1).Draw(t, "kind")]
 			n := makeRepoNode(id, name, kind, file, "go", prefix)
 			g.AddNode(n)
-			expected[prefix] = append(expected[prefix], id)
-			allNodeIDs = append(allNodeIDs, id)
+			// AddNode upserts by ID, so a drawn (name, file) collision must
+			// also appear only once in the expected model.
+			if !seenIDs[id] {
+				seenIDs[id] = true
+				expected[prefix] = append(expected[prefix], id)
+				allNodeIDs = append(allNodeIDs, id)
+			}
 		}
 	}
 

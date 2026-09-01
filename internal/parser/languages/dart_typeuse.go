@@ -23,12 +23,13 @@ import (
 // Inferred bindings (`var x = ...`, `final x = ...`) carry no written type
 // and are skipped — there is nothing to attribute.
 //
-// Fields attribute to the file node (the extractor doesn't materialise a
-// per-field symbol node). Parameters and return types attribute to the
-// enclosing function / method node. Typed locals attribute to the enclosing
-// function via the same funcRange mechanism extractCalls uses, falling back
-// to the file node when no function encloses the line (e.g. a typed local in
-// a field initialiser).
+// Fields attribute to the file node: one declaration can bind several names
+// (`String? a, b;`) and therefore several field nodes, so a per-field owner
+// would have to either duplicate the edge or pick one binding arbitrarily.
+// Parameters and return types attribute to the enclosing function / method
+// node. Typed locals attribute to the enclosing function via the same
+// funcRange mechanism extractCalls uses, falling back to the file node when no
+// function encloses the line (e.g. a typed local in a field initialiser).
 func (e *DartExtractor) extractTypeUses(
 	root *sitter.Node, src []byte, filePath string, fileNode *graph.Node,
 	result *parser.ExtractionResult,

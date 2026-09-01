@@ -23,17 +23,28 @@ type Matcher struct {
 // directory matches paths regardless of which Unicode form the
 // filesystem walk produced — MatchRel folds the candidate path to the
 // same form before testing it.
+//
+// Each pattern is also run through literalizePattern before it reaches
+// go-gitignore, whose compiler splices pattern text straight into a Go
+// regexp and escapes only "." and "?". Without that step a line as
+// ordinary as "*$" compiles to a regexp that matches every path and
+// excludes the entire repository (#624). The Matcher keeps the original
+// text in patterns — the rewrite is a compiler detail and must never
+// reach a user-visible surface.
 func New(patterns []string) *Matcher {
 	cleaned := make([]string, 0, len(patterns))
+	compiled := make([]string, 0, len(patterns))
 	for _, p := range patterns {
 		p = strings.TrimSpace(p)
 		if p == "" || strings.HasPrefix(p, "#") {
 			continue
 		}
-		cleaned = append(cleaned, pathkey.Normalize(p))
+		p = pathkey.Normalize(p)
+		cleaned = append(cleaned, p)
+		compiled = append(compiled, literalizePattern(p))
 	}
 	return &Matcher{
-		ign:      ignore.CompileIgnoreLines(cleaned...),
+		ign:      ignore.CompileIgnoreLines(compiled...),
 		patterns: cleaned,
 	}
 }
@@ -66,6 +77,34 @@ func (m *Matcher) MatchRel(relPath string) bool {
 	return m.ign.MatchesPath(rel)
 }
 
+// Explain reports whether a repo-root-relative path is excluded and, when
+// it is, which pattern excluded it — in the caller's original wording, not
+// the rewritten form New compiles.
+//
+// This is what makes an over-broad ignore self-diagnosing: a repo that
+// indexes zero files can name the one line responsible instead of leaving
+// the operator to bisect a .gitignore by hand.
+func (m *Matcher) Explain(relPath string) (bool, string) {
+	if m == nil || m.ign == nil {
+		return false, ""
+	}
+	rel := pathkey.Normalize(filepath.ToSlash(relPath))
+	rel = strings.TrimPrefix(rel, "./")
+	if rel == "" || rel == "." {
+		return false, ""
+	}
+	matched, ip := m.ign.MatchesPathHow(rel)
+	if !matched || ip == nil {
+		return matched, ""
+	}
+	// LineNo is 1-based into the slice New handed the compiler, which is
+	// index-aligned with m.patterns.
+	if ip.LineNo >= 1 && ip.LineNo <= len(m.patterns) {
+		return true, m.patterns[ip.LineNo-1]
+	}
+	return true, ip.Line
+}
+
 // MatchAbs reports whether an absolute path under root is excluded.
 // Returns false if path is not under root.
 func (m *Matcher) MatchAbs(absPath, root string) bool {
@@ -79,17 +118,25 @@ func (m *Matcher) MatchAbs(absPath, root string) bool {
 // descending it and re-testing every file. Returns false if path is
 // not under root.
 func (m *Matcher) MatchAbsDir(absPath, root string, isDir bool) bool {
+	matched, _ := m.ExplainAbsDir(absPath, root, isDir)
+	return matched
+}
+
+// ExplainAbsDir is MatchAbsDir plus the pattern that excluded the path,
+// in the caller's original wording. The pattern is "" when nothing
+// matched.
+func (m *Matcher) ExplainAbsDir(absPath, root string, isDir bool) (bool, string) {
 	if m == nil || m.ign == nil {
-		return false
+		return false, ""
 	}
 	rel, err := filepath.Rel(root, absPath)
 	if err != nil {
-		return false
+		return false, ""
 	}
 	if isDir {
 		rel += "/"
 	}
-	return m.MatchRel(rel)
+	return m.Explain(rel)
 }
 
 // HasNegatedDescendant reports whether any re-include ("!") pattern in

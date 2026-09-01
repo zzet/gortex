@@ -10,7 +10,7 @@ import (
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
 
-func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
+func TestWeakReadAllowsBoundedSearchRecoveriesThenTerminates(t *testing.T) {
 	server := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 	ctx := WithSessionID(context.Background(), "weak_read_search_recovery")
 	terminal := server.localizationFor(ctx)
@@ -44,13 +44,23 @@ func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
 	}
 	requireLocalizationResultStateEqual(t, terminal, readResult, localizationStateNeedsRecovery, false, 1)
 
+	// The stub search returns a page with no graph-backed identity, so it
+	// corroborates nothing. One further allowance follows; the second spends it.
 	searchResult, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "resolveCandidate",
 	}))
 	if err != nil || searchResult == nil || searchResult.IsError || searchCalls != 1 {
 		t.Fatalf("bounded recovery search = (%#v, %v), calls=%d", searchResult, err, searchCalls)
 	}
-	requireLocalizationResultStateEqual(t, terminal, searchResult, localizationStateAnswerReady, true, 0)
+	requireLocalizationResultStateEqual(t, terminal, searchResult, localizationStateNeedsRecovery, false, 1)
+
+	secondResult, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
+		"query": "findCandidate",
+	}))
+	if err != nil || secondResult == nil || secondResult.IsError || searchCalls != 2 {
+		t.Fatalf("second bounded recovery search = (%#v, %v), calls=%d", secondResult, err, searchCalls)
+	}
+	requireLocalizationResultStateEqual(t, terminal, secondResult, localizationStateAnswerReady, true, 0)
 
 	extra, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
 		"query": "another anchor",
@@ -58,8 +68,8 @@ func TestWeakReadAllowsOneBoundedSearchRecoveryThenTerminates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-recovery call returned transport error: %v", err)
 	}
-	requireLocalizationTerminalReplay(t, extra, "search", "text")
-	if searchCalls != 1 {
+	requireLocalizationUnconfirmedReplay(t, extra)
+	if searchCalls != 2 {
 		t.Fatalf("post-recovery search reached handler: calls=%d", searchCalls)
 	}
 }
@@ -124,7 +134,17 @@ func TestRecoveryRejectsUnrelatedAnchorWithoutConsumingAllowance(t *testing.T) {
 	if err != nil || retry == nil || retry.IsError || calls != 1 {
 		t.Fatalf("corrected recovery = (%#v, %v), calls=%d", retry, err, calls)
 	}
-	requireLocalizationResultStateEqual(t, terminal, retry, localizationStateAnswerReady, true, 0)
+	// Accepted, so the allowance the rejection preserved was spent here. The
+	// stub page corroborates nothing, so one further allowance remains.
+	requireLocalizationResultStateEqual(t, terminal, retry, localizationStateNeedsRecovery, false, 1)
+
+	last, err := server.handleFacade(ctx, "search", localizationRecoveryRequest("search", "text", map[string]any{
+		"query": "--multiline",
+	}))
+	if err != nil || last == nil || last.IsError || calls != 2 {
+		t.Fatalf("final recovery = (%#v, %v), calls=%d", last, err, calls)
+	}
+	requireLocalizationResultStateEqual(t, terminal, last, localizationStateAnswerReady, true, 0)
 }
 
 func TestRecoveryAcceptsTaskAlignedIdentifierAndCompactLiteralAnchors(t *testing.T) {
@@ -403,7 +423,7 @@ func TestRecoveryEvidenceRejectsGenericCallableWithSignatureOnlyOverlap(t *testi
 	}
 }
 
-func TestRecoveryWeakResultReleasesAdvisoryForEveryOperation(t *testing.T) {
+func TestRecoveryWeakResultReAllowsThenTerminatesUnconfirmedForEveryOperation(t *testing.T) {
 	longSink := localizationDigestRow{
 		ID:        "fixture/storage/report.go::Reporter.ReportStorageFailureAsPending",
 		Name:      "ReportStorageFailureAsPending",
@@ -432,14 +452,20 @@ func TestRecoveryWeakResultReleasesAdvisoryForEveryOperation(t *testing.T) {
 				t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
 			}
 			completion := state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{longSink}, true)
-			if completion.State != localizationStateLocalized || completion.AllowedToolCalls != 0 || completion.Enforceable {
-				t.Fatalf("weak accepted recovery did not release advisory completion: %#v", completion)
+			if completion.State != localizationStateNeedsRecovery || completion.AllowedToolCalls != 1 || completion.Enforceable {
+				t.Fatalf("weak accepted recovery did not keep one further allowance: %#v", completion)
 			}
-			state.mu.Lock()
-			storedState := state.state
-			state.mu.Unlock()
-			if storedState != localizationStateInactive {
-				t.Fatalf("weak accepted recovery left session restricted: %q", storedState)
+
+			blocked, token = state.authorizeWithToken(test.facade, test.operation, test.arguments)
+			if blocked != nil || token == 0 {
+				t.Fatalf("second recovery authorization = (%#v, %d)", blocked, token)
+			}
+			completion = state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{longSink}, true)
+			if completion.State != localizationStateAnswerReady || completion.Enforceable {
+				t.Fatalf("spent recovery allowance did not terminate: %#v", completion)
+			}
+			if !strings.HasPrefix(completion.FinalResponse, localizationProvisionalHeading) {
+				t.Fatalf("uncorroborated terminal page claimed proof: %q", completion.FinalResponse)
 			}
 		})
 	}
@@ -560,7 +586,7 @@ func TestPlannedRecoveryReplaceFamilyRegression(t *testing.T) {
 	}
 }
 
-func TestPlannedRecoveryIsExactRetriableAndWeakResultReleasesAdvisory(t *testing.T) {
+func TestPlannedRecoveryIsExactRetriableAndWeakResultReAllowsRecovery(t *testing.T) {
 	task := "Printed records are duplicated unexpectedly\ncombining --multiline with --replace while --only-matching spans lines"
 	preferred := "crates/searcher/src/sink.rs::sink_slow_multi_line_only_matching"
 	current := []localizationDigestRow{{
@@ -635,18 +661,21 @@ func TestPlannedRecoveryIsExactRetriableAndWeakResultReleasesAdvisory(t *testing
 	if blocked != nil || token == 0 {
 		t.Fatalf("exact planned recovery authorization = (%#v, %d)", blocked, token)
 	}
+	// The planned anchor was derived from evidence the page already retained, so
+	// a hit on it corroborates and terminalizes. A weak page that agrees with
+	// nothing keeps the second allowance instead.
 	weak := []localizationDigestRow{{
-		ID:   "crates/searcher/src/glue.rs::Matcher.replace_with_captures",
-		Name: "replace_with_captures", Kind: "method", File: "crates/searcher/src/glue.rs",
+		ID:   "crates/other/src/unrelated.rs::Unrelated.run",
+		Name: "run", Kind: "method", File: "crates/other/src/unrelated.rs",
 	}}
 	completion = state.finishReservedReadTokenWithDigest(token, true, weak, true)
-	if completion.State != localizationStateLocalized || completion.RequiredAction != "continue_task" ||
-		completion.AllowedToolCalls != 0 || completion.Enforceable {
-		t.Fatalf("weak planned result did not release an advisory completion: %#v", completion)
+	if completion.State != localizationStateNeedsRecovery || completion.RequiredAction != "recover_once" ||
+		completion.AllowedToolCalls != 1 || completion.Enforceable {
+		t.Fatalf("weak planned result did not keep one further allowance: %#v", completion)
 	}
 }
 
-func TestPlannedRecoveryEmptyResultReleasesAdvisory(t *testing.T) {
+func TestPlannedRecoveryEmptyResultReAllowsThenTerminatesUnconfirmed(t *testing.T) {
 	state := newLocalizationTerminalState()
 	state.armForTask(newLocalizationPlannedRecoveryCompletion("search.symbols", "transform_with"), "--multi-line with --transform duplicates output")
 	blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "transform_with"})
@@ -654,10 +683,194 @@ func TestPlannedRecoveryEmptyResultReleasesAdvisory(t *testing.T) {
 		t.Fatalf("planned recovery authorization = (%#v, %d)", blocked, token)
 	}
 	completion := state.finishReservedReadTokenWithDigest(token, true, nil, true)
-	if completion.State != localizationStateLocalized || completion.RequiredAction != "continue_task" ||
-		completion.AllowedToolCalls != 0 || completion.Enforceable {
-		t.Fatalf("empty planned result did not release an advisory completion: %#v", completion)
+	// An exact plan that returns nothing has disproved the plan, not the task:
+	// the next allowance is unplanned so the caller can pick its own anchor.
+	if completion.State != localizationStateNeedsRecovery || completion.RequiredAction != "recover_once" ||
+		completion.AllowedToolCalls != 1 || completion.Enforceable {
+		t.Fatalf("empty planned result did not keep one further allowance: %#v", completion)
 	}
+
+	blocked, token = state.authorizeWithToken("search", "symbols", map[string]any{"query": "--transform"})
+	if blocked != nil || token == 0 {
+		t.Fatalf("second recovery authorization = (%#v, %d)", blocked, token)
+	}
+	completion = state.finishReservedReadTokenWithDigest(token, true, nil, true)
+	if completion.State != localizationStateAnswerReady || completion.Enforceable {
+		t.Fatalf("spent recovery allowance did not terminate: %#v", completion)
+	}
+}
+
+// A recovery page whose identities say nothing about the request can still be
+// the right location — when it contributes a declaration the page did not have
+// in a file the page already located. A row the page already ranked contributes
+// nothing: re-returning it is the recovery agreeing with itself.
+func TestRecoveryTerminalizesOnlyWhenItContributesAlignedNovelEvidence(t *testing.T) {
+	ranked := captureTestRow("fixture/storage/flush.go::Storage.Flush", "fixture/storage/flush.go")
+	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{ranked}, nil)
+	tests := []struct {
+		name  string
+		row   localizationDigestRow
+		state string
+	}{
+		{
+			name: "novel declaration in a retained file",
+			row: localizationDigestRow{
+				ID: "fixture/storage/flush.go::Storage.helper", Name: "helper",
+				Kind: "method", File: "fixture/storage/flush.go",
+			},
+			state: localizationStateAnswerReady,
+		},
+		{
+			name:  "row the page already ranked",
+			row:   ranked,
+			state: localizationStateNeedsRecovery,
+		},
+		{
+			name: "unrelated file",
+			row: localizationDigestRow{
+				ID: "fixture/other/pool.go::Pool.helper", Name: "helper",
+				Kind: "method", File: "fixture/other/pool.go",
+			},
+			state: localizationStateNeedsRecovery,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := newLocalizationTerminalState()
+			completion := newLocalizationRecoveryCompletion()
+			completion.digest = retained
+			state.armForTask(completion, "Storage writes stall during commit")
+
+			blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "storage"})
+			if blocked != nil || token == 0 {
+				t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
+			}
+			result := state.finishReservedReadTokenWithDigest(token, true, []localizationDigestRow{test.row}, true)
+			if result.State != test.state {
+				t.Fatalf("recovery completion = %#v, want state %q", result, test.state)
+			}
+			if test.state == localizationStateAnswerReady &&
+				!strings.HasPrefix(result.FinalResponse, localizationAnswerHeading) {
+				t.Fatalf("corroborated terminal did not emit the proven page: %q", result.FinalResponse)
+			}
+		})
+	}
+}
+
+// The page ranks several declarations from one file. A recovery that returns
+// those same siblings has narrowed nothing, and terminalizing on them stops a
+// session on a candidate the ranking had already offered and the caller had
+// already passed over.
+func TestRecoveryReturningOnlyRankedSiblingsDoesNotTerminalize(t *testing.T) {
+	siblings := []localizationDigestRow{
+		captureTestRow("fixture/storage/flush.go::Storage.Flush", "fixture/storage/flush.go"),
+		captureTestRow("fixture/storage/flush.go::Storage.Sync", "fixture/storage/flush.go"),
+	}
+	baseline := mergeLocalizationEvidenceDigest(siblings, nil)
+	newcomer := localizationDigestRow{
+		ID: "fixture/storage/flush.go::Storage.drain", Name: "drain",
+		Kind: "method", File: "fixture/storage/flush.go",
+	}
+	tests := []struct {
+		name  string
+		rows  []localizationDigestRow
+		state string
+	}{
+		{name: "ranked siblings only", rows: siblings, state: localizationStateNeedsRecovery},
+		{name: "one ranked sibling", rows: siblings[1:], state: localizationStateNeedsRecovery},
+		{
+			name:  "ranked siblings plus a novel declaration",
+			rows:  append(append([]localizationDigestRow(nil), siblings...), newcomer),
+			state: localizationStateAnswerReady,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := newLocalizationTerminalState()
+			completion := newLocalizationRecoveryCompletion()
+			completion.digest = baseline
+			state.armForTask(completion, "Storage writes stall during commit")
+
+			blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "storage"})
+			if blocked != nil || token == 0 {
+				t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
+			}
+			result := state.finishReservedReadTokenWithDigest(token, true, test.rows, true)
+			if result.State != test.state {
+				t.Fatalf("recovery completion = %#v, want state %q", result, test.state)
+			}
+		})
+	}
+}
+
+// Rows an uncorroborated recovery surfaced are kept for the caller, but they
+// must never become the evidence the next recovery corroborates against.
+func TestASecondRecoveryCannotCorroborateItselfWithTheFirstResult(t *testing.T) {
+	retained := mergeLocalizationEvidenceDigest([]localizationDigestRow{
+		captureTestRow("fixture/storage/flush.go::Storage.Flush", "fixture/storage/flush.go"),
+	}, nil)
+	state := newLocalizationTerminalState()
+	completion := newLocalizationRecoveryCompletion()
+	completion.digest = retained
+	state.armForTask(completion, "Storage writes stall during commit")
+
+	unrelated := []localizationDigestRow{{
+		ID: "fixture/other/pool.go::Pool.helper", Name: "helper",
+		Kind: "method", File: "fixture/other/pool.go",
+	}}
+	for attempt, want := range []string{localizationStateNeedsRecovery, localizationStateAnswerReady} {
+		blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "storage"})
+		if blocked != nil || token == 0 {
+			t.Fatalf("recovery %d authorization = (%#v, %d)", attempt+1, blocked, token)
+		}
+		result := state.finishReservedReadTokenWithDigest(token, true, unrelated, true)
+		if result.State != want {
+			t.Fatalf("recovery %d completion = %#v, want state %q", attempt+1, result, want)
+		}
+		if want == localizationStateAnswerReady {
+			if result.Enforceable || !strings.HasPrefix(result.FinalResponse, localizationProvisionalHeading) {
+				t.Fatalf("self-corroborated recovery claimed proof: %#v", result)
+			}
+		}
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !localizationDigestHasRow(state.digest, unrelated[0].ID) {
+		t.Fatalf("uncorroborated recovery discarded what it surfaced: %#v", state.digest)
+	}
+}
+
+// The two limits are different axes: a handler that never ran proves nothing
+// about the evidence, so it must not cost a corroboration allowance.
+func TestFailedRecoveryHandlerDoesNotSpendACorroborationAllowance(t *testing.T) {
+	state := newLocalizationTerminalState()
+	state.armForTask(newLocalizationRecoveryCompletion(), "Storage writes stall during commit")
+
+	blocked, token := state.authorizeWithToken("search", "symbols", map[string]any{"query": "storage"})
+	if blocked != nil || token == 0 {
+		t.Fatalf("recovery authorization = (%#v, %d)", blocked, token)
+	}
+	if failed := state.finishReservedReadTokenWithDigest(token, false, nil, false); failed.State != localizationStateNeedsRecovery {
+		t.Fatalf("failed recovery handler = %#v, want restored allowance", failed)
+	}
+	state.mu.Lock()
+	remaining := state.recoveryAllowancesRemaining
+	state.mu.Unlock()
+	if remaining != localizationRecoveryAllowanceCap {
+		t.Fatalf("failed handler spent %d corroboration allowances", localizationRecoveryAllowanceCap-remaining)
+	}
+}
+
+func localizationDigestHasRow(digest *localizationEvidenceDigest, id string) bool {
+	if digest == nil {
+		return false
+	}
+	for _, row := range digest.Evidence {
+		if row.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func localizationRecoveryRequest(facade, operation string, arguments map[string]any) mcpgo.CallToolRequest {

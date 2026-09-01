@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
@@ -562,7 +563,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, repoPrefix, allowedRepos)
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, analysis.RepoRelativePath, repoPrefix, allowedRepos)
 		impact = s.reviewImpact(diff.ChangedSymbols)
 		changedFiles = diff.ChangedFiles
 	}
@@ -614,7 +615,10 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 // changed files relative to the working tree while the graph keys every file
 // node "<prefix>/<rel>". Matches come back repo-relative — the spelling that
 // rule resolution, the per-file risk ranking, and the forge comment API speak.
-func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []string, repoPrefix string, allowedRepos map[string]bool) []astquery.Match {
+//
+// domain declares which vocabulary changedFiles is spelled in, because the two
+// overlap and cannot be recovered by inspection — see reviewChangedGraphPaths.
+func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []string, domain analysis.PathDomain, repoPrefix string, allowedRepos map[string]bool) []astquery.Match {
 	bundle := astquery.DetectorsByCategory("review")
 	if len(bundle) == 0 {
 		return nil
@@ -627,13 +631,18 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 
 	// Narrow to the changed-file set so the rulepack only scans the changeset,
 	// not the whole repository.
-	changed := reviewChangedGraphPaths(changedFiles, repoPrefix)
+	changed := reviewChangedGraphPaths(changedFiles, domain, repoPrefix)
 	if len(changed) == 0 {
 		return nil
 	}
 	targets := make([]astquery.Target, 0, len(allTargets))
 	for _, t := range allTargets {
-		if changed[filepath.Clean(t.GraphPath)] {
+		// Normalize, do not Clean. A graph path is "<prefix>/" + the rest in
+		// native separators, so filepath.Clean rewrites the prefix slash on
+		// Windows ("repo-a/pkg\widget.go" -> "repo-a\pkg\widget.go") and the
+		// key the changeset built no longer matches. graphpath.Norm is the
+		// canonical comparison form and is the identity on POSIX.
+		if changed[graphpath.Norm(t.GraphPath)] {
 			targets = append(targets, t)
 		}
 	}
@@ -677,16 +686,28 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 //
 // Only the prefixed spelling is admitted once a prefix applies — a bare
 // relative path would also match a same-named file in a sibling tracked repo.
-// Paths that already carry the prefix pass through unchanged, so a caller
-// holding graph-keyed paths (a changed symbol's FilePath) joins too.
-func reviewChangedGraphPaths(changedFiles []string, repoPrefix string) map[string]bool {
+//
+// The caller states which vocabulary it holds; this function never guesses.
+// The two domains are not distinguishable by inspection: in a repo whose tree
+// carries a top-level directory named like the repo prefix,
+// `repo-a/pkg/widget.go` is a valid path in *both*. Inferring "already
+// prefixed" from that spelling skips the real key
+// `repo-a/repo-a/pkg/widget.go`, so the changed target is missed — and when a
+// same-named `pkg/widget.go` also exists, that unchanged shadow is scanned in
+// its place. Admitting both candidate keys is not a fix either: it still lets
+// unchanged code be selected.
+func reviewChangedGraphPaths(changedFiles []string, domain analysis.PathDomain, repoPrefix string) map[string]bool {
 	changed := make(map[string]bool, len(changedFiles))
 	for _, f := range changedFiles {
-		f = filepath.Clean(strings.TrimSpace(f))
+		// Clean collapses "./" and "..", then Norm puts both vocabularies in
+		// the one comparison spelling — git already speaks '/', and a caller
+		// handing in a graph-keyed path carries native separators after the
+		// prefix. Identity on POSIX.
+		f = graphpath.Norm(filepath.Clean(strings.TrimSpace(f)))
 		if f == "" || f == "." {
 			continue
 		}
-		if repoPrefix != "" && !strings.HasPrefix(f, repoPrefix+"/") {
+		if domain == analysis.RepoRelativePath && repoPrefix != "" {
 			f = repoPrefix + "/" + f
 		}
 		changed[f] = true
@@ -698,7 +719,12 @@ func reviewChangedGraphPaths(changedFiles []string, repoPrefix string) map[strin
 // repo-relative spelling the rest of the review pipeline speaks: the rule
 // resolver matches `.gortex.yaml` globs against it, rankFileRisk keys its rows
 // on it, and post_review hands it to the forge's comment API.
+// Every one of those consumers speaks '/', so the result is normalized: a
+// graph path carries native separators after the prefix, and handing
+// `pkg\widget.go` to a `.gortex.yaml` glob or the forge comment API would
+// match nothing and anchor a comment nowhere. Identity on POSIX.
 func reviewRepoRelPath(path, repoPrefix string) string {
+	path = graphpath.Norm(path)
 	if repoPrefix == "" {
 		return path
 	}
@@ -1101,7 +1127,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, repoPrefix, allowedRepos)
+		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, analysis.RepoRelativePath, repoPrefix, allowedRepos)
 		impact = s.reviewImpact(diff.ChangedSymbols)
 		for _, cs := range diff.ChangedSymbols {
 			if cs.ID != "" {

@@ -147,7 +147,13 @@ func TestCachedConsentResolver(t *testing.T) {
 	if err := SaveConsent(dir, true, "test", nil); err != nil {
 		t.Fatal(err)
 	}
-	resolve := CachedConsentResolver(dir, 20*time.Millisecond)
+	// A stepped clock, not wall time: the TTL boundary is the thing under test,
+	// so the test must not lose a race between SaveConsent's disk write and a
+	// real deadline on a loaded machine.
+	const ttl = 20 * time.Millisecond
+	base, _ := time.Parse("2006-01-02", "2026-06-18")
+	clock := base
+	resolve := cachedConsentResolver(dir, ttl, func() time.Time { return clock })
 	if !resolve() {
 		t.Fatal("resolver should reflect persisted enabled=true")
 	}
@@ -155,12 +161,27 @@ func TestCachedConsentResolver(t *testing.T) {
 	if err := SaveConsent(dir, false, "test", nil); err != nil {
 		t.Fatal(err)
 	}
+	clock = base.Add(ttl - 1)
 	if !resolve() {
 		t.Error("within TTL the cached value should persist")
 	}
-	// After the TTL elapses it re-reads → false.
-	time.Sleep(30 * time.Millisecond)
+	// Once the TTL has elapsed it re-reads → false.
+	clock = base.Add(ttl)
 	if resolve() {
 		t.Error("after TTL the resolver should re-read and return false")
+	}
+}
+
+func TestCachedConsentResolverUsesRealClock(t *testing.T) {
+	t.Setenv("GORTEX_TELEMETRY", "")
+	t.Setenv("DO_NOT_TRACK", "")
+	dir := t.TempDir()
+	if err := SaveConsent(dir, true, "test", nil); err != nil {
+		t.Fatal(err)
+	}
+	// The exported constructor is the one production wires up; a long TTL keeps
+	// this to the wiring (dir + real clock) with no timing assumption.
+	if !CachedConsentResolver(dir, time.Hour)() {
+		t.Error("exported resolver should reflect persisted enabled=true")
 	}
 }
