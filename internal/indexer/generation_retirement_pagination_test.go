@@ -358,9 +358,32 @@ func TestCheckoutLifecycleRouteFlipAfterBatchProtectsGeneration(t *testing.T) {
 	lifecycle.coordMu.Lock()
 	_, stillOwed := lifecycle.owed[candidate]
 	lifecycle.coordMu.Unlock()
-	if !stillOwed {
-		t.Fatal("route-protected generation disappeared from retry set")
+	if stillOwed {
+		t.Fatal("durably pinned route generation remained as process-local retry debt")
 	}
+
+	route, found, err := catalog.GetCheckoutRoute(ctx, checkoutID)
+	if err != nil || !found {
+		t.Fatalf("read candidate route: found=%v err=%v", found, err)
+	}
+	if err := catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
+		CheckoutID: checkoutID, Slot: store_sqlite.RouteSlotCommit, GenerationID: oldRouted,
+		ExpectedRouteEpoch: route.RouteEpoch, State: store_sqlite.RouteActive,
+	}); err != nil {
+		t.Fatalf("move route off candidate: %v", err)
+	}
+	if _, err := catalog.PruneCheckoutCommitCachePins(ctx,
+		store_sqlite.CheckoutCommitCacheRetention{
+			InactiveCutoff:  time.Now().Add(time.Second).Unix(),
+			MaxGenerations:  32,
+			MaxStorageBytes: 1 << 62,
+		}); err != nil {
+		t.Fatalf("evict candidate pin: %v", err)
+	}
+	if retired := lifecycle.sweepRetirements(ctx); retired == 0 {
+		t.Fatal("pin deletion did not recreate durable retirement work")
+	}
+	requireGenerationRetired(t, fixture.store, candidate)
 }
 
 func generationIDs(rows []store_sqlite.ViewGeneration) []int64 {

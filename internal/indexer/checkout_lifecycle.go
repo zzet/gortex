@@ -3281,6 +3281,23 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 	l.coordMu.Unlock()
 
 	retired := 0
+	if l.store != nil && l.catalog != nil {
+		pruned, err := l.catalog.PruneCheckoutCommitCachePins(ctx,
+			store_sqlite.CheckoutCommitCacheRetention{
+				InactiveCutoff:  l.now().Add(-l.refViewRetention.RetainInactive).Unix(),
+				MaxGenerations:  l.refViewRetention.MaxCachedGenerations,
+				MaxStorageBytes: l.refViewRetention.MaxBytesPerGraph,
+			})
+		if err != nil {
+			l.logger.Debug("checkout lifecycle: could not prune checkout commit cache", zap.Error(err))
+		} else {
+			// Pin eviction removes the durable owner before payload retirement.
+			// Hand every evicted id to the lifecycle backlog first, so a live
+			// reader/build/base refusal survives this sweep and is retried later.
+			l.oweRetirement(pruned.EvictedGenerationIDs...)
+			owed = append(owed, pruned.EvictedGenerationIDs...)
+		}
+	}
 	for _, coordinator := range coordinators {
 		retired += coordinator.SweepRetirements(ctx)
 	}
@@ -3288,7 +3305,35 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 		return retired
 	}
 	owed = append(owed, l.orphanedGenerations(ctx, served, owed)...)
+	owed = append(owed, l.queuedCheckoutCommitCacheRetirements(ctx)...)
+	if l.catalog != nil {
+		pinned, err := l.catalog.CheckoutCommitCachePinnedGenerations(ctx, owed)
+		if err != nil {
+			// A failed owner read is not evidence that the generations are free.
+			l.logger.Debug("checkout lifecycle: could not read checkout commit cache pins", zap.Error(err))
+			return retired
+		}
+		if len(pinned) > 0 {
+			// Durable ownership supersedes process-local debt. If the pin is
+			// deleted later, schema-v21's trigger re-enqueues the generation;
+			// retaining the old owed entry only causes permanent retry churn and
+			// unbounded growth across independent re-pin races.
+			l.coordMu.Lock()
+			for generationID := range pinned {
+				delete(l.owed, generationID)
+			}
+			l.coordMu.Unlock()
+			eligible := owed[:0]
+			for _, generationID := range owed {
+				if _, held := pinned[generationID]; !held {
+					eligible = append(eligible, generationID)
+				}
+			}
+			owed = eligible
+		}
+	}
 	retireNewestFirst(owed)
+	owed = slices.Compact(owed)
 
 	inUse := func(generationID int64) bool {
 		return l.leases.InUse(generationID) || l.store.PayloadBuildFlightActive(generationID)
@@ -3306,6 +3351,34 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 		l.coordMu.Unlock()
 	}
 	return retired
+}
+
+// queuedCheckoutCommitCacheRetirements reads the durable handoff written by
+// cache-pin eviction. Unlike the generic orphan scan, these generations are
+// eligible while their checkout has a live coordinator: their cache owner was
+// deliberately revoked, and a concurrent route or re-pin is revalidated by
+// the catalog before retirement can claim the generation.
+func (l *CheckoutLifecycle) queuedCheckoutCommitCacheRetirements(ctx context.Context) []int64 {
+	if l == nil || l.catalog == nil {
+		return nil
+	}
+	const pageSize = 512
+	var (
+		after int64
+		out   []int64
+	)
+	for {
+		page, err := l.catalog.ListCheckoutCommitCacheRetirementCandidates(ctx, after, pageSize)
+		if err != nil {
+			l.logger.Debug("checkout lifecycle: could not read commit cache retirement queue", zap.Error(err))
+			return out
+		}
+		out = append(out, page...)
+		if len(page) < pageSize {
+			return out
+		}
+		after = page[len(page)-1]
+	}
 }
 
 // orphanedGenerations re-derives, from the catalog, the generations no one is

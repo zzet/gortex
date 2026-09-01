@@ -1515,13 +1515,23 @@ func TestCoordinatorLeavesAGenerationAnotherCheckoutRoutes(t *testing.T) {
 		t.Fatalf("generation %d was collected out from under the sibling's route", first.CommitGenerationID)
 	}
 
-	// The sibling leaves. Nothing names the generation now, so the offer the
-	// coordinator kept on its backlog finally succeeds.
+	// The sibling leaves, but the originating checkout's durable branch cache
+	// still owns A. Expire that cache entry explicitly; its deletion trigger,
+	// rather than the process-local backlog cleared above, must drive cleanup.
 	if err := f.catalog.DeleteCheckoutRoute(ctx, sibling); err != nil {
 		t.Fatalf("withdraw the sibling's route: %v", err)
 	}
-	if retired := c.SweepRetirements(ctx); retired != 1 {
-		t.Fatalf("the sweep collected %d generations once the sibling left, want 1", retired)
+	if _, err := f.catalog.PruneCheckoutCommitCachePins(ctx,
+		store_sqlite.CheckoutCommitCacheRetention{
+			InactiveCutoff:  time.Now().Add(time.Second).Unix(),
+			MaxGenerations:  32,
+			MaxStorageBytes: 1 << 62,
+		}); err != nil {
+		t.Fatalf("expire the originating checkout's commit cache pin: %v", err)
+	}
+	lifecycle := newGenerationRetirementLifecycle(f.store, time.Now())
+	if retired := lifecycle.sweepRetirements(ctx); retired != 1 {
+		t.Fatalf("the durable queue collected %d generations once the sibling left, want 1", retired)
 	}
 	if _, found := f.generation(first.CommitGenerationID); found {
 		t.Fatalf("generation %d survived the last route that named it", first.CommitGenerationID)
@@ -1584,9 +1594,18 @@ func TestCoordinatorRetiresACommitLayerTheCacheEvicts(t *testing.T) {
 		t.Fatal("the commit slot did not move")
 	}
 
-	// A cache of one has evicted A's generation. Its retire was refused while
-	// A's working-tree layer still named it as a base; the janitor retries
-	// after that layer has been collected in its turn.
+	// The process cache of one has evicted A, while the restart-safe durable
+	// cache still owns it. Expire the durable entry; its retire is then refused
+	// while A's working-tree layer still names it as a base, and the janitor
+	// retries after that layer has been collected in its turn.
+	if _, err := f.catalog.PruneCheckoutCommitCachePins(context.Background(),
+		store_sqlite.CheckoutCommitCacheRetention{
+			InactiveCutoff:  time.Now().Add(time.Second).Unix(),
+			MaxGenerations:  32,
+			MaxStorageBytes: 1 << 62,
+		}); err != nil {
+		t.Fatalf("expire the evicted commit's durable cache pin: %v", err)
+	}
 	c.SweepRetirements(context.Background())
 	if _, found := f.generation(first.CommitGenerationID); found {
 		t.Fatalf("generation %d survived eviction and two retire attempts", first.CommitGenerationID)
@@ -1597,6 +1616,131 @@ func TestCoordinatorRetiresACommitLayerTheCacheEvicts(t *testing.T) {
 	if _, found := f.generation(second.CommitGenerationID); !found {
 		t.Fatalf("the routed commit generation %d was collected", second.CommitGenerationID)
 	}
+}
+
+func TestCoordinatorSweepDropsDurablyPinnedBacklogWithoutWriter(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Retain: 1})
+	ctx := context.Background()
+
+	first := coordinatorReconcile(t, c)
+	f.commitTreeB()
+	second := coordinatorReconcile(t, c)
+	if second.CommitGenerationID == first.CommitGenerationID {
+		t.Fatal("the commit slot did not move")
+	}
+	// Isolate the old commit from unrelated refused dirty-layer cleanup before
+	// closing the writer gate. It remains process-local debt until the observed
+	// sweep transfers authority to its durable pin.
+	c.mu.Lock()
+	_, pending := c.backlog[first.CommitGenerationID]
+	c.backlog = map[int64]struct{}{first.CommitGenerationID: {}}
+	c.mu.Unlock()
+	if !pending {
+		t.Fatalf("pinned generation %d is not initially on the coordinator backlog", first.CommitGenerationID)
+	}
+
+	release, err := f.store.HoldWriteGate(ctx)
+	if err != nil {
+		t.Fatalf("hold writer gate: %v", err)
+	}
+	budget, cancel := context.WithTimeout(ctx, time.Second)
+	retired := c.SweepRetirements(budget)
+	budgetErr := budget.Err()
+	cancel()
+	release()
+	if budgetErr != nil {
+		t.Fatalf("pinned backlog sweep waited for the writer gate: %v", budgetErr)
+	}
+	if retired != 0 {
+		t.Fatalf("pinned backlog sweep retired %d generations", retired)
+	}
+	if _, found := f.generation(first.CommitGenerationID); !found {
+		t.Fatalf("pinned generation %d was retired", first.CommitGenerationID)
+	}
+	c.mu.Lock()
+	_, pending = c.backlog[first.CommitGenerationID]
+	c.mu.Unlock()
+	if pending {
+		t.Fatalf("durably pinned generation %d remained as process-local debt", first.CommitGenerationID)
+	}
+}
+
+func TestLifecyclePinnedOwedDebtReturnsThroughDurableRetirementQueue(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	coordinator := f.inertCoordinator(t, CheckoutCoordinatorConfig{Retain: 1})
+	ctx := context.Background()
+
+	first := coordinatorReconcile(t, coordinator)
+	f.commitTreeB()
+	second := coordinatorReconcile(t, coordinator)
+	if second.CommitGenerationID == first.CommitGenerationID {
+		t.Fatal("the commit slot did not move")
+	}
+	lifecycle := newGenerationRetirementLifecycle(f.store, time.Now())
+	lifecycle.oweRetirement(first.CommitGenerationID)
+	if retired := lifecycle.sweepRetirements(ctx); retired != 0 {
+		t.Fatalf("pinned owed sweep retired %d generations", retired)
+	}
+	if _, found := f.generation(first.CommitGenerationID); !found {
+		t.Fatalf("pinned generation %d was retired", first.CommitGenerationID)
+	}
+	lifecycle.coordMu.Lock()
+	_, owed := lifecycle.owed[first.CommitGenerationID]
+	lifecycle.coordMu.Unlock()
+	if owed {
+		t.Fatalf("durably pinned generation %d remained in lifecycle owed debt", first.CommitGenerationID)
+	}
+
+	pruned, err := f.catalog.PruneCheckoutCommitCachePins(ctx,
+		store_sqlite.CheckoutCommitCacheRetention{
+			InactiveCutoff:  time.Now().Add(time.Second).Unix(),
+			MaxGenerations:  32,
+			MaxStorageBytes: 1 << 62,
+		})
+	if err != nil {
+		t.Fatalf("evict durable pin: %v", err)
+	}
+	if len(pruned.EvictedGenerationIDs) == 0 {
+		t.Fatal("durable cache eviction produced no retirement handoff")
+	}
+	if retired := lifecycle.sweepRetirements(ctx); retired == 0 {
+		t.Fatal("durable retirement queue did not replace cleared process-local debt")
+	}
+	if _, found := f.generation(first.CommitGenerationID); found {
+		t.Fatalf("generation %d survived durable queue retirement", first.CommitGenerationID)
+	}
+}
+
+func BenchmarkCoordinatorSweepPinnedCommitBacklog(b *testing.B) {
+	f := newCoordinatorFixture(b)
+	c := f.inertCoordinator(b, CheckoutCoordinatorConfig{Retain: 1})
+	ctx := context.Background()
+	first := c.reconcile(ctx)
+	if first.Err != nil {
+		b.Fatal(first.Err)
+	}
+	f.commitTreeB()
+	second := c.reconcile(ctx)
+	if second.Err != nil || second.CommitGenerationID == first.CommitGenerationID {
+		b.Fatalf("build second commit: %+v", second)
+	}
+	c.SweepRetirements(ctx)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		c.mu.Lock()
+		c.backlog[first.CommitGenerationID] = struct{}{}
+		c.mu.Unlock()
+		b.StartTimer()
+		if retired := c.SweepRetirements(ctx); retired != 0 {
+			b.Fatalf("retired %d pinned generations", retired)
+		}
+	}
+	b.ReportMetric(0, "writer-transactions/op")
+	b.ReportMetric(1, "durable-debt-drops/op")
 }
 
 // --- closing ------------------------------------------------------------

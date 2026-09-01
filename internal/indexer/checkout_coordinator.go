@@ -2290,6 +2290,35 @@ func (c *CheckoutCoordinator) SweepRetirements(ctx context.Context) int {
 		pending = append(pending, generationID)
 	}
 	c.mu.Unlock()
+	if len(pending) == 0 {
+		return 0
+	}
+	if c.catalog != nil {
+		pinned, err := c.catalog.CheckoutCommitCachePinnedGenerations(ctx, pending)
+		if err != nil {
+			// A failed ownership read is not evidence that retirement is useful.
+			// Keep the backlog intact and let the next janitor pass retry.
+			return 0
+		}
+		if len(pinned) > 0 {
+			// A durable pin replaces this process-local retirement offer. Keeping
+			// both makes every janitor pass reread the same debt and lets repeated
+			// prune/re-pin races grow the backlog. The pin-delete trigger will
+			// recreate durable retirement work when the holder is later evicted.
+			c.mu.Lock()
+			for generationID := range pinned {
+				delete(c.backlog, generationID)
+			}
+			c.mu.Unlock()
+			eligible := pending[:0]
+			for _, generationID := range pending {
+				if _, held := pinned[generationID]; !held {
+					eligible = append(eligible, generationID)
+				}
+			}
+			pending = eligible
+		}
+	}
 	retireNewestFirst(pending)
 
 	retired := 0

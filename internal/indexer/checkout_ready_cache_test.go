@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
@@ -169,4 +170,127 @@ func TestCoordinatorReusesCanonicalCommitGenerationAfterRestart(t *testing.T) {
 	afterView := f.materialize(automatic.CheckoutID)
 	defer afterView.Close()
 	require.Equal(t, beforeIdentities, contentIdentities(afterView.Reader, automaticPrefix))
+}
+
+func TestCoordinatorRestartSweepRetainsInactiveCommitForSwitchBack(t *testing.T) {
+	f := newFamilyFixture(t, "ready-cache-inactive-restart")
+	defer f.close()
+	ctx := context.Background()
+	checkoutID := f.automatic.CheckoutID
+	runGit(t, f.worktree, "add", ".")
+	runGit(t, f.worktree, "commit", "-q", "-m", "tree A")
+	commitA := runGitWatcherGit(t, f.worktree, "rev-parse", "HEAD")
+
+	f.runCoordinator(checkoutID)
+	routeA, ok := f.routeOf(checkoutID)
+	require.True(t, ok)
+	require.Positive(t, routeA.CommitGenerationID)
+	generationA := routeA.CommitGenerationID
+
+	require.NoError(t, os.WriteFile(filepath.Join(f.worktree, "branch_b.go"),
+		[]byte("package a\n\nfunc BranchB() {}\n"), 0o644))
+	runGit(t, f.worktree, "add", ".")
+	runGit(t, f.worktree, "commit", "-q", "-m", "tree B")
+	f.runCoordinator(checkoutID)
+	routeB, ok := f.routeOf(checkoutID)
+	require.True(t, ok)
+	require.Positive(t, routeB.CommitGenerationID)
+	require.NotEqual(t, generationA, routeB.CommitGenerationID)
+
+	pinnedBefore, err := f.catalog.ListCheckoutCommitCachePins(ctx, routeB.GraphID)
+	require.NoError(t, err)
+	require.True(t, checkoutCommitPinnedBy(pinnedBefore, checkoutID, generationA),
+		"switching A -> B must durably retain A before restart")
+	require.True(t, checkoutCommitPinnedBy(pinnedBefore, checkoutID, routeB.CommitGenerationID),
+		"the selected B generation must bridge restart")
+
+	f.restart()
+	_, err = f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
+	require.NoError(t, err)
+	require.NoError(t, f.lc.Seed(ctx))
+	_, err = f.lc.Sweep(ctx)
+	require.NoError(t, err)
+
+	pinnedAfter, err := f.catalog.ListCheckoutCommitCachePins(ctx, routeB.GraphID)
+	require.NoError(t, err)
+	require.True(t, checkoutCommitPinnedBy(pinnedAfter, checkoutID, generationA),
+		"startup retirement sweep discarded inactive A generation %d", generationA)
+	_, found, err := f.catalog.GetViewGeneration(ctx, generationA)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	runGitWatcherGit(t, f.worktree, "checkout", "--detach", commitA)
+	third := f.runCoordinator(checkoutID)
+	routeAgain, ok := f.routeOf(checkoutID)
+	require.True(t, ok)
+	require.Equal(t, generationA, routeAgain.CommitGenerationID)
+	require.False(t, third.CommitBuilt, "restart-safe B -> A switch rebuilt A")
+	require.True(t, third.CommitReused, "restart-safe B -> A switch did not report cache reuse")
+}
+
+func TestCheckoutCommitCacheEvictionSurvivesRefusalAndLostRetryMemory(t *testing.T) {
+	f := newFamilyFixture(t, "ready-cache-eviction-retry")
+	defer f.close()
+	ctx := context.Background()
+	checkoutID := f.automatic.CheckoutID
+	runGit(t, f.worktree, "add", ".")
+	runGit(t, f.worktree, "commit", "-q", "-m", "tree A")
+
+	f.runCoordinator(checkoutID)
+	routeA, ok := f.routeOf(checkoutID)
+	require.True(t, ok)
+	require.Positive(t, routeA.CommitGenerationID)
+	generationA := routeA.CommitGenerationID
+
+	require.NoError(t, os.WriteFile(filepath.Join(f.worktree, "branch_b.go"),
+		[]byte("package a\n\nfunc BranchB() {}\n"), 0o644))
+	runGit(t, f.worktree, "add", ".")
+	runGit(t, f.worktree, "commit", "-q", "-m", "tree B")
+	f.runCoordinator(checkoutID)
+	routeB, ok := f.routeOf(checkoutID)
+	require.True(t, ok)
+	require.NotEqual(t, generationA, routeB.CommitGenerationID)
+
+	retention := DefaultRefViewRetention()
+	retention.RetainInactive = time.Hour
+	f.lc.refViewRetention = retention
+	f.clock.advance(2 * 365 * 24 * time.Hour)
+	lease := f.lc.ViewLeases().Acquire(generationA)
+	f.lc.sweepRetirements(ctx)
+
+	pins, err := f.catalog.ListCheckoutCommitCachePins(ctx, routeA.GraphID)
+	require.NoError(t, err)
+	require.False(t, checkoutCommitPinnedBy(pins, checkoutID, generationA),
+		"expired A pin survived retention")
+	_, found, err := f.catalog.GetViewGeneration(ctx, generationA)
+	require.NoError(t, err)
+	require.True(t, found, "live lease did not refuse the first retirement")
+	f.lc.coordMu.Lock()
+	_, owed := f.lc.owed[generationA]
+	delete(f.lc.owed, generationA)
+	f.lc.coordMu.Unlock()
+	require.True(t, owed, "pin eviction was not handed to the retry backlog")
+
+	// Dropping the process-local retry entry models a crash after the pin
+	// transaction committed. The durable retirement queue must still hand off
+	// the unpinned, unrouted layer even though this checkout has a live
+	// coordinator and runtime orphan discovery deliberately skips READY rows.
+	lease.Release()
+	f.lc.sweepRetirements(ctx)
+	_, found, err = f.catalog.GetViewGeneration(ctx, generationA)
+	require.NoError(t, err)
+	require.False(t, found, "evicted A was lost after retry memory disappeared")
+}
+
+func checkoutCommitPinnedBy(
+	pins []store_sqlite.CheckoutCommitCachePin,
+	checkoutID string,
+	generationID int64,
+) bool {
+	for _, pin := range pins {
+		if pin.CheckoutID == checkoutID && pin.GenerationID == generationID {
+			return true
+		}
+	}
+	return false
 }
