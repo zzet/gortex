@@ -1,7 +1,7 @@
 # Worktree and branch graph views
 
-**Status:** Draft specification, decision rounds 3–4 incorporated<br>
-**Date:** 2026-08-15<br>
+**Status:** Implementation validation reopened after the 2026-09-01 cold-start fanout incident; product decisions remain stable<br>
+**Date:** 2026-09-01<br>
 **Scope:** Persistent graph views for Git worktrees and branches<br>
 **Audience:** Gortex maintainers, indexer/storage owners, MCP/CLI owners
 
@@ -82,7 +82,7 @@ Delivery is foundational and staged: first define and enforce the view contract,
 | `MIGRATION-2` | Schema v21 adds checkout commit-cache pins, the durable retirement handoff queue/trigger, and indexes in place, backfills every currently routed commit plus all eligible checkout-owned ready/superseded commit generations before lifecycle retirement runs, and never rewrites or reindexes generation payload. Seed immediately applies retention bounds after the conservative backfill; `user_version=21` is committed only after the catalog migration and integrity checks succeed. | **DECIDED** |
 | `ANALYSIS-1` | Analyzer rollout beyond the structural profile is capability-by-capability; every producer is exact for the selected `ViewID` or explicitly unavailable/incomplete. | **DECIDED** |
 | `SLO-1` | The proposed latency/storage values are benchmark hypotheses; final targets are approved only after the Phase 3 shared-database prototype. | **DECIDED** |
-| `HOOKS-VIEW-1` | A hook/control-socket probe for a file in an undiscovered or grace-period checkout of a known family triggers immediate family reconciliation and fails open until that checkout's view is ready, then enforces normally. | **DECIDED** |
+| `HOOKS-VIEW-1` | A hook/control-socket probe for a ready, cataloged, route-free automatic checkout activates exactly that checkout and fails open until its view is ready, then enforces normally. Activation is checkout-debounced; family reconciliation is only the recovery fallback. Grace-period checkouts remain sealed read-only fallbacks and are never reactivated by a probe. | **DECIDED** |
 | `TEXT-SEARCH-VIEW-1` | Trigram `search_text` is a filesystem capability of the selected view: worktree views search their own `ViewRoot`; commit-only views report `capability_unavailable`. | **DECIDED** |
 | `LSP-SCOPE-1` | Automatic checkouts receive per-checkout workspace/LSP enrichment under a global concurrent-language-server cap with eviction; markers/state key by generation and checkout. | **DECIDED** |
 | `PREFIX-1` | A new dedicated worktree graph derives its `RepoPrefix` from the stable worktree administrative name (`<base>@<admin-name>`) with a deterministic offline-reproducible collision rule; existing prefixes are preserved. | **DECIDED** |
@@ -3263,6 +3263,114 @@ failure, panic, or timeout (slowest package `internal/indexer`, 782.972 s;
 approximately 13m30s total wall), `golangci-lint run --timeout=5m` with zero
 issues, `go vet ./...`, and `git diff --check`. Focused publication, retirement,
 route, replay, and migration races plus all four per-fix benchmarks also passed.
-This closes the durable checkout-cache and worktree-overlay acceptance ledger;
-the separate fault-injection gate for an actually exhausted filesystem remains
-part of the cold-failure hardening contract above.
+This closed the durable checkout-cache and worktree-overlay acceptance ledger
+for that revision. The later cold-start fanout incident below supersedes the
+closure claim and reopens final acceptance; the separate fault-injection gate
+for an actually exhausted filesystem also remains part of the cold-failure
+hardening contract above.
+
+#### Post-acceptance cold-start fanout incident and repairs (2026-09-01)
+
+A later clean-store run of feature revision `a6570f69` disproved the assumption
+that successful bounded-family replay also made a machine-wide cold start safe.
+After 1 hour 40 minutes the daemon was still `warming up (resolving
+references)`, with 1,360 goroutines and 29 configured repositories. Earlier in
+the same incident Activity Monitor's process-list `Memory`/footprint column
+reported 43.17 GB while its inspector reported a 1.02 GB `Real Memory Size`.
+The later daemon status separately reported 693.5 MiB Go live allocation and
+3.9 GiB runtime `Sys`; these are different metrics and are not interpreted as
+RSS or as proof of how the earlier footprint was recovered. The daemon was not
+merely finishing one slow repository.
+
+Native log, process, SQLite, and pprof evidence identified a compounded
+fanout/liveness failure:
+
+- cold inventory created approximately 285 checkout coordinators, including
+  roughly 256 automatic checkouts from one Git family, rather than keeping
+  never-selected route-free worktrees catalog-only;
+- those coordinators serialized physical generation construction through one
+  SQLite writer. Parse commonly finished in 2–4 seconds while closure/drain and
+  SQLite row/page-cache work took hundreds of seconds, with observed builds as
+  long as 1,307 seconds;
+- 237 goroutines were blocked at view-build admission while the old binary
+  continued polling and scheduling the fanout;
+- guarded Git-ref reconciliation did not advance its acknowledged SHA and
+  repeated the same no-op transaction two to three times per second;
+- a required configured/dedicated publication could queue behind ordinary ref
+  or background work, while pre-generation and dedicated-base-refresh failures
+  could remain represented as `Building` forever;
+- `SQLITE_FULL` in `AddBatch` escaped as a fatal panic. When abandonment also
+  timed out, the durable generation could not be marked failed and startup had
+  no terminal verdict; and
+- a route-free worktree selected by a control probe requested a whole-family
+  reconcile. The lazy policy intentionally leaves `ReadyConfirmed` automatic
+  rows dormant, so that request was no longer a progress edge.
+
+The repair is intentionally split into atomic commits:
+
+| Commit | Repair and invariant |
+| --- | --- |
+| `b8c47fae` | Warmup reports the exact frozen checkout cohort instead of repeating opaque aggregate counts. |
+| `20bd577e` | Dedicated publication receives lifecycle priority; superseded by the stricter required class below. |
+| `875b831e` | A successful guarded ref update acknowledges the observed SHA, eliminating the no-op reconciliation/WAL loop. |
+| `f6ffbcf9` | Raw indexing converts expected storage exhaustion into typed terminal failure while releasing mutation/admission resources; arbitrary programmer panics still propagate. |
+| `af1d1137` | Watcher point/storm paths contain the same typed storage failures, complete waiters, and avoid killing the daemon. |
+| `8731d9a2` | Cold discovery persists automatic worktrees as catalog-only rows. Configured/dedicated or transitioning owners and previously routed/live warm checkouts receive coordinators/watchers; dormant route-free siblings activate on selection. |
+| `beee692e` | Startup uses two admission phases: `OpenRequired` publishes the frozen exact cohort, finalizers observe its terminal graph, then full `Open` releases interactive/ref/background work. Required admission is non-rejecting, failure fails open into degraded service, and primary switching obeys build-gate → family-topology → checkout-topology order. Dedicated refresh failure is keyed independently by graph plus active fallback generation, so a nested replacement generation cannot erase its terminal verdict. |
+| `771dd576` | A probe of a ready route-free automatic checkout asynchronously activates exactly its checkout ID. Checkout-scoped debounce prevents signal storms; a rejected launch clears its stamp and requests the separately debounced family-reconciliation recovery path. Dedicated, inaccessible, and removal-grace checkouts retain their prior behavior. |
+
+`OpenRequired` admits the unbounded lifecycle-critical class: startup
+coordinator publication plus dedicated-base construction/refresh, promotion,
+rehome, and primary switching. The startup finalizer waits specifically for its
+frozen exact cohort before full `Open` releases ordinary work. Rejecting the
+129th healthy required owner because it lost a wake race would turn transient
+occupancy into a false terminal failure. Interactive and background queue
+limits, including their zero-capacity semantics, are unchanged. Cold catalog
+cardinality still bounds the startup cohort: automatic route-free discoveries
+are not members of it.
+
+The process-local terminal registries also have distinct identities. Sparse
+commit/dirty attempts remain keyed by checkout plus replacement generation;
+dedicated-base refresh attempts are keyed by graph plus the still-active base
+generation. Readiness consults the latter only while that exact graph/base pair
+is the labeled fallback. A replacement build may allocate and fail a newer
+generation without overwriting the refresh verdict for the old active base.
+
+Focused post-repair evidence on Apple M1 Pro:
+
+| Gate or path | Result |
+| --- | ---: |
+| Required build-gate handoff | median 868.6 ns/op, 527–528 B/op, 12 allocs/op (5 runs) |
+| Existing normal build-gate handoff | median 952.5 ns/op, 655–656 B/op, 13 allocs/op (5 runs) |
+| Settled coordinator cycle | median 115.6 ns/op, 96 B/op, 2 allocs/op (5 runs) |
+| Debounced route-free automatic probe | median 193.6 µs/op, about 40.0 KiB/op, 526 allocs/op (5 runs) |
+| Existing generation-backed dedicated probe | median 573.8 µs/op, about 96.6 KiB/op, 1,503 allocs/op (5 runs) |
+| Storage-panic success boundary | median 4.769 ns/op, 0 B/op, 0 allocs/op (5 runs) |
+| Watcher retry coalescing / retry cycle | median 18.20 ns/op, 0 allocs / 6.564 µs/op, 1,424 B, 24 allocs (5 runs) |
+| Deferred mutation-admission retry cycle | median 8.230 µs/op, about 1,832 B/op, 26–27 allocs/op (5 runs) |
+| Guarded zero-patch Git-ref acknowledgement | median 8.657 ms/op, about 25.1 KiB/op, 140 allocs/op (5 runs) |
+| Dormant startup admission scan | 256 rows median 426.3 ns; 10,000 rows median 16.700 µs; 0 B/op and 0 allocs/op (5 runs) |
+| Dedicated-base refresh admission/coalescing | median 14.37 ns/op, 0 B/op, 0 allocs/op (5 runs) |
+| Primary switch/promotion/demotion contention | PASS 10 repetitions; 152.908 s package time |
+| Required/failure/controller focused race gate | PASS; indexer 40.085 s, controller 10.196 s |
+| Probe activation/debounce/recovery race stress | PASS 10 repetitions; 63.331 s |
+| Real lifecycle dormant-worktree activation race stress | PASS 10 repetitions; 25.334 s |
+
+Tests additionally admit and drain a 256-member required wake cohort with zero
+rejections; reconcile offline HEAD changes and dirty-only edit/add/delete/
+untracked changes before full admission opens; make pre-generation and nested
+base-refresh failures terminal; prove the SetPrimary lock order; and prove that
+distinct checkout probes do not coalesce or hold the debounce mutex while
+calling lifecycle activation. All controller validation used isolated
+HOME/XDG/cache/config/store namespaces so concurrent writes by the machine-wide
+daemon could not invalidate the test package's user-state guard. The live
+daemon was not stopped, restarted, signaled, reconfigured, or used as the test
+store.
+
+This repairs the identified fanout and terminal-liveness mechanisms, but it does
+not by itself restore the final acceptance claim. Before push/release, the
+current branch MUST pass the repository-wide tests, race/lint/vet gates, a
+private-daemon cold start over a high-cardinality worktree family, unchanged
+warm restart, selection-driven activation, overlay priority, branch/ref reuse,
+grace/removal cleanup, and explicit disk/RSS/time ceilings. The machine-wide
+daemon remains outside that validation.
