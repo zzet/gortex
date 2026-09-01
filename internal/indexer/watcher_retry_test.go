@@ -10,8 +10,13 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"go.uber.org/zap"
 )
+
+type committedMutationTestError struct{ error }
+
+func (committedMutationTestError) Committed() bool { return true }
 
 func newMutationRetryTestWatcher(t testing.TB) *Watcher {
 	t.Helper()
@@ -89,6 +94,76 @@ func TestMutationRetryPermanentErrorIsTerminal(t *testing.T) {
 	if attempts.Load() != 1 {
 		t.Fatalf("attempts = %d, want 1", attempts.Load())
 	}
+}
+
+func TestPointStoragePanicCompletesTicketWithTypedError(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	_, storageErr := indexCtxRawStorageError(t)
+	var attempts atomic.Int32
+	w.pointMutationPatch = func(string, ChangeKind, uint64) error {
+		attempts.Add(1)
+		panic(storageErr)
+	}
+
+	result := awaitMutationRetryResult(t, w.scheduleFileMutation("storage-full.go", ChangeModified))
+	var typed *store_sqlite.StorageError
+	if result.Reindexed || !errors.As(result.Err, &typed) || typed != storageErr {
+		t.Fatalf("storage panic result = %+v, want original StorageError %p", result, storageErr)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("storage panic attempts = %d, want terminal single attempt", attempts.Load())
+	}
+}
+
+func TestGuardWatcherPanicRecoversOnlyTypedStoragePanic(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	_, storageErr := indexCtxRawStorageError(t)
+	func() {
+		defer w.guardWatcherPanic("test background mutation")
+		panic(storageErr)
+	}()
+
+	wantPanic := &struct{ label string }{label: "programmer panic"}
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		func() {
+			defer w.guardWatcherPanic("test background mutation")
+			panic(wantPanic)
+		}()
+	}()
+	if recovered != wantPanic {
+		t.Fatalf("recovered panic = %#v, want original %#v", recovered, wantPanic)
+	}
+}
+
+func TestPointMutationRepanicsArbitraryPanicWithoutCompletingTicket(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	const path = "programmer-panic.go"
+	done := make(chan MutationResult, 1)
+	w.mu.Lock()
+	w.pendingGeneration[path] = 1
+	w.mutationWaiters = map[string]map[uint64]chan MutationResult{path: {1: done}}
+	w.mu.Unlock()
+	wantPanic := &struct{ label string }{label: "programmer panic"}
+	w.pointMutationPatch = func(string, ChangeKind, uint64) error {
+		panic(wantPanic)
+	}
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		w.runPointMutation(path, ChangeModified, 1, 0)
+	}()
+	if recovered != wantPanic {
+		t.Fatalf("recovered panic = %#v, want original %#v", recovered, wantPanic)
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("arbitrary panic falsely completed ticket: %+v", result)
+	default:
+	}
+	w.failMutationWaiters(errWatcherStopped)
 }
 
 func TestMutationRetryStopTerminatesPendingTimer(t *testing.T) {
@@ -311,8 +386,9 @@ func TestStormPermanentCompletionDefersToSuccessor(t *testing.T) {
 	}
 }
 
-func TestStormDrainPanicCompletesDetachedWaiters(t *testing.T) {
+func TestStormStoragePanicCompletesDetachedWaitersWithTypedError(t *testing.T) {
 	w := newMutationRetryTestWatcher(t)
+	_, storageErr := indexCtxRawStorageError(t)
 	const path = "storm-panic.go"
 	done := make(chan MutationResult, 1)
 	w.mu.Lock()
@@ -324,14 +400,15 @@ func TestStormDrainPanicCompletesDetachedWaiters(t *testing.T) {
 	w.stormGenerations[path] = 1
 	w.stormMu.Unlock()
 	w.batchReindex = func([]string) (*IndexResult, error) {
-		panic("injected storm panic")
+		panic(storageErr)
 	}
 
 	w.drainStorm()
 	select {
 	case result := <-done:
-		if result.Reindexed || result.Err == nil {
-			t.Fatalf("panic result = %+v", result)
+		var typed *store_sqlite.StorageError
+		if result.Reindexed || !errors.As(result.Err, &typed) || typed != storageErr {
+			t.Fatalf("storage panic result = %+v, want original StorageError %p", result, storageErr)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("panic stranded detached storm waiter")
@@ -340,8 +417,41 @@ func TestStormDrainPanicCompletesDetachedWaiters(t *testing.T) {
 	leaked := len(w.mutationWaiters[path])
 	w.mu.Unlock()
 	if leaked != 0 {
-		t.Fatalf("panic leaked %d waiter(s)", leaked)
+		t.Fatalf("storage panic leaked %d waiter(s)", leaked)
 	}
+}
+
+func TestStormDrainRepanicsArbitraryPanicWithoutCompletingWaiters(t *testing.T) {
+	w := newMutationRetryTestWatcher(t)
+	const path = "storm-programmer-panic.go"
+	done := make(chan MutationResult, 1)
+	w.mu.Lock()
+	w.pendingGeneration[path] = 1
+	w.mutationWaiters = map[string]map[uint64]chan MutationResult{path: {1: done}}
+	w.mu.Unlock()
+	w.stormMu.Lock()
+	w.stormBatch[path] = ChangeModified
+	w.stormGenerations[path] = 1
+	w.stormMu.Unlock()
+	wantPanic := &struct{ label string }{label: "programmer panic"}
+	w.batchReindex = func([]string) (*IndexResult, error) {
+		panic(wantPanic)
+	}
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		w.drainStorm()
+	}()
+	if recovered != wantPanic {
+		t.Fatalf("recovered panic = %#v, want original %#v", recovered, wantPanic)
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("arbitrary panic falsely completed storm waiter: %+v", result)
+	default:
+	}
+	w.failMutationWaiters(errWatcherStopped)
 }
 
 func TestRetryableMutationErrorClassifier(t *testing.T) {
@@ -356,6 +466,10 @@ func TestRetryableMutationErrorClassifier(t *testing.T) {
 	}
 	if retryableMutationError(context.Canceled) {
 		t.Fatal("cancellation must remain terminal")
+	}
+	committedDeadline := committedMutationTestError{error: fmt.Errorf("committed storage failure: %w", context.DeadlineExceeded)}
+	if retryableMutationError(committedDeadline) {
+		t.Fatal("committed storage failure must not retry even when it wraps a retryable deadline")
 	}
 	for attempt, want := range map[int]time.Duration{1: 100 * time.Millisecond, 2: 200 * time.Millisecond, 7: 5 * time.Second, 100: 5 * time.Second} {
 		if got := mutationRetryBackoff(attempt); got != want {

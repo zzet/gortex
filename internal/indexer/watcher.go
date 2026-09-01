@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 )
@@ -238,6 +239,10 @@ const (
 )
 
 func retryableMutationError(err error) bool {
+	var committed interface{ Committed() bool }
+	if errors.As(err, &committed) && committed.Committed() {
+		return false
+	}
 	return errors.Is(err, context.DeadlineExceeded)
 }
 
@@ -1356,23 +1361,38 @@ func (w *Watcher) signalStopped() {
 	w.stoppedOnce.Do(func() { close(w.stopped) })
 }
 
-// guardWatcherPanic recovers a panic in a watcher background goroutine —
+// guardWatcherPanic recovers a typed store panic in a watcher background goroutine —
 // a debounced patch, a storm drain, an overflow reconcile, or a
 // new-directory scan. Those goroutines call into the graph store, and
-// store_sqlite turns a fatal storage error (a closed DB during a daemon
-// restart, a busy/locked DB, disk-full) into a panic via panicOnFatal.
+// legacy store methods turn operational SQLite failures into a typed panic.
 // The MCP tool path has its own firewall (wrapToolHandler); these
 // fsnotify-driven goroutines don't route through it, so without this a
-// single transient store error during a restart or rebuild takes the
-// whole daemon down. Recovering aborts just that unit of work — the file
-// stays stale until the next event or the reconcile janitor — instead of
-// crashing the process.
+// storage error can take the whole daemon down. Arbitrary error-valued,
+// runtime, parser, and programmer panics must continue propagating unchanged.
 func (w *Watcher) guardWatcherPanic(op string) {
-	if r := recover(); r != nil && w.logger != nil {
-		w.logger.Error("watcher: recovered from panic in background re-index",
-			zap.String("op", op),
-			zap.Any("panic", r),
-			zap.Stack("stack"))
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	panicErr, ok := watcherStoragePanicError(op, recovered)
+	if !ok {
+		panic(recovered)
+	}
+	w.logWatcherStorageFailure(op, panicErr)
+}
+
+func watcherStoragePanicError(op string, recovered any) (error, bool) {
+	storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+	if !ok {
+		return nil, false
+	}
+	return fmt.Errorf("watcher: %s storage failure: %w", op, storageErr), true
+}
+
+func (w *Watcher) logWatcherStorageFailure(op string, err error) {
+	if w.logger != nil {
+		w.logger.Error("watcher: storage failure in background re-index",
+			zap.String("op", op), zap.Error(err), zap.Stack("stack"))
 	}
 }
 
@@ -1815,8 +1835,15 @@ func (w *Watcher) runPointMutation(path string, kind ChangeKind, generation uint
 	}
 	defer release()
 	complete := true
-	defer w.guardWatcherPanic("patch " + path)
 	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr, ok := watcherStoragePanicError("patch "+path, recovered)
+			if !ok {
+				panic(recovered)
+			}
+			patchErr = panicErr
+			w.logWatcherStorageFailure("patch "+path, panicErr)
+		}
 		if complete {
 			if w.mutationBeforeComplete != nil {
 				w.mutationBeforeComplete(path, generation)
@@ -1828,6 +1855,10 @@ func (w *Watcher) runPointMutation(path string, kind ChangeKind, generation uint
 		patchErr = w.pointMutationPatch(path, kind, generation)
 	} else {
 		patchErr = w.patchGraph(path, kind, generation)
+	}
+	var storageErr *store_sqlite.StorageError
+	if errors.As(patchErr, &storageErr) {
+		w.logWatcherStorageFailure("patch "+path, patchErr)
 	}
 	if w.mutationAdmissionStopped() {
 		patchErr = errWatcherStopped
@@ -2060,13 +2091,16 @@ func (w *Watcher) stopStormTimerLocked() {
 func (w *Watcher) drainStorm() {
 	var generations map[string]uint64
 	defer func() {
-		if recovered := recover(); recovered != nil {
-			panicErr := fmt.Errorf("watcher: storm drain panic: %v", recovered)
-			if w.logger != nil {
-				w.logger.Error("watcher: recovered storm drain panic", zap.Error(panicErr))
-			}
-			w.completeStormMutationWaiters(generations, nil, panicErr)
+		recovered := recover()
+		if recovered == nil {
+			return
 		}
+		panicErr, ok := watcherStoragePanicError("storm drain", recovered)
+		if !ok {
+			panic(recovered)
+		}
+		w.logWatcherStorageFailure("storm drain", panicErr)
+		w.completeStormMutationWaiters(generations, nil, panicErr)
 	}()
 	w.stormMu.Lock()
 	stopped := w.stormStopped

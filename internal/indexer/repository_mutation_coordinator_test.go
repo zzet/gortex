@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"go.uber.org/zap"
 )
@@ -167,7 +169,8 @@ func TestRepositoryMutationCoordinatorFullDominatesQueuedPaths(t *testing.T) {
 	}
 }
 
-func TestRepositoryMutationCoordinatorRecoversPanicAndRunsDirtyFollowup(t *testing.T) {
+func TestRepositoryMutationCoordinatorReturnsStoragePanicAndRunsDirtyFollowup(t *testing.T) {
+	_, storageErr := indexCtxRawStorageError(t)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
@@ -176,7 +179,7 @@ func TestRepositoryMutationCoordinatorRecoversPanicAndRunsDirtyFollowup(t *testi
 		if call == 1 {
 			close(started)
 			<-release
-			panic("store failure")
+			panic(storageErr)
 		}
 		return &IndexResult{FileCount: int(call)}, nil
 	})
@@ -201,14 +204,130 @@ func TestRepositoryMutationCoordinatorRecoversPanicAndRunsDirtyFollowup(t *testi
 	})
 	close(release)
 
-	if got := <-first; got.result != nil || got.err == nil {
-		t.Fatalf("panic outcome = result:%#v err:%v", got.result, got.err)
+	if got := <-first; got.result != nil {
+		t.Fatalf("storage panic result = %#v, want nil", got.result)
+	} else {
+		var typed *store_sqlite.StorageError
+		if !errors.As(got.err, &typed) || typed != storageErr {
+			t.Fatalf("storage panic error = %T %v, want original StorageError %p", got.err, got.err, storageErr)
+		}
 	}
 	if got := <-second; got.err != nil || got.result == nil || got.result.FileCount != 2 {
 		t.Fatalf("dirty followup = result:%#v err:%v", got.result, got.err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("executor calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestRepositoryMutationCoordinatorDeliversStoragePanicToCoalescedWaiters(t *testing.T) {
+	_, storageErr := indexCtxRawStorageError(t)
+	var calls atomic.Int32
+	coordinator := newRepositoryMutationCoordinator(func([]string) (*IndexResult, error) {
+		calls.Add(1)
+		panic(storageErr)
+	})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	exclusiveDone := make(chan error, 1)
+	go func() {
+		exclusiveDone <- coordinator.runExclusive(context.Background(), func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	results := make(chan error, 2)
+	for _, path := range []string{"a.go", "b.go"} {
+		go func(path string) {
+			result, err := coordinator.reconcile(context.Background(), []string{path})
+			if result != nil {
+				results <- fmt.Errorf("result for %s = %#v, want nil", path, result)
+				return
+			}
+			results <- err
+		}(path)
+	}
+	waitForRepositoryMutationStats(t, coordinator, func(stats repositoryMutationCoordinatorStats) bool {
+		return stats.RequestedGeneration == 2 && stats.PendingPaths == 2
+	})
+	close(release)
+	if err := <-exclusiveDone; err != nil {
+		t.Fatalf("exclusive holder: %v", err)
+	}
+
+	for range 2 {
+		err := <-results
+		var typed *store_sqlite.StorageError
+		if !errors.As(err, &typed) || typed != storageErr {
+			t.Fatalf("coalesced storage panic error = %T %v, want original StorageError %p", err, err, storageErr)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("coalesced executor calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestExecuteRepositoryMutationRepanicsArbitraryPanic(t *testing.T) {
+	wantPanic := &struct{ label string }{label: "programmer panic"}
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = executeRepositoryMutation(func([]string) (*IndexResult, error) {
+			panic(wantPanic)
+		}, []string{"a.go"})
+	}()
+	if recovered != wantPanic {
+		t.Fatalf("recovered panic = %#v, want original %#v", recovered, wantPanic)
+	}
+}
+
+func TestRepositoryMutationExclusiveReturnsStoragePanicAndReleasesLane(t *testing.T) {
+	_, storageErr := indexCtxRawStorageError(t)
+	coordinator := newRepositoryMutationCoordinator(nil)
+	err := coordinator.runExclusive(context.Background(), func() error {
+		panic(storageErr)
+	})
+	var typed *store_sqlite.StorageError
+	if !errors.As(err, &typed) || typed != storageErr {
+		t.Fatalf("exclusive storage panic error = %T %v, want original StorageError %p", err, err, storageErr)
+	}
+	if err := coordinator.runExclusive(context.Background(), func() error { return nil }); err != nil {
+		t.Fatalf("lane remained unavailable after storage panic: %v", err)
+	}
+}
+
+func TestRepositoryMutationExclusiveRepanicsArbitraryPanicAndReleasesLane(t *testing.T) {
+	wantPanic := &struct{ label string }{label: "programmer panic"}
+	coordinator := newRepositoryMutationCoordinator(nil)
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = coordinator.runExclusive(context.Background(), func() error {
+			panic(wantPanic)
+		})
+	}()
+	if recovered != wantPanic {
+		t.Fatalf("recovered panic = %#v, want original %#v", recovered, wantPanic)
+	}
+	if err := coordinator.runExclusive(context.Background(), func() error { return nil }); err != nil {
+		t.Fatalf("lane remained unavailable after arbitrary panic: %v", err)
+	}
+}
+
+func BenchmarkExecuteRepositoryMutationStoragePanicBoundarySuccess(b *testing.B) {
+	want := &IndexResult{FileCount: 1}
+	executor := func([]string) (*IndexResult, error) { return want, nil }
+	paths := []string{"a.go"}
+	b.ReportAllocs()
+	for b.Loop() {
+		outcome := executeRepositoryMutation(executor, paths)
+		if outcome.result != want || outcome.err != nil {
+			b.Fatalf("outcome = result:%p err:%v, want result:%p", outcome.result, outcome.err, want)
+		}
 	}
 }
 

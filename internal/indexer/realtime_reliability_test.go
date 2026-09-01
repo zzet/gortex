@@ -533,34 +533,35 @@ func TestWatcher_DirEventScanGating(t *testing.T) {
 	}
 }
 
-// panicOnReadStore wraps a real Store but panics on GetFileNodes once
-// armed — the shape store_sqlite's panicOnFatal produces when the DB is
-// closed/locked (e.g. mid daemon-restart) or its schema is missing.
+// panicOnReadStore wraps a real Store but emits a typed storage panic from
+// GetFileNodes once armed — the exact operational shape panicOnFatal exposes
+// at legacy Store boundaries.
 type panicOnReadStore struct {
 	graph.Store
-	armed atomic.Bool
+	armed      atomic.Bool
+	panicValue any
 }
 
 func (s *panicOnReadStore) GetFileNodes(p string) []*graph.Node {
 	if s.armed.Load() {
-		panic("simulated fatal store error")
+		panic(s.panicValue)
 	}
 	return s.Store.GetFileNodes(p)
 }
 
-// TestWatcher_PatchPanicRecoveredNotCrash proves the watcher panic
-// firewall: a fatal store error during a debounced patch is recovered
+// TestWatcher_PatchStoragePanicRecoveredNotCrash proves the watcher panic
+// firewall: a typed storage error during a debounced patch is recovered
 // and logged, not propagated out of the timer goroutine to crash the
 // whole daemon. The fsnotify-driven goroutines don't route through the
 // MCP wrapToolHandler firewall, so a closed/locked DB during a restart
 // (panicOnFatal) used to take the process down — the exact shape of the
-// observed crash. Against the pre-firewall code the panic escapes the
-// AfterFunc goroutine and aborts the test binary.
-func TestWatcher_PatchPanicRecoveredNotCrash(t *testing.T) {
+// observed crash. Arbitrary panics are covered separately and still escape.
+func TestWatcher_PatchStoragePanicRecoveredNotCrash(t *testing.T) {
 	ext := &toggleExtractor{}
 	reg := parser.NewRegistry()
 	reg.Register(ext)
-	store := &panicOnReadStore{Store: graph.New()}
+	_, storageErr := indexCtxRawStorageError(t)
+	store := &panicOnReadStore{Store: graph.New(), panicValue: storageErr}
 	idx := New(store, reg, config.IndexConfig{Workers: 1}, zap.NewNop())
 	idx.search = search.NewNull()
 	dir := t.TempDir()
@@ -585,7 +586,7 @@ func TestWatcher_PatchPanicRecoveredNotCrash(t *testing.T) {
 	})
 
 	require.Eventually(t, func() bool {
-		return logs.FilterMessageSnippet("recovered from panic").Len() > 0
+		return logs.FilterMessageSnippet("storage failure in background re-index").Len() > 0
 	}, 2*time.Second, 10*time.Millisecond,
-		"a panic in the debounced patch must be recovered and logged, not crash the daemon")
+		"a storage panic in the debounced patch must be recovered and logged, not crash the daemon")
 }

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 const repositoryMutationPathCap = 2048
@@ -227,10 +229,16 @@ func (c *repositoryMutationCoordinator) drain() {
 
 func executeRepositoryMutation(executor repositoryMutationExecutor, paths []string) (outcome repositoryMutationOutcome) {
 	defer func() {
-		if recovered := recover(); recovered != nil {
-			outcome.result = nil
-			outcome.err = fmt.Errorf("repository mutation panic: %v", recovered)
+		recovered := recover()
+		if recovered == nil {
+			return
 		}
+		storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+		if !ok {
+			panic(recovered)
+		}
+		outcome.result = nil
+		outcome.err = fmt.Errorf("repository mutation storage failure: %w", storageErr)
 	}()
 	if executor == nil {
 		outcome.err = errors.New("repository mutation executor is not configured")
@@ -256,7 +264,22 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	ctx context.Context,
 	acquireBatchGate bool,
 	fn func() error,
-) error {
+) (retErr error) {
+	// This boundary is registered before the lane and batch-gate defers, so
+	// every admission resource is released before an operational store panic is
+	// returned to the watcher. Programmer and runtime panics retain their exact
+	// payload and propagation semantics.
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+		if !ok {
+			panic(recovered)
+		}
+		retErr = fmt.Errorf("repository exclusive mutation storage failure: %w", storageErr)
+	}()
 	if fn == nil {
 		return nil
 	}
