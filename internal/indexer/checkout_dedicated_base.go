@@ -42,15 +42,16 @@ func (l *CheckoutLifecycle) buildPromotedCorpus(
 	checkout store_sqlite.Checkout,
 	prefix string,
 ) (*IndexResult, int64, checkoutSample, int, error) {
-	// This is the one physical full-tree pass a promotion requires. It is
-	// background work: interactive ref/checkout requests retain their bounded
-	// burst ahead of it in the shared gate, while the mode-transition scheduler
-	// prevents a restart journal from filling that background queue with one
-	// waiter per row.
+	// This is the one physical full-tree pass a promotion requires. A promotion
+	// is foreground admission: it is durable user/config intent and may be part
+	// of the daemon's exact startup cohort. Classifying it as background lets a
+	// cold automatic-worktree queue hold configured repositories unready for
+	// hours. The gate's bounded interactive burst still prevents already-queued
+	// background maintenance from starving.
 	release := func() {}
 	if gate := l.buildGate(); gate != nil {
 		var err error
-		release, err = gate.Acquire(ctx, ViewBuildBackground)
+		release, err = gate.Acquire(ctx, ViewBuildInteractive)
 		if err != nil {
 			return nil, 0, checkoutSample{}, 0, fmt.Errorf(
 				"indexer: wait for dedicated base build admission: %w", err)

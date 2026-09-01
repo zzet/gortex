@@ -268,7 +268,10 @@ func (l *CheckoutLifecycle) refreshDedicatedBase(
 
 	release := func() {}
 	if gate := l.buildGate(); gate != nil {
-		release, err = gate.Acquire(ctx, ViewBuildBackground)
+		// A configured dedicated graph cannot become exact until this refresh
+		// publishes. Admit it with other foreground lifecycle work so an
+		// automatic overlay backlog cannot starve daemon readiness.
+		release, err = gate.Acquire(ctx, ViewBuildInteractive)
 		if err != nil {
 			return fmt.Errorf("indexer: wait for dedicated base refresh admission: %w", err)
 		}

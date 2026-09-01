@@ -517,16 +517,19 @@ func TestDedicatedBaseExcludesDirtyFilesystemContent(t *testing.T) {
 
 // TestPromotionBuildAdmissionIsRetryable holds the shared physical lane while
 // a promotion is admitted. The base build must not bypass that lane; bounded
-// background overflow leaves the durable transition pending, and the identical
+// foreground overflow leaves the durable transition pending, and the identical
 // request completes it once capacity is available.
 func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
 	f := newFamilyFixture(t, "promote-admission")
 	defer f.close()
 	ctx := context.Background()
 
-	gate := newViewBuildGateWithLimits(1, 0)
+	// A zero interactive queue proves promotion is classified as foreground:
+	// background still has capacity, so a background admission would park here
+	// instead of returning the retryable overload result below.
+	gate := newViewBuildGateWithLimits(0, 1)
 	gate.Open()
-	release, err := gate.Acquire(ctx, ViewBuildInteractive)
+	release, err := gate.Acquire(ctx, ViewBuildBackground)
 	require.NoError(t, err)
 	defer func() {
 		if release != nil {
