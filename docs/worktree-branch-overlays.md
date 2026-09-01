@@ -76,7 +76,10 @@ Delivery is foundational and staged: first define and enforce the view contract,
 | `REF-SCOPE-1` | Accepted inactive-view selectors: full `refs/heads/*`, peelable-to-commit `refs/tags/*`, already-local `refs/remotes/*`, and exact commit OIDs. | **DECIDED** |
 | `BASE-3` | The full base advances only when an explicitly configured `base_ref` advances; automatic density/age compaction is post-V1, after benchmarks. | **DECIDED** |
 | `UNBORN-1` | Unborn/orphan HEAD uses an empty committed-tree lower source plus the dirty checkout layer, accepting a dense first overlay. | **DECIDED** |
-| `RETENTION-1` | Defaults: 5 GiB byte cap per graph, 7 inactive days, 32 cached tree generations; graph and search bytes accounted separately; live routes, sealed dedicated generations, and primary bases are never quota-evicted. | **DECIDED** |
+| `RETENTION-1` | Defaults: 5 GiB of inactive cache per graph, 7 inactive days, and 32 inactive cached tree generations; graph and search bytes are accounted separately and shared payload is counted once. Only currently routed commit generations are excluded from inactive count/byte quotas. Sealed dedicated generations, primary bases, refs, lower-layer references, and active leases remain deletion blockers but do not create another quota-accounting exemption. | **DECIDED** |
+| `CACHE-PIN-1` | Checked-out immutable commit reuse is durable catalog state, not process-local ownership. A holder-scoped `(checkout_id, generation_id)` cache pin survives warm daemon restart and denormalizes the generation's `graph_id` for bounded graph-local retention; graph/generation agreement is enforced, dirty generations are never pinned, and logical checkout/graph cleanup removes only the claims in its deletion scope. Every pin deletion durably enqueues generation retirement in the same transaction; re-pin or successful generation deletion clears that handoff. | **DECIDED** |
+| `CACHE-IDENTITY-1` | A ready immutable generation's cache identity is independent of checkout/ref/layer/path aliases and includes every content, lower-base, build, configuration, producer, and required-capability input. Stable exact routes perform no claim/lease/pin/route write. | **DECIDED** |
+| `MIGRATION-2` | Schema v21 adds checkout commit-cache pins, the durable retirement handoff queue/trigger, and indexes in place, backfills every currently routed commit plus all eligible checkout-owned ready/superseded commit generations before lifecycle retirement runs, and never rewrites or reindexes generation payload. Seed immediately applies retention bounds after the conservative backfill; `user_version=21` is committed only after the catalog migration and integrity checks succeed. | **DECIDED** |
 | `ANALYSIS-1` | Analyzer rollout beyond the structural profile is capability-by-capability; every producer is exact for the selected `ViewID` or explicitly unavailable/incomplete. | **DECIDED** |
 | `SLO-1` | The proposed latency/storage values are benchmark hypotheses; final targets are approved only after the Phase 3 shared-database prototype. | **DECIDED** |
 | `HOOKS-VIEW-1` | A hook/control-socket probe for a file in an undiscovered or grace-period checkout of a known family triggers immediate family reconciliation and fails open until that checkout's view is ready, then enforces normally. | **DECIDED** |
@@ -90,7 +93,7 @@ Delivery is foundational and staged: first define and enforce the view contract,
 2. Linked worktrees in an explicitly known Git family are discovered automatically without a separate `track` command.
 3. An implicit worktree consumes storage proportional to its changed files plus dependency/invalidation closure, not an unconditional full copy.
 4. Queries from an implicit worktree observe exactly that worktree: committed branch state, dirty files, and session buffers, in priority order.
-5. Switching to a previously indexed tree selects a cached generation without reparsing the branch diff.
+5. Switching to a previously indexed tree selects the same cached immutable generation without reparsing the branch diff, including after a warm daemon restart and across compatible checkout/ref aliases.
 6. Cold checked-out or explicitly requested ref indexing is proportional to the exact tree difference and affected closure.
 7. Worktree addition, move, inaccessibility, authoritative removal, daemon restart, and rapid remove/re-add are reconciled safely; terminal removal leaves no logical checkout state, while primary loss forgets all dependent automatic checkouts entirely, identities and clocks included.
 8. Search, navigation, graph traversal, statistics, and analyzers either reflect the selected view or report an explicit completeness limitation. They MUST NOT silently return base-only data as if it represented the view.
@@ -638,6 +641,19 @@ routes(
     dirty_generation_id, route_epoch, state
 )
 
+checkout_commit_cache_pins(
+    checkout_id REFERENCES checkouts ON DELETE CASCADE,
+    graph_id TEXT,
+    generation_id REFERENCES generations ON DELETE RESTRICT,
+    last_selected,
+    PRIMARY KEY(checkout_id, generation_id)
+)
+
+checkout_commit_cache_retirements(
+    generation_id REFERENCES generations ON DELETE CASCADE PRIMARY KEY,
+    enqueued_at
+)
+
 ref_views(
     ref_view_id, graph_id, selector_kind, selector_value,
     desired_ref, desired_commit, desired_tree,
@@ -664,6 +680,48 @@ cleanup_journal(
     grace_deadline, primary_epoch, last_progress, last_error
 )
 ```
+
+`checkout_commit_cache_pins` is the durable ownership record for immutable
+checked-out commit reuse. It denormalizes `graph_id` from the referenced
+generation so retention selection, count, and byte accounting remain bounded to
+one graph without a cross-catalog scan. Every insert/update and integrity check
+MUST prove `pin.graph_id = generation.graph_id`. There is deliberately no graph
+foreign key; graph cleanup is an explicit bounded delete by the denormalized
+key. The generation foreign key is restrictive so a generic generation delete
+cannot erase a live claim accidentally; deleting a checkout cascades only that
+checkout's claims. Promotion, demotion, and rehome revoke that checkout's pins in the old
+graph and pin the newly routed compatible commit in the new graph as part of
+the authorized transition. Intentional graph/family cleanup first deletes every
+pin naming a graph in the authorized deletion closure, then retires payload
+after the ordinary reader/lease drain.
+
+`checkout_commit_cache_retirements` is the crash-safe handoff between durable
+pin deletion and physical generation retirement. An `AFTER DELETE` trigger on
+`checkout_commit_cache_pins` conservatively enqueues the deleted pin's
+generation in the same transaction, including checkout-FK cascades and future
+deletion paths. Inserting or refreshing a valid pin removes that generation's
+queue row in the same transaction. Queue readers are read-only and expose only
+rows with no current pin, route, ref-view, lower-layer, or dedicated-graph
+owner; the final retirement transaction rechecks every owner and live handoff
+lease. Refusal keeps the queue row. Successful re-pin removes it, and successful
+generation deletion removes it through `ON DELETE CASCADE`.
+
+Schema v21 is an additive catalog migration over the canonical generation-keyed
+payload schema. In one transaction it creates the pin table, retirement queue,
+pin-deletion trigger, and graph/age/generation indexes, backfills every current
+ready commit route, and
+conservatively backfills every eligible checkout-owned ready or superseded
+immutable commit generation whose owner checkout and graph still exist. The
+migration query itself is not quota-capped: immediately after recovery resumes,
+and before ordinary orphan deletion, Seed applies `RETENTION-1` per graph to the
+complete conservative set. Ref-owned generations retain their existing ref
+holders and gain a checkout pin only when a checkout route actually adopts
+them. This catalog-only
+`INSERT ... SELECT` never scans, copies, reparses, or rewrites node, edge, file,
+mask, search, vector, or sidecar payload. It MUST complete before startup's first
+orphan/retirement sweep. Failure rolls the transaction back, leaves schema v20
+authoritative, and retries on the next open; `PRAGMA user_version=21` is the
+transaction's final durable success marker.
 
 `cleanup_journal` intentionally does not cascade from the rows it is deleting; it is removed last after successful cleanup. A partial unique index enforces one `is_primary_base = 1` graph per family instead of a destructive `family.primary_graph_id ↔ graph.family_id` cascade cycle. Active-generation pointers are nullable/deferred during construction and `RESTRICT` deletion once published. Route, lower-generation, and active-lease references also use `RESTRICT` so bases cannot disappear while selected. Family/checkout ownership uses cascades only where bounded relational deletion is safe; FTS/search, analyzer, LSP, config-file, and cross-repository cleanup remains explicit and integrity-checked.
 
@@ -1161,7 +1219,29 @@ Startup MUST reconcile catalog, two distinct durable grace classes, intent sourc
 - Automatic availability expiry resumes terminal `forget_checkout`: route, checkout identity, incarnation, clocks, and rebuildable layers disappear after lease drain while the family primary remains. Explicitly retained dedicated expiry resumes `purge_inaccessible_layers`: exact routing stays withdrawn and rebuildable layers disappear, but intent/config/checkout/graph IDs and sealed full generations remain for later validated recovery.
 - Authoritative-removal expiry resumes `forget_checkout` or `retire_primary_closure` before any affected route is advertised. Once terminal row/config absence is committed, later discovery creates a new incarnation even if an old lease briefly delayed physical row deletion.
 - Worktrees authoritatively removed while the daemon was stopped are collected even when stale prefixes would otherwise have registered them; uncertainty remains inaccessible until authoritative evidence is available.
-- A ready generation is reusable only if all fingerprints, enrichment profile, and lower generations remain valid.
+- A ready generation is reusable only if its owner-independent cache identity,
+  required capabilities, enrichment profile, and lower generations remain
+  valid. A cache pin is a retention reference, not evidence of compatibility;
+  withdrawal of `source.snapshot` or another required capability bypasses the
+  pinned candidate and schedules/reuses a compatible replacement.
+- Startup reconstructs checked-out commit reuse from durable cache pins before
+  orphan discovery or retirement. Coordinator-local maps are lookup
+  accelerators only. A branch changed while the daemon was stopped reuses the
+  cached target when compatible, preserves the formerly routed generation as an
+  inactive cache entry, publishes coherent checkout HEAD/route state, and
+  supersedes the obsolete startup-readiness target so warmup cannot remain
+  indefinitely at `checkout_builds_pending`.
+- Generic discovery of unqueued `ready` checkout commit/dirty orphans runs only
+  in Seed, after pin backfill and before coordinator build admission opens. A
+  runtime sweep MUST NOT infer retirement from a momentary absence of a route,
+  pin, or live-registry entry: normal and temporary transition coordinators
+  both have a valid build-return-to-route-publication window. Runtime cleanup
+  consumes explicit coordinator/lifecycle backlogs, the durable pin-retirement
+  queue, intrinsically terminal/abandoned rows, and rows whose graph is gone.
+  A crash in the publication window is recovered by the next Seed scan.
+- An unchanged warm restart reparses zero files and physically builds zero
+  immutable commit generations. Store deletion is a cold rebuild and has no
+  cache-reuse promise; schema migration alone is not a cold rebuild.
 - Orphaned `building` generations are resumed only with sufficient journal state; otherwise their generation-keyed rows are deleted.
 - `retiring` checkout/family sagas finish idempotent bounded cleanup, verify operation-specific postconditions, and delete their journals on success.
 - A `no_primary` family may expose its independent dedicated graphs and explicit ref views rooted in any such ready graph. It MUST NOT reconstruct/advertise automatic checkout routes, durable automatic checkout identities, or any ref view rooted in the lost primary until a primary is explicitly designated with `set-primary`.
@@ -1360,6 +1440,90 @@ The existing session “overlay branch” terminology should be renamed internal
 - A base-generation change cannot reinterpret an existing layer; it creates a new layer generation.
 - No layer survives loss of its lower base; it is rebuilt/rerouted first or cascade-retired.
 
+### Durable checked-out commit cache
+
+An immutable checked-out commit generation remains reusable because the catalog
+persists a holder pin; a coordinator's local LRU is never its lifetime owner.
+The durable holder identity is `(checkout_id, generation_id)` and each row also
+stores the referenced generation's `graph_id`. The denormalized graph value is
+validated on every mutation and makes retention/cleanup graph-local and bounded.
+Tree/base/fingerprint identity, physical size, and state still come from the
+generation. Promotion, demotion, or rehome revokes that checkout's old-graph
+pins and pins its newly routed compatible commit; graph teardown revokes every
+pin for that graph before generation deletion.
+
+The normal A→B route transaction has one atomic contract:
+
+1. claim a ready B by the owner-independent compatibility key and hold a
+   short-lived cache-claim lease;
+2. revalidate checkout ID/incarnation/root/state, primary epoch, expected old
+   route, graph/base ancestry, B state, and every required capability;
+3. set A's holder `last_selected` to the database transaction time (the start
+   of its inactivity), insert/refresh B's holder, publish B's commit slot and
+   the coherent route/HEAD metadata, and consume the lease in that transaction;
+4. on stale compare-and-set, roll back all pin/route timestamps and leave the
+   lease for its caller to release; and
+5. build/rebind the checkout-specific dirty layer separately. Dirty layers are
+   never branch-cache entries and may be rebuilt after a switch or restart.
+
+An already exact route takes a read-only settled path: it does not claim a ready
+generation, acquire/release a cache lease, refresh a pin timestamp, rewrite
+checkout HEAD, advance the route epoch, or touch the WAL. Owner checkout/ref,
+layer ID, path alias, and ref spelling are excluded from the canonical ready
+identity. Graph, lower-base generation/fingerprint, target tree, sanitized
+source configuration, extractor/resolver/producer versions, completeness
+profile, and all producer-declared commit-sensitive inputs are included.
+`source.snapshot` and every operation-required producer must still be complete;
+a pinned but withdrawn/incompatible generation is bypassed and may be retired
+after its independent references drain.
+
+Warm restart reconstructs cache eligibility from pins before retirement. Thus a
+stored A→B→A sequence, daemon restart, and another B→A sequence reuses the same
+immutable generation IDs with zero physical commit builds and zero reparsed
+files while fingerprints and retention remain valid. If Git HEAD changes while
+the daemon is stopped, startup treats the persisted route as the old exact view,
+adopts an already cached new HEAD when possible, retains the old commit, and
+updates the startup-readiness expectation to the current sample. It MUST NOT
+wait forever for an obsolete tree or report permanent 99% warmup after a
+successful route switch.
+
+Pin eviction and payload deletion are deliberately two transactions. The pin
+transaction's delete trigger writes a durable retirement-queue row first; the
+lifecycle repeatedly offers only currently unowned queue candidates to the
+ordinary lease-aware generation retirement path. A refusal never consumes the
+queue row. A concurrent route/claim that pins the generation also removes the
+row atomically; if retirement reaches `retiring` first, the route/claim rejects
+the generation and rebuilds or reschedules. This journal is what makes cleanup
+survive both lost process-local backlog memory and checkout deletion through a
+foreign-key cascade.
+
+`RETENTION-1` applies to inactive cache with one accounting exemption:
+
+- a currently routed commit generation is excluded from the 32-generation and
+  5-GiB inactive allowance and cannot be quota-evicted;
+- a ref, lower-layer/base, sealed dedicated/primary, reader/build/cache-claim
+  lease, or other durable reference remains a deletion blocker, but does not
+  create another count/byte-accounting exemption;
+- for a non-routed candidate, effective inactivity begins at the maximum holder
+  `last_selected`; shared holders do not duplicate count or bytes;
+- graph and search bytes are measured separately against the same generation
+  set, and quota selection is per referenced generation graph;
+- expired/over-quota candidates are ordered by oldest effective selection time
+  with generation ID as a stable tie break; and
+- pruning first removes only expired/selected holder pins, then transactionally
+  rechecks routes, refs, lower/base relationships, capabilities, leases, and all
+  remaining pins before payload deletion. One holder's removal never invalidates
+  another holder.
+
+Ordinary same-graph route withdrawal or branch switch preserves the checkout's
+inactive commit pins. Authoritative checkout forgetting cascades that holder's pins.
+Explicit inaccessible-layer purge removes that checkout's pins with other
+rebuildable state. Promotion/demotion/rehome atomically revokes that checkout's
+old-graph pins and pins the newly routed commit in the new graph. Any authorized
+graph deletion removes every pin for that graph. Primary/family forgetting
+removes the primary dependency closure's checkout holders and graph payload,
+while healthy independently dedicated graphs and their holders remain.
+
 ### Building behavior
 
 **DECIDED BUILD-1:**
@@ -1375,7 +1539,7 @@ The existing session “overlay branch” terminology should be renamed internal
 
 Cleanup is operation-typed; a generic “purge everything with this path” API is forbidden:
 
-- `purge_inaccessible_layers(checkout_id, incarnation)` withdraws exact routing, unregisters checkout watchers/LSP/session bindings (including buffer-overlay sessions), and cancels builders. It detaches the checkout from shared commit generations; after lease drain it deletes checkout-owned dirty generations and their masks/search/sidecars. A commit generation is garbage-collected only when no checkout route, ref view, lower-layer reference, cache retention pin, or lease remains. The operation preserves checkout/graph identities, every explicit intent/config record, and sealed dedicated full generations, and proves that no surviving reference was invalidated.
+- `purge_inaccessible_layers(checkout_id, incarnation)` withdraws exact routing, unregisters checkout watchers/LSP/session bindings (including buffer-overlay sessions), and cancels builders. It detaches the checkout from shared commit generations and removes that checkout's durable cache pins; after lease drain it deletes checkout-owned dirty generations and their masks/search/sidecars. A commit generation is garbage-collected only when no checkout route, ref view, lower-layer reference, cache retention pin, reader/build/cache-claim lease, sealed-base reference, or other durable holder remains. The early candidate query, reference classifier, and final transactional delete predicate MUST all recognize pins so a concurrent successful route bind cannot race physical deletion. The operation preserves checkout/graph identities, every explicit intent/config record, and sealed dedicated full generations, and proves that no surviving reference was invalidated.
 - `forget_checkout(checkout_id, incarnation)` additionally removes the checkout identity, dedicated graph identity, every owned generation and sidecar, routes/aliases/caches, every Gortex-owned intent/config/project membership, and finally its cleanup journal. Its postcondition is zero live logical state for that checkout.
 - `retire_primary_closure(graph_id, primary_epoch, cause)` removes the primary plus every automatic checkout/ref/dirty generation, route, alias, cache, watcher/session binding (including buffer overlays), and derived payload whose lower chain depends on it — and every dependent automatic checkout identity, incarnation, and clock (**DECIDED PRIMARY-LIVE-IDENTITY-1**). Independent sibling `GraphID`, intent/config, full generations, routes, and unrelated owned payload remain unchanged. Bridge/cross-view/derived rows that reference the retired primary are invalidated or rebuilt under a new view generation. The family then enters `no_primary` or invokes `forget_family` when none survive.
 - `forget_family(family_id, primary_epoch)` removes the final primary closure and every remaining logical family/catalog/config row, then deletes the journal last.
@@ -1510,7 +1674,23 @@ If implementation evidence contradicts a decided branch, this specification must
 
 ### Phase 5: checked-out tree and explicit-ref caching
 
-- Cache immutable tree generations encountered by checked-out worktrees and make A→B→A reuse them.
+- Cache immutable tree generations encountered by checked-out worktrees with
+  durable holder pins and make A→B→A reuse the same generation across warm
+  restart and compatible checkout/ref aliases.
+- Ship the additive schema-v21 pin migration/backfill before startup retirement;
+  make route bind, lease consumption, old/new holder timestamps, and route/HEAD
+  publication one compare-and-set transaction.
+- Persist every final-pin deletion in a generation-keyed retirement queue in
+  the same transaction, including checkout/graph foreign-key cascades. Consume
+  that queue during ordinary runtime cleanup, and reserve generic READY-layer
+  orphan discovery for Seed before build admission so an off-route generation
+  in the build-to-publication window cannot be reclaimed.
+- Use one owner-independent ready-generation identity and a zero-write settled
+  route fast path; owner/layer/path/ref labels never cause claim/release or WAL
+  churn.
+- Enforce the 7-day/32-generation/5-GiB per-graph retention policy with only
+  currently routed commits excluded from inactive count/bytes, shared-holder
+  accounting, and pin-aware transactional retirement guards.
 - Ensure unrelated inactive-ref changes schedule no indexing work.
 - Add local-only explicit-ref selection/prewarming with direct base→target tree diff, build-time `GitTreeSource`, and no tracking/config/checkout side effects.
 - Implement desired/active `ref_views`, coalesced CAS-guarded `ref_view_builds`, cold descriptors, stable errors, LRU retention, and `inactive_ref_structural_v1`.
@@ -1519,7 +1699,16 @@ If implementation evidence contradicts a decided branch, this specification must
 - Record per-foreign-repository generation pins for baked cross-repository edges and build view-keyed bridge generations where selected pairings diverge (**DECIDED CROSSREPO-1**).
 - Handle detached/unborn HEAD, commit-sensitive producers, ref movement on next access, non-storming base advancement, and unrelated histories.
 
-**Gate:** A→B→A reuse, profile-compatible tree sharing with correct commit metadata, full structural/search differential equivalence, the decided source-withdrawal behavior, no-fetch/no-hidden-worktree/offline-config-trust behavior, capability-scoped completeness, cross-repository pinning, build coalescing/CAS, and zero idle-ref work pass under concurrent events.
+**Gate:** A→B→A reuse across warm restart and aliases with identical commit
+generation IDs, zero reparsing/physical cache-hit builds, and below-100-ms p95
+selection; zero-write settled polling; schema-v21 upgrade/backfill before
+startup retirement; crash-safe pin-retirement handoff and publication-window
+protection; profile-compatible tree sharing with correct commit
+metadata; full structural/search differential equivalence; the decided
+source-withdrawal behavior; no-fetch/no-hidden-worktree/offline-config-trust
+behavior; capability-scoped completeness; cross-repository pinning; pin-aware
+retirement races; build coalescing/CAS; and zero idle-ref work all pass under
+concurrent events.
 
 ### Phase 6: analyzer expansion and optimization
 
@@ -1600,6 +1789,18 @@ For an inactive-ref oracle, both sides use the exact `inactive_ref_structural_v1
 - live accessible non-primary untrack demotes after all intent sources are revoked; inaccessible non-primary untrack uses previewed `forget_checkout` rather than demotion; untrack of an accessible non-primary with no different ready primary fails with the exact blocker and leaves intent and routing unchanged (**UNTRACK-BLOCKED-1**);
 - an explicitly retained long-inaccessible checkout, or an automatic checkout that gains positive removal evidence before its availability deadline, receives a fresh removal clock; reappearance before that removal deadline cancels automatic removal and restores ready or prior availability state;
 - daemon restart preserves distinct availability/removal evidence and deadlines and resumes the correct cleanup mode;
+- schema-v20→v21 startup creates pin keys/FKs/indexes, conservatively backfills
+  all eligible checkout-owned ready/superseded commits plus every exact routed
+  commit without applying migration-query quota caps, then Seed immediately
+  applies retention bounds before ordinary retirement; it performs zero payload
+  writes/parses/builds, commits `user_version=21` last, and rolls back/retries
+  cleanly after failures before each migration step;
+- lifecycle Seed preserves pinned non-routed commit generations before
+  coordinators exist while retiring an otherwise identical unpinned orphan;
+- promotion, demotion, rehome, checkout forgetting, dedicated-graph deletion,
+  primary closure, and family forgetting leave exactly the holder pins allowed
+  by their authorized checkout/graph deletion closure; independent checkout/ref
+  holders and independently dedicated graphs survive;
 - a common-directory inventory failure applies family availability handling, a root-only failure affects one checkout, and neither is absence; a pending zero-source family remains inventory-scoped through restart;
 - missed filesystem events are repaired by periodic authoritative inventory without treating a failed inventory as absence;
 - the recorded-volume/prunable evidence algorithm persists root/common-directory volume kinds/tokens and nearest-ancestor evidence, survives restart, distinguishes the same reachable mount from an unavailable or changed volume, and never treats a different parent volume as proof; a terminally forgotten prunable/inaccessible record remains ephemeral until genuinely accessible;
@@ -1621,6 +1822,28 @@ For an inactive-ref oracle, both sides use the exact `inactive_ref_structural_v1
 ### Required Git/ref tests
 
 - A→B→A cache reuse and zero work for updating/adding/deleting/moving an unrelated inactive ref;
+- after building A and B, a warm store reopen followed by B→A reuses the same A
+  and B immutable generation IDs with zero physical builds and zero reparsed
+  files; changing HEAD from A to already-cached B while the daemon is stopped
+  adopts B, retains A, and reaches ready rather than leaving startup pending;
+- two checkouts and one ref may hold one compatible generation: deleting holders
+  one at a time preserves payload until the final route/ref/lower/lease/pin is
+  gone, and a concurrent pin bind always defeats the final transactional
+  retirement predicate;
+- route-bind success atomically consumes its claim lease, pins/restamps old and
+  new commit generations, and advances one route epoch; stale incarnation,
+  root, graph/base, or expected-route comparison changes no pin/timestamp/route
+  and does not consume the lease;
+- withdrawing `source.snapshot` from a pinned A, switching to B, and returning
+  to A rebuilds or adopts a newly compatible A rather than routing the withdrawn
+  generation; restoring a compatible candidate returns to normal cache reuse;
+- retention boundaries cover exactly 7 inactive days, 32→33 inactive unique
+  generations, and graph/search byte thresholds around 5 GiB; live
+  route/base/ref/lower/lease protection, shared-holder single accounting,
+  deterministic oldest/tie-break eviction, and per-graph isolation are proved;
+- stable exact reconciliation of a locally built, checkout-adopted, ref-adopted,
+  and sibling-adopted commit performs zero ready claims, lease operations, pin
+  timestamp writes, route/HEAD writes, WAL growth, and physical builds;
 - repeated settled reconciliation after canonical commit adoption preserves both the dirty generation ID and route epoch; one real dirty edit rebuilds exactly once and subsequent settled polls stabilize;
 - existing metadata `ref` filtering remains byte-for-byte compatible; combining it with structured `view` either selects a graph in the filtered set or returns `selector_conflict`, never reinterprets either field;
 - the structured `view` selector applies `REF-SCOPE-1`, rejects short names/revision expressions, peels tags only to commits, validates exact OIDs/object format, returns stable selector errors, and accepts any ready dedicated `graph_id` including a surviving non-primary graph in `no_primary`;
@@ -1692,7 +1915,11 @@ The feature is complete when all of these are true:
 6. The visible composed graph matches an independent full index of the target for all declared-complete capabilities.
 7. Deleted/replaced data never leaks from a lower layer; the highest payload wins identity/ownership conflicts, while unrelated visible overlay/base results share one relevance ordering.
 8. New overlay symbols participate in normal search, and unselected cached generations cannot influence result identity or ranking statistics.
-9. Cached A→B→A returns to A with zero reparsing when fingerprints remain valid, while unrelated inactive refs cause zero work.
+9. Cached A→B→A returns to the same immutable A generation with zero reparsing
+   and zero physical commit builds when fingerprints remain valid, including
+   across warm daemon restart and compatible aliases. Stable exact polling
+   performs zero cache-claim, lease, pin, route, HEAD, or WAL writes; unrelated
+   inactive refs cause zero work.
 10. A new generation is published atomically and old requests remain consistent.
 11. Authoritative disappearance/`forget` (and destructive inaccessible non-primary checkout untrack) plus lease drain leave zero logical checkout graph/identity/intent/config/cache/journal state; later discovery gets new identities. Live accessible non-primary untrack instead retains `CheckoutID` and demotes. Logs, WAL/free pages, metrics history, backups, and snapshots are outside logical erasure.
 12. Availability and removal evidence/deadlines remain distinct across restart. Mere inaccessibility preserves explicit intent/config/identity/sealed dedicated generations and later recovers the same IDs. Automatic availability-deadline forgetting and authoritative terminal forgetting both create a new incarnation on later discovery.
@@ -1703,7 +1930,7 @@ The feature is complete when all of these are true:
 17. No analyzer silently treats base-only or checkout-LSP data as the selected view; completeness is capability- and operation-specific.
 18. Explicit inactive refs are V1, local-only/read-only committed-tree views implementing the finalized `inactive_ref_structural_v1`; they never Git-fetch/create a checkout/intent/config entry, enforce fully offline target-config trust (**REF-CONFIG-TRUST-1**), follow the decided **SOURCE-DURABILITY-1** withdrawal contract (object-database reads, atomic file-read withdrawal on pruned objects), fail missing-object builds without an exact route, preserve metadata-`ref` semantics, and report LSP capabilities unavailable.
 19. One canonical shared-database schema has one representation per payload kind. Graph/search/mask/producer rows bind `generation_id`; composed analyses bind `analysis_generation_id`/`ViewID`; transient caches bind `ViewID`; source metadata is generation-keyed payload with no persisted bytes. No per-graph/view/generation database or search-table family and no permanent legacy-plus-`view_*` schema exists.
-20. Adjacent-epoch shadow and offline cold-rebuild paths are recoverable and converge on identical normalized schema/data/query results. Shadow cutover uses a revisioned mutation journal plus final writer barrier so no old-epoch mutation is lost. Request-serving and mutation operations are owner-scoped; only typed allowlisted audit/GC/migration discovery may scan across owners, followed by owner-scoped mutation.
+20. Adjacent-epoch shadow and offline cold-rebuild paths are recoverable and converge on identical normalized schema/data/query results. Shadow cutover uses a revisioned mutation journal plus final writer barrier so no old-epoch mutation is lost. Request-serving and mutation operations are owner-scoped; only typed allowlisted audit/GC/migration discovery may scan across owners, followed by owner-scoped mutation. The later additive schema-v21 pin migration is catalog-only, conservatively backfills all eligible checkout-owned ready/superseded commits plus every routed commit without query-time quota caps, lets Seed immediately enforce retention bounds before ordinary retirement, writes `user_version=21` last, and never triggers graph payload migration or repository indexing.
 21. Explicit ref selection/prewarm creates only desired/active ref-view cache/build records and evictable generations, coalesces identical builds, CAS-rejects changed-tree/base/full-build-fingerprint publication while permitting revalidated same-tree adoption with current route metadata, returns truthful requested/actual/fallback descriptors and stable errors, and re-resolves movement only on next access.
 22. Storage and latency metrics demonstrate sparse behavior for sparse diffs and quantify the wider-key/shared-writer cost.
 23. Documentation explains selection, freshness, capability completeness, retention, promotion, demotion, inaccessibility, authoritative removal, fallback, no-primary, and migration semantics.
@@ -2133,6 +2360,355 @@ the fully resolved staged source tree immediately before commit; the only later
 change was this documentation-only evidence update. The retained isolated
 artifact is `/private/tmp/gortex-isolated-lifecycle.Bbs031/PASS.json`.
 
+### Cold-start, migration, and rollout follow-up (2026-08-30)
+
+This follow-up records the reliability incident found while validating the implemented feature, the resulting implementation invariants, and the evidence still required before release. It refines validation and rollout requirements without changing the product decisions above. Measurements in this section are observations of the pre-fix feature branch unless explicitly labeled as post-fix acceptance evidence.
+
+#### Incident: generation zero was indexed without a publishable primary
+
+A cold restart after deleting the store exposed two startup paths that both believed they owned explicitly configured Git roots:
+
+1. `warmupDaemonState` sent every configured root through the legacy `MultiIndexer.TrackRepoCtx`/`ReconcileRepoCtx` path. That path built the full corpus in legacy generation zero and populated generation-zero file metadata.
+2. `CheckoutLifecycle.Seed` persisted the checkout, manual intent, and a `graph_ready` dedicated graph, but—unlike live `Register`—did not start promotion. The graph therefore had no nonzero active generation and no publishable checkout route.
+
+The captured catalog had 29 active `manual_config` intents, 29 primary dedicated graphs whose `active_generation_id` was `NULL`, 53 desired/effective automatic checkouts, zero checkout routes, zero view generations, zero view layers, and 11,154 file-mtime rows assigned to `view_gen = 0`. Automatic coordinators retried roughly every 15 seconds and reported that the primary had no active generation. Thus the expensive legacy corpus was present but could not serve as the lifecycle primary. Any subsequent recovery that built the dedicated graph repeated corpus work; across configured repositories this was an N+1-shaped startup path, not sparse overlay construction.
+
+During the user-visible incident the daemon reached more than 40 GiB resident memory and made the machine unusable even after indexing appeared to finish. The catalog and control-flow evidence above identifies the duplicate/unpublished corpus path that made the design unsafe. It does not attribute every byte of the 40+ GiB peak to a single allocation site; the process was restarted before a complete incident profile could be retained.
+
+A separate measured cold run after store removal covered 29 repositories and 11,092 files:
+
+| Milestone or phase | Observed time |
+| --- | ---: |
+| Open SQLite to socket serving | 0.520 s |
+| Start to queryable | 369.690 s |
+| Start to fully enriched | 898.514 s |
+| Parse | 206.482 s |
+| Resolve | 315.240 s |
+| Deferred enrichment | 218.093 s |
+| Global pass | 0.151 s |
+| End-batch/persistence | 145.993 s |
+
+After that run, in-use heap was about 189 MiB and ordinary post-warmup RSS was about 0.5–0.85 GiB, but cumulative allocation was 73.95 GiB. The largest allocation families were SQLite row materialization (`columnText`, node/edge scans, and `Rows.Next`), parser node arenas, and file reads. The store occupied about 4.4 GiB on disk (approximately 4.659 GB database plus a 64 MB WAL). These are diagnostic baselines for the old path, not acceptance results for the corrected lifecycle.
+
+#### Required startup ownership and build-count invariant
+
+There MUST be exactly one physical owner of each configured Git corpus:
+
+- An explicitly configured Git checkout is lifecycle-managed. Legacy generation-zero warmup MUST exclude it.
+- `CheckoutLifecycle.Seed` MUST follow the same explicit-intent promotion contract as `Register`: persist intent, restore only an O(1) transient shell for an already-ready durable route, or start one promotion for a cold/pending checkout.
+- Promotion MUST index the exact HEAD base once, publish a nonzero active dedicated generation and route atomically, then reconcile the family so dependent automatic worktrees can build sparse views.
+- An automatic coordinator MUST NOT start until its designated primary has a ready active generation.
+- A ready warm restart MUST restore the transient shell and durable route without reparsing or rebuilding the full corpus.
+- Non-Git configured roots remain on the legacy warmup path because they have no Git-family lifecycle.
+- Recovery from an older feature store MAY retire an obsolete generation-zero payload before promotion, but MUST still build at most one replacement full corpus and MUST never retain both as independently routable bases.
+
+The release gates are consequently quantitative: a fresh cold start performs exactly one full physical corpus build per explicitly configured Git checkout; an unchanged warm start performs zero full physical corpus builds; `GraphID`, active `GenerationID`, `CheckoutID`, and routes remain stable across the warm restart. Tests MUST count physical build admission/completion, not infer it from high-level lifecycle calls.
+
+#### Current-owner topology reconciliation and fallback behavior
+
+The disappearing-worktree CI failure exposed a second ownership gap. `AttachWatcherContext` previously nudged only families returned while registering the current watcher set. If the current-owner checkout disappeared from that snapshot first, its watcher source could be removed before any reconciliation nudge was retained, even though the catalog still owned the family. Reconciliation MUST therefore seed topology dispatch from every catalog family before refreshing configured watchers. Duplicate watcher and catalog nudges remain coalesced by the family singleflight mechanism.
+
+When absence or inaccessibility is confirmed, the 30-second grace has immediate routing consequences:
+
+- new eligible graph/search requests receive a clearly labeled primary-base fallback;
+- that fallback is read-only and contains neither dirty checkout state nor editor buffers;
+- exact-view, checkout-root file, and edit requests are rejected;
+- only queries that already pinned the exact view may drain on it;
+- authoritative disappearance proceeds to the logical cleanup contract after grace, while ambiguous inaccessibility follows the retention rules recorded above.
+
+Tests for the current-owner case MUST remove the watcher membership before the administrative checkout record disappears, drain stale topology notifications, then prove that catalog-seeded reconciliation observes and forgets the vanished checkout. Repeated/race-enabled execution is required because a single pass does not exercise the scheduling window that caused the macOS CI failure.
+
+#### Observable migration and daemon startup
+
+The feature store reaches schema version 20 through migrations 14–20. Migrations
+14–19 establish generation-scoped graph/view storage and replay; migration 20
+adds the bounded `checkout_root_moves` recovery journal. A changed checkout root
+and its journal marker commit atomically under the expected incarnation and
+prior-root compare-and-set guard. The marker preserves the earliest uncompleted
+previous root and newest current root for one checkout incarnation. Migrations
+run synchronously before the daemon listens and pending steps are committed as
+one transaction, so failure rolls the transaction back and restart repeats it
+safely.
+
+The prior `daemon restart` failure cannot be proven from its original daemon log because that log was overwritten by the later cold restart. Store deletion removed the startup delay and is consistent with a large in-place migration exceeding the controller's fixed 60-second socket deadline, but that remains an inference rather than retained proof. The measured 0.520-second open-to-listen interval above was a fresh-store run with no pending large migration and MUST NOT be cited as migration latency.
+
+Startup MUST remain unavailable until the store is safe to serve; it MUST NOT open the normal socket early merely to satisfy the controller. Instead, the child writes an atomic, same-directory runtime-state record with these observable phases:
+
+```text
+opening_store -> migrating -> serving
+                         \-> failed
+```
+
+The record includes PID, phase timestamps, source and target schema versions, current migration version/name or step, a fresh heartbeat, and a sanitized terminal error. Migration callbacks also emit structured start/progress/completion timings. The detached parent keeps waiting beyond the legacy 60 seconds only while the child PID is alive and the state heartbeat/progress is fresh; absent state, stale state, an exited child, or a terminal failure preserves prompt failure behavior. User cancellation remains effective. This turns a healthy long migration into visible progress without disguising a hung process.
+
+Migration timing and peak-space claims require an isolated copy of a realistically large pre-v14 store. The overwritten incident log and a fresh empty-store startup are insufficient. Final validation MUST record per-step wall time, total migration time, peak RSS, peak database/WAL/temp disk use, heartbeat cadence, parent wait behavior, rollback/retry behavior, and the first post-migration query.
+
+#### Bounded performance evidence and safety caveat
+
+The bounded pre-fix/fix-development benchmarks captured the following ranges on this machine:
+
+| Path | Observed range |
+| --- | ---: |
+| Dedicated-base refresh admission/coalescing | 14.5–15.0 ns/op, 0 allocs/op |
+| Stable adopted-commit dirty reconciliation | 22.8–74.8 ms/op, about 72–74 KiB and 897–899 allocs/op |
+| Stable Git topology watcher tick | 39–69 µs/op, about 4.7–5.2 KiB and 37–38 allocs/op |
+| Ready-generation catalog hit | 330–359 µs/op, about 4.9 KiB and 150 allocs/op |
+| Pinned generation winner selection | 0.82–1.12 ms/op |
+| Cold 100-item generation payload | 5.8–7.9 ms/op, about 510 KiB and 5,668 allocs/op |
+| Checkout adoption | 454–487 µs/op, about 11.9 KiB and 372 allocs/op |
+| Ready dedicated-graph lookup | about 12.7 µs/op, 1,120 B and 37 allocs/op |
+| Generation-scoped `AllNodes` / `AllEdges` | about 101 µs/op / 52 µs/op |
+
+These microbenchmarks bound admission, catalog, watcher, and small-payload mechanics; they do not prove whole-repository cold/warm behavior. An attempted self-repository incremental benchmark was stopped after roughly five minutes when actual RSS reached about 4.1 GiB (about 5.1 GiB reported by the benchmark process). It is excluded from acceptance evidence and MUST NOT be rerun against the shared developer environment. Repository-scale validation uses isolated stores, bounded fixtures, explicit time/memory limits, and phase metrics.
+
+#### Implemented agent-facing worktree guidance
+
+Commit `f9edcb14` centralizes the routing contract in
+`profiles.WorktreeBranchRoutingPolicy` and renders it through profiles, agent
+adapters, Claude/Cursor integrations, session-start and subagent hooks, and MCP
+initialize instructions. The generated instructions teach the routing model
+once in the shared profile rather than duplicating divergent prose through
+every skill:
+
+- use the session/current working-tree checkout and let discovery create an automatic overlay;
+- do not explicitly track every linked worktree unless the user asks for an independent dedicated graph;
+- understand “overall” as the selected overlay plus its one designated family primary, never a union of incompatible branches. Unique overlay/base results retain their relevance order; only duplicate logical identities prefer the overlay, while tombstone/path masks hide deleted base data;
+- distinguish a normal building fallback from a sealed availability/removal fallback. Both must be labeled. The sealed fallback has no checkout dirty state or editor buffers; capability metadata governs exact/source/file/AST, filesystem `search.text`, LSP, and edits, which must refuse rather than silently use another checkout;
+- treat an inactive `git_ref`/commit view as a committed graph and Git-object source snapshot: structural/source/content operations may work, but working-copy LSP, filesystem `search.text`, and edits do not;
+- expect explicit tracking to promote to dedicated ownership and supported explicit untrack to demote over a surviving primary;
+- require preview/confirmation before moving the primary or forgetting a primary closure/family;
+- report view/freshness/capability metadata instead of silently describing a fallback as exact.
+
+Golden renders, profile drift tests, adapter/hook tests, and MCP initialize tests
+assert that the canonical policy appears exactly once. State-aware tests also
+distinguish an unrelated repository from either direction of an already-tracked
+Git family and explicitly suppress `gortex track` while automatic discovery is
+pending. Individual task skills may link to the shared rule; they need separate
+prose only when they add workflow-specific behavior.
+
+#### Post-fix validation ledger
+
+Focused correctness coverage MUST include:
+
+1. cold `Seed` performs exactly one dedicated-base build, publishes one active generation and route, and persists one explicit intent;
+2. unchanged second `Seed` performs zero corpus builds and preserves graph/generation/checkout/route identities;
+3. a linked automatic checkout has no coordinator while promotion is gated, then starts after base publication;
+4. current-owner topology reconciliation discovers addition and forgets authoritative removal under repeated and race-enabled scheduling;
+5. new grace-period requests receive only labeled read-only primary fallback, while exact/file/edit requests fail and pinned readers drain;
+6. startup-state tests cover fresh progress, stale/no state, child exit, failure, cancellation, and a migration lasting longer than 60 seconds;
+7. migration rollback/retry leaves a valid pre-migration store and eventually publishes schema 20 exactly once;
+8. generated agent instructions describe automatic overlays, explicit dedicated graphs, and fallback limitations (`f9edcb14`);
+9. inactive local refs retain the V1 structural-only behavior and report unavailable LSP-only capabilities.
+10. project-only configuration cold/warm startup produces one physical build,
+    no synthetic top-level config row, stable identities, and exact
+    provenance-bearing intents; removing one source preserves every independent
+    remaining source;
+11. primary retirement plus explicit retrack does not elect a primary,
+    idempotent rebinding preserves the current primary, and concurrent first
+    bindings produce exactly one primary;
+12. implicit session/CWD admission creates only an automatic checkout over an
+    already-ready primary, never calls `TrackRepoCtx`, never writes explicit
+    intent/config, is coalesced per canonical checkout, and remains deferred
+    without a primary;
+13. v19→v20 migration creates the move journal, preserves existing data,
+    retries safely after failure, reopens idempotently, and cascade-deletes
+    markers with checkout/family cleanup;
+14. A→B→C rejects stale root observations and stale completion, preserves the
+    earliest previous/latest current roots, repairs after each crash cut, and
+    leaves zero journal rows after success;
+15. automatic and dedicated moves preserve checkout/incarnation/graph/
+    generation/route identity, stop old runtime sources, bind new ones, avoid
+    corpus builds, relocate config and path-bearing intents, preserve logical
+    project locators, and retry after config-save failure;
+16. canonical aliases and missing old leaves are identity-equal for assertions,
+    config repair, cleanup, and journal completion.
+
+The final isolated validation MUST use a dedicated configuration/store/socket namespace and MUST NOT stop, restart, attach to, or mutate the machine-wide daemon or its store. Record the following before replacing these placeholders:
+
+| Acceptance evidence | Final isolated result |
+| --- | --- |
+| Feature revision and binary version | **TODO(final isolated E2E):** revision/version |
+| Fixture shape and pre-migration schema/store size | **TODO(final isolated E2E):** repositories, worktrees, refs, files, bytes, and an explicit populated v19 store so migration 20 is exercised |
+| Migration duration/progress and peak RSS/disk | **TODO(final isolated E2E):** per-step/total time, heartbeat observations, memory and disk peaks |
+| Fresh cold start | **TODO(final isolated E2E):** queryable/full-ready times and exactly-one physical build count |
+| Unchanged warm start | **TODO(final isolated E2E):** startup time, zero physical builds, stable identities/routes |
+| Automatic worktree discovery | **TODO(final isolated E2E):** discovery-to-ready latency and sparse generation size |
+| Overlay correctness | **TODO(final isolated E2E):** same-symbol shadowing, unrelated-result ranking, deletion masking, dirty/untracked visibility |
+| Grace/removal behavior | **TODO(final isolated E2E):** immediate labeled fallback, exact/file/edit rejection, reader drain, 30-second cleanup |
+| Branch/ref behavior | **TODO(final isolated E2E):** checked-out switch/cache reuse and inactive-ref structural capability report |
+| Configuration/provenance and implicit CWD admission | **TODO(final isolated E2E):** project-only cold/warm registration, independent provenance, same-family admission, and no-primary refusal |
+| Automatic/dedicated move and restart-journal recovery | **TODO(final isolated E2E):** stable identities, zero rebuilds, A→B→C, crash cuts, alias identity, and empty journal after convergence |
+| Resource ceiling | **TODO(final isolated E2E):** peak RSS, allocations if profiled, database/WAL size, descriptor count |
+| Test/benchmark commands | **TODO(final isolated E2E):** focused, race, migration, benchmark, lint, and full-suite outcomes |
+
+No release claim is complete while any final isolated E2E placeholder remains unresolved.
+
+#### Corrected cold-start failure chain and atomic repair evidence
+
+The later clean-store reproduction disproved the hypothesis that the remaining
+failure was still generation-zero duplication. Its startup census reported
+`configured_repos=29` and `legacy_jobs=0`, so configured Git repositories were
+already excluded from the legacy owner. The actual first failure was the
+configured `growth` repository: it was a valid unborn Git repository with no
+commit, but with source present in its index/working tree. Promotion attempted
+to resolve `HEAD^{tree}`, treated the missing commit tree as fatal, rolled the
+provisional graph back, and left a coordinator referring to the deleted graph.
+Three secondary bugs then amplified that first failure:
+
+1. the durable transition worker refilled its queue only after success, so the
+   failed first item starved the remaining 27 configured repositories;
+2. retry reconstruction looked up the deleted provisional graph before it
+   recovered the stable repo prefix/config identity, so the promotion could
+   not repair itself without a restart;
+3. the stale coordinator polled every 15 seconds and repeatedly reported
+   `primary base unavailable: designated graph ... does not exist` instead of
+   retiring after the authoritative graph deletion.
+
+The daemon consequently advertised ready after roughly two seconds with zero
+documents while the intended configured-startup cohort had not published. The
+published readiness state was process readiness, not corpus readiness. This is
+the direct explanation for the observed `ready (warmup 2s)`, `docs=0`, and 29
+`not indexed` rows after the clean restart.
+
+An unborn repository now uses Git's canonical empty-tree object (SHA-1 or
+SHA-256 as appropriate) as its immutable base, with staged and non-ignored
+untracked files represented only in the dirty layer. Ignored files remain
+excluded. Empty-tree resolution is cached per coordinator. A failed promotion
+no longer blocks later durable work; retry restores the stable prefix from
+config/root identity; coordinators are installed only over published graphs
+and terminate after authoritative graph deletion. Startup readiness freezes the
+exact configured-Git cohort after seed and remains `building`/`degraded` until
+every member has a valid route. The socket may serve during that interval, but
+responses carry partial/fallback metadata rather than a false global-ready
+claim.
+
+The following changes were deliberately committed as independent fixes. The
+measurements are development-machine bounds, not whole-daemon acceptance
+results:
+
+| Atomic repair | Focused benchmark/result |
+| --- | ---: |
+| durable queue continues after one failed promotion | 143–153 ns/op, 448 B, 3 allocs |
+| unborn empty-tree resolution | first resolve 6.1–6.6 ms; cached 22.8–23.5 ns, 0 allocs |
+| failed-promotion prefix recovery | 512-entry worst lookup 0.993–1.004 ms |
+| publication/coordinator classification | missing graph 9.5–10 us; unpublished graph 21.2–21.6 us |
+| configured startup readiness snapshot | 256 repos 14.4–15.0 us, 28.2 KiB, 5 allocs |
+| generation shadow publication | 2,050 files: direct 2.54–2.64 s; shadow 1.67–1.69 s |
+| generation content finalization | 10,000 rows / 5,000 retained files 72.6–74.8 ms |
+| concurrent daemon-start loser wait | 700 polls / 70 virtual seconds 28.8–29.5 us, 48 B |
+| migration success boundary | v18 tail 5.25–5.67 ms; representative 10k-row v13→v19 10.12–10.47 ms |
+| routed status aggregation | 256 rows 130–149 us; no graph-row recount |
+| sparse reachability scope | 2,050 files: direct 3.04–3.24 s; shadow 1.75–1.97 s |
+| removal-grace text refusal | 1.13–1.37 us, 969 B, 14 allocs |
+| provenance-bearing registration snapshot (`1624e938`) | 256 physical/768 sources: 4.292–4.397 ms, about 1.47 MB, 13,575 allocs; 1,000 physical/3,000 sources: 17.067–17.571 ms, about 5.72–5.75 MB, 53,019 allocs |
+| primary designation (`02b09b20`, benchmark `2def4188`) | first graph in an empty family: 0.326–1.417 ms, 3,552–3,553 B, 101 allocs; family with 256 surviving non-primary graphs: 0.722–1.005 ms, 150,272 B, 3,182 allocs; idempotent current-primary binding: 12.84–13.08 us, 1,167–1,168 B, 37 allocs |
+| agent automatic-checkout guidance (`c4124d52`) | 1 tracked root: 40.3–76.4 us; 32 roots: 573.3–618.5 us; 256 roots: 4.42–4.68 ms; same-family matches and unrelated repositories measured separately |
+
+The shadow benchmark's isolated peak RSS was approximately 210 MiB versus
+196 MiB for the direct path (about +14 MiB / +7.1%). It therefore demonstrates
+bounded staging overhead for the fixture; it does not by itself close the
+repository-scale 40+ GiB incident. That closure requires the final isolated
+cold/warm run and resource ceiling in the ledger above.
+
+Generation payload publication also exposed two integrity requirements that
+are easy to miss when optimizing the build:
+
+- derived generations must take the shadow fast path without being mistaken
+  for generation zero; the drain must preserve workspace/project identity,
+  builtins, masks, producer metadata, symbol/content FTS ownership, and sibling
+  generations;
+- authoritative content cleanup is keyed to completion of the content-source
+  walk, not to an mtime snapshot. Git/file-set sources intentionally have zero
+  mtimes. Cleanup runs only after all parse workers join and cancellation is
+  checked, and only against the target generation; an interrupted walk retains
+  unvisited rows for retry.
+
+Likewise, reachability invalidation records whether the destination writes base
+topology before any in-memory shadow substitution. Re-reading the staging graph
+at the deferred invalidation point misclassifies a derived build as base and
+retires unrelated base reach records.
+
+#### Status, migration, and removal-grace observability contracts
+
+`daemon status` must describe the selected routed view, never the empty
+generation-zero process shell used to host a durable route. Exact files/nodes/
+edges may be reported from persisted dedicated-base counters only when every
+upper generation is provably a no-op. A changed sparse overlay remains `ready`
+but reports `counts_known=false`; exact composed totals are not manufactured by
+summing overlapping physical generations. Memory attribution is a separate
+truth value: structural counts do not make process-wide search/vector bytes
+attributable to one routed generation, so routed rows currently report
+`memory_known=false`. Workspace totals propagate unknown counts. If a catalog
+read fails, only identities from the last successful routed snapshot degrade;
+unrelated non-Git/generation-zero rows remain authoritative.
+
+Migration `PRAGMA user_version` is the final durable success marker, after
+in-place steps, core/sidecar index repair, and old-shape analysis invalidation.
+A failure in that tail leaves the old version so the next `Open` retries the
+idempotent work. Concurrent autostart callers use a 60-second *inactivity*
+budget renewed only by a fresh PID-bound startup heartbeat; a healthy migration
+may therefore exceed the old 65-second total ceiling, while cancellation, stale
+progress, process exit, socket availability, and lock release remain prompt
+terminal conditions.
+
+Raw `search_text` is a selected-working-copy filesystem capability under
+`TEXT-SEARCH-VIEW-1`; an immutable graph generation has no raw-code trigram
+corpus. During removal grace it MUST NOT fall through to the removed checkout,
+the primary checkout's potentially dirty bytes, or editor buffers. The request
+may resolve the sealed fallback identity solely to return a labeled
+`capability_unavailable`; it MUST NOT claim `search.text` was base-scoped.
+Graph/symbol searches that need no selected filesystem remain eligible for the
+read-only labeled base fallback. Exact file/read/edit requests remain strict.
+
+#### Additional lifecycle gaps found by the post-fix audit
+
+The audit findings now have mixed dispositions. Runtime changes remain
+benchmark- and E2E-gated; policy-only and test-only corrections are
+validation-gated. Resolved findings remain listed as regression contracts:
+
+1. **RESOLVED by `1624e938`:** configuration exposes both a canonical physical
+   registration and every independent global/project source. Startup, reload,
+   watchers, and offline cleanup consume that provenance. Project-only cold and
+   warm startup, independent-source retention, CLI/MCP ownership survival,
+   offline removal, and fail-closed unresolved aliases are regression contracts;
+2. implicit CWD discovery must never call the full `TrackRepoCtx` path or bind
+   a dedicated graph. With a primary it records an automatic checkout and lets
+   the coordinator build sparse layers; without a primary it creates no hidden
+   primary/full corpus and remains explicitly deferred. Admission uses the
+   session CWD/path, not the daemon process CWD, and runs before the dispatcher
+   rejects an uncovered root. A daemon-wide `sync.Once` is invalid because
+   different sessions can introduce different linked worktrees. Concurrent
+   admission is coalesced per canonical checkout and catalog allocation is
+   guarded by the same ready primary generation observed before the write;
+3. **RESOLVED by `02b09b20`:** only the first graph in an empty family is
+   automatically designated primary. Primary loss with surviving dedicated
+   siblings stays primary-less until the explicit, previewed `set-primary`
+   action;
+4. `git worktree move` is implemented by the schema-v20 root-move patch and
+   remains benchmark/E2E-gated. A real root change updates the checkout and
+   upserts `checkout_root_moves` in one transaction under `(checkout_id,
+   incarnation, expected_root_path)`. The journal—not incidental config/locator
+   mismatch—is the authoritative crash-recovery marker. It retains the earliest
+   uncompleted previous root and newest current root across A→B→C. Automatic
+   moves swap only the process coordinator/source watcher; dedicated moves
+   rebind the process shell, coordinator, dirty sampler, watcher, config, and
+   path-bearing CLI/MCP/manual locators without `TrackRepoCtx`, corpus rebuild,
+   generation change, or route-epoch change. Project-membership intent locators
+   remain logical and pathless. Completion deletes only the exact journal row
+   after all runtime, config, and intent state has converged, so delayed A→B
+   completion cannot clear B→C;
+5. **PARTIALLY RESOLVED by `72f92185`:** lifecycle tests now compare canonical
+   identity in embedded-index and offline track assertions. The schema-v20 move
+   patch owns the broader config relocation, missing-old-leaf canonicalization,
+   cleanup, and move-lifecycle identity contract, so macOS `/var/...` and
+   `/private/var/...` aliases neither fail valid checks nor hide stale state.
+
+The audit revalidated event-driven add/remove discovery (one-second bounded
+topology probe), ordinary demotion/primary closure, A→B→A commit-layer reuse,
+inactive-ref structural views and write refusal, and duplicate-only overlay
+precedence. Those areas remain subject to the final isolated E2E, but no new
+implementation gap was found in their focused coverage.
+
 ### CI follow-up: reload demotion atomicity (2026-08-30)
 
 The first CI run after the mainline merge found 30 deterministic lint issues
@@ -2221,3 +2797,428 @@ added.
 
 No machine daemon was stopped, restarted, reconfigured, tracked, untracked, or
 mutated during this follow-up.
+
+### Topology publication and mutation-fence audit (2026-09-01)
+
+The final concurrency audit found four correctness hazards that ordinary
+single-checkout tests could not expose:
+
+1. a primary-closure saga could invoke a nested checkout-removal callback while
+   an outer family/checkout guard was still held. Root convergence acquires the
+   global publication mutex before those guards, so the callback created the
+   reverse edge and a hard AB/BA deadlock;
+2. shutdown waited for retry/transition workers before failing their
+   transferred mutation tickets, and it tried to drain a checkout cohort while
+   holding that cohort incrementally. Either shape could deadlock a nested
+   primary closure;
+3. coordinator convergence waited for per-checkout fences while holding the
+   global root-publication locks, blocking unrelated Git families. It also acted
+   on the report captured before that wait, so a stale non-ready report could
+   withdraw a route and coordinator that had already recovered;
+4. the family, checkout, and graph semaphore registries retained every identity
+   ever seen. Deleting a raw map entry was not safe: a caller can resolve the
+   old gate before entering its semaphore, then overlap a recreated identity on
+   a new gate.
+
+The implemented lock and publication contract is:
+
+```text
+family gate -> complete sorted checkout cohort -> graph gate
+
+root publication:
+  topologyPublishMu -> moveMu -> durable root convergence
+  release moveMu -> publish topology event -> release topologyPublishMu
+  then acquire per-family/per-checkout gates for coordinator convergence
+
+terminal saga publication:
+  durable terminal journal delete
+  -> unwind every inherited family/checkout guard
+  -> graph completion(s)
+  -> checkout completion(s)
+  -> family completion
+```
+
+Primary retirement precomputes and acquires the complete family checkout
+cohort in one canonical call. A nested primary closure refuses a partially
+inherited cohort instead of extending it in an order that cannot be proven
+safe. Terminal events are collected by the outermost saga boundary, deduped by
+durable identity, and flushed after all topology guards unwind. Completed
+nested events still flush if a later parent phase fails, because their journal
+rows are already gone and replay cannot reproduce them.
+
+`CheckoutLifecycle.Close` closes retry admission first, cancels and fails every
+registered and started coordinator's mutation waiters before joining workers,
+then drains checkout gates one at a time. It never owns a multi-checkout cohort
+during shutdown. Coordinator reports are now wakeups only: after publication
+locks are released, each entry acquires its family/checkout fence, rereads the
+current checkout, incarnation, move journal, graph and route, and acts only on
+that current state.
+
+#### Lease-aware gate reclamation
+
+Every registry lookup now acquires a reference while holding the registry
+mutex, before waiting on the semaphore. A multi-key lookup reserves all
+references atomically or none. Retirement marks the entry `retiring`, makes new
+lookups wait and re-resolve, drains outstanding holders and pre-acquire waiters,
+then runs an authoritative catalog guard. Cancellation, catalog error, or guard
+loss reactivates the same entry. Successful deletion wakes waiters so they
+resolve a fresh gate; old and new identities can therefore never execute on two
+independent semaphores.
+
+Reclamation is tied to logical terminal edges, not daemon shutdown:
+
+- checkout gates retire after the exact-incarnation checkout-removal callback;
+- family gates retire only after `forget_family` has deleted its terminal
+  journal. Primary loss with independent dedicated graphs does not retire the
+  family gate;
+- graph gates retire after terminal graph removal or successful provisional
+  promotion rollback. The final guard is one SQLite snapshot over
+  `dedicated_graphs`, `checkout_routes`, `view_generations`, and `ref_views`.
+  Retained generations/ref views keep a process-local pending ID that is retried
+  after generation and ref-view sweeps. `view_layers` are immutable metadata and
+  are deliberately excluded because they have no graph-gate users and may
+  outlive the graph.
+
+Terminal callbacks notify without holding `topologyPublishMu` during fence
+drain. One shared one-second deadline bounds each retirement pass; a stalled
+holder leaves the ID pending instead of multiplying janitor latency by the
+number of identities. The retry sets are process-local because the gates
+themselves do not survive restart.
+
+#### Measured cost and regression evidence
+
+Measurements are five runs with `-benchtime=2s -benchmem` on Apple M1 Pro:
+
+| Mechanism | Final observed range |
+| --- | ---: |
+| Empty lifecycle close | 456.1–471.1 ns/op, 1,072 B, 8 allocs |
+| Gate registry steady acquire/release | 141.0–151.3 ns/op, 96 B, 4 allocs |
+| Gate retirement plus same-ID recreation | 317.2–336.6 ns/op, 448 B, 8 allocs |
+| Full mutation admission/publication | 239.8–261.6 µs/op, about 5.03 KiB, 141–142 allocs |
+| Ready-route guard | 11.82–12.01 µs/op, 1,032 B, 32 allocs |
+| Checkout topology token acquire/release | 106.7–107.8 µs/op, about 9.34 KiB, 248 allocs |
+| Family topology token acquire/release | 141.9–144.5 ns/op, 96 B, 4 allocs |
+| Settled coordinator cycle | 98.77–100.8 ns/op, 96 B, 2 allocs |
+
+Relative to the pre-reclamation mutation admission sample (108.361 µs,
+9,279 B, 246 allocations), the topology-token path remains latency-neutral;
+the two lookup leases cost approximately 65 B and two allocations. This is the
+bounded price of closing the lookup-before-semaphore race.
+
+The combined race command ran the nested primary closure, partial-cohort
+refusal, ordered terminal publications, later-parent failure, shutdown ticket
+cycle, individual gate drain, stale coordinator recovery, unrelated-family
+publication, checkout/graph/family reclamation, retained generation, catalog
+ownership, concurrent recreation, and 10,000-ID churn tests ten times. All
+three packages passed (`reconcile` 32.087 s, `indexer` 81.798 s,
+`store_sqlite` 29.314 s). `golangci-lint run --timeout=10m` reported zero
+issues, `go vet` passed for the four affected packages, and `git diff --check`
+passed. These results close the concurrency findings; they do not replace the
+isolated production-daemon cold/warm acceptance ledger above.
+
+### Durable checkout commit cache and schema-v21 follow-up (2026-09-01)
+
+The final branch-switch/restart audit found that same-process A→B→A success did
+not yet prove the V1 cache contract. This section is normative where it uses
+MUST/MUST NOT and records the implementation evidence that motivated schema
+v21. It does not mark the final isolated acceptance ledger complete.
+
+#### Restart defect and ownership model
+
+The coordinator's retained-commit LRU was process-local. On a fresh process it
+was empty, even though immutable ready generations remained in SQLite.
+`CheckoutLifecycle.Seed` ran its retirement sweep before configured
+registration/family reconciliation recreated coordinators. At that point the
+served-coordinator set was empty and the lifecycle classified every ready
+checkout commit/dirty generation not named by the one persisted route as an
+orphan. Consequently the general cache was deterministically discarded during
+warm restart, not merely vulnerable to a rare race.
+
+A branch changed while the daemon was stopped exposed a second edge. The old A
+generation survived the pre-coordinator sweep only because the persisted route
+still named A. Reconciliation then adopted/built B and released the old routed
+A through the process-local cache path, which immediately made A retireable.
+The daemon could therefore answer B correctly while destroying the generation
+needed for a subsequent cached return to A. Restart reuse already worked for
+durably retained inactive-ref views; checked-out branches had no equivalent
+durable holder.
+
+The corrective ownership model is:
+
+```text
+durable payload identity     ReadyGenerationCacheKey -> generation_id
+durable checkout claim       (checkout_id, graph_id, generation_id, last_selected)
+transient build handoff      ready-generation lease
+transient lookup accelerator coordinator retained/LRU map
+```
+
+Only the first two survive process restart. A local LRU may avoid catalog
+lookups, but losing it changes no lifetime or reuse semantics. The durable
+claim is checkout-scoped and denormalizes the generation's graph so quota and
+cleanup remain graph-local and bounded. Every write verifies that pin and
+generation graph IDs agree. Promotion, demotion, and rehome revoke that
+checkout's old-graph claims and pin the newly routed commit in the new graph.
+Deleting the holder checkout revokes all of its claims; deleting a graph
+explicitly revokes every claim for that graph before generation deletion.
+
+#### Schema-v21 migration and SQL integrity
+
+Schema v21 adds `checkout_commit_cache_pins`,
+`checkout_commit_cache_retirements`, the narrow pin-delete handoff trigger, and
+the pin indexes. The pin primary key is `(checkout_id, generation_id)`. It
+includes a denormalized `graph_id TEXT` with no graph foreign key; catalog
+mutations and integrity checks require it to equal the referenced generation's
+graph. The checkout foreign key uses `ON DELETE CASCADE`, and the generation
+foreign key uses `ON DELETE RESTRICT`. The retirement queue has one row per
+generation and uses `ON DELETE CASCADE`, because it is retry work rather than an
+owner.
+
+Upgrade runs synchronously inside the normal store-open migration transaction:
+
+1. create the pin table, retirement queue, pin-delete trigger, uniqueness key,
+   generation-reference index, and retention-order support;
+2. conservatively backfill every eligible checkout-owned ready or superseded
+   immutable commit generation whose owner checkout and graph still exist;
+3. backfill every current ready checkout commit route, including a route that
+   adopted a generation owned by a ref or different checkout;
+4. verify that every inserted generation is eligible immutable commit content,
+   has a matching denormalized graph,
+   belongs to an existing graph, and that every current ready commit route has
+   exactly one holder row; and
+5. set `PRAGMA user_version=21` last and commit.
+
+The migration query is deliberately not count/TTL/byte capped: immediately
+after recovery resumes, and before ordinary orphan deletion, Seed applies
+`RETENTION-1` per graph to the complete conservative backfill. The migration
+MUST finish before `CheckoutLifecycle.Seed` calls orphan or retirement
+discovery. It is a catalog-sized `INSERT ... SELECT`, not a payload
+migration: it reads no source tree, starts no indexer/coordinator, and writes no
+node, edge, file, mask, FTS, vector, or sidecar row. A failure rolls back the
+whole v21 step and leaves v20 authoritative for retry. Startup progress reports
+the v21 step and heartbeat through the existing migration state channel; a
+socket wait timeout MUST NOT be disguised as repository indexing. Existing
+v20 cache candidates without checkout ownership or a routed checkout adopter
+remain governed by their existing ref/lower/base references; every eligible
+checkout-owned candidate and every current routed commit is conservatively
+represented before Seed applies the bounds.
+
+The following SQL paths MUST understand pins:
+
+- ready claim and checkout bind, including lease consumption;
+- route upsert, full-route flip, commit-slot flip, base-route install, and
+  authorized promotion/demotion publication;
+- checkout and dedicated-graph deletion;
+- Seed-only ready-layer orphan discovery, runtime durable-queue candidates,
+  and explicit lifecycle/coordinator retirement backlogs;
+- generation reference reporting/refusal; and
+- both the early retirement query and final transaction-time payload delete
+  predicate.
+
+The final delete guard is mandatory even when candidate discovery already saw
+no pin: a concurrent successful route bind may create one between those steps.
+The restrictive generation foreign key is a last integrity fence, not a
+substitute for returning a truthful `generation_referenced` result. Intentional
+checkout/graph/family cleanup deletes only pins inside its authorized
+incarnation/primary-epoch closure and then retries bounded lease-aware payload
+retirement.
+
+Every pin deletion MUST enqueue its generation in the same SQLite transaction.
+This includes explicit retention pruning, route/graph transitions, direct
+catalog deletion, and implicit checkout foreign-key cascade. A semantic helper
+alone is insufficient because a future caller or cascade can bypass it; schema
+v21 therefore uses a narrow `AFTER DELETE` trigger on
+`checkout_commit_cache_pins`. Re-pinning removes the queued row atomically,
+successful generation deletion removes it by foreign-key cascade, and a
+refused retirement deliberately leaves it for retry. Runtime candidate reads
+are read-only and exclude pins, routes, ref views, child layers, and dedicated
+graph ownership. Lazy ready-generation leases are checked by the final
+writer-gated retirement predicate, so candidate discovery cannot manufacture a
+lease merely to prove that one is absent.
+
+When a candidate is re-pinned, both coordinator and lifecycle process-local
+retirement debt MUST be discarded after the durable holder is observed. The
+pin is now the lifetime authority, and its eventual deletion trigger will
+recreate the durable handoff. Retaining the stale in-memory offer would make
+every janitor poll reread it and let independent prune/re-pin races grow retry
+maps without bound.
+
+Generic READY-layer orphan inference is startup recovery only. `Seed` first
+backfills routed durable pins and then performs the conservative scan before any
+checkout build is admitted. Runtime cleanup consumes explicit coordinator and
+lifecycle backlogs, terminal/abandoned rows, missing-graph rows, and the durable
+retirement queue. It MUST NOT infer liveness from a snapshot of registered or
+served coordinators: temporary promotion/base-refresh coordinators are not
+necessarily registered, and both commit and dirty builders have a valid
+build-return-to-route-publication interval. A crash inside that interval is
+recovered by the next Seed scan; a live publication is protected from runtime
+collection without extending process-local ownership into a durability
+contract.
+
+#### Owner-independent compatibility and idle writer contract
+
+The ready key MUST exclude `owner_kind`, checkout/ref/layer IDs, repository path
+aliases, and selector spelling. It MUST include graph, lower/base identity,
+target tree, complete build fingerprint, sanitized source configuration,
+extractor/resolver/producer versions, completeness profile, and any
+producer-declared commit-sensitive input. A generation produced for a ref or
+sibling checkout is therefore adoptable without changing its immutable owner
+metadata when the key and required capabilities match.
+
+Pins do not override capability truth. A candidate whose `source.snapshot` or
+another required producer has been withdrawn is bypassed even while a holder
+row exists. The coordinator must build/adopt a compatible replacement, publish
+it atomically, and allow the obsolete claim to expire or be revoked by the
+cleanup path. A withdrawal race can never make an exact file read route to a
+generation that no longer has source capability.
+
+Once the routed commit and independently validated dirty layer match the current
+sample, every subsequent poll is observational. It performs zero ready-cache
+claims, lease acquisition/release, pin timestamp refreshes, checkout-HEAD
+writes, route/epoch writes, generation builds, or WAL writes. `last_selected`
+is refreshed only on an actual selection/route transition; otherwise polling
+would make inactive generations immortal and recreate the writer/WAL storm that
+the cache is intended to prevent.
+
+#### Retention and cleanup boundaries
+
+The quota is an inactive-cache allowance, not a total graph-size ceiling. Only
+a currently routed commit generation is excluded from the 32 inactive
+generations and 5-GiB inactive byte allowance. A ref, lower/base relationship,
+sealed dedicated/primary ownership, reader/build/cache-claim lease, or other
+durable reference still blocks deletion while present, but does not create a
+second accounting exemption. A non-routed candidate's effective age is the
+maximum `last_selected` across holders. Graph/search physical bytes are tracked
+separately and a generation shared by several holders is counted once in its
+denormalized pin graph.
+
+Retention pruning applies all three defaults—seven inactive days, 32 inactive
+tree generations, and 5 GiB per graph—and selects deterministic oldest victims
+with generation ID as tie break. It removes an expired/selected holder only
+after checking whether another holder should keep it; payload retirement occurs
+through the durable queue and only after the final transactional reference
+guard passes. Refusal preserves the queue row; re-pin clears it, and pagination
+must eventually visit more than one cleanup page without losing or duplicating
+ownership. The following cleanup boundaries are explicit:
+
+- same-graph branch switch or ordinary route withdrawal retains inactive
+  commit pins;
+- availability/removal grace creates or refreshes no pin and cannot route a
+  fallback through cached checkout content;
+- `purge_inaccessible_layers` revokes that checkout's pins with its other
+  rebuildable state while preserving explicit identity/sealed graph;
+- `forget_checkout` cascades that checkout holder and leaves shared/ref holders;
+- promotion, demotion, and rehome revoke that checkout's old-graph pins and pin
+  the newly routed compatible commit in the new graph as part of the authorized
+  transition; an idempotent publication replay removes only pins outside the
+  target graph, preserving branch history selected after the first publication;
+- deletion of a provisional/owned/primary graph revokes every pin for that
+  graph before payload retirement;
+- primary closure/family forget removes only the authorized primary/dependent
+  closure; healthy independent dedicated graphs and their holders survive; and
+- source-capability withdrawal is compatibility invalidation, not a reason to
+  ignore a live route/ref/lease deletion guard.
+
+#### Cold-indexing failure lessons
+
+Durable branch caching does not weaken the cold-start ownership invariant. A
+store deletion has no generations to reuse, but it still performs exactly one
+full physical build per explicitly configured Git corpus. The lifecycle path
+owns configured Git checkout indexing; the legacy generation-zero warmup path
+MUST exclude it. Dependent automatic worktrees start only after their primary
+base is ready and then build sparse commit/dirty layers. This prevents the
+observed N+1-shaped duplicate corpus, unpublished generation-zero rows, and the
+40+ GiB machine-wide reliability incident described above.
+
+A later isolated cold attempt exposed a separate failure mode: a sparse
+generation physical build ran for approximately 2,910 seconds, `AddBatch`
+received SQLite `database or disk is full`, and a fatal-store panic terminated
+the daemon. Capacity/resource exhaustion is an expected build failure, not a
+process invariant violation. Cold and sparse builders MUST:
+
+- preflight bounded database/WAL/temp headroom and report the estimate;
+- bound concurrent corpus memory and writer admission across repositories;
+- publish phase/file/row/byte progress so a long build is distinguishable from
+  a stalled migration or dead daemon;
+- convert `SQLITE_FULL`, quota, I/O, and cancellation into a failed unpublished
+  generation plus structured error, release every memory/writer/lease token,
+  and keep the daemon/control socket alive;
+- clean or resume partial generation payload idempotently without deleting a
+  prior ready route; and
+- checkpoint opportunistically without blocking the only writer or treating a
+  deferred passive checkpoint as build success.
+
+No repository-scale benchmark may run against the developer's shared daemon or
+store. Cold/warm acceptance uses an isolated socket, state/config/XDG roots,
+store, bounded repository fixture, explicit disk/RSS/time ceilings, and exact
+process cleanup.
+
+#### Required validation and benchmarks
+
+The durable-cache change is not complete until all of the following pass in
+normal, race-enabled, crash/reopen, and isolated process shapes as applicable:
+
+| Contract | Required proof |
+| --- | --- |
+| schema v21 | v20 fixture upgrades catalog-only, creates pin/queue/index/trigger definitions identical to a fresh store, uncapped-backfills every eligible checkout-owned ready/superseded commit plus every routed commit, then Seed enforces bounds before ordinary retirement; it writes `user_version=21` last and retries every injected rollback point with zero payload/index builds |
+| restart cache | build A/B, route A, reopen store/coordinator, switch B→A; generation IDs are unchanged and physical build/reparse counters remain zero |
+| stopped branch change | stop on A, change Git HEAD to cached B, reopen; B is exact, A remains pinned, checkout HEAD equals route, and warmup reaches ready |
+| shared holders | two checkouts plus a ref share one generation; removing each holder preserves payload until the final route/ref/lower/lease/pin drains |
+| route CAS | successful A→B restamps/pins/consumes lease once; stale root/incarnation/graph/base/route changes no pin/timestamp/route and consumes no lease |
+| retirement race | a pin created after candidate discovery defeats the final SQL delete predicate; generation FK restriction remains intact |
+| publication window | runtime cleanup between commit/dirty build return and route/stack publication cannot collect either generation, including an unregistered promotion/base-refresh coordinator; the next Seed reclaims a generation left by a crash in that window |
+| retirement handoff | explicit pin deletion plus checkout/graph cascade enqueue exactly once; refusal under route/ref/lower/lease ownership survives reopen; re-pin clears the queue row and both process-local debt maps; successful deletion cascades the row; more than 512 queued candidates drain across pages; concurrent prune versus route bind preserves the winning pin/route |
+| capability withdrawal | pinned A loses `source.snapshot`; B→A never reuses withdrawn A and a compatible replacement later caches normally |
+| retention | exact seven-day, 32→33, and 5-GiB boundaries; unique shared-byte accounting; per-graph isolation; only current routes excluded from count/bytes; base/ref/lower/lease deletion protection without an accounting exemption; deterministic eviction |
+| cleanup modes | promotion, demotion, rehome, inaccessible purge, checkout/graph/family forget leave exactly the scoped pin and graph sets; a lost-response promotion/demotion replay preserves newer target-graph cache pins while deleting foreign-graph pins |
+| idle stability | adopted local/ref/sibling routes poll with zero DB writes, lease churn, route epochs, physical builds, or monotonic WAL/RSS growth |
+| cold failure | one full corpus build per configured Git checkout; `SQLITE_FULL`/cancel leaves daemon alive, old ready routes intact, and partial generation recoverable |
+
+Benchmarks are named or equivalently scoped as follows and report `benchstat`
+over at least ten repetitions for microbenchmarks:
+
+- `BenchmarkCheckoutCommitPinBind`: successful transition, stale CAS, and
+  shared-generation holder cases, including writes/op and WAL bytes;
+- `BenchmarkCheckoutCommitCacheWarmRestart`: reopen plus cached hit, separating
+  store hydration, claim, route publication, and dirty rebuild;
+- `BenchmarkCoordinatorStableAdoptedCommitDirtyReconcile`: local, ref-owned, and
+  sibling-owned commit routes, requiring zero writes/leases/builds per op;
+- `BenchmarkCheckoutCommitRetentionSweep`: 32, 256, and 4,096 candidate/holder
+  fixtures with shared holders and graph/search byte limits;
+- `BenchmarkCheckoutCommitCacheRetirementCandidates4096`: read-only queue
+  discovery plus paginated filtering, separately from writer-gated deletion;
+- runtime and startup retirement scans over 10,000 READY generations, proving
+  that runtime does no generic orphan scan while Seed recovery remains bounded;
+- v20→v21 migration at 10,000 and 100,000 eligible generations, reporting
+  transaction latency and final database/WAL bytes;
+- `BenchmarkReadyGenerationCacheKey`: every compatibility field and
+  owner/alias independence; and
+- the existing repository-scale isolated cold/warm gate, with physical build
+  counts, parsed files, phase timings, peak RSS, database/WAL/temp bytes, and
+  daemon-survival outcome.
+
+The externally observed cache-hit gate remains below 100 ms p95 with zero
+reparsed files and zero physical immutable-commit builds. Warm restart performs
+no full corpus build. Cold store initialization performs exactly one full build
+per configured Git checkout and never an N+1 duplicate. These measurements,
+plus the final repository-wide tests, race gates, lint, vet, diff check, and
+isolated end-to-end A→B→A/restart/failure replay, are required before the
+acceptance ledger may be marked complete.
+
+Development measurements for the schema-v21 repair on Apple M1 Pro are:
+
+| Mechanism | Observed range | Contract proved |
+| --- | ---: | --- |
+| Commit-cache bind (two pin upserts) | 0.401–0.833 ms/op, about 8.4–8.6 KiB/op, 264–266 allocs/op | Route publication pays bounded durable-holder work. |
+| Retention prune, 96→32 | median 5.07 ms/op; 4.29–70.82 ms full range including scheduler/cold outliers | Sixty-four evictions enqueue durable retirement work in one bounded sweep. |
+| Target-graph transition replay with 32 cached pins | 0.306–0.632 ms/op; 32 target pins preserved and one foreign pin removed per op | Promotion/demotion replay does not erase later same-graph branch history. |
+| 4,096 retirement candidates | 6.328–6.491 ms/op, about 188,208 B/op, 7,960 allocs/op | Queue discovery is read-only and paginates independently of physical cleanup. |
+| Runtime retirement, 10,000 READY rows | 21.74–27.32 ms/op, 12,400 B/op, 274 allocs/op, four queries | Runtime does not enumerate generic READY orphans. |
+| Seed recovery, 10,000 checkout READY rows | 67.76–70.80 ms/op, about 30.27 MiB/op, about 252,773 allocs/op | Conservative orphan inference is bounded and startup-only. |
+| v20→v21, 10,000 eligible rows | median 101.8 ms (79.21–168.38 ms); DB 4,227,072 B; WAL 1,994,112 B | Catalog-only migration; no payload build. |
+| v20→v21, 100,000 eligible rows | median 830.8 ms (767.7–925.1 ms); DB 37,163,008 B; WAL 19,228,072 B | Approximately linear catalog scaling at the required large-fixture size. |
+| Read-only ready-generation match | 38.05–41.27 µs/op versus 356–371 µs/op for the former claim path | Settled validation avoids writer/lease/timestamp churn. |
+| Stable adopted reconciliation | 18.13–22.97 ms/op | Zero physical builds and zero route-epoch advances per operation. |
+| Pinned coordinator-debt transfer | 13.05–14.58 µs/op, 808 B/op, 19 allocs/op | One stale local debt entry is dropped with zero writer transactions; the durable deletion trigger remains the future retirement authority. |
+
+These are ten-repetition development samples. They satisfy the microbenchmark
+sample-count gate but do not replace the isolated process replay.
