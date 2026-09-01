@@ -3133,15 +3133,16 @@ func (l *CheckoutLifecycle) SignalCheckout(checkoutID, reason string) bool {
 	l.coordMu.Lock()
 	coordinator := l.coordinators[checkoutID]
 	l.coordMu.Unlock()
-	if coordinator == nil {
+	if coordinator == nil || !coordinator.Running() {
 		return false
 	}
 	coordinator.Signal(reason)
 	return true
 }
 
-// ActivateCheckout schedules admission of one cataloged automatic checkout on demand
-// without waiting for coordinator construction or generation publication.
+// ActivateCheckout schedules admission of one cataloged automatic checkout,
+// or a dedicated checkout which already owns a route, on demand without
+// waiting for coordinator construction or generation publication.
 // Concurrent selectors coalesce before the goroutine is launched, so they
 // cannot create one publisher goroutine apiece. The lifecycle context, rather
 // than the selecting request, owns the work: an immediate base fallback may
@@ -3172,8 +3173,19 @@ func (l *CheckoutLifecycle) activateCheckout(checkoutID, reason string) {
 	}
 
 	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
-	if err != nil || !found || checkout.State != store_sqlite.CheckoutStateReady ||
-		checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
+	if err != nil || !found || checkout.State != store_sqlite.CheckoutStateReady {
+		return
+	}
+	switch checkout.EffectiveMode {
+	case store_sqlite.CheckoutModeAutomatic:
+	case store_sqlite.CheckoutModeDedicated:
+		// A legacy dedicated corpus with no route is already served directly
+		// from its base graph. Only route-owned exact-HEAD dedicated views have
+		// coordinator work to restore on demand.
+		if _, routed, routeErr := l.catalog.GetCheckoutRoute(ctx, checkoutID); routeErr != nil || !routed {
+			return
+		}
+	default:
 		return
 	}
 	l.applyCoordinatorReport(ctx, checkout.FamilyID, reconcile.CheckoutReport{
@@ -3186,6 +3198,86 @@ func (l *CheckoutLifecycle) activateCheckout(checkoutID, reason string) {
 		Action:      reconcile.ActionReadyConfirmed,
 	})
 	l.SignalCheckout(checkoutID, reason)
+}
+
+// EnsureCheckoutFresh compares one ready checkout's routed graph with its
+// current Git/filesystem snapshot. It never waits behind a physical build: a
+// busy, stale, or not-yet-admitted checkout is signalled or activated once and
+// reported as Building so a request deadline can poll this seam.
+//
+// Dedicated checkouts participate only after they own a checkout route. A
+// route-free legacy dedicated corpus is selected as a base graph and has no
+// checked-out freshness contract for this API to enforce.
+func (l *CheckoutLifecycle) EnsureCheckoutFresh(
+	ctx context.Context,
+	checkoutID string,
+) (CheckoutFreshness, error) {
+	if l == nil || l.catalog == nil {
+		return CheckoutFreshness{}, errors.New("indexer: checkout lifecycle is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return CheckoutFreshness{}, err
+	}
+	if checkoutID == "" {
+		return CheckoutFreshness{}, fmt.Errorf("%w: empty checkout id", ErrCheckoutNotTracked)
+	}
+
+	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	switch {
+	case err != nil:
+		return CheckoutFreshness{}, fmt.Errorf("indexer: read checkout %s freshness: %w", checkoutID, err)
+	case !found:
+		return CheckoutFreshness{}, fmt.Errorf("%w: checkout %s", ErrCheckoutNotTracked, checkoutID)
+	case checkout.State != store_sqlite.CheckoutStateReady:
+		return CheckoutFreshness{}, fmt.Errorf(
+			"%w: checkout %s is %s", ErrCheckoutMoved, checkoutID, checkout.State)
+	}
+
+	switch checkout.EffectiveMode {
+	case store_sqlite.CheckoutModeAutomatic:
+	case store_sqlite.CheckoutModeDedicated:
+		_, routed, routeErr := l.catalog.GetCheckoutRoute(ctx, checkoutID)
+		if routeErr != nil {
+			return CheckoutFreshness{}, fmt.Errorf(
+				"indexer: read dedicated checkout %s route: %w", checkoutID, routeErr)
+		}
+		if !routed {
+			return CheckoutFreshness{}, fmt.Errorf(
+				"%w: dedicated checkout %s has no routed view", ErrCheckoutMoved, checkoutID)
+		}
+	default:
+		return CheckoutFreshness{}, fmt.Errorf(
+			"%w: checkout %s has mode %s", ErrCheckoutMoved, checkoutID, checkout.EffectiveMode)
+	}
+
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	closing := l.coordinatorClosing
+	l.coordMu.Unlock()
+	if closing {
+		return CheckoutFreshness{}, errors.New("indexer: checkout lifecycle is closing")
+	}
+	if coordinator == nil || !coordinator.Running() {
+		if !l.ActivateCheckout(checkoutID, "freshness requested for inactive checkout") {
+			return CheckoutFreshness{}, errors.New("indexer: checkout coordinator could not be activated")
+		}
+		return CheckoutFreshness{Building: true}, nil
+	}
+	if !pathkey.EqualPaths(coordinator.root, checkout.RootPath) {
+		coordinator.Signal("freshness requested while checkout root is moving")
+		return CheckoutFreshness{Building: true}, nil
+	}
+
+	freshness, err := coordinator.ensureFresh(ctx, checkout.HeadCommit, checkout.HeadTree)
+	if err != nil && !coordinator.Running() {
+		if l.ActivateCheckout(checkoutID, "freshness requested after coordinator stopped") {
+			return CheckoutFreshness{Building: true}, nil
+		}
+	}
+	return freshness, err
 }
 
 func (l *CheckoutLifecycle) beginCheckoutActivation(checkoutID string) (admitted, active bool) {

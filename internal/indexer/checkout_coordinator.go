@@ -219,6 +219,21 @@ type CheckoutCycle struct {
 	Err error
 }
 
+// CheckoutFreshness is the request-time verdict for one checked-out view.
+// Exactly one of Fresh and Building is true on a successful call. Building
+// includes both a stale/missing route and a coordinator already reconciling
+// it; callers may wait and probe again without starting another build.
+type CheckoutFreshness struct {
+	Fresh    bool
+	Building bool
+}
+
+type checkoutRouteSnapshot struct {
+	cycle     CheckoutCycle
+	sample    gitstate.DirtySnapshot
+	commitKey string
+}
+
 // CheckoutCoordinator keeps one automatic checkout's routed view in step with
 // its disk. It is created by the checkout lifecycle when a family's
 // reconciliation reports an accessible automatic checkout, and closed when
@@ -1107,54 +1122,192 @@ func (c *CheckoutCoordinator) readyCommitGenerationMatches(
 	)
 }
 
-// settledWithoutBuild recognizes the overwhelmingly common poll result before
-// it queues for the one build lane. It performs the same identity and dirty
-// fingerprint checks as reconcile, but makes no catalog route change.
-func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (CheckoutCycle, bool) {
-	var out CheckoutCycle
-	if err := ctx.Err(); err != nil {
-		return out, false
+// probeRouteSnapshot compares the route with the checkout's current Git and
+// filesystem snapshot. It is deliberately observation-only: it never updates
+// checkout HEAD, flips a route, touches selection timestamps or handoff pins,
+// or mutates the coordinator's retained-generation/fingerprint caches.
+//
+// The returned snapshot is carried into settledWithoutBuild, whose ordinary
+// background cycle is still responsible for those bookkeeping side effects.
+func (c *CheckoutCoordinator) probeRouteSnapshot(
+	ctx context.Context,
+	base primaryBase,
+	sample gitstate.DirtySnapshot,
+) (checkoutRouteSnapshot, bool, error) {
+	var snapshot checkoutRouteSnapshot
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return snapshot, false, err
+	}
+	snapshot.sample = sample
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil {
+		return snapshot, false, err
+	}
+	if !found || route.State != store_sqlite.RouteActive ||
+		route.GraphID != base.graphID || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return snapshot, false, nil
+	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil {
+		return snapshot, false, err
+	}
+	if !found {
+		return snapshot, false, nil
+	}
+	commitMatches, err := c.readyCommitGenerationMatches(ctx, commit, base, sample.HeadTree)
+	if err != nil {
+		return snapshot, false, err
+	}
+	if !commitMatches {
+		return snapshot, false, nil
+	}
+	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+	if err != nil {
+		return snapshot, false, err
+	}
+	if !found || !servableGeneration(dirty.State) ||
+		dirty.BaseGenerationID != commit.GenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
+		return snapshot, false, nil
+	}
+
+	snapshot.cycle.CommitGenerationID = commit.GenerationID
+	snapshot.cycle.DirtyGenerationID = dirty.GenerationID
+	snapshot.commitKey = generationRowKey(commit)
+	return snapshot, true, nil
+}
+
+// canonicalDirtySnapshotReadOnly uses an already learned unborn-tree identity
+// when available but never populates that cache. Request-time freshness checks
+// must not change process state merely because a client asked whether a route
+// is current.
+func (c *CheckoutCoordinator) canonicalDirtySnapshotReadOnly(
+	ctx context.Context,
+	snapshot gitstate.DirtySnapshot,
+) (gitstate.DirtySnapshot, error) {
+	if snapshot.HeadTree != "" || snapshot.HeadCommit != "" {
+		return canonicalDirtySnapshot(ctx, c.root, snapshot, "")
+	}
+	c.unbornTreeMu.Lock()
+	unbornTreeOID := c.unbornTreeOID
+	c.unbornTreeMu.Unlock()
+	return canonicalDirtySnapshot(ctx, c.root, snapshot, unbornTreeOID)
+}
+
+// ensureFresh performs the request-time route probe without ever waiting
+// behind a physical generation build. A busy or stale coordinator receives a
+// coalesced follow-up signal so a sample taken after the current work will
+// eventually publish the exact route.
+func (c *CheckoutCoordinator) ensureFresh(
+	ctx context.Context,
+	seedCommit string,
+	seedTree string,
+) (CheckoutFreshness, error) {
+	if c == nil || !c.Running() {
+		return CheckoutFreshness{}, errors.New("indexer: checkout coordinator is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return CheckoutFreshness{}, err
+	}
+	if !c.cycleMu.TryLock() {
+		c.Signal("freshness requested while checkout is building")
+		return CheckoutFreshness{Building: true}, nil
+	}
+	defer c.cycleMu.Unlock()
+
 	base, err := c.primaryBase(ctx)
 	if err != nil {
-		return out, false
+		return c.freshnessProbeError(ctx, err)
+	}
+	// Use a root-known one-shot sampler rather than the coordinator's retained
+	// sampler. Its immutable-commit tree cache is valuable to background
+	// polling, but a request asking a question must not rewrite even
+	// process-local caches. NewDirtySampler avoids SampleDirty's compatibility
+	// `rev-parse --show-toplevel` discovery process because root is canonical;
+	// the catalog's immutable commit/tree pair also avoids another process when
+	// the checkout still names that commit.
+	sampler, err := gitstate.NewDirtySampler(c.root, seedCommit, seedTree)
+	if err != nil {
+		return c.freshnessProbeError(ctx, err)
+	}
+	sample, err := sampler.Sample(ctx)
+	if err != nil {
+		return c.freshnessProbeError(ctx, err)
+	}
+	sample, err = c.canonicalDirtySnapshotReadOnly(ctx, sample)
+	if err != nil {
+		return c.freshnessProbeError(ctx, err)
+	}
+	_, fresh, err := c.probeRouteSnapshot(ctx, base, sample)
+	if err != nil {
+		return c.freshnessProbeError(ctx, err)
+	}
+	if fresh {
+		return CheckoutFreshness{Fresh: true}, nil
+	}
+	c.Signal("freshness requested for stale checkout")
+	return CheckoutFreshness{Building: true}, nil
+}
+
+func (c *CheckoutCoordinator) freshnessProbeError(
+	ctx context.Context,
+	err error,
+) (CheckoutFreshness, error) {
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return CheckoutFreshness{}, ctxErr
+		}
+	}
+	c.Signal("freshness probe failed")
+	return CheckoutFreshness{}, err
+}
+
+// settledWithoutBuild recognizes the overwhelmingly common poll result before
+// it queues for the one build lane. It performs the same identity and dirty
+// fingerprint checks as reconcile, but makes no catalog route change. Unlike
+// the request-time probe, the coordinator cycle also publishes the observed
+// HEAD and maintains its local route/reuse bookkeeping.
+func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (CheckoutCycle, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Preserve the original coordinator preflight ordering: validate the base,
+	// sample disk, and publish the observed HEAD before any route/generation
+	// lookup. A catalog read failure after that point must not leave the
+	// checkout row labeling an older branch while the previous route remains
+	// eligible for fallback.
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		return CheckoutCycle{}, false
 	}
 	sample, err := c.sampler.Sample(ctx)
 	if err != nil {
-		return out, false
+		return CheckoutCycle{}, false
 	}
 	sample, err = c.canonicalDirtySnapshot(ctx, sample)
 	if err != nil {
-		return out, false
+		return CheckoutCycle{}, false
 	}
 	if _, err := c.updateCheckoutHead(ctx, sample); err != nil {
-		return out, false
+		return CheckoutCycle{}, false
 	}
-	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
-	if err != nil || !found || route.State != store_sqlite.RouteActive ||
-		route.GraphID != base.graphID || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
-		return out, false
+	snapshot, settled, err := c.probeRouteSnapshot(ctx, base, sample)
+	if err != nil {
+		return CheckoutCycle{}, false
 	}
-	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
-	if err != nil || !found {
-		return out, false
-	}
-	commitMatches, err := c.readyCommitGenerationMatches(ctx, commit, base, sample.HeadTree)
-	if err != nil || !commitMatches {
-		return out, false
-	}
-	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
-	if err != nil || !found || !servableGeneration(dirty.State) ||
-		dirty.BaseGenerationID != commit.GenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
-		return out, false
+	if !settled {
+		return CheckoutCycle{}, false
 	}
 
-	c.noteDirtyFingerprint(sample.Fingerprint)
-	c.retainCommit(ctx, generationRowKey(commit), commit.GenerationID)
-	c.rememberRoutedDirty(dirty.GenerationID)
-	out.CommitGenerationID = commit.GenerationID
-	out.DirtyGenerationID = dirty.GenerationID
-	return out, true
+	c.noteDirtyFingerprint(snapshot.sample.Fingerprint)
+	c.retainCommit(ctx, snapshot.commitKey, snapshot.cycle.CommitGenerationID)
+	c.rememberRoutedDirty(snapshot.cycle.DirtyGenerationID)
+	return snapshot.cycle, true
 }
 
 func (c *CheckoutCoordinator) lifetimeContext() context.Context {
