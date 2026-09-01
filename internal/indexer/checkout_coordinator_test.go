@@ -806,6 +806,71 @@ func TestCoordinatorReusesCommitAcrossIsolatedDirtyStates(t *testing.T) {
 	}
 }
 
+func TestCoordinatorStableAdoptedRouteDoesNotWaitForWriter(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	ctx := context.Background()
+
+	const siblingName = "stable-adopted-sibling"
+	siblingRoot := filepath.Join(filepath.Dir(f.worktree), siblingName)
+	builderGit(t, f.primary, "worktree", "add", "-b", siblingName, siblingRoot)
+	siblingID := f.siblingCheckout(siblingName)
+
+	checkoutID, worktree := f.checkoutID, f.worktree
+	f.checkoutID, f.worktree = siblingID, siblingRoot
+	sibling := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	siblingCycle := coordinatorReconcile(t, sibling)
+	if siblingCycle.CommitGenerationID <= 0 {
+		t.Fatalf("sibling routed no commit generation: %+v", siblingCycle)
+	}
+
+	f.checkoutID, f.worktree = checkoutID, worktree
+	builderWriteFile(t, f.worktree, "stable_adopted_dirty.go", "package fixture\n\nfunc StableAdoptedDirty() {}\n")
+	coordinator := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	adopted := coordinatorReconcile(t, coordinator)
+	initialRoute := f.route()
+	if initialRoute.CommitGenerationID != siblingCycle.CommitGenerationID ||
+		initialRoute.DirtyGenerationID <= 0 {
+		t.Fatalf("route did not adopt sibling commit %d with a dirty layer: cycle=%+v route=%+v",
+			siblingCycle.CommitGenerationID, adopted, initialRoute)
+	}
+	row, found := f.generation(initialRoute.CommitGenerationID)
+	if !found || row.CheckoutID != siblingID || row.CheckoutID == checkoutID {
+		t.Fatalf("commit generation is not owned by the sibling checkout: found=%v row=%+v", found, row)
+	}
+
+	release, err := f.store.HoldWriteGate(ctx)
+	if err != nil {
+		t.Fatalf("hold writer gate: %v", err)
+	}
+	defer release()
+	budget, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	preflight, settled := coordinator.settledWithoutBuild(budget)
+	if !settled {
+		t.Fatal("owner-independent adopted route did not settle in the read-only preflight")
+	}
+	if preflight.CommitGenerationID != initialRoute.CommitGenerationID ||
+		preflight.DirtyGenerationID != initialRoute.DirtyGenerationID {
+		t.Fatalf("preflight moved adopted route: before=%+v after=%+v", initialRoute, preflight)
+	}
+
+	again := coordinator.reconcile(budget)
+	if again.Err != nil {
+		t.Fatalf("stable adopted reconcile waited for writer gate: %v", again.Err)
+	}
+	if again.CommitBuilt || again.DirtyBuilt || again.CommitReused ||
+		again.CommitGenerationID != initialRoute.CommitGenerationID ||
+		again.DirtyGenerationID != initialRoute.DirtyGenerationID {
+		t.Fatalf("stable adopted reconcile did work: %+v", again)
+	}
+	if finalRoute := f.route(); finalRoute.RouteEpoch != initialRoute.RouteEpoch ||
+		finalRoute.CommitGenerationID != initialRoute.CommitGenerationID ||
+		finalRoute.DirtyGenerationID != initialRoute.DirtyGenerationID {
+		t.Fatalf("stable adopted route changed: before=%+v after=%+v", initialRoute, finalRoute)
+	}
+}
+
 func BenchmarkCoordinatorStableAdoptedCommitDirtyReconcile(b *testing.B) {
 	f := newCoordinatorFixture(b)
 	ctx := context.Background()

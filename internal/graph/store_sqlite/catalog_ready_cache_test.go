@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -449,8 +450,85 @@ func TestReadyGenerationCacheKeyUsesEveryCompatibilityField(t *testing.T) {
 	}
 }
 
+func TestReadyGenerationMatchesIsReadOnlyAndCapabilityAware(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	catalog := store.Catalog()
+	key := readyCacheTestKey("graph-read-only-match", 0)
+	generationID := createReadyCacheGeneration(
+		t, catalog, key, "ref_view", "", "ref-owner", "commit",
+	)
+
+	release, err := store.HoldWriteGate(ctx)
+	if err != nil {
+		t.Fatalf("hold writer gate: %v", err)
+	}
+	budget, cancel := context.WithTimeout(ctx, time.Second)
+	matched, matchErr := catalog.ReadyGenerationMatches(
+		budget,
+		generationID,
+		key,
+		[]string{readyGenerationSourceSnapshotCapability},
+	)
+	cancel()
+	release()
+	if matchErr != nil || !matched {
+		t.Fatalf("read-only match while writer gate held = %v, err=%v", matched, matchErr)
+	}
+
+	if err := catalog.WithdrawProducer(
+		ctx,
+		generationID,
+		readyGenerationSourceSnapshotCapability,
+		"source snapshot removed",
+	); err != nil {
+		t.Fatalf("withdraw source snapshot: %v", err)
+	}
+	matched, err = catalog.ReadyGenerationMatches(
+		ctx,
+		generationID,
+		key,
+		[]string{readyGenerationSourceSnapshotCapability},
+	)
+	if err != nil {
+		t.Fatalf("match after capability withdrawal: %v", err)
+	}
+	if matched {
+		t.Fatal("generation with a withdrawn source snapshot remained reusable")
+	}
+}
+
 func BenchmarkReadyGenerationCache(b *testing.B) {
 	ctx := context.Background()
+	b.Run("ReadOnlyMatch", func(b *testing.B) {
+		store, err := Open(filepath.Join(b.TempDir(), "store.db"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer store.Close()
+		catalog := store.Catalog()
+		key := readyCacheTestKey("graph-read-only-bench", 0)
+		generationID := createReadyCacheGeneration(
+			b, catalog, key, "ref_view", "", "read-only", "bench",
+		)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			matched, err := catalog.ReadyGenerationMatches(
+				ctx,
+				generationID,
+				key,
+				[]string{readyGenerationSourceSnapshotCapability},
+			)
+			if err != nil || !matched {
+				b.Fatalf("match=%v err=%v", matched, err)
+			}
+		}
+	})
 	b.Run("ReadyHitWithLease", func(b *testing.B) {
 		store, err := Open(filepath.Join(b.TempDir(), "store.db"))
 		if err != nil {

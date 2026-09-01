@@ -40,6 +40,22 @@ func commitLayerReadyGenerationKeyFromIdentity(identity GenerationIdentity) stor
 	return commitLayerReadyGenerationKey(identity.GraphID, identity.BaseGenerationID, identity.TreeOID, identity.ConfigHash, identity.ExtractorVersions)
 }
 
+// commitLayerReadyGenerationKeyFromRow projects a stored generation onto the
+// owner-independent identity used for cross-checkout and ref-view reuse. Keep
+// the stored pipeline epoch instead of substituting the current one: callers
+// compare this key with the current expected key and must reject generations
+// produced by an older pipeline.
+func commitLayerReadyGenerationKeyFromRow(row store_sqlite.ViewGeneration) store_sqlite.ReadyGenerationCacheKey {
+	return store_sqlite.ReadyGenerationCacheKey{
+		GraphID:              row.GraphID,
+		BaseGenerationID:     row.BaseGenerationID,
+		TreeOID:              row.TreeOID,
+		IndexConfigHash:      row.ConfigHash,
+		ExtractorFingerprint: row.ExtractorVersions,
+		SchemaPipelineEpoch:  row.ResolverVersion,
+	}
+}
+
 func commitLayerRouteFingerprint(identity GenerationIdentity, profile string) string {
 	key := commitLayerReadyGenerationKeyFromIdentity(identity)
 	raw := fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",

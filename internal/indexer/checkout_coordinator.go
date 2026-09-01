@@ -1007,6 +1007,31 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 }
 
+// readyCommitGenerationMatches validates a routed generation by immutable
+// payload identity rather than producer ownership. The catalog check is
+// read-only because an existing route already protects the generation.
+func (c *CheckoutCoordinator) readyCommitGenerationMatches(
+	ctx context.Context,
+	row store_sqlite.ViewGeneration,
+	base primaryBase,
+	targetTree string,
+) (bool, error) {
+	if row.GenerationID <= 0 || row.GenerationKind != CommitLayerGenerationKind ||
+		!servableGeneration(row.State) {
+		return false, nil
+	}
+	expected := c.readyCommitCacheKey(base, targetTree)
+	if commitLayerReadyGenerationKeyFromRow(row) != expected {
+		return false, nil
+	}
+	return c.catalog.ReadyGenerationMatches(
+		ctx,
+		row.GenerationID,
+		expected,
+		commitLayerRequiredCapabilities(),
+	)
+}
+
 // settledWithoutBuild recognizes the overwhelmingly common poll result before
 // it queues for the one build lane. It performs the same identity and dirty
 // fingerprint checks as reconcile, but makes no catalog route change.
@@ -1036,8 +1061,11 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 		return out, false
 	}
 	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
-	if err != nil || !found || !servableGeneration(commit.State) ||
-		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, sample.HeadTree)) {
+	if err != nil || !found {
+		return out, false
+	}
+	commitMatches, err := c.readyCommitGenerationMatches(ctx, commit, base, sample.HeadTree)
+	if err != nil || !commitMatches {
 		return out, false
 	}
 	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
@@ -1047,7 +1075,7 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	}
 
 	c.noteDirtyFingerprint(sample.Fingerprint)
-	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, sample.HeadTree)), commit.GenerationID)
+	c.retainCommit(ctx, generationRowKey(commit), commit.GenerationID)
 	c.rememberRoutedDirty(dirty.GenerationID)
 	out.CommitGenerationID = commit.GenerationID
 	out.DirtyGenerationID = dirty.GenerationID
@@ -1678,19 +1706,23 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 		if err != nil {
 			return 0, err
 		}
-		if found && servableGeneration(row.State) &&
-			row.OwnerKind == checkoutLayerOwnerKind &&
-			row.GenerationKind == CommitLayerGenerationKind {
-			// A fresh coordinator can inherit route A while the filesystem
-			// already names branch B. Preserve that persisted, still-servable
-			// commit before resolving B; otherwise releaseCommit sees an empty
-			// process-local cache and retires A, forcing a rebuild on the switch
-			// back. Retaining by the row's own identity also handles a canonical
-			// generation adopted from another checkout.
-			rowKey := generationRowKey(row)
-			c.retainCommit(ctx, rowKey, row.GenerationID)
-			if rowKey == key {
-				return row.GenerationID, nil
+		if found {
+			reusable, err := c.readyCommitGenerationMatches(ctx, row, base, row.TreeOID)
+			if err != nil {
+				return 0, err
+			}
+			if reusable {
+				// A fresh coordinator can inherit route A while the filesystem
+				// already names branch B. Preserve that persisted, still-servable
+				// commit before resolving B; otherwise releaseCommit sees an empty
+				// process-local cache and retires A, forcing a rebuild on the switch
+				// back. Retaining by the row's own identity also handles a canonical
+				// generation adopted from another checkout.
+				rowKey := generationRowKey(row)
+				c.retainCommit(ctx, rowKey, row.GenerationID)
+				if row.TreeOID == targetTree {
+					return row.GenerationID, nil
+				}
 			}
 		}
 	}
@@ -2098,7 +2130,18 @@ func (c *CheckoutCoordinator) cachedCommit(ctx context.Context, key string) (int
 		return 0, false
 	}
 	row, found, err := c.catalog.GetViewGeneration(ctx, generationID)
-	if err != nil || !found || !servableGeneration(row.State) || generationRowKey(row) != key {
+	if err != nil || !found || !servableGeneration(row.State) ||
+		row.GenerationKind != CommitLayerGenerationKind || generationRowKey(row) != key {
+		c.forgetRetained(generationID)
+		return 0, false
+	}
+	compatible, err := c.catalog.ReadyGenerationMatches(
+		ctx,
+		generationID,
+		commitLayerReadyGenerationKeyFromRow(row),
+		commitLayerRequiredCapabilities(),
+	)
+	if err != nil || !compatible {
 		c.forgetRetained(generationID)
 		return 0, false
 	}

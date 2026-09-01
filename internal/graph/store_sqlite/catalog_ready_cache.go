@@ -237,6 +237,49 @@ func (c *Catalog) ClaimReadyGeneration(
 	}, true, nil
 }
 
+// ReadyGenerationMatches reports whether generationID is a live, servable
+// generation for key and supplies every required producer capability. Unlike
+// ClaimReadyGeneration it acquires no handoff lease, updates no selection
+// timestamp, and never enters the writer gate. It is therefore suitable for
+// validating a generation that is already protected by a durable route.
+func (c *Catalog) ReadyGenerationMatches(
+	ctx context.Context,
+	generationID int64,
+	key ReadyGenerationCacheKey,
+	requiredCapabilities []string,
+) (bool, error) {
+	if err := validateReadyGenerationCacheKey(key); err != nil {
+		return false, err
+	}
+	if generationID <= 0 {
+		return false, fmt.Errorf("generation id must be positive")
+	}
+	required, err := normalizeReadyGenerationCapabilities(requiredCapabilities)
+	if err != nil {
+		return false, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	tx, err := c.store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	matched, err := candidateMatchesReadyGenerationKey(ctx, tx, generationID, key, required)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return matched, nil
+}
+
 // ReleaseReadyGenerationLease drops a handoff lease after the caller either
 // binds a durable owner or abandons the adoption attempt. It is idempotent.
 func (c *Catalog) ReleaseReadyGenerationLease(ctx context.Context, token string) error {
