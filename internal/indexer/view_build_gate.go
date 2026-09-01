@@ -291,9 +291,10 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 	}
 
 	limit, queued := g.backgroundLimit, len(g.background)
-	if priority == ViewBuildRequired {
+	switch priority {
+	case ViewBuildRequired:
 		limit, queued = g.requiredLimit, len(g.required)
-	} else if priority == ViewBuildInteractive {
+	case ViewBuildInteractive:
 		limit, queued = g.interactiveLimit, len(g.interactive)
 	}
 	if (priority != ViewBuildRequired || limit > 0) && queued >= limit {
@@ -307,17 +308,18 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 		priority:   priority,
 		enqueuedAt: time.Now(),
 	}
-	if priority == ViewBuildRequired {
+	switch priority {
+	case ViewBuildRequired:
 		g.required = append(g.required, waiter)
 		if len(g.required) > g.requiredHighWater {
 			g.requiredHighWater = len(g.required)
 		}
-	} else if priority == ViewBuildInteractive {
+	case ViewBuildInteractive:
 		g.interactive = append(g.interactive, waiter)
 		if len(g.interactive) > g.interactiveHighWater {
 			g.interactiveHighWater = len(g.interactive)
 		}
-	} else {
+	default:
 		g.background = append(g.background, waiter)
 		if len(g.background) > g.backgroundHighWater {
 			g.backgroundHighWater = len(g.background)
@@ -338,15 +340,16 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 		} else {
 			waiter.canceled = true
 			removed := false
-			if waiter.priority == ViewBuildRequired {
+			switch waiter.priority {
+			case ViewBuildRequired:
 				before := len(g.required)
 				g.required = removeViewBuildWaiter(g.required, waiter)
 				removed = len(g.required) != before
-			} else if waiter.priority == ViewBuildInteractive {
+			case ViewBuildInteractive:
 				before := len(g.interactive)
 				g.interactive = removeViewBuildWaiter(g.interactive, waiter)
 				removed = len(g.interactive) != before
-			} else {
+			default:
 				before := len(g.background)
 				g.background = removeViewBuildWaiter(g.background, waiter)
 				removed = len(g.background) != before
@@ -417,16 +420,17 @@ func (g *ViewBuildGate) grantNextLocked() {
 }
 
 func (g *ViewBuildGate) recordPriorityLocked(priority ViewBuildPriority) {
-	if priority == ViewBuildRequired {
+	switch priority {
+	case ViewBuildRequired:
 		return
-	}
-	if priority == ViewBuildInteractive {
+	case ViewBuildInteractive:
 		if g.interactiveBurst < maxInteractiveBuildBurst {
 			g.interactiveBurst++
 		}
 		return
+	default:
+		g.interactiveBurst = 0
 	}
-	g.interactiveBurst = 0
 }
 
 func (g *ViewBuildGate) recordDequeuedLocked(waiter *viewBuildWaiter) {
@@ -442,11 +446,12 @@ func (g *ViewBuildGate) recordDequeuedLocked(waiter *viewBuildWaiter) {
 }
 
 func (g *ViewBuildGate) recordAdmittedLocked(priority ViewBuildPriority) {
-	if priority == ViewBuildRequired {
+	switch priority {
+	case ViewBuildRequired:
 		g.admittedRequired++
-	} else if priority == ViewBuildInteractive {
+	case ViewBuildInteractive:
 		g.admittedInteractive++
-	} else {
+	default:
 		g.admittedBackground++
 	}
 	viewmetrics.Count(
@@ -457,11 +462,12 @@ func (g *ViewBuildGate) recordAdmittedLocked(priority ViewBuildPriority) {
 }
 
 func (g *ViewBuildGate) recordRejectedLocked(priority ViewBuildPriority) {
-	if priority == ViewBuildRequired {
+	switch priority {
+	case ViewBuildRequired:
 		g.rejectedRequired++
-	} else if priority == ViewBuildInteractive {
+	case ViewBuildInteractive:
 		g.rejectedInteractive++
-	} else {
+	default:
 		g.rejectedBackground++
 	}
 	viewmetrics.Count(
@@ -472,11 +478,12 @@ func (g *ViewBuildGate) recordRejectedLocked(priority ViewBuildPriority) {
 }
 
 func (g *ViewBuildGate) recordCanceledLocked(priority ViewBuildPriority) {
-	if priority == ViewBuildRequired {
+	switch priority {
+	case ViewBuildRequired:
 		g.canceledRequired++
-	} else if priority == ViewBuildInteractive {
+	case ViewBuildInteractive:
 		g.canceledInteractive++
-	} else {
+	default:
 		g.canceledBackground++
 	}
 	viewmetrics.Count(
@@ -494,13 +501,14 @@ func normalizeViewBuildPriority(priority ViewBuildPriority) ViewBuildPriority {
 }
 
 func viewBuildPriorityLabel(priority ViewBuildPriority) string {
-	if priority == ViewBuildRequired {
+	switch priority {
+	case ViewBuildRequired:
 		return viewmetrics.BuildPriorityRequired
-	}
-	if priority == ViewBuildInteractive {
+	case ViewBuildInteractive:
 		return viewmetrics.BuildPriorityInteractive
+	default:
+		return viewmetrics.BuildPriorityBackground
 	}
-	return viewmetrics.BuildPriorityBackground
 }
 
 func (g *ViewBuildGate) canAdmitImmediatelyLocked(priority ViewBuildPriority) bool {

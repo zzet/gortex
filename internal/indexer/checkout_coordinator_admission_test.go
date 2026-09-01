@@ -374,7 +374,9 @@ func TestCoordinatorReportAdmissionPolicy(t *testing.T) {
 			))
 		})
 	}
-	assert.Equal(t, coordinatorAdmissionRuntime, coordinatorAdmissionPolicyFrom(nil),
+	//nolint:staticcheck // This test pins the helper's deliberate nil-context fallback.
+	nilPolicy := coordinatorAdmissionPolicyFrom(nil)
+	assert.Equal(t, coordinatorAdmissionRuntime, nilPolicy,
 		"a defensive nil context retains runtime admission semantics")
 }
 
