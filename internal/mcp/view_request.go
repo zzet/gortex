@@ -1049,7 +1049,42 @@ func (s *Server) familyPrimaryRegistration(ctx context.Context, familyID string)
 // calling session may see. Without it, naming a checkout id would reach
 // across the workspace boundary every other query is held to.
 func (s *Server) checkoutInSessionScope(ctx context.Context, checkout store_sqlite.Checkout) error {
-	return s.repoPrefixInSessionScope(ctx, s.repoPrefixForCheckout(ctx, checkout), checkout.CheckoutID)
+	if prefix := s.repoPrefixForCheckout(ctx, checkout); prefix != "" {
+		return s.repoPrefixInSessionScope(ctx, prefix, checkout.CheckoutID)
+	}
+
+	// A family can be structurally invalid (for example, temporarily missing
+	// its primary) while its surviving graph row still proves which repository
+	// owns the checkout. Use that evidence only for the scope ceiling; the
+	// selector resolver must still return the more precise no_primary error.
+	repos, bound := s.sessionWorkspaceRepoSet(ctx)
+	if !bound {
+		return nil
+	}
+	if len(repos) == 0 {
+		// A broken family can make ordinary prefix resolution impossible, but
+		// the catalog still proves that the session CWD is one of this family's
+		// checkouts. Preserve the structural no_primary/inaccessible error only
+		// for that same-family session; an unrelated unresolved CWD still fails
+		// closed below.
+		if cwd := SessionCWDFromContext(ctx); cwd != "" {
+			_, found, err := graphview.CheckoutForPath(ctx, s.materializer.Catalog,
+				[]string{checkout.FamilyID}, cwd)
+			if err == nil && found {
+				return nil
+			}
+		}
+		return s.repoPrefixInSessionScope(ctx, "", checkout.CheckoutID)
+	}
+	graphs, err := s.materializer.Catalog.ListDedicatedGraphs(ctx, checkout.FamilyID)
+	if err == nil {
+		for _, dedicated := range graphs {
+			if dedicated.RepoPrefix != "" && repos[dedicated.RepoPrefix] {
+				return nil
+			}
+		}
+	}
+	return s.repoPrefixInSessionScope(ctx, "", checkout.CheckoutID)
 }
 
 // repoPrefixInSessionScope reports whether the session may read a repository.
@@ -1057,7 +1092,7 @@ func (s *Server) checkoutInSessionScope(ctx context.Context, checkout store_sqli
 // the same posture every other scope consumer takes.
 func (s *Server) repoPrefixInSessionScope(ctx context.Context, repoPrefix, subject string) error {
 	repos, bound := s.sessionWorkspaceRepoSet(ctx)
-	if !bound || len(repos) == 0 {
+	if !bound {
 		return nil
 	}
 	if repoPrefix != "" && repos[repoPrefix] {

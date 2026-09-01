@@ -184,7 +184,7 @@ func (s *Server) refViewGraphID(ctx context.Context, selector graphview.Selector
 	repos, bound := s.sessionWorkspaceRepoSet(ctx)
 	var reachable []string
 	for _, prefix := range s.graph.RepoPrefixes() {
-		if prefix == "" || (bound && len(repos) > 0 && !repos[prefix]) {
+		if prefix == "" || (bound && !repos[prefix]) {
 			continue
 		}
 		reachable = append(reachable, prefix)

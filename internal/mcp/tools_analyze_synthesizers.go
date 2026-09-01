@@ -34,10 +34,14 @@ func (s *Server) handleAnalyzeSynthesizers(ctx context.Context, req mcp.CallTool
 	// Clamp to the session workspace (synthesizer edge enumeration is
 	// global) so a workspace-bound caller never sees edges from sibling
 	// workspaces.
-	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound {
+	wsRepos, bound := s.sessionWorkspaceRepoSet(ctx)
+	if bound && len(wsRepos) > 0 {
 		opts = append(opts, analyzer.WithSynthesizerRepoScope(wsRepos))
 	}
-	result := analyzer.AnalyzeSynthesizers(s.readerFor(ctx), opts...)
+	result := analyzer.SynthesizersResult{}
+	if !bound || len(wsRepos) > 0 {
+		result = analyzer.AnalyzeSynthesizers(s.readerFor(ctx), opts...)
+	}
 
 	if isCompact(req) {
 		var b strings.Builder
