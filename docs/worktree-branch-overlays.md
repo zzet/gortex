@@ -3222,3 +3222,47 @@ Development measurements for the schema-v21 repair on Apple M1 Pro are:
 
 These are ten-repetition development samples. They satisfy the microbenchmark
 sample-count gate but do not replace the isolated process replay.
+
+#### Final isolated acceptance (2026-09-01)
+
+The final process replay passed in a synthetic Git family under a private
+foreground daemon. The branch binary, configuration, SQLite store, socket,
+PID/log/snapshot paths, and every XDG root lived in one temporary sandbox. Git
+system/global configuration was disabled, `HOME` and `CODEX_HOME` were not
+overridden, the supervisor-owned daemon was never contacted, and shutdown
+signalled only the exact recorded foreground PID. The successful sandbox was
+moved to trash only after both private processes exited.
+
+- Explicit tracking completed in 1.92 seconds and created dedicated graph
+  `graph-731412e8fd439360891a9b6bf50c2cbd` with base generation 1 and
+  `cli_track` intent. Its linked worktree was discovered automatically as an
+  automatic checkout on the same graph, initially routing commit generation 2
+  and dirty generation 4.
+- Exact worktree searches returned the overlay copy of a duplicate symbol,
+  exposed an untracked overlay-only file, and fell through to unchanged base
+  source. Freshness was exact and the requested/actual view remained the
+  worktree checkout.
+- The first A→B→A sequence routed commit generations `2 → 6 → 2`. B's first
+  immutable layer was physically built in 631.894 ms; returning to A reused
+  generation 2. Cleaning dirty content kept generation 2 and advanced only the
+  dirty layer.
+- A same-store foreground restart was queryable in 450.783 ms and completed
+  warmup in 865.768 ms with `repos_changed=0` and `files_reindexed=0`. A stayed
+  on generation 2; switching to B reused pre-restart generation 6 and built
+  only a clean dirty layer.
+- Authoritative linked-worktree removal immediately withdrew its coordinator
+  and route and exposed a labeled read-only primary fallback. After the
+  recorded 30-second grace, only the primary remained. Closed-store checks
+  found zero removed-checkout, route, or cache-pin rows; worktree generations
+  4–9 were physically gone while primary generations 1–3 remained.
+- Both private daemons exited with status 0. Their captured logs contained no
+  warning, error, panic, or fatal record.
+
+The committed tree then passed `go test ./... -count=1 -timeout=45m` with no
+failure, panic, or timeout (slowest package `internal/indexer`, 782.972 s;
+approximately 13m30s total wall), `golangci-lint run --timeout=5m` with zero
+issues, `go vet ./...`, and `git diff --check`. Focused publication, retirement,
+route, replay, and migration races plus all four per-fix benchmarks also passed.
+This closes the durable checkout-cache and worktree-overlay acceptance ledger;
+the separate fault-injection gate for an actually exhausted filesystem remains
+part of the cold-failure hardening contract above.
