@@ -183,7 +183,11 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	}
 
 	unrouted := func() probeView {
-		c.nudgeFamily(binding.FamilyID)
+		if binding.EffectiveMode == string(store_sqlite.CheckoutModeAutomatic) && binding.Route == nil {
+			c.nudgeCheckout(binding.CheckoutID, binding.FamilyID)
+		} else {
+			c.nudgeFamily(binding.FamilyID)
+		}
 		return probeView{
 			answer:   fallbackProbeView(daemon.ProbeViewUnrouted, binding.CheckoutID, binding.RepoPrefix, daemon.FallbackViewBuilding),
 			root:     binding.RootPath,
@@ -820,6 +824,55 @@ func (c *realController) trackedRoot(abs string) (prefix, root string, ok bool) 
 	return prefix, root, ok && root != ""
 }
 
+const probeCheckoutNudgePrefix = "checkout:"
+
+// nudgeCheckout activates exactly the cataloged automatic checkout selected
+// by a probe. Cold startup deliberately leaves route-free worktrees dormant;
+// a family inventory pass confirms those rows but does not allocate their
+// coordinator, watcher, or generations. Activation is therefore the required
+// progress edge, and it stays off the probe goroutine just like reconciliation.
+//
+// The family path remains the compatibility/recovery fallback for tests that
+// replace probe reconciliation and for a lifecycle that cannot admit the
+// selected checkout.
+func (c *realController) nudgeCheckout(checkoutID, familyID string) {
+	if c == nil || checkoutID == "" {
+		c.nudgeFamily(familyID)
+		return
+	}
+	run := c.probeActivateCheckout
+	if run == nil {
+		// Existing focused tests replace family reconciliation as their
+		// observation seam. Keep that contract; production never installs this
+		// override and takes the targeted path below.
+		if c.probeReconcile != nil {
+			c.nudgeFamily(familyID)
+			return
+		}
+		if c.lifecycle == nil {
+			c.nudgeFamily(familyID)
+			return
+		}
+		run = func(id string) bool {
+			return c.lifecycle.ActivateCheckout(id, "selected by control probe")
+		}
+	}
+	key := probeCheckoutNudgePrefix + checkoutID
+	if !c.claimProbeNudge(key) {
+		return
+	}
+	go func() {
+		if run(checkoutID) {
+			return
+		}
+		// A rejected targeted admission is not progress. Forget its debounce
+		// stamp before raising the broader recovery path, so a later probe may
+		// retry activation immediately after lifecycle recovery.
+		c.forgetProbeNudge(key)
+		c.nudgeFamily(familyID)
+	}()
+}
+
 // nudgeFamily asks for one family's reconciliation on a probe's behalf,
 // debounced per family and never on the probe's own goroutine.
 //
@@ -953,16 +1006,32 @@ func (c *realController) runTopologyNudgeLoop(
 // claimFamilyNudge reports whether this caller won the right to reconcile the
 // family now, stamping the window when it did.
 func (c *realController) claimFamilyNudge(familyID string) bool {
+	return c.claimProbeNudge(familyID)
+}
+
+func (c *realController) claimProbeNudge(key string) bool {
+	if c == nil || key == "" {
+		return false
+	}
 	c.probeNudgeMu.Lock()
 	defer c.probeNudgeMu.Unlock()
-	if last, seen := c.probeNudgedAt[familyID]; seen && time.Since(last) < probeReconcileDebounce {
+	if last, seen := c.probeNudgedAt[key]; seen && time.Since(last) < probeReconcileDebounce {
 		return false
 	}
 	if c.probeNudgedAt == nil {
 		c.probeNudgedAt = make(map[string]time.Time)
 	}
-	c.probeNudgedAt[familyID] = time.Now()
+	c.probeNudgedAt[key] = time.Now()
 	return true
+}
+
+func (c *realController) forgetProbeNudge(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.probeNudgeMu.Lock()
+	delete(c.probeNudgedAt, key)
+	c.probeNudgeMu.Unlock()
 }
 
 // reconcileFamilyForProbe runs the lifecycle's own family reconciliation. A

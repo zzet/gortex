@@ -876,12 +876,112 @@ func TestUnroutedProbeBurstReconcilesOncePerWindow(t *testing.T) {
 	})
 }
 
+func TestUnroutedAutomaticProbeActivatesOnlySelectedCheckout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		testenv.Sandbox(t)
+		f := newProbeFixture(t)
+		var activated, families []string
+		f.controller.probeActivateCheckout = func(checkoutID string) bool {
+			activated = append(activated, checkoutID)
+			return true
+		}
+		f.controller.probeReconcile = func(familyID string) {
+			families = append(families, familyID)
+		}
+		ctx := context.Background()
+		probed := filepath.Join(f.worktreeRoot, probeFile)
+
+		for range 5 {
+			_, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+			require.NoError(t, err)
+		}
+		synctest.Wait()
+		assert.Equal(t, []string{probeWorktreeID}, activated,
+			"a burst must target only the selected dormant checkout")
+		assert.Empty(t, families, "successful targeted activation must not scan the family")
+
+		time.Sleep(probeReconcileDebounce - time.Second)
+		_, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+		require.NoError(t, err)
+		synctest.Wait()
+		assert.Len(t, activated, 1, "checkout activation debounce had not elapsed")
+
+		time.Sleep(2 * time.Second)
+		_, err = f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+		require.NoError(t, err)
+		synctest.Wait()
+		assert.Equal(t, []string{probeWorktreeID, probeWorktreeID}, activated)
+		assert.Empty(t, families)
+	})
+}
+
+func TestUnroutedAutomaticProbeFallsBackWhenTargetedActivationIsUnavailable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		testenv.Sandbox(t)
+		f := newProbeFixture(t)
+		var activated, families []string
+		f.controller.probeActivateCheckout = func(checkoutID string) bool {
+			activated = append(activated, checkoutID)
+			return false
+		}
+		f.controller.probeReconcile = func(familyID string) {
+			families = append(families, familyID)
+		}
+
+		_, err := f.controller.FileCoverage(context.Background(), daemon.FileCoverageParams{
+			Path: filepath.Join(f.worktreeRoot, probeFile),
+		})
+		require.NoError(t, err)
+		synctest.Wait()
+		assert.Equal(t, []string{probeWorktreeID}, activated)
+		assert.Equal(t, []string{probeFamily}, families,
+			"rejected targeted admission must retain family recovery")
+	})
+}
+
+func TestCheckoutScopedProbeNudgesAreIndependentAndUnlockBeforeActivation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		controller := &realController{}
+		type activationResult struct {
+			checkoutID string
+			unlocked   bool
+		}
+		activated := make(chan activationResult, 2)
+		controller.probeActivateCheckout = func(checkoutID string) bool {
+			// Re-entering the debounce proves nudgeCheckout released its mutex
+			// before invoking lifecycle work.
+			activated <- activationResult{
+				checkoutID: checkoutID,
+				unlocked:   controller.claimProbeNudge("callback:" + checkoutID),
+			}
+			return true
+		}
+
+		controller.nudgeCheckout("checkout-a", "family")
+		controller.nudgeCheckout("checkout-b", "family")
+		synctest.Wait()
+		close(activated)
+		var got []string
+		for result := range activated {
+			assert.True(t, result.unlocked, "activation callback ran under the debounce mutex")
+			got = append(got, result.checkoutID)
+		}
+		assert.ElementsMatch(t, []string{"checkout-a", "checkout-b"}, got,
+			"checkout-scoped debounce must not collapse distinct worktrees")
+	})
+}
+
 // TestProbeOfWorktreeInGraceFallsBackToTheFamilyPrimary pins the grace rule: a
 // working copy that stopped answering is served by the family primary, by the
 // same fallback a read-only query takes — and the answer says so rather than
 // passing for the working copy's own.
 func TestProbeOfWorktreeInGraceFallsBackToTheFamilyPrimary(t *testing.T) {
 	f := newProbeFixture(t)
+	var activations atomic.Int64
+	f.controller.probeActivateCheckout = func(string) bool {
+		activations.Add(1)
+		return true
+	}
 	f.controller.probeReconcile = func(string) {}
 	f.upsertWorktree(t, f.worktreeRoot, store_sqlite.CheckoutStateAvailabilityGrace)
 	ctx := context.Background()
@@ -895,6 +995,7 @@ func TestProbeOfWorktreeInGraceFallsBackToTheFamilyPrimary(t *testing.T) {
 	assert.Equal(t, daemon.ProbeViewBase, coverage.View.Kind)
 	assert.False(t, coverage.View.Exact, "a fallback answer must never read as exact")
 	assert.Equal(t, string(store_sqlite.CheckoutStateAvailabilityGrace), coverage.View.FallbackReason)
+	assert.Zero(t, activations.Load(), "an unavailable checkout must never be reactivated by a probe")
 }
 
 // TestProbeOfDedicatedCheckoutReadsTheBaseCorpus pins that a checkout served
@@ -902,12 +1003,18 @@ func TestProbeOfWorktreeInGraceFallsBackToTheFamilyPrimary(t *testing.T) {
 // the base, unscoped, and marked exact.
 func TestProbeOfDedicatedCheckoutReadsTheBaseCorpus(t *testing.T) {
 	f := newProbeFixture(t)
+	var activations atomic.Int64
+	f.controller.probeActivateCheckout = func(string) bool {
+		activations.Add(1)
+		return true
+	}
 	ctx := context.Background()
 	probed := filepath.Join(f.primaryRoot, probeFile)
 
 	coverage, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
 	require.NoError(t, err)
 	assert.True(t, coverage.Covered)
+	assert.Zero(t, activations.Load(), "a dedicated checkout must never enter automatic activation")
 	assert.Equal(t, 2, coverage.Symbols)
 	require.NotNil(t, coverage.View)
 	assert.Equal(t, daemon.ProbeViewBase, coverage.View.Kind)
@@ -1249,6 +1356,28 @@ func BenchmarkSelectProbeViewGenerationBackedDedicated(b *testing.B) {
 		view := f.controller.selectProbeView(ctx, probed)
 		if !view.servable || view.reader == nil || view.answer == nil || !view.answer.Exact {
 			b.Fatalf("unexpected dedicated base view: %+v", view)
+		}
+		view.release()
+	}
+}
+
+func BenchmarkSelectProbeViewUnroutedAutomaticActivationDebounced(b *testing.B) {
+	f := newProbeFixture(b)
+	f.controller.probeActivateCheckout = func(string) bool { return true }
+	ctx := context.Background()
+	probed := filepath.Join(f.worktreeRoot, probeFile)
+	// Prime the checkout-scoped debounce so the benchmark measures the hot
+	// probe path agents exercise, including the nudge lookup but excluding the
+	// one asynchronous activation launch per window.
+	prime := f.controller.selectProbeView(ctx, probed)
+	prime.release()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		view := f.controller.selectProbeView(ctx, probed)
+		if view.servable || view.answer == nil || view.answer.Kind != daemon.ProbeViewUnrouted {
+			b.Fatalf("unexpected unrouted automatic view: %+v", view)
 		}
 		view.release()
 	}

@@ -86,6 +86,10 @@ type realController struct {
 	// copy has no composed view. nil routes to the lifecycle's own per-family
 	// path; tests substitute it to observe the debounce.
 	probeReconcile func(familyID string)
+	// probeActivateCheckout is the targeted cold-checkout activation seam.
+	// Production leaves it nil and calls lifecycle.ActivateCheckout; tests use
+	// it to prove a path wakes only its own cataloged automatic checkout.
+	probeActivateCheckout func(checkoutID string) bool
 	// checkoutStartupBuildStatus is the required-publication status lookup used
 	// by TrackReadiness. Production leaves it nil and reads the lifecycle;
 	// focused tests substitute it to pin pre-generation pending/failure states
