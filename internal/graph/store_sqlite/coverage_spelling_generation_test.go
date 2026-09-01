@@ -10,13 +10,13 @@ import (
 )
 
 func TestSchemaV13LineagesConvergeAtV14(t *testing.T) {
-	require.Equal(t, 20, currentSchemaVersion)
+	require.Equal(t, 21, currentSchemaVersion)
 	plan := planSchemaMigrationWith(13, currentSchemaVersion, schemaMigrations)
 	var pending []int
 	for _, migration := range plan.inPlace {
 		pending = append(pending, migration.version)
 	}
-	require.Equal(t, []int{14, 15, 16, 17, 18, 19, 20}, pending)
+	require.Equal(t, []int{14, 15, 16, 17, 18, 19, 20, 21}, pending)
 
 	for _, tc := range []struct {
 		name       string

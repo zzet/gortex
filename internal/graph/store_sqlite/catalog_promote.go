@@ -85,7 +85,13 @@ func (c *Catalog) CommitAuthorizedPromotion(ctx context.Context, req CommitAutho
 				route.CommitGenerationID == req.CommitGenerationID &&
 				route.DirtyGenerationID == req.DirtyGenerationID &&
 				route.State == RouteActive {
-				return nil
+				if err := deleteCheckoutCommitCachePinsOutsideGraphTx(
+					ctx, tx, req.CheckoutID, req.GraphID,
+				); err != nil {
+					return err
+				}
+				return upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.GraphID,
+					req.CommitGenerationID, req.LastSeen)
 			}
 			return fmt.Errorf("%w: checkout %s promotion publication moved",
 				ErrCatalogStaleGuard, req.CheckoutID)
@@ -144,6 +150,15 @@ VALUES (?, ?, ?, ?, 0, ?)`, req.CheckoutID, req.GraphID,
 				}
 				return err
 			}
+		}
+		if err := deleteCheckoutCommitCachePinsOutsideGraphTx(
+			ctx, tx, req.CheckoutID, req.GraphID,
+		); err != nil {
+			return err
+		}
+		if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.GraphID,
+			req.CommitGenerationID, req.LastSeen); err != nil {
+			return err
 		}
 
 		result, err = tx.ExecContext(ctx, `

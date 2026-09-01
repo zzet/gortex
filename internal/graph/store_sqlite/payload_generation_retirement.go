@@ -40,6 +40,9 @@ WHERE generation_id = ?
     WHERE commit_generation_id = ? OR dirty_generation_id = ?
   )
   AND NOT EXISTS (
+    SELECT 1 FROM checkout_commit_cache_pins WHERE generation_id = ?
+  )
+  AND NOT EXISTS (
     SELECT 1 FROM ref_views WHERE active_generation_id = ?
   )
   AND NOT EXISTS (
@@ -53,7 +56,7 @@ WHERE generation_id = ?
     WHERE generation_id = ? AND expires_at > ?
   )`,
 		string(ViewGenerationRetiring), generationID,
-		generationID, generationID, generationID, generationID, generationID,
+		generationID, generationID, generationID, generationID, generationID, generationID,
 		generationID, now,
 	)
 	if err != nil {
@@ -79,25 +82,26 @@ WHERE generation_id = ?
 		}
 		return fmt.Errorf("classify retirement for generation %d: %w", generationID, err)
 	}
-	var checkoutRef, refViewRef, childRef, dedicatedRef, liveLease int
+	var checkoutRef, checkoutCacheRef, refViewRef, childRef, dedicatedRef, liveLease int
 	if err := tx.QueryRowContext(ctx, `
 SELECT
   EXISTS(SELECT 1 FROM checkout_routes
          WHERE commit_generation_id = ? OR dirty_generation_id = ?),
+  EXISTS(SELECT 1 FROM checkout_commit_cache_pins WHERE generation_id = ?),
   EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?),
   EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?),
   EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?),
   EXISTS(SELECT 1 FROM ready_generation_leases
          WHERE generation_id = ? AND expires_at > ?)`,
-		generationID, generationID, generationID, generationID, generationID,
+		generationID, generationID, generationID, generationID, generationID, generationID,
 		generationID, now,
-	).Scan(&checkoutRef, &refViewRef, &childRef, &dedicatedRef, &liveLease); err != nil {
+	).Scan(&checkoutRef, &checkoutCacheRef, &refViewRef, &childRef, &dedicatedRef, &liveLease); err != nil {
 		return fmt.Errorf("classify retirement references for generation %d: %w", generationID, err)
 	}
 	if liveLease != 0 {
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
 	}
-	if checkoutRef != 0 || refViewRef != 0 || childRef != 0 || dedicatedRef != 0 {
+	if checkoutRef != 0 || checkoutCacheRef != 0 || refViewRef != 0 || childRef != 0 || dedicatedRef != 0 {
 		return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
 	}
 	return fmt.Errorf("%w: generation %d cannot retire from state %s", ErrCatalogStaleGuard, generationID, state)

@@ -100,6 +100,14 @@ func (c *Catalog) BindReadyGenerationLeaseToCheckout(
 			return fmt.Errorf("%w: dedicated graph %s base moved", ErrCatalogStaleGuard, req.Key.GraphID)
 		}
 	}
+	previousRoute, routed, err := checkoutRouteTx(ctx, tx, req.CheckoutID)
+	if err != nil {
+		return err
+	}
+	if !routed || previousRoute.RouteEpoch != req.ExpectedRouteEpoch ||
+		previousRoute.GraphID != req.Key.GraphID {
+		return fmt.Errorf("%w: checkout route moved", ErrCatalogStaleGuard)
+	}
 
 	result, err := tx.ExecContext(ctx, `
 		UPDATE checkout_routes
@@ -120,6 +128,18 @@ func (c *Catalog) BindReadyGenerationLeaseToCheckout(
 	}
 	if rows != 1 {
 		return fmt.Errorf("%w: checkout route moved", ErrCatalogStaleGuard)
+	}
+	// Both sides of a successful A -> B switch become durable cache entries.
+	// Restamping A here starts its inactivity window at switch-away, while B's
+	// pin bridges daemon restart even before another switch occurs. These writes
+	// share the route CAS transaction, so a stale publication touches neither.
+	if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.Key.GraphID,
+		previousRoute.CommitGenerationID, now); err != nil {
+		return fmt.Errorf("retain previous checkout commit generation: %w", err)
+	}
+	if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.Key.GraphID,
+		req.GenerationID, now); err != nil {
+		return fmt.Errorf("retain selected checkout commit generation: %w", err)
 	}
 	result, err = tx.ExecContext(ctx, `
 		DELETE FROM ready_generation_leases

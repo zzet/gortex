@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 20
+const currentSchemaVersion = 21
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -126,10 +126,26 @@ var schemaMigrations = []schemaMigration{
 	// shape and isolates every decision and delete by view_gen.
 	{version: 19, name: "replay generation-scoped legacy coverage purge", inPlace: purgeLegacyCoverageSpellings},
 	{version: 20, name: "add checkout root move recovery journal", inPlace: createCheckoutRootMoveJournal},
+	{version: 21, name: "add durable checkout commit cache pins", inPlace: createCheckoutCommitCachePins},
 }
 
 func createCheckoutRootMoveJournal(tx *sql.Tx) error {
 	_, err := tx.Exec(checkoutRootMoveSchemaSQL)
+	return err
+}
+
+// createCheckoutCommitCachePins is an additive control-plane migration. The
+// table and indexes are tiny compared with graph payload and require no source
+// reindex. Existing routed commit generations are backfilled before Store.Open
+// returns, so CheckoutLifecycle.Seed cannot mistake them for restart orphans.
+func createCheckoutCommitCachePins(tx *sql.Tx) error {
+	if _, err := tx.Exec(checkoutCommitCachePinSchemaSQL); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(backfillOwnedCheckoutCommitCachePinsSQL); err != nil {
+		return err
+	}
+	_, err := tx.Exec(backfillRoutedCheckoutCommitCachePinsSQL)
 	return err
 }
 

@@ -792,6 +792,50 @@ CREATE TABLE IF NOT EXISTS cleanup_journal (
 ) WITHOUT ROWID;
 `
 
+// checkoutCommitCachePinSchemaSQL is the durable ownership edge for commit
+// layers retained for a later checkout branch switch. A pin is holder-scoped:
+// two checkouts may independently retain the same canonical generation, and
+// forgetting one checkout removes only its own edge through ON DELETE CASCADE.
+// The generation-side RESTRICT is intentional. Retirement must first evict
+// every cache holder in the same guarded transaction; it may never turn a
+// retained cache entry into a dangling generation id.
+//
+// graph_id is denormalized from view_generations for bounded graph-local LRU
+// scans. It deliberately has no foreign key: graph teardown removes the pins
+// as part of its authorized transaction, before retiring generation payload.
+//
+// checkout_commit_cache_retirements is the crash-safe handoff from pin
+// eviction to payload collection. Removing a pin enqueues its generation in
+// the same transaction; adding a pin removes the queue row. The generation FK
+// cascades only after retirement succeeds, so a route, lease, child layer, or
+// remaining holder can refuse collection without losing the retry obligation.
+const checkoutCommitCachePinSchemaSQL = `
+CREATE TABLE IF NOT EXISTS checkout_commit_cache_pins (
+    checkout_id   TEXT NOT NULL
+        REFERENCES checkouts(checkout_id) ON DELETE CASCADE,
+    generation_id INTEGER NOT NULL
+        REFERENCES view_generations(generation_id) ON DELETE RESTRICT,
+    graph_id      TEXT NOT NULL,
+    last_selected INTEGER NOT NULL DEFAULT 0 CHECK (last_selected >= 0),
+    PRIMARY KEY (checkout_id, generation_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS checkout_commit_cache_pins_by_generation
+    ON checkout_commit_cache_pins(generation_id);
+CREATE INDEX IF NOT EXISTS checkout_commit_cache_pins_by_graph_recency
+    ON checkout_commit_cache_pins(graph_id, last_selected, generation_id);
+CREATE TABLE IF NOT EXISTS checkout_commit_cache_retirements (
+    generation_id INTEGER PRIMARY KEY
+        REFERENCES view_generations(generation_id) ON DELETE CASCADE,
+    enqueued_at INTEGER NOT NULL DEFAULT 0 CHECK (enqueued_at >= 0)
+) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS checkout_commit_cache_pin_retirement
+AFTER DELETE ON checkout_commit_cache_pins
+BEGIN
+    INSERT OR IGNORE INTO checkout_commit_cache_retirements(generation_id, enqueued_at)
+    VALUES (OLD.generation_id, unixepoch());
+END;
+`
+
 // vectorTableSQL is the durable embedding sidecar's CREATE statement. The v10
 // migration rebuilds the table from it, so it shares the registry body every
 // other creator of the table uses.
@@ -951,7 +995,7 @@ func createGraphCoreIndexes(db schemaColumnDB) error {
 // created afterwards too (createGraphCoreIndexes), because the v16 step rebuilds
 // both tables and a dropped table takes its indexes with it.
 var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + generationMaskSchemaSQL +
-	analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL
+	analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL + checkoutCommitCachePinSchemaSQL
 
 // graphSchemaSQL is the node/edge core plus the two FTS5 virtual tables — the
 // part of the schema that is not a generation-keyed payload sidecar.

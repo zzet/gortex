@@ -1430,8 +1430,24 @@ func (c *Catalog) DeleteDedicatedGraph(ctx context.Context, graphID string) erro
 	if err := requireCatalogID("graph_id", graphID); err != nil {
 		return err
 	}
-	return c.deleteOne(ctx, fmt.Sprintf("dedicated graph %s", graphID),
-		`DELETE FROM dedicated_graphs WHERE graph_id = ?`, graphID)
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := deleteCheckoutCommitCachePinsForGraphTx(ctx, tx, graphID); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx,
+			`DELETE FROM dedicated_graphs WHERE graph_id = ?`, graphID)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 {
+			return fmt.Errorf("%w: dedicated graph %s", ErrCatalogNotFound, graphID)
+		}
+		return nil
+	})
 }
 
 // DeleteDedicatedGraphForIncarnation removes a graph only while its owner is
@@ -1451,22 +1467,30 @@ func (c *Catalog) DeleteDedicatedGraphForIncarnation(
 	if err := requireCatalogID("incarnation", incarnation); err != nil {
 		return false, err
 	}
-	result, err := c.exec(ctx, `
-		DELETE FROM dedicated_graphs
-		WHERE graph_id = ?
-		  AND owner_checkout_id = ?
-		  AND EXISTS (
-			SELECT 1 FROM checkouts
-			WHERE checkout_id = ? AND incarnation = ?
-		  )`, graphID, checkoutID, checkoutID, incarnation)
-	if err != nil {
-		return false, err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return changed != 0, nil
+	deleted := false
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `
+			DELETE FROM dedicated_graphs
+			WHERE graph_id = ?
+			  AND owner_checkout_id = ?
+			  AND EXISTS (
+				SELECT 1 FROM checkouts
+				WHERE checkout_id = ? AND incarnation = ?
+			  )`, graphID, checkoutID, checkoutID, incarnation)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		deleted = changed != 0
+		if !deleted {
+			return nil
+		}
+		return deleteCheckoutCommitCachePinsForGraphTx(ctx, tx, graphID)
+	})
+	return deleted, err
 }
 
 // RestoreDedicatedGraphForIncarnation restores a captured graph row after a
@@ -2165,6 +2189,8 @@ func (c *Catalog) classifyProducerWithdrawal(
 type ViewGenerationReferences struct {
 	// Routed is a checkout route naming the generation in either slot.
 	Routed bool
+	// CheckoutCached is a checkout retaining the commit for a later switch.
+	CheckoutCached bool
 	// RefViewed is a ref view serving it as its active generation.
 	RefViewed bool
 	// Based is another generation naming it as the layer beneath.
@@ -2176,7 +2202,7 @@ type ViewGenerationReferences struct {
 // Any reports whether any pointer names the generation. It is the boolean the
 // delete guard enforces.
 func (r ViewGenerationReferences) Any() bool {
-	return r.Routed || r.RefViewed || r.Based || r.GraphActive
+	return r.Routed || r.CheckoutCached || r.RefViewed || r.Based || r.GraphActive
 }
 
 // ViewGenerationReferenced reports whether anything still points at a
@@ -2199,8 +2225,8 @@ func (c *Catalog) ViewGenerationReferences(
 		return refs, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
 	err := c.store.db.QueryRowContext(ctx, viewGenerationReferencesSQL,
-		generationID, generationID, generationID, generationID, generationID,
-	).Scan(&refs.Routed, &refs.RefViewed, &refs.Based, &refs.GraphActive)
+		generationID, generationID, generationID, generationID, generationID, generationID,
+	).Scan(&refs.Routed, &refs.CheckoutCached, &refs.RefViewed, &refs.Based, &refs.GraphActive)
 	return refs, err
 }
 
@@ -2208,6 +2234,7 @@ func (c *Catalog) ViewGenerationReferences(
 // enforces inside its own transaction.
 const viewGenerationReferencedSQL = `
 SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?)
+    OR EXISTS(SELECT 1 FROM checkout_commit_cache_pins WHERE generation_id = ?)
     OR EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?)
     OR EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?)
     OR EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`
@@ -2216,6 +2243,7 @@ SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR di
 // so one round trip answers both "is it referenced" and "by what".
 const viewGenerationReferencesSQL = `
 SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?),
+       EXISTS(SELECT 1 FROM checkout_commit_cache_pins WHERE generation_id = ?),
        EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?),
        EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?),
        EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`
@@ -2233,7 +2261,7 @@ func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) 
 	return c.withTx(ctx, func(tx *sql.Tx) error {
 		var referenced bool
 		if err := tx.QueryRowContext(ctx, viewGenerationReferencedSQL,
-			generationID, generationID, generationID, generationID, generationID,
+			generationID, generationID, generationID, generationID, generationID, generationID,
 		).Scan(&referenced); err != nil {
 			return err
 		}
@@ -2300,9 +2328,10 @@ SELECT kind, graph_id, checkout_id, target_ref, target_commit, target_tree
 
 // --- checkout routes ----------------------------------------------------
 
-// UpsertCheckoutRoute writes a checkout's route row, including its epoch.
-// Repointing an existing route is FlipCheckoutRoute's job: this write does not
-// compare-and-set, so it is for installing a route, not for moving one.
+// UpsertCheckoutRoute installs a checkout's first route row, including its
+// epoch. Despite the historical name, it deliberately refuses an existing
+// checkout: repointing is FlipCheckoutRoute's job and must preserve the route
+// CAS and durable commit-cache pin contract.
 func (c *Catalog) UpsertCheckoutRoute(ctx context.Context, route CheckoutRoute) error {
 	if err := route.validate(); err != nil {
 		return err
@@ -2314,15 +2343,13 @@ func (c *Catalog) UpsertCheckoutRoute(ctx context.Context, route CheckoutRoute) 
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO checkout_routes
   (checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(checkout_id) DO UPDATE SET
-  graph_id             = excluded.graph_id,
-  commit_generation_id = excluded.commit_generation_id,
-  dirty_generation_id  = excluded.dirty_generation_id,
-  route_epoch          = excluded.route_epoch,
-  state                = excluded.state`,
+VALUES (?, ?, ?, ?, ?, ?)`,
 			route.CheckoutID, route.GraphID, catalogNullInt(route.CommitGenerationID),
 			catalogNullInt(route.DirtyGenerationID), route.RouteEpoch, string(route.State))
+		if isSQLiteUniqueViolation(err) {
+			return fmt.Errorf("%w: checkout %s route already exists; use a guarded route transition",
+				ErrCatalogStaleGuard, route.CheckoutID)
+		}
 		return err
 	})
 }
@@ -2519,6 +2546,13 @@ UPDATE checkout_routes
 		if err := checkoutRouteGraphAuthorizedTx(ctx, tx, req.CheckoutID, req.GraphID); err != nil {
 			return err
 		}
+		previous, found, err := checkoutRouteTx(ctx, tx, req.CheckoutID)
+		if err != nil {
+			return err
+		}
+		if !found || previous.RouteEpoch != req.ExpectedRouteEpoch {
+			return fmt.Errorf("%w: %s", ErrCatalogStaleGuard, subject)
+		}
 		if req.RequireActiveGraphBase {
 			active, err := graphBaseGenerationIsActiveTx(
 				ctx, tx, req.GraphID, req.ExpectedBaseGenerationID)
@@ -2529,7 +2563,29 @@ UPDATE checkout_routes
 				return fmt.Errorf("%w: dedicated graph %s base moved", ErrCatalogStaleGuard, req.GraphID)
 			}
 		}
-		return execGuardedTx(ctx, tx, subject, query, args...)
+		if err := execGuardedTx(ctx, tx, subject, query, args...); err != nil {
+			return err
+		}
+		if previous.GraphID != req.GraphID {
+			if err := deleteCheckoutCommitCachePinsForCheckoutTx(ctx, tx, req.CheckoutID); err != nil {
+				return err
+			}
+		}
+		if req.CommitGenerationID <= 0 {
+			return nil
+		}
+		var selectedAt int64
+		if err := tx.QueryRowContext(ctx, `SELECT unixepoch()`).Scan(&selectedAt); err != nil {
+			return err
+		}
+		if previous.GraphID == req.GraphID {
+			if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.GraphID,
+				previous.CommitGenerationID, selectedAt); err != nil {
+				return err
+			}
+		}
+		return upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.GraphID,
+			req.CommitGenerationID, selectedAt)
 	})
 }
 
@@ -2564,6 +2620,9 @@ func (c *Catalog) FlipCheckoutRouteSlot(ctx context.Context, req FlipCheckoutRou
 	}
 	subject := fmt.Sprintf("%s slot of route for checkout %s at epoch %d", req.Slot, req.CheckoutID, req.ExpectedRouteEpoch)
 	args := []any{catalogNullInt(req.GenerationID), string(req.State), req.CheckoutID, req.ExpectedRouteEpoch}
+	if req.Slot == RouteSlotCommit {
+		return c.flipCheckoutCommitRouteSlot(ctx, req, subject, args)
+	}
 	if !req.RequireActiveGraphBase {
 		return c.execGuarded(ctx, subject, flipRouteSlotSQL[req.Slot], args...)
 	}
@@ -2580,6 +2639,52 @@ func (c *Catalog) FlipCheckoutRouteSlot(ctx context.Context, req FlipCheckoutRou
 			return fmt.Errorf("%w: checkout %s dedicated base moved", ErrCatalogStaleGuard, req.CheckoutID)
 		}
 		return execGuardedTx(ctx, tx, subject, flipRouteSlotSQL[req.Slot], args...)
+	})
+}
+
+func (c *Catalog) flipCheckoutCommitRouteSlot(
+	ctx context.Context,
+	req FlipCheckoutRouteSlotRequest,
+	subject string,
+	args []any,
+) error {
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		previous, found, err := checkoutRouteTx(ctx, tx, req.CheckoutID)
+		if err != nil {
+			return err
+		}
+		if !found || previous.RouteEpoch != req.ExpectedRouteEpoch {
+			return fmt.Errorf("%w: %s", ErrCatalogStaleGuard, subject)
+		}
+		if req.RequireActiveGraphBase {
+			active, err := checkoutRouteBaseGenerationIsActiveTx(
+				ctx, tx, req.CheckoutID, req.ExpectedBaseGenerationID)
+			if err != nil {
+				return err
+			}
+			if !active {
+				return fmt.Errorf("%w: checkout %s dedicated base moved", ErrCatalogStaleGuard, req.CheckoutID)
+			}
+		}
+		if err := execGuardedTx(ctx, tx, subject, flipRouteSlotSQL[RouteSlotCommit], args...); err != nil {
+			return err
+		}
+		// Clearing a slot is teardown/fallback, not a branch selection. Existing
+		// cache pins remain subject to normal retention, but the displaced route
+		// is not freshly restamped by the teardown itself.
+		if req.GenerationID <= 0 {
+			return nil
+		}
+		var selectedAt int64
+		if err := tx.QueryRowContext(ctx, `SELECT unixepoch()`).Scan(&selectedAt); err != nil {
+			return err
+		}
+		if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, previous.GraphID,
+			previous.CommitGenerationID, selectedAt); err != nil {
+			return err
+		}
+		return upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, previous.GraphID,
+			req.GenerationID, selectedAt)
 	})
 }
 

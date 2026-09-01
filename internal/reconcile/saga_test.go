@@ -448,7 +448,6 @@ func TestForgetCheckoutOutlivesARouteWrittenByTheStoppingBuilder(t *testing.T) {
 	f := newFixture(t, Default())
 	f.seedPrimaryGraph("graph-primary")
 	f.seedCheckout("co-1", "inc-1", "wt", store_sqlite.CheckoutModeAutomatic)
-	f.seedRoute("co-1", "graph-primary")
 	f.seedIntent("co-1")
 	f.hooks.onPurge = func(checkoutID string) { f.seedRoute(checkoutID, "graph-primary") }
 
@@ -961,7 +960,7 @@ func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
 	commitGenerationID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
 		OwnerKind: "dedicated_graph", GraphID: "primary-graph",
 		LayerID: "legacy-demotion-commit", CheckoutID: "co-1",
-		GenerationKind: "checkout_commit", BaseGenerationID: baseGenerationID,
+		GenerationKind: string(store_sqlite.RouteSlotCommit), BaseGenerationID: baseGenerationID,
 		TreeOID: "legacy-head-tree", State: store_sqlite.ViewGenerationReady,
 	})
 	if err != nil {
@@ -970,7 +969,7 @@ func TestResumeRepairsVerifiableLegacyRetireGraphTarget(t *testing.T) {
 	dirtyGenerationID, err := f.catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
 		OwnerKind: "dedicated_graph", GraphID: "primary-graph",
 		LayerID: "legacy-demotion-dirty", CheckoutID: "co-1",
-		GenerationKind: "checkout_dirty", BaseGenerationID: commitGenerationID,
+		GenerationKind: string(store_sqlite.RouteSlotDirty), BaseGenerationID: commitGenerationID,
 		State: store_sqlite.ViewGenerationReady,
 	})
 	if err != nil {

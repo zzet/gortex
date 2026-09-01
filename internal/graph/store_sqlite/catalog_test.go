@@ -27,6 +27,8 @@ var catalogTables = []string{
 	"view_generations",
 	"view_layers",
 	"checkout_routes",
+	"checkout_commit_cache_pins",
+	"checkout_commit_cache_retirements",
 	"ref_views",
 	"ref_view_builds",
 	"cleanup_journal",
@@ -820,6 +822,11 @@ func TestCatalogRouteEpochCASRejectsStaleFlip(t *testing.T) {
 
 	first := seedBuildingGeneration(t, catalog, "graph-1")
 	second := seedBuildingGeneration(t, catalog, "graph-1")
+	for _, generationID := range []int64{first, second} {
+		if err := catalog.PublishViewGeneration(ctx, generationID, 200); err != nil {
+			t.Fatalf("PublishViewGeneration(%d): %v", generationID, err)
+		}
+	}
 	if err := catalog.UpsertCheckoutRoute(ctx, CheckoutRoute{
 		CheckoutID: "wt", GraphID: "graph-1", CommitGenerationID: first,
 		RouteEpoch: 0, State: RouteActive,
@@ -1829,7 +1836,7 @@ func TestCatalogAuthorizedDemotionPreservesTransitionUntilCleanupCompletes(t *te
 	commitGenerationID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
 		OwnerKind: checkoutGenerationOwnerKind, GraphID: "primary-graph",
 		LayerID: "demotion-commit", CheckoutID: "demoted-wt",
-		GenerationKind: "checkout_commit", BaseGenerationID: baseGenerationID,
+		GenerationKind: string(RouteSlotCommit), BaseGenerationID: baseGenerationID,
 		TreeOID: "7ee7", State: ViewGenerationReady,
 	})
 	if err != nil {
@@ -1838,7 +1845,7 @@ func TestCatalogAuthorizedDemotionPreservesTransitionUntilCleanupCompletes(t *te
 	dirtyGenerationID, err := catalog.CreateViewGeneration(ctx, ViewGeneration{
 		OwnerKind: checkoutGenerationOwnerKind, GraphID: "primary-graph",
 		LayerID: "demotion-dirty", CheckoutID: "demoted-wt",
-		GenerationKind: "checkout_dirty", BaseGenerationID: commitGenerationID,
+		GenerationKind: string(RouteSlotDirty), BaseGenerationID: commitGenerationID,
 		State: ViewGenerationReady,
 	})
 	if err != nil {
@@ -2113,8 +2120,10 @@ func TestCatalogWriteValidationRejectsUnknownVocabulary(t *testing.T) {
 		}
 	}
 	for _, state := range []RouteState{RoutePending, RouteActive, RouteRetired} {
+		checkoutID := "route-" + string(state)
+		seedFamilyAndCheckout(t, catalog, "fam-"+checkoutID, checkoutID, "inc-"+checkoutID)
 		if err := catalog.UpsertCheckoutRoute(ctx, CheckoutRoute{
-			CheckoutID: "wt", GraphID: "g", State: state,
+			CheckoutID: checkoutID, GraphID: "g", State: state,
 		}); err != nil {
 			t.Errorf("route state %q rejected: %v", state, err)
 		}

@@ -550,7 +550,7 @@ func (s *Store) retirePayloadGeneration(
 // that would have to be released.
 func refusalReason(refs ViewGenerationReferences) string {
 	switch {
-	case refs.Routed, refs.RefViewed, refs.GraphActive:
+	case refs.Routed, refs.CheckoutCached, refs.RefViewed, refs.GraphActive:
 		return viewmetrics.RefusedRouted
 	case refs.Based:
 		return viewmetrics.RefusedBased

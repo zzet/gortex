@@ -278,7 +278,13 @@ func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthor
 							req.Cleanup.CleanupID, entry.Reason, req.Cleanup.Reason)
 					}
 				}
-				return nil
+				if err := deleteCheckoutCommitCachePinsOutsideGraphTx(
+					ctx, tx, req.CheckoutID, req.PrimaryGraphID,
+				); err != nil {
+					return err
+				}
+				return upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.PrimaryGraphID,
+					req.CommitGenerationID, req.LastSeen)
 			}
 			return fmt.Errorf("%w: checkout %s demotion publication moved",
 				ErrCatalogStaleGuard, req.CheckoutID)
@@ -341,6 +347,15 @@ VALUES (?, ?, ?, ?, 0, ?)`, req.CheckoutID, req.PrimaryGraphID,
 				}
 				return err
 			}
+		}
+		if err := deleteCheckoutCommitCachePinsOutsideGraphTx(
+			ctx, tx, req.CheckoutID, req.PrimaryGraphID,
+		); err != nil {
+			return err
+		}
+		if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.PrimaryGraphID,
+			req.CommitGenerationID, req.LastSeen); err != nil {
+			return err
 		}
 
 		result, err := tx.ExecContext(ctx, `

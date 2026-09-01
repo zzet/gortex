@@ -117,7 +117,7 @@ func newCatalogUntrackFixture(t *testing.T) *catalogUntrackFixture {
 		GraphID:          f.primaryGraphID,
 		LayerID:          "target-commit",
 		CheckoutID:       f.targetCheckoutID,
-		GenerationKind:   "checkout_commit",
+		GenerationKind:   string(RouteSlotCommit),
 		BaseGenerationID: baseID,
 		TreeOID:          "tree-target-head",
 		State:            ViewGenerationReady,
@@ -130,7 +130,7 @@ func newCatalogUntrackFixture(t *testing.T) *catalogUntrackFixture {
 		GraphID:          f.primaryGraphID,
 		LayerID:          "target-dirty",
 		CheckoutID:       f.targetCheckoutID,
-		GenerationKind:   "checkout_dirty",
+		GenerationKind:   string(RouteSlotDirty),
 		BaseGenerationID: commitID,
 		State:            ViewGenerationReady,
 	})
@@ -571,12 +571,36 @@ func TestCommitAuthorizedDemotionPublishesOneAtomicStack(t *testing.T) {
 		!found || stored.Reason != cleanup.Reason {
 		t.Fatalf("published cleanup = %+v, found %v, err %v", stored, found, err)
 	}
+	targetCached, _ := checkoutCommitCacheTestGeneration(
+		t, f.catalog, f.primaryGraphID, "demotion-replay-target-cache",
+	)
+	checkoutCommitCacheTestSetPin(
+		t, f.catalog, f.targetCheckoutID, f.primaryGraphID,
+		targetCached, req.LastSeen+1, 1,
+	)
+	foreignCached, _ := checkoutCommitCacheTestGeneration(
+		t, f.catalog, f.targetGraphID, "demotion-replay-foreign-cache",
+	)
+	checkoutCommitCacheTestSetPin(
+		t, f.catalog, f.targetCheckoutID, f.targetGraphID,
+		foreignCached, req.LastSeen+1, 1,
+	)
 
 	// A lost response retries the exact transaction without advancing the
 	// route epoch or duplicating publication. It remains recognizable after
 	// cleanup has already removed the checkout's former graph.
 	if err := f.catalog.CommitAuthorizedDemotion(ctx, req); err != nil {
 		t.Fatalf("idempotent CommitAuthorizedDemotion: %v", err)
+	}
+	targetPins := checkoutCommitCacheTestPinIDs(
+		checkoutCommitCacheTestPins(t, f.catalog, f.primaryGraphID),
+	)
+	if targetPins[f.commitGenerationID] != 1 || targetPins[targetCached] != 1 {
+		t.Fatalf("demotion replay target pins=%v, want current=%d and cached=%d",
+			targetPins, f.commitGenerationID, targetCached)
+	}
+	if foreignPins := checkoutCommitCacheTestPins(t, f.catalog, f.targetGraphID); len(foreignPins) != 0 {
+		t.Fatalf("demotion replay retained cross-graph pins: %+v", foreignPins)
 	}
 	deleted, err := f.catalog.DeleteDedicatedGraphForIncarnation(
 		ctx, f.targetGraphID, f.targetCheckoutID, f.targetIncarnation,

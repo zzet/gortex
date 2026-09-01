@@ -62,10 +62,12 @@ func TestOpenV19CheckoutRootMoveJournalAlreadyPresentIsIdempotent(t *testing.T) 
 		t.Fatalf("first Open of v19 fixture: %v", err)
 	}
 	assertCheckoutRootMoveMigrationFixture(t, migrated, wantMove, wantSchema)
-	if len(firstEvents) != 2 ||
+	if len(firstEvents) != 4 ||
 		firstEvents[0].Version != 20 || firstEvents[0].Phase != MigrationStarted ||
-		firstEvents[1].Version != 20 || firstEvents[1].Phase != MigrationFinished {
-		t.Fatalf("first Open migration events = %+v, want v20 started/finished", firstEvents)
+		firstEvents[1].Version != 20 || firstEvents[1].Phase != MigrationFinished ||
+		firstEvents[2].Version != 21 || firstEvents[2].Phase != MigrationStarted ||
+		firstEvents[3].Version != 21 || firstEvents[3].Phase != MigrationFinished {
+		t.Fatalf("first Open migration events = %+v, want v20 then v21 started/finished", firstEvents)
 	}
 	if err := migrated.Close(); err != nil {
 		t.Fatalf("close migrated store: %v", err)
@@ -207,8 +209,8 @@ func TestOpenV19CheckoutRootMoveMigrationFailureRetriesWithoutCatalogLoss(t *tes
 		t.Fatalf("retry Open after injected failure: %v", err)
 	}
 	defer retried.Close()
-	if version, err := readUserVersion(retried.writerDB); err != nil || version != 20 {
-		t.Fatalf("version after retry = %d, err %v; want 20", version, err)
+	if version, err := readUserVersion(retried.writerDB); err != nil || version != currentSchemaVersion {
+		t.Fatalf("version after retry = %d, err %v; want %d", version, err, currentSchemaVersion)
 	}
 	checkout, found, err := retried.Catalog().GetCheckout(ctx, "checkout-retry")
 	if err != nil || !found || checkout.Incarnation != "inc-retry" {
@@ -233,8 +235,8 @@ func assertCheckoutRootMoveMigrationFixture(
 ) {
 	t.Helper()
 	ctx := context.Background()
-	if version, err := readUserVersion(store.writerDB); err != nil || version != 20 {
-		t.Fatalf("user_version = %d, err %v; want 20", version, err)
+	if version, err := readUserVersion(store.writerDB); err != nil || version != currentSchemaVersion {
+		t.Fatalf("user_version = %d, err %v; want %d", version, err, currentSchemaVersion)
 	}
 	if got := sqliteSchemaObject(t, store.writerDB, "table", "checkout_root_moves"); got != wantSchema {
 		t.Fatalf("checkout_root_moves schema changed across migration:\nwant: %s\ngot:  %s", wantSchema, got)

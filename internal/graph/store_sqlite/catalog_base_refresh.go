@@ -182,6 +182,12 @@ SELECT generation_id
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		// Every cached commit in this graph composes over the base epoch being
+		// replaced. Revoke those cache owners in the same transaction that makes
+		// the new epoch authoritative; none may be migrated by generation id.
+		if err := deleteCheckoutCommitCachePinsForGraphTx(ctx, tx, req.GraphID); err != nil {
+			return err
+		}
 
 		result, err := tx.ExecContext(ctx, `
 UPDATE dedicated_graphs
@@ -230,6 +236,10 @@ VALUES (?, ?, ?, ?, 0, ?)`, req.CheckoutID, req.GraphID,
 			if err != nil {
 				return err
 			}
+		}
+		if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.GraphID,
+			req.CommitGenerationID, req.LastSeen); err != nil {
+			return err
 		}
 
 		if _, err := tx.ExecContext(ctx, `

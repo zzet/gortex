@@ -294,14 +294,39 @@ func (f *probeFixture) routeCheckoutFromBase(
 		require.NoError(t, f.store.PublishPayloadGeneration(ctx, dirtyID, 2001))
 	}
 
-	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
+	f.replaceCheckoutRoute(t, store_sqlite.CheckoutRoute{
 		CheckoutID:         checkoutID,
 		GraphID:            probeGraphID,
 		CommitGenerationID: commitID,
 		DirtyGenerationID:  dirtyID,
 		State:              store_sqlite.RouteActive,
-	}))
+	})
 	return commitID, dirtyID
+}
+
+func (f *probeFixture) replaceCheckoutRoute(
+	t testing.TB, desired store_sqlite.CheckoutRoute,
+) store_sqlite.CheckoutRoute {
+	t.Helper()
+	ctx := context.Background()
+	current, found, err := f.catalog.GetCheckoutRoute(ctx, desired.CheckoutID)
+	require.NoError(t, err)
+	if found {
+		require.NoError(t, f.catalog.FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
+			CheckoutID:         desired.CheckoutID,
+			ExpectedRouteEpoch: current.RouteEpoch,
+			GraphID:            desired.GraphID,
+			CommitGenerationID: desired.CommitGenerationID,
+			DirtyGenerationID:  desired.DirtyGenerationID,
+			State:              desired.State,
+		}))
+	} else {
+		require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, desired))
+	}
+	updated, found, err := f.catalog.GetCheckoutRoute(ctx, desired.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	return updated
 }
 
 // routeWorktree publishes a complete automatic-checkout route.
@@ -1094,13 +1119,13 @@ func TestDedicatedRouteMoveAtRevalidationBoundaryIsNeverExact(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.NoError(t, f.catalog.UpsertCheckout(ctx, oldCheckout))
-	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, oldRoute))
+	oldRoute = f.replaceCheckoutRoute(t, oldRoute)
 
 	var moved atomic.Bool
 	f.controller.probeViewRevalidateBarrier = func() {
 		if moved.CompareAndSwap(false, true) {
 			require.NoError(t, f.catalog.UpsertCheckout(ctx, newCheckout))
-			require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, newRoute))
+			f.replaceCheckoutRoute(t, newRoute)
 		}
 	}
 	probed := filepath.Join(f.primaryRoot, probeFile)
@@ -1124,7 +1149,7 @@ func TestDedicatedRouteMoveAtRevalidationBoundaryIsNeverExact(t *testing.T) {
 	// same route at that gate as well so it cannot publish Ready for route A
 	// after route B became current.
 	require.NoError(t, f.catalog.UpsertCheckout(ctx, oldCheckout))
-	require.NoError(t, f.catalog.UpsertCheckoutRoute(ctx, oldRoute))
+	f.replaceCheckoutRoute(t, oldRoute)
 	moved.Store(false)
 	readiness, err := f.controller.TrackReadiness(ctx, probed)
 	require.NoError(t, err)

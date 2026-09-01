@@ -113,7 +113,7 @@ func newAuthorizedPromotionFixture(tb testing.TB, suffix string) authorizedPromo
 			GraphID:            graphID,
 			RequiredGraphState: "graph_ready",
 			BaseGenerationID:   baseID,
-			BaseTreeOID:         treeOID,
+			BaseTreeOID:        treeOID,
 			CommitGenerationID: commitID,
 			DirtyGenerationID:  dirtyID,
 			State:              CheckoutStateReady,
@@ -251,6 +251,21 @@ func TestCommitAuthorizedPromotionIsIdempotentAndProtectsItsRoute(t *testing.T) 
 		route.State != RouteActive {
 		t.Fatalf("published stack = graph %+v route %+v", graph, route)
 	}
+	targetCached, _ := checkoutCommitCacheTestGeneration(
+		t, fixture.catalog, fixture.req.GraphID, "promotion-replay-target-cache",
+	)
+	checkoutCommitCacheTestSetPin(
+		t, fixture.catalog, fixture.req.CheckoutID, fixture.req.GraphID,
+		targetCached, fixture.req.LastSeen+1, 1,
+	)
+	const foreignGraphID = "promotion-replay-foreign-graph"
+	foreignCached, _ := checkoutCommitCacheTestGeneration(
+		t, fixture.catalog, foreignGraphID, "promotion-replay-foreign-cache",
+	)
+	checkoutCommitCacheTestSetPin(
+		t, fixture.catalog, fixture.req.CheckoutID, foreignGraphID,
+		foreignCached, fixture.req.LastSeen+1, 1,
+	)
 
 	if err := fixture.catalog.CommitAuthorizedPromotion(ctx, fixture.req); err != nil {
 		t.Fatalf("idempotent CommitAuthorizedPromotion: %v", err)
@@ -259,6 +274,16 @@ func TestCommitAuthorizedPromotionIsIdempotentAndProtectsItsRoute(t *testing.T) 
 	if err != nil || !found || replayed != route {
 		t.Fatalf("route after idempotent resume = %+v, found=%v, err=%v; want %+v",
 			replayed, found, err, route)
+	}
+	targetPins := checkoutCommitCacheTestPinIDs(
+		checkoutCommitCacheTestPins(t, fixture.catalog, fixture.req.GraphID),
+	)
+	if targetPins[fixture.req.CommitGenerationID] != 1 || targetPins[targetCached] != 1 {
+		t.Fatalf("promotion replay target pins=%v, want current=%d and cached=%d",
+			targetPins, fixture.req.CommitGenerationID, targetCached)
+	}
+	if foreignPins := checkoutCommitCacheTestPins(t, fixture.catalog, foreignGraphID); len(foreignPins) != 0 {
+		t.Fatalf("promotion replay retained cross-graph pins: %+v", foreignPins)
 	}
 	if err := fixture.catalog.CompleteIntentTransition(
 		ctx, fixture.req.CheckoutID, fixture.req.TransitionID,

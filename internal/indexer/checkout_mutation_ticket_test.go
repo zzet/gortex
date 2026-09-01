@@ -20,11 +20,43 @@ func newCheckoutMutationTicketHarness(t testing.TB) (*CheckoutCoordinator, store
 	if err != nil || !found || dedicated.ActiveGenerationID <= 0 {
 		t.Fatalf("read fixture dedicated generation: found=%v graph=%+v err=%v", found, dedicated, err)
 	}
+	commitGenerationID, err := fixture.catalog.CreateViewGeneration(context.Background(), store_sqlite.ViewGeneration{
+		OwnerKind:         checkoutLayerOwnerKind,
+		GraphID:           fixture.graphID,
+		LayerID:           "mutation-ticket-commit",
+		CheckoutID:        fixture.checkoutID,
+		GenerationKind:    CommitLayerGenerationKind,
+		BaseGenerationID:  dedicated.ActiveGenerationID,
+		TreeOID:           "mutation-ticket-tree",
+		ConfigHash:        "mutation-ticket-config",
+		ExtractorVersions: "mutation-ticket-extractors",
+		ResolverVersion:   commitLayerPipelineEpoch,
+		State:             store_sqlite.ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed mutation commit generation: %v", err)
+	}
+	dirtyGenerationID, err := fixture.catalog.CreateViewGeneration(context.Background(), store_sqlite.ViewGeneration{
+		OwnerKind:         checkoutLayerOwnerKind,
+		GraphID:           fixture.graphID,
+		LayerID:           "mutation-ticket-dirty",
+		CheckoutID:        fixture.checkoutID,
+		GenerationKind:    DirtyLayerGenerationKind,
+		BaseGenerationID:  commitGenerationID,
+		TreeOID:           "mutation-ticket-tree",
+		ConfigHash:        "mutation-ticket-config",
+		ExtractorVersions: "mutation-ticket-extractors",
+		ResolverVersion:   checkoutResolverVersion,
+		State:             store_sqlite.ViewGenerationReady,
+	})
+	if err != nil {
+		t.Fatalf("seed mutation dirty generation: %v", err)
+	}
 	route := store_sqlite.CheckoutRoute{
 		CheckoutID:         fixture.checkoutID,
 		GraphID:            fixture.graphID,
-		CommitGenerationID: dedicated.ActiveGenerationID,
-		DirtyGenerationID:  dedicated.ActiveGenerationID,
+		CommitGenerationID: commitGenerationID,
+		DirtyGenerationID:  dirtyGenerationID,
 		RouteEpoch:         7,
 		State:              store_sqlite.RouteActive,
 	}
@@ -69,10 +101,17 @@ func publishCheckoutMutationRoute(
 	route *store_sqlite.CheckoutRoute,
 ) {
 	t.Helper()
-	route.RouteEpoch++
-	if err := coordinator.catalog.UpsertCheckoutRoute(context.Background(), *route); err != nil {
+	if err := coordinator.catalog.FlipCheckoutRoute(context.Background(), store_sqlite.FlipCheckoutRouteRequest{
+		CheckoutID:         route.CheckoutID,
+		ExpectedRouteEpoch: route.RouteEpoch,
+		GraphID:            route.GraphID,
+		CommitGenerationID: route.CommitGenerationID,
+		DirtyGenerationID:  route.DirtyGenerationID,
+		State:              route.State,
+	}); err != nil {
 		t.Fatalf("publish checkout mutation route: %v", err)
 	}
+	route.RouteEpoch++
 }
 
 func awaitCheckoutMutationResult(t testing.TB, ticket *MutationTicket) MutationResult {
@@ -737,10 +776,7 @@ func BenchmarkCheckoutMutationTicketAdmissionPublication(b *testing.B) {
 			b.Fatal(err)
 		}
 		claim := coordinator.mutationClaim()
-		route.RouteEpoch++
-		if err := coordinator.catalog.UpsertCheckoutRoute(ctx, route); err != nil {
-			b.Fatal(err)
-		}
+		publishCheckoutMutationRoute(b, coordinator, &route)
 		coordinator.completeMutationClaim(ctx, claim, CheckoutCycle{
 			CommitGenerationID: route.CommitGenerationID,
 			DirtyGenerationID:  route.DirtyGenerationID,

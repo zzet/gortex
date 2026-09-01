@@ -189,6 +189,10 @@ func (c *Catalog) ClaimReadyGeneration(
 				WHERE commit_generation_id = ? OR dirty_generation_id = ?
 			  )
 			  AND NOT EXISTS (
+				SELECT 1 FROM checkout_commit_cache_pins
+				WHERE generation_id = ?
+			  )
+			  AND NOT EXISTS (
 				SELECT 1 FROM ref_views WHERE active_generation_id = ?
 			  )
 			  AND NOT EXISTS (
@@ -202,6 +206,7 @@ func (c *Catalog) ClaimReadyGeneration(
 				WHERE generation_id = ? AND expires_at > ?
 			  )
 		`, req.CandidateGenerationID, req.CandidateGenerationID, req.CandidateGenerationID,
+			req.CandidateGenerationID,
 			req.CandidateGenerationID, req.CandidateGenerationID, req.CandidateGenerationID,
 			req.CandidateGenerationID, now)
 		if err != nil {
@@ -345,6 +350,10 @@ func canonicalReadyGeneration(
 		      SELECT 1 FROM checkout_routes AS route
 		      WHERE route.commit_generation_id = view_generations.generation_id
 		         OR route.dirty_generation_id = view_generations.generation_id
+		    )
+		    OR EXISTS (
+		      SELECT 1 FROM checkout_commit_cache_pins AS pin
+		      WHERE pin.generation_id = view_generations.generation_id
 		    )
 		    OR EXISTS (
 		      SELECT 1 FROM ref_views AS ref_view

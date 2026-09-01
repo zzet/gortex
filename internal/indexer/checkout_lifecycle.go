@@ -3890,6 +3890,11 @@ func (h cleanupHooks) FamilyRemovalCompleted(target reconcile.FamilyRemovalTarge
 // identity and any dedicated corpus it owns.
 func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ string) error {
 	h.l.oweRoutedGenerations(ctx, checkoutID)
+	if h.l.catalog != nil {
+		if err := h.l.catalog.DeleteCheckoutCommitCachePins(ctx, checkoutID); err != nil {
+			return err
+		}
+	}
 	if checkoutTopologyHeld(ctx, checkoutID) {
 		h.l.dropCoordinatorFenced(checkoutID)
 	} else {

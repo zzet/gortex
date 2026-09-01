@@ -52,7 +52,7 @@ func TestSchemaV20CheckoutRootMoveJournalMigrationParityAndDurability(t *testing
 	if got := sqliteSchemaObject(t, migrated.writerDB, "table", "checkout_root_moves"); got != freshSQL {
 		t.Fatalf("fresh/migrated checkout_root_moves differ:\nfresh: %s\nmigrated: %s", freshSQL, got)
 	}
-	if version, err := readUserVersion(migrated.writerDB); err != nil || version != 20 {
+	if version, err := readUserVersion(migrated.writerDB); err != nil || version != currentSchemaVersion {
 		t.Fatalf("migrated user_version = %d, err %v", version, err)
 	}
 	checkout, found, err := migrated.Catalog().GetCheckout(ctx, "checkout-v19")
@@ -91,7 +91,7 @@ func TestSchemaV20CheckoutRootMoveJournalMigrationParityAndDurability(t *testing
 	if _, found, err := completed.Catalog().GetCheckoutRootMove(ctx, "checkout-v19"); err != nil || found {
 		t.Fatalf("completed journal after reopen = found %t, err %v", found, err)
 	}
-	if version, err := readUserVersion(completed.writerDB); err != nil || version != 20 {
+	if version, err := readUserVersion(completed.writerDB); err != nil || version != currentSchemaVersion {
 		t.Fatalf("durable user_version = %d, err %v", version, err)
 	}
 }

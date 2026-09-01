@@ -75,14 +75,32 @@ func seedStackControlPlane(t testing.TB, store *store_sqlite.Store, activeGenera
 // working-tree generation is routed.
 func routeStack(t testing.TB, store *store_sqlite.Store, commit, dirty int64, state store_sqlite.RouteState) {
 	t.Helper()
-	if err := store.Catalog().UpsertCheckoutRoute(context.Background(), store_sqlite.CheckoutRoute{
-		CheckoutID:         testCheckoutID,
-		GraphID:            testGraphID,
-		CommitGenerationID: commit,
-		DirtyGenerationID:  dirty,
-		State:              state,
-	}); err != nil {
-		t.Fatalf("UpsertCheckoutRoute: %v", err)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	route, found, err := catalog.GetCheckoutRoute(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("GetCheckoutRoute: %v", err)
+	}
+	if found {
+		err = catalog.FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
+			CheckoutID:         testCheckoutID,
+			ExpectedRouteEpoch: route.RouteEpoch,
+			GraphID:            testGraphID,
+			CommitGenerationID: commit,
+			DirtyGenerationID:  dirty,
+			State:              state,
+		})
+	} else {
+		err = catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
+			CheckoutID:         testCheckoutID,
+			GraphID:            testGraphID,
+			CommitGenerationID: commit,
+			DirtyGenerationID:  dirty,
+			State:              state,
+		})
+	}
+	if err != nil {
+		t.Fatalf("route stack: %v", err)
 	}
 }
 
@@ -362,6 +380,14 @@ func TestPinCheckoutRouteRejectsASnapshotThatMovedBeforeLease(t *testing.T) {
 		State:              store_sqlite.RouteActive,
 	}); err != nil {
 		t.Fatalf("FlipCheckoutRoute: %v", err)
+	}
+	if _, err := store.Catalog().PruneCheckoutCommitCachePins(ctx,
+		store_sqlite.CheckoutCommitCacheRetention{
+			InactiveCutoff:  time.Now().Add(time.Second).Unix(),
+			MaxGenerations:  32,
+			MaxStorageBytes: 1 << 62,
+		}); err != nil {
+		t.Fatalf("evict old checkout commit cache pin: %v", err)
 	}
 	if err := store.RetirePayloadGeneration(ctx, oldDirty, materializer.Leases.InUse); err != nil {
 		t.Fatalf("retire old dirty generation: %v", err)

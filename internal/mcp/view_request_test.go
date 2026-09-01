@@ -316,7 +316,26 @@ func seedViewCatalog(t testing.TB, store *store_sqlite.Store, graphID, repoRoot,
 
 func routeViewCheckout(t testing.TB, store *store_sqlite.Store, graphID string, commit, dirty int64, state store_sqlite.RouteState) {
 	t.Helper()
-	if err := store.Catalog().UpsertCheckoutRoute(context.Background(), store_sqlite.CheckoutRoute{
+	ctx := context.Background()
+	catalog := store.Catalog()
+	route, ok, err := catalog.GetCheckoutRoute(ctx, viewTestWorktree)
+	if err != nil {
+		t.Fatalf("GetCheckoutRoute: %v", err)
+	}
+	if ok {
+		if err := catalog.FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
+			CheckoutID:         viewTestWorktree,
+			ExpectedRouteEpoch: route.RouteEpoch,
+			GraphID:            graphID,
+			CommitGenerationID: commit,
+			DirtyGenerationID:  dirty,
+			State:              state,
+		}); err != nil {
+			t.Fatalf("FlipCheckoutRoute: %v", err)
+		}
+		return
+	}
+	if err := catalog.UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
 		CheckoutID:         viewTestWorktree,
 		GraphID:            graphID,
 		CommitGenerationID: commit,

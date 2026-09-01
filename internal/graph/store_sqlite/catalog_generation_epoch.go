@@ -132,6 +132,10 @@ func (c *Catalog) CommitCheckoutStack(ctx context.Context, req CommitCheckoutSta
 		if routed != req.RouteExists || (routed && route.RouteEpoch != req.ExpectedRouteEpoch) {
 			return fmt.Errorf("%w: checkout %s route moved", ErrCatalogStaleGuard, req.CheckoutID)
 		}
+		var selectedAt int64
+		if err := tx.QueryRowContext(ctx, `SELECT unixepoch()`).Scan(&selectedAt); err != nil {
+			return err
+		}
 		if routed {
 			result, err := tx.ExecContext(ctx, `
 UPDATE checkout_routes
@@ -150,18 +154,31 @@ UPDATE checkout_routes
 			if changed != 1 {
 				return fmt.Errorf("%w: checkout %s route moved", ErrCatalogStaleGuard, req.CheckoutID)
 			}
-			return nil
-		}
-
-		_, err = tx.ExecContext(ctx, `
+		} else {
+			_, err = tx.ExecContext(ctx, `
 INSERT INTO checkout_routes
   (checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state)
 VALUES (?, ?, ?, ?, 0, ?)`, req.CheckoutID, req.GraphID,
-			req.CommitGenerationID, req.DirtyGenerationID, string(req.State))
-		if isSQLiteUniqueViolation(err) {
-			return fmt.Errorf("%w: checkout %s route appeared", ErrCatalogStaleGuard, req.CheckoutID)
+				req.CommitGenerationID, req.DirtyGenerationID, string(req.State))
+			if isSQLiteUniqueViolation(err) {
+				return fmt.Errorf("%w: checkout %s route appeared", ErrCatalogStaleGuard, req.CheckoutID)
+			}
+			if err != nil {
+				return err
+			}
 		}
-		return err
+		if routed && route.GraphID != req.GraphID {
+			if err := deleteCheckoutCommitCachePinsForCheckoutTx(ctx, tx, req.CheckoutID); err != nil {
+				return err
+			}
+		} else if routed {
+			if err := upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.GraphID,
+				route.CommitGenerationID, selectedAt); err != nil {
+				return err
+			}
+		}
+		return upsertCheckoutCommitCachePinTx(ctx, tx, req.CheckoutID, req.GraphID,
+			req.CommitGenerationID, selectedAt)
 	})
 }
 

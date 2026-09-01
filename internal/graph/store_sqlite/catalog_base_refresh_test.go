@@ -299,9 +299,18 @@ func TestBeginDedicatedBaseRefreshFencesCapturedOldBaseRoutePublication(t *testi
 
 func TestBeginDedicatedBaseRefreshFencesAlreadyPendingCheckoutRoute(t *testing.T) {
 	f := newDedicatedBaseRefreshFixture(t)
-	pending := f.depOld
-	pending.State = RoutePending
-	mustRefreshWrite(t, "seed pending dependent route", f.catalog.UpsertCheckoutRoute(f.ctx, pending))
+	mustRefreshWrite(t, "seed pending dependent route", f.catalog.FlipCheckoutRoute(
+		f.ctx, FlipCheckoutRouteRequest{
+			CheckoutID: f.depOld.CheckoutID, GraphID: f.depOld.GraphID,
+			CommitGenerationID: f.depOld.CommitGenerationID,
+			DirtyGenerationID:  f.depOld.DirtyGenerationID,
+			ExpectedRouteEpoch: f.depOld.RouteEpoch, State: RoutePending,
+		},
+	))
+	pending, found, err := f.catalog.GetCheckoutRoute(f.ctx, f.depOld.CheckoutID)
+	if err != nil || !found {
+		t.Fatalf("read seeded pending route: found=%v err=%v", found, err)
+	}
 
 	if err := f.catalog.BeginDedicatedBaseRefresh(f.ctx, f.graphID, f.oldBase); err != nil {
 		t.Fatalf("begin refresh: %v", err)
