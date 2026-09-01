@@ -227,7 +227,10 @@ func runReposExplainView(cmd *cobra.Command, args []string) error {
 // newer daemon adds is ignored rather than failing the verb.
 
 type familiesPayload struct {
-	Families []familyPayload `json:"families"`
+	Families              []familyPayload `json:"families"`
+	TruncatedByBudget     bool            `json:"_truncated_by_budget"`
+	MaxReturnedFamilies   int             `json:"_max_returned_families"`
+	OriginalCountFamilies int             `json:"_original_count_families"`
 }
 
 type familyPayload struct {
@@ -240,6 +243,14 @@ type familyPayload struct {
 	Graphs            []graphPayload    `json:"graphs"`
 	Checkouts         []checkoutPayload `json:"checkouts"`
 	RefViews          []refViewPayload  `json:"ref_views"`
+
+	TruncatedByBudget      bool `json:"_truncated_by_budget"`
+	MaxReturnedGraphs      int  `json:"_max_returned_graphs"`
+	OriginalCountGraphs    int  `json:"_original_count_graphs"`
+	MaxReturnedCheckouts   int  `json:"_max_returned_checkouts"`
+	OriginalCountCheckouts int  `json:"_original_count_checkouts"`
+	MaxReturnedRefViews    int  `json:"_max_returned_ref_views"`
+	OriginalCountRefViews  int  `json:"_original_count_ref_views"`
 }
 
 type graphPayload struct {
@@ -394,6 +405,15 @@ type viewBindingPayload struct {
 
 func renderFamilies(w io.Writer, payload familiesPayload) {
 	if len(payload.Families) == 0 {
+		if payload.TruncatedByBudget {
+			if payload.OriginalCountFamilies > 0 {
+				fmt.Fprintf(w, "(checkout family listing truncated by response budget: showing %d of %d checkout families)\n",
+					payload.MaxReturnedFamilies, payload.OriginalCountFamilies)
+			} else {
+				fmt.Fprintln(w, "(checkout family listing truncated by response budget; no family row fit)")
+			}
+			return
+		}
 		fmt.Fprintln(w, "(no checkout families)")
 		return
 	}
@@ -421,7 +441,28 @@ func renderFamilies(w io.Writer, payload familiesPayload) {
 				view.SelectorKind, view.SelectorValue, view.State,
 				orNone(view.ActiveTree), orNone(view.DesiredTree), unixCell(view.LastSelected))
 		}
+		renderFamilyBudgetNotices(w, family)
 	}
+	if payload.TruncatedByBudget && payload.OriginalCountFamilies > payload.MaxReturnedFamilies {
+		fmt.Fprintf(w, "\nresponse budget: showing %d of %d checkout families\n",
+			payload.MaxReturnedFamilies, payload.OriginalCountFamilies)
+	}
+}
+
+func renderFamilyBudgetNotices(w io.Writer, family familyPayload) {
+	if !family.TruncatedByBudget {
+		return
+	}
+	renderFamilyBudgetNotice(w, "graphs", family.MaxReturnedGraphs, family.OriginalCountGraphs)
+	renderFamilyBudgetNotice(w, "checkouts", family.MaxReturnedCheckouts, family.OriginalCountCheckouts)
+	renderFamilyBudgetNotice(w, "ref views", family.MaxReturnedRefViews, family.OriginalCountRefViews)
+}
+
+func renderFamilyBudgetNotice(w io.Writer, label string, returned, original int) {
+	if original <= returned {
+		return
+	}
+	fmt.Fprintf(w, "  response budget: showing %d of %d %s\n", returned, original, label)
 }
 
 func renderCheckoutRow(w io.Writer, checkout checkoutPayload) {

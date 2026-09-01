@@ -3,13 +3,16 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	toon "github.com/toon-format/toon-go"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -107,6 +110,464 @@ func checkoutNamed(t *testing.T, family indexer.FamilyOverview, adminName string
 	}
 	t.Fatalf("family %s holds no checkout administered as %q", family.FamilyID, adminName)
 	return indexer.CheckoutOverview{}
+}
+
+func checkoutBudgetOverview(checkoutCount int) indexer.FamiliesOverview {
+	checkouts := make([]indexer.CheckoutOverview, 0, checkoutCount)
+	for i := 0; i < checkoutCount; i++ {
+		adminName := fmt.Sprintf("wt-%03d", i)
+		effectiveMode := string(store_sqlite.CheckoutModeAutomatic)
+		graphID := ""
+		if i == 0 {
+			adminName = gitstate.MainAdminName
+			effectiveMode = string(store_sqlite.CheckoutModeDedicated)
+			graphID = "graph-primary"
+		}
+		root := fmt.Sprintf("/tmp/high-cardinality-checkout-family/worktrees/%s/%s",
+			adminName, strings.Repeat("representative-path-segment/", 3))
+		checkouts = append(checkouts, indexer.CheckoutOverview{
+			CheckoutID:      fmt.Sprintf("checkout-%03d", i),
+			Incarnation:     fmt.Sprintf("incarnation-%03d", i),
+			AdminName:       adminName,
+			RootPath:        root,
+			GitDir:          root + "/.git",
+			State:           string(store_sqlite.CheckoutStateReady),
+			DesiredMode:     effectiveMode,
+			EffectiveMode:   effectiveMode,
+			HeadRef:         fmt.Sprintf("refs/heads/feature-%03d", i),
+			HeadCommit:      strings.Repeat("a", 40),
+			HeadTree:        strings.Repeat("b", 40),
+			LastAccessible:  1_788_000_000 + int64(i),
+			LastSeen:        1_788_000_100 + int64(i),
+			GraphID:         graphID,
+			CoordinatorLive: i == 0,
+			Evidence: indexer.EvidenceOverview{
+				Present:                     true,
+				RootPathIdentity:            root,
+				RootVolumeKind:              "local",
+				NearestExistingAncestorPath: filepath.Dir(root),
+				SampledAt:                   1_788_000_000 + int64(i),
+				SampleGeneration:            int64(i + 1),
+			},
+		})
+	}
+	return indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+		FamilyID:          "family-high-cardinality",
+		CommonDir:         "/tmp/high-cardinality-checkout-family/main/.git",
+		State:             "family_ready",
+		PrimaryEpoch:      7,
+		PrimaryGraphID:    "graph-primary",
+		PrimaryRepoPrefix: "repo-high-cardinality",
+		Graphs: []indexer.GraphOverview{{
+			GraphID: "graph-primary", RepoPrefix: "repo-high-cardinality",
+			IsPrimary: true, State: store_sqlite.DedicatedGraphStateReady, Served: true,
+		}},
+		Checkouts: checkouts,
+	}}}
+}
+
+func TestCheckoutOverviewPayloadPreservesFamilyEnvelopeUnderDefaultBudget(t *testing.T) {
+	overview := checkoutBudgetOverview(257)
+	unbudgeted, err := json.Marshal(overview)
+	require.NoError(t, err)
+	require.Greater(t, len(unbudgeted), defaultMaxBytes, "fixture must cross the default response budget")
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{}
+	renderReq, payload := prepareCheckoutOverviewResponse(req, overview)
+	require.Zero(t, effectiveBudget(renderReq), "the common formatter must not apply a second budget")
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(encoded), defaultMaxBytes)
+
+	root, ok := payload.(map[string]any)
+	require.True(t, ok, "an oversized typed overview must become a detached budgeted map")
+	require.Equal(t, true, root[budgetTruncatedKey])
+	families, ok := root["families"].([]any)
+	require.True(t, ok)
+	require.Len(t, families, 1, "the family envelope must survive nested checkout trimming")
+	family, ok := families[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "family-high-cardinality", family["family_id"])
+	require.Equal(t, true, family[budgetTruncatedKey])
+	require.Equal(t, 257, family["_original_count_checkouts"])
+
+	checkouts, ok := family["checkouts"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, checkouts, "the cap has room for a useful stable prefix")
+	require.Less(t, len(checkouts), 257)
+	require.Equal(t, len(checkouts), family["_max_returned_checkouts"])
+	first, ok := checkouts[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, gitstate.MainAdminName, first["admin_name"], "the catalog's stable @main-first order must survive")
+	require.Len(t, overview.Families[0].Checkouts, 257, "budgeting must not mutate the lifecycle read model")
+
+	again, againTrimmed := applyCheckoutOverviewBudget(overview, defaultMaxBytes)
+	require.True(t, againTrimmed)
+	againEncoded, err := json.Marshal(again)
+	require.NoError(t, err)
+	require.Equal(t, encoded, againEncoded, "unchanged input must produce a byte-stable prefix and metadata")
+
+	// Ride the shared formatter/budget path too: the pre-budgeted nested
+	// answer must not be reinterpreted as one oversized top-level family and
+	// erased on the second guard.
+	srv, _ := setupTestServer(t)
+	renderReq.Params.Name = "list_checkouts"
+	renderArgs := renderReq.GetArguments()
+	renderArgs["format"] = "json"
+	renderReq.Params.Arguments = renderArgs
+	res, err := srv.respondJSONOrTOON(context.Background(), renderReq, payload)
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	wire := []byte(extractTextFromContent(t, res.Content))
+	require.LessOrEqual(t, len(wire), defaultMaxBytes)
+	var formatted map[string]any
+	require.NoError(t, json.Unmarshal(wire, &formatted))
+	require.Len(t, formatted["families"], 1)
+}
+
+func TestCheckoutOverviewPayloadMaxBytesZeroIsExhaustive(t *testing.T) {
+	overview := checkoutBudgetOverview(257)
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "list_checkouts"
+	req.Params.Arguments = map[string]any{"format": "json", "max_bytes": float64(0)}
+
+	renderReq, payload := prepareCheckoutOverviewResponse(req, overview)
+	full, ok := payload.(indexer.FamiliesOverview)
+	require.True(t, ok, "the opt-out must preserve the typed exhaustive answer")
+	require.Len(t, full.Families, 1)
+	require.Len(t, full.Families[0].Checkouts, 257)
+
+	srv, _ := setupTestServer(t)
+	res, err := srv.respondJSONOrTOON(context.Background(), renderReq, payload)
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	var wire indexer.FamiliesOverview
+	require.NoError(t, json.Unmarshal([]byte(extractTextFromContent(t, res.Content)), &wire))
+	require.Len(t, wire.Families, 1)
+	require.Len(t, wire.Families[0].Checkouts, 257,
+		"the shared formatter must honor the exhaustive opt-out too")
+}
+
+func TestCheckoutOverviewMaxTokensPreservesFamilyAndDecoration(t *testing.T) {
+	const maxTokens = 6_000
+	overview := checkoutBudgetOverview(257)
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "list_checkouts"
+	req.Params.Arguments = map[string]any{
+		"format":     "json",
+		"max_tokens": float64(maxTokens),
+	}
+
+	renderReq, payload := prepareCheckoutOverviewResponse(req, overview)
+	require.Zero(t, effectiveBudget(renderReq))
+	require.NotContains(t, renderReq.GetArguments(), "max_tokens",
+		"the common formatter must not reserve or decorate a second time")
+
+	srv, _ := setupTestServer(t)
+	res, err := srv.respondJSONOrTOON(context.Background(), renderReq, payload)
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	wire := []byte(extractTextFromContent(t, res.Content))
+	require.LessOrEqual(t, len(wire), tokensToBytes(maxTokens))
+
+	var root map[string]any
+	require.NoError(t, json.Unmarshal(wire, &root))
+	require.Equal(t, true, root[budgetTruncatedKey])
+	require.Equal(t, true, root["_truncated_by_tokens"])
+	require.Equal(t, float64(maxTokens), root["_max_tokens"])
+	families := root["families"].([]any)
+	require.Len(t, families, 1, "token budgeting must trim nested rows, not the family envelope")
+	family := families[0].(map[string]any)
+	checkouts := family["checkouts"].([]any)
+	require.NotEmpty(t, checkouts)
+	require.Less(t, len(checkouts), 257)
+	require.Equal(t, float64(257), family["_original_count_checkouts"])
+	require.Equal(t, float64(len(checkouts)), family["_max_returned_checkouts"])
+}
+
+func TestCheckoutOverviewFieldsProjectBeforeBudget(t *testing.T) {
+	overview := checkoutBudgetOverview(257)
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "list_checkouts"
+	req.Params.Arguments = map[string]any{
+		"fields": "family_id",
+		"format": "json",
+	}
+
+	renderReq, payload := prepareCheckoutOverviewResponse(req, overview)
+	require.NotContains(t, renderReq.GetArguments(), "fields",
+		"the common formatter must not project an already-projected payload")
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.Less(t, len(encoded), defaultMaxBytes)
+	require.NotContains(t, string(encoded), budgetTruncatedKey,
+		"a sparse fieldset that already fits must not be unnecessarily pre-trimmed")
+
+	srv, _ := setupTestServer(t)
+	res, err := srv.respondJSONOrTOON(context.Background(), renderReq, payload)
+	require.NoError(t, err)
+	var root map[string]any
+	require.NoError(t, json.Unmarshal([]byte(extractTextFromContent(t, res.Content)), &root))
+	families := root["families"].([]any)
+	require.Len(t, families, 1)
+	require.Equal(t, map[string]any{"family_id": "family-high-cardinality"}, families[0])
+}
+
+func TestApplyCheckoutOverviewBudgetTrimsGraphsAndRefViewsInsideFamily(t *testing.T) {
+	const rows = 96
+	cases := []struct {
+		name  string
+		key   string
+		build func() indexer.FamiliesOverview
+	}{
+		{
+			name: "graphs",
+			key:  "graphs",
+			build: func() indexer.FamiliesOverview {
+				graphs := make([]indexer.GraphOverview, 0, rows)
+				for i := 0; i < rows; i++ {
+					graphs = append(graphs, indexer.GraphOverview{
+						GraphID: fmt.Sprintf("graph-%03d-%s", i, strings.Repeat("g", 80)),
+						RepoPrefix: fmt.Sprintf("repo-%03d/%s", i,
+							strings.Repeat("representative-prefix/", 6)),
+						State: store_sqlite.DedicatedGraphStateReady, Served: true,
+					})
+				}
+				return indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+					FamilyID: "family-graphs", CommonDir: "/tmp/graphs/.git", Graphs: graphs,
+				}}}
+			},
+		},
+		{
+			name: "ref_views",
+			key:  "ref_views",
+			build: func() indexer.FamiliesOverview {
+				views := make([]indexer.RefViewOverview, 0, rows)
+				for i := 0; i < rows; i++ {
+					views = append(views, indexer.RefViewOverview{
+						RefViewID: fmt.Sprintf("view-%03d-%s", i, strings.Repeat("v", 80)),
+						GraphID:   "graph-primary", SelectorKind: "git_ref",
+						SelectorValue: fmt.Sprintf("refs/heads/feature-%03d/%s", i,
+							strings.Repeat("representative-branch/", 6)),
+						State: "ready", ActiveTree: strings.Repeat("c", 40),
+					})
+				}
+				return indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+					FamilyID: "family-ref-views", CommonDir: "/tmp/ref-views/.git", RefViews: views,
+				}}}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			overview := tc.build()
+			payload, trimmed := applyCheckoutOverviewBudget(overview, 8_000)
+			require.True(t, trimmed)
+			encoded, err := json.Marshal(payload)
+			require.NoError(t, err)
+			require.LessOrEqual(t, len(encoded), 8_000)
+
+			root := payload.(map[string]any)
+			families := root["families"].([]any)
+			require.Len(t, families, 1)
+			family := families[0].(map[string]any)
+			nested := family[tc.key].([]any)
+			require.NotEmpty(t, nested)
+			require.Less(t, len(nested), rows)
+			require.Equal(t, rows, family["_original_count_"+tc.key])
+			require.Equal(t, len(nested), family["_max_returned_"+tc.key])
+		})
+	}
+}
+
+func TestApplyCheckoutOverviewBudgetPreservesCheckoutAndGraphHeads(t *testing.T) {
+	const budget = 8_000
+	const rows = 24
+	overview := checkoutBudgetOverview(rows)
+	graphs := make([]indexer.GraphOverview, 0, rows)
+	for i := 0; i < rows; i++ {
+		graphs = append(graphs, indexer.GraphOverview{
+			GraphID: fmt.Sprintf("graph-%03d-%s", i, strings.Repeat("g", 80)),
+			RepoPrefix: fmt.Sprintf("repo-%03d/%s", i,
+				strings.Repeat("representative-prefix/", 5)),
+			IsPrimary: i == 0,
+			State:     store_sqlite.DedicatedGraphStateReady,
+			Served:    true,
+		})
+	}
+	overview.Families[0].Graphs = graphs
+
+	payload, trimmed := applyCheckoutOverviewBudget(overview, budget)
+	require.True(t, trimmed)
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(encoded), budget)
+
+	root := payload.(map[string]any)
+	family := root["families"].([]any)[0].(map[string]any)
+	checkouts := family["checkouts"].([]any)
+	budgetedGraphs := family["graphs"].([]any)
+	require.NotEmpty(t, checkouts, "the primary checkout census must keep its identifying head")
+	require.NotEmpty(t, budgetedGraphs, "a second nested collection must keep its identifying head too")
+	require.Equal(t, gitstate.MainAdminName, checkouts[0].(map[string]any)["admin_name"])
+	require.Equal(t, graphs[0].GraphID, budgetedGraphs[0].(map[string]any)["graph_id"])
+	require.Less(t, len(checkouts), rows)
+	require.Less(t, len(budgetedGraphs), rows)
+	require.Equal(t, rows, family["_original_count_checkouts"])
+	require.Equal(t, rows, family["_original_count_graphs"])
+
+	// Metadata for a collection that became complete is removed while fitting.
+	// The freed bytes must be offered back to the earlier, higher-priority
+	// checkout prefix. Pin the fixed point: its very next stable row cannot fit
+	// in the final representation, even after all metadata cleanup has settled.
+	nextCheckoutJSON, err := json.Marshal(overview.Families[0].Checkouts[len(checkouts)])
+	require.NoError(t, err)
+	var nextCheckout map[string]any
+	require.NoError(t, json.Unmarshal(nextCheckoutJSON, &nextCheckout))
+	family["checkouts"] = append(checkouts, nextCheckout)
+	family["_max_returned_checkouts"] = len(checkouts) + 1
+	withNextCheckout, err := json.Marshal(root)
+	require.NoError(t, err)
+	require.Greater(t, len(withNextCheckout), budget,
+		"budgeting left enough cleaned-up headroom for the next higher-priority checkout")
+}
+
+func TestApplyCheckoutOverviewBudgetPreservesEachFamilyCheckoutHead(t *testing.T) {
+	const familyCount = 3
+	var overview indexer.FamiliesOverview
+	for familyIndex := 0; familyIndex < familyCount; familyIndex++ {
+		family := checkoutBudgetOverview(12).Families[0]
+		family.FamilyID = fmt.Sprintf("family-%d", familyIndex)
+		family.CommonDir = fmt.Sprintf("/tmp/family-%d/.git", familyIndex)
+		overview.Families = append(overview.Families, family)
+	}
+
+	payload, trimmed := applyCheckoutOverviewBudget(overview, 12_000)
+	require.True(t, trimmed)
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(encoded), 12_000)
+
+	root := payload.(map[string]any)
+	families := root["families"].([]any)
+	require.Len(t, families, familyCount, "family shells fit and must not be traded for another family's tail")
+	for familyIndex, rawFamily := range families {
+		family := rawFamily.(map[string]any)
+		require.Equal(t, fmt.Sprintf("family-%d", familyIndex), family["family_id"])
+		checkouts := family["checkouts"].([]any)
+		require.NotEmpty(t, checkouts, "family %d lost its identifying checkout", familyIndex)
+		require.Equal(t, gitstate.MainAdminName, checkouts[0].(map[string]any)["admin_name"])
+	}
+}
+
+func TestCheckoutOverviewTOONHonorsNormalAndTinyBudgets(t *testing.T) {
+	overview := checkoutBudgetOverview(257)
+
+	t.Run("normal keeps family", func(t *testing.T) {
+		const budget = 8_000
+		req := mcplib.CallToolRequest{}
+		req.Params.Name = "list_checkouts"
+		req.Params.Arguments = map[string]any{"format": "toon", "max_bytes": float64(budget)}
+		_, payload := prepareCheckoutOverviewResponseWithSizer(req, overview, checkoutOverviewTOONSize)
+		res, err := returnTOON(payload)
+		require.NoError(t, err)
+		text := extractTextFromContent(t, res.Content)
+		require.LessOrEqual(t, len(text), budget)
+		require.Contains(t, text, "family-high-cardinality")
+		require.Contains(t, text, budgetTruncatedKey)
+		require.Contains(t, text, "_original_count_checkouts: 257")
+		require.Contains(t, text, "_max_returned_checkouts:")
+		require.Contains(t, text, "admin_name: @main")
+	})
+
+	for _, budget := range []int{1, 16, 64} {
+		t.Run(fmt.Sprintf("tiny-%d", budget), func(t *testing.T) {
+			req := mcplib.CallToolRequest{}
+			req.Params.Name = "list_checkouts"
+			req.Params.Arguments = map[string]any{"format": "toon", "max_bytes": float64(budget)}
+			renderReq, payload := prepareCheckoutOverviewResponseWithSizer(req, overview, checkoutOverviewTOONSize)
+			// The shared renderer is deliberately budget-disabled afterward;
+			// this format-aware preparation already chose the structural floor.
+			require.Zero(t, effectiveBudget(renderReq))
+			res, err := returnTOON(payload)
+			require.NoError(t, err)
+			text := extractTextFromContent(t, res.Content)
+			require.NotEmpty(t, text)
+			_, err = toon.Decode([]byte(text))
+			require.NoError(t, err, "the scalar floor must remain a valid TOON document")
+			// Like JSON, TOON preserves its shortest valid structured response
+			// when the caller's cap is smaller than that document. At realistic
+			// caps the exact encoded-size fitter is a hard ceiling.
+			if len(text) > budget {
+				decoded, decodeErr := toon.Decode([]byte(text))
+				require.NoError(t, decodeErr)
+				root := decoded.(map[string]any)
+				require.Equal(t, true, root[budgetTruncatedKey])
+				require.Empty(t, root["families"])
+			}
+		})
+	}
+}
+
+func TestCheckoutOverviewTOONMaxTokensPreservesFamilyAndDecoration(t *testing.T) {
+	const maxTokens = 2_000
+	overview := checkoutBudgetOverview(257)
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "list_checkouts"
+	req.Params.Arguments = map[string]any{
+		"format":     "toon",
+		"max_tokens": float64(maxTokens),
+	}
+
+	_, payload := prepareCheckoutOverviewResponseWithSizer(req, overview, checkoutOverviewTOONSize)
+	res, err := returnTOON(payload)
+	require.NoError(t, err)
+	text := extractTextFromContent(t, res.Content)
+	require.LessOrEqual(t, len(text), tokensToBytes(maxTokens))
+
+	require.Contains(t, text, budgetTruncatedKey+": true")
+	require.Contains(t, text, "_truncated_by_tokens: true")
+	require.Contains(t, text, fmt.Sprintf("_max_tokens: %d", maxTokens))
+	require.Contains(t, text, "family-high-cardinality")
+	require.Contains(t, text, "_original_count_checkouts: 257")
+	require.Contains(t, text, "admin_name: @main")
+}
+
+func TestCheckoutOverviewJSONKeepsDocumentedScalarFloor(t *testing.T) {
+	overview := checkoutBudgetOverview(257)
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "list_checkouts"
+	req.Params.Arguments = map[string]any{"format": "json", "max_bytes": float64(1)}
+	renderReq, payload := prepareCheckoutOverviewResponse(req, overview)
+
+	srv, _ := setupTestServer(t)
+	res, err := srv.respondJSONOrTOON(context.Background(), renderReq, payload)
+	require.NoError(t, err)
+	wire := []byte(extractTextFromContent(t, res.Content))
+	require.Greater(t, len(wire), 1, "JSON keeps its documented valid scalar-skeleton floor")
+	var root map[string]any
+	require.NoError(t, json.Unmarshal(wire, &root), "the floor must remain valid JSON")
+	require.Equal(t, true, root[budgetTruncatedKey])
+	require.Equal(t, float64(0), root["_max_returned_families"])
+	require.Equal(t, float64(1), root["_original_count_families"])
+	require.Empty(t, root["families"])
+}
+
+var checkoutOverviewBudgetBenchmarkSink any
+
+func BenchmarkCheckoutOverviewBudget257(b *testing.B) {
+	overview := checkoutBudgetOverview(257)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		payload, trimmed := applyCheckoutOverviewBudget(overview, defaultMaxBytes)
+		if !trimmed {
+			b.Fatal("representative overview unexpectedly fit without trimming")
+		}
+		checkoutOverviewBudgetBenchmarkSink = payload
+	}
 }
 
 // TestListCheckoutsReportsTheFamilyItsGraphsAndItsCheckouts is the read model

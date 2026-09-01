@@ -126,6 +126,50 @@ func TestReposFamiliesForwardsTheFilterAndJSON(t *testing.T) {
 	require.Contains(t, buf.String(), `"families": []`)
 }
 
+func TestReposFamiliesRendersNestedBudgetTruncationTruthfully(t *testing.T) {
+	stubCheckoutsTool(t, func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+		return json.RawMessage(`{
+			"_truncated_by_budget":true,
+			"families":[{
+				"family_id":"family-1","common_dir":"/repo/.git","state":"family_ready",
+				"primary_epoch":2,"primary_graph_id":"graph-1","primary_repo_prefix":"repo",
+				"_truncated_by_budget":true,
+				"_max_returned_checkouts":1,"_original_count_checkouts":257,
+				"graphs":[{"graph_id":"graph-1","repo_prefix":"repo","is_primary":true,
+					"state":"graph_ready","served":true}],
+				"checkouts":[{"checkout_id":"c-main","admin_name":"@main","root_path":"/repo",
+					"state":"checkout_ready","desired_mode":"dedicated","effective_mode":"dedicated"}]
+			}]
+		}`), nil
+	})
+
+	cmd, buf := newCheckoutsTestCmd(t)
+	require.NoError(t, runReposFamilies(cmd, nil))
+	out := buf.String()
+	require.Contains(t, out, "family family-1")
+	require.Contains(t, out, "checkout @main")
+	require.Contains(t, out, "response budget: showing 1 of 257 checkouts")
+	require.NotContains(t, out, "(no checkout families)")
+}
+
+func TestReposFamiliesNeverCallsABudgetedOuterEmptyCatalogEmpty(t *testing.T) {
+	stubCheckoutsTool(t, func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+		return json.RawMessage(`{
+			"_truncated_by_budget":true,
+			"_max_returned_families":0,
+			"_original_count_families":1,
+			"families":[]
+		}`), nil
+	})
+
+	cmd, buf := newCheckoutsTestCmd(t)
+	require.NoError(t, runReposFamilies(cmd, nil))
+	out := buf.String()
+	require.Contains(t, out, "listing truncated by response budget")
+	require.Contains(t, out, "showing 0 of 1 checkout families")
+	require.NotContains(t, out, "(no checkout families)")
+}
+
 func TestReposSetPrimaryPreviewsUntilConfirmed(t *testing.T) {
 	var gotArgs map[string]any
 	stubCheckoutsTool(t, func(_ string, tool string, args map[string]any) (json.RawMessage, error) {
