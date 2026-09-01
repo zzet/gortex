@@ -350,6 +350,52 @@ func TestStartupViewReadinessWaitTerminalReturnsDurableFailure(t *testing.T) {
 	require.False(t, terminal.complete())
 }
 
+func TestStartupRequiredFailureFailsOpenNormalBuildAdmission(t *testing.T) {
+	gate := indexer.NewViewBuildGate()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type acquireResult struct {
+		release func()
+		err     error
+	}
+	interactive := make(chan acquireResult, 1)
+	go func() {
+		release, err := gate.Acquire(ctx, indexer.ViewBuildInteractive)
+		interactive <- acquireResult{release: release, err: err}
+	}()
+	require.Eventually(t, func() bool {
+		return gate.Stats().InteractiveQueued == 1
+	}, time.Second, time.Millisecond)
+
+	gate.OpenRequired()
+	select {
+	case admitted := <-interactive:
+		if admitted.release != nil {
+			admitted.release()
+		}
+		t.Fatalf("interactive work crossed the required-only startup phase: %v", admitted.err)
+	default:
+	}
+
+	monitor := newStartupViewReadinessMonitor([]string{"/failed"})
+	failed := monitor.snapshot(ctx, func(context.Context, string) (daemon.TrackReadiness, error) {
+		return daemon.TrackReadiness{State: daemon.TrackReadinessFailed}, nil
+	})
+	terminal, err := monitor.waitTerminal(ctx)
+	require.NoError(t, err)
+	require.Equal(t, failed, terminal)
+	require.False(t, terminal.complete())
+
+	// This is the daemon startup branch: terminal degradation must release
+	// unrelated work even though readiness remains failed/labeled.
+	gate.Open()
+	admitted := <-interactive
+	require.NoError(t, admitted.err)
+	require.NotNil(t, admitted.release)
+	admitted.release()
+	require.True(t, gate.Stats().Open)
+}
+
 func TestStartupViewReadinessWaitTerminalRunsFinalizerFirst(t *testing.T) {
 	monitor := newStartupViewReadinessMonitor(nil)
 	ready := monitor.snapshot(context.Background(), func(context.Context, string) (daemon.TrackReadiness, error) {

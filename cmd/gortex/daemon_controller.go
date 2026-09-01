@@ -86,6 +86,11 @@ type realController struct {
 	// copy has no composed view. nil routes to the lifecycle's own per-family
 	// path; tests substitute it to observe the debounce.
 	probeReconcile func(familyID string)
+	// checkoutStartupBuildStatus is the required-publication status lookup used
+	// by TrackReadiness. Production leaves it nil and reads the lifecycle;
+	// focused tests substitute it to pin pre-generation pending/failure states
+	// without constructing a physical generation worker.
+	checkoutStartupBuildStatus func(checkoutID string) (pending bool, failure string)
 	// probeViewRevalidateBarrier is a deterministic test seam between leasing
 	// a generation-backed view and re-reading its catalog binding. Production
 	// leaves it nil. Keeping the seam here lets race regressions move a graph
@@ -1702,11 +1707,16 @@ func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsSt
 		Checkouts:    health.Checkouts,
 		Coordinators: health.Coordinators,
 		BuildQueue: &daemon.ViewBuildQueueStatus{
-			Open: health.BuildQueue.Open, Active: health.BuildQueue.Active,
+			Open:              health.BuildQueue.Open,
+			RequiredOpen:      health.BuildQueue.RequiredOpen,
+			Active:            health.BuildQueue.Active,
+			RequiredQueued:    health.BuildQueue.RequiredQueued,
 			InteractiveQueued: health.BuildQueue.InteractiveQueued,
 			BackgroundQueued:  health.BuildQueue.BackgroundQueued,
+			RequiredLimit:     health.BuildQueue.RequiredLimit,
 			InteractiveLimit:  health.BuildQueue.InteractiveLimit,
 			BackgroundLimit:   health.BuildQueue.BackgroundLimit,
+			RequiredHigh:      health.BuildQueue.RequiredHighWater,
 			InteractiveHigh:   health.BuildQueue.InteractiveHighWater,
 			BackgroundHigh:    health.BuildQueue.BackgroundHighWater,
 			MaxWaitMillis:     health.BuildQueue.MaxWait.Milliseconds(),

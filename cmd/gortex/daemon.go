@@ -1238,6 +1238,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 			if warmupCtx.Err() != nil {
 				return
 			}
+			// Required lifecycle publication has reached the exact startup
+			// cohort. Release ref and background work only after finalizers have
+			// observed that settled graph. The defer keeps the lane live even if a
+			// future non-fatal finalizer returns early.
+			defer viewBuilds.Open()
 			runtimeactivity.Begin("startup_finalize")
 			defer func() {
 				runtimeactivity.End("startup_finalize")
@@ -1272,16 +1277,20 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 		}
 		startupReadiness.onConfirmedComplete(finalizeEnrichment)
 
-		// The reference tail is done, so the exact view builds that were
-		// competing with it are admitted. The level-triggered waiter below was
-		// armed above; opening the gate before waiting is the progress edge.
-		viewBuilds.Open()
+		// The reference tail is done, so admit only the lifecycle publication
+		// required by the frozen startup cohort. Client-requested ref builds and
+		// automatic reconciliation remain queued until the cohort is terminal.
+		viewBuilds.OpenRequired()
 		terminal, waitErr := startupReadiness.waitTerminal(startupReadinessCtx)
 		if waitErr != nil {
 			logger.Info("daemon: exact startup-view wait cancelled", zap.Error(waitErr))
 			return
 		}
 		if !terminal.complete() {
+			// A terminal publication failure must not freeze unrelated runtime
+			// work forever. Status stays degraded, while the full lane reopens for
+			// recovery and labeled fallback service.
+			viewBuilds.Open()
 			logger.Error("daemon: exact startup-view publication failed",
 				zap.Int("expected", terminal.Expected),
 				zap.Int("ready", terminal.Ready),
@@ -2169,7 +2178,10 @@ func formatDaemonWarmupState(st daemon.StatusResponse) string {
 		}
 		if st.Views != nil && st.Views.BuildQueue != nil {
 			queue := st.Views.BuildQueue
-			parts := make([]string, 0, 2)
+			parts := make([]string, 0, 3)
+			if queue.RequiredQueued > 0 {
+				parts = append(parts, fmt.Sprintf("%d required queued", queue.RequiredQueued))
+			}
 			if queue.InteractiveQueued > 0 {
 				parts = append(parts, fmt.Sprintf("%d interactive queued", queue.InteractiveQueued))
 			}

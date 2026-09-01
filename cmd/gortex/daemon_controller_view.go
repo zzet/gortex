@@ -517,6 +517,40 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 	} else if moving {
 		return building("checkout root move recovery is pending"), nil
 	}
+	var (
+		graphRow   store_sqlite.DedicatedGraph
+		graphFound bool
+	)
+	if binding.GraphID != "" {
+		graphRow, graphFound, err = catalog.GetDedicatedGraph(ctx, binding.GraphID)
+		if err != nil {
+			return daemon.TrackReadiness{}, fmt.Errorf("read dedicated graph %q: %w", binding.GraphID, err)
+		}
+		if graphFound && graphRow.GraphID == binding.GraphID &&
+			graphRow.RepoPrefix == binding.RepoPrefix &&
+			graphRow.ActiveGenerationID == binding.ActiveGenerationID &&
+			graphRow.State == store_sqlite.DedicatedGraphStateRefreshing {
+			if refreshFailure, failedInProcess := c.lifecycle.DedicatedBaseRefreshFailure(
+				graphRow.GraphID, graphRow.ActiveGenerationID,
+			); failedInProcess {
+				return failed(refreshFailure), nil
+			}
+		}
+	}
+	// A base refresh failure is checked first because it owns every dependent
+	// route in the graph. A still-pending automatic coordinator must not mask
+	// the owner's terminal required-publication verdict.
+	startupStatus := c.lifecycle.CheckoutStartupBuildStatus
+	if c.checkoutStartupBuildStatus != nil {
+		startupStatus = c.checkoutStartupBuildStatus
+	}
+	startupPending, startupFailure := startupStatus(binding.CheckoutID)
+	if startupFailure != "" {
+		return failed(startupFailure), nil
+	}
+	if startupPending {
+		return building("startup checkout reconciliation is pending"), nil
+	}
 
 	route, routed, err := catalog.GetCheckoutRoute(ctx, binding.CheckoutID)
 	if err != nil {
@@ -541,11 +575,7 @@ func (c *realController) TrackReadiness(ctx context.Context, path string) (daemo
 		return building("checkout has no selected dedicated graph"), nil
 	}
 
-	graphRow, found, err := catalog.GetDedicatedGraph(ctx, binding.GraphID)
-	if err != nil {
-		return daemon.TrackReadiness{}, fmt.Errorf("read dedicated graph %q: %w", binding.GraphID, err)
-	}
-	if !found || graphRow.State != store_sqlite.DedicatedGraphStateReady {
+	if !graphFound || graphRow.State != store_sqlite.DedicatedGraphStateReady {
 		return building("dedicated graph has no active ready generation"), nil
 	}
 	if graphRow.GraphID != binding.GraphID || graphRow.RepoPrefix != binding.RepoPrefix ||

@@ -203,7 +203,7 @@ func (l *CheckoutLifecycle) executeModeTransition(
 	ctx context.Context, transition store_sqlite.IntentTransition,
 ) modeTransitionOutcome {
 	if gate := l.buildGate(); gate != nil {
-		if err := gate.WaitUntilOpen(ctx); err != nil {
+		if err := gate.WaitUntilRequiredOpen(ctx); err != nil {
 			return modeTransitionOutcome{err: err}
 		}
 	}

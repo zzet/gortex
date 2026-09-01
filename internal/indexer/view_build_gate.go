@@ -11,15 +11,22 @@ import (
 )
 
 // ViewBuildPriority determines how a queued build competes for the one physical
-// build lane. Interactive requests may jump ahead of background reconciliation,
-// but a bounded burst keeps background work from starving.
+// build lane. Required lifecycle publication always precedes client-requested
+// and background work. Interactive requests may jump ahead of background
+// reconciliation, but a bounded burst keeps background work from starving.
 type ViewBuildPriority uint8
 
 const (
 	ViewBuildBackground ViewBuildPriority = iota
 	ViewBuildInteractive
+	ViewBuildRequired
 
-	maxInteractiveBuildBurst              = 4
+	maxInteractiveBuildBurst = 4
+	// Required publication is the frozen startup/lifecycle cohort. Zero means
+	// unbounded: rejecting one of these owners because other required owners
+	// woke first would turn healthy startup work into a terminal degraded
+	// verdict. The cohort is already bounded by cataloged lifecycle state.
+	defaultRequiredViewBuildQueueLimit    = 0
 	defaultInteractiveViewBuildQueueLimit = 128
 	defaultBackgroundViewBuildQueueLimit  = 1024
 )
@@ -53,22 +60,29 @@ type viewBuildWaiter struct {
 // depths exclude the active build. No repository, checkout, ref, or path is
 // retained in these statistics.
 type ViewBuildGateStats struct {
-	Open   bool
-	Active bool
+	Open         bool
+	RequiredOpen bool
+	Active       bool
 
+	RequiredLimit    int
 	InteractiveLimit int
 	BackgroundLimit  int
 
+	RequiredQueued    int
 	InteractiveQueued int
 	BackgroundQueued  int
 
+	RequiredHighWater    int
 	InteractiveHighWater int
 	BackgroundHighWater  int
 
+	AdmittedRequired    uint64
 	AdmittedInteractive uint64
 	AdmittedBackground  uint64
+	RejectedRequired    uint64
 	RejectedInteractive uint64
 	RejectedBackground  uint64
+	CanceledRequired    uint64
 	CanceledInteractive uint64
 	CanceledBackground  uint64
 
@@ -83,24 +97,32 @@ type ViewBuildGateStats struct {
 type ViewBuildGate struct {
 	mu sync.Mutex
 
-	open   bool
-	opened chan struct{}
-	active bool
+	open           bool
+	opened         chan struct{}
+	requiredOpen   bool
+	requiredOpened chan struct{}
+	active         bool
 
+	required    []*viewBuildWaiter
 	interactive []*viewBuildWaiter
 	background  []*viewBuildWaiter
 
 	interactiveBurst int
+	requiredLimit    int
 	interactiveLimit int
 	backgroundLimit  int
 
+	requiredHighWater    int
 	interactiveHighWater int
 	backgroundHighWater  int
 
+	admittedRequired    uint64
 	admittedInteractive uint64
 	admittedBackground  uint64
+	rejectedRequired    uint64
 	rejectedInteractive uint64
 	rejectedBackground  uint64
+	canceledRequired    uint64
 	canceledInteractive uint64
 	canceledBackground  uint64
 
@@ -116,6 +138,19 @@ func (g *ViewBuildGate) IsOpen() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.open
+}
+
+// IsRequiredOpen reports whether lifecycle publication work may enter the
+// physical build lane. During daemon startup this becomes true before Open:
+// configured/dedicated views publish first while ref and background work stay
+// queued.
+func (g *ViewBuildGate) IsRequiredOpen() bool {
+	if g == nil {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.requiredOpen
 }
 
 func (g *ViewBuildGate) WaitUntilOpen(ctx context.Context) error {
@@ -138,22 +173,73 @@ func (g *ViewBuildGate) WaitUntilOpen(ctx context.Context) error {
 	}
 }
 
+func (g *ViewBuildGate) WaitUntilRequiredOpen(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g.mu.Lock()
+	if g.requiredOpen {
+		g.mu.Unlock()
+		return nil
+	}
+	opened := g.requiredOpened
+	g.mu.Unlock()
+
+	select {
+	case <-opened:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func NewViewBuildGate() *ViewBuildGate {
-	return newViewBuildGateWithLimits(
+	return newViewBuildGateWithAllLimits(
+		defaultRequiredViewBuildQueueLimit,
 		defaultInteractiveViewBuildQueueLimit,
 		defaultBackgroundViewBuildQueueLimit,
 	)
 }
 
 func newViewBuildGateWithLimits(interactiveLimit, backgroundLimit int) *ViewBuildGate {
-	if interactiveLimit < 0 || backgroundLimit < 0 {
+	return newViewBuildGateWithAllLimits(
+		defaultRequiredViewBuildQueueLimit,
+		interactiveLimit,
+		backgroundLimit,
+	)
+}
+
+func newViewBuildGateWithAllLimits(requiredLimit, interactiveLimit, backgroundLimit int) *ViewBuildGate {
+	if requiredLimit < 0 || interactiveLimit < 0 || backgroundLimit < 0 {
 		panic("indexer: view build queue limits must be non-negative")
 	}
 	return &ViewBuildGate{
 		opened:           make(chan struct{}),
+		requiredOpened:   make(chan struct{}),
+		requiredLimit:    requiredLimit,
 		interactiveLimit: interactiveLimit,
 		backgroundLimit:  backgroundLimit,
 	}
+}
+
+// OpenRequired starts only durable lifecycle publication. It deliberately
+// leaves interactive and background work queued until Open is called after the
+// startup exact-view cohort reaches a terminal state.
+func (g *ViewBuildGate) OpenRequired() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.requiredOpen {
+		return
+	}
+	g.requiredOpen = true
+	close(g.requiredOpened)
+	g.grantNextLocked()
 }
 
 func (g *ViewBuildGate) Open() {
@@ -162,6 +248,10 @@ func (g *ViewBuildGate) Open() {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if !g.requiredOpen {
+		g.requiredOpen = true
+		close(g.requiredOpened)
+	}
 	if g.open {
 		return
 	}
@@ -188,7 +278,7 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 	// Restore the invariant before evaluating the immediate path. Normally all
 	// state transitions already call grantNextLocked.
 	g.grantNextLocked()
-	if g.open && !g.active && len(g.interactive) == 0 && len(g.background) == 0 {
+	if g.canAdmitImmediatelyLocked(priority) {
 		g.active = true
 		g.recordPriorityLocked(priority)
 		g.recordAdmittedLocked(priority)
@@ -201,10 +291,12 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 	}
 
 	limit, queued := g.backgroundLimit, len(g.background)
-	if priority == ViewBuildInteractive {
+	if priority == ViewBuildRequired {
+		limit, queued = g.requiredLimit, len(g.required)
+	} else if priority == ViewBuildInteractive {
 		limit, queued = g.interactiveLimit, len(g.interactive)
 	}
-	if queued >= limit {
+	if (priority != ViewBuildRequired || limit > 0) && queued >= limit {
 		g.recordRejectedLocked(priority)
 		g.mu.Unlock()
 		return nil, &ViewBuildQueueFullError{Priority: priority, Limit: limit}
@@ -215,7 +307,12 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 		priority:   priority,
 		enqueuedAt: time.Now(),
 	}
-	if priority == ViewBuildInteractive {
+	if priority == ViewBuildRequired {
+		g.required = append(g.required, waiter)
+		if len(g.required) > g.requiredHighWater {
+			g.requiredHighWater = len(g.required)
+		}
+	} else if priority == ViewBuildInteractive {
 		g.interactive = append(g.interactive, waiter)
 		if len(g.interactive) > g.interactiveHighWater {
 			g.interactiveHighWater = len(g.interactive)
@@ -241,7 +338,11 @@ func (g *ViewBuildGate) Acquire(ctx context.Context, priority ViewBuildPriority)
 		} else {
 			waiter.canceled = true
 			removed := false
-			if waiter.priority == ViewBuildInteractive {
+			if waiter.priority == ViewBuildRequired {
+				before := len(g.required)
+				g.required = removeViewBuildWaiter(g.required, waiter)
+				removed = len(g.required) != before
+			} else if waiter.priority == ViewBuildInteractive {
 				before := len(g.interactive)
 				g.interactive = removeViewBuildWaiter(g.interactive, waiter)
 				removed = len(g.interactive) != before
@@ -277,12 +378,17 @@ func (g *ViewBuildGate) release() {
 }
 
 func (g *ViewBuildGate) grantNextLocked() {
-	if !g.open || g.active {
+	if g.active {
 		return
 	}
 	for {
 		var waiter *viewBuildWaiter
 		switch {
+		case g.requiredOpen && len(g.required) > 0:
+			waiter = g.required[0]
+			g.required = g.required[1:]
+		case !g.open:
+			return
 		case len(g.interactive) > 0 && (len(g.background) == 0 || g.interactiveBurst < maxInteractiveBuildBurst):
 			waiter = g.interactive[0]
 			g.interactive = g.interactive[1:]
@@ -311,6 +417,9 @@ func (g *ViewBuildGate) grantNextLocked() {
 }
 
 func (g *ViewBuildGate) recordPriorityLocked(priority ViewBuildPriority) {
+	if priority == ViewBuildRequired {
+		return
+	}
 	if priority == ViewBuildInteractive {
 		if g.interactiveBurst < maxInteractiveBuildBurst {
 			g.interactiveBurst++
@@ -333,7 +442,9 @@ func (g *ViewBuildGate) recordDequeuedLocked(waiter *viewBuildWaiter) {
 }
 
 func (g *ViewBuildGate) recordAdmittedLocked(priority ViewBuildPriority) {
-	if priority == ViewBuildInteractive {
+	if priority == ViewBuildRequired {
+		g.admittedRequired++
+	} else if priority == ViewBuildInteractive {
 		g.admittedInteractive++
 	} else {
 		g.admittedBackground++
@@ -346,7 +457,9 @@ func (g *ViewBuildGate) recordAdmittedLocked(priority ViewBuildPriority) {
 }
 
 func (g *ViewBuildGate) recordRejectedLocked(priority ViewBuildPriority) {
-	if priority == ViewBuildInteractive {
+	if priority == ViewBuildRequired {
+		g.rejectedRequired++
+	} else if priority == ViewBuildInteractive {
 		g.rejectedInteractive++
 	} else {
 		g.rejectedBackground++
@@ -359,7 +472,9 @@ func (g *ViewBuildGate) recordRejectedLocked(priority ViewBuildPriority) {
 }
 
 func (g *ViewBuildGate) recordCanceledLocked(priority ViewBuildPriority) {
-	if priority == ViewBuildInteractive {
+	if priority == ViewBuildRequired {
+		g.canceledRequired++
+	} else if priority == ViewBuildInteractive {
 		g.canceledInteractive++
 	} else {
 		g.canceledBackground++
@@ -372,17 +487,30 @@ func (g *ViewBuildGate) recordCanceledLocked(priority ViewBuildPriority) {
 }
 
 func normalizeViewBuildPriority(priority ViewBuildPriority) ViewBuildPriority {
-	if priority == ViewBuildInteractive {
+	if priority == ViewBuildRequired || priority == ViewBuildInteractive {
 		return priority
 	}
 	return ViewBuildBackground
 }
 
 func viewBuildPriorityLabel(priority ViewBuildPriority) string {
+	if priority == ViewBuildRequired {
+		return viewmetrics.BuildPriorityRequired
+	}
 	if priority == ViewBuildInteractive {
 		return viewmetrics.BuildPriorityInteractive
 	}
 	return viewmetrics.BuildPriorityBackground
+}
+
+func (g *ViewBuildGate) canAdmitImmediatelyLocked(priority ViewBuildPriority) bool {
+	if g.active {
+		return false
+	}
+	if priority == ViewBuildRequired {
+		return g.requiredOpen && len(g.required) == 0
+	}
+	return g.open && len(g.required) == 0 && len(g.interactive) == 0 && len(g.background) == 0
 }
 
 func removeViewBuildWaiter(queue []*viewBuildWaiter, target *viewBuildWaiter) []*viewBuildWaiter {
@@ -399,23 +527,30 @@ func removeViewBuildWaiter(queue []*viewBuildWaiter, target *viewBuildWaiter) []
 
 func (g *ViewBuildGate) Stats() ViewBuildGateStats {
 	if g == nil {
-		return ViewBuildGateStats{Open: true}
+		return ViewBuildGateStats{Open: true, RequiredOpen: true}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return ViewBuildGateStats{
 		Open:                 g.open,
+		RequiredOpen:         g.requiredOpen,
 		Active:               g.active,
+		RequiredLimit:        g.requiredLimit,
 		InteractiveLimit:     g.interactiveLimit,
 		BackgroundLimit:      g.backgroundLimit,
+		RequiredQueued:       len(g.required),
 		InteractiveQueued:    len(g.interactive),
 		BackgroundQueued:     len(g.background),
+		RequiredHighWater:    g.requiredHighWater,
 		InteractiveHighWater: g.interactiveHighWater,
 		BackgroundHighWater:  g.backgroundHighWater,
+		AdmittedRequired:     g.admittedRequired,
 		AdmittedInteractive:  g.admittedInteractive,
 		AdmittedBackground:   g.admittedBackground,
+		RejectedRequired:     g.rejectedRequired,
 		RejectedInteractive:  g.rejectedInteractive,
 		RejectedBackground:   g.rejectedBackground,
+		CanceledRequired:     g.canceledRequired,
 		CanceledInteractive:  g.canceledInteractive,
 		CanceledBackground:   g.canceledBackground,
 		WaitSamples:          g.waitSamples,
@@ -441,6 +576,18 @@ func (g *ViewBuildGate) Opened() <-chan struct{} {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.opened
+}
+
+// RequiredOpened is the startup publication edge. Coordinators responsible
+// for the frozen exact cohort wait here; ordinary coordinators continue to
+// wait on Opened until every required member is terminal.
+func (g *ViewBuildGate) RequiredOpened() <-chan struct{} {
+	if g == nil {
+		return admittedChannel
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.requiredOpened
 }
 
 var admittedChannel = func() chan struct{} {

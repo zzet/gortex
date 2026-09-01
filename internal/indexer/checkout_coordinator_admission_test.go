@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/reconcile"
 )
@@ -135,6 +136,135 @@ func TestApplyCoordinatorsLosesStaleReportToReadyRecovery(t *testing.T) {
 	after := liveCoordinatorOrNil(f.lc, f.automatic.CheckoutID)
 	require.Same(t, before, after, "a stale non-ready report retired the recovered coordinator")
 	require.True(t, after.Running())
+}
+
+func TestSeedRequiredAdmissionPublishesOfflineCheckoutChangesBeforeFullOpen(t *testing.T) {
+	tests := []struct {
+		name          string
+		fixture       string
+		mutate        func(*familyFixture) string
+		commitChanged bool
+	}{
+		{
+			name: "head changed", fixture: "head",
+			mutate: func(f *familyFixture) string {
+				builderWriteTree(f.t, f.worktree, builderTreeB())
+				builderGit(f.t, f.worktree, "add", "-A")
+				builderGit(f.t, f.worktree, "commit", "-m", "offline head change")
+				return builderGit(f.t, f.worktree, "rev-parse", "HEAD^{tree}")
+			},
+			commitChanged: true,
+		},
+		{
+			name: "dirty working copy changed", fixture: "dirty",
+			mutate: func(f *familyFixture) string {
+				headTree := builderGit(f.t, f.worktree, "rev-parse", "HEAD^{tree}")
+				// This replaces tracked content, deletes tracked files, and adds
+				// untracked Go source without moving HEAD.
+				builderWriteTree(f.t, f.worktree, builderTreeB())
+				return headTree
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFamilyFixture(t, "required-seed-"+tt.fixture)
+			defer f.close()
+			ctx := context.Background()
+			initial := f.runCoordinator(f.automatic.CheckoutID)
+			require.Positive(t, initial.CommitGenerationID)
+			require.Positive(t, initial.DirtyGenerationID)
+			before, routed := f.routeOf(f.automatic.CheckoutID)
+			require.True(t, routed)
+
+			f.restart()
+			gate := NewViewBuildGate()
+			f.lc.SetBuildGate(gate)
+			wantTree := tt.mutate(f)
+			_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{
+				Path: f.main, Name: f.mainPrefix,
+			})
+			require.NoError(t, err)
+			require.NoError(t, f.lc.Seed(ctx))
+
+			coordinator := lifecycleCoordinator(t, f.lc, f.automatic.CheckoutID)
+			pending, failure := coordinator.startupBuildStatus()
+			require.True(t, pending,
+				"Seed did not wire its routed cold-start coordinator into required admission")
+			require.Empty(t, failure)
+			gate.OpenRequired()
+
+			require.Eventually(t, func() bool {
+				pending, failure = coordinator.startupBuildStatus()
+				if pending || failure != "" {
+					return false
+				}
+				route, found := f.routeOf(f.automatic.CheckoutID)
+				if !found || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+					return false
+				}
+				commit, found, readErr := f.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+				return readErr == nil && found && commit.TreeOID == wantTree
+			}, 20*time.Second, 10*time.Millisecond,
+				"required-only phase did not publish the exact offline checkout state")
+
+			after, routed := f.routeOf(f.automatic.CheckoutID)
+			require.True(t, routed)
+			if tt.commitChanged {
+				assert.NotEqual(t, before.CommitGenerationID, after.CommitGenerationID)
+			} else {
+				assert.Equal(t, before.CommitGenerationID, after.CommitGenerationID)
+				assert.NotEqual(t, before.DirtyGenerationID, after.DirtyGenerationID)
+			}
+			assert.False(t, gate.IsOpen(), "required publication opened normal background work")
+			stats := gate.Stats()
+			assert.Positive(t, stats.AdmittedRequired)
+			assert.Zero(t, stats.AdmittedBackground)
+		})
+	}
+}
+
+func TestStartupFamilyMarkerPropagatesRequiredAdmissionIntoCoordinator(t *testing.T) {
+	f := newFamilyFixture(t, "required-family-marker")
+	defer f.close()
+	ctx := context.Background()
+	f.runCoordinator(f.automatic.CheckoutID)
+	f.lc.dropCoordinator(f.automatic.CheckoutID)
+	gate := NewViewBuildGate()
+	f.lc.SetBuildGate(gate)
+	f.lc.markStartupFamilyAdmission(f.familyID, "cold-promotion-owner")
+	defer f.lc.releaseStartupFamilyAdmission(f.familyID, "cold-promotion-owner")
+
+	f.lc.applyCoordinators(ctx, reconcile.FamilyReport{
+		FamilyID:       f.familyID,
+		PrimaryGraphID: f.primaryGraph,
+		Checkouts: []reconcile.CheckoutReport{{
+			CheckoutID: f.automatic.CheckoutID,
+			Durable:    true,
+			State:      store_sqlite.CheckoutStateReady,
+			Action:     reconcile.ActionReadyConfirmed,
+		}},
+	})
+	coordinator := lifecycleCoordinator(t, f.lc, f.automatic.CheckoutID)
+	pending, failure := coordinator.startupBuildStatus()
+	assert.True(t, pending,
+		"process-local startup-family policy was not propagated into coordinator construction")
+	assert.Empty(t, failure)
+}
+
+func TestCheckoutStartupBuildStatusDoesNotWaitOnStoppedCoordinator(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	stopped := &CheckoutCoordinator{startupRequired: true, done: done}
+	lifecycle := &CheckoutLifecycle{
+		coordinators: map[string]*CheckoutCoordinator{"checkout": stopped},
+		started:      map[string][]*CheckoutCoordinator{"checkout": {stopped}},
+	}
+	pending, failure := lifecycle.CheckoutStartupBuildStatus("checkout")
+	assert.False(t, pending)
+	assert.Contains(t, failure, "stopped before exact publication")
+	assert.Empty(t, lifecycle.started["checkout"], "stopped startup owner remained in the registry")
 }
 
 func TestCoordinatorReportAdmissionPolicy(t *testing.T) {

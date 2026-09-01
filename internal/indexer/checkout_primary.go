@@ -182,6 +182,20 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 	if err != nil {
 		return SetPrimaryResult{}, err
 	}
+	// The physical build lane is always outside topology. Promotion and
+	// demotion build first, then acquire family/checkout topology only at their
+	// publication callback. Taking these in the opposite order here creates a
+	// lock cycle: SetPrimary holds topology waiting for the lane while a
+	// promotion holds the lane waiting for topology.
+	releaseBuild := func() {}
+	if gate := l.buildGate(); gate != nil {
+		releaseBuild, err = gate.Acquire(ctx, ViewBuildRequired)
+		if err != nil {
+			return SetPrimaryResult{FamilyID: initial.FamilyID, GraphID: graphID},
+				fmt.Errorf("indexer: wait for primary-switch build admission: %w", err)
+		}
+	}
+	defer releaseBuild()
 	familyTopology, err := l.AcquireCheckoutFamilyTopology(ctx, initial.FamilyID)
 	if err != nil {
 		return SetPrimaryResult{FamilyID: initial.FamilyID, GraphID: graphID}, err
@@ -241,6 +255,10 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 		// family's own primary-switch fence.
 		topology.Release()
 		familyTopology.Release()
+		// The coalesced invalidation below may synchronously reconcile and
+		// acquire the build lane. Release it after topology but before the
+		// notification edge to avoid self-deadlock.
+		releaseBuild()
 		endBatch()
 	}()
 
@@ -323,7 +341,7 @@ func (l *CheckoutLifecycle) rehomeCheckoutFenced(
 	}
 	bounded, cancel := context.WithTimeout(ctx, rebuildBudget)
 	defer cancel()
-	if _, err := coordinator.RehomeTo(bounded, graphID); err != nil {
+	if _, err := coordinator.prepareRehomeToAdmitted(bounded, graphID, coordinator.installStack); err != nil {
 		_ = coordinator.Close()
 		l.oweRetirement(coordinator.DrainRetirements()...)
 		return err

@@ -12,6 +12,11 @@ func TestViewBuildAndDeferredMetricsKeepFixedVocabulary(t *testing.T) {
 		BuildPriorityInteractive,
 		BuildAdmissionRejected,
 	)
+	recorder.Count(
+		ViewBuildAdmissionTotal,
+		BuildPriorityRequired,
+		BuildAdmissionAdmitted,
+	)
 	recorder.Count(CoordinatorCycleTotal, OutcomeDeferred)
 	recorder.Count(RefViewSelectionTotal, RefViewDeferred)
 	recorder.AddGauge(ViewBuildQueue, 1, BuildPriorityBackground)
@@ -21,6 +26,7 @@ func TestViewBuildAndDeferredMetricsKeepFixedVocabulary(t *testing.T) {
 	counters := snapshot.Counters
 	for _, key := range []string{
 		"views_build_admission_total{priority=interactive,outcome=rejected}",
+		"views_build_admission_total{priority=required,outcome=admitted}",
 		"views_coordinator_cycle_total{outcome=deferred}",
 		"views_ref_view_selection_total{outcome=deferred}",
 	} {

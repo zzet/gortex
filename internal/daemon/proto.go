@@ -609,11 +609,15 @@ type StartupViewsStatus struct {
 // admission. Queue depths exclude the active build.
 type ViewBuildQueueStatus struct {
 	Open              bool   `json:"open"`
+	RequiredOpen      bool   `json:"required_open"`
 	Active            bool   `json:"active"`
+	RequiredQueued    int    `json:"required_queued"`
 	InteractiveQueued int    `json:"interactive_queued"`
 	BackgroundQueued  int    `json:"background_queued"`
+	RequiredLimit     int    `json:"required_limit"`
 	InteractiveLimit  int    `json:"interactive_limit"`
 	BackgroundLimit   int    `json:"background_limit"`
+	RequiredHigh      int    `json:"required_high_water"`
 	InteractiveHigh   int    `json:"interactive_high_water"`
 	BackgroundHigh    int    `json:"background_high_water"`
 	MaxWaitMillis     int64  `json:"max_wait_millis,omitempty"`

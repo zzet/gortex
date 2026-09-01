@@ -117,6 +117,7 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 	checkpoint := make(chan projectOnlyStartupCheckpoint, 1)
 	startupDone := make(chan error, 1)
 	var markReadyCalls atomic.Int32
+	var finalizedBeforeFullOpen atomic.Bool
 	go func() {
 		if seedErr := lifecycle.Seed(ctx); seedErr != nil {
 			checkpoint <- projectOnlyStartupCheckpoint{err: seedErr}
@@ -147,15 +148,18 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 		checkpoint <- projectOnlyStartupCheckpoint{timings: timings}
 		<-releaseGate
 		monitor.onConfirmedComplete(func() {
+			finalizedBeforeFullOpen.Store(!gate.IsOpen())
+			defer gate.Open()
 			controller.MarkEnriched(time.Since(started))
 		})
-		gate.Open()
+		gate.OpenRequired()
 		terminal, waitErr := monitor.waitTerminal(monitorCtx)
 		if waitErr != nil {
 			startupDone <- waitErr
 			return
 		}
 		if !terminal.complete() {
+			gate.Open()
 			startupDone <- fmt.Errorf("startup view terminal failure: %+v", terminal)
 			return
 		}
@@ -236,6 +240,14 @@ func TestProjectOnlyColdStartupKeepsStatusUnreadyUntilExactViewPublishes(t *test
 		"exact-view transition did not publish daemon readiness")
 	require.True(t, controller.IsEnriched(),
 		"full enrichment must publish only after the exact route is ready")
+	require.True(t, finalizedBeforeFullOpen.Load(),
+		"normal build admission opened before exact-view finalization")
+	gateStats := gate.Stats()
+	require.True(t, gateStats.Open)
+	require.True(t, gateStats.RequiredOpen)
+	require.Positive(t, gateStats.AdmittedRequired)
+	require.Zero(t, gateStats.AdmittedBackground,
+		"cold required publication leaked into background admission")
 
 	statusCtx, cancelStatus = context.WithTimeout(ctx, 5*time.Second)
 	readyStatus, err := controller.Status(statusCtx)

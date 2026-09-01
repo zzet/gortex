@@ -442,6 +442,80 @@ func TestTrackReadinessWaitsForExactRoutedView(t *testing.T) {
 	assert.False(t, binding.CoordinatorLive, "readiness polling must not start a build coordinator")
 }
 
+func TestTrackReadinessFencesRequiredStartupReconciliationAndFailure(t *testing.T) {
+	testenv.Sandbox(t)
+	f := newProbeFixture(t)
+	f.routeWorktree(t)
+	ctx := context.Background()
+	probed := filepath.Join(f.worktreeRoot, probeFile)
+
+	pending := true
+	failure := ""
+	f.controller.checkoutStartupBuildStatus = func(checkoutID string) (bool, string) {
+		assert.Equal(t, probeWorktreeID, checkoutID)
+		return pending, failure
+	}
+	building, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessBuilding, building.State)
+	assert.Contains(t, building.Error, "startup checkout reconciliation")
+	assert.False(t, building.View.Exact)
+
+	pending = false
+	failure = "startup checkout reconciliation failed; see daemon log"
+	failed, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessFailed, failed.State)
+	assert.Equal(t, failure, failed.Error)
+	assert.False(t, failed.View.Exact)
+
+	failure = ""
+	ready, err := f.controller.TrackReadiness(ctx, probed)
+	require.NoError(t, err)
+	assert.Equal(t, daemon.TrackReadinessReady, ready.State)
+	assert.True(t, ready.View.Exact)
+}
+
+func TestTrackReadinessSurfacesDedicatedBaseRefreshFailure(t *testing.T) {
+	testenv.Sandbox(t)
+	f := newProbeFixture(t)
+	ctx := context.Background()
+	baseGenerationID := f.publishDedicatedBase(t)
+	f.routeCheckout(t, probePrimaryID, true)
+	f.routeWorktree(t)
+	require.NoError(t, f.catalog.BeginDedicatedBaseRefresh(
+		ctx, probeGraphID, baseGenerationID,
+	))
+	for _, checkoutID := range []string{probePrimaryID, probeWorktreeID} {
+		route, found, routeErr := f.catalog.GetCheckoutRoute(ctx, checkoutID)
+		require.NoError(t, routeErr)
+		require.True(t, found)
+		require.Equal(t, store_sqlite.RoutePending, route.State,
+			"fixture must model the production refresh transaction")
+	}
+
+	const reason = "dedicated base refresh failed; see daemon log"
+	f.controller.lifecycle.RecordDedicatedBaseRefreshFailure(
+		probeGraphID, baseGenerationID, reason,
+	)
+	// A dependent coordinator may still be carrying its own cold-start claim.
+	// The shared base owner's terminal failure must take precedence or the
+	// startup cohort remains Building forever.
+	f.controller.checkoutStartupBuildStatus = func(string) (bool, string) {
+		return true, ""
+	}
+	for _, path := range []string{
+		filepath.Join(f.primaryRoot, probeFile),
+		filepath.Join(f.worktreeRoot, probeFile),
+	} {
+		failed, err := f.controller.TrackReadiness(ctx, path)
+		require.NoError(t, err)
+		assert.Equal(t, daemon.TrackReadinessFailed, failed.State, path)
+		assert.Equal(t, reason, failed.Error, path)
+		assert.False(t, failed.View.Exact, path)
+	}
+}
+
 func TestTrackReadinessFencesPendingRootMove(t *testing.T) {
 	testenv.Sandbox(t)
 	f := newProbeFixture(t)

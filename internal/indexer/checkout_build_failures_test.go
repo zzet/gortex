@@ -56,3 +56,32 @@ func TestCheckoutBuildFailuresConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestCheckoutBuildFailuresKeepBaseRefreshIndependentFromReplacementGeneration(t *testing.T) {
+	failures := newCheckoutBuildFailures()
+	failures.startBaseRefresh("graph", 10)
+
+	// The replacement build is newer and uses the same owner checkout, but it
+	// is not the identity TrackReadiness represents while the old base remains
+	// active as fallback.
+	failures.start("owner", 11)
+	failures.record("owner", 11, "replacement")
+	failures.recordBaseRefresh("graph", 10, "refresh")
+
+	if reason, ok := failures.baseRefreshFailure("graph", 10); !ok || reason != "refresh" {
+		t.Fatalf("base refresh failure = (%q, %t), want refresh", reason, ok)
+	}
+	if reason, ok := failures.failure("owner", 11); !ok || reason != "replacement" {
+		t.Fatalf("replacement failure = (%q, %t), want replacement", reason, ok)
+	}
+
+	failures.startBaseRefresh("graph", 10)
+	if reason, ok := failures.baseRefreshFailure("graph", 10); ok || reason != "" {
+		t.Fatalf("same-base retry retained refresh failure (%q, %t)", reason, ok)
+	}
+	failures.recordBaseRefresh("graph", 10, "retry")
+	failures.clearBaseRefresh("graph", 10)
+	if _, ok := failures.baseRefreshFailure("graph", 10); ok {
+		t.Fatal("successful refresh did not clear its graph/base verdict")
+	}
+}

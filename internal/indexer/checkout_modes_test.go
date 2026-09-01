@@ -524,10 +524,11 @@ func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
 	defer f.close()
 	ctx := context.Background()
 
-	// A zero interactive queue proves promotion is classified as foreground:
-	// background still has capacity, so a background admission would park here
-	// instead of returning the retryable overload result below.
-	gate := newViewBuildGateWithLimits(0, 1)
+	// Fill an explicitly bounded required queue behind the held lane. Production
+	// uses an unbounded required cohort; this test-only bound proves promotion
+	// still classifies capacity errors as retryable without weakening its
+	// lifecycle priority.
+	gate := newViewBuildGateWithAllLimits(1, 1, 1)
 	gate.Open()
 	release, err := gate.Acquire(ctx, ViewBuildBackground)
 	require.NoError(t, err)
@@ -536,6 +537,11 @@ func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
 			release()
 		}
 	}()
+	queueCtx, cancelQueue := context.WithCancel(ctx)
+	queuedRequired := acquireViewBuildAsync(queueCtx, gate, ViewBuildRequired)
+	awaitBoundedGateStats(t, gate, func(stats ViewBuildGateStats) bool {
+		return stats.RequiredQueued == 1
+	})
 	f.lc.SetBuildGate(gate)
 	indexed := make(chan struct{}, 1)
 	f.lc.indexBarrier = func() { indexed <- struct{}{} }
@@ -560,6 +566,13 @@ func TestPromotionBuildAdmissionIsRetryable(t *testing.T) {
 	require.True(t, found, "overload must retain the durable retry row")
 	assert.Equal(t, store_sqlite.IntentTransitionPending, standing.State)
 
+	cancelQueue()
+	queuedOutcome := <-queuedRequired
+	require.ErrorIs(t, queuedOutcome.err, context.Canceled)
+	require.Nil(t, queuedOutcome.release)
+	awaitBoundedGateStats(t, gate, func(stats ViewBuildGateStats) bool {
+		return stats.RequiredQueued == 0
+	})
 	release()
 	release = nil
 	retry, retryRun, err := f.lc.startPromoteCheckout(ctx, f.automatic.CheckoutID, TrackSourceMCP)
@@ -1501,6 +1514,72 @@ func TestSetPrimaryRebuildsEveryDependentBeforeItFlips(t *testing.T) {
 	defer after.Close()
 	assert.Equal(t, beforeIDs, contentIdentities(after.Reader, tracked.Prefix),
 		"the same working tree, read over a different base")
+}
+
+func TestSetPrimaryQueuesForBuildAdmissionBeforeTopology(t *testing.T) {
+	f := newFamilyFixture(t, "setprimary-lock-order")
+	defer f.close()
+	ctx := context.Background()
+
+	candidate := f.worktreeOf(f.main, "setprimary-lock-order-alt")
+	runGit(t, candidate, "add", "-A")
+	runGit(t, candidate, "commit", "-q", "-m", "alt")
+	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: candidate}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, tracked.CatalogErr)
+	f.runCoordinator(f.automatic.CheckoutID)
+
+	gate := NewViewBuildGate()
+	gate.Open()
+	f.lc.SetBuildGate(gate)
+	hold, err := gate.Acquire(ctx, ViewBuildRequired)
+	require.NoError(t, err)
+	holdReleased := false
+	defer func() {
+		if !holdReleased {
+			hold()
+		}
+	}()
+
+	type setPrimaryOutcome struct {
+		result SetPrimaryResult
+		err    error
+	}
+	finished := make(chan setPrimaryOutcome, 1)
+	setPrimaryCtx, cancelSetPrimary := context.WithCancel(ctx)
+	defer cancelSetPrimary()
+	go func() {
+		result, setErr := f.lc.SetPrimary(setPrimaryCtx, tracked.GraphID)
+		finished <- setPrimaryOutcome{result: result, err: setErr}
+	}()
+	require.Eventually(t, func() bool {
+		return gate.Stats().RequiredQueued == 1
+	}, 2*time.Second, time.Millisecond,
+		"SetPrimary did not queue for the held physical build lane")
+
+	// The fixed global order is gate -> family topology -> checkout topology.
+	// Therefore a SetPrimary visibly queued on the gate cannot own either token.
+	topologyCtx, cancelTopology := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelTopology()
+	familyTopology, err := f.lc.AcquireCheckoutFamilyTopology(topologyCtx, f.familyID)
+	require.NoError(t, err, "SetPrimary held family topology while waiting for the build lane")
+	defer familyTopology.Release()
+	checkoutTopology, err := f.lc.AcquireCheckoutTopology(topologyCtx, f.automatic.CheckoutID)
+	require.NoError(t, err, "SetPrimary held checkout topology while waiting for the build lane")
+	defer checkoutTopology.Release()
+	checkoutTopology.Release()
+	familyTopology.Release()
+
+	hold()
+	holdReleased = true
+	select {
+	case outcome := <-finished:
+		require.NoError(t, outcome.err)
+		assert.Equal(t, []string{f.automatic.CheckoutID}, outcome.result.Rebuilt)
+		assert.Empty(t, outcome.result.Errors)
+	case <-time.After(20 * time.Second):
+		t.Fatal("SetPrimary did not finish after build admission and topology were released")
+	}
 }
 
 // TestSetPrimaryReportsACheckoutThatCannotRebuild covers the other outcome: a

@@ -189,6 +189,7 @@ const (
 // Physical view-build admission priorities and outcomes. Both vocabularies
 // are fixed: no checkout, ref, repository, or path identity enters metrics.
 const (
+	BuildPriorityRequired    = "required"
 	BuildPriorityInteractive = "interactive"
 	BuildPriorityBackground  = "background"
 	BuildAdmissionAdmitted   = "admitted"
@@ -352,16 +353,16 @@ var catalog = map[string]spec{
 		{name: LabelSlot, values: []string{SlotCommit, SlotDirty}},
 	}},
 	ViewBuildAdmissionTotal: {kind: kindCounter, labels: []labelSpec{
-		{name: LabelPriority, values: []string{BuildPriorityInteractive, BuildPriorityBackground}},
+		{name: LabelPriority, values: []string{BuildPriorityRequired, BuildPriorityInteractive, BuildPriorityBackground}},
 		{name: LabelOutcome, values: []string{
 			BuildAdmissionAdmitted, BuildAdmissionRejected, BuildAdmissionCanceled,
 		}},
 	}},
 	ViewBuildQueue: {kind: kindGauge, labels: []labelSpec{
-		{name: LabelPriority, values: []string{BuildPriorityInteractive, BuildPriorityBackground}},
+		{name: LabelPriority, values: []string{BuildPriorityRequired, BuildPriorityInteractive, BuildPriorityBackground}},
 	}},
 	ViewBuildWaitSeconds: {kind: kindDuration, labels: []labelSpec{
-		{name: LabelPriority, values: []string{BuildPriorityInteractive, BuildPriorityBackground}},
+		{name: LabelPriority, values: []string{BuildPriorityRequired, BuildPriorityInteractive, BuildPriorityBackground}},
 	}},
 	Coordinators: {kind: kindGauge},
 

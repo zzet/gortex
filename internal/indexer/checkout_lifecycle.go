@@ -2412,6 +2412,7 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 	if l.startupFamilyAdmissionPending(report.FamilyID) {
 		policy = coordinatorAdmissionStartupRoutedOnly
 	}
+	ctx = withCoordinatorAdmissionPolicy(ctx, policy)
 	for _, entry := range report.Checkouts {
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
@@ -2709,6 +2710,10 @@ func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
 		Config: index,
 		Logger: l.logger,
 		Gate:   l.buildGate(),
+		// Coordinators admitted from the frozen cold-start inventory own one
+		// exact reconciliation in the reserved lifecycle class. Runtime-created
+		// coordinators remain ordinary background work.
+		StartupRequired: coordinatorAdmissionPolicyFrom(ctx) == coordinatorAdmissionStartupRoutedOnly,
 		// The watcher's own debounce is the quiet window: both coalesce the
 		// same event storms, and a checkout whose watch configuration says how
 		// long to wait means it for its views too.
@@ -2727,6 +2732,47 @@ func (l *CheckoutLifecycle) buildCoordinatorWithPoll(
 	return coordinator, nil
 }
 
+// CheckoutStartupBuildStatus reports the process-local terminal state of the
+// coordinator responsible for the frozen startup cohort. It covers failures
+// that happen before a generation exists and therefore cannot be represented
+// by durable generation metadata. The registered coordinator is authoritative;
+// a still-starting coordinator is consulted only during the narrow publication
+// window before it reaches the registry.
+func (l *CheckoutLifecycle) CheckoutStartupBuildStatus(checkoutID string) (pending bool, failure string) {
+	if l == nil || checkoutID == "" {
+		return false, ""
+	}
+	l.coordMu.Lock()
+	registered := l.coordinators[checkoutID]
+	started := stillRunning(l.started[checkoutID])
+	if len(started) == 0 {
+		delete(l.started, checkoutID)
+	} else {
+		l.started[checkoutID] = started
+	}
+	started = append([]*CheckoutCoordinator(nil), started...)
+	l.coordMu.Unlock()
+	if registered != nil && registered.Running() {
+		return registered.startupBuildStatus()
+	}
+	for i := len(started) - 1; i >= 0; i-- {
+		candidatePending, candidateFailure := started[i].startupBuildStatus()
+		if candidatePending || candidateFailure != "" {
+			return candidatePending, candidateFailure
+		}
+	}
+	if registered != nil {
+		registeredPending, registeredFailure := registered.startupBuildStatus()
+		if registeredFailure != "" {
+			return false, registeredFailure
+		}
+		if registeredPending {
+			return false, "startup checkout coordinator stopped before exact publication; see daemon log"
+		}
+	}
+	return false, ""
+}
+
 // CheckoutBuildFailure returns a terminal process-local verdict only for the
 // exact durable generation still marked building. It is intentionally narrow:
 // callers must supply the catalog row they are about to represent.
@@ -2735,6 +2781,27 @@ func (l *CheckoutLifecycle) CheckoutBuildFailure(checkoutID string, generationID
 		return "", false
 	}
 	return l.buildFailures.failure(checkoutID, generationID)
+}
+
+// DedicatedBaseRefreshFailure reports a terminal refresh verdict for the
+// exact graph/base pair still serving as the labeled fallback. Its identity is
+// independent from the replacement generation built inside the refresh.
+func (l *CheckoutLifecycle) DedicatedBaseRefreshFailure(graphID string, baseGenerationID int64) (string, bool) {
+	if l == nil {
+		return "", false
+	}
+	return l.buildFailures.baseRefreshFailure(graphID, baseGenerationID)
+}
+
+// RecordDedicatedBaseRefreshFailure records the narrow graph/base verdict used
+// when a refresh cannot persist its terminal state. The production worker owns
+// the normal call path; this method is also the controller integration seam.
+func (l *CheckoutLifecycle) RecordDedicatedBaseRefreshFailure(graphID string, baseGenerationID int64, reason string) {
+	if l == nil {
+		return
+	}
+	l.buildFailures.startBaseRefresh(graphID, baseGenerationID)
+	l.buildFailures.recordBaseRefresh(graphID, baseGenerationID, reason)
 }
 
 // RecordCheckoutBuildFailure records a terminal attempt that could not be

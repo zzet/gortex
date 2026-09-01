@@ -43,15 +43,14 @@ func (l *CheckoutLifecycle) buildPromotedCorpus(
 	prefix string,
 ) (*IndexResult, int64, checkoutSample, int, error) {
 	// This is the one physical full-tree pass a promotion requires. A promotion
-	// is foreground admission: it is durable user/config intent and may be part
-	// of the daemon's exact startup cohort. Classifying it as background lets a
-	// cold automatic-worktree queue hold configured repositories unready for
-	// hours. The gate's bounded interactive burst still prevents already-queued
-	// background maintenance from starving.
+	// is required admission: it is durable user/config intent and may be part of
+	// the daemon's exact startup cohort. It owns a reserved queue and is the only
+	// class admitted during the exact-publication startup phase, so ref views or
+	// automatic-worktree maintenance cannot hold configured repositories unready.
 	release := func() {}
 	if gate := l.buildGate(); gate != nil {
 		var err error
-		release, err = gate.Acquire(ctx, ViewBuildInteractive)
+		release, err = gate.Acquire(ctx, ViewBuildRequired)
 		if err != nil {
 			return nil, 0, checkoutSample{}, 0, fmt.Errorf(
 				"indexer: wait for dedicated base build admission: %w", err)

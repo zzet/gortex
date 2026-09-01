@@ -12,9 +12,10 @@ import (
 )
 
 type dedicatedBaseRefreshRequest struct {
-	graphID    string
-	checkoutID string
-	familyID   string
+	graphID          string
+	checkoutID       string
+	familyID         string
+	baseGenerationID int64
 }
 
 func dedicatedBaseGenerationStructurallyValid(
@@ -122,6 +123,7 @@ func (l *CheckoutLifecycle) scheduleDedicatedBaseRefreshIfNeeded(
 		}
 		l.scheduleDedicatedBaseRefresh(dedicatedBaseRefreshRequest{
 			graphID: graph.GraphID, checkoutID: checkout.CheckoutID, familyID: checkout.FamilyID,
+			baseGenerationID: row.GenerationID,
 		})
 		return true
 	}
@@ -186,7 +188,23 @@ func (l *CheckoutLifecycle) runDedicatedBaseRefreshWorker() {
 		if l.baseRefreshExecute != nil {
 			execute = l.baseRefreshExecute
 		}
+		if req.baseGenerationID > 0 {
+			// A newly admitted retry supersedes the prior process-local verdict
+			// even though it rebuilds from the same active base generation.
+			l.buildFailures.startBaseRefresh(req.graphID, req.baseGenerationID)
+		}
 		err := execute(l.transitionCtx, req)
+		if req.baseGenerationID > 0 {
+			if err == nil {
+				l.buildFailures.clearBaseRefresh(req.graphID, req.baseGenerationID)
+			} else if !errors.Is(err, context.Canceled) {
+				l.buildFailures.recordBaseRefresh(
+					req.graphID,
+					req.baseGenerationID,
+					dedicatedBaseRefreshFailureReason(err),
+				)
+			}
+		}
 		l.transitionMu.Lock()
 		delete(l.baseRefreshInFlight, req.graphID)
 		l.transitionMu.Unlock()
@@ -199,6 +217,14 @@ func (l *CheckoutLifecycle) runDedicatedBaseRefreshWorker() {
 				zap.String("checkout", req.checkoutID), zap.Error(err))
 		}
 	}
+}
+
+func dedicatedBaseRefreshFailureReason(err error) string {
+	var storageErr *store_sqlite.StorageError
+	if errors.As(err, &storageErr) {
+		return store_sqlite.SafeStorageFailureReason(err)
+	}
+	return "dedicated base refresh failed; see daemon log"
 }
 
 func (l *CheckoutLifecycle) takeDedicatedBaseRefresh() (dedicatedBaseRefreshRequest, bool) {
@@ -269,9 +295,9 @@ func (l *CheckoutLifecycle) refreshDedicatedBase(
 	release := func() {}
 	if gate := l.buildGate(); gate != nil {
 		// A configured dedicated graph cannot become exact until this refresh
-		// publishes. Admit it with other foreground lifecycle work so an
-		// automatic overlay backlog cannot starve daemon readiness.
-		release, err = gate.Acquire(ctx, ViewBuildInteractive)
+		// publishes. Its reserved lifecycle admission cannot be displaced by ref
+		// views or automatic overlay maintenance during daemon startup.
+		release, err = gate.Acquire(ctx, ViewBuildRequired)
 		if err != nil {
 			return fmt.Errorf("indexer: wait for dedicated base refresh admission: %w", err)
 		}

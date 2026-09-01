@@ -23,6 +23,7 @@ func newDedicatedBaseRefreshWorkerTestLifecycle(
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &CheckoutLifecycle{
 		catalog: catalog, logger: zap.NewNop(), transitionCtx: ctx, cancelTransitions: cancel,
+		buildFailures:       newCheckoutBuildFailures(),
 		baseRefreshPending:  map[string]dedicatedBaseRefreshRequest{},
 		baseRefreshInFlight: map[string]struct{}{}, baseRefreshWake: make(chan struct{}, 1),
 		baseRefreshExecute: execute, baseRefreshDone: done,
@@ -205,8 +206,16 @@ func TestDedicatedBaseRefreshFailureKeepsPublishedBaseFallback(t *testing.T) {
 	f := newPrimaryBaseTestFixture(t, 1)
 	wantErr := errors.New("refresh failed before publication")
 	done := make(chan error, 1)
-	l := newDedicatedBaseRefreshWorkerTestLifecycle(t, f.catalog,
-		func(context.Context, dedicatedBaseRefreshRequest) error { return wantErr },
+	var l *CheckoutLifecycle
+	l = newDedicatedBaseRefreshWorkerTestLifecycle(t, f.catalog,
+		func(_ context.Context, req dedicatedBaseRefreshRequest) error {
+			// A real refresh allocates a replacement generation inside the sparse
+			// builder. Simulate that nested attempt reaching its own terminal
+			// fallback: it must not overwrite the graph/base refresh verdict.
+			l.buildFailures.start(req.checkoutID, f.generation+1)
+			l.buildFailures.record(req.checkoutID, f.generation+1, "replacement generation failed")
+			return wantErr
+		},
 		func(_ dedicatedBaseRefreshRequest, err error) { done <- err },
 	)
 
@@ -238,6 +247,15 @@ func TestDedicatedBaseRefreshFailureKeepsPublishedBaseFallback(t *testing.T) {
 	}
 	if generation.State != store_sqlite.ViewGenerationReady {
 		t.Fatalf("fallback generation state after failed refresh = %q, want %q", generation.State, store_sqlite.ViewGenerationReady)
+	}
+	if reason, failed := l.DedicatedBaseRefreshFailure(f.graphID, f.generation); !failed {
+		t.Fatal("failed refresh remained indistinguishable from an in-progress refresh")
+	} else if reason != "dedicated base refresh failed; see daemon log" {
+		t.Fatalf("refresh failure reason = %q", reason)
+	}
+	if reason, failed := l.CheckoutBuildFailure(checkout.CheckoutID, f.generation+1); !failed ||
+		reason != "replacement generation failed" {
+		t.Fatalf("nested replacement failure = (%q, %t), want independent terminal verdict", reason, failed)
 	}
 }
 

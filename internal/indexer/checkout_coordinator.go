@@ -165,6 +165,12 @@ type CheckoutCoordinatorConfig struct {
 	// Gate holds the loop's build cycles while the daemon warms up. nil admits
 	// every cycle at once, which is what a coordinator outside a warmup has.
 	Gate *ViewBuildGate
+	// StartupRequired keeps this coordinator's first unsettled route
+	// reconciliation in the reserved lifecycle class. It is cleared only after
+	// the route is proven exact or the first required attempt fails terminally,
+	// so an offline HEAD or dirty-worktree change cannot deadlock the daemon's
+	// required-only startup phase.
+	StartupRequired bool
 
 	// Debounce is the quiet window; <= 0 takes defaultCheckoutQuietWindow.
 	Debounce time.Duration
@@ -235,6 +241,13 @@ type CheckoutCoordinator struct {
 	leases  *graphview.LeaseManager
 	logger  *zap.Logger
 	gate    *ViewBuildGate
+	// startupRequired and startupFailure are guarded by mu. Deferred and
+	// rescheduled attempts remain pending. The first actual attempt becomes
+	// terminal as either an exact route or a degraded failure, allowing the
+	// daemon to open normal service instead of waiting forever on a log-only
+	// pre-generation error. A later exact background cycle clears the failure.
+	startupRequired bool
+	startupFailure  string
 
 	quiet      time.Duration
 	poll       time.Duration
@@ -508,33 +521,34 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	lifetime, cancelLifetime := context.WithCancel(context.Background())
 	pipeline := DedicatedBasePipelineFor(cfg.Config)
 	c := &CheckoutCoordinator{
-		checkoutID:     cfg.CheckoutID,
-		root:           cfg.CheckoutRoot,
-		sampler:        sampler,
-		familyID:       cfg.FamilyID,
-		graphID:        cfg.GraphID,
-		repoPrefix:     cfg.RepoPrefix,
-		workspaceID:    cfg.WorkspaceID,
-		projectID:      cfg.ProjectID,
-		store:          cfg.Store,
-		catalog:        cfg.Store.Catalog(),
-		builder:        cfg.Builder,
-		leases:         cfg.Leases,
-		logger:         logger,
-		gate:           cfg.Gate,
-		quiet:          cfg.Debounce,
-		poll:           cfg.PollInterval,
-		retain:         cfg.Retain,
-		configHash:     pipeline.ConfigHash,
-		extractors:     pipeline.ExtractorVersions,
-		signal:         make(chan struct{}, 1),
-		stop:           make(chan struct{}),
-		done:           make(chan struct{}),
-		lifetime:       lifetime,
-		cancelLifetime: cancelLifetime,
-		backlog:        map[int64]struct{}{},
-		cycleDone:      cfg.cycleDone,
-		dirtyBarrier:   cfg.dirtyBarrier,
+		checkoutID:      cfg.CheckoutID,
+		root:            cfg.CheckoutRoot,
+		sampler:         sampler,
+		familyID:        cfg.FamilyID,
+		graphID:         cfg.GraphID,
+		repoPrefix:      cfg.RepoPrefix,
+		workspaceID:     cfg.WorkspaceID,
+		projectID:       cfg.ProjectID,
+		store:           cfg.Store,
+		catalog:         cfg.Store.Catalog(),
+		builder:         cfg.Builder,
+		leases:          cfg.Leases,
+		logger:          logger,
+		gate:            cfg.Gate,
+		startupRequired: cfg.StartupRequired,
+		quiet:           cfg.Debounce,
+		poll:            cfg.PollInterval,
+		retain:          cfg.Retain,
+		configHash:      pipeline.ConfigHash,
+		extractors:      pipeline.ExtractorVersions,
+		signal:          make(chan struct{}, 1),
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
+		lifetime:        lifetime,
+		cancelLifetime:  cancelLifetime,
+		backlog:         map[int64]struct{}{},
+		cycleDone:       cfg.cycleDone,
+		dirtyBarrier:    cfg.dirtyBarrier,
 	}
 	if c.quiet <= 0 {
 		c.quiet = defaultCheckoutQuietWindow
@@ -868,6 +882,7 @@ func (c *CheckoutCoordinator) run() {
 				continue
 			}
 			c.cycle(lifetime)
+			admitted = c.admissionWait()
 		case <-admitted:
 			admitted = nil
 			if !claimed {
@@ -875,6 +890,7 @@ func (c *CheckoutCoordinator) run() {
 			}
 			claimed = false
 			c.cycle(lifetime)
+			admitted = c.admissionWait()
 		}
 	}
 }
@@ -882,10 +898,63 @@ func (c *CheckoutCoordinator) run() {
 // admissionWait is the channel the loop waits for build admission on, nil when
 // builds are already admitted.
 func (c *CheckoutCoordinator) admissionWait() <-chan struct{} {
+	if c.startupBuildPending() {
+		if c.gate.IsRequiredOpen() {
+			return nil
+		}
+		return c.gate.RequiredOpened()
+	}
 	if c.gate.Admitted() {
 		return nil
 	}
 	return c.gate.Opened()
+}
+
+func (c *CheckoutCoordinator) startupBuildPending() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.startupRequired
+}
+
+func (c *CheckoutCoordinator) startupBuildStatus() (pending bool, failure string) {
+	if c == nil {
+		return false, ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.startupRequired, c.startupFailure
+}
+
+func (c *CheckoutCoordinator) completeStartupBuild(out CheckoutCycle) {
+	if c == nil || out.Deferred || out.Rescheduled {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if out.Err != nil {
+		if !c.startupRequired || errors.Is(out.Err, context.Canceled) {
+			return
+		}
+		c.startupRequired = false
+		c.startupFailure = checkoutStartupFailureReason(out.Err)
+		return
+	}
+	if out.CommitGenerationID <= 0 || out.DirtyGenerationID <= 0 {
+		return
+	}
+	c.startupRequired = false
+	c.startupFailure = ""
+}
+
+func checkoutStartupFailureReason(err error) string {
+	var storageErr *store_sqlite.StorageError
+	if errors.As(err, &storageErr) {
+		return store_sqlite.SafeStorageFailureReason(err)
+	}
+	return "startup checkout reconciliation failed; see daemon log"
 }
 
 // deferCycle records a cycle the warmup gate held back. Nothing is read and
@@ -935,6 +1004,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	if out, settled := preflight(ctx); settled {
 		completed = out
+		c.completeStartupBuild(out)
 		recordCoordinatorCycle(out)
 		if c.cycleDone != nil {
 			c.cycleDone(out)
@@ -942,7 +1012,11 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 
-	release, err := c.gate.Acquire(ctx, ViewBuildBackground)
+	priority := ViewBuildBackground
+	if c.startupBuildPending() {
+		priority = ViewBuildRequired
+	}
+	release, err := c.gate.Acquire(ctx, priority)
 	if err != nil {
 		if errors.Is(err, ErrViewBuildQueueFull) {
 			c.logger.Debug("checkout coordinator: build deferred by admission capacity",
@@ -982,6 +1056,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	out := c.reconcile(ctx)
 	completed = out
+	c.completeStartupBuild(out)
 	recordCoordinatorCycle(out)
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
@@ -1219,6 +1294,28 @@ func (c *CheckoutCoordinator) prepareRehomeTo(
 	graphID string,
 	publish checkoutRehomePublisher,
 ) (CheckoutCycle, error) {
+	return c.prepareRehomeToWithAdmission(ctx, graphID, publish, false)
+}
+
+// prepareRehomeToAdmitted is the SetPrimary variant. SetPrimary acquires the
+// physical build lane before any family/checkout topology token, then holds it
+// across its batch. Reacquiring the non-reentrant gate here would self-deadlock;
+// acquiring it after topology would invert the order used by promotion and
+// demotion publication callbacks.
+func (c *CheckoutCoordinator) prepareRehomeToAdmitted(
+	ctx context.Context,
+	graphID string,
+	publish checkoutRehomePublisher,
+) (CheckoutCycle, error) {
+	return c.prepareRehomeToWithAdmission(ctx, graphID, publish, true)
+}
+
+func (c *CheckoutCoordinator) prepareRehomeToWithAdmission(
+	ctx context.Context,
+	graphID string,
+	publish checkoutRehomePublisher,
+	admitted bool,
+) (CheckoutCycle, error) {
 	var out CheckoutCycle
 	if c == nil {
 		return out, errors.New("indexer: no coordinator to rehome")
@@ -1235,9 +1332,13 @@ func (c *CheckoutCoordinator) prepareRehomeTo(
 		stopLifetimeCancel()
 		cancel()
 	}()
-	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
-	if err != nil {
-		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
+	release := func() {}
+	if !admitted {
+		var err error
+		release, err = c.gate.Acquire(ctx, ViewBuildRequired)
+		if err != nil {
+			return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
+		}
 	}
 	defer release()
 
@@ -1337,7 +1438,7 @@ func (c *CheckoutCoordinator) preparePromotion(
 		stopLifetimeCancel()
 		cancel()
 	}()
-	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
+	release, err := c.gate.Acquire(ctx, ViewBuildRequired)
 	if err != nil {
 		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
 	}

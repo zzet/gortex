@@ -43,6 +43,7 @@ func TestViewsStatusCountsTheCatalogByState(t *testing.T) {
 	assert.Equal(t, 0, views.Leases, "no view is materialized")
 	require.NotNil(t, views.BuildQueue)
 	assert.True(t, views.BuildQueue.Open)
+	assert.True(t, views.BuildQueue.RequiredOpen)
 	assert.False(t, views.BuildQueue.Active)
 	assert.Empty(t, views.RefViews, "this family has no ref views")
 	assert.NotEmpty(t, views.Counters, "the metric registry is not reaching the status block")
