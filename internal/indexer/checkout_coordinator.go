@@ -1678,9 +1678,20 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 		if err != nil {
 			return 0, err
 		}
-		if found && servableGeneration(row.State) && generationRowKey(row) == key {
-			c.retainCommit(ctx, key, row.GenerationID)
-			return row.GenerationID, nil
+		if found && servableGeneration(row.State) &&
+			row.OwnerKind == checkoutLayerOwnerKind &&
+			row.GenerationKind == CommitLayerGenerationKind {
+			// A fresh coordinator can inherit route A while the filesystem
+			// already names branch B. Preserve that persisted, still-servable
+			// commit before resolving B; otherwise releaseCommit sees an empty
+			// process-local cache and retires A, forcing a rebuild on the switch
+			// back. Retaining by the row's own identity also handles a canonical
+			// generation adopted from another checkout.
+			rowKey := generationRowKey(row)
+			c.retainCommit(ctx, rowKey, row.GenerationID)
+			if rowKey == key {
+				return row.GenerationID, nil
+			}
 		}
 	}
 

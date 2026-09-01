@@ -512,6 +512,97 @@ func TestCoordinatorReusesACommitLayerOnTheWayBack(t *testing.T) {
 	}
 }
 
+func TestCoordinatorFreshProcessRetainsRoutedCommitForSwitchBack(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	firstCoordinator := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	commitA := builderGit(t, f.worktree, "rev-parse", "HEAD")
+
+	first := coordinatorReconcile(t, firstCoordinator)
+	if !first.CommitBuilt || first.CommitGenerationID == 0 {
+		t.Fatalf("the first process did not build A: %+v", first)
+	}
+	generationA := first.CommitGenerationID
+
+	// The daemon is down while the checkout moves to B. The replacement
+	// coordinator therefore inherits route A with an empty in-memory cache.
+	f.commitTreeB()
+	restarted := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	second := coordinatorReconcile(t, restarted)
+	if !second.CommitBuilt || second.CommitGenerationID == generationA {
+		t.Fatalf("the fresh process did not build and route B: %+v", second)
+	}
+	if _, found := f.generation(generationA); !found {
+		t.Fatalf("the fresh process retired routed A generation %d while switching to B", generationA)
+	}
+
+	builderGit(t, f.worktree, "checkout", "--detach", commitA)
+	third := coordinatorReconcile(t, restarted)
+	if third.CommitBuilt || !third.CommitReused {
+		t.Fatalf("the post-restart switch back rebuilt A: %+v", third)
+	}
+	if third.CommitGenerationID != generationA {
+		t.Fatalf("the post-restart switch back routed generation %d, want %d",
+			third.CommitGenerationID, generationA)
+	}
+
+	commits := 0
+	for _, row := range f.generations() {
+		if row.GenerationKind == CommitLayerGenerationKind {
+			commits++
+		}
+	}
+	if commits != 2 {
+		t.Fatalf("%d commit generations exist for two trees across restart", commits)
+	}
+}
+
+func BenchmarkCoordinatorSwitchesBetweenRestartRetainedCommits(b *testing.B) {
+	f := newCoordinatorFixture(b)
+	first := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	initial := first.reconcile(context.Background())
+	if initial.Err != nil || initial.CommitGenerationID == 0 {
+		b.Fatalf("initial A reconcile: %+v", initial)
+	}
+	treeB := f.commitTreeB()
+	c := f.inertCoordinator(b, CheckoutCoordinatorConfig{})
+	second := c.reconcile(context.Background())
+	if second.Err != nil || second.CommitGenerationID == 0 || second.CommitGenerationID == initial.CommitGenerationID {
+		b.Fatalf("fresh-process B reconcile: %+v", second)
+	}
+	ctx := context.Background()
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		b.Fatalf("primary base: %v", err)
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil || !found {
+		b.Fatalf("route: found=%t err=%v", found, err)
+	}
+	targets := [...]string{f.treeA, treeB}
+	var physicalBuilds int64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		out := CheckoutCycle{}
+		generationID, reconcileErr := c.reconcileCommitSlot(
+			ctx, base, targets[i%len(targets)], &route, &out,
+		)
+		if out.CommitBuilt {
+			physicalBuilds++
+		}
+		if reconcileErr != nil || generationID == 0 || !out.CommitReused {
+			b.Fatalf("switch %d: generation=%d cycle=%+v err=%v",
+				i, generationID, out, reconcileErr)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(physicalBuilds)/float64(b.N), "physical-builds/op")
+	if physicalBuilds != 0 {
+		b.Fatalf("%d physical builds across %d retained switches", physicalBuilds, b.N)
+	}
+}
+
 func TestCoordinatorPublishesCheckoutHeadBeforeTheSwitchedRoute(t *testing.T) {
 	f := newCoordinatorFixture(t)
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
