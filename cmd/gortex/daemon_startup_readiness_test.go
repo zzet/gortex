@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -139,6 +140,66 @@ func TestStartupViewReadinessWatcherRetriesProbeWithoutTransitionEdge(t *testing
 	require.GreaterOrEqual(t, calls.Load(), int32(3))
 	require.True(t, controller.IsReady())
 	require.True(t, controller.IsEnriched())
+}
+
+func TestStartupViewReadinessWatcherRetriesBranchRouteBuildWithoutTransitionEdge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		monitor := newStartupViewReadinessMonitor([]string{"/repo"})
+		monitor.retryInitial = time.Second
+		monitor.retryMax = 4 * time.Second
+		var calls, routePhase atomic.Int32
+		// A coordinator-owned commit/dirty rebuild, including a branch switch,
+		// reports Building and later Ready but does not emit a mode-transition
+		// event. The readiness timer is the liveness edge for that path.
+		probe := func(context.Context, string) (daemon.TrackReadiness, error) {
+			calls.Add(1)
+			if routePhase.Load() < 2 {
+				return daemon.TrackReadiness{
+					State: daemon.TrackReadinessBuilding,
+					View:  &daemon.ProbeView{CheckoutID: "checkout-1"},
+				}, nil
+			}
+			return daemon.TrackReadiness{
+				State: daemon.TrackReadinessReady,
+				View:  &daemon.ProbeView{CheckoutID: "checkout-1", Exact: true},
+			}, nil
+		}
+		controller := &realController{}
+		controller.setStartupViewReadiness(monitor.snapshot(context.Background(), probe))
+		controller.MarkEnriched(time.Second)
+		monitor.onConfirmedComplete(func() {})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			watchStartupViewReadiness(ctx, nil, controller, monitor, probe)
+		}()
+		monitor.finishInitialSnapshot()
+		synctest.Wait()
+		require.Equal(t, int32(2), calls.Load(), "initial confirming probe did not run")
+		require.False(t, controller.IsReady())
+
+		// The checkout switches from main to feature while the replacement
+		// route is still building. There is deliberately no observer edge.
+		routePhase.Store(1)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.Equal(t, int32(3), calls.Load(), "clean Building state was not retried")
+		require.False(t, controller.IsReady())
+
+		routePhase.Store(2)
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("completed branch route did not release startup readiness")
+		}
+		require.Equal(t, int32(4), calls.Load())
+		require.True(t, controller.IsReady())
+		require.True(t, controller.IsEnriched())
+	})
 }
 
 func TestStartupViewReadinessWatcherStopsRetryTimerOnCancellation(t *testing.T) {
@@ -703,6 +764,32 @@ func BenchmarkStartupViewReadinessSnapshot256(b *testing.B) {
 	for range b.N {
 		if snapshot := monitor.snapshot(context.Background(), probe); !snapshot.complete() {
 			b.Fatal("ready cohort regressed")
+		}
+	}
+}
+
+func BenchmarkStartupViewReadinessPendingRetryPoll256(b *testing.B) {
+	paths := make([]string, 256)
+	states := make(map[string]daemon.TrackReadiness, len(paths))
+	for i := range paths {
+		path := fmt.Sprintf("/repo/%03d", i)
+		paths[i] = path
+		states[path] = daemon.TrackReadiness{
+			State: daemon.TrackReadinessBuilding,
+			View:  &daemon.ProbeView{CheckoutID: fmt.Sprintf("checkout-%03d", i)},
+		}
+	}
+	monitor := newStartupViewReadinessMonitor(paths)
+	probe := func(_ context.Context, path string) (daemon.TrackReadiness, error) {
+		return states[path], nil
+	}
+	require.Equal(b, 256, monitor.snapshot(context.Background(), probe).Building)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if snapshot := monitor.snapshot(context.Background(), probe); snapshot.Building != 256 {
+			b.Fatalf("building cohort changed: %+v", snapshot)
 		}
 	}
 }

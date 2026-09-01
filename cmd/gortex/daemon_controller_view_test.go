@@ -1170,6 +1170,22 @@ func BenchmarkTrackReadinessGenerationBackedDedicated(b *testing.B) {
 	}
 }
 
+func BenchmarkTrackReadinessRoutedWorktree(b *testing.B) {
+	f := newProbeFixture(b)
+	f.publishDedicatedBase(b)
+	f.routeWorktree(b)
+	ctx := context.Background()
+	probed := filepath.Join(f.worktreeRoot, probeFile)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		readiness, err := f.controller.TrackReadiness(ctx, probed)
+		if err != nil || readiness.State != daemon.TrackReadinessReady {
+			b.Fatalf("readiness=%+v err=%v", readiness, err)
+		}
+	}
+}
+
 func TestProbeOfDedicatedCheckoutInRemovalGraceIsLabeledFallback(t *testing.T) {
 	f := newProbeFixture(t)
 	baseID := f.publishDedicatedBase(t)

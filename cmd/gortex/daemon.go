@@ -570,7 +570,13 @@ func watchStartupViewReadiness(
 			snapshot := monitor.snapshot(ctx, probe)
 			controller.setStartupViewReadiness(snapshot)
 			publishStartupViewReadiness(state, controller)
-			if snapshot.ProbeErrors > 0 {
+			// Transition observers cover explicit promotion/demotion workers, but
+			// ordinary checkout route construction is owned by the coordinator and
+			// has no mode-transition edge. Keep one bounded safety poll armed while
+			// any frozen member is still building so a successfully published route
+			// cannot leave startup readiness parked forever. The exponential cap
+			// keeps a genuinely long build to one cohort probe every retryMax.
+			if snapshot.Building > 0 || snapshot.ProbeErrors > 0 {
 				scheduleRetry()
 			} else {
 				stopRetry()
