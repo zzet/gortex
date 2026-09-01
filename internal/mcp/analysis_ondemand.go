@@ -106,34 +106,29 @@ func analysisPendingPayload(a AnalysisAvailability, collection string) map[strin
 // eagerly both delays readiness and keeps the result resident. This is the
 // path that replaces that eager pass.
 func (s *Server) ensureAnalysis() AnalysisAvailability {
-	// RunAnalysis holds analysisMu for the whole pass, so a plain RLock here
-	// would queue behind it and block the caller for minutes — the exact
-	// failure this path exists to prevent. Failing to take the lock is
-	// itself the answer: a writer holds it, so a pass is in flight.
-	if !s.analysisMu.TryRLock() {
-		return AnalysisAvailability{Running: true, RetryAfter: s.analysisRun.retryHint()}
-	}
-	ready := s.analysisSnapshotCurrentLocked()
-	s.analysisMu.RUnlock()
-	if ready {
-		return AnalysisAvailability{Ready: true}
+	// A lifecycle request retained behind a startup hold is stale by definition,
+	// even if the last durable analysis generation still matches the currently
+	// visible base graph. On-demand callers bypass the hold and start the shared
+	// single-flight immediately.
+	pendingLifecycle := s.analysisSchedulePending()
+	if !pendingLifecycle {
+		// RunAnalysis holds analysisMu for the whole pass, so a plain RLock here
+		// would queue behind it and block the caller for minutes — the exact
+		// failure this path exists to prevent. Failing to take the lock is
+		// itself the answer: a writer holds it, so a pass is in flight.
+		if !s.analysisMu.TryRLock() {
+			return AnalysisAvailability{Running: true, RetryAfter: s.analysisRun.retryHint()}
+		}
+		ready := s.analysisSnapshotCurrentLocked()
+		s.analysisMu.RUnlock()
+		if ready {
+			return AnalysisAvailability{Ready: true}
+		}
 	}
 
-	// Exactly one caller starts the pass; the rest join the same wait.
-	if s.analysisRun.running.CompareAndSwap(false, true) {
-		s.analysisRun.startedAt.Store(time.Now().UnixNano())
-		go func() {
-			started := time.Now()
-			defer func() {
-				s.analysisRun.lastTook.Store(int64(time.Since(started)))
-				s.analysisRun.startedAt.Store(0)
-				s.analysisRun.running.Store(false)
-			}()
-			if s.logger != nil {
-				s.logger.Info("analysis: starting on-demand pass")
-			}
-			s.RunAnalysis()
-		}()
+	started := s.startBackgroundAnalysis("on-demand")
+	return AnalysisAvailability{
+		Running:    started || s.analysisRun.running.Load(),
+		RetryAfter: s.analysisRun.retryHint(),
 	}
-	return AnalysisAvailability{Running: true, RetryAfter: s.analysisRun.retryHint()}
 }

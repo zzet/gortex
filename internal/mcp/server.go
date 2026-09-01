@@ -211,10 +211,18 @@ type Server struct {
 	hotspotsReady   bool
 	hotspotsBuildMu sync.Mutex
 	analysisEpoch   uint64
-	// analysisRun tracks the background on-demand analysis pass so a tool
-	// call can report "running, retry in Ns" instead of blocking for
-	// minutes on a whole-graph computation.
+	// analysisRun tracks the shared background analysis pass so on-demand and
+	// lifecycle-triggered work join one single-flight instead of queueing whole-
+	// graph scans behind each other.
 	analysisRun analysisRunState
+	// analysisSchedule batches lifecycle-triggered analysis while the exact
+	// startup cohort is publishing. It is deliberately independent from
+	// analysisMu: scheduling must remain O(1) while a minutes-long pass runs.
+	analysisSchedule scheduledAnalysisState
+	// analysisRunOverride is a narrow scheduler test seam. Production leaves it
+	// nil and runs RunAnalysis; tests use it to count and pause launches without
+	// materializing a whole graph.
+	analysisRunOverride func()
 	// hotspotsFn is a test seam for deterministic concurrency/invalidation
 	// tests. Production leaves it nil and uses analysis.FindHotspots.
 	hotspotsFn func(graph.Reader, *analysis.CommunityResult, float64) []analysis.HotspotEntry
@@ -2862,7 +2870,13 @@ func (s *Server) RunAnalysis() {
 	}()
 
 	s.analysisMu.Lock()
+	// Capture the latest lifecycle request at the same boundary as the graph
+	// snapshot. A notification that lands after this point remains pending and
+	// schedules one follow-up; notifications already visible here are covered by
+	// this pass even when they arrived while startup analysis was held.
+	analysisSnapshotEpoch := s.analysisScheduleSnapshotEpoch()
 	analysisMetrics := s.populateAnalysisLocked()
+	s.analysisScheduleMarkSatisfied(analysisSnapshotEpoch)
 	s.analysisMu.Unlock()
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol

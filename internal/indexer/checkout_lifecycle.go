@@ -57,8 +57,17 @@ var errNoCatalog = errors.New("indexer: this store keeps no checkout catalog")
 type LifecycleNotifier interface {
 	// InvalidateSessionScopes drops cached per-session workspace bindings.
 	InvalidateSessionScopes()
-	// RunAnalysis recomputes the graph-wide rollups.
+	// RunAnalysis recomputes the graph-wide rollups. It remains the fallback
+	// for embedders and tests that do not implement LifecycleAnalysisScheduler.
 	RunAnalysis()
+}
+
+// LifecycleAnalysisScheduler is the optional non-blocking analysis fan-out.
+// The MCP server implements it so a cold startup cohort can coalesce many
+// lifecycle publications into one whole-graph pass without weakening the
+// minimal LifecycleNotifier contract used by embedders and tests.
+type LifecycleAnalysisScheduler interface {
+	ScheduleAnalysis()
 }
 
 // RepoWatcher is the part of the live file watcher the lifecycle drives.
@@ -4856,6 +4865,10 @@ func (l *CheckoutLifecycle) notifyTrackedSetChanged() {
 		return
 	}
 	notifier.InvalidateSessionScopes()
+	if scheduler, ok := notifier.(LifecycleAnalysisScheduler); ok {
+		scheduler.ScheduleAnalysis()
+		return
+	}
 	notifier.RunAnalysis()
 }
 

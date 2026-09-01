@@ -843,6 +843,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 	// The monitor must observe Seed transitions, but its exact cohort is frozen
 	// only after Seed from the one ownership plan shared with legacy warmup.
 	startupReadiness := newStartupViewReadinessMonitor(nil)
+	// Seed and exact-view publication can emit one tracked-set notification per
+	// configured repository. Hold only those scheduled whole-graph passes until
+	// the frozen cohort is terminal; session-scope invalidation remains immediate.
+	releaseStartupAnalysis, cancelStartupAnalysis := func() {}, func() {}
+	if state.mcpServer != nil {
+		releaseStartupAnalysis, cancelStartupAnalysis = state.mcpServer.HoldScheduledAnalysis()
+	}
 	warmupCtx, cancelWarmup := context.WithCancel(context.Background())
 	startupReadinessCtx, cancelStartupReadiness := context.WithCancel(warmupCtx)
 	state.lifecycle.SetModeTransitionObserver(startupReadiness.observe)
@@ -877,6 +884,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 		stopJanitor()
 		warmupWG.Wait()
 		startupReadinessWG.Wait()
+		// Process teardown discards the startup hold without launching minutes
+		// of analysis against a store that is about to close. The dirty epoch is
+		// retained until the server itself is destroyed.
+		cancelStartupAnalysis()
 		// Warmup is the only event-hub Run producer. Join it before stopping
 		// and waiting the hub so Add can never race Wait.
 		stopEventHub()
@@ -1238,6 +1249,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 			if warmupCtx.Err() != nil {
 				return
 			}
+			// Open the general build lane before launching the one coalesced
+			// analysis pass; neither derived analysis nor its memory burst is part
+			// of exact-view readiness.
+			defer releaseStartupAnalysis()
 			// Required lifecycle publication has reached the exact startup
 			// cohort. Release ref and background work only after finalizers have
 			// observed that settled graph. The defer keeps the lane live even if a
@@ -1295,6 +1310,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) (retErr error) {
 				zap.Int("expected", terminal.Expected),
 				zap.Int("ready", terminal.Ready),
 				zap.Int("failed", terminal.Failed))
+			releaseStartupAnalysis()
 		}
 	}()
 
