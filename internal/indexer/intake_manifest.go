@@ -89,7 +89,6 @@ func (idx *Indexer) dryRunIntake(ctx context.Context, root string) (*IntakeManif
 		return nil, err
 	}
 
-	maxSize := idx.config.MaxFileSize
 	// Apply the same corpus-admission gates the real index walk uses, so the
 	// manifest's admitted/skipped split matches what IndexCtx would actually
 	// do — oversized documents and (by default) data assets are reported as
@@ -97,8 +96,10 @@ func (idx *Indexer) dryRunIntake(ctx context.Context, root string) (*IntakeManif
 	// index.skip_untracked_assets is on, untracked assets as untracked_asset.
 	// Without this the report would still count gigabytes of non-source files
 	// as admitted even though the indexer now drops them (#120).
-	contentGate := idx.newContentAdmissionGate()
-	untrackedGate := idx.newUntrackedAssetGate(ctx, absRoot)
+	gates := admissionGates{
+		untracked: idx.newUntrackedAssetGate(ctx, absRoot),
+		content:   idx.newContentAdmissionGate(),
+	}
 	manifest := &IntakeManifest{
 		SchemaVersion:           "gortex.index_intake.v1",
 		RawPathsIncluded:        false,
@@ -128,20 +129,7 @@ func (idx *Indexer) dryRunIntake(ctx context.Context, root string) (*IntakeManif
 		manifest.FilesSeen++
 		manifest.BytesSeen += size
 
-		reason := ""
-		lang, ok := idx.effectiveLanguage(path, nil)
-		if !ok {
-			reason = "no_language"
-		} else if idx.shouldExclude(path, absRoot, false) {
-			reason = "excluded"
-		} else if maxSize > 0 && size > maxSize {
-			reason = "max_file_size"
-		} else if r, skip := untrackedGate.skip(lang, path); skip {
-			reason = r
-		} else if r, skip := contentGate.skip(lang, size); skip {
-			reason = r
-		}
-
+		_, reason := idx.admitFile(path, absRoot, size, gates)
 		if reason != "" {
 			manifest.FilesSkipped++
 			manifest.BytesSkipped += size

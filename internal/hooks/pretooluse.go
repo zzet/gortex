@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -500,12 +501,12 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		return enrichResult{}
 	}
 
-	fileIndexed, symbolCount := queryFileIndexed(cwd, filePath)
+	st := queryFileIndexScope(cwd, filePath)
 
 	// If the file is indexed, BLOCK the read and provide graph alternatives.
-	if fileIndexed {
+	if st.Indexed {
 		var reason strings.Builder
-		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Call `explore` first, then use `read` instead:\n", filePath, symbolCount)
+		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Call `explore` first, then use `read` instead:\n", filePath, st.Count)
 		reason.WriteString("  - `read(target:{symbol:\"<id>\"})` — one symbol\n")
 		reason.WriteString("  - `read(target:{symbols:[\"<id>\"]})` — several symbols\n")
 		reason.WriteString("  - `read(operation:\"editing_context\", target:{file:\"<path>\"})` — full editing context\n")
@@ -523,7 +524,14 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		}
 	}
 
-	// File not indexed — allow with advisory.
+	// Stay silent when the graph has no answer to redirect to: the file is
+	// unindexable by design, it is indexed but defines no symbols, or no
+	// usable verdict came back at all.
+	if st.noGraphAnswer() {
+		return enrichResult{}
+	}
+
+	// File not indexed but indexable — allow with advisory.
 	var guidance strings.Builder
 	guidance.WriteString("[Gortex] Use `explore` first, then `read` for indexed source:\n")
 	guidance.WriteString("  - one symbol: `read(target:{symbol:\"<id>\"})`\n")
@@ -650,14 +658,34 @@ func hookSearchScope(cwd string, toolInput map[string]any) searchScopeVerdict {
 		if !looksLikeSourceFile(scope) {
 			return searchScopeNonSource
 		}
-		if indexed, _ := queryFileIndexed(cwd, scope); indexed {
+		fs := queryFileIndexScope(cwd, scope)
+		// Before Indexed: the tools this deny redirects to apply the same
+		// filter, so denying would trade a working search for an empty one.
+		if fs.OutOfScope {
+			return searchScopeNonSource
+		}
+		// Symbolless denies here but not on the read doors: search(text),
+		// search(files) and explore(outline) all have rows for a file the
+		// graph holds, symbol-free or not.
+		if fs.Indexed || fs.Symbolless {
 			return searchScopeIndexed
 		}
+		if fs.NeverIndexable {
+			return searchScopeNonSource
+		}
+		// A failed probe is not evidence. NonSource here would make narrowing
+		// `path` to one file a way to switch enforcement off on a hiccup.
 		return searchScopeUnproven
 	}
 
-	if scopeTrackedFn(cwd, scope) {
+	// A directory scope. scopeTrackedFn proves whether it holds indexed source
+	// at all
+	hasSource, probeOK := scopeTrackedFn(cwd, scope)
+	switch {
+	case hasSource:
 		return searchScopeIndexed
+	case probeOK:
+		return searchScopeNonSource
 	}
 	return searchScopeUnproven
 }
@@ -1020,45 +1048,150 @@ func fileOutlineWithin(cwd, filePath string, timeout time.Duration) (*hookFileSu
 	}
 }
 
-// queryFileIndexed reports whether the file at filePath is indexed by the
-// daemon, with the symbol count when it is. cwd scopes the probe to the
-// right workspace (and absolutises a relative filePath). A zero return
-// (false, 0) is the "no signal" case — daemon unreachable, malformed
-// response, or file genuinely not indexed; callers treat all three the
-// same (fall through to soft guidance).
+// fileIndexStatus is the daemon's per-file verdict from one get_file_summary
+// probe. The flags are independent facts about the file, not a ranking:
 //
-// fileIndexedFn is the seam tests stub; production routes through the
-// daemon's MCP socket (the old HTTP :8765 /api/graph/file endpoint this
-// used to hit was removed when the web API migrated to the daemon, which
-// is why the hard deny silently stopped firing for every agent).
+//   - Indexed: the graph holds Count definition symbols for the file, so a
+//     graph tool can answer a read of it. The only state that earns a deny.
+//   - NeverIndexable: the walk will never hold it — exclude rule, unclaimed
+//     language, size cap, or a corpus-admission gate. Deliberately not named
+//     Excluded: the server's wire field of that name is the narrower "a RULE
+//     is the reason" flag, and this is its union with `unindexable`.
+//   - Symbolless: the graph holds the file, it just defines no symbols
+//     (doc-only or constants-only). The locators still have rows for it.
+//   - OutOfScope: the graph holds the file, but the active repo/project/ref
+//     filter hides it — so the locators have nothing for it either.
+//   - Tracked: some tracked repo owns the path.
+//   - OwnershipUnknown: Tracked is false only because the tracked-repo
+//     registry could not be read.
+//   - ProbeOK: a usable verdict came back at all.
+//
+// ProbeOK with neither NeverIndexable nor Symbolless means tracked, indexable,
+// not indexed yet — the one state that earns a read advisory.
+//
+// Known gap: the daemon only reports the not-indexed flags on a response
+// carrying no definition symbols, so a tree excluded AFTER indexing still
+// reads as Indexed until a re-index drops the stale nodes. The eviction is the
+// better fix and lives in the indexer.
+type fileIndexStatus struct {
+	Indexed          bool
+	NeverIndexable   bool
+	Symbolless       bool
+	OutOfScope       bool
+	Tracked          bool
+	OwnershipUnknown bool
+	ProbeOK          bool
+	Count            int
+}
+
+// noGraphAnswer reports whether a redirect to graph tools has nothing true to
+// say. READ-shaped doors only (Read, Bash cat/head/tail) — they redirect to
+// symbol lookups; the search doors answer for symbol-free files too.
+//
+// A missing verdict is not proof: !ProbeOK also covers a wedged daemon and an
+// unparseable body. Silence only when the daemon is down and the advisory would
+// name unreachable tools, or when nothing tracks the path and the registry was
+// readable enough to say so.
+func (st fileIndexStatus) noGraphAnswer() bool {
+	if st.NeverIndexable || st.Symbolless || st.OutOfScope {
+		return true
+	}
+	if st.ProbeOK {
+		return false
+	}
+	if !daemonReachableFn() {
+		return true
+	}
+	return !st.Tracked && !st.OwnershipUnknown
+}
+
+// queryFileIndexed is a shape adapter over fileIndexScopeFn for the WRITE
+// doors, which branch on "does the graph hold symbols for this file" and
+// nothing else: a file the daemon cannot place is not one to redirect a write
+// away from. Read-shaped callers must use queryFileIndexScope instead — they
+// need to tell "excluded by design" and "no verdict" apart from "tracked but
+// not indexed yet", and this signature collapses all three to (false, 0).
 func queryFileIndexed(cwd, filePath string) (bool, int) {
-	return fileIndexedFn(cwd, filePath)
+	st := fileIndexScopeFn(cwd, filePath)
+	return st.Indexed, st.Count
+}
+
+// queryFileIndexScope returns the full per-file verdict, for callers that must
+// tell "excluded by design" apart from "tracked but not yet indexed".
+func queryFileIndexScope(cwd, filePath string) fileIndexStatus {
+	return fileIndexScopeFn(cwd, filePath)
 }
 
 // fileIndexedTimeout bounds the daemon probe so a wedged daemon never
 // stalls the PreToolUse critical path.
 const fileIndexedTimeout = 2 * time.Second
 
-var fileIndexedFn = fileIndexedViaDaemon
+var fileIndexScopeFn = fileIndexScopeViaDaemon
 
-// fileIndexedViaDaemon asks the daemon's get_file_summary tool how many
-// definition symbols the file carries, over the AF_UNIX MCP channel. The
-// graph keys files by their repo-relative path, so the absolute file path
-// is resolved against its tracked-repo root and the root-relative path is
-// what gets queried (with the handshake CWD set to that root for scoping).
+// fileIndexScopeViaDaemon asks the daemon's get_file_summary tool for the
+// file's verdict over the AF_UNIX MCP channel. The graph keys files by their
+// repo-relative path, so the absolute file path is resolved against its
+// tracked-repo root and the root-relative path is what gets queried (with the
+// handshake CWD set to that root for scoping). Both the definition-symbol count
+// and the exclusion flag ride the one response — no extra round-trip.
 //
 // TODO(hook-local perf): each probe opens a fresh MCP connection, so a wide
 // postGlob still pays one dial per file even though repoRootForFile's status
 // fetch is now memoised. Reusing a single connection across the batch — or a
 // count-only probe that skips get_file_summary's ensureFresh re-index on the
 // hot path — is the next optimisation. Deferred so the test seam
-// (fileIndexedFn) stays a simple per-file func; left to the maintainer.
-func fileIndexedViaDaemon(cwd, filePath string) (bool, int) {
+// (fileIndexScopeFn) stays a simple per-file func; left to the maintainer.
+func fileIndexScopeViaDaemon(cwd, filePath string) fileIndexStatus {
+	// Ownership is resolved separately from the probe: "nothing tracks it" and
+	// "the probe didn't come back" mean opposite things to the caller. The same
+	// split one level deeper — an unreadable registry proves nothing either.
+	if _, _, tracked := resolveTrackedRel(cwd, filePath); !tracked {
+		return fileIndexStatus{OwnershipUnknown: !trackedRegistryKnownFn()}
+	}
 	resp, ok := daemonFileSummaryRaw(cwd, filePath)
 	if !ok {
-		return false, 0
+		return fileIndexStatus{Tracked: true}
 	}
-	return parseFileSummaryIndexed(resp)
+	st := parseFileSummaryScope(resp)
+	st.Tracked = true
+	return st
+}
+
+// trackedRegistryKnownFn is the seam tests replace.
+var trackedRegistryKnownFn = trackedRegistryKnown
+
+// trackedRegistryKnown distinguishes "the registry says no repo owns this" from
+// "the registry could not be read" — cachedTrackedRepos returns the same nil
+// slice for both. An empty list is a verdict only when the status call behind
+// it succeeded.
+func trackedRegistryKnown() bool {
+	if len(hookTrackedReposFn()) > 0 {
+		return true
+	}
+	status, err := cachedDaemonStatus()
+	return err == nil && status != nil
+}
+
+// resolveTrackedRel maps a (cwd, filePath) pair onto the tracked-repo root that
+// owns it and the root-relative path the graph keys files by. ok is false for a
+// relative path with no cwd and for a path outside every tracked repo.
+func resolveTrackedRel(cwd, filePath string) (root, rel string, ok bool) {
+	abs := filePath
+	if !filepath.IsAbs(abs) {
+		if cwd == "" {
+			return "", "", false
+		}
+		abs = filepath.Join(cwd, abs)
+	}
+	root = repoRootForFile(abs)
+	if root == "" {
+		return "", "", false
+	}
+	rel, err := filepath.Rel(root, abs)
+	if err != nil {
+		return "", "", false
+	}
+	return root, rel, true
 }
 
 // daemonFileSummaryRaw resolves filePath to its tracked-repo root, asks the
@@ -1068,27 +1201,10 @@ func fileIndexedViaDaemon(cwd, filePath string) (bool, int) {
 // The graph keys files by their repo-relative path, so the absolute path is
 // resolved against its tracked-repo root and the root-relative path is what
 // gets queried (with the handshake CWD set to that root for scoping).
-//
-// Shared by the PreToolUse file-indexed probe (fileIndexedViaDaemon) and the
-// PostToolUse enrichment (fileSummaryViaDaemon) so both stay on the daemon
-// socket — the HTTP :8765 /api/graph/* API they used to hit was removed when
-// the web surface migrated to the daemon (#241).
 func daemonFileSummaryRaw(cwd, filePath string) ([]byte, bool) {
-	abs := filePath
-	if !filepath.IsAbs(abs) {
-		if cwd == "" {
-			return nil, false
-		}
-		abs = filepath.Join(cwd, abs)
-	}
-
-	root := repoRootForFile(abs)
-	if root == "" {
-		return nil, false // outside every tracked repo → not indexed
-	}
-	rel, err := filepath.Rel(root, abs)
-	if err != nil {
-		return nil, false
+	root, rel, ok := resolveTrackedRel(cwd, filePath)
+	if !ok {
+		return nil, false // no cwd for a relative path, or outside every tracked repo
 	}
 
 	client, err := daemon.Dial(hookMCPHandshake(root))
@@ -1171,36 +1287,58 @@ func repoRootForFile(abs string) string {
 	return repo.Path
 }
 
-// parseFileSummaryIndexed unwraps a get_file_summary tools/call response —
-// JSON-RPC envelope → first content block (the JSON payload as text) →
-// total_nodes. get_file_summary strips the file/import nodes, so
-// total_nodes is the definition-symbol count; a not-indexed file comes back
-// as a tool error / guidance text, which fails the parse → (false, 0).
-func parseFileSummaryIndexed(resp []byte) (bool, int) {
-	var rpc struct {
-		Result struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-			IsError bool `json:"isError"`
-		} `json:"result"`
+// fileNotIndexedCondition is the recoverable-guidance condition code
+// get_file_summary returns for a file with no indexed symbols. The scope flags
+// below are only trusted on a payload that actually carries it: `data` is a
+// free-form map on the server side, so any other guidance reachable from this
+// tool that happens to grow an `excluded` key would otherwise silence the read
+// door for genuinely indexed source, and nothing would fail.
+const fileNotIndexedCondition = "file_not_indexed"
+
+// parseFileSummaryScope turns one get_file_summary tools/call response into
+// the per-file verdict — JSON-RPC envelope → first content block (the JSON
+// payload as text) → either a summary (total_nodes, the definition-symbol
+// count after the handler strips file/import nodes) or the file_not_indexed
+// guidance and its scope flags. encoding/json ignores unknown fields, so both
+// shapes decode in a single pass.
+//
+// Every failure to reach a usable payload returns the zero value, whose
+// ProbeOK is false: an unreachable bridge, an isError frame (get_file_summary
+// converts its own recovered panics into one), and an unparseable body are all
+// "no verdict", never "not indexed". Conflating the two is what made a
+// daemon-side crash produce a confident advisory.
+func parseFileSummaryScope(resp []byte) fileIndexStatus {
+	text := parseToolCallText(resp)
+	if text == "" {
+		return fileIndexStatus{}
 	}
-	if err := json.Unmarshal(resp, &rpc); err != nil {
-		return false, 0
+	var payload struct {
+		TotalNodes int    `json:"total_nodes"`
+		Condition  string `json:"condition"`
+		Data       struct {
+			Excluded    bool `json:"excluded"`
+			Unindexable bool `json:"unindexable"`
+			Indexed     bool `json:"indexed"`
+			OutOfScope  bool `json:"out_of_scope"`
+		} `json:"data"`
 	}
-	if rpc.Result.IsError || len(rpc.Result.Content) == 0 {
-		return false, 0
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		return fileIndexStatus{}
 	}
-	var summary struct {
-		TotalNodes int `json:"total_nodes"`
+	st := fileIndexStatus{ProbeOK: true}
+	if payload.TotalNodes > 0 {
+		st.Indexed = true
+		st.Count = payload.TotalNodes
 	}
-	if err := json.Unmarshal([]byte(rpc.Result.Content[0].Text), &summary); err != nil {
-		return false, 0
+	if payload.Condition == fileNotIndexedCondition {
+		// Union: `excluded` is the narrow "a RULE is the reason" flag.
+		st.NeverIndexable = payload.Data.Excluded || payload.Data.Unindexable
+		st.OutOfScope = payload.Data.OutOfScope
+		// `indexed` covers both; only a symbol-free file leaves the locators
+		// able to answer, so the filtered one must not read as Symbolless.
+		st.Symbolless = payload.Data.Indexed && !payload.Data.OutOfScope
 	}
-	if summary.TotalNodes <= 0 {
-		return false, 0
-	}
-	return true, summary.TotalNodes
+	return st
 }
 
 // enrichBash classifies the Bash command and routes codebase-search shapes
@@ -1237,12 +1375,18 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 		return probeSymbolPattern("Bash", c.Pattern, defaultGrepGuidance())
 
 	case BashActionReadSource:
-		indexed, symbolCount := queryFileIndexed(cwd, c.Path)
-		if indexed {
+		// Bash is the door an agent falls back to the moment Read denies, so
+		// it has to reach the same verdict Read does — including the silences.
+		// The (indexed, count) adapter collapses "excluded by design" and "no
+		// verdict" into the not-indexed branch, which is how `cat` on a
+		// vendored file kept emitting a redirect to graph tools that will
+		// never hold it.
+		st := queryFileIndexScope(cwd, c.Path)
+		if st.Indexed {
 			var reason strings.Builder
 			fmt.Fprintf(&reason,
 				"[Gortex] BLOCKED: Bash `%s %s` reads indexed source (%d symbols). Use graph tools instead:\n",
-				c.Primary, c.Path, symbolCount)
+				c.Primary, c.Path, st.Count)
 			reason.WriteString("  - one symbol: `read(target:{symbol:\"<id>\"})`\n")
 			reason.WriteString("  - file overview: `read(operation:\"summary\", target:{file:\"<path>\"})`\n")
 			reason.WriteString("  - before editing: `read(operation:\"editing_context\", target:{file:\"<path>\"})`\n")
@@ -1250,7 +1394,10 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 			reason.WriteString(toolref.MCPRequiredLine())
 			return enrichResult{deny: true, reason: reason.String()}
 		}
-		// Not indexed — soft guidance so Bash proceeds.
+		if st.noGraphAnswer() {
+			return enrichResult{}
+		}
+		// Tracked, indexable, not indexed yet — soft guidance so Bash proceeds.
 		var g strings.Builder
 		g.WriteString("[Gortex] Use `read` instead of Bash cat/head/tail for indexed source:\n")
 		g.WriteString("  - `read(target:{symbol:\"<id>\"})` for one symbol; use operation `summary` for an overview or `editing_context` before editing\n")
@@ -1308,50 +1455,156 @@ func firstIndexedWriteTarget(writes []BashWrite, cwd string) (BashWrite, int, bo
 // without a real socket. Production reads daemon.IsRunning.
 var daemonReachableFn = daemon.IsRunning
 
-// scopeTrackedFn proves that a Grep/Glob scope contains at least one indexed
-// source file. Tests replace it so fallback cases stay deterministic.
+// scopeTrackedFn asks whether a Grep/Glob directory scope contains at least
+// one indexed source file. The second return separates "asked, and the answer
+// is no" from "could not ask" — without it a daemon hiccup is indistinguishable
+// from a proven-empty vendored tree, and the caller cannot tell whether
+// silence or the historical pattern probe is the right posture. Tests replace
+// it so fallback cases stay deterministic.
 var scopeTrackedFn = scopeTrackedViaDaemon
 
-func scopeTrackedViaDaemon(cwd, scope string) bool {
+func scopeTrackedViaDaemon(cwd, scope string) (hasSource, probeOK bool) {
 	if !daemonReachableFn() {
-		return false
+		return false, false
 	}
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
 		scope = cwd
 	}
 	if scope == "" {
-		return false
+		return false, false
 	}
 	if !filepath.IsAbs(scope) {
 		if cwd == "" {
-			return false
+			return false, false
 		}
 		scope = filepath.Join(cwd, scope)
 	}
 	scope = filepath.Clean(scope)
 	info, err := os.Stat(scope)
 	if err != nil || !info.IsDir() {
-		return false
+		return false, false
 	}
 	root := repoRootForFile(scope)
 	if root == "" {
-		return false
+		return false, false
 	}
 	rel, err := filepath.Rel(root, scope)
 	if err != nil {
-		return false
+		return false, false
 	}
+	if rel == "." {
+		rel = ""
+	}
+	return scopeTrackedFromProbes(rel, func(at string) (bool, bool) {
+		return findFilesProbeFn(root, at)
+	}, func() (fileIndexStatus, scopeWitness) {
+		return scopeWitnessFn(cwd, scope)
+	})
+}
 
+// scopeTrackedFromProbes turns the find_files answer for a scope into the scope
+// verdict. Split from the transport so the decision is testable without a daemon.
+//
+// Zero hits is not proof of a vendored tree: a warming graph, a never-indexed
+// repo and a repo/project filter answer identically. Nor is corroborating
+// against the whole repo — "some file in this repo is indexed" holds while the
+// scope itself is mid-walk. Only the scope's own witness separates the cases: an
+// excluded tree answers NeverIndexable, an unreached one answers "tracked,
+// indexable, not indexed yet", and only the first is proof.
+func scopeTrackedFromProbes(rel string, probe func(at string) (hasSource, ok bool), witness func() (fileIndexStatus, scopeWitness)) (hasSource, probeOK bool) {
+	scoped, ok := probe(rel)
+	if !ok {
+		return false, false
+	}
+	if scoped {
+		return true, true
+	}
+	st, found := witness()
+	switch found {
+	case witnessNone:
+		return false, true
+	case witnessFound:
+		switch {
+		case st.Indexed || st.Symbolless:
+			// The doors disagree; enforce on the one that found something.
+			return true, true
+		case st.NeverIndexable:
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// scopeWitness is what a bounded walk of a directory scope turned up.
+type scopeWitness int
+
+const (
+	// witnessUnknown: the walk could not finish. Nothing is proven.
+	witnessUnknown scopeWitness = iota
+	// witnessNone: walked it all, no source-looking file in the scope.
+	witnessNone
+	// witnessFound: a representative source file, whose status stands in for
+	// the scope's.
+	witnessFound
+)
+
+// witnessWalkBudget caps one witness walk. A scope with source in it matches
+// almost immediately; the budget only bounds a huge asset tree with none.
+const witnessWalkBudget = 4096
+
+var errWitnessBudget = errors.New("scope witness budget exhausted")
+
+// scopeWitnessFn resolves a directory scope to one representative source file's
+// index verdict. Tests replace it.
+var scopeWitnessFn = scopeWitnessViaWalk
+
+func scopeWitnessViaWalk(cwd, absScope string) (fileIndexStatus, scopeWitness) {
+	seen := 0
+	found := ""
+	err := filepath.WalkDir(absScope, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// An unreadable root proves nothing; an unreadable subtree is
+			// skipped so the rest of the scope can still produce a witness.
+			if path == absScope {
+				return err
+			}
+			return nil
+		}
+		seen++
+		if seen > witnessWalkBudget {
+			return errWitnessBudget
+		}
+		if d.IsDir() || !looksLikeSourceFile(path) {
+			return nil
+		}
+		found = path
+		return fs.SkipAll
+	})
+	if err != nil {
+		return fileIndexStatus{}, witnessUnknown
+	}
+	if found == "" {
+		return fileIndexStatus{}, witnessNone
+	}
+	return queryFileIndexScope(cwd, found), witnessFound
+}
+
+// findFilesProbeFn asks the daemon whether a repo-relative path ("" = the whole
+// repo) holds at least one indexed file. Tests replace it to drive
+// scopeTrackedViaDaemon's verdict without a socket.
+var findFilesProbeFn = findFilesViaDaemon
+
+func findFilesViaDaemon(root, rel string) (hasSource, ok bool) {
 	client, err := daemon.Dial(hookMCPHandshake(root))
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer client.Close()
 	_ = client.Conn.SetDeadline(time.Now().Add(fileIndexedTimeout))
 
 	arguments := map[string]any{"glob": "**/*", "limit": 1, "format": "json"}
-	if rel != "." {
+	if rel != "" {
 		arguments["path"] = filepath.ToSlash(rel)
 	}
 	frame, err := json.Marshal(map[string]any{
@@ -1364,23 +1617,23 @@ func scopeTrackedViaDaemon(cwd, scope string) bool {
 		},
 	})
 	if err != nil || client.WriteMCPFrame(frame) != nil {
-		return false
+		return false, false
 	}
 	resp, err := client.ReadMCPFrame()
-	return err == nil && parseFindFilesHasSource(resp)
+	if err != nil {
+		return false, false
+	}
+	return parseFindFilesHasSource(resp)
 }
 
-func parseFindFilesHasSource(resp []byte) bool {
-	var rpc struct {
-		Result struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-			IsError bool `json:"isError"`
-		} `json:"result"`
-	}
-	if json.Unmarshal(resp, &rpc) != nil || rpc.Result.IsError || len(rpc.Result.Content) == 0 {
-		return false
+// parseFindFilesHasSource reports whether a find_files response lists at least
+// one indexed file. ok is false only when no usable list came back, so a
+// transport failure stays distinguishable from a well-formed empty list —
+// what that emptiness proves is scopeTrackedFromProbes' call, not this one's.
+func parseFindFilesHasSource(resp []byte) (hasSource, ok bool) {
+	text := parseToolCallText(resp)
+	if text == "" {
+		return false, false
 	}
 	var files struct {
 		Count int `json:"count"`
@@ -1388,10 +1641,10 @@ func parseFindFilesHasSource(resp []byte) bool {
 			Path string `json:"path"`
 		} `json:"files"`
 	}
-	if json.Unmarshal([]byte(rpc.Result.Content[0].Text), &files) != nil {
-		return false
+	if json.Unmarshal([]byte(text), &files) != nil {
+		return false, false
 	}
-	return files.Count > 0 && len(files.Files) > 0
+	return files.Count > 0 && len(files.Files) > 0, true
 }
 
 // enrichGlob denies source enumeration within a proven tracked/indexed scope.

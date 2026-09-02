@@ -7,16 +7,38 @@ import (
 
 func stubIndexedFile(t *testing.T, indexed bool, symbols int) {
 	t.Helper()
-	old := fileIndexedFn
-	fileIndexedFn = func(string, string) (bool, int) { return indexed, symbols }
-	t.Cleanup(func() { fileIndexedFn = old })
+	old := fileIndexScopeFn
+	fileIndexScopeFn = func(string, string) fileIndexStatus {
+		return fileIndexStatus{Indexed: indexed, Count: symbols, ProbeOK: true}
+	}
+	t.Cleanup(func() { fileIndexScopeFn = old })
 }
 
-func stubTrackedScope(t *testing.T, tracked bool) {
+// stubFileIndexScope stubs the file-verdict seam with a full status, for tests
+// that must exercise the excluded / probe-unavailable branches the boolean
+// stubIndexedFile helper cannot express.
+func stubFileIndexScope(t *testing.T, st fileIndexStatus) {
+	t.Helper()
+	old := fileIndexScopeFn
+	fileIndexScopeFn = func(string, string) fileIndexStatus { return st }
+	t.Cleanup(func() { fileIndexScopeFn = old })
+}
+
+func stubScopeTracked(t *testing.T, hasSource, probeOK bool) {
 	t.Helper()
 	old := scopeTrackedFn
-	scopeTrackedFn = func(string, string) bool { return tracked }
+	scopeTrackedFn = func(string, string) (bool, bool) { return hasSource, probeOK }
 	t.Cleanup(func() { scopeTrackedFn = old })
+}
+
+// stubTrackedScope is the pre-existing single-bool seam. It conflated "the
+// daemon proved this scope holds no indexed source" with "the daemon could not
+// be asked", and both produced the Unproven posture — so `false` maps to the
+// unprovable half here, preserving every caller's behaviour. Tests that mean
+// the proven-empty half call stubScopeTracked directly.
+func stubTrackedScope(t *testing.T, tracked bool) {
+	t.Helper()
+	stubScopeTracked(t, tracked, tracked)
 }
 
 func TestEnrichReadBlocksIndexedRangedRead(t *testing.T) {
@@ -111,8 +133,15 @@ func TestScopeTrackedViaDaemonUnavailable(t *testing.T) {
 	daemonReachableFn = func() bool { return false }
 	t.Cleanup(func() { daemonReachableFn = old })
 
-	if scopeTrackedViaDaemon("/repo", "internal") {
+	hasSource, probeOK := scopeTrackedViaDaemon("/repo", "internal")
+	if hasSource {
 		t.Fatal("unreachable daemon must not prove a tracked scope")
+	}
+	// And it must not prove an EMPTY one either: an unreachable daemon is no
+	// evidence the scope holds no source, so the caller keeps probing rather
+	// than going silent.
+	if probeOK {
+		t.Fatal("unreachable daemon must report the scope as unprovable, not proven-empty")
 	}
 }
 
@@ -156,12 +185,24 @@ func TestEnrichGlobUntrackedDaemonUpGreedyPatternStaysSoft(t *testing.T) {
 
 func TestParseFindFilesHasSourceRequiresNonEmptyIndexedResult(t *testing.T) {
 	withSource := []byte(`{"result":{"content":[{"text":"{\"count\":1,\"files\":[{\"path\":\"pkg/a.go\"}]}"}]}}`)
-	if !parseFindFilesHasSource(withSource) {
-		t.Fatal("non-empty find_files result should prove indexed source")
+	if hasSource, ok := parseFindFilesHasSource(withSource); !hasSource || !ok {
+		t.Fatalf("non-empty find_files result should prove indexed source, got (%v, %v)", hasSource, ok)
 	}
+	// An empty list is a PROVEN-empty scope, distinct from a failed probe —
+	// that distinction is what lets a vendored directory stay silent instead of
+	// falling through to a scope-blind pattern probe.
 	withoutSource := []byte(`{"result":{"content":[{"text":"{\"count\":0,\"files\":[]}"}]}}`)
-	if parseFindFilesHasSource(withoutSource) {
-		t.Fatal("empty find_files result must not prove indexed source")
+	if hasSource, ok := parseFindFilesHasSource(withoutSource); hasSource || !ok {
+		t.Fatalf("empty find_files result should be proven-empty, got (%v, %v)", hasSource, ok)
+	}
+	for name, resp := range map[string][]byte{
+		"error frame":       []byte(`{"result":{"isError":true,"content":[{"text":"boom"}]}}`),
+		"unparseable body":  []byte(`{"result":{"content":[{"text":"not json"}]}}`),
+		"unparseable frame": []byte("not json"),
+	} {
+		if hasSource, ok := parseFindFilesHasSource(resp); hasSource || ok {
+			t.Errorf("%s should be unprovable, got (%v, %v)", name, hasSource, ok)
+		}
 	}
 }
 

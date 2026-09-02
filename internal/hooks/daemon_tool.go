@@ -86,8 +86,8 @@ func hookMCPHandshake(cwd string) daemon.Handshake {
 // its AF_UNIX socket and returns the first text content block, or "" on any
 // error. cwd scopes the handshake to the caller's workspace so tools that read
 // the working tree (detect_changes) or the active project (analyze) resolve the
-// right repo. Mirrors fileIndexedViaDaemon's transport; kept separate so the
-// file-indexed probe stays a tight count-only path.
+// right repo. Mirrors fileIndexScopeViaDaemon's transport; kept separate so the
+// file-scope probe stays a tight single-purpose path.
 func callServerToolViaDaemon(cwd, name string, args map[string]any) string {
 	if args == nil {
 		args = map[string]any{}

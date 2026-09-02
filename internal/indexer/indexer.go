@@ -206,7 +206,9 @@ type Indexer struct {
 	excludeMu     sync.Mutex
 	dirIgnore     *excludes.Hierarchical
 	dirIgnoreOnce sync.Once
-	rootPath      string
+	// probeGates memoises admission gates for single-path probes.
+	probeGates probeGateCache
+	rootPath   string
 	// projectName is the repo's own name (go.mod module / package.json /
 	// dir), computed once per index. Stripped from the BM25-indexed file
 	// path so a query word matching it doesn't earn a useless uniform
@@ -2355,17 +2357,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// syscall per file regardless; trading one walk-time stat for two
 	// later stats is the net win.
 	maxSize := idx.config.MaxFileSize
-	// Corpus-admission gate: drops oversized document assets and (by
-	// default) binary/vector data artifacts at the walk, before they are
-	// read and extracted, so a content-heavy repo can't pull gigabytes of
-	// non-source files into the parse pipeline and OOM (#120). Inert for
-	// all-code repos.
-	contentGate := idx.newContentAdmissionGate()
-	// Git-aware admission (opt-in): when index.skip_untracked_assets is on,
-	// drop asset-class files git does not track — uncommitted RAG corpora /
-	// datasets / build outputs that .gitignore can't catch (#120). Inert
-	// when off, on a non-git repo, or when git is unavailable.
-	untrackedGate := idx.newUntrackedAssetGate(ctx, absRoot)
+	// Built once per walk, handed to admitFile per file. untracked drops
+	// asset-class files git doesn't track (opt-in); content drops oversized
+	// documents and binary/vector data before they are read (#120). Both are
+	// inert on an all-code repo.
+	gates := admissionGates{
+		untracked: idx.newUntrackedAssetGate(ctx, absRoot),
+		content:   idx.newContentAdmissionGate(),
+	}
 	var files []walkedFile
 	var skippedLarge int
 	var skippedBytes int64
@@ -2383,20 +2382,19 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 			return nil
 		}
-		lang, ok := idx.effectiveLanguage(path, nil)
-		if !ok {
-			return nil
-		}
-		if idx.shouldExclude(path, absRoot, false) {
-			return nil
-		}
 		info, statErr := d.Info()
 		if statErr != nil {
 			// Couldn't read FileInfo (race with deletion, broken
 			// symlink, …). Skip — the worker would fail too.
 			return nil
 		}
-		if maxSize > 0 && info.Size() > maxSize {
+		lang, reason := idx.admitFile(path, absRoot, info.Size(), gates)
+		switch reason {
+		case "":
+			// Admitted.
+		case skipReasonExcluded, skipReasonNoLanguage:
+			return nil // corpus boundary, not skip telemetry
+		case skipReasonMaxFileSize:
 			skippedLarge++
 			skippedBytes += info.Size()
 			rel, _ := filepath.Rel(absRoot, path)
@@ -2404,16 +2402,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(),
 			})
 			return nil
-		}
-		if reason, skip := untrackedGate.skip(lang, path); skip {
-			skippedContentBytes += info.Size()
-			rel, _ := filepath.Rel(absRoot, path)
-			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(), reason: reason,
-			})
-			return nil
-		}
-		if reason, skip := contentGate.skip(lang, info.Size()); skip {
+		default: // the corpus-admission gates
 			skippedContentBytes += info.Size()
 			rel, _ := filepath.Rel(absRoot, path)
 			skippedByContent = append(skippedByContent, skippedFile{
@@ -5444,6 +5433,26 @@ func (idx *Indexer) warnIfWalkAdmittedNothing(absRoot string, admitted int) {
 		zap.String("example_file", cause.RelPath),
 		zap.String("excluded_by", cause.Source),
 		zap.String("pattern", cause.Pattern))
+}
+
+// absWithinRoot resolves a repo-relative path against root and refuses
+// anything that does not land inside it. The guard is load-bearing, not
+// defensive garnish: filepath.Join swallows a leading separator
+// (Join("/repo", "/etc/passwd") == "/repo/etc/passwd") and Cleans "../" away
+// against the root, so without it an absolute or escaping caller path is
+// silently rewritten into a plausible in-root path and answered for — a file
+// this repo does not own. Callers do hand over unvalidated strings: the MCP
+// graph-path helpers deliberately echo their input back when resolution fails.
+func absWithinRoot(root, relPath string) (string, bool) {
+	if root == "" || relPath == "" || filepath.IsAbs(relPath) {
+		return "", false
+	}
+	abs := filepath.Join(root, relPath)
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return abs, true
 }
 
 // shouldPruneDir reports whether the index walk may skip a directory

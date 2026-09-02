@@ -150,6 +150,89 @@ func (s *Server) indexerForRel(graphPath string) (*indexer.Indexer, string) {
 	return owner, strings.TrimPrefix(graphPath, prefix+"/")
 }
 
+// pathIndexability answers, for a file the graph holds no nodes for, whether
+// the index walk would ever hold it — the distinction between "excluded /
+// unindexable by design" and "tracked and indexable, just not indexed yet".
+//
+// Resolution goes through indexerForRel, which fails closed on a BARE
+// unprefixed path that more than one tracked repo could own (two JS repos each
+// holding node_modules/react/index.js). That is exactly the shape the
+// PreToolUse hook sends, and it is exactly the vendored path the flag exists
+// for, so a nil owner is not the end: every tracked repo is asked and the
+// verdict is taken only when they all agree. Unanimity is the conservative
+// direction — a split answer leaves enforcement on rather than silencing a
+// door on a guess.
+//
+// A repo that cannot answer casts no vote; see unanimousPathSkip.
+//
+// ensureFresh resolved this same path moments earlier via freshnessIndexer,
+// but that helper is deliberately watcher-gated (it returns nil whenever a
+// file watcher owns freshness), so it cannot double as an ownership lookup.
+func (s *Server) pathIndexability(graphPath string) fileNotIndexedState {
+	if idx, rel := s.indexerForRel(graphPath); idx != nil {
+		skip, answered := idx.PathIndexability(rel)
+		if !answered {
+			return fileNotIndexedState{}
+		}
+		return skipState(skip)
+	}
+	if s.multiIndexer == nil {
+		return fileNotIndexedState{}
+	}
+	rel := filepath.ToSlash(graphPath)
+	votes := make([]pathSkipVote, 0, 4)
+	for _, prefix := range s.multiIndexer.RepoPrefixes() {
+		idx := s.multiIndexer.GetIndexer(prefix)
+		if idx == nil {
+			continue
+		}
+		skip, answered := idx.PathIndexability(rel)
+		votes = append(votes, pathSkipVote{Skip: skip, Answered: answered})
+	}
+	agreed, ok := unanimousPathSkip(votes)
+	if !ok {
+		return fileNotIndexedState{}
+	}
+	return skipState(agreed)
+}
+
+// pathSkipVote is one repo's answer; Answered is false when it could not
+// answer at all.
+type pathSkipVote struct {
+	Skip     indexer.PathSkip
+	Answered bool
+}
+
+// unanimousPathSkip takes the verdict only when every repo that could answer
+// agreed. Abstentions are dropped: an un-rooted repo returns the zero PathSkip,
+// bit-identical to "indexable", so counting it made one silent repo disagree
+// with every repo that had actually looked. ok is false on no answers or a
+// genuine conflict — both leave enforcement on.
+func unanimousPathSkip(votes []pathSkipVote) (indexer.PathSkip, bool) {
+	var agreed *indexer.PathSkip
+	for _, v := range votes {
+		if !v.Answered {
+			continue
+		}
+		if agreed == nil {
+			skip := v.Skip
+			agreed = &skip
+			continue
+		}
+		if *agreed != v.Skip {
+			return indexer.PathSkip{}, false
+		}
+	}
+	if agreed == nil {
+		return indexer.PathSkip{}, false
+	}
+	return *agreed, true
+}
+
+func skipState(skip indexer.PathSkip) fileNotIndexedState {
+	return fileNotIndexedState{Unindexable: skip.Skipped, Excluded: skip.ByRule}
+}
+
 // detectWorktreeMismatch reports (once per server, cached) whether the
 // current working directory is a linked git worktree that the indexed graph
 // does not cover — i.e. the agent is working in a worktree but the graph

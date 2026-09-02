@@ -72,13 +72,65 @@ func symbolNotFoundGuidance(id string) *mcp.CallToolResult {
 	})
 }
 
-// fileNotIndexedGuidance: a file has no indexed symbols. Routes to file/content
-// discovery and a raw read.
-func fileNotIndexedGuidance(path string) *mcp.CallToolResult {
+// fileNotIndexedState says WHY a file has no indexed symbols, so the guidance
+// can name a next step that can actually answer instead of a generic triple.
+type fileNotIndexedState struct {
+	// Unindexable: the index walk will never hold this file — an exclude rule,
+	// a language no extractor claims, or a file over the size cap.
+	Unindexable bool
+	// Excluded: Unindexable, and an exclude / ignore RULE is the reason
+	// (vendored tree, build output, .gortexignore).
+	Excluded bool
+	// Indexed: the graph DOES hold this file; it just defines no symbols — a
+	// package-doc-only file, a constants file, a shell or SQL file with no
+	// definitions. The locators still have rows for it.
+	Indexed bool
+	// OutOfScope: the graph holds this file but the active repo/project/ref
+	// filter excludes it. Not folded into Indexed: every graph tool applies
+	// the same filter, so the locators have no rows for it either.
+	OutOfScope bool
+}
+
+// fileNotIndexedGuidance: a file has no indexed symbols. The suggested tools
+// are chosen from the reason, not fixed: find_files and search_text are both
+// graph-backed, so for a path the graph will NEVER hold they return zero rows
+// and naming them costs the caller two dead round-trips before it reaches the
+// only tool that can answer. That narrowing applies to Unindexable alone — an
+// Indexed file is in the graph, so both locators do have rows for it and a
+// scoped text search answers at a fraction of a whole-file read's tokens; only
+// the symbol lookup has nothing to return. The Unindexable distinction also
+// rides the Data block — the PreToolUse hook stays silent rather than nudging
+// toward graph tools whenever the graph cannot answer for the path.
+func fileNotIndexedGuidance(path string, st fileNotIndexedState) *mcp.CallToolResult {
+	message := fmt.Sprintf("no symbols are indexed for %q — the file may be new, ignored, or in a language without an extractor. Find or read it directly instead.", path)
+	tools := []string{"find_files", "search_text", "read_file"}
+	switch {
+	case st.Unindexable:
+		reason := "the indexer skips it by design — no extractor claims its language, or it is over the size cap"
+		if st.Excluded {
+			reason = "an exclude rule skips it by design (vendored, ignored, or build output)"
+		}
+		message = fmt.Sprintf("no symbols are indexed for %q and none ever will be: %s. Only a direct read can answer for it.", path, reason)
+		tools = []string{"read_file"}
+	case st.OutOfScope:
+		// The locators apply the same filter, so they are not offered here.
+		message = fmt.Sprintf("%q is indexed but outside the active project/ref scope — every graph tool applies that same filter, so none can answer for it here. Widen the scope or read it directly.", path)
+		tools = []string{"set_active_project", "read_file"}
+	case st.Indexed:
+		// Tools stay the full triple: the graph holds this file, so the
+		// locators can answer for it — only the symbol lookup cannot.
+		message = fmt.Sprintf("%q is indexed but defines no symbols in scope — a symbol lookup has nothing to return for it. Search its text or read it directly.", path)
+	}
 	return newRecoverableResult(RecoverableGuidance{
 		Condition:      ErrCodeFileNotIndexed,
-		Message:        fmt.Sprintf("no symbols are indexed for %q — the file may be new, ignored, or in a language without an extractor. Find or read it directly instead.", path),
-		SuggestedTools: []string{"find_files", "search_text", "read_file"},
-		Data:           map[string]any{"path": path},
+		Message:        message,
+		SuggestedTools: tools,
+		Data: map[string]any{
+			"path":         path,
+			"excluded":     st.Excluded,
+			"unindexable":  st.Unindexable,
+			"indexed":      st.Indexed,
+			"out_of_scope": st.OutOfScope,
+		},
 	})
 }

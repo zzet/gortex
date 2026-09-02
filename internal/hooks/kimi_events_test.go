@@ -22,9 +22,11 @@ func stubDaemonTool(t *testing.T, responses map[string]string) {
 
 func TestRunKimiPreToolUseReadIndexedDenies(t *testing.T) {
 	cwd := writeGortexProjectMarker(t, t.TempDir())
-	old := fileIndexedFn
-	fileIndexedFn = func(_, _ string) (bool, int) { return true, 7 }
-	defer func() { fileIndexedFn = old }()
+	old := fileIndexScopeFn
+	fileIndexScopeFn = func(_, _ string) fileIndexStatus {
+		return fileIndexStatus{Indexed: true, Count: 7, ProbeOK: true}
+	}
+	defer func() { fileIndexScopeFn = old }()
 
 	out := captureStdout(t, func() {
 		runKimi(kimiPreToolPayload(cwd, "Read", `{"file_path":"internal/auth/token.go"}`), 0, ModeDeny)
@@ -42,9 +44,11 @@ func TestRunKimiPreToolUseReadIndexedDenies(t *testing.T) {
 
 func TestRunKimiPreToolUseReadUnindexedSoftStdout(t *testing.T) {
 	cwd := writeGortexProjectMarker(t, t.TempDir())
-	old := fileIndexedFn
-	fileIndexedFn = func(_, _ string) (bool, int) { return false, 0 }
-	defer func() { fileIndexedFn = old }()
+	old := fileIndexScopeFn
+	fileIndexScopeFn = func(_, _ string) fileIndexStatus {
+		return fileIndexStatus{ProbeOK: true}
+	}
+	defer func() { fileIndexScopeFn = old }()
 
 	out := captureStdout(t, func() {
 		runKimi(kimiPreToolPayload(cwd, "Read", `{"file_path":"internal/new.go"}`), 0, ModeDeny)
