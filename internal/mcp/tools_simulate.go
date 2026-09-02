@@ -326,7 +326,7 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 	current := map[string]daemon.OverlayFile{}
 
 	if inherit {
-		if sessID := SessionIDFromContext(ctx); sessID != "" && s.overlays != nil && s.overlays.Has(sessID) {
+		if sessID := OverlayCohortIDFromContext(ctx); sessID != "" && s.overlays != nil && s.overlays.Has(sessID) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
@@ -1125,7 +1125,7 @@ func (s *Server) persistSimulationOverlay(ctx context.Context, sim *simulation) 
 	if s.overlays == nil {
 		return "", errors.New("overlay support is not enabled on this server")
 	}
-	sessID := SessionIDFromContext(ctx)
+	sessID := OverlayCohortIDFromContext(ctx)
 	if sessID == "" {
 		return "", nil
 	}

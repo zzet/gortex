@@ -29,7 +29,7 @@ gortex mcp --index /path/to/repo --server --port 8765
 |----------|--------|-------------|
 | `/v1/health` | GET | Status, node/edge counts, uptime |
 | `/v1/tools` | GET | List all available tools with descriptions |
-| `/v1/tools/{name}` | POST | Invoke any MCP tool with JSON arguments. Accepts `?format=gcx` or top-level `"format"` in the body |
+| `/v1/tools/{name}` | POST | Invoke any MCP tool with JSON arguments. Accepts `?format=gcx` or top-level `"format"` in the body. Under the `core`/`defer` default surface, aliased `analyze` kinds (`processes`, `communities`, `contracts`, …) are routed through the facade to their legacy handlers without requiring `tools_search` promotion — the dashboard's `/v1/processes`, `/v1/communities`, and `/v1/contracts` endpoints rely on this. Non-aliased kinds dispatch as usual. |
 | `/v1/stats` | GET | Graph statistics by kind and language, plus `server_id` + `started_at` |
 | `/v1/graph` | GET | Full brief-graph dump (nodes + edges + stats); accepts `?project=` and/or `?repo=` for scoping |
 | `/v1/events` | GET | SSE stream of graph-change events (the daemon watches tracked repos by default). Accepts `?token=<t>` for `EventSource` auth |

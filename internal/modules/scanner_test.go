@@ -128,6 +128,31 @@ func TestBuildGraphArtifacts(t *testing.T) {
 	}
 }
 
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The indexer mints the synthetic manifest file node with the
+	// exact relPath spelling; a re-spelled EdgeDependsOnModule From
+	// endpoint dangles from a nonexistent node on Windows for any
+	// manifest below the repo root.
+	// Written out, not composed with filepath.Join: on a POSIX runner
+	// Join yields exactly what the pre-fix ToSlash call returned, so
+	// the assertion would hold with or without the fix.
+	const rel = `services\api\go.mod`
+	specs := []Spec{{Ecosystem: "go", Path: "github.com/foo/bar", Version: "v1.0.0", Line: 5}}
+	nodes, edges := BuildGraphArtifacts(rel, specs)
+	if len(nodes) != 1 || len(edges) != 1 {
+		t.Fatalf("nodes = %d, edges = %d", len(nodes), len(edges))
+	}
+	if nodes[0].FilePath != rel {
+		t.Errorf("node file path = %q, want %q", nodes[0].FilePath, rel)
+	}
+	if edges[0].From != rel {
+		t.Errorf("edge.From = %q, want %q", edges[0].From, rel)
+	}
+	if edges[0].FilePath != rel {
+		t.Errorf("edge file path = %q, want %q", edges[0].FilePath, rel)
+	}
+}
+
 func TestParsePackageJSON_AllBlocks(t *testing.T) {
 	src := []byte(`{
   "name": "my-app",

@@ -21,6 +21,16 @@ type sessionCtxKey struct{}
 // calling MCPServer.HandleMessage, giving every tool handler access
 // to the per-session state without touching the handler signature.
 //
+// This is the ONE universal session identity: sessionFor,
+// effectiveSessionPolicy (and therefore every tool-policy gate),
+// tokenStatsFor, the agent registry, diagnostics/health/readiness/
+// stale-refs subscriptions, localization state, query logging, and
+// notes/memory scoping all key off SessionIDFromContext. It MUST be
+// the caller's real transport/MCP session id (Mcp-Session-Id, or the
+// stdio server's implicit single session) — never overridden by an
+// unrelated selector. See WithOverlayCohortID for the one narrow
+// exception (overlay snapshot binding) that is allowed to diverge.
+//
 // An empty id is treated as "no session" and returns ctx unchanged —
 // that's the path the embedded stdio server takes, where there's only
 // one implicit session.
@@ -42,6 +52,56 @@ func SessionIDFromContext(ctx context.Context) string {
 		return id
 	}
 	return ""
+}
+
+// overlayCohortCtxKey carries an explicit override for which overlay
+// cohort a request's overlay-scoped calls should bind to, when that
+// differs from the caller's real session id (see WithOverlayCohortID).
+// Unexported: use WithOverlayCohortID / OverlayCohortIDFromContext.
+type overlayCohortCtxKey struct{}
+
+// WithOverlayCohortID returns a context carrying an overlay-cohort
+// override distinct from the request's real session id
+// (SessionIDFromContext). Only the overlay subsystem's own accessors
+// (overlaySessionID, snapshotOverlayRequestForCtx,
+// prepareOverlayRequest, buildOverlayViewForCtx, and the simulate /
+// explore-literal-overlay call sites) consult this — every other
+// SessionIDFromContext caller (policy, token stats, notes, agent
+// registry, diagnostics subscriptions, ...) is intentionally
+// unaffected by it.
+//
+// This exists for callers that legitimately want to scope overlay
+// state to a cohort id that differs from their own transport session
+// (e.g. a CI harness that orchestrates several overlay scopes from
+// one connection) WITHOUT that selection also silently redirecting
+// every other per-session subsystem to the wrong identity — which is
+// exactly what happened when a single header-precedence value fed
+// both purposes: a session's own tool-policy gate could be bypassed
+// by pairing a restricted Mcp-Session-Id with a permissive
+// X-Gortex-Overlay-Session.
+//
+// An empty id returns ctx unchanged; OverlayCohortIDFromContext then
+// falls back to SessionIDFromContext, so a caller that never sets
+// this behaves byte-identically to before this type existed.
+func WithOverlayCohortID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, overlayCohortCtxKey{}, id)
+}
+
+// OverlayCohortIDFromContext returns the overlay-cohort override
+// attached via WithOverlayCohortID, or SessionIDFromContext(ctx) when
+// none was set — the common case, where overlay state binds to the
+// caller's own session exactly as it always has.
+func OverlayCohortIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if id, ok := ctx.Value(overlayCohortCtxKey{}).(string); ok && id != "" {
+		return id
+	}
+	return SessionIDFromContext(ctx)
 }
 
 // sessionCWDCtxKey carries the session's working directory. The

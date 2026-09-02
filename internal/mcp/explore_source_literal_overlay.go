@@ -128,8 +128,8 @@ func (s *Server) snapshotExploreSourceLiteralOverlays(
 		}
 		return nil, covered, false, false, nil
 	}
-	if snapshot.sessionID != SessionIDFromContext(ctx) {
-		return nil, covered, false, false, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, SessionIDFromContext(ctx))
+	if snapshot.sessionID != OverlayCohortIDFromContext(ctx) {
+		return nil, covered, false, false, fmt.Errorf("overlay request snapshot belongs to session %q, not %q", snapshot.sessionID, OverlayCohortIDFromContext(ctx))
 	}
 	if !snapshot.canonical {
 		return nil, covered, true, false, fmt.Errorf("overlay request snapshot is not canonical")

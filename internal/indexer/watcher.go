@@ -419,24 +419,23 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 	}
 
 	// WSL2 / slow-mount degradation: on a 9p/drvfs mount (a Windows drive
-	// under WSL2, an SMB share) native fsnotify delivers events late or not
-	// at all, and confirmWatchActive would hang ~5s per path before timing
-	// out. Skip the fsnotify backend entirely and rely on the adaptive
-	// poller + git hooks, which are mount-agnostic. The downstream code
-	// already tolerates a nil fsw. GORTEX_FORCE_FSNOTIFY=1 overrides.
-	if w.config.Enabled {
-		probe := paths[0]
-		if abs, err := filepath.Abs(probe); err == nil {
-			probe = abs
-		}
-		if slowWatchMount(probe) {
-			w.degradedNoFsnotify = true
-			w.logger.Warn("watcher: slow mount detected — disabling native fsnotify, using adaptive poller fallback",
-				zap.String("path", probe))
-			w.poller = newPoller(w, w.indexer, w.logger)
-			w.poller.Start()
-			return nil
-		}
+	// under WSL2, an SMB share) or an NFS mount, native fsnotify delivers
+	// events late or not at all, and confirmWatchActive would hang ~5s per
+	// path before timing out. Skip the fsnotify backend entirely and rely
+	// on the adaptive poller + git hooks, which are mount-agnostic. The
+	// downstream code already tolerates a nil fsw. GORTEX_FORCE_FSNOTIFY=1
+	// overrides.
+	probe := paths[0]
+	if abs, err := filepath.Abs(probe); err == nil {
+		probe = abs
+	}
+	if slowWatchMount(probe) {
+		w.degradedNoFsnotify = true
+		w.logger.Warn("watcher: slow mount detected — disabling native fsnotify, using adaptive poller fallback",
+			zap.String("path", probe))
+		w.poller = newPoller(w, w.indexer, w.logger)
+		w.poller.Start()
+		return nil
 	}
 	ready := make(chan struct{})
 	// Own the events/dropped channels so the library never closes them on
@@ -543,10 +542,8 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 				w.fsw.Close()
 				w.fsw = nil
 			}
-			if w.config.Enabled {
-				w.poller = newPoller(w, w.indexer, w.logger)
-				w.poller.Start()
-			}
+			w.poller = newPoller(w, w.indexer, w.logger)
+			w.poller.Start()
 			return nil
 		}
 		return err
@@ -608,10 +605,13 @@ func (w *Watcher) Start(paths []string) (retErr error) {
 		}
 	}
 
-	// Launch the adaptive-interval poller alongside the fsnotify
-	// backend. It is a fallback for the changes fsnotify misses, so
-	// it shares the watcher's lifecycle. Gated on WatchConfig.Enabled
-	// — a repo that opted out of watching gets no fallback either.
+	// Launch the adaptive-interval poller alongside the fsnotify backend.
+	// It is a fallback for the changes fsnotify misses, so it shares the
+	// watcher's lifecycle. Enabled is the opt-in only here, where
+	// fsnotify is LIVE — there the poller is a belt-and-braces extra for
+	// what fsnotify misses, and a repo may decline it. The degraded
+	// paths above start it unconditionally: fsnotify is dead there, so
+	// declining it means the repo silently goes stale.
 	if w.config.Enabled {
 		w.poller = newPoller(w, w.indexer, w.logger)
 		w.poller.Start()

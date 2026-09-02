@@ -209,8 +209,10 @@ func TestPoller_DetectsGitHeadMoveMissedByFsnotify(t *testing.T) {
 
 // TestPoller_RespectsWatcherDisableKnob verifies the poller honours
 // the per-repo watcher-disable knob: when WatchConfig.Enabled is
-// false, Start must not create a poller — the disabled repo gets no
-// fallback either.
+// false, Start must not create the alongside-fsnotify poller. This
+// is not the whole story on a slow mount, where the degraded-path
+// pollers still start unconditionally regardless of Enabled — see
+// TestWatcher_ShippedDefaultStillWatches and the slow-mount tests.
 func TestPoller_RespectsWatcherDisableKnob(t *testing.T) {
 	dir := t.TempDir()
 	writeTestFile(t, filepath.Join(dir, "main.go"), "package main\n\nfunc Main() {}\n")

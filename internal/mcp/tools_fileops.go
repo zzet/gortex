@@ -637,8 +637,20 @@ func (s *Server) recordFileBaselineSavings(ctx context.Context, tool, relPath, l
 		return
 	}
 	returned := tokens.CachedCountInt64(payload)
-	fullFile := int64(tokens.EstimateFromSample(int(info.Size()), payload))
-	s.tokenStatsFor(ctx).record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
+	// Calibrate the file's token count on the FILE, not on the response.
+	// EstimateFromSample scales a byte count by the chars-per-token ratio of
+	// its sample, and the sample is only meaningful when it is "a smaller
+	// chunk of the same content" (see its doc comment). The payload here is a
+	// marshalled node list or an editing-context bundle, whose ratio is
+	// nothing like the source it is standing in for, so calibrating on it
+	// mis-priced every summary and editing-context baseline.
+	fullFile := int64(tokens.EstimateFromSample(int(info.Size()), fileHeadSample(abs)))
+	stats := s.tokenStatsFor(ctx)
+	// This charges the whole file as the counterfactual, so claim it for the
+	// session: a later retrieval page that merely cites the file must not
+	// bill it a second time (savings_retrieval.go).
+	stats.creditFile(abs)
+	stats.record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
 }
 
 // repoRelative converts an absolute path to a repo-prefixed or root-relative
@@ -1326,6 +1338,17 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
+	// Admission before any work: a fidelity_globs value that breaks a size
+	// bound refuses the request. Dropping the offending rule would rewrite
+	// a first-match policy silently — an over-budget `omit` disappearing
+	// lets a later `full` win, and the content the caller asked to hide
+	// comes back in a response that looks like a normal success. Parsed
+	// here rather than at the point of use so a malformed request cannot
+	// be served by a path that happens not to reach the compressor.
+	fidelityRules, fidelityErr := parseFidelityGlobs(req.GetString("fidelity_globs", ""))
+	if fidelityErr != nil {
+		return mcp.NewToolResultError("read_file: " + fidelityErr.Error()), nil
+	}
 	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
@@ -1416,7 +1439,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			symbols = sg.Nodes
 		}
 		keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), symbols)
-		decide := fidelityDecideForPath(parseFidelityGlobs(req.GetString("fidelity_globs", "")), relPath)
+		decide := fidelityDecideForPath(fidelityRules, relPath)
 		if out, eerr := elide.CompressWith(content, language, elide.Options{Keep: keepPred, Decide: decide}); eerr == nil && len(out) != len(content) {
 			content = out
 			bodiesElided = true
@@ -1589,7 +1612,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		if bodiesElided || salienceTruncated || windowed || contentTruncated {
 			fullFile = int64(tokens.EstimateFromSample(originalBytes, contentStr))
 		}
-		s.tokenStatsFor(ctx).record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
+		stats := s.tokenStatsFor(ctx)
+		stats.creditFile(absPath)
+		stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
 	}
 
 	s.attachFileDependents(result, relPath)

@@ -79,3 +79,17 @@ func RestoreRestubProvenance(e *Edge) bool {
 	delete(e.Meta, metaRestubPrevConf)
 	return restored
 }
+
+// HasRestubProvenance reports whether e still carries the restub stash — the
+// mark that this unresolved write is a surviving edge parked by the re-parse
+// flow, not a genuinely new unresolved reference. Receipt recorders use it to
+// keep the surviving source's file out of the forward resolution frontier:
+// only the incoming/name frontier restores the stash, and a forward re-resolve
+// would bind the stub with a fresh tier and silently drop the stashed one.
+func HasRestubProvenance(e *Edge) bool {
+	if e == nil || e.Meta == nil {
+		return false
+	}
+	_, ok := e.Meta[metaRestubPrevTo]
+	return ok
+}

@@ -91,15 +91,28 @@ func (s *Server) sessionLiveToolNames(ctx context.Context) []string {
 
 // registeredToolNames returns the complete catalog behind this server: both
 // the currently registered MCP tools and the lazy registry's cold tools.
+//
+// Read order matters: lazyToolRegistry.Promote holds its lock for the
+// entire mark-and-register transition (see lazy_tools.go), so
+// DeferredNames' RLock cannot return mid-promotion — it either observes a
+// name still deferred, or observes it already excluded because Promote
+// (registration included) has fully completed. Reading DeferredNames
+// FIRST and ListTools SECOND therefore guarantees no false miss: a name
+// excluded from the first read is guaranteed live by the time of the
+// second (registration only ever moves deferred -> live, never back).
+// Reading ListTools first (the previous order) raced a concurrent
+// Promote: ListTools could snapshot before AddTool ran and DeferredNames
+// could snapshot after the name was marked promoted, missing the name in
+// both and misclassifying a legitimately live tool as "absent".
 func (s *Server) registeredToolNames() []string {
 	names := make(map[string]bool)
-	for name := range s.mcpServer.ListTools() {
-		names[name] = true
-	}
 	if s.lazy != nil {
 		for _, name := range s.lazy.DeferredNames() {
 			names[name] = true
 		}
+	}
+	for name := range s.mcpServer.ListTools() {
+		names[name] = true
 	}
 
 	out := make([]string, 0, len(names))

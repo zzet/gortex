@@ -133,6 +133,7 @@ var metaStringSliceKeys = map[string]bool{
 // metaMapSliceKeys are keys whose array value must be []map[string]any.
 var metaMapSliceKeys = map[string]bool{
 	"response_envelope": true,
+	"ef_fluent":         true,
 }
 
 // UnmarshalJSON decodes the typed fields and captures every other key into

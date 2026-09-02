@@ -280,3 +280,57 @@ func TestResolveDeferredMutationsIncompleteReceiptFallsBackWhenNoUnresolvedWrite
 		t.Fatalf("fallback edge target = %q, want b.go::Target", edge.To)
 	}
 }
+
+// The reviewer scenario for receipt-exact evictions: a pending reference in a
+// file OUTSIDE every receipt frontier names an evicted definition. The evicted
+// file is empty post-eviction, so the file-scoped pass cannot reach the
+// pending edge; only the receipt's EvictedNames can. Before the names pass the
+// whole-graph fallback healed this shape on every wave.
+func TestResolveDeferredMutationsExactReceiptRebindsEvictedNamePendings(t *testing.T) {
+	store, edge := deferredReceiptFixture()
+	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
+	receipt := &graph.MutationReceipt{
+		Complete:           true,
+		ResolutionRelevant: true,
+		DefinitionFiles:    []string{"gone.go"},
+		TargetNames:        []string{"Target"},
+		EvictedNames:       []string{"Target"},
+	}
+
+	mode, complete := mi.resolveDeferredMutations(receipt, false, nil, false)
+	if mode != deferredResolveExact || !complete {
+		t.Fatalf("mode = %q complete=%v, want %q exact", mode, complete, deferredResolveExact)
+	}
+	if got := store.unresolvedScans.Load(); got != 0 {
+		t.Fatalf("exact path performed %d whole unresolved scans", got)
+	}
+	if edge.To != "b.go::Target" {
+		t.Fatalf("name-parked pending edge target = %q, want b.go::Target (rebound via receipt EvictedNames)", edge.To)
+	}
+}
+
+// The narrowing itself: the name pass is driven by EvictedNames, not by the
+// whole target set. TargetNames carries every added node's Name and QualName,
+// and each entry costs four stub forms per repository prefix in the pass's
+// probe, so feeding it the added names is what made the pass scale with batch
+// size instead of with the evictions that motivated it. An added definition
+// needs no name pass: its file is in DefinitionFiles, and the file frontier
+// enumerates the stub forms of every name that file declares.
+func TestResolveDeferredMutationsExactReceiptNamePassIgnoresAddedNames(t *testing.T) {
+	store, edge := deferredReceiptFixture()
+	mi := &MultiIndexer{graph: store, logger: zap.NewNop()}
+	receipt := &graph.MutationReceipt{
+		Complete:           true,
+		ResolutionRelevant: true,
+		DefinitionFiles:    []string{"gone.go"},
+		TargetNames:        []string{"Target"},
+	}
+
+	mode, complete := mi.resolveDeferredMutations(receipt, false, nil, false)
+	if mode != deferredResolveExact || !complete {
+		t.Fatalf("mode = %q complete=%v, want %q exact", mode, complete, deferredResolveExact)
+	}
+	if edge.To != graph.UnresolvedMarker+"Target" {
+		t.Fatalf("name-parked pending edge target = %q, want it untouched by the name pass", edge.To)
+	}
+}

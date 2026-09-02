@@ -104,6 +104,122 @@ func TestMutationFreshnessTerminalFailureFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMutationFreshnessSuccessResolvesSupersededFailures(t *testing.T) {
+	s := &Server{mutationSafetyWait: time.Millisecond}
+	stale := pendingFreshnessReceipt(s, "receipt-stale-failed", "repo-a", "/repo-a/file.go", 6)
+	completeFreshnessReceipt(stale, indexer.MutationResult{
+		RequestedGeneration: 6,
+		Err:                 errors.New("context deadline exceeded"),
+	})
+	otherPath := pendingFreshnessReceipt(s, "receipt-other-path", "repo-a", "/repo-a/other.go", 7)
+	completeFreshnessReceipt(otherPath, indexer.MutationResult{
+		RequestedGeneration: 7,
+		Err:                 errors.New("unrelated failure"),
+	})
+	newer := pendingFreshnessReceipt(s, "receipt-newer-failed", "repo-a", "/repo-a/file.go", 12)
+	completeFreshnessReceipt(newer, indexer.MutationResult{
+		RequestedGeneration: 12,
+		Err:                 errors.New("later failure"),
+	})
+
+	succeeded := pendingFreshnessReceipt(s, "receipt-success", "repo-a", "/repo-a/file.go", 9)
+	appliedResult := indexer.MutationResult{
+		RequestedGeneration: 9,
+		AppliedGeneration:   9,
+		Reindexed:           true,
+	}
+	completeFreshnessReceipt(succeeded, appliedResult)
+	s.resolveSupersededFailedReceipts("/repo-a/file.go", 9, appliedResult)
+
+	if _, loaded := s.mutationReceipts.Load("receipt-stale-failed"); !loaded {
+		t.Fatal("superseded receipt was deleted; it must stay queryable for the mutation-commit ledger")
+	}
+	resolved := stale.outcome(false)
+	if resolved.Err != nil || !resolved.Reindexed || resolved.AppliedGeneration != 9 {
+		t.Fatalf("superseded failure was not resolved in place: %+v", resolved)
+	}
+	if outcome := otherPath.outcome(false); outcome.Err == nil {
+		t.Fatal("failure on an unrelated path was resolved")
+	}
+	if outcome := newer.outcome(false); outcome.Err == nil {
+		t.Fatal("failure newer than the succeeded generation was resolved")
+	}
+
+	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
+	if err == nil {
+		t.Fatal("remaining failures did not fail closed")
+	}
+	message := err.Error()
+	if strings.Contains(message, "receipt-stale-failed") {
+		t.Fatalf("freshness error still reports the superseded receipt: %s", message)
+	}
+	for _, want := range []string{
+		"receipt-other-path",
+		"receipt-newer-failed",
+		"do not recover by waiting",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("freshness error %q does not contain %q", message, want)
+		}
+	}
+}
+
+func TestTrackMutationTicketResolvesSupersededFailures(t *testing.T) {
+	s := &Server{}
+	stale := pendingFreshnessReceipt(s, "receipt-stale-failed", "", "/repo/file.go", 3)
+	completeFreshnessReceipt(stale, indexer.MutationResult{
+		RequestedGeneration: 3,
+		Err:                 errors.New("context deadline exceeded"),
+	})
+
+	done := make(chan indexer.MutationResult, 1)
+	ticket := &indexer.MutationTicket{Path: "/repo/file.go", Generation: 5, Done: done}
+	receipt := s.trackMutationTicket(ticket)
+	done <- indexer.MutationResult{
+		RequestedGeneration: 5,
+		AppliedGeneration:   5,
+		Reindexed:           true,
+	}
+	close(done)
+	<-receipt.done
+
+	if _, loaded := s.mutationReceipts.Load("receipt-stale-failed"); !loaded {
+		t.Fatal("stale receipt was deleted; it must stay queryable for the mutation-commit ledger")
+	}
+	resolved := stale.outcome(false)
+	if resolved.Err != nil || !resolved.Reindexed || resolved.AppliedGeneration != 5 {
+		t.Fatalf("stale failed receipt not resolved after a successful ticket: %+v", resolved)
+	}
+	if _, loaded := s.mutationReceipts.Load(receipt.id); !loaded {
+		t.Fatal("successful receipt itself was dropped before retention")
+	}
+}
+
+func TestMutationFreshnessSuccessKeepsPendingSamePathReceipts(t *testing.T) {
+	s := &Server{mutationSafetyWait: time.Millisecond}
+	inflight := pendingFreshnessReceipt(s, "receipt-inflight", "repo-a", "/repo-a/file.go", 4)
+
+	appliedResult := indexer.MutationResult{
+		RequestedGeneration: 9,
+		AppliedGeneration:   9,
+		Reindexed:           true,
+	}
+	succeeded := pendingFreshnessReceipt(s, "receipt-success", "repo-a", "/repo-a/file.go", 9)
+	completeFreshnessReceipt(succeeded, appliedResult)
+	s.resolveSupersededFailedReceipts("/repo-a/file.go", 9, appliedResult)
+
+	if _, loaded := s.mutationReceipts.Load("receipt-inflight"); !loaded {
+		t.Fatal("a still-pending receipt for the same path was dropped by the resolve")
+	}
+	if outcome := inflight.outcome(true); outcome.Pending != true {
+		t.Fatalf("a still-pending receipt was marked completed by the resolve: %+v", outcome)
+	}
+	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
+	if err == nil || !strings.Contains(err.Error(), "receipt-inflight") {
+		t.Fatalf("barrier no longer reports the in-flight receipt: %v", err)
+	}
+}
+
 func TestMutationReposForSymbolIDsUnresolvedWidensBarrier(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{

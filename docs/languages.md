@@ -11,7 +11,7 @@ Three engine tiers are used, in order of decreasing extraction depth:
   symbols, resolved call edges, ORM/contract/dataflow extraction, and accurate
   node ranges. Languages: Go, TypeScript, JavaScript, Python, Rust, Java, C#,
   Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Dart, OCaml, Lua, Bash, SQL,
-  HTML, CSS, Markdown, OrgMode, Protobuf, YAML, TOML, HCL, Dockerfile.
+  HTML, CSS, Markdown, OrgMode, Protobuf, YAML, TOML, HCL, Dockerfile, Julia.
 - **regex** (~60 languages) — pattern-matched line scanning with indent / brace /
   keyword block heuristics. Captures top-level symbols and imports; call edges
   vary per language. Used where no upstream tree-sitter grammar is available
@@ -84,6 +84,7 @@ on interface nodes stores the expected method set for implementation matching.
 | Dart | Full | Full | Classes/Enums/Mixins/Extensions | Abstract interface | Full | Full | Full |
 | OCaml | Full | Full (class) | Types/Modules | Module types | open | Full | Full |
 | Lua | Full | Full (M.func/M:method) | - | - | require() | Full | Full |
+| Julia | Full (long + short form, `where` syntax) | Full (qualified `Base.show`, operators) | Structs/abstract/primitive + fields | - | Full (`using`/`import`/`include`, selective lists incl. macros/operators) | Full (incl. broadcast, macro calls, `Vector{Int}` constructors) | `const` (with `member_of`) |
 
 ### Rust specifics
 
@@ -107,6 +108,87 @@ exports (`#[no_mangle]`, `#[wasm_bindgen]`, pyo3, napi). Declarations inside an
 language, so a missing definition is not a missing implementation.
 
 Recent extraction refinements (each covered by a per-feature CI golden): Java `@interface` annotation types index as interfaces and participate in implementation matching; Java `new T(){…}` and C# `new { … }` anonymous classes/types become synthetic type nodes with an `extends` edge (to the instantiated type, or to `object` for C#); JS/TS arrow-valued class fields (`x = () => {…}`) are emitted as callable methods; JS/TS named imports emit one `imports` edge per binding (alias-aware via `Edge.Alias`) and barrel re-exports emit `re_exports` edges; JS/TS cross-file imports resolve onto the target file/symbol for relative specifiers (`./x`, `../x`) and for `tsconfig.json` / `jsconfig.json` `compilerOptions.paths` / `baseUrl` path aliases (`@/lib/x`), so callers / usages / blast-radius span aliased imports the same as relative ones; chained / factory-call receivers (`New().Build()`) carry an inferred `receiver_type`. See [features.md](features.md) and [architecture.md](architecture.md) for the edge semantics.
+
+### Julia specifics
+
+`module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
+is reserved for ecosystem packages) and carry the module's `export` list in
+`Meta["exports"]` — including exported macros and operators, recorded
+verbatim (`export @m, ⊗` records `@m` and `⊗`) — and the Julia 1.11
+`public` list in `Meta["public"]` (public-without-reexport, operators
+included); definitions, constants and
+nested modules inside a module get `member_of` edges to it.
+Node ids stay flat — the enclosing module rides on `Meta["scope_mod"]`, the
+Rust `mod` convention — and two definitions that would collide on one id
+(`f` in module `A` and `f` in module `B`) separate through the shared
+line-suffix helper. Qualified method definitions (`function Base.show(...)`,
+`function Base.:+`) become `KindMethod` with `Meta["receiver"]`, mirroring
+the Lua `M.func` convention. Julia has no constructor keyword, so a callable
+named after a type is that type's constructor and takes the cross-language
+`<Type>.<init>` spelling Java, C# and Swift already emit — outer, short and
+inner forms alike. Struct fields are `KindField` nodes with `member_of` into
+the struct; supertypes (`struct X <: Y`) emit `extends` edges with the full
+right-hand path in `Meta["base_path"]` (python extractor convention).
+
+`using M: a, b` / `import M as Alias` keep the module as the import target,
+including when the path is dotted or relative (`using A.B: x`, `import
+..Up: q`). A selective list additionally emits one edge per binding to
+`unresolved::import::<module>::<name>` — the per-binding shape JS/TS
+already uses, bounded by the same cap so one statement cannot dwarf a
+file's graph — and a rename rides on `Edge.Alias` plus `Meta["alias"]`,
+because the SQLite edges table has no alias column and Meta is the half
+that survives the round-trip. A module alias is applied at extraction time, so `import Foo as F`
+followed by `F.process(x)` records a call to `Foo.process`: the same target
+the unaliased spelling produces. Nothing in the resolver reads the import
+`Meta` — the edge targets are the consumable surface. All imports including
+`include("file.jl")` target `unresolved::import::<path>`.
+Calls attribute to the enclosing function-like definition (long form, short
+form, macro, or nested closure) and cover qualified (`Mod.f`),
+parametric-constructor (`Vector{Int}(xs)` → `unresolved::Vector{Int}`), and
+broadcast (`f.(x)`, `Meta["broadcast"]`) callees, plus bare and
+module-qualified macro invocations (`Base.@time` → `unresolved::Base.time`,
+`Meta["macro"]`). A callee chained onto a call result (`get(cfg).run(x)`)
+has no decodable receiver and records its method name (`unresolved::run`);
+quoted operators normalise (`Base.:+` and `Base.:(==)` →
+`unresolved::Base.+` / `unresolved::Base.==`). Docstrings attach as
+`Meta["doc"]` to long and short definitions, types, modules and constants,
+but only when the string sits immediately above the documented object —
+the adjacency Julia itself enforces, where a blank line or an own-line
+comment detaches the string and leaves the definition undocumented. A
+string at the top of a function body is executable code, not
+documentation. The explicit `@doc "text" object` form (which is what
+Julia lowers every docstring to) attaches the same way, with the text
+taken from inside the macro call. The stored text is the first PROSE
+paragraph, skipping the
+indented signature block Julia's convention opens a docstring with.
+
+What is **not** covered:
+
+- **Calls inside anonymous functions and do-blocks**
+  (`double = x -> f(x)`, `map(xs) do y g(y) end`) attribute to the
+  ENCLOSING function — source locality outranks a closure node for the
+  graph's consumers, so the closure itself mints no node. A short-form
+  definition nested in a block (`nested() = 1`) is still its own node.
+- **`@enum` members** are not extracted — the macro generates the enum
+  type and its member constants at runtime.
+- **`@.`** records no macro edge (a target named `.` is meaningless);
+  calls inside its arguments edge normally.
+- **Operator calls in infix position** (`a + b`) — dispatch on operators is
+  not statically attributable. Explicit call syntax (`Base.:+(a, b)`) is a
+  normal call.
+- **Typed constant declarations** (`const X::Int = 1`) mint no variable node.
+- **Parametric constructor definitions** (`Box{T}(x) where T = …`) are
+  extracted as plain functions named `Box{T}` — not with the
+  `<Type>.<init>` constructor spelling, and not bound to `Box`.
+- **Callable-object definitions** (`(f::Box)(x) = …`) are not extracted.
+- **Calls inside string interpolation** (`"$(f(x))"`) are not walked.
+- **Two methods of one name on one physical line**
+  (`g(x) = h(x); g(y) = k(y)`) collapse onto one node — line numbers cannot
+  separate them — though each body's call edges are preserved.
+- **Call and macro edges are extraction-side facts**: targets are
+  `unresolved::` names, and binding them to definitions in another file —
+  including qualified calls into another file's module, and constructor
+  call sites to `<Type>.<init>` — is resolver work, not attempted here.
 
 ## Data, config, build
 
@@ -188,7 +270,6 @@ What is **not** covered:
 
 | Language | Extensions | What it extracts |
 |----------|------------|------------------|
-| Julia | `.jl` | `function`, `struct`, `module`, `using` / `import` |
 | R | `.r`, `.R` | Function defs; `library` / `require` / `source` |
 | MATLAB | `.mlx` | `function` (end-terminated), `classdef`, `import a.b.c` |
 | Mathematica | `.wl`, `.wls`, `.nb` | `name[args_] := body`, `SetDelayed`, `Get[…]` / `Needs[…]` |

@@ -602,9 +602,14 @@ func TestSQLiteMutationReceiptTopologyMutations(t *testing.T) {
 		if nodes != 1 {
 			t.Fatalf("EvictFile nodes = %d, want 1", nodes)
 		}
-		if receipt := store.EndMutationReceipt(token); receipt.Complete {
-			t.Fatalf("EvictFile returned complete receipt: %+v", receipt)
+		receipt := store.EndMutationReceipt(token)
+		if !receipt.Complete || !receipt.ResolutionRelevant {
+			t.Fatalf("EvictFile receipt = %+v, want complete exact eviction frontier", receipt)
 		}
+		if want := []string{"a.go"}; !slices.Equal(receipt.DefinitionFiles, want) {
+			t.Fatalf("EvictFile definition files = %v, want %v", receipt.DefinitionFiles, want)
+		}
+		assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A")
 
 		noop := store.BeginMutationReceipt()
 		store.EvictFile("missing.go")
@@ -783,5 +788,247 @@ func assertSQLiteReceiptContains(t *testing.T, label string, got []string, want 
 		if !slices.Contains(got, value) {
 			t.Errorf("%s = %v, missing %q", label, got, value)
 		}
+	}
+}
+
+func TestSQLiteMutationReceiptEvictFilesCapturesExactFrontier(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/b.go::B", Kind: graph.KindType, Name: "B", FilePath: "b.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{{
+		From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: graph.EdgeCalls, FilePath: "keep.go", Line: 3,
+	}})
+
+	// Mirror the reindex composition: the surviving caller's edge is parked
+	// under an unresolved stub BEFORE the eviction, so no resolved incoming
+	// edge from a surviving source is deleted and the receipt can stay exact.
+	token := store.BeginMutationReceipt()
+	in := store.GetInEdgesByNodeIDs([]string{"repo/a.go::A"})
+	stub := in["repo/a.go::A"][0]
+	oldTo := stub.To
+	graph.StashRestubProvenance(stub)
+	stub.To = graph.UnresolvedMarker + "A"
+	store.ReindexEdges([]graph.EdgeReindex{{Edge: stub, OldTo: oldTo}})
+	nodes, edges := store.EvictFiles([]string{"a.go", "b.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if nodes != 2 || edges != 0 {
+		t.Fatalf("EvictFiles removed nodes=%d edges=%d, want 2/0 (the restubbed edge no longer touches the doomed nodes)", nodes, edges)
+	}
+	if !receipt.Complete {
+		t.Fatalf("EvictFiles receipt incomplete (%q), want exact frontier: %+v", receipt.IncompleteReason, receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("evicting referenceable definitions must be resolution-relevant: %+v", receipt)
+	}
+	if want := []string{"a.go", "b.go"}; !slices.Equal(receipt.DefinitionFiles, want) {
+		t.Fatalf("definition files = %v, want %v", receipt.DefinitionFiles, want)
+	}
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A", "pkg.A", "B")
+	assertSQLiteReceiptContains(t, "target ids", receipt.TargetIDs, "repo/a.go::A", "repo/b.go::B")
+	assertSQLiteReceiptContains(t, "changed files", receipt.ChangedFiles, "a.go", "b.go")
+	if slices.Contains(receipt.DefinitionFiles, "keep.go") {
+		t.Fatalf("unrelated file leaked into definition frontier: %+v", receipt)
+	}
+}
+
+func TestSQLiteMutationReceiptEvictFilesNonreferenceableOnlyStaysNeutral(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddNode(&graph.Node{ID: "repo/doc.md::note", Kind: graph.KindImport, Name: "note", FilePath: "doc.md", RepoPrefix: "repo"})
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"doc.md"})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("non-referenceable eviction receipt incomplete (%q): %+v", receipt.IncompleteReason, receipt)
+	}
+	if receipt.ResolutionRelevant || len(receipt.ResolutionFiles()) != 0 {
+		t.Fatalf("non-referenceable eviction entered the resolution frontier: %+v", receipt)
+	}
+	assertSQLiteReceiptContains(t, "changed files", receipt.ChangedFiles, "doc.md")
+}
+
+// SQLite twin of the graph-side restub-write pin: the parked stub keeps the
+// receipt complete and resolution-relevant, contributes its name, and keeps
+// the surviving caller's file out of UnresolvedFiles.
+func TestSQLiteMutationReceiptRestubWriteStaysOutOfUnresolvedFiles(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{{
+		From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: graph.EdgeCalls,
+		FilePath: "keep.go", Line: 3, Origin: graph.OriginLSPResolved, Confidence: 1,
+	}})
+	in := store.GetInEdgesByNodeIDs([]string{"repo/a.go::A"})
+	if len(in["repo/a.go::A"]) != 1 {
+		t.Fatalf("expected one incoming edge, got %d", len(in["repo/a.go::A"]))
+	}
+	e := in["repo/a.go::A"][0]
+
+	token := store.BeginMutationReceipt()
+	oldTo := e.To
+	graph.StashRestubProvenance(e)
+	e.To = graph.UnresolvedMarker + "A"
+	store.ReindexEdges([]graph.EdgeReindex{{Edge: e, OldTo: oldTo}})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("restub write must not void the receipt: %+v", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("a parked stub still needs the name frontier: %+v", receipt)
+	}
+	if slices.Contains(receipt.UnresolvedFiles, "keep.go") {
+		t.Fatalf("restubbed caller file leaked into UnresolvedFiles (forward pass would demote its tier): %+v", receipt)
+	}
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A")
+}
+
+// SQLite twin: an eviction deleting a resolved incoming edge from a surviving
+// source still describes its resolution delta exactly, on every active
+// window. No pass reconstructs a deleted edge, so failing closed would only
+// buy a larger pass onto the same graph.
+func TestSQLiteMutationReceiptEvictSurvivingIncomingEdgeStaysExact(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{{
+		From: "repo/keep.go::Keep", To: "repo/a.go::A", Kind: graph.EdgeCalls, FilePath: "keep.go", Line: 3,
+	}})
+
+	outer := store.BeginMutationReceipt()
+	inner := store.BeginMutationReceipt()
+	store.EvictFile("a.go")
+	store.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", QualName: "pkg.A", FilePath: "a.go", RepoPrefix: "repo"})
+	innerReceipt := store.EndMutationReceipt(inner)
+	outerReceipt := store.EndMutationReceipt(outer)
+
+	if !innerReceipt.Complete || !innerReceipt.ResolutionRelevant {
+		t.Fatalf("inner receipt = %+v, want a complete resolution-relevant delta", innerReceipt)
+	}
+	if !outerReceipt.Complete || !outerReceipt.ResolutionRelevant {
+		t.Fatalf("outer receipt = %+v, want a complete resolution-relevant delta", outerReceipt)
+	}
+	assertSQLiteReceiptContains(t, "evicted names", innerReceipt.EvictedNames, "A", "pkg.A")
+	if edges := store.GetOutEdges("repo/keep.go::Keep"); len(edges) != 0 {
+		t.Fatalf("surviving caller edges = %v, want the eviction to have destroyed it", edges)
+	}
+}
+
+// SQLite twin of the non-referenceable case: the surviving file's import edge
+// into a doomed package node is destroyed, and the package's own import stubs
+// are what the receipt has to describe.
+func TestSQLiteMutationReceiptEvictImportToNonreferenceableStaysExact(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/a.go::pkg", Kind: graph.KindPackage, Name: "pkg", QualName: "example/pkg", FilePath: "a.go", RepoPrefix: "repo"},
+		{ID: "repo/keep.go::Keep", Kind: graph.KindFunction, Name: "Keep", FilePath: "keep.go", RepoPrefix: "repo"},
+	}, []*graph.Edge{{
+		From: "repo/keep.go::Keep", To: "repo/a.go::pkg", Kind: graph.EdgeImports, FilePath: "keep.go",
+	}})
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"a.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
+	}
+	assertSQLiteReceiptContains(t, "evicted names", receipt.EvictedNames, "import::example/pkg", "import::pkg")
+	if edges := store.GetOutEdges("repo/keep.go::Keep"); len(edges) != 0 {
+		t.Fatalf("surviving importer edges = %v, want the eviction to have destroyed it", edges)
+	}
+}
+
+func TestSQLiteMutationReceiptEvictAmbiguousImportPackageCandidateRecordsImportStub(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{{
+		ID: "one::pkg", Kind: graph.KindPackage, Name: "pkg", QualName: "example/pkg",
+		FilePath: "a/one.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"a/one.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want a complete resolution-relevant delta", receipt)
+	}
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "import::example/pkg", "import::pkg")
+	assertSQLiteReceiptContains(t, "evicted names", receipt.EvictedNames, "import::example/pkg", "import::pkg")
+	if want := []string{"a/one.go"}; !slices.Equal(receipt.ResolutionFiles(), want) {
+		t.Fatalf("resolution files = %v, want %v", receipt.ResolutionFiles(), want)
+	}
+}
+
+// SQLite mirror: evicting a file node contributes no stub name, but a file
+// node is an import candidate, so the receipt must stay resolution-relevant
+// and put the file in the frontier rather than certify the eviction neutral.
+func TestSQLiteMutationReceiptEvictNamelessNodeStaysResolutionRelevant(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/b.go", Kind: graph.KindFile, Name: "b.go", FilePath: "b.go", RepoPrefix: "repo"},
+	}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"b.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete {
+		t.Fatalf("receipt = %+v, want complete", receipt)
+	}
+	if !receipt.ResolutionRelevant {
+		t.Fatalf("receipt = %+v, want resolution-relevant: an evicted file node can rebind a pending import", receipt)
+	}
+	if files := receipt.ResolutionFiles(); !slices.Contains(files, "b.go") {
+		t.Fatalf("resolution files = %v, want the evicted file in the frontier", files)
+	}
+}
+
+// The SQLite mirror of the Graph EvictedNames split: the name frontier's input
+// carries the vanished definition and not the added one, which the file
+// frontier already reaches through DefinitionFiles.
+func TestSQLiteMutationReceiptEvictedNamesCarryOnlyVanishedDefinitions(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{{
+		ID: "repo/gone.go::Gone", Kind: graph.KindFunction, Name: "Gone", QualName: "pkg.Gone",
+		FilePath: "gone.go", RepoPrefix: "repo",
+	}}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.AddBatch([]*graph.Node{{
+		ID: "repo/new.go::Added", Kind: graph.KindFunction, Name: "Added", QualName: "pkg.Added",
+		FilePath: "new.go", RepoPrefix: "repo",
+	}}, nil)
+	store.EvictFiles([]string{"gone.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "Added", "pkg.Added", "Gone", "pkg.Gone")
+	assertSQLiteReceiptContains(t, "evicted names", receipt.EvictedNames, "Gone", "pkg.Gone")
+	for _, added := range []string{"Added", "pkg.Added"} {
+		if slices.Contains(receipt.EvictedNames, added) {
+			t.Fatalf("evicted names %v include the added definition %q", receipt.EvictedNames, added)
+		}
+	}
+}
+
+func TestSQLiteMutationReceiptEvictUnmappedImportCandidateKindFailsClosed(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	store.AddBatch([]*graph.Node{{
+		ID: "one::mod", Kind: graph.KindModule, Name: "mod", QualName: "example/pkg",
+		FilePath: "m/mod.go", RepoPrefix: "one",
+	}}, nil)
+
+	token := store.BeginMutationReceipt()
+	store.EvictFiles([]string{"m/mod.go"})
+	receipt := store.EndMutationReceipt(token)
+
+	if receipt.Complete {
+		t.Fatalf("receipt = %+v, want incomplete: the kind is a qualified-name import candidate without an exact stub mapping", receipt)
 	}
 }

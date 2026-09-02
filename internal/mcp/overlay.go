@@ -172,6 +172,14 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			qStart = time.Now()
 		}
 		res, hErr := h(ctx, req)
+		// Book the retrieval half of the savings ledger for a DIRECT legacy
+		// call. Facade calls do not reach here under their legacy name — the
+		// facade holds the unwrapped handler (prepareTool) and books in
+		// invokeFacadeSpec — and facade names are not in the allow-list, so
+		// the two paths cannot double-count.
+		if hErr == nil {
+			s.recordRetrievalSavings(ctx, req.Params.Name, res)
+		}
 		// Opt-in usage telemetry: count this tool invocation by name only —
 		// never arguments or results. nil-safe, consent-gated, and fail-silent,
 		// so a disabled or absent recorder adds nothing to the dispatch path.

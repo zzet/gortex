@@ -63,6 +63,9 @@ func (s *Server) handleAnalyzeConstructorsMissingFields(ctx context.Context, req
 		if n.Kind != graph.KindField {
 			continue
 		}
+		if isUnsettableMember(n) {
+			continue
+		}
 		for _, e := range s.graph.GetOutEdges(n.ID) {
 			if e.Kind != graph.EdgeMemberOf {
 				continue
@@ -189,6 +192,25 @@ func (s *Server) handleAnalyzeConstructorsMissingFields(ctx context.Context, req
 //   - meta["nullable"]   bool — explicit opt-out
 //   - meta["optional"]   bool — same intent, different convention
 //   - meta["json_tag"]   string containing "omitempty" — Go convention
+// isUnsettableMember reports whether a field-kind member cannot be
+// assigned at construction, which makes it a guaranteed false positive
+// here: this heuristic asks which of a type's members an instantiation
+// site left unset, and a member that no instantiation CAN set is
+// missing at every site forever. C# indexers and events are both
+// field-kind member nodes and both qualify - an indexer needs an index
+// argument, so it can never appear in an object initializer, and an
+// event is reachable only through += and -=.
+func isUnsettableMember(n *graph.Node) bool {
+	if n == nil || n.Meta == nil {
+		return false
+	}
+	switch k, _ := n.Meta["kind"].(string); k {
+	case "indexer", "event_accessor":
+		return true
+	}
+	return false
+}
+
 func isNullableField(n *graph.Node) bool {
 	if n.Meta == nil {
 		return false

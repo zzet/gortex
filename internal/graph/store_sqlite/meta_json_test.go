@@ -31,7 +31,47 @@ func roundTrip(t *testing.T, in map[string]any) map[string]any {
 // TestMetaRoundTripExactTypes is the fidelity canary: every key the audit
 // found read with a raw type-assertion must survive a JSON round-trip with
 // its exact Go type, or the corresponding reader silently breaks.
+func TestDecodeLegacyJSONEFFluentExactType(t *testing.T) {
+	got, err := decodeMeta([]byte(`{
+		"ef_fluent": [{
+			"context": "ProbeContext",
+			"kind": "mapping",
+			"line": 12,
+			"ordinal": 0,
+			"entity": "Widget",
+			"table": "widget|rows",
+			"schema": "core",
+			"relation": "table"
+		}]
+	}`))
+	if err != nil {
+		t.Fatalf("decode legacy JSON ef_fluent: %v", err)
+	}
+	actions, ok := got["ef_fluent"].([]map[string]any)
+	if !ok {
+		t.Fatalf("ef_fluent type = %T, want []map[string]any", got["ef_fluent"])
+	}
+	if len(actions) != 1 {
+		t.Fatalf("ef_fluent length = %d, want 1", len(actions))
+	}
+	assertType[string](t, actions[0], "table", "widget|rows")
+	assertType[int](t, actions[0], "line", 12)
+	assertType[int](t, actions[0], "ordinal", 0)
+}
+
 func TestMetaRoundTripExactTypes(t *testing.T) {
+	var efWire metaWire
+	if err := efWire.UnmarshalJSON([]byte(`{"ef_fluent":[{"context":"ProbeContext","kind":"mapping","line":11,"ordinal":0,"entity":"Widget","table":"widgets","schema":"","relation":"table"}]}`)); err != nil {
+		t.Fatalf("decode structured ef_fluent: %v", err)
+	}
+	actions, ok := efWire.Extra["ef_fluent"].([]map[string]any)
+	if !ok {
+		t.Fatalf("structured ef_fluent type = %T, want []map[string]any", efWire.Extra["ef_fluent"])
+	}
+	if len(actions) != 1 || actions[0]["kind"] != "mapping" || actions[0]["entity"] != "Widget" {
+		t.Fatalf("structured ef_fluent = %#v", actions)
+	}
+
 	shape := &contracts.Shape{
 		Kind:   "struct",
 		Fields: []contracts.ShapeField{{Name: "id", Type: "int64", Required: true}},

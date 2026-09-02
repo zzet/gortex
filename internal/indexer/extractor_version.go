@@ -12,6 +12,14 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+const (
+	// postExtractionPolicySnapshotKey is a reserved RepoIndexState extractor-
+	// version key. It versions admission rules that run after every language
+	// extractor, so it must never be returned as a language to re-stage.
+	postExtractionPolicySnapshotKey = "_post_extraction_policy"
+	postExtractionPolicyVersion     = 2
+)
+
 // extractorVersions records the logic version of each language's
 // extractor. Bump a language's entry when its extraction logic changes
 // in a way that should re-extract already-indexed files whose content
@@ -32,11 +40,12 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 12,                                     // receiverless calls carry arg_count / type_arg_count for #559 (was: params parameters emit complete shape and arity evidence)
+	"csharp": 20,                                     // indexers and accessor-bearing events are emitted as members and own their body calls (was: verbatim-identifier canonicalization unified across type refs, the base-list prescan, and partial identity)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
 	"swift":  2,                                      // generic calls and ordinary member calls emit call edges
+	"julia":  3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -87,6 +96,7 @@ var extractorSaltExtLang = map[string]string{
 	".exs":    "elixir",
 	".sh":     "bash",
 	".bash":   "bash",
+	".jl":     "julia",
 }
 
 // ExtractorLangForFile returns the extractor-staleness language key for a
@@ -106,21 +116,21 @@ func extractorVersionForLang(lang string) int {
 	return 1
 }
 
-// merkleSaltFor returns the Merkle leaf salt for a repo-relative path:
-// "" when the file's language extractor is at the baseline version 1
-// (so the leaf equals the content hash and nothing changes), or
-// "lang@N" once a language's extractor version is bumped, so its files
-// re-extract on the next reconcile even when their content is unchanged.
+// merkleSaltFor returns the Merkle leaf salt for a repo-relative path. Every
+// mapped source language carries the global post-extraction policy epoch; a
+// bumped language additionally carries its extractor version. An unmapped
+// extension remains content-only and therefore has no salt.
 func merkleSaltFor(rel string) string {
 	lang := extractorSaltExtLang[strings.ToLower(filepath.Ext(rel))]
 	if lang == "" {
 		return ""
 	}
+	policySalt := postExtractionPolicySnapshotKey + "@" + strconv.Itoa(postExtractionPolicyVersion)
 	v := extractorVersionForLang(lang)
 	if v <= 1 {
-		return ""
+		return policySalt
 	}
-	return lang + "@" + strconv.Itoa(v)
+	return policySalt + "|" + lang + "@" + strconv.Itoa(v)
 }
 
 // ExtractorVersionStaleLangs reports which languages' extractors have been
@@ -146,14 +156,55 @@ func ExtractorVersionStaleLangs(storedJSON string) []string {
 }
 
 // staleLangsBetween returns the languages whose stored version is behind the
-// current version — only languages present in BOTH maps are compared, so a
-// language the stored snapshot never recorded is not spuriously flagged.
+// current version. Iteration is over CURRENT, not stored: a language the
+// stored snapshot never recorded is compared against the implicit baseline
+// version 1 that every untracked language carries, and flagged only when the
+// running binary has raised it above that baseline.
+//
+// The reserved post-extraction policy epoch is global: when current tracks it
+// and stored is missing or behind, every real current language is stale. A
+// language present in stored but absent from current is dropped because its
+// extension is no longer version-tracked.
 func staleLangsBetween(stored, current map[string]int) []string {
-	var stale []string
-	for lang, storedV := range stored {
-		if cur, ok := current[lang]; ok && storedV < cur {
-			stale = append(stale, lang)
+	// No baseline at all is "we do not know what produced this graph",
+	// not "everything is behind".
+	if len(stored) == 0 {
+		return nil
+	}
+
+	staleSet := make(map[string]struct{})
+	if currentPolicy, tracked := current[postExtractionPolicySnapshotKey]; tracked {
+		storedPolicy, found := stored[postExtractionPolicySnapshotKey]
+		if !found || storedPolicy < currentPolicy {
+			for lang := range current {
+				if lang != postExtractionPolicySnapshotKey {
+					staleSet[lang] = struct{}{}
+				}
+			}
 		}
+	}
+
+	for lang, cur := range current {
+		if lang == postExtractionPolicySnapshotKey {
+			continue
+		}
+		storedV, recorded := stored[lang]
+		if !recorded {
+			// Never recorded means the snapshot's binary tracked no
+			// version for this language: the implicit baseline is 1.
+			if cur > 1 {
+				staleSet[lang] = struct{}{}
+			}
+			continue
+		}
+		if storedV < cur {
+			staleSet[lang] = struct{}{}
+		}
+	}
+
+	var stale []string
+	for lang := range staleSet {
+		stale = append(stale, lang)
 	}
 	sort.Strings(stale)
 	return stale
@@ -201,11 +252,11 @@ func extractorLangStale(set map[string]struct{}, rel string) bool {
 	return ok
 }
 
-// extractorVersionsSnapshot returns a copy of the current per-language
-// extractor versions for persistence in repo_index_state, so a future
-// reconcile can tell which extractor produced the stored graph.
+// extractorVersionsSnapshot returns the current per-language extractor versions
+// plus the reserved global post-extraction policy epoch for persistence in
+// repo_index_state.
 func extractorVersionsSnapshot() map[string]int {
-	out := make(map[string]int, len(extractorSaltExtLang))
+	out := make(map[string]int, len(extractorSaltExtLang)+1)
 	seen := map[string]bool{}
 	for _, lang := range extractorSaltExtLang {
 		if seen[lang] {
@@ -214,5 +265,6 @@ func extractorVersionsSnapshot() map[string]int {
 		seen[lang] = true
 		out[lang] = extractorVersionForLang(lang)
 	}
+	out[postExtractionPolicySnapshotKey] = postExtractionPolicyVersion
 	return out
 }

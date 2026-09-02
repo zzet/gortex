@@ -34,6 +34,12 @@ import (
 type csharpDeferredFieldAssign struct {
 	name string
 	line int
+	// offset is the assignment target's own start byte, so the shadow
+	// question is asked at the write's coordinate. With no coordinate
+	// (-1) the question falls back to function-wide, and an expired
+	// same-named binder elsewhere in the method deletes a genuine
+	// write (round-5 finding 3).
+	offset int
 }
 
 // csharpFieldNamesByType indexes the file's declared field names per
@@ -87,7 +93,8 @@ func emitCSharpFieldIdentifierUses(
 	calls []csharpDeferredCall, accesses []csharpDeferredAccess,
 	fieldAssigns []csharpDeferredFieldAssign,
 	src []byte, filePath string, funcRanges *csharpFuncLookup,
-	localNamesByOwner map[string]map[string]bool,
+	paramsByOwner map[string]map[string]bool,
+	localScopes csharpLocalScopes,
 	builtinsByOwner map[string]map[string]string,
 	result *parser.ExtractionResult,
 ) {
@@ -95,12 +102,17 @@ func emitCSharpFieldIdentifierUses(
 	if len(fieldsByType) == 0 {
 		return
 	}
-	paramsByOwner := csharpParamNamesByOwner(result)
 
 	// eligible resolves the enclosing owner and reports whether name is
-	// an unshadowed field of the owner's type.
-	eligible := func(line int, name string) (owner, ownerType string, ok bool) {
-		owner = funcRanges.enclosing(line)
+	// an unshadowed field of the owner's type. Sites carrying a byte
+	// offset ask the shadow question at their own coordinate — a lambda
+	// parameter, foreach variable, or builtin-typed local elsewhere in
+	// the method must not delete a genuine field use outside its
+	// extent. A site with no coordinate (offset < 0) keeps the
+	// function-wide questions, which can only withhold a use, never
+	// invent one.
+	eligible := func(line, offset int, name string) (owner, ownerType string, ok bool) {
+		owner = funcRanges.enclosingAt(line, offset)
 		if owner == "" {
 			return "", "", false
 		}
@@ -108,8 +120,19 @@ func emitCSharpFieldIdentifierUses(
 		if ownerType == "" || !fieldsByType[ownerType][name] {
 			return "", "", false
 		}
-		if paramsByOwner[owner][name] || localNamesByOwner[owner][name] ||
-			builtinsByOwner[owner][name] != "" {
+		shadowed := localScopes.shadowsAnywhere(owner, name)
+		builtinVeto := builtinsByOwner[owner][name] != ""
+		if offset >= 0 {
+			shadowed = localScopes.shadows(owner, name, offset)
+			// The scope index already answers offset-aware for EVERY
+			// local, builtin-typed ones included - the flat builtin map
+			// would resurrect the function-wide question and delete a
+			// read/write after the local's block has closed (round-5
+			// finding 3's read half). It stays as the fallback veto only
+			// for sites with no coordinate.
+			builtinVeto = false
+		}
+		if paramsByOwner[owner][name] || shadowed || builtinVeto {
 			return "", "", false
 		}
 		return owner, ownerType, true
@@ -125,8 +148,8 @@ func emitCSharpFieldIdentifierUses(
 		kind  graph.EdgeKind
 	}
 	seen := map[siteKey]bool{}
-	emit := func(line int, name string, kind graph.EdgeKind) {
-		owner, ownerType, ok := eligible(line, name)
+	emit := func(line, offset int, name string, kind graph.EdgeKind) {
+		owner, ownerType, ok := eligible(line, offset, name)
 		if !ok {
 			return
 		}
@@ -148,7 +171,7 @@ func emitCSharpFieldIdentifierUses(
 		if !c.isMember || c.recvType != "" || !csharpBareIdentifier(c.receiver) {
 			continue
 		}
-		emit(c.line, c.receiver, graph.EdgeReads)
+		emit(c.line, c.offset, c.receiver, graph.EdgeReads)
 	}
 
 	for _, a := range accesses {
@@ -167,10 +190,10 @@ func emitCSharpFieldIdentifierUses(
 		if csharpAccessInCallPosition(a.node) {
 			continue
 		}
-		emit(a.line, recv.Content(src), graph.EdgeReads)
+		emit(a.line, int(a.node.StartByte()), recv.Content(src), graph.EdgeReads)
 	}
 
 	for _, fa := range fieldAssigns {
-		emit(fa.line, fa.name, graph.EdgeWrites)
+		emit(fa.line, fa.offset, fa.name, graph.EdgeWrites)
 	}
 }

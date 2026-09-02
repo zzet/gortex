@@ -14,8 +14,9 @@ import (
 // buildFixture writes the fixture files under a temp dir, indexes them
 // with the real per-language extractors (so the graph carries the
 // exact node-ID and unresolved-edge conventions the daemon's index
-// produces), and returns the graph plus the repo root.
-func buildFixture(t *testing.T, files map[string]string) (*graph.Graph, string) {
+// produces), and returns the graph plus the repo root. testing.TB so
+// benchmarks can build the same fixtures.
+func buildFixture(t testing.TB, files map[string]string) (*graph.Graph, string) {
 	t.Helper()
 	dir := t.TempDir()
 	g := graph.New()

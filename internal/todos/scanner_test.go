@@ -214,6 +214,35 @@ func TestBuildGraphArtifacts_DisambiguatesSameLine(t *testing.T) {
 	}
 }
 
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The indexer keys node identity, eviction, and incremental
+	// replacement by the exact relPath spelling it hands the builder
+	// (OS-native separators for subdirectory files on Windows). A
+	// re-spelled artifact is invisible to those sweeps and goes stale.
+	//
+	// The spelling under test is written out rather than composed with
+	// filepath.Join: on a POSIX runner Join yields the forward-slash
+	// form, which the pre-fix ToSlash call also returned, so the
+	// assertion would hold with or without the fix.
+	const rel = `src\data\foo.go`
+	nodes, edges := BuildGraphArtifacts(rel, []Finding{{Tag: "TODO", Text: "x", Line: 7}}, "go")
+	if len(nodes) != 1 || len(edges) != 1 {
+		t.Fatalf("nodes = %d, edges = %d", len(nodes), len(edges))
+	}
+	if nodes[0].ID != rel+"::todo:7" {
+		t.Errorf("node id = %q, want %q", nodes[0].ID, rel+"::todo:7")
+	}
+	if nodes[0].FilePath != rel {
+		t.Errorf("node file path = %q, want %q", nodes[0].FilePath, rel)
+	}
+	if edges[0].From != rel {
+		t.Errorf("edge.From = %q, want %q", edges[0].From, rel)
+	}
+	if edges[0].FilePath != rel {
+		t.Errorf("edge file path = %q, want %q", edges[0].FilePath, rel)
+	}
+}
+
 func repeat(s string, n int) string {
 	out := make([]byte, 0, len(s)*n)
 	for range n {

@@ -83,11 +83,13 @@ func (s *Server) registerOverlayTools() {
 	s.registerOverlayBranchTools()
 }
 
-// overlaySessionID returns the calling MCP session ID, or a structured
-// MCP error result when no session is on the context. Used by every
+// overlaySessionID returns the calling request's overlay cohort id —
+// SessionIDFromContext by default, or the X-Gortex-Overlay-Session
+// override when one was set (see WithOverlayCohortID) — or a
+// structured MCP error result when neither is present. Used by every
 // overlay_* handler.
 func (s *Server) overlaySessionID(ctx context.Context) (string, *mcp.CallToolResult) {
-	id := SessionIDFromContext(ctx)
+	id := OverlayCohortIDFromContext(ctx)
 	if id == "" {
 		return "", mcp.NewToolResultError("overlay tools require an MCP session — connect via the daemon or set X-Mcp-Session-Id")
 	}

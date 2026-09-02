@@ -223,7 +223,7 @@ require (
 	github.com/coder/hnsw v0.6.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
-	github.com/gofrs/flock v0.13.0
+	github.com/gofrs/flock v0.13.1
 	github.com/gomlx/go-huggingface v0.4.1
 	github.com/google/go-github/v88 v88.0.0
 	github.com/google/uuid v1.6.0

@@ -35,7 +35,7 @@ var mediatrHandleMethods = map[string]bool{"Handle": true, "HandleAsync": true}
 
 // captureMediatRDispatch tags handler methods and stamps Send/Publish
 // placeholders. Runs at the tail of Extract so the method nodes exist.
-func captureMediatRDispatch(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte) {
+func captureMediatRDispatch(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte, funcBytes, funcLines map[string][2]int) {
 	if root == nil || result == nil {
 		return
 	}
@@ -83,8 +83,11 @@ func captureMediatRDispatch(result *parser.ExtractionResult, root *sitter.Node, 
 		}
 	})
 
-	// Pass 2: Send/Publish dispatch sites.
-	funcRanges := buildFuncRanges(result)
+	// Pass 2: Send/Publish dispatch sites. The widened owner set, not the
+	// methods-only one - a dispatch site inside an accessor or
+	// initializer body found no owner and the placeholder was dropped
+	// outright at the from=="" gate below.
+	funcRanges := csharpOwnerRanges(result, funcBytes, funcLines)
 	seen := map[string]bool{}
 	mediatrWalk(root, func(call *sitter.Node) {
 		if call.Type() != "invocation_expression" {

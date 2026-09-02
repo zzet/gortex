@@ -549,9 +549,10 @@ func printSavings(w io.Writer, sv doctorSavings) {
 			}
 		}
 	}
-	fmt.Fprintln(w, "    note: only the read-family tools write here (saved = whole-file tokens −")
-	fmt.Fprintln(w, "          returned). explore / search / relations / trace record nothing, and")
-	fmt.Fprintln(w, "          reading a whole file records 0 — so this describes those calls only.")
+	fmt.Fprintln(w, "    note: saved = whole-file tokens − returned. The read-family tools book the")
+	fmt.Fprintln(w, "          one file they stand in for; explore / search / relations / trace book")
+	fmt.Fprintln(w, "          the files their page cites, each credited once per session. Reading a")
+	fmt.Fprintln(w, "          whole file still records 0 — it displaces nothing.")
 	fmt.Fprintln(w)
 }
 

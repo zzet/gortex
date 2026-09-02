@@ -142,12 +142,13 @@ func LoadFromRepo(repoRoot string) (rules []Rule, sourcePath string, ok bool) {
 // an email) is a person.
 //
 // filePath is the unprefixed path; applyRepoPrefix downstream
-// handles multi-repo namespacing.
+// handles multi-repo namespacing. Its spelling is preserved verbatim —
+// the edge endpoint must match the extractor's file-node ID spelling
+// (OS-native separators on Windows) or the edge dangles.
 func BuildGraphArtifacts(filePath string, owners []string, language string) ([]*graph.Node, []*graph.Edge) {
 	if len(owners) == 0 {
 		return nil, nil
 	}
-	filePath = filepath.ToSlash(filePath)
 	nodes := make([]*graph.Node, 0, len(owners))
 	edges := make([]*graph.Edge, 0, len(owners))
 	for _, owner := range owners {

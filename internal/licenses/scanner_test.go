@@ -72,6 +72,29 @@ func TestBuildGraphArtifacts(t *testing.T) {
 	}
 }
 
+func TestBuildGraphArtifacts_PreservesCallerPathSpelling(t *testing.T) {
+	// The indexer keys eviction and incremental replacement by the
+	// exact relPath spelling it hands the builder; a re-spelled edge
+	// endpoint dangles from a nonexistent file node on Windows. The
+	// spelling is written out, not composed with filepath.Join: on a
+	// POSIX runner Join yields exactly what the pre-fix ToSlash call
+	// returned, so the assertion would hold either way.
+	const rel = `src\data\foo.go`
+	nodes, edges := BuildGraphArtifacts(rel, "MIT", "go")
+	if len(nodes) != 1 || len(edges) != 1 {
+		t.Fatalf("nodes = %d, edges = %d", len(nodes), len(edges))
+	}
+	if nodes[0].FilePath != rel {
+		t.Errorf("node file path = %q, want %q", nodes[0].FilePath, rel)
+	}
+	if edges[0].From != rel {
+		t.Errorf("edge.From = %q, want %q", edges[0].From, rel)
+	}
+	if edges[0].FilePath != rel {
+		t.Errorf("edge file path = %q, want %q", edges[0].FilePath, rel)
+	}
+}
+
 func TestBuildGraphArtifacts_NoSPDXReturnsEmpty(t *testing.T) {
 	nodes, edges := BuildGraphArtifacts("pkg/foo.go", "", "go")
 	if len(nodes) != 0 || len(edges) != 0 {

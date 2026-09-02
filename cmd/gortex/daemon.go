@@ -409,6 +409,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// handler needs — the MCP server, graph, config manager, overlay
 		// manager, and federation router — so this is pure composition.
 		v1 := server.NewHandler(state.mcpServer.MCPServer(), state.graph, version, logger)
+
 		if state.configManager != nil {
 			v1.SetConfigManager(state.configManager)
 		}

@@ -1652,7 +1652,7 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 // that touches one of those nodes. Returns (nodesRemoved,
 // edgesRemoved).
 func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
-	return s.evictByPredicate(evictFilePredicate, filePath)
+	return s.evictByPredicate(evictFilePredicate, filePath, true)
 }
 
 // EvictRepo removes every node in repoPrefix and every edge that
@@ -1676,7 +1676,7 @@ func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 		// that compact index for ordinary named repositories.
 		predicate = evictNonEmptyRepoPredicate
 	}
-	return s.evictByPredicate(predicate, repoPrefix)
+	return s.evictByPredicate(predicate, repoPrefix, false)
 }
 
 // -- reads ---------------------------------------------------------------

@@ -218,6 +218,18 @@ type Resolver struct {
 	// (filepathlite.Dir/Clean dominate). Read-only after build, so the
 	// workers share it lock-free.
 	dirByFilePath map[string]string
+	// retargetedTestCallFiles accumulates the caller files of EdgeCalls
+	// edges a resolution pass bound where the caller is test-classified
+	// (test file path, or an is_test-stamped source symbol). The test
+	// projection skips unresolved calls, so a call that resolves LATER
+	// needs its caller reconciled — but the definition-side derived plan
+	// never names the caller file. Consumers drain this frontier via
+	// TakeRetargetedTestCallFiles after resolution and re-run the scoped
+	// test projection over it. Guarded by retargetedMu: the parallel
+	// apply loop holds r.mu, but single-file passes and the deferred LSP
+	// apply note entries on their own paths.
+	retargetedMu            sync.Mutex
+	retargetedTestCallFiles map[string]struct{}
 	// importEdgeGen counts imports-kind edge writes noted while a resolve
 	// pass may hold pass-scoped import-adjacency retention. Write-site
 	// verdicts live at noteImportEdgeWrite's callers.
@@ -1057,6 +1069,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				placeholderStart := time.Now()
 				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 				applyPlaceholderElapsed += time.Since(placeholderStart)
+				for _, ri := range reindexBatch {
+					r.noteRetargetedCall(ri.Edge)
+				}
 				reindexTotal += len(reindexBatch)
 				if pageRevisionKnown {
 					// Ignore this pass's own committed mutations. A later delta
@@ -2548,9 +2563,13 @@ func collectIncrementalFileFrontierMode(
 			if node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
 				continue
 			}
-			appendStubKey(graph.UnresolvedMarker + node.Name)
-			if node.RepoPrefix != "" {
-				appendStubKey(node.RepoPrefix + "::" + graph.UnresolvedMarker + node.Name)
+			// The four name-owned forms are one contract. This builder is
+			// the batched incremental path's incoming leg, and it was the
+			// last one still hand-building the bare pair: a member
+			// reference parked under a wildcard form stayed pending until
+			// the next whole-graph resolve.
+			for _, key := range graph.UnresolvedNameCandidateIDs(node) {
+				appendStubKey(key)
 			}
 		}
 	}
@@ -2750,6 +2769,9 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
 		reconcilePlaceholderSources(r.graph, nil, reindexBatch)
+		for _, ri := range reindexBatch {
+			r.noteRetargetedCall(ri.Edge)
+		}
 	}
 	// Cross-package name-match guard — same contract as in ResolveAll.
 	if len(jobs) == 0 {
@@ -2896,6 +2918,79 @@ func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
 	return stats
 }
 
+// ResolveIncomingForNames rebinds the pending references parked under the
+// given symbol names' unresolved stubs, probing the bare and the
+// `<repoPrefix>::` multi-repo stub forms for every supplied prefix. The
+// receipt-exact eviction path records the names whose definitions were
+// removed; their pending references live OUTSIDE any file frontier (the
+// definition's file no longer declares the name, so a file-scoped incoming
+// pass never enumerates its stub) and were previously retried only by the
+// whole-graph fallback the exact receipt now avoids. The gates are unchanged:
+// resolveEdge refuses ambiguity identically here, so a name whose surviving
+// candidates are still ambiguous binds no differently and stays pending.
+func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *ResolveStats {
+	stats := &ResolveStats{}
+	if len(names) == 0 {
+		return stats
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	seen := make(map[string]struct{}, len(names))
+	var stubKeys []string
+	appendKeys := func(keys []string) {
+		for _, key := range keys {
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			stubKeys = append(stubKeys, key)
+		}
+	}
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		appendKeys(graph.UnresolvedNameCandidateIDsForName(name, ""))
+		for _, prefix := range repoPrefixes {
+			if prefix != "" {
+				appendKeys(graph.UnresolvedNameCandidateIDsForName(name, prefix))
+			}
+		}
+	}
+	if len(stubKeys) == 0 {
+		return stats
+	}
+	// Probe the pending buckets before paying for the pass indexes: the
+	// receipt consumers call this on every apply, and the common case is
+	// that no edge is parked under any requested name. buildPassIndexes is
+	// graph-wide (it scales with the store, not with the request), so a
+	// no-work call must cost one bounded read instead. The probe's
+	// materialized read is retained and handed to the resolution helper:
+	// it is exactly the batch that helper needs, and re-reading it doubled
+	// the hit path's store time and allocations at scale.
+	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
+	pending := false
+	for _, edges := range inByStub {
+		for _, edge := range edges {
+			if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+				pending = true
+				break
+			}
+		}
+		if pending {
+			break
+		}
+	}
+	if !pending {
+		return stats
+	}
+	clear := r.buildPassIndexes()
+	defer clear()
+	r.resolveIncomingStubEdgesLocked(stubKeys, inByStub, stats)
+	return stats
+}
+
 // resolveIncomingLocked is the core of the reverse pass. Caller holds
 // r.mu and has built the per-pass indexes. For each distinct
 // referenceable symbol name defined in filePath it looks up the pending
@@ -2919,10 +3014,7 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 			continue
 		}
 		seen[n.Name] = struct{}{}
-		stubKeys = append(stubKeys, graph.UnresolvedMarker+n.Name)
-		if n.RepoPrefix != "" {
-			stubKeys = append(stubKeys, n.RepoPrefix+"::"+graph.UnresolvedMarker+n.Name)
-		}
+		stubKeys = append(stubKeys, graph.UnresolvedNameCandidateIDs(n)...)
 	}
 	if len(stubKeys) == 0 {
 		return
@@ -2937,9 +3029,18 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 	if len(stubKeys) == 0 {
 		return
 	}
+	r.resolveIncomingStubEdgesLocked(stubKeys, r.graph.GetInEdgesByNodeIDs(stubKeys), stats)
+}
+
+// resolveIncomingStubEdgesLocked is resolveIncomingStubKeysLocked over a
+// caller-supplied incoming-edge batch, for callers that already materialized
+// the frontier (the names-pass probe). Caller holds r.mu.
+func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub map[string][]*graph.Edge, stats *ResolveStats) {
+	if len(stubKeys) == 0 {
+		return
+	}
 	var reindexBatch []graph.EdgeReindex
 	var jobs []reindexJob
-	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
 	for _, key := range stubKeys {
 		for _, edge := range inByStub[key] {
 			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
@@ -3057,8 +3158,24 @@ func releaseResolverClone(clone *graph.Edge) {
 // caller decides whether to call graph.ReindexEdge immediately
 // (single-threaded ResolveFile) or to defer the reindex (parallel
 // ResolveAll). When nothing changed the returned bool is false.
+// resolutionExempt reports whether the resolver must never bind this edge
+// independently, on ANY path — the heuristic cascade, the inline LSP
+// hot-path, the deferred bulk LSP batch, and the cross-repository pass all
+// consult it. A tests edge is DERIVED: the test-linkage pass clones a test
+// caller's calls edges, meta-free. Re-running the bind WITHOUT the
+// original's receiver evidence bypasses every receiver-gated guard (a
+// List<int> site's clone bound a `this List<string>` extension the guarded
+// calls edge itself refuses). The tests layer follows its calls edge; the
+// resolver never binds it.
+func resolutionExempt(e *graph.Edge) bool {
+	return e != nil && e.Kind == graph.EdgeTests
+}
+
 func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string, changed bool) {
 	oldTo = e.To
+	if resolutionExempt(e) {
+		return oldTo, false
+	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
 	// strings.TrimPrefix only stripped the bare form, leaving every

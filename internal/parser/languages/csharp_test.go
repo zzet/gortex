@@ -714,6 +714,22 @@ class Panel : Widget {}`)
 			edgeTargetNames(result.Edges, "Outer.cs::Outer", graph.EdgeImplements))
 	})
 
+	// The two cases above cross here: a qualified name whose FINAL
+	// segment is itself generic. That segment parses as a `generic_name`,
+	// not an `identifier`, so scanning a qualified_name's direct
+	// identifier children walked straight past it and returned the
+	// penultimate segment - the namespace - as the base's name.
+	t.Run("qualified generic base reduces to its final segment", func(t *testing.T) {
+		src := []byte(`class Dual : App.Base<int>, App.IBox<int> {}`)
+		result, err := e.Extract("Dual.cs", src)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"Base"},
+			edgeTargetNames(result.Edges, "Dual.cs::Dual", graph.EdgeExtends))
+		assert.Equal(t, []string{"IBox"},
+			edgeTargetNames(result.Edges, "Dual.cs::Dual", graph.EdgeImplements))
+	})
+
 	t.Run("record extends base and implements interface", func(t *testing.T) {
 		src := []byte(`record Rec(int X) : Base(X), IThing {}`)
 		result, err := e.Extract("Rec.cs", src)
