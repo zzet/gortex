@@ -663,13 +663,17 @@ type FileCoverageParams struct {
 // it — the fact a hook turns into a deny. Symbols is how many, which is the
 // evidence the deny cites.
 //
-// Answered is what separates a verdict from an abstention, and every other
-// field is meaningless without it. A path whose view is not built yet, or one
-// no tracked checkout owns, leaves it false: an unbuilt view knows nothing
-// about the file, and reporting the primary's answer instead would deny a
-// read on another working copy's content. A daemon predating this field omits
-// it, so a newer caller reads that whole answer as an abstention rather than
-// as proof the file is uncovered.
+// Answered is what separates a verdict from an abstention. A path whose view
+// is not built yet leaves it false: an unbuilt view knows nothing about the
+// file, and reporting the primary's answer instead would deny a read on
+// another working copy's content.
+//
+// It qualifies the negative fields, not the positive one. Covered stands on
+// its own — coverage is never reported for a path the daemon could not place,
+// and a daemon predating Answered omits the field while still reporting it
+// truthfully. A caller that gated the deny on Answered would switch
+// enforcement off for the whole life of such a daemon, and daemons outlive the
+// binary upgrade that starts them.
 type FileCoverageResult struct {
 	Covered bool       `json:"covered"`
 	Symbols int        `json:"symbols"`

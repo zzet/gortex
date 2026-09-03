@@ -181,6 +181,22 @@ func TestFileIndexedViaDaemonLogsNothingForAnExactAnswer(t *testing.T) {
 	}
 }
 
+// A daemon predating the Answered field still reports coverage truthfully, and
+// daemons outlive the binary upgrade that starts them. Gating the deny on the
+// absent field would switch enforcement off for that process's whole life —
+// the exact silent bypass the field was added to prevent.
+func TestFileCoverageWithoutTheAnsweredFieldStillDenies(t *testing.T) {
+	startCoverageDaemon(t, daemon.FileCoverageResult{Covered: true, Symbols: 4})
+
+	st := probeFileIndexScope("/wt", "internal/live.go")
+	if !st.Indexed || st.Count != 4 {
+		t.Fatalf("coverage = %+v, want an older daemon's answer honoured", st)
+	}
+	if st.noGraphAnswer() {
+		t.Fatal("a covered file must never silence the read door")
+	}
+}
+
 // TestProbeViaDaemonForwardsTheScope pins that the symbol probe tells the
 // daemon where the search was issued from, which is what lets a worktree's
 // grep be answered from its own composed view.

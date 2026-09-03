@@ -728,13 +728,19 @@ func hookSearchScope(cwd string, toolInput map[string]any) searchScopeVerdict {
 		}
 		st := queryFileIndexScope(cwd, scope)
 		switch {
+		case st.Indexed:
+			return searchScopeIndexed
+		// Before Symbolless, which it can accompany: a size- or gate-skipped
+		// file earns a synthetic node, so the graph holds it while its bytes
+		// were never read. Denying would redirect a text search to an index
+		// that has nothing of it.
+		case st.NeverIndexable:
+			return searchScopeNonSource
 		// Symbolless denies here but not on the read doors: search(text),
 		// search(files) and explore(outline) all have rows for a file the
 		// graph holds, symbol-free or not.
-		case st.Indexed || st.Symbolless:
+		case st.Symbolless:
 			return searchScopeIndexed
-		case st.NeverIndexable:
-			return searchScopeNonSource
 		}
 		// A failed probe is not evidence. NonSource here would make narrowing
 		// `path` to one file a way to switch enforcement off on a hiccup.
@@ -1146,10 +1152,18 @@ type fileIndexStatus struct {
 // symbol lookups; the search doors answer for symbol-free files too.
 func (st fileIndexStatus) noGraphAnswer() bool {
 	switch {
+	case st.Indexed:
+		// The graph holds symbols for it, so there is plainly something to
+		// redirect to. Callers deny before ever asking, but the predicate must
+		// not lean on that: an older daemon reports coverage without the
+		// tracked flag, and the Tracked test below would silence it.
+		return false
 	case st.NeverIndexable || st.Symbolless:
 		return true
 	case st.ProbeOK:
-		return false
+		// The daemon answered. Silence only for a path it placed outside every
+		// tracked checkout, where no graph will ever hold it.
+		return !st.Tracked
 	case !daemonReachableFn():
 		// The advisory would name tools the agent cannot reach.
 		return true
@@ -1159,8 +1173,7 @@ func (st fileIndexStatus) noGraphAnswer() bool {
 		// "not indexed" is what turned one timed-out probe into a bypass.
 		return false
 	default:
-		// The daemon looked and could not place the path. Outside every
-		// tracked checkout there is nothing to redirect to.
+		// The answer reached the hook but placed the path nowhere.
 		return !st.Tracked
 	}
 }
@@ -1219,10 +1232,17 @@ func fileIndexScopeViaDaemon(cwd, filePath string, timeout time.Duration) fileIn
 		return fileIndexStatus{Unreached: true}
 	}
 	logProbeViewFallback(daemon.ControlFileCoverage, result.View)
-	st := fileIndexStatus{Tracked: result.Tracked, ProbeOK: result.Answered}
+	// Covered counts as an answer whatever the daemon's vintage. A daemon
+	// predating Answered still reports coverage truthfully, and gating on the
+	// missing field would drop a real deny into silence for the whole life of
+	// that process — daemons outlive the binary upgrade that starts them.
+	// The advisory tier still degrades to silence there, because such a daemon
+	// genuinely cannot say whether it tracks an uncovered path.
+	st := fileIndexStatus{
+		Tracked: result.Tracked,
+		ProbeOK: result.Answered || result.Covered,
+	}
 	if !st.ProbeOK {
-		// An abstention carries no other facts, and an older daemon leaves
-		// every flag below at its zero value anyway.
 		return st
 	}
 	st.Indexed = result.Covered
@@ -1601,6 +1621,7 @@ func scopeWitnessViaWalk(cwd, absScope string) scopeWitness {
 // to sample — none of which proves anything.
 func witnessSample(absScope string, deadline time.Time) (sample []string, complete bool) {
 	seen := 0
+	pruned := false
 	var preferred, other []string
 	err := filepath.WalkDir(absScope, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -1615,7 +1636,19 @@ func witnessSample(absScope string, deadline time.Time) (sample []string, comple
 		if seen > witnessWalkEntries || time.Now().After(deadline) {
 			return errWitnessBudget
 		}
-		if d.IsDir() || !d.Type().IsRegular() {
+		if d.IsDir() {
+			// WalkDir is lexical, so a repo root's .git sorts first and its
+			// object store alone exhausts the entry budget before any source
+			// file is reached. Pruning costs the sample nothing the index
+			// would have claimed, but it does mean an empty sample no longer
+			// proves an empty scope.
+			if path != absScope && strings.HasPrefix(d.Name(), ".") {
+				pruned = true
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		if looksLikeSourceFile(path) {
@@ -1636,6 +1669,9 @@ func witnessSample(absScope string, deadline time.Time) (sample []string, comple
 		return preferred, true
 	}
 	if err != nil {
+		return nil, false
+	}
+	if len(other) == 0 && pruned {
 		return nil, false
 	}
 	return other, true

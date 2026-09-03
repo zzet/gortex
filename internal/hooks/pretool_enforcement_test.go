@@ -26,15 +26,19 @@ func stubFileIndexScope(t *testing.T, st fileIndexStatus) {
 	stubFileIndexScopeBy(t, func(string, string) fileIndexStatus { return st })
 }
 
-// indexedStatus is the answered verdict for a path holding symbols, or not
-// holding them yet at zero.
+// indexedStatus is the answered verdict for a TRACKED path holding symbols, or
+// not holding them yet at zero. Tracked is not optional: an answered verdict
+// that tracks nothing is the one state the read doors go silent for, so a stub
+// omitting it silences every advisory it means to assert.
 func indexedStatus(symbols int) fileIndexStatus {
-	return fileIndexStatus{Indexed: symbols > 0, Count: symbols, ProbeOK: true}
+	return fileIndexStatus{Indexed: symbols > 0, Count: symbols, Tracked: true, ProbeOK: true}
 }
 
 func stubIndexedFile(t *testing.T, indexed bool, symbols int) {
 	t.Helper()
-	stubFileIndexScope(t, fileIndexStatus{Indexed: indexed, Count: symbols, ProbeOK: true})
+	st := indexedStatus(symbols)
+	st.Indexed = indexed
+	stubFileIndexScope(t, st)
 }
 
 func stubScopeTracked(t *testing.T, hasSource, probeOK bool) {

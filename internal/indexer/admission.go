@@ -47,6 +47,12 @@ func (idx *Indexer) PathIndexability(relPath string) (PathSkip, bool) {
 	if err != nil {
 		return PathSkip{}, false
 	}
+	if info.IsDir() {
+		// The walk never puts a directory through the file gates, so running
+		// one through them here would report "unclaimed language, and never
+		// will be" for a path that is not a file at all.
+		return PathSkip{}, false
+	}
 	adm := idx.admitWalkEntry(root, abs, info.Size(), false)
 	if !adm.admit {
 		return PathSkip{Skipped: true, ByRule: adm.excluded}, true

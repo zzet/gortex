@@ -94,13 +94,19 @@ func TestEnrichRead_NeverIndexableByDaemon_Silent(t *testing.T) {
 }
 
 // The daemon looked and placed the path outside every tracked checkout, so no
-// graph will ever hold it.
+// graph will ever hold it. ProbeOK is set because that IS the daemon's answer:
+// an untracked path is the one abstention-shaped verdict it can give.
 func TestEnrichRead_Untracked_Silent(t *testing.T) {
 	withDaemonReachable(t, true)
-	stubFileIndexScope(t, fileIndexStatus{}) // answered, not tracked
-	res := enrichRead(map[string]any{"file_path": "/elsewhere/pkg/a.go"}, "/repo")
-	if res.deny || res.context != "" {
-		t.Fatalf("untracked read must be silent: deny=%v ctx=%q", res.deny, res.context)
+	for _, st := range []fileIndexStatus{
+		{ProbeOK: true}, // answered: nothing tracks it
+		{},              // no answer, and nothing tracks it either
+	} {
+		stubFileIndexScope(t, st)
+		res := enrichRead(map[string]any{"file_path": "/elsewhere/pkg/a.go"}, "/repo")
+		if res.deny || res.context != "" {
+			t.Fatalf("untracked read (%+v) must be silent: deny=%v ctx=%q", st, res.deny, res.context)
+		}
 	}
 }
 
@@ -261,6 +267,21 @@ func TestHookSearchScope_SingleFileProbeUnavailable_Unproven(t *testing.T) {
 	v := hookSearchScope("/repo", map[string]any{"path": "pkg/a.go"})
 	if v != searchScopeUnproven {
 		t.Fatalf("no-verdict single-file scope should stay Unproven, got %v", v)
+	}
+}
+
+// A size- or gate-skipped file earns a synthetic node, so it comes back Held
+// (hence Symbolless) AND unindexable at once. Its bytes were never read, so
+// text search has nothing of it and the deny would point nowhere.
+func TestHookSearchScope_SkippedFileIsNonSourceDespiteItsNode(t *testing.T) {
+	stubFileIndexScope(t, fileIndexStatus{
+		Symbolless:     true,
+		NeverIndexable: true,
+		Tracked:        true,
+		ProbeOK:        true,
+	})
+	if v := hookSearchScope("/repo", map[string]any{"path": "internal/generated/huge.go"}); v != searchScopeNonSource {
+		t.Fatalf("a file the walk rejected is NonSource even though the graph names it, got %v", v)
 	}
 }
 
@@ -604,6 +625,38 @@ func TestScopeWitnessViaWalk(t *testing.T) {
 			t.Fatalf("an unwalkable scope proves nothing, got %v", w)
 		}
 	})
+
+	// WalkDir is lexical, so an unpruned .git swallows the entry budget before
+	// any source file is reached and every warming-repo Grep pays for it.
+	t.Run("dot-directories are pruned", func(t *testing.T) {
+		dir := t.TempDir()
+		for i := range witnessWalkEntries + 16 {
+			writeScopeFile(t, dir, filepath.Join(".git", "objects", strconv.Itoa(i)), "x")
+		}
+		writeScopeFile(t, dir, "pkg/a.go", "package a\n")
+		asked := ""
+		stubFileIndexScopeBy(t, func(_, path string) fileIndexStatus {
+			asked = path
+			return fileIndexStatus{Indexed: true, Count: 1, Tracked: true, ProbeOK: true}
+		})
+
+		if w := scopeWitnessViaWalk(dir, dir); w != witnessSource {
+			t.Fatalf("the .go file past .git must still be reached, got %v", w)
+		}
+		if filepath.Base(asked) != "a.go" {
+			t.Fatalf("the graph was asked about %q, want the source file", asked)
+		}
+	})
+
+	// …but pruning means an empty sample is no longer an empty scope.
+	t.Run("a scope holding only dot-directories proves nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		writeScopeFile(t, dir, filepath.Join(".hidden", "a.go"), "package a\n")
+
+		if w := scopeWitnessViaWalk(dir, dir); w != witnessUnknown {
+			t.Fatalf("a pruned scope with nothing left to sample proves nothing, got %v", w)
+		}
+	})
 }
 
 // The witness runs on the PreToolUse critical path, so the walk and every
@@ -721,10 +774,12 @@ func TestNoGraphAnswer(t *testing.T) {
 		want      bool
 	}{
 		{"indexed", fileIndexStatus{Indexed: true, Count: 3, ProbeOK: true, Tracked: true}, true, false},
+		{"indexed by a daemon with no tracked flag", fileIndexStatus{Indexed: true, Count: 3, ProbeOK: true}, true, false},
 		{"never indexable", fileIndexStatus{NeverIndexable: true, ProbeOK: true, Tracked: true}, true, true},
 		{"symbolless", fileIndexStatus{Symbolless: true, ProbeOK: true, Tracked: true}, true, true},
 		{"tracked, indexable, not held", fileIndexStatus{ProbeOK: true, Tracked: true}, true, false},
-		{"answered: nothing tracks it", fileIndexStatus{}, true, true},
+		{"answered: nothing tracks it", fileIndexStatus{ProbeOK: true}, true, true},
+		{"no answer, nothing tracks it", fileIndexStatus{}, true, true},
 		{"unreached, daemon up", fileIndexStatus{Unreached: true}, true, false},
 		{"unreached, daemon down", fileIndexStatus{Unreached: true}, false, true},
 		{"tracked, no verdict, daemon up", fileIndexStatus{Tracked: true}, true, false},

@@ -235,6 +235,24 @@ func TestPathIndexability_RejectsPathsOutsideRoot(t *testing.T) {
 	}
 }
 
+// A directory lstats fine and then fails every FILE gate, so answering for one
+// reports "no extractor claims this, and none ever will" for a path that is not
+// a file. get_file_summary on a package path rendered exactly that.
+func TestPathIndexability_DirectoryCannotAnswer(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "internal", "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	idx := newAdmissionTestIndexer(t, repo)
+
+	for _, path := range []string{"internal", "internal/hooks"} {
+		skip, ok := idx.PathIndexability(path)
+		if ok {
+			t.Errorf("PathIndexability(%q) claimed a verdict for a directory: %+v", path, skip)
+		}
+	}
+}
+
 // Must stay distinguishable from "indexable": a unanimity check that counts
 // this silence lets one un-rooted repo veto every other repo's verdict.
 func TestPathIndexability_BlankRootCannotAnswer(t *testing.T) {
