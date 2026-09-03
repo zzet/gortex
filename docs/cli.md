@@ -342,7 +342,7 @@ The daemon's safe-edit surface as CLI verbs. The read-only verbs (`context`, `ve
 | `edit plan` | `get_edit_plan` | `--ids <csv>` (required), `--depth` (default 3) |
 | `edit preview` | `preview_edit` | `--workspace-edit` / `--workspace-edit-file` / `-`; `--no-diagnostics`, `--inherit-overlay` |
 | `edit simulate` | `simulate_chain` | `--steps` / `--steps-file` / `-`; `--keep`, `--no-stop-on-error`, `--inherit-overlay` |
-| `edit batch` | `batch_edit` | `--edits` / `--edits-file` / `-`; `--dry-run`, `--compact` |
+| `edit batch` | `batch_edit` | `--edits` / `--edits-file` / `-`; `--dry-run`, `--compact`. Each edit selects one of four ops: `edit_symbol`, `edit_file`, `move_file` (whole file), `delete_file` (whole file) |
 | `edit apply <file>` | `edit_file` | `--old`, `--new` (required), `--replace-all`, `--dry-run`, `--allow-parse-errors`, `--expected <n>` |
 | `edit symbol <id>` | `edit_symbol` | `--old`, `--new` (required), `--dry-run` |
 | `edit rename <id>` | `rename_symbol` | `--to <name>` (required), `--dry-run` |

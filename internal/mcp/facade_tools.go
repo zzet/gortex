@@ -148,7 +148,13 @@ func facadeToolDefinitionWithOperations(name string, operations []string) mcpgo.
 		opts = []mcpgo.ToolOption{
 			operation, target, mcpgo.WithString("match"), mcpgo.WithString("replacement"),
 			mcpgo.WithString("content"), freeObject("guard", "Stale-write and occurrence guards."),
-			mcpgo.WithArray("changes", mcpgo.Description("Batch file or symbol edits."), mcpgo.Items(map[string]any{"type": "object", "additionalProperties": true})),
+			// The per-op contract rides in the description rather than in an
+			// items union: every session on this preset pays for tools/list,
+			// and the union costs kilobytes to say what one line says. Naming
+			// each op with its exact field list — optional fields marked `?` —
+			// keeps expected_sha256 and replace_all discoverable without a
+			// capabilities round trip.
+			mcpgo.WithArray("changes", mcpgo.Description("Batch items by op: edit_file{path,old_string,new_string,replace_all?}, edit_symbol{id,old_source,new_source}. move_file{source,destination,expected_sha256?} and delete_file{path,expected_sha256?} act on whole files."), mcpgo.Items(map[string]any{"type": "object", "additionalProperties": true})),
 			mcpgo.WithBoolean("dry_run"), options, output,
 		}
 	case "refactor":
@@ -3018,10 +3024,26 @@ func facadeRequestShape(spec facadeOperationSpec, properties map[string]any, req
 			args["match"] = "<existing source>"
 			args["replacement"] = "<replacement source>"
 		case "batch":
-			args["changes"] = []map[string]any{{
-				"op": "edit_file", "path": "<file>",
-				"old_string": "<existing text>", "new_string": "<replacement text>",
-			}}
+			// One example per accepted `op` so the shape advertises the
+			// whole-file lifecycle items, not just the string replacement.
+			// The lifecycle examples carry expected_sha256 because a stale
+			// digest is the one precondition that turns a blind whole-file
+			// move or delete into a refusal instead of a silent overwrite.
+			args["changes"] = []map[string]any{
+				{
+					"op": "edit_file", "path": "<file>",
+					"old_string": "<existing text>", "new_string": "<replacement text>",
+				},
+				{
+					"op": "edit_symbol", "id": "<symbol>",
+					"old_source": "<existing source>", "new_source": "<replacement source>",
+				},
+				{
+					"op": "move_file", "source": "<file>",
+					"destination": "<destination file>", "expected_sha256": "<sha256>",
+				},
+				{"op": "delete_file", "path": "<file>", "expected_sha256": "<sha256>"},
+			}
 		default:
 			args["options"] = map[string]any{}
 		}

@@ -732,9 +732,15 @@ func TestBatchEditDryRunReturnsPlanOnly(t *testing.T) {
 	})
 
 	eng := query.NewEngine(g)
+	// A dry run resolves symbol paths exactly as the commit does, so the plan
+	// needs a root to anchor them against — without one every entry reports the
+	// unresolved-path failure instead of the order under test.
+	idx := indexer.New(g, testRegistry(), config.IndexConfig{}, zap.NewNop())
+	idx.SetRootPath(t.TempDir())
 	srv := &Server{
-		graph:  g,
-		engine: eng,
+		graph:   g,
+		engine:  eng,
+		indexer: idx,
 	}
 
 	editsJSON := `[{"id":"pkg/b.go::TypeB","old_source":"old","new_source":"new"},{"id":"pkg/a.go::FuncA","old_source":"old","new_source":"new"}]`

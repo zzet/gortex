@@ -17,6 +17,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -40,6 +41,7 @@ type batchFileBuffer struct {
 	relPath      string
 	mode         os.FileMode // permission bits preserved when writing replacement files
 	fileMode     os.FileMode // complete mode retained for symlink and regular-file checks
+	followedInfo os.FileInfo // identity behind a symlink leaf, so a link and its target are one file
 	original     []byte
 	content      []byte
 	existsBefore bool
@@ -195,6 +197,11 @@ func markBatchCommitFailure(results []batchEditResult, failedPath, message strin
 	return marked
 }
 
+// isBatchLifecycleOp reports whether an op owns a whole file rather than a
+// fragment of one. The plan, the transaction, and the dry-run preflight all
+// branch on it, so it is spelled once.
+func isBatchLifecycleOp(op string) bool { return op == "move_file" || op == "delete_file" }
+
 func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem, resolvePaths bool) []plannedBatchEdit {
 	plans := make([]plannedBatchEdit, 0, len(edits))
 	for i, edit := range edits {
@@ -307,7 +314,7 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 	}
 	owners := make(map[string]pathOwner)
 	for i := range plans {
-		lifecycle := plans[i].op == "move_file" || plans[i].op == "delete_file"
+		lifecycle := isBatchLifecycleOp(plans[i].op)
 		for _, path := range []string{plans[i].absPath, plans[i].destinationPath} {
 			if path == "" {
 				continue
@@ -357,19 +364,69 @@ func validBatchExpectedSHA256(expected string) bool {
 	return err == nil && len(decoded) == sha256.Size
 }
 
-// guardBatchLifecycleDestination rejects every symlink component below the
-// lexical repository root. General file resolution permits in-repo symlinks,
-// which is correct for reads, but a move destination must not redirect a
-// transaction write through either a symlink leaf or a symlinked parent.
-// The repository root itself is deliberately not inspected so checkouts under
-// symlinked system prefixes remain valid.
-func (s *Server) guardBatchLifecycleDestination(absPath string) error {
-	cleanPath := filepath.Clean(absPath)
-	root := ""
+// batchCheckoutCandidate is one spelling of a checkout a request may write
+// through, with the identity behind it when the spelling exists on disk.
+type batchCheckoutCandidate struct {
+	spelling string
+	identity os.FileInfo
+}
+
+// batchLifecycleRoot returns the innermost checkout containing a lifecycle
+// path, in the caller's own spelling, plus whether any checkout is known at
+// all. A control client with no known roots gets ("", false) and keeps its
+// deliberate no-op posture; ("", true) means checkouts are known and none of
+// them accounts for this spelling, which the callers refuse rather than skip.
+//
+// The candidates are every checkout a request can legitimately write through:
+// each tracked repository root — linked worktrees included, since they are
+// registered under their own prefix like any other repo — the lone indexer's
+// root, and the root of a view the request was routed to. Each is registered
+// in its own spelling and in its symlink-resolved one, and the match runs in
+// two passes.
+//
+// The first pass is lexical: the longest candidate spelling that contains the
+// path wins. It decides every ordinary request, and it is what makes a symlink
+// inside a checkout a component of the path rather than a root of its own —
+// `repoRoot/self -> repoRoot` is a candidate spelling only after resolution,
+// while `repoRoot` itself lexically contains the destination and is the deeper
+// answer the guard needs.
+//
+// The second pass exists for spellings no candidate prefixes: a path that
+// resolves some of its symlinks and not others (macOS hands out /var/folders/…
+// for a checkout registered as /private/var/…), a case variant of the root on a
+// case-insensitive filesystem, or an alias nobody registered. It climbs the
+// caller's own ancestors. A real directory is the root when it IS a checkout
+// root — os.SameFile with a candidate — and it is taken at once, being the
+// deepest such spelling. A symlink ancestor is an alias into a checkout when
+// its resolved location lies inside one; it is remembered rather than taken,
+// and a later (outer) alias replaces it, so that when only aliases identify the
+// checkout the outermost one becomes the root and every link between it and
+// the destination stays in the range the callers inspect. A real directory is
+// never matched by containment: a subdirectory inside a checkout resolves
+// inside it too, and taking one as the root would lift a symlinked parent
+// above the inspected range.
+func (s *Server) batchLifecycleRoot(ctx context.Context, absPath string) (string, bool) {
+	var candidates []batchCheckoutCandidate
+	seen := make(map[string]struct{}, 4)
+	addSpelling := func(spelling string) {
+		spelling = filepath.Clean(spelling)
+		if _, dup := seen[spelling]; dup {
+			return
+		}
+		seen[spelling] = struct{}{}
+		candidate := batchCheckoutCandidate{spelling: spelling}
+		if info, err := os.Stat(spelling); err == nil {
+			candidate.identity = info
+		}
+		candidates = append(candidates, candidate)
+	}
 	considerRoot := func(candidate string) {
-		candidate = filepath.Clean(candidate)
-		if pathContainedIn(cleanPath, candidate) && len(candidate) > len(root) {
-			root = candidate
+		if candidate == "" {
+			return
+		}
+		addSpelling(candidate)
+		if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
+			addSpelling(resolved)
 		}
 	}
 	if s.multiIndexer != nil {
@@ -379,11 +436,94 @@ func (s *Server) guardBatchLifecycleDestination(absPath string) error {
 			}
 		}
 	}
-	if s.indexer != nil && s.indexer.RootPath() != "" {
+	if s.indexer != nil {
 		considerRoot(s.indexer.RootPath())
 	}
+	considerRoot(requestViewPathRoot(ctx).root)
+	if len(candidates) == 0 {
+		return "", false
+	}
+
+	cleanPath := filepath.Clean(absPath)
+	lexical := ""
+	for _, candidate := range candidates {
+		if pathContainedIn(cleanPath, candidate.spelling) && len(candidate.spelling) > len(lexical) {
+			lexical = candidate.spelling
+		}
+	}
+	if lexical != "" {
+		return lexical, true
+	}
+
+	isCheckoutRoot := func(ancestor string) bool {
+		info, err := os.Stat(ancestor)
+		if err != nil {
+			return false
+		}
+		for _, candidate := range candidates {
+			if candidate.identity != nil && os.SameFile(info, candidate.identity) {
+				return true
+			}
+		}
+		return false
+	}
+	aliasesCheckout := func(ancestor string) bool {
+		resolved, err := filepath.EvalSymlinks(ancestor)
+		if err != nil {
+			return false
+		}
+		resolved = filepath.Clean(resolved)
+		for _, candidate := range candidates {
+			if pathContainedIn(resolved, candidate.spelling) {
+				return true
+			}
+		}
+		return false
+	}
+	// Start at the parent: a lifecycle destination is allowed not to exist, so
+	// the path itself has no spelling to resolve.
+	symlinked := ""
+	for ancestor := filepath.Dir(cleanPath); ; {
+		info, err := os.Lstat(ancestor)
+		switch {
+		case err != nil:
+		case info.Mode()&os.ModeSymlink != 0:
+			if aliasesCheckout(ancestor) {
+				symlinked = ancestor
+			}
+		case isCheckoutRoot(ancestor):
+			return ancestor, true
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return symlinked, true
+		}
+		ancestor = parent
+	}
+}
+
+// guardBatchLifecycleDestination inspects every component of a move destination
+// strictly below the checkout root batchLifecycleRoot selects, Lstat-ing each
+// and refusing the destination when one is a symlink. The root itself is not
+// inspected, which is what keeps a checkout under a symlinked system prefix
+// valid. A symlink can be the root only when it is a registered spelling of a
+// checkout or an alias that resolves into one; the write then still lands
+// inside that checkout, and every component below the alias is inspected.
+// General file resolution permits in-repo symlinks, which is correct for
+// reads, but a move destination must not redirect a transaction write through
+// either a symlink leaf or a symlinked parent.
+func (s *Server) guardBatchLifecycleDestination(ctx context.Context, absPath string) error {
+	cleanPath := filepath.Clean(absPath)
+	root, known := s.batchLifecycleRoot(ctx, cleanPath)
 	if root == "" {
-		return nil
+		if !known {
+			return nil
+		}
+		// Path resolution admitted the destination, so its real location is
+		// inside some checkout — yet no spelling of one accounts for it.
+		// Skipping the walk here would leave whatever redirected the path
+		// uninspected, so the destination is refused instead.
+		return fmt.Errorf("move destination %s is not spelled under any indexed checkout", cleanPath)
 	}
 
 	rel, err := filepath.Rel(root, cleanPath)
@@ -409,8 +549,14 @@ func (s *Server) guardBatchLifecycleDestination(absPath string) error {
 	return nil
 }
 
-func (s *Server) validateBatchCreateTarget(absPath, relPath string) error {
-	if err := s.guardBatchLifecycleDestination(absPath); err != nil {
+// errBatchDestinationExists is the single wording for a lifecycle destination
+// that is already taken. Three sites raise it — the dry-run preflight, the
+// pre-write create guard, and the plan application — and a dry run only
+// predicts the abort it names if all three spell it the same way.
+var errBatchDestinationExists = errors.New("destination already exists")
+
+func (s *Server) validateBatchCreateTarget(ctx context.Context, absPath, relPath string) error {
+	if err := s.guardBatchLifecycleDestination(ctx, absPath); err != nil {
 		return err
 	}
 	_, err := os.Lstat(absPath)
@@ -420,11 +566,49 @@ func (s *Server) validateBatchCreateTarget(absPath, relPath string) error {
 	case err != nil:
 		return fmt.Errorf("could not stat %s: %w", relPath, err)
 	default:
-		return fmt.Errorf("destination already exists")
+		return errBatchDestinationExists
 	}
 }
 
-func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
+// batchPathBytes is the stat-then-read the transaction performs for one batch
+// path: the Lstat result (nil when the path is absent), the bytes behind it,
+// and the refusal that aborts the batch when either step fails. The dry-run
+// preflight runs the same function over the same fixture, which is what keeps
+// a reported conflict spelled exactly like the abort it predicts.
+func batchPathBytes(path, relPath string) (os.FileInfo, []byte, error) {
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, nil, nil
+	case err != nil:
+		return nil, nil, fmt.Errorf("could not stat %s: %w", relPath, err)
+	}
+	content, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return info, nil, fmt.Errorf("could not read %s: %w", relPath, readErr)
+	}
+	return info, content, nil
+}
+
+// batchLifecycleSourceRefusal reports why a whole-file lifecycle operation
+// cannot take this source, once its bytes have been collected. It is the
+// per-operation half of the contract batchPathBytes opens: shared for the same
+// reason, so the dry run and the commit refuse in identical words.
+func batchLifecycleSourceRefusal(exists bool, fileMode os.FileMode, content []byte, expectedSHA256 string) error {
+	switch {
+	case !exists:
+		return errors.New("source file does not exist")
+	case fileMode&os.ModeSymlink != 0:
+		return errors.New("source path is a symlink; whole-file lifecycle operations require a regular file")
+	case !fileMode.IsRegular():
+		return errors.New("source path is not a regular file")
+	case expectedSHA256 != "" && !strings.EqualFold(expectedSHA256, digestBatchBytes(content)):
+		return errors.New("expected_sha256 does not match complete source bytes")
+	}
+	return nil
+}
+
+func (s *Server) readBatchBuffers(ctx context.Context, plans []plannedBatchEdit) (map[string]*batchFileBuffer, []string, error) {
 	buffers := make(map[string]*batchFileBuffer)
 	paths := make([]string, 0)
 	add := func(path, relPath string) error {
@@ -432,19 +616,15 @@ func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFi
 			return nil
 		}
 		buffer := &batchFileBuffer{absPath: path, relPath: relPath, mode: 0o644, existenceSet: true}
-		info, err := os.Lstat(path)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			// Missing paths are retained in the transaction snapshot so a move
-			// destination can be created and rollback can prove it was absent.
-		case err != nil:
-			return fmt.Errorf("could not stat %s: %w", relPath, err)
-		default:
-			content, readErr := os.ReadFile(path)
-			if readErr != nil {
-				return fmt.Errorf("could not read %s: %w", relPath, readErr)
-			}
+		info, content, err := batchPathBytes(path, relPath)
+		if err != nil {
+			return err
+		}
+		// A missing path is retained in the transaction snapshot so a move
+		// destination can be created and rollback can prove it was absent.
+		if info != nil {
 			buffer.fileMode = info.Mode()
+			buffer.followedInfo = batchFollowedIdentity(path, info)
 			// fileMode intentionally describes the path itself for lifecycle
 			// type checks, while mode follows symlinks so edit_file preserves
 			// the permissions of the content source it is replacing.
@@ -465,7 +645,7 @@ func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFi
 			return nil, nil, err
 		}
 		if plan.destinationPath != "" {
-			if err := s.guardBatchLifecycleDestination(plan.destinationPath); err != nil {
+			if err := s.guardBatchLifecycleDestination(ctx, plan.destinationPath); err != nil {
 				return nil, nil, err
 			}
 			if err := add(plan.destinationPath, plan.destination); err != nil {
@@ -474,7 +654,185 @@ func (s *Server) readBatchBuffers(plans []plannedBatchEdit) (map[string]*batchFi
 		}
 	}
 	sort.Strings(paths)
+	if err := rejectAliasedBatchPaths(buffers, paths); err != nil {
+		return nil, nil, err
+	}
 	return buffers, paths, nil
+}
+
+// rejectAliasedBatchPaths refuses a batch whose distinct paths name one file.
+// A hard link, or a case alias on a case-insensitive filesystem, gives one
+// inode two buffers, and the transaction then plans an independent future for
+// each. On a case alias the two spellings are one directory entry, so
+// `edit_file a.txt` plus `delete_file A.txt` deletes what the edit just wrote
+// and reports both as applied. A hard link survives that exact sequence — the
+// writer renames a replacement into place, which breaks the link — and is
+// refused all the same: rollback and the before-image journal are recorded per
+// path and assume independent inodes, so one inode under two entries would be
+// restored through a history that was never written for it.
+//
+// A symlink leaf and the file it points at are one file too, and that is the
+// single rule the comparison runs: what the path ultimately names.
+// batchFollowedIdentity falls back to the Lstat result for everything that is
+// not a resolvable symlink, so one comparison covers the hard link and the case
+// alias as well as the link beside its target. A content edit through a symlink
+// replaces the link with a regular file, so `edit_file link.txt` beside
+// `edit_file a.txt` would otherwise commit two divergent copies of what the
+// batch addressed as one. A lifecycle operation on a symlink source stays
+// refused on its own terms when its target is not also in the batch; when it
+// is, this pairing is what refuses first.
+//
+// Two batch items spelling the path identically stay supported — they share one
+// buffer, and lifecycle overlap is already governed by the plan's path owners.
+func rejectAliasedBatchPaths(buffers map[string]*batchFileBuffer, paths []string) error {
+	pairs := batchAliasedPathPairs(paths, func(path string) os.FileInfo {
+		if buffer := buffers[path]; buffer != nil {
+			return buffer.followedInfo
+		}
+		return nil
+	})
+	if len(pairs) == 0 {
+		return nil
+	}
+	return errors.New(pairs[0].message(buffers[pairs[0].left].relPath, buffers[pairs[0].right].relPath))
+}
+
+// batchFollowedIdentity reports what a batch path ultimately names: the Lstat
+// result for anything but a symlink, and the target's identity for a symlink
+// that resolves. A broken link keeps its own identity, which names nothing but
+// itself.
+func batchFollowedIdentity(path string, info os.FileInfo) os.FileInfo {
+	if info == nil || info.Mode()&os.ModeSymlink == 0 {
+		return info
+	}
+	if followed, err := os.Stat(path); err == nil {
+		return followed
+	}
+	return info
+}
+
+// batchAliasKind says why two distinct batch paths cannot be planned
+// independently, which is also how the refusal is worded.
+type batchAliasKind int
+
+const (
+	// batchAliasSameFile: two existing paths that ultimately name one file.
+	batchAliasSameFile batchAliasKind = iota
+	// batchAliasCaseVariant: two absent destinations one directory would
+	// create under names that differ only by case.
+	batchAliasCaseVariant
+	// batchAliasSameEntry: two absent destinations one directory entry would
+	// serve — byte-identical names under two spellings of the directory, or
+	// names that differ only by Unicode normalisation.
+	batchAliasSameEntry
+)
+
+// batchAliasedPair is one pair of distinct batch paths the transaction cannot
+// plan independent futures for. Nothing on disk distinguishes an absent pair,
+// so it is worded for what it is rather than as two spellings of one file.
+type batchAliasedPair struct {
+	left, right string
+	kind        batchAliasKind
+}
+
+// message renders this pair's refusal from the relative spellings the batch
+// quoted, so the dry-run preflight and the transaction word it identically.
+func (pair batchAliasedPair) message(left, right string) string {
+	switch pair.kind {
+	case batchAliasCaseVariant:
+		return fmt.Sprintf("batch destinations %s and %s differ only by case", left, right)
+	case batchAliasSameEntry:
+		return fmt.Sprintf("batch destinations %s and %s would be created as one directory entry", left, right)
+	}
+	return fmt.Sprintf("batch paths %s and %s name the same file", left, right)
+}
+
+// batchAliasedPathIdentity is one path reduced to what the pairwise comparison
+// needs, resolved once per path so the pass costs no map lookup per pair.
+type batchAliasedPathIdentity struct {
+	path     string
+	identity os.FileInfo // what the path ultimately names; nil when it is absent
+	anchor   os.FileInfo // for an absent path, its nearest existing ancestor
+	suffix   string      // for an absent path, the components below that ancestor
+}
+
+// batchAbsentPathAnchor splits an absent path into its nearest existing
+// ancestor and the components the commit would create below it. The ancestor
+// is identified through symlinks, so two spellings of one directory anchor
+// alike, and a parent that does not exist yet is simply part of the suffix —
+// which is what lets two destinations under a directory the batch would
+// create be compared at all.
+func batchAbsentPathAnchor(path string) (os.FileInfo, string) {
+	current := filepath.Clean(path)
+	suffix := ""
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil, ""
+		}
+		suffix = filepath.Join(filepath.Base(current), suffix)
+		if info, err := os.Stat(parent); err == nil {
+			return info, suffix
+		}
+		current = parent
+	}
+}
+
+// batchAliasedPathPairs reports every pair of distinct batch paths that cannot
+// both be planned, ordered by the sorted paths so the first pair is the one the
+// transaction aborts on. Two paths that exist pair when they ultimately name
+// one file, which is the hard link, the case alias, and the symlink leaf beside
+// its target alike.
+//
+// Two paths that do NOT exist have no identity to compare, and skipping them
+// let a batch plan two destinations a case-insensitive filesystem creates as
+// one: the first move made the file the second then found already taken, at
+// commit time and past the point rollback can describe either. They pair when
+// they would be created below one existing directory — os.SameFile on the
+// nearest existing ancestors, so a directory reached two ways still counts
+// once — under names that are one entry to a normalising or case-insensitive
+// filesystem: byte-identical, equal after folding to NFC, or equal under case
+// folding on top of that. The rule does not consult the filesystem's own
+// sensitivity: where both destinations are legal the batch still cannot say
+// which file the caller meant, and refusing is the fail-closed answer.
+//
+// The dry-run preflight reports every pair; the transaction refuses on the
+// first.
+func batchAliasedPathPairs(paths []string, followed func(string) os.FileInfo) []batchAliasedPair {
+	identities := make([]batchAliasedPathIdentity, 0, len(paths))
+	for _, path := range paths {
+		identity := batchAliasedPathIdentity{path: path, identity: followed(path)}
+		if identity.identity == nil {
+			identity.anchor, identity.suffix = batchAbsentPathAnchor(path)
+		}
+		identities = append(identities, identity)
+	}
+	var pairs []batchAliasedPair
+	for i, left := range identities {
+		for _, right := range identities[i+1:] {
+			switch {
+			case left.identity != nil && right.identity != nil:
+				if os.SameFile(left.identity, right.identity) {
+					pairs = append(pairs, batchAliasedPair{left: left.path, right: right.path, kind: batchAliasSameFile})
+				}
+			case left.identity == nil && right.identity == nil:
+				if left.anchor == nil || right.anchor == nil || !os.SameFile(left.anchor, right.anchor) {
+					continue
+				}
+				// Composition is folded before case: a normalising filesystem
+				// serves "é" and "é" from one entry, so the spellings
+				// have to agree on composition before case can be compared.
+				leftName, rightName := pathkey.Normalize(left.suffix), pathkey.Normalize(right.suffix)
+				switch {
+				case leftName == rightName:
+					pairs = append(pairs, batchAliasedPair{left: left.path, right: right.path, kind: batchAliasSameEntry})
+				case strings.EqualFold(leftName, rightName):
+					pairs = append(pairs, batchAliasedPair{left: left.path, right: right.path, kind: batchAliasCaseVariant})
+				}
+			}
+		}
+	}
+	return pairs
 }
 
 func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, error) {
@@ -591,20 +949,11 @@ func applyBatchPlans(plans []plannedBatchEdit, buffers map[string]*batchFileBuff
 				buffer.content = content
 			}
 		case "move_file", "delete_file":
-			switch {
-			case !buffer.existsAfter:
-				err = fmt.Errorf("source file does not exist")
-			case buffer.fileMode&os.ModeSymlink != 0:
-				err = fmt.Errorf("source path is a symlink; whole-file lifecycle operations require a regular file")
-			case !buffer.fileMode.IsRegular():
-				err = fmt.Errorf("source path is not a regular file")
-			case plan.edit.ExpectedSHA256 != "" && !strings.EqualFold(plan.edit.ExpectedSHA256, digestBatchBytes(buffer.content)):
-				err = fmt.Errorf("expected_sha256 does not match complete source bytes")
-			}
+			err = batchLifecycleSourceRefusal(buffer.existsAfter, buffer.fileMode, buffer.content, plan.edit.ExpectedSHA256)
 			if err == nil && plan.op == "move_file" {
 				destination := buffers[plan.destinationPath]
 				if destination.existsAfter {
-					err = fmt.Errorf("destination already exists")
+					err = errBatchDestinationExists
 				} else {
 					destination.mode = buffer.mode
 					destination.fileMode = buffer.fileMode
@@ -684,7 +1033,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", receipt.Results[0].Error), nil
 	}
 
-	buffers, orderedPaths, readErr := s.readBatchBuffers(plans)
+	buffers, orderedPaths, readErr := s.readBatchBuffers(ctx, plans)
 	if readErr != nil {
 		receipt.Results = batchFailureResults(plans, 0, readErr.Error())
 		receipt.Summary = batchSummary(receipt.Results)
@@ -740,7 +1089,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		}
 		var commitErr error
 		if !buffer.existsBefore {
-			if targetErr := s.validateBatchCreateTarget(path, buffer.relPath); targetErr != nil {
+			if targetErr := s.validateBatchCreateTarget(ctx, path, buffer.relPath); targetErr != nil {
 				commitErr = targetErr
 			} else {
 				commitErr = writer(path, buffer.content, buffer.mode)
@@ -1028,17 +1377,40 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("edits array is empty"), nil
 	}
 	if dryRun, _ := args["dry_run"].(bool); dryRun {
-		plans := s.planBatchTransaction(ctx, edits, false)
+		// Paths are resolved exactly as the commit resolves them, symbol edits
+		// included: without that a symbol edit has no path, and the rules that
+		// compare paths — lifecycle overlap, then aliasing — see a shorter
+		// batch than the one that would be committed.
+		plans := s.planBatchTransaction(ctx, edits, true)
+		// Lifecycle operations are re-validated against disk so the dry run
+		// answers "would this commit?" rather than only "is this well-formed?".
+		preflights := s.preflightBatchLifecycle(ctx, plans)
 		plan := make([]map[string]any, 0, len(plans))
+		// conflicts counts the lifecycle preconditions, the aliasing rule
+		// across all items, and the argument failures: the first two report
+		// "conflict: <err>" and the last "failed: <err>", and a caller deciding
+		// whether to apply the batch needs one number covering both. It is not
+		// a count of everything that would not commit — a content edit is never
+		// evaluated against disk here, so an absent path, a directory, or an
+		// old_string that is not there still counts as planned and refuses
+		// under the lock instead.
+		conflicts := 0
 		for i, item := range plans {
 			status := "planned"
 			if item.err != "" {
 				status = "failed: " + item.err
 			}
-			plan = append(plan, map[string]any{
+			entry := map[string]any{
 				"order": i + 1, "op": item.op, "id": item.edit.SymbolID,
 				"path": item.file, "destination": item.destination, "status": status,
-			})
+			}
+			if preflight := preflights[i]; preflight != nil {
+				preflight.annotate(entry, item)
+			}
+			if entry["status"] != "planned" {
+				conflicts++
+			}
+			plan = append(plan, entry)
 		}
 		if isCompact(req) {
 			var out strings.Builder
@@ -1047,7 +1419,9 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 			}
 			return mcp.NewToolResultText(out.String()), nil
 		}
-		return s.respondJSONOrTOON(ctx, req, map[string]any{"plan": plan, "dry_run": true, "total": len(plan)})
+		return s.respondJSONOrTOON(ctx, req, map[string]any{
+			"plan": plan, "dry_run": true, "total": len(plan), "conflicts": conflicts,
+		})
 	}
 
 	receipt, err := s.runBatchTransaction(ctx, edits, transactionID)

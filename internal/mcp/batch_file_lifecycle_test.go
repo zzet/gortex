@@ -260,11 +260,11 @@ func TestValidateBatchCreateTargetRejectsLateDestination(t *testing.T) {
 	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
 	dir := t.TempDir()
 	destination := filepath.Join(dir, "destination.txt")
-	if err := s.validateBatchCreateTarget(destination, "destination.txt"); err != nil {
+	if err := s.validateBatchCreateTarget(context.Background(), destination, "destination.txt"); err != nil {
 		t.Fatalf("absent destination rejected: %v", err)
 	}
 	writeAtomicBatchFixture(t, dir, "destination.txt", "racer\n")
-	if err := s.validateBatchCreateTarget(destination, "destination.txt"); err == nil || !strings.Contains(err.Error(), "destination already exists") {
+	if err := s.validateBatchCreateTarget(context.Background(), destination, "destination.txt"); err == nil || !strings.Contains(err.Error(), "destination already exists") {
 		t.Fatalf("late destination error = %v", err)
 	}
 }

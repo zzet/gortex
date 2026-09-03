@@ -1178,6 +1178,47 @@ func TestFacadeCapabilitiesRequestShapesUsePublicMutationFields(t *testing.T) {
 	require.NotEmpty(t, ranges["source"].(map[string]any)["ranges"])
 	batch := requestShape("edit", "batch")
 	require.NotEmpty(t, batch["changes"])
+	batchItems, ok := batch["changes"].([]any)
+	require.True(t, ok)
+	batchOps := make([]string, 0, len(batchItems))
+	byOp := map[string]map[string]any{}
+	for _, item := range batchItems {
+		change, isObject := item.(map[string]any)
+		require.True(t, isObject)
+		op, _ := change["op"].(string)
+		batchOps = append(batchOps, op)
+		byOp[op] = change
+	}
+	// Every item kind batch_edit accepts must be visible in the shape; an
+	// agent reading only edit_file concludes whole-file lifecycle is missing.
+	require.ElementsMatch(t, []string{"edit_file", "edit_symbol", "move_file", "delete_file"}, batchOps)
+	require.Equal(t, "<file>", byOp["edit_file"]["path"])
+	require.Equal(t, "<symbol>", byOp["edit_symbol"]["id"])
+	require.Equal(t, "<file>", byOp["move_file"]["source"])
+	require.Equal(t, "<destination file>", byOp["move_file"]["destination"])
+	require.Equal(t, "<file>", byOp["delete_file"]["path"])
+	require.Equal(t, "<sha256>", byOp["move_file"]["expected_sha256"])
+	require.Equal(t, "<sha256>", byOp["delete_file"]["expected_sha256"])
+	// Each example must be a legal instance of the branch it selects: a field
+	// no branch declares, or a required one the example omits, advertises a
+	// call batch_edit would refuse.
+	branches := batchEditItemsSchema()["oneOf"].([]any)
+	matched := 0
+	for _, raw := range branches {
+		branch := raw.(map[string]any)
+		properties := branch["properties"].(map[string]any)
+		op := properties["op"].(map[string]any)["const"].(string)
+		example, present := byOp[op]
+		require.True(t, present, "no request-shape example for op %q", op)
+		matched++
+		for field := range example {
+			require.Contains(t, properties, field, "op %q example names undeclared field %q", op, field)
+		}
+		for _, required := range branch["required"].([]any) {
+			require.Contains(t, example, required.(string), "op %q example omits required field %q", op, required)
+		}
+	}
+	require.Len(t, byOp, matched, "every request-shape example must select a published branch")
 	closure := requestShape("explore", "closure")
 	require.NotEmpty(t, closure["options"].(map[string]any)["files"])
 	citation := requestShape("analyze", "citation")
@@ -1629,4 +1670,136 @@ func TestFacadeReadResolvesOnlyUniqueSymbolShorthand(t *testing.T) {
 	resolved, ambiguous = srv.resolveFacadeSymbolShorthand(context.Background(), "UniqueReadTarget")
 	require.Equal(t, "UniqueReadTarget", resolved)
 	require.ElementsMatch(t, []string{first.ID, second.ID}, ambiguous)
+}
+
+// TestFacadeEditBatchDescriptionNamesEveryOp holds the facade to what tools/list
+// alone has to teach. The items schema stays a permissive object so every
+// session on this preset keeps paying the compact price for it, which makes the
+// `changes` description the only place the per-op fields are announced: drop a
+// name from it and expected_sha256 or replace_all becomes reachable only by
+// calling the legacy tool the facade exists to replace.
+func TestFacadeEditBatchDescriptionNamesEveryOp(t *testing.T) {
+	definition := facadeToolDefinition("edit")
+	changes, ok := definition.InputSchema.Properties["changes"].(map[string]any)
+	require.True(t, ok, "edit must publish a changes property")
+	require.Equal(t, map[string]any{"type": "object", "additionalProperties": true}, changes["items"],
+		"changes.items must stay permissive; the per-op contract belongs in the description")
+	description, _ := changes["description"].(string)
+	// The exact field lists are the contract: a bare token such as "id" or
+	// "path" would match almost any prose, so each op is checked with its
+	// complete brace-delimited field set, optional fields marked with `?`.
+	for _, fragment := range []string{
+		"edit_file{path,old_string,new_string,replace_all?}",
+		"edit_symbol{id,old_source,new_source}",
+		"move_file{source,destination,expected_sha256?}",
+		"delete_file{path,expected_sha256?}",
+	} {
+		require.Contains(t, description, fragment, "changes description hides %q", fragment)
+	}
+
+	// capabilities mirrors the same string, so an agent that does spend the
+	// round trip is not told something different from tools/list.
+	srv, _ := setupTestServer(t)
+	srv.facades.capture(mcpgo.NewTool("batch_edit"), srv.handleBatchEdit)
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"domain": "edit", "operation": "batch", "detail": "schema"}
+	result, err := srv.handleCapabilities(context.Background(), req)
+	require.NoError(t, err)
+	out := unmarshalResult(t, result)
+	schema := out["input_schema"].(map[string]any)
+	published := schema["properties"].(map[string]any)["changes"].(map[string]any)
+	require.Equal(t, description, published["description"])
+}
+
+// TestFacadeEditBatchApplyForwardsTheTransactionID drives one whole-file move
+// through the facade for real, twice with identical arguments. transaction_id
+// is inert under dry_run, so this is the only call that proves the facade
+// forwards it: without it the second call opens a second transaction, finds
+// the source already moved, and fails.
+func TestFacadeEditBatchApplyForwardsTheTransactionID(t *testing.T) {
+	t.Setenv(batchTransactionDirEnv, filepath.Join(t.TempDir(), "transactions"))
+	srv, root := setupTestServer(t)
+	srv.facades.capture(mcpgo.NewTool("batch_edit"), srv.handleBatchEdit)
+	source := filepath.Join(root, "facade-apply-source.txt")
+	require.NoError(t, os.WriteFile(source, []byte("move me\n"), 0o644))
+	destination := filepath.Join(root, "facade-apply-destination.txt")
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"operation": "batch",
+		"changes": []any{map[string]any{
+			"op": "move_file", "source": source, "destination": destination,
+		}},
+		"options": map[string]any{"transaction_id": "facade-batch-apply"},
+	}
+	apply := func() map[string]any {
+		t.Helper()
+		result, err := srv.handleFacade(context.Background(), "edit", req)
+		require.NoError(t, err)
+		require.False(t, result.IsError, "facade apply failed: %v", result.Content)
+		return unmarshalResult(t, result)
+	}
+
+	first := apply()
+	require.Equal(t, "facade-batch-apply", first["transaction_id"])
+	require.Equal(t, "committed", first["status"])
+
+	// The retry receives the original receipt rather than a fresh attempt at
+	// a source that is no longer there.
+	second := apply()
+	require.Equal(t, first["transaction_id"], second["transaction_id"])
+	require.Equal(t, first["fingerprint"], second["fingerprint"])
+	require.Equal(t, "committed", second["status"])
+	require.Empty(t, second["error"])
+
+	moved, err := os.ReadFile(destination)
+	require.NoError(t, err)
+	require.Equal(t, "move me\n", string(moved))
+	_, statErr := os.Stat(source)
+	require.True(t, os.IsNotExist(statErr), "source survived the move: %v", statErr)
+}
+
+// TestFacadeEditBatchDryRunReturnsThePlan drives one whole-file move through
+// the facade end to end. The lifecycle preflight an agent reaches through
+// `edit` has to be the one batch_edit answers with — resolved paths, path
+// state, and the conflict count — and it still has to write nothing.
+func TestFacadeEditBatchDryRunReturnsThePlan(t *testing.T) {
+	t.Setenv(batchTransactionDirEnv, filepath.Join(t.TempDir(), "transactions"))
+	srv, root := setupTestServer(t)
+	srv.facades.capture(mcpgo.NewTool("batch_edit"), srv.handleBatchEdit)
+	source := filepath.Join(root, "facade-move-source.txt")
+	require.NoError(t, os.WriteFile(source, []byte("move me\n"), 0o644))
+	destination := filepath.Join(root, "facade-move-destination.txt")
+
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"operation": "batch",
+		"changes": []any{map[string]any{
+			"op": "move_file", "source": source, "destination": destination,
+		}},
+		"dry_run": true,
+	}
+	result, err := srv.handleFacade(context.Background(), "edit", req)
+	require.NoError(t, err)
+	require.False(t, result.IsError, "facade dry run failed: %v", result.Content)
+
+	out := unmarshalResult(t, result)
+	require.Equal(t, true, out["dry_run"])
+	require.Equal(t, float64(0), out["conflicts"])
+	plan := out["plan"].([]any)
+	require.Len(t, plan, 1)
+	entry := plan[0].(map[string]any)
+	require.Equal(t, "move_file", entry["op"])
+	require.Equal(t, source, entry["resolved_path"])
+	require.Equal(t, destination, entry["resolved_destination"])
+	sourceState := entry["source_state"].(map[string]any)
+	require.Equal(t, true, sourceState["exists"])
+	require.Equal(t, "regular", sourceState["kind"])
+	require.Equal(t, false, entry["destination_state"].(map[string]any)["exists"])
+
+	_, statErr := os.Stat(destination)
+	require.True(t, os.IsNotExist(statErr), "dry run created the destination: %v", statErr)
+	content, err := os.ReadFile(source)
+	require.NoError(t, err)
+	require.Equal(t, "move me\n", string(content))
 }

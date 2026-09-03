@@ -171,6 +171,7 @@ The following invariants apply:
 - `change.contract` fixes `ack=false`; durable risk acknowledgement uses `remember(operation="risk_ack")` with `ack=true` fixed by the server.
 - Forge reads MUST route through `pr`; forge writes MUST route through `publish_review`.
 - Generation and graph export operations route through the local-write `edit` facade because their legacy handlers can write output. `edit(operation="wiki")` forces `enhance=false`, so this local-write boundary cannot invoke an LLM; enhanced wiki generation remains on the explicit legacy compatibility surface.
+- `edit(operation="batch")` carries whole-file lifecycle items — `move_file` and `delete_file` — alongside `edit_file` and `edit_symbol`; whole-file relocation and removal are local writes on the `edit` facade, not semantic operations on `refactor`.
 - Overlay comparison and preview are reads under `change`; overlay mutation uses `overlay`; applying overlay content to disk uses `edit`.
 - Effect-split overlay operations are fixed-safe: `change.simulate` forces `keep=false`, `overlay.simulate` forces `keep=true`, `overlay.merge` forces `to_disk=false`, and `edit.apply_overlay` forces `to_disk=true`. Caller arguments cannot override these values.
 - Proxy reads use `workspace`; cursor navigation, agent registry operations, and proxy/planning/workflow changes use `session`. Listing or comparing overlays uses `change`; mutating overlays uses `overlay`.
@@ -299,6 +300,31 @@ Write complete file content:
   "dry_run": true
 }
 ```
+
+Preview one atomic batch that moves a whole file and deletes another:
+
+```json
+{
+  "operation": "batch",
+  "changes": [
+    {"op": "move_file", "source": "internal/mcp/old_name.go", "destination": "internal/mcp/new_name.go"},
+    {"op": "delete_file", "path": "internal/mcp/obsolete.go"}
+  ],
+  "dry_run": true
+}
+```
+
+`move_file` and `delete_file` operate on whole files of any language and
+rewrite no callers; `refactor` remains the semantic path for one symbol
+(`refactor move` is Go-only). `dry_run` returns the resolved plan without
+writing — a lifecycle entry carries `resolved_path` and `source_state`, a
+`move_file` entry adds `resolved_destination` and `destination_state`, and a
+path state is `{exists, kind, git, ignored}` plus `sha256` on a regular-file
+source. A lifecycle precondition or the aliasing rule reports `status:
+"conflict: …"` and an argument failure reports `status: "failed: …"`, with the
+top-level `conflicts` counting both; content edits are not checked against disk
+until the locked commit. `transaction_id` makes the applying call idempotent
+under a lost response; under `dry_run` it is inert.
 
 Preview a semantic refactor:
 

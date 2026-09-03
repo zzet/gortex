@@ -3864,7 +3864,7 @@ func batchEditItemsSchema() map[string]any {
 				"properties": map[string]any{
 					"op":              map[string]any{"const": "move_file"},
 					"source":          map[string]any{"type": "string", "description": "Existing source path (repo-relative or absolute)."},
-					"destination":     map[string]any{"type": "string", "description": "Non-existing destination path in the same indexed repository."},
+					"destination":     map[string]any{"type": "string", "description": "Non-existing destination path inside an indexed repository."},
 					"expected_sha256": map[string]any{"type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Optional SHA-256 precondition for the complete source bytes."},
 				},
 				"required": []any{"op", "source", "destination"},
