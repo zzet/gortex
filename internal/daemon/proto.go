@@ -661,14 +661,37 @@ type FileCoverageParams struct {
 //
 // Covered reports that the graph serving Path holds definition symbols for
 // it — the fact a hook turns into a deny. Symbols is how many, which is the
-// evidence the deny cites. Both are false/zero for a path whose view is not
-// built yet: an unbuilt view knows nothing about the file, and reporting the
-// primary's answer instead would deny a read on another working copy's
-// content.
+// evidence the deny cites.
+//
+// Answered is what separates a verdict from an abstention, and every other
+// field is meaningless without it. A path whose view is not built yet, or one
+// no tracked checkout owns, leaves it false: an unbuilt view knows nothing
+// about the file, and reporting the primary's answer instead would deny a
+// read on another working copy's content. A daemon predating this field omits
+// it, so a newer caller reads that whole answer as an abstention rather than
+// as proof the file is uncovered.
 type FileCoverageResult struct {
 	Covered bool       `json:"covered"`
 	Symbols int        `json:"symbols"`
 	View    *ProbeView `json:"view,omitempty"`
+	// Answered reports that the daemon established which graph serves Path
+	// and read it. False means the rest of this struct is unknown, not
+	// negative.
+	Answered bool `json:"answered,omitempty"`
+	// Tracked reports that a registered checkout owns Path. Answered without
+	// Tracked is the verdict "this path is outside every indexed corpus".
+	Tracked bool `json:"tracked,omitempty"`
+	// Held reports that the serving graph holds Path at all. Held without
+	// Covered is a file the walk indexed that defines no symbols — the
+	// locators still have rows for it even though no symbol lookup does.
+	Held bool `json:"held,omitempty"`
+	// Excluded and Unindexable report what the index walk would do with Path,
+	// which is how a caller tells "not indexed yet" from "never will be".
+	// Unindexable is any rejection; Excluded narrows it to an exclude or
+	// ignore rule. Both stay false when no indexer could answer, and they are
+	// only consulted for a path the graph does not already cover.
+	Excluded    bool `json:"excluded,omitempty"`
+	Unindexable bool `json:"unindexable,omitempty"`
 }
 
 // EnrichChurnParams is the payload for ControlEnrichChurn.

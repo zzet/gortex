@@ -331,9 +331,12 @@ func TestRunCodexHardDenyRequiresIndexedWorkspaceMatch(t *testing.T) {
 }
 
 func TestRunCodexBashRewriteOnlyForSimpleIndexedCat(t *testing.T) {
-	oldIndexed := fileIndexedFn
-	fileIndexedFn = func(_, path string) (bool, int) { return path == "internal/a.go", 3 }
-	t.Cleanup(func() { fileIndexedFn = oldIndexed })
+	stubFileIndexScopeBy(t, func(_, path string) fileIndexStatus {
+		if path == "internal/a.go" {
+			return indexedStatus(3)
+		}
+		return indexedStatus(0)
+	})
 
 	data := codexBashPayload("cat internal/a.go")
 	out := captureStdout(t, func() { runCodex(data, 0, CodexModeRewrite) })

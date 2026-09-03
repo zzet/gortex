@@ -3,20 +3,55 @@ package hooks
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+// stubFileIndexScopeBy stubs the file-verdict seam with a function of the
+// probed path. The timeout the production seam carries is dropped: no stub
+// waits on anything.
+func stubFileIndexScopeBy(t *testing.T, fn func(cwd, filePath string) fileIndexStatus) {
+	t.Helper()
+	old := fileIndexScopeFn
+	fileIndexScopeFn = func(cwd, filePath string, _ time.Duration) fileIndexStatus {
+		return fn(cwd, filePath)
+	}
+	t.Cleanup(func() { fileIndexScopeFn = old })
+}
+
+// stubFileIndexScope stubs the file-verdict seam with a full status, for tests
+// that must exercise the excluded / probe-unavailable branches the boolean
+// stubIndexedFile helper cannot express.
+func stubFileIndexScope(t *testing.T, st fileIndexStatus) {
+	t.Helper()
+	stubFileIndexScopeBy(t, func(string, string) fileIndexStatus { return st })
+}
+
+// indexedStatus is the answered verdict for a path holding symbols, or not
+// holding them yet at zero.
+func indexedStatus(symbols int) fileIndexStatus {
+	return fileIndexStatus{Indexed: symbols > 0, Count: symbols, ProbeOK: true}
+}
 
 func stubIndexedFile(t *testing.T, indexed bool, symbols int) {
 	t.Helper()
-	old := fileIndexedFn
-	fileIndexedFn = func(string, string) (bool, int) { return indexed, symbols }
-	t.Cleanup(func() { fileIndexedFn = old })
+	stubFileIndexScope(t, fileIndexStatus{Indexed: indexed, Count: symbols, ProbeOK: true})
 }
 
-func stubTrackedScope(t *testing.T, tracked bool) {
+func stubScopeTracked(t *testing.T, hasSource, probeOK bool) {
 	t.Helper()
 	old := scopeTrackedFn
-	scopeTrackedFn = func(string, string) bool { return tracked }
+	scopeTrackedFn = func(string, string) (bool, bool) { return hasSource, probeOK }
 	t.Cleanup(func() { scopeTrackedFn = old })
+}
+
+// stubTrackedScope is the pre-existing single-bool seam. It conflated "the
+// daemon proved this scope holds no indexed source" with "the daemon could not
+// be asked", and both produced the Unproven posture — so `false` maps to the
+// unprovable half here, preserving every caller's behaviour. Tests that mean
+// the proven-empty half call stubScopeTracked directly.
+func stubTrackedScope(t *testing.T, tracked bool) {
+	t.Helper()
+	stubScopeTracked(t, tracked, tracked)
 }
 
 func TestEnrichReadBlocksIndexedRangedRead(t *testing.T) {
@@ -111,8 +146,15 @@ func TestScopeTrackedViaDaemonUnavailable(t *testing.T) {
 	daemonReachableFn = func() bool { return false }
 	t.Cleanup(func() { daemonReachableFn = old })
 
-	if scopeTrackedViaDaemon("/repo", "internal") {
+	hasSource, probeOK := scopeTrackedViaDaemon("/repo", "internal")
+	if hasSource {
 		t.Fatal("unreachable daemon must not prove a tracked scope")
+	}
+	// And it must not prove an EMPTY one either: an unreachable daemon is no
+	// evidence the scope holds no source, so the caller keeps probing rather
+	// than going silent.
+	if probeOK {
+		t.Fatal("unreachable daemon must report the scope as unprovable, not proven-empty")
 	}
 }
 
@@ -156,12 +198,15 @@ func TestEnrichGlobUntrackedDaemonUpGreedyPatternStaysSoft(t *testing.T) {
 
 func TestParseFindFilesHasSourceRequiresNonEmptyIndexedResult(t *testing.T) {
 	withSource := []byte(`{"result":{"content":[{"text":"{\"count\":1,\"files\":[{\"path\":\"pkg/a.go\"}]}"}]}}`)
-	if !parseFindFilesHasSource(withSource) {
+	if hasSource, ok := parseFindFilesHasSource(withSource); !hasSource || !ok {
 		t.Fatal("non-empty find_files result should prove indexed source")
 	}
 	withoutSource := []byte(`{"result":{"content":[{"text":"{\"count\":0,\"files\":[]}"}]}}`)
-	if parseFindFilesHasSource(withoutSource) {
-		t.Fatal("empty find_files result must not prove indexed source")
+	if hasSource, ok := parseFindFilesHasSource(withoutSource); hasSource || !ok {
+		t.Fatal("empty find_files result must read as a well-formed no")
+	}
+	if _, ok := parseFindFilesHasSource([]byte(`{"result":{"isError":true}}`)); ok {
+		t.Fatal("an error frame is no answer at all")
 	}
 }
 

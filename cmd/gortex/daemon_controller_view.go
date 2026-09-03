@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -269,7 +270,7 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 	view := c.resolveProbeView(ctx, abs)
 	defer view.release()
 
-	out := daemon.FileCoverageResult{View: view.answer}
+	out := daemon.FileCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
 	if !view.servable {
 		return out, nil
 	}
@@ -282,9 +283,18 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 	}
 	prefix, key, ok := c.fileGraphKey(abs, view)
 	if !ok {
+		// Two different failures share this branch. A path no checkout owns
+		// was looked at and placed outside every corpus, which is an answer.
+		// A tracked path whose key could not be measured is not.
+		out.Answered = !out.Tracked
 		return out, nil
 	}
+	out.Answered = true
 	for _, n := range reader.GetFileNodes(key) {
+		if n == nil || (prefix != "" && n.RepoPrefix != prefix) {
+			continue
+		}
+		out.Held = true
 		// The file and import nodes ride on the by-file index for other
 		// walkers; the coverage question is "what does this file define".
 		if !probeSymbolCandidate(n, prefix) {
@@ -293,7 +303,59 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 		out.Symbols++
 	}
 	out.Covered = out.Symbols > 0
+	if !out.Covered {
+		// Only a path the graph has nothing for needs the walk's opinion, so
+		// the common answer costs no filesystem work.
+		//
+		// Known gap: a tree excluded AFTER it was indexed keeps its nodes and
+		// so keeps reading as covered, never reaching this branch, until a
+		// re-index drops them. Evicting them is the better fix and lives in
+		// the indexer.
+		out.Excluded, out.Unindexable = c.pathAdmission(abs)
+	}
 	return out, nil
+}
+
+// pathTracked reports whether a registered checkout owns abs.
+func (c *realController) pathTracked(abs string, view probeView) bool {
+	if view.root != "" {
+		return true
+	}
+	_, _, ok := c.trackedRoot(abs)
+	return ok
+}
+
+// pathAdmission asks the indexer that owns abs what the index walk would do
+// with it: unindexable is any rejection, excluded narrows it to an exclude or
+// ignore rule.
+//
+// A path no indexer owns, or one its owner cannot place or stat, leaves both
+// false. That is an abstention rather than "indexable", and the caller must
+// read it as one: PathIndexability already refuses to guess, and turning its
+// silence into a verdict here would undo that.
+func (c *realController) pathAdmission(abs string) (excluded, unindexable bool) {
+	idx := c.indexerForPath(abs)
+	if idx == nil {
+		return false, false
+	}
+	rel, ok := pathRelativeTo(idx.RootPath(), abs)
+	if !ok {
+		return false, false
+	}
+	skip, answered := idx.PathIndexability(rel)
+	if !answered {
+		return false, false
+	}
+	return skip.ByRule, skip.Skipped
+}
+
+// indexerForPath finds the indexer whose root contains abs.
+func (c *realController) indexerForPath(abs string) *indexer.Indexer {
+	if c.multiIndexer != nil {
+		owner, _ := c.multiIndexer.IndexerForFile(abs)
+		return owner
+	}
+	return c.indexer
 }
 
 // fileGraphKey renders an absolute path the way the graph spells a file key:
