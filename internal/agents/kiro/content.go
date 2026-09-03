@@ -19,6 +19,54 @@ var HookFiles = map[string]string{
 	"gortex-pre-read.json":      hookPreRead,
 }
 
+// legacyHookFiles contains only the exact Kiro hook payloads Gortex shipped
+// before Kiro's v1 schema. Semantic comparison permits whitespace changes but
+// preserves any user customization instead of claiming ownership by filename.
+var legacyHookFiles = map[string]string{
+	"gortex-smart-context.json": legacyHookTaskContext,
+	"gortex-post-edit.json":     legacyHookPostEdit,
+	"gortex-pre-read.json":      legacyHookPreRead,
+}
+
+const legacyHookTaskContext = `{
+  "name": "Gortex: Task Context",
+  "version": "1.0.0",
+  "description": "Localize each coding task with the graph before opening files.",
+  "when": {"type": "userTriggered"},
+  "then": {
+    "type": "askAgent",
+    "prompt": "For a coding task, call Gortex explore with operation task and the user's task text before reading or searching files. Skip this only for non-coding conversation."
+  }
+}
+`
+
+const legacyHookPostEdit = `{
+  "name": "Gortex: Post-Edit Check",
+  "version": "1.0.0",
+  "description": "Check impact and tests after a source edit.",
+  "when": {
+    "type": "fileEdited",
+    "patterns": ["**/*.go", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.py", "**/*.rs", "**/*.java", "**/*.kt", "**/*.scala", "**/*.swift", "**/*.rb", "**/*.cs", "**/*.php"]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Call Gortex change with operation detect for unstaged changes. Use its affected symbol IDs with operations tests, guards, and contract; run the selected tests and report every result."
+  }
+}
+`
+
+const legacyHookPreRead = `{
+  "name": "Gortex: Enrich Source Read",
+  "version": "1.0.0",
+  "description": "Use indexed source context before a raw source-file read.",
+  "when": {"type": "preToolUse", "toolTypes": ["read"]},
+  "then": {
+    "type": "askAgent",
+    "prompt": "For indexed source code, use Gortex read with operation editing_context or source instead of a raw file read. Skip generated files, metadata, documentation, configuration, and non-source assets."
+  }
+}
+`
+
 const steeringWorkflow = `---
 inclusion: always
 ---
@@ -92,41 +140,52 @@ inclusion: manual
 `
 
 const hookTaskContext = `{
-  "name": "Gortex: Task Context",
-  "version": "1.0.0",
-  "description": "Localize each coding task with the graph before opening files.",
-  "when": {"type": "userTriggered"},
-  "then": {
-    "type": "askAgent",
-    "prompt": "For a coding task, call Gortex explore with operation task and the user's task text before reading or searching files. Skip this only for non-coding conversation."
-  }
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Gortex: Task Context",
+      "description": "Localize each coding task with the graph before opening files.",
+      "trigger": "UserPromptSubmit",
+      "action": {
+        "type": "agent",
+        "prompt": "For a coding task, call Gortex explore with operation task and the user's task text before reading or searching files. Skip this only for non-coding conversation."
+      }
+    }
+  ]
 }
 `
 
 const hookPostEdit = `{
-  "name": "Gortex: Post-Edit Check",
-  "version": "1.0.0",
-  "description": "Check impact and tests after a source edit.",
-  "when": {
-    "type": "fileEdited",
-    "patterns": ["**/*.go", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.py", "**/*.rs", "**/*.java", "**/*.kt", "**/*.scala", "**/*.swift", "**/*.rb", "**/*.cs", "**/*.php"]
-  },
-  "then": {
-    "type": "askAgent",
-    "prompt": "Call Gortex change with operation detect for unstaged changes. Use its affected symbol IDs with operations tests, guards, and contract; run the selected tests and report every result."
-  }
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Gortex: Post-Edit Check",
+      "description": "Check impact and tests after a source edit.",
+      "trigger": "PostFileSave",
+      "matcher": "\\.(go|ts|tsx|js|jsx|py|rs|java|kt|scala|swift|rb|cs|php)$",
+      "action": {
+        "type": "agent",
+        "prompt": "Call Gortex change with operation detect for unstaged changes. Use its affected symbol IDs with operations tests, guards, and contract; run the selected tests and report every result."
+      }
+    }
+  ]
 }
 `
 
 const hookPreRead = `{
-  "name": "Gortex: Enrich Source Read",
-  "version": "1.0.0",
-  "description": "Use indexed source context before a raw source-file read.",
-  "when": {"type": "preToolUse", "toolTypes": ["read"]},
-  "then": {
-    "type": "askAgent",
-    "prompt": "For indexed source code, use Gortex read with operation editing_context or source instead of a raw file read. Skip generated files, metadata, documentation, configuration, and non-source assets."
-  }
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Gortex: Enrich Source Read",
+      "description": "Use indexed source context before a raw source-file read.",
+      "trigger": "PreToolUse",
+      "matcher": "read",
+      "action": {
+        "type": "agent",
+        "prompt": "For indexed source code, use Gortex read with operation editing_context or source instead of a raw file read. Skip generated files, metadata, documentation, configuration, and non-source assets."
+      }
+    }
+  ]
 }
 `
 

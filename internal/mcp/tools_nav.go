@@ -374,7 +374,7 @@ func (s *Server) navRead(ctx context.Context, req mcp.CallToolRequest, eng engin
 		payload["note"] = "symbol has no line range"
 		return s.respondJSONOrTOON(ctx, req, payload)
 	}
-	absPath, resolveErr := s.resolveNodePath(node)
+	absPath, resolveErr := s.resolveNodePath(ctx, node)
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}

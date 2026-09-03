@@ -137,6 +137,132 @@ Causes worth knowing:
 janitor walks every tracked repo against disk on that tick regardless of
 watcher health.
 
+## Checkout families and worktree views
+
+A tracked repository is rarely one directory. Git's linked worktrees give the
+same repository several working copies off one shared administrative directory,
+and Gortex models that set as a **checkout family**: every worktree of one
+repository, keyed by the common git dir, with the repository's own checkouts
+inside it identified by `(family, administrative name)` — the name git keeps
+under `<commondir>/worktrees/`. That identity is what survives a path going
+away and coming back.
+
+**Discovery is automatic.** Reconciliation reads `git worktree list` for each
+tracked family and mints a durable identity for every linked worktree it has
+not seen, provided the worktree is usable (git does not already call it
+prunable, its root is reachable, it has an administrative name) and the family
+already has a **primary corpus** to serve from. Nothing is tracked twice: a
+newly discovered worktree becomes an *automatic* checkout, served from the
+family's shared lane, rather than a second indexed repository. `gortex track` on
+a worktree still makes it *dedicated* — its own graph, indexed in its own right.
+
+**Automatic checkouts are dormant until selected.** Minting the identity is
+cheap; standing up a coordinator and building its commit and dirty layers is
+not, and a family with dozens of linked worktrees would pay that cost, serialized
+through the build gate, for every one at startup — most of them never read. So an
+automatic checkout the startup inventory sees keeps only its catalog row until a
+session or query selects it; the first selection wakes its coordinator, and the
+retry that follows finds the composed view built. A worktree already being served
+resumes on restart through its persisted route. A `git worktree add` performed
+while the daemon is running is built eagerly on discovery by default — set
+`views.lazy_worktree_activation: true` (or `GORTEX_WORKTREE_LAZY_ACTIVATION=1`,
+which overrides the file either way) to defer those too, for worktree-heavy trees
+that never want an unselected view built.
+
+**One corpus, layered per checkout.** The primary corpus is the index built
+from one checkout of the family; every automatic checkout is served by composing
+two generations on top of it — a **commit layer** that turns the corpus at the
+primary's tree into the corpus at that checkout's HEAD tree, and a **dirty
+layer** that turns that into what its working tree currently holds. A
+per-checkout coordinator keeps both in step: a filesystem signal opens a quiet
+window, the state is sampled after the window closes (not when the signal
+arrived), and each slot is reconciled against the identity of what it is routed
+to. Because a commit layer's identity is the tree it targets over the base it
+sits on, switching branch A → B → A re-routes A's existing generation instead of
+re-indexing A's tree. Every route flip is a compare-and-set on the route's
+epoch, so a coordinator that loses the race supersedes what it built and
+reschedules. `gortex repos set-primary` moves the primary; every automatic
+checkout then rebuilds its layers over the new base, and one that cannot finish
+in time keeps its old route — a stale view of a real state rather than a
+failure.
+
+**Views of committed state.** A `git_ref` or `commit` selector
+([mcp.md](mcp.md#worktree-views-and-checkouts)) names a tree nobody has checked
+out. It is served by building one generation describing that tree over the
+graph's corpus — no dirty slot, because a ref means the committed tree by
+definition. Those generations are cached and reclaimed on three bounds: the
+generation a view selected inside the retention window is always kept; past the
+per-graph count cap candidates go least-recently-selected first; and the same
+order pays down the per-graph byte budget. Eviction never forces anything —
+every candidate is offered to the same guarded retire the coordinators use, so a
+routed, based-upon or leased generation is simply offered again next sweep. A
+selector whose payload was evicted resolves and rebuilds on its next selection.
+
+```yaml
+# ~/.gortex/config.yaml (or per-repo .gortex.yaml)
+views:
+  retain_inactive: 168h          # keep a generation this long after the last
+                                 # selection of the view serving it (default 7 days)
+  max_cached_generations: 32     # per-graph cap on cached ref-view generations
+  max_bytes_per_graph: 5368709120  # per-graph payload budget in bytes (default 5 GiB)
+  lazy_worktree_activation: false  # keep a runtime-discovered worktree dormant
+                                   # until it is selected, too (default: eager on
+                                   # discovery; startup inventory is always dormant)
+```
+
+Each is "unset" at zero (or at an unparseable duration, which is logged) and
+takes the shipped bound; a cap of zero would evict a generation the moment it
+was published. Language-server enrichment of a routed checkout has its own
+bounds — see [`semantic.checkout_lsp`](lsp.md#checkout-workspaces).
+
+**A view and a checkout at the same commit build separately.** That is by
+design, not a missed cache hit: a checkout's commit layer is keyed per checkout
+(`commit-<checkout id>`, owned by the graph) and a ref view's layer is keyed per
+view (`refview-layer-<view id>`, owned by the view), because the two have
+different owners and different retirement lifecycles — a checkout's layers
+follow its coordinator's route flips, a ref view's are collected by the sweep
+above. Sharing one generation row between them would still be safe — the
+guarded retire refuses any generation a ref view points at, whoever offered it
+— but it would entangle the two owners' accounting. The view's pointer would
+pin the checkout's layer, so a branch switch could never reclaim it and every
+sweep would re-offer a generation that is refused again; and each side's bounds
+— the view's retention window, count cap and byte budget against the
+coordinator's branch-switch reuse cache — would be sizing a payload the other
+one holds. The payloads are not interchangeable either: a ref
+view describes a tree nobody has checked out, so it carries neither the
+language-server enrichment nor the text-search rows a checkout's layers get from
+a root on disk. What the duplication costs, in the rare case where a view and a
+checkout do sit on the same tree over the same base, is one redundant build and
+the rows it writes.
+
+**Removal needs evidence.** Anything the daemon cannot positively prove is
+treated as a checkout that is temporarily unreachable, never as one that is
+gone: a failed stat looks identical either way and only one of the two is
+recoverable. Availability and removal are separate clocks — being unreachable
+for an hour brings a checkout no closer to being forgotten. The removal clock
+starts only on evidence, of which there are two kinds: a trustworthy inventory
+of the family that did not list the checkout (git's administrative data is the
+authority on which worktrees exist, so its silence is a statement), or git
+still listing the worktree as prunable *and* the filesystem agreeing the root
+is absent from a volume that is still mounted. Both are recorded on the
+catalog row beside the clock, so a reader can tell afterwards which proof was
+used, and deletion runs through journalled sagas whose every phase is
+idempotent — a crash resumes rather than re-running side effects.
+`gortex repos families` shows both clocks with their deadlines and the last
+evidence; `gortex repos reconcile` runs the pass now instead of waiting for the
+janitor.
+
+**Builds wait for warmup.** A warm restart brings everything back at once: the
+warmup tail re-resolves the graph while every automatic checkout the catalog
+remembers wants its two layers built, all through one store writer. Build work
+is therefore held until warmup completes. Nothing else is: registration,
+catalog seeding, route reads and serving a generation that is already published
+never consult the gate, so a warming daemon keeps answering from whatever the
+last run left behind. Held work is not dropped either — a coordinator cycle
+reschedules onto the gate's own wake, and a ref view's build keeps its claim, so
+the selection that made it still gets a token to poll and later selections
+coalesce onto the same one.
+
 ## CLI
 
 ```bash
@@ -147,6 +273,13 @@ gortex mcp --project my-saas        # Set active project scope
 gortex status                       # Per-repo and per-project stats
 gortex repos                        # List tracked repos — head-commit SHA, last-indexed time, freshness
 gortex repos --json                 # Same, machine-readable (for scripts / CI)
+
+# Worktree + checkout administration lives under `gortex repos` (see cli.md)
+gortex repos families               # Families, their primary corpus, working copies, routes, views
+gortex repos explain-view <path>    # Which graph answers for a path, and why
+gortex repos reconcile [family]     # Reconcile against git + the filesystem now
+gortex repos set-primary <graph>    # Move a family's primary corpus (preview; --confirm runs it)
+gortex repos forget <path>          # Remove a checkout outright (preview; --confirm runs it)
 
 # Stamp workspace / project slugs across tracked repos (migration helper)
 gortex workspace list                                       # Show what each tracked repo currently declares

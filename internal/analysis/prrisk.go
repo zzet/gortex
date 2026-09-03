@@ -105,7 +105,7 @@ var securityKeywords = []string{
 // symbols. Five 0-100 axes are blended into a weighted normalized composite
 // and bucketed into a RiskLevel via the same thresholds the composite-impact
 // scorer uses. The ordered Factors slice doubles as a review-priority list.
-func ScorePRRisk(g graph.Store, in PRRiskInput) PRRiskResult {
+func ScorePRRisk(g graph.Reader, in PRRiskInput) PRRiskResult {
 	ids := dedupStrings(in.SymbolIDs)
 
 	// Axis (a): blast-radius flow. AnalyzeImpact gives the total affected
@@ -244,7 +244,7 @@ func securityKeywordHits(files []string, names []string) []string {
 // hasCoveringTest reports whether any inbound EdgeTests edge points at the
 // symbol — the same inverse-edge walk buildBlastRadius uses to find covering
 // tests, run at the graph-store level (one hop, no BFS).
-func hasCoveringTest(g graph.Store, symbolID string) bool {
+func hasCoveringTest(g graph.Reader, symbolID string) bool {
 	for _, e := range g.GetInEdges(symbolID) {
 		if e.Kind == graph.EdgeTests {
 			return true
@@ -256,7 +256,7 @@ func hasCoveringTest(g graph.Store, symbolID string) bool {
 // callerFanIn counts the distinct callers of a symbol — inbound calls/
 // references edges, deduped by source node. A reference edge is included so a
 // symbol used as a value (not only called) still registers fan-in.
-func callerFanIn(g graph.Store, symbolID string) int {
+func callerFanIn(g graph.Reader, symbolID string) int {
 	seen := make(map[string]bool)
 	for _, e := range g.GetInEdges(symbolID) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
@@ -273,7 +273,7 @@ func callerFanIn(g graph.Store, symbolID string) int {
 // symbolNames resolves the changed symbol IDs to their node names for the
 // security-keyword match. Unknown IDs fall back to the trailing segment of the
 // ID so a name still feeds the matcher even when the node is not in the graph.
-func symbolNames(g graph.Store, ids []string) []string {
+func symbolNames(g graph.Reader, ids []string) []string {
 	out := make([]string, 0, len(ids))
 	for _, id := range ids {
 		if n := g.GetNode(id); n != nil && n.Name != "" {

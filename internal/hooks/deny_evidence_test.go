@@ -25,7 +25,7 @@ func TestGrepDenyCarriesProbeHits(t *testing.T) {
 		{Name: "placeEdges", Kind: "method", FilePath: "internal/place/edges.go", Line: 7},
 	}, nil)
 
-	result := probeSymbolPattern("Grep", "handlePlace", defaultGrepGuidance())
+	result := probeSymbolPattern("Grep", "handlePlace", "", defaultGrepGuidance())
 	if !result.deny {
 		t.Fatalf("probed Grep hit was not denied: %#v", result)
 	}
@@ -65,7 +65,7 @@ func TestGrepDenyEvidenceStaysWithinByteBound(t *testing.T) {
 	}
 
 	stubProbe(t, hits, nil)
-	result := probeSymbolPattern("Grep", "veryLongSymbolNameNumber00", defaultGrepGuidance())
+	result := probeSymbolPattern("Grep", "veryLongSymbolNameNumber00", "", defaultGrepGuidance())
 	if !result.deny || !strings.Contains(result.reason, block) {
 		t.Fatalf("Grep deny does not embed the bounded evidence block: %#v", result)
 	}
@@ -94,7 +94,7 @@ func TestDenyEvidenceBlockCountsItsHeader(t *testing.T) {
 func TestGrepProbeDaemonUnreachableKeepsBaselineGuidance(t *testing.T) {
 	stubProbe(t, nil, errDaemonUnreachable)
 
-	result := probeSymbolPattern("Grep", "handlePlace", defaultGrepGuidance())
+	result := probeSymbolPattern("Grep", "handlePlace", "", defaultGrepGuidance())
 	if result.deny {
 		t.Fatalf("unreachable daemon must not deny: %#v", result)
 	}

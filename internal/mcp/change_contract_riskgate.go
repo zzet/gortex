@@ -63,11 +63,11 @@ func riskGateCallerThreshold() int {
 }
 
 // riskGatedSymbols returns the changed symbols that require an ack.
-func (s *Server) riskGatedSymbols(p *prediction) []*graph.Node {
+func (s *Server) riskGatedSymbols(ctx context.Context, p *prediction) []*graph.Node {
 	if p == nil || len(p.nodes) == 0 {
 		return nil
 	}
-	fanIn, _ := computeFanInOut(s.graph, p.nodes)
+	fanIn, _ := computeFanInOut(s.readerFor(ctx), p.nodes)
 	ids := make([]string, 0, len(p.nodes))
 	for _, node := range p.nodes {
 		if node != nil {
@@ -133,9 +133,9 @@ func (s *Server) recordRiskAck(id, author string, risk changeRisk) (string, erro
 
 // riskGateReasons checks each gated symbol for a fresh ack and returns refuse
 // reasons for those lacking one.
-func (s *Server) riskGateReasons(p *prediction, risk changeRisk) []changeReason {
+func (s *Server) riskGateReasons(ctx context.Context, p *prediction, risk changeRisk) []changeReason {
 	var reasons []changeReason
-	for _, n := range s.riskGatedSymbols(p) {
+	for _, n := range s.riskGatedSymbols(ctx, p) {
 		if s.hasFreshAck(n.ID) {
 			reasons = append(reasons, changeReason{
 				Family:     "risk_gate",

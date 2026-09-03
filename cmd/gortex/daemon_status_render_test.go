@@ -79,6 +79,57 @@ func TestRenderDaemonRepos_NoRepos(t *testing.T) {
 	assert.Contains(t, buf.String(), "tracked repos: (none)")
 }
 
+// TestRenderDaemonRepos_BusyAggregate — a status served while a track holds
+// the controller carries the table from the last pass that computed one. The
+// heading has to say so: an unmarked stale table is indistinguishable from a
+// current one, and an unmarked empty one reads as "nothing is tracked".
+func TestRenderDaemonRepos_BusyAggregate(t *testing.T) {
+	t.Run("cached table names its age and the reason", func(t *testing.T) {
+		now := time.Now()
+		st := sampleStatus()
+		st.AggregateBusy = true
+		st.AggregateCachedUnix = now.Add(-90 * time.Second).Unix()
+		assert.Equal(t,
+			" (cached 1m30s ago — a track/reload is in progress)",
+			daemonAggregateSuffix(st, time.Unix(st.AggregateCachedUnix+90, 0)))
+
+		var buf bytes.Buffer
+		renderDaemonRepos(&buf, st)
+		out := buf.String()
+		assert.Contains(t, out, "cached ")
+		assert.Contains(t, out, "a track/reload is in progress")
+		// The table itself still renders — a marked snapshot beats no answer.
+		assert.Contains(t, out, "project1")
+	})
+
+	t.Run("clock skew never prints a negative age", func(t *testing.T) {
+		st := sampleStatus()
+		st.AggregateBusy = true
+		st.AggregateCachedUnix = 5_000
+		assert.Equal(t,
+			" (cached 0s ago — a track/reload is in progress)",
+			daemonAggregateSuffix(st, time.Unix(4_990, 0)))
+	})
+
+	t.Run("busy with no snapshot says so instead of (none)", func(t *testing.T) {
+		var buf bytes.Buffer
+		renderDaemonRepos(&buf, daemon.StatusResponse{AggregateBusy: true})
+		out := buf.String()
+		assert.Contains(t, out, "a track/reload is in progress")
+		assert.NotContains(t, out, "(none)",
+			"an unknown table must not be reported as an empty one")
+	})
+
+	t.Run("an uncontended status prints no suffix", func(t *testing.T) {
+		var buf bytes.Buffer
+		renderDaemonRepos(&buf, sampleStatus())
+		out := buf.String()
+		assert.Contains(t, out, "tracked repos:")
+		assert.NotContains(t, out, "cached")
+		assert.NotContains(t, out, "in progress")
+	})
+}
+
 func TestRenderDaemonHeader_SearchBackendRow(t *testing.T) {
 	st := sampleStatus()
 	// What resolveSearchBackend emits for the store-native FTS index:

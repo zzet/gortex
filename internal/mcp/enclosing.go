@@ -20,14 +20,18 @@ const astPostMatchFileLimit = 64
 
 // astPostMatchSymbolLookupContext builds enclosing-symbol indexes only for the
 // first 64 distinct files that survived a caller's stable ordering and result
-// limit. AST targets come from the durable graph, so enrichment deliberately
-// reads s.graph even when the request carries an editor overlay.
+// limit. Enrichment reads through the request reader, so a call carrying an
+// editor overlay attributes its matches to the buffer's symbols.
 func (s *Server) astPostMatchSymbolLookupContext(
 	ctx context.Context,
 	count int,
 	pathAt func(int) string,
 ) astquery.SymbolLookup {
-	if s == nil || s.graph == nil || count <= 0 || pathAt == nil || ctx.Err() != nil {
+	if s == nil || count <= 0 || pathAt == nil || ctx.Err() != nil {
+		return nil
+	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return nil
 	}
 	paths := make([]string, 0, astPostMatchFileLimit)
@@ -47,7 +51,7 @@ func (s *Server) astPostMatchSymbolLookupContext(
 		return nil
 	}
 	indexes := s.buildFileSymbolIndexForOrderedPathsScopedReaderContext(
-		ctx, s.graph, paths, query.QueryOptions{},
+		ctx, reader, paths, query.QueryOptions{},
 	)
 	return func(path string, line int) (string, string) {
 		if _, ok := admitted[path]; !ok {

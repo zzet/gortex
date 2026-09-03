@@ -9,6 +9,10 @@ import (
 // EvictConfigNodesByIDs removes only KindConfigKey nodes from the supplied
 // bounded ID set and every incident edge in one transaction. It is the
 // set-oriented migration path for legacy unqualified Spring config IDs.
+//
+// Scoped to the handle's payload view generation: the stale IDs come from the
+// contract extractor's own read of the corpus this handle indexed, and the
+// re-qualified replacements land at the same generation.
 func (s *Store) EvictConfigNodesByIDs(ids []string) (nodesRemoved, edgesRemoved int) {
 	if len(ids) == 0 {
 		return 0, 0
@@ -50,14 +54,16 @@ func (s *Store) EvictConfigNodesByIDs(ids []string) (nodesRemoved, edgesRemoved 
 		end := minInt(start+contractNodeEvictChunkSize, len(unique))
 		chunk := unique[start:end]
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-		args := make([]any, 0, len(chunk)+1)
+		args := make([]any, 0, len(chunk)+2)
 		args = append(args, string(graph.KindConfigKey))
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		configIDs := `SELECT id FROM nodes WHERE kind = ? AND id IN (` + placeholders + `)`
+		args = append(args, s.viewGen)
+		configIDs := `SELECT id FROM nodes WHERE kind = ? AND id IN (` + placeholders + `) AND view_gen = ?`
+		edgeArgs := append(append([]any{}, args...), s.viewGen)
 		for _, column := range []string{"from_id", "to_id"} {
-			result, execErr := tx.Exec(`DELETE FROM edges WHERE `+column+` IN (`+configIDs+`)`, args...)
+			result, execErr := tx.Exec(`DELETE FROM edges WHERE `+column+` IN (`+configIDs+`) AND view_gen = ?`, edgeArgs...)
 			if execErr != nil {
 				panicOnFatal(execErr)
 				return 0, edgesRemoved
@@ -69,7 +75,7 @@ func (s *Store) EvictConfigNodesByIDs(ids []string) (nodesRemoved, edgesRemoved 
 			}
 			edgesRemoved += int(rows)
 		}
-		result, execErr := tx.Exec(`DELETE FROM nodes WHERE kind = ? AND id IN (`+placeholders+`)`, args...)
+		result, execErr := tx.Exec(`DELETE FROM nodes WHERE kind = ? AND id IN (`+placeholders+`) AND view_gen = ?`, args...)
 		if execErr != nil {
 			panicOnFatal(execErr)
 			return nodesRemoved, edgesRemoved

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -14,12 +15,13 @@ import (
 
 // paramCount returns the number of parameters declared on a function/method
 // node — params point at their owner via EdgeParamOf.
-func (s *Server) paramCount(id string) int {
-	if s.graph == nil {
+func (s *Server) paramCount(ctx context.Context, id string) int {
+	g := s.readerFor(ctx)
+	if g == nil {
 		return 0
 	}
 	n := 0
-	for _, e := range s.graph.GetInEdges(id) {
+	for _, e := range g.GetInEdges(id) {
 		if e.Kind == graph.EdgeParamOf {
 			n++
 		}
@@ -58,14 +60,14 @@ func ccImpactTier(lineCount, fanOut int) string {
 
 // buildEditStrategy derives a named refactoring technique for the dominant
 // changed symbol, or nil when the change is small enough not to warrant one.
-func (s *Server) buildEditStrategy(p *prediction) *editStrategy {
+func (s *Server) buildEditStrategy(ctx context.Context, p *prediction) *editStrategy {
 	node := s.dominantSymbol(p.nodes)
 	if node == nil {
 		return nil
 	}
 	lineCount := node.EndLine - node.StartLine + 1
-	params := s.paramCount(node.ID)
-	fanIn, fanOut := computeFanInOut(s.graph, []*graph.Node{node})
+	params := s.paramCount(ctx, node.ID)
+	fanIn, fanOut := computeFanInOut(s.readerFor(ctx), []*graph.Node{node})
 	callers := fanIn[node.ID]
 	callees := fanOut[node.ID]
 

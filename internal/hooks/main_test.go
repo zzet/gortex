@@ -28,12 +28,11 @@ func TestMain(m *testing.M) {
 	// without a daemon (and never dial a real socket); daemon-outage tests
 	// stub it false via withDaemonReachable.
 	daemonReachableFn = func() bool { return true }
-	// Default the file-scope / file-summary probes to "tracked, indexable, not
-	// indexed" so no test dials a real daemon. Tests needing another verdict
-	// stub fileIndexScopeFn / fileSummaryFn (stubFileIndexScope /
-	// fakeIndexedBridge / newIndexedBridge) and restore these defaults on
-	// cleanup.
-	fileIndexScopeFn = func(_, _ string) fileIndexStatus { return fileIndexStatus{ProbeOK: true} }
+	// Default the file-indexed / file-summary probes to "not indexed" so no
+	// test dials a real daemon. Tests needing an indexed verdict stub
+	// fileIndexedFn / fileSummaryFn (fakeIndexedBridge / newIndexedBridge /
+	// stubBridge) and restore these defaults on cleanup.
+	fileIndexedFn = func(_, _ string) (bool, int) { return false, 0 }
 	fileSummaryFn = func(_, _ string) (*hookFileSummary, bool) { return nil, false }
 	callServerToolDaemonFn = func(string, string, map[string]any) string { return "" }
 	// Same reason: attribution resolves the diffed repo through the daemon's

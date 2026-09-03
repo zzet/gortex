@@ -112,8 +112,9 @@ func (s *Server) handleGetArtifact(ctx context.Context, req mcp.CallToolRequest)
 		File string `json:"file"`
 	}
 	refs := make([]refRow, 0, len(art.References))
+	reader := s.readerFor(ctx)
 	for _, symID := range art.References {
-		if n := s.graph.GetNode(symID); n != nil {
+		if n := reader.GetNode(symID); n != nil {
 			refs = append(refs, refRow{ID: n.ID, Name: n.Name, Kind: string(n.Kind), File: n.FilePath})
 		}
 	}
@@ -130,7 +131,7 @@ func (s *Server) handleGetArtifact(ctx context.Context, req mcp.CallToolRequest)
 	// resolveFilePath blocks lexical `../` traversal but follows symlinks, so
 	// the confinement check every other content-serving tool applies is
 	// required here too before the bytes go into the response.
-	if abs, _, err := s.resolveFilePath(art.Path); err == nil && s.guardSymlinkWithinRepo(abs) == nil {
+	if abs, _, err := s.resolveFilePath(ctx, art.Path); err == nil && s.guardSymlinkWithinRepo(ctx, abs) == nil {
 		if data, err := os.ReadFile(abs); err == nil { //nolint:gosec // path resolved from the indexed manifest
 			content := data
 			truncated := false

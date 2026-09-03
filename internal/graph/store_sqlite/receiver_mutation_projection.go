@@ -19,7 +19,7 @@ func receiverMutationPageSize(pageSize int) int {
 func (s *Store) receiverMutationNodeHighWater(kind graph.NodeKind) (string, bool) {
 	var highWater string
 	if err := s.db.QueryRow(
-		`SELECT COALESCE(MAX(id), '') FROM nodes WHERE kind = ?`, string(kind),
+		`SELECT COALESCE(MAX(id), '') FROM nodes WHERE kind = ? AND view_gen = ?`, string(kind), s.viewGen,
 	).Scan(&highWater); err != nil {
 		panicOnFatal(err)
 		return "", false
@@ -30,7 +30,7 @@ func (s *Store) receiverMutationNodeHighWater(kind graph.NodeKind) (string, bool
 func (s *Store) receiverMutationEdgeHighWater(kind graph.EdgeKind) (int64, bool) {
 	var highWater int64
 	if err := s.db.QueryRow(
-		`SELECT COALESCE(MAX(id), 0) FROM edges WHERE kind = ?`, string(kind),
+		`SELECT COALESCE(MAX(id), 0) FROM edges WHERE kind = ? AND view_gen = ?`, string(kind), s.viewGen,
 	).Scan(&highWater); err != nil {
 		panicOnFatal(err)
 		return 0, false
@@ -56,7 +56,7 @@ func (s *Store) ScanReceiverMutationMethods(
 	stmt, err := s.db.Prepare(`
 SELECT id, meta
 FROM nodes
-WHERE kind = ? AND id > ? AND id <= ?
+WHERE kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`)
 	if err != nil {
@@ -67,7 +67,7 @@ LIMIT ?`)
 
 	lastID := ""
 	for lastID < highWater {
-		rows, err := stmt.Query(string(graph.KindMethod), lastID, highWater, pageSize)
+		rows, err := stmt.Query(string(graph.KindMethod), lastID, highWater, s.viewGen, pageSize)
 		if err != nil {
 			panicOnFatal(err)
 			return
@@ -119,7 +119,7 @@ func (s *Store) ScanReceiverMutationFields(
 	stmt, err := s.db.Prepare(`
 SELECT id, name, meta
 FROM nodes
-WHERE kind = ? AND id > ? AND id <= ?
+WHERE kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`)
 	if err != nil {
@@ -130,7 +130,7 @@ LIMIT ?`)
 
 	lastID := ""
 	for lastID < highWater {
-		rows, err := stmt.Query(string(graph.KindField), lastID, highWater, pageSize)
+		rows, err := stmt.Query(string(graph.KindField), lastID, highWater, s.viewGen, pageSize)
 		if err != nil {
 			panicOnFatal(err)
 			return
@@ -182,7 +182,7 @@ func (s *Store) ScanReceiverMutationWrites(
 	stmt, err := s.db.Prepare(`
 SELECT id, from_id, to_id, meta
 FROM edges
-WHERE kind = ? AND id > ? AND id <= ?
+WHERE kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`)
 	if err != nil {
@@ -193,7 +193,7 @@ LIMIT ?`)
 
 	lastID := int64(0)
 	for lastID < highWater {
-		rows, err := stmt.Query(string(graph.EdgeWrites), lastID, highWater, pageSize)
+		rows, err := stmt.Query(string(graph.EdgeWrites), lastID, highWater, s.viewGen, pageSize)
 		if err != nil {
 			panicOnFatal(err)
 			return
@@ -247,7 +247,7 @@ func (s *Store) ScanReceiverMutationCalls(
 	candidateStmt, err := s.db.Prepare(`
 SELECT id, meta
 FROM edges
-WHERE kind = ? AND id > ? AND id <= ?
+WHERE kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`)
 	if err != nil {
@@ -262,8 +262,8 @@ WITH requested(id) AS (
 SELECT e.id, e.from_id, e.to_id, e.file_path, e.line,
        target.kind, target.name, target.meta
 FROM requested AS r
-JOIN edges AS e ON e.id = r.id
-LEFT JOIN nodes AS target ON target.id = e.to_id
+JOIN edges AS e ON e.id = r.id AND e.view_gen = ?
+LEFT JOIN nodes AS target ON target.id = e.to_id AND target.view_gen = e.view_gen
 ORDER BY e.id`)
 	if err != nil {
 		panicOnFatal(err)
@@ -277,7 +277,7 @@ ORDER BY e.id`)
 	}
 	lastID := int64(0)
 	for lastID < highWater {
-		rows, err := candidateStmt.Query(string(graph.EdgeCalls), lastID, highWater, pageSize)
+		rows, err := candidateStmt.Query(string(graph.EdgeCalls), lastID, highWater, s.viewGen, pageSize)
 		if err != nil {
 			panicOnFatal(err)
 			return
@@ -312,7 +312,7 @@ ORDER BY e.id`)
 				panicOnFatal(err)
 				return
 			}
-			exactRows, err := exactStmt.Query(string(encodedIDs))
+			exactRows, err := exactStmt.Query(string(encodedIDs), s.viewGen)
 			if err != nil {
 				panicOnFatal(err)
 				return

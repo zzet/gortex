@@ -221,13 +221,19 @@ func TestPromotedColumns_Migration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The pre-promotion column set on the current identity key. The key is not
+	// what this test is about, but the plan below pins the migration list to
+	// the v2 step, so the v16 re-key never runs here and the fixture has to
+	// carry it — the node writer binds view_gen on every insert.
 	_, err = raw.Exec(`CREATE TABLE nodes (
-		id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+		id TEXT NOT NULL, view_gen INTEGER NOT NULL DEFAULT 0,
+		kind TEXT NOT NULL, name TEXT NOT NULL,
 		qual_name TEXT NOT NULL DEFAULT '', file_path TEXT NOT NULL,
 		start_line INTEGER NOT NULL DEFAULT 0, end_line INTEGER NOT NULL DEFAULT 0,
 		language TEXT NOT NULL DEFAULT '', repo_prefix TEXT NOT NULL DEFAULT '',
 		workspace_id TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '',
-		meta BLOB
+		meta BLOB,
+		PRIMARY KEY (id, view_gen)
 	) WITHOUT ROWID`)
 	if err != nil {
 		t.Fatal(err)

@@ -837,6 +837,25 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		}
 		return ControlResponse{OK: true, Result: buf}
 
+	case ControlFileCoverage:
+		coverage, ok := s.Controller.(FileCoverageController)
+		if !ok {
+			return controlErr(ErrInternal, "this daemon cannot resolve a path to the view that serves it")
+		}
+		var p FileCoverageParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := coverage.FileCoverage(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal file_coverage result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
+
 	case ControlShutdown:
 		if err := s.Controller.Shutdown(ctx); err != nil {
 			return controlErr(ErrInternal, err.Error())
@@ -1037,6 +1056,15 @@ func unmarshalParams(raw json.RawMessage, v any) error {
 
 func controlErr(code, msg string) ControlResponse {
 	return ControlResponse{ErrorCode: code, ErrorMsg: msg}
+}
+
+// FileCoverageController is the opt-in view-scoped coverage answer behind
+// ControlFileCoverage. A controller implements it when it can resolve a
+// filesystem path to the graph that serves it; one that cannot leaves the
+// kind unanswered, and the caller degrades exactly as it does for a daemon
+// that is not running at all.
+type FileCoverageController interface {
+	FileCoverage(ctx context.Context, params FileCoverageParams) (FileCoverageResult, error)
 }
 
 // StatusExactController is the opt-in audit half of ControlStatus. A

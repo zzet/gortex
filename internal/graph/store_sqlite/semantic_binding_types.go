@@ -5,7 +5,7 @@ import "github.com/zzet/gortex/internal/graph"
 var _ graph.SemanticBindingTypeStore = (*Store)(nil)
 
 // semanticBindingChunk keeps VALUES/INSERT statements below SQLite's
-// conservative 999-host-parameter limit (5 parameters per persisted row,
+// conservative 999-host-parameter limit (6 parameters per persisted row,
 // 4 per lookup row).
 const semanticBindingChunk = 150
 
@@ -21,7 +21,7 @@ func (s *Store) ReplaceSemanticBindingTypes(repoPrefix string, rows []graph.Sema
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
-	if _, err := tx.Exec("DELETE FROM semantic_binding_types WHERE repo_prefix = ?", repoPrefix); err != nil {
+	if _, err := tx.Exec("DELETE FROM semantic_binding_types WHERE view_gen = ? AND repo_prefix = ?", s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	for start := 0; start < len(rows); start += semanticBindingChunk {
@@ -30,15 +30,15 @@ func (s *Store) ReplaceSemanticBindingTypes(repoPrefix string, rows []graph.Sema
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*5)
+		args := make([]any, 0, len(batch)*6)
 		stmt := make([]byte, 0, 128+len(batch)*17)
-		stmt = append(stmt, "INSERT OR REPLACE INTO semantic_binding_types (repo_prefix, file_path, line, name, type_name) VALUES "...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO semantic_binding_types (view_gen, repo_prefix, file_path, line, name, type_name) VALUES "...)
 		for i, row := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?, ?)"...)
-			args = append(args, repoPrefix, row.Site.FilePath, row.Site.Line, row.Site.Name, row.TypeName)
+			stmt = append(stmt, "(?, ?, ?, ?, ?, ?)"...)
+			args = append(args, s.viewGen, repoPrefix, row.Site.FilePath, row.Site.Line, row.Site.Name, row.TypeName)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -68,10 +68,10 @@ func (s *Store) ReplaceSemanticBindingTypesForFiles(repoPrefix string, files []s
 			end = len(files)
 		}
 		chunk := files[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 96+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM semantic_binding_types WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "DELETE FROM semantic_binding_types WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, filePath := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -90,15 +90,15 @@ func (s *Store) ReplaceSemanticBindingTypesForFiles(repoPrefix string, files []s
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*5)
+		args := make([]any, 0, len(batch)*6)
 		stmt := make([]byte, 0, 128+len(batch)*17)
-		stmt = append(stmt, "INSERT OR REPLACE INTO semantic_binding_types (repo_prefix, file_path, line, name, type_name) VALUES "...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO semantic_binding_types (view_gen, repo_prefix, file_path, line, name, type_name) VALUES "...)
 		for i, row := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?, ?)"...)
-			args = append(args, repoPrefix, row.Site.FilePath, row.Site.Line, row.Site.Name, row.TypeName)
+			stmt = append(stmt, "(?, ?, ?, ?, ?, ?)"...)
+			args = append(args, s.viewGen, repoPrefix, row.Site.FilePath, row.Site.Line, row.Site.Name, row.TypeName)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -128,10 +128,10 @@ func (s *Store) DeleteSemanticBindingTypesByFiles(repoPrefix string, files []str
 			end = len(files)
 		}
 		chunk := files[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 96+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM semantic_binding_types WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "DELETE FROM semantic_binding_types WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, filePath := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -186,10 +186,12 @@ func (s *Store) SemanticBindingTypes(sites []graph.SemanticBindingSite) (map[gra
 		stmt = append(stmt, `) SELECT b.repo_prefix, b.file_path, b.line, b.name, b.type_name
 FROM wanted AS w
 JOIN semantic_binding_types AS b
-  ON b.repo_prefix = w.repo_prefix
+  ON b.view_gen = ?
+ AND b.repo_prefix = w.repo_prefix
  AND b.file_path = w.file_path
  AND b.line = w.line
  AND b.name = w.name`...)
+		args = append(args, s.viewGen)
 
 		rows, err := s.db.Query(string(stmt), args...)
 		if err != nil {

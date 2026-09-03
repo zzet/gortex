@@ -65,7 +65,7 @@ type ReviewPack struct {
 // tier 2, and tier 2 before tier 1, so the change itself always survives. A
 // budget of <= 0 means "no budget" (every tier kept). Truncated is set when any
 // entry was dropped.
-func BuildReviewPack(g graph.Store, view *ChangeView, diff *analysis.DiffResult, impact *analysis.ImpactResult, tokenBudget int) *ReviewPack {
+func BuildReviewPack(g graph.Reader, view *ChangeView, diff *analysis.DiffResult, impact *analysis.ImpactResult, tokenBudget int) *ReviewPack {
 	pack := &ReviewPack{Budget: tokenBudget}
 
 	changed := buildChangedEntries(g, view, diff)
@@ -131,7 +131,7 @@ func changedIDSet(diff *analysis.DiffResult) map[string]bool {
 
 // buildChangedEntries renders each changed symbol as its diff-hunk text (tier 1).
 // Entries are sorted by id for a deterministic pack.
-func buildChangedEntries(g graph.Store, view *ChangeView, diff *analysis.DiffResult) []PackEntry {
+func buildChangedEntries(g graph.Reader, view *ChangeView, diff *analysis.DiffResult) []PackEntry {
 	if diff == nil {
 		return nil
 	}
@@ -153,7 +153,7 @@ func buildChangedEntries(g graph.Store, view *ChangeView, diff *analysis.DiffRes
 // full source) and tier 3 (the deeper neighbourhood, outline-only). A symbol
 // that is itself a changed symbol is skipped from both tiers. Each tier is
 // sorted by id for a deterministic pack.
-func buildImpactEntries(g graph.Store, view *ChangeView, impact *analysis.ImpactResult, changed map[string]bool) (callers, outline []PackEntry) {
+func buildImpactEntries(g graph.Reader, view *ChangeView, impact *analysis.ImpactResult, changed map[string]bool) (callers, outline []PackEntry) {
 	if impact == nil {
 		return nil, nil
 	}
@@ -207,7 +207,7 @@ func buildImpactEntries(g graph.Store, view *ChangeView, impact *analysis.Impact
 // SymbolHunk renders the diff-hunk text for a single changed symbol — the
 // exported entry point the packaged-review layer uses to ground a per-symbol
 // classification on the change itself.
-func SymbolHunk(g graph.Store, view *ChangeView, sym analysis.ChangedSymbol) string {
+func SymbolHunk(g graph.Reader, view *ChangeView, sym analysis.ChangedSymbol) string {
 	return symbolHunk(g, view, sym)
 }
 
@@ -215,7 +215,7 @@ func SymbolHunk(g graph.Store, view *ChangeView, sym analysis.ChangedSymbol) str
 // old-side lines from the ChangeView that fall inside the symbol's graph span
 // [StartLine,EndLine], as a +/- block. When the view carries no lines for the
 // symbol's range it falls back to a unified diff of the symbol's old/new source.
-func symbolHunk(g graph.Store, view *ChangeView, sym analysis.ChangedSymbol) string {
+func symbolHunk(g graph.Reader, view *ChangeView, sym analysis.ChangedSymbol) string {
 	file := cleanPath(sym.FilePath)
 	start, end := symbolSpan(g, sym)
 
@@ -303,7 +303,7 @@ func inSpan(line, start, end int) bool {
 // symbolSpan returns the [start,end] line range for a changed symbol, preferring
 // the live graph node's range (more precise than the hunk's start line) and
 // falling back to the diff's recorded line when the node is absent.
-func symbolSpan(g graph.Store, sym analysis.ChangedSymbol) (int, int) {
+func symbolSpan(g graph.Reader, sym analysis.ChangedSymbol) (int, int) {
 	if g != nil {
 		if n := g.GetNode(sym.ID); n != nil && n.StartLine > 0 {
 			end := n.EndLine
@@ -321,7 +321,7 @@ func symbolSpan(g graph.Store, sym analysis.ChangedSymbol) (int, int) {
 
 // fullSource renders a caller's complete source (tier 2). It reads the node's
 // [StartLine,EndLine] span from disk under the ChangeView's RepoRoot.
-func fullSource(g graph.Store, view *ChangeView, id string) string {
+func fullSource(g graph.Reader, view *ChangeView, id string) string {
 	if g == nil {
 		return ""
 	}
@@ -335,7 +335,7 @@ func fullSource(g graph.Store, view *ChangeView, id string) string {
 // symbolSource reads the [start,end] source span for a symbol from disk under the
 // ChangeView's RepoRoot. Returns "" when the range or repo root is unknown or the
 // file can't be read (the synthetic-graph path with no on-disk file).
-func symbolSource(g graph.Store, view *ChangeView, id string, start, end int) string {
+func symbolSource(g graph.Reader, view *ChangeView, id string, start, end int) string {
 	if view == nil || view.RepoRoot == "" || start <= 0 {
 		return ""
 	}
@@ -360,7 +360,7 @@ func symbolSource(g graph.Store, view *ChangeView, id string, start, end int) st
 	return strings.Join(lines[start-1:end], "\n")
 }
 
-func nodeForID(g graph.Store, id string) *graph.Node {
+func nodeForID(g graph.Reader, id string) *graph.Node {
 	if g == nil {
 		return nil
 	}
@@ -370,7 +370,7 @@ func nodeForID(g graph.Store, id string) *graph.Node {
 // signatureOf renders a tier-3 outline line for a symbol: its stamped
 // Meta["signature"] when present, else a bare `name` fallback so the outline
 // entry is never empty.
-func signatureOf(g graph.Store, id, name string) string {
+func signatureOf(g graph.Reader, id, name string) string {
 	if g != nil {
 		if n := g.GetNode(id); n != nil {
 			if sig, ok := n.Meta["signature"].(string); ok && strings.TrimSpace(sig) != "" {

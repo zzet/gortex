@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -203,6 +204,8 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		return spawnDetachedDaemon(detachedDaemonArgs(cmd.Flags(), daemonStartAcceptedFlags()))
 	}
 	logger := newLogger()
+	startupReporter := newDaemonStartupReporter(logger)
+	defer startupReporter.Stop()
 
 	// Raise the per-process file-descriptor cap as early as possible.
 	// fsnotify holds one FD per watched directory on Linux and one FD
@@ -231,8 +234,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// warmupDaemonState below so the socket opens immediately instead
 	// of waiting 30–60s for contract re-extraction across every tracked
 	// repo.
-	state, err := buildDaemonState(logger)
+	state, err := buildDaemonState(logger, startupReporter.ObserveMigration)
 	if err != nil {
+		startupReporter.Fail(err)
 		return fmt.Errorf("build daemon state: %w", err)
 	}
 
@@ -246,11 +250,25 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	}
 	applyStandingMemoryLimit(logger, daemonMemLimit)
 
+	// View builds wait for warmup. A restart finds the graph, the routes and
+	// every ref view already stored, and building them again would run through
+	// the same store writer and the same topology gate the warmup tail is
+	// holding — which is how a restart over a persisted graph ends up costing
+	// more than the cold index that produced it. Installed here, before the
+	// janitor and before the seeding that brings the first coordinator up, so
+	// no build can start ahead of the gate.
+	//
+	// Nothing else is held: tracking a repository, seeding the catalog,
+	// reading a route and serving a published generation never consult it.
+	viewBuilds := indexer.NewViewBuildGate()
+	state.lifecycle.SetBuildGate(viewBuilds)
+
 	controller := &realController{
 		graph:         state.graph,
 		indexer:       state.indexer,
 		multiIndexer:  state.multiIndexer,
 		configManager: state.configManager,
+		lifecycle:     state.lifecycle,
 		logger:        logger,
 	}
 	if state.mcpServer != nil {
@@ -259,6 +277,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			preset, mode := srv.ActivePreset()
 			return preset, mode, srv.LearnedToolCount()
 		}
+		// The stack builds exactly one materializer, over the lifecycle's own
+		// lease manager. Taking it from here rather than building a second is
+		// what keeps a control-socket probe's lease visible to the retirement
+		// sweep the coordinators run.
+		controller.viewMaterializer = srv.Materializer()
 	}
 	// Teardown is wired into every exit path, not just the control-socket
 	// one. A SIGINT/SIGTERM is handled inside the daemon server: it calls
@@ -481,21 +504,19 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// event-queue overflow). Default interval 1 h; override via
 	// GORTEX_RECONCILE_INTERVAL (a Go duration string, e.g. "15m").
 	// Set to "0" to disable.
-	stopJanitor := startReconcileJanitor(state.multiIndexer, reconcileInterval(), logger)
+	stopJanitor := startReconcileJanitor(
+		state.multiIndexer, state.lifecycle, reconcileInterval(), logger)
 	defer stopJanitor()
 
 	if err := srv.Listen(); err != nil {
+		startupReporter.Fail(err)
 		return err
 	}
-	// Publish the choices an out-of-band CLI cannot otherwise discover. The
-	// store path is the one that matters: `gortex repos` reads the freshness
-	// rows straight out of the store file, and a daemon started with
-	// --backend-path put them somewhere the platform default does not name.
-	// Advisory — a daemon that cannot write its record still serves, callers
-	// just fall back to the default path.
-	if err := daemon.WriteRuntimeState(daemon.RuntimeState{BackendPath: state.backendPath}); err != nil {
-		logger.Warn("daemon: could not record runtime state", zap.Error(err))
-	}
+	// The socket remains the authoritative readiness signal. The runtime
+	// record now transitions from pre-socket progress to serving only after
+	// Listen succeeds, and keeps the resolved backend path for out-of-band
+	// readers such as `gortex repos`.
+	startupReporter.Serving(state.backendPath)
 	fmt.Fprintf(cmd.ErrOrStderr(),
 		"[gortex daemon] listening on %s (pid %d)\n",
 		daemon.SocketPath(), os.Getpid())
@@ -516,6 +537,18 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 
 		start := time.Now()
 		logger.Info("daemon: warmup starting")
+		// Bring the checkout catalog in line with the configured repos
+		// before anything re-indexes them. It is the migration path for an
+		// installation that predates the catalog and the restart path for
+		// one that does not: identities that already exist keep their rows
+		// and their clocks (a repo that was mid-grace when the daemon
+		// stopped resumes where it was, it does not restart the wait), and
+		// any teardown interrupted by the stop is resumed.
+		if state.lifecycle != nil {
+			if err := state.lifecycle.Seed(context.Background()); err != nil {
+				logger.Warn("daemon: seeding the checkout catalog was incomplete", zap.Error(err))
+			}
+		}
 		// markReady fires once references are resolved and the graph is
 		// queryable — ahead of the slow enrichment pass — so clients can
 		// start issuing find_usages / get_callers immediately. Enrichment
@@ -569,6 +602,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 		elapsed := time.Since(start)
 		controller.MarkEnriched(elapsed)
+		// The warmup tail is done, so the view builds that were competing with
+		// it are admitted. Every coordinator holding a cycle and every ref-view
+		// build parked on a claim starts here, without being asked again.
+		viewBuilds.Open()
 		logger.Info("daemon: enrichment complete", zap.Duration("warmup", elapsed))
 		publishReadinessPhase(state, "enrichment_complete", true, map[string]any{
 			"enriched":       true,
@@ -663,18 +700,27 @@ func reconcileInterval() time.Duration {
 }
 
 // startReconcileJanitor launches a background goroutine that, on every
-// interval tick, garbage-collects the index of any linked git worktree
-// whose root directory has vanished from disk and then calls
+// interval tick, runs the checkout lifecycle sweep and then calls
 // MultiIndexer.ReconcileAll. interval=0 is a no-op; the returned stop
 // function can be called unconditionally.
 //
-// The worktree GC runs *before* ReconcileAll on purpose: a removed
-// worktree's root no longer exists, so ReconcileAll's IncrementalReindexPaths
-// would only error on the missing path without evicting anything.
-// Pruning the vanished worktrees first keeps the reconcile sweep
-// working on live repos and stops a deleted worktree's snapshot slot
-// and graph nodes from leaking forever.
-func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, logger *zap.Logger) func() {
+// The sweep runs *before* ReconcileAll on purpose: a removed checkout's root
+// no longer exists, so ReconcileAll's IncrementalReindexPaths would only
+// error on the missing path without evicting anything. Sweeping first keeps
+// the reconcile pass working on live repos and stops a removed checkout's
+// snapshot slot and graph nodes from leaking forever.
+//
+// The sweep is evidence-and-clock driven: it resumes any teardown interrupted
+// by a restart, then reconciles every known family, so an unreachable root
+// waits out its availability grace instead of being evicted on one failed
+// stat, and a genuinely removed one is forgotten only after its removal grace
+// expires. The old check could tell neither apart.
+func startReconcileJanitor(
+	mi *indexer.MultiIndexer,
+	lifecycle *indexer.CheckoutLifecycle,
+	interval time.Duration,
+	logger *zap.Logger,
+) func() {
 	if mi == nil || interval <= 0 {
 		logger.Info("daemon: reconcile janitor disabled")
 		return func() {}
@@ -691,10 +737,18 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 					runtimeactivity.Begin("reconcile")
 					defer runtimeactivity.End("reconcile")
 
-					gced := mi.GCVanishedWorktrees()
-					if len(gced) > 0 {
-						logger.Info("janitor: pruned vanished worktrees",
-							zap.Int("count", len(gced)))
+					swept := 0
+					if lifecycle != nil {
+						report, err := lifecycle.Sweep(context.Background())
+						if err != nil {
+							logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
+						}
+						swept = report.Removed
+						if swept > 0 {
+							logger.Info("janitor: pruned vanished checkouts",
+								zap.Int("count", swept),
+								zap.Int("families", report.Families))
+						}
 					}
 					results := mi.ReconcileAll()
 					reconciled := 0
@@ -703,7 +757,7 @@ func startReconcileJanitor(mi *indexer.MultiIndexer, interval time.Duration, log
 							reconciled += r.StaleFileCount + r.DeletedFileCount
 						}
 					}
-					return len(gced), reconciled
+					return swept, reconciled
 				}()
 				// Only a tick that changed the graph schedules reclamation. The
 				// process-wide quiet gate postpones it if another subsystem is busy.
@@ -823,15 +877,15 @@ func spawnDetachedDaemon(childArgs []string) error {
 		sp.Start("Waiting for daemon socket")
 	}
 
-	// Wait until the socket is live or a timeout hits, so we fail fast
-	// if the child died on startup. The socket opens after buildDaemonState
-	// finishes opening the store, which on a large workspace can take
-	// 10–20 s — 5 s used to time out a perfectly healthy daemon mid-load.
-	// 60 s comfortably covers the biggest stores we see while still
-	// failing fast on a child that crashed outright (those die in well
-	// under a second).
+	// Wait until the socket is live or startup stops making progress. Store
+	// migrations run before Listen and can legitimately exceed a minute on a
+	// large existing database. The child publishes a PID-bound heartbeat while
+	// opening/migrating, so fresh progress extends the inactivity deadline;
+	// missing or stale progress still fails in 60 seconds.
 	start := time.Now()
-	deadline := start.Add(60 * time.Second)
+	const startupInactivityTimeout = 60 * time.Second
+	const startupProgressFreshness = 10 * time.Second
+	deadline := start.Add(startupInactivityTimeout)
 	for time.Now().Before(deadline) {
 		if daemon.IsRunning() {
 			elapsed := time.Since(start).Truncate(10 * time.Millisecond)
@@ -845,8 +899,15 @@ func spawnDetachedDaemon(childArgs []string) error {
 			}
 			return nil
 		}
+		st, stateOK := daemon.ReadRuntimeState()
+		if phase, active := daemonStartupProgress(st, stateOK, child.Process.Pid, time.Now(), startupProgressFreshness); active {
+			deadline = time.Now().Add(startupInactivityTimeout)
+			if sp != nil {
+				sp.Set("", fmt.Sprintf("%s · %s", phase, time.Since(start).Truncate(100*time.Millisecond)))
+			}
+		}
 		// Bail out early if the child has already exited — no point
-		// waiting another 59 seconds for a corpse.
+		// waiting for an exited process's heartbeat to expire.
 		select {
 		case werr := <-exited:
 			failMsg := fmt.Errorf("daemon exited during startup (%v); check %s",
@@ -857,16 +918,23 @@ func spawnDetachedDaemon(childArgs []string) error {
 			return failMsg
 		default:
 		}
-		if sp != nil {
-			sp.Set("", fmt.Sprintf("opening store · %s", time.Since(start).Truncate(100*time.Millisecond)))
-		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	timeoutErr := fmt.Errorf("daemon did not come up within 60s; check %s", daemon.LogFilePath())
+	timeoutErr := fmt.Errorf("daemon startup made no progress for 60s; check %s", daemon.LogFilePath())
 	if sp != nil {
 		sp.Fail(timeoutErr)
 	}
 	return timeoutErr
+}
+
+func daemonStartupProgress(st daemon.RuntimeState, ok bool, childPID int, now time.Time, freshness time.Duration) (string, bool) {
+	if !ok || st.PID != childPID || !st.StartupProgressFresh(now, freshness) {
+		return "", false
+	}
+	if st.StartupPhase == daemon.StartupMigrating {
+		return fmt.Sprintf("migrating schema v%d (%s)", st.MigrationVersion, st.MigrationName), true
+	}
+	return "opening store", true
 }
 
 // newDaemonSpawnSpinner returns a spinner bound to w when it's a TTY (and the
@@ -1449,8 +1517,16 @@ func formatEnrichmentProgress(e *daemon.EnrichmentProgress) string {
 // process-total memory and the sum of attributed per-repo memory —
 // embedder model weights, runtime heap headroom, semantic caches, etc.
 func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
+	// A daemon that could not take its own controller mutex inside the
+	// request budget answers from the last table it computed. The heading
+	// carries that caveat: an unmarked snapshot is indistinguishable from
+	// the current inventory.
+	suffix := daemonAggregateSuffix(st, time.Now())
 	if len(st.TrackedRepos) == 0 {
-		fmt.Fprintln(w, "\ntracked repos: (none)")
+		if suffix == "" {
+			suffix = " (none)"
+		}
+		fmt.Fprintln(w, "\ntracked repos:"+suffix)
 		return
 	}
 
@@ -1460,7 +1536,7 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		return rows[i].Memory.TotalBytes > rows[j].Memory.TotalBytes
 	})
 
-	fmt.Fprintln(w, "\ntracked repos:")
+	fmt.Fprintln(w, "\ntracked repos:"+suffix)
 	t := table.NewWriter()
 	t.SetOutputMirror(w)
 	t.SetStyle(table.StyleLight)
@@ -1864,6 +1940,29 @@ func tailLines(f io.Reader, n int) ([]string, error) {
 		out = out[len(out)-n:]
 	}
 	return out, nil
+}
+
+// daemonAggregateSuffix qualifies the repo-table heading when the daemon
+// served the aggregate half of its status from an earlier pass — the mutex
+// that guards it was held by a track / reload / enrichment for the whole
+// slice of the budget the wait was allowed. Empty for the ordinary case, so
+// an uncontended status prints exactly what it has always printed.
+func daemonAggregateSuffix(st daemon.StatusResponse, now time.Time) string {
+	if !st.AggregateBusy {
+		return ""
+	}
+	if st.AggregateCachedUnix <= 0 {
+		// No pass has ever computed one. Any rows below came from the
+		// tracked-repo registry, which is read without the mutex, so the
+		// caveat is the counts rather than the table.
+		return " (counts not computed — a track/reload is in progress)"
+	}
+	age := now.Sub(time.Unix(st.AggregateCachedUnix, 0))
+	if age < 0 {
+		age = 0 // clock skew must not print a negative age
+	}
+	return fmt.Sprintf(" (cached %s ago — a track/reload is in progress)",
+		formatDuration(age.Round(time.Second)))
 }
 
 func formatDuration(d time.Duration) string {

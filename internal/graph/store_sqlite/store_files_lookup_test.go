@@ -53,8 +53,8 @@ func TestFileMetasByPathsReturnsOnlyRequestedPrimaryKeys(t *testing.T) {
 
 	planRows, err := store.db.Query(
 		`EXPLAIN QUERY PLAN SELECT file_path, content_hash, size, node_count, errors
-		 FROM files WHERE repo_prefix = ? AND file_path IN (?, ?, ?)`,
-		"repo", requested[0], requested[80], requested[124],
+		 FROM files WHERE view_gen = ? AND repo_prefix = ? AND file_path IN (?, ?, ?)`,
+		store.viewGen, "repo", requested[0], requested[80], requested[124],
 	)
 	require.NoError(t, err)
 	defer planRows.Close()

@@ -60,8 +60,22 @@ func (s *Server) autoIndexCWDBackground() {
 	if s.logger != nil {
 		s.logger.Info("auto-index: background-indexing untracked cwd", zap.String("root", root))
 	}
-	if _, err := s.multiIndexer.TrackRepoCtx(context.Background(), config.RepoEntry{Path: root}); err != nil && s.logger != nil {
-		s.logger.Warn("auto-index: track failed", zap.String("root", root), zap.Error(err))
+	ctx := context.Background()
+	if _, err := s.multiIndexer.TrackRepoCtx(ctx, config.RepoEntry{Path: root}); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("auto-index: track failed", zap.String("root", root), zap.Error(err))
+		}
+		return
+	}
+	// Implicit registration: the checkout is recorded — family, identity,
+	// graph binding — and its watcher attached, but no tracking intent is
+	// written. Nobody asked for this repository; the daemon indexed it on
+	// its own initiative, and an intent would claim otherwise.
+	if s.lifecycle != nil {
+		if err := s.lifecycle.RecordImplicit(ctx, root); err != nil && s.logger != nil {
+			s.logger.Warn("auto-index: recording the checkout failed",
+				zap.String("root", root), zap.Error(err))
+		}
 	}
 }
 

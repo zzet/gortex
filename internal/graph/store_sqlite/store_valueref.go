@@ -17,11 +17,12 @@ var _ graph.ValueRefPlaceholderScanner = (*Store)(nil)
 // payload because the resolver revalidates Meta["via"] and reads Meta["name"].
 func (s *Store) ValueRefPlaceholderEdges() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		edges := s.queryEdgesSQL(`SELECT ` + lookupEdgeCols + `
+		edges := s.queryEdgesSQL(`SELECT `+lookupEdgeCols+`
 FROM edges
 WHERE to_id >= 'unresolved::valueref::'
   AND to_id < 'unresolved::valueref:;'
-  AND kind = 'reads'`)
+  AND kind = 'reads'
+  AND view_gen = ?`, s.viewGen)
 		for _, edge := range edges {
 			if !yield(edge) {
 				return

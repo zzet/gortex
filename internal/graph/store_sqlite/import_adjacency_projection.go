@@ -21,9 +21,9 @@ WITH requested(file_path) AS (
 SELECT e.file_path, e.to_id, 0 AS malformed
 FROM requested AS r
 JOIN edges AS e INDEXED BY edges_by_file
-  ON e.file_path = r.file_path AND e.kind = ?
+  ON e.file_path = r.file_path AND e.kind = ? AND e.view_gen = ?
 JOIN nodes AS source
-  ON source.id = e.from_id AND source.file_path = e.file_path
+  ON source.id = e.from_id AND source.file_path = e.file_path AND source.view_gen = e.view_gen
 UNION ALL
 SELECT r.file_path, '', 1 AS malformed
 FROM requested AS r
@@ -31,10 +31,11 @@ WHERE EXISTS (
     SELECT 1
     FROM nodes AS source INDEXED BY nodes_by_file
     JOIN edges AS e INDEXED BY edges_by_from
-      ON e.from_id = source.id
+      ON e.from_id = source.id AND e.view_gen = source.view_gen
     WHERE source.file_path = r.file_path
       AND e.kind = ?
       AND e.file_path <> source.file_path
+      AND source.view_gen = ?
 )`
 
 var _ graph.ImportAdjacencyProjector = (*Store)(nil)
@@ -81,7 +82,9 @@ func (s *Store) ProjectImportAdjacency(filePaths []string) (map[string][]string,
 		if err != nil {
 			return nil, false
 		}
-		rows, err := s.db.Query(importAdjacencyProjectionSQL, string(payload), string(graph.EdgeImports), string(graph.EdgeImports))
+		rows, err := s.db.Query(importAdjacencyProjectionSQL,
+			string(payload), string(graph.EdgeImports), s.viewGen,
+			string(graph.EdgeImports), s.viewGen)
 		if err != nil {
 			return nil, false
 		}

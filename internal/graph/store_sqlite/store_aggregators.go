@@ -20,6 +20,11 @@ import (
 //   - Input id / kind slices are deduped before they reach the IN-list.
 //   - Large IN-lists are chunked by lookupChunkSize.
 //   - agg-prefixed helpers are local to this file.
+//   - Every query binds the handle's payload view generation. Correlated
+//     subqueries bind it INSIDE the subquery, because that is where the rows
+//     they count come from; endpoint JOINs pair the two sides' generations so
+//     a node from another generation can neither attribute nor authorise an
+//     edge here.
 
 var (
 	_ graph.InEdgeCounter            = (*Store)(nil)
@@ -82,8 +87,8 @@ func (s *Store) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
 	if len(args) == 0 {
 		return nil
 	}
-	q := `SELECT to_id, COUNT(*) FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) GROUP BY to_id`
-	rows, err := s.db.Query(q, args...)
+	q := `SELECT to_id, COUNT(*) FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) AND view_gen = ? GROUP BY to_id`
+	rows, err := s.db.Query(q, append(args, s.viewGen)...)
 	panicOnFatal(err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
@@ -108,8 +113,8 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 	if len(args) == 0 {
 		return nil
 	}
-	q := `SELECT id FROM nodes WHERE kind IN (` + inPlaceholders(len(args)) + `) ORDER BY id`
-	rows, err := s.db.Query(q, args...)
+	q := `SELECT id FROM nodes WHERE kind IN (` + inPlaceholders(len(args)) + `) AND view_gen = ? ORDER BY id`
+	rows, err := s.db.Query(q, append(args, s.viewGen)...)
 	panicOnFatal(err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
@@ -129,7 +134,7 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 // EdgeKindCounts returns one entry per distinct edge kind with its
 // occurrence count across the whole graph.
 func (s *Store) EdgeKindCounts() map[graph.EdgeKind]int {
-	rows, err := s.db.Query(`SELECT kind, COUNT(*) FROM edges GROUP BY kind`)
+	rows, err := s.db.Query(`SELECT kind, COUNT(*) FROM edges WHERE view_gen = ? GROUP BY kind`, s.viewGen)
 	panicOnFatal(err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
@@ -155,12 +160,16 @@ func (s *Store) NodeDegreeByKinds(kinds []graph.NodeKind, pathPrefix string) []g
 	if len(kindArgs) == 0 {
 		return nil
 	}
-	args := append([]any(nil), kindArgs...)
+	// Bind order follows placeholder order: the two degree subqueries, then
+	// the kind IN-list, then the node-side generation, then the path prefix.
+	args := []any{s.viewGen, s.viewGen}
+	args = append(args, kindArgs...)
+	args = append(args, s.viewGen)
 	q := `SELECT n.id,
-		(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS in_count,
-		(SELECT COUNT(*) FROM edges e WHERE e.from_id = n.id) AS out_count
+		(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.view_gen = ?) AS in_count,
+		(SELECT COUNT(*) FROM edges e WHERE e.from_id = n.id AND e.view_gen = ?) AS out_count
 	FROM nodes n
-	WHERE n.kind IN (` + inPlaceholders(len(kindArgs)) + `)`
+	WHERE n.kind IN (` + inPlaceholders(len(kindArgs)) + `) AND n.view_gen = ?`
 	if pathPrefix != "" {
 		pred, pargs := pathPrefixPredicate("n.file_path", pathPrefix)
 		q += ` AND ` + pred
@@ -215,7 +224,7 @@ func pathPrefixPredicate(column, pathPrefix string) (string, []any) {
 // sort instead.
 func nodesInFilesByKindQuery(files, kinds int) string {
 	return `SELECT ` + lookupNodeCols + ` FROM nodes WHERE file_path IN (` +
-		inPlaceholders(files) + `) AND +kind IN (` + inPlaceholders(kinds) + `)`
+		inPlaceholders(files) + `) AND +kind IN (` + inPlaceholders(kinds) + `) AND view_gen = ?`
 }
 
 // NodesInFilesByKind returns every node living in one of the supplied
@@ -245,6 +254,7 @@ func (s *Store) NodesInFilesByKindSeq(files []string, kinds []graph.NodeKind) it
 			end := minInt(i+lookupChunkSize, len(uniqFiles))
 			chunk := uniqFiles[i:end]
 			args := append(toAnyArgs(chunk), kindArgs...)
+			args = append(args, s.viewGen)
 			byFile := make(map[string][]*graph.Node, len(chunk))
 			for _, n := range s.queryNodesSQL(nodesInFilesByKindQuery(len(chunk), len(kindArgs)), args...) {
 				byFile[n.FilePath] = append(byFile[n.FilePath], n)
@@ -271,9 +281,9 @@ func (s *Store) FileImportCounts(scope []string) []graph.FileImportCountRow {
 		return nil
 	}
 	base := `SELECT COALESCE(NULLIF(n.file_path, ''), n.id) AS path, COUNT(*) AS cnt
-		FROM edges e JOIN nodes n ON e.to_id = n.id
-		WHERE e.kind = ?`
-	args := []any{string(graph.EdgeImports)}
+		FROM edges e JOIN nodes n ON e.to_id = n.id AND n.view_gen = e.view_gen
+		WHERE e.kind = ? AND e.view_gen = ?`
+	args := []any{string(graph.EdgeImports), s.viewGen}
 	fileToCount := make(map[string]int)
 	if scope == nil {
 		q := base + ` GROUP BY path`
@@ -331,8 +341,8 @@ func (s *Store) InDegreeForNodes(ids []string) map[string]int {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
 		q := `SELECT to_id, COUNT(*) FROM edges WHERE to_id IN (` +
-			inPlaceholders(len(chunk)) + `) GROUP BY to_id`
-		rows, err := s.db.Query(q, toAnyArgs(chunk)...)
+			inPlaceholders(len(chunk)) + `) AND view_gen = ? GROUP BY to_id`
+		rows, err := s.db.Query(q, append(toAnyArgs(chunk), s.viewGen)...)
 		panicOnFatal(err)
 		if rows == nil {
 			// swallowed teardown-race error: read returns empty (see panicOnFatal)
@@ -357,11 +367,11 @@ func (s *Store) InDegreeForNodes(ids []string) map[string]int {
 func (s *Store) CrossRepoEdgeCounts() []graph.CrossRepoEdgeRow {
 	q := `SELECT e.kind, nf.repo_prefix, nt.repo_prefix, COUNT(*)
 		FROM edges e
-		JOIN nodes nf ON e.from_id = nf.id
-		JOIN nodes nt ON e.to_id = nt.id
-		WHERE nf.repo_prefix <> nt.repo_prefix
+		JOIN nodes nf ON e.from_id = nf.id AND nf.view_gen = e.view_gen
+		JOIN nodes nt ON e.to_id = nt.id AND nt.view_gen = e.view_gen
+		WHERE nf.repo_prefix <> nt.repo_prefix AND e.view_gen = ?
 		GROUP BY e.kind, nf.repo_prefix, nt.repo_prefix`
-	rows, err := s.db.Query(q)
+	rows, err := s.db.Query(q, s.viewGen)
 	panicOnFatal(err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
@@ -406,11 +416,11 @@ func (s *Store) FileImporters(filePath string) []graph.FileImporterRow {
 	}
 	q := `SELECT nf.file_path, nf.id, nf.name, nf.kind
 		FROM edges e
-		JOIN nodes nt ON e.to_id = nt.id
-		JOIN nodes nf ON e.from_id = nf.id
-		WHERE e.kind = ? AND (nt.file_path = ? OR nt.id = ?)
+		JOIN nodes nt ON e.to_id = nt.id AND nt.view_gen = e.view_gen
+		JOIN nodes nf ON e.from_id = nf.id AND nf.view_gen = e.view_gen
+		WHERE e.kind = ? AND (nt.file_path = ? OR nt.id = ?) AND e.view_gen = ?
 		ORDER BY nf.file_path`
-	rows, err := s.db.Query(q, string(graph.EdgeImports), filePath, filePath)
+	rows, err := s.db.Query(q, string(graph.EdgeImports), filePath, filePath, s.viewGen)
 	panicOnFatal(err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
@@ -443,8 +453,9 @@ func (s *Store) FileSymbolNamesByPaths(paths []string, kinds []graph.NodeKind) [
 		end := minInt(i+lookupChunkSize, len(uniqPaths))
 		chunk := uniqPaths[i:end]
 		args := append(toAnyArgs(chunk), kindArgs...)
+		args = append(args, s.viewGen)
 		q := `SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (` +
-			inPlaceholders(len(chunk)) + `) AND kind IN (` + inPlaceholders(len(kindArgs)) + `)`
+			inPlaceholders(len(chunk)) + `) AND kind IN (` + inPlaceholders(len(kindArgs)) + `) AND view_gen = ?`
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
 		if rows == nil {
@@ -477,8 +488,8 @@ func (s *Store) EdgesByKinds(kinds []graph.EdgeKind) iter.Seq[*graph.Edge] {
 			return
 		}
 		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE kind IN (` +
-			inPlaceholders(len(args)) + `) ORDER BY id`
-		for _, e := range s.queryEdgesSQL(q, args...) {
+			inPlaceholders(len(args)) + `) AND view_gen = ? ORDER BY id`
+		for _, e := range s.queryEdgesSQL(q, append(args, s.viewGen)...) {
 			if e == nil {
 				continue
 			}
@@ -505,8 +516,9 @@ const externalCallTargetPredicate = `(to_id GLOB 'dep::*' OR to_id GLOB 'externa
 func (s *Store) ExternalCallCandidateEdges() []*graph.Edge {
 	q := `SELECT ` + lookupEdgeCols + ` FROM edges
 		WHERE kind IN ('calls','references') AND ` + externalCallTargetPredicate + `
+		  AND view_gen = ?
 		ORDER BY id`
-	return s.queryEdgesSQL(q)
+	return s.queryEdgesSQL(q, s.viewGen)
 }
 
 // DistinctExternalTargets performs the Go external-attribution discovery as
@@ -519,8 +531,9 @@ func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind) []string {
 	}
 	q := `SELECT DISTINCT to_id FROM edges
 		WHERE kind IN (` + inPlaceholders(len(args)) + `) AND ` + externalCallTargetPredicate + `
+		  AND view_gen = ?
 		ORDER BY to_id`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.Query(q, append(args, s.viewGen)...)
 	panicOnFatal(err)
 	if rows == nil {
 		return nil
@@ -544,8 +557,8 @@ func (s *Store) NodesByKinds(kinds []graph.NodeKind) []*graph.Node {
 		return nil
 	}
 	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind IN (` +
-		inPlaceholders(len(args)) + `) ORDER BY id`
-	return s.queryNodesSQL(q, args...)
+		inPlaceholders(len(args)) + `) AND view_gen = ? ORDER BY id`
+	return s.queryNodesSQL(q, append(args, s.viewGen)...)
 }
 
 // EdgeAdjacencyForKinds streams (from, to) id pairs for edges whose
@@ -561,13 +574,15 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 		args := append([]any(nil), eArgs...)
 		args = append(args, nArgs...)
 		args = append(args, nArgs...)
+		args = append(args, s.viewGen)
 		q := `SELECT e.from_id, e.to_id
 			FROM edges e
-			JOIN nodes nf ON e.from_id = nf.id
-			JOIN nodes nt ON e.to_id = nt.id
+			JOIN nodes nf ON e.from_id = nf.id AND nf.view_gen = e.view_gen
+			JOIN nodes nt ON e.to_id = nt.id AND nt.view_gen = e.view_gen
 			WHERE e.kind IN (` + inPlaceholders(len(eArgs)) + `)
 			AND nf.kind IN (` + inPlaceholders(len(nArgs)) + `)
-			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)`
+			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)
+			AND e.view_gen = ?`
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
 		if rows == nil {
@@ -603,18 +618,21 @@ func (s *Store) NodeDegreeCounts(ids []string, usageKinds []graph.EdgeKind) []gr
 		var usageInline []any
 		if len(usageArgs) > 0 {
 			usageExpr = `(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.kind IN (` +
-				inPlaceholders(len(usageArgs)) + `))`
-			usageInline = usageArgs
+				inPlaceholders(len(usageArgs)) + `) AND e.view_gen = ?)`
+			usageInline = append(append([]any(nil), usageArgs...), s.viewGen)
 		}
 		q := `SELECT n.id,
-			(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id) AS in_count,
-			(SELECT COUNT(*) FROM edges e WHERE e.from_id = n.id) AS out_count,
+			(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.view_gen = ?) AS in_count,
+			(SELECT COUNT(*) FROM edges e WHERE e.from_id = n.id AND e.view_gen = ?) AS out_count,
 			` + usageExpr + ` AS usage_in
 		FROM nodes n
-		WHERE n.id IN (` + inPlaceholders(len(chunk)) + `)`
-		// Bind order matches placeholder order: usage subquery first
-		// (it appears earlier in the SELECT list), then the id IN-list.
-		args := append(append([]any(nil), usageInline...), toAnyArgs(chunk)...)
+		WHERE n.id IN (` + inPlaceholders(len(chunk)) + `) AND n.view_gen = ?`
+		// Bind order matches placeholder order: the two degree subqueries,
+		// the usage subquery, the id IN-list, then the node-side generation.
+		args := []any{s.viewGen, s.viewGen}
+		args = append(args, usageInline...)
+		args = append(args, toAnyArgs(chunk)...)
+		args = append(args, s.viewGen)
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
 		if rows == nil {
@@ -651,24 +669,25 @@ func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.Edge
 		var inInline []any
 		if len(inArgs) > 0 {
 			fanInExpr = `(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.kind IN (` +
-				inPlaceholders(len(inArgs)) + `))`
-			inInline = inArgs
+				inPlaceholders(len(inArgs)) + `) AND e.view_gen = ?)`
+			inInline = append(append([]any(nil), inArgs...), s.viewGen)
 		}
 		fanOutExpr := `0`
 		var outInline []any
 		if len(outArgs) > 0 {
 			fanOutExpr = `(SELECT COUNT(*) FROM edges e WHERE e.from_id = n.id AND e.kind IN (` +
-				inPlaceholders(len(outArgs)) + `))`
-			outInline = outArgs
+				inPlaceholders(len(outArgs)) + `) AND e.view_gen = ?)`
+			outInline = append(append([]any(nil), outArgs...), s.viewGen)
 		}
 		q := `SELECT n.id, ` + fanInExpr + ` AS fan_in, ` + fanOutExpr + ` AS fan_out
 		FROM nodes n
-		WHERE n.id IN (` + inPlaceholders(len(chunk)) + `)`
-		// Bind order matches placeholder order in the SELECT list:
-		// fan-in subquery, fan-out subquery, then the id IN-list.
+		WHERE n.id IN (` + inPlaceholders(len(chunk)) + `) AND n.view_gen = ?`
+		// Bind order matches placeholder order in the SELECT list: fan-in
+		// subquery, fan-out subquery, the id IN-list, then the node generation.
 		args := append([]any(nil), inInline...)
 		args = append(args, outInline...)
 		args = append(args, toAnyArgs(chunk)...)
+		args = append(args, s.viewGen)
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
 		if rows == nil {
@@ -697,8 +716,8 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 	if len(args) == 0 || len(nodeToComm) == 0 {
 		return nil
 	}
-	q := `SELECT from_id, to_id FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `)`
-	rows, err := s.db.Query(q, args...)
+	q := `SELECT from_id, to_id FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) AND view_gen = ?`
+	rows, err := s.db.Query(q, append(args, s.viewGen)...)
 	panicOnFatal(err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)

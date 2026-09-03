@@ -358,7 +358,7 @@ func (s *Server) handleGetPRImpact(ctx context.Context, req mcp.CallToolRequest)
 // repoPrefix anchors the file→symbol join in multi-repo mode (see
 // prJoinPrefix).
 func (s *Server) prImpactForNumber(ctx context.Context, number int, repoPrefix string, files []string, receipt, scrub bool) map[string]any {
-	changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(repoPrefix, files)
+	changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(ctx, repoPrefix, files)
 	symbolIDs := make([]string, 0, len(changedSymbolNodes))
 	for _, n := range changedSymbolNodes {
 		symbolIDs = append(symbolIDs, n.ID)
@@ -370,7 +370,7 @@ func (s *Server) prImpactForNumber(ctx context.Context, number int, repoPrefix s
 		nodeToComm = communities.NodeToComm
 	}
 
-	result := analysis.ScorePRRisk(s.graph, analysis.PRRiskInput{
+	result := analysis.ScorePRRisk(s.readerFor(ctx), analysis.PRRiskInput{
 		SymbolIDs:    symbolIDs,
 		ChangedFiles: changedFiles,
 		NodeToComm:   nodeToComm,
@@ -438,7 +438,8 @@ func (s *Server) prImpactForNumber(ctx context.Context, number int, repoPrefix s
 // key file paths as "<prefix>/<rel>"; repoPrefix bridges the two. Returns
 // the deduped non-empty file list and the deduped symbol nodes (file nodes
 // excluded), both deterministically ordered.
-func (s *Server) changedSymbolsForFiles(repoPrefix string, files []string) ([]string, []*graph.Node) {
+func (s *Server) changedSymbolsForFiles(ctx context.Context, repoPrefix string, files []string) ([]string, []*graph.Node) {
+	reader := s.readerFor(ctx)
 	fileSeen := map[string]bool{}
 	var changedFiles []string
 	nodeSeen := map[string]bool{}
@@ -450,7 +451,7 @@ func (s *Server) changedSymbolsForFiles(repoPrefix string, files []string) ([]st
 		}
 		fileSeen[f] = true
 		changedFiles = append(changedFiles, f)
-		for _, n := range analysis.JoinFileNodes(s.graph, repoPrefix, f, analysis.RepoRelativePath) {
+		for _, n := range analysis.JoinFileNodes(reader, repoPrefix, f, analysis.RepoRelativePath) {
 			if n == nil || n.Kind == graph.KindFile {
 				continue
 			}

@@ -67,7 +67,7 @@ func (s *Server) lowerRangesDetailedContext(ctx context.Context, specs []rangeSp
 	displayOf := make(map[string]string)
 	var unresolved []string
 	for _, sp := range specs {
-		absPath, relPath, err := s.resolveFilePath(sp.File)
+		absPath, relPath, err := s.resolveFilePath(ctx, sp.File)
 		if err != nil {
 			unresolved = append(unresolved, sp.File)
 			continue

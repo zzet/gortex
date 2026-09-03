@@ -1,5 +1,7 @@
 package graph
 
+import "iter"
+
 // Reader is the read-only contract every graph consumer (query
 // engine, MCP tool handlers, analyzers, resolver introspection) depends
 // on. *Graph satisfies it directly; OverlaidView (overlay.go) wraps a
@@ -65,6 +67,17 @@ type Reader interface {
 	// passes.
 	AllNodes() []*Node
 	AllEdges() []*Edge
+
+	// Kind-predicate scans — the bounded siblings of AllNodes /
+	// AllEdges. Analyzers that only care about one edge or node kind
+	// use these so disk backends serve an indexed SELECT instead of
+	// materialising the whole table, and so an overlay view can answer
+	// them without the caller falling back to base.
+	//
+	// Iterators stop when the consumer's yield returns false;
+	// implementations MUST honour early-stop.
+	EdgesByKind(kind EdgeKind) iter.Seq[*Edge]
+	NodesByKind(kind NodeKind) iter.Seq[*Node]
 
 	// Counters & stats.
 	NodeCount() int

@@ -55,10 +55,11 @@ func (s *Server) handleAnalyzeTestsAsEdges(ctx context.Context, req mcp.CallTool
 
 	// Collect the EdgeTests layer. From = test function, To = the
 	// non-test symbol it exercises.
+	reader := s.readerFor(ctx)
 	testsBySymbol := make(map[string][]string)
 	symbolsByTest := make(map[string][]string)
 	edgeCount := 0
-	for e := range edgesByKinds(s.graph, graph.EdgeTests) {
+	for e := range edgesByKinds(reader, graph.EdgeTests) {
 		edgeCount++
 		testsBySymbol[e.To] = append(testsBySymbol[e.To], e.From)
 		symbolsByTest[e.From] = append(symbolsByTest[e.From], e.To)
@@ -85,7 +86,7 @@ func (s *Server) handleAnalyzeTestsAsEdges(ctx context.Context, req mcp.CallTool
 	for id := range idSet {
 		allIDs = append(allIDs, id)
 	}
-	nodeByID := s.graph.GetNodesByIDs(allIDs)
+	nodeByID := reader.GetNodesByIDs(allIDs)
 
 	rows := make([]testEdgeRow, 0, len(primary))
 	for id, relatedIDs := range primary {

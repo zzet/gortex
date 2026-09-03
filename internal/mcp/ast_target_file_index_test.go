@@ -124,7 +124,11 @@ func TestEnrichASTMatchesFailsClosedWithoutFullScan(t *testing.T) {
 	})
 }
 
-func TestEnrichASTMatchesReadsBaseInsteadOfOverlay(t *testing.T) {
+// TestEnrichASTMatchesReadsOverlayInsteadOfBase pins AST enclosing-symbol
+// enrichment to the request reader: a match in a file the session has an
+// editor buffer for is attributed to the buffer's owner, not to the durable
+// declaration the buffer replaced.
+func TestEnrichASTMatchesReadsOverlayInsteadOfBase(t *testing.T) {
 	const path = "repo/service.go"
 	baseOwner := &graph.Node{
 		ID: path + "::base", Name: "base", Kind: graph.KindFunction,
@@ -150,11 +154,13 @@ func TestEnrichASTMatchesReadsBaseInsteadOfOverlay(t *testing.T) {
 
 	server.enrichASTMatchesContext(ctx, matches)
 
-	if matches[0].SymbolID != baseOwner.ID || matches[0].SymbolName != baseOwner.Name {
-		t.Fatalf("AST match owner = %#v, want durable base owner (%q, %q)", matches[0], baseOwner.ID, baseOwner.Name)
+	// The overlaid file is answered from the buffer, so the match is
+	// attributed to the buffer's owner and base is never projected.
+	if matches[0].SymbolID != overlayOwner.ID || matches[0].SymbolName != overlayOwner.Name {
+		t.Fatalf("AST match owner = %#v, want overlay owner (%q, %q)", matches[0], overlayOwner.ID, overlayOwner.Name)
 	}
-	if len(probe.calls) != 1 {
-		t.Fatalf("base projection calls = %d, want one", len(probe.calls))
+	if len(probe.calls) != 0 {
+		t.Fatalf("base projection calls = %d, want none for an overlaid file", len(probe.calls))
 	}
 }
 

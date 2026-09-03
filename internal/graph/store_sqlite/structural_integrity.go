@@ -16,7 +16,10 @@ const (
 	structuralAuditRepoExpr       = `COALESCE(NULLIF(n.repo_prefix, ''), 'unknown')`
 	structuralAuditReasonExpr     = `CASE WHEN instr(e.to_id, '#param:') > 0 THEN 'parameter_target' ELSE 'local_target' END`
 	structuralAuditOriginExpr     = `CASE WHEN trim(COALESCE(e.origin, '')) = '' THEN 'unknown' ELSE lower(substr(trim(e.origin), 1, 48)) END`
-	structuralAuditFromSQL        = ` FROM edges e LEFT JOIN nodes n ON n.id = e.from_id WHERE e.kind IN (?, ?, ?, ?, ?) AND (instr(e.to_id, '#param:') > 0 OR instr(e.to_id, '#local:') > 0)`
+	// The LEFT JOIN pairs generations: an edge whose source node is missing
+	// from this generation must audit as dangling, not borrow a same-id node
+	// from another generation and read as attributed.
+	structuralAuditFromSQL = ` FROM edges e LEFT JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen WHERE e.kind IN (?, ?, ?, ?, ?) AND (instr(e.to_id, '#param:') > 0 OR instr(e.to_id, '#local:') > 0) AND e.view_gen = ?`
 )
 
 var structuralAuditKinds = []any{
@@ -34,7 +37,7 @@ var (
 )
 
 func (s *Store) RecordStructuralIntegrityEvent(event graph.StructuralIntegrityEvent) {
-	if s == nil {
+	if s.coreless() {
 		return
 	}
 	s.structuralIntegrity.Record(event)
@@ -51,7 +54,7 @@ func (s *Store) RecordStructuralIntegrityEvent(event graph.StructuralIntegrityEv
 }
 
 func (s *Store) StructuralIntegritySnapshot(opts graph.StructuralIntegritySnapshotOptions) graph.StructuralIntegritySnapshot {
-	if s == nil {
+	if s.coreless() {
 		return graph.StructuralIntegritySnapshot{}
 	}
 	return s.structuralIntegrity.Snapshot(opts)
@@ -131,9 +134,12 @@ func structuralAuditScopeSQL(repos []string, active bool) (string, []any) {
 	return " AND " + structuralAuditRepoExpr + " IN (" + strings.Join(placeholders, ", ") + ")", args
 }
 
-func structuralAuditArgs(scopeArgs []any) []any {
-	args := make([]any, 0, len(structuralAuditKinds)+len(scopeArgs)+1)
+// structuralAuditArgs follows the placeholder order of structuralAuditFromSQL
+// plus the appended repository scope: kinds, generation, then scope.
+func structuralAuditArgs(viewGen int64, scopeArgs []any) []any {
+	args := make([]any, 0, len(structuralAuditKinds)+len(scopeArgs)+2)
 	args = append(args, structuralAuditKinds...)
+	args = append(args, viewGen)
 	args = append(args, scopeArgs...)
 	return args
 }
@@ -148,7 +154,7 @@ func (s *Store) AuditStructuralIntegrity(ctx context.Context, opts graph.Structu
 	scopeSQL, scopeArgs := structuralAuditScopeSQL(opts.RepoPrefixes, opts.RepoScopeActive)
 	groupSQL := `SELECT ` + structuralAuditRepoExpr + `, e.kind, ` + structuralAuditReasonExpr + `, ` + structuralAuditOriginExpr + `, COUNT(*)` +
 		structuralAuditFromSQL + scopeSQL + ` GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4`
-	rows, err := s.db.QueryContext(ctx, groupSQL, structuralAuditArgs(scopeArgs)...)
+	rows, err := s.db.QueryContext(ctx, groupSQL, structuralAuditArgs(s.viewGen, scopeArgs)...)
 	if err != nil {
 		return out, fmt.Errorf("store_sqlite: structural integrity grouping: %w", err)
 	}
@@ -187,7 +193,7 @@ func (s *Store) AuditStructuralIntegrity(ctx context.Context, opts graph.Structu
 	}
 	sampleSQL := `SELECT ` + structuralAuditRepoExpr + `, e.kind, ` + structuralAuditReasonExpr + `, ` + structuralAuditOriginExpr + `, e.from_id, e.to_id, e.file_path, e.line` +
 		structuralAuditFromSQL + scopeSQL + ` ORDER BY 1, 2, 3, 4, e.from_id, e.to_id, e.file_path, e.line, e.id LIMIT ?`
-	args := structuralAuditArgs(scopeArgs)
+	args := structuralAuditArgs(s.viewGen, scopeArgs)
 	args = append(args, limit+1)
 	rows, err = s.db.QueryContext(ctx, sampleSQL, args...)
 	if err != nil {

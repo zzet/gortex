@@ -217,7 +217,7 @@ func (s *Server) returnSubGraph(ctx context.Context, req mcp.CallToolRequest, sg
 	// Decorate nodes with absolute paths once, up front, so every output
 	// format below surfaces an openable path. The canonical graph nodes
 	// are copied, never mutated.
-	sg.Nodes = s.withAbsPaths(sg.Nodes)
+	sg.Nodes = s.withAbsPaths(ctx, sg.Nodes)
 	// Diagram formats render the subgraph directly — one place serves
 	// every traversal tool (callers/dependencies/usages/...), so a
 	// `gortex query ... --format mermaid|dot` gets a real diagram.
@@ -1525,8 +1525,17 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 	pathArg := req.GetString("path", "")
 
 	var (
-		result *indexer.IndexResult
-		err    error
+		result      *indexer.IndexResult
+		err         error
+		reindexRoot string
+		// eligible is snapshotted BEFORE the pass runs: only receipts that
+		// had already failed when the indexer read the file may be resolved
+		// by it. A mutation that lands mid-pass, fails its own ingest and
+		// completes before this handler returns would otherwise be stamped
+		// fresh, certifying bytes the graph never read. Using pass start as
+		// the cutoff declines some safe resolutions, which is the right way
+		// to be wrong here.
+		eligible map[string]struct{}
 	)
 
 	// Multi-repo mode: route through the per-repo indexer so nodes keep
@@ -1553,6 +1562,8 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 					"reindex_repository: no repository specified and the active repository is ambiguous; pass `path`"), nil
 			}
 		}
+		reindexRoot, _ = s.multiIndexer.RepoRoot(prefix)
+		eligible = s.failedReceiptsBefore(paths, reindexRoot)
 		result, err = s.multiIndexer.IncrementalReindexRepo(prefix, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1573,10 +1584,28 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		if absErr != nil {
 			return mcp.NewToolResultError(absErr.Error()), nil
 		}
+		reindexRoot = root
+		eligible = s.failedReceiptsBefore(paths, reindexRoot)
 		result, err = s.indexer.IncrementalReindexPaths(root, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+	}
+
+	// A successful scoped re-parse is exactly the evidence a terminally failed
+	// freshness receipt for that path is waiting for, so clear it here: a
+	// failed ingest otherwise fail-closes change.detect for the whole
+	// repository until retention lapses, and reindex is the recovery callers
+	// reach for first (#692).
+	//
+	// Deliberately narrow. IncrementalReindexRepo scopes the pass to the given
+	// paths, so with exactly one requested path a non-zero StaleFileCount
+	// proves that file was re-parsed. With several paths the count cannot be
+	// attributed per path, and clearing a receipt for a file that was not
+	// re-parsed would be a false green — the very thing the receipt exists to
+	// prevent — so anything wider is left alone.
+	if resolved, ok := reindexedReceiptPath(paths, reindexRoot, result); ok {
+		s.resolveReindexedPathReceipts(resolved, eligible)
 	}
 
 	s.RunAnalysis()
@@ -1602,6 +1631,68 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		payload["failed_files"] = result.FailedFiles
 	}
 	return s.respondJSONOrTOON(ctx, req, payload)
+}
+
+// reindexCandidatePath resolves the single requested path against the repo
+// root. Split out from reindexedReceiptPath so the pre-pass snapshot and the
+// post-pass resolution agree on the spelling by construction: if they ever
+// disagreed, the snapshot would bound the wrong receipts.
+func reindexCandidatePath(paths []string, root string) (string, bool) {
+	if len(paths) != 1 {
+		return "", false
+	}
+	resolved := paths[0]
+	if !filepath.IsAbs(resolved) {
+		if root == "" {
+			return "", false
+		}
+		resolved = filepath.Join(root, resolved)
+	}
+	return filepath.Clean(resolved), true
+}
+
+// reindexedReceiptPath reports the absolute path whose failed freshness
+// receipts a reindex pass has earned the right to resolve, if any.
+//
+// Deliberately narrow. IncrementalReindexRepo scopes the pass to the requested
+// paths, so with exactly one requested path a non-zero StaleFileCount proves
+// that file was re-parsed. With several paths the count cannot be attributed
+// per path, and clearing a receipt for a file that was not re-parsed would be
+// a false green — the very thing the receipt exists to prevent — so anything
+// wider resolves nothing.
+//
+// Two properties worth stating because both are fail-closed by construction
+// and would be surprising to rediscover: path comparison is case-sensitive,
+// so a spelling difference on a case-insensitive filesystem silently skips a
+// resolution rather than making a wrong one; and `paths` may name a directory,
+// which returns a directory path here and then matches no receipt, because
+// receipts hold file paths and matching is exact equality. If receipt matching
+// ever became prefix-based, that second property would turn into a hole.
+func reindexedReceiptPath(paths []string, root string, result *indexer.IndexResult) (string, bool) {
+	if len(paths) != 1 || result == nil || result.StaleFileCount <= 0 {
+		return "", false
+	}
+	resolved, ok := reindexCandidatePath(paths, root)
+	if !ok {
+		return "", false
+	}
+
+	// FailedFiles carries ABSOLUTE paths (pinned by
+	// TestIncrementalReindex_FailedFileSurfacedAndRetried) while paths[0] is
+	// whatever spelling the caller passed, so the comparison has to happen
+	// after the join — checking the raw request alone lets a relative request
+	// walk straight past this guard, which is the only thing standing between
+	// a file that failed to index and a barrier that reports it fresh.
+	// StaleFileCount counts discovered-stale files INCLUDING the ones that
+	// then failed, so it cannot stand in for this check. Both spellings are
+	// compared because refusing a resolution is always the safe direction.
+	requested := filepath.Clean(paths[0])
+	for _, failed := range result.FailedFiles {
+		if clean := filepath.Clean(failed); clean == resolved || clean == requested {
+			return "", false
+		}
+	}
+	return resolved, true
 }
 
 func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1638,7 +1729,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 
 	detail := req.GetString("detail", "brief")
 	if detail == "brief" {
-		return s.respondScopedJSONOrTOON(ctx, req, s.withAbsPath(node).Brief(), resolved)
+		return s.respondScopedJSONOrTOON(ctx, req, s.withAbsPath(ctx, node).Brief(), resolved)
 	}
 
 	// Full: include node + direct edges.
@@ -1646,7 +1737,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	out := filterEdgesByResolvedScope(eng, eng.GetOutEdges(node.ID), resolved)
 	in := filterEdgesByResolvedScope(eng, eng.GetInEdges(node.ID), resolved)
 	return s.respondScopedJSONOrTOON(ctx, req, map[string]any{
-		"node":      s.withAbsPath(node),
+		"node":      s.withAbsPath(ctx, node),
 		"out_edges": out,
 		"in_edges":  in,
 	}, resolved)
@@ -2123,7 +2214,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	var rerankBreakdown []*rerank.Candidate
 	var rerankPrepare, rerankSignals time.Duration
-	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(s, nodes, q, rctx, &rerankBreakdown)
+	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(ctx, s, nodes, q, rctx, &rerankBreakdown)
 
 	// Post-rerank exact-cosine refinement. The merged rerank above
 	// scores the semantic channel by RRF rank and discards the raw
@@ -2182,7 +2273,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	recordLastSearchFromNodes(sess, q, page)
 	// Decorate the page with absolute file paths so every output format
 	// below surfaces an openable path alongside the repo-relative one.
-	page = s.withAbsPaths(page)
+	page = s.withAbsPaths(ctx, page)
 	// Capture the final ranked, scoped page once, before JSON/TOON/GCX encoding.
 	captureLocalizationSearchSymbols(ctx, page)
 	nextCursor := ""
@@ -2451,7 +2542,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// Normalise to the graph's stored path form so a repo-relative path
 	// (internal/x.go) doesn't miss the repo-prefixed nodes in multi-repo
 	// mode — the cause of spurious file_not_indexed misses.
-	fp = s.graphRelPath(fp)
+	fp = s.graphRelPath(ctx, fp)
 
 	// Auto re-index stale file before querying.
 	s.ensureFresh([]string{fp})
@@ -2553,7 +2644,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		"truncated":   sg.Truncated,
 		"etag":        etag,
 	}
-	s.attachFileDependents(result, fp)
+	s.attachFileDependents(ctx, result, fp)
 	if payload, merr := json.Marshal(result); merr == nil {
 		s.recordFileBaselineSavings(ctx, "get_file_summary", fp, summaryLang, string(payload))
 	}
@@ -2700,7 +2791,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// Same adaptive default as find_usages: hide the name-only
 		// fan-out once resolver-verified callers exist.
 		sg.SuppressRedundantTextMatches()
-		s.attachSuppressionCaveat(sg, id)
+		s.attachSuppressionCaveat(ctx, sg, id)
 	}
 	s.attachNameOnlyCandidates(eng, sg, id, minTier, opts)
 	enrichSubGraphEdges(sg)
@@ -2741,7 +2832,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 		// The reach is a floor because dispatch is dynamic — scan the seed's
 		// body for the exact runtime-dispatch sites so the agent gets
 		// {site, form, key, candidates} instead of a read-spiral.
-		if db := s.dynamicBoundariesForSymbol(ctx, reader.GetNode(id)); len(db) > 0 {
+		if db := s.dynamicBoundariesForSymbol(ctx, reader, reader.GetNode(id)); len(db) > 0 {
 			sg.DynamicBoundaries = db
 		}
 	}
@@ -2802,7 +2893,7 @@ func (s *Server) handleFindOverrides(ctx context.Context, req mcp.CallToolReques
 	// here.
 	nodes = s.scopedNodeSlice(ctx, nodes)
 	nodes = filterNodesByResolvedScope(nodes, resolved)
-	nodes = s.withAbsPaths(nodes)
+	nodes = s.withAbsPaths(ctx, nodes)
 
 	if s.isGCX(ctx, req) {
 		sg := &query.SubGraph{Nodes: nodes, TotalNodes: len(nodes)}
@@ -2846,7 +2937,7 @@ func (s *Server) handleFindImplementations(ctx context.Context, req mcp.CallTool
 	// doesn't take QueryOptions, so the boundary is enforced here.
 	impls = s.scopedNodeSlice(ctx, impls)
 	impls = filterNodesByResolvedScope(impls, resolved)
-	impls = s.withAbsPaths(impls)
+	impls = s.withAbsPaths(ctx, impls)
 
 	if s.isGCX(ctx, req) {
 		// Keep only the implements-edges whose implementation survived
@@ -2957,7 +3048,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// symbol's result is never altered.
 	node := eng.GetSymbol(id)
 	if node == nil {
-		if canon := reExportBindingCanonical(s.graph, id, 0); canon != "" {
+		if canon := reExportBindingCanonical(s.readerFor(ctx), id, 0); canon != "" {
 			id = canon
 			node = eng.GetSymbol(id)
 		}
@@ -2983,7 +3074,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// deduped. So the façade an agent actually imports answers with the full
 	// usage set instead of only the forwarding site.
 	if isReExportNode(node) {
-		if canon := reExportNodeCanonical(s.graph, id, 0); canon != "" && canon != id {
+		if canon := reExportNodeCanonical(s.readerFor(ctx), id, 0); canon != "" && canon != id {
 			mergeUsageSubGraph(sg, eng.FindUsagesScoped(canon, opts))
 		}
 	}
@@ -2996,7 +3087,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 		// text_matched fan-out is noise — suppress it and report the count
 		// via text_matched_suppressed. min_tier:"text_matched" restores it.
 		sg.SuppressRedundantTextMatches()
-		s.attachSuppressionCaveat(sg, id)
+		s.attachSuppressionCaveat(ctx, sg, id)
 	}
 	s.attachNameOnlyCandidates(eng, sg, id, minTier, opts)
 	enrichSubGraphEdges(sg)
@@ -3064,7 +3155,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// diagram formats go through the shared subgraph renderer.
 	format := req.GetString("format", "")
 	if !s.isTOON(ctx, req) && !isCompact(req) && format != "mermaid" && format != "dot" {
-		sg.Nodes = s.withAbsPaths(sg.Nodes)
+		sg.Nodes = s.withAbsPaths(ctx, sg.Nodes)
 		return s.respondScopedJSONOrTOON(ctx, req, newUsageResponse(sg, getter), resolved)
 	}
 	return s.returnScopedSubGraph(ctx, req, sg, resolved)
@@ -3120,11 +3211,11 @@ func (s *Server) attachNameOnlyCandidates(eng *query.Engine, sg *query.SubGraph,
 // hidden-but-real usage is diagnosable instead of silently dropped. No-op when
 // nothing was suppressed or the file is not stale; the existing
 // text_matched_suppressed count carries the number in every response either way.
-func (s *Server) attachSuppressionCaveat(sg *query.SubGraph, id string) {
+func (s *Server) attachSuppressionCaveat(ctx context.Context, sg *query.SubGraph, id string) {
 	if sg == nil || sg.TextMatchedSuppressed == 0 {
 		return
 	}
-	if !s.suppressionMayBeStale(id) {
+	if !s.suppressionMayBeStale(ctx, id) {
 		return
 	}
 	sg.SuppressionCaveat = fmt.Sprintf(
@@ -3140,12 +3231,13 @@ func (s *Server) attachSuppressionCaveat(sg *query.SubGraph, id string) {
 // real ones. Reads graph.MetaReparsePendingEnrichment, which the indexer
 // stamps on the file's KindFile node. Conservative: false whenever the marker
 // is absent (no rider rather than a false alarm on a converged graph).
-func (s *Server) suppressionMayBeStale(id string) bool {
-	n := s.graph.GetNode(id)
+func (s *Server) suppressionMayBeStale(ctx context.Context, id string) bool {
+	g := s.readerFor(ctx)
+	n := g.GetNode(id)
 	if n == nil || n.FilePath == "" {
 		return false
 	}
-	for _, fn := range s.graph.GetFileNodes(n.FilePath) {
+	for _, fn := range g.GetFileNodes(n.FilePath) {
 		if fn.Kind != graph.KindFile {
 			continue
 		}
@@ -3424,14 +3516,18 @@ func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
 	result["edge_identity_revisions"] = s.readerFor(ctx).EdgeIdentityRevisions()
 
 	if s.multiIndexer != nil && s.multiIndexer.IsMultiRepo() {
-		// BUG_FIX_CONTEXT: an unbounded per-repo dump here made the MCP unusable on large
-		// monorepos. The gortex://stats resource is advertised "read at session start to
-		// orient", so an agent reads it on connect — and a full GraphStats for every one of
-		// the hundreds of tracked sub-repos a monorepo decomposes into overflowed the agent's
-		// context window before any user turn (small repos: IsMultiRepo()==false → no dump →
-		// fine). Cap to the top-N repos by node count + a truncation marker; per-repo detail
-		// for one repo stays available via graph_stats repo=<prefix>.
-		result["per_repo"] = cappedRepoStats(s.readerFor(ctx).RepoStats(), graphStatsPerRepoCap)
+		// The per-repo dump is bounded two ways. Each entry is only the
+		// node/edge totals — no per-repo histogram and no edge join — so it
+		// reads from the persisted counters instead of scanning the nodes
+		// and edges tables. The number of entries is then capped with a
+		// truncation marker. Both matter because the gortex://stats resource
+		// is advertised "read at session start to orient": an agent reads it
+		// on connect, and on a monorepo that decomposes into hundreds of
+		// sub-repos an unbounded full-GraphStats dump overflowed the agent's
+		// context window before any user turn (small repos:
+		// IsMultiRepo()==false → no dump). Per-repo detail for one repo stays
+		// available via graph_stats repo=<prefix>.
+		result["per_repo"] = cappedRepoTotals(perRepoTotals(s.readerFor(ctx)), graphStatsPerRepoCap)
 	}
 
 	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
@@ -3470,43 +3566,80 @@ func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
 	return result
 }
 
-// graphStatsPerRepoCap bounds how many per-repo GraphStats entries the
+// graphStatsPerRepoCap bounds how many per-repo entries the
 // gortex://stats resource / graph_stats tool inlines. On a large monorepo
-// gortex tracks hundreds of sub-repos; dumping a full GraphStats per repo
-// into a resource that is read "at session start" overflows an agent's
-// context window — the bug that made the MCP unusable on big monorepos.
+// gortex tracks hundreds of sub-repos; inlining an entry per repo into a
+// resource that is read "at session start" overflows an agent's context
+// window — the bug that made the MCP unusable on big monorepos.
 const graphStatsPerRepoCap = 25
 
-// cappedRepoStats returns the per_repo rollup verbatim when the repo count is
-// within the cap, otherwise the top-`limit` repos by TotalNodes plus a
-// `_truncated` marker pointing at graph_stats repo=<prefix> for the rest.
-// Keeps the stats payload bounded regardless of how many repos are tracked.
-func cappedRepoStats(stats map[string]graph.GraphStats, limit int) map[string]any {
-	out := make(map[string]any, len(stats)+1)
-	if len(stats) <= limit {
-		for k, v := range stats {
-			out[k] = v
+// repoTotal is one repository's whole-graph contribution by count. The
+// stats dump reports these instead of a full per-repo GraphStats so the
+// multi-repo payload stays counter-cheap: the persisted counters already
+// hold the totals, so no per-repo node histogram or edge join is run.
+type repoTotal struct {
+	nodes int
+	edges int
+}
+
+// perRepoTotals returns each repository's node and edge totals for the
+// reader's view. A store or graph that maintains the persisted per-repo
+// counters answers from them in O(repos) with no scan; any other reader —
+// a composed overlay view — falls back to RepoStats, whose per-repo totals
+// are already correct under composition.
+func perRepoTotals(r graph.Reader) map[string]repoTotal {
+	if c, ok := r.(interface {
+		AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate
+	}); ok {
+		est := c.AllRepoMemoryEstimates()
+		out := make(map[string]repoTotal, len(est))
+		for repo, e := range est {
+			out[repo] = repoTotal{nodes: e.NodeCount, edges: e.EdgeCount}
+		}
+		return out
+	}
+	rs := r.RepoStats()
+	out := make(map[string]repoTotal, len(rs))
+	for repo, st := range rs {
+		out[repo] = repoTotal{nodes: st.TotalNodes, edges: st.TotalEdges}
+	}
+	return out
+}
+
+// cappedRepoTotals renders per-repo totals into the stats payload:
+// verbatim when the repo count is within the cap, otherwise the top-`limit`
+// repos by node count plus a `_truncated` marker pointing at graph_stats
+// repo=<prefix> for the rest. Keeps the payload bounded regardless of how
+// many repos are tracked.
+func cappedRepoTotals(totals map[string]repoTotal, limit int) map[string]any {
+	entry := func(t repoTotal) map[string]any {
+		return map[string]any{"total_nodes": t.nodes, "total_edges": t.edges}
+	}
+	out := make(map[string]any, len(totals)+1)
+	if len(totals) <= limit {
+		for k, v := range totals {
+			out[k] = entry(v)
 		}
 		return out
 	}
 	type kv struct {
 		name string
-		st   graph.GraphStats
+		t    repoTotal
 	}
-	arr := make([]kv, 0, len(stats))
-	for k, v := range stats {
-		arr = append(arr, kv{name: k, st: v})
+	arr := make([]kv, 0, len(totals))
+	for k, v := range totals {
+		arr = append(arr, kv{name: k, t: v})
 	}
-	sort.Slice(arr, func(i, j int) bool { return arr[i].st.TotalNodes > arr[j].st.TotalNodes })
+	sort.Slice(arr, func(i, j int) bool { return arr[i].t.nodes > arr[j].t.nodes })
 	for i := 0; i < limit; i++ {
-		out[arr[i].name] = arr[i].st
+		out[arr[i].name] = entry(arr[i].t)
 	}
 	out["_truncated"] = map[string]any{
 		"shown":       limit,
-		"total_repos": len(stats),
+		"total_repos": len(totals),
 		"note": fmt.Sprintf("per_repo capped to the top %d of %d tracked repos by node count "+
 			"(context-frugal on monorepos); call graph_stats with repo=<prefix> for a specific repo.",
-			limit, len(stats)),
+			limit, len(totals)),
 	}
 	return out
 }

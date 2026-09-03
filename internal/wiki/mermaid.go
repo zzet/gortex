@@ -42,7 +42,7 @@ func mermaidEscape(s string) string {
 // the cross-community calls between them. Each node is a community;
 // edge weights are the number of calls flowing across the boundary.
 // Used both on the index page and as the wiki/<repo>/_assets file.
-func RenderCommunityGraph(g graph.Store, communities *analysis.CommunityResult, opts CommunityGraphOpts) string {
+func RenderCommunityGraph(g graph.Reader, communities *analysis.CommunityResult, opts CommunityGraphOpts) string {
 	if communities == nil || len(communities.Communities) == 0 {
 		return "graph LR\n  empty[\"No communities detected\"]\n"
 	}
@@ -235,7 +235,7 @@ func stepLabel(id string, nodeByID map[string]*graph.Node) string {
 // RenderArchitecture emits a Mermaid flowchart showing communities
 // grouped by parent (when present) plus cross-community arrows.
 // Mirrors the architecture overview page.
-func RenderArchitecture(g graph.Store, communities *analysis.CommunityResult, opts CommunityGraphOpts) string {
+func RenderArchitecture(g graph.Reader, communities *analysis.CommunityResult, opts CommunityGraphOpts) string {
 	if communities == nil || len(communities.Communities) == 0 {
 		return "graph TB\n  empty[\"No communities detected\"]\n"
 	}

@@ -61,7 +61,7 @@ func (s *Server) buildSymbolCFG(ctx context.Context, id string) (*symbolCFG, err
 	if node.StartLine == 0 || node.EndLine == 0 {
 		return nil, fmt.Errorf("symbol has no line range: %s", id)
 	}
-	absPath, err := s.resolveNodePath(node)
+	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return nil, err
 	}

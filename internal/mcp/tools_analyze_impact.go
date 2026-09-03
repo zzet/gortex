@@ -232,6 +232,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 		})
 	}
 
+	reader := s.readerFor(ctx)
 	scope := &impactTargetScope{Depth: map[string]int{}, ByDepth: map[int]int{}}
 	if symbol != "" {
 		canonical, ambiguous := s.resolveFacadeSymbolShorthand(ctx, symbol)
@@ -242,7 +243,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 				Data:      map[string]any{"field": "target.symbol", "symbol": symbol, "candidates": ambiguous},
 			})
 		}
-		node := s.graph.GetNode(canonical)
+		node := reader.GetNode(canonical)
 		if node == nil || !s.nodeInSessionScope(ctx, node) {
 			return nil, NewStructuredErrorResult(StructuredError{
 				ErrorCode: ErrCodeSymbolNotFound,
@@ -254,7 +255,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 		scope.Seeds = []string{node.ID}
 	} else {
 		scope.File = file
-		for _, node := range s.graph.GetFileNodes(file) {
+		for _, node := range reader.GetFileNodes(file) {
 			if node == nil || !reach.ImpactSeedKind(node.Kind) || !s.nodeInSessionScope(ctx, node) {
 				continue
 			}
@@ -279,7 +280,7 @@ func (s *Server) resolveImpactTarget(ctx context.Context, symbol, file string) (
 	closureCtx, cancel := context.WithTimeout(ctx, impactClosureTimeout)
 	defer cancel()
 	communities, processes := s.tryImpactAnalysisSnapshots()
-	if result := analysis.AnalyzeImpactContext(closureCtx, s.graph, scope.Seeds, communities, processes); result != nil {
+	if result := analysis.AnalyzeImpactContext(closureCtx, reader, scope.Seeds, communities, processes); result != nil {
 		scope.LowerBound = result.LowerBound
 		scope.Truncated = result.Truncated
 		for depth := 1; depth <= 3; depth++ {
@@ -416,7 +417,14 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 	// candidate id set) and falls back to a per-kind EdgesByKind
 	// stream otherwise. fanOutKinds is empty -- impact only reads
 	// fan-in.
-	fanIn, _ := analysis.CollectFanCounts(s.graph, candidateIDs,
+	reader := s.readerFor(ctx)
+	// The published reach index is built over the base corpus and keyed off
+	// base node metadata, so it is consulted only when this request reads the
+	// base graph itself. Under a request overlay or a routed view the fan-in
+	// collected here through the request's own reader is the depth-1 stand-in,
+	// exactly as it is when no reach record has been published.
+	baseReach := baseReachUsable(ctx)
+	fanIn, _ := analysis.CollectFanCounts(reader, candidateIDs,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		nil,
 	)
@@ -449,8 +457,8 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		// reference edge in the graph. addComm already ignores
 		// non-candidates, so either endpoint may be the candidate.
 		for _, byNode := range []map[string][]*graph.Edge{
-			s.graph.GetInEdgesByNodeIDs(candidateIDs),
-			s.graph.GetOutEdgesByNodeIDs(candidateIDs),
+			reader.GetInEdgesByNodeIDs(candidateIDs),
+			reader.GetOutEdgesByNodeIDs(candidateIDs),
 		} {
 			for _, edges := range byNode {
 				for _, e := range edges {
@@ -464,7 +472,7 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		}
 	} else {
 		for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-			for e := range s.graph.EdgesByKind(kind) {
+			for e := range reader.EdgesByKind(kind) {
 				if e == nil {
 					continue
 				}
@@ -495,7 +503,7 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		// accidental eager all-symbol reach build.
 		reachCount := fanIn[n.ID]
 		reachLowerBound := false
-		if d1, d2, d3, hit, bounded := reach.LookupCached(s.graph, n.ID); hit {
+		if d1, d2, d3, hit, bounded := s.impactReachCached(baseReach, n.ID); hit {
 			observed := len(d1) + len(d2) + len(d3)
 			if observed > reachCount {
 				reachCount = observed
@@ -637,6 +645,28 @@ func (s *Server) handleAnalyzeImpactComposite(ctx context.Context, req mcp.CallT
 		resp["limit"] = limit
 	}
 	return s.respondJSONOrTOON(ctx, req, resp)
+}
+
+// baseReachUsable reports whether this request may consult the published reach
+// index at all. The records are built and stamped on the base store's nodes,
+// so only a request that reads the base graph itself describes the corpus they
+// were built over: an overlay carries the caller's unsaved edits, and a routed
+// view answers about a checkout the base index never saw. Either way the
+// records belong to a different corpus than the one the caller asked about.
+func baseReachUsable(ctx context.Context) bool {
+	return OverlayViewFromContext(ctx) == nil && !requestViewFromContext(ctx).routed()
+}
+
+// impactReachCached reads an already-published transitive reach record for one
+// candidate, and only for a request the records describe. Reporting a miss
+// instead sends the caller back to the fan-in the request's own reader
+// produced, which is the same depth-1 stand-in used whenever no record has
+// been published.
+func (s *Server) impactReachCached(usable bool, id string) (d1, d2, d3 []reach.Entry, hit, truncated bool) {
+	if !usable {
+		return nil, nil, nil, false, false
+	}
+	return reach.LookupCached(s.graph, id)
 }
 
 // saturate maps a non-negative raw value onto 0..100 with a

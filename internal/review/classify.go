@@ -26,7 +26,7 @@ const (
 // path / node kind), then the hunk is inspected — a fix (error-handling /
 // guarding signal) outranks a feature, and a hunk with no net line change is a
 // refactor. It is deterministic and graph-grounded but never calls an LLM.
-func ClassifyChange(g graph.Store, sym analysis.ChangedSymbol, hunk string) string {
+func ClassifyChange(g graph.Reader, sym analysis.ChangedSymbol, hunk string) string {
 	file := cleanPath(sym.FilePath)
 
 	// (1) Test: the file is a test file, or the symbol is a test function.
@@ -66,7 +66,7 @@ func ClassifyChange(g graph.Store, sym analysis.ChangedSymbol, hunk string) stri
 
 // isTestSymbol reports whether the changed symbol is a test function/method by
 // its name or its enclosing file.
-func isTestSymbol(g graph.Store, sym analysis.ChangedSymbol) bool {
+func isTestSymbol(g graph.Reader, sym analysis.ChangedSymbol) bool {
 	if strings.HasPrefix(sym.Name, "Test") || strings.HasPrefix(sym.Name, "Benchmark") || strings.HasPrefix(sym.Name, "Fuzz") {
 		return true
 	}
@@ -81,7 +81,7 @@ func isTestSymbol(g graph.Store, sym analysis.ChangedSymbol) bool {
 // isConfigKind reports whether the changed symbol's graph node is a
 // non-behavioural surface — a constant, variable, field, enum member, or
 // config key.
-func isConfigKind(g graph.Store, sym analysis.ChangedSymbol) bool {
+func isConfigKind(g graph.Reader, sym analysis.ChangedSymbol) bool {
 	kind := sym.Kind
 	if kind == "" && g != nil && sym.ID != "" {
 		if n := g.GetNode(sym.ID); n != nil {

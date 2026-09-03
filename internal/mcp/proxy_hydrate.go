@@ -53,6 +53,8 @@ func (s *Server) hydrateProxyTargets(ctx context.Context, id string) {
 		_, _ = s.proxyHydrate(ctx, id)
 		return
 	}
+	// Base read on purpose: hydration writes the fetched ring into the base
+	// graph, so the edges it looks for must be read from there too.
 	for _, e := range s.graph.GetOutEdges(id) {
 		if graph.IsProxyID(e.To) {
 			_, _ = s.proxyHydrate(ctx, e.To)

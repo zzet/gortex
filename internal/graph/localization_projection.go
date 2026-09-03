@@ -345,11 +345,15 @@ func (v *OverlaidView) FindNodesByNameBounded(
 		}
 	}
 
-	removedCount, overlayNodeCount := 0, 0
+	var (
+		removedIDs   []string
+		overlayNamed []*Node
+	)
 	if v.layer != nil {
-		removedCount = len(v.layer.nameRemoved[name])
-		overlayNodeCount = len(v.layer.nodesByName[name])
+		removedIDs = v.layer.RemovedIDsForName(name)
+		overlayNamed = v.layer.NodesByName(name)
 	}
+	removedCount, overlayNodeCount := len(removedIDs), len(overlayNamed)
 	if removedCount > overlayExactNameInspectionLimit ||
 		overlayNodeCount > overlayExactNameInspectionLimit-removedCount {
 		return BoundedNodeProjection{}, &BoundedLocalizationLimitError{
@@ -410,7 +414,7 @@ func (v *OverlaidView) FindNodesByNameBounded(
 		return nil
 	}
 	if v.layer != nil {
-		for id := range v.layer.nameRemoved[name] {
+		for _, id := range removedIDs {
 			if err := checkInspection(); err != nil {
 				return BoundedNodeProjection{}, err
 			}
@@ -418,7 +422,7 @@ func (v *OverlaidView) FindNodesByNameBounded(
 				return BoundedNodeProjection{}, err
 			}
 		}
-		for _, node := range v.layer.nodesByName[name] {
+		for _, node := range overlayNamed {
 			if err := checkInspection(); err != nil {
 				return BoundedNodeProjection{}, err
 			}
@@ -531,7 +535,7 @@ func (v *OverlaidView) FindFileNodesBounded(
 		pageSize := limit + 1
 		kept := make([]*Node, 0, pageSize)
 		total := 0
-		for index, node := range v.layer.nodesForFileReadOnly(filePath) {
+		for index, node := range v.layer.FileNodes(filePath) {
 			if index&127 == 0 {
 				if err := ctx.Err(); err != nil {
 					return BoundedNodeProjection{}, err

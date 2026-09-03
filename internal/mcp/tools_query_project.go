@@ -69,7 +69,7 @@ func (s *Server) handleQueryProject(ctx context.Context, req mcp.CallToolRequest
 	if len(nodes) > limit {
 		nodes = nodes[:limit]
 	}
-	nodes = s.withAbsPaths(nodes)
+	nodes = s.withAbsPaths(ctx, nodes)
 
 	results := make([]map[string]any, 0, len(nodes))
 	for _, n := range nodes {

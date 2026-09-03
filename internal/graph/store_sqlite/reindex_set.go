@@ -187,7 +187,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		inserts = conversionPlan.fallbackInserts
 
 		updated, statements, repairDeletes, repairInserts, updateErr :=
-			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, false)
+			updateSQLiteResolvedConversionsTxLimited(tx, s.viewGen, mutations, conversionPlan, false)
 		if updateErr != nil {
 			return stats, false, false, nil, updateErr
 		}
@@ -197,7 +197,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		inserts = append(inserts, repairInserts...)
 
 		updated, statements, repairDeletes, repairInserts, updateErr =
-			updateSQLiteResolvedConversionsTxLimited(tx, mutations, conversionPlan, true)
+			updateSQLiteResolvedConversionsTxLimited(tx, s.viewGen, mutations, conversionPlan, true)
 		if updateErr != nil {
 			return stats, false, false, nil, updateErr
 		}
@@ -207,7 +207,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		inserts = append(inserts, repairInserts...)
 	} else {
 		keys := sqliteReindexKeys(mutations)
-		initial, selectStatements, selectErr := sqliteReindexRowsTxLimited(tx, keys, &variableLimit)
+		initial, selectStatements, selectErr := sqliteReindexRowsTxLimited(tx, s.viewGen, keys, &variableLimit)
 		if selectErr != nil {
 			return stats, false, false, nil, selectErr
 		}
@@ -215,11 +215,11 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 		deletes, inserts = simulateSQLiteReindexSet(initial, keys, mutations)
 	}
 
-	stats.deletedRows, stats.deleteStatements, err = deleteSQLiteReindexRowsTxLimited(tx, deletes, &variableLimit)
+	stats.deletedRows, stats.deleteStatements, err = deleteSQLiteReindexRowsTxLimited(tx, s.viewGen, deletes, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
-	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTxLimited(tx, inserts, &variableLimit)
+	stats.insertedRows, stats.insertStatements, err = insertSQLiteReindexRowsTxLimited(tx, s.viewGen, inserts, &variableLimit)
 	if err != nil {
 		return stats, false, false, nil, err
 	}
@@ -400,6 +400,7 @@ func sqliteReindexRowForEdge(edge *graph.Edge) (sqliteReindexRow, error) {
 
 func updateSQLiteResolvedConversionsTxLimited(
 	tx *sql.Tx,
+	viewGen int64,
 	mutations []sqliteReindexMutation,
 	plan sqliteResolvedConversionPlan,
 	updateKind bool,
@@ -435,7 +436,7 @@ func updateSQLiteResolvedConversionsTxLimited(
 		if encodeErr != nil {
 			return updatedRows, statements, repairDeletes, repairInserts, encodeErr
 		}
-		result, execErr := tx.Exec(query, payload)
+		result, execErr := tx.Exec(query, payload, viewGen)
 		if execErr != nil {
 			return updatedRows, statements, repairDeletes, repairInserts, execErr
 		}
@@ -611,7 +612,8 @@ func sqliteResolvedConversionUpdateJSONStatement(updateKind bool) string {
 		AND e.to_id = p.old_to_id
 		AND e.kind = p.old_kind
 		AND e.file_path = p.file_path
-		AND e.line = p.line`
+		AND e.line = p.line
+		AND e.view_gen = ?`
 	}
 	return `WITH patch AS (SELECT
 		value ->> 0 AS old_from_id,
@@ -646,10 +648,14 @@ func sqliteResolvedConversionUpdateJSONStatement(updateKind bool) string {
 		AND e.to_id = p.old_to_id
 		AND e.kind = p.kind
 		AND e.file_path = p.file_path
-		AND e.line = p.line`
+		AND e.line = p.line
+		AND e.view_gen = ?`
 }
 
-func sqliteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLimit *int) (map[sqliteReindexKey]sqliteReindexRow, int, error) {
+// sqliteReindexRowsTxLimited reads the stored rows the simulator compares
+// against. It binds the generation the deletes and inserts below use, so the
+// simulated before-state and the writes that act on it describe one corpus.
+func sqliteReindexRowsTxLimited(tx *sql.Tx, viewGen int64, keys []sqliteReindexKey, variableLimit *int) (map[sqliteReindexKey]sqliteReindexRow, int, error) {
 	out := make(map[sqliteReindexKey]sqliteReindexRow, len(keys))
 	if len(keys) == 0 {
 		return out, 0, nil
@@ -663,7 +669,7 @@ func sqliteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLim
 	statements := 0
 	for pos := 0; pos < len(keys); {
 		chunkStart := pos
-		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow)
+		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow+1)
 		argBytes := 0
 		rowCount := 0
 		for pos < len(keys) && rowCount < rowLimit {
@@ -679,6 +685,7 @@ func sqliteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLim
 			rowCount++
 			argBytes += rowBytes
 		}
+		args = append(args, viewGen)
 
 		query := `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + multiValues(rowCount, reindexKeyParamsPerRow) + `)
 		SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
@@ -690,7 +697,8 @@ func sqliteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLim
 		 AND e.to_id = w.to_id
 		 AND e.kind = w.kind
 		 AND e.file_path = w.file_path
-		 AND e.line = w.line`
+		 AND e.line = w.line
+		 AND e.view_gen = ?`
 		rows, err := tx.Query(query, args...)
 		if tooManySQLVariables(err) && rowCount > 1 {
 			rowLimit = lowerBatchVariableLimit(variableLimit, reindexKeyParamsPerRow, rowCount)
@@ -769,7 +777,7 @@ func equalSQLiteReindexRows(left, right sqliteReindexRow) bool {
 		left.semanticSource == right.semanticSource
 }
 
-func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, variableLimit *int) (int, int, error) {
+func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, viewGen int64, keys []sqliteReindexKey, variableLimit *int) (int, int, error) {
 	if len(keys) == 0 {
 		return 0, 0, nil
 	}
@@ -783,7 +791,7 @@ func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, varia
 	statements := 0
 	for pos := 0; pos < len(keys); {
 		chunkStart := pos
-		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow)
+		args := make([]any, 0, rowLimit*reindexKeyParamsPerRow+1)
 		argBytes := 0
 		rowCount := 0
 		for pos < len(keys) && rowCount < rowLimit {
@@ -799,6 +807,7 @@ func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, varia
 			rowCount++
 			argBytes += rowBytes
 		}
+		args = append(args, viewGen)
 
 		query := `WITH doomed(from_id, to_id, kind, file_path, line) AS (VALUES ` + multiValues(rowCount, reindexKeyParamsPerRow) + `)
 		DELETE FROM edges
@@ -811,6 +820,7 @@ func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, varia
 			 AND e.kind = d.kind
 			 AND e.file_path = d.file_path
 			 AND e.line = d.line
+			 AND e.view_gen = ?
 		)`
 		result, err := tx.Exec(query, args...)
 		if tooManySQLVariables(err) && rowCount > 1 {
@@ -831,7 +841,7 @@ func deleteSQLiteReindexRowsTxLimited(tx *sql.Tx, keys []sqliteReindexKey, varia
 	return changed, statements, nil
 }
 
-func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, rows []sqliteReindexRow, variableLimit *int) (int, int, error) {
+func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, viewGen int64, rows []sqliteReindexRow, variableLimit *int) (int, int, error) {
 	if len(rows) == 0 {
 		return 0, 0, nil
 	}
@@ -852,6 +862,7 @@ func insertSQLiteReindexRowsTxLimited(tx *sql.Tx, rows []sqliteReindexRow, varia
 			row := rows[pos]
 			argStart := len(args)
 			args = append(args,
+				viewGen,
 				row.key.fromID, row.key.toID, row.key.kind, row.key.filePath, row.key.line,
 				row.confidence, row.confidenceLabel, row.origin, row.tier,
 				row.crossRepo, row.meta, row.resolveTerminal, row.resolveTerminalReason, row.semanticSource,

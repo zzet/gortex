@@ -3980,6 +3980,19 @@ func (g *Graph) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 	return nodesRemoved, edgesRemoved
 }
 
+// EvictRepoCurrentGeneration declares the in-memory store's one-generation
+// semantics to generation-aware callers.
+func (g *Graph) EvictRepoCurrentGeneration(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	return g.EvictRepo(repoPrefix)
+}
+
+// EvictRepoAllGenerations declares the destructive capability explicitly. An
+// in-memory Graph has exactly one logical generation, so the implementation is
+// identical to EvictRepo; its empty-prefix guard is inherited.
+func (g *Graph) EvictRepoAllGenerations(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	return g.EvictRepo(repoPrefix)
+}
+
 // RepoStats returns per-repository node and edge counts.
 func (g *Graph) RepoStats() map[string]GraphStats {
 	g.lockAllRead()

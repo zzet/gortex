@@ -51,9 +51,10 @@ func (s *Server) handleAnalyzeLogEvents(ctx context.Context, req mcp.CallToolReq
 		Emits    int      `json:"emits"`
 		Emitters []string `json:"emitters,omitempty"`
 	}
+	reader := s.readerFor(ctx)
 	byString := map[string]*logRow{}
-	for e := range edgesByKinds(s.graph, graph.EdgeEmits) {
-		n := s.graph.GetNode(e.To)
+	for e := range edgesByKinds(reader, graph.EdgeEmits) {
+		n := reader.GetNode(e.To)
 		if n == nil || n.Kind != graph.KindString {
 			continue
 		}
@@ -97,12 +98,12 @@ func (s *Server) handleAnalyzeLogEvents(ctx context.Context, req mcp.CallToolReq
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*logRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.ID)) {
+			if !s.analyzeNodeVisible(ctx, reader.GetNode(r.ID)) {
 				continue
 			}
 			emitters := make([]string, 0, len(r.Emitters))
 			for _, em := range r.Emitters {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(em)) {
+				if s.analyzeNodeVisible(ctx, reader.GetNode(em)) {
 					emitters = append(emitters, em)
 				}
 			}
@@ -223,6 +224,10 @@ func (s *Server) handleAnalyzeSQLRebuild(ctx context.Context, req mcp.CallToolRe
 //
 // Filters: name (call-site symbol name, case-insensitive), limit.
 func (s *Server) handleAnalyzeSQLCallSites(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// The rebuild writes nodes and edges, so it stays on the base store — a
+	// request view is read-only. The rows below read through the request
+	// reader, which serves the freshly materialised base layer plus whatever
+	// the caller's buffers changed on top of it.
 	if requestBoolDefault(req, "materialize", true) {
 		gortexsql.RebuildTablesFromStringRegistry(s.graph)
 	}
@@ -242,12 +247,13 @@ func (s *Server) handleAnalyzeSQLCallSites(ctx context.Context, req mcp.CallTool
 		Reads   int      `json:"reads"`
 		Writes  int      `json:"writes"`
 	}
+	reader := s.readerFor(ctx)
 	bySite := map[string]*sqlCallSite{}
-	for e := range edgesByKinds(s.graph, graph.EdgeQueries) {
+	for e := range edgesByKinds(reader, graph.EdgeQueries) {
 		row, ok := bySite[e.From]
 		if !ok {
 			name, file := e.From, ""
-			if n := s.graph.GetNode(e.From); n != nil {
+			if n := reader.GetNode(e.From); n != nil {
 				name, file = n.Name, n.FilePath
 			}
 			if nameFilter != "" && strings.ToLower(name) != nameFilter {
@@ -262,7 +268,7 @@ func (s *Server) handleAnalyzeSQLCallSites(ctx context.Context, req mcp.CallTool
 		} else {
 			row.Reads++
 		}
-		if t := s.graph.GetNode(e.To); t != nil && t.Name != "" {
+		if t := reader.GetNode(e.To); t != nil && t.Name != "" {
 			row.Tables = appendUnique(row.Tables, t.Name)
 		}
 	}
@@ -279,7 +285,7 @@ func (s *Server) handleAnalyzeSQLCallSites(ctx context.Context, req mcp.CallTool
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*sqlCallSite, 0, len(rows))
 		for _, r := range rows {
-			if s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Symbol)) {
+			if s.analyzeNodeVisible(ctx, reader.GetNode(r.Symbol)) {
 				kept = append(kept, r)
 			}
 		}

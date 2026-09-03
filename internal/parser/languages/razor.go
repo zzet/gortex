@@ -204,6 +204,14 @@ func (e *RazorExtractor) delegateRazorCode(content []byte, lineOffset int, wrapP
 			n.Meta = map[string]any{}
 		}
 		n.Meta["inline_script"] = true
+		// The recorded ownership span is spelled in the same coordinates
+		// as the node's lines, so it moves with them; left in wrapper
+		// coordinates it would name unrelated host lines.
+		for _, k := range []string{graph.MetaOwnershipStartLine, graph.MetaOwnershipEndLine} {
+			if v, ok := n.Meta[k].(int); ok && v > 0 {
+				n.Meta[k] = v + shift
+			}
+		}
 		result.Nodes = append(result.Nodes, n)
 	}
 	for _, ed := range sub.Edges {

@@ -11,6 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphpath"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // registerArchitectureTool wires get_architecture — the single-shot
@@ -70,6 +71,12 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	// the helpers handle via nil inScope.
 	_, _, bound := s.sessionScope(ctx)
 	needScoped := bound || pathPrefix != ""
+
+	// Node / edge reads run on the request's reader so an overlay-active
+	// caller is described by its own buffers. Hoisted once — the snapshot
+	// reads it from four sections.
+	reader := s.readerFor(ctx)
+
 	var scoped []*graph.Node
 	var inScope map[string]bool
 	var totalNodesScoped int
@@ -84,11 +91,11 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 		}
 		totalNodesScoped = len(inScope)
 	} else {
-		totalNodesScoped = s.graph.NodeCount()
+		totalNodesScoped = reader.NodeCount()
 	}
 
 	// 1. Summary — language mix + node/edge counts.
-	summary := architectureSummary(scoped, inScope, totalNodesScoped, s.graph)
+	summary := architectureSummary(scoped, inScope, totalNodesScoped, reader)
 
 	// 2. Communities — same shape as the outline tool, capped here.
 	communitiesSection := architectureCommunities(s.getCommunities(), inScope, topCommunities)
@@ -99,15 +106,22 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	// 4. Entry points — functions with zero in-edges that have
 	// out-edges (called by no one, calls into the system). Sorted
 	// by out-degree so the most-impactful entry points surface first.
-	entries := architectureEntryPoints(inScope, s.graph, topEntryPoints)
+	entries := architectureEntryPoints(inScope, reader, topEntryPoints)
 
 	// 5. Processes — analysis.DiscoverProcesses output, trimmed.
 	processes := architectureProcesses(s.getProcesses(), inScope, topProcesses)
 
+	// The communities, hotspots and processes sections come from the
+	// server-wide analysis caches, which are computed over the base corpus
+	// rather than through this request's reader. Under a view three of the
+	// snapshot's sections therefore describe the base, so the response says
+	// so instead of reading as a wholly view-scoped answer.
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
+
 	// 6. Cross-repo edges — rollup by (from_repo, to_repo, kind) so
 	// the architecture view shows which repos talk to which without
 	// dumping every individual call site.
-	crossRepo := architectureCrossRepo(s.graph)
+	crossRepo := architectureCrossRepo(reader)
 
 	// 7. Contracts — count by type and role, plus a per-workspace
 	// rollup. The full contract list lives behind `contracts list`.
@@ -127,7 +141,9 @@ func (s *Server) handleGetArchitecture(ctx context.Context, req mcp.CallToolRequ
 	// asks for a resolution tier, collapse the leaf graph to that tier
 	// so the response carries the architecture at the requested
 	// granularity (file / package / service / system) with no
-	// function-leaf nodes. Computed on demand from the base graph.
+	// function-leaf nodes. Computed on demand from the base graph, so it is
+	// base-scoped for the same reason the cached sections are and rides on
+	// the same annotation.
 	if hierarchy, errMsg := architectureHierarchy(s.graph, s.getCommunities(), req.GetString("resolution", "")); errMsg != "" {
 		return mcp.NewToolResultError(errMsg), nil
 	} else if hierarchy != nil {
@@ -189,7 +205,7 @@ func architectureHierarchy(g graph.Store, cr *analysis.CommunityResult, resoluti
 // signal that every node is in scope — the helper short-circuits
 // the lang count through Stats() and the edge count through
 // EdgeCount() rather than materialising the whole graph over cgo.
-func architectureSummary(allScoped []*graph.Node, inScope map[string]bool, totalNodes int, g graph.Store) map[string]any {
+func architectureSummary(allScoped []*graph.Node, inScope map[string]bool, totalNodes int, g graph.Reader) map[string]any {
 	langCounts := map[string]int{}
 	if inScope == nil {
 		// Unbound session + no path-prefix — pull the aggregate from
@@ -341,8 +357,10 @@ func architectureHotspots(hotspots []analysis.HotspotEntry, inScope map[string]b
 // Uses NodeDegreeAggregator when the backend implements it (one
 // batched in/out count instead of 2N GetInEdges/GetOutEdges
 // round-trips on a disk backend — the per-node loop was the entire
-// wall-clock cost of this section on large repos).
-func architectureEntryPoints(inScope map[string]bool, g graph.Store, top int) []map[string]any {
+// wall-clock cost of this section on large repos). Both capability
+// probes miss on an overlay view, which takes the per-node walks over
+// the overlaid edge relation instead.
+func architectureEntryPoints(inScope map[string]bool, g graph.Reader, top int) []map[string]any {
 	type entryCandidate struct {
 		node   *graph.Node
 		fanOut int
@@ -474,7 +492,7 @@ func architectureProcesses(pr *analysis.ProcessResult, inScope map[string]bool, 
 // per-edge GetNode pair — typically ~286k edge rows + thousands
 // of GetNode round-trips on a disk backend for <100 rows of output). Falls
 // back to the AllEdges-driven loop on backends that don't.
-func architectureCrossRepo(g graph.Store) []crossRepoRow {
+func architectureCrossRepo(g graph.Reader) []crossRepoRow {
 	type key struct {
 		kind, fromRepo, toRepo string
 	}

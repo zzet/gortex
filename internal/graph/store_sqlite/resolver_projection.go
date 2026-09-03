@@ -58,7 +58,10 @@ func resolverNodeProjectionSeq[T any](
 		for _, kind := range uniq {
 			baseArgs := []any{kind}
 			var highWater string
-			err := s.db.QueryRow(`SELECT id FROM nodes WHERE kind = ? ORDER BY id DESC LIMIT 1`, baseArgs...).Scan(&highWater)
+			err := s.db.QueryRow(
+				`SELECT id FROM nodes WHERE kind = ? AND view_gen = ? ORDER BY id DESC LIMIT 1`,
+				kind, s.viewGen,
+			).Scan(&highWater)
 			if err == sql.ErrNoRows {
 				continue
 			}
@@ -73,19 +76,19 @@ func resolverNodeProjectionSeq[T any](
 			for {
 				query := `SELECT ` + columns + `
 FROM nodes
-WHERE kind = ? AND id <= ?
+WHERE kind = ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`
 				args := append([]any(nil), baseArgs...)
-				args = append(args, highWater, resolverProjectionPageSize)
+				args = append(args, highWater, s.viewGen, resolverProjectionPageSize)
 				if !firstPage {
 					query = `SELECT ` + columns + `
 FROM nodes
-WHERE kind = ? AND id > ? AND id <= ?
+WHERE kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`
 					args = append([]any(nil), baseArgs...)
-					args = append(args, after, highWater, resolverProjectionPageSize)
+					args = append(args, after, highWater, s.viewGen, resolverProjectionPageSize)
 				}
 				rows, queryErr := s.db.Query(query, args...)
 				if queryErr != nil {
@@ -199,19 +202,19 @@ func resolverScopedNodeProjectionSeq[T any](
 	}
 }
 
-const resolverScopedProjectionHighWaterQuery = `SELECT id FROM nodes WHERE repo_prefix = ? AND kind = ? ORDER BY id DESC LIMIT 1`
+const resolverScopedProjectionHighWaterQuery = `SELECT id FROM nodes WHERE repo_prefix = ? AND kind = ? AND view_gen = ? ORDER BY id DESC LIMIT 1`
 
 func resolverScopedProjectionPageQuery(columns string, started bool) string {
 	if started {
 		return `SELECT ` + columns + `
 FROM nodes
-WHERE repo_prefix = ? AND kind = ? AND id > ? AND id <= ?
+WHERE repo_prefix = ? AND kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`
 	}
 	return `SELECT ` + columns + `
 FROM nodes
-WHERE repo_prefix = ? AND kind = ? AND id <= ?
+WHERE repo_prefix = ? AND kind = ? AND id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`
 }
@@ -228,7 +231,7 @@ func streamResolverScopedKindProjection[T any](
 	for _, prefix := range prefixes {
 		var highWater string
 		err := s.db.QueryRow(
-			resolverScopedProjectionHighWaterQuery, prefix, kind,
+			resolverScopedProjectionHighWaterQuery, prefix, kind, s.viewGen,
 		).Scan(&highWater)
 		if err == sql.ErrNoRows {
 			continue
@@ -299,9 +302,9 @@ func fillResolverProjectionPage[T any](
 	state *resolverProjectionPrefixState[T],
 ) bool {
 	query := resolverScopedProjectionPageQuery(columns, state.started)
-	args := []any{state.prefix, kind, state.highWater, pageSize}
+	args := []any{state.prefix, kind, state.highWater, s.viewGen, pageSize}
 	if state.started {
-		args = []any{state.prefix, kind, state.after, state.highWater, pageSize}
+		args = []any{state.prefix, kind, state.after, state.highWater, s.viewGen, pageSize}
 	}
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -432,8 +435,8 @@ func (s *Store) GetInEdgeIdentitiesByNodeIDs(ids []string) map[string][]graph.Ed
 		end := minInt(start+lookupChunkSize, len(uniq))
 		chunk := uniq[start:end]
 		query := `SELECT from_id, to_id, kind, file_path, line FROM edges WHERE to_id IN (` +
-			inPlaceholders(len(chunk)) + `)`
-		rows, err := s.db.Query(query, toAnyArgs(chunk)...)
+			inPlaceholders(len(chunk)) + `) AND view_gen = ?`
+		rows, err := s.db.Query(query, append(toAnyArgs(chunk), s.viewGen)...)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -475,8 +478,8 @@ func (s *Store) NodePlacementsByIDs(ids []string) map[string]graph.NodePlacement
 		end := minInt(start+lookupChunkSize, len(uniq))
 		chunk := uniq[start:end]
 		query := `SELECT id, kind, file_path, repo_prefix FROM nodes WHERE id IN (` +
-			inPlaceholders(len(chunk)) + `)`
-		rows, err := s.db.Query(query, toAnyArgs(chunk)...)
+			inPlaceholders(len(chunk)) + `) AND view_gen = ?`
+		rows, err := s.db.Query(query, append(toAnyArgs(chunk), s.viewGen)...)
 		if err != nil {
 			panicOnFatal(err)
 			return out

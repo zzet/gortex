@@ -40,7 +40,7 @@ var extractorVersions = map[string]int{
 	//   "go": 2,
 	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
 	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 20,                                     // indexers and accessor-bearing events are emitted as members and own their body calls (was: verbatim-identifier canonicalization unified across type refs, the base-list prescan, and partial identity)
+	"csharp": 23,                                     // partial / conditionally-compiled properties carry their recorded ownership span (was: repeated partial base classes dropped, chained/awaited receivers typed at the site offset)
 	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
 	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
 	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges

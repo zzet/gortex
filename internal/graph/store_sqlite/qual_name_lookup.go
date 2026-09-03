@@ -15,6 +15,7 @@ WHERE qual_name <> ''
     FROM json_each(?)
     WHERE CAST(value AS TEXT) <> ''
   )
+  AND view_gen = ?
 ORDER BY qual_name, id`
 
 func qualNameLookupPayload(qualNames []string) string {

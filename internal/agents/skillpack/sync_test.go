@@ -13,7 +13,10 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents/hermes"
 	"github.com/zzet/gortex/internal/agents/skillpack"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 const skillFile = "SKILL.md"
@@ -354,7 +357,7 @@ func TestSyncKnownHashesTreatAnOldBodyAsOurs(t *testing.T) {
 
 	spec := func(dir string) skillpack.SyncSpec {
 		s := specFor(dir, rendered)
-		s.KnownHashes = map[string]string{"gortex-guide": oldHash}
+		s.KnownHashes = map[string][]string{"gortex-guide": {"unused", oldHash}}
 		return s
 	}
 
@@ -379,6 +382,111 @@ func TestSyncKnownHashesTreatAnOldBodyAsOurs(t *testing.T) {
 			t.Fatalf("installed = %v, want [gortex-explore]", installed)
 		}
 	})
+
+	t.Run("one byte customization is preserved", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "skills")
+		custom := oldBody + "x"
+		path := seedSkill(t, dir, "gortex-guide", custom)
+		actions, err := skillpack.Sync(nil, spec(dir), nil, agents.ApplyOpts{})
+		if err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+		if got := readFileString(t, path); got != custom {
+			t.Fatalf("customized body overwritten: %q", got)
+		}
+		if got := actionsByID(actions)["gortex-guide"].Reason; got != "customised" {
+			t.Fatalf("reason = %q, want customised", got)
+		}
+	})
+}
+
+func BenchmarkSyncTwentyOneUnchangedSkills(b *testing.B) {
+	dir := filepath.Join(b.TempDir(), "skills")
+	rendered := make(map[string]string, 21)
+	for i := 0; i < 21; i++ {
+		id := fmt.Sprintf("gortex-skill-%02d", i)
+		rendered[id] = fmt.Sprintf("---\nname: %s\n---\nbody\n", id)
+		path := filepath.Join(dir, id, skillFile)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(rendered[id]), 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	spec := specFor(dir, rendered)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := skillpack.Sync(nil, spec, nil, agents.ApplyOpts{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestHistoricalHashSetsAreDefensiveAndComplete(t *testing.T) {
+	for name, hashes := range map[string]map[string][]string{
+		"agent":  skillpack.PreWorktreeAgentSkillHashes(),
+		"claude": skillpack.PreWorktreeClaudeSkillHashes(),
+		"hermes": skillpack.PreWorktreeHermesSkillHashes(),
+	} {
+		want := 21
+		if name == "hermes" {
+			want = 20
+		}
+		if len(hashes) != want {
+			t.Errorf("%s hashes = %d, want %d", name, len(hashes), want)
+		}
+	}
+	first := skillpack.PreWorktreeAgentSkillHashes()
+	first["gortex-guide"][0] = "mutated"
+	if skillpack.PreWorktreeAgentSkillHashes()["gortex-guide"][0] == "mutated" {
+		t.Fatal("historical hashes leaked mutable package state")
+	}
+}
+
+func TestAddWorktreeV1HashesAddsOwnershipWithoutMutatingPriorCatalog(t *testing.T) {
+	prior := skillpack.PreWorktreeClaudeSkillHashes()
+	rendered := map[string]string{"gortex-guide": "before\n" + profiles.WorktreeBranchRoutingPolicy + "after\n"}
+	got := skillpack.AddWorktreeV1Hashes(rendered, profiles.WorktreeBranchRoutingPolicy, prior)
+	if len(got["gortex-guide"]) != 2 {
+		t.Fatalf("hashes = %v, want pre-worktree + worktree-v1", got["gortex-guide"])
+	}
+	if len(prior["gortex-guide"]) != 1 {
+		t.Fatal("prior catalog was mutated")
+	}
+	if got["gortex-guide"][1] != skillpack.WorktreeV1BodyHash(rendered["gortex-guide"], profiles.WorktreeBranchRoutingPolicy) {
+		t.Fatal("catalog and single-body worktree-v1 hashes disagree")
+	}
+}
+
+func TestPreWorktreeHashesMatchImmediatelyPriorShippedBodies(t *testing.T) {
+	policy := "\n## Worktree and branch routing\n\n" + profiles.WorktreeBranchRoutingPolicy
+	assertHashes := func(name string, current map[string]string, hashes map[string][]string) {
+		t.Helper()
+		for id, body := range current {
+			old := strings.Replace(body, policy, "", 1)
+			if old == body {
+				t.Errorf("%s/%s: policy block not found", name, id)
+				continue
+			}
+			got := fmt.Sprintf("%x", sha256.Sum256([]byte(old)))
+			if len(hashes[id]) != 1 || hashes[id][0] != got {
+				t.Errorf("%s/%s: historical hash = %v, want %s", name, id, hashes[id], got)
+			}
+		}
+	}
+	assertHashes("claude", claudecode.GlobalSkills, skillpack.PreWorktreeClaudeSkillHashes())
+	assertHashes("hermes", hermes.RoutingSkills(), skillpack.PreWorktreeHermesSkillHashes())
+	agent := make(map[string]string)
+	for id, raw := range claudecode.GlobalSkills {
+		s, err := skillpack.Parse(id, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent[id] = skillpack.RenderFrontmatter([][2]string{{"name", s.Name}, {"description", s.Description}}) + "\n" + s.Body
+	}
+	assertHashes("agent", agent, skillpack.PreWorktreeAgentSkillHashes())
 }
 
 // TestSyncEmptyAllowedRemovesEverything separates "nil = no filtering"

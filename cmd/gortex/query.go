@@ -74,10 +74,18 @@ func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, to
 
 // daemonRequiredErr explains how to make the daemon able to answer: start
 // it (when none runs) or track the repo (when it runs but does not own it).
+//
+// A linked git worktree takes neither remedy verbatim — the repository to
+// track is its main checkout — so it is answered separately. That resolution
+// is a filesystem fact, which is what makes it available on the arm where the
+// daemon is down and nothing can be asked.
 func daemonRequiredErr(repoPath string) error {
 	abs, aerr := filepath.Abs(repoPath)
 	if aerr != nil {
 		abs = repoPath
+	}
+	if fam, ok := linkedWorktreeAt(abs); ok {
+		return worktreeCWDErr(abs, fam, trackedFamilyRepo(fam))
 	}
 	if !daemon.IsRunning() {
 		return fmt.Errorf("no gortex daemon is running — start it with `gortex daemon start --detach`, then track this repo with `gortex track %s`", abs)

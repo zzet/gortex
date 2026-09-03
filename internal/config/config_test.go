@@ -65,6 +65,38 @@ func toYAMLConfig(gc GuardsConfig) yamlConfig {
 	return yamlConfig{Guards: yamlGuardsConfig{Rules: rules}}
 }
 
+func TestGlobalConfigRemoveRepoIfPresentIsIdempotent(t *testing.T) {
+	repoPath := t.TempDir()
+	global := &GlobalConfig{Repos: []RepoEntry{{Path: repoPath}}}
+
+	removed, err := global.RemoveRepoIfPresent(repoPath)
+	if err != nil || !removed || len(global.Repos) != 0 {
+		t.Fatalf("first removal: removed=%v repos=%d err=%v", removed, len(global.Repos), err)
+	}
+	removed, err = global.RemoveRepoIfPresent(repoPath)
+	if err != nil || removed || len(global.Repos) != 0 {
+		t.Fatalf("replayed removal: removed=%v repos=%d err=%v", removed, len(global.Repos), err)
+	}
+	if err := global.RemoveRepo(repoPath); err == nil {
+		t.Fatal("legacy RemoveRepo on an absent repository returned nil")
+	}
+}
+
+func TestGlobalConfigRemoveRepoIfPresentMatchesFilesystemIdentity(t *testing.T) {
+	realPath := t.TempDir()
+	aliasPath := filepath.Join(t.TempDir(), "repo-link")
+	if err := os.Symlink(realPath, aliasPath); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	global := &GlobalConfig{Repos: []RepoEntry{{Path: aliasPath}}}
+
+	removed, err := global.RemoveRepoIfPresent(realPath)
+	if err != nil || !removed || len(global.Repos) != 0 {
+		t.Fatalf("filesystem-identity removal: removed=%v repos=%d err=%v",
+			removed, len(global.Repos), err)
+	}
+}
+
 func TestPropertyGuardConfigRoundTrip(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		original := genGuardsConfig().Draw(rt, "guardsConfig")

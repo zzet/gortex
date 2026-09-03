@@ -150,7 +150,7 @@ func TestFindIncomingSourcesBoundedPlanAvoidsOrderBySorter(t *testing.T) {
 
 	rows, err := store.db.Query(
 		"EXPLAIN QUERY PLAN "+findIncomingSourcesBoundedSQL,
-		"target", graph.EdgeCalls, 17,
+		"target", graph.EdgeCalls, baseViewGeneration, 17,
 	)
 	if err != nil {
 		t.Fatalf("explain incoming projection: %v", err)

@@ -21,8 +21,10 @@ import (
 	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/releases"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/semantic"
@@ -53,6 +55,40 @@ type realController struct {
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
+	// lifecycle owns every checkout lifecycle side effect. It is the same
+	// instance the MCP tools drive, so a track over the control socket and a
+	// track over MCP leave identical state behind. Nil only in tests that
+	// build a controller by hand; the methods that need it say so.
+	lifecycle *indexer.CheckoutLifecycle
+	// viewMaterializer composes the routed stack a probing path reads. It
+	// MUST be the one the rest of the stack materializes through: retirement
+	// runs with that instance's lease manager as its in-use predicate, so a
+	// probe leasing through a second manager would be invisible to the sweep
+	// and could have its generations deleted mid-read. Nil leaves every probe
+	// on the base corpus.
+	viewMaterializer *graphview.Materializer
+
+	// probeNudgeMu guards probeNudgedAt alone. It is deliberately not mu: the
+	// whole point of the nudge is to be raised from the probe path, which
+	// must never queue behind a track / reload / enrichment.
+	probeNudgeMu  sync.Mutex
+	probeNudgedAt map[string]time.Time
+	// topologyNudgeMu owns the event-driven reconciliation single-flight.
+	// Filesystem topology events must not share the probe's 30-second rate
+	// limiter: the final event can be the removal of the watched directory,
+	// so dropping it can leave a stale checkout until the hourly janitor.
+	// A running family records one trailing pass, coalescing event bursts
+	// without losing their final state.
+	topologyNudgeMu sync.Mutex
+	topologyNudges  map[string]*topologyNudgeState
+	// probeReconcile is the reconciliation a probe asks for when a working
+	// copy has no composed view. nil routes to the lifecycle's own per-family
+	// path; tests substitute it to observe the debounce.
+	probeReconcile func(familyID string)
+	// probeActivateCheckout activates one checkout's coordinator when a probe
+	// selects a ready, automatic, unrouted working copy. nil in production →
+	// the real lifecycle call; a test substitutes it to observe the nudge.
+	probeActivateCheckout func(string) bool
 	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
 	// teardown hook reads it, and reading it under mu is what kept `daemon
 	// stop` queued behind a running track / reload / enrichment. One writer
@@ -102,6 +138,15 @@ type realController struct {
 	warmupSeconds atomic.Int64
 	enriched      atomic.Bool
 	enrichSeconds atomic.Int64
+
+	// lastAggregate is the mutex-guarded half of the last status pass that
+	// managed to take mu: the repo table, the workspace rollup and the rest
+	// of what the indexer registry decides. A status caller that cannot get
+	// mu inside its budget serves this instead of timing out — see Status.
+	//
+	// Atomic, deliberately not guarded by mu: the entire point of the cache
+	// is to be readable while a minutes-long track holds mu.
+	lastAggregate atomic.Pointer[statusAggregate]
 }
 
 // Track indexes a new repository and persists it to the global config.
@@ -117,57 +162,41 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 	if err != nil {
 		return nil, fmt.Errorf("resolve path: %w", err)
 	}
+	if c.lifecycle == nil {
+		return nil, fmt.Errorf("checkout lifecycle not initialized")
+	}
 	entry := config.RepoEntry{Path: absPath, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree}
-	result, err := c.multiIndexer.TrackRepoCtx(ctx, entry)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		// Already tracked — idempotent.
-		return json.RawMessage(fmt.Sprintf(`{"status":"already_tracked","path":%q}`, absPath)), nil
-	}
-	// TrackRepoCtx may have derived a worktree-instance prefix that the
-	// by-value entry above can't see — read the prefix it actually
-	// registered under for the watcher attach and the response.
-	prefix := result.RepoPrefix
-	if prefix == "" {
-		prefix = config.ResolvePrefix(entry)
-	}
 
 	// Project association from TrackParams.Project isn't wired yet — the
 	// config package doesn't expose an AddRepoToProject helper. Callers
 	// who need project scoping can edit ~/.gortex/config.yaml and
 	// run `gortex daemon reload`; track from the daemon-v1 surface just
 	// adds to the top-level repo list.
-
-	// Attach a watcher to the newly-tracked repo so file edits in it
-	// flow back into the graph live without a manual reload. Failures
-	// here are logged but don't fail the track — an indexed-but-
-	// unwatched repo is still queryable, just stale if edited.
-	if mw := c.watcher(); mw != nil && c.configManager != nil {
-		wcfg := c.configManager.GetRepoConfig(prefix).Watch
-		if err := mw.AddRepo(prefix, wcfg); err != nil {
-			c.logger.Warn("track: attach watcher failed",
-				zap.String("prefix", prefix), zap.Error(err))
-		}
+	//
+	// Everything else — the index, the catalog identity, the CLI tracking
+	// intent, the watcher attach, the config flush and the session
+	// invalidation — is the shared registration path, so this surface and
+	// the MCP tool leave the same state behind.
+	result, err := c.lifecycle.Register(ctx, entry, indexer.TrackSourceCLI)
+	if err != nil {
+		return nil, err
 	}
-
-	// Persist the config change. TrackRepoCtx mutates the in-memory
-	// GlobalConfig via AddRepo but does not flush to disk; without this
-	// Save the new repo vanishes on daemon restart. Mirrors Untrack.
-	if c.configManager != nil {
-		if err := c.configManager.Global().Save(); err != nil {
-			c.logger.Warn("track: save config failed", zap.Error(err))
-		}
+	if result.CatalogErr != nil {
+		c.logger.Warn("track: recording the checkout identity failed",
+			zap.String("path", absPath), zap.Error(result.CatalogErr))
+	}
+	if result.AlreadyTracked {
+		// Already tracked — idempotent.
+		return json.RawMessage(fmt.Sprintf(`{"status":"already_tracked","path":%q}`, absPath)), nil
 	}
 
 	return json.Marshal(map[string]any{
 		"status":     "tracked",
 		"path":       absPath,
-		"prefix":     prefix,
-		"file_count": result.FileCount,
-		"node_count": result.NodeCount,
-		"edge_count": result.EdgeCount,
+		"prefix":     result.Prefix,
+		"file_count": result.Index.FileCount,
+		"node_count": result.Index.NodeCount,
+		"edge_count": result.Index.EdgeCount,
 	})
 }
 
@@ -411,58 +440,106 @@ func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCoch
 
 // Untrack evicts a repo from the graph and drops it from config.
 // PathOrPrefix accepts either an absolute path or a repo prefix.
-func (c *realController) Untrack(_ context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
+//
+// What an untrack does is a property of the checkout's family, so the plan is
+// read before anything is torn down and the destructive ones are shown rather
+// than run. The control socket carries the same gate as the tool surface for
+// one reason: an older CLI binary against a newer daemon sends nothing but a
+// path, and a request it means as "drop this one checkout" must not become a
+// retirement of the family's whole automatic lane because the daemon learned
+// how to do that.
+func (c *realController) Untrack(ctx context.Context, p daemon.UntrackParams) (json.RawMessage, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.multiIndexer == nil {
 		return nil, fmt.Errorf("multi-repo indexer not initialized")
 	}
-
-	prefix := p.PathOrPrefix
-	// Resolve path → prefix if an absolute path was given. Absolutise (to
-	// Clean) and compare with fold-aware EqualPaths so a case-variant
-	// spelling of a tracked root on a case-insensitive filesystem still
-	// resolves to the right prefix.
-	if filepath.IsAbs(p.PathOrPrefix) {
-		abs, err := filepath.Abs(p.PathOrPrefix)
-		if err != nil {
-			abs = p.PathOrPrefix
-		}
-		for pfx, meta := range c.multiIndexer.AllMetadata() {
-			if pathkey.EqualPaths(meta.RootPath, abs) {
-				prefix = pfx
-				break
-			}
-		}
+	if c.lifecycle == nil {
+		return nil, fmt.Errorf("checkout lifecycle not initialized")
 	}
 
-	// Detach the watcher before evicting from the graph — otherwise a
-	// late fsnotify event could race the eviction and try to re-index
-	// files whose nodes are already gone.
-	if mw := c.watcher(); mw != nil {
-		if err := mw.RemoveRepo(prefix); err != nil {
-			c.logger.Debug("untrack: detach watcher",
-				zap.String("prefix", prefix), zap.Error(err))
-		}
+	preview, err := c.lifecycle.PreviewUntrack(ctx, p.PathOrPrefix)
+	if err != nil {
+		return nil, err
+	}
+	if !p.Confirm && destructiveUntrackPlan(preview.Plan) {
+		return json.Marshal(untrackPreviewPayload(preview))
 	}
 
-	nodesRemoved, edgesRemoved := c.multiIndexer.UntrackRepo(prefix)
-
-	// Persist the config change.
-	if c.configManager != nil {
-		_ = c.configManager.Global().RemoveRepo(prefix)
-		if err := c.configManager.Global().Save(); err != nil {
-			c.logger.Warn("untrack: save config failed", zap.Error(err))
-		}
+	// The lifecycle revokes every revocable tracking intent and runs the
+	// plan's saga — which detaches the watcher before evicting from the graph
+	// (a late fsnotify event must not race the eviction), then persists the
+	// config and invalidates every session.
+	result, err := c.lifecycle.ApplyUntrack(ctx, preview)
+	if err != nil {
+		return nil, err
 	}
 
-	return json.Marshal(map[string]any{
-		"status":        "untracked",
-		"prefix":        prefix,
-		"nodes_removed": nodesRemoved,
-		"edges_removed": edgesRemoved,
-	})
+	status := "untracked"
+	if result.Demoted {
+		status = "demoted"
+	}
+	payload := map[string]any{
+		"status":        status,
+		"plan":          string(result.Plan),
+		"prefix":        result.Prefix,
+		"nodes_removed": result.NodesRemoved,
+		"edges_removed": result.EdgesRemoved,
+	}
+	if len(result.Revoked) > 0 {
+		payload["revoked_intents"] = result.Revoked
+	}
+	if len(result.Dependents) > 0 {
+		payload["dependents"] = dependentDetails(result.Dependents)
+	}
+	return json.Marshal(payload)
+}
+
+// destructiveUntrackPlan reports whether a plan removes rows a caller has to be
+// asked about. A plan that keeps the checkout — an eviction of a repository
+// with no catalog identity, or a demotion into the family's automatic lane —
+// is the ordinary untrack and runs as it always has.
+func destructiveUntrackPlan(plan indexer.UntrackPlan) bool {
+	switch plan {
+	case indexer.UntrackPlanForget, indexer.UntrackPlanPrimaryClosure:
+		return true
+	default:
+		return false
+	}
+}
+
+// untrackPreviewPayload renders a plan that was shown instead of run.
+func untrackPreviewPayload(preview indexer.UntrackPreview) map[string]any {
+	payload := map[string]any{
+		"status":           "preview",
+		"plan":             string(preview.Plan),
+		"prefix":           preview.Prefix,
+		"is_primary":       preview.IsPrimary,
+		"confirm_required": true,
+		"detail": "nothing was written; repeat the untrack with confirm to run this plan, " +
+			"or use the untrack_repository / forget_checkout tools",
+	}
+	if preview.IsPrimary {
+		payload["sole_primary"] = preview.SolePrimary
+	}
+	if len(preview.Closure) > 0 {
+		payload["closure"] = dependentDetails(preview.Closure)
+	}
+	if len(preview.Preserved) > 0 {
+		payload["preserved"] = dependentDetails(preview.Preserved)
+	}
+	return payload
+}
+
+// dependentDetails flattens closure rows to the one-line statements the control
+// socket has always carried.
+func dependentDetails(dependents []reconcile.Dependent) []string {
+	out := make([]string, 0, len(dependents))
+	for _, dep := range dependents {
+		out = append(out, dep.Detail)
+	}
+	return out
 }
 
 // Reload re-reads the global config, indexes new repos that were added
@@ -531,64 +608,27 @@ func (c *realController) Reload(ctx context.Context) (json.RawMessage, error) {
 	if err := c.configManager.Reload(); err != nil {
 		return nil, fmt.Errorf("reload config: %w", err)
 	}
-
-	// Re-read every already-tracked repo's `.gortex.yaml` and push the
-	// refreshed excludes into its live indexer. The tracked-repo diff
-	// below keeps such repos by root path and never re-tracks them, so
-	// without this an edit to a per-repo config could not reach a running
-	// daemon at all: reload was global-config-only in practice.
-	refreshed := c.multiIndexer.RefreshRepoConfigs()
-
-	var added, removed int
-
-	// Match configured entries to currently-tracked instances by ROOT
-	// PATH, not by a recomputed prefix. A worktree tracked as an
-	// independent instance registers under a derived `<base>@<workspace>`
-	// prefix, so keying the diff on config.ResolvePrefix(entry) (the bare
-	// basename) would fail to recognise it as wanted and untrack it on
-	// every reload. The root path is the stable identity of a checkout.
-	trackedByRoot := make(map[string]string) // absolute RootPath → prefix
-	for prefix, meta := range c.multiIndexer.AllMetadata() {
-		if meta != nil {
-			trackedByRoot[meta.RootPath] = prefix
-		}
+	if c.lifecycle == nil {
+		return nil, fmt.Errorf("checkout lifecycle not initialized")
 	}
 
-	wantedPrefixes := make(map[string]bool)
-	for _, entry := range c.configManager.Global().Repos {
-		abs, err := filepath.Abs(entry.Path)
-		if err != nil {
-			abs = entry.Path
-		}
-		if prefix, ok := trackedByRoot[abs]; ok {
-			// Already tracked (under whatever prefix it registered) — keep it.
-			wantedPrefixes[prefix] = true
-			continue
-		}
-		res, trackErr := c.multiIndexer.TrackRepoCtx(ctx, entry)
-		if trackErr != nil {
-			c.logger.Warn("reload: track failed",
-				zap.String("path", entry.Path), zap.Error(trackErr))
-			continue
-		}
-		added++
-		if res != nil && res.RepoPrefix != "" {
-			wantedPrefixes[res.RepoPrefix] = true
-		}
-	}
-
-	for prefix := range c.multiIndexer.AllMetadata() {
-		if wantedPrefixes[prefix] {
-			continue
-		}
-		c.multiIndexer.UntrackRepo(prefix)
-		removed++
+	// The diff itself is unchanged — configured entries are matched to
+	// tracked instances by root path, never by a recomputed prefix — but both
+	// halves now run through the lifecycle: an added entry gets the same
+	// identity, watcher and invalidation an explicit track would give it, and
+	// a removed one goes through the reconciler's retirement rule instead of
+	// a direct eviction, so a config edit can no longer delete a corpus that
+	// nothing else can serve.
+	result, err := c.lifecycle.ApplyReload(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	return json.Marshal(map[string]any{
-		"added":     added,
-		"removed":   removed,
-		"refreshed": refreshed,
+		"added":     result.Added,
+		"removed":   result.Removed,
+		"pending":   result.Pending,
+		"refreshed": result.Refreshed,
 	})
 }
 
@@ -783,7 +823,7 @@ func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse
 				zap.Bool("backend_can_recount", ok),
 				zap.Bool("enriched", c.enriched.Load()))
 		}
-		return c.Status(ctx)
+		return c.status(ctx, true)
 	}
 
 	scanned, err := scanner.ScanRepoMemoryEstimates(ctx)
@@ -800,10 +840,22 @@ func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse
 			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
 		}
 	}
-	return c.Status(ctx)
+	return c.status(ctx, true)
 }
 
+// Status answers within the caller's budget even while the controller mutex
+// is held. See status: the aggregate half may be served from the last
+// successful pass, marked as such on the response.
 func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, error) {
+	return c.status(ctx, false)
+}
+
+// status assembles a status response. waitForAggregate distinguishes the two
+// contracts: the routine pass (false) gives the controller mutex a slice of
+// the budget and falls back to the last aggregate it computed, while the
+// exact pass (true) waits for the mutex — a caller that paid for a full
+// recount asked for measured numbers, and a cached table is not that.
+func (c *realController) status(ctx context.Context, waitForAggregate bool) (daemon.StatusResponse, error) {
 	// Bail before doing any work if the caller is already gone. Status sits
 	// on the critical path of `daemon stop`, `gortex call`, and the agent
 	// hooks, all of which now bound the round trip — once their budget has
@@ -856,6 +908,11 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 	// wedge track / untrack / reload behind a dead NFS handle.
 	configRepos, repoMissing := c.trackedRepoLiveness()
 
+	// The view census is catalog listings bounded by the number of families,
+	// graphs and generations, so it belongs in the slow half rather than
+	// under the mutex the coordinators contend for.
+	views := c.collectViewsStatus(ctx)
+
 	// Everything above is the slow half and c.mu below is the contended half.
 	// Re-check between them: a caller whose budget expired during the scans
 	// must not go on to queue behind a mutex held by a minutes-long track.
@@ -863,8 +920,232 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		return daemon.StatusResponse{}, err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	agg, cached, err := c.statusAggregateFor(ctx, waitForAggregate, statusAggregateInput{
+		enriched:        enriched,
+		memEstimates:    memEstimates,
+		wholeStoreNodes: wholeStoreNodes,
+		wholeStoreEdges: wholeStoreEdges,
+		repoMissing:     repoMissing,
+	})
+	if err != nil {
+		return daemon.StatusResponse{}, err
+	}
+
+	// Reconcile the live indexer registry against the tracked-repo registry
+	// in the global config, so `daemon status` and `gortex repos` report one
+	// inventory instead of two that can drift apart (#312). A repo whose
+	// directory was deleted while the daemon was down fails startup indexing
+	// and never reaches AllMetadata — it would silently vanish from this
+	// response while `gortex repos`, which reads the config, kept listing it.
+	// Synthesised rows carry zero counts and are appended AFTER the workspace
+	// rollup, which summarises indexed content only.
+	//
+	// Both inputs were read without the controller mutex, so this half still
+	// answers on a pass that had to serve a cached aggregate: a daemon in its
+	// first track reports the repos it is about to index rather than none.
+	// The copy keeps the cached slice immutable — it is shared by every
+	// subsequent busy pass.
+	tracked := append([]daemon.TrackedRepoStatus(nil), agg.tracked...)
+	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked)...)
+
+	// mem was sampled before the mutex was taken — see the note at the top
+	// of status.
+
+	resp := daemon.StatusResponse{
+		TrackedRepos:   tracked,
+		MemoryBytes:    mem.Alloc,
+		SearchBackend:  agg.searchBackend,
+		TrigramCache:   trigramCacheForResponse(),
+		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
+		Runtime: daemon.RuntimeStats{
+			Alloc:        mem.Alloc,
+			Sys:          mem.Sys,
+			HeapInuse:    mem.HeapInuse,
+			HeapIdle:     mem.HeapIdle,
+			HeapReleased: mem.HeapReleased,
+			StackInuse:   mem.StackInuse,
+			NumGC:        mem.NumGC,
+			NumGoroutine: runtime.NumGoroutine(),
+		},
+		PProfAddr:          daemonPProfAddr(),
+		Ready:              c.ready.Load(),
+		WarmupSeconds:      c.warmupSeconds.Load(),
+		EnrichmentComplete: enriched,
+		EnrichSeconds:      c.enrichSeconds.Load(),
+		Workspaces:         agg.workspaces,
+		ConfiguredServers:  agg.configuredServers,
+		LocalServerSlug:    agg.localServerSlug,
+		LSPRouter:          agg.lspRouter,
+		Enrichment:         agg.enrichment,
+		Views:              views,
+		ToolPreset:         agg.toolPreset,
+		ToolPresetMode:     agg.toolPresetMode,
+		LearnedTools:       agg.learnedTools,
+	}
+	if cached {
+		// Say which half is a snapshot. Without the marker a stale repo
+		// table is indistinguishable from a current one, and an empty one
+		// reads as "nothing is tracked" rather than "not computed yet".
+		resp.AggregateBusy = true
+		if !agg.takenAt.IsZero() {
+			resp.AggregateCachedUnix = agg.takenAt.Unix()
+		}
+	}
+	return resp, nil
+	// MCPSessions is populated by the daemon Server (it owns the
+	// SessionRegistry — the controller doesn't have a back-pointer).
+	// See internal/daemon/server.go around the ControlStatus handler.
+}
+
+// statusAggregate is the half of a status response that only the controller
+// mutex can produce: the per-repo table and everything derived from the
+// indexer registry behind it. Status caches the last one it managed to
+// compute, so a caller arriving while a track holds the mutex gets that
+// instead of a timeout.
+//
+// Treat a stored aggregate as immutable — every busy pass shares the one
+// pointer, so a reader that appends to its slices corrupts the next answer.
+type statusAggregate struct {
+	takenAt           time.Time
+	tracked           []daemon.TrackedRepoStatus
+	workspaces        []daemon.WorkspaceSummary
+	searchBackend     daemon.SearchBackendStats
+	configuredServers []daemon.ConfiguredServerStatus
+	localServerSlug   string
+	lspRouter         *daemon.LSPRouterStatus
+	enrichment        *daemon.EnrichmentProgress
+	toolPreset        string
+	toolPresetMode    string
+	learnedTools      int
+}
+
+// statusAggregateInput carries the lock-free half of the computation into the
+// aggregate pass: the corpus-wide estimates and the repo-path liveness map are
+// deliberately gathered before the mutex is taken (see status).
+type statusAggregateInput struct {
+	enriched        bool
+	memEstimates    map[string]graph.RepoMemoryEstimate
+	wholeStoreNodes int
+	wholeStoreEdges int
+	repoMissing     map[string]bool
+}
+
+// statusLockPoll is how often a status caller retries the controller mutex
+// while it waits for it. sync.Mutex has no context-aware acquire, so the wait
+// is a poll: fine-grained enough to pick the mutex up as soon as a track
+// releases it, coarse enough to cost nothing over a whole budget.
+const statusLockPoll = 5 * time.Millisecond
+
+// statusLockWait caps how long the routine status pass waits for the mutex
+// before serving its last aggregate. A mutex that has not come free in this
+// long is held by something long — a track, a reload, an enrichment — and
+// every further second of waiting trades the caller's whole budget for a
+// shrinking chance at a fresh repo table.
+const statusLockWait = 2 * time.Second
+
+// statusLockReserve is the slice of the caller's remaining budget kept back
+// from the wait. The daemon abandons a control handler the instant its budget
+// expires (Server.handleControlBounded), so a wait that runs to the deadline
+// produces exactly the timeout it was meant to prevent.
+const statusLockReserve = 250 * time.Millisecond
+
+// statusAggregateFor produces the mutex-guarded half of a status response,
+// reporting whether it had to be served from the last successful pass.
+//
+// wait is the StatusExact contract: hold out for the mutex until the caller's
+// context ends, and report that expiry rather than substituting a snapshot.
+func (c *realController) statusAggregateFor(ctx context.Context, wait bool, in statusAggregateInput) (*statusAggregate, bool, error) {
+	if wait {
+		if err := lockContext(ctx, &c.mu, 0); err != nil {
+			return nil, false, err
+		}
+		return c.storeStatusAggregate(in), false, nil
+	}
+
+	budget := statusLockWait
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline) - statusLockReserve; remaining < budget {
+			budget = remaining
+		}
+	}
+	switch {
+	case budget <= 0:
+		// Not enough budget left to wait in: the answer has to be assembled
+		// now. One attempt still catches a free mutex.
+		if c.mu.TryLock() {
+			return c.storeStatusAggregate(in), false, nil
+		}
+	default:
+		if err := lockContext(ctx, &c.mu, budget); err == nil {
+			return c.storeStatusAggregate(in), false, nil
+		}
+	}
+
+	// The mutex is held by a long operation. Everything else in the response
+	// is live; this half is the last one that was computable. A daemon that
+	// has never finished a pass has none, and reports an empty aggregate
+	// under the same marker — status must degrade, never fail, or the one
+	// call that explains a busy daemon is the one the busy daemon eats.
+	if agg := c.lastAggregate.Load(); agg != nil {
+		return agg, true, nil
+	}
+	return &statusAggregate{}, true, nil
+}
+
+// storeStatusAggregate computes the aggregate under the already-held mutex,
+// publishes it as the new last-good snapshot, and releases the mutex.
+func (c *realController) storeStatusAggregate(in statusAggregateInput) *statusAggregate {
+	agg := c.buildStatusAggregate(in)
+	// Publish before releasing, so mu orders the stores: a pass descheduled
+	// between building and publishing cannot overwrite a newer snapshot with
+	// its own older one.
+	c.lastAggregate.Store(agg)
+	c.mu.Unlock()
+	return agg
+}
+
+// lockContext acquires mu without letting the caller's budget expire in the
+// queue. budget caps the wait when positive; the context bounds it either way.
+//
+// sync.Mutex cannot be acquired against a context, so this polls TryLock. A
+// caller with nothing that can end its wait blocks outright instead: waiting
+// is what it asked for, and it is cheaper than spinning for the length of a
+// track.
+func lockContext(ctx context.Context, mu *sync.Mutex, budget time.Duration) error {
+	if mu.TryLock() {
+		return nil
+	}
+	if ctx.Done() == nil && budget <= 0 {
+		mu.Lock()
+		return nil
+	}
+	if budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+	ticker := time.NewTicker(statusLockPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if mu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+// buildStatusAggregate assembles the per-repo table and its rollups. Callers
+// must hold c.mu: it reads the indexer registry that track / untrack / reload
+// mutate.
+func (c *realController) buildStatusAggregate(in statusAggregateInput) *statusAggregate {
+	enriched := in.enriched
+	memEstimates := in.memEstimates
+	repoMissing := in.repoMissing
+	wholeStoreNodes, wholeStoreEdges := in.wholeStoreNodes, in.wholeStoreEdges
 
 	var (
 		tracked                  []daemon.TrackedRepoStatus
@@ -1057,53 +1338,20 @@ func (c *realController) Status(ctx context.Context) (daemon.StatusResponse, err
 		workspaces = append(workspaces, *wsAgg[k])
 	}
 
-	// Reconcile the live indexer registry against the tracked-repo registry
-	// in the global config, so `daemon status` and `gortex repos` report one
-	// inventory instead of two that can drift apart (#312). A repo whose
-	// directory was deleted while the daemon was down fails startup indexing
-	// and never reaches AllMetadata — it would silently vanish from this
-	// response while `gortex repos`, which reads the config, kept listing it.
-	// Synthesised rows carry zero counts and are appended AFTER the workspace
-	// rollup above, which summarises indexed content only.
-	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, tracked)...)
-
-	// mem was sampled before the mutex was taken — see the note at the top
-	// of Status.
-
-	resp := daemon.StatusResponse{
-		TrackedRepos:   tracked,
-		MemoryBytes:    mem.Alloc,
-		SearchBackend:  searchBackendForResponse,
-		TrigramCache:   trigramCacheForResponse(),
-		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
-		Runtime: daemon.RuntimeStats{
-			Alloc:        mem.Alloc,
-			Sys:          mem.Sys,
-			HeapInuse:    mem.HeapInuse,
-			HeapIdle:     mem.HeapIdle,
-			HeapReleased: mem.HeapReleased,
-			StackInuse:   mem.StackInuse,
-			NumGC:        mem.NumGC,
-			NumGoroutine: runtime.NumGoroutine(),
-		},
-		PProfAddr:          daemonPProfAddr(),
-		Ready:              c.ready.Load(),
-		WarmupSeconds:      c.warmupSeconds.Load(),
-		EnrichmentComplete: enriched,
-		EnrichSeconds:      c.enrichSeconds.Load(),
-		Workspaces:         workspaces,
-		ConfiguredServers:  c.collectConfiguredServers(),
-		LocalServerSlug:    c.localServerSlug(),
-		LSPRouter:          c.collectLSPRouterStatus(),
-		Enrichment:         c.collectEnrichmentProgress(),
+	agg := &statusAggregate{
+		takenAt:           time.Now(),
+		tracked:           tracked,
+		workspaces:        workspaces,
+		searchBackend:     searchBackendForResponse,
+		configuredServers: c.collectConfiguredServers(),
+		localServerSlug:   c.localServerSlug(),
+		lspRouter:         c.collectLSPRouterStatus(),
+		enrichment:        c.collectEnrichmentProgress(),
 	}
 	if c.toolSurface != nil {
-		resp.ToolPreset, resp.ToolPresetMode, resp.LearnedTools = c.toolSurface()
+		agg.toolPreset, agg.toolPresetMode, agg.learnedTools = c.toolSurface()
 	}
-	return resp, nil
-	// MCPSessions is populated by the daemon Server (it owns the
-	// SessionRegistry — the controller doesn't have a back-pointer).
-	// See internal/daemon/server.go around the ControlStatus handler.
+	return agg
 }
 
 // trackedRepoLiveness snapshots the configured repo registry and stats
@@ -1255,6 +1503,38 @@ func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
 	return out
 }
 
+// collectViewsStatus reflects the checkout-view lifecycle census into the
+// status payload.
+//
+// It runs before the controller mutex is taken, like every other listing
+// Status assembles, and it is skipped outright once the caller's budget has
+// expired — the block is a report, and a status call that is already out of
+// time should not spend its last milliseconds on one. A catalog that cannot
+// be read yields nil for the same reason: the rest of the answer is still
+// true, and an omitted block reads as "not available" while a zeroed one
+// would read as "nothing exists".
+func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsStatus {
+	if c == nil || c.lifecycle == nil || ctx.Err() != nil {
+		return nil
+	}
+	health, err := c.lifecycle.ViewsHealth(ctx)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Debug("daemon: view lifecycle census unavailable", zap.Error(err))
+		}
+		return nil
+	}
+	return &daemon.ViewsStatus{
+		Families:     health.Families,
+		Checkouts:    health.Checkouts,
+		Coordinators: health.Coordinators,
+		Generations:  health.Generations,
+		Leases:       health.Leases,
+		RefViews:     health.RefViews,
+		Counters:     health.Counters,
+	}
+}
+
 // collectEnrichmentProgress reflects the semantic manager's per-(repo,
 // provider) enrichment statuses into the compact summary the daemon
 // status line needs. Returns nil when no semantic manager is wired, or
@@ -1342,14 +1622,36 @@ const (
 // graph, so on a multi-repo daemon this probe queued behind the indexer's
 // shard writers and blew past the hook's 200ms budget. The hook then logged
 // probed_miss / timed_out and never once produced a hit.
-func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
+//
+// Path scopes the probe to the graph that path reads through. Without one the
+// base corpus answers and the response carries no view block at all, which is
+// what every client that predates routed views sends and still receives.
+func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
 	// No mu: graph is write-once at construction (see the field comment), and
 	// this is the probe path a hook calls on a sub-second budget. Taking mu
 	// here is what made it wait out an in-flight reindex.
-	g := c.graph
+	var g graph.Reader = c.graph
 
 	if g == nil || p.Query == "" {
 		return daemon.SearchSymbolsResult{}, nil
+	}
+
+	// The lease is held for exactly as long as the answer is being built: the
+	// hits are copied out of the composed reader below, so nothing the caller
+	// receives outlives the generations that produced it.
+	view := c.resolveProbeView(ctx, p.Path)
+	defer view.release()
+	if !view.servable {
+		// A registered working copy with no composed view. Reporting the
+		// primary's symbols would cite another working copy's code as
+		// evidence about this one.
+		return daemon.SearchSymbolsResult{Hits: []daemon.SymbolHit{}, View: view.answer}, nil
+	}
+	if view.reader != nil {
+		g = view.reader
+	}
+	if p.Repo == "" {
+		p.Repo = view.searchScope
 	}
 
 	limit := p.Limit
@@ -1374,7 +1676,7 @@ func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbols
 		}
 	}
 	if len(hits) > 0 {
-		return daemon.SearchSymbolsResult{Hits: hits}, nil
+		return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
 	}
 
 	// Substring fallback, for patterns that name part of a symbol. The name
@@ -1416,7 +1718,7 @@ func (c *realController) SearchSymbols(_ context.Context, p daemon.SearchSymbols
 		}
 		fetch *= 4
 	}
-	return daemon.SearchSymbolsResult{Hits: hits}, nil
+	return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
 }
 
 // probeSymbolCandidate reports whether n can answer a symbol probe. File and
@@ -1446,12 +1748,37 @@ func probeSymbolHit(n *graph.Node) daemon.SymbolHit {
 }
 
 // AttachWatcher is called by warmup to hand over the MultiWatcher once
-// it has been initialized. Until this is called, realController.Track
-// skips the per-repo watcher attach — a newly-tracked repo gets its
-// watcher when the warmup-constructed MultiWatcher iterates
-// mi.AllMetadata() at startup.
+// it has been initialized. Until this is called, the lifecycle skips the
+// per-repo watcher attach — a newly-tracked repo gets its watcher when the
+// warmup-constructed MultiWatcher iterates mi.AllMetadata() at startup.
+//
+// The lifecycle reads the watcher through this same pointer, so every
+// surface's attach and detach hit the one live watcher.
 func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 	c.multiWatcher.Store(mw)
+	c.lifecycle.SetWatcherSource(func() indexer.RepoWatcher {
+		// A typed nil in an interface is not nil; return the untyped one so
+		// the lifecycle's "is there a watcher yet" test stays honest.
+		if live := c.watcher(); live != nil {
+			return live
+		}
+		return nil
+	})
+	if mw == nil {
+		return
+	}
+	mw.OnWorktreeChangeContext(func(dispatchCtx context.Context, repoPrefix, _ string) {
+		resolveCtx, cancel := context.WithTimeout(dispatchCtx, 10*time.Second)
+		familyID, err := c.lifecycle.ResolveFamilyID(resolveCtx, repoPrefix)
+		cancel()
+		if err != nil {
+			c.logger.Debug("worktree topology event could not resolve family",
+				zap.String("repo", repoPrefix), zap.Error(err))
+			return
+		}
+		retainedCtx, release := mw.RetainTopologyDispatch(dispatchCtx)
+		c.nudgeFamilyTopologyRequest(retainedCtx, familyID, release)
+	})
 }
 
 // watcher reads the attached MultiWatcher without touching the coarse mutex.

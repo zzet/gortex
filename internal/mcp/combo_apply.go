@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -26,7 +27,7 @@ import (
 // time honestly between the batched edge fetch (prepare) and the
 // in-process scoring loop (signals). Zero durations when there's no
 // work to do.
-func applyRerankBoostsTimed(s *Server, nodes []*graph.Node, query string, rerankCtx *rerank.Context, lastResults *[]*rerank.Candidate) (result []*graph.Node, prepare time.Duration, signals time.Duration) {
+func applyRerankBoostsTimed(ctx context.Context, s *Server, nodes []*graph.Node, query string, rerankCtx *rerank.Context, lastResults *[]*rerank.Candidate) (result []*graph.Node, prepare time.Duration, signals time.Duration) {
 	if len(nodes) < 2 || s == nil || s.engine == nil {
 		return nodes, 0, 0
 	}
@@ -44,7 +45,9 @@ func applyRerankBoostsTimed(s *Server, nodes []*graph.Node, query string, rerank
 		rerankCtx = &rerank.Context{}
 	}
 	if rerankCtx.Graph == nil {
-		rerankCtx.Graph = s.graph
+		// Same reader buildRerankContext would have set, so a Context the
+		// caller left ungraphed still scores against the request's view.
+		rerankCtx.Graph = s.readerFor(ctx)
 	}
 
 	// Phase 1: prepare — the batched in/out edge fetch + scratch fields.

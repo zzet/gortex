@@ -35,7 +35,7 @@ func edgeKindIn(k graph.EdgeKind, set []graph.EdgeKind) bool {
 
 // topicTargets returns the topic/event nodes a symbol links to via the given
 // edge kinds.
-func topicTargets(g graph.Store, id string, kinds []graph.EdgeKind) []*graph.Node {
+func topicTargets(g graph.Reader, id string, kinds []graph.EdgeKind) []*graph.Node {
 	var out []*graph.Node
 	for _, e := range g.GetOutEdges(id) {
 		if !edgeKindIn(e.Kind, kinds) {
@@ -49,7 +49,7 @@ func topicTargets(g graph.Store, id string, kinds []graph.EdgeKind) []*graph.Nod
 }
 
 // topicHasConsumer reports whether any symbol consumes the topic node.
-func topicHasConsumer(g graph.Store, topicID string) bool {
+func topicHasConsumer(g graph.Reader, topicID string) bool {
 	for _, e := range g.GetInEdges(topicID) {
 		if edgeKindIn(e.Kind, consumeEdges) {
 			return true
@@ -58,7 +58,7 @@ func topicHasConsumer(g graph.Store, topicID string) bool {
 	return false
 }
 
-func (f EventBoundaryFamily) Evaluate(g graph.Store, changedSet []string) []GuardViolation {
+func (f EventBoundaryFamily) Evaluate(g graph.Reader, changedSet []string) []GuardViolation {
 	if g == nil || len(f.Rules) == 0 {
 		return nil
 	}

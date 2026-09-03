@@ -10,21 +10,21 @@ import (
 
 // collectHookGuidance runs every hook / adapter guidance emitter with inputs
 // that force it to render, and returns the resulting text keyed by a label so a
-// failure names the offending template. The seam vars (fileIndexScopeFn,
+// failure names the offending template. The seam vars (fileIndexedFn,
 // daemonReachableFn) are stubbed so the deny paths fire without a daemon.
 func collectHookGuidance(t *testing.T) map[string]string {
 	t.Helper()
 
-	prevIndexed := fileIndexScopeFn
+	prevIndexed := fileIndexedFn
 	prevReach := daemonReachableFn
 	prevScope := scopeTrackedFn
 	t.Cleanup(func() {
-		fileIndexScopeFn = prevIndexed
+		fileIndexedFn = prevIndexed
 		daemonReachableFn = prevReach
 		scopeTrackedFn = prevScope
 	})
 	daemonReachableFn = func() bool { return true }
-	scopeTrackedFn = func(string, string) (bool, bool) { return true, true }
+	scopeTrackedFn = func(string, string) bool { return true }
 
 	out := map[string]string{}
 
@@ -42,10 +42,8 @@ func collectHookGuidance(t *testing.T) map[string]string {
 	out["rulePreamble"] = rulePreamble()
 	out["consultUnlockReason"] = consultUnlockReason("some deny reason")
 
-	// Indexed-source deny paths: force fileIndexScopeFn to report "indexed".
-	fileIndexScopeFn = func(_, _ string) fileIndexStatus {
-		return fileIndexStatus{Indexed: true, Count: 7, ProbeOK: true}
-	}
+	// Indexed-source deny paths: force fileIndexedFn to report "indexed".
+	fileIndexedFn = func(_, _ string) (bool, int) { return true, 7 }
 	out["enrichRead_deny"] = enrichRead(map[string]any{"file_path": "pkg/a.go"}, "/repo").reason
 	out["enrichBash_readSource_deny"] = enrichBash(map[string]any{"command": "cat pkg/a.go"}, "/repo").reason
 	t.Setenv(editBlockingEnvVar, "1")
@@ -56,7 +54,7 @@ func collectHookGuidance(t *testing.T) map[string]string {
 	out["enrichGlob_deny"] = enrichGlob(map[string]any{"pattern": "**/*.go"}).reason
 
 	// Not-indexed soft-guidance paths.
-	fileIndexScopeFn = func(_, _ string) fileIndexStatus { return fileIndexStatus{ProbeOK: true} }
+	fileIndexedFn = func(_, _ string) (bool, int) { return false, 0 }
 	out["enrichRead_soft"] = enrichRead(map[string]any{"file_path": "pkg/a.go"}, "/repo").context
 	out["enrichBash_readSource_soft"] = enrichBash(map[string]any{"command": "cat pkg/a.go"}, "/repo").context
 

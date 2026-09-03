@@ -54,6 +54,7 @@ func (s *Server) handleAnalyzeRole(ctx context.Context, req mcp.CallToolRequest)
 	rows := make([]roleRow, 0, len(scoped))
 	tally := map[string]int{}
 
+	reader := s.readerFor(ctx)
 	for _, n := range scoped {
 		if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 			continue
@@ -61,9 +62,9 @@ func (s *Server) handleAnalyzeRole(ctx context.Context, req mcp.CallToolRequest)
 		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		fanIn := countCallEdges(s.graph.GetInEdges(n.ID))
-		fanOut := countCallEdges(s.graph.GetOutEdges(n.ID))
-		role := classifyRole(n, fanIn, fanOut, s.graph, nodeToComm)
+		fanIn := countCallEdges(reader.GetInEdges(n.ID))
+		fanOut := countCallEdges(reader.GetOutEdges(n.ID))
+		role := classifyRole(n, fanIn, fanOut, reader, nodeToComm)
 		tally[role]++
 		if roleFilter != "" && role != roleFilter {
 			continue
@@ -104,7 +105,7 @@ func (s *Server) handleAnalyzeRole(ctx context.Context, req mcp.CallToolRequest)
 // the first matching label. Rules are deliberately conservative;
 // false-negatives (defaulting to "core") are preferable to noisy
 // false-positives on a label that pretends to be authoritative.
-func classifyRole(n *graph.Node, fanIn, fanOut int, g graph.Store, nodeToComm map[string]string) string {
+func classifyRole(n *graph.Node, fanIn, fanOut int, g graph.Reader, nodeToComm map[string]string) string {
 	switch {
 	case fanIn == 0 && fanOut == 0:
 		return "dead"

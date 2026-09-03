@@ -72,8 +72,11 @@ func (s *Server) handleAnalyzeChannelOps(ctx context.Context, req mcp.CallToolRe
 	}
 
 	// One scan over Sends+Recvs only — replaces the legacy AllEdges()
-	// walk that pulled every edge over cgo just to keep two kinds.
-	for e := range edgesByKinds(s.graph, graph.EdgeSends, graph.EdgeRecvs) {
+	// walk that pulled every edge over cgo just to keep two kinds. The
+	// reader is hoisted so an overlay-active request walks the pushed
+	// buffers for both the scan and the node lookups below.
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeSends, graph.EdgeRecvs) {
 		if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 			continue
 		}
@@ -100,19 +103,19 @@ func (s *Server) handleAnalyzeChannelOps(ctx context.Context, req mcp.CallToolRe
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*channelRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Channel)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.Channel)) {
 				continue
 			}
 			senders := make([]string, 0, len(r.Senders))
 			for _, id := range r.Senders {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					senders = append(senders, id)
 				}
 			}
 			r.Senders = senders
 			receivers := make([]string, 0, len(r.Receivers))
 			for _, id := range r.Receivers {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					receivers = append(receivers, id)
 				}
 			}
@@ -186,7 +189,8 @@ func (s *Server) handleAnalyzeGoroutineSpawns(ctx context.Context, req mcp.CallT
 	}
 	byTarget := map[string]*spawnRow{}
 
-	for e := range edgesByKinds(s.graph, graph.EdgeSpawns) {
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeSpawns) {
 		mode, _ := e.Meta["mode"].(string)
 		key := e.To + "|" + mode
 		row, ok := byTarget[key]
@@ -201,7 +205,7 @@ func (s *Server) handleAnalyzeGoroutineSpawns(ctx context.Context, req mcp.CallT
 	rows := make([]*spawnRow, 0, len(byTarget))
 	for _, r := range byTarget {
 		sort.Strings(r.Spawners)
-		if ann := graph.ClassifyConcurrency(s.graph, r.Target); ann.Any() {
+		if ann := graph.ClassifyConcurrency(g, r.Target); ann.Any() {
 			a := ann
 			r.Concurrency = &a
 		}
@@ -212,12 +216,12 @@ func (s *Server) handleAnalyzeGoroutineSpawns(ctx context.Context, req mcp.CallT
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*spawnRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Target)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.Target)) {
 				continue
 			}
 			spawners := make([]string, 0, len(r.Spawners))
 			for _, id := range r.Spawners {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					spawners = append(spawners, id)
 				}
 			}
@@ -317,7 +321,8 @@ func (s *Server) handleAnalyzeFieldWriters(ctx context.Context, req mcp.CallTool
 	}
 	byField := map[string]*writerRow{}
 
-	for e := range edgesByKinds(s.graph, graph.EdgeWrites) {
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeWrites) {
 		if idFilter != "" && e.To != idFilter {
 			continue
 		}
@@ -327,7 +332,7 @@ func (s *Server) handleAnalyzeFieldWriters(ctx context.Context, req mcp.CallTool
 		// rewrites the To, so any unresolved edges left at query
 		// time are a different problem.
 		if idFilter == "" {
-			target := s.graph.GetNode(e.To)
+			target := g.GetNode(e.To)
 			if target == nil || target.Kind != graph.KindField {
 				continue
 			}
@@ -351,12 +356,12 @@ func (s *Server) handleAnalyzeFieldWriters(ctx context.Context, req mcp.CallTool
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*writerRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Field)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.Field)) {
 				continue
 			}
 			writers := make([]string, 0, len(r.Writers))
 			for _, id := range r.Writers {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					writers = append(writers, id)
 				}
 			}
@@ -436,7 +441,8 @@ func (s *Server) handleAnalyzeIndirectMutations(ctx context.Context, req mcp.Cal
 	}
 	byField := map[string]*fieldRow{}
 
-	for e := range edgesByKinds(s.graph, graph.EdgeAccessesField) {
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeAccessesField) {
 		if e.Meta == nil {
 			continue
 		}
@@ -467,12 +473,12 @@ func (s *Server) handleAnalyzeIndirectMutations(ctx context.Context, req mcp.Cal
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*fieldRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Field)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.Field)) {
 				continue
 			}
 			mutators := make([]mutator, 0, len(r.Mutators))
 			for _, m := range r.Mutators {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(m.Function)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(m.Function)) {
 					mutators = append(mutators, m)
 				}
 			}
@@ -520,14 +526,15 @@ func (s *Server) handleAnalyzeSpeculative(ctx context.Context, req mcp.CallToolR
 	byShape := map[string]*shapeRow{}
 	total := 0
 	scoped := s.scopeFiltersActive(ctx)
-	for e := range edgesByKinds(s.graph, graph.EdgeCalls) {
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeCalls) {
 		if !e.IsSpeculative() {
 			continue
 		}
 		// Scope filter: a speculative edge is a from->to peer pair; drop it
 		// unless both endpoints are visible. Gating the loop recomputes
 		// Edges, total, and Samples together. No-op when unbound.
-		if scoped && (!s.analyzeNodeVisible(ctx, s.graph.GetNode(e.From)) || !s.analyzeNodeVisible(ctx, s.graph.GetNode(e.To))) {
+		if scoped && (!s.analyzeNodeVisible(ctx, g.GetNode(e.From)) || !s.analyzeNodeVisible(ctx, g.GetNode(e.To))) {
 			continue
 		}
 		total++
@@ -590,12 +597,13 @@ func (s *Server) handleAnalyzeRefFacts(ctx context.Context, req mcp.CallToolRequ
 		File    string `json:"file,omitempty"`
 	}
 
+	g := s.readerFor(ctx)
 	var nodes []*graph.Node
 	if fileFilter != "" {
-		nodes = s.graph.GetFileNodes(fileFilter)
+		nodes = g.GetFileNodes(fileFilter)
 	} else {
 		for _, k := range []graph.NodeKind{graph.KindFunction, graph.KindMethod} {
-			for n := range s.graph.NodesByKind(k) {
+			for n := range g.NodesByKind(k) {
 				nodes = append(nodes, n)
 			}
 		}
@@ -613,7 +621,7 @@ func (s *Server) handleAnalyzeRefFacts(ctx context.Context, req mcp.CallToolRequ
 		if scoped && !s.analyzeNodeVisible(ctx, n) {
 			continue
 		}
-		for _, e := range s.graph.GetOutEdges(n.ID) {
+		for _, e := range g.GetOutEdges(n.ID) {
 			if e == nil || !graph.IsResolvableRefEdge(e.Kind) {
 				continue
 			}
@@ -622,11 +630,11 @@ func (s *Server) handleAnalyzeRefFacts(ctx context.Context, req mcp.CallToolRequ
 			}
 			// Scope filter: also drop facts whose resolved target is out
 			// of scope, so no cross-workspace target id leaks into a row.
-			if scoped && !s.analyzeNodeVisible(ctx, s.graph.GetNode(e.To)) {
+			if scoped && !s.analyzeNodeVisible(ctx, g.GetNode(e.To)) {
 				continue
 			}
 			refName := ""
-			if t := s.graph.GetNode(e.To); t != nil {
+			if t := g.GetNode(e.To); t != nil {
 				refName = t.Name
 			}
 			origin := e.Origin
@@ -677,6 +685,7 @@ func (s *Server) handleAnalyzeAnnotationUsers(ctx context.Context, req mcp.CallT
 	args := req.GetArguments()
 	idFilter := strings.TrimSpace(stringArg(args, "id"))
 	nameFilter := strings.ToLower(strings.TrimSpace(stringArg(args, "name")))
+	g := s.readerFor(ctx)
 
 	if idFilter != "" {
 		type annotatedRow struct {
@@ -686,7 +695,7 @@ func (s *Server) handleAnalyzeAnnotationUsers(ctx context.Context, req mcp.CallT
 			Args   string `json:"args,omitempty"`
 		}
 		var rows []annotatedRow
-		for e := range edgesByKinds(s.graph, graph.EdgeAnnotated) {
+		for e := range edgesByKinds(g, graph.EdgeAnnotated) {
 			if e.To != idFilter {
 				continue
 			}
@@ -703,7 +712,7 @@ func (s *Server) handleAnalyzeAnnotationUsers(ctx context.Context, req mcp.CallT
 		if s.scopeFiltersActive(ctx) {
 			kept := make([]annotatedRow, 0, len(rows))
 			for _, r := range rows {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Symbol)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(r.Symbol)) {
 					kept = append(kept, r)
 				}
 			}
@@ -751,10 +760,10 @@ func (s *Server) handleAnalyzeAnnotationUsers(ctx context.Context, req mcp.CallT
 		Users int    `json:"users"`
 	}
 	byID := map[string]*annoRow{}
-	for e := range edgesByKinds(s.graph, graph.EdgeAnnotated) {
+	for e := range edgesByKinds(g, graph.EdgeAnnotated) {
 		row, ok := byID[e.To]
 		if !ok {
-			n := s.graph.GetNode(e.To)
+			n := g.GetNode(e.To)
 			name := ""
 			if n != nil {
 				name = n.Name
@@ -776,7 +785,7 @@ func (s *Server) handleAnalyzeAnnotationUsers(ctx context.Context, req mcp.CallT
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*annoRow, 0, len(rows))
 		for _, r := range rows {
-			if s.analyzeNodeVisible(ctx, s.graph.GetNode(r.ID)) {
+			if s.analyzeNodeVisible(ctx, g.GetNode(r.ID)) {
 				kept = append(kept, r)
 			}
 		}
@@ -849,10 +858,11 @@ func (s *Server) handleAnalyzeConfigReaders(ctx context.Context, req mcp.CallToo
 		Reads   int      `json:"reads"`
 	}
 	byKey := map[string]*configRow{}
-	for e := range edgesByKinds(s.graph, graph.EdgeReadsConfig) {
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeReadsConfig) {
 		row, ok := byKey[e.To]
 		if !ok {
-			n := s.graph.GetNode(e.To)
+			n := g.GetNode(e.To)
 			name := ""
 			source := ""
 			if n != nil {
@@ -879,12 +889,12 @@ func (s *Server) handleAnalyzeConfigReaders(ctx context.Context, req mcp.CallToo
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*configRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.ID)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.ID)) {
 				continue
 			}
 			readers := make([]string, 0, len(r.Readers))
 			for _, id := range r.Readers {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					readers = append(readers, id)
 				}
 			}
@@ -978,10 +988,11 @@ func (s *Server) handleAnalyzeEnvVarUsers(ctx context.Context, req mcp.CallToolR
 		Reads   int      `json:"reads"`
 	}
 	byKey := map[string]*envRow{}
-	for e := range edgesByKinds(s.graph, graph.EdgeReadsConfig) {
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeReadsConfig) {
 		row, ok := byKey[e.To]
 		if !ok {
-			n := s.graph.GetNode(e.To)
+			n := g.GetNode(e.To)
 			if !isEnvConfigKey(n) {
 				continue
 			}
@@ -1005,12 +1016,12 @@ func (s *Server) handleAnalyzeEnvVarUsers(ctx context.Context, req mcp.CallToolR
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*envRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.ID)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.ID)) {
 				continue
 			}
 			readers := make([]string, 0, len(r.Readers))
 			for _, id := range r.Readers {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					readers = append(readers, id)
 				}
 			}
@@ -1085,7 +1096,8 @@ func (s *Server) handleAnalyzeEventEmitters(ctx context.Context, req mcp.CallToo
 		Emitters []string `json:"emitters,omitempty"`
 	}
 	byEvent := map[string]*eventRow{}
-	for e := range edgesByKinds(s.graph, graph.EdgeEmits) {
+	g := s.readerFor(ctx)
+	for e := range edgesByKinds(g, graph.EdgeEmits) {
 		// Level filter: an emit edge stores the method on the edge
 		// (e.g. "Errorf"); the event node may carry an event_kind.
 		// We accept either source so both per-event and per-call
@@ -1093,7 +1105,7 @@ func (s *Server) handleAnalyzeEventEmitters(ctx context.Context, req mcp.CallToo
 		if levelFilter != "" {
 			method, _ := e.Meta["method"].(string)
 			if !levelMatches(levelFilter, method) {
-				n := s.graph.GetNode(e.To)
+				n := g.GetNode(e.To)
 				if n == nil {
 					continue
 				}
@@ -1105,7 +1117,7 @@ func (s *Server) handleAnalyzeEventEmitters(ctx context.Context, req mcp.CallToo
 		}
 		row, ok := byEvent[e.To]
 		if !ok {
-			n := s.graph.GetNode(e.To)
+			n := g.GetNode(e.To)
 			name := ""
 			kind := ""
 			if n != nil {
@@ -1131,12 +1143,12 @@ func (s *Server) handleAnalyzeEventEmitters(ctx context.Context, req mcp.CallToo
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*eventRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.ID)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.ID)) {
 				continue
 			}
 			emitters := make([]string, 0, len(r.Emitters))
 			for _, id := range r.Emitters {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					emitters = append(emitters, id)
 				}
 			}
@@ -1224,6 +1236,7 @@ func (s *Server) handleAnalyzePubsub(ctx context.Context, req mcp.CallToolReques
 	// isn't re-checked per edge.
 	rejected := map[string]struct{}{}
 
+	g := s.readerFor(ctx)
 	ensureRow := func(nodeID string) *pubsubRow {
 		if row, ok := byTopic[nodeID]; ok {
 			return row
@@ -1231,7 +1244,7 @@ func (s *Server) handleAnalyzePubsub(ctx context.Context, req mcp.CallToolReques
 		if _, ok := rejected[nodeID]; ok {
 			return nil
 		}
-		n := s.graph.GetNode(nodeID)
+		n := g.GetNode(nodeID)
 		if n == nil || n.Meta == nil {
 			rejected[nodeID] = struct{}{}
 			return nil
@@ -1254,7 +1267,7 @@ func (s *Server) handleAnalyzePubsub(ctx context.Context, req mcp.CallToolReques
 		return row
 	}
 
-	for e := range edgesByKinds(s.graph, graph.EdgeEmits, graph.EdgeListensOn) {
+	for e := range edgesByKinds(g, graph.EdgeEmits, graph.EdgeListensOn) {
 		switch e.Kind {
 		case graph.EdgeEmits:
 			row := ensureRow(e.To)
@@ -1295,19 +1308,19 @@ func (s *Server) handleAnalyzePubsub(ctx context.Context, req mcp.CallToolReques
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*pubsubRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.ID)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.ID)) {
 				continue
 			}
 			publishers := make([]string, 0, len(r.Publishers))
 			for _, id := range r.Publishers {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					publishers = append(publishers, id)
 				}
 			}
 			r.Publishers = publishers
 			subscribers := make([]string, 0, len(r.Subscribers))
 			for _, id := range r.Subscribers {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					subscribers = append(subscribers, id)
 				}
 			}
@@ -1389,7 +1402,11 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 		ErrorMsgs []string `json:"error_msgs,omitempty"`
 	}
 	rows := make([]*throwerRow, 0)
-	if surfacer, ok := s.graph.(graph.ThrowerErrorSurfacer); ok {
+	// The surfacer probe runs on the request reader: an overlay view does
+	// not implement the capability, so an overlay-active request falls
+	// through to the edge walk below and reads the pushed buffers.
+	g := s.readerFor(ctx)
+	if surfacer, ok := g.(graph.ThrowerErrorSurfacer); ok {
 		// Server-side path: one server-side aggregate for the per-thrower
 		// throws+targets dedup, one for the per-thrower error-msg
 		// attachment. No per-thrower GetOutEdges fanout.
@@ -1408,13 +1425,13 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 		}
 	} else {
 		byThrower := map[string]*throwerRow{}
-		for e := range edgesByKinds(s.graph, graph.EdgeThrows) {
+		for e := range edgesByKinds(g, graph.EdgeThrows) {
 			if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 				continue
 			}
 			row, ok := byThrower[e.From]
 			if !ok {
-				n := s.graph.GetNode(e.From)
+				n := g.GetNode(e.From)
 				file := e.FilePath
 				line := e.Line
 				if n != nil {
@@ -1436,11 +1453,11 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 		// data-side companion (errors.New("…") → string::error_msg::…)
 		// carries the literal message.
 		for thrower, row := range byThrower {
-			for _, e := range s.graph.GetOutEdges(thrower) {
+			for _, e := range g.GetOutEdges(thrower) {
 				if e == nil || e.Kind != graph.EdgeEmits {
 					continue
 				}
-				n := s.graph.GetNode(e.To)
+				n := g.GetNode(e.To)
 				if n == nil || n.Kind != graph.KindString {
 					continue
 				}
@@ -1465,12 +1482,12 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*throwerRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Symbol)) {
+			if !s.analyzeNodeVisible(ctx, g.GetNode(r.Symbol)) {
 				continue
 			}
 			errs := make([]string, 0, len(r.Errors))
 			for _, id := range r.Errors {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
 					errs = append(errs, id)
 				}
 			}
@@ -1584,11 +1601,12 @@ func (s *Server) handleAnalyzeCrossRepo(ctx context.Context, req mcp.CallToolReq
 	}
 	byKey := map[string]*crossRepoRow{}
 
+	g := s.readerFor(ctx)
 	// repoOf prefers the live node's RepoPrefix and falls back to the
 	// edge Meta stamped at materialisation time — Meta is dropped by
 	// snapshot round-trips, so the node lookup is the durable path.
 	repoOf := func(id, metaKey string, e *graph.Edge) string {
-		if n := s.graph.GetNode(id); n != nil && n.RepoPrefix != "" {
+		if n := g.GetNode(id); n != nil && n.RepoPrefix != "" {
 			return n.RepoPrefix
 		}
 		if e.Meta != nil {
@@ -1599,7 +1617,7 @@ func (s *Server) handleAnalyzeCrossRepo(ctx context.Context, req mcp.CallToolReq
 		return ""
 	}
 
-	for e := range edgesByKinds(s.graph,
+	for e := range edgesByKinds(g,
 		graph.EdgeCrossRepoCalls,
 		graph.EdgeCrossRepoImplements,
 		graph.EdgeCrossRepoExtends,
@@ -1716,7 +1734,7 @@ func (s *Server) handleAnalyzeCrossRepo(ctx context.Context, req mcp.CallToolReq
 //
 // Empty kinds yields nothing — matches both the capability contract
 // and the original semantics (no kinds requested means no rows).
-func edgesByKinds(g graph.Store, kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
+func edgesByKinds(g graph.Reader, kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
 	if len(kinds) == 0 {
 		return func(yield func(*graph.Edge) bool) {}
 	}

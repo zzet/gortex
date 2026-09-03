@@ -104,6 +104,79 @@ func newGCX(w *bytes.Buffer, tool string, fields []string, metaKV ...string) *wi
 	})
 }
 
+// injectGCXHeaderMeta writes fields into an already-encoded GCX
+// payload's header as key=value meta, and reports whether the payload
+// was GCX at all. Header.Meta is the format's own metadata channel, so
+// a decorator running after the encoder — the view rider — stays
+// readable by every decoder instead of being dropped for want of a
+// JSON object to merge into.
+//
+// Only scalars ride: a header token has no room for a structured
+// value. A key the header already declares is left alone, because the
+// encoder is the authority on its own payload. A key or value carrying
+// a space, tab, newline or backslash is dropped for the reason newGCX
+// documents — the header tokenises on single spaces and the escaper
+// does not encode them, so one such value costs the whole payload.
+func injectGCXHeaderMeta(payload string, fields map[string]any) (string, bool) {
+	if payload == "" || !strings.HasPrefix(payload, wire.Tag) {
+		return payload, false
+	}
+	if len(fields) == 0 {
+		return payload, true
+	}
+	head, rows, split := strings.Cut(payload, wire.RowSep)
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString(head)
+	for _, name := range names {
+		value, scalar := gcxHeaderValue(fields[name])
+		if !scalar || !gcxHeaderSafe(name) || strings.Contains(name, "=") || !gcxHeaderSafe(value) {
+			continue
+		}
+		if strings.Contains(head, " "+name+"=") {
+			continue
+		}
+		b.WriteString(" ")
+		b.WriteString(name)
+		b.WriteString("=")
+		b.WriteString(value)
+	}
+	if !split {
+		return b.String(), true
+	}
+	b.WriteString(wire.RowSep)
+	b.WriteString(rows)
+	return b.String(), true
+}
+
+// gcxHeaderValue renders a scalar as its header-token form. Anything
+// structured reports false — it belongs in a section row, not a token.
+func gcxHeaderValue(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return v, true
+	case bool:
+		return strconv.FormatBool(v), true
+	case int:
+		return strconv.Itoa(v), true
+	case int64:
+		return strconv.FormatInt(v, 10), true
+	default:
+		return "", false
+	}
+}
+
+// gcxHeaderSafe reports whether a token survives the header's
+// single-space tokenisation without the escaping the header cannot do.
+func gcxHeaderSafe(s string) bool {
+	return s != "" && !strings.ContainsAny(s, " \t\n\r\\")
+}
+
 // nodeShort returns the short form of a node ID — whatever follows
 // the last "::" separator. For methods this carries the receiver; for
 // functions / types it is the plain name.

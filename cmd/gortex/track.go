@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,11 +24,25 @@ var (
 	trackAsWorktree  bool
 	trackWait        bool
 	trackWaitTimeout time.Duration
+	untrackConfirm   bool
+	untrackFormat    string
 )
 
-// trackStatusFn fetches the daemon status; indirected through a package var so
-// the --wait poll loop can be exercised in tests without a running daemon.
-var trackStatusFn = fetchDaemonStatusForCLI
+// untrackDaemonTool is the daemon-tool relay seam. Untrack goes through the
+// tool rather than the control socket because what an untrack does depends on
+// the family: a checkout the family can still serve is demoted outright, and a
+// plan that removes rows is previewed and needs --confirm. Both decisions are
+// the tool's, so the CLI and an agent see the same one.
+var untrackDaemonTool = requireDaemonTool
+
+// Injectable seams keep the --wait orchestration testable without a live
+// daemon. The real notification receives the absolute deadline so dialing and
+// the control round trip consume one shared budget.
+var (
+	trackStatusFn            = fetchDaemonStatusForCLI
+	trackEnsureDaemonReadyFn = ensureDaemonReady
+	trackNotifyDaemonTrackFn = notifyDaemonTrack
+)
 
 // trackPollInterval is how often --wait re-queries the daemon. A package var so
 // tests can drop it to a sub-millisecond tick instead of waiting whole seconds.
@@ -44,9 +59,16 @@ var trackCmd = &cobra.Command{
 var untrackCmd = &cobra.Command{
 	Use:   "untrack <path>",
 	Short: "Remove a repository from the tracked workspace",
-	Long:  "Resolves the path and removes the matching entry from the global config.",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runUntrack,
+	Long: `Resolves the path and removes the matching entry from the global config.
+
+Against a running daemon what happens depends on what the checkout's family can
+still serve it from. A checkout another corpus can serve is demoted into the
+family's automatic lane and the call runs outright. A plan that removes rows —
+a primary corpus with everything composed over it, or a checkout with nowhere
+to be demoted to — is previewed instead, and runs only with --confirm.`,
+	Args:         cobra.ExactArgs(1),
+	SilenceUsage: true,
+	RunE:         runUntrack,
 }
 
 func init() {
@@ -58,6 +80,9 @@ func init() {
 		"Block until the daemon has indexed the repo and the graph is queryable (useful for CI / one-shot scripts)")
 	trackCmd.Flags().DurationVar(&trackWaitTimeout, "wait-timeout", 10*time.Minute,
 		"With --wait, fail if indexing has not settled within this duration (0 = wait forever)")
+	untrackCmd.Flags().BoolVar(&untrackConfirm, "confirm", false,
+		"Run a plan that removes rows. Without it such a plan is only previewed.")
+	untrackCmd.Flags().StringVar(&untrackFormat, "format", "text", "output format: text|json")
 	rootCmd.AddCommand(trackCmd)
 	rootCmd.AddCommand(untrackCmd)
 }
@@ -91,6 +116,7 @@ func runTrack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving path %s: %w", rawPath, err)
 	}
 	absPath = pathkey.NormalizeVolume(absPath)
+	absPath = pathkey.CanonicalExistingRoot(absPath)
 
 	// Validate path exists and is a directory.
 	info, err := os.Stat(absPath)
@@ -149,15 +175,33 @@ func runTrack(cmd *cobra.Command, args []string) error {
 	}
 
 	// 2. Best-effort daemon: bring it up (single-flight) and hand it the
-	//    repo so indexing starts now. Spawn / control failure is
-	//    NON-FATAL — the config write above already persisted the repo,
-	//    so we degrade to the offline summary instead of erroring.
-	if ensureDaemonReady(daemon.ParseAutostart()) != daemonUnavailable {
-		if err := notifyDaemonTrack(absPath); err == nil {
+	//    repo so indexing starts now. For --wait, one absolute deadline spans
+	//    readiness, the track control RPC, and the settle poll. The config write
+	//    above remains durable even when that wait budget expires.
+	waitDeadline := time.Time{}
+	if trackWait && trackWaitTimeout > 0 {
+		waitDeadline = time.Now().Add(trackWaitTimeout)
+	}
+	ensureFn := trackEnsureDaemonReadyFn
+	decision, timedOut := beforeTrackDeadline(waitDeadline, func() daemonDecision {
+		return ensureFn(daemon.ParseAutostart())
+	})
+	if timedOut || trackDeadlineExpired(waitDeadline) {
+		return trackWaitTimeoutError(absPath, trackWaitTimeout, "waiting for daemon readiness")
+	}
+	if decision != daemonUnavailable {
+		notifyFn := trackNotifyDaemonTrackFn
+		notifyErr, notifyTimedOut := beforeTrackDeadline(waitDeadline, func() error {
+			return notifyFn(absPath, waitDeadline)
+		})
+		if notifyTimedOut || trackDeadlineExpired(waitDeadline) {
+			return trackWaitTimeoutError(absPath, trackWaitTimeout, "waiting for the daemon to accept the repository")
+		}
+		if notifyErr == nil {
 			// --wait blocks until the daemon has actually indexed the repo so
 			// a following `gortex analyze` / query sees a complete graph.
 			if trackWait {
-				if werr := waitForRepoIndexed(w, absPath, trackWaitTimeout); werr != nil {
+				if werr := waitForRepoIndexedUntil(w, absPath, waitDeadline, trackWaitTimeout); werr != nil {
 					return werr
 				}
 			}
@@ -166,10 +210,10 @@ func runTrack(cmd *cobra.Command, args []string) error {
 		} else if trackWait {
 			// The repo is persisted, but --wait promised a queryable graph we
 			// can no longer deliver — surface that rather than a soft success.
-			return fmt.Errorf("--wait: daemon did not accept the repo: %w", err)
+			return fmt.Errorf("--wait: daemon did not accept the repo (it remains tracked in config): %w", notifyErr)
 		}
 	} else if trackWait {
-		return fmt.Errorf("--wait requires a running daemon, but none is available — start it with `gortex daemon start --detach`")
+		return fmt.Errorf("--wait requires a running daemon, but none is available; the repository remains tracked in config — start it with `gortex daemon start --detach`")
 	}
 
 	// 3. Daemon unavailable (autostart off, spawn failed/timed out, or
@@ -190,26 +234,72 @@ func repoNodeCount(st daemon.StatusResponse, absPath string) int {
 	return -1
 }
 
+// beforeTrackDeadline runs one potentially blocking wait stage against the
+// command's shared absolute deadline. The result channel is buffered so a
+// bounded caller can return while an uncancellable readiness probe winds down.
+func beforeTrackDeadline[T any](deadline time.Time, fn func() T) (T, bool) {
+	if deadline.IsZero() {
+		return fn(), false
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		var zero T
+		return zero, true
+	}
+	result := make(chan T, 1)
+	go func() { result <- fn() }()
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case value := <-result:
+		return value, false
+	case <-timer.C:
+		var zero T
+		return zero, true
+	}
+}
+
+func trackDeadlineExpired(deadline time.Time) bool {
+	return !deadline.IsZero() && time.Until(deadline) <= 0
+}
+
+func trackWaitTimeoutError(absPath string, timeout time.Duration, phase string) error {
+	return fmt.Errorf("--wait: timed out after %s %s for %s; repository is tracked in config and daemon work may continue", timeout, phase, absPath)
+}
+
 // indexSettled reports whether the repo at absPath looks fully indexed: the
-// daemon has it with a non-zero node count that has stopped moving (equal to
-// prevNodes, the previous poll's reading) and the graph is resolved (Ready).
-// prevNodes is -1 before the first reading. Requiring a stable count across two
-// polls is a per-repo heuristic that holds even on a warm multi-repo daemon
-// where the global Ready flag alone would be insufficient.
+// daemon has registered it, its non-negative node count has stopped moving
+// (equal to prevNodes), and the graph is resolved (Ready). Zero is a valid
+// settled count for an empty repository; -1 exclusively means not registered.
+// Requiring a stable count across two polls is a per-repo heuristic that holds
+// even on a warm multi-repo daemon where the global Ready flag is insufficient.
 func indexSettled(st daemon.StatusResponse, absPath string, prevNodes int) (settled bool, nodes int) {
 	nodes = repoNodeCount(st, absPath)
-	if nodes <= 0 || !st.Ready {
+	if nodes < 0 || !st.Ready {
 		return false, nodes
 	}
 	return nodes == prevNodes, nodes
 }
 
 // waitForRepoIndexed polls the daemon until the repo at absPath has settled
-// (see indexSettled) or timeout elapses. timeout <= 0 waits forever. On a TTY
-// the wait renders as a live step with the node count ticking up; on a pipe
-// (or with --no-progress) it prints one start line, slow heartbeats, and the
-// settle summary.
+// (see indexSettled) or timeout elapses. timeout <= 0 waits forever.
 func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) error {
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	return waitForRepoIndexedUntil(w, absPath, deadline, timeout)
+}
+
+type trackStatusResult struct {
+	status daemon.StatusResponse
+	err    error
+}
+
+// waitForRepoIndexedUntil is the runTrack form: deadline was created before
+// daemon readiness and registration, so status RPCs and poll sleeps only get
+// the budget left over from those earlier stages.
+func waitForRepoIndexedUntil(w io.Writer, absPath string, deadline time.Time, timeout time.Duration) error {
 	tr := progress.NewTracker(w)
 	if noProgress {
 		tr = progress.NewTracker(w, progress.WithoutAnimation())
@@ -218,14 +308,23 @@ func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) erro
 	step := tr.StartStep("indexing " + filepath.Base(absPath))
 	step.SetUnit("nodes")
 
-	var deadline time.Time
-	if timeout > 0 {
-		deadline = time.Now().Add(timeout)
+	failTimeout := func() error {
+		err := trackWaitTimeoutError(absPath, timeout, "waiting for indexing to settle")
+		tr.Fail(err)
+		return err
 	}
 	prevNodes := -1
+	statusFn := trackStatusFn
 	for {
-		if st, err := trackStatusFn(); err == nil {
-			settled, nodes := indexSettled(st, absPath, prevNodes)
+		statusResult, timedOut := beforeTrackDeadline(deadline, func() trackStatusResult {
+			st, err := statusFn()
+			return trackStatusResult{status: st, err: err}
+		})
+		if timedOut || trackDeadlineExpired(deadline) {
+			return failTimeout()
+		}
+		if statusResult.err == nil {
+			settled, nodes := indexSettled(statusResult.status, absPath, prevNodes)
 			if nodes > 0 {
 				step.Progress(int64(nodes), 0)
 			}
@@ -236,12 +335,23 @@ func waitForRepoIndexed(w io.Writer, absPath string, timeout time.Duration) erro
 			}
 			prevNodes = nodes
 		}
-		if timeout > 0 && time.Now().After(deadline) {
-			err := fmt.Errorf("--wait: timed out after %s waiting for %s to index", timeout, absPath)
-			tr.Fail(err)
-			return err
+		if trackDeadlineExpired(deadline) {
+			return failTimeout()
 		}
-		time.Sleep(trackPollInterval)
+		delay := trackPollInterval
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return failTimeout()
+			}
+			if delay > remaining {
+				delay = remaining
+			}
+		}
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			<-timer.C
+		}
 	}
 }
 
@@ -263,17 +373,25 @@ type trackResult struct {
 // socket. It returns an error when the daemon can't be reached or rejects
 // the request; the caller treats that as non-fatal because the config
 // write already persisted the repo.
-func notifyDaemonTrack(absPath string) error {
+func notifyDaemonTrack(absPath string, deadline time.Time) error {
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	resp, err := c.Control(daemon.ControlTrack, daemon.TrackParams{
+
+	controlTimeout := time.Duration(0)
+	if !deadline.IsZero() {
+		controlTimeout = time.Until(deadline)
+		if controlTimeout <= 0 {
+			return fmt.Errorf("track wait deadline expired before the control request")
+		}
+	}
+	resp, err := c.ControlWithTimeout(daemon.ControlTrack, daemon.TrackParams{
 		Path:       absPath,
 		Name:       trackName,
 		AsWorktree: trackAsWorktree,
-	})
+	}, controlTimeout)
 	if err != nil {
 		return err
 	}
@@ -379,20 +497,8 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 
 	emitUntrackBanner(w, target, daemon.IsRunning())
 
-	if daemon.IsRunning() {
-		c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
-		if err == nil {
-			defer c.Close()
-			resp, ctlErr := c.Control(daemon.ControlUntrack, daemon.UntrackParams{PathOrPrefix: target})
-			if ctlErr != nil {
-				return ctlErr
-			}
-			if !resp.OK {
-				return fmt.Errorf("untrack rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
-			}
-			emitUntrackSummary(w, target, untrackResult{viaDaemon: true})
-			return nil
-		}
+	if index, reachable := untrackDaemonIndex(target); reachable {
+		return untrackViaDaemon(cmd, w, index, target)
 	}
 
 	// Standalone fallback.
@@ -410,13 +516,73 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// untrackDaemonIndex picks the repository the untrack tool call is routed
+// through, and reports false when no running daemon owns it.
+//
+// False is what keeps `gortex untrack` offline-safe: a repo the daemon never
+// loaded is still a line in the user's config, and removing that line is
+// exactly what the standalone fallback is for.
+func untrackDaemonIndex(target string) (string, bool) {
+	if !daemon.IsRunning() {
+		return "", false
+	}
+	// A bare repo prefix names no directory, so the call is routed through the
+	// caller's own working directory instead; the prefix rides as the tool's
+	// argument either way.
+	index := target
+	if !filepath.IsAbs(target) {
+		index = "."
+	}
+	abs, err := filepath.Abs(index)
+	if err != nil {
+		return "", false
+	}
+	if !daemonOwnsRepo(abs) {
+		return "", false
+	}
+	return index, true
+}
+
+// untrackViaDaemon runs the untrack tool and renders what it decided: a
+// preview the caller has to confirm, or the plan it carried out.
+func untrackViaDaemon(cmd *cobra.Command, w io.Writer, index, target string) error {
+	toolArgs := map[string]any{"path": target}
+	if untrackConfirm {
+		toolArgs["confirm"] = true
+	}
+	raw, err := untrackDaemonTool(index, "untrack_repository", toolArgs)
+	if err != nil {
+		return err
+	}
+	if untrackFormat == "json" {
+		return emitDaemonJSON(cmd, raw)
+	}
+	var payload checkoutOutcome
+	if err := json.Unmarshal(raw, &payload); err != nil || payload.Status == "" {
+		// Anything that is not one of this tool's own answers — the
+		// not-tracked guidance, a shape a newer daemon added — is printed as
+		// it came rather than squeezed into a summary card.
+		return emitDaemonJSON(cmd, raw)
+	}
+	if payload.Status == "preview" {
+		renderCheckoutOutcome(cmd.OutOrStdout(), target, payload,
+			"gortex untrack "+target+" --confirm")
+		return nil
+	}
+	emitUntrackSummary(w, target, untrackResult{viaDaemon: true, demoted: payload.Demoted})
+	return nil
+}
+
 // untrackResult mirrors trackResult — kept distinct so the two summaries can
 // drift apart later (e.g. untrack might want to show whether the repo had
 // pending edits before removal) without one breaking the other.
 type untrackResult struct {
 	viaDaemon  bool
 	configOnly bool
-	repoCount  int // tracked repo count *after* removal (configOnly path)
+	// demoted reports that the checkout kept its identity and moved to the
+	// family's automatic lane instead of being removed.
+	demoted   bool
+	repoCount int // tracked repo count *after* removal (configOnly path)
 }
 
 // emitUntrackBanner prints the gortex mesh banner + subtitle indicating which
@@ -444,6 +610,8 @@ func emitUntrackBanner(w io.Writer, target string, daemonUp bool) {
 func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 	if !progress.IsTTY(w) {
 		switch {
+		case r.demoted:
+			fmt.Fprintf(w, "[gortex] demoted %s to its family's automatic lane (via daemon)\n", target)
 		case r.viaDaemon:
 			fmt.Fprintf(w, "[gortex] untracked %s (via daemon)\n", target)
 		case r.configOnly:
@@ -454,6 +622,9 @@ func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 
 	var stats []string
 	switch {
+	case r.demoted:
+		stats = append(stats, progress.Stat("via daemon", "", progress.StatGood))
+		stats = append(stats, progress.Stat("served from", "the family primary", progress.StatGood))
 	case r.viaDaemon:
 		stats = append(stats, progress.Stat("via daemon", "", progress.StatGood))
 		stats = append(stats, progress.Stat("index", "dropped", progress.StatGood))

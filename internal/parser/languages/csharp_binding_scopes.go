@@ -1,6 +1,8 @@
 package languages
 
 import (
+	"sort"
+
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
 
@@ -75,6 +77,27 @@ func csharpCollectExtraBindingScopes(root *sitter.Node, src []byte, funcRanges *
 	// receiver_name inside the variable's own source, and the extension
 	// binder then read the static form as instance form - one parameter
 	// wide.
+	//
+	// The continuation positions are collected ONCE per query and kept by
+	// the query's byte span: every binding clause asks for its tail, and
+	// rescanning the query's children per clause made extraction quadratic
+	// in clause count (issue 727 - a few hundred `let` clauses cost
+	// hundreds of milliseconds and tens of megabytes).
+	continuations := map[csharpLocalScope][]int{}
+	continuationStarts := func(q *sitter.Node) []int {
+		key := csharpLocalScope{start: int(q.StartByte()), end: int(q.EndByte())}
+		if starts, ok := continuations[key]; ok {
+			return starts
+		}
+		var starts []int
+		for i, _nc := 0, int(q.NamedChildCount()); i < _nc; i++ {
+			if c := q.NamedChild(i); c != nil && c.Type() == "identifier" {
+				starts = append(starts, int(c.StartByte()))
+			}
+		}
+		continuations[key] = starts
+		return starts
+	}
 	queryTail := func(n *sitter.Node, start int) csharpLocalScope {
 		var q *sitter.Node
 		for cur := n; cur != nil; cur = cur.Parent() {
@@ -87,10 +110,10 @@ func csharpCollectExtraBindingScopes(root *sitter.Node, src []byte, funcRanges *
 			return csharpLocalScopeOf(n)
 		}
 		end := int(q.EndByte())
-		for i, _nc := 0, int(q.NamedChildCount()); i < _nc; i++ {
-			if c := q.NamedChild(i); c != nil && c.Type() == "identifier" && int(c.StartByte()) >= start {
-				end = int(c.StartByte())
-				break
+		// Children come in source order, so the starts are ascending.
+		if starts := continuationStarts(q); len(starts) > 0 {
+			if i := sort.SearchInts(starts, start); i < len(starts) {
+				end = starts[i]
 			}
 		}
 		if end < start {

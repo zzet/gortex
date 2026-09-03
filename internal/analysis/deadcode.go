@@ -231,7 +231,7 @@ var candidateNodeKinds = []graph.NodeKind{
 // FindDeadCode returns all symbols with zero incoming calls or references,
 // excluding entry points, test functions, exported symbols, and user-excluded patterns.
 // By default, variables are excluded (see FindDeadCodeOptions for rationale).
-func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []string, opts ...FindDeadCodeOptions) []DeadCodeEntry {
+func FindDeadCode(g graph.Reader, processes *ProcessResult, excludePatterns []string, opts ...FindDeadCodeOptions) []DeadCodeEntry {
 	var opt FindDeadCodeOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -550,7 +550,7 @@ func FindDeadCode(g graph.Store, processes *ProcessResult, excludePatterns []str
 // AllNodes + batched-GetInEdgesByNodeIDs path, identical pre-Part-2
 // behaviour. The post-filter loop in FindDeadCode handles both shapes
 // uniformly — incomingByID==nil means "filter already applied".
-func collectDeadCodeCandidates(g graph.Store, opt FindDeadCodeOptions) (candidates []*graph.Node, incomingByID map[string][]*graph.Edge) {
+func collectDeadCodeCandidates(g graph.Reader, opt FindDeadCodeOptions) (candidates []*graph.Node, incomingByID map[string][]*graph.Edge) {
 	if dc, ok := g.(graph.DeadCodeCandidator); ok {
 		kinds := candidateNodeKinds[:0:0]
 		for _, k := range candidateNodeKinds {
@@ -602,7 +602,7 @@ func collectDeadCodeCandidates(g graph.Store, opt FindDeadCodeOptions) (candidat
 // single join; otherwise the fallback iterates
 // NodesByKind(KindInterface) + EdgesByKind(EdgeImplements). Both paths
 // produce the same map.
-func buildIfaceRequiredMethods(g graph.Store) map[string]map[string]bool {
+func buildIfaceRequiredMethods(g graph.Reader) map[string]map[string]bool {
 	if scanner, ok := g.(graph.IfaceImplementsScanner); ok {
 		return buildIfaceRequiredMethodsFromRows(scanner.IfaceImplementsRows())
 	}
@@ -723,7 +723,7 @@ const hotspotBetweennessWeight = 0.4
 // centrality component — how often the symbol lies on a shortest path between
 // other symbols — that augments the fan-in/out signals rather than replacing them.
 // If threshold <= 0, the default threshold is mean + 2*stddev.
-func FindHotspots(g graph.Store, communities *CommunityResult, threshold float64) []HotspotEntry {
+func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float64) []HotspotEntry {
 	// Pull only function/method node IDs — the hotspots ranking is
 	// callable-only, and the scoring math doesn't touch any column
 	// beyond the id. NodeIDsByKinds returns the projection from a
@@ -1171,7 +1171,7 @@ func matchesExcludePattern(filePath, nodeID string, patterns []string) bool {
 // same fanInKinds / fanOutKinds pair today; the function signature
 // keeps them per-call so a future analyzer with a different kind
 // split can share the same plumbing.
-func CollectFanCounts(g graph.Store, ids []string, fanInKinds []graph.EdgeKind, fanOutKinds []graph.EdgeKind) (fanIn, fanOut map[string]int) {
+func CollectFanCounts(g graph.Reader, ids []string, fanInKinds []graph.EdgeKind, fanOutKinds []graph.EdgeKind) (fanIn, fanOut map[string]int) {
 	fanIn = make(map[string]int, len(ids))
 	fanOut = make(map[string]int, len(ids))
 	if len(ids) == 0 {

@@ -51,9 +51,19 @@ func ReadRepoIndexStates(path string) (map[string]graph.RepoIndexState, error) {
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 
+	// view_gen = 0 is spelled out rather than inherited from a Store handle:
+	// this door never opens one, and every caller of it wants the base corpus
+	// a plain index writes, not whatever derived view a daemon happens to be
+	// serving. A store that predates the column holds only base rows, so the
+	// fallback below reads exactly the same set.
 	rows, err := db.Query(`
 SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions
+  FROM repo_index_state WHERE view_gen = 0`)
+	if err != nil && isMissingColumnErr(err, "view_gen") {
+		rows, err = db.Query(`
+SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions
   FROM repo_index_state`)
+	}
 	if err != nil {
 		// A store written before the repo_index_state table existed has
 		// nothing recorded yet. Anything else — most importantly a file that
@@ -90,4 +100,14 @@ SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, ed
 // covered here.
 func isMissingTableErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no such table")
+}
+
+// isMissingColumnErr reports whether err is SQLite refusing a query because
+// the named column does not exist. It exists so this door still reads a store
+// stamped before the view generation column shipped: such a store carries only
+// base-generation rows, so dropping the predicate reads the same set rather
+// than reporting the repos as never indexed. String-matched for the same
+// reason as isMissingTableErr.
+func isMissingColumnErr(err error, column string) bool {
+	return err != nil && strings.Contains(err.Error(), "no such column: "+column)
 }

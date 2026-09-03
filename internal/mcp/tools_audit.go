@@ -55,7 +55,7 @@ func (s *Server) registerAuditTool() {
 // never be graded against another workspace's symbols — and so an
 // explicit repo selector narrows instead of being silently dropped.
 func (s *Server) handleAuditHealth(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	g := s.graph
+	g := s.readerFor(ctx)
 	if g == nil {
 		return mcp.NewToolResultError("audit: graph is not initialised"), nil
 	}
@@ -86,7 +86,10 @@ func (s *Server) handleAuditHealth(ctx context.Context, req mcp.CallToolRequest)
 //	complexity_health = 100 / (1 + raw/20)
 //	mean              = mean across callable symbols
 //	grade             = auditScoreGrade(mean)
-func ComputeAuditReport(g graph.Store, nodes []*graph.Node) AuditReport {
+//
+// Read-only: g is the caller's request reader, so an overlay-active
+// session is graded against its own buffers.
+func ComputeAuditReport(g graph.Reader, nodes []*graph.Node) AuditReport {
 	type entry struct {
 		id, file string
 		line     int

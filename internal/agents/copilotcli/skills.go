@@ -10,6 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/internalutil"
 	"github.com/zzet/gortex/internal/agents/skillpack"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // skills.go installs Agent Skills for the Copilot CLI. The CLI adopted
@@ -178,13 +179,11 @@ func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.A
 	if root == "" {
 		return nil, nil
 	}
-	// KnownHashes stays unset: this pack has only ever shipped one
-	// rendering, so the byte compare against CuratedSkills() is the
-	// complete definition of "still ours".
 	return skillpack.Sync(w, skillpack.SyncSpec{
-		Dir:      root,
-		FileName: skillFileName,
-		Rendered: CuratedSkills(),
+		Dir:         root,
+		FileName:    skillFileName,
+		Rendered:    CuratedSkills(),
+		KnownHashes: skillpack.AddWorktreeV1Hashes(CuratedSkills(), profiles.WorktreeBranchRoutingPolicy, skillpack.PreWorktreeClaudeSkillHashes()),
 	}, allowed, opts)
 }
 

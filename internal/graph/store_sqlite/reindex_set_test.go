@@ -271,7 +271,7 @@ func TestReindexInsertChunksRespectBoundArgumentBytes(t *testing.T) {
 		}
 	}
 	variableLimit := sqliteBatchVariableHardCap
-	inserted, statements, err := insertSQLiteReindexRowsTxLimited(tx, rows, &variableLimit)
+	inserted, statements, err := insertSQLiteReindexRowsTxLimited(tx, baseViewGeneration, rows, &variableLimit)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 	assert.Equal(t, len(rows), inserted)

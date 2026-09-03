@@ -262,14 +262,15 @@ func runDeadCodeInspection(ctx context.Context, s *Server, scope inspectionScope
 	// both are the analyzer's inputs and stay global so an entry point in
 	// another repo still keeps a symbol alive. Only the rows are narrowed,
 	// matching handleFindDeadCode.
-	entries := analysis.FindDeadCode(s.graph, s.getProcesses(), nil)
+	reader := s.readerFor(ctx)
+	entries := analysis.FindDeadCode(reader, s.getProcesses(), nil)
 	scoped := s.scopeFiltersActive(ctx)
 	out := make([]inspectionViolation, 0, len(entries))
 	for _, e := range entries {
 		if !scope.keep(e.FilePath) {
 			continue
 		}
-		if scoped && !s.analyzeNodeVisible(ctx, s.graph.GetNode(e.ID)) {
+		if scoped && !s.analyzeNodeVisible(ctx, reader.GetNode(e.ID)) {
 			continue
 		}
 		out = append(out, inspectionViolation{
@@ -288,7 +289,8 @@ func runCyclesInspection(ctx context.Context, s *Server, scope inspectionScope) 
 	// DetectCycles' own scope argument stays empty on purpose: it drops
 	// out-of-prefix nodes before Tarjan runs, which splits or dissolves
 	// SCCs rather than filtering rows. Narrow the results instead.
-	cycles := analysis.DetectCycles(s.graph, s.getCommunities(), "")
+	reader := s.readerFor(ctx)
+	cycles := analysis.DetectCycles(reader, s.getCommunities(), "")
 	scoped := s.scopeFiltersActive(ctx)
 	out := make([]inspectionViolation, 0, len(cycles))
 	for _, c := range cycles {
@@ -308,7 +310,7 @@ func runCyclesInspection(ctx context.Context, s *Server, scope inspectionScope) 
 		anchorLine := 0
 		if len(c.Path) > 0 {
 			anchor = c.Path[0]
-			if n := s.graph.GetNode(anchor); n != nil {
+			if n := reader.GetNode(anchor); n != nil {
 				if !scope.keep(n.FilePath) {
 					continue
 				}
@@ -360,7 +362,7 @@ func runTodosInspection(ctx context.Context, s *Server, scope inspectionScope) [
 
 func runCoverageGapsInspection(ctx context.Context, s *Server, scope inspectionScope) []inspectionViolation {
 	out := make([]inspectionViolation, 0)
-	covRows := s.coverageByID()
+	covRows := coverageRowsByID(s.readerFor(ctx))
 	for _, n := range s.scopedNodesByKinds(ctx, inspectionCallableKinds) {
 		if !scope.keep(n.FilePath) {
 			continue
@@ -390,7 +392,7 @@ func runStaleCodeInspection(ctx context.Context, s *Server, scope inspectionScop
 	out := make([]inspectionViolation, 0)
 	now := time.Now().Unix()
 	cutoff := now - staleInspectionDays*24*3600
-	blame := blameRowsByID(s.graph)
+	blame := blameRowsByID(s.readerFor(ctx))
 	for _, n := range s.scopedNodesByKinds(ctx, inspectionCallableKinds) {
 		if !scope.keep(n.FilePath) {
 			continue

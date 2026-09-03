@@ -16,9 +16,9 @@ import (
 // gets slack for its longer surface description only; localization is
 // the diet profile and must stay under 2 KiB (~0.45k tokens).
 var bodyByteCeilings = map[string]int{
-	"core":         3072,
-	"full":         6912,
-	"localization": 2304,
+	"core":         4608,
+	"full":         8192,
+	"localization": 3840,
 }
 
 func TestProfileBodyByteCeilings(t *testing.T) {
@@ -52,8 +52,53 @@ var positioningCues = []string{
 	"explore",
 	"Gortex MCP integration failure",
 	"Do not start a daemon",
+	"automatic overlay",
+	"explicit user request to track",
+	"selected overlay plus exactly one designated primary",
+	"Unique overlay/base matches keep normal relevance order",
+	"deletion/tombstone masks hide the base copy",
+	"exact:false",
+	"Every fallback is read-only",
+	"require_exact:true",
+	"require_fresh:true",
+	"RFC3339",
+	"wait_deadline",
+	`view:{kind:"worktree"`,
+	`view:{kind:"git_ref"`,
+	"Inactive ref/commit views",
+	"no working-copy LSP",
+	"coordinator-backed exact worktree edits",
+	"preview the effects and obtain user confirmation",
+	"Never restart the daemon, delete its store, or re-track",
 	"gortex instructions switch",
 	"NEW sessions only",
+}
+
+func TestEveryProfileEmbedsCanonicalWorktreeBranchPolicyVerbatim(t *testing.T) {
+	for _, p := range Table() {
+		if got := strings.Count(p.Body(), WorktreeBranchRoutingPolicy); got != 1 {
+			t.Errorf("profile %q embeds canonical worktree policy %d times, want exactly once", p.Name, got)
+		}
+	}
+}
+
+var benchmarkProfileBody string
+
+// BenchmarkProfileBodyRender measures the per-generation cost of composing
+// the three instruction profiles, including the shared routing policy. The
+// bodies are materialized at install/switch time rather than per request, but
+// this guard makes accidental quadratic assembly visible.
+func BenchmarkProfileBodyRender(b *testing.B) {
+	for _, profile := range Table() {
+		profile := profile
+		b.Run(profile.Name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				benchmarkProfileBody = profile.Body()
+			}
+			b.ReportMetric(float64(len(benchmarkProfileBody)), "body_bytes")
+		})
+	}
 }
 
 func TestEveryProfileKeepsPositioningCues(t *testing.T) {

@@ -41,7 +41,7 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 		// response and therefore never saw a receipt id. Resolution failure is
 		// not fatal here: the raw spelling is still matched against the ledger.
 		lookup := rawPath
-		if absPath, relPath, err := s.resolveFilePath(rawPath); err == nil {
+		if absPath, relPath, err := s.resolveFilePath(ctx, rawPath); err == nil {
 			if record, ok := s.mutationCommits.recentForPath(relPath); ok {
 				return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 			}
@@ -61,10 +61,14 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 	}
 
 	records := s.mutationCommits.recent(maxMutationCommitListing)
+	// Rendered through the same flag as the single-record path. A listing that
+	// showed graph_status without graph_status_terminal would hand an agent
+	// exactly the reading this tool is trying to stop, just by a different
+	// entry point.
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"mutations": mutationCommitListing(records),
+		"mutations": mutationCommitListingPayload(records),
 		"count":     len(records),
-		"note":      "most recent first; pass receipt, mutation_id, or path to select one",
+		"note":      "most recent first; pass receipt, mutation_id, or path to select one. Read graph_status_terminal before waiting on graph_status",
 	})
 }
 
@@ -106,14 +110,59 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		payload["committed_at"] = snap.CommittedAt
 	}
 	payload["retry_safe"] = snap.DiskStatus == mutationDiskNotApplied || snap.DiskStatus == mutationDiskFailed
+	payload["graph_status_terminal"] = graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded)
+	if note := graphStatusNote(snap.GraphStatus, snap.GraphRecorded); note != "" {
+		payload["graph_note"] = note
+	}
 	payload["guidance"] = mutationStatusGuidance(snap.DiskStatus)
 	return payload
+}
+
+// graphStatusTerminal answers the only question a caller actually has about
+// the graph half: is it still worth waiting? Once an outcome is recorded only
+// "pending" resolves on its own — mutationStatusPayload refreshes a record
+// through pendingReindexReceipt, which returns nothing once the record left
+// that state, so every other value is frozen for the life of the entry.
+// Rendering the four values without this flag makes a terminal one look like a
+// stage in a progression, and a caller that waits on it waits forever.
+//
+// recorded is not a refinement, it is the other half of the answer.
+// beginMutationCommit seeds graph as "stale" and nothing reports back until
+// the mutation completes, so an edit still in flight renders exactly like one
+// whose reindex finished without confirming a write. Deriving terminality from
+// the string alone would tell the caller this tool exists to serve — one whose
+// edit was abandoned at its deadline and may still be completing — to stop
+// waiting on a value that is about to become "fresh". That is the failure this
+// flag is meant to prevent, pointing the other way.
+func graphStatusTerminal(graph string, recorded bool) bool {
+	return recorded && graph != mutationGraphPending
+}
+
+// graphStatusNote says what the value means and what would change it. The
+// wording matters most for "stale" and "failed", which are the two a caller
+// is most likely to sit on.
+func graphStatusNote(graph string, recorded bool) string {
+	if !recorded {
+		return "the reindex for this mutation has not reported back yet, so this value is a seed rather than an outcome — poll this receipt; it is not settled"
+	}
+	switch graph {
+	case mutationGraphPending:
+		return "the reindex for this mutation is still running — poll this receipt; this is the one graph_status that resolves on its own"
+	case mutationGraphFresh:
+		return "the graph has read these bytes"
+	case mutationGraphStale:
+		return "the reindex reported back without confirming an index write. This will NOT become \"fresh\" on its own. It also does not gate change.detect — that barrier reads the freshness receipts, not this ledger. The bytes are on disk: verify them and proceed"
+	case mutationGraphFailed:
+		return "the graph ingest failed terminally. Waiting will not change it. A later successful mutation of this path, or a scoped reindex of it, resolves the freshness receipt that does gate change.detect"
+	default:
+		return ""
+	}
 }
 
 func mutationStatusGuidance(disk string) string {
 	switch disk {
 	case mutationDiskCommitted:
-		return "the bytes are on disk — do not re-apply this edit; if graph_status is not \"fresh\" the graph is still catching up"
+		return "the bytes are on disk — do not re-apply this edit; read graph_status_terminal before waiting on graph_status, because only \"pending\" resolves on its own"
 	case mutationDiskNotApplied:
 		return "nothing was written — the file is unchanged and retrying is safe"
 	case mutationDiskFailed:
@@ -123,4 +172,62 @@ func mutationStatusGuidance(disk string) string {
 	default:
 		return ""
 	}
+}
+
+// mutationCommitListingPayload renders the listing with the same graph
+// terminality the single-record payload carries. It deliberately does not
+// refresh pending records the way mutationStatusPayload does: a listing is a
+// survey, and a caller acting on one entry selects it by receipt, which takes
+// the refreshing path.
+//
+// Worth naming because it is surprising: a frozen graph_status is
+// observer-dependent. mutationStatusPayload only refreshes while the record is
+// pending, so if someone calls change.receipt in the window between an ingest
+// failure and a later mutation that supersedes it, the ledger reads "failed"
+// for the life of the entry; if nobody looks in that window, the same history
+// renders "fresh". The notes handle the consequence by pointing at the
+// freshness receipt rather than this ledger, which is the structure that
+// actually gates change.detect.
+func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]any {
+	snaps := mutationCommitListing(records)
+	out := make([]map[string]any, 0, len(snaps))
+	for _, snap := range snaps {
+		entry := map[string]any{
+			"receipt":               snap.Receipt,
+			"disk_status":           snap.DiskStatus,
+			"graph_status":          snap.GraphStatus,
+			"graph_status_terminal": graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded),
+		}
+		// Every remaining field mirrors mutationCommitSnapshot's omitempty
+		// exactly. Rendering by hand is what dropped new_sha and
+		// bytes_written the first time, so the parity is asserted against the
+		// struct itself rather than trusted here — see
+		// TestMutationCommitListingKeepsEverySnapshotField.
+		if snap.Tool != "" {
+			entry["tool"] = snap.Tool
+		}
+		if snap.Path != "" {
+			entry["path"] = snap.Path
+		}
+		if snap.MutationID != "" {
+			entry["mutation_id"] = snap.MutationID
+		}
+		if snap.NewSHA != "" {
+			entry["new_sha"] = snap.NewSHA
+		}
+		if snap.BytesWritten != 0 {
+			entry["bytes_written"] = snap.BytesWritten
+		}
+		if snap.Error != "" {
+			entry["error"] = snap.Error
+		}
+		if snap.StartedAt != "" {
+			entry["started_at"] = snap.StartedAt
+		}
+		if snap.CommittedAt != "" {
+			entry["committed_at"] = snap.CommittedAt
+		}
+		out = append(out, entry)
+	}
+	return out
 }

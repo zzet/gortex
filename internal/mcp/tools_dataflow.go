@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/callpath"
 	"github.com/zzet/gortex/internal/dataflow"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // registerDataflowTools wires the CPG-lite dataflow MCP surface.
@@ -84,8 +85,13 @@ func (s *Server) handleFlowBetween(ctx context.Context, req mcp.CallToolRequest)
 	maxPaths := req.GetInt("max_paths", dataflow.DefaultMaxPaths)
 	minTier := req.GetString("min_tier", "")
 
+	// dataflow.New builds its traversal state over a graph.Store, so these
+	// paths are computed over the base corpus even when the request carries
+	// an overlay or a routed view. Under a view that is a base-scoped answer
+	// the caller has to be told about.
 	engine := dataflow.New(s.graph).WithRefiner(s.dataflowRefiner(ctx))
 	paths := engine.FlowBetweenWithTier(source, sink, maxDepth, maxPaths, minTier)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 
 	if s.isGCX(ctx, req) {
 		payload, err := encodeFlowBetween(source, sink, paths)
@@ -120,7 +126,11 @@ func (s *Server) handleTracePath(ctx context.Context, req mcp.CallToolRequest) (
 		MinTier:           req.GetString("min_tier", ""),
 		IncludeReferences: req.GetBool("include_references", true),
 	}
+	// callpath.New builds its traversal state over a graph.Store, so this
+	// path is computed over the base corpus even when the request carries an
+	// overlay or a routed view, and says so on the response under one.
 	res := callpath.New(s.graph).ShortestPath(source, sink, opts)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 
 	if s.isGCX(ctx, req) {
 		payload, encErr := encodeTracePath(res)
@@ -154,8 +164,13 @@ func (s *Server) handleTaintPaths(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("sink_pattern matched no clauses"), nil
 	}
 
+	// dataflow.New builds its traversal state over a graph.Store, so these
+	// findings are computed over the base corpus even when the request
+	// carries an overlay or a routed view, and say so on the response under
+	// one.
 	engine := dataflow.New(s.graph).WithRefiner(s.dataflowRefiner(ctx))
 	findings := engine.TaintPathsWithTier(src, sink, maxDepth, limit, minTier)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 
 	if s.isGCX(ctx, req) {
 		payload, err := encodeTaintPaths(srcRaw, sinkRaw, findings)
@@ -192,7 +207,7 @@ func (s *Server) dataflowRefiner(ctx context.Context) *dataflow.Refiner {
 		if fn.StartLine == 0 || fn.EndLine == 0 {
 			return dataflow.FuncSource{}, fmt.Errorf("symbol has no line range: %s", fn.ID)
 		}
-		absPath, err := s.resolveNodePath(fn)
+		absPath, err := s.resolveNodePath(ctx, fn)
 		if err != nil {
 			return dataflow.FuncSource{}, err
 		}
@@ -202,6 +217,10 @@ func (s *Server) dataflowRefiner(ctx context.Context) *dataflow.Refiner {
 		}
 		return dataflow.FuncSource{Src: []byte(src), StartLine: fromLine}, nil
 	}
+	// dataflow.NewRefiner caches per-function analyses keyed off a
+	// graph.Store, so its symbol lookups read the base corpus even when the
+	// request carries an overlay view; only the source resolver above is
+	// overlay-aware.
 	return dataflow.NewRefiner(s.graph, resolve, 0)
 }
 

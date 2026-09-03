@@ -55,7 +55,7 @@ func matchesAnyGlob(p string, globs []string) bool {
 // For "boundary" rules: reports a violation when any changed symbol whose file path
 // matches the Source prefix has outgoing call or reference edges to symbols whose
 // file paths match the Target prefix.
-func EvaluateGuards(g graph.Store, rules []config.GuardRule, changedSymbolIDs []string) []GuardViolation {
+func EvaluateGuards(g graph.Reader, rules []config.GuardRule, changedSymbolIDs []string) []GuardViolation {
 	var violations []GuardViolation
 
 	// Pre-resolve changed symbols to nodes for efficient lookup.
@@ -117,7 +117,7 @@ func evaluateCoChange(rule config.GuardRule, changedNodes []*graph.Node) []Guard
 
 // evaluateBoundary checks whether any changed symbol in the source prefix has
 // outgoing call or reference edges targeting symbols in the target prefix.
-func evaluateBoundary(g graph.Store, rule config.GuardRule, changedNodes []*graph.Node) []GuardViolation {
+func evaluateBoundary(g graph.Reader, rule config.GuardRule, changedNodes []*graph.Node) []GuardViolation {
 	var violations []GuardViolation
 	seen := make(map[string]bool)
 

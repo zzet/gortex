@@ -38,6 +38,11 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	// sections; nil for an unbound session means "no filter".
 	_, _, bound := s.sessionScope(ctx)
 
+	// Every node / edge read below goes through the request's reader, so
+	// an overlay-active caller sees its own buffers. Hoisted once: the
+	// outline touches the reader from several sections.
+	reader := s.readerFor(ctx)
+
 	// Pull the full scoped node slice only when the session is bound
 	// — the lang count, total-node count, and edge filter need it then.
 	// Unbound sessions get the same numbers from the backend's cached
@@ -72,7 +77,7 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	} else {
 		// Unbound: Stats().ByLanguage already aggregates this server-
 		// side; the cgo cost is one GROUP BY instead of one row per node.
-		stats := s.graph.Stats()
+		stats := reader.Stats()
 		maps.Copy(langCounts, stats.ByLanguage)
 		totalScopedNodes = stats.TotalNodes
 	}
@@ -100,9 +105,9 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	// materialising every edge over cgo.
 	totalEdges := 0
 	if inScope == nil {
-		totalEdges = s.graph.EdgeCount()
+		totalEdges = reader.EdgeCount()
 	} else {
-		for _, e := range s.graph.AllEdges() {
+		for _, e := range reader.AllEdges() {
 			if !inScope[e.From] || !inScope[e.To] {
 				continue
 			}
@@ -175,8 +180,8 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 		"summary":             summary,
 		"communities":         communitiesSection,
 		"hotspots":            hotspotsSection,
-		"most_imported_files": mostImportedFiles(s.graph, inScope, topMostImportedN),
-		"entry_points":        entryPoints(s.graph, inScope, topEntryPointsN),
+		"most_imported_files": mostImportedFiles(reader, inScope, topMostImportedN),
+		"entry_points":        entryPoints(reader, inScope, topEntryPointsN),
 	})
 }
 
@@ -206,8 +211,9 @@ func topCommunitiesSummary(comms []analysis.Community) []map[string]any {
 // Picks the FileImportAggregator capability when the backend
 // implements it (one server-side aggregate ships back the per-file count
 // instead of materialising every edge over cgo just to bucket).
-// Falls back to the AllEdges-driven loop on backends that don't.
-func mostImportedFiles(g graph.Store, inScope map[string]bool, topN int) []map[string]any {
+// Falls back to the AllEdges-driven loop on backends that don't — which
+// is what an overlay view takes, since it implements no aggregate.
+func mostImportedFiles(g graph.Reader, inScope map[string]bool, topN int) []map[string]any {
 	type fileCount struct {
 		path  string
 		count int
@@ -288,7 +294,7 @@ func mostImportedFiles(g graph.Store, inScope map[string]bool, topN int) []map[s
 // an inScope filter is supplied (bound session), it's applied after
 // the name lookup so a bound session never sees mains from other
 // workspaces.
-func entryPoints(g graph.Store, inScope map[string]bool, topN int) []map[string]any {
+func entryPoints(g graph.Reader, inScope map[string]bool, topN int) []map[string]any {
 	type ep struct {
 		id       string
 		name     string

@@ -120,7 +120,7 @@ func TestFindExistingEdgeEndpointsPlanUsesExactIndexWithoutSorter(t *testing.T) 
 
 	rows, err := store.db.Query(
 		"EXPLAIN QUERY PLAN "+boundedEdgeExistenceQuery(1),
-		"source", "target", string(graph.EdgeMemberOf),
+		"source", "target", string(graph.EdgeMemberOf), baseViewGeneration,
 	)
 	if err != nil {
 		t.Fatalf("explain edge existence: %v", err)

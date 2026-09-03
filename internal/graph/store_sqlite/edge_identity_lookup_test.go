@@ -78,6 +78,7 @@ func TestFindEdgesByIdentitiesSQLiteUsesExistingUniqueIndexWithoutTempTree(t *te
 	rows, err := store.db.Query("EXPLAIN QUERY PLAN "+query,
 		"a", "b", graph.EdgeCalls, "a.go", 1,
 		"c", "d", graph.EdgeCalls, "c.go", 2,
+		baseViewGeneration,
 	)
 	require.NoError(t, err)
 	defer rows.Close()
@@ -91,7 +92,19 @@ func TestFindEdgesByIdentitiesSQLiteUsesExistingUniqueIndexWithoutTempTree(t *te
 	}
 	require.NoError(t, rows.Err())
 	plan := strings.Join(details, "\n")
-	require.Contains(t, plan, uniqueIndex, "identity matching must seek through the existing five-column UNIQUE index")
+	// The index name alone is not enough: a whole-index scan names it too.
+	// The property under lock is the per-key probe, so the step that reads
+	// the identity index has to be a SEARCH.
+	var identityStep string
+	for _, detail := range details {
+		if strings.Contains(detail, uniqueIndex) {
+			identityStep = strings.TrimSpace(detail)
+			break
+		}
+	}
+	require.NotEmpty(t, identityStep, "identity matching must read the six-column UNIQUE index")
+	require.True(t, strings.HasPrefix(identityStep, "SEARCH"),
+		"identity matching must seek the six-column UNIQUE index, not scan it: %s", identityStep)
 	require.Contains(t, plan, "INTEGER PRIMARY KEY", "full rows must be re-fetched through ordered row-id seeks")
 	require.NotContains(t, strings.ToUpper(plan), "TEMP B-TREE")
 }
@@ -202,10 +215,10 @@ func exactEdgeIdentityUniqueIndex(t *testing.T, store *Store) string {
 		}
 		require.NoError(t, indexRows.Err())
 		require.NoError(t, indexRows.Close())
-		if strings.Join(columns, ",") == "from_id,to_id,kind,file_path,line" {
+		if strings.Join(columns, ",") == "from_id,to_id,kind,file_path,line,view_gen" {
 			return name
 		}
 	}
-	t.Fatal("edges table has no five-column logical-identity UNIQUE index")
+	t.Fatal("edges table has no six-column logical-identity UNIQUE index")
 	return ""
 }

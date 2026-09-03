@@ -217,7 +217,7 @@ func TestSQLiteBoundedAdjacencyMidScanCancellationReturnsNoPartial(t *testing.T)
 		edges = append(edges, &graph.Edge{From: source, To: fmt.Sprintf("target-%03d", index), Kind: graph.EdgeCalls, Line: index})
 	}
 	store.AddBatch(nil, edges)
-	rows, err := store.db.Query(boundedOutgoingAdjacencySQL(1), source, string(graph.EdgeCalls), graph.MaxBoundedAdjacencyRowsPerKey+1)
+	rows, err := store.db.Query(boundedOutgoingAdjacencySQL(1), source, string(graph.EdgeCalls), baseViewGeneration, graph.MaxBoundedAdjacencyRowsPerKey+1)
 	if err != nil {
 		t.Fatalf("open rows: %v", err)
 	}
@@ -242,9 +242,9 @@ func TestSQLiteBoundedAdjacencyPlansUsePredicateIndexes(t *testing.T) {
 		index       string
 		constraints string
 	}{
-		{name: "outgoing", query: boundedOutgoingAdjacencySQL(1), args: []any{"source", string(graph.EdgeCalls), 2}, index: "EDGES_BY_FROM", constraints: "(FROM_ID=? AND KIND=?)"},
-		{name: "incoming", query: boundedIncomingAdjacencySQL(1), args: []any{"target", string(graph.EdgeCalls), 2}, index: "EDGES_BY_TO", constraints: "(TO_ID=? AND KIND=?)"},
-		{name: "site", query: boundedOutgoingSiteAdjacencySQL(1), args: []any{"source", 10, string(graph.EdgeCalls), 2}, index: "EDGES_BY_FROM_LINE_KIND", constraints: "(FROM_ID=? AND LINE=? AND KIND=?)"},
+		{name: "outgoing", query: boundedOutgoingAdjacencySQL(1), args: []any{"source", string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_FROM", constraints: "(FROM_ID=? AND KIND=?)"},
+		{name: "incoming", query: boundedIncomingAdjacencySQL(1), args: []any{"target", string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_TO", constraints: "(TO_ID=? AND KIND=?)"},
+		{name: "site", query: boundedOutgoingSiteAdjacencySQL(1), args: []any{"source", 10, string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_FROM_LINE_KIND", constraints: "(FROM_ID=? AND LINE=? AND KIND=?)"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			rows, err := store.db.Query("EXPLAIN QUERY PLAN "+test.query, test.args...)

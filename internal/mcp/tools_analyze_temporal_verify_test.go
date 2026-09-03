@@ -73,7 +73,7 @@ func TestServerSourceProvider_ReadsNodeSource(t *testing.T) {
 		t.Fatal("fixture node `helper` not found in the indexed graph")
 	}
 
-	src := newServerSourceProvider(srv)
+	src := newServerSourceProvider(context.Background(), srv)
 	body, ok := src.NodeSource(helper)
 	if !ok {
 		t.Fatalf("NodeSource(helper) returned ok=false (path=%q)", helper.FilePath)

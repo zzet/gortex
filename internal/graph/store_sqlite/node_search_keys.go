@@ -12,7 +12,7 @@ import (
 // callback may safely re-enter Store and no long-lived read snapshot pins WAL
 // checkpoints while ranking candidates.
 func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func([]graph.NodeSearchKey) bool) error {
-	if s == nil || yield == nil {
+	if s.coreless() || yield == nil {
 		return nil
 	}
 	if ctx == nil {
@@ -29,7 +29,8 @@ func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func
 	// in-progress scan indefinitely. The query layer compares MutationRevision
 	// around scan + hydration and retries once when any committed mutation races.
 	var highWater string
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM nodes ORDER BY id DESC LIMIT 1`).Scan(&highWater)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM nodes WHERE view_gen = ? ORDER BY id DESC LIMIT 1`, s.viewGen).Scan(&highWater)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -53,16 +54,16 @@ func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func
 			rows, err = s.db.QueryContext(ctx, `
 SELECT id, kind, name
 FROM nodes
-WHERE id <= ?
+WHERE id <= ? AND view_gen = ?
 ORDER BY id
-LIMIT ?`, highWater, pageSize)
+LIMIT ?`, highWater, s.viewGen, pageSize)
 		} else {
 			rows, err = s.db.QueryContext(ctx, `
 SELECT id, kind, name
 FROM nodes
-WHERE id > ? AND id <= ?
+WHERE id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
-LIMIT ?`, after, highWater, pageSize)
+LIMIT ?`, after, highWater, s.viewGen, pageSize)
 		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {

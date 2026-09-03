@@ -158,9 +158,17 @@ func (s *Server) handleAnalyzeFixesHistory(ctx context.Context, req mcp.CallTool
 // symbolNamesInFile returns the sorted, de-duplicated names of the
 // function / method / type symbols defined in filePath.
 func (s *Server) symbolNamesInFile(filePath string) []string {
+	return fileSymbolNames(s.graph, filePath)
+}
+
+// fileSymbolNames is the reader-parameterised body behind
+// symbolNamesInFile: hand it the request's reader and the names come
+// from the caller's buffers, hand it the base store and they come from
+// the index.
+func fileSymbolNames(g graph.Reader, filePath string) []string {
 	var names []string
 	seen := map[string]bool{}
-	for _, n := range s.graph.GetFileNodes(filePath) {
+	for _, n := range g.GetFileNodes(filePath) {
 		switch n.Kind {
 		case graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface:
 			if n.Name != "" && !seen[n.Name] {
@@ -181,13 +189,17 @@ func (s *Server) symbolNamesInFile(filePath string) []string {
 // the row count after truncation is bounded but each per-row name
 // lookup was a separate query before — multiple thousand
 // query-engine entry points per call on a disk backend.
-func (s *Server) symbolNamesByFiles(paths []string) map[string][]string {
+func (s *Server) symbolNamesByFiles(ctx context.Context, paths []string) map[string][]string {
 	if len(paths) == 0 {
 		return nil
 	}
 	kinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface}
 	out := make(map[string][]string, len(paths))
-	if scanner, ok := s.graph.(graph.FileSymbolNamesByPaths); ok {
+	// Probed on the request's reader: an overlay view is not a scanner,
+	// so an overlay-active call takes the per-file loop below and reads
+	// the caller's buffers.
+	reader := s.readerFor(ctx)
+	if scanner, ok := reader.(graph.FileSymbolNamesByPaths); ok {
 		rows := scanner.FileSymbolNamesByPaths(paths, kinds)
 		seenPerFile := make(map[string]map[string]bool, len(paths))
 		for _, r := range rows {
@@ -208,7 +220,7 @@ func (s *Server) symbolNamesByFiles(paths []string) map[string][]string {
 		return out
 	}
 	for _, p := range paths {
-		out[p] = s.symbolNamesInFile(p)
+		out[p] = fileSymbolNames(reader, p)
 	}
 	return out
 }

@@ -76,11 +76,12 @@ func (s *Server) handleSuggestBoundaries(ctx context.Context, req mcp.CallToolRe
 	}
 
 	// Observed cross-layer dependencies become the allow lists.
+	g := s.readerFor(ctx)
 	allow := make(map[string]map[string]bool)
 	for _, cd := range cands {
 		c := comms.Communities[cd.comm]
 		for _, memberID := range c.Members {
-			for _, e := range s.graph.GetOutEdges(memberID) {
+			for _, e := range g.GetOutEdges(memberID) {
 				if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 					continue
 				}

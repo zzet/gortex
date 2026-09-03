@@ -632,7 +632,7 @@ func TestOverlayLayerAddNodeReplacesDuplicateIdentity(t *testing.T) {
 	}
 	layer.AddNode(filePath, final)
 
-	if nodes := layer.nodesForFile(filePath); len(nodes) != 1 || nodes[0] != final {
+	if nodes := layer.FileNodes(filePath); len(nodes) != 1 || nodes[0] != final {
 		t.Fatalf("file nodes = %#v, want one final replacement", nodes)
 	}
 	if old := layer.NodesByName("old"); len(old) != 0 {

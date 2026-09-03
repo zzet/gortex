@@ -162,9 +162,12 @@ type topologyGate struct {
 // buildCounter is already process-global, so topology publication uses one
 // process-global gate as well. This avoids retaining one registry entry per
 // short-lived Store forever (notably across tests and workspace reloads).
-// Production multi-repo indexers share one Store; independent-store watcher
-// transactions are rare enough that the conservative cross-store serialization
-// is preferable to an unbounded coordination registry.
+// Production multi-repo indexers share one Store, and the conservative
+// cross-store serialization is preferable to an unbounded coordination
+// registry — but only while what passes through it stays scarce. Every
+// checkout coordinator, ref view and warmup tail in the daemon queues on this
+// one gate, so a pass that cannot change what the records describe must not
+// enter it at all: see WritesBaseTopology.
 var globalTopologyGate = func() *topologyGate {
 	gate := &topologyGate{}
 	gate.cond = sync.NewCond(&gate.mu)
@@ -230,14 +233,48 @@ func lockContext(ctx context.Context, mu *sync.Mutex) bool {
 	return true
 }
 
+// viewGenerationPinned is implemented by a store handle bound to one payload
+// view generation. A handle that does not report one reads and writes the base
+// corpus.
+type viewGenerationPinned interface {
+	ViewGeneration() int64
+}
+
+// WritesBaseTopology reports whether writes through g can change what the
+// reach index describes.
+//
+// Records are built over the base corpus and stamped on its nodes, and every
+// consumer reads them through the base store itself: a routed view answers
+// about a checkout the base index never saw, so its reader is sent to a live
+// walk instead. A handle pinned to a derived payload generation therefore
+// writes rows no record covers and no reach reader visits, and a pass over it
+// needs neither side of the gate — its own reads are generation-scoped, so it
+// observes nothing a base mutation can tear either.
+//
+// A store that reports no generation is treated as the base corpus. Taking the
+// gate for a mutation that did not need it costs concurrency; skipping it for
+// one that did costs correctness.
+func WritesBaseTopology(g graph.Store) bool {
+	if g == nil {
+		return false
+	}
+	pinned, ok := g.(viewGenerationPinned)
+	return !ok || pinned.ViewGeneration() == 0
+}
+
 // BeginTopologyMutation prevents reach lookups/builds from observing a
 // watcher's parse-then-swap and resolver work half-applied. The returned
 // function must be called exactly once; changed=true invalidates every cached
 // generation before waiting readers are released. A separate gate is required
 // because the mutation body itself invokes resolver methods that acquire the
 // store's non-reentrant ResolveMutex.
+//
+// A mutation that cannot reach the base corpus takes nothing and invalidates
+// nothing. The gate is process-global, so a generation-pinned build that held
+// it would serialise every unrelated store and pass in the daemon behind a
+// pass whose duration is its payload's, not the corpus's.
 func BeginTopologyMutation(g graph.Store) func(changed bool) {
-	if g == nil {
+	if !WritesBaseTopology(g) {
 		return func(bool) {}
 	}
 	gate := globalTopologyGate

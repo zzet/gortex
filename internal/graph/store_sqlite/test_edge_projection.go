@@ -56,7 +56,7 @@ func (s *Store) ScanTestNodeProjections(kinds []graph.NodeKind, pageSize int, yi
 		seen[kind] = struct{}{}
 
 		var highWater sql.NullString
-		if err := s.db.QueryRow(`SELECT MAX(id) FROM nodes WHERE kind = ?`, kind).Scan(&highWater); err != nil {
+		if err := s.db.QueryRow(`SELECT MAX(id) FROM nodes WHERE kind = ? AND view_gen = ?`, kind, s.viewGen).Scan(&highWater); err != nil {
 			panicOnFatal(err)
 			return
 		}
@@ -68,9 +68,9 @@ func (s *Store) ScanTestNodeProjections(kinds []graph.NodeKind, pageSize int, yi
 		for after < highWater.String {
 			rows, err := s.db.Query(`SELECT id, kind, name, file_path, language
 FROM nodes
-WHERE kind = ? AND id > ? AND id <= ?
+WHERE kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
-LIMIT ?`, kind, after, highWater.String, pageSize)
+LIMIT ?`, kind, after, highWater.String, s.viewGen, pageSize)
 			if err != nil {
 				panicOnFatal(err)
 				return
@@ -128,7 +128,7 @@ func (s *Store) ScanTestEdgeProjections(kinds []graph.EdgeKind, pageSize int, yi
 		seen[kind] = struct{}{}
 
 		var highWater sql.NullInt64
-		if err := s.db.QueryRow(`SELECT MAX(id) FROM edges WHERE kind = ?`, kind).Scan(&highWater); err != nil {
+		if err := s.db.QueryRow(`SELECT MAX(id) FROM edges WHERE kind = ? AND view_gen = ?`, kind, s.viewGen).Scan(&highWater); err != nil {
 			panicOnFatal(err)
 			return
 		}
@@ -140,9 +140,9 @@ func (s *Store) ScanTestEdgeProjections(kinds []graph.EdgeKind, pageSize int, yi
 		for after < highWater.Int64 {
 			rows, err := s.db.Query(`SELECT id, from_id, to_id, kind, file_path, line
 FROM edges
-WHERE kind = ? AND id > ? AND id <= ?
+WHERE kind = ? AND id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
-LIMIT ?`, kind, after, highWater.Int64, pageSize)
+LIMIT ?`, kind, after, highWater.Int64, s.viewGen, pageSize)
 			if err != nil {
 				panicOnFatal(err)
 				return
@@ -187,6 +187,7 @@ FROM requested AS r
 CROSS JOIN edges AS e INDEXED BY edges_by_from
 WHERE e.from_id = r.from_id
   AND e.kind = ?
+  AND e.view_gen = ?
   AND e.id <= ?
 ORDER BY e.from_id, e.id`
 
@@ -220,7 +221,7 @@ func (s *Store) ScanTestCallProjections(sourceIDs []string, sourceBatchSize, pag
 	sort.Strings(sources)
 
 	var highWater sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MAX(id) FROM edges WHERE kind = ?`, graph.EdgeCalls).Scan(&highWater); err != nil {
+	if err := s.db.QueryRow(`SELECT MAX(id) FROM edges WHERE kind = ? AND view_gen = ?`, graph.EdgeCalls, s.viewGen).Scan(&highWater); err != nil {
 		panicOnFatal(err)
 		return
 	}
@@ -235,7 +236,7 @@ func (s *Store) ScanTestCallProjections(sourceIDs []string, sourceBatchSize, pag
 			panicOnFatal(err)
 			return
 		}
-		rows, err := s.db.Query(testCallProjectionSQL, string(payload), graph.EdgeCalls, highWater.Int64)
+		rows, err := s.db.Query(testCallProjectionSQL, string(payload), graph.EdgeCalls, s.viewGen, highWater.Int64)
 		if err != nil {
 			panicOnFatal(err)
 			return

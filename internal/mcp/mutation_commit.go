@@ -106,6 +106,12 @@ type mutationCommitRecord struct {
 
 	disk  string
 	graph string
+	// graphRecorded says whether graph carries an outcome or is still the
+	// seed beginMutationCommit wrote. The status string cannot answer that on
+	// its own: "stale" means both "the reindex reported without confirming an
+	// index write" (terminal) and "nothing has reported yet" (in flight), and
+	// terminality is the opposite in the two cases.
+	graphRecorded bool
 
 	newSHA         string
 	bytesWritten   int
@@ -122,32 +128,38 @@ type mutationCommitRecord struct {
 }
 
 type mutationCommitSnapshot struct {
-	Receipt      string `json:"receipt"`
-	Tool         string `json:"tool,omitempty"`
-	MutationID   string `json:"mutation_id,omitempty"`
-	Path         string `json:"path,omitempty"`
-	DiskStatus   string `json:"disk_status"`
-	GraphStatus  string `json:"graph_status"`
-	NewSHA       string `json:"new_sha,omitempty"`
-	BytesWritten int    `json:"bytes_written,omitempty"`
-	Error        string `json:"error,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CommittedAt  string `json:"committed_at,omitempty"`
+	Receipt     string `json:"receipt"`
+	Tool        string `json:"tool,omitempty"`
+	MutationID  string `json:"mutation_id,omitempty"`
+	Path        string `json:"path,omitempty"`
+	DiskStatus  string `json:"disk_status"`
+	GraphStatus string `json:"graph_status"`
+	// GraphRecorded is not published on its own; it decides
+	// graph_status_terminal and graph_note, which is the form a caller can act
+	// on. Ordering matters for the listing: it is filled from the same
+	// snapshot the flag is derived from, so the two cannot disagree.
+	GraphRecorded bool   `json:"-"`
+	NewSHA        string `json:"new_sha,omitempty"`
+	BytesWritten  int    `json:"bytes_written,omitempty"`
+	Error         string `json:"error,omitempty"`
+	StartedAt     string `json:"started_at,omitempty"`
+	CommittedAt   string `json:"committed_at,omitempty"`
 }
 
 func (r *mutationCommitRecord) snapshot() mutationCommitSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	snap := mutationCommitSnapshot{
-		Receipt:      r.id,
-		Tool:         r.tool,
-		MutationID:   r.key,
-		Path:         r.relPath,
-		DiskStatus:   r.disk,
-		GraphStatus:  r.graph,
-		NewSHA:       r.newSHA,
-		BytesWritten: r.bytesWritten,
-		Error:        r.errText,
+		Receipt:       r.id,
+		Tool:          r.tool,
+		MutationID:    r.key,
+		Path:          r.relPath,
+		DiskStatus:    r.disk,
+		GraphStatus:   r.graph,
+		GraphRecorded: r.graphRecorded,
+		NewSHA:        r.newSHA,
+		BytesWritten:  r.bytesWritten,
+		Error:         r.errText,
 	}
 	if !r.startedAt.IsZero() {
 		snap.StartedAt = r.startedAt.UTC().Format(time.RFC3339Nano)
@@ -169,6 +181,7 @@ func (r *mutationCommitRecord) markNotApplied(err error) {
 	defer r.mu.Unlock()
 	r.disk = mutationDiskNotApplied
 	r.graph = mutationGraphStale
+	r.graphRecorded = true
 	if err != nil {
 		r.errText = err.Error()
 	}
@@ -179,6 +192,7 @@ func (r *mutationCommitRecord) markFailed(err error) {
 	defer r.mu.Unlock()
 	r.disk = mutationDiskFailed
 	r.graph = mutationGraphStale
+	r.graphRecorded = true
 	if err != nil {
 		r.errText = err.Error()
 	}
@@ -204,6 +218,7 @@ func (r *mutationCommitRecord) recordGraph(outcome mutationReindexOutcome) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.graph = graphStatusFor(outcome)
+	r.graphRecorded = true
 	r.reindexReceipt = outcome.Receipt
 }
 
@@ -437,8 +452,10 @@ func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fing
 		relPath:     relPath,
 		absPath:     absPath,
 		disk:        mutationDiskInFlight,
-		graph:       mutationGraphStale,
-		startedAt:   time.Now(),
+		// Seed, not an outcome: graphRecorded stays false until something
+		// reports back, and that is what makes the difference visible.
+		graph:     mutationGraphStale,
+		startedAt: time.Now(),
 	}
 	s.mutationCommits.put(record)
 	mutationCommitNoteFrom(ctx).observe(record)

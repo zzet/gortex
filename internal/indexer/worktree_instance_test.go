@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -119,26 +120,68 @@ func TestWorktreeInstance_IndexAll_AutoSeparatesByWorkspace(t *testing.T) {
 
 // TestWorktreeInstance_PlainWorktreeStillCoalesces guards the opposite
 // case: a worktree that declares NO distinct workspace (and is not
-// flagged) keeps the legacy behaviour and coalesces into the canonical —
-// we don't want to double-index every incidental worktree.
+// flagged) must not derive a workspace instance. It keeps the legacy
+// disposition instead — a tracked path whose basename collides with the
+// canonical's, so it lands under a path-hash-suffixed prefix rather than
+// an `@workspace` instance sibling.
 func TestWorktreeInstance_PlainWorktreeStillCoalesces(t *testing.T) {
 	canon, wt := setupCollidingWorktree(t, "oas-orm", "task", "") // no .gortex.yaml
 
-	_, mi, _ := newWorktreeTestIndexer(t,
+	g, mi, _ := newWorktreeTestIndexer(t,
 		config.RepoEntry{Path: canon},
 		config.RepoEntry{Path: wt},
 	)
 	results, err := mi.IndexAll()
 	require.NoError(t, err)
 
-	// Same basename, same (default) workspace → one instance wins; there
-	// is exactly one "oas-orm" and no "oas-orm@..." sibling.
-	assert.NotNil(t, mi.GetMetadata("oas-orm"))
+	// Same basename, same (default) workspace → the canonical keeps the
+	// bare "oas-orm" prefix and no "oas-orm@..." sibling is derived.
+	canonMeta := mi.GetMetadata("oas-orm")
+	require.NotNil(t, canonMeta)
 	for prefix := range mi.AllMetadata() {
 		assert.NotContains(t, prefix, "@",
 			"a plain worktree must not spawn a separate instance, got %q", prefix)
 	}
-	_ = results
+
+	// Name shape alone is a weak guard — it passes just as happily when
+	// the worktree is folded into the canonical's prefix as when it is
+	// tracked beside it. Pin the disposition with counts: the canonical
+	// indexes only its own checkout, and the worktree is a second
+	// tracked path under a hash-suffixed (not instance-tagged) prefix.
+	require.Len(t, mi.AllMetadata(), 2)
+	require.Len(t, results, 2, "each tracked path runs its own index pass")
+	assert.False(t, canonMeta.IsWorktree)
+	assert.Equal(t, realpath(t, canon), realpath(t, canonMeta.RootPath))
+	assert.Equal(t, 1, canonMeta.FileCount, "the canonical sees only its own file")
+
+	var wtPrefix string
+	for prefix, meta := range mi.AllMetadata() {
+		if prefix == "oas-orm" {
+			continue
+		}
+		wtPrefix = prefix
+		assert.True(t, meta.IsWorktree, "the second instance is the worktree")
+		assert.True(t, strings.HasPrefix(prefix, "oas-orm-"),
+			"a basename collision resolves by path hash, got %q", prefix)
+		assert.Equal(t, realpath(t, wt), realpath(t, meta.RootPath))
+		assert.Equal(t, 2, meta.FileCount, "the worktree sees the branch file too")
+	}
+	require.NotEmpty(t, wtPrefix)
+
+	// Every metadata rollup reports the counts of its own pass.
+	for prefix, meta := range mi.AllMetadata() {
+		result := results[prefix]
+		require.NotNil(t, result, "no index result for %q", prefix)
+		assert.Equal(t, meta.NodeCount, result.NodeCount, "node count for %q", prefix)
+		assert.Equal(t, meta.EdgeCount, result.EdgeCount, "edge count for %q", prefix)
+		assert.Equal(t, meta.FileCount, result.FileCount, "file count for %q", prefix)
+		assert.NotZero(t, meta.NodeCount, "instance %q indexed nothing", prefix)
+	}
+
+	// The branch-only file never bleeds into the canonical's prefix.
+	assert.NotEmpty(t, g.GetFileNodes("oas-orm/lib.go"))
+	assert.Empty(t, g.GetFileNodes("oas-orm/feature.go"))
+	assert.NotEmpty(t, g.GetFileNodes(wtPrefix+"/feature.go"))
 }
 
 // TestWorktreeInstance_TrackCtx_NoCoalesce_PersistsName exercises the
@@ -222,12 +265,12 @@ func TestWorktreeInstance_TwoWorktreesSameWorkspaceDisambiguated(t *testing.T) {
 	writeFile(t, filepath.Join(wtB, ".gortex.yaml"), "workspace: shared\n")
 	writeFile(t, filepath.Join(wtB, "b.go"), "package lib\n\nfunc B() {}\n")
 
-	_, mi, _ := newWorktreeTestIndexer(t,
+	g, mi, _ := newWorktreeTestIndexer(t,
 		config.RepoEntry{Path: canon},
 		config.RepoEntry{Path: wtA},
 		config.RepoEntry{Path: wtB},
 	)
-	_, err := mi.IndexAll()
+	results, err := mi.IndexAll()
 	require.NoError(t, err)
 
 	// Both worktrees want "oas-orm@shared"; one keeps it, the other gets
@@ -240,6 +283,24 @@ func TestWorktreeInstance_TwoWorktreesSameWorkspaceDisambiguated(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 2, shared, "two distinct worktree instances under the shared workspace")
+
+	// Each instance did its own indexing pass, and its metadata carries
+	// that pass's counts — not just a distinct name.
+	require.Len(t, results, 3, "every instance produces its own index result")
+	for prefix, meta := range mi.AllMetadata() {
+		result := results[prefix]
+		require.NotNil(t, result, "no index result for instance %q", prefix)
+		assert.Equal(t, meta.NodeCount, result.NodeCount, "node count for %q", prefix)
+		assert.Equal(t, meta.EdgeCount, result.EdgeCount, "edge count for %q", prefix)
+		assert.Equal(t, meta.FileCount, result.FileCount, "file count for %q", prefix)
+		assert.NotZero(t, meta.NodeCount, "instance %q indexed nothing", prefix)
+	}
+
+	// The branch-only files land under their own instance's prefix, so
+	// the three instances hold disjoint content.
+	assert.NotEmpty(t, g.GetFileNodes("oas-orm/lib.go"))
+	assert.Empty(t, g.GetFileNodes("oas-orm/a.go"))
+	assert.Empty(t, g.GetFileNodes("oas-orm/b.go"))
 }
 
 // TestEffectiveRepoPrefix_MatchesRegisteredPrefix guarantees the warm-

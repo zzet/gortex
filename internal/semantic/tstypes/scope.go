@@ -65,6 +65,12 @@ type callFact struct {
 	// call's arity as unknown and never narrows an overload set by it.
 	argCount int
 	argKnown bool
+	// owner is the member declaration that authored this call site, spelled
+	// as the extractor names that member's node (LangSpec.MemberDeclName);
+	// "" when the spec names no members. The apply phase reads it for one
+	// purpose: breaking a same-line same-name stub tie in favour of the
+	// fact's own author.
+	owner string
 }
 
 // arity returns the call site's argument count, or -1 when it was not
@@ -228,6 +234,11 @@ type binder struct {
 	// declared after it — and, for Rust, fields declared on the struct
 	// while the method lives in a separate impl block.
 	fieldsByType map[string]map[string]fieldType
+	// member is the innermost member declaration the walk is inside, as
+	// LangSpec.MemberDeclName spells it; "" at type / file scope or when
+	// the spec names no members. Every call fact recorded under it carries
+	// it as its authored owner.
+	member string
 }
 
 func newBinder(spec *LangSpec, src []byte, facts *fileFacts) *binder {
@@ -286,6 +297,17 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 		return
 	}
 	t := n.Type()
+
+	// Entering a member declaration names the author of every call fact
+	// recorded beneath it; the previous author is restored on the way out,
+	// whichever branch below returns.
+	if b.spec.MemberDeclName != nil {
+		if name, ok := b.spec.MemberDeclName(n, b.src); ok {
+			prev := b.member
+			b.member = name
+			defer func() { b.member = prev }()
+		}
+	}
 
 	if b.spec.TypeDeclTypes[t] && b.spec.TypeDeclName != nil {
 		name := b.spec.TypeDeclName(n, b.src)
@@ -407,6 +429,7 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 			if cf, grounded := b.receiverFact(recv, env); grounded {
 				cf.line = nodeLine(n)
 				cf.method = method
+				cf.owner = b.member
 				if b.spec.CallArgCount != nil {
 					if c, ok := b.spec.CallArgCount(n, b.src); ok {
 						cf.argCount = c
@@ -434,6 +457,7 @@ func (b *binder) walk(n *sitter.Node, env *scopeEnv) {
 			if cf, grounded := b.receiverFact(sc.Receiver, env); grounded {
 				cf.line = nodeLine(n)
 				cf.method = sc.Method
+				cf.owner = b.member
 				b.facts.calls = append(b.facts.calls, cf)
 			}
 		}

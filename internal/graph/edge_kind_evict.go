@@ -12,6 +12,9 @@ type EdgeKindEvicter interface {
 // for lightweight adapter stores only: it deduplicates logical edge keys before
 // calling the legacy mutator, avoiding repeated deletes when multiple source
 // locations share the same endpoints.
+//
+// Callers must hold Store.ResolveMutex(). Scanning a kind reads From / To /
+// Kind off edge values a resolve pass rewrites in place under that lock.
 func EvictEdgesByKinds(s Store, kinds []EdgeKind) int {
 	if s == nil || len(kinds) == 0 {
 		return 0

@@ -61,7 +61,7 @@ func (s *Server) handleGraphCompletionSearch(ctx context.Context, req mcp.CallTo
 		MaxSeedExpansion: maxExpand,
 		EdgeKinds:        edgeKinds,
 	}
-	cands, rerr := retriever.Retrieve(ctx, s.graph, query, limit*4) // headroom for expansion before final cap
+	cands, rerr := retriever.Retrieve(ctx, s.readerFor(ctx), query, limit*4) // headroom for expansion before final cap
 	if rerr != nil {
 		return mcp.NewToolResultError("graph_completion retrieve: " + rerr.Error()), nil
 	}
@@ -100,7 +100,7 @@ func (s *Server) handleGraphCompletionSearch(ctx context.Context, req mcp.CallTo
 // substring (case-insensitive). Replaceable by callers who plug in
 // vector search or another retrieval scheme via the public Retriever
 // interface.
-func (s *Server) nameMatchSeeder(ctx context.Context, g graph.Store, query string, limit int) ([]*rerank.Candidate, error) {
+func (s *Server) nameMatchSeeder(ctx context.Context, g graph.Reader, query string, limit int) ([]*rerank.Candidate, error) {
 	// FindNodesByNameContaining pushes the case-insensitive substring
 	// filter into the backend — on a disk backend that's an indexed
 	// substring filter against the name column, so only matching rows

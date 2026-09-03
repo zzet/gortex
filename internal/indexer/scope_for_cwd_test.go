@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -93,6 +94,94 @@ func TestScopeForCWD_And_ReposInWorkspace(t *testing.T) {
 
 	// An unknown workspace resolves to the empty set.
 	assert.Empty(t, mi.ReposInWorkspace("does-not-exist"))
+}
+
+// TestScopeForCWD_ResolvesCanonicalAliases keeps daemon admission and request
+// scoping on one filesystem identity. On macOS the same checkout commonly
+// arrives as /tmp/... from a client and /private/tmp/... from Git; an admitted
+// session must not become the unresolved, deny-all scope merely because those
+// spellings differ.
+func TestScopeForCWD_ResolvesCanonicalAliases(t *testing.T) {
+	base := t.TempDir()
+	realWorkspace := filepath.Join(base, "real-workspace")
+	realRepo := filepath.Join(realWorkspace, "repo")
+	realNested := filepath.Join(realRepo, "internal")
+	require.NoError(t, os.MkdirAll(realNested, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(realNested, "main.go"), []byte("package internal\n"), 0o644))
+	aliasWorkspace := filepath.Join(base, "workspace-alias")
+	if err := os.Symlink(realWorkspace, aliasWorkspace); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	aliasRepo := filepath.Join(aliasWorkspace, "repo")
+	aliasNested := filepath.Join(aliasRepo, "internal")
+
+	mi := &MultiIndexer{repos: map[string]*RepoMetadata{
+		"repo": {RepoPrefix: "repo", RootPath: realRepo},
+	}}
+	ws, project, prefix, ok := mi.ScopeForCWD(aliasNested)
+	require.True(t, ok)
+	assert.Equal(t, "repo", ws)
+	assert.Equal(t, "repo", project)
+	assert.Equal(t, "repo", prefix)
+
+	repos, workspaces, contained := mi.ContainedReposScope(aliasWorkspace)
+	require.True(t, contained)
+	assert.Equal(t, []string{"repo"}, repos)
+	assert.Equal(t, []string{"repo"}, workspaces)
+	assert.Equal(t, "repo", mi.RepoForFile(filepath.Join(aliasNested, "main.go")))
+	assert.Equal(t, "repo", mi.RepoForFile(filepath.Join(aliasNested, "new-buffer.go")))
+}
+
+func TestScopeForCWD_RefusesAliasToFilesystemRoot(t *testing.T) {
+	repo := t.TempDir()
+	aliasRoot := filepath.Join(t.TempDir(), "root-alias")
+	if err := os.Symlink(string(filepath.Separator), aliasRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	mi := &MultiIndexer{repos: map[string]*RepoMetadata{
+		"repo": {RepoPrefix: "repo", RootPath: repo},
+	}}
+	if _, _, _, ok := mi.ScopeForCWD(aliasRoot); ok {
+		t.Fatal("a symlink to the filesystem root bypassed ScopeForCWD's broad-root guard")
+	}
+	if repos, _, ok := mi.ContainedReposScope(aliasRoot); ok || len(repos) != 0 {
+		t.Fatalf("a symlink to the filesystem root yielded contained repos: %v", repos)
+	}
+}
+
+func BenchmarkScopeForCWDAlias(b *testing.B) {
+	base := b.TempDir()
+	realWorkspace := filepath.Join(base, "real-workspace")
+	realRepo := filepath.Join(realWorkspace, "repo")
+	realNested := filepath.Join(realRepo, "internal")
+	if err := os.MkdirAll(realNested, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	aliasWorkspace := filepath.Join(base, "workspace-alias")
+	if err := os.Symlink(realWorkspace, aliasWorkspace); err != nil {
+		b.Skipf("symlinks unavailable: %v", err)
+	}
+	aliasNested := filepath.Join(aliasWorkspace, "repo", "internal")
+	mi := &MultiIndexer{repos: map[string]*RepoMetadata{
+		"repo": {RepoPrefix: "repo", RootPath: realRepo},
+	}}
+	for i := range 31 {
+		name := fmt.Sprintf("unrelated-%02d", i)
+		root := filepath.Join(base, name)
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		mi.repos[name] = &RepoMetadata{RepoPrefix: name, RootPath: root}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, _, prefix, ok := mi.ScopeForCWD(aliasNested); !ok || prefix != "repo" {
+			b.Fatal("alias cwd did not resolve")
+		}
+	}
 }
 
 // TestScopeForCWD_WorkspaceRoot covers the reverse containment: a cwd

@@ -51,10 +51,13 @@ type contentFTSReplaceStats struct {
 	commits                   int
 }
 
+// Every ownership predicate leads with view_gen: the FTS5 virtual table has no
+// rewritable primary key, so the docid map carries the generation and scopes
+// each delete to the caller's view.
 const (
-	contentOwnerByRepo     = `repo_prefix = ?`
-	contentOwnerByFile     = `file_path = ?`
-	contentOwnerByRepoFile = `repo_prefix = ? AND file_path = ?`
+	contentOwnerByRepo     = `view_gen = ? AND repo_prefix = ?`
+	contentOwnerByFile     = `view_gen = ? AND file_path = ?`
+	contentOwnerByRepoFile = `view_gen = ? AND repo_prefix = ? AND file_path = ?`
 )
 
 // deleteContentFTSByOwnershipTx resolves ownership through the ordinary
@@ -88,7 +91,7 @@ func (s *Store) WipeContent(repoPrefix string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if _, err := deleteContentFTSByOwnershipTx(tx, contentOwnerByRepo, repoPrefix); err != nil {
+	if _, err := deleteContentFTSByOwnershipTx(tx, contentOwnerByRepo, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -107,7 +110,7 @@ func (s *Store) WipeContentFile(filePath string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if _, err := deleteContentFTSByOwnershipTx(tx, contentOwnerByFile, filePath); err != nil {
+	if _, err := deleteContentFTSByOwnershipTx(tx, contentOwnerByFile, s.viewGen, filePath); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -125,12 +128,14 @@ func (s *Store) WipeContentFile(filePath string) error {
 func (s *Store) ContentRepoHasRows(repoPrefix string) (bool, error) {
 	var exists bool
 	if repoPrefix == "" {
-		err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM content_fts_rowid LIMIT 1)`).Scan(&exists)
+		err := s.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM content_fts_rowid WHERE view_gen = ? LIMIT 1
+	)`, s.viewGen).Scan(&exists)
 		return exists, err
 	}
 	err := s.db.QueryRow(`SELECT EXISTS(
-		SELECT 1 FROM content_fts_rowid WHERE repo_prefix = ? LIMIT 1
-	)`, repoPrefix).Scan(&exists)
+		SELECT 1 FROM content_fts_rowid WHERE view_gen = ? AND repo_prefix = ? LIMIT 1
+	)`, s.viewGen, repoPrefix).Scan(&exists)
 	return exists, err
 }
 
@@ -152,7 +157,7 @@ func (s *Store) WipeContentFileInRepo(repoPrefix, filePath string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if _, err := deleteContentFTSByOwnershipTx(tx, contentOwnerByRepoFile, repoPrefix, filePath); err != nil {
+	if _, err := deleteContentFTSByOwnershipTx(tx, contentOwnerByRepoFile, s.viewGen, repoPrefix, filePath); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -194,9 +199,10 @@ func (s *Store) DeleteContentFilesForRepoNotIn(repoPrefix string, keep map[strin
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	predicate := `repo_prefix = ?
+	predicate := `view_gen = ?
+AND repo_prefix = ?
 AND file_path NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
-	if _, err := deleteContentFTSByOwnershipTx(tx, predicate, repoPrefix, keepJSON); err != nil {
+	if _, err := deleteContentFTSByOwnershipTx(tx, predicate, s.viewGen, repoPrefix, keepJSON); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -316,9 +322,10 @@ func (s *Store) replaceContentFileGroupLocked(
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	predicate := `repo_prefix = ?
+	predicate := `view_gen = ?
+AND repo_prefix = ?
 AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
-	if _, err := deleteContentFTSByOwnershipTx(tx, predicate, repoPrefix, pathsJSON); err != nil {
+	if _, err := deleteContentFTSByOwnershipTx(tx, predicate, s.viewGen, repoPrefix, pathsJSON); err != nil {
 		return err
 	}
 	stats.ftsDeleteStatements++
@@ -342,7 +349,7 @@ AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
 			var insert strings.Builder
 			insert.WriteString(`INSERT INTO content_fts (rowid, node_id, repo_prefix, file_path, ordinal, body) VALUES `)
 			args := make([]any, 0, len(chunk)*6)
-			ownerArgs := make([]any, 0, len(chunk)*3)
+			ownerArgs := make([]any, 0, len(chunk)*4)
 			for _, item := range chunk {
 				if len(args) > 0 {
 					insert.WriteByte(',')
@@ -351,7 +358,7 @@ AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
 				rowid := nextRowid
 				nextRowid++
 				args = append(args, rowid, item.NodeID, repoPrefix, item.FilePath, item.Ordinal, item.Body)
-				ownerArgs = append(ownerArgs, rowid, repoPrefix, item.FilePath)
+				ownerArgs = append(ownerArgs, s.viewGen, rowid, repoPrefix, item.FilePath)
 			}
 			if _, err := tx.Exec(insert.String(), args...); err != nil {
 				return err
@@ -359,12 +366,12 @@ AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
 			stats.insertStatements++
 
 			var owners strings.Builder
-			owners.WriteString(`INSERT INTO content_fts_rowid (fts_rowid, repo_prefix, file_path) VALUES `)
+			owners.WriteString(`INSERT INTO content_fts_rowid (view_gen, fts_rowid, repo_prefix, file_path) VALUES `)
 			for i := range chunk {
 				if i > 0 {
 					owners.WriteByte(',')
 				}
-				owners.WriteString(`(?,?,?)`)
+				owners.WriteString(`(?,?,?,?)`)
 			}
 			if _, err := tx.Exec(owners.String(), ownerArgs...); err != nil {
 				return err
@@ -413,7 +420,7 @@ func (s *Store) AppendContent(repoPrefix string, items []graph.ContentFTSItem) e
 		var b strings.Builder
 		b.WriteString(`INSERT INTO content_fts (rowid, node_id, repo_prefix, file_path, ordinal, body) VALUES `)
 		args := make([]any, 0, len(chunk)*6)
-		mapArgs := make([]any, 0, len(chunk)*3)
+		mapArgs := make([]any, 0, len(chunk)*4)
 		for _, it := range chunk {
 			if it.NodeID == "" {
 				continue
@@ -425,7 +432,7 @@ func (s *Store) AppendContent(repoPrefix string, items []graph.ContentFTSItem) e
 			rowid := nextRowid + validOffset
 			validOffset++
 			args = append(args, rowid, it.NodeID, repoPrefix, it.FilePath, it.Ordinal, it.Body)
-			mapArgs = append(mapArgs, rowid, repoPrefix, it.FilePath)
+			mapArgs = append(mapArgs, s.viewGen, rowid, repoPrefix, it.FilePath)
 		}
 		if len(args) == 0 {
 			continue
@@ -434,12 +441,12 @@ func (s *Store) AppendContent(repoPrefix string, items []graph.ContentFTSItem) e
 			return err
 		}
 		var owners strings.Builder
-		owners.WriteString(`INSERT INTO content_fts_rowid (fts_rowid, repo_prefix, file_path) VALUES `)
-		for i := 0; i < len(mapArgs)/3; i++ {
+		owners.WriteString(`INSERT INTO content_fts_rowid (view_gen, fts_rowid, repo_prefix, file_path) VALUES `)
+		for i := 0; i < len(mapArgs)/4; i++ {
 			if i > 0 {
 				owners.WriteByte(',')
 			}
-			owners.WriteString(`(?,?,?)`)
+			owners.WriteString(`(?,?,?,?)`)
 		}
 		if _, err := tx.Exec(owners.String(), mapArgs...); err != nil {
 			return err
@@ -455,7 +462,10 @@ func (s *Store) AppendContent(repoPrefix string, items []graph.ContentFTSItem) e
 
 // backfillContentFTSRowidMap upgrades a store written before the ownership
 // sidecar existed. It scans the FTS virtual table once on that transition;
-// every subsequent Open sees a populated map and stays O(1).
+// every subsequent Open sees a populated map and stays O(1). Like the symbol
+// map's backfill it runs before the migration steps and so names no view_gen
+// column: the column's DEFAULT 0 puts recovered rows in the base corpus, and
+// an older store does not have the column yet.
 func backfillContentFTSRowidMap(db *sql.DB) error {
 	var mapped bool
 	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM content_fts_rowid)`).Scan(&mapped); err != nil {
@@ -480,6 +490,12 @@ SELECT rowid, repo_prefix, file_path FROM content_fts`)
 // improvement). Like BuildSymbolIndex it is a no-op for correctness — the
 // FTS index is maintained incrementally on every insert — and idempotent.
 func (s *Store) BuildContentIndex() error {
+	// Derived generations are immutable and invisible until publication. Their
+	// incremental FTS writes are already query-correct; optimizing the global
+	// virtual table once per generation only multiplies writer hold time.
+	if s.viewGen > 0 {
+		return nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.coordinatedBulkLoad {
@@ -512,10 +528,19 @@ func (s *Store) SearchContent(query, repoPrefix string, limit int) ([]graph.Cont
 	// ellipsis for elision, ~16 tokens of context. CAST(ordinal AS INTEGER)
 	// forces integer affinity so the FTS5 text column scans cleanly into an
 	// int.
-	sb.WriteString(`SELECT node_id, file_path, CAST(ordinal AS INTEGER), snippet(content_fts, 4, '', '', '…', 16), bm25(content_fts) FROM content_fts WHERE content_fts MATCH ?`)
-	args := []any{match}
+	// The rowid map carries the generation content_fts itself cannot: one
+	// shared virtual table holds every generation's sections, so the MATCH is
+	// joined back through content_fts_rowid (whose primary key IS fts_rowid) to
+	// keep hidden generations out of the candidate set. bm25 ordering is
+	// unchanged.
+	sb.WriteString(`SELECT content_fts.node_id, content_fts.file_path, CAST(content_fts.ordinal AS INTEGER), snippet(content_fts, 4, '', '', '…', 16), bm25(content_fts)
+FROM content_fts
+JOIN content_fts_rowid
+  ON content_fts_rowid.fts_rowid = content_fts.rowid AND content_fts_rowid.view_gen = ?
+WHERE content_fts MATCH ?`)
+	args := []any{s.viewGen, match}
 	if repoPrefix != "" {
-		sb.WriteString(` AND repo_prefix = ?`)
+		sb.WriteString(` AND content_fts.repo_prefix = ?`)
 		args = append(args, repoPrefix)
 	}
 	sb.WriteString(` ORDER BY bm25(content_fts) LIMIT ?`)
@@ -563,10 +588,16 @@ func (s *Store) SearchContent(query, repoPrefix string, limit int) ([]graph.Cont
 func (s *Store) ScanContent(repoPrefix string, fn func(nodeID, filePath, body string) bool) error {
 	var rows *sql.Rows
 	var err error
+	// Same rowid-map join as SearchContent: the virtual table is shared, so the
+	// generation filter has to come from the ownership sidecar.
+	const scan = `SELECT content_fts.node_id, content_fts.file_path, content_fts.body
+FROM content_fts
+JOIN content_fts_rowid
+  ON content_fts_rowid.fts_rowid = content_fts.rowid AND content_fts_rowid.view_gen = ?`
 	if repoPrefix == "" {
-		rows, err = s.db.Query(`SELECT node_id, file_path, body FROM content_fts`)
+		rows, err = s.db.Query(scan, s.viewGen)
 	} else {
-		rows, err = s.db.Query(`SELECT node_id, file_path, body FROM content_fts WHERE repo_prefix = ?`, repoPrefix)
+		rows, err = s.db.Query(scan+` WHERE content_fts.repo_prefix = ?`, s.viewGen, repoPrefix)
 	}
 	if err != nil {
 		return err

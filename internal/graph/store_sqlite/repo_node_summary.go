@@ -12,8 +12,8 @@ func (s *Store) GetRepoNodeSummariesByLanguage(repoPrefix, language string) []*g
 		return nil
 	}
 	rows, err := s.db.Query(
-		`SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE repo_prefix = ? AND language = ?`,
-		repoPrefix, language,
+		`SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE repo_prefix = ? AND language = ? AND view_gen = ?`,
+		repoPrefix, language, s.viewGen,
 	)
 	if err != nil {
 		panicOnFatal(err)

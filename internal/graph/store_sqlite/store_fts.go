@@ -57,9 +57,12 @@ var (
 // rows is 960 params, below SQLite's conservative 999-variable limit.
 const ftsInsertChunkRows = 240
 
+// The FTS5 virtual table itself is not generation-keyed — a vtable has no
+// rewritable primary key — so the docid map carries the generation and every
+// statement below resolves docids through it.
 const deleteSymbolFTSForRepoSQL = `DELETE FROM symbol_fts
 WHERE rowid IN (
-    SELECT fts_rowid FROM symbol_fts_rowid WHERE repo_prefix = ?
+    SELECT fts_rowid FROM symbol_fts_rowid WHERE view_gen = ? AND repo_prefix = ?
 )`
 
 // nextFTSRowIDTx allocates a contiguous docid range while the caller holds
@@ -87,7 +90,7 @@ func (s *Store) UpsertSymbolFTS(nodeID, tokens string) error {
 // maintains, so this is the corpus size.
 func (s *Store) SymbolFTSCount() (int, error) {
 	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_fts_rowid`).Scan(&count); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM symbol_fts_rowid WHERE view_gen = ?`, s.viewGen).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count, nil
@@ -117,10 +120,10 @@ func (s *Store) ResetSymbolFTS(repoPrefix string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, repoPrefix); err != nil {
+	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -168,16 +171,17 @@ func (s *Store) BatchDeleteSymbolFTS(nodeIDs []string) error {
 		end := minInt(start+ftsInsertChunkRows, len(ids))
 		chunk := ids[start:end]
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-		args := make([]any, len(chunk))
-		for i, nodeID := range chunk {
-			args[i] = nodeID
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.viewGen)
+		for _, nodeID := range chunk {
+			args = append(args, nodeID)
 		}
 		if _, err := tx.Exec(`DELETE FROM symbol_fts WHERE rowid IN (
-SELECT fts_rowid FROM symbol_fts_rowid WHERE node_id IN (`+placeholders+`)
+SELECT fts_rowid FROM symbol_fts_rowid WHERE view_gen = ? AND node_id IN (`+placeholders+`)
 )`, args...); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE node_id IN (`+placeholders+`)`, args...); err != nil {
+		if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE view_gen = ? AND node_id IN (`+placeholders+`)`, args...); err != nil {
 			return err
 		}
 	}
@@ -207,7 +211,7 @@ func dedupeSymbolFTSItems(items []graph.SymbolFTSItem) []graph.SymbolFTSItem {
 // open write transaction, advancing *nextRowid over the docids it allocates.
 // Shared by the incremental batch path and the whole-repository replacement so
 // the two cannot drift in how they derive ownership or reuse docids.
-func upsertSymbolFTSChunkTx(tx *sql.Tx, chunk []graph.SymbolFTSItem, nextRowid *int64, stats *symbolFTSBatchStats) error {
+func upsertSymbolFTSChunkTx(tx *sql.Tx, viewGen int64, chunk []graph.SymbolFTSItem, nextRowid *int64, stats *symbolFTSBatchStats) error {
 	type rowState struct {
 		repoPrefix string
 		rowid      int64
@@ -227,12 +231,18 @@ func upsertSymbolFTSChunkTx(tx *sql.Tx, chunk []graph.SymbolFTSItem, nextRowid *
 		lookup.WriteString(`(?, ?)`)
 		lookupArgs = append(lookupArgs, i, item.NodeID)
 	}
+	// Both LEFT JOINs bind the same generation: the owning repo prefix must be
+	// read from the node this generation carries, not a same-id node another
+	// generation happens to hold, or the row would be filed under the wrong
+	// repository in this generation's index.
 	lookup.WriteString(`)
 SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid
 FROM wanted
-LEFT JOIN nodes ON nodes.id = wanted.node_id
-LEFT JOIN symbol_fts_rowid ON symbol_fts_rowid.node_id = wanted.node_id
+LEFT JOIN nodes ON nodes.id = wanted.node_id AND nodes.view_gen = ?
+LEFT JOIN symbol_fts_rowid
+       ON symbol_fts_rowid.view_gen = ? AND symbol_fts_rowid.node_id = wanted.node_id
 ORDER BY wanted.ord`)
+	lookupArgs = append(lookupArgs, viewGen, viewGen)
 	rows, err := tx.Query(lookup.String(), lookupArgs...)
 	if err != nil {
 		return err
@@ -309,14 +319,14 @@ ORDER BY wanted.ord`)
 	stats.insertStatements++
 
 	var ownership strings.Builder
-	ownership.WriteString(`INSERT OR REPLACE INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES `)
-	ownershipArgs := make([]any, 0, len(chunk)*3)
+	ownership.WriteString(`INSERT OR REPLACE INTO symbol_fts_rowid (view_gen, node_id, repo_prefix, fts_rowid) VALUES `)
+	ownershipArgs := make([]any, 0, len(chunk)*4)
 	for i, item := range chunk {
 		if i > 0 {
 			ownership.WriteByte(',')
 		}
-		ownership.WriteString(`(?, ?, ?)`)
-		ownershipArgs = append(ownershipArgs, item.NodeID, states[i].repoPrefix, states[i].rowid)
+		ownership.WriteString(`(?, ?, ?, ?)`)
+		ownershipArgs = append(ownershipArgs, viewGen, item.NodeID, states[i].repoPrefix, states[i].rowid)
 	}
 	if _, err := tx.Exec(ownership.String(), ownershipArgs...); err != nil {
 		return err
@@ -351,7 +361,7 @@ func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatc
 
 	for start := 0; start < len(items); start += ftsInsertChunkRows {
 		end := minInt(start+ftsInsertChunkRows, len(items))
-		if err := upsertSymbolFTSChunkTx(tx, items[start:end], &nextRowid, &stats); err != nil {
+		if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats); err != nil {
 			return stats, err
 		}
 	}
@@ -399,10 +409,10 @@ func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]gra
 
 	// Drive the wipe through the indexed rowid sidecar, and drop the sidecar
 	// rows in lockstep so the two can never diverge.
-	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, repoPrefix); err != nil {
+	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	// Allocated after the wipe: every surviving docid is below this, so newly
@@ -418,7 +428,7 @@ func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]gra
 		items = dedupeSymbolFTSItems(items)
 		for start := 0; start < len(items); start += ftsInsertChunkRows {
 			end := minInt(start+ftsInsertChunkRows, len(items))
-			if err := upsertSymbolFTSChunkTx(tx, items[start:end], &nextRowid, &stats); err != nil {
+			if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats); err != nil {
 				return err
 			}
 		}
@@ -487,13 +497,13 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 	// Drive the wipe through the indexed rowid sidecar. Filtering the FTS5
 	// table's UNINDEXED repo_prefix column here used to rescan the growing
 	// corpus once per repository during a cold multi-repo build.
-	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, repoPrefix); err != nil {
+	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	// Drop this repo's rowid-map entries in lockstep with the symbol_fts
 	// wipe so the two never diverge; they are rebuilt from the freshly
 	// inserted rows below.
-	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	nextRowid, err := nextFTSRowIDTx(tx, "symbol_fts")
@@ -520,14 +530,14 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 		}
 
 		var rowids strings.Builder
-		rowids.WriteString(`INSERT INTO symbol_fts_rowid (node_id, repo_prefix, fts_rowid) VALUES `)
-		mapArgs := make([]any, 0, len(chunk)*3)
+		rowids.WriteString(`INSERT INTO symbol_fts_rowid (view_gen, node_id, repo_prefix, fts_rowid) VALUES `)
+		mapArgs := make([]any, 0, len(chunk)*4)
 		for i, it := range chunk {
 			if i > 0 {
 				rowids.WriteByte(',')
 			}
-			rowids.WriteString(`(?,?,?)`)
-			mapArgs = append(mapArgs, it.NodeID, repoPrefix, nextRowid+int64(start+i))
+			rowids.WriteString(`(?,?,?,?)`)
+			mapArgs = append(mapArgs, s.viewGen, it.NodeID, repoPrefix, nextRowid+int64(start+i))
 		}
 		if _, err := tx.Exec(rowids.String(), mapArgs...); err != nil {
 			return err
@@ -547,7 +557,11 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 // map entry, skip the delete, and leak a duplicate FTS row. It is a
 // one-time cost: skipped once the map has any row (steady state) or when
 // the FTS index is empty (a fresh DB the bulk path will populate with the
-// map maintained inline). Runs at Open, before any reader or writer.
+// map maintained inline). Runs at Open, before any reader or writer — and so
+// before the migration steps, which is why it names no view_gen column: on a
+// store that already carries one the column's DEFAULT 0 puts the recovered
+// rows in the base corpus they belong to, and on an older store the column is
+// not there yet to name.
 func backfillSymbolFTSRowidMap(db *sql.DB) error {
 	var mapped bool
 	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM symbol_fts_rowid)`).Scan(&mapped); err != nil {
@@ -576,6 +590,12 @@ func backfillSymbolFTSRowidMap(db *sql.DB) error {
 // error is ignored because the index is already correct without it.
 // Idempotent — safe to call any number of times.
 func (s *Store) BuildSymbolIndex() error {
+	// A generation's rows are correct as soon as its bounded inserts commit.
+	// FTS5 optimize is global maintenance, so running it for every unpublished
+	// generation turns a view burst into repeated whole-table writer holds.
+	if s.viewGen > 0 {
+		return nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.coordinatedBulkLoad {
@@ -669,13 +689,22 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 		return nil, nil
 	}
 
-	q := `SELECT node_id, bm25(symbol_fts) FROM symbol_fts WHERE symbol_fts MATCH ?`
-	args := []any{match}
+	// symbol_fts is one shared virtual table across every generation, so the
+	// MATCH alone would rank rows this handle cannot see. The rowid map carries
+	// the generation and its symbol_fts_rowid_by_rowid index is UNIQUE on
+	// fts_rowid, so the join is a per-candidate point seek and the bm25
+	// ordering below is untouched.
+	q := `SELECT symbol_fts.node_id, bm25(symbol_fts)
+FROM symbol_fts
+JOIN symbol_fts_rowid
+  ON symbol_fts_rowid.fts_rowid = symbol_fts.rowid AND symbol_fts_rowid.view_gen = ?
+WHERE symbol_fts MATCH ?`
+	args := []any{s.viewGen, match}
 	if len(repoAllow) > 0 {
 		// The empty prefix always passes: unowned rows (synthetic
 		// externals) are admitted by every repo-narrow predicate — see
 		// QueryOptions.ScopeAllows for the invariant.
-		q += ` AND repo_prefix IN ('', ?` + strings.Repeat(`,?`, len(repoAllow)-1) + `)`
+		q += ` AND symbol_fts.repo_prefix IN ('', ?` + strings.Repeat(`,?`, len(repoAllow)-1) + `)`
 		for _, r := range repoAllow {
 			args = append(args, r)
 		}
@@ -825,7 +854,7 @@ func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, er
 	if s.bundles != nil {
 		missIDs = missIDs[:0:0]
 		for _, id := range ids {
-			if b, ok := s.bundles.lookup(id); ok {
+			if b, ok := s.bundles.lookup(s.viewGen, id); ok {
 				cached[id] = b
 				continue
 			}
@@ -867,7 +896,7 @@ func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, er
 			InEdges:  in[id],
 		}
 		if s.bundles != nil {
-			s.bundles.store(b)
+			s.bundles.store(s.viewGen, b)
 		}
 		bundles = append(bundles, b)
 	}

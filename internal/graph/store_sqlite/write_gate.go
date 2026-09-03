@@ -66,3 +66,22 @@ func (g *sqliteWriteGate) Unlock() {
 		panic("store_sqlite: unlock of unlocked write gate")
 	}
 }
+
+// HoldWriteGate takes the store's mutation gate and returns the release.
+//
+// It is the exclusive-writer window in its own right, the way ResolveMutex is
+// the resolver's: a caller that needs every other write to queue behind it
+// holds this, and the read pool keeps answering throughout. It is also the
+// only way a package that cannot see the gate can reproduce a saturated
+// writer — the state a long build leaves the store in — and prove that a read
+// path never reaches for it.
+//
+// Nothing bounds how long the gate may be held, so the release belongs on a
+// defer. It is idempotent; releasing twice does not free somebody else's turn.
+func (s *Store) HoldWriteGate(ctx context.Context) (func(), error) {
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() { once.Do(s.writeMu.Unlock) }, nil
+}

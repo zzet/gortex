@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -518,5 +519,32 @@ func BenchmarkCSharpExtractSiblingHeavyTypeArgStamps(b *testing.B) {
 		if _, err := e.Extract("Siblings.cs", sb); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// Aliases x plain fields (issue 727): no stamp is ever possible - every
+// declared type is `int` - yet the per-stamp-site helper copied the file's
+// whole alias set into a fresh map once per field. 2,000 x 2,000 cost
+// 460 MB/op before csharpOpenNames kept the alias half by reference.
+func BenchmarkCSharpExtractAliasHeavyPlainFields(b *testing.B) {
+	for _, n := range []int{1000, 2000} {
+		var sb strings.Builder
+		for i := 0; i < n; i++ {
+			sb.WriteString("using Alias" + itoa(i) + " = App.Target" + itoa(i) + ";\n")
+		}
+		sb.WriteString("namespace App {\n    public class Holder {\n")
+		for i := 0; i < n; i++ {
+			sb.WriteString("        private int _f" + itoa(i) + ";\n")
+		}
+		sb.WriteString("    }\n}\n")
+		src := []byte(sb.String())
+		e := NewCSharpExtractor()
+		b.Run(itoa(n)+"x"+itoa(n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if _, err := e.Extract("Aliases.cs", src); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

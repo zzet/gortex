@@ -193,14 +193,15 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 		}
 		candidateIDs = append(candidateIDs, n.ID)
 	}
-	fanIn, fanOut := analysis.CollectFanCounts(s.graph, candidateIDs,
+	reader := s.readerFor(ctx)
+	fanIn, fanOut := analysis.CollectFanCounts(reader, candidateIDs,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		[]graph.EdgeKind{graph.EdgeCalls},
 	)
 
 	crossings := map[string]int{}
 	for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-		for e := range s.graph.EdgesByKind(kind) {
+		for e := range reader.EdgesByKind(kind) {
 			if e == nil {
 				continue
 			}
@@ -219,8 +220,8 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 
 	now := time.Now()
 
-	covRows := s.coverageByID()
-	blame := blameRowsByID(s.graph)
+	covRows := coverageRowsByID(reader)
+	blame := blameRowsByID(reader)
 	rows := make([]healthScoreRow, 0, 128)
 	for _, n := range scoped {
 		if n == nil {
@@ -352,7 +353,7 @@ func (s *Server) handleAnalyzeHealthScore(ctx context.Context, req mcp.CallToolR
 		})
 	case "repo":
 		rollupRows = rollupHealthBy(rows, "repo", func(r healthScoreRow) string {
-			return repoPrefixForPath(s, r.File)
+			return repoPrefixForPath(reader, r.File)
 		})
 	}
 
@@ -594,18 +595,18 @@ func rollupHealthBy(rows []healthScoreRow, scope string, keyFn func(healthScoreR
 }
 
 // repoPrefixForPath returns the indexed repo prefix that owns the
-// given graph file path. Falls back to the path's first component
-// when no tracked repo claims it — keeps the rollup defined on
-// single-repo setups that don't carry a RepoPrefix at all.
-func repoPrefixForPath(s *Server, path string) string {
+// given graph file path, read through g. Falls back to the path's
+// first component when no tracked repo claims it — keeps the rollup
+// defined on single-repo setups that don't carry a RepoPrefix at all.
+func repoPrefixForPath(g graph.Reader, path string) string {
 	if path == "" {
 		return ""
 	}
 	// Match against the KindFile node so we read the prefix the
 	// indexer stamped. Cheap lookup — the graph indexes nodes by
 	// ID already and KindFile IDs equal the file path.
-	if s.graph != nil {
-		if n := s.graph.GetNode(path); n != nil && n.RepoPrefix != "" {
+	if g != nil {
+		if n := g.GetNode(path); n != nil && n.RepoPrefix != "" {
 			return n.RepoPrefix
 		}
 	}

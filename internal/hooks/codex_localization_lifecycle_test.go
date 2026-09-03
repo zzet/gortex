@@ -12,7 +12,7 @@ import (
 func TestCodexLocalizationLifecycleArmsClaimCheckFromReceipt(t *testing.T) {
 	configureLocalizationTerminalTestHome(t)
 	oldProbe := userPromptProbe
-	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) { return nil, nil }
+	userPromptProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) { return nil, nil }
 	t.Cleanup(func() { userPromptProbe = oldProbe })
 
 	sessionID := "codex-lifecycle"

@@ -430,32 +430,45 @@ func (idx *Indexer) snapshotAffectedBy(graphPath string) *affectedBySnapshot {
 // key plus an add of the new one, so it lands here through the removed
 // side. Newly added symbols are never part of the delta — nothing can
 // hold a stale reference to a symbol that did not exist.
-func affectedByDelta(g graph.Store, snap *affectedBySnapshot, newNodes []*graph.Node) []string {
-	current := make(map[string]symbolShape, len(newNodes))
-	refNodes := make([]*graph.Node, 0, len(newNodes))
-	for _, n := range newNodes {
-		if n == nil || n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
+func semanticShapeNodes(nodes []*graph.Node) []*graph.Node {
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil || node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
 			continue
 		}
-		refNodes = append(refNodes, n)
+		out = append(out, node)
 	}
-	adj := loadSymbolShapeAdjacency(g, refNodes, newNodes)
-	for _, n := range refNodes {
-		key := stableSymbolKey(n)
-		cur := current[key]
-		cur.kind = n.Kind
-		cur.shape += symbolShapeFromAdjacency(n, adj) + "\n"
-		current[key] = cur
+	return out
+}
+
+func semanticShapeSet(nodes []*graph.Node, adj symbolShapeAdjacency) map[string]symbolShape {
+	shapes := make(map[string]symbolShape, len(nodes))
+	for _, node := range semanticShapeNodes(nodes) {
+		key := stableSymbolKey(node)
+		shape := shapes[key]
+		shape.kind = node.Kind
+		shape.shape += symbolShapeFromAdjacency(node, adj) + "\n"
+		shapes[key] = shape
 	}
+	return shapes
+}
+
+func semanticShapeDelta(before, after map[string]symbolShape) []string {
 	var delta []string
-	for key, old := range snap.symbols {
-		now, exists := current[key]
+	for key, old := range before {
+		now, exists := after[key]
 		if !exists || now.kind != old.kind || now.shape != old.shape {
 			delta = append(delta, key)
 		}
 	}
 	sort.Strings(delta)
 	return delta
+}
+
+func affectedByDelta(g graph.Store, snap *affectedBySnapshot, newNodes []*graph.Node) []string {
+	refNodes := semanticShapeNodes(newNodes)
+	current := semanticShapeSet(refNodes, loadSymbolShapeAdjacency(g, refNodes, newNodes))
+	return semanticShapeDelta(snap.symbols, current)
 }
 
 // affectedFilesFor unions the persisted reverse lookup with the

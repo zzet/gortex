@@ -223,9 +223,9 @@ func TestDispatcher_RemoteRoutableCWD_Passes(t *testing.T) {
 	d.SetRouter(router)
 
 	// Sanity: cwdReachable agrees the remote-routable cwd passes.
-	assert.True(t, d.cwdReachable(remote),
+	assert.True(t, d.cwdReachable(context.Background(), remote),
 		"cwd inside remote-served repo must be reachable")
-	assert.False(t, d.cwdReachable(filepath.Join(t.TempDir(), "nowhere")),
+	assert.False(t, d.cwdReachable(context.Background(), filepath.Join(t.TempDir(), "nowhere")),
 		"cwd with no .gortex.yaml + no roster match must be rejected")
 
 	// End-to-end: Dispatch must NOT short-circuit with repo_not_tracked
@@ -288,7 +288,7 @@ func TestDispatcher_LocalWorkspaceUmbrellaCWD_Passes(t *testing.T) {
 	})
 	d.SetRouter(router)
 
-	assert.True(t, d.cwdReachable(umbrella),
+	assert.True(t, d.cwdReachable(context.Background(), umbrella),
 		"workspace-umbrella cwd must be reachable when .gortex.yaml declares a workspace, even when no server claims it")
 
 	sess := &daemon.Session{ID: "sess_umbrella", CWD: umbrella}
@@ -332,7 +332,7 @@ func TestDispatcher_UnreachableCWD_StillRejected(t *testing.T) {
 	d.SetRouter(router)
 
 	stranger := t.TempDir() // no .gortex.yaml, not tracked, no roster match
-	assert.False(t, d.cwdReachable(stranger))
+	assert.False(t, d.cwdReachable(context.Background(), stranger))
 
 	sess := &daemon.Session{ID: "sess_stranger", CWD: stranger}
 	frame := []byte(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"graph_stats","arguments":{}}}`)
@@ -364,7 +364,7 @@ func TestDispatcher_WorkspaceRootCWD_Passes(t *testing.T) {
 
 	d, mi := trackedPathMCPSetup(t, app)
 
-	assert.True(t, d.cwdReachable(parent),
+	assert.True(t, d.cwdReachable(context.Background(), parent),
 		"workspace root above one tracked repo must be reachable")
 
 	sess := &daemon.Session{ID: "sess_wsroot", CWD: parent}
@@ -396,7 +396,7 @@ func TestDispatcher_WorkspaceRootCWD_Passes(t *testing.T) {
 	require.NoError(t, err)
 	_, _, _, singleSlug := mi.ScopeForCWD(parent)
 	require.False(t, singleSlug, "precondition: the parent must span two workspaces")
-	assert.True(t, d.cwdReachable(parent),
+	assert.True(t, d.cwdReachable(context.Background(), parent),
 		"parent containing repos in different workspaces must bind to the contained repo set")
 
 	sess = &daemon.Session{ID: "sess_wsroot_mixed", CWD: parent}
@@ -432,7 +432,7 @@ func TestDispatcher_GateMatchesSessionScope(t *testing.T) {
 
 	stranger := t.TempDir()
 
-	for _, tc := range []struct {
+	cases := []struct {
 		name string
 		cwd  string
 		want bool
@@ -441,9 +441,21 @@ func TestDispatcher_GateMatchesSessionScope(t *testing.T) {
 		{"subdirectory of a tracked repo", filepath.Join(repoA, "internal", "deep"), true},
 		{"parent containing two tracked repos", parent, true},
 		{"unrelated directory", stranger, false},
-	} {
+	}
+	aliasParent := filepath.Join(t.TempDir(), "parent-alias")
+	if err := os.Symlink(parent, aliasParent); err == nil {
+		cases = append(cases,
+			struct {
+				name string
+				cwd  string
+				want bool
+			}{"canonical alias of a tracked repo", filepath.Join(aliasParent, "a"), true},
+		)
+	}
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gate := d.cwdReachable(tc.cwd)
+			gate := d.cwdReachable(context.Background(), tc.cwd)
 			assert.Equal(t, tc.want, gate, "gate verdict")
 
 			_, _, _, inside := mi.ScopeForCWD(tc.cwd)

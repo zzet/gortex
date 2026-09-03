@@ -10,6 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 func (s *Server) registerAnalysisTools() {
@@ -105,6 +106,10 @@ func (s *Server) handleGetCommunities(ctx context.Context, req mcp.CallToolReque
 	// probeable, and a community that straddles the boundary still has its
 	// foreign members dropped.
 	comms := s.communitiesInSessionScope(ctx, s.getCommunities())
+	// The partition is the server-wide one, computed over the base corpus
+	// rather than through this request's reader, so under a view every answer
+	// built from it describes the base.
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 
 	// If id is provided, return the single community in detail.
 	if id := req.GetString("id", ""); id != "" {
@@ -196,6 +201,10 @@ func (s *Server) handleGetProcesses(ctx context.Context, req mcp.CallToolRequest
 	// Clamp before the id branch so an out-of-scope process id reports the
 	// same "not found" as a fabricated one.
 	procs := s.processesInSessionScope(ctx, s.getProcesses())
+	// Process discovery is the server-wide pass over the base corpus, not a
+	// walk of this request's reader, so under a view every answer built from
+	// it describes the base.
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 
 	// If id is provided, return the single process in detail.
 	if id := req.GetString("id", ""); id != "" {
@@ -335,7 +344,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		return mcp.NewToolResultError("change detection refused a stale graph: " + freshnessErr.Error()), nil
 	}
 
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -379,7 +388,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		symbolIDs[i] = cs.ID
 	}
 
-	impact := analysis.AnalyzeImpact(s.graph, symbolIDs, s.getCommunities(), s.getProcesses())
+	impact := analysis.AnalyzeImpact(s.readerFor(ctx), symbolIDs, s.getCommunities(), s.getProcesses())
 
 	detectResult := map[string]any{
 		"changed_symbols":      diff.ChangedSymbols,
@@ -441,7 +450,7 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	impactCtx, cancelImpact := context.WithTimeout(ctx, 3*time.Second)
 	defer cancelImpact()
 	communities, processes := s.tryImpactAnalysisSnapshots()
-	impact := analysis.AnalyzeImpactContext(impactCtx, s.graph, ids, communities, processes)
+	impact := analysis.AnalyzeImpactContext(impactCtx, s.readerFor(ctx), ids, communities, processes)
 
 	result := map[string]any{
 		"risk":                 impact.Risk,
@@ -490,11 +499,12 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		// cheaply — so the safety gate is armed everywhere, not only on small
 		// embedded graphs.
 		var caveats []graph.ZeroImpactCaveat
+		reader := s.readerFor(ctx)
 		for _, id := range ids {
 			if id == "" {
 				continue
 			}
-			if c := graph.CaveatForZeroEdge(s.graph, id); c != nil {
+			if c := graph.CaveatForZeroEdge(reader, id); c != nil {
 				caveats = append(caveats, graph.ZeroImpactCaveat{
 					ID:      id,
 					Class:   c.Class,
@@ -657,13 +667,14 @@ func (s *Server) computeContractImpactContext(ctx context.Context, changedIDs []
 		}
 	}
 	aborted := false
+	reader := s.readerFor(ctx)
 	lookup := contracts.ShapeLookup(func(id string) *contracts.Shape {
-		if ctx.Err() != nil || s.graph == nil {
+		if ctx.Err() != nil || reader == nil {
 			aborted = true
 			return nil
 		}
 		var n *graph.Node
-		if getter, ok := s.graph.(contractImpactNodeContextGetter); ok {
+		if getter, ok := reader.(contractImpactNodeContextGetter); ok {
 			var err error
 			n, err = getter.GetNodeContext(ctx, id)
 			if err != nil {
@@ -678,7 +689,7 @@ func (s *Server) computeContractImpactContext(ctx context.Context, changedIDs []
 				aborted = true
 				return nil
 			}
-			n = s.graph.GetNode(id)
+			n = reader.GetNode(id)
 			if ctx.Err() != nil {
 				aborted = true
 				return nil

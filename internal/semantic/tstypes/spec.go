@@ -258,6 +258,18 @@ type LangSpec struct {
 	TypeDeclTypes map[string]bool
 	FuncDeclTypes map[string]bool
 
+	// MemberDeclName names the member declaration that authors every call
+	// site in n's subtree — a method, constructor, property, field
+	// declarator, indexer or event — spelled exactly as the extractor names
+	// that member's graph node, so the apply phase can pick a call fact's
+	// own author out of a same-line same-name stub tie. ok=false for any
+	// other node; a nested callable that mints no node of its own (a local
+	// function, a lambda) must answer false so its calls stay with the
+	// enclosing member, as the extractor's stubs do. nil (the default)
+	// records no author, and a tie is then broken by line containment
+	// alone, byte-for-byte as before.
+	MemberDeclName func(n *sitter.Node, src []byte) (string, bool)
+
 	// SelfName is the receiver keyword ("this", "self"); "" when the
 	// language has none.
 	SelfName string

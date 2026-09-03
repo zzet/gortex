@@ -65,7 +65,7 @@ func DefaultWakeupOptions() WakeupOptions {
 // communities. Returns the markdown body and an approximate token
 // count (bytes / 4). Exposed so CLI and MCP paths share one
 // implementation.
-func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts WakeupOptions) (markdown string, tokensEst int) {
+func BuildWakeup(g graph.Reader, communities *analysis.CommunityResult, opts WakeupOptions) (markdown string, tokensEst int) {
 	if opts.MaxTokens <= 0 {
 		opts.MaxTokens = 500
 	}
@@ -187,7 +187,7 @@ func BuildWakeup(g graph.Store, communities *analysis.CommunityResult, opts Wake
 // twice per candidate, the worst single hot spot in this file). We
 // stash the fan-out alongside each node so the sort never has to
 // re-query.
-func wakeupEntryPoints(g graph.Store, top int) []*graph.Node {
+func wakeupEntryPoints(g graph.Reader, top int) []*graph.Node {
 	type entry struct {
 		node   *graph.Node
 		fanOut int
@@ -288,7 +288,7 @@ func (s *Server) handleGortexWakeup(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	opts.PrecomputedHotspots = s.getHotspots()
-	md, est := BuildWakeup(s.graph, s.getCommunities(), opts)
+	md, est := BuildWakeup(s.readerFor(ctx), s.getCommunities(), opts)
 
 	format := strings.ToLower(strings.TrimSpace(req.GetString("format", "markdown")))
 	if format == "markdown" || format == "" {

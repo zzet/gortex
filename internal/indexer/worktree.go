@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -94,33 +93,6 @@ func ResolveWorktree(path string) WorktreeInfo {
 		info.MainRepoPath = filepath.Dir(common)
 	}
 	return info
-}
-
-// WorktreeRootGone reports whether a directory that was previously
-// tracked as a repository root has since disappeared from disk — the
-// `git worktree remove` (or manual `rm -rf`) case. It returns true only
-// when a Stat of the path fails with a not-exist error; a transient
-// error (EACCES on a mounted volume, an NFS hiccup) returns false so a
-// flaky filesystem can never trigger a destructive index eviction.
-//
-// This mirrors the deletion-detection rule IncrementalReindexPaths already
-// uses for individual files: only os.ErrNotExist counts as gone, every
-// other Stat error is treated as "preserve, can't verify."
-//
-// The check is path existence, not git liveness: once the worktree
-// directory is gone there is no `.git` file left to resolve, so the
-// only signal available is "the root no longer exists." Callers that
-// need to know the directory *was* a worktree must remember that fact
-// from when it was still on disk (see RepoMetadata.IsWorktree).
-func WorktreeRootGone(rootPath string) bool {
-	if rootPath == "" {
-		return false
-	}
-	_, err := os.Stat(rootPath)
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, os.ErrNotExist)
 }
 
 // WorktreeInstanceName decides the repo prefix that absPath should be

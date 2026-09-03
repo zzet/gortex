@@ -28,6 +28,7 @@ import (
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/fixtures"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/intern"
 	"github.com/zzet/gortex/internal/licenses"
 	"github.com/zzet/gortex/internal/modules"
@@ -209,6 +210,11 @@ type Indexer struct {
 	// probeGates memoises admission gates for single-path probes.
 	probeGates probeGateCache
 	rootPath   string
+	// contentSrc is the optional immutable snapshot every content read
+	// goes through; nil reads the working tree with the os package. Held
+	// in an atomic pointer because reindex paths read it without a lock,
+	// the same way they read rootPath.
+	contentSrc atomic.Pointer[contentSourceRef]
 	// projectName is the repo's own name (go.mod module / package.json /
 	// dir), computed once per index. Stripped from the BM25-indexed file
 	// path so a query word matching it doesn't earn a useless uniform
@@ -742,9 +748,8 @@ const (
 // (shouldIndexForSearch, ftsTokensFor) so the corpus is identical whichever
 // path produced it.
 func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
-	replacer, hasReplacer := idx.graph.(graph.SymbolFTSRepoReplacer)
 	stream, hasStream := idx.graph.(graph.ScopedProjectionSequencer)
-	if !hasReplacer || !hasStream {
+	if !hasStream {
 		return nil
 	}
 
@@ -755,7 +760,7 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 	}
 
 	written := 0
-	err := replacer.ReplaceSymbolFTS(repoPrefix, func(emit func([]graph.SymbolFTSItem) error) error {
+	produce := func(emit func([]graph.SymbolFTSItem) error) error {
 		items := make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
 		var pending uint64
 		flush := func() error {
@@ -770,7 +775,6 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 			pending = 0
 			return nil
 		}
-		var produceErr error
 		for node := range stream.NodesInScopeSeq([]string{repoPrefix}, nil) {
 			if node == nil || !idx.shouldIndexForSearch(node) {
 				continue
@@ -779,16 +783,37 @@ func (idx *Indexer) populateSymbolFTS(reporter progress.Reporter) error {
 			items = append(items, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
 			pending += uint64(len(node.ID) + len(tokens) + 32)
 			if len(items) >= symbolFTSDirectChunkRows || pending >= symbolFTSDirectChunkBytes {
-				if produceErr = flush(); produceErr != nil {
-					break
+				if err := flush(); err != nil {
+					return err
 				}
 			}
 		}
-		if produceErr != nil {
-			return produceErr
-		}
 		return flush()
-	})
+	}
+
+	// A building generation is not visible through a route, so it does not
+	// need the base-corpus replacement's one giant transaction. Reset once and
+	// commit bounded batches instead, releasing SQLite's writer between chunks
+	// so lifecycle and ref-view heartbeat writes remain responsive.
+	derived := false
+	if scoped, ok := idx.graph.(interface{ ViewGeneration() int64 }); ok {
+		derived = scoped.ViewGeneration() > 0
+	}
+	var err error
+	if derived {
+		resetter, resetOK := idx.graph.(graph.SymbolFTSRepoResetter)
+		batcher, batchOK := idx.graph.(graph.SymbolFTSBatchUpserter)
+		if !resetOK || !batchOK {
+			return fmt.Errorf("indexer: symbol FTS backend lacks bounded reset/upsert capabilities")
+		}
+		if err = resetter.ResetSymbolFTS(repoPrefix); err == nil {
+			err = produce(batcher.BatchUpsertSymbolFTS)
+		}
+	} else if replacer, ok := idx.graph.(graph.SymbolFTSRepoReplacer); ok {
+		err = replacer.ReplaceSymbolFTS(repoPrefix, produce)
+	} else {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("indexer: rebuild symbol FTS: %w", err)
 	}
@@ -2355,8 +2380,17 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // indexCtxRaw performs full-tree indexing while the caller holds the
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
+	defer recoverIndexCtxRawStoragePanic(&result, &retErr)
+
 	start := time.Now()
 	reporter := progress.FromContext(ctx)
+	// Pin the destination's reachability scope before the cold-index shadow can
+	// replace idx.graph with its plain in-memory staging graph. The staging graph
+	// deliberately has no view-generation identity; asking it at the end of the
+	// pass would therefore misclassify a derived-generation build as a base
+	// mutation and retire the base corpus's reach records even though the drain
+	// writes only the generation-pinned target.
+	writesBaseReachTopology := reach.WritesBaseTopology(idx.graph)
 
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -2379,14 +2413,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// syscall per file regardless; trading one walk-time stat for two
 	// later stats is the net win.
 	maxSize := idx.config.MaxFileSize
-	// Built once per walk, handed to admitFile per file. untracked drops
-	// asset-class files git doesn't track (opt-in); content drops oversized
-	// documents and binary/vector data before they are read (#120). Both are
-	// inert on an all-code repo.
-	gates := admissionGates{
-		untracked: idx.newUntrackedAssetGate(ctx, absRoot),
-		content:   idx.newContentAdmissionGate(),
-	}
+	// Corpus-admission gate: drops oversized document assets and (by
+	// default) binary/vector data artifacts at the walk, before they are
+	// read and extracted, so a content-heavy repo can't pull gigabytes of
+	// non-source files into the parse pipeline and OOM (#120). Inert for
+	// all-code repos.
+	contentGate := idx.newContentAdmissionGate()
+	// Git-aware admission (opt-in): when index.skip_untracked_assets is on,
+	// drop asset-class files git does not track — uncommitted RAG corpora /
+	// datasets / build outputs that .gitignore can't catch (#120). Inert
+	// when off, on a non-git repo, or when git is unavailable.
+	untrackedGate := idx.newUntrackedAssetGate(ctx, absRoot)
 	var files []walkedFile
 	var skippedLarge int
 	var skippedBytes int64
@@ -2394,52 +2431,97 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var skippedByContent []skippedFile
 	var skippedContentBytes int64
 	var parseFailedFiles []skippedFile
-	err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if idx.shouldPruneDir(path, absRoot) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		info, statErr := d.Info()
-		if statErr != nil {
-			// Couldn't read FileInfo (race with deletion, broken
-			// symlink, …). Skip — the worker would fail too.
-			return nil
-		}
-		lang, reason := idx.admitFile(path, absRoot, info.Size(), gates)
-		switch reason {
-		case "":
-			// Admitted.
-		case skipReasonExcluded, skipReasonNoLanguage:
-			return nil // corpus boundary, not skip telemetry
-		case skipReasonMaxFileSize:
-			skippedLarge++
-			skippedBytes += info.Size()
-			rel, _ := filepath.Rel(absRoot, path)
-			skippedBySize = append(skippedBySize, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(),
-			})
-			return nil
-		default: // the corpus-admission gates
-			skippedContentBytes += info.Size()
-			rel, _ := filepath.Rel(absRoot, path)
+	// admitWalkedFile applies the two gates that sit above the shared walk
+	// admission: the git-aware untracked-asset gate and the content-admission
+	// gate. Both walks below feed it, and both account for an over-cap file the
+	// same way, so a source-backed index admits what a filesystem index of the
+	// same bytes would — save for the per-directory ignore files a snapshot
+	// cannot consult, which shouldExclude names and the producer state
+	// declares.
+	admitWalkedFile := func(wf walkedFile) {
+		if reason, skip := untrackedGate.skip(wf.lang, wf.path); skip {
+			skippedContentBytes += wf.size
+			rel, _ := filepath.Rel(absRoot, wf.path)
 			skippedByContent = append(skippedByContent, skippedFile{
-				relPath: pathkey.Normalize(rel), lang: lang, size: info.Size(), reason: reason,
+				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+			})
+			return
+		}
+		if reason, skip := contentGate.skip(wf.lang, wf.size); skip {
+			skippedContentBytes += wf.size
+			rel, _ := filepath.Rel(absRoot, wf.path)
+			skippedByContent = append(skippedByContent, skippedFile{
+				relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size, reason: reason,
+			})
+			return
+		}
+		files = append(files, wf)
+	}
+	if src := idx.contentSource(); src != nil {
+		// A snapshot enumerates itself, through the same gate and with the
+		// same accounting. An over-cap entry is bucketed here rather than
+		// dropped inside the walk: the size-skip node it earns is what leaves
+		// a trace at that path, and a sparse generation needs that trace to
+		// claim the path at all — without it the layer below keeps showing its
+		// stale symbols through where a flat index of the same bytes shows a
+		// skip stub.
+		err = idx.walkSource(ctx, src, func(wf walkedFile, adm walkAdmission) error {
+			if adm.oversize {
+				skippedLarge++
+				skippedBytes += wf.size
+				rel, _ := filepath.Rel(absRoot, wf.path)
+				skippedBySize = append(skippedBySize, skippedFile{
+					relPath: pathkey.Normalize(rel), lang: wf.lang, size: wf.size,
+				})
+				return nil
+			}
+			admitWalkedFile(wf)
+			return nil
+		})
+	} else {
+		err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			// The FileInfo is taken before the admission gate rather than
+			// between its stages, because the gate needs the size for the cap.
+			// It costs one lstat on a file the language or exclude check would
+			// have rejected without any — the price of both walks sharing one
+			// gate instead of two copies that can drift.
+			info, statErr := d.Info()
+			if statErr != nil {
+				// Couldn't read FileInfo (race with deletion, broken
+				// symlink, …). Skip — the worker would fail too.
+				return nil
+			}
+			adm := idx.admitWalkEntry(absRoot, path, info.Size(), false)
+			if adm.oversize {
+				skippedLarge++
+				skippedBytes += info.Size()
+				rel, _ := filepath.Rel(absRoot, path)
+				skippedBySize = append(skippedBySize, skippedFile{
+					relPath: pathkey.Normalize(rel), lang: adm.lang, size: info.Size(),
+				})
+				return nil
+			}
+			if !adm.admit {
+				return nil
+			}
+			admitWalkedFile(walkedFile{
+				path:      path,
+				lang:      adm.lang,
+				size:      info.Size(),
+				mtimeNano: info.ModTime().UnixNano(),
 			})
 			return nil
-		}
-		files = append(files, walkedFile{
-			path:      path,
-			lang:      lang,
-			size:      info.Size(),
-			mtimeNano: info.ModTime().UnixNano(),
 		})
-		return nil
-	})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2526,7 +2608,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
-	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes
+	// A handle pinned to a derived payload generation is disqualified outright.
+	// The drain evicts the repository's persisted rows before its INSERT-only
+	// bulk load, and that eviction spans every generation — right for a
+	// re-track of the base corpus, and a wipe of the very corpus a sparse
+	// generation exists to leave alone. See derivedGenerationTarget.
+	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes &&
+		!derivedGenerationTarget(idx.graph)
 
 	// Acquire a queued shadow slot before the shared repository-memory envelope.
 	// Waiting candidates therefore hold no general memory reservation. Every
@@ -2684,17 +2772,23 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			idx.resolver.SetGraph(inMemShadow)
 		}
 		defer func() {
-			if retErr != nil {
-				if deferredVectorPlan != nil {
-					deferredVectorPlan.Release()
-					deferredVectorPlan = nil
-				}
+			// Restore the durable graph and every shadow-routed sink even when a
+			// legacy store mutation panics from inside this drain. This defer is
+			// registered before the drain does any work, so it also releases a
+			// vector plan whose ownership was never transferred to installation.
+			defer func() {
 				idx.graph = diskTarget
 				idx.contentSink = nil
 				idx.contractStateSink = nil
 				if idx.resolver != nil {
 					idx.resolver.SetGraph(diskTarget)
 				}
+				if deferredVectorPlan != nil {
+					deferredVectorPlan.Release()
+					deferredVectorPlan = nil
+				}
+			}()
+			if retErr != nil {
 				return
 			}
 			reporter.Report("persisting bulk graph", 0, 0)
@@ -2716,11 +2810,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			finishDrainPressure := drainPressure.begin()
 			defer finishDrainPressure()
 			// BulkLoad is INSERT-only. A fresh per-repository Indexer also has
-			// firstIndex=true on warm restart, so remove any persisted rows for
-			// this prefix after the replacement parse succeeds and before its
-			// first disk write. EvictRepo is a no-op on a genuine cold/new repo.
-			if n, e := diskTarget.EvictRepo(idx.RepoPrefix()); n > 0 || e > 0 {
-				idx.logger.Info("indexer: evicted stale repo rows before shadow drain",
+			// firstIndex=true on warm restart, so remove persisted rows only from
+			// this handle's generation after the replacement parse succeeds and
+			// before its first disk write. Immutable payload generations sharing
+			// the prefix remain queryable through their catalog pointers.
+			if n, e := evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix()); n > 0 || e > 0 {
+				idx.logger.Info("indexer: evicted stale generation rows before shadow drain",
 					zap.String("repo", idx.RepoPrefix()),
 					zap.Int("nodes", n), zap.Int("edges", e))
 			}
@@ -2981,6 +3076,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		contentRecordFile    func(filePath string)
 		contentStreamedMu    sync.Mutex
 		contentStreamedFiles map[string]struct{}
+		contentWalkComplete  bool
 	)
 	if cs := idx.contentSearcher(); cs != nil {
 		repoPrefix := idx.RepoPrefix()
@@ -3097,11 +3193,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	largeReadGate := make(chan struct{}, largeFileReadParallelism(workers))
 	readFile := func(wf walkedFile) ([]byte, error) {
 		if wf.size < largeFileReadThresholdBytes {
-			return os.ReadFile(wf.path)
+			return idx.readFileContent(wf.path)
 		}
 		largeReadGate <- struct{}{}
 		defer func() { <-largeReadGate }()
-		return os.ReadFile(wf.path)
+		return idx.readFileContent(wf.path)
 	}
 
 	// recordStreamedMtime persists a file's mtime incrementally, in batches,
@@ -3216,7 +3312,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// file themselves — one page/slide/sheet at a time — instead
 					// of materialising the whole file. Only the in-process route
 					// streams; the crash-isolation subprocess route keeps bytes.
-					if walkExt, found := idx.registry.GetByLanguage(wf.lang); found && parsePool == nil {
+					//
+					// The stream opens the path by handle, which is the working
+					// tree and not the snapshot a content source serves, so
+					// under a source the file falls through to the ordinary
+					// byte path below. A StreamingExtractor is an Extractor
+					// too, so the same extractor runs on the same content; what
+					// is given up is the O(one unit) memory bound, and that is
+					// worth less than reading the state the pass is describing.
+					streamable := idx.contentSource() == nil
+					if walkExt, found := idx.registry.GetByLanguage(wf.lang); found && parsePool == nil && streamable {
 						if se, ok := walkExt.(parser.StreamingExtractor); ok {
 							result, serr := idx.extractStreaming(se, path, relPath)
 							if serr != nil {
@@ -3597,6 +3702,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			return nil, err
 		}
 	}
+	// Reaching this boundary means the ContentSource Walk and every dispatched
+	// parse worker completed without cancellation. IndexCtx is the authoritative
+	// full-build API for its target handle: for a narrowed fileSetSource that
+	// means the exact sparse generation payload, not the repository's other
+	// generations. Incremental/partial mutation APIs never cross this boundary.
+	contentWalkComplete = true
 
 	// A pressure-sized shadow reserves its drain turn as soon as parsing has
 	// produced the graph. The later deferred drain marks this reservation ready
@@ -3720,37 +3831,31 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}
 
-		// Crash-safe content path: reap every content row this walk did NOT
-		// re-stream. keep is contentStreamedFiles — the files that actually
-		// produced content sections this run — NOT the surviving-file mtime
-		// set: a file can survive on disk yet stop yielding content (doc
-		// emptied, classification changed), and keying keep off mtimes would
-		// protect its stale rows forever. Recorded keys are the wipe's own
-		// argument (the node FilePath content_fts carries), so the comparison
-		// matches the stored rows in single- and multi-repo form alike. A walk
-		// that streamed NO content falls back to the repo-wide wipe: the repo
-		// has zero content files now, and the sweep's empty-keep guard (a
-		// never-wipe-from-empty safety net) would otherwise no-op and leave
-		// every stale row behind. Only when the per-file wipe path is active;
-		// on the repo-wide-wipe fallback the up-front pre-wipe already cleared
-		// both transitions. Runs only under the completed-walk guard above
-		// (len(mtimeSnapshot) > 0), so a killed parse never triggers it.
-		if contentWipeFile != nil {
-			contentStreamedMu.Lock()
-			keep := contentStreamedFiles
-			contentStreamedMu.Unlock()
-			if len(keep) == 0 {
-				if cs := idx.contentSearcher(); cs != nil {
-					if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
-						idx.logger.Warn("indexer: content wipe of contentless repo failed", zap.Error(err))
-					}
+	}
+
+	// Crash-safe content finalization is coupled to the completed authoritative
+	// walk above, not to mtimes. Snapshot ContentSources deliberately have no
+	// mtime field, so using len(mtimeSnapshot) as the completion proxy skipped
+	// this sweep for every git/file-set generation build. keep is the exact set
+	// of files that produced content in this target handle. An empty keep set is
+	// authoritative too: it means this payload has no content now. Cancellation
+	// and Walk failures return before contentWalkComplete, retaining old rows for
+	// retry; generation-scoped store handles isolate base and sibling payloads.
+	if contentWipeFile != nil && contentWalkComplete {
+		contentStreamedMu.Lock()
+		keep := contentStreamedFiles
+		contentStreamedMu.Unlock()
+		if len(keep) == 0 {
+			if cs := idx.contentSearcher(); cs != nil {
+				if err := cs.WipeContent(idx.RepoPrefix()); err != nil {
+					idx.logger.Warn("indexer: content wipe of contentless repo failed", zap.Error(err))
 				}
-			} else if sw, ok := idx.contentSearcher().(interface {
-				DeleteContentFilesForRepoNotIn(repoPrefix string, keep map[string]struct{}) error
-			}); ok {
-				if err := sw.DeleteContentFilesForRepoNotIn(idx.repoPrefix, keep); err != nil {
-					idx.logger.Warn("indexer: content sweep of stale files failed", zap.Error(err))
-				}
+			}
+		} else if sw, ok := idx.contentSearcher().(interface {
+			DeleteContentFilesForRepoNotIn(repoPrefix string, keep map[string]struct{}) error
+		}); ok {
+			if err := sw.DeleteContentFilesForRepoNotIn(idx.repoPrefix, keep); err != nil {
+				idx.logger.Warn("indexer: content sweep of stale files failed", zap.Error(err))
 			}
 		}
 	}
@@ -3929,8 +4034,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// InvalidateIndex call bumps the build counter so any
 			// stale stamps from a prior build (e.g. snapshot reload
 			// before a partial mutation) no longer shadow the live
-			// graph state.
-			reach.InvalidateIndex()
+			// graph state. A generation-pinned pass wrote none of the
+			// corpus those stamps describe, and runs outside the
+			// topology writer, so retiring them here would move the
+			// counter under a concurrent reader for nothing.
+			if writesBaseReachTopology {
+				reach.InvalidateIndex()
+			}
 		}
 	}
 
@@ -3981,6 +4091,26 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		idx.fullReindexed.Store(true)
 	}
 	return result, nil
+}
+
+// recoverIndexCtxRawStoragePanic contains operational SQLite failures at the
+// lowest synchronous full-index boundary. indexCtxRaw is also called directly
+// by cold-start, track, reindex, and reconciliation workers, so the public
+// IndexCtx recovery boundary alone cannot protect those goroutines. Registering
+// this defer at method entry makes every later cleanup defer run first. Only the
+// store's typed legacy panic payload is converted; parser, runtime, and
+// programmer panics must retain their established propagation semantics.
+func recoverIndexCtxRawStoragePanic(result **IndexResult, retErr *error) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+	if !ok {
+		panic(recovered)
+	}
+	*result = nil
+	*retErr = fmt.Errorf("indexer: graph storage failure: %w", storageErr)
 }
 
 // repoNodeEdgeCount returns this indexer's contribution to the graph,
@@ -4249,7 +4379,7 @@ func (idx *Indexer) indexFile(
 		if err != nil {
 			return err
 		}
-		src, readVersion, err = readFileWithVersion(absPath)
+		src, readVersion, err = idx.readFileWithVersion(absPath)
 		if err != nil {
 			return err
 		}
@@ -4652,6 +4782,12 @@ func (idx *Indexer) recordFileReadVersion(relPath, absPath string, version fileR
 	if !version.valid {
 		return false
 	}
+	if version.snapshot {
+		// An immutable snapshot has nothing to restat and no disk mtime
+		// worth stamping: the staleness ledger tracks the working tree,
+		// which this read never touched.
+		return true
+	}
 	current, err := os.Stat(absPath)
 	if err != nil || !sameFileVersion(version.info, current) {
 		return false
@@ -5018,8 +5154,10 @@ func (idx *Indexer) collectEmbedTexts(nodes []*graph.Node) (texts []string, ids 
 	if threshold <= 0 {
 		threshold = embedding.DefaultChunkThresholdLines
 	}
-	// fileCache memoizes one os.ReadFile per source file — many symbols
-	// share a file, and the chunker only needs the bytes once.
+	// fileCache memoizes one read per source file — many symbols share a
+	// file, and the chunker only needs the bytes once. The read goes
+	// through the content seam so the vectors describe the state the rest
+	// of the pass indexed, not whatever the working tree holds.
 	fileCache := make(map[string][]byte)
 	readFile := func(graphPath string) []byte {
 		if cached, ok := fileCache[graphPath]; ok {
@@ -5027,7 +5165,7 @@ func (idx *Indexer) collectEmbedTexts(nodes []*graph.Node) (texts []string, ids 
 		}
 		var data []byte
 		if abs := idx.ResolveFilePath(graphPath); abs != "" {
-			if b, err := os.ReadFile(abs); err == nil {
+			if b, err := idx.readFileContent(abs); err == nil {
 				data = b
 			}
 		}
@@ -5350,6 +5488,17 @@ func (idx *Indexer) shouldExclude(path, root string, isDir bool) bool {
 	if m := idx.excludeMatcher(); m != nil && m.MatchAbsDir(path, root, isDir) {
 		return true
 	}
+	if idx.contentSource() != nil {
+		// Per-directory ignore files are a working-tree fact: the
+		// hierarchical matcher reads them off disk, while a snapshot
+		// source serves a revision whose ignore files may differ from the
+		// checkout's — or not be on disk at all. A snapshot is therefore
+		// admitted by the layered config excludes alone, and an index
+		// built from one should declare that omission in its producer
+		// state rather than claim per-directory ignore coverage it never
+		// had.
+		return false
+	}
 	return idx.dirIgnoreMatcher(root).Match(path, isDir)
 }
 
@@ -5462,26 +5611,6 @@ func (idx *Indexer) warnIfWalkAdmittedNothing(absRoot string, admitted int) {
 		zap.String("pattern", cause.Pattern))
 }
 
-// absWithinRoot resolves a repo-relative path against root and refuses
-// anything that does not land inside it. The guard is load-bearing, not
-// defensive garnish: filepath.Join swallows a leading separator
-// (Join("/repo", "/etc/passwd") == "/repo/etc/passwd") and Cleans "../" away
-// against the root, so without it an absolute or escaping caller path is
-// silently rewritten into a plausible in-root path and answered for — a file
-// this repo does not own. Callers do hand over unvalidated strings: the MCP
-// graph-path helpers deliberately echo their input back when resolution fails.
-func absWithinRoot(root, relPath string) (string, bool) {
-	if root == "" || relPath == "" || filepath.IsAbs(relPath) {
-		return "", false
-	}
-	abs := filepath.Join(root, relPath)
-	rel, err := filepath.Rel(root, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	return abs, true
-}
-
 // shouldPruneDir reports whether the index walk may skip a directory
 // subtree wholesale (filepath.SkipDir) instead of descending it. A
 // directory is prunable only when it is excluded AND no re-include ("!")
@@ -5500,7 +5629,10 @@ func (idx *Indexer) shouldPruneDir(path, root string) bool {
 			return false
 		}
 	}
-	if idx.dirIgnoreMatcher(root).HasNegatedDescendant(path) {
+	// Same bypass as shouldExclude: under a snapshot source the
+	// per-directory ignore files are not part of the decision, so the
+	// matcher is not built at all.
+	if idx.contentSource() == nil && idx.dirIgnoreMatcher(root).HasNegatedDescendant(path) {
 		return false
 	}
 	return true
@@ -5911,15 +6043,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 					return nil
 				}
 				if d.IsDir() {
-					if idx.shouldPruneDir(path, absRoot) {
+					if idx.admitWalkEntry(absRoot, path, -1, true).pruneDir {
 						return filepath.SkipDir
 					}
 					return nil
 				}
-				if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
-					return nil
-				}
-				if idx.shouldExclude(path, absRoot, false) {
+				if !idx.admitScopedWalkFile(absRoot, path) {
 					return nil
 				}
 				// relKey (slash + NFC) keeps the disk set keyed
@@ -5939,10 +6068,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 
 		// Single file. Apply the same language / exclude gate so a
 		// caller can't force a non-source or excluded file in.
-		if _, ok := idx.effectiveLanguage(absPath, nil); !ok && !idx.isIncrementalContractManifest(absPath) {
-			continue
-		}
-		if idx.shouldExclude(absPath, absRoot, false) {
+		if !idx.admitScopedWalkFile(absRoot, absPath) {
 			continue
 		}
 		// relKey (slash + NFC) — same canonical key the graph and
@@ -6615,17 +6741,18 @@ func (idx *Indexer) routerPrefixScanFiles(reg *contracts.Registry) []string {
 	)
 }
 
-// contractFileSrc reads the on-disk source for a contract FilePath
-// (which is repo-prefixed when the indexer uses a repo prefix). Returns
-// nil when the file can't be read. Mirrors the disk-resolution logic in
-// resolveProviderHandlers so cross-file passes share one access pattern.
+// contractFileSrc reads the source behind a contract FilePath (which is
+// repo-prefixed when the indexer uses a repo prefix). Returns nil when the
+// file can't be read. Every cross-file contract pass goes through it, so the
+// bytes they see come from the same place the parse pipeline read: the
+// installed content source when there is one, and the working tree otherwise.
 func (idx *Indexer) contractFileSrc(filePath string) []byte {
 	diskPath := filePath
 	if idx.repoPrefix != "" && strings.HasPrefix(diskPath, idx.repoPrefix+"/") {
 		diskPath = strings.TrimPrefix(diskPath, idx.repoPrefix+"/")
 	}
 	diskPath = filepath.Join(idx.rootPath, diskPath)
-	data, err := os.ReadFile(diskPath)
+	data, err := idx.readFileContent(diskPath)
 	if err != nil {
 		return nil
 	}
@@ -6813,18 +6940,9 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		handlerNode := item.handler
 		src, ok := fileSrc[handlerNode.FilePath]
 		if !ok {
-			diskPath := handlerNode.FilePath
-			if idx.repoPrefix != "" && strings.HasPrefix(diskPath, idx.repoPrefix+"/") {
-				diskPath = strings.TrimPrefix(diskPath, idx.repoPrefix+"/")
-			}
-			diskPath = filepath.Join(idx.rootPath, diskPath)
-			data, err := os.ReadFile(diskPath)
-			if err != nil {
-				fileSrc[handlerNode.FilePath] = nil
-				continue
-			}
-			fileSrc[handlerNode.FilePath] = data
-			src = data
+			// Cache misses too (nil) — one read attempt per file.
+			src = idx.contractFileSrc(handlerNode.FilePath)
+			fileSrc[handlerNode.FilePath] = src
 		}
 		if src == nil {
 			continue
@@ -7983,20 +8101,9 @@ func (idx *Indexer) snapshotContractShapes(reg *contracts.Registry) {
 		}
 		src, ok := srcCache[node.FilePath]
 		if !ok {
-			// File paths in the graph are repo-prefixed; trim the
-			// prefix for disk I/O.
-			diskPath := node.FilePath
-			if idx.repoPrefix != "" && strings.HasPrefix(diskPath, idx.repoPrefix+"/") {
-				diskPath = strings.TrimPrefix(diskPath, idx.repoPrefix+"/")
-			}
-			diskPath = filepath.Join(idx.rootPath, diskPath)
-			data, err := os.ReadFile(diskPath)
-			if err != nil {
-				srcCache[node.FilePath] = nil
-				continue
-			}
-			srcCache[node.FilePath] = data
-			src = data
+			// Cache misses too (nil) — one read attempt per file.
+			src = idx.contractFileSrc(node.FilePath)
+			srcCache[node.FilePath] = src
 		}
 		if src == nil {
 			continue
@@ -8151,32 +8258,27 @@ func (idx *Indexer) inlineEnvelopeShapes(reg *contracts.Registry) {
 	}
 }
 
-// extractExternalModules parses the repo's go.mod once and writes
-// KindModule nodes plus EdgeDependsOnModule edges into the graph.
-// A synthetic KindFile node is emitted for go.mod itself so the
-// edges have a real source endpoint that survives applyRepoPrefix.
-// Safe to call when no go.mod exists. Other manifest formats
-// (package.json, pnpm-lock, requirements.txt, Cargo.toml, …) are
-// future additions — each lands as another switch case here.
+// rootManifest is one dependency manifest the pass reads from the repository
+// root. Each produces an independent Spec list and gets its own synthetic file
+// node — the file→module edge stays scoped to the originating manifest so
+// cross-ecosystem queries (e.g. "what does package.json declare") don't bleed
+// into go.mod's answer.
+type rootManifest struct {
+	path           string
+	parse          func([]byte) []modules.Spec
+	ownPathFromSrc func([]byte) string
+}
+
+// rootManifests is the manifest formats the indexer recognises at a repository
+// root, in the order they are read.
 //
-// Import-node → module-node edges (per the broader coverage spec)
-// are deferred to v2; the v1 file-level edge is already enough for
-// agents asking "what does this repo depend on".
-func (idx *Indexer) extractExternalModules() {
-	if !idx.config.Coverage.IsEnabled("modules") {
-		return
-	}
-	// Walk known manifest formats at the repo root. Each manifest
-	// produces an independent Spec list and gets its own synthetic
-	// file node — the file→module edge stays scoped to the
-	// originating manifest so cross-ecosystem queries (e.g. "what
-	// does package.json declare") don't bleed into go.mod's
-	// answer.
-	manifests := []struct {
-		path           string
-		parse          func([]byte) []modules.Spec
-		ownPathFromSrc func([]byte) string
-	}{
+// It is a function rather than a table inlined in extractExternalModules
+// because the sparse-generation builder reads the same list: a manifest states
+// the repository's own module identity and its dependency set, so a generation
+// built without one classifies a module-local import as external and mints
+// stubs for it. The two callers must not be able to drift apart.
+func rootManifests() []rootManifest {
+	return []rootManifest{
 		{
 			path:           "go.mod",
 			parse:          modules.ParseGoMod,
@@ -8234,8 +8336,22 @@ func (idx *Indexer) extractExternalModules() {
 			ownPathFromSrc: nil,
 		},
 	}
+}
 
-	for _, m := range manifests {
+// extractExternalModules reads every manifest rootManifests names and writes
+// KindModule nodes plus EdgeDependsOnModule edges into the graph.
+// A synthetic KindFile node is emitted for each manifest itself so the
+// edges have a real source endpoint that survives applyRepoPrefix.
+// Safe to call when a manifest does not exist.
+//
+// Import-node → module-node edges (per the broader coverage spec)
+// are deferred to v2; the v1 file-level edge is already enough for
+// agents asking "what does this repo depend on".
+func (idx *Indexer) extractExternalModules() {
+	if !idx.config.Coverage.IsEnabled("modules") {
+		return
+	}
+	for _, m := range rootManifests() {
 		idx.extractOneModuleManifest(m.path, m.parse, m.ownPathFromSrc)
 	}
 
@@ -8251,7 +8367,7 @@ func (idx *Indexer) extractExternalModules() {
 // from extractExternalModules's per-manifest dispatch.
 func (idx *Indexer) extractOneModuleManifest(relPath string, parse func([]byte) []modules.Spec, ownPathFromSrc func([]byte) string) {
 	manifestAbs := filepath.Join(idx.rootPath, relPath)
-	src, err := os.ReadFile(manifestAbs)
+	src, err := idx.readFileContent(manifestAbs)
 	if err != nil {
 		return
 	}
@@ -8465,7 +8581,7 @@ func readGoModModulePath(src []byte) string {
 // graph (UpgradeBareTypeRefs, resolveProviderHandlers).
 func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	goModPath := filepath.Join(idx.rootPath, "go.mod")
-	goModSrc, err := os.ReadFile(goModPath)
+	goModSrc, err := idx.readFileContent(goModPath)
 	if err != nil {
 		return
 	}
@@ -8581,12 +8697,11 @@ func (idx *Indexer) extractContracts() {
 		}
 
 		absPath := filepath.Join(idx.rootPath, relPath)
-		info, statErr := os.Stat(absPath)
-		if statErr != nil {
+		currentMtime, _, readable := idx.contentFileVersion(absPath)
+		if !readable {
 			continue
 		}
 		seenFiles[fileNode.FilePath] = struct{}{}
-		currentMtime := info.ModTime().UnixNano()
 
 		// Cache hit: replay the previously-extracted contracts without
 		// re-reading the file or re-running the 8 extractors. This is
@@ -8603,7 +8718,7 @@ func (idx *Indexer) extractContracts() {
 			continue
 		}
 
-		src, err := os.ReadFile(absPath)
+		src, err := idx.readFileContent(absPath)
 		if err != nil {
 			continue
 		}

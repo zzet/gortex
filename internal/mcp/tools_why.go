@@ -72,12 +72,13 @@ func (s *Server) handleWhy(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 func (s *Server) whyEntriesFor(ctx context.Context, id string) []whyEntry {
 	var entries []whyEntry
 	seen := map[string]bool{}
+	reader := s.readerFor(ctx)
 	for _, e := range s.engineFor(ctx).GetInEdges(id) {
 		if e == nil || e.Kind != graph.EdgeMotivates || seen[e.From] {
 			continue
 		}
 		seen[e.From] = true
-		n := s.graph.GetNode(e.From)
+		n := reader.GetNode(e.From)
 		if n == nil {
 			continue
 		}

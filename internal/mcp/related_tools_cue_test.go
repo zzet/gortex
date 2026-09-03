@@ -23,9 +23,10 @@ func dispatchGraph(t *testing.T) *graph.Graph {
 
 func TestDispatchImplementorCount(t *testing.T) {
 	s := &Server{graph: dispatchGraph(t)}
-	require.Equal(t, 2, s.dispatchImplementorCount("pkg.go::I"))
-	require.Equal(t, 0, s.dispatchImplementorCount("pkg.go::A"))
-	require.Equal(t, 0, s.dispatchImplementorCount("pkg.go::missing"))
+	ctx := context.Background()
+	require.Equal(t, 2, s.dispatchImplementorCount(ctx, "pkg.go::I"))
+	require.Equal(t, 0, s.dispatchImplementorCount(ctx, "pkg.go::A"))
+	require.Equal(t, 0, s.dispatchImplementorCount(ctx, "pkg.go::missing"))
 }
 
 func TestAttachRelatedToolsCue_DispatchHeavy(t *testing.T) {

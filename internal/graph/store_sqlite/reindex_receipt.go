@@ -45,7 +45,7 @@ func (s *Store) prepareSQLiteReindexReceiptTx(tx *sql.Tx, batch []graph.EdgeRein
 	}
 
 	var err error
-	receipt.sourceNodes, err = mutationNodeIdentitiesTx(tx, ids)
+	receipt.sourceNodes, err = mutationNodeIdentitiesTx(tx, s.viewGen, ids)
 	if err != nil {
 		receipt.sourcesExact = false
 		receipt.sourceNodes = make(map[string]sqliteMutationNodeIdentity)

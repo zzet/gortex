@@ -535,7 +535,7 @@ func (s *Server) promoteExploreSourceRangeCandidates(
 	orderedPaths := make([]string, 0, len(specs)*exploreSourceRangeMaxAliases)
 	seenPaths := make(map[string]struct{}, len(specs)*exploreSourceRangeMaxAliases)
 	for _, spec := range specs {
-		absPath, relPath, err := s.resolveFilePath(spec.File)
+		absPath, relPath, err := s.resolveFilePath(ctx, spec.File)
 		resolvedGraphPath := ""
 		resolvedRepoPrefix := ""
 		if err == nil {

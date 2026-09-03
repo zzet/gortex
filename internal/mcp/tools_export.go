@@ -51,6 +51,14 @@ func (s *Server) confineCallerPaths(ctx context.Context) bool {
 }
 
 func (s *Server) handleExportGraph(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// reader serves the node / edge snapshot the cypher and graphml writers
+	// emit, so an overlay-active caller exports its own buffers.
+	reader := s.readerFor(ctx)
+	// The mermaid scopes run community detection and process discovery, which
+	// build their own indexes over a graph.Store, so those diagrams are
+	// rendered from the base corpus even when the request carries an overlay
+	// view. A routed view never reaches here: the export writes files, so the
+	// mutation gate refuses it before the handler runs.
 	g := s.graph
 	if g == nil {
 		return mcp.NewToolResultError("export: graph is not initialised"), nil
@@ -92,7 +100,7 @@ func (s *Server) handleExportGraph(ctx context.Context, req mcp.CallToolRequest)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("export: resolve output path %q: %v", p, err)), nil
 			}
-			if err := s.guardSymlinkWithinRepo(abs); err != nil {
+			if err := s.guardSymlinkWithinRepo(ctx, abs); err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 		}
@@ -135,7 +143,7 @@ func (s *Server) handleExportGraph(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	var buf bytes.Buffer
-	st, err := exportByFormat(&buf, g, format, opts, mermaidOpts)
+	st, err := exportByFormat(&buf, reader, g, format, opts, mermaidOpts)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -154,16 +162,17 @@ func (s *Server) handleExportGraph(ctx context.Context, req mcp.CallToolRequest)
 	return mcp.NewToolResultText(buf.String()), nil
 }
 
-
-
-func exportByFormat(w io.Writer, g graph.Store, format string, opts exporter.Options, mermaidOpts exporter.MermaidOpts) (exporter.Stats, error) {
+// exportByFormat renders one export. reader is the request's graph reader and
+// serves the snapshot formats; store is the base graph the mermaid scopes need
+// for their community / process passes.
+func exportByFormat(w io.Writer, reader graph.Reader, store graph.Store, format string, opts exporter.Options, mermaidOpts exporter.MermaidOpts) (exporter.Stats, error) {
 	switch format {
 	case "cypher":
-		return exporter.WriteCypher(w, g, opts)
+		return exporter.WriteCypher(w, reader, opts)
 	case "graphml":
-		return exporter.WriteGraphML(w, g, opts)
+		return exporter.WriteGraphML(w, reader, opts)
 	case "mermaid":
-		return exporter.WriteMermaid(w, g, mermaidOpts)
+		return exporter.WriteMermaid(w, store, mermaidOpts)
 	default:
 		return exporter.Stats{}, fmt.Errorf("unknown format %q (expected cypher | graphml | mermaid)", format)
 	}

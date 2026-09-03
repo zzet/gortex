@@ -46,8 +46,17 @@ func serializeToolsList(t *testing.T, preset, mode string) (int, []string) {
 // growth, which had already eaten most of the diet slack. Measured after
 // the stamp: 96168 bytes. The assertion still bites on description
 // creep; the stamp is contract, not creep.
+//
+// Universal structured `view` publication adds a bounded per-tool schema
+// cost. Measured core cost is 97246 bytes; the rounded 97350 baseline keeps
+// sub-1% slack without hiding future growth.
+//
+// Re-based 97350 → 97500 when main's view-selector schema completion and the
+// bounded `**` glob description landed on find_files / get_editing_context /
+// read_file (~194 bytes across the three). Measured core cost is 97440
+// bytes; the rounded margin stays below 1%.
 const (
-	corePresetBaselineBytes = 96500
+	corePresetBaselineBytes = 97500
 	fullPresetBaselineBytes = 289808
 )
 
@@ -79,7 +88,15 @@ const (
 // contract states what dispatch now surfaces — and read_file declared its
 // handler-honored max_chars option. Measured after both, on top of the
 // receipt/idempotency growth: 29313 bytes; ~390 bytes of slack.
-const agentPresetByteCeiling = 29700
+//
+// Re-based 29700 → 29900 for universal structured `view` publication.
+// Measured cost is 29832 bytes; the rounded margin remains below 1%.
+//
+// Re-based 29900 → 30000 when batch_symbols' description grew to disclose the
+// capped neighbourhood and the `callers_truncated` / `callees_truncated`
+// markers (+136 bytes). Measured cost is 29968 bytes; the rounded margin
+// remains below 1%.
+const agentPresetByteCeiling = 30000
 
 // localizationPresetByteCeiling is the hard budget for the diet
 // localization preset (the `localization` instruction profile's tool
@@ -97,7 +114,14 @@ const agentPresetByteCeiling = 29700
 // stamp (~27 bytes per tool) and read_file's max_chars declaration:
 // measured 21020 bytes, restoring ~300 bytes of slack the stamp had
 // eaten.
-const localizationPresetByteCeiling = 21350
+//
+// Re-based 21350 → 21450 for universal structured `view` publication.
+// Measured cost is 21389 bytes; the rounded margin remains below 1%.
+//
+// Re-based 21450 → 21600 alongside the batch_symbols neighbourhood-truncation
+// description growth (+136 bytes, the same shared tool the agent surface
+// carries). Measured cost is 21525 bytes; the rounded margin remains below 1%.
+const localizationPresetByteCeiling = 21600
 
 // TestToolsListByteCeilings is the permanent measurement gate: it prints the
 // cold tools/list byte cost of every preset and asserts the agent preset

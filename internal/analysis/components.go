@@ -33,7 +33,7 @@ type ComponentOptions struct {
 //
 // O(V + E). Used as the fallback when the backing graph.Store
 // does not implement graph.ComponentFinder.
-func ComputeWCC(g graph.Store, opts ComponentOptions) []ComponentResult {
+func ComputeWCC(g graph.Reader, opts ComponentOptions) []ComponentResult {
 	if g == nil {
 		return nil
 	}
@@ -105,7 +105,7 @@ func ComputeWCC(g graph.Store, opts ComponentOptions) []ComponentResult {
 // pairs of nodes mutually reachable along directed edges. Uses
 // an iterative Tarjan's algorithm to avoid blowing the recursion
 // stack on a deep call graph. O(V + E).
-func ComputeSCC(g graph.Store, opts ComponentOptions) []ComponentResult {
+func ComputeSCC(g graph.Reader, opts ComponentOptions) []ComponentResult {
 	if g == nil {
 		return nil
 	}

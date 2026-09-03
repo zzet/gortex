@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,6 +58,54 @@ func decodeReindexResult(t *testing.T, res *mcplib.CallToolResult) reindexResult
 // single-repo path of reindex_repository with no `paths` argument: a
 // file changed since the initial index is re-parsed, and the result
 // reports scope="repository" plus a sane node/edge/stale count.
+// TestHandleReindexRepository_ResolvesFailedReceiptForTheReparsedPath covers
+// the wiring itself: a scoped reindex of one file must clear a terminally
+// failed freshness receipt for that file, because otherwise a failed ingest
+// fail-closes change.detect for the whole repository until retention lapses
+// and reindex — the recovery callers reach for first — silently does nothing.
+func TestHandleReindexRepository_ResolvesFailedReceiptForTheReparsedPath(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "main.go")
+	require.NoError(t, os.WriteFile(target,
+		[]byte("package main\n\nfunc Main() {}\n"), 0o644))
+
+	g := graph.New()
+	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	srv := NewServer(query.NewEngine(g), g, idx, nil, zap.NewNop(), nil)
+
+	// A failed ingest for that exact path, plus one for a file the pass will
+	// not touch: only the re-parsed path may be resolved.
+	failed := pendingFreshnessReceipt(srv, "receipt-failed", "", target, 4)
+	completeFreshnessReceipt(failed, indexer.MutationResult{
+		RequestedGeneration: 4,
+		Err:                 errors.New("context deadline exceeded"),
+	})
+	untouched := pendingFreshnessReceipt(srv, "receipt-untouched", "",
+		filepath.Join(dir, "other.go"), 5)
+	completeFreshnessReceipt(untouched, indexer.MutationResult{
+		RequestedGeneration: 5,
+		Err:                 errors.New("unrelated failure"),
+	})
+
+	bumpFile(t, target, "package main\n\nfunc Main() {}\n\nfunc Extra() {}\n")
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"paths": []any{target}}
+	res, err := srv.handleReindexRepository(context.Background(), req)
+	require.NoError(t, err)
+	out := decodeReindexResult(t, res)
+	require.Equal(t, 1, out.StaleFileCount, "the pass must have re-parsed the file")
+
+	if outcome := failed.outcome(false); outcome.Err != nil || !outcome.Reindexed {
+		t.Fatalf("reindex did not resolve the failed receipt for the re-parsed path: %+v", outcome)
+	}
+	if outcome := untouched.outcome(false); outcome.Err == nil {
+		t.Fatal("reindex resolved a receipt for a path it never re-parsed")
+	}
+}
+
 func TestHandleReindexRepository_WholeRepoSingleMode(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "pkg"), 0o755))

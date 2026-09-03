@@ -38,8 +38,19 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cmd/gortex: cannot sandbox the test environment: %v\n", err)
 		os.Exit(1)
 	}
+	queryLogDisabled, hadQueryLogDisabled := os.LookupEnv("GORTEX_QUERY_LOG_DISABLE")
+	if err := os.Setenv("GORTEX_QUERY_LOG_DISABLE", "1"); err != nil {
+		fmt.Fprintf(os.Stderr, "cmd/gortex: cannot disable query telemetry in tests: %v\n", err)
+		restore()
+		os.Exit(1)
+	}
 
 	code := m.Run()
+	if hadQueryLogDisabled {
+		_ = os.Setenv("GORTEX_QUERY_LOG_DISABLE", queryLogDisabled)
+	} else {
+		_ = os.Unsetenv("GORTEX_QUERY_LOG_DISABLE")
+	}
 	restore()
 
 	if report := diffUserState(before); report != "" {

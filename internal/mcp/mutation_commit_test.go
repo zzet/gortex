@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -468,6 +469,187 @@ func TestMutationStatusRefreshesPendingGraphStatus(t *testing.T) {
 	payload := s.mutationStatusPayload(record)
 	require.Equal(t, mutationGraphFresh, payload["graph_status"])
 	require.Equal(t, mutationDiskCommitted, payload["disk_status"])
+}
+
+// TestMutationStatusMarksTerminalGraphStatus pins the distinction a caller
+// cannot otherwise draw: only "pending" resolves on its own, so every other
+// graph_status must announce itself as terminal or a caller will wait on it
+// forever.
+func TestMutationCommitListingKeepsEverySnapshotField(t *testing.T) {
+	// mutationCommitListingPayload renders by hand, and the first version of
+	// it silently dropped new_sha and bytes_written from a published payload.
+	// Listing the expected keys here by hand would repeat the same mistake in
+	// the test, so the expectation is derived from mutationCommitSnapshot
+	// itself: whatever the struct marshals, the listing must publish, and
+	// nothing beyond it except the flag the listing exists to add.
+	const added = "graph_status_terminal"
+
+	now := time.Now()
+	for _, tc := range []struct {
+		name   string
+		record *mutationCommitRecord
+	}{
+		{"every field populated", &mutationCommitRecord{
+			id: "commit-full", tool: "edit_file", key: "m-1",
+			relPath: "pkg/a.go", absPath: "/abs/pkg/a.go",
+			disk: mutationDiskCommitted, graph: mutationGraphFresh, graphRecorded: true,
+			newSHA: "sha-abc", bytesWritten: 42, errText: "boom",
+			startedAt: now, committedAt: now,
+		}},
+		// The omitempty half: a hand-rolled map can just as easily publish a
+		// key the struct would have dropped, rendering "" where the caller
+		// saw nothing before.
+		{"only the always-present fields", &mutationCommitRecord{
+			id: "commit-bare", disk: mutationDiskInFlight, graph: mutationGraphStale,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.record.snapshot())
+			require.NoError(t, err)
+			var marshalled map[string]any
+			require.NoError(t, json.Unmarshal(raw, &marshalled))
+
+			want := make([]string, 0, len(marshalled)+1)
+			for key := range marshalled {
+				want = append(want, key)
+			}
+			want = append(want, added)
+
+			entries := mutationCommitListingPayload([]*mutationCommitRecord{tc.record})
+			require.Len(t, entries, 1)
+			got := make([]string, 0, len(entries[0]))
+			for key := range entries[0] {
+				got = append(got, key)
+			}
+			require.ElementsMatch(t, want, got,
+				"the listing diverged from the snapshot it renders")
+		})
+	}
+
+	// The two fields that were actually lost, asserted by value as well: a key
+	// carrying the wrong content would satisfy the parity check above.
+	record := &mutationCommitRecord{
+		id: "commit-full", tool: "edit_file", relPath: "pkg/a.go",
+		disk: mutationDiskCommitted, graph: mutationGraphFresh, graphRecorded: true,
+		newSHA: "sha-abc", bytesWritten: 42, startedAt: now, committedAt: now,
+	}
+	entry := mutationCommitListingPayload([]*mutationCommitRecord{record})[0]
+	require.Equal(t, "sha-abc", entry["new_sha"],
+		"new_sha is how a caller tells which content actually landed")
+	require.Equal(t, 42, entry["bytes_written"])
+}
+
+func TestMutationStatusTerminalForWritesThatNeverHappened(t *testing.T) {
+	// markNotApplied and markFailed leave graph at the same "stale" seed an
+	// in-flight record carries, but they are genuinely terminal: nothing was
+	// written, so no reindex is coming. Terminality has to follow the recorded
+	// flag rather than the status string, and these are the two cases where
+	// the string alone would give the wrong answer in the safe-looking
+	// direction.
+	for _, tc := range []struct {
+		name string
+		mark func(*mutationCommitRecord)
+	}{
+		{"nothing was written", func(r *mutationCommitRecord) { r.markNotApplied(errors.New("refused")) }},
+		{"the write failed", func(r *mutationCommitRecord) { r.markFailed(errors.New("disk full")) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMutationServer()
+			record := s.beginMutationCommit(context.Background(), "edit_file", "", "fp", "pkg/a.go", "/abs/pkg/a.go")
+			tc.mark(record)
+
+			payload := s.mutationStatusPayload(record)
+			require.Equal(t, mutationGraphStale, payload["graph_status"])
+			require.Equal(t, true, payload["graph_status_terminal"],
+				"a mutation that never reached disk is waiting for nothing")
+			require.Equal(t, true, payload["retry_safe"])
+		})
+	}
+}
+
+func TestMutationCommitListingCarriesGraphTerminality(t *testing.T) {
+	// The listing is a second entry point onto the same records. Rendering
+	// graph_status there without the flag hands an agent the reading this
+	// whole change exists to stop.
+	s := newMutationServer()
+	inflight := s.beginMutationCommit(context.Background(), "edit_file", "", "fp-a", "pkg/a.go", "/abs/pkg/a.go")
+	inflight.markCommitted("sha-a", 10)
+
+	settled := s.beginMutationCommit(context.Background(), "edit_file", "", "fp-b", "pkg/b.go", "/abs/pkg/b.go")
+	settled.markCommitted("sha-b", 10)
+	settled.recordGraph(mutationReindexOutcome{})
+
+	byPath := map[string]map[string]any{}
+	for _, entry := range mutationCommitListingPayload([]*mutationCommitRecord{inflight, settled}) {
+		path, _ := entry["path"].(string)
+		byPath[path] = entry
+	}
+	require.Len(t, byPath, 2)
+	require.Equal(t, false, byPath["pkg/a.go"]["graph_status_terminal"],
+		"an in-flight record was listed as settled")
+	require.Equal(t, true, byPath["pkg/b.go"]["graph_status_terminal"],
+		"a recorded stale record was listed as still moving")
+	require.Equal(t, mutationGraphStale, byPath["pkg/a.go"]["graph_status"])
+	require.Equal(t, mutationGraphStale, byPath["pkg/b.go"]["graph_status"],
+		"both render the same status string; only the flag separates them")
+}
+
+func TestMutationStatusMarksTerminalGraphStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		// unrecorded skips recordGraph, leaving the record in the state
+		// beginMutationCommit created it in. No other case reaches that state,
+		// which is why the flag could be wrong there while every recorded case
+		// stayed green.
+		unrecorded bool
+		outcome    mutationReindexOutcome
+		graph      string
+		terminal   bool
+		noteHas    string
+	}{
+		{"an edit still in flight is not terminal", true,
+			mutationReindexOutcome{},
+			mutationGraphStale, false, "not settled"},
+		{"pending is the only value worth waiting on", false,
+			mutationReindexOutcome{Pending: true, Receipt: "mutation-none", Generation: 1},
+			mutationGraphPending, false, "resolves on its own"},
+		{"fresh is terminal", false,
+			mutationReindexOutcome{Reindexed: true},
+			mutationGraphFresh, true, "has read these bytes"},
+		{"stale is terminal and says so", false,
+			mutationReindexOutcome{},
+			mutationGraphStale, true, "reported back without confirming"},
+		{"failed is terminal and says so", false,
+			mutationReindexOutcome{Err: errors.New("context deadline exceeded")},
+			mutationGraphFailed, true, "Waiting will not change it"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMutationServer()
+			record := s.beginMutationCommit(context.Background(), "edit_file", "", "fp", "pkg/a.go", "/abs/pkg/a.go")
+			record.markCommitted("sha", 10)
+			if !tc.unrecorded {
+				record.recordGraph(tc.outcome)
+			}
+
+			payload := s.mutationStatusPayload(record)
+			require.Equal(t, tc.graph, payload["graph_status"])
+			require.Equal(t, tc.terminal, payload["graph_status_terminal"],
+				"graph_status %q reported the wrong terminality", tc.graph)
+			note, _ := payload["graph_note"].(string)
+			require.Contains(t, note, tc.noteHas)
+		})
+	}
+}
+
+// TestMutationStatusGuidanceDoesNotPromiseProgress guards the sentence that
+// sent a caller into an unbounded wait: a committed write must not assert
+// that a non-fresh graph is still catching up, because stale and failed are
+// terminal.
+func TestMutationStatusGuidanceDoesNotPromiseProgress(t *testing.T) {
+	guidance := mutationStatusGuidance(mutationDiskCommitted)
+	require.NotContains(t, guidance, "still catching up")
+	require.Contains(t, guidance, "graph_status_terminal")
 }
 
 func TestMutationLedgerEvictsOldestPastCap(t *testing.T) {

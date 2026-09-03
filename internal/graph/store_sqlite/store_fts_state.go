@@ -15,7 +15,7 @@ var _ graph.SymbolFTSNormalizationState = (*Store)(nil)
 // one-time authoritative rebuild.
 func (s *Store) GetSymbolFTSNormalization(repoPrefix string) (string, bool, error) {
 	var mode string
-	err := s.db.QueryRow(`SELECT normalization FROM symbol_fts_state WHERE repo_prefix = ?`, repoPrefix).Scan(&mode)
+	err := s.db.QueryRow(`SELECT normalization FROM symbol_fts_state WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix).Scan(&mode)
 	if err == sql.ErrNoRows {
 		return "", false, nil
 	}
@@ -34,7 +34,7 @@ func (s *Store) SetSymbolFTSNormalization(repoPrefix, mode string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(), `
-INSERT INTO symbol_fts_state (repo_prefix, normalization) VALUES (?, ?)
-ON CONFLICT(repo_prefix) DO UPDATE SET normalization = excluded.normalization`, repoPrefix, mode)
+INSERT INTO symbol_fts_state (view_gen, repo_prefix, normalization) VALUES (?, ?, ?)
+ON CONFLICT(view_gen, repo_prefix) DO UPDATE SET normalization = excluded.normalization`, s.viewGen, repoPrefix, mode)
 	return err
 }

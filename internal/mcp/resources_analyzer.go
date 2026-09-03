@@ -100,8 +100,9 @@ func (s *Server) handleResourceReport(ctx context.Context, req mcp.ReadResourceR
 			todoCount++
 		}
 	}
+	g := s.readerFor(ctx)
 	totalEdges := 0
-	for _, e := range s.graph.AllEdges() {
+	for _, e := range g.AllEdges() {
 		if inScope != nil && (!inScope[e.From] || !inScope[e.To]) {
 			continue
 		}
@@ -121,7 +122,7 @@ func (s *Server) handleResourceReport(ctx context.Context, req mcp.ReadResourceR
 	}
 
 	deadCount := 0
-	for _, d := range analysis.FindDeadCode(s.graph, s.getProcesses(), nil) {
+	for _, d := range analysis.FindDeadCode(g, s.getProcesses(), nil) {
 		if inScope == nil || inScope[d.ID] {
 			deadCount++
 		}
@@ -165,8 +166,8 @@ func (s *Server) handleResourceReport(ctx context.Context, req mcp.ReadResourceR
 	})
 }
 
-func (s *Server) handleResourceGodNodes(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	if s.graph.NodeCount() < 10 {
+func (s *Server) handleResourceGodNodes(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	if s.readerFor(ctx).NodeCount() < 10 {
 		return jsonResource(req.Params.URI, map[string]any{
 			"god_nodes": []any{},
 			"message":   "codebase too small for meaningful hotspot analysis (need at least 10 symbols)",
@@ -188,15 +189,16 @@ func (s *Server) handleResourceGodNodes(_ context.Context, req mcp.ReadResourceR
 	})
 }
 
-func (s *Server) handleResourceSurprises(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+func (s *Server) handleResourceSurprises(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	communities := s.getCommunities()
+	g := s.readerFor(ctx)
 
-	cycles := analysis.DetectCycles(s.graph, communities, "")
+	cycles := analysis.DetectCycles(g, communities, "")
 	if len(cycles) > 10 {
 		cycles = cycles[:10]
 	}
 
-	deadAll := analysis.FindDeadCode(s.graph, s.getProcesses(), nil)
+	deadAll := analysis.FindDeadCode(g, s.getProcesses(), nil)
 	deadTrunc := false
 	if len(deadAll) > 20 {
 		deadAll = deadAll[:20]
@@ -204,7 +206,7 @@ func (s *Server) handleResourceSurprises(_ context.Context, req mcp.ReadResource
 	}
 
 	var topHubs []analysis.HotspotEntry
-	if s.graph.NodeCount() >= 10 {
+	if g.NodeCount() >= 10 {
 		hot := s.getHotspots()
 		// Top hubs == hotspots with at least one community crossing.
 		for _, h := range hot {
@@ -225,7 +227,7 @@ func (s *Server) handleResourceSurprises(_ context.Context, req mcp.ReadResource
 	})
 }
 
-func (s *Server) handleResourceAudit(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+func (s *Server) handleResourceAudit(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 	// Match the tool's fallback chain. Resources can't take args, so
 	// skip the explicit-arg step and start from the indexer root.
 	root := ""
@@ -252,7 +254,7 @@ func (s *Server) handleResourceAudit(_ context.Context, req mcp.ReadResourceRequ
 		})
 	}
 
-	return jsonResource(req.Params.URI, audit.Audit(s.graph, root, files))
+	return jsonResource(req.Params.URI, audit.Audit(s.readerFor(ctx), root, files))
 }
 
 func (s *Server) handleResourceQuestions(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {

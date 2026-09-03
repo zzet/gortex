@@ -81,6 +81,10 @@ func boundedEdgeExistenceQuery(rows int) string {
 		}
 		query.WriteString("(?,?,?)")
 	}
+	// The generation predicate belongs inside the correlated EXISTS: the
+	// wanted CTE is a constant VALUES relation carrying no generation, so an
+	// outer filter would have nothing to filter and an edge from a hidden
+	// generation would answer the existence question.
 	query.WriteString(`)
 SELECT wanted.from_id, wanted.to_id, wanted.kind
 FROM wanted
@@ -90,6 +94,7 @@ WHERE EXISTS (
     WHERE edges.from_id = wanted.from_id
       AND edges.to_id = wanted.to_id
       AND edges.kind = wanted.kind
+      AND edges.view_gen = ?
     LIMIT 1
 )`)
 	return query.String()
@@ -130,10 +135,11 @@ func (s *Store) FindExistingEdgeEndpoints(
 			end = len(keys)
 		}
 		chunk := keys[start:end]
-		args := make([]any, 0, len(chunk)*3)
+		args := make([]any, 0, len(chunk)*3+1)
 		for _, endpoint := range chunk {
 			args = append(args, endpoint.From, endpoint.To, string(endpoint.Kind))
 		}
+		args = append(args, s.viewGen)
 		rows, queryErr := tx.QueryContext(ctx, boundedEdgeExistenceQuery(len(chunk)), args...)
 		if queryErr != nil {
 			return nil, queryErr

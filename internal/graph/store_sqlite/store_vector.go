@@ -40,9 +40,9 @@ var errInvalidDims = errors.New("store_sqlite: invalid vector dims")
 // directly.
 
 // vectorChunk bounds rows per multi-row INSERT in BulkUpsertEmbeddings and
-// ReplaceVectorCorpus. Five host parameters per row, SQLite's conservative
-// default limit is 999; 180 leaves headroom.
-const vectorChunk = 180
+// ReplaceVectorCorpus. Six host parameters per row, SQLite's conservative
+// default limit is 999; 160 leaves headroom.
+const vectorChunk = 160
 
 // encodeVec serialises a float32 slice to a little-endian BLOB
 // (4 bytes per element).
@@ -73,8 +73,8 @@ func (s *Store) UpsertEmbedding(nodeID string, vec []float32) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(),
-		`INSERT OR REPLACE INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES (?, ?, '', ?, ?)`,
-		nodeID, graph.RepoPrefixOfID(nodeID), len(vec), encodeVec(vec),
+		`INSERT OR REPLACE INTO vectors (view_gen, node_id, repo_prefix, parent_id, dims, vec) VALUES (?, ?, ?, '', ?, ?)`,
+		s.viewGen, nodeID, graph.RepoPrefixOfID(nodeID), len(vec), encodeVec(vec),
 	)
 	return err
 }
@@ -103,15 +103,15 @@ func (s *Store) BulkUpsertEmbeddings(items []graph.VectorItem) error {
 		}
 		batch := items[start:end]
 
-		args := make([]any, 0, len(batch)*4)
+		args := make([]any, 0, len(batch)*5)
 		stmt := make([]byte, 0, 96+len(batch)*20)
-		stmt = append(stmt, "INSERT OR REPLACE INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES "...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO vectors (view_gen, node_id, repo_prefix, parent_id, dims, vec) VALUES "...)
 		for i, it := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, '', ?, ?)"...)
-			args = append(args, it.NodeID, graph.RepoPrefixOfID(it.NodeID), len(it.Vec), encodeVec(it.Vec))
+			stmt = append(stmt, "(?, ?, ?, '', ?, ?)"...)
+			args = append(args, s.viewGen, it.NodeID, graph.RepoPrefixOfID(it.NodeID), len(it.Vec), encodeVec(it.Vec))
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -157,8 +157,9 @@ func (s *Store) GetEmbeddings(ids []string) map[string][]float32 {
 		batch := ids[start:end]
 
 		stmt := make([]byte, 0, 48+len(batch)*2)
-		stmt = append(stmt, "SELECT node_id, vec FROM vectors WHERE node_id IN ("...)
-		args := make([]any, 0, len(batch))
+		stmt = append(stmt, "SELECT node_id, vec FROM vectors WHERE view_gen = ? AND node_id IN ("...)
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, s.viewGen)
 		for i, id := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -209,7 +210,7 @@ func (s *Store) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
 		return nil, nil
 	}
 
-	rows, err := s.db.Query(`SELECT node_id, parent_id, vec FROM vectors WHERE dims = ?`, len(vec))
+	rows, err := s.db.Query(`SELECT node_id, parent_id, vec FROM vectors WHERE view_gen = ? AND dims = ?`, s.viewGen, len(vec))
 	if err != nil {
 		return nil, err
 	}

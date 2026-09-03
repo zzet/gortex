@@ -204,6 +204,32 @@ func boundHandler[Req, Res any](
 	}
 }
 
+// overlayPrepared installs the calling session's overlay view on the request
+// context before the handler runs — the same installation the tool wrapper
+// applies in wrapToolHandlerMode.
+//
+// Resources and prompts read the graph through s.readerFor(ctx) exactly like
+// tools do, but nothing had ever put a view on their context, so every
+// resource read and prompt fetch silently answered from the base graph while
+// the session's editor buffers were live. That made gortex://report and the
+// orientation prompt disagree with every tool call in the same session.
+//
+// Applied inside the bound handler, so preparation runs under the same
+// deadline and on the same detached goroutine as the handler it feeds.
+func overlayPrepared[Req, Res any](s *Server, h func(context.Context, Req) (Res, error)) func(context.Context, Req) (Res, error) {
+	return func(ctx context.Context, req Req) (Res, error) {
+		prepared, _, err := s.prepareOverlayRequest(ctx)
+		if err != nil {
+			var zero Res
+			if ctxErr := requestContextError(ctx, err); ctxErr != nil {
+				return zero, ctxErr
+			}
+			return zero, err
+		}
+		return h(prepared, req)
+	}
+}
+
 // busyMessage is the shared diagnosis for "too many handlers are already
 // stuck to admit another".
 func busyMessage(what string, stuck int64, timeout time.Duration) string {
@@ -314,7 +340,7 @@ func (s *Server) addPrompt(prompt mcp.Prompt, handler mcpserver.PromptHandlerFun
 }
 
 func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFunc) mcpserver.ResourceHandlerFunc {
-	bounded := boundHandler(s, "resource", uri, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h),
+	bounded := boundHandler(s, "resource", uri, overlayPrepared(s, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h)),
 		func(stuck int64, timeout time.Duration) ([]mcp.ResourceContents, error) {
 			return nil, errors.New(busyMessage("resource reads", stuck, timeout))
 		},
@@ -345,7 +371,7 @@ func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFun
 }
 
 func (s *Server) boundPromptHandler(name string, h mcpserver.PromptHandlerFunc) mcpserver.PromptHandlerFunc {
-	bounded := boundHandler(s, "prompt", name, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h),
+	bounded := boundHandler(s, "prompt", name, overlayPrepared(s, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h)),
 		func(stuck int64, timeout time.Duration) (*mcp.GetPromptResult, error) {
 			return nil, errors.New(busyMessage("prompt requests", stuck, timeout))
 		},

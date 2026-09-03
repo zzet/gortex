@@ -60,7 +60,12 @@ var errPathEscape = errors.New("relative path escapes the indexed repo root")
 // Both relative and absolute inputs are confined to the indexed
 // repository roots: an absolute path that points outside every root is
 // refused, not honoured. See the confinement guard at the top of the body.
-func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err error) {
+//
+// ctx decides which checkout a resolved repo-relative path lands in: a request
+// routed to a worktree view reads that checkout's working copy, every other
+// request the canonical one. An absolute input names a location outright and is
+// never moved between checkouts.
+func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, relPath string, err error) {
 	// Post-resolution confinement (the SECURITY.md "confined to indexed
 	// repository roots" invariant): whatever path the body resolves below —
 	// relative or absolute — is refused if its real, symlink-resolved
@@ -70,7 +75,7 @@ func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err e
 	// guardSymlinkWithinRepo takes on the read path).
 	defer func() {
 		if err == nil {
-			if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
+			if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 				absPath, relPath, err = "", "", guardErr
 			}
 		}
@@ -100,7 +105,7 @@ func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err e
 				if !pathContainedIn(abs, root) {
 					return "", "", fmt.Errorf("%w: %q resolves to %q, outside repo root %q", errPathEscape, rawPath, abs, root)
 				}
-				abs = worktreeRootedPath(abs, root, s.multiIndexer)
+				abs = s.checkoutRootedPath(ctx, abs, root, soleRepo)
 				// relPath is the GRAPH's spelling, not the caller's: it is
 				// what downstream node lookups (get_file_summary, savings
 				// recording, session bookkeeping) key on, and graph file
@@ -117,7 +122,7 @@ func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err e
 			// learning the prefix. A brand-new file (matches == 0) still
 			// requires an explicit prefix; a path present in several
 			// repos (matches > 1) is reported as such.
-			if abs, rel, matches := anchorUnprefixedExisting(s.multiIndexer, rawPath); matches == 1 {
+			if abs, rel, matches := anchorUnprefixedExisting(s.multiIndexer, requestViewPathRoot(ctx), rawPath); matches == 1 {
 				return abs, rel, nil
 			} else if matches > 1 {
 				return "", "", fmt.Errorf("%w: path %q names a file in multiple tracked repos; prefix it with one of: %s/",
@@ -148,7 +153,7 @@ func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err e
 		// index identity with one. relPath stays the repo-prefixed form
 		// for session bookkeeping — the prefix names the same repo
 		// regardless of which worktree the bytes land in.
-		abs = worktreeRootedPath(abs, root, s.multiIndexer)
+		abs = s.checkoutRootedPath(ctx, abs, root, prefix)
 		return abs, rawPath, nil
 	}
 
@@ -158,7 +163,7 @@ func (s *Server) resolveFilePath(rawPath string) (absPath, relPath string, err e
 			if !pathContainedIn(abs, root) {
 				return "", "", fmt.Errorf("%w: %q resolves to %q, outside repo root %q", errPathEscape, rawPath, abs, root)
 			}
-			return abs, rawPath, nil
+			return requestViewPathRoot(ctx).rooted(abs, root), rawPath, nil
 		}
 	}
 
@@ -254,8 +259,8 @@ func worktreeRootedPath(abs, root string, mi multiRepoLookup) string {
 	if _, err := os.Stat(abs); err == nil {
 		return abs
 	}
-	rel, err := filepath.Rel(root, abs)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+	rel, ok := relativeWithinRoot(root, abs)
+	if !ok {
 		return abs
 	}
 	match := ""
@@ -289,7 +294,10 @@ func worktreeRootedPath(abs, root string, mi multiRepoLookup) string {
 // and relPath are unset and the caller decides how to report it. The
 // existence gate is what keeps this unambiguous — it never invents a
 // location for a path that does not already resolve to exactly one file.
-func anchorUnprefixedExisting(mi multiRepoLookup, rawPath string) (absPath, relPath string, matches int) {
+// view is the checkout the calling request reads: the zero value keeps the
+// canonical anchoring, and a routed one moves both the existence probe and the
+// answer into its own working copy.
+func anchorUnprefixedExisting(mi multiRepoLookup, view viewPathRoot, rawPath string) (absPath, relPath string, matches int) {
 	if mi == nil || rawPath == "" || filepath.IsAbs(rawPath) {
 		return "", "", 0
 	}
@@ -305,11 +313,23 @@ func anchorUnprefixedExisting(mi multiRepoLookup, rawPath string) (absPath, relP
 		if !pathContainedIn(cand, root) {
 			continue
 		}
-		if _, err := os.Stat(cand); err != nil {
+		// Existence is tested in the checkout this request reads. For a base
+		// request that is the canonical root, exactly as before; for a routed
+		// one it is the view's working copy, so a file only that checkout
+		// carries still anchors the path it uniquely names.
+		var resolved string
+		probe := cand
+		if view.serves(prefix) {
+			resolved = view.rooted(cand, root)
+			probe = resolved
+		} else {
+			resolved = worktreeRootedPath(cand, root, mi)
+		}
+		if _, err := os.Stat(probe); err != nil {
 			continue
 		}
 		matches++
-		absPath = worktreeRootedPath(cand, root, mi)
+		absPath = resolved
 		relPath = prefix + "/" + rawPath
 	}
 	if matches != 1 {
@@ -340,7 +360,7 @@ func pathContainedIn(abs, root string) bool {
 	if rel == "." {
 		return true
 	}
-	if strings.HasPrefix(rel, "..") {
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
 	return true
@@ -356,7 +376,7 @@ func pathContainedIn(abs, root string) bool {
 // /tmp -> /private/tmp, a temp-dir test root) still matches. A broken / missing
 // target, or a control client with no known roots, is left to the normal read
 // path — there is nothing to leak.
-func (s *Server) guardSymlinkWithinRepo(absPath string) error {
+func (s *Server) guardSymlinkWithinRepo(ctx context.Context, absPath string) error {
 	real, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
 		// Not-yet-created file (or broken symlink): EvalSymlinks can't resolve
@@ -367,7 +387,7 @@ func (s *Server) guardSymlinkWithinRepo(absPath string) error {
 		// refused below.
 		real = resolveNearestExistingAncestor(absPath)
 	}
-	return s.guardResolvedPathWithinRepo(absPath, real)
+	return s.guardResolvedPathWithinRepo(ctx, absPath, real)
 }
 
 // guardResolvedPathWithinRepo validates the resolved target that was actually
@@ -375,8 +395,8 @@ func (s *Server) guardSymlinkWithinRepo(absPath string) error {
 // this to bind repository confinement to the file handle whose bytes were
 // hashed, even if a symlink is retargeted out of the repo and restored before
 // the request returns.
-func (s *Server) guardResolvedPathWithinRepo(requestedPath, resolvedPath string) error {
-	roots := s.guardRepoRoots()
+func (s *Server) guardResolvedPathWithinRepo(ctx context.Context, requestedPath, resolvedPath string) error {
+	roots := s.guardRepoRoots(ctx)
 	if len(roots) == 0 {
 		return nil // no known roots (control client / unindexed) — nothing to enforce
 	}
@@ -415,7 +435,12 @@ func resolveNearestExistingAncestor(absPath string) string {
 
 // guardRepoRoots returns the symlink-resolved root paths of every tracked repo
 // (multi-repo) plus the lone indexer (single-repo), for guardSymlinkWithinRepo.
-func (s *Server) guardRepoRoots() []string {
+//
+// A request routed to a worktree view adds that checkout's root: it is a
+// working copy of a tracked repository the request was deliberately routed to,
+// and it is where every path this request resolves now lands. Without it the
+// confinement guard would refuse the view's own files.
+func (s *Server) guardRepoRoots(ctx context.Context) []string {
 	var roots []string
 	add := func(root string) {
 		if root == "" {
@@ -436,6 +461,7 @@ func (s *Server) guardRepoRoots() []string {
 	if s.indexer != nil {
 		add(s.indexer.RootPath())
 	}
+	add(requestViewPathRoot(ctx).root)
 	return roots
 }
 
@@ -445,9 +471,12 @@ func (s *Server) guardRepoRoots() []string {
 // error (not a relative path) when no repo root is available, to keep callers
 // from passing a bare-relative path to os.Open and resolving against the
 // daemon process CWD.
-func (s *Server) resolveNodePath(node *graph.Node) (string, error) {
+func (s *Server) resolveNodePath(ctx context.Context, node *graph.Node) (string, error) {
 	if node == nil {
 		return "", errors.New("nil node")
+	}
+	if requestReadsCommittedTree(ctx) {
+		return "", errViewHasNoWorkingCopy
 	}
 	if node.FilePath == "" {
 		return "", fmt.Errorf("node %q has no file path", node.ID)
@@ -474,13 +503,14 @@ func (s *Server) resolveNodePath(node *graph.Node) (string, error) {
 			// same reasoning as resolveFilePath: worktrees of one repo
 			// share an index identity, so a node's resolved path can
 			// land on a sibling checkout.
-			return worktreeRootedPath(abs, root, s.multiIndexer), nil
+			return s.checkoutRootedPath(ctx, abs, root, node.RepoPrefix), nil
 		}
 		return "", fmt.Errorf("could not resolve repo root for node %q (repo_prefix=%q)", node.ID, node.RepoPrefix)
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			return filepath.Clean(filepath.Join(root, node.FilePath)), nil
+			abs := filepath.Clean(filepath.Join(root, node.FilePath))
+			return requestViewPathRoot(ctx).rooted(abs, root), nil
 		}
 	}
 	return "", fmt.Errorf("%w: node=%q file=%q", errPathUnresolved, node.ID, node.FilePath)
@@ -491,12 +521,12 @@ func (s *Server) resolveNodePath(node *graph.Node) (string, error) {
 // this is safe to call from concurrent request handlers; AbsoluteFilePath
 // is left empty when the path cannot be resolved (callers still carry the
 // repo-relative file_path).
-func (s *Server) withAbsPath(n *graph.Node) *graph.Node {
+func (s *Server) withAbsPath(ctx context.Context, n *graph.Node) *graph.Node {
 	if n == nil {
 		return nil
 	}
 	cp := *n
-	if abs, err := s.resolveNodePath(n); err == nil {
+	if abs, err := s.resolveNodePath(ctx, n); err == nil {
 		cp.AbsoluteFilePath = abs
 	}
 	return &cp
@@ -504,13 +534,13 @@ func (s *Server) withAbsPath(n *graph.Node) *graph.Node {
 
 // withAbsPaths maps withAbsPath over a slice, returning a fresh slice of
 // copies. The input slice and its nodes are left untouched.
-func (s *Server) withAbsPaths(nodes []*graph.Node) []*graph.Node {
+func (s *Server) withAbsPaths(ctx context.Context, nodes []*graph.Node) []*graph.Node {
 	if nodes == nil {
 		return nil
 	}
 	out := make([]*graph.Node, len(nodes))
 	for i, n := range nodes {
-		out[i] = s.withAbsPath(n)
+		out[i] = s.withAbsPath(ctx, n)
 	}
 	return out
 }
@@ -520,9 +550,12 @@ func (s *Server) withAbsPaths(nodes []*graph.Node) []*graph.Node {
 // works on raw path strings — used for edges, search results, and other
 // references that don't carry a Node pointer. Returns errPathUnresolved
 // rather than letting os.Open resolve against the daemon process CWD.
-func (s *Server) resolveGraphPath(graphPath string) (string, error) {
+func (s *Server) resolveGraphPath(ctx context.Context, graphPath string) (string, error) {
 	if graphPath == "" {
 		return "", errors.New("empty path")
+	}
+	if requestReadsCommittedTree(ctx) {
+		return "", errViewHasNoWorkingCopy
 	}
 	if filepath.IsAbs(graphPath) {
 		return filepath.Clean(graphPath), nil
@@ -530,13 +563,18 @@ func (s *Server) resolveGraphPath(graphPath string) (string, error) {
 	if s.multiIndexer != nil {
 		if abs := s.multiIndexer.ResolveFilePath(graphPath); abs != "" {
 			abs = filepath.Clean(abs)
-			// Re-root onto the linked worktree the file belongs to.
+			// Re-root onto the checkout this request reads.
 			// ResolveFilePath joins against the matched prefix's root;
-			// recover that root so worktreeRootedPath can decide.
+			// recover that root so the checkout choice has an anchor.
 			if prefix := matchedRepoPrefix(s.multiIndexer, graphPath); prefix != "" {
 				if root, ok := s.multiIndexer.RepoRoot(prefix); ok {
-					abs = worktreeRootedPath(abs, root, s.multiIndexer)
+					abs = s.checkoutRootedPath(ctx, abs, root, prefix)
 				}
+			} else if _, root, ok := soleTrackedRepo(s.multiIndexer); ok {
+				// A lone repo's graph paths are spelled without a prefix, so
+				// there is no prefix to recover the root from — but a routed
+				// view still has to move the path into its own checkout.
+				abs = requestViewPathRoot(ctx).rooted(abs, root)
 			}
 			return abs, nil
 		}
@@ -544,7 +582,8 @@ func (s *Server) resolveGraphPath(graphPath string) (string, error) {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			return filepath.Clean(filepath.Join(root, graphPath)), nil
+			abs := filepath.Clean(filepath.Join(root, graphPath))
+			return requestViewPathRoot(ctx).rooted(abs, root), nil
 		}
 	}
 	return "", fmt.Errorf("%w: path=%q", errPathUnresolved, graphPath)
@@ -561,8 +600,8 @@ func (s *Server) resolveGraphPath(graphPath string) (string, error) {
 // behaviour callers had before, never worse. Use it before GetFileSymbols
 // / FileEditingContext so a repo-relative path doesn't silently miss the
 // prefixed nodes in multi-repo mode.
-func (s *Server) graphRelPath(fp string) string {
-	if _, rel, err := s.resolveFilePath(fp); err == nil && rel != "" {
+func (s *Server) graphRelPath(ctx context.Context, fp string) string {
+	if _, rel, err := s.resolveFilePath(ctx, fp); err == nil && rel != "" {
 		return s.graphPathSpelling(rel)
 	}
 	return fp
@@ -628,7 +667,7 @@ func (s *Server) savingsAttributionNode(node *graph.Node) *graph.Node {
 // on-disk byte size of the file the agent would otherwise have read.
 // Best-effort accounting: files that don't resolve or stat book nothing.
 func (s *Server) recordFileBaselineSavings(ctx context.Context, tool, relPath, language, payload string) {
-	abs, err := s.resolveGraphPath(relPath)
+	abs, err := s.resolveGraphPath(ctx, relPath)
 	if err != nil {
 		return
 	}
@@ -660,7 +699,7 @@ func (s *Server) repoRelative(absPath string) string {
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
 			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil {
-				if rel, err := filepath.Rel(idx.RootPath(), absPath); err == nil {
+				if rel, ok := relativeWithinRoot(idx.RootPath(), absPath); ok {
 					return filepath.ToSlash(filepath.Join(prefix, rel))
 				}
 			}
@@ -669,7 +708,7 @@ func (s *Server) repoRelative(absPath string) string {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+			if rel, ok := relativeWithinRoot(root, absPath); ok {
 				return filepath.ToSlash(rel)
 			}
 		}
@@ -694,7 +733,7 @@ func (s *Server) reindexFile(absPath string) bool {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+			if _, ok := relativeWithinRoot(root, absPath); ok {
 				result, reindexErr := s.indexer.IncrementalReindexPaths(root, []string{absPath})
 				if incrementalReindexSucceeded(result, reindexErr) {
 					return true
@@ -716,6 +755,8 @@ func (s *Server) fileSyntaxHealth(relPath, absPath string) map[string]any {
 		return nil
 	}
 	graphPath := s.resolveOverlayGraphPath(relPath, absPath)
+	// Base read on purpose: the parse-error stamp this reads back is written
+	// by the indexer after the file lands on disk.
 	for _, n := range s.graph.GetFileNodes(graphPath) {
 		if n == nil || n.Kind != graph.KindFile || n.Meta == nil {
 			continue
@@ -772,7 +813,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
-	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
+	absPath, relPath, resolveErr := s.resolveFilePath(ctx, rawPath)
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
@@ -926,7 +967,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
 	if evidenceRequested {
-		s.attachMutationPhysicalEvidence(resp, absPath, content, true)
+		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}
 	attachMutationCommit(resp, commit)
 	// Retained last so a replayed retry returns the complete original payload,
@@ -955,7 +996,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	mutationID := strings.TrimSpace(req.GetString("mutation_id", ""))
 
-	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
+	absPath, relPath, resolveErr := s.resolveFilePath(ctx, rawPath)
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
@@ -1085,7 +1126,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
 	if evidenceRequested {
-		s.attachMutationPhysicalEvidence(resp, absPath, priorContent, fileExists)
+		s.attachMutationPhysicalEvidence(ctx, resp, absPath, priorContent, fileExists)
 	}
 	attachMutationCommit(resp, commit)
 	// Retained last so a replayed retry returns the complete original payload,
@@ -1110,17 +1151,18 @@ func matchLocationsHint(fileStr, oldString string) string {
 // fileDependents returns the distinct source files that import the given file —
 // the files a change to it would ripple into. Only import edges into the file
 // node count, so the header reflects real file-to-file dependencies.
-func (s *Server) fileDependents(fileID string) []string {
-	if s.graph == nil || fileID == "" {
+func (s *Server) fileDependents(ctx context.Context, fileID string) []string {
+	g := s.readerFor(ctx)
+	if g == nil || fileID == "" {
 		return nil
 	}
 	seen := map[string]bool{}
 	var deps []string
-	for _, e := range s.graph.GetInEdges(fileID) {
+	for _, e := range g.GetInEdges(fileID) {
 		if e == nil || e.Kind != graph.EdgeImports {
 			continue
 		}
-		f := s.fileOfNode(e.From)
+		f := fileOfNode(g, e.From)
 		if f == "" || f == fileID || seen[f] {
 			continue
 		}
@@ -1133,8 +1175,8 @@ func (s *Server) fileDependents(fileID string) []string {
 
 // fileOfNode returns the source file a node belongs to: a file node is its own
 // file, any other node reports its FilePath; falls back to the id.
-func (s *Server) fileOfNode(id string) string {
-	if n := s.graph.GetNode(id); n != nil {
+func fileOfNode(g graph.Reader, id string) string {
+	if n := g.GetNode(id); n != nil {
 		if n.Kind == graph.KindFile {
 			return n.ID
 		}
@@ -1166,8 +1208,8 @@ func fileDependentsNote(deps []string) string {
 
 // attachFileDependents records the dependents list + one-line header on a file
 // tool's result map, when the file has any importers.
-func (s *Server) attachFileDependents(result map[string]any, fileID string) {
-	if deps := s.fileDependents(fileID); len(deps) > 0 {
+func (s *Server) attachFileDependents(ctx context.Context, result map[string]any, fileID string) {
+	if deps := s.fileDependents(ctx, fileID); len(deps) > 0 {
 		result["dependents"] = deps
 		result["dependents_header"] = fileDependentsNote(deps)
 	}
@@ -1349,67 +1391,94 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if fidelityErr != nil {
 		return mcp.NewToolResultError("read_file: " + fidelityErr.Error()), nil
 	}
-	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
-	if resolveErr != nil {
-		return mcp.NewToolResultError(resolveErr.Error()), nil
-	}
-	if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
-		return mcp.NewToolResultError(guardErr.Error()), nil
-	}
-	info, statErr := os.Stat(absPath)
-	if statErr != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
-	}
-	if info.IsDir() {
-		return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
-	}
-
 	physicalEvidenceRequested, evidenceErr := parsePhysicalEvidenceRequest(req)
 	if evidenceErr != nil {
 		return mcp.NewToolResultError(evidenceErr.Error()), nil
 	}
 
-	var diskContent []byte
-	var physicalEvidence physicalReadEvidence
-	if physicalEvidenceRequested {
-		var readErr error
-		read := readPhysicalFileEvidence
-		if s.physicalEvidenceOverride != nil {
-			read = s.physicalEvidenceOverride
-		}
-		diskContent, physicalEvidence, readErr = read(absPath)
-		if readErr != nil {
-			return mcp.NewToolResultError(readErr.Error()), nil
-		}
-		// Bind confinement to the resolved target that supplied the hashed
-		// bytes. Re-resolving only absPath is insufficient when a symlink is
-		// retargeted outside the repo for the read and restored afterward.
-		if guardErr := s.guardResolvedPathWithinRepo(absPath, physicalEvidence.resolvedPath); guardErr != nil {
-			return mcp.NewToolResultError(guardErr.Error()), nil
-		}
-		// Also reject a path retargeted outside after the evidence snapshot.
-		if guardErr := s.guardSymlinkWithinRepo(absPath); guardErr != nil {
-			return mcp.NewToolResultError(guardErr.Error()), nil
-		}
-	}
+	var (
+		absPath, relPath  string
+		viewURI           string
+		content           []byte
+		diskContent       []byte
+		physicalEvidence  physicalReadEvidence
+		servedFromOverlay bool
+	)
 
-	// Honour the editor-buffer overlay if one is active for this path. A
-	// drifted overlay is already rejected upstream by the overlay view
-	// guard; what reaches here is a live buffer, which we flag as such so
-	// the caller knows the bytes are an unsaved editor view, not disk.
-	var content []byte
-	servedFromOverlay := false
-	if buf, ok := s.overlayContentFor(ctx, absPath); ok {
-		content = []byte(buf)
-		servedFromOverlay = true
-	} else if physicalEvidenceRequested {
-		content = diskContent
-	} else {
-		b, rerr := os.ReadFile(absPath)
-		if rerr != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", rerr)), nil
+	if files := refViewFilesFor(ctx); files != nil {
+		// The view is a committed tree, so there is no file on disk to stat,
+		// hash or confine — the bytes come out of the object store and the
+		// location they came from is the view's own identity.
+		if physicalEvidenceRequested {
+			return mcp.NewToolResultError(
+				"physical_evidence describes a file on disk, and this request reads a committed tree " +
+					"that is not checked out anywhere"), nil
 		}
-		content = b
+		bytes, rel, viewErr := readViewFile(ctx, files, rawPath)
+		if viewErr != nil {
+			return mcp.NewToolResultError(viewErr.Error()), nil
+		}
+		content = bytes
+		relPath = files.graphPath(rel)
+		viewURI = files.uri(rel)
+		// The URI stands in for the absolute path in the language probe: it
+		// carries the extension, and nothing can open it.
+		absPath = viewURI
+	} else {
+		var resolveErr error
+		absPath, relPath, resolveErr = s.resolveFilePath(ctx, rawPath)
+		if resolveErr != nil {
+			return mcp.NewToolResultError(resolveErr.Error()), nil
+		}
+		if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
+			return mcp.NewToolResultError(guardErr.Error()), nil
+		}
+		info, statErr := os.Stat(absPath)
+		if statErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
+		}
+		if info.IsDir() {
+			return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
+		}
+
+		if physicalEvidenceRequested {
+			var readErr error
+			read := readPhysicalFileEvidence
+			if s.physicalEvidenceOverride != nil {
+				read = s.physicalEvidenceOverride
+			}
+			diskContent, physicalEvidence, readErr = read(absPath)
+			if readErr != nil {
+				return mcp.NewToolResultError(readErr.Error()), nil
+			}
+			// Bind confinement to the resolved target that supplied the hashed
+			// bytes. Re-resolving only absPath is insufficient when a symlink is
+			// retargeted outside the repo for the read and restored afterward.
+			if guardErr := s.guardResolvedPathWithinRepo(ctx, absPath, physicalEvidence.resolvedPath); guardErr != nil {
+				return mcp.NewToolResultError(guardErr.Error()), nil
+			}
+			// Also reject a path retargeted outside after the evidence snapshot.
+			if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
+				return mcp.NewToolResultError(guardErr.Error()), nil
+			}
+		}
+
+		// Honour the editor-buffer overlay if one is active for this path. A
+		// drifted overlay is already rejected upstream by the overlay view
+		// guard; what reaches here is a live buffer, which we flag as such so
+		// the caller knows the bytes are an unsaved editor view, not disk.
+		if buf, ok := s.overlayContentFor(ctx, absPath); ok {
+			content = []byte(buf)
+			servedFromOverlay = true
+		} else if physicalEvidenceRequested {
+			content = diskContent
+		} else {
+			b, rerr := os.ReadFile(absPath)
+			if rerr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", rerr)), nil
+			}
+			content = b
+		}
 	}
 
 	originalBytes := len(content)
@@ -1518,6 +1587,13 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if servedFromOverlay {
 		result["served_from"] = "overlay"
 	}
+	if viewURI != "" {
+		// The file has no location outside the view, so the view's identity is
+		// the location: no absolute path is reported, and the one that is
+		// reported resolves only against this exact content.
+		result["served_from"] = "view"
+		result["view_uri"] = viewURI
+	}
 	if bodiesElided {
 		result["bodies_elided"] = true
 		if len(keptSymbols) > 0 {
@@ -1617,7 +1693,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
 	}
 
-	s.attachFileDependents(result, relPath)
+	s.attachFileDependents(ctx, result, relPath)
 
 	if s.isTOON(ctx, req) {
 		return returnTOON(result)

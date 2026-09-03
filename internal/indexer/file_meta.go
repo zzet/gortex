@@ -21,13 +21,19 @@ type fileReadVersion struct {
 	mtime int64
 	size  int64
 	valid bool
+	// snapshot marks a version read from an immutable content source.
+	// There is no on-disk file to restat and no mtime to stamp: the bytes
+	// cannot change under the reader, so the version is valid by
+	// construction and every restat check accepts it without a syscall.
+	snapshot bool
 }
 
-// readFileWithVersion returns the bytes together with the stable stat version
+// readOSFileWithVersion returns the bytes together with the stable stat version
 // they came from. A concurrent replace/write does not fail the read; it only
 // makes the receipt invalid so the caller cannot stamp newer disk state onto
-// older parsed bytes.
-func readFileWithVersion(path string) ([]byte, fileReadVersion, error) {
+// older parsed bytes. Callers go through (*Indexer).readFileWithVersion, which
+// picks this or the content source.
+func readOSFileWithVersion(path string) ([]byte, fileReadVersion, error) {
 	before, beforeErr := os.Stat(path)
 	src, err := os.ReadFile(path)
 	if err != nil {

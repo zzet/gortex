@@ -50,11 +50,12 @@ func (s *Server) handlePlanTurn(ctx context.Context, req mcp.CallToolRequest) (*
 	// above a single exact-name match because parser tables saturate
 	// the token corpus. The exact-name shortcut puts the user's
 	// identifier at position 0; BM25 still fills the rest.
+	reader := s.readerFor(ctx)
 	for _, kw := range keywords {
 		if len(kw) < 3 || !hasIdentifierShape(kw) {
 			continue
 		}
-		for _, m := range s.scopedNodeSlice(ctx, s.graph.FindNodesByName(kw)) {
+		for _, m := range s.scopedNodeSlice(ctx, reader.FindNodesByName(kw)) {
 			if m.Kind == graph.KindFile || m.Kind == graph.KindImport {
 				continue
 			}

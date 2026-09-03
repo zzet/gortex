@@ -45,9 +45,9 @@ SELECT 1 FROM repo_prefixes
 WHERE rp IS NOT NULL
   AND EXISTS (
       SELECT 1 FROM nodes
-      WHERE repo_prefix = rp AND language = ? AND name <> ''
+      WHERE repo_prefix = rp AND language = ? AND name <> '' AND view_gen = ?
   )
-LIMIT 1`, lang).Scan(&one)
+LIMIT 1`, lang, s.viewGen).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false
 	}
@@ -64,8 +64,8 @@ LIMIT 1`, lang).Scan(&one)
 // which previously always fell back to NodesByKind + an in-Go filter.
 func (s *Store) NodesByKindLang(kind graph.NodeKind, lang string) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		out := s.queryNodesSQL(`SELECT `+lookupNodeCols+` FROM nodes WHERE kind = ? AND language = ?`,
-			string(kind), lang)
+		out := s.queryNodesSQL(`SELECT `+lookupNodeCols+` FROM nodes WHERE kind = ? AND language = ? AND view_gen = ?`,
+			string(kind), lang, s.viewGen)
 		for _, n := range out {
 			if !yield(n) {
 				return

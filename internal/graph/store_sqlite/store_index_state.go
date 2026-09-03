@@ -18,9 +18,9 @@ func (s *Store) SetRepoIndexState(st graph.RepoIndexState) error {
 	}
 	_, err := s.execActiveWriteLocked(context.Background(), `
 INSERT OR REPLACE INTO repo_index_state
-  (repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		st.RepoPrefix, st.IndexedSHA, dirty, st.IndexedAt, st.WorkspaceFP,
+  (view_gen, repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.viewGen, st.RepoPrefix, st.IndexedSHA, dirty, st.IndexedAt, st.WorkspaceFP,
 		st.NodeCount, st.EdgeCount, st.ExtractorVersions)
 	return err
 }
@@ -30,7 +30,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 func (s *Store) GetRepoIndexState(repoPrefix string) (graph.RepoIndexState, bool, error) {
 	row := s.db.QueryRow(`
 SELECT indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions
-  FROM repo_index_state WHERE repo_prefix = ?`, repoPrefix)
+  FROM repo_index_state WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix)
 	st := graph.RepoIndexState{RepoPrefix: repoPrefix}
 	var dirty int
 	err := row.Scan(&st.IndexedSHA, &dirty, &st.IndexedAt, &st.WorkspaceFP,

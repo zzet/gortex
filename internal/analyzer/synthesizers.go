@@ -74,7 +74,7 @@ func WithSynthesizerRepoScope(repos map[string]bool) SynthesizersOption {
 // AnalyzeSynthesizers groups every synthesized edge in the graph by the
 // synthesizer that produced it and returns a sorted, structured result.
 // It is a pure Calculation: no side effects, no I/O.
-func AnalyzeSynthesizers(g graph.Store, opts ...SynthesizersOption) SynthesizersResult {
+func AnalyzeSynthesizers(g graph.Reader, opts ...SynthesizersOption) SynthesizersResult {
 	cfg := &synthConfig{}
 	for _, o := range opts {
 		o(cfg)

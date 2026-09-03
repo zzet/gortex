@@ -107,6 +107,9 @@ func buildStaleIndexHint(cwd string) string {
 		}
 		exact, contained := classifyCwd(abs, status.TrackedRepos)
 		if exact == nil && len(contained) == 0 {
+			if pendingAutomaticCheckout(abs, status.TrackedRepos) {
+				return fmt.Sprintf("[Gortex] cwd `%s` is a Git checkout awaiting automatic discovery; do not run `gortex track`. Wait for reconciliation and reconnect.", abs)
+			}
 			return fmt.Sprintf("[Gortex] cwd `%s` is not tracked — run `gortex track %s` to enable graph context here.", abs, abs)
 		}
 	}

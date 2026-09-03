@@ -220,6 +220,70 @@ func (s *Server) resolveSupersededFailedReceipts(succeededPath string, succeeded
 	})
 }
 
+// resolveReindexedPathReceipts resolves terminally failed freshness receipts
+// for a path that an explicit reindex has just re-parsed. A failed ingest
+// fail-closes change.detect for the whole repository until retention lapses,
+// and reindex_repository was the obvious recovery that did not work: it
+// re-reads the file into the graph but never touched this map, so the barrier
+// kept reporting a gap the graph no longer had.
+//
+// The evidence a failed receipt is waiting for is exactly "the graph has read
+// the current bytes of this path", which a successful scoped re-parse
+// provides. Pending receipts are left alone: they describe work still in
+// flight, not a dead generation, and clearing one would hide a real gap.
+// failedReceiptsBefore snapshots the failed freshness receipts a reindex pass
+// is entitled to resolve. It MUST be called before the pass starts: a receipt
+// that fails its own ingest while the pass is running was never read by it, so
+// resolving it would certify bytes the graph never saw. Receipt IDs are the
+// bound rather than a timestamp because receipts carry no completion time.
+//
+// A nil result resolves nothing, which is the correct reading of "no snapshot
+// was taken".
+func (s *Server) failedReceiptsBefore(paths []string, root string) map[string]struct{} {
+	candidate, ok := reindexCandidatePath(paths, root)
+	if !ok {
+		return nil
+	}
+	eligible := make(map[string]struct{})
+	s.mutationReceipts.Range(func(_, value any) bool {
+		receipt, ok := value.(*mutationReceipt)
+		if !ok || filepath.Clean(receipt.path) != candidate {
+			return true
+		}
+		receipt.mu.RLock()
+		failed := receipt.completed && (receipt.result.Err != nil || !receipt.result.Reindexed)
+		receipt.mu.RUnlock()
+		if failed {
+			eligible[receipt.id] = struct{}{}
+		}
+		return true
+	})
+	return eligible
+}
+
+func (s *Server) resolveReindexedPathReceipts(reindexedPath string, eligible map[string]struct{}) {
+	cleanPath := filepath.Clean(reindexedPath)
+	s.mutationReceipts.Range(func(_, value any) bool {
+		receipt, ok := value.(*mutationReceipt)
+		if !ok || filepath.Clean(receipt.path) != cleanPath {
+			return true
+		}
+		if _, wasFailingBeforeThePass := eligible[receipt.id]; !wasFailingBeforeThePass {
+			return true
+		}
+		receipt.mu.Lock()
+		if receipt.completed && (receipt.result.Err != nil || !receipt.result.Reindexed) {
+			receipt.result = indexer.MutationResult{
+				RequestedGeneration: receipt.generation,
+				AppliedGeneration:   receipt.generation,
+				Reindexed:           true,
+			}
+		}
+		receipt.mu.Unlock()
+		return true
+	})
+}
+
 func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

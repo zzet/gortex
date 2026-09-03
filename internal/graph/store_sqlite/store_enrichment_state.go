@@ -21,9 +21,9 @@ func (s *Store) SetEnrichmentState(st graph.EnrichmentState) error {
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(), `
 INSERT OR REPLACE INTO enrichment_state
-  (repo_prefix, provider, indexed_sha, completed_at, coverage)
-VALUES (?, ?, ?, ?, ?)`,
-		st.RepoPrefix, st.Provider, st.IndexedSHA, st.CompletedAt, st.Coverage)
+  (view_gen, repo_prefix, provider, indexed_sha, completed_at, coverage)
+VALUES (?, ?, ?, ?, ?, ?)`,
+		s.viewGen, st.RepoPrefix, st.Provider, st.IndexedSHA, st.CompletedAt, st.Coverage)
 	return err
 }
 
@@ -33,7 +33,7 @@ VALUES (?, ?, ?, ?, ?)`,
 func (s *Store) GetEnrichmentState(repoPrefix, provider string) (graph.EnrichmentState, bool, error) {
 	row := s.db.QueryRow(`
 SELECT indexed_sha, completed_at, coverage
-  FROM enrichment_state WHERE repo_prefix = ? AND provider = ?`, repoPrefix, provider)
+  FROM enrichment_state WHERE view_gen = ? AND repo_prefix = ? AND provider = ?`, s.viewGen, repoPrefix, provider)
 	st := graph.EnrichmentState{RepoPrefix: repoPrefix, Provider: provider}
 	err := row.Scan(&st.IndexedSHA, &st.CompletedAt, &st.Coverage)
 	if err == sql.ErrNoRows {

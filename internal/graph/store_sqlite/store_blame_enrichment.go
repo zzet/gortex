@@ -11,7 +11,8 @@ var (
 	_ graph.BlameEnrichmentReader = (*Store)(nil)
 )
 
-const blameChunk = 180
+// blameChunk bounds rows per multi-row INSERT (6 cols → 6 params/row).
+const blameChunk = 160
 
 const blameCols = `node_id, repo_prefix, commit_sha, email, ts`
 
@@ -32,17 +33,17 @@ func (s *Store) BulkSetBlame(repoPrefix string, rows []graph.BlameEnrichment) er
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*5)
+		args := make([]any, 0, len(batch)*6)
 		stmt := make([]byte, 0, 96+len(batch)*16)
-		stmt = append(stmt, "INSERT OR REPLACE INTO blame_enrichment ("...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO blame_enrichment (view_gen, "...)
 		stmt = append(stmt, blameCols...)
 		stmt = append(stmt, ") VALUES "...)
 		for i, e := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?,?,?,?,?)"...)
-			args = append(args, e.NodeID, repoPrefix, e.Commit, e.Email, e.Timestamp)
+			stmt = append(stmt, "(?,?,?,?,?,?)"...)
+			args = append(args, s.viewGen, e.NodeID, repoPrefix, e.Commit, e.Email, e.Timestamp)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -83,15 +84,16 @@ func (s *Store) DeleteBlame(nodeIDs []string) error {
 			end = len(uniq)
 		}
 		chunk := uniq[start:end]
-		args := make([]any, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.viewGen)
 		stmt := make([]byte, 0, 56+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM blame_enrichment WHERE node_id IN ("...)
+		stmt = append(stmt, "DELETE FROM blame_enrichment WHERE view_gen = ? AND node_id IN ("...)
 		for i, id := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
 			stmt = append(stmt, '?')
-			args[i] = id
+			args = append(args, id)
 		}
 		stmt = append(stmt, ')')
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
@@ -107,9 +109,9 @@ func (s *Store) BlameRows(repoPrefix string) []graph.BlameEnrichment {
 		err  error
 	)
 	if repoPrefix == "" {
-		rows, err = s.db.Query(`SELECT ` + blameCols + ` FROM blame_enrichment`)
+		rows, err = s.db.Query(`SELECT `+blameCols+` FROM blame_enrichment WHERE view_gen = ?`, s.viewGen)
 	} else {
-		rows, err = s.db.Query(`SELECT `+blameCols+` FROM blame_enrichment WHERE repo_prefix = ? AND repo_prefix <> ''`, repoPrefix)
+		rows, err = s.db.Query(`SELECT `+blameCols+` FROM blame_enrichment WHERE view_gen = ? AND repo_prefix = ? AND repo_prefix <> ''`, s.viewGen, repoPrefix)
 	}
 	if err != nil {
 		return nil

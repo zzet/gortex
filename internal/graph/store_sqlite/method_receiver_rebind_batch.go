@@ -10,19 +10,26 @@ const goMethodReceiverFileTableSQL = `CREATE TEMP TABLE IF NOT EXISTS go_receive
     file_path TEXT PRIMARY KEY
 ) WITHOUT ROWID`
 
+// The batch candidate query pairs generations the same way its single-file
+// sibling does (see method_receiver_rebind.go): the edge, the owning method,
+// the current target and the canonical replacement are all held to the writing
+// handle's generation, and the target probe stays in the LEFT JOIN's ON clause.
 const goMethodReceiverCandidatesForFilesSQL = `
 SELECT e.id, MIN(c.id)
 FROM temp.go_receiver_rebind_files AS f
 CROSS JOIN nodes AS m INDEXED BY nodes_by_file
 CROSS JOIN edges AS e INDEXED BY edges_by_from
-LEFT JOIN nodes AS t ON t.id = e.to_id
+LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = ?
 JOIN nodes AS c INDEXED BY nodes_go_receiver_type
   ON c.repo_prefix = m.repo_prefix
  AND c.file_dir = e.member_receiver_dir
  AND c.name = e.member_receiver
+ AND c.view_gen = ?
 WHERE m.file_path = f.file_path
+  AND m.view_gen = ?
   AND e.from_id = m.id
   AND e.kind = 'member_of'
+  AND e.view_gen = ?
   AND m.language = 'go'
   AND m.kind = 'method'
   AND e.member_receiver IS NOT NULL
@@ -97,7 +104,8 @@ func (s *Store) RebindGoMethodReceiversForFiles(filePaths []string) (changed int
 	}
 
 	result, err := conn.ExecContext(ctx,
-		`INSERT INTO temp.go_receiver_rebind_candidates (edge_id, new_to) `+goMethodReceiverCandidatesForFilesSQL)
+		`INSERT INTO temp.go_receiver_rebind_candidates (edge_id, new_to) `+goMethodReceiverCandidatesForFilesSQL,
+		s.viewGen, s.viewGen, s.viewGen, s.viewGen)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite receiver batch collect candidates: %w", err)
 	}
@@ -141,6 +149,7 @@ WHERE id IN (
           AND existing.kind = old.kind
           AND existing.file_path = old.file_path
           AND existing.line = old.line
+          AND existing.view_gen = old.view_gen
     )
 )`); err != nil {
 		return 0, fmt.Errorf("sqlite receiver batch remove existing-key conflicts: %w", err)

@@ -539,7 +539,10 @@ func TestCodingAgentInstructionsStayTerseAndDirective(t *testing.T) {
 	srv := &Server{}
 	got := srv.stateAwareInstructionsForClient("", "generic-harness")
 	require.Equal(t, codingAgentInstructions, got)
-	require.Less(t, len(got), 550)
+	// The workflow directive stays compact; the shared safety policy deliberately
+	// raises the complete initialize envelope while keeping it below one 2 KiB
+	// prompt block.
+	require.Less(t, len(got), 2_048)
 	for _, implementationTerm := range []string{"codex", "facade", "version", "preset", "tools/list", "tools_search"} {
 		require.NotContains(t, strings.ToLower(got), implementationTerm)
 	}

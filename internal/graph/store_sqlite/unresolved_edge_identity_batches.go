@@ -52,6 +52,19 @@ func (s *Store) ScanUnresolvedEdgeIdentitiesBatched(
 	}
 }
 
+// unresolvedIdentityPageSQL is one keyset page of the attribution pass's
+// enumeration. The generation binds first so a pinned handle seeks into its own
+// rows; the base corpus keeps the raw rowid walk it owns.
+func unresolvedIdentityPageSQL(source, generation string, kinds int) string {
+	return `SELECT id, from_id, to_id, kind, file_path, line
+	FROM ` + source + `
+	WHERE ` + generation + ` AND id > ? AND id <= ? AND kind IN (` + inPlaceholders(kinds) + `)
+	  AND (substr(to_id, 1, 12) = 'unresolved::'
+	       OR instr(to_id, '::unresolved::') > 0)
+	ORDER BY id
+	LIMIT ?`
+}
+
 func (s *Store) unresolvedEdgeIdentityPage(
 	kinds []string,
 	after, highWater int64,
@@ -60,18 +73,13 @@ func (s *Store) unresolvedEdgeIdentityPage(
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	query := `SELECT id, from_id, to_id, kind, file_path, line
-	FROM edges NOT INDEXED
-	WHERE id > ? AND id <= ? AND kind IN (` + inPlaceholders(len(kinds)) + `)
-	  AND (substr(to_id, 1, 12) = 'unresolved::'
-	       OR instr(to_id, '::unresolved::') > 0)
-	ORDER BY id
-	LIMIT ?`
-	args := make([]any, 0, len(kinds)+3)
-	args = append(args, after, highWater)
+	source, generation := s.unresolvedScanSource(unresolvedIdentityBaseSource)
+	args := make([]any, 0, len(kinds)+4)
+	args = append(args, s.viewGen, after, highWater)
 	args = append(args, toAnyArgs(kinds)...)
 	args = append(args, limit)
-	rows, err := s.queryActiveWriteLocked(context.Background(), query, args...)
+	rows, err := s.queryActiveWriteLocked(
+		context.Background(), unresolvedIdentityPageSQL(source, generation, len(kinds)), args...)
 	if err != nil {
 		panicOnFatal(err)
 		return nil, after, false
@@ -216,12 +224,12 @@ func (s *Store) reindexUnresolvedEdgeTargetsTransactionLocked(
 
 	var repairDeletes []sqliteReindexKey
 	stats.updatedRows, stats.updateStatements, repairDeletes, err =
-		updateSQLiteUnresolvedTargetsTxLimited(tx, mutations, variableLimit)
+		updateSQLiteUnresolvedTargetsTxLimited(tx, s.viewGen, mutations, variableLimit)
 	if err != nil {
 		return stats, false, false, err
 	}
 	stats.deletedRows, stats.deleteStatements, err =
-		deleteSQLiteReindexRowsTxLimited(tx, repairDeletes, variableLimit)
+		deleteSQLiteReindexRowsTxLimited(tx, s.viewGen, repairDeletes, variableLimit)
 	if err != nil {
 		return stats, false, false, err
 	}
@@ -276,6 +284,7 @@ func sqliteUnresolvedTargetMutations(
 
 func updateSQLiteUnresolvedTargetsTxLimited(
 	tx *sql.Tx,
+	viewGen int64,
 	mutations []sqliteUnresolvedTargetMutation,
 	variableLimit *int,
 ) (updatedRows, statements int, repairDeletes []sqliteReindexKey, err error) {
@@ -292,7 +301,7 @@ func updateSQLiteUnresolvedTargetsTxLimited(
 	)
 	for pos := 0; pos < len(mutations); {
 		chunkStart := pos
-		args := make([]any, 0, rowLimit*unresolvedTargetUpdateParamsPerRow)
+		args := make([]any, 0, rowLimit*unresolvedTargetUpdateParamsPerRow+1)
 		argBytes := 0
 		rowCount := 0
 		for pos < len(mutations) && rowCount < rowLimit {
@@ -311,6 +320,7 @@ func updateSQLiteUnresolvedTargetsTxLimited(
 			rowCount++
 			argBytes += rowBytes
 		}
+		args = append(args, viewGen)
 
 		query := `WITH patch(old_from_id, old_to_id, kind, file_path, line, new_to_id) AS (VALUES ` +
 			multiValues(rowCount, unresolvedTargetUpdateParamsPerRow) + `)
@@ -321,7 +331,8 @@ func updateSQLiteUnresolvedTargetsTxLimited(
 			AND e.to_id = p.old_to_id
 			AND e.kind = p.kind
 			AND e.file_path = p.file_path
-			AND e.line = p.line`
+			AND e.line = p.line
+			AND e.view_gen = ?`
 		result, execErr := tx.Exec(query, args...)
 		if tooManySQLVariables(execErr) && rowCount > 1 {
 			rowLimit = lowerBatchVariableLimit(variableLimit, unresolvedTargetUpdateParamsPerRow, rowCount)

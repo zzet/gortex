@@ -86,15 +86,16 @@ func (s *Server) handleAnalyzePageRank(ctx context.Context, req mcp.CallToolRequ
 		defer scheduleOSMemoryReleaseAfterBurst(s.logger, "analyze_pagerank")
 	}
 
+	reader := s.readerFor(ctx)
+
 	// Narrow to the session workspace + optional repo allow-set, then
 	// re-apply the original limit (runPageRank ran unbounded above under
-	// scope). pagerank reads s.graph directly, so without this the authority
-	// ranking would span every workspace. Strict no-op for an unbound
-	// session with no RepoAllow.
+	// scope). Without this the authority ranking would span every
+	// workspace. Strict no-op for an unbound session with no RepoAllow.
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]graph.PageRankHit, 0, len(hits))
 		for _, h := range hits {
-			if s.analyzeNodeVisible(ctx, s.graph.GetNode(h.NodeID)) {
+			if s.analyzeNodeVisible(ctx, reader.GetNode(h.NodeID)) {
 				kept = append(kept, h)
 			}
 		}
@@ -116,7 +117,7 @@ func (s *Server) handleAnalyzePageRank(ctx context.Context, req mcp.CallToolRequ
 			ids = append(ids, h.NodeID)
 		}
 	}
-	nodeByID := s.graph.GetNodesByIDs(ids)
+	nodeByID := reader.GetNodesByIDs(ids)
 
 	rows := make([]pageRankRow, 0, len(hits))
 	for _, h := range hits {
@@ -235,7 +236,7 @@ func (s *Server) handleAnalyzeLouvain(ctx context.Context, req mcp.CallToolReque
 		limit = int(v)
 	}
 
-	result := s.runLouvain()
+	result := s.runLouvain(ctx)
 	if result == nil {
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"communities": []any{},
@@ -249,19 +250,19 @@ func (s *Server) handleAnalyzeLouvain(ctx context.Context, req mcp.CallToolReque
 	// Narrow to the session workspace + optional repo allow-set when the
 	// request scopes below the global graph: prune each community's members
 	// to visible nodes, recompute Size/Files, and drop communities left
-	// empty. louvain reads s.graph directly, so without this the partition
-	// would span every workspace. Hub is a symbol name (not a node ID) so it
-	// is left untouched. Filter before the limit cap so the cap and the
-	// total recompute over the visible set. Strict no-op for an unbound
-	// session with no RepoAllow.
+	// empty. Without this the partition would span every workspace. Hub is
+	// a symbol name (not a node ID) so it is left untouched. Filter before
+	// the limit cap so the cap and the total recompute over the visible
+	// set. Strict no-op for an unbound session with no RepoAllow.
 	if s.scopeFiltersActive(ctx) {
+		reader := s.readerFor(ctx)
 		kept := make([]analysis.Community, 0, len(communities))
 		for _, c := range communities {
 			visMembers := make([]string, 0, len(c.Members))
 			files := make([]string, 0, len(c.Files))
 			seenFile := make(map[string]struct{}, len(c.Files))
 			for _, id := range c.Members {
-				n := s.graph.GetNode(id)
+				n := reader.GetNode(id)
 				if !s.analyzeNodeVisible(ctx, n) {
 					continue
 				}
@@ -316,7 +317,7 @@ func (s *Server) handleAnalyzeLouvain(ctx context.Context, req mcp.CallToolReque
 // pure-Go in-process Louvain. The output shape is identical
 // either way (analysis.DetectCommunitiesLouvainBackend threads
 // the engine-native partition through the same post-processing).
-func (s *Server) runLouvain() *analysis.CommunityResult {
+func (s *Server) runLouvain(ctx context.Context) *analysis.CommunityResult {
 	if store := s.backendStore(); store != nil {
 		if cd, ok := store.(graph.CommunityDetector); ok {
 			if r := analysis.DetectCommunitiesLouvainBackend(s.graph, cd); r != nil {
@@ -327,7 +328,7 @@ func (s *Server) runLouvain() *analysis.CommunityResult {
 			// a half-completed result.
 		}
 	}
-	return analysis.DetectCommunitiesLouvain(s.graph)
+	return analysis.DetectCommunitiesLouvain(s.readerFor(ctx))
 }
 
 // makeKindAllow returns a predicate that reports whether a node's

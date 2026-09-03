@@ -144,7 +144,7 @@ func TestEvaluateGuards_EvaluatesEachIDAgainstItsOwnRepoRules(t *testing.T) {
 		}),
 	}
 
-	got := s.evaluateGuards([]string{
+	got := s.evaluateGuards(g, []string{
 		"repo-a/pkg/handler/h.go::Handle",
 		"repo-b/pkg/handler/h.go::Handle",
 	})
@@ -172,7 +172,7 @@ func TestEvaluateGuards_RulesDoNotLeakAcrossRepos(t *testing.T) {
 		configManager: guardRulesTestManager(t, map[string]string{"repo-a": guardRulesRepoA}),
 	}
 
-	assert.Empty(t, s.evaluateGuards([]string{"repo-b/pkg/handler/h.go::Handle"}))
+	assert.Empty(t, s.evaluateGuards(g, []string{"repo-b/pkg/handler/h.go::Handle"}))
 }
 
 func TestGroupIDsByRepo_NoTrackedSetTrustsTheIDPrefix(t *testing.T) {

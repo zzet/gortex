@@ -1036,6 +1036,12 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 			stale = append(stale, receipt.absPath)
 			continue
 		}
+		if receipt.readVersion.snapshot {
+			// Read from an immutable content source: nothing on disk to
+			// restat, and no working-tree mtime to advance the ledger to.
+			fresh = append(fresh, receipt.absPath)
+			continue
+		}
 		current, err := os.Stat(receipt.absPath)
 		if err != nil || !sameFileVersion(receipt.readVersion.info, current) {
 			stale = append(stale, receipt.absPath)

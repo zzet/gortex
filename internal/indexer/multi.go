@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/entrypoints"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
@@ -52,6 +53,28 @@ type RepoMetadata struct {
 	IsWorktree bool
 }
 
+// repositoryUntrackState is the process-local continuation for one
+// authoritative teardown. The catalog cleanup saga and the still-persisted
+// configuration are the restart authority; this state keeps same-process
+// retries from repeating successful payload/vector phases and keeps the stable
+// mutation lane closed until every external side effect commits.
+type repositoryUntrackState struct {
+	mu          sync.Mutex
+	metadata    *RepoMetadata
+	indexer     *Indexer
+	coordinator *repositoryMutationCoordinator
+	contract    DerivedInvalidationPlan
+	finalize    func(*RepoMetadata) error
+
+	indexerClosed   bool
+	payloadPurged   bool
+	vectorPublished bool
+	configFinalized bool
+	completed       bool
+	nodesRemoved    int
+	edgesRemoved    int
+}
+
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
 	graph     graph.Store
@@ -67,6 +90,10 @@ type MultiIndexer struct {
 	// it to New; every per-repository construction flows through this factory.
 	newIndexer func(graph.Store, *parser.Registry, config.IndexConfig, *zap.Logger) *Indexer
 	mu         sync.RWMutex
+	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
+	// a live repo is hidden and removed only after payload, vector, config, and
+	// derived-contract cleanup have all succeeded.
+	pendingRepositoryUntracks map[string]*repositoryUntrackState
 
 	// repositoryMutations owns one stable mutation lane per repository prefix.
 	// The slot survives Indexer replacement so an explicit re-index cannot race
@@ -2284,10 +2311,10 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		return nil, fmt.Errorf("repository not found: %s", repoPrefix)
 	}
 
-	// Evict existing data for this repo before re-indexing. Always — a lone
-	// repo is now stored prefixed (see SetRepoPrefix below), so the eviction
-	// must clear the prefixed slice regardless of repo count.
-	mi.graph.EvictRepo(repoPrefix)
+	// Replace only the base handle's generation before re-indexing. A lone repo
+	// is stored prefixed from its first index, but immutable commit/dirty/ref
+	// payload generations may carry the same prefix and must remain intact.
+	evictRepoCurrentGeneration(mi.graph, repoPrefix)
 
 	mi.configMgr.LoadWorkspaceConfig(repoPrefix, meta.RootPath)
 	cfg := mi.configMgr.GetRepoConfig(repoPrefix)
@@ -2705,6 +2732,15 @@ func EffectiveRepoPrefix(cm *config.ConfigManager, entry config.RepoEntry) strin
 // TrackRepoCtx is TrackRepo with a context, allowing callers to pipe progress
 // reporters (via progress.WithReporter) through to the underlying Index call.
 func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry) (*IndexResult, error) {
+	return mi.trackRepoSourceCtx(ctx, entry, nil)
+}
+
+// trackRepoSourceCtx is TrackRepoCtx with a borrowed immutable content source.
+// A nil source preserves the legacy filesystem-backed behavior. The caller owns
+// the source and must keep it open until this method returns.
+func (mi *MultiIndexer) trackRepoSourceCtx(
+	ctx context.Context, entry config.RepoEntry, content source.ContentSource,
+) (*IndexResult, error) {
 	absPath, err := filepath.Abs(entry.Path)
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", entry.Path, err)
@@ -2778,6 +2814,7 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 	// mtime lookups — had to carry a branch for the unprefixed shape.
 	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
+	setTrackContentSource(idx, content)
 	// Workspace / project slugs stamped on every node. Resolution
 	// order (highest priority first): RepoEntry.Workspace from the
 	// global config (lets users pin OSS repos without committing a
@@ -3215,201 +3252,21 @@ func (mi *MultiIndexer) ReconcileAllCtx(ctx context.Context) map[string]*IndexRe
 
 // UntrackRepo evicts a repo from the graph and removes it from config.
 func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
-	if mi.isClosed() {
-		return 0, 0
-	}
-	// Snapshot the exact live registry generation first. Legacy restores and
-	// direct-map fixtures may not have a stable lane yet; backfill one only
-	// while both metadata and Indexer pointers still match this generation.
-	mi.mu.RLock()
-	metaSnapshot, tracked := mi.repos[repoPrefix]
-	idx := mi.indexers[repoPrefix]
-	mi.mu.RUnlock()
-	if !tracked {
-		return 0, 0
-	}
-	coordinator, current := mi.repositoryMutationCoordinatorForTeardownSnapshot(
-		repoPrefix, metaSnapshot, idx,
-	)
-	if !current {
-		return 0, 0
-	}
-
-	// Close admission before removing the live Indexer or purging its graph.
-	// Waiting outside mi.mu lets the in-flight mutation tail finish without
-	// lock inversion; every later admission observes the closed stable lane.
-	if err := coordinator.closeAndWait(context.Background()); err != nil {
-		mi.logger.Warn("failed to drain repository mutation coordinator",
-			zap.String("prefix", repoPrefix), zap.Error(err))
-		return 0, 0
-	}
-
-	// The lane is now closed and drained, so no new admission can cross this
-	// teardown while it takes the transition read side. Retain that admission
-	// through exact-generation validation, graph/config purge, contract
-	// reconciliation, and conditional detach; EndBatch and direct global passes
-	// see either the complete repository or its complete absence.
-	mi.batchMutationGate.RLock()
-	defer mi.batchMutationGate.RUnlock()
-	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
-	defer finishTopologyMutation(true)
-
-	mi.mu.Lock()
-	meta, ok := mi.repos[repoPrefix]
-	idx = mi.indexers[repoPrefix]
-	// A concurrent teardown may have removed the old generation and a later
-	// track may already have installed a fresh Indexer/slot for this prefix.
-	// Delete metadata only when both live objects still belong to the exact
-	// coordinator generation drained above.
-	if !ok ||
-		mi.existingRepositoryMutationCoordinator(repoPrefix) != coordinator ||
-		(idx != nil && !idx.hasRepositoryMutationCoordinator(coordinator)) {
-		mi.mu.Unlock()
-		return 0, 0
-	}
-	// Snapshot the exact derived-contract frontier before deleting the repo.
-	// Cross-repo bridge nodes can be owned by a surviving repo, so purge alone
-	// cannot remove every dangling derived edge.
-	contractPlan := mi.contractInvalidationPlanForRepo(idx)
-	delete(mi.repos, repoPrefix)
-	delete(mi.indexers, repoPrefix)
-	mi.mu.Unlock()
-
-	// The stable mutation lane is drained and this exact generation is detached;
-	// now wait for any overlay/direct extraction before terminating its workers.
-	if idx != nil {
-		idx.Close()
-	}
-
-	// The process-wide trigram budget otherwise retains the removed Indexer
-	// (and its full-text cache) until an unrelated search happens to evict it.
-	if idx != nil {
-		idx.releaseTrigramSearcher()
-		idx.trigramBudget().forget(idx)
-	}
-
-	// Every repo's nodes live in its byRepo bucket. Serialize the complete
-	// sidecar/vector purge and aggregate vector publication with sibling repo
-	// installs; otherwise an older stats snapshot can be published after a newer
-	// corpus commit. The callback holds no mi.mu and releases every SQLite write
-	// transaction before ReplaceHybridVector waits for pinned search readers.
-	var nodesRemoved, edgesRemoved int
-	purgeRepo := func() {
-		if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
-			// Prefer the full sidecar-aware purge. It returns no counts, so report
-			// the last-index metadata as the estimate; fall back to EvictRepo on
-			// error. The subsequent empty corpus replacement also cleans legacy
-			// synthetic chunk rows that are not graph node IDs.
-			if err := purger.PurgeRepo(repoPrefix); err != nil {
-				mi.logger.Warn("purge repo failed; falling back to node/edge eviction",
-					zap.String("prefix", repoPrefix), zap.Error(err))
-				nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
-			} else {
-				nodesRemoved, edgesRemoved = meta.NodeCount, meta.EdgeCount
+	nodesRemoved, edgesRemoved, err := mi.untrackRepoChecked(
+		context.Background(), repoPrefix, false,
+		func(meta *RepoMetadata) error {
+			if meta == nil || meta.RootPath == "" || mi.configMgr == nil {
+				return nil
 			}
-			return
-		}
-		// Backends without sidecars are complete after ordinary eviction.
-		nodesRemoved, edgesRemoved = mi.graph.EvictRepo(repoPrefix)
-	}
-	refresh := func(sw *search.Swappable) error {
-		purgeRepo()
-		return mi.publishVectorCorpusAfterRepoRemoval(context.Background(), repoPrefix, sw)
-	}
-	if sw, ok := mi.search.(*search.Swappable); ok {
-		if err := sw.SerializeVectorUpdate(func() error { return refresh(sw) }); err != nil {
-			mi.logger.Warn("refresh vector corpus after untrack failed",
-				zap.String("prefix", repoPrefix), zap.Error(err))
-		}
-	} else if err := refresh(nil); err != nil {
-		mi.logger.Warn("remove vector corpus after untrack failed",
+			_, err := mi.configMgr.Global().RemoveRepoAndSaveIfPresent(meta.RootPath)
+			return err
+		},
+	)
+	if err != nil {
+		mi.logger.Error("repository untrack remains pending",
 			zap.String("prefix", repoPrefix), zap.Error(err))
 	}
-
-	// Remove from global config.
-	if meta.RootPath != "" {
-		if err := mi.configMgr.Global().RemoveRepo(meta.RootPath); err != nil {
-			mi.logger.Warn("failed to remove repo from config",
-				zap.String("prefix", repoPrefix), zap.Error(err))
-		}
-	}
-
-	if !contractPlan.Empty() {
-		mi.ReconcileContractEdgesForFrontier(contractPlan)
-	}
-
-	// Keep the closed slot installed until every purge/config side effect is
-	// complete, then remove only the exact generation drained above. A stale
-	// teardown racing a retrack must leave the replacement lane installed.
-	mi.detachRepositoryMutationCoordinator(repoPrefix, coordinator)
 	return nodesRemoved, edgesRemoved
-}
-
-// WorktreeGC is the per-repo outcome of GCVanishedWorktrees.
-type WorktreeGC struct {
-	RepoPrefix   string
-	RootPath     string
-	NodesRemoved int
-	EdgesRemoved int
-}
-
-// GCVanishedWorktrees garbage-collects the index of any tracked linked
-// git worktree whose root directory has disappeared from disk — the
-// `git worktree remove` (or manual deletion) case. Each vanished
-// worktree's branch-keyed snapshot slot and graph nodes would otherwise
-// leak forever: a removed worktree never fires a per-file fsnotify
-// delete for its whole tree, and the janitor's full-tree reconciliation just
-// errors out on the missing root without evicting anything.
-//
-// Only repos recorded as worktrees (RepoMetadata.IsWorktree) are
-// eligible — a vanished *main* checkout is left alone, since that is
-// far more likely a transient mount problem than an intentional
-// removal, and untracking it would also orphan every linked worktree
-// that shares its .git. The directory-existence test uses the same
-// not-exist-only rule as the per-file deletion detector, so a flaky
-// filesystem cannot trigger a destructive eviction.
-//
-// Returns one WorktreeGC record per repo evicted; an empty slice when
-// every tracked worktree is still present.
-func (mi *MultiIndexer) GCVanishedWorktrees() []WorktreeGC {
-	// Snapshot the candidate set under the read lock, then evict
-	// outside it — UntrackRepo takes the write lock itself.
-	type candidate struct {
-		prefix string
-		root   string
-	}
-	var candidates []candidate
-	mi.mu.RLock()
-	for prefix, meta := range mi.repos {
-		if meta == nil || !meta.IsWorktree || meta.RootPath == "" {
-			continue
-		}
-		if WorktreeRootGone(meta.RootPath) {
-			candidates = append(candidates, candidate{prefix: prefix, root: meta.RootPath})
-		}
-	}
-	mi.mu.RUnlock()
-
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	out := make([]WorktreeGC, 0, len(candidates))
-	for _, c := range candidates {
-		nodes, edges := mi.UntrackRepo(c.prefix)
-		mi.logger.Info("janitor: garbage-collected vanished worktree",
-			zap.String("prefix", c.prefix),
-			zap.String("root", c.root),
-			zap.Int("nodes_removed", nodes),
-			zap.Int("edges_removed", edges))
-		out = append(out, WorktreeGC{
-			RepoPrefix:   c.prefix,
-			RootPath:     c.root,
-			NodesRemoved: nodes,
-			EdgesRemoved: edges,
-		})
-	}
-	return out
 }
 
 // GetMetadata returns the metadata for a specific repo, or nil if not found.
@@ -3468,24 +3325,10 @@ func (mi *MultiIndexer) RepoForFile(filePath string) string {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 
-	var bestPrefix string
-	var bestLen int
-
-	for prefix, meta := range mi.repos {
-		// Fold-aware containment so a case-variant file path still maps
-		// to its repo on a case-insensitive filesystem. Longest-root-wins
-		// breaks ties by nesting depth; nested roots share a prefix, so
-		// the raw RootPath length orders them the same as their folded
-		// forms would.
-		if pathkey.HasPathPrefix(absPath, meta.RootPath) {
-			if len(meta.RootPath) > bestLen {
-				bestLen = len(meta.RootPath)
-				bestPrefix = prefix
-			}
-		}
-	}
-
-	return bestPrefix
+	// The shared resolver does one complete lexical pass before its
+	// canonical fallback, so the common path performs no filesystem I/O even
+	// when many unrelated repositories precede the matching one.
+	return mi.bestRepoPrefixForPathLocked(absPath)
 }
 
 // GetIndexer returns the Indexer for a specific repo prefix, or nil.
@@ -4127,6 +3970,16 @@ func (mi *MultiIndexer) ReconcileContractEdges() int {
 	if g == nil {
 		return 0
 	}
+
+	// reconcileMu excludes other reconciles; it says nothing about a resolve.
+	// A resolve pass mutates To / Kind / Origin on the *Edge values the store
+	// already holds and only then hands them to ReindexEdges, so on the
+	// in-memory backend every edge pointer this pass walks is live memory a
+	// concurrent ResolveAll is writing. ResolveMutex is the only thing
+	// ordering those writes, so every whole-graph derived pass takes it —
+	// clone detection, test edges, capability edges — and so must this one.
+	g.ResolveMutex().Lock()
+	defer g.ResolveMutex().Unlock()
 
 	// Replace the three derived edge generations with one backend delete. The
 	// old collect+RemoveEdge loops opened one SQLite mutation per relationship.

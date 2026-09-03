@@ -69,7 +69,7 @@ func (o *Options) nodeFilter(n *graph.Node) bool {
 // When opts.DropSynthetic is false (default), edges pointing at IDs that are
 // not real graph nodes (`unresolved::*`, `external::*`, `annotation::*`) get
 // synthesized stub nodes added to the result so the call topology is preserved.
-func snapshot(g graph.Store, opts Options) ([]*graph.Node, []*graph.Edge, map[string]bool) {
+func snapshot(g graph.Reader, opts Options) ([]*graph.Node, []*graph.Edge, map[string]bool) {
 	allNodes := g.AllNodes()
 	allEdges := g.AllEdges()
 

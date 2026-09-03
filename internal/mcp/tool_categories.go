@@ -81,11 +81,14 @@ var toolCategoryOverrides = map[string]string{
 	"get_active_project": toolCatWorkspace, "set_active_project": toolCatWorkspace,
 	"save_scope": toolCatWorkspace, "delete_scope": toolCatWorkspace, "list_scopes": toolCatWorkspace,
 	"track_repository": toolCatWorkspace, "untrack_repository": toolCatWorkspace,
+	"list_checkouts": toolCatWorkspace, "set_primary_checkout": toolCatWorkspace,
+	"forget_checkout": toolCatWorkspace,
 	// admin / introspection
 	"graph_stats": toolCatAdmin, "index_health": toolCatAdmin, "index_repository": toolCatAdmin,
 	"reindex_repository": toolCatAdmin, "tool_profile": toolCatAdmin, "feedback": toolCatAdmin,
 	"get_diagnostics": toolCatAdmin, "plan_turn": toolCatAdmin, "set_planning_mode": toolCatAdmin,
 	"prefetch_context": toolCatAdmin, "workflow": toolCatAdmin, "check_guards": toolCatAdmin,
+	"reconcile_checkouts": toolCatAdmin, "explain_view": toolCatAdmin,
 	"get_test_targets": toolCatAdmin, LazyToolsSearchName: toolCatAdmin,
 }
 

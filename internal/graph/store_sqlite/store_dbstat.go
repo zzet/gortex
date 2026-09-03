@@ -8,7 +8,7 @@ import "os"
 // runaway WAL high-water mark is observable instead of silently filling
 // the disk.
 func (s *Store) DBStats() (dbBytes, walBytes int64) {
-	if s == nil || s.dbPath == "" {
+	if s.coreless() || s.dbPath == "" {
 		return 0, 0
 	}
 	if fi, err := os.Stat(s.dbPath); err == nil {

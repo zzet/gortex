@@ -11,8 +11,8 @@ var (
 	_ graph.ReleaseEnrichmentReader = (*Store)(nil)
 )
 
-// releaseChunk bounds rows per multi-row INSERT (3 cols → 3 params/row).
-const releaseChunk = 300
+// releaseChunk bounds rows per multi-row INSERT (4 cols → 4 params/row).
+const releaseChunk = 240
 
 const releaseCols = `node_id, repo_prefix, added_in`
 
@@ -36,17 +36,17 @@ func (s *Store) BulkSetReleases(repoPrefix string, rows []graph.ReleaseEnrichmen
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*3)
+		args := make([]any, 0, len(batch)*4)
 		stmt := make([]byte, 0, 96+len(batch)*12)
-		stmt = append(stmt, "INSERT OR REPLACE INTO release_enrichment ("...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO release_enrichment (view_gen, "...)
 		stmt = append(stmt, releaseCols...)
 		stmt = append(stmt, ") VALUES "...)
 		for i, e := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?,?,?)"...)
-			args = append(args, e.NodeID, repoPrefix, e.AddedIn)
+			stmt = append(stmt, "(?,?,?,?)"...)
+			args = append(args, s.viewGen, e.NodeID, repoPrefix, e.AddedIn)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -91,15 +91,16 @@ func (s *Store) DeleteReleases(nodeIDs []string) error {
 			end = len(uniq)
 		}
 		chunk := uniq[start:end]
-		args := make([]any, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.viewGen)
 		stmt := make([]byte, 0, 56+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM release_enrichment WHERE node_id IN ("...)
+		stmt = append(stmt, "DELETE FROM release_enrichment WHERE view_gen = ? AND node_id IN ("...)
 		for i, id := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
 			stmt = append(stmt, '?')
-			args[i] = id
+			args = append(args, id)
 		}
 		stmt = append(stmt, ')')
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
@@ -116,9 +117,9 @@ func (s *Store) ReleaseRows(repoPrefix string) []graph.ReleaseEnrichment {
 		err  error
 	)
 	if repoPrefix == "" {
-		rows, err = s.db.Query(`SELECT ` + releaseCols + ` FROM release_enrichment`)
+		rows, err = s.db.Query(`SELECT `+releaseCols+` FROM release_enrichment WHERE view_gen = ?`, s.viewGen)
 	} else {
-		rows, err = s.db.Query(`SELECT `+releaseCols+` FROM release_enrichment WHERE repo_prefix = ? AND repo_prefix <> ''`, repoPrefix)
+		rows, err = s.db.Query(`SELECT `+releaseCols+` FROM release_enrichment WHERE view_gen = ? AND repo_prefix = ? AND repo_prefix <> ''`, s.viewGen, repoPrefix)
 	}
 	if err != nil {
 		return nil

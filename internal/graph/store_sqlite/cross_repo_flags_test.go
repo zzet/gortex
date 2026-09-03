@@ -11,7 +11,7 @@ import (
 
 func TestCrossRepoFlagUpdateSeeksRequestedLogicalKeys(t *testing.T) {
 	store := openReindexReceiptTestStore(t)
-	query, args := crossRepoFlagStatement([]*graph.Edge{{
+	query, args := crossRepoFlagStatement(store.viewGen, []*graph.Edge{{
 		From: "repoA/a.go::A", To: "repoB/b.go::B", Kind: graph.EdgeCalls,
 		FilePath: "repoA/a.go", Line: 9,
 	}})

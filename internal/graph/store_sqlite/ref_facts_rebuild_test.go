@@ -131,8 +131,8 @@ func TestRefFactRebuildPlanUsesOwnershipAndAdjacencyIndexes(t *testing.T) {
 	query := `EXPLAIN QUERY PLAN ` + refFactInsertPrefix + `    FROM json_each(?) AS requested
     JOIN nodes AS n
       ON n.repo_prefix = ? AND n.file_path = CAST(requested.value AS TEXT)
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id` + refFactInsertSuffix
-	rows, err := store.db.Query(query, `["repoA/a.go"]`, "repoA")
+    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
+	rows, err := store.db.Query(query, `["repoA/a.go"]`, "repoA", store.viewGen, store.viewGen)
 	require.NoError(t, err)
 	defer rows.Close()
 	var details []string

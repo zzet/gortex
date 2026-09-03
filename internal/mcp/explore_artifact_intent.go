@@ -348,12 +348,16 @@ func exploreArtifactPathEligible(intent exploreArtifactIntent, path string) bool
 // gatherExploreArtifactLane reuses search(files)' graph file nodes and
 // search(text)'s trigram backend. The inactive path returns before either I/O.
 func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreArtifactIntent, scope query.QueryOptions) exploreArtifactLane {
-	if !intent.active || (len(intent.paths) == 0 && len(intent.probes) == 0) || s == nil || s.graph == nil || ctx.Err() != nil {
+	if !intent.active || (len(intent.paths) == 0 && len(intent.probes) == 0) || s == nil || ctx.Err() != nil {
+		return exploreArtifactLane{}
+	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return exploreArtifactLane{}
 	}
 	files := make([]*exploreArtifactHit, 0, 64)
 	byPath := make(map[string]*exploreArtifactHit)
-	for node := range s.graph.NodesByKind(graph.KindFile) {
+	for node := range reader.NodesByKind(graph.KindFile) {
 		if node == nil || !s.nodeInSessionScope(ctx, node) || !scope.ScopeAllows(node) {
 			continue
 		}
@@ -417,7 +421,7 @@ func (s *Server) gatherExploreArtifactLane(ctx context.Context, intent exploreAr
 			ids = append(ids, hit.declaration)
 		}
 	}
-	declarations := s.graph.GetNodesByIDs(ids)
+	declarations := reader.GetNodesByIDs(ids)
 	lane := exploreArtifactLane{targets: make([]exploreTarget, 0, len(results))}
 	for _, hit := range results {
 		node := hit.file

@@ -17,16 +17,24 @@ var (
 // It scans only member_of rowids and projects (edge rowid, canonical target)
 // into a temp table; no graph rows cross the SQLite/Go boundary. Scoped
 // warm/partial paths remain driven by edges_by_from below.
+//
+// Every one of the four relations binds the handle's payload view generation,
+// so the edge, its owning method, its current target and its canonical
+// replacement all come from the same corpus. The phantom-target probe rides in
+// the LEFT JOIN's ON clause rather than the WHERE, so a target that exists only
+// in another generation reads as absent instead of dropping the row.
 const goMethodReceiverCandidatesGlobalSQL = `
 SELECT e.id, MIN(c.id)
 FROM edges AS e INDEXED BY edges_by_kind
-JOIN nodes AS m ON m.id = e.from_id
-LEFT JOIN nodes AS t ON t.id = e.to_id
+JOIN nodes AS m ON m.id = e.from_id AND m.view_gen = ?
+LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = ?
 JOIN nodes AS c INDEXED BY nodes_go_receiver_type
   ON c.repo_prefix = m.repo_prefix
  AND c.file_dir = e.member_receiver_dir
  AND c.name = e.member_receiver
+ AND c.view_gen = ?
 WHERE e.kind = 'member_of'
+  AND e.view_gen = ?
   AND e.member_receiver IS NOT NULL
   AND e.member_receiver_dir IS NOT NULL
   AND m.language = 'go'
@@ -49,12 +57,15 @@ FROM nodes AS m INDEXED BY nodes_by_file
 JOIN edges AS e INDEXED BY edges_by_from
   ON e.from_id = m.id
  AND e.kind = 'member_of'
-LEFT JOIN nodes AS t ON t.id = e.to_id
+ AND e.view_gen = ?
+LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = ?
 JOIN nodes AS c INDEXED BY nodes_go_receiver_type
   ON c.repo_prefix = m.repo_prefix
  AND c.file_dir = e.member_receiver_dir
  AND c.name = e.member_receiver
+ AND c.view_gen = ?
 WHERE m.file_path = ?
+  AND m.view_gen = ?
   AND m.language = 'go'
   AND m.kind = 'method'
   AND e.member_receiver IS NOT NULL
@@ -109,11 +120,11 @@ func (s *Store) RebindGoMethodReceivers(filePath string) (changed int, err error
 		goMethodReceiverCandidatesGlobalSQL
 	var result sql.Result
 	if filePath == "" {
-		result, err = conn.ExecContext(ctx, insertSQL)
+		result, err = conn.ExecContext(ctx, insertSQL, s.viewGen, s.viewGen, s.viewGen, s.viewGen)
 	} else {
 		insertSQL = `INSERT INTO temp.go_receiver_rebind_candidates (edge_id, new_to) ` +
 			goMethodReceiverCandidatesForFileSQL
-		result, err = conn.ExecContext(ctx, insertSQL, filePath)
+		result, err = conn.ExecContext(ctx, insertSQL, s.viewGen, s.viewGen, s.viewGen, filePath, s.viewGen)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("sqlite receiver rebind collect candidates: %w", err)
@@ -166,6 +177,7 @@ WHERE id IN (
           AND existing.kind = old.kind
           AND existing.file_path = old.file_path
           AND existing.line = old.line
+          AND existing.view_gen = old.view_gen
     )
 )`); err != nil {
 		return 0, fmt.Errorf("sqlite receiver rebind remove existing-key conflicts: %w", err)

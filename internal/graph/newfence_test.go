@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -23,6 +24,22 @@ import (
 // list this short is the point: a new entry means some production path is about
 // to hold graph data that no restart can recover.
 var stagingCallers []string
+
+// harnessCallers lists the non-test files that construct it for a test and are
+// only reachable from one.
+//
+// A _test.go file is already exempt: its store dies with the test. A shared
+// harness is the same store with the same lifetime, in a plain .go file for the
+// single reason that Go compiles a package's _test.go files only when testing
+// that package, so a matrix more than one package runs cannot live in one. Each
+// entry names a package that exists to be imported from tests and nothing else,
+// which is the claim to check before adding one.
+var harnessCallers = []string{
+	// The overlay composition matrix, run against every implementation of
+	// graph.OverlayLayerReader — the in-memory layer from this package and the
+	// persisted generation layer from internal/graphview.
+	"internal/graph/overlaytest/conformance.go",
+}
 
 // graphImportPath is the package under fence. The scan resolves whatever local
 // name each file binds it to, so an alias or a dot import is caught the same as
@@ -45,13 +62,14 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 		t.Fatalf("locating repository root: %v", err)
 	}
 
-	allowed := make(map[string]struct{}, len(stagingCallers))
-	for _, p := range stagingCallers {
+	declared := append(append([]string{}, stagingCallers...), harnessCallers...)
+	allowed := make(map[string]struct{}, len(declared))
+	for _, p := range declared {
 		allowed[p] = struct{}{}
 	}
 
 	var offenders []string
-	seen := make(map[string]struct{}, len(stagingCallers))
+	seen := make(map[string]struct{}, len(declared))
 
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -59,6 +77,13 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 		}
 		if d.IsDir() {
 			if _, skip := fenceSkippedDirs[d.Name()]; skip {
+				return filepath.SkipDir
+			}
+			nested, gitErr := nestedGitCheckout(root, p)
+			if gitErr != nil {
+				return gitErr
+			}
+			if nested {
 				return filepath.SkipDir
 			}
 			return nil
@@ -103,14 +128,67 @@ func TestNewIsFencedToIndexerStaging(t *testing.T) {
 			"restart, and no other process can read it. Production code that needs a graph should "+
 			"accept a Store from its caller or open a durable one. If you really are adding an "+
 			"indexer staging buffer that is drained into a durable store, add the file to "+
-			"stagingCallers in this test and say why in the commit.",
+			"stagingCallers in this test and say why in the commit. A test harness a _test.go "+
+			"file cannot hold goes in harnessCallers instead.",
 			strings.Join(offenders, "\n  "))
 	}
 
-	for _, p := range stagingCallers {
+	for _, p := range declared {
 		if _, ok := seen[p]; !ok {
-			t.Errorf("%s no longer constructs the in-memory Store — drop it from stagingCallers", p)
+			t.Errorf("%s no longer constructs the in-memory Store — drop it from the allow list", p)
 		}
+	}
+}
+
+// nestedGitCheckout reports whether dir starts a Git repository/worktree below
+// root. Repository-wide fences must not inspect a second checkout merely
+// because an agent placed that checkout under this one's filesystem tree.
+func nestedGitCheckout(root, dir string) (bool, error) {
+	if filepath.Clean(root) == filepath.Clean(dir) {
+		return false, nil
+	}
+	_, err := os.Lstat(filepath.Join(dir, ".git"))
+	switch {
+	case err == nil:
+		return true, nil
+	case os.IsNotExist(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func TestNestedGitCheckoutDetection(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	ordinary := filepath.Join(root, "ordinary")
+	for _, dir := range []string{nested, ordinary} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(nested, ".git"), []byte("gitdir: elsewhere\n"), 0o644); err != nil {
+		t.Fatalf("write nested .git file: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		dir  string
+		want bool
+	}{
+		{name: "root", dir: root, want: false},
+		{name: "ordinary directory", dir: ordinary, want: false},
+		{name: "nested worktree", dir: nested, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := nestedGitCheckout(root, tc.dir)
+			if err != nil {
+				t.Fatalf("nestedGitCheckout: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("nestedGitCheckout(%q) = %v, want %v", tc.dir, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -20,7 +20,7 @@ import (
 // reports a violation when a cross-layer dependency breaks the source
 // layer's allow/deny rules. Symbols in no declared layer, and edges
 // to such symbols, are unconstrained.
-func EvaluateArchitecture(g graph.Store, arch config.ArchitectureConfig, changedSymbolIDs []string) []GuardViolation {
+func EvaluateArchitecture(g graph.Reader, arch config.ArchitectureConfig, changedSymbolIDs []string) []GuardViolation {
 	if g == nil || arch.IsEmpty() {
 		return nil
 	}
@@ -78,7 +78,7 @@ func EvaluateArchitecture(g graph.Store, arch config.ArchitectureConfig, changed
 // evaluateArchRules checks the per-layer / per-pattern dependency-cone
 // rules — fan-out caps and caller-boundary restrictions — for a set
 // of changed symbols.
-func evaluateArchRules(g graph.Store, arch config.ArchitectureConfig, changedSymbolIDs, layerNames []string) []GuardViolation {
+func evaluateArchRules(g graph.Reader, arch config.ArchitectureConfig, changedSymbolIDs, layerNames []string) []GuardViolation {
 	if len(arch.Rules) == 0 {
 		return nil
 	}
@@ -176,7 +176,7 @@ func callerWithinBoundary(callerPath string, rule config.ArchRule, callerLayer s
 
 // distinctCallTargets counts the distinct symbols a node calls or
 // references — the dependency-cone size.
-func distinctCallTargets(g graph.Store, id string) int {
+func distinctCallTargets(g graph.Reader, id string) int {
 	seen := make(map[string]bool)
 	for _, e := range g.GetOutEdges(id) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {

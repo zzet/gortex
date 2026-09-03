@@ -696,6 +696,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			// branch loads file nodes a kind-filtered store would not).
 			continue
 		}
+		stampLo, stampHi, stamped := recordedOwnershipSpan(n)
 		for _, e := range a.outEdges(n.ID) {
 			if e == nil || e.Kind != graph.EdgeCalls || e.Line == 0 {
 				continue
@@ -703,16 +704,65 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			if e.FilePath != "" && e.FilePath != facts.file {
 				continue
 			}
-			if e.Line < n.StartLine || e.Line > n.EndLine {
+			inNode := e.Line >= n.StartLine && e.Line <= n.EndLine
+			inStamp := stamped && e.Line >= stampLo && e.Line <= stampHi
+			if !inNode && !inStamp {
 				// Framework-dispatch synthesis (Rails callbacks, Laravel
 				// middleware) parks an owner's edge on a line outside the
-				// owner's own span — not site evidence at that line.
+				// owner's own span — not site evidence at that line. The
+				// owner's span is its node's lines plus, when the extractor
+				// recorded one elsewhere, the ownership span it stamped on
+				// the node (recordedOwnershipSpan): a stub parked there IS
+				// the authored site. Two intervals, never their hull — the
+				// lines between two fragments belong to other members.
 				continue
 			}
 			idx.stubsByLine[e.Line] = append(idx.stubsByLine[e.Line], stubRef{owner: n, to: e.To})
 		}
 	}
 	return idx
+}
+
+// recordedOwnershipSpan reads the ownership span the extractor stamped on
+// a node (graph.MetaOwnershipStartLine / MetaOwnershipEndLine) when the
+// span it attributed the member's calls by is not contained by the node's
+// own lines: a C# 13 partial property extracted declaring fragment first,
+// or a property declared in both arms of an #if / #else, keeps the first
+// fragment's lines on its node while its calls are owned by the
+// body-bearing fragment's span - the node's lines alone would refuse
+// every stub the extractor deliberately parked there (issue #731). ok is
+// false when nothing is stamped or the pair is not a sane 1-based span,
+// and the caller then tests the node's lines only. The store's flat meta
+// codec hands an int back as an int and its JSON fallback normalizes an
+// integral number to int too, so the wider metaLine cases are a cheap
+// guard against another writer or a future codec, not an observed shape.
+func recordedOwnershipSpan(n *graph.Node) (lo, hi int, ok bool) {
+	lo, okLo := metaLine(n.Meta[graph.MetaOwnershipStartLine])
+	hi, okHi := metaLine(n.Meta[graph.MetaOwnershipEndLine])
+	if !okLo || !okHi || lo <= 0 || hi < lo {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
+func metaLine(v any) (int, bool) {
+	switch x := v.(type) {
+	case int:
+		return x, true
+	case int64:
+		return int(x), true
+	case float64:
+		return int(x), true
+	case interface{ Int64() (int64, error) }:
+		if i, err := x.Int64(); err == nil {
+			return int(i), true
+		}
+	case string:
+		if i, err := strconv.Atoi(x); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // applyAll joins every analyzed file's facts against the graph in
@@ -1125,6 +1175,29 @@ func (idx *fileIndex) enclosingCallable(line int) *graph.Node {
 	return best
 }
 
+// authoredOwner picks, out of a same-line same-name stub tie, the owner
+// the binder named as the call fact's author (LangSpec.MemberDeclName
+// spells it exactly as the extractor names the node). nil when the author
+// is unnamed, names none of the tied owners (a member the extractor mints
+// no node for), or names more than one (same-named overloads sharing a
+// line) — every one of those falls back to line containment.
+func authoredOwner(owners []*graph.Node, author string) *graph.Node {
+	if author == "" {
+		return nil
+	}
+	var match *graph.Node
+	for _, o := range owners {
+		if o.Name != author {
+			continue
+		}
+		if match != nil {
+			return nil
+		}
+		match = o
+	}
+	return match
+}
+
 // --- Call application -------------------------------------------------
 
 func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichResult) {
@@ -1156,11 +1229,17 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	// of every edge identity). The line-keyed containment lookup stays
 	// as the fallback for sites the extractor recorded no stub for
 	// (desugared operator calls carry no authored-name stub). On a
-	// multi-owner tie, containment may still break it — but only WITHIN
-	// the tied set: a callable that merely shares the line never
-	// collects a call it did not author (it has no stub to claim, so it
-	// would mint), and when no tied owner contains the line the site is
-	// refused outright.
+	// multi-owner tie the fact's own author breaks it: the binder names
+	// the member each call sits in, spelled as the extractor names its
+	// node, so a same-line same-name tie resolves each fact onto its own
+	// owner's stub — never onto a neighbour's, whatever target that
+	// neighbour's own site resolves to. Containment breaks a tie only
+	// when the author is unnamed (a spec without MemberDeclName) or names
+	// none — or several — of the tied owners, and then only WITHIN the
+	// tied set: a callable that merely shares the line never collects a
+	// call it did not author (it has no stub to claim, so it would mint),
+	// and when no tied owner contains the line the site is refused
+	// outright.
 	//
 	// Adoption couples this tier's precision to extraction's attribution
 	// accuracy, and that trade is only sound where extraction is
@@ -1188,11 +1267,14 @@ func (a *applier) applyCall(idx *fileIndex, cf callFact, res *semantic.EnrichRes
 	case 1:
 		caller = owners[0]
 	default:
-		if enc := idx.enclosingCallable(cf.line); enc != nil {
-			for _, o := range owners {
-				if o.ID == enc.ID {
-					caller = enc
-					break
+		caller = authoredOwner(owners, cf.owner)
+		if caller == nil {
+			if enc := idx.enclosingCallable(cf.line); enc != nil {
+				for _, o := range owners {
+					if o.ID == enc.ID {
+						caller = enc
+						break
+					}
 				}
 			}
 		}

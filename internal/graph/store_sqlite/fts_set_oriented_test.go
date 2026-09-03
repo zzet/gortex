@@ -29,7 +29,7 @@ func sqliteExplainPlan(t *testing.T, db *sql.DB, query string, args ...any) stri
 func TestFTSOwnershipDeletesSeekIndexedSidecars(t *testing.T) {
 	store := openReindexReceiptTestStore(t)
 
-	symbolPlan := sqliteExplainPlan(t, store.db, deleteSymbolFTSForRepoSQL, "repo")
+	symbolPlan := sqliteExplainPlan(t, store.db, deleteSymbolFTSForRepoSQL, store.viewGen, "repo")
 	require.Contains(t, symbolPlan, "symbol_fts_rowid_by_repo")
 	require.Contains(t, symbolPlan, "symbol_fts VIRTUAL TABLE INDEX 0:=",
 		"FTS deletion must constrain the virtual table by rowid")
@@ -38,13 +38,14 @@ func TestFTSOwnershipDeletesSeekIndexedSidecars(t *testing.T) {
 WHERE rowid IN (
     SELECT fts_rowid FROM content_fts_rowid WHERE ` + contentOwnerByRepoFile + `
 )`
-	contentPlan := sqliteExplainPlan(t, store.db, contentQuery, "repo", "docs/a.md")
+	contentPlan := sqliteExplainPlan(t, store.db, contentQuery, store.viewGen, "repo", "docs/a.md")
 	require.Contains(t, contentPlan, "content_fts_rowid_by_repo_file")
 	require.Contains(t, contentPlan, "content_fts VIRTUAL TABLE INDEX 0:=",
 		"per-file deletion must constrain the virtual table by rowid")
 
 	presencePlan := sqliteExplainPlan(t, store.db,
-		`SELECT 1 FROM content_fts_rowid WHERE repo_prefix = ? LIMIT 1`, "repo")
+		`SELECT 1 FROM content_fts_rowid WHERE view_gen = ? AND repo_prefix = ? LIMIT 1`,
+		store.viewGen, "repo")
 	require.Contains(t, presencePlan, "content_fts_rowid_by_repo_file",
 		"cold/warm presence projection must remain an indexed repo seek")
 }
@@ -161,7 +162,9 @@ WITH wanted(ord, node_id) AS (VALUES (?, ?))
 SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid
 FROM wanted
 LEFT JOIN nodes ON nodes.id = wanted.node_id
-LEFT JOIN symbol_fts_rowid ON symbol_fts_rowid.node_id = wanted.node_id`, 0, items[0].NodeID)
+LEFT JOIN symbol_fts_rowid
+       ON symbol_fts_rowid.view_gen = ? AND symbol_fts_rowid.node_id = wanted.node_id`,
+		0, items[0].NodeID, store.viewGen)
 	require.Contains(t, plan, "SEARCH nodes USING PRIMARY KEY")
 	require.Contains(t, plan, "SEARCH symbol_fts_rowid USING PRIMARY KEY")
 

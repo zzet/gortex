@@ -63,6 +63,25 @@ var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work. Call
 
 `)
 
+// WorktreeBranchRoutingPolicy is the single agent-facing contract for graph
+// ownership, composition, fallback, and lifecycle. Keep this compact: it is
+// reused verbatim by profiles, adapter instructions, initialize guidance,
+// lifecycle hooks, skills, and sub-agents. Those surfaces must concatenate
+// this constant rather than paraphrase it; routing is safety policy, and two
+// almost-equivalent copies eventually teach agents different destructive
+// actions.
+const WorktreeBranchRoutingPolicy = "- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.\n" +
+	"- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.\n" +
+	"- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.\n" +
+	"- Select explicitly when CWD is not the target, for example `view:{kind:\"worktree\",checkout_id:\"…\"}` or `view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.\n" +
+	"- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.\n"
+
+// sectionWorktreeViews teaches agents the ownership boundary that keeps
+// ordinary linked-worktree use cheap. It is shared by every profile so a lean
+// session cannot accidentally turn an automatic overlay into a dedicated graph.
+const sectionWorktreeViews = "## Worktree and branch routing\n\n" + WorktreeBranchRoutingPolicy +
+	"Never restart the daemon, delete its store, or re-track merely to expose a worktree.\n\n"
+
 var sectionFullRuleTable = bt(`| Instead of...                       | Use...                                   |
 |-------------------------------------|------------------------------------------|
 | Explicitly named file to read / review / summarize | First new-task read: §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§ |
@@ -142,6 +161,7 @@ func coreBody() string {
 	return sectionHeader(false) +
 		sectionCompactWorkflow +
 		sectionCompactMemory +
+		sectionWorktreeViews +
 		sectionDiscovery("core", compactSurfaceLine)
 }
 
@@ -155,6 +175,7 @@ func fullBody() string {
 		sectionMCPRequired +
 		sectionReadDiscipline +
 		sectionMemoryFull +
+		sectionWorktreeViews +
 		sectionDiscovery("full", fullSurfaceLine)
 }
 
@@ -195,6 +216,7 @@ func localizationBody() string {
 	return sectionHeader(true) +
 		sectionCompactWorkflow +
 		sectionCompactMemory +
+		sectionWorktreeViews +
 		bt(`**Reference:** call §capabilities§ for an exact operation schema; use §gortex://guide§ only for deeper background.
 `) + switchBullet("localization", true)
 }

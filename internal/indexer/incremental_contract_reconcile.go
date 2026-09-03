@@ -21,6 +21,11 @@ func (mi *MultiIndexer) ReconcileContractEdgesForFrontier(plan DerivedInvalidati
 	if g == nil {
 		return 0
 	}
+	// Same resolver-lane exclusion as the full pass: the incident-edge scan
+	// below dereferences live store edges a concurrent resolve rewrites in
+	// place. See ReconcileContractEdges.
+	g.ResolveMutex().Lock()
+	defer g.ResolveMutex().Unlock()
 	merged := mi.MergedContractRegistry()
 	if merged == nil {
 		return 0

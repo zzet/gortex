@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/intern"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -36,7 +37,11 @@ type daemonState struct {
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
-	mcpServer     *gortexmcp.Server
+	// lifecycle is the shared owner of checkout lifecycle side effects —
+	// track, forget, reload, the periodic sweep. The controller, the MCP
+	// tools and the janitor all drive this one instance.
+	lifecycle *indexer.CheckoutLifecycle
+	mcpServer *gortexmcp.Server
 	// proxyHydrator lazily fills cross-daemon proxy-edge nodes from the
 	// owning remote's /v1/subgraph. nil unless federation.edges is on;
 	// the read path hydrates a proxy target before traversing it.
@@ -76,7 +81,7 @@ type daemonState struct {
 // buildDaemonState builds the daemon's stack through the shared
 // serverstack constructor and returns the long-lived daemonState the
 // warmup loop and controller share.
-func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
+func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (*daemonState, error) {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -87,14 +92,19 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 	// re-exec'd child re-parses the same flags.
 	applyToolPresetFlags(cfg, daemonTools, daemonToolsMode)
 
+	var migrationObserver store_sqlite.MigrationObserver
+	if len(observers) > 0 {
+		migrationObserver = observers[0]
+	}
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
-		Lifecycle:   serverstack.LifecycleDaemon,
-		Backend:     daemonBackend,
-		BackendPath: daemonBackendPath,
-		Config:      cfg,
-		Global:      gc,
-		Logger:      logger,
-		Version:     version,
+		Lifecycle:         serverstack.LifecycleDaemon,
+		Backend:           daemonBackend,
+		BackendPath:       daemonBackendPath,
+		Config:            cfg,
+		Global:            gc,
+		Logger:            logger,
+		Version:           version,
+		MigrationObserver: migrationObserver,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: daemonEmbeddingsChanged,
 			FlagEnabled: daemonEmbeddings,
@@ -120,6 +130,7 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		indexer:             ss.Indexer,
 		multiIndexer:        ss.MultiIndexer,
 		configManager:       ss.ConfigMgr,
+		lifecycle:           ss.CheckoutLifecycle,
 		mcpServer:           ss.MCP,
 		overlays:            ss.Overlays,
 		shared:              ss,
@@ -127,6 +138,123 @@ func buildDaemonState(logger *zap.Logger) (*daemonState, error) {
 		resolverLSPRegistry: ss.ResolverLSPRegistry,
 		lspRouter:           ss.LSPRouter,
 	}, nil
+}
+
+const daemonStartupHeartbeatInterval = 2 * time.Second
+
+type daemonStartupReporter struct {
+	mu       sync.Mutex
+	state    daemon.RuntimeState
+	logger   *zap.Logger
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func newDaemonStartupReporter(logger *zap.Logger) *daemonStartupReporter {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	now := time.Now().UnixMilli()
+	r := &daemonStartupReporter{
+		state: daemon.RuntimeState{
+			StartupPhase:     daemon.StartupOpeningStore,
+			StartupStartedAt: now,
+		},
+		logger: logger,
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	r.publishLocked()
+	go r.heartbeat()
+	return r
+}
+
+func (r *daemonStartupReporter) heartbeat() {
+	defer close(r.done)
+	ticker := time.NewTicker(daemonStartupHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.mu.Lock()
+			if r.state.StartupPhase == daemon.StartupOpeningStore || r.state.StartupPhase == daemon.StartupMigrating {
+				r.publishLocked()
+			}
+			r.mu.Unlock()
+		case <-r.stop:
+			return
+		}
+	}
+}
+
+func (r *daemonStartupReporter) ObserveMigration(progress store_sqlite.MigrationProgress) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	switch progress.Phase {
+	case store_sqlite.MigrationStarted:
+		r.state.StartupPhase = daemon.StartupMigrating
+		r.state.MigrationVersion = progress.Version
+		r.state.MigrationName = progress.Name
+		r.state.StartupError = ""
+		r.logger.Info("daemon: schema migration starting",
+			zap.Int("version", progress.Version), zap.String("name", progress.Name))
+	case store_sqlite.MigrationFinished:
+		r.logger.Info("daemon: schema migration complete",
+			zap.Int("version", progress.Version), zap.String("name", progress.Name),
+			zap.Duration("elapsed", progress.Elapsed))
+		r.state.StartupPhase = daemon.StartupOpeningStore
+		r.state.MigrationVersion = 0
+		r.state.MigrationName = ""
+	case store_sqlite.MigrationFailed:
+		r.logger.Error("daemon: schema migration failed",
+			zap.Int("version", progress.Version), zap.String("name", progress.Name),
+			zap.Duration("elapsed", progress.Elapsed), zap.Error(progress.Error))
+		r.state.StartupPhase = daemon.StartupFailed
+		r.state.StartupError = boundedStartupError(progress.Error)
+	}
+	r.publishLocked()
+}
+
+func (r *daemonStartupReporter) Fail(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.StartupPhase = daemon.StartupFailed
+	r.state.StartupError = boundedStartupError(err)
+	r.publishLocked()
+}
+
+func (r *daemonStartupReporter) Serving(backendPath string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.BackendPath = backendPath
+	r.state.StartupPhase = daemon.StartupServing
+	r.state.MigrationVersion = 0
+	r.state.MigrationName = ""
+	r.state.StartupError = ""
+	r.publishLocked()
+}
+
+func (r *daemonStartupReporter) Stop() {
+	r.stopOnce.Do(func() { close(r.stop) })
+	<-r.done
+}
+
+func (r *daemonStartupReporter) publishLocked() {
+	if err := daemon.WriteRuntimeState(r.state); err != nil && r.logger != nil {
+		r.logger.Warn("daemon: could not record startup state", zap.Error(err))
+	}
+}
+
+func boundedStartupError(err error) string {
+	if err == nil {
+		return ""
+	}
+	// Runtime state is consumed out of band and must not become a side
+	// channel for SQL text, filesystem paths, DSNs, or credentials embedded in
+	// wrapped errors. The daemon log retains the full structured error.
+	return "startup failed; check the daemon log"
 }
 
 // warmupTimings collects the per-phase costs of one warmupDaemonState run so

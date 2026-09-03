@@ -14,8 +14,12 @@ import (
 // no handler, and registered activities/workflows nobody dispatches or
 // starts. Exposed as `analyze kind=temporal_orphans`.
 func (s *Server) handleAnalyzeTemporalOrphans(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// DetectTemporalOrphans takes a graph.Store, so the integrity walk itself
+	// runs on the base store; the row gates below read through the request
+	// reader, which drops entries whose subject the caller's buffers deleted.
 	rep := resolver.DetectTemporalOrphans(s.graph)
 	if s.scopeFiltersActive(ctx) {
+		reader := s.readerFor(ctx)
 		// Narrow each integrity-gap list to entries whose subject node is
 		// visible to the request (workspace ceiling + optional repo
 		// allow-set); the inline response below then recomputes totals
@@ -27,7 +31,7 @@ func (s *Server) handleAnalyzeTemporalOrphans(ctx context.Context, req mcp.CallT
 		keepOrphans := func(in []resolver.TemporalOrphan) []resolver.TemporalOrphan {
 			out := make([]resolver.TemporalOrphan, 0, len(in))
 			for _, o := range in {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(o.From)) {
+				if s.analyzeNodeVisible(ctx, reader.GetNode(o.From)) {
 					out = append(out, o)
 				}
 			}
@@ -36,7 +40,7 @@ func (s *Server) handleAnalyzeTemporalOrphans(ctx context.Context, req mcp.CallT
 		keepIDs := func(in []string) []string {
 			out := make([]string, 0, len(in))
 			for _, id := range in {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, reader.GetNode(id)) {
 					out = append(out, id)
 				}
 			}

@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // TestCursorMDCFrontmatter proves the MDC wrapper emits the two keys
@@ -57,7 +59,10 @@ func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 			t.Errorf("InstructionsBody re-carries relocated content %q — single-home violation", banned)
 		}
 	}
-	if len(InstructionsBody) > 2_500 {
+	if got := strings.Count(InstructionsBody, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+		t.Fatalf("InstructionsBody embeds canonical worktree policy %d times, want once", got)
+	}
+	if len(InstructionsBody) > 3_584 {
 		t.Fatalf("InstructionsBody grew to %d bytes; keep ambient agent guidance lean", len(InstructionsBody))
 	}
 }
@@ -70,6 +75,9 @@ func TestBashInstructionsBodyUsesOnlyExplicitCLIMirror(t *testing.T) {
 	}
 	if strings.Contains(BashInstructionsBody, "Native Gortex MCP is mandatory") {
 		t.Error("Bash-only instructions must not claim a native MCP transport")
+	}
+	if got := strings.Count(BashInstructionsBody, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+		t.Fatalf("BashInstructionsBody embeds canonical worktree policy %d times, want once", got)
 	}
 }
 

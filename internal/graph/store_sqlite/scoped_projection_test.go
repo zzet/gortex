@@ -205,19 +205,19 @@ func TestScopedProjectionQueriesStreamWithoutTempBTree(t *testing.T) {
 		}
 	}
 
-	edgeQuery, edgeArgs, ok := scopedEdgeProjectionQuery([]string{"a"}, nil, string(graph.EdgeCalls))
+	edgeQuery, edgeArgs, ok := scopedEdgeProjectionQuery([]string{"a"}, nil, string(graph.EdgeCalls), baseViewGeneration)
 	if !ok {
 		t.Fatal("edge query not built")
 	}
 	assertNoTempBTree("edges", edgeQuery, append(edgeArgs, int64(0), int64(1)<<60, scopedProjectionPage))
 
-	nodeQuery, nodeArgs, ok := scopedNodeProjectionQuery([]string{"a"}, nil, string(graph.KindFunction), lookupNodeCols)
+	nodeQuery, nodeArgs, ok := scopedNodeProjectionQuery([]string{"a"}, nil, string(graph.KindFunction), lookupNodeCols, baseViewGeneration)
 	if !ok {
 		t.Fatal("node query not built")
 	}
 	assertNoTempBTree("nodes", nodeQuery, append(nodeArgs, "", scopedProjectionPage))
 
-	lightQuery, lightArgs, ok := scopedNodeProjectionQuery([]string{"a"}, nil, "", lookupNodeSummaryCols)
+	lightQuery, lightArgs, ok := scopedNodeProjectionQuery([]string{"a"}, nil, "", lookupNodeSummaryCols, baseViewGeneration)
 	if !ok {
 		t.Fatal("light query not built")
 	}
@@ -280,7 +280,7 @@ func TestScopedEdgeProjectionPlansStayInsideRequestedFiles(t *testing.T) {
 			required []string
 		} {
 			query, args, ok := scopedEdgeProjectionQuery(
-				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls),
+				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls), baseViewGeneration,
 			)
 			if !ok {
 				t.Fatal("canonical file query was not built")
@@ -299,7 +299,7 @@ func TestScopedEdgeProjectionPlansStayInsideRequestedFiles(t *testing.T) {
 			required []string
 		} {
 			query, args, ok := scopedEdgeSourceProjectionQuery(
-				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls),
+				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls), baseViewGeneration,
 			)
 			if !ok {
 				t.Fatal("source fallback query was not built")

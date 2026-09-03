@@ -1,5 +1,5 @@
 # golangci-lint configuration (schema v2).
-# CI pins golangci-lint to v2.11.4 (.github/workflows/ci.yml).
+# CI pins golangci-lint to v2.13.1 (.github/workflows/ci.yml).
 version: "2"
 
 linters:
@@ -36,6 +36,18 @@ linters:
   exclusions:
     # `lax` skips obviously generated files; we keep it explicit.
     generated: lax
+    rules:
+      # internal/thirdparty/fswatcher declares one watcher struct that is
+      # shared across platform-specific files. The handle and streamMu fields
+      # and the scanDirectory method are used only by the Darwin, Windows and
+      # BSD builds; the Linux `unused` pass compiles just the Linux files and
+      # cannot see those uses, so it reports them as dead. A struct cannot be
+      # split across files, so this is a single-GOOS blind spot, not real dead
+      # code. Scope the exemption to the `unused` linter and this path so every
+      # other linter still covers the package.
+      - path: internal/thirdparty/fswatcher/
+        linters:
+          - unused
     presets:
       # Drops the well-known stdlib error-handling false positives that
       # errcheck flags: the fmt print family, (*T).Close / .Flush,

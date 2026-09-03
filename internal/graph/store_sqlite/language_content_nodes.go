@@ -11,8 +11,8 @@ func (s *Store) GetNodesByLanguage(language string) []*graph.Node {
 		return nil
 	}
 	return s.queryNodesSQL(
-		`SELECT `+lookupNodeCols+` FROM nodes WHERE language = ? ORDER BY id`,
-		language,
+		`SELECT `+lookupNodeCols+` FROM nodes WHERE language = ? AND view_gen = ? ORDER BY id`,
+		language, s.viewGen,
 	)
 }
 
@@ -20,7 +20,7 @@ func (s *Store) GetNodesByLanguage(language string) []*graph.Node {
 // promoted data_class column avoids decoding non-content Meta blobs.
 func (s *Store) GetRepoContentNodes(repoPrefix string) []*graph.Node {
 	return s.queryNodesSQL(
-		`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND kind = ? AND data_class = 'content' ORDER BY id`,
-		repoPrefix, graph.KindDoc,
+		`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND kind = ? AND data_class = 'content' AND view_gen = ? ORDER BY id`,
+		repoPrefix, graph.KindDoc, s.viewGen,
 	)
 }

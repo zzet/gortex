@@ -45,6 +45,7 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/lspuri"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/semantic/lsp"
@@ -446,7 +447,12 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 		if layerErr != nil {
 			return nil, fmt.Errorf("step %d: overlay parse: %w", stepIdx, layerErr)
 		}
+		// The shadow view composes the step's layer onto the base graph, not
+		// onto whatever view answers this request, so every verdict below —
+		// the graph diff, the broken callers, the impact rollup — describes
+		// the base corpus. Under a view the response says so.
 		view := graph.NewOverlaidView(s.graph, layer)
+		annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 		s.fillStepImpact(&step, layer, view, step.touchedFiles)
 
 		for _, id := range step.symbolsAdded {

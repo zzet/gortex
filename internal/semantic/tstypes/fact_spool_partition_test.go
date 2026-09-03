@@ -14,7 +14,7 @@ func sampleFacts() *fileFacts {
 		imports: []Import{{Local: "Sys"}},
 		supers:  []superFact{{typeName: "A", superName: "B", kind: graph.EdgeExtends, line: 1}},
 		metas:   []metaFact{{key: "return_type", value: "C", owner: "A", name: "M", line: 2}},
-		calls: []callFact{{line: 3, method: "M", recvType: "C",
+		calls: []callFact{{line: 3, method: "M", recvType: "C", owner: "Q",
 			recvChain: &callFact{line: 3, method: "N"}, argCount: 2, argKnown: true}},
 		// aliases deliberately empty — must be absent from the payload map
 	}
@@ -51,6 +51,9 @@ func TestMarshalClassPayloadsRoundTrip(t *testing.T) {
 	}
 	if len(dst.calls) != 1 || dst.calls[0].recvChain == nil || dst.calls[0].recvChain.method != "N" {
 		t.Fatalf("calls (incl. chain) lost: %+v", dst.calls)
+	}
+	if dst.calls[0].owner != "Q" {
+		t.Fatalf("authored owner lost across the spool: %+v", dst.calls[0])
 	}
 	if len(dst.aliases) != 0 {
 		t.Fatalf("aliases should stay empty: %+v", dst.aliases)

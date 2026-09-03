@@ -22,7 +22,8 @@ func openImportProjectionTestStore(t *testing.T) *Store {
 func TestImportAdjacencyProjectionUsesCoveringFileIndexes(t *testing.T) {
 	store := openImportProjectionTestStore(t)
 	rows, err := store.db.Query("EXPLAIN QUERY PLAN "+importAdjacencyProjectionSQL,
-		`["pkg/caller.go"]`, string(graph.EdgeImports), string(graph.EdgeImports))
+		`["pkg/caller.go"]`, string(graph.EdgeImports), baseViewGeneration,
+		string(graph.EdgeImports), baseViewGeneration)
 	if err != nil {
 		t.Fatal(err)
 	}

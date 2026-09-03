@@ -32,13 +32,6 @@ var (
 	maxBoundedIncomingSourceLimit = int(^uint(0) >> 1)
 )
 
-func (l *OverlayLayer) ownsNodeIdentity(id string) bool {
-	if l == nil || id == "" {
-		return false
-	}
-	return l.nodeByID[id] != nil || l.removedByID[id]
-}
-
 // GetNodesByIDsContext is the cancellable exact-refetch sibling used by
 // bounded request paths. It preserves overlay ownership for both ordinary and
 // detached legacy identities, never mutates the caller's ID slice, and delegates
@@ -69,8 +62,8 @@ func (v *OverlaidView) GetNodesByIDsContext(ctx context.Context, ids []string) (
 			continue
 		}
 		seen[id] = struct{}{}
-		if v.layer != nil && (v.nodeBelongsToOverlay(id) || v.layer.ownsNodeIdentity(id)) {
-			if node := v.layer.nodeByID[id]; node != nil {
+		if v.layer != nil && (v.nodeBelongsToOverlay(id) || v.layer.OwnsNodeIdentity(id)) {
+			if node := v.layer.NodeByID(id); node != nil {
 				out[id] = node
 			}
 			continue
@@ -248,7 +241,7 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 			return nil
 		}
 		shadowIDs[id] = struct{}{}
-		if filePath := IDFile(id); filePath != "" && v.layer.HasFile(filePath) {
+		if v.layer.CoversNodeID(id) {
 			standardShadows++
 			if standardShadows > overlayExactNameInspectionLimit {
 				return &BoundedLocalizationLimitError{
@@ -268,7 +261,7 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 		return nil
 	}
 	inspectedShadows := 0
-	for id := range v.layer.removedByID {
+	for id := range v.layer.RemovedIDs() {
 		if inspectedShadows&127 == 0 {
 			if err := ctx.Err(); err != nil {
 				return BoundedIncomingSourceProjection{}, err
@@ -279,14 +272,17 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 			return BoundedIncomingSourceProjection{}, err
 		}
 	}
-	for id := range v.layer.nodeByID {
+	for node := range v.layer.Nodes() {
 		if inspectedShadows&127 == 0 {
 			if err := ctx.Err(); err != nil {
 				return BoundedIncomingSourceProjection{}, err
 			}
 		}
 		inspectedShadows++
-		if err := addShadow(id); err != nil {
+		if node == nil {
+			continue
+		}
+		if err := addShadow(node.ID); err != nil {
 			return BoundedIncomingSourceProjection{}, err
 		}
 	}
@@ -317,13 +313,13 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 		if err := ctx.Err(); err != nil {
 			return BoundedIncomingSourceProjection{}, err
 		}
-		targetRemoved := v.layer.removedByID[targetID]
-		if (targetRemoved || v.layer.HasFile(IDFile(targetID))) && v.layer.nodeByID[targetID] == nil {
+		targetRemoved := v.layer.IsRemovedID(targetID)
+		if (targetRemoved || v.layer.CoversNodeID(targetID)) && v.layer.NodeByID(targetID) == nil {
 			continue
 		}
 		seen := make(map[string]struct{}, limit+1)
 		for _, sourceID := range baseProjection.Sources[targetID] {
-			if _, shadowed := shadowIDs[sourceID]; shadowed || v.layer.HasFile(IDFile(sourceID)) {
+			if _, shadowed := shadowIDs[sourceID]; shadowed || v.layer.CoversNodeID(sourceID) {
 				continue
 			}
 			seen[sourceID] = struct{}{}
@@ -336,7 +332,7 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 			projection.Truncated[targetID] = true
 			continue
 		}
-		for index, edge := range v.layer.inEdges[targetID] {
+		for index, edge := range v.layer.InEdges(targetID) {
 			if index&127 == 0 {
 				if err := ctx.Err(); err != nil {
 					return BoundedIncomingSourceProjection{}, err

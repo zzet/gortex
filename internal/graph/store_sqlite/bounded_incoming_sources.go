@@ -13,7 +13,7 @@ var _ graph.BoundedIncomingSourceReader = (*Store)(nil)
 
 const findIncomingSourcesBoundedSQL = `SELECT DISTINCT from_id
 	FROM edges
-	WHERE to_id = ? AND kind = ? AND from_id <> ''
+	WHERE to_id = ? AND kind = ? AND from_id <> '' AND view_gen = ?
 	LIMIT ?`
 
 // FindIncomingSourcesBounded projects distinct incoming source identities for
@@ -64,7 +64,7 @@ func (s *Store) FindIncomingSourcesBounded(
 		if err := ctx.Err(); err != nil {
 			return graph.BoundedIncomingSourceProjection{}, err
 		}
-		rows, queryErr := tx.QueryContext(ctx, findIncomingSourcesBoundedSQL, targetID, kind, limit+1)
+		rows, queryErr := tx.QueryContext(ctx, findIncomingSourcesBoundedSQL, targetID, kind, s.viewGen, limit+1)
 		if queryErr != nil {
 			return graph.BoundedIncomingSourceProjection{}, queryErr
 		}

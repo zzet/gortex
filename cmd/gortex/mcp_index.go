@@ -66,7 +66,8 @@ func resolveEmbeddedIndex(flagIndex, cwd string, global *config.GlobalConfig) em
 	cacheNotebook := filepath.Join(platform.DataDir(), "notebook-cache")
 
 	if flagIndex != "" {
-		return embeddedIndexPlan{Index: flagIndex, Notebook: flagIndex}
+		root := pathkey.CanonicalExistingRoot(flagIndex)
+		return embeddedIndexPlan{Index: root, Notebook: root}
 	}
 	if cwd == "" {
 		return embeddedIndexPlan{

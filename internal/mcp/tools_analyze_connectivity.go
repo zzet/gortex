@@ -46,7 +46,7 @@ func (s *Server) handleAnalyzeConnectivityHealth(ctx context.Context, req mcp.Ca
 		fileLimit = int(v)
 	}
 
-	report := analysis.GraphConnectivity(s.graph, s.scopedNodesLight(ctx), fileLimit)
+	report := analysis.GraphConnectivity(s.readerFor(ctx), s.scopedNodesLight(ctx), fileLimit)
 
 	if s.isGCX(ctx, req) {
 		return s.gcxResponseWithBudget(req)(encodeAnalyze("connectivity_health", report))

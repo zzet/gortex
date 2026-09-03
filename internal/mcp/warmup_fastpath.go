@@ -374,14 +374,37 @@ func singleTextContent(res *mcp.CallToolResult) (string, bool) {
 }
 
 // rebuildTextResult returns a copy of res with its text content
-// replaced by body, preserving the IsError flag. StructuredContent is
-// dropped because it would otherwise disagree with the decorated text
-// block — the text block is the canonical payload every Gortex tool
-// ships.
+// replaced by body, preserving the IsError flag and the _meta
+// envelope. StructuredContent is dropped because it would otherwise
+// disagree with the decorated text block — the text block is the
+// canonical payload every Gortex tool ships. _meta is not payload:
+// the scope disclosure and the view rider both ride there, and a
+// decorator that rewrites the text block must not take them with it.
 func rebuildTextResult(res *mcp.CallToolResult, body string) *mcp.CallToolResult {
 	out := mcp.NewToolResultText(body)
 	if res != nil {
 		out.IsError = res.IsError
+		out.Meta = res.Meta
 	}
 	return out
+}
+
+// mergeResultMeta writes fields into the result's _meta envelope — the
+// format-independent channel a payload's wire encoding cannot reach.
+// Creates the block when the result carries none.
+func mergeResultMeta(res *mcp.CallToolResult, fields map[string]any) *mcp.CallToolResult {
+	if res == nil || len(fields) == 0 {
+		return res
+	}
+	if res.Meta == nil {
+		res.Meta = mcp.NewMetaFromMap(fields)
+		return res
+	}
+	if res.Meta.AdditionalFields == nil {
+		res.Meta.AdditionalFields = map[string]any{}
+	}
+	for name, value := range fields {
+		res.Meta.AdditionalFields[name] = value
+	}
+	return res
 }

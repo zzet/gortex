@@ -134,7 +134,7 @@ func (s *Server) handleAnalyzeBottlenecks(ctx context.Context, req mcp.CallToolR
 	// Call adjacency restricted to resolved function/method targets in
 	// the candidate set, so interprocedural walks stay bounded.
 	callees := map[string]map[string]struct{}{}
-	for e := range s.graph.EdgesByKind(graph.EdgeCalls) {
+	for e := range s.readerFor(ctx).EdgesByKind(graph.EdgeCalls) {
 		if e == nil {
 			continue
 		}

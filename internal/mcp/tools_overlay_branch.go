@@ -262,7 +262,7 @@ func (s *Server) handleOverlayMerge(ctx context.Context, req mcp.CallToolRequest
 	if toDisk {
 		// Capture the resolver closure once; each per-file write
 		// re-resolves, re-checks drift, and atomically writes.
-		writer = s.diskWriteForMerge()
+		writer = s.diskWriteForMerge(ctx)
 	}
 
 	res, mergeErr := s.overlays.MergeBranches(id, opts, writer)
@@ -320,9 +320,9 @@ func (s *Server) handleOverlayMerge(ctx context.Context, req mcp.CallToolRequest
 // (path resolution, base_sha drift, temp+rename) — without that
 // reuse, drift detection would be duplicated and could silently
 // diverge across surfaces.
-func (s *Server) diskWriteForMerge() daemon.DiskWriteFn {
+func (s *Server) diskWriteForMerge(ctx context.Context) daemon.DiskWriteFn {
 	return func(f daemon.OverlayFile) error {
-		absPath, _, resolveErr := s.resolveFilePath(f.Path)
+		absPath, _, resolveErr := s.resolveFilePath(ctx, f.Path)
 		if resolveErr != nil {
 			return fmt.Errorf("merge to_disk: %s: %w", f.Path, resolveErr)
 		}

@@ -20,12 +20,16 @@ import (
 // a symbol from the resolved graph — the signal that a plain find_usages on
 // this symbol is under-selling the picture because dispatch fans out to
 // implementations the reference list doesn't name.
-func (s *Server) dispatchImplementorCount(id string) int {
-	if s == nil || s.graph == nil || id == "" {
+func (s *Server) dispatchImplementorCount(ctx context.Context, id string) int {
+	if s == nil || id == "" {
+		return 0
+	}
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return 0
 	}
 	n := 0
-	for _, e := range s.graph.GetInEdges(id) {
+	for _, e := range reader.GetInEdges(id) {
 		if e == nil {
 			continue
 		}
@@ -50,7 +54,7 @@ func (s *Server) attachRelatedToolsCue(ctx context.Context, sg *query.SubGraph, 
 		return
 	}
 	const minImplementors = 2
-	n := s.dispatchImplementorCount(id)
+	n := s.dispatchImplementorCount(ctx, id)
 	if n < minImplementors {
 		return
 	}

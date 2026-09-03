@@ -9,7 +9,7 @@ import (
 var _ graph.WorkspaceSlugBackfiller = (*Store)(nil)
 var _ graph.WorkspaceSlugImpactBackfiller = (*Store)(nil)
 
-const workspaceSlugChunkSize = 300 // 900 host parameters, below SQLite's conservative 999 limit.
+const workspaceSlugChunkSize = 300 // 900 slug values plus two literals, below SQLite's conservative 999 limit.
 
 // BackfillWorkspaceSlugs fills legacy empty boundary columns with set-oriented
 // VALUES updates. It neither reads node rows nor rewrites Meta blobs.
@@ -48,7 +48,7 @@ func (s *Store) BackfillWorkspaceSlugsWithImpact(slugs []graph.WorkspaceSlug) gr
 	for start := 0; start < len(updates); start += workspaceSlugChunkSize {
 		end := minInt(start+workspaceSlugChunkSize, len(updates))
 		chunk := updates[start:end]
-		impactQuery, impactArgs := workspaceSlugResolutionImpact(chunk)
+		impactQuery, impactArgs := workspaceSlugResolutionImpact(s.viewGen, chunk)
 		var resolutionAffected int
 		if scanErr := tx.QueryRow(impactQuery, impactArgs...).Scan(&resolutionAffected); scanErr != nil {
 			_ = tx.Rollback()
@@ -56,7 +56,7 @@ func (s *Store) BackfillWorkspaceSlugsWithImpact(slugs []graph.WorkspaceSlug) gr
 			return graph.WorkspaceSlugBackfillResult{}
 		}
 		backfill.ResolutionAffected += resolutionAffected
-		query, args := workspaceSlugUpdate(chunk)
+		query, args := workspaceSlugUpdate(s.viewGen, chunk)
 		result, execErr := tx.Exec(query, args...)
 		if execErr != nil {
 			_ = tx.Rollback()
@@ -106,13 +106,17 @@ func workspaceSlugValues(slugs []graph.WorkspaceSlug) (string, []any) {
 	return values.String(), args
 }
 
-func workspaceSlugResolutionImpact(slugs []graph.WorkspaceSlug) (string, []any) {
+// The count and the update below share one generation predicate. The updates
+// relation is a constant VALUES table with no generation of its own, so pairing
+// means holding the joined node row to the writing handle's generation: a
+// backfill through generation 1 must neither count nor fill generation 0's rows.
+func workspaceSlugResolutionImpact(viewGen int64, slugs []graph.WorkspaceSlug) (string, []any) {
 	values, args := workspaceSlugValues(slugs)
 	// Builtin stubs are target-only synthetic sentinels. They are physically
 	// stamped like every repository node, but the cross-repository resolver
 	// never selects KindBuiltin as a function, method, file, or import target;
 	// filling their boundary columns therefore cannot change resolution.
-	args = append(args, graph.KindBuiltin)
+	args = append(args, graph.KindBuiltin, viewGen)
 	query := `WITH updates(repo_prefix, workspace_id, project_id) AS (VALUES ` + values + `)
 	SELECT COUNT(*)
 	FROM nodes AS n
@@ -120,12 +124,14 @@ func workspaceSlugResolutionImpact(slugs []graph.WorkspaceSlug) (string, []any) 
 	WHERE n.workspace_id = ''
 		AND u.workspace_id <> ''
 		AND u.workspace_id <> n.repo_prefix
-		AND n.kind <> ?`
+		AND n.kind <> ?
+		AND n.view_gen = ?`
 	return query, args
 }
 
-func workspaceSlugUpdate(slugs []graph.WorkspaceSlug) (string, []any) {
+func workspaceSlugUpdate(viewGen int64, slugs []graph.WorkspaceSlug) (string, []any) {
 	values, args := workspaceSlugValues(slugs)
+	args = append(args, viewGen)
 	query := `WITH updates(repo_prefix, workspace_id, project_id) AS (VALUES ` + values + `)
 	UPDATE nodes AS n
 	SET workspace_id = CASE
@@ -138,6 +144,7 @@ func workspaceSlugUpdate(slugs []graph.WorkspaceSlug) (string, []any) {
 		END
 	FROM updates AS u
 	WHERE n.repo_prefix = u.repo_prefix
+		AND n.view_gen = ?
 		AND ((n.workspace_id = '' AND u.workspace_id <> '')
 			OR (n.project_id = '' AND u.project_id <> ''))`
 	return query, args

@@ -4,7 +4,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
 
@@ -79,46 +78,63 @@ func csharpFileAliasNames(root *sitter.Node, src []byte) map[string]bool {
 	return out
 }
 
-// csharpUnstampableArgNames collects every identifier that must NOT be
-// read as a closed concrete type argument at node's position:
+// csharpOpenNames is the set of identifiers that must NOT be read as a
+// closed concrete type argument at one position, as two halves that are
+// never merged:
 //
-//   - type parameters of every enclosing type declaration, the node's own
-//     included — a nested type legitimately closes over its outer types'
-//     parameters, and every one of them is open (per-declaration ancestor
-//     walk, cheap);
-//   - the file's using-alias names, precollected by csharpFileAliasNames.
+//   - params: type parameters of every enclosing type declaration, the
+//     node's own included — a nested type legitimately closes over its
+//     outer types' parameters, and every one of them is open. Built per
+//     position from a cheap ancestor walk; nil when no enclosing type is
+//     generic.
+//   - aliases: the file's using-alias names, precollected ONCE by
+//     csharpFileAliasNames and already canonical. Shared by every
+//     position and never written through this view.
 //
-// Both categories mean the same thing to the caller: this spelling does
-// not denote a type the dispatch gate may compare by name.
-func csharpUnstampableArgNames(node *sitter.Node, src []byte, fileAliases map[string]bool) map[string]bool {
-	var out map[string]bool
-	add := func(name string) {
-		// The set must live in the same normalization domain the use side
-		// compares in: a declaration spelled `class Outer<@T>` (or with a
-		// Unicode escape) declares the same open parameter T that every
-		// use-side spelling normalizes to. A malformed escape keeps the
-		// raw spelling — the use side refuses those outright.
-		if c := csharpCanonicalIdentifier(name); c != "" {
-			name = c
-		}
-		if name == "" {
-			return
-		}
-		if out == nil {
-			out = map[string]bool{}
-		}
-		out[name] = true
-	}
+// Both halves mean the same thing to the caller: this spelling does not
+// denote a type the dispatch gate may compare by name. Keeping them
+// apart is what makes the view cheap: the earlier per-position copy of
+// the alias half into a fresh map — re-canonicalizing every name, once
+// per field, property, base list and positional list, whether or not the
+// declared type was generic — cost 460 MB of allocation on a file with
+// 2,000 aliases and 2,000 plain `int` fields (issue 727).
+type csharpOpenNames struct {
+	params  map[string]bool
+	aliases map[string]bool
+}
+
+// has reports whether name (already canonical) is open at this position.
+func (o csharpOpenNames) has(name string) bool {
+	return o.params[name] || o.aliases[name]
+}
+
+// csharpUnstampableArgNames builds the csharpOpenNames view for node's
+// position: the enclosing chain's type parameters plus the file's alias
+// set. fileAliases is kept by reference, not copied.
+func csharpUnstampableArgNames(node *sitter.Node, src []byte, fileAliases map[string]bool) csharpOpenNames {
+	out := csharpOpenNames{aliases: fileAliases}
 	for n := node; n != nil; n = n.Parent() {
 		switch n.Type() {
 		case "class_declaration", "struct_declaration", "record_declaration", "interface_declaration":
 			for name := range csharpMethodTypeParamNames(n, src) {
-				add(name)
+				// The set must live in the same normalization domain the
+				// use side compares in: a declaration spelled
+				// `class Outer<@T>` (or with a Unicode escape) declares the
+				// same open parameter T that every use-side spelling
+				// normalizes to. A malformed escape keeps the raw spelling
+				// — the use side refuses those outright.
+				if c := csharpCanonicalIdentifier(name); c != "" {
+					name = c
+				}
+				if name == "" {
+					continue
+				}
+				if out.params == nil {
+					out.params = map[string]bool{}
+				}
+				out.params[name] = true
 			}
 		}
-	}
-	for name := range fileAliases {
-		add(name)
 	}
 	return out
 }
@@ -250,11 +266,46 @@ func csharpUsingAliasName(n *sitter.Node, src []byte) string {
 	return ""
 }
 
+// csharpBCLKeywordFolds maps each BCL alias spelling (plus `dynamic`,
+// which erases to object) onto the C# keyword form of the same
+// underlying type. csharpCanonicalTypeArg is its only consumer today.
+// When the deferred dispatch gate returns, its resolver-side alias
+// refusal must fold with the SAME table — a fold present on one side
+// only makes the refusal miss the folded spelling (`global using
+// @dynamic = ...` stamped object while the refusal only knew
+// Object->object, and a whole fan-out was suppressed). Exporting it
+// here will not do then: package resolver cannot import languages (a
+// languages test file already imports resolver, so the languages test
+// binary would cycle). Move the table to a package below both at that
+// point, which is where it lived while the gate was in the tree.
+var csharpBCLKeywordFolds = map[string]string{
+	"String":  "string",
+	"Boolean": "bool",
+	"Byte":    "byte",
+	"SByte":   "sbyte",
+	"Char":    "char",
+	"Decimal": "decimal",
+	"Double":  "double",
+	"Single":  "float",
+	"Int16":   "short",
+	"UInt16":  "ushort",
+	"Int32":   "int",
+	"UInt32":  "uint",
+	"Int64":   "long",
+	"UInt64":  "ulong",
+	"Object":  "object",
+	// dynamic erases to object - the two spellings construct over the
+	// same underlying type, and folding can only CREATE matches.
+	"dynamic": "object",
+	"IntPtr":  "nint",
+	"UIntPtr": "nuint",
+}
+
 // csharpCanonicalTypeArg folds the BCL alias spellings of the C# built-in
 // types onto their keyword form, so `System.Int32`, `Int32` and `int` —
 // the SAME constructed type — compare equal on both sides of the gate.
 func csharpCanonicalTypeArg(t string) string {
-	if folded, ok := parser.CSharpBCLKeywordFolds[t]; ok {
+	if folded, ok := csharpBCLKeywordFolds[t]; ok {
 		return folded
 	}
 	return t
@@ -262,9 +313,9 @@ func csharpCanonicalTypeArg(t string) string {
 
 // csharpBaseTypeArgs returns the comma-joined, normalized type-argument
 // list of a generic base-list entry, or "" when the entry is not generic
-// or any argument is open or non-simple. openParams is the full
-// enclosing-chain parameter set (csharpEnclosingTypeParams).
-func csharpBaseTypeArgs(entry *sitter.Node, src []byte, openParams map[string]bool) string {
+// or any argument is open or non-simple. openParams is the position's
+// open-name view (csharpUnstampableArgNames).
+func csharpBaseTypeArgs(entry *sitter.Node, src []byte, openParams csharpOpenNames) string {
 	argList := csharpEntryTypeArgumentList(entry)
 	if argList == nil {
 		return ""
@@ -290,7 +341,7 @@ func csharpBaseTypeArgs(entry *sitter.Node, src []byte, openParams map[string]bo
 // csharpNormalizeSimpleArg reduces one type-argument spelling to its
 // comparable form, or "" when it is non-simple or names an open
 // parameter.
-func csharpNormalizeSimpleArg(text string, openParams map[string]bool) string {
+func csharpNormalizeSimpleArg(text string, openParams csharpOpenNames) string {
 	text = strings.TrimSpace(text)
 	if text == "" || strings.ContainsAny(text, "<[?(, ") {
 		// Nested generic, array, nullable, tuple, or anything else
@@ -320,7 +371,7 @@ func csharpNormalizeSimpleArg(text string, openParams map[string]bool) string {
 	// A malformed escape (or one decoding to a non-identifier character)
 	// refuses: the compiler would too, and refusal never filters.
 	text = csharpCanonicalIdentifier(text)
-	if text == "" || strings.ContainsAny(text, "<[?(,. :@/\\*") || openParams[text] {
+	if text == "" || strings.ContainsAny(text, "<[?(,. :@/\\*") || openParams.has(text) {
 		return ""
 	}
 	// Fold AFTER the open-name check: a type parameter or alias named
@@ -340,7 +391,7 @@ func csharpNormalizeSimpleArg(text string, openParams map[string]bool) string {
 // dispatch gate then filtered the valid implementor. "" when the type is
 // not a plain generic name (wrapped forms — nullable, array — refuse the
 // same way the text path did), or any argument is open or non-simple.
-func csharpTypeArgsFromTypeNode(typeNode *sitter.Node, src []byte, openParams map[string]bool) string {
+func csharpTypeArgsFromTypeNode(typeNode *sitter.Node, src []byte, openParams csharpOpenNames) string {
 	if typeNode == nil {
 		return ""
 	}

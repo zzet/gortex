@@ -137,5 +137,5 @@ func (s *Server) guardGeneratedOutputPath(ctx context.Context, path string) erro
 	if err != nil {
 		return fmt.Errorf("resolve output path %q: %w", path, err)
 	}
-	return s.guardSymlinkWithinRepo(abs)
+	return s.guardSymlinkWithinRepo(ctx, abs)
 }

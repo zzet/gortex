@@ -3,50 +3,17 @@ package indexer
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Skip reasons for the gates that don't live in content_admission.go.
-const (
-	skipReasonNoLanguage  = "no_language"   // no registered extractor claims it
-	skipReasonExcluded    = "excluded"      // an exclude / ignore RULE drops it
-	skipReasonMaxFileSize = "max_file_size" // over index.max_file_size
-)
-
-// admissionGates carries the two gates that hold per-run state. The zero value
-// is inert; both gates are nil-safe.
+// admissionGates carries the two corpus-admission gates that hold per-run
+// state. The zero value is inert; both gates are nil-safe.
 type admissionGates struct {
 	untracked *untrackedAssetGate
 	content   *contentAdmissionGate
-}
-
-// admitFile is the one admission decision, shared by the cold walk
-// (indexCtxRaw), the dry-run manifest (DryRunIntake) and the single-path probe
-// (PathIndexability) so the three cannot drift. reason is "" when admitted.
-//
-// Exclude rules run before language detection on purpose: effectiveLanguage
-// falls through to readSniffPrefix, which os.Opens the file. Language-first
-// read files inside vendored trees, and read them before shouldExclude's
-// symlink-confinement guard refused links pointing out of the repo.
-func (idx *Indexer) admitFile(path, absRoot string, size int64, gates admissionGates) (lang, reason string) {
-	if idx.shouldExclude(path, absRoot, false) {
-		return "", skipReasonExcluded
-	}
-	lang, claimed := idx.effectiveLanguage(path, nil)
-	if !claimed {
-		return "", skipReasonNoLanguage
-	}
-	if maxSize := idx.config.MaxFileSize; maxSize > 0 && size > maxSize {
-		return lang, skipReasonMaxFileSize
-	}
-	if r, skip := gates.untracked.skip(lang, path); skip {
-		return lang, r
-	}
-	if r, skip := gates.content.skip(lang, size); skip {
-		return lang, r
-	}
-	return lang, ""
 }
 
 // PathSkip is how the walk would treat one file. ByRule narrows Skipped to "an
@@ -58,7 +25,8 @@ type PathSkip struct {
 }
 
 // PathIndexability answers the walk's admission question for one repo-relative
-// file, via admitFile.
+// file, through the same admitWalkEntry verdict both walks use plus the corpus
+// gates layered above it, so the probe cannot drift from what the walk does.
 //
 // The second return is false when this indexer cannot answer at all (blank
 // root, absolute path, path outside the root, or a path it cannot stat).
@@ -74,14 +42,42 @@ func (idx *Indexer) PathIndexability(relPath string) (PathSkip, bool) {
 	// its target. A path that cannot be stat'd is an abstention, not a verdict:
 	// the walk never meets it, so there is nothing to agree with. Reporting it
 	// as skipped rendered as "no symbols are indexed and none ever will be" for
-	// a path that is merely absent — a typo, a file about to be created, or a
-	// path form that did not round-trip to this root.
+	// a path that is merely absent.
 	info, err := os.Lstat(abs)
 	if err != nil {
 		return PathSkip{}, false
 	}
-	_, reason := idx.admitFile(abs, root, info.Size(), idx.probeAdmissionGates(root))
-	return PathSkip{Skipped: reason != "", ByRule: reason == skipReasonExcluded}, true
+	adm := idx.admitWalkEntry(root, abs, info.Size(), false)
+	if !adm.admit {
+		return PathSkip{Skipped: true, ByRule: adm.excluded}, true
+	}
+	gates := idx.probeAdmissionGates(root)
+	if _, skip := gates.untracked.skip(adm.lang, abs); skip {
+		return PathSkip{Skipped: true}, true
+	}
+	if _, skip := gates.content.skip(adm.lang, info.Size()); skip {
+		return PathSkip{Skipped: true}, true
+	}
+	return PathSkip{}, true
+}
+
+// absWithinRoot resolves a repo-relative path against root and refuses
+// anything that does not land inside it. filepath.Join swallows a leading
+// separator (Join("/repo", "/etc/passwd") == "/repo/etc/passwd") and Cleans
+// "../" away against the root, so without this an absolute or escaping caller
+// path is silently rewritten into a plausible in-root path and answered for.
+// Callers do hand over unvalidated strings: the MCP graph-path helpers
+// deliberately echo their input back when resolution fails.
+func absWithinRoot(root, relPath string) (string, bool) {
+	if root == "" || relPath == "" || filepath.IsAbs(relPath) {
+		return "", false
+	}
+	abs := filepath.Join(root, relPath)
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return abs, true
 }
 
 const (

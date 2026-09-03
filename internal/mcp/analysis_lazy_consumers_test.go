@@ -26,11 +26,11 @@ func TestNormalAnalysisConsumersDoNotMaterializeWholeGraphMaps(t *testing.T) {
 	}
 	prediction := &prediction{
 		changedIDs: []string{id},
-		nodes:      server.nodesForIDs([]string{id}),
+		nodes:      server.nodesForIDs(context.Background(), []string{id}),
 		impact:     impact,
 	}
 	_ = server.scoreChangeRisk(prediction)
-	_ = server.riskGatedSymbols(prediction)
+	_ = server.riskGatedSymbols(context.Background(), prediction)
 	assertNoMaterializedAnalysis(t, server)
 
 	node := store.GetNode(id)

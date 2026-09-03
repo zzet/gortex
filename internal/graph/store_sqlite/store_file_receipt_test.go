@@ -64,7 +64,7 @@ func TestFileReceiptPagerFreezesHighWaterAndClosesRows(t *testing.T) {
 
 	planRows, err := store.db.Query(
 		"EXPLAIN QUERY PLAN "+fileReceiptPageQuery,
-		"repo", "", highWater, 128,
+		store.viewGen, "repo", "", highWater, 128,
 	)
 	require.NoError(t, err)
 	var plan []string

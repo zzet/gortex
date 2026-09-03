@@ -56,9 +56,12 @@ func TestProbeAnswersDuringLongMutation(t *testing.T) {
 	}
 }
 
-// The contrast that makes the test above meaningful: Status does block on the
-// same mutex. If this ever stops blocking, Status was fixed and Probe's
-// justification should be revisited rather than silently kept.
+// The contrast that makes the test above meaningful: Status still takes the
+// same mutex. A caller carrying a budget gets an answer regardless — the
+// mutex-guarded aggregate falls back to the last computed snapshot, see
+// TestStatusAnswersWhileTheControllerMutexIsHeld — but a caller with nothing
+// that can end its wait, as here, waits for the exact one. Probe keeps its
+// justification: it is the path that never queues at all.
 func TestStatusBlocksDuringLongMutation(t *testing.T) {
 	c := probeController(t, "repos:\n  - path: /work/alpha\n")
 

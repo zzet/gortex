@@ -84,6 +84,14 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 	if g == nil {
 		return mcp.NewToolResultError("wiki: graph is not initialised"), nil
 	}
+	// reader serves the node / edge reads the wiki renders, so an
+	// overlay-active caller documents its own buffers. The community,
+	// process, hotspot and cycle passes below build their own indexes over a
+	// graph.Store, so those four sections are computed over the base corpus
+	// even when the request carries an overlay view. A routed view never
+	// reaches here: the wiki writes files, so the mutation gate refuses it
+	// before the handler runs.
+	reader := s.readerFor(ctx)
 	communities := analysis.DetectCommunities(g)
 	processes := analysis.DiscoverProcesses(g)
 	hotspots := analysis.FindHotspots(g, communities, 0)
@@ -97,7 +105,7 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 	// Optional docs bundle inside the wiki.
 	var docsMarkdown string
 	if !opts.NoDocs {
-		bundle, err := docs.Generate(docs.Deps{Graph: g, History: s.docsHistoryProvider()}, docs.Options{
+		bundle, err := docs.Generate(docs.Deps{Graph: reader, History: s.docsHistoryProvider()}, docs.Options{
 			WorkspaceID: opts.WorkspaceID,
 		})
 		if err == nil {
@@ -113,7 +121,7 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	gen := wiki.New(wiki.Inputs{
-		Graph:       g,
+		Graph:       reader,
 		Communities: communities,
 		Processes:   processes,
 		Hotspots:    hotspots,
@@ -137,7 +145,7 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 func (s *Server) handleGenerateDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
-	g := s.graph
+	g := s.readerFor(ctx)
 	if g == nil {
 		return mcp.NewToolResultError("docs: graph is not initialised"), nil
 	}

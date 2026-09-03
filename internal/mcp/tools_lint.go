@@ -26,7 +26,7 @@ func (s *Server) handleLintFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError("path is required"), nil
 	}
-	absPath, relPath, resolveErr := s.resolveFilePath(rawPath)
+	absPath, relPath, resolveErr := s.resolveFilePath(ctx, rawPath)
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}

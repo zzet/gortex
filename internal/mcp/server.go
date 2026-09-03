@@ -18,18 +18,21 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/artifacts"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/llm/registry"
 	"github.com/zzet/gortex/internal/llm/svc"
 	"github.com/zzet/gortex/internal/modelhint"
 	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
 	"github.com/zzet/gortex/internal/runtimeactivity"
@@ -140,6 +143,8 @@ type Server struct {
 	watcher       watcherHistory
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
+	// lifecycle is the shared owner of checkout track / forget side effects.
+	lifecycle     *indexer.CheckoutLifecycle
 	activeProject string
 	// testIndexProbe caches, per repo prefix, which language families the
 	// graph carries test symbols for (see testLangsIndexed). The answer
@@ -212,7 +217,7 @@ type Server struct {
 	analysisRun analysisRunState
 	// hotspotsFn is a test seam for deterministic concurrency/invalidation
 	// tests. Production leaves it nil and uses analysis.FindHotspots.
-	hotspotsFn func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry
+	hotspotsFn func(graph.Reader, *analysis.CommunityResult, float64) []analysis.HotspotEntry
 	// adjacency is the compact CSR snapshot of the call / reference
 	// graph, built once per RunAnalysis pass so seeded random-walk
 	// queries (context_closure proximity ranking) never re-scan
@@ -548,6 +553,12 @@ type Server struct {
 	// immutable base graph. Wired post-construction by
 	// SetOverlayManager.
 	overlays *daemon.OverlayManager
+
+	// materializer builds the composed reader a routed checkout is served
+	// through. Nil when the backing store carries no view catalog, in which
+	// case every request reads the base corpus exactly as it did before
+	// routed views existed. Wired post-construction by SetMaterializer.
+	materializer *graphview.Materializer
 
 	// overlayLayerCache memoises per-session parsed overlay layers
 	// keyed by (sessionID, content-hash sum). Cache hits avoid the
@@ -1404,7 +1415,11 @@ func prependUnique(slice []string, item string, maxLen int) []string {
 type MultiRepoOptions struct {
 	MultiIndexer  *indexer.MultiIndexer
 	ConfigManager *config.ConfigManager
-	ActiveProject string
+	// CheckoutLifecycle owns every side effect of tracking and forgetting a
+	// checkout. Nil leaves the track / untrack tools unavailable rather than
+	// letting them run a second, divergent copy of that sequence.
+	CheckoutLifecycle *indexer.CheckoutLifecycle
+	ActiveProject     string
 	// ScopeWorkspace is the workspace slug filter applied as the
 	// default scope on every query. Set by `gortex server --workspace
 	// <slug>`. Empty disables the filter.
@@ -1433,12 +1448,20 @@ const serverInstructions = `Gortex is a code-intelligence graph server — it in
 - The cold tools/list shows a core set — call tools_search to discover the rest of the catalogue on demand.
 - Pass format:"gcx" to list-shaped tools for a compact, round-trippable wire format (~27% fewer tokens).
 
+Worktree and branch routing:
+
+` + profiles.WorktreeBranchRoutingPolicy + `
+
 ` + sharedParamLegend
 
 // codingAgentInstructions is intentionally terse because some MCP hosts repeat
 // initialize instructions beside every rendered tool. It describes what to do,
 // not how the server versions or implements its tool surface.
-const codingAgentInstructions = `MUST use Gortex MCP. First explicit-file read per new user request: read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true}); do not localize. Unknown file/symbol/evidence: explore(operation:"localize"); obey completion.required_action; stop at answer_ready. Diagnosis/change: explore(operation:"task"); 1 follow-up. Pre-edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only via edit/refactor. Post-edit: change(operation:"detect"), tests/guards/contract. capabilities only if fields unknown.`
+const codingAgentInstructions = `MUST use Gortex MCP. First explicit-file read per new user request: read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true}); do not localize. Unknown file/symbol/evidence: explore(operation:"localize"); obey completion.required_action; stop at answer_ready. Diagnosis/change: explore(operation:"task"); 1 follow-up. Pre-edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only via edit/refactor. Post-edit: change(operation:"detect"), tests/guards/contract. capabilities only if fields unknown.
+
+Worktree and branch routing:
+
+` + profiles.WorktreeBranchRoutingPolicy
 
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
@@ -1468,6 +1491,34 @@ func ServerInstructionsUntracked(cwd string, roots ...string) string {
 			"under a different letter case, that is the mismatch.", strings.Join(quoted, ", "), target)
 	}
 	return msg
+}
+
+// ServerInstructionsPendingAutomaticCheckout is the inactive initialize
+// variant for a checkout whose Git family is already tracked. The
+// checkout reconciler owns this transition; recommending `track` here would
+// turn a transient discovery lag into an unintended dedicated graph.
+func ServerInstructionsPendingAutomaticCheckout(cwd string, roots ...string) string {
+	target := strings.TrimSpace(cwd)
+	if target == "" {
+		target = "."
+	}
+	msg := fmt.Sprintf("Gortex is connected but this Git checkout is still awaiting automatic discovery: %q belongs to an already tracked Git family, but its overlay route is not published yet.\n\n"+
+		"Do not run `gortex track` for this state: implicit/session checkouts are automatic overlays. Wait for reconciliation and reconnect; if it remains unavailable, report the discovery lag. Explicit tracking is only for a user-requested dedicated graph.\n\n"+
+		"Until its route is published, graph calls may return repo_not_tracked rather than silently reading another checkout.\n\n"+
+		"Worktree and branch routing:\n\n%s", target, profiles.WorktreeBranchRoutingPolicy)
+	return appendTrackedRootsDiagnostic(msg, roots)
+}
+
+func appendTrackedRootsDiagnostic(msg string, roots []string) string {
+	if len(roots) == 0 {
+		return msg
+	}
+	quoted := make([]string, len(roots))
+	for i, root := range roots {
+		quoted[i] = fmt.Sprintf("%q", root)
+	}
+	return msg + fmt.Sprintf("\n\nTracked repository roots: [%s]. The worktree shares a Git common directory with one of these roots.",
+		strings.Join(quoted, ", "))
 }
 
 // afterInitializeInstructions is the server's OnAfterInitialize hook. It
@@ -1534,7 +1585,11 @@ func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
 		_, _, _, inside := s.multiIndexer.ScopeForCWD(cwd)
 		_, _, contains := s.multiIndexer.ContainedReposScope(cwd)
 		if !inside && !contains {
-			return ServerInstructionsUntracked(cwd, s.trackedRepoRoots()...)
+			roots := s.trackedRepoRoots()
+			if agents.PendingAutomaticCheckout(cwd, roots) {
+				return ServerInstructionsPendingAutomaticCheckout(cwd, roots...)
+			}
+			return ServerInstructionsUntracked(cwd, roots...)
 		}
 	}
 	if facts := s.liveInstructionFacts(cwd); facts != "" {
@@ -1734,12 +1789,34 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		o := opts[0]
 		s.multiIndexer = o.MultiIndexer
 		s.configManager = o.ConfigManager
+		s.lifecycle = o.CheckoutLifecycle
 		s.activeProject = o.ActiveProject
 		s.scopeWorkspace = o.ScopeWorkspace
 		s.scopeProject = o.ScopeProject
 		if o.ScopeIntentDefaults != nil {
 			s.scopeIntentDefaults = *o.ScopeIntentDefaults
 		}
+		// A stack-built server is handed the lifecycle every other entry
+		// point shares. A server constructed on its own — the embedded and
+		// test paths — owns the only tracked set there is, so it builds the
+		// same coordinator over the same inputs rather than growing a second
+		// copy of the track / forget sequence.
+		if s.lifecycle == nil && s.multiIndexer != nil {
+			lifecycle, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+				MultiIndexer:  s.multiIndexer,
+				ConfigManager: s.configManager,
+				Graph:         g,
+				Logger:        logger,
+			})
+			if err != nil {
+				if logger != nil {
+					logger.Warn("mcp: could not build the checkout lifecycle", zap.Error(err))
+				}
+			} else {
+				s.lifecycle = lifecycle
+			}
+		}
+		s.lifecycle.SetNotifier(s)
 	}
 
 	// Proactive-notification broadcasters. Constructed up-front so
@@ -1844,6 +1921,10 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// Register multi-repo tools when multi-repo components are available.
 	if s.multiIndexer != nil || s.configManager != nil {
 		s.registerMultiRepoTools()
+		// The checkout administration surface reads and drives the same
+		// lifecycle the track / untrack tools do, so it is registered on the
+		// same condition.
+		s.registerCheckoutAdminTools()
 	}
 
 	// Workspace-scope bootstrap tools (list_repos, workspace_info).
@@ -2206,6 +2287,19 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 		return ss.scopeWorkspaceID, ss.scopeProjectID, true
 	}
 
+	// cwd lies inside no tracked repo and contains none — but the view
+	// catalog may still know it as an automatic checkout of a tracked
+	// family. That is a directory the repository registry never covers, so
+	// without this arm a session sitting in a worktree binds the unresolved
+	// form below and every scope-narrowed read comes back empty, including
+	// the reads its own routed view was built to serve.
+	if ws, proj, prefix, resolved := s.scopeForAutomaticCheckout(ctx, cwd); resolved {
+		ss.scopeWorkspaceID = ws
+		ss.scopeProjectID = proj
+		ss.scopeRepoPrefix = prefix
+		return ss.scopeWorkspaceID, ss.scopeProjectID, true
+	}
+
 	// cwd neither lives inside nor contains a tracked repo. The daemon
 	// dispatcher rejects unreachable cwds before dispatch, so this is
 	// defensive: the sentinel matches no node, so the session sees
@@ -2373,8 +2467,11 @@ func (s *Server) nodeInSessionScope(ctx context.Context, n *graph.Node) bool {
 // untested, resource rollups, …) iterate this instead of
 // graph.AllNodes() so a workspace-bound session can never observe
 // another workspace's nodes — not even in aggregate counts.
+//
+// The scan runs on the request's reader, so an overlay-active call sees
+// the pushed buffers instead of what is on disk.
 func (s *Server) scopedNodes(ctx context.Context) []*graph.Node {
-	return s.scopeNodes(ctx, s.graph.AllNodes())
+	return s.scopeNodes(ctx, s.readerFor(ctx).AllNodes())
 }
 
 // scopedNodesLight is scopedNodes over the projected node scan: the same
@@ -2393,8 +2490,12 @@ func (s *Server) scopedNodes(ctx context.Context) []*graph.Node {
 // the in-memory graph has no projection and hands back canonical nodes
 // with full Meta, so a wrong call site passes every in-memory test and
 // fails only against SQLite.
+//
+// The projection is asked of the request's reader. An overlay view is not
+// a light scanner, so an overlay-active call falls back to AllNodes and
+// gets fully materialized nodes — the conservative direction.
 func (s *Server) scopedNodesLight(ctx context.Context) []*graph.Node {
-	return s.scopeNodes(ctx, graph.AllNodesLight(s.graph))
+	return s.scopeNodes(ctx, graph.AllNodesLight(s.readerFor(ctx)))
 }
 
 // scopeNodes applies the session's workspace / repo scope to an
@@ -2464,16 +2565,22 @@ func (s *Server) scopeOptionsWithRepoNarrow(ctx context.Context, narrow map[stri
 //
 // Empty kinds returns nil — defensive against caller bugs that would
 // otherwise drop into the full-AllNodes fallback path.
+//
+// The pushdown is probed on the request's reader, never on the base
+// store: an overlay view does not implement the scanner, so an
+// overlay-active call takes the AllNodes fallback and reads the pushed
+// buffers rather than the backend's kind index.
 func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind) []*graph.Node {
 	if len(kinds) == 0 {
 		return nil
 	}
+	reader := s.readerFor(ctx)
 	var nodes []*graph.Node
-	if scan, ok := s.graph.(graph.NodesByKindsScanner); ok {
+	if scan, ok := reader.(graph.NodesByKindsScanner); ok {
 		nodes = scan.NodesByKinds(kinds)
 	} else {
 		// Fallback: same behaviour as scopedNodes, kind-filtered Go-side.
-		all := s.graph.AllNodes()
+		all := reader.AllNodes()
 		allowed := make(map[graph.NodeKind]struct{}, len(kinds))
 		for _, k := range kinds {
 			allowed[k] = struct{}{}
@@ -3164,6 +3271,9 @@ func (s *Server) prepareTool(tool *mcp.Tool, handler server.ToolHandlerFunc) ser
 	// the full semantics live once in the server instructions legend. Runs
 	// before the split so deferred tools carry the compact schema too.
 	compactSharedToolParams(tool)
+	// View selection is handled and stripped by universal request middleware,
+	// but it is still part of every callable tool's public input contract.
+	publishViewSelectorSchema(tool)
 	// #597: dispatch reads only the keys it knows, so an unknown option
 	// used to vanish silently — the caller paid the full un-windowed
 	// response with no signal to self-correct. Close any structured schema

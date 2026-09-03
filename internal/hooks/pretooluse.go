@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,6 +77,10 @@ const gortexMCPToolPrefix = "mcp__gortex__"
 // alternative but the original call still runs and PostToolUse can layer
 // graph context on the actual output.
 func runPreToolUse(data []byte, gortexPort int, mode Mode) {
+	runPreToolUseForHost(data, gortexPort, mode, preToolUseClaude)
+}
+
+func runPreToolUseForHost(data []byte, gortexPort int, mode Mode, host preToolUseHost) {
 	started := time.Now()
 	var input HookInput
 	if err := json.Unmarshal(data, &input); err != nil {
@@ -162,7 +165,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 			hso.UpdatedInput = updatedInput
 		}
 		emitted = hso.AdditionalContext != "" || hso.PermissionDecisionReason != ""
-		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
+		emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: hso})
 		return
 	}
 
@@ -173,7 +176,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	if mode == ModeConsultUnlock && isGortexMCP {
 		markGraphConsulted(input.SessionID)
 		if updatedInput != nil {
-			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+			emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: &HookSpecificOutput{
 				HookEventName: "PreToolUse",
 				UpdatedInput:  updatedInput,
 			}})
@@ -202,7 +205,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 			return
 		}
 		emitted = hso.AdditionalContext != ""
-		emitPreToolUse(HookOutput{HookSpecificOutput: hso})
+		emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: hso})
 		return
 	}
 
@@ -210,7 +213,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 
 	if result.context == "" && !result.deny {
 		if updatedInput != nil {
-			emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
+			emitPreToolUseForHost(host, input.PermissionMode, HookOutput{HookSpecificOutput: &HookSpecificOutput{
 				HookEventName: "PreToolUse",
 				UpdatedInput:  updatedInput,
 			}})
@@ -235,7 +238,7 @@ func runPreToolUse(data []byte, gortexPort int, mode Mode) {
 	}
 
 	emitted = true
-	emitPreToolUse(output)
+	emitPreToolUseForHost(host, input.PermissionMode, output)
 }
 
 // enforceLocalizationTerminalPreToolUse applies only the local terminal
@@ -341,8 +344,64 @@ func markGraphConsulted(sessionID string) {
 	}
 }
 
+type preToolUseHost uint8
+
+const (
+	preToolUseClaude preToolUseHost = iota
+	preToolUseCodex
+)
+
+// normalizePreToolUseOutput applies the host-specific rewrite contract without
+// broadening the user's permission policy. Claude Code can ask while carrying
+// updatedInput; Codex requires allow for every rewrite and does not support ask.
+func normalizePreToolUseOutput(host preToolUseHost, permissionMode string, output HookOutput) HookOutput {
+	hso := output.HookSpecificOutput
+	if hso == nil || hso.HookEventName != "PreToolUse" {
+		return output
+	}
+
+	normalized := *hso
+	if normalized.UpdatedInput == nil {
+		// Codex rejects allow when there is no replacement input. Removing it
+		// restores the host's normal permission flow instead of broadening it.
+		if host == preToolUseCodex && normalized.PermissionDecision == "allow" {
+			normalized.PermissionDecision = ""
+			normalized.PermissionDecisionReason = ""
+		}
+		output.HookSpecificOutput = &normalized
+		return output
+	}
+
+	switch normalized.PermissionDecision {
+	case "":
+		if host == preToolUseCodex || isPermissivePermissionMode(permissionMode) {
+			normalized.PermissionDecision = "allow"
+		} else {
+			normalized.PermissionDecision = "ask"
+		}
+	case "allow":
+		// Valid for both hosts when paired with updatedInput.
+	case "ask":
+		if host == preToolUseCodex {
+			normalized.PermissionDecision = "deny"
+			normalized.PermissionDecisionReason = "[Gortex] Codex cannot safely apply an ask rewrite."
+			normalized.UpdatedInput = nil
+		}
+	default:
+		// A deny, defer, or future non-rewrite decision keeps its policy but
+		// cannot carry replacement input.
+		normalized.UpdatedInput = nil
+	}
+	output.HookSpecificOutput = &normalized
+	return output
+}
+
+func emitPreToolUseForHost(host preToolUseHost, permissionMode string, output HookOutput) {
+	emitPreToolUse(normalizePreToolUseOutput(host, permissionMode, output))
+}
+
 // emitPreToolUse marshals a PreToolUse HookOutput to stdout. A marshal
-// failure is swallowed — a hook must never block Claude Code's flow.
+// failure is swallowed — a hook must never block the host agent's flow.
 func emitPreToolUse(output HookOutput) {
 	out, err := json.Marshal(output)
 	if err != nil {
@@ -501,12 +560,12 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		return enrichResult{}
 	}
 
-	st := queryFileIndexScope(cwd, filePath)
+	fileIndexed, symbolCount := queryFileIndexed(cwd, filePath)
 
 	// If the file is indexed, BLOCK the read and provide graph alternatives.
-	if st.Indexed {
+	if fileIndexed {
 		var reason strings.Builder
-		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Call `explore` first, then use `read` instead:\n", filePath, st.Count)
+		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Call `explore` first, then use `read` instead:\n", filePath, symbolCount)
 		reason.WriteString("  - `read(target:{symbol:\"<id>\"})` — one symbol\n")
 		reason.WriteString("  - `read(target:{symbols:[\"<id>\"]})` — several symbols\n")
 		reason.WriteString("  - `read(operation:\"editing_context\", target:{file:\"<path>\"})` — full editing context\n")
@@ -524,14 +583,7 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		}
 	}
 
-	// Stay silent when the graph has no answer to redirect to: the file is
-	// unindexable by design, it is indexed but defines no symbols, or no
-	// usable verdict came back at all.
-	if st.noGraphAnswer() {
-		return enrichResult{}
-	}
-
-	// File not indexed but indexable — allow with advisory.
+	// File not indexed — allow with advisory.
 	var guidance strings.Builder
 	guidance.WriteString("[Gortex] Use `explore` first, then `read` for indexed source:\n")
 	guidance.WriteString("  - one symbol: `read(target:{symbol:\"<id>\"})`\n")
@@ -600,7 +652,12 @@ var errDaemonUnreachable = errors.New("daemon unreachable")
 // grepProbeFn is the function the Grep enrichment uses to query the
 // graph for symbol matches. Defaults to the daemon-socket implementation;
 // tests swap it for a stub.
-type grepProbeFn func(pattern string, timeout time.Duration) ([]grepSymbolHit, error)
+//
+// scope is where the search was issued from. It rides along so the daemon can
+// answer out of the graph that location reads through — an automatic worktree
+// is served by its own composed view, and matching the pattern against the
+// family primary's corpus would cite another working copy's code as evidence.
+type grepProbeFn func(pattern, scope string, timeout time.Duration) ([]grepSymbolHit, error)
 
 // grepProbe is the indirection point. Production reads probeViaDaemon;
 // tests reassign this var via a t.Cleanup-restored helper.
@@ -630,7 +687,7 @@ func enrichGrep(toolInput map[string]any, _ int, cwdArg ...string) enrichResult 
 			reason: formatTrackedSearchDeny("Grep", pattern),
 		}
 	}
-	return probeSymbolPattern("Grep", pattern, defaultGrepGuidance())
+	return probeSymbolPattern("Grep", pattern, cwd, defaultGrepGuidance())
 }
 
 // searchScopeVerdict is what a Grep/Glob scope resolves to. The three states
@@ -658,34 +715,14 @@ func hookSearchScope(cwd string, toolInput map[string]any) searchScopeVerdict {
 		if !looksLikeSourceFile(scope) {
 			return searchScopeNonSource
 		}
-		fs := queryFileIndexScope(cwd, scope)
-		// Before Indexed: the tools this deny redirects to apply the same
-		// filter, so denying would trade a working search for an empty one.
-		if fs.OutOfScope {
-			return searchScopeNonSource
-		}
-		// Symbolless denies here but not on the read doors: search(text),
-		// search(files) and explore(outline) all have rows for a file the
-		// graph holds, symbol-free or not.
-		if fs.Indexed || fs.Symbolless {
+		if indexed, _ := queryFileIndexed(cwd, scope); indexed {
 			return searchScopeIndexed
 		}
-		if fs.NeverIndexable {
-			return searchScopeNonSource
-		}
-		// A failed probe is not evidence. NonSource here would make narrowing
-		// `path` to one file a way to switch enforcement off on a hiccup.
 		return searchScopeUnproven
 	}
 
-	// A directory scope. scopeTrackedFn proves whether it holds indexed source
-	// at all
-	hasSource, probeOK := scopeTrackedFn(cwd, scope)
-	switch {
-	case hasSource:
+	if scopeTrackedFn(cwd, scope) {
 		return searchScopeIndexed
-	case probeOK:
-		return searchScopeNonSource
 	}
 	return searchScopeUnproven
 }
@@ -732,14 +769,14 @@ const maxAlternationProbes = 5
 // alternatives are. Each identifier-shaped alternative is probed and the hits
 // aggregated; a pure-text alternation (phrases, hyphenated words) falls
 // through to guidance that points at search_text.
-func probeSymbolPattern(tool, pattern, guidance string) enrichResult {
+func probeSymbolPattern(tool, pattern, scope, guidance string) enrichResult {
 	if pattern == "" {
 		return enrichResult{}
 	}
 
 	segments := splitAlternation(pattern)
 	if len(segments) == 1 {
-		return probeSinglePattern(tool, segments[0], guidance)
+		return probeSinglePattern(tool, segments[0], scope, guidance)
 	}
 
 	var symbolSegs []string
@@ -762,7 +799,7 @@ func probeSymbolPattern(tool, pattern, guidance string) enrichResult {
 	}
 
 	start := time.Now()
-	hits, reached := probeSegments(symbolSegs)
+	hits, reached := probeSegments(symbolSegs, scope)
 	dur := time.Since(start)
 	if len(hits) == 0 {
 		// Only record a miss when the daemon actually answered — a fully
@@ -783,7 +820,7 @@ func probeSymbolPattern(tool, pattern, guidance string) enrichResult {
 // probeSinglePattern gates a single (non-alternation) pattern on symbol-shape
 // and probes the daemon's search_symbols endpoint, returning deny-with-hits on
 // a match or soft guidance on miss/timeout/non-symbol.
-func probeSinglePattern(tool, pattern, guidance string) enrichResult {
+func probeSinglePattern(tool, pattern, scope, guidance string) enrichResult {
 	if classifyGrepPattern(pattern) != GrepPatternSymbol {
 		if len(pattern) > 2 {
 			logHookDecision(tool, pattern, DecisionSkippedNonSymbol, 0, 0)
@@ -793,7 +830,7 @@ func probeSinglePattern(tool, pattern, guidance string) enrichResult {
 	}
 
 	start := time.Now()
-	hits, err := grepProbe(pattern, grepProbeTimeout)
+	hits, err := grepProbe(pattern, scope, grepProbeTimeout)
 	dur := time.Since(start)
 	switch {
 	case errors.Is(err, errProbeTimeout):
@@ -825,10 +862,10 @@ func probeSinglePattern(tool, pattern, guidance string) enrichResult {
 // error (timeout, decode) drops that segment silently — one bad alternative
 // shouldn't sink the whole redirect — and an unreachable daemon leaves
 // reached=false so the caller can stay quiet instead of logging a false miss.
-func probeSegments(segs []string) (hits []grepSymbolHit, reached bool) {
+func probeSegments(segs []string, scope string) (hits []grepSymbolHit, reached bool) {
 	seen := make(map[string]bool)
 	for _, s := range segs {
-		found, err := grepProbe(s, grepProbeTimeout)
+		found, err := grepProbe(s, scope, grepProbeTimeout)
 		if errors.Is(err, errDaemonUnreachable) {
 			continue
 		}
@@ -1048,150 +1085,53 @@ func fileOutlineWithin(cwd, filePath string, timeout time.Duration) (*hookFileSu
 	}
 }
 
-// fileIndexStatus is the daemon's per-file verdict from one get_file_summary
-// probe. The flags are independent facts about the file, not a ranking:
+// queryFileIndexed reports whether the file at filePath is covered by the
+// graph the daemon serves that path from, with the symbol count when it is.
+// cwd absolutises a relative filePath. A zero return (false, 0) is the "no
+// signal" case — daemon unreachable, malformed response, a working copy whose
+// view is not built yet, or a file genuinely not indexed; callers treat all
+// four the same (fall through to soft guidance, so the native tool proceeds).
 //
-//   - Indexed: the graph holds Count definition symbols for the file, so a
-//     graph tool can answer a read of it. The only state that earns a deny.
-//   - NeverIndexable: the walk will never hold it — exclude rule, unclaimed
-//     language, size cap, or a corpus-admission gate. Deliberately not named
-//     Excluded: the server's wire field of that name is the narrower "a RULE
-//     is the reason" flag, and this is its union with `unindexable`.
-//   - Symbolless: the graph holds the file, it just defines no symbols
-//     (doc-only or constants-only). The locators still have rows for it.
-//   - OutOfScope: the graph holds the file, but the active repo/project/ref
-//     filter hides it — so the locators have nothing for it either.
-//   - Tracked: some tracked repo owns the path.
-//   - OwnershipUnknown: Tracked is false only because the tracked-repo
-//     registry could not be read.
-//   - ProbeOK: a usable verdict came back at all.
-//
-// ProbeOK with neither NeverIndexable nor Symbolless means tracked, indexable,
-// not indexed yet — the one state that earns a read advisory.
-//
-// Known gap: the daemon only reports the not-indexed flags on a response
-// carrying no definition symbols, so a tree excluded AFTER indexing still
-// reads as Indexed until a re-index drops the stale nodes. The eviction is the
-// better fix and lives in the indexer.
-type fileIndexStatus struct {
-	Indexed          bool
-	NeverIndexable   bool
-	Symbolless       bool
-	OutOfScope       bool
-	Tracked          bool
-	OwnershipUnknown bool
-	ProbeOK          bool
-	Count            int
-}
-
-// noGraphAnswer reports whether a redirect to graph tools has nothing true to
-// say. READ-shaped doors only (Read, Bash cat/head/tail) — they redirect to
-// symbol lookups; the search doors answer for symbol-free files too.
-//
-// A missing verdict is not proof: !ProbeOK also covers a wedged daemon and an
-// unparseable body. Silence only when the daemon is down and the advisory would
-// name unreachable tools, or when nothing tracks the path and the registry was
-// readable enough to say so.
-func (st fileIndexStatus) noGraphAnswer() bool {
-	if st.NeverIndexable || st.Symbolless || st.OutOfScope {
-		return true
-	}
-	if st.ProbeOK {
-		return false
-	}
-	if !daemonReachableFn() {
-		return true
-	}
-	return !st.Tracked && !st.OwnershipUnknown
-}
-
-// queryFileIndexed is a shape adapter over fileIndexScopeFn for the WRITE
-// doors, which branch on "does the graph hold symbols for this file" and
-// nothing else: a file the daemon cannot place is not one to redirect a write
-// away from. Read-shaped callers must use queryFileIndexScope instead — they
-// need to tell "excluded by design" and "no verdict" apart from "tracked but
-// not indexed yet", and this signature collapses all three to (false, 0).
+// fileIndexedFn is the seam tests stub; production routes through the
+// daemon's control socket (the old HTTP :8765 /api/graph/file endpoint this
+// used to hit was removed when the web API migrated to the daemon, which
+// is why the hard deny silently stopped firing for every agent).
 func queryFileIndexed(cwd, filePath string) (bool, int) {
-	st := fileIndexScopeFn(cwd, filePath)
-	return st.Indexed, st.Count
-}
-
-// queryFileIndexScope returns the full per-file verdict, for callers that must
-// tell "excluded by design" apart from "tracked but not yet indexed".
-func queryFileIndexScope(cwd, filePath string) fileIndexStatus {
-	return fileIndexScopeFn(cwd, filePath)
+	return fileIndexedFn(cwd, filePath)
 }
 
 // fileIndexedTimeout bounds the daemon probe so a wedged daemon never
 // stalls the PreToolUse critical path.
 const fileIndexedTimeout = 2 * time.Second
 
-var fileIndexScopeFn = fileIndexScopeViaDaemon
+var fileIndexedFn = fileIndexedViaDaemon
 
-// fileIndexScopeViaDaemon asks the daemon's get_file_summary tool for the
-// file's verdict over the AF_UNIX MCP channel. The graph keys files by their
-// repo-relative path, so the absolute file path is resolved against its
-// tracked-repo root and the root-relative path is what gets queried (with the
-// handshake CWD set to that root for scoping). Both the definition-symbol count
-// and the exclusion flag ride the one response — no extra round-trip.
+// fileIndexedViaDaemon asks the daemon's file_coverage control verb how many
+// definition symbols the graph serving this path holds for it.
 //
-// TODO(hook-local perf): each probe opens a fresh MCP connection, so a wide
-// postGlob still pays one dial per file even though repoRootForFile's status
-// fetch is now memoised. Reusing a single connection across the batch — or a
-// count-only probe that skips get_file_summary's ensureFresh re-index on the
-// hot path — is the next optimisation. Deferred so the test seam
-// (fileIndexScopeFn) stays a simple per-file func; left to the maintainer.
-func fileIndexScopeViaDaemon(cwd, filePath string) fileIndexStatus {
-	// Ownership is resolved separately from the probe: "nothing tracks it" and
-	// "the probe didn't come back" mean opposite things to the caller. The same
-	// split one level deeper — an unreadable registry proves nothing either.
-	if _, _, tracked := resolveTrackedRel(cwd, filePath); !tracked {
-		return fileIndexStatus{OwnershipUnknown: !trackedRegistryKnownFn()}
-	}
-	resp, ok := daemonFileSummaryRaw(cwd, filePath)
-	if !ok {
-		return fileIndexStatus{Tracked: true}
-	}
-	st := parseFileSummaryScope(resp)
-	st.Tracked = true
-	return st
-}
-
-// trackedRegistryKnownFn is the seam tests replace.
-var trackedRegistryKnownFn = trackedRegistryKnown
-
-// trackedRegistryKnown distinguishes "the registry says no repo owns this" from
-// "the registry could not be read" — cachedTrackedRepos returns the same nil
-// slice for both. An empty list is a verdict only when the status call behind
-// it succeeded.
-func trackedRegistryKnown() bool {
-	if len(hookTrackedReposFn()) > 0 {
-		return true
-	}
-	status, err := cachedDaemonStatus()
-	return err == nil && status != nil
-}
-
-// resolveTrackedRel maps a (cwd, filePath) pair onto the tracked-repo root that
-// owns it and the root-relative path the graph keys files by. ok is false for a
-// relative path with no cwd and for a path outside every tracked repo.
-func resolveTrackedRel(cwd, filePath string) (root, rel string, ok bool) {
+// The path is sent absolute and resolved daemon-side. That is the whole point
+// of the verb: which graph answers for a path is a catalog question — an
+// automatic worktree reads a composed view, a dedicated checkout reads its own
+// corpus — and a hook resolving the path against its own tracked-repo list
+// cannot see any of it.
+//
+// The answer's view block is recorded, not acted on: a fallback answer still
+// decides the deny the same way an exact one does, and the flag exists so the
+// posture is visible before it is given weight.
+func fileIndexedViaDaemon(cwd, filePath string) (bool, int) {
 	abs := filePath
 	if !filepath.IsAbs(abs) {
 		if cwd == "" {
-			return "", "", false
+			return false, 0
 		}
 		abs = filepath.Join(cwd, abs)
 	}
-	root = repoRootForFile(abs)
-	if root == "" {
-		return "", "", false
+	result, ok := fileCoverageViaDaemon(abs, fileIndexedTimeout)
+	if !ok {
+		return false, 0
 	}
-	rel, err := filepath.Rel(root, abs)
-	if err != nil {
-		return "", "", false
-	}
-	return root, rel, true
+	logProbeViewFallback(daemon.ControlFileCoverage, result.View)
+	return result.Covered, result.Symbols
 }
 
 // daemonFileSummaryRaw resolves filePath to its tracked-repo root, asks the
@@ -1201,10 +1141,27 @@ func resolveTrackedRel(cwd, filePath string) (root, rel string, ok bool) {
 // The graph keys files by their repo-relative path, so the absolute path is
 // resolved against its tracked-repo root and the root-relative path is what
 // gets queried (with the handshake CWD set to that root for scoping).
+//
+// Shared by the PreToolUse file-indexed probe (fileIndexedViaDaemon) and the
+// PostToolUse enrichment (fileSummaryViaDaemon) so both stay on the daemon
+// socket — the HTTP :8765 /api/graph/* API they used to hit was removed when
+// the web surface migrated to the daemon (#241).
 func daemonFileSummaryRaw(cwd, filePath string) ([]byte, bool) {
-	root, rel, ok := resolveTrackedRel(cwd, filePath)
-	if !ok {
-		return nil, false // no cwd for a relative path, or outside every tracked repo
+	abs := filePath
+	if !filepath.IsAbs(abs) {
+		if cwd == "" {
+			return nil, false
+		}
+		abs = filepath.Join(cwd, abs)
+	}
+
+	root := repoRootForFile(abs)
+	if root == "" {
+		return nil, false // outside every tracked repo → not indexed
+	}
+	rel, err := filepath.Rel(root, abs)
+	if err != nil {
+		return nil, false
 	}
 
 	client, err := daemon.Dial(hookMCPHandshake(root))
@@ -1287,60 +1244,6 @@ func repoRootForFile(abs string) string {
 	return repo.Path
 }
 
-// fileNotIndexedCondition is the recoverable-guidance condition code
-// get_file_summary returns for a file with no indexed symbols. The scope flags
-// below are only trusted on a payload that actually carries it: `data` is a
-// free-form map on the server side, so any other guidance reachable from this
-// tool that happens to grow an `excluded` key would otherwise silence the read
-// door for genuinely indexed source, and nothing would fail.
-const fileNotIndexedCondition = "file_not_indexed"
-
-// parseFileSummaryScope turns one get_file_summary tools/call response into
-// the per-file verdict — JSON-RPC envelope → first content block (the JSON
-// payload as text) → either a summary (total_nodes, the definition-symbol
-// count after the handler strips file/import nodes) or the file_not_indexed
-// guidance and its scope flags. encoding/json ignores unknown fields, so both
-// shapes decode in a single pass.
-//
-// Every failure to reach a usable payload returns the zero value, whose
-// ProbeOK is false: an unreachable bridge, an isError frame (get_file_summary
-// converts its own recovered panics into one), and an unparseable body are all
-// "no verdict", never "not indexed". Conflating the two is what made a
-// daemon-side crash produce a confident advisory.
-func parseFileSummaryScope(resp []byte) fileIndexStatus {
-	text := parseToolCallText(resp)
-	if text == "" {
-		return fileIndexStatus{}
-	}
-	var payload struct {
-		TotalNodes int    `json:"total_nodes"`
-		Condition  string `json:"condition"`
-		Data       struct {
-			Excluded    bool `json:"excluded"`
-			Unindexable bool `json:"unindexable"`
-			Indexed     bool `json:"indexed"`
-			OutOfScope  bool `json:"out_of_scope"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(text), &payload); err != nil {
-		return fileIndexStatus{}
-	}
-	st := fileIndexStatus{ProbeOK: true}
-	if payload.TotalNodes > 0 {
-		st.Indexed = true
-		st.Count = payload.TotalNodes
-	}
-	if payload.Condition == fileNotIndexedCondition {
-		// Union: `excluded` is the narrow "a RULE is the reason" flag.
-		st.NeverIndexable = payload.Data.Excluded || payload.Data.Unindexable
-		st.OutOfScope = payload.Data.OutOfScope
-		// `indexed` covers both; only a symbol-free file leaves the locators
-		// able to answer, so the filtered one must not read as Symbolless.
-		st.Symbolless = payload.Data.Indexed && !payload.Data.OutOfScope
-	}
-	return st
-}
-
 // enrichBash classifies the Bash command and routes codebase-search shapes
 // through the same graph probes the Grep and Read enrichments use, and shell
 // mutations of indexed source through the same answer Edit and Write get.
@@ -1365,28 +1268,22 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 	}
 	switch c.Action {
 	case BashActionGrepLike:
-		return probeSymbolPattern("Bash", c.Pattern, defaultGrepGuidance())
+		return probeSymbolPattern("Bash", c.Pattern, cwd, defaultGrepGuidance())
 
 	case BashActionFindName:
 		// find -name values often include `*` globs; the classifier has
 		// already stripped wildcards, but the residue may still be
 		// non-symbol-shaped (e.g. ".go" from `-name "*.go"`) — let
 		// probeSymbolPattern decide.
-		return probeSymbolPattern("Bash", c.Pattern, defaultGrepGuidance())
+		return probeSymbolPattern("Bash", c.Pattern, cwd, defaultGrepGuidance())
 
 	case BashActionReadSource:
-		// Bash is the door an agent falls back to the moment Read denies, so
-		// it has to reach the same verdict Read does — including the silences.
-		// The (indexed, count) adapter collapses "excluded by design" and "no
-		// verdict" into the not-indexed branch, which is how `cat` on a
-		// vendored file kept emitting a redirect to graph tools that will
-		// never hold it.
-		st := queryFileIndexScope(cwd, c.Path)
-		if st.Indexed {
+		indexed, symbolCount := queryFileIndexed(cwd, c.Path)
+		if indexed {
 			var reason strings.Builder
 			fmt.Fprintf(&reason,
 				"[Gortex] BLOCKED: Bash `%s %s` reads indexed source (%d symbols). Use graph tools instead:\n",
-				c.Primary, c.Path, st.Count)
+				c.Primary, c.Path, symbolCount)
 			reason.WriteString("  - one symbol: `read(target:{symbol:\"<id>\"})`\n")
 			reason.WriteString("  - file overview: `read(operation:\"summary\", target:{file:\"<path>\"})`\n")
 			reason.WriteString("  - before editing: `read(operation:\"editing_context\", target:{file:\"<path>\"})`\n")
@@ -1394,10 +1291,7 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 			reason.WriteString(toolref.MCPRequiredLine())
 			return enrichResult{deny: true, reason: reason.String()}
 		}
-		if st.noGraphAnswer() {
-			return enrichResult{}
-		}
-		// Tracked, indexable, not indexed yet — soft guidance so Bash proceeds.
+		// Not indexed — soft guidance so Bash proceeds.
 		var g strings.Builder
 		g.WriteString("[Gortex] Use `read` instead of Bash cat/head/tail for indexed source:\n")
 		g.WriteString("  - `read(target:{symbol:\"<id>\"})` for one symbol; use operation `summary` for an overview or `editing_context` before editing\n")
@@ -1455,156 +1349,50 @@ func firstIndexedWriteTarget(writes []BashWrite, cwd string) (BashWrite, int, bo
 // without a real socket. Production reads daemon.IsRunning.
 var daemonReachableFn = daemon.IsRunning
 
-// scopeTrackedFn asks whether a Grep/Glob directory scope contains at least
-// one indexed source file. The second return separates "asked, and the answer
-// is no" from "could not ask" — without it a daemon hiccup is indistinguishable
-// from a proven-empty vendored tree, and the caller cannot tell whether
-// silence or the historical pattern probe is the right posture. Tests replace
-// it so fallback cases stay deterministic.
+// scopeTrackedFn proves that a Grep/Glob scope contains at least one indexed
+// source file. Tests replace it so fallback cases stay deterministic.
 var scopeTrackedFn = scopeTrackedViaDaemon
 
-func scopeTrackedViaDaemon(cwd, scope string) (hasSource, probeOK bool) {
+func scopeTrackedViaDaemon(cwd, scope string) bool {
 	if !daemonReachableFn() {
-		return false, false
+		return false
 	}
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
 		scope = cwd
 	}
 	if scope == "" {
-		return false, false
+		return false
 	}
 	if !filepath.IsAbs(scope) {
 		if cwd == "" {
-			return false, false
+			return false
 		}
 		scope = filepath.Join(cwd, scope)
 	}
 	scope = filepath.Clean(scope)
 	info, err := os.Stat(scope)
 	if err != nil || !info.IsDir() {
-		return false, false
+		return false
 	}
 	root := repoRootForFile(scope)
 	if root == "" {
-		return false, false
+		return false
 	}
 	rel, err := filepath.Rel(root, scope)
 	if err != nil {
-		return false, false
+		return false
 	}
-	if rel == "." {
-		rel = ""
-	}
-	return scopeTrackedFromProbes(rel, func(at string) (bool, bool) {
-		return findFilesProbeFn(root, at)
-	}, func() (fileIndexStatus, scopeWitness) {
-		return scopeWitnessFn(cwd, scope)
-	})
-}
 
-// scopeTrackedFromProbes turns the find_files answer for a scope into the scope
-// verdict. Split from the transport so the decision is testable without a daemon.
-//
-// Zero hits is not proof of a vendored tree: a warming graph, a never-indexed
-// repo and a repo/project filter answer identically. Nor is corroborating
-// against the whole repo — "some file in this repo is indexed" holds while the
-// scope itself is mid-walk. Only the scope's own witness separates the cases: an
-// excluded tree answers NeverIndexable, an unreached one answers "tracked,
-// indexable, not indexed yet", and only the first is proof.
-func scopeTrackedFromProbes(rel string, probe func(at string) (hasSource, ok bool), witness func() (fileIndexStatus, scopeWitness)) (hasSource, probeOK bool) {
-	scoped, ok := probe(rel)
-	if !ok {
-		return false, false
-	}
-	if scoped {
-		return true, true
-	}
-	st, found := witness()
-	switch found {
-	case witnessNone:
-		return false, true
-	case witnessFound:
-		switch {
-		case st.Indexed || st.Symbolless:
-			// The doors disagree; enforce on the one that found something.
-			return true, true
-		case st.NeverIndexable:
-			return false, true
-		}
-	}
-	return false, false
-}
-
-// scopeWitness is what a bounded walk of a directory scope turned up.
-type scopeWitness int
-
-const (
-	// witnessUnknown: the walk could not finish. Nothing is proven.
-	witnessUnknown scopeWitness = iota
-	// witnessNone: walked it all, no source-looking file in the scope.
-	witnessNone
-	// witnessFound: a representative source file, whose status stands in for
-	// the scope's.
-	witnessFound
-)
-
-// witnessWalkBudget caps one witness walk. A scope with source in it matches
-// almost immediately; the budget only bounds a huge asset tree with none.
-const witnessWalkBudget = 4096
-
-var errWitnessBudget = errors.New("scope witness budget exhausted")
-
-// scopeWitnessFn resolves a directory scope to one representative source file's
-// index verdict. Tests replace it.
-var scopeWitnessFn = scopeWitnessViaWalk
-
-func scopeWitnessViaWalk(cwd, absScope string) (fileIndexStatus, scopeWitness) {
-	seen := 0
-	found := ""
-	err := filepath.WalkDir(absScope, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// An unreadable root proves nothing; an unreadable subtree is
-			// skipped so the rest of the scope can still produce a witness.
-			if path == absScope {
-				return err
-			}
-			return nil
-		}
-		seen++
-		if seen > witnessWalkBudget {
-			return errWitnessBudget
-		}
-		if d.IsDir() || !looksLikeSourceFile(path) {
-			return nil
-		}
-		found = path
-		return fs.SkipAll
-	})
-	if err != nil {
-		return fileIndexStatus{}, witnessUnknown
-	}
-	if found == "" {
-		return fileIndexStatus{}, witnessNone
-	}
-	return queryFileIndexScope(cwd, found), witnessFound
-}
-
-// findFilesProbeFn asks the daemon whether a repo-relative path ("" = the whole
-// repo) holds at least one indexed file. Tests replace it to drive
-// scopeTrackedViaDaemon's verdict without a socket.
-var findFilesProbeFn = findFilesViaDaemon
-
-func findFilesViaDaemon(root, rel string) (hasSource, ok bool) {
 	client, err := daemon.Dial(hookMCPHandshake(root))
 	if err != nil {
-		return false, false
+		return false
 	}
 	defer client.Close()
 	_ = client.Conn.SetDeadline(time.Now().Add(fileIndexedTimeout))
 
 	arguments := map[string]any{"glob": "**/*", "limit": 1, "format": "json"}
-	if rel != "" {
+	if rel != "." {
 		arguments["path"] = filepath.ToSlash(rel)
 	}
 	frame, err := json.Marshal(map[string]any{
@@ -1617,23 +1405,23 @@ func findFilesViaDaemon(root, rel string) (hasSource, ok bool) {
 		},
 	})
 	if err != nil || client.WriteMCPFrame(frame) != nil {
-		return false, false
+		return false
 	}
 	resp, err := client.ReadMCPFrame()
-	if err != nil {
-		return false, false
-	}
-	return parseFindFilesHasSource(resp)
+	return err == nil && parseFindFilesHasSource(resp)
 }
 
-// parseFindFilesHasSource reports whether a find_files response lists at least
-// one indexed file. ok is false only when no usable list came back, so a
-// transport failure stays distinguishable from a well-formed empty list —
-// what that emptiness proves is scopeTrackedFromProbes' call, not this one's.
-func parseFindFilesHasSource(resp []byte) (hasSource, ok bool) {
-	text := parseToolCallText(resp)
-	if text == "" {
-		return false, false
+func parseFindFilesHasSource(resp []byte) bool {
+	var rpc struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(resp, &rpc) != nil || rpc.Result.IsError || len(rpc.Result.Content) == 0 {
+		return false
 	}
 	var files struct {
 		Count int `json:"count"`
@@ -1641,10 +1429,10 @@ func parseFindFilesHasSource(resp []byte) (hasSource, ok bool) {
 			Path string `json:"path"`
 		} `json:"files"`
 	}
-	if json.Unmarshal([]byte(text), &files) != nil {
-		return false, false
+	if json.Unmarshal([]byte(rpc.Result.Content[0].Text), &files) != nil {
+		return false
 	}
-	return files.Count > 0 && len(files.Files) > 0, true
+	return files.Count > 0 && len(files.Files) > 0
 }
 
 // enrichGlob denies source enumeration within a proven tracked/indexed scope.

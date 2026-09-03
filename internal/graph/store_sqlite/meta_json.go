@@ -820,11 +820,13 @@ type promotedNodeMeta struct {
 	updatedAt                                           sql.NullInt64
 }
 
-// ensureNodeColumns adds the promoted + struct columns to a nodes table
-// created before they existed. A fresh DB already has them from the DDL, so
-// this is a no-op; an older DB is altered in place.
-func ensureNodeColumns(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(nodes)`)
+// ensureNodeColumns adds the promoted + struct columns to a nodes-shaped table
+// created before they existed. nodesTableBody deliberately omits them, so this
+// runs on a freshly created table as well as on an older one; table is a
+// parameter because the v16 rebuild reconciles its replacement table under a
+// temporary name before copying rows into it.
+func ensureNodeColumns(db schemaColumnDB, table string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
 		return err
 	}
@@ -850,7 +852,7 @@ func ensureNodeColumns(db *sql.DB) error {
 		if existing[name] {
 			return nil
 		}
-		_, err := db.Exec(`ALTER TABLE nodes ADD COLUMN ` + ddl)
+		_, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + ddl)
 		return err
 	}
 	for _, c := range structNodeColumns {

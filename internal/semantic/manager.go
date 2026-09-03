@@ -104,6 +104,13 @@ type Manager struct {
 	// instead of holding hard references that would defeat reaping.
 	lspRouter LSPRouter
 
+	// checkouts admits the per-(language, checkout root) language-server
+	// workspaces EnrichCheckout runs through, against one global cap. It is
+	// separate from the router's own live-provider cap because it bounds a
+	// different population: the router caps what the tracked repositories keep
+	// warm, and this caps the second copies routed checkouts add on top.
+	checkouts *CheckoutWorkspaces
+
 	mu          sync.RWMutex
 	lastResults map[string]*EnrichResult // provider name → last result
 	// enrichStatus tracks the lifecycle of every per-(repo, provider)
@@ -134,6 +141,7 @@ func NewManager(cfg Config, logger *zap.Logger) *Manager {
 	m := &Manager{
 		config:          cfg,
 		logger:          logger,
+		checkouts:       NewCheckoutWorkspaces(cfg.checkoutWorkspaceCap(), logger),
 		lastResults:     make(map[string]*EnrichResult),
 		enrichStatus:    make(map[string]*EnrichmentStatus),
 		lifecycleCtx:    lifecycleCtx,
@@ -207,6 +215,12 @@ func (m *Manager) RegisterProvider(p Provider) {
 // resolved lazily via ProviderForSpec.
 func (m *Manager) SetLSPRouter(r LSPRouter) {
 	m.lspRouter = r
+	// The router is also what can stop a per-checkout workspace's servers, so
+	// the eviction path is wired from the same call rather than from a second
+	// one a caller could forget. A router that cannot stop one — and a nil
+	// detach — leaves the registry evicting its bookkeeping alone.
+	stopper, _ := r.(WorkspaceStopper)
+	m.checkouts.SetStopper(stopper)
 }
 
 // LSPRouter returns the configured LSPRouter, or nil if none has been
@@ -233,6 +247,17 @@ type RepoEnrichState struct {
 	// enrichment edges until HEAD moves or the tree goes dirty. The clean
 	// non-partial completion still refreshes the marker afterwards.
 	Force bool
+
+	// CheckoutID scopes the pass to one routed automatic checkout's working
+	// copy. Empty — every caller but EnrichCheckout — means the repository's
+	// base corpus, and keeps the legacy marker key exactly as it was.
+	//
+	// It exists because every checkout of a family shares one repo prefix. A
+	// checkout pass writing the unscoped key would overwrite the primary's
+	// completion marker with a sha the primary's tree was never at, and the
+	// next warm restart would skip the repository's enrichment on that
+	// evidence. See enrichMarkerProvider.
+	CheckoutID string
 }
 
 // EnrichOptions carries the optional per-repo freshness inputs to EnrichAll.
@@ -259,6 +284,13 @@ type EnrichOptions struct {
 	// floor is what stops a Rust repo's go-binding stub or a grammar repo's
 	// seven-node bindings/go tree from admitting a whole Go compiler pass.
 	MinLanguageNodes int
+
+	// Languages, when non-empty, narrows the pass to these language codes: a
+	// provider whose languages the list does not name is skipped even though
+	// the graph holds nodes for it. EnrichCheckout sets it to the languages
+	// the workspace cap admitted, so a starved language is not enriched by
+	// some other provider that happens to cover it as a side language.
+	Languages []string
 
 	// ApplyGate, when non-nil, parks every provider's graph-apply phase until
 	// the channel closes (see WithApplyGate). The warmup sets it while the
@@ -342,10 +374,26 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 				zap.Any("skipped", below))
 		}
 	}
+	// A caller-supplied language set narrows what the census found. It is an
+	// intersection rather than a replacement: the list says which languages
+	// the caller is willing to pay for, not that the graph holds them.
+	if len(opts.Languages) > 0 {
+		allowed := make(map[string]bool, len(opts.Languages))
+		for _, language := range opts.Languages {
+			allowed[language] = true
+		}
+		for language := range present {
+			if !allowed[language] {
+				delete(present, language)
+			}
+		}
+	}
 	// Presence gating needs only EVIDENCE, not survivors: when the census saw
 	// rows but the floor rejected every language, providers must still be
-	// gated off rather than falling through to their own per-pass gates.
-	gateOnPresence := len(langCounts) > 0
+	// gated off rather than falling through to their own per-pass gates. A
+	// caller-supplied language set is evidence of its own — it is a decision
+	// about what may run, and an empty graph must not turn it back off.
+	gateOnPresence := len(langCounts) > 0 || len(opts.Languages) > 0
 	if len(present) > 0 {
 		langs := make([]string, 0, len(present))
 		for l := range present {
@@ -820,6 +868,15 @@ func (m *Manager) enrichMarkerCurrent(g graph.Store, repoPrefix, provider string
 	if os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1" {
 		return false
 	}
+	// A checkout-scoped pass never skips on its own marker. Each working-tree
+	// build mints a fresh payload whose nodes carry no enrichment edges, so a
+	// marker an earlier generation of the same checkout left says nothing
+	// about this one — honouring it would declare a capability complete over a
+	// payload nothing enriched. The scoped marker is a record of what ran, not
+	// a gate.
+	if rs.CheckoutID != "" {
+		return false
+	}
 	// A full re-track re-parsed every file and dropped this repo's hover
 	// edges, so the marker's implicit invariant ("marker present + sha match
 	// ⇒ the graph carries the enrichment edges") no longer holds — re-enrich
@@ -851,7 +908,14 @@ func (m *Manager) enrichMarkerCurrent(g graph.Store, repoPrefix, provider string
 // the tree becomes clean at the same sha), or the backend does not persist
 // enrichment state.
 func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string, rs RepoEnrichState, coverage float64) {
-	if rs.SHA == "" || rs.Dirty {
+	if rs.SHA == "" {
+		return
+	}
+	// The dirty veto exists because a commit sha cannot name a tree with
+	// uncommitted edits in it. A checkout-scoped marker keys on the working
+	// tree's own fingerprint, which names exactly that tree, so the veto does
+	// not apply to it.
+	if rs.Dirty && rs.CheckoutID == "" {
 		return
 	}
 	store, ok := g.(graph.EnrichmentStateStore)
@@ -860,7 +924,7 @@ func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string,
 	}
 	if err := store.SetEnrichmentState(graph.EnrichmentState{
 		RepoPrefix:  repoPrefix,
-		Provider:    provider,
+		Provider:    enrichMarkerProvider(provider, rs.CheckoutID),
 		IndexedSHA:  rs.SHA,
 		CompletedAt: time.Now().Unix(),
 		Coverage:    coverage,
@@ -871,6 +935,34 @@ func (m *Manager) recordEnrichMarker(g graph.Store, repoPrefix, provider string,
 			zap.Error(err),
 		)
 	}
+}
+
+// checkoutMarkerSeparator joins a provider name to the checkout a marker is
+// scoped to. No provider name and no reserved key contains it, so a scoped key
+// can never be read as an unscoped one.
+const checkoutMarkerSeparator = "@"
+
+// enrichMarkerProvider spells the key an enrichment marker is stored under.
+//
+// The marker table is keyed by (repo prefix, provider), and every checkout of
+// a family shares one repo prefix — the layers compose over the primary's
+// corpus, so their nodes live in the primary's namespace. Base-corpus
+// enrichment therefore keeps the bare provider name: markers written before
+// checkouts existed stay valid, and every gate that reads them keeps reading
+// exactly what it wrote. Only a checkout-scoped pass carries the extra
+// dimension, which is what stops one worktree's completion from speaking for
+// the primary's or for a sibling worktree's.
+//
+// The generation dimension rides in the row's IndexedSHA, which for a checkout
+// pass is the working tree's fingerprint rather than a commit: one row per
+// (checkout, provider) naming the state it was enriched at, instead of one row
+// per generation growing without bound behind a checkout that is edited all
+// day.
+func enrichMarkerProvider(provider, checkoutID string) string {
+	if checkoutID == "" {
+		return provider
+	}
+	return provider + checkoutMarkerSeparator + checkoutID
 }
 
 // repoEnrichMarkerProvider is the reserved provider key under which the

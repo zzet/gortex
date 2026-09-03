@@ -243,7 +243,7 @@ eval-setup: build
 
 # Build linux/amd64 binary for container injection (requires podman/docker)
 eval-build-linux:
-	podman run --rm --platform linux/amd64 -v $(CURDIR):/src -w /src golang:1.26 \
+	podman run --rm --platform linux/amd64 -v $(CURDIR):/src -w /src golang:1.27 \
 		bash -c "apt-get update -qq && apt-get install -y -qq libtree-sitter-dev && go build -ldflags '$(LDFLAGS)' -o gortex-linux ./cmd/gortex/"
 	@echo "✓ Built gortex-linux (linux/amd64)"
 

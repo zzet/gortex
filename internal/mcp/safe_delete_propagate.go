@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -30,14 +31,14 @@ type callerPatch struct {
 
 // buildPropagationPlan walks the referencing call sites of a symbol and returns
 // the per-caller patch each one needs.
-func (s *Server) buildPropagationPlan(target *graph.Node) []callerPatch {
+func (s *Server) buildPropagationPlan(ctx context.Context, g graph.Reader, target *graph.Node) []callerPatch {
 	var plan []callerPatch
 	seen := make(map[string]bool)
-	for _, e := range s.graph.GetInEdges(target.ID) {
+	for _, e := range g.GetInEdges(target.ID) {
 		if !isReferencingEdgeKind(e.Kind) || e.Line == 0 {
 			continue
 		}
-		caller := s.graph.GetNode(e.From)
+		caller := g.GetNode(e.From)
 		if caller == nil {
 			continue
 		}
@@ -47,7 +48,7 @@ func (s *Server) buildPropagationPlan(target *graph.Node) []callerPatch {
 		}
 		seen[key] = true
 
-		abs, err := s.resolveNodePath(caller)
+		abs, err := s.resolveNodePath(ctx, caller)
 		if err != nil {
 			continue
 		}

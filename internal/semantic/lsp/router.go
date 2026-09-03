@@ -863,6 +863,66 @@ func (r *Router) Reap() []string {
 	return names
 }
 
+// The router is what the per-checkout workspace registry stops an evicted
+// workspace through. SetLSPRouter type-asserts for it, so the assertion here
+// is what keeps that wiring from going quiet if the method's shape drifts.
+var _ semantic.WorkspaceStopper = (*Router)(nil)
+
+// CloseCheckoutWorkspace stops every provider serving language at workspace
+// and reports how many it stopped. It is what the semantic layer's
+// per-checkout workspace registry calls when its own cap evicts a (language,
+// root) pair, so an evicted workspace really gives its subprocess back rather
+// than merely losing its slot in a ledger.
+//
+// A provider pinned in-use is left running: the pass holding it is reading the
+// very server the eviction would stop, and the registry never evicts a pair a
+// pass still holds either.
+func (r *Router) CloseCheckoutWorkspace(language, workspace string) int {
+	if language == "" || workspace == "" {
+		return 0
+	}
+	root := absWorkspace(workspace)
+	r.mu.Lock()
+	var victims []*routedProvider
+	for key, rp := range r.providers {
+		if key.workspace != root || rp.inUse > 0 {
+			continue
+		}
+		if !specServesLanguage(rp.spec, language) {
+			continue
+		}
+		victims = append(victims, rp)
+		delete(r.providers, key)
+	}
+	r.mu.Unlock()
+	for _, victim := range victims {
+		_ = victim.provider.Close()
+	}
+	if len(victims) > 0 {
+		names := make([]string, 0, len(victims))
+		for _, victim := range victims {
+			names = append(names, formatProviderKey(victim.spec.Name, victim.workspace))
+		}
+		r.logger.Info("LSP router stopped a checkout workspace's providers",
+			zap.String("language", language),
+			zap.Strings("names", names))
+	}
+	return len(victims)
+}
+
+// specServesLanguage reports whether spec covers one internal language code.
+func specServesLanguage(spec *ServerSpec, language string) bool {
+	if spec == nil {
+		return false
+	}
+	for _, candidate := range spec.Languages {
+		if candidate == language {
+			return true
+		}
+	}
+	return false
+}
+
 // maybeEvictLRULocked evicts least-recently-used providers until the
 // live count is within maxAlive (or no unpinned provider remains to
 // evict). Caller must hold r.mu. It loops so a SetMaxAlive that lowers

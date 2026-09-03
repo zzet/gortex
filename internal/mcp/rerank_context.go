@@ -11,8 +11,9 @@ import (
 // every session-aware data source the server holds: locality, combo,
 // frecency, feedback, and churn. Pure structural signals (BM25 rank,
 // fan-in / fan-out, MinHash, signature match, recency, community) do
-// not depend on session state and read from the graph directly via
-// the Context.Graph pointer set by the pipeline call site.
+// not depend on session state and read the graph directly through the
+// Context.Graph reader set here — the calling request's reader, so an
+// overlay-active search scores against the editor buffer.
 //
 // Returned Context is safe to reuse for the lifetime of the request
 // but should not be cached across requests — the combo boost map is
@@ -20,11 +21,13 @@ import (
 func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.Context {
 	repo, project := s.sessionLocality(ctx)
 	rctx := &rerank.Context{
-		Graph:             s.graph,
+		Graph:             s.readerFor(ctx),
 		RepoPrefix:        repo,
 		ProjectID:         project,
 		AnalysisMetricsOf: s.rerankAnalysisMetrics,
-		BatchedCentrality: s.rerankBoundedCentrality,
+		BatchedCentrality: func(seeds, candidateIDs []string) rerank.CentralityResult {
+			return s.rerankBoundedCentrality(ctx, seeds, candidateIDs)
+		},
 	}
 
 	if s.combo != nil {

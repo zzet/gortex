@@ -72,7 +72,7 @@ func (s *Server) handleReplayEpisode(ctx context.Context, req mcp.CallToolReques
 	windowDays := req.GetInt("window_days", 30)
 	limit := max(req.GetInt("limit", 25), 1)
 
-	anchorNode := s.graph.GetNode(anchor)
+	anchorNode := s.readerFor(ctx).GetNode(anchor)
 	if anchorNode == nil {
 		return mcp.NewToolResultError("anchor symbol not found: " + anchor), nil
 	}
@@ -81,12 +81,12 @@ func (s *Server) handleReplayEpisode(ctx context.Context, req mcp.CallToolReques
 	// Reuses the graph's edge index — no recursion into all-callers
 	// helpers so the implementation is self-contained and easy to
 	// reason about.
-	radius := s.walkCallers(anchor, depth)
+	radius := s.walkCallers(ctx, anchor, depth)
 	radius[anchor] = 0
 
-	timeline := s.replayTimeline(radius, windowDays, limit)
-	callers := s.replayCallers(radius, anchor, limit)
-	coverage := s.replayCoverageGaps(radius, limit)
+	timeline := s.replayTimeline(ctx, radius, windowDays, limit)
+	callers := s.replayCallers(ctx, radius, anchor, limit)
+	coverage := s.replayCoverageGaps(ctx, radius, limit)
 	memories := s.replayMemories(radius, limit)
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
@@ -108,7 +108,8 @@ func (s *Server) handleReplayEpisode(ctx context.Context, req mcp.CallToolReques
 // walkCallers performs a bounded BFS over EdgeCalls (and dispatch
 // kinds where applicable) and returns the set of caller IDs keyed
 // by traversal depth from the anchor. Depth=1 are direct callers.
-func (s *Server) walkCallers(anchor string, maxDepth int) map[string]int {
+func (s *Server) walkCallers(ctx context.Context, anchor string, maxDepth int) map[string]int {
+	g := s.readerFor(ctx)
 	radius := map[string]int{}
 	frontier := []string{anchor}
 	depth := 0
@@ -116,7 +117,7 @@ func (s *Server) walkCallers(anchor string, maxDepth int) map[string]int {
 		depth++
 		next := make([]string, 0, len(frontier)*4)
 		for _, id := range frontier {
-			for _, e := range s.graph.GetInEdges(id) {
+			for _, e := range g.GetInEdges(id) {
 				if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeExtends {
 					continue
 				}
@@ -132,7 +133,7 @@ func (s *Server) walkCallers(anchor string, maxDepth int) map[string]int {
 	return radius
 }
 
-func (s *Server) replayTimeline(radius map[string]int, windowDays, limit int) []replayTimelineRow {
+func (s *Server) replayTimeline(ctx context.Context, radius map[string]int, windowDays, limit int) []replayTimelineRow {
 	cutoff := time.Time{}
 	if windowDays > 0 {
 		cutoff = time.Now().Add(-time.Duration(windowDays) * 24 * time.Hour)
@@ -144,7 +145,7 @@ func (s *Server) replayTimeline(radius map[string]int, windowDays, limit int) []
 	for id := range radius {
 		ids = append(ids, id)
 	}
-	nodeByID := s.graph.GetNodesByIDs(ids)
+	nodeByID := s.readerFor(ctx).GetNodesByIDs(ids)
 	rows := make([]replayTimelineRow, 0, len(radius))
 	for id := range radius {
 		n := nodeByID[id]
@@ -204,7 +205,7 @@ func (s *Server) replayTimeline(radius map[string]int, windowDays, limit int) []
 	return rows
 }
 
-func (s *Server) replayCallers(radius map[string]int, anchor string, limit int) []replayCallerRow {
+func (s *Server) replayCallers(ctx context.Context, radius map[string]int, anchor string, limit int) []replayCallerRow {
 	// Batch-fetch the radius minus the anchor; same rationale as
 	// replayTimeline — per-id GetNode on a disk backend costs one
 	// round-trip per BFS node.
@@ -215,7 +216,7 @@ func (s *Server) replayCallers(radius map[string]int, anchor string, limit int) 
 		}
 		ids = append(ids, id)
 	}
-	nodeByID := s.graph.GetNodesByIDs(ids)
+	nodeByID := s.readerFor(ctx).GetNodesByIDs(ids)
 	rows := make([]replayCallerRow, 0, len(radius))
 	for id, d := range radius {
 		if id == anchor {
@@ -244,13 +245,13 @@ func (s *Server) replayCallers(radius map[string]int, anchor string, limit int) 
 	return rows
 }
 
-func (s *Server) replayCoverageGaps(radius map[string]int, limit int) []replayCoverageRow {
+func (s *Server) replayCoverageGaps(ctx context.Context, radius map[string]int, limit int) []replayCoverageRow {
 	// Batch-fetch the radius — same rationale as replayTimeline.
 	ids := make([]string, 0, len(radius))
 	for id := range radius {
 		ids = append(ids, id)
 	}
-	nodeByID := s.graph.GetNodesByIDs(ids)
+	nodeByID := s.readerFor(ctx).GetNodesByIDs(ids)
 	covRows := s.coverageByID()
 	rows := make([]replayCoverageRow, 0)
 	for id := range radius {

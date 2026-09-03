@@ -24,10 +24,14 @@ type probeRecorder struct {
 	hits  []grepSymbolHit
 	err   error
 	calls []string
+	// scopes records the location each probe was issued from, so a test can
+	// assert the daemon is told which working copy is asking.
+	scopes []string
 }
 
-func (r *probeRecorder) probe(pattern string, _ time.Duration) ([]grepSymbolHit, error) {
+func (r *probeRecorder) probe(pattern, scope string, _ time.Duration) ([]grepSymbolHit, error) {
 	r.calls = append(r.calls, pattern)
+	r.scopes = append(r.scopes, scope)
 	return r.hits, r.err
 }
 
@@ -62,6 +66,21 @@ func readDecisions(t *testing.T, path string) []hookDecision {
 		out = append(out, rec)
 	}
 	return out
+}
+
+// TestEnrichGrepProbesFromTheCallersLocation pins that the search's own
+// working directory rides on the probe. Without it the daemon answers a
+// worktree's grep from the family primary's corpus and the deny cites another
+// working copy's code.
+func TestEnrichGrepProbesFromTheCallersLocation(t *testing.T) {
+	redirectTelemetry(t)
+	rec := stubProbe(t, nil, nil)
+
+	enrichGrep(map[string]any{"pattern": "handleFoo"}, 0, "/wt/project")
+
+	if len(rec.scopes) != 1 || rec.scopes[0] != "/wt/project" {
+		t.Fatalf("probe scopes = %v, want the caller's working directory once", rec.scopes)
+	}
 }
 
 func TestEnrichGrep_SymbolHit_Denies(t *testing.T) {

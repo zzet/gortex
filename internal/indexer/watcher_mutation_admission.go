@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"time"
@@ -52,37 +53,45 @@ func mutationWorkSlots() int {
 	return n
 }
 
+var errMutationAdmissionDeferred = errors.New("mutation admission deferred")
+
 // admitMutationWork takes a slot in the watcher's cohort semaphore. The
-// returned release must be called when the work is done. admitted is
-// false when the wait timed out or the watcher is stopping, in which case
-// release is a no-op and the caller must not proceed. path names the file
-// whose patch is at stake; it is only used to give the shed warning a
-// sample worth acting on.
-func (w *Watcher) admitMutationWork(path string) (release func(), admitted bool) {
+// returned release must be called when the work is done. A timeout is a
+// deferred admission, not a terminal patch failure: the caller retains the
+// same mutation generation and rearms it through the point retry scheduler.
+func (w *Watcher) admitMutationWork(path string) (release func(), err error) {
 	if w == nil {
-		return func() {}, false
+		return func() {}, errWatcherStopped
 	}
 	slots := w.mutationSlots()
 	if slots == nil {
-		return func() {}, true
+		return func() {}, nil
 	}
-	timer := time.NewTimer(mutationAdmissionWaitTimeout)
+	waited := w.mutationAdmissionWaitDuration()
+	timer := time.NewTimer(waited)
 	defer timer.Stop()
 	select {
 	case slots <- struct{}{}:
-		return func() { <-slots }, true
+		return func() { <-slots }, nil
 	case <-w.done:
-		return func() {}, false
+		return func() {}, errWatcherStopped
 	case <-timer.C:
-		w.noteShedPatch(path)
-		return func() {}, false
+		w.noteDeferredPatch(path, waited)
+		return func() {}, errMutationAdmissionDeferred
 	}
 }
 
-// noteShedPatch records one shed patch and writes at most one warning per
-// mutationShedLogInterval. The first shed of a burst logs immediately so the
-// condition is never silent; the rest accumulate into that line's count.
-func (w *Watcher) noteShedPatch(path string) {
+func (w *Watcher) mutationAdmissionWaitDuration() time.Duration {
+	if w != nil && w.mutationAdmissionWaitFn != nil {
+		return w.mutationAdmissionWaitFn()
+	}
+	return mutationAdmissionWaitTimeout
+}
+
+// noteDeferredPatch records one deferred patch and writes at most one warning
+// per mutationShedLogInterval. The first deferral of a burst logs immediately;
+// the rest accumulate into that line's count.
+func (w *Watcher) noteDeferredPatch(path string, waited time.Duration) {
 	if w == nil || w.logger == nil {
 		return
 	}
@@ -106,14 +115,14 @@ func (w *Watcher) noteShedPatch(path string) {
 	w.shedMu.Unlock()
 
 	fields := []zap.Field{
-		zap.Int("shed", count),
-		zap.Duration("waited", mutationAdmissionWaitTimeout),
+		zap.Int("deferred", count),
+		zap.Duration("waited", waited),
 		zap.String("sample_path", sample),
 	}
 	if !first {
 		fields = append(fields, zap.Duration("window", window))
 	}
-	w.logger.Warn("watcher: mutation admission timed out; shedding patches", fields...)
+	w.logger.Warn("watcher: mutation admission timed out; deferring patch", fields...)
 }
 
 // mutationSlots returns the cohort semaphore, creating it on first use so
@@ -127,8 +136,9 @@ func (w *Watcher) mutationSlots() chan struct{} {
 
 // watcherMutationAdmission is embedded in Watcher.
 type watcherMutationAdmission struct {
-	mutationSlotsOnce sync.Once
-	mutationSlotsCh   chan struct{}
+	mutationSlotsOnce       sync.Once
+	mutationSlotsCh         chan struct{}
+	mutationAdmissionWaitFn func() time.Duration
 
 	// shed* throttle the admission-timeout warning. Guarded by shedMu
 	// because every debounce callback that gives up races here.

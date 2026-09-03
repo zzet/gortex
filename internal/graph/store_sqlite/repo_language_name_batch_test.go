@@ -152,7 +152,8 @@ func TestSQLiteFindNodesByResolverNameScopesPlanUsesExistingIndexes(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := store.writerDB.Query("EXPLAIN QUERY PLAN "+resolverNameScopeQuery, payload)
+	rows, err := store.writerDB.Query("EXPLAIN QUERY PLAN "+resolverNameScopeQuery,
+		resolverNameScopeArgs(payload, store.viewGen)...)
 	if err != nil {
 		t.Fatal(err)
 	}

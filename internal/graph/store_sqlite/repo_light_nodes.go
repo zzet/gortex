@@ -17,7 +17,8 @@ WITH requested(repo_prefix) AS (
 SELECT n.id, n.kind, n.name, n.file_path, n.language, n.repo_prefix
 FROM requested AS r
 JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
-ORDER BY n.id`, reposJSON)
+WHERE n.view_gen = ?
+ORDER BY n.id`, reposJSON, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil

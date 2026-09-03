@@ -107,8 +107,10 @@ func (s *Server) groupIDsByRepo(ids []string) (map[string][]string, []string) {
 // evaluateGuards evaluates each ID against the guard rules of its OWN
 // repo. Evaluating the union of every repo's rules over every ID would let
 // a rule declared in one repo fire against another repo's symbols, so the
-// IDs are grouped by repo first.
-func (s *Server) evaluateGuards(ids []string) []analysis.GuardViolation {
+// IDs are grouped by repo first. Rule evaluation only reads, so it runs on
+// the caller's reader and an overlay-active request is gated on the buffers
+// it pushed.
+func (s *Server) evaluateGuards(r graph.Reader, ids []string) []analysis.GuardViolation {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -119,7 +121,7 @@ func (s *Server) evaluateGuards(ids []string) []analysis.GuardViolation {
 		if len(rules) == 0 {
 			continue
 		}
-		out = append(out, analysis.EvaluateGuards(s.graph, rules, groups[prefix])...)
+		out = append(out, analysis.EvaluateGuards(r, rules, groups[prefix])...)
 	}
 	return out
 }
@@ -169,6 +171,6 @@ type guardsFamily struct{ srv *Server }
 
 func (f guardsFamily) Name() string { return "guards" }
 
-func (f guardsFamily) Evaluate(_ graph.Store, changedSet []string) []analysis.GuardViolation {
-	return f.srv.evaluateGuards(changedSet)
+func (f guardsFamily) Evaluate(g graph.Reader, changedSet []string) []analysis.GuardViolation {
+	return f.srv.evaluateGuards(g, changedSet)
 }

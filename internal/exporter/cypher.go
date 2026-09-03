@@ -25,7 +25,7 @@ import (
 //
 //	CREATE INDEX ON :GortexNode(id);   // Memgraph
 //	CREATE INDEX FOR (n:GortexNode) ON (n.id);   // Neo4j 5.x
-func WriteCypher(w io.Writer, g graph.Store, opts Options) (Stats, error) {
+func WriteCypher(w io.Writer, g graph.Reader, opts Options) (Stats, error) {
 	cw := &countingWriter{w: w}
 	nodes, edges, _ := snapshot(g, opts)
 

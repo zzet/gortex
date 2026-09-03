@@ -106,7 +106,9 @@ type BlameSummary struct {
 
 // Deps bundles the runtime dependencies injected by the MCP/CLI layer.
 type Deps struct {
-	Graph   graph.Store
+	// Graph is read-only here, so callers may hand over a request-scoped
+	// reader (an overlay view) instead of the base store.
+	Graph   graph.Reader
 	History HistoryProvider
 	Blame   BlameRunner
 }
@@ -190,7 +192,7 @@ func Generate(deps Deps, opts Options) (*Bundle, error) {
 
 // walkNodes does a single pass over symbol nodes and emits the
 // ownership and stale-code tables in a single pass.
-func walkNodes(g graph.Store, opts Options, now time.Time) ([]OwnershipRow, []StaleCodeRow) {
+func walkNodes(g graph.Reader, opts Options, now time.Time) ([]OwnershipRow, []StaleCodeRow) {
 	type ownerStats struct {
 		row     OwnershipRow
 		fileSet map[string]struct{}

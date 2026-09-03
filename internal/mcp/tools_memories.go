@@ -173,7 +173,7 @@ func (s *Server) handleStoreMemory(ctx context.Context, req mcp.CallToolRequest)
 			patch.SupersededBy = &supersededBy
 		}
 		if !noAutolink && body != "" {
-			patch.AddLinks = autoLinkBody(body, s.graph, sessionWorkspaceIDOrEmpty(s, ctx), defaultAutoLinkOptions())
+			patch.AddLinks = autoLinkBody(body, s.readerFor(ctx), sessionWorkspaceIDOrEmpty(s, ctx), defaultAutoLinkOptions())
 		}
 		updated, err := store.Update(id, patch)
 		if err != nil {
@@ -201,8 +201,8 @@ func (s *Server) handleStoreMemory(ctx context.Context, req mcp.CallToolRequest)
 	workspaceID, projectID, _ := s.sessionScope(ctx)
 	repoPrefix, _ := s.sessionLocality(ctx)
 
-	if len(symbolIDs) > 0 && s.graph != nil {
-		if node := s.graph.GetNode(symbolIDs[0]); node != nil {
+	if reader := s.readerFor(ctx); len(symbolIDs) > 0 && reader != nil {
+		if node := reader.GetNode(symbolIDs[0]); node != nil {
 			if workspaceID == "" {
 				workspaceID = node.WorkspaceID
 			}
@@ -217,7 +217,7 @@ func (s *Server) handleStoreMemory(ctx context.Context, req mcp.CallToolRequest)
 
 	var autoLinks []string
 	if !noAutolink && body != "" {
-		autoLinks = autoLinkBody(body, s.graph, workspaceID, defaultAutoLinkOptions())
+		autoLinks = autoLinkBody(body, s.readerFor(ctx), workspaceID, defaultAutoLinkOptions())
 	}
 
 	entry := persistence.MemoryEntry{
@@ -367,11 +367,12 @@ func (s *Server) handleSurfaceMemories(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 
+	reader := s.readerFor(ctx)
 	res := store.Surface(opts, func(id string) *graph.Node {
-		if s.graph == nil {
+		if reader == nil {
 			return nil
 		}
-		return s.graph.GetNode(id)
+		return reader.GetNode(id)
 	})
 	return s.respondJSONOrTOON(ctx, req, res)
 }

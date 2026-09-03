@@ -15,7 +15,7 @@ import (
 // All Gortex node properties are projected to GraphML <data> attributes.
 // Free-form Meta is JSON-encoded into a single `meta_json` attribute so no
 // information is lost — viewers that don't care about it ignore it.
-func WriteGraphML(w io.Writer, g graph.Store, opts Options) (Stats, error) {
+func WriteGraphML(w io.Writer, g graph.Reader, opts Options) (Stats, error) {
 	cw := &countingWriter{w: w}
 	nodes, edges, _ := snapshot(g, opts)
 

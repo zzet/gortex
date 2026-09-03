@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // stubDaemonServer is a minimal in-process daemon that speaks just enough of
@@ -32,6 +33,14 @@ type stubDaemonServer struct {
 	lastMCPHandshake daemon.Handshake
 	mcpResult        json.RawMessage // raw result payload echoed in the content block
 	mcpError         *stubRPCError   // when set, the MCP reply is a JSON-RPC error
+	// checkoutRoots are the roots file_coverage answers for with a checkout
+	// in its view block — the registered working copies of a tracked family.
+	checkoutRoots []string
+	// coverageProbes records every path file_coverage was asked about.
+	coverageProbes []string
+	// coverageBusy makes file_coverage answer the way a daemon holding its
+	// controller mutex does: it could not finish in time.
+	coverageBusy bool
 }
 
 type stubRPCError struct {
@@ -117,17 +126,77 @@ func (s *stubDaemonServer) serveControl(conn net.Conn, reader *bufio.Reader) {
 		if err := json.Unmarshal(line, &req); err != nil {
 			return
 		}
-		if req.Kind != daemon.ControlStatus {
+		switch req.Kind {
+		case daemon.ControlStatus:
+			st := daemon.StatusResponse{Version: "stub", Ready: true}
+			for _, p := range s.trackedRepos {
+				st.TrackedRepos = append(st.TrackedRepos, daemon.TrackedRepoStatus{Path: p})
+			}
+			raw, _ := json.Marshal(st)
+			_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: true, Result: raw})
+		case daemon.ControlFileCoverage:
+			s.mu.Lock()
+			busy := s.coverageBusy
+			s.mu.Unlock()
+			if busy {
+				_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: false, ErrorCode: daemon.ErrTimeout})
+				continue
+			}
+			raw, _ := json.Marshal(s.fileCoverage(req.Params))
+			_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: true, Result: raw})
+		default:
 			_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: false, ErrorCode: "unsupported"})
+		}
+	}
+}
+
+// fileCoverage answers the view half of ControlFileCoverage: a path inside a
+// registered checkout gets a view block naming it. The symbol counts stay
+// zero — this stub serves the routing question, which is the only half the
+// CLI pre-flight reads.
+func (s *stubDaemonServer) fileCoverage(params json.RawMessage) daemon.FileCoverageResult {
+	var p daemon.FileCoverageParams
+	_ = json.Unmarshal(params, &p)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.coverageProbes = append(s.coverageProbes, p.Path)
+	for _, root := range s.checkoutRoots {
+		if !pathkey.HasPathPrefix(p.Path, root) {
 			continue
 		}
-		st := daemon.StatusResponse{Version: "stub", Ready: true}
-		for _, p := range s.trackedRepos {
-			st.TrackedRepos = append(st.TrackedRepos, daemon.TrackedRepoStatus{Path: p})
-		}
-		raw, _ := json.Marshal(st)
-		_ = daemon.WriteJSONLine(conn, daemon.ControlResponse{OK: true, Result: raw})
+		return daemon.FileCoverageResult{View: &daemon.ProbeView{
+			Kind:       "worktree",
+			CheckoutID: "chk-" + filepath.Base(root),
+			RepoPrefix: "stub",
+			Exact:      true,
+		}}
 	}
+	return daemon.FileCoverageResult{}
+}
+
+// serveCheckouts declares the registered checkout roots before any client
+// dials, so the serving goroutine reads them under the same lock it answers
+// with.
+func (s *stubDaemonServer) serveCheckouts(roots ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checkoutRoots = roots
+}
+
+// serveCoverageBusy makes every subsequent file_coverage probe answer
+// "could not finish in time", under the same lock the serving goroutine
+// reads it with.
+func (s *stubDaemonServer) serveCoverageBusy() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.coverageBusy = true
+}
+
+// seenCoverageProbes returns every path file_coverage was asked about.
+func (s *stubDaemonServer) seenCoverageProbes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.coverageProbes...)
 }
 
 func (s *stubDaemonServer) serveMCP(conn net.Conn, reader *bufio.Reader) {

@@ -396,15 +396,25 @@ func fileSummaryViaDaemon(cwd, filePath string) (*hookFileSummary, bool) {
 // nodes is the definition-symbol list; a not-indexed file comes back as a
 // tool error / guidance text, which fails the parse → ok=false.
 func parseFileSummary(resp []byte) (nodes []summaryNode, dependents int, ok bool) {
-	text := parseToolCallText(resp)
-	if text == "" {
+	var rpc struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &rpc); err != nil {
+		return nil, 0, false
+	}
+	if rpc.Result.IsError || len(rpc.Result.Content) == 0 {
 		return nil, 0, false
 	}
 	var summary struct {
 		Nodes      []summaryNode     `json:"nodes"`
 		Dependents []json.RawMessage `json:"dependents"`
 	}
-	if err := json.Unmarshal([]byte(text), &summary); err != nil {
+	if err := json.Unmarshal([]byte(rpc.Result.Content[0].Text), &summary); err != nil {
 		return nil, 0, false
 	}
 	if len(summary.Nodes) == 0 {

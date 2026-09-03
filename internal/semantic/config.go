@@ -1,6 +1,9 @@
 package semantic
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // Config holds configuration for the semantic enrichment layer.
 type Config struct {
@@ -30,6 +33,23 @@ type Config struct {
 	// concurrent-request cap for spawned LSP servers. Zero keeps each
 	// spec's own default; GORTEX_LSP_MAX_PARALLEL wins over both.
 	LSPMaxParallel int `mapstructure:"lsp_max_parallel" yaml:"lsp_max_parallel,omitempty"`
+	// CheckoutLSP is the per-checkout language-server enrichment mode: ""
+	// (the default) and "on" run it, "off" switches it off. It gates the
+	// enrichment stage a routed automatic checkout's working-tree build runs
+	// against its own root — a separate decision from EagerLSP, which is about
+	// the synchronous pass over a tracked repository's base corpus. Default on
+	// because the cap, not the switch, is what bounds the cost: a checkout
+	// whose languages the cap cannot admit skips the stage on its own.
+	CheckoutLSP string `mapstructure:"checkout_lsp" yaml:"checkout_lsp,omitempty"`
+	// CheckoutLSPMaxWorkspaces budgets the language servers (language,
+	// checkout root) pairs may hold at once, across every checkout of every
+	// family. It counts slots rather than pairs: an ordinary server spends
+	// one and a gigabytes-resident one spends several
+	// (lsp.ServerSpec.CheckoutWorkspaceWeight), so raising this raises the
+	// weighted budget. Zero takes defaultCheckoutWorkspaceCap. Set CheckoutLSP
+	// to "off" rather than this to zero to switch the stage off — an unbounded
+	// budget is what this knob exists to prevent.
+	CheckoutLSPMaxWorkspaces int `mapstructure:"checkout_lsp_max_workspaces" yaml:"checkout_lsp_max_workspaces,omitempty"`
 	// EagerLSP runs the subprocess LSP servers during the synchronous
 	// enrichment pass. Default false: LSP is the slowest part of a cold index
 	// (a full gopls/tsserver/rust-analyzer/pyright sweep can run for minutes to
@@ -40,6 +60,21 @@ type Config struct {
 	// a server on demand. Set true (or GORTEX_LSP_EAGER=1) to restore the
 	// pre-change eager behaviour.
 	EagerLSP bool `mapstructure:"eager_lsp" yaml:"eager_lsp,omitempty"`
+}
+
+// checkoutLSPEnabled resolves the CheckoutLSP tri-state. Anything but an
+// explicit "off" runs the stage, so a config written before the knob existed
+// keeps the shipped default.
+func (c Config) checkoutLSPEnabled() bool {
+	return !strings.EqualFold(strings.TrimSpace(c.CheckoutLSP), "off")
+}
+
+// checkoutWorkspaceCap resolves the global per-checkout workspace cap.
+func (c Config) checkoutWorkspaceCap() int {
+	if c.CheckoutLSPMaxWorkspaces > 0 {
+		return c.CheckoutLSPMaxWorkspaces
+	}
+	return defaultCheckoutWorkspaceCap
 }
 
 // ProviderConfig holds configuration for a single semantic provider.

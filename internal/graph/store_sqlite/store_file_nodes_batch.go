@@ -34,11 +34,12 @@ func (s *Store) GetFileNodesByPaths(filePaths []string) map[string][]*graph.Node
 		end := minInt(start+lookupChunkSize, len(paths))
 		chunk := paths[start:end]
 		placeholders := strings.Repeat(",?", len(chunk))[1:]
-		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE file_path IN (` + placeholders + `)`
-		args := make([]any, len(chunk))
-		for i, path := range chunk {
-			args[i] = path
+		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE file_path IN (` + placeholders + `) AND view_gen = ?`
+		args := make([]any, 0, len(chunk)+1)
+		for _, path := range chunk {
+			args = append(args, path)
 		}
+		args = append(args, s.viewGen)
 		for _, node := range s.queryNodesSQL(query, args...) {
 			if node != nil {
 				out[node.FilePath] = append(out[node.FilePath], node)

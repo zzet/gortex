@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -22,7 +23,7 @@ func depGraph() *graph.Graph {
 
 func TestFileDependentsHeader(t *testing.T) {
 	s := &Server{graph: depGraph()}
-	deps := s.fileDependents("a.go")
+	deps := s.fileDependents(context.Background(), "a.go")
 	require.Equal(t, []string{"b.go"}, deps)
 
 	header := fileDependentsNote(deps)
@@ -30,7 +31,7 @@ func TestFileDependentsHeader(t *testing.T) {
 		t.Errorf("header = %q", header)
 	}
 	// No importers → empty header.
-	require.Empty(t, s.fileDependents("c.go"))
+	require.Empty(t, s.fileDependents(context.Background(), "c.go"))
 	require.Equal(t, "", fileDependentsNote(nil))
 }
 
@@ -39,7 +40,7 @@ func TestFileDependentsHeaderImportsOnly(t *testing.T) {
 	// c.go references a.go via a non-import edge — must NOT count as a dependent.
 	g.AddEdge(&graph.Edge{From: "c.go", To: "a.go", Kind: graph.EdgeReferences})
 	s := &Server{graph: g}
-	deps := s.fileDependents("a.go")
+	deps := s.fileDependents(context.Background(), "a.go")
 	require.Equal(t, []string{"b.go"}, deps, "only import edges should count")
 }
 

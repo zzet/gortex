@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -35,7 +36,7 @@ func TestCoverageKnownFromTestStamp(t *testing.T) {
 	))
 	s := coverageProbeServer(g)
 
-	require.True(t, s.coverageKnownForDiff("", []string{"src/production.ts", "src/production.test.ts"}),
+	require.True(t, s.coverageKnownForDiff(context.Background(), "", []string{"src/production.ts", "src/production.test.ts"}),
 		"a stamped vitest probe attests coverage for the changed TypeScript")
 }
 
@@ -47,7 +48,7 @@ func TestCoverageKnownAnnotationDrivenTest(t *testing.T) {
 	g.AddNode(testSymbol("src/lib.rs::parse", "src/lib.rs", nil))
 	g.AddNode(testSymbol("src/lib.rs::parses_empty", "src/lib.rs", map[string]any{"is_test": true}))
 
-	require.True(t, coverageProbeServer(g).coverageKnownForDiff("", []string{"src/lib.rs"}))
+	require.True(t, coverageProbeServer(g).coverageKnownForDiff(context.Background(), "", []string{"src/lib.rs"}))
 }
 
 // TestCoverageUnknownWhenIndexExcludesTests pins the behaviour the
@@ -57,7 +58,7 @@ func TestCoverageUnknownWhenIndexExcludesTests(t *testing.T) {
 	g := graph.New()
 	g.AddNode(testSymbol("pkg/foo.go::Bar", "pkg/foo.go", nil))
 
-	require.False(t, coverageProbeServer(g).coverageKnownForDiff("", []string{"pkg/foo.go"}))
+	require.False(t, coverageProbeServer(g).coverageKnownForDiff(context.Background(), "", []string{"pkg/foo.go"}))
 }
 
 // TestCoverageKnownIsPerLanguage pins that attesting one language does not
@@ -70,8 +71,8 @@ func TestCoverageKnownIsPerLanguage(t *testing.T) {
 	g.AddNode(testSymbol("src/app.ts::render", "src/app.ts", nil))
 	s := coverageProbeServer(g)
 
-	require.True(t, s.coverageKnownForDiff("", []string{"pkg/foo.go"}))
-	require.False(t, s.coverageKnownForDiff("", []string{"pkg/foo.go", "src/app.ts"}),
+	require.True(t, s.coverageKnownForDiff(context.Background(), "", []string{"pkg/foo.go"}))
+	require.False(t, s.coverageKnownForDiff(context.Background(), "", []string{"pkg/foo.go", "src/app.ts"}),
 		"Go tests say nothing about whether TypeScript tests are indexed")
 }
 
@@ -83,7 +84,7 @@ func TestCoverageKnownWindowsSeparators(t *testing.T) {
 	g.AddNode(testSymbol(`src\production.ts::resolve`, `src\production.ts`, nil))
 	g.AddNode(testSymbol(`src\__tests__\production.ts::probe`, `src\__tests__\production.ts`, nil))
 
-	require.True(t, coverageProbeServer(g).coverageKnownForDiff("", []string{"src/production.ts"}))
+	require.True(t, coverageProbeServer(g).coverageKnownForDiff(context.Background(), "", []string{"src/production.ts"}))
 }
 
 // TestTestIndexProbeResetsOnReindex pins the staleness fix: the probe is
@@ -94,13 +95,13 @@ func TestTestIndexProbeResetsOnReindex(t *testing.T) {
 	g.AddNode(testSymbol("pkg/foo.go::Bar", "pkg/foo.go", nil))
 	s := coverageProbeServer(g)
 
-	require.False(t, s.coverageKnownForDiff("", []string{"pkg/foo.go"}), "mid-warmup: no test symbols yet")
+	require.False(t, s.coverageKnownForDiff(context.Background(), "", []string{"pkg/foo.go"}), "mid-warmup: no test symbols yet")
 
 	g.AddNode(testSymbol("pkg/foo_test.go::TestBar", "pkg/foo_test.go", nil))
-	require.False(t, s.coverageKnownForDiff("", []string{"pkg/foo.go"}), "still serving the cached answer")
+	require.False(t, s.coverageKnownForDiff(context.Background(), "", []string{"pkg/foo.go"}), "still serving the cached answer")
 
 	s.resetTestIndexProbe()
-	require.True(t, s.coverageKnownForDiff("", []string{"pkg/foo.go"}),
+	require.True(t, s.coverageKnownForDiff(context.Background(), "", []string{"pkg/foo.go"}),
 		"the reset must let the next review see the test symbols the reindex landed")
 }
 
@@ -110,5 +111,5 @@ func TestCoverageKnownIgnoresNonCodeChanges(t *testing.T) {
 	g := graph.New()
 	g.AddNode(testSymbol("pkg/foo_test.go::TestBar", "pkg/foo_test.go", nil))
 
-	require.False(t, coverageProbeServer(g).coverageKnownForDiff("", []string{"README.md", "docs/guide.md"}))
+	require.False(t, coverageProbeServer(g).coverageKnownForDiff(context.Background(), "", []string{"README.md", "docs/guide.md"}))
 }

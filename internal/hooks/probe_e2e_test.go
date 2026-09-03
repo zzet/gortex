@@ -101,7 +101,7 @@ func TestProbeViaDaemon_Hit_E2E(t *testing.T) {
 			{Name: "handleFoo", Kind: "function", FilePath: "x.go", Line: 7},
 		},
 	})
-	hits, err := probeViaDaemon("handleFoo", 2*time.Second)
+	hits, err := probeViaDaemon("handleFoo", "", 2*time.Second)
 	if err != nil {
 		t.Fatalf("probe error: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestProbeViaDaemon_NoDaemon_ReturnsUnreachable(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(dir, "missing"))
 
-	_, err = probeViaDaemon("handleFoo", 500*time.Millisecond)
+	_, err = probeViaDaemon("handleFoo", "", 500*time.Millisecond)
 	if err != errDaemonUnreachable {
 		t.Errorf("expected errDaemonUnreachable, got %v", err)
 	}

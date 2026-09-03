@@ -41,7 +41,8 @@ func TestIndexSettled(t *testing.T) {
 	}{
 		{"absent", daemon.StatusResponse{Ready: true}, -1, false},
 		{"not ready", statusWithRepo(abs, 100, false), 100, false},
-		{"zero nodes", statusWithRepo(abs, 0, true), 0, false},
+		{"zero nodes first reading", statusWithRepo(abs, 0, true), -1, false},
+		{"zero nodes stable", statusWithRepo(abs, 0, true), 0, true},
 		{"count still moving", statusWithRepo(abs, 200, true), 100, false},
 		{"stable and ready", statusWithRepo(abs, 200, true), 200, true},
 	}
@@ -79,6 +80,22 @@ func TestWaitForRepoIndexed_Settles(t *testing.T) {
 	var buf bytes.Buffer
 	if err := waitForRepoIndexed(&buf, abs, time.Second); err != nil {
 		t.Fatalf("waitForRepoIndexed: %v", err)
+	}
+}
+
+func TestWaitForRepoIndexed_EmptyRepoSettles(t *testing.T) {
+	abs := t.TempDir()
+	origFn, origInterval := trackStatusFn, trackPollInterval
+	t.Cleanup(func() { trackStatusFn, trackPollInterval = origFn, origInterval })
+	trackPollInterval = time.Millisecond
+
+	trackStatusFn = func() (daemon.StatusResponse, error) {
+		return statusWithRepo(abs, 0, true), nil
+	}
+
+	var buf bytes.Buffer
+	if err := waitForRepoIndexed(&buf, abs, time.Second); err != nil {
+		t.Fatalf("empty repository should settle: %v", err)
 	}
 }
 

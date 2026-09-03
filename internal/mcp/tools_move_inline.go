@@ -95,11 +95,11 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError(fmt.Sprintf("unsupported symbol kind for move: %s", node.Kind)), nil
 	}
 
-	srcAbs, err := s.resolveNodePath(node)
+	srcAbs, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	tgtAbs, tgtRel, err := s.resolveFilePath(targetFileArg)
+	tgtAbs, tgtRel, err := s.resolveFilePath(ctx, targetFileArg)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -235,7 +235,7 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		if !isGoSourcePath(fromNode.FilePath) {
 			continue
 		}
-		abs, rerr := s.resolveNodePath(fromNode)
+		abs, rerr := s.resolveNodePath(ctx, fromNode)
 		if rerr != nil {
 			continue
 		}
@@ -1076,7 +1076,7 @@ func (s *Server) handleInlineSymbol(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(fmt.Sprintf("inline_symbol only supports functions and methods (got %s)", node.Kind)), nil
 	}
 
-	calleeAbs, err := s.resolveNodePath(node)
+	calleeAbs, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -1123,7 +1123,7 @@ func (s *Server) handleInlineSymbol(ctx context.Context, req mcp.CallToolRequest
 		if !isGoSourcePath(fromNode.FilePath) {
 			continue
 		}
-		abs, rerr := s.resolveNodePath(fromNode)
+		abs, rerr := s.resolveNodePath(ctx, fromNode)
 		if rerr != nil {
 			continue
 		}

@@ -34,7 +34,7 @@ func (s *Server) unindexedRenameRecovery(ctx context.Context, id, newName string
 		return nil
 	}
 
-	absPath, relPath, err := s.resolveFilePath(filePart)
+	absPath, relPath, err := s.resolveFilePath(ctx, filePart)
 	if err != nil {
 		return nil
 	}
@@ -338,7 +338,7 @@ type renameFileWrite struct {
 // caller commits any file, so a rename either lands completely or not at all.
 // A half-applied rename is worse than a refused one: it leaves the tree
 // uncompilable with no record of how far it got.
-func (s *Server) planRenameWrites(edits []renameEdit, allowParseErrors bool) ([]*renameFileWrite, error) {
+func (s *Server) planRenameWrites(ctx context.Context, edits []renameEdit, allowParseErrors bool) ([]*renameFileWrite, error) {
 	byFile := make(map[string][]renameEdit)
 	for _, e := range edits {
 		byFile[e.File] = append(byFile[e.File], e)
@@ -351,7 +351,7 @@ func (s *Server) planRenameWrites(edits []renameEdit, allowParseErrors bool) ([]
 
 	writes := make([]*renameFileWrite, 0, len(files))
 	for _, relPath := range files {
-		absPath, err := s.resolveGraphPath(relPath)
+		absPath, err := s.resolveGraphPath(ctx, relPath)
 		if err != nil {
 			return nil, fmt.Errorf("could not resolve %s: %w", relPath, err)
 		}

@@ -172,6 +172,17 @@ const (
 	// ControlEnrichCochange dispatches to Controller.EnrichCochange —
 	// co-change edge mining against the daemon's in-process graph.
 	ControlEnrichCochange = "enrich_cochange"
+	// ControlFileCoverage answers whether one file on disk is covered by the
+	// graph the caller's path actually reads through, and how many definition
+	// symbols that graph holds for it. It is the coverage half of the hook
+	// front door — the deny decision — where ControlSearchSymbols is the
+	// evidence half.
+	//
+	// It exists on the control surface rather than on the tool surface
+	// because the caller is a PreToolUse hook on a sub-second budget that
+	// must not set up an MCP session, and because only the daemon can turn a
+	// worktree path into the composed view that serves it.
+	ControlFileCoverage = "file_coverage"
 )
 
 // DefaultControlTimeout bounds the control kinds that are supposed to answer
@@ -240,6 +251,11 @@ type TrackParams struct {
 // UntrackParams is the payload for ControlUntrack.
 type UntrackParams struct {
 	PathOrPrefix string `json:"path_or_prefix"`
+	// Confirm runs a plan that removes rows. Without it such a plan is
+	// previewed and nothing is written, which is what keeps a client that
+	// predates the plan-shaped untrack — every older CLI binary — from
+	// escalating a request to drop one checkout into a family teardown.
+	Confirm bool `json:"confirm,omitempty"`
 }
 
 // ProbeResponse is the payload returned under Result on a successful
@@ -308,6 +324,23 @@ type StatusResponse struct {
 	// rendering an unasked zero as a real one is the same class of mistake as
 	// reading a timed-out status as "nothing is tracked".
 	CountsUnknown bool `json:"counts_unknown,omitempty"`
+	// AggregateBusy marks a response whose repo table, workspace rollup and
+	// search attribution did not come from this pass: the controller mutex
+	// was held by a long-running track / reload / enrichment for the whole
+	// slice of the budget the aggregate was allowed, so what is reported is
+	// the last pass that did hold it. Everything else — readiness, runtime,
+	// the view census — is live.
+	//
+	// A late-but-marked answer beats a timeout: `daemon status` is how a
+	// user finds out that a track is what the daemon is busy with, so it is
+	// the one call that must survive one. Old clients ignore the field and
+	// see the response they always saw.
+	AggregateBusy bool `json:"aggregate_busy,omitempty"`
+	// AggregateCachedUnix is when the served aggregate was computed. Zero
+	// alongside AggregateBusy means no pass has ever completed one, so the
+	// repo table is empty because it is unknown — not because nothing is
+	// tracked.
+	AggregateCachedUnix int64 `json:"aggregate_cached_unix,omitempty"`
 	// PProfAddr is set when the daemon has opened an HTTP pprof
 	// listener (via the GORTEX_DAEMON_PPROF_ADDR env var). Empty
 	// string means pprof is not enabled on this daemon.
@@ -365,6 +398,13 @@ type StatusResponse struct {
 	// every alive (spec, workspace) subprocess. Empty when no LSP
 	// router is wired (`semantic.enabled: false` in `.gortex.yaml`).
 	LSPRouter *LSPRouterStatus `json:"lsp_router,omitempty"`
+
+	// Views is the checkout-view lifecycle census: how many families,
+	// checkouts, generations, leases and ref views exist and what state
+	// they are in. Nil on a daemon with no view catalog, and on one whose
+	// catalog could not be read — a status answer is never failed over a
+	// block that is a report rather than a fact the caller asked for.
+	Views *ViewsStatus `json:"views,omitempty"`
 
 	// BinaryStale is true when the file at the daemon's os.Executable()
 	// path no longer matches the image the daemon is running (size or
@@ -480,6 +520,37 @@ type TrigramCacheStats struct {
 	Evictions int64 `json:"evictions,omitempty"`
 }
 
+// ViewsStatus is the checkout-view lifecycle census in `daemon status`.
+//
+// It carries counts and states, never identities: the per-worktree picture —
+// which checkout, which route, which generation — is what `gortex checkouts`
+// renders, and duplicating it here would make a status poll grow with the
+// number of worktrees a user keeps. Read the levels here, then go there for
+// the one that looks wrong.
+type ViewsStatus struct {
+	// Families is how many checkout families the catalog holds.
+	Families int `json:"families"`
+	// Checkouts counts working copies by lifecycle state, so a checkout in
+	// an availability or removal grace window is visible as a level rather
+	// than only as a log line.
+	Checkouts map[string]int `json:"checkouts,omitempty"`
+	// Coordinators is how many checkout build loops this daemon runs.
+	Coordinators int `json:"coordinators"`
+	// Generations counts payload generations by state.
+	Generations map[string]int `json:"generations,omitempty"`
+	// Leases is how many generations live views currently pin. A generation
+	// cannot retire while it is leased, so this is the level to read when
+	// retiring generations are not going away.
+	Leases int `json:"leases"`
+	// RefViews counts named views of committed state by state.
+	RefViews map[string]int `json:"ref_views,omitempty"`
+	// Counters is the view-lifecycle metric registry flattened to series key
+	// and value, zero-valued series omitted. Every label in a key comes from
+	// a fixed vocabulary, so the map's size is a property of the build rather
+	// than of the workload.
+	Counters map[string]int64 `json:"counters,omitempty"`
+}
+
 // SearchBackendStats identifies which search backend is currently
 // serving queries, so users can read the `search_b` column in the
 // repo breakdown with the right mental model. The store-native FTS
@@ -512,6 +583,13 @@ type SearchSymbolsParams struct {
 	Query string `json:"query"`
 	Limit int    `json:"limit,omitempty"`
 	Repo  string `json:"repo,omitempty"`
+	// Path is the file or directory the probe is about. It is what lets the
+	// daemon answer out of the graph that path actually reads through — a
+	// worktree served by the family's automatic lane reads a composed view,
+	// not the primary's corpus. Empty means "answer from the base corpus",
+	// which is what every client that predates routed views sends and what
+	// it still gets, field for field.
+	Path string `json:"path,omitempty"`
 }
 
 // SymbolHit is one entry in SearchSymbolsResult.Hits.
@@ -526,6 +604,71 @@ type SymbolHit struct {
 // successful ControlSearchSymbols call.
 type SearchSymbolsResult struct {
 	Hits []SymbolHit `json:"hits"`
+	// View names the graph that answered. It is present only when the
+	// request carried a Path, so an older client's response keeps the shape
+	// it has always had.
+	View *ProbeView `json:"view,omitempty"`
+}
+
+// Probe view kinds. They name where a path-scoped answer came from, not what
+// the caller asked for — a probe never names a view.
+const (
+	// ProbeViewBase is the indexed corpus: the answer for a dedicated
+	// checkout, for the family primary, and for any path no checkout owns.
+	ProbeViewBase = "base"
+	// ProbeViewWorktree is an automatic checkout's composed view — the
+	// primary's corpus with that working copy's routed generations on top.
+	ProbeViewWorktree = "worktree"
+	// ProbeViewUnrouted is a registered automatic checkout with no composed
+	// view yet. Nothing can answer for it truthfully, so nothing does.
+	ProbeViewUnrouted = "unrouted"
+)
+
+// Probe fallback reasons. Kept to a short stable vocabulary so a caller can
+// log or branch on them without parsing prose.
+const (
+	// FallbackViewBuilding means the checkout's route does not name both
+	// generations yet.
+	FallbackViewBuilding = "view_building"
+	// FallbackCheckoutInaccessible means the catalog could not be read, so
+	// which view serves the path is unknown.
+	FallbackCheckoutInaccessible = "checkout_inaccessible"
+)
+
+// ProbeView is what a path-scoped probe answered from.
+//
+// Exact is the honesty bit: false says the answer came from somewhere other
+// than the path's own view, and FallbackReason says why. A consumer must
+// never present a fallback answer as if the path's own graph produced it.
+type ProbeView struct {
+	Kind       string `json:"kind"`
+	CheckoutID string `json:"checkout_id,omitempty"`
+	RepoPrefix string `json:"repo_prefix,omitempty"`
+	Exact      bool   `json:"exact"`
+	// FallbackReason is set exactly when Exact is false.
+	FallbackReason string `json:"fallback_reason,omitempty"`
+}
+
+// FileCoverageParams is the payload for ControlFileCoverage. Path is the file
+// being probed; a relative path is resolved against the daemon's own working
+// directory, so callers send an absolute one.
+type FileCoverageParams struct {
+	Path string `json:"path"`
+}
+
+// FileCoverageResult is the payload returned under Result for a successful
+// ControlFileCoverage call.
+//
+// Covered reports that the graph serving Path holds definition symbols for
+// it — the fact a hook turns into a deny. Symbols is how many, which is the
+// evidence the deny cites. Both are false/zero for a path whose view is not
+// built yet: an unbuilt view knows nothing about the file, and reporting the
+// primary's answer instead would deny a read on another working copy's
+// content.
+type FileCoverageResult struct {
+	Covered bool       `json:"covered"`
+	Symbols int        `json:"symbols"`
+	View    *ProbeView `json:"view,omitempty"`
 }
 
 // EnrichChurnParams is the payload for ControlEnrichChurn.

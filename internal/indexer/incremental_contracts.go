@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -132,7 +131,7 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 	for _, absPath := range files {
 		relPath := idx.graphRelKey(absPath)
 		graphPath := idx.prefixPath(relPath)
-		src, readVersion, err := readFileWithVersion(absPath)
+		src, readVersion, err := idx.readFileWithVersion(absPath)
 		if err != nil || !readVersion.valid {
 			failed = append(failed, absPath)
 			continue
@@ -382,7 +381,7 @@ func (idx *Indexer) expandIncrementalContractFrontier(files []string, reg *contr
 			relPath = strings.TrimPrefix(relPath, prefix)
 		}
 		absPath := filepath.Join(idx.rootPath, filepath.FromSlash(relPath))
-		src, err := os.ReadFile(absPath)
+		src, err := idx.readFileContent(absPath)
 		if err != nil {
 			continue
 		}
@@ -535,19 +534,19 @@ func (idx *Indexer) extractIncrementalManifestContracts(
 		relPath = strings.TrimPrefix(relPath, prefix)
 	}
 	absPath := filepath.Join(idx.rootPath, filepath.FromSlash(relPath))
-	info, err := os.Stat(absPath)
-	if err != nil {
-		if os.IsNotExist(err) {
+	mtimeNano, exists, readable := idx.contentFileVersion(absPath)
+	if !readable {
+		if !exists {
 			return nil, 0, false, false, true
 		}
 		return nil, 0, true, true, true
 	}
-	src, err := os.ReadFile(absPath)
+	src, err := idx.readFileContent(absPath)
 	if err != nil {
 		return nil, 0, true, true, true
 	}
 	if base == "go.work" {
-		return nil, info.ModTime().UnixNano(), true, false, true
+		return nil, mtimeNano, true, false, true
 	}
 	extractor := &contracts.GoModExtractor{TrackedRepos: idx.trackedRepoModules}
 	fresh = extractor.Extract(graphPath, src, nil, nil)
@@ -556,7 +555,7 @@ func (idx *Indexer) extractIncrementalManifestContracts(
 		fresh[i].WorkspaceID = idx.workspaceID
 		fresh[i].ProjectID = idx.projectID
 	}
-	return fresh, info.ModTime().UnixNano(), true, false, true
+	return fresh, mtimeNano, true, false, true
 }
 
 func (idx *Indexer) extractContractsForGraphFileFromBatch(
@@ -589,14 +588,14 @@ func (idx *Indexer) extractContractsForGraphFileFromBatch(
 		relPath = strings.TrimPrefix(relPath, prefix)
 	}
 	absPath := filepath.Join(idx.rootPath, filepath.FromSlash(relPath))
-	info, err := os.Stat(absPath)
-	if err != nil {
+	mtimeNano, _, readable := idx.contentFileVersion(absPath)
+	if !readable {
 		return nil, 0, true, true
 	}
 	fileEdges := edgesByNode[fileNode.ID]
 	var fresh []contracts.Contract
 	if extractors := byLang[fileNode.Language]; len(extractors) > 0 {
-		src, err := os.ReadFile(absPath)
+		src, err := idx.readFileContent(absPath)
 		if err != nil {
 			return nil, 0, true, true
 		}
@@ -631,7 +630,7 @@ func (idx *Indexer) extractContractsForGraphFileFromBatch(
 			fresh = append(fresh, contract)
 		}
 	}
-	return fresh, info.ModTime().UnixNano(), true, false
+	return fresh, mtimeNano, true, false
 }
 
 func contractSourceNeedsFullRefresh(graphPath, language string, src []byte) bool {

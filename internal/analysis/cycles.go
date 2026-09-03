@@ -20,7 +20,7 @@ type Cycle struct {
 // DetectCycles finds all dependency cycles in the graph using Tarjan's SCC algorithm.
 // If scope is non-empty, only nodes whose FilePath starts with scope are considered.
 // Cycles are classified by edge type and community membership, then sorted by severity descending.
-func DetectCycles(g graph.Store, communities *CommunityResult, scope string) []Cycle {
+func DetectCycles(g graph.Reader, communities *CommunityResult, scope string) []Cycle {
 	nodes := g.AllNodes()
 
 	// Build set of in-scope node IDs
@@ -99,7 +99,7 @@ func DetectCycles(g graph.Store, communities *CommunityResult, scope string) []C
 // WouldCreateCycle checks if adding an edge from fromID to toID would create a cycle.
 // It performs DFS from toID to see if fromID is reachable. If so, adding fromID→toID
 // would close a cycle. Returns the cycle path from toID to fromID when found.
-func WouldCreateCycle(g graph.Store, fromID, toID string) (bool, []string) {
+func WouldCreateCycle(g graph.Reader, fromID, toID string) (bool, []string) {
 	edges := g.AllEdges()
 
 	// Build adjacency from calls and imports edges

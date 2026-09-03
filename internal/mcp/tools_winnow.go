@@ -158,7 +158,7 @@ func (s *Server) handleWinnowSymbols(ctx context.Context, req mcp.CallToolReques
 
 	rows := make([]map[string]any, 0, len(results))
 	for _, r := range results {
-		row := s.withAbsPath(r.Node).Brief()
+		row := s.withAbsPath(ctx, r.Node).Brief()
 		row["score"] = roundFloat(r.Score)
 		row["fan_in"] = r.FanIn
 		row["fan_out"] = r.FanOut

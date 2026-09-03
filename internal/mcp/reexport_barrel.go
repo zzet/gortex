@@ -35,7 +35,7 @@ const maxReExportChainDepth = 8
 
 // reExportBindingCanonical returns the canonical declaration id a barrel-binding
 // id forwards to, or "" when id is not a resolvable barrel binding.
-func reExportBindingCanonical(g graph.Store, id string, depth int) string {
+func reExportBindingCanonical(g graph.Reader, id string, depth int) string {
 	if g == nil || depth > maxReExportChainDepth {
 		return ""
 	}
@@ -82,7 +82,7 @@ func reExportBindingCanonical(g graph.Store, id string, depth int) string {
 // probeBindingInFile resolves the relative spec to a target file and returns
 // the canonical id for `orig` there — either a real symbol node, or, when the
 // target is itself a barrel, the result of recursing through it.
-func probeBindingInFile(g graph.Store, fromFile, spec, orig string, depth int) string {
+func probeBindingInFile(g graph.Reader, fromFile, spec, orig string, depth int) string {
 	tf := probeRelativeModuleFile(g, fromFile, spec)
 	if tf == "" {
 		return ""
@@ -125,7 +125,7 @@ func parseReExportTarget(to string) (spec, orig string) {
 // node16` / `nodenext` — is probed verbatim and then against the sources
 // that compile to it; appending extensions alone would only ever look for
 // `impl.js.ts` (issue #304).
-func probeRelativeModuleFile(g graph.Store, fromFile, spec string) string {
+func probeRelativeModuleFile(g graph.Reader, fromFile, spec string) string {
 	stem := path.Clean(path.Join(path.Dir(fromFile), spec))
 	isFile := func(id string) bool {
 		n := g.GetNode(id)
@@ -180,7 +180,7 @@ func isReExportNode(n *graph.Node) bool { return graph.IsReExportNode(n) }
 // resolved forward edge (e.g. a bare-package re-export the resolver left
 // unresolved). Distinct from reExportBindingCanonical, which walks a FILE's
 // out-edges on the pre-resolution unresolved targets.
-func reExportNodeCanonical(g graph.Store, id string, depth int) string {
+func reExportNodeCanonical(g graph.Reader, id string, depth int) string {
 	if g == nil || depth > maxReExportChainDepth {
 		return ""
 	}

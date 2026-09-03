@@ -51,7 +51,7 @@ func TestBFSQueryUsesEdgeIndex(t *testing.T) {
 	s.AddEdge(&graph.Edge{From: "B", To: "C", Kind: graph.EdgeCalls, Confidence: 1, Origin: graph.OriginASTResolved})
 
 	forwardQ := buildBFSQuery(graph.DirectionForward, 1, 1, true)
-	forwardPlan := queryPlan(t, s, forwardQ, "A", 3, string(graph.EdgeCalls), 50)
+	forwardPlan := queryPlan(t, s, forwardQ, "A", 3, string(graph.EdgeCalls), baseViewGeneration, 50)
 	if !strings.Contains(forwardPlan, "edges_by_from") {
 		t.Fatalf("forward BFS plan does not use edges_by_from:\n%s", forwardPlan)
 	}
@@ -61,7 +61,7 @@ func TestBFSQueryUsesEdgeIndex(t *testing.T) {
 	}
 
 	backwardQ := buildBFSQuery(graph.DirectionBackward, 1, 1, true)
-	backwardPlan := queryPlan(t, s, backwardQ, "C", 3, string(graph.EdgeCalls), 50)
+	backwardPlan := queryPlan(t, s, backwardQ, "C", 3, string(graph.EdgeCalls), baseViewGeneration, 50)
 	if !strings.Contains(backwardPlan, "edges_by_to") {
 		t.Fatalf("backward BFS plan does not use edges_by_to:\n%s", backwardPlan)
 	}

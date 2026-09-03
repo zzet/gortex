@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,8 +39,12 @@ func (s *Server) registerMultiRepoTools() {
 
 	s.addTool(
 		mcp.NewTool("untrack_repository",
-			mcp.WithDescription("Remove a repository from the tracked workspace at runtime. Evicts nodes/edges and persists to config."),
+			mcp.WithDescription("Remove a repository from the tracked workspace at runtime. Evicts nodes/edges and persists to config. "+
+				"A checkout the family can still serve from another corpus is demoted into the automatic lane and the call runs "+
+				"outright; a plan that removes rows — a primary corpus with its closure, or a checkout with nowhere to be demoted "+
+				"to — is previewed instead and needs confirm:true."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Path or repo prefix to remove")),
+			mcp.WithBoolean("confirm", mcp.Description("Run a plan that removes rows. Without it such a plan is only previewed.")),
 		),
 		s.handleUntrackRepository,
 	)
@@ -139,8 +144,12 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		})
 	}
 
+	if s.lifecycle == nil {
+		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
+	}
+
 	type trackOutcome struct {
-		result *indexer.IndexResult
+		result indexer.RegisterResult
 		err    error
 	}
 	done := make(chan trackOutcome, 1)
@@ -149,24 +158,18 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		// WithoutCancel keeps the request's values (progress token, session)
 		// while dropping its cancellation, so the daemon's request lifetime
 		// can no longer kill a half-written first index.
-		res, trackErr := s.multiIndexer.TrackRepoCtx(
-			s.progressCtx(context.WithoutCancel(ctx), req), entry)
-		if trackErr == nil && res != nil {
-			// Persist and refresh here rather than in the caller: the caller
-			// may already have answered `accepted` and returned.
-			if s.configManager != nil {
-				if saveErr := s.configManager.Global().Save(); saveErr != nil {
-					s.logger.Warn("failed to persist config after tracking repo",
-						zap.String("path", path), zap.Error(saveErr))
-				}
-			}
-			// The tracked-repo set just changed, so every session's
-			// cached workspace binding is stale. Without this the
-			// session that ran `track` to repair its own uncovered cwd
-			// keeps the boundary it latched before the call and stays
-			// blind to the repo it just added.
-			s.InvalidateSessionScopes()
-			s.RunAnalysis()
+		//
+		// Registration also persists the config, attaches the watcher and
+		// invalidates every session's cached workspace binding — the last of
+		// which is what stops the session that ran `track` to repair its own
+		// uncovered cwd from staying blind to the repo it just added. It
+		// happens inside the goroutine because the caller may already have
+		// answered `accepted` and returned.
+		res, trackErr := s.lifecycle.Register(
+			s.progressCtx(context.WithoutCancel(ctx), req), entry, indexer.TrackSourceMCP)
+		if trackErr == nil && res.CatalogErr != nil {
+			s.logger.Warn("track: recording the checkout identity failed",
+				zap.String("path", path), zap.Error(res.CatalogErr))
 		}
 		done <- trackOutcome{result: res, err: trackErr}
 	}()
@@ -186,11 +189,12 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		if out.err != nil {
 			return mcp.NewToolResultError(out.err.Error()), nil
 		}
-		// Already tracked — TrackRepo returns nil result when repo exists.
-		if out.result == nil {
+		// Already tracked — the corpus held the repo, so only its identity
+		// and side effects were brought up to date.
+		if out.result.AlreadyTracked {
 			return mcp.NewToolResultText("repository already tracked"), nil
 		}
-		prefix := out.result.RepoPrefix
+		prefix := out.result.Prefix
 		if prefix == "" {
 			prefix = config.ResolvePrefix(entry)
 		}
@@ -198,9 +202,9 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 			"status":     "tracked",
 			"path":       path,
 			"prefix":     prefix,
-			"file_count": out.result.FileCount,
-			"node_count": out.result.NodeCount,
-			"edge_count": out.result.EdgeCount,
+			"file_count": out.result.Index.FileCount,
+			"node_count": out.result.Index.NodeCount,
+			"edge_count": out.result.Index.EdgeCount,
 		})
 	case <-answerBy:
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
@@ -221,38 +225,39 @@ func (s *Server) handleUntrackRepository(ctx context.Context, req mcp.CallToolRe
 	if s.multiIndexer == nil {
 		return mcp.NewToolResultError("multi-repo indexing is not enabled"), nil
 	}
+	if s.lifecycle == nil {
+		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
+	}
 
-	// Try to find the repo by prefix or by path.
-	prefix := s.resolveRepoPrefix(path)
-	if prefix == "" {
-		// Untracking something already untracked is a no-op the agent can act
-		// on, not a session-ending failure — return success-shaped guidance.
+	// What an untrack of this path does is a property of the catalog, so it is
+	// read before anything is torn down. The lifecycle uses the fail-closed
+	// destructive resolver; an unknown token is guidance, never a path relative
+	// to the daemon's working directory. A plan that removes rows is shown and
+	// not run; a plan that keeps the checkout is the ordinary untrack.
+	preview, err := s.lifecycle.PreviewUntrack(ctx, path)
+	if errors.Is(err, indexer.ErrCheckoutNotTracked) {
 		return repoNotTrackedGuidance(path), nil
 	}
-
-	nodesRemoved, edgesRemoved := s.multiIndexer.UntrackRepo(prefix)
-
-	// Persist updated config.
-	if s.configManager != nil {
-		if saveErr := s.configManager.Global().Save(); saveErr != nil {
-			s.logger.Warn("failed to persist config after untracking repo",
-				zap.String("path", path), zap.Error(saveErr))
-		}
+	if err != nil {
+		return untrackFailure(path, err), nil
+	}
+	if destructiveUntrackPlan(preview.Plan) && !req.GetBool("confirm", false) {
+		return s.respondJSONOrTOON(ctx, req, untrackPreviewPayload("untrack", preview,
+			"nothing was written; call untrack_repository again with confirm:true to run this plan"))
 	}
 
-	// The tracked-repo set changed: drop cached session bindings so a
-	// session does not keep serving a repo that is no longer tracked.
-	s.InvalidateSessionScopes()
-
-	// Re-run analysis after removing a repo.
-	s.RunAnalysis()
-
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"status":        "untracked",
-		"prefix":        prefix,
-		"nodes_removed": nodesRemoved,
-		"edges_removed": edgesRemoved,
-	})
+	// The lifecycle revokes the tracking intents, runs the plan's saga and
+	// drives every side effect from it: watcher detach, graph eviction,
+	// config persist, session invalidation, analysis rerun.
+	result, err := s.lifecycle.ApplyUntrack(ctx, preview)
+	if err != nil {
+		return untrackFailure(path, err), nil
+	}
+	status := "untracked"
+	if result.Demoted {
+		status = "demoted"
+	}
+	return s.respondJSONOrTOON(ctx, req, untrackResultPayload(status, result))
 }
 
 // handleSetActiveProject validates the project name, updates the active project,
@@ -374,32 +379,14 @@ func (s *Server) resolveRepoPrefix(pathOrPrefix string) string {
 	}
 
 	// Files and working directories inside a tracked repository are valid
-	// selectors too. Prefer the longest containing root so nested repositories
-	// resolve deterministically to their own graph instead of the parent repo.
+	// selectors too. RepoForFile owns the longest-root and canonical-alias
+	// rules shared with every request path; duplicating them here previously
+	// made administrative selectors disagree with graph routing.
 	absInput, err := filepath.Abs(pathOrPrefix)
 	if err != nil {
 		return ""
 	}
-	bestPrefix := ""
-	bestRootLen := -1
-	for prefix, meta := range s.multiIndexer.AllMetadata() {
-		if meta == nil || meta.RootPath == "" {
-			continue
-		}
-		root, err := filepath.Abs(meta.RootPath)
-		if err != nil {
-			continue
-		}
-		rel, err := filepath.Rel(root, absInput)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			continue
-		}
-		if len(root) > bestRootLen {
-			bestPrefix = prefix
-			bestRootLen = len(root)
-		}
-	}
-	return bestPrefix
+	return s.multiIndexer.RepoForFile(absInput)
 }
 
 // diffJoinPrefix resolves the graph repo prefix used to join repo-relative

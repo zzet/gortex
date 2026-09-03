@@ -63,6 +63,54 @@ func TestRazorExtractor(t *testing.T) {
 	}
 }
 
+// A @code block's members are rebased into host coordinates; the
+// ownership span stamped on a declaring-first partial property (issue
+// #731) has to move with the node's lines, or it names unrelated host
+// lines and the semantic tier admits stubs from the wrong region.
+func TestRazorCodeBlockRebasesOwnershipSpan(t *testing.T) {
+	const razor = `@page "/p"
+
+@code {
+    private Svc _c = new Svc();
+    public partial int P { get; set; }
+    public partial int P {
+        get { return _c.F(); }
+    }
+}
+`
+	res, err := NewRazorExtractor().Extract("Page.razor", []byte(razor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prop *graph.Node
+	for _, n := range res.Nodes {
+		if n.Name == "P" && n.Kind == graph.KindField {
+			prop = n
+		}
+	}
+	if prop == nil {
+		t.Fatal("partial property P not extracted from the @code block")
+	}
+	if prop.StartLine != 5 || prop.EndLine != 5 {
+		t.Errorf("P node lines = %d..%d, want 5..5 (host coordinates of the declaring fragment)", prop.StartLine, prop.EndLine)
+	}
+	if got, want := prop.Meta[graph.MetaOwnershipStartLine], 6; got != want {
+		t.Errorf("ownership_start_line = %v, want %d (host coordinates of the implementing fragment)", got, want)
+	}
+	if got, want := prop.Meta[graph.MetaOwnershipEndLine], 8; got != want {
+		t.Errorf("ownership_end_line = %v, want %d", got, want)
+	}
+	var callLine int
+	for _, e := range res.Edges {
+		if e.From == prop.ID && e.Kind == graph.EdgeCalls && strings.HasSuffix(e.To, ".F") {
+			callLine = e.Line
+		}
+	}
+	if callLine != 7 {
+		t.Errorf("P's body call line = %d, want 7 (inside the stamped span, outside the node's)", callLine)
+	}
+}
+
 // TestRazorUsingExtraction pins `@using` directive extraction (with the
 // `@using static` member-import form skipped to its namespace) and the
 // path-derived component namespace.

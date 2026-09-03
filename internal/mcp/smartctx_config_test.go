@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -31,12 +32,12 @@ func TestSmartContextDefaultOff_AttachNoop(t *testing.T) {
 	s := &Server{}
 	result := map[string]any{"relevant_symbols": []string{}}
 	// Default-off sections leave the pack untouched.
-	s.attachInPackSections(result, s.smartContextSections(map[string]any{}, ""), nil)
+	s.attachInPackSections(context.Background(), result, s.smartContextSections(map[string]any{}, ""), nil)
 	if _, ok := result["in_pack"]; ok {
 		t.Errorf("default-off should not add an in_pack block, got %+v", result["in_pack"])
 	}
 	// Opting call-paths in with no graph / no reachable paths adds no block.
-	s.attachInPackSections(result, config.SmartContextSections{CallPaths: true}, nil)
+	s.attachInPackSections(context.Background(), result, config.SmartContextSections{CallPaths: true}, nil)
 	if _, ok := result["in_pack"]; ok {
 		t.Errorf("opt-in with no reachable paths should add no block, got %+v", result["in_pack"])
 	}
@@ -60,7 +61,7 @@ func TestSmartContextCallPaths(t *testing.T) {
 	symbols := []*graph.Node{{ID: "focus"}, {ID: "a"}, {ID: "c"}}
 
 	result := map[string]any{}
-	s.attachInPackSections(result, config.SmartContextSections{CallPaths: true}, symbols)
+	s.attachInPackSections(context.Background(), result, config.SmartContextSections{CallPaths: true}, symbols)
 
 	blk, ok := result["in_pack"].(map[string]any)
 	if !ok {
@@ -83,7 +84,7 @@ func TestSmartContextCallPaths(t *testing.T) {
 
 	// Default-off leaves the pack untouched even with reachable symbols.
 	off := map[string]any{}
-	s.attachInPackSections(off, config.SmartContextSections{}, symbols)
+	s.attachInPackSections(context.Background(), off, config.SmartContextSections{}, symbols)
 	if _, ok := off["in_pack"]; ok {
 		t.Errorf("call-paths off should add no block, got %+v", off["in_pack"])
 	}
@@ -125,7 +126,7 @@ func flowGraph() *graph.Graph {
 func TestSmartContextFlows(t *testing.T) {
 	s := &Server{graph: flowGraph()}
 	result := map[string]any{}
-	s.attachInPackSections(result, config.SmartContextSections{Flows: true}, []*graph.Node{{ID: "focus"}})
+	s.attachInPackSections(context.Background(), result, config.SmartContextSections{Flows: true}, []*graph.Node{{ID: "focus"}})
 
 	blk, ok := result["in_pack"].(map[string]any)
 	if !ok {
@@ -151,7 +152,7 @@ func TestSmartContextFlows(t *testing.T) {
 
 	// Flows off → no block.
 	off := map[string]any{}
-	s.attachInPackSections(off, config.SmartContextSections{}, []*graph.Node{{ID: "focus"}})
+	s.attachInPackSections(context.Background(), off, config.SmartContextSections{}, []*graph.Node{{ID: "focus"}})
 	if _, ok := off["in_pack"]; ok {
 		t.Errorf("flows off should add no block, got %+v", off["in_pack"])
 	}
@@ -164,7 +165,7 @@ func TestSmartContextBoundary(t *testing.T) {
 	s := &Server{graph: g}
 
 	result := map[string]any{}
-	s.attachInPackSections(result, config.SmartContextSections{Flows: true}, []*graph.Node{{ID: "focus"}})
+	s.attachInPackSections(context.Background(), result, config.SmartContextSections{Flows: true}, []*graph.Node{{ID: "focus"}})
 
 	blk := result["in_pack"].(map[string]any)
 	flows := blk["flows"].(map[string]any)
@@ -280,7 +281,7 @@ func TestSmartContextAssembly(t *testing.T) {
 	s := &Server{graph: g}
 	pack := []*graph.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 
-	rec := s.recoverPackEdges(pack)
+	rec := s.recoverPackEdges(context.Background(), pack)
 	if len(rec) != 2 {
 		t.Fatalf("expected 2 recovered edges (a→b, b→c), got %d: %+v", len(rec), rec)
 	}
@@ -313,7 +314,7 @@ func TestSmartContextSiblings(t *testing.T) {
 	s := &Server{graph: g}
 	pack := []*graph.Node{{ID: "InternalEngine", Kind: graph.KindType}}
 
-	sibs := s.packHierarchySiblings(pack)
+	sibs := s.packHierarchySiblings(context.Background(), pack)
 	if len(sibs) != 1 || sibs[0]["id"] != "ReadOnlyEngine" || sibs[0]["parent"] != "Engine" {
 		t.Fatalf("expected ReadOnlyEngine sibling via Engine, got %+v", sibs)
 	}

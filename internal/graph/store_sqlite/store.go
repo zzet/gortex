@@ -39,8 +39,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store is the SQLite-backed graph.Store implementation.
-type Store struct {
+// storeCore holds the connection pools, prepared statements, caches and
+// mutation state of one open SQLite database. Exactly one storeCore exists
+// per Open; every Store handle over that database points at it, so they all
+// share the same pools, locks and caches.
+type storeCore struct {
 	// db is the bounded, logically read-dedicated pool for on-disk stores.
 	// writerDB is a separate read-write pool capped at one physical connection. In-memory
 	// stores use the same max-one handle for both because independent
@@ -67,6 +70,22 @@ type Store struct {
 	// as KindBuiltin stub nodes (see graph.BuiltinStubNodes), so warm
 	// re-indexes don't re-upsert identical stubs on every batch.
 	builtinSeen sync.Map
+
+	// payloadSeals maps a derived payload generation to the write-admission
+	// flag every handle over that generation shares, so publishing one
+	// generation refuses the next write through every handle that holds it.
+	// Keyed by int64 generation; values are *payloadSeal.
+	payloadSeals sync.Map
+
+	// resolveLanes maps a derived payload generation to the resolver-
+	// coordination mutex every handle over that generation shares. Keyed by
+	// int64 generation; values are *sync.Mutex. See ResolveMutex.
+	resolveLanes sync.Map
+
+	// payloadBuildFlights maps a catalog generation to its sole process-local
+	// physical writer. Every handle over this core joins the same rendezvous;
+	// entries vanish when the writer completes and are never persisted.
+	payloadBuildFlights sync.Map
 
 	// Structural integrity is owned by this logical store. Shadows forward
 	// rejected attempts into the same recorder; warnings are rate-limited per
@@ -187,40 +206,84 @@ type Store struct {
 	bulkFinalizeObserver func(bulkFinalizeEvent)
 
 	// Prepared statements (compiled once in Open, closed in Close).
-	stmtInsertNode         *sql.Stmt
-	stmtGetNode            *sql.Stmt
-	stmtGetNodeByQual      *sql.Stmt
-	stmtFindByName         *sql.Stmt
-	stmtFindByNameInRepo   *sql.Stmt
-	stmtFileNodes          *sql.Stmt
-	stmtRepoNodes          *sql.Stmt
-	stmtAllNodes           *sql.Stmt
-	stmtNodeCount          *sql.Stmt
-	stmtRepoPrefixes       *sql.Stmt
-	stmtRepoStatsNodes     *sql.Stmt
-	stmtRepoStatsEdges     *sql.Stmt
-	stmtRepoNodeCount      *sql.Stmt
-	stmtRepoEdgeCount      *sql.Stmt
-	stmtAllRepoCountsNodes *sql.Stmt
-	stmtAllRepoCountsEdges *sql.Stmt
-	stmtAllRepoStateCounts *sql.Stmt
-	stmtStatsByKind        *sql.Stmt
-	stmtStatsByLanguage    *sql.Stmt
+	stmtInsertNode          *sql.Stmt
+	stmtGetNode             *sql.Stmt
+	stmtGetNodeByQual       *sql.Stmt
+	stmtFindByName          *sql.Stmt
+	stmtFindByNameInRepo    *sql.Stmt
+	stmtFileNodes           *sql.Stmt
+	stmtRepoNodes           *sql.Stmt
+	stmtAllNodes            *sql.Stmt
+	stmtGenerationAllNodes  *sql.Stmt
+	stmtNodeCount           *sql.Stmt
+	stmtGenerationNodeCount *sql.Stmt
+	stmtRepoPrefixes        *sql.Stmt
+	stmtRepoStatsNodes      *sql.Stmt
+	stmtRepoStatsEdges      *sql.Stmt
+	stmtRepoNodeCount       *sql.Stmt
+	stmtRepoEdgeCount       *sql.Stmt
+	stmtAllRepoCountsNodes  *sql.Stmt
+	stmtAllRepoCountsEdges  *sql.Stmt
+	stmtAllRepoStateCounts  *sql.Stmt
+	stmtIndexStateTotals    *sql.Stmt
+	stmtStatsByKind         *sql.Stmt
+	stmtStatsByLanguage     *sql.Stmt
 
-	stmtInsertEdge       *sql.Stmt
-	unresolvedInserts    atomic.Uint64
-	stmtOutEdges         *sql.Stmt
-	stmtInEdges          *sql.Stmt
-	stmtRepoEdges        *sql.Stmt
-	stmtAllEdges         *sql.Stmt
-	stmtEdgeCount        *sql.Stmt
-	stmtRemoveEdge       *sql.Stmt
-	stmtUpdateEdgeOrigin *sql.Stmt
-	stmtUpdateEdgeAttrs  *sql.Stmt
-	stmtSelectEdgeOrigin *sql.Stmt
-	stmtDeleteEdgeByKey  *sql.Stmt
-	stmtEdgeExists       *sql.Stmt
+	stmtInsertEdge          *sql.Stmt
+	unresolvedInserts       atomic.Uint64
+	stmtOutEdges            *sql.Stmt
+	stmtInEdges             *sql.Stmt
+	stmtRepoEdges           *sql.Stmt
+	stmtAllEdges            *sql.Stmt
+	stmtGenerationAllEdges  *sql.Stmt
+	stmtEdgeCount           *sql.Stmt
+	stmtGenerationEdgeCount *sql.Stmt
+	stmtRemoveEdge          *sql.Stmt
+	stmtUpdateEdgeOrigin    *sql.Stmt
+	stmtUpdateEdgeAttrs     *sql.Stmt
+	stmtSelectEdgeOrigin    *sql.Stmt
+	stmtDeleteEdgeByKey     *sql.Stmt
+	stmtEdgeExists          *sql.Stmt
 }
+
+// Store is the SQLite-backed graph.Store implementation. It is a handle over
+// a storeCore pinned to one payload view generation: every method reads and
+// writes through the embedded core, so the pools, prepared statements, caches
+// and write gate are shared by every handle over the same database.
+//
+// Open returns the owning handle. AtGeneration derives further handles that
+// differ only in viewGen; a derived handle must never tear the core down, so
+// only the owning handle's Close does any work (see ownsCore).
+type Store struct {
+	*storeCore
+
+	// viewGen is the payload view generation this handle reads and writes.
+	// Generation 0 is the base corpus every store starts with.
+	viewGen int64
+
+	// seal is the write-admission flag for viewGen, shared with every other
+	// handle over the same generation. It is nil on the base handle, which is
+	// never published and therefore never sealed.
+	seal *payloadSeal
+
+	// resolveLane is the resolver-coordination mutex for viewGen, shared with
+	// every other handle over the same generation. It is nil on the base
+	// handle, which coordinates on the core's own mutex.
+	resolveLane *sync.Mutex
+
+	// ownsCore marks the single handle Open returned. It gates teardown:
+	// pools, prepared statements and the checkpoint loop belong to the core,
+	// and closing them from a derived handle would break every other handle
+	// still using the same database.
+	ownsCore bool
+}
+
+// coreless reports a handle with nothing behind it: a nil pointer, or a zero
+// Store value whose core was never attached. Both used to be inert wherever a
+// method guarded on a nil receiver, because every field lived on Store itself.
+// Now that the fields live on storeCore, those guards must also cover a nil
+// core or the very next field read panics.
+func (s *Store) coreless() bool { return s == nil || s.storeCore == nil }
 
 // Compile-time assertion: *Store satisfies graph.Store.
 var _ graph.Store = (*Store)(nil)
@@ -231,13 +294,33 @@ var _ graph.Store = (*Store)(nil)
 // exists to check rather than failing to compile.
 var _ graph.RepoMemoryEstimateScanner = (*Store)(nil)
 
-// ResolveMutex returns the resolver-coordination mutex. Held by
-// cross-repo / temporal / external resolver passes to serialise edge
-// mutations. Separate from writeMu (which protects per-statement
-// write serialisation against SQLITE_BUSY) so the resolver can hold
-// it across multi-write batches without blocking unrelated steady-
-// state mutations on the same store.
-func (s *Store) ResolveMutex() *sync.Mutex { return &s.resolveMu }
+// ResolveMutex returns the resolver-coordination mutex for the generation this
+// handle reads and writes. Held by cross-repo / temporal / external resolver
+// passes to serialise edge mutations. Separate from writeMu (which protects
+// per-statement write serialisation against SQLITE_BUSY) so the resolver can
+// hold it across multi-write batches without blocking unrelated steady-state
+// mutations on the same store.
+//
+// The lane is per generation, and that grain is what the passes holding it
+// need. A pass takes it for its whole duration — the resolver's inference
+// passes, clone detection, capability / test-edge and external-call synthesis
+// are all O(graph) and none of them yields — because the mutations it
+// interleaves with are mutations of the graph it is reading. Reads and writes
+// through a derived handle are strictly generation-scoped: they neither see
+// nor touch the layer below, so two generations' passes cannot interleave with
+// each other at all, and one database-wide lane would only price a checkout's
+// build at every other checkout's — a lane held for as long as somebody else's
+// payload takes.
+//
+// The base corpus keeps the core's own mutex, so every base mutation — watcher
+// reindex, reconciliation, the warmup tail's whole-graph passes — still
+// serialises exactly as before.
+func (s *Store) ResolveMutex() *sync.Mutex {
+	if s.resolveLane != nil {
+		return s.resolveLane
+	}
+	return &s.resolveMu
+}
 
 // NeedsRebuild reports that Open dropped an incompatible on-disk database and
 // recreated it empty, so the daemon's warm-restart path should force a full
@@ -264,14 +347,15 @@ func Open(path string, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return openWith(path, currentSchemaVersion, schemaMigrations, o.allowRebuild)
+	return openWithObserver(path, currentSchemaVersion, schemaMigrations, o.allowRebuild, o.migrationObserver)
 }
 
 // Option configures Open.
 type Option func(*openOptions)
 
 type openOptions struct {
-	allowRebuild bool
+	allowRebuild      bool
+	migrationObserver MigrationObserver
 }
 
 // WithRebuild permits Open to drop and recreate an on-disk database whose
@@ -286,6 +370,13 @@ type openOptions struct {
 // plan yields ErrSchemaRebuildRequired and the file is left intact, so a
 // caller that does not hold the lock cannot corrupt a live store.
 func WithRebuild() Option { return func(o *openOptions) { o.allowRebuild = true } }
+
+// WithMigrationObserver reports in-place schema migration boundaries while
+// Open is reconciling an existing store. The callback is synchronous and must
+// return promptly. It is not called when the store is already current.
+func WithMigrationObserver(observer MigrationObserver) Option {
+	return func(o *openOptions) { o.migrationObserver = observer }
+}
 
 // ErrSchemaRebuildRequired is returned by Open when an on-disk database needs a
 // destructive rebuild but the caller did not pass WithRebuild (i.e. cannot
@@ -317,6 +408,10 @@ func configureConnectionPool(db *sql.DB) {
 }
 
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
+	return openWithObserver(path, current, migrations, allowRebuild, nil)
+}
+
+func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
 	// embedded tradeoff. cache_size(-32768) gives each pooled connection a
 	// 32 MiB page cache; temp_store(MEMORY) keeps GROUP BY / ORDER BY scratch
@@ -400,7 +495,7 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	// existed (CREATE TABLE IF NOT EXISTS won't alter an existing table).
 	// Must run before prepare(), whose node INSERT references the promoted
 	// columns too.
-	if err := ensureNodeColumns(db); err != nil {
+	if err := ensureNodeColumns(db, "nodes"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node columns: %w", err)
 	}
@@ -414,45 +509,16 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 	}
 	// nodes.is_stub generated column — see ensureNodeGeneratedColumns for why
 	// this is a separate function from ensureNodeColumns above.
-	if err := ensureNodeGeneratedColumns(db); err != nil {
+	if err := ensureNodeGeneratedColumns(db, "nodes"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite node generated columns: %w", err)
 	}
 	// Same treatment for the edges table's is_unresolved generated column —
-	// must run before the droppable-index loop below, which creates an index
+	// must run before createGraphCoreIndexes below, which creates an index
 	// over it.
-	if err := ensureEdgeColumns(db); err != nil {
+	if err := ensureEdgeColumns(db, "edges"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite edge columns: %w", err)
-	}
-	// Create the droppable secondary indexes from the shared set so their
-	// initial-creation DDL is byte-identical to the DDL the bulk-load fast
-	// path rebuilds them with (BeginBulkLoad drops these, FlushBulk
-	// recreates them — see bulk_load.go). Kept out of schemaSQL so the two
-	// sites cannot drift.
-	for _, idx := range bulkDroppableIndexes {
-		if _, err := db.Exec(idx.ddl); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
-		}
-	}
-	// Sparse partial indexes remain live through a cold load, but share the
-	// same explicit DDL ownership rather than drifting into schemaSQL.
-	for _, idx := range bulkAlwaysLiveIndexes {
-		if _, err := db.Exec(idx.ddl); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("sqlite create index %s: %w", idx.name, err)
-		}
-	}
-	// edges_external is a partial index over exactly the external-call
-	// terminals, so ExternalCallCandidateEdges scans a tiny index instead
-	// of the full edges table. Built from the shared predicate const (not
-	// inlined in schemaSQL) so the index WHERE and the query WHERE stay
-	// byte-identical — SQLite only uses a partial index when the query's
-	// WHERE matches the index's.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS edges_external ON edges(kind) WHERE ` + externalCallTargetPredicate); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("sqlite edges_external index: %w", err)
 	}
 	// Backfill the FTS rowid sidecar for databases built before it existed,
 	// so the first incremental UpsertSymbolFTS on an already-indexed symbol
@@ -470,28 +536,36 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		return nil, fmt.Errorf("sqlite content fts rowid backfill: %w", err)
 	}
 
-	// Apply any in-place migration steps, then stamp the current schema version.
+	// Apply any in-place migration steps. The version stamp is deliberately
+	// deferred until every migration-dependent postcondition below succeeds:
+	// core/sidecar indexes exist and an analysis snapshot produced against the
+	// old graph shape is durably invalidated. PRAGMA user_version is the next
+	// Open's sole completion marker; publishing it earlier would let a crash or
+	// failure in that tail suppress the required repair forever.
 	// Fresh and pre-versioning (stored==0) stores run the in-place steps too —
 	// they are idempotent and no-op on an empty or already-clean store — so the
 	// first in-place migration ships without forcing every non-daemon Open to
 	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
 	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
-		if err := applyInPlaceMigrations(db, plan.inPlace); err != nil {
+		if err := applyInPlaceMigrations(db, plan.inPlace, observe); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite schema migrate: %w", err)
 		}
-		if err := setUserVersion(db, current); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
-		}
 	}
-	// The repository index references columns introduced by the v10 vector
-	// migration, so create it only after pending migrations have rebuilt the
-	// legacy table. On current and fresh stores this is an idempotent no-op.
-	if _, err := db.Exec(vectorRepoIndexSQL); err != nil {
+	// Both index sets are created after the pending steps, for two different
+	// reasons. The core indexes because the v16 step rebuilds nodes and edges,
+	// and dropping a table takes its indexes with it. The sidecar ones because
+	// they span columns a step introduces — view_gen (v15) and the vector
+	// ownership columns the v10 rebuild adds. On current and fresh stores both
+	// calls are idempotent no-ops.
+	if err := createGraphCoreIndexes(db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("sqlite vector repository index: %w", err)
+		return nil, fmt.Errorf("sqlite core index: %w", err)
+	}
+	if err := createSidecarIndexes(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite sidecar index: %w", err)
 	}
 	// A schema transition invalidates any generation produced against the old
 	// graph shape. The v4 migration also drops the unreleased blob-only table.
@@ -505,6 +579,15 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 			return nil, fmt.Errorf("sqlite clear active analysis generation after migration: %w", err)
 		}
 	}
+	// The stamp is the final durable schema-transition success marker. Every
+	// preceding operation is idempotent, so an interruption before this point
+	// leaves the old version and safely retries the transition on the next Open.
+	if plan.stamp {
+		if err := setUserVersion(db, current); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
+		}
+	}
 
 	readDB := db
 	if !isMemoryPath(path) {
@@ -515,7 +598,13 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 		}
 	}
 
-	s := &Store{db: readDB, writerDB: db, dbPath: path, wiped: didWipe}
+	// The handle openWith returns owns the core: it is the only one allowed to
+	// close the pools and prepared statements. Handles derived later by
+	// AtGeneration share this core and leave teardown to this one.
+	s := &Store{
+		storeCore: &storeCore{db: readDB, writerDB: db, dbPath: path, wiped: didWipe},
+		ownsCore:  true,
+	}
 	// Initialise the bundle cache at construction so its pointer is
 	// never written after Open — concurrent SearchSymbolBundles reads
 	// and SetBundleFingerprints writes then race only on the cache's
@@ -563,6 +652,11 @@ const (
 	// non-blocking TryLock; this context only protects an unexpected writer-pool
 	// wait or a slow driver call.
 	walPassiveCheckpointTimeout = 1 * time.Second
+	// A deferred periodic checkpoint must not disappear for another five-minute
+	// interval. Retry promptly, then exponentially cap contention traffic so a
+	// long bulk writer or read snapshot cannot create a polling storm.
+	walCheckpointRetryInitial = 1 * time.Second
+	walCheckpointRetryMax     = 30 * time.Second
 )
 
 var errWALCheckpointDeferredBulk = errors.New("store_sqlite: WAL checkpoint deferred while bulk writer is pinned")
@@ -578,21 +672,64 @@ func (r walCheckpointResult) incomplete() bool {
 }
 
 // runCheckpointLoop attempts one non-blocking PASSIVE checkpoint per interval.
-// It never queues behind graph mutation or a pinned bulk writer. An incomplete
-// reader-limited checkpoint is logged with SQLite's counters and retried at the
-// next interval; it is never reported as a completed drain.
+// Transient deferrals retry on a bounded 1s..30s exponential cadence rather
+// than disappearing until the next five-minute tick. One reusable timer and
+// goroutine-local state prevent retry goroutine/timer storms.
 func (s *Store) runCheckpointLoop(interval time.Duration) {
+	s.runCheckpointLoopWithAttempt(
+		interval,
+		walCheckpointRetryInitial,
+		walCheckpointRetryMax,
+		s.checkpointWALPassive,
+	)
+}
+
+func (s *Store) runCheckpointLoopWithAttempt(
+	interval, retryInitial, retryMax time.Duration,
+	attempt func() bool,
+) {
 	defer close(s.checkpointDone)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	if retryInitial <= 0 {
+		retryInitial = walCheckpointRetryInitial
+	}
+	if retryMax < retryInitial {
+		retryMax = retryInitial
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	retryDelay := retryInitial
 	for {
 		select {
 		case <-s.stopCheckpoint:
 			return
-		case <-ticker.C:
-			s.checkpointWALPassive()
+		case <-timer.C:
+			// If shutdown and the timer become ready together, prefer shutdown
+			// before starting another bounded SQLite call.
+			select {
+			case <-s.stopCheckpoint:
+				return
+			default:
+			}
+			delay := interval
+			if attempt() {
+				delay = retryDelay
+				retryDelay = growWALCheckpointRetry(retryDelay, retryMax)
+			} else {
+				retryDelay = retryInitial
+			}
+			timer.Reset(delay)
 		}
 	}
+}
+
+func growWALCheckpointRetry(current, maximum time.Duration) time.Duration {
+	if current <= 0 {
+		return maximum
+	}
+	if current >= maximum || current > maximum-current {
+		return maximum
+	}
+	return current * 2
 }
 
 func (s *Store) passiveCheckpointWindow() time.Duration {
@@ -602,15 +739,19 @@ func (s *Store) passiveCheckpointWindow() time.Duration {
 	return walPassiveCheckpointTimeout
 }
 
-func (s *Store) checkpointWALPassive() {
+// checkpointWALPassive returns true only when the next periodic attempt should
+// happen on the prompt retry cadence. Permanent driver/I/O errors remain on the
+// ordinary interval; contention, deadlines and measured incomplete drains do
+// not silently wait five minutes.
+func (s *Store) checkpointWALPassive() bool {
 	if !s.writeMu.TryLock() {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_gate")
-		return
+		return true
 	}
 	defer s.writeMu.Unlock()
 	if s.bulkConn != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=bulk_writer")
-		return
+		return true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
@@ -624,15 +765,23 @@ func (s *Store) checkpointWALPassive() {
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy error=%q", err)
-		return
+		return shouldRetryPassiveCheckpoint(err, ctx.Err())
 	}
 	defer func() { _ = conn.Close() }()
 
 	result, err := checkpointWALOnceOn(ctx, conn, "PASSIVE")
 	if err == nil {
-		return
+		return false
 	}
 	log.Print(passiveCheckpointReport(result, err, ctx.Err()))
+	return shouldRetryPassiveCheckpoint(err, ctx.Err())
+}
+
+func shouldRetryPassiveCheckpoint(err, ctxErr error) bool {
+	return errors.Is(err, errSQLiteCheckpointIncomplete) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		ctxErr != nil ||
+		isSQLiteBusyErr(err)
 }
 
 // passiveCheckpointReport renders the log line for a periodic checkpoint that
@@ -749,7 +898,15 @@ func (s *Store) stopCheckpointLoop() {
 // first stops the WAL-checkpoint loop and issues one final TRUNCATE
 // checkpoint so the -wal file is drained and shrunk on graceful shutdown
 // rather than lingering at its high-water mark until the next open.
+//
+// Only the handle Open returned tears the core down. Closing a handle
+// derived by AtGeneration is a no-op that returns nil: the derived handle
+// borrows pools and statements it does not own, and closing them would break
+// every other handle over the same database.
 func (s *Store) Close() error {
+	if !s.ownsCore {
+		return nil
+	}
 	s.stopCheckpointLoop()
 	// A caller normally ends an outer cold-load window explicitly, but Close is
 	// also the last durability boundary on cancellation or startup failure.
@@ -785,15 +942,17 @@ func (s *Store) Close() error {
 		s.stmtInsertNode, s.stmtGetNode, s.stmtGetNodeByQual,
 		s.stmtFindByName, s.stmtFindByNameInRepo,
 		s.stmtFileNodes, s.stmtRepoNodes,
-		s.stmtAllNodes, s.stmtNodeCount, s.stmtRepoPrefixes,
+		s.stmtAllNodes, s.stmtGenerationAllNodes,
+		s.stmtNodeCount, s.stmtGenerationNodeCount, s.stmtRepoPrefixes,
 		s.stmtRepoStatsNodes, s.stmtRepoStatsEdges,
 		s.stmtRepoNodeCount, s.stmtRepoEdgeCount,
 		s.stmtAllRepoCountsNodes, s.stmtAllRepoCountsEdges,
-		s.stmtAllRepoStateCounts,
+		s.stmtAllRepoStateCounts, s.stmtIndexStateTotals,
 		s.stmtStatsByKind, s.stmtStatsByLanguage,
 		s.stmtInsertEdge, s.stmtOutEdges, s.stmtInEdges,
 		s.stmtRepoEdges,
-		s.stmtAllEdges, s.stmtEdgeCount, s.stmtRemoveEdge,
+		s.stmtAllEdges, s.stmtGenerationAllEdges,
+		s.stmtEdgeCount, s.stmtGenerationEdgeCount, s.stmtRemoveEdge,
 		s.stmtUpdateEdgeOrigin, s.stmtUpdateEdgeAttrs, s.stmtSelectEdgeOrigin, s.stmtDeleteEdgeByKey,
 		s.stmtEdgeExists,
 	}
@@ -804,6 +963,29 @@ func (s *Store) Close() error {
 	}
 	return errors.Join(bulkErr, checkpointErr, closeSQLitePools(s.db, s.writerDB))
 }
+
+const (
+	generationAllNodesSQL = `SELECT ` + lookupNodeCols + `
+FROM nodes INDEXED BY nodes_by_generation
+WHERE view_gen > 0 AND view_gen = ?
+ORDER BY id`
+	generationNodeCountSQL = `SELECT COUNT(*)
+FROM nodes INDEXED BY nodes_by_generation
+WHERE view_gen > 0 AND view_gen = ?`
+	generationAllEdgesSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen > 0 AND view_gen = ?
+ORDER BY id`
+	generationEdgeCountSQL = `SELECT COUNT(*)
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen > 0 AND view_gen = ?`
+	generationNodesByKindSQL = `SELECT ` + lookupNodeCols + `
+FROM nodes INDEXED BY nodes_by_generation
+WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
+	generationEdgesByKindSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
+)
 
 func (s *Store) prepare() error {
 	var err error
@@ -834,7 +1016,9 @@ func (s *Store) prepare() error {
 		prepOn(s.writerDB, out, q)
 	}
 
-	const nodeCols = nodeInsertColumns
+	// The insert list leads with view_gen; the read list does not, because a
+	// scanned row becomes a graph.Node, which carries no generation.
+	const nodeCols = lookupNodeCols
 
 	// Never use INSERT OR REPLACE here. SQLite implements REPLACE as
 	// DELETE+INSERT; the DELETE fires the nodes->edges ON DELETE CASCADE and
@@ -843,73 +1027,96 @@ func (s *Store) prepare() error {
 	// A true UPSERT updates the existing row in place and therefore preserves
 	// graph topology.
 	prepWrite(&s.stmtInsertNode,
-		`INSERT INTO nodes (`+nodeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
+		`INSERT INTO nodes (`+nodeInsertColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`+nodeUpsertClause)
+	// Base reads bind the handle's generation as a trailing residual conjunct
+	// and keep their established access paths. Whole-generation reads have a
+	// second statement for derived handles: it restates view_gen > 0 literally
+	// and forces the matching partial index, so a sparse overlay never scans
+	// generation zero beside it. SQLite cannot infer a partial-index predicate
+	// from the bound view_gen parameter alone.
+	//
+	// This one is not a residual at all: it probes the nodes PRIMARY KEY
+	// exactly, and the conjuncts follow the key order, so the generation
+	// completes the seek instead of filtering after it. Without it the same id
+	// names one row per generation and the lookup returns whichever the seek
+	// reached first.
 	prep(&s.stmtGetNode,
-		`SELECT `+nodeCols+` FROM nodes WHERE id = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE id = ? AND view_gen = ?`)
 	// The literal qual_name <> '' conjunct is what makes the partial
 	// nodes_by_qual index usable: SQLite cannot prove a bound parameter is
 	// non-empty, so without it this statement is a full node scan per call
 	// on resolver hot paths (measured against a production store). Every
 	// reader of a partial index must restate its predicate literally.
 	prep(&s.stmtGetNodeByQual,
-		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' ORDER BY id LIMIT 1`)
+		`SELECT `+nodeCols+` FROM nodes WHERE qual_name = ? AND qual_name <> '' AND view_gen = ? ORDER BY id LIMIT 1`)
 	prep(&s.stmtFindByName,
-		`SELECT `+nodeCols+` FROM nodes WHERE name = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE name = ? AND view_gen = ?`)
 	prep(&s.stmtFindByNameInRepo,
-		`SELECT `+nodeCols+` FROM nodes WHERE name = ? AND repo_prefix = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE name = ? AND repo_prefix = ? AND view_gen = ?`)
 	prep(&s.stmtFileNodes,
-		`SELECT `+nodeCols+` FROM nodes WHERE file_path = ?`)
+		`SELECT `+nodeCols+` FROM nodes WHERE file_path = ? AND view_gen = ?`)
 	prep(&s.stmtRepoNodes,
-		`SELECT `+nodeCols+` FROM nodes WHERE repo_prefix = ?`)
-	// ORDER BY id: nodes is WITHOUT ROWID keyed on id, so the scan already
-	// walks primary-key order and the clause costs nothing (no temp b-tree in
-	// the query plan). Stating it makes whole-graph enumeration reproducible
-	// instead of merely happening to be stable.
+		`SELECT `+nodeCols+` FROM nodes WHERE repo_prefix = ? AND view_gen = ?`)
+	// ORDER BY id: nodes is WITHOUT ROWID keyed on (id, view_gen), so the scan
+	// already walks primary-key order and the clause costs nothing (no temp
+	// b-tree in the query plan). Stating it makes whole-graph enumeration
+	// reproducible instead of merely happening to be stable.
 	prep(&s.stmtAllNodes,
-		`SELECT `+nodeCols+` FROM nodes ORDER BY id`)
+		`SELECT `+nodeCols+` FROM nodes WHERE view_gen = ? ORDER BY id`)
+	prep(&s.stmtGenerationAllNodes, generationAllNodesSQL)
 	prep(&s.stmtNodeCount,
-		`SELECT COUNT(*) FROM nodes`)
+		`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`)
+	prep(&s.stmtGenerationNodeCount, generationNodeCountSQL)
 	prep(&s.stmtRepoPrefixes,
-		`SELECT DISTINCT repo_prefix FROM nodes WHERE repo_prefix <> ''`)
+		`SELECT DISTINCT repo_prefix FROM nodes WHERE repo_prefix <> '' AND view_gen = ?`)
 
 	prep(&s.stmtRepoStatsNodes,
-		`SELECT repo_prefix, kind, language, COUNT(*) FROM nodes WHERE repo_prefix <> '' GROUP BY repo_prefix, kind, language`)
+		`SELECT repo_prefix, kind, language, COUNT(*) FROM nodes WHERE repo_prefix <> '' AND view_gen = ? GROUP BY repo_prefix, kind, language`)
+	// The nodes-edges endpoint JOINs pair generations in the ON clause and
+	// bind the pair once in the WHERE. Without the pairing an edge in this
+	// generation could be attributed to a repository through a node of
+	// another, and the row would count twice as generations accumulate.
 	prep(&s.stmtRepoStatsEdges,
 		`SELECT n.repo_prefix, COUNT(*)
 		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id
-		 WHERE n.repo_prefix <> ''
+		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		 WHERE n.repo_prefix <> '' AND e.view_gen = ?
 		 GROUP BY n.repo_prefix`)
 	prep(&s.stmtRepoNodeCount,
-		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ?`)
+		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND view_gen = ?`)
 	prep(&s.stmtRepoEdgeCount,
 		`SELECT COUNT(*)
 		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id
-		 WHERE n.repo_prefix = ?`)
+		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		 WHERE n.repo_prefix = ? AND e.view_gen = ?`)
 	prep(&s.stmtAllRepoCountsNodes,
-		`SELECT repo_prefix, COUNT(*) FROM nodes WHERE repo_prefix <> '' GROUP BY repo_prefix`)
+		`SELECT repo_prefix, COUNT(*) FROM nodes WHERE repo_prefix <> '' AND view_gen = ? GROUP BY repo_prefix`)
 	prep(&s.stmtAllRepoCountsEdges,
 		`SELECT n.repo_prefix, COUNT(*)
 		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id
-		 WHERE n.repo_prefix <> ''
+		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		 WHERE n.repo_prefix <> '' AND e.view_gen = ?
 		 GROUP BY n.repo_prefix`)
 	// The counters the indexer persists on the way in. repo_index_state is
 	// WITHOUT ROWID, so its primary key IS the table: this reads one row per
 	// tracked repo with no scan of nodes or edges.
 	prep(&s.stmtAllRepoStateCounts,
-		`SELECT repo_prefix, node_count, edge_count FROM repo_index_state`)
+		`SELECT repo_prefix, node_count, edge_count FROM repo_index_state WHERE view_gen = ?`)
+	// Whole-graph totals summed from the same persisted counters. The
+	// leading COUNT(*) lets the reader tell "no counter rows for this
+	// view" (fall back to the exact scan) from a genuine zero total.
+	prep(&s.stmtIndexStateTotals,
+		`SELECT COUNT(*), COALESCE(SUM(node_count),0), COALESCE(SUM(edge_count),0) FROM repo_index_state WHERE view_gen = ?`)
 
 	prep(&s.stmtStatsByKind,
-		`SELECT kind, COUNT(*) FROM nodes GROUP BY kind`)
+		`SELECT kind, COUNT(*) FROM nodes WHERE view_gen = ? GROUP BY kind`)
 	prep(&s.stmtStatsByLanguage,
-		`SELECT language, COUNT(*) FROM nodes GROUP BY language`)
+		`SELECT language, COUNT(*) FROM nodes WHERE view_gen = ? GROUP BY language`)
 
-	const edgeCols = edgeInsertColumns
+	const edgeCols = lookupEdgeCols
 
 	prepWrite(&s.stmtInsertEdge,
-		`INSERT OR IGNORE INTO edges (`+edgeCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		`INSERT OR IGNORE INTO edges (`+edgeInsertColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	// The adjacency reads carry an explicit total order. Several callers take
 	// the FIRST edge matching a predicate (the semantic enricher's
 	// matching-edge lookup, for one), so several edges sharing
@@ -922,33 +1129,44 @@ func (s *Store) prepare() error {
 	// key, so the planner satisfies them from the index walk with no temp
 	// b-tree.
 	prep(&s.stmtOutEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE from_id = ? ORDER BY line, id`)
+		`SELECT `+edgeCols+` FROM edges WHERE from_id = ? AND view_gen = ? ORDER BY line, id`)
 	prep(&s.stmtInEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE to_id = ? ORDER BY kind, id`)
+		`SELECT `+edgeCols+` FROM edges WHERE to_id = ? AND view_gen = ? ORDER BY kind, id`)
 	prep(&s.stmtRepoEdges,
 		`SELECT `+lookupQualifiedEdgeCols+`
 		   FROM edges e
-		   JOIN nodes n ON n.id = e.from_id
-		  WHERE n.repo_prefix = ?`)
+		   JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
+		  WHERE n.repo_prefix = ? AND e.view_gen = ?`)
 	// id is the rowid alias, so the full scan already yields insertion order
 	// and the clause adds no sorter — same reasoning as stmtAllNodes above.
 	prep(&s.stmtAllEdges,
-		`SELECT `+edgeCols+` FROM edges ORDER BY id`)
+		`SELECT `+edgeCols+` FROM edges WHERE view_gen = ? ORDER BY id`)
+	prep(&s.stmtGenerationAllEdges, generationAllEdgesSQL)
 	prep(&s.stmtEdgeCount,
-		`SELECT COUNT(*) FROM edges`)
+		`SELECT COUNT(*) FROM edges WHERE view_gen = ?`)
+	prep(&s.stmtGenerationEdgeCount, generationEdgeCountSQL)
+	// The edge mutation statements all bind the handle's generation as a
+	// trailing residual conjunct: they rewrite or delete rows this handle
+	// owns, and an identical edge in another generation belongs to another
+	// corpus. The conjunct is appended, never woven into the existing key
+	// order, so each statement keeps the index it already sought through.
 	prepWrite(&s.stmtRemoveEdge,
-		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?`)
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND view_gen = ?`)
 
 	prep(&s.stmtSelectEdgeOrigin,
-		`SELECT origin FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+		`SELECT origin FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
 	prepWrite(&s.stmtUpdateEdgeOrigin,
-		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
 	prepWrite(&s.stmtUpdateEdgeAttrs,
-		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
 	prepWrite(&s.stmtDeleteEdgeByKey,
-		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`)
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`)
+	// This one probes the edges UNIQUE key, which ends with the generation, so
+	// the conjunct completes the seek rather than filtering after it. It
+	// answers "would the INSERT OR IGNORE that writes this edge be a no-op",
+	// so an identical edge in another generation must not read as present.
 	prep(&s.stmtEdgeExists,
-		`SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? LIMIT 1`)
+		`SELECT 1 FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ? LIMIT 1`)
 
 	return err
 }
@@ -1162,6 +1380,7 @@ func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
 		return false, err
 	}
 	res, err := stmt.Exec(
+		s.viewGen,
 		n.ID, string(n.Kind), n.Name, n.QualName, n.FilePath,
 		n.StartLine, n.EndLine, n.StartColumn, n.EndColumn, n.Language,
 		n.RepoPrefix, n.WorkspaceID, n.ProjectID,
@@ -1221,6 +1440,7 @@ func (s *Store) insertEdgeLocked(stmt *sql.Stmt, e *graph.Edge) (bool, error) {
 		crossRepo = 1
 	}
 	res, err := stmt.Exec(
+		s.viewGen,
 		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier,
 		crossRepo, metaBlob, p.resolveTerminal, p.resolveTerminalReason, p.semanticSource,
@@ -1241,6 +1461,16 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	}
 }
 
+// AddBatchChecked is the durable, error-returning sibling of AddBatch. It
+// preserves the historical Store interface while allowing long-running index
+// builds to surface a genuine storage failure (SQLITE_FULL, I/O error, or a
+// failed deferred-index seal) without taking down the daemon, instead of the
+// void AddBatch path that panics through panicOnFatal.
+func (s *Store) AddBatchChecked(nodes []*graph.Node, edges []*graph.Edge) error {
+	_, err := s.addBatchSetOriented(nodes, edges)
+	return wrapStorageError(err)
+}
+
 // SetEdgeProvenance mutates an existing edge's origin in-place and
 // bumps the identity-revision counter when the origin actually
 // changes. Returns true iff a change was applied. Mirrors the
@@ -1256,7 +1486,7 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 	// detached copy whose Origin already matches newOrigin even though
 	// the row still has the old value.
 	var storedOrigin string
-	row := s.stmtSelectEdgeOrigin.QueryRow(e.From, e.To, string(e.Kind), e.FilePath, e.Line)
+	row := s.stmtSelectEdgeOrigin.QueryRow(e.From, e.To, string(e.Kind), e.FilePath, e.Line, s.viewGen)
 	if err := row.Scan(&storedOrigin); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false
@@ -1275,8 +1505,8 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 		newTier = graph.ResolvedBy(newOrigin)
 	}
 	if _, err := s.execActiveWriteLocked(context.Background(),
-		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`,
-		newOrigin, newTier, e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+		`UPDATE edges SET origin = ?, tier = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`,
+		newOrigin, newTier, e.From, e.To, string(e.Kind), e.FilePath, e.Line, s.viewGen,
 	); err != nil {
 		panicOnFatal(err)
 		return false
@@ -1315,10 +1545,10 @@ func (s *Store) PersistEdgeAttributes(e *graph.Edge) {
 		return
 	}
 	res, err := s.execActiveWriteLocked(context.Background(),
-		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ?`,
+		`UPDATE edges SET confidence = ?, confidence_label = ?, origin = ?, tier = ?, meta = ?, resolve_terminal = ?, resolve_terminal_reason = ?, semantic_source = ? WHERE from_id = ? AND to_id = ? AND kind = ? AND file_path = ? AND line = ? AND view_gen = ?`,
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier, metaBlob,
 		p.resolveTerminal, p.resolveTerminalReason, p.semanticSource,
-		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
+		e.From, e.To, string(e.Kind), e.FilePath, e.Line, s.viewGen,
 	)
 	if err != nil {
 		panicOnFatal(err)
@@ -1348,7 +1578,8 @@ func (s *Store) PersistEdgeAttributesBatch(edges []*graph.Edge) {
 	}
 }
 
-// Thirteen bound values are carried per logical edge. Seventy-five rows use 975 host
+// Thirteen bound values are carried per logical edge, plus one trailing
+// generation binding for the whole statement. Seventy-five rows use 976 host
 // parameters, leaving headroom below SQLite's conservative 999-variable
 // limit while collapsing the former one-UPDATE-per-edge loop.
 const (
@@ -1381,7 +1612,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 		chunkChanged := false
 		for j := i; j < end; j += edgeAttributeUpdateChunkSize {
 			batchEnd := minInt(j+edgeAttributeUpdateChunkSize, end)
-			query, args, err := edgeAttributeUpdateStatement(edges[j:batchEnd])
+			query, args, err := edgeAttributeUpdateStatement(s.viewGen, edges[j:batchEnd])
 			if err != nil {
 				_ = tx.Rollback()
 				return statements, err
@@ -1426,7 +1657,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 // logical keys within a chunk retain their last value, matching the former
 // ordered per-edge loop; duplicates across chunks are naturally overwritten
 // by the later statement.
-func edgeAttributeUpdateStatement(edges []*graph.Edge) (string, []any, error) {
+func edgeAttributeUpdateStatement(viewGen int64, edges []*graph.Edge) (string, []any, error) {
 	updates := make([]*graph.Edge, 0, len(edges))
 	positions := make(map[edgeAttributeKey]int, len(edges))
 	for _, edge := range edges {
@@ -1467,6 +1698,9 @@ func edgeAttributeUpdateStatement(edges []*graph.Edge) (string, []any, error) {
 			edge.From, edge.To, string(edge.Kind), edge.FilePath, edge.Line,
 		)
 	}
+	// The generation rides one bound value for the whole statement, after the
+	// per-row VALUES arguments the placeholders above consumed.
+	args = append(args, viewGen)
 
 	query := `WITH updates(
 		confidence, confidence_label, origin, tier, meta,
@@ -1488,6 +1722,7 @@ func edgeAttributeUpdateStatement(edges []*graph.Edge) (string, []any, error) {
 		AND e.kind = u.kind
 		AND e.file_path = u.file_path
 		AND e.line = u.line
+		AND e.view_gen = ?
 		AND (e.confidence IS NOT u.confidence
 			OR e.confidence_label IS NOT u.confidence_label
 			OR e.origin IS NOT u.origin
@@ -1537,7 +1772,7 @@ func (s *Store) ReindexEdge(e *graph.Edge, oldTo string) {
 	insertStmt := tx.Stmt(s.stmtInsertEdge)
 	defer insertStmt.Close()
 
-	res, err := deleteStmt.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line)
+	res, err := deleteStmt.Exec(e.From, oldTo, string(e.Kind), e.FilePath, e.Line, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return
@@ -1628,8 +1863,8 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 		return false
 	}
 	res, err := s.execActiveWriteLocked(context.Background(),
-		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ?`,
-		from, to, string(kind),
+		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND kind = ? AND view_gen = ?`,
+		from, to, string(kind), s.viewGen,
 	)
 	if err != nil {
 		panicOnFatal(err)
@@ -1652,7 +1887,7 @@ func (s *Store) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 // that touches one of those nodes. Returns (nodesRemoved,
 // edgesRemoved).
 func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
-	return s.evictByPredicate(evictFilePredicate, filePath, true)
+	return s.evictByPredicate(evictFilePredicate, filePath, evictThisGeneration)
 }
 
 // EvictRepo removes every node in repoPrefix and every edge that
@@ -1669,20 +1904,64 @@ func (s *Store) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 // The divergence expires once every repo carries a prefix: "" then names
 // only the synthetic global externals, which no caller should ever bulk
 // evict, and this can refuse "" the way PurgeRepo already does.
+//
+// EvictRepo follows the graph.Store contract: it removes rows only from the
+// calling handle's logical generation. Repository administration must call
+// EvictRepoAllGenerations (or the sidecar-aware PurgeRepo) explicitly.
 func (s *Store) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	return s.EvictRepoCurrentGeneration(repoPrefix)
+}
+
+// EvictRepoCurrentGeneration replaces one generation without invalidating
+// immutable base/commit/dirty/ref payloads that share the repository prefix.
+func (s *Store) EvictRepoCurrentGeneration(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	return s.evictRepoScope(repoPrefix, evictThisGeneration)
+}
+
+// EvictRepoAllGenerations is the destructive fallback for authoritative
+// repository removal. Prefer PurgeRepo when the backend sidecars must go too.
+// Like PurgeRepo, it refuses an empty prefix because that scope can contain
+// shared global externals and solo-repository data.
+func (s *Store) EvictRepoAllGenerations(repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	if repoPrefix == "" {
+		return 0, 0
+	}
+	nodesRemoved, edgesRemoved, err := s.EvictRepoAllGenerationsChecked(repoPrefix)
+	if err != nil {
+		panicOnFatal(err)
+		return 0, 0
+	}
+	return nodesRemoved, edgesRemoved
+}
+
+// EvictRepoAllGenerationsChecked is the error-returning administrative path.
+// It shares the same transaction as the compatibility method but lets durable
+// cleanup retain its saga and retry instead of converting a write failure into
+// empty counts or a process panic.
+func (s *Store) EvictRepoAllGenerationsChecked(
+	repoPrefix string,
+) (nodesRemoved, edgesRemoved int, err error) {
+	if repoPrefix == "" {
+		return 0, 0, fmt.Errorf("store_sqlite: all-generation eviction refuses empty repo prefix")
+	}
+	predicate := evictNonEmptyRepoPredicate
+	return s.evictByPredicateResult(predicate, repoPrefix, evictAllGenerations)
+}
+
+func (s *Store) evictRepoScope(repoPrefix string, scope evictScope) (nodesRemoved, edgesRemoved int) {
 	predicate := evictRepoPredicate
 	if repoPrefix != "" {
 		// Make the partial nodes_by_repo predicate explicit so SQLite can use
 		// that compact index for ordinary named repositories.
 		predicate = evictNonEmptyRepoPredicate
 	}
-	return s.evictByPredicate(predicate, repoPrefix, false)
+	return s.evictByPredicate(predicate, repoPrefix, scope)
 }
 
 // -- reads ---------------------------------------------------------------
 
 func (s *Store) GetNode(id string) *graph.Node {
-	row := s.stmtGetNode.QueryRow(id)
+	row := s.stmtGetNode.QueryRow(id, s.viewGen)
 	n, err := scanNode(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1698,7 +1977,7 @@ func (s *Store) GetNodeByQualName(qualName string) *graph.Node {
 	if qualName == "" {
 		return nil
 	}
-	row := s.stmtGetNodeByQual.QueryRow(qualName)
+	row := s.stmtGetNodeByQual.QueryRow(qualName, s.viewGen)
 	n, err := scanNode(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1711,11 +1990,11 @@ func (s *Store) GetNodeByQualName(qualName string) *graph.Node {
 }
 
 func (s *Store) FindNodesByName(name string) []*graph.Node {
-	return s.queryNodes(s.stmtFindByName, name)
+	return s.queryNodes(s.stmtFindByName, name, s.viewGen)
 }
 
 func (s *Store) FindNodesByNameInRepo(name, repoPrefix string) []*graph.Node {
-	return s.queryNodes(s.stmtFindByNameInRepo, name, repoPrefix)
+	return s.queryNodes(s.stmtFindByNameInRepo, name, repoPrefix, s.viewGen)
 }
 
 func (s *Store) GetFileNodes(filePath string) []*graph.Node {
@@ -1726,11 +2005,11 @@ func (s *Store) GetFileNodes(filePath string) []*graph.Node {
 // localization. QueryContext covers both pool acquisition and SQLite execution,
 // so a busy store cannot extend a request beyond its context budget.
 func (s *Store) GetFileNodesContext(ctx context.Context, filePath string) []*graph.Node {
-	return s.queryNodesContext(ctx, s.stmtFileNodes, filePath)
+	return s.queryNodesContext(ctx, s.stmtFileNodes, filePath, s.viewGen)
 }
 
 func (s *Store) GetRepoNodes(repoPrefix string) []*graph.Node {
-	return s.queryNodes(s.stmtRepoNodes, repoPrefix)
+	return s.queryNodes(s.stmtRepoNodes, repoPrefix, s.viewGen)
 }
 
 func (s *Store) GetRepoNodesByLanguage(repoPrefix, language string) []*graph.Node {
@@ -1738,13 +2017,17 @@ func (s *Store) GetRepoNodesByLanguage(repoPrefix, language string) []*graph.Nod
 		return nil
 	}
 	return s.queryNodesSQL(
-		`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND language = ? ORDER BY id`,
-		repoPrefix, language,
+		`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND language = ? AND view_gen = ? ORDER BY id`,
+		repoPrefix, language, s.viewGen,
 	)
 }
 
 func (s *Store) AllNodes() []*graph.Node {
-	return s.queryNodes(s.stmtAllNodes)
+	stmt := s.stmtAllNodes
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationAllNodes
+	}
+	return s.queryNodes(stmt, s.viewGen)
 }
 
 func (s *Store) queryNodes(stmt *sql.Stmt, args ...any) []*graph.Node {
@@ -1791,16 +2074,16 @@ func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...a
 func (s *Store) GetRepoNonContentNodes(repoPrefix string) []*graph.Node {
 	const filter = `COALESCE(data_class, CASE WHEN json_valid(CAST(meta AS TEXT)) THEN json_extract(CAST(meta AS TEXT), '$.data_class') END) IS NOT 'content'`
 	if repoPrefix == "" {
-		return s.scanNodeQuery(`SELECT ` + lookupNodeCols + ` FROM nodes WHERE ` + filter)
+		return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE `+filter+` AND view_gen = ?`, s.viewGen)
 	}
-	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter, repoPrefix)
+	return s.scanNodeQuery(`SELECT `+lookupNodeCols+` FROM nodes WHERE repo_prefix = ? AND `+filter+` AND view_gen = ?`, repoPrefix, s.viewGen)
 }
 
 // AllNodesLight implements graph.NodeLightScanner with the identity/location
 // projection only. Whole-graph analyses avoid both the opaque metadata blob and
 // promoted docs/signatures, so returned nodes always have nil Meta.
 func (s *Store) AllNodesLight() []*graph.Node {
-	rows, err := s.db.Query(`SELECT ` + lookupNodeSummaryCols + ` FROM nodes`)
+	rows, err := s.db.Query(`SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE view_gen = ?`, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -1825,7 +2108,7 @@ func (s *Store) AllNodesLight() []*graph.Node {
 // only need promoted structural fields. This keeps an already-enriched repo's
 // metadata blobs out of the driver and decoder hot path.
 func (s *Store) GetRepoNodesLight(repoPrefix string) []*graph.Node {
-	rows, err := s.db.Query(`SELECT `+lookupNodeColsLight+` FROM nodes WHERE repo_prefix = ?`, repoPrefix)
+	rows, err := s.db.Query(`SELECT `+lookupNodeColsLight+` FROM nodes WHERE repo_prefix = ? AND view_gen = ?`, repoPrefix, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -1875,7 +2158,7 @@ func (s *Store) scanNodeQuery(query string, args ...any) []*graph.Node {
 }
 
 func (s *Store) GetOutEdges(nodeID string) []*graph.Edge {
-	return s.queryEdges(s.stmtOutEdges, nodeID)
+	return s.queryEdges(s.stmtOutEdges, nodeID, s.viewGen)
 }
 
 // EdgeExists reports whether an edge with exactly this identity is present --
@@ -1887,7 +2170,7 @@ func (s *Store) GetOutEdges(nodeID string) []*graph.Edge {
 // dominant share of resolve cost on a large graph.
 func (s *Store) EdgeExists(from, to string, kind graph.EdgeKind, filePath string, line int) bool {
 	var one int
-	err := s.stmtEdgeExists.QueryRow(from, to, string(kind), filePath, line).Scan(&one)
+	err := s.stmtEdgeExists.QueryRow(from, to, string(kind), filePath, line, s.viewGen).Scan(&one)
 	if err == sql.ErrNoRows {
 		return false
 	}
@@ -1899,7 +2182,7 @@ func (s *Store) EdgeExists(from, to string, kind graph.EdgeKind, filePath string
 }
 
 func (s *Store) GetInEdges(nodeID string) []*graph.Edge {
-	return s.queryEdges(s.stmtInEdges, nodeID)
+	return s.queryEdges(s.stmtInEdges, nodeID, s.viewGen)
 }
 
 // GetOutEdgesForNodes fetches the out-edges of many nodes in one batched query
@@ -1928,12 +2211,13 @@ func (s *Store) GetOutEdgesForNodes(ids []string) map[string][]*graph.Edge {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
 		ph := make([]string, len(chunk))
-		args := make([]any, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
 		for j, id := range chunk {
 			ph[j] = "?"
-			args[j] = id
+			args = append(args, id)
 		}
-		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id IN (` + strings.Join(ph, ",") + `)`
+		args = append(args, s.viewGen)
+		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id IN (` + strings.Join(ph, ",") + `) AND view_gen = ?`
 		for _, e := range s.queryEdgesSQL(q, args...) {
 			out[e.From] = append(out[e.From], e)
 		}
@@ -1942,7 +2226,11 @@ func (s *Store) GetOutEdgesForNodes(ids []string) map[string][]*graph.Edge {
 }
 
 func (s *Store) AllEdges() []*graph.Edge {
-	return s.queryEdges(s.stmtAllEdges)
+	stmt := s.stmtAllEdges
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationAllEdges
+	}
+	return s.queryEdges(stmt, s.viewGen)
 }
 
 // GetRepoEdges returns every edge whose source node has the given
@@ -1956,7 +2244,7 @@ func (s *Store) GetRepoEdges(repoPrefix string) []*graph.Edge {
 	if repoPrefix == "" {
 		return nil
 	}
-	return s.queryEdges(s.stmtRepoEdges, repoPrefix)
+	return s.queryEdges(s.stmtRepoEdges, repoPrefix, s.viewGen)
 }
 
 func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
@@ -1990,8 +2278,12 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 // -- counts and stats -----------------------------------------------------
 
 func (s *Store) NodeCount() int {
+	stmt := s.stmtNodeCount
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationNodeCount
+	}
 	var n int
-	if err := s.stmtNodeCount.QueryRow().Scan(&n); err != nil {
+	if err := stmt.QueryRow(s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
@@ -1999,12 +2291,34 @@ func (s *Store) NodeCount() int {
 }
 
 func (s *Store) EdgeCount() int {
+	stmt := s.stmtEdgeCount
+	if s.viewGen > baseViewGeneration {
+		stmt = s.stmtGenerationEdgeCount
+	}
 	var n int
-	if err := s.stmtEdgeCount.QueryRow().Scan(&n); err != nil {
+	if err := stmt.QueryRow(s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return 0
 	}
 	return n
+}
+
+// countsFromIndexState returns the whole-graph node and edge totals for
+// this view from the persisted per-repo counters in repo_index_state --
+// one indexed row per tracked repo, with no scan of the nodes or edges
+// tables. ok is false when the view has no counter rows (a never-indexed
+// or pre-counter store) so the caller falls back to the exact scan rather
+// than reporting a counter-absent zero as a real total.
+func (s *Store) countsFromIndexState() (nodes, edges int, ok bool) {
+	var rows int
+	if err := s.stmtIndexStateTotals.QueryRow(s.viewGen).Scan(&rows, &nodes, &edges); err != nil {
+		panicOnFatal(err)
+		return 0, 0, false
+	}
+	if rows == 0 {
+		return 0, 0, false
+	}
+	return nodes, edges, true
 }
 
 func (s *Store) Stats() graph.GraphStats {
@@ -2012,10 +2326,18 @@ func (s *Store) Stats() graph.GraphStats {
 		ByKind:     map[string]int{},
 		ByLanguage: map[string]int{},
 	}
-	st.TotalNodes = s.NodeCount()
-	st.TotalEdges = s.EdgeCount()
+	// Totals come from the persisted per-repo counters when present so a
+	// base (view_gen 0) read stays O(repos); the exact scan is the
+	// fallback for a store that has no counter rows yet.
+	if nodes, edges, ok := s.countsFromIndexState(); ok {
+		st.TotalNodes = nodes
+		st.TotalEdges = edges
+	} else {
+		st.TotalNodes = s.NodeCount()
+		st.TotalEdges = s.EdgeCount()
+	}
 
-	rows, err := s.stmtStatsByKind.Query()
+	rows, err := s.stmtStatsByKind.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return st
@@ -2040,7 +2362,7 @@ func (s *Store) Stats() graph.GraphStats {
 	}
 	_ = rows.Close()
 
-	rows, err = s.stmtStatsByLanguage.Query()
+	rows, err = s.stmtStatsByLanguage.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return st
@@ -2066,7 +2388,7 @@ func (s *Store) Stats() graph.GraphStats {
 
 func (s *Store) RepoStats() map[string]graph.GraphStats {
 	out := map[string]graph.GraphStats{}
-	rows, err := s.stmtRepoStatsNodes.Query()
+	rows, err := s.stmtRepoStatsNodes.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
@@ -2095,7 +2417,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 	}
 	_ = rows.Close()
 
-	rows, err = s.stmtRepoStatsEdges.Query()
+	rows, err = s.stmtRepoStatsEdges.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
@@ -2125,7 +2447,7 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 }
 
 func (s *Store) RepoPrefixes() []string {
-	rows, err := s.stmtRepoPrefixes.Query()
+	rows, err := s.stmtRepoPrefixes.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -2174,11 +2496,11 @@ const (
 func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 	var est graph.RepoMemoryEstimate
 	var n, e int
-	if err := s.stmtRepoNodeCount.QueryRow(repoPrefix).Scan(&n); err != nil {
+	if err := s.stmtRepoNodeCount.QueryRow(repoPrefix, s.viewGen).Scan(&n); err != nil {
 		panicOnFatal(err)
 		return est
 	}
-	if err := s.stmtRepoEdgeCount.QueryRow(repoPrefix).Scan(&e); err != nil {
+	if err := s.stmtRepoEdgeCount.QueryRow(repoPrefix, s.viewGen).Scan(&e); err != nil {
 		panicOnFatal(err)
 		return est
 	}
@@ -2212,7 +2534,7 @@ func (s *Store) RepoMemoryEstimate(repoPrefix string) graph.RepoMemoryEstimate {
 // renders.
 func (s *Store) AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate {
 	out := map[string]graph.RepoMemoryEstimate{}
-	rows, err := s.stmtAllRepoStateCounts.Query()
+	rows, err := s.stmtAllRepoStateCounts.Query(s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
@@ -2281,7 +2603,7 @@ func (s *Store) ScanRepoMemoryEstimates(ctx context.Context) (map[string]graph.R
 // scanRepoCounts runs one COUNT … GROUP BY repo_prefix scan to completion.
 // A scan cut short by the caller's deadline is an error, never a short map.
 func (s *Store) scanRepoCounts(ctx context.Context, stmt *sql.Stmt) (map[string]int, error) {
-	rows, err := stmt.QueryContext(ctx)
+	rows, err := stmt.QueryContext(ctx, s.viewGen)
 	if err != nil {
 		if ctx.Err() == nil {
 			panicOnFatal(err)
@@ -2411,11 +2733,19 @@ func isStoreClosedErr(err error) bool {
 // keep the structural advantage that the row count flowing through
 // scanEdge is proportional to the result, not the table.
 
-// EdgesByKind: indexed SELECT on the (kind) column.
+// EdgesByKind uses the kind index for the base corpus and the generation index
+// for derived views, where scanning a tiny layer is cheaper than scanning every
+// edge of the requested kind in generation zero and filtering afterward.
 func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		out := s.queryEdgesSQL(`SELECT `+lookupEdgeCols+`
-FROM edges WHERE kind = ?`, string(kind))
+		query := `SELECT ` + lookupEdgeCols + `
+FROM edges WHERE kind = ? AND view_gen = ?`
+		args := []any{string(kind), s.viewGen}
+		if s.viewGen > baseViewGeneration {
+			query = generationEdgesByKindSQL
+			args = []any{s.viewGen, string(kind)}
+		}
+		out := s.queryEdgesSQL(query, args...)
 		for _, e := range out {
 			if !yield(e) {
 				return
@@ -2424,10 +2754,17 @@ FROM edges WHERE kind = ?`, string(kind))
 	}
 }
 
-// NodesByKind: indexed SELECT on the (kind) column.
+// NodesByKind follows the same base-versus-derived access-path split as
+// EdgesByKind; derived generations are intentionally sparse.
 func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		out := s.queryNodesSQL(`SELECT `+lookupNodeCols+` FROM nodes WHERE kind = ?`, string(kind))
+		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind = ? AND view_gen = ?`
+		args := []any{string(kind), s.viewGen}
+		if s.viewGen > baseViewGeneration {
+			query = generationNodesByKindSQL
+			args = []any{s.viewGen, string(kind)}
+		}
+		out := s.queryNodesSQL(query, args...)
 		for _, n := range out {
 			if !yield(n) {
 				return
@@ -2576,11 +2913,12 @@ func (s *Store) GetNodesByIDs(ids []string) map[string]*graph.Node {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
 		placeholders := strings.Repeat(",?", len(chunk))[1:]
-		q := `SELECT ` + nodeCols + ` FROM nodes WHERE id IN (` + placeholders + `)`
-		args := make([]any, len(chunk))
-		for j, id := range chunk {
-			args[j] = id
+		q := `SELECT ` + nodeCols + ` FROM nodes WHERE id IN (` + placeholders + `) AND view_gen = ?`
+		args := make([]any, 0, len(chunk)+1)
+		for _, id := range chunk {
+			args = append(args, id)
 		}
+		args = append(args, s.viewGen)
 		for _, n := range s.queryNodesSQL(q, args...) {
 			if n != nil {
 				out[n.ID] = n
@@ -2617,11 +2955,12 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
 		placeholders := strings.Repeat(",?", len(chunk))[1:]
-		q := `SELECT ` + nodeCols + ` FROM nodes WHERE name IN (` + placeholders + `)`
-		args := make([]any, len(chunk))
-		for j, name := range chunk {
-			args[j] = name
+		q := `SELECT ` + nodeCols + ` FROM nodes WHERE name IN (` + placeholders + `) AND view_gen = ?`
+		args := make([]any, 0, len(chunk)+1)
+		for _, name := range chunk {
+			args = append(args, name)
 		}
+		args = append(args, s.viewGen)
 		for _, n := range s.queryNodesSQL(q, args...) {
 			if n == nil {
 				continue

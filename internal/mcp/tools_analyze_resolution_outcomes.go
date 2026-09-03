@@ -36,7 +36,7 @@ func (s *Server) handleAnalyzeResolutionOutcomes(ctx context.Context, req mcp.Ca
 	reasonFilter := strings.TrimSpace(stringArg(args, "reason"))
 	limit := intArg(args, "limit", 50)
 
-	result := analyzer.AnalyzeResolutionOutcomes(s.graph, reasonFilter, limit)
+	result := analyzer.AnalyzeResolutionOutcomes(s.readerFor(ctx), reasonFilter, limit)
 
 	if isCompact(req) {
 		var b strings.Builder

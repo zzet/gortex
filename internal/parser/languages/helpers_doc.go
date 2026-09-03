@@ -37,20 +37,28 @@ const (
 	DocLangDashDash
 )
 
-// docWrapperKeywords are the leading tokens of a "wrapper" line that sits
-// between a doc comment and the real declaration — export / visibility
-// modifiers the doc lives above. Matched as a whole line or as a leading word.
-var docWrapperKeywords = []string{
-	"export", "export default", "default",
-	"public", "private", "protected", "internal", "pub",
-	"module.exports", "abstract", "final",
+// docWrapperTokens are the modifier tokens a "wrapper" line may consist
+// of — a line that sits between a doc comment and the real declaration
+// carrying nothing but export / visibility modifiers (`export default`,
+// a bare `public`).
+var docWrapperTokens = map[string]bool{
+	"export": true, "default": true,
+	"public": true, "private": true, "protected": true, "internal": true, "pub": true,
+	"abstract": true, "final": true, "static": true,
 }
 
 // isDocWrapperLine reports whether a non-comment line is a declaration wrapper
 // the doc-comment climb should skip over (rather than terminate on) when no
 // comment has been collected yet: a decorator / annotation (`@Component`,
-// `@app.route(...)`, `@dataclass`) or an export / visibility keyword that
-// commonly sits on its own line between the doc and the declaration.
+// `@app.route(...)`, `@dataclass`) or a line made ONLY of export /
+// visibility modifiers that sit on their own line between the doc and the
+// declaration.
+//
+// A line that merely STARTS with a modifier is not a wrapper — it is the
+// previous declaration. Climbing past `public int A { get; set; }` handed
+// A's doc to every undocumented member below it (any language whose
+// members lead with a modifier), and made the climb linear in the member
+// count per member, quadratic per file.
 func isDocWrapperLine(trimmed []byte) bool {
 	if len(trimmed) == 0 {
 		return false
@@ -58,13 +66,24 @@ func isDocWrapperLine(trimmed []byte) bool {
 	if trimmed[0] == '@' { // decorator / annotation
 		return true
 	}
-	s := string(trimmed)
-	for _, w := range docWrapperKeywords {
-		if s == w || strings.HasPrefix(s, w+" ") {
-			return true
+	// Token scan in place — no bytes.Fields slice — so ExtractDocAbove's
+	// allocation contract still holds on this path.
+	rest := trimmed
+	for len(rest) > 0 {
+		rest = bytes.TrimLeft(rest, " \t")
+		if len(rest) == 0 {
+			break
 		}
+		end := bytes.IndexAny(rest, " \t")
+		if end < 0 {
+			end = len(rest)
+		}
+		if !docWrapperTokens[string(rest[:end])] {
+			return false
+		}
+		rest = rest[end:]
 	}
-	return false
+	return true
 }
 
 // ExtractDocAbove walks upward from startRow0 collecting contiguous
@@ -115,6 +134,30 @@ func ExtractDocAbove(src []byte, startRow0 int, lang docCommentLang) string {
 			}
 		}
 	}
+	return extractDocAboveEnd(src, end, lang)
+}
+
+// ExtractDocAboveByte is ExtractDocAbove addressed by the declaration's
+// start BYTE offset instead of its row. The row form has to count
+// newlines from the top of the file to find its starting point, which
+// is linear in the declaration's position and therefore quadratic over a
+// file's members; a caller holding the tree-sitter node can hand over
+// its start byte and the walk begins right there. Same lines, same
+// result.
+func ExtractDocAboveByte(src []byte, startByte int, lang docCommentLang) string {
+	if startByte <= 0 || len(src) == 0 {
+		return ""
+	}
+	if startByte > len(src) {
+		startByte = len(src)
+	}
+	return extractDocAboveEnd(src, bytes.LastIndexByte(src[:startByte], '\n'), lang)
+}
+
+// extractDocAboveEnd is the shared upward walk. end indexes the '\n'
+// that terminates the line directly above the declaration; -1 means
+// there is no such line.
+func extractDocAboveEnd(src []byte, end int, lang docCommentLang) string {
 	if end < 0 {
 		return ""
 	}

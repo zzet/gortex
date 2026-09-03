@@ -3,9 +3,10 @@ package tstypes
 // Shape pins for stub adoption beyond the core four in
 // csharp_accessor_attribution_test.go: the initializer lanes, chained
 // heads, pre-resolved stubs, snapshot-hygiene guards, and the tie
-// semantics (line containment breaks a tie only WITHIN the tied owner
-// set — a callable that merely shares the line never collects a call it
-// did not author).
+// semantics (the fact's own author breaks a same-line same-name tie;
+// line containment is the fallback and breaks it only WITHIN the tied
+// owner set — a callable that merely shares the line never collects a
+// call it did not author).
 
 import (
 	"testing"
@@ -290,10 +291,11 @@ func TestCSharpAdopt_OutOfExtentSyntheticEdgeNotAdopted(t *testing.T) {
 }
 
 // The dangerous tie variant: TWO properties call the same name on a line
-// shared with a method that calls it NOT AT ALL. The tie must refuse the
-// site outright — falling back to line containment would name the
-// method, find no claimable stub, and MINT an ast_resolved edge for a
-// call the method never authored.
+// shared with a method that calls it NOT AT ALL. Each property's fact
+// names its own author, so both sites resolve onto their own stubs; the
+// method never enters — falling back to line containment would name it,
+// find no claimable stub, and MINT an ast_resolved edge for a call it
+// never authored.
 func TestCSharp_TieWithNonCandidateCallableRefusesMint(t *testing.T) {
 	g, dir := buildFixture(t, map[string]string{
 		"A/Svc.cs": csSvc,
@@ -313,15 +315,24 @@ func TestCSharp_TieWithNonCandidateCallableRefusesMint(t *testing.T) {
 	if got := callEdgesNamed(g, idle.ID, "Run"); len(got) != 0 {
 		t.Errorf("tie fallback fabricated %d Run edge(s) on a method that authored none: %v", len(got), got)
 	}
-	a1 := nodeByNameKind(t, g, "A1", graph.KindField)
-	a2 := nodeByNameKind(t, g, "A2", graph.KindField)
-	assertUntouched(t, g, a1.ID, "Run", "csharp-types")
-	assertUntouched(t, g, a2.ID, "Run", "csharp-types")
+	run := nodeByNameKind(t, g, "Run", graph.KindMethod)
+	for _, name := range []string{"A1", "A2"} {
+		prop := nodeByNameKind(t, g, name, graph.KindField)
+		if e := callEdgeTo(g, prop.ID, run.ID); e == nil {
+			t.Errorf("%s: own call not resolved on a same-name tie; edges: %v", name, g.GetOutEdges(prop.ID))
+		} else {
+			assertASTProvenance(t, e, "csharp-types")
+		}
+		if edges := callEdgesNamed(g, prop.ID, "Run"); len(edges) != 1 {
+			t.Errorf("%s: %d Run edge(s), want exactly its own: %v", name, len(edges), edges)
+		}
+	}
 }
 
-// A same-name tie where the line-containment answer IS one of the tied
-// owners: the method keeps its own call (claimed in place) and the
-// property's indistinguishable site stays untouched — never handed to a
+// A same-name tie where a property and a method call the SAME target on
+// one shared line: a tie is broken per authored fact, not once per line,
+// so each owner resolves its own site onto its own stub — the method's
+// claimed in place, the property's independently — never handed to a
 // third party, never doubled.
 func TestCSharp_SameNameTieMethodKeepsOwnCall(t *testing.T) {
 	g, dir := buildFixture(t, map[string]string{
@@ -338,17 +349,74 @@ func TestCSharp_SameNameTieMethodKeepsOwnCall(t *testing.T) {
 	if _, err := p.Enrich(g, dir); err != nil {
 		t.Fatal(err)
 	}
-	busy := nodeByNameKind(t, g, "Busy", graph.KindMethod)
 	run := nodeByNameKind(t, g, "Run", graph.KindMethod)
-	if e := callEdgeTo(g, busy.ID, run.ID); e == nil {
-		t.Errorf("method's own call lost on a same-name tie; edges: %v", g.GetOutEdges(busy.ID))
-	}
+	busy := nodeByNameKind(t, g, "Busy", graph.KindMethod)
 	quick := nodeByNameKind(t, g, "Quick", graph.KindField)
-	if edges := callEdgesNamed(g, busy.ID, "Run"); len(edges) > 1 {
-		t.Errorf("same-name tie doubled the method's edges: %v", edges)
+	for _, owner := range []*graph.Node{busy, quick} {
+		if e := callEdgeTo(g, owner.ID, run.ID); e == nil {
+			t.Errorf("%s: own call lost on a same-name tie; edges: %v", owner.Name, g.GetOutEdges(owner.ID))
+		} else {
+			assertASTProvenance(t, e, "csharp-types")
+		}
+		if edges := callEdgesNamed(g, owner.ID, "Run"); len(edges) != 1 {
+			t.Errorf("%s: %d Run edge(s), want exactly its own: %v", owner.Name, len(edges), edges)
+		}
 	}
-	if e := callEdgeTo(g, quick.ID, run.ID); e != nil {
-		t.Logf("note: property side also resolved (%v) — acceptable, but not required by the tie contract", e)
+}
+
+// The issue-730 shape: two tied owners call the same NAME on different
+// TYPES. Each fact must land on its own author's stub. Before the authored
+// owner rode on the fact, the first fact applied (the property's)
+// retargeted the METHOD's stub to the property's target — the method then
+// carried a confident edge to a type it never calls, and its real call
+// was unreachable because the edge was no longer claimable.
+func TestCSharp_SameNameTieDifferentTargets(t *testing.T) {
+	g, dir := buildFixture(t, map[string]string{
+		"Core/Engine.cs": `namespace Core {
+    public class Engine {
+        public void Fire() {}
+        public void Halt() {}
+    }
+}
+`,
+		"Core/Other.cs": `namespace Core {
+    public class Other {
+        public void Fire() {}
+    }
+}
+`,
+		"Use/Rig.cs": `namespace Use {
+    public class Rig {
+        private Engine motor; private Other pal;
+        public int Level { get { motor.Fire(); return 7; } } public void Busy() { pal.Fire(); }
+    }
+}
+`,
+	})
+	p := NewProvider(CSharpSpec(), zap.NewNop())
+	if _, err := p.Enrich(g, dir); err != nil {
+		t.Fatal(err)
+	}
+	const engineFire, otherFire = "Core/Engine.cs::Engine.Fire", "Core/Other.cs::Other.Fire"
+	busy := nodeByNameKind(t, g, "Busy", graph.KindMethod)
+	level := nodeByNameKind(t, g, "Level", graph.KindField)
+	if e := callEdgeTo(g, busy.ID, otherFire); e == nil {
+		t.Errorf("method's own call (Other.Fire) lost; edges: %v", g.GetOutEdges(busy.ID))
+	} else {
+		assertASTProvenance(t, e, "csharp-types")
+	}
+	if e := callEdgeTo(g, busy.ID, engineFire); e != nil {
+		t.Errorf("method carries the property's resolution (Engine.Fire): %v", e)
+	}
+	if e := callEdgeTo(g, level.ID, engineFire); e == nil {
+		t.Errorf("property's own call (Engine.Fire) not resolved; edges: %v", g.GetOutEdges(level.ID))
+	} else {
+		assertASTProvenance(t, e, "csharp-types")
+	}
+	for _, owner := range []*graph.Node{busy, level} {
+		if edges := callEdgesNamed(g, owner.ID, "Fire"); len(edges) != 1 {
+			t.Errorf("%s: %d Fire edge(s), want exactly its own: %v", owner.Name, len(edges), edges)
+		}
 	}
 }
 

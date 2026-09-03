@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -109,19 +110,21 @@ func isExportedChange(n *graph.Node) bool {
 }
 
 // externalCallers counts call / reference sites that originate outside the
-// symbol's own file — the consumers an API change would break.
-func (s *Server) externalCallers(n *graph.Node) int {
-	if s.graph == nil {
+// symbol's own file — the consumers an API change would break. Reads through
+// the caller's reader, so an overlay-active request counts the consumers its
+// own buffers have.
+func externalCallers(r graph.Reader, n *graph.Node) int {
+	if r == nil {
 		return 0
 	}
 	count := 0
-	for _, e := range s.graph.GetInEdges(n.ID) {
+	for _, e := range r.GetInEdges(n.ID) {
 		switch e.Kind {
 		case graph.EdgeCalls, graph.EdgeReferences, graph.EdgeCrossRepoCalls:
 		default:
 			continue
 		}
-		if caller := s.graph.GetNode(e.From); caller != nil && caller.FilePath != n.FilePath {
+		if caller := r.GetNode(e.From); caller != nil && caller.FilePath != n.FilePath {
 			count++
 		}
 	}
@@ -130,9 +133,9 @@ func (s *Server) externalCallers(n *graph.Node) int {
 
 // contractsTouched returns the names of API contracts (HTTP routes, topics,
 // …) the symbol participates in, via implements / references edges to
-// KindContract nodes.
-func (s *Server) contractsTouched(n *graph.Node) []string {
-	if s.graph == nil {
+// KindContract nodes. Reads through the caller's reader.
+func contractsTouched(r graph.Reader, n *graph.Node) []string {
+	if r == nil {
 		return nil
 	}
 	seen := make(map[string]bool)
@@ -142,7 +145,7 @@ func (s *Server) contractsTouched(n *graph.Node) []string {
 			if e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeReferences {
 				continue
 			}
-			if cn := s.graph.GetNode(to(e)); cn != nil && cn.Kind == graph.KindContract {
+			if cn := r.GetNode(to(e)); cn != nil && cn.Kind == graph.KindContract {
 				if !seen[cn.Name] {
 					seen[cn.Name] = true
 					names = append(names, cn.Name)
@@ -150,16 +153,18 @@ func (s *Server) contractsTouched(n *graph.Node) []string {
 			}
 		}
 	}
-	visit(s.graph.GetOutEdges(n.ID), func(e *graph.Edge) string { return e.To })
-	visit(s.graph.GetInEdges(n.ID), func(e *graph.Edge) string { return e.From })
+	visit(r.GetOutEdges(n.ID), func(e *graph.Edge) string { return e.To })
+	visit(r.GetInEdges(n.ID), func(e *graph.Edge) string { return e.From })
 	sort.Strings(names)
 	return names
 }
 
 // apiDriftReasons evaluates the public-surface drift of the changed set: each
 // exported symbol with cross-file consumers (or a participating contract) is a
-// breaking-change risk between the two refs.
-func (s *Server) apiDriftReasons(p *prediction) ([]changeReason, []apiSurfaceEntry) {
+// breaking-change risk between the two refs. The request reader is resolved
+// once and handed to both per-symbol lookups.
+func (s *Server) apiDriftReasons(ctx context.Context, p *prediction) ([]changeReason, []apiSurfaceEntry) {
+	reader := s.readerFor(ctx)
 	var reasons []changeReason
 	var surface []apiSurfaceEntry
 	for _, n := range p.nodes {
@@ -170,8 +175,8 @@ func (s *Server) apiDriftReasons(p *prediction) ([]changeReason, []apiSurfaceEnt
 		if !isExportedChange(n) {
 			continue
 		}
-		ext := s.externalCallers(n)
-		contracts := s.contractsTouched(n)
+		ext := externalCallers(reader, n)
+		contracts := contractsTouched(reader, n)
 		surface = append(surface, apiSurfaceEntry{
 			ID:              n.ID,
 			Name:            n.Name,

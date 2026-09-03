@@ -240,7 +240,7 @@ jobs:
             -v "$PWD":/go/src/gortex \
             -w /go/src/gortex \
             -e GITHUB_TOKEN \
-            ghcr.io/goreleaser/goreleaser-cross:v1.26 \
+            ghcr.io/goreleaser/goreleaser-cross:v1.27 \
             release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

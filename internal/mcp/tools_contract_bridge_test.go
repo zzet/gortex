@@ -345,7 +345,7 @@ func TestCollectBridgeGroups_BoundaryScopedParticipants(t *testing.T) {
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil)
 	srv.SetContractRegistry(reg)
 
-	groups := srv.collectBridgeGroups(nil)
+	groups := srv.collectBridgeGroups(context.Background(), nil)
 	require.Len(t, groups, 1)
 	grp := groups[0]
 	require.Len(t, grp.Providers, 1,

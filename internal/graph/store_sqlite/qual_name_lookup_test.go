@@ -28,7 +28,7 @@ func TestGetNodesByQualNamesUsesPartialIndexAndReopens(t *testing.T) {
 
 	ordered := store.queryNodesSQL(
 		nodesByQualNameLookupSQL,
-		qualNameLookupPayload([]string{"pkg.Zeta", "pkg.Alpha", "pkg.Middle"}),
+		qualNameLookupPayload([]string{"pkg.Zeta", "pkg.Alpha", "pkg.Middle"}), store.viewGen,
 	)
 	if len(ordered) != 3 {
 		t.Fatalf("ordered lookup returned %d nodes, want 3", len(ordered))
@@ -86,8 +86,10 @@ func TestGetNodesByQualNamesSingleJSONBindHandles40001Names(t *testing.T) {
 	qualNames[count/2] = "hit.middle"
 	qualNames[count-1] = "hit.last"
 
-	if binds := strings.Count(nodesByQualNameLookupSQL, "?"); binds != 1 {
-		t.Fatalf("qualified-name lookup bind count = %d, want exactly 1", binds)
+	// One bind for the whole name page plus one for the generation: the page
+	// size must never reach the SQL text, whatever its length.
+	if binds := strings.Count(nodesByQualNameLookupSQL, "?"); binds != 2 {
+		t.Fatalf("qualified-name lookup bind count = %d, want the JSON page plus the generation", binds)
 	}
 	got := store.GetNodesByQualNames(qualNames)
 	if len(got) != 3 {
@@ -162,7 +164,7 @@ func assertQualNameLookupPlan(t *testing.T, store *Store) {
 	t.Helper()
 	rows, err := store.writerDB.Query(
 		`EXPLAIN QUERY PLAN `+nodesByQualNameLookupSQL,
-		qualNameLookupPayload([]string{"pkg.Alpha", "pkg.Zeta"}),
+		qualNameLookupPayload([]string{"pkg.Alpha", "pkg.Zeta"}), store.viewGen,
 	)
 	if err != nil {
 		t.Fatal(err)

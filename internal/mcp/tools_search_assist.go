@@ -530,14 +530,14 @@ func topCallersForVerify(eng *query.Engine, n *graph.Node) []llm.CallerInfo {
 // Returns "" when no source can be read or when the node isn't a
 // function/method — non-function symbols pass through to the verifier
 // with signature-only context, which the prompt handles explicitly.
-func extractBodyForVerify(s *Server, n *graph.Node) string {
+func extractBodyForVerify(ctx context.Context, s *Server, n *graph.Node) string {
 	if n.Kind != graph.KindFunction && n.Kind != graph.KindMethod {
 		return ""
 	}
 	if n.StartLine <= 0 || n.EndLine <= 0 {
 		return ""
 	}
-	abs, err := s.resolveNodePath(n)
+	abs, err := s.resolveNodePath(ctx, n)
 	if err != nil {
 		return ""
 	}
@@ -616,7 +616,7 @@ func verifyWithLLM(ctx context.Context, s *Server, query string, nodes []*graph.
 			ID:        n.ID,
 			Name:      n.Name,
 			Signature: sig,
-			Body:      extractBodyForVerify(s, n),
+			Body:      extractBodyForVerify(ctx, s, n),
 			Callers:   topCallersForVerify(s.engineFor(ctx), n),
 		}
 		idx[n.ID] = n

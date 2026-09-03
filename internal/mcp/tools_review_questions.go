@@ -148,16 +148,16 @@ func (s *Server) handleSuggestedReviewQuestions(ctx context.Context, req mcp.Cal
 
 	var questions []reviewQuestion
 	if wantCat[rqCatBridge] {
-		questions = append(questions, s.mineBridgeQuestions(candidates, minBetweenness)...)
+		questions = append(questions, s.mineBridgeQuestions(ctx, candidates, minBetweenness)...)
 	}
 	if wantCat[rqCatHubRisk] {
-		questions = append(questions, s.mineHubRiskQuestions(candidates, hubThreshold)...)
+		questions = append(questions, s.mineHubRiskQuestions(ctx, candidates, hubThreshold)...)
 	}
 	if wantCat[rqCatThinCommunity] {
 		questions = append(questions, s.mineThinCommunityQuestions(candidates, minCommunitySize)...)
 	}
 	if wantCat[rqCatUntestedHotspot] {
-		questions = append(questions, s.mineUntestedHotspotQuestions(candidates, hubThreshold)...)
+		questions = append(questions, s.mineUntestedHotspotQuestions(ctx, candidates, hubThreshold)...)
 	}
 	if wantCat[rqCatSurprising] {
 		questions = append(questions, s.mineSurprisingQuestions(ctx, scopedSet, targetIDs, pathPrefix, hubThreshold)...)
@@ -227,7 +227,7 @@ func (s *Server) resolveReviewQuestionTargets(ctx context.Context, req mcp.CallT
 		if repoRoot == "" {
 			return nil, errReviewQuestionsNoRoot
 		}
-		diff, derr := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, "compare", base)
+		diff, derr := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, "compare", base)
 		if derr != nil {
 			return nil, derr
 		}
@@ -272,8 +272,8 @@ func parseReviewQuestionCategories(raw string) map[string]bool {
 // mineBridgeQuestions flags candidate symbols whose normalized
 // betweenness centrality clears minBetweenness — the call graph routes
 // many shortest paths through them, so a change there ripples widely.
-func (s *Server) mineBridgeQuestions(candidates []*graph.Node, minBetweenness float64) []reviewQuestion {
-	bc := analysis.ComputeBetweenness(s.graph)
+func (s *Server) mineBridgeQuestions(ctx context.Context, candidates []*graph.Node, minBetweenness float64) []reviewQuestion {
+	bc := analysis.ComputeBetweenness(s.readerFor(ctx))
 	if bc == nil || bc.Max <= 0 {
 		return nil
 	}
@@ -307,7 +307,7 @@ func (s *Server) mineBridgeQuestions(candidates []*graph.Node, minBetweenness fl
 // mineHubRiskQuestions flags candidate symbols whose fan-in (incoming
 // calls/references) is at or above hubThreshold — a wide blast radius
 // for any behaviour change.
-func (s *Server) mineHubRiskQuestions(candidates []*graph.Node, hubThreshold int) []reviewQuestion {
+func (s *Server) mineHubRiskQuestions(ctx context.Context, candidates []*graph.Node, hubThreshold int) []reviewQuestion {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -315,7 +315,7 @@ func (s *Server) mineHubRiskQuestions(candidates []*graph.Node, hubThreshold int
 	for _, n := range candidates {
 		ids = append(ids, n.ID)
 	}
-	fanIn, _ := analysis.CollectFanCounts(s.graph, ids,
+	fanIn, _ := analysis.CollectFanCounts(s.readerFor(ctx), ids,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		[]graph.EdgeKind{graph.EdgeCalls},
 	)
@@ -391,7 +391,7 @@ func (s *Server) mineThinCommunityQuestions(candidates []*graph.Node, minCommuni
 // mineUntestedHotspotQuestions flags candidate symbols that are
 // load-bearing (fan-in at or above hubThreshold) yet have no inbound
 // EdgeTests edge — a change there is high-impact and unguarded by tests.
-func (s *Server) mineUntestedHotspotQuestions(candidates []*graph.Node, hubThreshold int) []reviewQuestion {
+func (s *Server) mineUntestedHotspotQuestions(ctx context.Context, candidates []*graph.Node, hubThreshold int) []reviewQuestion {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -399,7 +399,7 @@ func (s *Server) mineUntestedHotspotQuestions(candidates []*graph.Node, hubThres
 	for _, n := range candidates {
 		ids = append(ids, n.ID)
 	}
-	fanIn, _ := analysis.CollectFanCounts(s.graph, ids,
+	fanIn, _ := analysis.CollectFanCounts(s.readerFor(ctx), ids,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		[]graph.EdgeKind{graph.EdgeCalls},
 	)
@@ -409,7 +409,7 @@ func (s *Server) mineUntestedHotspotQuestions(candidates []*graph.Node, hubThres
 		if fi < hubThreshold {
 			continue
 		}
-		if s.symbolHasInboundTest(n.ID) {
+		if s.symbolHasInboundTest(ctx, n.ID) {
 			continue
 		}
 		sev := rqSevHigh
@@ -493,8 +493,8 @@ func (s *Server) mineSurprisingQuestions(
 // at the symbol — the same one-hop inverse-edge walk the blast-radius
 // analyzer uses, kept inline so this file doesn't reach into analysis
 // for one predicate.
-func (s *Server) symbolHasInboundTest(symbolID string) bool {
-	for _, e := range s.graph.GetInEdges(symbolID) {
+func (s *Server) symbolHasInboundTest(ctx context.Context, symbolID string) bool {
+	for _, e := range s.readerFor(ctx).GetInEdges(symbolID) {
 		if e.Kind == graph.EdgeTests {
 			return true
 		}

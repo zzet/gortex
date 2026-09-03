@@ -17,13 +17,15 @@ import (
 // the number of bucket rows crossing from SQLite into Go.
 const unresolvedFrontierBucketLimit = 128
 
-var unresolvedFrontierSQL = `
+func unresolvedFrontierSQL(source, generation string) string {
+	return `
 WITH pending AS (
     SELECT
         kind,
         substr(to_id, instr(to_id, 'unresolved::') + length('unresolved::')) AS target_tail
-    FROM edges INDEXED BY edges_by_unresolved
-    WHERE ` + unresolvedEdgePredicate + `
+    FROM ` + source + `
+    WHERE ` + generation + `
+      AND ` + unresolvedEdgePredicate + `
 )
 SELECT
     kind,
@@ -44,6 +46,7 @@ FROM pending
 GROUP BY kind, target_class
 ORDER BY bucket_count DESC, kind, target_class
 LIMIT ` + strconv.Itoa(unresolvedFrontierBucketLimit)
+}
 
 var _ graph.UnresolvedFrontierCounter = (*Store)(nil)
 
@@ -52,7 +55,8 @@ var _ graph.UnresolvedFrontierCounter = (*Store)(nil)
 // follow-up queries.
 func (s *Store) CountUnresolvedFrontier() (graph.UnresolvedFrontierStats, error) {
 	stats := graph.UnresolvedFrontierStats{QueryCount: 1}
-	rows, err := s.db.Query(unresolvedFrontierSQL)
+	source, generation := s.unresolvedScanSource(unresolvedFrontierBaseSource)
+	rows, err := s.db.Query(unresolvedFrontierSQL(source, generation), s.viewGen)
 	if err != nil {
 		return stats, fmt.Errorf("count unresolved frontier: %w", err)
 	}

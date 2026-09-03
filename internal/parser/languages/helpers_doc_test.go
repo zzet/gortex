@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -246,6 +247,55 @@ func TestDocWrapperClimb(t *testing.T) {
 		src := []byte("// unrelated comment\nsomeRealCode()\nfunc Bar() {}\n")
 		if got := ExtractDocAbove(src, 2, DocLangSlashSlash); got != "" {
 			t.Errorf("must not climb past real code; got %q", got)
+		}
+	})
+
+	t.Run("sibling_declaration_terminates", func(t *testing.T) {
+		// A line that merely STARTS with a modifier is the previous
+		// declaration, not a wrapper: B must not inherit A's doc. Climbing
+		// past it also made the scan linear in the member count per member.
+		src := []byte("// doc A\npublic int A;\npublic int B;\n")
+		if got := ExtractDocAbove(src, 1, DocLangSlashSlash); got != "doc A" {
+			t.Errorf("A's own doc = %q, want %q", got, "doc A")
+		}
+		if got := ExtractDocAbove(src, 2, DocLangSlashSlash); got != "" {
+			t.Errorf("B inherited a sibling's doc: %q", got)
+		}
+	})
+
+	t.Run("bare_modifier_line_still_climbed", func(t *testing.T) {
+		src := []byte("// doc F\nexport default\nfunction f() {}\n")
+		if got := ExtractDocAbove(src, 2, DocLangSlashSlash); got != "doc F" {
+			t.Errorf("export default climb = %q, want %q", got, "doc F")
+		}
+		src = []byte("// doc S\npublic static\nint S() { return 1; }\n")
+		if got := ExtractDocAbove(src, 2, DocLangSlashSlash); got != "doc S" {
+			t.Errorf("public static climb = %q, want %q", got, "doc S")
+		}
+	})
+
+	t.Run("module_exports_statement_terminates", func(t *testing.T) {
+		// `module.exports = ...` led the old wrapper list, so a doc above
+		// it reached whatever declaration came NEXT - the first member of
+		// the exported object literal. It is a statement, not a wrapper.
+		src := []byte("// doc for the module\nmodule.exports = {\n  run() {}\n}\n")
+		if got := ExtractDocAbove(src, 2, DocLangSlashSlash); got != "" {
+			t.Errorf("module.exports climb handed the module doc to a member: %q", got)
+		}
+	})
+
+	t.Run("byte_offset_entry_matches_row_entry", func(t *testing.T) {
+		// The byte-offset entry point finds the same lines as the row
+		// entry point, including CRLF sources and a declaration whose
+		// node starts mid-line.
+		src := []byte("using X;\r\n\r\n/// <summary>Sum.</summary>\r\n[Obsolete] public int Sum() => 1;\r\n")
+		row := ExtractDocAbove(src, 3, DocLangCSharpXML)
+		start := bytes.Index(src, []byte("public int Sum"))
+		if got := ExtractDocAboveByte(src, start, DocLangCSharpXML); got != row || got == "" {
+			t.Errorf("byte entry = %q, row entry = %q", got, row)
+		}
+		if got := ExtractDocAboveByte(src, 0, DocLangCSharpXML); got != "" {
+			t.Errorf("offset 0 has nothing above it, got %q", got)
 		}
 	})
 }

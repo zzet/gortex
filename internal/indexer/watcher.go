@@ -13,12 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sgtdi/fswatcher"
+	"github.com/zzet/gortex/internal/thirdparty/fswatcher"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 )
@@ -106,9 +107,14 @@ type Watcher struct {
 	pendingGeneration  map[string]uint64
 	mutationWaiters    map[string]map[uint64]chan MutationResult
 	nextGeneration     uint64
-	mu                 sync.Mutex
-	stopping           bool
-	asyncWork          sync.WaitGroup
+	// mutationRetryDelayFn and pointMutationPatch are deterministic test seams.
+	// Production retries use mutationRetryBackoff and the complete point pipeline.
+	mutationRetryDelayFn   func(int) time.Duration
+	pointMutationPatch     func(string, ChangeKind, uint64) error
+	mutationBeforeComplete func(string, uint64)
+	mu                     sync.Mutex
+	stopping               bool
+	asyncWork              sync.WaitGroup
 	// patchMu serialises per-path patchGraph invocations so the
 	// post-patch reach rebuild (which scans every Node.Meta) cannot
 	// race with another debounced patch's IndexFile / EvictFile /
@@ -156,18 +162,19 @@ type Watcher struct {
 
 	// Storm-mode state. Guarded by stormMu so the hot per-file
 	// debounce path (mu) doesn't contend with rate-tracking.
-	stormMu          sync.Mutex
-	eventTimes       []time.Time           // sliding window of recent event timestamps
-	stormBatch       map[string]ChangeKind // dirty set during an event storm
-	stormGenerations map[string]uint64     // newest debounced generation adopted per path
-	stormTimer       *time.Timer           // fires after the quiet period
-	stormActive      bool                  // true while waiting to drain
-	stormStopped     bool                  // Stop has closed storm admission
-	stormWork        sync.WaitGroup        // scheduled/running timer callbacks
-	stormDrained     func(int)             // test hook: batch drained; batch size arg
-	stormBeforeLock  func()                // test hook: immediately before repository-lane admission
-	batchReindex     watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
-	discoverReindex  watcherBatchReindex   // additive directory discovery with the same complete tail
+	stormMu           sync.Mutex
+	eventTimes        []time.Time           // sliding window of recent event timestamps
+	stormBatch        map[string]ChangeKind // dirty set during an event storm
+	stormGenerations  map[string]uint64     // newest debounced generation adopted per path
+	stormTimer        *time.Timer           // fires after the quiet period
+	stormActive       bool                  // true while waiting to drain
+	stormStopped      bool                  // Stop has closed storm admission
+	stormRetryAttempt int                   // retry ordinal for the published storm timer
+	stormWork         sync.WaitGroup        // scheduled/running timer callbacks
+	stormDrained      func(int)             // test hook: batch drained; batch size arg
+	stormBeforeLock   func()                // test hook: immediately before repository-lane admission
+	batchReindex      watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
+	discoverReindex   watcherBatchReindex   // additive directory discovery with the same complete tail
 	// pointReindexRaw runs the complete exact-path pipeline after the watcher
 	// already owns the repository lane. MultiWatcher installs its raw tail here.
 	pointReindexRaw func(string) (*IndexResult, error)
@@ -215,7 +222,43 @@ type Watcher struct {
 	reresolveFn      func(map[string]struct{})
 }
 
-const maxHistory = 1000
+const (
+	maxHistory             = 1000
+	mutationRetryBaseDelay = 100 * time.Millisecond
+	mutationRetryMaxDelay  = 5 * time.Second
+)
+
+func retryableMutationError(err error) bool {
+	var committed interface{ Committed() bool }
+	if errors.As(err, &committed) && committed.Committed() {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func mutationRetryBackoff(attempt int) time.Duration {
+	if attempt <= 1 {
+		return mutationRetryBaseDelay
+	}
+	delay := mutationRetryBaseDelay
+	for n := 1; n < attempt; n++ {
+		if delay >= mutationRetryMaxDelay/2 {
+			return mutationRetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > mutationRetryMaxDelay {
+		return mutationRetryMaxDelay
+	}
+	return delay
+}
+
+func (w *Watcher) mutationRetryDelay(attempt int) time.Duration {
+	if w.mutationRetryDelayFn != nil {
+		return w.mutationRetryDelayFn(attempt)
+	}
+	return mutationRetryBackoff(attempt)
+}
 
 var (
 	errMutationSuperseded    = errors.New("mutation generation superseded")
@@ -1101,6 +1144,7 @@ func (w *Watcher) Stop() error {
 	w.stormGenerations = make(map[string]uint64)
 	w.eventTimes = nil
 	w.stormActive = false
+	w.stormRetryAttempt = 0
 	w.stormMu.Unlock()
 
 	close(w.done)
@@ -1307,23 +1351,38 @@ func (w *Watcher) signalStopped() {
 	w.stoppedOnce.Do(func() { close(w.stopped) })
 }
 
-// guardWatcherPanic recovers a panic in a watcher background goroutine —
+// guardWatcherPanic recovers a typed store panic in a watcher background goroutine —
 // a debounced patch, a storm drain, an overflow reconcile, or a
 // new-directory scan. Those goroutines call into the graph store, and
-// store_sqlite turns a fatal storage error (a closed DB during a daemon
-// restart, a busy/locked DB, disk-full) into a panic via panicOnFatal.
+// legacy store methods turn operational SQLite failures into a typed panic.
 // The MCP tool path has its own firewall (wrapToolHandler); these
 // fsnotify-driven goroutines don't route through it, so without this a
-// single transient store error during a restart or rebuild takes the
-// whole daemon down. Recovering aborts just that unit of work — the file
-// stays stale until the next event or the reconcile janitor — instead of
-// crashing the process.
+// storage error can take the whole daemon down. Arbitrary error-valued,
+// runtime, parser, and programmer panics must continue propagating unchanged.
 func (w *Watcher) guardWatcherPanic(op string) {
-	if r := recover(); r != nil && w.logger != nil {
-		w.logger.Error("watcher: recovered from panic in background re-index",
-			zap.String("op", op),
-			zap.Any("panic", r),
-			zap.Stack("stack"))
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	panicErr, ok := watcherStoragePanicError(op, recovered)
+	if !ok {
+		panic(recovered)
+	}
+	w.logWatcherStorageFailure(op, panicErr)
+}
+
+func watcherStoragePanicError(op string, recovered any) (error, bool) {
+	storageErr, ok := store_sqlite.StorageErrorFromPanic(recovered)
+	if !ok {
+		return nil, false
+	}
+	return fmt.Errorf("watcher: %s storage failure: %w", op, storageErr), true
+}
+
+func (w *Watcher) logWatcherStorageFailure(op string, err error) {
+	if w.logger != nil {
+		w.logger.Error("watcher: storage failure in background re-index",
+			zap.String("op", op), zap.Error(err), zap.Stack("stack"))
 	}
 }
 
@@ -1711,51 +1770,125 @@ func (w *Watcher) scheduleFileMutation(path string, kind ChangeKind) *MutationTi
 	done := make(chan MutationResult, 1)
 	w.mutationWaiters[path][generation] = done
 	w.pendingGeneration[path] = generation
-	debounce := time.Duration(w.config.DebounceMs) * time.Millisecond
+	w.armPointMutationTimerLocked(path, kind, generation, 0, time.Duration(w.config.DebounceMs)*time.Millisecond)
+	w.mu.Unlock()
+	return &MutationTicket{Path: path, Generation: generation, Done: done}
+}
+
+func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, generation uint64, retryAttempt int, delay time.Duration) {
 	var timer *time.Timer
 	w.asyncWork.Add(1)
-	timer = time.AfterFunc(debounce, func() {
+	timer = time.AfterFunc(delay, func() {
 		defer w.asyncWork.Done()
 		// Timer.Stop can lose a race with a callback that is already queued.
 		// Only the newest timer may consume the pending entry.
 		if !w.claimPendingTimer(path, &timer) {
 			return
 		}
-		if w.pointMutationClaimed != nil {
-			w.pointMutationClaimed(path)
-		}
-		patchErr := errMutationPatchAborted
-		// Admit through the cohort semaphore before doing any work. A
-		// fired cohort otherwise puts every path's callback into the
-		// patch path at once, all of them contending for the repository
-		// mutation lane. Giving up here rather than queueing forever is
-		// what lets a jammed lane shed work instead of accumulating
-		// goroutines against it.
-		release, admitted := w.admitMutationWork(path)
-		if !admitted {
-			w.completeMutationWaiters(path, generation, errMutationPatchAborted)
-			return
-		}
-		defer release()
-		superseded := false
-		defer w.guardWatcherPanic("patch " + path)
-		defer func() {
-			if !superseded {
-				w.completeMutationWaiters(path, generation, patchErr)
-			}
-		}()
-		patchErr = w.patchGraph(path, kind, generation)
-		if w.mutationAdmissionStopped() {
-			patchErr = errWatcherStopped
-		} else if w.mutationGenerationSuperseded(path, generation) {
-			patchErr = errMutationSuperseded
-			superseded = true
-			return
-		}
+		w.runPointMutation(path, kind, generation, retryAttempt)
 	})
 	w.pending[path] = timer
-	w.mu.Unlock()
-	return &MutationTicket{Path: path, Generation: generation, Done: done}
+}
+
+func (w *Watcher) runPointMutation(path string, kind ChangeKind, generation uint64, retryAttempt int) {
+	if w.pointMutationClaimed != nil {
+		w.pointMutationClaimed(path)
+	}
+	patchErr := errMutationPatchAborted
+	// Admit through the cohort semaphore before doing any work. A fired cohort
+	// otherwise puts every path into the patch path at once, contending for the
+	// repository mutation lane. Admission pressure retains this generation and
+	// its waiters instead of turning a bounded wait into a terminal receipt.
+	release, admissionErr := w.admitMutationWork(path)
+	if admissionErr != nil {
+		if errors.Is(admissionErr, errWatcherStopped) {
+			w.completeMutationWaitersIfCurrent(path, generation, errWatcherStopped)
+			return
+		}
+		if errors.Is(admissionErr, errMutationAdmissionDeferred) {
+			if w.mutationGenerationSuperseded(path, generation) {
+				return
+			}
+			if w.schedulePointMutationRetry(path, kind, generation, retryAttempt+1) {
+				return
+			}
+			if w.mutationAdmissionStopped() {
+				w.completeMutationWaitersIfCurrent(path, generation, errWatcherStopped)
+				return
+			}
+			if w.mutationGenerationSuperseded(path, generation) {
+				return
+			}
+		}
+		w.completeMutationWaitersIfCurrent(path, generation, admissionErr)
+		return
+	}
+	defer release()
+	complete := true
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr, ok := watcherStoragePanicError("patch "+path, recovered)
+			if !ok {
+				panic(recovered)
+			}
+			patchErr = panicErr
+			w.logWatcherStorageFailure("patch "+path, panicErr)
+		}
+		if complete {
+			if w.mutationBeforeComplete != nil {
+				w.mutationBeforeComplete(path, generation)
+			}
+			w.completeMutationWaitersIfCurrent(path, generation, patchErr)
+		}
+	}()
+	if w.pointMutationPatch != nil {
+		patchErr = w.pointMutationPatch(path, kind, generation)
+	} else {
+		patchErr = w.patchGraph(path, kind, generation)
+	}
+	var storageErr *store_sqlite.StorageError
+	if errors.As(patchErr, &storageErr) {
+		w.logWatcherStorageFailure("patch "+path, patchErr)
+	}
+	if w.mutationAdmissionStopped() {
+		patchErr = errWatcherStopped
+		return
+	}
+	if w.mutationGenerationSuperseded(path, generation) {
+		patchErr = errMutationSuperseded
+		complete = false
+		return
+	}
+	if !retryableMutationError(patchErr) {
+		return
+	}
+	if w.schedulePointMutationRetry(path, kind, generation, retryAttempt+1) {
+		complete = false
+		return
+	}
+	if w.mutationAdmissionStopped() {
+		patchErr = errWatcherStopped
+		return
+	}
+	if w.mutationGenerationSuperseded(path, generation) {
+		patchErr = errMutationSuperseded
+		complete = false
+	}
+}
+
+func (w *Watcher) schedulePointMutationRetry(path string, kind ChangeKind, generation uint64, attempt int) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopping || w.pendingGeneration[path] != generation {
+		return false
+	}
+	// A concurrent retry scheduler may already have retained this generation.
+	// Never publish more than one timer for a path.
+	if _, exists := w.pending[path]; exists {
+		return true
+	}
+	w.armPointMutationTimerLocked(path, kind, generation, attempt, w.mutationRetryDelay(attempt))
+	return true
 }
 
 func (w *Watcher) mutationAdmissionStopped() bool {
@@ -1764,12 +1897,23 @@ func (w *Watcher) mutationAdmissionStopped() bool {
 	return w.stopping
 }
 
-func (w *Watcher) completeMutationWaiters(path string, appliedGeneration uint64, err error) {
+func (w *Watcher) completeMutationWaitersIfCurrent(path string, appliedGeneration uint64, err error) bool {
+	return w.completeMutationWaitersGuarded(path, appliedGeneration, err, true)
+}
+
+func (w *Watcher) completeMutationWaitersGuarded(path string, appliedGeneration uint64, err error, requireCurrent bool) bool {
 	type completion struct {
 		requested uint64
 		done      chan MutationResult
 	}
 	w.mu.Lock()
+	if requireCurrent && w.pendingGeneration[path] > appliedGeneration {
+		w.mu.Unlock()
+		return false
+	}
+	if requireCurrent && w.pendingGeneration[path] == appliedGeneration {
+		delete(w.pendingGeneration, path)
+	}
 	var completions []completion
 	for generation, done := range w.mutationWaiters[path] {
 		if generation <= appliedGeneration {
@@ -1791,6 +1935,7 @@ func (w *Watcher) completeMutationWaiters(path string, appliedGeneration uint64,
 		}
 		close(completion.done)
 	}
+	return true
 }
 
 func (w *Watcher) failMutationWaiters(err error) {
@@ -1900,11 +2045,16 @@ func (w *Watcher) recordInStorm(path string, kind ChangeKind) {
 	}
 	w.mu.Unlock()
 	w.stormBatch[path] = kind
+	w.stormRetryAttempt = 0
 
 	quiet := time.Duration(w.config.StormQuietPeriodMs) * time.Millisecond
 	w.stopStormTimerLocked()
+	w.armStormTimerLocked(quiet)
+}
+
+func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 	w.stormWork.Add(1)
-	w.stormTimer = time.AfterFunc(quiet, func() {
+	w.stormTimer = time.AfterFunc(delay, func() {
 		defer w.stormWork.Done()
 		w.drainStorm()
 	})
@@ -1929,15 +2079,29 @@ func (w *Watcher) stopStormTimerLocked() {
 // pass and one derived catch-up; no per-file transaction or graph-wide tail is
 // paid for a checkout-sized event burst.
 func (w *Watcher) drainStorm() {
-	defer w.guardWatcherPanic("storm-drain")
+	var generations map[string]uint64
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		panicErr, ok := watcherStoragePanicError("storm drain", recovered)
+		if !ok {
+			panic(recovered)
+		}
+		w.logWatcherStorageFailure("storm drain", panicErr)
+		w.completeStormMutationWaiters(generations, nil, panicErr)
+	}()
 	w.stormMu.Lock()
 	stopped := w.stormStopped
 	batch := w.stormBatch
-	generations := w.stormGenerations
+	generations = w.stormGenerations
+	retryAttempt := w.stormRetryAttempt
 	w.stormBatch = make(map[string]ChangeKind)
 	w.stormGenerations = make(map[string]uint64)
 	w.eventTimes = nil
 	w.stormActive = false
+	w.stormRetryAttempt = 0
 	drained := w.stormDrained
 	w.stormMu.Unlock()
 
@@ -1956,11 +2120,6 @@ func (w *Watcher) drainStorm() {
 	if w.stormBeforeLock != nil {
 		w.stormBeforeLock()
 	}
-	var result *IndexResult
-	completionErr := errMutationPatchAborted
-	defer func() {
-		w.completeStormMutationWaiters(generations, result, completionErr)
-	}()
 	paths := make([]string, 0, len(batch))
 	for path := range batch {
 		paths = append(paths, path)
@@ -1972,9 +2131,7 @@ func (w *Watcher) drainStorm() {
 
 	// reindexStormPaths enters the repository coordinator; its raw executor
 	// acquires the topology gate only after the repository lane is held.
-	var err error
-	result, err = w.reindexStormPaths(paths)
-	completionErr = err
+	result, err := w.reindexStormPaths(paths)
 
 	reindexed, deleted, failed := 0, 0, 0
 	if result != nil {
@@ -1995,6 +2152,45 @@ func (w *Watcher) drainStorm() {
 	if drained != nil {
 		drained(len(batch))
 	}
+	if retryableMutationError(err) {
+		if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1) {
+			return
+		}
+		err = errWatcherStopped
+	}
+	w.completeStormMutationWaiters(generations, result, err)
+}
+
+func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, generations map[string]uint64, attempt int) bool {
+	w.stormMu.Lock()
+	defer w.stormMu.Unlock()
+	if w.stormStopped {
+		return false
+	}
+	if w.stormBatch == nil {
+		w.stormBatch = make(map[string]ChangeKind)
+	}
+	if w.stormGenerations == nil {
+		w.stormGenerations = make(map[string]uint64)
+	}
+	for path, kind := range batch {
+		// Anything already queued arrived after this failed batch was detached,
+		// so its final kind wins. The highest generation still owns all older
+		// direct-mutation waiters for that path.
+		if _, newerKind := w.stormBatch[path]; !newerKind {
+			w.stormBatch[path] = kind
+		}
+		if generation := generations[path]; generation > w.stormGenerations[path] {
+			w.stormGenerations[path] = generation
+		}
+	}
+	w.stormActive = len(w.stormBatch) != 0
+	if attempt > w.stormRetryAttempt {
+		w.stormRetryAttempt = attempt
+	}
+	w.stopStormTimerLocked()
+	w.armStormTimerLocked(w.mutationRetryDelay(w.stormRetryAttempt))
+	return true
 }
 
 // completeStormMutationWaiters publishes a storm batch's terminal outcome to
@@ -2025,6 +2221,13 @@ func (w *Watcher) completeStormMutationWaiters(
 
 	w.mu.Lock()
 	for path, appliedGeneration := range generations {
+		// A newer direct mutation now owns every older ticket for this path.
+		// Recheck while holding the same mutex used by successor admission so a
+		// permanent batch failure cannot strand the older waiter on the failed
+		// generation.
+		if w.pendingGeneration[path] > appliedGeneration {
+			continue
+		}
 		pathErr := batchErr
 		if pathErr == nil && result == nil {
 			pathErr = errors.New("storm mutation batch completed without a result")
@@ -2145,8 +2348,6 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 	if !w.generationCurrent(path, generation) {
 		return errMutationSuperseded
 	}
-	defer w.finishGeneration(path, generation)
-
 	var pending symbolChangeNotification
 	// w.indexer carries the stable lane installed when this watcher was
 	// created. Select the registered Indexer only after admission, because an
@@ -2164,6 +2365,12 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 	// User callbacks are deliberately outside the repository lane. Their
 	// payload was copied while the graph mutation still owned the lane.
 	pending.dispatch()
+	// A transient writer-gate deadline keeps the generation live: its existing
+	// receipt and waiters are retried by the watcher without inventing a new
+	// mutation. Every terminal outcome releases the generation normally.
+	if !retryableMutationError(err) {
+		w.finishGeneration(path, generation)
+	}
 	return err
 }
 

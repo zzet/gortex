@@ -66,15 +66,42 @@ var v060SubAgentHashes = map[string]string{
 	"gortex-search.md": "40cb39e36419993b2d75a9a13f363542bf392168e2d299e201165da7459f715b",
 }
 
+var preWorktreeSlashCommandHashes = map[string]string{
+	"gortex-add-test.md": "5f146a2ca1ed064eb4988568b93cbf77bb0fce92967151d95d3db00d6f13dd6f", "gortex-architecture-review.md": "12c074cf6cdd2d18962980d5417ec2749379a4d2117acdaecc74860ec4f0acc1",
+	"gortex-co-change.md": "4509d967766bc956be79638b01f0d9779994953bc986a320ad52e4b6edc5a362", "gortex-cross-repo-usage.md": "f4e62b30555965628db275d40d85f09cfc895d3735b238b4c9ab7347bde559a9",
+	"gortex-dataflow-trace.md": "46848c39e937cc218a673a25243b7110562916e14f65e01ebcf4f175e96e9013", "gortex-debug.md": "3ae4d4db496d5a56d23083d878e342372050702da435d44998b24fa3d5885d32",
+	"gortex-episode-replay.md": "d746b112628330ec037049aaee17cb5e715be1c93ee8cc0c9ec985357fb5c091", "gortex-explore.md": "c81aff53e081f987463f8b9e0ab396becc8025be5bde52ebf480f3389e378aff",
+	"gortex-extract-function.md": "cca40211532f7883a9ef882dcfd8889a01bc431bd4cf1c86e03c374608359acf", "gortex-fix-all.md": "3401163345332c89742bd4493b42081a230d35e0ea520dca727b2178f1cfc19c",
+	"gortex-guide.md": "f53403043ee232f487031dde3c7a845b9c9c6066a2075eb26e629ef898c809ac", "gortex-impact.md": "810265956680292a24f813ab8b627288782afe6c5c9a948d2519e1339bbeeba9",
+	"gortex-incident-investigation.md": "ffa1d998e413d2baecbf6f998de82fe3dc3aeb13fa1c6e62554bab76cb26614f", "gortex-onboarding.md": "7965dc26cd556a3a3924748d3b3658bd6616818ea1e3f9c8b5803a403c9dddf9",
+	"gortex-pr-review-agent.md": "3a69060d52fccaba694b9176a562557777d39178f3d685ea89865b4716b86cc8", "gortex-pr-review.md": "125a5197b8554579ae1d0e7f4b74051499d4021a936b821812ba1d5fc387ac8d",
+	"gortex-quality-audit.md": "0358173a3c822c0f00b21ec7d673edcf6f96e2bd6fa0c76183dfdf586e719724", "gortex-refactor.md": "0cb9486f1372626cc84ae154e7b16a7c70eb68e888f15b5c291cfa21fe5d8a3d",
+	"gortex-rename.md": "e9bfc1f4213e7334e64bf7c495f4486bab978a9dab8e868c67683fa2f451796b", "gortex-safe-edit.md": "c262e1ca08752d5f97cf9109eafa0ffe458a7196af7a8154a708816abb093833",
+}
+
+var preWorktreeSubAgentHashes = map[string]string{
+	"gortex-impact.md": "031565a4ff5cf6731a6145d883b9be419f529179631b18e400b3383bd4878ee1",
+	"gortex-search.md": "881631c1588c304c95b25ae1c74259e6afc5b9682eec034d42abcc3c74edb996",
+}
+
 func artifactHash(content []byte) string {
 	return fmt.Sprintf("%x", sha256.Sum256(content))
 }
 
-func isShippedAgentArtifact(existing []byte, current, migrationHash string) bool {
-	return string(existing) == current || (migrationHash != "" && artifactHash(existing) == migrationHash)
+func isShippedAgentArtifact(existing []byte, current string, migrationHashes ...string) bool {
+	if string(existing) == current {
+		return true
+	}
+	hash := artifactHash(existing)
+	for _, migrationHash := range migrationHashes {
+		if migrationHash != "" && hash == migrationHash {
+			return true
+		}
+	}
+	return false
 }
 
-func writeAgentArtifact(w io.Writer, path, current, migrationHash string, opts agents.ApplyOpts) (agents.FileAction, error) {
+func writeAgentArtifact(w io.Writer, path, current string, migrationHashes []string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	existing, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return agents.WriteIfNotExists(w, path, current, opts)
@@ -85,7 +112,7 @@ func writeAgentArtifact(w io.Writer, path, current, migrationHash string, opts a
 	if string(existing) == current {
 		return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "unchanged"}, nil
 	}
-	if migrationHash != "" && artifactHash(existing) == migrationHash {
+	if isShippedAgentArtifact(existing, current, migrationHashes...) {
 		return agents.WriteOwnedFile(w, path, current, opts)
 	}
 	logWarn(w, "keeping customised agent artifact %s", path)

@@ -173,7 +173,7 @@ func (s *Server) recordFileSetBaselineSavings(ctx context.Context, tool string, 
 		if credited >= retrievalBaselineMaxFiles {
 			break
 		}
-		abs, err := s.resolveGraphPath(rel)
+		abs, err := s.resolveGraphPath(ctx, rel)
 		if err != nil {
 			continue
 		}

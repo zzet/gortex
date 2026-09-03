@@ -121,10 +121,11 @@ func TestCSharp_SharedLineCallsSplitByOwner(t *testing.T) {
 }
 
 // Two properties on one line calling the SAME method: the stub lookup
-// cannot tell the owners apart by (line, name), and the engine never
-// guesses among candidates — both sites stay untouched rather than one
-// owner collecting both.
-func TestCSharp_SharedLineSameNameAmbiguityRefused(t *testing.T) {
+// cannot tell the owners apart by (line, name), but each call fact
+// names the member that authored it, so each property resolves its own
+// site onto its own stub — the engine never guesses among candidates,
+// and neither owner collects both.
+func TestCSharp_SharedLineSameNameEachOwnerResolvesItsOwn(t *testing.T) {
 	g, dir := buildFixture(t, map[string]string{
 		"A/Svc.cs": csSvc,
 		"B/App.cs": `namespace B {
@@ -139,8 +140,16 @@ func TestCSharp_SharedLineSameNameAmbiguityRefused(t *testing.T) {
 	if _, err := p.Enrich(g, dir); err != nil {
 		t.Fatal(err)
 	}
-	a1 := nodeByNameKind(t, g, "A1", graph.KindField)
-	a2 := nodeByNameKind(t, g, "A2", graph.KindField)
-	assertUntouched(t, g, a1.ID, "Run", "csharp-types")
-	assertUntouched(t, g, a2.ID, "Run", "csharp-types")
+	run := nodeByNameKind(t, g, "Run", graph.KindMethod)
+	for _, name := range []string{"A1", "A2"} {
+		prop := nodeByNameKind(t, g, name, graph.KindField)
+		if e := callEdgeTo(g, prop.ID, run.ID); e == nil {
+			t.Errorf("%s: own call not resolved; edges: %v", name, g.GetOutEdges(prop.ID))
+		} else {
+			assertASTProvenance(t, e, "csharp-types")
+		}
+		if edges := callEdgesNamed(g, prop.ID, "Run"); len(edges) != 1 {
+			t.Errorf("%s: %d Run edge(s), want exactly its own: %v", name, len(edges), edges)
+		}
+	}
 }

@@ -48,7 +48,7 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 	var targetFile string
 	switch {
 	case symbolID != "":
-		n := s.graph.GetNode(symbolID)
+		n := s.readerFor(ctx).GetNode(symbolID)
 		if n == nil {
 			return mcp.NewToolResultError("symbol not found: " + symbolID), nil
 		}
@@ -101,7 +101,7 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 	for _, p := range pendings {
 		keepFiles = append(keepFiles, p.file)
 	}
-	symbolsByFile := s.symbolNamesByFiles(keepFiles)
+	symbolsByFile := s.symbolNamesByFiles(ctx, keepFiles)
 	rows := make([]coChangeRow, 0, len(pendings))
 	for _, p := range pendings {
 		rows = append(rows, coChangeRow{
@@ -259,6 +259,10 @@ func (s *Server) mineCoChange() {
 // edges already in the graph. Returns true when at least one edge was
 // found — the signal that an enriched snapshot is loaded and no fresh
 // git mine is needed.
+//
+// Reads the base store on purpose: the caches it fills are process-wide
+// and outlive the request that triggered the mine, so they must never be
+// built from one caller's buffers.
 //
 // EdgesByKind streams only the CoChange edges; the endpoint nodes are
 // fetched in one batched GetNodesByIDs call instead of two GetNode

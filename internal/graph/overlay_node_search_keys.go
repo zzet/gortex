@@ -40,7 +40,7 @@ func (v *OverlaidView) ScanNodeSearchKeys(ctx context.Context, pageSize int, yie
 					if v.nodeBelongsToOverlay(key.ID) {
 						continue
 					}
-					if removed := v.layer.nameRemoved[key.Name]; removed != nil && removed[key.ID] {
+					if v.layer.IsNameRemoved(key.Name, key.ID) {
 						continue
 					}
 				}
@@ -62,7 +62,7 @@ func (v *OverlaidView) ScanNodeSearchKeys(ctx context.Context, pageSize int, yie
 	}
 
 	if v.layer != nil {
-		for _, node := range v.layer.nodeByID {
+		for node := range v.layer.Nodes() {
 			if err := ctx.Err(); err != nil {
 				return err
 			}

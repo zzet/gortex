@@ -116,6 +116,7 @@ type encodedCall struct {
 	Inferred          bool         `json:"inferred,omitempty"`
 	ArgCount          int          `json:"arg_count,omitempty"`
 	ArgKnown          bool         `json:"arg_known,omitempty"`
+	Owner             string       `json:"owner,omitempty"`
 }
 
 type encodedSuper struct {
@@ -150,6 +151,7 @@ func encodeCallFact(in *callFact) *encodedCall {
 		RecvPendingCallee: in.recvPendingCallee, RecvCallTypeArg: in.recvCallTypeArg,
 		RecvIdent: in.recvIdent, RecvChain: encodeCallFact(in.recvChain),
 		Inferred: in.inferred, ArgCount: in.argCount, ArgKnown: in.argKnown,
+		Owner: in.owner,
 	}
 }
 
@@ -162,6 +164,7 @@ func decodeCallFact(in *encodedCall) *callFact {
 		recvPendingCallee: in.RecvPendingCallee, recvCallTypeArg: in.RecvCallTypeArg,
 		recvIdent: in.RecvIdent, recvChain: decodeCallFact(in.RecvChain),
 		inferred: in.Inferred, argCount: in.ArgCount, argKnown: in.ArgKnown,
+		owner: in.Owner,
 	}
 }
 

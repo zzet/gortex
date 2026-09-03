@@ -10,8 +10,9 @@ var _ graph.SemanticNodeStampWriter = (*Store)(nil)
 
 const (
 	semanticNodeStampParamsPerRow = 4
-	// Four values per row; 240 rows use 960 host parameters, leaving
-	// headroom below SQLite's conservative 999-variable limit.
+	// Four values per row plus one trailing generation binding; 240 rows use
+	// 961 host parameters, leaving headroom below SQLite's conservative
+	// 999-variable limit.
 	semanticNodeStampChunkSize = 240
 )
 
@@ -53,7 +54,7 @@ func (s *Store) persistSemanticNodeStamps(stamps []graph.SemanticNodeStamp) (sem
 		txChanged := 0
 		for start := txStart; start < txEnd; start += semanticNodeStampChunkSize {
 			end := minInt(start+semanticNodeStampChunkSize, txEnd)
-			countQuery, updateQuery, args := semanticNodeStampStatements(stamps[start:end])
+			countQuery, updateQuery, args := semanticNodeStampStatements(s.viewGen, stamps[start:end])
 			if len(args) == 0 {
 				continue
 			}
@@ -104,7 +105,12 @@ func (s *Store) persistSemanticNodeStamps(stamps []graph.SemanticNodeStamp) (sem
 // semanticNodeStampStatements returns one predicate-shaped count and one
 // set-oriented update over the same VALUES relation. Empty type fields preserve
 // their columns; semantic_source changes only when at least one type is set.
-func semanticNodeStampStatements(stamps []graph.SemanticNodeStamp) (countQuery, updateQuery string, args []any) {
+//
+// Both statements take the same argument list, so the trailing generation
+// binding pairs the joined node row with the writing handle for the count and
+// the update alike — a count over a generation the update cannot reach would
+// report coverage the store never gained.
+func semanticNodeStampStatements(viewGen int64, stamps []graph.SemanticNodeStamp) (countQuery, updateQuery string, args []any) {
 	updates := make([]graph.SemanticNodeStamp, 0, len(stamps))
 	positions := make(map[string]int, len(stamps))
 	for _, stamp := range stamps {
@@ -132,13 +138,15 @@ func semanticNodeStampStatements(stamps []graph.SemanticNodeStamp) (countQuery, 
 		values.WriteString("(?,?,?,?)")
 		args = append(args, stamp.NodeID, stamp.SemanticType, stamp.ReturnType, stamp.SemanticSource)
 	}
+	args = append(args, viewGen)
 
 	withUpdates := `WITH updates(node_id, semantic_type, return_type, semantic_source) AS (VALUES ` + values.String() + `)`
 	countQuery = withUpdates + `
 	SELECT COUNT(*)
 	FROM nodes AS n
 	JOIN updates AS u ON u.node_id = n.id
-	WHERE u.semantic_type <> ''`
+	WHERE u.semantic_type <> ''
+		AND n.view_gen = ?`
 	updateQuery = withUpdates + `
 	UPDATE nodes AS n
 	SET semantic_type = CASE WHEN u.semantic_type <> '' THEN u.semantic_type ELSE n.semantic_type END,
@@ -146,6 +154,7 @@ func semanticNodeStampStatements(stamps []graph.SemanticNodeStamp) (countQuery, 
 		semantic_source = u.semantic_source
 	FROM updates AS u
 	WHERE n.id = u.node_id
+		AND n.view_gen = ?
 		AND (u.semantic_type <> '' OR u.return_type <> '')
 		AND ((u.semantic_type <> '' AND n.semantic_type IS NOT u.semantic_type)
 			OR (u.return_type <> '' AND n.return_type IS NOT u.return_type)

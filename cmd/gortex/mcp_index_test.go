@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/testenv"
 )
@@ -41,8 +42,9 @@ func TestResolveEmbeddedIndex(t *testing.T) {
 		// The notebook is committed to git so it travels with the repo.
 		// That is right only when the user named the tree.
 		plan := resolveEmbeddedIndex(repoA, parent, global)
-		assert.Equal(t, repoA, plan.Index)
-		assert.Equal(t, repoA, plan.Notebook)
+		canonicalRepoA := pathkey.CanonicalExistingRoot(repoA)
+		assert.Equal(t, canonicalRepoA, plan.Index)
+		assert.Equal(t, canonicalRepoA, plan.Notebook)
 		assert.False(t, plan.Inferred)
 		assert.Empty(t, plan.Refusal)
 	})

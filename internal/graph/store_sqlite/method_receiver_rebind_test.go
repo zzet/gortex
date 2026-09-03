@@ -315,7 +315,8 @@ func TestSQLiteRebindGoMethodReceiversPreservesReindexDedupSemantics(t *testing.
 
 func TestSQLiteReceiverRebindQueryPlansUseBoundedIndexes(t *testing.T) {
 	s := openReceiverRebindStore(t)
-	global := queryPlan(t, s, goMethodReceiverCandidatesGlobalSQL)
+	global := queryPlan(t, s, goMethodReceiverCandidatesGlobalSQL,
+		baseViewGeneration, baseViewGeneration, baseViewGeneration, baseViewGeneration)
 	for _, index := range []string{"edges_by_kind", "nodes_go_receiver_type"} {
 		if !strings.Contains(global, index) {
 			t.Fatalf("global receiver plan does not use %s:\n%s", index, global)
@@ -328,7 +329,8 @@ func TestSQLiteReceiverRebindQueryPlansUseBoundedIndexes(t *testing.T) {
 		t.Fatalf("global receiver plan still depends on obsolete index:\n%s", global)
 	}
 
-	scoped := queryPlan(t, s, goMethodReceiverCandidatesForFileSQL, "pkg/m.go")
+	scoped := queryPlan(t, s, goMethodReceiverCandidatesForFileSQL,
+		baseViewGeneration, baseViewGeneration, baseViewGeneration, "pkg/m.go", baseViewGeneration)
 	for _, index := range []string{"nodes_by_file", "edges_by_from", "nodes_go_receiver_type"} {
 		if !strings.Contains(scoped, index) {
 			t.Fatalf("scoped receiver plan does not use %s:\n%s", index, scoped)

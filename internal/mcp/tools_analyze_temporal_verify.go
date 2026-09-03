@@ -45,12 +45,16 @@ const maxTemporalNodeSourceBytes = 6000
 // single-repo, multi-repo prefix, and linked-worktree layouts alike. Read file
 // bodies are cached for the run.
 type serverSourceProvider struct {
-	s     *Server
+	s *Server
+	// ctx is the request the provider was built for. The resolver interface
+	// carries none, and path resolution needs one to place a path in the
+	// checkout the request reads.
+	ctx   context.Context
 	cache map[string]string // absolute path -> file body ("" = unreadable)
 }
 
-func newServerSourceProvider(s *Server) *serverSourceProvider {
-	return &serverSourceProvider{s: s, cache: map[string]string{}}
+func newServerSourceProvider(ctx context.Context, s *Server) *serverSourceProvider {
+	return &serverSourceProvider{s: s, ctx: ctx, cache: map[string]string{}}
 }
 
 // NodeSource returns the source text of n's declaration, or ("", false).
@@ -58,7 +62,7 @@ func (p *serverSourceProvider) NodeSource(n *graph.Node) (string, bool) {
 	if n == nil {
 		return "", false
 	}
-	abs, err := p.s.resolveNodePath(n)
+	abs, err := p.s.resolveNodePath(p.ctx, n)
 	if err != nil || abs == "" {
 		return "", false
 	}
@@ -132,7 +136,7 @@ func (s *Server) handleAnalyzeTemporalVerify(ctx context.Context, req mcp.CallTo
 		}
 	}
 	verifier := analyzer.NewCachingVerifier(inner, provider.Name(), cachePath)
-	src := newServerSourceProvider(s)
+	src := newServerSourceProvider(ctx, s)
 	report := resolver.VerifyTemporalEdges(ctx, s.graph, src, verifier)
 	if err := verifier.Flush(); err != nil && s.logger != nil {
 		s.logger.Warn("temporal_verify: verdict cache flush failed", zap.Error(err))

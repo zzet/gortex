@@ -9,6 +9,10 @@ import (
 // EvictEdgesFromSourcesByKinds reconciles a derived-edge frontier with one
 // indexed DELETE. Both source and kind scopes stay inside SQLite; no edge rows
 // cross into Go merely to be deleted.
+//
+// Scoped to the handle's payload view generation: the frontier comes from an
+// indexing pass over one checkout, and the replacement edges land at that same
+// generation.
 func (s *Store) EvictEdgesFromSourcesByKinds(
 	ctx context.Context,
 	sourceIDs []string,
@@ -69,7 +73,8 @@ func (s *Store) EvictEdgesFromSourcesByKinds(
 	res, err := tx.ExecContext(ctx, `
 DELETE FROM edges
 WHERE from_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-  AND kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, sourcesJSON, kindsJSON)
+  AND kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+  AND view_gen = ?`, sourcesJSON, kindsJSON, s.viewGen)
 	if err != nil {
 		_ = tx.Rollback()
 		if ctxErr := ctx.Err(); ctxErr != nil {

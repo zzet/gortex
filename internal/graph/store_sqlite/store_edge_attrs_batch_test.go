@@ -51,9 +51,9 @@ func TestPersistEdgeAttributesBatchUsesSetOrientedChunks(t *testing.T) {
 		})
 	}
 
-	query, args, err := edgeAttributeUpdateStatement(updates[:edgeAttributeUpdateChunkSize])
+	query, args, err := edgeAttributeUpdateStatement(store.viewGen, updates[:edgeAttributeUpdateChunkSize])
 	require.NoError(t, err)
-	assert.Len(t, args, edgeAttributeUpdateChunkSize*edgeAttributeUpdateParamsPerRow, "the chunk must stay below SQLite's conservative 999-variable bound")
+	assert.Len(t, args, edgeAttributeUpdateChunkSize*edgeAttributeUpdateParamsPerRow+1, "the chunk plus its trailing generation binding must stay below SQLite's conservative 999-variable bound")
 	assert.Equal(t, edgeAttributeUpdateChunkSize, strings.Count(query, "(?,?,?,?,?,?,?,?,?,?,?,?,?)"), "each logical edge must contribute exactly one VALUES row")
 
 	updates = append(updates, nil)

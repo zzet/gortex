@@ -13,6 +13,17 @@ const (
 	evictNonEmptyRepoPredicate = `repo_prefix = ? AND repo_prefix <> ''`
 )
 
+// evictScope selects whether an eviction is bound to the handle's payload view
+// generation. File replacement and ordinary repository reindexing retire only
+// rows written through the calling handle. Authoritative untrack is the sole
+// repository path that selects every generation, matching store_purge.go.
+type evictScope bool
+
+const (
+	evictThisGeneration evictScope = true
+	evictAllGenerations evictScope = false
+)
+
 // EvictFiles removes a bounded file replacement set in one transaction. The
 // two edge deletes deliberately use indexed from_id/to_id predicates instead
 // of an OR expression, and keep the candidate node set inside SQLite rather
@@ -37,16 +48,17 @@ func (s *Store) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) 
 	if !ok {
 		return 0, 0
 	}
-	return s.evictByPredicate(evictFilesPredicate, pathsJSON, true)
+	return s.evictByPredicate(evictFilesPredicate, pathsJSON, evictThisGeneration)
 }
 
 // evictByPredicate is the common SQLite-native scope eviction path. The
 // predicate is always one of the package constants above, never caller SQL.
-// exactReceipt marks predicates whose evicted-node set is bounded enough to
-// describe exactly to active mutation receipts (the file predicates); scope
-// evictions without it fail the receipt closed as before.
-func (s *Store) evictByPredicate(predicate string, arg any, exactReceipt bool) (nodesRemoved, edgesRemoved int) {
-	nodesRemoved, edgesRemoved, err := s.evictByPredicateResult(predicate, arg, exactReceipt)
+// The scope also selects the exact-receipt path: a this-generation eviction
+// names a bounded set of nodes that can be described exactly to active
+// mutation receipts, while an all-generations repo sweep fails the receipt
+// closed as before.
+func (s *Store) evictByPredicate(predicate string, arg any, scope evictScope) (nodesRemoved, edgesRemoved int) {
+	nodesRemoved, edgesRemoved, err := s.evictByPredicateResult(predicate, arg, scope)
 	if err != nil {
 		panicOnFatal(err)
 		return 0, 0
@@ -59,11 +71,11 @@ func (s *Store) evictByPredicate(predicate string, arg any, exactReceipt bool) (
 // edge deletes consume the same predicate subquery directly, so scope size
 // never creates a Go ID frontier or a DELETE-per-node loop. The one exception
 // is the exact-receipt path: while a mutation receipt is active, a bounded
-// file-scoped eviction reads the doomed nodes' identities first (same
+// this-generation file eviction reads the doomed nodes' identities first (same
 // pattern as mutationNodeIdentitiesTx — paid only while receipts observe) so
 // the receipt can stay complete instead of forcing the whole-graph fallback
 // resolve.
-func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt bool) (nodesRemoved, edgesRemoved int, retErr error) {
+func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictScope) (nodesRemoved, edgesRemoved int, retErr error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -74,12 +86,34 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
 	ctx := context.Background()
+	// A generation-scoped eviction appends the residual conjunct to every
+	// predicate and binds the handle's generation once per placeholder. A
+	// repo-administration eviction leaves all three statements byte-identical
+	// to what they were before generations existed, so it still reaches every
+	// generation's rows in one pass.
+	// The edge delete carries the conjunct twice: once inside the candidate-node
+	// subquery and once on the edge row itself, so an edge cannot be dragged out
+	// of another generation by a node id this one also uses.
+	scoped, scopeArgs := predicate, []any{arg}
+	edgeScope, edgeArgs := "", []any{arg}
+	if scope == evictThisGeneration {
+		scoped += ` AND view_gen = ?`
+		scopeArgs = append(scopeArgs, s.viewGen)
+		edgeScope = ` AND view_gen = ?`
+		edgeArgs = append(edgeArgs, s.viewGen, s.viewGen)
+	}
 	// A failure in this receipt-only read degrades the receipt to incomplete
 	// (receiptDelta stays nil, the post-commit branch marks the fallback)
 	// rather than blocking the eviction itself - the same choice
 	// prepareSQLiteReindexReceiptTx makes for its identity read.
+	//
+	// The read is bound to the same generation scope as the eviction itself
+	// (scoped/scopeArgs), so it describes exactly the rows this handle will
+	// delete and never another generation's copy of the same path. Only a
+	// this-generation file eviction is bounded enough to describe exactly; an
+	// all-generations repo sweep never takes this path.
 	var receiptDelta *sqliteMutationReceiptAccumulator
-	if exactReceipt && s.hasActiveMutationReceiptsLocked() {
+	if scope == evictThisGeneration && s.hasActiveMutationReceiptsLocked() {
 		// The DELETEs below remove every edge touching a doomed node,
 		// including edges whose SOURCE survives. restubIncomingRefs parks the
 		// IsResolvableRefEdge kinds under a stub first, so those stay
@@ -96,7 +130,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 		// exactly, which is the only question a receipt answers; the
 		// destruction is a real pre-existing defect tracked separately.
 		delta := newSQLiteMutationReceiptAccumulator()
-		rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+predicate, arg)
+		rows, err := tx.QueryContext(ctx, `SELECT id, kind, name, qual_name, file_path FROM nodes WHERE `+scoped, scopeArgs...)
 		if err == nil {
 			for rows.Next() {
 				var id, kind, name, qualName, filePath string
@@ -114,12 +148,15 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 			receiptDelta = delta
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+predicate, arg); err != nil {
+	// The binding sidecar follows the node/edge scope: an unscoped sweep would
+	// strand bindings against nodes that no longer exist, and a scoped one must
+	// not touch another generation's bindings for the same path.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+scoped, scopeArgs...); err != nil {
 		return 0, 0, err
 	}
-	scopedNodes := `SELECT id FROM nodes WHERE ` + predicate
+	scopedNodes := `SELECT id FROM nodes WHERE ` + scoped
 	for _, column := range []string{"from_id", "to_id"} {
-		result, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE `+column+` IN (`+scopedNodes+`)`, arg)
+		result, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE `+column+` IN (`+scopedNodes+`)`+edgeScope, edgeArgs...)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -129,7 +166,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, exactReceipt b
 		}
 		edgesRemoved += int(removed)
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE `+predicate, arg)
+	result, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE `+scoped, scopeArgs...)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -207,4 +244,9 @@ func recordSQLiteEvictedNode(acc *sqliteMutationReceiptAccumulator, id, kind, na
 	}
 }
 
-var _ graph.FileBatchEvicter = (*Store)(nil)
+var (
+	_ graph.FileBatchEvicter                 = (*Store)(nil)
+	_ graph.CurrentGenerationRepoEvicter     = (*Store)(nil)
+	_ graph.AllGenerationsRepoEvicter        = (*Store)(nil)
+	_ graph.CheckedAllGenerationsRepoEvicter = (*Store)(nil)
+)

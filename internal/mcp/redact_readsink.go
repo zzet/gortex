@@ -32,5 +32,7 @@ func (s *Server) redactConfigSecretsEnabled(relPath string) bool {
 	if s.configManager == nil {
 		return true
 	}
-	return s.configManager.GetRepoConfig(repoPrefixForPath(s, relPath)).MCP.RedactConfigSecretsEnabled()
+	// Base read: the repo prefix keys a config lookup, and config is a
+	// property of the indexed repo, not of a session's edits.
+	return s.configManager.GetRepoConfig(repoPrefixForPath(s.graph, relPath)).MCP.RedactConfigSecretsEnabled()
 }

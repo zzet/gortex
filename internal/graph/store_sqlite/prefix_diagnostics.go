@@ -49,7 +49,7 @@ func (s *Store) PrefixDiagnostics(sampleLimit int) graph.PrefixDiagnostics {
 	d.OwnedCodeNodes, _ = s.countAndSampleNodes(ownedCodeNodePredicate, 0)
 	d.UnownedCodeNodes, d.UnownedSamples = s.countAndSampleNodes(unownedCodeNodePredicate, sampleLimit)
 	d.MisprefixedNodes, d.MisprefixedSamples = s.countAndSampleNodes(misprefixedNodePredicate, sampleLimit)
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&d.Scanned); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`, s.viewGen).Scan(&d.Scanned); err != nil {
 		panicOnFatal(err)
 	}
 	return d
@@ -60,14 +60,14 @@ func (s *Store) PrefixDiagnostics(sampleLimit int) graph.PrefixDiagnostics {
 // panicking on a non-fatal error: this is a diagnostic, and a health probe
 // that takes the daemon down would be worse than one that stays quiet.
 func (s *Store) countAndSampleNodes(predicate string, sampleLimit int) (count int, samples []string) {
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE ` + predicate).Scan(&count); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE `+predicate+` AND view_gen = ?`, s.viewGen).Scan(&count); err != nil {
 		panicOnFatal(err)
 		return 0, nil
 	}
 	if count == 0 || sampleLimit <= 0 {
 		return count, nil
 	}
-	rows, err := s.db.Query(`SELECT id FROM nodes WHERE `+predicate+` LIMIT ?`, sampleLimit)
+	rows, err := s.db.Query(`SELECT id FROM nodes WHERE `+predicate+` AND view_gen = ? LIMIT ?`, s.viewGen, sampleLimit)
 	if err != nil {
 		panicOnFatal(err)
 		return count, nil

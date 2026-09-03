@@ -64,24 +64,24 @@ func TestAnchorUnprefixedExisting(t *testing.T) {
 
 	// Unique existing match → anchored to the lone owning repo, with the
 	// repo-prefixed relPath for session bookkeeping.
-	abs, rel, n := anchorUnprefixedExisting(mi, "internal/x.go")
+	abs, rel, n := anchorUnprefixedExisting(mi, viewPathRoot{}, "internal/x.go")
 	require.Equal(t, 1, n)
 	require.Equal(t, filepath.Join(a, "internal", "x.go"), abs)
 	require.Equal(t, "alpha/internal/x.go", rel)
 
 	// Present in two repos → ambiguous, caller must disambiguate.
-	_, _, n = anchorUnprefixedExisting(mi, "shared/y.go")
+	_, _, n = anchorUnprefixedExisting(mi, viewPathRoot{}, "shared/y.go")
 	require.Equal(t, 2, n)
 
 	// Missing everywhere (a new write target) → no anchor.
-	_, _, n = anchorUnprefixedExisting(mi, "internal/new.go")
+	_, _, n = anchorUnprefixedExisting(mi, viewPathRoot{}, "internal/new.go")
 	require.Equal(t, 0, n)
 
 	// A `..` traversal is rejected by the containment gate, not anchored.
-	_, _, n = anchorUnprefixedExisting(mi, "../escape.go")
+	_, _, n = anchorUnprefixedExisting(mi, viewPathRoot{}, "../escape.go")
 	require.Equal(t, 0, n)
 
 	// An absolute path is never an "unprefixed" path — left to the caller.
-	_, _, n = anchorUnprefixedExisting(mi, filepath.Join(a, "internal", "x.go"))
+	_, _, n = anchorUnprefixedExisting(mi, viewPathRoot{}, filepath.Join(a, "internal", "x.go"))
 	require.Equal(t, 0, n)
 }

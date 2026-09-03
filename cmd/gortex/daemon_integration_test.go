@@ -82,18 +82,42 @@ func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot strin
 		ConfigManager: cm,
 	})
 
+	// The controller drives every track / untrack through the shared
+	// checkout lifecycle. An in-memory graph has no catalog, so this one
+	// runs in its degraded shape: the index, watcher, config and session
+	// side effects, with no durable identity behind them.
+	lifecycle, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+		MultiIndexer:  mi,
+		ConfigManager: cm,
+		Graph:         g,
+		Logger:        zap.NewNop(),
+	})
+	require.NoError(t, err)
+
 	d := daemon.New(socket, "test", zap.NewNop())
 	d.Controller = &realController{
 		graph:         g,
 		multiIndexer:  mi,
 		configManager: cm,
+		lifecycle:     lifecycle,
 		logger:        zap.NewNop(),
 	}
 	d.MCPDispatcher = newMCPDispatcher(srv, mi, zap.NewNop())
 
 	require.NoError(t, d.Listen())
-	go func() { _ = d.Serve() }()
-	t.Cleanup(func() { _ = d.Shutdown() })
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- d.Serve() }()
+	t.Cleanup(func() {
+		shutdownErr := d.Shutdown()
+		select {
+		case err := <-serveDone:
+			require.NoError(t, shutdownErr)
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			require.NoError(t, shutdownErr)
+			t.Error("daemon did not stop")
+		}
+	})
 
 	require.Eventually(t, func() bool { return daemon.IsRunningAt(socket) },
 		2*time.Second, 10*time.Millisecond)

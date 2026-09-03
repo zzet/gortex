@@ -626,9 +626,19 @@ func TestSQLiteMutationReceiptTopologyMutations(t *testing.T) {
 		if nodes != 1 {
 			t.Fatalf("EvictRepo nodes = %d, want 1", nodes)
 		}
-		if receipt := store.EndMutationReceipt(token); receipt.Complete {
-			t.Fatalf("EvictRepo returned complete receipt: %+v", receipt)
+		// EvictRepo defaults to the calling handle's generation
+		// (EvictRepoCurrentGeneration), so it names a bounded, exactly
+		// describable set of doomed nodes and keeps the receipt complete -
+		// mirroring the file eviction above. The unbounded all-generation
+		// sweep (EvictRepoAllGenerations) is what fails the receipt closed.
+		receipt := store.EndMutationReceipt(token)
+		if !receipt.Complete || !receipt.ResolutionRelevant {
+			t.Fatalf("EvictRepo receipt = %+v, want complete generation-scoped eviction frontier", receipt)
 		}
+		if want := []string{"a.go"}; !slices.Equal(receipt.DefinitionFiles, want) {
+			t.Fatalf("EvictRepo definition files = %v, want %v", receipt.DefinitionFiles, want)
+		}
+		assertSQLiteReceiptContains(t, "target names", receipt.TargetNames, "A")
 
 		noop := store.BeginMutationReceipt()
 		store.EvictRepo("missing")

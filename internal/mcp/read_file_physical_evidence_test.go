@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -207,7 +208,7 @@ func TestReadFilePhysicalEvidenceRejectsOutAndBackSymlinkTarget(t *testing.T) {
 	require.NoError(t, os.WriteFile(inside, []byte("inside"), 0o644))
 	require.NoError(t, os.WriteFile(outside, []byte("outside"), 0o644))
 	require.NoError(t, os.Symlink(inside, link))
-	require.NoError(t, srv.guardSymlinkWithinRepo(link))
+	require.NoError(t, srv.guardSymlinkWithinRepo(context.Background(), link))
 
 	require.NoError(t, os.Remove(link))
 	require.NoError(t, os.Symlink(outside, link))
@@ -217,8 +218,8 @@ func TestReadFilePhysicalEvidenceRejectsOutAndBackSymlinkTarget(t *testing.T) {
 
 	require.NoError(t, os.Remove(link))
 	require.NoError(t, os.Symlink(inside, link))
-	require.NoError(t, srv.guardSymlinkWithinRepo(link), "a fresh post-read resolution alone sees only the restored inside target")
-	err = srv.guardResolvedPathWithinRepo(link, evidence.resolvedPath)
+	require.NoError(t, srv.guardSymlinkWithinRepo(context.Background(), link), "a fresh post-read resolution alone sees only the restored inside target")
+	err = srv.guardResolvedPathWithinRepo(context.Background(), link, evidence.resolvedPath)
 	require.Error(t, err)
 	require.ErrorIs(t, err, errPathEscape)
 }

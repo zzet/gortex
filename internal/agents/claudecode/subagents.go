@@ -1,6 +1,10 @@
 package claudecode
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/zzet/gortex/internal/profiles"
+)
 
 // SubAgents maps the filename under .claude/agents/ to a graph-only
 // sub-agent definition. Each allowlist names tools present on the compact MCP
@@ -45,7 +49,10 @@ Answer the delegated code-navigation question using only Gortex.
 6. Call ` + "`capabilities`" + ` with ` + "`detail: \"schema\"`" + ` if an operation's exact arguments are not visible.
 
 Return the answer first, then symbol IDs and file:line evidence, then caveats. Do not dump raw tool output.
-`
+
+## Worktree and branch routing
+
+` + profiles.WorktreeBranchRoutingPolicy
 
 const subagentImpact = `---
 name: gortex-impact
@@ -62,4 +69,7 @@ Convert the delegated change into a concise, graph-grounded impact report. Do no
 5. Call ` + "`capabilities`" + ` with ` + "`detail: \"schema\"`" + ` if an operation's exact arguments are not visible.
 
 Return: one-line safe/risky/breaking verdict; broken callers, contracts, or guards with file:line; then exact tests to run.
-`
+
+## Worktree and branch routing
+
+` + profiles.WorktreeBranchRoutingPolicy

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -25,6 +26,12 @@ const (
 	// mutating indexed source and answered with the graph-aware edit path.
 	// Without it a shell write leaves no trace of which door a change took.
 	DecisionRedirectedWrite DecisionKind = "redirected_write"
+	// DecisionViewFallback records that a path-scoped probe was answered from
+	// a graph other than the probed path's own — the family primary standing
+	// in for a working copy whose availability or removal grace window is
+	// running. It changes no verdict; it exists so a fallback answer is
+	// visible before it is ever given weight.
+	DecisionViewFallback DecisionKind = "view_fallback"
 )
 
 type hookDecision struct {
@@ -33,6 +40,9 @@ type hookDecision struct {
 	Decision   DecisionKind `json:"decision"`
 	Hits       int          `json:"hits,omitempty"`
 	DurationMS int64        `json:"duration_ms,omitempty"`
+	// View names the graph that answered a path-scoped probe and why it stood
+	// in. The probed path is deliberately absent: this log carries no content.
+	View string `json:"view,omitempty"`
 }
 
 // hookEffectiveness records one hook invocation without source, prompt, path,
@@ -146,6 +156,30 @@ func logHookDecision(tool, _ string, decision DecisionKind, hits int, dur time.D
 		DurationMS: dur.Milliseconds(),
 	}
 	appendHookJSONL(path, rec)
+}
+
+// logProbeViewFallback records a path-scoped answer that came from a graph
+// other than the probed path's own. An exact answer is the ordinary case and
+// writes nothing, so the log stays a record of degradations rather than a
+// per-call trace.
+//
+// tool names the control verb that answered — both path-scoped probes
+// (file_coverage and search_symbols) can be served by a stand-in graph, and a
+// record that did not say which one produced it would read as coverage.
+func logProbeViewFallback(tool string, view *daemon.ProbeView) {
+	if view == nil || view.Exact {
+		return
+	}
+	path := hookDecisionsPath()
+	if path == "" {
+		return
+	}
+	appendHookJSONL(path, hookDecision{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Tool:      tool,
+		Decision:  DecisionViewFallback,
+		View:      view.Kind + "/" + view.FallbackReason,
+	})
 }
 
 // logHookEffectiveness appends one bounded observation. alternationSegments is

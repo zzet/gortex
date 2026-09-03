@@ -25,7 +25,7 @@ func TestGetHotspotsCoalescesConcurrentLazyBuilds(t *testing.T) {
 	var builds atomic.Int32
 	s := &Server{
 		graph: graph.New(),
-		hotspotsFn: func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry {
+		hotspotsFn: func(graph.Reader, *analysis.CommunityResult, float64) []analysis.HotspotEntry {
 			builds.Add(1)
 			return []analysis.HotspotEntry{{ID: "hot"}}
 		},
@@ -57,7 +57,7 @@ func TestGetHotspotsRebuildsAfterAnalysisEpochInvalidation(t *testing.T) {
 	var builds atomic.Int32
 	s := &Server{
 		graph: graph.New(),
-		hotspotsFn: func(graph.Store, *analysis.CommunityResult, float64) []analysis.HotspotEntry {
+		hotspotsFn: func(graph.Reader, *analysis.CommunityResult, float64) []analysis.HotspotEntry {
 			return []analysis.HotspotEntry{{ID: string(rune('0' + builds.Add(1)))}}
 		},
 	}
@@ -93,7 +93,7 @@ func TestIncrementalCommunitiesInvalidatesInFlightHotspotBuild(t *testing.T) {
 	s := &Server{
 		graph:       g,
 		communities: oldCommunities,
-		hotspotsFn: func(_ graph.Store, communities *analysis.CommunityResult, _ float64) []analysis.HotspotEntry {
+		hotspotsFn: func(_ graph.Reader, communities *analysis.CommunityResult, _ float64) []analysis.HotspotEntry {
 			if builds.Add(1) == 1 {
 				firstSawOld.Store(communities == oldCommunities)
 				close(started)

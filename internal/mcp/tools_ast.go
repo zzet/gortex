@@ -92,7 +92,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	targets, err := s.buildASTTargets(language, pathPrefix, allowedRepos)
+	targets, err := s.buildASTTargets(ctx, language, pathPrefix, allowedRepos)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -121,7 +121,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 	s.enrichASTMatchesContext(ctx, res.Matches)
 
 	if minFanIn > 0 {
-		res.Matches = filterByMinFanIn(s.graph, res.Matches, minFanIn)
+		res.Matches = filterByMinFanIn(s.readerFor(ctx), res.Matches, minFanIn)
 		res.Total = len(res.Matches)
 	}
 
@@ -141,7 +141,7 @@ func (s *Server) handleSearchAST(ctx context.Context, req mcp.CallToolRequest) (
 // Path resolution: KindFile nodes carry repo-prefixed paths; the
 // engine needs absolute paths to read file bytes, so we resolve via
 // `s.resolveGraphPath` (which knows the repo roots).
-func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[string]bool) ([]astquery.Target, error) {
+func (s *Server) buildASTTargets(ctx context.Context, language, pathPrefix string, allowedRepos map[string]bool) ([]astquery.Target, error) {
 	if s.graph == nil {
 		return nil, fmt.Errorf("search_ast: no graph available")
 	}
@@ -152,6 +152,8 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 	// Repo / language / path filters compose AND, so they stay Go-
 	// side — they can't be projected onto the bucket index without
 	// duplicating the predicate set across both call sites.
+	// Base read on purpose: these nodes only supply absolute paths, and the
+	// engine re-parses each file from disk anyway.
 	for n := range s.graph.NodesByKind(graph.KindFile) {
 		if n == nil {
 			continue
@@ -165,7 +167,7 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		abs, err := s.resolveNodePath(n)
+		abs, err := s.resolveNodePath(ctx, n)
 		if err != nil {
 			// Indexed file whose repo we can't currently
 			// resolve (rare; happens during an in-flight
@@ -201,7 +203,7 @@ func (s *Server) buildASTTargets(language, pathPrefix string, allowedRepos map[s
 // than `min` incoming edges. Without an enclosing symbol, the
 // match is preserved (we'd otherwise silently swallow file-level
 // matches that legitimately have no caller graph).
-func filterByMinFanIn(g graph.Store, matches []astquery.Match, min int) []astquery.Match {
+func filterByMinFanIn(g graph.Reader, matches []astquery.Match, min int) []astquery.Match {
 	if g == nil || min <= 0 {
 		return matches
 	}

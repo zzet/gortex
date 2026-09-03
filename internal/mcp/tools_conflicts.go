@@ -122,7 +122,7 @@ func (s *Server) handleConflictsPRs(ctx context.Context, req mcp.CallToolRequest
 			return mcp.NewToolResultError(ferr.Error()), nil
 		}
 
-		changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(joinPrefix, files)
+		changedFiles, changedSymbolNodes := s.changedSymbolsForFiles(ctx, joinPrefix, files)
 		symbolIDs := make([]string, 0, len(changedSymbolNodes))
 		for _, n := range changedSymbolNodes {
 			symbolIDs = append(symbolIDs, n.ID)
@@ -140,7 +140,7 @@ func (s *Server) handleConflictsPRs(ctx context.Context, req mcp.CallToolRequest
 		}
 		prCommunities[pr.Number] = comms
 
-		result := analysis.ScorePRRisk(s.graph, analysis.PRRiskInput{
+		result := analysis.ScorePRRisk(s.readerFor(ctx), analysis.PRRiskInput{
 			SymbolIDs:    symbolIDs,
 			ChangedFiles: changedFiles,
 			NodeToComm:   nodeToComm,

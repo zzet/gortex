@@ -52,7 +52,7 @@ type ReturnUsageSummary struct {
 // summarizeReturnUsage builds the return-usage distribution for one
 // function/method's incoming call edges. Returns nil when the symbol
 // has no call sites at all (nothing to report).
-func summarizeReturnUsage(g graph.Store, node *graph.Node) *ReturnUsageSummary {
+func summarizeReturnUsage(g graph.Reader, node *graph.Node) *ReturnUsageSummary {
 	if node == nil || (node.Kind != graph.KindFunction && node.Kind != graph.KindMethod) {
 		return nil
 	}
@@ -92,7 +92,7 @@ type parsedSignature struct {
 
 // VerifyChanges checks proposed signature changes against all callers and interface
 // implementors, returning any contract violations found.
-func VerifyChanges(g graph.Store, engine *query.Engine, changes []SignatureChange) *VerifyResult {
+func VerifyChanges(g graph.Reader, engine *query.Engine, changes []SignatureChange) *VerifyResult {
 	result := &VerifyResult{}
 
 	for _, change := range changes {
@@ -212,7 +212,7 @@ func VerifyChanges(g graph.Store, engine *query.Engine, changes []SignatureChang
 // checkInterfaceViolations checks if the changed symbol is a method that belongs to
 // an interface, and if so, verifies all other implementors still conform.
 // Traversal: EdgeMemberOf → parent type → EdgeImplements → interface → all implementors
-func checkInterfaceViolations(g graph.Store, engine *query.Engine, node *graph.Node, newSig *parsedSignature, result *VerifyResult) {
+func checkInterfaceViolations(g graph.Reader, engine *query.Engine, node *graph.Node, newSig *parsedSignature, result *VerifyResult) {
 	if node.Kind != graph.KindMethod {
 		return
 	}
@@ -293,7 +293,7 @@ func checkInterfaceViolations(g graph.Store, engine *query.Engine, node *graph.N
 }
 
 // findMemberMethods returns all method nodes that are members of the given type.
-func findMemberMethods(g graph.Store, typeID string) []*graph.Node {
+func findMemberMethods(g graph.Reader, typeID string) []*graph.Node {
 	inEdges := g.GetInEdges(typeID)
 	var methods []*graph.Node
 	for _, edge := range inEdges {

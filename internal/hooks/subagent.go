@@ -3,6 +3,7 @@ package hooks
 import (
 	"strings"
 
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/toolref"
 )
 
@@ -82,7 +83,8 @@ const gortexToolGuidance = "### MUST use Gortex MCP tools instead of Read/Grep/G
 	"1. Call `explore` with the delegated task.\n" +
 	"2. Inspect indexed code only with `search`, `read`, `relations`, and `trace`.\n" +
 	"3. Before mutation call `change(operation:\"impact\")`; for a signature change also call `change(operation:\"verify\")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`, then use its symbol IDs with `change` operations `tests`, `guards`, and `contract`.\n" +
-	"4. Call `capabilities` only when an operation's exact fields are unknown.\n"
+	"4. Call `capabilities` only when an operation's exact fields are unknown.\n" +
+	"\n### Worktree and branch routing\n\n" + profiles.WorktreeBranchRoutingPolicy
 
 // renderTaskContext calls smart_context with the subagent task text and
 // returns a capped body. Falls back to empty on any error. Only declared

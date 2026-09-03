@@ -159,6 +159,29 @@ func (r *facadeRegistry) availableOperations(facade string) []facadeOperationSpe
 	return out
 }
 
+// sourceMutatingFacades are the two facades whose every operation writes
+// source into a working copy. They are the enumeration of the mutation entry
+// points: a legacy tool reachable through either one writes files, whichever
+// name the caller used to reach it.
+var sourceMutatingFacades = map[string]bool{"edit": true, "refactor": true}
+
+// mutatesSource reports whether a tool name writes source into a working
+// copy, whether it is a facade name or the legacy tool behind one.
+func (r *facadeRegistry) mutatesSource(tool string) bool {
+	if r == nil || tool == "" {
+		return false
+	}
+	if sourceMutatingFacades[tool] {
+		return true
+	}
+	for _, spec := range r.byLegacy[tool] {
+		if sourceMutatingFacades[spec.Facade] {
+			return true
+		}
+	}
+	return false
+}
+
 func facadeToolNames() []string {
 	return []string{
 		"analyze", "ask", "capabilities", "change", "edit", "explore",

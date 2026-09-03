@@ -102,9 +102,13 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 	// scan we used to pay for. ~500k edge rows materialised over the
 	// storage boundary dropped to the SimilarTo-bearing
 	// subset (~hundreds-to-thousands on a normal workspace).
+	// One reader for the whole call — the edge stream and every endpoint
+	// lookup must agree, and under an overlay they resolve to the
+	// caller's buffers.
+	reader := s.readerFor(ctx)
 	seen := make(map[[2]string]struct{})
 	var pairs []clones.Pair
-	for e := range s.graph.EdgesByKind(graph.EdgeSimilarTo) {
+	for e := range reader.EdgesByKind(graph.EdgeSimilarTo) {
 		if e == nil {
 			continue
 		}
@@ -123,8 +127,8 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 		if sim < minSim {
 			continue
 		}
-		from := s.graph.GetNode(a)
-		to := s.graph.GetNode(b)
+		from := reader.GetNode(a)
+		to := reader.GetNode(b)
 		if !inScope(from) || !inScope(to) {
 			continue
 		}
@@ -138,7 +142,7 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 	// depends on knowing which clone members have zero incoming
 	// calls/references. Computed once and shared across every cluster.
 	deadSet := make(map[string]bool)
-	for _, d := range analysis.FindDeadCode(s.graph, s.getProcesses(), nil) {
+	for _, d := range analysis.FindDeadCode(reader, s.getProcesses(), nil) {
 		deadSet[d.ID] = true
 	}
 
@@ -149,7 +153,7 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 			AvgSimilarity: roundSim(c.AvgSimilarity),
 		}
 		for _, id := range c.Members {
-			n := s.graph.GetNode(id)
+			n := reader.GetNode(id)
 			if n == nil {
 				continue
 			}

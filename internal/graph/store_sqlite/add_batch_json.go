@@ -90,6 +90,13 @@ func (buffers *jsonbIngestBuffers) release() {
 	*buffers = jsonbIngestBuffers{}
 }
 
+// The $[i] positions are the encoded row's element indices, not the target
+// column ordinals: the single metadata BLOB argument is encoded as an
+// (offset, length) PAIR into the raw arena, so every element after it sits one
+// position later than its column. Element 0 is view_gen, the first column of
+// both insert lists — the whole chunk was produced by one handle, so the same
+// generation rides on every row rather than a third bound scalar the two
+// writers would then have to keep in step.
 const jsonbNodeIngestSQL = `INSERT INTO nodes (` + nodeInsertColumns + `)
 SELECT
 	json_extract(row.value, '$[0]'), json_extract(row.value, '$[1]'),
@@ -106,12 +113,12 @@ SELECT
 	json_extract(row.value, '$[22]'), json_extract(row.value, '$[23]'),
 	json_extract(row.value, '$[24]'), json_extract(row.value, '$[25]'),
 	json_extract(row.value, '$[26]'), json_extract(row.value, '$[27]'),
-	json_extract(row.value, '$[28]'),
-	CASE WHEN json_type(row.value, '$[29]') = 'null' THEN NULL
-		ELSE substr(?2, json_extract(row.value, '$[29]') + 1, json_extract(row.value, '$[30]')) END,
-	json_extract(row.value, '$[31]'), json_extract(row.value, '$[32]'),
-	json_extract(row.value, '$[33]'), json_extract(row.value, '$[34]'),
-	json_extract(row.value, '$[35]')
+	json_extract(row.value, '$[28]'), json_extract(row.value, '$[29]'),
+	CASE WHEN json_type(row.value, '$[30]') = 'null' THEN NULL
+		ELSE substr(?2, json_extract(row.value, '$[30]') + 1, json_extract(row.value, '$[31]')) END,
+	json_extract(row.value, '$[32]'), json_extract(row.value, '$[33]'),
+	json_extract(row.value, '$[34]'), json_extract(row.value, '$[35]'),
+	json_extract(row.value, '$[36]')
 FROM jsonb_each(jsonb(?1)) AS row
 WHERE true` + nodeUpsertClause
 
@@ -122,11 +129,22 @@ SELECT
 	json_extract(row.value, '$[4]'), json_extract(row.value, '$[5]'),
 	json_extract(row.value, '$[6]'), json_extract(row.value, '$[7]'),
 	json_extract(row.value, '$[8]'), json_extract(row.value, '$[9]'),
-	CASE WHEN json_type(row.value, '$[10]') = 'null' THEN NULL
-		ELSE substr(?2, json_extract(row.value, '$[10]') + 1, json_extract(row.value, '$[11]')) END,
-	json_extract(row.value, '$[12]'), json_extract(row.value, '$[13]'),
-	json_extract(row.value, '$[14]')
+	json_extract(row.value, '$[10]'),
+	CASE WHEN json_type(row.value, '$[11]') = 'null' THEN NULL
+		ELSE substr(?2, json_extract(row.value, '$[11]') + 1, json_extract(row.value, '$[12]')) END,
+	json_extract(row.value, '$[13]'), json_extract(row.value, '$[14]'),
+	json_extract(row.value, '$[15]')
 FROM jsonb_each(jsonb(?1)) AS row`
+
+// jsonbNodeMetaIndex / jsonbEdgeMetaIndex are the offsets of the metadata BLOB
+// argument inside the rows appendNodeInsertArgs / appendEdgeInsertArgs build —
+// the element the encoder splits into the (offset, length) pair above. Named
+// rather than inlined at the call sites so the two SQL statements and the
+// encoder cannot drift apart silently.
+const (
+	jsonbNodeMetaIndex = 30
+	jsonbEdgeMetaIndex = 11
+)
 
 // jsonbIngestEnabled is the operator kill switch: GORTEX_SQLITE_JSONB_INGEST=0
 // (or "false") forces the placeholder writer everywhere.
@@ -237,7 +255,7 @@ func appendJSONBIngestRow(buffers *jsonbIngestBuffers, row []any, metaIndex, row
 	return true, nil
 }
 
-func nextJSONBNodePayload(buffers *jsonbIngestBuffers, nodes []*graph.Node, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
+func nextJSONBNodePayload(buffers *jsonbIngestBuffers, viewGen int64, nodes []*graph.Node, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
 	buffers.reset(nodeInsertParams + 1)
 	pos := start
 	for pos < len(nodes) && rows < jsonbIngestNodeRows {
@@ -246,12 +264,12 @@ func nextJSONBNodePayload(buffers *jsonbIngestBuffers, nodes []*graph.Node, star
 			pos++
 			continue
 		}
-		args, appendErr := appendNodeInsertArgs(buffers.args[:0], node)
+		args, appendErr := appendNodeInsertArgs(buffers.args[:0], viewGen, node)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
 		buffers.args = args
-		added, appendErr := appendJSONBIngestRow(buffers, args, 29, rows)
+		added, appendErr := appendJSONBIngestRow(buffers, args, jsonbNodeMetaIndex, rows)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
@@ -265,7 +283,7 @@ func nextJSONBNodePayload(buffers *jsonbIngestBuffers, nodes []*graph.Node, star
 	return buffers.payload.Bytes(), buffers.blobs.Bytes(), pos, rows, nil
 }
 
-func nextJSONBEdgePayload(buffers *jsonbIngestBuffers, edges []*graph.Edge, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
+func nextJSONBEdgePayload(buffers *jsonbIngestBuffers, viewGen int64, edges []*graph.Edge, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
 	buffers.reset(edgeInsertParams + 1)
 	pos := start
 	for pos < len(edges) && rows < jsonbIngestEdgeRows {
@@ -274,12 +292,12 @@ func nextJSONBEdgePayload(buffers *jsonbIngestBuffers, edges []*graph.Edge, star
 			pos++
 			continue
 		}
-		args, appendErr := appendEdgeInsertArgs(buffers.args[:0], edge)
+		args, appendErr := appendEdgeInsertArgs(buffers.args[:0], viewGen, edge)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
 		buffers.args = args
-		added, appendErr := appendJSONBIngestRow(buffers, args, 10, rows)
+		added, appendErr := appendJSONBIngestRow(buffers, args, jsonbEdgeMetaIndex, rows)
 		if appendErr != nil {
 			return nil, nil, start, 0, appendErr
 		}
@@ -299,15 +317,17 @@ func nextJSONBEdgePayload(buffers *jsonbIngestBuffers, edges []*graph.Edge, star
 // the bounded two-bind JSONB statements.
 func insertNodeChunksJSONBTx(
 	tx *sql.Tx,
+	viewGen int64,
 	nodes []*graph.Node,
 	returnChanged bool,
 ) (rowsChanged, statements int, changedIDs map[string]int, err error) {
 	var buffers jsonbIngestBuffers
-	return insertNodeChunksJSONBTxWithBuffers(tx, nodes, returnChanged, &buffers)
+	return insertNodeChunksJSONBTxWithBuffers(tx, viewGen, nodes, returnChanged, &buffers)
 }
 
 func insertNodeChunksJSONBTxWithBuffers(
 	tx *sql.Tx,
+	viewGen int64,
 	nodes []*graph.Node,
 	returnChanged bool,
 	buffers *jsonbIngestBuffers,
@@ -323,7 +343,7 @@ func insertNodeChunksJSONBTxWithBuffers(
 	}
 	defer stmt.Close()
 	for pos := 0; pos < len(nodes); {
-		payload, blobs, next, rows, encodeErr := nextJSONBNodePayload(buffers, nodes, pos)
+		payload, blobs, next, rows, encodeErr := nextJSONBNodePayload(buffers, viewGen, nodes, pos)
 		if encodeErr != nil {
 			return rowsChanged, statements, changedIDs, encodeErr
 		}
@@ -375,15 +395,17 @@ func insertNodeChunksJSONBTxWithBuffers(
 // payloads and INSERT OR IGNORE semantics.
 func insertEdgeChunksJSONBTx(
 	tx *sql.Tx,
+	viewGen int64,
 	edges []*graph.Edge,
 	returnInserted bool,
 ) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
 	var buffers jsonbIngestBuffers
-	return insertEdgeChunksJSONBTxWithBuffers(tx, edges, returnInserted, &buffers)
+	return insertEdgeChunksJSONBTxWithBuffers(tx, viewGen, edges, returnInserted, &buffers)
 }
 
 func insertEdgeChunksJSONBTxWithBuffers(
 	tx *sql.Tx,
+	viewGen int64,
 	edges []*graph.Edge,
 	returnInserted bool,
 	buffers *jsonbIngestBuffers,
@@ -399,7 +421,7 @@ func insertEdgeChunksJSONBTxWithBuffers(
 	}
 	defer stmt.Close()
 	for pos := 0; pos < len(edges); {
-		payload, blobs, next, rows, encodeErr := nextJSONBEdgePayload(buffers, edges, pos)
+		payload, blobs, next, rows, encodeErr := nextJSONBEdgePayload(buffers, viewGen, edges, pos)
 		if encodeErr != nil {
 			return rowsInserted, statements, insertedKeys, encodeErr
 		}

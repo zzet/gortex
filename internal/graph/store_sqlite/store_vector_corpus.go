@@ -44,16 +44,16 @@ func (s *Store) ReplaceVectorCorpus(
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
-	if err := validateVectorCorpusOwnershipTx(ctx, tx, repoPrefix, items); err != nil {
+	if err := validateVectorCorpusOwnershipTx(ctx, tx, s.viewGen, repoPrefix, items); err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM vectors WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM vectors WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
-	if err := insertVectorCorpusTx(ctx, tx, repoPrefix, dims, items); err != nil {
+	if err := insertVectorCorpusTx(ctx, tx, s.viewGen, repoPrefix, dims, items); err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
-	stats, err := vectorCorpusStatsForRepoDims(ctx, tx, repoPrefix, dims)
+	stats, err := vectorCorpusStatsForRepoDims(ctx, tx, s.viewGen, repoPrefix, dims)
 	if err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
@@ -74,7 +74,7 @@ func (s *Store) VectorCorpusStats(ctx context.Context, dims int) (graph.VectorCo
 		return graph.VectorCorpusStats{}, err
 	}
 	if dims > 0 {
-		return vectorCorpusStatsForDims(ctx, s.db, dims)
+		return vectorCorpusStatsForDims(ctx, s.db, s.viewGen, dims)
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
@@ -82,9 +82,10 @@ SELECT dims,
        COUNT(*),
        COALESCE(SUM(CASE WHEN parent_id <> '' THEN 1 ELSE 0 END), 0)
 FROM vectors
+WHERE view_gen = ?
 GROUP BY dims
 ORDER BY dims
-LIMIT 2`)
+LIMIT 2`, s.viewGen)
 	if err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
@@ -124,7 +125,7 @@ func (s *Store) VectorCorpusStatsForRepo(
 		return graph.VectorCorpusStats{}, err
 	}
 	if dims > 0 {
-		return vectorCorpusStatsForRepoDims(ctx, s.db, repoPrefix, dims)
+		return vectorCorpusStatsForRepoDims(ctx, s.db, s.viewGen, repoPrefix, dims)
 	}
 
 	var stats graph.VectorCorpusStats
@@ -136,7 +137,8 @@ SELECT COALESCE(MIN(dims), 0),
        COALESCE(SUM(CASE WHEN parent_id <> '' THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN repo_prefix = ? THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN repo_prefix = ? AND parent_id <> '' THEN 1 ELSE 0 END), 0)
-FROM vectors`, repoPrefix, repoPrefix).Scan(
+FROM vectors
+WHERE view_gen = ?`, repoPrefix, repoPrefix, s.viewGen).Scan(
 		&stats.Dims,
 		&distinctDims,
 		&stats.VectorCount,
@@ -190,6 +192,7 @@ func validateVectorCorpus(ctx context.Context, dims int, items []graph.VectorCor
 func validateVectorCorpusOwnershipTx(
 	ctx context.Context,
 	tx *sql.Tx,
+	viewGen int64,
 	repoPrefix string,
 	items []graph.VectorCorpusItem,
 ) error {
@@ -232,7 +235,8 @@ func validateVectorCorpusOwnershipTx(
 			stmt = append(stmt, '?')
 			args = append(args, id)
 		}
-		stmt = append(stmt, ')')
+		stmt = append(stmt, ") AND view_gen = ?"...)
+		args = append(args, viewGen)
 
 		rows, err := tx.QueryContext(ctx, string(stmt), args...)
 		if err != nil {
@@ -275,8 +279,9 @@ func validateVectorCorpusOwnershipTx(
 		}
 		batch := items[start:end]
 		stmt := make([]byte, 0, 96+len(batch)*2)
-		stmt = append(stmt, "SELECT node_id, repo_prefix FROM vectors WHERE node_id IN ("...)
-		args := make([]any, 0, len(batch)+1)
+		stmt = append(stmt, "SELECT node_id, repo_prefix FROM vectors WHERE view_gen = ? AND node_id IN ("...)
+		args := make([]any, 0, len(batch)+2)
+		args = append(args, viewGen)
 		for i, item := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -317,6 +322,7 @@ func validateCanonicalVectorChunkID(nodeID, parentID string) error {
 func insertVectorCorpusTx(
 	ctx context.Context,
 	tx *sql.Tx,
+	viewGen int64,
 	repoPrefix string,
 	dims int,
 	items []graph.VectorCorpusItem,
@@ -332,14 +338,14 @@ func insertVectorCorpusTx(
 		batch := items[start:end]
 
 		stmt := make([]byte, 0, 96+len(batch)*20)
-		stmt = append(stmt, "INSERT INTO vectors (node_id, repo_prefix, parent_id, dims, vec) VALUES "...)
-		args := make([]any, 0, len(batch)*5)
+		stmt = append(stmt, "INSERT INTO vectors (view_gen, node_id, repo_prefix, parent_id, dims, vec) VALUES "...)
+		args := make([]any, 0, len(batch)*6)
 		for i, item := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?, ?)"...)
-			args = append(args, item.NodeID, repoPrefix, item.ParentID, dims, encodeVec(item.Vec))
+			stmt = append(stmt, "(?, ?, ?, ?, ?, ?)"...)
+			args = append(args, viewGen, item.NodeID, repoPrefix, item.ParentID, dims, encodeVec(item.Vec))
 		}
 		if _, err := tx.ExecContext(ctx, string(stmt), args...); err != nil {
 			return err
@@ -355,6 +361,7 @@ type vectorCorpusStatsQuerier interface {
 func vectorCorpusStatsForDims(
 	ctx context.Context,
 	q vectorCorpusStatsQuerier,
+	viewGen int64,
 	dims int,
 ) (graph.VectorCorpusStats, error) {
 	stats := graph.VectorCorpusStats{Dims: dims}
@@ -362,7 +369,7 @@ func vectorCorpusStatsForDims(
 SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN parent_id <> '' THEN 1 ELSE 0 END), 0)
 FROM vectors
-WHERE dims = ?`, dims).Scan(&stats.VectorCount, &stats.ChunkCount)
+WHERE view_gen = ? AND dims = ?`, viewGen, dims).Scan(&stats.VectorCount, &stats.ChunkCount)
 	if err != nil {
 		return graph.VectorCorpusStats{}, err
 	}
@@ -372,6 +379,7 @@ WHERE dims = ?`, dims).Scan(&stats.VectorCount, &stats.ChunkCount)
 func vectorCorpusStatsForRepoDims(
 	ctx context.Context,
 	q vectorCorpusStatsQuerier,
+	viewGen int64,
 	repoPrefix string,
 	dims int,
 ) (graph.VectorCorpusStats, error) {
@@ -382,7 +390,7 @@ SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN repo_prefix = ? THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN repo_prefix = ? AND parent_id <> '' THEN 1 ELSE 0 END), 0)
 FROM vectors
-WHERE dims = ?`, repoPrefix, repoPrefix, dims).Scan(
+WHERE view_gen = ? AND dims = ?`, repoPrefix, repoPrefix, viewGen, dims).Scan(
 		&stats.VectorCount,
 		&stats.ChunkCount,
 		&stats.RepositoryVectorCount,

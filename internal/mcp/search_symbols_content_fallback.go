@@ -104,7 +104,7 @@ func (s *Server) searchSymbolsContentFallback(
 			exact = append(exact, match)
 		}
 	}
-	exact = s.filterTextMatchesByResolvedScope(exact, resolved)
+	exact = s.filterTextMatchesByResolvedScope(ctx, exact, resolved)
 	if len(exact) > searchSymbolsContentFallbackMaxMatches {
 		exact = exact[:searchSymbolsContentFallbackMaxMatches]
 	}

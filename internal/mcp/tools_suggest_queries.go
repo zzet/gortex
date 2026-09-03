@@ -44,7 +44,7 @@ func (s *Server) handleSuggestQueries(ctx context.Context, req mcp.CallToolReque
 		}
 	}
 
-	suggestions := s.buildSuggestedQueries(scoped, inScope, limit)
+	suggestions := s.buildSuggestedQueries(ctx, scoped, inScope, limit)
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
 		"suggestions": suggestions,
 		"count":       len(suggestions),
@@ -64,7 +64,8 @@ type symbolStat struct {
 // reader starts), then bridges and hubs (the load-bearing seams), then
 // subsystems and shared modules. The whole list is deterministic:
 // every ranking sort carries an ID tie-break.
-func (s *Server) buildSuggestedQueries(scoped []*graph.Node, inScope map[string]bool, limit int) []suggestedQuery {
+func (s *Server) buildSuggestedQueries(ctx context.Context, scoped []*graph.Node, inScope map[string]bool, limit int) []suggestedQuery {
+	g := s.readerFor(ctx)
 	var out []suggestedQuery
 	seen := make(map[string]bool)
 	add := func(query, category, why string) {
@@ -78,7 +79,7 @@ func (s *Server) buildSuggestedQueries(scoped []*graph.Node, inScope map[string]
 	}
 
 	// 1. Entry points — where the program starts executing.
-	for i, ep := range entryPoints(s.graph, inScope, 3) {
+	for i, ep := range entryPoints(g, inScope, 3) {
 		if i >= 2 {
 			break
 		}
@@ -112,7 +113,7 @@ func (s *Server) buildSuggestedQueries(scoped []*graph.Node, inScope map[string]
 		statByID[stats[i].node.ID] = &stats[i]
 	}
 	for _, k := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
-		for e := range s.graph.EdgesByKind(k) {
+		for e := range g.EdgesByKind(k) {
 			if e == nil {
 				continue
 			}
@@ -189,7 +190,7 @@ func (s *Server) buildSuggestedQueries(scoped []*graph.Node, inScope map[string]
 	}
 
 	// 5. Shared modules — the files almost everything imports.
-	for i, f := range mostImportedFiles(s.graph, inScope, 5) {
+	for i, f := range mostImportedFiles(g, inScope, 5) {
 		if i >= 2 {
 			break
 		}

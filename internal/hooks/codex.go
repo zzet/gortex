@@ -117,7 +117,7 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 		case CodexModeRewrite:
 			runCodexBashRewrite(data, port)
 		default:
-			runPreToolUse(data, port, ModeEnrich)
+			runPreToolUseForHost(data, port, ModeEnrich, preToolUseCodex)
 		}
 	case peek.HookEventName == "PreToolUse" && codexLocalizationPreToolUseTool(peek.ToolName):
 		runCodexLocalizationPreToolUse(data, mode)
@@ -352,10 +352,16 @@ func runCodexLocalizationPreToolUse(data []byte, mode CodexMode) {
 		AdditionalContext: ctx,
 		UpdatedInput:      updatedInput,
 	}
+	if updatedInput != nil {
+		// Codex requires every input rewrite to carry an explicit allow.
+		// Unlike Claude Code, it does not accept ask with updatedInput.
+		hso.PermissionDecision = "allow"
+	}
 	if ctx != "" {
 		switch mode {
 		case CodexModeDeny:
 			hso.AdditionalContext = ""
+			hso.UpdatedInput = nil
 			hso.PermissionDecision = "deny"
 			hso.PermissionDecisionReason = ctx
 		case CodexModeRewrite:

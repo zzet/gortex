@@ -10,14 +10,12 @@ import (
 // test. Used to exercise enrichBash's ReadSource path without a real daemon.
 // Returns a dummy port (0) so the legacy `port := newIndexedBridge(...)`
 // call sites still compile; the value is unused now that the indexed check
-// routes through the stubbed fileIndexScopeFn seam rather than an HTTP port.
+// routes through the stubbed fileIndexedFn seam rather than an HTTP port.
 func newIndexedBridge(t *testing.T, symbols int) int {
 	t.Helper()
-	prev := fileIndexScopeFn
-	t.Cleanup(func() { fileIndexScopeFn = prev })
-	fileIndexScopeFn = func(_, _ string) fileIndexStatus {
-		return fileIndexStatus{Indexed: symbols > 0, Count: symbols, ProbeOK: true}
-	}
+	prev := fileIndexedFn
+	t.Cleanup(func() { fileIndexedFn = prev })
+	fileIndexedFn = func(_, _ string) (bool, int) { return symbols > 0, symbols }
 	return 0
 }
 
@@ -178,14 +176,14 @@ func TestEnrichBash_UnrelatedCommand(t *testing.T) {
 func probedIndexedBridge(t *testing.T, indexed map[string]bool) *[]string {
 	t.Helper()
 	probes := &[]string{}
-	prev := fileIndexScopeFn
-	t.Cleanup(func() { fileIndexScopeFn = prev })
-	fileIndexScopeFn = func(_, filePath string) fileIndexStatus {
+	prev := fileIndexedFn
+	t.Cleanup(func() { fileIndexedFn = prev })
+	fileIndexedFn = func(_, filePath string) (bool, int) {
 		*probes = append(*probes, filePath)
 		if indexed[filePath] {
-			return fileIndexStatus{Indexed: true, Count: 4, ProbeOK: true}
+			return true, 4
 		}
-		return fileIndexStatus{ProbeOK: true}
+		return false, 0
 	}
 	return probes
 }

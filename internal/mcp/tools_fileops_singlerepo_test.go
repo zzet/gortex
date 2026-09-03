@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -58,7 +59,7 @@ func TestResolveNodePath_LoneRepoNode(t *testing.T) {
 	require.NotNil(t, node, "a lone repo's node IDs carry its prefix")
 	require.Equal(t, "myrepo", node.RepoPrefix)
 
-	abs, err := srv.resolveNodePath(node)
+	abs, err := srv.resolveNodePath(context.Background(), node)
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(dir, "main.go"), abs)
 }
@@ -69,7 +70,7 @@ func TestResolveNodePath_LoneRepoNode(t *testing.T) {
 func TestResolveFilePath_LoneRepoBareRelative(t *testing.T) {
 	srv, _, dir := newSingleRepoServer(t)
 
-	abs, rel, err := srv.resolveFilePath("main.go")
+	abs, rel, err := srv.resolveFilePath(context.Background(), "main.go")
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(dir, "main.go"), abs)
 	// relPath comes back in the GRAPH's spelling, not the caller's. Every
@@ -81,17 +82,17 @@ func TestResolveFilePath_LoneRepoBareRelative(t *testing.T) {
 	// A file that does NOT exist yet — a write_file / edit_file create
 	// target — must resolve too. Existence-gated anchoring alone would
 	// refuse this, which is the regression the sole-repo lookup prevents.
-	abs, rel, err = srv.resolveFilePath("internal/brand_new.go")
+	abs, rel, err = srv.resolveFilePath(context.Background(), "internal/brand_new.go")
 	require.NoError(t, err, "creating a new file by bare path must work in a solo workspace")
 	assert.Equal(t, filepath.Join(dir, "internal", "brand_new.go"), abs)
 	assert.Equal(t, "myrepo/internal/brand_new.go", rel)
 
 	// Containment still enforced: escaping the lone root is refused.
-	_, _, err = srv.resolveFilePath("../escape.go")
+	_, _, err = srv.resolveFilePath(context.Background(), "../escape.go")
 	require.Error(t, err)
 
 	// The prefixed form keeps working.
-	abs, _, err = srv.resolveFilePath("myrepo/main.go")
+	abs, _, err = srv.resolveFilePath(context.Background(), "myrepo/main.go")
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(dir, "main.go"), abs)
 }
@@ -124,6 +125,6 @@ func TestResolveFilePath_MultiRepoBareRelativeStillAmbiguous(t *testing.T) {
 		MultiIndexer:  mi,
 	})
 
-	_, _, err = srv.resolveFilePath("main.go")
+	_, _, err = srv.resolveFilePath(context.Background(), "main.go")
 	require.Error(t, err, "bare-relative path with two tracked repos stays ambiguous")
 }

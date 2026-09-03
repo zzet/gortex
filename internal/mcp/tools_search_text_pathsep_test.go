@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -83,9 +84,9 @@ func TestGraphRelPath_LoneRepoForwardSlash(t *testing.T) {
 	nodeKey := "solo/" + filepath.FromSlash("pkg/sub/main.go")
 	require.NotNil(t, g.GetNode(nodeKey), "fixture invariant: a lone repo's node ids carry its prefix")
 
-	require.Equal(t, nodeKey, srv.graphRelPath("solo/pkg/sub/main.go"),
+	require.Equal(t, nodeKey, srv.graphRelPath(context.Background(), "solo/pkg/sub/main.go"),
 		"a forward-slash path must be normalised to the graph's spelling")
-	require.Equal(t, nodeKey, srv.graphRelPath(nodeKey),
+	require.Equal(t, nodeKey, srv.graphRelPath(context.Background(), nodeKey),
 		"an already OS-spelled path is unchanged (idempotent)")
 
 	res := callTool(t, srv, "get_file_summary", map[string]any{"path": "pkg/sub/main.go"})
@@ -118,6 +119,7 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			"fixture invariant: several tracked repos mint prefixed node ids")
 
 		got := srv.filterTextMatchesByResolvedScope(
+			context.Background(),
 			[]trigram.Match{{Path: "beta/pkg/sub/main.go", Line: 3, Text: "// marker"}},
 			ResolvedScope{WorkspaceID: "shared", RepoAllow: map[string]bool{"beta": true}},
 		)
@@ -135,6 +137,7 @@ func TestFilterTextMatchesByResolvedScope_BelowRepoRoot(t *testing.T) {
 			"fixture invariant: a lone repo's node ids carry its prefix")
 
 		got := srv.filterTextMatchesByResolvedScope(
+			context.Background(),
 			[]trigram.Match{{Path: "solo/pkg/sub/main.go", Line: 3, Text: "// marker"}},
 			ResolvedScope{WorkspaceID: "shared", RepoAllow: map[string]bool{"solo": true}},
 		)

@@ -24,11 +24,11 @@ func (s *Store) AllEdgesLight(kinds ...graph.EdgeKind) []*graph.Edge {
 		if len(kinds) > 0 {
 			return nil // caller passed only empty kinds — nothing matches
 		}
-		return s.queryEdgesLightSQL(`SELECT ` + edgeColsLight + ` FROM edges ORDER BY id`)
+		return s.queryEdgesLightSQL(`SELECT `+edgeColsLight+` FROM edges WHERE view_gen = ? ORDER BY id`, s.viewGen)
 	}
 	q := `SELECT ` + edgeColsLight + ` FROM edges WHERE kind IN (` +
-		inPlaceholders(len(args)) + `) ORDER BY id`
-	return s.queryEdgesLightSQL(q, args...)
+		inPlaceholders(len(args)) + `) AND view_gen = ? ORDER BY id`
+	return s.queryEdgesLightSQL(q, append(args, s.viewGen)...)
 }
 
 // queryEdgesLightSQL is the meta-less sibling of queryEdgesSQL: it materialises

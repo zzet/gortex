@@ -16,21 +16,17 @@ func unmarshalResult(raw json.RawMessage, v any) error {
 	return json.Unmarshal(raw, v)
 }
 
-// probeViaDaemon dials the local daemon over its unix socket and runs one
-// search_symbols control RPC. The whole exchange (dial + handshake + RPC)
-// must fit inside timeout; otherwise errProbeTimeout is returned and the
-// caller falls through to soft guidance.
+// controlRoundTrip dials the local daemon over its unix socket, runs one
+// control RPC, and decodes the result into out. The whole exchange (dial +
+// handshake + RPC) must fit inside timeout; otherwise errProbeTimeout is
+// returned and the caller falls through to soft guidance.
 //
 // Returns errDaemonUnreachable when the daemon isn't running — the hook
 // distinguishes "no signal" from "probed and missed" so telemetry stays
 // clean.
-func probeViaDaemon(pattern string, timeout time.Duration) ([]grepSymbolHit, error) {
+func controlRoundTrip(kind string, params any, out any, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	type probeResult struct {
-		hits []grepSymbolHit
-		err  error
-	}
-	done := make(chan probeResult, 1)
+	done := make(chan error, 1)
 
 	go func() {
 		client, err := daemon.Dial(daemon.Handshake{
@@ -39,10 +35,10 @@ func probeViaDaemon(pattern string, timeout time.Duration) ([]grepSymbolHit, err
 		})
 		if err != nil {
 			if errors.Is(err, daemon.ErrDaemonUnavailable) {
-				done <- probeResult{err: errDaemonUnreachable}
+				done <- errDaemonUnreachable
 				return
 			}
-			done <- probeResult{err: fmt.Errorf("dial daemon: %w", err)}
+			done <- fmt.Errorf("dial daemon: %w", err)
 			return
 		}
 		defer client.Close()
@@ -58,43 +54,83 @@ func probeViaDaemon(pattern string, timeout time.Duration) ([]grepSymbolHit, err
 		// only unbounded one.
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			done <- probeResult{err: fmt.Errorf("daemon probe budget exhausted before the search rpc")}
+			done <- fmt.Errorf("daemon probe budget exhausted before the %s rpc", kind)
 			return
 		}
-		resp, err := client.ControlWithTimeout(daemon.ControlSearchSymbols, daemon.SearchSymbolsParams{
-			Query: pattern,
-			Limit: 10,
-		}, remaining)
+		resp, err := client.ControlWithTimeout(kind, params, remaining)
 		if err != nil {
-			done <- probeResult{err: fmt.Errorf("control rpc: %w", err)}
+			done <- fmt.Errorf("control rpc: %w", err)
 			return
 		}
 		if !resp.OK {
-			done <- probeResult{err: fmt.Errorf("daemon rejected search [%s]: %s", resp.ErrorCode, resp.ErrorMsg)}
+			done <- fmt.Errorf("daemon rejected %s [%s]: %s", kind, resp.ErrorCode, resp.ErrorMsg)
 			return
 		}
-
-		var result daemon.SearchSymbolsResult
-		if err := unmarshalResult(resp.Result, &result); err != nil {
-			done <- probeResult{err: fmt.Errorf("decode result: %w", err)}
+		if err := unmarshalResult(resp.Result, out); err != nil {
+			done <- fmt.Errorf("decode result: %w", err)
 			return
 		}
-		hits := make([]grepSymbolHit, 0, len(result.Hits))
-		for _, h := range result.Hits {
-			hits = append(hits, grepSymbolHit{
-				Name:     h.Name,
-				Kind:     h.Kind,
-				FilePath: h.FilePath,
-				Line:     h.Line,
-			})
-		}
-		done <- probeResult{hits: hits}
+		done <- nil
 	}()
 
 	select {
-	case r := <-done:
-		return r.hits, r.err
+	case err := <-done:
+		return err
 	case <-time.After(time.Until(deadline)):
-		return nil, errProbeTimeout
+		return errProbeTimeout
 	}
+}
+
+// probeViaDaemon runs one search_symbols control RPC.
+//
+// scope is the file or directory the probe is about. The daemon answers out of
+// the graph that path reads through, so a pattern probed from inside an
+// automatic worktree is matched against that working copy's composed view
+// rather than against the family primary's corpus. An empty scope keeps the
+// base-corpus answer.
+//
+// The answer's view block is recorded, not acted on: a fallback answer still
+// drives the deny the same way an exact one does. Recording it here matters as
+// much as on the coverage verb — a grace-window deny whose evidence came from
+// the family primary is a degradation, and one that left no record would be
+// indistinguishable from a hit on the worktree's own view.
+func probeViaDaemon(pattern, scope string, timeout time.Duration) ([]grepSymbolHit, error) {
+	var result daemon.SearchSymbolsResult
+	err := controlRoundTrip(daemon.ControlSearchSymbols, daemon.SearchSymbolsParams{
+		Query: pattern,
+		Limit: 10,
+		Path:  scope,
+	}, &result, timeout)
+	if err != nil {
+		return nil, err
+	}
+	logProbeViewFallback(daemon.ControlSearchSymbols, result.View)
+	hits := make([]grepSymbolHit, 0, len(result.Hits))
+	for _, h := range result.Hits {
+		hits = append(hits, grepSymbolHit{
+			Name:     h.Name,
+			Kind:     h.Kind,
+			FilePath: h.FilePath,
+			Line:     h.Line,
+		})
+	}
+	return hits, nil
+}
+
+// fileCoverageViaDaemon asks the daemon whether the graph serving path holds
+// definition symbols for it.
+//
+// The path resolution is the daemon's, not the hook's: only the daemon can
+// tell an automatic worktree from an ordinary tracked root, and only it knows
+// whether a composed view exists for that working copy yet. A hook that
+// resolved the path itself reported every worktree file as belonging to no
+// tracked repository, which read as "not indexed" and let native tools
+// through even where a routed view was serving.
+func fileCoverageViaDaemon(path string, timeout time.Duration) (daemon.FileCoverageResult, bool) {
+	var result daemon.FileCoverageResult
+	if err := controlRoundTrip(daemon.ControlFileCoverage,
+		daemon.FileCoverageParams{Path: path}, &result, timeout); err != nil {
+		return daemon.FileCoverageResult{}, false
+	}
+	return result, true
 }

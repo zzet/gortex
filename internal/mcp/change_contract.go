@@ -141,13 +141,14 @@ type prediction struct {
 
 // nodesForIDs resolves symbol IDs to graph nodes, dropping any that no longer
 // exist.
-func (s *Server) nodesForIDs(ids []string) []*graph.Node {
-	if s.graph == nil {
+func (s *Server) nodesForIDs(ctx context.Context, ids []string) []*graph.Node {
+	g := s.readerFor(ctx)
+	if g == nil {
 		return nil
 	}
 	out := make([]*graph.Node, 0, len(ids))
 	for _, id := range ids {
-		if n := s.graph.GetNode(id); n != nil {
+		if n := g.GetNode(id); n != nil {
 			out = append(out, n)
 		}
 	}
@@ -269,12 +270,12 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	ids = dedupeStrings(ids)
 
-	nodes := s.nodesForIDs(ids)
+	nodes := s.nodesForIDs(ctx, ids)
 	changed := make([]changedSymbolRef, 0, len(nodes))
 	for _, n := range nodes {
 		changed = append(changed, refFromNode(n))
 	}
-	verificationFiles, verr := s.workspaceEditVerificationFiles(edit)
+	verificationFiles, verr := s.workspaceEditVerificationFiles(ctx, edit)
 	if verr != nil {
 		return nil, verr
 	}
@@ -294,14 +295,14 @@ func (s *Server) lowerEditSource(ctx context.Context, req mcp.CallToolRequest) (
 // owner and one repository-local path. Verification command synthesis consumes
 // only this canonical form, never the caller's absolute, URI, or graph-qualified
 // spelling.
-func (s *Server) workspaceEditVerificationFiles(edit lsp.WorkspaceEdit) ([]verificationFile, error) {
+func (s *Server) workspaceEditVerificationFiles(ctx context.Context, edit lsp.WorkspaceEdit) ([]verificationFile, error) {
 	fileEdits, err := s.groupEditByFile(edit)
 	if err != nil {
 		return nil, err
 	}
 	files := make([]verificationFile, 0, len(fileEdits))
 	for _, fe := range fileEdits {
-		_, rel, err := s.resolveFilePath(fe.overlayPath)
+		_, rel, err := s.resolveFilePath(ctx, fe.overlayPath)
 		if err != nil {
 			return nil, fmt.Errorf("cannot determine repository ownership for workspace edit path %q: %w", fe.overlayPath, err)
 		}
@@ -380,7 +381,7 @@ func (s *Server) lowerRangeSource(ctx context.Context, req mcp.CallToolRequest) 
 		files = append(files, h.File)
 	}
 	ids = dedupeStrings(ids)
-	nodes := s.nodesForIDs(ids)
+	nodes := s.nodesForIDs(ctx, ids)
 	return &prediction{
 		source:            "ranges",
 		changed:           changed,
@@ -398,7 +399,7 @@ func (s *Server) lowerSymbolSource(ctx context.Context, req mcp.CallToolRequest)
 		return nil, fmt.Errorf("source=symbols requires a comma-separated `symbols` list")
 	}
 	ids = dedupeStrings(ids)
-	nodes := s.nodesForIDs(ids)
+	nodes := s.nodesForIDs(ctx, ids)
 	changed := make([]changedSymbolRef, 0, len(nodes))
 	files := make([]string, 0, len(nodes))
 	for _, n := range nodes {
@@ -429,7 +430,7 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 	if rootErr != nil {
 		return nil, rootErr
 	}
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, base)
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, base)
 	if err != nil {
 		return nil, err
 	}
@@ -444,7 +445,7 @@ func (s *Server) lowerDiffSource(ctx context.Context, req mcp.CallToolRequest) (
 		source:       "diff",
 		changed:      changed,
 		changedIDs:   ids,
-		nodes:        s.nodesForIDs(ids),
+		nodes:        s.nodesForIDs(ctx, ids),
 		impact:       s.analyzeImpactLazy(ctx, ids),
 		touchedFiles: diff.ChangedFiles,
 		repoPrefixes: []string{repoPrefix},
@@ -474,14 +475,17 @@ func (s *Server) extraRuleFamilies() []analysis.RuleFamily {
 	return fams
 }
 
-// evaluateChange runs every registered rule family over the changed set.
-func (s *Server) evaluateChange(p *prediction) []analysis.GuardViolation {
+// evaluateChange runs every registered rule family over the changed set,
+// reading through the request's reader so a gate fires on the caller's own
+// buffers rather than on the last-indexed state.
+func (s *Server) evaluateChange(ctx context.Context, p *prediction) []analysis.GuardViolation {
 	if len(p.changedIDs) == 0 {
 		return nil
 	}
+	reader := s.readerFor(ctx)
 	var violations []analysis.GuardViolation
 	for _, fam := range s.ruleFamilies() {
-		violations = append(violations, fam.Evaluate(s.graph, p.changedIDs)...)
+		violations = append(violations, fam.Evaluate(reader, p.changedIDs)...)
 	}
 	return violations
 }
@@ -770,7 +774,7 @@ func buildStopCondition(p *prediction, risk changeRisk, verCmd string) string {
 
 // assembleEnvelope is the EMIT stage — fold prediction + violations + risk +
 // classification into one verdict.
-func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViolation) changeEnvelope {
+func (s *Server) assembleEnvelope(ctx context.Context, p *prediction, violations []analysis.GuardViolation) changeEnvelope {
 	risk := s.scoreChangeRisk(p)
 	verdict := verdictAllow
 	var reasons []changeReason
@@ -826,7 +830,7 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 	var apiSurface []apiSurfaceEntry
 	if p.lens == "api" {
 		var apiReasons []changeReason
-		apiReasons, apiSurface = s.apiDriftReasons(p)
+		apiReasons, apiSurface = s.apiDriftReasons(ctx, p)
 		for _, r := range apiReasons {
 			reasons = append(reasons, r)
 			verdict = escalate(verdict, verdictForSeverity(r.Severity))
@@ -835,7 +839,7 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 
 	// Risk gate: load-bearing symbols need a fresh impact-review ack.
 	if p.riskGate {
-		for _, r := range s.riskGateReasons(p, risk) {
+		for _, r := range s.riskGateReasons(ctx, p, risk) {
 			reasons = append(reasons, r)
 			verdict = escalate(verdict, verdictForSeverity(r.Severity))
 		}
@@ -866,7 +870,7 @@ func (s *Server) assembleEnvelope(p *prediction, violations []analysis.GuardViol
 		Risk:                risk,
 		VerificationCommand: verCmd,
 		StopCondition:       stopCondition,
-		EditStrategy:        s.buildEditStrategy(p),
+		EditStrategy:        s.buildEditStrategy(ctx, p),
 		APISurface:          apiSurface,
 	}
 	if p.impact != nil {
@@ -902,7 +906,7 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 	if req.GetBool("ack", false) {
 		return s.handleRiskAck(ctx, req, p)
 	}
-	violations := s.evaluateChange(p)
-	env := s.assembleEnvelope(p, violations)
+	violations := s.evaluateChange(ctx, p)
+	env := s.assembleEnvelope(ctx, p, violations)
 	return s.respondJSONOrTOON(ctx, req, env)
 }

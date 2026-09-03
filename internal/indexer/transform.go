@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -206,7 +207,29 @@ const sniffPrefixBytes = 512
 // readSniffPrefix reads up to sniffPrefixBytes from path for a content
 // probe. Returns nil on any error — the caller treats a nil prefix as
 // "no content available" and degrades to name-based detection.
-func readSniffPrefix(path string) []byte {
+//
+// Under a content source the prefix comes out of the snapshot, so a file
+// that is not in the working tree still gets its shebang probe. That read
+// is drained with ReadFull because a source can be backed by a pipe,
+// which answers a single Read with whatever happens to be buffered.
+func (idx *Indexer) readSniffPrefix(path string) []byte {
+	if src := idx.contentSource(); src != nil {
+		rel, ok := idx.sourceRelPath(path)
+		if !ok {
+			return nil
+		}
+		rc, _, err := src.Open(rel)
+		if err != nil {
+			return nil
+		}
+		defer rc.Close()
+		buf := make([]byte, sniffPrefixBytes)
+		n, _ := io.ReadFull(rc, buf)
+		if n <= 0 {
+			return nil
+		}
+		return buf[:n]
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -234,7 +257,7 @@ func (idx *Indexer) effectiveLanguage(path string, src []byte) (string, bool) {
 		return lang, true
 	}
 	if len(src) == 0 {
-		if prefix := readSniffPrefix(path); prefix != nil {
+		if prefix := idx.readSniffPrefix(path); prefix != nil {
 			if lang, ok := idx.registry.DetectLanguageContent(path, prefix); ok {
 				return lang, true
 			}

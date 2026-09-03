@@ -67,7 +67,7 @@ func (s *Server) handleAnalyzeK8sResources(ctx context.Context, req mcp.CallTool
 			c.usesEnv++
 		}
 	}
-	for e := range edgesByKinds(s.graph,
+	for e := range edgesByKinds(s.readerFor(ctx),
 		graph.EdgeDependsOn,
 		graph.EdgeConfigures,
 		graph.EdgeMounts,
@@ -150,7 +150,7 @@ func (s *Server) handleAnalyzeImages(ctx context.Context, req mcp.CallToolReques
 	}
 
 	consumers := make(map[string]int)
-	for e := range edgesByKinds(s.graph, graph.EdgeDependsOn) {
+	for e := range edgesByKinds(s.readerFor(ctx), graph.EdgeDependsOn) {
 		consumers[e.To]++
 	}
 
@@ -226,7 +226,7 @@ func (s *Server) handleAnalyzeKustomize(ctx context.Context, req mcp.CallToolReq
 			c.res++
 		}
 	}
-	for e := range edgesByKinds(s.graph, graph.EdgeDependsOn, graph.EdgeReferences) {
+	for e := range edgesByKinds(s.readerFor(ctx), graph.EdgeDependsOn, graph.EdgeReferences) {
 		bump(e.From, e.Kind)
 	}
 

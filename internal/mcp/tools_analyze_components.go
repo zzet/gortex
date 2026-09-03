@@ -71,23 +71,23 @@ func (s *Server) handleAnalyzeConnectedComponents(
 		kindLabel = "scc"
 	}
 
-	results := s.runComponents(directed, analysis.ComponentOptions{MinSize: minSize})
+	results := s.runComponents(ctx, directed, analysis.ComponentOptions{MinSize: minSize})
 
 	// Narrow to the session workspace + optional repo allow-set when the
 	// request scopes below the global graph: prune each component's
 	// members to visible nodes, recompute Size, and drop components left
-	// empty. wcc/scc read s.graph directly, so without this the components
-	// would span every workspace. The row ID is an opaque component index
-	// (not a node ID), so it is left untouched. Filter before the limit
-	// cap and the per-component member-limit truncation so both land on
-	// the visible set. Strict no-op for an unbound session with no
-	// RepoAllow.
+	// empty. Without this the components would span every workspace. The
+	// row ID is an opaque component index (not a node ID), so it is left
+	// untouched. Filter before the limit cap and the per-component
+	// member-limit truncation so both land on the visible set. Strict
+	// no-op for an unbound session with no RepoAllow.
 	if s.scopeFiltersActive(ctx) {
+		reader := s.readerFor(ctx)
 		kept := make([]analysis.ComponentResult, 0, len(results))
 		for _, r := range results {
 			visMembers := make([]string, 0, len(r.Members))
 			for _, id := range r.Members {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(id)) {
+				if s.analyzeNodeVisible(ctx, reader.GetNode(id)) {
 					visMembers = append(visMembers, id)
 				}
 			}
@@ -134,7 +134,7 @@ func (s *Server) handleAnalyzeConnectedComponents(
 // runComponents picks the engine-native path when the backing
 // store implements graph.ComponentFinder, otherwise falls back to
 // the in-process analysis.ComputeWCC / ComputeSCC.
-func (s *Server) runComponents(directed bool, opts analysis.ComponentOptions) []analysis.ComponentResult {
+func (s *Server) runComponents(ctx context.Context, directed bool, opts analysis.ComponentOptions) []analysis.ComponentResult {
 	if store := s.backendStore(); store != nil {
 		if cf, ok := store.(graph.ComponentFinder); ok {
 			hits, err := callComponentFinder(cf, directed, graph.ComponentOpts{
@@ -148,10 +148,11 @@ func (s *Server) runComponents(directed bool, opts analysis.ComponentOptions) []
 			// path rather than returning a half-done result.
 		}
 	}
+	reader := s.readerFor(ctx)
 	if directed {
-		return analysis.ComputeSCC(s.graph, opts)
+		return analysis.ComputeSCC(reader, opts)
 	}
-	return analysis.ComputeWCC(s.graph, opts)
+	return analysis.ComputeWCC(reader, opts)
 }
 
 func callComponentFinder(cf graph.ComponentFinder, directed bool, opts graph.ComponentOpts) ([]graph.ComponentHit, error) {

@@ -5,7 +5,7 @@
 // PostFilter only ever sees (parser.QueryResult, []byte), so the
 // undecidable-from-AST-alone rules — N+1 query-in-loop and
 // check-then-act on a shared map/dict — are emitted optimistically and
-// then confirmed or refuted here, where a graph.Store is reachable.
+// then confirmed or refuted here, where a graph reader is reachable.
 //
 // Grounding takes the match row (file + line + enclosing symbol) and
 // consults graph metadata / resolved edges. A match that the graph
@@ -48,7 +48,7 @@ var mutatingEdgeKinds = map[graph.EdgeKind]struct{}{
 // them. A nil store grounds nothing — every row is returned as-is, so
 // the feature degrades to pure-AST behaviour rather than dropping
 // findings on a missing graph.
-func GroundReviewMatches(g graph.Store, matches []astquery.Match) []astquery.Match {
+func GroundReviewMatches(g graph.Reader, matches []astquery.Match) []astquery.Match {
 	if len(matches) == 0 {
 		return matches
 	}
@@ -61,7 +61,7 @@ func GroundReviewMatches(g graph.Store, matches []astquery.Match) []astquery.Mat
 	return out
 }
 
-func keepReviewMatch(g graph.Store, m astquery.Match) bool {
+func keepReviewMatch(g graph.Reader, m astquery.Match) bool {
 	switch m.Detector {
 	case detectorLoopQueryGo, detectorLoopQueryPy:
 		return GroundLoopCall(g, m)
@@ -83,7 +83,7 @@ func keepReviewMatch(g graph.Store, m astquery.Match) bool {
 // A nil store or an unresolvable symbol leaves the AST verdict intact
 // (keep) — grounding only ever removes a row it can affirmatively
 // refute.
-func GroundLoopCall(g graph.Store, m astquery.Match) bool {
+func GroundLoopCall(g graph.Reader, m astquery.Match) bool {
 	if g == nil || m.SymbolID == "" {
 		return true
 	}
@@ -104,7 +104,7 @@ func GroundLoopCall(g graph.Store, m astquery.Match) bool {
 //
 // A nil store or an unresolvable symbol leaves the AST verdict intact
 // (keep).
-func GroundCheckThenAct(g graph.Store, m astquery.Match) bool {
+func GroundCheckThenAct(g graph.Reader, m astquery.Match) bool {
 	if g == nil || m.SymbolID == "" {
 		return true
 	}

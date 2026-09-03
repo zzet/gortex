@@ -77,9 +77,9 @@ type SyncSpec struct {
 	// KnownHashes maps skill ID -> sha256 hex digests of bodies an
 	// EARLIER Gortex release shipped for that ID. A file matching one is
 	// still Gortex's, not the user's, so it may be refreshed in place or
-	// pruned. Optional: a pack that has only ever shipped one rendering
-	// leaves this nil and relies on the byte compare alone.
-	KnownHashes map[string]string
+	// pruned. Optional: a pack with no superseded rendering leaves this
+	// nil and relies on the byte compare alone.
+	KnownHashes map[string][]string
 
 	// DirFor overrides where one skill's directory lives, for a host
 	// that groups skills below the root instead of placing them
@@ -174,7 +174,7 @@ func Sync(w io.Writer, spec SyncSpec, allowed []string, opts agents.ApplyOpts) (
 
 // installSkill writes content at path unless something is already there
 // that Gortex did not write.
-func installSkill(w io.Writer, path, content, knownHash string, opts agents.ApplyOpts) (agents.FileAction, error) {
+func installSkill(w io.Writer, path, content string, knownHashes []string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	existing, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return agents.WriteIfNotExists(w, path, content, opts)
@@ -185,7 +185,7 @@ func installSkill(w io.Writer, path, content, knownHash string, opts agents.Appl
 	if string(existing) == content {
 		return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "unchanged"}, nil
 	}
-	if knownHash != "" && bodyHash(existing) == knownHash {
+	if matchesKnownHash(existing, knownHashes) {
 		// A previous release's body: ours to replace, so an upgrade
 		// actually delivers the new playbook.
 		return agents.WriteOwnedFile(w, path, content, opts)
@@ -196,7 +196,7 @@ func installSkill(w io.Writer, path, content, knownHash string, opts agents.Appl
 
 // pruneSkill removes a skill the active profile excludes, but only when
 // the installed bytes are still one Gortex shipped.
-func pruneSkill(w io.Writer, dir, path, content, knownHash string, opts agents.ApplyOpts) (agents.FileAction, error) {
+func pruneSkill(w io.Writer, dir, path, content string, knownHashes []string, opts agents.ApplyOpts) (agents.FileAction, error) {
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		// Not installed, or unreadable — either way there is nothing to
@@ -206,7 +206,7 @@ func pruneSkill(w io.Writer, dir, path, content, knownHash string, opts agents.A
 		// direction for a file we cannot even read.
 		return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "outside-profile"}, nil
 	}
-	if !isShippedBody(existing, content, knownHash) {
+	if !isShippedBody(existing, content, knownHashes) {
 		internalutil.Warnf(w, "keeping customised skill %s (outside the active profile)", path)
 		return agents.FileAction{Path: path, Action: agents.ActionSkip, Reason: "customised"}, nil
 	}
@@ -222,8 +222,21 @@ func pruneSkill(w io.Writer, dir, path, content, knownHash string, opts agents.A
 
 // isShippedBody reports whether existing is a body Gortex wrote: either
 // the one this build renders, or one a previous release shipped.
-func isShippedBody(existing []byte, current, knownHash string) bool {
-	return string(existing) == current || (knownHash != "" && bodyHash(existing) == knownHash)
+func isShippedBody(existing []byte, current string, knownHashes []string) bool {
+	return string(existing) == current || matchesKnownHash(existing, knownHashes)
+}
+
+func matchesKnownHash(existing []byte, knownHashes []string) bool {
+	if len(knownHashes) == 0 {
+		return false
+	}
+	hash := bodyHash(existing)
+	for _, knownHash := range knownHashes {
+		if knownHash != "" && hash == knownHash {
+			return true
+		}
+	}
+	return false
 }
 
 // bodyHash fingerprints an on-disk body for comparison against

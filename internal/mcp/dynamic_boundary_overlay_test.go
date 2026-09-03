@@ -53,12 +53,13 @@ func TestDynamicBoundariesScanTheOverlayBuffer(t *testing.T) {
 		files:     []daemon.OverlayFile{{Path: fp, Content: overlay}},
 	})
 
-	got := srv.dynamicBoundariesForSymbol(ctx, node)
+	got := srv.dynamicBoundariesForSymbol(ctx, srv.readerFor(ctx), node)
 	require.NotEmpty(t, got, "the buffer's getattr dispatch at the node's buffer lines must be detected")
 	require.Equal(t, fp+":3", got[0].Site,
 		"the site is a buffer coordinate — the disk file has no dispatch at all")
 
 	// Without the overlay, the same node coordinates slice the disk
 	// file: no dispatch there, no boundaries — never fabricated ones.
-	require.Empty(t, srv.dynamicBoundariesForSymbol(context.Background(), node))
+	base := context.Background()
+	require.Empty(t, srv.dynamicBoundariesForSymbol(base, srv.readerFor(base), node))
 }

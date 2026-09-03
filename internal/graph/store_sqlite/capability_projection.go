@@ -29,7 +29,7 @@ func (s *Store) ScanRepoCapabilityEdges(
 	}
 
 	var highWater int64
-	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges`).Scan(&highWater); err != nil {
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`, s.viewGen).Scan(&highWater); err != nil {
 		panicOnFatal(err)
 		return
 	}
@@ -44,10 +44,10 @@ WITH requested_repos(repo_prefix) AS (
 SELECT e.id, n.repo_prefix,
        e.from_id, e.to_id, e.kind, e.file_path, e.line
 FROM edges AS e NOT INDEXED
-JOIN nodes AS n ON n.id = e.from_id
+JOIN nodes AS n ON n.id = e.from_id AND n.view_gen = e.view_gen
 JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix
-LEFT JOIN nodes AS target ON target.id = e.to_id
-WHERE e.id > ? AND e.id <= ?
+LEFT JOIN nodes AS target ON target.id = e.to_id AND target.view_gen = e.view_gen
+WHERE e.id > ? AND e.id <= ? AND e.view_gen = ?
   AND e.kind IN (?, ?, ?, ?)
   AND (e.kind NOT IN (?, ?) OR target.kind = ?)
 ORDER BY e.id
@@ -56,9 +56,9 @@ LIMIT ?`
 SELECT e.id, n.repo_prefix,
        e.from_id, e.to_id, e.kind, e.file_path, e.line
 FROM edges AS e NOT INDEXED
-JOIN nodes AS n ON n.id = e.from_id
-LEFT JOIN nodes AS target ON target.id = e.to_id
-WHERE e.id > ? AND e.id <= ?
+JOIN nodes AS n ON n.id = e.from_id AND n.view_gen = e.view_gen
+LEFT JOIN nodes AS target ON target.id = e.to_id AND target.view_gen = e.view_gen
+WHERE e.id > ? AND e.id <= ? AND e.view_gen = ?
   AND e.kind IN (?, ?, ?, ?)
   AND (e.kind NOT IN (?, ?) OR target.kind = ?)
 ORDER BY e.id
@@ -76,12 +76,12 @@ LIMIT ?`
 
 	lastID := int64(0)
 	for lastID < highWater {
-		args := make([]any, 0, 12)
+		args := make([]any, 0, 13)
 		if !allRepos {
 			args = append(args, reposJSON)
 		}
 		args = append(args,
-			lastID, highWater,
+			lastID, highWater, s.viewGen,
 			string(graph.EdgeReadsConfig), string(graph.EdgeReads),
 			string(graph.EdgeWrites), string(graph.EdgeCalls),
 			string(graph.EdgeReads), string(graph.EdgeWrites), string(graph.KindField),

@@ -123,7 +123,7 @@ const connectivityNote = "Connectivity health is a graph-EXTRACTION diagnostic, 
 // why a kind-only aggregate row suffices. It deliberately does NOT
 // reproduce ClassifyZeroEdge: that classifier also weighs each usage
 // edge's provenance, which no edge-count row can express.
-func GraphConnectivity(g graph.Store, nodes []*graph.Node, fileLimit int) GraphConnectivityReport {
+func GraphConnectivity(g graph.Reader, nodes []*graph.Node, fileLimit int) GraphConnectivityReport {
 	report := GraphConnectivityReport{Note: connectivityNote}
 	if g == nil {
 		return report
@@ -272,7 +272,7 @@ func GraphConnectivity(g graph.Store, nodes []*graph.Node, fileLimit int) GraphC
 // today GraphConnectivity only consumes In/Out totals, but the usage
 // count rides on the same row at no extra round-trip cost and makes
 // the capability self-contained for callers that need it next.
-func collectConnectivityCounts(g graph.Store, nodes []*graph.Node) map[string]graph.NodeDegreeRow {
+func collectConnectivityCounts(g graph.Reader, nodes []*graph.Node) map[string]graph.NodeDegreeRow {
 	agg, ok := g.(graph.NodeDegreeAggregator)
 	if !ok {
 		return nil

@@ -147,7 +147,7 @@ func TestLowerEditSourceRefusesTwoRepoNewFilesActionably(t *testing.T) {
 		{repoPrefix: "worker", path: "newpkg/job.go"},
 	}, p.verificationFiles)
 
-	env := srv.assembleEnvelope(p, nil)
+	env := srv.assembleEnvelope(context.Background(), p, nil)
 	require.Equal(t, verdictWarn, env.Verdict)
 	require.Empty(t, env.VerificationCommand)
 	require.Contains(t, env.StopCondition, "repository-scoped verification commands")

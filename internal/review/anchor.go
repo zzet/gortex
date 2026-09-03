@@ -73,7 +73,7 @@ type Anchor struct {
 // spans inside MapGitDiffWithLines; it may be nil (then only the line text is
 // available, which is all the resolver needs). repoPrefix anchors the node
 // join in multi-repo mode (see analysis.MapGitDiff).
-func BuildChangeView(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*ChangeView, error) {
+func BuildChangeView(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*ChangeView, error) {
 	_, newLines, err := analysis.MapGitDiffWithLines(g, repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return nil, err

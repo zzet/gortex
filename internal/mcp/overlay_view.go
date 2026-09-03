@@ -82,11 +82,17 @@ func validateBoundedOverlayExtractionUsage(
 }
 
 type stagedOverlayFile struct {
-	graphPath  string
-	deleted    bool
-	repoPrefix string
-	baseNodes  []*graph.Node
-	result     *parser.ExtractionResult
+	graphPath string
+	deleted   bool
+	// repoPrefix / workspaceID / projectID are the repo identity stamped
+	// onto every node this file contributes to the layer. All three are
+	// resolved once per file at staging time so one layer build cannot
+	// hand two nodes of the same file different scope identities.
+	repoPrefix  string
+	workspaceID string
+	projectID   string
+	baseNodes   []*graph.Node
+	result      *parser.ExtractionResult
 }
 
 // overlayRequestSnapshot is the immutable raw-buffer cohort used to build one
@@ -144,9 +150,9 @@ func OverlayViewFromContext(ctx context.Context) *graph.OverlaidView {
 
 // readerFor returns the graph.Reader the calling tool handler should
 // read through. When ctx carries an overlay view, that view is the
-// reader and base is consulted through it. Otherwise the base graph
-// is returned directly. The single helper keeps every read site
-// overlay-aware with one line of plumbing.
+// reader and base is consulted through it. Otherwise the request's
+// base reader is returned directly. The single helper keeps every read
+// site overlay-aware with one line of plumbing.
 //
 // Never nil unless the server itself has no graph wired (test-only
 // state). Callers that hot-loop on this should hoist the lookup —
@@ -155,6 +161,16 @@ func OverlayViewFromContext(ctx context.Context) *graph.OverlaidView {
 func (s *Server) readerFor(ctx context.Context) graph.Reader {
 	if v := OverlayViewFromContext(ctx); v != nil {
 		return v
+	}
+	return s.requestBaseReader(ctx)
+}
+
+// requestBaseReader is what this request reads when no editor buffer is in
+// play, and what a buffer overlay composes on top of: the routed checkout
+// view when the request resolved to one, the indexed corpus otherwise.
+func (s *Server) requestBaseReader(ctx context.Context) graph.Reader {
+	if view := requestViewFromContext(ctx); view.routed() {
+		return view.reader
 	}
 	return s.graph
 }
@@ -178,12 +194,21 @@ func (s *Server) nodeGetterFor(ctx context.Context) graph.NodeGetter {
 // Cheap: WithReader is a shallow clone (one struct copy, shares
 // search provider and rerank pipeline). Safe to call inside hot
 // tool-handler paths.
+// A routed request additionally hands the engine the stack it reads
+// through, so candidate enumeration covers every generation's corpus
+// and not just the indexed one underneath them. The layer slice is nil
+// on a base request and WithViewLayers is then WithReader exactly, so
+// nothing on that path changes.
 func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	if s == nil || s.engine == nil {
 		return nil
 	}
+	view := requestViewFromContext(ctx)
 	if v := OverlayViewFromContext(ctx); v != nil {
-		return s.engine.WithReader(v)
+		return s.engine.WithViewLayers(v, view.candidateLayers())
+	}
+	if view.routed() {
+		return s.engine.WithViewLayers(view.reader, view.candidateLayers())
 	}
 	return s.engine
 }
@@ -236,6 +261,12 @@ func (s *Server) snapshotOverlayRequestForCtx(ctx context.Context) (*overlayRequ
 // idempotent, which keeps nested facade calls on the same editor-buffer cohort.
 func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *graph.OverlaidView, error) {
 	if ctx == nil {
+		return ctx, nil, nil
+	}
+	if !requestViewFromContext(ctx).acceptsBufferOverlay() {
+		if OverlayViewFromContext(ctx) != nil {
+			return ctx, nil, fmt.Errorf("editor overlay is forbidden on a read-only grace fallback")
+		}
 		return ctx, nil, nil
 	}
 	snapshot, ok := overlayRequestSnapshotFromContext(ctx)
@@ -383,13 +414,18 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	}
 
 	hash := hashOverlayFiles(files)
+	// The buffer layer composes over whatever answers THIS request — the
+	// indexed corpus, or the routed checkout view the session's cwd bound to.
+	// The parsed layer itself is base-independent, which is what lets the
+	// cache below stay keyed by content alone.
+	base := s.requestBaseReader(ctx)
 
 	// Cache hit: same session pushed the same buffers; reuse the
 	// parsed layer. The cache stores up to one entry per session; a
 	// changed content hash evicts the prior entry.
 	if v, ok := s.overlayLayerCache.Load(sessID); ok {
 		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash {
-			return graph.NewOverlaidView(s.graph, entry.layer), nil
+			return graph.NewOverlaidView(base, entry.layer), nil
 		}
 		s.overlayLayerCache.Delete(sessID)
 	}
@@ -401,7 +437,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	defer s.overlayLayerBuildMu.Unlock()
 	if v, ok := s.overlayLayerCache.Load(sessID); ok {
 		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash {
-			return graph.NewOverlaidView(s.graph, entry.layer), nil
+			return graph.NewOverlaidView(base, entry.layer), nil
 		}
 	}
 
@@ -417,7 +453,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 		layer: layer,
 		files: paths,
 	})
-	return graph.NewOverlaidView(s.graph, layer), nil
+	return graph.NewOverlaidView(base, layer), nil
 }
 
 // resolveOverlayAbsPath turns the overlay's caller-supplied path into
@@ -454,7 +490,7 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
 			if idx, _ := s.multiIndexer.IndexerForFile(absPath); idx != nil {
 				if root := idx.RootPath(); root != "" {
-					if rel, err := filepath.Rel(root, absPath); err == nil {
+					if rel, ok := relativeWithinRoot(root, absPath); ok {
 						return prefix + "/" + filepath.ToSlash(rel)
 					}
 				}
@@ -463,7 +499,7 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil {
+			if rel, ok := relativeWithinRoot(root, absPath); ok {
 				return filepath.ToSlash(rel)
 			}
 		}
@@ -471,6 +507,24 @@ func (s *Server) resolveOverlayGraphPath(p, absPath string) string {
 	// Fall back to caller-supplied path — this is the single-repo
 	// repo-relative case where p is already the graph_path.
 	return filepath.ToSlash(p)
+}
+
+// resolveOverlayGraphPathForRequest maps a file beneath the selected checkout
+// back to the shared graph spelling. A routed worktree is intentionally not a
+// registered MultiIndexer root, so the legacy owner lookup cannot derive this
+// identity from the absolute path alone.
+func (s *Server) resolveOverlayGraphPathForRequest(ctx context.Context, p, absPath string) string {
+	view := requestViewPathRoot(ctx)
+	if view.root != "" && view.contains(absPath) {
+		if rel, ok := relativeWithinRoot(view.root, absPath); ok {
+			rel = filepath.ToSlash(rel)
+			if view.repoPrefix != "" {
+				return path.Join(view.repoPrefix, rel)
+			}
+			return rel
+		}
+	}
+	return s.resolveOverlayGraphPath(p, absPath)
 }
 
 // pickIndexerForPath chooses the per-repo Indexer (multi-repo) or
@@ -485,7 +539,7 @@ func (s *Server) pickIndexerForPath(absPath string) *indexer.Indexer {
 	}
 	if s.indexer != nil {
 		if root := s.indexer.RootPath(); root != "" {
-			if rel, err := filepath.Rel(root, absPath); err == nil && !strings.HasPrefix(rel, "..") {
+			if _, ok := relativeWithinRoot(root, absPath); ok {
 				return s.indexer
 			}
 		}
@@ -584,7 +638,7 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if idx.RepoPrefix() != "" {
 			relPath = strings.TrimPrefix(graphPath, idx.RepoPrefix()+"/")
 		} else if root != "" {
-			if r, err := filepath.Rel(root, absPath); err == nil {
+			if r, ok := relativeWithinRoot(root, absPath); ok {
 				relPath = filepath.ToSlash(r)
 			}
 		}
@@ -663,11 +717,14 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if err != nil {
 			return nil, nil, err
 		}
+		workspaceID, projectID := overlayScopeIdentity(baseNodes, graphPath, idx)
 		staged = append(staged, stagedOverlayFile{
-			graphPath:  graphPath,
-			repoPrefix: idx.RepoPrefix(),
-			baseNodes:  baseNodes,
-			result:     cloneOverlayExtractionResult(result),
+			graphPath:   graphPath,
+			repoPrefix:  idx.RepoPrefix(),
+			workspaceID: workspaceID,
+			projectID:   projectID,
+			baseNodes:   baseNodes,
+			result:      cloneOverlayExtractionResult(result),
 		})
 	}
 
@@ -694,10 +751,10 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 			continue
 		}
 
-		// The staged result is an owned, unprefixed clone captured before the
-		// next Extract call. Prefix it only after the full cohort preflight.
+		// The staged result is an owned, unstamped clone captured before the
+		// next Extract call. Stamp it only after the full cohort preflight.
 		result := file.result
-		applyRepoPrefixToResult(result, file.repoPrefix)
+		applyRepoIdentityToResult(result, file.repoPrefix, file.workspaceID, file.projectID)
 
 		baseIDsByName := make(map[string]map[string]bool)
 		for _, node := range file.baseNodes {
@@ -901,12 +958,39 @@ func requestContextError(ctx context.Context, _ error) error {
 	return ctx.Err()
 }
 
-// applyRepoPrefixToResult prepends repoPrefix to every node/edge in
-// an extraction result so IDs match base's shape in multi-repo mode.
-// Mirrors `Indexer.applyRepoPrefix` but kept here to avoid having to
-// expose that helper to non-indexer packages.
-func applyRepoPrefixToResult(result *parser.ExtractionResult, repoPrefix string) {
-	if result == nil || repoPrefix == "" {
+// applyRepoIdentityToResult stamps one repository's identity onto every
+// node/edge in an extraction result: the repo prefix on IDs and file paths
+// so they match base's shape in multi-repo mode, and the workspace /
+// project slugs so the nodes carry the same scope identity as the base
+// nodes of that repo. Mirrors `Indexer.applyRepoPrefix` but kept here to
+// avoid having to expose that helper to non-indexer packages.
+//
+// Prefix and slugs are independent. A repo can declare a workspace without
+// being prefixed (single-repo mode), and the base path stamps the slugs
+// before its own prefix check for exactly that reason. Stamping only the
+// prefix leaves the node with an empty WorkspaceID, which every reader's
+// scope gate reads as "no workspace declared" and falls back to the repo
+// prefix — so an overlay node in a repo whose workspace slug differs from
+// its prefix is dropped by any scope-narrowed read.
+//
+// Like the base path, a slug is written only where the extractor left the
+// field empty, so a node that already carries an identity keeps it.
+func applyRepoIdentityToResult(result *parser.ExtractionResult, repoPrefix, workspaceID, projectID string) {
+	if result == nil {
+		return
+	}
+	for _, n := range result.Nodes {
+		if n == nil {
+			continue
+		}
+		if workspaceID != "" && n.WorkspaceID == "" {
+			n.WorkspaceID = workspaceID
+		}
+		if projectID != "" && n.ProjectID == "" {
+			n.ProjectID = projectID
+		}
+	}
+	if repoPrefix == "" {
 		return
 	}
 	for _, n := range result.Nodes {
@@ -928,6 +1012,48 @@ func applyRepoPrefixToResult(result *parser.ExtractionResult, repoPrefix string)
 			e.To = repoPrefix + "/" + e.To
 		}
 	}
+}
+
+// overlayScopeIdentity resolves the workspace / project slugs one overlay
+// file's nodes must carry. It runs once per staged file, so every node the
+// file contributes to the layer gets the same pair.
+//
+// Precedence, highest first:
+//
+//  1. The base file node for this path. It is what the repo's own indexer
+//     stamped for this exact file, so copying it keeps the buffer and the
+//     file it shadows on the same side of every scope boundary.
+//  2. The base sibling with the smallest ID among those carrying a
+//     workspace slug — for a file whose extractor emits no file node. The
+//     smallest ID makes the pick independent of projection order.
+//  3. The repo indexer's own binding, which is the value
+//     `Indexer.applyRepoPrefix` stamps at indexing time. This is the only
+//     source for a file that is new in the buffer and has no base nodes.
+//
+// Both slugs come from a single source. Mixing them could place a node in
+// one stamping generation's workspace under another's project slug, and a
+// project narrow would then drop it.
+func overlayScopeIdentity(baseNodes []*graph.Node, graphPath string, idx *indexer.Indexer) (workspaceID, projectID string) {
+	var donor *graph.Node
+	for _, node := range baseNodes {
+		if node == nil || node.WorkspaceID == "" {
+			continue
+		}
+		if node.ID == graphPath {
+			donor = node
+			break
+		}
+		if donor == nil || node.ID < donor.ID {
+			donor = node
+		}
+	}
+	if donor != nil {
+		return donor.WorkspaceID, donor.ProjectID
+	}
+	if idx == nil {
+		return "", ""
+	}
+	return idx.WorkspaceID(), idx.ProjectID()
 }
 
 // unresolvedPrefix matches the resolver's prefix for placeholder

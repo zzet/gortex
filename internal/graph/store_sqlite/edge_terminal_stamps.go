@@ -11,8 +11,9 @@ var _ graph.EdgeTerminalStampPersister = (*Store)(nil)
 
 const (
 	edgeTerminalStampParamsPerRow = 7
-	// Seven values per row; 140 rows use 980 host parameters, leaving
-	// headroom below SQLite's conservative 999-variable limit.
+	// Seven values per row plus one trailing generation binding; 140 rows use
+	// 981 host parameters, leaving headroom below SQLite's conservative
+	// 999-variable limit.
 	edgeTerminalStampChunkSize = 140
 )
 
@@ -48,7 +49,7 @@ func (s *Store) persistEdgeTerminalStamps(edges []*graph.Edge) (edgeTerminalStam
 		txChanged := 0
 		for start := txStart; start < txEnd; start += edgeTerminalStampChunkSize {
 			end := minInt(start+edgeTerminalStampChunkSize, txEnd)
-			query, args := edgeTerminalStampUpdateStatement(edges[start:end])
+			query, args := edgeTerminalStampUpdateStatement(s.viewGen, edges[start:end])
 			if len(args) == 0 {
 				continue
 			}
@@ -90,7 +91,7 @@ func (s *Store) persistEdgeTerminalStamps(edges []*graph.Edge) (edgeTerminalStam
 // Duplicate identities within a statement retain their last input value;
 // duplicates across statements are applied in input order, so the final value
 // is likewise last-wins.
-func edgeTerminalStampUpdateStatement(edges []*graph.Edge) (string, []any) {
+func edgeTerminalStampUpdateStatement(viewGen int64, edges []*graph.Edge) (string, []any) {
 	updates := make([]*graph.Edge, 0, len(edges))
 	positions := make(map[graph.EdgeIdentity]int, len(edges))
 	for _, edge := range edges {
@@ -123,6 +124,8 @@ func edgeTerminalStampUpdateStatement(edges []*graph.Edge) (string, []any) {
 			edge.From, edge.To, string(edge.Kind), edge.FilePath, edge.Line,
 		)
 	}
+	// One trailing bound value carries the generation for the whole statement.
+	args = append(args, viewGen)
 
 	query := `WITH updates(
 		resolve_terminal, resolve_terminal_reason,
@@ -137,6 +140,7 @@ func edgeTerminalStampUpdateStatement(edges []*graph.Edge) (string, []any) {
 		AND e.kind = u.kind
 		AND e.file_path = u.file_path
 		AND e.line = u.line
+		AND e.view_gen = ?
 		AND (e.resolve_terminal IS NOT u.resolve_terminal
 			OR e.resolve_terminal_reason IS NOT u.resolve_terminal_reason)`
 	return query, args

@@ -111,7 +111,7 @@ func TestFindUsages_FlavorNilSafety(t *testing.T) {
 	// the graph reader — the filter must not panic and must still resolve.
 	sg.Nodes = nil
 	require.NotPanics(t, func() {
-		filterUsagesByFlavor(srv.graph, sg, helperID, "struct")
+		filterUsagesByFlavor(srv.nodeGetterFor(context.Background()), sg, helperID, "struct")
 	})
 	require.Equal(t, 1, len(sg.Edges), "struct-owned call survives even with no node set")
 }

@@ -5,6 +5,22 @@ import (
 	"time"
 )
 
+// Node Meta keys shared between the extractor that writes them and the
+// tier that reads them, so both sides compile against one spelling.
+const (
+	// MetaOwnershipStartLine / MetaOwnershipEndLine carry the 1-based line
+	// span an extractor attributed a member's calls by, stamped only when
+	// that span is not contained by the node's own lines: a C# 13 partial
+	// property extracted declaring fragment first (or a property declared
+	// in both arms of an #if / #else) keeps its first declaration's lines
+	// while its calls live in the body-bearing fragment. Absent on every
+	// node whose own lines already answer. Any pass that rebases a node's
+	// lines (the Razor code-block delegation) must rebase these with them.
+	// Read by the semantic tier's stub admission guard (issue #731).
+	MetaOwnershipStartLine = "ownership_start_line"
+	MetaOwnershipEndLine   = "ownership_end_line"
+)
+
 type NodeKind string
 
 const (

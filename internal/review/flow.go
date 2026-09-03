@@ -89,7 +89,7 @@ const defaultMaxLLMTokens = 2048
 // with just the deterministic rule findings and a verdict, never an error. Only a
 // failure to assemble the deterministic substrate (e.g. an unreadable git diff on
 // the on-disk path) surfaces as an error.
-func Run(ctx context.Context, g graph.Store, gen LLMGen, opts Options) (*ReviewReport, error) {
+func Run(ctx context.Context, g graph.Reader, gen LLMGen, opts Options) (*ReviewReport, error) {
 	plan, err := planReview(g, opts)
 	if err != nil {
 		return nil, err
@@ -120,7 +120,7 @@ type LLMGenWithUsage func(ctx context.Context, prompt string, maxTokens int) (st
 // distributed by finding-body weight). A nil seam — or a provider that
 // reports no usage — yields a zero, Estimated:false cost block rather
 // than omitting it. The plain Run path is unchanged.
-func RunWithUsage(ctx context.Context, g graph.Store, gen LLMGenWithUsage, price llm.ProviderPricing, opts Options) (*ReviewReport, error) {
+func RunWithUsage(ctx context.Context, g graph.Reader, gen LLMGenWithUsage, price llm.ProviderPricing, opts Options) (*ReviewReport, error) {
 	var total llm.TokenUsage
 	var elapsed time.Duration
 	// Adapt the usage-aware seam down to the plain LLMGen the flow uses,
@@ -168,7 +168,7 @@ type reviewPlan struct {
 // deterministic grounding once — the change view (from pasted diff or git), the
 // diff→symbol map, the tiered review pack, the per-file rule resolution, and the
 // deterministic rule findings translated from the caller's matches.
-func planReview(g graph.Store, opts Options) (*reviewPlan, error) {
+func planReview(g graph.Reader, opts Options) (*reviewPlan, error) {
 	view, diff, err := buildSubstrate(g, opts)
 	if err != nil {
 		return nil, err
@@ -216,7 +216,7 @@ func planReview(g graph.Store, opts Options) (*reviewPlan, error) {
 // buildSubstrate produces the change view and diff→symbol map for the run,
 // preferring the pasted-diff text when present (off-disk / test path) and
 // otherwise shelling out via the landed git substrate.
-func buildSubstrate(g graph.Store, opts Options) (*ChangeView, *analysis.DiffResult, error) {
+func buildSubstrate(g graph.Reader, opts Options) (*ChangeView, *analysis.DiffResult, error) {
 	if strings.TrimSpace(opts.Diff) != "" {
 		view := ChangeViewFromDiff(opts.RepoRoot, opts.Diff)
 		// A pasted diff has no graph-backed symbol map; synthesize a minimal
@@ -325,7 +325,7 @@ func ruleFindings(matches []astquery.Match, resolver *RuleResolver) []Finding {
 // exact line via the deterministic tiers plus the LLM fallback, dropping any that
 // stay unresolved. Returns the anchored findings, the dropped count, and whether
 // a token bound trimmed candidates.
-func mainAndRelocate(ctx context.Context, g graph.Store, gen LLMGen, opts Options, plan *reviewPlan) (findings []Finding, dropped int, truncated bool) {
+func mainAndRelocate(ctx context.Context, g graph.Reader, gen LLMGen, opts Options, plan *reviewPlan) (findings []Finding, dropped int, truncated bool) {
 	if !opts.UseLLM || gen == nil {
 		return nil, 0, false
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/internalutil"
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 const Name = "cursor"
@@ -129,7 +130,10 @@ Use Gortex MCP tools for indexed code. This is mandatory.
 If the configured Gortex tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or use a CLI/shell fallback.
 
 Use **recall** before editing known code and **remember** for durable decisions or invariants.
-`
+
+## Worktree and branch routing
+
+` + profiles.WorktreeBranchRoutingPolicy
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {
 	res := &agents.Result{Name: Name, DocsURL: DocsURL}

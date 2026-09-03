@@ -33,9 +33,12 @@ func (s *Server) handleAnalyzeStringEmitters(ctx context.Context, req mcp.CallTo
 		Emits    int      `json:"emits"`
 		Emitters []string `json:"emitters,omitempty"`
 	}
+	// Hoisted before the loop: the loop body shadows `ctx` with the string
+	// node's context label, so the request reader has to be resolved here.
+	reader := s.readerFor(ctx)
 	byString := map[string]*stringRow{}
-	for e := range edgesByKinds(s.graph, graph.EdgeEmits) {
-		n := s.graph.GetNode(e.To)
+	for e := range edgesByKinds(reader, graph.EdgeEmits) {
+		n := reader.GetNode(e.To)
 		if n == nil || n.Kind != graph.KindString {
 			continue
 		}
@@ -70,12 +73,12 @@ func (s *Server) handleAnalyzeStringEmitters(ctx context.Context, req mcp.CallTo
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]*stringRow, 0, len(rows))
 		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, s.graph.GetNode(r.ID)) {
+			if !s.analyzeNodeVisible(ctx, reader.GetNode(r.ID)) {
 				continue
 			}
 			emitters := make([]string, 0, len(r.Emitters))
 			for _, em := range r.Emitters {
-				if s.analyzeNodeVisible(ctx, s.graph.GetNode(em)) {
+				if s.analyzeNodeVisible(ctx, reader.GetNode(em)) {
 					emitters = append(emitters, em)
 				}
 			}

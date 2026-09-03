@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -84,7 +85,7 @@ func (s *Server) guardMutationEvidenceIntent(language, relPath string, before []
 // reported as evidence_error on an otherwise truthful success response, never
 // as a call failure — failing the call would invite a retry that applies the
 // same edit twice.
-func (s *Server) attachMutationPhysicalEvidence(resp map[string]any, absPath string, before []byte, beforeExisted bool) {
+func (s *Server) attachMutationPhysicalEvidence(ctx context.Context, resp map[string]any, absPath string, before []byte, beforeExisted bool) {
 	read := readPhysicalFileEvidence
 	if s.physicalEvidenceOverride != nil {
 		read = s.physicalEvidenceOverride
@@ -97,10 +98,10 @@ func (s *Server) attachMutationPhysicalEvidence(resp map[string]any, absPath str
 		// and only a guard on the resolved target sees it. Same two guards, same
 		// order, as the read path — a new file-touching sink that skips them is
 		// exactly the shape of this project's two published advisories.
-		err = s.guardResolvedPathWithinRepo(absPath, evidence.resolvedPath)
+		err = s.guardResolvedPathWithinRepo(ctx, absPath, evidence.resolvedPath)
 	}
 	if err == nil {
-		err = s.guardSymlinkWithinRepo(absPath)
+		err = s.guardSymlinkWithinRepo(ctx, absPath)
 	}
 	if err != nil {
 		resp["evidence_error"] = err.Error()

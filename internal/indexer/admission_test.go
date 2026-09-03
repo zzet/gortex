@@ -266,64 +266,6 @@ func TestPathIndexability_MissingFile(t *testing.T) {
 	}
 }
 
-// The one place the exclude-before-language ordering is directly observable:
-// an escaping symlink whose target's CONTENT identifies its language. Under
-// language-first, readSniffPrefix opened the target before the confinement
-// guard refused the link — and the sniffed language is the proof it happened.
-func TestAdmitFile_SymlinkEscapeRefusedBeforeSniff(t *testing.T) {
-	repo := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "secret.conf")
-	writeFile(t, outside, "#!/usr/bin/env python3\nSECRET = 1\n")
-	link := filepath.Join(repo, "pwn.unclaimedext")
-	if err := os.Symlink(outside, link); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-
-	idx := newAdmissionTestIndexer(t, repo)
-
-	lang, reason := idx.admitFile(link, repo, 1, admissionGates{})
-	if reason != skipReasonExcluded {
-		t.Fatalf("admitFile of an escaping symlink = %q, want %q (the confinement guard)",
-			reason, skipReasonExcluded)
-	}
-	if lang != "" {
-		t.Errorf("the escaping symlink's TARGET was opened and sniffed (language %q) before the "+
-			"confinement guard refused the link; the exclude rules must run first", lang)
-	}
-
-	if got := mustIndexability(t, idx, "pwn.unclaimedext"); got != (PathSkip{Skipped: true, ByRule: true}) {
-		t.Errorf("PathIndexability of an escaping symlink = %+v, want skipped by rule", got)
-	}
-}
-
-// Pin the reason vocabulary: callers switch on these strings.
-func TestAdmitFile_ReasonVocabulary(t *testing.T) {
-	repo := t.TempDir()
-	writeExcludeFixture(t, filepath.Join(repo, "main.go"), "package app\n")
-	writeExcludeFixture(t, filepath.Join(repo, "node_modules", "x.js"), "1\n")
-	writeExcludeFixture(t, filepath.Join(repo, "logo.sketch"), "x\n")
-	writeExcludeFixture(t, filepath.Join(repo, "big.go"), "package app\n")
-
-	idx := newAdmissionTestIndexer(t, repo)
-	idx.config.MaxFileSize = 4
-
-	for _, tc := range []struct {
-		rel        string
-		size       int64
-		wantReason string
-	}{
-		{"main.go", 1, ""},
-		{"node_modules/x.js", 1, skipReasonExcluded},
-		{"logo.sketch", 1, skipReasonNoLanguage},
-		{"big.go", 4096, skipReasonMaxFileSize},
-	} {
-		abs := filepath.Join(repo, filepath.FromSlash(tc.rel))
-		if _, reason := idx.admitFile(abs, repo, tc.size, admissionGates{}); reason != tc.wantReason {
-			t.Errorf("admitFile(%q) reason = %q, want %q", tc.rel, reason, tc.wantReason)
-		}
-	}
-}
-
 // Divergence guard: before the shared predicate the probe ran three of the
 // walk's five gates, so a .parquet read as indexable while the manifest
 // counted it skipped.
@@ -422,5 +364,37 @@ func TestProbeAdmissionGates_RekeyedOnRoot(t *testing.T) {
 	if idx.probeGates.root != repoB {
 		t.Errorf("a probe against another root must rebuild the memo; root = %q, want %q",
 			idx.probeGates.root, repoB)
+	}
+}
+
+// The exclude stage must run before language detection: effectiveLanguage
+// falls through to readSniffPrefix, which opens the file, and shouldExclude is
+// what refuses a symlink pointing out of the repo. Language-first sniffed the
+// target first.
+func TestAdmitWalkEntry_SymlinkEscapeRefusedBeforeSniff(t *testing.T) {
+	repo := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.conf")
+	writeFile(t, outside, "#!/usr/bin/env python3\nSECRET = 1\n")
+	link := filepath.Join(repo, "pwn.unclaimedext")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	idx := newAdmissionTestIndexer(t, repo)
+
+	adm := idx.admitWalkEntry(repo, link, 1, false)
+	if adm.admit {
+		t.Fatal("an escaping symlink must never be admitted")
+	}
+	if !adm.excluded {
+		t.Error("the confinement guard should be what rejects it, so excluded must be set")
+	}
+	if adm.lang != "" {
+		t.Errorf("the escaping symlink's TARGET was opened and sniffed (language %q) before the "+
+			"confinement guard refused the link; the exclude rules must run first", adm.lang)
+	}
+
+	if got := mustIndexability(t, idx, "pwn.unclaimedext"); got != (PathSkip{Skipped: true, ByRule: true}) {
+		t.Errorf("PathIndexability of an escaping symlink = %+v, want skipped by rule", got)
 	}
 }

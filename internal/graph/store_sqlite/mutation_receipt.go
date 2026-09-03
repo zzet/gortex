@@ -305,7 +305,7 @@ func (i sqliteMutationNodeIdentity) equalsNode(n *graph.Node) bool {
 // mutationNodeIdentitiesTx preloads node identities in bounded batches. It is
 // called only while receipts are active, so the steady indexing path pays no
 // extra reads.
-func mutationNodeIdentitiesTx(tx *sql.Tx, ids []string) (map[string]sqliteMutationNodeIdentity, error) {
+func mutationNodeIdentitiesTx(tx *sql.Tx, viewGen int64, ids []string) (map[string]sqliteMutationNodeIdentity, error) {
 	const chunkSize = 900
 	unique := make(map[string]struct{}, len(ids))
 	ordered := make([]string, 0, len(ids))
@@ -327,12 +327,15 @@ func mutationNodeIdentitiesTx(tx *sql.Tx, ids []string) (map[string]sqliteMutati
 		}
 		chunk := ordered[start:end]
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-		args := make([]any, len(chunk))
-		for i, id := range chunk {
-			args[i] = id
+		args := make([]any, 0, len(chunk)+1)
+		for _, id := range chunk {
+			args = append(args, id)
 		}
+		// An id names one row per generation; the receipt describes the
+		// mutation the writing handle made, so it reads that handle's row.
+		args = append(args, viewGen)
 		rows, err := tx.Query(
-			`SELECT id, kind, name, qual_name, file_path, repo_prefix FROM nodes WHERE id IN (`+placeholders+`)`,
+			`SELECT id, kind, name, qual_name, file_path, repo_prefix FROM nodes WHERE id IN (`+placeholders+`) AND view_gen = ?`,
 			args...,
 		)
 		if err != nil {

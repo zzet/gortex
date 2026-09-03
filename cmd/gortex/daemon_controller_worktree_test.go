@@ -20,12 +20,19 @@ import (
 	"github.com/zzet/gortex/internal/search"
 )
 
+// wtGit runs one git command in dir with the developer's own configuration
+// pinned out of the way.
+//
+// The null device is os.DevNull rather than a "/dev/null" literal: that
+// literal names no file on Windows, so the isolation it is there to provide
+// depends on git's own path emulation rather than on the platform.
 func wtGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
-		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_SYSTEM="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
 		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
 	out, err := cmd.CombinedOutput()
@@ -71,7 +78,24 @@ func buildWorktreeController(t *testing.T) (*realController, *indexer.MultiIndex
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 
-	c := &realController{graph: g, multiIndexer: mi, configManager: cm, logger: zap.NewNop()}
+	// An in-memory graph has no checkout catalog, so the lifecycle runs in
+	// its degraded shape here: no identities, and the same index / watcher /
+	// config side effects the reload diff has always had.
+	lifecycle, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+		MultiIndexer:  mi,
+		ConfigManager: cm,
+		Graph:         g,
+		Logger:        zap.NewNop(),
+	})
+	require.NoError(t, err)
+
+	c := &realController{
+		graph:         g,
+		multiIndexer:  mi,
+		configManager: cm,
+		lifecycle:     lifecycle,
+		logger:        zap.NewNop(),
+	}
 	return c, mi, cm, canon, wt
 }
 

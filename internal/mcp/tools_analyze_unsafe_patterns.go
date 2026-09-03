@@ -73,7 +73,7 @@ func (s *Server) handleAnalyzeUnsafePatterns(ctx context.Context, req mcp.CallTo
 
 	// Build target list once; reused across every detector to avoid
 	// re-walking the KindFile node set per rule.
-	targets, err := s.buildASTTargets("", pathPrefix, allowedRepos)
+	targets, err := s.buildASTTargets(ctx, "", pathPrefix, allowedRepos)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

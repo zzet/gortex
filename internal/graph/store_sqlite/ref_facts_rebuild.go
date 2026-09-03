@@ -9,7 +9,7 @@ import (
 
 var _ graph.RefFactsRebuilder = (*Store)(nil)
 
-const refFactColumns = `repo_prefix, from_id, to_id, kind, ref_name, line, origin, tier, candidates, file_path, lang`
+const refFactColumns = `view_gen, repo_prefix, from_id, to_id, kind, ref_name, line, origin, tier, candidates, file_path, lang`
 
 // refFactEligiblePredicate is the SQL spelling of graph.IsResolvableRefEdge,
 // graph.IsUnresolvedTarget, and graph.IsStub. Keep the string predicates
@@ -54,11 +54,18 @@ WITH selected AS (
            n.file_path, n.language
 `
 
+// Two view_gen placeholders trail every caller's own: SQLite numbers unnamed
+// parameters by their position in the statement text, and every placeholder a
+// caller supplies lives in the CTE's FROM clause, ahead of these. The first
+// scopes the source corpus the facts are derived from, the second stamps the
+// generation the rows are written at; the joins pair the two endpoint sides
+// with the edge so a foreign-generation node cannot name a fact here.
 const refFactInsertSuffix = `
-    LEFT JOIN nodes AS t ON t.id = e.to_id
+    LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = e.view_gen
     WHERE ` + refFactEligiblePredicate + `
+      AND n.view_gen = ?
 )
-SELECT repo_prefix, from_id, to_id, kind, ref_name, line, effective_origin,
+SELECT ?, repo_prefix, from_id, to_id, kind, ref_name, line, effective_origin,
        CASE effective_origin
            WHEN 'lsp_resolved' THEN 'lsp'
            WHEN 'lsp_dispatch' THEN 'lsp'
@@ -92,13 +99,13 @@ func (s *Store) rebuildRefFactsForRepos(repoPrefixes []string) (statements int, 
 
 	var insert string
 	if repoPrefixes == nil {
-		if _, err := tx.Exec(`DELETE FROM ref_facts`); err != nil {
+		if _, err := tx.Exec(`DELETE FROM ref_facts WHERE view_gen = ?`, s.viewGen); err != nil {
 			return statements, err
 		}
 		statements++
 		insert = refFactInsertPrefix + `    FROM nodes AS n
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id` + refFactInsertSuffix
-		if _, err := tx.Exec(insert); err != nil {
+    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
+		if _, err := tx.Exec(insert, s.viewGen, s.viewGen); err != nil {
 			return statements, err
 		}
 		statements++
@@ -111,14 +118,15 @@ func (s *Store) rebuildRefFactsForRepos(repoPrefixes []string) (statements int, 
 			return 0, nil
 		}
 		if _, err := tx.Exec(`DELETE FROM ref_facts
-WHERE repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, string(reposJSON)); err != nil {
+WHERE view_gen = ?
+  AND repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, s.viewGen, string(reposJSON)); err != nil {
 			return statements, err
 		}
 		statements++
 		insert = refFactInsertPrefix + `    FROM json_each(?) AS requested
     JOIN nodes AS n ON n.repo_prefix = CAST(requested.value AS TEXT)
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id` + refFactInsertSuffix
-		if _, err := tx.Exec(insert, string(reposJSON)); err != nil {
+    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
+		if _, err := tx.Exec(insert, string(reposJSON), s.viewGen, s.viewGen); err != nil {
 			return statements, err
 		}
 		statements++
@@ -157,16 +165,17 @@ func (s *Store) replaceRefFactsForFiles(repoPrefix string, files []string) (stat
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
 	if _, err := tx.Exec(`DELETE FROM ref_facts
-WHERE repo_prefix = ?
-  AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, repoPrefix, string(filesJSON)); err != nil {
+WHERE view_gen = ?
+  AND repo_prefix = ?
+  AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, s.viewGen, repoPrefix, string(filesJSON)); err != nil {
 		return statements, err
 	}
 	statements++
 	insert := refFactInsertPrefix + `    FROM json_each(?) AS requested
     JOIN nodes AS n
       ON n.repo_prefix = ? AND n.file_path = CAST(requested.value AS TEXT)
-    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id` + refFactInsertSuffix
-	if _, err := tx.Exec(insert, string(filesJSON), repoPrefix); err != nil {
+    JOIN edges AS e INDEXED BY edges_by_from ON e.from_id = n.id AND e.view_gen = n.view_gen` + refFactInsertSuffix
+	if _, err := tx.Exec(insert, string(filesJSON), repoPrefix, s.viewGen, s.viewGen); err != nil {
 		return statements, fmt.Errorf("ref-facts refill: %w", err)
 	}
 	statements++

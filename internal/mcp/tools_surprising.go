@@ -96,7 +96,7 @@ func (s *Server) handleGetSurprisingConnections(ctx context.Context, req mcp.Cal
 // step — this returns the full sorted set so a downstream consumer can
 // pick its own cap.
 func (s *Server) collectSurprisingEdges(
-	_ context.Context,
+	ctx context.Context,
 	scopedSet map[string]*graph.Node,
 	pathPrefix string,
 	minScore float64,
@@ -115,16 +115,17 @@ func (s *Server) collectSurprisingEdges(
 	// not one per edge — a few-dozen-row response replaces a ~286k
 	// edge round-trip on a disk backend). The total edge count then comes
 	// from the per-kind sum so we don't need a second backend call.
+	reader := s.readerFor(ctx)
 	kindCounts := make(map[graph.EdgeKind]int, 16)
 	totalEdges := 0
 	var allEdges []*graph.Edge
-	if counter, ok := s.graph.(graph.EdgeKindCounter); ok {
+	if counter, ok := reader.(graph.EdgeKindCounter); ok {
 		for k, c := range counter.EdgeKindCounts() {
 			kindCounts[k] = c
 			totalEdges += c
 		}
 	} else {
-		allEdges = s.graph.AllEdges()
+		allEdges = reader.AllEdges()
 		for _, e := range allEdges {
 			kindCounts[e.Kind]++
 		}
@@ -139,7 +140,7 @@ func (s *Server) collectSurprisingEdges(
 	// thousands of indexed subqueries are noticeably slower than the
 	// single AllEdges materialisation the anomaly walk already pays.
 	if allEdges == nil {
-		allEdges = s.graph.AllEdges()
+		allEdges = reader.AllEdges()
 	}
 	inDegree := make(map[string]int, len(scopedSet))
 	for _, e := range allEdges {

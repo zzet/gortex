@@ -793,7 +793,7 @@ func TestFilterTextMatches_LoneRepoAttribution(t *testing.T) {
 		WorkspaceID: "lone-repo",
 		RepoAllow:   map[string]bool{"lone-repo": true},
 	}
-	kept := srv.filterTextMatchesByResolvedScope(matches, resolved)
+	kept := srv.filterTextMatchesByResolvedScope(context.Background(), matches, resolved)
 	require.Len(t, kept, 1,
 		"a stamped match in the lone repo must attribute to its graph node")
 }

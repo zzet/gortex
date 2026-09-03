@@ -17,9 +17,9 @@ var (
 	_ graph.CloneShingleReader = (*Store)(nil)
 )
 
-// shingleChunk bounds clone-corpus writes. Five parameters per row stay below
+// shingleChunk bounds clone-corpus writes. Six parameters per row stay below
 // SQLite's conservative 999 host-parameter limit with ample headroom.
-const shingleChunk = 180
+const shingleChunk = 160
 
 // encodeShingles serialises a uint64 slice to a little-endian BLOB
 // (8 bytes per element). A nil/empty slice encodes to an empty BLOB.
@@ -102,15 +102,16 @@ func (s *Store) DeleteCloneShingles(nodeIDs []string) error {
 			end = len(uniq)
 		}
 		chunk := uniq[start:end]
-		args := make([]any, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.viewGen)
 		stmt := make([]byte, 0, 48+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM clone_shingles WHERE node_id IN ("...)
+		stmt = append(stmt, "DELETE FROM clone_shingles WHERE view_gen = ? AND node_id IN ("...)
 		for i, id := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
 			stmt = append(stmt, '?')
-			args[i] = id
+			args = append(args, id)
 		}
 		stmt = append(stmt, ')')
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
@@ -127,8 +128,8 @@ func (s *Store) DeleteCloneShingles(nodeIDs []string) error {
 // empty map, not an error.
 func (s *Store) LoadCloneShingles(repoPrefix string) (map[string][]uint64, error) {
 	rows, err := s.db.Query(
-		`SELECT node_id, shingles FROM clone_shingles WHERE repo_prefix = ?`,
-		repoPrefix,
+		`SELECT node_id, shingles FROM clone_shingles WHERE view_gen = ? AND repo_prefix = ?`,
+		s.viewGen, repoPrefix,
 	)
 	if err != nil {
 		return nil, err

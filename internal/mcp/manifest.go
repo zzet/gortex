@@ -85,7 +85,7 @@ func (s *Server) buildContextManifest(ctx context.Context, focus, outlineCandida
 	// once from the primary focus symbol.
 	onSpine := make(map[string]bool)
 	if len(focus) > 0 && focus[0] != nil {
-		if spine, _ := s.flowSpine(focus[0].ID, manifestSpineDepth); len(spine) > 0 {
+		if spine, _ := s.flowSpine(ctx, focus[0].ID, manifestSpineDepth); len(spine) > 0 {
 			for _, id := range spine {
 				onSpine[id] = true
 			}
@@ -248,7 +248,7 @@ func (s *Server) manifestSymbolSource(ctx context.Context, n *graph.Node) string
 	if n.StartLine <= 0 || n.EndLine <= 0 {
 		return ""
 	}
-	absPath, err := s.resolveNodePath(n)
+	absPath, err := s.resolveNodePath(ctx, n)
 	if err != nil {
 		return ""
 	}

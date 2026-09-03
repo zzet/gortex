@@ -87,9 +87,9 @@ func (s *Server) handleGetKnowledgeGaps(ctx context.Context, req mcp.CallToolReq
 	// kind-filtered node set so the planner never builds the list.
 	degreeByID, scoped := s.scopedFunctionDegrees(ctx, pathPrefix)
 
-	disconnected := s.collectDisconnected(scoped, pathPrefix, perCategoryLimit, degreeByID)
+	disconnected := s.collectDisconnected(ctx, scoped, pathPrefix, perCategoryLimit, degreeByID)
 	thin, singleFile := s.collectCommunityGaps(thinSize, pathPrefix, perCategoryLimit)
-	untested := s.collectUntestedHotspots(scoped, pathPrefix, hotspotLimit, minCov, perCategoryLimit, degreeByID)
+	untested := s.collectUntestedHotspots(ctx, scoped, pathPrefix, hotspotLimit, minCov, perCategoryLimit, degreeByID)
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
 		"disconnected_nodes":      disconnected,
@@ -123,7 +123,7 @@ func (s *Server) scopedFunctionDegrees(ctx context.Context, pathPrefix string) (
 	kinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod}
 	scoped := s.scopedNodesByKinds(ctx, kinds)
 	var degByID map[string]graph.NodeDegreeRow
-	if dk, ok := s.graph.(graph.NodeDegreeByKinds); ok {
+	if dk, ok := s.readerFor(ctx).(graph.NodeDegreeByKinds); ok {
 		rows := dk.NodeDegreeByKinds(kinds, pathPrefix)
 		degByID = make(map[string]graph.NodeDegreeRow, len(rows))
 		for _, r := range rows {
@@ -144,7 +144,7 @@ func (s *Server) scopedFunctionDegrees(ctx context.Context, pathPrefix string) (
 // per-node GetInEdges / GetOutEdges otherwise. The legacy
 // NodeDegreeAggregator path is kept as a tertiary fallback for
 // backends that publish NodeDegreeCounts but not NodeDegreeByKinds.
-func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapDisconnected {
+func (s *Server) collectDisconnected(ctx context.Context, scoped []*graph.Node, pathPrefix string, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapDisconnected {
 	candidates := make([]*graph.Node, 0, len(scoped))
 	for _, n := range scoped {
 		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
@@ -176,7 +176,8 @@ func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, li
 			})
 		}
 	default:
-		if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(candidates) > 0 {
+		reader := s.readerFor(ctx)
+		if agg, ok := reader.(graph.NodeDegreeAggregator); ok && len(candidates) > 0 {
 			ids := make([]string, 0, len(candidates))
 			byID := make(map[string]*graph.Node, len(candidates))
 			for _, n := range candidates {
@@ -198,7 +199,7 @@ func (s *Server) collectDisconnected(scoped []*graph.Node, pathPrefix string, li
 			}
 		} else {
 			for _, n := range candidates {
-				if len(s.graph.GetInEdges(n.ID)) > 0 || len(s.graph.GetOutEdges(n.ID)) > 0 {
+				if len(reader.GetInEdges(n.ID)) > 0 || len(reader.GetOutEdges(n.ID)) > 0 {
 					continue
 				}
 				out = append(out, gapDisconnected{
@@ -280,7 +281,7 @@ func (s *Server) collectCommunityGaps(thinSize int, pathPrefix string, limit int
 // falls back to NodeDegreeAggregator (the older IN-list shape) for
 // backends that only publish that one, and finally to per-node
 // GetInEdges for everyone else.
-func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string, hotspotLimit int, minCov float64, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapUntestedHotspot {
+func (s *Server) collectUntestedHotspots(ctx context.Context, scoped []*graph.Node, pathPrefix string, hotspotLimit int, minCov float64, limit int, degreeByID map[string]graph.NodeDegreeRow) []gapUntestedHotspot {
 	type ranked struct {
 		node  *graph.Node
 		fanIn int
@@ -300,7 +301,8 @@ func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string
 			candidates = append(candidates, ranked{node: n, fanIn: r.InCount})
 		}
 	default:
-		if agg, ok := s.graph.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
+		reader := s.readerFor(ctx)
+		if agg, ok := reader.(graph.NodeDegreeAggregator); ok && len(pool) > 0 {
 			ids := make([]string, 0, len(pool))
 			byID := make(map[string]*graph.Node, len(pool))
 			for _, n := range pool {
@@ -316,7 +318,7 @@ func (s *Server) collectUntestedHotspots(scoped []*graph.Node, pathPrefix string
 			}
 		} else {
 			for _, n := range pool {
-				candidates = append(candidates, ranked{node: n, fanIn: len(s.graph.GetInEdges(n.ID))})
+				candidates = append(candidates, ranked{node: n, fanIn: len(reader.GetInEdges(n.ID))})
 			}
 		}
 	}

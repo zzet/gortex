@@ -72,7 +72,7 @@ type ImpactResult struct {
 // slow path is identical to the pre-index implementation so consumer
 // semantics never diverge. Missing or interrupted symbol records are
 // recomputed and atomically published by reach.Lookup.
-func AnalyzeImpact(g graph.Store, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
+func AnalyzeImpact(g graph.Reader, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return AnalyzeImpactContext(ctx, g, symbolIDs, communities, processes)
@@ -81,7 +81,7 @@ func AnalyzeImpact(g graph.Store, symbolIDs []string, communities *CommunityResu
 // AnalyzeImpactContext is the cancellable form used by interactive callers.
 // The compatibility wrapper above supplies a strict deadline so even callers
 // that have not yet propagated their request context cannot hang on a hub.
-func AnalyzeImpactContext(ctx context.Context, g graph.Store, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
+func AnalyzeImpactContext(ctx context.Context, g graph.Reader, symbolIDs []string, communities *CommunityResult, processes *ProcessResult) *ImpactResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -238,7 +238,7 @@ type impactNodesContextGetter interface {
 	GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
 }
 
-func getImpactNodesContext(ctx context.Context, g graph.Store, ids []string) (map[string]*graph.Node, error) {
+func getImpactNodesContext(ctx context.Context, g graph.Reader, ids []string) (map[string]*graph.Node, error) {
 	if getter, ok := g.(impactNodesContextGetter); ok {
 		return getter.GetNodesByIDsContext(ctx, ids)
 	}
@@ -248,7 +248,7 @@ func getImpactNodesContext(ctx context.Context, g graph.Store, ids []string) (ma
 	return g.GetNodesByIDs(ids), nil
 }
 
-func fillImpactLive(ctx context.Context, g graph.Store, result *ImpactResult, symbolIDs []string) {
+func fillImpactLive(ctx context.Context, g graph.Reader, result *ImpactResult, symbolIDs []string) {
 	const maxLiveImpactEdges = maxImpactEntriesPerTier + 1
 
 	type boundedIncomingEdgeReader interface {
@@ -369,9 +369,20 @@ func fillImpactLive(ctx context.Context, g graph.Store, result *ImpactResult, sy
 // deterministic-by-shard-iteration choice closely enough for tests
 // that compare ByDepth ID sets, which is the contract consumers rely
 // on. EdgeConfidence is set from that representative edge.
-func fillImpactFromReach(ctx context.Context, g graph.Store, result *ImpactResult, symbolIDs []string) bool {
+//
+// The reach index is built over the base corpus and is keyed off node Meta
+// plus the store's resolve mutex, so it is only consulted when the reader is
+// the base store itself. A reader that layers unsaved edits over the base
+// (a request overlay view) is not a store, and the miss sends the caller to
+// fillImpactLive, which walks the reader's own edges and so reflects the
+// layered state.
+func fillImpactFromReach(ctx context.Context, r graph.Reader, result *ImpactResult, symbolIDs []string) bool {
 	if len(symbolIDs) == 0 {
 		return true
+	}
+	g, ok := r.(graph.Store)
+	if !ok {
+		return false
 	}
 	// Single-seed shortcut. The precomputed tier slices are already
 	// unique and sorted by ID (BuildIndex calls sortTierByID), so the

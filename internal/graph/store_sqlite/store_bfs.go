@@ -65,7 +65,7 @@ func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind,
 
 	query := buildBFSQuery(dir, len(uniqSeeds), len(uniqKinds), limit > 0)
 
-	args := make([]any, 0, len(uniqSeeds)+1+len(uniqKinds)+1)
+	args := make([]any, 0, len(uniqSeeds)+len(uniqKinds)+3)
 	for _, sd := range uniqSeeds {
 		args = append(args, sd)
 	}
@@ -73,6 +73,7 @@ func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind,
 	for _, k := range uniqKinds {
 		args = append(args, string(k))
 	}
+	args = append(args, s.viewGen)
 	if limit > 0 {
 		args = append(args, limit)
 	}
@@ -144,8 +145,10 @@ func buildBFSQuery(dir graph.Direction, nSeeds, nKinds int, withLimit bool) stri
 	// node. If the index is ever absent (a bulk-load window drops it) the
 	// query errors and the engine falls back to the in-memory walk.
 	b.WriteString("  JOIN edges e INDEXED BY " + edgeIdx + " ON " + joinCol + " = b.node_id\n")
-	b.WriteString("  JOIN nodes n ON n.id = " + nextCol + "\n")
-	b.WriteString("  WHERE b.depth < ? AND e.kind IN (" + inPlaceholders(nKinds) + ")\n")
+	// The node-backed gate pairs generations: a target that exists only in
+	// another generation must read as absent, not as a followable hop.
+	b.WriteString("  JOIN nodes n ON n.id = " + nextCol + " AND n.view_gen = e.view_gen\n")
+	b.WriteString("  WHERE b.depth < ? AND e.kind IN (" + inPlaceholders(nKinds) + ") AND e.view_gen = ?\n")
 	b.WriteString("),\n")
 	b.WriteString("ranked AS (\n")
 	b.WriteString("  SELECT node_id, depth, parent_id, edge_kind,\n")

@@ -24,7 +24,9 @@ type SemanticProviderStatus struct {
 // Inputs is the dependency bundle the Generator needs. All fields are
 // optional except Graph (without a graph there is nothing to render).
 type Inputs struct {
-	Graph             graph.Store
+	// Graph is only read, so the caller may hand over a request-scoped
+	// reader (an overlay view) instead of the base store.
+	Graph             graph.Reader
 	Communities       *analysis.CommunityResult
 	Processes         *analysis.ProcessResult
 	Hotspots          []analysis.HotspotEntry
@@ -51,7 +53,7 @@ type Result struct {
 // derives the supporting lookup maps; Generate writes the markdown
 // pages and flushes the writer.
 type Generator struct {
-	graph             graph.Store
+	graph             graph.Reader
 	communities       *analysis.CommunityResult
 	processes         *analysis.ProcessResult
 	hotspots          []analysis.HotspotEntry

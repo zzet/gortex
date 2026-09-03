@@ -14,8 +14,8 @@ var (
 	_ graph.FileMetaPathReader   = (*Store)(nil)
 )
 
-// fileMetaChunk bounds rows per multi-row INSERT (6 params/row; 80 rows =
-// 480 host params, well under SQLite's 999 default).
+// fileMetaChunk bounds rows per multi-row INSERT (7 params/row; 80 rows =
+// 560 host params, well under SQLite's 999 default).
 const fileMetaChunk = 80
 
 // SetFileMetas upserts per-file metadata rows for one repo prefix in a single
@@ -40,15 +40,15 @@ func (s *Store) SetFileMetas(repoPrefix string, rows []graph.FileMetaRow) error 
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*6)
+		args := make([]any, 0, len(batch)*7)
 		stmt := make([]byte, 0, 96+len(batch)*24)
-		stmt = append(stmt, "INSERT OR REPLACE INTO files (repo_prefix, file_path, content_hash, size, node_count, errors) VALUES "...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO files (view_gen, repo_prefix, file_path, content_hash, size, node_count, errors) VALUES "...)
 		for i, r := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?, ?, ?)"...)
-			args = append(args, repoPrefix, r.FilePath, r.ContentHash, r.Size, r.NodeCount, r.Errors)
+			stmt = append(stmt, "(?, ?, ?, ?, ?, ?, ?)"...)
+			args = append(args, s.viewGen, repoPrefix, r.FilePath, r.ContentHash, r.Size, r.NodeCount, r.Errors)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -69,7 +69,7 @@ func (s *Store) ReplaceFileMetas(repoPrefix string, rows []graph.FileMetaRow) er
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if _, err := tx.Exec(`DELETE FROM files WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`DELETE FROM files WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	for start := 0; start < len(rows); start += fileMetaChunk {
@@ -78,15 +78,15 @@ func (s *Store) ReplaceFileMetas(repoPrefix string, rows []graph.FileMetaRow) er
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*6)
+		args := make([]any, 0, len(batch)*7)
 		stmt := make([]byte, 0, 96+len(batch)*24)
-		stmt = append(stmt, "INSERT INTO files (repo_prefix, file_path, content_hash, size, node_count, errors) VALUES "...)
+		stmt = append(stmt, "INSERT INTO files (view_gen, repo_prefix, file_path, content_hash, size, node_count, errors) VALUES "...)
 		for i, row := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?, ?, ?)"...)
-			args = append(args, repoPrefix, row.FilePath, row.ContentHash, row.Size, row.NodeCount, row.Errors)
+			stmt = append(stmt, "(?, ?, ?, ?, ?, ?, ?)"...)
+			args = append(args, s.viewGen, repoPrefix, row.FilePath, row.ContentHash, row.Size, row.NodeCount, row.Errors)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -116,10 +116,10 @@ func (s *Store) DeleteFileMetasByFiles(repoPrefix string, files []string) error 
 			end = len(files)
 		}
 		chunk := files[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 64+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM files WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "DELETE FROM files WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, f := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -139,8 +139,8 @@ func (s *Store) DeleteFileMetasByFiles(repoPrefix string, files []string) error 
 // Always non-nil.
 func (s *Store) FileMetasForRepo(repoPrefix string) ([]graph.FileMetaRow, error) {
 	rows, err := s.db.Query(
-		`SELECT file_path, content_hash, size, node_count, errors FROM files WHERE repo_prefix = ? ORDER BY file_path`,
-		repoPrefix,
+		`SELECT file_path, content_hash, size, node_count, errors FROM files WHERE view_gen = ? AND repo_prefix = ? ORDER BY file_path`,
+		s.viewGen, repoPrefix,
 	)
 	if err != nil {
 		return nil, err
@@ -168,10 +168,10 @@ func (s *Store) FileMetasByPaths(repoPrefix string, filePaths []string) (map[str
 			end = len(filePaths)
 		}
 		chunk := filePaths[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 112+len(chunk)*2)
-		stmt = append(stmt, "SELECT file_path, content_hash, size, node_count, errors FROM files WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "SELECT file_path, content_hash, size, node_count, errors FROM files WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, filePath := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')

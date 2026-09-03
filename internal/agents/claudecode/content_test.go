@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 // TestCommandPRReviewAgent_ShellsTheReviewVerb asserts the agent-review skill
@@ -72,6 +74,14 @@ func TestGeneratedClaudeContent_UsesOnlyPublicToolDomains(t *testing.T) {
 		}
 		if len(body) > 6000 {
 			t.Errorf("%s is not lean: %d bytes (limit 6000)", name, len(body))
+		}
+	}
+}
+
+func TestEveryClaudeSkillCarriesCanonicalWorktreeBranchPolicy(t *testing.T) {
+	for name, body := range GlobalSkills {
+		if got := strings.Count(body, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+			t.Errorf("skill %q embeds canonical worktree policy %d times, want once", name, got)
 		}
 	}
 }

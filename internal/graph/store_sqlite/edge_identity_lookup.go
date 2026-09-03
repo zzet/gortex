@@ -85,6 +85,10 @@ func (s *Store) findEdgesByIdentities(identities []graph.EdgeIdentity) (map[grap
 			keyCount++
 		}
 
+		// The generation binds after the VALUES rows, matching its place in
+		// the query text. It fits inside sqliteBatchVariableHeadroom.
+		args = append(args, s.viewGen)
+
 		query := exactEdgeIdentityQuery(keyCount)
 
 		stats.Statements++
@@ -151,6 +155,11 @@ func compareEdgeIdentityLookupKey(left, right graph.EdgeIdentity) int {
 // integer row IDs; the outer primary-key walk then decodes full rows in table
 // order. ORDER BY is satisfied by that row-ID walk (the plan test forbids a
 // full-row temp sort).
+//
+// The generation is the sixth column of the edges UNIQUE key, so binding it in
+// the inner probe lengthens that seek instead of filtering after it. The outer
+// walk needs no filter of its own: edge ids are unique across generations, so
+// the inner match already decided which rows it may fetch.
 func exactEdgeIdentityQuery(rows int) string {
 	return `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` +
 		multiValues(rows, exactEdgeIdentityParamsPerRow) + `)
@@ -165,6 +174,7 @@ WHERE e.id IN (
        AND matched.kind = w.kind
        AND matched.file_path = w.file_path
        AND matched.line = w.line
+       AND matched.view_gen = ?
 )
 ORDER BY e.id`
 }

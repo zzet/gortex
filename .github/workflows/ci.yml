@@ -9,10 +9,13 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # The suite runs ~30m on the ubuntu runners and slower on macos, so the
+    # per-step budget needs headroom; this job-level cap still bounds a hang.
+    timeout-minutes: 60
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        go-version: ['1.26']
+        go-version: ['1.27']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -24,10 +27,10 @@ jobs:
         run: go build -o gortex ./cmd/gortex/
 
       - name: Test
-        run: go test -race -timeout=30m -coverprofile=coverage.out ./...
+        run: go test -race -timeout=45m -coverprofile=coverage.out ./...
 
       - name: Upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           files: coverage.out
@@ -37,8 +40,10 @@ jobs:
     # CGO build smoke-test on native Windows. tree-sitter needs a C/C++
     # compiler — the GitHub windows runner ships mingw-w64 on PATH, so no
     # extra toolchain setup is required. `go build ./...` compiles every
-    # production package; the focused agents and sidecar tests also exercise
-    # Windows-only paths without opting into the unsupported full test suite.
+    # production package; the focused test steps below exercise the paths
+    # whose behaviour actually differs here — separators, volumes, open-file
+    # semantics, %USERPROFILE%, and the git layouts the checkout catalog is
+    # built from — without opting into the unsupported full test suite.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,6 +145,37 @@ jobs:
           ./internal/mcp ./internal/resolver ./internal/persistence
           ./internal/review
 
+      # gitstate reads git's own answers and measures them against host paths.
+      # git spells a worktree root with '/' on every platform while a fixture
+      # builds one with the host separator, an absolute path needs a volume
+      # here and not on POSIX, and a repository's admin directory is reached
+      # by joining. None of those distinctions exists on the linux/macos
+      # matrix, so the whole package runs here rather than the one test that
+      # looks path-shaped. The timeout is generous because every fixture
+      # shells out to git and process spawn is the slow axis on this runner.
+      - name: Test git state inspection
+        run: go test -timeout=15m -count=1 ./internal/gitstate
+
+      # The reconcile pass turns that inventory into catalog rows: it joins
+      # admin directories, and it decides which checkout owns a path by
+      # measuring roots against each other. Both are separator-shaped, so a
+      # '/'-spelled expectation passes on POSIX whatever the code does.
+      - name: Test checkout reconciliation
+        run: go test -timeout=10m -count=1 ./internal/reconcile
+
+      # The CLI half of the same code: the checkout verbs, the view router
+      # that answers a probe from the checkout containing the probed path,
+      # and the classifier that tells a linked worktree from a main checkout
+      # by reading its `.git` file. Every one of them decides by comparing
+      # path spellings, and the git layouts they classify are built by git
+      # itself. The selector names those tests only — the rest of the package
+      # is either unrelated or needs a daemon behind an AF_UNIX socket.
+      - name: Test checkout and view path routing
+        run: >
+          go test -timeout=10m -count=1
+          -run '^(TestRepos(Families|SetPrimary|Forget|Reconcile|ExplainView)|TestUntrack(Previews|Reports)|TestController(TrackUntrack|Reload)DrivesTheCheckoutLifecycle|TestControllerAnswersTheFileCoverageVerb|TestProbeOf|TestProbeMatchesAPathSpelledThroughASymlink|TestRoutedProbe|TestUnroutedProbe|TestSearchSymbolsWithoutAPath|TestViewsStatus|TestReload_(Keeps|Untracks)|TestDispatcher_(RegisteredCheckout|UnregisteredWorktree)|TestLinkedWorktreeAt_)'
+          ./cmd/gortex
+
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any
     # distro (see .goreleaser.yml). That only holds while the code stays
@@ -202,7 +238,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.11.4
+          version: v2.13.1
           args: --timeout=10m
 
       # goreleaser used to run `go mod tidy` as a release before-hook, which

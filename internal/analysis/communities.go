@@ -58,7 +58,7 @@ func DetectCommunities(g graph.Store) *CommunityResult {
 
 // DetectCommunitiesLouvain is the original Louvain implementation,
 // retained for benchmarking and as a known-good fallback.
-func DetectCommunitiesLouvain(g graph.Store) *CommunityResult {
+func DetectCommunitiesLouvain(g graph.Reader) *CommunityResult {
 	nodes := g.AllNodes()
 	edges := g.AllEdges()
 
@@ -833,7 +833,7 @@ func finaliseCommunityPartition(
 // Returns nil when the backend errors — callers should fall
 // through to the in-process path rather than surface a half-done
 // CommunityResult.
-func DetectCommunitiesLouvainBackend(g graph.Store, cd graph.CommunityDetector) *CommunityResult {
+func DetectCommunitiesLouvainBackend(g graph.Reader, cd graph.CommunityDetector) *CommunityResult {
 	if g == nil || cd == nil {
 		return nil
 	}

@@ -16,15 +16,15 @@ func TestResolverScopedProjectionProductionQueriesUseRepoKindIndex(t *testing.T)
 	}{
 		{
 			name: "high water", query: resolverScopedProjectionHighWaterQuery,
-			args: []any{"repo", graph.KindFile},
+			args: []any{"repo", graph.KindFile, baseViewGeneration},
 		},
 		{
 			name: "first page", query: resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", false),
-			args: []any{"repo", graph.KindFile, "repo::z", resolverProjectionPageSize},
+			args: []any{"repo", graph.KindFile, "repo::z", baseViewGeneration, resolverProjectionPageSize},
 		},
 		{
 			name: "next page", query: resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", true),
-			args: []any{"repo", graph.KindFile, "repo::a", "repo::z", resolverProjectionPageSize},
+			args: []any{"repo", graph.KindFile, "repo::a", "repo::z", baseViewGeneration, resolverProjectionPageSize},
 		},
 	}
 

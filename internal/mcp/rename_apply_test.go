@@ -368,7 +368,7 @@ func TestRenameSymbol_RefusesOnDiskDrift(t *testing.T) {
 		OldText: "\treturn SomethingElse()",
 		NewText: "\treturn Renamed()",
 	}}
-	_, err := srv.planRenameWrites(edits, false)
+	_, err := srv.planRenameWrites(context.Background(), edits, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "changed on disk")
 
@@ -382,7 +382,7 @@ func TestRenameSymbol_RefusesOnDiskDrift(t *testing.T) {
 func TestRenameSymbol_RefusesOutOfRangeLine(t *testing.T) {
 	srv, _ := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
 
-	_, err := srv.planRenameWrites([]renameEdit{{
+	_, err := srv.planRenameWrites(context.Background(), []renameEdit{{
 		File: "caller.go", Line: 9999, OldText: "x", NewText: "y",
 	}}, false)
 	require.Error(t, err)
@@ -398,7 +398,7 @@ func TestRenameSymbol_ParseGateRefusesWholeRename(t *testing.T) {
 	srv, dir := setupRenameServer(t, renameTargetSrc, renameCallerSrc)
 
 	// A replacement that is not a legal identifier breaks the file's syntax.
-	_, err := srv.planRenameWrites([]renameEdit{{
+	_, err := srv.planRenameWrites(context.Background(), []renameEdit{{
 		File:    "caller.go",
 		Line:    4,
 		OldText: "\treturn Target()",

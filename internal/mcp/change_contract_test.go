@@ -174,7 +174,7 @@ func TestAssembleEnvelopeKeepsSingleRepoVerificationWithCrossRepoImpact(t *testi
 		},
 	}
 
-	env := srv.assembleEnvelope(p, nil)
+	env := srv.assembleEnvelope(context.Background(), p, nil)
 	require.Equal(t, verdictAllow, env.Verdict)
 	require.Equal(t, "go test -race ./internal/mcp", env.VerificationCommand)
 	require.Contains(t, env.StopCondition, "`go test -race ./internal/mcp` exits 0")
@@ -194,7 +194,7 @@ func TestAssembleEnvelopeReportsMultiRepoVerificationRefusal(t *testing.T) {
 		},
 	}
 
-	env := srv.assembleEnvelope(p, nil)
+	env := srv.assembleEnvelope(context.Background(), p, nil)
 	require.Equal(t, verdictWarn, env.Verdict)
 	require.Empty(t, env.VerificationCommand)
 

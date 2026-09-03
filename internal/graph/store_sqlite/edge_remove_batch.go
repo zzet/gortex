@@ -11,6 +11,10 @@ import (
 // WHERE EXISTS against a constant VALUES table cannot be inverted by the
 // planner and scans the whole edges table per chunk; driving the join
 // from the VALUES side probes the edges primary key per identity.
+//
+// The generation is the sixth and last column of that key, so binding it after
+// the five identity columns completes the seek instead of demoting it to a
+// filter. Callers bind it once, after the VALUES arguments.
 func edgeExactDeleteByIdentitySQL(values string) string {
 	return `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + values + `)
 DELETE FROM edges
@@ -23,10 +27,11 @@ WHERE id IN (
      AND e.kind = w.kind
      AND e.file_path = w.file_path
      AND e.line = w.line
+     AND e.view_gen = ?
 )`
 }
 
-const exactEdgeRemoveChunkSize = 160 // 160 * 5 = 800 bound parameters.
+const exactEdgeRemoveChunkSize = 160 // 160*5 + 1 generation = 801 bound parameters.
 
 // RemoveEdgesExact deletes complete logical edge identities through bounded
 // VALUES joins in one transaction. It is the set-oriented sibling of
@@ -78,7 +83,7 @@ func (s *Store) RemoveEdgesExact(edges []*graph.Edge) int {
 		end := minInt(start+exactEdgeRemoveChunkSize, len(keys))
 		chunk := keys[start:end]
 		var values strings.Builder
-		args := make([]any, 0, len(chunk)*5)
+		args := make([]any, 0, len(chunk)*5+1)
 		for i, k := range chunk {
 			if i > 0 {
 				values.WriteByte(',')
@@ -86,6 +91,7 @@ func (s *Store) RemoveEdgesExact(edges []*graph.Edge) int {
 			values.WriteString("(?,?,?,?,?)")
 			args = append(args, k.from, k.to, k.kind, k.file, k.line)
 		}
+		args = append(args, s.viewGen)
 		result, execErr := tx.Exec(edgeExactDeleteByIdentitySQL(values.String()), args...)
 		if execErr != nil {
 			panicOnFatal(execErr)

@@ -129,7 +129,7 @@ func hierarchyLeafKinds(k graph.NodeKind) bool {
 // The base graph is read-only here — BuildHierarchy never mutates g
 // and never persists a second graph. An unknown level yields an empty
 // view carrying that level, so callers can surface a clean error.
-func BuildHierarchy(g graph.Store, level ResolutionLevel, communities *CommunityResult) *HierarchyView {
+func BuildHierarchy(g graph.Reader, level ResolutionLevel, communities *CommunityResult) *HierarchyView {
 	view := &HierarchyView{Level: level, SelfLoops: map[string]int{}}
 	if g == nil || !ValidResolutionLevel(level) {
 		return view

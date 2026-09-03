@@ -59,8 +59,8 @@ func (s *Store) ExistingNodeIDs(ids []string) map[string]struct{} {
 	for i := 0; i < len(uniq); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
-		q := `SELECT id FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `)`
-		rows, err := s.db.Query(q, toAnyArgs(chunk)...)
+		q := `SELECT id FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?`
+		rows, err := s.db.Query(q, append(toAnyArgs(chunk), s.viewGen)...)
 		if err != nil {
 			panicOnFatal(err)
 			return out
@@ -108,11 +108,12 @@ func (s *Store) CountNodesByNameClass(names []string, definitionKinds []graph.No
 		             SUM(CASE WHEN is_stub = 0 AND kind IN (` + kindPlaceholders + `) THEN 1 ELSE 0 END),
 		             SUM(CASE WHEN is_stub = 1 THEN 1 ELSE 0 END)
 		        FROM nodes
-		       WHERE name IN (` + inPlaceholders(len(chunk)) + `)
+		       WHERE name IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?
 		       GROUP BY name`
-		args := make([]any, 0, len(kindArgs)+len(chunk))
+		args := make([]any, 0, len(kindArgs)+len(chunk)+1)
 		args = append(args, kindArgs...)
 		args = append(args, toAnyArgs(chunk)...)
+		args = append(args, s.viewGen)
 		rows, err := s.db.Query(q, args...)
 		if err != nil {
 			panicOnFatal(err)
@@ -150,11 +151,11 @@ func (s *Store) FindNodesByNameContaining(substr string, limit int) []*graph.Nod
 		return nil
 	}
 	pattern := "%" + escapeLikePattern(substr) + "%"
-	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE name LIKE ? ESCAPE '\' ORDER BY id`
+	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE name LIKE ? ESCAPE '\' AND view_gen = ? ORDER BY id`
 	if limit > 0 {
-		return s.queryNodesSQL(q+` LIMIT ?`, pattern, limit)
+		return s.queryNodesSQL(q+` LIMIT ?`, pattern, s.viewGen, limit)
 	}
-	return s.queryNodesSQL(q, pattern)
+	return s.queryNodesSQL(q, pattern, s.viewGen)
 }
 
 // GetNodesByQualNames returns every candidate for each requested qualified
@@ -167,7 +168,7 @@ func (s *Store) GetNodesByQualNames(qualNames []string) map[string][]*graph.Node
 	}
 
 	out := make(map[string][]*graph.Node, len(uniq))
-	for _, n := range s.queryNodesSQL(nodesByQualNameLookupSQL, qualNameLookupPayload(uniq)) {
+	for _, n := range s.queryNodesSQL(nodesByQualNameLookupSQL, qualNameLookupPayload(uniq), s.viewGen) {
 		if n != nil {
 			out[n.QualName] = append(out[n.QualName], n)
 		}
@@ -189,7 +190,7 @@ func (s *Store) GetNodeContext(ctx context.Context, id string) (*graph.Node, err
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	row := s.stmtGetNode.QueryRowContext(ctx, id)
+	row := s.stmtGetNode.QueryRowContext(ctx, id, s.viewGen)
 	n, err := scanNode(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -215,8 +216,8 @@ func (s *Store) GetNodesByIDsContext(ctx context.Context, ids []string) (map[str
 		}
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
-		q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `)`
-		rows, err := s.db.QueryContext(ctx, q, toAnyArgs(chunk)...)
+		q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?`
+		rows, err := s.db.QueryContext(ctx, q, append(toAnyArgs(chunk), s.viewGen)...)
 		if err != nil {
 			return out, fmt.Errorf("get nodes by ids: %w", err)
 		}
@@ -274,9 +275,9 @@ func (s *Store) GetOutEdgesByNodeIDsContext(ctx context.Context, ids []string, l
 		chunk := uniq[i:end]
 		remaining := limit - total
 		queryLimit := remaining + 1
-		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE from_id IN (` + inPlaceholders(len(chunk)) + `) LIMIT ?`
+		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE from_id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ? LIMIT ?`
 		args := toAnyArgs(chunk)
-		args = append(args, queryLimit)
+		args = append(args, s.viewGen, queryLimit)
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
 			return out, true, err
@@ -328,9 +329,9 @@ func (s *Store) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, li
 		// remaining may be zero: fetch one proof row from later chunks so
 		// exactly-limit and greater-than-limit are distinguishable.
 		queryLimit := remaining + 1
-		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE to_id IN (` + inPlaceholders(len(chunk)) + `) LIMIT ?`
+		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE to_id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ? LIMIT ?`
 		args := toAnyArgs(chunk)
-		args = append(args, queryLimit)
+		args = append(args, s.viewGen, queryLimit)
 		rows, err := s.db.QueryContext(ctx, q, args...)
 		if err != nil {
 			return out, true, err
@@ -434,10 +435,11 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 	for i := 0; i < len(endpointKeys); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(endpointKeys))
 		chunk := endpointKeys[i:end]
-		args := make([]any, 0, len(chunk)*2)
+		args := make([]any, 0, len(chunk)*2+1)
 		for _, key := range chunk {
 			args = append(args, key.From, key.To)
 		}
+		args = append(args, s.viewGen)
 		if !collect("endpoint", edgeCandidatesEndpointQuery(len(chunk)), args, addEndpoint) {
 			return out
 		}
@@ -477,10 +479,11 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 	for i := 0; i < len(exactSites); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(exactSites))
 		chunk := exactSites[i:end]
-		args := make([]any, 0, len(chunk)*3)
+		args := make([]any, 0, len(chunk)*3+1)
 		for _, key := range chunk {
 			args = append(args, key.From, key.Line, string(key.Kind))
 		}
+		args = append(args, s.viewGen)
 		if !collect("exact-site", edgeCandidatesExactSiteQuery(len(chunk)), args, addSite) {
 			return out
 		}
@@ -488,10 +491,11 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 	for i := 0; i < len(anySites); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(anySites))
 		chunk := anySites[i:end]
-		args := make([]any, 0, len(chunk)*2)
+		args := make([]any, 0, len(chunk)*2+1)
 		for _, key := range chunk {
 			args = append(args, key.From, key.Line)
 		}
+		args = append(args, s.viewGen)
 		if !collect("any-kind site", edgeCandidatesAnySiteQuery(len(chunk)), args, addSite) {
 			return out
 		}
@@ -509,25 +513,33 @@ func edgeCandidatesValues(rows int, row string) string {
 	return strings.TrimSuffix(strings.Repeat(row+",", rows), ",")
 }
 
+// The wanted CTE is a constant VALUES relation with no generation of its own,
+// so the generation predicate rides one trailing bind on the edges side. It
+// stays out of the JOIN's ON clause so the probe columns the plan locks name
+// are still the ones the planner sees first.
+
 func edgeCandidatesEndpointQuery(pairs int) string {
 	return `WITH wanted(from_id, to_id) AS (VALUES ` + edgeCandidatesValues(pairs, "(?, ?)") + `)
 	      SELECT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.to_id = w.to_id`
+	        JOIN edges AS e ON e.from_id = w.from_id AND e.to_id = w.to_id
+	       WHERE e.view_gen = ?`
 }
 
 func edgeCandidatesExactSiteQuery(triples int) string {
 	return `WITH wanted(from_id, line, kind) AS (VALUES ` + edgeCandidatesValues(triples, "(?, ?, ?)") + `)
 	      SELECT DISTINCT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.kind = w.kind AND e.line = w.line`
+	        JOIN edges AS e ON e.from_id = w.from_id AND e.kind = w.kind AND e.line = w.line
+	       WHERE e.view_gen = ?`
 }
 
 func edgeCandidatesAnySiteQuery(pairs int) string {
 	return `WITH wanted(from_id, line) AS (VALUES ` + edgeCandidatesValues(pairs, "(?, ?)") + `)
 	      SELECT DISTINCT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.line = w.line`
+	        JOIN edges AS e ON e.from_id = w.from_id AND e.line = w.line
+	       WHERE e.view_gen = ?`
 }
 
 // edgeCandidateIdentity mirrors the edges table's logical UNIQUE key. A row
@@ -586,8 +598,8 @@ func (s *Store) edgesByNodeIDs(ids []string, col string, key func(*graph.Edge) s
 	for i := 0; i < len(uniq); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
-		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE ` + col + ` IN (` + inPlaceholders(len(chunk)) + `)`
-		for _, e := range s.queryEdgesSQL(q, toAnyArgs(chunk)...) {
+		q := `SELECT ` + lookupEdgeCols + ` FROM edges WHERE ` + col + ` IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?`
+		for _, e := range s.queryEdgesSQL(q, append(toAnyArgs(chunk), s.viewGen)...) {
 			if e == nil {
 				continue
 			}

@@ -22,6 +22,7 @@ Gortex exposes a knowledge-graph query surface over the [Model Context Protocol]
 - [Code generation](#code-generation)
 - [PR review](#pr-review)
 - [Multi-repo management](#multi-repo-management)
+- [Worktree views and checkouts](#worktree-views-and-checkouts)
 - [Live editor buffers (overlay sessions)](#live-editor-buffers-overlay-sessions)
 - [Speculative execution](#speculative-execution)
 - [MCP resources (18)](#mcp-resources-18)
@@ -497,6 +498,122 @@ A graph-grounded pull-request review surface. The forge-data tools self-serve PR
 | `save_scope` | Save a named, reusable set of repository prefixes — accepted by `search_symbols` / `smart_context` via `scope` |
 | `list_scopes` | List every saved repository scope |
 | `delete_scope` | Delete a saved repository scope by name |
+
+## Worktree views and checkouts
+
+A **view** is what one request reads through. The session CWD automatically selects its checkout: an ordinary linked worktree is discovered and represented as an overlay over the family's designated primary, without an explicit `track_repository` call. Explicit tracking is reserved for a user-requested dedicated logical graph. Any request may name a different view explicitly. See [multi-repo.md](multi-repo.md#checkout-families-and-worktree-views) for the storage and lifecycle model.
+
+### The `view` selector
+
+`view` is request context, not a tool parameter: the server reads it off the arguments and strips it before parameter reconciliation and before any handler runs, so every tool honours it and no tool schema declares it.
+
+```jsonc
+// Search the index as it stands on another branch.
+{"name":"search_symbols","arguments":{"query":"Login","view":{"kind":"git_ref","value":"refs/heads/release-2","graph_id":"graph-1f0c…"}}}
+
+// Read a file through one registered worktree.
+{"name":"read_file","arguments":{"path":"internal/auth/login.go","view":{"kind":"worktree","checkout_id":"018f…"}}}
+```
+
+Graph and checkout ids are opaque; `list_checkouts` (CLI: `gortex repos families`) lists them per family alongside the repo prefix each graph serves.
+
+| `kind` | Required field | Selects |
+|---|---|---|
+| `auto` (default when `view` is omitted) | — | the session's own view: its cwd's checkout when that checkout is served automatically, else the base corpus |
+| `base` | `graph_id` | one persisted base graph by id |
+| `worktree` | `checkout_id` | one registered checkout by id, including its working-tree edits |
+| `git_ref` | `value` | the commit a **full** ref points at — under `refs/heads/`, `refs/tags/`, or `refs/remotes/` |
+| `commit` | `value` | one commit by object id — a full lowercase hex oid, 40 (SHA-1) or 64 (SHA-256) characters |
+
+`git_ref` and `commit` also take an optional `graph_id`. `kind`, `graph_id`, `checkout_id` and `value` are the only accepted fields, and each must be a string.
+
+Rules worth knowing before a client builds selectors:
+
+- **Full names only.** Short refs (`main`), `HEAD`, revision expressions (`main~1`, `a..b`, `x@{1}`) and abbreviated object ids are rejected — they resolve against ambient state, and a pinned view may not. Values are never trimmed: surrounding whitespace is a malformed value, not a typo.
+- **Multi-repo disambiguation.** A `git_ref` / `commit` selector with no `graph_id` resolves only when the session reaches exactly one repository; reaching several fails with `invalid_view_selector` naming them, so name one with `graph_id`.
+- **Scope still applies.** A `base` or `worktree` selector naming a graph or checkout outside the session's workspace is refused with `selector_out_of_scope`, and the scope check runs before the readiness check so a session cannot probe a sibling workspace's build state.
+- **Substitution is always labelled.** `exact: false` means the requested view was not served. Every fallback is read-only. Set `require_exact: true` when substitution is unacceptable.
+- **Exact worktree edits are supported through the coordinator-backed write path.** Fallback, inactive ref, and commit views remain read-only and return `view_read_only` for mutation.
+- A view of a committed tree has no working copy, so its files are served out of the object store and a file location is reported as a `gortex-view://<view-fingerprint>/<repo-prefix>/<path>` identity instead of an on-disk path.
+
+The view is resolved before the session's overlay is prepared, so pushed editor buffers layer on top of whatever answers.
+
+### Freshness rider
+
+Every view-aware response says which view answered, in the same `freshness` block file-drift provenance already uses. It always rides on the response envelope's `_meta`, and is additionally merged into the payload where the wire format has a home for it — into a JSON object's own `freshness`, or into a GCX header's meta channel — so a client that reads only the payload still sees it. Shapes with no structural home (TOON, the one-line text form, a diagram) carry it on the envelope alone. An empty field is omitted.
+
+| Field | Meaning |
+|---|---|
+| `requested_view` | the selector the caller sent, rendered as `kind` plus its payload — `auto`, `base:<graph-id>`, `worktree:<checkout-id>`, `git_ref:<ref>` or `git_ref:<graph-id>:<ref>` |
+| `actual_view` | what served the request — a selector string, or the view fingerprint when the server pinned one |
+| `exact` | whether `actual_view` is the view that was requested |
+| `fallback_reason` | why it is not; set exactly when `exact` is false |
+| `view_fingerprint` | identity of the content that answered — the authority half of every `gortex-view://` URI in the same response |
+| `requested_ref` / `resolved_ref` / `resolved_commit` / `resolved_tree` | the ref or object id the selector named, and what it resolved to when the request was served (`resolved_ref` is empty for a `commit` selector) |
+| `build_token` | an in-progress build the caller can poll |
+| `retry_after` | poll hint, in whole seconds |
+| `degraded_capabilities` | capabilities this view does not serve completely that the request did not require — each with the state it was found in |
+| `base_scoped` | capabilities a base-scoped engine answered while a routed view served the request |
+
+### Capability arguments
+
+A view is rarely complete all at once: source bytes are readable long before the syntax graph is resolved, and vector search may never be enabled at all. Three request-level arguments — read and stripped on the same seam as `view` — let a caller state what it needs instead of accepting a silently thin answer.
+
+| Argument | Type | Effect |
+|---|---|---|
+| `require_complete` | bool (a `"true"` / `"false"` string is accepted) | promotes the calling operation's own default capabilities to required |
+| `required_capabilities` | array of names, or one comma-separated string | adds to whatever `require_complete` produced; the request fails if the view cannot serve them |
+| `optional_capabilities` | same shapes | annotates only — never fails a request |
+
+The schemas also publish three consistency controls on every view-aware tool: `require_exact` rejects substitution, `require_fresh` waits until the selected worktree reflects current filesystem state, and `wait_deadline` is the absolute RFC3339 deadline bounding that wait. A deadline without a wait requirement is rejected rather than ignored.
+
+Defaults that were not required are still evaluated and reported under `degraded_capabilities`. A request the base corpus serves is exempt: the base is a plain whole index with no producer rows to read.
+
+The capability vocabulary is closed — an unknown name is refused with `invalid_view_selector` rather than silently requiring nothing:
+
+| Group | Ids |
+|---|---|
+| source | `source.snapshot`, `source.config` |
+| graph | `graph.syntax`, `graph.resolution.local`, `graph.resolution.cross_repo`, `graph.incoming_edges`, `graph.similarity` |
+| search | `search.symbols`, `search.content`, `search.vector`, `search.text` |
+| lsp | `lsp.references`, `lsp.diagnostics`, `lsp.hover`, `lsp.rename`, `lsp.code_actions` |
+
+Each is in one of five states for a given view: `complete`, `incomplete`, `building`, `unavailable`, `disabled_by_config`. A required capability in a terminal state (`unavailable`, `disabled_by_config`, or undeclared by the view) refuses the request with `capability_unavailable` — waiting cannot clear it. One that is merely `building` or `incomplete` refuses with `required_capability_incomplete`, which a retry can clear.
+
+### Typed errors
+
+Every refusal on the view path carries a stable code as the first token of the message. The codes are a wire contract — a client may switch on them, and none is ever reworded.
+
+| Code | Meaning |
+|---|---|
+| `invalid_view_selector` | malformed selector — unknown kind or field, a non-string value, a missing required field, a ref name git itself would reject, an abbreviated object id, or an unresolvable repository for a bare ref |
+| `selector_conflict` | the selector carries a field its kind does not use |
+| `selector_out_of_scope` | the selector names a repository or checkout outside the caller's workspace |
+| `ref_not_commit` | the selector resolved to an object that is not a commit |
+| `ref_not_available_locally` | the ref or object is well-formed but the local object store does not have it |
+| `view_building` | the view exists but is still being built; the response carries `build_token` and `retry_after` (2 s for a ref view) |
+| `view_read_only` | the request would mutate a view that only serves reads |
+| `capability_unavailable` | a required capability cannot be served by this view at all |
+| `required_capability_incomplete` | a required capability exists but is still building or only partly populated |
+| `checkout_inaccessible` | the checkout backing the view cannot be read — not registered, not ready, unmounted, or permission denied |
+| `no_primary` | the family has no primary base graph to compose a view over |
+| `source_object_missing` | the source bytes a result points at are gone from the object store |
+
+A ref view that is rebuilding while already serving an older generation answers with that generation rather than refusing, marked `exact: false` with the `view_building` reason and the build token to poll — so the answer is never mistaken for the requested tree.
+
+### Tools
+
+Checkout administration is one surface with two front doors; the CLI verbs under `gortex repos` call exactly these tools ([cli.md](cli.md#worktrees-and-checkouts)). Every destructive tool previews by default: a call without `confirm` reads the catalog, returns what would happen, and writes nothing.
+
+| Tool | Description |
+|------|-------------|
+| `list_checkouts` | List the checkout families this daemon tracks — per family the primary corpus and epoch, its dedicated graphs, every registered working copy (mode, state, both reconciler clocks with their deadlines, path evidence, route, whether a build coordinator is live) and the views rooted in its graphs. `family` narrows by family id / graph id / repo prefix / a path inside a tracked repo. Reads the catalog only |
+| `set_primary_checkout` | Make one corpus (`graph`: a graph id, repo prefix, or path) the base every automatic checkout of its family composes over. Previews the incumbent, the epoch, whether the move is accepted, and every checkout that must rebuild its layers; `confirm: true` runs it |
+| `forget_checkout` | Remove one checkout (`path`: a path or repo prefix), its corpus and everything rooted in it. Unlike `untrack_repository` it never demotes the checkout into the family's automatic lane. Previews the closure; `confirm: true` runs it |
+| `reconcile_checkouts` | Reconcile families against git and the filesystem now instead of waiting for the janitor — identities confirmed or allocated, the availability and removal clocks moved, build coordinators brought in line. `family` scopes it; omit for every family |
+| `explain_view` | Explain which graph answers for one filesystem `path`: the checkout it binds to, how that checkout is served, its route and the generations behind it — or the step in the chain that could not be taken and left the base corpus to answer |
+
+All five take `format` (`json` default, `gcx`, `toon`) and `max_bytes`.
 
 ## Live editor buffers (overlay sessions)
 

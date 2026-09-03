@@ -178,7 +178,7 @@ func TestRunKimiNoopShapes(t *testing.T) {
 
 func TestRunKimiNoopOutsideGortexProject(t *testing.T) {
 	var calls int
-	restore := stubUserPromptProbeFunc(t, func(string, time.Duration) ([]grepSymbolHit, error) {
+	restore := stubUserPromptProbeFunc(t, func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		calls++
 		return []grepSymbolHit{
 			{Name: "ShouldNotAppear", Kind: "function", FilePath: "internal/nope.go"},
@@ -251,7 +251,7 @@ func writeKimiProjectMCP(t *testing.T, dir string) string {
 
 func stubUserPromptProbe(t *testing.T, hits []grepSymbolHit, err error) func() {
 	t.Helper()
-	return stubUserPromptProbeFunc(t, func(string, time.Duration) ([]grepSymbolHit, error) {
+	return stubUserPromptProbeFunc(t, func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return hits, err
 	})
 }

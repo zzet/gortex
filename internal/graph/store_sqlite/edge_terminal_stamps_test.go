@@ -237,11 +237,11 @@ func terminalStampBenchmarkEdges(count int) []*graph.Edge {
 func TestEdgeTerminalStampStatementUsesFewerAllocationsThanFullAttributes(t *testing.T) {
 	edges := terminalStampBenchmarkEdges(75)
 	narrowAllocs := testing.AllocsPerRun(20, func() {
-		terminalStampBenchmarkQuery, terminalStampBenchmarkArgs = edgeTerminalStampUpdateStatement(edges)
+		terminalStampBenchmarkQuery, terminalStampBenchmarkArgs = edgeTerminalStampUpdateStatement(baseViewGeneration, edges)
 	})
 	fullAllocs := testing.AllocsPerRun(20, func() {
 		var err error
-		terminalStampBenchmarkQuery, terminalStampBenchmarkArgs, err = edgeAttributeUpdateStatement(edges)
+		terminalStampBenchmarkQuery, terminalStampBenchmarkArgs, err = edgeAttributeUpdateStatement(baseViewGeneration, edges)
 		if err != nil {
 			panic(err)
 		}
@@ -258,7 +258,7 @@ func BenchmarkEdgeTerminalStampStatements(b *testing.B) {
 		b.ReportAllocs()
 		b.ReportMetric(float64(len(edges)), "rows/op")
 		for i := 0; i < b.N; i++ {
-			terminalStampBenchmarkQuery, terminalStampBenchmarkArgs = edgeTerminalStampUpdateStatement(edges)
+			terminalStampBenchmarkQuery, terminalStampBenchmarkArgs = edgeTerminalStampUpdateStatement(baseViewGeneration, edges)
 		}
 	})
 	b.Run("full_attributes_75", func(b *testing.B) {
@@ -266,7 +266,7 @@ func BenchmarkEdgeTerminalStampStatements(b *testing.B) {
 		b.ReportMetric(float64(len(edges)), "rows/op")
 		for i := 0; i < b.N; i++ {
 			var err error
-			terminalStampBenchmarkQuery, terminalStampBenchmarkArgs, err = edgeAttributeUpdateStatement(edges)
+			terminalStampBenchmarkQuery, terminalStampBenchmarkArgs, err = edgeAttributeUpdateStatement(baseViewGeneration, edges)
 			if err != nil {
 				b.Fatal(err)
 			}

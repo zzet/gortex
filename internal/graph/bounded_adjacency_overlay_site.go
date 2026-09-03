@@ -5,8 +5,10 @@ import "context"
 var _ BoundedOutgoingSiteEdgeIdentityReader = (*OverlaidView)(nil)
 
 // FindOutgoingSiteEdgeIdentitiesBounded is the exact {source,line} overlay
-// projection. Source ownership is decided once per source, so multiple sites
-// from the same overlay file share one raw adjacency scan.
+// projection. Each site merges the base rows the layer does not supersede with
+// the layer's own, under the same per-edge rule the plain readers apply. Sites
+// are grouped by source, so every site of one source shares a single raw scan
+// of the layer's adjacency.
 func (v *OverlaidView) FindOutgoingSiteEdgeIdentitiesBounded(
 	ctx context.Context,
 	sites []EdgeSourceSite,
@@ -46,10 +48,10 @@ func (v *OverlaidView) FindOutgoingSiteEdgeIdentitiesBounded(
 	}
 
 	baseSites := make([]EdgeSourceSite, 0, len(canonical))
-	overlayCurrent := make(map[string]bool)
+	hiddenSources := make(map[string]bool)
 	for _, site := range canonical {
-		if v.overlayOwnsIdentity(site.From) {
-			overlayCurrent[site.From] = v.layer.nodeByID[site.From] != nil
+		if v.overlayOwnsIdentity(site.From) && v.layer.NodeByID(site.From) == nil {
+			hiddenSources[site.From] = true
 			continue
 		}
 		baseSites = append(baseSites, site)
@@ -78,41 +80,39 @@ func (v *OverlaidView) FindOutgoingSiteEdgeIdentitiesBounded(
 			end++
 		}
 		from := canonical[start].From
-		if current, owned := overlayCurrent[from]; owned {
-			if current {
-				bySite, truncated, scanErr := scanBoundedSiteEdgeIdentities(
-					ctx, v.layer.outEdges[from], canonical[start:end], kindSet, limit, budget,
-					func(identity EdgeIdentity) bool { return v.overlayTargetVisible(identity.To) },
-				)
-				if scanErr != nil {
-					return BoundedSiteEdgeIdentityProjection{}, scanErr
-				}
-				for site, identities := range bySite {
-					projection.BySite[site] = identities
-				}
-				for site := range truncated {
-					projection.Truncated[site] = true
-				}
-			}
+		if hiddenSources[from] {
 			start = end
 			continue
 		}
+		overlayBySite, overlayTruncated, scanErr := scanBoundedSiteEdgeIdentities(
+			ctx, v.layer.OutEdges(from), canonical[start:end], kindSet, limit, budget,
+			func(identity EdgeIdentity) bool { return v.overlayIdentityVisible(identity.To) },
+		)
+		if scanErr != nil {
+			return BoundedSiteEdgeIdentityProjection{}, scanErr
+		}
 		for _, site := range canonical[start:end] {
-			if baseProjection.Truncated[site] {
+			if baseProjection.Truncated[site] || overlayTruncated[site] {
 				projection.Truncated[site] = true
 				continue
 			}
-			identities, truncated, mergeErr := appendBoundedBaseIdentities(
+			baseIdentities, truncated, mergeErr := appendBoundedBaseIdentities(
 				ctx, baseProjection.BySite[site], limit, budget,
 				func(identity EdgeIdentity) bool {
 					return identity.From == site.From && identity.Line == site.Line &&
-						v.overlayTargetVisible(identity.To) && kindRequested(kindSet, identity.Kind)
+						!v.overlayOwnsBaseEdge(identity.From, identity.FilePath) &&
+						v.overlayIdentityVisible(identity.To) && kindRequested(kindSet, identity.Kind)
 				},
 			)
 			if mergeErr != nil {
 				return BoundedSiteEdgeIdentityProjection{}, mergeErr
 			}
 			if truncated {
+				projection.Truncated[site] = true
+				continue
+			}
+			identities, capped := mergeBoundedIdentitySlices(baseIdentities, overlayBySite[site], limit)
+			if capped {
 				projection.Truncated[site] = true
 				continue
 			}

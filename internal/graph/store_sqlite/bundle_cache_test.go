@@ -35,15 +35,15 @@ func TestBundleCache_ServesOnlyValidatedFingerprints(t *testing.T) {
 
 	// No fingerprint reported for the package yet -> store is a no-op
 	// (conservative: never cache an unvalidated bundle).
-	c.store(b)
-	if _, ok := c.lookup("pkg/x.go::A"); ok {
+	c.store(baseViewGeneration, b)
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); ok {
 		t.Fatal("bundle was cached despite no package fingerprint")
 	}
 
 	// Report a fingerprint, then store: now it caches and serves.
 	c.refresh(map[string]uint64{"pkg": 100})
-	c.store(b)
-	if _, ok := c.lookup("pkg/x.go::A"); !ok {
+	c.store(baseViewGeneration, b)
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); !ok {
 		t.Fatal("bundle should be served once its package fingerprint is known")
 	}
 }
@@ -51,15 +51,15 @@ func TestBundleCache_ServesOnlyValidatedFingerprints(t *testing.T) {
 func TestBundleCache_InvalidatesOnFingerprintChange(t *testing.T) {
 	c := newTestBundleCache()
 	c.refresh(map[string]uint64{"pkg": 1})
-	c.store(graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
+	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
 
-	if _, ok := c.lookup("pkg/x.go::A"); !ok {
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); !ok {
 		t.Fatal("expected a cache hit on the unchanged fingerprint")
 	}
 
 	// Fingerprint changes -> the entry is invalidated.
 	c.refresh(map[string]uint64{"pkg": 2})
-	if _, ok := c.lookup("pkg/x.go::A"); ok {
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); ok {
 		t.Fatal("entry must be dropped when its package fingerprint changes")
 	}
 }
@@ -72,18 +72,18 @@ func TestBundleCache_CrossRepoIsolation(t *testing.T) {
 		"repoA/pkg": 10,
 		"repoB/pkg": 20,
 	})
-	c.store(graph.SymbolBundle{Node: mkFnNode("repoA/pkg/x.go::A", "A", "repoA/pkg/x.go")})
-	c.store(graph.SymbolBundle{Node: mkFnNode("repoB/pkg/x.go::A", "A", "repoB/pkg/x.go")})
+	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("repoA/pkg/x.go::A", "A", "repoA/pkg/x.go")})
+	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("repoB/pkg/x.go::A", "A", "repoB/pkg/x.go")})
 
 	// Bumping only repoA's fingerprint must not touch repoB's entry.
 	c.refresh(map[string]uint64{
 		"repoA/pkg": 11,
 		"repoB/pkg": 20,
 	})
-	if _, ok := c.lookup("repoA/pkg/x.go::A"); ok {
+	if _, ok := c.lookup(baseViewGeneration, "repoA/pkg/x.go::A"); ok {
 		t.Fatal("repoA entry should have been invalidated")
 	}
-	if _, ok := c.lookup("repoB/pkg/x.go::A"); !ok {
+	if _, ok := c.lookup(baseViewGeneration, "repoB/pkg/x.go::A"); !ok {
 		t.Fatal("repoB entry must survive a repoA-only fingerprint bump")
 	}
 }
@@ -258,7 +258,7 @@ func TestBundleCache_ByteBudgetEvictionAtBoundary(t *testing.T) {
 	c.maxBytes = unit * k // budget holds exactly k entries
 
 	for i := 0; i < k; i++ {
-		c.store(mk(i))
+		c.store(baseViewGeneration, mk(i))
 	}
 	if len(c.entries) != k {
 		t.Fatalf("expected %d entries filling the budget, got %d", k, len(c.entries))
@@ -269,17 +269,17 @@ func TestBundleCache_ByteBudgetEvictionAtBoundary(t *testing.T) {
 
 	// One more entry crosses the budget -> wholesale clear, only the newest
 	// survives and the byte total resets to a single unit.
-	c.store(mk(k))
+	c.store(baseViewGeneration, mk(k))
 	if len(c.entries) != 1 {
 		t.Fatalf("crossing the budget must clear wholesale to 1 entry, got %d", len(c.entries))
 	}
 	if c.curBytes != unit {
 		t.Fatalf("curBytes after clear = %d, want %d", c.curBytes, unit)
 	}
-	if _, ok := c.lookup(fmt.Sprintf("pkg/x.go::N%03d", k)); !ok {
+	if _, ok := c.lookup(baseViewGeneration, fmt.Sprintf("pkg/x.go::N%03d", k)); !ok {
 		t.Fatal("the entry that triggered the clear must remain served")
 	}
-	if _, ok := c.lookup("pkg/x.go::N000"); ok {
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::N000"); ok {
 		t.Fatal("a pre-clear entry must be gone after the wholesale clear")
 	}
 }
@@ -290,8 +290,8 @@ func TestBundleCache_RefusesEntryLargerThanBudget(t *testing.T) {
 	b := graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")}
 	c.maxBytes = bundleEntryBytes(b) - 1 // budget just below a single entry
 
-	c.store(b)
-	if _, ok := c.lookup("pkg/x.go::A"); ok {
+	c.store(baseViewGeneration, b)
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); ok {
 		t.Fatal("an entry larger than the whole budget must not be cached")
 	}
 	if len(c.entries) != 0 || c.curBytes != 0 {
@@ -327,11 +327,11 @@ func TestBundleCache_DisabledMode(t *testing.T) {
 		t.Fatalf("expected a disabled cache (maxBytes 0), got %d", c.maxBytes)
 	}
 	c.refresh(map[string]uint64{"pkg": 1})
-	c.store(graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
+	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
 	if len(c.entries) != 0 {
 		t.Fatalf("a disabled cache must not store, got %d entries", len(c.entries))
 	}
-	if _, ok := c.lookup("pkg/x.go::A"); ok {
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); ok {
 		t.Fatal("a disabled cache must always miss")
 	}
 
@@ -379,9 +379,9 @@ func TestBundleCache_ConcurrentReadInsert(t *testing.T) {
 				id := fmt.Sprintf("pkg/x.go::N%d_%d", w, i%64)
 				switch i % 3 {
 				case 0:
-					c.store(graph.SymbolBundle{Node: mkFnNode(id, "W", "pkg/x.go")})
+					c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode(id, "W", "pkg/x.go")})
 				case 1:
-					_, _ = c.lookup(id)
+					_, _ = c.lookup(baseViewGeneration, id)
 				default:
 					c.refresh(map[string]uint64{"pkg": uint64(i)})
 				}

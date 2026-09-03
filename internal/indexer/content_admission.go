@@ -106,10 +106,19 @@ type untrackedAssetGate struct {
 }
 
 // newUntrackedAssetGate builds the gate, returning nil (inert) when the flag
-// is off, no asset extractors are registered, or the tracked set can't be
-// resolved.
+// is off, a content source is installed, no asset extractors are registered,
+// or the tracked set can't be resolved.
 func (idx *Indexer) newUntrackedAssetGate(ctx context.Context, absRoot string) *untrackedAssetGate {
 	if !idx.config.SkipUntrackedAssets {
+		return nil
+	}
+	if idx.contentSource() != nil {
+		// The gate's whole question is "does git track this working-tree
+		// path", and a snapshot source serves a revision the checkout is not
+		// necessarily at — every path in it is by definition committed, and
+		// `git ls-files` describes the wrong tree. The gate goes inert rather
+		// than answering from a state the pass is not reading, and the index
+		// declares the omission in its producer state.
 		return nil
 	}
 	classes := idx.registry.AssetClasses()

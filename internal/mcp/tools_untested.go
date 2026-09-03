@@ -29,7 +29,10 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 	filePrefix := req.GetString("file_prefix", "")
 	minFanIn := req.GetInt("min_fan_in", 0)
 
-	covered := reachableFromTests(s.graph)
+	// One reader for the whole call: both passes below must see the same
+	// state, and under an overlay that state is the caller's buffers.
+	reader := s.readerFor(ctx)
+	covered := reachableFromTests(reader)
 
 	// Fan-in map for ranking — incoming calls/references only; imports and
 	// defines would flood every exported symbol with meaningless coverage.
@@ -37,7 +40,7 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 	// count(*) join — on a disk backend the legacy AllEdges() loop
 	// materialised every edge over the storage boundary just to bucket two kinds. The
 	// fallback walks AllEdges() as before.
-	fanIn := collectFanInByKind(s.graph, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences})
+	fanIn := collectFanInByKind(reader, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences})
 
 	type untestedEntry struct {
 		ID       string `json:"id"`
@@ -123,8 +126,10 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 // The BFS itself runs through graph.ReachableForwardByKinds when the
 // backend implements it (one query per layer over the frontier
 // IN-list instead of N+1 GetOutEdges round-trips). Falls back to
-// the per-id GetOutEdges loop on backends that don't.
-func reachableFromTests(g graph.Store) map[string]bool {
+// the per-id GetOutEdges loop on backends that don't — an overlay
+// view is one of those, so an overlay-active request walks the
+// buffers edge by edge instead of the backend's index.
+func reachableFromTests(g graph.Reader) map[string]bool {
 	// Seed: every function/method defined in a test file. NodesByKind
 	// pushes the kind filter into the backend; isTestFile stays Go.
 	seeds := make([]string, 0)
@@ -179,8 +184,9 @@ func reachableFromTests(g graph.Store) map[string]bool {
 // every edge whose kind is in the allowlist. Prefers the
 // graph.InEdgeCounter capability — backends that ship it run one
 // count(*) per request instead of an AllEdges() materialisation
-// + Go-side bucketing.
-func collectFanInByKind(g graph.Store, kinds []graph.EdgeKind) map[string]int {
+// + Go-side bucketing. An overlay view has no counter, so an
+// overlay-active request buckets its edges Go-side.
+func collectFanInByKind(g graph.Reader, kinds []graph.EdgeKind) map[string]int {
 	if len(kinds) == 0 {
 		return map[string]int{}
 	}

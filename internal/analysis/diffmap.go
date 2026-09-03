@@ -79,7 +79,7 @@ type DiffResult struct {
 // The daemon keys every file path as "<prefix>/<rel>" while git emits
 // repo-relative paths; empty only for the standalone Indexer, which
 // mints unprefixed paths.
-func MapGitDiff(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
+func MapGitDiff(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
 	if err := gitcmd.ValidateRef(baseRef); err != nil {
 		return nil, err
 	}
@@ -158,7 +158,7 @@ func RepoRelPath(repoPrefix, path string, domain PathDomain) string {
 // which resolved a legitimate git-relative "<prefix>/<rel>" against the
 // same-named top-level file instead — and returned nil when that shadow did
 // not exist, never trying the real key.
-func JoinFileNodes(g graph.Store, repoPrefix, path string, domain PathDomain) []*graph.Node {
+func JoinFileNodes(g graph.Reader, repoPrefix, path string, domain PathDomain) []*graph.Node {
 	return g.GetFileNodes(GraphKey(repoPrefix, path, domain))
 }
 
@@ -167,7 +167,7 @@ func JoinFileNodes(g graph.Store, repoPrefix, path string, domain PathDomain) []
 // hunk in its file, deduped, plus the changed-file set. ChangedFiles keeps
 // the diff-relative paths (callers re-join them with git pathspecs); only
 // the node lookup is prefix-aware.
-func joinHunksToSymbols(g graph.Store, repoPrefix string, hunks []DiffHunk, files []FileChange) *DiffResult {
+func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, files []FileChange) *DiffResult {
 	result := &DiffResult{Hunks: hunks, FileChanges: files}
 
 	fileSet := make(map[string]bool)
@@ -398,7 +398,7 @@ func parseNewStart(line string) (int, bool) {
 // The returned *DiffResult is computed with the same logic as MapGitDiff (only
 // the diff's context width differs), so symbol overlap is unaffected.
 // repoPrefix anchors the node join exactly as in MapGitDiff.
-func MapGitDiffWithLines(g graph.Store, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, map[string][]HunkLine, error) {
+func MapGitDiffWithLines(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, map[string][]HunkLine, error) {
 	if err := gitcmd.ValidateRef(baseRef); err != nil {
 		return nil, nil, err
 	}

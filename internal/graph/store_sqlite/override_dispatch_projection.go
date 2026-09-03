@@ -60,13 +60,13 @@ func (s *Store) overrideDispatchCallPage(
 
 	query := `SELECT e.id, e.from_id, e.to_id, e.file_path, e.line, e.meta, caller.language
 FROM edges AS e INDEXED BY edges_by_kind
-JOIN nodes AS caller ON caller.id = e.from_id
-WHERE e.kind = ? AND e.id > ? AND e.id <= ?
+JOIN nodes AS caller ON caller.id = e.from_id AND caller.view_gen = e.view_gen
+WHERE e.kind = ? AND e.id > ? AND e.id <= ? AND e.view_gen = ?
   AND (substr(e.to_id, 1, 12) = 'unresolved::'
        OR instr(e.to_id, '::unresolved::') > 0)
   AND caller.language IN ('java', 'php')`
-	args := make([]any, 0, len(repoPrefixes)+4)
-	args = append(args, string(graph.EdgeCalls), after, highWater)
+	args := make([]any, 0, len(repoPrefixes)+5)
+	args = append(args, string(graph.EdgeCalls), after, highWater, s.viewGen)
 	if repoPrefixes != nil {
 		query += ` AND e.from_repo IN (` + inPlaceholders(len(repoPrefixes)) + `)`
 		args = append(args, toAnyArgs(repoPrefixes)...)

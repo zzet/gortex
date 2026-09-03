@@ -92,7 +92,7 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// and tools/list answers an empty/track-only list, instead of a
 	// connection-poisoning errored initialize. Only tools/call is refused (with
 	// the structured not-tracked error the agent can act on).
-	untracked := sess.CWD != "" && !d.cwdReachable(sess.CWD)
+	untracked := sess.CWD != "" && !d.cwdReachable(ctx, sess.CWD)
 	if untracked {
 		d.logUncoveredCWDOnce(sess)
 	}
@@ -312,6 +312,7 @@ func (d *mcpDispatcher) SessionEnded(sess *daemon.Session) {
 // Reachable when:
 //   - cwd is empty (no opinion — control-style sessions),
 //   - cwd is inside a locally tracked repo,
+//   - cwd is a registered checkout of a tracked family,
 //   - or the router resolves cwd to a known workspace via an
 //     explicit signal: scope-override, .gortex.yaml::workspace, or a
 //     server's declared workspaces / cached roster.
@@ -321,7 +322,7 @@ func (d *mcpDispatcher) SessionEnded(sess *daemon.Session) {
 // silently route to whatever server happens to be marked default
 // in servers.toml, which is the same wrong-result class
 // repo_not_tracked is meant to prevent.
-func (d *mcpDispatcher) cwdReachable(cwd string) bool {
+func (d *mcpDispatcher) cwdReachable(ctx context.Context, cwd string) bool {
 	if cwd == "" {
 		return true
 	}
@@ -349,6 +350,15 @@ func (d *mcpDispatcher) cwdReachable(cwd string) bool {
 		if _, _, ok := d.multiIndexer.ContainedReposScope(cwd); ok {
 			return true
 		}
+	}
+	// Checkout fallback: a git worktree of a tracked family is a directory
+	// the repository registry never covers, so neither arm above sees it —
+	// yet the view catalog binds it to the family's primary and sessionScope
+	// resolves it through the same lookup. Refusing it here made that arm
+	// unreachable and left every worktree session with repo_not_tracked and a
+	// remedy that would have indexed the worktree as a second repository.
+	if d.srv != nil && d.srv.CheckoutServesCWD(ctx, cwd) {
+		return true
 	}
 	rtr := d.router.Load()
 	if rtr == nil {
@@ -380,7 +390,7 @@ func (d *mcpDispatcher) isCWDTracked(cwd string) bool {
 	// `c:\repo` vs the config's `C:\repo`). A byte compare would reject
 	// it and publish zero tools; HasPathPrefix folds both first (#277).
 	for _, meta := range d.multiIndexer.AllMetadata() {
-		if pathkey.HasPathPrefix(cwd, meta.RootPath) {
+		if pathkey.CanonicalHasPathPrefix(cwd, meta.RootPath) {
 			return true
 		}
 	}

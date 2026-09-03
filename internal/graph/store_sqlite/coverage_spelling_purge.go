@@ -41,6 +41,10 @@ var coverageNodeSidecarTables = []string{
 	"coverage_enrichment",
 	"release_enrichment",
 	"blame_enrichment",
+	// A generation tombstone masks a base node in a sparse view generation.
+	// Purging the base node it names leaves that mask pointing at nothing, so
+	// it is cleared here alongside the other node_id-keyed sidecars.
+	"generation_node_tombstones",
 }
 
 // purgeLegacyCoverageSpellings removes the coverage-domain rows that

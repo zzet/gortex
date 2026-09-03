@@ -144,7 +144,7 @@ func (s *Server) localizationSourceWindowForHit(
 		strings.TrimSpace(anchorSymbol) == "" {
 		return nil
 	}
-	absPath, displayPath, err := s.resolveFilePath(hit.matchPath)
+	absPath, displayPath, err := s.resolveFilePath(ctx, hit.matchPath)
 	if err != nil {
 		return nil
 	}

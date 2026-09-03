@@ -131,7 +131,7 @@ type prReviewSimulation struct {
 // changed set without the caller having to hand-author proposed signatures —
 // the broken-edge gate is "does this symbol's surface still hold for everyone
 // who depends on it". Symbols with no recorded signature are skipped.
-func changedSymbolsToSignatureChanges(g graph.Store, changed []analysis.ChangedSymbol) []analysis.SignatureChange {
+func changedSymbolsToSignatureChanges(g graph.Reader, changed []analysis.ChangedSymbol) []analysis.SignatureChange {
 	if g == nil {
 		return nil
 	}
@@ -180,7 +180,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		ids  []string
 	)
 	if idsArg := strings.TrimSpace(req.GetString("ids", "")); idsArg != "" {
-		diff = s.prReviewDiffFromIDs(idsArg)
+		diff = s.prReviewDiffFromIDs(ctx, idsArg)
 		for _, cs := range diff.ChangedSymbols {
 			ids = append(ids, cs.ID)
 		}
@@ -188,7 +188,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		if repoRoot == "" {
 			return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
 		}
-		d, err := analysis.MapGitDiff(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
+		d, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -218,9 +218,9 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		verifyGate   *reviewGate
 	)
 	if wantVerify {
-		changes := changedSymbolsToSignatureChanges(s.graph, diff.ChangedSymbols)
+		changes := changedSymbolsToSignatureChanges(s.readerFor(ctx), diff.ChangedSymbols)
 		if len(changes) > 0 {
-			verifyResult = analysis.VerifyChanges(s.graph, s.engine, changes)
+			verifyResult = analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
 			out.Verify = verifyResult
 			g := prReviewVerifyGate(verifyResult)
 			verifyGate = &g
@@ -237,7 +237,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- composite impact (verdict input; also exposed) ---
 	if len(ids) > 0 {
-		imp := analysis.AnalyzeImpact(s.graph, ids, communities, processes)
+		imp := analysis.AnalyzeImpact(s.readerFor(ctx), ids, communities, processes)
 		out.Impact = &prReviewImpact{
 			Risk:          string(imp.Risk),
 			TotalAffected: imp.TotalAffected,
@@ -269,8 +269,9 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- guards gate (architecture + co-change / boundary rules) ---
 	if len(ids) > 0 && (s.hasGuardRules(ids) || !s.architecture.IsEmpty()) {
-		guards := s.evaluateGuards(ids)
-		guards = append(guards, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
+		guardReader := s.readerFor(ctx)
+		guards := s.evaluateGuards(guardReader, ids)
+		guards = append(guards, analysis.EvaluateArchitecture(guardReader, s.architecture, ids)...)
 		out.Guards = guards
 		out.Gates = append(out.Gates, prReviewGuardGate(guards))
 	}
@@ -287,7 +288,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- section: audit_agent_config ---
 	if wantAudit {
-		report := s.buildConfigAuditSection(repoRoot)
+		report := s.buildConfigAuditSection(ctx, repoRoot)
 		out.ConfigAudit = report
 		out.Gates = append(out.Gates, prReviewAuditGate(report))
 	}
@@ -313,8 +314,9 @@ func (s *Server) prReviewRepoRoot(ctx context.Context, req mcp.CallToolRequest) 
 // prReviewDiffFromIDs synthesises a DiffResult from caller-supplied symbol
 // IDs so the rollup can run without a working tree. Each ID resolves to its
 // graph node for the name / kind / file, and the file set is unioned.
-func (s *Server) prReviewDiffFromIDs(idsArg string) *analysis.DiffResult {
+func (s *Server) prReviewDiffFromIDs(ctx context.Context, idsArg string) *analysis.DiffResult {
 	diff := &analysis.DiffResult{}
+	reader := s.readerFor(ctx)
 	fileSet := map[string]bool{}
 	for _, raw := range strings.Split(idsArg, ",") {
 		id := strings.TrimSpace(raw)
@@ -322,7 +324,7 @@ func (s *Server) prReviewDiffFromIDs(idsArg string) *analysis.DiffResult {
 			continue
 		}
 		cs := analysis.ChangedSymbol{ID: id}
-		if node := s.graph.GetNode(id); node != nil {
+		if node := reader.GetNode(id); node != nil {
 			cs.Name = node.Name
 			cs.Kind = string(node.Kind)
 			cs.FilePath = node.FilePath
@@ -345,6 +347,7 @@ func (s *Server) prReviewDiffFromIDs(idsArg string) *analysis.DiffResult {
 func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.DiffResult, communities *analysis.CommunityResult, processes *analysis.ProcessResult) []diffContextSymbol {
 	const cap = 50
 	engine := s.engineFor(ctx)
+	reader := s.readerFor(ctx)
 
 	// Pre-compute per-file risk so every symbol in a file shares one tier.
 	fileIDs := map[string][]string{}
@@ -352,7 +355,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 		if cs.ID == "" {
 			continue
 		}
-		node := s.graph.GetNode(cs.ID)
+		node := reader.GetNode(cs.ID)
 		if node == nil || node.FilePath == "" {
 			continue
 		}
@@ -360,7 +363,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 	}
 	fileRisk := map[string]string{}
 	for fp, fids := range fileIDs {
-		imp := analysis.AnalyzeImpact(s.graph, fids, communities, processes)
+		imp := analysis.AnalyzeImpact(reader, fids, communities, processes)
 		fileRisk[fp] = string(imp.Risk)
 	}
 
@@ -369,7 +372,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 		if len(syms) >= cap {
 			break
 		}
-		node := s.graph.GetNode(cs.ID)
+		node := reader.GetNode(cs.ID)
 		if node == nil {
 			continue
 		}
@@ -411,7 +414,7 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 
 // buildConfigAuditSection runs the agent-config drift audit over the repo's
 // discovered config files. Returns nil when no root or no config files.
-func (s *Server) buildConfigAuditSection(repoRoot string) *audit.Report {
+func (s *Server) buildConfigAuditSection(ctx context.Context, repoRoot string) *audit.Report {
 	root := repoRoot
 	if root == "" && s.indexer != nil {
 		root = s.indexer.RootPath()
@@ -423,7 +426,7 @@ func (s *Server) buildConfigAuditSection(repoRoot string) *audit.Report {
 	if len(files) == 0 {
 		return &audit.Report{Root: root, FilesScanned: 0}
 	}
-	return audit.Audit(s.graph, root, files)
+	return audit.Audit(s.readerFor(ctx), root, files)
 }
 
 // buildPRReviewSimulation runs the optional simulation section. It is gated
@@ -438,12 +441,12 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 	editsArg := strings.TrimSpace(req.GetString("edits", ""))
 	if editsArg == "" {
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true,
-				Note: "no `edits` supplied — pass a JSON array of WorkspaceEdit objects to run the simulation section",
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewPass,
-				Detail: "skipped: no edits supplied",
-			}, nil
+			Ran: false, GraphUntouched: true,
+			Note: "no `edits` supplied — pass a JSON array of WorkspaceEdit objects to run the simulation section",
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewPass,
+			Detail: "skipped: no edits supplied",
+		}, nil
 	}
 
 	sessionID := strings.TrimSpace(req.GetString("session_id", ""))
@@ -452,23 +455,23 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 	}
 	if sessionID == "" {
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true,
-				Note: "simulation section skipped: pass an explicit `session_id` (an overlay session) — the simulation is not run against a synthesized or empty session",
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewPass,
-				Detail: "skipped: no overlay session id",
-			}, nil
+			Ran: false, GraphUntouched: true,
+			Note: "simulation section skipped: pass an explicit `session_id` (an overlay session) — the simulation is not run against a synthesized or empty session",
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewPass,
+			Detail: "skipped: no overlay session id",
+		}, nil
 	}
 
 	edits, err := parsePRReviewEdits(editsArg)
 	if err != nil {
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true, SessionID: sessionID,
-				Note: "invalid edits: " + err.Error(),
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewWarn,
-				Detail: "invalid edits: " + err.Error(),
-			}, nil
+			Ran: false, GraphUntouched: true, SessionID: sessionID,
+			Note: "invalid edits: " + err.Error(),
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewWarn,
+			Detail: "invalid edits: " + err.Error(),
+		}, nil
 	}
 
 	// Run the chain on top of the named session's overlay. buildSimulation
@@ -481,12 +484,12 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 			return nil, reviewGate{}, ctxErr
 		}
 		return &prReviewSimulation{
-				Ran: false, GraphUntouched: true, SessionID: sessionID,
-				Note: "simulation failed: " + simErr.Error(),
-			}, reviewGate{
-				Name: "simulate_chain", Status: prReviewWarn,
-				Detail: "simulation failed: " + simErr.Error(),
-			}, nil
+			Ran: false, GraphUntouched: true, SessionID: sessionID,
+			Note: "simulation failed: " + simErr.Error(),
+		}, reviewGate{
+			Name: "simulate_chain", Status: prReviewWarn,
+			Detail: "simulation failed: " + simErr.Error(),
+		}, nil
 	}
 
 	steps := make([]map[string]any, 0, len(sim.steps))

@@ -14,8 +14,10 @@ type RuleFamily interface {
 	// Name identifies the family for provenance on each finding.
 	Name() string
 	// Evaluate checks a set of changed symbol IDs against the family's rules
-	// and returns the violations, each carrying its own severity.
-	Evaluate(g graph.Store, changedSet []string) []GuardViolation
+	// and returns the violations, each carrying its own severity. Families
+	// only read, so the caller hands over its own reader and an
+	// overlay-active request is gated on the buffers it pushed.
+	Evaluate(g graph.Reader, changedSet []string) []GuardViolation
 }
 
 // ArchitectureFamily adapts the declarative architecture: layer DSL.
@@ -25,7 +27,7 @@ type ArchitectureFamily struct {
 
 func (f ArchitectureFamily) Name() string { return "architecture" }
 
-func (f ArchitectureFamily) Evaluate(g graph.Store, changedSet []string) []GuardViolation {
+func (f ArchitectureFamily) Evaluate(g graph.Reader, changedSet []string) []GuardViolation {
 	if f.Config.IsEmpty() {
 		return nil
 	}

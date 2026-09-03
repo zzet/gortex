@@ -17,6 +17,7 @@ gortex context [flags]       Generate portable context briefing for a task
 gortex savings [flags]       Token-savings dashboard (Today / Last 7 days / All time + USD avoided)
 gortex status [flags]        Show index status (per-repo and per-project in multi-repo mode)
 gortex repos [--json]        List every tracked repo with git head-commit SHA, last-indexed time, and a freshness flag (MISSING when the path is gone)
+gortex repos <sub>           families / explain-view / forget / reconcile / set-primary — worktree and checkout administration
 gortex track <path>          Add a repository to the tracked workspace
 gortex untrack <path>        Remove a repository from the tracked workspace
 gortex workspace <sub>       list [--json] / set / set-all — manage workspace + project slugs across tracked repos
@@ -47,10 +48,15 @@ gortex daemon start --detach --http-addr 127.0.0.1:7411 --log-level debug
                                     # --detach forwards every other flag to the background process,
                                     # so a detached start behaves like the same command without it
 gortex daemon status                # PID, uptime, memory, tracked repos, sessions, server roster, search backend, warmup + enrichment progress
+                                    # Answers while a track / reload / enrichment holds the daemon: the repo
+                                    # table is then the last one computed and the heading says so
+                                    # ("cached 45s ago — a track/reload is in progress"). Everything else —
+                                    # readiness, runtime, the view census — is live either way.
 gortex daemon status --exact        # recount nodes/edges from the store instead of reading the counters the
                                     # indexer maintains, and repair any that have drifted. Proportional to the
                                     # whole corpus — tens of seconds on a large store — so it waits without a
-                                    # timeout. Routine status never scans.
+                                    # timeout, and waits for the busy daemon rather than serving the cached
+                                    # table. Routine status never scans.
 gortex daemon stop                  # graceful shutdown; the graph store is already on disk
 gortex daemon restart               # stop + start
 gortex daemon reload                # re-read the global config AND every tracked repo's .gortex.yaml, pick up new/removed repos
@@ -94,6 +100,70 @@ gortex mcp --index /path/to/repo --watch
 # Require the shared daemon even when embedded fallback is globally allowed.
 gortex mcp --proxy
 ```
+
+## Worktrees and checkouts
+
+Checkout and worktree administration lives under **`gortex repos`** — there is no
+`gortex checkouts` command. Each subcommand is a thin shell over one daemon tool,
+so the CLI and an agent over MCP get the same answer from the same handler; see
+[mcp.md](mcp.md#worktree-views-and-checkouts) for the tools and their payloads.
+
+| Command | MCP tool | Argument |
+|---|---|---|
+| `repos families` | `list_checkouts` | none |
+| `repos set-primary <graph\|prefix\|path>` | `set_primary_checkout` | the corpus to promote |
+| `repos forget <path\|prefix>` | `forget_checkout` | the checkout to remove |
+| `repos reconcile [family\|prefix\|path]` | `reconcile_checkouts` | one family; omit for every family |
+| `repos explain-view <path>` | `explain_view` | a filesystem path |
+
+All five accept `--index` / `--repo <path>` (default `.`) to name the repository
+the daemon must track, and `--format text|json` (default `text`). The `--json`
+flag on the bare `gortex repos` table is unrelated and does not apply here.
+
+```bash
+gortex repos families                              # every family the daemon tracks
+gortex repos families --family backend --format json
+gortex repos explain-view ../feature-worktree/internal/auth/login.go
+gortex repos reconcile                             # reconcile every family now
+gortex repos forget ../old-worktree                # preview
+gortex repos forget ../old-worktree --confirm      # run it
+```
+
+**`families`** reads the catalog and stats nothing on disk. Per family it prints
+the primary corpus and its epoch, every dedicated graph (`primary`, `served`,
+active generation), every registered working copy (`<effective mode>/<state>`,
+its HEAD — `detached@<short sha>` when there is no ref — graph, whether a build
+coordinator is live, tracking intents, the route with its epoch and commit /
+dirty generations, both reconciler clocks with their deadlines, and the last path
+evidence), and the ref and commit views rooted in its graphs. `--family` narrows
+to one family by family id, graph id, repo prefix, or a path inside a tracked
+repository. Run `repos reconcile` first for a fresh look at the filesystem.
+
+**`set-primary`** and **`forget`** preview by default and write nothing. Both
+close the preview with the command that carries the same request through, so the
+`--confirm` run is a copy-paste rather than a re-derivation.
+
+- `set-primary` previews the incumbent, the family's epoch, whether the move
+  would be accepted, and every automatic checkout that has to rebuild its layers
+  over the new base. Confirmed, it reports how many rebuilt and which kept their
+  old route because they could not finish in time.
+- `forget` previews the plan, the closure it would remove, what it would keep,
+  and any blockers — an intent another tracking source still holds blocks it.
+  Confirmed, it reports the revoked intents and the removed node and edge counts.
+  It is the deliberate removal: unlike `gortex untrack` it never demotes the
+  checkout into its family's automatic lane.
+
+**`reconcile`** runs the pass the janitor runs on its own schedule: identities
+are confirmed or allocated, the availability and removal clocks move, and the
+build coordinators are brought in line with the verdicts. It prints one row per
+checkout (`admin name`, action, path) and closes with a summary line — families
+reconciled, checkouts removed, coordinators live, generations retired, view
+generations retired.
+
+**`explain-view`** walks one path's binding chain: the checkout the path binds
+to, the graph that answers for it, the route and the generations behind it,
+whether a composed view served it, and — when none did — the step in the chain
+that could not be taken and left the base corpus to answer.
 
 ## Query subcommands
 

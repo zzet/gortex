@@ -22,7 +22,7 @@ func TestCursorMetadataDecodedBeforeRowsNext(t *testing.T) {
 		{From: "b", To: "a", Kind: graph.EdgeCalls, FilePath: "b.go", Line: 2, Meta: map[string]any{"payload": payloadB}},
 	})
 
-	nodeRows, err := store.db.Query(`SELECT ` + nodeInsertColumns + ` FROM nodes ORDER BY id`)
+	nodeRows, err := store.db.Query(`SELECT ` + lookupNodeCols + ` FROM nodes ORDER BY id`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestCursorMetadataDecodedBeforeRowsNext(t *testing.T) {
 	assertMetadataPayload(t, nodesByID(nodes)["a"].Meta, payloadA)
 	assertMetadataPayload(t, nodesByID(nodes)["b"].Meta, payloadB)
 
-	edgeRows, err := store.db.Query(`SELECT ` + edgeInsertColumns + ` FROM edges ORDER BY id`)
+	edgeRows, err := store.db.Query(`SELECT ` + lookupEdgeCols + ` FROM edges ORDER BY id`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func benchmarkNodeMetadataCursor(b *testing.B, store *Store, raw bool) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := store.db.Query(`SELECT ` + nodeInsertColumns + ` FROM nodes ORDER BY id`)
+		rows, err := store.db.Query(`SELECT ` + lookupNodeCols + ` FROM nodes ORDER BY id`)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -204,7 +204,7 @@ func benchmarkEdgeMetadataCursor(b *testing.B, store *Store, raw bool) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := store.db.Query(`SELECT ` + edgeInsertColumns + ` FROM edges ORDER BY id`)
+		rows, err := store.db.Query(`SELECT ` + lookupEdgeCols + ` FROM edges ORDER BY id`)
 		if err != nil {
 			b.Fatal(err)
 		}

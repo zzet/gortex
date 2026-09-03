@@ -79,7 +79,7 @@ func (s *Server) handleContractBridges(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	groups := s.collectBridgeGroups(allowed)
+	groups := s.collectBridgeGroups(ctx, allowed)
 	if len(groups) == 0 {
 		return mcp.NewToolResultError("no contract bridges materialized — index repositories with matched provider/consumer contracts first"), nil
 	}
@@ -100,10 +100,11 @@ func (s *Server) handleContractBridges(ctx context.Context, req mcp.CallToolRequ
 // Meta as fallback so the view survives a daemon restart that hasn't
 // rehydrated the registry yet). A non-nil allowed set scopes the
 // result to bridges touching at least one allowed repo.
-func (s *Server) collectBridgeGroups(allowed map[string]bool) []*bridgeGroupResult {
+func (s *Server) collectBridgeGroups(ctx context.Context, allowed map[string]bool) []*bridgeGroupResult {
 	registry := s.effectiveContractRegistry()
+	g := s.readerFor(ctx)
 	var out []*bridgeGroupResult
-	for n := range s.graph.NodesByKind(graph.KindContractBridge) {
+	for n := range g.NodesByKind(graph.KindContractBridge) {
 		if n == nil || n.Meta == nil {
 			continue
 		}
@@ -131,7 +132,7 @@ func (s *Server) collectBridgeGroups(allowed map[string]bool) []*bridgeGroupResu
 			project:   bridgeBoundarySlug("", n.Meta, "project", n.RepoPrefix),
 		}
 
-		for _, e := range s.graph.GetOutEdges(n.ID) {
+		for _, e := range g.GetOutEdges(n.ID) {
 			if e.Kind != graph.EdgeBridges {
 				continue
 			}
@@ -141,7 +142,7 @@ func (s *Server) collectBridgeGroups(allowed map[string]bool) []*bridgeGroupResu
 					side = v
 				}
 			}
-			provs, cons := s.bridgeSideEntries(registry, e.To, side, bnd)
+			provs, cons := bridgeSideEntries(g, registry, e.To, side, bnd)
 			grp.Providers = append(grp.Providers, provs...)
 			grp.Consumers = append(grp.Consumers, cons...)
 		}
@@ -199,7 +200,7 @@ func bridgeBoundarySlug(explicit string, meta map[string]any, key, repoPrefix st
 // contract node). Records outside the bridge's match boundary are
 // filtered out so a same-ID contract in an unrelated workspace is not
 // listed as a participant.
-func (s *Server) bridgeSideEntries(registry *contracts.Registry, contractID, side string, bnd bridgeBoundary) (provs, cons []bridgeSideEntry) {
+func bridgeSideEntries(g graph.Reader, registry *contracts.Registry, contractID, side string, bnd bridgeBoundary) (provs, cons []bridgeSideEntry) {
 	wantProv := side == "provider" || side == "both"
 	wantCons := side == "consumer" || side == "both"
 
@@ -231,7 +232,7 @@ func (s *Server) bridgeSideEntries(registry *contracts.Registry, contractID, sid
 	// Fallback: the contract node itself. It carries a single role's
 	// Meta (same-ID records collapse), so this is best-effort — the
 	// registry path above is authoritative whenever it has data.
-	n := s.graph.GetNode(contractID)
+	n := g.GetNode(contractID)
 	if n == nil {
 		return nil, nil
 	}
@@ -273,11 +274,11 @@ func (s *Server) bridgeRank(ctx context.Context, req mcp.CallToolRequest, groups
 	}
 
 	if symbolID != "" {
-		symNode := s.graph.GetNode(symbolID)
+		symNode := s.readerFor(ctx).GetNode(symbolID)
 		if symNode == nil {
 			return mcp.NewToolResultError("symbol not found: " + symbolID), nil
 		}
-		anchors := s.bridgeAnchorContracts(symNode)
+		anchors := s.bridgeAnchorContracts(ctx, symNode)
 		rankings["adjacency"] = rankBridges(groups, func(g *bridgeGroupResult) float64 {
 			return bridgeAdjacencyScore(g, symNode, anchors)
 		})
@@ -340,11 +341,12 @@ func (s *Server) bridgeImpact(ctx context.Context, req mcp.CallToolRequest, grou
 	if symbolID == "" {
 		return mcp.NewToolResultError("symbol is required for bridge impact mode"), nil
 	}
-	symNode := s.graph.GetNode(symbolID)
+	g := s.readerFor(ctx)
+	symNode := g.GetNode(symbolID)
 	if symNode == nil {
 		return mcp.NewToolResultError("symbol not found: " + symbolID), nil
 	}
-	anchors := s.bridgeAnchorContracts(symNode)
+	anchors := s.bridgeAnchorContracts(ctx, symNode)
 	if len(anchors) == 0 {
 		payload := map[string]any{
 			"mode":   "impact",
@@ -363,7 +365,7 @@ func (s *Server) bridgeImpact(ctx context.Context, req mcp.CallToolRequest, grou
 
 	matchedVia := make(map[string][]string)
 	for contractID := range anchors {
-		for _, e := range s.graph.GetInEdges(contractID) {
+		for _, e := range g.GetInEdges(contractID) {
 			if e.Kind != graph.EdgeBridges {
 				continue
 			}
@@ -412,7 +414,7 @@ func (s *Server) bridgeImpact(ctx context.Context, req mcp.CallToolRequest, grou
 // symbol: contracts attached to the symbol itself plus every contract
 // declared in the symbol's file. This is the entry set a change to
 // the symbol can reach without leaving its file.
-func (s *Server) bridgeAnchorContracts(symNode *graph.Node) map[string]bool {
+func (s *Server) bridgeAnchorContracts(ctx context.Context, symNode *graph.Node) map[string]bool {
 	anchors := make(map[string]bool)
 	registry := s.effectiveContractRegistry()
 	if registry != nil {
@@ -427,7 +429,7 @@ func (s *Server) bridgeAnchorContracts(symNode *graph.Node) map[string]bool {
 	}
 	// Graph fallback: provides/consumes out-edges land on contract
 	// nodes directly.
-	for _, e := range s.graph.GetOutEdges(symNode.ID) {
+	for _, e := range s.readerFor(ctx).GetOutEdges(symNode.ID) {
 		if e.Kind == graph.EdgeProvides || e.Kind == graph.EdgeConsumes {
 			anchors[e.To] = true
 		}

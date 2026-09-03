@@ -60,7 +60,10 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 		limit = int(v)
 	}
 
-	goroutineReachable := s.buildGoroutineReachableSet()
+	// One reader for the whole pass: an overlay-active request walks the
+	// pushed buffers, everyone else the base graph.
+	g := s.readerFor(ctx)
+	goroutineReachable := s.buildGoroutineReachableSet(g)
 	guarded := map[string]bool{}
 
 	type raceRow struct {
@@ -73,11 +76,11 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 	}
 	var rows []raceRow
 
-	for e := range edgesByKinds(s.graph, graph.EdgeWrites) {
+	for e := range edgesByKinds(g, graph.EdgeWrites) {
 		if !goroutineReachable[e.From] {
 			continue
 		}
-		target := s.graph.GetNode(e.To)
+		target := g.GetNode(e.To)
 		if target == nil || target.Kind != graph.KindField {
 			continue
 		}
@@ -88,7 +91,7 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 		// writer's out-edges once and the writer is reused across
 		// every field it touches.
 		if _, cached := guarded[e.From]; !cached {
-			guarded[e.From] = s.writerHoldsLock(e.From)
+			guarded[e.From] = s.writerHoldsLock(g, e.From)
 		}
 		if guarded[e.From] {
 			continue
@@ -109,8 +112,8 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]raceRow, 0, len(rows))
 		for _, r := range rows {
-			if s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Field)) &&
-				s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Writer)) {
+			if s.analyzeNodeVisible(ctx, g.GetNode(r.Field)) &&
+				s.analyzeNodeVisible(ctx, g.GetNode(r.Writer)) {
 				kept = append(kept, r)
 			}
 		}
@@ -171,11 +174,12 @@ func (s *Server) handleAnalyzeRaceWrites(ctx context.Context, req mcp.CallToolRe
 // is the target of an `EdgeSpawns` edge. Membership in this set is
 // the precondition for a write to be considered "happens on another
 // goroutine"; an unguarded write to a shared field by such a writer
-// is a data race candidate.
-func (s *Server) buildGoroutineReachableSet() map[string]bool {
+// is a data race candidate. The walk runs on the caller's reader so an
+// overlay-active request sees the pushed buffers' spawn/call edges.
+func (s *Server) buildGoroutineReachableSet(g graph.Reader) map[string]bool {
 	reach := map[string]bool{}
 	var roots []string
-	for e := range edgesByKinds(s.graph, graph.EdgeSpawns) {
+	for e := range edgesByKinds(g, graph.EdgeSpawns) {
 		if !reach[e.To] {
 			reach[e.To] = true
 			roots = append(roots, e.To)
@@ -188,7 +192,7 @@ func (s *Server) buildGoroutineReachableSet() map[string]bool {
 	for len(frontier) > 0 {
 		var next []string
 		for _, id := range frontier {
-			for _, e := range s.graph.GetOutEdges(id) {
+			for _, e := range g.GetOutEdges(id) {
 				if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeSpawns {
 					continue
 				}
@@ -209,16 +213,17 @@ func (s *Server) buildGoroutineReachableSet() map[string]bool {
 // list — covers stdlib sync.Mutex / RWMutex, the common pattern of
 // `withLock(func() { ... })`, JS `Mutex.acquire`, and Rust's
 // `lock()`. False positives are preferable to false negatives here
-// because the analyzer is review-grade, not enforcement-grade.
-func (s *Server) writerHoldsLock(writerID string) bool {
-	for _, e := range s.graph.GetOutEdges(writerID) {
+// because the analyzer is review-grade, not enforcement-grade. The
+// out-edge walk runs on the caller's reader.
+func (s *Server) writerHoldsLock(g graph.Reader, writerID string) bool {
+	for _, e := range g.GetOutEdges(writerID) {
 		if e.Kind != graph.EdgeCalls {
 			continue
 		}
 		if name := callTargetName(e); isLockMethodName(name) {
 			return true
 		}
-		target := s.graph.GetNode(e.To)
+		target := g.GetNode(e.To)
 		if target != nil && isLockMethodName(target.Name) {
 			return true
 		}
@@ -287,12 +292,16 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 		limit = int(v)
 	}
 
+	// One reader for the whole pass: an overlay-active request walks the
+	// pushed buffers, everyone else the base graph.
+	g := s.readerFor(ctx)
+
 	// Pass 1: build the set of functions that contain a `close()`
 	// call. Indirect proxy for "this function probably closes a
 	// channel"; the channel arg isn't tracked so the membership test
 	// is per-function, not per-channel.
 	closesIn := map[string]bool{}
-	for e := range edgesByKinds(s.graph, graph.EdgeCalls) {
+	for e := range edgesByKinds(g, graph.EdgeCalls) {
 		if callTargetName(e) != "close" {
 			continue
 		}
@@ -310,7 +319,7 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 		Line      int
 	}
 	byChannel := map[string]*channelInfo{}
-	for e := range edgesByKinds(s.graph, graph.EdgeSends, graph.EdgeRecvs) {
+	for e := range edgesByKinds(g, graph.EdgeSends, graph.EdgeRecvs) {
 		info := byChannel[e.To]
 		if info == nil {
 			info = &channelInfo{
@@ -390,7 +399,7 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]unclosedRow, 0, len(rows))
 		for _, r := range rows {
-			if s.analyzeNodeVisible(ctx, s.graph.GetNode(r.Channel)) {
+			if s.analyzeNodeVisible(ctx, g.GetNode(r.Channel)) {
 				kept = append(kept, r)
 			}
 		}

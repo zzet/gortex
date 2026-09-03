@@ -61,8 +61,9 @@ func TestPersistSemanticNodeStampsIsSetOrientedAndPreservesNodeData(t *testing.T
 	})
 	store.AddBatch(nodes, nil)
 
-	countQuery, updateQuery, args := semanticNodeStampStatements(stamps[:semanticNodeStampChunkSize])
-	assert.Len(t, args, semanticNodeStampChunkSize*semanticNodeStampParamsPerRow)
+	countQuery, updateQuery, args := semanticNodeStampStatements(store.viewGen, stamps[:semanticNodeStampChunkSize])
+	// One argument past the per-row values: the trailing generation binding.
+	assert.Len(t, args, semanticNodeStampChunkSize*semanticNodeStampParamsPerRow+1)
 	assert.Equal(t, semanticNodeStampChunkSize, strings.Count(countQuery, "(?,?,?,?)"))
 	assert.Equal(t, semanticNodeStampChunkSize, strings.Count(updateQuery, "(?,?,?,?)"))
 

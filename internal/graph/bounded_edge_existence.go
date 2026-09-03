@@ -162,6 +162,15 @@ func (g *Graph) FindExistingEdgeEndpoints(
 // overlay. A source owned by the overlay uses only current overlay edges. For an
 // untouched source, base evidence survives unless the exact target identity is
 // tombstoned by the overlay; a same-ID replacement preserves that base edge.
+//
+// Ownership here is decided per SOURCE, not per edge as everywhere else,
+// because a {from,to,kind} key names no recorded file to ask the layer about.
+// The two readings a file would separate — a call the overlay deleted from the
+// covered buffer, and a base edge out of a covered symbol that some other file
+// recorded — are the same key at this surface, so the reader keeps the answer
+// that never authenticates a deleted declaration. An existence probe that must
+// see the second kind reads the outgoing identity projection, whose keys carry
+// the path.
 func (v *OverlaidView) FindExistingEdgeEndpoints(
 	ctx context.Context,
 	endpoints []TypedEdgeEndpoint,
@@ -199,19 +208,17 @@ func (v *OverlaidView) FindExistingEdgeEndpoints(
 			end++
 		}
 		from := keys[start].From
-		sourceOwned := v.nodeBelongsToOverlay(from) || v.layer.ownsNodeIdentity(from)
-		if sourceOwned {
-			// A covered or detached tombstone owns the identity but carries no
-			// current adjacency. Never authenticate a stray staged edge for a
+		if v.overlayOwnsSourceAdjacency(from) {
+			// A covered or detached tombstone owns the adjacency but carries no
+			// current declaration. Never authenticate a stray staged edge for a
 			// source declaration the overlay removed.
-			if v.layer.nodeByID[from] == nil {
+			if !v.overlayIdentityVisible(from) {
 				start = end
 				continue
 			}
 			wanted := make(map[typedEdgeTarget]TypedEdgeEndpoint, end-start)
 			for _, endpoint := range keys[start:end] {
-				targetOwned := v.nodeBelongsToOverlay(endpoint.To) || v.layer.ownsNodeIdentity(endpoint.To)
-				if targetOwned && v.layer.nodeByID[endpoint.To] == nil {
+				if !v.overlayIdentityVisible(endpoint.To) {
 					continue
 				}
 				wanted[typedEdgeTarget{to: endpoint.To, kind: endpoint.Kind}] = endpoint
@@ -220,7 +227,7 @@ func (v *OverlaidView) FindExistingEdgeEndpoints(
 				start = end
 				continue
 			}
-			for index, edge := range v.layer.outEdges[from] {
+			for index, edge := range v.layer.OutEdges(from) {
 				if index&127 == 0 {
 					if err := ctx.Err(); err != nil {
 						return nil, err
@@ -244,8 +251,7 @@ func (v *OverlaidView) FindExistingEdgeEndpoints(
 			continue
 		}
 		for _, endpoint := range keys[start:end] {
-			targetOwned := v.nodeBelongsToOverlay(endpoint.To) || v.layer.ownsNodeIdentity(endpoint.To)
-			if targetOwned && v.layer.nodeByID[endpoint.To] == nil {
+			if !v.overlayIdentityVisible(endpoint.To) {
 				continue
 			}
 			baseKeys = append(baseKeys, endpoint)

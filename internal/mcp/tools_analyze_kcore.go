@@ -54,9 +54,10 @@ func (s *Server) handleAnalyzeKCore(ctx context.Context, req mcp.CallToolRequest
 		minDegree = int(v)
 	}
 
-	hits := s.runKCore(graph.KCoreOpts{
+	hits := s.runKCore(ctx, graph.KCoreOpts{
 		NodeKinds: parseKindFilter(stringArg(args, "node_kinds")),
 	})
+	reader := s.readerFor(ctx)
 
 	// Filter by min_degree (drop trivial low-core nodes), then cap.
 	if minDegree > 0 {
@@ -70,15 +71,15 @@ func (s *Server) handleAnalyzeKCore(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// Narrow to the session workspace + optional repo allow-set when the
-	// request scopes below the global graph. kcore reads s.graph directly,
-	// so without this the densely-connected core would span every
-	// workspace. Filter after the min_degree pass and before the limit cap
-	// so the cap lands on the visible set and count recomputes. Strict
-	// no-op for an unbound session with no RepoAllow.
+	// request scopes below the global graph. Without this the
+	// densely-connected core would span every workspace. Filter after the
+	// min_degree pass and before the limit cap so the cap lands on the
+	// visible set and count recomputes. Strict no-op for an unbound session
+	// with no RepoAllow.
 	if s.scopeFiltersActive(ctx) {
 		kept := hits[:0]
 		for _, h := range hits {
-			if s.analyzeNodeVisible(ctx, s.graph.GetNode(h.NodeID)) {
+			if s.analyzeNodeVisible(ctx, reader.GetNode(h.NodeID)) {
 				kept = append(kept, h)
 			}
 		}
@@ -98,7 +99,7 @@ func (s *Server) handleAnalyzeKCore(ctx context.Context, req mcp.CallToolRequest
 			ids = append(ids, h.NodeID)
 		}
 	}
-	nodeByID := s.graph.GetNodesByIDs(ids)
+	nodeByID := reader.GetNodesByIDs(ids)
 
 	rows := make([]kcoreRow, 0, len(hits))
 	for _, h := range hits {
@@ -131,7 +132,7 @@ func (s *Server) handleAnalyzeKCore(ctx context.Context, req mcp.CallToolRequest
 // returns them unordered; the in-process ComputeKCore returns
 // already sorted — normalise both here so the handler doesn't
 // have to re-sort).
-func (s *Server) runKCore(opts graph.KCoreOpts) []graph.KCoreHit {
+func (s *Server) runKCore(ctx context.Context, opts graph.KCoreOpts) []graph.KCoreHit {
 	if store := s.backendStore(); store != nil {
 		if kc, ok := store.(graph.KCorer); ok {
 			hits, err := kc.KCoreDecomposition(opts)
@@ -147,7 +148,7 @@ func (s *Server) runKCore(opts graph.KCoreOpts) []graph.KCoreHit {
 			// Engine-native error falls through.
 		}
 	}
-	res := analysis.ComputeKCore(s.graph, analysis.KCoreOptions{
+	res := analysis.ComputeKCore(s.readerFor(ctx), analysis.KCoreOptions{
 		NodeKinds: opts.NodeKinds,
 		EdgeKinds: opts.EdgeKinds,
 	})

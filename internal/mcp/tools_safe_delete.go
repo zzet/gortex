@@ -93,7 +93,9 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	cascadeMode := normaliseCascadeMode(req.GetString("cascade", cascadeModeOff))
 	cascadeIntoTests := req.GetBool("cascade_into_tests", false)
 
-	node := s.graph.GetNode(id)
+	g := s.readerFor(ctx)
+
+	node := g.GetNode(id)
 	if node == nil {
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
@@ -105,14 +107,14 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	// that signal actual code-level use; structural edges like
 	// EdgeDefines / EdgeMemberOf are skipped (they don't represent
 	// "someone calls this").
-	refs := collectReferencingEdges(s.graph, id)
+	refs := collectReferencingEdges(g, id)
 
 	// SRN-7: propagate-delete — patch the surviving call sites instead of
 	// refusing. Builds a per-caller plan, applies the removable standalone
 	// calls (parse-gate validated), and flags embedded references as manual.
 	var appliedPatches, failedPatches []callerPatch
 	if req.GetBool("propagate", false) && len(refs) > 0 {
-		plan := s.buildPropagationPlan(node)
+		plan := s.buildPropagationPlan(ctx, g, node)
 		manual := countManual(plan)
 		if dryRun {
 			return s.respondJSONOrTOON(ctx, req, map[string]any{
@@ -153,7 +155,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		// Callers patched — proceed with the deletion. Re-fetch the node in
 		// case a same-file removal shifted its line range.
 		force = true
-		node = s.graph.GetNode(id)
+		node = g.GetNode(id)
 		if node == nil {
 			return s.respondJSONOrTOON(ctx, req, map[string]any{
 				"status":          "deleted_by_propagation",
@@ -190,10 +192,10 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		cascadeTruncated bool
 	)
 	if cascadeMode != cascadeModeOff {
-		closure, cascadeTruncated = computeCascadeClosure(s.graph, node, cascadeIntoTests)
+		closure, cascadeTruncated = computeCascadeClosure(g, node, cascadeIntoTests)
 	}
 
-	absPath, err := s.resolveNodePath(node)
+	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -246,14 +248,14 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	}}
 	if cascadeMode == cascadeModeApply {
 		for _, entry := range closure {
-			cn := s.graph.GetNode(entry.ID)
+			cn := g.GetNode(entry.ID)
 			if cn == nil {
 				return mcp.NewToolResultError(fmt.Sprintf("cascade target disappeared from graph: %s", entry.ID)), nil
 			}
 			if cn.StartLine == 0 || cn.EndLine == 0 {
 				return mcp.NewToolResultError(fmt.Sprintf("cascade target has no line range: %s", entry.ID)), nil
 			}
-			cAbs, err := s.resolveNodePath(cn)
+			cAbs, err := s.resolveNodePath(ctx, cn)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("resolve cascade target %s: %v", entry.ID, err)), nil
 			}
@@ -431,7 +433,7 @@ func expandDeleteRange(node *graph.Node, lines []string) (int, int) {
 // target. Iteration is bounded by cascadeIterationCap; if hit, the
 // caller surfaces cascade_truncated so the agent knows the closure
 // may be incomplete.
-func computeCascadeClosure(g graph.Store, target *graph.Node, cascadeIntoTests bool) ([]cascadeClosureEntry, bool) {
+func computeCascadeClosure(g graph.Reader, target *graph.Node, cascadeIntoTests bool) ([]cascadeClosureEntry, bool) {
 	closure := []cascadeClosureEntry{}
 	inClosure := map[string]bool{target.ID: true}
 	reasons := map[string]string{}
@@ -491,7 +493,7 @@ func computeCascadeClosure(g graph.Store, target *graph.Node, cascadeIntoTests b
 // collectCascadeCandidates returns every distinct node ID that an
 // in-closure node points at via a referencing edge — the only
 // possible new entrants to the closure on this iteration.
-func collectCascadeCandidates(g graph.Store, inClosure map[string]bool) []string {
+func collectCascadeCandidates(g graph.Reader, inClosure map[string]bool) []string {
 	seen := map[string]bool{}
 	out := []string{}
 	for from := range inClosure {
@@ -516,7 +518,7 @@ func collectCascadeCandidates(g graph.Store, inClosure map[string]bool) []string
 // reports whether the node has no caller outside the current
 // closure. Returns a human-readable reason string when the node
 // qualifies (used for the response payload).
-func candidateQualifies(g graph.Store, cn *graph.Node, inClosure map[string]bool, cascadeIntoTests bool) (string, bool) {
+func candidateQualifies(g graph.Reader, cn *graph.Node, inClosure map[string]bool, cascadeIntoTests bool) (string, bool) {
 	targetWS := ""
 	// Build an "in-closure caller" list so the reason string can
 	// name the symbol(s) that are the only ones still calling this
@@ -608,7 +610,7 @@ func workspaceKey(n *graph.Node) string {
 // represents real use (someone calls, implements, extends, or
 // references this symbol). Structural edges (defines, member_of)
 // are excluded because they don't block a delete.
-func collectReferencingEdges(g graph.Store, id string) []safeDeleteReference {
+func collectReferencingEdges(g graph.Reader, id string) []safeDeleteReference {
 	out := make([]safeDeleteReference, 0)
 	seen := map[string]bool{}
 	for _, e := range g.GetInEdges(id) {

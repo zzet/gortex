@@ -113,7 +113,7 @@ func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest,
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	targets, err := s.buildASTTargets("", pathPrefix, allowedRepos)
+	targets, err := s.buildASTTargets(ctx, "", pathPrefix, allowedRepos)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -225,16 +225,16 @@ func (s *Server) handleAnalyzeSAST(ctx context.Context, req mcp.CallToolRequest,
 	// Graph-grounding post-pass — the load-bearing FP-reduction step.
 	// The review detectors emit undecidable-from-AST-alone rows (N+1
 	// query-in-loop, check-then-act) optimistically; here, one layer
-	// up from the engine where s.graph is reachable, we drop the rows
-	// the resolved call / loop metadata refutes. Only the review
-	// bundle is grounded; sast / hygiene / domain pass through.
+	// up from the engine where the request's graph reader is reachable,
+	// we drop the rows the resolved call / loop metadata refutes. Only
+	// the review bundle is grounded; sast / hygiene / domain pass through.
 	if kind == "review" {
 		// Establish the same global priority the final rows use before the
 		// bounded enrichment pass. Grounding preserves this order. Only the
 		// requested result prefix is enriched: grounding may drop a prefix
 		// row, but admitting later rows would exceed the caller's work bound.
 		s.prepareReviewSASTMatchesContext(ctx, collected, limit, !kindsOnly)
-		collected = review.GroundReviewMatches(s.graph, collected)
+		collected = review.GroundReviewMatches(s.readerFor(ctx), collected)
 	}
 
 	for _, m := range collected {

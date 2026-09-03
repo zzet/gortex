@@ -15,8 +15,8 @@ var (
 	_ graph.ConstantValueReader       = (*Store)(nil)
 )
 
-// constValueChunk bounds rows per multi-row INSERT (4 params/row; 80 rows
-// = 320 host params, well under SQLite's 999 default).
+// constValueChunk bounds rows per multi-row INSERT (5 params/row; 80 rows
+// = 400 host params, well under SQLite's 999 default).
 const constValueChunk = 80
 
 // BulkSetConstantValues persists constant values for one repo prefix in a
@@ -41,15 +41,15 @@ func (s *Store) BulkSetConstantValues(repoPrefix string, rows []graph.ConstantVa
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*4)
+		args := make([]any, 0, len(batch)*5)
 		stmt := make([]byte, 0, 96+len(batch)*16)
-		stmt = append(stmt, "INSERT OR REPLACE INTO constant_values (node_id, repo_prefix, file_path, value) VALUES "...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO constant_values (view_gen, node_id, repo_prefix, file_path, value) VALUES "...)
 		for i, r := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?)"...)
-			args = append(args, r.NodeID, repoPrefix, r.FilePath, r.Value)
+			stmt = append(stmt, "(?, ?, ?, ?, ?)"...)
+			args = append(args, s.viewGen, r.NodeID, repoPrefix, r.FilePath, r.Value)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -70,7 +70,7 @@ func (s *Store) ReplaceConstantValues(repoPrefix string, rows []graph.ConstantVa
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if _, err := tx.Exec(`DELETE FROM constant_values WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`DELETE FROM constant_values WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	for start := 0; start < len(rows); start += constValueChunk {
@@ -79,15 +79,15 @@ func (s *Store) ReplaceConstantValues(repoPrefix string, rows []graph.ConstantVa
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*4)
+		args := make([]any, 0, len(batch)*5)
 		stmt := make([]byte, 0, 96+len(batch)*16)
-		stmt = append(stmt, "INSERT INTO constant_values (node_id, repo_prefix, file_path, value) VALUES "...)
+		stmt = append(stmt, "INSERT INTO constant_values (view_gen, node_id, repo_prefix, file_path, value) VALUES "...)
 		for i, row := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?)"...)
-			args = append(args, row.NodeID, repoPrefix, row.FilePath, row.Value)
+			stmt = append(stmt, "(?, ?, ?, ?, ?)"...)
+			args = append(args, s.viewGen, row.NodeID, repoPrefix, row.FilePath, row.Value)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -118,10 +118,10 @@ func (s *Store) DeleteConstantValuesByFiles(repoPrefix string, files []string) e
 			end = len(files)
 		}
 		chunk := files[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 64+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM constant_values WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "DELETE FROM constant_values WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, f := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -150,9 +150,10 @@ func (s *Store) ConstantValuesByNodeIDs(nodeIDs []string) (map[string]string, er
 			end = len(nodeIDs)
 		}
 		chunk := nodeIDs[start:end]
-		args := make([]any, 0, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.viewGen)
 		stmt := make([]byte, 0, 64+len(chunk)*2)
-		stmt = append(stmt, "SELECT node_id, value FROM constant_values WHERE node_id IN ("...)
+		stmt = append(stmt, "SELECT node_id, value FROM constant_values WHERE view_gen = ? AND node_id IN ("...)
 		for i, id := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')

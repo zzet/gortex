@@ -21,9 +21,9 @@ func (s *Store) SetContractState(st graph.ContractState) error {
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(), `
 INSERT OR REPLACE INTO contract_state
-  (repo_prefix, indexed_sha, completed_at, contract_count)
-VALUES (?, ?, ?, ?)`,
-		st.RepoPrefix, st.IndexedSHA, st.CompletedAt, st.ContractCount)
+  (view_gen, repo_prefix, indexed_sha, completed_at, contract_count)
+VALUES (?, ?, ?, ?, ?)`,
+		s.viewGen, st.RepoPrefix, st.IndexedSHA, st.CompletedAt, st.ContractCount)
 	return err
 }
 
@@ -33,7 +33,7 @@ VALUES (?, ?, ?, ?)`,
 func (s *Store) GetContractState(repoPrefix string) (graph.ContractState, bool, error) {
 	row := s.db.QueryRow(`
 SELECT indexed_sha, completed_at, contract_count
-  FROM contract_state WHERE repo_prefix = ?`, repoPrefix)
+  FROM contract_state WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix)
 	st := graph.ContractState{RepoPrefix: repoPrefix}
 	err := row.Scan(&st.IndexedSHA, &st.CompletedAt, &st.ContractCount)
 	if err == sql.ErrNoRows {

@@ -36,7 +36,7 @@ import (
 // schema version is incompatible. The caller must hold the store lock;
 // NewSharedServer passes true only in the branch where it acquired the
 // exclusive flock.
-func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool) (graph.Store, func(), error) {
+func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func(), error) {
 	if err := checkBackend(name); err != nil {
 		return nil, nil, err
 	}
@@ -47,7 +47,7 @@ func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool) (grap
 	if logger != nil {
 		logger.Info("opening sqlite backend", zap.String("path", resolved))
 	}
-	return openSqliteBackend(resolved, allowRebuild)
+	return openSqliteBackend(resolved, allowRebuild, observers...)
 }
 
 // checkBackend validates a requested backend name. It is split out of
@@ -96,8 +96,11 @@ func resolveBackendPath(in, filename string) (string, error) {
 // openSqliteBackend opens (or creates) the SQLite store at path. The
 // pure-Go modernc.org/sqlite driver keeps the binary CGo-free while still
 // getting a real query planner that drives the graph's secondary indexes.
-func openSqliteBackend(path string, allowRebuild bool) (graph.Store, func(), error) {
+func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func(), error) {
 	var opts []store_sqlite.Option
+	if len(observers) > 0 && observers[0] != nil {
+		opts = append(opts, store_sqlite.WithMigrationObserver(observers[0]))
+	}
 	if allowRebuild {
 		opts = append(opts, store_sqlite.WithRebuild())
 	}

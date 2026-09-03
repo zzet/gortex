@@ -11,9 +11,9 @@ func (s *Store) ProxyNodeCountAtLeast(limit int) bool {
 	err := s.db.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM nodes
-			WHERE id >= 'remote:' AND id < 'remote;'
+			WHERE id >= 'remote:' AND id < 'remote;' AND view_gen = ?
 			LIMIT 1 OFFSET ?
-		)`, limit-1).Scan(&present)
+		)`, s.viewGen, limit-1).Scan(&present)
 	if err != nil {
 		panicOnFatal(err)
 		return true

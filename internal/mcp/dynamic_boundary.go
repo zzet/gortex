@@ -106,17 +106,18 @@ func anyAgentNamed(candidates []string) bool {
 }
 
 // dynamicBoundariesForSymbol reads a symbol's source and detects the runtime
-// dispatch boundaries inside it, resolving candidate targets through the graph.
-// Returns nil when the source can't be read or no dispatch is found.
+// dispatch boundaries inside it, resolving candidate targets through the
+// caller's reader. Returns nil when the source can't be read or no dispatch is
+// found.
 // The session's overlay buffer substitutes for the on-disk file when the
 // request carries one: an overlay-served node's line range is a BUFFER
 // coordinate, and slicing the stale disk content by it reads a different
 // body and fabricates boundaries.
-func (s *Server) dynamicBoundariesForSymbol(ctx context.Context, node *graph.Node) []DynamicBoundary {
+func (s *Server) dynamicBoundariesForSymbol(ctx context.Context, r graph.Reader, node *graph.Node) []DynamicBoundary {
 	if node == nil || node.StartLine <= 0 {
 		return nil
 	}
-	absPath, err := s.resolveNodePath(node)
+	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return nil
 	}
@@ -138,30 +139,34 @@ func (s *Server) dynamicBoundariesForSymbol(ctx context.Context, node *graph.Nod
 		return nil
 	}
 	body := strings.Join(lines[start:end], "\n")
-	return detectDynamicBoundaries(body, node.FilePath, node.StartLine, s.dispatchCandidates)
+	return detectDynamicBoundaries(body, node.FilePath, node.StartLine, dispatchCandidatesFor(r))
 }
 
-// dispatchCandidates is the graph-backed candidate resolver: when the dispatch
-// key looks like a symbol name, the shortlist is the functions/methods that
-// bear that name (capped). A non-identifier key (a runtime variable) yields no
-// shortlist — honest about what's statically knowable.
-func (s *Server) dispatchCandidates(_, key string) []string {
-	if !isIdentifierKey(key) {
-		return nil
-	}
-	var out []string
-	for _, n := range s.graph.FindNodesByName(key) {
-		if n == nil {
-			continue
+// dispatchCandidatesFor returns the graph-backed candidate resolver bound to
+// one reader: when the dispatch key looks like a symbol name, the shortlist is
+// the functions/methods that bear that name (capped). A non-identifier key (a
+// runtime variable) yields no shortlist — honest about what's statically
+// knowable. Binding the reader keeps the shortlist in the caller's scope, so
+// an overlay-active request can name a candidate that only its buffers define.
+func dispatchCandidatesFor(r graph.Reader) func(form, key string) []string {
+	return func(_, key string) []string {
+		if r == nil || !isIdentifierKey(key) {
+			return nil
 		}
-		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-			out = append(out, n.ID)
-			if len(out) >= 8 {
-				break
+		var out []string
+		for _, n := range r.FindNodesByName(key) {
+			if n == nil {
+				continue
+			}
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				out = append(out, n.ID)
+				if len(out) >= 8 {
+					break
+				}
 			}
 		}
+		return out
 	}
-	return out
 }
 
 func isIdentifierKey(key string) bool {

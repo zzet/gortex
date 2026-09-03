@@ -11,6 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/eval/quality"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -20,7 +21,9 @@ import (
 func (s *Server) smartContextSections(args map[string]any, relPath string) config.SmartContextSections {
 	cfg := config.SmartContextConfig{}
 	if s.configManager != nil {
-		cfg = s.configManager.GetRepoConfig(repoPrefixForPath(s, relPath)).MCP.SmartContext
+		// Base read: the repo prefix keys a config lookup, and config is a
+		// property of the indexed repo, not of a session's edits.
+		cfg = s.configManager.GetRepoConfig(repoPrefixForPath(s.graph, relPath)).MCP.SmartContext
 	}
 	return cfg.Resolve(
 		boolPtrArg(args, "include_call_paths"),
@@ -42,15 +45,20 @@ func boolPtrArg(args map[string]any, key string) *bool {
 // assembled pack under result["in_pack"]. Only sections with content are
 // written, so the default pack stays untouched; later passes attach the flow
 // spine and confidence verdict to the same block.
-func (s *Server) attachInPackSections(result map[string]any, sections config.SmartContextSections, symbols []*graph.Node) {
+func (s *Server) attachInPackSections(ctx context.Context, result map[string]any, sections config.SmartContextSections, symbols []*graph.Node) {
 	block := map[string]any{}
 	if sections.CallPaths {
-		if cp := s.inPackCallPaths(symbols); len(cp) > 0 {
+		// The annotation follows the engine, not its output: "no call path
+		// between these symbols" is a claim about the base corpus the
+		// traversal ran over just as much as a path is.
+		cp := s.inPackCallPaths(symbols)
+		annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
+		if len(cp) > 0 {
 			block["call_paths"] = cp
 		}
 	}
 	if sections.Flows {
-		if fl := s.inPackFlows(symbols); fl != nil {
+		if fl := s.inPackFlows(ctx, symbols); fl != nil {
 			block["flows"] = fl
 		}
 	}
@@ -64,12 +72,12 @@ func (s *Server) attachInPackSections(result map[string]any, sections config.Sma
 // hits — call sites whose target the static graph cannot resolve, where the
 // flow would continue at runtime. Returns nil when there is no multi-node spine
 // and no boundary to announce.
-func (s *Server) inPackFlows(symbols []*graph.Node) map[string]any {
-	if s.graph == nil || len(symbols) == 0 || symbols[0] == nil {
+func (s *Server) inPackFlows(ctx context.Context, symbols []*graph.Node) map[string]any {
+	if s.readerFor(ctx) == nil || len(symbols) == 0 || symbols[0] == nil {
 		return nil
 	}
 	budget := s.inPackBudget()
-	spine, boundaries := s.flowSpine(symbols[0].ID, budget.FlowDepth)
+	spine, boundaries := s.flowSpine(ctx, symbols[0].ID, budget.FlowDepth)
 	if len(boundaries) > budget.MaxBoundaries {
 		boundaries = boundaries[:budget.MaxBoundaries]
 	}
@@ -101,8 +109,9 @@ var packRecoveryKinds = map[graph.EdgeKind]bool{
 // overrides) that exist between the pack's symbols — the internal connectivity
 // a many-rooted retrieval leaves out. Returns nil when fewer than two symbols
 // are in the pack or none are connected.
-func (s *Server) recoverPackEdges(symbols []*graph.Node) []map[string]any {
-	if s.graph == nil || len(symbols) < 2 {
+func (s *Server) recoverPackEdges(ctx context.Context, symbols []*graph.Node) []map[string]any {
+	g := s.readerFor(ctx)
+	if g == nil || len(symbols) < 2 {
 		return nil
 	}
 	ids := make(map[string]bool, len(symbols))
@@ -117,7 +126,7 @@ func (s *Server) recoverPackEdges(symbols []*graph.Node) []map[string]any {
 	seen := map[string]bool{}
 	var out []map[string]any
 	for _, id := range ordered {
-		for _, e := range s.graph.GetOutEdges(id) {
+		for _, e := range g.GetOutEdges(id) {
 			if e == nil || !packRecoveryKinds[e.Kind] || !ids[e.To] {
 				continue
 			}
@@ -136,8 +145,9 @@ func (s *Server) recoverPackEdges(symbols []*graph.Node) []map[string]any {
 // type — its siblings in the class hierarchy (e.g. a pack's InternalEngine and
 // the sibling ReadOnlyEngine that both extend Engine). Already-packed types are
 // excluded; the result is capped.
-func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
-	if s.graph == nil {
+func (s *Server) packHierarchySiblings(ctx context.Context, symbols []*graph.Node) []map[string]any {
+	g := s.readerFor(ctx)
+	if g == nil {
 		return nil
 	}
 	inPack := map[string]bool{}
@@ -151,7 +161,7 @@ func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
 		if n == nil || (n.Kind != graph.KindType && n.Kind != graph.KindInterface) {
 			continue
 		}
-		for _, e := range s.graph.GetOutEdges(n.ID) {
+		for _, e := range g.GetOutEdges(n.ID) {
 			if e != nil && (e.Kind == graph.EdgeExtends || e.Kind == graph.EdgeImplements) {
 				parents[e.To] = true
 			}
@@ -169,7 +179,7 @@ func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
 	sibSeen := map[string]bool{}
 	var out []map[string]any
 	for _, parent := range parentIDs {
-		for _, e := range s.graph.GetInEdges(parent) {
+		for _, e := range g.GetInEdges(parent) {
 			if e == nil || (e.Kind != graph.EdgeExtends && e.Kind != graph.EdgeImplements) {
 				continue
 			}
@@ -177,7 +187,7 @@ func (s *Server) packHierarchySiblings(symbols []*graph.Node) []map[string]any {
 			if inPack[sib] || sibSeen[sib] {
 				continue
 			}
-			n := s.graph.GetNode(sib)
+			n := g.GetNode(sib)
 			if n == nil {
 				continue
 			}
@@ -394,14 +404,18 @@ func slashDir(p string) string {
 // edges (smallest target id first, for determinism), returning the chain of
 // node ids it traverses and the dynamic-dispatch boundaries — out-edges to
 // unresolved targets — encountered along the way.
-func (s *Server) flowSpine(focus string, maxDepth int) (spine []string, boundaries []map[string]any) {
+func (s *Server) flowSpine(ctx context.Context, focus string, maxDepth int) (spine []string, boundaries []map[string]any) {
+	g := s.readerFor(ctx)
+	if g == nil {
+		return nil, nil
+	}
 	visited := map[string]bool{focus: true}
 	bseen := map[string]bool{}
 	spine = []string{focus}
 	cur := focus
 	for depth := 0; depth < maxDepth; depth++ {
 		next := ""
-		for _, e := range s.graph.GetOutEdges(cur) {
+		for _, e := range g.GetOutEdges(cur) {
 			if e == nil || (e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences) {
 				continue
 			}
@@ -449,6 +463,10 @@ func (s *Server) inPackCallPaths(symbols []*graph.Node) []map[string]any {
 			roots = append(roots, n.ID)
 		}
 	}
+	// callpath.New builds its traversal state over a graph.Store, so these
+	// paths are computed over the base corpus even when the request carries
+	// an overlay or a routed view; the caller attaching the section annotates
+	// the response for a view.
 	anchored := callpath.New(s.graph).PathsToAnchor(roots, anchor, callpath.Options{MaxDepth: 8})
 	if len(anchored) == 0 {
 		return nil

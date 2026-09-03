@@ -174,7 +174,7 @@ func TestRunCodexPreToolUseWithoutTerminalPreservesBuiltins(t *testing.T) {
 
 func TestRunCodexPreToolUseBashSoftAdditionalContext(t *testing.T) {
 	oldProbe := grepProbe
-	grepProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	grepProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return nil, errDaemonUnreachable
 	}
 	t.Cleanup(func() { grepProbe = oldProbe })
@@ -318,7 +318,7 @@ func TestRunCodexHardDenyRequiresIndexedWorkspaceMatch(t *testing.T) {
 	}
 
 	oldProbe := grepProbe
-	grepProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	grepProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return []grepSymbolHit{{Name: "Foo", FilePath: "internal/a.go", Line: 1}}, nil
 	}
 	t.Cleanup(func() { grepProbe = oldProbe })
@@ -331,11 +331,9 @@ func TestRunCodexHardDenyRequiresIndexedWorkspaceMatch(t *testing.T) {
 }
 
 func TestRunCodexBashRewriteOnlyForSimpleIndexedCat(t *testing.T) {
-	oldIndexed := fileIndexScopeFn
-	fileIndexScopeFn = func(_, path string) fileIndexStatus {
-		return fileIndexStatus{Indexed: path == "internal/a.go", Count: 3, ProbeOK: true}
-	}
-	t.Cleanup(func() { fileIndexScopeFn = oldIndexed })
+	oldIndexed := fileIndexedFn
+	fileIndexedFn = func(_, path string) (bool, int) { return path == "internal/a.go", 3 }
+	t.Cleanup(func() { fileIndexedFn = oldIndexed })
 
 	data := codexBashPayload("cat internal/a.go")
 	out := captureStdout(t, func() { runCodex(data, 0, CodexModeRewrite) })
@@ -770,7 +768,7 @@ func TestRunCodexPostToolUseMalformedJSONNoop(t *testing.T) {
 
 func TestRunCodexUserPromptSubmitInjectsGraphContext(t *testing.T) {
 	prev := userPromptProbe
-	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	userPromptProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return []grepSymbolHit{
 			{Name: "AuthMiddleware", Kind: "function", FilePath: "internal/auth.go", Line: 12},
 		}, nil
@@ -799,7 +797,7 @@ func TestRunCodexUserPromptSubmitInjectsGraphContext(t *testing.T) {
 
 func TestRunCodexUserPromptSubmitSilentWhenNoHits(t *testing.T) {
 	prev := userPromptProbe
-	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) {
+	userPromptProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) {
 		return nil, nil
 	}
 	t.Cleanup(func() { userPromptProbe = prev })

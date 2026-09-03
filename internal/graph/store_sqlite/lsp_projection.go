@@ -28,8 +28,9 @@ FROM requested_languages AS l
 JOIN nodes AS n ON n.language = l.language
 WHERE n.repo_prefix = ?
   AND n.kind NOT IN (?, ?)
+  AND n.view_gen = ?
 GROUP BY n.file_path
-ORDER BY n.file_path`, languagesJSON, repoPrefix, string(graph.KindFile), string(graph.KindImport))
+ORDER BY n.file_path`, languagesJSON, repoPrefix, string(graph.KindFile), string(graph.KindImport), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return totals, unstamped
@@ -82,7 +83,8 @@ JOIN requested_languages AS l ON l.language = n.language
 WHERE n.file_path = f.file_path
   AND +n.repo_prefix = ?
   AND n.kind NOT IN (?, ?)`+predicate+`
-ORDER BY n.file_path, n.id`, languagesJSON, filesJSON, repoPrefix, string(graph.KindFile), string(graph.KindImport))
+  AND n.view_gen = ?
+ORDER BY n.file_path, n.id`, languagesJSON, filesJSON, repoPrefix, string(graph.KindFile), string(graph.KindImport), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -136,9 +138,10 @@ WHERE n.file_path = f.file_path
   AND e.from_id = n.id
   AND +n.repo_prefix = ?
   AND e.kind NOT IN (?, ?, ?, ?, ?, ?)`+confidencePredicate+`
+  AND n.view_gen = ? AND e.view_gen = n.view_gen
 ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJSON, repoPrefix,
 		string(graph.EdgeMemberOf), string(graph.EdgeDefines), string(graph.EdgeContains),
-		string(graph.EdgeParamOf), string(graph.EdgeImports), string(graph.EdgeCaptures))
+		string(graph.EdgeParamOf), string(graph.EdgeImports), string(graph.EdgeCaptures), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -199,7 +202,8 @@ JOIN requested_kinds AS k ON k.kind = e.kind
 WHERE n.file_path = f.file_path
   AND e.from_id = n.id
   AND +n.repo_prefix = ?
-ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJSON, kindsJSON, repoPrefix)
+  AND n.view_gen = ? AND e.view_gen = n.view_gen
+ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, languagesJSON, filesJSON, kindsJSON, repoPrefix, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -238,9 +242,9 @@ WITH requested_nodes(id) AS (
 )
 SELECT r.id, COUNT(e.to_id)
 FROM requested_nodes AS r
-LEFT JOIN edges AS e ON e.to_id = r.id
+LEFT JOIN edges AS e ON e.to_id = r.id AND e.view_gen = ?
 GROUP BY r.id
-ORDER BY r.id`, idsJSON)
+ORDER BY r.id`, idsJSON, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
@@ -285,9 +289,9 @@ WITH requested_nodes(id) AS (
 )
 SELECT `+lookupQualifiedEdgeCols+`
 FROM requested_nodes AS r
-JOIN edges AS e ON e.to_id = r.id
+JOIN edges AS e ON e.to_id = r.id AND e.view_gen = ?
 JOIN requested_kinds AS k ON k.kind = e.kind
-ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, idsJSON, kindsJSON)
+ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`, idsJSON, kindsJSON, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil

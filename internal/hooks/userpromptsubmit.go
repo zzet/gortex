@@ -207,7 +207,10 @@ func buildUserPromptSubmitContext(eventName, prompt string) string {
 	if query == "" {
 		return ""
 	}
-	hits, err := userPromptProbe(query, userPromptProbeTimeout)
+	// No scope: the prompt-time probe is orientation injected as context, not
+	// a decision about a file, and its callers carry a prompt rather than a
+	// location. It reads the base corpus, which is what it has always done.
+	hits, err := userPromptProbe(query, "", userPromptProbeTimeout)
 	if err != nil || len(hits) == 0 {
 		return ""
 	}

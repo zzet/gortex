@@ -309,7 +309,7 @@ func runHermesPreLLMCall(data []byte) {
 		if query == "" {
 			return
 		}
-		hits, err := probeViaDaemon(query, userPromptProbeTimeout)
+		hits, err := probeViaDaemon(query, cwd, userPromptProbeTimeout)
 		if err != nil || len(hits) == 0 {
 			return
 		}

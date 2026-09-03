@@ -106,6 +106,7 @@ func (s *Server) handleGetCouplingMetrics(ctx context.Context, req mcp.CallToolR
 	// repos drop out before they cross the storage boundary. Order is fixed so the
 	// loop body stays trivially identical to the legacy AllEdges
 	// branch.
+	couplingReader := s.readerFor(ctx)
 	for _, k := range []graph.EdgeKind{
 		graph.EdgeCalls,
 		graph.EdgeImports,
@@ -117,7 +118,7 @@ func (s *Server) handleGetCouplingMetrics(ctx context.Context, req mcp.CallToolR
 		graph.EdgeCrossRepoImplements,
 		graph.EdgeCrossRepoExtends,
 	} {
-		for e := range s.graph.EdgesByKind(k) {
+		for e := range couplingReader.EdgesByKind(k) {
 			if e == nil {
 				continue
 			}

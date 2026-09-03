@@ -16,10 +16,10 @@ var (
 	_ graph.ChurnEnrichmentReader = (*Store)(nil)
 )
 
-// churnChunk bounds rows per multi-row INSERT. churn_enrichment has 10
-// columns, so at 10 params/row the 999 host-param limit caps a statement
-// at 99 rows; 90 leaves headroom. Mirrors shingleChunk / mtimeChunk.
-const churnChunk = 90
+// churnChunk bounds rows per multi-row INSERT. churn_enrichment writes 11
+// columns, so at 11 params/row the 999 host-param limit caps a statement
+// at 90 rows; 80 leaves headroom. Mirrors shingleChunk / mtimeChunk.
+const churnChunk = 80
 
 const churnCols = `node_id, repo_prefix, commit_count, age_days, churn_rate, last_author, last_commit_at, head_sha, branch, computed_at`
 
@@ -45,17 +45,17 @@ func (s *Store) BulkSetChurn(repoPrefix string, rows []graph.ChurnEnrichment) er
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*10)
+		args := make([]any, 0, len(batch)*11)
 		stmt := make([]byte, 0, 128+len(batch)*24)
-		stmt = append(stmt, "INSERT OR REPLACE INTO churn_enrichment ("...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO churn_enrichment (view_gen, "...)
 		stmt = append(stmt, churnCols...)
 		stmt = append(stmt, ") VALUES "...)
 		for i, e := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?,?,?,?,?,?,?,?,?,?)"...)
-			args = append(args, e.NodeID, repoPrefix, e.CommitCount, e.AgeDays,
+			stmt = append(stmt, "(?,?,?,?,?,?,?,?,?,?,?)"...)
+			args = append(args, s.viewGen, e.NodeID, repoPrefix, e.CommitCount, e.AgeDays,
 				e.ChurnRate, e.LastAuthor, e.LastCommitAt, e.HeadSHA, e.Branch, e.ComputedAt)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
@@ -102,15 +102,16 @@ func (s *Store) DeleteChurn(nodeIDs []string) error {
 			end = len(uniq)
 		}
 		chunk := uniq[start:end]
-		args := make([]any, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.viewGen)
 		stmt := make([]byte, 0, 48+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM churn_enrichment WHERE node_id IN ("...)
+		stmt = append(stmt, "DELETE FROM churn_enrichment WHERE view_gen = ? AND node_id IN ("...)
 		for i, id := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
 			stmt = append(stmt, '?')
-			args[i] = id
+			args = append(args, id)
 		}
 		stmt = append(stmt, ')')
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
@@ -130,9 +131,9 @@ func (s *Store) ChurnRows(repoPrefix string) []graph.ChurnEnrichment {
 		err  error
 	)
 	if repoPrefix == "" {
-		rows, err = s.db.Query(`SELECT ` + churnCols + ` FROM churn_enrichment`)
+		rows, err = s.db.Query(`SELECT `+churnCols+` FROM churn_enrichment WHERE view_gen = ?`, s.viewGen)
 	} else {
-		rows, err = s.db.Query(`SELECT `+churnCols+` FROM churn_enrichment WHERE repo_prefix = ? AND repo_prefix <> ''`, repoPrefix)
+		rows, err = s.db.Query(`SELECT `+churnCols+` FROM churn_enrichment WHERE view_gen = ? AND repo_prefix = ? AND repo_prefix <> ''`, s.viewGen, repoPrefix)
 	}
 	if err != nil {
 		return nil

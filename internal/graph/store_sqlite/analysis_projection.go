@@ -11,7 +11,7 @@ import (
 // full []*Node retained by the former RunAnalysis snapshot wrapper.
 func (s *Store) NodesLightSeq() iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		rows, err := s.db.Query(`SELECT ` + lookupNodeSummaryCols + ` FROM nodes ORDER BY id`)
+		rows, err := s.db.Query(`SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE view_gen = ? ORDER BY id`, s.viewGen)
 		if err != nil {
 			panicOnFatal(err)
 			return
@@ -43,8 +43,8 @@ func (s *Store) EdgesLightSeq(kinds ...graph.EdgeKind) iter.Seq[*graph.Edge] {
 			return
 		}
 		query := `SELECT ` + edgeColsLight + ` FROM edges WHERE kind IN (` +
-			inPlaceholders(len(args)) + `)`
-		rows, err := s.db.Query(query, args...)
+			inPlaceholders(len(args)) + `) AND view_gen = ?`
+		rows, err := s.db.Query(query, append(args, s.viewGen)...)
 		if err != nil {
 			panicOnFatal(err)
 			return
@@ -76,8 +76,8 @@ func (s *Store) NodesByKindsSeq(kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
 			return
 		}
 		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind IN (` +
-			inPlaceholders(len(args)) + `)`
-		rows, err := s.db.Query(query, args...)
+			inPlaceholders(len(args)) + `) AND view_gen = ?`
+		rows, err := s.db.Query(query, append(args, s.viewGen)...)
 		if err != nil {
 			panicOnFatal(err)
 			return
@@ -114,7 +114,8 @@ func (s *Store) NodeIDNamesByKindsSeq(repoPrefix string, kinds ...graph.NodeKind
 			query += ` AND repo_prefix = ?`
 			args = append(args, repoPrefix)
 		}
-		query += ` ORDER BY name, id`
+		query += ` AND view_gen = ? ORDER BY name, id`
+		args = append(args, s.viewGen)
 		rows, err := s.db.Query(query, args...)
 		if err != nil {
 			panicOnFatal(err)

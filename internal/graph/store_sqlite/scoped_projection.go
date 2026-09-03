@@ -59,7 +59,7 @@ func (s *Store) NodesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 	}
 	return func(yield func(*graph.Node) bool) {
 		for _, kind := range kindValues {
-			query, args, ok := scopedNodeProjectionQuery(repoPrefixes, filePaths, kind, lookupNodeCols)
+			query, args, ok := scopedNodeProjectionQuery(repoPrefixes, filePaths, kind, lookupNodeCols, s.viewGen)
 			if !ok {
 				return
 			}
@@ -74,7 +74,7 @@ func (s *Store) NodesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 // keyset paging as NodesInScopeSeq but never reads Meta, docs, or signatures.
 func (s *Store) NodesLightInScopeSeq(repoPrefixes, filePaths []string) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		query, args, ok := scopedNodeProjectionQuery(repoPrefixes, filePaths, "", lookupNodeSummaryCols)
+		query, args, ok := scopedNodeProjectionQuery(repoPrefixes, filePaths, "", lookupNodeSummaryCols, s.viewGen)
 		if !ok {
 			return
 		}
@@ -144,7 +144,7 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 	}
 	return func(yield func(graph.ScopedEdgeRow) bool) {
 		var maxID int64
-		if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges`).Scan(&maxID); err != nil {
+		if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`, s.viewGen).Scan(&maxID); err != nil {
 			panicOnFatal(err)
 			return
 		}
@@ -161,9 +161,9 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 			var args []any
 			var ok bool
 			if fileIndexed {
-				query, args, ok = scopedEdgeProjectionQuery(repoPrefixes, filePaths, kind)
+				query, args, ok = scopedEdgeProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
 			} else {
-				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind)
+				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
 			}
 			if !ok {
 				return
@@ -248,6 +248,7 @@ func scopedNodeProjectionQuery(
 	repoPrefixes, filePaths []string,
 	kind string,
 	columns string,
+	viewGen int64,
 ) (string, []any, bool) {
 	reposJSON, haveRepos := projectionJSON(repoPrefixes)
 	filesJSON, haveFiles := projectionJSON(filePaths)
@@ -278,10 +279,12 @@ func scopedNodeProjectionQuery(
 		kindPredicate = `n.kind = ? AND `
 		args = append(args, kind)
 	}
+	// The generation binds ahead of the keyset arguments the pager appends.
+	args = append(args, viewGen)
 	query := `WITH ` + strings.Join(ctes, ", ") +
 		` SELECT ` + qualifiedNodeColumns("n", columns) +
 		` FROM nodes AS n ` + strings.Join(joins, " ") +
-		` WHERE ` + kindPredicate + `n.id > ? ORDER BY n.id LIMIT ?`
+		` WHERE ` + kindPredicate + `n.view_gen = ? AND n.id > ? ORDER BY n.id LIMIT ?`
 	return query, args, true
 }
 
@@ -292,13 +295,14 @@ func scopedNodeProjectionQuery(
 func scopedEdgeProjectionQuery(
 	repoPrefixes, filePaths []string,
 	kind string,
+	viewGen int64,
 ) (string, []any, bool) {
 	if kind == "" {
 		return "", nil, false
 	}
 	filesJSON, haveFiles := projectionJSON(filePaths)
 	if !haveFiles {
-		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind)
+		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, viewGen)
 	}
 	reposJSON, haveRepos := projectionJSON(repoPrefixes)
 	ctes := []string{`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`}
@@ -309,7 +313,7 @@ func scopedEdgeProjectionQuery(
 		args = append(args, reposJSON)
 		repoPredicate = ` AND n.repo_prefix IN (SELECT repo_prefix FROM requested_repos)`
 	}
-	args = append(args, kind)
+	args = append(args, kind, viewGen)
 	query := `WITH ` + strings.Join(ctes, ", ") +
 		` SELECT e.id, ` + lookupQualifiedEdgeCols +
 		` FROM requested_files AS f` +
@@ -317,6 +321,7 @@ func scopedEdgeProjectionQuery(
 		` CROSS JOIN nodes AS n` +
 		` WHERE e.file_path = f.file_path AND e.kind = ?` +
 		` AND n.id = e.from_id AND n.file_path = e.file_path` + repoPredicate +
+		` AND e.view_gen = ? AND n.view_gen = e.view_gen` +
 		` AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
 	return query, args, true
 }
@@ -328,6 +333,7 @@ func scopedEdgeProjectionQuery(
 func scopedEdgeSourceProjectionQuery(
 	repoPrefixes, filePaths []string,
 	kind string,
+	viewGen int64,
 ) (string, []any, bool) {
 	if kind == "" {
 		return "", nil, false
@@ -344,10 +350,10 @@ func scopedEdgeSourceProjectionQuery(
 		query := `WITH requested_repos(repo_prefix) AS (` +
 			`SELECT CAST(value AS TEXT) FROM json_each(?))` +
 			` SELECT e.id, ` + lookupQualifiedEdgeCols +
-			` FROM nodes AS n JOIN edges AS e ON e.from_id = n.id` +
+			` FROM nodes AS n JOIN edges AS e ON e.from_id = n.id AND e.view_gen = n.view_gen` +
 			` JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix` +
-			` WHERE e.kind = ? AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
-		return query, []any{reposJSON, kind}, true
+			` WHERE e.kind = ? AND e.view_gen = ? AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
+		return query, []any{reposJSON, kind, viewGen}, true
 	}
 
 	ctes := []string{`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`}
@@ -358,13 +364,14 @@ func scopedEdgeSourceProjectionQuery(
 		args = append(args, reposJSON)
 		scopePredicate += ` AND n.repo_prefix IN (SELECT repo_prefix FROM requested_repos)`
 	}
-	args = append(args, kind)
+	args = append(args, kind, viewGen)
 	query := `WITH ` + strings.Join(ctes, ", ") +
 		` SELECT e.id, ` + lookupQualifiedEdgeCols +
 		` FROM requested_files AS f` +
 		` CROSS JOIN nodes AS n INDEXED BY nodes_by_file` +
 		` CROSS JOIN edges AS e INDEXED BY edges_by_from` +
 		` WHERE ` + scopePredicate + ` AND e.from_id = n.id AND e.kind = ?` +
+		` AND n.view_gen = ? AND e.view_gen = n.view_gen` +
 		` AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
 	return query, args, true
 }
@@ -390,7 +397,7 @@ func (s *Store) scopedEdgeFileProvenanceCanonical(
 		args = append(args, reposJSON)
 		repoPredicate = ` AND n.repo_prefix IN (SELECT repo_prefix FROM requested_repos)`
 	}
-	args = append(args, maxID)
+	args = append(args, s.viewGen, maxID)
 	query := `WITH ` + strings.Join(ctes, ", ") +
 		` SELECT NOT EXISTS (` +
 		`SELECT 1 FROM requested_files AS f` +
@@ -398,6 +405,7 @@ func (s *Store) scopedEdgeFileProvenanceCanonical(
 		` CROSS JOIN edges AS e INDEXED BY edges_by_from` +
 		` WHERE n.file_path = f.file_path AND e.from_id = n.id` +
 		` AND e.kind IN (SELECT kind FROM requested_kinds)` + repoPredicate +
+		` AND n.view_gen = ? AND e.view_gen = n.view_gen` +
 		` AND e.id <= ? AND e.file_path <> n.file_path LIMIT 1)`
 	var canonical bool
 	if err := s.db.QueryRow(query, args...).Scan(&canonical); err != nil {

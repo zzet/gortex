@@ -45,8 +45,9 @@ func CSharpSpec() *LangSpec {
 			}
 			return ""
 		},
-		LocalBinding: csharpLocalBinding,
-		Call:         csharpCall,
+		LocalBinding:   csharpLocalBinding,
+		MemberDeclName: csharpMemberDeclName,
+		Call:           csharpCall,
 		NewExprType: func(n *sitter.Node, src []byte) string {
 			if n.Type() != "object_creation_expression" {
 				return ""
@@ -224,4 +225,46 @@ func csharpCall(n *sitter.Node, src []byte) (*sitter.Node, string, bool) {
 	// A `this` receiver needs no special case: its content matches
 	// SelfName, so it resolves against the enclosing type.
 	return obj, fieldText(fn, "name", src), true
+}
+
+// csharpMemberDeclName spells the authoring member the way the extractor
+// names its node: methods, properties and accessor events by identifier,
+// field declarators by their own name, constructors as `<Type>.<init>`,
+// indexers as `this[]`. Local functions and lambdas are deliberately
+// absent — the extractor mints no node for them, so their calls belong to
+// the enclosing member, exactly where its stubs already sit.
+func csharpMemberDeclName(n *sitter.Node, src []byte) (string, bool) {
+	switch n.Type() {
+	case "method_declaration", "property_declaration", "event_declaration":
+		name := fieldText(n, "name", src)
+		return name, name != ""
+	case "constructor_declaration":
+		if owner := csharpEnclosingTypeName(n, src); owner != "" {
+			return owner + ".<init>", true
+		}
+	case "indexer_declaration":
+		return "this[]", true
+	case "variable_declarator":
+		// Only a FIELD's declarator owns code (its initializer); a local's
+		// declarator sits inside a member named above already.
+		if p := n.Parent(); p != nil && p.Type() == "variable_declaration" {
+			if gp := p.Parent(); gp != nil && gp.Type() == "field_declaration" {
+				name := csharpDeclaratorName(n, src)
+				return name, name != ""
+			}
+		}
+	}
+	return "", false
+}
+
+// csharpEnclosingTypeName returns the name of the nearest type
+// declaration enclosing n ("" at file scope).
+func csharpEnclosingTypeName(n *sitter.Node, src []byte) string {
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		switch p.Type() {
+		case "class_declaration", "struct_declaration", "record_declaration", "interface_declaration":
+			return fieldText(p, "name", src)
+		}
+	}
+	return ""
 }

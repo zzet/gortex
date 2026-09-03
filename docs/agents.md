@@ -18,6 +18,14 @@ config file can prove, whether the hooks it declares are actually running. Both
 commands accept `--agents=<csv>` to constrain setup and
 `--agents-skip=<csv>` to exclude an adapter.
 
+## Worktrees and branch views
+
+Agent sessions inherit a view from their CWD. A linked worktree is discovered automatically as an overlay over its Git family's designated primary; agents should not explicitly track it unless the user asks for a dedicated logical graph. Overall queries remain coherent: overlay and primary results are composed, overlay data wins only for duplicate logical identities, and tombstones hide deleted base identities.
+
+Agents must inspect response freshness. `exact: false` means the requested view was not served, and every fallback is read-only. Use `require_exact: true` to reject fallback, `require_fresh: true` to wait for current filesystem state, and an absolute RFC3339 `wait_deadline` to bound the wait. When CWD is not the target, pass an explicit selector such as `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive refs provide immutable committed source and structural graph only—no working-copy LSP, `search.text`, or edits. Exact worktree edits are supported through the approved coordinator-backed path.
+
+Checkout removal and primary changes are destructive administration. Preview primary closure, family forget, and `set-primary` effects and obtain explicit user confirmation before confirming them.
+
 ## Adapter matrix
 
 | Name            | What gets written                                                                               | Mode       | Docs link                                                           |

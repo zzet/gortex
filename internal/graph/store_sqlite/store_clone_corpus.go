@@ -97,10 +97,10 @@ func (s *Store) BulkSetCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := upsertCloneCorpusTx(tx, repoPrefix, rows); err != nil {
+	if err := upsertCloneCorpusTx(tx, s.viewGen, repoPrefix, rows); err != nil {
 		return err
 	}
-	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
+	if err := markCloneCorpusInitializedTx(tx, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -120,16 +120,16 @@ func (s *Store) BulkSetCloneSignatures(repoPrefix string, updates []graph.CloneC
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := updateCloneSignaturesTx(tx, repoPrefix, updates); err != nil {
+	if err := updateCloneSignaturesTx(tx, s.viewGen, repoPrefix, updates); err != nil {
 		return err
 	}
-	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
+	if err := markCloneCorpusInitializedTx(tx, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func updateCloneSignaturesTx(tx *sql.Tx, repoPrefix string, updates []graph.CloneCorpusSignatureUpdate) error {
+func updateCloneSignaturesTx(tx *sql.Tx, viewGen int64, repoPrefix string, updates []graph.CloneCorpusSignatureUpdate) error {
 	for start := 0; start < len(updates); start += shingleChunk {
 		end := min(start+shingleChunk, len(updates))
 		batch := updates[start:end]
@@ -150,25 +150,28 @@ func updateCloneSignaturesTx(tx *sql.Tx, repoPrefix string, updates []graph.Clon
 		}
 		cases.WriteString(" ELSE signature END")
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-		args = append(args, repoPrefix)
+		args = append(args, viewGen, repoPrefix)
 		for _, id := range ids {
 			args = append(args, id)
 		}
 		query := `UPDATE clone_shingles SET signature = ` + cases.String() + `
-WHERE repo_prefix = ? AND node_id IN (` + placeholders + `)`
+WHERE view_gen = ? AND repo_prefix = ? AND node_id IN (` + placeholders + `)`
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
 		}
 
-		nodeArgs := make([]any, 0, len(ids)+1)
+		// The nodes.clone_sig mirror reads back the signature this handle just
+		// wrote, so its subqueries carry the same generation scope.
+		nodeArgs := make([]any, 0, len(ids)+4)
+		nodeArgs = append(nodeArgs, viewGen)
 		for _, id := range ids {
 			nodeArgs = append(nodeArgs, id)
 		}
-		nodeArgs = append(nodeArgs, repoPrefix)
+		nodeArgs = append(nodeArgs, repoPrefix, viewGen, viewGen)
 		updateNodes := `UPDATE nodes
-SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id), '')
-WHERE id IN (` + placeholders + `) AND repo_prefix = ?
-  AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id), '')`
+SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')
+WHERE id IN (` + placeholders + `) AND repo_prefix = ? AND view_gen = ?
+  AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')`
 		if _, err := tx.Exec(updateNodes, nodeArgs...); err != nil {
 			return err
 		}
@@ -187,29 +190,29 @@ func (s *Store) ReplaceCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if _, err := tx.Exec(`DELETE FROM clone_shingles WHERE repo_prefix = ?`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`DELETE FROM clone_shingles WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE nodes SET clone_sig = NULL WHERE repo_prefix = ? AND clone_sig IS NOT NULL`, repoPrefix); err != nil {
+	if _, err := tx.Exec(`UPDATE nodes SET clone_sig = NULL WHERE repo_prefix = ? AND view_gen = ? AND clone_sig IS NOT NULL`, repoPrefix, s.viewGen); err != nil {
 		return err
 	}
-	if err := upsertCloneCorpusTx(tx, repoPrefix, rows); err != nil {
+	if err := upsertCloneCorpusTx(tx, s.viewGen, repoPrefix, rows); err != nil {
 		return err
 	}
-	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
+	if err := markCloneCorpusInitializedTx(tx, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func upsertCloneCorpusTx(tx *sql.Tx, repoPrefix string, rows []graph.CloneCorpusRow) error {
+func upsertCloneCorpusTx(tx *sql.Tx, viewGen int64, repoPrefix string, rows []graph.CloneCorpusRow) error {
 	for start := 0; start < len(rows); start += shingleChunk {
 		end := start + shingleChunk
 		if end > len(rows) {
 			end = len(rows)
 		}
 		batch := rows[start:end]
-		args := make([]any, 0, len(batch)*5)
+		args := make([]any, 0, len(batch)*6)
 		var values strings.Builder
 		for _, row := range batch {
 			if row.NodeID == "" {
@@ -218,7 +221,7 @@ func upsertCloneCorpusTx(tx *sql.Tx, repoPrefix string, rows []graph.CloneCorpus
 			if values.Len() > 0 {
 				values.WriteByte(',')
 			}
-			values.WriteString("(?, ?, ?, ?, ?)")
+			values.WriteString("(?, ?, ?, ?, ?, ?)")
 			var signature any
 			if row.Finalized {
 				signature = row.Signature
@@ -227,13 +230,13 @@ func upsertCloneCorpusTx(tx *sql.Tx, repoPrefix string, rows []graph.CloneCorpus
 			if row.RepoPrefix != "" {
 				prefix = row.RepoPrefix
 			}
-			args = append(args, row.NodeID, prefix, encodeShingles(row.Shingles), signature, row.TokenCount)
+			args = append(args, viewGen, row.NodeID, prefix, encodeShingles(row.Shingles), signature, row.TokenCount)
 		}
 		if values.Len() == 0 {
 			continue
 		}
-		query := `INSERT INTO clone_shingles (node_id, repo_prefix, shingles, signature, token_count) VALUES ` + values.String() + `
-ON CONFLICT(node_id) DO UPDATE SET
+		query := `INSERT INTO clone_shingles (view_gen, node_id, repo_prefix, shingles, signature, token_count) VALUES ` + values.String() + `
+ON CONFLICT(view_gen, node_id) DO UPDATE SET
  repo_prefix=excluded.repo_prefix,
  shingles=excluded.shingles,
  token_count=excluded.token_count,
@@ -262,14 +265,16 @@ WHERE clone_shingles.repo_prefix IS NOT excluded.repo_prefix
 			continue
 		}
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-		updateArgs := make([]any, len(ids))
+		updateArgs := make([]any, 0, len(ids)+3)
+		updateArgs = append(updateArgs, viewGen)
 		for i := range ids {
-			updateArgs[i] = ids[i]
+			updateArgs = append(updateArgs, ids[i])
 		}
+		updateArgs = append(updateArgs, viewGen, viewGen)
 		update := `UPDATE nodes
-SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id), '')
-WHERE id IN (` + placeholders + `)
-  AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id), '')`
+SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')
+WHERE id IN (` + placeholders + `) AND view_gen = ?
+  AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')`
 		if _, err := tx.Exec(update, updateArgs...); err != nil {
 			return err
 		}
@@ -283,7 +288,7 @@ WHERE id IN (` + placeholders + `)
 func (s *Store) CloneCorpusInitialized(repoPrefix string) (bool, error) {
 	var initialized bool
 	if err := s.db.QueryRow(`SELECT EXISTS(
-SELECT 1 FROM clone_corpus_state WHERE repo_prefix = ?)`, repoPrefix).Scan(&initialized); err != nil {
+SELECT 1 FROM clone_corpus_state WHERE view_gen = ? AND repo_prefix = ?)`, s.viewGen, repoPrefix).Scan(&initialized); err != nil {
 		return false, err
 	}
 	return initialized, nil
@@ -299,14 +304,14 @@ func (s *Store) MarkCloneCorpusInitialized(repoPrefix string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := markCloneCorpusInitializedTx(tx, repoPrefix); err != nil {
+	if err := markCloneCorpusInitializedTx(tx, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func markCloneCorpusInitializedTx(tx *sql.Tx, repoPrefix string) error {
-	_, err := tx.Exec(`INSERT OR IGNORE INTO clone_corpus_state (repo_prefix) VALUES (?)`, repoPrefix)
+func markCloneCorpusInitializedTx(tx *sql.Tx, viewGen int64, repoPrefix string) error {
+	_, err := tx.Exec(`INSERT OR IGNORE INTO clone_corpus_state (view_gen, repo_prefix) VALUES (?, ?)`, viewGen, repoPrefix)
 	return err
 }
 
@@ -320,9 +325,9 @@ func (s *Store) CloneCorpusPage(repoPrefix, afterNodeID string, limit int) ([]gr
 	rows, err := s.db.Query(`
 SELECT node_id, shingles, signature, token_count
 FROM clone_shingles
-WHERE repo_prefix = ? AND node_id > ?
+WHERE view_gen = ? AND repo_prefix = ? AND node_id > ?
 ORDER BY node_id
-LIMIT ?`, repoPrefix, afterNodeID, limit)
+LIMIT ?`, s.viewGen, repoPrefix, afterNodeID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -390,6 +395,8 @@ func ensureCloneCorpusColumns(db cloneCorpusSchemaDB) error {
 			return fmt.Errorf("add clone token count: %w", err)
 		}
 	}
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS clone_shingles_by_repo ON clone_shingles(repo_prefix, node_id)`)
-	return err
+	// clone_shingles_by_repo leads with view_gen, a column the v15 step adds,
+	// so it is created from the shared sidecar registry after the migration
+	// steps run rather than here — this function runs before them.
+	return nil
 }

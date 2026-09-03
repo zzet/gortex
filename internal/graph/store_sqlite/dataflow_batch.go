@@ -54,8 +54,8 @@ func (s *Store) edgeKindHighWater(kinds []string) (int64, bool) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	query := `SELECT COALESCE(MAX(id), 0) FROM edges WHERE kind IN (` +
-		inPlaceholders(len(kinds)) + `)`
-	rows, err := s.queryActiveWriteLocked(context.Background(), query, toAnyArgs(kinds)...)
+		inPlaceholders(len(kinds)) + `) AND view_gen = ?`
+	rows, err := s.queryActiveWriteLocked(context.Background(), query, append(toAnyArgs(kinds), s.viewGen)...)
 	if err != nil {
 		panicOnFatal(err)
 		return 0, false
@@ -87,13 +87,13 @@ func (s *Store) edgeKindPage(
 	       confidence, confidence_label, origin, tier, cross_repo,
 	       meta, resolve_terminal, resolve_terminal_reason, semantic_source
 	FROM edges NOT INDEXED
-	WHERE id > ? AND id <= ? AND kind IN (` + inPlaceholders(len(kinds)) + `)
+	WHERE id > ? AND id <= ? AND kind IN (` + inPlaceholders(len(kinds)) + `) AND view_gen = ?
 	ORDER BY id
 	LIMIT ?`
-	args := make([]any, 0, len(kinds)+3)
+	args := make([]any, 0, len(kinds)+4)
 	args = append(args, after, highWater)
 	args = append(args, toAnyArgs(kinds)...)
-	args = append(args, limit)
+	args = append(args, s.viewGen, limit)
 	rows, err := s.queryActiveWriteLocked(context.Background(), query, args...)
 	if err != nil {
 		panicOnFatal(err)
@@ -200,9 +200,9 @@ func (s *Store) dataflowLightEdgesByNodeIDs(
 		end := minInt(start+lookupChunkSize, len(uniq))
 		chunk := uniq[start:end]
 		query := `SELECT ` + edgeColsLight + ` FROM edges WHERE ` + column + ` IN (` +
-			inPlaceholders(len(chunk)) + `) AND kind = ? ORDER BY id`
+			inPlaceholders(len(chunk)) + `) AND kind = ? AND view_gen = ? ORDER BY id`
 		args := toAnyArgs(chunk)
-		args = append(args, string(kind))
+		args = append(args, string(kind), s.viewGen)
 		for _, edge := range s.queryDataflowLightActive(query, args...) {
 			out[key(edge)] = append(out[key(edge)], edge)
 		}

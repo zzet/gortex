@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -10,17 +11,27 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
+// builtinSeenKey namespaces a materialised builtin stub by the generation it
+// was written into.
+func builtinSeenKey(viewGen int64, id string) string {
+	return strconv.FormatInt(viewGen, 10) + "\x00" + id
+}
+
+// view_gen leads both insert column lists: it is part of the nodes primary key
+// and of the edges dedup key, and every writer binds the handle's pinned
+// generation for it. It is NOT part of the read column lists — reads scan a row
+// into a graph.Node / graph.Edge, which carry no generation.
 const (
-	nodeInsertColumns = lookupNodeCols
-	nodeInsertParams  = 35
+	nodeInsertColumns = viewGenColumnName + ", " + lookupNodeCols
+	nodeInsertParams  = 36
 	// The package-private compatibility writer retains the conservative shape.
 	nodeInsertChunkSize = 35
 	// AddBatch uses the runtime SQLite variable limit, but never lets one node
 	// statement retain more than 256 rows or the shared byte cap below.
 	nodeInsertMaxChunkSize = 256
 
-	edgeInsertColumns = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason, semantic_source`
-	edgeInsertParams  = 14
+	edgeInsertColumns = viewGenColumnName + ", " + lookupEdgeCols
+	edgeInsertParams  = 15
 	// The package-private compatibility writer retains the conservative shape.
 	// Edges carry half as many parameters as nodes, so the same variable and
 	// byte budgets permit twice as many rows per statement.
@@ -37,8 +48,10 @@ const (
 
 // nodeUpsertClause is shared by the single-row prepared statement and the
 // bounded multi-row AddBatch writer. Keeping one conflict predicate preserves
-// exact no-op/change semantics across both paths.
-const nodeUpsertClause = ` ON CONFLICT(id) DO UPDATE SET
+// exact no-op/change semantics across both paths. The conflict target names the
+// whole nodes primary key: a write for one generation must update that
+// generation's row, never another's.
+const nodeUpsertClause = ` ON CONFLICT(id, view_gen) DO UPDATE SET
 kind=excluded.kind, name=excluded.name, qual_name=excluded.qual_name,
 file_path=excluded.file_path, start_line=excluded.start_line, end_line=excluded.end_line,
 start_column=excluded.start_column, end_column=excluded.end_column,
@@ -177,13 +190,14 @@ func lowerBatchVariableLimit(variableLimit *int, paramsPerRow, failedRows int) i
 	return rows
 }
 
-func appendNodeInsertArgs(args []any, n *graph.Node) ([]any, error) {
+func appendNodeInsertArgs(args []any, viewGen int64, n *graph.Node) ([]any, error) {
 	promoted, blobMeta := extractPromotedMeta(stripCloneShingles(n.Meta))
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
 		return nil, err
 	}
 	return append(args,
+		viewGen,
 		n.ID, string(n.Kind), n.Name, n.QualName, n.FilePath,
 		n.StartLine, n.EndLine, n.StartColumn, n.EndColumn, n.Language,
 		n.RepoPrefix, n.WorkspaceID, n.ProjectID,
@@ -196,7 +210,7 @@ func appendNodeInsertArgs(args []any, n *graph.Node) ([]any, error) {
 	), nil
 }
 
-func appendEdgeInsertArgs(args []any, e *graph.Edge) ([]any, error) {
+func appendEdgeInsertArgs(args []any, viewGen int64, e *graph.Edge) ([]any, error) {
 	promoted, blobMeta := extractPromotedEdgeMeta(e.Meta)
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
@@ -207,6 +221,7 @@ func appendEdgeInsertArgs(args []any, e *graph.Edge) ([]any, error) {
 		crossRepo = 1
 	}
 	return append(args,
+		viewGen,
 		e.From, e.To, string(e.Kind), e.FilePath, e.Line,
 		e.Confidence, e.ConfidenceLabel, e.Origin, e.Tier,
 		crossRepo, metaBlob, promoted.resolveTerminal, promoted.resolveTerminalReason, promoted.semanticSource,
@@ -232,12 +247,12 @@ func multiValues(rows, params int) string {
 	return values.String()
 }
 
-func insertNodeChunksTx(tx *sql.Tx, nodes []*graph.Node, returnChanged bool) (rowsChanged, statements int, changedIDs map[string]int, err error) {
+func insertNodeChunksTx(tx *sql.Tx, viewGen int64, nodes []*graph.Node, returnChanged bool) (rowsChanged, statements int, changedIDs map[string]int, err error) {
 	variableLimit := sqliteFallbackVariableLimit
-	return insertNodeChunksTxLimited(tx, nodes, returnChanged, &variableLimit)
+	return insertNodeChunksTxLimited(tx, viewGen, nodes, returnChanged, &variableLimit)
 }
 
-func insertNodeChunksTxLimited(tx *sql.Tx, nodes []*graph.Node, returnChanged bool, variableLimit *int) (rowsChanged, statements int, changedIDs map[string]int, err error) {
+func insertNodeChunksTxLimited(tx *sql.Tx, viewGen int64, nodes []*graph.Node, returnChanged bool, variableLimit *int) (rowsChanged, statements int, changedIDs map[string]int, err error) {
 	if returnChanged {
 		changedIDs = make(map[string]int)
 	}
@@ -265,7 +280,7 @@ func insertNodeChunksTxLimited(tx *sql.Tx, nodes []*graph.Node, returnChanged bo
 				pos++
 				continue
 			}
-			candidate, appendErr := appendNodeInsertArgs(args, node)
+			candidate, appendErr := appendNodeInsertArgs(args, viewGen, node)
 			if appendErr != nil {
 				return rowsChanged, statements, changedIDs, appendErr
 			}
@@ -368,12 +383,12 @@ func insertNodeChunksTxLimited(tx *sql.Tx, nodes []*graph.Node, returnChanged bo
 	return rowsChanged, statements, changedIDs, nil
 }
 
-func insertEdgeChunksTx(tx *sql.Tx, edges []*graph.Edge, returnInserted bool) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
+func insertEdgeChunksTx(tx *sql.Tx, viewGen int64, edges []*graph.Edge, returnInserted bool) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
 	variableLimit := sqliteFallbackVariableLimit
-	return insertEdgeChunksTxLimited(tx, edges, returnInserted, &variableLimit)
+	return insertEdgeChunksTxLimited(tx, viewGen, edges, returnInserted, &variableLimit)
 }
 
-func insertEdgeChunksTxLimited(tx *sql.Tx, edges []*graph.Edge, returnInserted bool, variableLimit *int) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
+func insertEdgeChunksTxLimited(tx *sql.Tx, viewGen int64, edges []*graph.Edge, returnInserted bool, variableLimit *int) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
 	if returnInserted {
 		insertedKeys = make(map[sqliteEdgeIdentity]int)
 	}
@@ -401,7 +416,7 @@ func insertEdgeChunksTxLimited(tx *sql.Tx, edges []*graph.Edge, returnInserted b
 				pos++
 				continue
 			}
-			candidate, appendErr := appendEdgeInsertArgs(args, edge)
+			candidate, appendErr := appendEdgeInsertArgs(args, viewGen, edge)
 			if appendErr != nil {
 				return rowsInserted, statements, insertedKeys, appendErr
 			}
@@ -524,11 +539,30 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// Lazy builtin-sentinel materialization, mirroring Graph.AddBatch: give
 	// every ::builtin:: edge target a real KindBuiltin node so those edges
 	// stop reading as orphans. The per-store seen-set keeps warm re-indexes
-	// from re-upserting identical stubs on every batch.
+	// from re-upserting identical stubs on every batch. It is keyed by
+	// generation: the set is shared by every handle over one core, so a stub
+	// the base corpus already holds must not suppress the same stub in a
+	// derived generation that has never had it written.
+	// builtinSeen is shared by every generation handle over one store. Pair its
+	// admission with the writer lock so another batch cannot observe a key whose
+	// transaction later rolls back and omit the corresponding stub.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var freshBuiltinKeys []string
+	builtinKeysCommitted := false
+	defer func() {
+		if builtinKeysCommitted {
+			return
+		}
+		for _, key := range freshBuiltinKeys {
+			s.builtinSeen.Delete(key)
+		}
+	}()
 	if stubs := graph.BuiltinStubNodes(edges); len(stubs) > 0 {
 		var fresh []*graph.Node
 		for _, stub := range stubs {
-			if _, dup := s.builtinSeen.LoadOrStore(stub.ID, struct{}{}); !dup {
+			key := builtinSeenKey(s.viewGen, stub.ID)
+			if _, dup := s.builtinSeen.LoadOrStore(key, struct{}{}); !dup {
 				fresh = append(fresh, stub)
 			}
 		}
@@ -536,8 +570,6 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 			nodes = append(append(make([]*graph.Node, 0, len(nodes)+len(fresh)), nodes...), fresh...)
 		}
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 
 	hasGraphInput := false
 	for _, node := range nodes {
@@ -621,7 +653,7 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				ids = append(ids, edge.From)
 			}
 		}
-		identities, err = mutationNodeIdentitiesTx(tx, ids)
+		identities, err = mutationNodeIdentitiesTx(tx, s.viewGen, ids)
 		if err != nil {
 			identityExact = false
 			identities = make(map[string]sqliteMutationNodeIdentity)
@@ -644,15 +676,15 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	}
 	var changedNodeIDs map[string]int
 	if useJSONB {
-		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTxWithBuffers(tx, nodes, receiptDelta != nil, &s.jsonbIngestBuffers)
+		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTxWithBuffers(tx, s.viewGen, nodes, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
-		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksTxLimited(tx, nodes, receiptDelta != nil, &variableLimit)
+		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksTxLimited(tx, s.viewGen, nodes, receiptDelta != nil, &variableLimit)
 	}
 	if err != nil {
 		return stats, err
 	}
 	if corpusRows := cloneCorpusRowsFromNodes(nodes); len(corpusRows) > 0 {
-		if err := upsertCloneCorpusTx(tx, "", corpusRows); err != nil {
+		if err := upsertCloneCorpusTx(tx, s.viewGen, "", corpusRows); err != nil {
 			return stats, err
 		}
 	}
@@ -692,9 +724,9 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 
 	var insertedEdgeKeys map[sqliteEdgeIdentity]int
 	if useJSONB {
-		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTxWithBuffers(tx, edges, receiptDelta != nil, &s.jsonbIngestBuffers)
+		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTxWithBuffers(tx, s.viewGen, edges, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
-		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksTxLimited(tx, edges, receiptDelta != nil, &variableLimit)
+		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksTxLimited(tx, s.viewGen, edges, receiptDelta != nil, &variableLimit)
 	}
 	if err != nil {
 		return stats, err

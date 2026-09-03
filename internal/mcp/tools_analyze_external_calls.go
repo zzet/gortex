@@ -102,6 +102,8 @@ func (s *Server) externalCallsRollup(ctx context.Context, req mcp.CallToolReques
 		return s.emitExternalCallsRollup(ctx, req, nil)
 	}
 
+	// Hoisted once — the caller-tally below runs per external symbol.
+	reader := s.readerFor(ctx)
 	for _, n := range s.scopedNodes(ctx) {
 		if n == nil {
 			continue
@@ -115,7 +117,7 @@ func (s *Server) externalCallsRollup(ctx context.Context, req mcp.CallToolReques
 			continue
 		}
 		row.Symbols++
-		row.Calls += countCallersToExternal(s.graph, n.ID)
+		row.Calls += countCallersToExternal(reader, n.ID)
 	}
 
 	rows := make([]*externalModuleRow, 0, len(byModule))
@@ -138,7 +140,8 @@ func (s *Server) externalCallsRollup(ctx context.Context, req mcp.CallToolReques
 // externalCallsForModule lists every external symbol attributed to one
 // KindModule, with its caller count.
 func (s *Server) externalCallsForModule(ctx context.Context, req mcp.CallToolRequest, moduleID, nameFilter string) (*mcp.CallToolResult, error) {
-	mod := s.graph.GetNode(moduleID)
+	reader := s.readerFor(ctx)
+	mod := reader.GetNode(moduleID)
 	rows := []*externalSymbolRow{}
 	if mod != nil && mod.Kind == graph.KindModule {
 		for _, n := range s.scopedNodes(ctx) {
@@ -155,7 +158,7 @@ func (s *Server) externalCallsForModule(ctx context.Context, req mcp.CallToolReq
 			if nameFilter != "" && !strings.Contains(strings.ToLower(n.Name), nameFilter) {
 				continue
 			}
-			calls, callers := tallyExternalCallers(s.graph, n.ID)
+			calls, callers := tallyExternalCallers(reader, n.ID)
 			importPath, _ := n.Meta["import_path"].(string)
 			rows = append(rows, &externalSymbolRow{
 				ID:      n.ID,
@@ -247,7 +250,7 @@ func suffixVersion(v string) string {
 // countCallersToExternal counts every incoming non-EdgeDependsOnModule
 // edge to an external symbol node — those are the calls / references
 // that goanalysis attributed.
-func countCallersToExternal(g graph.Store, nodeID string) int {
+func countCallersToExternal(g graph.Reader, nodeID string) int {
 	n := 0
 	for _, e := range g.GetInEdges(nodeID) {
 		if e.Kind == graph.EdgeDependsOnModule {
@@ -260,7 +263,7 @@ func countCallersToExternal(g graph.Store, nodeID string) int {
 
 // tallyExternalCallers returns (totalCallEdges, distinctCallers) — the
 // detail surface for the per-module symbol listing.
-func tallyExternalCallers(g graph.Store, nodeID string) (int, int) {
+func tallyExternalCallers(g graph.Reader, nodeID string) (int, int) {
 	calls := 0
 	seen := map[string]struct{}{}
 	for _, e := range g.GetInEdges(nodeID) {

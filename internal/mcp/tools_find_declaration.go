@@ -89,11 +89,11 @@ func (s *Server) handleFindDeclaration(ctx context.Context, req mcp.CallToolRequ
 
 	// Stage 2 — resolve each use site to a declaration.
 	eng := s.engineFor(ctx)
-	// Pass the NodesInFilesByKindFinder capability when the backend
-	// implements it; buildDeclFileIndex falls back to AllNodes() when
-	// finder is nil (e.g. behind an overlay view that doesn't expose
-	// the capability).
-	finder, _ := s.graph.(graph.NodesInFilesByKindFinder)
+	// Pass the NodesInFilesByKindFinder capability when the request
+	// reader implements it; buildDeclFileIndex falls back to AllNodes()
+	// when finder is nil (e.g. behind an overlay view that doesn't
+	// expose the capability), and that walk reads the overlay too.
+	finder, _ := s.readerFor(ctx).(graph.NodesInFilesByKindFinder)
 	fileIdx := buildDeclFileIndex(eng, finder, matches)
 
 	groups := make(map[string]*declGroup)

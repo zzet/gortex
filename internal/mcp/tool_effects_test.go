@@ -32,6 +32,8 @@ func TestLegacyEffectRegistryNamesAreRegistered(t *testing.T) {
 		"proxy_disable": true, "proxy_enable": true,
 		"set_active_project": true, "tools_search": true,
 		"track_repository": true, "untrack_repository": true,
+		"forget_checkout": true, "set_primary_checkout": true,
+		"reconcile_checkouts": true,
 	}
 	for name := range daemon.ToolEffects {
 		if facades[name] || conditionalLegacy[name] {

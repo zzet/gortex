@@ -370,17 +370,7 @@ func decorateResultWithScope(res *mcp.CallToolResult, scope ResolvedScope) *mcp.
 		"scope_applied":    scopeApplied(scope),
 		"scope_widen_hint": `to widen: pass repo:"*" or project:<name> or scope:<name>`,
 	}
-	if res.Meta == nil {
-		res.Meta = mcp.NewMetaFromMap(fields)
-		return res
-	}
-	if res.Meta.AdditionalFields == nil {
-		res.Meta.AdditionalFields = map[string]any{}
-	}
-	for k, v := range fields {
-		res.Meta.AdditionalFields[k] = v
-	}
-	return res
+	return mergeResultMeta(res, fields)
 }
 
 // scopeZeroNote is the body-visible variant of the scope disclosure for a
@@ -441,8 +431,9 @@ func (s *Server) sessionWorkspaceRepoSet(ctx context.Context) (map[string]bool, 
 		return nil, false
 	}
 	// A session bound to the repos its cwd contains carries the ceiling
-	// directly: its workspace slug is empty, and ReposInWorkspace("") is
-	// the empty set — which every clamp below reads as "nothing to clamp".
+	// directly. A bound empty result is deliberately distinct from unbound:
+	// it is a deny-all ceiling for an unresolved cwd, never permission to
+	// widen back to the whole graph.
 	if ceiling := s.sessionRepoCeiling(ctx); len(ceiling) > 0 {
 		return ceiling, true
 	}
@@ -460,11 +451,15 @@ func (s *Server) sessionWorkspaceRepoSet(ctx context.Context) (map[string]bool, 
 // slices. An unbound session gets cr back unchanged.
 func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.CommunityResult) *analysis.CommunityResult {
 	wsRepos, bound := s.sessionWorkspaceRepoSet(ctx)
-	if !bound || len(wsRepos) == 0 || cr == nil {
+	if !bound || cr == nil {
 		return cr
 	}
 	out := *cr
 	out.Communities = make([]analysis.Community, 0, len(cr.Communities))
+	out.NodeToComm = make(map[string]string)
+	if len(wsRepos) == 0 {
+		out.Modularity = 0
+	}
 	for _, c := range cr.Communities {
 		members := make([]string, 0, len(c.Members))
 		for _, m := range c.Members {
@@ -497,6 +492,9 @@ func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.Com
 		c.Files = files
 		c.Size = len(members)
 		out.Communities = append(out.Communities, c)
+		for _, member := range members {
+			out.NodeToComm[member] = c.ID
+		}
 	}
 	return &out
 }
@@ -507,7 +505,8 @@ func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.Com
 // same order: the session-workspace ceiling first, then the resolved repo
 // allow-set.
 //
-// An unattributed row — one whose prefix is empty — is admitted by both
+// Except for a bound-empty deny-all session, an unattributed row — one whose
+// prefix is empty — is admitted by both
 // gates. The allow-set half routes through repoNarrowAdmits, the single
 // definition of what a repo narrow does to something carrying no prefix;
 // the workspace half follows it for the same reason. Single-repo daemons
@@ -515,7 +514,10 @@ func (s *Server) communitiesInSessionScope(ctx context.Context, cr *analysis.Com
 // empty one. In multi-repo mode every row of both kinds this gates is
 // attributed at its source, so the admitted case does not arise there.
 func (s *Server) repoPrefixVisible(ctx context.Context, prefix string) bool {
-	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound && len(wsRepos) > 0 {
+	if wsRepos, bound := s.sessionWorkspaceRepoSet(ctx); bound {
+		if len(wsRepos) == 0 {
+			return false
+		}
 		if prefix != "" && !wsRepos[prefix] {
 			return false
 		}
@@ -550,7 +552,7 @@ func (s *Server) processesInSessionScope(ctx context.Context, pr *analysis.Proce
 		return pr
 	}
 	wsRepos, bound := s.sessionWorkspaceRepoSet(ctx)
-	clampWorkspace := bound && len(wsRepos) > 0
+	clampWorkspace := bound
 	repoAllow := repoAllowFromContext(ctx)
 	if !clampWorkspace && len(repoAllow) == 0 {
 		return pr

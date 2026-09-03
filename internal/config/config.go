@@ -525,6 +525,47 @@ type Config struct {
 	// depth-selection bounds, and the posting gate. Empty by default;
 	// the embedded default rules apply when no rule is configured.
 	Review ReviewConfig `mapstructure:"review" yaml:"review,omitempty"`
+	// Views bounds the payload kept for pinned views of committed state
+	// — branches, tags and commits nobody has checked out. Empty takes
+	// the shipped retention bounds.
+	Views ViewsConfig `mapstructure:"views" yaml:"views,omitempty"`
+}
+
+// ViewsConfig is the `views:` block. It bounds how much payload the
+// generations behind pinned ref views keep, per graph. Nothing else in a
+// repository's configuration governs a view: which views exist is decided by
+// what callers select, so retention is the only knob there is.
+type ViewsConfig struct {
+	// RetainInactive is how long a generation survives after the last
+	// selection of the view serving it, as a Go duration ("168h"). Empty
+	// takes the shipped window.
+	RetainInactive string `mapstructure:"retain_inactive" yaml:"retain_inactive,omitempty"`
+	// MaxCachedGenerations caps how many ref-view generations one graph
+	// keeps. Zero takes the shipped cap.
+	MaxCachedGenerations int `mapstructure:"max_cached_generations" yaml:"max_cached_generations,omitempty"`
+	// MaxBytesPerGraph caps the total recorded payload size, in bytes, of
+	// one graph's ref-view generations. Zero takes the shipped budget.
+	MaxBytesPerGraph int64 `mapstructure:"max_bytes_per_graph" yaml:"max_bytes_per_graph,omitempty"`
+	// LazyWorktreeActivation keeps a linked worktree discovered while the
+	// daemon is running dormant until a session or query selects it, the same
+	// way the startup inventory is always deferred. Off by default: a `git
+	// worktree add` after the daemon is up builds its view eagerly on
+	// discovery. The GORTEX_WORKTREE_LAZY_ACTIVATION env var overrides it.
+	LazyWorktreeActivation bool `mapstructure:"lazy_worktree_activation" yaml:"lazy_worktree_activation,omitempty"`
+}
+
+// RetainInactiveDuration parses RetainInactive. An empty or malformed value
+// yields 0, which every consumer reads as "unset" and fills from its own
+// default — the same posture the numeric bounds beside it take.
+func (v ViewsConfig) RetainInactiveDuration() time.Duration {
+	if v.RetainInactive == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v.RetainInactive)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
 }
 
 // ReviewConfig is the `review:` block. It carries every knob the

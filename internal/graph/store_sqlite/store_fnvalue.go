@@ -30,17 +30,17 @@ var _ graph.FnValuePlaceholderScanner = (*Store)(nil)
 // marker, the infix form requires a repo prefix before it), so no dedupe.
 func (s *Store) FnValuePlaceholderEdges() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		bare := s.queryEdgesSQL(`SELECT ` + lookupEdgeCols + `
+		bare := s.queryEdgesSQL(`SELECT `+lookupEdgeCols+`
 FROM edges
-WHERE to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;'`)
+WHERE to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;' AND view_gen = ?`, s.viewGen)
 		for _, e := range bare {
 			if !yield(e) {
 				return
 			}
 		}
-		prefixed := s.queryEdgesSQL(`SELECT ` + lookupEdgeCols + `
+		prefixed := s.queryEdgesSQL(`SELECT `+lookupEdgeCols+`
 FROM edges
-WHERE to_id LIKE '%::unresolved::fnvalue::%'`)
+WHERE to_id LIKE '%::unresolved::fnvalue::%' AND view_gen = ?`, s.viewGen)
 		for _, e := range prefixed {
 			if !yield(e) {
 				return

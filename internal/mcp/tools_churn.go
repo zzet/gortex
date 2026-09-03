@@ -70,19 +70,24 @@ func (s *Server) handleGetChurnRate(ctx context.Context, req mcp.CallToolRequest
 	sawMeta := false
 
 	usedSidecar := false
-	if reader, ok := s.graph.(graph.ChurnEnrichmentReader); ok {
+	// The sidecar is probed on the request's reader. An overlay view
+	// carries no churn rows, so an overlay-active call falls through to
+	// the meta scan below and reports churn for the symbols its buffers
+	// still define.
+	reader := s.readerFor(ctx)
+	if sidecar, ok := reader.(graph.ChurnEnrichmentReader); ok {
 		// Sidecar fast-path (change A): read the typed churn rows via an
 		// index over the (small) enriched set, then resolve their nodes
 		// in one batch — instead of scanning AllNodes and gob-decoding
 		// every meta blob to peek at Meta["churn"].
-		if enrich := reader.ChurnRows(""); len(enrich) > 0 {
+		if enrich := sidecar.ChurnRows(""); len(enrich) > 0 {
 			usedSidecar = true
 			sawMeta = true
 			ids := make([]string, 0, len(enrich))
 			for _, e := range enrich {
 				ids = append(ids, e.NodeID)
 			}
-			nodes := s.graph.GetNodesByIDs(ids)
+			nodes := reader.GetNodesByIDs(ids)
 			sessWS, _, bound := s.sessionScope(ctx)
 			var opts query.QueryOptions
 			if bound {

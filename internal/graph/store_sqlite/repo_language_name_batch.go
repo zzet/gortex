@@ -26,6 +26,10 @@ type resolverNameScopePayload struct {
 // use nodes_by_name and apply only their remaining cheap filters. CROSS JOIN
 // fixes the wanted rows as the outer loop, so each request performs an index
 // seek instead of inviting a scan of nodes.
+//
+// Bind order is the payload followed by one generation per UNION arm: the
+// wanted rows come from JSON and carry no generation, so each arm has to
+// constrain the nodes side itself. resolverNameScopeArgs builds the list.
 var resolverNameScopeQuery = `
 WITH raw_scopes AS MATERIALIZED (
     SELECT
@@ -64,6 +68,7 @@ CROSS JOIN nodes AS n INDEXED BY nodes_by_repo_language_name
 WHERE w.all_repos = 0 AND w.all_languages = 0
   AND n.repo_prefix = w.repo_prefix AND n.language = w.language
   AND n.name = w.name AND n.name <> ''
+  AND n.view_gen = ?
 UNION ALL
 SELECT w.scope_id, n.repo_prefix, n.language,
        ` + qualifiedNodeColumns("n", lookupNodeCols) + `
@@ -71,6 +76,7 @@ FROM wanted AS w
 CROSS JOIN nodes AS n INDEXED BY nodes_by_name
 WHERE w.all_repos = 1 AND w.all_languages = 0
   AND n.name = w.name AND n.language = w.language
+  AND n.view_gen = ?
 UNION ALL
 SELECT w.scope_id, '', '',
        ` + qualifiedNodeColumns("n", lookupNodeCols) + `
@@ -78,6 +84,7 @@ FROM wanted AS w
 CROSS JOIN nodes AS n INDEXED BY nodes_by_name
 WHERE w.all_repos = 0 AND w.all_languages = 1
   AND n.name = w.name AND n.repo_prefix = w.repo_prefix
+  AND n.view_gen = ?
 UNION ALL
 SELECT w.scope_id, n.repo_prefix, '',
        ` + qualifiedNodeColumns("n", lookupNodeCols) + `
@@ -85,7 +92,23 @@ FROM wanted AS w
 CROSS JOIN nodes AS n INDEXED BY nodes_by_name
 WHERE w.all_repos = 1 AND w.all_languages = 1
   AND n.name = w.name
+  AND n.view_gen = ?
 ORDER BY 1, 2, 3, 4`
+
+// resolverNameScopeUnionArms is the number of UNION arms in
+// resolverNameScopeQuery, each of which binds the generation once.
+const resolverNameScopeUnionArms = 4
+
+// resolverNameScopeArgs orders the payload bind ahead of one generation bind
+// per UNION arm, matching the placeholders' textual order.
+func resolverNameScopeArgs(payload []byte, viewGen int64) []any {
+	args := make([]any, 0, 1+resolverNameScopeUnionArms)
+	args = append(args, payload)
+	for i := 0; i < resolverNameScopeUnionArms; i++ {
+		args = append(args, viewGen)
+	}
+	return args
+}
 
 // FindNodesByResolverNameScopes performs one correlated read for every logical
 // resolver scope in a pending page. It uses one bind regardless of the number
@@ -118,7 +141,7 @@ func (s *Store) FindNodesByResolverNameScopes(scopes []graph.ResolverNameScope) 
 	if err != nil {
 		return nil, fmt.Errorf("sqlite resolver name scopes encode: %w", err)
 	}
-	rows, err := s.db.Query(resolverNameScopeQuery, payload)
+	rows, err := s.db.Query(resolverNameScopeQuery, resolverNameScopeArgs(payload, s.viewGen)...)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite resolver name scopes query: %w", err)
 	}
@@ -199,9 +222,10 @@ func (s *Store) FindNodesByNamesInRepoLanguages(names []string, repoPrefix strin
 	}
 
 	// lookupChunkSize stays well below SQLite's variable limit. Reserve one
-	// binding for repo_prefix and one for every compatible language; bound
-	// values do not expand the SQL text, so the placeholder string stays small.
-	nameChunkSize := lookupChunkSize - len(uniqLanguages) - 1
+	// binding for repo_prefix, one for the generation, and one for every
+	// compatible language; bound values do not expand the SQL text, so the
+	// placeholder string stays small.
+	nameChunkSize := lookupChunkSize - len(uniqLanguages) - 2
 	if nameChunkSize < 1 {
 		nameChunkSize = 1
 	}
@@ -215,8 +239,9 @@ func (s *Store) FindNodesByNamesInRepoLanguages(names []string, repoPrefix strin
 WHERE repo_prefix = ?
   AND language IN (` + languagePlaceholders + `)
   AND name IN (` + namePlaceholders + `)
-  AND name <> ''`
-		args := make([]any, 0, 1+len(uniqLanguages)+len(chunk))
+  AND name <> ''
+  AND view_gen = ?`
+		args := make([]any, 0, 2+len(uniqLanguages)+len(chunk))
 		args = append(args, repoPrefix)
 		for _, language := range uniqLanguages {
 			args = append(args, language)
@@ -224,6 +249,7 @@ WHERE repo_prefix = ?
 		for _, name := range chunk {
 			args = append(args, name)
 		}
+		args = append(args, s.viewGen)
 		for _, node := range s.queryNodesSQL(query, args...) {
 			if node != nil {
 				out[node.Name] = append(out[node.Name], node)

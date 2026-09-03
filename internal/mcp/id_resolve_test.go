@@ -59,14 +59,15 @@ func TestResolveSymbolID_WithoutMultiIndexer_StillAnchorsThePath(t *testing.T) {
 
 func TestResolveNameToIDs(t *testing.T) {
 	s := nameResolveServer(t)
-	got := s.resolveNameToIDs("Bar")
+	ctx := context.Background()
+	got := s.resolveNameToIDs(ctx, "Bar")
 	// Two definitions, the KindLocal excluded, sorted.
 	require.Equal(t, []string{"pkg/foo.go::Bar", "pkg/other.go::Bar"}, got)
 
 	// Unique name → single id.
-	require.Equal(t, []string{"pkg/foo.go::Baz"}, s.resolveNameToIDs("Baz"))
+	require.Equal(t, []string{"pkg/foo.go::Baz"}, s.resolveNameToIDs(ctx, "Baz"))
 	// No match → nil.
-	require.Nil(t, s.resolveNameToIDs("Nope"))
+	require.Nil(t, s.resolveNameToIDs(ctx, "Nope"))
 }
 
 func TestSymbolTargetArgExactIDWins(t *testing.T) {

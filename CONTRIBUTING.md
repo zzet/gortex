@@ -87,7 +87,7 @@ make lint      # golangci-lint run --timeout=5m
 ```
 
 **A green test run is not the full CI gate.** CI pins golangci-lint to
-**v2.11.4** and fails the build on any finding. Run it locally before opening a
+**v2.13.1** and fails the build on any finding. Run it locally before opening a
 PR — config lives in [`.golangci.yaml`](.golangci.yaml).
 
 ```bash

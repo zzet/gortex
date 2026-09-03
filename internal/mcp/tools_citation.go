@@ -54,7 +54,7 @@ func (s *Server) handleVerifyCitation(ctx context.Context, req mcp.CallToolReque
 	// on `file_path`, or the sole tracked repo's root for an unqualified
 	// path. The shared resolveFilePath already encodes both rules and
 	// rejects escapes.
-	absPath, relPath, err := s.resolveFilePath(rawPath)
+	absPath, relPath, err := s.resolveFilePath(ctx, rawPath)
 	if err != nil {
 		return s.respondJSONOrTOON(ctx, req, citationFailure(sha, rawPath, fmt.Sprintf("resolve path: %v", err)))
 	}

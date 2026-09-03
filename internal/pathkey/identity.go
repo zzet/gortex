@@ -139,6 +139,73 @@ func SamePathIdentity(a, b string) bool {
 	return os.SameFile(ai, bi)
 }
 
+// CanonicalExistingRoot returns a stable absolute identity for an existing
+// filesystem root. It resolves aliases such as macOS's /tmp -> /private/tmp,
+// while retaining the clean absolute spelling when symlink resolution is not
+// possible (for example, when a previously configured root is offline).
+func CanonicalExistingRoot(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return filepath.Clean(root)
+	}
+	abs = NormalizeVolume(filepath.Clean(abs))
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs
+	}
+	return NormalizeVolume(filepath.Clean(resolved))
+}
+
+// CanonicalPath returns the physical spelling of path while preserving a
+// suffix that does not exist yet. It is the request-path counterpart to
+// CanonicalExistingRoot: editor buffers and disappeared worktrees routinely
+// name a missing leaf, but their nearest existing ancestor still carries the
+// alias (/tmp versus /private/tmp, or a symlinked workspace) that routing must
+// resolve. If no ancestor can be resolved, the clean absolute spelling is
+// retained.
+func CanonicalPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	abs = NormalizeVolume(filepath.Clean(abs))
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return NormalizeVolume(filepath.Clean(resolved))
+	}
+
+	current := abs
+	missing := make([]string, 0, 4)
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return abs
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+		resolved, err := filepath.EvalSymlinks(current)
+		if err != nil {
+			continue
+		}
+		for i := len(missing) - 1; i >= 0; i-- {
+			resolved = filepath.Join(resolved, missing[i])
+		}
+		return NormalizeVolume(filepath.Clean(resolved))
+	}
+}
+
+// CanonicalHasPathPrefix reports lexical containment first, then retries after
+// canonicalizing both operands. The lexical fast path is not only cheaper for
+// the ordinary same-spelling case: it preserves containment when a configured
+// child has gone offline and therefore cannot be symlink-resolved while its
+// still-existing parent can. The canonical fallback keeps routing across
+// aliases such as macOS's /tmp -> /private/tmp.
+func CanonicalHasPathPrefix(path, prefix string) bool {
+	if HasPathPrefix(path, prefix) {
+		return true
+	}
+	return HasPathPrefix(CanonicalPath(path), CanonicalPath(prefix))
+}
+
 // volumeNameLen returns the length of the leading Windows-style volume
 // component of p — a drive letter ("c:") or a UNC root ("\\host\share").
 // It uses Windows semantics regardless of the host OS so that path

@@ -73,9 +73,9 @@ func (s *Store) scanFrameworkCensusKind(
 	}
 	query += `
 FROM edges INDEXED BY edges_by_kind
-WHERE kind = ?
+WHERE kind = ? AND view_gen = ?
 ORDER BY id`
-	rows, err := s.db.Query(query, string(kind))
+	rows, err := s.db.Query(query, string(kind), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return false

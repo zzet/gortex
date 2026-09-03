@@ -146,6 +146,49 @@ func TestOverlaidViewBoundedIncomingRejectsStrayAndTombstonedOverlaySources(t *t
 	}
 }
 
+// TestOverlaidViewDetachedIdentityOutEdgeReadersAgree pins the ownership
+// the plain out-edge reader applies to a detached identity: an ID whose
+// file the layer does not cover but whose node it re-emitted. The layer
+// speaks for such a node's whole outgoing edge set, so GetOutEdges serves
+// the layer's adjacency — the same relation the bounded projection and
+// the bulk read expose. A reader that asked only whether the source's
+// file is covered would answer "no edges", because base's own edge out of
+// the source is already hidden by the same ownership.
+func TestOverlaidViewDetachedIdentityOutEdgeReadersAgree(t *testing.T) {
+	const (
+		source  = "legacy-source"
+		target  = "repo/target.go::Target"
+		overlay = "repo/overlay.go"
+	)
+	base := New()
+	base.AddNode(&Node{ID: source, Name: "legacy-source", Kind: KindMethod, FilePath: "legacy.go", RepoPrefix: "repo"})
+	base.AddNode(&Node{ID: target, Name: "Target", Kind: KindFunction, FilePath: "repo/target.go", RepoPrefix: "repo"})
+	base.AddEdge(&Edge{From: source, To: target, Kind: EdgeCalls, FilePath: "legacy.go", Line: 1})
+
+	layer := NewOverlayLayer()
+	layer.AddNode(overlay, &Node{ID: source, Name: "legacy-source", Kind: KindMethod, FilePath: overlay, RepoPrefix: "repo"})
+	replacement := &Edge{From: source, To: target, Kind: EdgeCalls, FilePath: overlay, Line: 2}
+	layer.AddEdge(replacement)
+	view := NewOverlaidView(base, layer)
+
+	if got := view.GetOutEdges(source); len(got) != 1 || got[0] != replacement {
+		t.Fatalf("GetOutEdges(%q) = %#v, want the layer's edge", source, got)
+	}
+	if got := view.AllEdges(); len(got) != 1 || got[0] != replacement {
+		t.Fatalf("AllEdges = %#v, want only the layer's edge", got)
+	}
+	if got := view.GetOutEdgesByNodeIDs([]string{source})[source]; len(got) != 1 || got[0] != replacement {
+		t.Fatalf("GetOutEdgesByNodeIDs[%q] = %#v, want the layer's edge", source, got)
+	}
+	projection, err := view.FindOutgoingEdgeIdentitiesBounded(
+		context.Background(), []string{source}, []EdgeKind{EdgeCalls}, 4,
+	)
+	if err != nil {
+		t.Fatalf("bounded outgoing projection: %v", err)
+	}
+	requireSingleBoundedIdentity(t, projection.ByEndpoint[source], EdgeIdentityFor(replacement))
+}
+
 func TestOverlaidViewBoundedAdjacencyDetachedReplacementAndTombstoneParity(t *testing.T) {
 	const (
 		source = "legacy-source"
@@ -218,7 +261,16 @@ func TestOverlaidViewBoundedSiteReplacementAndTombstoneParity(t *testing.T) {
 		{name: "detached", source: "legacy-source", target: "legacy-target"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			baseEdge := &Edge{From: test.source, To: test.target, Kind: EdgeCalls, FilePath: "base.go", Line: 10}
+			// A call site is recorded in the file that holds it, which is
+			// how covering the source's file reaches base's row: ownership
+			// is per edge, keyed on the path the edge was recorded at. The
+			// detached source lives at no file, so its row stays where a
+			// path claim cannot reach it and only the identity claim can.
+			baseFile := test.sourceFile
+			if baseFile == "" {
+				baseFile = "base.go"
+			}
+			baseEdge := &Edge{From: test.source, To: test.target, Kind: EdgeCalls, FilePath: baseFile, Line: 10}
 			base := New()
 			base.AddEdge(baseEdge)
 			site := EdgeSourceSite{From: test.source, Line: 10}

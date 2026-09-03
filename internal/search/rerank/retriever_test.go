@@ -24,7 +24,7 @@ func newRetrieverGraph(t *testing.T) *graph.Graph {
 	return g
 }
 
-func seedHub(_ context.Context, g graph.Store, _ string, _ int) ([]*Candidate, error) {
+func seedHub(_ context.Context, g graph.Reader, _ string, _ int) ([]*Candidate, error) {
 	n := g.GetNode("h")
 	if n == nil {
 		return nil, nil
@@ -102,7 +102,7 @@ func TestGraphCompletion_NilSeederErrors(t *testing.T) {
 func TestGraphCompletion_SeederErrorPropagates(t *testing.T) {
 	g := newRetrieverGraph(t)
 	gc := &GraphCompletion{
-		Seeder: func(context.Context, graph.Store, string, int) ([]*Candidate, error) {
+		Seeder: func(context.Context, graph.Reader, string, int) ([]*Candidate, error) {
 			return nil, errors.New("seeder failed")
 		},
 	}
@@ -114,7 +114,7 @@ func TestGraphCompletion_SeederErrorPropagates(t *testing.T) {
 func TestGraphCompletion_DedupesSeedFromExpansion(t *testing.T) {
 	g := newRetrieverGraph(t)
 	// Two seeds, the second is reachable from the first.
-	multiSeed := func(_ context.Context, gr graph.Store, _ string, _ int) ([]*Candidate, error) {
+	multiSeed := func(_ context.Context, gr graph.Reader, _ string, _ int) ([]*Candidate, error) {
 		return []*Candidate{
 			{Node: gr.GetNode("h"), TextRank: 0},
 			{Node: gr.GetNode("a"), TextRank: 1}, // also reachable from h
@@ -136,7 +136,7 @@ func TestGraphCompletion_DedupesSeedFromExpansion(t *testing.T) {
 func TestGraphCompletion_NilSeedsIgnored(t *testing.T) {
 	g := newRetrieverGraph(t)
 	gc := &GraphCompletion{
-		Seeder: func(context.Context, graph.Store, string, int) ([]*Candidate, error) {
+		Seeder: func(context.Context, graph.Reader, string, int) ([]*Candidate, error) {
 			return []*Candidate{nil, {Node: nil}, {Node: g.GetNode("h")}}, nil
 		},
 	}

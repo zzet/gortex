@@ -122,34 +122,38 @@ func boundedAdjacencyKindList(count int) string {
 	return strings.TrimRight(strings.Repeat("?,", count), ",")
 }
 
+// The generation predicate is appended after the indexed conjuncts, so each
+// shape keeps the index named in its INDEXED BY clause and only filters the
+// rows that index already produced.
+
 func boundedOutgoingAdjacencySQL(kindCount int) string {
 	return `SELECT from_id, to_id, kind, file_path, line
 FROM edges INDEXED BY edges_by_from
-WHERE from_id = ? AND kind IN (` + boundedAdjacencyKindList(kindCount) + `)
+WHERE from_id = ? AND kind IN (` + boundedAdjacencyKindList(kindCount) + `) AND view_gen = ?
 LIMIT ?`
 }
 
 func boundedIncomingAdjacencySQL(kindCount int) string {
 	return `SELECT from_id, to_id, kind, file_path, line
 FROM edges INDEXED BY edges_by_to
-WHERE to_id = ? AND kind IN (` + boundedAdjacencyKindList(kindCount) + `)
+WHERE to_id = ? AND kind IN (` + boundedAdjacencyKindList(kindCount) + `) AND view_gen = ?
 LIMIT ?`
 }
 
 func boundedOutgoingSiteAdjacencySQL(kindCount int) string {
 	return `SELECT from_id, to_id, kind, file_path, line
 FROM edges INDEXED BY edges_by_from_line_kind
-WHERE from_id = ? AND line = ? AND kind IN (` + boundedAdjacencyKindList(kindCount) + `)
+WHERE from_id = ? AND line = ? AND kind IN (` + boundedAdjacencyKindList(kindCount) + `) AND view_gen = ?
 LIMIT ?`
 }
 
-func boundedAdjacencyArgs(prefix []any, kinds []graph.EdgeKind, limit int) []any {
-	args := make([]any, 0, len(prefix)+len(kinds)+1)
+func boundedAdjacencyArgs(prefix []any, kinds []graph.EdgeKind, viewGen int64, limit int) []any {
+	args := make([]any, 0, len(prefix)+len(kinds)+2)
 	args = append(args, prefix...)
 	for _, kind := range kinds {
 		args = append(args, string(kind))
 	}
-	args = append(args, limit+1)
+	args = append(args, viewGen, limit+1)
 	return args
 }
 
@@ -289,7 +293,7 @@ func (s *Store) findEndpointEdgeIdentitiesBounded(
 		if err := ctx.Err(); err != nil {
 			return graph.BoundedEdgeIdentityProjection{}, err
 		}
-		rows, queryErr := tx.QueryContext(ctx, query, boundedAdjacencyArgs([]any{id}, kindSet, limit)...)
+		rows, queryErr := tx.QueryContext(ctx, query, boundedAdjacencyArgs([]any{id}, kindSet, s.viewGen, limit)...)
 		if queryErr != nil {
 			return graph.BoundedEdgeIdentityProjection{}, queryErr
 		}
@@ -353,7 +357,7 @@ func (s *Store) FindOutgoingSiteEdgeIdentitiesBounded(
 			return graph.BoundedSiteEdgeIdentityProjection{}, err
 		}
 		rows, queryErr := tx.QueryContext(
-			ctx, query, boundedAdjacencyArgs([]any{site.From, site.Line}, kindSet, limit)...,
+			ctx, query, boundedAdjacencyArgs([]any{site.From, site.Line}, kindSet, s.viewGen, limit)...,
 		)
 		if queryErr != nil {
 			return graph.BoundedSiteEdgeIdentityProjection{}, queryErr

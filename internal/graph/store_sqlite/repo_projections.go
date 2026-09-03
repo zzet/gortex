@@ -51,8 +51,9 @@ JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
 WHERE n.language <> ''
   AND n.kind <> ?
   AND (n.kind <> ? OR n.data_class IS NOT 'content')
+  AND n.view_gen = ?
 GROUP BY n.repo_prefix, n.file_path, n.language
-ORDER BY n.repo_prefix, n.file_path, n.language`, reposJSON, string(graph.KindModule), string(graph.KindDoc))
+ORDER BY n.repo_prefix, n.file_path, n.language`, reposJSON, string(graph.KindModule), string(graph.KindDoc), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -92,8 +93,9 @@ FROM requested AS r
 JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
 WHERE n.language <> ''
   AND (n.kind <> ? OR n.data_class IS NOT 'content')
+  AND n.view_gen = ?
 GROUP BY n.repo_prefix, n.language
-ORDER BY n.repo_prefix, n.language`, reposJSON, string(graph.KindDoc))
+ORDER BY n.repo_prefix, n.language`, reposJSON, string(graph.KindDoc), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
@@ -136,7 +138,7 @@ func (s *Store) RepoNodeIDsByKinds(repoPrefixes []string, kinds []graph.NodeKind
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(repoNodeIDsByKindsQuery(), reposJSON, kindsJSON)
+	rows, err := s.db.Query(repoNodeIDsByKindsQuery(), reposJSON, kindsJSON, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -180,7 +182,7 @@ WITH requested_repos(repo_prefix) AS (
 SELECT n.id
 FROM requested_repos AS r
 CROSS JOIN requested_kinds AS k
-CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix AND n.kind = k.kind`
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix AND n.kind = k.kind AND n.view_gen = ?`
 	// CROSS JOIN (not INDEXED BY): SQLite never reorders CROSS JOIN, which is
 	// the whole fix — n can only be the probed side. INDEXED BY would be a
 	// hard runtime error whenever the partial index cannot serve the query
@@ -212,6 +214,8 @@ func (s *Store) RepoFilePaths(repoPrefix, workspaceID string, languages, extensi
 	if len(predicates) > 0 {
 		query.WriteString(` AND (` + strings.Join(predicates, ` OR `) + `)`)
 	}
+	query.WriteString(` AND n.view_gen = ?`)
+	args = append(args, s.viewGen)
 	query.WriteString(` ORDER BY ` + pathExpr)
 
 	rows, err := s.db.Query(query.String(), args...)
@@ -273,7 +277,8 @@ WHERE n.repo_prefix = ?`
 		query += ` AND n.workspace_id = ?`
 		args = append(args, workspaceID)
 	}
-	query += ` ORDER BY n.id`
+	query += ` AND n.view_gen = ? ORDER BY n.id`
+	args = append(args, s.viewGen)
 	candidates := s.scanNodeQuery(query, args...)
 	out := candidates[:0]
 	for _, node := range candidates {
@@ -316,7 +321,7 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(repoEdgesByKindsQuery(), reposJSON, kindsJSON)
+	rows, err := s.db.Query(repoEdgesByKindsQuery(), reposJSON, kindsJSON, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -379,9 +384,9 @@ SELECT n.repo_prefix,
 	       e.confidence, e.confidence_label, e.origin, e.tier,
 	       e.cross_repo, e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source
 FROM requested_repos AS r
-CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix AND n.view_gen = ?
 CROSS JOIN requested_kinds AS k
-CROSS JOIN edges AS e ON e.from_id = n.id AND e.kind = k.kind`
+CROSS JOIN edges AS e ON e.from_id = n.id AND e.kind = k.kind AND e.view_gen = n.view_gen`
 }
 
 var (

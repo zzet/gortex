@@ -209,7 +209,7 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 			case edit.OldString == edit.NewString:
 				plan.err = "old_string and new_string are identical"
 			default:
-				absPath, relPath, err := s.resolveFilePath(edit.Path)
+				absPath, relPath, err := s.resolveFilePath(ctx, edit.Path)
 				if err != nil {
 					plan.err = err.Error()
 				} else {
@@ -227,12 +227,12 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 			case !validBatchExpectedSHA256(edit.ExpectedSHA256):
 				plan.err = "expected_sha256 must be exactly 64 hexadecimal characters"
 			default:
-				sourcePath, sourceRel, err := s.resolveFilePath(edit.SourcePath)
+				sourcePath, sourceRel, err := s.resolveFilePath(ctx, edit.SourcePath)
 				if err != nil {
 					plan.err = err.Error()
 					break
 				}
-				destinationPath, destinationRel, err := s.resolveFilePath(edit.DestinationPath)
+				destinationPath, destinationRel, err := s.resolveFilePath(ctx, edit.DestinationPath)
 				if err != nil {
 					plan.err = err.Error()
 					break
@@ -253,7 +253,7 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 			case !validBatchExpectedSHA256(edit.ExpectedSHA256):
 				plan.err = "expected_sha256 must be exactly 64 hexadecimal characters"
 			default:
-				absPath, relPath, err := s.resolveFilePath(edit.Path)
+				absPath, relPath, err := s.resolveFilePath(ctx, edit.Path)
 				if err != nil {
 					plan.err = err.Error()
 				} else {
@@ -278,7 +278,7 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 					break
 				}
 				if resolvePaths {
-					absPath, err := s.resolveNodePath(plan.node)
+					absPath, err := s.resolveNodePath(ctx, plan.node)
 					if err != nil {
 						plan.err = err.Error()
 						break

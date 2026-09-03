@@ -29,16 +29,17 @@ func (s *Store) FindNodesByNamesInRepo(names []string, repoPrefix string) map[st
 		return nil
 	}
 	out := make(map[string][]*graph.Node, len(uniq))
-	for start := 0; start < len(uniq); start += lookupChunkSize - 1 {
-		end := minInt(start+lookupChunkSize-1, len(uniq))
+	for start := 0; start < len(uniq); start += lookupChunkSize - 2 {
+		end := minInt(start+lookupChunkSize-2, len(uniq))
 		chunk := uniq[start:end]
 		query := `SELECT ` + lookupNodeCols + ` FROM nodes
-WHERE repo_prefix = ? AND name IN (` + strings.Repeat(",?", len(chunk))[1:] + `)`
-		args := make([]any, 0, len(chunk)+1)
+WHERE repo_prefix = ? AND name IN (` + strings.Repeat(",?", len(chunk))[1:] + `) AND view_gen = ?`
+		args := make([]any, 0, len(chunk)+2)
 		args = append(args, repoPrefix)
 		for _, name := range chunk {
 			args = append(args, name)
 		}
+		args = append(args, s.viewGen)
 		for _, node := range s.queryNodesSQL(query, args...) {
 			if node != nil {
 				out[node.Name] = append(out[node.Name], node)
@@ -66,13 +67,13 @@ func (s *Store) CountRepoLanguageSymbols(repoPrefix string, languages []string) 
 	}
 	query := `SELECT COUNT(*) FROM nodes
 WHERE repo_prefix = ? AND language IN (` + strings.Repeat(",?", len(uniq))[1:] + `)
-  AND kind <> ? AND kind <> ?`
-	args := make([]any, 0, len(uniq)+3)
+  AND kind <> ? AND kind <> ? AND view_gen = ?`
+	args := make([]any, 0, len(uniq)+4)
 	args = append(args, repoPrefix)
 	for _, language := range uniq {
 		args = append(args, language)
 	}
-	args = append(args, string(graph.KindFile), string(graph.KindImport))
+	args = append(args, string(graph.KindFile), string(graph.KindImport), s.viewGen)
 	var count int
 	if err := s.db.QueryRow(query, args...).Scan(&count); err != nil {
 		panicOnFatal(err)

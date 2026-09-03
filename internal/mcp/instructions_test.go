@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -48,6 +51,7 @@ func TestInitialize_ReturnsInstructions(t *testing.T) {
 		t.Fatalf("initialize response carried no instructions field; got: %s", out)
 	}
 	require.Equal(t, codingAgentInstructions, parsed.Result.Instructions)
+	require.Equal(t, 1, strings.Count(parsed.Result.Instructions, profiles.WorktreeBranchRoutingPolicy))
 }
 
 func TestServerInstructions_NonEmpty(t *testing.T) {
@@ -57,6 +61,40 @@ func TestServerInstructions_NonEmpty(t *testing.T) {
 	if scrubControlChars(serverInstructions) != serverInstructions {
 		t.Error("serverInstructions carries control characters")
 	}
+	if got := strings.Count(serverInstructions, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+		t.Fatalf("serverInstructions embeds canonical worktree policy %d times, want once", got)
+	}
+	if got := strings.Count(codingAgentInstructions, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+		t.Fatalf("codingAgentInstructions embeds canonical worktree policy %d times, want once", got)
+	}
+}
+
+func TestStateAwareInstructionsWaitForAutomaticFamilyCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	main := filepath.Join(t.TempDir(), "main")
+	gitInitWorktreeRepo(t, main)
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitInit(t, main, "worktree", "add", "-q", "-b", "feature", linked)
+
+	srv, _ := newWorktreeMCPServer(t, config.RepoEntry{Path: main, Name: "main"})
+	got := srv.stateAwareInstructions(linked)
+	require.Contains(t, got, "awaiting automatic discovery")
+	require.Contains(t, got, "Do not run `gortex track`")
+	require.NotContains(t, got, "`gortex track "+linked+"`")
+	require.Equal(t, 1, strings.Count(got, profiles.WorktreeBranchRoutingPolicy))
+
+	reverseSrv, _ := newWorktreeMCPServer(t, config.RepoEntry{Path: linked, Name: "linked"})
+	reverse := reverseSrv.stateAwareInstructions(main)
+	require.Contains(t, reverse, "awaiting automatic discovery")
+	require.Contains(t, reverse, "Do not run `gortex track`")
+	require.NotContains(t, reverse, "`gortex track "+main+"`")
+
+	unrelated := filepath.Join(t.TempDir(), "unrelated")
+	require.NoError(t, os.MkdirAll(unrelated, 0o755))
+	unrelatedInstructions := srv.stateAwareInstructions(unrelated)
+	require.Contains(t, unrelatedInstructions, "gortex track "+unrelated)
 }
 
 // TestStateAwareInstructionsVariants proves the F5 contract: the initialize

@@ -86,6 +86,13 @@ var ToolEffects = map[string]ToolEffect{
 	"track_repository":   EffectConfigWrite | EffectGraphWrite,
 	"untrack_repository": EffectConfigWrite | EffectGraphWrite,
 
+	// Checkout administration. The confirm argument is what separates a
+	// preview from a transaction, and the classification is per tool name, so
+	// all three carry the write effect their confirmed call has.
+	"forget_checkout":      EffectConfigWrite | EffectGraphWrite,
+	"set_primary_checkout": EffectConfigWrite | EffectGraphWrite,
+	"reconcile_checkouts":  EffectConfigWrite | EffectGraphWrite,
+
 	// Review publication mutates a remote forge. dry_run does not weaken the
 	// tool-level classification because ordinary calls can still post.
 	"post_review": EffectExternalWrite,

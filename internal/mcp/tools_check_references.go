@@ -65,9 +65,11 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 	evidenceLimit := max(req.GetInt("evidence_limit", 50), 1)
 	minTier := strings.TrimSpace(req.GetString("min_tier", ""))
 
+	g := s.readerFor(ctx)
+
 	var target *graph.Node
 	if symbolID != "" {
-		target = s.graph.GetNode(symbolID)
+		target = g.GetNode(symbolID)
 	}
 
 	// If name wasn't given explicitly, derive it from the resolved
@@ -87,7 +89,7 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 		// for heavily-referenced symbols (hundreds of callers) the
 		// cost was dominant. One GetNodesByIDs gives us the same
 		// data in a single bulk query.
-		inEdges := s.graph.GetInEdges(target.ID)
+		inEdges := g.GetInEdges(target.ID)
 		fromIDs := make([]string, 0, len(inEdges))
 		seenFrom := make(map[string]struct{}, len(inEdges))
 		for _, e := range inEdges {
@@ -103,7 +105,7 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 			seenFrom[e.From] = struct{}{}
 			fromIDs = append(fromIDs, e.From)
 		}
-		fromByID := s.graph.GetNodesByIDs(fromIDs)
+		fromByID := g.GetNodesByIDs(fromIDs)
 
 		for _, e := range inEdges {
 			if !isCheckRefEdge(e.Kind) {
@@ -179,7 +181,7 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 	// (no AllEdges() materialisation, no per-edge GetNode round-
 	// trip). The legacy AllEdges + per-edge GetNode loop stays as
 	// the fallback for backends that don't ship the capability.
-	importingFiles := s.collectImportingFiles(target, excludeTests)
+	importingFiles := collectImportingFiles(g, target, excludeTests)
 
 	referenced := totalEdges > 0 || len(sameName) > 0 || len(importingFiles) > 0
 
@@ -206,7 +208,7 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 //
 // When target is nil or has no FilePath the question is undefined;
 // returns an empty slice (consistent with the legacy behaviour).
-func (s *Server) collectImportingFiles(target *graph.Node, excludeTests bool) []string {
+func collectImportingFiles(g graph.Reader, target *graph.Node, excludeTests bool) []string {
 	importingFiles := []string{}
 	if target == nil || target.FilePath == "" {
 		return importingFiles
@@ -226,7 +228,7 @@ func (s *Server) collectImportingFiles(target *graph.Node, excludeTests bool) []
 		importingFiles = append(importingFiles, fromFile)
 	}
 
-	if fi, ok := s.graph.(graph.FileImporters); ok {
+	if fi, ok := g.(graph.FileImporters); ok {
 		for _, row := range fi.FileImporters(target.FilePath) {
 			add(row.FromFile)
 		}
@@ -237,18 +239,18 @@ func (s *Server) collectImportingFiles(target *graph.Node, excludeTests bool) []
 	// Fallback: pull every edge and filter Go-side. Identical
 	// pre-capability behaviour — only the cgo-heavy backend ever
 	// reaches this path.
-	for _, e := range s.graph.AllEdges() {
+	for _, e := range g.AllEdges() {
 		if e.Kind != graph.EdgeImports {
 			continue
 		}
-		toNode := s.graph.GetNode(e.To)
+		toNode := g.GetNode(e.To)
 		if toNode == nil {
 			continue
 		}
 		if toNode.FilePath != target.FilePath && toNode.ID != target.FilePath {
 			continue
 		}
-		fromNode := s.graph.GetNode(e.From)
+		fromNode := g.GetNode(e.From)
 		if fromNode == nil {
 			continue
 		}

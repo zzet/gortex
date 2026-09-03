@@ -1,11 +1,13 @@
 package kiro
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
@@ -125,15 +127,21 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 }
 
 func writeKiroArtifact(w io.Writer, path, content string, opts agents.ApplyOpts) (agents.FileAction, error) {
-	if existing, err := os.ReadFile(path); err == nil && isLegacyKiroArtifact(string(existing)) {
+	if existing, err := os.ReadFile(path); err == nil && isLegacyKiroArtifact(path, string(existing)) {
 		return agents.WriteOwnedFile(w, path, content, opts)
 	}
 	return agents.WriteIfNotExists(w, path, content, opts)
 }
 
-func isLegacyKiroArtifact(body string) bool {
-	owned := strings.Contains(body, "# Gortex") || strings.Contains(body, `"name": "Gortex:`)
-	if !owned {
+func isLegacyKiroArtifact(path, body string) bool {
+	if legacy, ok := legacyHookFiles[filepath.Base(path)]; ok {
+		return sameJSONDocument(body, legacy)
+	}
+
+	// Steering files predate managed-file markers. Keep their narrow textual
+	// fingerprint, but never apply it to hook paths where user JSON may contain
+	// similar words in a customized prompt.
+	if !strings.Contains(body, "# Gortex") {
 		return false
 	}
 	for _, legacy := range []string{"smart_context", "search_symbols", "get_editing_context", "detect_changes"} {
@@ -142,6 +150,17 @@ func isLegacyKiroArtifact(body string) bool {
 		}
 	}
 	return false
+}
+
+func sameJSONDocument(left, right string) bool {
+	var leftValue, rightValue any
+	if err := json.Unmarshal([]byte(left), &leftValue); err != nil {
+		return false
+	}
+	if err := json.Unmarshal([]byte(right), &rightValue); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 // mcpConfigPath returns the mcp.json path for the given Env's

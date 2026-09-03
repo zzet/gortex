@@ -15,8 +15,8 @@ var (
 	_ graph.RefFactsReader = (*Store)(nil)
 )
 
-// refFactChunk bounds rows per multi-row INSERT. 11 params/row; 80 rows = 880
-// host params, under SQLite's 999 default. Mirrors shingleChunk.
+// refFactChunk bounds rows per multi-row INSERT. 12 params/row; 80 rows = 960
+// host params, under SQLite's 999 default.
 const refFactChunk = 80
 
 // candidate-list separator (unit separator — never appears in identifiers).
@@ -53,15 +53,15 @@ func (s *Store) BulkSetRefFacts(repoPrefix string, facts []graph.RefFact) error 
 			end = len(facts)
 		}
 		batch := facts[start:end]
-		args := make([]any, 0, len(batch)*11)
+		args := make([]any, 0, len(batch)*12)
 		stmt := make([]byte, 0, 96+len(batch)*24)
-		stmt = append(stmt, "INSERT OR REPLACE INTO ref_facts (repo_prefix, from_id, to_id, kind, ref_name, line, origin, tier, candidates, file_path, lang) VALUES "...)
+		stmt = append(stmt, "INSERT OR REPLACE INTO ref_facts (view_gen, repo_prefix, from_id, to_id, kind, ref_name, line, origin, tier, candidates, file_path, lang) VALUES "...)
 		for i, f := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
 			}
-			stmt = append(stmt, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"...)
-			args = append(args, repoPrefix, f.FromID, f.ToID, f.Kind, f.RefName, f.Line, f.Origin, f.Tier, encodeCandidates(f.Candidates), f.FilePath, f.Lang)
+			stmt = append(stmt, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"...)
+			args = append(args, s.viewGen, repoPrefix, f.FromID, f.ToID, f.Kind, f.RefName, f.Line, f.Origin, f.Tier, encodeCandidates(f.Candidates), f.FilePath, f.Lang)
 		}
 		if _, err := tx.Exec(string(stmt), args...); err != nil {
 			return err
@@ -91,10 +91,10 @@ func (s *Store) DeleteRefFactsByFiles(repoPrefix string, files []string) error {
 			end = len(files)
 		}
 		chunk := files[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 64+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM ref_facts WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "DELETE FROM ref_facts WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, f := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -134,7 +134,7 @@ func (s *Store) LoadRefFactsByFiles(repoPrefix string, files []string) ([]graph.
 	}
 	const cols = `from_id, to_id, kind, ref_name, line, origin, tier, candidates, file_path, lang`
 	if len(files) == 0 {
-		if err := scan(`SELECT `+cols+` FROM ref_facts WHERE repo_prefix = ?`, repoPrefix); err != nil {
+		if err := scan(`SELECT `+cols+` FROM ref_facts WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 			return nil, err
 		}
 		return out, nil
@@ -145,10 +145,10 @@ func (s *Store) LoadRefFactsByFiles(repoPrefix string, files []string) ([]graph.
 			end = len(files)
 		}
 		chunk := files[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 96+len(chunk)*2)
-		stmt = append(stmt, "SELECT "+cols+" FROM ref_facts WHERE repo_prefix = ? AND file_path IN ("...)
+		stmt = append(stmt, "SELECT "+cols+" FROM ref_facts WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
 		for i, f := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -182,10 +182,10 @@ func (s *Store) LoadRefFactsByTargets(repoPrefix string, targetIDs []string) (ma
 			end = len(targetIDs)
 		}
 		chunk := targetIDs[start:end]
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, repoPrefix)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.viewGen, repoPrefix)
 		stmt := make([]byte, 0, 96+len(chunk)*2)
-		stmt = append(stmt, "SELECT "+cols+" FROM ref_facts WHERE repo_prefix = ? AND to_id IN ("...)
+		stmt = append(stmt, "SELECT "+cols+" FROM ref_facts WHERE view_gen = ? AND repo_prefix = ? AND to_id IN ("...)
 		for i, id := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')

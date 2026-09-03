@@ -60,7 +60,7 @@ type ResolutionOutcomesResult struct {
 // in the graph by the structured reason the resolver gave up. reasonFilter
 // restricts the returned rows to a single outcome; limit caps the row count.
 // It is a pure Calculation: no side effects, no I/O.
-func AnalyzeResolutionOutcomes(g graph.Store, reasonFilter string, limit int) ResolutionOutcomesResult {
+func AnalyzeResolutionOutcomes(g graph.Reader, reasonFilter string, limit int) ResolutionOutcomesResult {
 	type pending struct {
 		edge *graph.Edge
 		name string
@@ -166,7 +166,7 @@ func AnalyzeResolutionOutcomes(g graph.Store, reasonFilter string, limit int) Re
 // ClassifyUnresolved returns the structured suppression reason for an
 // unresolved name relative to the caller's language, plus the number of
 // real (non-stub) definition candidates considered. It is a pure Calculation.
-func ClassifyUnresolved(g graph.Store, name, fromLang string) (reason string, candidates int) {
+func ClassifyUnresolved(g graph.Reader, name, fromLang string) (reason string, candidates int) {
 	var realSameLang, realOtherLang, stubs int
 	for _, n := range g.FindNodesByName(name) {
 		if n == nil {

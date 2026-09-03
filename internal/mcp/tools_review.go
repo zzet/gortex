@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphpath"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/llm"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/review"
@@ -255,14 +256,14 @@ func (s *Server) handleSiblingDiffContext(ctx context.Context, req mcp.CallToolR
 	}
 
 	// Enumerate the whole changeset.
-	diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Resolve the focus set: explicit focus_files / focus_file plus the file
 	// of any focus_symbol_id.
-	focus := s.resolveFocusFiles(req)
+	focus := s.resolveFocusFiles(ctx, req)
 	focusList := make([]string, 0, len(focus))
 	for f := range focus {
 		focusList = append(focusList, f)
@@ -283,7 +284,7 @@ func (s *Server) handleSiblingDiffContext(ctx context.Context, req mcp.CallToolR
 		if derr != nil || strings.TrimSpace(raw) == "" {
 			continue
 		}
-		relation, score := s.siblingRelation(f, focusList)
+		relation, score := s.siblingRelation(ctx, f, focusList)
 		siblings = append(siblings, siblingDiffRow{
 			File:     f,
 			Relation: relation,
@@ -326,7 +327,7 @@ func siblingDiffScope(req mcp.CallToolRequest) (scope, baseRef string) {
 // resolveFocusFiles collects the focus file set from focus_files / focus_file
 // (paths) and focus_symbol_id (the symbol's file). Paths are cleaned so they
 // join the MapGitDiff ChangedFiles keys.
-func (s *Server) resolveFocusFiles(req mcp.CallToolRequest) map[string]bool {
+func (s *Server) resolveFocusFiles(ctx context.Context, req mcp.CallToolRequest) map[string]bool {
 	focus := map[string]bool{}
 	add := func(p string) {
 		p = filepath.Clean(strings.TrimSpace(p))
@@ -341,7 +342,7 @@ func (s *Server) resolveFocusFiles(req mcp.CallToolRequest) map[string]bool {
 		add(ff)
 	}
 	if id := strings.TrimSpace(req.GetString("focus_symbol_id", "")); id != "" {
-		if n := s.graph.GetNode(id); n != nil && n.FilePath != "" {
+		if n := s.readerFor(ctx).GetNode(id); n != nil && n.FilePath != "" {
 			add(n.FilePath)
 		}
 	}
@@ -359,18 +360,19 @@ func (s *Server) resolveFocusFiles(req mcp.CallToolRequest) map[string]bool {
 //
 // Score is a coarse band per relation (plus a co-change magnitude bump) so the
 // ranking is deterministic and the bands stay separable.
-func (s *Server) siblingRelation(file string, focusFiles []string) (string, float64) {
+func (s *Server) siblingRelation(ctx context.Context, file string, focusFiles []string) (string, float64) {
 	if len(focusFiles) == 0 {
 		return "none", 0
 	}
 
 	// community / process sharing, evaluated symbol-wise across both sides.
+	reader := s.readerFor(ctx)
 	communities := s.getCommunities()
 	processes := s.getProcesses()
 	focusCommunities := map[string]bool{}
 	focusProcesses := map[string]bool{}
 	for _, ff := range focusFiles {
-		for _, n := range s.graph.GetFileNodes(ff) {
+		for _, n := range reader.GetFileNodes(ff) {
 			if communities != nil {
 				if c, ok := communities.NodeToComm[n.ID]; ok && c != "" {
 					focusCommunities[c] = true
@@ -386,14 +388,14 @@ func (s *Server) siblingRelation(file string, focusFiles []string) (string, floa
 		}
 	}
 	if communities != nil && len(focusCommunities) > 0 {
-		for _, n := range s.graph.GetFileNodes(file) {
+		for _, n := range reader.GetFileNodes(file) {
 			if c, ok := communities.NodeToComm[n.ID]; ok && focusCommunities[c] {
 				return "community", 100
 			}
 		}
 	}
 	if processes != nil && len(focusProcesses) > 0 {
-		for _, n := range s.graph.GetFileNodes(file) {
+		for _, n := range reader.GetFileNodes(file) {
 			for _, p := range processes.NodeToProcs[n.ID] {
 				if focusProcesses[p] {
 					return "process", 80
@@ -555,7 +557,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 		changedFiles []string
 	)
 	if diffText == "" {
-		diff, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+		diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -564,7 +566,7 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, analysis.RepoRelativePath, repoPrefix, allowedRepos)
-		impact = s.reviewImpact(diff.ChangedSymbols)
+		impact = s.reviewImpact(ctx, diff.ChangedSymbols)
 		changedFiles = diff.ChangedFiles
 	}
 
@@ -575,10 +577,10 @@ func (s *Server) handleReview(ctx context.Context, req mcp.CallToolRequest) (*mc
 	gen := s.reviewLLMGenWithUsage(useLLM)
 
 	suppStore, suppRepoKey := s.reviewSuppressions()
-	report, err := review.RunWithUsage(ctx, s.graph, gen, s.reviewPricing(), review.Options{
+	report, err := review.RunWithUsage(ctx, s.readerFor(ctx), gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
-		CoverageKnown:   s.coverageKnownForDiff(repoPrefix, changedFiles),
+		CoverageKnown:   s.coverageKnownForDiff(ctx, repoPrefix, changedFiles),
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,
@@ -624,7 +626,7 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 		return nil
 	}
 
-	allTargets, err := s.buildASTTargets("", "", allowedRepos)
+	allTargets, err := s.buildASTTargets(ctx, "", "", allowedRepos)
 	if err != nil || len(allTargets) == 0 {
 		return nil
 	}
@@ -671,7 +673,7 @@ func (s *Server) reviewRulepackMatches(ctx context.Context, changedFiles []strin
 	// post-match enrichment must precede it; path rewriting still happens only
 	// after the surviving rows are known.
 	s.enrichASTMatchesContext(ctx, collected)
-	kept := review.GroundReviewMatches(s.graph, collected)
+	kept := review.GroundReviewMatches(s.readerFor(ctx), collected)
 	for i := range kept {
 		kept[i].File = reviewRepoRelPath(kept[i].File, repoPrefix)
 	}
@@ -777,6 +779,9 @@ func (s *Server) testLangsIndexed(repoPrefix string) map[string]bool {
 	if v, ok := s.testIndexProbe.Load(repoPrefix); ok {
 		return v.(map[string]bool)
 	}
+	// The probe is a per-repo cache shared by every session, so it scans the
+	// base corpus even when the calling request carries an overlay: reading
+	// one session's buffers here would answer every other session from them.
 	var nodes []*graph.Node
 	if repoPrefix != "" {
 		nodes = s.graph.GetRepoNodes(repoPrefix)
@@ -812,8 +817,12 @@ func nodeIsTestSymbol(n *graph.Node) bool {
 // An index config that excludes a language's test files (e.g. "**/*_test.go")
 // makes "no covering test" blindness, not a finding — the review then says
 // "coverage unknown" instead of "untested".
-func (s *Server) coverageKnownForDiff(repoPrefix string, changedFiles []string) bool {
+//
+// The probe behind it is per-repo and shared by every session, so the verdict
+// is the base corpus's; under a view the response says so.
+func (s *Server) coverageKnownForDiff(ctx context.Context, repoPrefix string, changedFiles []string) bool {
 	langs := s.testLangsIndexed(repoPrefix)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 	sawCode := false
 	for _, f := range changedFiles {
 		lang, ok := testLangByExt[strings.ToLower(filepath.Ext(f))]
@@ -830,7 +839,7 @@ func (s *Server) coverageKnownForDiff(repoPrefix string, changedFiles []string) 
 
 // reviewImpact builds the per-changed-symbol blast-radius map review.Run uses to
 // rank per-file risk. A symbol whose impact analysis is empty is omitted.
-func (s *Server) reviewImpact(changed []analysis.ChangedSymbol) map[string]*analysis.ImpactResult {
+func (s *Server) reviewImpact(ctx context.Context, changed []analysis.ChangedSymbol) map[string]*analysis.ImpactResult {
 	if len(changed) == 0 {
 		return nil
 	}
@@ -841,7 +850,7 @@ func (s *Server) reviewImpact(changed []analysis.ChangedSymbol) map[string]*anal
 		if cs.ID == "" {
 			continue
 		}
-		if ir := analysis.AnalyzeImpact(s.graph, []string{cs.ID}, communities, processes); ir != nil {
+		if ir := analysis.AnalyzeImpact(s.readerFor(ctx), []string{cs.ID}, communities, processes); ir != nil {
 			out[cs.ID] = ir
 		}
 	}
@@ -1118,7 +1127,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		ids      []string
 	)
 	if diffText == "" {
-		d, err := analysis.MapGitDiff(s.graph, repoRoot, repoPrefix, scope, baseRef)
+		d, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -1128,7 +1137,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		rulepack = s.reviewRulepackMatches(ctx, diff.ChangedFiles, analysis.RepoRelativePath, repoPrefix, allowedRepos)
-		impact = s.reviewImpact(diff.ChangedSymbols)
+		impact = s.reviewImpact(ctx, diff.ChangedSymbols)
 		for _, cs := range diff.ChangedSymbols {
 			if cs.ID != "" {
 				ids = append(ids, cs.ID)
@@ -1148,10 +1157,10 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	useLLM := requestBoolDefault(req, "use_llm", false)
 	gen := s.reviewLLMGenWithUsage(useLLM)
 	suppStore, suppRepoKey := s.reviewSuppressions()
-	report, err := review.RunWithUsage(ctx, s.graph, gen, s.reviewPricing(), review.Options{
+	report, err := review.RunWithUsage(ctx, s.readerFor(ctx), gen, s.reviewPricing(), review.Options{
 		RepoRoot:        repoRoot,
 		RepoPrefix:      repoPrefix,
-		CoverageKnown:   len(testTargets) > 0 || (diff != nil && s.coverageKnownForDiff(repoPrefix, diff.ChangedFiles)),
+		CoverageKnown:   len(testTargets) > 0 || (diff != nil && s.coverageKnownForDiff(ctx, repoPrefix, diff.ChangedFiles)),
 		Scope:           scope,
 		BaseRef:         baseRef,
 		Diff:            diffText,
@@ -1174,8 +1183,9 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	// Gate: guard + architecture rules.
 	var guards []analysis.GuardViolation
 	if len(ids) > 0 && (s.hasGuardRules(ids) || !s.architecture.IsEmpty()) {
-		guards = s.evaluateGuards(ids)
-		guards = append(guards, analysis.EvaluateArchitecture(s.graph, s.architecture, ids)...)
+		guardReader := s.readerFor(ctx)
+		guards = s.evaluateGuards(guardReader, ids)
+		guards = append(guards, analysis.EvaluateArchitecture(guardReader, s.architecture, ids)...)
 	}
 
 	// Verdict = the review report's worst-of, upgraded to BLOCK on any contract
@@ -1186,7 +1196,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	// Per-symbol semantic classification, graph-grounded on the diff-hunk text.
-	changedSyms := s.classifyChangedSymbols(diff, impact)
+	changedSyms := s.classifyChangedSymbols(ctx, diff, impact)
 
 	verCmd := review.VerificationCommand(testTargets, reviewPackLang(diff))
 
@@ -1199,7 +1209,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 
 	// Privacy-safe risk receipt over the whole changeset.
 	scrub := requestBoolDefault(req, "scrub", false)
-	receipt := s.reviewReceipt(ids, diff, contracts, guards, scrub)
+	receipt := s.reviewReceipt(ctx, ids, diff, contracts, guards, scrub)
 
 	env := reviewEnvelope{
 		Verdict:             string(verdict),
@@ -1218,7 +1228,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		Cost:                report.Cost,
 	}
 	if requestBoolDefault(req, "include_pack", false) {
-		env.Pack = s.buildReviewPack(diff, impact, intArg(req.GetArguments(), "max_tokens", 0))
+		env.Pack = s.buildReviewPack(ctx, diff, impact, intArg(req.GetArguments(), "max_tokens", 0))
 	}
 
 	payload := reviewPackPayload(env)
@@ -1235,14 +1245,15 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 // classifyChangedSymbols stamps a change class + impact-risk tier on every
 // changed symbol. The class is graph-grounded on the symbol's diff-hunk text;
 // the risk tier is the symbol's AnalyzeImpact tier (LOW when no impact entry).
-func (s *Server) classifyChangedSymbols(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []classifiedSymbol {
+func (s *Server) classifyChangedSymbols(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []classifiedSymbol {
 	if diff == nil {
 		return []classifiedSymbol{}
 	}
-	view, _ := s.reviewChangeView(diff)
+	reader := s.readerFor(ctx)
+	view, _ := s.reviewChangeView(ctx, diff)
 	out := make([]classifiedSymbol, 0, len(diff.ChangedSymbols))
 	for _, cs := range diff.ChangedSymbols {
-		hunk := review.SymbolHunk(s.graph, view, cs)
+		hunk := review.SymbolHunk(reader, view, cs)
 		risk := string(analysis.RiskLow)
 		if impact != nil {
 			if ir := impact[cs.ID]; ir != nil && ir.Risk != "" {
@@ -1252,7 +1263,7 @@ func (s *Server) classifyChangedSymbols(diff *analysis.DiffResult, impact map[st
 		out = append(out, classifiedSymbol{
 			ID:    cs.ID,
 			Name:  cs.Name,
-			Class: review.ClassifyChange(s.graph, cs, hunk),
+			Class: review.ClassifyChange(reader, cs, hunk),
 			Risk:  risk,
 		})
 	}
@@ -1262,12 +1273,12 @@ func (s *Server) classifyChangedSymbols(diff *analysis.DiffResult, impact map[st
 
 // reviewChangeView builds the ChangeView the classify/pack rendering reads its
 // diff-hunk text from. Errors degrade to a nil view (the renderers tolerate it).
-func (s *Server) reviewChangeView(diff *analysis.DiffResult) (*review.ChangeView, *analysis.DiffResult) {
+func (s *Server) reviewChangeView(ctx context.Context, diff *analysis.DiffResult) (*review.ChangeView, *analysis.DiffResult) {
 	repoRoot := ""
 	if s.indexer != nil {
 		repoRoot = s.indexer.RootPath()
 	}
-	view, err := review.BuildChangeView(s.graph, repoRoot, s.diffJoinPrefix(repoRoot), "", "")
+	view, err := review.BuildChangeView(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), "", "")
 	if err != nil {
 		return nil, diff
 	}
@@ -1363,6 +1374,8 @@ func (s *Server) highRiskPreviews(ctx context.Context, diff *analysis.DiffResult
 // yields the symbol's broken-callers / impact preview without changing disk. Only
 // nodes with a known range under the indexed root are eligible.
 func (s *Server) identityEditForSymbol(id string) (lsp.WorkspaceEdit, bool) {
+	// Base read on purpose: this range is the "before" side the simulation
+	// is compared against.
 	n := s.graph.GetNode(id)
 	if n == nil || n.StartLine <= 0 || n.FilePath == "" {
 		return lsp.WorkspaceEdit{}, false
@@ -1404,7 +1417,7 @@ func (s *Server) identityEditForSymbol(id string) (lsp.WorkspaceEdit, bool) {
 // reviewReceipt scores PR-level risk over the changeset and projects it to the
 // privacy-safe receipt. A contract break or guard violation flags the
 // out-of-band hard blocker so the receipt's merge_blocker reflects the gates.
-func (s *Server) reviewReceipt(ids []string, diff *analysis.DiffResult, ci *contractImpact, guards []analysis.GuardViolation, scrub bool) analysis.ReviewReceipt {
+func (s *Server) reviewReceipt(ctx context.Context, ids []string, diff *analysis.DiffResult, ci *contractImpact, guards []analysis.GuardViolation, scrub bool) analysis.ReviewReceipt {
 	var changedFiles []string
 	if diff != nil {
 		changedFiles = diff.ChangedFiles
@@ -1414,7 +1427,7 @@ func (s *Server) reviewReceipt(ids []string, diff *analysis.DiffResult, ci *cont
 	if communities != nil {
 		nodeToComm = communities.NodeToComm
 	}
-	result := analysis.ScorePRRisk(s.graph, analysis.PRRiskInput{
+	result := analysis.ScorePRRisk(s.readerFor(ctx), analysis.PRRiskInput{
 		SymbolIDs:    ids,
 		ChangedFiles: changedFiles,
 		NodeToComm:   nodeToComm,
@@ -1427,12 +1440,12 @@ func (s *Server) reviewReceipt(ids []string, diff *analysis.DiffResult, ci *cont
 
 // buildReviewPack renders the FG9 tiered review pack for the envelope: changed
 // symbols as diff hunks, direct callers as full source, the rest as an outline.
-func (s *Server) buildReviewPack(diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, budget int) *review.ReviewPack {
+func (s *Server) buildReviewPack(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, budget int) *review.ReviewPack {
 	if diff == nil {
 		return nil
 	}
-	view, _ := s.reviewChangeView(diff)
-	return review.BuildReviewPack(s.graph, view, diff, review.MergeImpact(impact), budget)
+	view, _ := s.reviewChangeView(ctx, diff)
+	return review.BuildReviewPack(s.readerFor(ctx), view, diff, review.MergeImpact(impact), budget)
 }
 
 // reviewFindingsToComments projects the report's findings onto the line-anchored

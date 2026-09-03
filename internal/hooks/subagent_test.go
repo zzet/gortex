@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/profiles"
 )
 
 func TestEnrichTask_NoBridge_Silent(t *testing.T) {
@@ -97,6 +99,9 @@ func TestEnrichTask_AlwaysIncludesToolGuidance(t *testing.T) {
 	}
 	if !strings.Contains(result.context, "MUST use Gortex MCP tools instead of Read/Grep/Glob") {
 		t.Errorf("tool guidance header missing:\n%s", result.context)
+	}
+	if got := strings.Count(result.context, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+		t.Errorf("subagent briefing embeds canonical worktree policy %d times, want once", got)
 	}
 }
 

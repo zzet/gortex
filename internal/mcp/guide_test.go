@@ -29,6 +29,7 @@ func TestGuideText_TopicsAndContent(t *testing.T) {
 	require.Contains(t, full, "Overlay sessions", "capabilities catalog must live in the guide")
 	require.Contains(t, full, "compress_bodies", "token-economy content must live in the guide")
 	require.Contains(t, full, "gortex://report", "resources list must live in the guide")
+	require.Contains(t, full, "## Worktree and branch views")
 
 	// Section addressing returns just that section.
 	require.Contains(t, GuideText("providers"), providerMatrixMarker)
@@ -36,6 +37,10 @@ func TestGuideText_TopicsAndContent(t *testing.T) {
 		"a section address must return only its section")
 	require.Contains(t, GuideText("capabilities"), "Speculative execution")
 	require.Contains(t, GuideText("resources"), "gortex://guide")
+	views := GuideText("views")
+	for _, cue := range []string{"exact:false", "require_exact:true", "require_fresh:true", "wait_deadline", "checkout_id", "refs/heads/release", "coordinator-backed"} {
+		require.Contains(t, views, cue)
+	}
 
 	// The analyze / search_ast sections point at the single-source catalog
 	// (kind:"help" / detector:"help" / gortex://schema) rather than re-inlining
@@ -52,6 +57,7 @@ func TestGuideText_TopicsAndContent(t *testing.T) {
 	// Aliases resolve.
 	require.Equal(t, GuideText("llm"), GuideText("providers"))
 	require.Equal(t, GuideText("features"), GuideText("capabilities"))
+	require.Equal(t, GuideText("worktrees"), GuideText("views"))
 
 	// Unknown topic degrades to the full guide (still useful, names topics).
 	unknown := GuideText("does-not-exist")

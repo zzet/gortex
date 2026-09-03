@@ -96,29 +96,29 @@ func jsonIngestExperimentFixture(nodeCount, edgeCount int) ([]*graph.Node, []*gr
 
 func ingestCurrentExperiment(tx *sql.Tx, nodes []*graph.Node, edges []*graph.Edge) (int, int, error) {
 	limit := sqliteBatchVariableHardCap
-	_, nodeStatements, _, err := insertNodeChunksTxLimited(tx, nodes, false, &limit)
+	_, nodeStatements, _, err := insertNodeChunksTxLimited(tx, baseViewGeneration, nodes, false, &limit)
 	if err != nil {
 		return nodeStatements, 0, err
 	}
-	_, edgeStatements, _, err := insertEdgeChunksTxLimited(tx, edges, false, &limit)
+	_, edgeStatements, _, err := insertEdgeChunksTxLimited(tx, baseViewGeneration, edges, false, &limit)
 	return nodeStatements, edgeStatements, err
 }
 
 func ingestJSONExperiment(tx *sql.Tx, nodes []*graph.Node, edges []*graph.Edge) (int, int, error) {
-	_, nodeStatements, _, err := insertNodeChunksJSONBTx(tx, nodes, false)
+	_, nodeStatements, _, err := insertNodeChunksJSONBTx(tx, baseViewGeneration, nodes, false)
 	if err != nil {
 		return nodeStatements, 0, err
 	}
-	_, edgeStatements, _, err := insertEdgeChunksJSONBTx(tx, edges, false)
+	_, edgeStatements, _, err := insertEdgeChunksJSONBTx(tx, baseViewGeneration, edges, false)
 	return nodeStatements, edgeStatements, err
 }
 
 func ingestJSONReturningExperiment(tx *sql.Tx, nodes []*graph.Node, edges []*graph.Edge) (int, int, error) {
-	_, nodeStatements, _, err := insertNodeChunksJSONBTx(tx, nodes, true)
+	_, nodeStatements, _, err := insertNodeChunksJSONBTx(tx, baseViewGeneration, nodes, true)
 	if err != nil {
 		return nodeStatements, 0, err
 	}
-	_, edgeStatements, _, err := insertEdgeChunksJSONBTx(tx, edges, true)
+	_, edgeStatements, _, err := insertEdgeChunksJSONBTx(tx, baseViewGeneration, edges, true)
 	return nodeStatements, edgeStatements, err
 }
 

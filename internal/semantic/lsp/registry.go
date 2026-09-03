@@ -127,6 +127,16 @@ type ServerSpec struct {
 	// operator running a server build without the leak sets it "on" to
 	// restore the heavy legs.
 	NoHeavyRequests bool
+	// CheckoutWorkspaceWeight is how many slots one live per-checkout
+	// workspace of this server charges against the checkout workspace budget
+	// (semantic's `checkout_lsp_max_workspaces`). Zero and one both mean one
+	// slot — the ordinary 200-500MB subprocess the budget is denominated in.
+	// A server documented as gigabytes-resident carries
+	// heavyCheckoutWorkspaceWeight instead, so the budget bounds approximate
+	// memory rather than instance count. Unrelated to NoHeavyRequests, which
+	// is about a per-request leak on one code path; a server may carry both,
+	// for reasons that have nothing to do with each other.
+	CheckoutWorkspaceWeight int
 	// ProjectReady, when non-nil, reports whether a workspace has the
 	// project setup this server needs to resolve anything at all — e.g.
 	// node_modules for tsserver, whose every cross-file / import lookup
@@ -218,6 +228,23 @@ type ServerAlt struct {
 // compiles the sources — which is code execution from the indexed repo. Only
 // enable it for repositories you trust.
 const JdtlsTrustBuildEnv = "GORTEX_LSP_JDTLS_TRUST_BUILD"
+
+// heavyCheckoutWorkspaceWeight is what a language server whose resident set is
+// measured in gigabytes charges against the per-checkout workspace budget. The
+// budget's unit is one ordinary server — the 200-500MB subprocess most specs
+// here spawn — and a Roslyn or Eclipse JDT workspace is an order of magnitude
+// past that, so counting it as one workspace is what let four of them add
+// ~20GB of language servers to a worktree-heavy day.
+//
+// Two, rather than the true ratio: the weight bounds the worst case, it does
+// not model the footprint. At the shipped budget of four it halves that worst
+// case while still admitting one heavy server with two ordinary ones beside
+// it. A weight that refused the heavy server outright would cost a Java or C#
+// checkout its whole language-server stage, and rationing what a checkout may
+// hold is what the budget is for — denying it is not. An operator with the
+// memory for a third heavy workspace raises `checkout_lsp_max_workspaces`,
+// which buys weighted room rather than instance count.
+const heavyCheckoutWorkspaceWeight = 2
 
 // jdtlsSafeInitOptions keeps jdtls in a no-build mode: JRE-only classpath, with
 // Maven/Gradle import and autobuild DISABLED. Resolution is more limited (jdtls
@@ -453,6 +480,10 @@ var Servers = []ServerSpec{
 		Priority:    6, // jdtls is heavyweight; lower priority than scip-java.
 		Daemon:      true,
 		MaxParallel: 6,
+		// An Eclipse JDT workspace on a JVM is gigabytes resident on a real
+		// Java tree, so a per-checkout instance of it costs the workspace
+		// budget several ordinary servers' worth of slots.
+		CheckoutWorkspaceWeight: heavyCheckoutWorkspaceWeight,
 		// InitializationOptions for jdtls. SAFE BY DEFAULT (jdtlsSafeInitOptions):
 		// no Maven/Gradle import and no autobuild, so indexing an UNTRUSTED Java
 		// repo never runs its build. Build-backed resolution — which EXECUTES the
@@ -496,6 +527,11 @@ var Servers = []ServerSpec{
 		// definition at call sites instead and leave dispatch fan-out to
 		// the interface-dispatch synthesizer.
 		NoHeavyRequests: true,
+		// A different kind of heavy, and the reason both flags sit here:
+		// either Roslyn driver holds the whole solution's compilations in
+		// memory and runs gigabytes resident on a large one, so a per-checkout
+		// workspace of it costs several budget slots.
+		CheckoutWorkspaceWeight: heavyCheckoutWorkspaceWeight,
 		// csharp-ls is a Roslyn stdio LSP (`dotnet tool install csharp-ls`)
 		// that speaks plain LSP with no args. Current versions discover
 		// solutions on their own (recursive .sln/.slnx glob, most-projects
@@ -706,6 +742,11 @@ func init() {
 		sort.SliceStable(specs, func(i, j int) bool { return specs[i].Priority < specs[j].Priority })
 	}
 
+	// Contribute the per-language checkout workspace weights, so the cap that
+	// admits per-checkout language servers charges a gigabytes-resident one
+	// more than a 200-500MB one instead of counting both as a workspace.
+	semantic.RegisterCheckoutWorkspaceWeights(CheckoutWorkspaceWeights)
+
 	// Contribute every known LSP spec to semantic.DefaultConfig()
 	// so the daemon picks them up automatically when the binary is
 	// on PATH. Each spec becomes a disabled-only-when-binary-missing
@@ -727,6 +768,31 @@ func init() {
 		}
 		return out
 	})
+}
+
+// CheckoutWorkspaceWeights maps a language code to the slots one live
+// per-checkout workspace in that language charges against the checkout
+// workspace budget. Only the languages a heavy server covers appear: an absent
+// language weighs one, which is the unit the budget counts.
+//
+// A language several specs cover takes the largest weight among them. Which
+// spec a checkout actually spawns depends on what is installed on the machine,
+// and admission happens before the spawn — so the budget is charged for the
+// heaviest server that could answer for the language rather than the lightest.
+func CheckoutWorkspaceWeights() map[string]int {
+	out := make(map[string]int, 2)
+	for i := range Servers {
+		spec := &Servers[i]
+		if spec.CheckoutWorkspaceWeight <= 1 {
+			continue
+		}
+		for _, language := range spec.Languages {
+			if spec.CheckoutWorkspaceWeight > out[language] {
+				out[language] = spec.CheckoutWorkspaceWeight
+			}
+		}
+	}
+	return out
 }
 
 // SpecForExtension returns the ServerSpec preferred for the given file

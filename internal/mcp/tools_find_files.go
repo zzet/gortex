@@ -55,7 +55,8 @@ type fileHit struct {
 }
 
 func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if s.graph == nil {
+	reader := s.readerFor(ctx)
+	if reader == nil {
 		return mcp.NewToolResultError("find_files: no graph available"), nil
 	}
 	query := strings.TrimSpace(req.GetString("query", ""))
@@ -95,7 +96,7 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 	}
 
 	hits := make([]fileHit, 0, 64)
-	for n := range s.graph.NodesByKind(graph.KindFile) {
+	for n := range reader.NodesByKind(graph.KindFile) {
 		if n == nil {
 			continue
 		}

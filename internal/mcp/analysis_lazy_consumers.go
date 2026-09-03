@@ -67,7 +67,7 @@ func (s *Server) topAnalysisMetricValue(metric graph.AnalysisMetric) float64 {
 // deterministic community/process ordering of analysis.AnalyzeImpactContext
 // without retaining whole-graph maps on the Server.
 func (s *Server) analyzeImpactLazy(ctx context.Context, symbolIDs []string) *analysis.ImpactResult {
-	result := analysis.AnalyzeImpactContext(ctx, s.graph, symbolIDs, nil, nil)
+	result := analysis.AnalyzeImpactContext(ctx, s.readerFor(ctx), symbolIDs, nil, nil)
 	ids := append([]string(nil), symbolIDs...)
 	for depth := 1; depth <= 3; depth++ {
 		for _, entry := range result.ByDepth[depth] {
@@ -170,8 +170,8 @@ func (s *Server) processSummariesForEntries(entryIDs map[string]bool, scoped boo
 	return out
 }
 
-func (s *Server) rerankBoundedCentrality(seeds, candidateIDs []string) rerank.CentralityResult {
-	snapshot, stats := analysis.BuildBoundedAdjacencySnapshot(s.graph, candidateIDs, 2, 4096, 16384)
+func (s *Server) rerankBoundedCentrality(ctx context.Context, seeds, candidateIDs []string) rerank.CentralityResult {
+	snapshot, stats := analysis.BuildBoundedAdjacencySnapshot(s.readerFor(ctx), candidateIDs, 2, 4096, 16384)
 	return rerank.CentralityResult{
 		Scores:      s.personalizedPageRank(snapshot, seeds),
 		NodeCount:   stats.NodeCount,

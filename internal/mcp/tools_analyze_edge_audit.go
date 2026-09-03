@@ -59,8 +59,12 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 	// requests skip the gate entirely — a byte-for-byte no-op.
 	scoped := s.scopeFiltersActive(ctx)
 
-	for _, e := range s.graph.AllEdges() {
-		if scoped && (!s.analyzeNodeVisible(ctx, s.graph.GetNode(e.From)) || !s.analyzeNodeVisible(ctx, s.graph.GetNode(e.To))) {
+	// Both scans and every endpoint lookup share one reader, so the
+	// tiers grade the state this request reads — the caller's buffers
+	// when a view is active.
+	reader := s.readerFor(ctx)
+	for _, e := range reader.AllEdges() {
+		if scoped && (!s.analyzeNodeVisible(ctx, reader.GetNode(e.From)) || !s.analyzeNodeVisible(ctx, reader.GetNode(e.To))) {
 			continue
 		}
 		tier := edgeTierLabel(e.Origin)
@@ -82,7 +86,7 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 	// Targets reached only from test symbols — dead-code false
 	// positives once test callers are policy-excluded.
 	var testOnly []string
-	for _, n := range s.graph.AllNodes() {
+	for _, n := range reader.AllNodes() {
 		if scoped && !s.analyzeNodeVisible(ctx, n) {
 			continue
 		}
@@ -101,7 +105,7 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 			}
 			allTest := true
 			for _, c := range callers {
-				cn := s.graph.GetNode(c)
+				cn := reader.GetNode(c)
 				if cn == nil || !auditIsTestNode(cn) {
 					allTest = false
 					break

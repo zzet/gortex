@@ -105,7 +105,11 @@ func (s *Server) collectExtractionCandidates(
 	pathPrefix string,
 ) []extractCandidateRow {
 	callKinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeCrossRepoCalls}
-	if scanner, ok := s.graph.(graph.ExtractCandidatesScanner); ok {
+	// The pushdown is probed on the request's reader: an overlay view is
+	// not a scanner, so an overlay-active call takes the fallback below
+	// and counts callers over the caller's buffers.
+	reader := s.readerFor(ctx)
+	if scanner, ok := reader.(graph.ExtractCandidatesScanner); ok {
 		raw := scanner.ExtractCandidates(callKinds, minLines, minCallers, minFanOut, pathPrefix)
 		// Session-scope post-filter: skip the lookup when the session
 		// is unbound (every node is in scope) so the bench-friendly
@@ -117,7 +121,7 @@ func (s *Server) collectExtractionCandidates(
 			for _, r := range raw {
 				ids = append(ids, r.NodeID)
 			}
-			scopeIDs = s.graph.GetNodesByIDs(ids)
+			scopeIDs = reader.GetNodesByIDs(ids)
 		}
 		out := make([]extractCandidateRow, 0, len(raw))
 		for _, r := range raw {
@@ -161,11 +165,11 @@ func (s *Server) collectExtractionCandidates(
 		if lineCount < minLines {
 			continue
 		}
-		callers := callerCount(s.graph, n.ID)
+		callers := callerCount(reader, n.ID)
 		if callers < minCallers {
 			continue
 		}
-		fanOut := distinctCalleeCount(s.graph, n.ID)
+		fanOut := distinctCalleeCount(reader, n.ID)
 		if fanOut < minFanOut {
 			continue
 		}
@@ -187,7 +191,7 @@ func (s *Server) collectExtractionCandidates(
 
 // callerCount returns the number of distinct call-site origins for
 // the given node. Counts EdgeCalls and the cross-repo call variant.
-func callerCount(g graph.Store, id string) int {
+func callerCount(g graph.Reader, id string) int {
 	seen := map[string]bool{}
 	for _, e := range g.GetInEdges(id) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeCrossRepoCalls {
@@ -201,7 +205,7 @@ func callerCount(g graph.Store, id string) int {
 // distinctCalleeCount returns how many distinct functions/methods
 // the node calls. Proxy for internal complexity — a function that
 // orchestrates 20 different callees is probably doing too much.
-func distinctCalleeCount(g graph.Store, id string) int {
+func distinctCalleeCount(g graph.Reader, id string) int {
 	seen := map[string]bool{}
 	for _, e := range g.GetOutEdges(id) {
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeCrossRepoCalls {

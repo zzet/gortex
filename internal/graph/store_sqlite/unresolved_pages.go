@@ -13,11 +13,79 @@ const unresolvedEdgePredicate = `is_unresolved = 1
   AND NOT (to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;')
   AND to_id NOT LIKE '%::unresolved::fnvalue::%'`
 
+// The unresolved frontier lives in one table for every payload generation, and
+// nothing the base corpus's own indexes key on distinguishes them: a scan that
+// filters `view_gen = ?` after the fact still fetches and discards every
+// unresolved row the corpus holds. That is the whole cost of a sparse
+// generation's resolve pass — its payload is one change's closure, and it
+// reached those few rows through the workspace's entire backlog.
+//
+// edges_by_generation is keyed (view_gen, id) over exactly the derived rows, so
+// a pinned handle seeks straight into its own range. The base corpus is not in
+// that partial index and keeps the source it was tuned for, which is what
+// leaves generation 0's scope exactly as wide as it has always been.
+const (
+	// unresolvedHighWaterBaseSource is the base corpus's frontier walk: the
+	// partial is_unresolved index, which for generation 0 is the whole
+	// frontier and nothing else.
+	unresolvedHighWaterBaseSource = `edges INDEXED BY edges_by_unresolved`
+	// unresolvedPageBaseSource leaves the base corpus's page statement on the
+	// planner's own choice, which is the rowid range it already used.
+	unresolvedPageBaseSource = `edges`
+	// unresolvedIdentityBaseSource keeps the attribution pass's base scan on
+	// the raw rowid order: it walks the corpus end to end, and an index would
+	// only add a hop per row.
+	unresolvedIdentityBaseSource = `edges NOT INDEXED`
+	// unresolvedFrontierBaseSource matches unresolvedHighWaterBaseSource; the
+	// census aggregates the same frontier.
+	unresolvedFrontierBaseSource = unresolvedHighWaterBaseSource
+)
+
+// unresolvedScanSource returns the FROM clause and the leading generation
+// predicate one enumeration must use on this handle, given the source the base
+// corpus's own scan is tuned for.
+//
+// The redundant-looking `view_gen > 0` is load-bearing: SQLite uses a partial
+// index only when the query's WHERE clause implies the index's, and a bound
+// parameter proves nothing at planning time.
+func (s *Store) unresolvedScanSource(baseSource string) (source, generation string) {
+	if s.viewGen > baseViewGeneration {
+		return `edges INDEXED BY ` + edgesByGenerationIndexName, `view_gen > 0 AND view_gen = ?`
+	}
+	return baseSource, `view_gen = ?`
+}
+
+// unresolvedWaterMarkSQL walks the handle's own frontier to one end. direction
+// is `DESC` for the high-water mark and `ASC` for the low.
+func unresolvedWaterMarkSQL(source, generation, direction string) string {
+	return `SELECT id
+FROM ` + source + `
+WHERE ` + generation + `
+  AND ` + unresolvedEdgePredicate + `
+ORDER BY id ` + direction + `
+LIMIT 1`
+}
+
+// unresolvedEdgePageSQL is one bounded keyset page. extra carries the optional
+// terminal-skip and scope predicates, each already prefixed with ` AND `; its
+// parameters bind after the rowid bounds and before the row limit.
+func unresolvedEdgePageSQL(source, generation, extra string) string {
+	return `SELECT id, ` + lookupEdgeCols + `
+FROM ` + source + `
+WHERE ` + generation + ` AND id > ? AND id <= ? AND ` + unresolvedEdgePredicate + extra + `
+ORDER BY id
+LIMIT ?`
+}
+
 var _ graph.UnresolvedEdgePager = (*Store)(nil)
 
-// BeginUnresolvedEdgeScan captures a stable rowid high-water mark. Reindexing
-// an edge may delete and insert its row; the replacement receives a larger id
-// and therefore cannot be visited twice by the same resolver pass.
+// BeginUnresolvedEdgeScan captures a stable rowid window. Reindexing an edge
+// may delete and insert its row; the replacement receives a larger id and
+// therefore cannot be visited twice by the same resolver pass.
+//
+// A derived generation also captures the LOW end, so its pass is bounded below
+// by its own first row rather than by the base corpus's. Generation 0 owns the
+// whole frontier and leaves it at 0.
 //
 // PendingBefore is deliberately unknown for a non-empty frontier. Computing
 // it with COUNT(*) made every warm scoped resolve walk the entire unresolved
@@ -26,13 +94,19 @@ var _ graph.UnresolvedEdgePager = (*Store)(nil)
 // diagnostic count while consuming pages.
 func (s *Store) BeginUnresolvedEdgeScan(ctx context.Context) (graph.UnresolvedEdgeScan, error) {
 	scan := graph.UnresolvedEdgeScan{PendingBefore: -1}
-	err := s.db.QueryRowContext(ctx, `SELECT id
-FROM edges INDEXED BY edges_by_unresolved
-WHERE `+unresolvedEdgePredicate+`
-ORDER BY id DESC
-LIMIT 1`).Scan(&scan.HighWaterID)
+	source, generation := s.unresolvedScanSource(unresolvedHighWaterBaseSource)
+	err := s.db.QueryRowContext(ctx,
+		unresolvedWaterMarkSQL(source, generation, `DESC`), s.viewGen).Scan(&scan.HighWaterID)
 	if errors.Is(err, sql.ErrNoRows) {
 		scan.PendingBefore = 0
+		return scan, nil
+	}
+	if err != nil || s.viewGen == baseViewGeneration {
+		return scan, err
+	}
+	err = s.db.QueryRowContext(ctx,
+		unresolvedWaterMarkSQL(source, generation, `ASC`), s.viewGen).Scan(&scan.LowWaterID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return scan, nil
 	}
 	return scan, err
@@ -54,9 +128,17 @@ func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.Unresolve
 		page.Exhausted = true
 		return page, nil
 	}
+	// The cursor the caller keeps stays its own; only the row the statement
+	// starts after is lifted to the scan's floor, so a pass that begins at 0
+	// never looks below the generation it is pinned to.
+	lowerBound := afterID
+	if floor := scan.LowWaterID - 1; floor > lowerBound {
+		lowerBound = floor
+	}
 
-	predicate := unresolvedEdgePredicate
-	args := []any{afterID, scan.HighWaterID}
+	source, generation := s.unresolvedScanSource(unresolvedPageBaseSource)
+	extra := ""
+	args := []any{s.viewGen, lowerBound, scan.HighWaterID}
 	anchorIn := func(column string) (string, []any) {
 		if len(scan.ScopeAnchors) == 0 {
 			return "", nil
@@ -91,7 +173,7 @@ func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.Unresolve
 			args = append(args, toArgs...)
 		}
 		cond += `)`
-		predicate += ` AND ` + cond
+		extra += ` AND ` + cond
 	}
 	if scan.ScopeFilter && len(scan.ScopeAnchors) > 0 {
 		// Scoped-pass pushdown of edgeInResolveScope: keep when the source
@@ -110,14 +192,10 @@ func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.Unresolve
 			args = append(args, toArgs...)
 		}
 		cond += `)`
-		predicate += ` AND ` + cond
+		extra += ` AND ` + cond
 	}
 	args = append(args, maxRows)
-	rows, err := s.db.QueryContext(ctx, `SELECT id, `+lookupEdgeCols+`
-FROM edges
-WHERE id > ? AND id <= ? AND `+predicate+`
-ORDER BY id
-LIMIT ?`, args...)
+	rows, err := s.db.QueryContext(ctx, unresolvedEdgePageSQL(source, generation, extra), args...)
 	if err != nil {
 		return page, err
 	}

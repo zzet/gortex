@@ -91,12 +91,12 @@ func (s *Server) handleAPIImpact(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("no route matching %q", target)), nil
 	}
 
-	lookup := s.contractShapeLookup()
+	lookup := s.contractShapeLookup(ctx)
 	fanout := consumerFileFanout(reg)
 
 	reports := make([]apiImpactReport, 0, len(providers))
 	for _, p := range providers {
-		reports = append(reports, s.buildAPIImpactReport(p, reg, lookup, fanout))
+		reports = append(reports, s.buildAPIImpactReport(ctx, p, reg, lookup, fanout))
 	}
 
 	var payload any
@@ -169,7 +169,7 @@ func consumerFileFanout(reg *contracts.Registry) map[string]int {
 	return out
 }
 
-func (s *Server) buildAPIImpactReport(p contracts.Contract, reg *contracts.Registry, lookup contracts.ShapeLookup, fanout map[string]int) apiImpactReport {
+func (s *Server) buildAPIImpactReport(ctx context.Context, p contracts.Contract, reg *contracts.Registry, lookup contracts.ShapeLookup, fanout map[string]int) apiImpactReport {
 	rep := apiImpactReport{
 		Route:   p.ID,
 		Method:  metaStr(p.Meta, "method"),
@@ -189,7 +189,7 @@ func (s *Server) buildAPIImpactReport(p contracts.Contract, reg *contracts.Regis
 		if c.Role != contracts.RoleConsumer {
 			continue
 		}
-		name := s.nodeName(c.SymbolID)
+		name := s.nodeName(ctx, c.SymbolID)
 		cons := apiImpactConsumer{
 			Name:     name,
 			File:     c.FilePath,
@@ -253,7 +253,7 @@ func (s *Server) buildAPIImpactReport(p contracts.Contract, reg *contracts.Regis
 	// Blast radius + execution flows from the real impact analysis.
 	var impact *analysis.ImpactResult
 	if p.SymbolID != "" {
-		impact = analysis.AnalyzeImpact(s.graph, []string{p.SymbolID}, s.getCommunities(), s.getProcesses())
+		impact = analysis.AnalyzeImpact(s.readerFor(ctx), []string{p.SymbolID}, s.getCommunities(), s.getProcesses())
 	}
 	if impact != nil {
 		rep.ExecutionFlows = impact.AffectedProcesses
@@ -264,7 +264,7 @@ func (s *Server) buildAPIImpactReport(p contracts.Contract, reg *contracts.Regis
 
 	// Middleware: best-effort from annotation edges on the handler. Never
 	// fabricate — mark unavailable when nothing is extracted.
-	rep.Middleware = s.handlerMiddleware(p.SymbolID)
+	rep.Middleware = s.handlerMiddleware(ctx, p.SymbolID)
 	if len(rep.Middleware) == 0 {
 		rep.MiddlewareDetection = "unavailable: gortex does not extract HTTP middleware chains; none inferable from annotations"
 	}
@@ -334,9 +334,10 @@ func riskFromRank(n int) analysis.RiskLevel {
 // contractShapeLookup resolves a type symbol ID to its field-level Shape from
 // the graph (the same closure handleValidateContracts / computeContractImpact
 // use).
-func (s *Server) contractShapeLookup() contracts.ShapeLookup {
+func (s *Server) contractShapeLookup(ctx context.Context) contracts.ShapeLookup {
+	g := s.readerFor(ctx)
 	return contracts.ShapeLookup(func(id string) *contracts.Shape {
-		n := s.graph.GetNode(id)
+		n := g.GetNode(id)
 		if n == nil || n.Meta == nil {
 			return nil
 		}
@@ -373,17 +374,17 @@ func consumerAccesses(c contracts.Contract, lookup contracts.ShapeLookup) []stri
 
 // handlerMiddleware collects annotation targets on a handler symbol as a
 // best-effort middleware list (decorators like @UseGuards / withAuth).
-func (s *Server) handlerMiddleware(symbolID string) []string {
+func (s *Server) handlerMiddleware(ctx context.Context, symbolID string) []string {
 	if symbolID == "" {
 		return nil
 	}
 	var out []string
 	seen := map[string]bool{}
-	for _, e := range s.graph.GetOutEdges(symbolID) {
+	for _, e := range s.readerFor(ctx).GetOutEdges(symbolID) {
 		if e.Kind != graph.EdgeAnnotated {
 			continue
 		}
-		name := s.nodeName(e.To)
+		name := s.nodeName(ctx, e.To)
 		if name == "" || seen[name] {
 			continue
 		}
@@ -430,11 +431,11 @@ func metaStr(m map[string]any, key string) string {
 	return v
 }
 
-func (s *Server) nodeName(id string) string {
+func (s *Server) nodeName(ctx context.Context, id string) string {
 	if id == "" {
 		return ""
 	}
-	if n := s.graph.GetNode(id); n != nil && n.Name != "" {
+	if n := s.readerFor(ctx).GetNode(id); n != nil && n.Name != "" {
 		return n.Name
 	}
 	if i := strings.LastIndex(id, "::"); i >= 0 {

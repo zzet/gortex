@@ -25,7 +25,7 @@ func copilotPayload(t *testing.T, fields map[string]any) []byte {
 func stubPromptProbe(t *testing.T, hits []grepSymbolHit) {
 	t.Helper()
 	prev := userPromptProbe
-	userPromptProbe = func(string, time.Duration) ([]grepSymbolHit, error) { return hits, nil }
+	userPromptProbe = func(string, string, time.Duration) ([]grepSymbolHit, error) { return hits, nil }
 	t.Cleanup(func() { userPromptProbe = prev })
 }
 

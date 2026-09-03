@@ -257,15 +257,24 @@ func bundlePackageKey(filePath string) string {
 	return dir
 }
 
-// lookup returns the cached bundle for id when it is fresh — the entry
-// exists and its package fingerprint still matches the current one. A
+// bundleCacheKey namespaces an entry by the payload view generation of the
+// handle that computed it. One core is shared by every handle over the same
+// database, so a node id alone would let one generation's bundle — its own
+// node, its own in/out edges — answer another generation's lookup.
+func bundleCacheKey(viewGen int64, id string) string {
+	return strconv.FormatInt(viewGen, 10) + "\x00" + id
+}
+
+// lookup returns the cached bundle for id in viewGen when it is fresh — the
+// entry exists and its package fingerprint still matches the current one. A
 // node whose package has no reported fingerprint is never served (ok is
 // false) so an unvalidated bundle can never escape the cache. A stale
 // entry is dropped in place and its bytes reclaimed.
-func (c *bundleCache) lookup(id string) (graph.SymbolBundle, bool) {
+func (c *bundleCache) lookup(viewGen int64, id string) (graph.SymbolBundle, bool) {
+	key := bundleCacheKey(viewGen, id)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e, ok := c.entries[id]
+	e, ok := c.entries[key]
 	if !ok {
 		return graph.SymbolBundle{}, false
 	}
@@ -273,7 +282,7 @@ func (c *bundleCache) lookup(id string) (graph.SymbolBundle, bool) {
 	if !ok || cur != e.fp {
 		// Stale or unvalidated — drop it so a later refresh doesn't
 		// have to, and reclaim its bytes.
-		delete(c.entries, id)
+		delete(c.entries, key)
 		c.curBytes -= e.bytes
 		return graph.SymbolBundle{}, false
 	}
@@ -291,10 +300,11 @@ func (c *bundleCache) lookup(id string) (graph.SymbolBundle, bool) {
 // case a byte cap exists to keep out of long-lived memory — is refused
 // outright rather than pinned. With maxBytes <= 0 the cache is disabled
 // and every store is a no-op.
-func (c *bundleCache) store(b graph.SymbolBundle) {
+func (c *bundleCache) store(viewGen int64, b graph.SymbolBundle) {
 	if b.Node == nil {
 		return
 	}
+	key := bundleCacheKey(viewGen, b.Node.ID)
 	pkgKey := bundlePackageKey(b.Node.FilePath)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -311,16 +321,16 @@ func (c *bundleCache) store(b graph.SymbolBundle) {
 		// be evicted by the very next insert's wholesale clear anyway.
 		return
 	}
-	if old, ok := c.entries[b.Node.ID]; ok {
+	if old, ok := c.entries[key]; ok {
 		// Replacing an existing entry — discount its bytes and drop it so
 		// curBytes and the count check track the live set.
 		c.curBytes -= old.bytes
-		delete(c.entries, b.Node.ID)
+		delete(c.entries, key)
 	}
 	if len(c.entries) > 0 && (c.curBytes+sz > c.maxBytes || len(c.entries) >= c.maxEntries) {
 		c.entries = make(map[string]*bundleCacheEntry)
 		c.curBytes = 0
 	}
-	c.entries[b.Node.ID] = &bundleCacheEntry{pkgKey: pkgKey, fp: fp, bundle: b, bytes: sz}
+	c.entries[key] = &bundleCacheEntry{pkgKey: pkgKey, fp: fp, bundle: b, bytes: sz}
 	c.curBytes += sz
 }
