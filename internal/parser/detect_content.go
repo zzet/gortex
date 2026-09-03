@@ -178,13 +178,17 @@ func sniffAmbiguous(filePath, ext string, content []byte) (string, bool) {
 			return "mathematica", true
 		}
 	case ".xml":
-		// A MyBatis mapper / Spring beans XML routes to its specific
-		// extractor; every other .xml keeps the generic "xml" default.
+		// A MyBatis mapper / Spring beans / ABA QIK descriptor XML routes
+		// to its specific extractor; every other .xml keeps the generic
+		// "xml" default.
 		if hasMyBatisMapperMarkers(probe) {
 			return "mybatis", true
 		}
 		if hasSpringBeansMarkers(probe) {
 			return "spring", true
+		}
+		if hasQikXMLMarkers(probe) {
+			return "qikxml", true
 		}
 	}
 	return "", false
@@ -202,6 +206,21 @@ func isShopifyThemeJSONPath(filePath string) bool {
 // section file. A cheap byte pre-filter; the extractor parses and validates.
 func hasShopifyTemplateMarkers(b []byte) bool {
 	return bytes.Contains(b, []byte(`"sections"`)) && bytes.Contains(b, []byte(`"type"`))
+}
+
+
+// hasQikXMLMarkers reports whether the content is an ABA/Sabre QIK
+// LocalDescRef descriptor (DATAITEM or TABLE AppObjectDesc). Inlined in
+// package parser to avoid an import cycle with languages.IsQikXML.
+func hasQikXMLMarkers(b []byte) bool {
+	lower := bytes.ToLower(b)
+	if !bytes.Contains(lower, []byte("<localdescref")) {
+		return false
+	}
+	return bytes.Contains(lower, []byte(`class="dataitem"`)) ||
+		bytes.Contains(lower, []byte(`class="table"`)) ||
+		bytes.Contains(lower, []byte(`class='dataitem'`)) ||
+		bytes.Contains(lower, []byte(`class='table'`))
 }
 
 // hasMyBatisMapperMarkers reports whether the content is a MyBatis mapper
