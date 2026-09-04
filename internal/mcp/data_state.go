@@ -36,19 +36,26 @@ import (
 // parsing prose.
 const dataStateCaveatKey = "data_state"
 
+// The three states name what was OBSERVED in the answer's own scope, never
+// what a pass did or did not do. That distinction is not pedantry: these
+// enrichments are best-effort per file and report success while skipping every
+// file they could not read, so "no data present" and "never ran" are not the
+// same claim and only the first one is observable from here. Naming a state
+// after run history would publish a history this code cannot see, and hand the
+// caller a recovery that may not clear it.
 const (
-	// dataStateNeverBuilt: the enrichment that populates this surface has
-	// never run over the scope, so the empty result carries no information
-	// about the question that was asked.
-	dataStateNeverBuilt = "never_built"
-	// dataStatePartial: it ran over part of the scope. Rows may exist and
-	// still be an undercount, which is why this is reported separately
-	// rather than folded into "built".
+	// dataStateAbsent: nothing in scope carries this data. Whether the pass
+	// never ran or ran and produced nothing is outside what can be seen here.
+	dataStateAbsent = "absent"
+	// dataStatePartial: some of the scope carries it and some does not. Rows
+	// may exist and still be an undercount, which is why this is reported
+	// separately rather than folded into complete.
 	dataStatePartial = "partial"
-	// dataStateBuilt: the data is there and the answer is real. This is the
-	// valuable half — it lets a caller say "actually nothing" with the same
-	// confidence the tool has, instead of hedging every zero forever.
-	dataStateBuilt = "built"
+	// dataStateComplete: every symbol the pass admits carries data, so the
+	// answer is whole. This is the valuable half — it lets a caller say
+	// "actually nothing" with the same confidence the tool has, instead of
+	// hedging every zero forever.
+	dataStateComplete = "complete"
 )
 
 // dataStateCaveat is the structured caveat attached to an empty result whose
@@ -64,7 +71,7 @@ type dataStateCaveat struct {
 	// never_built and partial. Empty for built.
 	Repos []string
 	// Recovery is the command that would produce the data. Empty when the
-	// state is built, where there is nothing to recover.
+	// state is complete, where there is nothing to recover.
 	Recovery string
 	// Eligible and Stamped size the shortfall: how many symbols the pass
 	// admits in scope, and how many carry data. A caller deciding whether to
@@ -115,7 +122,7 @@ const blameDataStateSource = "blame_enrichment"
 // blameRecovery names the pass that stamps authorship, and rules out the two
 // calls a caller reaches for first. Indexing does not read git blame at all,
 // so neither a re-index nor a re-track produces a single stamp.
-const blameRecovery = "run `gortex enrich blame` (or `gortex enrich all`). reindex_repository and untrack/track will NOT stamp authorship: indexing never reads git blame, so a re-parse of every file still leaves it empty."
+const blameRecovery = "run `gortex enrich blame` (or `gortex enrich all`). reindex_repository and untrack/track will NOT stamp authorship: indexing never reads git blame, so a re-parse of every file still leaves it empty. If this state survives the pass, the remaining files are ones git could not blame — an unborn commit, an untracked or generated file — rather than ones nobody has enriched yet."
 
 // ownershipDataState classifies an ownership answer from the counts its own
 // scan produced.
@@ -139,7 +146,13 @@ const blameRecovery = "run `gortex enrich blame` (or `gortex enrich all`). reind
 // The counting population is blame's own admission set for the same reason in
 // reverse: a symbol the pass never looks at is not a coverage hole, and
 // counting it would report a shortfall no enrichment could close.
-func ownershipDataState(candidates, stamped map[string]int, owners int) dataStateCaveat {
+// thresholdClause is appended whenever min_symbols emptied an answer that had
+// owners in it. It is a SECOND, unrelated reason the response is empty, and
+// reporting only the coverage shortfall would send a caller to re-run an
+// enrichment that would not put the rows back.
+const thresholdClause = " Separately: owners were found and min_symbols removed every one of them, so this particular response is empty for a second reason that no enrichment will change — lower min_symbols to see them."
+
+func ownershipDataState(candidates, stamped map[string]int, owners, rows int) dataStateCaveat {
 	var unmined, incomplete []string
 	covered := 0
 	total := 0
@@ -165,27 +178,39 @@ func ownershipDataState(candidates, stamped map[string]int, owners int) dataStat
 	sort.Strings(unstamped)
 	sort.Strings(unmined)
 
+	// Both causes are live at once when coverage is short AND the threshold
+	// emptied the rows, so the note is composed rather than chosen.
+	thresholdEmptied := rows == 0 && owners > 0
+
 	switch {
 	case total == 0:
 		// Nothing was in scope to be owned. Blame state is irrelevant: no
 		// enrichment would put a row here, so reporting one as missing would
 		// send the caller after the wrong thing.
 		return dataStateCaveat{
-			State:  dataStateBuilt,
+			State:  dataStateComplete,
 			Source: blameDataStateSource,
 			Note:   "no symbol matched the kind / path_prefix filters, so this empty result is about the filters rather than about authorship data.",
 		}
 	case stampedTotal == 0:
+		note := "not one symbol in scope carries a blame stamp, so this result is NOT evidence that nobody owns this path — authorship comes from a separate pass and none of it is present here."
+		if thresholdEmptied {
+			note += thresholdClause
+		}
 		return dataStateCaveat{
-			State:    dataStateNeverBuilt,
+			State:    dataStateAbsent,
 			Source:   blameDataStateSource,
 			Repos:    unmined,
 			Recovery: blameRecovery,
 			Eligible: eligibleTotal,
 			Stamped:  stampedTotal,
-			Note:     "not one symbol in scope carries a blame stamp, so this result is NOT evidence that nobody owns this path — authorship is stamped by a separate enrichment pass and is absent until it runs.",
+			Note:     note,
 		}
 	case len(unstamped) > 0:
+		note := "these repositories hold symbols the blame pass admits but that carry no authorship — the pass is best-effort per file and skips what it cannot blame, silently. Any ownership answer over this scope is an undercount: whatever rows it returns are real, and the symbols behind the shortfall are invisible to them."
+		if thresholdEmptied {
+			note += thresholdClause
+		}
 		return dataStateCaveat{
 			State:    dataStatePartial,
 			Source:   blameDataStateSource,
@@ -193,19 +218,19 @@ func ownershipDataState(candidates, stamped map[string]int, owners int) dataStat
 			Recovery: blameRecovery,
 			Eligible: eligibleTotal,
 			Stamped:  stampedTotal,
-			Note:     "these repositories hold symbols the blame pass admits but did not stamp — either it never ran over them, or it ran and skipped files it could not blame, which it does silently. Any ownership answer over this scope is an undercount: the rows below are real, and the symbols behind the shortfall are invisible to them.",
+			Note:     note,
 		}
-	case owners > 0:
+	case thresholdEmptied:
 		return dataStateCaveat{
-			State:  dataStateBuilt,
+			State:  dataStateComplete,
 			Source: blameDataStateSource,
-			Note:   "authorship is stamped across the scope and owners were found; every one of them fell below min_symbols. Lower min_symbols to see them — this empty result is a threshold, not an absence.",
+			Note:   "authorship is stamped across every symbol the pass admits, so nothing is missing." + thresholdClause,
 		}
 	default:
 		return dataStateCaveat{
-			State:  dataStateBuilt,
+			State:  dataStateComplete,
 			Source: blameDataStateSource,
-			Note:   "authorship is stamped across the scope, so this empty result is a real answer: no symbol in it carries an owner email and timestamp.",
+			Note:   "authorship is stamped across every symbol the pass admits, so this result is whole: what it shows is what there is.",
 		}
 	}
 }

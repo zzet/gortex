@@ -1486,8 +1486,8 @@ func (s *Server) handleAnalyzeOwnership(ctx context.Context, req mcp.CallToolReq
 	// dangerous shape: an empty answer at least looks suspicious, while rows
 	// look like the answer. This is the same argument the route inventory
 	// case makes — 130 of 153 rows is the reading that gets acted on.
-	state := ownershipDataState(candidatesByRepo, stampedByRepo, len(byEmail))
-	if len(rows) > 0 && state.State == dataStateBuilt {
+	state := ownershipDataState(candidatesByRepo, stampedByRepo, len(byEmail), len(rows))
+	if len(rows) > 0 && state.State == dataStateComplete {
 		state = dataStateCaveat{}
 	}
 
@@ -2371,7 +2371,9 @@ func (s *Server) handleAnalyzeBlame(ctx context.Context, req mcp.CallToolRequest
 	total := 0
 	perRepo := make(map[string]any, len(roots))
 	for prefix, root := range roots {
-		count, err := blame.EnrichGraph(s.graph, root)
+		// prefix scopes the pass: without it the walk over one repo's root can
+		// stamp another repo's identically-pathed nodes.
+		count, err := blame.EnrichGraph(s.graph, root, prefix)
 		if err != nil {
 			perRepo[prefix] = map[string]any{"root": root, "error": err.Error()}
 			continue

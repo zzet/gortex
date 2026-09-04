@@ -91,7 +91,7 @@ func TestAnalyzeOwnership_ReindexAfterEnrichmentReportsPartialCoverage(t *testin
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 
-	enriched, err := blame.EnrichGraph(g, dir)
+	enriched, err := blame.EnrichGraph(g, dir, "")
 	require.NoError(t, err)
 	require.Positive(t, enriched, "the blame pass stamped nothing; the fixture proves nothing")
 

@@ -208,7 +208,21 @@ func PersonNodeID(email string) string {
 	return "team::" + strings.ToLower(strings.TrimSpace(email))
 }
 
-func EnrichGraph(g graph.Store, repoRoot string) (int, error) {
+// EnrichGraph stamps authorship on the symbols of ONE repository.
+//
+// repoPrefix scopes which nodes this pass may touch, mirroring
+// cochange.EnrichGraph. Pass "" for a single-repo graph.
+//
+// The scope is load-bearing rather than an optimisation. In multi-repo mode
+// the daemon calls this once per repository against the COMBINED graph, and
+// stripRepoPrefix resolves a node path by trying it under the current root
+// and then retrying without its leading segment. Two repositories holding the
+// same relative path — internal/foo.go in both — therefore let the pass over
+// repo A open repo A's file and stamp repo B's node with repo A's authors. The
+// stamp is well-formed, plausible, and about a different file, and anything
+// downstream that counts stamps as coverage then certifies repo B on the
+// strength of it.
+func EnrichGraph(g graph.Store, repoRoot, repoPrefix string) (int, error) {
 	if g == nil || repoRoot == "" {
 		return 0, nil
 	}
@@ -222,6 +236,9 @@ func EnrichGraph(g graph.Store, repoRoot string) (int, error) {
 	gitAvailable := gitErr == nil
 	for _, n := range g.AllNodes() {
 		if !Eligible(n) {
+			continue
+		}
+		if n.RepoPrefix != repoPrefix {
 			continue
 		}
 		path, ok := normalizedPaths[n.FilePath]

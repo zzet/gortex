@@ -366,7 +366,7 @@ func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlamePara
 	started := time.Now()
 	var combined daemon.EnrichBlameResult
 	for _, t := range targets {
-		count, err := blame.EnrichGraph(c.graph, t.root)
+		count, err := blame.EnrichGraph(c.graph, t.root, t.prefix)
 		if err != nil {
 			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
