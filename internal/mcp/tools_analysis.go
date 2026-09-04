@@ -67,7 +67,7 @@ func (s *Server) registerAnalysisTools() {
 			mcp.WithDescription("Trigram-accelerated literal (or regexp) code search across the indexed repository — the alt grep backbone. Each hit carries the enclosing graph symbol (symbol_id / symbol_name) so you see which function or method a match landed in without a follow-up call. A trigram index narrows the candidate files, so a repo-wide search costs roughly the size of the matching files, not the whole tree. Use for literal-string / regexp lookups; use search_symbols for symbol-name / concept queries."),
 			mcp.WithString("query", mcp.Description("Literal substring (case-sensitive) to search for — or a regular expression when regexp=true.")),
 			mcp.WithBoolean("regexp", mcp.Description("Treat query as a regular expression instead of a literal substring. An invalid pattern is returned as a tool error. Default false.")),
-			mcp.WithNumber("limit", mcp.Description("Max matching lines to return (default 100, capped at 1000; raise the cap with GORTEX_SEARCH_TEXT_MAX_LIMIT). A result bound by the limit carries _truncated_by_limit and count_is_exact=false — read those before treating count as a total, because a `path` filter cannot recover the remainder.")),
+			mcp.WithNumber("limit", mcp.Description("Max matching lines to return (default 100, capped at 1000). A bound result sets _truncated_by_limit.")),
 			mcp.WithString("path", mcp.Description("Restrict matches to one or more sub-paths (comma-separated) -- a monorepo-service slice. Anchored, slash-segment-boundary prefixes relative to the repo root.")),
 			mcp.WithString("repo", mcp.Description("Restrict matches to a single repository prefix.")),
 			mcp.WithString("project", mcp.Description("Restrict matches to repositories in a specific project.")),
