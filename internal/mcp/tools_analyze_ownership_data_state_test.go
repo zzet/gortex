@@ -5,8 +5,22 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
 )
+
+// ownershipIsolatedServer serves an empty graph, so a test can state what full
+// blame coverage looks like. setupTestServer seeds unstamped symbols of its
+// own — correctly reported as a coverage shortfall now that coverage is
+// compared rather than presence — which makes it unusable for asserting the
+// absence of a caveat.
+func ownershipIsolatedServer(t *testing.T) *Server {
+	t.Helper()
+	g := graph.New()
+	return NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
+}
 
 // addBlameNodeInRepo is addBlameNode with an explicit repo prefix, for the
 // multi-repo cases where the caveat has to name WHICH repository is missing
@@ -109,7 +123,7 @@ func TestAnalyzeOwnership_PartialNamesTheUnstampedRepoEvenWithRows(t *testing.T)
 }
 
 func TestAnalyzeOwnership_BuiltZeroIsReportedAsReal(t *testing.T) {
-	srv, _ := setupTestServer(t)
+	srv := ownershipIsolatedServer(t)
 	addBlameNode(srv.graph, "f.go::A", "f.go", "alice@x", time.Now().Unix())
 
 	// Blame is stamped and an owner exists; min_symbols removed the answer. A
@@ -148,7 +162,7 @@ func TestAnalyzeOwnership_FilterMissIsNotBlamedOnEnrichment(t *testing.T) {
 }
 
 func TestAnalyzeOwnership_CompleteAnswerCarriesNoCaveat(t *testing.T) {
-	srv, _ := setupTestServer(t)
+	srv := ownershipIsolatedServer(t)
 	now := time.Now().Unix()
 	addBlameNode(srv.graph, "f.go::A", "f.go", "alice@x", now)
 	addBlameNode(srv.graph, "f.go::B", "f.go", "bob@x", now)
@@ -174,6 +188,13 @@ func TestOwnershipDataStateClassification(t *testing.T) {
 		{"scope holds only empty repos", map[string]int{"repo-a": 0}, map[string]int{}, 0, dataStateBuilt, nil},
 		{"no repo stamped", map[string]int{"repo-a": 3, "repo-b": 2}, map[string]int{}, 0, dataStateNeverBuilt, []string{"repo-a", "repo-b"}},
 		{"one repo stamped", map[string]int{"repo-a": 3, "repo-b": 2}, map[string]int{"repo-a": 3}, 1, dataStatePartial, []string{"repo-b"}},
+		// The review case: one stamp does not cover a repository. blame is
+		// best-effort per file, so a repo routinely holds both stamped and
+		// unstamped eligible symbols, and reading presence as coverage
+		// published the undercount this caveat exists to prevent.
+		{"same repo only partly stamped", map[string]int{"repo-a": 3}, map[string]int{"repo-a": 1}, 1, dataStatePartial, []string{"repo-a"}},
+		{"same repo one short", map[string]int{"repo-a": 3}, map[string]int{"repo-a": 2}, 1, dataStatePartial, []string{"repo-a"}},
+		{"a partly stamped repo alongside an unmined one", map[string]int{"repo-a": 3, "repo-b": 2}, map[string]int{"repo-a": 1}, 1, dataStatePartial, []string{"repo-a", "repo-b"}},
 		{"every repo stamped", map[string]int{"repo-a": 3}, map[string]int{"repo-a": 3}, 0, dataStateBuilt, nil},
 		{"owners dropped by threshold", map[string]int{"repo-a": 3}, map[string]int{"repo-a": 3}, 2, dataStateBuilt, nil},
 	} {

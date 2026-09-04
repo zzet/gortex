@@ -1418,12 +1418,20 @@ func (s *Server) handleAnalyzeOwnership(ctx context.Context, req mcp.CallToolReq
 		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
-		candidatesByRepo[n.RepoPrefix]++
+		// Counted against blame's OWN admission set, not against everything
+		// that passed the filters: a symbol the pass never looks at is not a
+		// coverage hole, and counting it would report a shortfall no
+		// enrichment could ever close.
+		if blame.Eligible(n) {
+			candidatesByRepo[n.RepoPrefix]++
+		}
 		la, ok := lastAuthoredFrom(ownBlame, n)
 		if !ok {
 			continue
 		}
-		stampedByRepo[n.RepoPrefix]++
+		if blame.Eligible(n) {
+			stampedByRepo[n.RepoPrefix]++
+		}
 		email := la.Email
 		if email == "" {
 			continue

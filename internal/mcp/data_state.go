@@ -66,6 +66,11 @@ type dataStateCaveat struct {
 	// Recovery is the command that would produce the data. Empty when the
 	// state is built, where there is nothing to recover.
 	Recovery string
+	// Eligible and Stamped size the shortfall: how many symbols the pass
+	// admits in scope, and how many carry data. A caller deciding whether to
+	// act on a partial answer needs the magnitude, not only the verdict.
+	Eligible int
+	Stamped  int
 	// Note carries the reading a caller must not make, in prose.
 	Note string
 }
@@ -81,6 +86,10 @@ func (c dataStateCaveat) payload() map[string]any {
 	}
 	if c.Recovery != "" {
 		out["recovery"] = c.Recovery
+	}
+	if c.Eligible > 0 {
+		out["symbols_eligible"] = c.Eligible
+		out["symbols_stamped"] = c.Stamped
 	}
 	return out
 }
@@ -108,32 +117,53 @@ const blameDataStateSource = "blame_enrichment"
 // so neither a re-index nor a re-track produces a single stamp.
 const blameRecovery = "run `gortex enrich blame` (or `gortex enrich all`). reindex_repository and untrack/track will NOT stamp authorship: indexing never reads git blame, so a re-parse of every file still leaves it empty."
 
-// ownershipDataState classifies an empty ownership answer from the counts its
-// own scan produced.
+// ownershipDataState classifies an ownership answer from the counts its own
+// scan produced.
 //
 // candidates and stamped are per-repo tallies over exactly the nodes the
 // handler considered: candidates counts every symbol that passed the kind and
-// path filters, stamped counts those carrying blame authorship. owners is the
-// number of distinct owners found before the min_symbols filter — non-zero
-// there with no rows means the data was fine and the threshold removed the
-// answer, which is a third silent zero this handler used to render
-// identically to the other two.
+// path filters AND that the blame pass would admit (blame.Eligible), stamped
+// counts those carrying authorship. owners is the number of distinct owners
+// found before the min_symbols filter — non-zero there with no rows means the
+// data was fine and the threshold removed the answer, which is a third silent
+// zero this handler used to render identically to the other two.
+//
+// Coverage is compared, not presence. One stamped symbol proves the pass ran
+// over that repository; it does not prove the repository is covered.
+// blame.EnrichGraph is best-effort per file — a file git cannot blame is
+// skipped and the pass reports success — so a single repository routinely
+// holds both stamped and unstamped eligible symbols. Reading a single stamp as
+// full coverage published exactly the misleading non-empty undercount this
+// caveat exists to prevent.
+//
+// The counting population is blame's own admission set for the same reason in
+// reverse: a symbol the pass never looks at is not a coverage hole, and
+// counting it would report a shortfall no enrichment could close.
 func ownershipDataState(candidates, stamped map[string]int, owners int) dataStateCaveat {
-	var unstamped []string
+	var unmined, incomplete []string
 	covered := 0
 	total := 0
+	eligibleTotal, stampedTotal := 0, 0
 	for repo, n := range candidates {
 		if n == 0 {
 			continue
 		}
 		total++
-		if stamped[repo] > 0 {
+		eligibleTotal += n
+		got := stamped[repo]
+		stampedTotal += got
+		switch {
+		case got == 0:
+			unmined = append(unmined, repo)
+		case got < n:
+			incomplete = append(incomplete, repo)
+		default:
 			covered++
-			continue
 		}
-		unstamped = append(unstamped, repo)
 	}
+	unstamped := append(append([]string{}, unmined...), incomplete...)
 	sort.Strings(unstamped)
+	sort.Strings(unmined)
 
 	switch {
 	case total == 0:
@@ -145,13 +175,15 @@ func ownershipDataState(candidates, stamped map[string]int, owners int) dataStat
 			Source: blameDataStateSource,
 			Note:   "no symbol matched the kind / path_prefix filters, so this empty result is about the filters rather than about authorship data.",
 		}
-	case covered == 0:
+	case stampedTotal == 0:
 		return dataStateCaveat{
 			State:    dataStateNeverBuilt,
 			Source:   blameDataStateSource,
-			Repos:    unstamped,
+			Repos:    unmined,
 			Recovery: blameRecovery,
-			Note:     "not one symbol in scope carries a blame stamp, so this empty result is NOT evidence that nobody owns this path — authorship is stamped by a separate enrichment pass and is absent until it runs.",
+			Eligible: eligibleTotal,
+			Stamped:  stampedTotal,
+			Note:     "not one symbol in scope carries a blame stamp, so this result is NOT evidence that nobody owns this path — authorship is stamped by a separate enrichment pass and is absent until it runs.",
 		}
 	case len(unstamped) > 0:
 		return dataStateCaveat{
@@ -159,7 +191,9 @@ func ownershipDataState(candidates, stamped map[string]int, owners int) dataStat
 			Source:   blameDataStateSource,
 			Repos:    unstamped,
 			Recovery: blameRecovery,
-			Note:     "these repositories hold candidate symbols but no blame stamps, while others in scope are stamped. Any ownership answer over this scope is an undercount, and an empty one says nothing about the unstamped repositories.",
+			Eligible: eligibleTotal,
+			Stamped:  stampedTotal,
+			Note:     "these repositories hold symbols the blame pass admits but did not stamp — either it never ran over them, or it ran and skipped files it could not blame, which it does silently. Any ownership answer over this scope is an undercount: the rows below are real, and the symbols behind the shortfall are invisible to them.",
 		}
 	case owners > 0:
 		return dataStateCaveat{

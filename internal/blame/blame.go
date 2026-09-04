@@ -221,10 +221,7 @@ func EnrichGraph(g graph.Store, repoRoot string) (int, error) {
 	_, gitErr := exec.LookPath("git")
 	gitAvailable := gitErr == nil
 	for _, n := range g.AllNodes() {
-		if !shouldEnrichBlame(n.Kind) {
-			continue
-		}
-		if n.FilePath == "" || n.StartLine == 0 {
+		if !Eligible(n) {
 			continue
 		}
 		path, ok := normalizedPaths[n.FilePath]
@@ -379,6 +376,23 @@ func pickLatest(lines map[int]Author, startLine, endLine int) *Author {
 // fixture) are also excluded since their "authorship" is the
 // authorship of the underlying source line, which the agent can
 // look up via the file/function the synthetic node attaches to.
+// Eligible reports whether this pass will consider n at all: the right kind,
+// and enough position information to blame. It is exported because a caller
+// that reports blame COVERAGE has to count the same population this pass
+// admits — counting symbols the pass never looks at would report a permanent
+// shortfall that no enrichment could ever close.
+//
+// Eligibility is not a promise of a stamp. A file git cannot blame is skipped
+// below, and a symbol whose lines carry no blame data is skipped too; both
+// leave an eligible symbol unstamped, which is a real coverage hole rather
+// than an ineligible symbol.
+func Eligible(n *graph.Node) bool {
+	if n == nil || n.FilePath == "" || n.StartLine == 0 {
+		return false
+	}
+	return shouldEnrichBlame(n.Kind)
+}
+
 func shouldEnrichBlame(kind graph.NodeKind) bool {
 	switch kind {
 	case graph.KindFunction, graph.KindMethod, graph.KindType,
