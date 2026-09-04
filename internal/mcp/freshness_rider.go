@@ -160,23 +160,12 @@ func (s *Server) indexerForRel(graphPath string) (*indexer.Indexer, string) {
 }
 
 // pathIndexability answers, for a file the graph holds no nodes for, whether
-// the index walk would ever hold it — the distinction between "excluded /
-// unindexable by design" and "tracked and indexable, just not indexed yet".
+// the walk would ever hold it — "excluded by design" versus "not indexed yet".
 //
-// Resolution goes through indexerForRel, which fails closed on a BARE
-// unprefixed path that more than one tracked repo could own (two JS repos each
-// holding node_modules/react/index.js). That is exactly the shape the
-// PreToolUse hook sends, and it is exactly the vendored path the flag exists
-// for, so a nil owner is not the end: every tracked repo is asked and the
-// verdict is taken only when they all agree. Unanimity is the conservative
-// direction — a split answer leaves enforcement on rather than silencing a
-// door on a guess.
-//
-// A repo that cannot answer casts no vote; see unanimousPathSkip.
-//
-// ensureFresh resolved this same path moments earlier via freshnessIndexer,
-// but that helper is deliberately watcher-gated (it returns nil whenever a
-// file watcher owns freshness), so it cannot double as an ownership lookup.
+// indexerForRel fails closed on a bare unprefixed path more than one repo
+// could own (two JS repos each holding node_modules/react/index.js), which is
+// the shape the PreToolUse hook sends. So a nil owner falls through to a vote,
+// taken only on unanimity — a split answer leaves enforcement on.
 func (s *Server) pathIndexability(graphPath string) fileNotIndexedState {
 	if idx, rel := s.indexerForRel(graphPath); idx != nil {
 		skip, answered := idx.PathIndexability(rel)
@@ -189,6 +178,20 @@ func (s *Server) pathIndexability(graphPath string) fileNotIndexedState {
 		return fileNotIndexedState{}
 	}
 	rel := filepath.ToSlash(graphPath)
+	if prefix, stripped, ok := s.splitRepoPrefix(rel); ok {
+		// The path names its own corpus, so one repo owns it. A vote would ask
+		// the others about a path spelled for this one, which they answer for
+		// a file of their own whenever the spelling collides.
+		idx := s.multiIndexer.GetIndexer(prefix)
+		if idx == nil {
+			return fileNotIndexedState{}
+		}
+		skip, answered := idx.PathIndexability(stripped)
+		if !answered {
+			return fileNotIndexedState{}
+		}
+		return skipState(skip)
+	}
 	votes := make([]pathSkipVote, 0, 4)
 	for _, prefix := range s.multiIndexer.RepoPrefixes() {
 		idx := s.multiIndexer.GetIndexer(prefix)
@@ -205,6 +208,21 @@ func (s *Server) pathIndexability(graphPath string) fileNotIndexedState {
 	return skipState(agreed)
 }
 
+// splitRepoPrefix separates a graph path that names its corpus into that repo
+// prefix and the path relative to the repo's root. Longest match wins, so a
+// repo nested under another resolves to the inner one.
+func (s *Server) splitRepoPrefix(graphPath string) (prefix, rel string, ok bool) {
+	for _, p := range s.multiIndexer.RepoPrefixes() {
+		if p == "" || len(p) <= len(prefix) {
+			continue
+		}
+		if rest, found := strings.CutPrefix(graphPath, p+"/"); found {
+			prefix, rel, ok = p, rest, true
+		}
+	}
+	return prefix, rel, ok
+}
+
 // pathSkipVote is one repo's answer; Answered is false when it could not
 // answer at all.
 type pathSkipVote struct {
@@ -214,9 +232,8 @@ type pathSkipVote struct {
 
 // unanimousPathSkip takes the verdict only when every repo that could answer
 // agreed. Abstentions are dropped: an un-rooted repo returns the zero PathSkip,
-// bit-identical to "indexable", so counting it made one silent repo disagree
-// with every repo that had actually looked. ok is false on no answers or a
-// genuine conflict — both leave enforcement on.
+// bit-identical to "indexable", so counting it let one silent repo disagree
+// with every repo that looked. ok is false on no answers or a conflict.
 func unanimousPathSkip(votes []pathSkipVote) (indexer.PathSkip, bool) {
 	var agreed *indexer.PathSkip
 	for _, v := range votes {

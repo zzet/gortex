@@ -856,6 +856,25 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		}
 		return ControlResponse{OK: true, Result: buf}
 
+	case ControlDirCoverage:
+		coverage, ok := s.Controller.(DirCoverageController)
+		if !ok {
+			return controlErr(ErrInternal, "this daemon cannot resolve a path to the view that serves it")
+		}
+		var p DirCoverageParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		result, err := coverage.DirCoverage(ctx, p)
+		if err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		buf, err := json.Marshal(result)
+		if err != nil {
+			return controlErr(ErrInternal, "marshal dir_coverage result: "+err.Error())
+		}
+		return ControlResponse{OK: true, Result: buf}
+
 	case ControlShutdown:
 		if err := s.Controller.Shutdown(ctx); err != nil {
 			return controlErr(ErrInternal, err.Error())
@@ -1065,6 +1084,14 @@ func controlErr(code, msg string) ControlResponse {
 // that is not running at all.
 type FileCoverageController interface {
 	FileCoverage(ctx context.Context, params FileCoverageParams) (FileCoverageResult, error)
+}
+
+// DirCoverageController is the opt-in scope answer behind ControlDirCoverage,
+// implemented on the same terms as FileCoverageController: a controller that
+// cannot resolve a path to the graph serving it leaves the kind unanswered,
+// and the caller degrades as it does for a daemon that is not running.
+type DirCoverageController interface {
+	DirCoverage(ctx context.Context, params DirCoverageParams) (DirCoverageResult, error)
 }
 
 // StatusExactController is the opt-in audit half of ControlStatus. A

@@ -1,20 +1,13 @@
 package indexer
 
 import (
-	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
-
-// admissionGates carries the two corpus-admission gates that hold per-run
-// state. The zero value is inert; both gates are nil-safe.
-type admissionGates struct {
-	untracked *untrackedAssetGate
-	content   *contentAdmissionGate
-}
 
 // PathSkip is how the walk would treat one file. ByRule narrows Skipped to "an
 // exclude or ignore rule says so", as opposed to an unclaimed language, the
@@ -57,14 +50,81 @@ func (idx *Indexer) PathIndexability(relPath string) (PathSkip, bool) {
 	if !adm.admit {
 		return PathSkip{Skipped: true, ByRule: adm.excluded}, true
 	}
-	gates := idx.probeAdmissionGates(root)
-	if _, skip := gates.untracked.skip(adm.lang, abs); skip {
-		return PathSkip{Skipped: true}, true
-	}
-	if _, skip := gates.content.skip(adm.lang, info.Size()); skip {
+	// Only the gates the incremental watcher keeps. SkipUntrackedAssets
+	// governs the cold walk alone, so applying it here would report "never
+	// indexable" for a file the watcher indexes on the next save.
+	if _, skip := idx.newContentAdmissionGate().skip(adm.lang, info.Size()); skip {
 		return PathSkip{Skipped: true}, true
 	}
 	return PathSkip{}, true
+}
+
+// errScopeWalkBudget stops a scope walk that ran out of its budget.
+var errScopeWalkBudget = errors.New("scope walk budget exhausted")
+
+// ScopeIndexability reports whether the index walk would claim any file under
+// relDir, the directory counterpart of PathIndexability. relDir is empty for
+// the repository root.
+//
+// walked is false when the walk did not finish (unreadable directory, path
+// outside the root, exhausted budget). Callers must not read
+// (!indexable && !walked) as "no source here".
+//
+// The corpus-admission gates are deliberately not applied: they only skip more
+// files, so honouring them could turn "the walk would claim something" into a
+// proof that it would not.
+func (idx *Indexer) ScopeIndexability(relDir string, budget time.Duration) (indexable, walked bool) {
+	root := idx.RootPath()
+	if root == "" {
+		return false, false
+	}
+	abs := root
+	if relDir != "" {
+		var ok bool
+		if abs, ok = absWithinRoot(root, relDir); !ok {
+			return false, false
+		}
+	}
+	info, err := os.Lstat(abs)
+	if err != nil || !info.IsDir() {
+		return false, false
+	}
+
+	deadline := time.Now().Add(budget)
+	complete := true
+	_ = filepath.WalkDir(abs, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// An unread subtree may hold source, so the scope is unsettled.
+			complete = false
+			if path == abs {
+				return walkErr
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			complete = false
+			return errScopeWalkBudget
+		}
+		if d.IsDir() {
+			if idx.admitWalkEntry(root, path, -1, true).pruneDir {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if !idx.admitWalkEntry(root, path, -1, false).admit {
+			return nil
+		}
+		indexable = true
+		return fs.SkipAll
+	})
+	if indexable {
+		// One file the walk would claim settles the scope however it ended.
+		return true, true
+	}
+	return false, complete
 }
 
 // absWithinRoot resolves a repo-relative path against root and refuses
@@ -84,40 +144,4 @@ func absWithinRoot(root, relPath string) (string, bool) {
 		return "", false
 	}
 	return abs, true
-}
-
-const (
-	// probeGatesTTL bounds gate reuse across probes: the untracked gate shells
-	// out to `git ls-files` for the whole repo, and the tracked set moves at
-	// commit speed, not per-call speed.
-	probeGatesTTL = 30 * time.Second
-	// probeGitTimeout keeps a wedged repo from stalling the triggering call.
-	probeGitTimeout = 2 * time.Second
-)
-
-// probeGateCache memoises the gates for single-path probes, keyed on root so a
-// re-rooted indexer never answers with another checkout's tracked set.
-type probeGateCache struct {
-	mu    sync.Mutex
-	at    time.Time
-	root  string
-	gates admissionGates
-}
-
-func (idx *Indexer) probeAdmissionGates(root string) admissionGates {
-	c := &idx.probeGates
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.root == root && !c.at.IsZero() && time.Since(c.at) < probeGatesTTL {
-		return c.gates
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), probeGitTimeout)
-	defer cancel()
-	c.gates = admissionGates{
-		untracked: idx.newUntrackedAssetGate(ctx, root),
-		content:   idx.newContentAdmissionGate(),
-	}
-	c.root = root
-	c.at = time.Now()
-	return c.gates
 }

@@ -80,11 +80,13 @@ func (idx *Indexer) admitScopedWalkFile(root, absPath string) bool {
 	if adm.admit {
 		return true
 	}
-	if adm.excluded || adm.lang != "" {
+	if adm.excluded {
 		return false
 	}
-	// Not excluded and unclaimed: reaching here already means the ignore list
-	// let it through, so the manifest check is the whole remaining question.
+	// Not excluded and unclaimed — the only rejection left, since the caller
+	// passes no size and so never meets the cap. Reaching here already means
+	// the ignore list let the path through, so the manifest check is the whole
+	// remaining question.
 	return idx.isIncrementalContractManifest(absPath)
 }
 

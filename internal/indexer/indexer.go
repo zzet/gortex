@@ -207,9 +207,7 @@ type Indexer struct {
 	excludeMu     sync.Mutex
 	dirIgnore     *excludes.Hierarchical
 	dirIgnoreOnce sync.Once
-	// probeGates memoises admission gates for single-path probes.
-	probeGates probeGateCache
-	rootPath   string
+	rootPath      string
 	// contentSrc is the optional immutable snapshot every content read
 	// goes through; nil reads the working tree with the os package. Held
 	// in an atomic pointer because reindex paths read it without a lock,

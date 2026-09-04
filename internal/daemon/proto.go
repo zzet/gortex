@@ -183,6 +183,13 @@ const (
 	// must not set up an MCP session, and because only the daemon can turn a
 	// worktree path into the composed view that serves it.
 	ControlFileCoverage = "file_coverage"
+	// ControlDirCoverage answers whether the graph serving a directory holds
+	// indexed source under it, and when it does not, whether the index walk
+	// would ever claim anything there. It is the scope half of the hook front
+	// door. It lives here because a client can only sample the directory, and
+	// any sample small enough for a hook's budget is decided by what it
+	// happened to pick.
+	ControlDirCoverage = "dir_coverage"
 )
 
 // DefaultControlTimeout bounds the control kinds that are supposed to answer
@@ -659,21 +666,10 @@ type FileCoverageParams struct {
 // FileCoverageResult is the payload returned under Result for a successful
 // ControlFileCoverage call.
 //
-// Covered reports that the graph serving Path holds definition symbols for
-// it — the fact a hook turns into a deny. Symbols is how many, which is the
-// evidence the deny cites.
-//
-// Answered is what separates a verdict from an abstention. A path whose view
-// is not built yet leaves it false: an unbuilt view knows nothing about the
-// file, and reporting the primary's answer instead would deny a read on
-// another working copy's content.
-//
-// It qualifies the negative fields, not the positive one. Covered stands on
-// its own — coverage is never reported for a path the daemon could not place,
-// and a daemon predating Answered omits the field while still reporting it
-// truthfully. A caller that gated the deny on Answered would switch
-// enforcement off for the whole life of such a daemon, and daemons outlive the
-// binary upgrade that starts them.
+// Answered qualifies the negative fields only. Covered stands on its own: a
+// daemon predating Answered omits the field while still reporting coverage
+// truthfully, and gating the deny on it would switch enforcement off for that
+// daemon's whole life.
 type FileCoverageResult struct {
 	Covered bool       `json:"covered"`
 	Symbols int        `json:"symbols"`
@@ -686,16 +682,41 @@ type FileCoverageResult struct {
 	// Tracked is the verdict "this path is outside every indexed corpus".
 	Tracked bool `json:"tracked,omitempty"`
 	// Held reports that the serving graph holds Path at all. Held without
-	// Covered is a file the walk indexed that defines no symbols — the
-	// locators still have rows for it even though no symbol lookup does.
+	// Covered is an indexed file that defines no symbols.
 	Held bool `json:"held,omitempty"`
-	// Excluded and Unindexable report what the index walk would do with Path,
-	// which is how a caller tells "not indexed yet" from "never will be".
-	// Unindexable is any rejection; Excluded narrows it to an exclude or
-	// ignore rule. Both stay false when no indexer could answer, and they are
-	// only consulted for a path the graph does not already cover.
+	// Excluded and Unindexable report what the walk would do with Path — how
+	// a caller tells "not indexed yet" from "never will be". Unindexable is
+	// any rejection, Excluded narrows it to a rule. Both stay false when no
+	// indexer could answer.
 	Excluded    bool `json:"excluded,omitempty"`
 	Unindexable bool `json:"unindexable,omitempty"`
+}
+
+// DirCoverageParams is the payload for ControlDirCoverage. Path is the
+// directory being probed; callers send an absolute one.
+type DirCoverageParams struct {
+	Path string `json:"path"`
+}
+
+// DirCoverageResult is the payload returned under Result for a successful
+// ControlDirCoverage call. HasSource settles the scope; the rest only
+// qualifies a false one.
+type DirCoverageResult struct {
+	View *ProbeView `json:"view,omitempty"`
+	// Answered reports that the daemon resolved Path to a graph and read it.
+	// False means the rest of this struct is unknown, not negative.
+	Answered bool `json:"answered,omitempty"`
+	// Tracked reports that a registered checkout owns Path.
+	Tracked bool `json:"tracked,omitempty"`
+	// HasSource reports that the serving graph holds an indexed file under
+	// Path.
+	HasSource bool `json:"has_source,omitempty"`
+	// Walked reports that the admission walk ran to completion. False makes
+	// Indexable a lower bound rather than a verdict.
+	Walked bool `json:"walked,omitempty"`
+	// Indexable reports that the walk found a file it would claim. Without
+	// HasSource that is mid-walk, not excluded — never "no source here".
+	Indexable bool `json:"indexable,omitempty"`
 }
 
 // EnrichChurnParams is the payload for ControlEnrichChurn.

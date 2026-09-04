@@ -3,7 +3,6 @@ package hooks
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,46 +10,21 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 )
 
-// withRepoRoot makes root the one tracked repo, no daemon needed.
-func withRepoRoot(t *testing.T, root string) {
+// stubDirCoverage fixes the daemon's scope answer without a socket.
+func stubDirCoverage(t *testing.T, result daemon.DirCoverageResult) {
 	t.Helper()
-	old := hookTrackedReposFn
-	hookTrackedReposFn = func() []daemon.TrackedRepoStatus {
-		return []daemon.TrackedRepoStatus{{Path: root}}
+	stubDirCoverageBy(t, func(string) (daemon.DirCoverageResult, bool) { return result, true })
+}
+
+// stubDirCoverageBy answers per absolute scope, so a test can give one
+// directory a different verdict from another.
+func stubDirCoverageBy(t *testing.T, fn func(scope string) (daemon.DirCoverageResult, bool)) {
+	t.Helper()
+	old := dirCoverageFn
+	dirCoverageFn = func(path string, _ time.Duration) (daemon.DirCoverageResult, bool) {
+		return fn(path)
 	}
-	t.Cleanup(func() { hookTrackedReposFn = old })
-}
-
-// stubFindFilesProbe answers per repo-relative path ("" = whole repo); a path
-// absent from the map answers (false, false) — "could not ask".
-func stubFindFilesProbe(t *testing.T, answers map[string][2]bool) {
-	t.Helper()
-	old := findFilesProbeFn
-	findFilesProbeFn = func(_, rel string) (bool, bool) {
-		a, present := answers[rel]
-		if !present {
-			return false, false
-		}
-		return a[0], a[1]
-	}
-	t.Cleanup(func() { findFilesProbeFn = old })
-}
-
-// stubFileIndexScopeTimed stubs the file-verdict seam with the probe budget
-// visible, for the tests that assert the witness shares one deadline.
-func stubFileIndexScopeTimed(t *testing.T, fn func(cwd, filePath string, timeout time.Duration) fileIndexStatus) {
-	t.Helper()
-	old := fileIndexScopeFn
-	fileIndexScopeFn = fn
-	t.Cleanup(func() { fileIndexScopeFn = old })
-}
-
-// stubScopeWitness fixes the witness verdict without walking anything.
-func stubScopeWitness(t *testing.T, w scopeWitness) {
-	t.Helper()
-	old := scopeWitnessFn
-	scopeWitnessFn = func(string, string) scopeWitness { return w }
-	t.Cleanup(func() { scopeWitnessFn = old })
+	t.Cleanup(func() { dirCoverageFn = old })
 }
 
 // --- read doors: Read, and Bash cat/head/tail ---
@@ -358,113 +332,68 @@ func TestHookSearchScope_TrackedDirectory_Indexed(t *testing.T) {
 	}
 }
 
-// --- what an empty find_files answer may prove ---
+// --- what a scope answer may prove ---
 
-// Zero hits is not proof of a vendored tree, and neither is "some file
-// somewhere in this repo is indexed" — that holds while the walk has not
-// reached this scope yet. Only the scope's own witness separates "excluded by
-// design" from "not indexed yet".
-func TestScopeTrackedFromProbes(t *testing.T) {
-	const (
-		hasSource = true
-		empty     = false
-		answered  = true
-	)
+// The graph holding nothing under a scope is not proof the scope holds no
+// source: that is equally true of a tree excluded by design and of one the
+// walk has not reached yet. Only a completed admission walk separates them.
+func TestScopeTrackedFromCoverage(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
-		rel           string
-		answers       map[string][2]bool
-		witness       scopeWitness
+		result        daemon.DirCoverageResult
 		wantHasSource bool
 		wantProbeOK   bool
 	}{{
 		name:          "scope holds indexed source",
-		rel:           "internal",
-		answers:       map[string][2]bool{"internal": {hasSource, answered}},
+		result:        daemon.DirCoverageResult{Answered: true, Tracked: true, HasSource: true},
 		wantHasSource: true,
 		wantProbeOK:   true,
 	}, {
-		name:          "scope empty and every sampled file is unindexable ⇒ proven empty",
-		rel:           "node_modules/dpack",
-		answers:       map[string][2]bool{"node_modules/dpack": {empty, answered}},
-		witness:       witnessNever,
-		wantHasSource: false,
-		wantProbeOK:   true,
+		name:        "graph empty and the walk claims nothing ⇒ proven source-free",
+		result:      daemon.DirCoverageResult{Answered: true, Tracked: true, Walked: true},
+		wantProbeOK: true,
 	}, {
-		name:          "witness settled nothing ⇒ NOT proof",
-		rel:           "internal/parser",
-		answers:       map[string][2]bool{"internal/parser": {empty, answered}},
-		witness:       witnessUnknown,
-		wantHasSource: false,
-		wantProbeOK:   false,
+		name:   "graph empty but the walk claims a file ⇒ mid-walk, NOT proof",
+		result: daemon.DirCoverageResult{Answered: true, Tracked: true, Walked: true, Indexable: true},
 	}, {
-		name:          "witness contradicts find_files ⇒ enforce",
-		rel:           "internal",
-		answers:       map[string][2]bool{"internal": {empty, answered}},
-		witness:       witnessSource,
-		wantHasSource: true,
-		wantProbeOK:   true,
+		name:   "the walk did not finish ⇒ NOT proof",
+		result: daemon.DirCoverageResult{Answered: true, Tracked: true},
 	}, {
-		name:          "an empty repo root is corroborated like any other scope",
-		rel:           "",
-		answers:       map[string][2]bool{"": {empty, answered}},
-		witness:       witnessUnknown,
-		wantHasSource: false,
-		wantProbeOK:   false,
+		name:   "an unfinished walk that found nothing yet is still not proof",
+		result: daemon.DirCoverageResult{Answered: true, Tracked: true, Indexable: false},
 	}, {
-		name:          "repo root holds source",
-		rel:           "",
-		answers:       map[string][2]bool{"": {hasSource, answered}},
-		wantHasSource: true,
-		wantProbeOK:   true,
+		name:   "the daemon could not answer",
+		result: daemon.DirCoverageResult{},
 	}, {
-		name:          "scoped probe failed outright",
-		rel:           "internal",
-		answers:       map[string][2]bool{},
-		wantHasSource: false,
-		wantProbeOK:   false,
+		name:        "a scope outside every corpus is an answer",
+		result:      daemon.DirCoverageResult{Answered: true, Walked: true},
+		wantProbeOK: true,
+	}, {
+		// An older daemon omits every flag this verb added, which must read
+		// as an abstention rather than as an empty scope.
+		name:   "a daemon that predates the verb's flags",
+		result: daemon.DirCoverageResult{Answered: true, Tracked: true, HasSource: false},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
-			probe := func(at string) (bool, bool) {
-				calls++
-				a, present := tc.answers[at]
-				if !present {
-					return false, false
-				}
-				return a[0], a[1]
-			}
-			witnessCalls := 0
-			witness := func() scopeWitness {
-				witnessCalls++
-				return tc.witness
-			}
-			gotHas, gotOK := scopeTrackedFromProbes(tc.rel, probe, witness)
+			gotHas, gotOK := scopeTrackedFromCoverage(tc.result)
 			if gotHas != tc.wantHasSource || gotOK != tc.wantProbeOK {
-				t.Errorf("scopeTrackedFromProbes(%q) = (%v, %v), want (%v, %v)",
-					tc.rel, gotHas, gotOK, tc.wantHasSource, tc.wantProbeOK)
-			}
-			// One probe, never two — the witness replaced the repo-wide dial.
-			if calls != 1 {
-				t.Errorf("the scope is probed exactly once; calls = %d", calls)
-			}
-			if a, ok := tc.answers[tc.rel]; ok && a[0] && witnessCalls != 0 {
-				t.Errorf("a scope that holds source must not pay the witness walk; calls = %d", witnessCalls)
+				t.Errorf("scopeTrackedFromCoverage(%+v) = (%v, %v), want (%v, %v)",
+					tc.result, gotHas, gotOK, tc.wantHasSource, tc.wantProbeOK)
 			}
 		})
 	}
 }
 
-// The corroboration must survive the transport path, not just the decision fn:
-// a repo mid-walk answers "no indexed files here" for a package full of source.
+// The verdict must survive the transport, not just the decision function.
+
+// A repo mid-walk answers "nothing indexed here" for a package full of source.
 func TestScopeTrackedViaDaemon_WarmingRepoIsNotProof(t *testing.T) {
 	withDaemonReachable(t, true)
 	dir := t.TempDir()
 	writeScopeFile(t, dir, "internal/parser.go", "package p\n")
-	withRepoRoot(t, dir)
-	stubFindFilesProbe(t, map[string][2]bool{"internal": {false, true}})
-	// Tracked and indexable — the walk simply has not reached it yet.
-	stubFileIndexScope(t, fileIndexStatus{Tracked: true, ProbeOK: true})
+	stubDirCoverage(t, daemon.DirCoverageResult{
+		Answered: true, Tracked: true, Walked: true, Indexable: true,
+	})
 
 	hasSource, probeOK := scopeTrackedViaDaemon(dir, "internal")
 	if hasSource || probeOK {
@@ -472,33 +401,66 @@ func TestScopeTrackedViaDaemon_WarmingRepoIsNotProof(t *testing.T) {
 	}
 }
 
-// Indexed source elsewhere in the repo proves nothing about THIS scope.
-func TestScopeTrackedViaDaemon_SourceElsewhereIsNotProof(t *testing.T) {
-	withDaemonReachable(t, true)
-	dir := t.TempDir()
-	writeScopeFile(t, dir, "internal/parser.go", "package p\n")
-	withRepoRoot(t, dir)
-	stubFindFilesProbe(t, map[string][2]bool{"internal": {false, true}, "": {true, true}})
-	stubFileIndexScope(t, fileIndexStatus{Tracked: true, ProbeOK: true})
-
-	hasSource, probeOK := scopeTrackedViaDaemon(dir, "internal")
-	if hasSource || probeOK {
-		t.Fatalf("indexed source elsewhere in the repo is not proof about this scope, got (%v, %v)", hasSource, probeOK)
-	}
-}
-
-// The complement: a tree whose own files are excluded by design is proven empty.
+// The complement: a tree whose files the walk will never claim is proven empty.
 func TestScopeTrackedViaDaemon_ProvenEmptySubdirectory(t *testing.T) {
 	withDaemonReachable(t, true)
 	dir := t.TempDir()
 	writeScopeFile(t, dir, "node_modules/dpack/index.js", "module.exports = {}\n")
-	withRepoRoot(t, dir)
-	stubFindFilesProbe(t, map[string][2]bool{"node_modules/dpack": {false, true}})
-	stubFileIndexScope(t, fileIndexStatus{NeverIndexable: true, Tracked: true, ProbeOK: true})
+	stubDirCoverage(t, daemon.DirCoverageResult{Answered: true, Tracked: true, Walked: true})
 
 	hasSource, probeOK := scopeTrackedViaDaemon(dir, "node_modules/dpack")
 	if hasSource || !probeOK {
 		t.Fatalf("an excluded-by-design subdirectory should be proven empty, got (%v, %v)", hasSource, probeOK)
+	}
+}
+
+// The scope the daemon is asked about is the one the caller named, resolved
+// against cwd — the daemon does the rest, because only it can tell a worktree
+// from an ordinary tracked root.
+func TestScopeTrackedViaDaemon_AsksAboutTheScopeItself(t *testing.T) {
+	withDaemonReachable(t, true)
+	dir := t.TempDir()
+	writeScopeFile(t, dir, "internal/parser.go", "package p\n")
+	asked := ""
+	stubDirCoverageBy(t, func(scope string) (daemon.DirCoverageResult, bool) {
+		asked = scope
+		return daemon.DirCoverageResult{Answered: true, Tracked: true, HasSource: true}, true
+	})
+
+	if hasSource, probeOK := scopeTrackedViaDaemon(dir, "internal"); !hasSource || !probeOK {
+		t.Fatalf("a scope the graph holds source under denies, got (%v, %v)", hasSource, probeOK)
+	}
+	if want := filepath.Join(dir, "internal"); asked != want {
+		t.Errorf("the daemon was asked about %q, want %q", asked, want)
+	}
+}
+
+// A scope that is not a directory never reaches the daemon.
+func TestScopeTrackedViaDaemon_MissingScopeIsUnproven(t *testing.T) {
+	withDaemonReachable(t, true)
+	dir := t.TempDir()
+	stubDirCoverageBy(t, func(scope string) (daemon.DirCoverageResult, bool) {
+		t.Errorf("an unwalkable scope was put to the daemon: %q", scope)
+		return daemon.DirCoverageResult{}, false
+	})
+
+	if hasSource, probeOK := scopeTrackedViaDaemon(dir, "gone"); hasSource || probeOK {
+		t.Fatalf("a scope that does not exist proves nothing, got (%v, %v)", hasSource, probeOK)
+	}
+}
+
+// A transport failure is not a verdict.
+func TestScopeTrackedViaDaemon_UnreachedIsNotProvenEmpty(t *testing.T) {
+	withDaemonReachable(t, true)
+	dir := t.TempDir()
+	writeScopeFile(t, dir, "infra/main.tf", "resource \"x\" \"y\" {}\n")
+	stubDirCoverageBy(t, func(string) (daemon.DirCoverageResult, bool) {
+		return daemon.DirCoverageResult{}, false
+	})
+
+	hasSource, probeOK := scopeTrackedViaDaemon(dir, "infra")
+	if hasSource || probeOK {
+		t.Fatalf("a scope the daemon never answered for is unproven, got (%v, %v)", hasSource, probeOK)
 	}
 }
 
@@ -511,254 +473,6 @@ func writeScopeFile(t *testing.T, root, rel, body string) {
 	}
 	if err := os.WriteFile(abs, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// The graph decides what a scope holds. looksLikeSourceFile only ranks the
-// sample, so a scope whose files carry no recognised extension is put to the
-// daemon rather than written off.
-func TestScopeWitnessViaWalk(t *testing.T) {
-	t.Run("a recognised source file represents the scope", func(t *testing.T) {
-		dir := t.TempDir()
-		writeScopeFile(t, dir, "README.md", "# hi\n")
-		writeScopeFile(t, dir, "assets/logo.png", "\x89PNG\n")
-		writeScopeFile(t, dir, "pkg/a.go", "package a\n")
-		stubFileIndexScopeBy(t, func(_, path string) fileIndexStatus {
-			if !strings.HasSuffix(path, ".go") {
-				t.Errorf("the walk sampled %q over the .go file it should prefer", path)
-			}
-			return fileIndexStatus{Indexed: true, Count: 2, Tracked: true, ProbeOK: true}
-		})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessSource {
-			t.Fatalf("a tree holding an indexed .go file has a source witness, got %v", w)
-		}
-	})
-
-	t.Run("excluded by design", func(t *testing.T) {
-		dir := t.TempDir()
-		writeScopeFile(t, dir, "vendor/x/y.go", "package y\n")
-		stubFileIndexScope(t, fileIndexStatus{NeverIndexable: true, Tracked: true, ProbeOK: true})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessNever {
-			t.Fatalf("a tree the walk will never hold is proven source-free, got %v", w)
-		}
-	})
-
-	t.Run("indexable but not held yet settles nothing", func(t *testing.T) {
-		dir := t.TempDir()
-		writeScopeFile(t, dir, "pkg/a.go", "package a\n")
-		stubFileIndexScope(t, fileIndexStatus{Tracked: true, ProbeOK: true})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessUnknown {
-			t.Fatalf("a scope mid-walk is not a scope without source, got %v", w)
-		}
-	})
-
-	t.Run("a failed witness probe settles nothing", func(t *testing.T) {
-		dir := t.TempDir()
-		writeScopeFile(t, dir, "pkg/a.go", "package a\n")
-		stubFileIndexScope(t, fileIndexStatus{Unreached: true})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessUnknown {
-			t.Fatalf("a probe that never answered proves nothing, got %v", w)
-		}
-	})
-
-	// The finding this rewrite exists for. Every one of these is a language
-	// with a first-class extractor and none carries a recognised extension,
-	// so an extension list would call the scope settled-non-source and switch
-	// enforcement off for the repositories that need it most.
-	t.Run("unrecognised source names go to the graph, not to a list", func(t *testing.T) {
-		for _, name := range []string{
-			"main.tf", "Chart.yaml", "playbook.yml", "App.csproj",
-			"report.qmd", "init.luau", "README.md",
-		} {
-			t.Run(name, func(t *testing.T) {
-				dir := t.TempDir()
-				writeScopeFile(t, dir, name, "x\n")
-				asked := ""
-				stubFileIndexScopeBy(t, func(_, path string) fileIndexStatus {
-					asked = filepath.Base(path)
-					// The extractor claims it; it is simply not held yet.
-					return fileIndexStatus{Tracked: true, ProbeOK: true}
-				})
-
-				if w := scopeWitnessViaWalk(dir, dir); w != witnessUnknown {
-					t.Fatalf("%s must not read as settled-non-source, got %v", name, w)
-				}
-				if asked != name {
-					t.Fatalf("the graph was asked about %q, want %q", asked, name)
-				}
-			})
-		}
-	})
-
-	t.Run("unrecognised names the graph will never hold", func(t *testing.T) {
-		dir := t.TempDir()
-		writeScopeFile(t, dir, "docs/a.md", "# a\n")
-		writeScopeFile(t, dir, "docs/b.txt", "b\n")
-		stubFileIndexScope(t, fileIndexStatus{NeverIndexable: true, Tracked: true, ProbeOK: true})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessNever {
-			t.Fatalf("a tree the daemon disowns is proven source-free, got %v", w)
-		}
-	})
-
-	t.Run("an empty tree holds no source", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(dir, "empty"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		stubFileIndexScopeBy(t, func(_, path string) fileIndexStatus {
-			t.Errorf("nothing to sample, yet the graph was asked about %q", path)
-			return fileIndexStatus{}
-		})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessNever {
-			t.Fatalf("a tree with no files at all holds no source, got %v", w)
-		}
-	})
-
-	t.Run("missing directory is unknown, not empty", func(t *testing.T) {
-		if w := scopeWitnessViaWalk(t.TempDir(), filepath.Join(t.TempDir(), "gone")); w != witnessUnknown {
-			t.Fatalf("an unwalkable scope proves nothing, got %v", w)
-		}
-	})
-
-	// WalkDir is lexical, so an unpruned .git swallows the entry budget before
-	// any source file is reached and every warming-repo Grep pays for it.
-	t.Run("dot-directories are pruned", func(t *testing.T) {
-		dir := t.TempDir()
-		for i := range witnessWalkEntries + 16 {
-			writeScopeFile(t, dir, filepath.Join(".git", "objects", strconv.Itoa(i)), "x")
-		}
-		writeScopeFile(t, dir, "pkg/a.go", "package a\n")
-		asked := ""
-		stubFileIndexScopeBy(t, func(_, path string) fileIndexStatus {
-			asked = path
-			return fileIndexStatus{Indexed: true, Count: 1, Tracked: true, ProbeOK: true}
-		})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessSource {
-			t.Fatalf("the .go file past .git must still be reached, got %v", w)
-		}
-		if filepath.Base(asked) != "a.go" {
-			t.Fatalf("the graph was asked about %q, want the source file", asked)
-		}
-	})
-
-	// …but pruning means an empty sample is no longer an empty scope.
-	t.Run("a scope holding only dot-directories proves nothing", func(t *testing.T) {
-		dir := t.TempDir()
-		writeScopeFile(t, dir, filepath.Join(".hidden", "a.go"), "package a\n")
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessUnknown {
-			t.Fatalf("a pruned scope with nothing left to sample proves nothing, got %v", w)
-		}
-	})
-}
-
-// The witness runs on the PreToolUse critical path, so the walk and every
-// probe it raises share one deadline rather than each getting its own.
-func TestScopeWitnessViaWalk_FitsOneBudget(t *testing.T) {
-	t.Run("each probe sees the remaining budget", func(t *testing.T) {
-		dir := t.TempDir()
-		for _, name := range []string{"a.go", "b.go", "c.go"} {
-			writeScopeFile(t, dir, name, "package p\n")
-		}
-		var budgets []time.Duration
-		stubFileIndexScopeTimed(t, func(_, _ string, timeout time.Duration) fileIndexStatus {
-			budgets = append(budgets, timeout)
-			time.Sleep(2 * time.Millisecond)
-			return fileIndexStatus{NeverIndexable: true, Tracked: true, ProbeOK: true}
-		})
-
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessNever {
-			t.Fatalf("witness = %v, want witnessNever", w)
-		}
-		if len(budgets) != witnessSamples {
-			t.Fatalf("the walk raised %d probes, want the %d-sample cap", len(budgets), witnessSamples)
-		}
-		if budgets[0] > witnessBudget {
-			t.Errorf("the first probe got %s, more than the %s witness budget", budgets[0], witnessBudget)
-		}
-		for i := 1; i < len(budgets); i++ {
-			if budgets[i] >= budgets[i-1] {
-				t.Errorf("probe %d got %s, not less than the %s left before it — the budget is not shared",
-					i, budgets[i], budgets[i-1])
-			}
-		}
-	})
-
-	t.Run("an exhausted budget settles nothing", func(t *testing.T) {
-		dir := t.TempDir()
-		for _, name := range []string{"a.go", "b.go"} {
-			writeScopeFile(t, dir, name, "package p\n")
-		}
-		probes := 0
-		stubFileIndexScopeTimed(t, func(_, _ string, _ time.Duration) fileIndexStatus {
-			probes++
-			time.Sleep(witnessBudget)
-			return fileIndexStatus{NeverIndexable: true, Tracked: true, ProbeOK: true}
-		})
-
-		start := time.Now()
-		if w := scopeWitnessViaWalk(dir, dir); w != witnessUnknown {
-			t.Fatalf("a witness that ran out of budget proves nothing, got %v", w)
-		}
-		if probes != 1 {
-			t.Errorf("the walk raised %d probes past its deadline, want 1", probes)
-		}
-		// One overrunning probe, not one per sample.
-		if elapsed := time.Since(start); elapsed > 2*witnessBudget {
-			t.Errorf("the witness took %s, want it bounded near the %s budget", elapsed, witnessBudget)
-		}
-	})
-}
-
-// The whole point of the second return: a scope the daemon could not answer
-// for must not read as a scope with nothing in it.
-func TestScopeTrackedViaDaemon_WitnessUnknownIsNotProvenEmpty(t *testing.T) {
-	withDaemonReachable(t, true)
-	dir := t.TempDir()
-	writeScopeFile(t, dir, "infra/main.tf", "resource \"x\" \"y\" {}\n")
-	withRepoRoot(t, dir)
-	stubFindFilesProbe(t, map[string][2]bool{"infra": {false, true}})
-	stubScopeWitness(t, witnessUnknown)
-
-	hasSource, probeOK := scopeTrackedViaDaemon(dir, "infra")
-	if hasSource || probeOK {
-		t.Fatalf("an unsettled witness leaves the scope unproven, got (%v, %v)", hasSource, probeOK)
-	}
-}
-
-// --- wire parsing ---
-
-func TestParseFindFilesHasSource(t *testing.T) {
-	body := func(s string) []byte {
-		return []byte(`{"result":{"content":[{"text":` + strconv.Quote(s) + `}]}}`)
-	}
-	for _, tc := range []struct {
-		name          string
-		resp          []byte
-		wantHasSource bool
-		wantOK        bool
-	}{
-		{"one file", body(`{"count":1,"files":[{"path":"a.go"}]}`), true, true},
-		{"well-formed empty list", body(`{"count":0,"files":[]}`), false, true},
-		{"count without rows", body(`{"count":3,"files":[]}`), false, true},
-		{"error frame", []byte(`{"result":{"isError":true,"content":[{"text":"boom"}]}}`), false, false},
-		{"unparseable body", body("not json"), false, false},
-		{"unparseable frame", []byte("not json"), false, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			gotHas, gotOK := parseFindFilesHasSource(tc.resp)
-			if gotHas != tc.wantHasSource || gotOK != tc.wantOK {
-				t.Errorf("parseFindFilesHasSource() = (%v, %v), want (%v, %v)",
-					gotHas, gotOK, tc.wantHasSource, tc.wantOK)
-			}
-		})
 	}
 }
 

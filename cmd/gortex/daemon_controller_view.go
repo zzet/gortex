@@ -304,25 +304,129 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 	}
 	out.Covered = out.Symbols > 0
 	if !out.Covered {
-		// Only a path the graph has nothing for needs the walk's opinion, so
-		// the common answer costs no filesystem work.
-		//
-		// Known gap: a tree excluded AFTER it was indexed keeps its nodes and
-		// so keeps reading as covered, never reaching this branch, until a
-		// re-index drops them. Evicting them is the better fix and lives in
-		// the indexer.
+		// Only a path the graph has nothing for needs the walk's opinion.
+		// Known gap: a tree excluded after it was indexed keeps its nodes and
+		// so never reaches here until a re-index drops them.
 		out.Excluded, out.Unindexable = c.pathAdmission(abs)
 	}
 	return out, nil
 }
 
-// pathTracked reports whether a registered checkout owns abs.
+// pathTracked reports whether a registered checkout owns abs. trackedRoot
+// answers from the multi-repo catalog alone, so a single-indexer daemon needs
+// its own root consulted too — without it every path there reports untracked.
 func (c *realController) pathTracked(abs string, view probeView) bool {
 	if view.root != "" {
 		return true
 	}
-	_, _, ok := c.trackedRoot(abs)
+	if _, _, ok := c.trackedRoot(abs); ok {
+		return true
+	}
+	idx := c.indexerForPath(abs)
+	if idx == nil {
+		return false
+	}
+	_, ok := pathRelativeTo(idx.RootPath(), abs)
 	return ok
+}
+
+// dirCoverageWalkBudget bounds the admission walk one scope probe pays for.
+// The hook waits on it, so an unfinished walk is reported, not waited out.
+const dirCoverageWalkBudget = 500 * time.Millisecond
+
+// DirCoverage answers whether the graph serving Path holds indexed source
+// under it, and when it does not, whether the walk would ever claim anything
+// there. It is the scope verdict a PreToolUse hook turns into a Grep/Glob
+// deny; both halves are exact rather than sampled.
+func (c *realController) DirCoverage(ctx context.Context, p daemon.DirCoverageParams) (daemon.DirCoverageResult, error) {
+	if c == nil || p.Path == "" {
+		return daemon.DirCoverageResult{}, nil
+	}
+	abs := p.Path
+	if resolved, err := filepath.Abs(abs); err == nil {
+		abs = resolved
+	}
+
+	view := c.resolveProbeView(ctx, abs)
+	defer view.release()
+
+	out := daemon.DirCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
+	if !view.servable {
+		return out, nil
+	}
+	reader := view.reader
+	if reader == nil {
+		reader = c.graph
+	}
+	if reader == nil {
+		return out, nil
+	}
+	prefix, key, ok := c.fileGraphKey(abs, view)
+	if !ok {
+		// Same split as FileCoverage: a path outside every corpus is an
+		// answer, a tracked path that could not be keyed is not.
+		out.Answered = !out.Tracked
+		return out, nil
+	}
+	out.Answered = true
+	out.HasSource = graphHoldsUnder(reader, prefix, dirKeyPrefix(key))
+	if out.HasSource {
+		return out, nil
+	}
+	// Only a scope the graph has nothing for needs the walk's opinion.
+	out.Indexable, out.Walked = c.scopeAdmission(abs)
+	return out, nil
+}
+
+// dirKeyPrefix turns the file key fileGraphKey measures for a directory into
+// the prefix its files share. A directory that is the repository root measures
+// as ".", which names nothing in the graph.
+func dirKeyPrefix(key string) string {
+	key = strings.TrimSuffix(key, "/.")
+	if key == "." {
+		return ""
+	}
+	return key
+}
+
+// graphHoldsUnder reports whether reader holds a file node under keyPrefix,
+// stopping at the first one. An empty keyPrefix is the whole corpus. Holding
+// the file is the question, not holding symbols: the surfaces a search is
+// redirected to have rows for an indexed file that defines nothing.
+func graphHoldsUnder(reader graph.Reader, prefix, keyPrefix string) bool {
+	for n := range reader.NodesByKind(graph.KindFile) {
+		if n == nil || (prefix != "" && n.RepoPrefix != prefix) {
+			continue
+		}
+		if keyPrefix == "" || pathUnderDir(n.FilePath, keyPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathUnderDir reports whether a graph file key names a file inside dir. The
+// separator keeps "internal/hooks" from claiming "internal/hooksx".
+func pathUnderDir(key, dir string) bool {
+	return strings.HasPrefix(strings.ReplaceAll(key, "\\", "/"), dir+"/")
+}
+
+// scopeAdmission asks the indexer that owns abs whether the walk would claim
+// any file under it, and whether that walk finished. A scope no indexer owns
+// leaves both false — an abstention, not "nothing here".
+func (c *realController) scopeAdmission(abs string) (indexable, walked bool) {
+	idx := c.indexerForPath(abs)
+	if idx == nil {
+		return false, false
+	}
+	rel, ok := pathRelativeTo(idx.RootPath(), abs)
+	if !ok {
+		return false, false
+	}
+	if rel == "." {
+		rel = ""
+	}
+	return idx.ScopeIndexability(rel, dirCoverageWalkBudget)
 }
 
 // pathAdmission asks the indexer that owns abs what the index walk would do

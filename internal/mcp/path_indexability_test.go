@@ -1,14 +1,19 @@
 package mcp
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // PathIndexability returns the zero PathSkip both for "indexable" and for "this
@@ -122,5 +127,65 @@ func TestPathIndexability_SingleRepoCannotAnswer(t *testing.T) {
 
 	if got := srv.pathIndexability("node_modules/dpack/lib/Block.js"); got != (fileNotIndexedState{}) {
 		t.Errorf("an indexer with no stored root must yield no reason, got %+v", got)
+	}
+}
+
+// newPrefixFixture wires two tracked repos so the multi-repo fallback has real
+// prefixes to route against.
+func newPrefixFixture(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	repoA := setupMiniRepo(t, "repo-a")
+	repoB := setupMiniRepo(t, "repo-b")
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{
+		{Path: repoA, Name: "repo-a"},
+		{Path: repoB, Name: "repo-b"},
+	}}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	g := graph.New()
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	return &Server{multiIndexer: mi}, repoA, repoB
+}
+
+// A graph path that names its corpus must be answered by that repo, against a
+// path relative to ITS root. Asking every repo about the prefixed spelling
+// either reaches nothing (the common case, so the fallback contributes
+// nothing) or reaches an unrelated file of the same name in another repo.
+func TestPathIndexability_PrefixedPathRoutesToItsOwnRepo(t *testing.T) {
+	srv, repoA, _ := newPrefixFixture(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(repoA, "vendor", "dep"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repoA, "vendor", "dep", "a.go"), []byte("package dep\n"), 0o644))
+
+	got := srv.pathIndexability("repo-a/vendor/dep/a.go")
+	if !got.Excluded {
+		t.Errorf("a vendored path in repo-a must answer excluded, got %+v", got)
+	}
+}
+
+// The prefix must not be stripped off a path that merely starts with the same
+// letters.
+func TestSplitRepoPrefix(t *testing.T) {
+	srv, _, _ := newPrefixFixture(t)
+
+	prefix, rel, ok := srv.splitRepoPrefix("repo-a/vendor/dep/a.go")
+	if !ok || prefix != "repo-a" || rel != "vendor/dep/a.go" {
+		t.Errorf("splitRepoPrefix = (%q, %q, %v), want (repo-a, vendor/dep/a.go, true)", prefix, rel, ok)
+	}
+	if _, _, ok := srv.splitRepoPrefix("repo-abc/main.go"); ok {
+		t.Error("a path that only shares a prefix's letters must not be split")
+	}
+	if _, _, ok := srv.splitRepoPrefix("node_modules/dpack/lib/Block.js"); ok {
+		t.Error("a bare unprefixed path must fall through to the vote")
 	}
 }

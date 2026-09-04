@@ -1,12 +1,9 @@
 package indexer
 
 import (
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
-	"sort"
 	"strings"
 	"testing"
 
@@ -24,7 +21,7 @@ import (
 // is intentionally empty, so passing it asserts a branch production never
 // takes) and the full registry (a hand-picked one manufactures unindexable
 // verdicts for .sql / .sh / .parquet that production never produces).
-func newAdmissionTestIndexer(t *testing.T, root string, extra ...string) *Indexer {
+func newAdmissionTestIndexer(t testing.TB, root string, extra ...string) *Indexer {
 	t.Helper()
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
@@ -162,7 +159,6 @@ func TestPathIndexability_ContentGate_DataAsset(t *testing.T) {
 	}
 
 	idx.config.Content.IndexData = true
-	idx.probeGates = probeGateCache{} // config changed: drop the memo
 	if got := mustIndexability(t, idx, "data/embeddings.parquet"); got.Skipped {
 		t.Errorf("with index_data on the data asset must be admitted, got %+v", got)
 	}
@@ -179,15 +175,16 @@ func TestPathIndexability_ContentGate_DocumentCap(t *testing.T) {
 	}
 
 	idx.config.Content.MaxDocumentBytes = 64
-	idx.probeGates = probeGateCache{}
 	if got := mustIndexability(t, idx, "docs/handbook.txt"); !got.Skipped || got.ByRule {
 		t.Errorf("a document over the cap = %+v, want skipped but not by rule", got)
 	}
 }
 
-// The second gate the probe used to miss. Inert (flag off, or no git) must
-// leave the asset admitted — no inventing skips the walk would not make.
-func TestPathIndexability_UntrackedAssetGate(t *testing.T) {
+// SkipUntrackedAssets governs the cold full-index walk alone; the incremental
+// watcher keeps only the size / class caps. So the probe must not apply it —
+// reporting "never indexable" for a file the watcher indexes on the next save
+// is the silence this PR exists to remove.
+func TestPathIndexability_IgnoresTheUntrackedAssetGate(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -202,186 +199,15 @@ func TestPathIndexability_UntrackedAssetGate(t *testing.T) {
 
 	idx := newAdmissionTestIndexer(t, repo)
 	if got := mustIndexability(t, idx, "docs/untracked.txt"); got.Skipped {
-		t.Skipf("no asset extractor claims .txt in this build (%+v); the gate is inert", got)
+		t.Skipf("no asset extractor claims .txt in this build (%+v); nothing to gate", got)
 	}
 
 	idx.config.SkipUntrackedAssets = true
-	idx.probeGates = probeGateCache{}
-	if got := mustIndexability(t, idx, "docs/untracked.txt"); !got.Skipped || got.ByRule {
-		t.Errorf("an untracked asset with the flag on = %+v, want skipped but not by rule", got)
+	if got := mustIndexability(t, idx, "docs/untracked.txt"); got.Skipped {
+		t.Errorf("an untracked asset must stay admitted for the probe, got %+v", got)
 	}
 	if got := mustIndexability(t, idx, "docs/tracked.txt"); got.Skipped {
 		t.Errorf("a git-tracked asset must stay admitted, got %+v", got)
-	}
-}
-
-// filepath.Join swallows a leading separator and Cleans "../" against the root,
-// so an unguarded join answers for a file this repo does not own. Callers do
-// pass unvalidated strings. Must report "cannot answer", not a verdict.
-func TestPathIndexability_RejectsPathsOutsideRoot(t *testing.T) {
-	repo := t.TempDir()
-	idx := newAdmissionTestIndexer(t, repo)
-
-	for _, path := range []string{
-		"/home/u/other-project/dist/app.js",
-		"../other-project/dist/app.js",
-		"../../dist/app.js",
-		"",
-	} {
-		skip, ok := idx.PathIndexability(path)
-		if ok {
-			t.Errorf("PathIndexability(%q) claimed a verdict for a path outside the repo: %+v", path, skip)
-		}
-	}
-}
-
-// A directory lstats fine and then fails every FILE gate, so answering for one
-// reports "no extractor claims this, and none ever will" for a path that is not
-// a file. get_file_summary on a package path rendered exactly that.
-func TestPathIndexability_DirectoryCannotAnswer(t *testing.T) {
-	repo := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(repo, "internal", "hooks"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	idx := newAdmissionTestIndexer(t, repo)
-
-	for _, path := range []string{"internal", "internal/hooks"} {
-		skip, ok := idx.PathIndexability(path)
-		if ok {
-			t.Errorf("PathIndexability(%q) claimed a verdict for a directory: %+v", path, skip)
-		}
-	}
-}
-
-// Must stay distinguishable from "indexable": a unanimity check that counts
-// this silence lets one un-rooted repo veto every other repo's verdict.
-func TestPathIndexability_BlankRootCannotAnswer(t *testing.T) {
-	idx := New(graph.New(), parser.NewRegistry(), config.Default().Index, zap.NewNop())
-
-	skip, ok := idx.PathIndexability("node_modules/dpack/lib/Block.js")
-	if ok {
-		t.Fatalf("an indexer with no stored root must not vote, got %+v", skip)
-	}
-	if skip != (PathSkip{}) {
-		t.Errorf("the un-answerable verdict should be the zero value, got %+v", skip)
-	}
-}
-
-// A path that isn't on disk is an abstention, not a verdict — the walk never
-// meets it. Answering "skipped" folded to Unindexable, which the guidance
-// renders as "and none ever will be" for what may be a typo or a file about to
-// be written.
-func TestPathIndexability_MissingFile(t *testing.T) {
-	repo := t.TempDir()
-	idx := newAdmissionTestIndexer(t, repo)
-
-	skip, ok := idx.PathIndexability("pkg/never_written.go")
-	if ok {
-		t.Fatalf("PathIndexability of a nonexistent path claimed a verdict: %+v", skip)
-	}
-	if skip != (PathSkip{}) {
-		t.Errorf("the un-answerable verdict should be the zero value, got %+v", skip)
-	}
-}
-
-// Divergence guard: before the shared predicate the probe ran three of the
-// walk's five gates, so a .parquet read as indexable while the manifest
-// counted it skipped.
-func TestPathIndexability_AgreesWithDryRunIntake(t *testing.T) {
-	repo := t.TempDir()
-	fixtures := []string{
-		"main.go",                     // admitted
-		"web/app.ts",                  // admitted
-		"db/0042.sql",                 // admitted (production claims .sql)
-		"node_modules/dpack/lib/b.js", // excluded by rule
-		"assets/logo.sketch",          // no extractor claims it
-		"data/embeddings.parquet",     // dropped by the content gate
-		"build/out/bundle.min.js",     // excluded by rule
-	}
-	for _, rel := range fixtures {
-		writeExcludeFixture(t, filepath.Join(repo, filepath.FromSlash(rel)), "x\n")
-	}
-
-	idx := newAdmissionTestIndexer(t, repo)
-
-	manifest, err := idx.dryRunIntake(context.Background(), repo)
-	if err != nil {
-		t.Fatalf("DryRunIntake: %v", err)
-	}
-
-	admitted := 0
-	for _, rel := range fixtures {
-		if got := mustIndexability(t, idx, rel); !got.Skipped {
-			admitted++
-		}
-	}
-	if int(manifest.FilesAdmitted) != admitted {
-		t.Errorf("DryRunIntake admitted %d files, PathIndexability admits %d — the walk and the probe disagree",
-			manifest.FilesAdmitted, admitted)
-	}
-	if manifest.FilesSeen == 0 {
-		t.Fatal("the manifest saw no files; the fixture never reached the walk")
-	}
-}
-
-// Same guard against the REAL walk rather than the dry-run's model of it. If
-// these disagree, the PreToolUse hook advises about a corpus that doesn't exist.
-func TestPathIndexability_AgreesWithRealIndexWalk(t *testing.T) {
-	repo := t.TempDir()
-	fixtures := map[string]string{
-		"main.go":                 "package app\n\nfunc Main() {}\n",
-		"pkg/util.go":             "package pkg\n\nfunc Util() {}\n",
-		"web/app.ts":              "export function a() { return 1 }\n",
-		"db/0042.sql":             "select 1;\n",
-		"node_modules/dpack/b.js": "module.exports = 1\n",
-		"vendor/lib/vendored.go":  "package lib\n",
-		"assets/logo.sketch":      "not source\n",
-		"data/embeddings.parquet": "PAR1....\n",
-	}
-	for rel, body := range fixtures {
-		writeExcludeFixture(t, filepath.Join(repo, filepath.FromSlash(rel)), body)
-	}
-
-	idx := newAdmissionTestIndexer(t, repo)
-	result, err := idx.Index(repo)
-	if err != nil {
-		t.Fatalf("Index: %v", err)
-	}
-
-	var indexable []string
-	for rel := range fixtures {
-		if got := mustIndexability(t, idx, rel); !got.Skipped {
-			indexable = append(indexable, rel)
-		}
-	}
-	sort.Strings(indexable)
-
-	if result.FileCount != len(indexable) {
-		t.Errorf("the walk admitted %d files, PathIndexability calls %d indexable %v — probe and walk disagree",
-			result.FileCount, len(indexable), indexable)
-	}
-	// Pin the split explicitly too, so a change that moves a file from one
-	// side to the other has to be deliberate rather than merely count-neutral.
-	want := []string{"db/0042.sql", "main.go", "pkg/util.go", "web/app.ts"}
-	if !slices.Equal(indexable, want) {
-		t.Errorf("indexable set = %v, want %v", indexable, want)
-	}
-}
-
-// A memo answered with another checkout's tracked-set would silence the read
-// door for a file this repo tracks fine.
-func TestProbeAdmissionGates_RekeyedOnRoot(t *testing.T) {
-	repoA, repoB := t.TempDir(), t.TempDir()
-	idx := newAdmissionTestIndexer(t, repoA)
-
-	idx.probeAdmissionGates(repoA)
-	if idx.probeGates.root != repoA {
-		t.Fatalf("gate memo root = %q, want %q", idx.probeGates.root, repoA)
-	}
-	idx.probeAdmissionGates(repoB)
-	if idx.probeGates.root != repoB {
-		t.Errorf("a probe against another root must rebuild the memo; root = %q, want %q",
-			idx.probeGates.root, repoB)
 	}
 }
 

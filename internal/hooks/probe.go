@@ -134,3 +134,15 @@ func fileCoverageViaDaemon(path string, timeout time.Duration) (daemon.FileCover
 	}
 	return result, true
 }
+
+// dirCoverageViaDaemon asks the daemon whether the graph serving path holds
+// indexed source under it. The path is resolved daemon-side for the reason
+// fileCoverageViaDaemon documents.
+func dirCoverageViaDaemon(path string, timeout time.Duration) (daemon.DirCoverageResult, bool) {
+	var result daemon.DirCoverageResult
+	if err := controlRoundTrip(daemon.ControlDirCoverage,
+		daemon.DirCoverageParams{Path: path}, &result, timeout); err != nil {
+		return daemon.DirCoverageResult{}, false
+	}
+	return result, true
+}

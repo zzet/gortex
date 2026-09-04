@@ -200,20 +200,6 @@ func TestEnrichGlobUntrackedDaemonUpGreedyPatternStaysSoft(t *testing.T) {
 	}
 }
 
-func TestParseFindFilesHasSourceRequiresNonEmptyIndexedResult(t *testing.T) {
-	withSource := []byte(`{"result":{"content":[{"text":"{\"count\":1,\"files\":[{\"path\":\"pkg/a.go\"}]}"}]}}`)
-	if hasSource, ok := parseFindFilesHasSource(withSource); !hasSource || !ok {
-		t.Fatal("non-empty find_files result should prove indexed source")
-	}
-	withoutSource := []byte(`{"result":{"content":[{"text":"{\"count\":0,\"files\":[]}"}]}}`)
-	if hasSource, ok := parseFindFilesHasSource(withoutSource); hasSource || !ok {
-		t.Fatal("empty find_files result must read as a well-formed no")
-	}
-	if _, ok := parseFindFilesHasSource([]byte(`{"result":{"isError":true}}`)); ok {
-		t.Fatal("an error frame is no answer at all")
-	}
-}
-
 func TestTrackedSearchDenyStillSoftensInEnrichMode(t *testing.T) {
 	stubTrackedScope(t, true)
 	raw := enrichGrep(map[string]any{"pattern": "ca740d9"}, 0, "/repo")
