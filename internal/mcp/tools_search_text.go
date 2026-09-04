@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -49,8 +51,13 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	if limit < 1 {
 		limit = 100
 	}
-	if limit > 1000 {
-		limit = 1000
+	// The requested value is kept so the response can say the ceiling chose
+	// the effective limit rather than the caller: a caller who asked for
+	// 100000 and silently got 1000 has no way to tell that from a corpus that
+	// held exactly 1000 matches.
+	requestedLimit := limit
+	if maxLimit := searchTextMaxLimit(); limit > maxLimit {
+		limit = maxLimit
 	}
 
 	// Multi-repo mode: the daemon owns a MultiIndexer and the per-repo
@@ -101,6 +108,13 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 		matches = s.indexer.GrepText(query, limit)
 	}
 
+	// Counted BEFORE the filters below, and that ordering is the whole point.
+	// The searcher stops at `limit`; the path and scope filters then run over
+	// what survived, so a response holding 952 matches can be a truncated
+	// 1000 rather than a complete 952. Measuring after the filters would miss
+	// exactly the case a caller cannot detect on its own.
+	rawMatches := len(matches)
+
 	// Sub-path scoping: a `path` argument or a `scope:`-named saved
 	// scope's paths narrow the literal hits to a monorepo service
 	// slice. In multi-repo mode MultiIndexer.GrepText stamps a repo
@@ -125,6 +139,20 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 		"matches": enriched,
 		"count":   len(enriched),
 	}
+	// A result bound by `limit` was byte-indistinguishable from a complete
+	// one: `count` was set to the same ceiling the array stopped at, so the
+	// two corroborated each other at the wrong number. The byte budget has
+	// always disclosed its own truncation (`_truncated_by_budget`); this is
+	// the limit path's equivalent.
+	if searchTextBoundByLimit(rawMatches, limit) {
+		resp["_truncated_by_limit"] = true
+		resp["_limit_applied"] = limit
+		resp["count_is_exact"] = false
+		resp["truncation_note"] = searchTextTruncationNote
+		if requestedLimit > limit {
+			resp["_limit_requested"] = requestedLimit
+		}
+	}
 	// Body-visible disclosure for a repo-narrowed zero (the _meta scope
 	// fields are invisible in CLI output and most clients). No recheck
 	// here — the note still names the scope and the widen escape hatch.
@@ -132,6 +160,45 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 		resp["scope_note"] = scopeZeroNote(resolved, -1)
 	}
 	return s.respondScopedJSONOrTOON(ctx, req, resp, resolved)
+}
+
+// searchTextDefaultMaxLimit is the ceiling `limit` is clamped to. It has been
+// 1000 since search_text was added and is kept as the default so no existing
+// caller's response changes shape.
+const searchTextDefaultMaxLimit = 1000
+
+// searchTextMaxLimit returns the effective ceiling, overridable through
+// GORTEX_SEARCH_TEXT_MAX_LIMIT for the sweep this tool exists to serve —
+// search_text is the literal-search backbone agents reach for in place of
+// grep, where an unbounded pass is the normal request. An unset, unparseable
+// or non-positive value keeps the default rather than lifting the bound: a
+// typo must not turn into an unbounded scan.
+//
+// Raising it is not the fix on its own. Without the disclosure below a higher
+// ceiling only moves the silent cliff, which is why the flag lands with it.
+func searchTextMaxLimit() int {
+	v := strings.TrimSpace(os.Getenv("GORTEX_SEARCH_TEXT_MAX_LIMIT"))
+	if v == "" {
+		return searchTextDefaultMaxLimit
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return searchTextDefaultMaxLimit
+	}
+	return n
+}
+
+const searchTextTruncationNote = "the search stopped at `limit`, so `count` is a floor rather than a total and the matches are a prefix of the real result set. Raise `limit` (or the GORTEX_SEARCH_TEXT_MAX_LIMIT ceiling) to widen. Narrowing with `path` will NOT recover the remainder: the path filter runs over what survived truncation, not over the corpus, so a subtree slice returns whatever was left of the global cut."
+
+// searchTextBoundByLimit reports whether the search stopped because of the
+// limit rather than because the corpus ran out.
+//
+// rawMatches is the count the searcher returned, before the path and scope
+// filters. Landing on the effective limit is the signal, and it can fire on a
+// corpus holding exactly that many matches — a spurious "verify this" is the
+// safe direction to be wrong in, against silently losing most of the result.
+func searchTextBoundByLimit(rawMatches, limit int) bool {
+	return limit > 0 && rawMatches >= limit
 }
 
 // filterTextMatchesByPath keeps only the trigram matches whose file
