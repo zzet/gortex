@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/zzet/gortex/internal/semantic"
 )
@@ -145,6 +146,7 @@ type Router struct {
 	// of the router. Read via EvictionCount to observe provider churn
 	// during batch enrichment. Atomic so the accessor needn't take r.mu.
 	evictions atomic.Uint64
+	timing    routerTimingCounters
 
 	stopReaper chan struct{}
 
@@ -570,6 +572,20 @@ func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider
 // LRU eviction can never Close a freshly-returned-but-not-yet-pinned provider
 // (the spawn→pin TOCTOU). A pinned fetch MUST be paired with ReleaseSpecWorkspace.
 func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) (*Provider, error) {
+	acquireStarted := time.Now()
+	success, reused := false, false
+	r.timing.acquires.Add(1)
+	defer func() {
+		elapsed := time.Since(acquireStarted)
+		r.timing.acquireNanos.Add(int64(elapsed))
+		if !success {
+			r.timing.acquireFailures.Add(1)
+		}
+		if reused {
+			r.timing.reuses.Add(1)
+			r.timing.reuseNanos.Add(int64(elapsed))
+		}
+	}()
 	if !r.specAvailable(spec) {
 		return nil, fmt.Errorf("LSP server %q not available on PATH", spec.Name)
 	}
@@ -583,7 +599,9 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	workspace = absWorkspace(workspace)
 	key := providerKey{specName: spec.Name, workspace: workspace}
 
+	lockStarted := time.Now()
 	r.mu.Lock()
+	r.timing.waitNanos.Add(int64(time.Since(lockStarted)))
 	rp, ok := r.providers[key]
 	if ok {
 		rp.lastUsed = time.Now()
@@ -591,6 +609,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 			rp.inUse++
 		}
 		r.mu.Unlock()
+		success, reused = true, true
 		return rp.provider, nil
 	}
 	r.mu.Unlock()
@@ -606,6 +625,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	}
 
 	// Spawn outside the lock — initialize() blocks on stdio I/O.
+	constructStarted := time.Now()
 	p := NewProviderFromSpec(spec, r.logger)
 	p.workspaceFolders = r.additionalWorkspaceFolders
 	p.excludeGlobs = r.enrichExcludeGlobs
@@ -629,7 +649,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 			return nil, fmt.Errorf("ruby-lsp: no Gemfile in %s; skipping composed-bundle install", workspace)
 		}
 	}
-	if err := p.EnsureClient(workspace); err != nil {
+	if err := r.ensureTimedProvider(p, spec.Name, workspace, time.Since(constructStarted)); err != nil {
 		// A binary that resolves on PATH but cannot launch (e.g. a rustup
 		// `rust-analyzer` shim whose toolchain lacks the component) would
 		// otherwise be re-attempted on every repo. Mark it unavailable so the
@@ -642,7 +662,9 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	// burst some servers emit during workspace warmup.
 	r.attachDiagnosticsHook(spec.Name, p)
 
+	lockStarted = time.Now()
 	r.mu.Lock()
+	r.timing.waitNanos.Add(int64(time.Since(lockStarted)))
 	defer r.mu.Unlock()
 	// Race: another goroutine may have spawned it while we were
 	// initializing. Prefer the existing one and shut down our duplicate.
@@ -651,7 +673,9 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 		if pin {
 			existing.inUse++
 		}
-		go func() { _ = p.Close() }()
+		go func() { _ = r.closeTimedProvider(p, spec.Name, workspace, "duplicate") }()
+		r.timing.raceReuses.Add(1)
+		success = true
 		return existing.provider, nil
 	}
 	newRP := &routedProvider{
@@ -667,6 +691,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	}
 	r.providers[key] = newRP
 	r.maybeEvictLRULocked()
+	success = true
 	return p, nil
 }
 
@@ -855,7 +880,7 @@ func (r *Router) Reap() []string {
 	names := make([]string, 0, len(victims))
 	for _, v := range victims {
 		names = append(names, formatProviderKey(v.spec.Name, v.workspace))
-		_ = v.provider.Close()
+		_ = r.closeTimedProvider(v.provider, v.spec.Name, v.workspace, "idle")
 	}
 	if len(names) > 0 {
 		r.logger.Info("LSP router reaped idle providers", zap.Strings("names", names))
@@ -896,7 +921,7 @@ func (r *Router) CloseCheckoutWorkspace(language, workspace string) int {
 	}
 	r.mu.Unlock()
 	for _, victim := range victims {
-		_ = victim.provider.Close()
+		_ = r.closeTimedProvider(victim.provider, victim.spec.Name, victim.workspace, "checkout")
 	}
 	if len(victims) > 0 {
 		names := make([]string, 0, len(victims))
@@ -946,7 +971,7 @@ func (r *Router) maybeEvictLRULocked() {
 		}
 		delete(r.providers, oldestKey)
 		r.evictions.Add(1)
-		go func() { _ = oldest.provider.Close() }()
+		go func() { _ = r.closeTimedProvider(oldest.provider, oldestKey.specName, oldestKey.workspace, "lru") }()
 		r.logger.Info("LSP router evicted LRU provider",
 			zap.String("name", formatProviderKey(oldestKey.specName, oldestKey.workspace)))
 	}
@@ -987,11 +1012,128 @@ func (r *Router) Close() error {
 
 	var firstErr error
 	for _, rp := range provs {
-		if err := rp.provider.Close(); err != nil && firstErr == nil {
+		if err := r.closeTimedProvider(rp.provider, rp.spec.Name, rp.workspace, "shutdown"); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+// RouterTimingStats is a process-lifetime diagnostic snapshot. Durations sum
+// individual operations and can overlap across goroutines; they are not an
+// additive breakdown of wall-clock startup time.
+type RouterTimingStats struct {
+	Acquires         uint64        `json:"acquires"`
+	AcquireFailures  uint64        `json:"acquire_failures"`
+	Reuses           uint64        `json:"reuses"`
+	Starts           uint64        `json:"starts"`
+	StartFailures    uint64        `json:"start_failures"`
+	Evictions        uint64        `json:"evictions"`
+	EvictionDuration time.Duration `json:"eviction_duration"`
+	RaceReuses       uint64        `json:"race_reuses"`
+	Closes           uint64        `json:"closes"`
+	CloseFailures    uint64        `json:"close_failures"`
+	AcquireDuration  time.Duration `json:"acquire_duration"`
+	ReuseDuration    time.Duration `json:"reuse_duration"`
+	StartDuration    time.Duration `json:"start_duration"`
+	CloseDuration    time.Duration `json:"close_duration"`
+	WaitDuration     time.Duration `json:"wait_duration"`
+}
+
+// MarshalLogObject uses the logger's configured duration encoding, matching
+// ordinary zap.Duration fields rather than reflecting raw nanoseconds.
+func (s RouterTimingStats) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddUint64("acquires", s.Acquires)
+	enc.AddUint64("acquire_failures", s.AcquireFailures)
+	enc.AddUint64("reuses", s.Reuses)
+	enc.AddUint64("starts", s.Starts)
+	enc.AddUint64("start_failures", s.StartFailures)
+	enc.AddUint64("race_reuses", s.RaceReuses)
+	enc.AddUint64("evictions", s.Evictions)
+	enc.AddUint64("closes", s.Closes)
+	enc.AddUint64("close_failures", s.CloseFailures)
+	enc.AddDuration("acquire_duration", s.AcquireDuration)
+	enc.AddDuration("reuse_duration", s.ReuseDuration)
+	enc.AddDuration("start_duration", s.StartDuration)
+	enc.AddDuration("close_duration", s.CloseDuration)
+	enc.AddDuration("eviction_duration", s.EvictionDuration)
+	enc.AddDuration("wait_duration", s.WaitDuration)
+	return nil
+}
+
+// Sub reports the work completed since an earlier snapshot of the same router.
+func (s RouterTimingStats) Sub(before RouterTimingStats) RouterTimingStats {
+	return RouterTimingStats{
+		Acquires: s.Acquires - before.Acquires, AcquireFailures: s.AcquireFailures - before.AcquireFailures,
+		Reuses: s.Reuses - before.Reuses, Starts: s.Starts - before.Starts, StartFailures: s.StartFailures - before.StartFailures,
+		Evictions: s.Evictions - before.Evictions, EvictionDuration: s.EvictionDuration - before.EvictionDuration,
+		RaceReuses: s.RaceReuses - before.RaceReuses, Closes: s.Closes - before.Closes, CloseFailures: s.CloseFailures - before.CloseFailures,
+		AcquireDuration: s.AcquireDuration - before.AcquireDuration, ReuseDuration: s.ReuseDuration - before.ReuseDuration,
+		StartDuration: s.StartDuration - before.StartDuration, CloseDuration: s.CloseDuration - before.CloseDuration,
+		WaitDuration: s.WaitDuration - before.WaitDuration,
+	}
+}
+
+type routerTimingCounters struct {
+	acquires, acquireFailures, reuses, starts, startFailures, raceReuses, closes, closeFailures atomic.Uint64
+	acquireNanos, reuseNanos, startNanos, closeNanos, waitNanos, evictionNanos                  atomic.Int64
+}
+
+// TimingStats is lock-free so sampling a slow acquisition does not wait on the
+// provider-map mutex being measured. Concurrent operations may finish between
+// counter loads; snapshots are observational, not transactional.
+func (r *Router) TimingStats() RouterTimingStats {
+	return RouterTimingStats{
+		Acquires: r.timing.acquires.Load(), AcquireFailures: r.timing.acquireFailures.Load(),
+		Reuses: r.timing.reuses.Load(), Starts: r.timing.starts.Load(), StartFailures: r.timing.startFailures.Load(),
+		Evictions: r.evictions.Load(), EvictionDuration: time.Duration(r.timing.evictionNanos.Load()),
+		RaceReuses: r.timing.raceReuses.Load(), Closes: r.timing.closes.Load(), CloseFailures: r.timing.closeFailures.Load(),
+		AcquireDuration: time.Duration(r.timing.acquireNanos.Load()), ReuseDuration: time.Duration(r.timing.reuseNanos.Load()),
+		StartDuration: time.Duration(r.timing.startNanos.Load()), CloseDuration: time.Duration(r.timing.closeNanos.Load()),
+		WaitDuration: time.Duration(r.timing.waitNanos.Load()),
+	}
+}
+
+// closeTimedProvider preserves the caller's synchronous/asynchronous close
+// policy while exposing shutdown latency and errors for every lifecycle reason.
+func (r *Router) closeTimedProvider(p *Provider, spec, workspace, reason string) error {
+	started := time.Now()
+	fields := []zap.Field{zap.String("spec", spec), zap.String("workspace", workspace), zap.String("reason", reason)}
+	r.logger.Info("LSP router provider close starting", fields...)
+	err := p.Close()
+	elapsed := time.Since(started)
+	r.timing.closes.Add(1)
+	r.timing.closeNanos.Add(int64(elapsed))
+	if reason == "lru" {
+		r.timing.evictionNanos.Add(int64(elapsed))
+	}
+	fields = append(fields, zap.Duration("elapsed", elapsed))
+	if err != nil {
+		r.timing.closeFailures.Add(1)
+		r.logger.Warn("LSP router provider close failed", append(fields, zap.Error(err))...)
+	} else {
+		r.logger.Info("LSP router provider close complete", fields...)
+	}
+	return err
+}
+
+// ensureTimedProvider measures construction-independent initialize latency.
+func (r *Router) ensureTimedProvider(p *Provider, spec, workspace string, constructionDuration time.Duration) error {
+	started := time.Now()
+	r.timing.starts.Add(1)
+	fields := []zap.Field{zap.String("spec", spec), zap.String("workspace", workspace), zap.Duration("construct_elapsed", constructionDuration)}
+	r.logger.Info("LSP router provider startup starting", fields...)
+	err := p.EnsureClient(workspace)
+	elapsed := time.Since(started)
+	r.timing.startNanos.Add(int64(elapsed))
+	fields = append(fields, zap.Duration("elapsed", elapsed))
+	if err != nil {
+		r.timing.startFailures.Add(1)
+		r.logger.Warn("LSP router provider startup failed", append(fields, zap.Error(err))...)
+	} else {
+		r.logger.Info("LSP router provider startup complete", fields...)
+	}
+	return err
 }
 
 // Stats reports the live provider names and their last-used times.

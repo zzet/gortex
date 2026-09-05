@@ -91,7 +91,11 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	idx.loadFileIndexFailures()
 	defer idx.flushFileIndexFailures()
 	var invalidation DerivedInvalidationPlan
+	deleteTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "graph_delete",
+		zap.Int("deleted_files", len(deletedFiles)))
+	defer deleteTiming.abort()
 	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
+	deleteTiming.complete(nil)
 
 	passPlan, reparsed, failed, versionChanged := idx.reindexIncrementalStalePass(
 		staleFiles, markerBatch, surfaceFirstVersionChange,
@@ -183,10 +187,17 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 
 	graphPaths := make([]string, len(files))
+	priorTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_prior_graph",
+		zap.Int("candidate_files", len(files)))
+	defer priorTiming.abort()
 	for i, filePath := range files {
 		graphPaths[i] = idx.prefixPath(idx.relKey(filePath))
 	}
 	priorByFile := idx.graph.GetFileNodesByPaths(graphPaths)
+	priorTiming.complete(nil)
+	parseTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_parse",
+		zap.Int("candidate_files", len(files)), zap.Bool("includes_admission_wait", true))
+	defer parseTiming.abort()
 
 	stages := make([]*incrementalBatchStage, 0, len(files))
 	// Each staged result carries the tree-sitter tree its extraction
@@ -281,6 +292,9 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 	}
 
+	parseTiming.complete(nil, zap.Int("consumed_files", consumed), zap.Int("staged_files", len(stages)),
+		zap.Int("inert_files", plan.InertFiles), zap.Int("read_failed_files", len(readFailed)),
+		zap.Int("fallback_files", len(fallbacks)), zap.Int("nodes", nodeCount), zap.Int("edges", edgeCount))
 	if len(stages) > 0 {
 		plan.Merge(idx.commitIncrementalStages(stages, markerBatch))
 		for _, stage := range stages {
@@ -295,7 +309,11 @@ func (idx *Indexer) reindexIncrementalChunk(
 			stage.releasePrepared()
 		}
 	}
+	receiptTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_receipts",
+		zap.Int("receipts", len(receipts)))
+	defer receiptTiming.abort()
 	freshPaths, stalePaths := idx.recordFileReadVersionsBatched(receipts)
+	receiptTiming.complete(nil, zap.Int("fresh_files", len(freshPaths)), zap.Int("stale_files", len(stalePaths)))
 	freshSet := make(map[string]struct{}, len(freshPaths))
 	for _, filePath := range freshPaths {
 		freshSet[filePath] = struct{}{}
@@ -309,6 +327,15 @@ func (idx *Indexer) reindexIncrementalChunk(
 			versionChanged = append(versionChanged, path)
 		}
 	}
+	var fallbackTiming *reconcilePhaseTiming
+	if len(fallbacks) > 0 {
+		// Legacy fallback combines extraction and graph mutation; do not label
+		// this interval as parse-only or silently charge it to graph apply.
+		fallbackTiming = startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_fallback_parse_apply",
+			zap.Int("files", len(fallbacks)))
+		defer fallbackTiming.abort()
+	}
+	failedBeforeFallback := len(failed)
 	for _, fallback := range fallbacks {
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
 			idx.noteFileIndexFailure(fallback.filePath, err)
@@ -321,6 +348,10 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 		idx.noteFileIndexFailure(fallback.filePath, nil)
 		reparsed = append(reparsed, fallback.filePath)
+	}
+	if fallbackTiming != nil {
+		// Prior read/receipt failures belong to earlier phases, not fallback.
+		fallbackTiming.complete(nil, zap.Int("failed_files", len(failed)-failedBeforeFallback))
 	}
 	for _, stage := range stages {
 		if _, fresh := freshSet[stage.absPath]; fresh && !stage.metadataOnly {
@@ -449,6 +480,9 @@ func (idx *Indexer) commitIncrementalStages(
 	stages []*incrementalBatchStage,
 	markerBatch *reparsePendingEnrichmentBatch,
 ) DerivedInvalidationPlan {
+	timing := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_graph_apply",
+		zap.Int("staged_files", len(stages)))
+	defer timing.abort()
 	var plan DerivedInvalidationPlan
 	view := loadIncrementalPriorView(idx.graph, stages)
 
@@ -584,6 +618,7 @@ func (idx *Indexer) commitIncrementalStages(
 			stage.graphPath, stage.priorNodes, stage.result.Nodes,
 		))
 	}
+	timing.complete(nil, zap.Int("structural_files", len(structural)), zap.Int("metadata_files", len(metadata)))
 	return plan
 }
 

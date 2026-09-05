@@ -6101,9 +6101,16 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// Reconcile the complete durable corpus before any scoped mutation writes
 	// rows with this process's normalization mode. Doing this after a partial
 	// update would leave unchanged symbols in the previous mode.
+	normalizationTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "fts_normalization")
+	defer normalizationTiming.abort()
 	if _, err := idx.reconcileSymbolFTSNormalization(nil); err != nil {
+		normalizationTiming.complete(err)
 		return nil, err
 	}
+	normalizationTiming.complete(nil)
+	discoveryTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "scoped_discovery",
+		zap.Int("requested_paths", len(paths)), zap.Bool("full_root", fullRoot))
+	defer discoveryTiming.abort()
 
 	// scopeRels holds the repo-relative slash-paths the caller asked to
 	// reindex — used both to drive the discovery walk and to bound
@@ -6325,6 +6332,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 	}
 	deletedFiles = appendUniqueSorted(nil, deletedFiles...)
+	discoveryTiming.complete(nil, zap.Int("detected_files", len(diskFiles)),
+		zap.Int("changed_files", len(staleFiles)), zap.Int("deleted_files", len(deletedFiles)),
+		zap.Int("failed_paths", len(discoveryFailed)))
+	dependencyTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "deletion_frontier",
+		zap.Int("deleted_files", len(deletedFiles)))
+	defer dependencyTiming.abort()
 
 	// Capture surviving dependents before deletion evicts the target symbols and
 	// their incoming adjacency. The helper performs one batched node/edge
@@ -6349,6 +6362,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 	}
 	sourceStaleFiles, manifestFiles := splitIncrementalContractManifests(idx, staleFiles)
+	dependencyTiming.complete(nil, zap.Int("dependent_files", len(deletedDependencyFiles)))
 	markerBatch := &reparsePendingEnrichmentBatch{}
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
 		markerBatch = markerBatches[0]
@@ -6356,6 +6370,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
 		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
 	)
+	finalizeTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "contracts_and_metadata",
+		zap.Int("manifest_files", len(manifestFiles)), zap.Int("reparsed_files", len(reparsedFiles)))
+	defer finalizeTiming.abort()
 	manifestPlan, manifestFailed := idx.refreshIncrementalContractManifests(manifestFiles)
 	invalidation.Merge(manifestPlan)
 	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
@@ -6469,6 +6486,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	recoveredFiles = append(recoveredFiles, staleFiles...)
 	recoveredFiles = append(recoveredFiles, walkedDirs...)
 	idx.clearRecoveredParseErrors(recoveredFiles, failedFiles, nil)
+	finalizeTiming.complete(nil, zap.Int("failed_files", len(failedFiles)),
+		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount))
 	return result, nil
 }
 
@@ -9040,6 +9059,54 @@ func (idx *Indexer) ChangedSinceMtimes(root string) (changed []string, deleted [
 	return changed, deleted, err
 }
 
+// reconcilePhaseTiming measures wall time for one serial phase. Chunk timings
+// are bounded summaries, never per-file logs. Abort distinguishes an early
+// return or panic from a successful completion. Do not share timers between
+// goroutines.
+type reconcilePhaseTiming struct {
+	logger   *zap.Logger
+	fields   []zap.Field
+	started  time.Time
+	finished bool
+}
+
+func startReconcilePhase(logger *zap.Logger, repo, phase string, fields ...zap.Field) *reconcilePhaseTiming {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	timer := &reconcilePhaseTiming{
+		logger:  logger,
+		fields:  append([]zap.Field{zap.String("repo", repo), zap.String("phase", phase)}, fields...),
+		started: time.Now(),
+	}
+	logger.Info("indexer: reconcile phase started", timer.fields...)
+	return timer
+}
+
+func (timer *reconcilePhaseTiming) complete(err error, fields ...zap.Field) {
+	outcome := "complete"
+	if err != nil {
+		outcome = "error"
+		fields = append(fields, zap.Error(err))
+	}
+	timer.finish(outcome, fields...)
+}
+
+func (timer *reconcilePhaseTiming) abort() {
+	timer.finish("aborted")
+}
+
+func (timer *reconcilePhaseTiming) finish(outcome string, fields ...zap.Field) {
+	if timer.finished {
+		return
+	}
+	timer.finished = true
+	all := append([]zap.Field(nil), timer.fields...)
+	all = append(all, zap.Duration("elapsed", time.Since(timer.started)), zap.String("outcome", outcome))
+	all = append(all, fields...)
+	timer.logger.Info("indexer: reconcile phase complete", all...)
+}
+
 // changedSinceMtimesCensus also returns the complete tracked-source count from
 // the same walk. ReconcileRepoCtx uses that count to publish an honest clean
 // result without repeating the full-tree discovery in the incremental path.
@@ -9049,8 +9116,20 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 	detected int,
 	err error,
 ) {
+	timing := startReconcilePhase(idx.logger, idx.repoPrefix, "census")
+	returned := false
+	defer func() {
+		if !returned {
+			timing.abort()
+			return
+		}
+		timing.complete(err, zap.Int("detected_files", detected),
+			zap.Int("changed_files", len(changed)), zap.Int("deleted_files", len(deleted)),
+			zap.Bool("no_changes", err == nil && len(changed) == 0 && len(deleted) == 0))
+	}()
 	absRoot, absErr := filepath.Abs(root)
 	if absErr != nil {
+		returned = true
 		return nil, nil, 0, absErr
 	}
 	idx.storeRootPath(absRoot)
@@ -9084,6 +9163,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		return nil
 	})
 	if walkErr != nil {
+		returned = true
 		return nil, nil, 0, walkErr
 	}
 
@@ -9114,6 +9194,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 			deleted = append(deleted, rel)
 		}
 	}
+	returned = true
 	return changed, deleted, len(diskFiles), nil
 }
 

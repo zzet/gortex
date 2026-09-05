@@ -1,13 +1,142 @@
 package resolver
 
 import (
+	"fmt"
 	"iter"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestResolveFilesAndIncomingLogsPhasesAndAdmissions(t *testing.T) {
+	g := graph.New()
+	for _, node := range []*graph.Node{
+		{ID: "a/pkg/changed.go", Kind: graph.KindFile, Name: "changed.go", FilePath: "a/pkg/changed.go", RepoPrefix: "a", Language: "go"},
+		{ID: "a/pkg/other.go", Kind: graph.KindFile, Name: "other.go", FilePath: "a/pkg/other.go", RepoPrefix: "a", Language: "go"},
+		{ID: "b/pkg/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "b/pkg/caller.go", RepoPrefix: "b", Language: "go"},
+		{ID: "a/pkg/changed.go::Target", Kind: graph.KindFunction, Name: "Target", FilePath: "a/pkg/changed.go", RepoPrefix: "a", Language: "go"},
+		{ID: "a/pkg/other.go::Other", Kind: graph.KindFunction, Name: "Other", FilePath: "a/pkg/other.go", RepoPrefix: "a", Language: "go"},
+		{ID: "b/pkg/caller.go::Caller", Kind: graph.KindFunction, Name: "Caller", FilePath: "b/pkg/caller.go", RepoPrefix: "b", Language: "go"},
+	} {
+		g.AddNode(node)
+	}
+	for _, edge := range []*graph.Edge{
+		{From: "a/pkg/changed.go::Target", To: "unresolved::Other", Kind: graph.EdgeCalls, FilePath: "a/pkg/changed.go", Line: 2},
+		{From: "a/pkg/changed.go::Target", To: "unresolved::Target", Kind: graph.EdgeCalls, FilePath: "a/pkg/changed.go", Line: 3},
+		{From: "b/pkg/caller.go::Caller", To: "unresolved::Target", Kind: graph.EdgeCalls, FilePath: "b/pkg/caller.go", Line: 2},
+	} {
+		g.AddEdge(edge)
+	}
+	core, logs := observer.New(zap.InfoLevel)
+	r := New(g)
+	r.SetLogger(zap.New(core))
+	r.ResolveFilesAndIncoming([]string{"a/pkg/changed.go", "a/pkg/changed.go", ""})
+
+	var starts, completions []string
+	for _, entry := range logs.All() {
+		switch entry.Message {
+		case "resolver: incremental phase starting":
+			starts = append(starts, entry.ContextMap()["phase"].(string))
+		case "resolver: incremental phase complete":
+			completions = append(completions, entry.ContextMap()["phase"].(string))
+			assert.Contains(t, entry.ContextMap(), "elapsed")
+		}
+	}
+	want := []string{"wait_lock", "visibility", "pending_collect", "build_indexes", "warm_lookup", "resolve_outgoing", "resolve_incoming", "attribution"}
+	assert.Equal(t, want, starts)
+	assert.Equal(t, want, completions)
+	admissions := logs.FilterMessage("resolver: incremental pending admissions").All()
+	require.Len(t, admissions, 1)
+	fields := admissions[0].ContextMap()
+	assert.EqualValues(t, 2, fields["outgoing_pending"])
+	assert.EqualValues(t, 2, fields["incoming_pending"])
+	assert.Equal(t, []incrementalRepoAdmission{
+		{Repo: "a", Outgoing: 2, Incoming: 1},
+		{Repo: "b", Incoming: 1},
+	}, fields["repositories"])
+	summaries := logs.FilterMessage("resolver: incremental files phases").All()
+	require.Len(t, summaries, 1)
+	summary := summaries[0].ContextMap()
+	assert.Equal(t, "complete", summary["outcome"])
+	assert.EqualValues(t, 1, summary["files"])
+	assert.EqualValues(t, 4, summary["pending"])
+	for _, key := range []string{"wait_lock", "visibility", "outgoing_collect", "incoming_collect", "resolve_outgoing", "resolve_incoming", "resolve", "total"} {
+		assert.Contains(t, summary, key)
+	}
+}
+
+func TestResolveFilesAndIncomingLogsNoPending(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	r := New(graph.New())
+	r.SetLogger(zap.New(core))
+	r.ResolveFilesAndIncoming([]string{"missing.go"})
+	summaries := logs.FilterMessage("resolver: incremental files phases").All()
+	require.Len(t, summaries, 1)
+	assert.Equal(t, "no_pending", summaries[0].ContextMap()["outcome"])
+	assert.EqualValues(t, 0, summaries[0].ContextMap()["pending"])
+	assert.Empty(t, logs.FilterMessage("resolver: incremental pending admissions").All())
+	assert.Len(t, logs.FilterMessage("resolver: incremental phase starting").All(), 3)
+	assert.Len(t, logs.FilterMessage("resolver: incremental phase complete").All(), 3)
+}
+
+type incrementalTimingPanicStore struct{ graph.Store }
+
+func (incrementalTimingPanicStore) GetOutEdgesByNodeIDs([]string) map[string][]*graph.Edge {
+	panic("frontier read interrupted")
+}
+
+func TestResolveFilesAndIncomingLogsInterruptedPhase(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	r := New(incrementalTimingPanicStore{Store: graph.New()})
+	r.SetLogger(zap.New(core))
+	require.PanicsWithValue(t, "frontier read interrupted", func() {
+		r.ResolveFilesAndIncoming([]string{"missing.go"})
+	})
+	starts := logs.FilterMessage("resolver: incremental phase starting").All()
+	require.NotEmpty(t, starts)
+	assert.Equal(t, "pending_collect", starts[len(starts)-1].ContextMap()["phase"])
+	summaries := logs.FilterMessage("resolver: incremental files phases").All()
+	require.Len(t, summaries, 1)
+	assert.Equal(t, "interrupted", summaries[0].ContextMap()["outcome"])
+}
+
+func TestIncrementalAdmissionSummaryMissingProvenanceAndBound(t *testing.T) {
+	frontier := incrementalFileFrontier{
+		pending: []*graph.Edge{
+			{From: "known"}, {From: "missing"}, {From: "empty-repo"}, nil,
+		},
+		outgoingPending: 2,
+	}
+	sources := map[string]*graph.Node{
+		"known":      {RepoPrefix: "a"},
+		"empty-repo": {},
+	}
+	repos, omittedRepos, omittedAdmissions := incrementalAdmissionSummary(frontier, sources)
+	assert.Equal(t, []incrementalRepoAdmission{
+		{Repo: "(unknown)", Outgoing: 1, Incoming: 2},
+		{Repo: "a", Outgoing: 1},
+	}, repos)
+	assert.Zero(t, omittedRepos)
+	assert.Zero(t, omittedAdmissions)
+
+	frontier = incrementalFileFrontier{}
+	sources = make(map[string]*graph.Node)
+	for i := 0; i < incrementalRepoLogLimit+3; i++ {
+		repo := fmt.Sprintf("repo-%03d", i)
+		frontier.pending = append(frontier.pending, &graph.Edge{From: repo})
+		sources[repo] = &graph.Node{RepoPrefix: repo}
+	}
+	repos, omittedRepos, omittedAdmissions = incrementalAdmissionSummary(frontier, sources)
+	assert.Len(t, repos, incrementalRepoLogLimit)
+	assert.Equal(t, 3, omittedRepos)
+	assert.Equal(t, 3, omittedAdmissions)
+	assert.Equal(t, "repo-000", repos[0].Repo)
+	assert.Equal(t, fmt.Sprintf("repo-%03d", incrementalRepoLogLimit-1), repos[len(repos)-1].Repo)
+}
 
 func TestResolveAll_InternalCall(t *testing.T) {
 	g := graph.New()
