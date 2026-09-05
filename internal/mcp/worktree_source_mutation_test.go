@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -347,12 +348,14 @@ func newRealCheckoutMutationFixture(t testing.TB) *realCheckoutMutationFixture {
 	checkoutID := ""
 	for _, family := range overview.Families {
 		for _, checkout := range family.Checkouts {
-			if checkout.RootPath == worktree {
+			// Git emits slash-separated worktree roots on Windows, while
+			// filepath.Join uses native separators. Compare path identities.
+			if pathkey.EqualPaths(checkout.RootPath, worktree) {
 				checkoutID = checkout.CheckoutID
 			}
 		}
 	}
-	require.NotEmpty(t, checkoutID, "linked worktree must be discovered through registration")
+	require.NotEmpty(t, checkoutID, "linked worktree %q must be discovered through registration: %+v", worktree, overview.Families)
 	require.True(t, lifecycle.ActivateCheckout(checkoutID, "mutation-test"))
 	require.Eventually(t, func() bool {
 		route, found, routeErr := store.Catalog().GetCheckoutRoute(ctx, checkoutID)
