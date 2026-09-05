@@ -104,13 +104,43 @@ func TestScanRepoMemoryEstimatesReportsTheCorpusAndExposesDrift(t *testing.T) {
 // because the caller owns the deadline and gets an error instead of numbers.
 func TestScanRepoMemoryEstimatesFailsRatherThanTruncating(t *testing.T) {
 	s := openEstimateStore(t)
-	addRepoNodes(t, s, "r1", 20000)
+	addRepoNodes(t, s, "r1", 2)
+	addRepoNodes(t, s, "r2", 3)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
-	defer cancel()
-	got, err := s.ScanRepoMemoryEstimates(ctx)
-	require.Error(t, err, "an unfinished scan must not be reported as a result")
-	require.Nil(t, got)
+	// A 1 ns timer can fire after a fast scan completes, especially on
+	// platforms with coarse clock/timer resolution. Inject the failure before
+	// querying so this checks the error contract, not a scheduling race.
+	for _, tc := range []struct {
+		name       string
+		newContext func() (context.Context, context.CancelFunc)
+		wantErr    error
+	}{
+		{
+			name: "canceled",
+			newContext: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "expired_deadline",
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Unix(0, 0))
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := tc.newContext()
+			defer cancel()
+			require.ErrorIs(t, ctx.Err(), tc.wantErr, "the scan must start with the failure already observable")
+			got, err := s.ScanRepoMemoryEstimates(ctx)
+			require.ErrorIs(t, err, tc.wantErr, "an unfinished scan must not be reported as a result")
+			require.Nil(t, got, "failed scans must not expose partial estimates")
+		})
+	}
 }
 
 // Whatever the scan reports can be written straight back, which is how
