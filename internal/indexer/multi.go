@@ -2926,6 +2926,9 @@ func (mi *MultiIndexer) trackRepoSourceCtx(
 // reconcile against and a full index is the correct path.
 func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoEntry, priorMtimes map[string]int64) (*IndexResult, error) {
 	start := time.Now()
+	setupTiming := startReconcilePhase(mi.logger, entry.Name, "repository_setup",
+		zap.Int("prior_files", len(priorMtimes)))
+	defer setupTiming.abort()
 
 	absPath, err := filepath.Abs(entry.Path)
 	if err != nil {
@@ -2952,6 +2955,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	// reconcile path too; config can change between sessions and warmup-
 	// time reconcile runs after a daemon restart.
 	prefix, cfg := mi.resolveTrackPrefix(&entry, absPath, identity)
+	setupTiming.complete(nil, zap.String("prefix", prefix))
 
 	// Already tracked — nothing to do.
 	mi.mu.RLock()
@@ -2973,6 +2977,8 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	}
 
 	// Prefix unconditionally, as TrackRepoCtx does — see the note there.
+	restoreTiming := startReconcilePhase(mi.logger, prefix, "indexer_restore")
+	defer restoreTiming.abort()
 	idx := mi.newPerRepoIndexerForMutation(ctx, cfg.Index)
 	idx.SetRepoPrefix(prefix)
 	entryCopy := entry
@@ -2980,10 +2986,16 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetProjectID(resolveProjectID(&entryCopy, cfg, prefix))
 	idx.SetRootPath(absPath)
 	idx.SetFileMtimes(priorMtimes)
+	restoreTiming.complete(nil)
 
 	var result *IndexResult
 	installed := false
+	admissionTiming := startReconcilePhase(mi.logger, prefix, "topology_admission")
+	defer admissionTiming.abort()
 	err = mi.coordinateRepositoryTopologyMutation(ctx, idx, func() error {
+		admissionTiming.complete(nil)
+		admittedSetupTiming := startReconcilePhase(mi.logger, prefix, "admitted_setup")
+		defer admittedSetupTiming.abort()
 		// Construction can precede a queued batch transition. Once the stable
 		// lane and transition generation are held, reapply the authoritative mode.
 		batchMode := mi.reapplyBatchModeForMutation(idx)
@@ -3037,6 +3049,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			}
 			return r, e
 		}
+		admittedSetupTiming.complete(nil)
 		changed, deleted, detected, censusErr := idx.changedSinceMtimesCensus(absPath)
 		churn := len(changed) + len(deleted)
 		priorCount := len(priorMtimes)
@@ -3049,6 +3062,10 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 				break
 			}
 		}
+		applyTiming := startReconcilePhase(mi.logger, prefix, "apply",
+			zap.Int("changed_files", len(changed)), zap.Int("deleted_files", len(deleted)),
+			zap.Bool("force_full", forceFull), zap.Bool("census_failed", censusErr != nil))
+		defer applyTiming.abort()
 		switch {
 		case censusErr != nil:
 			// A partial filesystem census cannot safely authorize replacement:
@@ -3086,12 +3103,15 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			route = "scoped"
 			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
 		}
+		applyTiming.complete(err, zap.String("route", route))
 		if err != nil {
 			return fmt.Errorf("reconciling %s: %w", absPath, err)
 		}
 		if result == nil {
 			return fmt.Errorf("reconciling %s returned a nil result", absPath)
 		}
+		publishTiming := startReconcilePhase(mi.logger, prefix, "publish_and_catchup", zap.String("route", route))
+		defer publishTiming.abort()
 		// A scoped snapshot reconcile cannot derive its total from the walked
 		// scope. Its post-mutation tracked count is the repository-wide baseline.
 		if idx.totalDetected == 0 {
@@ -3141,6 +3161,8 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			mi.ReconcileContractEdges()
 		}
 
+		publishTiming.complete(nil)
+		// Total includes nested phase timings: do not sum it with them.
 		mi.logger.Info("daemon: reconciled repo from snapshot",
 			zap.String("prefix", prefix),
 			zap.String("route", route),

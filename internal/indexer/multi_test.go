@@ -1,15 +1,18 @@
 package indexer
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"pgregory.net/rapid"
 
 	"github.com/zzet/gortex/internal/config"
@@ -34,6 +37,140 @@ func newTestRegistry() *parser.Registry {
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	return reg
+}
+
+func TestReconcilePhaseTimingOutcomes(t *testing.T) {
+	for _, outcome := range []string{"complete", "error", "aborted"} {
+		t.Run(outcome, func(t *testing.T) {
+			core, logs := observer.New(zap.InfoLevel)
+			timing := startReconcilePhase(zap.New(core), "repo", "test", zap.Int("files", 3))
+			switch outcome {
+			case "complete":
+				timing.complete(nil)
+			case "error":
+				timing.complete(errors.New("census failed"))
+			case "aborted":
+				timing.abort()
+			}
+			// Deferred abort and duplicate completion cannot turn an error into
+			// success or emit multiple terminal records.
+			timing.abort()
+			timing.complete(nil)
+			entries := logs.All()
+			require.Len(t, entries, 2)
+			require.Equal(t, "indexer: reconcile phase started", entries[0].Message)
+			require.Equal(t, "indexer: reconcile phase complete", entries[1].Message)
+			for _, entry := range entries {
+				require.Equal(t, "repo", entry.ContextMap()["repo"])
+				require.Equal(t, "test", entry.ContextMap()["phase"])
+				require.EqualValues(t, 3, entry.ContextMap()["files"])
+			}
+			fields := entries[1].ContextMap()
+			require.Equal(t, outcome, fields["outcome"])
+			elapsed, ok := fields["elapsed"].(time.Duration)
+			require.True(t, ok, "elapsed is a structured duration")
+			require.GreaterOrEqual(t, elapsed, time.Duration(0))
+			if outcome == "error" {
+				require.Equal(t, "census failed", fields["error"])
+			}
+		})
+	}
+}
+
+func TestReconcileCensusTiming(t *testing.T) {
+	for _, mode := range []string{"clean", "changed", "missing"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := setupRepoDir(t, "census")
+			core, logs := observer.New(zap.InfoLevel)
+			idx := New(graph.New(), newTestRegistry(), config.IndexConfig{}, zap.New(core))
+			t.Cleanup(func() { idx.Close() })
+			idx.SetRepoPrefix("repo")
+			info, err := os.Stat(filepath.Join(dir, "main.go"))
+			require.NoError(t, err)
+			mtime := info.ModTime().UnixNano()
+			if mode == "changed" {
+				mtime = 0
+			}
+			idx.SetFileMtimes(map[string]int64{"main.go": mtime})
+			if mode == "missing" {
+				dir = filepath.Join(dir, "missing")
+			}
+			changed, deleted, detected, err := idx.changedSinceMtimesCensus(dir)
+			if mode == "missing" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 1, detected)
+				require.Empty(t, deleted)
+				require.Len(t, changed, map[string]int{"clean": 0, "changed": 1}[mode])
+			}
+			entries := logs.FilterMessage("indexer: reconcile phase complete").All()
+			require.Len(t, entries, 1)
+			fields := entries[0].ContextMap()
+			require.Equal(t, "census", fields["phase"])
+			require.EqualValues(t, len(changed), fields["changed_files"])
+			require.EqualValues(t, detected, fields["detected_files"])
+			require.Equal(t, mode == "clean", fields["no_changes"])
+			if mode == "missing" {
+				require.Equal(t, "error", fields["outcome"])
+				require.NotEmpty(t, fields["error"])
+			} else {
+				require.Equal(t, "complete", fields["outcome"])
+			}
+		})
+	}
+}
+
+func TestIncrementalReconcilePhaseTimings(t *testing.T) {
+	dir := setupRepoDir(t, "incremental")
+	core, logs := observer.New(zap.InfoLevel)
+	g := graph.New()
+	idx := New(g, newTestRegistry(), config.IndexConfig{}, zap.New(core))
+	t.Cleanup(func() { idx.Close() })
+	idx.SetRepoPrefix("repo")
+	idx.SetDeferResolve(true)
+	idx.SetDeferGlobalPasses(true)
+
+	result, err := idx.incrementalReindexPathsMode(dir, []string{"main.go"}, incrementalPathMode{})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.StaleFileCount)
+	require.NotEmpty(t, g.AllNodes())
+	phases := make(map[string]map[string]any)
+	for _, entry := range logs.FilterMessage("indexer: reconcile phase complete").All() {
+		fields := entry.ContextMap()
+		require.Equal(t, "repo", fields["repo"])
+		require.Equal(t, "complete", fields["outcome"])
+		phases[fields["phase"].(string)] = fields
+	}
+	for _, phase := range []string{"fts_normalization", "scoped_discovery", "deletion_frontier",
+		"graph_delete", "chunk_prior_graph", "chunk_parse", "chunk_graph_apply", "chunk_receipts",
+		"contracts_and_metadata"} {
+		require.Contains(t, phases, phase)
+	}
+	require.EqualValues(t, 1, phases["chunk_parse"]["consumed_files"])
+	require.Equal(t, true, phases["chunk_parse"]["includes_admission_wait"])
+	require.EqualValues(t, 1, phases["chunk_graph_apply"]["staged_files"])
+
+	logs.TakeAll()
+	result, err = idx.incrementalReindexPathsMode(dir, []string{"main.go"}, incrementalPathMode{})
+	require.NoError(t, err)
+	require.Zero(t, result.StaleFileCount)
+	for _, entry := range logs.FilterMessage("indexer: reconcile phase started").All() {
+		require.NotEqual(t, "chunk_parse", entry.ContextMap()["phase"], "no-op reconciliation must not invent parse work")
+	}
+
+	logs.TakeAll()
+	_, err = idx.incrementalReindexPathsMode(dir, []string{"../outside.go"}, incrementalPathMode{})
+	require.Error(t, err)
+	aborted := false
+	for _, entry := range logs.FilterMessage("indexer: reconcile phase complete").All() {
+		fields := entry.ContextMap()
+		if fields["phase"] == "scoped_discovery" {
+			require.Equal(t, "aborted", fields["outcome"])
+			aborted = true
+		}
+	}
+	require.True(t, aborted, "early discovery failure must have a terminal phase record")
 }
 
 // setupRepoDir creates a temp directory with a Go file for testing.
