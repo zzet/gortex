@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // checkoutMutationLifecycle is the request's already-acquired checkout lease.
@@ -67,28 +68,38 @@ func guardCheckoutMutationPath(ctx context.Context, path string) error {
 }
 
 func guardCheckoutMutationResolvedPath(root, resolved, path string) error {
-	if !pathContainedIn(resolved, root) || resolved == root {
+	if !pathkey.HasPathPrefix(resolved, root) || pathkey.EqualPaths(resolved, root) {
 		return fmt.Errorf("checkout mutation target %q is outside selected working copy %q", path, root)
-	}
-	relative, err := filepath.Rel(root, resolved)
-	if err != nil {
-		return fmt.Errorf("could not verify checkout mutation target %q: %w", path, err)
-	}
-	for _, component := range strings.Split(relative, string(filepath.Separator)) {
-		if strings.EqualFold(component, ".git") {
-			return fmt.Errorf("checkout source mutation cannot modify Git metadata: %q", path)
-		}
 	}
 	// A repository nested below the selected checkout has independent dirty
 	// state and a different coordinator, even though lexical confinement passes.
-	for dir := filepath.Dir(resolved); dir != root; dir = filepath.Dir(dir) {
-		if dir == filepath.Dir(dir) {
+	// Use the same path identity for confinement and termination: a case or
+	// separator alias must not make the selected root's own .git look nested.
+	dir := resolved
+	for ; !pathkey.EqualPaths(dir, root); dir = filepath.Dir(dir) {
+		if strings.EqualFold(filepath.Base(dir), ".git") {
+			return fmt.Errorf("checkout source mutation cannot modify Git metadata: %q", path)
+		}
+		if pathkey.EqualPaths(dir, filepath.Dir(dir)) {
 			return fmt.Errorf("could not verify selected checkout root for mutation target %q", path)
+		}
+		if dir == resolved {
+			continue // Only ancestors, not the source file, can contain a nested .git.
 		}
 		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
 			return fmt.Errorf("checkout mutation target %q belongs to nested checkout %q; select that checkout instead", path, dir)
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("could not verify checkout mutation target %q: %w", path, err)
+		}
+	}
+	if dir != root {
+		// Identity folding follows the host default, but a particular volume
+		// may be case-sensitive. Never grant a lease for /repo access to a
+		// physically distinct /REPO merely because their names fold equally.
+		selected, selectedErr := os.Stat(root)
+		matched, matchedErr := os.Stat(dir)
+		if selectedErr != nil || matchedErr != nil || !os.SameFile(selected, matched) {
+			return fmt.Errorf("could not verify selected checkout root identity for mutation target %q", path)
 		}
 	}
 	return nil

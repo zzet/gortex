@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 type fakeCheckoutMutationLifecycle struct {
@@ -96,6 +97,91 @@ func TestCheckoutMutationPathConfinement(t *testing.T) {
 
 	if err := guardCheckoutMutationPath(context.Background(), filepath.Join(other, "file.go")); err != nil {
 		t.Fatalf("ordinary mutation was changed: %v", err)
+	}
+}
+
+func TestCheckoutMutationResolvedRootIdentity(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, ".git"), []byte("gitdir: independent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	roots := map[string]string{
+		"canonical":          root,
+		"trailing_separator": root + string(filepath.Separator),
+		"dot_component":      root + string(filepath.Separator) + ".",
+	}
+	if pathkey.CaseInsensitivePaths {
+		roots["case_alias"] = strings.ToUpper(root)
+	}
+	for name, selected := range roots {
+		t.Run(name, func(t *testing.T) {
+			if name == "case_alias" {
+				actual, actualErr := os.Stat(root)
+				alias, aliasErr := os.Stat(selected)
+				if actualErr != nil || aliasErr != nil || !os.SameFile(actual, alias) {
+					t.Skip("filesystem does not resolve this case alias to the selected root")
+				}
+			}
+			// The selected checkout's own .git must not look like a nested repo
+			// merely because Git and the filesystem spell its root differently.
+			path := filepath.Join(root, "new", "file.go")
+			if err := guardCheckoutMutationResolvedPath(selected, path, path); err != nil {
+				t.Fatalf("selected checkout source rejected: %v", err)
+			}
+			if err := guardCheckoutMutationResolvedPath(selected, root, root); err == nil {
+				t.Fatal("accepted checkout root as a source file")
+			}
+			for _, path := range []string{filepath.Join(root+"-sibling", "file.go"), filepath.Join(root, "..", "other", "file.go")} {
+				if err := guardCheckoutMutationResolvedPath(selected, path, path); err == nil {
+					t.Fatalf("accepted path outside selected working copy: %q", path)
+				}
+			}
+			path = filepath.Join(root, ".git", "HEAD")
+			if err := guardCheckoutMutationResolvedPath(selected, path, path); err == nil || !strings.Contains(err.Error(), "Git metadata") {
+				t.Fatalf("Git metadata refusal = %v", err)
+			}
+			path = filepath.Join(nested, "new", "file.go")
+			if err := guardCheckoutMutationResolvedPath(selected, path, path); err == nil || !strings.Contains(err.Error(), "nested checkout") {
+				t.Fatalf("nested checkout refusal = %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckoutMutationResolvedRootRejectsFoldedDistinctDirectory(t *testing.T) {
+	base := t.TempDir()
+	root, other := filepath.Join(base, "repo"), filepath.Join(base, "REPO")
+	for _, dir := range []string{root, other} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	distinct, err := os.Stat(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(selected, distinct) {
+		t.Skip("filesystem cannot represent case-distinct directories")
+	}
+	// Model a case-sensitive volume mounted on a normally case-insensitive
+	// host. This test is deliberately not parallel: the policy is global.
+	original := pathkey.CaseInsensitivePaths
+	pathkey.CaseInsensitivePaths = true
+	t.Cleanup(func() { pathkey.CaseInsensitivePaths = original })
+	path := filepath.Join(other, "file.go")
+	if err := guardCheckoutMutationResolvedPath(root, path, path); err == nil || !strings.Contains(err.Error(), "root identity") {
+		t.Fatalf("physically distinct checkout refusal = %v", err)
 	}
 }
 
