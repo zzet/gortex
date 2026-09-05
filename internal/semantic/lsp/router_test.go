@@ -4,8 +4,123 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestRouterTimingCachedAcquisitionsDoNotLogPerRequest(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	r := NewRouter(t.TempDir(), zap.New(core))
+	spec := &ServerSpec{Name: "timing-cached"}
+	p := &Provider{}
+	key := providerKey{specName: spec.Name, workspace: r.defaultWorkspace}
+	r.avail[spec.Name] = true
+	r.providers[key] = &routedProvider{spec: spec, provider: p, workspace: key.workspace}
+	before := r.TimingStats()
+	for range 3 {
+		got, err := r.forSpecWorkspace(spec, key.workspace, true)
+		require.NoError(t, err)
+		assert.Same(t, p, got)
+		r.ReleaseSpecWorkspace(spec.Name, key.workspace)
+	}
+	delta := r.TimingStats().Sub(before)
+	assert.EqualValues(t, 3, delta.Acquires)
+	assert.EqualValues(t, 3, delta.Reuses)
+	assert.Zero(t, delta.AcquireFailures)
+	assert.Zero(t, delta.Starts)
+	assert.GreaterOrEqual(t, delta.AcquireDuration, time.Duration(0))
+	assert.GreaterOrEqual(t, delta.ReuseDuration, time.Duration(0))
+	assert.GreaterOrEqual(t, delta.WaitDuration, time.Duration(0))
+	assert.Empty(t, logs.All(), "a cache hit is aggregated, not logged once per edge")
+}
+
+func TestRouterTimingFailedStartupIsPairedAndNotRetried(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	r := NewRouter(t.TempDir(), zap.New(core))
+	spec := &ServerSpec{Name: "timing-start-failure", Command: "gortex-timing-test-no-such-lsp"}
+	// Exercise the initialization failure, not PATH availability detection.
+	r.avail[spec.Name] = true
+	_, err := r.ForSpecWorkspace(spec, r.defaultWorkspace)
+	require.Error(t, err)
+	first := r.TimingStats()
+	assert.EqualValues(t, 1, first.Acquires)
+	assert.EqualValues(t, 1, first.AcquireFailures)
+	assert.EqualValues(t, 1, first.Starts)
+	assert.EqualValues(t, 1, first.StartFailures)
+	assert.GreaterOrEqual(t, first.StartDuration, time.Duration(0))
+	require.Len(t, logs.FilterMessage("LSP router provider startup starting").All(), 1)
+	failures := logs.FilterMessage("LSP router provider startup failed").All()
+	require.Len(t, failures, 1)
+	assert.Contains(t, failures[0].ContextMap(), "elapsed")
+	assert.Contains(t, failures[0].ContextMap(), "error")
+	_, err = r.ForSpecWorkspace(spec, r.defaultWorkspace)
+	require.Error(t, err)
+	second := r.TimingStats()
+	assert.EqualValues(t, 2, second.Acquires)
+	assert.EqualValues(t, 2, second.AcquireFailures)
+	assert.EqualValues(t, 1, second.Starts, "existing spawn-failure backoff is unchanged")
+	assert.Len(t, logs.FilterMessage("LSP router provider startup starting").All(), 1)
+}
+
+func TestRouterTimingEvictionMeasuresAsyncClose(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	r := NewRouter(t.TempDir(), zap.New(core))
+	r.maxAlive = 1
+	for i, name := range []string{"older", "newer"} {
+		spec := &ServerSpec{Name: name}
+		key := providerKey{specName: name, workspace: r.defaultWorkspace}
+		r.providers[key] = &routedProvider{
+			spec: spec, workspace: key.workspace, provider: &Provider{},
+			lastUsed: time.Now().Add(time.Duration(i-2) * time.Minute),
+		}
+	}
+	r.mu.Lock()
+	r.maybeEvictLRULocked()
+	r.mu.Unlock()
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("LSP router provider close complete").Len() == 1
+	}, time.Second, time.Millisecond)
+	stats := r.TimingStats()
+	assert.EqualValues(t, 1, r.EvictionCount())
+	assert.EqualValues(t, 1, stats.Evictions)
+	assert.GreaterOrEqual(t, stats.EvictionDuration, time.Duration(0))
+	assert.EqualValues(t, 1, stats.Closes)
+	assert.Zero(t, stats.CloseFailures)
+	assert.GreaterOrEqual(t, stats.CloseDuration, time.Duration(0))
+	require.Len(t, logs.FilterMessage("LSP router provider close starting").All(), 1)
+	entry := logs.FilterMessage("LSP router provider close complete").All()[0]
+	assert.Equal(t, "lru", entry.ContextMap()["reason"])
+	assert.Equal(t, "older", entry.ContextMap()["spec"])
+	assert.Contains(t, entry.ContextMap(), "elapsed")
+}
+
+func TestRouterTimingStatsLogDurationEncoding(t *testing.T) {
+	stats := RouterTimingStats{Acquires: 2, AcquireDuration: time.Second, WaitDuration: time.Millisecond}
+	encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{EncodeDuration: zapcore.StringDurationEncoder})
+	buffer, err := encoder.EncodeEntry(zapcore.Entry{}, []zapcore.Field{zap.Any("timing", stats)})
+	require.NoError(t, err)
+	defer buffer.Free()
+	assert.Contains(t, buffer.String(), `"acquires":2`)
+	assert.Contains(t, buffer.String(), `"acquire_duration":"1s"`)
+	assert.Contains(t, buffer.String(), `"wait_duration":"1ms"`)
+	assert.Contains(t, buffer.String(), `"eviction_duration":"0s"`)
+}
+
+func TestRouterTimingStatsSub(t *testing.T) {
+	before := RouterTimingStats{
+		Acquires: 1, AcquireFailures: 2, Reuses: 3, Starts: 4, StartFailures: 5, RaceReuses: 6,
+		Closes: 7, CloseFailures: 8, AcquireDuration: 9, ReuseDuration: 10,
+		StartDuration: 11, CloseDuration: 12, WaitDuration: 13,
+	}
+	assert.Equal(t, RouterTimingStats{}, before.Sub(before))
+	after := before
+	after.Acquires += 2
+	after.StartDuration += time.Second
+	assert.Equal(t, RouterTimingStats{Acquires: 2, StartDuration: time.Second}, after.Sub(before))
+}
 
 // TestRouter_For_NoSpec returns an error for unknown extensions.
 func TestRouter_For_NoSpec(t *testing.T) {
