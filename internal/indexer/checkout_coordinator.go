@@ -253,6 +253,11 @@ type CheckoutCoordinator struct {
 	cycleMu sync.Mutex
 
 	mu sync.Mutex
+	// Source mutations are admitted under mu and joined by CloseContext before
+	// lifecycle teardown can retire the checkout while its disk writer runs.
+	sourceMutationsClosing bool
+	sourceMutations        int
+	sourceMutationsDrained chan struct{}
 	// retained is the commit-layer reuse cache, most recently routed first.
 	retained []retainedCommitLayer
 	// backlog holds generations a retire refused. The janitor retries them.
@@ -405,6 +410,9 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	c.once.Do(func() {
+		c.mu.Lock()
+		c.sourceMutationsClosing = true
+		c.mu.Unlock()
 		if c.cancelLifetime != nil {
 			c.cancelLifetime()
 		}
@@ -414,7 +422,7 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 	})
 	select {
 	case <-c.done:
-		return nil
+		return c.waitSourceMutations(ctx)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
