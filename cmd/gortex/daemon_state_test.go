@@ -1,15 +1,108 @@
 package main
 
 import (
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/intern"
 	"github.com/zzet/gortex/internal/serverstack"
 )
+
+func TestWarmupStepLogsStartBeforeCompletion(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	finish := startWarmupStep(zap.New(core), "resolver_helper", zap.String("repo", "example"))
+	if observed.Len() != 1 {
+		t.Fatalf("expected a start event before work completes, got %d", observed.Len())
+	}
+	if got := observed.All()[0]; got.Message != "daemon: warmup step start" || got.ContextMap()["step"] != "resolver_helper" {
+		t.Fatalf("unexpected start event: %+v", got)
+	}
+	elapsed := finish(zap.String("outcome", "skipped"), zap.Int("files", 0))
+	if elapsed < 0 || observed.Len() != 2 {
+		t.Fatalf("expected completion with nonnegative elapsed, elapsed=%v events=%d", elapsed, observed.Len())
+	}
+	event := observed.All()[1]
+	fields := event.ContextMap()
+	if event.Message != "daemon: warmup step complete" || fields["repo"] != "example" ||
+		fields["outcome"] != "skipped" || fields["files"] != int64(0) {
+		t.Fatalf("missing no-op result or correlation fields: %+v", event)
+	}
+	if _, ok := fields["elapsed"]; !ok {
+		t.Fatal("completion has no elapsed field")
+	}
+}
+
+func TestWarmupStepAllowsNilLogger(t *testing.T) {
+	if elapsed := startWarmupStep(nil, "no_logger")(); elapsed < 0 {
+		t.Fatalf("negative elapsed: %v", elapsed)
+	}
+}
+
+func TestWarmupSummaryIncludesPrelude(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	logWarmupSummary(zap.New(core), &warmupTimings{}, 0, 0)
+	if observed.Len() != 1 {
+		t.Fatalf("expected one summary, got %d", observed.Len())
+	}
+	if _, ok := observed.All()[0].ContextMap()["prelude_s"]; !ok {
+		t.Fatal("summary omits prelude")
+	}
+}
+
+func TestWarmupSummaryAccountsOnlyTopLevelPhases(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	timings := &warmupTimings{
+		prelude: time.Second, prepareResolve: time.Second, parse: time.Second,
+		resolve: 3 * time.Second, resolveCompute: time.Second, resolveTail: 2 * time.Second,
+		enrich: time.Second, contractRehydrate: time.Second, workspaceBackfill: time.Second,
+		globalResolve: time.Second, endBatch: time.Second, watchers: time.Second, analysis: time.Second,
+	}
+	logWarmupSummary(zap.New(core), timings, 5*time.Second, 15*time.Second)
+	fields := observed.All()[0].ContextMap()
+	if fields["accounted_s"] != float64(13) || fields["other_s"] != float64(2) {
+		t.Fatalf("nested measurements counted twice or phases omitted: %+v", fields)
+	}
+	if fields["resolve_compute_s"] != float64(1) || fields["resolve_tail_s"] != float64(2) {
+		t.Fatalf("missing resolver split: %+v", fields)
+	}
+}
+
+func TestWarmupResolveTimerPreservesCallbacks(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	timer := newWarmupResolveTimer(zap.New(core))
+	calls := 0
+	ready := timer.ready(func() { calls++ })
+	ready()
+	ready()
+	compute, tail := timer.finish(nil)
+	if calls != 2 || compute <= 0 || tail < 0 {
+		t.Fatalf("callbacks=%d compute=%v tail=%v", calls, compute, tail)
+	}
+	entries := observed.All()
+	if len(entries) != 4 || entries[1].ContextMap()["step"] != "resolve_compute" ||
+		entries[2].ContextMap()["step"] != "resolve_tail" || entries[3].Message != "daemon: warmup step complete" {
+		t.Fatalf("expected exactly one compute and tail pair, got %+v", entries)
+	}
+}
+
+func TestWarmupResolveTimerWithoutReadyReportsFailure(t *testing.T) {
+	core, observed := observer.New(zap.InfoLevel)
+	timer := newWarmupResolveTimer(zap.New(core))
+	compute, tail := timer.finish(errors.New("resolve failed"))
+	if compute < 0 || tail != 0 || observed.Len() != 2 {
+		t.Fatalf("compute=%v tail=%v events=%d", compute, tail, observed.Len())
+	}
+	fields := observed.All()[1].ContextMap()
+	if fields["queryable_callback"] != false || fields["error"] != "resolve failed" {
+		t.Fatalf("missing failure without readiness: %+v", fields)
+	}
+}
 
 // TestLSPDisabledSet_ConfigOnly — a `semantic.providers` entry with
 // `enabled: false` whose name matches a known LSP spec lands in the

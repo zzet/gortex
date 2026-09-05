@@ -264,12 +264,19 @@ func boundedStartupError(err error) string {
 // already compute — those logs stay untouched; this just also keeps the
 // values around instead of discarding them.
 type warmupTimings struct {
-	parse         time.Duration
-	resolve       time.Duration
-	enrich        time.Duration
-	globalResolve time.Duration
-	endBatch      time.Duration
-	analysis      time.Duration
+	prelude           time.Duration
+	prepareResolve    time.Duration
+	contractRehydrate time.Duration
+	workspaceBackfill time.Duration
+	watchers          time.Duration
+	resolveCompute    time.Duration
+	resolveTail       time.Duration
+	parse             time.Duration
+	resolve           time.Duration
+	enrich            time.Duration
+	globalResolve     time.Duration
+	endBatch          time.Duration
+	analysis          time.Duration
 	// reposChanged is the number of tracked repos whose reindex actually did
 	// work this warmup (cold track, or a reconcile with stale/deleted files).
 	reposChanged int
@@ -425,6 +432,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		return nil, timings
 	}
 
+	finishPrelude := startWarmupStep(logger, "prelude")
 	ctx := progress.WithReporter(context.Background(), progress.Nop{})
 	// BeginParallelBatch / EndBatch tells every per-repo Indexer
 	// constructed inside the loop to skip both the graph-wide
@@ -436,14 +444,18 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// loop below just parses; RunDeferredPassesAll drains the deferred
 	// per-repo passes serially before the global resolve. Without this
 	// batch wrapper, a 100+ repo warmup is O(R · global_size).
+	finishBatch := startWarmupStep(logger, "begin_parallel_batch")
 	state.multiIndexer.BeginParallelBatch()
+	finishBatch()
 
 	// Heal any duplicate tracked-repo entries that name the same directory
 	// under a different path spelling (case, or Unicode normalisation)
 	// BEFORE the warmup loop registers them. Two spellings of one directory
 	// would otherwise both reach the indexer and flip the daemon into
 	// multi-repo mode, desyncing the unprefixed graph (#270).
-	healDuplicateRepos(state.configManager.Global(), logger)
+	finishHeal := startWarmupStep(logger, "heal_duplicate_repos")
+	removedDuplicates := healDuplicateRepos(state.configManager.Global(), logger)
+	finishHeal(zap.Int("removed", removedDuplicates))
 
 	repos := state.configManager.Global().Repos
 
@@ -459,10 +471,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// prefix outside that set, and PurgeRepo each. '' is never an orphan
 	// (shared global externals / solo data). Capability-probed, so only the
 	// sidecar-bearing on-disk store participates; the in-memory store skips it.
+	finishOrphans := startWarmupStep(logger, "orphan_maintenance")
+	orphanSupported := false
+	orphanCount, purgedCount, purgeFailures := 0, 0, 0
 	if orphaner, ok := state.graph.(interface {
 		OrphanRepoPrefixes(known []string) []string
 	}); ok {
 		if purger, ok := state.graph.(interface{ PurgeRepo(string) error }); ok {
+			orphanSupported = true
+			finishScan := startWarmupStep(logger, "orphan_prefix_scan", zap.Int("repos", len(repos)))
 			known := make([]string, 0, len(repos))
 			for _, entry := range repos {
 				p := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
@@ -470,17 +487,28 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 					known = append(known, p)
 				}
 			}
-			for _, prefix := range orphaner.OrphanRepoPrefixes(known) {
+			orphans := orphaner.OrphanRepoPrefixes(known)
+			orphanCount = len(orphans)
+			finishScan(zap.Int("orphans", orphanCount))
+			for _, prefix := range orphans {
+				finishPurge := startWarmupStep(logger, "orphan_prefix_purge", zap.String("repo", prefix))
 				if err := purger.PurgeRepo(prefix); err != nil {
+					purgeFailures++
+					finishPurge(zap.String("outcome", "error"), zap.Error(err))
 					logger.Warn("daemon: purging orphaned repo prefix failed",
 						zap.String("prefix", prefix), zap.Error(err))
 					continue
 				}
+				purgedCount++
+				finishPurge(zap.String("outcome", "purged"))
 				logger.Info("daemon: purged orphaned repo prefix (no tracked repo in config keys under it)",
 					zap.String("prefix", prefix))
 			}
 		}
 	}
+
+	finishOrphans(zap.Bool("supported", orphanSupported), zap.Int("orphans", orphanCount),
+		zap.Int("purged", purgedCount), zap.Int("failed", purgeFailures))
 
 	// One-time store compaction, guarded (see daemon_compact.go). Placed HERE
 	// on purpose: after the orphan purge, so the pages it just freed are
@@ -494,28 +522,36 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// Running before the socket opened instead would hold the daemon
 	// unreachable for the whole VACUUM, turning a compacting boot into an
 	// apparent hang.
+	finishCompact := startWarmupStep(logger, "store_compaction_check")
 	maybeCompactStore(state.graph, logger)
+	finishCompact()
 
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
 	// helpers are lazy: language servers are not spawned until the
-	// resolver asks for a supported edge resolution, so there's no
-	// startup cost for repos with no matching code.
+	// resolver asks for a supported edge resolution. Time helper construction
+	// separately so repository discovery is visible even when no server starts.
+	finishHelpers := startWarmupStep(logger, "resolver_helper_registration", zap.Int("repos", len(repos)))
 	if state.resolverLSPRegistry != nil && state.lspRouter != nil {
 		poolSize := lsp.ResolverPoolSizeFromEnv(1)
 		registered, skipped, tsRepos, pythonRepos := 0, 0, 0, 0
 		for _, entry := range repos {
+			finishHelper := startWarmupStep(logger, "resolver_helper", zap.String("path", entry.Path))
 			absRoot, err := filepath.Abs(entry.Path)
 			if err != nil {
+				skipped++
+				finishHelper(zap.String("outcome", "invalid_path"), zap.Error(err))
 				continue
 			}
 			helper, specs := serverstack.BuildResolverLSPHelperForRepo(state.lspRouter, absRoot, poolSize, logger)
 			if helper == nil {
 				skipped++
+				finishHelper(zap.String("outcome", "skipped"))
 				continue
 			}
 			prefix := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
 			state.resolverLSPRegistry.Register(prefix, helper)
+			finishHelper(zap.String("outcome", "registered"), zap.String("repo", prefix), zap.Strings("providers", specs))
 			registered++
 			for _, spec := range specs {
 				switch spec {
@@ -532,6 +568,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.Int("ts_repos", tsRepos),
 			zap.Int("python_repos", pythonRepos),
 			zap.Int("pool_size", poolSize))
+		finishHelpers(zap.Int("registered", registered), zap.Int("skipped", skipped), zap.Bool("enabled", true))
+	} else {
+		finishHelpers(zap.Bool("enabled", false), zap.Int("skipped", len(repos)))
 	}
 	// Bounded worker pool — disk I/O dominates parsing for most repos,
 	// but a few CPU-heavy ones overlap with disk waits on others. NumCPU
@@ -556,6 +595,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.String("value", os.Getenv(warmupMemoryBudgetEnv)),
 			zap.Error(budgetErr))
 	}
+	timings.prelude = finishPrelude(zap.Int("repos", len(repos)))
 	logger.Info("daemon: warmup phase start",
 		zap.String("phase", "parallel_parse"),
 		zap.Int("repos", len(repos)),
@@ -770,6 +810,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		"repos_per_sec": parseStats.ItemsPerSec,
 	})
 
+	prepareStart := time.Now()
+	logger.Info("daemon: warmup step start", zap.String("step", "prepare_resolve"))
 	// Warm-restart fast path. When the reconcile loop above re-indexed
 	// nothing, the persistent backend already carries every resolved and
 	// derived edge from the prior run; the deferred per-repo passes, the
@@ -827,7 +869,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// covers those repos too. Cheap for a fully-enriched workspace: each
 	// already-complete repo pays a git rev-parse, one marker lookup, and one
 	// repo-scoped file-node projection — bounded by file count, not symbols.
+	finishSeed := startWarmupStep(logger, "seed_pending_enrichment", zap.Int("repos", len(repos)))
 	enrichPending := state.multiIndexer.SeedPendingEnrichAll()
+	finishSeed(zap.Int("pending_repos", enrichPending))
 	if enrichPending > 0 && !anyChanged {
 		logger.Info("daemon: warmup resuming incomplete enrichment on an otherwise-unchanged restart",
 			zap.Int("repos_pending_enrich", enrichPending))
@@ -866,6 +910,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// cross-repo resolver. On the warm-restart fast path nothing changed, so
 	// the persisted graph already carries resolved edges and we skip straight
 	// to marking ready.
+	timings.prepareResolve = time.Since(prepareStart)
+	logger.Info("daemon: warmup step complete", zap.String("step", "prepare_resolve"), zap.Duration("elapsed", timings.prepareResolve))
 	resolveOK := true
 	if anyChanged {
 		phaseStart = time.Now()
@@ -883,12 +929,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		// and cross-repo passes starved cross-repo to a standstill
 		// (measured: 1,049s for a pass that runs in ~38s uncontended). The
 		// gate opens right after this call returns.
+		resolveTimer := newWarmupResolveTimer(logger)
+		timedReady := resolveTimer.ready(markReady)
 		var resolveErr error
 		if exactWarmDelta {
-			resolveErr = state.multiIndexer.RunPreEnrichResolveFiles(ctx, deltaFiles, markReady)
+			resolveErr = state.multiIndexer.RunPreEnrichResolveFiles(ctx, deltaFiles, timedReady)
 		} else {
-			resolveErr = state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, markReady)
+			resolveErr = state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, timedReady)
 		}
+		timings.resolveCompute, timings.resolveTail = resolveTimer.finish(resolveErr)
 		if resolveErr != nil {
 			resolveOK = false
 			exactWarmDelta = false
@@ -925,6 +974,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	var deferredResult indexer.DeferredPassesResult
 	if anyChanged || enrichPending > 0 {
 		phaseStart = time.Now()
+		logger.Info("daemon: warmup phase start", zap.String("phase", "deferred_passes_all"), zap.Int("pending_repos", enrichPending))
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
 		if deferredRun != nil {
 			deferredResult = deferredRun.FinishTailResult()
@@ -955,6 +1005,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// last shutdown.
 	{
 		phaseStart = time.Now()
+		finishContracts := startWarmupStep(logger, "contract_registry_rehydrate")
 		injectedRepos, injectedCount := 0, 0
 		for prefix := range state.multiIndexer.AllMetadata() {
 			idx := state.multiIndexer.GetIndexer(prefix)
@@ -972,6 +1023,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			injectedRepos++
 			injectedCount += len(reg.All())
 		}
+		timings.contractRehydrate = finishContracts(zap.Int("repos", injectedRepos), zap.Int("contracts", injectedCount))
 		if injectedRepos > 0 {
 			logger.Info("daemon: rehydrated contract registries from graph",
 				zap.Int("repos", injectedRepos),
@@ -985,9 +1037,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// shared-workspace declarations stop working until every file is
 	// touched. Idempotent — re-running on a stamped graph is a no-op.
 	phaseStart = time.Now()
+	finishBackfill := startWarmupStep(logger, "workspace_backfill_before_derived")
 	backfillRevisionBefore, backfillRevisionBeforeKnown := state.multiIndexer.GraphMutationRevision()
 	backfilledNodes, backfilledContracts, backfillResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
 	backfillRevisionAfter, backfillRevisionAfterKnown := state.multiIndexer.GraphMutationRevision()
+	timings.workspaceBackfill = finishBackfill(zap.Int("nodes", backfilledNodes), zap.Int("contracts", backfilledContracts), zap.Int("resolution_affected", backfillResolutionAffected))
 	if backfilledNodes+backfilledContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs from .gortex.yaml",
 			zap.Int("nodes", backfilledNodes),
@@ -1021,6 +1075,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}, backfilledContracts)
 	if globalResolveAction != warmGlobalResolveNone {
 		phaseStart = time.Now()
+		logger.Info("daemon: warmup phase start", zap.String("phase", "global_resolve"), zap.Bool("full_cross_repo", globalResolveAction == warmGlobalResolveFull))
 		publishReadinessPhase(state, "global_resolve", true, nil)
 		switch globalResolveAction {
 		case warmGlobalResolveContracts:
@@ -1071,6 +1126,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 
 	phaseStart = time.Now()
+	logger.Info("daemon: warmup phase start", zap.String("phase", "end_batch"), zap.Bool("changed", anyChanged), zap.Bool("exact", exactWarmDelta))
 	publishReadinessPhase(state, "end_batch", true, nil)
 	switch {
 	case !anyChanged:
@@ -1084,7 +1140,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	default:
 		state.multiIndexer.EndBatch()
 	}
+	finishPostBackfill := startWarmupStep(logger, "workspace_backfill_after_derived")
 	postBatchNodes, postBatchContracts, postBatchResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
+	finishPostBackfill(zap.Int("nodes", postBatchNodes), zap.Int("contracts", postBatchContracts), zap.Int("resolution_affected", postBatchResolutionAffected))
 	if postBatchNodes+postBatchContracts > 0 {
 		logger.Info("daemon: backfilled workspace/project slugs after derived passes",
 			zap.Int("nodes", postBatchNodes),
@@ -1110,6 +1168,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 	})
 
+	finishWatchers := startWarmupStep(logger, "watcher_start")
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
 		watchCfgs[prefix] = state.configManager.GetRepoConfig(prefix).Watch
@@ -1117,10 +1176,12 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	mw, err := indexer.NewMultiWatcher(state.multiIndexer, watchCfgs, logger)
 	if err != nil {
 		logger.Warn("daemon: multi-watcher init failed", zap.Error(err))
+		timings.watchers = finishWatchers(zap.String("outcome", "init_failed"), zap.Error(err))
 		return nil, timings
 	}
 	if err := mw.Start(); err != nil {
 		logger.Warn("daemon: multi-watcher start failed", zap.Error(err))
+		timings.watchers = finishWatchers(zap.String("outcome", "start_failed"), zap.Error(err))
 		return nil, timings
 	}
 	// Attach the live watcher before publishing watcher_started. This makes
@@ -1145,6 +1206,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			zap.String("first_reason", mw.DegradedReason()),
 		)
 	}
+	timings.watchers = finishWatchers(zap.String("outcome", "started"), zap.Int("repos", live), zap.Int("configured", configured))
 	logger.Info("daemon: watching", zap.Int("repos", live), zap.Int("configured", configured))
 	publishReadinessPhase(state, "watcher_started", true, map[string]any{
 		"watched_repos":    live,
@@ -1164,7 +1226,20 @@ func logWarmupSummary(logger *zap.Logger, warmup *warmupTimings, queryable, tota
 	if logger == nil || warmup == nil {
 		return
 	}
+	// Resolve compute/tail and post-derived backfill are nested measurements.
+	// Only disjoint top-level intervals belong in the accounting total.
+	accounted := warmup.prelude + warmup.prepareResolve + warmup.parse + warmup.resolve + warmup.enrich + warmup.contractRehydrate + warmup.workspaceBackfill + warmup.globalResolve + warmup.endBatch + warmup.watchers + warmup.analysis
+	other := max(total-accounted, 0)
 	logger.Info("daemon: warmup summary",
+		zap.Float64("prepare_resolve_s", warmup.prepareResolve.Seconds()),
+		zap.Float64("contract_rehydrate_s", warmup.contractRehydrate.Seconds()),
+		zap.Float64("workspace_backfill_s", warmup.workspaceBackfill.Seconds()),
+		zap.Float64("watchers_s", warmup.watchers.Seconds()),
+		zap.Float64("resolve_compute_s", warmup.resolveCompute.Seconds()),
+		zap.Float64("resolve_tail_s", warmup.resolveTail.Seconds()),
+		zap.Float64("accounted_s", accounted.Seconds()),
+		zap.Float64("other_s", other.Seconds()),
+		zap.Float64("prelude_s", warmup.prelude.Seconds()),
 		zap.Float64("parse_s", warmup.parse.Seconds()),
 		zap.Float64("resolve_s", warmup.resolve.Seconds()),
 		zap.Float64("enrich_s", warmup.enrich.Seconds()),
