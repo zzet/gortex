@@ -916,23 +916,27 @@ func (s *Server) repoPrefixForCheckout(ctx context.Context, checkout store_sqlit
 	return primary
 }
 
-// refuseRoutedViewMutation blocks a source-mutating tool whose request reads
-// through a routed view.
-//
-// Path resolution follows the view, but nothing else on the write path does:
-// the view is a leased snapshot of generations, and a write beneath it leaves
-// the stack this request read describing content that is no longer there.
-// Refusing is the honest answer until the write path can invalidate the route
-// it wrote through; editing an automatic worktree comes with that.
+// refuseRoutedViewMutation admits only mutations that obtained checkout-local
+// coordination. An inexact fallback is read-only even when it has no routed
+// reader: allowing that case would silently write the primary checkout.
 func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
-	if !view.routed() || !s.facades.mutatesSource(tool) {
+	if !s.facades.mutatesSource(tool) || view == nil {
+		return nil
+	}
+	if view.rider != nil && !view.rider.Exact {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"%s: source edits require an exact live checkout; this request received a read-only fallback. Retry when the selected checkout is ready.",
+			graphview.CodeViewReadOnly))
+	}
+	if !view.routed() || checkoutMutationFromContext(ctx) != nil {
 		return nil
 	}
 	return mcp.NewToolResultError(fmt.Sprintf(
-		"%s: this request reads through %s, and %s would write the canonical checkout instead of that one. "+
-			"Read through the view; edit from the checkout's own working copy.",
-		graphview.CodeViewReadOnly, view.rider.ActualView, tool))
+		"%s: %s has no approved write path for this view. "+
+			"Only file edits, file writes, and symbol edits are supported on an exact live worktree with an active checkout coordinator. "+
+			"Batch operations, refactors, and immutable ref views remain read-only through routed views.",
+		graphview.CodeViewReadOnly, tool))
 }
 
 // attachViewRider puts the view fields on the response, inside the freshness
