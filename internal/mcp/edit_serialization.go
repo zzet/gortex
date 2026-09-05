@@ -45,6 +45,9 @@ type mutationReindexOutcome struct {
 	Generation        uint64
 	AppliedGeneration uint64
 	Err               error
+	// A checkout generation is not reflected in the canonical syntax-health
+	// reader. Do not attach another checkout's parse errors to this result.
+	checkoutScoped bool
 }
 
 type mutationReceipt struct {
@@ -66,6 +69,9 @@ type mutationScheduler interface {
 // context-aware: a cancelled MCP request leaves the queue immediately, which
 // lets its dispatcher goroutine finish and release admission capacity.
 func acquireMutationPath(ctx context.Context, path string) (func(), error) {
+	if err := guardCheckoutMutationPath(ctx, path); err != nil {
+		return nil, err
+	}
 	path = filepath.Clean(path)
 
 	mutationPathLocks.Lock()
@@ -321,6 +327,9 @@ func (s *Server) mutationSafetyWaitDuration() time.Duration {
 // the request path both blocks the response and races the watcher. Embedded
 // servers have no watcher and retain the synchronous freshness contract.
 func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
+	if state := checkoutMutationFromContext(ctx); state != nil {
+		return s.refreshCheckoutMutation(ctx, absPath, state)
+	}
 	if watcher := s.currentWatcher(); watcher != nil {
 		// Admission is path-scoped and authoritative. Scheduling uses a detached
 		// context because the disk commit already happened; client cancellation
@@ -528,7 +537,7 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 		resp["reindex_pending"] = true
 		return
 	}
-	if outcome.Reindexed {
+	if outcome.Reindexed && !outcome.checkoutScoped {
 		if health := s.fileSyntaxHealth(relPath, absPath); health != nil {
 			resp["syntax_health"] = health
 		}

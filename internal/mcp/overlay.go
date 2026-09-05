@@ -168,8 +168,15 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withRequestView(ctx, view)
 			defer view.close()
 		}
-		// A write issued while reading a routed view would land in the
-		// canonical checkout, not the one the answer came from.
+		// Approved source tools serialize with the selected checkout's index
+		// coordinator. The lease does not invalidate or rebuild for dry runs;
+		// the shared disk-commit and reindex helpers perform those steps.
+		mutationCtx, releaseMutation, mutationErr := s.prepareRoutedViewMutation(ctx, &req)
+		if mutationErr != nil {
+			return mutationErr, nil
+		}
+		ctx = mutationCtx
+		defer releaseMutation()
 		if refused := s.refuseRoutedViewMutation(ctx, req.Params.Name); refused != nil {
 			return refused, nil
 		}

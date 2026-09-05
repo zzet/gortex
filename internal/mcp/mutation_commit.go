@@ -484,6 +484,16 @@ func (s *Server) commitFileMutation(
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
 	}
+	if err := prepareCheckoutMutation(ctx, absPath); err != nil {
+		record.markNotApplied(err)
+		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
+	}
+	// Preparing may wait for durable route invalidation. Cancellation during
+	// that wait still guarantees that this handler has not written any bytes.
+	if err := ctx.Err(); err != nil {
+		record.markNotApplied(err)
+		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
+	}
 	if err := agents.AtomicWriteFile(absPath, data, perm); err != nil {
 		record.markFailed(err)
 		return record, err
