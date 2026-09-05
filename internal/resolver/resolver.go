@@ -2502,6 +2502,10 @@ type incrementalFileFrontier struct {
 	outByNode   map[string][]*graph.Edge
 	stubKeys    []string
 	pending     []*graph.Edge
+	// Admissions may overlap between outgoing and incoming frontiers.
+	outgoingPending int
+	outgoingCollect time.Duration
+	incomingCollect time.Duration
 }
 
 func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge {
@@ -2557,6 +2561,7 @@ func collectIncrementalFileFrontierMode(
 		return frontier
 	}
 
+	outgoingStarted := time.Now()
 	frontier.nodesByFile = g.GetFileNodesByPaths(frontier.paths)
 	var nodeIDs []string
 	for _, path := range frontier.paths {
@@ -2602,6 +2607,9 @@ func collectIncrementalFileFrontierMode(
 			}
 		}
 	}
+	frontier.outgoingPending = len(frontier.pending)
+	frontier.outgoingCollect = time.Since(outgoingStarted)
+	incomingStarted := time.Now()
 	// The unresolved target string is the incoming-edge bucket key even when
 	// no node with that ID exists.
 	if lightweightIncoming {
@@ -2629,6 +2637,7 @@ func collectIncrementalFileFrontierMode(
 			}
 		}
 	}
+	frontier.incomingCollect = time.Since(incomingStarted)
 	return frontier
 }
 
@@ -2644,52 +2653,161 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 		return stats
 	}
 	started := time.Now()
+	logger := r.logger.With(zap.Int("input_files", len(filePaths)))
+	var frontier incrementalFileFrontier
+	var lockDuration, visibilityDuration, pendingDuration, indexDuration, warmDuration time.Duration
+	var outgoingDuration, incomingDuration, attributionDuration time.Duration
+	outcome := "interrupted"
+	defer func() {
+		logger.Info("resolver: incremental files phases",
+			zap.String("outcome", outcome),
+			zap.Int("files", len(frontier.paths)),
+			zap.Int("pending", len(frontier.pending)),
+			zap.Int("outgoing_pending", frontier.outgoingPending),
+			zap.Int("incoming_pending", len(frontier.pending)-frontier.outgoingPending),
+			zap.Duration("wait_lock", lockDuration),
+			zap.Duration("visibility", visibilityDuration),
+			zap.Duration("pending_collect", pendingDuration),
+			zap.Duration("outgoing_collect", frontier.outgoingCollect),
+			zap.Duration("incoming_collect", frontier.incomingCollect),
+			zap.Duration("build_indexes", indexDuration),
+			zap.Duration("warm_lookup", warmDuration),
+			zap.Duration("resolve_outgoing", outgoingDuration),
+			zap.Duration("resolve_incoming", incomingDuration),
+			zap.Duration("resolve", outgoingDuration+incomingDuration),
+			zap.Duration("attribution", attributionDuration),
+			zap.Duration("total", time.Since(started)))
+	}()
+	finish := startIncrementalPhase(logger, "wait_lock")
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	lockDuration = finish()
 	// The edited files may have (re)stamped global usings — reconcile the
 	// persistent index instead of paying the workspace rescan per save.
+	finish = startIncrementalPhase(logger, "visibility")
 	r.scopedCSharpVisibilityInvalidate(filePaths)
+	visibilityDuration = finish()
 
-	pendingStarted := time.Now()
-	frontier := r.collectIncrementalFileFrontier(filePaths)
-	pendingDuration := time.Since(pendingStarted)
+	finish = startIncrementalPhase(logger, "pending_collect")
+	frontier = r.collectIncrementalFileFrontier(filePaths)
+	pendingDuration = finish(
+		zap.Int("files", len(frontier.paths)),
+		zap.Int("outgoing_pending", frontier.outgoingPending),
+		zap.Int("incoming_pending", len(frontier.pending)-frontier.outgoingPending),
+		zap.Int("stub_keys", len(frontier.stubKeys)),
+		zap.Duration("outgoing_collect", frontier.outgoingCollect),
+		zap.Duration("incoming_collect", frontier.incomingCollect))
 	if len(frontier.pending) == 0 {
+		outcome = "no_pending"
 		return stats
 	}
-	indexStarted := time.Now()
+	finish = startIncrementalPhase(logger, "build_indexes")
 	clear := r.buildPassIndexesForPending(frontier.pending)
-	indexDuration := time.Since(indexStarted)
+	indexDuration = finish(zap.Int("pending", len(frontier.pending)))
 	defer clear()
-	warmStarted := time.Now()
+	finish = startIncrementalPhase(logger, "warm_lookup")
 	r.warmLookupCache(frontier.pending)
-	warmDuration := time.Since(warmStarted)
+	warmDuration = finish()
 	defer r.clearLookupCache()
+	repos, omittedRepos, omittedAdmissions := incrementalAdmissionSummary(frontier, r.nodeByID)
+	logger.Info("resolver: incremental pending admissions",
+		zap.Any("repositories", repos),
+		zap.Int("repositories_omitted", omittedRepos),
+		zap.Int("admissions_omitted", omittedAdmissions),
+		zap.Int("outgoing_pending", frontier.outgoingPending),
+		zap.Int("incoming_pending", len(frontier.pending)-frontier.outgoingPending))
 
-	resolveStarted := time.Now()
 	// Resolve every changed file from the preloaded frontier, flush once, then
 	// read the incoming restub buckets afresh. The fresh read preserves the
 	// old forward-before-reverse semantics without one query/transaction per
-	// file.
+	// file. Phase durations include each leg's batched graph mutation.
+	finish = startIncrementalPhase(logger, "resolve_outgoing")
 	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats)
+	outgoingDuration = finish(
+		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
+	beforeIncoming := *stats
+	finish = startIncrementalPhase(logger, "resolve_incoming")
 	r.resolveIncomingStubKeysLocked(frontier.stubKeys, stats)
-	resolveDuration := time.Since(resolveStarted)
-	attributionStarted := time.Now()
+	incomingDuration = finish(
+		zap.Int("resolved", stats.Resolved-beforeIncoming.Resolved),
+		zap.Int("unresolved", stats.Unresolved-beforeIncoming.Unresolved),
+		zap.Int("external", stats.External-beforeIncoming.External))
+	finish = startIncrementalPhase(logger, "attribution")
 	r.prepareIncrementalAttributionCache(frontier)
 	r.runFileAttributionPassesForFilesLocked(frontier)
 	r.clearIncrementalAttributionCache()
-	attributionDuration := time.Since(attributionStarted)
-	if elapsed := time.Since(started); elapsed >= time.Second {
-		r.logger.Info("resolver: incremental files phases",
-			zap.Int("files", len(frontier.paths)),
-			zap.Int("pending", len(frontier.pending)),
-			zap.Duration("pending_collect", pendingDuration),
-			zap.Duration("build_indexes", indexDuration),
-			zap.Duration("warm_lookup", warmDuration),
-			zap.Duration("resolve", resolveDuration),
-			zap.Duration("attribution", attributionDuration),
-			zap.Duration("total", elapsed))
-	}
+	attributionDuration = finish()
+	outcome = "complete"
 	return stats
+}
+
+// Keep one bounded summary per pass, never one log record per admitted edge.
+const incrementalRepoLogLimit = 32
+
+type incrementalRepoAdmission struct {
+	Repo     string `json:"repo"`
+	Outgoing int    `json:"outgoing"`
+	Incoming int    `json:"incoming"`
+}
+
+// incrementalAdmissionSummary only inspects the already hydrated frontier and
+// lookup cache. Missing provenance is reported explicitly, never hydrated with
+// an extra store query just for logging. Counts are admissions, not unique
+// edges: one edge may legitimately occur in both the outgoing and incoming legs.
+func incrementalAdmissionSummary(frontier incrementalFileFrontier, sources map[string]*graph.Node) ([]incrementalRepoAdmission, int, int) {
+	byRepo := make(map[string]*incrementalRepoAdmission)
+	for i, edge := range frontier.pending {
+		repo := "(unknown)"
+		if edge != nil {
+			if source := sources[edge.From]; source != nil && source.RepoPrefix != "" {
+				repo = source.RepoPrefix
+			}
+		}
+		counts := byRepo[repo]
+		if counts == nil {
+			counts = &incrementalRepoAdmission{Repo: repo}
+			byRepo[repo] = counts
+		}
+		if i < frontier.outgoingPending {
+			counts.Outgoing++
+		} else {
+			counts.Incoming++
+		}
+	}
+	repos := make([]incrementalRepoAdmission, 0, len(byRepo))
+	for _, counts := range byRepo {
+		repos = append(repos, *counts)
+	}
+	sort.Slice(repos, func(i, j int) bool {
+		left, right := repos[i].Outgoing+repos[i].Incoming, repos[j].Outgoing+repos[j].Incoming
+		if left != right {
+			return left > right
+		}
+		return repos[i].Repo < repos[j].Repo
+	})
+	omittedRepos, omittedAdmissions := 0, 0
+	if len(repos) > incrementalRepoLogLimit {
+		omittedRepos = len(repos) - incrementalRepoLogLimit
+		for _, counts := range repos[incrementalRepoLogLimit:] {
+			omittedAdmissions += counts.Outgoing + counts.Incoming
+		}
+		repos = repos[:incrementalRepoLogLimit]
+	}
+	return repos, omittedRepos, omittedAdmissions
+}
+
+// A start event leaves the active operation visible even if it blocks or never
+// returns. Durations use the monotonic component of time.Now, not wall-clock
+// subtraction or sleeps.
+func startIncrementalPhase(logger *zap.Logger, phase string) func(...zap.Field) time.Duration {
+	started := time.Now()
+	logger.Info("resolver: incremental phase starting", zap.String("phase", phase))
+	return func(fields ...zap.Field) time.Duration {
+		elapsed := time.Since(started)
+		fields = append(fields, zap.String("phase", phase), zap.Duration("elapsed", elapsed))
+		logger.Info("resolver: incremental phase complete", fields...)
+		return elapsed
+	}
 }
 
 // resolveFileLocked is the forward-pass core. Caller holds r.mu and
