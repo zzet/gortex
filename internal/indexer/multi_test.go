@@ -78,7 +78,7 @@ func TestReconcilePhaseTimingOutcomes(t *testing.T) {
 }
 
 func TestReconcileCensusTiming(t *testing.T) {
-	for _, mode := range []string{"clean", "changed", "missing"} {
+	for _, mode := range []string{"clean", "changed", "missing", "panic"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := setupRepoDir(t, "census")
 			core, logs := observer.New(zap.InfoLevel)
@@ -94,6 +94,20 @@ func TestReconcileCensusTiming(t *testing.T) {
 			idx.SetFileMtimes(map[string]int64{"main.go": mtime})
 			if mode == "missing" {
 				dir = filepath.Join(dir, "missing")
+			}
+			if mode == "panic" {
+				// Inject a parser lookup panic; the telemetry must not claim a
+				// successful no-op merely because the named error is still nil.
+				registry := idx.registry
+				idx.registry = nil
+				defer func() { idx.registry = registry }()
+				require.Panics(t, func() { _, _, _, _ = idx.changedSinceMtimesCensus(dir) })
+				entries := logs.FilterMessage("indexer: reconcile phase complete").All()
+				require.Len(t, entries, 1)
+				fields := entries[0].ContextMap()
+				require.Equal(t, "aborted", fields["outcome"])
+				require.NotContains(t, fields, "no_changes")
+				return
 			}
 			changed, deleted, detected, err := idx.changedSinceMtimesCensus(dir)
 			if mode == "missing" {

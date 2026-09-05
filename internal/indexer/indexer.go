@@ -9117,13 +9117,19 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 	err error,
 ) {
 	timing := startReconcilePhase(idx.logger, idx.repoPrefix, "census")
+	returned := false
 	defer func() {
+		if !returned {
+			timing.abort()
+			return
+		}
 		timing.complete(err, zap.Int("detected_files", detected),
 			zap.Int("changed_files", len(changed)), zap.Int("deleted_files", len(deleted)),
 			zap.Bool("no_changes", err == nil && len(changed) == 0 && len(deleted) == 0))
 	}()
 	absRoot, absErr := filepath.Abs(root)
 	if absErr != nil {
+		returned = true
 		return nil, nil, 0, absErr
 	}
 	idx.storeRootPath(absRoot)
@@ -9157,6 +9163,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		return nil
 	})
 	if walkErr != nil {
+		returned = true
 		return nil, nil, 0, walkErr
 	}
 
@@ -9187,6 +9194,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 			deleted = append(deleted, rel)
 		}
 	}
+	returned = true
 	return changed, deleted, len(diskFiles), nil
 }
 

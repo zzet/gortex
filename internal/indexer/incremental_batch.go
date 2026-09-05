@@ -335,6 +335,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			zap.Int("files", len(fallbacks)))
 		defer fallbackTiming.abort()
 	}
+	failedBeforeFallback := len(failed)
 	for _, fallback := range fallbacks {
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
 			idx.noteFileIndexFailure(fallback.filePath, err)
@@ -349,7 +350,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 		reparsed = append(reparsed, fallback.filePath)
 	}
 	if fallbackTiming != nil {
-		fallbackTiming.complete(nil, zap.Int("failed_files", len(failed)))
+		// Prior read/receipt failures belong to earlier phases, not fallback.
+		fallbackTiming.complete(nil, zap.Int("failed_files", len(failed)-failedBeforeFallback))
 	}
 	for _, stage := range stages {
 		if _, fresh := freshSet[stage.absPath]; fresh && !stage.metadataOnly {
