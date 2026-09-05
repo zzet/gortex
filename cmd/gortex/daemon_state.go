@@ -929,6 +929,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		// and cross-repo passes starved cross-repo to a standstill
 		// (measured: 1,049s for a pass that runs in ~38s uncontended). The
 		// gate opens right after this call returns.
+		var lspBefore lsp.RouterTimingStats
+		if state.lspRouter != nil {
+			lspBefore = state.lspRouter.TimingStats()
+		}
 		resolveTimer := newWarmupResolveTimer(logger)
 		timedReady := resolveTimer.ready(markReady)
 		var resolveErr error
@@ -938,6 +942,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			resolveErr = state.multiIndexer.RunPreEnrichResolve(ctx, resolveScope, timedReady)
 		}
 		timings.resolveCompute, timings.resolveTail = resolveTimer.finish(resolveErr)
+		if state.lspRouter != nil {
+			// Router counters are global: concurrent queries or opt-in enrichment
+			// overlap may contribute. Summed operation durations are not wall time.
+			logger.Info("daemon: resolver LSP timing",
+				zap.String("phase", "pre_enrich_resolve"),
+				zap.String("scope", "router_global_delta"),
+				zap.Any("timing", state.lspRouter.TimingStats().Sub(lspBefore)))
+		}
 		if resolveErr != nil {
 			resolveOK = false
 			exactWarmDelta = false
