@@ -581,10 +581,30 @@ func (mi *MultiIndexer) RunDeferredPassesAllResult(ctx context.Context) Deferred
 // repeating the whole-graph cross-repository resolver. The receipt-guided tail
 // already performs either exact cross-repository catch-up or a fail-closed full
 // pass; only contract-bridge reconciliation remains afterward.
-func (mi *MultiIndexer) finishColdDeferredPasses(ctx context.Context) DeferredPassesResult {
-	result := mi.RunDeferredPassesAllResult(ctx)
+func (mi *MultiIndexer) finishColdDeferredPasses(ctx context.Context, completedIndexers []*Indexer) DeferredPassesResult {
+	result := mi.beginDeferredPasses(ctx, nil, completedIndexers, true).FinishTailResult()
 	mi.ReconcileContractEdges()
 	return result
+}
+
+// current requires this Indexer's repository mutation lane to be held.
+func (a *deferredPassAttempt) current() bool {
+	return a.indexer.deferredAttempt == a && a.indexer.pendingContractReg == a.registry
+}
+
+// lanesHeld is valid only for the explicit completed cold cohort whose
+// repository lanes the caller already holds, never the global registered set.
+func (mi *MultiIndexer) withDeferredRepositoryMutation(idx *Indexer, lanesHeld bool, fn func()) error {
+	if lanesHeld {
+		fn()
+		return nil
+	}
+	// BeginDeferredPasses previously ignored its context. Do not introduce
+	// cancellation of an admitted pipeline as an incidental ownership change.
+	return idx.coordinateRepositoryMutation(context.Background(), func() error {
+		fn()
+		return nil
+	})
 }
 
 // DeferredPassesRun is one in-flight execution of the deferred pass pipeline,
@@ -597,6 +617,9 @@ func (mi *MultiIndexer) finishColdDeferredPasses(ctx context.Context) DeferredPa
 type DeferredPassesRun struct {
 	mi              *MultiIndexer
 	workIndexers    []*Indexer
+	attempts        []*deferredPassAttempt
+	lanesHeld       bool
+	attemptAborted  bool
 	enrichScheduled int
 	catchupNeeded   bool
 	catchupKnown    bool
@@ -653,63 +676,64 @@ func (r *DeferredPassesRun) BeginApplyMutationReceipt() {
 // Without an apply gate the receipt opens here. With overlap, delaying it until
 // the apply boundary excludes resolver writes while still observing every
 // semantic apply and contract commit, preserving an exact file frontier.
-func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan struct{}) *DeferredPassesRun {
+func (mi *MultiIndexer) BeginDeferredPasses(ctx context.Context, applyGate <-chan struct{}) *DeferredPassesRun {
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
 		indexers = append(indexers, idx)
 	}
 	mi.mu.RUnlock()
+	return mi.beginDeferredPasses(ctx, applyGate, indexers, false)
+}
+
+// The lanes-held route receives only completed cold indexers already covered
+// by the caller's mutation lanes; the public route coordinates each indexer.
+func (mi *MultiIndexer) beginDeferredPasses(_ context.Context, applyGate <-chan struct{}, indexers []*Indexer, lanesHeld bool) *DeferredPassesRun {
+	indexers = append([]*Indexer(nil), indexers...)
 	sort.Slice(indexers, func(i, j int) bool {
 		return indexers[i].repoPrefix < indexers[j].repoPrefix
 	})
 	forced := os.Getenv("GORTEX_WARMUP_FORCE_ENRICH") == "1"
+	// Catch-up scope is compared with the complete registered universe,
+	// independently of the explicit cold cohort admitted as work below.
+	mi.mu.RLock()
+	repoCount := len(mi.indexers)
+	mi.mu.RUnlock()
 	run := &DeferredPassesRun{
-		mi:           mi,
-		catchupKnown: true,
-		catchupScope: make(map[string]struct{}),
-		indexerCount: len(indexers),
-		poolDone:     make(chan struct{}),
-		// The deferred phase is the second half of the same allocation burst
-		// IndexCtx tunes for — go/packages closures, tree-sitter parses, and
-		// the catch-up resolve — but it runs OUTSIDE any IndexCtx window, so
-		// on a daemon with a default standing limit it was paced against the
-		// lean steady-state ceiling. Hold one ref-counted tuning window
-		// across the whole span (pool + contracts + catch-up resolve);
-		// FinishTail restores the standing knobs exactly.
+		mi:            mi,
+		lanesHeld:     lanesHeld,
+		catchupKnown:  true,
+		catchupScope:  make(map[string]struct{}),
+		indexerCount:  repoCount,
+		poolDone:      make(chan struct{}),
 		restoreGCTune: applyIndexGCTuning(mi.logger),
 	}
 	for _, idx := range indexers {
-		enrich := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() &&
-			(idx.pendingEnrich.Load() || forced)
-		if enrich {
-			run.enrichScheduled++
+		err := mi.withDeferredRepositoryMutation(idx, lanesHeld, func() {
+			enrich := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders() &&
+				(idx.pendingEnrich.Load() || forced)
+			if !enrich && idx.pendingContractReg == nil {
+				return
+			}
+			attempt := &deferredPassAttempt{indexer: idx, registry: idx.pendingContractReg, enrich: enrich}
+			idx.deferredAttempt = attempt
+			idx.SetSkipResolveInDeferred(true)
+			idx.deferredApplyGate = applyGate
+			run.attempts = append(run.attempts, attempt)
+			run.catchupNeeded = true
+			if idx.repoPrefix == "" {
+				run.catchupKnown = false
+			} else {
+				run.catchupScope[idx.repoPrefix] = struct{}{}
+			}
+		})
+		if err != nil {
+			run.attemptAborted = true
+			mi.logger.Warn("deferred attempt admission failed", zap.String("repo", idx.repoPrefix), zap.Error(err))
 		}
-		// Only repositories with actual deferred work enter the language-stats,
-		// enrichment, contract, and retained-state pipeline. This keeps a warm or
-		// partial restart proportional to its changed repositories.
-		if !enrich && idx.pendingContractReg == nil {
-			continue
-		}
-		run.workIndexers = append(run.workIndexers, idx)
-		run.catchupNeeded = true
-		if idx.repoPrefix == "" {
-			run.catchupKnown = false
-			continue
-		}
-		run.catchupScope[idx.repoPrefix] = struct{}{}
-	}
-	for _, idx := range run.workIndexers {
-		idx.SetSkipResolveInDeferred(true)
-		idx.deferredApplyGate = applyGate
 	}
 
-	// Keep the receipt window exact: only go.mod materialisation, semantic
-	// enrichment, and contract commits are observed. Without an apply gate the
-	// deferred pipeline starts after base resolution, so the window may open
-	// now and include go.mod work. With overlap, warmup opens it later — after
-	// pre-enrichment resolution and immediately before releasing parked applies.
-	// Unsupported stores retain the conservative scheduled-work fallback.
+	// Preserve the existing observational receipt order before GoMod mutations.
 	run.receiptStore, _ = mi.graph.(graph.MutationReceiptStore)
 	run.unresolvedCounter, _ = mi.graph.(graph.UnresolvedInsertionCounter)
 	if applyGate == nil {
@@ -718,12 +742,30 @@ func (mi *MultiIndexer) BeginDeferredPasses(_ context.Context, applyGate <-chan 
 		run.SnapshotUnresolvedBase()
 	}
 
-	// Per-repo deferred work starts with serial go.mod materialisation.
-	// Semantic enrichment then runs in bounded parallel lanes on its own
-	// goroutine so the caller may overlap it with the resolve phase.
-	for _, idx := range run.workIndexers {
-		idx.runDeferredGoMod()
+	started := make([]*deferredPassAttempt, 0, len(run.attempts))
+	for _, attempt := range run.attempts {
+		owned := false
+		err := mi.withDeferredRepositoryMutation(attempt.indexer, lanesHeld, func() {
+			if !attempt.current() {
+				return
+			}
+			attempt.indexer.runDeferredGoMod()
+			owned = true
+		})
+		if err != nil {
+			mi.logger.Warn("deferred dependency admission failed", zap.String("repo", attempt.indexer.repoPrefix), zap.Error(err))
+		}
+		if !owned {
+			run.attemptAborted = true
+			continue
+		}
+		started = append(started, attempt)
+		run.workIndexers = append(run.workIndexers, attempt.indexer)
+		if attempt.enrich {
+			run.enrichScheduled++
+		}
 	}
+	run.attempts = started
 	go func() {
 		defer close(run.poolDone)
 		mi.runDeferredEnrichPool(run.workIndexers)
@@ -738,28 +780,20 @@ func (r *DeferredPassesRun) Wait() { <-r.poolDone }
 // the receipt window, and performs the deferred-mutation catch-up resolve.
 func (r *DeferredPassesRun) FinishTailResult() DeferredPassesResult {
 	r.Wait()
-	// Contract passes run serially only after every enrichment lane has
-	// drained: the "no contract mutation overlaps enrichment" invariant
-	// holds globally instead of per batch, and each repo's retained
-	// compiler state is the compact binding projection, which stays
-	// cheap to hold until its pass releases it here.
-	for _, idx := range r.workIndexers {
-		idx.runDeferredContractsAndReleaseSemanticState()
-	}
+	// This run's enrichment lanes have drained. Complete only its still-owned
+	// attempts; an older run must not consume or certify a newer registry.
+	r.finishOwnedContractTails()
 	var mutationReceipt *graph.MutationReceipt
 	if r.receiptStore != nil && r.receiptOpen {
 		receipt := r.receiptStore.EndMutationReceipt(r.receiptToken)
 		mutationReceipt = &receipt
 		r.receiptOpen = false
 	}
-	for _, idx := range r.workIndexers {
-		idx.SetSkipResolveInDeferred(false)
-		idx.deferredApplyGate = nil
-	}
 	scope := normalizeDeferredCatchupScope(r.catchupScope, r.catchupKnown, r.indexerCount)
 	noNewUnresolved := r.unresolvedCounter != nil &&
 		r.unresolvedCounter.UnresolvedEdgeInsertions() == r.unresolvedBase
 	mode, crossRepoComplete := r.mi.resolveDeferredMutations(mutationReceipt, r.catchupNeeded, scope, noNewUnresolved)
+	crossRepoComplete = crossRepoComplete && !r.attemptAborted
 	var mutationRevision uint64
 	var mutationRevisionKnown bool
 	if crossRepoComplete {
@@ -774,6 +808,30 @@ func (r *DeferredPassesRun) FinishTailResult() DeferredPassesResult {
 		CrossRepoComplete:              crossRepoComplete,
 		CrossRepoMutationRevision:      mutationRevision,
 		CrossRepoMutationRevisionKnown: mutationRevisionKnown,
+	}
+}
+
+func (r *DeferredPassesRun) finishOwnedContractTails() {
+	for _, attempt := range r.attempts {
+		owned := false
+		err := r.mi.withDeferredRepositoryMutation(attempt.indexer, r.lanesHeld, func() {
+			if !attempt.current() {
+				return
+			}
+			idx := attempt.indexer
+			idx.runDeferredContractsAndReleaseSemanticState()
+			r.mi.refreshColdCensusMetadata(idx)
+			idx.SetSkipResolveInDeferred(false)
+			idx.deferredApplyGate = nil
+			idx.deferredAttempt = nil
+			owned = true
+		})
+		if err != nil {
+			r.mi.logger.Warn("deferred contract admission failed", zap.String("repo", attempt.indexer.repoPrefix), zap.Error(err))
+		}
+		if !owned {
+			r.attemptAborted = true
+		}
 	}
 }
 
@@ -2248,7 +2306,11 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			if err := mi.RunPreEnrichResolve(deferCtx, nil, nil); err != nil {
 				return results, fmt.Errorf("multi-repo pre-enrichment resolve: %w", err)
 			}
-			deferredResult := mi.finishColdDeferredPasses(deferCtx)
+			completedIndexers := make([]*Indexer, 0, len(completed))
+			for _, rr := range completed {
+				completedIndexers = append(completedIndexers, rr.idx)
+			}
+			deferredResult := mi.finishColdDeferredPasses(deferCtx, completedIndexers)
 			mi.logger.Info("multi-repo coordinated deferred passes complete",
 				zap.Int("repos_indexed", len(results)),
 				zap.Int("repos_failed", len(indexErrors)),

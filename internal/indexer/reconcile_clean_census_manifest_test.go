@@ -1,8 +1,10 @@
 package indexer
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,7 +34,14 @@ func TestReconcileRepoCtxRoutesManifestOnlyChurnScopedAndConverges(t *testing.T)
 	require.NoError(t, err)
 	prior := seed.GetIndexer("repo").FileMtimes()
 	_, manifestTrackedByFullIndex := prior["go.mod"]
-	assert.False(t, manifestTrackedByFullIndex)
+	require.True(t, manifestTrackedByFullIndex)
+
+	// Create real manifest-only churn. A completed cold index now records
+	// its successful manifest receipt, so an unchanged restart is a no-op.
+	manifestPath := filepath.Join(root, "go.mod")
+	writeFile(t, manifestPath, "module example.com/sample\nrequire example.com/dependency v1.0.0\n")
+	changedAt := time.Unix(0, prior["go.mod"]).Add(time.Second)
+	require.NoError(t, os.Chtimes(manifestPath, changedAt, changedAt))
 
 	core, logs := observer.New(zap.DebugLevel)
 	firstRestart := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.New(core))
@@ -40,6 +49,7 @@ func TestReconcileRepoCtxRoutesManifestOnlyChurnScopedAndConverges(t *testing.T)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.FullRetrack)
+	assert.Equal(t, 1, result.StaleFileCount)
 	entries := logs.FilterMessage("daemon: reconciled repo from snapshot").All()
 	require.Len(t, entries, 1)
 	assert.Equal(t, "scoped", entries[0].ContextMap()["route"])
@@ -53,6 +63,7 @@ func TestReconcileRepoCtxRoutesManifestOnlyChurnScopedAndConverges(t *testing.T)
 	result, err = secondRestart.ReconcileRepoCtx(t.Context(), entry, convergedMtimes)
 	require.NoError(t, err)
 	require.NotNil(t, result)
+	assert.Zero(t, result.StaleFileCount)
 	entries = logs.FilterMessage("daemon: reconciled repo from snapshot").All()
 	require.Len(t, entries, 1)
 	assert.Equal(t, "census_noop", entries[0].ContextMap()["route"])

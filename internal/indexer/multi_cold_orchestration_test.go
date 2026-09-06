@@ -98,7 +98,7 @@ func TestFinishColdDeferredPassesDoesNotRepeatFullCrossRepoResolve(t *testing.T)
 	store := &coldOrchestrationProbeStore{Graph: graph.New()}
 	mi := newColdOrchestrationMulti(store, zap.NewNop())
 
-	result := mi.finishColdDeferredPasses(t.Context())
+	result := mi.finishColdDeferredPasses(t.Context(), nil)
 
 	assert.True(t, result.ExactCrossRepoComplete)
 	assert.Zero(t, store.unresolvedScans.Load(),
