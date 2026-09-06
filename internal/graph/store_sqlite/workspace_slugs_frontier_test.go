@@ -105,7 +105,7 @@ func TestWorkspaceSlugFrontierIsGenerationScopedAndIndexed(t *testing.T) {
 	query, args := workspaceSlugCandidates(0, slugs)
 	tx, err = s.beginWrite()
 	require.NoError(t, err)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.Query("EXPLAIN QUERY PLAN "+query, args...)
 	require.NoError(t, err)
 	var plan []string
@@ -126,7 +126,7 @@ func workspaceFrontierHasCandidates(t *testing.T, s *Store, generation int64, sl
 	t.Helper()
 	tx, err := s.beginWrite()
 	require.NoError(t, err)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	query, args := workspaceSlugCandidates(generation, slugs)
 	var found bool
 	require.NoError(t, tx.QueryRow(query, args...).Scan(&found))
@@ -192,7 +192,7 @@ func BenchmarkWorkspaceSlugNoopBackfill(b *testing.B) {
 				if err != nil {
 					return err
 				}
-				defer tx.Rollback()
+				defer func() { _ = tx.Rollback() }()
 				impactQuery, impactArgs := workspaceSlugResolutionImpact(0, slugs)
 				updateQuery, updateArgs := workspaceSlugUpdate(0, slugs)
 				var affected int
