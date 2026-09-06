@@ -240,12 +240,15 @@ func TestObserveCheckoutPathSlowInventoryMakesProgressAcrossRetries(t *testing.T
 	if elapsed := time.Since(started); elapsed < 200*time.Millisecond || elapsed > time.Second {
 		t.Fatalf("unexpected discovery wait: %s", elapsed)
 	}
+	firstJob := checkoutObservationJobForTest(lc, worktree)
 	checkout, found, err := observeCheckoutUntilSettled(t, lc, worktree)
 	if err != nil || !found || checkout.FamilyID != familyID {
 		t.Fatalf("retry did not finish continuing discovery: %+v found=%v err=%v", checkout, found, err)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("retry restarted slow inventory %d times", got)
+		currentJob := checkoutObservationJobForTest(lc, worktree)
+		t.Fatalf("retry restarted slow inventory %d times; first_job=%p {%s}; current_job=%p {%s}",
+			got, firstJob, checkoutObservationJobStateForTest(firstJob), currentJob, checkoutObservationJobStateForTest(currentJob))
 	}
 	rows, err := catalog.ListCheckouts(t.Context(), familyID)
 	if err != nil || len(rows) != 2 {
@@ -468,6 +471,129 @@ func TestObserveCheckoutPathRejectsBindingChangesWhileProofIsPending(t *testing.
 			rows, err := catalog.ListCheckouts(t.Context(), familyID)
 			if err != nil || len(rows) != 1 {
 				t.Fatalf("invalid proof allocated checkout: %+v %v", rows, err)
+			}
+		})
+	}
+}
+
+func checkoutObservationJobForTest(lc *CheckoutLifecycle, path string) *checkoutObservationJob {
+	lc.observationMu.Lock()
+	defer lc.observationMu.Unlock()
+	return lc.observationJobs[pathkey.CanonicalExistingRoot(path)]
+}
+
+func checkoutObservationJobStateForTest(job *checkoutObservationJob) string {
+	if job == nil {
+		return "not registered"
+	}
+	proof, result := "pending", "pending"
+	select {
+	case <-job.proofReady:
+		proof = fmt.Sprintf("error=%v", job.proofErr)
+	default:
+	}
+	select {
+	case <-job.done:
+		result = fmt.Sprintf("found=%v error=%v", job.found, job.err)
+	default:
+	}
+	return fmt.Sprintf("context=%v proof={%s} result={%s}", job.ctx.Err(), proof, result)
+}
+
+func completedCheckoutObservationForTest(t *testing.T) (*CheckoutLifecycle, *checkoutObservationJob, string, *atomic.Int32) {
+	t.Helper()
+	lc, _, primary, _, _, _ := newCheckoutObservationFixture(t)
+	worktree := filepath.Join(filepath.Dir(primary), "completed")
+	builderGit(t, primary, "worktree", "add", "-b", "completed", worktree)
+	calls := &atomic.Int32{}
+	lc.observationInventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
+		calls.Add(1)
+		return gitstate.Inventory(ctx, path)
+	}
+	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-job.proofReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("observation proof did not finish")
+	}
+	if job.proofErr != nil || job.proof == nil {
+		t.Fatalf("observation proof failed: %v", job.proofErr)
+	}
+	// This fixture is an authorized own-CWD observation, without a foreground
+	// timeout race during setup. The retry below exercises the public method.
+	job.authorizeOnce.Do(func() { close(job.authorized) })
+	select {
+	case <-job.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("authorized observation did not finish")
+	}
+	if job.err != nil || !job.found {
+		t.Fatalf("authorized observation failed: found=%v err=%v", job.found, job.err)
+	}
+	return lc, job, worktree, calls
+}
+
+func TestObserveCheckoutPathValidationFailuresPreserveCompletedJob(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"caller_deadline", context.DeadlineExceeded},
+		{"caller_canceled", context.Canceled},
+		{"catalog_busy", fmt.Errorf("catalog read: %w", ErrCheckoutMutationBusy)},
+		{"catalog_failure", errors.New("catalog read failed")},
+		{"primary_unavailable", fmt.Errorf("known family has no primary: %w", ErrCheckoutNotTracked)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lc, job, worktree, calls := completedCheckoutObservationForTest(t)
+			// The production foreground validation branch returns this error:
+			// retaining reusable work must never turn a refusal into success.
+			if got := job.invalidateStaleProof(tc.err); got != tc.err {
+				t.Fatalf("validation error was not preserved: got=%v want=%v", got, tc.err)
+			}
+			if err := job.ctx.Err(); err != nil {
+				t.Fatalf("reader failure canceled valid shared discovery: %v", err)
+			}
+			if current := checkoutObservationJobForTest(lc, worktree); current != job {
+				t.Fatal("reader failure discarded the completed shared job")
+			}
+			checkout, found, err := observeCheckoutUntilSettled(t, lc, worktree)
+			if err != nil || !found || checkout.CheckoutID != job.checkout.CheckoutID {
+				t.Fatalf("later reader did not reuse validated completion: %+v found=%v err=%v", checkout, found, err)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("later reader restarted Inventory %d times", got)
+			}
+		})
+	}
+}
+
+func TestObserveCheckoutPathStaleValidationStillInvalidatesCompletedJob(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"stale", ErrCheckoutMutationStale},
+		{"wrapped_stale", fmt.Errorf("cached physical proof: %w", ErrCheckoutMutationStale)},
+		{"stale_and_deadline", errors.Join(context.DeadlineExceeded, ErrCheckoutMutationStale)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lc, job, worktree, _ := completedCheckoutObservationForTest(t)
+			if got := job.invalidateStaleProof(tc.err); got != tc.err {
+				t.Fatalf("stale validation error was not preserved: %v", got)
+			}
+			if !errors.Is(job.ctx.Err(), context.Canceled) {
+				t.Fatal("positively stale proof remained live")
+			}
+			deadline := time.Now().Add(time.Second)
+			for checkoutObservationJobForTest(lc, worktree) == job && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if checkoutObservationJobForTest(lc, worktree) == job {
+				t.Fatal("invalidated proof did not drain from discovery registry")
 			}
 		})
 	}

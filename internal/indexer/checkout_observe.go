@@ -124,8 +124,7 @@ func (l *CheckoutLifecycle) ObserveCheckoutPath(ctx context.Context, path string
 	// Cached completion is not permanent authority: deletion, replacement and
 	// primary changes invalidate the proof before any identity is returned.
 	if err := l.validateCheckoutObservation(ctx, job.proof); err != nil {
-		job.cancel()
-		return checkout, false, err
+		return checkout, false, job.invalidateStaleProof(err)
 	}
 	checkout, found, err = l.catalog.GetCheckout(ctx, job.checkout.CheckoutID)
 	if err != nil || !found {
@@ -135,6 +134,17 @@ func (l *CheckoutLifecycle) ObserveCheckoutPath(ctx context.Context, path string
 		return store_sqlite.Checkout{}, false, ErrCheckoutMutationStale
 	}
 	return checkout, true, nil
+}
+
+func (job *checkoutObservationJob) invalidateStaleProof(err error) error {
+	// Reader timeouts and catalog failures refuse that request, but do not
+	// prove the shared identity stale. Leave its bounded completion available
+	// for another caller to reauthorize and revalidate; only positive identity
+	// invalidation discards it.
+	if errors.Is(err, ErrCheckoutMutationStale) {
+		job.cancel()
+	}
+	return err
 }
 
 func (l *CheckoutLifecycle) checkoutObservation(path string) (*checkoutObservationJob, error) {

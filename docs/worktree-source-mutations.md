@@ -290,3 +290,49 @@ three runs, about 21.6 KB and 288 allocations per operation. Each run performed
 one inventory across 1,873–2,390 requests, demonstrating coalesced reuse without
 skipping physical-binding checks. This benchmark passes no authorizer callback;
 per-caller authorization is covered separately by denied-caller regressions.
+
+### Reader failures must not invalidate shared discovery
+
+The macOS race/coverage job for PR #759 observed a second inventory in the
+slow-discovery retry test before the shared job's five-second lifetime elapsed.
+Review exposed a foreground lifetime bug: final proof validation unconditionally
+canceled the lifecycle-owned completed job on any error, including a reader's
+expired context or a transient catalog read failure. The next reader could then
+start the expensive inventory again.
+
+Only a positive `ErrCheckoutMutationStale` classification, including wrapped or
+joined errors, may invalidate shared discovery after foreground validation.
+Other errors still refuse that request; they do not confer authority or return a
+checkout. A later reader must independently reauthorize and revalidate the proof
+before reusing the completed job. Expiry, shutdown, the five-second lifetime, and
+the 32-active-job limit are unchanged. Background discovery errors retain their
+existing behavior; this fix introduces no automatic background retry policy.
+
+A deterministic regression supplies deadline, cancellation, busy-catalog,
+generic-catalog, and unavailable-primary errors to the foreground invalidation
+policy. All five cases failed with unconditional cancellation and pass with the
+fix: the same shared job survives, a subsequent public observation succeeds, and
+inventory runs once. Bare, wrapped, and joined stale errors still cancel and drain
+the job. Existing root and Git-binding replacement tests remain in force.
+
+The original CI timing failure did not reproduce in 20 local race/coverage runs;
+its exact cause is therefore not conclusively established by the log alone.
+Background apply errors are another possible reason for a second inventory. The
+original single-inventory assertion and deadlines remain unchanged, with
+channel-synchronized diagnostics added for the first and current job's context,
+proof error, and terminal result if it fails again.
+
+Validation on macOS/arm64 passed the full indexer race/coverage suite in
+928.991 seconds (85.3% statement coverage), the routed/worktree/checkout MCP
+selection repeated three times under the race detector in 747.665 seconds
+(744 passing test/subtest executions), the indexer build, and lint with zero
+issues. The initial three-repeat MCP command exhausted a five-minute total suite
+budget while advancing through tests; the completed run used a fifteen-minute
+suite budget. No individual test deadlines or assertions were relaxed.
+
+Three cached-proof benchmark runs measured 138,269, 137,244, and 143,127 ns/op,
+with 21,678, 21,644, and 21,631 B/op respectively, and 288 allocations per request.
+Each run performed one inventory across 2,388, 2,496, and 2,684 requests
+respectively. These are reuse measurements, not a claimed speedup: the successful
+validation path is unchanged. As above, this benchmark has no authorizer callback;
+authorization behavior is validated by separate regressions.
