@@ -184,7 +184,14 @@ type checkoutRefreshTestCodedError int
 func (e checkoutRefreshTestCodedError) Error() string { return "injected SQLite error" }
 func (e checkoutRefreshTestCodedError) Code() int     { return int(e) }
 
+type checkoutRefreshTestCommittedError struct{ checkoutRefreshTestCodedError }
+
+func (checkoutRefreshTestCommittedError) Committed() bool { return true }
+
 func TestCheckoutRefreshDoesNotRetryPermanentSQLiteFailures(t *testing.T) {
+	if retryableCheckoutRefreshError(fmt.Errorf("committed: %w", checkoutRefreshTestCommittedError{checkoutRefreshTestCodedError(5)})) {
+		t.Fatal("committed storage error was retried")
+	}
 	for _, code := range []int{1, 7, 10, 13, 19} {
 		if retryableCheckoutRefreshError(fmt.Errorf("storage: %w", checkoutRefreshTestCodedError(code))) {
 			t.Fatalf("permanent SQLite failure %d was retried", code)

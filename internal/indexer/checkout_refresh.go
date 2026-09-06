@@ -401,6 +401,10 @@ func (c *CheckoutCoordinator) failCheckoutRefreshRequests(requests []*checkoutRe
 }
 
 func retryableCheckoutRefreshError(err error) bool {
+	var committed interface{ Committed() bool }
+	if errors.As(err, &committed) && committed.Committed() {
+		return false
+	}
 	if retryableMutationError(err) || errors.Is(err, ErrViewBuildQueueFull) {
 		return true
 	}
