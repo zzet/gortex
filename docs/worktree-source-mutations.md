@@ -208,3 +208,28 @@ The real Git-diff benchmark remained dominated by subprocess time (medians
 
 Compile-only checks do not execute the constructor guard. Validation must run
 `go test ./internal/graph` as well as the affected analysis and MCP tests.
+
+### Windows physical-root identity
+
+Windows CI exposed a real replacement-check failure: `os.Stat` can defer file-ID
+lookup until `os.SameFile`, reopening a pathname after another directory has
+replaced it. Mutation admission and refresh tickets must capture identity before
+waiting, not when comparing later. On Windows, identity now comes from an open
+directory handle's `File.Stat`; that handle is closed immediately. Non-Windows
+platforms retain their eager `os.Stat` path. Rooted hashing also compares identity
+obtained from its opened root, not a lazily resolved pathname. See Go's
+[Windows file identity implementation](https://go.dev/src/os/types_windows.go)
+and [handle-based stat implementation](https://go.dev/src/os/stat_windows.go).
+
+The regression captures identity, renames the original, recreates its pathname,
+and only then compares identities. It must reject the replacement while still
+recognizing the renamed original. This ordering matters: an earlier `SameFile`
+call would hide the Windows bug by populating its lazy ID. Missing roots and
+regular files fail closed, and no persistent directory lock is introduced.
+
+Local mutation/refresh/root race tests passed, as did Windows cross-compilation
+of the standalone identity helper and tests. Windows execution remains a CI
+check, not a claim based on Darwin tests. Three Darwin benchmark runs measured
+2.139–2.527 microseconds for pathname stat and 1.904–2.030 microseconds for the
+final capture helper, both 304 bytes and two allocations per call. These results
+show no material non-Windows overhead; they do not measure Windows performance.

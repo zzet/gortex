@@ -66,7 +66,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	if !found || !sameMutationRoot(checkout.RootPath, expectedRoot) {
 		return nil, fmt.Errorf("%w: checkout root changed", ErrCheckoutMutationStale)
 	}
-	rootInfo, err := os.Stat(checkout.RootPath)
+	rootInfo, err := checkoutRootFileInfo(checkout.RootPath)
 	if err != nil || !rootInfo.IsDir() {
 		return nil, fmt.Errorf("%w: checkout root is unavailable", ErrCheckoutMutationStale)
 	}
@@ -237,7 +237,7 @@ func (m *CheckoutMutation) validateCheckout(ctx context.Context) error {
 	if !found || checkout.Incarnation != m.checkout.Incarnation || checkout.State != store_sqlite.CheckoutStateReady || checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic || checkout.DesiredMode != store_sqlite.CheckoutModeAutomatic || checkout.ActiveIntentTransitionID != "" || checkout.UnavailableSince != 0 || checkout.RemovalDetectedAt != 0 || !sameMutationRoot(checkout.RootPath, m.checkout.RootPath) {
 		return fmt.Errorf("%w: checkout identity or availability changed", ErrCheckoutMutationStale)
 	}
-	info, err := os.Stat(checkout.RootPath)
+	info, err := checkoutRootFileInfo(checkout.RootPath)
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("%w: checkout root is unavailable", ErrCheckoutMutationStale)
 	}

@@ -378,7 +378,7 @@ func TestCheckoutRefreshOperationalStoragePanicFailsTicketOnly(t *testing.T) {
 
 func TestCheckoutRefreshHashRejectsOutsideAndReplacedPhysicalRoot(t *testing.T) {
 	f, _, _ := newCheckoutMutationFixture(t)
-	rootInfo, err := os.Stat(f.worktree)
+	rootInfo, err := checkoutRootFileInfo(f.worktree)
 	if err != nil {
 		t.Fatal(err)
 	}

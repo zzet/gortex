@@ -119,7 +119,7 @@ func (l *CheckoutLifecycle) RequestCheckoutRefresh(ctx context.Context, checkout
 	if !found || !sameMutationRoot(checkout.RootPath, expectedRoot) {
 		return nil, fmt.Errorf("%w: checkout root changed", ErrCheckoutMutationStale)
 	}
-	rootInfo, err := os.Stat(checkout.RootPath)
+	rootInfo, err := checkoutRootFileInfo(checkout.RootPath)
 	if err != nil || !rootInfo.IsDir() {
 		return nil, fmt.Errorf("%w: checkout root is unavailable", ErrCheckoutMutationStale)
 	}
@@ -337,7 +337,7 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 		c.failCheckoutRefreshRequests(requests, ErrCheckoutRefreshSuperseded)
 		return
 	}
-	rootInfo, err := os.Stat(current.RootPath)
+	rootInfo, err := checkoutRootFileInfo(current.RootPath)
 	if err != nil {
 		c.failCheckoutRefreshRequests(requests, ErrCheckoutRefreshSuperseded)
 		return
@@ -454,7 +454,7 @@ func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileI
 		}
 		ancestor = parent
 	}
-	matched, err := os.Stat(ancestor)
+	matched, err := checkoutRootFileInfo(ancestor)
 	if err != nil || !os.SameFile(rootInfo, matched) {
 		return "", "", ErrCheckoutRefreshSuperseded
 	}
@@ -464,8 +464,13 @@ func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileI
 		return "", "", err
 	}
 	defer rooted.Close()
-	openedRoot, err := rooted.Stat(".")
-	if err != nil || !os.SameFile(rootInfo, openedRoot) {
+	rootFile, err := rooted.Open(".")
+	if err != nil {
+		return "", "", ErrCheckoutRefreshSuperseded
+	}
+	openedRoot, err := rootFile.Stat()
+	closeErr := rootFile.Close()
+	if err != nil || closeErr != nil || !os.SameFile(rootInfo, openedRoot) {
 		return "", "", ErrCheckoutRefreshSuperseded
 	}
 	file, err := rooted.Open(filepath.Join(components...))
