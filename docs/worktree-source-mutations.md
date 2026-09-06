@@ -233,3 +233,60 @@ check, not a claim based on Darwin tests. Three Darwin benchmark runs measured
 2.139–2.527 microseconds for pathname stat and 1.904–2.030 microseconds for the
 final capture helper, both 304 bytes and two allocations per call. These results
 show no material non-Windows overhead; they do not measure Windows performance.
+
+### Slow Git discovery must make progress across requests
+
+Windows CI exposed starvation in the original first-request budget: the entire
+Git inventory and checkout observation were canceled after 250 ms. If metadata
+work consistently exceeded that budget, every retry restarted it from scratch.
+A second routing bug converted the retryable discovery error into a successful
+empty search. Neither behavior satisfied the new-worktree agent flow.
+
+The 250 ms caller wait remains, but discovery now belongs to the lifecycle:
+
+- Requests for the same canonical path share one job with a five-second
+  cooperative work deadline. A timed-out caller does not discard its progress.
+- At most 32 jobs may exist. Expired or canceled work still occupies its slot
+  until its worker exits, so slow cancellation cannot evade the concurrency cap.
+  Lifecycle shutdown cancels and joins the workers.
+- The first phase only reads Git metadata and the known-family catalog. Every
+  caller independently authorizes the proven primary before observation can
+  start or a shared successful result can be returned. Denied callers cannot
+  start observation or borrow another caller's authority.
+- Cached proof records physical root, Git-directory and common-directory
+  identities, plus `.git` and `commondir` identity/content/absence. A directory
+  resolution after capture verifies that this proof belongs to the inventory's
+  family. This uses the existing Git resolver without repeating the worktree
+  inventory. Later validation is filesystem/catalog-only, including before
+  activation and before returning a cached result.
+- Pending discovery returns typed `view_building`; stale, stopped, denied, and
+  canceled admission cannot become a base result. A generic catalog failure may
+  use labeled fallback only when independent tracked-root metadata proves that
+  the canonical checkout owns the CWD, excluding nested or sibling checkouts.
+
+Agents retry a pending request in the same session. Once admission establishes
+the checkout, ordinary labeled base fallback may serve search while its graph
+builds; edits still require the exact selected view. No explicit tracking or
+additional graph copy is introduced.
+
+Deterministic regressions delay both inventory and HEAD sampling beyond the
+caller budget, then verify eventual success with each operation executed once.
+Other tests cover caller-specific authorization, canceled and expired jobs,
+shutdown, proof replacement, and exact/nonexact search refusal and recovery.
+Windows path assertions use normalized paths, and the relative Git-path fixture
+changes to its own temporary directory so CI's D: checkout/C: temporary-directory
+layout does not invalidate or skip relative-path coverage.
+
+After binding hardening, three five-admission benchmark runs on Apple M1 Pro
+measured 90.49, 79.68, and 105.89 ms per new checkout, with 15/15 successful
+admissions and zero busy responses. The extra binding check costs time compared
+with the earlier 65–77 ms runs; it is not a claimed performance improvement.
+These measurements cover a tiny cold metadata fixture, not Windows runtime,
+large-family inventory, or graph construction. The improvement under slow Git
+is preserved progress with bounded caller waits, not faster subprocesses.
+
+Completed-proof validation measured 0.253, 0.445, and 0.301 ms per request in
+three runs, about 21.6 KB and 288 allocations per operation. Each run performed
+one inventory across 1,873–2,390 requests, demonstrating coalesced reuse without
+skipping physical-binding checks. This benchmark passes no authorizer callback;
+per-caller authorization is covered separately by denied-caller regressions.

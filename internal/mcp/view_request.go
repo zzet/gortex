@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -538,15 +539,7 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 	}
 	checkout, found, err := s.checkoutForRequestPath(ctx, cwd)
 	if err != nil {
-		// The binding is an optimization over the base corpus, not a
-		// precondition for answering: a catalog that cannot be read still
-		// answers from the base. The cwd may well sit inside a routed
-		// checkout, so the degradation rides on the response rather than
-		// passing for an exact answer.
-		if s.logger != nil {
-			s.logger.Debug("view routing: could not bind the session cwd to a checkout", zap.Error(err))
-		}
-		return viewFallback(false, graphview.NewViewRider(graphview.Selector{Kind: graphview.SelectorAuto}), err)
+		return s.viewForCWDLookupError(cwd, err)
 	}
 	if !found || !graphview.ServesAutomaticView(checkout) {
 		return nil, nil
@@ -556,6 +549,58 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 	}
 	requested := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID}
 	return s.materializeRequestView(ctx, requested, checkout, false)
+}
+
+// A lookup error is not proof that the canonical corpus owns this CWD. Only
+// independent tracked-root metadata may authorize the legacy catalog fallback;
+// an unknown, nested, or automatic sibling checkout must fail closed instead.
+func (s *Server) viewForCWDLookupError(cwd string, err error) (*requestView, error) {
+	if errors.Is(err, indexer.ErrCheckoutMutationStale) || errors.Is(err, indexer.ErrCheckoutRefreshStopped) {
+		return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+			"automatic checkout discovery no longer has a valid checkout identity", err)
+	}
+	if errors.Is(err, indexer.ErrCheckoutMutationBusy) {
+		return nil, graphview.WrapViewError(graphview.CodeViewBuilding,
+			"automatic checkout discovery is still pending; retry this request", err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+			"automatic checkout discovery was interrupted", err)
+	}
+	if checkoutLookupErrorRequiresRefusal(err) {
+		return nil, err
+	}
+	if s.logger != nil {
+		s.logger.Debug("view routing: could not bind the session cwd to a checkout", zap.Error(err))
+	}
+	if s.multiIndexer != nil {
+		_, _, prefix, bound := s.multiIndexer.ScopeForCWD(cwd)
+		if root, found := s.multiIndexer.RepoRoot(prefix); bound && found && checkoutControlRootOwnsPath(root, cwd) == nil {
+			return viewFallback(false, graphview.NewViewRider(graphview.Selector{Kind: graphview.SelectorAuto}), err)
+		}
+	}
+	return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+		"checkout lookup failed before a canonical root could be established", err)
+}
+
+// Catalog reads use checkout_inaccessible too; that code may reach the
+// independent canonical-ownership gate. No wrapper or joined cause may hide
+// a more specific refusal such as a denied scope or invalid selector.
+func checkoutLookupErrorRequiresRefusal(err error) bool {
+	if code := graphview.CodeOf(err); code != "" && code != graphview.CodeCheckoutInaccessible {
+		return true
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, cause := range wrapped.Unwrap() {
+			if checkoutLookupErrorRequiresRefusal(cause) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return checkoutLookupErrorRequiresRefusal(wrapped.Unwrap())
+	}
+	return false
 }
 
 // viewForWorktreeSelector serves an explicitly named checkout. Every refusal

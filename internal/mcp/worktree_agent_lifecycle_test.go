@@ -15,6 +15,8 @@ import (
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 
+	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 )
 
@@ -146,6 +148,23 @@ func TestNewWorktreeSearchDiscoversCheckoutWithoutTracking(t *testing.T) {
 	}
 }
 
+func awaitCheckoutAdmission(t testing.TB, srv *Server, ctx context.Context, root string, deadline time.Time) {
+	t.Helper()
+	for {
+		started := time.Now()
+		served, err := srv.CheckoutServesCWDChecked(ctx, root)
+		require.Less(t, time.Since(started), time.Second, "each admission attempt must remain responsive")
+		if err == nil {
+			require.True(t, served, "a known checkout must not become untracked")
+			return
+		}
+		require.False(t, served, "pending observation must not grant scope")
+		require.ErrorIs(t, err, indexer.ErrCheckoutMutationBusy, "only explicit pending discovery is retryable")
+		require.True(t, time.Now().Before(deadline), "checkout admission never completed: %v", err)
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func testNewWorktreeAgentLifecycle(t *testing.T, handshake bool) {
 	t.Helper()
 	t.Setenv("GORTEX_TOOLS", "facade-v1")
@@ -156,13 +175,26 @@ func testNewWorktreeAgentLifecycle(t *testing.T, handshake bool) {
 	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "newly-added", root)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "added.go"), []byte("package repo\n\nfunc NewlyDiscovered() {}\n"), 0o644))
 	started := time.Now()
+	deadline := started.Add(2 * time.Second)
 	if handshake {
 		// The daemon checks this before dispatching tools/call with the CWD.
-		require.True(t, f.srv.CheckoutServesCWD(context.Background(), root), "daemon must admit the automatically discovered checkout")
+		ctx := WithSessionCWD(WithSessionID(context.Background(), "real-checkout-lifecycle"), root)
+		awaitCheckoutAdmission(t, f.srv, ctx, root, deadline)
 	}
-	first := f.facade(t, root, "search", map[string]any{
-		"operation": "symbols", "query": "Old", "options": map[string]any{"limit": 10},
-	})
+	var first *mcplib.CallToolResult
+	for {
+		callStarted := time.Now()
+		first = f.facade(t, root, "search", map[string]any{
+			"operation": "symbols", "query": "Old", "options": map[string]any{"limit": 10},
+		})
+		require.Less(t, time.Since(callStarted), 2*time.Second, "each cold search must remain responsive")
+		if !first.IsError {
+			break
+		}
+		assertToolError(t, first, graphview.CodeViewBuilding)
+		require.True(t, time.Now().Before(deadline), "cold discovery never completed: %+v", first.Content)
+		time.Sleep(10 * time.Millisecond)
+	}
 	require.False(t, first.IsError, "%+v", first.Content)
 	require.Less(t, time.Since(started), 2*time.Second, "cold search must not wait for indexing")
 	freshness := resultFreshness(t, first)
@@ -244,7 +276,7 @@ func TestWorktreeAgentLifecycleSlowRefreshRemainsRecoverable(t *testing.T) {
 		"operation": "detect", "target": map[string]any{"repo": "repo"}, "view": view,
 	})
 	diff := lifecycleResultPayload(t, detected)
-	require.Equal(t, f.worktree, diff["repo_root"])
+	require.Equal(t, filepath.ToSlash(f.worktree), diff["repo_root"])
 	require.Equal(t, false, diff["complete"])
 	require.Equal(t, "UNKNOWN", diff["risk"])
 	files, err := json.Marshal(diff["changed_files"])

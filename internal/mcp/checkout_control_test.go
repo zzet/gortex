@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -230,11 +232,18 @@ func TestCheckoutAdmissionContentionIsRetryableWithoutInventingScope(t *testing.
 	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "admission-busy", root)
 	ctx := WithSessionCWD(WithSessionID(context.Background(), "real-checkout-lifecycle"), root)
 	rec := f.srv.lifecycle.Reconciler()
-	reconcile.WithHEADSampler(func(ctx context.Context, _ string) (gitstate.HEADState, error) {
-		<-ctx.Done()
-		return gitstate.HEADState{}, errors.New("injected Git subprocess killed")
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	reconcile.WithHEADSampler(func(ctx context.Context, root string) (gitstate.HEADState, error) {
+		select {
+		case <-ctx.Done():
+			return gitstate.HEADState{}, errors.New("injected Git subprocess killed")
+		case <-release:
+			return gitstate.SampleHEAD(ctx, root)
+		}
 	})(rec)
-	t.Cleanup(func() { reconcile.WithHEADSampler(gitstate.SampleHEAD)(rec) })
+	t.Cleanup(unblock)
 	started := time.Now()
 	served, err := f.srv.CheckoutServesCWDChecked(ctx, root)
 	require.False(t, served, "pending observation is not a scoped checkout")
@@ -248,14 +257,16 @@ func TestCheckoutAdmissionContentionIsRetryableWithoutInventingScope(t *testing.
 
 	// Exercise the same session's scope cache during the failed observation.
 	// It must not remain unresolved once a retry can establish the checkout.
-	before := f.facade(t, root, "search", map[string]any{
-		"operation": "symbols", "query": "Old", "require_exact": true,
-	})
-	require.True(t, before.IsError)
-	reconcile.WithHEADSampler(gitstate.SampleHEAD)(rec)
-	served, err = f.srv.CheckoutServesCWDChecked(ctx, root)
-	require.NoError(t, err)
-	require.True(t, served)
+	for _, exact := range []bool{false, true} {
+		started := time.Now()
+		before := f.facade(t, root, "search", map[string]any{
+			"operation": "symbols", "query": "Old", "require_exact": exact,
+		})
+		assertToolError(t, before, graphview.CodeViewBuilding)
+		require.Less(t, time.Since(started), time.Second, "pending discovery must not become a successful empty search or wait on the job")
+	}
+	unblock()
+	awaitCheckoutAdmission(t, f.srv, ctx, root, time.Now().Add(2*time.Second))
 	var exact *mcp.CallToolResult
 	require.Eventually(t, func() bool {
 		exact = f.facade(t, root, "search", map[string]any{
@@ -293,6 +304,107 @@ func TestCheckoutAdmissionPreservesPrefixCatalogFailure(t *testing.T) {
 	served, err = stack.srv.CheckoutServesCWDChecked(context.Background(), stack.worktreeRoot)
 	require.NoError(t, err)
 	require.True(t, served)
+}
+
+func TestCheckoutLookupFailureRequiresIndependentCanonicalOwnership(t *testing.T) {
+	f := newRealCheckoutMutationFixture(t)
+	nested := filepath.Join(f.primary, "unregistered-nested")
+	require.NoError(t, os.MkdirAll(nested, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, ".git"), []byte("gitdir: /not-yet-registered"), 0o644))
+	lookupErr := errors.New("injected catalog or proof read failure")
+	for _, tc := range []struct {
+		name, cwd string
+		fallback  bool
+	}{
+		{"canonical", f.primary, true},
+		{"automatic_sibling", f.worktree, false},
+		{"nested_checkout", nested, false},
+		{"unknown", t.TempDir(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view, err := f.srv.viewForCWDLookupError(tc.cwd, lookupErr)
+			if tc.fallback {
+				require.NoError(t, err)
+				require.NotNil(t, view)
+				defer view.close()
+				require.NotNil(t, view.rider)
+				require.False(t, view.rider.Exact, "canonical catalog fallback must remain labeled")
+				return
+			}
+			require.Nil(t, view, "a failed proof must not hand out any base reader or fallback")
+			require.Equal(t, graphview.CodeCheckoutInaccessible, graphview.CodeOf(err))
+			require.ErrorIs(t, err, lookupErr)
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"stale", indexer.ErrCheckoutMutationStale, graphview.CodeCheckoutInaccessible},
+		{"stopped", indexer.ErrCheckoutRefreshStopped, graphview.CodeCheckoutInaccessible},
+		{"busy", indexer.ErrCheckoutMutationBusy, graphview.CodeViewBuilding},
+		{"canceled", context.Canceled, graphview.CodeCheckoutInaccessible},
+		{"deadline", context.DeadlineExceeded, graphview.CodeCheckoutInaccessible},
+		{"denied", graphview.NewViewError(graphview.CodeSelectorOutOfScope, "scope denied"), graphview.CodeSelectorOutOfScope},
+		{"wrapped_stale", graphview.WrapViewError(graphview.CodeCheckoutInaccessible, "catalog unavailable", indexer.ErrCheckoutMutationStale), graphview.CodeCheckoutInaccessible},
+		{"wrapped_busy", graphview.WrapViewError(graphview.CodeCheckoutInaccessible, "catalog unavailable", indexer.ErrCheckoutMutationBusy), graphview.CodeViewBuilding},
+		{"wrapped_denied", graphview.WrapViewError(graphview.CodeCheckoutInaccessible, "catalog unavailable", graphview.NewViewError(graphview.CodeSelectorOutOfScope, "scope denied")), graphview.CodeCheckoutInaccessible},
+		{"wrapped_unknown", graphview.WrapViewError(graphview.CodeCheckoutInaccessible, "catalog unavailable", graphview.NewViewError(graphview.CodeInvalidViewSelector, "unknown selector")), graphview.CodeCheckoutInaccessible},
+		{"joined_denied", errors.Join(graphview.NewViewError(graphview.CodeCheckoutInaccessible, "catalog unavailable"), graphview.NewViewError(graphview.CodeSelectorOutOfScope, "scope denied")), graphview.CodeCheckoutInaccessible},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, cwd := range []string{f.primary, f.worktree} {
+				view, err := f.srv.viewForCWDLookupError(cwd, tc.err)
+				require.Nil(t, view, "an explicit admission failure cannot use even a canonical fallback")
+				require.Equal(t, tc.code, graphview.CodeOf(err))
+				require.ErrorIs(t, err, tc.err)
+			}
+		})
+	}
+}
+
+func TestCheckoutStaleDiscoveryProofNeverReturnsBaseData(t *testing.T) {
+	t.Setenv("GORTEX_TOOLS", "facade-v1")
+	f := newRealCheckoutMutationFixture(t)
+	root := filepath.Join(filepath.Dir(f.primary), "stale-proof")
+	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "stale-proof", root)
+	var changed atomic.Bool
+	reconcile.WithHEADSampler(func(ctx context.Context, observedRoot string) (gitstate.HEADState, error) {
+		head, err := gitstate.SampleHEAD(ctx, observedRoot)
+		if err != nil || filepath.Clean(observedRoot) != filepath.Clean(root) || !changed.CompareAndSwap(false, true) {
+			return head, err
+		}
+		// Proof captured the marker before this sampler. A newline keeps Git's
+		// target valid but changes the proof bytes before final admission.
+		marker := filepath.Join(root, ".git")
+		data, err := os.ReadFile(marker)
+		if err != nil {
+			return gitstate.HEADState{}, err
+		}
+		if err := os.WriteFile(marker, append(data, '\n'), 0o644); err != nil {
+			return gitstate.HEADState{}, err
+		}
+		return head, nil
+	})(f.srv.lifecycle.Reconciler())
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		started := time.Now()
+		result := f.facade(t, root, "search", map[string]any{
+			"operation": "symbols", "query": "Old", "options": map[string]any{"limit": 10},
+		})
+		require.Less(t, time.Since(started), time.Second)
+		require.True(t, result.IsError, "stale proof must not expose the primary's Old symbol: %+v", result.Content)
+		if strings.Contains(viewResultText(t, result), graphview.CodeViewBuilding) {
+			require.True(t, time.Now().Before(deadline), "stale proof was never resolved")
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		assertToolError(t, result, graphview.CodeCheckoutInaccessible)
+		require.True(t, changed.Load(), "the real post-proof Git marker mutation must execute")
+		require.Contains(t, viewResultText(t, result), indexer.ErrCheckoutMutationStale.Error())
+		break
+	}
 }
 
 func TestCheckoutControlClassifiesOnlySupportedOperations(t *testing.T) {

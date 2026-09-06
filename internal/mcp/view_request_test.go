@@ -950,9 +950,14 @@ func TestUnreadableCWDBindingSaysItFellBack(t *testing.T) {
 	breakCheckoutReads(t, stack.dbPath)
 
 	var reader graph.Reader
-	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil, captureReader(stack.srv, &reader))
+	// Tracked-root metadata proves this canonical CWD independently of the
+	// unreadable checkout table. The automatic sibling has no such proof.
+	res, err := stack.callWithView(t, stack.repoRoot, "get_symbol", nil, captureReader(stack.srv, &reader))
 	if err != nil {
 		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("canonical fallback was refused: %s", viewResultText(t, res))
 	}
 	if hasNode(reader, "repo/added.go::Fresh") {
 		t.Error("an unreadable binding served the routed generations anyway")
@@ -975,6 +980,21 @@ func TestUnreadableCWDBindingSaysItFellBack(t *testing.T) {
 	}
 	if rider["fallback_reason"] != graphview.CodeCheckoutInaccessible {
 		t.Errorf("fallback_reason = %v, want %q", rider["fallback_reason"], graphview.CodeCheckoutInaccessible)
+	}
+}
+
+func TestUnreadableAutomaticBindingDoesNotReturnBaseData(t *testing.T) {
+	stack := newViewStack(t)
+	breakCheckoutReads(t, stack.dbPath)
+
+	var reader graph.Reader
+	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil, captureReader(stack.srv, &reader))
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	assertToolError(t, res, graphview.CodeCheckoutInaccessible)
+	if reader != nil {
+		t.Fatal("unreadable automatic binding reached a graph reader without checkout authority")
 	}
 }
 
