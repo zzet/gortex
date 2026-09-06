@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -77,11 +78,40 @@ func sizeSkipMetaInt64(value any) (int64, bool) {
 // read into memory merely to mint a receipt. The normal post-publication
 // receipt validator must still check this version before persisting it.
 func (idx *Indexer) coldSizeSkipReceipt(path string, info os.FileInfo) fileReadReceipt {
-	return fileReadReceipt{
-		absPath: path, mtimeKey: idx.relKey(path),
-		readVersion: fileReadVersion{
+	receipt := fileReadReceipt{absPath: path, mtimeKey: idx.relKey(path)}
+	if runtime.GOOS == "windows" {
+		// Some Windows directory metadata defers identity lookup until
+		// SameFile. Freeze it now, before the path can be replaced.
+		receipt.readVersion = coldSizeSkipDescriptorVersion(path, info)
+	} else {
+		receipt.readVersion = fileReadVersion{
 			info: info, mtime: info.ModTime().UnixNano(), size: info.Size(), valid: true,
-		},
+		}
+	}
+	return receipt
+}
+
+// File.Stat captures identity from the open handle without reading file bytes.
+// The helper is platform-neutral so its failure and identity boundaries can be
+// tested directly; only Windows cold capture needs this extra handle. A failed
+// capture returns an invalid version, which the normal receipt finalizer marks
+// stale and invalidates rather than certifying an old durable mtime.
+func coldSizeSkipDescriptorVersion(path string, walked os.FileInfo) fileReadVersion {
+	if walked == nil || !walked.Mode().IsRegular() {
+		return fileReadVersion{}
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fileReadVersion{}
+	}
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil || closeErr != nil || !info.Mode().IsRegular() ||
+		info.Size() != walked.Size() || info.ModTime().UnixNano() != walked.ModTime().UnixNano() {
+		return fileReadVersion{}
+	}
+	return fileReadVersion{
+		info: info, mtime: info.ModTime().UnixNano(), size: info.Size(), valid: true,
 	}
 }
 

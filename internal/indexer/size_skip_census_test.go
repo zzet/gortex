@@ -668,6 +668,14 @@ func TestSizeSkipFailureBoundaryRemovesOldReceiptAndRetries(t *testing.T) {
 				require.Equal(t, oldMtime, currentInfo.ModTime().UnixNano())
 				require.NotEqual(t, capturedInfo.Size(), currentInfo.Size())
 			case "same_mtime_same_size_file_replaced":
+				// The oracle must not freeze capturedInfo: Windows Stat may
+				// defer its identity lookup until after the replacement.
+				original, err := os.Open(gifPath)
+				require.NoError(t, err)
+				originalIdentity, statErr := original.Stat()
+				closeErr := original.Close()
+				require.NoError(t, statErr)
+				require.NoError(t, closeErr)
 				replacement := filepath.Join(root, "replacement.gif")
 				sizeFailureBoundaryWriteGIF(t, replacement, oldSize)
 				require.NoError(t, os.Chtimes(replacement, capturedInfo.ModTime(), capturedInfo.ModTime()))
@@ -677,7 +685,7 @@ func TestSizeSkipFailureBoundaryRemovesOldReceiptAndRetries(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, oldMtime, currentInfo.ModTime().UnixNano())
 				require.Equal(t, capturedInfo.Size(), currentInfo.Size())
-				require.False(t, os.SameFile(capturedInfo, currentInfo), "fixture must actually replace the file identity")
+				require.False(t, os.SameFile(originalIdentity, currentInfo), "fixture must actually replace the file identity")
 			}
 
 			candidateMtimes := map[string]int64{}
@@ -860,6 +868,101 @@ func TestSizeSkipFailureBoundaryIndexCtxWiring(t *testing.T) {
 			assert.Equal(t, []string{"demo.gif"}, changed)
 			require.Empty(t, deleted)
 			require.Equal(t, 2, detected)
+		})
+	}
+}
+
+func TestSizeSkipDescriptorVersionFreezesIdentity(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "demo.gif")
+	writeSizeCensusGIF(t, path, 512)
+	walked, err := os.Stat(path)
+	require.NoError(t, err)
+	original, err := os.Open(path)
+	require.NoError(t, err)
+	originalIdentity, statErr := original.Stat()
+	closeErr := original.Close()
+	require.NoError(t, statErr)
+	require.NoError(t, closeErr)
+
+	version := coldSizeSkipDescriptorVersion(path, walked)
+	require.True(t, version.valid)
+	require.Equal(t, walked.Size(), version.size)
+	require.Equal(t, walked.ModTime().UnixNano(), version.mtime)
+
+	replacement := filepath.Join(root, "replacement.gif")
+	writeSizeCensusGIF(t, replacement, 512)
+	require.NoError(t, os.Chtimes(replacement, walked.ModTime(), walked.ModTime()))
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Rename(replacement, path))
+	current, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, walked.Size(), current.Size())
+	require.Equal(t, walked.ModTime().UnixNano(), current.ModTime().UnixNano())
+	// Both identity checks are independent of the metadata-only walked
+	// value, which must remain unfrozen so it cannot hide a lazy-ID bug.
+	require.False(t, os.SameFile(originalIdentity, current))
+	require.False(t, sameFileVersion(version.info, current))
+}
+
+func TestSizeSkipDescriptorCaptureFailureInvalidatesOldReceipt(t *testing.T) {
+	for _, scenario := range []string{
+		"missing", "current_directory", "changed_size", "changed_mtime",
+		"unreadable", "nil_walk", "directory_walk",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newSizeCensusFixture(t, 128)
+			path := filepath.Join(f.root, "demo.gif")
+			walked, err := os.Stat(path)
+			require.NoError(t, err)
+			f.establishKnownReceipt()
+			require.NoError(t, f.store.BulkSetFileMtimes("repo", map[string]int64{"durable-only.go": 7}))
+			wantMtimes := f.store.LoadFileMtimes("repo")
+			delete(wantMtimes, "demo.gif")
+			f.idx.SetFileMtimes(map[string]int64{"demo.gif": f.mtime.UnixNano()})
+
+			switch scenario {
+			case "missing":
+				require.NoError(t, os.Remove(path))
+			case "current_directory":
+				require.NoError(t, os.Remove(path))
+				require.NoError(t, os.Mkdir(path, 0700))
+			case "changed_size":
+				writeSizeCensusGIF(t, path, 768)
+				require.NoError(t, os.Chtimes(path, walked.ModTime(), walked.ModTime()))
+			case "changed_mtime":
+				require.NoError(t, os.Chtimes(path, walked.ModTime(), walked.ModTime().Add(time.Second)))
+			case "unreadable":
+				require.NoError(t, os.Chmod(path, 0000))
+				t.Cleanup(func() { require.NoError(t, os.Chmod(path, 0600)) })
+				file, openErr := os.Open(path)
+				if openErr == nil {
+					require.NoError(t, file.Close())
+					t.Skip("current platform/user can open mode-000 files")
+				}
+				require.ErrorIs(t, openErr, fs.ErrPermission)
+			case "nil_walk":
+				walked = nil
+			case "directory_walk":
+				walked, err = os.Stat(f.root)
+				require.NoError(t, err)
+			}
+			version := coldSizeSkipDescriptorVersion(path, walked)
+			require.False(t, version.valid)
+			receipt := fileReadReceipt{absPath: path, mtimeKey: "demo.gif", readVersion: version}
+			mtimes := make(map[string]int64)
+			failed := f.idx.finishColdSizeSkips(context.Background(), []fileReadReceipt{receipt}, mtimes, true)
+			require.True(t, failed)
+			require.NotContains(t, mtimes, "demo.gif")
+			require.NotContains(t, f.idx.publishFileMtimes(), "demo.gif")
+			require.Equal(t, wantMtimes, f.store.LoadFileMtimes("repo"))
+			// Invalid capture is nonfatal to graph publication, but must
+			// suppress authoritative pruning of unrelated durable-only keys.
+			require.NotNil(t, f.fileNode())
+			f.idx.finishColdIndexCensus(context.Background(), &IndexResult{}, nil, mtimes, nil, failed)
+			require.Equal(t, wantMtimes, f.store.LoadFileMtimes("repo"))
+			f.reopen(128)
+			require.Equal(t, wantMtimes, f.store.LoadFileMtimes("repo"))
 		})
 	}
 }
