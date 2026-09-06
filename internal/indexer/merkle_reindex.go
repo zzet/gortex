@@ -74,14 +74,26 @@ func (c *merkleBaselineCollector) take() map[string]merkle.FileNode {
 // touched without a content change is not reported, unlike the
 // bare-mtime path.
 func (idx *Indexer) merkleStaleFiles(rootAbs string, diskFiles map[string]bool) []string {
+	return idx.merkleStaleFilesInScope(rootAbs, diskFiles, nil)
+}
+
+// A scoped pass cannot replace the repository baseline with only its frontier:
+// the next full pass would then rediscover unchanged files outside that scope.
+// Preserve those prior leaves verbatim, without reading or re-salting them.
+func (idx *Indexer) merkleStaleFilesInScope(rootAbs string, diskFiles map[string]bool, contains func(string) bool) []string {
 	rels := make([]string, 0, len(diskFiles))
 	for rel := range diskFiles {
-		rels = append(rels, rel)
+		if contains == nil || contains(rel) {
+			rels = append(rels, rel)
+		}
 	}
 	treePath := merkleTreeFile(rootAbs)
 	prior, _ := merkle.Load(treePath)
 	tree := merkle.Build(rootAbs, rels, prior, merkleSaltFor)
 	changed, _ := tree.Diff(prior)
+	if contains != nil {
+		tree = merkle.MergeScope(prior, tree, contains)
+	}
 	if err := tree.Save(treePath); err != nil {
 		idx.logger.Warn("indexer: merkle tree save failed", zap.Error(err))
 	}

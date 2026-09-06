@@ -2413,6 +2413,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	idx.deferredAttempt = nil
 	var coldManifests *coldManifestCensus
 	var censusMtimes map[string]int64
+	var sizeReceipts []fileReadReceipt
+	sizeReceiptCtx := ctx
 	var fileFailed atomic.Bool
 	var successfulFiles sync.Map
 	recordFileOutcome := func(path string, err error) {
@@ -2461,6 +2463,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}()
 		defer recoverIndexCtxRawStoragePanic(&result, &retErr)
+		published := retErr == nil && result != nil && censusMtimes != nil
+		if idx.finishColdSizeSkips(sizeReceiptCtx, sizeReceipts, censusMtimes, published) {
+			fileFailed.Store(true)
+		}
 		idx.finishColdIndexCensus(ctx, result, retErr, censusMtimes, coldManifests, fileFailed.Load())
 	}()
 	defer recoverIndexCtxRawStoragePanic(&result, &retErr)
@@ -2599,6 +2605,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				skippedBySize = append(skippedBySize, skippedFile{
 					relPath: idx.relKey(path), lang: adm.lang, size: info.Size(),
 				})
+				// Keep the walk's no-follow identity: a symlink cannot earn a
+				// target-follow receipt from its own DirEntry metadata.
+				if info.Mode().IsRegular() && supportsColdManifestReceipts(idx.graph) {
+					sizeReceipts = append(sizeReceipts, idx.coldSizeSkipReceipt(path, info))
+				}
 				return nil
 			}
 			if adm.lang == "" && idx.isIncrementalContractManifest(path) && !idx.shouldExclude(path, absRoot, false) {
@@ -6246,7 +6257,14 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// comes from a content-addressed tree diff over the whole repo,
 	// then intersected back down to the requested scope.
 	if merkleMode {
-		for _, abs := range idx.merkleStaleFiles(absRoot, diskFiles) {
+		var merkleChanges []string
+		if fullRoot {
+			merkleChanges = idx.merkleStaleFiles(absRoot, diskFiles)
+		} else {
+			merkleScope := func(rel string) bool { return relPathInScope(rel, scopeRels) }
+			merkleChanges = idx.merkleStaleFilesInScope(absRoot, diskFiles, merkleScope)
+		}
+		for _, abs := range merkleChanges {
 			rel, relErr := filepath.Rel(absRoot, abs)
 			if relErr != nil {
 				continue
@@ -9159,6 +9177,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		return nil, nil, 0, absErr
 	}
 	idx.storeRootPath(absRoot)
+	sizeSkips := idx.sizeSkipCensusNodes()
 
 	diskFiles := make(map[string]bool)
 	projectionCandidates := make([]string, 0, 1)
@@ -9172,7 +9191,8 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 			}
 			return nil
 		}
-		if _, ok := idx.effectiveLanguage(path, nil); !ok && !idx.isIncrementalContractManifest(path) {
+		_, supported := idx.effectiveLanguage(path, nil)
+		if !supported && !idx.isIncrementalContractManifest(path) {
 			return nil
 		}
 		if idx.shouldExclude(path, absRoot, false) {
@@ -9183,7 +9203,14 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		if filepath.Base(filepath.FromSlash(rel)) == "parser.c" {
 			projectionCandidates = append(projectionCandidates, rel)
 		}
-		if idx.IsStale(rel) {
+		// Reuse IsStale's stat for the current size policy as well as mtime.
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			changed = append(changed, rel)
+			return nil
+		}
+		oversize := supported && idx.config.MaxFileSize > 0 && info.Size() > idx.config.MaxFileSize
+		if idx.sizeSkipCensusIsStale(rel, info, oversize, sizeSkips) {
 			changed = append(changed, rel)
 		}
 		return nil

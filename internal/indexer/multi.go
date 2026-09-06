@@ -3157,13 +3157,13 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			// one changed go.mod must not look like >40% source churn in a tiny
 			// repository. The scoped refresh records its mtime and converges.
 			route = "scoped"
-			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceiptMode(absPath, append(changed, deleted...), incrementalPathMode{detectDeletions: true, forceExplicitFiles: true})
 		case priorCount > 0 && churn*100 > priorCount*40:
 			route = "full_retrack"
 			result, err = fullRetrack()
 		default:
 			route = "scoped"
-			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, append(changed, deleted...), true)
+			result, receipt, batch, err = idx.incrementalReindexPathsWithReceiptMode(absPath, append(changed, deleted...), incrementalPathMode{detectDeletions: true, forceExplicitFiles: true})
 		}
 		applyTiming.complete(err, zap.String("route", route))
 		if err != nil {
