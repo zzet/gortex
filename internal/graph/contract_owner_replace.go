@@ -2,6 +2,7 @@ package graph
 
 import (
 	"errors"
+	"maps"
 	"sort"
 )
 
@@ -24,7 +25,9 @@ type ContractOwnerReplaceResult struct {
 	EdgesAdded   int
 }
 
-// ContractOwnerReplacer applies a replacement atomically when the backend can.
+// ContractOwnerReplacer applies a replacement atomically when the backend can,
+// including invalidation of an exact removed legacy scalar record when a
+// sibling owner requires the shared canonical node to remain.
 // SQLite implements one transaction; the in-memory compatibility path below is
 // still set-oriented and never removes another repository's shared-ID edges.
 type ContractOwnerReplacer interface {
@@ -81,21 +84,34 @@ func ReplaceContractOwners(store Store, replacement ContractOwnerReplacement) (C
 	}
 
 	result := ContractOwnerReplaceResult{}
+	if invalidator, ok := store.(ContractOwnerScalarInvalidator); ok {
+		result.NodesChanged = invalidator.InvalidateContractOwnerScalars(replacement)
+	}
 	if len(stale) > 0 {
 		result.EdgesRemoved = remover.RemoveEdgesExact(stale)
 	}
 	if len(replacement.Nodes) > 0 || len(replacement.Edges) > 0 {
 		store.AddBatch(replacement.Nodes, replacement.Edges)
-		result.NodesChanged = len(replacement.Nodes)
+		result.NodesChanged += len(replacement.Nodes)
 		result.EdgesAdded = len(replacement.Edges)
 	}
 	if len(pruneIDs) == 0 {
 		return result, nil
 	}
 
+	currentNodes := store.GetNodesByIDs(pruneIDs)
 	incoming := store.GetInEdgesByNodeIDs(pruneIDs)
 	orphanIDs := make([]string, 0, len(pruneIDs))
 	for _, id := range pruneIDs {
+		node := currentNodes[id]
+		if node != nil && node.Kind == KindContract {
+			removed, _ := node.Meta["contract_owner_removed"].(bool)
+			ownerBacked, _ := node.Meta["contract_owner_record"].(bool)
+			_, removedFile := files[node.FilePath]
+			if !removed && !ownerBacked && (node.RepoPrefix != replacement.RepoPrefix || !removedFile) {
+				continue // This exact legacy scalar belongs to a surviving frontier.
+			}
+		}
 		owned := false
 		for _, edge := range incoming[id] {
 			if edge != nil && (edge.Kind == EdgeProvides || edge.Kind == EdgeConsumes || edge.Kind == EdgeHandlesRoute) {
@@ -113,6 +129,83 @@ func ReplaceContractOwners(store Store, replacement ContractOwnerReplacement) (C
 		result.EdgesRemoved += edges
 	}
 	return result, nil
+}
+
+// ContractOwnerScalarInvalidator invalidates a removed scalar record only if
+// that record still belongs to the exact replacement repository/file frontier.
+// It is a conditional node mutation, not an atomic replacement of owner edges.
+type ContractOwnerScalarInvalidator interface {
+	InvalidateContractOwnerScalars(replacement ContractOwnerReplacement) int
+}
+
+// InvalidateContractOwnerScalars uses the same node lock, index accounting and
+// receipt boundaries as AddNode, but rechecks ownership under the lock before
+// copying metadata. A sibling that replaced the shared canonical ID wins: its
+// current record never gets replaced with a stale pre-lock snapshot.
+func (g *Graph) InvalidateContractOwnerScalars(replacement ContractOwnerReplacement) int {
+	files := make(map[string]struct{}, len(replacement.FilePaths))
+	for _, path := range replacement.FilePaths {
+		if path != "" {
+			files[path] = struct{}{}
+		}
+	}
+	ids := contractOwnerPruneIDs(replacement)
+	if len(files) == 0 || len(ids) == 0 {
+		return 0
+	}
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
+	changed := 0
+	for _, id := range ids {
+		shard := g.shardFor(id)
+		shard.mu.Lock()
+		if g.invalidateContractOwnerScalarLocked(id, replacement.RepoPrefix, files) {
+			changed++
+		}
+		shard.mu.Unlock()
+	}
+	if changed > 0 {
+		g.nodeMutGen.Add(1)
+		// The removed scalar is no longer a usable contract record even though
+		// the shared canonical node and sibling edges remain. This is not an
+		// add-only frontier; do not leave an observation receipt complete.
+		g.markMutationReceiptsIncomplete()
+	}
+	return changed
+}
+
+func (g *Graph) invalidateContractOwnerScalarLocked(id, repo string, files map[string]struct{}) bool {
+	shard := g.shardFor(id)
+	current := shard.nodes[id]
+	if !contractOwnerScalarMatchesRemovedFrontier(current, repo, files) {
+		return false
+	}
+	updated := *current
+	updated.Meta = maps.Clone(current.Meta)
+	if updated.Meta == nil {
+		updated.Meta = make(map[string]any, 1)
+	}
+	updated.Meta["contract_owner_removed"] = true
+	g.addNodeLocked(shard, &updated)
+	return true
+}
+
+func contractOwnerScalarMatchesRemovedFrontier(node *Node, repo string, files map[string]struct{}) bool {
+	if node == nil || node.Kind != KindContract || node.RepoPrefix != repo {
+		return false
+	}
+	if _, removed := files[node.FilePath]; !removed {
+		return false
+	}
+	if removed, _ := node.Meta["contract_owner_removed"].(bool); removed {
+		return false
+	}
+	if ownerBacked, _ := node.Meta["contract_owner_record"].(bool); ownerBacked {
+		return false // fallback already requires the corresponding owner row
+	}
+	return true
 }
 
 func contractOwnerPruneIDs(replacement ContractOwnerReplacement) []string {
