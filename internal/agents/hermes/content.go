@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 	yaml "gopkg.in/yaml.v3"
 )
@@ -142,34 +141,33 @@ func masterSkillCommands() string {
 // surface — explore / impact / debug / refactor / rename / safe-edit /
 // add-test / pr-review / … — that `gortex install` gives Claude Code.
 //
-// The bodies are the single source of truth in
-// internal/agents/claudecode (reused verbatim so the two agents never
-// drift); internal/agents/skillpack strips the Claude frontmatter off
-// them and Hermes' own envelope goes back on. Hermes also turns every
-// installed skill into a `/skill-name` slash command, so the
-// `/gortex-explore`-style cross-references in the bodies resolve to the
-// sibling skills installed here.
+// The bodies are the single source of truth in the agents package
+// (reused verbatim so no two hosts drift); internal/agents/skillpack
+// strips the shared frontmatter off them and Hermes' own envelope goes
+// back on. Hermes also turns every installed skill into a `/skill-name`
+// slash command, so the `/gortex-explore`-style cross-references in the
+// bodies resolve to the sibling skills installed here.
 //
 // gortex-guide is excluded: the native master `gortex` skill
 // (SkillBody) already fills the guide role, and shipping both would be
 // a redundant entry in Hermes' skill picker.
 func RoutingSkills() map[string]string {
-	out := make(map[string]string, len(claudecode.GlobalSkills))
-	for name, claudeBody := range claudecode.GlobalSkills {
+	out := make(map[string]string, len(agents.GlobalSkills))
+	for name, sharedBody := range agents.GlobalSkills {
 		if name == "gortex-guide" {
 			continue
 		}
-		skill, err := skillpack.Parse(name, claudeBody)
+		skill, err := skillpack.Parse(name, sharedBody)
 		if err != nil {
-			// The Claude bodies are compile-time constants, so this can
-			// only fire if that package is edited into a shape skillpack
-			// rejects (a non-kebab id, an unclosed frontmatter fence).
-			// Skip rather than install a skill whose frontmatter we could
-			// not rewrite — skillpack's test over claudecode.GlobalSkills
+			// The shared bodies are compile-time constants, so this can
+			// only fire if the agents package is edited into a shape
+			// skillpack rejects (a non-kebab id, an unclosed frontmatter
+			// fence). Skip rather than install a skill whose frontmatter we
+			// could not rewrite — skillpack's test over agents.GlobalSkills
 			// is what turns the mistake into a red build.
 			continue
 		}
-		out[name] = hermesSkillFromClaude(skill)
+		out[name] = hermesSkillFromShared(skill)
 	}
 	return out
 }
@@ -186,7 +184,7 @@ func RoutingSkillNames() []string {
 	return names
 }
 
-// hermesSkillFromClaude re-frames one parsed skill as a Hermes skill:
+// hermesSkillFromShared re-frames one parsed skill as a Hermes skill:
 // it keeps the body verbatim and puts Hermes frontmatter (name +
 // description + version + metadata.hermes.{tags,category}) in front of
 // it.
@@ -196,7 +194,7 @@ func RoutingSkillNames() []string {
 // with flow sequences, which the flat ordered-pair renderer cannot
 // express. Only the description scalar goes through skillpack, so the
 // prose quoting rule stays shared with every other host.
-func hermesSkillFromClaude(skill skillpack.Skill) string {
+func hermesSkillFromShared(skill skillpack.Skill) string {
 	tags, category := routingSkillTaxonomy(skill.ID)
 
 	var b strings.Builder

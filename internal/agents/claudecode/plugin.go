@@ -265,11 +265,11 @@ Copyright 2024-2026 Andrey Kumanyaev <me@zzet.org>
 // output. Returns the list of paths written, relative to TargetDir,
 // in stable order.
 //
-// Single source of truth: skills come from GlobalSkills, slash
-// commands from SlashCommands. Both are reused from
-// content.go without duplication, so a change to a skill's body
-// flows through both the user-level install (~/.claude/skills/) and
-// the marketplace plugin (claude-plugin/skills/) on the next emit.
+// Single source of truth: skills come from agents.GlobalSkills, slash
+// commands from agents.SlashCommands. Both are reused from the agents
+// package without duplication, so a change to a skill's body flows
+// through both the user-level install (~/.claude/skills/) and the
+// marketplace plugin (claude-plugin/skills/) on the next emit.
 func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 	if spec.LayoutVariant == "" {
 		spec.LayoutVariant = LayoutVariantAnthropic

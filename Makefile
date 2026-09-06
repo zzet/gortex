@@ -149,10 +149,10 @@ build-windows:
 # (claude-plugin-check) asserts that re-running this target produces
 # no diff against what's checked in — drift means the bundle is stale
 # vs the source-of-truth content in
-# internal/agents/claudecode/content.go.
+# internal/agents/commands_bodies.go.
 claude-plugin: build
 	./$(BINARY) plugin emit --target ./claude-plugin --variant anthropic
-	@echo "✓ Regenerated claude-plugin/ from internal/agents/claudecode content"
+	@echo "✓ Regenerated claude-plugin/ from internal/agents commands"
 
 claude-plugin-check: claude-plugin
 	@if ! git diff --exit-code -- claude-plugin >/dev/null 2>&1; then \

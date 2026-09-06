@@ -1,4 +1,4 @@
-package claudecode
+package agents
 
 import (
 	"regexp"
@@ -34,7 +34,41 @@ func TestCommandPRReviewAgent_ShellsTheReviewVerb(t *testing.T) {
 	}
 }
 
-func TestGeneratedClaudeContent_UsesOnlyPublicToolDomains(t *testing.T) {
+// TestCommandPRReviewAgent_Registered asserts the agent-review skill is wired
+// into both the slash-command registry and the global-skill registry under
+// matching names, so the plugin emitter and every adapter pick it up.
+func TestCommandPRReviewAgent_Registered(t *testing.T) {
+	if got := SlashCommands["gortex-pr-review-agent.md"]; got != commandPRReviewAgent {
+		t.Error("gortex-pr-review-agent.md must map to commandPRReviewAgent in SlashCommands")
+	}
+	skill, ok := GlobalSkills["gortex-pr-review-agent"]
+	if !ok {
+		t.Fatal("gortex-pr-review-agent must be registered in GlobalSkills")
+	}
+	// The skill body is the frontmatter + the command body; the command body
+	// must be present verbatim so a drift edit can't silently desync them.
+	if !strings.Contains(skill, commandPRReviewAgent) {
+		t.Error("gortex-pr-review-agent skill body must embed commandPRReviewAgent")
+	}
+	if !strings.HasPrefix(skill, "---\nname: gortex-pr-review-agent\n") {
+		t.Error("gortex-pr-review-agent skill must carry matching frontmatter")
+	}
+}
+
+// TestEverySkillCarriesCanonicalWorktreeBranchPolicy asserts every
+// global skill body embeds the worktree branch routing policy exactly once.
+func TestEverySkillCarriesCanonicalWorktreeBranchPolicy(t *testing.T) {
+	for name, body := range GlobalSkills {
+		if got := strings.Count(body, profiles.WorktreeBranchRoutingPolicy); got != 1 {
+			t.Errorf("skill %q embeds canonical worktree policy %d times, want once", name, got)
+		}
+	}
+}
+
+// TestGeneratedAgentContent_UsesOnlyPublicToolDomains asserts every
+// slash command and skill body restricts itself to the public MCP tool
+// surface and stays within a lean byte budget.
+func TestGeneratedAgentContent_UsesOnlyPublicToolDomains(t *testing.T) {
 	public := map[string]bool{
 		"analyze": true, "ask": true, "capabilities": true, "change": true,
 		"edit": true, "explore": true, "overlay": true, "pr": true,
@@ -75,34 +109,5 @@ func TestGeneratedClaudeContent_UsesOnlyPublicToolDomains(t *testing.T) {
 		if len(body) > 6000 {
 			t.Errorf("%s is not lean: %d bytes (limit 6000)", name, len(body))
 		}
-	}
-}
-
-func TestEveryClaudeSkillCarriesCanonicalWorktreeBranchPolicy(t *testing.T) {
-	for name, body := range GlobalSkills {
-		if got := strings.Count(body, profiles.WorktreeBranchRoutingPolicy); got != 1 {
-			t.Errorf("skill %q embeds canonical worktree policy %d times, want once", name, got)
-		}
-	}
-}
-
-// TestCommandPRReviewAgent_Registered asserts the agent-review skill is wired
-// into both the slash-command registry and the global-skill registry under
-// matching names, so the plugin emitter and every adapter pick it up.
-func TestCommandPRReviewAgent_Registered(t *testing.T) {
-	if got := SlashCommands["gortex-pr-review-agent.md"]; got != commandPRReviewAgent {
-		t.Error("gortex-pr-review-agent.md must map to commandPRReviewAgent in SlashCommands")
-	}
-	skill, ok := GlobalSkills["gortex-pr-review-agent"]
-	if !ok {
-		t.Fatal("gortex-pr-review-agent must be registered in GlobalSkills")
-	}
-	// The skill body is the frontmatter + the command body; the command body
-	// must be present verbatim so a drift edit can't silently desync them.
-	if !strings.Contains(skill, commandPRReviewAgent) {
-		t.Error("gortex-pr-review-agent skill body must embed commandPRReviewAgent")
-	}
-	if !strings.HasPrefix(skill, "---\nname: gortex-pr-review-agent\n") {
-		t.Error("gortex-pr-review-agent skill must carry matching frontmatter")
 	}
 }

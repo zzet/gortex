@@ -11,7 +11,7 @@ package opencode
 // directory holding the SKILL.md. The rejection is silent — the skill
 // simply never appears — so this file derives both halves from the same
 // value (skillpack.Skill.ID) rather than trusting the frontmatter that
-// arrived from the Claude source, and skills_test.go asserts the
+// arrived on the shared body, and skills_test.go asserts the
 // equality over the whole corpus rather than a sample.
 //
 // # Only five frontmatter keys are recognised
@@ -51,7 +51,6 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/internalutil"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 	"github.com/zzet/gortex/internal/profiles"
@@ -82,28 +81,26 @@ func projectSkillsDir(root string) string {
 
 // Skills returns the curated Gortex playbook pack in host-neutral form.
 //
-// The bodies are single-sourced in internal/agents/claudecode and each
-// host re-wraps them in its own frontmatter dialect; skillpack does the
-// stripping. Reading claudecode's map directly from an adapter is the
-// established direction (codex and hermes do the same) — claudecode never
-// imports another adapter, so there is no cycle to trip over.
+// The bodies are single-sourced in the agents package and each host
+// re-wraps them in its own frontmatter dialect; skillpack does the
+// stripping.
 func Skills() ([]skillpack.Skill, error) {
-	return skillpack.ParseAll(claudecode.GlobalSkills)
+	return skillpack.ParseAll(agents.GlobalSkills)
 }
 
 // Commands returns the slash-command pack in host-neutral form, keyed by
 // the command name (the file's base name, minus `.md`).
 //
-// The source is claudecode.GlobalSkills rather than
-// claudecode.SlashCommands wherever both carry the same id: the two hold
+// The source is agents.GlobalSkills rather than
+// agents.SlashCommands wherever both carry the same id: the two hold
 // the same body, but only the skill map wraps it in frontmatter, and that
 // frontmatter is where the description lives. A command with no skill
 // twin falls back to its bare body and ships without a description.
 func Commands() ([]skillpack.Skill, error) {
-	raw := make(map[string]string, len(claudecode.SlashCommands))
-	for file, body := range claudecode.SlashCommands {
+	raw := make(map[string]string, len(agents.SlashCommands))
+	for file, body := range agents.SlashCommands {
 		id := strings.TrimSuffix(file, commandFileExt)
-		if described, ok := claudecode.GlobalSkills[id]; ok {
+		if described, ok := agents.GlobalSkills[id]; ok {
 			body = described
 		}
 		raw[id] = body

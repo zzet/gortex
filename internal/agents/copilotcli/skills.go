@@ -7,7 +7,6 @@ import (
 	"sort"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/internalutil"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 	"github.com/zzet/gortex/internal/profiles"
@@ -15,8 +14,8 @@ import (
 
 // skills.go installs Agent Skills for the Copilot CLI. The CLI adopted
 // Anthropic's Agent Skills spec verbatim — a `<name>/SKILL.md` with
-// `name` + `description` frontmatter — so the bodies are Claude Code's,
-// reused through skillpack with a minimal envelope back on.
+// `name` + `description` frontmatter — so the shared bodies come through
+// skillpack with a minimal envelope back on.
 //
 // Where those files may live is the part a maintainer will get wrong,
 // because the CLI has *removed* discovery roots over its life:
@@ -44,17 +43,17 @@ const (
 
 // CuratedSkillNames returns the curated pack's skill IDs, sorted, so a
 // Plan, an install report and a golden test all see the same order —
-// Go randomises map iteration, and claudecode.GlobalSkills is a map.
+// Go randomises map iteration, and agents.GlobalSkills is a map.
 func CuratedSkillNames() []string {
-	names := make([]string, 0, len(claudecode.GlobalSkills))
-	for name := range claudecode.GlobalSkills {
+	names := make([]string, 0, len(agents.GlobalSkills))
+	for name := range agents.GlobalSkills {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
 }
 
-// CuratedSkills renders claudecode.GlobalSkills into the Copilot
+// CuratedSkills renders agents.GlobalSkills into the Copilot
 // envelope, keyed by skill ID.
 //
 // The envelope is `name` + `description` and nothing else. The CLI also
@@ -64,28 +63,28 @@ func CuratedSkillNames() []string {
 // for any of them would silently disable a playbook, so the two required
 // keys are all that is written.
 func CuratedSkills() map[string]string {
-	out := make(map[string]string, len(claudecode.GlobalSkills))
-	for id, claudeBody := range claudecode.GlobalSkills {
-		skill, err := skillpack.Parse(id, claudeBody)
+	out := make(map[string]string, len(agents.GlobalSkills))
+	for id, sharedBody := range agents.GlobalSkills {
+		skill, err := skillpack.Parse(id, sharedBody)
 		if err != nil {
-			// The Claude bodies are compile-time constants, so this can
-			// only fire if that package is edited into a shape skillpack
+			// The shared bodies are compile-time constants, so this can
+			// only fire if the agents package is edited into a shape skillpack
 			// rejects. Skipping beats installing a skill whose frontmatter
 			// we could not rewrite; skillpack's own test over
-			// claudecode.GlobalSkills turns the mistake into a red build.
+			// agents.GlobalSkills turns the mistake into a red build.
 			continue
 		}
-		out[id] = copilotSkillFromClaude(skill)
+		out[id] = copilotSkillFromShared(skill)
 	}
 	return out
 }
 
-// copilotSkillFromClaude keeps the body byte-for-byte and puts the
-// Copilot frontmatter in front of it. `name` is the skill ID rather than
+// copilotSkillFromShared keeps the shared body byte-for-byte and puts
+// the Copilot frontmatter in front of it. `name` is the skill ID rather than
 // the parsed frontmatter name: the CLI requires a lowercase, hyphenated
 // name and matches it against the containing directory, and the ID is
 // the value that is guaranteed (by skillpack.ValidID) to be both.
-func copilotSkillFromClaude(skill skillpack.Skill) string {
+func copilotSkillFromShared(skill skillpack.Skill) string {
 	return skillpack.RenderFrontmatter([][2]string{
 		{"name", skill.ID},
 		{"description", skill.Description},
