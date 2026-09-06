@@ -21,19 +21,31 @@ var ErrCheckoutMutationStale = errors.New("indexer: checkout mutation view is st
 // routed generation. It does not mean the disk mutation was rolled back.
 var ErrCheckoutMutationPending = errors.New("indexer: checkout mutation refresh is pending")
 
+// ErrCheckoutMutationBusy refuses admission before source is written. Retry
+// once the active checkout build releases its lane; no primary fallback writes.
+var ErrCheckoutMutationBusy = errors.New("indexer: checkout mutation lane is busy; retry")
+
+const checkoutMutationAdmissionTimeout = 250 * time.Millisecond
+
 // CheckoutMutation owns one checkout's physical build lane and route lock for
 // a source edit. Callers must Close it on every exit, including dry runs. It
 // never writes source itself and must not be used to update the primary corpus.
 type CheckoutMutation struct {
-	mu          sync.Mutex
-	coordinator *CheckoutCoordinator
-	checkout    store_sqlite.Checkout
-	rootInfo    os.FileInfo
-	route       store_sqlite.CheckoutRoute
-	release     func()
-	prepared    bool
-	fresh       bool
-	closed      bool
+	mu              sync.Mutex
+	coordinator     *CheckoutCoordinator
+	checkout        store_sqlite.Checkout
+	rootInfo        os.FileInfo
+	route           store_sqlite.CheckoutRoute
+	release         func()
+	prepared        bool
+	fresh           bool
+	closed          bool
+	refreshQueued   bool
+	refreshReserved bool
+	snapshotPinned  bool
+	headRef         string
+	headCommit      string
+	headTree        string
 }
 
 // BeginCheckoutMutation admits a source edit against the exact checkout route
@@ -77,9 +89,11 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 
 	waitCtx, cancel := checkoutMutationContext(ctx, c.lifetimeContext())
 	defer cancel()
-	releaseGate, err := c.gate.Acquire(waitCtx, ViewBuildInteractive)
+	admissionCtx, cancelAdmission := context.WithTimeout(waitCtx, checkoutMutationAdmissionTimeout)
+	defer cancelAdmission()
+	releaseGate, err := c.gate.Acquire(admissionCtx, ViewBuildInteractive)
 	if err != nil {
-		return nil, err
+		return nil, checkoutMutationAdmissionError(waitCtx, err)
 	}
 	gateOwned := true
 	defer func() {
@@ -87,8 +101,8 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 			releaseGate()
 		}
 	}()
-	if err := lockCheckoutMutationCycle(waitCtx, c); err != nil {
-		return nil, err
+	if err := lockCheckoutMutationCycle(admissionCtx, c); err != nil {
+		return nil, checkoutMutationAdmissionError(waitCtx, err)
 	}
 	cycleOwned := true
 	defer func() {
@@ -116,12 +130,12 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 }
 
 // Prepare withdraws the old dirty generation immediately before the disk
-// commit. It is idempotent until Refresh; validation/preview failures and dry
+// commit. It is idempotent until Refresh or EnqueueRefresh; failures and dry
 // runs must not call it. Already-pinned readers retain their immutable view.
 func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed || m.fresh {
+	if m.closed || m.fresh || m.refreshQueued {
 		return fmt.Errorf("%w: mutation lease is no longer writable", ErrCheckoutMutationStale)
 	}
 	if m.prepared {
@@ -135,11 +149,24 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	if err := m.validateSnapshot(ctx); err != nil {
 		return err
 	}
+	if err := m.coordinator.reserveCheckoutRefresh(); err != nil {
+		return err
+	}
+	m.refreshReserved = true
 	if err := m.coordinator.clearDirtySlot(ctx, &m.route); err != nil {
+		m.coordinator.releaseCheckoutRefreshReservation()
+		m.refreshReserved = false
 		return fmt.Errorf("%w: withdraw dirty route: %w", ErrCheckoutMutationStale, err)
 	}
 	m.prepared = true
 	return nil
+}
+
+func checkoutMutationAdmissionError(ctx context.Context, err error) error {
+	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrCheckoutMutationBusy, err)
+	}
+	return err
 }
 
 // Refresh publishes the edited checkout through its sparse coordinator, never
@@ -148,7 +175,7 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed || !m.prepared {
+	if m.closed || !m.prepared || m.refreshQueued {
 		return CheckoutCycle{}, fmt.Errorf("%w: no prepared checkout mutation", ErrCheckoutMutationStale)
 	}
 	ctx, cancel := checkoutMutationContext(ctx, m.coordinator.lifetimeContext())
@@ -187,6 +214,10 @@ func (m *CheckoutMutation) Close() {
 		return
 	}
 	m.closed = true
+	if m.refreshReserved {
+		m.coordinator.releaseCheckoutRefreshReservation()
+		m.refreshReserved = false
+	}
 	if m.prepared && !m.fresh {
 		m.coordinator.Signal("source mutation needs a dirty generation refresh")
 	}
@@ -256,6 +287,11 @@ func (m *CheckoutMutation) validateSnapshot(ctx context.Context) error {
 	if !found || !servableGeneration(dirty.State) || dirty.BaseGenerationID != m.route.CommitGenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
 		return fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
 	}
+	if m.snapshotPinned && (m.headRef != sample.HeadRef || m.headCommit != sample.HeadCommit || m.headTree != sample.HeadTree) {
+		return fmt.Errorf("%w: checkout HEAD changed since source admission", ErrCheckoutMutationStale)
+	}
+	m.snapshotPinned = true
+	m.headRef, m.headCommit, m.headTree = sample.HeadRef, sample.HeadCommit, sample.HeadTree
 	return nil
 }
 
