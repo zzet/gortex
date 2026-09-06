@@ -102,18 +102,6 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	{"nodes_by_kind", `CREATE INDEX IF NOT EXISTS nodes_by_kind ON nodes(kind)`},
 	{"nodes_by_file", `CREATE INDEX IF NOT EXISTS nodes_by_file ON nodes(file_path)`},
 	{"nodes_by_repo", `CREATE INDEX IF NOT EXISTS nodes_by_repo ON nodes(repo_prefix) WHERE repo_prefix <> ''`},
-	// Repo-first (repo_prefix, kind) probes for the repository projections:
-	// the flat kind index invites whole-kind-range scans that a repo filter
-	// then discards — measured on this workspace at 4.67s vs 0.82s (common
-	// kind) and 6.21s vs 0.02s (small repo) against repo-first plans.
-	// Deliberately NOT partial: the projections probe repo_prefix through a
-	// json_each CTE join, and SQLite cannot prove such a join implies
-	// repo_prefix <> '', so a partial index is structurally unusable there —
-	// which is precisely why the partial nodes_by_repo never served these
-	// queries and they fell back to kind-range scans. WITHOUT ROWID keys
-	// make each entry (repo_prefix, kind, id, view_gen), so ID projections
-	// are index-only.
-	{"nodes_by_repo_kind", `CREATE INDEX IF NOT EXISTS nodes_by_repo_kind ON nodes(repo_prefix, kind)`},
 	// Resolver warmup selects definitions by exact repository, compatible
 	// language family, and a bounded page of names. Keep the key minimal: kind
 	// is not a query predicate and WITHOUT ROWID secondary indexes already
@@ -162,10 +150,23 @@ const (
 	edgesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_generation ON edges(view_gen, id) WHERE view_gen > 0`
 )
 
-// bulkAlwaysLiveIndexes are sparse partial indexes. Their predicates keep
-// maintenance bounded, while leaving them live preserves resolver and
-// repository projections as soon as the first repository publishes.
+// bulkAlwaysLiveIndexes preserve bounded maintenance and resolver/repository
+// projections as soon as the first repository publishes. Most are sparse
+// partial indexes; the dense repo-leading index also stays live so per-repo
+// emptiness checks and exact recounts never scan the growing cold corpus.
 var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
+	// Repo-first (repo_prefix, kind) probes for the repository projections:
+	// the flat kind index invites whole-kind-range scans that a repo filter
+	// then discards — measured on this workspace at 4.67s vs 0.82s (common
+	// kind) and 6.21s vs 0.02s (small repo) against repo-first plans.
+	// Deliberately NOT partial: the projections probe repo_prefix through a
+	// json_each CTE join, and SQLite cannot prove such a join implies
+	// repo_prefix <> '', so a partial index is structurally unusable there —
+	// which is precisely why the partial nodes_by_repo never served these
+	// queries and they fell back to kind-range scans. WITHOUT ROWID keys
+	// make each entry (repo_prefix, kind, id, view_gen), so ID projections
+	// are index-only.
+	{"nodes_by_repo_kind", `CREATE INDEX IF NOT EXISTS nodes_by_repo_kind ON nodes(repo_prefix, kind)`},
 	{nodesByGenerationIndexName, nodesByGenerationIndexDDL},
 	{edgesByGenerationIndexName, edgesByGenerationIndexDDL},
 	{"nodes_repo_files", `CREATE INDEX IF NOT EXISTS nodes_repo_files ON nodes(repo_prefix, workspace_id, language, file_path, id) WHERE kind = 'file'`},
