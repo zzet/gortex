@@ -58,6 +58,34 @@ type Tree struct {
 	Dirs map[string]string `json:"dirs"`
 }
 
+// MergeScope combines a rebuilt scope with untouched leaves from the previous
+// repository baseline. A nil contains predicate means a full replacement.
+// Leaves outside the scope are copied verbatim, including empty hashes and
+// old extractor salts: this operation does not read or certify those files.
+// Neither input tree is mutated.
+func MergeScope(prior, scoped *Tree, contains func(string) bool) *Tree {
+	merged := &Tree{
+		Files: make(map[string]FileNode),
+		Dirs:  make(map[string]string),
+	}
+	if prior != nil && contains != nil {
+		for rel, leaf := range prior.Files {
+			if !contains(rel) {
+				merged.Files[rel] = leaf
+			}
+		}
+	}
+	if scoped != nil {
+		for rel, leaf := range scoped.Files {
+			if contains == nil || contains(rel) {
+				merged.Files[rel] = leaf
+			}
+		}
+	}
+	merged.aggregate()
+	return merged
+}
+
 // Build constructs a Merkle tree for the files (forward-slash repo-
 // relative paths) under rootAbs. When prior is non-nil, a file whose
 // on-disk mtime matches prior's reuses the prior content hash and is
