@@ -48,6 +48,16 @@ func (s *Store) BackfillWorkspaceSlugsWithImpact(slugs []graph.WorkspaceSlug) gr
 	for start := 0; start < len(updates); start += workspaceSlugChunkSize {
 		end := minInt(start+workspaceSlugChunkSize, len(updates))
 		chunk := updates[start:end]
+		candidateQuery, candidateArgs := workspaceSlugCandidates(s.viewGen, chunk)
+		var hasCandidates bool
+		if scanErr := tx.QueryRow(candidateQuery, candidateArgs...).Scan(&hasCandidates); scanErr != nil {
+			_ = tx.Rollback()
+			panicOnFatal(scanErr)
+			return graph.WorkspaceSlugBackfillResult{}
+		}
+		if !hasCandidates {
+			continue
+		}
 		impactQuery, impactArgs := workspaceSlugResolutionImpact(s.viewGen, chunk)
 		var resolutionAffected int
 		if scanErr := tx.QueryRow(impactQuery, impactArgs...).Scan(&resolutionAffected); scanErr != nil {
@@ -90,6 +100,24 @@ func (s *Store) BackfillWorkspaceSlugsWithImpact(slugs []graph.WorkspaceSlug) gr
 	}
 	s.finishAnalysisMutationLocked(backfill.Changed > 0)
 	return backfill
+}
+
+// Probe the database-maintained missing-ownership frontier, not every node in
+// a repository. Reevaluate supplied configuration on each call; project-only
+// and builtin fills remain eligible even when resolution impact is zero.
+func workspaceSlugCandidates(viewGen int64, slugs []graph.WorkspaceSlug) (string, []any) {
+	values, args := workspaceSlugValues(slugs)
+	args = append(args, viewGen)
+	query := `WITH updates(repo_prefix, workspace_id, project_id) AS (VALUES ` + values + `)
+	SELECT EXISTS (
+		SELECT 1 FROM updates AS u
+		CROSS JOIN nodes AS n INDEXED BY nodes_missing_workspace_slugs ON n.repo_prefix = u.repo_prefix
+		WHERE n.view_gen = ?
+			AND (n.workspace_id = '' OR n.project_id = '')
+			AND ((n.workspace_id = '' AND u.workspace_id <> '')
+				OR (n.project_id = '' AND u.project_id <> ''))
+	)`
+	return query, args
 }
 
 func workspaceSlugValues(slugs []graph.WorkspaceSlug) (string, []any) {
