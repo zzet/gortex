@@ -11,7 +11,6 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 )
 
@@ -32,8 +31,8 @@ func TestCodexGlobalModeInstallsSubAgents(t *testing.T) {
 	}
 
 	names := SubAgentNames()
-	if len(names) != len(claudecode.SubAgents) {
-		t.Fatalf("rendered %d sub-agents, want %d", len(names), len(claudecode.SubAgents))
+	if len(names) != len(agents.SubAgents) {
+		t.Fatalf("rendered %d sub-agents, want %d", len(names), len(agents.SubAgents))
 	}
 	if len(names) == 0 {
 		t.Fatal("sub-agent set is empty")
@@ -360,8 +359,8 @@ func TestCodexSubAgentsRefuseAnEmptyHome(t *testing.T) {
 // test can inspect the neutral Skill rather than the rendered file.
 func subAgentSkills(t *testing.T) []skillpack.Skill {
 	t.Helper()
-	out := make([]skillpack.Skill, 0, len(claudecode.SubAgents))
-	for file, body := range claudecode.SubAgents {
+	out := make([]skillpack.Skill, 0, len(agents.SubAgents))
+	for file, body := range agents.SubAgents {
 		skill, err := skillpack.Parse(subAgentID(file), body)
 		if err != nil {
 			t.Fatalf("parse %s: %v", file, err)

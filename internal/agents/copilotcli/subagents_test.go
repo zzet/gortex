@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 )
 
 // TestGlobalModeInstallsSubAgents pins the discovery-critical filename
@@ -19,8 +18,8 @@ func TestGlobalModeInstallsSubAgents(t *testing.T) {
 	}
 
 	names := SubAgentNames()
-	if len(names) != len(claudecode.SubAgents) {
-		t.Fatalf("rendered %d sub-agents, want %d", len(names), len(claudecode.SubAgents))
+	if len(names) != len(agents.SubAgents) {
+		t.Fatalf("rendered %d sub-agents, want %d", len(names), len(agents.SubAgents))
 	}
 	for _, id := range names {
 		path := filepath.Join(env.Home, copilotConfigDirName, "agents", id+".agent.md")

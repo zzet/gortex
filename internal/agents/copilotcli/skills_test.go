@@ -9,7 +9,6 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/agentstest"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 )
 
 // globalEnv is newCopilotEnv switched to the user-level mode `gortex
@@ -59,8 +58,8 @@ func TestGlobalModeInstallsCuratedSkills(t *testing.T) {
 	}
 
 	names := CuratedSkillNames()
-	if len(names) != len(claudecode.GlobalSkills) {
-		t.Fatalf("curated pack has %d skills, want %d", len(names), len(claudecode.GlobalSkills))
+	if len(names) != len(agents.GlobalSkills) {
+		t.Fatalf("curated pack has %d skills, want %d", len(names), len(agents.GlobalSkills))
 	}
 	for _, id := range names {
 		path := filepath.Join(env.Home, copilotConfigDirName, "skills", id, "SKILL.md")

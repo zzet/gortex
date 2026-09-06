@@ -9,7 +9,6 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/agentstest"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 )
 
@@ -37,8 +36,8 @@ func TestSkillNameEqualsDirectoryForWholeCorpus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", root, err)
 	}
-	if len(entries) != len(claudecode.GlobalSkills) {
-		t.Fatalf("wrote %d skill dirs, want %d", len(entries), len(claudecode.GlobalSkills))
+	if len(entries) != len(agents.GlobalSkills) {
+		t.Fatalf("wrote %d skill dirs, want %d", len(entries), len(agents.GlobalSkills))
 	}
 	for _, entry := range entries {
 		dir := entry.Name()
@@ -77,8 +76,8 @@ func TestCommandsAreNamedByFilename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", root, err)
 	}
-	if len(entries) != len(claudecode.SlashCommands) {
-		t.Fatalf("wrote %d commands, want %d", len(entries), len(claudecode.SlashCommands))
+	if len(entries) != len(agents.SlashCommands) {
+		t.Fatalf("wrote %d commands, want %d", len(entries), len(agents.SlashCommands))
 	}
 	for _, entry := range entries {
 		name := entry.Name()
@@ -89,8 +88,8 @@ func TestCommandsAreNamedByFilename(t *testing.T) {
 		if !skillpack.ValidID(stem) {
 			t.Fatalf("command %q would be invoked as /%s, which is not kebab-case", name, stem)
 		}
-		if _, ok := claudecode.SlashCommands[name]; !ok {
-			t.Fatalf("command %s has no source in claudecode.SlashCommands", name)
+		if _, ok := agents.SlashCommands[name]; !ok {
+			t.Fatalf("command %s has no source in agents.SlashCommands", name)
 		}
 		front := readFrontmatter(t, filepath.Join(root, name))
 		if front["description"] == "" {

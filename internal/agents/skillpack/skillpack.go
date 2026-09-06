@@ -14,11 +14,11 @@
 // This package MUST NOT import any adapter package
 // (internal/agents/claudecode, internal/agents/hermes, …). The skill
 // bodies stay where they are; callers pass the raw map in. The
-// tempting inversion — skillpack reaching into claudecode for the
-// bodies — deadlocks the moment an adapter wants to call back into
-// skillpack (Sync, in sync.go, is exactly that), because Go rejects the
-// import cycle. Keeping the arrow one-way means any number of adapters
-// can depend on skillpack without ever constraining each other.
+// tempting inversion — skillpack reaching up for the bodies itself —
+// deadlocks the moment an adapter wants to call back into skillpack
+// (Sync, in sync.go, is exactly that), because Go rejects the import
+// cycle. Keeping the arrow one-way means any number of adapters can
+// depend on skillpack without ever constraining each other.
 //
 // This file imports only the stdlib. sync.go additionally imports
 // internal/agents and internal/agents/internalutil for the shared file
@@ -64,9 +64,9 @@ func ValidID(id string) bool { return idPattern.MatchString(id) }
 // broken skill, so this is an error rather than a fallback.
 var ErrUnterminatedFrontmatter = errors.New("unterminated frontmatter")
 
-// Parse turns one Claude-style SKILL.md into a Skill: it splits the
-// leading YAML frontmatter off the markdown, and reads the `name` and
-// `description` scalars out of it.
+// Parse turns one SKILL.md into a Skill: it splits the leading YAML
+// frontmatter off the markdown, and reads the `name` and `description`
+// scalars out of it.
 //
 // A document with no frontmatter at all is not an error — the whole
 // text becomes Body and the caller supplies name/description itself.

@@ -28,7 +28,7 @@ slash commands, skills, and hooks. The Cursor variant lands in a
 follow-up.
 
 The marketplace bundle is generated, not hand-maintained. The single
-source of truth lives in internal/agents/claudecode/content.go;
+source of truth lives in internal/agents/commands_bodies.go and
 this command serialises that content into the directory layout the
 marketplace expects.`,
 }

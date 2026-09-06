@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents"
 )
 
 // TestRoutingSkillsMatchLegacyRendering is the zero-diff guard for the
@@ -19,7 +19,7 @@ func TestRoutingSkillsMatchLegacyRendering(t *testing.T) {
 		t.Fatal("no routing skills derived")
 	}
 	for name, got := range routing {
-		want := legacyHermesSkill(name, claudecode.GlobalSkills[name])
+		want := legacyHermesSkill(name, agents.GlobalSkills[name])
 		if got != want {
 			t.Errorf("%s: rendering changed\n--- got ---\n%s\n--- want ---\n%s", name, got, want)
 		}
@@ -50,14 +50,14 @@ metadata:
 	if !strings.HasPrefix(got, want) {
 		t.Errorf("frontmatter drifted\n--- got ---\n%s\n--- want ---\n%s", firstN(got, len(want)), want)
 	}
-	// The Claude body must follow the Hermes frontmatter untouched —
+	// The shared body must follow the Hermes frontmatter untouched —
 	// with no second `---` block stacked on top of it.
 	body := strings.TrimPrefix(got, want)
 	if strings.HasPrefix(body, "---") {
-		t.Errorf("body still carries Claude frontmatter:\n%s", firstN(body, 120))
+		t.Errorf("body still carries the shared frontmatter:\n%s", firstN(body, 120))
 	}
-	if !strings.HasSuffix(claudecode.GlobalSkills["gortex-explore"], body) {
-		t.Errorf("body is not the Claude body verbatim:\n%s", firstN(body, 200))
+	if !strings.HasSuffix(agents.GlobalSkills["gortex-explore"], body) {
+		t.Errorf("body is not the shared body verbatim:\n%s", firstN(body, 200))
 	}
 }
 
@@ -65,9 +65,9 @@ metadata:
 // the reference oracle for the test above. Do not "simplify" it to call
 // the production code — a guard that shares the code under test proves
 // nothing.
-func legacyHermesSkill(name, claudeContent string) string {
-	desc := legacyFrontmatterField(claudeContent, "description")
-	body := legacyStripFrontmatter(claudeContent)
+func legacyHermesSkill(name, sharedContent string) string {
+	desc := legacyFrontmatterField(sharedContent, "description")
+	body := legacyStripFrontmatter(sharedContent)
 	tags, category := routingSkillTaxonomy(name)
 
 	var b strings.Builder

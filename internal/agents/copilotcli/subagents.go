@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/internalutil"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 )
@@ -38,15 +37,15 @@ const (
 // SubAgentNames returns the sub-agent IDs, sorted, so Plan and the
 // install report stay byte-stable across runs.
 func SubAgentNames() []string {
-	names := make([]string, 0, len(claudecode.SubAgents))
-	for file := range claudecode.SubAgents {
+	names := make([]string, 0, len(agents.SubAgents))
+	for file := range agents.SubAgents {
 		names = append(names, subAgentID(file))
 	}
 	sort.Strings(names)
 	return names
 }
 
-// SubAgents renders claudecode.SubAgents into the Copilot envelope,
+// SubAgents renders agents.SubAgents into the Copilot envelope,
 // keyed by agent ID (the filename without any extension).
 //
 // The envelope carries `name` + `description` only. The CLI also accepts
@@ -58,12 +57,12 @@ func SubAgentNames() []string {
 // and no error message. Omitting the key inherits the session's tools,
 // which is the safe half of that trade.
 func SubAgents() map[string]string {
-	out := make(map[string]string, len(claudecode.SubAgents))
-	for file, claudeBody := range claudecode.SubAgents {
+	out := make(map[string]string, len(agents.SubAgents))
+	for file, sharedBody := range agents.SubAgents {
 		id := subAgentID(file)
-		skill, err := skillpack.Parse(id, claudeBody)
+		skill, err := skillpack.Parse(id, sharedBody)
 		if err != nil {
-			// Compile-time constants: only reachable if claudecode is
+			// Compile-time constants: only reachable if the agents package is
 			// edited into a shape skillpack rejects. Skip rather than
 			// install an agent whose frontmatter we could not rewrite.
 			continue
@@ -76,7 +75,7 @@ func SubAgents() map[string]string {
 	return out
 }
 
-// subAgentID strips the ".md" claudecode uses as its map key, leaving the
+// subAgentID strips the ".md" the agents package uses as its map key, leaving the
 // bare name the Copilot filename and frontmatter both need.
 func subAgentID(file string) string {
 	return strings.TrimSuffix(file, ".md")

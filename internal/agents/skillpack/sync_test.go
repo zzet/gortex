@@ -1,6 +1,6 @@
 // sync_test.go stays in the external test package for the same reason
-// skillpack_test.go does: skillpack must never depend on an adapter, and
-// keeping the tests outside the package means an adapter that imports
+// skillpack_test.go does: skillpack must never depend on its consumers,
+// and keeping the tests outside the package means a consumer that imports
 // skillpack can still be imported here without closing a cycle.
 package skillpack_test
 
@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/hermes"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 	"github.com/zzet/gortex/internal/profiles"
@@ -476,10 +475,10 @@ func TestPreWorktreeHashesMatchImmediatelyPriorShippedBodies(t *testing.T) {
 			}
 		}
 	}
-	assertHashes("claude", claudecode.GlobalSkills, skillpack.PreWorktreeClaudeSkillHashes())
+	assertHashes("claude", agents.GlobalSkills, skillpack.PreWorktreeClaudeSkillHashes())
 	assertHashes("hermes", hermes.RoutingSkills(), skillpack.PreWorktreeHermesSkillHashes())
 	agent := make(map[string]string)
-	for id, raw := range claudecode.GlobalSkills {
+	for id, raw := range agents.GlobalSkills {
 		s, err := skillpack.Parse(id, raw)
 		if err != nil {
 			t.Fatal(err)

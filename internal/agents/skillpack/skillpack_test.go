@@ -1,9 +1,8 @@
 // Package skillpack_test is deliberately an external test package: it
-// imports internal/agents/claudecode to assert the real skill corpus
-// parses, and skillpack itself must never import an adapter. Keeping
-// the assertion outside the package means a later phase can have
-// claudecode depend on skillpack without this file turning into an
-// import cycle.
+// imports internal/agents to assert the real skill corpus parses, and
+// skillpack itself must never import its parent. Keeping the assertion
+// outside the package means a later refactor can move the corpus without
+// turning this file into an import cycle.
 package skillpack_test
 
 import (
@@ -11,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 )
 
@@ -19,13 +18,13 @@ import (
 // survive the neutral round trip, because a skill that loses its name
 // or description is one a host silently drops from its picker, and a
 // body that still carries frontmatter renders two stacked blocks.
-func TestParseAllClaudeSkills(t *testing.T) {
-	skills, err := skillpack.ParseAll(claudecode.GlobalSkills)
+func TestParseAllSharedSkills(t *testing.T) {
+	skills, err := skillpack.ParseAll(agents.GlobalSkills)
 	if err != nil {
-		t.Fatalf("ParseAll(claudecode.GlobalSkills): %v", err)
+		t.Fatalf("ParseAll(agents.GlobalSkills): %v", err)
 	}
-	if len(skills) != len(claudecode.GlobalSkills) {
-		t.Fatalf("parsed %d skills, want %d", len(skills), len(claudecode.GlobalSkills))
+	if len(skills) != len(agents.GlobalSkills) {
+		t.Fatalf("parsed %d skills, want %d", len(skills), len(agents.GlobalSkills))
 	}
 
 	for _, skill := range skills {
@@ -49,7 +48,7 @@ func TestParseAllClaudeSkills(t *testing.T) {
 // slice, and Go's randomised map iteration would otherwise reorder
 // them on every run.
 func TestParseAllIsIDSorted(t *testing.T) {
-	skills, err := skillpack.ParseAll(claudecode.GlobalSkills)
+	skills, err := skillpack.ParseAll(agents.GlobalSkills)
 	if err != nil {
 		t.Fatalf("ParseAll: %v", err)
 	}
@@ -65,7 +64,7 @@ func TestParseAllIsIDSorted(t *testing.T) {
 // whose name is not kebab-case, and they refuse it silently.
 func TestSkillIDsAreKebabCase(t *testing.T) {
 	kebab := regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
-	for id := range claudecode.GlobalSkills {
+	for id := range agents.GlobalSkills {
 		if !kebab.MatchString(id) {
 			t.Errorf("skill id %q is not kebab-case", id)
 		}
@@ -80,7 +79,7 @@ func TestSkillIDsAreKebabCase(t *testing.T) {
 // representative) is what lets an adapter re-render descriptions
 // through QuoteYAMLValue without shifting a single installed byte.
 func TestRoundTripReproducesSource(t *testing.T) {
-	skills, err := skillpack.ParseAll(claudecode.GlobalSkills)
+	skills, err := skillpack.ParseAll(agents.GlobalSkills)
 	if err != nil {
 		t.Fatalf("ParseAll: %v", err)
 	}
@@ -89,7 +88,7 @@ func TestRoundTripReproducesSource(t *testing.T) {
 			{"name", skill.Name},
 			{"description", skill.Description},
 		}) + skill.Body
-		if want := claudecode.GlobalSkills[skill.ID]; got != want {
+		if want := agents.GlobalSkills[skill.ID]; got != want {
 			t.Errorf("%s: round trip changed the file\n--- got ---\n%s\n--- want ---\n%s", skill.ID, firstLines(got, 6), firstLines(want, 6))
 		}
 	}

@@ -8,7 +8,6 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/agentstest"
-	"github.com/zzet/gortex/internal/agents/claudecode"
 )
 
 // TestInspectEmptyHome: doctor describes a broken machine, it does not
@@ -46,11 +45,11 @@ func TestInspectAfterGlobalInstall(t *testing.T) {
 	if state.PluginPath != PluginPath(env.Home) {
 		t.Fatalf("PluginPath disagrees with the writer: %s", state.PluginPath)
 	}
-	if state.Skills != len(claudecode.GlobalSkills) {
-		t.Fatalf("found %d skills, want %d", state.Skills, len(claudecode.GlobalSkills))
+	if state.Skills != len(agents.GlobalSkills) {
+		t.Fatalf("found %d skills, want %d", state.Skills, len(agents.GlobalSkills))
 	}
-	if state.Commands != len(claudecode.SlashCommands) {
-		t.Fatalf("found %d commands, want %d", state.Commands, len(claudecode.SlashCommands))
+	if state.Commands != len(agents.SlashCommands) {
+		t.Fatalf("found %d commands, want %d", state.Commands, len(agents.SlashCommands))
 	}
 	// The bridge is the whole hook surface: present means every declared
 	// event is wired.
