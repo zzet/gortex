@@ -1,6 +1,9 @@
 package contracts
 
 import (
+	"iter"
+	"slices"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -21,12 +24,18 @@ func LoadRegistryFromGraph(g graph.Store, repoPrefix string) *Registry {
 	if g == nil {
 		return nil
 	}
-	all := g.GetRepoNodes(repoPrefix)
-	if len(all) == 0 {
-		return nil
+	var nodes iter.Seq[*graph.Node]
+	if repoPrefix == "" {
+		// Preserve the store's global empty-prefix behavior; scoped readers
+		// require an explicit repository or file frontier.
+		nodes = slices.Values(g.GetRepoNodes(""))
+	} else {
+		// Filter before hydration, retaining full metadata for sparse and
+		// wrapper-generated contracts. SQLite streams bounded pages here.
+		nodes = graph.NodesInScopeSeq(g, []string{repoPrefix}, nil, graph.KindContract)
 	}
 	reg := NewRegistry()
-	for _, n := range all {
+	for n := range nodes {
 		if n == nil || n.Kind != graph.KindContract {
 			continue
 		}
