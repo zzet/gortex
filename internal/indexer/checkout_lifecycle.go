@@ -152,6 +152,15 @@ type CheckoutLifecycle struct {
 	// crash residue unless a process-local payload flight has adopted it.
 	buildingRecoveryCutoff int64
 
+	// observationMu bounds and coalesces first-request metadata work. Jobs
+	// belong to this lifecycle, not whichever request first waits for them.
+	observationMu     sync.Mutex
+	observationJobs   map[string]*checkoutObservationJob
+	observationWG     sync.WaitGroup
+	observationClosed bool
+	// observationInventory is a test-only latency seam; set before any jobs.
+	observationInventory func(context.Context, string) (*gitstate.FamilyInventory, error)
+
 	// retryMu owns one deadline timer per family. Filesystem events start the
 	// grace; these timers guarantee its expiry is reconciled even when Git is
 	// otherwise quiet. retryClosing rejects new timer and callback admission
@@ -276,18 +285,18 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		now:                    now,
 		buildingRecoveryCutoff: now().Unix(),
 		leases:                 cfg.ViewLeases,
-		coordinators:          map[string]*CheckoutCoordinator{},
-		coordinatorHeads:      map[string]checkoutHeadIdentity{},
-		coordinatorActivating: map[string]struct{}{},
-		initialInventoryTaken: map[string]bool{},
-		started:               map[string][]*CheckoutCoordinator{},
-		owed:                  map[int64]struct{}{},
-		familyRetries:     map[string]familyRetry{},
-		refViewRetention:  cfg.RefViews.withDefaults(),
-		indexBarrier:      cfg.indexBarrier,
-		transitionCtx:     transitionCtx,
-		cancelTransitions: cancelTransitions,
-		transitionRuns:    map[string]*modeTransitionRun{},
+		coordinators:           map[string]*CheckoutCoordinator{},
+		coordinatorHeads:       map[string]checkoutHeadIdentity{},
+		coordinatorActivating:  map[string]struct{}{},
+		initialInventoryTaken:  map[string]bool{},
+		started:                map[string][]*CheckoutCoordinator{},
+		owed:                   map[int64]struct{}{},
+		familyRetries:          map[string]familyRetry{},
+		refViewRetention:       cfg.RefViews.withDefaults(),
+		indexBarrier:           cfg.indexBarrier,
+		transitionCtx:          transitionCtx,
+		cancelTransitions:      cancelTransitions,
+		transitionRuns:         map[string]*modeTransitionRun{},
 	}
 	// The env override wins over the config-file setting either way, so a
 	// worktree-heavy tree can opt every discovered worktree into dormancy — or
@@ -2093,6 +2102,7 @@ func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	l.closeCheckoutObservations()
 	l.transitionMu.Lock()
 	if !l.transitionClosed {
 		l.transitionClosed = true

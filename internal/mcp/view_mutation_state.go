@@ -19,18 +19,36 @@ type checkoutMutationLifecycle interface {
 	Refresh(context.Context) (indexer.CheckoutCycle, error)
 }
 
+// checkoutMutationScheduler queues publication on the existing coordinator loop.
+// The request must return before that loop can acquire the checkout lease.
+type checkoutMutationScheduler interface {
+	EnqueueRefresh(context.Context, string) (*indexer.CheckoutRefreshTicket, error)
+}
+
+type checkoutMutationIdentity interface {
+	Identity() (checkoutID, incarnation string)
+}
+
 type checkoutMutationContextKey struct{}
 
 type checkoutMutationState struct {
-	mutation checkoutMutationLifecycle
-	root     string
+	mutation      checkoutMutationLifecycle
+	root          string
+	checkoutID    string
+	incarnation   string
+	committedHash string
+	committedPath string
 }
 
 func withCheckoutMutation(ctx context.Context, mutation checkoutMutationLifecycle, root string) context.Context {
-	return context.WithValue(ctx, checkoutMutationContextKey{}, &checkoutMutationState{
+	state := &checkoutMutationState{
 		mutation: mutation,
 		root:     resolveNearestExistingAncestor(root),
-	})
+	}
+	if identity, ok := mutation.(checkoutMutationIdentity); ok {
+		state.checkoutID, state.incarnation = identity.Identity()
+	}
+	return context.WithValue(ctx, checkoutMutationContextKey{}, state)
 }
 
 func checkoutMutationFromContext(ctx context.Context) *checkoutMutationState {
@@ -122,8 +140,34 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 		outcome.Err = err
 		return outcome
 	}
-	// Disk has committed. Give its selected checkout a bounded refresh even
-	// when the caller has disconnected, then let Close signal a retry on failure.
+	if scheduler, ok := state.mutation.(checkoutMutationScheduler); ok {
+		// Disk has committed, so caller cancellation must not abandon graph
+		// publication. Admission only captures evidence and signals the existing
+		// coordinator: never wait here while the handler still holds its lease.
+		ticket, err := scheduler.EnqueueRefresh(context.WithoutCancel(ctx), path)
+		if err != nil {
+			outcome.Err = fmt.Errorf("checkout graph refresh admission failed after disk commit: %w", err)
+			return outcome
+		}
+		if ticket == nil || ticket.Ticket == nil || ticket.Ticket.Done == nil || ticket.CheckoutID == "" || ticket.Incarnation == "" {
+			outcome.Err = fmt.Errorf("checkout graph refresh admission returned no scoped completion ticket")
+			return outcome
+		}
+		if state.checkoutID != "" && (ticket.CheckoutID != state.checkoutID || ticket.Incarnation != state.incarnation) {
+			outcome.Err = fmt.Errorf("checkout graph refresh ticket does not belong to the committed checkout incarnation")
+			return outcome
+		}
+		if !pathkey.EqualPaths(ticket.Ticket.Path, path) {
+			outcome.Err = fmt.Errorf("checkout graph refresh ticket does not name the committed file")
+			return outcome
+		}
+		if state.committedHash != "" && (!pathkey.EqualPaths(state.committedPath, path) || ticket.ContentHash != state.committedHash) {
+			outcome.Err = fmt.Errorf("%w: checkout file changed after disk commit before publication admission", indexer.ErrCheckoutRefreshSuperseded)
+			return outcome
+		}
+		return s.trackCheckoutRefreshTicket(ticket).outcome(true)
+	}
+	// Embedded adapters without queue support retain their synchronous contract.
 	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.mutationWaitDuration())
 	defer cancel()
 	cycle, err := state.mutation.Refresh(refreshCtx)
@@ -131,8 +175,12 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 		outcome.Err = fmt.Errorf("checkout graph refresh failed after disk commit: %w", err)
 		return outcome
 	}
-	if cycle.Err != nil || cycle.Rescheduled || cycle.Deferred || cycle.DirtyGenerationID <= 0 || cycle.CommitGenerationID <= 0 {
-		outcome.Err = fmt.Errorf("checkout graph refresh did not publish an exact view")
+	if cycle.Err != nil {
+		outcome.Err = fmt.Errorf("checkout graph refresh did not publish an exact view: %w", cycle.Err)
+		return outcome
+	}
+	if cycle.Rescheduled || cycle.Deferred || cycle.DirtyGenerationID <= 0 || cycle.CommitGenerationID <= 0 {
+		outcome.Err = fmt.Errorf("checkout graph refresh did not publish an exact view (rescheduled=%t deferred=%t commit_generation=%d dirty_generation=%d)", cycle.Rescheduled, cycle.Deferred, cycle.CommitGenerationID, cycle.DirtyGenerationID)
 		return outcome
 	}
 	outcome.Reindexed = true

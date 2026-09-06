@@ -23,6 +23,11 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 	case receipt != "":
 		record, ok := s.mutationCommits.byReceipt(receipt)
 		if !ok {
+			if payload, found := s.graphRefreshReceiptPayload(ctx, receipt); found {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+		}
+		if !ok || !mutationCommitInScope(ctx, record) {
 			return mcp.NewToolResultError(
 				"no mutation receipt " + receipt + " — receipts are kept for " + mutationCommitRetention.String() +
 					"; query by path instead, or read the file to see its current state"), nil
@@ -31,7 +36,7 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 
 	case mutationID != "":
 		record, ok := s.mutationCommits.byMutationID(mutationID)
-		if !ok {
+		if !ok || !mutationCommitInScope(ctx, record) {
 			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID), nil
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
@@ -42,12 +47,12 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 		// not fatal here: the raw spelling is still matched against the ledger.
 		lookup := rawPath
 		if absPath, relPath, err := s.resolveFilePath(ctx, rawPath); err == nil {
-			if record, ok := s.mutationCommits.recentForPath(relPath); ok {
+			if record, ok := s.recentMutationCommitInScope(ctx, relPath); ok {
 				return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 			}
 			lookup = absPath
 		}
-		record, ok := s.mutationCommits.recentForPath(lookup)
+		record, ok := s.recentMutationCommitInScope(ctx, lookup)
 		if !ok {
 			return s.respondJSONOrTOON(ctx, req, map[string]any{
 				"path":        rawPath,
@@ -60,7 +65,15 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 	}
 
-	records := s.mutationCommits.recent(maxMutationCommitListing)
+	var records []*mutationCommitRecord
+	for _, record := range s.mutationCommits.recent(maxMutationCommits) {
+		if mutationCommitInScope(ctx, record) {
+			records = append(records, record)
+			if len(records) == maxMutationCommitListing {
+				break
+			}
+		}
+	}
 	// Rendered through the same flag as the single-record path. A listing that
 	// showed graph_status without graph_status_terminal would hand an agent
 	// exactly the reading this tool is trying to stop, just by a different
@@ -70,6 +83,69 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 		"count":     len(records),
 		"note":      "most recent first; pass receipt, mutation_id, or path to select one. Read graph_status_terminal before waiting on graph_status",
 	})
+}
+
+// Recovery reindexes have a publication ticket but no disk commit. Accept that
+// same ticket ID through change.receipt without inventing a write verdict.
+func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map[string]any, bool) {
+	value, ok := s.mutationReceipts.Load(id)
+	if !ok {
+		return nil, false
+	}
+	receipt, ok := value.(*mutationReceipt)
+	if !ok {
+		return nil, false
+	}
+	checkoutID, incarnation := mutationCheckoutScope(ctx)
+	if !mutationCheckoutScopeMatches(checkoutID, incarnation, receipt.checkoutID, receipt.checkoutIncarnation) {
+		return nil, false
+	}
+	outcome := receipt.outcome(true)
+	status := graphStatusFor(outcome)
+	payload := map[string]any{
+		"found":                 true,
+		"receipt":               receipt.id,
+		"receipt_kind":          "graph_refresh",
+		"path":                  receipt.path,
+		"disk_status":           "unrecorded",
+		"graph_status_terminal": !outcome.Pending,
+		"graph_note":            mutationGraphStatusNote(status, true, receipt.checkoutID),
+		"guidance":              "this receipt tracks graph publication only; use the mutation_receipt for disk commit evidence",
+	}
+	// This endpoint has no source-file syntax-health target, including for a
+	// canonical watcher receipt. Only render the publication evidence.
+	outcome.checkoutScoped = true
+	s.attachMutationFreshness(payload, "", "", outcome)
+	if receipt.checkoutID != "" {
+		payload["checkout_id"] = receipt.checkoutID
+		payload["checkout_incarnation"] = receipt.checkoutIncarnation
+	}
+	if outcome.Err != nil {
+		payload["error"] = outcome.Err.Error()
+	}
+	return payload, true
+}
+
+func mutationCommitInScope(ctx context.Context, record *mutationCommitRecord) bool {
+	checkoutID, incarnation := mutationCheckoutScope(ctx)
+	record.mu.RLock()
+	defer record.mu.RUnlock()
+	return mutationCheckoutScopeMatches(checkoutID, incarnation, record.checkoutID, record.checkoutIncarnation)
+}
+
+func (s *Server) recentMutationCommitInScope(ctx context.Context, path string) (*mutationCommitRecord, bool) {
+	for _, record := range s.mutationCommits.recent(maxMutationCommits) {
+		if !mutationCommitInScope(ctx, record) {
+			continue
+		}
+		record.mu.RLock()
+		match := record.relPath == path || record.absPath == path
+		record.mu.RUnlock()
+		if match {
+			return record, true
+		}
+	}
+	return nil, false
 }
 
 // mutationStatusPayload renders one record, refreshing the graph half if the
@@ -91,6 +167,7 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		"disk_status":  snap.DiskStatus,
 		"graph_status": snap.GraphStatus,
 	}
+	attachMutationRefreshSnapshot(payload, snap)
 	if snap.MutationID != "" {
 		payload["mutation_id"] = snap.MutationID
 	}
@@ -111,11 +188,36 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	}
 	payload["retry_safe"] = snap.DiskStatus == mutationDiskNotApplied || snap.DiskStatus == mutationDiskFailed
 	payload["graph_status_terminal"] = graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded)
-	if note := graphStatusNote(snap.GraphStatus, snap.GraphRecorded); note != "" {
+	if note := mutationGraphStatusNote(snap.GraphStatus, snap.GraphRecorded, snap.CheckoutID); note != "" {
 		payload["graph_note"] = note
 	}
 	payload["guidance"] = mutationStatusGuidance(snap.DiskStatus)
 	return payload
+}
+
+func mutationGraphStatusNote(graph string, recorded bool, checkoutID string) string {
+	if recorded && checkoutID != "" && graph == mutationGraphFailed {
+		return "publication of the original checkout content failed terminally; inspect the error and the current exact checkout view. A different branch or later edit cannot certify this receipt; request a new scoped refresh if needed"
+	}
+	return graphStatusNote(graph, recorded)
+}
+
+func attachMutationRefreshSnapshot(payload map[string]any, snap mutationCommitSnapshot) {
+	if snap.ReindexReceipt != "" {
+		payload["reindex_receipt"] = snap.ReindexReceipt
+	}
+	if snap.ReindexGeneration != 0 {
+		payload["reindex_generation"] = snap.ReindexGeneration
+	}
+	if snap.AppliedGeneration != 0 {
+		payload["applied_generation"] = snap.AppliedGeneration
+	}
+	if snap.CheckoutID != "" {
+		payload["checkout_id"] = snap.CheckoutID
+	}
+	if snap.CheckoutIncarnation != "" {
+		payload["checkout_incarnation"] = snap.CheckoutIncarnation
+	}
 }
 
 // graphStatusTerminal answers the only question a caller actually has about
@@ -198,6 +300,7 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 			"graph_status":          snap.GraphStatus,
 			"graph_status_terminal": graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded),
 		}
+		attachMutationRefreshSnapshot(entry, snap)
 		// Every remaining field mirrors mutationCommitSnapshot's omitempty
 		// exactly. Rendering by hand is what dropped new_sha and
 		// bytes_written the first time, so the parity is asserted against the

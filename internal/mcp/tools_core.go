@@ -1523,6 +1523,14 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 	}
 
 	pathArg := req.GetString("path", "")
+	if control := checkoutControlFromContext(ctx); control != nil {
+		if err := control.validateReindexPaths(pathArg, paths); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if control.CheckoutScoped {
+			return s.handleCheckoutControlReindex(ctx, req, control, paths)
+		}
+	}
 
 	var (
 		result      *indexer.IndexResult
@@ -1563,6 +1571,9 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 			}
 		}
 		reindexRoot, _ = s.multiIndexer.RepoRoot(prefix)
+		if scopeErr := s.repoPrefixInSessionScope(ctx, prefix, prefix); scopeErr != nil {
+			return mcp.NewToolResultError(scopeErr.Error()), nil
+		}
 		eligible = s.failedReceiptsBefore(paths, reindexRoot)
 		result, err = s.multiIndexer.IncrementalReindexRepo(prefix, paths)
 		if err != nil {

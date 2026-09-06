@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // SetOverlayManager wires the editor-overlay manager into the MCP
@@ -123,6 +124,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read and stripped here so every tool honours it and no handler or
 		// schema has to know about it. Stripping precedes reconciliation so
 		// the alias matcher cannot rewrite it into a tool's own parameter.
+		requireExactView := requestRequiresExactCheckoutView(&req)
 		selector, selectorErr := takeViewSelector(&req)
 		if selectorErr != nil {
 			return mcp.NewToolResultError(selectorErr.Error()), nil
@@ -160,13 +162,38 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// overlay so a session's editor buffers layer on top of whatever
 		// answers here. The lease the materialized view holds is released
 		// with the request, on the same lifecycle that discards the overlay.
-		view, viewErr := s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req))
-		if viewErr != nil {
-			return mcp.NewToolResultError(viewErr.Error()), nil
+		controlOperation := s.checkoutControlOperation(&req)
+		if controlOperation != "" {
+			control, controlErr := s.resolveCheckoutControlScope(ctx, selector, &req)
+			if controlErr != nil {
+				return mcp.NewToolResultError(controlErr.Error()), nil
+			}
+			ctx = withCheckoutControl(ctx, control)
+		}
+		var view *requestView
+		if !catalogOnlyCheckoutControl(controlOperation) {
+			var viewErr error
+			view, viewErr = s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req))
+			if viewErr != nil {
+				control := checkoutControlFromContext(ctx)
+				if controlOperation != "detect_changes" || control == nil || !control.CheckoutScoped {
+					return mcp.NewToolResultError(viewErr.Error()), nil
+				}
+				// A pending graph cannot certify symbol impact. The detect handler
+				// can still report this checkout's Git file changes, explicitly
+				// incomplete, without substituting the primary's working tree.
+				view, _ = viewFallback(false, graphview.NewViewRider(control.Selector), viewErr)
+				view.rider.CheckoutID = control.Checkout.CheckoutID
+				view.rider.GraphID = control.GraphID
+			}
 		}
 		if view != nil {
 			ctx = withRequestView(ctx, view)
 			defer view.close()
+		}
+		if requireExactView && view != nil && view.rider != nil && !view.rider.Exact {
+			return mcp.NewToolResultError(graphview.NewViewError(graphview.CodeViewBuilding,
+				"the requested exact checkout view is unavailable; retry after publication; no fallback was served").Error()), nil
 		}
 		// Approved source tools serialize with the selected checkout's index
 		// coordinator. The lease does not invalidate or rebuild for dry runs;
@@ -183,10 +210,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// What the view can answer, checked against what this operation
 		// needs, before the handler runs — a thin view must refuse rather
 		// than answer thinly and look complete doing it.
-		if refused := s.evaluateRequestCapabilities(ctx, &req, capabilities); refused != nil {
-			return refused, nil
+		if !catalogOnlyCheckoutControl(controlOperation) {
+			if refused := s.evaluateRequestCapabilities(ctx, &req, capabilities); refused != nil {
+				return refused, nil
+			}
 		}
-		if injectOverlay && view.acceptsBufferOverlay() {
+		if injectOverlay && !catalogOnlyCheckoutControl(controlOperation) && view.acceptsBufferOverlay() {
 			var err error
 			ctx, _, err = s.prepareOverlayRequest(ctx)
 			if err != nil {
@@ -252,6 +281,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			// came from somewhere other than the base — or fell back to it —
 			// must say so where the caller already looks for provenance.
 			res = s.attachViewRider(ctx, res)
+			res = s.attachCheckoutControlScope(ctx, res)
 		}
 		// The arg guard's warn rider lands here — after the warming and
 		// freshness decorators, both of which rebuild the text result from

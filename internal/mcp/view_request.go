@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -15,7 +16,6 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
-	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/viewmetrics"
@@ -537,23 +537,70 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 	if cwd == "" {
 		return nil, nil
 	}
-	checkout, found, err := graphview.CheckoutForPath(ctx, s.materializer.Catalog, s.viewFamilies(ctx), cwd)
+	checkout, found, err := s.checkoutForRequestPath(ctx, cwd)
 	if err != nil {
-		// The binding is an optimization over the base corpus, not a
-		// precondition for answering: a catalog that cannot be read still
-		// answers from the base. The cwd may well sit inside a routed
-		// checkout, so the degradation rides on the response rather than
-		// passing for an exact answer.
-		if s.logger != nil {
-			s.logger.Debug("view routing: could not bind the session cwd to a checkout", zap.Error(err))
-		}
-		return viewFallback(false, graphview.NewViewRider(graphview.Selector{Kind: graphview.SelectorAuto}), err)
+		return s.viewForCWDLookupError(cwd, err)
 	}
 	if !found || !graphview.ServesAutomaticView(checkout) {
 		return nil, nil
 	}
+	if err := s.checkoutInSessionScope(ctx, checkout); err != nil {
+		return nil, err
+	}
 	requested := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID}
 	return s.materializeRequestView(ctx, requested, checkout, false)
+}
+
+// A lookup error is not proof that the canonical corpus owns this CWD. Only
+// independent tracked-root metadata may authorize the legacy catalog fallback;
+// an unknown, nested, or automatic sibling checkout must fail closed instead.
+func (s *Server) viewForCWDLookupError(cwd string, err error) (*requestView, error) {
+	if errors.Is(err, indexer.ErrCheckoutMutationStale) || errors.Is(err, indexer.ErrCheckoutRefreshStopped) {
+		return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+			"automatic checkout discovery no longer has a valid checkout identity", err)
+	}
+	if errors.Is(err, indexer.ErrCheckoutMutationBusy) {
+		return nil, graphview.WrapViewError(graphview.CodeViewBuilding,
+			"automatic checkout discovery is still pending; retry this request", err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+			"automatic checkout discovery was interrupted", err)
+	}
+	if checkoutLookupErrorRequiresRefusal(err) {
+		return nil, err
+	}
+	if s.logger != nil {
+		s.logger.Debug("view routing: could not bind the session cwd to a checkout", zap.Error(err))
+	}
+	if s.multiIndexer != nil {
+		_, _, prefix, bound := s.multiIndexer.ScopeForCWD(cwd)
+		if root, found := s.multiIndexer.RepoRoot(prefix); bound && found && checkoutControlRootOwnsPath(root, cwd) == nil {
+			return viewFallback(false, graphview.NewViewRider(graphview.Selector{Kind: graphview.SelectorAuto}), err)
+		}
+	}
+	return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
+		"checkout lookup failed before a canonical root could be established", err)
+}
+
+// Catalog reads use checkout_inaccessible too; that code may reach the
+// independent canonical-ownership gate. No wrapper or joined cause may hide
+// a more specific refusal such as a denied scope or invalid selector.
+func checkoutLookupErrorRequiresRefusal(err error) bool {
+	if code := graphview.CodeOf(err); code != "" && code != graphview.CodeCheckoutInaccessible {
+		return true
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, cause := range wrapped.Unwrap() {
+			if checkoutLookupErrorRequiresRefusal(cause) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return checkoutLookupErrorRequiresRefusal(wrapped.Unwrap())
+	}
+	return false
 }
 
 // viewForWorktreeSelector serves an explicitly named checkout. Every refusal
@@ -564,39 +611,9 @@ func (s *Server) viewForWorktreeSelector(
 	selector graphview.Selector,
 	policy requestViewPolicy,
 ) (*requestView, error) {
-	catalog := s.materializer.Catalog
-	var checkout store_sqlite.Checkout
-	var found bool
-	var err error
-	subject := selector.CheckoutID
-	if selector.Path != "" {
-		subject = selector.Path
-		root := canonicalWorktreeSelectorRoot(selector.Path)
-		checkout, found, err = graphview.CheckoutForPath(ctx, catalog, s.viewFamilies(ctx), root)
-		// A new nested worktree must not be mistaken for its already-indexed
-		// parent while discovery is pending. Path selectors name roots, unlike
-		// implicit session-CWD binding which also accepts directories inside one.
-		if err == nil && found {
-			found = pathkey.EqualPaths(root, canonicalWorktreeSelectorRoot(checkout.RootPath))
-		}
-	} else {
-		checkout, found, err = catalog.GetCheckout(ctx, selector.CheckoutID)
-	}
-	switch {
-	case err != nil:
-		return nil, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
-			fmt.Sprintf("read checkout %q", subject), err)
-	case !found:
-		if selector.Path == "" && filepath.IsAbs(selector.CheckoutID) {
-			return nil, graphview.NewViewError(graphview.CodeInvalidViewSelector,
-				fmt.Sprintf("view.checkout_id expects a registered identifier, not a filesystem path; use view:{kind:\"worktree\",path:%q} or workspace(operation:\"checkouts\") to find its checkout_id", selector.CheckoutID))
-		}
-		if selector.Path != "" {
-			return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible,
-				fmt.Sprintf("no registered worktree root matches path %q; supply the worktree root, and if automatic discovery is pending inspect workspace(operation:\"checkouts\") and retry", selector.Path))
-		}
-		return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible,
-			fmt.Sprintf("checkout %q is not registered; use view.path for a filesystem path or workspace(operation:\"checkouts\") to find its checkout_id", selector.CheckoutID))
+	checkout, err := s.registeredWorktreeSelector(ctx, selector)
+	if err != nil {
+		return nil, err
 	}
 	if checkout.State != store_sqlite.CheckoutStateReady {
 		stateErr := graphview.NewViewError(graphview.CodeCheckoutInaccessible,
@@ -720,6 +737,7 @@ func (s *Server) materializeRequestView(
 	strict bool,
 ) (*requestView, error) {
 	rider := graphview.NewViewRider(requested)
+	rider.CheckoutID = checkout.CheckoutID
 	route, found, err := s.materializer.Catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
 	switch {
 	case err != nil:
@@ -900,20 +918,25 @@ func (s *Server) repoPrefixInSessionScope(ctx context.Context, repoPrefix, subje
 // its own dedicated graph when it has one, and otherwise the family's primary
 // base graph, which is the lane an automatic checkout reads through.
 func (s *Server) repoPrefixForCheckout(ctx context.Context, checkout store_sqlite.Checkout) string {
+	prefix, _ := s.repoPrefixForCheckoutChecked(ctx, checkout)
+	return prefix
+}
+
+func (s *Server) repoPrefixForCheckoutChecked(ctx context.Context, checkout store_sqlite.Checkout) (string, error) {
 	graphs, err := s.materializer.Catalog.ListDedicatedGraphs(ctx, checkout.FamilyID)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	primary := ""
 	for _, dedicated := range graphs {
 		if dedicated.OwnerCheckoutID == checkout.CheckoutID && dedicated.RepoPrefix != "" {
-			return dedicated.RepoPrefix
+			return dedicated.RepoPrefix, nil
 		}
 		if dedicated.IsPrimaryBase && dedicated.RepoPrefix != "" {
 			primary = dedicated.RepoPrefix
 		}
 	}
-	return primary
+	return primary, nil
 }
 
 // refuseRoutedViewMutation admits only mutations that obtained checkout-local

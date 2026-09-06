@@ -83,15 +83,20 @@ func TestHalfRoutedRequestCountsABuildingFallback(t *testing.T) {
 
 // TestUnreadableBindingCountsAnInaccessibleFallback pins the other reason: a
 // catalog that cannot be read is a different operational problem from a view
-// that is still being built, and one counter for both would hide it.
+// that is still being built. Independent canonical ownership permits this
+// fallback; an unbound automatic checkout is refused and is not counted served.
 func TestUnreadableBindingCountsAnInaccessibleFallback(t *testing.T) {
 	stack := newViewStack(t)
 	breakCheckoutReads(t, stack.dbPath)
 
 	var reader graph.Reader
 	before := viewmetrics.Read()
-	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil, captureReader(stack.srv, &reader)); err != nil {
+	res, err := stack.callWithView(t, stack.repoRoot, "get_symbol", nil, captureReader(stack.srv, &reader))
+	if err != nil {
 		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("canonical fallback was refused: %s", viewResultText(t, res))
 	}
 	after := viewmetrics.Read()
 
@@ -100,6 +105,36 @@ func TestUnreadableBindingCountsAnInaccessibleFallback(t *testing.T) {
 	}
 	if got := fallbackDelta(before, after, graphview.CodeViewBuilding); got != 0 {
 		t.Fatalf("an unreadable catalog was counted as a building view (%d)", got)
+	}
+	if got := servedDelta(before, after, viewmetrics.ViewBase); got != 1 {
+		t.Fatalf("canonical base views served = %d, want 1", got)
+	}
+}
+
+func TestUnreadableAutomaticBindingCountsNeitherServedNorFallback(t *testing.T) {
+	stack := newViewStack(t)
+	breakCheckoutReads(t, stack.dbPath)
+
+	var reader graph.Reader
+	before := viewmetrics.Read()
+	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil, captureReader(stack.srv, &reader))
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	after := viewmetrics.Read()
+	assertToolError(t, res, graphview.CodeCheckoutInaccessible)
+	if reader != nil {
+		t.Fatal("refused automatic checkout reached the graph handler")
+	}
+	for _, kind := range []string{viewmetrics.ViewBase, viewmetrics.ViewWorktree} {
+		if got := servedDelta(before, after, kind); got != 0 {
+			t.Fatalf("refused checkout counted a %s answer (%d)", kind, got)
+		}
+	}
+	for _, reason := range viewmetrics.ViewErrorCodes {
+		if got := fallbackDelta(before, after, reason); got != 0 {
+			t.Fatalf("refused checkout counted a %s fallback (%d)", reason, got)
+		}
 	}
 }
 

@@ -304,6 +304,10 @@ func checkoutMutationGit(t testing.TB, dir string, args ...string) string {
 }
 
 func newRealCheckoutMutationFixture(t testing.TB) *realCheckoutMutationFixture {
+	return newRealCheckoutMutationFixtureWithRegistry(t, nil)
+}
+
+func newRealCheckoutMutationFixtureWithRegistry(t testing.TB, configure func(*parser.Registry)) *realCheckoutMutationFixture {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
@@ -329,6 +333,9 @@ func newRealCheckoutMutationFixture(t testing.TB) *realCheckoutMutationFixture {
 	require.NoError(t, err)
 	registry := parser.NewRegistry()
 	languages.RegisterAll(registry)
+	if configure != nil {
+		configure(registry)
+	}
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(store, registry, bm, cm, zap.NewNop())
 	leases := graphview.NewLeaseManager()
@@ -432,7 +439,7 @@ func TestWorktreeMutationCoordinatorEndToEnd(t *testing.T) {
 			writeArgs := args(false)
 			written := fixture.edit(t, cwd, writeArgs)
 			require.False(t, written.IsError, viewResultText(t, written))
-			require.Equal(t, true, decodeFileOpsResult(t, written)["reindexed"])
+			fixture.awaitMutation(t, cwd, written)
 			afterWrite, found, err := fixture.store.Catalog().GetCheckoutRoute(ctx, fixture.checkoutID)
 			require.NoError(t, err)
 			require.True(t, found)
@@ -510,7 +517,7 @@ func TestWorktreeMutationFacadeEndToEnd(t *testing.T) {
 						require.Equal(t, primitiveWorktreeSource, string(body))
 					} else {
 						require.Equal(t, after, string(body))
-						require.Equal(t, true, decodeFileOpsResult(t, result)["reindexed"])
+						fixture.awaitMutation(t, fixture.primary, result)
 					}
 				}
 				primaryAfter, err := os.ReadFile(filepath.Join(fixture.primary, "edit.go"))
