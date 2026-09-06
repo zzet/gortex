@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"errors"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -43,6 +44,14 @@ func (s *Store) ReplaceContractOwners(replacement graph.ContractOwnerReplacement
 	}()
 
 	result := graph.ContractOwnerReplaceResult{}
+	if hasFiles && hasTouched {
+		invalidated, invalidationErr := s.invalidateContractOwnerScalarsTx(
+			tx, replacement.RepoPrefix, filesJSON, touchedJSON)
+		if invalidationErr != nil {
+			return graph.ContractOwnerReplaceResult{}, invalidationErr
+		}
+		result.NodesChanged = invalidated
+	}
 	if hasFiles {
 		removed, execErr := tx.Exec(`
 WITH owner_files(file_path) AS (
@@ -77,7 +86,7 @@ WHERE kind IN (?, ?, ?)
 	if err != nil {
 		return graph.ContractOwnerReplaceResult{}, err
 	}
-	result.NodesChanged = nodesChanged
+	result.NodesChanged += nodesChanged
 	edgesAdded, _, _, err := insertEdgeChunksTx(tx, s.viewGen, replacement.Edges, false)
 	if err != nil {
 		return graph.ContractOwnerReplaceResult{}, err
@@ -85,6 +94,13 @@ WHERE kind IN (?, ?, ?)
 	result.EdgesAdded = edgesAdded
 
 	if hasTouched {
+		// Exact invalidation above retired only removed scalar records. A
+		// recoverable scalar from another file/repository remains a live owner
+		// even if this replacement removed the final incoming owner edge.
+		prunableJSON, err := s.prunableContractOwnerIDsTx(tx, touchedJSON)
+		if err != nil {
+			return graph.ContractOwnerReplaceResult{}, err
+		}
 		const orphanContractIDs = `
 WITH touched(id) AS (
     SELECT CAST(value AS TEXT) FROM json_each(?)
@@ -104,7 +120,7 @@ DELETE FROM edges
 WHERE (from_id IN (SELECT id FROM orphan)
     OR to_id IN (SELECT id FROM orphan))
   AND view_gen = ?`,
-			touchedJSON, s.viewGen, string(graph.KindContract),
+			prunableJSON, s.viewGen, string(graph.KindContract),
 			string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute),
 			s.viewGen, s.viewGen)
 		if execErr != nil {
@@ -118,7 +134,7 @@ WHERE (from_id IN (SELECT id FROM orphan)
 
 		removed, execErr = tx.Exec(orphanContractIDs+`
 DELETE FROM nodes WHERE id IN (SELECT id FROM orphan) AND view_gen = ?`,
-			touchedJSON, s.viewGen, string(graph.KindContract),
+			prunableJSON, s.viewGen, string(graph.KindContract),
 			string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute),
 			s.viewGen, s.viewGen)
 		if execErr != nil {
@@ -143,6 +159,82 @@ DELETE FROM nodes WHERE id IN (SELECT id FROM orphan) AND view_gen = ?`,
 	return result, nil
 }
 
+// invalidateContractOwnerScalarsTx runs only while the caller holds writeMu
+// and its existing replacement transaction. It reads bounded candidate rows
+// from the exact handle generation; no read-pool snapshot is blindly upserted.
+func (s *Store) invalidateContractOwnerScalarsTx(tx *sql.Tx, repo, filesJSON, touchedJSON string) (int, error) {
+	rows, err := tx.Query(`SELECT `+lookupNodeCols+` FROM nodes
+WHERE view_gen = ? AND kind = ? AND repo_prefix = ?
+  AND id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+  AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+		s.viewGen, string(graph.KindContract), repo, touchedJSON, filesJSON)
+	if err != nil {
+		return 0, err
+	}
+	var updates []*graph.Node
+	for rows.Next() {
+		node, scanErr := scanNodeCursor(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return 0, scanErr
+		}
+		removed, _ := node.Meta["contract_owner_removed"].(bool)
+		ownerBacked, _ := node.Meta["contract_owner_record"].(bool)
+		if removed || ownerBacked {
+			continue
+		}
+		if node.Meta == nil {
+			node.Meta = make(map[string]any, 1)
+		}
+		node.Meta["contract_owner_removed"] = true
+		updates = append(updates, node)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	changed, _, _, err := insertNodeChunksTx(tx, s.viewGen, updates, false)
+	return changed, err
+}
+
+func (s *Store) prunableContractOwnerIDsTx(tx *sql.Tx, touchedJSON string) (string, error) {
+	rows, err := tx.Query(`SELECT `+lookupNodeCols+` FROM nodes
+WHERE view_gen = ? AND kind = ?
+  AND id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+		s.viewGen, string(graph.KindContract), touchedJSON)
+	if err != nil {
+		return "", err
+	}
+	var ids []string
+	for rows.Next() {
+		node, scanErr := scanNodeCursor(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return "", scanErr
+		}
+		removed, _ := node.Meta["contract_owner_removed"].(bool)
+		ownerBacked, _ := node.Meta["contract_owner_record"].(bool)
+		if removed || ownerBacked {
+			ids = append(ids, node.ID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", err
+	}
+	if err := rows.Close(); err != nil {
+		return "", err
+	}
+	encoded, _ := projectionJSON(ids)
+	if encoded == "" {
+		encoded = "[]"
+	}
+	return encoded, nil
+}
+
 func nonEmptyProjectionJSON(values []string) (string, bool) {
 	filtered := make([]string, 0, len(values))
 	for _, value := range values {
@@ -154,8 +246,8 @@ func nonEmptyProjectionJSON(values []string) (string, bool) {
 }
 
 // contractOwnerPruneIDs omits current replacement nodes. A current contract
-// without a symbol has no provides/consumes edge but remains a valid extracted
-// contract; only IDs absent from the new file frontier are orphan candidates.
+// without an admitted source owner remains a valid extracted scalar; only IDs
+// absent from the new file frontier are orphan candidates.
 func contractOwnerPruneIDs(replacement graph.ContractOwnerReplacement) []string {
 	current := make(map[string]struct{}, len(replacement.Nodes))
 	for _, node := range replacement.Nodes {

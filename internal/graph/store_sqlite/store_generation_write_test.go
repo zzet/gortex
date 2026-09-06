@@ -912,9 +912,12 @@ func generationWriteCases() []generationWriteCase {
 // generationWriteContractMaterial is the contract node plus the owner edge both
 // the contract evicter and the owner replacer select on.
 func generationWriteContractMaterial() ([]*graph.Node, []*graph.Edge) {
+	// This canonical belongs only to the owner edge below. Its different
+	// file path must not imply a separate, surviving legacy scalar record.
 	return []*graph.Node{{
 		ID: genWriteContract, Kind: graph.KindContract, Name: "Contract",
 		FilePath: "repo::pkg/contract.go", RepoPrefix: genWriteRepo,
+		Meta: map[string]any{"contract_owner_record": true},
 	}}, []*graph.Edge{{
 		From: genWriteCaller, To: genWriteContract, Kind: graph.EdgeProvides,
 		FilePath: genWriteCallerFile, Line: 5,
