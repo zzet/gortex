@@ -161,6 +161,24 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 			return 0, 0, err
 		}
 	}
+	// A repository's first cold drain has no existing nodes, but the incoming
+	// edge DELETE can still scan the growing edge table while its index is
+	// deferred. Prove emptiness in the same writer transaction and generation
+	// as the deletes: persisted repository counters are not a freshness proof.
+	// Sidecar cleanup stays above this guard because bindings and failures can
+	// outlive every candidate node.
+	var hasCandidates bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE `+scoped+` LIMIT 1)`, scopeArgs...).Scan(&hasCandidates); err != nil {
+		return 0, 0, err
+	}
+	if !hasCandidates {
+		if err := tx.Commit(); err != nil {
+			return 0, 0, err
+		}
+		s.finishAnalysisMutationLocked(false)
+		return 0, 0, nil
+	}
+
 	scopedNodes := `SELECT id FROM nodes WHERE ` + scoped
 	for _, column := range []string{"from_id", "to_id"} {
 		result, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE `+column+` IN (`+scopedNodes+`)`+edgeScope, edgeArgs...)
