@@ -186,3 +186,25 @@ Formatting the daemon's retryable admission-error response measured 2.34–2.38 
 per response (three 200 ms benchmark runs, 1,601 bytes and 26 allocations per
 operation). Wire-level tests preserve initialization/capability metadata while
 denying graph reads and source/configuration mutations until admission succeeds.
+
+### CI regression: graph-free pending detection
+
+The first lifecycle patch created an empty in-memory graph to suppress stale
+symbols during pending detection. CI's `TestNewIsFencedToIndexerStaging` correctly
+rejected that production allocation. Pending detection now passes an explicit nil
+reader to the Git diff mapper. Both symbol-join paths skip graph access while
+preserving Git hunks and added, modified, deleted, and renamed file metadata.
+Non-nil readers retain their existing behavior; ordinary untracked files are
+not newly included by this change. Pending analysis remains incomplete with
+unknown risk, not a claim that no symbols changed.
+
+Regression tests cover empty-file deletion, intent-to-add, both non-nil symbol
+joins, Git failures, and a pending reader that panics if consulted. The
+constructor guard remains unchanged. On Apple M1 Pro, three benchmark runs
+measured a median of 7,999 ns / 17,504 B / 313 allocations for the former
+placeholder join versus 234.3 ns / 208 B / 4 allocations for file-only mode.
+The real Git-diff benchmark remained dominated by subprocess time (medians
+9.98 ms and 9.29 ms); these runs do not establish an end-to-end speedup.
+
+Compile-only checks do not execute the constructor guard. Validation must run
+`go test ./internal/graph` as well as the affected analysis and MCP tests.

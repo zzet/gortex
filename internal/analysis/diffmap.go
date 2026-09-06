@@ -80,6 +80,9 @@ type DiffResult struct {
 // The daemon keys every file path as "<prefix>/<rel>" while git emits
 // repo-relative paths; empty only for the standalone Indexer, which
 // mints unprefixed paths.
+// A nil reader requests file-only metadata from the same Git diff: hunks,
+// changed files and file changes are preserved, but symbols are not mapped.
+// This does not add changes that Git diff itself does not report.
 func MapGitDiff(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
 	if err := gitcmd.ValidateRef(baseRef); err != nil {
 		return nil, err
@@ -194,6 +197,10 @@ func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, fil
 	for _, hunk := range hunks {
 		fileSet[hunk.FilePath] = true
 
+		// A nil reader requests file-only metadata, not a substitute graph.
+		if g == nil {
+			continue
+		}
 		// Find symbols whose line range overlaps the hunk
 		for _, n := range JoinFileNodes(g, repoPrefix, hunk.FilePath, RepoRelativePath) {
 			// Check if symbol's line range overlaps with the hunk
@@ -220,6 +227,9 @@ func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, fil
 			continue
 		}
 		fileSet[vanished] = true
+		if g == nil {
+			continue
+		}
 		for _, n := range JoinFileNodes(g, repoPrefix, vanished, RepoRelativePath) {
 			addSymbol(n)
 		}

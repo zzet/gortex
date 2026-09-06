@@ -378,7 +378,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	if graphStatus != "ready" {
 		// Git can still report file changes, but stale/base symbols must not
 		// impersonate the selected checkout's changed symbols or impact.
-		reader = graph.New()
+		reader = nil
 	}
 
 	diff, err := analysis.MapGitDiff(reader, repoRoot, repoPrefix, scope, baseRef)
