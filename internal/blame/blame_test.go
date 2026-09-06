@@ -149,7 +149,7 @@ func TestEnrichGraph_StampsLastAuthored(t *testing.T) {
 		EndLine:   3,
 	})
 
-	count, err := EnrichGraph(g, repoDir)
+	count, err := EnrichGraph(g, repoDir, "")
 	if err != nil {
 		t.Fatalf("enrich: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestEnrichGraph_EmitsAuthoredEdgeAndPersonNode(t *testing.T) {
 		EndLine:   3,
 	})
 
-	if _, err := EnrichGraph(g, repoDir); err != nil {
+	if _, err := EnrichGraph(g, repoDir, ""); err != nil {
 		t.Fatalf("enrich: %v", err)
 	}
 
@@ -290,7 +290,7 @@ func TestEnrichGraph_PersonNodeRepoScoped(t *testing.T) {
 		RepoPrefix: "myrepo",
 	})
 
-	if _, err := EnrichGraph(g, repoDir); err != nil {
+	if _, err := EnrichGraph(g, repoDir, "myrepo"); err != nil {
 		t.Fatalf("enrich: %v", err)
 	}
 
@@ -370,7 +370,7 @@ func TestEnrichGraph_CachesPathNormalization(t *testing.T) {
 	}
 	t.Cleanup(func() { fileExists = originalFileExists })
 
-	if _, err := EnrichGraph(g, repoDir); err != nil {
+	if _, err := EnrichGraph(g, repoDir, ""); err != nil {
 		t.Fatalf("enrich: %v", err)
 	}
 	if statCalls != 2 {

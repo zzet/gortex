@@ -1406,13 +1406,31 @@ func (s *Server) handleAnalyzeOwnership(ctx context.Context, req mcp.CallToolReq
 	// function/method (or wider) nodes; the analyzer scans tens of
 	// thousands of irrelevant nodes without it on a disk backend.
 	ownBlame := blameRowsByID(s.readerFor(ctx))
+	// Tallied inside the scan the answer is computed from, so the caveat can
+	// never disagree with the number it accompanies: candidates counts every
+	// symbol that passed the kind and path filters, stamped the subset
+	// carrying authorship. An empty answer means something different
+	// depending on which of the two is zero, and that difference was
+	// previously invisible.
+	candidatesByRepo := map[string]int{}
+	stampedByRepo := map[string]int{}
 	for _, n := range s.scopedNodesByKinds(ctx, allowedKindsSlice(allowedKinds)) {
 		if !graphpath.HasPrefix(n.FilePath, pathPrefix) {
 			continue
 		}
+		// Counted against blame's OWN admission set, not against everything
+		// that passed the filters: a symbol the pass never looks at is not a
+		// coverage hole, and counting it would report a shortfall no
+		// enrichment could ever close.
+		if blame.Eligible(n) {
+			candidatesByRepo[n.RepoPrefix]++
+		}
 		la, ok := lastAuthoredFrom(ownBlame, n)
 		if !ok {
 			continue
+		}
+		if blame.Eligible(n) {
+			stampedByRepo[n.RepoPrefix]++
 		}
 		email := la.Email
 		if email == "" {
@@ -1458,6 +1476,21 @@ func (s *Server) handleAnalyzeOwnership(ctx context.Context, req mcp.CallToolReq
 		return rows[i].Email < rows[j].Email
 	})
 
+	// A "built" state is dropped when there are rows: they are their own proof
+	// that authorship was stamped, and annotating them would spend a caller's
+	// attention on the case that never misleads.
+	//
+	// never_built and partial are NOT dropped. A repository in scope with no
+	// blame stamps makes this answer an undercount whether or not other
+	// repositories produced rows, and a non-empty undercount is the more
+	// dangerous shape: an empty answer at least looks suspicious, while rows
+	// look like the answer. This is the same argument the route inventory
+	// case makes — 130 of 153 rows is the reading that gets acted on.
+	state := ownershipDataState(candidatesByRepo, stampedByRepo, len(byEmail), len(rows))
+	if len(rows) > 0 && state.State == dataStateComplete {
+		state = dataStateCaveat{}
+	}
+
 	if isCompact(req) {
 		var b strings.Builder
 		for _, r := range rows {
@@ -1466,12 +1499,19 @@ func (s *Server) handleAnalyzeOwnership(ctx context.Context, req mcp.CallToolReq
 		if len(rows) == 0 {
 			b.WriteString("no owners matched\n")
 		}
+		if state.State != "" {
+			b.WriteString(state.line())
+		}
 		return mcp.NewToolResultText(b.String()), nil
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	payload := map[string]any{
 		"owners": rows,
 		"total":  len(rows),
-	})
+	}
+	if state.State != "" {
+		payload[dataStateCaveatKey] = state.payload()
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
 }
 
 // tsFromMeta normalises the timestamp field across the int64
@@ -2331,7 +2371,9 @@ func (s *Server) handleAnalyzeBlame(ctx context.Context, req mcp.CallToolRequest
 	total := 0
 	perRepo := make(map[string]any, len(roots))
 	for prefix, root := range roots {
-		count, err := blame.EnrichGraph(s.graph, root)
+		// prefix scopes the pass: without it the walk over one repo's root can
+		// stamp another repo's identically-pathed nodes.
+		count, err := blame.EnrichGraph(s.graph, root, prefix)
 		if err != nil {
 			perRepo[prefix] = map[string]any{"root": root, "error": err.Error()}
 			continue
