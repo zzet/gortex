@@ -134,7 +134,8 @@ func TestDirKeyPrefix(t *testing.T) {
 
 func TestPathUnderDir(t *testing.T) {
 	assert.True(t, pathUnderDir("repo/internal/a.go", "repo/internal"))
-	assert.True(t, pathUnderDir("repo\\internal\\a.go", "repo/internal"))
+	assert.True(t, pathUnderDir(filepath.FromSlash("repo/internal/a.go"), "repo/internal"))
+	assert.True(t, pathUnderDir("repo/internal/a.go", filepath.FromSlash("repo/internal")))
 	assert.False(t, pathUnderDir("repo/internalx/a.go", "repo/internal"))
 	assert.False(t, pathUnderDir("repo/internal", "repo/internal"))
 	assert.False(t, pathUnderDir("other/internal/a.go", "repo/internal"))

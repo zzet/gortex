@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 
 	"github.com/zzet/gortex/internal/indexer/source"
@@ -60,6 +61,26 @@ func (idx *Indexer) admitWalkEntry(root, absPath string, size int64, isDir bool)
 	if idx.shouldExclude(absPath, root, false) {
 		return walkAdmission{excluded: true}
 	}
+	return idx.admitUnexcludedWalkFile(absPath, size)
+}
+
+// admitWalkFileKnownType reuses metadata the caller already obtained without
+// following the entry's final symlink (Lstat, DirEntry.Info, or DirEntry.Type).
+// Regular files need no second Lstat for confinement. Actual symlinks still
+// take the full guard, ahead of every exclusion override and content read.
+func (idx *Indexer) admitWalkFileKnownType(root, absPath string, size int64, mode os.FileMode) walkAdmission {
+	if !mode.IsRegular() {
+		return idx.admitWalkEntry(root, absPath, size, false)
+	}
+	if idx.shouldExcludeRules(absPath, root, false) {
+		return walkAdmission{excluded: true}
+	}
+	return idx.admitUnexcludedWalkFile(absPath, size)
+}
+
+// admitUnexcludedWalkFile may read a prefix for shebang detection, so callers
+// must finish confinement and exclusion checks before reaching this stage.
+func (idx *Indexer) admitUnexcludedWalkFile(absPath string, size int64) walkAdmission {
 	lang, ok := idx.effectiveLanguage(absPath, nil)
 	if !ok {
 		return walkAdmission{}

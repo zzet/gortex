@@ -2498,7 +2498,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				// symlink, …). Skip — the worker would fail too.
 				return nil
 			}
-			adm := idx.admitWalkEntry(absRoot, path, info.Size(), false)
+			adm := idx.admitWalkFileKnownType(absRoot, path, info.Size(), info.Mode())
 			if adm.oversize {
 				skippedLarge++
 				skippedBytes += info.Size()
@@ -5472,6 +5472,12 @@ func (idx *Indexer) shouldExclude(path, root string, isDir bool) bool {
 	if !isDir && pathguard.SymlinkEscapes(path, root) {
 		return true
 	}
+	return idx.shouldExcludeRules(path, root, isDir)
+}
+
+// shouldExcludeRules applies the lexical and per-directory ignore rules.
+// Callers must first establish that a file is not an escaping symlink.
+func (idx *Indexer) shouldExcludeRules(path, root string, isDir bool) bool {
 	// .claude/ and .kiro/ are Builtin-excluded wholesale, but may hold an
 	// MCP server config the MCP-config-as-graph feature targets (the
 	// extractor's own docs name .kiro/mcp.json). Descend those subtrees

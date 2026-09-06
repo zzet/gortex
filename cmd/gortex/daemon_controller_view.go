@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -290,7 +291,15 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 		return out, nil
 	}
 	out.Answered = true
-	for _, n := range reader.GetFileNodes(key) {
+	// Newer graph writers use slash keys; retained graphs can still hold
+	// repo-prefixed native keys. Prefer the canonical spelling without
+	// counting both copies when a graph contains both generations of keys.
+	canonicalKey := graphpath.Norm(key)
+	nodes := reader.GetFileNodes(canonicalKey)
+	if len(nodes) == 0 && key != canonicalKey {
+		nodes = reader.GetFileNodes(key)
+	}
+	for _, n := range nodes {
 		if n == nil || (prefix != "" && n.RepoPrefix != prefix) {
 			continue
 		}
@@ -408,7 +417,7 @@ func graphHoldsUnder(reader graph.Reader, prefix, keyPrefix string) bool {
 // pathUnderDir reports whether a graph file key names a file inside dir. The
 // separator keeps "internal/hooks" from claiming "internal/hooksx".
 func pathUnderDir(key, dir string) bool {
-	return strings.HasPrefix(strings.ReplaceAll(key, "\\", "/"), dir+"/")
+	return strings.HasPrefix(graphpath.Norm(key), graphpath.Norm(dir)+"/")
 }
 
 // scopeAdmission asks the indexer that owns abs whether the walk would claim

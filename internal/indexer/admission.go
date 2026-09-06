@@ -46,7 +46,7 @@ func (idx *Indexer) PathIndexability(relPath string) (PathSkip, bool) {
 		// will be" for a path that is not a file at all.
 		return PathSkip{}, false
 	}
-	adm := idx.admitWalkEntry(root, abs, info.Size(), false)
+	adm := idx.admitWalkFileKnownType(root, abs, info.Size(), info.Mode())
 	if !adm.admit {
 		return PathSkip{Skipped: true, ByRule: adm.excluded}, true
 	}
@@ -114,7 +114,7 @@ func (idx *Indexer) ScopeIndexability(relDir string, budget time.Duration) (inde
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		if !idx.admitWalkEntry(root, path, -1, false).admit {
+		if !idx.admitWalkFileKnownType(root, path, -1, d.Type()).admit {
 			return nil
 		}
 		indexable = true
