@@ -2565,7 +2565,11 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		sg = s.engineFor(ctx).GetFileSymbols(fp)
 	}
 	if len(sg.Nodes) == 0 {
-		return fileNotIndexedGuidance(fp), nil
+		// Not in the graph. Say whether the walk will EVER hold it — an
+		// exclude rule, a language with no extractor, or the size cap all mean
+		// no graph tool can answer for this path, so the guidance names
+		// read_file rather than locators with zero rows for it.
+		return fileNotIndexedGuidance(fp, s.pathIndexability(fp)), nil
 	}
 
 	// Apply repo/project/ref filter.
@@ -2575,7 +2579,11 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	}
 	sg = filterSubGraph(sg, allowed)
 	if len(sg.Nodes) == 0 {
-		return fileNotIndexedGuidance(fp), nil
+		// Filtered out by the repo/ref filter: indexed, just not in scope.
+		// OutOfScope rather than a bare Indexed — the same filter applies to
+		// the locators, so they have no rows for it either and the guidance
+		// has to offer set_active_project instead.
+		return fileNotIndexedGuidance(fp, fileNotIndexedState{Indexed: true, OutOfScope: true}), nil
 	}
 
 	// get_file_summary's contract is "what symbols does this file
@@ -2587,7 +2595,11 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// same shape.
 	sg = stripNonDefinitionNodes(sg)
 	if len(sg.Nodes) == 0 {
-		return fileNotIndexedGuidance(fp), nil
+		// Only file/import nodes survived: the file IS indexed, it just defines
+		// no symbols (a package-doc-only doc.go, a constants file, a shell or
+		// SQL file with no function definitions). The locators still have rows
+		// for it, so the guidance keeps them and drops only the symbol lookup.
+		return fileNotIndexedGuidance(fp, fileNotIndexedState{Indexed: true}), nil
 	}
 
 	// ETag conditional fetch — checked before any savings accounting so

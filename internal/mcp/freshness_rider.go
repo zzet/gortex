@@ -159,6 +159,106 @@ func (s *Server) indexerForRel(graphPath string) (*indexer.Indexer, string) {
 	return owner, strings.TrimPrefix(graphPath, prefix+"/")
 }
 
+// pathIndexability answers, for a file the graph holds no nodes for, whether
+// the walk would ever hold it — "excluded by design" versus "not indexed yet".
+//
+// indexerForRel fails closed on a bare unprefixed path more than one repo
+// could own (two JS repos each holding node_modules/react/index.js), which is
+// the shape the PreToolUse hook sends. So a nil owner falls through to a vote,
+// taken only on unanimity — a split answer leaves enforcement on.
+func (s *Server) pathIndexability(graphPath string) fileNotIndexedState {
+	if idx, rel := s.indexerForRel(graphPath); idx != nil {
+		skip, answered := idx.PathIndexability(rel)
+		if !answered {
+			return fileNotIndexedState{}
+		}
+		return skipState(skip)
+	}
+	if s.multiIndexer == nil {
+		return fileNotIndexedState{}
+	}
+	rel := filepath.ToSlash(graphPath)
+	if prefix, stripped, ok := s.splitRepoPrefix(rel); ok {
+		// The path names its own corpus, so one repo owns it. A vote would ask
+		// the others about a path spelled for this one, which they answer for
+		// a file of their own whenever the spelling collides.
+		idx := s.multiIndexer.GetIndexer(prefix)
+		if idx == nil {
+			return fileNotIndexedState{}
+		}
+		skip, answered := idx.PathIndexability(stripped)
+		if !answered {
+			return fileNotIndexedState{}
+		}
+		return skipState(skip)
+	}
+	votes := make([]pathSkipVote, 0, 4)
+	for _, prefix := range s.multiIndexer.RepoPrefixes() {
+		idx := s.multiIndexer.GetIndexer(prefix)
+		if idx == nil {
+			continue
+		}
+		skip, answered := idx.PathIndexability(rel)
+		votes = append(votes, pathSkipVote{Skip: skip, Answered: answered})
+	}
+	agreed, ok := unanimousPathSkip(votes)
+	if !ok {
+		return fileNotIndexedState{}
+	}
+	return skipState(agreed)
+}
+
+// splitRepoPrefix separates a graph path that names its corpus into that repo
+// prefix and the path relative to the repo's root. Longest match wins, so a
+// repo nested under another resolves to the inner one.
+func (s *Server) splitRepoPrefix(graphPath string) (prefix, rel string, ok bool) {
+	for _, p := range s.multiIndexer.RepoPrefixes() {
+		if p == "" || len(p) <= len(prefix) {
+			continue
+		}
+		if rest, found := strings.CutPrefix(graphPath, p+"/"); found {
+			prefix, rel, ok = p, rest, true
+		}
+	}
+	return prefix, rel, ok
+}
+
+// pathSkipVote is one repo's answer; Answered is false when it could not
+// answer at all.
+type pathSkipVote struct {
+	Skip     indexer.PathSkip
+	Answered bool
+}
+
+// unanimousPathSkip takes the verdict only when every repo that could answer
+// agreed. Abstentions are dropped: an un-rooted repo returns the zero PathSkip,
+// bit-identical to "indexable", so counting it let one silent repo disagree
+// with every repo that looked. ok is false on no answers or a conflict.
+func unanimousPathSkip(votes []pathSkipVote) (indexer.PathSkip, bool) {
+	var agreed *indexer.PathSkip
+	for _, v := range votes {
+		if !v.Answered {
+			continue
+		}
+		if agreed == nil {
+			skip := v.Skip
+			agreed = &skip
+			continue
+		}
+		if *agreed != v.Skip {
+			return indexer.PathSkip{}, false
+		}
+	}
+	if agreed == nil {
+		return indexer.PathSkip{}, false
+	}
+	return *agreed, true
+}
+
+func skipState(skip indexer.PathSkip) fileNotIndexedState {
+	return fileNotIndexedState{Unindexable: skip.Skipped, Excluded: skip.ByRule}
+}
+
 // detectWorktreeMismatch reports (once per server, cached) whether the
 // current working directory is a linked git worktree that the indexed graph
 // does not cover — i.e. the agent is working in a worktree but the graph

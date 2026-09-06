@@ -42,20 +42,29 @@ func startCoverageDaemon(t *testing.T, result daemon.FileCoverageResult) *covera
 	return ctrl
 }
 
+// probeFileIndexScope runs the real probe against the test daemon under the
+// production budget.
+func probeFileIndexScope(cwd, filePath string) fileIndexStatus {
+	return fileIndexScopeViaDaemon(cwd, filePath, fileIndexedTimeout)
+}
+
 // TestFileIndexedViaDaemonSendsTheAbsolutePath pins the shape of the request:
 // the hook resolves nothing itself, it hands the daemon an absolute path and
 // lets the catalog decide which graph serves it. Resolving the path hook-side
 // is what made every worktree file look untracked.
 func TestFileIndexedViaDaemonSendsTheAbsolutePath(t *testing.T) {
 	ctrl := startCoverageDaemon(t, daemon.FileCoverageResult{
-		Covered: true,
-		Symbols: 5,
-		View:    &daemon.ProbeView{Kind: daemon.ProbeViewWorktree, Exact: true},
+		Answered: true,
+		Tracked:  true,
+		Held:     true,
+		Covered:  true,
+		Symbols:  5,
+		View:     &daemon.ProbeView{Kind: daemon.ProbeViewWorktree, Exact: true},
 	})
 
-	indexed, symbols := fileIndexedViaDaemon("/wt", "internal/live.go")
-	if !indexed || symbols != 5 {
-		t.Fatalf("coverage = (%v, %d), want the daemon's answer (true, 5)", indexed, symbols)
+	st := probeFileIndexScope("/wt", "internal/live.go")
+	if !st.Indexed || st.Count != 5 {
+		t.Fatalf("coverage = %+v, want the daemon's answer (indexed, 5 symbols)", st)
 	}
 	if want := filepath.Join("/wt", "internal/live.go"); ctrl.probedPath() != want {
 		t.Fatalf("daemon was asked about %q, want %q", ctrl.probedPath(), want)
@@ -74,9 +83,13 @@ func TestFileIndexedViaDaemonFailsOpenOnAnUnroutedWorktree(t *testing.T) {
 		},
 	})
 
-	indexed, symbols := fileIndexedViaDaemon("/wt", "internal/live.go")
-	if indexed || symbols != 0 {
-		t.Fatalf("coverage = (%v, %d), want the fail-open (false, 0)", indexed, symbols)
+	st := probeFileIndexScope("/wt", "internal/live.go")
+	if st.Indexed || st.Count != 0 {
+		t.Fatalf("coverage = %+v, want the fail-open", st)
+	}
+	// An unbuilt view is an abstention, not proof the file is uncovered.
+	if st.ProbeOK {
+		t.Fatalf("coverage = %+v, want no verdict at all from an unrouted worktree", st)
 	}
 }
 
@@ -88,9 +101,12 @@ func TestFileIndexedViaDaemonFailsOpenWithNoDaemon(t *testing.T) {
 	t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(testenv.ShortTempDir(t), "missing"))
 
 	start := time.Now()
-	indexed, symbols := fileIndexedViaDaemon("/wt", "internal/live.go")
-	if indexed || symbols != 0 {
-		t.Fatalf("coverage = (%v, %d) with no daemon, want (false, 0)", indexed, symbols)
+	st := probeFileIndexScope("/wt", "internal/live.go")
+	if st.Indexed || st.Count != 0 {
+		t.Fatalf("coverage = %+v with no daemon, want nothing", st)
+	}
+	if !st.Unreached {
+		t.Fatalf("coverage = %+v with no daemon, want the probe marked unreached", st)
 	}
 	if elapsed := time.Since(start); elapsed > fileIndexedTimeout {
 		t.Fatalf("the probe took %s with no daemon, want under the %s budget", elapsed, fileIndexedTimeout)
@@ -101,10 +117,10 @@ func TestFileIndexedViaDaemonFailsOpenWithNoDaemon(t *testing.T) {
 // relative path with nothing to resolve it against is still no signal rather
 // than a request the daemon would answer about its own working directory.
 func TestFileIndexedViaDaemonWithNoCWDCannotResolveARelativePath(t *testing.T) {
-	startCoverageDaemon(t, daemon.FileCoverageResult{Covered: true, Symbols: 3})
+	startCoverageDaemon(t, daemon.FileCoverageResult{Answered: true, Covered: true, Symbols: 3})
 
-	if indexed, symbols := fileIndexedViaDaemon("", "internal/live.go"); indexed || symbols != 0 {
-		t.Fatalf("coverage = (%v, %d) for an unresolvable path, want (false, 0)", indexed, symbols)
+	if st := probeFileIndexScope("", "internal/live.go"); st.Indexed || st.Count != 0 || st.ProbeOK {
+		t.Fatalf("coverage = %+v for an unresolvable path, want no verdict", st)
 	}
 }
 
@@ -114,8 +130,11 @@ func TestFileIndexedViaDaemonWithNoCWDCannotResolveARelativePath(t *testing.T) {
 func TestFileIndexedViaDaemonLogsOnlyFallbackAnswers(t *testing.T) {
 	log := redirectTelemetry(t)
 	startCoverageDaemon(t, daemon.FileCoverageResult{
-		Covered: true,
-		Symbols: 2,
+		Answered: true,
+		Tracked:  true,
+		Held:     true,
+		Covered:  true,
+		Symbols:  2,
 		View: &daemon.ProbeView{
 			Kind:           daemon.ProbeViewBase,
 			Exact:          false,
@@ -123,8 +142,8 @@ func TestFileIndexedViaDaemonLogsOnlyFallbackAnswers(t *testing.T) {
 		},
 	})
 
-	if indexed, symbols := fileIndexedViaDaemon("/wt", "internal/live.go"); !indexed || symbols != 2 {
-		t.Fatalf("coverage = (%v, %d), want the fallback answer honoured unchanged", indexed, symbols)
+	if st := probeFileIndexScope("/wt", "internal/live.go"); !st.Indexed || st.Count != 2 {
+		t.Fatalf("coverage = %+v, want the fallback answer honoured unchanged", st)
 	}
 	records := readDecisions(t, log)
 	if len(records) != 1 {
@@ -141,16 +160,35 @@ func TestFileIndexedViaDaemonLogsOnlyFallbackAnswers(t *testing.T) {
 func TestFileIndexedViaDaemonLogsNothingForAnExactAnswer(t *testing.T) {
 	log := redirectTelemetry(t)
 	startCoverageDaemon(t, daemon.FileCoverageResult{
-		Covered: true,
-		Symbols: 2,
-		View:    &daemon.ProbeView{Kind: daemon.ProbeViewWorktree, Exact: true},
+		Answered: true,
+		Tracked:  true,
+		Held:     true,
+		Covered:  true,
+		Symbols:  2,
+		View:     &daemon.ProbeView{Kind: daemon.ProbeViewWorktree, Exact: true},
 	})
 
-	if indexed, _ := fileIndexedViaDaemon("/wt", "internal/live.go"); !indexed {
+	if st := probeFileIndexScope("/wt", "internal/live.go"); !st.Indexed {
 		t.Fatal("an exact covered answer must still deny")
 	}
 	if records := readDecisions(t, log); len(records) != 0 {
 		t.Fatalf("decision log holds %d records for an exact answer, want none", len(records))
+	}
+}
+
+// A daemon predating the Answered field still reports coverage truthfully, and
+// daemons outlive the binary upgrade that starts them. Gating the deny on the
+// absent field would switch enforcement off for that process's whole life —
+// the exact silent bypass the field was added to prevent.
+func TestFileCoverageWithoutTheAnsweredFieldStillDenies(t *testing.T) {
+	startCoverageDaemon(t, daemon.FileCoverageResult{Covered: true, Symbols: 4})
+
+	st := probeFileIndexScope("/wt", "internal/live.go")
+	if !st.Indexed || st.Count != 4 {
+		t.Fatalf("coverage = %+v, want an older daemon's answer honoured", st)
+	}
+	if st.noGraphAnswer() {
+		t.Fatal("a covered file must never silence the read door")
 	}
 }
 

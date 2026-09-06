@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 )
 
@@ -56,7 +57,7 @@ func TestRecoverableNotTrackedReturnsSuccessGuidance(t *testing.T) {
 	})
 
 	t.Run("file_not_indexed", func(t *testing.T) {
-		res := fileNotIndexedGuidance("internal/new.go")
+		res := fileNotIndexedGuidance("internal/new.go", fileNotIndexedState{})
 		if res.IsError {
 			t.Fatal("file-not-indexed must NOT be an isError result")
 		}
@@ -64,10 +65,60 @@ func TestRecoverableNotTrackedReturnsSuccessGuidance(t *testing.T) {
 		if g.Condition != ErrCodeFileNotIndexed {
 			t.Errorf("condition = %q, want file_not_indexed", g.Condition)
 		}
-		if !containsString(g.SuggestedTools, "read_file") {
-			t.Errorf("suggested_tools = %v, want read_file as a fallback", g.SuggestedTools)
+		// A file that may yet be indexed keeps the full discovery triple.
+		if !containsString(g.SuggestedTools, "find_files") || !containsString(g.SuggestedTools, "read_file") {
+			t.Errorf("suggested_tools = %v, want the discovery tools plus read_file", g.SuggestedTools)
+		}
+		if g.Data["excluded"] != false || g.Data["unindexable"] != false || g.Data["indexed"] != false {
+			t.Errorf("data = %v, want all scope flags false for an indexable file", g.Data)
 		}
 	})
+
+	// find_files and search_text are both graph-backed. For a path the graph
+	// will NEVER hold they return zero rows, so naming them costs the caller
+	// two dead round-trips before it reaches the only tool that can answer.
+	// An INDEXED file is the opposite case: the graph holds it, so both
+	// locators have rows and only the symbol lookup comes up empty.
+	for _, tc := range []struct {
+		name      string
+		path      string
+		state     fileNotIndexedState
+		want      map[string]bool
+		wantTools []string
+	}{{
+		name:      "file_not_indexed_excluded",
+		path:      "node_modules/x.js",
+		state:     fileNotIndexedState{Unindexable: true, Excluded: true},
+		want:      map[string]bool{"excluded": true, "unindexable": true, "indexed": false},
+		wantTools: []string{"read_file"},
+	}, {
+		name:      "file_not_indexed_unindexable",
+		path:      "db/migrations/0042.sql",
+		state:     fileNotIndexedState{Unindexable: true},
+		want:      map[string]bool{"excluded": false, "unindexable": true, "indexed": false},
+		wantTools: []string{"read_file"},
+	}, {
+		name:      "file_indexed_but_symbolless",
+		path:      "internal/doc.go",
+		state:     fileNotIndexedState{Indexed: true},
+		want:      map[string]bool{"excluded": false, "unindexable": false, "indexed": true},
+		wantTools: []string{"find_files", "search_text", "read_file"},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := decode(t, toolResultText(fileNotIndexedGuidance(tc.path, tc.state)))
+			for key, want := range tc.want {
+				if g.Data[key] != want {
+					t.Errorf("data.%s = %v, want %v", key, g.Data[key], want)
+				}
+			}
+			if !slices.Equal(g.SuggestedTools, tc.wantTools) {
+				t.Errorf("suggested_tools = %v, want %v", g.SuggestedTools, tc.wantTools)
+			}
+			if tc.state.Unindexable && containsString(g.SuggestedTools, "search_text") {
+				t.Error("search_text is graph-backed and cannot answer for a path the graph will never hold")
+			}
+		})
+	}
 }
 
 func containsString(s []string, want string) bool {

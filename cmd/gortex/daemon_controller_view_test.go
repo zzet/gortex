@@ -33,16 +33,9 @@ const (
 	probeFile       = "internal/live.go"
 )
 
-// probeFileKey is the key the store holds probeFile under: the repo prefix,
-// one '/', then the repo-relative remainder in the indexing machine's native
-// separators (see internal/graphpath).
-//
-// The two spellings coincide on POSIX and diverge on Windows, and the probe is
-// exactly the seam between them: fileGraphKey renders `prefix + "/" +
-// filepath.Rel(root, path)`, whose remainder carries the host separator.
-// Keying the corpus with the '/'-joined form describes a file a Windows daemon
-// never indexes, so the key the probe computes misses it and every coverage
-// assertion below reads as uncovered.
+// probeFileKey keeps the older repo-prefixed native spelling in the fixture.
+// Coverage must still read retained graphs in this form after newer writers
+// switch to slash keys. The two spellings diverge on Windows.
 var probeFileKey = probePrefix + "/" + filepath.FromSlash(probeFile)
 
 // probeFixture is the seeded catalog a probe resolves against, plus the paths
@@ -155,6 +148,11 @@ func newProbeFixture(t *testing.T) *probeFixture {
 // one by content rather than by shape.
 func (f *probeFixture) routeWorktree(t *testing.T) {
 	t.Helper()
+	f.routeWorktreeFile(t, probeFileKey)
+}
+
+func (f *probeFixture) routeWorktreeFile(t *testing.T, key string) {
+	t.Helper()
 	ctx := context.Background()
 
 	commitID, commitHandle, err := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
@@ -182,10 +180,17 @@ func (f *probeFixture) routeWorktree(t *testing.T) {
 	})
 	require.NoError(t, err)
 	dirtyHandle.AddBatch([]*graph.Node{{
-		ID:         probeFileKey + "::GenerationOnly",
+		ID:         key,
+		Kind:       graph.KindFile,
+		Name:       key,
+		FilePath:   key,
+		RepoPrefix: probePrefix,
+		Language:   "go",
+	}, {
+		ID:         key + "::GenerationOnly",
 		Kind:       graph.KindFunction,
 		Name:       "GenerationOnly",
-		FilePath:   probeFileKey,
+		FilePath:   key,
 		RepoPrefix: probePrefix,
 		Language:   "go",
 		StartLine:  3,
@@ -193,7 +198,7 @@ func (f *probeFixture) routeWorktree(t *testing.T) {
 	}}, nil)
 	require.NoError(t, dirtyHandle.SetFileMasks([]store_sqlite.FileMask{{
 		RepoPrefix: probePrefix,
-		FilePath:   probeFileKey,
+		FilePath:   key,
 		Mode:       store_sqlite.OwnershipReplace,
 	}}))
 	require.NoError(t, f.store.PublishPayloadGeneration(ctx, dirtyID, 2001))

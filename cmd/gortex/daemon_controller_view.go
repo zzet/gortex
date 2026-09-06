@@ -13,6 +13,8 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphpath"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -269,7 +271,7 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 	view := c.resolveProbeView(ctx, abs)
 	defer view.release()
 
-	out := daemon.FileCoverageResult{View: view.answer}
+	out := daemon.FileCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
 	if !view.servable {
 		return out, nil
 	}
@@ -282,9 +284,26 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 	}
 	prefix, key, ok := c.fileGraphKey(abs, view)
 	if !ok {
+		// Two different failures share this branch. A path no checkout owns
+		// was looked at and placed outside every corpus, which is an answer.
+		// A tracked path whose key could not be measured is not.
+		out.Answered = !out.Tracked
 		return out, nil
 	}
-	for _, n := range reader.GetFileNodes(key) {
+	out.Answered = true
+	// Newer graph writers use slash keys; retained graphs can still hold
+	// repo-prefixed native keys. Prefer the canonical spelling without
+	// counting both copies when a graph contains both generations of keys.
+	canonicalKey := graphpath.Norm(key)
+	nodes := reader.GetFileNodes(canonicalKey)
+	if len(nodes) == 0 && key != canonicalKey {
+		nodes = reader.GetFileNodes(key)
+	}
+	for _, n := range nodes {
+		if n == nil || (prefix != "" && n.RepoPrefix != prefix) {
+			continue
+		}
+		out.Held = true
 		// The file and import nodes ride on the by-file index for other
 		// walkers; the coverage question is "what does this file define".
 		if !probeSymbolCandidate(n, prefix) {
@@ -293,7 +312,163 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 		out.Symbols++
 	}
 	out.Covered = out.Symbols > 0
+	if !out.Covered {
+		// Only a path the graph has nothing for needs the walk's opinion.
+		// Known gap: a tree excluded after it was indexed keeps its nodes and
+		// so never reaches here until a re-index drops them.
+		out.Excluded, out.Unindexable = c.pathAdmission(abs)
+	}
 	return out, nil
+}
+
+// pathTracked reports whether a registered checkout owns abs. trackedRoot
+// answers from the multi-repo catalog alone, so a single-indexer daemon needs
+// its own root consulted too — without it every path there reports untracked.
+func (c *realController) pathTracked(abs string, view probeView) bool {
+	if view.root != "" {
+		return true
+	}
+	if _, _, ok := c.trackedRoot(abs); ok {
+		return true
+	}
+	idx := c.indexerForPath(abs)
+	if idx == nil {
+		return false
+	}
+	_, ok := pathRelativeTo(idx.RootPath(), abs)
+	return ok
+}
+
+// dirCoverageWalkBudget bounds the admission walk one scope probe pays for.
+// The hook waits on it, so an unfinished walk is reported, not waited out.
+const dirCoverageWalkBudget = 500 * time.Millisecond
+
+// DirCoverage answers whether the graph serving Path holds indexed source
+// under it, and when it does not, whether the walk would ever claim anything
+// there. It is the scope verdict a PreToolUse hook turns into a Grep/Glob
+// deny; both halves are exact rather than sampled.
+func (c *realController) DirCoverage(ctx context.Context, p daemon.DirCoverageParams) (daemon.DirCoverageResult, error) {
+	if c == nil || p.Path == "" {
+		return daemon.DirCoverageResult{}, nil
+	}
+	abs := p.Path
+	if resolved, err := filepath.Abs(abs); err == nil {
+		abs = resolved
+	}
+
+	view := c.resolveProbeView(ctx, abs)
+	defer view.release()
+
+	out := daemon.DirCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
+	if !view.servable {
+		return out, nil
+	}
+	reader := view.reader
+	if reader == nil {
+		reader = c.graph
+	}
+	if reader == nil {
+		return out, nil
+	}
+	prefix, key, ok := c.fileGraphKey(abs, view)
+	if !ok {
+		// Same split as FileCoverage: a path outside every corpus is an
+		// answer, a tracked path that could not be keyed is not.
+		out.Answered = !out.Tracked
+		return out, nil
+	}
+	out.Answered = true
+	out.HasSource = graphHoldsUnder(reader, prefix, dirKeyPrefix(key))
+	if out.HasSource {
+		return out, nil
+	}
+	// Only a scope the graph has nothing for needs the walk's opinion.
+	out.Indexable, out.Walked = c.scopeAdmission(abs)
+	return out, nil
+}
+
+// dirKeyPrefix turns the file key fileGraphKey measures for a directory into
+// the prefix its files share. A directory that is the repository root measures
+// as ".", which names nothing in the graph.
+func dirKeyPrefix(key string) string {
+	key = strings.TrimSuffix(key, "/.")
+	if key == "." {
+		return ""
+	}
+	return key
+}
+
+// graphHoldsUnder reports whether reader holds a file node under keyPrefix,
+// stopping at the first one. An empty keyPrefix is the whole corpus. Holding
+// the file is the question, not holding symbols: the surfaces a search is
+// redirected to have rows for an indexed file that defines nothing.
+func graphHoldsUnder(reader graph.Reader, prefix, keyPrefix string) bool {
+	for n := range reader.NodesByKind(graph.KindFile) {
+		if n == nil || (prefix != "" && n.RepoPrefix != prefix) {
+			continue
+		}
+		if keyPrefix == "" || pathUnderDir(n.FilePath, keyPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathUnderDir reports whether a graph file key names a file inside dir. The
+// separator keeps "internal/hooks" from claiming "internal/hooksx".
+func pathUnderDir(key, dir string) bool {
+	return strings.HasPrefix(graphpath.Norm(key), graphpath.Norm(dir)+"/")
+}
+
+// scopeAdmission asks the indexer that owns abs whether the walk would claim
+// any file under it, and whether that walk finished. A scope no indexer owns
+// leaves both false — an abstention, not "nothing here".
+func (c *realController) scopeAdmission(abs string) (indexable, walked bool) {
+	idx := c.indexerForPath(abs)
+	if idx == nil {
+		return false, false
+	}
+	rel, ok := pathRelativeTo(idx.RootPath(), abs)
+	if !ok {
+		return false, false
+	}
+	if rel == "." {
+		rel = ""
+	}
+	return idx.ScopeIndexability(rel, dirCoverageWalkBudget)
+}
+
+// pathAdmission asks the indexer that owns abs what the index walk would do
+// with it: unindexable is any rejection, excluded narrows it to an exclude or
+// ignore rule.
+//
+// A path no indexer owns, or one its owner cannot place or stat, leaves both
+// false. That is an abstention rather than "indexable", and the caller must
+// read it as one: PathIndexability already refuses to guess, and turning its
+// silence into a verdict here would undo that.
+func (c *realController) pathAdmission(abs string) (excluded, unindexable bool) {
+	idx := c.indexerForPath(abs)
+	if idx == nil {
+		return false, false
+	}
+	rel, ok := pathRelativeTo(idx.RootPath(), abs)
+	if !ok {
+		return false, false
+	}
+	skip, answered := idx.PathIndexability(rel)
+	if !answered {
+		return false, false
+	}
+	return skip.ByRule, skip.Skipped
+}
+
+// indexerForPath finds the indexer whose root contains abs.
+func (c *realController) indexerForPath(abs string) *indexer.Indexer {
+	if c.multiIndexer != nil {
+		owner, _ := c.multiIndexer.IndexerForFile(abs)
+		return owner
+	}
+	return c.indexer
 }
 
 // fileGraphKey renders an absolute path the way the graph spells a file key:

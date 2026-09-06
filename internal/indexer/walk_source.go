@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 
 	"github.com/zzet/gortex/internal/indexer/source"
@@ -26,6 +27,11 @@ type walkAdmission struct {
 	// bulk walk reports those to the user; a caller that passes a
 	// negative size never sees it.
 	oversize bool
+	// excluded reports that an exclude / ignore RULE rejected the entry.
+	// It carries what lang can no longer imply: exclusion is decided
+	// before language detection, so an excluded entry has no lang to
+	// distinguish it from one nothing claims.
+	excluded bool
 }
 
 // admitWalkEntry applies the walk-time gates every index walk shares:
@@ -47,12 +53,37 @@ func (idx *Indexer) admitWalkEntry(root, absPath string, size int64, isDir bool)
 	if isDir {
 		return walkAdmission{pruneDir: idx.shouldPruneDir(absPath, root)}
 	}
+	// Exclude rules run before language detection on purpose, and the order is
+	// load-bearing rather than tidy: effectiveLanguage falls through to
+	// readSniffPrefix, which os.Opens the file. Language-first opened files
+	// inside vendored trees, and opened them before shouldExclude's
+	// SymlinkEscapes guard had refused links pointing out of the repo.
+	if idx.shouldExclude(absPath, root, false) {
+		return walkAdmission{excluded: true}
+	}
+	return idx.admitUnexcludedWalkFile(absPath, size)
+}
+
+// admitWalkFileKnownType reuses metadata the caller already obtained without
+// following the entry's final symlink (Lstat, DirEntry.Info, or DirEntry.Type).
+// Regular files need no second Lstat for confinement. Actual symlinks still
+// take the full guard, ahead of every exclusion override and content read.
+func (idx *Indexer) admitWalkFileKnownType(root, absPath string, size int64, mode os.FileMode) walkAdmission {
+	if !mode.IsRegular() {
+		return idx.admitWalkEntry(root, absPath, size, false)
+	}
+	if idx.shouldExcludeRules(absPath, root, false) {
+		return walkAdmission{excluded: true}
+	}
+	return idx.admitUnexcludedWalkFile(absPath, size)
+}
+
+// admitUnexcludedWalkFile may read a prefix for shebang detection, so callers
+// must finish confinement and exclusion checks before reaching this stage.
+func (idx *Indexer) admitUnexcludedWalkFile(absPath string, size int64) walkAdmission {
 	lang, ok := idx.effectiveLanguage(absPath, nil)
 	if !ok {
 		return walkAdmission{}
-	}
-	if idx.shouldExclude(absPath, root, false) {
-		return walkAdmission{lang: lang}
 	}
 	if maxSize := idx.config.MaxFileSize; maxSize > 0 && size > maxSize {
 		return walkAdmission{lang: lang, oversize: true}
@@ -70,10 +101,14 @@ func (idx *Indexer) admitScopedWalkFile(root, absPath string) bool {
 	if adm.admit {
 		return true
 	}
-	if adm.lang != "" || !idx.isIncrementalContractManifest(absPath) {
+	if adm.excluded {
 		return false
 	}
-	return !idx.shouldExclude(absPath, root, false)
+	// Not excluded and unclaimed — the only rejection left, since the caller
+	// passes no size and so never meets the cap. Reaching here already means
+	// the ignore list let the path through, so the manifest check is the whole
+	// remaining question.
+	return idx.isIncrementalContractManifest(absPath)
 }
 
 // walkSource enumerates src through the same admission gate the

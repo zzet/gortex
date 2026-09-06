@@ -14,6 +14,10 @@ import (
 type Matcher struct {
 	ign      *ignore.GitIgnore
 	patterns []string
+	// Required literals cheaply rule out simple positive patterns. Positive
+	// patterns with uncertain syntax retain their original compiled matcher.
+	requiredLiterals []string
+	unfiltered       *ignore.GitIgnore
 }
 
 // New compiles the given patterns into a Matcher. A nil/empty list is
@@ -43,10 +47,56 @@ func New(patterns []string) *Matcher {
 		cleaned = append(cleaned, p)
 		compiled = append(compiled, literalizePattern(p))
 	}
-	return &Matcher{
+	m := &Matcher{
 		ign:      ignore.CompileIgnoreLines(compiled...),
 		patterns: cleaned,
 	}
+	var unfiltered []string
+	seen := make(map[string]bool)
+	for i, p := range cleaned {
+		if strings.HasPrefix(p, "!") {
+			continue
+		}
+		literal := requiredLiteral(p)
+		if literal == "" {
+			unfiltered = append(unfiltered, compiled[i])
+		} else if !seen[literal] {
+			seen[literal] = true
+			m.requiredLiterals = append(m.requiredLiterals, literal)
+		}
+	}
+	if len(m.requiredLiterals) > 0 && len(unfiltered) > 0 {
+		m.unfiltered = ignore.CompileIgnoreLines(unfiltered...)
+	}
+	return m
+}
+
+// requiredLiteral returns a substring every match of a simple glob must
+// contain. Split at slashes too: a/b/* can match the directory a/b itself,
+// and ** can consume zero path segments. Uncertain syntax stays unfiltered.
+func requiredLiteral(pattern string) string {
+	if strings.ContainsAny(pattern, "\\?[]") {
+		return ""
+	}
+	var longest string
+	for _, part := range strings.FieldsFunc(pattern, func(r rune) bool { return r == '*' || r == '/' }) {
+		if len(part) > len(longest) {
+			longest = part
+		}
+	}
+	return longest
+}
+
+func (m *Matcher) couldMatch(rel string) bool {
+	if len(m.requiredLiterals) == 0 {
+		return true
+	}
+	for _, literal := range m.requiredLiterals {
+		if strings.Contains(rel, literal) {
+			return true
+		}
+	}
+	return m.unfiltered != nil && m.unfiltered.MatchesPath(rel)
 }
 
 // Patterns returns the cleaned pattern list (empties and comments removed).
@@ -72,6 +122,9 @@ func (m *Matcher) MatchRel(relPath string) bool {
 	rel := pathkey.Normalize(filepath.ToSlash(relPath))
 	rel = strings.TrimPrefix(rel, "./")
 	if rel == "" || rel == "." {
+		return false
+	}
+	if !m.couldMatch(rel) {
 		return false
 	}
 	return m.ign.MatchesPath(rel)
@@ -118,8 +171,17 @@ func (m *Matcher) MatchAbs(absPath, root string) bool {
 // descending it and re-testing every file. Returns false if path is
 // not under root.
 func (m *Matcher) MatchAbsDir(absPath, root string, isDir bool) bool {
-	matched, _ := m.ExplainAbsDir(absPath, root, isDir)
-	return matched
+	if m == nil || m.ign == nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, absPath)
+	if err != nil {
+		return false
+	}
+	if isDir {
+		rel += "/"
+	}
+	return m.MatchRel(rel)
 }
 
 // ExplainAbsDir is MatchAbsDir plus the pattern that excluded the path,

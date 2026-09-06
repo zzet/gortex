@@ -19,17 +19,15 @@ func withEditBlocking(t *testing.T, on bool) {
 // test, restoring the real probe on cleanup.
 // Returns a dummy port (0) so the legacy `port := fakeIndexedBridge(...)`
 // call sites still compile; the value is unused now that the indexed check
-// routes through the stubbed fileIndexedFn seam rather than an HTTP port.
+// routes through the stubbed fileIndexScopeFn seam rather than an HTTP port.
 func fakeIndexedBridge(t *testing.T, indexedPaths map[string]bool) int {
 	t.Helper()
-	prev := fileIndexedFn
-	t.Cleanup(func() { fileIndexedFn = prev })
-	fileIndexedFn = func(_, filePath string) (bool, int) {
+	stubFileIndexScopeBy(t, func(_, filePath string) fileIndexStatus {
 		if indexedPaths[filePath] {
-			return true, 1
+			return indexedStatus(1)
 		}
-		return false, 0
-	}
+		return indexedStatus(0)
+	})
 	return 0
 }
 
