@@ -24,17 +24,98 @@ The replacement admits only the audited checkout-aware write paths.
 - Immediately before a real write, the old dirty route becomes pending. Existing
   leased readers remain valid; new requests cannot mistake the old generation
   for the updated working copy.
-- The existing single-file commit ledger still distinguishes disk commit from
-  graph refresh. Refresh uses the selected checkout coordinator, never the
-  primary repository's watcher or incremental indexer. A bounded refresh failure
-  leaves a stale/failed graph outcome and schedules reconciliation; it must not
-  report that a successful disk write did not happen.
+- The existing single-file commit ledger distinguishes disk commit from graph
+  refresh. Once bytes commit, the edit enqueues a checkout refresh ticket and
+  returns `reindexed:false`, `reindex_pending:true`, and `graph_status:pending`.
+  The middleware releases the write lease before background publication; the
+  response does not wait for parsing, enrichment, or the old synchronous refresh
+  budget. It includes a `mutation_receipt` for the disk commit and a
+  `reindex_receipt` for the graph refresh.
+- The existing coordinator loop owns refresh execution. There is no second
+  indexer, per-edit build goroutine, or primary-watcher fallback. The physical
+  build uses coordinator lifetime, not the request's short wait deadline. A
+  disconnected caller does not cancel a committed edit's publication.
+- A ticket becomes fresh only after an active route publishes the expected
+  checkout incarnation, HEAD, and content. Deferred or rescheduled work remains
+  pending. Supersession, disappearance, and terminal failures cannot be mistaken
+  for success; the original failure detail is retained. A primary reindex cannot
+  certify an automatic checkout's receipt.
+- Publication evidence includes the admitted branch/HEAD, checkout/root identity,
+  the dirty snapshot fingerprint, and a SHA-256 of the committed target bytes.
+  An intervening change to another dirty file can conservatively supersede the
+  ticket instead of claiming freshness. This does not strengthen the existing
+  whole-checkout sampler, which fingerprints dirty paths and their size/mtime
+metadata rather than hashing every file. Historical superseded receipts remain
+  inspectable but do not block diagnostics for a newer current view.
 - Coordinator shutdown joins admitted writes before checkout state can retire.
 
 All inexact fallbacks and immutable ref/commit views remain read-only. A missing
 coordinator refuses the operation before touching files. Save or discard active
 session editor buffers before editing on-disk worktree content; buffer-derived
 symbol locations are not authority to modify disk.
+
+## Agent lifecycle and recovery
+
+The supported flow is:
+
+`new worktree -> automatic discovery -> search -> exact edit -> pending refresh -> fresh -> next edit`
+
+1. An agent request from a newly added checkout discovers it without adding
+   explicit tracking intent. Search may return a labeled, read-only base
+   fallback while the selected graph builds. `require_exact:true` refuses that
+   substitution.
+2. Source edits still require an exact, authorized working-copy view. Busy
+   admission is bounded and retryable; graph-dependent operations do not wait
+   indefinitely behind a build or silently edit the primary fallback.
+3. A successful disk edit returns a pending publication receipt promptly. Query
+   `change(operation:"receipt", options:{receipt:"<mutation_receipt>"}, view:...)`
+   to observe `pending -> fresh` or a specific failure. Never repeat the disk
+   edit merely because its graph publication is pending.
+4. Receipt inspection and checkout-scoped recovery validate checkout identity
+   and authorization independently of graph materialization. They work while a
+   route is building. Their checkout-scope metadata is not a claim that an exact
+   graph was served. Successful scoped recovery can clear previously failed
+   tickets from the current-view safety barrier, but leaves their historical
+   failure receipts intact. It cannot clear failures admitted after that recovery
+   request or failures from another checkout/incarnation.
+5. `workspace_admin.reindex` for an automatic checkout queues its coordinator;
+   it does not require promoting the checkout to a dedicated graph or invoke
+   canonical incremental indexing. Scoped paths must remain inside the selected
+   working copy. These working-copy controls accept automatic/worktree selection;
+   explicit base/ref/commit selectors are refused rather than silently operating
+   on a different working copy.
+6. `change.detect` always examines Git changes in the selected checkout. If the
+   corresponding graph is not ready, it reports the file changes with incomplete
+   graph analysis and unknown risk, rather than returning a false clean-tree
+   verdict from the main checkout.
+
+The old flow violated these rules in three connected places: a short synchronous
+refresh error became a frozen terminal receipt even though the coordinator later
+retried; ready-graph routing blocked receipt inspection and recovery; and change
+detection used the canonical repository root despite an exact-worktree rider.
+The repair needs neither a schema migration nor a daemon restart protocol.
+
+First-CWD discovery is limited to a checkout proven by Git's worktree inventory
+to belong to an already known family with a designated primary. It records only
+that missing checkout and activates its coordinator. It does not sweep other
+families, perform retirement/forget cleanup, modify explicit tracking intent, or
+wait for a graph build. Both daemon CWD admission and direct tool routing use the
+same path lookup, so a first request need not wait for a periodic reconciliation.
+
+### Observed slow-refresh incident (2026-09-06)
+
+In the PR-744 worktree, an edit committed at 10:11:51 UTC. A subsequent sparse
+build reached the 200-file dependency-closure cap. Parsing took 46.165 seconds;
+the eight workers accumulated 0.132 seconds reading, 5.739 seconds extracting,
+and 305.566 seconds in batch processing. Those worker times overlap and must
+not be added to derive wall time. Synthesis, store work, and semantic enrichment
+continued until 10:16:40 UTC. The exact route later recovered while the receipt
+still claimed terminal failure. The retained receipt did not expose the original
+refresh error, so this evidence alone does not prove its initial trigger.
+
+This fix removes request-lifetime cancellation and recovery dead ends from that
+flow. It does not claim that a large dependency closure becomes cheap: background
+build cost and interactive request latency must be measured separately.
 
 ## Deliberately unsupported write paths
 
@@ -56,6 +137,13 @@ subsequent exact graph/source reads. Separate tests cover stale epochs, dirty
 state, cancellation, shutdown, panic cleanup, root replacement, and failed
 publication after a successful disk commit.
 
+The lifecycle regressions additionally add a worktree after startup and search
+it without tracking; block the real extractor on post-edit content; verify that
+edit returns pending before the parser is released; query receipts, queue scoped
+recovery, and detect selected-root changes during the blocked build; then release
+the parser, observe fresh publication, and perform a second edit. Pending exact
+writes remain refused and the primary's bytes remain unchanged throughout.
+
 On an Apple M1 Pro, three 10-iteration runs against a tiny fixture measured:
 
 | Operation | Time per operation |
@@ -69,3 +157,32 @@ generation IDs unchanged. Reproduce with
 `go test ./internal/indexer -run '^$' -bench '^BenchmarkCheckoutMutation' -benchmem`
 and
 `go test ./internal/mcp -run '^$' -bench '^BenchmarkWorktreeMutationDryRun$' -benchmem`.
+
+Measure enqueue latency independently of a stalled parser with
+`go test ./internal/mcp -run '^$' -bench '^BenchmarkWorktreeMutationEnqueueWithBlockedIndexer$' -benchtime=5x -benchmem`.
+
+For the lifecycle repair on 2026-09-06, three five-iteration runs measured
+11.74–12.50 ms per dry run, compared with 11.21–12.17 ms before the repair
+(medians 12.38 and 12.07 ms respectively). The median allocation count increased
+from 2,835 to 3,062 with the additional checkout binding and scope checks.
+Committed edits with the real extractor blocked returned in 33.55, 34.45, and
+37.57 ms per operation (three run averages; median 34.45 ms). Fixture setup and
+eventual publication are outside that edit timing. These tiny-repository
+measurements demonstrate separation from the stalled indexer, not a prediction
+of large-repository indexing throughput or a production latency guarantee.
+
+Receipt inspection during pending publication measured 0.167–0.239 ms per call
+(three 100-iteration run averages), including checkout binding and authorization.
+
+First-checkout observation measured 65.40, 64.66, and 76.91 ms per admission
+(three five-admission run averages; 15 successful admissions, zero busy replies
+in that final run). An earlier loaded run reached the 250 ms admission bound;
+this exposed a duplicated Git inventory scan and a lost busy classification.
+Observation now reuses the validated inventory and preserves retryable busy
+errors through daemon admission instead of presenting them as untracked CWDs.
+The bound is not increased, and no pending request is granted graph authority.
+
+Formatting the daemon's retryable admission-error response measured 2.34–2.38 µs
+per response (three 200 ms benchmark runs, 1,601 bytes and 26 allocations per
+operation). Wire-level tests preserve initialization/capability metadata while
+denying graph reads and source/configuration mutations until admission succeeds.

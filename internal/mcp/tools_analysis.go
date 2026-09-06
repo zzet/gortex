@@ -336,15 +336,52 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	// Resolve the working tree: explicit repo selector, lone tracked repo,
 	// or the session's cwd-bound repo. The "." fallback keeps the standalone
 	// (indexer-less) server working from its own cwd.
-	repoRoot, repoPrefix, rootErr := s.resolveDiffRoot(ctx, strings.TrimSpace(req.GetString("repo", "")))
+	repoSelector := strings.TrimSpace(req.GetString("repo", ""))
+	control := checkoutControlFromContext(ctx)
+	var repoRoot, repoPrefix string
+	var rootErr error
+	if control != nil && control.CheckoutScoped {
+		rootErr = control.validateRepoSelector(repoSelector)
+		repoRoot, repoPrefix = control.Checkout.RootPath, control.RepoPrefix
+	} else {
+		repoRoot, repoPrefix, rootErr = s.resolveDiffRoot(ctx, repoSelector)
+	}
 	if rootErr != nil {
 		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
-	if freshnessErr := s.awaitMutationFreshnessForRepos(ctx, repoPrefix); freshnessErr != nil {
-		return mcp.NewToolResultError("change detection refused a stale graph: " + freshnessErr.Error()), nil
+	if scopeErr := s.repoPrefixInSessionScope(ctx, repoPrefix, repoPrefix); scopeErr != nil {
+		return mcp.NewToolResultError(scopeErr.Error()), nil
+	}
+	var pending bool
+	var freshnessErr error
+	if control != nil && control.CheckoutScoped {
+		pending, freshnessErr = s.mutationFreshnessSummaryForRepos(ctx, repoPrefix)
+	} else if err := s.awaitMutationFreshnessForRepos(ctx, repoPrefix); err != nil {
+		return mcp.NewToolResultError("change detection refused a stale graph: " + err.Error()), nil
+	}
+	reader := s.readerFor(ctx)
+	graphStatus, graphDetail := "ready", ""
+	if pending {
+		graphStatus, graphDetail = "pending", "checkout changes are committed but graph publication is pending"
+	}
+	if freshnessErr != nil {
+		graphStatus, graphDetail = "failed", freshnessErr.Error()
+	}
+	if control != nil && control.CheckoutScoped {
+		view := requestViewFromContext(ctx)
+		if view == nil || view.rider == nil || !view.rider.Exact || !view.routed() {
+			if graphStatus == "ready" {
+				graphStatus, graphDetail = "pending", "the selected checkout has no exact published graph view"
+			}
+		}
+	}
+	if graphStatus != "ready" {
+		// Git can still report file changes, but stale/base symbols must not
+		// impersonate the selected checkout's changed symbols or impact.
+		reader = graph.New()
 	}
 
-	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiff(reader, repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -359,6 +396,14 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	fileChanges := diff.FileChanges
 	if fileChanges == nil {
 		fileChanges = []analysis.FileChange{}
+	}
+	if graphStatus != "ready" {
+		return s.respondJSONOrTOON(ctx, req, map[string]any{
+			"changed_symbols": []any{}, "changed_files": changedFiles, "file_changes": fileChanges,
+			"risk": "UNKNOWN", "complete": false, "graph_status": graphStatus,
+			"summary": "Git file changes are available; symbol mapping and impact await an exact published graph",
+			"detail":  graphDetail, "scope": scope, "repo": repoPrefix, "repo_root": repoRoot,
+		})
 	}
 
 	if len(diff.ChangedSymbols) == 0 {

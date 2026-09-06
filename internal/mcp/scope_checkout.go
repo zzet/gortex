@@ -5,6 +5,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 )
 
@@ -29,30 +30,43 @@ import (
 // for, or when its family's primary is not a tracked repository. Every one of
 // those leaves the caller on the fail-closed path it took before.
 func (s *Server) scopeForAutomaticCheckout(ctx context.Context, cwd string) (workspaceID, projectID, repoPrefix string, ok bool) {
+	workspaceID, projectID, repoPrefix, ok, _ = s.scopeForAutomaticCheckoutChecked(ctx, cwd)
+	return workspaceID, projectID, repoPrefix, ok
+}
+
+func (s *Server) scopeForAutomaticCheckoutChecked(ctx context.Context, cwd string) (workspaceID, projectID, repoPrefix string, ok bool, err error) {
+	return s.scopeForAutomaticCheckoutWithPrefix(ctx, cwd, s.repoPrefixForCheckoutChecked)
+}
+
+func (s *Server) scopeForAutomaticCheckoutWithPrefix(ctx context.Context, cwd string, lookup func(context.Context, store_sqlite.Checkout) (string, error)) (workspaceID, projectID, repoPrefix string, ok bool, err error) {
 	if s == nil || s.multiIndexer == nil || s.materializer == nil || s.materializer.Catalog == nil {
-		return "", "", "", false
+		return "", "", "", false, nil
 	}
-	checkout, found, err := graphview.CheckoutForPath(ctx, s.materializer.Catalog, s.viewFamilies(ctx), cwd)
+	checkout, found, err := s.checkoutForRequestPath(ctx, cwd)
 	if err != nil {
 		// A catalog that cannot be read leaves the cwd unresolved, which is
 		// the fail-closed answer — never a wider one.
 		if s.logger != nil {
 			s.logger.Debug("session scope: could not bind the cwd to a checkout", zap.Error(err))
 		}
-		return "", "", "", false
+		return "", "", "", false, err
 	}
 	if !found || !graphview.ServesAutomaticView(checkout) {
-		return "", "", "", false
+		return "", "", "", false, nil
 	}
-	prefix := s.repoPrefixForCheckout(ctx, checkout)
+	prefix, err := lookup(ctx, checkout)
+	if err != nil {
+		return "", "", "", false, err
+	}
 	if prefix == "" {
-		return "", "", "", false
+		return "", "", "", false, nil
 	}
 	root, known := s.multiIndexer.RepoRoot(prefix)
 	if !known {
-		return "", "", "", false
+		return "", "", "", false, nil
 	}
-	return s.multiIndexer.ScopeForCWD(root)
+	workspaceID, projectID, repoPrefix, ok = s.multiIndexer.ScopeForCWD(root)
+	return workspaceID, projectID, repoPrefix, ok, nil
 }
 
 // CheckoutServesCWD reports whether a working directory binds to a registered
@@ -64,6 +78,15 @@ func (s *Server) scopeForAutomaticCheckout(ctx context.Context, cwd string) (wor
 // binds to the family's primary, and a cwd refused here is one it would have
 // left unresolved.
 func (s *Server) CheckoutServesCWD(ctx context.Context, cwd string) bool {
-	_, _, _, ok := s.scopeForAutomaticCheckout(ctx, cwd)
+	ok, _ := s.CheckoutServesCWDChecked(ctx, cwd)
 	return ok
+}
+
+// CheckoutServesCWDChecked distinguishes an unknown checkout from transient
+// catalog/discovery contention. Both remain unadmitted, but a daemon must tell
+// the caller to retry the latter rather than incorrectly suggest tracking it.
+// No pending observation is treated as a scoped or ready checkout.
+func (s *Server) CheckoutServesCWDChecked(ctx context.Context, cwd string) (bool, error) {
+	_, _, _, ok, err := s.scopeForAutomaticCheckoutChecked(ctx, cwd)
+	return ok, err
 }

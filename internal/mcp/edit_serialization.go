@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -36,8 +37,8 @@ type mutationPathLock struct {
 }
 
 // mutationReindexOutcome is the complete freshness state produced after a disk
-// mutation. A receipt is present only when the bounded request-path wait ended
-// before the watcher ticket did.
+// mutation. A receipt identifies admitted publication work that can outlive the
+// request, either on a watcher or on the selected checkout's coordinator.
 type mutationReindexOutcome struct {
 	Reindexed         bool
 	Pending           bool
@@ -47,18 +48,24 @@ type mutationReindexOutcome struct {
 	Err               error
 	// A checkout generation is not reflected in the canonical syntax-health
 	// reader. Do not attach another checkout's parse errors to this result.
-	checkoutScoped bool
+	checkoutScoped      bool
+	checkoutID          string
+	checkoutIncarnation string
 }
 
 type mutationReceipt struct {
-	id         string
-	repo       string
-	path       string
-	generation uint64
-	done       chan struct{}
-	mu         sync.RWMutex
-	result     indexer.MutationResult
-	completed  bool
+	id                         string
+	repo                       string
+	path                       string
+	generation                 uint64
+	done                       chan struct{}
+	mu                         sync.RWMutex
+	result                     indexer.MutationResult
+	completed                  bool
+	checkoutScoped             bool
+	checkoutID                 string
+	checkoutIncarnation        string
+	barrierRecoveredGeneration uint64
 }
 
 type mutationScheduler interface {
@@ -157,12 +164,37 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 	if s.multiIndexer != nil {
 		repo = s.multiIndexer.RepoForFile(ticket.Path)
 	}
+	return s.trackScopedMutationTicket(ticket, repo, "", "", nil)
+}
+
+func (s *Server) trackCheckoutRefreshTicket(ticket *indexer.CheckoutRefreshTicket) *mutationReceipt {
+	return s.trackScopedMutationTicket(ticket.Ticket, ticket.RepoPrefix, ticket.CheckoutID, ticket.Incarnation, nil)
+}
+
+// trackCheckoutRecoveryTicket lets verified whole-checkout recovery retire
+// historical freshness gaps without rewriting their original result/error.
+// eligible must be captured before RequestCheckoutRefresh starts sampling.
+func (s *Server) trackCheckoutRecoveryTicket(ticket *indexer.CheckoutRefreshTicket, eligible map[string]struct{}) *mutationReceipt {
+	var captured map[string]struct{}
+	if ticket.ContentHash == "" && filepath.Clean(ticket.Ticket.Path) == filepath.Clean(ticket.Root) {
+		captured = make(map[string]struct{}, len(eligible))
+		for id := range eligible {
+			captured[id] = struct{}{}
+		}
+	}
+	return s.trackScopedMutationTicket(ticket.Ticket, ticket.RepoPrefix, ticket.CheckoutID, ticket.Incarnation, captured)
+}
+
+func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo, checkoutID, incarnation string, recoveryCandidates map[string]struct{}) *mutationReceipt {
 	receipt := &mutationReceipt{
-		id:         fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
-		repo:       repo,
-		path:       ticket.Path,
-		generation: ticket.Generation,
-		done:       make(chan struct{}),
+		id:                  fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
+		repo:                repo,
+		path:                ticket.Path,
+		generation:          ticket.Generation,
+		done:                make(chan struct{}),
+		checkoutScoped:      checkoutID != "",
+		checkoutID:          checkoutID,
+		checkoutIncarnation: incarnation,
 	}
 	s.mutationReceipts.Store(receipt.id, receipt)
 	go func() {
@@ -177,15 +209,62 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 		receipt.result = result
 		receipt.completed = true
 		receipt.mu.Unlock()
-		if result.Err == nil && result.Reindexed {
+		if result.Err == nil && result.Reindexed && !receipt.checkoutScoped {
 			s.resolveSupersededFailedReceipts(receipt.path, receipt.generation, result)
 		}
+		if result.Err == nil && result.Reindexed && result.AppliedGeneration > 0 && receipt.checkoutScoped {
+			s.resolveCheckoutRecoveryReceipts(receipt, recoveryCandidates, result.AppliedGeneration)
+		}
 		close(receipt.done)
-		time.AfterFunc(mutationReceiptRetention, func() {
+		retention := mutationReceiptRetention
+		if receipt.checkoutScoped {
+			// A commit receipt can be queried long after publication finished.
+			// Its freshness ticket must outlive that ledger's polling window.
+			retention = mutationCommitRetention
+		}
+		time.AfterFunc(retention, func() {
 			s.mutationReceipts.Delete(receipt.id)
 		})
 	}()
 	return receipt
+}
+
+// Only failures already terminal before recovery admission are eligible. An
+// in-flight edit which fails later, or a newer edit, must retain its own gate.
+func (s *Server) failedCheckoutRefreshReceiptsBefore(checkoutID, incarnation string) map[string]struct{} {
+	eligible := make(map[string]struct{})
+	s.mutationReceipts.Range(func(_, value any) bool {
+		receipt, ok := value.(*mutationReceipt)
+		if !ok || !receipt.checkoutScoped || receipt.checkoutID != checkoutID || receipt.checkoutIncarnation != incarnation {
+			return true
+		}
+		receipt.mu.RLock()
+		failed := receipt.completed && (receipt.result.Err != nil || !receipt.result.Reindexed) && receipt.barrierRecoveredGeneration == 0
+		receipt.mu.RUnlock()
+		if failed {
+			eligible[receipt.id] = struct{}{}
+		}
+		return true
+	})
+	return eligible
+}
+
+func (s *Server) resolveCheckoutRecoveryReceipts(recovery *mutationReceipt, eligible map[string]struct{}, generation uint64) {
+	for id := range eligible {
+		value, ok := s.mutationReceipts.Load(id)
+		if !ok {
+			continue
+		}
+		receipt, ok := value.(*mutationReceipt)
+		if !ok || !receipt.checkoutScoped || receipt.checkoutID != recovery.checkoutID || receipt.checkoutIncarnation != recovery.checkoutIncarnation || receipt.generation >= recovery.generation {
+			continue
+		}
+		receipt.mu.Lock()
+		if receipt.completed && (receipt.result.Err != nil || !receipt.result.Reindexed) {
+			receipt.barrierRecoveredGeneration = generation
+		}
+		receipt.mu.Unlock()
+	}
 }
 
 // resolveSupersededFailedReceipts resolves terminally failed receipts for a
@@ -207,7 +286,7 @@ func (s *Server) resolveSupersededFailedReceipts(succeededPath string, succeeded
 	cleanPath := filepath.Clean(succeededPath)
 	s.mutationReceipts.Range(func(_, value any) bool {
 		other, ok := value.(*mutationReceipt)
-		if !ok {
+		if !ok || other.checkoutScoped {
 			return true
 		}
 		if other.generation >= succeededGeneration || filepath.Clean(other.path) != cleanPath {
@@ -253,7 +332,7 @@ func (s *Server) failedReceiptsBefore(paths []string, root string) map[string]st
 	eligible := make(map[string]struct{})
 	s.mutationReceipts.Range(func(_, value any) bool {
 		receipt, ok := value.(*mutationReceipt)
-		if !ok || filepath.Clean(receipt.path) != candidate {
+		if !ok || receipt.checkoutScoped || filepath.Clean(receipt.path) != candidate {
 			return true
 		}
 		receipt.mu.RLock()
@@ -271,7 +350,7 @@ func (s *Server) resolveReindexedPathReceipts(reindexedPath string, eligible map
 	cleanPath := filepath.Clean(reindexedPath)
 	s.mutationReceipts.Range(func(_, value any) bool {
 		receipt, ok := value.(*mutationReceipt)
-		if !ok || filepath.Clean(receipt.path) != cleanPath {
+		if !ok || receipt.checkoutScoped || filepath.Clean(receipt.path) != cleanPath {
 			return true
 		}
 		if _, wasFailingBeforeThePass := eligible[receipt.id]; !wasFailingBeforeThePass {
@@ -294,9 +373,12 @@ func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	outcome := mutationReindexOutcome{
-		Pending:    pending,
-		Receipt:    r.id,
-		Generation: r.generation,
+		Pending:             pending,
+		Receipt:             r.id,
+		Generation:          r.generation,
+		checkoutScoped:      r.checkoutScoped,
+		checkoutID:          r.checkoutID,
+		checkoutIncarnation: r.checkoutIncarnation,
 	}
 	if r.completed {
 		outcome.Reindexed = r.result.Reindexed
@@ -368,11 +450,36 @@ func (s *Server) awaitMutationFreshness(ctx context.Context) error {
 	return s.awaitMutationFreshnessForRepos(ctx)
 }
 
-// awaitMutationFreshnessForRepos waits once, under one shared budget, for every
-// ticket in the requested repositories. Receipts with unknown ownership remain
-// in scope so incomplete metadata cannot disarm the safety gate. On timeout it
-// reports every pending and terminally failed generation, not only the first.
-func (s *Server) awaitMutationFreshnessForRepos(ctx context.Context, repos ...string) error {
+// mutationCheckoutScope is metadata-only so receipts remain inspectable while
+// the selected checkout has no materialized graph. An unselected request is
+// canonical; sharing a repository prefix does not give it sibling receipts.
+func mutationCheckoutScope(ctx context.Context) (checkoutID, incarnation string) {
+	if state := checkoutMutationFromContext(ctx); state != nil {
+		return state.checkoutID, state.incarnation
+	}
+	if control := checkoutControlFromContext(ctx); control != nil {
+		if !control.CheckoutScoped {
+			return "", ""
+		}
+		return control.Checkout.CheckoutID, control.Checkout.Incarnation
+	}
+	if view := requestViewFromContext(ctx); view != nil && view.rider != nil {
+		return view.rider.CheckoutID, ""
+	}
+	return "", ""
+}
+
+func mutationCheckoutScopeMatches(checkoutID, incarnation, candidateID, candidateIncarnation string) bool {
+	if checkoutID != candidateID {
+		return false
+	}
+	return incarnation == "" || incarnation == candidateIncarnation
+}
+
+// mutationReceiptsForRepos selects the same coherent checkout view as the
+// request. Unknown repository ownership remains in scope within that view.
+func (s *Server) mutationReceiptsForRepos(ctx context.Context, repos ...string) []*mutationReceipt {
+	checkoutID, incarnation := mutationCheckoutScope(ctx)
 	repoScope := make(map[string]struct{}, len(repos))
 	for _, repo := range repos {
 		if repo != "" {
@@ -386,14 +493,55 @@ func (s *Server) awaitMutationFreshnessForRepos(ctx context.Context, repos ...st
 		if !ok {
 			return true
 		}
+		if !mutationCheckoutScopeMatches(checkoutID, incarnation, receipt.checkoutID, receipt.checkoutIncarnation) {
+			return true
+		}
 		if len(repoScope) > 0 && receipt.repo != "" {
 			if _, included := repoScope[receipt.repo]; !included {
 				return true
 			}
 		}
+		// Superseded content and failures covered by verified root recovery
+		// remain historical receipts, not current-view freshness gaps. This
+		// never marks an original result fresh; exact route readiness remains
+		// the authority for the current view.
+		receipt.mu.RLock()
+		historical := receipt.checkoutScoped && receipt.completed && (errors.Is(receipt.result.Err, indexer.ErrCheckoutRefreshSuperseded) || receipt.barrierRecoveredGeneration > 0)
+		receipt.mu.RUnlock()
+		if historical {
+			return true
+		}
 		receipts = append(receipts, receipt)
 		return true
 	})
+	return receipts
+}
+
+// mutationFreshnessSummaryForRepos is a non-blocking version of the freshness
+// barrier for partial diagnostic results. It uses the same checkout and repo
+// scope as the waiting path, but never turns a pending ticket into a failure.
+func (s *Server) mutationFreshnessSummaryForRepos(ctx context.Context, repos ...string) (pending bool, err error) {
+	var failures []error
+	for _, receipt := range s.mutationReceiptsForRepos(ctx, repos...) {
+		outcome := receipt.outcome(true)
+		if outcome.Pending {
+			pending = true
+			continue
+		}
+		if outcome.Err != nil {
+			failures = append(failures, fmt.Errorf("failed receipt=%s path=%q: %w", receipt.id, receipt.path, outcome.Err))
+		} else if !outcome.Reindexed {
+			failures = append(failures, fmt.Errorf("failed receipt=%s path=%q: reindex not confirmed", receipt.id, receipt.path))
+		}
+	}
+	return pending, errors.Join(failures...)
+}
+
+// awaitMutationFreshnessForRepos waits once, under one shared budget, for every
+// selected ticket. On timeout it reports all pending and terminally failed
+// generations rather than hiding the remaining gaps behind the first one.
+func (s *Server) awaitMutationFreshnessForRepos(ctx context.Context, repos ...string) error {
+	receipts := s.mutationReceiptsForRepos(ctx, repos...)
 	if len(receipts) == 0 {
 		return nil
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -26,9 +27,12 @@ import (
 // ID into ctx via gortexmcp.WithSessionID before HandleMessage runs.
 // Tool handlers resolve per-client state through Server.sessionFor(ctx).
 type mcpDispatcher struct {
-	srv          *gortexmcp.Server
-	multiIndexer *indexer.MultiIndexer
-	logger       *zap.Logger
+	// checkoutCWDProbe preserves discovery errors across the daemon admission
+	// boundary. Nil delegates to the server's checked checkout resolver.
+	checkoutCWDProbe func(context.Context, string) (bool, error)
+	srv              *gortexmcp.Server
+	multiIndexer     *indexer.MultiIndexer
+	logger           *zap.Logger
 	// router is held behind an atomic.Pointer so ControlProxy can
 	// publish a freshly-built (or torn-down) router live without
 	// racing a concurrent dispatch read.
@@ -92,7 +96,15 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// and tools/list answers an empty/track-only list, instead of a
 	// connection-poisoning errored initialize. Only tools/call is refused (with
 	// the structured not-tracked error the agent can act on).
-	untracked := sess.CWD != "" && !d.cwdReachable(ctx, sess.CWD)
+	// Discovery needs the calling CWD for its scope authorization, but binding
+	// a client session must wait until admission has succeeded.
+	ctx = gortexmcp.WithSessionID(ctx, sess.ID)
+	ctx = gortexmcp.WithSessionCWD(ctx, sess.CWD)
+	reachable, admissionErr := d.cwdReachableChecked(ctx, sess.CWD)
+	untracked := sess.CWD != "" && !reachable && admissionErr == nil
+	if admissionErr != nil && !checkoutAdmissionMetadataMethod(peekFrameMethod(frame)) {
+		return checkoutAdmissionError(sess.CWD, frame, admissionErr), nil
+	}
 	if untracked {
 		d.logUncoveredCWDOnce(sess)
 	}
@@ -100,12 +112,10 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 		return d.notTrackedError(sess, frame), nil
 	}
 
-	ctx = gortexmcp.WithSessionID(ctx, sess.ID)
 	// Carry the session's cwd so MCP tool handlers can resolve — and
 	// enforce — the workspace boundary for this session. Without this
 	// every query runs against the whole multi-workspace graph and a
 	// session in workspace A can see workspace B's nodes.
-	ctx = gortexmcp.WithSessionCWD(ctx, sess.CWD)
 	// Run session-aware: attaching the connected client session (wired
 	// by SessionStarted) lets mcp-go's initialize handler mark it
 	// initialized — the gate SendNotificationToAllClients applies
@@ -184,6 +194,9 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// "run gortex track" instructions and an empty track-only tool list.
 	if untracked {
 		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, sess.CWD, d.trackedRoots())
+	}
+	if admissionErr != nil {
+		out = rewriteCheckoutAdmissionResponse(peekFrameMethod(frame), out, sess.CWD, admissionErr)
 	}
 	return out, nil
 }
@@ -323,11 +336,93 @@ func (d *mcpDispatcher) SessionEnded(sess *daemon.Session) {
 // in servers.toml, which is the same wrong-result class
 // repo_not_tracked is meant to prevent.
 func (d *mcpDispatcher) cwdReachable(ctx context.Context, cwd string) bool {
-	if cwd == "" {
+	reachable, err := d.cwdReachableChecked(ctx, cwd)
+	return err == nil && reachable
+}
+
+// A failed discovery must not expose graph data or accept source/configuration
+// mutations. Keep only the connection and stable capability metadata available.
+func checkoutAdmissionMetadataMethod(method string) bool {
+	switch method {
+	case "initialize", "tools/list", "ping":
 		return true
+	default:
+		return strings.HasPrefix(method, "notifications/")
+	}
+}
+
+func checkoutAdmissionFailure(err error) (code string, retryable bool) {
+	var committed interface{ Committed() bool }
+	if errors.As(err, &committed) && committed.Committed() {
+		return "checkout_inaccessible", false
+	}
+	if errors.Is(err, indexer.ErrCheckoutMutationBusy) || errors.Is(err, context.DeadlineExceeded) {
+		return "view_building", true
+	}
+	// Catalog readers can surface SQLite contention directly, including an
+	// extended result code. Only BUSY/LOCKED are safe retry classifications.
+	var coded interface{ Code() int }
+	if errors.As(err, &coded) {
+		switch coded.Code() & 0xff {
+		case 5, 6: // SQLITE_BUSY, SQLITE_LOCKED
+			return "view_building", true
+		}
+	}
+	return "checkout_inaccessible", false
+}
+
+func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
+	var req struct {
+		ID json.RawMessage `json:"id"`
+	}
+	_ = json.Unmarshal(inbound, &req)
+	code, retryable := checkoutAdmissionFailure(err)
+	out, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      req.ID,
+		"error": map[string]any{
+			"code":    -32000,
+			"message": "checkout discovery unavailable: " + err.Error(),
+			"data": map[string]any{
+				"error_code": code,
+				"path":       cwd,
+				"retryable":  retryable,
+			},
+		},
+	})
+	return out
+}
+
+func rewriteCheckoutAdmissionResponse(method string, out []byte, cwd string, err error) []byte {
+	if method != "initialize" {
+		return out
+	}
+	var reply map[string]any
+	if json.Unmarshal(out, &reply) != nil {
+		return out
+	}
+	result, ok := reply["result"].(map[string]any)
+	if !ok {
+		return out
+	}
+	code, retryable := checkoutAdmissionFailure(err)
+	result["instructions"] = fmt.Sprintf(
+		"Gortex checkout discovery is unavailable for %s (%s, retryable=%t): %v. "+
+			"No graph access has been granted. Retry after discovery can complete; do not change tracking configuration to resolve this admission error.",
+		cwd, code, retryable, err)
+	updated, marshalErr := json.Marshal(reply)
+	if marshalErr != nil {
+		return out
+	}
+	return updated
+}
+
+func (d *mcpDispatcher) cwdReachableChecked(ctx context.Context, cwd string) (bool, error) {
+	if cwd == "" {
+		return true, nil
 	}
 	if d.isCWDTracked(cwd) {
-		return true
+		return true, nil
 	}
 	// Workspace-root fallback: a cwd that CONTAINS tracked repos — an
 	// agent opened at the root above its repos — is reachable when
@@ -345,10 +440,10 @@ func (d *mcpDispatcher) cwdReachable(ctx context.Context, cwd string) bool {
 	// <parent>`) that would have indexed every child a second time.
 	if d.multiIndexer != nil {
 		if _, _, _, ok := d.multiIndexer.ScopeForCWD(cwd); ok {
-			return true
+			return true, nil
 		}
 		if _, _, ok := d.multiIndexer.ContainedReposScope(cwd); ok {
-			return true
+			return true, nil
 		}
 	}
 	// Checkout fallback: a git worktree of a tracked family is a directory
@@ -357,19 +452,26 @@ func (d *mcpDispatcher) cwdReachable(ctx context.Context, cwd string) bool {
 	// resolves it through the same lookup. Refusing it here made that arm
 	// unreachable and left every worktree session with repo_not_tracked and a
 	// remedy that would have indexed the worktree as a second repository.
-	if d.srv != nil && d.srv.CheckoutServesCWD(ctx, cwd) {
-		return true
+	probe := d.checkoutCWDProbe
+	if probe == nil && d.srv != nil {
+		probe = d.srv.CheckoutServesCWDChecked
+	}
+	if probe != nil {
+		reachable, err := probe(ctx, cwd)
+		if err != nil || reachable {
+			return err == nil && reachable, err
+		}
 	}
 	rtr := d.router.Load()
 	if rtr == nil {
-		return false
+		return false, nil
 	}
 	lookup := rtr.LookupForCwd(cwd, "")
 	switch lookup.Source {
 	case "scope-override", "config-yaml", "roster":
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 // isCWDTracked reports whether the proxy's cwd lies inside any tracked
