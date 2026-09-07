@@ -3223,46 +3223,15 @@ func (g *Graph) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 		defer g.endReceiptMutation()
 	}
 	g.lockAllWrite()
-	defer g.unlockAllWrite()
-
-	// Gather nodes across shards.
-	var nodes []*Node
-	for _, s := range g.shards {
-		nodes = append(nodes, s.byFile[filePath]...)
-	}
-	if len(nodes) == 0 {
-		return 0, 0
-	}
-	// id → source-repo captured BEFORE we delete the node from
-	// s.nodes; evictEdgesLocked needs the repo to debit per-repo
-	// edge counters and the live node would already be gone.
-	evictedIDs := make(map[string]string, len(nodes))
-	for _, n := range nodes {
-		evictedIDs[n.ID] = n.RepoPrefix
-	}
-	// See EvictFiles: the edges this eviction destroys from surviving
-	// sources are not reconstructible by any resolution pass, so failing the
-	// receipt closed over them would force a fallback that reaches the same
-	// graph. The RESOLUTION delta stays exactly describable.
-	g.recordEvictedNodesForReceipts(nodes)
-
-	for _, n := range nodes {
-		s := g.shardFor(n.ID)
-		s.repoNodeRemove(n)
-		delete(s.nodes, n.ID)
-		if n.QualName != "" {
-			if cur, ok := s.byQual[n.QualName]; ok && cur.ID == n.ID {
-				delete(s.byQual, n.QualName)
-			}
+	var scalarInvalidated bool
+	defer func() {
+		g.unlockAllWrite()
+		if scalarInvalidated {
+			g.markMutationReceiptsIncomplete()
 		}
-		removeNodeFromBucket(s.byName, s.byNameIdx, n.Name, n.ID)
-		removeNodeFromBucket(s.byFile, s.byFileIdx, filePath, n.ID)
-		removeNodeFromBucket(s.byRepo, s.byRepoIdx, n.RepoPrefix, n.ID)
-	}
-	nodesRemoved = len(nodes)
-	g.nodeMutGen.Add(1)
-
-	edgesRemoved = g.evictEdgesLocked(evictedIDs)
+	}()
+	// Direct eviction historically accepts the empty file-path bucket.
+	nodesRemoved, edgesRemoved, scalarInvalidated = g.evictFileNodesLocked(map[string]struct{}{filePath: {}}, true)
 	return nodesRemoved, edgesRemoved
 }
 
