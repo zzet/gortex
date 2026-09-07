@@ -167,6 +167,16 @@ func (s *Store) BatchDeleteSymbolFTS(nodeIDs []string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	if err := s.deleteSymbolFTSTx(tx, ids); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// deleteSymbolFTSTx deletes only the supplied IDs in the caller's existing
+// transaction and payload generation. Mapping rows must outlive virtual-row
+// deletion; this helper never locks, begins, commits or rolls back a transaction.
+func (s *Store) deleteSymbolFTSTx(tx *sql.Tx, ids []string) error {
 	for start := 0; start < len(ids); start += ftsInsertChunkRows {
 		end := minInt(start+ftsInsertChunkRows, len(ids))
 		chunk := ids[start:end]
@@ -185,7 +195,7 @@ SELECT fts_rowid FROM symbol_fts_rowid WHERE view_gen = ? AND node_id IN (`+plac
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // dedupeSymbolFTSItems drops empty IDs and collapses repeats with last-write-
