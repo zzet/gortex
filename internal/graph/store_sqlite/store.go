@@ -485,6 +485,12 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 }
 
 func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
+	// Refuse unsupported newer schemas before a writer connection can change
+	// journal mode or checkpoint their WAL. WithRebuild does not override this.
+	if err := checkSchemaDowngrade(path, current); err != nil {
+		return nil, err
+	}
+
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
 	// embedded tradeoff. cache_size(-32768) gives each pooled connection a
 	// 32 MiB page cache; temp_store(MEMORY) keeps GROUP BY / ORDER BY scratch
@@ -510,17 +516,20 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// A separate bounded query pool is opened after schema reconciliation.
 	configureWriterPool(db)
 
-	// Reconcile the on-disk schema version before applying schemaSQL. The graph
-	// store is a rebuildable cache, so an incompatible (older needing a rebuild
-	// step, or newer) DB is dropped and reindexed rather than migrated in place
-	// (see schema_version.go). The daemon holds an exclusive store.lock around
-	// Open, so wiping the file here cannot race another process.
+	// Recheck on the writer handle before applying schemaSQL, including for
+	// shared in-memory stores and a version changed after the read-only probe.
+	// Only known older rebuild boundaries may use destructive rebuild authority.
+	// The daemon holds an exclusive store.lock around Open and that rebuild.
 	stored, err := readUserVersion(db)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite read schema version: %w", err)
 	}
 	plan := planSchemaMigrationWith(stored, current, migrations)
+	if plan.err != nil {
+		_ = db.Close()
+		return nil, plan.err
+	}
 	// A rebuild migration applies to an existing pre-versioning database, but
 	// not to the brand-new empty file sql.Open just created. Distinguish those
 	// two user_version=0 cases before requiring destructive-rebuild authority.

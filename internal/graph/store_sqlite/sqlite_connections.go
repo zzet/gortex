@@ -90,7 +90,7 @@ func sqliteReaderDSN(path string) string {
 func sqliteDSN(path, rawQuery string) string {
 	// Preserve explicit URI and in-memory callers. Their existing query string
 	// may carry cache=shared/mode=memory, so append rather than replace it.
-	if isMemoryPath(path) || strings.HasPrefix(path, "file:") {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
 		separator := "?"
 		if strings.Contains(path, "?") {
 			separator = "&"

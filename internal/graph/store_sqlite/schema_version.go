@@ -828,9 +828,10 @@ DELETE FROM edges WHERE id IN (SELECT id FROM ph) AND id NOT IN (SELECT id FROM 
 // schemaPlan is the decision planSchemaMigration derives from the stored
 // PRAGMA user_version. It mutates nothing on its own.
 type schemaPlan struct {
-	wipe    bool              // drop the on-disk DB and rebuild from source
+	wipe    bool              // drop an explicitly rebuildable older DB
 	inPlace []schemaMigration // ordered in-place steps to run after schemaSQL
 	stamp   bool              // write currentSchemaVersion once reconciled
+	err     error             // refuse unsupported versions without mutation
 }
 
 // planSchemaMigrationWith decides how to reconcile a store at the stored
@@ -842,9 +843,9 @@ func planSchemaMigrationWith(stored, current int, migrations []schemaMigration) 
 	case stored == current:
 		return schemaPlan{} // up to date, nothing to do
 	case stored > current:
-		// Written by a newer build than this binary understands; the shape may
-		// have changed under us. For a cache the safe move is to rebuild.
-		return schemaPlan{wipe: true, stamp: true}
+		// A newer shape is not an authorized rebuild target. In particular,
+		// checkout catalog metadata cannot be reconstructed by reindexing.
+		return schemaPlan{err: &SchemaTooNewError{Stored: stored, Supported: current}}
 	case stored == 0:
 		// Fresh DB, or a pre-versioning store of unknown shape. schemaSQL's
 		// idempotent CREATE ... IF NOT EXISTS plus ensureNodeColumns /
