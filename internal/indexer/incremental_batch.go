@@ -778,60 +778,18 @@ func prepareMetadataRefreshFromView(
 	}
 
 	applyResolvedOutEdgesFromView(stage.result.Edges, stage.reuse, existing)
-	freshByKey := make(map[edgeRefreshKey][]*graph.Edge)
 	for _, edge := range stage.result.Edges {
-		if edge == nil {
-			continue
-		}
-		if priorByID[edge.From] == nil {
+		if edge != nil && priorByID[edge.From] == nil {
 			return false
 		}
-		key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
-		freshByKey[key] = append(freshByKey[key], edge)
 	}
-	oldByKey := make(map[edgeRefreshKey][]*graph.Edge)
+	var oldEdges []*graph.Edge
 	for id := range priorByID {
-		for _, edge := range outByNode[id] {
-			if edge == nil {
-				continue
-			}
-			key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
-			if _, needed := freshByKey[key]; needed {
-				oldByKey[key] = append(oldByKey[key], edge)
-			}
-		}
+		oldEdges = append(oldEdges, outByNode[id]...)
 	}
-	updates := make([]graph.EdgeReindex, 0, len(stage.result.Edges))
-	for key, fresh := range freshByKey {
-		old := oldByKey[key]
-		if len(old) != len(fresh) {
-			return false
-		}
-		sort.Slice(old, func(i, j int) bool {
-			if old[i].Line != old[j].Line {
-				return old[i].Line < old[j].Line
-			}
-			return old[i].To < old[j].To
-		})
-		sort.Slice(fresh, func(i, j int) bool {
-			if fresh[i].Line != fresh[j].Line {
-				return fresh[i].Line < fresh[j].Line
-			}
-			return fresh[i].To < fresh[j].To
-		})
-		for i := range fresh {
-			before := old[i]
-			after := *before
-			after.FilePath = fresh[i].FilePath
-			after.Line = fresh[i].Line
-			after.Alias = fresh[i].Alias
-			after.Meta = mergeRefreshMeta(before.Meta, fresh[i].Meta)
-			updates = append(updates, graph.EdgeReindex{
-				Edge: &after, OldTo: before.To,
-				OldFilePath: before.FilePath, OldLine: before.Line,
-				RefreshIdentity: true,
-			})
-		}
+	updates, ok := pairMetadataEdgeRefreshes(stage.graphPath, priorByID, oldEdges, stage.result.Edges)
+	if !ok {
+		return false
 	}
 	stage.edgeRefreshes = updates
 	return true
