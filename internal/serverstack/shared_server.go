@@ -309,9 +309,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	}
 
 	// allowRebuild is gated on actually holding the store lock: only then may
-	// the sqlite backend drop and recreate an incompatible-schema DB.
+	// the sqlite backend rebuild a supported older schema when necessary.
 	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, logger, storeLockHeld, cfg.MigrationObserver)
 	if err != nil {
+		// Backend initialization can fail after the store lock was acquired.
+		_ = s.Close()
 		return nil, err
 	}
 	s.cleanup = append(s.cleanup, backendCleanup)
