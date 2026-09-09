@@ -1002,11 +1002,25 @@ func graphBase(
 		if err != nil {
 			return primaryBase{}, err
 		}
-		if found {
-			out.generationID = row.GenerationID
-			out.treeOID = row.TreeOID
-			return out, nil
+		if !found {
+			return primaryBase{}, fmt.Errorf(
+				"indexer: primary graph %s active generation %d does not exist",
+				dedicated.GraphID, dedicated.ActiveGenerationID)
 		}
+		if row.OwnerKind != checkoutLayerOwnerKind || row.GraphID != dedicated.GraphID ||
+			row.CheckoutID != dedicated.OwnerCheckoutID || row.GenerationKind != "dedicated" {
+			return primaryBase{}, fmt.Errorf(
+				"indexer: primary graph %s active generation %d has incompatible ownership or kind",
+				dedicated.GraphID, dedicated.ActiveGenerationID)
+		}
+		if !servableGeneration(row.State) || row.TreeOID == "" {
+			return primaryBase{}, fmt.Errorf(
+				"indexer: primary graph %s active generation %d is not a servable committed tree (state %s)",
+				dedicated.GraphID, dedicated.ActiveGenerationID, row.State)
+		}
+		out.generationID = row.GenerationID
+		out.treeOID = row.TreeOID
+		return out, nil
 	}
 	owner, found, err := catalog.GetCheckout(ctx, dedicated.OwnerCheckoutID)
 	if err != nil {
