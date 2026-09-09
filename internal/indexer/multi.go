@@ -2808,6 +2808,27 @@ func (mi *MultiIndexer) TrackRepoCtx(ctx context.Context, entry config.RepoEntry
 func (mi *MultiIndexer) trackRepoSourceCtx(
 	ctx context.Context, entry config.RepoEntry, content source.ContentSource,
 ) (*IndexResult, error) {
+	prepared, err := mi.prepareTrackRepo(entry)
+	if err != nil || prepared == nil {
+		return nil, err
+	}
+	return mi.trackPreparedRepoSourceCtx(ctx, prepared, content)
+}
+
+// preparedTrackRepo carries one tracking attempt, not a namespace reservation
+// or an immutable configuration snapshot. It must not be cached across attempts.
+type preparedTrackRepo struct {
+	entry    config.RepoEntry
+	absPath  string
+	identity *RepoIdentity
+	prefix   string
+	cfg      *config.Config
+}
+
+// prepareTrackRepo resolves the existing pre-index inputs and runs the existing
+// hook. It does not itself construct or register an Indexer; config loading and
+// the hook remain side effects, so this is not a pure preflight operation.
+func (mi *MultiIndexer) prepareTrackRepo(entry config.RepoEntry) (*preparedTrackRepo, error) {
 	absPath, err := filepath.Abs(entry.Path)
 	if err != nil {
 		return nil, fmt.Errorf("resolving path %s: %w", entry.Path, err)
@@ -2871,6 +2892,27 @@ func (mi *MultiIndexer) trackRepoSourceCtx(
 	if hook != nil {
 		hook(prefix, absPath)
 	}
+
+	return &preparedTrackRepo{
+		entry:    entry,
+		absPath:  absPath,
+		identity: identity,
+		prefix:   prefix,
+		cfg:      cfg,
+	}, nil
+}
+
+// trackPreparedRepoSourceCtx consumes a nonnil preparation for this attempt.
+// The coordinated second deduplication remains the authority to install it.
+func (mi *MultiIndexer) trackPreparedRepoSourceCtx(
+	ctx context.Context, prepared *preparedTrackRepo, content source.ContentSource,
+) (*IndexResult, error) {
+	entry := prepared.entry
+	absPath := prepared.absPath
+	identity := prepared.identity
+	prefix := prepared.prefix
+	cfg := prepared.cfg
+	var err error
 
 	// Every repo is prefixed, including the first one. There is no
 	// repo-count gate here any more: a lone repo is just the first tracked

@@ -937,3 +937,97 @@ fixture does not establish survival under full filesystems, successful metadata
 cleanup while space remains exhausted, retry throttling, disk reclamation, WAL
 size, cold/warm throughput, or sustained background I/O. Those remain separate
 acceptance gates, as do immutable primary activation and public untrack safety.
+
+### 2026-09-09: tracking preparation split, without runtime activation
+
+The first runtime-integration seam is now separated without adding another
+physical index. `TrackRepoCtx` and its source-aware overload retain their public
+behavior. The overload calls `prepareTrackRepo` and then
+`trackPreparedRepoSourceCtx`; the existing constructor, coordinated second
+duplicate check, physical build, metadata/indexer installation, deferred global
+work and uninstalled-indexer cleanup retain their order. A byte-level reverse
+check reconstructs the original file from the single reviewed replacement.
+
+Preparation resolves the canonical root, identity, final prefix and effective
+configuration, performs the existing early duplicate checks, and invokes the
+existing tracking hook outside the registry lock. It does not construct or
+publish an Indexer. Its value is neither a namespace reservation nor an immutable
+configuration snapshot; configuration loading and the hook remain side effects.
+Concurrent preparations can both invoke the hook. The coordinated duplicate
+check remains authoritative for installation. Already-tracked calls still
+return nil without indexing newly changed source.
+
+The nonempty-mtime warm `ReconcileRepoCtx` path is deliberately unchanged. It
+does not invoke the cold tracking hook, has different early admission/dedup
+checks, and still installs its restored Indexer after a successful nonnil
+result, including a clean census. Blindly sharing cold preparation with that
+path would introduce behavior changes. Installed-runtime observations also
+cannot obtain publisher inputs merely by calling a preparation helper that
+returns nil for an already-tracked repository.
+
+The actual SharedServer tracking hook constructs/registers a resolver LSP
+helper; replacing it with publication wiring would remove existing behavior.
+Startup also calls Track/Reconcile directly, so lifecycle Register-only wiring
+would miss cold/warm producers. Exact startup source confirms that a closed
+view-build gate is installed before catalog seeding, while that gate opens only
+after warmup and enrichment. An initial immutable publisher must not wait behind
+a gate whose opening depends on its own completion. Early query readiness also
+precedes deferred global writes: it is not an immutable sealing/adoption event.
+These are integration constraints, not new runtime behavior in this extraction.
+
+Actual-file acceptance:
+
+- Four new preparation tests cover returned inputs, the unlocked hook,
+  concurrent non-reserving preparation, validation and public duplicate exits.
+  Their private Git fixtures clear inherited Git-routing environment variables
+  before both explicit and internal Git calls.
+- The isolated public regression builds a real SharedServer/SQLite store,
+  verifies cold symbol persistence, changes private source, and verifies that
+  repeated public tracking calls do not silently reindex it. Its ordinary test
+  parent launches an isolated child and requires a unique success marker after
+  cleanup; a skipped or empty child cannot pass the test.
+- Indexer: 32 selected normal tests passed in 2.763s; 12 selected race tests
+  repeated three times produced 36 passes in 4.273s. Both builds used actual
+  source/test files without overlays, and their inventories matched selection.
+- Public cold/no-op check: one pass in 1.007s. Permanent public regression:
+  three normal passes in 2.401s and three race passes in 10.996s, with three
+  distinct cleanup markers in each run. Its builds included only the absent,
+  frozen benchmark/diagnostic test fixture as an extra test source; no
+  production or permanent-test files were replaced.
+- No selected test failed or skipped, and no race was reported. Formatting,
+  vet and lint passed for the affected Indexer/SharedServer packages. Static
+  checks used actual files without overlays. Source/provenance manifests stayed
+  stable throughout compilation and validation.
+
+Before/after benchmarks used the same frozen fixture, three fresh processes per
+case, and one timed operation per sample. The no-op operation is a batch of 20
+public calls; every cold sample observes the expected function, and every no-op
+sample preserves the old function without materializing the newly added one.
+
+| Operation | Before median (range), ms | After median (range), ms | After allocations |
+| --- | ---: | ---: | ---: |
+| Public cold call | 380.792 (200.306–411.435) | 64.235 (61.805–64.497) | 5,526,168 B; 16,660 allocs, medians |
+| 20-call public no-op batch | 1,084.865 (741.745–1,329.037) | 243.259 (232.844–246.896) | 879,680 B; 1,940 allocs in every sample |
+
+Cold allocation ranges were 5,492,704–5,527,016 B and 16,659–16,678 allocations.
+No-op allocations exactly match the baseline: 43,984 B and 97 allocations per
+call. The lower wall times are **not a causal speedup claim**: the baseline had
+large uncontrolled host contention, and this extraction adds no faster indexing
+algorithm. These payload oracles do not count parser invocations, loser Close
+calls, database writes, WAL growth or SSD writes.
+
+Runtime CWD/config/data/cache/state/temp paths were private and credentials were
+unset before package initialization; normal shared Go compiler/module caches
+were reused. Go 1.27.0 reported no active parent go.work. The live daemon,
+application store and tracking configuration were not restarted or modified.
+
+Native post-detect timed out; test mapping found no covering tests and no guard
+rules were configured. Contract analysis still described the pre-extraction
+170-line body and warned about broad caller impact. These are not green
+post-change graph checks; acceptance rests on the actual-file executions,
+reviewed byte-preservation proof and static checks above.
+
+This is a behavior-preserving prerequisite, not the completed disk-usage fix.
+Immutable cold/warm/steady publication, coherent primary dirty views and
+dependent rebasing, public-untrack safety, full MCP end-to-end validation and
+sustained large-corpus I/O acceptance remain open.
