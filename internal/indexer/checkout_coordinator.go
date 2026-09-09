@@ -1161,9 +1161,23 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 		return cached, true, nil
 	}
 	started := time.Now()
+	var baseReader LayerBase = c.store.AtGeneration(base.generationID)
+	if base.generationID > 0 {
+		materializer := graphview.Materializer{
+			Store: c.store, Catalog: c.catalog, Leases: c.leases, Logger: c.logger,
+		}
+		view, openErr := materializer.MaterializeRefView(ctx, base.graphID, base.generationID)
+		if openErr != nil {
+			return 0, false, fmt.Errorf("indexer: open primary generation %d: %w", base.generationID, openErr)
+		}
+		defer view.Close()
+		// Closure reads need the complete committed ancestry. Ref-fact hints
+		// retain their existing corpus scope; they are not a flattened copy.
+		baseReader = commitLayerBase{Reader: view.Reader, corpus: c.store.AtGeneration(base.generationID)}
+	}
 	generationID, report, err := c.builder.BuildCommitLayer(ctx, CommitLayerRequest{
 		Identity:      identity,
-		Base:          c.store.AtGeneration(base.generationID),
+		Base:          baseReader,
 		RepoDir:       c.root,
 		BaseTreeOID:   base.treeOID,
 		TargetTreeOID: targetTree,
@@ -1365,10 +1379,11 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
 	ctx context.Context, graphID string, commitGeneration int64,
 ) (int64, error) {
-	dirtyBase, err := c.commitLayerReader(ctx, commitGeneration)
+	dirtyBase, releaseBase, err := c.commitLayerReader(ctx, commitGeneration)
 	if err != nil {
 		return 0, err
 	}
+	defer releaseBase()
 	identity := c.dirtyIdentity(graphID, commitGeneration)
 	for attempt := 0; attempt < 2; attempt++ {
 		started := time.Now()
@@ -1402,25 +1417,28 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 }
 
 // commitLayerReader is the reader a dirty-layer build computes its affected
-// closure against: the checkout's commit generation composed over the exact
-// base generation recorded in the catalog.
-func (c *CheckoutCoordinator) commitLayerReader(ctx context.Context, commitGeneration int64) (LayerBase, error) {
+// closure against: the checkout's commit generation and its complete ancestry.
+// The caller must release the pinned view after every build attempt has ended.
+func (c *CheckoutCoordinator) commitLayerReader(ctx context.Context, commitGeneration int64) (LayerBase, func(), error) {
 	row, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
 	if err != nil {
-		return nil, fmt.Errorf("indexer: read commit generation %d: %w", commitGeneration, err)
+		return nil, nil, fmt.Errorf("indexer: read commit generation %d: %w", commitGeneration, err)
 	}
 	if !found || !servableGeneration(row.State) {
-		return nil, fmt.Errorf("indexer: commit generation %d is not servable", commitGeneration)
+		return nil, nil, fmt.Errorf("indexer: commit generation %d is not servable", commitGeneration)
 	}
-	layer, err := graphview.NewGenerationLayer(c.store.AtGeneration(commitGeneration))
+	materializer := graphview.Materializer{
+		Store: c.store, Catalog: c.catalog, Leases: c.leases, Logger: c.logger,
+	}
+	view, err := materializer.MaterializeRefView(ctx, row.GraphID, commitGeneration)
 	if err != nil {
-		return nil, fmt.Errorf("indexer: open commit generation %d: %w", commitGeneration, err)
+		return nil, nil, fmt.Errorf("indexer: open commit generation %d: %w", commitGeneration, err)
 	}
-	corpus := c.store.AtGeneration(row.BaseGenerationID)
 	return commitLayerBase{
-		Reader: graph.NewOverlaidViewWithLayer(corpus, layer),
-		corpus: corpus,
-	}, nil
+		Reader: view.Reader,
+		// Keep ref-fact hints scoped to the same immediate corpus as before.
+		corpus: c.store.AtGeneration(row.BaseGenerationID),
+	}, view.Close, nil
 }
 
 // flip repoints one slot under the route epoch this cycle read, and advances

@@ -1116,3 +1116,35 @@ and separate writable outputs. Simply installing an empty registry shell or
 pointing legacy writers at a sealed generation would be incorrect. The combined
 actual-file test/static validation above covers this component, not that runtime
 integration or end-to-end feature completion.
+
+### 2026-09-10: complete lower ancestry for coordinator builds
+
+Commit and dirty builds now consume the complete composed lower ancestry, not
+only the newest sparse payload handle. The coordinator holds the materialized
+read leases through physical planning/building and both dirty confirmation
+attempts, then releases them idempotently. Initial generation-zero behavior is
+preserved. Committed dedicated roots do not accidentally inherit dirty legacy
+generation-zero payload. Ref-fact hints still come from the immediate corpus;
+the full composed reader remains authoritative for closure discovery.
+
+Six new regressions and the existing nonzero-base regression passed normally
+and in three race repetitions. They cover inherited nodes, replace/delete masks,
+node tombstones, missing/retiring/wrong-owner ancestry, real Git incoming-caller
+closure from the oldest ancestor, and leases across two dirty retries. Initial
+synthetic tests failed because top nodes lacked required file-ownership masks.
+The fixtures now create those masks and assert raw payload presence; production
+ownership guards were not relaxed. An explicit outgoing source-mask oracle is
+still separate from these incoming-closure checks.
+
+Three serial 100-iteration small-fixture benchmarks measured reader construction
+and release at 176.934 microseconds (173.998–184.178) for depth one, and 396.461
+microseconds (393.876–400.852) for depth three. Median allocations were
+23,696 B/589 and 48,069 B/1,219 respectively. This measures composition overhead,
+not full query throughput, parser work or disk-write savings. The actual-file
+normal/race and four-package static checks above cover this change.
+
+The full release gate remains open: effective runtime/service identity binding,
+single-pass cold/warm publication and global read/write separation, primary dirty
+and committed advancement dispatch, source/context reuse and import semantics,
+bounded ancestry/cleanup, public-untrack reader/build lifetime, isolated MCP
+end-to-end behavior and sustained realistic-corpus I/O must still be validated.

@@ -1521,11 +1521,12 @@ func TestCommitLayerReaderUsesRecordedNonzeroBase(t *testing.T) {
 		t.Fatalf("PublishPayloadGeneration(commit): %v", err)
 	}
 
-	coordinator := &CheckoutCoordinator{store: f.store, catalog: f.catalog}
-	reader, err := coordinator.commitLayerReader(ctx, commitGeneration)
+	coordinator := &CheckoutCoordinator{store: f.store, catalog: f.catalog, leases: f.leases, logger: zap.NewNop()}
+	reader, release, err := coordinator.commitLayerReader(ctx, commitGeneration)
 	if err != nil {
 		t.Fatalf("commitLayerReader: %v", err)
 	}
+	defer release()
 	if got := reader.GetNode(nodeID); got == nil || got.StartLine != 5 {
 		t.Fatalf("unchanged node = %+v, want catalog-recorded base line 5", got)
 	}
