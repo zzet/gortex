@@ -828,24 +828,7 @@ SELECT root_path_identity, root_volume_kind, root_volume_token,
 // unique index refuses a second one. Moving the flag between graphs is
 // SetPrimaryDedicatedGraph's job, which clears the incumbent first.
 func (c *Catalog) UpsertDedicatedGraph(ctx context.Context, dedicated DedicatedGraph) error {
-	if err := dedicated.validate(); err != nil {
-		return err
-	}
-	_, err := c.exec(ctx, `
-INSERT INTO dedicated_graphs
-  (graph_id, owner_checkout_id, repo_prefix, family_id, is_primary_base, active_generation_id, state)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(graph_id) DO UPDATE SET
-  owner_checkout_id    = excluded.owner_checkout_id,
-  repo_prefix          = excluded.repo_prefix,
-  family_id            = excluded.family_id,
-  is_primary_base      = excluded.is_primary_base,
-  active_generation_id = excluded.active_generation_id,
-  state                = excluded.state`,
-		dedicated.GraphID, catalogNullString(dedicated.OwnerCheckoutID), dedicated.RepoPrefix,
-		dedicated.FamilyID, catalogBoolInt(dedicated.IsPrimaryBase),
-		catalogNullInt(dedicated.ActiveGenerationID), dedicated.State)
-	return err
+	return c.upsertDedicatedGraphIdentity(ctx, dedicated)
 }
 
 // GetDedicatedGraph returns one dedicated graph.

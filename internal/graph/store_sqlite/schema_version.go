@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 21
+const currentSchemaVersion = 22
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -118,6 +118,7 @@ var schemaMigrations = []schemaMigration{
 	{version: 19, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
 	{version: 20, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
 	{version: 21, name: "persist per-file indexing failures", inPlace: createFileIndexFailuresTable},
+	{version: 22, name: "add dedicated base publication intent", inPlace: createDedicatedBasePublicationsTable},
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are

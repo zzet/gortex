@@ -936,7 +936,8 @@ func createGraphCoreIndexes(db schemaColumnDB) error {
 // created afterwards too (createGraphCoreIndexes), because the v16 step rebuilds
 // both tables and a dropped table takes its indexes with it.
 var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + generationMaskSchemaSQL +
-	analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL
+	analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL + "\n" +
+	dedicatedBasePublicationsSchemaSQL + ";\n"
 
 // graphSchemaSQL is the node/edge core plus the two FTS5 virtual tables — the
 // part of the schema that is not a generation-keyed payload sidecar.

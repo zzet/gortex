@@ -466,3 +466,144 @@ Safe regular-source reader, module alias repair and module-manifest-only subtree
 invalidation, positive-base validation,
 committed-base publication, read-through/context reuse, final isolated
 benchmarks/E2E, PR and CI.
+
+## Implementation checkpoint: publication and lifetime safety (2026-09-09)
+
+This checkpoint supersedes earlier implementation-status paragraphs. The
+positive-base guard is committed as `9fdcd266`, the regular-source reader as
+`4428743b`, and dedicated-root isolation/validation as `01ba7596`, with their
+actual-source validation recorded. Earlier references to nine failing
+positive-base scenarios describe the pre-fix baseline, not current failures.
+
+The catalog publication protocol and v22 schema wiring are implemented, but
+the new dedicated-base runtime path remains dormant. Installing authority or
+advancing active pointers is not safe until configuration identity, primary
+dirty layering, coherent lower-view reads, source-owned writes, and retirement
+and build-lifetime protection are integrated. This is not a completed-feature
+or end-to-end disk-I/O verdict.
+
+### Publication and migration evidence
+
+The new metadata table records publication authority, desired content and a
+transactionally associated build claim; it does not duplicate payload tables.
+Both physical builders and ready-payload reuse must pass guarded adoption.
+Unchanged, already-adopted cycles require zero catalog writes. Selecting a
+historical ready candidate may require bounded claim/adoption metadata writes,
+but must not rebuild or rewrite its unchanged payload.
+
+In the captured authority-present fixture, the actual public identity-upsert
+wrapper previously performed 20 updates for 20 identical calls, growing a
+private test WAL by 333,720 bytes. The corrected wrapper preserves the adopted
+pointer and skips unchanged writes; tests prove zero writes with authority
+absent as well as present. Paired
+100-iteration benchmarks, repeated three times on Darwin/arm64, show:
+
+| Identical public upsert | Before median | After median |
+| --- | ---: | ---: |
+| No publication authority | 62.667 µs | 35.116 µs |
+| Publication authority present | 62.400 µs | 33.728 µs |
+
+The guarded reads increase allocation cost from approximately 0.8 KB and 18
+allocations to 3.12 KB and 82 allocations per call. This is an explicit tradeoff,
+not a zero-cost shortcut. The WAL measurement is isolated fixture evidence,
+not NAND-write accounting or an explanation for the entire reported process
+write total.
+
+Actual v22 migration tests cover fresh installation, populated v21 upgrade,
+rollback/replay, cascade behavior, failed-open retry without premature version
+stamping, warm authority preservation, and future-schema refusal before DDL.
+There is no payload or authority backfill. A failed startup may have created
+the new companion table before a later phase fails; replay is idempotent, not
+a claim that all startup DDL is one transaction.
+
+After all catalog helpers, schema wiring, the public wrapper and the combined
+test file landed, the actual complete `store_sqlite` suite passed in 66.193s,
+including the 33 new top-level tests; no source or test overlays were used.
+The 33 new tests then passed three race-detector repetitions (99 executions,
+172.173s), without race reports. Actual-package `go vet` and changed-lines
+catalog lint also passed. A final no-overlay 100-iteration, three-repetition
+benchmark confirmation measured 34.550 µs without authority, 36.242 µs with
+authority, and 290.642 µs for the unchanged observation/claim/adoption cycle;
+the earlier closely paired before/after table remains the comparison above.
+The full-package linter found one
+unchanged warning in this branch's earlier downgrade-guard change
+(`schema_version_downgrade.go:43`, an ineffectual assignment), which is queued
+as a separate atomic repair rather than reported as a green full lint run.
+
+The claimed-builder boundary also passed 12 tests repeated three times normally
+and under the race detector against actual catalog/cold-schema/graphview code,
+without the earlier test-only schema installer. That builder remains a private
+additive candidate: ordinary sparse Build routing and runtime startup are not
+validated by those component results.
+
+### Lifetime races that still require repair before activation
+
+Public-API regressions reproduce reference-check/state-change races that let
+retirement delete a newly adopted or parented payload, a successfully pinned
+view, or an active physical build. A legitimate allocation delayed until after
+retirement/deletion can also enter the fresh-leader fast path. The tests do not
+establish how frequently the production janitor selects these candidates.
+
+Retirement must atomically check durable references, including publication
+claims, and fence the generation, then take a decisive fresh lease/flight check
+before deletion. Parent validation belongs inside the allocator transaction,
+before both coalesced reuse and insertion. Chunked payload deletion stays
+outside one enormous writer transaction. A final row-deletion check cannot
+repair payload deleted earlier.
+
+There is a further seal-lifetime concern: allocation's unconditional open can
+overwrite a retirement seal. Removing that unconditional reset alone does not
+cover a removed cache entry, because generic positive-generation handles
+intentionally permit missing catalog rows for unmanaged use. Managed write
+admission needs explicit provenance; a flag that only changes the unknown-seal
+case is insufficient if an unmanaged cached-open verdict already exists.
+
+A private strict per-transaction lookup candidate passes file-backed and
+asserted pinned-bulk tests, including a live catalog state change while the
+same bulk connection remains pinned. Its measured precheck cost is about
+9.4 µs, 940 bytes and 25 allocations; it is not selected or wired yet. In-memory
+coverage and complete managed-handle propagation remain unverified. Existing
+retained-handle late writes are correctly refused by the old seal, so this must
+not be described as a demonstrated universal write-seal bypass.
+
+One read-only runtime snapshot at 08:49:30 UTC found a dirty build waiting in
+enrichment, its worker blocked on the SQLite write gate, and retirement
+actively deleting payload through SQLite. The build and sweep referenced the
+same coordinator, but the snapshot did not identify its checkout or connect
+it to a particular mutation receipt. Native source confirms that
+`deletePayloadChunk` holds the shared writer gate through chunk SQL and commit.
+This makes retirement/enrichment contention a concrete performance lead, not
+a proven explanation for the whole publication delay. Bounded retirement
+throughput and competing-writer latency need explicit isolated measurements.
+The inspected sweep drains each selected table until a chunk removes no rows,
+checking context between chunks but without a total row, chunk or elapsed-time
+budget. Chunking alone therefore does not establish fair foreground latency;
+the bounded writer-probe experiment must measure it separately.
+
+### Observation ordering and release gates
+
+Fresh Git/config sampling must occur inside one context-cancelable per-graph
+gate, held through recording the desire and released before physical building.
+One stable daemon/MultiIndexer registry spans every publisher and authority
+replacement; replacing an actor cannot create a second gate while its previous
+observer can still execute. Epoch CAS alone does not order stale observations.
+The private gate candidate passes eight tests and five race repetitions, but
+runtime binding remains unimplemented.
+
+Release validation must retain the original coherent-view and lifecycle
+contracts: one selected overlay plus one designated primary, duplicate-identity
+precedence without globally promoting unique overlay hits, tombstone masking,
+immutable inactive refs, read-only labeled fallbacks, complete logical cleanup,
+independent dedicated-graph survival on primary loss, correct demotion and
+previewed last-primary family forget.
+
+The final isolated run must cover realistic corpus size and multiple dependent
+worktrees, not only a one-file fixture. Measure cold/warm startup, unchanged
+polls, same-byte/comment/semantic saves, branch switches, primary advancement,
+removal and failure recovery. Include disk mutation → exact fresh search →
+next edit latency: development publication waits have taken minutes between
+successive source writes, which component tests do not explain or certify.
+Separate initialization from steady-state I/O and report payload/metadata
+writes, WAL behavior, process counters, peak memory and retained generations.
+Use a separate temporary Git family and isolated daemon paths; never add test
+worktrees to a family watched by the main daemon.
