@@ -1084,3 +1084,35 @@ vet/lint and stable-source validation described above also cover these files.
 This helper is not yet the complete runtime identity binding. Output-affecting
 services/capabilities outside IndexConfig and extractor/resolver stamps must be
 bound by the publisher; a correct hash of incomplete inputs is not sufficient.
+
+### 2026-09-10: ordered initial publication runtime
+
+The initial publication primitive now uses one stable, context-cancelable graph
+observation gate across publisher replacements. Installation acquires authority
+once; observations validate it, sample fresh inputs, and record/claim under that
+gate. Physical work and follower waits run after releasing it. Every successful
+return, including ready reuse, passes guarded adoption. A canceled follower must
+not mark its leader's physical claim failed. Idle gates are removed without
+splitting the gate used by queued waiters.
+
+An already-active but different tree/config/extractor/resolver identity returns
+an explicit incremental-advancement requirement without changing the desire.
+It must not become a full rebuild on every commit. This initial-only primitive
+also refuses ancestry it cannot consume; incremental dispatch is separate work.
+
+Ten tests passed normally and in three race repetitions. They cover no-write
+ready replay, observation ordering, authority replacement, external adoption,
+fresh builder requirements, canceled followers, ready-before-adoption retry,
+and gate serialization/ABA/cancellation/cleanup. Three serial 100-iteration
+benchmarks measured unchanged ready replay at 437.608 microseconds
+(431.518–445.524), 37,950 B and 1,060 allocations, with zero audited logical
+catalog/payload writes. Shared-gate acquisition measured 846.2 ns median;
+independent parallel gates measured 415.4 ns, with five allocations per operation.
+These small fixtures do not measure sustained daemon I/O or large-corpus latency.
+
+Startup, warm reconciliation and watchers are not wired to this primitive yet.
+Replacing legacy indexing must preserve complete global/cross-repository reads
+and separate writable outputs. Simply installing an empty registry shell or
+pointing legacy writers at a sealed generation would be incorrect. The combined
+actual-file test/static validation above covers this component, not that runtime
+integration or end-to-end feature completion.
