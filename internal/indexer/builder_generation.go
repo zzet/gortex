@@ -362,26 +362,42 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		return 0, report, err
 	}
 
+	return b.buildPlannedGeneration(ctx, req, plan, report, started)
+}
+
+// buildPlannedGeneration is the existing sparse builder's physical lifecycle,
+// shared by sparse and initial full plans. Claimed full builds join an already
+// reserved candidate through the preparation-aware runner below.
+func (b *SparseGenerationBuilder) buildPlannedGeneration(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time) (int64, BuildReport, error) {
 	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:            req.Identity.OwnerKind,
-		GraphID:              req.Identity.GraphID,
-		LayerID:              req.Identity.LayerID,
-		CheckoutID:           req.Identity.CheckoutID,
-		GenerationKind:       req.Identity.GenerationKind,
-		BaseGenerationID:     req.Identity.BaseGenerationID,
-		LowerViewFingerprint: req.Identity.LowerViewFingerprint,
-		TreeOID:              req.Identity.TreeOID,
-		ProvenanceCommitOID:  req.Identity.ProvenanceCommitOID,
-		ConfigHash:           req.Identity.ConfigHash,
-		ExtractorVersions:    req.Identity.ExtractorVersions,
-		ResolverVersion:      req.Identity.ResolverVersion,
-		CreatedAt:            req.Identity.CreatedAt,
+		OwnerKind: req.Identity.OwnerKind, GraphID: req.Identity.GraphID,
+		LayerID: req.Identity.LayerID, CheckoutID: req.Identity.CheckoutID,
+		GenerationKind: req.Identity.GenerationKind, BaseGenerationID: req.Identity.BaseGenerationID,
+		LowerViewFingerprint: req.Identity.LowerViewFingerprint, TreeOID: req.Identity.TreeOID,
+		ProvenanceCommitOID: req.Identity.ProvenanceCommitOID, ConfigHash: req.Identity.ConfigHash,
+		ExtractorVersions: req.Identity.ExtractorVersions, ResolverVersion: req.Identity.ResolverVersion,
+		CreatedAt: req.Identity.CreatedAt,
 	})
 	if err != nil {
 		return 0, BuildReport{}, fmt.Errorf("indexer: begin payload generation: %w", err)
 	}
-	report.GenerationID = generationID
+	return b.buildReservedGeneration(ctx, req, plan, report, started, generationID, handle, adopted)
+}
 
+// buildReservedGeneration runs one already-allocated candidate. The dedicated
+// catalog path will supply its transactionally associated reservation here;
+// ordinary sparse callers continue to allocate through their existing API.
+// This helper is private and assumes its caller validated reservation identity.
+func (b *SparseGenerationBuilder) buildReservedGeneration(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time, generationID int64, handle *store_sqlite.Store, adopted bool) (int64, BuildReport, error) {
+	return b.buildReservedGenerationWithPreparation(ctx, req, plan, report, started, generationID, handle, adopted, nil)
+}
+
+// A preparation callback transfers ownership of its returned source to the
+// physical leader. Followers never construct a source or enumerate its tree.
+type generationPayloadPreparation func(context.Context) (source.ContentSource, buildPlan, BuildReport, error)
+
+func (b *SparseGenerationBuilder) buildReservedGenerationWithPreparation(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time, generationID int64, handle *store_sqlite.Store, adopted bool, prepare generationPayloadPreparation) (int64, BuildReport, error) {
+	report.GenerationID = generationID
 	flight, leader, ready, err := b.Store.JoinPayloadBuildFlight(ctx, generationID, adopted)
 	if err != nil {
 		report.Coalesced = adopted
@@ -399,16 +415,15 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		report.Duration = time.Since(started)
 		return generationID, report, err
 	}
-
 	// Only the physical flight leader owns process activity. Ready reuse and
 	// followers do no payload work; counting them would unnecessarily suppress
-	// runtime maintenance. This guard spans preparation, planning, every store
-	// write, publication/abandonment and terminal flight completion, and its
-	// defer balances success, ordinary error, converted storage panic and
-	// re-panicked programmer faults alike.
+	// runtime maintenance. Ordinary sparse planning precedes this guard; claimed
+	// full-build preparation and planning run inside it, for the leader only.
+	// The guard spans store writes, publication/abandonment and terminal flight
+	// completion. Its defer balances success, ordinary error, converted storage
+	// panic and re-panicked programmer faults alike.
 	runtimeactivity.Begin(sparseGenerationBuildActivity)
 	defer runtimeactivity.End(sparseGenerationBuildActivity)
-
 	report.Coalesced = false
 	var buildErr error
 	defer func() {
@@ -430,7 +445,20 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 				b.abandon(cleanupCtx, generationID)
 			}
 		}()
-
+		if prepare != nil {
+			target, preparedPlan, preparedReport, err := prepare(ctx)
+			if target != nil {
+				defer target.Close()
+			}
+			if err != nil {
+				return err
+			}
+			if target == nil {
+				return fmt.Errorf("indexer: generation preparation returned no content source")
+			}
+			req.Target, plan, report = target, preparedPlan, preparedReport
+			report.GenerationID, report.Coalesced = generationID, false
+		}
 		// A newly allocated generation cannot carry payload yet. When the plan
 		// has no files to index, the masks below completely describe a no-op or
 		// deletion-only layer. A recovered adopted generation may carry partial

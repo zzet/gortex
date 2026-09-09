@@ -607,3 +607,49 @@ Separate initialization from steady-state I/O and report payload/metadata
 writes, WAL behavior, process counters, peak memory and retained generations.
 Use a separate temporary Git family and isolated daemon paths; never add test
 worktrees to a family watched by the main daemon.
+
+### Shared physical builder and reserved initial snapshot checkpoint
+
+The initial immutable dedicated snapshot consumes the positive generation
+reserved by the catalog publication protocol; it must not allocate a second
+generation. Reservation identity and authority are validated before expensive
+work. A physical-flight leader alone opens the committed Git tree and plans the
+full source inventory. The leader owns and closes that source, including on
+ordinary errors and panics; failure metadata cleanup precedes follower
+notification. Followers share the terminal result;
+ready reuse does not parse, reopen a seal, or scan payload to reconstruct counts.
+
+The ordinary sparse builder and the reserved snapshot builder share the same
+physical runner, retaining producer settlement, enrichment-before-masks,
+publication, failed-generation cleanup before follower notification, and runtime
+activity accounting. Ordinary sparse planning remains before the activity guard;
+leader-owned committed-source preparation and full planning occur inside it.
+This does not introduce another planner-statistics check.
+
+The full inventory planner only visits tree metadata. It does not open every
+blob or filter away potential languages before the ordinary index admission
+rules run. An actual empty initial Git commit is valid: it can build/adopt a
+positive empty snapshot and materialize an exact empty view without exposing
+generation-zero content. An unborn branch is a different case.
+
+Ready/follower success is not permission to update the primary pointer. The
+caller must perform the catalog's guarded adoption on every successful return,
+including reuse, so a stale authority or desire cannot publish an old result.
+This primitive handles initial full snapshots only, not subsequent incremental
+base advancement or live coordinator activation.
+
+The shared ordinary path passed 57 normal and 171 race test executions. Its
+empty physical-build benchmark median was 0.571 ms versus 0.555 ms before,
+with overlapping ranges and similar allocations; no clear regression or
+speedup is established by that small sample. The claimed snapshot's 13 focused
+tests, including the empty-commit boundary, passed normally and in three race
+repetitions against the actual files without implementation or test overlays.
+Each empty-commit run included three ready-reuse cycles with unchanged
+logical-write/WAL audits. These checks use real temporary SQLite stores and
+committed Git trees; they are component evidence, not a claim of complete
+daemon-level or sustained-I/O validation.
+
+This checkpoint does not claim the feature is complete. Managed-writer and
+retirement admission, runtime publication/observation ownership, primary dirty
+layers, coherent lower reads/source-owned writes, incremental advancement, and
+realistic isolated end-to-end plus sustained-I/O validation remain required.
