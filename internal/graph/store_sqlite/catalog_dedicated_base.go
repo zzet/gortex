@@ -76,6 +76,10 @@ type RecordDedicatedBaseDesireRequest struct {
 }
 
 type ClaimDedicatedBaseBuildRequest struct {
+	// ExistingGenerationID selects validation-only mode when positive: the
+	// same current generation and attempt must exist in a live attempt state.
+	// This mode never binds, allocates or writes; zero preserves normal claims.
+	ExistingGenerationID                               int64
 	Desire                                             DedicatedBaseDesire
 	ExpectedActiveGenerationID                         int64
 	AttemptToken                                       string
@@ -365,7 +369,7 @@ func bindDedicatedBaseClaimTx(ctx context.Context, tx *sql.Tx, claim DedicatedBa
 }
 
 func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicatedBaseBuildRequest) (DedicatedBaseBuildClaim, error) {
-	if req.AttemptToken == "" || req.BaseGenerationID < 0 || req.ExpectedActiveGenerationID < 0 {
+	if req.AttemptToken == "" || req.BaseGenerationID < 0 || req.ExpectedActiveGenerationID < 0 || req.ExistingGenerationID < 0 {
 		return DedicatedBaseBuildClaim{}, fmt.Errorf("dedicated base claim requires token and nonnegative generations")
 	}
 	var out DedicatedBaseBuildClaim
@@ -380,6 +384,11 @@ func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicate
 		}
 		if !found || p.Desire != req.Desire || p.Desire.Epoch <= 0 {
 			return dedicatedBaseStale("claim desire changed")
+		}
+		if req.ExistingGenerationID > 0 && (p.Claim.GenerationID != req.ExistingGenerationID ||
+			p.Claim.AttemptToken != req.AttemptToken ||
+			(p.AttemptState != "building" && p.AttemptState != "ready" && p.AttemptState != "adopted")) {
+			return dedicatedBaseStale("existing claim changed or is no longer live")
 		}
 		// Preserve the original adopted attempt before comparing its old expected
 		// pointer with the caller's now-current active pointer. This is the idle
@@ -424,6 +433,11 @@ func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicate
 			}
 			out = p.Claim
 			return nil
+		}
+		// Keep validation-only requests out of every binding/allocation path,
+		// including if future attempt-state handling adds another fallthrough.
+		if req.ExistingGenerationID > 0 {
+			return dedicatedBaseStale("existing claim cannot be validated")
 		}
 		if p.Claim.AttemptToken != "" && req.AttemptToken == p.Claim.AttemptToken {
 			return dedicatedBaseStale("retired attempt token reused")

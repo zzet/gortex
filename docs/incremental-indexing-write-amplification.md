@@ -1031,3 +1031,34 @@ This is a behavior-preserving prerequisite, not the completed disk-usage fix.
 Immutable cold/warm/steady publication, coherent primary dirty views and
 dependent rebasing, public-untrack safety, full MCP end-to-end validation and
 sustained large-corpus I/O acceptance remain open.
+
+### 2026-09-10: validation-only dedicated build claims
+
+A stale builder could read its current claim A, lose ownership to replacement B,
+then call the allocating claim API after both attempts had failed. The later
+caller-side mismatch check rejected the new claim, but could not undo the new
+association/generation already allocated by that call.
+
+`ClaimDedicatedBaseBuildRequest.ExistingGenerationID` now selects atomic
+validation-only behavior when positive. Inside the same writer transaction it
+requires the current generation, attempt, desire and a live building/ready/adopted
+state; all candidate and ownership guards still apply. This mode cannot enter
+historical binding or allocation paths. Zero retains ordinary claiming/retry;
+negative values are invalid. The initial claimed builder explicitly uses this
+mode. There is no schema or payload-format change.
+
+Four regressions passed normally and three times under the race detector. They
+cover A-fails/B-fails/stale-A, ordinary retry compatibility, unchanged live-state
+validation, incorrect IDs/tokens/desires, negative input, and direct failure.
+Actual initial build/ready replay and SQL logical-write audits also passed.
+Three serial 100-iteration samples measured validation-only calls at a median
+144.891 microseconds (143.038–148.778), 11,949 B and 326 allocations. Ordinary
+current-claim lookup measured 149.057 microseconds (146.131–154.365). This is a
+small correctness/overhead benchmark, not a sustained disk-saving claim.
+
+The combined actual-file cohort passed 26 normal tests and 78 race executions;
+vet/lint passed for store_sqlite, graphview, indexer and serverstack. Compilation
+and static source manifests stayed stable. Native post-detect remained
+unavailable/incomplete; no covering tests were mapped, no guards configured,
+and contract analysis warned about broad impact. These are not green native
+post-change checks. All runtime paths were private; the live daemon was untouched.

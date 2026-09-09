@@ -75,7 +75,8 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 	// Revalidate current availability and namespace before joining expensive
 	// work. This reuses the existing claim without allocating or rewriting it.
 	validated, err := b.Store.Catalog().ClaimDedicatedBaseBuild(ctx, store_sqlite.ClaimDedicatedBaseBuildRequest{
-		Desire: claim.Desire, ExpectedActiveGenerationID: claim.ExpectedActiveGenerationID,
+		ExistingGenerationID: claim.GenerationID,
+		Desire:               claim.Desire, ExpectedActiveGenerationID: claim.ExpectedActiveGenerationID,
 		AttemptToken: claim.AttemptToken, BaseGenerationID: claim.BaseGenerationID,
 		LayerID: claim.LayerID, LowerViewFingerprint: claim.LowerViewFingerprint,
 	})
