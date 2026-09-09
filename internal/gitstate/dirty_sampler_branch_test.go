@@ -116,9 +116,10 @@ func TestDirtySamplerBranchHeadersStopBeforeRenameSources(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			commands := &scriptedDirtyCommands{results: []dirtyCommandResult{{
-				out: porcelainBranch(testCommitA, "main", tc.record, tc.source),
-			}}}
+			commands := &scriptedDirtyCommands{results: []dirtyCommandResult{
+				{out: porcelainBranch(testCommitA, "main", tc.record, tc.source)},
+				{out: porcelainBranch(testCommitA, "main", tc.record, tc.source)},
+			}}
 			sampler := newDirtySampler(t.TempDir(), testCommitA, testTreeA, commands.run)
 			snap, err := sampler.Sample(context.Background())
 			if err != nil {
@@ -127,8 +128,8 @@ func TestDirtySamplerBranchHeadersStopBeforeRenameSources(t *testing.T) {
 			if snap.HeadRef != "refs/heads/main" || snap.HeadCommit != testCommitA || snap.HeadTree != testTreeA {
 				t.Fatalf("spoofed head = %+v", snap)
 			}
-			if got := len(commands.snapshotCalls()); got != 1 {
-				t.Fatalf("sample ran %d commands, want status only", got)
+			if got := len(commands.snapshotCalls()); got != 2 {
+				t.Fatalf("dirty sample ran %d commands, want status + status fence", got)
 			}
 		})
 	}
