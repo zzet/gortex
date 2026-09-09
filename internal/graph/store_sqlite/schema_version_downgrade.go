@@ -40,7 +40,7 @@ func checkSchemaDowngrade(path string, supported int) error {
 		return nil
 	}
 	var uri *url.URL
-	filename := path
+	var filename string
 	if strings.HasPrefix(path, "file:") {
 		var err error
 		uri, err = url.Parse(path)
