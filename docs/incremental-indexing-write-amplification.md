@@ -653,3 +653,25 @@ This checkpoint does not claim the feature is complete. Managed-writer and
 retirement admission, runtime publication/observation ownership, primary dirty
 layers, coherent lower reads/source-owned writes, incremental advancement, and
 realistic isolated end-to-end plus sustained-I/O validation remain required.
+
+### Sealed-store refusal normalization checkpoint
+
+An isolated public-API regression found that `RetirePayloadGeneration` followed
+by a retained handle's `AddBatch` produced a `fmt.wrapError` panic carrying
+`ErrPayloadGenerationSealed`. The existing `StorageErrorFromPanic` classifier
+rejected it because the chain contained no `StorageError`. The regression failed
+normally and in three race repetitions; payload isolation remained intact.
+
+`panicOnFatal` now wraps only this store-emitted lifecycle refusal in a direct
+`StorageError`, preserving its complete cause and diagnostic string. Nil,
+NoRows, closed-connection precedence, unrelated legacy store errors, and direct
+caller/runtime panic classification are unchanged. Tests cover direct, wrapped,
+already-typed, and wrapped-typed sealed errors, plus joined nonfatal/sealed errors.
+This is a narrow error-boundary fix, not activation of managed admission or proof
+of the full physical builder's retirement-loss behavior.
+
+Paired GOMAXPROCS=2 component benchmarks (three samples per case) measured median
+sealed-refusal emission/recovery at 365.7 -> 287.2 ns, 128 -> 16 B, and two -> one
+allocation. Nil and nonfatal controls remained allocation-free at approximately
+6.3-6.4 ns and 10.6-10.8 ns. These are panic-boundary microbenchmarks, not indexing
+throughput, sustained disk I/O, or end-to-end feature acceptance.
