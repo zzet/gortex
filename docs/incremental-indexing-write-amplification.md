@@ -1188,3 +1188,41 @@ These are small in-memory component benchmarks, not contention limits or daemon
 I/O results. Public MCP admission, durable closing authorization, deferred
 cleanup continuation, restart recovery and shutdown joining still need wiring
 and end-to-end validation. The full feature release gate remains open.
+
+### 2026-09-10: claimed sparse dedicated-base advancement
+
+The dedicated delta builder consumes an already reserved publication claim and
+the complete leased lower ancestry. It validates the current owner, claim,
+parent tree and policy before building into that exact positive generation;
+publication remains the caller's responsibility. Ready-claim replay performs no
+new physical build. An incompatible extraction policy requires a fresh full
+base rather than inheriting incompatible rows.
+
+Six actual-source tests cover real Git changes, two consecutively adopted
+layers, strict complete node/edge payload parity, stale claims, single-flight
+physical builds, ready replay, tree-equivalent commits and policy changes. The
+full-payload reference is an independently built positive generation at the same
+source identity and scope; a separate generation-zero cold reference remains a
+structural control. Generation-zero builtin scope differs from the scoped
+positive-generation path, so it is not used as a full-field oracle. The earlier
+failing evidence is retained rather than discarded. A body-only edit explicitly
+does not reparse an unchanged caller, while a real signature change must reparse
+that caller and preserve its dependency edges.
+
+Validation on actual source (no production overlays):
+
+- Normal: all 6 top-level tests pass, 10.781 s.
+- Race detector: all 6 tests pass three times, 18 passes, 93.130 s.
+- Three serial 100-iteration benchmark cohorts: ready replay median 324,050 ns,
+  30,822 B and 834 allocations per operation; one-file delta against a fixed
+  full base median 147,634,870 ns, 5,924,551 B and 23,644 allocations per
+  operation, with 2 indexed paths per operation.
+- Vet and lint pass for store_sqlite, graphview, indexer and serverstack with a
+  stable source manifest.
+
+The delta benchmark builds an unadopted child of the same base on each
+iteration; it is not a growing-chain benchmark, a before/after I/O result, or a
+measurement of SSD writes. Full cold/warm lifecycle integration, bounded
+ancestry maintenance, global enrichment and sustained daemon I/O remain release
+gates. Reproduction records and retained failure analysis are in
+`/private/tmp/gortex-claimed-dedicated-delta.aXnXca/STRICT-ORACLE-V2-VALIDATION.md`.
