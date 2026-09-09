@@ -504,17 +504,29 @@ func (m *Materializer) assemble(
 		return handle, layer, row, openErr
 	}
 
-	var base graph.Reader = m.Store.AtGeneration(0)
-	firstOverlay := 0
-	if routedStart > 0 {
-		handle, _, _, err := open(ancestry[0])
-		if err != nil {
+	firstHandle, firstLayer, firstRow, err := open(ancestry[0])
+	if err != nil {
+		return nil, err
+	}
+	if firstRow.GenerationKind == "dedicated" {
+		binding, found, bindingErr := m.Catalog.GetDedicatedGraph(ctx, graphID)
+		if bindingErr != nil {
+			return nil, WrapViewError(CodeCheckoutInaccessible, "read dedicated root graph "+graphID, bindingErr)
+		}
+		if !found {
+			return nil, NewViewError(CodeViewBuilding, "dedicated root graph is not in the catalog")
+		}
+		if err := validateDedicatedFullRoot(firstRow, binding, graphID, repoPrefix); err != nil {
 			return nil, err
 		}
-		base = handle
-		firstOverlay = 1
 	}
-	for index := firstOverlay; index <= routedStart; index++ {
+	var base graph.Reader
+	if routedStart > 0 || firstRow.GenerationKind == "dedicated" {
+		base = firstHandle
+	} else {
+		base = graph.NewOverlaidViewWithLayer(m.Store.AtGeneration(0), firstLayer)
+	}
+	for index := 1; index <= routedStart; index++ {
 		_, layer, _, err := open(ancestry[index])
 		if err != nil {
 			return nil, err
