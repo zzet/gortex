@@ -1062,3 +1062,25 @@ and static source manifests stayed stable. Native post-detect remained
 unavailable/incomplete; no covering tests were mapped, no guards configured,
 and contract analysis warned about broad impact. These are not green native
 post-change checks. All runtime paths were private; the live daemon was untouched.
+
+### 2026-09-10: owned effective configuration snapshots
+
+`snapshotDedicatedBaseConfig` freezes the complete effective IndexConfig,
+including nested maps/slices, rather than retaining ConfigManager's shared
+references. Its versioned fingerprint also includes repository, workspace and
+project output context. Framework selection is normalized as a set for hashing
+only; the frozen configuration retains its original selection values. Automatic
+selection remains distinct from explicitly disabled selection. A pointer to a
+nil selection slice is preserved correctly across the JSON ownership copy.
+
+Five actual-file tests passed normally and in three race repetitions, including
+all-field ownership/mutation checks, framework semantics, output-context and
+effective-field fingerprints, and a future JSON-shape guard. Three serial
+100-iteration benchmarks measured default snapshots at 16.794 microseconds
+(16.754–17.123), 8,832 B and nine allocations; configured snapshots at 22.821
+microseconds (21.502–23.706), 10,448 B and 33 allocations. The combined four-package
+vet/lint and stable-source validation described above also cover these files.
+
+This helper is not yet the complete runtime identity binding. Output-affecting
+services/capabilities outside IndexConfig and extractor/resolver stamps must be
+bound by the publisher; a correct hash of incomplete inputs is not sufficient.
