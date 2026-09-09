@@ -11,9 +11,32 @@ import (
 	"time"
 )
 
-func payloadFlightHandles() (*Store, *Store) {
-	core := &storeCore{}
-	return &Store{storeCore: core}, &Store{storeCore: core}
+func payloadFlightHandles(t testing.TB) (*Store, *Store, int64) {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "flight.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	generationID := payloadFlightGeneration(t, store, "layer-flight")
+	return store, store.AtGeneration(generationID), generationID
+}
+
+func payloadFlightGeneration(t testing.TB, store *Store, layerID string) int64 {
+	t.Helper()
+	generationID, _, adopted, err := store.BeginPayloadGenerationWithStatus(context.Background(), PayloadGenerationRequest{
+		OwnerKind:      "dedicated_graph",
+		GraphID:        "graph-flight",
+		LayerID:        layerID,
+		CheckoutID:     "checkout-flight",
+		GenerationKind: "commit",
+		TreeOID:        "tree-flight",
+		CreatedAt:      time.Now().Unix(),
+	})
+	if err != nil || adopted {
+		t.Fatalf("begin generation: adopted=%t err=%v", adopted, err)
+	}
+	return generationID
 }
 
 func awaitPayloadFlightWaiters(t testing.TB, store *Store, generationID, want int64) {
@@ -36,28 +59,28 @@ func awaitPayloadFlightWaiters(t testing.TB, store *Store, generationID, want in
 }
 
 func TestPayloadBuildFlightIsSharedByStoreCore(t *testing.T) {
-	owner, sibling := payloadFlightHandles()
-	leader, isLeader, ready, err := owner.JoinPayloadBuildFlight(context.Background(), 41, false)
+	owner, sibling, generationID := payloadFlightHandles(t)
+	leader, isLeader, ready, err := owner.JoinPayloadBuildFlight(context.Background(), generationID, false)
 	if err != nil || !isLeader || ready {
 		t.Fatalf("leader join = (%v, %t, %t, %v)", leader, isLeader, ready, err)
 	}
-	follower, isLeader, ready, err := sibling.JoinPayloadBuildFlight(context.Background(), 41, true)
+	follower, isLeader, ready, err := sibling.JoinPayloadBuildFlight(context.Background(), generationID, true)
 	if err != nil || isLeader || ready {
 		t.Fatalf("follower join = (%v, %t, %t, %v)", follower, isLeader, ready, err)
 	}
 
 	waited := make(chan error, 1)
 	go func() { waited <- follower.Wait(context.Background()) }()
-	awaitPayloadFlightWaiters(t, owner, 41, 1)
+	awaitPayloadFlightWaiters(t, owner, generationID, 1)
 	leader.Complete(nil)
 	if err := <-waited; err != nil {
 		t.Fatalf("follower wait: %v", err)
 	}
-	if got := owner.PayloadBuildFlightWaiters(41); got != 0 {
+	if got := owner.PayloadBuildFlightWaiters(generationID); got != 0 {
 		t.Fatalf("completed flight waiters = %d, want 0", got)
 	}
 
-	retry, isLeader, ready, err := sibling.JoinPayloadBuildFlight(context.Background(), 41, false)
+	retry, isLeader, ready, err := sibling.JoinPayloadBuildFlight(context.Background(), generationID, false)
 	if err != nil || !isLeader || ready {
 		t.Fatalf("post-completion join = (%v, %t, %t, %v)", retry, isLeader, ready, err)
 	}
@@ -65,12 +88,12 @@ func TestPayloadBuildFlightIsSharedByStoreCore(t *testing.T) {
 }
 
 func TestPayloadBuildFlightFollowerCancellationDoesNotCancelLeader(t *testing.T) {
-	owner, sibling := payloadFlightHandles()
-	leader, isLeader, _, err := owner.JoinPayloadBuildFlight(context.Background(), 52, false)
+	owner, sibling, generationID := payloadFlightHandles(t)
+	leader, isLeader, _, err := owner.JoinPayloadBuildFlight(context.Background(), generationID, false)
 	if err != nil || !isLeader {
 		t.Fatalf("leader join: leader=%t err=%v", isLeader, err)
 	}
-	follower, isLeader, _, err := sibling.JoinPayloadBuildFlight(context.Background(), 52, true)
+	follower, isLeader, _, err := sibling.JoinPayloadBuildFlight(context.Background(), generationID, true)
 	if err != nil || isLeader {
 		t.Fatalf("follower join: leader=%t err=%v", isLeader, err)
 	}
@@ -78,13 +101,13 @@ func TestPayloadBuildFlightFollowerCancellationDoesNotCancelLeader(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	waited := make(chan error, 1)
 	go func() { waited <- follower.Wait(ctx) }()
-	awaitPayloadFlightWaiters(t, owner, 52, 1)
+	awaitPayloadFlightWaiters(t, owner, generationID, 1)
 	cancel()
 	if err := <-waited; !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled follower wait = %v, want context canceled", err)
 	}
 
-	other, isLeader, _, err := sibling.JoinPayloadBuildFlight(context.Background(), 52, true)
+	other, isLeader, _, err := sibling.JoinPayloadBuildFlight(context.Background(), generationID, true)
 	if err != nil || isLeader {
 		t.Fatalf("leader flight vanished after follower cancellation: leader=%t err=%v", isLeader, err)
 	}
@@ -95,12 +118,12 @@ func TestPayloadBuildFlightFollowerCancellationDoesNotCancelLeader(t *testing.T)
 }
 
 func TestPayloadBuildFlightFailureAllowsRetry(t *testing.T) {
-	owner, sibling := payloadFlightHandles()
-	leader, isLeader, _, err := owner.JoinPayloadBuildFlight(context.Background(), 63, false)
+	owner, sibling, generationID := payloadFlightHandles(t)
+	leader, isLeader, _, err := owner.JoinPayloadBuildFlight(context.Background(), generationID, false)
 	if err != nil || !isLeader {
 		t.Fatalf("leader join: leader=%t err=%v", isLeader, err)
 	}
-	follower, isLeader, _, err := sibling.JoinPayloadBuildFlight(context.Background(), 63, true)
+	follower, isLeader, _, err := sibling.JoinPayloadBuildFlight(context.Background(), generationID, true)
 	if err != nil || isLeader {
 		t.Fatalf("follower join: leader=%t err=%v", isLeader, err)
 	}
@@ -110,7 +133,7 @@ func TestPayloadBuildFlightFailureAllowsRetry(t *testing.T) {
 	if err := follower.Wait(context.Background()); !errors.Is(err, wantErr) {
 		t.Fatalf("follower error = %v, want %v", err, wantErr)
 	}
-	retry, isLeader, ready, err := sibling.JoinPayloadBuildFlight(context.Background(), 63, false)
+	retry, isLeader, ready, err := sibling.JoinPayloadBuildFlight(context.Background(), generationID, false)
 	if err != nil || !isLeader || ready {
 		t.Fatalf("retry join = (%v, %t, %t, %v)", retry, isLeader, ready, err)
 	}
@@ -118,18 +141,19 @@ func TestPayloadBuildFlightFailureAllowsRetry(t *testing.T) {
 }
 
 func TestPayloadBuildFlightsAreDistinctByGenerationAndStore(t *testing.T) {
-	firstStore, _ := payloadFlightHandles()
-	secondStore, _ := payloadFlightHandles()
+	firstStore, _, firstID := payloadFlightHandles(t)
+	secondStore, _, otherStoreID := payloadFlightHandles(t)
+	secondID := payloadFlightGeneration(t, firstStore, "layer-flight-second")
 
-	first, firstLeader, _, err := firstStore.JoinPayloadBuildFlight(context.Background(), 1, false)
+	first, firstLeader, _, err := firstStore.JoinPayloadBuildFlight(context.Background(), firstID, false)
 	if err != nil || !firstLeader {
 		t.Fatalf("first generation leader=%t err=%v", firstLeader, err)
 	}
-	secondGeneration, secondLeader, _, err := firstStore.JoinPayloadBuildFlight(context.Background(), 2, false)
+	secondGeneration, secondLeader, _, err := firstStore.JoinPayloadBuildFlight(context.Background(), secondID, false)
 	if err != nil || !secondLeader {
 		t.Fatalf("second generation leader=%t err=%v", secondLeader, err)
 	}
-	secondStoreFlight, otherStoreLeader, _, err := secondStore.JoinPayloadBuildFlight(context.Background(), 1, false)
+	secondStoreFlight, otherStoreLeader, _, err := secondStore.JoinPayloadBuildFlight(context.Background(), otherStoreID, false)
 	if err != nil || !otherStoreLeader {
 		t.Fatalf("second store leader=%t err=%v", otherStoreLeader, err)
 	}
@@ -177,12 +201,13 @@ func TestPayloadBuildFlightRechecksReadyAdoptionAfterFlightRemoval(t *testing.T)
 func BenchmarkPayloadBuildFlight(b *testing.B) {
 	for _, callers := range []int{1, 8, 64} {
 		b.Run(fmt.Sprintf("%d_callers", callers), func(b *testing.B) {
-			store, _ := payloadFlightHandles()
+			store, _, generationID := payloadFlightHandles(b)
 			var physicalBuilds atomic.Int64
 			b.ReportAllocs()
 			b.ResetTimer()
+			// Reuse a real Building row after each completed flight. Catalog
+			// allocation is setup; fresh leader admission remains measured.
 			for i := 0; i < b.N; i++ {
-				generationID := int64(i + 1)
 				leader, isLeader, _, err := store.JoinPayloadBuildFlight(context.Background(), generationID, false)
 				if err != nil || !isLeader {
 					b.Fatalf("leader join: leader=%t err=%v", isLeader, err)

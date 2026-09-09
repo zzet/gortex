@@ -319,7 +319,7 @@ type storeCore struct {
 // and write gate are shared by every handle over the same database.
 //
 // Open returns the owning handle. AtGeneration derives further handles that
-// differ only in viewGen; a derived handle must never tear the core down, so
+// select a payload view; a derived handle must never tear the core down, so
 // only the owning handle's Close does any work (see ownsCore).
 type Store struct {
 	*storeCore
@@ -327,6 +327,10 @@ type Store struct {
 	// viewGen is the payload view generation this handle reads and writes.
 	// Generation 0 is the base corpus every store starts with.
 	viewGen int64
+
+	// managedPayloadGeneration requires fresh lifecycle admission for writes.
+	// It is immutable per handle, not shared write authority or a seal verdict.
+	managedPayloadGeneration bool
 
 	// seal is the write-admission flag for viewGen, shared with every other
 	// handle over the same generation. It is nil on the base handle, which is

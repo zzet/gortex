@@ -675,3 +675,172 @@ sealed-refusal emission/recovery at 365.7 -> 287.2 ns, 128 -> 16 B, and two -> o
 allocation. Nil and nonfatal controls remained allocation-free at approximately
 6.3-6.4 ns and 10.6-10.8 ns. These are panic-boundary microbenchmarks, not indexing
 throughput, sustained disk I/O, or end-to-end feature acceptance.
+
+### Managed generation lifetime and retirement checkpoint
+
+Cleanup must acquire a retirement fence before it can safely delete generation
+payload. Observing no readers/builders/references earlier is insufficient: a new
+owner can appear between that observation and the sweep. Refusing final catalog
+deletion cannot repair payload already deleted. Two deterministic real-component
+regressions cover a held materialized reader and a shared physical builder whose
+source is blocked in Open; these are ordering bugs, not only data races.
+
+The coupled safety implementation uses the following protocol:
+
+1. Catalog reference admission and the transition to Retiring serialize in the
+   actual SQLite writer transaction. Positive missing/Retiring parents and new
+   checkout, ref, or dedicated active pointers are rejected. Validate installed
+   values, not ignored proposals; preserve stale-epoch/token/identity error
+   priority, zero clears, and untouched route slots.
+2. Reference diagnostics, retirement admission, and final metadata deletion use
+   the same roots: checkout slots, active refs, child ancestry, dedicated active
+   pointers, and the current dedicated-publication association. Replacing that
+   association must release the historical snapshot unless another owner pins it.
+3. After the fence commits, cleanup rechecks Store-owned physical flights and
+   shared reader leases. Early owner checks are only cheap refusals. A late busy
+   generation stays Retiring and resumable; no sweep occurs until owners drain.
+   Omitting an external lease callback never disables the Store flight check.
+4. Readers pin before fresh servability validation and pin the full ancestry
+   before assembly. Physical leaders register a flight before freshly validating
+   the catalog, even when earlier allocation reported a new generation. The
+   existing materializer already had the required ordering and was not rewritten.
+5. Managed positive-generation handles admit writes only while Building, checked
+   inside each actual write transaction. Creating/deriving a handle grants no
+   liveness promise. Same-generation forwarding preserves qualification. Missing
+   managed rows produce the typed sealed failure without wrapping sql.ErrNoRows,
+   which legacy mutation emitters deliberately ignore.
+6. Guarded late publication, supersession, failure, and abandonment must preserve
+   a retirement fence. The low-level state setter still allows explicit generic
+   transitions when no expected state is supplied; runtime late transitions must
+   use the guarded contracts rather than treating the generic setter as a fence.
+
+No catalog transaction remains open while waiting for owners or sweeping payload,
+and no durable per-query lease heartbeat is introduced. Generation-zero and
+deliberately unmanaged compatibility handles retain their distinct semantics.
+Normal SQLite AUTOINCREMENT allocation does not reuse deleted generation IDs;
+retained-handle tests additionally prove that a later allocation cannot turn an
+old managed handle into an unmanaged writer or mutate the replacement namespace.
+
+#### Component validation and measured cost
+
+At the fixture-repair checkpoint, the full Store suite passed 816 tests with two
+expected skips. The 36 new lifetime regressions plus the repaired legacy identity
+fixture passed three race repetitions (111 top-level passes, no race reports).
+The 16 graph-base guard cases passed normally and in three race repetitions.
+The original held-reader and actual physical-builder retirement reproductions
+also passed normally and in three race repetitions, including unread payload,
+typed follower refusal, preserved Retiring after abandonment, and resumed cleanup.
+Eight additional parent/terminal boundary regressions passed normally and in
+three race repetitions. The combined Store checkpoint passed 824 tests with two
+expected skips (66.924 seconds), and all 45 focused lifetime/fixture tests passed
+together under the race detector (128.179 seconds). That combined run used the
+actual landed 36-test file plus one absent authored parent/terminal test overlay;
+it did not substitute production or existing test files. After both files were
+physically landed, the no-overlay Store suite again passed 824 tests with two
+expected skips (65.510 seconds), and Store vet passed. The physical-file binary
+was byte-identical to the earlier combined normal binary. Final reader/builder
+permanent-source checks remain separately recorded; these counts are not an
+end-to-end verdict.
+
+After the reader regression was physically landed, the complete reader package
+passed all 86 tests normally (3.172 seconds) and under the race detector
+(57.894 seconds). Both no-overlay runs matched their frozen-binary test
+inventories, with stable production/test inputs and no race reports.
+
+After the physical-builder regression landed, all 12 selected builder, claimed
+publication, graph-base, and related watcher tests passed normally (10.553
+seconds) and under the race detector (33.207 seconds). These no-overlay runs
+matched their frozen-binary inventories; they are not the entire indexer suite.
+Final vet and golangci-lint across Store, reader, and indexer packages passed,
+with zero lint issues. All 17 changed Go files were gofmt-clean and the diff
+passed whitespace checks. Inputs remained stable during those checks.
+
+The compatibility fixtures now allocate real healthy generations instead of
+inventing IDs. Missing/Retiring graph-base inputs remain deliberately stale caller
+values rather than invalid roots persisted through normal catalog admission.
+Original first-insert, zero-reset, identity-update, and error assertions remain.
+
+Paired managed single-row SetFileMtime benchmarks measured median file-backed
+26.083 -> 46.257 us (9 -> 38 allocations), and bulk-started 21.989 -> 41.219 us
+(9 -> 37 allocations). Generic controls were 29.559 -> 28.171 us and
+23.421 -> 26.624 us. This fixture therefore exposes approximately 20 us of added
+managed transaction cost. Metadata batching can amortize that cost only if the
+liveness check and every protected write remain in the same transaction; an
+unchecked cache cannot replace the guard.
+
+After-only catalog controls measured FlipCheckoutRouteSlot at median 34.161 us
+for zero clears versus 48.347 us for healthy positive pointers, and route upsert
+at 42.723 versus 55.544 us. These are not paired pre-change results: positive
+pointers also add foreign-key/storage work. Neither this difference nor logical
+route-write counts establishes cumulative WAL, filesystem, or SSD NAND writes.
+
+#### Remaining integration and failure gates
+
+The inspected RefViewManager.runBuild raw generation handle is a lower-base
+input, not a direct writer. That local result is not an exhaustive transitive
+audit. Preserve managed provenance through physical passes, enrichment,
+postprocessing, claimed builds, and future incremental-base advancement.
+
+The real isolated runtime precursor registered a primary, automatically
+discovered an already-existing linked checkout, activated it once, and published
+positive commit/dirty generations using the actual shared lease registry. A
+physical source edit refreshed the new view while a pinned old view remained
+unchanged, with no generation-zero leakage and no manual reindex/reactivation.
+Both checks passed, but that tiny edit took 13.522 seconds to become observable
+in one run. This remains an unresolved latency finding, not an immediate-readiness
+claim or attribution to a particular watcher/polling/scheduling stage.
+
+A second diagnostic changed only the fixture logger and added write markers.
+It passed with a 10.643-second write-to-view interval. The observed write itself
+took about 0.221 ms; 10.482 seconds then elapsed before the first update-indexer
+record, followed by 157.939 ms to the route record (labeled `reason="poll"`)
+and 3.319 ms to the coherent-view assertion. The old generation's retirement was
+explicitly deferred because it remained leased. No notification or reconcile-start
+record was emitted: this locates the observed wait before the logged indexing
+work, but does not establish why a watcher event was absent/delayed, nor prove
+that this SharedServer fixture includes every daemon watcher-start hook. The
+instrumented run is diagnostic, not a clean paired performance benchmark.
+
+Public untracking/primary closure needs its own held-reader and physical-flight
+tests: repository mutation draining alone does not establish reader protection,
+and a direct administrative PurgeRepo test cannot certify the public lifecycle.
+The first isolated real primary-closure run returned success while the linked
+worktree reader remained pinned, but both its held view and a positive-generation
+Store lookup lost the previously unread sentinel. A paired healthy control then
+proved the sentinel was populated in the positive generation and held view, not
+generation zero; the same frozen binary reproduced the untrack failure in a
+separate fresh process without warming that process's node cache. The high-level
+release/purge path therefore has a confirmed reader-lifetime defect, not covered
+by the passing Store retirement tests. Its fix must preserve intentional
+administrative all-generation purge semantics in unrelated callers. Purging only
+generation zero is not a complete workaround: a pinned delta can still depend on
+that mutable lower base. A further paired run populated a concrete generation-zero
+base symbol and the positive dirty symbol, left the composed reader cold, and
+observed both direct and held-view lookups disappear during public untrack while
+leased. Its healthy arm passed in 1.42 seconds; the untrack arm failed in 31.46
+seconds using the same binary and fresh private environments. This confirms loss
+of both observed portions of the view; it does not claim exhaustive ancestry
+ownership. Full coherent teardown requires the planned positive
+immutable-base activation or genuine per-graph lower-base ownership; global
+generation-zero blocking would unnecessarily couple unrelated repositories.
+
+The same run still saw the catalog row after 30 seconds, with payload absent.
+That is an observation, not yet a second confirmed production GC defect: the
+SharedServer fixture does not establish which daemon scheduler invokes lifecycle
+Sweep. Its inspected public Sweep does call retirement even with no families;
+the scheduling/lease-release trigger remains to be validated. Blocking until
+readers drain is permitted; without a verified drain boundary that outcome is
+inconclusive, not proof of deletion or a nonblocking-removal failure.
+
+The concrete SQLite driver error 13 path remains a separate fix. A private
+max_page_count ceiling reproduced AddBatch's ordinary error panic and lost driver
+cause for shared-build followers. The narrow proposal is typed normalization of
+concrete SQLite FULL at the legacy emitter, preserving nonfatal precedence and
+unrelated programmer panics. It does not promise general IOERR/NOMEM handling,
+retry/backoff, or successful cleanup on a truly full filesystem.
+
+This safety checkpoint does not activate the immutable primary snapshot or solve
+repeated large delta rebuilds. Runtime registration/publication ownership,
+committed-base advancement, primary dirty layering, coherent lower reads and
+source-owned writes, incremental dependency correctness, MCP edit/fresh-search
+flows, cold/warm indexing, and sustained isolated disk-I/O validation remain gates.

@@ -1019,11 +1019,29 @@ func (c *Catalog) CreateViewGeneration(ctx context.Context, generation ViewGener
 	if err := generation.validate(); err != nil {
 		return 0, err
 	}
-	result, err := c.exec(ctx, insertViewGenerationSQL, viewGenerationInsertArgs(generation)...)
+	if generation.BaseGenerationID <= 0 {
+		result, err := c.exec(ctx, insertViewGenerationSQL, viewGenerationInsertArgs(generation)...)
+		if err != nil {
+			return 0, err
+		}
+		return result.LastInsertId()
+	}
+	var generationID int64
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, insertViewGenerationSQL, viewGenerationInsertArgs(generation)...)
+		if err != nil {
+			return err
+		}
+		generationID, err = result.LastInsertId()
+		if err != nil {
+			return err
+		}
+		return validateViewGenerationAdmissionTx(ctx, tx, generation.BaseGenerationID)
+	})
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	return generationID, nil
 }
 
 // scanViewGeneration reads one row in viewGenerationColumns order, folding the
@@ -1236,7 +1254,9 @@ func (c *Catalog) AdoptOrCreateViewGeneration(ctx context.Context, generation Vi
 				generation.ExtractorVersions, generation.ResolverVersion).Scan(&generationID)
 			if err == nil {
 				adopted = true
-				return nil
+				// The exact match includes BaseGenerationID; reusing its row
+				// does not authorize grandfathered retiring ancestry.
+				return validateViewGenerationAdmissionTx(ctx, tx, generation.BaseGenerationID)
 			}
 			if !errors.Is(err, sql.ErrNoRows) {
 				return err
@@ -1247,7 +1267,10 @@ func (c *Catalog) AdoptOrCreateViewGeneration(ctx context.Context, generation Vi
 			return err
 		}
 		generationID, err = result.LastInsertId()
-		return err
+		if err != nil {
+			return err
+		}
+		return validateViewGenerationAdmissionTx(ctx, tx, generation.BaseGenerationID)
 	})
 	if err != nil {
 		return 0, false, err
@@ -1257,8 +1280,8 @@ func (c *Catalog) AdoptOrCreateViewGeneration(ctx context.Context, generation Vi
 
 // SetViewGenerationState moves a generation to another lifecycle state. The
 // expected states are the compare-and-set guard; passing none accepts whatever
-// the row currently holds, which is what retirement needs — a crashed build and
-// a superseded publish are both collectable.
+// the row currently holds. Retirement must use BeginViewGenerationRetirement,
+// which atomically checks references before installing the retiring fence.
 func (c *Catalog) SetViewGenerationState(ctx context.Context, generationID int64, next ViewGenerationState, expected ...ViewGenerationState) error {
 	if generationID <= 0 {
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
@@ -1334,12 +1357,14 @@ type ViewGenerationReferences struct {
 	Based bool
 	// GraphActive is a dedicated graph's active pointer.
 	GraphActive bool
+	// DedicatedPublication is the graph's current build/publication association.
+	DedicatedPublication bool
 }
 
 // Any reports whether any pointer names the generation. It is the boolean the
 // delete guard enforces.
 func (r ViewGenerationReferences) Any() bool {
-	return r.Routed || r.RefViewed || r.Based || r.GraphActive
+	return r.Routed || r.RefViewed || r.Based || r.GraphActive || r.DedicatedPublication
 }
 
 // ViewGenerationReferenced reports whether anything still points at a
@@ -1362,8 +1387,8 @@ func (c *Catalog) ViewGenerationReferences(
 		return refs, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
 	err := c.store.db.QueryRowContext(ctx, viewGenerationReferencesSQL,
-		generationID, generationID, generationID, generationID, generationID,
-	).Scan(&refs.Routed, &refs.RefViewed, &refs.Based, &refs.GraphActive)
+		generationID, generationID, generationID, generationID, generationID, generationID,
+	).Scan(&refs.Routed, &refs.RefViewed, &refs.Based, &refs.GraphActive, &refs.DedicatedPublication)
 	return refs, err
 }
 
@@ -1373,7 +1398,9 @@ const viewGenerationReferencedSQL = `
 SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?)
     OR EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?)
     OR EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?)
-    OR EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`
+    OR EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)
+    OR EXISTS(SELECT 1 FROM dedicated_base_publications
+              WHERE generation_id = ? AND attempt_state IN ('building', 'ready', 'adopted'))`
 
 // viewGenerationReferencesSQL is the same guard with its clauses kept apart,
 // so one round trip answers both "is it referenced" and "by what".
@@ -1381,14 +1408,17 @@ const viewGenerationReferencesSQL = `
 SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR dirty_generation_id = ?),
        EXISTS(SELECT 1 FROM ref_views WHERE active_generation_id = ?),
        EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?),
-       EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)`
+       EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?),
+       EXISTS(SELECT 1 FROM dedicated_base_publications
+               WHERE generation_id = ? AND attempt_state IN ('building', 'ready', 'adopted'))`
 
 // DeleteViewGeneration removes a generation nothing points at. SQLite's own
 // foreign keys already refuse a delete under a route, a ref view, or another
 // generation's base pointer (a non-deferred NO ACTION constraint is enforced
 // as RESTRICT); this checks the same references — plus dedicated_graphs'
-// deliberately key-free active pointer — first, so the caller gets one typed
-// refusal instead of a driver constraint string.
+// deliberately key-free active pointer and current dedicated publication
+// associations — first, so the caller gets one typed refusal instead of a driver
+// constraint string.
 func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) error {
 	if generationID <= 0 {
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
@@ -1396,7 +1426,7 @@ func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) 
 	return c.withTx(ctx, func(tx *sql.Tx) error {
 		var referenced bool
 		if err := tx.QueryRowContext(ctx, viewGenerationReferencedSQL,
-			generationID, generationID, generationID, generationID, generationID,
+			generationID, generationID, generationID, generationID, generationID, generationID,
 		).Scan(&referenced); err != nil {
 			return err
 		}
@@ -1470,7 +1500,8 @@ func (c *Catalog) UpsertCheckoutRoute(ctx context.Context, route CheckoutRoute) 
 	if err := route.validate(); err != nil {
 		return err
 	}
-	_, err := c.exec(ctx, `
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
 INSERT INTO checkout_routes
   (checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state)
 VALUES (?, ?, ?, ?, ?, ?)
@@ -1480,9 +1511,19 @@ ON CONFLICT(checkout_id) DO UPDATE SET
   dirty_generation_id  = excluded.dirty_generation_id,
   route_epoch          = excluded.route_epoch,
   state                = excluded.state`,
-		route.CheckoutID, route.GraphID, catalogNullInt(route.CommitGenerationID),
-		catalogNullInt(route.DirtyGenerationID), route.RouteEpoch, string(route.State))
-	return err
+			route.CheckoutID, route.GraphID, catalogNullInt(route.CommitGenerationID),
+			catalogNullInt(route.DirtyGenerationID), route.RouteEpoch, string(route.State))
+		if err != nil {
+			return err
+		}
+		if err := validateViewGenerationAdmissionTx(ctx, tx, route.CommitGenerationID); err != nil {
+			return err
+		}
+		if route.DirtyGenerationID != route.CommitGenerationID {
+			return validateViewGenerationAdmissionTx(ctx, tx, route.DirtyGenerationID)
+		}
+		return nil
+	})
 }
 
 // GetCheckoutRoute returns one checkout's route.
@@ -1620,13 +1661,25 @@ func (c *Catalog) FlipCheckoutRoute(ctx context.Context, req FlipCheckoutRouteRe
 	if err := requireCatalogValue("state", req.State, routeStates); err != nil {
 		return err
 	}
-	return c.execGuarded(ctx, fmt.Sprintf("route for checkout %s at epoch %d", req.CheckoutID, req.ExpectedRouteEpoch), `
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		err := execGuardedTx(ctx, tx, fmt.Sprintf("route for checkout %s at epoch %d", req.CheckoutID, req.ExpectedRouteEpoch), `
 UPDATE checkout_routes
    SET graph_id = ?, commit_generation_id = ?, dirty_generation_id = ?,
        route_epoch = route_epoch + 1, state = ?
  WHERE checkout_id = ? AND route_epoch = ?`,
-		req.GraphID, catalogNullInt(req.CommitGenerationID), catalogNullInt(req.DirtyGenerationID),
-		string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
+			req.GraphID, catalogNullInt(req.CommitGenerationID), catalogNullInt(req.DirtyGenerationID),
+			string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
+		if err != nil {
+			return err
+		}
+		if err := validateViewGenerationAdmissionTx(ctx, tx, req.CommitGenerationID); err != nil {
+			return err
+		}
+		if req.DirtyGenerationID != req.CommitGenerationID {
+			return validateViewGenerationAdmissionTx(ctx, tx, req.DirtyGenerationID)
+		}
+		return nil
+	})
 }
 
 // flipRouteSlotSQL is one guarded statement per slot. Naming a single column
@@ -1658,10 +1711,16 @@ func (c *Catalog) FlipCheckoutRouteSlot(ctx context.Context, req FlipCheckoutRou
 	if err := requireCatalogValue("state", req.State, routeStates); err != nil {
 		return err
 	}
-	return c.execGuarded(ctx,
-		fmt.Sprintf("%s slot of route for checkout %s at epoch %d", req.Slot, req.CheckoutID, req.ExpectedRouteEpoch),
-		flipRouteSlotSQL[req.Slot],
-		catalogNullInt(req.GenerationID), string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		err := execGuardedTx(ctx, tx,
+			fmt.Sprintf("%s slot of route for checkout %s at epoch %d", req.Slot, req.CheckoutID, req.ExpectedRouteEpoch),
+			flipRouteSlotSQL[req.Slot],
+			catalogNullInt(req.GenerationID), string(req.State), req.CheckoutID, req.ExpectedRouteEpoch)
+		if err != nil {
+			return err
+		}
+		return validateViewGenerationAdmissionTx(ctx, tx, req.GenerationID)
+	})
 }
 
 // --- ref views ----------------------------------------------------------
@@ -1698,7 +1757,8 @@ func (c *Catalog) UpsertRefView(ctx context.Context, view RefView) error {
 	if err := view.validate(); err != nil {
 		return err
 	}
-	_, err := c.exec(ctx, insertRefViewSQL+`
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, insertRefViewSQL+`
 ON CONFLICT(ref_view_id) DO UPDATE SET
   graph_id                  = excluded.graph_id,
   selector_kind             = excluded.selector_kind,
@@ -1719,8 +1779,12 @@ ON CONFLICT(ref_view_id) DO UPDATE SET
   last_resolved             = excluded.last_resolved,
   last_selected             = excluded.last_selected,
   last_error                = excluded.last_error`,
-		refViewInsertArgs(view)...)
-	return err
+			refViewInsertArgs(view)...)
+		if err != nil {
+			return err
+		}
+		return validateViewGenerationAdmissionTx(ctx, tx, view.ActiveGenerationID)
+	})
 }
 
 // GetOrCreateRefView returns the stored row for a view, creating it from the
@@ -1736,8 +1800,18 @@ func (c *Catalog) GetOrCreateRefView(ctx context.Context, view RefView) (RefView
 		return RefView{}, err
 	}
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, insertRefViewSQL+` ON CONFLICT DO NOTHING`, refViewInsertArgs(view)...)
-		return err
+		result, err := tx.ExecContext(ctx, insertRefViewSQL+` ON CONFLICT DO NOTHING`, refViewInsertArgs(view)...)
+		if err != nil {
+			return err
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if inserted == 0 {
+			return nil
+		}
+		return validateViewGenerationAdmissionTx(ctx, tx, view.ActiveGenerationID)
 	})
 	if err != nil {
 		return RefView{}, err
@@ -1822,7 +1896,7 @@ UPDATE ref_view_builds SET state = ?, generation_id = ?, last_progress = ?, erro
 				return err
 			}
 		}
-		return execGuardedTx(ctx, tx,
+		err := execGuardedTx(ctx, tx,
 			fmt.Sprintf("ref view %s at epoch %d", req.RefViewID, req.ExpectedRouteEpoch), `
 UPDATE ref_views
    SET active_generation_id = ?, active_ref = ?, active_commit = ?, active_tree = ?,
@@ -1837,6 +1911,10 @@ UPDATE ref_views
 			req.LastResolved, req.LastSelected,
 			req.RefViewID, req.ExpectedRouteEpoch,
 			req.ExpectedDesiredTree, req.ExpectedDesiredBuildFingerprint)
+		if err != nil {
+			return err
+		}
+		return validateViewGenerationAdmissionTx(ctx, tx, req.GenerationID)
 	})
 }
 

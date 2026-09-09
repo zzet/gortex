@@ -33,7 +33,10 @@ func (c *Catalog) upsertDedicatedGraphIdentity(ctx context.Context, dedicated De
 				VALUES (?, ?, ?, ?, ?, ?, ?)`, dedicated.GraphID, catalogNullString(dedicated.OwnerCheckoutID),
 				dedicated.RepoPrefix, dedicated.FamilyID, catalogBoolInt(dedicated.IsPrimaryBase),
 				catalogNullInt(dedicated.ActiveGenerationID), dedicated.State)
-			return err
+			if err != nil {
+				return err
+			}
+			return validateViewGenerationAdmissionTx(ctx, tx, dedicated.ActiveGenerationID)
 		}
 		if err != nil {
 			return err
@@ -57,10 +60,16 @@ func (c *Catalog) upsertDedicatedGraphIdentity(ctx context.Context, dedicated De
 		if dedicated == existing {
 			return nil
 		}
-		return execGuardedTx(ctx, tx, "dedicated graph identity", `UPDATE dedicated_graphs SET
+		if err := execGuardedTx(ctx, tx, "dedicated graph identity", `UPDATE dedicated_graphs SET
 			owner_checkout_id=?, repo_prefix=?, family_id=?, is_primary_base=?, active_generation_id=?, state=?
 			WHERE graph_id=?`, catalogNullString(dedicated.OwnerCheckoutID), dedicated.RepoPrefix,
 			dedicated.FamilyID, catalogBoolInt(dedicated.IsPrimaryBase), catalogNullInt(dedicated.ActiveGenerationID),
-			dedicated.State, dedicated.GraphID)
+			dedicated.State, dedicated.GraphID); err != nil {
+			return err
+		}
+		if dedicated.ActiveGenerationID != existing.ActiveGenerationID {
+			return validateViewGenerationAdmissionTx(ctx, tx, dedicated.ActiveGenerationID)
+		}
+		return nil
 	})
 }

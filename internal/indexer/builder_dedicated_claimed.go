@@ -103,8 +103,12 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		validation.Target = target
 		return prepareOwnedDedicatedSnapshot(ctx, target, func() error { return b.validate(ctx, &validation) })
 	}
+	handle, err := b.Store.AtManagedGeneration(claim.GenerationID)
+	if err != nil {
+		return 0, BuildReport{}, err
+	}
 	return b.buildReservedGenerationWithPreparation(ctx, req, buildPlan{}, BuildReport{}, started, claim.GenerationID,
-		b.Store.AtGeneration(claim.GenerationID), validated.Status != "allocated", prepare)
+		handle, validated.Status != "allocated", prepare)
 }
 
 // Until this function returns the source, the physical runner cannot own it.

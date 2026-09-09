@@ -10,7 +10,8 @@ const baseViewGeneration int64 = 0
 // AtGeneration returns a handle over the same database pinned to payload view
 // generation g. The returned handle shares the core — pools, prepared
 // statements, caches, write gate — with the receiver, so it sees every write
-// any other handle makes; only the pinned generation differs.
+// any other handle makes. Same-generation derivations preserve an existing
+// managed-write restriction; another generation requires explicit qualification.
 //
 // The derived handle never owns the core: closing it is a no-op, and the
 // handle Open returned stays responsible for teardown.
@@ -25,10 +26,11 @@ func (s *Store) AtGeneration(g int64) *Store {
 		return s.atBase()
 	}
 	return &Store{
-		storeCore:   s.storeCore,
-		viewGen:     g,
-		seal:        s.payloadSealFor(g),
-		resolveLane: s.resolveLaneFor(g),
+		storeCore:                s.storeCore,
+		viewGen:                  g,
+		seal:                     s.payloadSealFor(g),
+		resolveLane:              s.resolveLaneFor(g),
+		managedPayloadGeneration: s.managedPayloadGeneration && s.viewGen == g,
 	}
 }
 

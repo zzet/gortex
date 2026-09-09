@@ -200,8 +200,11 @@ func (s *Store) BeginPayloadGenerationWithStatus(
 	if err != nil {
 		return 0, nil, false, err
 	}
-	s.setPayloadSeal(generationID, payloadSealOpen)
-	return generationID, s.AtGeneration(generationID), adopted, nil
+	handle, err = s.AtManagedGeneration(generationID)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	return generationID, handle, adopted, nil
 }
 
 // PublishPayloadGeneration validates a building generation and moves it to
@@ -463,15 +466,16 @@ var generationFTSDocidMaps = []ftsDocidMap{
 
 // RetirePayloadGeneration deletes a generation and everything it carries.
 //
-// inUse is the lease hook: a graph-view lease manager passes a predicate that
-// reports whether any reader still holds the generation, and retirement is
-// refused while it does. A nil predicate means nothing leases generations.
+// inUse is the external reader lease hook: a graph-view lease manager passes a
+// predicate reporting whether readers still hold the generation. A nil predicate
+// omits that external reader check, never the Store's physical-flight check.
 //
-// The order is: refuse while referenced or leased, mark the catalog row
-// retiring, seal the generation and drain the writers already past the gate,
-// delete the payload in bounded chunks, then delete the catalog row. Every
-// delete is keyed by generation and idempotent, so a retire killed part way
-// leaves a retiring row whose next run simply continues.
+// The order is: refuse while referenced or owned, atomically fence the catalog
+// row as retiring while rechecking references, then recheck reader and physical
+// ownership after that transaction commits. Only then seal the generation and
+// drain writers already past the gate, delete payload in bounded chunks, and
+// delete the catalog row. Every delete is keyed and idempotent; a partial retire
+// leaves its fence in place so the next run can safely continue.
 func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64, inUse func(int64) bool) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
@@ -488,6 +492,8 @@ func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64,
 		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
 	owner := generationOwner(row.OwnerKind)
+	// Preserve cheap refusals and their existing metric labels. These observations
+	// are not the retirement authority: the catalog rechecks references atomically.
 	refs, err := catalog.ViewGenerationReferences(ctx, generationID)
 	if err != nil {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
@@ -497,13 +503,29 @@ func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64,
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, refusalReason(refs))
 		return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
 	}
-	if inUse != nil && inUse(generationID) {
+	inUseNow := func() bool {
+		return s.PayloadBuildFlightActive(generationID) || (inUse != nil && inUse(generationID))
+	}
+	if inUseNow() {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
 	}
-	if err := catalog.SetViewGenerationState(ctx, generationID, ViewGenerationRetiring); err != nil {
-		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
+	if err := catalog.BeginViewGenerationRetirement(ctx, generationID); err != nil {
+		reason := viewmetrics.RefusedError
+		if errors.Is(err, ErrCatalogGenerationReferenced) {
+			// The transaction reports a reference added after the fast check,
+			// but not its kind. Keep its cause without a second diagnostic query.
+			reason = viewmetrics.LabelOther
+		}
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, reason)
 		return err
+	}
+	// A reader or physical leader may have acquired ownership after the fast
+	// refusal. The fence is committed and its transaction ended before this
+	// decisive check. Keep it in place while owners drain; never reopen admissions.
+	if inUseNow() {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
+		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
 	}
 	s.setPayloadSeal(generationID, payloadSealSealed)
 	// A write admitted before the seal closed would otherwise commit rows into

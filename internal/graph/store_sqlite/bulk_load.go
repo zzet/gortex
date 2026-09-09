@@ -241,13 +241,27 @@ func (s *Store) beginWriteOnContext(ctx context.Context, beginner sqliteTxBeginn
 		tx, beginErr = beginner.BeginTx(attemptCtx, nil)
 		return beginErr
 	})
-	return tx, err
+	if err != nil {
+		return tx, err
+	}
+	if s.managedPayloadGeneration {
+		if err := checkManagedPayloadWriteTx(ctx, tx, s.viewGen); err != nil {
+			if tx != nil {
+				_ = tx.Rollback()
+			}
+			return nil, err
+		}
+	}
+	return tx, nil
 }
 
 // execActiveWriteLocked and queryActiveWriteLocked keep sidecar and eviction
 // writes on the pinned bulk connection when one is active. Callers hold
 // writeMu, which guards bulkConn for the full operation.
 func (s *Store) execActiveWriteLocked(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if s.managedPayloadGeneration {
+		return s.execManagedPayloadWriteLocked(ctx, query, args...)
+	}
 	if err := s.refuseSealedPayloadWrite(); err != nil {
 		return nil, err
 	}

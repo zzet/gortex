@@ -793,8 +793,40 @@ func TestDedicatedIdentityUpsertLegacyCompatibility(t *testing.T) {
 	if err := f.c.DeleteDedicatedGraph(context.Background(), f.graph.GraphID); err != nil {
 		t.Fatal(err)
 	}
+	// Keep real Ready payloads on an independent non-primary seed graph. The
+	// generic identity API admits healthy pointers without adopting authority.
+	seedOwner := f.owner
+	seedOwner.CheckoutID = "legacy-payload-owner"
+	seedOwner.Incarnation = "legacy-payload-incarnation"
+	seedOwner.AdminName = "legacy-payload"
+	seedOwner.RootPath = filepath.Join(filepath.Dir(f.path), "legacy-payload-root")
+	seedOwner.GitDir = filepath.Join(f.owner.GitDir, "worktrees", "legacy-payload")
+	if err := f.c.UpsertCheckout(context.Background(), seedOwner); err != nil {
+		t.Fatal(err)
+	}
+	seedGraph := f.graph
+	seedGraph.GraphID = "legacy-payload-graph"
+	seedGraph.OwnerCheckoutID = seedOwner.CheckoutID
+	seedGraph.RepoPrefix = "legacy-payload"
+	seedGraph.IsPrimaryBase = false
+	if err := f.c.UpsertDedicatedGraph(context.Background(), seedGraph); err != nil {
+		t.Fatal(err)
+	}
+	newReadyGeneration := func(layer string) int64 {
+		generationID, _, err := f.store.BeginPayloadGeneration(context.Background(), PayloadGenerationRequest{
+			OwnerKind: "dedicated_graph", GraphID: seedGraph.GraphID, CheckoutID: seedOwner.CheckoutID,
+			GenerationKind: "commit", LayerID: layer, TreeOID: layer,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.PublishPayloadGeneration(context.Background(), generationID, 2); err != nil {
+			t.Fatal(err)
+		}
+		return generationID
+	}
 	incoming := f.graph
-	incoming.ActiveGenerationID = 123
+	incoming.ActiveGenerationID = newReadyGeneration("legacy-insert")
 	if err := f.c.UpsertDedicatedGraph(context.Background(), incoming); err != nil {
 		t.Fatal(err)
 	}
@@ -827,7 +859,7 @@ func TestDedicatedIdentityUpsertLegacyCompatibility(t *testing.T) {
 	incoming.OwnerCheckoutID = otherOwner.CheckoutID
 	incoming.FamilyID = otherFamily.FamilyID
 	incoming.RepoPrefix = "legacy-prefix"
-	incoming.ActiveGenerationID = 456
+	incoming.ActiveGenerationID = newReadyGeneration("legacy-update")
 	if err := f.c.UpsertDedicatedGraph(context.Background(), incoming); err != nil {
 		t.Fatal(err)
 	}

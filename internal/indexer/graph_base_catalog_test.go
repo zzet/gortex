@@ -68,8 +68,9 @@ func newGraphBaseCatalogFixture(t testing.TB, scenario string) graphBaseCatalogF
 		return fixture
 	}
 	if scenario == "positive_missing_generation_healthy_owner" {
+		// graphBase validates the supplied value: model a stale/invalid caller
+		// without asking normal catalog admission to persist a missing target.
 		fixture.dedicated.ActiveGenerationID = 999999
-		must(catalog.UpsertDedicatedGraph(ctx, fixture.dedicated))
 		return fixture
 	}
 	row := store_sqlite.ViewGeneration{
@@ -129,7 +130,11 @@ func newGraphBaseCatalogFixture(t testing.TB, scenario string) graphBaseCatalogF
 		t.Fatalf("fixture generation mismatch: found=%v row=%+v", found, stored)
 	}
 	fixture.dedicated.ActiveGenerationID = id
-	must(catalog.UpsertDedicatedGraph(ctx, fixture.dedicated))
+	if scenario != "positive_retiring" {
+		must(catalog.UpsertDedicatedGraph(ctx, fixture.dedicated))
+	}
+	// The retiring case supplies a stale caller value to graphBase. Its real
+	// generation state remains checked above; no invalid pointer is persisted.
 	fixture.want = primaryBase{graphID: dedicated.GraphID, generationID: id, treeOID: row.TreeOID}
 	return fixture
 }
