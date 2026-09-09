@@ -1148,3 +1148,43 @@ single-pass cold/warm publication and global read/write separation, primary dirt
 and committed advancement dispatch, source/context reuse and import semantics,
 bounded ancestry/cleanup, public-untrack reader/build lifetime, isolated MCP
 end-to-end behavior and sustained realistic-corpus I/O must still be validated.
+
+### 2026-09-10: repository-owner read admission and drain primitive
+
+`LeaseManager` now has a separate repository-owner admission domain, including
+legacy generation-zero reads. Registration requires the complete graph,
+checkout, incarnation and repository-prefix identity. Prefix exclusivity matches
+the existing `dedicated_graphs.repo_prefix UNIQUE` storage contract. Closing
+admission retains an identity-specific tombstone until cleanup is explicitly
+finalized; a stale drain handle cannot delete a replacement owner.
+
+Explicit scopes acquire atomically. Broad/all-repository readers also protect
+owners registered after acquisition, including an initially empty graph.
+Closing one owner rejects new broad reads but still permits explicit reads of
+other healthy owners. Releases are concurrent/idempotent, notification callbacks
+run outside the mutex and release-once guard, and shutdown permanently closes
+admission while waiting for existing readers. These operations perform no SQL
+and create no per-query goroutine. The primitive does not itself delete payload,
+configuration or catalog state.
+
+All 14 new tests passed normally and in three race repetitions (42 race-test
+passes). Tests cover acquisition/close linearization, scope atomicity, stale
+handles and incarnation replacement, notification cancellation/reentry,
+initially empty broad readers, bounded finalized state, and shutdown races.
+The actual-source normal/race binaries and strict run logs are recorded in
+`/private/tmp/gortex-component-validation.fwgMDk`. Four-package vet and lint
+also passed, with stable source manifests; the new graphview test and both
+production-file hashes were checked independently before and after static runs.
+
+Three serial 100-iteration acquire/release runs measured the following medians:
+
+| Owners | Explicit scope | All scope | Allocations |
+| --- | --- | --- | --- |
+| 0 | 58.75 ns | 57.50 ns | 48 B / 1 |
+| 1 | 72.08 ns | 94.58 ns | 56 B / 2 |
+| 20 | 573.3 ns | 1,008 ns | 208 B / 2 |
+
+These are small in-memory component benchmarks, not contention limits or daemon
+I/O results. Public MCP admission, durable closing authorization, deferred
+cleanup continuation, restart recovery and shutdown joining still need wiring
+and end-to-end validation. The full feature release gate remains open.

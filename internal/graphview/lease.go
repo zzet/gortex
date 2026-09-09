@@ -19,6 +19,8 @@ type LeaseManager struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	counts map[int64]int
+
+	repositories repositoryLeaseState
 }
 
 // NewLeaseManager returns an empty lease manager.
