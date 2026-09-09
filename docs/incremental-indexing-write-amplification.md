@@ -844,3 +844,96 @@ repeated large delta rebuilds. Runtime registration/publication ownership,
 committed-base advancement, primary dirty layering, coherent lower reads and
 source-owned writes, incremental dependency correctness, MCP edit/fresh-search
 flows, cold/warm indexing, and sustained isolated disk-I/O validation remain gates.
+
+### Genuine SQLite-full errors at the legacy panic boundary
+
+The private bounded SQLite page-limit reproducer returned a real driver primary
+code 13 from `Store.AddBatch`, but the legacy emitter wrapped it in a generic
+error. The direct-only `StorageErrorFromPanic` classifier correctly refused that
+payload. Consequently, the physical builder could re-panic and its waiting
+followers could lose the original driver cause.
+
+The narrow repair normalizes only genuine `*sqlite.Error` primary-code-13 causes
+at `panicOnFatal`, alongside its existing typed sealed-generation refusal. It
+does not broaden the panic classifier or recover arbitrary programmer panics.
+The existing nil, no-rows, connection-done, and closed-store precedence remains.
+Errors merely implementing `Code() int` or containing a disk-full message do not
+qualify. Original error chains and messages must remain available.
+
+The new public-ingress fixture uses the real `SparseGenerationBuilder.Build`,
+with internal Store test exports and an external Store test. Planning opens pass
+through; a source read during an actual positive-generation physical flight
+provides the barrier for installing the private page ceiling and admitting two
+real waiting callers. The fixture, not Build, owns the supplied source's Close.
+The fixture adds no test API to production and uses no private indexer entry
+point or production overlay. The before binary included the dormant predicate only, with the old
+emitter unchanged: healthy passed in 1.66s; FULL failed in 0.84s with a generic panic,
+lost returned generation identity, and generic errors for both waiting callers.
+
+The same public fixture after the emitter change passed healthy in 1.51s and FULL
+in 0.88s. FULL returned generation 1 and retained concrete SQLite code 13 for the
+leader and both followers without escaping a panic. Both modes passed three
+race-detector repetitions (36.656s package time, no reported race). Both arms
+retained generation-zero data, drained the real flight and all participants, and
+closed the caller-owned source once. These are test observations, not throughput
+comparisons. The small FULL fixture could mark the row Failed before restoring
+capacity; this does not guarantee metadata writes succeed on a full filesystem.
+
+The actual on-disk internal Store tests then passed all six selected tests in
+0.434s. The same-test Store baseline on 11c2dcbf reproduced exactly the expected
+AddBatch/matrix failures, with healthy and unrelated-error controls passing.
+The paired observable-sink benchmark ran all four cases three times, 200ms per
+case, GOMAXPROCS=2. Genuine FULL recognition changed from 0 to 1; nil/no-rows stayed
+at 0. Results below are nanoseconds per operation (median and observed range):
+
+| Case | Before ns/op | After ns/op | Before → after B/op | Allocations/op |
+| --- | ---: | ---: | ---: | ---: |
+| nil | 6.581 (6.559–6.589) | 6.254 (6.180–6.318) | 0 → 0 | 0 → 0 |
+| nonfatal no-rows | 10.69 (10.60–10.76) | 9.951 (9.922–10.080) | 0 → 0 | 0 → 0 |
+| real FULL | 483.9 (463.4–884.8) | 294.4 (293.8–294.5) | 80 → 24 | 2 → 2 |
+| wrapped real FULL | 385.6 (377.1–454.2) | 325.1 (321.5–327.3) | 96 → 24 | 2 → 2 |
+
+These measure emission/recovery overhead, not database filling or indexing. Host
+contention was uncontrolled, and the before-FULL outlier is retained. No claim of
+statistical significance or indexing-throughput improvement follows. The before
+binary used the original combined test; the after binary used its exact contents
+plus test-only writer exports. Benchmark bodies and observable sinks were kept
+byte-for-byte. Both were frozen from verified actual production inputs; neither
+replaced production source through an overlay.
+
+Final actual-file acceptance includes the portable public test (`os.DevNull` for
+Git's disabled global config), with no test or production overlays:
+
+- Full Store suite: 828 passed, 2 expected skips, 0 failures, 71.117s; its 830
+  terminal test names exactly matched the same frozen binary's inventory.
+- Seven selected tests, including the public builder, passed all three race
+  repetitions: 21 passes, no failures or race reports, 46.949s.
+- Vet and lint passed for Store, graphview, and indexer; lint reported zero issues.
+  Formatting checks passed for both production files and both permanent tests.
+- Production/test manifests stayed unchanged across validation. Recursive Store
+  package file/hash snapshots matched before and after the final full run.
+
+The first full invocation used an empty private working directory and failed the
+source-census test `TestGenerationCapabilityChecklistIsComplete`; the other 827
+tests passed and 2 skipped. Native source inspection confirmed its explicit
+`os.ReadDir(".")` and relative `parser.ParseFile` dependency. The earlier passing
+Store runner had used the actual package working directory. The same frozen
+binary passed the census control and full rerun after restoring that directory,
+with private config/data/cache/state/temp paths and credential-free environment
+unchanged. No source was copied and no test assertion was changed or skipped.
+The initial failure remains recorded, not relabeled as a successful invocation.
+Two lint launches also failed before analysis because the isolated runner lacked
+a lint cache and selected Go 1.26 instead of required Go 1.27. Explicit private
+cache and verified toolchain selection corrected the runner; no code was changed
+for those failures.
+
+Graph-assisted post-analysis remains limited: detect and contract checks timed
+out; test mapping did not identify the executed emitter tests; no guard rules
+were configured. Acceptance here rests on the recorded actual-file executions
+and static checks, not a claim that those graph checks passed.
+
+This is error propagation, not a cure for disk-write amplification. A page-limit
+fixture does not establish survival under full filesystems, successful metadata
+cleanup while space remains exhausted, retry throttling, disk reclamation, WAL
+size, cold/warm throughput, or sustained background I/O. Those remain separate
+acceptance gates, as do immutable primary activation and public untrack safety.

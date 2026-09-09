@@ -29,6 +29,13 @@ func (e *StorageError) Unwrap() error {
 	return e.err
 }
 
+// isSQLiteFullFailure recognizes the actual SQLite driver cause, not errors
+// that merely resemble a full-volume failure or implement a Code method.
+func isSQLiteFullFailure(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr != nil && sqliteErr.Code()&0xff == 13
+}
+
 func wrapStorageError(err error) error {
 	if err == nil {
 		return nil

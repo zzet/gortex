@@ -2804,9 +2804,9 @@ func panicOnFatal(err error) {
 	if errors.Is(err, sql.ErrConnDone) || isStoreClosedErr(err) {
 		return
 	}
-	// Sealed payload writes are lifecycle refusals. Keep the store error typed
-	// so index/build recovery can recognize it without absorbing other panics.
-	if errors.Is(err, ErrPayloadGenerationSealed) {
+	// Keep sealed lifecycle refusals and actual SQLite-full failures typed so
+	// index/build recovery recognizes them without absorbing other panics.
+	if errors.Is(err, ErrPayloadGenerationSealed) || isSQLiteFullFailure(err) {
 		panic(&StorageError{err: err})
 	}
 	panic(fmt.Errorf("store_sqlite: %w", err))
