@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -350,17 +352,64 @@ func TestCheckoutLifecycleCloseWaitsForAdmittedFamilyRetry(t *testing.T) {
 		t.Fatal("family retry did not finish")
 	}
 
+	// Close is terminal: draining the admitted retry does not reopen the gate.
+	// A retry admitted after Close would reconcile against a Store its owner is
+	// already releasing, which is why the gate stays shut for the life of the
+	// object — see the Close doc comment in checkout_lifecycle.go, and the
+	// coordinator/transition/observation/repository gates, none of which reopen
+	// either. The barrier stays installed as a fired-work detector: from here on
+	// nothing may run it again.
+	var lateAdmissions atomic.Int64
 	fixture.lc.retryMu.Lock()
-	fixture.lc.familyRetryBarrier = nil
+	fixture.lc.familyRetryBarrier = func() { lateAdmissions.Add(1) }
 	fixture.lc.retryMu.Unlock()
+
+	// New admission after Close is refused — on the retry gate, and with the
+	// typed closed error on the repository-admission surface.
 	afterCloseDeadline := fixture.lc.now().Add(time.Hour).Unix()
 	fixture.lc.scheduleFamilyRetryAt("after-close", afterCloseDeadline)
 	fixture.lc.retryMu.Lock()
-	afterClose, scheduledAfterClose := fixture.lc.familyRetries["after-close"]
+	_, scheduledAfterClose := fixture.lc.familyRetries["after-close"]
+	gateStillClosed := fixture.lc.retryClosing
 	fixture.lc.retryMu.Unlock()
-	require.True(t, scheduledAfterClose, "Close must restore retry admission for lifecycle reuse")
-	require.Equal(t, afterCloseDeadline, afterClose.deadline)
-	require.NoError(t, fixture.lc.Close())
+	require.False(t, scheduledAfterClose, "Close must keep rejecting family retries after the drain")
+	require.True(t, gateStillClosed, "Close must leave retry admission closed")
+	_, readErr := fixture.lc.AcquireRepositoryRead()
+	require.ErrorIs(t, readErr, graphview.ErrRepositoryAdmissionsStopped)
+	require.ErrorIs(t,
+		fixture.lc.RegisterRepositoryOwner(context.Background(), "graph-after-close"),
+		graphview.ErrRepositoryAdmissionsStopped)
+	require.True(t, fixture.lc.RepositoryAdmissionClosed("prefix-after-close"),
+		"every prefix is closed to admission once the lifecycle is closed")
+
+	// A timer callback delayed past Close cannot resurrect the retry it was
+	// scheduled for, in either window: after Close removed the entry, and in the
+	// race where the callback still sees an entry Close has not yet cleared.
+	fixture.lc.runFamilyRetry("admitted-family-retry", deadline)
+	lateTimer := time.NewTimer(time.Hour)
+	defer lateTimer.Stop()
+	fixture.lc.retryMu.Lock()
+	fixture.lc.familyRetries["late-callback"] = familyRetry{deadline: afterCloseDeadline, timer: lateTimer}
+	fixture.lc.retryMu.Unlock()
+	fixture.lc.runFamilyRetry("late-callback", afterCloseDeadline)
+	require.Zero(t, lateAdmissions.Load(), "a callback delayed past Close must not be admitted")
+
+	// Close is idempotent: the second call returns promptly, joins nothing and
+	// re-runs no drained work, and it still clears the entry the late callback
+	// left behind.
+	secondClose := make(chan error, 1)
+	go func() { secondClose <- fixture.lc.Close() }()
+	select {
+	case err := <-secondClose:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a second Close blocked instead of returning")
+	}
+	require.Zero(t, lateAdmissions.Load(), "a second Close must not re-drain admitted work")
+	fixture.lc.retryMu.Lock()
+	remainingRetries := len(fixture.lc.familyRetries)
+	fixture.lc.retryMu.Unlock()
+	require.Zero(t, remainingRetries, "Close must leave no family retry timers behind")
 }
 
 // volumeEvidenceUsable reports whether this platform's path evidence carries
