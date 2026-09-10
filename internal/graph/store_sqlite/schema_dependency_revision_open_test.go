@@ -10,8 +10,9 @@ import (
 )
 
 // Build the complete immediately-prior canonical schema in a disposable file.
-// Only the two NEW column declarations are removed; no production source or
-// database is copied/modified. Metadata rows are a valid dedicated ownership chain.
+// Remove all post-v22 column declarations, including the v24 node-mask kind;
+// no production source/database is copied. Preserve the actual historical
+// shape, not merely a current schema stamped with an older version.
 func dependencyRevisionV22File(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "v22.sqlite")
@@ -19,6 +20,7 @@ func dependencyRevisionV22File(t *testing.T) string {
 	for _, column := range []string{
 		"    dependency_revision    TEXT NOT NULL DEFAULT '',\n",
 		"\tdependency_revision TEXT NOT NULL DEFAULT '',\n",
+		"    claim_kind TEXT NOT NULL DEFAULT 'legacy_tombstone',\n",
 	} {
 		if strings.Count(legacy, column) != 1 {
 			t.Fatalf("canonical new column must occur exactly once: %q", column)

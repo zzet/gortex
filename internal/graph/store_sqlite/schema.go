@@ -1553,6 +1553,7 @@ const generationFileMasksTableBody = ` (
 const generationNodeTombstonesTableBody = ` (
     view_gen INTEGER NOT NULL,
     node_id  TEXT NOT NULL,
+    claim_kind TEXT NOT NULL DEFAULT 'legacy_tombstone',
     PRIMARY KEY (view_gen, node_id)
 ) WITHOUT ROWID`
 

@@ -208,37 +208,22 @@ SELECT ownership_mode FROM generation_file_masks
 // SetNodeTombstones records node identities this generation removes without
 // claiming their whole file. Idempotent on (view_gen, node_id).
 func (s *Store) SetNodeTombstones(nodeIDs []string) error {
-	if err := s.requireDerivedGeneration(); err != nil {
-		return err
-	}
-	for _, nodeID := range nodeIDs {
-		if err := requireMaskID("node_id", nodeID); err != nil {
-			return err
-		}
-	}
-	return s.writeMaskRows(`INSERT OR REPLACE INTO generation_node_tombstones (view_gen, node_id) VALUES `,
-		len(nodeIDs), func(i int) []any {
-			return []any{s.viewGen, nodeIDs[i]}
-		})
+	return s.setNodeIdentityMasks(nodeIDs, NodeIdentityMaskLegacy)
 }
 
 // NodeTombstones returns every node identity this generation removes.
 func (s *Store) NodeTombstones() ([]string, error) {
-	rows, err := s.db.Query(
-		`SELECT node_id FROM generation_node_tombstones WHERE view_gen = ? ORDER BY node_id`, s.viewGen)
+	masks, err := s.NodeIdentityMasks()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []string{}
-	for rows.Next() {
-		var nodeID string
-		if err := rows.Scan(&nodeID); err != nil {
-			return nil, err
+	out := make([]string, 0, len(masks))
+	for _, mask := range masks {
+		if mask.Kind == NodeIdentityMaskLegacy {
+			out = append(out, mask.NodeID)
 		}
-		out = append(out, nodeID)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // SetEdgeSourceMasks upserts edge-set replacement markers for this generation.
@@ -342,6 +327,12 @@ func (s *Store) ProducerStates() ([]ProducerCompleteness, error) {
 // width, so the VALUES fragment is built once. Empty input opens no
 // transaction.
 func (s *Store) writeMaskRows(insert string, total int, row func(i int) []any) error {
+	return s.writeMaskRowsWithSuffix(insert, "", total, row)
+}
+
+// writeMaskRowsWithSuffix keeps the same mutation gate and single transaction,
+// with an optional trailing conflict policy after each bounded VALUES batch.
+func (s *Store) writeMaskRowsWithSuffix(insert, suffix string, total int, row func(i int) []any) error {
 	if total == 0 {
 		return nil
 	}
@@ -369,6 +360,7 @@ func (s *Store) writeMaskRows(insert string, total int, row func(i int) []any) e
 			stmt.WriteString(placeholders)
 			args = append(args, row(i)...)
 		}
+		stmt.WriteString(suffix)
 		if _, err := tx.Exec(stmt.String(), args...); err != nil {
 			return err
 		}
@@ -425,6 +417,9 @@ func (s *Store) writeMaskRows(insert string, total int, row func(i int) []any) e
 //
 // A base handle has no masks, so this reports nothing rather than refusing.
 func (s *Store) ValidateGenerationMasks() error {
+	if err := s.validateNodeIdentityMasks(); err != nil {
+		return err
+	}
 	rows, err := s.db.Query(`
 WITH masked(repo_prefix, file_path, ownership_mode, covered) AS (
     SELECT m.repo_prefix, m.file_path, m.ownership_mode,
