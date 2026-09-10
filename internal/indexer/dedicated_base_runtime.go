@@ -199,7 +199,8 @@ func (p *dedicatedBasePublisher) ensureObserved(ctx context.Context, observe fun
 			return out, fmt.Errorf("%w: active generation missing", store_sqlite.ErrDedicatedBaseCandidate)
 		}
 		activeIdentity := store_sqlite.DedicatedBaseIdentity{TreeOID: active.TreeOID, ConfigHash: active.ConfigHash,
-			ExtractorVersions: active.ExtractorVersions, ResolverVersion: active.ResolverVersion}
+			ExtractorVersions: active.ExtractorVersions, ResolverVersion: active.ResolverVersion,
+			DependencyRevision: active.DependencyRevision}
 		if activeIdentity != identity && leases == nil {
 			return out, &dedicatedBaseAdvanceRequiredError{GraphID: p.authority.GraphID,
 				ActiveGenerationID: active.GenerationID, Active: activeIdentity, Observed: identity}

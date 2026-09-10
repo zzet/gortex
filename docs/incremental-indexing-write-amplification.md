@@ -1429,3 +1429,39 @@ change adds no query. These short measurements expose overhead; they do not
 establish a speedup, performance neutrality, or reduced sustained disk I/O.
 Full lifecycle, immutable-input integration, end-to-end correctness and sustained
 I/O acceptance remain required before the feature is declared complete.
+
+### Runtime replay must retain the captured dependency revision
+
+The catalog identity is not sufficient if runtime reconstruction drops a field.
+`DedicatedBaseRuntime` reconstructed the active identity from tree, configuration,
+extractor and resolver versions but omitted `DependencyRevision`. Consequently,
+an already-ready initial base with a nonempty dependency revision appeared to
+require advancement when replayed with the identical complete identity. An actual
+source or policy change was not necessary to trigger this rejection. Diagnostics
+for a real dependency-only change also reported an incomplete active identity.
+The current-base path happened to recover through its adoption path, so testing
+only that path missed the initial-base defect.
+
+The repair copies the persisted dependency revision when reconstructing the
+active identity. It does not relax equality, change the initial-HEAD guard,
+introduce another query, or treat a dependency-only change as an unchanged base.
+A changed dependency revision still requires the explicit advancement path.
+Healthy replay must reuse both the ready generation and the completed attempt;
+it must not rebuild, publish another generation, or write catalog bookkeeping.
+
+Regression coverage uses actual SQLite storage and a real Git fixture. Four
+consecutive initial/current replays use a nonexistent source root after the
+initial publication, proving that replay does not silently rebuild. A separate
+A-to-B dependency-only change verifies the complete active and observed identities
+and verifies that the rejected initial-base request performs no catalog writes.
+The initial replay and diagnostic regression failed before the one-line repair.
+The repaired selection passed 70 normal tests and the same 70 tests three times
+under the race detector, including the owner, advance, cleanup and replay controls.
+
+Paired short benchmarks used the same isolated process environment, installed Go
+1.27.0 toolchain, and 100 iterations per measurement, repeated three times. The
+existing empty-revision ready replay measured 437.6–443.1 microseconds before and
+441.3–443.8 microseconds after, with 1,081 allocations in both cases. The new
+nonempty-revision replay measured 437.0–448.7 microseconds and 1,099 allocations.
+These measurements support the narrowly scoped replay repair, not a throughput
+improvement or completion of the sustained write-amplification acceptance gate.
