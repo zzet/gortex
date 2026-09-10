@@ -40,6 +40,7 @@ type repositoryLeaseState struct {
 	mu             sync.Mutex
 	byPrefix       map[string]*repositoryOwnerState
 	byGraph        map[string]*repositoryOwnerState
+	byRawRoot      map[string]*repositoryOwnerState
 	closing        map[*repositoryOwnerState]struct{}
 	readers        int
 	broadReaders   int
@@ -50,6 +51,9 @@ type repositoryLeaseState struct {
 
 type repositoryOwnerState struct {
 	owner            RepositoryOwner
+	rawOwner         *RawRepositoryOwner     // nil for dedicated owners; never fake dedicated IDs
+	rawProvisional   bool                    // reserves lifetime before constructor writes; not visible to new readers
+	rawData          *rawRepositoryDataState // initialized under the shared owner mutex
 	readers          int
 	closing          bool
 	finalized        bool
@@ -140,18 +144,21 @@ func (m *LeaseManager) AcquireAllRepositoryReads() (*RepositoryReadLease, error)
 	}
 	states := make([]*repositoryOwnerState, 0, len(r.byPrefix))
 	for _, state := range r.byPrefix {
+		if state.rawProvisional {
+			return nil, ErrRawRepositoryNotReady
+		}
 		if state.closing {
-			return nil, fmt.Errorf("%w: prefix %q", ErrRepositoryAdmissionClosed, state.owner.RepoPrefix)
+			return nil, fmt.Errorf("%w: prefix %q", ErrRepositoryAdmissionClosed, state.prefix())
 		}
 		states = append(states, state)
 	}
 	// Stable scope reporting is useful to downstream binding and tests. Explicit
 	// acquisition preserves the caller's order after duplicate removal.
 	slices.SortFunc(states, func(a, b *repositoryOwnerState) int {
-		if a.owner.RepoPrefix < b.owner.RepoPrefix {
+		if a.prefix() < b.prefix() {
 			return -1
 		}
-		if a.owner.RepoPrefix > b.owner.RepoPrefix {
+		if a.prefix() > b.prefix() {
 			return 1
 		}
 		return 0
@@ -177,9 +184,11 @@ func (l *RepositoryReadLease) Owners() []RepositoryOwner {
 	if l == nil {
 		return nil
 	}
-	owners := make([]RepositoryOwner, len(l.states))
-	for i, state := range l.states {
-		owners[i] = state.owner
+	owners := make([]RepositoryOwner, 0, len(l.states))
+	for _, state := range l.states {
+		if state.rawOwner == nil {
+			owners = append(owners, state.owner)
+		}
 	}
 	return owners
 }
@@ -331,14 +340,25 @@ func (m *LeaseManager) FinalizeRepositoryCleanup(drain *RepositoryDrain) error {
 	if state.finalized {
 		return nil
 	}
-	if r.byPrefix[state.owner.RepoPrefix] != state || r.byGraph[state.owner.GraphID] != state {
+	if r.byPrefix[state.prefix()] != state {
+		return ErrRepositoryDrainInvalid
+	}
+	if state.rawOwner == nil {
+		if r.byGraph[state.owner.GraphID] != state {
+			return ErrRepositoryDrainInvalid
+		}
+	} else if r.byRawRoot[state.rawOwner.RootIdentity] != state {
 		return ErrRepositoryDrainInvalid
 	}
 	if !state.drained {
 		return ErrRepositoryLeaseInUse
 	}
-	delete(r.byPrefix, state.owner.RepoPrefix)
-	delete(r.byGraph, state.owner.GraphID)
+	delete(r.byPrefix, state.prefix())
+	if state.rawOwner == nil {
+		delete(r.byGraph, state.owner.GraphID)
+	} else {
+		delete(r.byRawRoot, state.rawOwner.RootIdentity)
+	}
 	delete(r.closing, state)
 	if len(r.closing) == 0 {
 		r.closing = nil
@@ -346,6 +366,7 @@ func (m *LeaseManager) FinalizeRepositoryCleanup(drain *RepositoryDrain) error {
 	if len(r.byPrefix) == 0 {
 		r.byPrefix = nil
 		r.byGraph = nil
+		r.byRawRoot = nil
 	}
 	state.finalized = true
 	return nil
