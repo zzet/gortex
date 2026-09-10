@@ -396,7 +396,16 @@ func (b *SparseGenerationBuilder) buildReservedGeneration(ctx context.Context, r
 // physical leader. Followers never construct a source or enumerate its tree.
 type generationPayloadPreparation func(context.Context) (source.ContentSource, buildPlan, BuildReport, error)
 
+// A failure callback belongs to the physical leader only. It runs after payload
+// abandonment, within the same bounded cleanup context, before flight completion.
+// Ordinary builders have no dedicated publication association and pass nil.
+type generationPayloadFailure func(context.Context, error) error
+
 func (b *SparseGenerationBuilder) buildReservedGenerationWithPreparation(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time, generationID int64, handle *store_sqlite.Store, adopted bool, prepare generationPayloadPreparation) (int64, BuildReport, error) {
+	return b.buildReservedGenerationWithCallbacks(ctx, req, plan, report, started, generationID, handle, adopted, prepare, nil)
+}
+
+func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time, generationID int64, handle *store_sqlite.Store, adopted bool, prepare generationPayloadPreparation, failed generationPayloadFailure) (int64, BuildReport, error) {
 	report.GenerationID = generationID
 	flight, leader, ready, err := b.Store.JoinPayloadBuildFlight(ctx, generationID, adopted)
 	if err != nil {
@@ -433,7 +442,7 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithPreparation(ctx con
 		}
 		flight.Complete(buildErr)
 	}()
-	buildErr = func() error {
+	buildErr = func() (physicalErr error) {
 		// A physical build that dies part way must not leave a generation in the
 		// only mutable state forever. Cleanup completes before followers wake, so
 		// a retry cannot re-adopt payload the failed writer left behind.
@@ -443,6 +452,19 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithPreparation(ctx con
 				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generationAbandonTimeout)
 				defer cancel()
 				b.abandon(cleanupCtx, generationID)
+				if failed != nil {
+					cause := physicalErr
+					if cause == nil {
+						// Panic unwinding has no named return error. The outer defer
+						// still completes the flight and re-panics the original value.
+						cause = fmt.Errorf("indexer: payload generation %d exited before publication", generationID)
+					}
+					if err := failed(cleanupCtx, cause); err != nil && physicalErr != nil {
+						// Retain errors.Is for the physical failure. A refused/lost
+						// notification must not make the failed build successful.
+						physicalErr = fmt.Errorf("%w; recording claimed payload failure: %v", physicalErr, err)
+					}
+				}
 			}
 		}()
 		if prepare != nil {

@@ -1317,3 +1317,47 @@ Run ledger: `/private/tmp/gortex-go-package-after.2H03VR/LANDED-VALIDATION.md`
 with the exact 22-file manifest, baseline reproduction, final tests, race runs,
 benchmarks and preserved failures. All validation used private configuration,
 state and storage; the live daemon was not restarted or reconfigured.
+
+
+## 2026-09-10: recover abandoned dedicated build claims
+
+A physical payload could reach `failed` while its dedicated publication still
+said `building`. A same-desire retry then found an incompatible dead generation
+instead of allocating a new attempt. This was reproduced independently of daemon
+startup using actual SQLite full-base and delta claims.
+
+The physical leader now records failure for its exact publication claim after
+bounded payload abandonment and before completing its build flight. Cancellation
+of a follower does not fail the leader. Stale leaders cannot alter newer attempts,
+and panic cleanup preserves the original panic. The existing ordinary preparation
+helper retains its signature; only dedicated builders receive the failure callback.
+
+For a lost notification, normal claim allocation can recognize an exactly matching
+terminal failed payload and atomically allocate/bind a replacement. Owner,
+incarnation, authority floor, desired identity, active-generation CAS, layer/lower
+identity and complete ready parent ancestry remain guards. Missing, retiring,
+foreign or malformed generations are not recoverable. `ExistingGenerationID`
+remains strictly validation-only. Failed payloads are never resurrected, and a
+healthy building or ready replay does not write.
+
+Validation on actual source (private pre-init config/data/cache/state/TMP roots;
+no live daemon or store): 42 store tests and 62 builder/runtime/retirement tests
+passed normally; the same selections passed three times under the race detector
+(126 and 186 passes, respectively), without failures or skips. Five strict new
+physical tests cover full/delta retry, cancelled leaders, stale failure delivery,
+lost notification and original-panic preservation. Four catalog tests cover the
+terminal recovery transition, refusal matrix, invalid ancestry and concurrent
+single allocation. This supersedes the earlier permissive retry characterization.
+
+Three serial 100-iteration SQLite metadata samples measured healthy coalescing at
+125.6–133.3 microseconds before and 121.3–131.3 microseconds after, with 322–323
+versus 322 allocations and zero DML. An intermediate redundant-query regression
+was detected and removed. Terminal recovery measured 270.8–319.5 microseconds,
+301 allocations and exactly two logical DML operations. These are bounded fixture
+measurements, not sustained daemon I/O or SSD NAND-write measurements.
+
+Additional actual-builder characterization: full ready replay 335.1–356.9
+microseconds, delta ready replay 325.0–326.1 microseconds, and empty physical build
+682.2–901.3 microseconds. These after-only figures are not claimed as speedups.
+The integrated startup/global-cohort, lifecycle-finalizer, migration and sustained
+I/O acceptance gates remain separate; this recovery fix alone does not close them.

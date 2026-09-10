@@ -108,8 +108,13 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 	if err != nil {
 		return 0, BuildReport{}, err
 	}
-	return b.buildReservedGenerationWithPreparation(ctx, req, buildPlan{}, BuildReport{}, started, claim.GenerationID,
-		handle, validated.Status != "allocated", prepare)
+	failed := func(ctx context.Context, cause error) error {
+		return b.Store.Catalog().FailDedicatedBaseBuild(ctx, store_sqlite.FailDedicatedBaseBuildRequest{
+			Claim: claim, Error: cause.Error(),
+		})
+	}
+	return b.buildReservedGenerationWithCallbacks(ctx, req, buildPlan{}, BuildReport{}, started, claim.GenerationID,
+		handle, validated.Status != "allocated", prepare, failed)
 }
 
 // Until this function returns the source, the physical runner cannot own it.

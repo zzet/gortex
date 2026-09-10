@@ -406,6 +406,26 @@ func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicate
 		if active != req.ExpectedActiveGenerationID {
 			return dedicatedBaseStale("claim active pointer changed")
 		}
+		var buildingGeneration ViewGeneration
+		// A physical leader normally marks both records failed. If its bounded
+		// notification was lost (including process exit), recover only a fully
+		// verified current Failed payload. Validation-only callers must never
+		// enter this allocating path, and a healthy Building row still coalesces.
+		if p.AttemptState == "building" && req.ExistingGenerationID == 0 {
+			if p.Claim.ExpectedActiveGenerationID != active {
+				return dedicatedBaseStale("existing claim active pointer changed")
+			}
+			var failed bool
+			buildingGeneration, failed, err = failedDedicatedBaseClaimTx(ctx, tx, p.Claim)
+			if err != nil {
+				return err
+			}
+			if failed {
+				// Only local state changes here. The replacement binding below is
+				// the sole publication write, in the same guarded transaction.
+				p.AttemptState = "failed"
+			}
+		}
 		if p.AttemptState == "building" || p.AttemptState == "ready" {
 			if p.Claim.ExpectedActiveGenerationID != active {
 				return dedicatedBaseStale("existing claim active pointer changed")
@@ -418,9 +438,15 @@ func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicate
 				if err := validateDedicatedBaseClaimTx(ctx, tx, p.Claim, true); err != nil {
 					return err
 				}
-				g, err := dedicatedBaseGenerationTx(ctx, tx, p.Claim.GenerationID)
-				if err != nil {
-					return err
+				// Ordinary claims already read this row while checking failure
+				// recovery. Reuse it within the same transaction rather than
+				// adding a third metadata query to healthy build coalescing.
+				g := buildingGeneration
+				if req.ExistingGenerationID > 0 {
+					g, err = dedicatedBaseGenerationTx(ctx, tx, p.Claim.GenerationID)
+					if err != nil {
+						return err
+					}
 				}
 				if g.State == ViewGenerationReady || g.State == ViewGenerationSuperseded {
 					if err := validateDedicatedBaseClaimTx(ctx, tx, p.Claim); err != nil {
