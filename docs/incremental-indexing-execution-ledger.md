@@ -787,3 +787,81 @@ command, and the limitation of what it proves.
 - Limitation: this is housekeeping, not evidence about the branch. It does, however, invalidate
   the `go build ./...` arm of the W1 suite, which is recorded as "to be re-run" rather than as a
   pass.
+
+### 2026-09-10 — Dirty inventory split into atomic commits
+
+- Precondition: the worktree tree at `297f5a44` built and vetted clean before any commit was made
+  — `go build ./...` exit 0 (zero output) and `go vet ./internal/graph/... ./internal/graphview/...
+  ./internal/indexer/... ./internal/reconcile/...` exit 0, both from the worktree under the
+  isolated environment (`GOWORK=off GOTOOLCHAIN=local GOFLAGS="-mod=mod -buildvcs=false"
+  GOPROXY=off`), with 15 GiB free. This closes the "inconclusive `go build ./...`" arm recorded in
+  the W1 suite entry above: the failure was the disk incident, not the source.
+- Grouping was derived from actual symbol dependencies, not from file names: package order
+  `internal/graph` → `internal/graph/store_sqlite` → `internal/graphview` →
+  `internal/indexer`/`internal/reconcile` follows `go list` imports, and within each package the
+  cut lines follow cross-file references (for example `overlay.go` needs
+  `OverlayDetachedNodeReader`, `localization_identity_projection.go` needs it too, and
+  `bounded_incoming_sources.go` now delegates to `FindIncomingSourcesScoped`).
+- The dedicated-graph ready-state rename is the one deliberately cross-package commit: the catalog
+  constant, its two production consumers in `internal/indexer` and `internal/reconcile`, and their
+  fixtures land together, because splitting them would leave a history point where a graph the
+  reconciler calls ready is rejected by the catalog.
+
+| # | sha | subject | files |
+| --- | --- | --- | --- |
+| 1 | `b7f6eff0` | graph: allow the dedicated claimed builder to construct a staging graph | 1 |
+| 2 | `84a0ad2b` | graph: audit the checkout that supplied the parity test source | 1 |
+| 3 | `6c65ff8f` | graph: serve detached node identities through the overlay | 3 |
+| 4 | `7d967314` | graph: push identity ownership into the bounded localization readers | 5 |
+| 5 | `33bc0820` | graph: bound incoming-source candidate inspection across composed layers | 6 |
+| 6 | `a7e6f222` | store: separate node identity-only ownership masks from file masks | 7 |
+| 7 | `7dad4460` | store: project node identity summaries for bounded localization | 3 |
+| 8 | `b04bc364` | store: read incoming sources through scoped, budgeted candidate pages | 10 |
+| 9 | `7e67d4e7` | catalog: name the dedicated graph ready state instead of a bare literal | 11 |
+| 10 | `d36573b4` | graphview: compose node-identity ownership into the generation layer | 7 |
+| 11 | `a76cd2a9` | graphview: serve scoped incoming-source candidates from the generation layer | 7 |
+| 12 | `1c708197` | graphview: admit raw repository owners alongside dedicated ones | 7 |
+| 13 | `24755c00` | indexer: pin checkout lifecycle close as permanently terminal | 1 |
+| 14 | `b4e3dbde` | indexer: pin untrack retry against the live cleanup repair timer | 1 |
+| 15 | `05e8fdad` | indexer: cover repository readiness restored at lifecycle seed | 1 |
+| 16 | `6893a89e` | indexer: keep checkout text layer claims out of the file inventory | 1 |
+| 17 | `4ad382da` | indexer: pin the composed view's pathless identity union | 1 |
+| 18 | `b10ded03` | docs: add the incremental indexing execution ledger | 2 |
+
+- Per-commit isolation: every commit was exported on its own with `git archive <sha> | tar -x` into
+  a fixed slot directory and rebuilt there from scratch. All 18 exports returned `go build ./...`
+  exit 0 **and** `go vet` exit 0 over the packages that commit touched — so each commit compiles,
+  and its test files compile, without any later commit. No reordering or `git reset --soft` was
+  needed; the dependency-derived order held on the first pass.
+- Final-HEAD suite at `b10ded03` (harness `validate.sh`, `normal` mode, isolated env, one process
+  per row; `internal/indexer` again split across the five chunk patterns):
+
+| Package | pass | fail | skip | exit | seconds |
+| --- | --- | --- | --- | --- | --- |
+| `internal/graph/store_sqlite` | 1757 | 0 | 2 | 0 | 93.79 |
+| `internal/graph` | 522 | 0 | 0 | 0 | 4.61 |
+| `internal/graphview` | 435 | 0 | 0 | 0 | 4.84 |
+| `internal/reconcile` | 92 | 0 | 0 | 0 | 2.81 |
+| `internal/indexer` chunk 1 | 527 | 0 | 0 | 0 | 111.89 |
+| `internal/indexer` chunk 2 | 502 | 0 | 1 | 0 | 132.96 |
+| `internal/indexer` chunk 3 | 482 | 0 | 1 | 0 | 117.53 |
+| `internal/indexer` chunk 4 | 510 | 0 | 0 | 0 | 119.37 |
+| `internal/indexer` chunk 5 | 532 | 0 | 0 | 0 | 104.22 |
+| **Total** | **5359** | **0** | **4** | — | — |
+
+- Named skips, all four with their exact reason strings and none newly introduced:
+  `TestBundlePackageKeyNeverUsesOSSeparator` (`bundle_cache_test.go:111`, "separator matches the
+  contract on this platform"), `TestMetaBlobCensus` (`meta_census_probe_test.go:17`, needs
+  `GORTEX_BENCH_STORE`), `TestBackendBench` (`zzbench_backends_test.go:39`, needs
+  `GORTEX_BENCH_ROOT`/`GORTEX_BENCH_BACKEND`), `TestMeasureEditLatency`
+  (`editlatency_measure_test.go:26`, needs `GORTEX_MEASURE_REPO`).
+- `TestSparseGenerationClaimsPathlessIdentities` — the single failure in the earlier W1 suite —
+  passes here, inside chunk 4, as the rewritten positive regression carried by commit `4ad382da`.
+- Source identity: the `internal/indexer` normal test binary at final HEAD hashes to
+  `9995fdf618f74b85cff701984656a9dd62b1529bba96ea11382f7db9ace9c3a1`, byte-identical to the binary
+  the W1 lane recorded before the split, so the commit boundaries moved no indexer source.
+- Not committed, by decision: `docs/incremental-indexing-handoff-2026-09-10.md` stays untracked.
+- Limitation: per-commit verification is compile + vet, not test execution. An intermediate commit
+  can therefore be red — for instance the store's generation capability checklist gains its three
+  incoming-source interface rows one commit after the graph package declares the interfaces. Only
+  the final HEAD is claimed green.
