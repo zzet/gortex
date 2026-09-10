@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 var errDedicatedBaseRuntimeInput = errors.New("invalid dedicated base runtime input")
@@ -130,7 +131,7 @@ func (r *dedicatedBaseRuntime) install(ctx context.Context, req store_sqlite.Acq
 	return &dedicatedBasePublisher{runtime: r, authority: authority}, nil
 }
 
-func (p *dedicatedBasePublisher) ensureInitial(ctx context.Context, observe func(context.Context) (dedicatedBaseObservation, error)) (dedicatedBaseResult, error) {
+func (p *dedicatedBasePublisher) ensureObserved(ctx context.Context, observe func(context.Context) (dedicatedBaseObservation, error), leases *graphview.LeaseManager) (dedicatedBaseResult, error) {
 	var out dedicatedBaseResult
 	if p == nil || p.runtime == nil || p.runtime.store == nil || observe == nil {
 		return out, fmt.Errorf("%w: ensure requires publisher, store and observer", errDedicatedBaseRuntimeInput)
@@ -166,6 +167,7 @@ func (p *dedicatedBasePublisher) ensureInitial(ctx context.Context, observe func
 	if !found || graph.ActiveGenerationID != observation.ExpectedActiveGenerationID {
 		return out, fmt.Errorf("%w: observed active generation changed", store_sqlite.ErrCatalogStaleGuard)
 	}
+	var parentID int64
 	if graph.ActiveGenerationID > 0 {
 		active, found, err := catalog.GetViewGeneration(ctx, graph.ActiveGenerationID)
 		if err != nil {
@@ -176,12 +178,18 @@ func (p *dedicatedBasePublisher) ensureInitial(ctx context.Context, observe func
 		}
 		activeIdentity := store_sqlite.DedicatedBaseIdentity{TreeOID: active.TreeOID, ConfigHash: active.ConfigHash,
 			ExtractorVersions: active.ExtractorVersions, ResolverVersion: active.ResolverVersion}
-		if activeIdentity != identity {
+		if activeIdentity != identity && leases == nil {
 			return out, &dedicatedBaseAdvanceRequiredError{GraphID: p.authority.GraphID,
 				ActiveGenerationID: active.GenerationID, Active: activeIdentity, Observed: identity}
 		}
-		if active.BaseGenerationID != 0 || active.LayerID != "" || active.LowerViewFingerprint != "" {
+		if leases == nil && (active.BaseGenerationID != 0 || active.LayerID != "" || active.LowerViewFingerprint != "") {
 			return out, fmt.Errorf("%w: initial runtime cannot consume active ancestry", store_sqlite.ErrDedicatedBaseCandidate)
+		}
+		if activeIdentity != identity {
+			parentID, err = dedicatedBaseParentForAdvance(ctx, catalog, p.authority, active, identity)
+			if err != nil {
+				return out, err
+			}
 		}
 	}
 	// The runtime gate covers its own adoption calls, but external publishers
@@ -196,21 +204,24 @@ func (p *dedicatedBasePublisher) ensureInitial(ctx context.Context, observe func
 	if _, err := rand.Read(token[:]); err != nil {
 		return out, fmt.Errorf("indexer: generate dedicated base attempt token: %w", err)
 	}
-	out.Claim, err = catalog.ClaimDedicatedBaseBuild(ctx, store_sqlite.ClaimDedicatedBaseBuildRequest{
+	claimRequest := store_sqlite.ClaimDedicatedBaseBuildRequest{
 		Desire: desire, ExpectedActiveGenerationID: graph.ActiveGenerationID, AttemptToken: hex.EncodeToString(token[:]),
 		ProvenanceCommitOID: observation.ProvenanceCommitOID, CreatedAt: observation.CreatedAt,
-	})
+		BaseGenerationID: parentID,
+	}
+	if parentID > 0 {
+		claimRequest.LayerID = fmt.Sprintf("dedicated-delta:%d", parentID)
+		claimRequest.LowerViewFingerprint = fmt.Sprintf("dedicated:%s:%d", p.authority.GraphID, parentID)
+	}
+	out.Claim, err = catalog.ClaimDedicatedBaseBuild(ctx, claimRequest)
 	if err != nil {
 		return out, err
 	}
-	if out.Claim.BaseGenerationID != 0 || out.Claim.LayerID != "" || out.Claim.LowerViewFingerprint != "" {
+	if leases == nil && (out.Claim.BaseGenerationID != 0 || out.Claim.LayerID != "" || out.Claim.LowerViewFingerprint != "") {
 		return out, fmt.Errorf("%w: initial runtime cannot consume a claimed delta", store_sqlite.ErrDedicatedBaseCandidate)
 	}
 	release() // No graph observation gate across physical work or follower waits.
-	id, report, err := observation.Builder.BuildClaimedDedicatedBase(ctx, ClaimedDedicatedBaseRequest{
-		Claim: out.Claim, RootPath: observation.RootPath, WorkspaceID: observation.WorkspaceID,
-		ProjectID: observation.ProjectID, PrePublish: observation.PrePublish,
-	})
+	id, report, err := p.buildObservedClaim(ctx, observation, out.Claim, leases)
 	out.Report = report
 	if err != nil {
 		// A canceled flight follower does not own the physical attempt. Never

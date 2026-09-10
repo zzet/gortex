@@ -4,6 +4,45 @@ Status: implementation in progress. This document separates observed behavior,
 required invariants, implementation stages, and measured results. A passing
 microbenchmark is not an end-to-end disk-usage verdict.
 
+## 2026-09-10: guarded committed-base advancement component
+
+The new `ensureCurrent` primitive shares initial publication's authority and
+observe-through-claim ordering, then builds outside the graph gate and adopts
+through the existing guarded catalog transaction. It requires the shared reader
+lease domain. The original `ensureInitial` remains initial-only. Neither entry
+point is newly activated in daemon startup, watchers, or Git callbacks by this
+component; choosing the default advancement trigger remains separate.
+
+Compatible committed changes propose a sparse parent; policy changes and active
+chains of 32 ancestors propose a full root. This is a provisional allocation
+policy, not compaction or a production write bound. Historical ready reuse still
+uses the catalog's hard 64-generation ancestry limit. A pre-authority active
+pointer is only a CAS fence: reconstruct its committed tree from Git rather than
+trusting legacy dirty payload. Dispatch uses the actual catalog-returned parent,
+including historical reuse, and pins the complete lower ancestry during a build.
+
+Actual-source validation: 20 focused tests passed normally and all 60 repetitions
+passed under the race detector. Resolver/indexer/serverstack vet and lint passed.
+The initial legacy-upgrade fixture duplicated an already registered Git family;
+it was corrected to reuse the fixture's actual owner binding, without weakening
+any legacy-payload exclusion assertions. The failed run is retained as evidence.
+
+Three serial, non-race, 100-iteration component benchmark runs measured ready
+replay at 661–699 microseconds/op, about 71 KB and 1,863 allocations/op, with an
+unavailable Git root and zero trigger-audited publication/generation writes.
+Small-fixture growing ancestry measured 182–187 ms/op and 6.56 MB/op, with three
+full reseeds and 2.03 indexed paths/op across 100 advancements. Git fixture commit
+creation is excluded. These results do not measure daemon cold/warm indexing,
+large-repository scaling, total SQLite bytes, or SSD writes.
+
+The failure characterization exposed a separate blocker: payload state becomes
+`failed` while its publication attempt remains `building`, and a same-desire
+retry is rejected. Passing that characterization does not mean recovery is
+fixed. Physical-leader failure notification and guarded crash-state recovery
+remain required, as do global enrichment/read-write integration, lifecycle
+admission, end-to-end routing, and sustained disk-I/O validation.
+
+
 ## Problem
 
 A small source edit can trigger work at several different scales:
