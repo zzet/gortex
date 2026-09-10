@@ -34,9 +34,14 @@ func (e *dedicatedBaseAdvanceRequiredError) Unwrap() error { return errDedicated
 // observation callers. It retains no observed config, builder or content source.
 // Startup must call it directly, not through a gate that startup itself opens.
 type dedicatedBaseRuntime struct {
-	store *store_sqlite.Store
-	mu    sync.Mutex
-	gates map[string]*dedicatedBaseObservationGate
+	store                *store_sqlite.Store
+	mu                   sync.Mutex
+	gates                map[string]*dedicatedBaseObservationGate
+	ownerAdmissions      map[string]*dedicatedBaseOwnerAdmission
+	admittedActors       int
+	admissionClosed      bool
+	admissionDrain       chan struct{}
+	admissionDrainClosed bool
 }
 
 type dedicatedBaseObservationGate struct {
@@ -47,6 +52,7 @@ type dedicatedBaseObservationGate struct {
 type dedicatedBasePublisher struct {
 	runtime   *dedicatedBaseRuntime
 	authority store_sqlite.DedicatedBaseAuthority
+	admission *dedicatedBaseOwnerAdmission
 }
 
 // All fields must come from one fresh observation made inside ensureInitial's
@@ -119,6 +125,11 @@ func (r *dedicatedBaseRuntime) install(ctx context.Context, req store_sqlite.Acq
 	if r == nil || r.store == nil {
 		return nil, fmt.Errorf("%w: installation requires a store", errDedicatedBaseRuntimeInput)
 	}
+	actorRelease, admission, err := r.admitOwnerState(ctx, req.GraphID, req.Owner, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer actorRelease()
 	release, err := r.acquire(ctx, req.GraphID)
 	if err != nil {
 		return nil, err
@@ -128,7 +139,10 @@ func (r *dedicatedBaseRuntime) install(ctx context.Context, req store_sqlite.Acq
 	if err != nil {
 		return nil, err
 	}
-	return &dedicatedBasePublisher{runtime: r, authority: authority}, nil
+	if err := r.confirmOwner(req.GraphID, authority.Owner); err != nil {
+		return nil, err
+	}
+	return &dedicatedBasePublisher{runtime: r, authority: authority, admission: admission}, nil
 }
 
 func (p *dedicatedBasePublisher) ensureObserved(ctx context.Context, observe func(context.Context) (dedicatedBaseObservation, error), leases *graphview.LeaseManager) (dedicatedBaseResult, error) {
@@ -137,6 +151,11 @@ func (p *dedicatedBasePublisher) ensureObserved(ctx context.Context, observe fun
 		return out, fmt.Errorf("%w: ensure requires publisher, store and observer", errDedicatedBaseRuntimeInput)
 	}
 	r := p.runtime
+	actorRelease, _, err := r.admitOwnerState(ctx, p.authority.GraphID, p.authority.Owner, p.admission)
+	if err != nil {
+		return out, err
+	}
+	defer actorRelease()
 	release, err := r.acquire(ctx, p.authority.GraphID)
 	if err != nil {
 		return out, err
@@ -150,6 +169,9 @@ func (p *dedicatedBasePublisher) ensureObserved(ctx context.Context, observe fun
 	}
 	if !found || publication.Desire.Authority != p.authority {
 		return out, fmt.Errorf("%w: publisher authority changed", store_sqlite.ErrCatalogStaleGuard)
+	}
+	if err := r.confirmOwner(p.authority.GraphID, p.authority.Owner); err != nil {
+		return out, err
 	}
 	observation, err := observe(ctx)
 	if err != nil {

@@ -1361,3 +1361,36 @@ microseconds, delta ready replay 325.0–326.1 microseconds, and empty physical 
 682.2–901.3 microseconds. These after-only figures are not claimed as speedups.
 The integrated startup/global-cohort, lifecycle-finalizer, migration and sustained
 I/O acceptance gates remain separate; this recovery fix alone does not close them.
+
+## 2026-09-10: counted dedicated publisher admission
+
+Publisher installation and observation now acquire an owner-scoped actor before
+waiting for the observation gate or accessing the catalog. That actor remains
+counted through physical work and adoption. Closing admission is nonblocking,
+does no SQL, rejects new work and returns a drain channel for existing actors.
+Runtime shutdown separately joins all admitted actors; physical flights and
+catalog writers still require their own lifecycle drains.
+
+Installed publishers capture the exact local admission slot. Authorized
+re-registration creates a new slot only after the old closing slot drains; even
+identical graph/checkout/incarnation values cannot revive an old publisher.
+Invalid installations do not permanently bind an alleged owner or retain idle
+unconfirmed slots. A concurrent valid installer keeps its shared slot alive.
+Durable cleanup authorization must precede local closure; stale lifecycle close
+callbacks still need their own captured-handle guard. Final cleanup must also
+reclaim local revocation state using an exact capability, not an owner tuple.
+
+Twelve new tests plus 25 existing runtime/advancement/failure controls passed on
+actual source (37 normal passes; 111 passes under three race repetitions).
+Indexer and serverstack vet/lint passed. Tests cover blocked observation,
+physical tails, cancellation, same-owner retracking, independent-owner shutdown,
+concurrent release and bounded invalid-install state. All runs used private
+pre-init environment roots and did not start or restart a daemon.
+
+Three serial 100-iteration samples measured ready replay at 414.3–435.2
+microseconds before and 415.4–430.5 microseconds after. The new bookkeeping adds
+64 bytes and two allocations per replay (1061 to 1063 allocations in the fixture).
+Its standalone hot-admission characterization was 64.6–109.2 nanoseconds; the
+short sample is not a sustained-throughput claim. Ready and rejected stale
+publisher tests assert no catalog writes. Full lifecycle/global-cohort and E2E
+acceptance remain separate from this admission primitive.
