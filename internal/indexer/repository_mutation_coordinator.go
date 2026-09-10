@@ -86,8 +86,9 @@ type repositoryMutationWaiter struct {
 type repositoryMutationCoordinator struct {
 	mu sync.Mutex
 
-	lane chan struct{}
-	work sync.WaitGroup
+	lane       chan struct{}
+	work       sync.WaitGroup
+	closeDrain chan struct{}
 
 	// batchMutationGate is shared by every stable repository lane owned by a
 	// MultiIndexer. Admission takes the read side before a lane: a queued batch
@@ -327,8 +328,16 @@ func (c *repositoryMutationCoordinator) wait(ctx context.Context) error {
 }
 
 func (c *repositoryMutationCoordinator) closeAndWait(ctx context.Context) error {
-	c.closeAdmission()
-	return c.wait(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := c.closeAndDrain()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type repositoryMutationCoordinatorStats struct {

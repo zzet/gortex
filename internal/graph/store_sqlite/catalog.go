@@ -946,6 +946,9 @@ func (c *Catalog) SetPrimaryDedicatedGraph(ctx context.Context, req SetPrimaryDe
 		return err
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateDedicatedGraphAdmissionTx(ctx, tx, req.GraphID); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `
 UPDATE repository_families
    SET primary_epoch = primary_epoch + 1, last_seen = ?
@@ -1019,15 +1022,11 @@ func (c *Catalog) CreateViewGeneration(ctx context.Context, generation ViewGener
 	if err := generation.validate(); err != nil {
 		return 0, err
 	}
-	if generation.BaseGenerationID <= 0 {
-		result, err := c.exec(ctx, insertViewGenerationSQL, viewGenerationInsertArgs(generation)...)
-		if err != nil {
-			return 0, err
-		}
-		return result.LastInsertId()
-	}
 	var generationID int64
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateDedicatedGraphAdmissionTx(ctx, tx, generation.GraphID); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, insertViewGenerationSQL, viewGenerationInsertArgs(generation)...)
 		if err != nil {
 			return err
@@ -1035,6 +1034,9 @@ func (c *Catalog) CreateViewGeneration(ctx context.Context, generation ViewGener
 		generationID, err = result.LastInsertId()
 		if err != nil {
 			return err
+		}
+		if generation.BaseGenerationID <= 0 {
+			return nil
 		}
 		return validateViewGenerationAdmissionTx(ctx, tx, generation.BaseGenerationID)
 	})
@@ -1245,6 +1247,9 @@ func (c *Catalog) AdoptOrCreateViewGeneration(ctx context.Context, generation Vi
 		adopted      bool
 	)
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateDedicatedGraphAdmissionTx(ctx, tx, generation.GraphID); err != nil {
+			return err
+		}
 		if generation.LayerID != "" {
 			err := tx.QueryRowContext(ctx, buildingViewGenerationMatchSQL,
 				string(ViewGenerationBuilding), generation.GraphID, generation.OwnerKind,
@@ -1501,6 +1506,9 @@ func (c *Catalog) UpsertCheckoutRoute(ctx context.Context, route CheckoutRoute) 
 		return err
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateDedicatedGraphAdmissionTx(ctx, tx, route.GraphID); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO checkout_routes
   (checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state)
@@ -1662,6 +1670,9 @@ func (c *Catalog) FlipCheckoutRoute(ctx context.Context, req FlipCheckoutRouteRe
 		return err
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateDedicatedGraphAdmissionTx(ctx, tx, req.GraphID); err != nil {
+			return err
+		}
 		err := execGuardedTx(ctx, tx, fmt.Sprintf("route for checkout %s at epoch %d", req.CheckoutID, req.ExpectedRouteEpoch), `
 UPDATE checkout_routes
    SET graph_id = ?, commit_generation_id = ?, dirty_generation_id = ?,
@@ -1712,6 +1723,9 @@ func (c *Catalog) FlipCheckoutRouteSlot(ctx context.Context, req FlipCheckoutRou
 		return err
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateRouteGraphAdmissionTx(ctx, tx, req.CheckoutID); err != nil {
+			return err
+		}
 		err := execGuardedTx(ctx, tx,
 			fmt.Sprintf("%s slot of route for checkout %s at epoch %d", req.Slot, req.CheckoutID, req.ExpectedRouteEpoch),
 			flipRouteSlotSQL[req.Slot],
@@ -1758,6 +1772,9 @@ func (c *Catalog) UpsertRefView(ctx context.Context, view RefView) error {
 		return err
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateDedicatedGraphAdmissionTx(ctx, tx, view.GraphID); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, insertRefViewSQL+`
 ON CONFLICT(ref_view_id) DO UPDATE SET
   graph_id                  = excluded.graph_id,
@@ -1800,6 +1817,9 @@ func (c *Catalog) GetOrCreateRefView(ctx context.Context, view RefView) (RefView
 		return RefView{}, err
 	}
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateDedicatedGraphAdmissionTx(ctx, tx, view.GraphID); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, insertRefViewSQL+` ON CONFLICT DO NOTHING`, refViewInsertArgs(view)...)
 		if err != nil {
 			return err
@@ -1844,7 +1864,11 @@ func (c *Catalog) UpdateRefViewDesire(ctx context.Context, req UpdateRefViewDesi
 	if err := requireCatalogValue("state", req.State, refViewStates); err != nil {
 		return err
 	}
-	return c.execGuarded(ctx, fmt.Sprintf("ref view %s", req.RefViewID), `
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateRefGraphAdmissionTx(ctx, tx, req.RefViewID); err != nil {
+			return err
+		}
+		return execGuardedTx(ctx, tx, fmt.Sprintf("ref view %s", req.RefViewID), `
 UPDATE ref_views
    SET desired_ref = ?, desired_commit = ?, desired_tree = ?,
        desired_build_fingerprint = ?, state = ?,
@@ -1852,10 +1876,11 @@ UPDATE ref_views
        route_epoch = route_epoch +
            (CASE WHEN desired_tree = ? AND desired_build_fingerprint = ? THEN 0 ELSE 1 END)
  WHERE ref_view_id = ?`,
-		req.DesiredRef, req.DesiredCommit, req.DesiredTree,
-		req.DesiredBuildFingerprint, string(req.State),
-		req.LastResolved, req.LastSelected,
-		req.DesiredTree, req.DesiredBuildFingerprint, req.RefViewID)
+			req.DesiredRef, req.DesiredCommit, req.DesiredTree,
+			req.DesiredBuildFingerprint, string(req.State),
+			req.LastResolved, req.LastSelected,
+			req.DesiredTree, req.DesiredBuildFingerprint, req.RefViewID)
+	})
 }
 
 // AdoptRefViewGeneration points a ref view at a finished build's generation
@@ -1886,6 +1911,9 @@ func (c *Catalog) AdoptRefViewGeneration(ctx context.Context, req AdoptRefViewGe
 		}
 	}
 	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateRefGraphAdmissionTx(ctx, tx, req.RefViewID); err != nil {
+			return err
+		}
 		if req.BuildID != "" {
 			err := execGuardedTx(ctx, tx, fmt.Sprintf("ref view build %s", req.BuildID), `
 UPDATE ref_view_builds SET state = ?, generation_id = ?, last_progress = ?, error = ''
@@ -2067,7 +2095,11 @@ func (c *Catalog) UpsertRefViewBuild(ctx context.Context, build RefViewBuild) er
 	if err := build.validate(); err != nil {
 		return err
 	}
-	_, err := c.exec(ctx, insertRefViewBuildSQL+`
+	return c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateRefBuildUpsertAdmissionTx(ctx, tx, build); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, insertRefViewBuildSQL+`
 ON CONFLICT(build_id) DO UPDATE SET
   ref_view_id          = excluded.ref_view_id,
   desired_ref          = excluded.desired_ref,
@@ -2083,8 +2115,9 @@ ON CONFLICT(build_id) DO UPDATE SET
   created_at           = excluded.created_at,
   last_progress        = excluded.last_progress,
   error                = excluded.error`,
-		refViewBuildInsertArgs(build)...)
-	return err
+			refViewBuildInsertArgs(build)...)
+		return err
+	})
 }
 
 // abandonedRefViewBuildError is what a reclaimed attempt records as its cause.
@@ -2128,6 +2161,9 @@ func (c *Catalog) ClaimRefViewBuild(
 		reclaimed bool
 	)
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := validateRefGraphAdmissionTx(ctx, tx, build.RefViewID); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx, insertRefViewBuildSQL, refViewBuildInsertArgs(build)...)
 		if err == nil {
 			return nil

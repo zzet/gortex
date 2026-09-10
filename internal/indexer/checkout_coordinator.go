@@ -253,8 +253,9 @@ type CheckoutCoordinator struct {
 	cycleMu sync.Mutex
 
 	mu sync.Mutex
-	// Source mutations are admitted under mu and joined by CloseContext before
-	// lifecycle teardown can retire the checkout while its disk writer runs.
+	// External source mutations and off-route RehomeTo builds are admitted
+	// under mu and joined by CloseContext before lifecycle teardown retires
+	// the checkout. The loop itself is joined separately through done.
 	sourceMutationsClosing bool
 	sourceMutations        int
 	sourceMutationsDrained chan struct{}
@@ -829,15 +830,15 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	if c == nil {
 		return out, errors.New("indexer: no coordinator to rehome")
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	if !c.admitSourceMutation() {
+		return out, context.Canceled
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	stopLifetimeCancel := context.AfterFunc(c.lifetimeContext(), cancel)
-	defer func() {
-		stopLifetimeCancel()
-		cancel()
-	}()
+	defer c.releaseSourceMutation()
+	ctx, cancel := checkoutMutationContext(ctx, c.lifetimeContext())
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
 	// Lock before lane, as cycle does; the rebuild budget and the coordinator
 	// lifetime bound the lock wait as they bound the lane wait.
 	if err := acquireCycleLock(ctx, c); err != nil {
@@ -849,6 +850,10 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
 	}
 	defer release()
+
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
 
 	dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {

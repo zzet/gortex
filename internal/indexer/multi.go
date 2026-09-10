@@ -59,12 +59,13 @@ type RepoMetadata struct {
 // retries from repeating successful payload/vector phases and keeps the stable
 // mutation lane closed until every external side effect commits.
 type repositoryUntrackState struct {
-	mu          sync.Mutex
-	metadata    *RepoMetadata
-	indexer     *Indexer
-	coordinator *repositoryMutationCoordinator
-	contract    DerivedInvalidationPlan
-	finalize    func(*RepoMetadata) error
+	retainAdmission bool
+	mu              sync.Mutex
+	metadata        *RepoMetadata
+	indexer         *Indexer
+	coordinator     *repositoryMutationCoordinator
+	contract        DerivedInvalidationPlan
+	finalize        func(*RepoMetadata) error
 
 	indexerClosed   bool
 	payloadPurged   bool

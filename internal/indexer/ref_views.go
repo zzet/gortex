@@ -220,11 +220,12 @@ type RefViewManagerConfig struct {
 // RefViewManager serves ref views of one store's graphs. It holds no
 // per-request state and is safe to use from many goroutines.
 type RefViewManager struct {
-	store   *store_sqlite.Store
-	catalog *store_sqlite.Catalog
-	builder *SparseGenerationBuilder
-	logger  *zap.Logger
-	gate    *ViewBuildGate
+	lifetime refViewLifetime
+	store    *store_sqlite.Store
+	catalog  *store_sqlite.Catalog
+	builder  *SparseGenerationBuilder
+	logger   *zap.Logger
+	gate     *ViewBuildGate
 
 	configHash string
 	extractors string
@@ -303,6 +304,11 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 	if err := m.validate(&req); err != nil {
 		return RefViewResult{}, err
 	}
+	ctx, release, err := m.lifetime.admit(ctx, false)
+	if err != nil {
+		return RefViewResult{}, err
+	}
+	defer release()
 	base, err := m.base(ctx, req.GraphID)
 	if err != nil {
 		return RefViewResult{}, err
@@ -655,8 +661,15 @@ func (m *RefViewManager) runDetached(
 	// Buffered by one: the grace can end the wait first, and the build must
 	// never block on a receiver that has already answered.
 	done := make(chan outcome, 1)
-	buildCtx := context.WithoutCancel(ctx)
+	buildCtx, releaseBuild, admissionErr := m.lifetime.admit(ctx, true)
+	if admissionErr != nil {
+		closingCtx, cancel := context.WithTimeout(context.Background(), m.writerBudget)
+		defer cancel()
+		m.completeBuild(closingCtx, build, store_sqlite.ViewGenerationFailed, 0, admissionErr.Error())
+		return RefViewResult{}, admissionErr
+	}
 	go func() {
+		defer releaseBuild()
 		stop := m.heartbeat(buildCtx, build)
 		defer stop()
 		release, err := m.gate.Acquire(buildCtx, ViewBuildInteractive)

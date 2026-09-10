@@ -41,6 +41,9 @@ func (c *Catalog) upsertDedicatedGraphIdentity(ctx context.Context, dedicated De
 		if err != nil {
 			return err
 		}
+		if existing.State == DedicatedGraphClosing {
+			return fmt.Errorf("%w: graph %s", ErrCatalogGraphClosing, existing.GraphID)
+		}
 		existing.OwnerCheckoutID, existing.ActiveGenerationID = owner.String, active.Int64
 		existing.IsPrimaryBase = primary != 0
 

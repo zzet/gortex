@@ -1465,3 +1465,78 @@ existing empty-revision ready replay measured 437.6–443.1 microseconds before 
 nonempty-revision replay measured 437.0–448.7 microseconds and 1,099 allocations.
 These measurements support the narrowly scoped replay repair, not a throughput
 improvement or completion of the sustained write-amplification acceptance gate.
+
+### Repository cleanup must drain the exact owner before retiring payload
+
+Removing a checkout or repository is not just a catalog-row deletion. A publisher,
+checkout coordinator, ref-view builder, ordinary source-mutation worker, or pinned
+reader can still hold the old registration. Releasing graph references or deleting
+payload before those actors finish can invalidate an admitted request. A late
+completion can also accidentally reopen or finalize a replacement registration
+when an identifier is reused. Repeated cleanup requests must join the same work,
+not start independent deletion loops or abandon the actor when one caller times out.
+
+The cleanup protocol now makes the ordering explicit:
+
+1. Commit the durable closing state and withdraw new admission for the selected
+   owner. New references into a closing graph are rejected in the same catalog
+   transaction that would create them.
+2. Stop and join producers, checkout coordinators and ref-view builders. Drain
+   ordinary source mutation, physical build flights, and admitted reader leases.
+   A canceled follower does not cancel or falsely complete the cleanup leader.
+3. Release catalog references only after these drains complete. Retire descendant
+   generations newest first; do not use a result cap that can silently leave an
+   older generation behind. Retirement and final deletion use the same complete
+   reference predicate, including the current dedicated publication association.
+4. Clean the selected graph's legacy rows and tracking configuration, delete its
+   logical catalog state, and finish the cleanup journal. Retained independently
+   dedicated graphs remain outside the primary-and-dependent-overlay deletion.
+5. Finalize only the captured registration. Registration tokens, exact completion
+   handles and cleanup-attempt compare-and-swap guards prevent a delayed old actor
+   from closing a newly installed registration with the same graph identifier.
+
+Multi-indexer cleanup retains the original four-argument untrack compatibility
+wrapper. The internal retaining-admission path can keep a completed drain closed
+through catalog/config cleanup; its retention decision is monotonic when callers
+join existing cleanup work. There is one cached close waiter per actor, not one
+unbounded goroutine per polling request. Completion callbacks run outside owner
+mutexes, and registration drain is not awaited while holding registry locks.
+
+Shutdown follows the same ownership ordering. The janitor receives cancellation
+and is joined, including the existing reconciliation tail that cannot be interrupted
+mid-call. Shared-server cleanup closes MCP request ownership before repository
+lifecycle ownership, then the multi-indexer/indexer, and finally the shared Store.
+Cancellation is not a substitute for waiting before closing a resource still in use.
+
+The component adds 64 top-level regressions across actual SQLite catalog cleanup,
+ref-build admission, reader and publisher registration, mutation-lane draining,
+cleanup attempt replay, identifier reuse, janitor lifetime and server close order.
+All 64 passed normal execution. Broader race selections ran three times each:
+
+| Package | Selected top-level tests | Passing race executions |
+| --- | ---: | ---: |
+| SQLite store | 137 | 411 |
+| Graph-view composition | 121 | 363 |
+| Indexer | 70 | 210 |
+| Reconciliation | 62 | 186 |
+| Shared server | 1 | 3 |
+| CLI daemon lifetime | 1 | 3 |
+
+Vet and lint passed all six package scopes with zero reported issues. A combined
+SQLite race invocation initially exceeded the harness's eight-minute aggregate
+limit during its third repetition; the identical 137-test selection passed after
+splitting it into bounded groups, still with three repetitions per test. This is
+not presented as either a product deadlock or a reduced test selection.
+
+Four isolated 100-iteration microbenchmarks cover cleanup execution admission,
+runtime owner finalization, prepared registration, and waiting for physical build
+flights. Uncontended execution admission measured 287 ns/464 bytes/7 allocations;
+runtime owner finalization measured 335 ns/432 bytes/4 allocations; prepared
+registration measured 491–733 ns/952 bytes/9 allocations. Flight-wait measurements
+were too short and variable to support a scaling claim. These are absolute small
+fixture costs, not paired proof of lower disk I/O.
+
+This commit establishes cleanup ownership and regression coverage. It does not
+by itself activate immutable primary publication, prove every public request is
+bound to the correct positive generation, or replace the required isolated
+end-to-end removal/recreation and sustained-I/O acceptance runs.

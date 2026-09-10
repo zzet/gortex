@@ -41,6 +41,11 @@ func (l *CheckoutLifecycle) EnsureRefView(ctx context.Context, sel RefViewSelect
 	if l == nil || l.store == nil || l.catalog == nil {
 		return RefViewResult{}, fmt.Errorf("indexer: this daemon serves no ref views")
 	}
+	ownerRead, err := l.AcquireRepositoryRead(sel.GraphID)
+	if err != nil {
+		return RefViewResult{}, err
+	}
+	defer ownerRead.Release()
 	dedicated, found, err := l.catalog.GetDedicatedGraph(ctx, sel.GraphID)
 	if err != nil {
 		return RefViewResult{}, err
@@ -89,6 +94,9 @@ func (l *CheckoutLifecycle) RefViewGeneration(ctx context.Context, refViewID str
 func (l *CheckoutLifecycle) refViewManager(repoPrefix string, idx *Indexer) (*RefViewManager, error) {
 	l.refViewMu.Lock()
 	defer l.refViewMu.Unlock()
+	if _, closing := l.closingRefViews[repoPrefix]; l.refViewsClosed || closing {
+		return nil, ErrRefViewManagerClosed
+	}
 	if manager, cached := l.refViews[repoPrefix]; cached {
 		return manager, nil
 	}

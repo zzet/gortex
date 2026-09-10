@@ -725,8 +725,9 @@ func startReconcileJanitor(
 		logger.Info("daemon: reconcile janitor disabled")
 		return func() {}
 	}
-	stop := make(chan struct{})
+	janitorCtx, janitorDone, stop := newReconcileJanitorLifetime()
 	go func() {
+		defer close(janitorDone)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		logger.Info("daemon: reconcile janitor running", zap.Duration("interval", interval))
@@ -739,7 +740,7 @@ func startReconcileJanitor(
 
 					swept := 0
 					if lifecycle != nil {
-						report, err := lifecycle.Sweep(context.Background())
+						report, err := lifecycle.Sweep(janitorCtx)
 						if err != nil {
 							logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
 						}
@@ -749,6 +750,9 @@ func startReconcileJanitor(
 								zap.Int("count", swept),
 								zap.Int("families", report.Families))
 						}
+					}
+					if janitorCtx.Err() != nil {
+						return swept, 0
 					}
 					results := mi.ReconcileAll()
 					reconciled := 0
@@ -764,12 +768,12 @@ func startReconcileJanitor(
 				if reconciled > 0 || gcedCount > 0 {
 					releaseMemoryToOS(logger, "reconcile_janitor")
 				}
-			case <-stop:
+			case <-janitorCtx.Done():
 				return
 			}
 		}
 	}()
-	return func() { close(stop) }
+	return stop
 }
 
 // daemonStartAcceptedFlags returns every flag the re-exec'd `daemon start`

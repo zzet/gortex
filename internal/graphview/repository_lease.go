@@ -85,35 +85,7 @@ type RepositoryDrain struct {
 // After finalization, registering an owner is a new privileged lifecycle action;
 // callers must revalidate its catalog authority, never replay an old snapshot.
 func (m *LeaseManager) RegisterRepositoryOwner(owner RepositoryOwner) error {
-	if m == nil || !owner.valid() {
-		return ErrRepositoryOwnerInvalid
-	}
-	r := &m.repositories
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.stopped {
-		return ErrRepositoryAdmissionsStopped
-	}
-	if current := r.byPrefix[owner.RepoPrefix]; current != nil {
-		if current.owner != owner {
-			return fmt.Errorf("%w: prefix %q", ErrRepositoryOwnerConflict, owner.RepoPrefix)
-		}
-		if current.closing {
-			return fmt.Errorf("%w: prefix %q", ErrRepositoryAdmissionClosed, owner.RepoPrefix)
-		}
-		return nil
-	}
-	if r.byGraph[owner.GraphID] != nil {
-		return fmt.Errorf("%w: graph %q", ErrRepositoryOwnerConflict, owner.GraphID)
-	}
-	if r.byPrefix == nil {
-		r.byPrefix = make(map[string]*repositoryOwnerState)
-		r.byGraph = make(map[string]*repositoryOwnerState)
-	}
-	state := &repositoryOwnerState{owner: owner}
-	r.byPrefix[owner.RepoPrefix] = state
-	r.byGraph[owner.GraphID] = state
-	return nil
+	return m.RegisterRepositoryOwnerPrepared(owner, nil)
 }
 
 // AcquireRepositoryRead atomically pins an explicit owner scope or pins none

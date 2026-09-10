@@ -144,9 +144,20 @@ type CheckoutLifecycle struct {
 	catalog *store_sqlite.Catalog
 	store   *store_sqlite.Store
 	leases  *graphview.LeaseManager
-	rec     *reconcile.Reconciler
-	logger  *zap.Logger
-	now     func() time.Time
+
+	// Owner registration and closure share this lock; serving acquisition is
+	// registry-only and always precedes the reader's catalog snapshot.
+	repositoryAdmissionMu       sync.Mutex
+	repositoryOwners            map[string]graphview.RepositoryOwner
+	repositoryClosing           map[string]*graphview.RepositoryDrain
+	repositoryAdmissionsClosed  bool
+	dedicatedBaseCleanupRuntime DedicatedBaseCleanupRuntime
+	repositoryCleanupMu         sync.Mutex
+	repositoryCleanup           *repositoryCleanupRuntime
+	repositoryCleanupClosed     bool
+	rec                         *reconcile.Reconciler
+	logger                      *zap.Logger
+	now                         func() time.Time
 	// buildingRecoveryCutoff is this lifecycle process's start. A building
 	// generation older than it cannot have been created by this process and is
 	// crash residue unless a process-local payload flight has adopted it.
@@ -224,8 +235,10 @@ type CheckoutLifecycle struct {
 
 	// refViewMu guards the per-repository ref-view manager cache alone. A
 	// manager holds no per-request state, so the lock covers only the map.
-	refViewMu sync.Mutex
-	refViews  map[string]*RefViewManager
+	refViewMu       sync.Mutex
+	refViews        map[string]*RefViewManager
+	closingRefViews map[string]*repositoryRefViewDrain
+	refViewsClosed  bool
 	// refViewRetention bounds how much ref-view payload survives a sweep.
 	refViewRetention RefViewRetention
 	// indexBarrier is the promotion's test seam; nil in production.
@@ -542,6 +555,9 @@ func (l *CheckoutLifecycle) recordCheckout(
 	if l.catalog == nil || prefix == "" {
 		return checkoutIdentity{}, nil
 	}
+	if l.RepositoryAdmissionClosed(prefix) {
+		return checkoutIdentity{}, graphview.ErrRepositoryAdmissionClosed
+	}
 	root = pathkey.CanonicalExistingRoot(root)
 	inv, err := gitstate.Inventory(ctx, root)
 	if err != nil {
@@ -807,6 +823,9 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 				store_sqlite.ErrCatalogStaleGuard, checkoutID, existing.GraphID, existing.FamilyID,
 			)
 		}
+		if err := l.RegisterRepositoryOwner(ctx, existing.GraphID); err != nil {
+			return "", true, err
+		}
 		return existing.GraphID, true, nil
 	}
 	if graphID, found, err := reuseOwner(); found || err != nil {
@@ -843,6 +862,9 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 			}
 			return "", retryErr
 		}
+	}
+	if err := l.RegisterRepositoryOwner(ctx, graphID); err != nil {
+		return "", err
 	}
 	return graphID, nil
 }
@@ -1028,7 +1050,7 @@ func (l *CheckoutLifecycle) applyUntrack(
 		}
 		if outcome.err != nil {
 			out.Pending = true
-			return out, outcome.err
+			return repositoryCleanupUntrackResult(out, outcome.err)
 		}
 		out.Demoted = outcome.demoted
 	case UntrackPlanPrimaryClosure:
@@ -1037,7 +1059,7 @@ func (l *CheckoutLifecycle) applyUntrack(
 			checkout.FamilyID, preview.PrimaryEpoch)
 		appendRevoked(revocation)
 		if err != nil {
-			return out, err
+			return repositoryCleanupUntrackResult(out, err)
 		}
 	case UntrackPlanForget:
 		revocation, err := l.rec.ForgetCheckoutExplicit(
@@ -1045,12 +1067,23 @@ func (l *CheckoutLifecycle) applyUntrack(
 			checkout.FamilyID, preview.GraphID)
 		appendRevoked(revocation)
 		if err != nil {
-			return out, err
+			return repositoryCleanupUntrackResult(out, err)
 		}
 	default:
 		return out, fmt.Errorf("indexer: unsupported untrack plan %q", preview.Plan)
 	}
 
+	// Do not let the no-binding fallback bypass a still-owned cleanup lane.
+	// Prefix/owner reuse remains fenced through the enclosing saga journal
+	// and any demotion transition, not merely through graph-row deletion.
+	pending, finalizeErr := l.finalizeRepositoryCleanups(opCtx, preview.Prefix)
+	if finalizeErr != nil {
+		return out, finalizeErr
+	}
+	if pending {
+		out.Pending = true
+		return out, nil
+	}
 	if before != nil {
 		out.NodesRemoved, out.EdgesRemoved = before.NodeCount, before.EdgeCount
 	}
@@ -1853,6 +1886,11 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	if l.store == nil || l.catalog == nil {
 		return nil, nil
 	}
+	ownerRead, err := l.AcquireRepositoryRead(primaryGraphID)
+	if err != nil {
+		return nil, err
+	}
+	defer ownerRead.Release()
 	primary, found, err := l.catalog.GetDedicatedGraph(ctx, primaryGraphID)
 	if err != nil {
 		return nil, err
@@ -2120,14 +2158,17 @@ func (l *CheckoutLifecycle) ViewLeases() *graphview.LeaseManager {
 	return l.leases
 }
 
-// Close stops every coordinator. The lifecycle stays usable afterwards —
-// closing is about the goroutines, not about the catalog — and a later sweep
-// brings the coordinators back up for whatever is still there.
+// Close permanently closes lifecycle admission and joins its producers and
+// cleanup worker before the owning server releases indexers or the Store.
 func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	readersDrained := l.stopRepositoryAdmissions()
+	publishersDrained := l.stopRepositoryPublishers()
+	l.closeRepositoryCleanup()
 	l.closeCheckoutObservations()
+	l.closeAllRefViews()
 	l.transitionMu.Lock()
 	if !l.transitionClosed {
 		l.transitionClosed = true
@@ -2161,11 +2202,6 @@ func (l *CheckoutLifecycle) Close() error {
 	}
 	l.retryMu.Unlock()
 	l.retryWG.Wait()
-	defer func() {
-		l.retryMu.Lock()
-		l.retryClosing = false
-		l.retryMu.Unlock()
-	}()
 
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
@@ -2181,6 +2217,23 @@ func (l *CheckoutLifecycle) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	// Constructors admitted just before shutdown record off-route actors in
+	// started even when they never reach the public coordinator registry.
+	<-readersDrained
+	l.coordMu.Lock()
+	prefixes := make(map[string]struct{})
+	for _, actors := range l.started {
+		for _, actor := range actors {
+			if actor != nil {
+				prefixes[actor.repoPrefix] = struct{}{}
+			}
+		}
+	}
+	l.coordMu.Unlock()
+	for prefix := range prefixes {
+		l.closeRepositoryCoordinators(prefix)
+	}
+	<-publishersDrained
 	return errors.Join(errs...)
 }
 
@@ -2541,6 +2594,9 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 		return nil
 	}
 	var errs []error
+	if err := l.restoreRepositoryAdmissions(ctx); err != nil {
+		return fmt.Errorf("restore repository cleanup admissions: %w", err)
+	}
 
 	// Finish cleanup that committed before a crash before reading config. A
 	// demotion may have flipped modes and journalled graph retirement while its
@@ -2567,6 +2623,9 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			}
 			if prefix == "" {
 				continue
+			}
+			if l.RepositoryAdmissionClosed(prefix) {
+				continue // Durable cleanup owns this stale configuration entry.
 			}
 			identity, err := l.recordCheckout(ctx, prefix, abs, TrackSourceConfig, true)
 			if err != nil {
@@ -2625,32 +2684,7 @@ func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ str
 // that path established: detach the watcher before evicting, so a late
 // filesystem event cannot re-index files whose nodes are already gone.
 func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
-	row, ok, err := h.l.catalog.GetDedicatedGraph(ctx, graphID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-	// The reconciler deletes the graph row after this hook returns. Capture
-	// every generation it owns while that durable ownership is still
-	// queryable; the retirement sweep runs after the graph reference is gone.
-	h.l.oweRetirement(h.l.graphGenerations(ctx, graphID)...)
-	if row.RepoPrefix == "" {
-		return nil
-	}
-	rootPath := ""
-	if row.OwnerCheckoutID != "" {
-		checkout, found, checkoutErr := h.l.catalog.GetCheckout(ctx, row.OwnerCheckoutID)
-		if checkoutErr != nil {
-			return checkoutErr
-		}
-		if found {
-			rootPath = checkout.RootPath
-		}
-	}
-	_, _, err = h.l.evictRepoChecked(ctx, row.RepoPrefix, rootPath)
-	return err
+	return h.l.releaseRepositoryGraph(ctx, graphID)
 }
 
 // --- side effects -------------------------------------------------------

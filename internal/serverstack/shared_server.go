@@ -647,6 +647,16 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		}
 		idx.Close()
 	})
+	// LIFO: MCP detached work -> lifecycle admissions/producers/retry joins ->
+	// MI parser workers -> standalone Indexer -> backend and store lock.
+	// This must remain after MI cleanup registration and before MCP drain.
+	s.cleanup = append(s.cleanup, func() {
+		if s.CheckoutLifecycle != nil {
+			if err := s.CheckoutLifecycle.Close(); err != nil {
+				logger.Warn("serverstack: checkout lifecycle shutdown failed", zap.Error(err))
+			}
+		}
+	})
 
 	toolPolicyCfg := gortexmcp.ToolPolicyConfig{
 		Preset:         conf.MCP.Tools.Preset,

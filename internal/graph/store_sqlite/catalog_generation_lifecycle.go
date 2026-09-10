@@ -11,8 +11,9 @@ import (
 // generation whose retirement fence has already committed.
 var ErrCatalogGenerationRetiring = errors.New("store_sqlite: view generation is retiring")
 
-// validateViewGenerationAdmissionTx rejects only missing or retiring positive
-// generations. Existing shape/sentinel rules and stricter dedicated ownership,
+// validateViewGenerationAdmissionTx rejects missing or retiring positive
+// generations, and references into an existing closing dedicated graph.
+// Existing shape/sentinel rules and stricter dedicated ownership,
 // policy, and ancestry checks remain the caller's responsibility. The caller
 // must retain this same writer transaction through reference mutation/commit.
 func validateViewGenerationAdmissionTx(ctx context.Context, tx *sql.Tx, generationID int64) error {
@@ -20,7 +21,8 @@ func validateViewGenerationAdmissionTx(ctx context.Context, tx *sql.Tx, generati
 		return nil
 	}
 	var state ViewGenerationState
-	err := tx.QueryRowContext(ctx, `SELECT state FROM view_generations WHERE generation_id=?`, generationID).Scan(&state)
+	var graphID sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT state, graph_id FROM view_generations WHERE generation_id=?`, generationID).Scan(&state, &graphID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
@@ -30,7 +32,7 @@ func validateViewGenerationAdmissionTx(ctx context.Context, tx *sql.Tx, generati
 	if state == ViewGenerationRetiring {
 		return fmt.Errorf("%w: generation %d", ErrCatalogGenerationRetiring, generationID)
 	}
-	return nil
+	return validateDedicatedGraphAdmissionTx(ctx, tx, graphID.String)
 }
 
 // BeginViewGenerationRetirement commits the catalog reference fence before any
