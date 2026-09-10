@@ -1,6 +1,7 @@
 package graphview
 
 import (
+	"context"
 	"fmt"
 	"iter"
 	"maps"
@@ -48,12 +49,10 @@ import (
 // it runs per node or per edge, and content reads, which it runs per
 // key the caller named. They are served differently on purpose.
 //
-//   - Prefetched whole, once, at construction: the covered-path set with
-//     its modes, the node tombstones, and the edge-source markers. These
-//     are the membership probes — HasFile, CoversNodeID, IsRemovedID,
-//     OwnsOutEdges — and a base edge scan runs one per edge endpoint. A
-//     query per probe would be a query per graph row; three queries
-//     bounded by the generation's own footprint are not.
+//   - Prefetched whole, once, at construction: covered paths, node-identity
+//     masks, edge-source markers, and summaries fetched ONLY for mask IDs.
+//     Membership probes run per lower node/edge without per-row SQL; ordinary
+//     file deltas perform no upper-node enumeration for identity membership.
 //   - Point reads, memoized for the layer's lifetime: NodeByID (misses
 //     included, so a repeated absence costs one query too) and FileNodes
 //     (prefetched per touched file, since a file's nodes are always
@@ -78,12 +77,12 @@ import (
 //
 // # Precondition
 //
-// Every node a generation carries lives at a path the same generation
-// masks. The payload lifecycle writes payload and mask together, and the
-// in-memory layer's builder maintains the same invariant by marking a
-// node's file when the node is added. The composition relies on it: a
-// node at an unmasked path would surface next to the copy still showing
-// through from below instead of replacing it.
+// A stored node at a masked path participates in whole-file replacement.
+// An explicit node-identity mask speaks for its ID outside masked files.
+// Identity-only replacement preserves adjacency; legacy tombstones retain
+// their old outgoing-set ownership with or without a carried node row.
+// Payload and masks must be immutable before construction; this cached layer
+// is not a live BUILDING-generation reader.
 //
 // A GenerationLayer is safe for concurrent reads from one request.
 type GenerationLayer struct {
@@ -108,6 +107,15 @@ type GenerationLayer struct {
 	// edgeSources is the set of nodes whose outgoing edge set this
 	// generation replaces without claiming their file.
 	edgeSources map[string]struct{}
+
+	// Explicit mask-backed rows at unclaimed paths carry node identity. The
+	// checked marker-ID projection is captured once for this immutable layer;
+	// lower-row membership probes never turn into per-row SQL.
+	detachedIDs         map[string]struct{}
+	detachedNodes       []graph.Node
+	detachedFileIndexes map[string][]int
+	detachedPaths       map[string]struct{}
+	detachedRepos       map[string]struct{}
 
 	mu        sync.Mutex
 	nodeByID  map[string]*graph.Node
@@ -143,13 +151,27 @@ func NewGenerationLayer(handle *store_sqlite.Store) (*GenerationLayer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read file masks of generation %d: %w", generation, err)
 	}
-	tombstones, err := handle.NodeTombstones()
+	// Read the node masks once. Derive legacy removals from the same checked
+	// enumeration rather than adding a second query for identity-only masks.
+	identityMasks, err := handle.NodeIdentityMasksContext(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("graphview: read node tombstones of generation %d: %w", generation, err)
+		return nil, fmt.Errorf("graphview: read node identity masks of generation %d: %w", generation, err)
+	}
+	var tombstones []string
+	for _, mask := range identityMasks {
+		if mask.Kind == store_sqlite.NodeIdentityMaskLegacy {
+			tombstones = append(tombstones, mask.NodeID)
+		}
 	}
 	edgeSources, err := handle.EdgeSourceMasks()
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read edge-source masks of generation %d: %w", generation, err)
+	}
+	// Fetch only explicit marker IDs, never enumerate the upper payload.
+	// An empty marker set performs no node query.
+	summaries, err := handle.NodeIdentityMaskSummariesContext(context.Background(), identityMasks)
+	if err != nil {
+		return nil, fmt.Errorf("graphview: read node identities of generation %d: %w", generation, err)
 	}
 
 	l := &GenerationLayer{
@@ -171,6 +193,25 @@ func NewGenerationLayer(handle *store_sqlite.Store) (*GenerationLayer, error) {
 	slices.Sort(l.removedID)
 	for _, mask := range edgeSources {
 		l.edgeSources[mask.SourceID] = struct{}{}
+	}
+	for _, node := range summaries {
+		if node == nil || node.ID == "" {
+			return nil, fmt.Errorf("graphview: invalid node identity in generation %d", generation)
+		}
+		if l.HasFile(node.FilePath) {
+			continue
+		}
+		if l.detachedIDs == nil {
+			l.detachedIDs = make(map[string]struct{})
+			l.detachedPaths = make(map[string]struct{})
+			l.detachedRepos = make(map[string]struct{})
+			l.detachedFileIndexes = make(map[string][]int)
+		}
+		l.detachedIDs[node.ID] = struct{}{}
+		l.detachedFileIndexes[node.FilePath] = append(l.detachedFileIndexes[node.FilePath], len(l.detachedNodes))
+		l.detachedNodes = append(l.detachedNodes, *node)
+		l.detachedPaths[node.FilePath] = struct{}{}
+		l.detachedRepos[node.RepoPrefix] = struct{}{}
 	}
 	return l, nil
 }
@@ -206,16 +247,17 @@ func (l *GenerationLayer) CoversNodeID(id string) bool {
 	return l.HasFile(id)
 }
 
-// OwnsNodeIdentity reports whether the generation speaks for an ID
-// itself. A tombstoned ID is answered from memory; for any other ID the
-// generation can only carry a node at a path it claims, so an ID whose
-// file it does not claim is not one it speaks for and no storage read is
-// needed to say so.
+// OwnsNodeIdentity reports whether the generation speaks for an ID.
+// An explicit identity-only marker replaces a node without owning outgoing
+// adjacency. Legacy tombstones preserve their independent outgoing claim.
 func (l *GenerationLayer) OwnsNodeIdentity(id string) bool {
 	if id == "" {
 		return false
 	}
 	if l.IsRemovedID(id) {
+		return true
+	}
+	if _, replaced := l.detachedIDs[id]; replaced {
 		return true
 	}
 	return l.CoversNodeID(id) && l.NodeByID(id) != nil
@@ -237,7 +279,9 @@ func (l *GenerationLayer) OwnsOutEdges(id string) bool {
 	if _, marked := l.edgeSources[id]; marked {
 		return true
 	}
-	return l.OwnsNodeIdentity(id)
+	// Identity-only masks do not own adjacency. Legacy tombstones retain
+	// outgoing ownership, whether or not they also carry a node row.
+	return l.IsRemovedID(id)
 }
 
 // IsRemovedID reports whether the generation tombstoned an identity.
