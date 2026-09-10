@@ -4,6 +4,8 @@ Status: implementation in progress. This document separates observed behavior,
 required invariants, implementation stages, and measured results. A passing
 microbenchmark is not an end-to-end disk-usage verdict.
 
+Execution ledger: [incremental-indexing-execution-ledger.md](incremental-indexing-execution-ledger.md)
+
 ## 2026-09-10: guarded committed-base advancement component
 
 The new `ensureCurrent` primitive shares initial publication's authority and
