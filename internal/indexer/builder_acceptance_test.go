@@ -304,6 +304,19 @@ func builderRenderEdges(edges []*graph.Edge) []string {
 	return out
 }
 
+// builderSortedIDs is one node list's identity set, sorted and with the
+// duplicates left in: a doubled row has to survive to this list to be caught.
+func builderSortedIDs(nodes []*graph.Node) []string {
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			ids = append(ids, n.ID)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 // builderNodeIDs is a reader's identity set, sorted.
 func builderNodeIDs(r graph.Reader) []string {
 	nodes := r.AllNodes()
@@ -718,12 +731,22 @@ func TestCommitLayerKeepsEdgesRecordedOutsideItsFiles(t *testing.T) {
 // an identity-level claim its copy would surface beside the one still showing
 // through from the corpus.
 //
-// It also pins the reach of that claim. The node tombstone and the edge-source
-// marker settle every reader that answers by identity. The two that answer from
-// the layer's FILE list — GetRepoNodes and the node counter — cannot see a node
-// that lives at no path, and that is a gap in the composition rather than in
-// the claim: nothing the builder can write puts a pathless node into a file
-// list. Naming it here is what keeps it from being rediscovered as a mystery.
+// It also pins the reach of that claim, which now runs to every reader. The
+// node tombstone and the edge-source marker settle the ones that answer by
+// identity. The two that used to answer from the layer's FILE list alone —
+// GetRepoNodes and the node counter — reach a pathless identity through the
+// layer's detached-row set instead: NewGenerationLayer keeps every identity
+// mask that has a carried row in this generation and whose path the layer does
+// not cover (internal/graphview/generation_layer.go:197-215), GetRepoNodes
+// appends them after filtering base (internal/graph/overlay.go:662-664) and
+// nodeCountDelta prices exactly the same set once, netting off the base rows
+// they hide (internal/graph/overlay.go:1010-1013, detachedBaseNodes at :1023-1062).
+// The sibling pin for the same rule lives in the owning package and runs over a
+// pathless id explicitly: TestGenerationLayerLegacyCarriedMaskStillOwnsOutgoing
+// over "alpha::builtin::String"
+// (internal/graphview/generation_layer_explicit_identity_test.go:151-179).
+// So the assertions below are positive: the composed view's identity set is the
+// flat index's, the builtin appears once, and the count is the distinct union.
 func TestSparseGenerationClaimsPathlessIdentities(t *testing.T) {
 	builderIsolateGit(t)
 	repoDir := builderTempDir(t, "repo")
@@ -822,24 +845,79 @@ func Calculate() int {
 		t.Errorf("FindNodesByName(int) returns %d nodes, want one", got)
 	}
 
-	// The known gap, asserted so a fix to the composition breaks this test
-	// rather than going unnoticed: both readers below answer from the layer's
-	// file list, which no pathless node can appear in.
+	// The two file-list readers, pinned positively against the reference half:
+	// a plain whole index of the same tree.
 	flat := builderOpenStore(t, "flat")
 	dirB := builderTempDir(t, "checkout-b")
 	builderWriteTree(t, dirB, treeB)
 	builderIndex(t, flat, dirB)
 
-	repoNodes := builderRenderNodes(composed.GetRepoNodes(builderRepoPrefix))
-	if len(repoNodes) != len(builderRenderNodes(flat.GetRepoNodes(builderRepoPrefix)))-1 {
-		t.Errorf("GetRepoNodes now returns %d nodes against the flat index's %d — "+
-			"the composition may have learned to union the layer's pathless identities",
-			len(repoNodes), len(flat.GetRepoNodes(builderRepoPrefix)))
+	composedRepo := composed.GetRepoNodes(builderRepoPrefix)
+	composedRepoIDs := builderSortedIDs(composedRepo)
+	flatRepoIDs := builderSortedIDs(flat.GetRepoNodes(builderRepoPrefix))
+
+	// The exact set, not a count: naming the identities is what makes a lost
+	// row and a swapped one different failures.
+	builderSameStrings(t, "GetRepoNodes disagrees with a flat index of the same tree",
+		composedRepoIDs, flatRepoIDs)
+	builderSameStrings(t, "GetRepoNodes is not the tree's identity set", composedRepoIDs, []string{
+		builderRepoPrefix + "/caller.go",
+		builderRepoPrefix + "/caller.go::Run",
+		builderRepoPrefix + "/core.go",
+		builderRepoPrefix + "/core.go::Calculate",
+		builtinID,
+	})
+	// The pathless identity is unioned in exactly once — base's copy is hidden
+	// by the tombstone, the layer's is appended by the detached-row set — and
+	// no other identity is doubled either.
+	if got := builderCountID(composedRepoIDs, builtinID); got != 1 {
+		t.Errorf("GetRepoNodes carries the pathless builtin %d times, want once", got)
 	}
-	if composed.NodeCount() != flat.NodeCount()-1 {
-		t.Errorf("NodeCount is %d against the flat index's %d — "+
-			"the counter may have learned to price the layer's pathless identities",
-			composed.NodeCount(), flat.NodeCount())
+	if got := slices.Compact(slices.Clone(composedRepoIDs)); len(got) != len(composedRepoIDs) {
+		t.Errorf("GetRepoNodes repeats an identity: %v", composedRepoIDs)
+	}
+	// The row served for the pathless id is the layer's re-materialised copy,
+	// not base's. BuildCommitLayer stamps the workspace/project it was given
+	// onto every node it writes; a plain index of a checkout leaves a builtin's
+	// unstamped, so that field is what tells the two copies of one id apart.
+	var servedBuiltin *graph.Node
+	for _, n := range composedRepo {
+		if n != nil && n.ID == builtinID {
+			servedBuiltin = n
+		}
+	}
+	if servedBuiltin == nil || servedBuiltin.WorkspaceID != builderRepoPrefix {
+		t.Errorf("GetRepoNodes serves %+v for the claimed builtin — want the layer's carried row "+
+			"(WorkspaceID %q), not base's", servedBuiltin, builderRepoPrefix)
+	}
+	// Every reader on the composed view answers with the same identity set,
+	// and the counter prices that set once.
+	builderSameStrings(t, "AllNodes and GetRepoNodes disagree over the pathless identity",
+		builderNodeIDs(composed), composedRepoIDs)
+	if got, want := composed.NodeCount(), len(composedRepoIDs); got != want {
+		t.Errorf("NodeCount = %d, the distinct composed identity set has %d", got, want)
+	}
+	if got, want := composed.NodeCount(), flat.NodeCount(); got != want {
+		t.Errorf("NodeCount = %d against the flat index's %d", got, want)
+	}
+
+	// The claim reaches the composed view only. Base is still the corpus it
+	// was indexed from: it answers with its own pathless copy and the symbol
+	// the generation replaced, and has never heard of the generation's.
+	base := store.AtGeneration(0)
+	baseRepoIDs := builderSortedIDs(base.GetRepoNodes(builderRepoPrefix))
+	builderSameStrings(t, "the base-only view moved when the layer was built", baseRepoIDs, []string{
+		builderRepoPrefix + "/caller.go",
+		builderRepoPrefix + "/caller.go::Run",
+		builderRepoPrefix + "/core.go",
+		builderRepoPrefix + "/core.go::Compute",
+		builtinID,
+	})
+	if n := base.GetNode(builtinID); n == nil || n.WorkspaceID != "" {
+		t.Errorf("the base-only view serves %+v for the pathless id — the layer's carried row leaked down", n)
+	}
+	if got, want := base.NodeCount(), len(baseRepoIDs); got != want {
+		t.Errorf("base NodeCount = %d, its own identity set has %d", got, want)
 	}
 }
 
