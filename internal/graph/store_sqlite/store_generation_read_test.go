@@ -342,6 +342,45 @@ func genReadProbeIDs() []string {
 	}
 }
 
+// genIncomingSourceTargets is the incoming-source frontier shared by the three
+// probes below: one call target each generation exclusively owns, one
+// unresolved target each generation exclusively owns, and the shared identity
+// that gains incoming callers only in generation 1. Every row a handle can
+// legitimately return therefore names the generation it was read from, in the
+// target key, in the source id, or in the edge file path.
+func genIncomingSourceTargets() []string {
+	return []string{
+		genOnlyID(genZeroMark), genOnlyID(genOneMark),
+		genUnresolved(genZeroMark), genUnresolved(genOneMark),
+		genReadShared,
+	}
+}
+
+// genIncomingSourceNodeIDs mixes the shared row, one row each generation owns
+// alone, two rows only generation 1 has, and one identity neither generation
+// ever indexed. Both directions of the presence check are therefore exercised:
+// a row visible in the derived generation and not the base, and vice versa.
+func genIncomingSourceNodeIDs() []string {
+	return []string{
+		genReadShared,
+		genOnlyID(genZeroMark), genOnlyID(genOneMark),
+		genExtraID(genOneMark), genSecondNodeID(genOneMark),
+		"repo::pkg/a.go::NeverIndexed",
+	}
+}
+
+const (
+	// genIncomingSourceLimit is a real distinct-source sentinel: above the
+	// fixture's per-target source count so nothing truncates by accident, and
+	// far below the unbounded maximum ValidateScopedIncomingSources rejects.
+	genIncomingSourceLimit = 8
+	// genIncomingSourceBudgetRows is the inspection remainder the scoped probe
+	// leaves on the shared budget after pre-charging it. A read that ignores
+	// the budget it was handed cannot be told from one that honours an
+	// unbounded default, so the probe never passes the zero value.
+	genIncomingSourceBudgetRows = 64
+)
+
 func genReadProbeNames() []string {
 	return []string{
 		"Shared" + genZeroMark, "Shared" + genOneMark,
@@ -775,6 +814,85 @@ func generationReadProbes() []genProbe {
 				}
 			}
 			return out
+		}},
+		{name: "ReadIncomingSourceCandidates", run: func(t *testing.T, s *Store) []string {
+			// Raw candidate rows, before any overlay dedup: the projection
+			// carries source identity AND edge-file provenance, so a row read
+			// from the wrong generation shows up in either column.
+			byTarget, err := s.ReadIncomingSourceCandidates(context.Background(), genIncomingSourceTargets(), graph.EdgeCalls)
+			if err != nil {
+				t.Fatalf("ReadIncomingSourceCandidates: %v", err)
+			}
+			var out []string
+			for target, rows := range byTarget {
+				for _, row := range rows {
+					out = append(out, fmt.Sprintf("cand %s<-%s|%s", target, row.From, row.FilePath))
+				}
+			}
+			if len(out) == 0 {
+				t.Fatal("no candidate rows for this handle; the probe would prove nothing")
+			}
+			return out
+		}},
+		{name: "FindIncomingSourcesScoped", run: func(t *testing.T, s *Store) []string {
+			// The budget is the shared inspection allowance of one public
+			// query. Pre-charging it leaves a real, bounded remainder, so the
+			// read runs against a genuine limit; a spend of zero would mean the
+			// raw rows were never charged and is failed here rather than
+			// rendered.
+			budget := &graph.IncomingSourceBudget{}
+			if err := budget.Charge(graph.MaxIncomingSourceCandidateRows - genIncomingSourceBudgetRows); err != nil {
+				t.Fatalf("pre-charge incoming-source budget: %v", err)
+			}
+			before := budget.Remaining()
+			if before != genIncomingSourceBudgetRows {
+				t.Fatalf("budget remaining after pre-charge = %d, want %d", before, genIncomingSourceBudgetRows)
+			}
+			p, err := s.FindIncomingSourcesScoped(context.Background(), genIncomingSourceTargets(),
+				graph.EdgeCalls, genIncomingSourceLimit, graph.IncomingSourceScope{}, budget)
+			if err != nil {
+				t.Fatalf("FindIncomingSourcesScoped: %v", err)
+			}
+			spent := before - budget.Remaining()
+			if spent <= 0 {
+				t.Fatal("scoped read charged no raw rows to the budget it was handed")
+			}
+			out := []string{fmt.Sprintf("scoped budget spent=%d", spent)}
+			for target, sources := range p.Sources {
+				for _, src := range sources {
+					out = append(out, "scoped "+target+"<-"+src)
+				}
+			}
+			for target, truncated := range p.Truncated {
+				out = append(out, fmt.Sprintf("scoped truncated %s=%v", target, truncated))
+			}
+			if len(out) == 1 {
+				t.Fatal("scoped read produced no sources for this handle")
+			}
+			return out
+		}},
+		{name: "IncomingSourceNodeExists", run: func(t *testing.T, s *Store) []string {
+			// Only positive results may be named. Rendering a miss would print
+			// the other generation's marker through this handle, and the leak
+			// assertion could no longer tell a leaked row from a probe
+			// artifact; the miss count keeps the negative half observable.
+			var out []string
+			misses := 0
+			for _, id := range genIncomingSourceNodeIDs() {
+				exists, err := s.IncomingSourceNodeExists(context.Background(), id, nil)
+				if err != nil {
+					t.Fatalf("IncomingSourceNodeExists(%s): %v", id, err)
+				}
+				if !exists {
+					misses++
+					continue
+				}
+				out = append(out, "nodeexists "+id)
+			}
+			if len(out) == 0 || misses == 0 {
+				t.Fatalf("presence probe needs a hit and a miss through this handle: hits=%d misses=%d", len(out), misses)
+			}
+			return append(out, fmt.Sprintf("nodeexists misses=%d", misses))
 		}},
 		{name: "EdgesWithUnresolvedTarget", run: func(t *testing.T, s *Store) []string {
 			var out []*graph.Edge
@@ -1692,6 +1810,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.BoundedExactNameReader)(nil), probe: "FindNodesByNameBounded"},
 		{iface: (*graph.BoundedFileNodeReader)(nil), probe: "FindFileNodesBounded"},
 		{iface: (*graph.BoundedIncomingEdgeIdentityReader)(nil), probe: "FindIncomingEdgeIdentitiesBounded"},
+		{iface: (*graph.BoundedIncomingSourceCandidateReader)(nil), probe: "ReadIncomingSourceCandidates"},
 		{iface: (*graph.BoundedIncomingSourceReader)(nil), probe: "FindIncomingSourcesBounded"},
 		{iface: (*graph.BoundedOutgoingEdgeIdentityReader)(nil), probe: "FindOutgoingEdgeIdentitiesBounded"},
 		{iface: (*graph.BoundedOutgoingSiteEdgeIdentityReader)(nil), probe: "FindOutgoingSiteEdgeIdentitiesBounded"},
@@ -1765,6 +1884,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.GoMethodReceiverRebinder)(nil), skip: skipWrite, writeFence: "TestGenerationScopedReceiverRebind"},
 		{iface: (*graph.IfaceImplementsScanner)(nil), probe: "IfaceImplementsRows"},
 		{iface: (*graph.ImportAdjacencyProjector)(nil), probe: "ProjectImportAdjacency"},
+		{iface: (*graph.IncomingSourceNodeChecker)(nil), probe: "IncomingSourceNodeExists"},
 		{iface: (*graph.InDegreeForNodes)(nil), probe: "InDegreeForNodes"},
 		{iface: (*graph.InEdgeCounter)(nil), probe: "InEdgeCountsByKind"},
 		{iface: (*graph.InEdgeIdentityBatchReader)(nil), probe: "GetInEdgeIdentitiesByNodeIDs"},
@@ -1813,6 +1933,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.ScopeBindingNodeSequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.ScopedCrossRepoCandidates)(nil), probe: "CrossRepoCandidatesForRepos"},
 		{iface: (*graph.ScopedEdgeKindEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("scoped_edge_kind_evict")},
+		{iface: (*graph.ScopedIncomingSourceReader)(nil), probe: "FindIncomingSourcesScoped"},
 		{iface: (*graph.ScopedProjectionSequencer)(nil), probe: "EdgesInScopeSeq"},
 		{iface: (*graph.ScopedSymbolBundleSearcher)(nil), probe: "SearchSymbolBundles"},
 		{iface: (*graph.SemanticBindingTypeStore)(nil), skip: skipSidecar},
