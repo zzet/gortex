@@ -159,10 +159,13 @@ type ResolveStats struct {
 // Indexer.IndexFile) crash the daemon with "concurrent map writes"
 // in buildDirIndexes.
 type Resolver struct {
-	graph        graph.Store
-	logger       *zap.Logger
-	dirIndex     map[string][]graph.FileNodeIdentity
-	lastDirIndex map[string][]graph.FileNodeIdentity
+	goPackageOwnership         GoPackageOwnershipLookup
+	goPackageOwnershipFactory  GoPackageOwnershipFactory
+	goPackageOwnershipPrepared map[string]GoPackageOwnershipLookup
+	graph                      graph.Store
+	logger                     *zap.Logger
+	dirIndex                   map[string][]graph.FileNodeIdentity
+	lastDirIndex               map[string][]graph.FileNodeIdentity
 	// OnComputeDone, when set, fires once per ResolveAll immediately after
 	// the parallel compute loop has committed — BEFORE the deferred LSP
 	// batch and the serial refinement tail (guard, attribution, dispatch
@@ -887,7 +890,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			sources := passIndexes.prepare(pending)
 			prepareElapsed += time.Since(prepareStart)
 			warmStart := time.Now()
-			r.warmLookupCacheWithSources(pending, sources)
+			if err := r.warmLookupCacheWithSources(ctx, pending, sources); err != nil {
+				return resolveError(err)
+			}
 			warmElapsed += time.Since(warmStart)
 		}
 		for base := 0; base < len(pending); base += superChunk {
@@ -1139,7 +1144,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					// the old generation; rebuild it with the rest.
 					r.clearCSharpVisibilityCaches()
 				}
-				passIndexes.refreshAfterInterleave(pending, forceRefresh)
+				if _, err := passIndexes.refreshAfterInterleave(ctx, pending, forceRefresh); err != nil {
+					return resolveError(err)
+				}
 				r.bulkMode = true
 			}
 		}
@@ -1964,8 +1971,8 @@ func (r *Resolver) clearDirIndexes() {
 // the two batched queries the Store exposes. Workers consult the
 // resulting maps via cachedGetNode / cachedFindNodesByName; misses
 // fall through to the underlying store.
-func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
-	r.warmLookupCacheWithSources(pending, nil)
+func (r *Resolver) warmLookupCache(pending []*graph.Edge) error {
+	return r.warmLookupCacheWithSources(context.Background(), pending, nil)
 }
 
 // warmLookupCacheWithSources reuses source nodes already hydrated while
@@ -1973,9 +1980,9 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 // hydration, even when empty; requested IDs absent from that result become
 // authoritative negatives only for the current page/generation, preventing a
 // dangling source from falling into a point-query N+1.
-func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map[string]*graph.Node) {
+func (r *Resolver) warmLookupCacheWithSources(ctx context.Context, pending []*graph.Edge, sources map[string]*graph.Node) error {
 	if len(pending) == 0 {
-		return
+		return nil
 	}
 	warmStart := time.Now()
 	idSet := make(map[string]struct{}, len(pending))
@@ -2028,6 +2035,9 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 		r.missingNodeByID = nil
 	}
 	idElapsed := time.Since(idStart)
+	if err := r.prepareGoPackageOwnership(ctx, pending, r.nodeByID); err != nil {
+		return err
+	}
 	nameStart := time.Now()
 	nameGroups, names, nameErr := r.warmRepoLanguageNameCache(pending)
 	nameElapsed := time.Since(nameStart)
@@ -2103,6 +2113,7 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 		zap.Duration("candidate_fold", foldElapsed),
 		zap.Duration("qual_lookup", qualElapsed),
 		zap.Duration("elapsed", time.Since(warmStart)))
+	return nil
 }
 
 // parallelGetNodesByIDs is the concurrent form of Store.GetNodesByIDs used to
@@ -2384,6 +2395,7 @@ func (r *Resolver) buildPassIndexes() (clear func()) {
 }
 
 func (r *Resolver) clearPassIndexes() {
+	r.clearGoPackageOwnership()
 	r.scratchGeneration++
 	r.clearDirIndexes()
 	r.clearDepModuleIndex()
@@ -2461,7 +2473,11 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// FindNodesByNames, like ResolveAll) materialises each candidate once
 	// and the passes read it from memory.
 	warmStarted := time.Now()
-	r.warmLookupCache(pending)
+	if err := r.warmLookupCache(pending); err != nil {
+		r.clearLookupCache()
+		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
+		return &ResolveStats{Unresolved: len(pending)}
+	}
 	warmDuration := time.Since(warmStarted)
 	defer r.clearLookupCache()
 
@@ -2706,7 +2722,13 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	indexDuration = finish(zap.Int("pending", len(frontier.pending)))
 	defer clear()
 	finish = startIncrementalPhase(logger, "warm_lookup")
-	r.warmLookupCache(frontier.pending)
+	if err := r.warmLookupCache(frontier.pending); err != nil {
+		r.clearLookupCache()
+		outcome = "metadata_error"
+		stats.Unresolved = len(frontier.pending)
+		logger.Warn("resolver: Go package preparation failed", zap.Error(err))
+		return stats
+	}
 	warmDuration = finish()
 	defer r.clearLookupCache()
 	repos, omittedRepos, omittedAdmissions := incrementalAdmissionSummary(frontier, r.nodeByID)
@@ -2873,6 +2895,11 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	outByNode map[string][]*graph.Edge,
 	stats *ResolveStats,
 ) {
+	if pending, err := r.prepareGoPackageFileFrontier(filePaths, nodesByFile, outByNode); err != nil {
+		stats.Unresolved += pending
+		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
+		return
+	}
 	var jobs []reindexJob
 	var reindexBatch []graph.EdgeReindex
 	for _, filePath := range filePaths {
@@ -3184,6 +3211,11 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 // the frontier (the names-pass probe). Caller holds r.mu.
 func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub map[string][]*graph.Edge, stats *ResolveStats) {
 	if len(stubKeys) == 0 {
+		return
+	}
+	if pending, err := r.prepareGoPackageIncomingFrontier(stubKeys, inByStub); err != nil {
+		stats.Unresolved += pending
+		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
 		return
 	}
 	var reindexBatch []graph.EdgeReindex
@@ -3504,6 +3536,7 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	}
 	importPath := spec[:sep]
 	symbol := spec[sep+2:]
+	goOwnership := r.goImportGateForEdge(e, importPath)
 
 	// Pass 1: does the symbol live in a file under this import path?
 	// Reuse dirIndex populated by buildDirIndexes — no extra scan.
@@ -3521,6 +3554,9 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	}
 	for _, c := range candidates {
 		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod && c.Kind != graph.KindType && c.Kind != graph.KindInterface {
+			continue
+		}
+		if !goOwnership.retainNode(c) {
 			continue
 		}
 		dir := r.dirFor(c.FilePath)
@@ -3622,6 +3658,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	callerWorkspace := r.callerWorkspaceID(e)
+	goOwnership := r.goImportGateForEdge(e, importPath)
 	ambiguousQualName := false
 
 	// JS/TS relative + tsconfig-path-alias / baseUrl import: resolve the
@@ -3639,7 +3676,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
 	// the in-repo source, not on its own installed dist inside
 	// node_modules.
-	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
+	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
 		e.To = to
 		if callerRepo != "" {
 			if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -3657,10 +3694,11 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// instead of falling through to an external stub. A no-op for
 	// non-aliased specifiers and non-JS/TS callers.
 	importPath, npmAliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, importPath)
+	goOwnership.query.ImportPath = importPath
 	if npmAliased {
 		// The rewritten specifier may itself be tsconfig-paths/relative
 		// resolvable (an alias onto a workspace member).
-		if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
+		if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
 			e.To = to
 			if callerRepo != "" {
 				if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -3679,7 +3717,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// unreachable. The extractor records the fully-qualified name on the edge;
 	// binding it to the class node makes that class's directory reachable.
 	if fqn := phpEdgeMetaString(e, "fqn"); fqn != "" {
-		if matches := r.phpFindByFQN(fqn, callerRepo); len(matches) == 1 {
+		if matches := r.phpFindByFQN(fqn, callerRepo); len(matches) == 1 && goOwnership.retainNode(matches[0]) {
 			node := matches[0]
 			e.To = node.ID
 			if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
@@ -3693,7 +3731,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// Look for every package node with this qualified name. The same import
 	// path may legitimately exist in several tracked repositories/workspaces;
 	// bind the caller-local instance instead of whichever row sorted first.
-	if candidates := r.cachedFindNodesByQualName(importPath); len(candidates) > 0 {
+	if candidates := goOwnership.filterNodes(r.cachedFindNodesByQualName(importPath)); len(candidates) > 0 {
 		node, ambiguous := pickResolverQualNameCandidate(candidates, callerRepo, callerWorkspace)
 		if node != nil {
 			e.To = node.ID
@@ -3737,6 +3775,9 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	var sameRepoFound, crossRepoFound bool
 	var sameRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
+		if !goOwnership.retainFile(file) {
+			return
+		}
 		if bareJSTS && !isJSTSDirEntryPoint(file.FilePath) {
 			return
 		}
@@ -3829,7 +3870,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// sub-module the importer reached for.
 	if npmAliased {
 		if pkg := npmPackagePrefix(importPath); pkg != "" {
-			if candidates := r.cachedFindNodesByQualName(pkg); len(candidates) > 0 {
+			if candidates := goOwnership.filterNodes(r.cachedFindNodesByQualName(pkg)); len(candidates) > 0 {
 				node, ambiguous := pickResolverQualNameCandidate(candidates, callerRepo, callerWorkspace)
 				if node != nil {
 					e.To = node.ID

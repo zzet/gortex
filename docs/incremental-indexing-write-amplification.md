@@ -1226,3 +1226,55 @@ measurement of SSD writes. Full cold/warm lifecycle integration, bounded
 ancestry maintenance, global enrichment and sustained daemon I/O remain release
 gates. Reproduction records and retained failure analysis are in
 `/private/tmp/gortex-claimed-dedicated-delta.aXnXca/STRICT-ORACLE-V2-VALIDATION.md`.
+
+### Go package ownership regression: validation checkpoint (2026-09-10)
+
+An independent cold/sparse SQLite fixture reproduced four wrong import/call
+targets when same-named Go packages in one repository were confused. The fix
+rejects only a candidate positively certified to belong to a different package.
+Unknown ownership preserves existing behavior; it neither invents missing
+candidates nor treats foreign repositories, replacements, workspaces, vendor
+paths or unsupported sources as certified. Parsing may use a narrowed source,
+but manifest authority comes from the full selected source, atomically paired
+with it. Immutable sources never consult dirty working-copy manifests.
+
+The actual resolver prepares this authority once per pass epoch, before candidate
+lookups and worker activity. A real SQLite test resolves 2,049 pending rows across
+a 2,048-row page boundary with one factory invocation. Both provider-disabled
+and provider-enabled foreign-repository controls retain the original target.
+
+Final actual-source validation: 31 focused tests pass; the full resolver package
+executes 1,020 tests with 1,018 passing and exactly two expected copied-store probe
+skips. Vet and golangci-lint pass for resolver, indexer and serverstack. The prior
+27-test race cohort passes three times (81 runs); the final delta after that run
+is four existing-test error checks and one error-message capitalization change.
+The wider 65-test indexer selection passes in a 64-plus-1 split: its promisor
+positive control needed a separate local-file-only Git environment. The missing
+relative resolver fixture was supplied inside the isolated CWD, without changing
+tests. Original harness failures and their corrections remain in the run ledger.
+
+Serial component timing (three samples, 10,000 iterations) measures the nil gate
+at 3.68–3.74 ns/op with zero allocations, fixture-certified rejection at
+132.5–145.6 ns/op with one allocation, and unchanged-epoch preparation at
+104.2–105 ns/op with zero allocations. These are not production-source costs.
+An additional isolated benchmark invokes the actual selected-source provider
+(three samples, 100 iterations). At 1,025 inventory files, filesystem preparation
+takes 56.0–58.6 ms and about 3.01 MB/39,120 allocations per pass; Git-tree
+preparation takes 1.98–2.04 ms and about 1.55 MB/18,606 allocations. Prepared
+lookup takes approximately 0.47–0.68 us with zero allocations. SQL inventory,
+outer master locks, parsing, global passes and end-to-end daemon work are outside
+those measurements. The filesystem result is Darwin evidence, not a Windows claim.
+
+This checkpoint fixes candidate rejection, not module-root/directory-mismatch
+candidate placement. Global immutable-base activation, owner-routed derived
+writes, cleanup integration, full daemon E2E and sustained write-amplification
+validation remain separate acceptance gates. Native post-change detection
+returned an incomplete, read-only fallback while the checkout rebuilt; graph
+tests/guards/contracts were unavailable, not green. Compiler, test and static
+results above are separately recorded actual-source evidence.
+
+Run ledger: `/private/tmp/gortex-go-package-after.2H03VR/LANDED-VALIDATION.md`
+(SHA-256 `f2a389dfb115639b33aabb84f25b76a66de45533b1acfef18eb4a1b4a311d312`),
+with the exact 22-file manifest, baseline reproduction, final tests, race runs,
+benchmarks and preserved failures. All validation used private configuration,
+state and storage; the live daemon was not restarted or reconfigured.

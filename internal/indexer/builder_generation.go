@@ -689,7 +689,7 @@ func (b *SparseGenerationBuilder) runPass(
 		idx.parseAdmission.Store(b.Admissions.parseAdmission.Load())
 		idx.nativeParseAdmission.Store(b.Admissions.nativeParseAdmission.Load())
 	}
-	idx.SetContentSource(newFileSetSource(req.Target, plan.indexed))
+	idx.setContentSourceWithManifests(newFileSetSource(req.Target, plan.indexed), req.Target)
 
 	result, err := idx.IndexCtx(ctx, req.RootPath)
 	if err != nil {
