@@ -84,7 +84,7 @@ func (l *CheckoutLifecycle) RegisterRepositoryOwner(ctx context.Context, graphID
 	if graph.State == store_sqlite.DedicatedGraphClosing {
 		return fmt.Errorf("%w: graph %s", graphview.ErrRepositoryAdmissionClosed, graphID)
 	}
-	if graph.State != "ready" {
+	if graph.State != store_sqlite.DedicatedGraphReady {
 		return fmt.Errorf("%w: graph %s is not ready", graphview.ErrRepositoryOwnerUnknown, graphID)
 	}
 	checkout, found, err := l.catalog.GetCheckout(ctx, graph.OwnerCheckoutID)

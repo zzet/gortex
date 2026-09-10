@@ -184,7 +184,7 @@ func dedicatedBaseOwnerTx(ctx context.Context, tx *sql.Tx, graphID string, owner
 	if err != nil {
 		return 0, err
 	}
-	if checkoutID != owner.CheckoutID || incarnation != owner.Incarnation || graphState != "ready" ||
+	if checkoutID != owner.CheckoutID || incarnation != owner.Incarnation || graphState != DedicatedGraphReady ||
 		checkoutState != string(CheckoutStateReady) || desired != string(CheckoutModeDedicated) ||
 		effective != string(CheckoutModeDedicated) || transition != "" {
 		return 0, dedicatedBaseStale("owner unavailable or not steady dedicated")

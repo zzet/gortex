@@ -42,7 +42,7 @@ func newDedicatedPublicationFixture(t testing.TB) *dedicatedPublicationFixture {
 	if err = f.c.UpsertCheckout(ctx, f.owner); err != nil {
 		t.Fatal(err)
 	}
-	f.graph = DedicatedGraph{GraphID: "graph", OwnerCheckoutID: f.owner.CheckoutID, RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: "ready"}
+	f.graph = DedicatedGraph{GraphID: "graph", OwnerCheckoutID: f.owner.CheckoutID, RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: DedicatedGraphReady}
 	if err = f.c.UpsertDedicatedGraph(ctx, f.graph); err != nil {
 		t.Fatal(err)
 	}
@@ -340,6 +340,8 @@ func TestDedicatedPublicationAuthorizationRejectsUnsupportedOwners(t *testing.T)
 		{"demotion_desired_overlay", `UPDATE checkouts SET desired_mode='automatic_overlay' WHERE checkout_id='owner'`, nil},
 		{"active_transition", `UPDATE checkouts SET active_intent_transition_id='transition' WHERE checkout_id='owner'`, nil},
 		{"graph_not_ready", `UPDATE dedicated_graphs SET state='building' WHERE graph_id='graph'`, nil},
+		{"generation_ready_is_not_graph_ready", `UPDATE dedicated_graphs SET state='ready' WHERE graph_id='graph'`, nil},
+		{"graph_closing", `UPDATE dedicated_graphs SET state='closing' WHERE graph_id='graph'`, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newDedicatedPublicationFixture(t)

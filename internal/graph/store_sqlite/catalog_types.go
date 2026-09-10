@@ -12,6 +12,10 @@ import (
 // Keeping the check in Go rather than in a CHECK constraint means extending a
 // vocabulary is a code change, not a migration of every installed database.
 
+// DedicatedGraphReady is a dedicated graph that can serve queries. This is
+// distinct from ViewGenerationReady, which describes a published generation.
+const DedicatedGraphReady = "graph_ready"
+
 // CheckoutState is the lifecycle state of one working copy.
 type CheckoutState string
 

@@ -716,7 +716,7 @@ func newDedicatedIdentityAdmissionFixture(t *testing.T) *dedicatedIdentityAdmiss
 			t.Fatal(err)
 		}
 	}
-	f.graph = DedicatedGraph{GraphID: "graph", OwnerCheckoutID: "owner", RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: "ready"}
+	f.graph = DedicatedGraph{GraphID: "graph", OwnerCheckoutID: "owner", RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: DedicatedGraphReady}
 	if err := f.c.UpsertDedicatedGraph(ctx, f.graph); err != nil {
 		t.Fatal(err)
 	}
@@ -759,7 +759,7 @@ func (f *dedicatedIdentityAdmissionFixture) row(t *testing.T, graphID string) (D
 }
 
 func (f *dedicatedIdentityAdmissionFixture) freshProposal() DedicatedGraph {
-	return DedicatedGraph{GraphID: "fresh-graph", OwnerCheckoutID: "insert-owner", RepoPrefix: "fresh-repo", FamilyID: f.graph.FamilyID, ActiveGenerationID: f.healthy, State: "ready"}
+	return DedicatedGraph{GraphID: "fresh-graph", OwnerCheckoutID: "insert-owner", RepoPrefix: "fresh-repo", FamilyID: f.graph.FamilyID, ActiveGenerationID: f.healthy, State: DedicatedGraphReady}
 }
 
 func (f *dedicatedIdentityAdmissionFixture) healthyInsertControl(t *testing.T) DedicatedGraph {
@@ -953,7 +953,7 @@ func newPublicationRetirementFixture(t *testing.T) *publicationRetirementFixture
 	if err := f.c.UpsertCheckout(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.c.UpsertDedicatedGraph(ctx, DedicatedGraph{GraphID: "graph", OwnerCheckoutID: owner.CheckoutID, RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: "ready"}); err != nil {
+	if err := f.c.UpsertDedicatedGraph(ctx, DedicatedGraph{GraphID: "graph", OwnerCheckoutID: owner.CheckoutID, RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: DedicatedGraphReady}); err != nil {
 		t.Fatal(err)
 	}
 	f.authority, err = f.c.AcquireDedicatedBaseAuthority(ctx, AcquireDedicatedBaseAuthorityRequest{GraphID: "graph", Owner: DedicatedBaseOwner{CheckoutID: owner.CheckoutID, Incarnation: owner.Incarnation}, Token: "authority"})

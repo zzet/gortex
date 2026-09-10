@@ -10,24 +10,35 @@ import (
 )
 
 func TestLifecycleRegistrationRequiresReadyBeforePublisherBinding(t *testing.T) {
-	lifecycle, identity := repositoryAdmissionFixture(t)
-	runtime := &repositoryAdmissionPublisher{}
-	if err := lifecycle.SetDedicatedBaseCleanupRuntime(runtime); err != nil {
-		t.Fatal(err)
-	}
-	graph, found, err := lifecycle.catalog.GetDedicatedGraph(context.Background(), identity.GraphID)
-	if err != nil || !found {
-		t.Fatalf("graph=%v %v", found, err)
-	}
-	graph.State = "unavailable"
-	if err := lifecycle.catalog.UpsertDedicatedGraph(context.Background(), graph); err != nil {
-		t.Fatal(err)
-	}
-	if err := lifecycle.RegisterRepositoryOwner(context.Background(), identity.GraphID); !errors.Is(err, graphview.ErrRepositoryOwnerUnknown) {
-		t.Fatalf("nonready graph registered: %v", err)
-	}
-	if len(runtime.registered) != 0 {
-		t.Fatal("nonready catalog bound publisher slot")
+	for _, state := range []string{"unavailable", "building", "ready", store_sqlite.DedicatedGraphClosing} {
+		t.Run(state, func(t *testing.T) {
+			lifecycle, identity := repositoryAdmissionFixture(t)
+			runtime := &repositoryAdmissionPublisher{}
+			if err := lifecycle.SetDedicatedBaseCleanupRuntime(runtime); err != nil {
+				t.Fatal(err)
+			}
+			graph, found, err := lifecycle.catalog.GetDedicatedGraph(context.Background(), identity.GraphID)
+			if err != nil || !found {
+				t.Fatalf("graph=%v %v", found, err)
+			}
+			graph.State = state
+			if err := lifecycle.catalog.UpsertDedicatedGraph(context.Background(), graph); err != nil {
+				t.Fatal(err)
+			}
+			want := graphview.ErrRepositoryOwnerUnknown
+			if state == store_sqlite.DedicatedGraphClosing {
+				want = graphview.ErrRepositoryAdmissionClosed
+			}
+			if err := lifecycle.RegisterRepositoryOwner(context.Background(), identity.GraphID); !errors.Is(err, want) {
+				t.Fatalf("nonready graph registered: %v", err)
+			}
+			if len(runtime.registered) != 0 {
+				t.Fatal("nonready catalog bound publisher slot")
+			}
+			if _, err := lifecycle.AcquireRepositoryRead(identity.GraphID); !errors.Is(err, graphview.ErrRepositoryOwnerUnknown) {
+				t.Fatalf("nonready graph opened read admission: %v", err)
+			}
+		})
 	}
 }
 
@@ -89,7 +100,7 @@ func TestLifecycleOldCleanupHandleCannotCloseSameOwnerReplacementPublisher(t *te
 	delete(lifecycle.repositoryOwners, identity.GraphID)
 	delete(lifecycle.repositoryClosing, identity.GraphID)
 	lifecycle.repositoryAdmissionMu.Unlock()
-	graph := store_sqlite.DedicatedGraph{GraphID: identity.GraphID, OwnerCheckoutID: identity.CheckoutID, RepoPrefix: identity.RepoPrefix, FamilyID: identity.FamilyID, State: "ready"}
+	graph := store_sqlite.DedicatedGraph{GraphID: identity.GraphID, OwnerCheckoutID: identity.CheckoutID, RepoPrefix: identity.RepoPrefix, FamilyID: identity.FamilyID, State: store_sqlite.DedicatedGraphReady}
 	if err := lifecycle.catalog.UpsertDedicatedGraph(ctx, graph); err != nil {
 		t.Fatal(err)
 	}

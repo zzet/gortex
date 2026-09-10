@@ -273,7 +273,7 @@ func (f dedicatedDeltaFixture) coldPositive(t *testing.T, ctx context.Context, r
 		t.Fatal(err)
 	}
 	if err := catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{GraphID: owner.GraphID, OwnerCheckoutID: checkout.CheckoutID,
-		RepoPrefix: owner.RepoPrefix, FamilyID: family.FamilyID, IsPrimaryBase: true, State: "ready"}); err != nil {
+		RepoPrefix: owner.RepoPrefix, FamilyID: family.FamilyID, IsPrimaryBase: true, State: store_sqlite.DedicatedGraphReady}); err != nil {
 		t.Fatal(err)
 	}
 	authority, err := catalog.AcquireDedicatedBaseAuthority(ctx, store_sqlite.AcquireDedicatedBaseAuthorityRequest{

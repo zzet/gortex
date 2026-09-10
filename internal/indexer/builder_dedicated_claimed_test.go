@@ -95,7 +95,7 @@ func privateDedicatedBuilderFixture(t testing.TB) (*SparseGenerationBuilder, ded
 	}
 	if err := catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
 		GraphID: request.Identity.GraphID, OwnerCheckoutID: owner.CheckoutID, RepoPrefix: request.RepoPrefix,
-		FamilyID: family.FamilyID, IsPrimaryBase: true, State: "ready",
+		FamilyID: family.FamilyID, IsPrimaryBase: true, State: store_sqlite.DedicatedGraphReady,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -836,7 +836,7 @@ func TestPrivateEmptyCommittedDedicatedBaseAcceptance(t *testing.T) {
 	}
 	if err := catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
 		GraphID: graphID, OwnerCheckoutID: checkoutID, RepoPrefix: prefix,
-		FamilyID: family.FamilyID, IsPrimaryBase: true, State: "ready",
+		FamilyID: family.FamilyID, IsPrimaryBase: true, State: store_sqlite.DedicatedGraphReady,
 	}); err != nil {
 		t.Fatal(err)
 	}

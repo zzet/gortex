@@ -39,7 +39,7 @@ func newDependencyPublicationFixture(t *testing.T, revision string) *dependencyP
 	if err := f.catalog.UpsertCheckout(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	g := DedicatedGraph{GraphID: "dependency-graph", OwnerCheckoutID: owner.CheckoutID, RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: "ready"}
+	g := DedicatedGraph{GraphID: "dependency-graph", OwnerCheckoutID: owner.CheckoutID, RepoPrefix: "repo", FamilyID: family.FamilyID, IsPrimaryBase: true, State: DedicatedGraphReady}
 	if err := f.catalog.UpsertDedicatedGraph(ctx, g); err != nil {
 		t.Fatal(err)
 	}

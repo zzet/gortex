@@ -27,7 +27,7 @@ func repositoryAdmissionFixture(t *testing.T) (*CheckoutLifecycle, store_sqlite.
 	if err := catalog.UpsertCheckout(ctx, checkout); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{GraphID: "graph", OwnerCheckoutID: checkout.CheckoutID, RepoPrefix: "repo", FamilyID: checkout.FamilyID, State: "ready"}); err != nil {
+	if err := catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{GraphID: "graph", OwnerCheckoutID: checkout.CheckoutID, RepoPrefix: "repo", FamilyID: checkout.FamilyID, State: store_sqlite.DedicatedGraphReady}); err != nil {
 		t.Fatal(err)
 	}
 	lifecycle := &CheckoutLifecycle{catalog: catalog, leases: graphview.NewLeaseManager()}
