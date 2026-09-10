@@ -24,6 +24,7 @@ const dedicatedBasePublicationsSchemaSQL = `CREATE TABLE IF NOT EXISTS dedicated
 	config_hash TEXT NOT NULL DEFAULT '',
 	extractor_versions TEXT NOT NULL DEFAULT '',
 	resolver_version TEXT NOT NULL DEFAULT '',
+	dependency_revision TEXT NOT NULL DEFAULT '',
 	attempt_token TEXT NOT NULL DEFAULT '',
 	attempt_state TEXT NOT NULL DEFAULT 'idle',
 	generation_id INTEGER NOT NULL DEFAULT 0,
@@ -38,6 +39,9 @@ const dedicatedBasePublicationsSchemaSQL = `CREATE TABLE IF NOT EXISTS dedicated
 // Commit provenance is deliberately not part of tree-equivalent payload reuse.
 type DedicatedBaseIdentity struct {
 	TreeOID, ConfigHash, ExtractorVersions, ResolverVersion string
+	// DependencyRevision identifies derived dependency inputs, not parent parse
+	// policy. Empty preserves legacy/unproven output identity only.
+	DependencyRevision string
 }
 
 type DedicatedBaseOwner struct {
@@ -122,7 +126,7 @@ var ErrDedicatedBaseCandidate = errors.New("invalid dedicated base candidate")
 
 const dedicatedBasePublicationColumns = `graph_id, owner_checkout_id, owner_incarnation, owner_generation_floor, repo_prefix, family_id,
 	authority_epoch, authority_token, desired_epoch, tree_oid, config_hash,
-	extractor_versions, resolver_version, attempt_token, attempt_state,
+	extractor_versions, resolver_version, dependency_revision, attempt_token, attempt_state,
 	generation_id, base_generation_id, layer_id, lower_view_fingerprint,
 	expected_active_generation_id, error`
 
@@ -136,7 +140,7 @@ func dedicatedBasePublicationRow(ctx context.Context, q dedicatedBaseQuerier, gr
 	i := &p.Desire.Identity
 	err := q.QueryRowContext(ctx, `SELECT `+dedicatedBasePublicationColumns+` FROM dedicated_base_publications WHERE graph_id=?`, graphID).Scan(
 		&a.GraphID, &a.Owner.CheckoutID, &a.Owner.Incarnation, &a.GenerationFloor, &a.RepoPrefix, &a.FamilyID, &a.Epoch, &a.Token,
-		&p.Desire.Epoch, &i.TreeOID, &i.ConfigHash, &i.ExtractorVersions, &i.ResolverVersion,
+		&p.Desire.Epoch, &i.TreeOID, &i.ConfigHash, &i.ExtractorVersions, &i.ResolverVersion, &i.DependencyRevision,
 		&p.Claim.AttemptToken, &p.AttemptState, &p.Claim.GenerationID, &p.Claim.BaseGenerationID,
 		&p.Claim.LayerID, &p.Claim.LowerViewFingerprint, &p.Claim.ExpectedActiveGenerationID, &p.Error)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -277,9 +281,9 @@ func (c *Catalog) RecordDedicatedBaseDesire(ctx context.Context, req RecordDedic
 		out.Epoch++
 		out.Identity = req.Identity
 		_, err = tx.ExecContext(ctx, `UPDATE dedicated_base_publications SET desired_epoch=?,tree_oid=?,config_hash=?,
-			extractor_versions=?,resolver_version=?,attempt_token='',attempt_state='idle',generation_id=0,
+			extractor_versions=?,resolver_version=?,dependency_revision=?,attempt_token='',attempt_state='idle',generation_id=0,
 			base_generation_id=0,layer_id='',lower_view_fingerprint='',expected_active_generation_id=0,error='' WHERE graph_id=?`,
-			out.Epoch, out.Identity.TreeOID, out.Identity.ConfigHash, out.Identity.ExtractorVersions, out.Identity.ResolverVersion, out.Authority.GraphID)
+			out.Epoch, out.Identity.TreeOID, out.Identity.ConfigHash, out.Identity.ExtractorVersions, out.Identity.ResolverVersion, out.Identity.DependencyRevision, out.Authority.GraphID)
 		return err
 	})
 	if err != nil {
@@ -332,6 +336,11 @@ func validateDedicatedBaseChainTx(ctx context.Context, tx *sql.Tx, desire Dedica
 			first = g
 			if exactTree && g.TreeOID != desire.Identity.TreeOID {
 				return ViewGeneration{}, fmt.Errorf("%w: tree mismatch", ErrDedicatedBaseCandidate)
+			}
+			// Only the output candidate must match current dependency inputs.
+			// A same-policy parent may supply the lower for a derived-only refresh.
+			if exactTree && g.DependencyRevision != desire.Identity.DependencyRevision {
+				return ViewGeneration{}, fmt.Errorf("%w: dependency revision mismatch", ErrDedicatedBaseCandidate)
 			}
 		}
 		id = g.BaseGenerationID
@@ -473,9 +482,9 @@ func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicate
 		// queries so the same transaction never depends on concurrent row cursors.
 		rows, err := tx.QueryContext(ctx, `SELECT generation_id FROM view_generations WHERE generation_id>? AND owner_kind='dedicated_graph'
 			AND generation_kind='dedicated' AND graph_id=? AND checkout_id=? AND tree_oid=? AND config_hash=?
-			AND extractor_versions=? AND resolver_version=? AND state IN ('ready','superseded') ORDER BY generation_id DESC LIMIT ?`,
+			AND extractor_versions=? AND resolver_version=? AND dependency_revision=? AND state IN ('ready','superseded') ORDER BY generation_id DESC LIMIT ?`,
 			req.Desire.Authority.GenerationFloor, req.Desire.Authority.GraphID, req.Desire.Authority.Owner.CheckoutID, req.Desire.Identity.TreeOID,
-			req.Desire.Identity.ConfigHash, req.Desire.Identity.ExtractorVersions, req.Desire.Identity.ResolverVersion, maxDedicatedBaseReuseCandidates)
+			req.Desire.Identity.ConfigHash, req.Desire.Identity.ExtractorVersions, req.Desire.Identity.ResolverVersion, req.Desire.Identity.DependencyRevision, maxDedicatedBaseReuseCandidates)
 		if err != nil {
 			return err
 		}
@@ -515,7 +524,8 @@ func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicate
 		g := ViewGeneration{OwnerKind: "dedicated_graph", GraphID: req.Desire.Authority.GraphID, CheckoutID: req.Desire.Authority.Owner.CheckoutID,
 			GenerationKind: "dedicated", LayerID: req.LayerID, BaseGenerationID: req.BaseGenerationID, LowerViewFingerprint: req.LowerViewFingerprint,
 			TreeOID: req.Desire.Identity.TreeOID, ConfigHash: req.Desire.Identity.ConfigHash, ExtractorVersions: req.Desire.Identity.ExtractorVersions,
-			ResolverVersion: req.Desire.Identity.ResolverVersion, ProvenanceCommitOID: req.ProvenanceCommitOID, CreatedAt: req.CreatedAt, State: ViewGenerationBuilding}
+			ResolverVersion: req.Desire.Identity.ResolverVersion, DependencyRevision: req.Desire.Identity.DependencyRevision,
+			ProvenanceCommitOID: req.ProvenanceCommitOID, CreatedAt: req.CreatedAt, State: ViewGenerationBuilding}
 		if err := g.validate(); err != nil {
 			return err
 		}

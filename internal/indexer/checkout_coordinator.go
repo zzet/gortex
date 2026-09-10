@@ -1816,6 +1816,14 @@ func generationIdentityKey(identity GenerationIdentity) string {
 		b.WriteString(field)
 		b.WriteByte(0)
 	}
+	// Empty is the legacy identity: keep its existing persisted fingerprints.
+	// Nonempty dependency inputs add a separate length-delimited output key.
+	if identity.DependencyRevision != "" {
+		b.WriteString("dependency-revision:")
+		b.WriteString(strconv.Itoa(len(identity.DependencyRevision)))
+		b.WriteByte(':')
+		b.WriteString(identity.DependencyRevision)
+	}
 	return b.String()
 }
 
@@ -1835,6 +1843,7 @@ func generationRowKey(row store_sqlite.ViewGeneration) string {
 		ConfigHash:           row.ConfigHash,
 		ExtractorVersions:    row.ExtractorVersions,
 		ResolverVersion:      row.ResolverVersion,
+		DependencyRevision:   row.DependencyRevision,
 	})
 }
 

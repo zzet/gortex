@@ -134,6 +134,7 @@ type GenerationIdentity struct {
 	ConfigHash           string
 	ExtractorVersions    string
 	ResolverVersion      string
+	DependencyRevision   string
 
 	CreatedAt int64 // unix seconds; 0 stamps the wall clock
 }
@@ -376,7 +377,8 @@ func (b *SparseGenerationBuilder) buildPlannedGeneration(ctx context.Context, re
 		LowerViewFingerprint: req.Identity.LowerViewFingerprint, TreeOID: req.Identity.TreeOID,
 		ProvenanceCommitOID: req.Identity.ProvenanceCommitOID, ConfigHash: req.Identity.ConfigHash,
 		ExtractorVersions: req.Identity.ExtractorVersions, ResolverVersion: req.Identity.ResolverVersion,
-		CreatedAt: req.Identity.CreatedAt,
+		DependencyRevision: req.Identity.DependencyRevision,
+		CreatedAt:          req.Identity.CreatedAt,
 	})
 	if err != nil {
 		return 0, BuildReport{}, fmt.Errorf("indexer: begin payload generation: %w", err)

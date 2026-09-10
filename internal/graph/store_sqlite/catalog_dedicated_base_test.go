@@ -50,7 +50,7 @@ func newDedicatedPublicationFixture(t testing.TB) *dedicatedPublicationFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.desire, err = f.c.RecordDedicatedBaseDesire(ctx, RecordDedicatedBaseDesireRequest{Authority: f.authority, Identity: DedicatedBaseIdentity{"tree-a", "config", "extractors", "resolver"}})
+	f.desire, err = f.c.RecordDedicatedBaseDesire(ctx, RecordDedicatedBaseDesireRequest{Authority: f.authority, Identity: DedicatedBaseIdentity{TreeOID: "tree-a", ConfigHash: "config", ExtractorVersions: "extractors", ResolverVersion: "resolver"}})
 	if err != nil {
 		t.Fatal(err)
 	}

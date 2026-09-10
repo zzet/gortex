@@ -1394,3 +1394,38 @@ Its standalone hot-admission characterization was 64.6–109.2 nanoseconds; the
 short sample is not a sustained-throughput claim. Ready and rejected stale
 publisher tests assert no catalog writes. Full lifecycle/global-cohort and E2E
 acceptance remain separate from this admission primitive.
+
+### Derived dependency revision metadata (implemented, not activated)
+
+Schema 23 adds a default-empty dependency revision to generation identity and
+dedicated-base build desires in the existing catalog tables. A nonempty token
+separates outputs resolved against different dependency inputs, even when their
+own source tree is unchanged. Output lookup, build claims, retries and builder
+publication carry the same token. Parent parse compatibility remains unchanged:
+reusable syntax is not the same thing as reusable dependency-resolved output.
+Legacy empty-token generation keys remain byte-for-byte compatible. The
+transactional v22 migration does not backfill a token or certify legacy output.
+
+This commit implements metadata propagation only. It neither computes a digest
+nor switches on immutable provider capture, cohort resolution or base advancement.
+Those activation paths must supply a complete, frozen input identity and reject
+stale publication; an arbitrary nonempty string is not a freshness certificate.
+
+Seventeen new tests and 163 existing controls passed on actual source: 180 normal
+passes and 540 passes with three race repetitions. Coverage includes full-schema
+open/reopen and rollback/retry migration, legacy key compatibility, generation
+lookup, claims and retry identity, and full/delta builder propagation. Indexer,
+SQLite-store and serverstack vet/lint passed. All runs used isolated pre-init
+environment roots without starting or restarting a daemon. Native post-change
+graph detection timed out, so it is not counted as a successful validation.
+
+Three serial 100-iteration samples measured healthy claim coalescing at
+129.4–131.8 microseconds (prior 121.3–131.3), with six additional allocations
+and approximately 214 bytes per call. Terminal recovery measured 319.2–359.0
+microseconds (prior 270.8–319.5). Ready runtime replay measured 421.2–459.8
+microseconds (prior 415.4–430.5), with about 740 additional bytes and 18 additional
+allocations. Healthy replay still performs no catalog writes and the metadata
+change adds no query. These short measurements expose overhead; they do not
+establish a speedup, performance neutrality, or reduced sustained disk I/O.
+Full lifecycle, immutable-input integration, end-to-end correctness and sustained
+I/O acceptance remain required before the feature is declared complete.

@@ -649,6 +649,7 @@ CREATE TABLE IF NOT EXISTS view_generations (
     config_hash            TEXT NOT NULL DEFAULT '',
     extractor_versions     TEXT NOT NULL DEFAULT '',
     resolver_version       TEXT NOT NULL DEFAULT '',
+    dependency_revision    TEXT NOT NULL DEFAULT '',
     state                  TEXT NOT NULL,
     covered_files          INTEGER NOT NULL DEFAULT 0,
     affected_files         INTEGER NOT NULL DEFAULT 0,

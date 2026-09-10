@@ -152,6 +152,7 @@ type PayloadGenerationRequest struct {
 	ConfigHash           string
 	ExtractorVersions    string
 	ResolverVersion      string
+	DependencyRevision   string
 
 	CreatedAt int64 // unix seconds
 }
@@ -194,6 +195,7 @@ func (s *Store) BeginPayloadGenerationWithStatus(
 		ConfigHash:           req.ConfigHash,
 		ExtractorVersions:    req.ExtractorVersions,
 		ResolverVersion:      req.ResolverVersion,
+		DependencyRevision:   req.DependencyRevision,
 		State:                ViewGenerationBuilding,
 		CreatedAt:            req.CreatedAt,
 	})

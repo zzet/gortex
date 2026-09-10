@@ -76,7 +76,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedDelta(ctx context.Context
 		row.GraphID != claim.Desire.Authority.GraphID || row.CheckoutID != claim.Desire.Authority.Owner.CheckoutID ||
 		row.BaseGenerationID != claim.BaseGenerationID || row.LayerID != claim.LayerID || row.LowerViewFingerprint != claim.LowerViewFingerprint ||
 		row.TreeOID != identity.TreeOID || row.ConfigHash != identity.ConfigHash ||
-		row.ExtractorVersions != identity.ExtractorVersions || row.ResolverVersion != identity.ResolverVersion {
+		row.ExtractorVersions != identity.ExtractorVersions || row.ResolverVersion != identity.ResolverVersion || row.DependencyRevision != identity.DependencyRevision {
 		return 0, BuildReport{}, fmt.Errorf("%w: incompatible dedicated delta identity", store_sqlite.ErrDedicatedBaseCandidate)
 	}
 	parent, found, err := catalog.GetViewGeneration(ctx, claim.BaseGenerationID)
@@ -112,7 +112,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedDelta(ctx context.Context
 		Identity: GenerationIdentity{OwnerKind: row.OwnerKind, GraphID: row.GraphID, LayerID: row.LayerID,
 			CheckoutID: row.CheckoutID, GenerationKind: row.GenerationKind, BaseGenerationID: row.BaseGenerationID,
 			LowerViewFingerprint: row.LowerViewFingerprint, TreeOID: row.TreeOID, ProvenanceCommitOID: row.ProvenanceCommitOID,
-			ConfigHash: row.ConfigHash, ExtractorVersions: row.ExtractorVersions, ResolverVersion: row.ResolverVersion, CreatedAt: row.CreatedAt},
+			ConfigHash: row.ConfigHash, ExtractorVersions: row.ExtractorVersions, ResolverVersion: row.ResolverVersion, DependencyRevision: row.DependencyRevision, CreatedAt: row.CreatedAt},
 		Base: request.Base, Changes: changes, RootPath: commit.RootPath,
 		RepoPrefix: claim.Desire.Authority.RepoPrefix, WorkspaceID: request.WorkspaceID,
 		ProjectID: request.ProjectID, PrePublish: request.PrePublish,

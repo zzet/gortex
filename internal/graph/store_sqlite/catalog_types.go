@@ -370,15 +370,17 @@ type ViewGeneration struct {
 	ConfigHash           string
 	ExtractorVersions    string
 	ResolverVersion      string
-	State                ViewGenerationState
-	CoveredFiles         int64
-	AffectedFiles        int64
-	StorageBytes         int64
-	Completeness         string
-	CreatedAt            int64 // unix seconds
-	PublishedAt          int64 // unix seconds
-	LastSelected         int64 // unix seconds
-	Error                string
+	// Empty denotes legacy/unproven derived dependency provenance.
+	DependencyRevision string
+	State              ViewGenerationState
+	CoveredFiles       int64
+	AffectedFiles      int64
+	StorageBytes       int64
+	Completeness       string
+	CreatedAt          int64 // unix seconds
+	PublishedAt        int64 // unix seconds
+	LastSelected       int64 // unix seconds
+	Error              string
 }
 
 // ViewGenerationFilter narrows a ListViewGenerations scan. Every field is

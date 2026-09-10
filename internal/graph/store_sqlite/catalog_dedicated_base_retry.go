@@ -24,6 +24,7 @@ func failedDedicatedBaseClaimTx(ctx context.Context, tx *sql.Tx, claim Dedicated
 		g.GraphID != desire.Authority.GraphID || g.CheckoutID != desire.Authority.Owner.CheckoutID ||
 		g.TreeOID == "" || g.TreeOID != desire.Identity.TreeOID || g.ConfigHash != desire.Identity.ConfigHash ||
 		g.ExtractorVersions != desire.Identity.ExtractorVersions || g.ResolverVersion != desire.Identity.ResolverVersion ||
+		g.DependencyRevision != desire.Identity.DependencyRevision ||
 		g.BaseGenerationID < 0 || g.BaseGenerationID != claim.BaseGenerationID || g.LayerID != claim.LayerID ||
 		g.LowerViewFingerprint != claim.LowerViewFingerprint {
 		return ViewGeneration{}, false, fmt.Errorf("%w: failed payload no longer matches its publication claim", ErrDedicatedBaseCandidate)

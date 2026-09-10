@@ -989,12 +989,12 @@ UPDATE dedicated_graphs SET is_primary_base = 1
 
 const viewGenerationColumns = `owner_kind, graph_id, layer_id, checkout_id, generation_kind,
 	base_generation_id, lower_view_fingerprint, tree_oid, provenance_commit_oid, config_hash,
-	extractor_versions, resolver_version, state, covered_files, affected_files, storage_bytes,
+	extractor_versions, resolver_version, dependency_revision, state, covered_files, affected_files, storage_bytes,
 	completeness, created_at, published_at, last_selected, error`
 
 const insertViewGenerationSQL = `
 INSERT INTO view_generations (` + viewGenerationColumns + `)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // viewGenerationInsertArgs binds one generation row in viewGenerationColumns
 // order, so the plain insert and the coalescing one cannot drift.
@@ -1005,7 +1005,7 @@ func viewGenerationInsertArgs(generation ViewGeneration) []any {
 		generation.GenerationKind, catalogNullInt(generation.BaseGenerationID),
 		generation.LowerViewFingerprint, generation.TreeOID,
 		catalogNullString(generation.ProvenanceCommitOID), generation.ConfigHash,
-		generation.ExtractorVersions, generation.ResolverVersion, string(generation.State),
+		generation.ExtractorVersions, generation.ResolverVersion, generation.DependencyRevision, string(generation.State),
 		generation.CoveredFiles, generation.AffectedFiles, generation.StorageBytes,
 		generation.Completeness, generation.CreatedAt, generation.PublishedAt,
 		generation.LastSelected, generation.Error,
@@ -1057,7 +1057,7 @@ func scanViewGeneration(scan func(...any) error, generation *ViewGeneration) err
 		&generation.OwnerKind, &generation.GraphID, &layerID, &checkoutID,
 		&generation.GenerationKind, &baseGeneration, &generation.LowerViewFingerprint,
 		&generation.TreeOID, &provenance, &generation.ConfigHash,
-		&generation.ExtractorVersions, &generation.ResolverVersion, &state,
+		&generation.ExtractorVersions, &generation.ResolverVersion, &generation.DependencyRevision, &state,
 		&generation.CoveredFiles, &generation.AffectedFiles, &generation.StorageBytes,
 		&generation.Completeness, &generation.CreatedAt, &generation.PublishedAt,
 		&generation.LastSelected, &generation.Error)
@@ -1218,7 +1218,7 @@ SELECT generation_id FROM view_generations
    AND IFNULL(base_generation_id, 0) = ?
    AND lower_view_fingerprint = ? AND tree_oid = ?
    AND IFNULL(provenance_commit_oid, '') = ? AND config_hash = ?
-   AND extractor_versions = ? AND resolver_version = ?
+   AND extractor_versions = ? AND resolver_version = ? AND dependency_revision = ?
  ORDER BY generation_id LIMIT 1`
 
 // AdoptOrCreateViewGeneration returns the id of the building generation this
@@ -1251,7 +1251,7 @@ func (c *Catalog) AdoptOrCreateViewGeneration(ctx context.Context, generation Vi
 				generation.GenerationKind, generation.LayerID, generation.CheckoutID,
 				generation.BaseGenerationID, generation.LowerViewFingerprint,
 				generation.TreeOID, generation.ProvenanceCommitOID, generation.ConfigHash,
-				generation.ExtractorVersions, generation.ResolverVersion).Scan(&generationID)
+				generation.ExtractorVersions, generation.ResolverVersion, generation.DependencyRevision).Scan(&generationID)
 			if err == nil {
 				adopted = true
 				// The exact match includes BaseGenerationID; reusing its row

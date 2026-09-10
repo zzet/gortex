@@ -58,7 +58,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		row.GraphID != claim.Desire.Authority.GraphID || row.CheckoutID != claim.Desire.Authority.Owner.CheckoutID ||
 		row.BaseGenerationID != 0 || row.LayerID != "" || row.LowerViewFingerprint != "" ||
 		row.TreeOID != identity.TreeOID || row.ConfigHash != identity.ConfigHash ||
-		row.ExtractorVersions != identity.ExtractorVersions || row.ResolverVersion != identity.ResolverVersion {
+		row.ExtractorVersions != identity.ExtractorVersions || row.ResolverVersion != identity.ResolverVersion || row.DependencyRevision != identity.DependencyRevision {
 		return 0, BuildReport{}, fmt.Errorf("%w: initial base reservation has incompatible payload identity", store_sqlite.ErrDedicatedBaseCandidate)
 	}
 	if row.State == store_sqlite.ViewGenerationReady || row.State == store_sqlite.ViewGenerationSuperseded {
@@ -90,7 +90,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		Identity: GenerationIdentity{OwnerKind: "dedicated_graph", GenerationKind: "dedicated",
 			GraphID: row.GraphID, CheckoutID: row.CheckoutID, TreeOID: row.TreeOID,
 			ProvenanceCommitOID: row.ProvenanceCommitOID, ConfigHash: row.ConfigHash,
-			ExtractorVersions: row.ExtractorVersions, ResolverVersion: row.ResolverVersion, CreatedAt: row.CreatedAt},
+			ExtractorVersions: row.ExtractorVersions, ResolverVersion: row.ResolverVersion, DependencyRevision: row.DependencyRevision, CreatedAt: row.CreatedAt},
 		Base: graph.New(), RootPath: request.RootPath,
 		RepoPrefix: claim.Desire.Authority.RepoPrefix, WorkspaceID: request.WorkspaceID,
 		ProjectID: request.ProjectID, PrePublish: request.PrePublish,
