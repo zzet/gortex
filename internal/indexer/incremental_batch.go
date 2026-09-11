@@ -988,13 +988,14 @@ func restubFrontierForStage(
 		return restubFrontier{conservative: true}
 	}
 	// reresolveAffectedByStages already built this snapshot for the same
-	// stage; reuse it when it is there and build the identical one from the
-	// prior view when the global passes are deferred.
-	snap := stage.abSnap
-	if snap == nil {
-		snap = snapshotAffectedByFromView(stage.priorNodes, view)
-	}
-	if snap == nil {
+	// stage; reuse its shapes when it is there. When it is not — the deferred
+	// (deferGlobalPasses / deferResolverCatchup) batches this path exists for
+	// — derive ONLY the shapes. snapshotAffectedByFromView would additionally
+	// walk every in-edge of every prior node to build refSources and record
+	// idsByKey, and the frontier reads neither; on a warm branch switch that
+	// second O(in-edges) pass is pure waste.
+	priorShapes := priorSymbolShapesFromView(stage, view)
+	if len(priorShapes) == 0 {
 		return restubFrontier{conservative: true}
 	}
 	fresh := semanticShapeSet(
@@ -1005,10 +1006,10 @@ func restubFrontierForStage(
 	freshVisibility := visibilityByStableKey(stage.result.Nodes)
 
 	changedNames := make(map[string]struct{})
-	for _, key := range semanticShapeDelta(snap.symbols, fresh) {
+	for _, key := range semanticShapeDelta(priorShapes, fresh) {
 		changedNames[stableSymbolKeyName(key)] = struct{}{}
 	}
-	for key := range snap.symbols {
+	for key := range priorShapes {
 		if priorVisibility[key] != freshVisibility[key] {
 			changedNames[stableSymbolKeyName(key)] = struct{}{}
 		}
@@ -1018,7 +1019,7 @@ func restubFrontierForStage(
 	// it does change the candidate set an existing referrer of that name
 	// should be re-offered, so it is part of this frontier.
 	for key := range fresh {
-		if _, known := snap.symbols[key]; !known {
+		if _, known := priorShapes[key]; !known {
 			changedNames[stableSymbolKeyName(key)] = struct{}{}
 		}
 	}
@@ -1405,6 +1406,40 @@ func (idx *Indexer) enrichAndMarkIncrementalStages(
 	}
 }
 
+// priorSymbolShapesFromView returns the per-stable-key PRE-EDIT shapes of one
+// stage's referenceable definitions — the only part of the affected-by
+// snapshot the restub frontier reads.
+//
+// It prefers the snapshot the affected-by pass already built for this stage
+// (byte-identical: snapshotAffectedByFromView composes its shapes with the
+// same loop semanticShapeSet runs, over the same adjacency). When there is
+// none, it derives the shapes alone rather than rebuilding the whole snapshot,
+// whose refSources walk is O(in-edges of every prior node) and whose idsByKey
+// the frontier never consults.
+//
+// An empty result means the stage defines no referenceable symbol, which is
+// exactly the condition snapshotAffectedByFromView reports by returning nil.
+func priorSymbolShapesFromView(
+	stage *incrementalBatchStage,
+	view incrementalPriorView,
+) map[string]symbolShape {
+	if stage == nil {
+		return nil
+	}
+	if stage.abSnap != nil {
+		return stage.abSnap.symbols
+	}
+	refNodes := semanticShapeNodes(stage.priorNodes)
+	if len(refNodes) == 0 {
+		return nil
+	}
+	return semanticShapeSet(refNodes, symbolShapeAdjacency{
+		inEdges:  view.inByNode,
+		outEdges: view.outByNode,
+		nodes:    view.nodesByID,
+	})
+}
+
 func snapshotAffectedByFromView(nodes []*graph.Node, view incrementalPriorView) *affectedBySnapshot {
 	refNodes := make([]*graph.Node, 0, len(nodes))
 	ownIDs := make(map[string]struct{}, len(nodes))
@@ -1503,13 +1538,58 @@ func affectedByDeltaFromExtraction(
 	return delta
 }
 
+// affectedByBatchPlan is the file set one affected-by pass will re-resolve,
+// plus everything needed to bound that set and to say so when the bound bites.
+// They travel together on purpose: a consumer that acts on the files has to be
+// able to tell a complete fan-out from a truncated one.
 type affectedByBatchPlan struct {
 	files []string
+	// maxFiles is the whole-batch bound this plan must be cut to. It rides on
+	// the plan so every site that applies the bound applies the SAME one
+	// without needing the Indexer's config in hand.
+	maxFiles int
+	// notify surfaces a cut. It is stamped by planAffectedByStages — the one
+	// constructor that holds the Indexer — so the fact is reported wherever
+	// the bound is applied, including at call sites that discard the bounded
+	// plan (indexer.go's exceptional-file merge does exactly that).
+	notify func(affectedByTruncation)
+	// truncation is the completeness fact for this plan: zero until the bound
+	// has been applied, set once it has.
+	truncation affectedByTruncation
 }
 
-func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(plan affectedByBatchPlan) {
+// bounded applies the whole-batch bound, reports a cut exactly once, and
+// returns the plan the pass will actually execute. p.files must already be
+// sorted.
+func (p affectedByBatchPlan) bounded() affectedByBatchPlan {
+	files, truncation := boundAffectedByFiles(p.files, p.maxFiles)
+	if truncation.Truncated && p.notify != nil {
+		p.notify(truncation)
+	}
+	return affectedByBatchPlan{
+		files: files, maxFiles: p.maxFiles, notify: p.notify, truncation: truncation,
+	}
+}
+
+// mergeDeferredAffected folds one structural chunk's affected set into the
+// batch-wide union and re-applies the whole-batch bound to the accumulated
+// result, returning the cumulative plan.
+//
+// Re-applying the bound on every merge is what makes this a bound on the
+// BATCH rather than on the chunk: a deferred reindex commits its stages in
+// chunks, and a per-chunk bound over C chunks re-resolves — and re-persists
+// reference facts for — up to C*cap files. Because the bound keeps the
+// lexicographically smallest cap entries, pruning incrementally lands on
+// exactly the set one bound over the complete union would have kept.
+//
+// The pruned entries leave the carrier too. Leaving them would let a file the
+// bound already rejected re-enter on the next merge and push the union back
+// over the cap.
+func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(
+	plan affectedByBatchPlan,
+) affectedByBatchPlan {
 	if b == nil {
-		return
+		return plan.bounded()
 	}
 	if len(plan.files) > 0 && b.deferredAffectedFiles == nil {
 		b.deferredAffectedFiles = make(map[string]struct{}, len(plan.files))
@@ -1519,9 +1599,21 @@ func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(plan affectedByBat
 			b.deferredAffectedFiles[filePath] = struct{}{}
 		}
 	}
+	union := b.deferredAffectedUnion()
+	union.maxFiles, union.notify = plan.maxFiles, plan.notify
+	bounded := union.bounded()
+	if bounded.truncation.Truncated {
+		kept := make(map[string]struct{}, len(bounded.files))
+		for _, filePath := range bounded.files {
+			kept[filePath] = struct{}{}
+		}
+		b.deferredAffectedFiles = kept
+	}
+	return bounded
 }
 
-func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPlan {
+// deferredAffectedUnion is the accumulated union in sorted order.
+func (b *reparsePendingEnrichmentBatch) deferredAffectedUnion() affectedByBatchPlan {
 	if b == nil {
 		return affectedByBatchPlan{}
 	}
@@ -1531,6 +1623,15 @@ func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPl
 	}
 	sort.Strings(files)
 	return affectedByBatchPlan{files: files}
+}
+
+// deferredAffectedPlan is what the deferred resolution catch-up executes. The
+// union it returns is already bounded and already reported:
+// mergeDeferredAffected re-applies the whole-batch bound on every chunk, so
+// the catch-up — which also persists reference facts for these files — never
+// widens past the cap, and the cut is not reported a second time here.
+func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPlan {
+	return b.deferredAffectedUnion()
 }
 
 func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affectedByBatchPlan {
@@ -1559,7 +1660,10 @@ func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affect
 		}
 	}
 	if len(filesByChanged) == 0 {
-		return affectedByBatchPlan{}
+		// Still carry the bound and the reporter: an empty chunk merged into
+		// a deferred batch must not hand mergeDeferredAffected a zero cap and
+		// leave the accumulated union unbounded.
+		return idx.emptyAffectedByPlan()
 	}
 
 	if reader, ok := idx.graph.(graph.RefFactsReader); ok && len(targetOwners) > 0 {
@@ -1599,33 +1703,40 @@ func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affect
 		}
 	}
 
-	plan := affectedByBatchPlan{}
+	// The union is returned UNBOUNDED and carries no completeness fact. The
+	// bound belongs to the batch, not to this stage set: a caller that runs
+	// the pass now bounds it here (reresolveAffectedByStages), and a caller
+	// that defers it merges this union into the batch-wide one and bounds
+	// that (mergeDeferredAffected). Bounding per changed path — which is what
+	// this function used to do — meant a batch of N changed paths re-resolved
+	// up to N*cap files and said nothing about it.
 	union := make(map[string]struct{})
-	for changedPath, fileSet := range filesByChanged {
-		files := make([]string, 0, len(fileSet))
+	for _, fileSet := range filesByChanged {
 		for filePath := range fileSet {
-			files = append(files, filePath)
-		}
-		sort.Strings(files)
-		if maxFiles := idx.affectedByMaxFiles(); len(files) > maxFiles {
-			idx.logger.Debug("affected-by: re-resolve set truncated",
-				zap.String("file", changedPath), zap.Int("affected", len(files)),
-				zap.Int("cap", maxFiles), zap.Int("dropped", len(files)-maxFiles))
-			files = files[:maxFiles]
-		}
-		if len(files) == 0 {
-			continue
-		}
-		for _, filePath := range files {
-			union[filePath] = struct{}{}
+			if filePath != "" {
+				union[filePath] = struct{}{}
+			}
 		}
 	}
-	plan.files = make([]string, 0, len(union))
+	files := make([]string, 0, len(union))
 	for filePath := range union {
-		plan.files = append(plan.files, filePath)
+		files = append(files, filePath)
 	}
-	sort.Strings(plan.files)
+	sort.Strings(files)
+	plan := idx.emptyAffectedByPlan()
+	plan.files = files
 	return plan
+}
+
+// emptyAffectedByPlan is a plan carrying no files but the batch's bound and
+// its reporter, so every plan this Indexer hands out bounds the same way.
+func (idx *Indexer) emptyAffectedByPlan() affectedByBatchPlan {
+	return affectedByBatchPlan{
+		maxFiles: idx.affectedByMaxFiles(),
+		notify: func(fact affectedByTruncation) {
+			idx.reportAffectedByTruncation("incremental_batch", fact)
+		},
+	}
 }
 
 func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
@@ -1638,7 +1749,7 @@ func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
 }
 
 func (idx *Indexer) reresolveAffectedByStages(stages []*incrementalBatchStage) {
-	plan := idx.planAffectedByStages(stages)
+	plan := idx.planAffectedByStages(stages).bounded()
 	idx.executeAffectedByPlan(plan)
 	if len(plan.files) > 0 {
 		idx.observeIncrementalCatchup("ref_facts", plan.files)
@@ -1772,7 +1883,18 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		// is conservative for all of them and every surviving in-edge is
 		// parked — the pre-gate behaviour, which is also the only correct one
 		// here: nothing comes back to bind to.
-		restubIncomingRefsFromView(idx.graph, stages, view)
+		//
+		// Nothing on this path re-states a carried edge: the eviction below
+		// deletes it and there is no AddBatch to put it back. A non-empty
+		// carry therefore means a deletion stage stopped being conservative,
+		// which would destroy those edges with no compile error to show for
+		// it — so the assumption is checked, not just documented.
+		if carried := restubIncomingRefsFromView(idx.graph, stages, view); len(carried) > 0 {
+			idx.logger.Error("indexer: deletion restub carried in-edges with no re-state path",
+				zap.String("repo", idx.repoPrefix),
+				zap.Int("carried", len(carried)),
+				zap.Int("files", len(graphPaths)))
+		}
 		idx.deleteEnrichmentByNodeIDs(nodeIDs)
 		// Canonical FTS lifetime is decided with its owners in the backend.
 		idx.deleteSymbolFTS(ftsNodeIDs)

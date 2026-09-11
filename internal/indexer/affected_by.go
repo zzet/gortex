@@ -57,12 +57,86 @@ import (
 // carries no explicit cap. See IndexConfig.AffectedByReresolveMax.
 const defaultAffectedByMax = 200
 
-// affectedByMaxFiles returns the effective fan-out cap.
+// affectedByMaxFiles returns the effective fan-out cap. The cap bounds ONE
+// pass — for a batch that is the whole batch, not each changed file in it: a
+// per-file cap over N changed files is a bound of N*cap, which is not a bound
+// at all on the batches this path actually sees (a branch switch reindexes
+// hundreds of paths at once). The sparse builder reads the same config key for
+// the same reason and applies it to the whole closure walk, not per seed
+// (builder_closure.go builderClosureCap).
 func (idx *Indexer) affectedByMaxFiles() int {
 	if n := idx.config.AffectedByReresolveMax; n > 0 {
 		return n
 	}
 	return defaultAffectedByMax
+}
+
+// affectedByTruncation is the completeness fact a bounded affected-by pass
+// emits. It is a fact, not a metric: a truncated pass leaves the dropped files
+// holding edges and persisted reference facts derived against the OLD shape,
+// so a caller that cannot tell a truncated fan-out from a complete one cannot
+// tell a coherent graph from an incoherent one. It mirrors
+// BuildReport.ClosureTruncated / ClosureCap on the sparse path, which publishes
+// a cut closure as knowingly incomplete rather than silently diverging
+// (builder_closure.go, builder_generation.go).
+type affectedByTruncation struct {
+	// Truncated is the fact itself: the bound fired.
+	Truncated bool
+	// Cap is the bound that fired and Considered the size of the union
+	// before it.
+	Cap        int
+	Considered int
+	// Dropped lists, sorted, the referencing files the pass did NOT
+	// re-resolve. They still hold stale edges and stale durable facts.
+	Dropped []string
+}
+
+// boundAffectedByFiles applies the whole-batch bound to an already-sorted
+// union of referencing files and returns the kept prefix plus the completeness
+// fact.
+//
+// Sorting is the caller's job and is load-bearing: keeping the
+// lexicographically smallest cap entries makes a truncated batch the same
+// batch on every run of the same inputs, and — because that choice is
+// order-independent — makes an incrementally maintained bound identical to a
+// one-shot bound over the same union. It is the same determinism rule
+// closureWalk.admitAll relies on (builder_closure.go).
+//
+// A non-positive cap is treated as "no bound": affectedByMaxFiles never
+// returns one, but an explicit zero must not mean "re-resolve nothing".
+func boundAffectedByFiles(files []string, maxFiles int) ([]string, affectedByTruncation) {
+	fact := affectedByTruncation{Cap: maxFiles, Considered: len(files)}
+	if maxFiles <= 0 || len(files) <= maxFiles {
+		return files, fact
+	}
+	fact.Truncated = true
+	fact.Dropped = append([]string(nil), files[maxFiles:]...)
+	return files[:maxFiles], fact
+}
+
+// reportAffectedByTruncation surfaces the completeness fact exactly once per
+// bound application.
+//
+// It is a Warn, not the Debug the pass used to emit: the sparse builder logs
+// its own cut closure at Warn (builder_closure.go), and the two say the same
+// thing — the pass knowingly left dependents reading a stale resolution. The
+// message and the affected/cap/dropped field names are the pre-existing
+// contract (affected_by_e2e_test.go reads them); scope replaces the single
+// changed-file name, which a whole-batch bound no longer has.
+//
+// The dropped set also rides the pass-observation hook, so a caller can name
+// the files that were not re-resolved without parsing logs.
+func (idx *Indexer) reportAffectedByTruncation(scope string, fact affectedByTruncation) {
+	if idx == nil || !fact.Truncated {
+		return
+	}
+	idx.logger.Warn("affected-by: re-resolve set truncated",
+		zap.String("repo", idx.repoPrefix),
+		zap.String("scope", scope),
+		zap.Int("affected", fact.Considered),
+		zap.Int("cap", fact.Cap),
+		zap.Int("dropped", len(fact.Dropped)))
+	idx.observeIncrementalCatchup("affected_by_truncated", fact.Dropped)
 }
 
 // symbolShape is the per-symbol contract the delta compares under the
@@ -565,14 +639,8 @@ func (idx *Indexer) reresolveAffectedBy(changedPath string, snap *affectedBySnap
 	if len(files) == 0 {
 		return
 	}
-	if maxFiles := idx.affectedByMaxFiles(); len(files) > maxFiles {
-		idx.logger.Debug("affected-by: re-resolve set truncated",
-			zap.String("file", changedPath),
-			zap.Int("affected", len(files)),
-			zap.Int("cap", maxFiles),
-			zap.Int("dropped", len(files)-maxFiles))
-		files = files[:maxFiles]
-	}
+	files, truncation := boundAffectedByFiles(files, idx.affectedByMaxFiles())
+	idx.reportAffectedByTruncation(changedPath, truncation)
 	idx.resolver.ResolveFilesAndIncoming(files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), files)
 	idx.persistRefFactsForFiles(files)
