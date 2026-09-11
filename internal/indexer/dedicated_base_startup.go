@@ -69,6 +69,53 @@ type InitialBasePublication struct {
 	Advanced bool
 	Skipped  string
 	Err      error
+
+	// Live marks an outcome the git watcher's HEAD-change finalize path asked
+	// for, as opposed to one this daemon start scheduled.
+	Live bool
+	// TreeOID is the committed tree the publication was FOR. It is reported
+	// because a live advance resolves its own target from Git rather than
+	// from the checkout row, so "which tree did this publish" is not
+	// answerable from the catalog's checkouts table alone until W4.4.
+	TreeOID string
+}
+
+// dedicatedBaseTarget names the committed point one publication is for.
+//
+// The startup publisher leaves it zero and takes the owner checkout row's
+// head_commit/head_tree: a start has just reconciled the family, so that row
+// is the freshest fact available.
+//
+// A LIVE advance cannot use it. `checkouts.head_tree` is written by the
+// reconciler's family pass (internal/reconcile/reconcile.go:448, :605 through
+// `headFor`) and by nothing on the ref-transition path, so at the instant the
+// git watcher observes a new commit the row still names the PREVIOUS tree —
+// the window W4.4 closes by advancing head_tree with adoption. The trigger
+// therefore resolves the target from Git itself and hands it in. Publishing
+// ahead of the row is coherent for every reader: once a base is adopted,
+// `primaryBase` reads the tree off the GENERATION row and not off the checkout
+// (checkout_coordinator.go:1258-1281), and only the unpublished fallback below
+// it reads `owner.HeadTree`.
+type dedicatedBaseTarget struct {
+	CommitOID string
+	TreeOID   string
+}
+
+// basePublishRequest is one queued publication.
+//
+// live requests carry the observed root so the publisher can refuse to
+// publish a graph whose owner checkout is NOT the working copy the watcher
+// observed: a linked worktree tracked as its own repository has its own HEAD,
+// and stamping the owner's base with a sibling's commit would publish a tree
+// the owner never had.
+type basePublishRequest struct {
+	prefix string
+	target dedicatedBaseTarget
+	root   string
+	live   bool
+	// done, when set, is called with the outcome after the worker records it.
+	// It runs off the publisher's lock.
+	done func(InitialBasePublication)
 }
 
 // InitialBasePublisher publishes the initial committed base for the dedicated
@@ -114,18 +161,39 @@ type InitialBasePublisher struct {
 	// end with this publisher's context cancelled and no entry left behind.
 	release func()
 
+	// advance is the live HEAD-change trigger this publisher owns. It shares
+	// this publisher's queue, so the process runs exactly ONE committed-base
+	// publication at a time whichever source asked for it: a startup
+	// publication and a watcher-observed advance for the same graph can
+	// otherwise reach two concurrent physical builds of the same tree.
+	advance *DedicatedBaseAdvanceTrigger
+
 	mu        sync.Mutex
 	scheduled map[string]struct{}
-	// pending is the FIFO of prefixes that have been scheduled and not yet
-	// attempted. It is a slice, not a channel: the enqueue side runs on the
-	// readiness path and must never wait for the drain side, whatever the
-	// repository count.
-	pending []string
-	// queued counts every prefix accepted into pending; attempted counts every
-	// one the worker has finished with (published, skipped or failed). Wait
-	// blocks while attempted < queued. PublishRepo touches neither, which is
-	// what keeps the accounting exact: it is a synchronous call whose result
-	// the caller already has, not scheduled work.
+	// pendingOrder is the FIFO of prefixes with an unattempted request, and
+	// pendingReq holds the request itself. It is a slice plus a map, not a
+	// channel: the startup enqueue side runs on the readiness path and must
+	// never wait for the drain side, whatever the repository count, and the
+	// live enqueue side must be able to REPLACE a queued request in place so
+	// a burst of HEAD changes coalesces to its newest target instead of
+	// publishing every intermediate commit.
+	pendingOrder []string
+	pendingReq   map[string]basePublishRequest
+	// drainReleased is BeginDraining's flag. A startup request is only
+	// admitted by the worker once it is set, which is what keeps "ready, then
+	// publish" a property of the code. A LIVE request ignores it: the git
+	// watcher is started after the readiness flip (warmupDaemonState brings
+	// the MultiWatcher up in its last step), so a HEAD change cannot precede
+	// readiness, and making an advance wait on a flag it can never observe
+	// unset would only strand it.
+	drainReleased bool
+	// queued counts every request accepted into the queue; attempted counts
+	// every one the worker has finished with (published, skipped or failed).
+	// Wait blocks while attempted < queued. PublishRepo touches neither,
+	// which is what keeps the accounting exact: it is a synchronous call
+	// whose result the caller already has, not scheduled work. A live request
+	// that REPLACES a queued one does not count twice — the queue depth did
+	// not move, so neither does the accounting.
 	queued    int
 	attempted int
 	outcomes  []InitialBasePublication
@@ -168,16 +236,31 @@ func NewInitialBasePublisher(lifecycle *CheckoutLifecycle) (*InitialBasePublishe
 		logger = zap.NewNop()
 	}
 	p := &InitialBasePublisher{
-		lifecycle: lifecycle,
-		runtime:   runtime,
-		logger:    logger,
-		scheduled: map[string]struct{}{},
-		changed:   make(chan struct{}),
-		wake:      make(chan struct{}, 1),
-		done:      make(chan struct{}),
+		lifecycle:  lifecycle,
+		runtime:    runtime,
+		logger:     logger,
+		scheduled:  map[string]struct{}{},
+		pendingReq: map[string]basePublishRequest{},
+		changed:    make(chan struct{}),
+		wake:       make(chan struct{}, 1),
+		done:       make(chan struct{}),
 	}
 	p.ctx, p.cancel, p.release = runtime.publicationContext(context.Background())
+	// The live advancement trigger is installed here rather than by the daemon
+	// because this is the one construction site that already holds everything
+	// it needs — the lifecycle, the installed runtime and the shared lease
+	// domain — and because the git watcher that reaches it is built by
+	// MultiWatcher, which holds none of them. See the registry's own comment.
+	p.advance = newDedicatedBaseAdvanceTrigger(p)
 	return p, nil
+}
+
+// AdvanceTrigger is the live HEAD-change trigger bound to this publisher.
+func (p *InitialBasePublisher) AdvanceTrigger() *DedicatedBaseAdvanceTrigger {
+	if p == nil {
+		return nil
+	}
+	return p.advance
 }
 
 // Schedule asks for one repository's initial committed base.
@@ -207,11 +290,80 @@ func (p *InitialBasePublisher) Schedule(repoPrefix string) {
 		return
 	}
 	p.scheduled[repoPrefix] = struct{}{}
-	p.pending = append(p.pending, repoPrefix)
-	p.queued++
-	p.notifyLocked()
+	p.enqueueLocked(basePublishRequest{prefix: repoPrefix})
 	p.mu.Unlock()
 	p.nudge()
+}
+
+// enqueueAdvance queues one live committed-base advance, coalescing a burst to
+// its newest target.
+//
+// A queued request for the same repository is REPLACED rather than appended
+// to: the newest observed commit supersedes every older one, so ten commits
+// landing while one publication runs cost one follow-up publication of the
+// tenth tree, not ten publications of ten trees. Replacement keeps the FIFO
+// position and the queue depth, so the accounting Wait reads stays exact.
+//
+// It reports whether the request was accepted; a stopped publisher accepts
+// nothing.
+func (p *InitialBasePublisher) enqueueAdvance(req basePublishRequest) bool {
+	if p == nil || req.prefix == "" {
+		return false
+	}
+	req.live = true
+	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return false
+	}
+	p.enqueueLocked(req)
+	p.mu.Unlock()
+	// A live advance starts the worker itself. Unlike a startup publication it
+	// cannot precede the readiness flip (watchers come up after it), so there
+	// is no ordering left for BeginDraining to protect here — and a HEAD
+	// change on a daemon whose warmup never reached BeginDraining would
+	// otherwise never be published at all.
+	p.worker.Do(func() { go p.run() })
+	p.nudge()
+	return true
+}
+
+// enqueueLocked appends or replaces one request. The caller holds p.mu.
+func (p *InitialBasePublisher) enqueueLocked(req basePublishRequest) {
+	if p.pendingReq == nil {
+		p.pendingReq = map[string]basePublishRequest{}
+	}
+	if _, queued := p.pendingReq[req.prefix]; queued {
+		// Same slot, newer target: the depth did not move, so neither does
+		// the accounting. A replaced request's completion callback is dropped
+		// with it — its caller is the trigger, which re-reads the outcome of
+		// whichever request actually runs.
+		p.pendingReq[req.prefix] = req
+		return
+	}
+	p.pendingReq[req.prefix] = req
+	p.pendingOrder = append(p.pendingOrder, req.prefix)
+	p.queued++
+	p.notifyLocked()
+}
+
+// popLocked takes the first request the worker may attempt now. A startup
+// request is admitted only once BeginDraining has released the queue; a live
+// one always is. The caller holds p.mu.
+func (p *InitialBasePublisher) popLocked() (basePublishRequest, bool) {
+	for i, prefix := range p.pendingOrder {
+		req, ok := p.pendingReq[prefix]
+		if !ok {
+			continue
+		}
+		if !req.live && !p.drainReleased {
+			continue
+		}
+		p.pendingOrder = append(p.pendingOrder[:i:i], p.pendingOrder[i+1:]...)
+		delete(p.pendingReq, prefix)
+		return req, true
+	}
+	return basePublishRequest{}, false
 }
 
 // BeginDraining releases the queue. Publication starts here and nowhere
@@ -228,6 +380,9 @@ func (p *InitialBasePublisher) BeginDraining() {
 	}
 	p.mu.Lock()
 	stopped := p.closed || p.ctx.Err() != nil
+	if !stopped {
+		p.drainReleased = true
+	}
 	p.mu.Unlock()
 	if stopped {
 		return
@@ -254,8 +409,9 @@ func (p *InitialBasePublisher) run() {
 	defer close(p.done)
 	for {
 		p.mu.Lock()
-		if len(p.pending) == 0 {
-			p.mu.Unlock()
+		req, ok := p.popLocked()
+		p.mu.Unlock()
+		if !ok {
 			select {
 			case <-p.ctx.Done():
 				return
@@ -263,22 +419,19 @@ func (p *InitialBasePublisher) run() {
 				continue
 			}
 		}
-		prefix := p.pending[0]
-		p.pending = p.pending[1:]
-		p.mu.Unlock()
 		if p.ctx.Err() != nil {
 			// Cancelled between dequeue and publish. Record the skip so the
 			// accounting Wait reads stays exact for this item, then stop:
 			// whatever is still pending is abandoned, and Wait reports the
 			// cancellation rather than completion.
-			p.record(InitialBasePublication{RepoPrefix: prefix, Skipped: "publisher stopped"})
+			p.record(InitialBasePublication{RepoPrefix: req.prefix, Live: req.live, Skipped: "publisher stopped"}, req.done)
 			return
 		}
-		p.record(p.publish(p.ctx, prefix))
+		p.record(p.publish(p.ctx, req), req.done)
 	}
 }
 
-func (p *InitialBasePublisher) record(outcome InitialBasePublication) {
+func (p *InitialBasePublisher) record(outcome InitialBasePublication, done func(InitialBasePublication)) {
 	p.mu.Lock()
 	p.outcomes = append(p.outcomes, outcome)
 	p.attempted++
@@ -299,7 +452,11 @@ func (p *InitialBasePublisher) record(outcome InitialBasePublication) {
 			zap.String("repo", outcome.RepoPrefix), zap.String("graph", outcome.GraphID),
 			zap.Int64("generation", outcome.GenerationID),
 			zap.Bool("already_adopted", outcome.AlreadyAdopted),
-			zap.Bool("advanced", outcome.Advanced))
+			zap.Bool("advanced", outcome.Advanced),
+			zap.Bool("live", outcome.Live))
+	}
+	if done != nil {
+		done(outcome)
 	}
 }
 
@@ -386,6 +543,7 @@ func (p *InitialBasePublisher) Close() {
 	}
 	p.closed = true
 	p.mu.Unlock()
+	p.advance.close()
 	p.cancel()
 	if p.release != nil {
 		p.release()
@@ -408,12 +566,13 @@ func (p *InitialBasePublisher) PublishRepo(ctx context.Context, repoPrefix strin
 	if ctx == nil {
 		ctx = p.ctx
 	}
-	return p.publish(ctx, repoPrefix)
+	return p.publish(ctx, basePublishRequest{prefix: repoPrefix})
 }
 
 // publish is the whole protocol for one repository.
-func (p *InitialBasePublisher) publish(ctx context.Context, repoPrefix string) InitialBasePublication {
-	out := InitialBasePublication{RepoPrefix: repoPrefix}
+func (p *InitialBasePublisher) publish(ctx context.Context, req basePublishRequest) InitialBasePublication {
+	repoPrefix := req.prefix
+	out := InitialBasePublication{RepoPrefix: repoPrefix, Live: req.live}
 	if err := ctx.Err(); err != nil {
 		out.Skipped = "publisher stopped"
 		return out
@@ -440,9 +599,27 @@ func (p *InitialBasePublisher) publish(ctx context.Context, repoPrefix string) I
 		return out
 	}
 	out.CheckoutID = checkout.CheckoutID
-	if checkout.HeadTree == "" {
+	target := dedicatedBaseTarget{CommitOID: checkout.HeadCommit, TreeOID: checkout.HeadTree}
+	if req.live {
+		// A watcher observes ONE working copy. If the graph this prefix names
+		// is owned by a different checkout, that checkout's HEAD is not the
+		// one that moved, and stamping its base with this commit would
+		// publish a tree the owner never had.
+		if !sameCheckoutRoot(req.root, checkout.RootPath) {
+			out.Skipped = "observed root is not the dedicated owner"
+			return out
+		}
+		tree, err := dedicatedBaseCommitTree(ctx, checkout.RootPath, req.target.CommitOID)
+		if err != nil {
+			out.Err = err
+			return out
+		}
+		target = dedicatedBaseTarget{CommitOID: req.target.CommitOID, TreeOID: tree}
+	}
+	out.TreeOID = target.TreeOID
+	if target.TreeOID == "" {
 		// Nothing committed to publish. A family whose reconcile has not yet
-		// named a HEAD tree is not an error; the next start, or W4.3's
+		// named a HEAD tree is not an error; the next start, or the live
 		// advancement trigger, publishes it.
 		out.Skipped = "owner has no committed tree"
 		return out
@@ -469,7 +646,7 @@ func (p *InitialBasePublisher) publish(ctx context.Context, repoPrefix string) I
 	}
 
 	observe := func(ctx context.Context) (dedicatedBaseObservation, error) {
-		return p.observe(ctx, graphID, repoPrefix)
+		return p.observe(ctx, graphID, repoPrefix, target)
 	}
 	var result dedicatedBaseResult
 	if graph.ActiveGenerationID == 0 {
@@ -522,7 +699,10 @@ func (p *InitialBasePublisher) publish(ctx context.Context, repoPrefix string) I
 // cohort. That is what makes the observation stable — the runtime holds the
 // graph's observation gate across this call and compares the pointer it
 // returns against the catalog inside the same gate.
-func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix string) (dedicatedBaseObservation, error) {
+// The target names the committed point being published: a live advance
+// resolved it from Git before entering the gate, a startup publication leaves
+// it zero and takes the owner checkout row's own head.
+func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix string, target dedicatedBaseTarget) (dedicatedBaseObservation, error) {
 	l := p.lifecycle
 	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
@@ -535,7 +715,14 @@ func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix 
 	if err != nil {
 		return dedicatedBaseObservation{}, err
 	}
-	if !found || checkout.HeadTree == "" {
+	if !found {
+		return dedicatedBaseObservation{}, fmt.Errorf("%w: dedicated owner %s is gone",
+			store_sqlite.ErrCatalogStaleGuard, graph.OwnerCheckoutID)
+	}
+	if target.TreeOID == "" {
+		target = dedicatedBaseTarget{CommitOID: checkout.HeadCommit, TreeOID: checkout.HeadTree}
+	}
+	if target.TreeOID == "" {
 		return dedicatedBaseObservation{}, fmt.Errorf("%w: dedicated owner %s has no committed tree",
 			store_sqlite.ErrCatalogStaleGuard, graph.OwnerCheckoutID)
 	}
@@ -601,7 +788,7 @@ func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix 
 	}
 	return dedicatedBaseObservation{
 		Identity: store_sqlite.DedicatedBaseIdentity{
-			TreeOID:            checkout.HeadTree,
+			TreeOID:            target.TreeOID,
 			ConfigHash:         checkoutConfigHash(fingerprint, sections),
 			ExtractorVersions:  extractorVersionsFingerprint(),
 			ResolverVersion:    resolverVersionFingerprint(),
@@ -611,7 +798,7 @@ func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix 
 		RootPath:                   checkout.RootPath,
 		WorkspaceID:                idx.WorkspaceID(),
 		ProjectID:                  idx.ProjectID(),
-		ProvenanceCommitOID:        checkout.HeadCommit,
+		ProvenanceCommitOID:        target.CommitOID,
 		CreatedAt:                  now().Unix(),
 		Builder:                    *builder,
 	}, nil

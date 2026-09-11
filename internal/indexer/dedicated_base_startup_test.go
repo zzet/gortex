@@ -555,7 +555,7 @@ func TestInitialBasePublisherObservationCarriesTheFrozenIdentity(t *testing.T) {
 	require.NoError(t, err)
 	publisher := startupPublisher(t, f)
 
-	observation, err := publisher.observe(ctx, GraphIDFor(registered.Prefix), registered.Prefix)
+	observation, err := publisher.observe(ctx, GraphIDFor(registered.Prefix), registered.Prefix, dedicatedBaseTarget{})
 	require.NoError(t, err)
 	checkout := f.checkoutOf(registered.Prefix)
 	require.Equal(t, checkout.HeadTree, observation.Identity.TreeOID)

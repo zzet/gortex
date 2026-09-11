@@ -263,7 +263,7 @@ func (gw *GitWatcher) registeredIndexer() *Indexer {
 // after the restamp; failed lane admission therefore leaves the prior SHA for
 // the next ref notification to retry.
 func (gw *GitWatcher) finalizeReconcile(ctx context.Context, newSHA string) error {
-	return gw.indexer.coordinateRepositoryMutation(ctx, OutputEntryGitWatcherFinalize, func() error {
+	if err := gw.indexer.coordinateRepositoryMutation(ctx, OutputEntryGitWatcherFinalize, func() error {
 		idx := gw.registeredIndexer()
 		if idx == nil {
 			return fmt.Errorf("git-watcher: repository indexer is no longer registered")
@@ -273,7 +273,42 @@ func (gw *GitWatcher) finalizeReconcile(ctx context.Context, newSHA string) erro
 		gw.lastSHA = newSHA
 		gw.mu.Unlock()
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	gw.dispatchDedicatedBaseAdvance(newSHA)
+	return nil
+}
+
+// dispatchDedicatedBaseAdvance hands an observed HEAD movement to the
+// committed-base advancement trigger.
+//
+// This is the ONE production source of committed advancement on a running
+// daemon, and it sits here rather than anywhere else for two reasons. It is
+// downstream of a real ref transition — reconcile reaches finalizeReconcile
+// only after `oldSHA != newSHA`, so nothing here fires for the mere passage of
+// time, which is what keeps a poll or a janitor tick from allocating a payload
+// generation. And it is downstream of the generation-0 reconcile above rather
+// than inside it: the repository mutation lane this method just released is
+// held by every point mutation in the repository, and a committed base is a
+// bounded index of a committed tree — holding the lane across it would stall
+// every watcher write for its length. The trigger itself only queues.
+func (gw *GitWatcher) dispatchDedicatedBaseAdvance(newSHA string) {
+	if gw == nil || newSHA == "" {
+		return
+	}
+	idx := gw.registeredIndexer()
+	if idx == nil {
+		return
+	}
+	trigger := dedicatedBaseAdvanceTriggerFor(idx.repositoryMutationOwner)
+	if trigger == nil {
+		// No committed-base publisher is installed (a non-sqlite backend, or a
+		// stack with no checkout lifecycle). Generation 0 has already been
+		// reconciled above; there is simply no committed base to advance.
+		return
+	}
+	trigger.HeadChanged(idx.repoPrefix, gw.repoPath, newSHA)
 }
 
 // Start sets up fsnotify watches on the repo's git control files and
