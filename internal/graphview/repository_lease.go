@@ -83,6 +83,106 @@ type RepositoryDrain struct {
 	done  chan struct{}
 }
 
+// RepositoryRegistration is the identity of ONE dedicated registration object,
+// the dedicated counterpart of RawRepositoryRegistration. It is minted by the
+// registration that created the live state and never resolves to a later
+// registration that reuses the same prefix, graph ID or complete owner tuple.
+// Closing through it is therefore reuse-safe: a stale publisher/drain holder or
+// a delayed cleanup callback can only ever close what it actually captured.
+type RepositoryRegistration struct {
+	mgr   *LeaseManager
+	state *repositoryOwnerState
+}
+
+// Owner reports the registered owner tuple, the zero value for a nil handle or
+// one that does not name a dedicated registration.
+func (r *RepositoryRegistration) Owner() RepositoryOwner {
+	if r == nil || r.state == nil || r.state.rawOwner != nil {
+		return RepositoryOwner{}
+	}
+	return r.state.owner
+}
+
+// dedicatedRegistrationLocked mirrors rawRegistrationLocked: a handle is live
+// only while this manager still serves that exact object under BOTH identity
+// indexes and it has not been finalized. Closing tombstones stay addressable so
+// that re-closing the captured registration remains idempotent.
+func (m *LeaseManager) dedicatedRegistrationLocked(registration *RepositoryRegistration) (*repositoryOwnerState, error) {
+	if registration == nil || registration.mgr != m || registration.state == nil || registration.state.rawOwner != nil {
+		return nil, ErrRepositoryOwnerInvalid
+	}
+	state := registration.state
+	owner := state.owner
+	if !owner.valid() {
+		return nil, ErrRepositoryOwnerInvalid
+	}
+	if m.repositories.byPrefix[owner.RepoPrefix] != state || m.repositories.byGraph[owner.GraphID] != state || state.finalized {
+		return nil, fmt.Errorf("%w: prefix %q", ErrRepositoryOwnerUnknown, owner.RepoPrefix)
+	}
+	return state, nil
+}
+
+// RegisterRepositoryOwnerHandle registers owner exactly as
+// RegisterRepositoryOwnerPrepared does and additionally returns the identity
+// handle of the registration that is live for it, so the caller can later close
+// THAT registration instead of whatever object happens to hold the prefix. Like
+// the raw path it is idempotent for the currently open identical owner.
+//
+// The handle is resolved in a second critical section, so a caller that shares
+// a prefix with a concurrent registrar must serialize its own registration and
+// finalization for that prefix; the lifecycle's admission mutex already does,
+// and it is the only in-tree registrar of this owner domain.
+func (m *LeaseManager) RegisterRepositoryOwnerHandle(owner RepositoryOwner, prepare func() error) (*RepositoryRegistration, error) {
+	if err := m.RegisterRepositoryOwnerPrepared(owner, prepare); err != nil {
+		return nil, err
+	}
+	r := &m.repositories
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.byPrefix[owner.RepoPrefix]
+	if state == nil || state.rawOwner != nil || state.owner != owner || state.finalized {
+		return nil, fmt.Errorf("%w: prefix %q", ErrRepositoryOwnerUnknown, owner.RepoPrefix)
+	}
+	return &RepositoryRegistration{mgr: m, state: state}, nil
+}
+
+// CloseRepositoryRegistration closes the captured registration, once, by object
+// identity, and is the close every production caller uses. A handle whose
+// registration was already finalized — including one whose prefix, graph ID or
+// entire owner tuple has since been reused by a replacement registration — is
+// refused instead of closing the replacement. Existing leases stay valid, the
+// tombstone survives draining until explicit finalization, and re-closing the
+// same registration returns the same drain.
+func (m *LeaseManager) CloseRepositoryRegistration(registration *RepositoryRegistration) (*RepositoryDrain, error) {
+	if m == nil {
+		return nil, ErrRepositoryOwnerInvalid
+	}
+	r := &m.repositories
+	r.mu.Lock()
+	state, err := m.dedicatedRegistrationLocked(registration)
+	if err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	r.closeLocked(m, state)
+	notifications := r.drainLocked(state, nil)
+	drain := state.drain
+	r.mu.Unlock()
+	runRepositoryNotifications(notifications)
+	return drain, nil
+}
+
+// Registration re-addresses the exact registration this cleanup capability was
+// created for. A holder of the drain can re-close or validate that object
+// without going back through a reusable owner tuple. It is nil for a raw
+// registration's drain, which is addressed by RawRepositoryRegistration.
+func (d *RepositoryDrain) Registration() *RepositoryRegistration {
+	if d == nil || d.mgr == nil || d.state == nil || d.state.rawOwner != nil {
+		return nil
+	}
+	return &RepositoryRegistration{mgr: d.mgr, state: d.state}
+}
+
 // RegisterRepositoryOwner explicitly opens one owner. Re-registering the exact
 // currently open owner is idempotent. Neither a closing owner nor another
 // incarnation may reopen its prefix or graph ID before explicit finalization.
@@ -226,10 +326,17 @@ func (l *RepositoryReadLease) Release() {
 	runRepositoryNotifications(notifications)
 }
 
-// CloseRepositoryAdmission closes one registered owner, once. Existing leases
-// remain valid; no new reader can cross this boundary. A close is already
-// drained only with zero explicit pins AND zero broad readers. The tombstone
-// survives draining until explicit finalization.
+// CloseRepositoryAdmission closes one registered owner, once, by owner TUPLE:
+// it resolves whichever registration currently serves that prefix, so a caller
+// holding a stale tuple closes a replacement registration that reused the same
+// identity strings. It is retained only for callers that provably hold the
+// current identity; every production caller captures a RepositoryRegistration
+// at registration time and closes through CloseRepositoryRegistration instead.
+//
+// Otherwise identical: existing leases remain valid, no new reader can cross
+// this boundary, a close is already drained only with zero explicit pins AND
+// zero broad readers, and the tombstone survives draining until explicit
+// finalization.
 func (m *LeaseManager) CloseRepositoryAdmission(owner RepositoryOwner) (*RepositoryDrain, error) {
 	if m == nil || !owner.valid() {
 		return nil, ErrRepositoryOwnerInvalid

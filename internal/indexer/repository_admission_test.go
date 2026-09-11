@@ -97,6 +97,52 @@ func TestLifecycleRepositoryAdmissionRestoresClosingBeforeSeed(t *testing.T) {
 	}
 }
 
+// TestLifecycleRepositoryCloseAddressesTheCapturedRegistration traces the
+// production close entrypoint (closeRepositoryAdmission ->
+// restoreRepositoryAdmissionLocked) onto the handle-identity primitive. Closing
+// must address the registration this lifecycle opened and captured, never
+// whatever registration currently serves the prefix: once a registration is
+// finalized and an identical owner tuple is registered again, a delayed cleanup
+// re-entry must be refused instead of closing the replacement (gate 7).
+func TestLifecycleRepositoryCloseAddressesTheCapturedRegistration(t *testing.T) {
+	lifecycle, identity := repositoryAdmissionFixture(t)
+	ctx := context.Background()
+	if err := lifecycle.RegisterRepositoryOwner(ctx, identity.GraphID); err != nil {
+		t.Fatal(err)
+	}
+	owner := repositoryCleanupOwner(identity)
+	_, drain, found, err := lifecycle.closeRepositoryAdmission(ctx, identity.GraphID)
+	if err != nil || !found {
+		t.Fatalf("close found=%v err=%v", found, err)
+	}
+	if got := drain.Registration().Owner(); got != owner {
+		t.Fatalf("captured registration owner=%+v want %+v", got, owner)
+	}
+	// A repeated cleanup attempt re-closes the same registration object.
+	_, again, found, err := lifecycle.closeRepositoryAdmission(ctx, identity.GraphID)
+	if err != nil || !found || again != drain {
+		t.Fatalf("second close drain=%p want %p found=%v err=%v", again, drain, found, err)
+	}
+	// The delayed-callback window: the captured registration is finalized and
+	// the exact same owner tuple is registered again by a later track. The
+	// lifecycle still names the old cleanup capability for this graph.
+	<-drain.Done()
+	if err := lifecycle.leases.FinalizeRepositoryCleanup(drain); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.leases.RegisterRepositoryOwner(owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, stale, _, err := lifecycle.closeRepositoryAdmission(ctx, identity.GraphID); !errors.Is(err, graphview.ErrRepositoryOwnerUnknown) || stale != nil {
+		t.Fatalf("delayed cleanup closed a replacement registration: drain=%p err=%v", stale, err)
+	}
+	read, err := lifecycle.leases.AcquireRepositoryRead(owner)
+	if err != nil {
+		t.Fatalf("replacement registration did not survive the delayed cleanup: %v", err)
+	}
+	read.Release()
+}
+
 type repositoryAdmissionPublisher struct {
 	registered []store_sqlite.DedicatedBaseOwner
 	closed     []store_sqlite.DedicatedBaseOwner

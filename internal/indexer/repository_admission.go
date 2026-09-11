@@ -200,16 +200,25 @@ func (l *CheckoutLifecycle) restoreRepositoryAdmissionLocked(identity store_sqli
 		if previous != owner {
 			return nil, fmt.Errorf("%w: graph %s cleanup owner changed", graphview.ErrRepositoryOwnerConflict, owner.GraphID)
 		}
-	} else {
-		if err := l.leases.RegisterRepositoryOwner(owner); err != nil {
-			return nil, err
+		// Re-entry re-closes the registration this lifecycle already closed,
+		// addressed through the cleanup capability it captured. Resolving the
+		// owner tuple again would let a delayed callback close a replacement
+		// registration that reused the prefix/graph ID after finalization.
+		if drain := l.repositoryClosing[owner.GraphID]; drain != nil {
+			return l.leases.CloseRepositoryRegistration(drain.Registration())
 		}
-		if l.repositoryOwners == nil {
-			l.repositoryOwners = make(map[string]graphview.RepositoryOwner)
-		}
-		l.repositoryOwners[owner.GraphID] = owner
 	}
-	drain, err := l.leases.CloseRepositoryAdmission(owner)
+	// Registration hands back the identity of the object it opened (idempotent
+	// for an already open identical owner), and only that object is closed.
+	registration, err := l.leases.RegisterRepositoryOwnerHandle(owner, nil)
+	if err != nil {
+		return nil, err
+	}
+	if l.repositoryOwners == nil {
+		l.repositoryOwners = make(map[string]graphview.RepositoryOwner)
+	}
+	l.repositoryOwners[owner.GraphID] = owner
+	drain, err := l.leases.CloseRepositoryRegistration(registration)
 	if err != nil {
 		return nil, err
 	}
