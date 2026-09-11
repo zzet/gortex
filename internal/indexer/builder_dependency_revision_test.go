@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -76,10 +77,26 @@ func TestDependencyRevisionOrdinaryBuilderCarriesMetadata(t *testing.T) {
 
 // This uses a REAL local source change as well as D1->D2. It tests initial and
 // delta output propagation/parent compatibility, not a dependency-only stage.
+//
+// D2: a dependency-revision change roots a NEW chain and never extends one. The
+// three arms are the whole contract: a delta over a MATCHING-revision parent
+// still builds and still coalesces on ready replay; a CHANGED revision is
+// published as a full root; and the composition D2 forbids (an output frozen at
+// one revision over a parent frozen at another) is refused by the builder with
+// the typed sentinel, writing nothing.
 func TestDependencyRevisionClaimedFullAndDeltaOutput(t *testing.T) {
 	builder, fixture, git := privateDedicatedBuilderFixture(t)
 	ctx := context.Background()
 	catalog := builder.Store.Catalog()
+	commit := func(body, message string) string {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(fixture.RootPath, "base.go"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		git("add", "base.go")
+		git("-c", "user.name=Private Test", "-c", "user.email=private@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", message)
+		return git("rev-parse", "HEAD^{tree}")
+	}
 	authority, err := catalog.AcquireDedicatedBaseAuthority(ctx, store_sqlite.AcquireDedicatedBaseAuthorityRequest{
 		GraphID: fixture.Identity.GraphID, Owner: store_sqlite.DedicatedBaseOwner{CheckoutID: fixture.Identity.CheckoutID, Incarnation: "private-incarnation"}, Token: "dependency-authority"})
 	if err != nil {
@@ -111,12 +128,9 @@ func TestDependencyRevisionClaimedFullAndDeltaOutput(t *testing.T) {
 	if lower.Reader.GetNode(fixture.RepoPrefix+"/base.go::Committed") == nil {
 		t.Fatal("full lower payload missing")
 	}
-	if err := os.WriteFile(filepath.Join(fixture.RootPath, "base.go"), []byte("package dedicated\n\nfunc Committed() string { return \"changed\" }\nfunc AddedByDelta() {}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	git("add", "base.go")
-	git("-c", "user.name=Private Test", "-c", "user.email=private@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "dependency revision delta")
-	identity.TreeOID, identity.DependencyRevision = git("rev-parse", "HEAD^{tree}"), "cohort-v1:b"
+
+	// Arm 1 — a MATCHING-revision parent still supports a real sparse delta.
+	identity.TreeOID = commit("package dedicated\n\nfunc Committed() string { return \"changed\" }\nfunc AddedByDelta() {}\n", "dependency revision delta")
 	desire, err = catalog.RecordDedicatedBaseDesire(ctx, store_sqlite.RecordDedicatedBaseDesireRequest{Authority: authority, ExpectedDesiredEpoch: desire.Epoch, Identity: identity})
 	if err != nil {
 		t.Fatal(err)
@@ -133,7 +147,7 @@ func TestDependencyRevisionClaimedFullAndDeltaOutput(t *testing.T) {
 		t.Fatalf("delta id=%d report=%+v err=%v", deltaID, deltaReport, err)
 	}
 	row, found, err := catalog.GetViewGeneration(ctx, deltaID)
-	if err != nil || !found || row.DependencyRevision != "cohort-v1:b" || row.BaseGenerationID != id {
+	if err != nil || !found || row.DependencyRevision != "cohort-v1:a" || row.BaseGenerationID != id {
 		t.Fatalf("delta metadata=%+v found=%v err=%v", row, found, err)
 	}
 	if builder.Store.AtGeneration(deltaID).GetNode(fixture.RepoPrefix+"/base.go::AddedByDelta") == nil {
@@ -150,7 +164,65 @@ func TestDependencyRevisionClaimedFullAndDeltaOutput(t *testing.T) {
 	if err != nil || reused != deltaID || !readyReport.Coalesced {
 		t.Fatalf("ready delta required source: id=%d report=%+v err=%v", reused, readyReport, err)
 	}
-	if len(builder.Store.AllNodes()) != 0 {
-		t.Fatal("claimed builders wrote generation zero")
+
+	// Arm 2 — a CHANGED revision is published as a full root, not as a delta.
+	identity.TreeOID = commit("package dedicated\n\nfunc Committed() string { return \"rerooted\" }\nfunc AddedByRoot() {}\n", "dependency revision reroot")
+	identity.DependencyRevision = "cohort-v1:b"
+	desire, err = catalog.RecordDedicatedBaseDesire(ctx, store_sqlite.RecordDedicatedBaseDesireRequest{Authority: authority, ExpectedDesiredEpoch: desire.Epoch, Identity: identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := catalog.ClaimDedicatedBaseBuild(ctx, store_sqlite.ClaimDedicatedBaseBuildRequest{Desire: desire, AttemptToken: "dependency-c", ExpectedActiveGenerationID: deltaID})
+	if err != nil || third.BaseGenerationID != 0 {
+		t.Fatalf("changed revision did not claim a full root: claim=%+v err=%v", third, err)
+	}
+	rootID, rootReport, err := builder.BuildClaimedDedicatedBase(ctx, ClaimedDedicatedBaseRequest{Claim: third, RootPath: fixture.RootPath, WorkspaceID: fixture.WorkspaceID, ProjectID: fixture.ProjectID})
+	if err != nil || rootID != third.GenerationID || rootReport.NodeCount == 0 {
+		t.Fatalf("reroot id=%d report=%+v err=%v", rootID, rootReport, err)
+	}
+	rootRow, found, err := catalog.GetViewGeneration(ctx, rootID)
+	if err != nil || !found || rootRow.BaseGenerationID != 0 || rootRow.LayerID != "" ||
+		rootRow.LowerViewFingerprint != "" || rootRow.DependencyRevision != "cohort-v1:b" {
+		t.Fatalf("reroot metadata=%+v found=%v err=%v", rootRow, found, err)
+	}
+	if builder.Store.AtGeneration(rootID).GetNode(fixture.RepoPrefix+"/base.go::AddedByRoot") == nil {
+		t.Fatal("rerooted parser payload missing")
+	}
+	if _, err := catalog.AdoptDedicatedBaseGeneration(ctx, store_sqlite.AdoptDedicatedBaseGenerationRequest{Claim: third}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Arm 3 — the composition D2 forbids. The catalog hands the reservation out
+	// (its ancestry validation revision-checks only the output candidate), so
+	// this guard is reachable production code and the builder must refuse it.
+	identity.TreeOID = commit("package dedicated\n\nfunc Committed() string { return \"forbidden\" }\nfunc AddedByForbiddenDelta() {}\n", "dependency revision forbidden composition")
+	desire, err = catalog.RecordDedicatedBaseDesire(ctx, store_sqlite.RecordDedicatedBaseDesireRequest{Authority: authority, ExpectedDesiredEpoch: desire.Epoch, Identity: identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatched, err := catalog.ClaimDedicatedBaseBuild(ctx, store_sqlite.ClaimDedicatedBaseBuildRequest{Desire: desire, AttemptToken: "dependency-d", ExpectedActiveGenerationID: rootID,
+		BaseGenerationID: id, LayerID: "dependency-mismatch", LowerViewFingerprint: "dependency-lower-mismatch"})
+	if err != nil || mismatched.BaseGenerationID != id {
+		t.Fatalf("catalog refused the mismatched reservation, so the guard would be dead code: claim=%+v err=%v", mismatched, err)
+	}
+	before := len(builder.Store.AllNodes())
+	refusedID, refusedReport, err := builder.BuildClaimedDedicatedDelta(ctx, ClaimedDedicatedDeltaRequest{Claim: mismatched,
+		Base: commitLayerBase{Reader: lower.Reader, corpus: builder.Store.AtGeneration(id)}, BaseTreeOID: fixture.Identity.TreeOID,
+		RepoDir: fixture.RootPath, RootPath: fixture.RootPath, WorkspaceID: fixture.WorkspaceID, ProjectID: fixture.ProjectID})
+	if !errors.Is(err, errDedicatedDeltaParentRevision) || !errors.Is(err, store_sqlite.ErrDedicatedBaseCandidate) {
+		t.Fatalf("mismatched-revision parent extended the chain: id=%d report=%+v err=%v", refusedID, refusedReport, err)
+	}
+	if refusedID != 0 || refusedReport.Coalesced || refusedReport.NodeCount != 0 {
+		t.Fatalf("refusal still produced output: id=%d report=%+v", refusedID, refusedReport)
+	}
+	refusedRow, found, err := catalog.GetViewGeneration(ctx, mismatched.GenerationID)
+	if err != nil || !found || refusedRow.State != store_sqlite.ViewGenerationBuilding {
+		t.Fatalf("refused reservation was published: row=%+v found=%v err=%v", refusedRow, found, err)
+	}
+	if len(builder.Store.AtGeneration(mismatched.GenerationID).AllNodes()) != 0 {
+		t.Fatal("refused delta wrote payload")
+	}
+	if len(builder.Store.AllNodes()) != before || before != 0 {
+		t.Fatalf("claimed builders wrote generation zero: before=%d after=%d", before, len(builder.Store.AllNodes()))
 	}
 }

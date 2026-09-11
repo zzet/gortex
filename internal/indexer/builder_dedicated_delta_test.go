@@ -706,6 +706,57 @@ func TestClaimedDedicatedDeltaPolicyChangeRequiresReseed(t *testing.T) {
 	}
 }
 
+// The catalog revision-checks only the output candidate, so it really does hand
+// out a delta reservation whose parent was frozen under different dependency
+// inputs. The builder is the guard that keeps such a chain from being extended,
+// and it must refuse before writing anything.
+func TestClaimedDedicatedDeltaParentRevisionChangeRefused(t *testing.T) {
+	f := newDedicatedDeltaFixture(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(f.request.RootPath, "revision.go"), []byte("package dedicated\nfunc RevisionOnly() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tree := f.commit(t)
+	catalog := f.builder.Store.Catalog()
+	parent, found, err := catalog.GetViewGeneration(ctx, f.baseClaim.GenerationID)
+	if err != nil || !found || parent.DependencyRevision != "" {
+		t.Fatalf("fixture parent revision: %+v found=%v err=%v", parent, found, err)
+	}
+	p, _, err := catalog.DedicatedBasePublication(ctx, f.baseClaim.Desire.Authority.GraphID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := f.baseClaim.Desire.Identity
+	identity.TreeOID, identity.DependencyRevision = tree, "cohort-v1:changed"
+	desire, err := catalog.RecordDedicatedBaseDesire(ctx, store_sqlite.RecordDedicatedBaseDesireRequest{
+		Authority: f.baseClaim.Desire.Authority, ExpectedDesiredEpoch: p.Desire.Epoch, Identity: identity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := catalog.ClaimDedicatedBaseBuild(ctx, store_sqlite.ClaimDedicatedBaseBuildRequest{
+		Desire: desire, ExpectedActiveGenerationID: f.baseClaim.GenerationID, AttemptToken: "delta-attempt-revision-changed",
+		BaseGenerationID: f.baseClaim.GenerationID, LayerID: fmt.Sprintf("dedicated-delta:%d", f.baseClaim.GenerationID),
+		LowerViewFingerprint: fmt.Sprintf("test-full-lower-%d", f.baseClaim.GenerationID), CreatedAt: 2,
+	})
+	if err != nil || claim.BaseGenerationID != f.baseClaim.GenerationID {
+		t.Fatalf("catalog did not hand out the revision-changed delta this test guards: %+v err=%v", claim, err)
+	}
+	request := ClaimedDedicatedDeltaRequest{Claim: claim, Base: f.base, BaseTreeOID: f.request.Identity.TreeOID,
+		RepoDir: f.request.RootPath, RootPath: f.request.RootPath, WorkspaceID: f.request.WorkspaceID, ProjectID: f.request.ProjectID}
+	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, report, err := f.builder.BuildClaimedDedicatedDelta(ctx, request)
+	if !errors.Is(err, errDedicatedDeltaParentRevision) || !errors.Is(err, store_sqlite.ErrDedicatedBaseCandidate) {
+		t.Fatalf("revision-changed parent extended the chain: id=%d report=%+v err=%v", id, report, err)
+	}
+	if err := check(); err != nil {
+		t.Fatalf("refused delta wrote rows: %v", err)
+	}
+}
+
 // Each measured candidate is independently rooted at the SAME adopted full
 // base; no candidate is adopted in this benchmark. This measures one-file
 // sparse build cost including Git metadata diff, not a runtime advancement

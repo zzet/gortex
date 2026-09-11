@@ -41,9 +41,18 @@ func dedicatedBaseParentForAdvance(ctx context.Context, catalog *store_sqlite.Ca
 		// materialize legacy payload merely because its stored labels match.
 		return 0, nil
 	}
+	// The advancement policy tuple is the COMPLETE frozen-input identity, not
+	// just parse policy. A dependency-revision change roots a new chain; it
+	// never extends one. The catalog's ancestry validation deliberately admits
+	// a same-policy parent whose revision differs (only the output candidate is
+	// revision-checked there, so a derived-only refresh may borrow an older
+	// lower), which makes this planner the site that enforces the chain rule:
+	// a changed revision falls to the full-root branch below, and stored
+	// ancestry that is not revision-homogeneous is not reusable advancement
+	// ancestry — it re-roots too, it never blocks publication.
 	policy := store_sqlite.DedicatedBaseIdentity{
 		ConfigHash: active.ConfigHash, ExtractorVersions: active.ExtractorVersions,
-		ResolverVersion: active.ResolverVersion,
+		ResolverVersion: active.ResolverVersion, DependencyRevision: active.DependencyRevision,
 	}
 	seen := make(map[int64]struct{})
 	row := active
@@ -56,6 +65,19 @@ func dedicatedBaseParentForAdvance(ctx context.Context, catalog *store_sqlite.Ca
 			(row.State != store_sqlite.ViewGenerationReady && row.State != store_sqlite.ViewGenerationSuperseded) ||
 			row.ConfigHash != policy.ConfigHash || row.ExtractorVersions != policy.ExtractorVersions || row.ResolverVersion != policy.ResolverVersion {
 			return 0, fmt.Errorf("%w: invalid active dedicated ancestry at generation %d", store_sqlite.ErrDedicatedBaseCandidate, row.GenerationID)
+		}
+		// Revision non-homogeneity below the head is NOT corruption, so it is
+		// not an error: the catalog's ancestry validation revision-checks only
+		// the output candidate (exactTree, depth 0), so a stored chain whose
+		// lower carries an older revision is a shape the catalog itself admits
+		// — from a mixed-binary window or a non-indexer claimer. Such a chain is
+		// simply not reusable advancement ancestry, so re-root. Erroring here
+		// would turn a legitimately reusable READY generation into a PERMANENT
+		// publication failure: every later ensureCurrent would return the same
+		// error with no path back to a full root. The builder keeps its typed
+		// refusal as the last line of defence against actually composing one.
+		if row.DependencyRevision != policy.DependencyRevision {
+			return 0, nil
 		}
 		seen[row.GenerationID] = struct{}{}
 		if row.BaseGenerationID == 0 {
@@ -74,7 +96,8 @@ func dedicatedBaseParentForAdvance(ctx context.Context, catalog *store_sqlite.Ca
 			return 0, fmt.Errorf("%w: active dedicated ancestor missing", store_sqlite.ErrDedicatedBaseCandidate)
 		}
 	}
-	if target.ConfigHash != policy.ConfigHash || target.ExtractorVersions != policy.ExtractorVersions || target.ResolverVersion != policy.ResolverVersion || len(seen) >= maxDedicatedBaseDeltaAncestors {
+	if target.ConfigHash != policy.ConfigHash || target.ExtractorVersions != policy.ExtractorVersions || target.ResolverVersion != policy.ResolverVersion ||
+		target.DependencyRevision != policy.DependencyRevision || len(seen) >= maxDedicatedBaseDeltaAncestors {
 		return 0, nil
 	}
 	return active.GenerationID, nil

@@ -27,6 +27,16 @@ type ClaimedDedicatedDeltaRequest struct {
 	PrePublish  func(context.Context, int64) error
 }
 
+// errDedicatedDeltaParentRevision refuses a reservation whose parent was frozen
+// under different dependency inputs. A dependency-revision change roots a new
+// chain; it never extends one. The catalog's ancestry validation revision-checks
+// only the output candidate, so it will hand out exactly such a reservation
+// ("a same-policy parent may supply the lower for a derived-only refresh") and
+// this builder is the last guard before payload is written under it. It wraps
+// ErrDedicatedBaseCandidate so existing candidate-class handling is unchanged.
+var errDedicatedDeltaParentRevision = fmt.Errorf("%w: dedicated delta parent dependency revision differs",
+	store_sqlite.ErrDedicatedBaseCandidate)
+
 // BuildClaimedDedicatedDelta reuses commit-layer sparse planning without calling
 // BuildCommitLayer/Build: those APIs stamp a commit kind and allocate a different
 // generation. This method publishes payload only. Every successful caller,
@@ -89,6 +99,11 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedDelta(ctx context.Context
 		parent.GraphID != row.GraphID || parent.CheckoutID != row.CheckoutID || parent.TreeOID != request.BaseTreeOID ||
 		parent.ConfigHash != identity.ConfigHash || parent.ExtractorVersions != identity.ExtractorVersions || parent.ResolverVersion != identity.ResolverVersion {
 		return 0, BuildReport{}, fmt.Errorf("%w: dedicated delta parent tree, policy or ownership differs", store_sqlite.ErrDedicatedBaseCandidate)
+	}
+	// Checked before the ready/superseded short circuit: a reservation already
+	// built over a differently-frozen parent must not be coalesced either.
+	if parent.DependencyRevision != identity.DependencyRevision {
+		return 0, BuildReport{}, fmt.Errorf("%w: parent generation %d", errDedicatedDeltaParentRevision, parent.GenerationID)
 	}
 	if row.State == store_sqlite.ViewGenerationReady || row.State == store_sqlite.ViewGenerationSuperseded {
 		return row.GenerationID, BuildReport{GenerationID: row.GenerationID, Coalesced: true, Duration: time.Since(started)}, nil
