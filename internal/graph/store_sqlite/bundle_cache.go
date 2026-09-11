@@ -65,8 +65,13 @@ const (
 // carry a stale edge.
 type bundleCacheEntry struct {
 	pkgKey string
-	fp     uint64
-	bundle graph.SymbolBundle
+	// viewGen is the payload view generation of the handle that computed
+	// the bundle. It is recorded on the entry — not only folded into the
+	// map key — so refresh can drop every entry that belongs to a snapshot
+	// the current fingerprint map does not describe.
+	viewGen int64
+	fp      uint64
+	bundle  graph.SymbolBundle
 	// bytes is the entry's estimated retained size, recorded at insert so
 	// the running byte total can be adjusted in O(1) whenever the entry is
 	// dropped (invalidation or a stale read).
@@ -99,13 +104,31 @@ type bundleCacheEntry struct {
 // LRU's per-entry ordering overhead. maxBytes <= 0 disables the cache —
 // stores become no-ops and every lookup misses (reads still recompute
 // live through the caller's fallback path).
+//
+// One core is shared by every handle over the same database, so the
+// fingerprint map alone cannot decide freshness: it describes exactly one
+// snapshot — the payload view generation of the handle it was installed
+// through — and says nothing about any other generation composed over it.
+// A bundle computed at another generation and validated against this map
+// would be a selected graph answered from another snapshot's cache data,
+// which is exactly the mixed view a per-generation key exists to prevent.
+// fpViewGen therefore records whose fingerprints these are, and only that
+// snapshot's entries are stored or served; every other generation misses
+// and recomputes live.
 type bundleCache struct {
 	mu           sync.Mutex
 	fingerprints map[string]uint64
-	entries      map[string]*bundleCacheEntry
-	maxBytes     int64 // byte budget (primary bound); <= 0 disables the cache
-	maxEntries   int   // count ceiling (secondary bound)
-	curBytes     int64 // running sum of entries' estimated bytes
+	// fpViewGen is the payload view generation the current fingerprint map
+	// describes; fpSet reports that a map was installed at all. Until the
+	// daemon installs one the cache is inert, and generation zero is not
+	// assumed to be the described snapshot — an uninitialised cache
+	// validates nothing.
+	fpViewGen  int64
+	fpSet      bool
+	entries    map[string]*bundleCacheEntry
+	maxBytes   int64 // byte budget (primary bound); <= 0 disables the cache
+	maxEntries int   // count ceiling (secondary bound)
+	curBytes   int64 // running sum of entries' estimated bytes
 }
 
 // newBundleCache builds an empty cache with the default budgets. The byte
@@ -209,30 +232,49 @@ func metaBytes(m map[string]any) int64 {
 //
 // fps is keyed by package key (the directory the package's files live
 // in, repo-prefixed in multi-repo because the node file paths are).
+//
+// The fingerprints describe the snapshot THIS handle reads: the daemon
+// derives them from the graph it just analysed, and that graph is whatever
+// the handle it installs them through serves. The handle's payload view
+// generation is therefore the identity of the fingerprinted snapshot, and
+// it is recorded with the map so no other generation's bundles can be
+// validated against it.
 func (s *Store) SetBundleFingerprints(fps map[string]uint64) {
 	if s.bundles == nil {
 		return
 	}
-	s.bundles.refresh(fps)
+	s.bundles.refresh(s.viewGen, fps)
 }
 
-// refresh swaps in the new fingerprint map and prunes every entry whose
-// package fingerprint no longer matches, decrementing the running byte
-// total by each dropped entry's estimated size.
-func (c *bundleCache) refresh(fps map[string]uint64) {
+// refresh swaps in the new fingerprint map — tagged with the payload view
+// generation it describes — and prunes every entry that the new map cannot
+// validate: one belonging to a different snapshot, or one whose package
+// fingerprint no longer matches. Each drop decrements the running byte
+// total by the entry's estimated size.
+func (c *bundleCache) refresh(viewGen int64, fps map[string]uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if fps == nil {
 		fps = map[string]uint64{}
 	}
 	c.fingerprints = fps
+	c.fpViewGen = viewGen
+	c.fpSet = true
 	for id, e := range c.entries {
 		cur, ok := fps[e.pkgKey]
-		if !ok || cur != e.fp {
+		if e.viewGen != viewGen || !ok || cur != e.fp {
 			delete(c.entries, id)
 			c.curBytes -= e.bytes
 		}
 	}
+}
+
+// describesLocked reports whether the installed fingerprint map speaks for
+// viewGen. It is the cache's snapshot-identity gate: a lookup or a store at
+// any other generation is refused outright, so a selected graph is never
+// served bundles another snapshot computed. The caller holds c.mu.
+func (c *bundleCache) describesLocked(viewGen int64) bool {
+	return c.fpSet && c.fpViewGen == viewGen
 }
 
 // bundlePackageKey derives the package key for a node's file path. It
@@ -266,14 +308,20 @@ func bundleCacheKey(viewGen int64, id string) string {
 }
 
 // lookup returns the cached bundle for id in viewGen when it is fresh — the
-// entry exists and its package fingerprint still matches the current one. A
-// node whose package has no reported fingerprint is never served (ok is
-// false) so an unvalidated bundle can never escape the cache. A stale
-// entry is dropped in place and its bytes reclaimed.
+// installed fingerprint map describes viewGen, the entry exists, and its
+// package fingerprint still matches the current one. A node whose package
+// has no reported fingerprint is never served (ok is false) so an
+// unvalidated bundle can never escape the cache, and a generation the
+// fingerprints do not describe misses outright rather than borrowing
+// another snapshot's validation. A stale entry is dropped in place and its
+// bytes reclaimed.
 func (c *bundleCache) lookup(viewGen int64, id string) (graph.SymbolBundle, bool) {
 	key := bundleCacheKey(viewGen, id)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.describesLocked(viewGen) {
+		return graph.SymbolBundle{}, false
+	}
 	e, ok := c.entries[key]
 	if !ok {
 		return graph.SymbolBundle{}, false
@@ -311,6 +359,12 @@ func (c *bundleCache) store(viewGen int64, b graph.SymbolBundle) {
 	if c.maxBytes <= 0 {
 		return
 	}
+	if !c.describesLocked(viewGen) {
+		// The installed fingerprints describe another snapshot, so this
+		// bundle could never be validated on read-back. Caching it would
+		// only pin bytes for an entry the next refresh discards.
+		return
+	}
 	fp, ok := c.fingerprints[pkgKey]
 	if !ok {
 		return
@@ -331,6 +385,6 @@ func (c *bundleCache) store(viewGen int64, b graph.SymbolBundle) {
 		c.entries = make(map[string]*bundleCacheEntry)
 		c.curBytes = 0
 	}
-	c.entries[key] = &bundleCacheEntry{pkgKey: pkgKey, fp: fp, bundle: b, bytes: sz}
+	c.entries[key] = &bundleCacheEntry{pkgKey: pkgKey, viewGen: viewGen, fp: fp, bundle: b, bytes: sz}
 	c.curBytes += sz
 }

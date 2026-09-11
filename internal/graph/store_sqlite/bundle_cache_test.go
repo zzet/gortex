@@ -41,7 +41,7 @@ func TestBundleCache_ServesOnlyValidatedFingerprints(t *testing.T) {
 	}
 
 	// Report a fingerprint, then store: now it caches and serves.
-	c.refresh(map[string]uint64{"pkg": 100})
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 100})
 	c.store(baseViewGeneration, b)
 	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); !ok {
 		t.Fatal("bundle should be served once its package fingerprint is known")
@@ -50,7 +50,7 @@ func TestBundleCache_ServesOnlyValidatedFingerprints(t *testing.T) {
 
 func TestBundleCache_InvalidatesOnFingerprintChange(t *testing.T) {
 	c := newTestBundleCache()
-	c.refresh(map[string]uint64{"pkg": 1})
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
 	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
 
 	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); !ok {
@@ -58,7 +58,7 @@ func TestBundleCache_InvalidatesOnFingerprintChange(t *testing.T) {
 	}
 
 	// Fingerprint changes -> the entry is invalidated.
-	c.refresh(map[string]uint64{"pkg": 2})
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 2})
 	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); ok {
 		t.Fatal("entry must be dropped when its package fingerprint changes")
 	}
@@ -68,7 +68,7 @@ func TestBundleCache_CrossRepoIsolation(t *testing.T) {
 	c := newTestBundleCache()
 	// Two repos with the same inner directory name resolve to DIFFERENT
 	// package keys because the stored file paths are repo-prefixed.
-	c.refresh(map[string]uint64{
+	c.refresh(baseViewGeneration, map[string]uint64{
 		"repoA/pkg": 10,
 		"repoB/pkg": 20,
 	})
@@ -76,7 +76,7 @@ func TestBundleCache_CrossRepoIsolation(t *testing.T) {
 	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("repoB/pkg/x.go::A", "A", "repoB/pkg/x.go")})
 
 	// Bumping only repoA's fingerprint must not touch repoB's entry.
-	c.refresh(map[string]uint64{
+	c.refresh(baseViewGeneration, map[string]uint64{
 		"repoA/pkg": 11,
 		"repoB/pkg": 20,
 	})
@@ -247,7 +247,7 @@ func TestSearchSymbolBundles_UncachedWithoutFingerprints(t *testing.T) {
 
 func TestBundleCache_ByteBudgetEvictionAtBoundary(t *testing.T) {
 	c := newTestBundleCache()
-	c.refresh(map[string]uint64{"pkg": 1})
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
 
 	// Fixed-width ids so every entry estimates to the same size.
 	mk := func(i int) graph.SymbolBundle {
@@ -286,7 +286,7 @@ func TestBundleCache_ByteBudgetEvictionAtBoundary(t *testing.T) {
 
 func TestBundleCache_RefusesEntryLargerThanBudget(t *testing.T) {
 	c := newTestBundleCache()
-	c.refresh(map[string]uint64{"pkg": 1})
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
 	b := graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")}
 	c.maxBytes = bundleEntryBytes(b) - 1 // budget just below a single entry
 
@@ -326,7 +326,7 @@ func TestBundleCache_DisabledMode(t *testing.T) {
 	if c.maxBytes != 0 {
 		t.Fatalf("expected a disabled cache (maxBytes 0), got %d", c.maxBytes)
 	}
-	c.refresh(map[string]uint64{"pkg": 1})
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
 	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
 	if len(c.entries) != 0 {
 		t.Fatalf("a disabled cache must not store, got %d entries", len(c.entries))
@@ -366,7 +366,7 @@ func TestSearchSymbolBundles_DisabledCacheStillServes(t *testing.T) {
 func TestBundleCache_ConcurrentReadInsert(t *testing.T) {
 	c := newTestBundleCache()
 	c.maxBytes = 8 << 10 // small budget so wholesale clears fire under contention
-	c.refresh(map[string]uint64{"pkg": 1})
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
 
 	const workers = 8
 	const iters = 3000
@@ -383,7 +383,7 @@ func TestBundleCache_ConcurrentReadInsert(t *testing.T) {
 				case 1:
 					_, _ = c.lookup(baseViewGeneration, id)
 				default:
-					c.refresh(map[string]uint64{"pkg": uint64(i)})
+					c.refresh(baseViewGeneration, map[string]uint64{"pkg": uint64(i)})
 				}
 			}
 		}(w)
@@ -402,5 +402,178 @@ func TestBundleCache_ConcurrentReadInsert(t *testing.T) {
 	}
 	if c.curBytes > c.maxBytes {
 		t.Fatalf("curBytes %d exceeds the byte budget %d", c.curBytes, c.maxBytes)
+	}
+}
+
+// --- snapshot-identity tests (the fingerprint map speaks for one view) ---
+
+// A fingerprint map describes exactly one snapshot: the payload view
+// generation of the handle it was installed through. Another generation's
+// bundle must never be validated against it — that is a selected graph
+// answered from a different snapshot's cache data.
+func TestBundleCache_RefusesGenerationTheFingerprintsDoNotDescribe(t *testing.T) {
+	const otherGen = int64(7)
+	c := newTestBundleCache()
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
+
+	b := graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")}
+
+	// The package IS fingerprinted, but for the base snapshot only. A store
+	// from a handle on another generation must be refused outright.
+	c.store(otherGen, b)
+	if _, ok := c.lookup(otherGen, "pkg/x.go::A"); ok {
+		t.Fatal("a generation the fingerprints do not describe must never be served from cache")
+	}
+	if len(c.entries) != 0 || c.curBytes != 0 {
+		t.Fatalf("a refused store must leave the cache empty, got %d entries / %d bytes",
+			len(c.entries), c.curBytes)
+	}
+
+	// The described snapshot still caches and serves normally.
+	c.store(baseViewGeneration, b)
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); !ok {
+		t.Fatal("the fingerprinted snapshot must still be served from cache")
+	}
+	if _, ok := c.lookup(otherGen, "pkg/x.go::A"); ok {
+		t.Fatal("another generation must not read the fingerprinted snapshot's entry")
+	}
+}
+
+// Installing fingerprints for a different snapshot retires every entry the
+// new map cannot speak for, even when the package fingerprint itself is
+// unchanged — the entries belong to a snapshot nobody is validating any more.
+func TestBundleCache_RefreshDropsEntriesOfOtherGenerations(t *testing.T) {
+	const otherGen = int64(7)
+	c := newTestBundleCache()
+	c.refresh(otherGen, map[string]uint64{"pkg": 1})
+	c.store(otherGen, graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
+	if _, ok := c.lookup(otherGen, "pkg/x.go::A"); !ok {
+		t.Fatal("the fingerprinted generation should have cached its bundle")
+	}
+
+	// Same package fingerprint, different snapshot: the old entry cannot be
+	// validated by the new map and must be dropped with its bytes.
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
+	if len(c.entries) != 0 || c.curBytes != 0 {
+		t.Fatalf("refresh for another snapshot must drop its entries, got %d entries / %d bytes",
+			len(c.entries), c.curBytes)
+	}
+	if _, ok := c.lookup(otherGen, "pkg/x.go::A"); ok {
+		t.Fatal("a dropped entry must not be served")
+	}
+}
+
+// An uninitialised cache validates nothing: generation zero is not assumed
+// to be the described snapshot before any fingerprints are installed.
+func TestBundleCache_InertUntilFingerprintsAreInstalled(t *testing.T) {
+	c := newTestBundleCache()
+
+	// The gate itself: an uninitialised cache describes NO generation, and in
+	// particular not generation zero, whose numeric value a zero-valued
+	// fpViewGen would otherwise match. Asserted on describesLocked directly
+	// because that is where the claim lives — store() and lookup() below also
+	// refuse, but they would refuse on the empty fingerprint / entry maps even
+	// with the gate gone, so they cannot pin it.
+	c.mu.Lock()
+	describesBase := c.describesLocked(baseViewGeneration)
+	c.mu.Unlock()
+	if describesBase {
+		t.Fatal("an uninitialised cache must describe no snapshot, generation zero included")
+	}
+
+	c.store(baseViewGeneration, graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")})
+	if _, ok := c.lookup(baseViewGeneration, "pkg/x.go::A"); ok {
+		t.Fatal("a cache with no installed fingerprint map must always miss")
+	}
+	if c.fpSet {
+		t.Fatal("fpSet must stay false until refresh installs a map")
+	}
+
+	// After a refresh for generation zero it describes exactly that snapshot,
+	// so the gate is an identity test and not a blanket refusal.
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
+	c.mu.Lock()
+	describesBase = c.describesLocked(baseViewGeneration)
+	describesOther := c.describesLocked(7)
+	c.mu.Unlock()
+	if !describesBase {
+		t.Fatal("after installing generation zero's fingerprints the cache must describe generation zero")
+	}
+	if describesOther {
+		t.Fatal("generation zero's fingerprints must not describe generation 7")
+	}
+}
+
+// Production entrypoint: fingerprints installed through a handle on one
+// generation must not validate another generation's bundles served through
+// Store.SearchSymbolBundles. The base handle here has no fingerprints of its
+// own, so every query recomputes live and a new edge shows up immediately —
+// the mirror of TestSearchSymbolBundles_CacheHitOnUnchangedFingerprint,
+// which proves the same store DOES cache when the generations agree.
+func TestSearchSymbolBundles_FingerprintsOfAnotherGenerationNeverValidate(t *testing.T) {
+	s := newBundleTestStore(t)
+	seedBundleStore(t, s)
+
+	derived := s.AtGeneration(7)
+	if derived == nil {
+		t.Fatal("AtGeneration(7) returned nil")
+	}
+	if derived.ViewGeneration() != 7 {
+		t.Fatalf("derived handle generation = %d, want 7", derived.ViewGeneration())
+	}
+	// The daemon installs the fingerprints it derived from generation 7's
+	// graph. The base corpus is a different snapshot.
+	derived.SetBundleFingerprints(map[string]uint64{"pkg": 1})
+
+	first, err := s.SearchSymbolBundles("widget", 10)
+	if err != nil {
+		t.Fatalf("first SearchSymbolBundles: %v", err)
+	}
+	if b := bundleByID(first)["pkg/x.go::A"]; len(b.OutEdges) != 1 {
+		t.Fatalf("expected A with 1 out-edge on the first query, got %d", len(b.OutEdges))
+	}
+
+	// Mutate the base graph without touching the fingerprints. A cache that
+	// accepted another generation's fingerprints would serve the stale
+	// 1-edge bundle here.
+	s.AddNode(mkFnNode("pkg/x.go::C", "GammaWidget", "pkg/x.go"))
+	s.AddEdge(&graph.Edge{From: "pkg/x.go::A", To: "pkg/x.go::C", Kind: graph.EdgeCalls, FilePath: "pkg/x.go"})
+
+	second, err := s.SearchSymbolBundles("widget", 10)
+	if err != nil {
+		t.Fatalf("second SearchSymbolBundles: %v", err)
+	}
+	if b := bundleByID(second)["pkg/x.go::A"]; len(b.OutEdges) != 2 {
+		t.Fatalf("the base corpus must recompute live under another generation's fingerprints, got %d edges",
+			len(b.OutEdges))
+	}
+	if len(s.bundles.entries) != 0 {
+		t.Fatalf("no base-generation bundle may be cached under generation 7's fingerprints, got %d entries",
+			len(s.bundles.entries))
+	}
+}
+
+// lookup enforces the snapshot gate itself rather than trusting that only
+// refresh and store ever populate the map. An entry that belongs to a
+// snapshot the installed fingerprints do not describe must never be served,
+// however it came to be there.
+func TestBundleCache_LookupRefusesForeignGenerationEntry(t *testing.T) {
+	const otherGen = int64(7)
+	c := newTestBundleCache()
+	c.refresh(baseViewGeneration, map[string]uint64{"pkg": 1})
+
+	b := graph.SymbolBundle{Node: mkFnNode("pkg/x.go::A", "A", "pkg/x.go")}
+	// Inject directly: the package fingerprint matches the installed map, so
+	// only the snapshot identity separates this entry from a valid one.
+	c.entries[bundleCacheKey(otherGen, "pkg/x.go::A")] = &bundleCacheEntry{
+		pkgKey:  "pkg",
+		viewGen: otherGen,
+		fp:      1,
+		bundle:  b,
+		bytes:   bundleEntryBytes(b),
+	}
+
+	if _, ok := c.lookup(otherGen, "pkg/x.go::A"); ok {
+		t.Fatal("lookup served an entry from a snapshot the fingerprints do not describe")
 	}
 }
