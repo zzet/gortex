@@ -41,6 +41,7 @@ not reachable from a default startup, watcher, or Git callback path is `implemen
 | Dirty-manifest sha256 (harness-computed, wave 1 exit suite) | `b9e80af941b8f56cee5158f0bda45efae458b07085d746cb2144ccde17889017` — identical on all 9 compiles and all 14 runs of the wave 1 exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave 2 exit suite) | `143bc0deec77cde06d78a4db5c56bd4458f171e8ecca88bbf451c47ea81e152a` over HEAD `10a8bd638445c2091dfa55476c9a9cedc78895a3` — identical on all 10 compiles and all 15 runs of the wave 2 exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave 3 exit suite) | `248ff1164c48c66b0637b3280293b14d1f9cb0da4a0215defe6984739507bbb9` over HEAD `43d2506a0e744fb3177241f0d6bc9ea0f86c2c1e` — identical on all 14 compiles and all 19 runs of the wave 3 exit suite; no source drift during the suite |
+| Dirty-manifest sha256 (harness-computed, wave 4 exit suite) | `36afdd22fb92fa7af1f9f6b927cc29a8f0e6dae95d8045e8eae4554a3a8dca0d` over HEAD `47c6efa02d1444eeb2252612b4d8802f58f359ba` — identical on all 14 compiles and all 19 runs of the wave 4 exit suite; no source drift during the suite |
 | Recovery branch (do NOT reapply) | `backup/incremental-before-main-20260910-1310` = `a2ccbe07` |
 | Recovery stash (do NOT reapply) | `6e9db642` |
 | Live daemon | `v0.64.1-36-ga2ccbe07-dirty`, pid 18828 — a **pre-rebase** binary. Must not be restarted, re-tracked, or reconfigured. |
@@ -438,7 +439,9 @@ Shared fields for all W1 sub-items unless overridden:
 - Limitations: schema 23 propagates dependency-revision **metadata only**; it computes no digest
   and certifies no legacy output. W2.1c and W2.4 each invalidate every cached generation once on
   first deploy (D8).
-- Next action: none in W2's MVI set. W2.1a and W2.1b landed in wave 1; W2.1c and W2.1d landed in
+- Next action: W2.4b is `blocked with evidence` after wave 4 on a **procedural ownership**
+  blocker — its source is on disk and green but **not committed**; see its row. W2.1a and W2.1b
+  landed in wave 1; W2.1c and W2.1d landed in
   wave 2; W2.4 landed in wave 3 and is recorded below. With W2.1c the identity binding is live:
   every production `DependencyRevision` is now non-empty, so W2.1b's and W2.1d's comparisons stop
   being `"" != ""`; with W2.4 the `ResolverVersion` component of that identity stops being the
@@ -796,6 +799,65 @@ Shared fields for all W1 sub-items unless overridden:
   the worktree. This is D8's second one-time invalidation: every cached generation is invalidated
   once on first contact with this binary.
 
+### W2.4b — Wire cohort invalidation events; certify ref-view cohorts; stop caching transient refusals
+
+- State: `blocked with evidence`. The source is implemented, compiles, is `tested` (19 mutations,
+  19 red) and reaches production through the coordinator's own hooks — but the item's **final
+  verifier verdict is `fail`** on a procedural ownership blocker, and this wave's commit rule is
+  "commit only on a passing verdict", so **nothing of W2.4b was committed**. Its five files stay
+  dirty in the worktree at the end of this wave.
+- Blocking evidence: `scratchpad/reports/W4-W2.4b.md` §2.2 and §14 —
+  `internal/indexer/checkout_coordinator.go` is edited outside every ownership list in this wave.
+  The repair round shrank the footprint from five hunks to two (`CheckoutCycle.Deferred` doc; the
+  `case out.Deferred:` arm in `recordCoordinatorCycle`) and removed the new field and its counter
+  entirely, but the two remaining changes are statements about `CheckoutCoordinator` whose
+  declarations live in that file; relocating them would be a larger edit to the same non-owned
+  file than the change itself. `internal/indexer/repository_cleanup.go` is now **byte-identical to
+  HEAD** (the teardown event source moved into the owned `cleanupHooks.ReleaseGraph`), so that half
+  of the round-1 blocker is closed. Required action: **the Suite cannot ratify an ownership list it
+  did not author** — the coordinator must either add `checkout_coordinator.go` to W2.4b's ownership
+  or take the two hunks into a separately owned file, after which the item commits as-is. There is
+  nothing technical to fix.
+- Agent: wave 4, Lane V (repair round 2 after a failed round-1 verification).
+- Scope/files (all uncommitted): `internal/indexer/checkout_lifecycle.go`,
+  `internal/indexer/ref_view_service.go`, `internal/indexer/ref_views.go`,
+  `internal/indexer/cohort_invalidation_test.go` (new),
+  `internal/indexer/checkout_coordinator.go` (**out of ownership**). `dependency_revision.go`,
+  `dependency_revision_test.go`, `dependency_cohort_scope_test.go`, `checkout_lifecycle_test.go`,
+  `ref_view_service_test.go`, `ref_views_test.go` and `repository_cleanup.go` are unchanged.
+- Invariant: a dependency cohort's certificate is invalidated by the lifecycle events that can
+  move it (owner re-registration, teardown, eviction, forgotten checkout, sweep, configuration
+  reload, fresh workspace bind) rather than by age; a ref view carries the certified cohort it was
+  built from, including `ConfigSections` and `Leases`; a **transient** refusal is never memoized as
+  if it were a certificate, and a refusal that is served holds the identity it was served under.
+- Change: the invalidation fan-out is driven from the lifecycle's own hooks and the sweep, scoped
+  to the repository prefix and its workspace (never a whole-corpus pass); the cohort mark is
+  cleared **before** the description so an invalidation arriving during one is not swallowed;
+  ref-view memo hits follow the workspace topology token; `recordCoordinatorCycle` counts the
+  deferred arm; a start failure is reported on `SweepReport.CoordinatorStartFailures` rather than
+  warned-and-continued.
+- Acceptance gate(s): G6, G3, G1.
+- Harness evidence (wave 4 exit suite, dirty tree): the item's files were present for every run of
+  this suite, and `internal/indexer` is green across all six chunks (2752 / 0 / 2) plus the indexer
+  race lane (462 / 0 / 0, 0 `DATA RACE`). This is suite evidence on the wave's dirty tree; the
+  blocker is not evidentiary and is not answered by a re-run.
+- Limitations: the **sibling HEAD/tree source is still unwired** (W4.3) — a certified cohort can
+  name a workspace sibling's committed tree OID that has since moved, with no lifecycle event to
+  catch it; every coordinator BUILD path re-describes, so only a ref view can be stamped with a
+  token-aged revision. `CoordinatorStartFailures` is on `SweepReport` and in the daemon log but on
+  no user-visible health surface (`ViewsHealth` and the MCP sweep payload need unowned files).
+  `invalidateAllDependencyCohorts` on reload is coarser than necessary because
+  `RefreshRepoConfigs` does not report which repositories moved. A degraded ref-view selection
+  pays one description per selection, deliberately. `cohortSubjectForGraph`'s `served` guard is a
+  cost guard, not a correctness one, and is not mutation-pinned. `ReleaseGraph` pays one indexed
+  catalog row read per release attempt to learn the subject before teardown.
+- Deviations: the round-1 counter field and its increment were withdrawn rather than moved;
+  deliverable 5 now needs no new coordinator state at all.
+- Next action: coordinator ratifies the ownership of `internal/indexer/checkout_coordinator.go` (or
+  relocates the two hunks); on that, the item commits unchanged.
+- Verifier verdict: **FAIL — one ownership blocker (procedural). No correctness defect found in the
+  shipped behaviour; 19 of 19 mutations bind.**
+
 ## W3 — Bind all writers and producers
 
 - State: `proposed`. Dependencies: W2. Items: W3.1–W3.7, all in MVI.
@@ -806,7 +868,8 @@ Shared fields for all W1 sub-items unless overridden:
   bytes; raw external repositories need a verified immutable image tied to their admitted data
   (out of scope, D10). Migration number allocation is single-owner: W3.3 takes **v25** (branch is
   at v24, `schema_version.go:37`) — two lanes each claiming v25 is the known salt-collision class.
-- Next action: the authority (W3.1) in wave 4. W3.5 landed in wave 1 and is recorded below. W3.4
+- Next action: W3.2, W3.3, W3.6 and W3.7 remain. W3.1 and W3.5b landed in wave 4, W3.5 in
+  wave 1, and both are recorded below. W3.4
   was `blocked with evidence` after wave 2 (an evidentiary blocker, not a defect); it was
   re-dispatched in wave 3, completed its fourth channel, passed verification and is now committed.
 
@@ -922,6 +985,113 @@ Shared fields for all W1 sub-items unless overridden:
   `{CapSearchText, Complete}`) and M3 (ref-view withdrawal deleted) are each RED across the
   expected test sets; the export reproduced 18 / 0 / 0 on the item's selection.
 
+### W3.1 — One output-generation authority at the mutation doors (D12)
+
+- State: `wired`. The verifier's wiring check is explicit; the authority is constructed in
+  `internal/serverstack.NewSharedServer` (`shared_server.go:684-712`), which both production entry
+  points build through (`cmd/gortex/daemon_state.go:99` daemon, `cmd/gortex/mcp.go:371` embedded
+  one-shot). No `cmd/gortex` edit was required.
+- Agent: wave 4, Lane I (repair round after a first failed verification).
+- Scope/files: `internal/indexer/repository_mutation_coordinator.go`, `checkout_mutation.go`,
+  `multi.go`, `indexer.go`, `watcher.go`, `git_watcher.go`, `poller.go`,
+  `repository_topology_batch.go`, `internal/serverstack/shared_server.go`, plus
+  `output_generation_authority_test.go` (new), `repository_mutation_coordinator_test.go`,
+  `checkout_mutation_test.go`, `shared_server_test.go` and six signature-forced test files
+  (`cold_manifest_census_test.go`, `contract_owner_frontier_test.go`, `direct_mutation_api_test.go`,
+  `poller_test.go`, `git_watcher_coordinator_test.go`, `watcher_coordinator_boundary_test.go`).
+  `index_state.go` is unchanged.
+- Invariant: every production mutation door names itself with a registered entry; every mutation
+  names exactly **one** output generation and owner — generation 0 for a legacy corpus write (a
+  legacy target carrying a non-zero generation is refused at admission), the routed dirty
+  generation for a checkout source edit, a claimed dedicated generation for a publication. The
+  owner is **(output store, repository)**. Receipts for one owner are totally ordered by issue
+  sequence and a newer one supersedes every outstanding older one. Generation 0 is never relabelled
+  as committed.
+- Change: admission returns a receipt and the fence has two halves — **preventive**
+  (`runUnderOutputReceipt` `repository_mutation_coordinator.go:1372`,
+  `OutputMutationReceipts.Current` `:1176`, `CheckoutMutation.receiptStillCurrent`
+  `checkout_mutation.go:218` from `Prepare` and `Refresh`) refuses a superseded receipt before the
+  payload runs, so no byte moves; **reporting** (`Complete`) refuses a receipt superseded while its
+  payload ran, without discarding the result the work produced. A per-door static scan of the
+  package's own source fails when any call site reaches generation zero without naming an entry.
+  The same choke point takes graphview's exclusive raw-source data gate for a legacy mutation, so a
+  live `graphview.BasePin` returns `ErrBaseCorpusChanged` instead of claiming exactness — the
+  production trigger W5.3's verification recorded as missing.
+- Acceptance gate(s): G3, G6, G2.
+- Harness evidence: wave 4 exit suite — `internal/indexer` 2752 / 0 / 2 across the six chunks,
+  `internal/serverstack` 27 / 0 / 0 normal and 27 / 0 / 0 race, `internal/indexer` race lane
+  462 / 0 / 0 with 0 `DATA RACE`.
+- Limitations: `coordinateRepositoryReindex` keeps its two-argument shape (it coalesces, so the
+  queuing caller is not the executing work; the lane worker holds the receipt). The orphan lane is
+  merged, not refused, because refusing it would break the embedded one-shot path.
+  `OutputGenerationDedicated` has no production caller in this item — the axis exists for the
+  publication path. A sparse generation build's private-handle write is still labelled
+  `legacy`/generation 0: the builder's Indexer carries no generation identity, so what the
+  authority guarantees for it today is a distinct output **owner**, not a truthful axis label.
+  `EnqueueRefresh` (`checkout_refresh.go:74`, not owned) carries no preventive check — it requires
+  `prepared` and `Prepare` is fenced, so the lease cannot reach it under a superseded receipt.
+  `outputStoreIdentity` uses the store handle's process identity (`%T/%p`), so two handles on one
+  file are two outputs — conservative, never an invented collision. A static source scan cannot be
+  mutation-tested through `go test -overlay`; the detector is covered by
+  `TestMutationDoorScanCatchesAnUnnamedDoor`.
+- Deviations: the owner key is (output store, repository) rather than the repository alone, which
+  the verifier required; the merged orphan lane is a deliberate departure from "refuse".
+- Commit: `cfe5a2da392b3ed19739f46b5f3cebcb1a9d2222` — *indexer: give every mutation door one
+  output generation authority*.
+- Verifier verdict: **PASS**.
+
+### W3.5b — `search_text` capability truth at the READER (D5)
+
+- State: `wired`. Round 2 (repair round); the verifier's check is explicit
+  ("implemented / compiled / tested / wired").
+- Agent: wave 4, Lane V+R.
+- Scope/files: `internal/graphview/materialize.go`, `materialize_test.go`,
+  `internal/mcp/view_search_text.go`, `view_search_text_reader_truth_test.go` (new),
+  `internal/mcp/view_capabilities.go` (**outside the ownership list**),
+  `internal/mcp/view_base_selector_test.go` (**outside the ownership list**),
+  `internal/indexer/builder_generation.go`, `builder_generation_test.go`,
+  `internal/indexer/checkout_text_search.go` (**outside the ownership list**),
+  `checkout_text_search_capability_test.go`.
+- Invariant: `search.text` is read off the **top** layer of a materialized stack alone, and silence
+  at the top is a **denial** (`StateUnavailable`), never inheritance from a lower layer; a refusal
+  states why; where an exact narrowing exists the base selector narrows rather than withdrawing,
+  so the declaration and the answer agree. No fallback is presented as an exact positive route.
+- Change: `Materializer.completeness` (`materialize.go:845`) keeps the worst-case union for every
+  capability **except** `CapSearchText`, scoped by an explicit arm in the row loop
+  (`:865-870`) and pinned by `TestTopLayerRuleAppliesToTextSearchAlone`; the final assignment
+  (`:881`) is unconditional, so an empty handle slice reports the denial instead of the seeded
+  `StateComplete`. `routeDescribesTheWorkingCopy`'s `!found` arm
+  (`checkout_text_search.go:117-119`) becomes fail-closed. `searchTextInView` attaches
+  `textSearchRefusalReason(view)`. `searchTextInNarrowedBase`
+  (`view_search_text.go:94-116`) pins `RepoAllow = {the graph's prefix}` and answers through
+  `MultiIndexer.GrepTextForRepos` / `GrepRegexpForRepos`, which stamp the prefix themselves; the
+  matching withdrawal is deleted from `baseGraphCompleteness`.
+- Acceptance gate(s): G5, G1.
+- Harness evidence: wave 4 exit suite — `internal/mcp` 6365 / 0 / 8 normal and 580 / 0 / 0 race
+  (0 `DATA RACE`), `internal/graphview` 477 / 0 / 0 normal and 168 / 0 / 0 race,
+  `internal/indexer` 2752 / 0 / 2.
+- Limitations: a dirty or commit generation built **before** W3.5 carries an explicit
+  `CapSearchText = complete` row, and the top-layer rule honours an explicit claim, so such a
+  generation at the top of a stack still reports `Complete` — deliberate; new builds are truthful
+  from the first cycle. There is still no generation-scoped text corpus (`internal/search/trigram`
+  has no serialization path), so a committed identity is refused rather than served from a snapshot
+  corpus. The base-selector answer is as fresh as the canonical checkout, not a snapshot read
+  (W5.7). A base selector whose store spells nodes with no repo prefix is not routed into the new
+  arm and answers exactly as at HEAD. The committed-identity half of the reader rule changes no
+  live MCP answer today; its value is prospective. The two end-to-end base-selector tests are
+  flaky under `-race` at wave concurrency and stable in isolation and under the normal flavor.
+- Deviations: three files outside the item's ownership list were changed and are in its commit —
+  `checkout_text_search.go` (the fail-open arm the item's own note requires be closed lives there,
+  only its *test* was listed: a plan defect), `view_capabilities.go` (one deleted line, without
+  which the owned narrowing would contradict the declaration) and `view_base_selector_test.go`
+  (the two tests that pinned the withdrawal the item replaces; leaving them would leave the wave
+  red). No concurrently running item in this wave owns any of the three, and the verifier graded
+  each and passed the item. Round 1 briefly mutated W2.4b's `checkout_coordinator.go` for 76 s
+  before restoring it byte-identically; round 2 used `go test -overlay` exclusively.
+- Commit: `f21bae29d07383dd5934be19fdb162aa8eb12e63` — *mcp: make the text-search capability
+  truthful at the reader*.
+- Verifier verdict: **PASS**.
+
 ## W4 — Activate coherent base and working routes
 
 - State: `proposed`. Dependencies: W2, W3. Items: W4.1–W4.4, W4.6–W4.8 in MVI; W4.5 out of scope.
@@ -936,7 +1106,8 @@ Shared fields for all W1 sub-items unless overridden:
   reintroducing both lock paths would deadlock. W4.3's audit must also cover `watcher.go:1459` and
   `incremental_watcher_batch.go:349`, two further `IncrementalReindexPaths` entrypoints into the
   legacy generation-0 writer.
-- Next action: W4.2 in wave 4, W4.3 in wave 5. W4.1 landed in wave 3 and is recorded below.
+- Next action: W4.3 in wave 5, then W4.4 / W4.6-W4.8. W4.1 landed in wave 3 and W4.2 in wave 4;
+  both are recorded below.
 
 ### W4.1 — Install the dedicated-base runtime before any owner registration (D1)
 
@@ -987,6 +1158,48 @@ Shared fields for all W1 sub-items unless overridden:
   registration to move the install after.
 - Verifier verdict: **PASS** (no blockers; 3 minor findings).
 
+### W4.2 — Initial committed publication on cold and warm startup
+
+- State: `wired`. The verifier's wiring check is explicit; the daemon's warmup dispatch
+  (`cmd/gortex/daemon_state.go`) schedules one publication per dedicated repository once that
+  repository's generation-zero index is complete, and the publisher is bound to the runtime W4.1
+  installs.
+- Agent: wave 4, Lane I (repair round after a first failed verification).
+- Scope/files: `internal/indexer/dedicated_base_startup.go` (new),
+  `dedicated_base_startup_test.go` (new), `dedicated_base_runtime.go`,
+  `cmd/gortex/daemon_state.go`, `cmd/gortex/daemon_dedicated_base_startup_test.go` (new). Owned but
+  unchanged: `dedicated_base_runtime_test.go`, `cmd/gortex/daemon_state_test.go`.
+- Invariant: **publication is not activation.** Adoption moves
+  `dedicated_graphs.active_generation_id` so dependents can key on an immutable lower snapshot; the
+  owning repository's own request route is untouched and generation 0 is never relabelled as
+  committed. Warmup readiness never waits for a publication, and closing publisher admission
+  cancels an in-flight publication so the drained-publishers join stays bounded.
+- Change: `InitialBasePublisher` installs the publisher against the catalog authority for one
+  dedicated repository, assembles one fresh observation inside the runtime's per-graph observation
+  gate, and calls `ensureInitial` (cold) or `ensureCurrent` (warm) with the runtime's **shared**
+  lease manager — reaching `BuildClaimedDedicatedBase` and `Catalog.AdoptDedicatedBaseGeneration`,
+  which before this item had zero production callers and left `active_generation_id` at 0 in every
+  running daemon. `dedicated_base_runtime.go` gains a cancellation registry on the exported handle
+  and explicit typed-nil-safe shadows of the four `DedicatedBaseCleanupRuntime` methods.
+- Acceptance gate(s): G4, G5, G6.
+- Harness evidence: wave 4 exit suite — `cmd/gortex` 1085 / 0 / 5, `internal/indexer` 2752 / 0 / 2
+  across the six chunks, indexer race lane 462 / 0 / 0 with 0 `DATA RACE`.
+- Limitations: publication is not activation (W4.5) — the owning repository's request route stays
+  on legacy generation 0, and dependents cannot yet *use* the published base (W4.4 / W4.8).
+  Failures are surfaced in the log and in `InitialBasePublisher.Outcomes()`, **not** in
+  `ViewsHealth`: `internal/viewmetrics/catalog.go` declares no dedicated-base series and belongs to
+  W8.3, so adding one here would have been an out-of-ownership edit. The one-shot embedded server
+  builds the same stack but runs no warmup, so it never schedules — pre-existing shape, not a
+  regression. Non-sqlite backends and stacks without a `MultiIndexer` get no publisher at all and
+  behave exactly as before. `Wait` parks on a movement channel for tests and an orderly join;
+  nothing on the readiness path calls it.
+- Deviations: the repair round replaced the original millisecond-poll `Wait` and rebuilt the
+  readiness assertion, which previously could not fail (the verifier's inline-publication mutant
+  passed against it).
+- Commit: `e0b90a760829048c90af33fd16567b0282bab2ae` — *indexer: publish an initial committed base
+  on cold and warm startup*.
+- Verifier verdict: **PASS**.
+
 ## W5 — Integrate request lifetime and selected readers
 
 - State: `proposed`. Dependencies: W4. Items: W5.1–W5.12, all in MVI.
@@ -999,10 +1212,10 @@ Shared fields for all W1 sub-items unless overridden:
   it was private, uncompiled and not activated; its counts (52 proposed files, 90 edits across 21
   files, 78 tests, 12 benchmarks) are proposal counts, not landed files or passing tests. Its
   source JSON is preserved in the recovery directory as `historical-proposal-tool-results.json`.
-- Next action: W5.4 onward; W5.10 in wave 4 inherits W5.5's cache residual. W5.1 and W5.8 landed
-  in wave 1; W5.2 and W5.3 landed in wave 2; W5.5 landed in wave 3. W5.9 is `blocked with
-  evidence` after wave 3 on a **procedural ownership** blocker — its source is on disk and green
-  but **not committed**; see its row.
+- Next action: W5.4, W5.6, W5.7, W5.11, W5.12. W5.1 and W5.8 landed in wave 1; W5.2 and W5.3 in
+  wave 2; W5.5 in wave 3; W5.10 in wave 4. W5.9 stays `blocked with evidence` after wave 4 on a
+  **procedural ownership** blocker — a different file from wave 3's, now the seven rendered agent
+  goldens — its source is on disk and green but **not committed**; see its row.
 
 ### W5.1 — Lease-handoff primitive (detach / joined consumer)
 
@@ -1299,69 +1512,145 @@ Shared fields for all W1 sub-items unless overridden:
 
 ### W5.9 — `require_fresh` / `wait_deadline`, and publishing `require_exact` (D6)
 
-- State: `blocked with evidence`. The source is implemented, compiles, is `wired` by the verifier's
-  own explicit check, and is green inside this wave's exit suite — but the item's **final verifier
-  verdict is `fail`** on a procedural ownership blocker, and the wave's commit rule is "commit only
-  on a passing verdict", so **nothing of W5.9 was committed**. Its seven files stay dirty in the
-  worktree at the end of wave 3.
-- Blocking evidence: `scratchpad/reports/W3-W5.9-verify.md` §5 and finding 1 —
-  `internal/mcp/tools_list_budget_test.go` (+27/−3) is edited outside every ownership list in the
-  wave. The verifier established the edit is **forced, not convenience**: reverting the three
-  constants against unmutated production fails with *"agent preset cold tools/list is 31944 bytes,
-  over the 30000 ceiling"*; the pre-item headroom was **32 bytes**, and the minimum publishable
-  schema is ~99 B/tool over 20 agent-preset tools. It also confirmed **no assertion was deleted or
-  weakened** and that the gate still bites. Required action: **the Suite cannot ratify an ownership
-  list it did not author** — the coordinator must either add that file to W5.9's ownership or move
-  the three constants into a separately owned file, after which the item commits as-is. There is
-  nothing technical to fix.
-- Agent: wave 3, Lane R (repair round after a first failed verification).
-- Scope/files (all uncommitted): `internal/mcp/view_request.go` (+243),
-  `internal/mcp/checkout_binding.go` (+366), `internal/mcp/server.go` (+22),
-  `internal/mcp/guide.go` (+6), `internal/mcp/arg_schema_guard.go` (+9, comment-only),
-  `internal/mcp/tools_list_budget_test.go` (+27/−3, **out of ownership**),
-  `internal/mcp/view_freshness_test.go` (new, 678). `internal/profiles/bodies.go` is in the
-  ownership list and unchanged (finding 7).
+- State: `blocked with evidence`, a second wave running. The source is implemented, compiles, is
+  `wired` by the verifier's own explicit check, and is green inside this wave's exit suite — but the
+  item's **final verifier verdict is `fail`** on a procedural ownership blocker, and the wave's
+  commit rule is "commit only on a passing verdict", so **nothing of W5.9 was committed**. Its
+  sixteen files stay dirty in the worktree at the end of wave 4.
+- Blocking evidence: wave 3's blocker is **closed** —
+  `internal/mcp/tools_list_budget_test.go` was restored byte-for-byte to HEAD (`git diff` on it is
+  empty) and the guard allowlist now achieves the plan's objective with every published list
+  byte-identical to HEAD, so no ceiling constant is touched. A **new** blocker took its place:
+  `cmd/gortex/testdata/agent-render/{antigravity,claude-code,codex,copilot-cli,cursor,hermes,opencode}.txt`
+  are modified and are in no item's ownership list. They are *generated* by the project's own
+  mechanism (`go test ./cmd/gortex -run TestAgentsRenderGolden -update-agent-render`) from a file
+  the item **does** own (`internal/profiles/bodies.go:73-88`), whose routing bullet the item note
+  explicitly requires be qualified; mutation M7b (revert `bodies.go`, keep the goldens) turns
+  `cmd/gortex TestAgentsRenderGolden` red, and reverting the goldens while keeping `bodies.go`
+  leaves the tree red. The diff is auditable in one grep: 372 changed `^[-+]` lines, 14 of them
+  file headers, and **0** changed content lines that are not the one routing bullet. Required
+  action: **the Suite cannot ratify an ownership list it did not author** — the coordinator must
+  amend W5.9's ownership with `cmd/gortex/testdata/agent-render/**`, or take the seven files into a
+  separately owned commit. There is nothing technical to fix.
+- Agent: wave 4, Lane R (repair round 2; wave 3 Lane R before it).
+- Scope/files (all uncommitted): `internal/mcp/view_request.go`, `checkout_binding.go`,
+  `arg_schema_guard.go`, `overlay.go`, `server.go`, `guide.go`,
+  `internal/mcp/view_freshness_test.go` (new), `internal/profiles/bodies.go`,
+  `internal/profiles/routing_freshness_policy_test.go` (new), and the seven
+  `cmd/gortex/testdata/agent-render/*.txt` goldens (**out of ownership**).
+  `internal/mcp/tools_list_budget_test.go` is byte-identical to HEAD and must not be committed.
 - Invariant: `require_exact:true` refuses a substituted view rather than serving one;
   `require_fresh:true` awaits filesystem state and `wait_deadline` bounds that wait with an
-  absolute RFC3339 instant; every outcome is reported on the rider (`fresh`, `waited_ms`,
-  `wait_deadline`, `fresh_reason`) rather than being silently absorbed.
-- Change: the three knobs are parsed and enforced in `requestRequestView`'s policy, the wait is
-  settled against the production `CheckoutLifecycle` (no test seam on the live path), and
-  `publishRequestFreshnessSchema` declares them additively and idempotently on guarded tools.
+  absolute RFC3339 instant; every outcome rides on the rider (`fresh`, `waited_ms`,
+  `wait_deadline`, `fresh_reason`) rather than being silently absorbed. No fallback is presented as
+  an exact positive route.
+- Change (this round, on top of wave 3's): a second `fresh_reason` —
+  `freshnessWaitTarget` (`view_request.go:679-723`) now returns the reason, and a lookup that could
+  not answer rides as `wait_target_unavailable` (`checkout_binding.go:239-243`) instead of being
+  mislabelled a committed-base advance; `guide.go:129` publishes the full seven-value vocabulary.
+  `require_exact` + `require_fresh` now refuses on **every** `fresh:false` outcome
+  (`view_request.go:630-633`, `:657-666`, `freshnessExactRefusal` at
+  `checkout_binding.go:444-466`), not only on `deadline_exceeded`. The committed-base gate in
+  `awaitCheckoutFreshness` (`checkout_binding.go:300`) is reached through an explicit
+  `view:{kind:"worktree"}` in both the routed and not-yet-routed shape, and the
+  "parse before `reconcileToolParams`" ordering is pinned by a live request through the whole
+  middleware.
 - Acceptance gate(s): G1, G7.
-- Harness evidence (wave 3 exit suite, dirty tree): the item's tests ran green inside
-  `internal/mcp` whole package (`results/internal_mcp-normal-_-w3suite-1`, 6164 / 0 / 8) and the
-  mcp race lane (528 / 0 / 0, 0 `DATA RACE`). This is suite evidence on the wave's dirty tree; the
-  blocker is not evidentiary and is not answered by a re-run.
+- Harness evidence (wave 4 exit suite, dirty tree): the item's files were present for every run of
+  this suite — `internal/mcp` 6365 / 0 / 8 normal and 580 / 0 / 0 race (0 `DATA RACE`),
+  `internal/profiles` 13 / 0 / 0, `cmd/gortex` 1085 / 0 / 5. This is suite evidence on the wave's
+  dirty tree; the blocker is not evidentiary and is not answered by a re-run.
 - Limitations / carried findings: **major** — the compact facade surface (21 tools, the default
-  `tools/list`) still does not *declare* the three knobs, though they work there (pinned
-  end-to-end). Measured: publishing them at `facade_tools.go:219` takes the compact list from
-  14 984 to **17 168** bytes against a 15 000 ceiling the facade test forbids raising, so closing
-  D6's publication half requires compacting the facade schemas first — a separate item. **minor** —
-  `effectiveDeadline` clamps to the 60 s hang-firewall deadline with no margin, so a `wait_deadline`
-  past ~60 s races the firewall and is counted into `abandonedToolCalls` instead of answering
-  `fresh_reason:"deadline_exceeded"`; the fix is to subtract `transportDeadlineMargin` and/or state
-  the cap in the guide. **minor** — the pre-wait view keeps its generation lease for the whole
-  wait on the expiry and retry paths. **minor** — a fresh wait whose re-selection returns
-  `(nil, nil)` claims `fresh:true` on a shared-corpus answer (narrow, untested race). **minor** —
-  a malformed `wait_deadline` degrades instead of refusing for the one `detect_changes`
-  checkout-scoped shape, because `overlay.go` converts the error into a fallback view.
-  **minor** — `internal/profiles/bodies.go:75` still ships `require_fresh:true to await filesystem
-  state` unqualified, which after this item holds only for a routed automatic checkout; the
-  sentence is verbatim in seven rendered agent goldens, none in any ownership list, so it is booked
-  as a W4.3 follow-up rather than edited here.
-- Deviations: publication rides `prepareTool`'s guarded population rather than
-  `publishViewSelectorSchema` as the plan named — that covers exactly the tools whose closed schema
-  rejected the knobs, and the facade population needs no declaration to accept them. The verifier
-  agrees with the outcome and disagrees only with the *stated reason* in the code comment
-  (`server.go:3286-3289` attributes the byte saving to the wrong seam; measured, the `guarded` gate
-  is worth +104 B on the agent preset, not the ~2184 B claimed, which lives at
-  `facade_tools.go:219`).
-- Next action: coordinator ratifies the ownership of `internal/mcp/tools_list_budget_test.go` (or
-  relocates the three constants); on that, the item commits unchanged. A follow-up item should
-  carry the facade-schema compaction that D6's publication half needs.
+  `tools/list`) still does not *declare* the three knobs, though they work there. Measured:
+  publishing them at `facade_tools.go:219` takes the compact list from 14 984 to **17 168** bytes
+  against a 15 000 ceiling the facade test forbids raising, so closing D6's publication half
+  requires compacting the facade schemas first — a separate item.
+  `TestGuardedToolsAcceptTheFreshnessKnobsWithoutDeclaringThem` now **asserts** the absence, so a
+  future publication has to change that test deliberately. **minor** — `effectiveDeadline` clamps
+  to the 60 s hang-firewall deadline with no margin, so a `wait_deadline` past ~60 s races the
+  firewall and is counted into `abandonedToolCalls`. **minor** — the pre-wait view keeps its
+  generation lease for the whole wait on the expiry and retry paths. **minor** — a fresh wait whose
+  re-selection returns `(nil, nil)` claims `fresh:true` on a shared-corpus answer (narrow,
+  untested race). **minor** — a malformed `wait_deadline` degrades instead of refusing for the one
+  `detect_changes` checkout-scoped shape, because `overlay.go` converts the error into a fallback
+  view. **minor** — the core profile body is **3 bytes** under its ceiling (4605 / 4608), so the
+  next instruction change to any shared section must trim or re-base
+  `profiles_test.go bodyByteCeilings["core"]`. **minor** — `require_exact` now refuses more than it
+  did: a caller that sent both knobs and previously got a stale answer with `fresh:false` now gets
+  a `view_building` error. That is the intended reading of the pair and is documented; no caller
+  can be affected today because the guard refused `require_exact` on every guarded tool before this
+  item. **minor** — the knobs are not stripped from the argument map, matching `require_exact`'s
+  pre-existing behaviour.
+- Deviations: the plan's publication step is still not performed (coordinator override, carried
+  from wave 3) — the guard allowlist achieves the stated objective with every published list
+  byte-identical to HEAD. `require_exact`'s scope was widened beyond the plan and beyond wave 3:
+  the pair now means "fresh route or nothing". A second `fresh_reason` the plan does not name was
+  added, and it is what makes the rider truthful. `internal/profiles/bodies.go:75` — booked in wave
+  3 as a W4.3 follow-up — was qualified in this round instead, which is what regenerated the seven
+  goldens and produced the new ownership blocker.
+- Next action: coordinator ratifies `cmd/gortex/testdata/agent-render/**` for W5.9 (or takes the
+  seven generated files into a Suite-owned commit); on that, the item commits unchanged. A
+  follow-up item should carry the facade-schema compaction that D6's publication half needs.
 - Verifier verdict: **FAIL — one ownership blocker (procedural), plus one major (incomplete
-  deliverable) and six minors. No correctness defect found in the shipped behaviour.**
+  deliverable) and several minors. No correctness defect found in the shipped behaviour; the five
+  findings of the previous round are all fixed and mutation-pinned (M11b, M16b, M17, M18, M19 all
+  RED).**
+
+### W5.10 — Key caches and sidecars by the selected snapshot identity (H5)
+
+- State: `wired`. The verifier's wiring check is explicit; both halves sit on default production
+  paths (the store's bundle cache on every FTS bundle read, the walk cache on every
+  `context_closure rank=proximity` request).
+- Agent: wave 4, Lane S+R (repair round after a first failed verification).
+- Scope/files: `internal/graph/store_sqlite/bundle_cache.go`, `bundle_cache_test.go`,
+  `internal/mcp/ppr_cache.go`, `centrality.go`, `tools_closure.go`,
+  `snapshot_keyed_caches_test.go` (new).
+- Invariant: a cache entry is served only to the snapshot identity it was computed for. A selected
+  graph plus global source/search/cache data must not produce a mixed view; a miss that recomputes
+  is always preferred to a wrong hit.
+- Change: three defects, all fixed. **(store)** `bundleCache` lives on `storeCore`, so every
+  generation handle over one database shares it, and entries were validated against a single
+  package-fingerprint map with no identity at all — a change confined to a higher layer moves no
+  base fingerprint, so stale bundles kept being served. `fpViewGen`/`fpSet` (`:126-127`) record
+  which payload view generation the installed map speaks for and whether one was installed at all
+  (generation 0 is **not** assumed), `refresh` (`:254`) prunes every entry the new map cannot
+  validate, and `describesLocked` (`:276`) gates both `lookup` (`:318`) and `store` (`:351`). The
+  `graph.BundleFingerprintSink` interface is untouched. **(ranking)** `closureProximity` ranked
+  every request over the process-global analysis CSR, so a selected view's own symbols scored zero
+  while base-only symbols carried mass; a routed request now builds a bounded CSR over its own
+  reader, rooted on the **scored candidate set** so every emitted score is real rather than a
+  horizon artefact, with the node cap sized from the root count so no member can be dropped.
+  **(key)** the walk key is scoped by snapshot identity plus the bound's roots, through a scoped
+  sibling plus an **uncacheable** delegating wrapper, so `personalizedPageRank`'s signature and its
+  unowned second caller are untouched. Buffer-overlay requests deliberately never cache.
+- Acceptance gate(s): G1, G5.
+- Harness evidence: wave 4 exit suite — `internal/graph/store_sqlite` 1767 / 0 / 2 normal and
+  145 / 0 / 1 race, `internal/mcp` 6365 / 0 / 8 normal and 580 / 0 / 0 race, 0 `DATA RACE`.
+  12 of 12 revert-red mutations bind.
+- Limitations: the rerank path no longer memoises its walk (the recovery is one line at an unowned
+  call site — worth a follow-up). `topK` still truncates the returned score map at
+  `pprCacheDefaultTopK = 4096`, unreachable at `context_closure`'s default `max_nodes` of 400.
+  The walk key remains a 1-hop statement **within** one snapshot, so a change two or more hops away
+  inside one view still reproduces a key; the scope closes the cross-snapshot and cross-bound
+  halves only. Routed proximity ranking is bounded where it used to be whole-graph: the ring is one
+  `proximityAdjacencyDepth` deep and the edge cap can still truncate on a pathologically dense
+  neighbourhood, shifting scores without dropping members; `BoundedAdjacencyStats.Truncated` is
+  returned by the builder and is **not** surfaced on the response (that is W5.6's charter). The
+  bounded CSR follows `calls` / `references` only, unchanged from the whole-graph CSR. Wire
+  rounding at 1e-6 can still print `0.0` for a genuinely non-zero score — pre-existing
+  presentation. A composed generation gets **no** bundle caching at all until something installs
+  fingerprints derived from that generation; no such wiring exists today, so this is a latency-only
+  regression on a path that was previously serving possibly-stale bundles.
+- Deviations: `tools_closure.go` was edited although the plan's row names only `ppr_cache.go` and
+  `centrality.go` — the file is in the item's ownership list and the edit is confined to the lines
+  that reach centrality, leaving W5.6's annotation work untouched. The store half keys on the
+  installing handle's `viewGen` rather than a `RepoViewID` fingerprint, because
+  `RepoViewID.Validate` requires `BaseGeneration > 0` (the base corpus cannot be expressed as one)
+  and `store_sqlite` does not import `graphview`. The cache scope grew a third dimension (`roots`)
+  the plan does not mention, forced by the bounded snapshot.
+- Commit: `ac44076cc0476d9494bac1829fd20b9f4036011d` — *mcp: key caches and sidecars by the
+  selected snapshot identity*.
+- Verifier verdict: **PASS**.
 
 ## W6 — Finish bounded reuse and storage maintenance
 
@@ -1379,7 +1668,8 @@ Shared fields for all W1 sub-items unless overridden:
   hard 64-generation catalog ancestry limit — **provisional**: not proven compaction, not a
   bounded steady-state disk figure, not an established reseed cost. W6.1 is the plan's only XL and
   is strictly serialized S → V → B.
-- Next action: W6.3 in wave 4. W6.2 landed in wave 3 and is recorded below.
+- Next action: W6.1, W6.4, W6.5, W6.7, W6.9-W6.12. W6.2 landed in wave 3 and W6.3 in wave 4;
+  both are recorded below.
 
 ### W6.2 — Exact restub gate on the legacy incremental path
 
@@ -1432,6 +1722,52 @@ Shared fields for all W1 sub-items unless overridden:
 - Verifier verdict: **PASS** (no blockers; 5 minor findings, all non-blocking). The verifier ran an
   independent losslessness probe on the carry.
 
+### W6.3 — Whole-batch bound and completeness fact for the legacy affected-by union
+
+- State: `wired`. The verifier's wiring check is explicit; the bound rides on the batch plan that
+  every incremental path builds, including the one call site that discards the plan it gets back
+  (`indexer.go:4980`).
+- Agent: wave 4, Lane B.
+- Scope/files: `internal/indexer/affected_by.go`, `incremental_batch.go`,
+  `affected_by_bound_test.go` (new).
+- Invariant: the affected-by cap bounds the **whole batch**, not each changed file, and a
+  truncation is never silent. The incrementally maintained bound over merged chunks is identical to
+  a one-shot bound over the complete union; a non-positive cap means "no bound", never "re-resolve
+  nothing". The change strictly **narrows** what is re-resolved — no scoped resolution becomes a
+  whole-corpus `ResolveAll`.
+- Change: `boundAffectedByFiles` (`affected_by.go:94-115`) is the one bound primitive, keeping the
+  lexicographically smallest `cap` entries of an already-sorted union and naming the rest — an
+  order-independent choice, which is what makes the merged-chunk bound equal the one-shot bound.
+  `affectedByTruncation` (`:74-92`) is the typed completeness fact (`Truncated`, `Cap`,
+  `Considered`, `Dropped`), modelled on `BuildReport.ClosureTruncated` / `ClosureCap`.
+  `reportAffectedByTruncation` (`:117-140`) is the single surfacing point, raised **Debug → Warn**
+  to match `builder_closure.go:200-204`, with the `affected` / `cap` / `dropped` field names kept
+  byte-identical because `affected_by_e2e_test.go:230-236` reads them (`file` becomes `scope`,
+  which a whole-batch bound actually has). `affectedByBatchPlan` (`incremental_batch.go:1546-1572`)
+  carries `maxFiles`, `notify` and `truncation` and applies the bound through `bounded()`; the
+  single-file legacy path (`:642-643`) calls the same primitive.
+- Acceptance gate(s): G3, G4, G8.
+- Harness evidence: wave 4 exit suite — `internal/indexer` 2752 / 0 / 2 across the six chunks,
+  indexer race lane 462 / 0 / 0 with 0 `DATA RACE`.
+- Limitations: the completeness fact does **not** reach the mutation receipt or the daemon
+  readiness payload — every available carrier (`IndexResult`, `DerivedInvalidationPlan`,
+  `reparsePendingEnrichmentBatch`, `graph.MutationReceipt`, the `viewmetrics` series catalog) is
+  outside this item's ownership, and two source facts make the receipt the wrong carrier anyway:
+  the deferred affected-by pass runs **after** the receipt closes, and marking the receipt
+  incomplete would force the whole-graph fallback resolve — i.e. it would *cause* the amplification
+  this item removes. Follow-up for Lane I / W6.11: add `AffectedByTruncated` + `AffectedByDropped`
+  to `DerivedInvalidationPlan`, which already flows to `IndexResult` and onto the wire. The
+  `affected_by_truncated` observation hook is nil in production (`indexer.go:544-547`) — it is a
+  test seam; the Warn log is the production surface. The bound is a **cut, not a deferral**: files
+  past the cap are not re-resolved and not queued, exactly as before — what changed is that the cut
+  is bounded per batch and recorded. `Considered` in the deferred path is the union size at the
+  merge that cut it, so summing `dropped` across facts is valid and summing `affected` is not.
+- Deviations: none beyond the Debug → Warn level change and the `file` → `scope` field rename,
+  both stated above. No schema change; no guard weakened; no skip, exemption or deleted assertion.
+- Commit: `2f0074cb7264b879ac10fc392a4bf6b5e9702ddb` — *indexer: bound the affected-by union per
+  batch and say what it dropped*.
+- Verifier verdict: **PASS**.
+
 ## W7 — Complete lifecycle/recovery integration
 
 - State: `proposed`. Dependencies: W1.3, W1.4, W4, W5. Items: W7.1, W7.2, W7.4, W7.6, W7.7 in MVI;
@@ -1445,7 +1781,55 @@ Shared fields for all W1 sub-items unless overridden:
 - Limitations: stale publishers, drain handles and cleanup callbacks must not affect replacement
   registrations at the same path or with reused IDs. The `internal/persistence` sidecar DB
   obligation is currently unowned — see the plan bookkeeping table (B1).
-- Next action: W7.4 in wave 4.
+- Next action: W7.1, W7.2, W7.6, W7.7. W7.4 landed in wave 4 and is recorded below.
+
+### W7.4 — Close a repository admission by handle identity
+
+- State: `wired`. The verifier's wiring check is explicit; the lifecycle's single production caller
+  of `CloseRepositoryAdmission` (`internal/indexer/repository_admission.go:212` pre-change) moves to
+  the handle on every path.
+- Agent: wave 4, Lane V+I.
+- Scope/files: `internal/graphview/repository_lease.go`,
+  `internal/graphview/repository_close_identity_test.go` (new),
+  `internal/indexer/repository_admission.go`, `repository_admission_test.go`.
+  `internal/graphview/repository_lease_test.go` was not modified.
+- Invariant: closing finalizes **only the captured registration**. A handle is valid only while the
+  registry still maps both the prefix and the raw root to that exact object and the object is not
+  finalized — so deletion/recreation, path/ID reuse, follower cancellation and delayed callbacks
+  cannot resurrect or damage another owner.
+- Change: `CloseRepositoryAdmission` previously resolved `r.byPrefix[owner.RepoPrefix]` and accepted
+  it on a **value** compare of the four identity strings (`repository_lease.go:239-243`
+  pre-change), so any holder of an old owner tuple closed whatever registration currently served
+  that prefix. Production was safe only because the lifecycle mints a fresh incarnation on every
+  registration — an argument, not a mechanism. `RepositoryRegistration` (`:92`), `Owner()` (`:99`),
+  `dedicatedRegistrationLocked` (`:110`) and a handle-shaped register/close pair adopt the rule the
+  raw path already used (`repository_raw_lease.go:102-112`). Additive only: no existing signature
+  changed, no existing behaviour changed. The already-closing path carries the captured
+  `*RepositoryDrain`, so it is handle identity end to end.
+- Acceptance gate(s): G7, G9.
+- Harness evidence: wave 4 exit suite — `internal/graphview` 477 / 0 / 0 normal and 168 / 0 / 0
+  race (0 `DATA RACE`), `internal/indexer` 2752 / 0 / 2.
+- Limitations: `CloseRepositoryAdmission` was **not** renamed or re-signed — changing the exported
+  signature would break four test files this item does not own, so the tuple entrypoint is kept
+  with byte-identical behaviour and an explicit doc warning while every production path moves to
+  the handle; a follow-up that owns those files can delete the tuple form.
+  `RegisterRepositoryOwnerPrepared` was not changed to return the handle (unowned file), so
+  `RegisterRepositoryOwnerHandle` delegates and resolves the handle in a second critical section —
+  ambiguous only if another registrar races the same prefix between the two, and the lifecycle
+  serializes its whole registration/close/finalize path under `repositoryAdmissionMu` and is the
+  only in-tree registrar of this owner domain. The lifecycle still cannot **persist** a registration
+  handle across calls: `CheckoutLifecycle.repositoryOwners` is
+  `map[string]graphview.RepositoryOwner` in a file owned by W2.4b this wave, so in the
+  "registered earlier, not yet closing" path the handle is re-minted at close time from the live
+  registration through the idempotent handle register. Closing that residual gap is a one-field
+  follow-up. No reuse-refusal was added to the tuple path, because a "this prefix was finalized
+  before" guard would break `BenchmarkRepositoryPreparedRegistration` in an unowned file.
+- Deviations: the plan's title says "move to handle identity"; the exported tuple form survives for
+  the reason above. The coordinator's note cited `repository_admission.go:90-97` for the fresh
+  incarnation mint; the mint is actually assembled at `:107-114`. No behaviour claim changed.
+- Commit: `2b2dcfb1909e3c6a4e78b2cc8600113214640d74` — *graphview: close a repository admission by
+  handle identity*.
+- Verifier verdict: **PASS**.
 
 ## W8 — Prove end-to-end correctness and I/O benefit
 
@@ -2322,5 +2706,123 @@ Runs executed 2026-09-10/11 local time; the entry is dated by the wave, not by t
   disjointness plus the aggregate build, not measured. W2.4 lands D8's second one-time
   invalidation, unmeasured on a real store.
 - **Disk.** Recorded in the wave 3 exit report (`scratchpad/reports/W3-suite.md`): `df -h /` before
+  and after the stage's cleanup, which deletes the per-run harness homes and compiled test binaries
+  and trims Go build-cache entries untouched for more than a day. No shared cache was cleared.
+
+### 2026-09-10 — Wave 4 exit suite (W3.1, W4.2, W7.4, W6.3, W3.5b, W5.10; W2.4b and W5.9 blocked)
+
+- **Source identity.** HEAD `47c6efa02d1444eeb2252612b4d8802f58f359ba`, dirty-manifest sha256
+  `36afdd22fb92fa7af1f9f6b927cc29a8f0e6dae95d8045e8eae4554a3a8dca0d` (57 modified + 11 untracked
+  paths, one of which is the untracked handoff working note). Identical on **all 14 compiles and
+  all 19 runs** — no source drift during the suite. Taken from the harness `result.json` /
+  `meta.json` files, which carry `head_sha` and `dirty_manifest_sha256` on every row (33 artifacts,
+  33 identical pairs).
+- **Commands.** From the worktree with the isolated environment (`GOWORK=off GOTOOLCHAIN=local
+  GOFLAGS="-mod=mod -buildvcs=false" GOPROXY=off`): `go build ./...` (exit 0, no output) and
+  `go vet` over `./cmd/gortex ./internal/graph ./internal/graph/store_sqlite ./internal/graphview
+  ./internal/indexer ./internal/mcp ./internal/profiles ./internal/serverstack ./internal/reconcile`
+  (exit 0 on all nine, no diagnostics). Then through `scratchpad/harness/validate.sh` with
+  `GXH_TAG=W4suite`: 14 × `compile` (9 normal, 5 race) and 19 × `test`.
+- **Result: 14490 pass / 0 fail / 18 skip, 0 `DATA RACE`.** Every skip is named with its exact
+  reason. `all_green = true`.
+
+  | run | pattern | pass | fail | skip | result dir |
+  | --- | --- | --- | --- | --- | --- |
+  | `internal/graph` normal | `.` | 530 | 0 | 0 | `results/graph-normal-_-W4suite-1` |
+  | `internal/graphview` normal | `.` | 477 | 0 | 0 | `results/graphview-normal-_-W4suite-1` |
+  | `internal/graph/store_sqlite` normal | `.` | 1767 | 0 | 2 | `results/store-normal-_-W4suite-1` |
+  | `internal/reconcile` normal | `.` | 92 | 0 | 0 | `results/reconcile-normal-_-W4suite-1` |
+  | `internal/mcp` normal | `.` | 6365 | 0 | 8 | `results/internal_mcp-normal-_-W4suite-1` |
+  | `internal/serverstack` normal | `.` | 27 | 0 | 0 | `results/internal_serverstack-normal-_-W4suite-1` |
+  | `internal/profiles` normal | `.` | 13 | 0 | 0 | `results/internal_profiles-normal-_-W4suite-1` |
+  | `cmd/gortex` normal | `.` | 1085 | 0 | 5 | `results/cmd-normal-_-W4suite-1` |
+  | `internal/indexer` normal | `^Test[A-C]` | 593 | 0 | 1 | `results/indexer-normal-_Test_A_C_-W4suite-1` |
+  | `internal/indexer` normal | `^Test[D-H]` | 546 | 0 | 0 | `results/indexer-normal-_Test_D_H_-W4suite-1` |
+  | `internal/indexer` normal | `^Test[I-M]` | 494 | 0 | 1 | `results/indexer-normal-_Test_I_M_-W4suite-1` |
+  | `internal/indexer` normal | `^Test[N-R]` | 620 | 0 | 0 | `results/indexer-normal-_Test_N_R_-W4suite-1` |
+  | `internal/indexer` normal | `^Test[S-T]` | 358 | 0 | 0 | `results/indexer-normal-_Test_S_T_-W4suite-1` |
+  | `internal/indexer` normal | `^Test[U-Z]` | 141 | 0 | 0 | `results/indexer-normal-_Test_U_Z_-W4suite-1` |
+  | `internal/indexer` race | `DedicatedBase\|Startup\|Publication\|Authority\|Mutation\|Receipt\|Admission\|Affected\|Restub\|Cohort\|RefView\|Rehome\|CheckoutMutation\|SearchText` | 462 | 0 | 0 | `results/indexer-race-DedicatedBase_Startup_Publication_Authority_Muta-W4suite-1` |
+  | `internal/graphview` race | `Lease\|Handoff\|Materialize\|Drain\|Raw\|Pin\|Close\|Identity\|Completeness` | 168 | 0 | 0 | `results/graphview-race-Lease_Handoff_Materialize_Drain_Raw_Pin_Close_Id-W4suite-1` |
+  | `internal/mcp` race | `SearchText\|Cache\|PPR\|Centrality\|Closure\|RequestView\|ViewBase\|Pin\|Fresh\|Deadline\|Guard` | 580 | 0 | 0 | `results/internal_mcp-race-SearchText_Cache_PPR_Centrality_Closure_RequestV-W4suite-1` |
+  | `internal/serverstack` race | `.` | 27 | 0 | 0 | `results/internal_serverstack-race-_-W4suite-1` |
+  | `internal/graph/store_sqlite` race | `Bundle\|DedicatedBase\|Adopt\|Publication` | 145 | 0 | 1 | `results/store-race-Bundle_DedicatedBase_Adopt_Publication-W4suite-1` |
+
+- **`internal/indexer` was chunked from the start**, as the six first-letter regexes the wave
+  mandates (`^Test[A-C]` … `^Test[U-Z]`), because the whole package does not fit the harness's
+  hardcoded `-test.timeout 8m` in one process — measured in wave 2, not re-attempted here. Totals
+  across the six chunks: **2752 / 0 / 2**. Cross-chunk single-process interference is therefore
+  unobserved in that package, as in every prior wave. The `^Test[A-C]` chunk took 375 s of its 480 s
+  wall with the other driver running concurrently; the two drivers (indexer chunks, everything
+  else) were run in parallel and the race lanes serially after both.
+- **Named skips (18), all pre-existing and environment- or platform-gated.**
+  `internal/graph/store_sqlite` (2 normal + 1 race): `TestBundlePackageKeyNeverUsesOSSeparator`
+  (*"separator matches the contract on this platform"* — the Windows path-separator test, skipped
+  in both flavors) and `TestMetaBlobCensus` (*"set GORTEX_BENCH_STORE to a copied store.sqlite to
+  run"*) — the two the exit criterion pre-blessed. `internal/indexer` (2): `TestBackendBench`
+  (*"bench harness; set GORTEX_BENCH_ROOT=<repo> and GORTEX_BENCH_BACKEND=memory|sqlite"*) and
+  `TestMeasureEditLatency` (*"set GORTEX_MEASURE_REPO=/abs/path to run"*). `internal/mcp` (8): five
+  `TestAnalyzeScope_AllScopeAwareKinds_NoCrossWorkspaceLeak` subtests (`coverage_gaps`,
+  `coverage_summary`, `ownership`, `stale_code`, `stale_flags` — each needs a coverage profile or
+  git-blame data that cannot be fixtured in memory), `TestATradeThatCannotSaveTheOutlineIsGivenBack`
+  (*"the fixture is no longer tight enough to drop the index"*),
+  `TestLocalizationTextMatchNormalisesNativePathToGraphKey` (Windows path spelling) and
+  `TestCheckoutMutationResolvedRootRejectsFoldedDistinctDirectory` (*"filesystem cannot represent
+  case-distinct directories"*). `cmd/gortex` (5):
+  `TestFileCoveragePrefersCanonicalKeysWithoutDoubleCounting` (*"native and slash graph keys
+  coincide on this platform"*), `TestSystemdUnitPath_ResolvesUnderHome` and
+  `TestServiceCommands_RejectUnsupportedOS` (linux-only / unsupported-OS-only), and the two
+  isolated-daemon integration tests (`TestIssue767IdleIOIntegration`,
+  `TestIssue767WorktreeReadinessIntegration`) that need an opt-in binary env var.
+- **Commits.** Six, one per passing item, in dependency order, each staging only that item's files
+  (`git add <paths>`, never `-A`); the ledger commit is seventh and last. The output-generation
+  authority is committed first because publication, checkout mutation and the base pin all admit
+  through it; the reader-side changes (capability truth, cache keying) are last.
+
+  | # | commit | item | subject |
+  | --- | --- | --- | --- |
+  | 1 | `cfe5a2da392b3ed19739f46b5f3cebcb1a9d2222` | W3.1 | indexer: give every mutation door one output generation authority |
+  | 2 | `e0b90a760829048c90af33fd16567b0282bab2ae` | W4.2 | indexer: publish an initial committed base on cold and warm startup |
+  | 3 | `2b2dcfb1909e3c6a4e78b2cc8600113214640d74` | W7.4 | graphview: close a repository admission by handle identity |
+  | 4 | `2f0074cb7264b879ac10fc392a4bf6b5e9702ddb` | W6.3 | indexer: bound the affected-by union per batch and say what it dropped |
+  | 5 | `f21bae29d07383dd5934be19fdb162aa8eb12e63` | W3.5b | mcp: make the text-search capability truthful at the reader |
+  | 6 | `ac44076cc0476d9494bac1829fd20b9f4036011d` | W5.10 | mcp: key caches and sidecars by the selected snapshot identity |
+
+- **W2.4b and W5.9 were NOT committed.** Both final verifier verdicts are `fail` on a **procedural
+  ownership** blocker, and the wave's rule is to commit only on a passing verdict. W2.4b edits
+  `internal/indexer/checkout_coordinator.go`; W5.9 edits the seven generated
+  `cmd/gortex/testdata/agent-render/*.txt` goldens. Neither path is in any item's ownership list in
+  this wave, and the Suite stage **cannot ratify an ownership list it did not author**, so both stay
+  `blocked with evidence` with their files dirty in the worktree — W2.4b's five, W5.9's sixteen.
+  Both blockers are procedural: no correctness defect was found in either item's shipped behaviour
+  (W2.4b binds 19 of 19 mutations; W5.9 fixed and pinned all five of the previous round's
+  findings). Wave 3's W5.9 blocker — `internal/mcp/tools_list_budget_test.go` — is **closed**: the
+  file is byte-identical to HEAD again. Note that both items' files were **present in the tree for
+  every run of this suite**, so the counts above were produced with their production changes active.
+- **A passing item also shipped three out-of-ownership files.** W3.5b's commit contains
+  `internal/indexer/checkout_text_search.go`, `internal/mcp/view_capabilities.go` and
+  `internal/mcp/view_base_selector_test.go`. Unlike the two blocked items, W3.5b's verifier graded
+  each of the three and returned **PASS**, so the Suite committed the item as its verifier
+  ratified it. The asymmetry is recorded rather than resolved here: it is a coordinator decision
+  whether an adversarial verifier's PASS is sufficient ratification for an out-of-list file.
+- **Post-commit verification.** `git status --porcelain -uall` after the six commits shows exactly
+  W2.4b's five files, W5.9's sixteen, this ledger and the untracked handoff working note — 22
+  entries, nothing outside this wave's ownership staged or touched. Every one of the 68 dirty paths
+  in the pre-commit snapshot was mapped to exactly one item before staging (no path unclaimed, no
+  path claimed twice).
+- **Limitations of what this suite proves.** These are unit and package regressions on a pinned
+  dirty source identity. W3.1, W4.2, W7.4, W6.3, W3.5b and W5.10 all reached `wired` by their
+  verifiers' explicit checks, but **no item reached `E2E validated`**: there is still no end-to-end
+  and no paired-I/O evidence, and gates G1–G9 are unchanged by this wave. W4.2 proves publication
+  and adoption only — nothing *activates* a published base, and no dependent reads one (W4.4 /
+  W4.5 / W4.8). W6.3's reduction is measured as a bound on the re-resolved union, never as wall
+  clock or bytes written. `internal/indexer` was covered as six chunk processes and has no
+  whole-package single-process result. `-race` was run over the mandated selections, not whole
+  packages (except `internal/serverstack`, which is small enough to run whole). Per-commit
+  intermediate trees were **not** individually exported and rebuilt — only the final six-commit
+  tree is covered by the aggregate build and vet, so "each commit compiles on its own" is asserted
+  from ownership disjointness, not measured. The suite ran with both blocked items' production
+  changes in the tree, so it does **not** prove the six commits are green *without* them.
+- **Disk.** Recorded in the wave 4 exit report (`scratchpad/reports/W4-suite.md`): `df -h /` before
   and after the stage's cleanup, which deletes the per-run harness homes and compiled test binaries
   and trims Go build-cache entries untouched for more than a day. No shared cache was cleared.
