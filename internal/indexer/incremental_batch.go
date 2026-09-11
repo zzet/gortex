@@ -826,12 +826,17 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		}
 	}
 
-	restubIncomingRefsFromView(idx.graph, stages, view)
+	carried := restubIncomingRefsFromView(idx.graph, stages, view)
 	// Canonical FTS lifetime follows the backend's atomic owner decision.
 	// Retained contracts keep existing rows; actual orphans are deleted there.
 	idx.deleteSymbolFTS(oldFTSNodeIDs)
 	evictFilesBatched(idx.graph, paths)
-	idx.graph.AddBatch(nodes, edges)
+	// The carried in-edges ride the same AddBatch as the fresh payload: the
+	// eviction above deletes every edge incident to a doomed node, including
+	// the ones whose SOURCE survives, so an edge the restub frontier left
+	// alone has to be re-stated here or it is lost. See
+	// restubIncomingRefsFromView.
+	idx.graph.AddBatch(nodes, append(edges, carried...))
 
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
@@ -910,24 +915,178 @@ func (idx *Indexer) updateIncrementalSearch(stages []*incrementalBatchStage) {
 	}
 }
 
+// restubFrontier is the per-stage answer to "which of this file's prior
+// symbols can a referrer in ANOTHER file still be bound to without the
+// incoming pass re-deciding?". It is the incoming twin of the out-edge reuse
+// captureIncrementalStateFromView/applyResolvedOutEdgesFromView already
+// perform, and it is computed from the same primitives Path B's reverse
+// frontier uses (semanticShapeSet / semanticShapeDelta, keyed on
+// stableSymbolKey) so both paths agree on what a contract change is.
+type restubFrontier struct {
+	// conservative keeps the pre-gate behaviour for the whole stage: every
+	// referenceable prior symbol is restubbed. Mirrors
+	// builderSemanticSeedNodeIDs' fallback — anything the delta cannot be
+	// computed from falls back to the full fanout rather than dropping a
+	// restub that might be needed.
+	conservative bool
+	survivingIDs map[string]struct{}
+	changedNames map[string]struct{}
+}
+
+// requiresRestub reports whether node's surviving in-edges must be parked
+// under an unresolved stub for the incoming pass to re-decide them.
+//
+// Three triggers, each independently sufficient:
+//
+//   - conservative — the frontier could not be computed for this stage.
+//   - the node ID does not survive the reparse. The stable key is
+//     deliberately line-insensitive (affected_by.go), so a body edit ABOVE a
+//     `name@<line>` / `..._L<line>` definition keeps the key while rewriting
+//     the ID; the in-edge still points at the dead ID and must be re-bound.
+//   - some definition of the same NAME changed contract, appeared or
+//     disappeared. Keyed on the name, not the (kind, name) key, because a
+//     referrer parked under `unresolved::<name>` is offered every kind that
+//     answers for that name.
+func (f restubFrontier) requiresRestub(node *graph.Node) bool {
+	if f.conservative || node == nil {
+		return true
+	}
+	if _, survives := f.survivingIDs[node.ID]; !survives {
+		return true
+	}
+	_, changed := f.changedNames[node.Name]
+	return changed
+}
+
+// visibilityByStableKey composes the extractor-stamped visibility of every
+// referenceable definition, per stable key, in node order.
+//
+// The affected-by shape deliberately covers only what a CALL SITE sees
+// (signature, parameters, returns). Whether a referrer in another file may
+// bind here at all is a separate question, and `Meta["visibility"]` is the
+// extraction-time stamp that answers it (Java, Dart, PHP, … ). A
+// public→private edit changes no shape, so without this the frontier would
+// keep a binding a whole index would refuse.
+func visibilityByStableKey(nodes []*graph.Node) map[string]string {
+	out := make(map[string]string, len(nodes))
+	for _, node := range semanticShapeNodes(nodes) {
+		visibility, _ := node.Meta["visibility"].(string)
+		key := stableSymbolKey(node)
+		out[key] = out[key] + visibility + "\n"
+	}
+	return out
+}
+
+// restubFrontierForStage derives the frontier from state already in hand:
+// the pre-evict prior view (prior shapes) and the fresh extraction (current
+// shapes). It issues no graph read of its own.
+func restubFrontierForStage(
+	stage *incrementalBatchStage,
+	view incrementalPriorView,
+) restubFrontier {
+	if stage == nil || stage.result == nil {
+		return restubFrontier{conservative: true}
+	}
+	// reresolveAffectedByStages already built this snapshot for the same
+	// stage; reuse it when it is there and build the identical one from the
+	// prior view when the global passes are deferred.
+	snap := stage.abSnap
+	if snap == nil {
+		snap = snapshotAffectedByFromView(stage.priorNodes, view)
+	}
+	if snap == nil {
+		return restubFrontier{conservative: true}
+	}
+	fresh := semanticShapeSet(
+		stage.result.Nodes,
+		symbolShapeAdjacencyFromExtraction(stage.result.Nodes, stage.result.Edges),
+	)
+	priorVisibility := visibilityByStableKey(stage.priorNodes)
+	freshVisibility := visibilityByStableKey(stage.result.Nodes)
+
+	changedNames := make(map[string]struct{})
+	for _, key := range semanticShapeDelta(snap.symbols, fresh) {
+		changedNames[stableSymbolKeyName(key)] = struct{}{}
+	}
+	for key := range snap.symbols {
+		if priorVisibility[key] != freshVisibility[key] {
+			changedNames[stableSymbolKeyName(key)] = struct{}{}
+		}
+	}
+	// A definition ADDED under a name is not part of the affected-by delta —
+	// nothing can hold a stale reference to a symbol that did not exist — but
+	// it does change the candidate set an existing referrer of that name
+	// should be re-offered, so it is part of this frontier.
+	for key := range fresh {
+		if _, known := snap.symbols[key]; !known {
+			changedNames[stableSymbolKeyName(key)] = struct{}{}
+		}
+	}
+
+	survivingIDs := make(map[string]struct{}, len(stage.result.Nodes))
+	for _, node := range stage.result.Nodes {
+		if node != nil && node.ID != "" {
+			survivingIDs[node.ID] = struct{}{}
+		}
+	}
+	return restubFrontier{survivingIDs: survivingIDs, changedNames: changedNames}
+}
+
+// restubIncomingRefsFromView parks the surviving in-edges of the reparsed
+// files under `unresolved::<name>` so the incoming pass re-binds them, and
+// returns the in-edges it deliberately did NOT park.
+//
+// The restub carries two jobs at once, and only the second one is gateable:
+//
+//  1. It rescues the edge from the eviction that follows. Both backends
+//     delete every edge incident to a doomed node — the in-memory graph in
+//     evictEdgesLocked's phase 2, SQLite in the `to_id IN (doomed)` DELETE —
+//     including edges whose source file is untouched. Parking the edge under
+//     a stub moves it off the doomed target first, which is why it survives.
+//  2. It forces the incoming pass to re-decide the binding.
+//
+// For a symbol whose ID survives and whose contract did not change, (2) is
+// pure write amplification: the edge is rewritten to the stub (one durable
+// ReindexEdges row), walked by the incoming pass, and rewritten back to the
+// same target (a second durable row), with StashRestubProvenance /
+// RestoreRestubProvenance round-tripping the tier it never lost. This is the
+// cost the n-th body-only edit of a widely-referenced file pays on every save.
+//
+// So the gate cannot simply skip the write: an unrestubbed edge is DELETED,
+// not left alone. Those edges are returned instead, and
+// commitStructuralIncrementalBatch re-states them in the same AddBatch as the
+// fresh payload — one bulk insert, with the exact target, origin, tier,
+// confidence and Meta the edge already had, and no incoming-pass work.
 func restubIncomingRefsFromView(
 	g graph.Store,
 	stages []*incrementalBatchStage,
 	view incrementalPriorView,
-) {
+) []*graph.Edge {
 	evicted := structuralPriorIDs(stages)
 	var reindexes []graph.EdgeReindex
+	var carried []*graph.Edge
+	carriedSeen := make(map[*graph.Edge]struct{})
 	for _, stage := range stages {
+		frontier := restubFrontierForStage(stage, view)
 		for _, node := range stage.priorNodes {
 			if node == nil || node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
 				continue
 			}
+			restub := frontier.requiresRestub(node)
 			stub := graph.UnresolvedMarker + node.Name
 			for _, edge := range view.inByNode[node.ID] {
 				if edge == nil || !graph.IsResolvableRefEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
 					continue
 				}
 				if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
+					continue
+				}
+				if !restub {
+					if _, duplicate := carriedSeen[edge]; duplicate {
+						continue
+					}
+					carriedSeen[edge] = struct{}{}
+					carried = append(carried, edge)
 					continue
 				}
 				oldTo := edge.To
@@ -940,6 +1099,7 @@ func restubIncomingRefsFromView(
 	if len(reindexes) > 0 {
 		g.ReindexEdges(reindexes)
 	}
+	return carried
 }
 
 func evictFilesBatched(g graph.Store, paths []string) (int, int) {
@@ -1608,6 +1768,10 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 			plan.ContractBridgeNodeIDs,
 			contractBridgeNodeIDsFromPriorView(stages, view)...,
 		)
+		// Deletion stages carry no fresh extraction, so the restub frontier
+		// is conservative for all of them and every surviving in-edge is
+		// parked — the pre-gate behaviour, which is also the only correct one
+		// here: nothing comes back to bind to.
 		restubIncomingRefsFromView(idx.graph, stages, view)
 		idx.deleteEnrichmentByNodeIDs(nodeIDs)
 		// Canonical FTS lifetime is decided with its owners in the backend.

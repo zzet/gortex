@@ -85,6 +85,18 @@ func stableSymbolKey(n *graph.Node) string {
 	return string(n.Kind) + "\x00" + n.Name
 }
 
+// stableSymbolKeyName recovers the NAME half of a stable key. Callers that
+// reason about what a referrer in another file can bind to need the name
+// rather than the (kind, name) pair: a referrer parked under
+// `unresolved::<name>` is offered every kind that answers for that name, so a
+// contract change on ANY kind of that name is a change for all of them.
+func stableSymbolKeyName(key string) string {
+	if i := strings.IndexByte(key, 0); i >= 0 {
+		return key[i+1:]
+	}
+	return key
+}
+
 // symbolShapeAdjacency is the file-bounded graph slice needed to derive every
 // symbol shape in one changed file. Both adjacency directions and any parameter
 // endpoints are prefetched once and then reused for all definitions.
