@@ -956,6 +956,30 @@ func builderMaskKey(id string) string {
 	return id
 }
 
+// sourceConfigNarrowingReason is what CapSourceConfig says about the
+// build-configuration inputs that do not come from the state the pass
+// describes. Every such input is named here rather than left as a coverage
+// the generation never had.
+//
+// Both are ADMISSION rules, and both are inert under a content source — what
+// they leave behind is an absence, never a wrong fact. The hierarchical ignore
+// matcher reads per-directory ignore files off disk, and a source serves a
+// revision whose ignore files may differ from the checkout's — or not be on
+// disk at all. The untracked-asset gate asks `git ls-files` of the checkout,
+// which describes a different tree.
+//
+// The compile database, the include-root heuristic, the npm / workspace
+// manifests and the tsconfig / jsconfig path-alias scopes are read through the
+// installed content source and are deliberately absent from this list. They
+// belong on a different axis anyway: each of them decides where an import or
+// an include BINDS, so a reader off the wrong tree lands a present, wrong edge
+// — a resolution defect, not a configuration absence — and naming that risk
+// here, under a capability whose payload is admission, would have pointed a
+// consumer at the wrong claim. There is no residual reader, so there is
+// nothing to declare on resolution either.
+const sourceConfigNarrowingReason = "per-directory ignore files and the untracked-asset gate " +
+	"are not applied under a content source"
+
 // declareProducers records how complete each capability is for this
 // generation. A capability nothing is said about is inherited from the layer
 // below, so silence is a claim too — every capability this build narrows is
@@ -965,16 +989,6 @@ func (b *SparseGenerationBuilder) declareProducers(
 	handle *store_sqlite.Store,
 	report *BuildReport,
 ) error {
-	// Two admission rules read the working tree rather than the state the pass
-	// describes, so both are inert under a content source and both are named
-	// here rather than left as a coverage the generation never had. The
-	// hierarchical ignore matcher reads per-directory ignore files off disk,
-	// and a source serves a revision whose ignore files may differ from the
-	// checkout's — or not be on disk at all. The untracked-asset gate asks
-	// `git ls-files` of the checkout, which describes a different tree.
-	const configReason = "per-directory ignore files and the untracked-asset gate " +
-		"are not applied under a content source"
-
 	vector := store_sqlite.ProducerCompleteness{
 		Producer: string(graphview.CapSearchVector),
 		State:    store_sqlite.ProducerStateDisabledByConfig,
@@ -1016,7 +1030,7 @@ func (b *SparseGenerationBuilder) declareProducers(
 
 	rows := []store_sqlite.ProducerCompleteness{
 		{Producer: string(graphview.CapSourceSnapshot), State: store_sqlite.ProducerStateComplete},
-		{Producer: string(graphview.CapSourceConfig), State: store_sqlite.ProducerStateComplete, Reason: configReason},
+		{Producer: string(graphview.CapSourceConfig), State: store_sqlite.ProducerStateComplete, Reason: sourceConfigNarrowingReason},
 		{Producer: string(graphview.CapSyntaxGraph), State: store_sqlite.ProducerStateComplete},
 		{Producer: string(graphview.CapResolutionLocal), State: store_sqlite.ProducerStateComplete},
 		{Producer: string(graphview.CapIncomingEdges), State: store_sqlite.ProducerStateComplete},

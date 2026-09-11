@@ -35,6 +35,7 @@ import (
 	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/crashpool"
+	"github.com/zzet/gortex/internal/parser/tsalias"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
@@ -374,6 +375,19 @@ type Indexer struct {
 	npmAliasOnce sync.Once
 	npmAlias     *npmAliasIndex
 
+	// tsAliasMu guards this Indexer's own tsconfig / jsconfig alias scopes.
+	// They are memoised HERE, not in the process-wide tsAliasCache, whenever a
+	// content source is installed: that cache is keyed by repo root, and a
+	// root cannot tell two snapshots of one checkout apart, so a committed
+	// build sharing it would resolve its path aliases through the live
+	// checkout's tsconfig. tsAliasRef is the source ref the scopes were loaded
+	// from, so swapping the installed source reloads them; tsAliasLoaded
+	// distinguishes "scanned, no usable config" from "not yet scanned".
+	tsAliasMu     sync.Mutex
+	tsAliasRef    *contentSourceRef
+	tsAliasColl   *tsalias.Collection
+	tsAliasLoaded bool
+
 	// workspaceMembersOnce builds workspaceMembers lazily on the first
 	// resolve-time package-manager-workspace lookup. Lazy for the same
 	// reason as npmAliasOnce — the repo root and prefix are final only
@@ -592,6 +606,89 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 	return idx
 }
 
+// manifestTree returns the tree this Indexer's build-configuration readers —
+// the compile database and the npm/workspace manifests — must consult.
+//
+// With a content source installed that is the source's manifest view: the
+// same snapshot the payload is parsed out of, and never the working copy,
+// even for a path the source cannot answer for. A build that indexes a
+// committed tree would otherwise reconstruct C/C++ include paths and npm
+// aliases from whatever the checkout holds right now, which is the one
+// remaining way for dirty bytes to reach a committed generation. With no
+// source installed the reads go to the checkout, which is exactly the tree
+// the live index describes.
+//
+// The answer is recomputed per call rather than captured, so it follows the
+// installed source the way every other content read does.
+func (idx *Indexer) manifestTree() manifestTree {
+	tree, _ := idx.manifestTreeWithRef()
+	return tree
+}
+
+// manifestTreeWithRef returns the manifest tree together with the content
+// source ref it was derived from (nil for the working copy). A caller that
+// MEMOISES an answer keys it on that ref: the root two snapshots of one
+// checkout share is not an identity, and a swapped source must invalidate.
+func (idx *Indexer) manifestTreeWithRef() (manifestTree, *contentSourceRef) {
+	if ref := idx.contentSrc.Load(); ref != nil {
+		src := ref.manifests
+		if src == nil {
+			src = ref.src
+		}
+		return sourceManifestTree{rootPath: idx.rootPath, src: src}, ref
+	}
+	return newDiskManifestTree(idx.rootPath), nil
+}
+
+// tsAliasCollection returns the tsconfig / jsconfig alias scopes this
+// Indexer's path-alias resolution reads.
+//
+// With no source installed that is the process-wide, root-keyed cache the live
+// index has always used. With a source installed the scopes are loaded out of
+// THAT SNAPSHOT and memoised on this Indexer, keyed on the installed ref: the
+// scan costs one walk of the source, the shared cache cannot tell two
+// snapshots of one root apart, and an alias scope read from the wrong tree
+// produces a wrong import edge rather than a missing one.
+func (idx *Indexer) tsAliasCollection() *tsalias.Collection {
+	tree, ref := idx.manifestTreeWithRef()
+	if ref == nil {
+		return tsAliasCollectionForTree(tree)
+	}
+	idx.tsAliasMu.Lock()
+	defer idx.tsAliasMu.Unlock()
+	if idx.tsAliasLoaded && idx.tsAliasRef == ref {
+		return idx.tsAliasColl
+	}
+	idx.tsAliasColl = tsAliasCollectionForTree(tree)
+	idx.tsAliasRef = ref
+	idx.tsAliasLoaded = true
+	return idx.tsAliasColl
+}
+
+// graphHasCFamilyFiles reports whether this pass's graph carries any C, C++ or
+// Objective-C file. It is the same question the resolver's relative-import
+// pass asks before it walks anything, answered here off the file/language
+// projection so an include-path reconstruction nothing will read is never
+// started.
+func (idx *Indexer) graphHasCFamilyFiles() bool {
+	for file := range graph.FileLanguageNodesSeq(idx.graph) {
+		switch file.Language {
+		case "c", "cpp", "objc":
+			return true
+		}
+	}
+	return false
+}
+
+// newIndexerNpmAliasIndex builds this Indexer's npm-alias index with its
+// manifest reads bound to the tree the Indexer is currently indexing.
+func (idx *Indexer) newIndexerNpmAliasIndex() *npmAliasIndex {
+	return newNpmAliasIndexWithTrees(
+		map[string]string{idx.repoPrefix: idx.rootPath},
+		func(string) manifestTree { return idx.manifestTree() },
+	)
+}
+
 // resolveNpmAliasImport is the resolver.NpmAliasResolver installed on
 // this Indexer's resolver. It rewrites a JS/TS import specifier that
 // matches an npm-alias dependency key in the importing file's
@@ -599,7 +696,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 // alias applies. The backing npmAliasIndex is built once, lazily.
 func (idx *Indexer) resolveNpmAliasImport(callerFile, specifier string) string {
 	idx.npmAliasOnce.Do(func() {
-		idx.npmAlias = newNpmAliasIndex(map[string]string{idx.repoPrefix: idx.rootPath})
+		idx.npmAlias = idx.newIndexerNpmAliasIndex()
 	})
 	return idx.npmAlias.Resolve(callerFile, specifier)
 }
@@ -611,7 +708,7 @@ func (idx *Indexer) resolveNpmAliasImport(callerFile, specifier string) string {
 // backing npmAliasIndex is the one resolveNpmAliasImport builds.
 func (idx *Indexer) declaresExternalNpmDep(callerFile, specifier string) bool {
 	idx.npmAliasOnce.Do(func() {
-		idx.npmAlias = newNpmAliasIndex(map[string]string{idx.repoPrefix: idx.rootPath})
+		idx.npmAlias = idx.newIndexerNpmAliasIndex()
 	})
 	return idx.npmAlias.DeclaresExternalDependency(callerFile, specifier)
 }
@@ -1392,11 +1489,35 @@ func (idx *Indexer) storeRootPath(absRoot string) {
 // before the suffix-unique fallback. forceReload drops the cache first, so an
 // incremental reindex picks up an edited compile_commands.json without a
 // daemon restart. Keys/dirs are prefixed in multi-repo mode to match file IDs.
+// installCppIncludeSearchPath hands a reconstructed include search path to the
+// resolver. It is a small indirection — the same shape as readDiskFile — for
+// one reason: the resolver exposes no reader for what it was given, so this is
+// the only place a test can observe the search path a REAL build computed out
+// of its own tree, rather than re-deriving it from a fixture.
+var installCppIncludeSearchPath = func(idx *Indexer, perFile map[string][]string, fallback []string) {
+	idx.resolver.SetCppIncludeDirs(perFile)
+	idx.resolver.SetCppFallbackIncludeDirs(fallback)
+}
+
 func (idx *Indexer) populateCppIncludeDirs(forceReload bool) {
 	if idx.resolver == nil || idx.rootPath == "" {
 		return
 	}
-	if forceReload {
+	tree := idx.manifestTree()
+	if tree.sourced() && !idx.graphHasCFamilyFiles() {
+		// Only C-family include resolution consumes these dirs, and the
+		// resolver's own pass is gated on the same question
+		// (resolveRelativeImports returns immediately for a graph with no
+		// c / cpp / objc). On the working copy the probe is a handful of
+		// stats; through a source it is a snapshot enumeration, so a tree
+		// with no C-family file must not pay for an answer nothing reads.
+		installCppIncludeSearchPath(idx, nil, nil)
+		return
+	}
+	if forceReload && !tree.sourced() {
+		// The cache holds working-copy answers keyed by root. A source-backed
+		// load neither reads nor writes it, so dropping the checkout's entry
+		// on its behalf would only cost the live index a re-read.
 		clearCppIncludeDirCache(idx.rootPath)
 	}
 	prefix := ""
@@ -1413,20 +1534,18 @@ func (idx *Indexer) populateCppIncludeDirs(forceReload bool) {
 		}
 		return pd
 	}
-	tus := loadCompileCommands(idx.rootPath)
+	tus := loadCompileCommands(tree)
 	if len(tus) == 0 {
 		// No compile DB: fall back to the conventional include-root heuristic
 		// so the ordered probe still runs for repos without a compile DB.
-		idx.resolver.SetCppIncludeDirs(nil)
-		idx.resolver.SetCppFallbackIncludeDirs(prefixDirs(heuristicIncludeDirs(idx.rootPath)))
+		installCppIncludeSearchPath(idx, nil, prefixDirs(heuristicIncludeDirs(tree)))
 		return
 	}
 	perFile := make(map[string][]string, len(tus))
 	for f, tu := range tus {
 		perFile[prefix+f] = prefixDirs(tu.includeDirs)
 	}
-	idx.resolver.SetCppIncludeDirs(perFile)
-	idx.resolver.SetCppFallbackIncludeDirs(nil)
+	installCppIncludeSearchPath(idx, perFile, nil)
 }
 
 // ResolveFilePath maps a graph file path (repo-relative in single-repo mode)
