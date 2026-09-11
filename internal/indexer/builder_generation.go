@@ -1009,19 +1009,10 @@ func (b *SparseGenerationBuilder) declareProducers(
 	}
 
 	// Literal and regex search is answered over a working copy on disk rather
-	// than out of the generation: the checkout's coordinator builds a trigram
-	// index over its checkout root and searches that. A generation describing
-	// a checkout therefore serves the capability whole, and one describing a
-	// committed tree nobody has checked out cannot serve it at all — there is
-	// no root to index, and the canonical checkout holds a different tree.
-	text := store_sqlite.ProducerCompleteness{
-		Producer: string(graphview.CapSearchText),
-		State:    store_sqlite.ProducerStateComplete,
-	}
-	if !servesTextSearch(req.Identity) {
-		text.State = store_sqlite.ProducerStateUnavailable
-		text.Reason = "a committed tree has no working copy to run a text search over"
-	}
+	// than out of the generation, so what a generation may say about it — and
+	// whether it may say anything — is decided by textSearchProducer rather
+	// than by the build reaching publish.
+	text, declaresText := textSearchProducer(req.Identity)
 
 	rows := []store_sqlite.ProducerCompleteness{
 		{Producer: string(graphview.CapSourceSnapshot), State: store_sqlite.ProducerStateComplete},
@@ -1033,12 +1024,14 @@ func (b *SparseGenerationBuilder) declareProducers(
 		{Producer: string(graphview.CapSearchContent), State: store_sqlite.ProducerStateComplete},
 		vector,
 		similarity,
-		text,
 		{
 			Producer: string(graphview.CapResolutionCrossRepo),
 			State:    store_sqlite.ProducerStateIncomplete,
 			Reason:   "a sparse generation is resolved within one repository",
 		},
+	}
+	if declaresText {
+		rows = append(rows, text)
 	}
 	lsp := lspProducerRow(req.Identity, report.Enrichment)
 	for _, capability := range []graphview.CapabilityID{
@@ -1184,12 +1177,77 @@ func enrichesWorkingCopy(identity GenerationIdentity) bool {
 	return identity.OwnerKind != refViewOwnerKind
 }
 
-// servesTextSearch reports whether a generation describes a state some working
-// copy holds on disk. A checkout's layers describe a checkout, whose
-// coordinator indexes its root; a ref view describes a committed tree nobody
-// has checked out, and nothing on disk holds it.
+// noWorkingCopyTextSearchReason is why a ref view cannot serve text search at
+// all: no checkout holds its tree, so there is no root to index.
+const noWorkingCopyTextSearchReason = "a committed tree has no working copy to run a text search over"
+
+// servesTextSearch reports whether a generation's own bytes are the working
+// copy a text search reads.
+//
+// Only a working-tree layer's are. The searcher an answer comes from is built
+// over a checkout root (checkout_text_search.go, trigram.Build(c.root, paths)),
+// so it describes the bytes on disk and nothing else, and a dirty layer IS
+// those bytes by construction — its lower-view fingerprint is sampled from the
+// same working copy. Every other identity names a committed tree: a commit
+// layer names the checkout's HEAD tree, a dedicated base the tree the graph's
+// corpus was built at, a ref view a tree nobody has checked out at all.
 func servesTextSearch(identity GenerationIdentity) bool {
-	return identity.OwnerKind != refViewOwnerKind
+	if identity.OwnerKind == refViewOwnerKind {
+		return false
+	}
+	return identity.GenerationKind == DirtyLayerGenerationKind
+}
+
+// textSearchProducer is what a generation declares about literal and regex
+// search, and whether it declares anything at all.
+//
+// Three answers, and the third one is silence:
+//
+//   - A working-tree layer IS the working copy the searcher reads, so it claims
+//     the capability whole.
+//   - A ref view names a tree no checkout holds. Nothing on disk can answer for
+//     it, so it withdraws the capability outright — that withdrawal is what
+//     makes a committed-tree view refuse a text search instead of answering out
+//     of somebody else's working copy.
+//   - Every other identity — a checkout's commit layer, a dedicated base, a
+//     kind this build does not recognise — declares NOTHING. It neither serves
+//     the capability nor withdraws it, because the capability is a property of
+//     the CHECKOUT rather than of any one layer in its stack: the searcher is
+//     addressed by checkout id, over a corpus composed from every routed layer
+//     (checkout_text_search.go textCorpus), and the layer that describes the
+//     working copy sits above these.
+//
+// The silence is deliberate and it is load-bearing, not a shortcut. A view's
+// completeness is the WORST state any generation in its stack declares
+// (graphview/materialize.go, Materializer.completeness), and a checkout view is
+// composed of the commit layer, the working-tree layer and the whole ancestry
+// beneath them (MaterializeCheckout -> assemble). A commit layer or dedicated
+// base that narrowed the capability would therefore narrow every live routed
+// view stacked on top of it, and refuse a search the checkout can answer
+// exactly — a false negative in place of a false positive. Declaring nothing
+// says the honest thing instead: this layer is not the one that answers.
+//
+// What silence cannot say is that a view assembled WITHOUT a working-tree layer
+// is reading a committed tree while the root holds edits it does not describe.
+// That is not a property of any generation — the same commit layer is served
+// both ways — so it is enforced where the route can be read, at
+// GrepCheckout (checkout_text_search.go).
+func textSearchProducer(identity GenerationIdentity) (store_sqlite.ProducerCompleteness, bool) {
+	switch {
+	case identity.OwnerKind == refViewOwnerKind:
+		return store_sqlite.ProducerCompleteness{
+			Producer: string(graphview.CapSearchText),
+			State:    store_sqlite.ProducerStateUnavailable,
+			Reason:   noWorkingCopyTextSearchReason,
+		}, true
+	case servesTextSearch(identity):
+		return store_sqlite.ProducerCompleteness{
+			Producer: string(graphview.CapSearchText),
+			State:    store_sqlite.ProducerStateComplete,
+		}, true
+	default:
+		return store_sqlite.ProducerCompleteness{}, false
+	}
 }
 
 // builderGraphPath prefixes a repo-relative slash path into the graph
