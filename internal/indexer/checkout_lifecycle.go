@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -212,6 +213,27 @@ type CheckoutLifecycle struct {
 	// loops are running one that runs none. Entries are dropped lazily, on the
 	// next read or start for the same checkout.
 	started map[string][]*CheckoutCoordinator
+	// coordinatorStartFailures is why a checkout has no build loop, keyed by
+	// checkout and bounded by the number of checkouts the daemon knows. A
+	// coordinator that cannot be built is not an error any caller receives —
+	// every entry point that starts one is a background reconciliation — so
+	// without this the checkout simply has no view and nothing says why.
+	// Cleared when a coordinator for the same checkout is finally installed.
+	coordinatorStartMu       sync.Mutex
+	coordinatorStartFailures map[string]CoordinatorStartFailure
+	// configSnapshot freezes a coordinator's index configuration. nil takes
+	// snapshotDedicatedBaseConfig, which is what production runs; the seam
+	// exists because no config.IndexConfig value json.Marshal rejects, so the
+	// refusal path has no other way to be exercised.
+	configSnapshot func(config.IndexConfig, string, string, string) (config.IndexConfig, string, error)
+	// cohortGraphSubject reads the dedicated-graph row a teardown names its
+	// cohort subject from. nil takes the catalog, which is what production
+	// runs; the seam exists for the same reason configSnapshot's does — the
+	// read is a single primary-key lookup that a real store does not fail, so
+	// the "the catalog could not be asked" branch has no other way to be
+	// exercised, and that branch is the one that decides whether a teardown's
+	// invalidation happens at all.
+	cohortGraphSubject func(context.Context, string) (store_sqlite.DedicatedGraph, bool, error)
 	// owed holds generations no coordinator is left to retire: the backlog a
 	// dropped one handed over, the commit layers its reuse cache was holding,
 	// and the two slots of a checkout whose route is being withdrawn. The
@@ -828,6 +850,13 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 		if err := l.RegisterRepositoryOwner(ctx, existing.GraphID); err != nil {
 			return "", true, err
 		}
+		// Inside the closure, so every path that reuses an existing binding
+		// carries it: the ordinary one below, and the two the UpsertDedicatedGraph
+		// error and retry arms take. A registration here is not always a no-op —
+		// a process that restarted over an existing catalog binding registers the
+		// owner for the FIRST time on this path, which is the transition that
+		// turns a member every description refused into a describable one.
+		l.invalidateDependencyCohortsForPrefix(prefix, "repository owner registered")
 		return existing.GraphID, true, nil
 	}
 	if graphID, found, err := reuseOwner(); found || err != nil {
@@ -868,6 +897,11 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 	if err := l.RegisterRepositoryOwner(ctx, graphID); err != nil {
 		return "", err
 	}
+	// The registration is the moment the cohort changes: a repository that was
+	// tracked but had no registered owner refused every description that named
+	// it, and one that did not exist at all was not an input. Both leave every
+	// in-scope consumer holding an answer that is no longer the current one.
+	l.invalidateDependencyCohortsForPrefix(prefix, "dedicated graph bound and its owner registered")
 	return graphID, nil
 }
 
@@ -1184,6 +1218,13 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 	defer l.beginBatch()()
 
 	out := ReloadResult{Refreshed: l.mi.RefreshRepoConfigs()}
+	if out.Refreshed > 0 {
+		// A refreshed repository configuration moves the config sections the
+		// cohort digests (artifacts, semantic/LSP, workspace/project,
+		// source-selection), and which repository's sections moved is not
+		// reported here — so every live consumer re-describes once.
+		l.invalidateAllDependencyCohorts("repository configuration reloaded")
+	}
 
 	// Match configured entries to tracked instances by ROOT PATH. A worktree
 	// tracked as an independent instance registers under a derived prefix, so
@@ -1287,6 +1328,13 @@ type SweepReport struct {
 	// collected. They are counted apart from Retired because nothing else
 	// would ever offer them: a ref view belongs to no checkout.
 	RefViewsRetired int
+	// CoordinatorStartFailures states why the checkouts that have no build
+	// loop have none. The pass itself is what tried to start them
+	// (applyCoordinators below), so the reasons it carries are this pass's,
+	// and a checkout that recovered a loop has dropped out of them. Empty is
+	// the ordinary answer: every checkout that was asked for a coordinator
+	// either got one or is still waiting on its primary.
+	CoordinatorStartFailures []CoordinatorStartFailure
 }
 
 // Sweep resumes unfinished cleanups and reconciles every known family.
@@ -1329,6 +1377,9 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 		l.applyCoordinators(ctx, report)
 	}
 	out.Coordinators = l.liveCoordinators("")
+	// Read after applyCoordinators, so the reasons are the ones this pass
+	// either recorded or retracted rather than the ones it inherited.
+	out.CoordinatorStartFailures = l.CoordinatorStartFailures()
 	out.Retired = l.sweepRetirements(ctx)
 	out.RefViewsRetired = l.sweepRefViewRetention(ctx)
 	recordSweepGauges(out)
@@ -1861,15 +1912,89 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 		l.logger.Warn("checkout lifecycle: could not start a checkout coordinator",
 			zap.String("checkout", checkout.CheckoutID),
 			zap.String("root", checkout.RootPath), zap.Error(err))
+		// Nobody receives this error: every entry point that reaches here is a
+		// background reconciliation. Recorded so the checkout has a stated
+		// reason for having no view instead of silently having none.
+		l.recordCoordinatorStartFailure(checkout, err)
 		return
 	}
 	if coordinator == nil {
+		// Not a failure: the primary is bound but has not finished indexing,
+		// and the next sweep tries again.
 		return
 	}
 	if !l.installCoordinatorAtHead(checkout, coordinator) {
 		return
 	}
+	l.clearCoordinatorStartFailure(checkout.CheckoutID)
 	coordinator.Signal("checkout registered")
+}
+
+// CoordinatorStartFailure is why one checkout has no build loop.
+//
+// It is a health reason, not an error return: the paths that start a
+// coordinator are background reconciliations with no caller to fail, so a
+// checkout whose coordinator cannot be built would otherwise just have no view
+// and no explanation.
+type CoordinatorStartFailure struct {
+	// CheckoutID and RootPath name the working copy that has no view.
+	CheckoutID string `json:"checkout_id"`
+	RootPath   string `json:"root_path,omitempty"`
+	// Reason is what stopped it, as the failing step stated it.
+	Reason string `json:"reason"`
+	// At is when the attempt failed, on the lifecycle's clock.
+	At int64 `json:"at"`
+}
+
+// CoordinatorStartFailures reports the checkouts whose build loop could not be
+// started, most recent first. An empty result means every checkout that was
+// asked for a coordinator either got one or is still waiting on its primary.
+func (l *CheckoutLifecycle) CoordinatorStartFailures() []CoordinatorStartFailure {
+	if l == nil {
+		return nil
+	}
+	l.coordinatorStartMu.Lock()
+	defer l.coordinatorStartMu.Unlock()
+	out := make([]CoordinatorStartFailure, 0, len(l.coordinatorStartFailures))
+	for _, failure := range l.coordinatorStartFailures {
+		out = append(out, failure)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].At != out[j].At {
+			return out[i].At > out[j].At
+		}
+		return out[i].CheckoutID < out[j].CheckoutID
+	})
+	return out
+}
+
+// recordCoordinatorStartFailure states why one checkout has no build loop.
+func (l *CheckoutLifecycle) recordCoordinatorStartFailure(checkout store_sqlite.Checkout, err error) {
+	if l == nil || err == nil || checkout.CheckoutID == "" {
+		return
+	}
+	l.coordinatorStartMu.Lock()
+	defer l.coordinatorStartMu.Unlock()
+	if l.coordinatorStartFailures == nil {
+		l.coordinatorStartFailures = map[string]CoordinatorStartFailure{}
+	}
+	l.coordinatorStartFailures[checkout.CheckoutID] = CoordinatorStartFailure{
+		CheckoutID: checkout.CheckoutID,
+		RootPath:   checkout.RootPath,
+		Reason:     err.Error(),
+		At:         l.now().Unix(),
+	}
+}
+
+// clearCoordinatorStartFailure retracts a stated reason once the checkout has a
+// build loop again.
+func (l *CheckoutLifecycle) clearCoordinatorStartFailure(checkoutID string) {
+	if l == nil || checkoutID == "" {
+		return
+	}
+	l.coordinatorStartMu.Lock()
+	defer l.coordinatorStartMu.Unlock()
+	delete(l.coordinatorStartFailures, checkoutID)
 }
 
 // buildCoordinator constructs one checkout's coordinator against a graph,
@@ -1921,19 +2046,22 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	// synthesizer slice, so what goes into the builder and the coordinator is
 	// this coordinator's for its whole lifetime. Its fingerprint is the same
 	// value the coordinator derives for the identity's config hash.
-	frozen, _, err := snapshotDedicatedBaseConfig(
-		index, primary.RepoPrefix, idx.WorkspaceID(), idx.ProjectID())
-	if err != nil {
-		// The coordinator carries the unencodable-configuration fail-safe of
-		// its own (a unique digest, so nothing is reused); an unfrozen config
-		// would silently share the ConfigManager's values, which is the one
-		// outcome this call exists to prevent.
-		l.logger.Warn("checkout lifecycle: could not freeze the index configuration for a coordinator",
-			zap.String("checkout", checkout.CheckoutID),
-			zap.String("repo", primary.RepoPrefix), zap.Error(err))
-	} else {
-		index = frozen
+	snapshot := l.configSnapshot
+	if snapshot == nil {
+		snapshot = snapshotDedicatedBaseConfig
 	}
+	frozen, _, err := snapshot(index, primary.RepoPrefix, idx.WorkspaceID(), idx.ProjectID())
+	if err != nil {
+		// Refused, not degraded. NewCheckoutCoordinator freezes the same value
+		// and returns an error when it cannot, so continuing here would build a
+		// coordinator config the constructor is about to reject anyway — and
+		// the only way it could NOT reject it is if the two disagreed, which
+		// would mean a builder holding the ConfigManager's own nested values.
+		// That is the one outcome this call exists to prevent.
+		return nil, fmt.Errorf(
+			"indexer: freeze the index configuration for checkout %s: %w", checkout.CheckoutID, err)
+	}
+	index = frozen
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
 		CheckoutID:   checkout.CheckoutID,
 		CheckoutRoot: checkout.RootPath,
@@ -2061,6 +2189,157 @@ func configSectionDigest(value any) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// --- dependency-cohort invalidation -------------------------------------
+//
+// A checkout coordinator and a ref-view manager both CACHE the description of
+// the resolver-visible input cohort their generations are keyed on. Describing
+// one costs a daemon-wide roster read lease and a catalog read per in-scope
+// member, which is why neither re-describes on a poll — but a cached
+// certificate that nothing ever refreshes is a freshness claim that stops being
+// true, and a cached REFUSAL is a degraded identity that never recovers.
+//
+// The lifecycle is the event source for everything a cohort consumer cannot
+// observe for itself, because the lifecycle is what performs those events:
+//
+//   - a repository owner registered (bindDedicatedGraph) — the cohort gains an
+//     in-scope member, and a dedicated graph becomes readable at the same
+//     moment, which is the transition that turns "tracked but not yet indexed"
+//     (a refusal) into a describable member.
+//   - a repository's registry entry torn down — the cohort loses a member, and
+//     a description taken while the admission was closing was a refusal. Two
+//     paths reach it: cleanupHooks.ReleaseGraph, which is how the forget saga
+//     tears down a repository that HAS a dedicated graph, and evictRepoChecked,
+//     which is how a checkout with no graph binding and the transition worker
+//     drop one. Both mark on the disappearance, not on the attempt — except
+//     when the catalog cannot say WHICH repository a released graph held, in
+//     which case the consumers that moved cannot be named and ReleaseGraph
+//     marks every one of them instead of nothing.
+//   - the repository configuration reloaded (ApplyReload) — the config sections
+//     the cohort digests moved. A ref-view manager also RE-READS those sections
+//     per description (RefViewManagerConfig.ConfigSectionsFor), so the mark is
+//     what makes it derive the reloaded configuration's digest rather than
+//     re-deriving the one it already had.
+//
+// The one source that is NOT here is a workspace sibling's HEAD or committed
+// tree moving with no lifecycle event at all. That observation belongs to the
+// git watcher, which owns the ref-transition signal, and it is not wired yet;
+// until it is, a certified revision can name a sibling tree OID that has since
+// moved. Two things bound that window: a membership change is self-observed
+// (the coordinator's poll and the ref-view memo both re-check the cheap
+// workspace topology token), and every BUILD path in a coordinator describes
+// the cohort afresh, so no checkout layer is ever stamped with a token-aged
+// revision.
+//
+// Nothing here reads anything: invalidation only marks, and the next
+// opportunity that is allowed to describe does the work. A source may
+// therefore call it as often as it likes.
+
+// invalidateDependencyCohorts marks the cohort of every live consumer whose
+// inputs could include one repository.
+//
+// The affected set is exactly what a cohort's scope admits: a consumer whose
+// own repository is the one that moved, plus — when the repository declares a
+// workspace — every consumer scoped to that workspace, since a workspace-scoped
+// cohort names each of its members' bytes. A consumer in an unrelated workspace
+// is deliberately left alone: re-describing it would pay a roster lease and a
+// catalog read per member for an answer that cannot have moved, which is the
+// daemon-wide amplification the scoped cohort exists to remove.
+func (l *CheckoutLifecycle) invalidateDependencyCohorts(repoPrefix, workspaceID, reason string) {
+	if l == nil || (repoPrefix == "" && workspaceID == "") {
+		return
+	}
+	affected := func(prefix, workspace string) bool {
+		if repoPrefix != "" && prefix == repoPrefix {
+			return true
+		}
+		return workspaceID != "" && workspace == workspaceID
+	}
+
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for _, coordinator := range l.coordinators {
+		// repoPrefix and workspaceID are set once by the constructor and never
+		// move, so reading them outside the coordinator's own locks is safe.
+		if coordinator != nil && affected(coordinator.repoPrefix, coordinator.workspaceID) {
+			coordinators = append(coordinators, coordinator)
+		}
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		coordinator.InvalidateDependencyCohort(reason)
+	}
+
+	// A ref-view manager is cached per repository but handed its target per
+	// request, so which of its memo entries moved is decided inside it.
+	l.refViewMu.Lock()
+	managers := make([]*RefViewManager, 0, len(l.refViews))
+	for prefix, manager := range l.refViews {
+		if manager != nil && (workspaceID != "" || prefix == repoPrefix) {
+			managers = append(managers, manager)
+		}
+	}
+	l.refViewMu.Unlock()
+	for _, manager := range managers {
+		manager.InvalidateDependencyCohortFor(repoPrefix, workspaceID, reason)
+	}
+}
+
+// invalidateDependencyCohortsForPrefix is invalidateDependencyCohorts for a
+// repository whose workspace the caller has not already read.
+//
+// The workspace is resolved from the live registry, so a caller that has
+// already REMOVED the repository must read it first and call the two-argument
+// form: a prefix the registry no longer serves resolves to no workspace, and
+// the siblings that lost a member would then never hear about it.
+func (l *CheckoutLifecycle) invalidateDependencyCohortsForPrefix(repoPrefix, reason string) {
+	l.invalidateDependencyCohorts(repoPrefix, l.workspaceForPrefix(repoPrefix), reason)
+}
+
+// invalidateAllDependencyCohorts marks every live consumer's cohort stale. It
+// is what a change with no single repository behind it means — a configuration
+// reload moves the digested config sections of every repository it refreshed.
+func (l *CheckoutLifecycle) invalidateAllDependencyCohorts(reason string) {
+	if l == nil {
+		return
+	}
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for _, coordinator := range l.coordinators {
+		if coordinator != nil {
+			coordinators = append(coordinators, coordinator)
+		}
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		coordinator.InvalidateDependencyCohort(reason)
+	}
+
+	l.refViewMu.Lock()
+	managers := make([]*RefViewManager, 0, len(l.refViews))
+	for _, manager := range l.refViews {
+		if manager != nil {
+			managers = append(managers, manager)
+		}
+	}
+	l.refViewMu.Unlock()
+	for _, manager := range managers {
+		manager.InvalidateDependencyCohort(reason)
+	}
+}
+
+// workspaceForPrefix reads one served repository's workspace, empty when the
+// registry does not serve it or it declares none.
+func (l *CheckoutLifecycle) workspaceForPrefix(repoPrefix string) string {
+	if l == nil || l.mi == nil || repoPrefix == "" {
+		return ""
+	}
+	idx := l.mi.GetIndexer(repoPrefix)
+	if idx == nil {
+		return ""
+	}
+	return idx.WorkspaceID()
+}
+
 // trackStarted records a coordinator whose loop is running, and forgets the
 // ones started earlier for the same checkout that have since stopped.
 func (l *CheckoutLifecycle) trackStarted(checkoutID string, coordinator *CheckoutCoordinator) {
@@ -2164,6 +2443,13 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 	// the registry it counts move together.
 	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
 	l.coordMu.Unlock()
+	// A checkout that no longer holds a build loop here is one nobody is
+	// asking about any more — it was forgotten, retired, or is being rebuilt —
+	// so a stated reason for it having none stops being a fact about the
+	// daemon's present. Bounded here rather than only on a successful install,
+	// or an untracked checkout's reason would outlive it for the life of the
+	// process.
+	l.clearCoordinatorStartFailure(checkoutID)
 	if coordinator != nil {
 		_ = coordinator.Close()
 		l.oweRetirement(coordinator.DrainRetirements()...)
@@ -2795,7 +3081,68 @@ func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ str
 // that path established: detach the watcher before evicting, so a late
 // filesystem event cannot re-index files whose nodes are already gone.
 func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
-	return h.l.releaseRepositoryGraph(ctx, graphID)
+	// Read BEFORE the release: once the registry stops serving the prefix its
+	// workspace is unreadable, and the cohort consumers that just lost a member
+	// would then never be told. Read here rather than inside
+	// releaseRepositoryGraph because the saga's hooks are where this lifecycle
+	// states its side effects; the cleanup step itself stays a pure teardown.
+	prefix, workspaceID, served, subjectErr := h.l.cohortSubjectForGraph(ctx, graphID)
+	err := h.l.releaseRepositoryGraph(ctx, graphID)
+	switch {
+	case subjectErr != nil:
+		// The catalog could not say WHICH repository this graph held, so the
+		// consumers that just lost a member cannot be named. Only two answers
+		// are available, and neither is "do nothing quietly": leave every
+		// cached cohort certifying a repository that has just been released —
+		// a freshness claim that has stopped being true and that nothing else
+		// would ever retract — or make every live consumer describe once more.
+		// The second is a bounded cost on a path a repository takes once, so
+		// it is the one taken, and it is stated rather than swallowed.
+		h.l.logger.Warn("checkout lifecycle: could not read which repository a released "+
+			"graph held; invalidating every cached dependency cohort instead",
+			zap.String("graph", graphID), zap.Error(subjectErr))
+		h.l.invalidateAllDependencyCohorts("repository graph released; its subject could not be read")
+	// Marked on the DISAPPEARANCE, not on every attempt: the saga retries a
+	// release that reported work still pending, and a mark per attempt would
+	// charge every in-scope consumer a fresh description per retry.
+	case served && h.l.mi.GetMetadata(prefix) == nil:
+		h.l.invalidateDependencyCohorts(prefix, workspaceID, "repository graph released")
+	}
+	return err
+}
+
+// cohortSubjectForGraph names the repository one dedicated graph holds and the
+// workspace its cohort consumers are scoped by, as the registry serves them
+// now. served is false when the registry does not serve the prefix, which is
+// what makes a later "the metadata is gone" reading a transition rather than a
+// restatement.
+//
+// A catalog failure is returned rather than folded into served: "this graph
+// names no repository the registry serves" and "the catalog could not be
+// asked" are different facts, and the caller acts differently on them. Folding
+// them together is what let a transient read failure suppress a teardown's
+// invalidation with nothing said anywhere.
+func (l *CheckoutLifecycle) cohortSubjectForGraph(
+	ctx context.Context, graphID string,
+) (prefix, workspaceID string, served bool, err error) {
+	if l == nil || l.catalog == nil || graphID == "" {
+		return "", "", false, nil
+	}
+	read := l.catalog.GetDedicatedGraph
+	if l.cohortGraphSubject != nil {
+		read = l.cohortGraphSubject
+	}
+	graph, found, err := read(ctx, graphID)
+	if err != nil {
+		return "", "", false, err
+	}
+	if !found || graph.RepoPrefix == "" {
+		return "", "", false, nil
+	}
+	if l.mi == nil || l.mi.GetMetadata(graph.RepoPrefix) == nil {
+		return graph.RepoPrefix, "", false, nil
+	}
+	return graph.RepoPrefix, l.workspaceForPrefix(graph.RepoPrefix), true, nil
 }
 
 // --- side effects -------------------------------------------------------
@@ -2809,6 +3156,10 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 	if prefix == "" {
 		return 0, 0, nil
 	}
+	// Read BEFORE the purge: once the registry stops serving the prefix its
+	// workspace is unreadable, and the siblings that just lost a cohort member
+	// would then never be told.
+	workspaceID := l.workspaceForPrefix(prefix)
 	l.detachWatcherContext(ctx, prefix)
 	finalize := func(meta *RepoMetadata) error {
 		if l.cfgMgr == nil {
@@ -2834,6 +3185,12 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 		// fails. Invalidate cached scopes now; the closed mutation lane prevents
 		// the retained config intent from retracking in this process.
 		l.notifyTrackedSetChanged()
+		// Same moment, different cache: every in-scope cohort consumer named
+		// this repository's bytes, and the ones scoped to its workspace are
+		// still running. Not coalesced with the batch above — marking costs
+		// nothing and a consumer that describes a cohort mid-batch must see the
+		// removal rather than the roster it had before it.
+		l.invalidateDependencyCohorts(prefix, workspaceID, "repository registry entry torn down")
 	}
 	return nodesRemoved, edgesRemoved, err
 }

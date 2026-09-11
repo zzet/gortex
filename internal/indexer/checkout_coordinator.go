@@ -288,10 +288,13 @@ type CheckoutCycle struct {
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
 	Rescheduled bool
-	// Deferred reports that the cycle never ran: either daemon warmup has not
-	// opened the build lane, or its bounded background queue was saturated.
-	// Opening the gate or the 15-second coordinator poll retries the demand.
-	// Nothing was read or written, so every other field is zero.
+	// Deferred reports that the cycle never ran. Three causes share the field:
+	// daemon warmup has not opened the build lane, its bounded background queue
+	// was saturated, or the resolver-visible input cohort could not be
+	// described and the coordinator would rather wait than stamp a layer nobody
+	// validated the inputs of. Opening the gate, an invalidation event or the
+	// 15-second coordinator poll retries the demand. Nothing was read or
+	// written, so every other field is zero.
 	Deferred bool
 	// Err is what stopped the cycle, nil when it settled both slots.
 	Err error
@@ -950,6 +953,14 @@ func recordCoordinatorCycle(out CheckoutCycle) {
 	case out.Err != nil:
 		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeFailed)
 	case out.Rescheduled:
+	case out.Deferred:
+		// A cycle held back for want of a describable cohort is the same
+		// outcome as one held back by warmup or a saturated queue: nothing was
+		// read, nothing was written, and the demand is still owed. The two
+		// sites that decide it before reconcile is entered count it themselves;
+		// without this arm the third one falls through to "skipped", which is
+		// the label for a cycle that found nothing to do.
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeDeferred)
 	case out.CommitBuilt || out.CommitReused || out.DirtyBuilt:
 		if out.CommitBuilt {
 			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeBuiltCommit)
@@ -2128,6 +2139,20 @@ func (c *CheckoutCoordinator) describeDependencyCohort(ctx context.Context) bool
 	// while the cohort is being described leaves the cache marked as described
 	// under the OLDER token, so the next poll re-describes. The other order
 	// would record a token the description had not seen and settle on it.
+	//
+	// The stale mark is cleared HERE, before the description, for the same
+	// reason. Everything this run reads happens from now on, so an event that
+	// lands while it is in flight names inputs it never saw — including, on
+	// the failure path, the very change that would let the next description
+	// succeed. Clearing after the description would clear that event's mark
+	// too and nothing would retry it: a poll re-describes only when the mark
+	// or the topology token has moved. Clearing before costs nothing extra —
+	// a coordinator nobody invalidated during the description still ends with
+	// the mark down, so a degraded poll still settles instead of paying a
+	// roster lease every fifteen seconds for the whole of a transient.
+	c.revisionMu.Lock()
+	c.cohortStale = false
+	c.revisionMu.Unlock()
 	token := c.cohort.topologyToken()
 	revision, err := c.cohort.revision(ctx)
 	reason, degraded := "", ""
@@ -2138,7 +2163,9 @@ func (c *CheckoutCoordinator) describeDependencyCohort(ctx context.Context) bool
 	c.revisionMu.Lock()
 	previous, previousReason := c.revision, c.revisionReason
 	c.revision, c.degraded, c.revisionReason = revision, degraded, reason
-	c.cohortStale = false
+	// cohortStale is deliberately NOT touched here: it was cleared before the
+	// description started, so whatever it holds now is an event this run did
+	// not cover.
 	c.cohortTopology = token
 	if revision != "" {
 		c.cohortEverDescribed = true

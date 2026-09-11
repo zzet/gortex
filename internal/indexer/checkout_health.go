@@ -42,6 +42,19 @@ type ViewsHealth struct {
 	Leases int `json:"leases"`
 	// RefViews counts named views of committed state by state.
 	RefViews map[string]int `json:"ref_views,omitempty"`
+	// CoordinatorStartFailures is the one part of this census that is not a
+	// count, and it is here because the count beside it cannot be read without
+	// it: Coordinators is how many build loops run, and a census that says
+	// "three checkouts, one loop" states a problem it cannot explain.
+	//
+	// Every path that starts a coordinator is a background reconciliation with
+	// no caller to fail, so a checkout whose loop could not be built has no
+	// view and — without this — no stated reason anywhere a person looks. The
+	// entries are bounded by the number of checkouts that have no loop and
+	// have been tried, each one is retracted the moment a loop is installed,
+	// and the ordinary answer is the empty one, which is why it is omitted
+	// rather than rendered as an empty list.
+	CoordinatorStartFailures []CoordinatorStartFailure `json:"coordinator_start_failures,omitempty"`
 	// Counters is the view-lifecycle metric registry, flattened: series key to
 	// value, zero-valued series omitted.
 	Counters map[string]int64 `json:"counters,omitempty"`
@@ -62,6 +75,10 @@ func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error
 		return out, errNoCatalog
 	}
 	out.Coordinators = l.liveCoordinators("")
+	// Read beside the coordinator count, from the same in-process state and
+	// under no catalog read at all: the reasons are what makes that count
+	// legible, so a census that carries one and not the other is the defect.
+	out.CoordinatorStartFailures = l.CoordinatorStartFailures()
 	out.Leases = l.leases.Held()
 
 	families, err := l.catalog.ListRepositoryFamilies(ctx)
