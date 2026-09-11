@@ -39,6 +39,7 @@ not reachable from a default startup, watcher, or Git callback path is `implemen
 | Dirty-tree safety snapshot | `refs/backup/incremental-dirty-resume-20260910` = `b6ddfc96be1304f01c6ec88d12bfdc5972487e2a`, tree `001a6214`, 69 entries = 68 unfinished files + the handoff document, `+7194/−433` lines vs HEAD |
 | Dirty-manifest sha256 (harness-computed, W1 suite) | `b341db31419ea47e9428a4639cde16ed9b4b3f6bd5db761dfe74d4dfdef4d73b` — identical on every compile and every run of the W1 exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave 1 exit suite) | `b9e80af941b8f56cee5158f0bda45efae458b07085d746cb2144ccde17889017` — identical on all 9 compiles and all 14 runs of the wave 1 exit suite; no source drift during the suite |
+| Dirty-manifest sha256 (harness-computed, wave 2 exit suite) | `143bc0deec77cde06d78a4db5c56bd4458f171e8ecca88bbf451c47ea81e152a` over HEAD `10a8bd638445c2091dfa55476c9a9cedc78895a3` — identical on all 10 compiles and all 15 runs of the wave 2 exit suite; no source drift during the suite |
 | Recovery branch (do NOT reapply) | `backup/incremental-before-main-20260910-1310` = `a2ccbe07` |
 | Recovery stash (do NOT reapply) | `6e9db642` |
 | Live daemon | `v0.64.1-36-ga2ccbe07-dirty`, pid 18828 — a **pre-rebase** binary. Must not be restarted, re-tracked, or reconfigured. |
@@ -436,8 +437,9 @@ Shared fields for all W1 sub-items unless overridden:
 - Limitations: schema 23 propagates dependency-revision **metadata only**; it computes no digest
   and certifies no legacy output. W2.1c and W2.4 each invalidate every cached generation once on
   first deploy (D8).
-- Next action: W2.1c (bind the revision into `GenerationIdentity`) in wave 2. W2.1a and W2.1b
-  landed in wave 1 and are recorded below.
+- Next action: W2.4. W2.1a and W2.1b landed in wave 1; W2.1c and W2.1d landed in wave 2 and are
+  recorded below. With W2.1c the identity binding is live: every production `DependencyRevision`
+  is now non-empty, so W2.1b's and W2.1d's comparisons stop being `"" != ""`.
 
 ### W2.1a — Dependency-revision cohort digest producer
 
@@ -596,6 +598,139 @@ Shared fields for all W1 sub-items unless overridden:
   the dependency revision changes* (5 files; the two `builder_dedicated_delta*` files carry the
   unchanged wave 1 content into the same commit).
 
+### W2.1c — Bind the cohort revision and the deep configuration digest into the checkout identity (absorbs W2.2, old W2.3)
+
+- State: `wired`. The verifier's wiring check confirms a production entrypoint: a real
+  `CheckoutCoordinator.reconcile` cycle stores both layers with the coordinator's `cohort-v1:`
+  revision, and `l.buildCoordinator` (the lifecycle's own constructor path) is what freezes the
+  configuration and supplies the sections. This is the item that makes W2.1a's producer and
+  W2.1b's / W2.1d's comparisons reachable: every production `DependencyRevision` is non-empty
+  from here on.
+- Agent: wave 2, Lane I.
+- Scope/files: `internal/indexer/checkout_coordinator.go`, `internal/indexer/checkout_lifecycle.go`,
+  `internal/indexer/checkout_coordinator_test.go` (fixture now registers the primary repository
+  owner and supplies default configuration sections, i.e. what `buildCoordinator` does in
+  production), `internal/indexer/checkout_identity_revision_test.go` (new),
+  `internal/indexer/checkout_config_snapshot_test.go` (new). 597 insertions / 18 deletions over the
+  three modified files; no exported signature changed and no schema change (the
+  `dependency_revision TEXT NOT NULL DEFAULT ''` column is pre-existing).
+- Invariant: a stored checkout identity must name everything that decided its payload — the frozen
+  resolver-visible input cohort **and** the whole output-affecting configuration. An identity that
+  names less than it depends on is a false reuse certificate; a cohort that cannot describe itself
+  must fail closed to a value **outside** the `cohort-v1:` vocabulary, never to the legacy empty
+  revision, because empty is a real stored value that matches every pre-cohort generation.
+- Change: `commitIdentity` / `dirtyIdentity` carry `c.dependencyRevision()`, computed once per
+  cycle by `refreshDependencyRevision` at the three entry points (`reconcile`,
+  `settledWithoutBuild`, `RehomeTo`) and in the constructor, over the roster, per-member source
+  identities, ownership, six configuration domains, the producer policy and the capability
+  vocabulary. `config_hash` moves from `indexConfigHash` (index configuration only) to
+  `checkoutConfigHash` over the frozen snapshot's versioned fingerprint plus the named domain
+  digests. `buildCoordinator` freezes the repository configuration through
+  `snapshotDedicatedBaseConfig` for both the builder and the coordinator, so neither aliases
+  `ConfigManager`'s `FrameworkSynthesizers` pointer or its memoized `EffectiveExclude` slice. A
+  refused cohort yields `cohort-refused:<nano base36>`, minted **once per coordinator** (a
+  per-call unique value would defeat the coordinator's retained-layer cache and rebuild every
+  cycle — the amplification this work exists to remove).
+- Acceptance gate(s): G6, G3, G1.
+- Harness evidence (wave 2 exit suite): the item's tests ran inside `internal/indexer` normal
+  chunks `^Test[A-C]` (`results/indexer-normal-_Test_A_C_-8`, 548 / 0 / 1) and `^Test[N-R]`
+  (`results/indexer-normal-_Test_N_R_-5`, 604 / 0 / 0), and in the race lane
+  `DependencyRevision|DedicatedBase|Dedicated|Identity|ConfigSnapshot|CompileDB|CompileCommands|Alias|SideChannel|Rehome|CheckoutMutation`
+  (`results/indexer-race-DependencyRevision_DedicatedBase_Dedicated_Ident-1`, 261 / 0 / 0, 0
+  `DATA RACE`).
+- Commit: `f971ad1ca2f0dac3a3ae3cddcfa05750ae813459` — *indexer: name the frozen input cohort and
+  the whole configuration in the checkout identity* (5 files, 2 new).
+- Limitations: (1) the roster lease is held across validation, enumeration and the digest, but
+  **released before the build's catalog writes** — see deviation D3; the residual window is "the
+  roster moved between the digest and the publish", bounded by W2.1b's re-rooting rule. (2) a raw
+  (non-Git) roster member is **witnessed, not frozen** — read under a 2-second budget, and a
+  timeout refuses the cohort (D10 scope). (3) a tracked-but-unindexed roster member refuses the
+  whole cohort, so a cold daemon builds every checkout under `cohort-refused:` until each member
+  has a corpus — fail-closed and self-healing, but one extra rebuild per layer. (4) the cohort's
+  producer policy **mirrors** `declareProducers` rather than calling it, and can drift from it;
+  `builder_generation.go` is W3.4's owner path. (5) `snapshotDedicatedBaseConfig`'s own
+  domain/version literals stay unpinned (W2.1a finding F1); `dedicated_base_config.go` is outside
+  this item's ownership. (6) **one-time global invalidation (D8), twice over**: the widened
+  `config_hash` and the newly non-empty `dependency_revision` each re-key every stored checkout
+  generation, so every layer rebuilds once on first contact with this binary. This belongs in the
+  PR's upgrade notes.
+- Deviations: D1 — the versioned fingerprint is *derived* in the coordinator rather than plumbed
+  (a snapshot of a snapshot is byte-identical, and one source of truth removes the way the two
+  could disagree). D2 — the cohort is frozen once per cycle, not once per identity, so a cycle
+  cannot build under one identity and cache under another. D3 — the roster lease is not held
+  across the catalog transaction (holding it would block every registration and admission close
+  for the length of a build, and lifecycle teardown would then wait on the build it is tearing
+  down); recorded in the function's doc comment. D4 — a sixth configuration domain
+  (`source-selection`) beyond the producer's required five, which the producer documents as a
+  floor rather than a closed vocabulary. D5 — the owned sibling fixture
+  `checkout_coordinator_test.go` had to gain the owner registration and default sections that
+  production supplies.
+- Verifier verdict: **PASS with findings** (no blocker), 6/6 mutants RED. Finding F5 (minor): the
+  report's `contracts_verified` attribution overstates what this item wired — the wiring itself is
+  real and proved by a production-entrypoint test.
+
+### W2.1d — Catalog ready-reuse and adoption require revision-homogeneous ancestry (D2)
+
+- State: `tested`. **Not independently `wired`**: the verifier's wiring check records "wired
+  within its subsystem — the subsystem itself still has no production constructor"
+  (`dedicatedBasePublisher` / `dedicatedBaseRuntime` have zero non-test constructors, pre-existing
+  at the branch base; W4.1 owns mounting them). The regression does drive the real
+  `ensureCurrent → ensureObserved → catalog claim → buildObservedClaim → adopt` path.
+- Agent: wave 2, Lane S. Closes the two findings the W1x/W2.1b verifier recorded (F1, F2).
+- Scope/files: `internal/graph/store_sqlite/catalog_dedicated_base.go` (one hunk, +14/−6, no schema
+  and no signature change), `internal/graph/store_sqlite/catalog_dependency_revision_test.go`
+  (+140/−12), `internal/indexer/dedicated_base_advance_revision_test.go` (+218/−72).
+  `catalog_dedicated_base_test.go` is owned and needed no change — every chain there carries the
+  legacy empty revision and is homogeneous by construction.
+- Invariant (D2, adoption half): a generation may only be reused or adopted if **every** row of its
+  ancestry was frozen under the same dependency revision. Certifying a mixed composition is a
+  false freshness claim; the refusal must fall through to allocating a fresh full root, never hard-fail.
+- Change: the per-row ancestry check becomes
+  `exactTree && g.DependencyRevision != desire.Identity.DependencyRevision && (depth == 0 || !allowBuildingCandidate)`.
+  Strict for ready reuse, adoption, adopted replay and the built-through arm; unchanged (depth-0
+  only) for the in-flight re-validation a builder performs over its own still-building
+  reservation, and unchanged (absent) for the proposed parent and the crash-retry path. The
+  building-candidate exception is deliberate: making it strict moves the refusal into the catalog
+  and leaves the builder's typed `errDedicatedDeltaParentRevision` unreachable (mutation M2 is
+  exactly that, and it is RED on two tests in files this lane does not own). A still-BUILDING row
+  is not yet an output, and it can never be certified — adoption is on the strict side.
+- Acceptance gate(s): G6, G3.
+- Harness evidence (wave 2 exit suite): `internal/graph/store_sqlite` whole package
+  (`results/store-normal-_-6`, 1762 / 0 / 2) and the race lane
+  `DedicatedBase|DependencyRevision|Publication|Retirement|Adopt`
+  (`results/store-race-DedicatedBase_DependencyRevision_Publication_Ret-1`, 152 / 0 / 0, 0
+  `DATA RACE`); the indexer regression sits in normal chunk `^Test[D-H]`
+  (`results/indexer-normal-_Test_D_H_-6`, 537 / 0 / 0) and in the indexer race lane
+  (`results/indexer-race-DependencyRevision_DedicatedBase_Dedicated_Ident-1`, 261 / 0 / 0).
+- Commit: `f642a15814a80eddbfa41470b580445b00ce9396` — *store: require a revision-homogeneous
+  ancestry before reusing a dedicated base* (3 files).
+- Limitations: (1) the item was behaviourally inert when written — every production revision was
+  empty — and **becomes live with W2.1c**, which landed in the same wave and is committed after
+  it, so the history has no point at which non-empty revisions exist without this guard. (2) the
+  proposed-parent arm keeps its latitude (`exactTree=false`), so a caller that ignores both the
+  planner and the builder can still burn an allocation on a composition adoption will refuse; not
+  reachable from the indexer. (3) a pre-fix store holding an *adopted* mixed chain would refuse
+  its adopted-replay validation instead of coalescing — unreachable, since no released binary
+  writes non-empty revisions, and a changed desire recovers through a fresh root. (4) the
+  subsystem still has no non-test constructor. (5) the lane did not run the full `internal/indexer`
+  package (three agents were editing it concurrently); the six-chunk leg is this exit suite's.
+- Deviations: (1) the fix is narrower than "delete the depth-0-only clause" — see the
+  building-candidate exception above. (2) the store fixture
+  `TestDedicatedDependencyRevisionParentAndHistoricalReuse` had to be reshaped to the D2 truth
+  (re-root, not adopt) because it manufactured its mixed chain through the public protocol; every
+  other assertion it carried is retained, none deleted. (3) the indexer fixture writes the active
+  pointer directly (`CreateViewGeneration` + `PublishViewGeneration` + an `UPDATE`), because
+  `upsertDedicatedGraphIdentity` ignores a supplied pointer once publication authority exists.
+  (4) **stale rationale comments in files this lane does not own** —
+  `dedicated_base_advance.go:45-53`, `:69-79`, `builder_dedicated_delta.go:30-36`,
+  `builder_dependency_revision_test.go:196-198` and `builder_dedicated_delta_test.go:708-711` still
+  say the catalog revision-checks only the output candidate; after this item that holds only for a
+  proposed parent, a still-building candidate, and rows written outside the protocol. The guards
+  themselves remain correct and necessary (M1/M2 prove it). Whoever owns those files next should
+  refresh the text. (5) the error string gained the generation id; no caller matches on it.
+- Verifier verdict: **PASS** (no blocker), 3 minor findings, all disclosure/accuracy, none in the
+  shipped code. The export reproduced the item's counts exactly, including 0 `DATA RACE`.
+
 ## W3 — Bind all writers and producers
 
 - State: `proposed`. Dependencies: W2. Items: W3.1–W3.7, all in MVI.
@@ -606,7 +741,70 @@ Shared fields for all W1 sub-items unless overridden:
   bytes; raw external repositories need a verified immutable image tied to their admitted data
   (out of scope, D10). Migration number allocation is single-owner: W3.3 takes **v25** (branch is
   at v24, `schema_version.go:37`) — two lanes each claiming v25 is the known salt-collision class.
-- Next action: the authority (W3.1) in wave 4. W3.5 landed in wave 1 and is recorded below.
+- Next action: the authority (W3.1) in wave 4. W3.5 landed in wave 1 and is recorded below. W3.4
+  is `blocked with evidence` after wave 2 — its source is on disk and green, but it is **not
+  committed**; see its row.
+
+### W3.4 — Route the committed build's disk readers through the installed source
+
+- State: `blocked with evidence`. Source is implemented, compiles, and its tests pass inside this
+  wave's exit suite, but the item's **final verifier verdict is `fail`** and the wave's commit rule
+  is "commit only on a passing verdict", so **nothing of W3.4 was committed**. Its seven files stay
+  dirty in the worktree at the end of wave 2.
+- Blocking evidence: `scratchpad/reports/W2-W3.4-verify.md` §0 and finding 1 — *"Verification could
+  not execute: 1.1 GiB free on `/` (< 3 GiB). No compile, no test, no mutation re-run."* The
+  verifier's static review found **no code blocker** and traced the production wiring by hand
+  (`BuildCommitLayer → runPass → New → setContentSourceWithManifests → IndexCtx →
+  populateCppIncludeDirs → manifestTree`), but the implementer's six revert-red mutants M1–M6 and
+  its own suite counts remain **unconfirmed by an independent run**. The blocker is evidentiary,
+  not a defect.
+- Agent: wave 2, Lane I (repair round after a first failed verification).
+- Scope/files (all uncommitted): `internal/indexer/contract_import_resolve.go`,
+  `internal/indexer/cpp_compile_db.go`, `internal/indexer/npm_alias_resolve.go`,
+  `internal/indexer/indexer.go`, `internal/indexer/builder_generation.go`,
+  `internal/indexer/cpp_compile_db_test.go`,
+  `internal/indexer/committed_build_side_channels_test.go` (new, 734 lines, 18 tests).
+- Invariant: **no committed build reads current dirty files through a side channel.** A build over
+  a frozen target tree must read its manifests, its compile database and its include roots from
+  the installed `ContentSource`, and a reader it cannot route must be *declared*, not silently left
+  on disk.
+- Change: a `manifestTree` abstraction with a disk implementation (byte-identical probes to the
+  ones it replaces) and a source implementation that **never falls back to disk** — an absent
+  source answers nothing. The compile database, the include-root heuristic (both probes preserved:
+  `topLevelDirs` membership for a conventional root, `isDir` only on the unsourced path) and the
+  npm / workspace manifest readers are routed through it; `populateCppIncludeDirs` additionally
+  short-circuits to empty when the source is installed and the graph holds no C-family files.
+  `sourceConfigNarrowingReason` is promoted to a package constant and **extended** to name the one
+  channel that stays open.
+- Acceptance gate(s): G3, G2.
+- Harness evidence (wave 2 exit suite, dirty tree): the item's tests ran green inside the same six
+  `internal/indexer` normal chunks and the same indexer race lane recorded for W2.1c — 2629 / 0 / 2
+  normal, 261 / 0 / 0 race, 0 `DATA RACE`. This is suite evidence on the wave's dirty tree, **not**
+  the independent re-run and mutation re-verification the failed verdict asks for.
+- Limitations: **the item's title overstates what landed — three of four channels are closed.** The
+  tsconfig / jsconfig path-alias channel is still open on the committed-build path:
+  `path_alias_resolve.go:19` → `tsalias.Load(rootPath)` walks the checkout, and neither that file
+  nor `internal/parser/tsalias` is in this item's ownership. Refusing the alias scan under a source
+  was rejected because it trades a wrong-tree edge for a **missing** edge. The verifier adds that
+  `tsAliasCache` is process-global, root-keyed and never invalidated, so a committed build and the
+  live index at the same root share one checkout-derived collection (pre-existing). A sourced build
+  also drops a **symlinked** conventional include root, a live/committed asymmetry with no
+  practical consequence (no indexed file lives under it) but undocumented until now.
+- Deviations / open contract questions carried from the verifier: (a) the narrowing is declared on
+  `CapSourceConfig` while the damage — a wrong edge from the unrouted alias scan — lands under
+  `CapResolutionLocal`, declared `Complete` with no reason at all (`builder_generation.go:1033`);
+  (b) `CapSourceConfig` stays `ProducerStateComplete` while carrying a reason that contradicts
+  "the payload is whole"; the enum is cross-package and unowned here, so the flip was rejected as
+  asserting a different untruth. **`source.config` must not be read as trustworthy for TS/JS
+  alias-derived edges.** (c) `TestBuiltGenerationDeclaresTheSourceConfigNarrowing` stays green if
+  the routing is reverted and the constant kept — the reason string is an unenforced claim, so it
+  is not coverage of the routing.
+- Next action: re-dispatch the verification slot now that disk headroom exists (the wave 2 exit
+  stage recovered ~6 GiB); on a passing verdict the item commits as-is. The tsalias follow-up
+  (export a source-reading loader from `internal/parser/tsalias` and route
+  `loadTSAliasCollection` / `resolveTSPathAlias`) is a separate item and is **not** part of W3.4.
+- Verifier verdict: **FAIL — verification blocked, not a code defect.** 1 blocker (evidentiary),
+  1 major, 4 minor.
 
 ### W3.5 — `search_text` capability truth for committed identities (D5)
 
@@ -694,7 +892,8 @@ Shared fields for all W1 sub-items unless overridden:
   it was private, uncompiled and not activated; its counts (52 proposed files, 90 edits across 21
   files, 78 tests, 12 benchmarks) are proposal counts, not landed files or passing tests. Its
   source JSON is preserved in the recovery directory as `historical-proposal-tool-results.json`.
-- Next action: W5.2 and W5.3 in wave 2. W5.1 and W5.8 landed in wave 1 and are recorded below.
+- Next action: W5.4 onward. W5.1 and W5.8 landed in wave 1; W5.2 and W5.3 landed in wave 2 and are
+  recorded below.
 
 ### W5.1 — Lease-handoff primitive (detach / joined consumer)
 
@@ -841,6 +1040,112 @@ Shared fields for all W1 sub-items unless overridden:
 - Verifier verdict (wave 1): **PASS** — 1 major, 5 minor findings, no blocker. Mutants M1–M7 are each RED
   and each named a single expected test; the whole-package failing set was `comm`-compared against
   a pristine rebuild in both directions and came back empty on both sides.
+
+### W5.2 — Bind detached workers and the deadline firewall to a handed-off lease
+
+- State: `wired`. The verifier's wiring check confirms the production seam: every one of the ten
+  tests drives `srv.wrapToolHandler`, and four of them enter through the real handlers
+  (`refreshCheckoutMutation` / `EnqueueRefresh`, `EnqueueFileMutation` via `SetWatcher`,
+  `handleTrackRepository`, and the deadline firewall's abandon path).
+- Agent: wave 2, Lane R + I. Depends on W5.1's `Lease.Handoff()` / `RepoView.Handoff()`.
+- Scope/files: `internal/mcp/overlay.go` (+100), `internal/mcp/tool_deadline.go` (+133/−12),
+  `internal/mcp/edit_serialization.go` (+60), `internal/mcp/view_mutation_state.go` (+23),
+  `internal/mcp/tools_multi.go` (+8), `internal/viewmetrics/catalog.go` (+54),
+  `internal/mcp/view_lease_handoff_test.go` (new, 10 tests). The four owned sibling test files were
+  **not** modified; every new assertion lives in the new file and reuses existing fixtures.
+- Invariant (G7): borrowed readers and source providers stay alive until **actual worker
+  completion, including cancellation tails**. A view released on handler return while a detached
+  worker still reads it is the defect; a handoff that cannot be released is equally a defect, so an
+  admission that yields no completion ticket releases rather than holds.
+- Change: the four detach points — checkout publication (`EnqueueRefresh` under
+  `context.WithoutCancel`), watcher reindex (`EnqueueFileMutation`), the detached first index
+  behind `lifecycle.Register`, and the deadline firewall's abandoned handler — join the request
+  view's lease before detaching and release when the detached work reports. A worker that asks
+  after its request ended is **refused** a handle rather than handed one over a possibly-collected
+  payload; an unrouted or reader-less view hands off nothing and every `*requestViewPin` method is
+  nil-safe. A `viewmetrics` counter/gauge pair makes an unreleased handoff observable, which is what
+  the W5.1 verifier asked for.
+- Acceptance gate(s): G7, G1.
+- Harness evidence (wave 2 exit suite): `internal/mcp` whole package in one process
+  (`results/internal_mcp-normal-_-9`, 5947 / 0 / 8) and the race lane
+  `Handoff|Detach|Deadline|Abandon|Pin|BasePin|RequestView|ViewBase|SearchText|EditSerial|Multi`
+  (`results/internal_mcp-race-Handoff_Detach_Deadline_Abandon_Pin_BasePin_Requ-1`, 105 / 0 / 0, 0
+  `DATA RACE`).
+- Commit: `905336c8d0b8d5a8865cbbe5e0f04eab327df4cc` — *mcp: hold a request's view until its
+  detached work actually finishes* (7 files, 1 new).
+- Limitations: the pin covers **generation lifetime, not filesystem bytes** (generation zero is
+  W5.3's half); `requestView.files`, the ref-view git child, is still closed on handler return — no
+  detached worker in this item reads committed bytes through it; a rejected admission runs unpinned
+  by design; a handler reached without the middleware (a direct call, or resources/prompts, which
+  have no request view until W5.6) publishes and retains nothing, and records no counter either;
+  `TestTrackRepositoryPinsTheViewForItsDetachedIndex` asserts through the counters rather than a
+  retirement refusal, because `Register` can finish before the assertion — the deterministic
+  lifetime proof for that consumer class is carried by test 1. The gauge is process-wide, so the
+  tests reset it and do not run in parallel, and nothing in production reads it back yet.
+- Deviations: the plan names `Lease.Detach()`; W5.1 shipped `Handoff()` and this item consumes that
+  name. `internal/viewmetrics/catalog.go` is beyond the plan's five-file list, added per the
+  coordinator's observability note; no other wave item owns it. The abandoned goroutine "releases
+  on exit" is implemented as the pre-existing `<-done` waiter releasing — that waiter *is* the
+  observation of the goroutine's exit, so no second goroutine was added. A file-local generic
+  helper's callback signature grew a third parameter; all call sites are in the same file.
+- Verifier verdict: **PASS** (no blockers), 5 minor findings; 10/10 new tests reproduced in the
+  export, race-clean at `-count=2`.
+
+### W5.3 — Pin the base corpus (generation zero) for the duration of a request
+
+- State: `wired`. The verifier's wiring check is explicit ("WIRED"), with mutants M10 and M11
+  deleting the two production wiring lines (`view_search.go:149` `readsBaseCorpus`,
+  `view_request.go:527` `pinRequestBaseCorpus`) and both going RED across all four mcp tests.
+- Agent: wave 2, Lane V + R.
+- Scope/files: `internal/graphview/lease.go` (+158), `internal/graphview/materialize.go` (+68/−4),
+  `internal/graphview/repository_raw_data.go` (+133), `internal/mcp/view_request.go` (+138),
+  `internal/mcp/view_search.go` (+10), `internal/graphview/lease_test.go` (+153),
+  `internal/graphview/materialize_test.go` (+130),
+  `internal/graphview/repository_raw_data_test.go` (+81),
+  `internal/mcp/view_base_pin_test.go` (new, 213 lines).
+- Invariant (G7, base half): the layer a request actually reads must be held for the request's
+  lifetime — and generation zero is the composed reader's bottom in the legacy regime, so the
+  materializer's ancestry walk, which terminates *at* zero, left the most-read layer unheld. A view
+  that does not read the base must take no pin, and a base that changed under a request must be
+  **labelled on the rider**, never served as exact.
+- Change: `BasePin` (`AcquireBaseCorpus` / `ValidateCurrent` / `Witnessed` / `OwnerPinned` /
+  `Generations` / `Release`) is three holds — generation zero in the same `LeaseManager` every
+  derived generation is leased through, the registered repository owner of the view's prefix (so
+  `CloseRepositoryAdmission` → `RepositoryDrain` drains *behind* the request), and a source witness
+  captured at acquisition. Acquisition takes no context and blocks on nothing, so naming the corpus
+  can never delay a request. The materializer pins only the arms that read the base (not a
+  dedicated root, not `routedStart > 0`). `repository_raw_data.go` gains an observation-based
+  witness readable without the data gate, a `ValidateCurrent` on the snapshot lease, and an
+  **initial capture** so a never-mutated owner is pinnable at all instead of reporting
+  `ErrRawRepositorySourceChanged`.
+- Acceptance gate(s): G7, G1.
+- Harness evidence (wave 2 exit suite): `internal/graphview` whole package
+  (`results/graphview-normal-_-9`, 460 / 0 / 0) and its race lane
+  `Lease|Handoff|Materialize|Drain|Raw|Pin` (`results/graphview-race-Lease_Handoff_Materialize_Drain_Raw_Pin-1`,
+  103 / 0 / 0, 0 `DATA RACE`); `internal/mcp` whole package (`results/internal_mcp-normal-_-9`,
+  5947 / 0 / 8) and its race lane (105 / 0 / 0).
+- Commit: `e148bbe6a1963fb276083d2124cf8e5ac92f2b47` — *graphview: pin the base corpus for the
+  lifetime of a request* (9 files, 1 new).
+- Limitations: **L1 — the witness half has no production producer yet.** Nothing outside
+  `internal/graphview` opens a `RawRepositoryRegistration` (D10 / the removed W2.5), so for an
+  ordinary Git-backed repository the pin holds generation zero and the registered dedicated owner —
+  both real, both exercised on the production request path — while `ValidateCurrent` reports
+  `ErrBaseCorpusUnwitnessed` and the rider is left exactly as the route built it. **W3.1 closes
+  this** with no change here, once generation-zero mutation goes through the mutation authority.
+  L2 — base-selector, fallback and no-view requests are unpinned. L3 — `recordRequestView` fires
+  before a rider-time downgrade, so `views_request_served_total` under-reports base-change
+  downgrades until a `"base_changed"` error code exists. L4 — the two `internal/mcp` failures the
+  lane reported are the harness `TMPDIR`-length artifacts, fixed by this exit stage (see the
+  Evidence log). L5 — `LeasesHeld` / `ViewsHealth.Leases` now count generation zero while a
+  legacy-regime or routed request is live: truthful, but a +1 step change in that gauge.
+- Deviations: D1 — generation zero is the composed bottom only in the legacy arm
+  (`materialize.go:653-658`), so the pin is conditional on the view actually reading it rather than
+  unconditional as the plan implied; the two non-reading arms have their own regressions. D3 —
+  base-selector / fallback / no-view requests were left unpinned rather than given a partial pin.
+- Verifier verdict: **PASS** (no blockers); 7/7 implementer mutants plus the verifier's own M10/M11
+  wiring mutants bind. The verifier's whole-package `internal/mcp` run in its export showed one
+  additional failure (`TestDetectChanges_EchoesMeasuredScope`) that is git-checkout dependent and
+  is green in this wave's exit suite.
 
 ## W6 — Finish bounded reuse and storage maintenance
 
@@ -1119,9 +1424,17 @@ Actions: `compile <alias|./pkg> <normal|race>` · `test <alias|./pkg> <normal|ra
   missing. Compile again after every relevant source change.
 - **Environment.** `test` runs under `env -i` with an explicit allowlist, so no `ANTHROPIC_*` /
   `OPENAI_*` / `AWS_*` / `AZURE_*` / `GEMINI_*` / `DEEPSEEK_*` credential can reach a test.
-  Private `HOME` / `TMPDIR` / `XDG_{CONFIG,DATA,CACHE,STATE}_HOME` / `XDG_RUNTIME_DIR` per run
-  under `harness/home-<run-id>/`. Git isolated (`GIT_CONFIG_GLOBAL`/`_SYSTEM=/dev/null`,
+  Private `HOME` / `XDG_{CONFIG,DATA,CACHE,STATE}_HOME` / `XDG_RUNTIME_DIR` per run under
+  `harness/home-<run-id>/`. Git isolated (`GIT_CONFIG_GLOBAL`/`_SYSTEM=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, deterministic identity).
+- **`TMPDIR` lives in the short private root, not under `HOME`** (changed by the wave 2 exit
+  stage; `validate.sh:198,229`). It was `harness/home-<run-id>/tmp`, 122+ characters, and any test
+  that binds an AF_UNIX socket under `t.TempDir()` failed with `bind: invalid argument` — the same
+  104-byte darwin cap the daemon roots already dodge. `TMPDIR`/`TMP` now point at
+  `/private/tmp/gxh-<pid>-<seq>/tmp`, still per-run and still private; `result.json` records it as
+  `tmpdir`. This removed two `internal/mcp` failures that were harness artifacts, not code:
+  `TestReadFilePhysicalEvidenceRejectsSpecialFiles` and `TestRetrievalSavingsCreditIsPerSession`
+  (see the wave 2 exit-suite entry in the Evidence log for the isolation proof).
 - **CWD** is the package source directory, so source-auditing tests such as
   `TestGenerationCapabilityChecklistIsComplete` see their package.
 - **Daemon unreachability.** `GORTEX_AUTOSTART=0` plus
@@ -1526,3 +1839,111 @@ Runs executed 2026-09-10/11 local time; the entry is dated by the wave, not by t
   G1–G9 are unchanged by this wave. The commits make the work durable and reviewable; they do not
   make it activated. `W2.1a` and `W5.1` remain inert primitives with no production caller, and
   `W2.1b`'s two revision comparisons are still `"" != ""` in production.
+
+### 2026-09-10 — Wave 2 exit suite (W2.1c, W2.1d, W3.4, W5.2, W5.3)
+
+- **Source identity.** HEAD `10a8bd638445c2091dfa55476c9a9cedc78895a3`, dirty-manifest sha256
+  `143bc0deec77cde06d78a4db5c56bd4458f171e8ecca88bbf451c47ea81e152a` (26 modified + 6 untracked
+  paths, one of which is the untracked handoff working note). Identical on all 10 compiles and all
+  15 runs — no source drift during the suite. Taken from the harness `result.json` files, which
+  carry `head_sha` and `dirty_manifest_sha256` on every row.
+- **Commands.** From the worktree with the isolated environment (`GOWORK=off GOTOOLCHAIN=local
+  GOFLAGS="-mod=mod -buildvcs=false" GOPROXY=off`): `go build ./...` (exit 0, no output) and
+  `go vet` over `./internal/indexer/ ./internal/graph/store_sqlite/ ./internal/graphview/
+  ./internal/mcp/ ./internal/viewmetrics/ ./internal/graph/ ./internal/reconcile/ ./cmd/gortex/`
+  (exit 0). Then through `scratchpad/harness/validate.sh`: 10 × `compile` (6 normal, 4 race),
+  8 × `vet`, 15 × `test`.
+- **Result: 12041 pass / 0 fail / 12 skip, 0 `DATA RACE`.** Every skip is named with its exact
+  reason. `all_green = true`.
+
+  | run | pattern | pass | fail | skip | result dir |
+  | --- | --- | --- | --- | --- | --- |
+  | `internal/graph` normal | `.` | 530 | 0 | 0 | `results/graph-normal-_-6` |
+  | `internal/graph/store_sqlite` normal | `.` | 1762 | 0 | 2 | `results/store-normal-_-6` |
+  | `internal/graphview` normal | `.` | 460 | 0 | 0 | `results/graphview-normal-_-9` |
+  | `internal/reconcile` normal | `.` | 92 | 0 | 0 | `results/reconcile-normal-_-5` |
+  | `internal/mcp` normal | `.` | 5947 | 0 | 8 | `results/internal_mcp-normal-_-9` |
+  | `internal/indexer` normal | `^Test[A-C]` | 548 | 0 | 1 | `results/indexer-normal-_Test_A_C_-8` |
+  | `internal/indexer` normal | `^Test[D-H]` | 537 | 0 | 0 | `results/indexer-normal-_Test_D_H_-6` |
+  | `internal/indexer` normal | `^Test[I-M]` | 466 | 0 | 1 | `results/indexer-normal-_Test_I_M_-6` |
+  | `internal/indexer` normal | `^Test[N-R]` | 604 | 0 | 0 | `results/indexer-normal-_Test_N_R_-5` |
+  | `internal/indexer` normal | `^Test[S-T]` | 334 | 0 | 0 | `results/indexer-normal-_Test_S_T_-5` |
+  | `internal/indexer` normal | `^Test[U-Z]` | 140 | 0 | 0 | `results/indexer-normal-_Test_U_Z_-5` |
+  | `internal/graph/store_sqlite` race | `DedicatedBase\|DependencyRevision\|Publication\|Retirement\|Adopt` | 152 | 0 | 0 | `results/store-race-DedicatedBase_DependencyRevision_Publication_Ret-1` |
+  | `internal/graphview` race | `Lease\|Handoff\|Materialize\|Drain\|Raw\|Pin` | 103 | 0 | 0 | `results/graphview-race-Lease_Handoff_Materialize_Drain_Raw_Pin-1` |
+  | `internal/indexer` race | `DependencyRevision\|DedicatedBase\|Dedicated\|Identity\|ConfigSnapshot\|CompileDB\|CompileCommands\|Alias\|SideChannel\|Rehome\|CheckoutMutation` | 261 | 0 | 0 | `results/indexer-race-DependencyRevision_DedicatedBase_Dedicated_Ident-1` |
+  | `internal/mcp` race | `Handoff\|Detach\|Deadline\|Abandon\|Pin\|BasePin\|RequestView\|ViewBase\|SearchText\|EditSerial\|Multi` | 105 | 0 | 0 | `results/internal_mcp-race-Handoff_Detach_Deadline_Abandon_Pin_BasePin_Requ-1` |
+
+- **`internal/indexer` had to be chunked.** The single-process whole-package attempt
+  (`results/indexer-normal-_-5`) reached 1373 passes and then **hit the harness's hardcoded
+  `-test.timeout 8m`** — `panic: test timed out after 8m0s`, still running
+  `TestIncrementalMultiFileBatchQueriesAndCommitsScaleByChunks`, exit 2. It was replaced by the six
+  first-letter chunks above (2629 / 0 / 2 in total). Cross-chunk single-process interference is
+  therefore unobserved in that package, as in every prior wave.
+- **The two `internal/mcp` failures were the harness, not the branch, and are now fixed at the
+  source.** The first whole-package run (`results/internal_mcp-normal-_-8`) reported
+  `TestReadFilePhysicalEvidenceRejectsSpecialFiles`
+  (`read_file_physical_evidence_nonblocking_test.go:61`, *"listen unix …/evidence.sock: bind:
+  invalid argument"*) and `TestRetrievalSavingsCreditIsPerSession` (`savings_retrieval_test.go:178`,
+  *"\"0\" is not greater than \"0\""*). Isolation proof: the **same compiled binary** from the
+  **same tree** run with `TMPDIR=/private/tmp/gxsock1` passes both, and run with a 122-character
+  `TMPDIR` under the harness home fails both — `TMPDIR` length is the only variable. The harness's
+  `TMPDIR`/`TMP` were moved into the existing short private root (`validate.sh:198,229`), which is
+  the same 104-byte AF_UNIX workaround the daemon paths already use, and the re-run
+  (`results/internal_mcp-normal-_-9`) is **5947 / 0 / 8**. W1.9 and W5.3 had each characterized
+  these two as environment artifacts reproducible on a pristine export of `main`; this stage
+  removed the cause instead of re-recording the symptom. No production or test source was touched.
+- **Named skips (12), all pre-existing and environment- or platform-gated.**
+  `internal/graph/store_sqlite`: `TestBundlePackageKeyNeverUsesOSSeparator` (*"separator matches the
+  contract on this platform"* — the Windows path-separator test) and `TestMetaBlobCensus` (*"set
+  GORTEX_BENCH_STORE to a copied store.sqlite to run"*) — the two the exit criterion pre-blessed.
+  `internal/indexer`: `TestBackendBench` (*"bench harness; set GORTEX_BENCH_ROOT …"*) and
+  `TestMeasureEditLatency` (*"set GORTEX_MEASURE_REPO=/abs/path to run"*). `internal/mcp`: five
+  `TestAnalyzeScope_AllScopeAwareKinds_NoCrossWorkspaceLeak` subtests needing a coverage profile or
+  git-blame data, `TestATradeThatCannotSaveTheOutlineIsGivenBack` (*"the fixture is no longer tight
+  enough to drop the index"*), `TestLocalizationTextMatchNormalisesNativePathToGraphKey` (Windows
+  path spelling) and `TestCheckoutMutationResolvedRootRejectsFoldedDistinctDirectory`
+  (*"filesystem cannot represent case-distinct directories"*).
+- **Commits.** Four, one per passing item, in dependency order, each staging only that item's files
+  (`git add <paths>`, never `-A`); the ledger commit is fifth and last. The catalog guard is
+  committed **before** the identity binding on purpose: there is no point in the history at which a
+  production `DependencyRevision` is non-empty while the catalog can still certify a mixed chain.
+
+  | # | commit | item | subject |
+  | --- | --- | --- | --- |
+  | 1 | `f642a15814a80eddbfa41470b580445b00ce9396` | W2.1d | store: require a revision-homogeneous ancestry before reusing a dedicated base |
+  | 2 | `f971ad1ca2f0dac3a3ae3cddcfa05750ae813459` | W2.1c | indexer: name the frozen input cohort and the whole configuration in the checkout identity |
+  | 3 | `905336c8d0b8d5a8865cbbe5e0f04eab327df4cc` | W5.2 | mcp: hold a request's view until its detached work actually finishes |
+  | 4 | `e148bbe6a1963fb276083d2124cf8e5ac92f2b47` | W5.3 | graphview: pin the base corpus for the lifetime of a request |
+
+- **W3.4 was NOT committed.** Its final verifier verdict is `fail` (evidentiary: the verification
+  slot had 1.1 GiB free and could not compile, test or re-run a single mutant), and the wave's rule
+  is to commit only on a passing verdict. Its seven files remain dirty in the worktree; the item's
+  row records the blocker, its static findings and the re-dispatch condition. Note that those
+  seven files were **present in the tree for every run of this suite**, so the counts above include
+  W3.4's 18 tests and were produced with its production changes active.
+- **Post-commit verification.** `git status --porcelain` after the four commits shows exactly
+  W3.4's seven files, this ledger, and the untracked handoff working note — nothing outside this
+  wave's ownership was staged or touched. The committed tree was then exported with
+  `git archive HEAD | tar -x` into a scratch directory and rebuilt there from scratch:
+  `go build ./...` exit 0 and `go vet` over the five touched packages exit 0, so the four commits
+  compile as a unit **without** W3.4's dirty changes.
+- **Limitations of what this suite proves.** These are unit and package regressions on a pinned
+  dirty source identity. No item advanced past `wired`: there is still **no end-to-end and no
+  paired-I/O evidence**, and gates G1–G9 are unchanged by this wave. `internal/indexer` was covered
+  as six chunk processes and has no whole-package single-process result at all (the one attempt was
+  killed by the time cap). `-race` was run over the mandated selections, not whole packages.
+  Per-commit intermediate trees were not individually exported and rebuilt — only the final
+  four-commit tree was — so "each commit compiles on its own" is asserted from ownership disjointness
+  plus the aggregate build, not measured. W2.1c's and W2.1d's contracts are now reachable in
+  production for the first time, which also means the D8 one-time invalidation lands on first
+  contact with this binary and has not been measured on a real store.
+- **Disk.** The stage began with **1.3 GiB free** on the data volume, which is why the first
+  `go build ./...` failed at link time with `no space left on device` (three packages,
+  `errno=28`) — the same class of incident that made the W1 suite's build arm inconclusive and that
+  blocked W3.4's verifier. Reclaimed without clearing any shared cache: the stale per-run harness
+  homes and test binaries, and an **orphaned 5.2 GiB `harness/gocache`** left by an earlier harness
+  revision that the current `validate.sh` does not use (it takes `GOCACHE` from `go env`). Free
+  space after the suite and the final cleanup is recorded in the wave 2 exit report. `find
+  ~/Library/Caches/go-build -type f -mtime +1 -delete` freed nothing — every entry in that 65 GB
+  cache was under a day old.
