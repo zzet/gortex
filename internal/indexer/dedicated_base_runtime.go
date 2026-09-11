@@ -59,6 +59,112 @@ type dedicatedBaseRuntime struct {
 // never a per-trigger or per-build value.
 type DedicatedBaseRuntime struct {
 	*dedicatedBaseRuntime
+
+	// publicationMu guards the cancellation registry below. It is the outer
+	// handle's own lock, deliberately separate from the runtime's: registering
+	// a cancellation is not an admission and must not contend with one.
+	publicationMu sync.Mutex
+	// publicationStops cancels the publication drivers this runtime admitted.
+	//
+	// CheckoutLifecycle.Close closes publisher admission FIRST and joins the
+	// publisher drain LAST, and an admitted publication counts as an admitted
+	// actor for its whole length — the physical build included. Without a way
+	// to tell a running publication to stop, that join is unbounded: a cold
+	// start interrupted by a shutdown would hold teardown for the length of a
+	// full index. Closing admission cancels every registered driver, so the
+	// build unwinds and the drain completes.
+	publicationStops map[uint64]context.CancelFunc
+	publicationNext  uint64
+	publicationsOff  bool
+}
+
+// publicationContext derives a context that is canceled when this runtime's
+// admission closes. The returned release detaches the registration; both it
+// and the cancel are idempotent.
+func (r *DedicatedBaseRuntime) publicationContext(parent context.Context) (context.Context, context.CancelFunc, func()) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	if r == nil {
+		cancel()
+		return ctx, cancel, func() {}
+	}
+	r.publicationMu.Lock()
+	if r.publicationsOff {
+		r.publicationMu.Unlock()
+		cancel()
+		return ctx, cancel, func() {}
+	}
+	if r.publicationStops == nil {
+		r.publicationStops = map[uint64]context.CancelFunc{}
+	}
+	r.publicationNext++
+	id := r.publicationNext
+	r.publicationStops[id] = cancel
+	r.publicationMu.Unlock()
+	release := func() {
+		r.publicationMu.Lock()
+		delete(r.publicationStops, id)
+		r.publicationMu.Unlock()
+	}
+	return ctx, cancel, release
+}
+
+// CloseDedicatedBaseAdmission shadows the embedded runtime's method so the
+// shutdown path reaches the publication cancellations before it starts waiting
+// on the drain, and so a typed-nil handle degrades instead of panicking.
+//
+// A typed nil cannot be produced by NewDedicatedBaseRuntime, but the
+// installation seam compares an INTERFACE to nil, so a caller that hands it
+// (*DedicatedBaseRuntime)(nil) passes that guard and would otherwise promote a
+// method through a nil embedded pointer at shutdown.
+func (r *DedicatedBaseRuntime) CloseDedicatedBaseAdmission() <-chan struct{} {
+	if r == nil {
+		return repositoryAlreadyDrained
+	}
+	r.publicationMu.Lock()
+	r.publicationsOff = true
+	stops := make([]context.CancelFunc, 0, len(r.publicationStops))
+	for _, stop := range r.publicationStops {
+		stops = append(stops, stop)
+	}
+	r.publicationStops = nil
+	r.publicationMu.Unlock()
+	for _, stop := range stops {
+		stop()
+	}
+	if r.dedicatedBaseRuntime == nil {
+		return repositoryAlreadyDrained
+	}
+	return r.dedicatedBaseRuntime.CloseDedicatedBaseAdmission()
+}
+
+// RegisterDedicatedBaseOwner, CloseDedicatedBaseOwner and
+// FinalizeDedicatedBaseOwner shadow their promoted counterparts for the same
+// typed-nil reason. Each refuses rather than degrading: registering or closing
+// an owner against a handle that carries no runtime is a wiring defect, and a
+// silent success would leave the publisher half unowned exactly as a nil
+// installation would.
+func (r *DedicatedBaseRuntime) RegisterDedicatedBaseOwner(graphID string, owner store_sqlite.DedicatedBaseOwner) error {
+	if r == nil || r.dedicatedBaseRuntime == nil {
+		return fmt.Errorf("%w: registration requires an installed runtime", errDedicatedBaseRuntimeInput)
+	}
+	return r.dedicatedBaseRuntime.RegisterDedicatedBaseOwner(graphID, owner)
+}
+
+func (r *DedicatedBaseRuntime) CloseDedicatedBaseOwner(graphID string, owner store_sqlite.DedicatedBaseOwner) (<-chan struct{}, error) {
+	if r == nil || r.dedicatedBaseRuntime == nil {
+		return nil, fmt.Errorf("%w: closing requires an installed runtime", errDedicatedBaseRuntimeInput)
+	}
+	return r.dedicatedBaseRuntime.CloseDedicatedBaseOwner(graphID, owner)
+}
+
+func (r *DedicatedBaseRuntime) FinalizeDedicatedBaseOwner(graphID string, owner store_sqlite.DedicatedBaseOwner, drained <-chan struct{}) error {
+	if r == nil || r.dedicatedBaseRuntime == nil {
+		return fmt.Errorf("%w: finalization requires an installed runtime", errDedicatedBaseRuntimeInput)
+	}
+	return r.dedicatedBaseRuntime.FinalizeDedicatedBaseOwner(graphID, owner, drained)
 }
 
 // NewDedicatedBaseRuntime builds that one runtime. Both inputs are mandatory

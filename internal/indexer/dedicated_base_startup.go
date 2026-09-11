@@ -1,0 +1,630 @@
+package indexer
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+)
+
+// The initial committed publication path.
+//
+// Everything below drives the publication runtime that W4.1 installed. The
+// runtime owns the authority, the per-graph observation gate and the drain;
+// this file is the only production caller that asks it to publish, and it asks
+// exactly once per dedicated repository per daemon start.
+//
+// Publication is NOT activation. Adopting a committed base moves
+// `dedicated_graphs.active_generation_id` so DEPENDENT checkouts can key their
+// commit layers on an immutable lower snapshot; the owning repository's own
+// request route stays on legacy generation 0 (the W4.5 limitation). Nothing
+// here relabels generation 0, and nothing here routes a request.
+
+var errInitialBasePublisherInput = errors.New("indexer: invalid initial dedicated base publisher")
+
+// initialDedicatedBaseAuthorityDomain versions the deterministic authority
+// token the startup publisher claims with.
+//
+// The token is deterministic ON PURPOSE. Catalog.AcquireDedicatedBaseAuthority
+// treats a repeated token as a lost-response retry and returns the stored
+// authority with ZERO writes; any other token rotates the epoch, which clears
+// the attempt record and forces the next claim to re-bind (a catalog write) or
+// re-allocate. A warm restart over an unchanged committed tree must perform no
+// catalog DML at all, so the token has to be a function of the identity that
+// survives the restart rather than of the process that claims it.
+//
+// The owner incarnation is part of the pre-image, so a retracked checkout — a
+// new incarnation for the same path — claims a different token and does rotate.
+// The catalog fences owner identity independently (dedicatedBaseOwnerTx joins
+// dedicated_graphs to checkouts on the exact incarnation), so a stable token
+// never widens who may publish.
+const initialDedicatedBaseAuthorityDomain = "gortex.dedicated-base.startup-authority.v1"
+
+// InitialBasePublication is one repository's publication outcome.
+//
+// It is a value rather than a log line because the startup publisher runs off
+// the readiness path: by the time a human or a test asks what happened, the
+// work is over. Skipped names a repository nothing was attempted for and why;
+// Err names one that was attempted and failed. A failure is recoverable — the
+// catalog's failed-claim recovery re-enters the same attempt on the next start
+// — so it is reported, never fatal to startup.
+type InitialBasePublication struct {
+	GraphID        string
+	RepoPrefix     string
+	CheckoutID     string
+	GenerationID   int64
+	AlreadyAdopted bool
+	Coalesced      bool
+	// Advanced is true when the committed tree had moved while this process
+	// was not running, so publication took the advancement path rather than
+	// the initial full-root path.
+	Advanced bool
+	Skipped  string
+	Err      error
+}
+
+// InitialBasePublisher publishes the initial committed base for the dedicated
+// repositories a daemon start brings up.
+//
+// Three properties decide its shape.
+//
+//   - It must not block readiness, for ANY number of repositories. A committed
+//     base is a full index of a committed tree; doing that inline in the warmup
+//     dispatch would double cold-start cost before the graph is queryable. So
+//     the readiness path only ever appends to an UNBOUNDED pending list
+//     (Schedule), and the queue is not drained at all until the daemon has
+//     flipped ready (BeginDraining). A bounded queue would reintroduce the very
+//     coupling this avoids: once it filled, the warmup worker calling Schedule
+//     would park behind whole-repository publications.
+//   - It must be bounded at shutdown. The lifecycle's Close joins the
+//     publisher drain (checkout_lifecycle.go, `<-publishersDrained`) and an
+//     admitted publication counts as an admitted actor for its whole length,
+//     physical build included. The publisher therefore registers its
+//     cancellation with the runtime, which cancels it the moment admission
+//     closes — the first thing Close does.
+//   - It must publish through the SHARED lease domain. A private
+//     graphview.LeaseManager leaves an advanced generation invisible to the
+//     retirement sweep the request readers agree on, and ensureObserved's
+//     nil-lease branch degrades a claimed delta to a refusal. The constructor
+//     refuses to build a publisher whose runtime does not carry the
+//     lifecycle's own manager.
+type InitialBasePublisher struct {
+	lifecycle *CheckoutLifecycle
+	runtime   *DedicatedBaseRuntime
+	logger    *zap.Logger
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	// release detaches this publisher's cancellation from the runtime.
+	//
+	// It is reached from Close, which is the stop for a caller that owns one
+	// publisher's lifetime while the runtime outlives it: a test that builds a
+	// publisher per fixture, and any future per-request publisher. The daemon
+	// does NOT call Close — its shutdown closes publisher admission on the
+	// runtime instead, and CloseDedicatedBaseAdmission cancels every
+	// registered driver and drops the whole registry in one act. Both routes
+	// end with this publisher's context cancelled and no entry left behind.
+	release func()
+
+	mu        sync.Mutex
+	scheduled map[string]struct{}
+	// pending is the FIFO of prefixes that have been scheduled and not yet
+	// attempted. It is a slice, not a channel: the enqueue side runs on the
+	// readiness path and must never wait for the drain side, whatever the
+	// repository count.
+	pending []string
+	// queued counts every prefix accepted into pending; attempted counts every
+	// one the worker has finished with (published, skipped or failed). Wait
+	// blocks while attempted < queued. PublishRepo touches neither, which is
+	// what keeps the accounting exact: it is a synchronous call whose result
+	// the caller already has, not scheduled work.
+	queued    int
+	attempted int
+	outcomes  []InitialBasePublication
+	closed    bool
+	// changed is closed and replaced on every queued/attempted movement, so
+	// Wait parks on a channel instead of polling.
+	changed chan struct{}
+
+	// wake nudges the worker when pending grows. Capacity 1: it is an edge
+	// signal, not a queue.
+	wake   chan struct{}
+	worker sync.Once
+	done   chan struct{}
+}
+
+// NewInitialBasePublisher binds a publisher to the lifecycle's installed
+// runtime. It publishes nothing; Schedule and PublishRepo do.
+//
+// Every input is mandatory and none is defaulted: without the installed
+// runtime there is no authority to publish under, and a substituted lease
+// manager is a silent downgrade rather than an error at the point of use.
+func NewInitialBasePublisher(lifecycle *CheckoutLifecycle) (*InitialBasePublisher, error) {
+	if lifecycle == nil || lifecycle.store == nil || lifecycle.catalog == nil || lifecycle.mi == nil {
+		return nil, fmt.Errorf("%w: publication requires a lifecycle over a store", errInitialBasePublisherInput)
+	}
+	runtime, ok := lifecycle.DedicatedBasePublisherRuntime().(*DedicatedBaseRuntime)
+	if !ok || runtime == nil || runtime.dedicatedBaseRuntime == nil {
+		return nil, fmt.Errorf("%w: no dedicated base publisher runtime is installed", errInitialBasePublisherInput)
+	}
+	leases := runtime.ViewLeases()
+	if leases == nil || leases != lifecycle.ViewLeases() {
+		// The runtime's own doc says the field exists so advancement triggers
+		// cannot invent a private manager. This is the check that makes that
+		// true: a publisher over a private domain would advance generations
+		// that the retirement sweep cannot see are in use.
+		return nil, fmt.Errorf("%w: publication requires the lifecycle's shared view leases", errInitialBasePublisherInput)
+	}
+	logger := lifecycle.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	p := &InitialBasePublisher{
+		lifecycle: lifecycle,
+		runtime:   runtime,
+		logger:    logger,
+		scheduled: map[string]struct{}{},
+		changed:   make(chan struct{}),
+		wake:      make(chan struct{}, 1),
+		done:      make(chan struct{}),
+	}
+	p.ctx, p.cancel, p.release = runtime.publicationContext(context.Background())
+	return p, nil
+}
+
+// Schedule asks for one repository's initial committed base.
+//
+// It NEVER publishes and NEVER blocks: it appends to an unbounded pending list
+// under a mutex held for the append alone, and returns. That is load-bearing
+// rather than incidental — every call site is a warmup worker upstream of the
+// readiness flip, so any wait here is a wait for the daemon to become
+// queryable. Nothing is drained until BeginDraining.
+//
+// Repeated calls for the same prefix are one publication: the catalog
+// coalesces a concurrent attempt anyway, but a queue that re-enqueues would
+// make an idle restart re-observe every repository on every warmup signal.
+func (p *InitialBasePublisher) Schedule(repoPrefix string) {
+	if p == nil || repoPrefix == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		// Stopped, whether by Close or by the runtime cancelling this driver
+		// when publisher admission closed. Both are "no more publications".
+		p.mu.Unlock()
+		return
+	}
+	if _, dup := p.scheduled[repoPrefix]; dup {
+		p.mu.Unlock()
+		return
+	}
+	p.scheduled[repoPrefix] = struct{}{}
+	p.pending = append(p.pending, repoPrefix)
+	p.queued++
+	p.notifyLocked()
+	p.mu.Unlock()
+	p.nudge()
+}
+
+// BeginDraining releases the queue. Publication starts here and nowhere
+// earlier.
+//
+// The daemon calls this immediately after the readiness flip, so the ordering
+// "ready, then publish" is a property of the code rather than a race the
+// scheduler usually wins: no committed-tree index can be in front of
+// markReady, however many repositories warmup brought up and however slow each
+// publication is. It is idempotent, and a call after Close is a no-op.
+func (p *InitialBasePublisher) BeginDraining() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	stopped := p.closed || p.ctx.Err() != nil
+	p.mu.Unlock()
+	if stopped {
+		return
+	}
+	p.worker.Do(func() { go p.run() })
+	p.nudge()
+}
+
+// nudge is the edge signal to the worker; a full buffer already means "there
+// is work", so dropping the second signal loses nothing.
+func (p *InitialBasePublisher) nudge() {
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+// run drains the pending list one repository at a time.
+//
+// Serial on purpose: each item is a full index of a committed tree, and a
+// workspace with twenty repositories would otherwise fork twenty of them
+// against the same store while the post-ready enrichment pool is running.
+func (p *InitialBasePublisher) run() {
+	defer close(p.done)
+	for {
+		p.mu.Lock()
+		if len(p.pending) == 0 {
+			p.mu.Unlock()
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-p.wake:
+				continue
+			}
+		}
+		prefix := p.pending[0]
+		p.pending = p.pending[1:]
+		p.mu.Unlock()
+		if p.ctx.Err() != nil {
+			// Cancelled between dequeue and publish. Record the skip so the
+			// accounting Wait reads stays exact for this item, then stop:
+			// whatever is still pending is abandoned, and Wait reports the
+			// cancellation rather than completion.
+			p.record(InitialBasePublication{RepoPrefix: prefix, Skipped: "publisher stopped"})
+			return
+		}
+		p.record(p.publish(p.ctx, prefix))
+	}
+}
+
+func (p *InitialBasePublisher) record(outcome InitialBasePublication) {
+	p.mu.Lock()
+	p.outcomes = append(p.outcomes, outcome)
+	p.attempted++
+	p.notifyLocked()
+	p.mu.Unlock()
+	switch {
+	case outcome.Err != nil:
+		// Recoverable by construction: a failed claim is re-entered by the
+		// next start's ClaimDedicatedBaseBuild, which verifies and replaces a
+		// failed payload rather than allocating beside it.
+		p.logger.Warn("daemon: initial committed base publication failed; the dedicated base stays where it was",
+			zap.String("repo", outcome.RepoPrefix), zap.String("graph", outcome.GraphID), zap.Error(outcome.Err))
+	case outcome.Skipped != "":
+		p.logger.Debug("daemon: initial committed base publication skipped",
+			zap.String("repo", outcome.RepoPrefix), zap.String("reason", outcome.Skipped))
+	default:
+		p.logger.Info("daemon: committed base published",
+			zap.String("repo", outcome.RepoPrefix), zap.String("graph", outcome.GraphID),
+			zap.Int64("generation", outcome.GenerationID),
+			zap.Bool("already_adopted", outcome.AlreadyAdopted),
+			zap.Bool("advanced", outcome.Advanced))
+	}
+}
+
+// notifyLocked publishes a queued/attempted movement to every parked Wait.
+// The caller holds p.mu.
+func (p *InitialBasePublisher) notifyLocked() {
+	close(p.changed)
+	p.changed = make(chan struct{})
+}
+
+// Pending reports how many scheduled publications have not been attempted yet
+// — the queue depth behind the readiness flip.
+func (p *InitialBasePublisher) Pending() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.queued - p.attempted
+}
+
+// Outcomes reports what the publisher has done so far, newest last.
+func (p *InitialBasePublisher) Outcomes() []InitialBasePublication {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]InitialBasePublication, len(p.outcomes))
+	copy(out, p.outcomes)
+	return out
+}
+
+// Wait blocks until every SCHEDULED publication has been attempted. It is the
+// join a test and an orderly shutdown use; nothing on the readiness path calls
+// it.
+//
+// Two things bound it. It parks on the movement channel rather than polling,
+// so it costs nothing while a publication runs; and it returns the
+// publisher's own context error the moment the driver is cancelled, because
+// the abandoned tail of the pending list will never be attempted. A caller
+// that never calls BeginDraining therefore waits for its own ctx, which is the
+// honest answer: nothing is draining.
+func (p *InitialBasePublisher) Wait(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		p.mu.Lock()
+		settled := p.attempted >= p.queued
+		changed := p.changed
+		p.mu.Unlock()
+		if settled {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+// Close stops admitting publications and cancels the one in flight.
+//
+// It is for a caller that owns one publisher's lifetime while the runtime
+// outlives it. The daemon does not call it: its shutdown closes publisher
+// admission on the runtime, which cancels this driver's context and drops its
+// registration wholesale, and the runtime's own drain is what shutdown joins.
+// After either route Schedule is a no-op and Wait reports the cancellation.
+func (p *InitialBasePublisher) Close() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	p.mu.Unlock()
+	p.cancel()
+	if p.release != nil {
+		p.release()
+	}
+}
+
+// PublishRepo publishes (or re-adopts) one repository's committed base
+// synchronously. Schedule is the production entry point; this is the same work
+// without the queue, so a caller that genuinely wants to wait — a test, a
+// one-shot server — does not have to poll.
+//
+// It deliberately does not touch the queue accounting: the outcome is returned
+// to the caller, so recording it would inflate Outcomes and, worse, make
+// attempted exceed queued for work Wait never promised. Outcomes and Pending
+// describe scheduled work only.
+func (p *InitialBasePublisher) PublishRepo(ctx context.Context, repoPrefix string) InitialBasePublication {
+	if p == nil {
+		return InitialBasePublication{RepoPrefix: repoPrefix, Skipped: "no publisher"}
+	}
+	if ctx == nil {
+		ctx = p.ctx
+	}
+	return p.publish(ctx, repoPrefix)
+}
+
+// publish is the whole protocol for one repository.
+func (p *InitialBasePublisher) publish(ctx context.Context, repoPrefix string) InitialBasePublication {
+	out := InitialBasePublication{RepoPrefix: repoPrefix}
+	if err := ctx.Err(); err != nil {
+		out.Skipped = "publisher stopped"
+		return out
+	}
+	l := p.lifecycle
+	graphID := GraphIDFor(repoPrefix)
+	out.GraphID = graphID
+	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		out.Err = err
+		return out
+	}
+	if !found || graph.State != store_sqlite.DedicatedGraphReady {
+		out.Skipped = "no ready dedicated graph"
+		return out
+	}
+	checkout, found, err := l.catalog.GetCheckout(ctx, graph.OwnerCheckoutID)
+	if err != nil {
+		out.Err = err
+		return out
+	}
+	if !found || checkout.Incarnation == "" {
+		out.Skipped = "no owner checkout"
+		return out
+	}
+	out.CheckoutID = checkout.CheckoutID
+	if checkout.HeadTree == "" {
+		// Nothing committed to publish. A family whose reconcile has not yet
+		// named a HEAD tree is not an error; the next start, or W4.3's
+		// advancement trigger, publishes it.
+		out.Skipped = "owner has no committed tree"
+		return out
+	}
+	owner := store_sqlite.DedicatedBaseOwner{CheckoutID: checkout.CheckoutID, Incarnation: checkout.Incarnation}
+
+	authority := store_sqlite.AcquireDedicatedBaseAuthorityRequest{
+		GraphID: graphID, Owner: owner, Token: initialDedicatedBaseAuthorityToken(graphID, owner),
+	}
+	// Read the stored authority so a token that does NOT match can still
+	// rotate. When it does match, AcquireDedicatedBaseAuthority returns before
+	// it looks at these, which is the zero-write warm-restart path.
+	if publication, found, err := l.catalog.DedicatedBasePublication(ctx, graphID); err != nil {
+		out.Err = err
+		return out
+	} else if found {
+		authority.ExpectedEpoch = publication.Desire.Authority.Epoch
+		authority.ExpectedToken = publication.Desire.Authority.Token
+	}
+	publisher, err := p.runtime.install(ctx, authority)
+	if err != nil {
+		out.Err = err
+		return out
+	}
+
+	observe := func(ctx context.Context) (dedicatedBaseObservation, error) {
+		return p.observe(ctx, graphID, repoPrefix)
+	}
+	var result dedicatedBaseResult
+	if graph.ActiveGenerationID == 0 {
+		// Cold: nothing is published for this graph, so the first committed
+		// generation is a self-contained full root. ensureInitial withholds
+		// the lease manager, which is what refuses a claimed delta on a path
+		// that has no lower snapshot to compose over.
+		result, err = publisher.ensureInitial(ctx, observe)
+	}
+	if graph.ActiveGenerationID != 0 || errors.Is(err, errDedicatedBaseAdvanceRequired) {
+		// Warm: a base is already published. If the committed tree, the
+		// configuration or the dependency revision moved while this process
+		// was not running, nothing else will notice — the Git watcher only
+		// sees HEAD changes it observes live — so startup is the advancement
+		// trigger for that window. An unchanged identity takes the catalog's
+		// adopted-replay path and writes nothing.
+		//
+		// The advance-required fallback covers the narrow window where the
+		// pointer moved between the read above and the observation gate:
+		// ensureInitial leaves desire and the active pointer untouched when it
+		// refuses, so re-entering through ensureCurrent is safe rather than a
+		// second publication attempt.
+		out.Advanced = true
+		result, err = publisher.ensureCurrent(ctx, p.runtime.ViewLeases(), observe)
+	}
+	out.GenerationID = result.Adoption.GenerationID
+	out.AlreadyAdopted = result.Adoption.AlreadyAdopted
+	out.Coalesced = result.Report.Coalesced
+	switch {
+	case err == nil:
+	case errors.Is(err, context.Canceled), errors.Is(err, errDedicatedBaseRuntimeClosed):
+		// Shutdown cancelled the publication. The attempt record survives and
+		// the next start recovers it; this is not a failure to report.
+		out.Skipped = "publisher stopped"
+	default:
+		out.Err = err
+	}
+	if out.AlreadyAdopted {
+		// A replay is not an advancement, whichever entry point reached it.
+		out.Advanced = false
+	}
+	return out
+}
+
+// observe assembles one fresh observation inside the runtime's per-graph gate.
+//
+// Everything the identity names is read HERE rather than carried in from the
+// caller: the active-generation pointer the claim is fenced against, the
+// committed tree, the frozen configuration digest and the dependency-revision
+// cohort. That is what makes the observation stable — the runtime holds the
+// graph's observation gate across this call and compares the pointer it
+// returns against the catalog inside the same gate.
+func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix string) (dedicatedBaseObservation, error) {
+	l := p.lifecycle
+	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		return dedicatedBaseObservation{}, err
+	}
+	if !found {
+		return dedicatedBaseObservation{}, fmt.Errorf("%w: dedicated graph %s vanished", store_sqlite.ErrCatalogStaleGuard, graphID)
+	}
+	checkout, found, err := l.catalog.GetCheckout(ctx, graph.OwnerCheckoutID)
+	if err != nil {
+		return dedicatedBaseObservation{}, err
+	}
+	if !found || checkout.HeadTree == "" {
+		return dedicatedBaseObservation{}, fmt.Errorf("%w: dedicated owner %s has no committed tree",
+			store_sqlite.ErrCatalogStaleGuard, graph.OwnerCheckoutID)
+	}
+	idx := l.mi.GetIndexer(repoPrefix)
+	if idx == nil {
+		return dedicatedBaseObservation{}, fmt.Errorf("%w: repository %s is not indexed", errInitialBasePublisherInput, repoPrefix)
+	}
+	repoCfg := config.Default()
+	if l.cfgMgr != nil {
+		repoCfg = l.cfgMgr.GetRepoConfig(repoPrefix)
+	}
+	// GetRepoConfig hands back a SHALLOW result. snapshotDedicatedBaseConfig
+	// deep-clones it and re-owns the synthesizer slice, so what the builder
+	// indexes under cannot change while it indexes, and the digest it returns
+	// is the same one the coordinator derives for its layers.
+	frozen, fingerprint, err := snapshotDedicatedBaseConfig(
+		repoCfg.Index, repoPrefix, idx.WorkspaceID(), idx.ProjectID())
+	if err != nil {
+		return dedicatedBaseObservation{}, fmt.Errorf("freeze the index configuration for %s: %w", repoPrefix, err)
+	}
+	sections := dedicatedBaseConfigSections(repoCfg)
+	builder := &SparseGenerationBuilder{
+		Store:      l.store,
+		Registry:   l.mi.registry,
+		Config:     frozen,
+		Logger:     l.logger,
+		Admissions: idx,
+		Embedder:   l.mi.embedder,
+		Semantic:   l.mi.semanticMgr,
+	}
+	cohort := dependencyCohortSource{
+		Target: DependencyRevisionTarget{
+			RepoPrefix: repoPrefix, WorkspaceID: idx.WorkspaceID(), ProjectID: idx.ProjectID(),
+		},
+		Leases:           l.leases,
+		Catalog:          l.catalog,
+		WorkspaceMembers: builderWorkspaceMembers(builder, idx.WorkspaceID()),
+		Config:           frozen,
+		ConfigSections:   sections,
+		Ownership: []DependencyRevisionOwnership{{
+			RepoPrefix: repoPrefix, Language: "go", Owner: goPackageOwnershipTargetEvidence,
+		}},
+		Producers:         cohortProducerPolicy(frozen, l.mi.embedder != nil),
+		Capabilities:      cohortCapabilityVocabulary(),
+		ExtractorVersions: extractorVersionsFingerprint(),
+		SourceBudget:      dependencyRevisionSourceBudget,
+	}
+	// The revision is never empty. An empty revision is the legacy value the
+	// reuse guards read as "matches anything"; a cohort that could not be
+	// described says so in a degraded revision instead, which fails closed
+	// (nothing reuses it) without blocking publication.
+	revision, revErr := cohort.revision(ctx)
+	if revErr != nil {
+		reason := dependencyCohortRefusalReason(revErr)
+		revision = cohort.degradedRevision(reason)
+		p.logger.Warn("daemon: the resolver-visible input cohort could not be described for the committed base; "+
+			"it carries a degraded revision",
+			zap.String("repo", repoPrefix), zap.String("reason", reason), zap.Error(revErr))
+	}
+	now := time.Now
+	if l.now != nil {
+		now = l.now
+	}
+	return dedicatedBaseObservation{
+		Identity: store_sqlite.DedicatedBaseIdentity{
+			TreeOID:            checkout.HeadTree,
+			ConfigHash:         checkoutConfigHash(fingerprint, sections),
+			ExtractorVersions:  extractorVersionsFingerprint(),
+			ResolverVersion:    resolverVersionFingerprint(),
+			DependencyRevision: revision,
+		},
+		ExpectedActiveGenerationID: graph.ActiveGenerationID,
+		RootPath:                   checkout.RootPath,
+		WorkspaceID:                idx.WorkspaceID(),
+		ProjectID:                  idx.ProjectID(),
+		ProvenanceCommitOID:        checkout.HeadCommit,
+		CreatedAt:                  now().Unix(),
+		Builder:                    *builder,
+	}, nil
+}
+
+// initialDedicatedBaseAuthorityToken derives the deterministic authority token
+// described on initialDedicatedBaseAuthorityDomain.
+func initialDedicatedBaseAuthorityToken(graphID string, owner store_sqlite.DedicatedBaseOwner) string {
+	var e dependencyRevisionEncoder
+	e.field("domain", initialDedicatedBaseAuthorityDomain)
+	e.field("graph", graphID)
+	e.field("checkout", owner.CheckoutID)
+	e.field("incarnation", owner.Incarnation)
+	sum := sha256.Sum256([]byte(e.b.String()))
+	return initialDedicatedBaseAuthorityDomain + ":" + hex.EncodeToString(sum[:16])
+}
