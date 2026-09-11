@@ -40,6 +40,7 @@ not reachable from a default startup, watcher, or Git callback path is `implemen
 | Dirty-manifest sha256 (harness-computed, W1 suite) | `b341db31419ea47e9428a4639cde16ed9b4b3f6bd5db761dfe74d4dfdef4d73b` — identical on every compile and every run of the W1 exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave 1 exit suite) | `b9e80af941b8f56cee5158f0bda45efae458b07085d746cb2144ccde17889017` — identical on all 9 compiles and all 14 runs of the wave 1 exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave 2 exit suite) | `143bc0deec77cde06d78a4db5c56bd4458f171e8ecca88bbf451c47ea81e152a` over HEAD `10a8bd638445c2091dfa55476c9a9cedc78895a3` — identical on all 10 compiles and all 15 runs of the wave 2 exit suite; no source drift during the suite |
+| Dirty-manifest sha256 (harness-computed, wave 3 exit suite) | `248ff1164c48c66b0637b3280293b14d1f9cb0da4a0215defe6984739507bbb9` over HEAD `43d2506a0e744fb3177241f0d6bc9ea0f86c2c1e` — identical on all 14 compiles and all 19 runs of the wave 3 exit suite; no source drift during the suite |
 | Recovery branch (do NOT reapply) | `backup/incremental-before-main-20260910-1310` = `a2ccbe07` |
 | Recovery stash (do NOT reapply) | `6e9db642` |
 | Live daemon | `v0.64.1-36-ga2ccbe07-dirty`, pid 18828 — a **pre-rebase** binary. Must not be restarted, re-tracked, or reconfigured. |
@@ -437,9 +438,11 @@ Shared fields for all W1 sub-items unless overridden:
 - Limitations: schema 23 propagates dependency-revision **metadata only**; it computes no digest
   and certifies no legacy output. W2.1c and W2.4 each invalidate every cached generation once on
   first deploy (D8).
-- Next action: W2.4. W2.1a and W2.1b landed in wave 1; W2.1c and W2.1d landed in wave 2 and are
-  recorded below. With W2.1c the identity binding is live: every production `DependencyRevision`
-  is now non-empty, so W2.1b's and W2.1d's comparisons stop being `"" != ""`.
+- Next action: none in W2's MVI set. W2.1a and W2.1b landed in wave 1; W2.1c and W2.1d landed in
+  wave 2; W2.4 landed in wave 3 and is recorded below. With W2.1c the identity binding is live:
+  every production `DependencyRevision` is now non-empty, so W2.1b's and W2.1d's comparisons stop
+  being `"" != ""`; with W2.4 the `ResolverVersion` component of that identity stops being the
+  literal `"1"`. W2.2 is absorbed into W2.1c; W2.5 and W2.6 are out of scope (D10).
 
 ### W2.1a — Dependency-revision cohort digest producer
 
@@ -731,6 +734,68 @@ Shared fields for all W1 sub-items unless overridden:
 - Verifier verdict: **PASS** (no blocker), 3 minor findings, all disclosure/accuracy, none in the
   shipped code. The export reproduced the item's counts exactly, including 0 `DATA RACE`.
 
+### W2.4 — A real `ResolverVersion`; scope, cache and de-poison the dependency cohort
+
+- State: `wired`. The verifier's wiring check is explicit ("implemented / compiled / tested /
+  WIRED") with one half declared unreached; 19 mutants — 17 RED, 1 discarded as a no-op, 1 real
+  survivor (see the verdict).
+- Agent: wave 3, Lane I (repair round after a first failed verification).
+- Scope/files: `internal/resolver/version.go` (new, 88), `internal/resolver/version_test.go`
+  (new, 118), `internal/indexer/checkout_coordinator.go` (674 changed lines),
+  `internal/indexer/dependency_revision.go` (+513), `internal/indexer/ref_views.go` (+216),
+  `internal/indexer/dependency_cohort_scope_test.go` (new, 1026),
+  `internal/indexer/checkout_identity_revision_test.go` (+66),
+  `internal/indexer/dependency_revision_test.go` (+109), `internal/indexer/ref_views_test.go`
+  (+214). `internal/indexer/checkout_coordinator_test.go` is in the ownership list and untouched.
+- Invariant: a dependency revision must name the **complete** frozen inputs, and the cohort that
+  produces it must be bounded by the workspace, never by the daemon. An out-of-scope repository can
+  neither be read nor poison the revision; an incomplete cohort fails closed with a stable,
+  content-derived degraded value rather than an empty one.
+- Change: (1) `internal/resolver` carries an explicit, golden-pinned `ResolutionSemanticsVersion`,
+  replacing the literal `"1"`; (2) both `describe` loops honour the `sourceIdentities` scope filter
+  (`dependency_revision.go:954`, `:982`); (3) the deferral budget is per-TRANSIENT, with the reset
+  on every successful description (`checkout_coordinator.go:2145-2153`); (4) the cohort cache gains
+  a **production** staleness source — a workspace topology token that takes no lease and no catalog
+  read (`dependency_revision.go:854-878`), consulted by the poll (`checkout_coordinator.go:2106-2113`)
+  and recorded under the same lock as the revision (`:2131`, `:2142`); (5) `ref_views.go` derives
+  its configuration sections when the caller passes none, so the widened configuration digest
+  reaches the production manager shape instead of collapsing (`checkout_coordinator.go:2428-2434`);
+  (6) the dead test-seam wrapper and the package-level mutable global are gone.
+- Acceptance gate(s): G6, G3, G1.
+- Harness evidence (wave 3 exit suite): `internal/indexer` six normal chunks
+  (`results/indexer-normal-_Test_A_C_-w3suite-1` … `_Test_U_Z_-w3suite-1`, 2684 / 0 / 2) and the
+  indexer race lane (`results/indexer-race-DependencyRevision_Cohort_ResolverVersion_Identi-w3suite-1`,
+  294 / 0 / 0, 0 `DATA RACE`); `internal/resolver` whole package
+  (`results/internal_resolver-normal-_-w3suite-1`, 1282 / 0 / 2).
+- Commit: `9ac5afec7a7e67dc6df245bdd8e792a09a68332f` — *indexer: scope, cache and de-poison the
+  dependency cohort revision* (9 files, 3 new).
+- Limitations: **L1** — `CheckoutCoordinator.InvalidateDependencyCohort` and
+  `RefViewManager.InvalidateDependencyCohort` remain test-and-future-only; their natural callers
+  live in `checkout_lifecycle.go` and the reconcile watcher, neither owned here. The *membership*
+  class of staleness is covered by the topology token; the *bytes* class is L2. **L2** — a
+  sibling's tree moving does not un-settle a poll; sound only while a sparse build leaves the
+  MultiIndexer link unset and declares `CapResolutionCrossRepo` incomplete. **L3** — production ref
+  views still carry a degraded revision (`cohort-degraded:cohort-incomplete:<digest>`) because
+  `ref_view_service.go:107-124` passes no `Leases`; stable and content-derived, but not a
+  certificate. The one-line fix is in an unowned file; `NewRefViewManager` now Warn-logs once.
+  **L4** — the cohort keeps every workspace sibling, so a sibling's commit re-keys this checkout's
+  layers. **L5** — `ResolutionSemanticsVersion` is hand-maintained. **L6** — the degraded revision
+  cannot see the roster it failed to enumerate.
+- Deviations: D1 — the fail-closed refusal lives in `NewCheckoutCoordinator`, not `buildCoordinator`
+  (`checkout_lifecycle.go` is unowned). D2 — `cohortProducerPolicy` and `declareProducers` are
+  pinned against each other by a test reading a real build's stored producer rows rather than
+  merged. D3 — the cache's staleness source is a self-observed topology token rather than a call
+  from the lifecycle, for the same ownership reason; strictly cheaper than what it replaces. D4 —
+  `ref_views.go` derives the configuration sections rather than the service passing them; an
+  explicitly passed list still wins.
+- Verifier verdict: **PASS** — no blocker, 3 majors (all latent / unpinned, none a live
+  regression), 7 minors. The one surviving mutant is the major MAJ-3: `scope()` still declares
+  `workspace:<ws>` when the target is not in its own workspace map, and no test binds that arm;
+  latent, not a live regression, and carried as an open obligation for whoever widens the scope
+  vocabulary. The adversarial probes were run as overlay-added test files and never written into
+  the worktree. This is D8's second one-time invalidation: every cached generation is invalidated
+  once on first contact with this binary.
+
 ## W3 — Bind all writers and producers
 
 - State: `proposed`. Dependencies: W2. Items: W3.1–W3.7, all in MVI.
@@ -742,69 +807,62 @@ Shared fields for all W1 sub-items unless overridden:
   (out of scope, D10). Migration number allocation is single-owner: W3.3 takes **v25** (branch is
   at v24, `schema_version.go:37`) — two lanes each claiming v25 is the known salt-collision class.
 - Next action: the authority (W3.1) in wave 4. W3.5 landed in wave 1 and is recorded below. W3.4
-  is `blocked with evidence` after wave 2 — its source is on disk and green, but it is **not
-  committed**; see its row.
+  was `blocked with evidence` after wave 2 (an evidentiary blocker, not a defect); it was
+  re-dispatched in wave 3, completed its fourth channel, passed verification and is now committed.
 
 ### W3.4 — Route the committed build's disk readers through the installed source
 
-- State: `blocked with evidence`. Source is implemented, compiles, and its tests pass inside this
-  wave's exit suite, but the item's **final verifier verdict is `fail`** and the wave's commit rule
-  is "commit only on a passing verdict", so **nothing of W3.4 was committed**. Its seven files stay
-  dirty in the worktree at the end of wave 2.
-- Blocking evidence: `scratchpad/reports/W2-W3.4-verify.md` §0 and finding 1 — *"Verification could
-  not execute: 1.1 GiB free on `/` (< 3 GiB). No compile, no test, no mutation re-run."* The
-  verifier's static review found **no code blocker** and traced the production wiring by hand
-  (`BuildCommitLayer → runPass → New → setContentSourceWithManifests → IndexCtx →
-  populateCppIncludeDirs → manifestTree`), but the implementer's six revert-red mutants M1–M6 and
-  its own suite counts remain **unconfirmed by an independent run**. The blocker is evidentiary,
-  not a defect.
-- Agent: wave 2, Lane I (repair round after a first failed verification).
-- Scope/files (all uncommitted): `internal/indexer/contract_import_resolve.go`,
-  `internal/indexer/cpp_compile_db.go`, `internal/indexer/npm_alias_resolve.go`,
-  `internal/indexer/indexer.go`, `internal/indexer/builder_generation.go`,
-  `internal/indexer/cpp_compile_db_test.go`,
-  `internal/indexer/committed_build_side_channels_test.go` (new, 734 lines, 18 tests).
+- State: `wired`. The verifier's wiring check is explicit ("implemented / compiled / tested /
+  **wired**") with a production-entrypoint trace; 15 mutations, 15 bind. This supersedes the wave 2
+  `blocked with evidence` state: the blocker there was evidentiary (1.1 GiB free on `/`, so the
+  verification slot could not compile, test or re-run a single mutant), and the wave 3 slot both
+  re-ran it and reviewed the fourth channel this round closed.
+- Agent: wave 2 Lane I (rounds 1–2), wave 3 Lane I (round 3, the repair that closes channel four).
+- Scope/files: `internal/parser/tsalias/tsalias.go` (+231), `internal/parser/tsalias/tsalias_test.go`
+  (+115), `internal/indexer/contract_import_resolve.go` (+450),
+  `internal/indexer/cpp_compile_db.go` (+158), `internal/indexer/npm_alias_resolve.go` (+119),
+  `internal/indexer/indexer.go` (+135), `internal/indexer/path_alias_resolve.go` (+15),
+  `internal/indexer/builder_generation.go` (+36), `internal/indexer/cpp_compile_db_test.go` (+26),
+  `internal/indexer/committed_build_side_channels_test.go` (new, 1242).
 - Invariant: **no committed build reads current dirty files through a side channel.** A build over
-  a frozen target tree must read its manifests, its compile database and its include roots from
-  the installed `ContentSource`, and a reader it cannot route must be *declared*, not silently left
-  on disk.
+  a frozen target tree reads its manifests, its compile database, its include roots and its
+  TS/JS path aliases from the installed `ContentSource`; a reader that cannot be routed must be
+  *declared*, not silently left on disk.
 - Change: a `manifestTree` abstraction with a disk implementation (byte-identical probes to the
   ones it replaces) and a source implementation that **never falls back to disk** — an absent
-  source answers nothing. The compile database, the include-root heuristic (both probes preserved:
-  `topLevelDirs` membership for a conventional root, `isDir` only on the unsourced path) and the
-  npm / workspace manifest readers are routed through it; `populateCppIncludeDirs` additionally
-  short-circuits to empty when the source is installed and the graph holds no C-family files.
-  `sourceConfigNarrowingReason` is promoted to a package constant and **extended** to name the one
-  channel that stays open.
+  source answers nothing. The compile database, the include-root heuristic and the npm / workspace
+  manifest readers are routed through it; `populateCppIncludeDirs` short-circuits to empty when the
+  source is installed and the graph holds no C-family files. **Round 3**: the tsconfig / jsconfig
+  path-alias channel is routed too — `tsalias` gains a tree-provided collection path, and the
+  process-global root-keyed `tsAliasCache` no longer lets a committed build and a live build at the
+  same root share one checkout-derived collection. Because the channel is now closed, the
+  `sourceConfigNarrowingReason` narrowing that stood in for it is **removed** rather than moved;
+  the reason is back to the two admission readers only.
 - Acceptance gate(s): G3, G2.
-- Harness evidence (wave 2 exit suite, dirty tree): the item's tests ran green inside the same six
-  `internal/indexer` normal chunks and the same indexer race lane recorded for W2.1c — 2629 / 0 / 2
-  normal, 261 / 0 / 0 race, 0 `DATA RACE`. This is suite evidence on the wave's dirty tree, **not**
-  the independent re-run and mutation re-verification the failed verdict asks for.
-- Limitations: **the item's title overstates what landed — three of four channels are closed.** The
-  tsconfig / jsconfig path-alias channel is still open on the committed-build path:
-  `path_alias_resolve.go:19` → `tsalias.Load(rootPath)` walks the checkout, and neither that file
-  nor `internal/parser/tsalias` is in this item's ownership. Refusing the alias scan under a source
-  was rejected because it trades a wrong-tree edge for a **missing** edge. The verifier adds that
-  `tsAliasCache` is process-global, root-keyed and never invalidated, so a committed build and the
-  live index at the same root share one checkout-derived collection (pre-existing). A sourced build
-  also drops a **symlinked** conventional include root, a live/committed asymmetry with no
-  practical consequence (no indexed file lives under it) but undocumented until now.
-- Deviations / open contract questions carried from the verifier: (a) the narrowing is declared on
-  `CapSourceConfig` while the damage — a wrong edge from the unrouted alias scan — lands under
-  `CapResolutionLocal`, declared `Complete` with no reason at all (`builder_generation.go:1033`);
-  (b) `CapSourceConfig` stays `ProducerStateComplete` while carrying a reason that contradicts
-  "the payload is whole"; the enum is cross-package and unowned here, so the flip was rejected as
-  asserting a different untruth. **`source.config` must not be read as trustworthy for TS/JS
-  alias-derived edges.** (c) `TestBuiltGenerationDeclaresTheSourceConfigNarrowing` stays green if
-  the routing is reverted and the constant kept — the reason string is an unenforced claim, so it
-  is not coverage of the routing.
-- Next action: re-dispatch the verification slot now that disk headroom exists (the wave 2 exit
-  stage recovered ~6 GiB); on a passing verdict the item commits as-is. The tsalias follow-up
-  (export a source-reading loader from `internal/parser/tsalias` and route
-  `loadTSAliasCollection` / `resolveTSPathAlias`) is a separate item and is **not** part of W3.4.
-- Verifier verdict: **FAIL — verification blocked, not a code defect.** 1 blocker (evidentiary),
-  1 major, 4 minor.
+- Harness evidence (wave 3 exit suite): the item's tests ran green inside the six `internal/indexer`
+  normal chunks (2684 / 0 / 2) and the indexer race lane (294 / 0 / 0, 0 `DATA RACE`);
+  `internal/parser/tsalias` compiles and vets clean and its own `TestLoad_*` cases still exercise
+  the real `WalkDir`. Wave 2's suite evidence on the dirty tree (2629 / 0 / 2 normal, 261 / 0 / 0
+  race) stands as the earlier datapoint.
+- Commit: `c5be184bc5476fb80a1909fd448f4a24469a5336` — *indexer: close the committed build's disk side channels* (10 files, 1 new).
+- Limitations: **L1** — the C++ gate-1 oracle is not edge-level, because the resolver pass that
+  would consume the include search path is unreachable on the whole-index path. For the includes
+  measured, the compile database and heuristic include dirs are reconstructed on every pass and
+  **read by nobody** — a pre-existing defect, now measured, with a canary test that fails the day
+  it is fixed. It deserves its own item. **L2** — on a snapshot a symlinked conventional include
+  root, a symlinked config and a symlinked manifest are skipped (a source hands back link text, not
+  the file's bytes); the working copy follows them. Deliberate and documented at each probe.
+  **L3** — `tsalias.Load` keeps the working-copy walk, so the live index path is byte-for-byte
+  unchanged. **L4** — `installCppIncludeSearchPath` is a package-level func var, following the
+  existing `readDiskFile` idiom in the same files; swapping it is test-only. **L5** —
+  `MultiIndexer` never carries a content source in production today, so both multi-repo preferences
+  are defensive, each tested in both directions.
+- Deviations: the coordinator's ownership list spells the alias package `internal/tsalias/**`; the
+  real package is `internal/parser/tsalias` and no `internal/tsalias` exists. Treated as the
+  intended path, with the test file owned as a `_test.go` sibling and no existing assertion there
+  changed. The wave 2 open contract questions (a)–(c) are closed by the routing: the narrowing that
+  carried the contradictory reason is gone.
+- Verifier verdict: **PASS** (no blockers); four minor findings, three of them documentation-level.
 
 ### W3.5 — `search_text` capability truth for committed identities (D5)
 
@@ -878,7 +936,56 @@ Shared fields for all W1 sub-items unless overridden:
   reintroducing both lock paths would deadlock. W4.3's audit must also cover `watcher.go:1459` and
   `incremental_watcher_batch.go:349`, two further `IncrementalReindexPaths` entrypoints into the
   legacy generation-0 writer.
-- Next action: W4.2 in wave 4, W4.3 in wave 5.
+- Next action: W4.2 in wave 4, W4.3 in wave 5. W4.1 landed in wave 3 and is recorded below.
+
+### W4.1 — Install the dedicated-base runtime before any owner registration (D1)
+
+- State: `wired`. The verifier's wiring check is explicit ("implemented / compiled / tested /
+  **WIRED**"); 9 mutations, 9 red.
+- Agent: wave 3, Lane I.
+- Scope/files: `internal/serverstack/shared_server.go` (+38),
+  `internal/indexer/dedicated_base_runtime.go` (+43), `internal/indexer/repository_admission.go`
+  (+17), `internal/serverstack/dedicated_base_runtime_install_test.go` (new, 213),
+  `internal/indexer/dedicated_base_runtime_test.go` (+32),
+  `internal/indexer/repository_admission_test.go` (+37), `cmd/gortex/daemon_state_test.go` (+65).
+  `cmd/gortex/daemon.go` and `cmd/gortex/daemon_state.go` are owned by this item and **unchanged**
+  (deviation 1).
+- Invariant: the publisher/drain half and every later publication trigger must see exactly one
+  live runtime owner, installed in a window that always precedes every owner registration. A
+  private lease manager degrades advancement into a full root, so the runtime must hold the
+  lifecycle's own `graphview.LeaseManager`, not one it invents.
+- Change: `NewSharedServer` constructs the runtime once per process, immediately after
+  `NewCheckoutLifecycle` returns and before the lifecycle reaches `multiOpts`, the MCP server, the
+  daemon controller or `Seed`. Both production entry points (`cmd/gortex/daemon_state.go:99` and
+  `cmd/gortex/mcp.go:371`) build their stack through that constructor, so one install reaches both.
+  An exported `DedicatedBaseRuntime` wrapper and `NewDedicatedBaseRuntime` constructor were added
+  because the unexported runtime is not constructible from `internal/serverstack`, plus a `leases`
+  field it did not have. `SetDedicatedBaseCleanupRuntime` gains a **nil refusal** on top of its
+  existing late-installation refusal. Before this item, every `&dedicatedBaseRuntime{…}` in the
+  tree was in a `_test.go` file, so `closeRepositoryPublisher` / `stopRepositoryPublishers` always
+  took their `runtime == nil` short-circuit and returned `repositoryAlreadyDrained`.
+- Acceptance gate(s): G4, G5, G6.
+- Harness evidence (wave 3 exit suite): `internal/serverstack` whole package normal
+  (`results/internal_serverstack-normal-_-w3suite-1`, 26 / 0 / 0) and whole-package race
+  (`results/internal_serverstack-race-_-w3suite-1`, 26 / 0 / 0, 0 `DATA RACE`); `cmd/gortex` whole
+  package (`results/cmd-normal-_-w3suite-1`, 1083 / 0 / 5); the six `internal/indexer` normal
+  chunks (2684 / 0 / 2) and the indexer race lane (294 / 0 / 0).
+- Commit: `c9d97359ea3959daaee5a8a27116654d0fb76f26` — *serverstack: install the dedicated-base runtime before any owner
+  registration* (7 files, 1 new).
+- Limitations: **L1** — the `internal/mcp` fallback lifecycle (`server.go:1809-1822`) gets no
+  runtime. No production entry point reaches it, but a direct `gortexmcp.NewServer` caller would
+  get a lifecycle with no publisher owner; that file is W5.9's. **L2** — non-sqlite backends get no
+  runtime, by design, matching the materializer wiring. **L3** — only *installation* is proven, not
+  publication: nothing here calls `ensureInitial` / `ensureCurrent` (W4.2 / W4.3), so the runtime's
+  held `leases` field has no consumer yet beyond `ViewLeases()`.
+- Deviations: (1) no production edit was needed in `cmd/gortex/daemon.go` or `daemon_state.go` —
+  installing there would repeat the `SetBuildGate` asymmetry the plan's own risk note warns
+  against; the daemon-side entry-point trace lives in `cmd/gortex/daemon_state_test.go` instead.
+  (2) an exported constructor was required. (3) the `leases` field is held, not yet consumed.
+  (4) the nil refusal is an addition the plan did not name — it strengthens the seam.
+  (5) the revert-red is a pinned negative in a test, since the production constructor has no owner
+  registration to move the install after.
+- Verifier verdict: **PASS** (no blockers; 3 minor findings).
 
 ## W5 — Integrate request lifetime and selected readers
 
@@ -892,8 +999,10 @@ Shared fields for all W1 sub-items unless overridden:
   it was private, uncompiled and not activated; its counts (52 proposed files, 90 edits across 21
   files, 78 tests, 12 benchmarks) are proposal counts, not landed files or passing tests. Its
   source JSON is preserved in the recovery directory as `historical-proposal-tool-results.json`.
-- Next action: W5.4 onward. W5.1 and W5.8 landed in wave 1; W5.2 and W5.3 landed in wave 2 and are
-  recorded below.
+- Next action: W5.4 onward; W5.10 in wave 4 inherits W5.5's cache residual. W5.1 and W5.8 landed
+  in wave 1; W5.2 and W5.3 landed in wave 2; W5.5 landed in wave 3. W5.9 is `blocked with
+  evidence` after wave 3 on a **procedural ownership** blocker — its source is on disk and green
+  but **not committed**; see its row.
 
 ### W5.1 — Lease-handoff primitive (detach / joined consumer)
 
@@ -1147,6 +1256,113 @@ Shared fields for all W1 sub-items unless overridden:
   additional failure (`TestDetectChanges_EchoesMeasuredScope`) that is git-checkout dependent and
   is green in this wave's exit suite.
 
+### W5.5 — Re-root the editor-buffer overlay onto the request view; key its cache by view identity
+
+- State: `wired`. The verifier's wiring check is explicit ("**WIRED**"); 14 mutations, 12 red on
+  the observable halves (two are behaviour-neutral in isolation and declared as such).
+- Agent: wave 3, Lane R (repair round after a first failed verification).
+- Scope/files: `internal/mcp/overlay_view.go` (+222/−27),
+  `internal/mcp/overlay_view_request_test.go` (new, 534).
+- Invariant: a buffer pushed while a session reads a routed view must be parsed, identified,
+  resolved and **served as bytes** against that view's reader and that checkout; a layer built
+  under one view must never be served to a request reading another.
+- Change: seven inputs that were hard-bound to the primary checkout and the shared corpus are
+  re-rooted onto the request view — base identities for `MarkRemoved`, the absolute path used by
+  the drift gate and the build loop, the graph-path spelling, the extractor's `relPath`,
+  unresolved-edge resolution, and (the repair round's blocker) the raw buffer bytes in
+  `overlayContentFor`. `resolveOverlayGraphPathForRequest`, written and unit-tested for exactly
+  this and with **no production caller**, is wired at the site it was written for. The layer cache
+  key widens from `(sessionID, contentHash)` to include the view identity.
+- Acceptance gate(s): G1, G7.
+- Harness evidence (wave 3 exit suite): `internal/mcp` whole package
+  (`results/internal_mcp-normal-_-w3suite-1`, 6164 / 0 / 8) and the mcp race lane
+  `Overlay|Buffer|Fresh|Deadline|RequireExact|RequestView|ViewBase|Handoff|Pin`
+  (`results/internal_mcp-race-Overlay_Buffer_Fresh_Deadline_RequireExact_Reque-w3suite-1`,
+  528 / 0 / 0, 0 `DATA RACE`).
+- Commit: `e0008c151cfe4f8059871d4d28d60bdf24f3b465` — *mcp: root the editor-buffer overlay on the request's view* (2 files, 1 new).
+- Limitations: **L1** — the cache is still one entry per session, so a session alternating between
+  two views with identical buffers re-parses on each switch instead of serving the wrong layer;
+  keyed eviction is W5.10's. **L2** — the cache key is generation-exact only on the materialized
+  arm: for the labelled base selector `materialized` is nil and the key degrades to an empty view
+  fingerprint, so two reads of the same dedicated base at different generations key identically.
+  Strictly no worse than the pre-change content-only key, and that arm's layer is built against the
+  corpus anyway; it cannot be made exact here because `BasePin` exposes no public base-corpus
+  generation identity. Carried to W5.10. **L3** — `overlayBaseReaderFor`'s fallback is a widening
+  for a labelled `base` selector, harmless and behaviour-preserving; narrowing that reader is
+  W5.8's. **L4** — a routed **ref/commit** view is not covered: buffers over a committed tree still
+  resolve against the primary checkout's paths, and `acceptsBufferOverlay()` does not exclude them.
+  **L5** — a latent view-prefix / owner-prefix inconsistency is deliberately not "fixed": today the
+  two always agree, and a reachable divergence could not be constructed. Whoever registers
+  worktree-instance prefixes beside their canonical repo must re-check that pair.
+- Deviations: none against the plan's shape.
+- Verifier verdict: **PASS** (no blockers; 3 minors + 1 out-of-scope observation).
+
+### W5.9 — `require_fresh` / `wait_deadline`, and publishing `require_exact` (D6)
+
+- State: `blocked with evidence`. The source is implemented, compiles, is `wired` by the verifier's
+  own explicit check, and is green inside this wave's exit suite — but the item's **final verifier
+  verdict is `fail`** on a procedural ownership blocker, and the wave's commit rule is "commit only
+  on a passing verdict", so **nothing of W5.9 was committed**. Its seven files stay dirty in the
+  worktree at the end of wave 3.
+- Blocking evidence: `scratchpad/reports/W3-W5.9-verify.md` §5 and finding 1 —
+  `internal/mcp/tools_list_budget_test.go` (+27/−3) is edited outside every ownership list in the
+  wave. The verifier established the edit is **forced, not convenience**: reverting the three
+  constants against unmutated production fails with *"agent preset cold tools/list is 31944 bytes,
+  over the 30000 ceiling"*; the pre-item headroom was **32 bytes**, and the minimum publishable
+  schema is ~99 B/tool over 20 agent-preset tools. It also confirmed **no assertion was deleted or
+  weakened** and that the gate still bites. Required action: **the Suite cannot ratify an ownership
+  list it did not author** — the coordinator must either add that file to W5.9's ownership or move
+  the three constants into a separately owned file, after which the item commits as-is. There is
+  nothing technical to fix.
+- Agent: wave 3, Lane R (repair round after a first failed verification).
+- Scope/files (all uncommitted): `internal/mcp/view_request.go` (+243),
+  `internal/mcp/checkout_binding.go` (+366), `internal/mcp/server.go` (+22),
+  `internal/mcp/guide.go` (+6), `internal/mcp/arg_schema_guard.go` (+9, comment-only),
+  `internal/mcp/tools_list_budget_test.go` (+27/−3, **out of ownership**),
+  `internal/mcp/view_freshness_test.go` (new, 678). `internal/profiles/bodies.go` is in the
+  ownership list and unchanged (finding 7).
+- Invariant: `require_exact:true` refuses a substituted view rather than serving one;
+  `require_fresh:true` awaits filesystem state and `wait_deadline` bounds that wait with an
+  absolute RFC3339 instant; every outcome is reported on the rider (`fresh`, `waited_ms`,
+  `wait_deadline`, `fresh_reason`) rather than being silently absorbed.
+- Change: the three knobs are parsed and enforced in `requestRequestView`'s policy, the wait is
+  settled against the production `CheckoutLifecycle` (no test seam on the live path), and
+  `publishRequestFreshnessSchema` declares them additively and idempotently on guarded tools.
+- Acceptance gate(s): G1, G7.
+- Harness evidence (wave 3 exit suite, dirty tree): the item's tests ran green inside
+  `internal/mcp` whole package (`results/internal_mcp-normal-_-w3suite-1`, 6164 / 0 / 8) and the
+  mcp race lane (528 / 0 / 0, 0 `DATA RACE`). This is suite evidence on the wave's dirty tree; the
+  blocker is not evidentiary and is not answered by a re-run.
+- Limitations / carried findings: **major** — the compact facade surface (21 tools, the default
+  `tools/list`) still does not *declare* the three knobs, though they work there (pinned
+  end-to-end). Measured: publishing them at `facade_tools.go:219` takes the compact list from
+  14 984 to **17 168** bytes against a 15 000 ceiling the facade test forbids raising, so closing
+  D6's publication half requires compacting the facade schemas first — a separate item. **minor** —
+  `effectiveDeadline` clamps to the 60 s hang-firewall deadline with no margin, so a `wait_deadline`
+  past ~60 s races the firewall and is counted into `abandonedToolCalls` instead of answering
+  `fresh_reason:"deadline_exceeded"`; the fix is to subtract `transportDeadlineMargin` and/or state
+  the cap in the guide. **minor** — the pre-wait view keeps its generation lease for the whole
+  wait on the expiry and retry paths. **minor** — a fresh wait whose re-selection returns
+  `(nil, nil)` claims `fresh:true` on a shared-corpus answer (narrow, untested race). **minor** —
+  a malformed `wait_deadline` degrades instead of refusing for the one `detect_changes`
+  checkout-scoped shape, because `overlay.go` converts the error into a fallback view.
+  **minor** — `internal/profiles/bodies.go:75` still ships `require_fresh:true to await filesystem
+  state` unqualified, which after this item holds only for a routed automatic checkout; the
+  sentence is verbatim in seven rendered agent goldens, none in any ownership list, so it is booked
+  as a W4.3 follow-up rather than edited here.
+- Deviations: publication rides `prepareTool`'s guarded population rather than
+  `publishViewSelectorSchema` as the plan named — that covers exactly the tools whose closed schema
+  rejected the knobs, and the facade population needs no declaration to accept them. The verifier
+  agrees with the outcome and disagrees only with the *stated reason* in the code comment
+  (`server.go:3286-3289` attributes the byte saving to the wrong seam; measured, the `guarded` gate
+  is worth +104 B on the agent preset, not the ~2184 B claimed, which lives at
+  `facade_tools.go:219`).
+- Next action: coordinator ratifies the ownership of `internal/mcp/tools_list_budget_test.go` (or
+  relocates the three constants); on that, the item commits unchanged. A follow-up item should
+  carry the facade-schema compaction that D6's publication half needs.
+- Verifier verdict: **FAIL — one ownership blocker (procedural), plus one major (incomplete
+  deliverable) and six minors. No correctness defect found in the shipped behaviour.**
+
 ## W6 — Finish bounded reuse and storage maintenance
 
 - State: `proposed`. Dependencies: W2, W3, W4. Items: W6.1–W6.5, W6.7, W6.9–W6.12 in MVI; W6.6 and
@@ -1163,7 +1379,58 @@ Shared fields for all W1 sub-items unless overridden:
   hard 64-generation catalog ancestry limit — **provisional**: not proven compaction, not a
   bounded steady-state disk figure, not an established reseed cost. W6.1 is the plan's only XL and
   is strictly serialized S → V → B.
-- Next action: W6.2 in wave 3.
+- Next action: W6.3 in wave 4. W6.2 landed in wave 3 and is recorded below.
+
+### W6.2 — Exact restub gate on the legacy incremental path
+
+- State: `wired`. The verifier's wiring check is explicit ("**wired**") with a full production
+  chain from `IncrementalReindexPaths` down to the gate; 10 mutations, all bind.
+- Agent: wave 3, Lane B.
+- Scope/files: `internal/indexer/incremental_batch.go` (+170),
+  `internal/indexer/affected_by.go` (+12), `internal/indexer/incremental_restub_gate_test.go`
+  (new, 426).
+- Invariant: reuse never drops supported derived output. An edit that changes no referrer-visible
+  symbol shape must issue **zero** `ReindexEdges` rows for surviving in-edges — and must not lose
+  those edges either.
+- Change: **the plan's literal gate is unsafe, and that was proven before the fix was written.**
+  The restub does two jobs: it *rescues* the in-edge from the eviction that immediately follows
+  (both backends delete every edge incident to a doomed node, including edges whose source file is
+  untouched — `graph.go:3283-3298`, `file_batch_evict.go:207-211`) and it forces the incoming pass
+  to *re-decide* the binding. Only re-decision is gateable; skipping the park **destroys** the
+  edge, and the fallback resolve cannot repair a deleted edge. A throwaway probe measured it: 0
+  in-edges survive. So `restubIncomingRefsFromView` now **returns the in-edges it deliberately did
+  not park** and `commitStructuralIncrementalBatch` re-states them in the same `AddBatch` as the
+  fresh payload, preserving target / origin / tier / confidence / `Meta` exactly instead of
+  round-tripping through the restub provenance stash — the incoming twin of the out-edge reuse the
+  same file already performs. Net per skipped edge: one bulk insert instead of one durable row to
+  the stub, the incoming pass walking it, and a second durable row rebinding it.
+- Acceptance gate(s): G3, G4, G8.
+- Harness evidence (wave 3 exit suite): the six `internal/indexer` normal chunks (2684 / 0 / 2) and
+  the indexer race lane (`…-Restub|Affected…`, 294 / 0 / 0, 0 `DATA RACE`). Two of the added tests
+  and both SQLite tests drive the chain from `IncrementalReindexPaths` with a real two-file Go
+  corpus, so this is real wiring, not a unit-only primitive.
+- Commit: `76f8a0e09cb66812efe2d06b9de89db2b4c2bb12` — *indexer: restub incoming refs only when the target's shape actually
+  changed* (3 files, 1 new).
+- Limitations: **L1** — accuracy is parity with the shipped affected-by gate, not better: the
+  frontier inherits `symbolShapeFromAdjacency`'s blind spots (anything neither in a stamped
+  `signature`, nor in the param/return structure, nor in `Meta["visibility"]`), and the shipped
+  `reresolveAffectedBy` gate already accepts the same class of miss. Widening it is W6.12's.
+  **L2** — only the batched twin is gated; `Indexer.restubIncomingRefs` (the single-file fallback
+  at `indexer.go:5209-5262`) is still unconditional and lives in a file W3.4 owned this wave.
+  Worth a follow-up item. **L3** — non-`IsResolvableRefEdge` in-edges are still destroyed by the
+  eviction, exactly as before: a pre-existing defect this change neither fixes nor worsens.
+  **L4** — a stale restub stash on an already-resolved edge is now carried forward untouched;
+  the edge stays byte-identical. **L5** — the reduction is measured as `ReindexEdges` rows, not
+  wall clock; no benchmark was run.
+- Deviations: (1) the gate cannot be write-skip-only (above), so it is gate + carry-through-
+  `AddBatch`. (2) two conservative triggers the plan did not name were required for correctness —
+  node-ID survival and an added same-name definition. (3) one accuracy trigger added:
+  `Meta["visibility"]`, without which a public→private edit would keep a binding a whole index
+  would refuse. (4) the frontier does not require `stage.abSnap`; it rebuilds the identical
+  snapshot from the prior view when the global passes are deferred, so warm and branch-switch
+  reconciles — the batches with the largest write amplification — get the gate too.
+- Verifier verdict: **PASS** (no blockers; 5 minor findings, all non-blocking). The verifier ran an
+  independent losslessness probe on the carry.
 
 ## W7 — Complete lifecycle/recovery integration
 
@@ -1947,3 +2214,113 @@ Runs executed 2026-09-10/11 local time; the entry is dated by the wave, not by t
   space after the suite and the final cleanup is recorded in the wave 2 exit report. `find
   ~/Library/Caches/go-build -type f -mtime +1 -delete` freed nothing — every entry in that 65 GB
   cache was under a day old.
+
+### 2026-09-10 — Wave 3 exit suite (W2.4, W3.4, W6.2, W4.1, W5.5; W5.9 blocked)
+
+- **Source identity.** HEAD `43d2506a0e744fb3177241f0d6bc9ea0f86c2c1e`, dirty-manifest sha256
+  `248ff1164c48c66b0637b3280293b14d1f9cb0da4a0215defe6984739507bbb9` (30 modified + 9 untracked
+  paths, one of which is the untracked handoff working note). Identical on **all 14 compiles and
+  all 19 runs** — no source drift during the suite. Taken from the harness `result.json` /
+  `meta.json` files, which carry `head_sha` and `dirty_manifest_sha256` on every row (33 artifacts,
+  33 identical pairs).
+- **Commands.** From the worktree with the isolated environment (`GOWORK=off GOTOOLCHAIN=local
+  GOFLAGS="-mod=mod -buildvcs=false" GOPROXY=off`): `go build ./...` (exit 0, no output) and
+  `go vet` over `./internal/resolver/ ./internal/indexer/ ./internal/serverstack/ ./internal/mcp/
+  ./internal/parser/tsalias/ ./internal/profiles/ ./cmd/gortex/` (exit 0). Then through
+  `scratchpad/harness/validate.sh` with `GXH_TAG=w3suite`: 14 × `compile` (10 normal, 4 race) and
+  19 × `test`.
+- **Result: 15046 pass / 0 fail / 19 skip, 0 `DATA RACE`.** Every skip is named with its exact
+  reason. `all_green = true`.
+
+  | run | pattern | pass | fail | skip | result dir |
+  | --- | --- | --- | --- | --- | --- |
+  | `internal/graph` normal | `.` | 530 | 0 | 0 | `results/graph-normal-_-w3suite-1` |
+  | `internal/graphview` normal | `.` | 460 | 0 | 0 | `results/graphview-normal-_-w3suite-1` |
+  | `internal/graph/store_sqlite` normal | `.` | 1762 | 0 | 2 | `results/store-normal-_-w3suite-1` |
+  | `internal/reconcile` normal | `.` | 92 | 0 | 0 | `results/reconcile-normal-_-w3suite-1` |
+  | `internal/mcp` normal | `.` | 6164 | 0 | 8 | `results/internal_mcp-normal-_-w3suite-1` |
+  | `internal/serverstack` normal | `.` | 26 | 0 | 0 | `results/internal_serverstack-normal-_-w3suite-1` |
+  | `internal/profiles` normal | `.` | 12 | 0 | 0 | `results/internal_profiles-normal-_-w3suite-1` |
+  | `internal/resolver` normal | `.` | 1282 | 0 | 2 | `results/internal_resolver-normal-_-w3suite-1` |
+  | `cmd/gortex` normal | `.` | 1083 | 0 | 5 | `results/cmd-normal-_-w3suite-1` |
+  | `internal/indexer` normal | `^Test[A-C]` | 568 | 0 | 1 | `results/indexer-normal-_Test_A_C_-w3suite-1` |
+  | `internal/indexer` normal | `^Test[D-H]` | 539 | 0 | 0 | `results/indexer-normal-_Test_D_H_-w3suite-1` |
+  | `internal/indexer` normal | `^Test[I-M]` | 472 | 0 | 1 | `results/indexer-normal-_Test_I_M_-w3suite-1` |
+  | `internal/indexer` normal | `^Test[N-R]` | 614 | 0 | 0 | `results/indexer-normal-_Test_N_R_-w3suite-1` |
+  | `internal/indexer` normal | `^Test[S-T]` | 351 | 0 | 0 | `results/indexer-normal-_Test_S_T_-w3suite-1` |
+  | `internal/indexer` normal | `^Test[U-Z]` | 140 | 0 | 0 | `results/indexer-normal-_Test_U_Z_-w3suite-1` |
+  | `internal/graphview` race | `Lease\|Handoff\|Materialize\|Drain\|Raw\|Pin` | 103 | 0 | 0 | `results/graphview-race-Lease_Handoff_Materialize_Drain_Raw_Pin-w3suite-1` |
+  | `internal/mcp` race | `Overlay\|Buffer\|Fresh\|Deadline\|RequireExact\|RequestView\|ViewBase\|Handoff\|Pin` | 528 | 0 | 0 | `results/internal_mcp-race-Overlay_Buffer_Fresh_Deadline_RequireExact_Reque-w3suite-1` |
+  | `internal/serverstack` race | `.` | 26 | 0 | 0 | `results/internal_serverstack-race-_-w3suite-1` |
+  | `internal/indexer` race | `DependencyRevision\|Cohort\|ResolverVersion\|Identity\|Restub\|Affected\|CompileDB\|CompileCommands\|Alias\|SideChannel\|DedicatedBaseRuntime\|Admission\|Rehome\|CheckoutMutation` | 294 | 0 | 0 | `results/indexer-race-DependencyRevision_Cohort_ResolverVersion_Identi-w3suite-1` |
+
+- **`internal/indexer` was chunked from the start**, as the six first-letter regexes the wave
+  mandates (`^Test[A-C]` … `^Test[U-Z]`), because the whole package does not fit the harness's
+  hardcoded `-test.timeout 8m` in one process — measured in wave 2, not re-attempted here.
+  Totals across the six chunks: **2684 / 0 / 2**. Cross-chunk single-process interference is
+  therefore unobserved in that package, as in every prior wave.
+- **Named skips (19), all pre-existing and environment- or platform-gated.**
+  `internal/graph/store_sqlite` (2): `TestBundlePackageKeyNeverUsesOSSeparator` (*"separator matches
+  the contract on this platform"* — the Windows path-separator test) and `TestMetaBlobCensus`
+  (*"set GORTEX_BENCH_STORE to a copied store.sqlite to run"*) — the two the exit criterion
+  pre-blessed. `internal/indexer` (2): `TestBackendBench` (*"bench harness; set GORTEX_BENCH_ROOT
+  …"*) and `TestMeasureEditLatency` (*"set GORTEX_MEASURE_REPO=/abs/path to run"*).
+  `internal/resolver` (2): `TestFrameworkCensusProbe` and `TestFrameworkSynthesisScopedProbe`
+  (both *"set GORTEX_BENCH_STORE to a copied store.sqlite to run"*). `internal/mcp` (8): five
+  `TestAnalyzeScope_AllScopeAwareKinds_NoCrossWorkspaceLeak` subtests needing a coverage profile or
+  git-blame data, `TestATradeThatCannotSaveTheOutlineIsGivenBack`,
+  `TestLocalizationTextMatchNormalisesNativePathToGraphKey` (Windows path spelling) and
+  `TestCheckoutMutationResolvedRootRejectsFoldedDistinctDirectory` (*"filesystem cannot represent
+  case-distinct directories"*). `cmd/gortex` (5):
+  `TestFileCoveragePrefersCanonicalKeysWithoutDoubleCounting` (*"native and slash graph keys
+  coincide on this platform"*), `TestSystemdUnitPath_ResolvesUnderHome` and
+  `TestServiceCommands_RejectUnsupportedOS` (linux-only / unsupported-OS-only), and the two
+  isolated-daemon integration tests (`TestIssue767IdleIOIntegration`,
+  `TestIssue767WorktreeReadinessIntegration`) that need an opt-in binary env var.
+- **The wave-2 `TMPDIR`-length harness artifacts did not recur.** `internal/mcp` ran 6164 / 0 / 8
+  with both previously-affected tests green, on the short private `/private/tmp/gxh-*` root the
+  wave 2 exit stage installed in `validate.sh`.
+- **Commits.** Five, one per passing item, in dependency order, each staging only that item's files
+  (`git add <paths>`, never `-A`); the ledger commit is sixth and last. The cohort revision is
+  committed first because the identity it keys is what the committed-build routing and the runtime
+  install later read; the overlay re-rooting is last because it is the only reader-side change.
+
+  | # | commit | item | subject |
+  | --- | --- | --- | --- |
+  | 1 | `9ac5afec7a7e67dc6df245bdd8e792a09a68332f` | W2.4 | indexer: scope, cache and de-poison the dependency cohort revision |
+  | 2 | `c5be184bc5476fb80a1909fd448f4a24469a5336` | W3.4 | indexer: close the committed build's disk side channels |
+  | 3 | `76f8a0e09cb66812efe2d06b9de89db2b4c2bb12` | W6.2 | indexer: restub incoming refs only when the target's shape actually changed |
+  | 4 | `c9d97359ea3959daaee5a8a27116654d0fb76f26` | W4.1 | serverstack: install the dedicated-base runtime before any owner registration |
+  | 5 | `e0008c151cfe4f8059871d4d28d60bdf24f3b465` | W5.5 | mcp: root the editor-buffer overlay on the request's view |
+
+- **W5.9 was NOT committed.** Its final verifier verdict is `fail` on a **procedural ownership**
+  blocker — `internal/mcp/tools_list_budget_test.go` is edited outside every ownership list in the
+  wave — and the wave's rule is to commit only on a passing verdict. The verifier established the
+  edit is forced (the pre-item headroom on the agent preset ceiling was 32 bytes; reverting the
+  three constants fails at 31 944 / 30 000) and that no assertion was deleted or weakened. The
+  Suite stage **cannot ratify an ownership list it did not author**, so the item stays
+  `blocked with evidence` and its seven files remain dirty in the worktree; the coordinator must
+  ratify the file or relocate the three constants. Note that those seven files were **present in
+  the tree for every run of this suite**, so the counts above were produced with W5.9's production
+  changes active. Its own row records the residual findings.
+- **Post-commit verification.** `git status --short` after the five commits shows exactly W5.9's
+  seven files, this ledger, and the untracked handoff working note — nothing outside this wave's
+  ownership was staged or touched. The committed tree was then exported with
+  `git archive HEAD | tar -x` into a scratch directory and rebuilt there from scratch:
+  `go build ./...` exit 0 and `go vet` over the six touched packages exit 0, so the five commits
+  compile **and vet, tests included,** as a unit without W5.9's dirty changes.
+- **Limitations of what this suite proves.** These are unit and package regressions on a pinned
+  dirty source identity. W2.4, W3.4, W6.2, W4.1 and W5.5 all reached `wired` by their verifiers'
+  explicit checks, but **no item reached `E2E validated`**: there is still no end-to-end and no
+  paired-I/O evidence, and gates G1–G9 are unchanged by this wave. W6.2's write reduction is
+  measured as `ReindexEdges` rows, never as wall clock or bytes written. W4.1 proves *installation*
+  only — nothing publishes a dedicated base yet. `internal/indexer` was covered as six chunk
+  processes and has no whole-package single-process result. `-race` was run over the mandated
+  selections, not whole packages (except `internal/serverstack`, which is small enough to run
+  whole). Per-commit intermediate trees were not individually exported and rebuilt — only the final
+  five-commit tree was — so "each commit compiles on its own" is asserted from ownership
+  disjointness plus the aggregate build, not measured. W2.4 lands D8's second one-time
+  invalidation, unmeasured on a real store.
+- **Disk.** Recorded in the wave 3 exit report (`scratchpad/reports/W3-suite.md`): `df -h /` before
+  and after the stage's cleanup, which deletes the per-run harness homes and compiled test binaries
+  and trims Go build-cache entries untouched for more than a day. No shared cache was cleared.
