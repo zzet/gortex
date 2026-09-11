@@ -78,6 +78,19 @@ const (
 	MaterializationTotal = "views_materialization_total"
 	// LeasesHeld is how many payload generations live views currently pin.
 	LeasesHeld = "views_leases_held"
+	// HandoffTotal counts attempts to hand a request's materialized view to
+	// work that outlives that request — a detached worker, an admitted
+	// publication, a handler the deadline firewall abandoned — by which
+	// consumer asked and whether the lease could still be joined.
+	HandoffTotal = "views_handoff_total"
+	// HandoffsOutstanding is how many handed-off view leases are open right
+	// now: detached work still pinning the generations its request read. It
+	// is the level paired with HandoffTotal{outcome=joined}, and it must
+	// return to zero once every detached worker has released. A level that
+	// does not come back down is the observable shape of an unreleased
+	// handoff — retirement will keep refusing a generation with nobody left
+	// to finish releasing it.
+	HandoffsOutstanding = "views_handoffs_outstanding"
 
 	// RequestServedTotal counts requests by the kind of view that answered.
 	RequestServedTotal = "views_request_served_total"
@@ -126,6 +139,40 @@ const (
 	LabelCorpus   = "corpus"
 	LabelEvent    = "event"
 	LabelExact    = "exact"
+	LabelConsumer = "consumer"
+)
+
+// Handed-off view consumers: the classes of work a request can leave running
+// behind it while still reading the payload it was served. Each names a call
+// site's role, never a checkout, a path or a generation.
+const (
+	// HandoffCheckoutRefresh is publication admitted on a selected checkout's
+	// coordinator after a source mutation committed to disk.
+	HandoffCheckoutRefresh = "checkout_refresh"
+	// HandoffFileMutation is the watcher-scheduled reindex of one mutated
+	// file.
+	HandoffFileMutation = "file_mutation"
+	// HandoffRepositoryIndex is a first index detached from the request that
+	// asked for it.
+	HandoffRepositoryIndex = "repository_index"
+	// HandoffAbandonedHandler is a handler the deadline firewall stopped
+	// waiting for while it was still reading its view.
+	HandoffAbandonedHandler = "abandoned_handler"
+)
+
+// handoffConsumers is the complete consumer vocabulary.
+var handoffConsumers = []string{
+	HandoffCheckoutRefresh,
+	HandoffFileMutation,
+	HandoffRepositoryIndex,
+	HandoffAbandonedHandler,
+}
+
+// Handoff outcomes: the lease was joined, or every holder had already
+// released and the handle was truthfully refused.
+const (
+	HandoffJoined  = "joined"
+	HandoffRefused = "refused"
 )
 
 // Checkout lifecycle states, as a metric label sees them. They mirror
@@ -398,6 +445,13 @@ var catalog = map[string]spec{
 		{name: LabelOutcome, values: []string{OutcomeOK, OutcomeError}},
 	}},
 	LeasesHeld: {kind: kindGauge},
+	HandoffTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelConsumer, values: handoffConsumers},
+		{name: LabelOutcome, values: []string{HandoffJoined, HandoffRefused}},
+	}},
+	HandoffsOutstanding: {kind: kindGauge, labels: []labelSpec{
+		{name: LabelConsumer, values: handoffConsumers},
+	}},
 
 	RequestServedTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelKind, values: []string{ViewBase, ViewWorktree, ViewRef}},

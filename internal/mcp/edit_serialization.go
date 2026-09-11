@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 const (
@@ -66,6 +67,48 @@ type mutationReceipt struct {
 	checkoutID                 string
 	checkoutIncarnation        string
 	barrierRecoveredGeneration uint64
+	// viewPin is the requesting call's hold on the view the admitted work was
+	// admitted against. Publication runs on a coordinator or watcher loop the
+	// request does not wait for, so the request's own lease is long gone by
+	// the time the ticket reports; this keeps the generations pinned for
+	// exactly as long as the detached work is outstanding. Released once,
+	// just before done closes.
+	viewPin *requestViewPin
+}
+
+// pinView attaches the caller's handed-off view lease to this receipt, so the
+// pin lives exactly as long as the admitted work does.
+//
+// Safe against a ticket that has already reported: the pin is released inline
+// rather than stored where nothing would ever look at it again.
+func (r *mutationReceipt) pinView(pin *requestViewPin) {
+	if pin == nil {
+		return
+	}
+	if r == nil {
+		pin.release()
+		return
+	}
+	r.mu.Lock()
+	if r.completed {
+		r.mu.Unlock()
+		pin.release()
+		return
+	}
+	r.viewPin = pin
+	r.mu.Unlock()
+}
+
+// releaseViewPin drops the receipt's hold on the request's view. Idempotent.
+func (r *mutationReceipt) releaseViewPin() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	pin := r.viewPin
+	r.viewPin = nil
+	r.mu.Unlock()
+	pin.release()
 }
 
 type mutationScheduler interface {
@@ -215,6 +258,11 @@ func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo,
 		if result.Err == nil && result.Reindexed && result.AppliedGeneration > 0 && receipt.checkoutScoped {
 			s.resolveCheckoutRecoveryReceipts(receipt, recoveryCandidates, result.AppliedGeneration)
 		}
+		// The admitted work has reported, so the payload it was admitted
+		// against no longer has to be held for it. Released before done
+		// closes, so a caller that waited on the receipt observes a drained
+		// lease rather than racing this goroutine for it.
+		receipt.releaseViewPin()
 		close(receipt.done)
 		retention := mutationReceiptRetention
 		if receipt.checkoutScoped {
@@ -417,12 +465,24 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 		// context because the disk commit already happened; client cancellation
 		// must not leave the graph permanently stale.
 		if scheduler, ok := watcher.(mutationScheduler); ok {
+			// The reindex is detached from this request, so the request's own
+			// lease cannot be what keeps its payload alive: join it for the
+			// admitted work and let the receipt hold the pin until the ticket
+			// reports. Nil whenever no generation stack answered this request.
+			pin := handoffRequestView(ctx, viewmetrics.HandoffFileMutation)
 			ticket, scheduleErr := scheduler.EnqueueFileMutation(context.WithoutCancel(ctx), absPath)
 			if scheduleErr != nil {
+				pin.release()
 				return mutationReindexOutcome{Err: scheduleErr}
+			}
+			if ticket == nil {
+				// Admission declined to schedule anything, so nothing outlives
+				// this frame and the fall-through below reindexes inline.
+				pin.release()
 			}
 			if ticket != nil {
 				receipt := s.trackMutationTicket(ticket)
+				receipt.pinView(pin)
 				timer := time.NewTimer(s.mutationWaitDuration())
 				defer timer.Stop()
 				select {

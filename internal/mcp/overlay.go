@@ -15,7 +15,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // SetOverlayManager wires the editor-overlay manager into the MCP
@@ -189,6 +191,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		if view != nil {
 			ctx = withRequestView(ctx, view)
+			// Tell the deadline firewall what this call is reading. If it
+			// stops waiting for this handler, the handler keeps running and
+			// keeps reading through the view below, so the firewall joins the
+			// lease on the abandoned goroutine's behalf and says so in its
+			// answer instead of leaving a silent pin. Publishing is a no-op
+			// when no firewall frame is above us (an unbounded call).
+			noteRetainedView(ctx, view)
 			defer view.close()
 		}
 		if requireExactView && view != nil && view.rider != nil && !view.rider.Exact {
@@ -358,3 +367,94 @@ func overlaySHAMatches(absPath, expected string) bool {
 // refactors strip a field — the import lints flagged a phantom
 // dependency in the prior iteration; harmless guard.
 var _ sync.Mutex
+
+// requestViewPin is one piece of detached work's own hold on the view its
+// request read.
+//
+// The request's view is released by `defer view.close()` above, on handler
+// return. Work that deliberately outlives the handler — an admitted
+// publication, a detached first index, a handler the deadline firewall
+// stopped waiting for — therefore used to run over a payload the retirement
+// sweep was free to collect the moment the response went out. A pin is the
+// joined-consumer half of that lifetime (graphview.RepoView.Handoff): the
+// generations stay pinned, retirement keeps refusing them and
+// LeaseManager.WaitDrain keeps blocking, until the detached worker releases
+// its own handle.
+//
+// release is mandatory and idempotent, and every method is nil-safe: a
+// request that materialized no view hands out a nil pin and the call sites
+// stay branch-free.
+type requestViewPin struct {
+	handoff  *graphview.ViewHandoff
+	consumer string
+	once     sync.Once
+}
+
+// handoffRequestView joins consumer to the lease of the view answering ctx.
+//
+// It returns nil in two different situations, which the counters separate:
+//
+//   - there is nothing to pin, because this request materialized no
+//     generation stack (the unrouted base corpus, or a reader-less fallback
+//     view). Nothing is recorded; there is no lifetime to extend.
+//   - the view exists but every holder of its lease has already released, so
+//     graphview refuses the join. That is recorded as a refusal, because the
+//     payload underneath may already be gone and the caller is now running
+//     unpinned. It is not reachable from inside a live handler — close() is
+//     deferred to handler return — so a non-zero refusal count means a
+//     detached worker asked for a pin after its request had already ended,
+//     which is a wiring bug rather than a routine outcome.
+//
+// A caller must never read a nil pin as a successful handoff.
+func handoffRequestView(ctx context.Context, consumer string) *requestViewPin {
+	return handoffView(requestViewFromContext(ctx), consumer)
+}
+
+// handoffView is handoffRequestView for a caller that already holds the view
+// rather than a context carrying it — the deadline firewall, which resolved
+// nothing itself and was handed the view by the middleware it bounds.
+func handoffView(view *requestView, consumer string) *requestViewPin {
+	if view == nil || view.materialized == nil {
+		return nil
+	}
+	handoff := view.materialized.Handoff()
+	if handoff == nil {
+		viewmetrics.Count(viewmetrics.HandoffTotal, consumer, viewmetrics.HandoffRefused)
+		return nil
+	}
+	viewmetrics.Count(viewmetrics.HandoffTotal, consumer, viewmetrics.HandoffJoined)
+	viewmetrics.AddGauge(viewmetrics.HandoffsOutstanding, 1, consumer)
+	return &requestViewPin{handoff: handoff, consumer: consumer}
+}
+
+// release drops this worker's hold. Idempotent and nil-safe; the generations
+// are unpinned once the request and every other joined consumer have released
+// too.
+func (p *requestViewPin) release() {
+	if p == nil || p.handoff == nil {
+		return
+	}
+	p.once.Do(func() {
+		p.handoff.Close()
+		viewmetrics.AddGauge(viewmetrics.HandoffsOutstanding, -1, p.consumer)
+	})
+}
+
+// generations lists the payload generations this pin keeps alive, bottom
+// first. Nil for a pin that was never taken, which is what lets a diagnosis
+// say "nothing is retained" without a second flag.
+func (p *requestViewPin) generations() []int64 {
+	if p == nil {
+		return nil
+	}
+	return p.handoff.Generations()
+}
+
+// reader is the composed stack the pinning worker may keep reading through
+// after the request that materialized it has returned.
+func (p *requestViewPin) reader() graph.Reader {
+	if p == nil || p.handoff == nil {
+		return nil
+	}
+	return p.handoff.Reader
+}
