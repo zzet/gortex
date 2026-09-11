@@ -45,7 +45,7 @@ func TestWatcher_SymbolChangeCallbackRunsAfterRepositoryLaneRelease(t *testing.T
 		callbackNew = newSymbols
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		callbackResult <- idx.coordinateRepositoryMutation(ctx, func() error { return nil })
+		callbackResult <- idx.coordinateRepositoryMutation(ctx, OutputEntryWatcherPatchGraph, func() error { return nil })
 	})
 
 	writeTestFile(t, path, "package main\n\nfunc Modified() {}\n")

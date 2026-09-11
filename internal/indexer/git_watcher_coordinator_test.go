@@ -94,7 +94,7 @@ func TestGitWatcherFreshnessTailWaitsForLaneAndUsesReplacementIndexer(t *testing
 	releaseLane := make(chan struct{})
 	holderDone := make(chan error, 1)
 	go func() {
-		holderDone <- oldIndexer.coordinateRepositoryMutation(context.Background(), func() error {
+		holderDone <- oldIndexer.coordinateRepositoryMutation(context.Background(), OutputEntryGitWatcherFinalize, func() error {
 			close(laneEntered)
 			<-releaseLane
 			return nil

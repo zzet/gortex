@@ -8,7 +8,9 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 const repositoryMutationPathCap = 2048
@@ -99,8 +101,13 @@ type repositoryMutationCoordinator struct {
 	// coordinators leave it nil; tests set it before admitting concurrent work.
 	batchAdmissionHook func()
 	executor           repositoryMutationExecutor
-	closed             bool
-	running            bool
+	// outputGeneration wraps ONE executed coalesced batch in an
+	// output-generation receipt. The coalescing lane, not the queuing caller,
+	// is the mutation entry point here: many callers merge into one execution,
+	// and it is that execution that names an output generation and owner.
+	outputGeneration func(fn func() error) error
+	closed           bool
+	running          bool
 
 	requestedGeneration uint64
 	completedGeneration uint64
@@ -184,9 +191,10 @@ func (c *repositoryMutationCoordinator) drain() {
 		waiters := c.waiters
 		c.waiters = nil
 		executor := c.executor
+		outputGeneration := c.outputGeneration
 		c.mu.Unlock()
 
-		outcome := executeRepositoryMutation(executor, paths)
+		outcome := executeRepositoryMutationUnderAuthority(outputGeneration, executor, paths)
 		c.lane <- struct{}{}
 		if batchMutationGate != nil {
 			batchMutationGate.RUnlock()
@@ -222,6 +230,49 @@ func executeRepositoryMutation(executor repositoryMutationExecutor, paths []stri
 	}
 	outcome.result, outcome.err = executor(paths)
 	return outcome
+}
+
+// executeRepositoryMutationUnderAuthority runs one coalesced batch under the
+// lane's output-generation receipt. An authority refusal (an unregistered entry
+// point, or a receipt a newer mutation for the same owner superseded) becomes
+// the batch's error: superseded work must not report a fulfilled reconcile.
+//
+// The refusal never DISCARDS a result that exists. Preventive refusals happen
+// before the executor runs and therefore carry no result to lose; a refusal
+// raised after the executor already ran leaves the real result in place beside
+// the error, so a coalesced waiter is never handed "nil result, no explanation"
+// for work that actually ran. Callers that key on the error (GitWatcher's
+// finalizeReconcile leaves the prior SHA for the next notification) still
+// retry, which is the correct response to an unfulfilled generation.
+func executeRepositoryMutationUnderAuthority(
+	outputGeneration func(fn func() error) error,
+	executor repositoryMutationExecutor,
+	paths []string,
+) repositoryMutationOutcome {
+	if outputGeneration == nil {
+		return executeRepositoryMutation(executor, paths)
+	}
+	var outcome repositoryMutationOutcome
+	err := outputGeneration(func() error {
+		outcome = executeRepositoryMutation(executor, paths)
+		return outcome.err
+	})
+	if err != nil && outcome.err == nil {
+		outcome.err = err
+	}
+	return outcome
+}
+
+// bindOutputGeneration attaches the receipt wrapper for this lane's coalesced
+// executions. It is set from repositoryMutations, the one place that knows both
+// the coordinator and the Indexer whose output generation it writes.
+func (c *repositoryMutationCoordinator) bindOutputGeneration(wrap func(fn func() error) error) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.outputGeneration = wrap
+	c.mu.Unlock()
 }
 
 func (c *repositoryMutationCoordinator) runExclusive(ctx context.Context, fn func() error) error {
@@ -523,6 +574,22 @@ func (idx *Indexer) attachRepositoryMutationCoordinator(coordinator *repositoryM
 	idx.repositoryMutationMu.Lock()
 	idx.repositoryMutation = coordinator
 	idx.repositoryMutationMu.Unlock()
+	// A coordinator becomes this Indexer's lane here as well as in
+	// repositoryMutations (SetRepoPrefix attaches the owned lane directly), so
+	// the receipt wrapper is bound at BOTH attachment points. A lane reachable
+	// with no wrapper is a mutation path with no named output generation.
+	idx.bindMutationLaneAuthority(coordinator)
+}
+
+// bindMutationLaneAuthority attaches the output-generation receipt wrapper the
+// lane worker opens around every coalesced batch it executes.
+func (idx *Indexer) bindMutationLaneAuthority(coordinator *repositoryMutationCoordinator) {
+	if coordinator == nil {
+		return
+	}
+	coordinator.bindOutputGeneration(func(fn func() error) error {
+		return idx.withOutputGeneration(context.Background(), OutputEntryRepositoryReconcileLane, fn)
+	})
 }
 
 func (idx *Indexer) ensureRepositoryMutationRoot(root string) error {
@@ -557,10 +624,21 @@ func (idx *Indexer) repositoryMutations() *repositoryMutationCoordinator {
 				return idx.incrementalReindexWatcherPaths(idx.rootPath, paths)
 			})
 		}
+		// Both lanes — the MultiIndexer-owned one and the orphan one a
+		// standalone Indexer mints — name their output generation through the
+		// same authority. Binding here is what stops the orphan lane from
+		// being the one mutation path with no named owner.
+		idx.bindMutationLaneAuthority(idx.repositoryMutation)
 	}
 	return idx.repositoryMutation
 }
 
+// coordinateRepositoryReindex coalesces a reconciliation onto the stable lane.
+//
+// It does NOT open a receipt here: reconcile requests coalesce, so the caller
+// that queues is not the work that executes. The receipt is opened by the lane
+// worker itself (drain -> outputGeneration, bound in repositoryMutations), so
+// exactly one receipt covers the one batch that actually mutates.
 func (idx *Indexer) coordinateRepositoryReindex(
 	ctx context.Context,
 	paths []string,
@@ -572,6 +650,738 @@ func (idx *Indexer) coordinateRepositoryReindex(
 // mutation with every watcher, reconciliation, and janitor pipeline for this
 // Indexer. The callback must use raw mutation methods and must not submit back
 // into the coordinator.
-func (idx *Indexer) coordinateRepositoryMutation(ctx context.Context, fn func() error) error {
-	return idx.repositoryMutations().runExclusive(ctx, fn)
+//
+// entry is the caller's registered identity with the output-generation
+// authority. The authority admission is nested INSIDE the lane on purpose:
+// receipts for one owner are then totally ordered by execution, and the raw
+// source gate is taken after batch admission and the repository lane, which is
+// the order graphview's raw mutation API requires.
+func (idx *Indexer) coordinateRepositoryMutation(ctx context.Context, entry OutputMutationEntry, fn func() error) error {
+	return idx.repositoryMutations().runExclusive(ctx, func() error {
+		return idx.withOutputGeneration(ctx, entry, fn)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Output-generation authority (D12, gate 6)
+// ---------------------------------------------------------------------------
+//
+// coordinateRepositoryMutation and BeginCheckoutMutation are the two lanes a
+// production repository mutation reaches the store through. Serializing them
+// is not the same as knowing what they write: a lane says "one at a time for
+// this repository", it does not say WHICH output generation the work landing
+// on it belongs to, nor which owner speaks for that generation. Without that
+// second fact there is no mutation receipt, so nothing can refuse superseded
+// work that arrives after a newer mutation was admitted for the same owner —
+// acceptance gate 6's last clause.
+//
+// The authority supplies exactly that. Every mutation entry point names itself
+// (a registered OutputMutationEntry) and names exactly one output generation
+// and owner (an OutputMutationTarget):
+//
+//   - OutputGenerationLegacy    generation 0, the legacy mutable corpus. The
+//                               generation number MUST be 0; the authority
+//                               never lets a legacy write claim a committed
+//                               generation number, which is the relabelling
+//                               refusal expressed at admission time.
+//   - OutputGenerationCheckout  the routed dirty/commit generation a checkout
+//                               source edit withdraws and republishes.
+//   - OutputGenerationDedicated a claimed dedicated generation for the
+//                               publication path.
+//
+// Admission returns a receipt. Receipts for one owner are totally ordered by
+// issue sequence; issuing a newer one supersedes every outstanding older one,
+// and a superseded receipt cannot be fulfilled. The fence has two halves:
+//
+//   - PREVENTIVE — runUnderOutputReceipt (and OutputMutationReceipts.Current,
+//     and CheckoutMutation.receiptStillCurrent before Prepare/Refresh) refuse a
+//     receipt that already lost its authority BEFORE the payload runs, so no
+//     byte moves. Admission is not instantaneous — Begin blocks on the source
+//     gate — so this window is real, not theoretical.
+//   - REPORTING — Complete refuses a receipt superseded WHILE its payload ran.
+//     Those bytes are already written; the refusal exists so the work is not
+//     reported as a fulfilled generation and the caller retries.
+//
+// Today the production lanes make the reporting half rare by construction: the
+// repository lane serializes generation-zero mutations for one owner, and
+// BeginCheckoutMutation holds the checkout's cycle lock from admission through
+// Close, so two live receipts for one "checkout:<id>" owner cannot overlap. The
+// case the fence exists for is the one the lanes do NOT cover: the standalone
+// (orphan-lane) Indexer a stack hands to the MCP server and an owned
+// per-repository lane naming the same repository root.
+//
+// The authority also owns the SOURCE half of the same choke point. A legacy
+// mutation changes bytes under generation 0 while requests may be reading it,
+// so it is witnessed through graphview's raw-source authority: the mutation
+// takes the exclusive data gate for the repository, which moves the owner's
+// source revision, and graphview.BasePin.ValidateCurrent — held by a routed
+// request for its lifetime — then reports ErrBaseCorpusChanged instead of
+// silently claiming exactness. A repository with no registered raw source
+// authority stays UNWITNESSED, which BasePin reports as "unknown"; the
+// authority never manufactures a witness it did not take.
+//
+// Plan-bookkeeping obligation B1 — internal/persistence (notes, memories,
+// scopes, notebooks, feedback, suppressions, frecency) is a SEPARATE sidecar
+// database with no generation axis at all. It is outside this payload
+// authority: it is never an output generation, it is never named by a target,
+// and repository untrack / generation retirement / payload cleanup must never
+// treat it as payload. Neither internal/indexer nor internal/graph/store_sqlite
+// imports it, and TestRepositoryCleanupLeavesPersistenceSidecarsAlone pins
+// both the import boundary and the on-disk files.
+
+// OutputGenerationKind names which of the three output axes a mutation writes.
+type OutputGenerationKind uint8
+
+const (
+	// OutputGenerationLegacy is the mutable legacy corpus: generation zero.
+	OutputGenerationLegacy OutputGenerationKind = iota + 1
+	// OutputGenerationCheckout is a checkout's routed dirty/commit generation.
+	OutputGenerationCheckout
+	// OutputGenerationDedicated is a claimed dedicated generation.
+	OutputGenerationDedicated
+)
+
+func (k OutputGenerationKind) String() string {
+	switch k {
+	case OutputGenerationLegacy:
+		return "legacy"
+	case OutputGenerationCheckout:
+		return "checkout"
+	case OutputGenerationDedicated:
+		return "dedicated"
+	default:
+		return "invalid"
+	}
+}
+
+var (
+	// ErrOutputMutationEntryUnregistered refuses a mutation raised from a call
+	// site the authority does not know. A new production mutation entry point
+	// must declare itself in outputMutationEntryKinds; until it does, it cannot
+	// name an output generation and is refused rather than admitted silently.
+	ErrOutputMutationEntryUnregistered = errors.New("indexer: repository mutation entry point is not registered with the output-generation authority")
+	// ErrOutputMutationTargetInvalid refuses a mutation that does not name
+	// exactly one output generation and owner.
+	ErrOutputMutationTargetInvalid = errors.New("indexer: repository mutation does not name exactly one output generation")
+	// ErrOutputMutationReceiptSuperseded refuses work whose authority was taken
+	// over by a newer mutation for the same owner. Gate 6, last clause.
+	ErrOutputMutationReceiptSuperseded = errors.New("indexer: superseded work cannot fulfil a newer mutation receipt")
+	// ErrOutputMutationReceiptSettled refuses a second settlement of a receipt
+	// that already settled. It is a DIFFERENT fact from supersession: the first
+	// settlement may well have fulfilled the generation, and reporting it as
+	// "superseded" would be a false identity.
+	ErrOutputMutationReceiptSettled = errors.New("indexer: mutation receipt has already settled")
+	// ErrOutputMutationAuthorityClosed refuses admission after teardown.
+	ErrOutputMutationAuthorityClosed = errors.New("indexer: output-generation authority is closed")
+)
+
+// OutputMutationEntry is the stable name of one production mutation entry
+// point. The constants below are the complete registry; see
+// TestEveryProductionMutationEntryPointIsRegistered, which reads the package
+// source and fails when a call site names anything else.
+type OutputMutationEntry string
+
+const (
+	OutputEntryIndexCtx            OutputMutationEntry = "indexer.Indexer.IndexCtx"
+	OutputEntryIndexFile           OutputMutationEntry = "indexer.Indexer.IndexFile"
+	OutputEntryEvictFile           OutputMutationEntry = "indexer.Indexer.EvictFile"
+	OutputEntryReresolveFileScoped OutputMutationEntry = "indexer.Indexer.ReresolveFileScoped"
+	// IncrementalReindexPaths has no entry of its own on purpose: it COALESCES
+	// through coordinateRepositoryReindex, so the execution that writes is the
+	// lane worker, which names OutputEntryRepositoryReconcileLane below.
+	OutputEntryDeferredPasses          OutputMutationEntry = "indexer.MultiIndexer.withDeferredRepositoryMutation"
+	OutputEntryRepositoryTopology      OutputMutationEntry = "indexer.MultiIndexer.coordinateRepositoryTopologyMutation"
+	OutputEntryIndexMultiRepo          OutputMutationEntry = "indexer.MultiIndexer.indexMultiRepo"
+	OutputEntryIndexRepo               OutputMutationEntry = "indexer.MultiIndexer.IndexRepo"
+	OutputEntryIncrementalDiscoverRepo OutputMutationEntry = "indexer.MultiIndexer.incrementalDiscoverRepo"
+	OutputEntryGitWatcherFinalize      OutputMutationEntry = "indexer.GitWatcher.finalizeReconcile"
+	OutputEntryPollerFinalizeGitHead   OutputMutationEntry = "indexer.Poller.finalizeGitHead"
+	OutputEntryWatcherDirScan          OutputMutationEntry = "indexer.Watcher.runDirScan"
+	OutputEntryWatcherPatchGraph       OutputMutationEntry = "indexer.Watcher.patchGraphWithReceiptState"
+	OutputEntryWatcherEnqueueReresolve OutputMutationEntry = "indexer.Watcher.enqueueReresolve"
+	OutputEntryCheckoutSourceMutation  OutputMutationEntry = "indexer.CheckoutLifecycle.BeginCheckoutMutation"
+	// OutputEntryRepositoryReconcileLane is the coalescing lane worker itself.
+	// Reconcile requests merge, so the execution — not the queuing caller — is
+	// the entry point that names an output generation.
+	OutputEntryRepositoryReconcileLane OutputMutationEntry = "indexer.repositoryMutationCoordinator.drain"
+)
+
+// outputMutationEntryKinds is the registry. An entry that is absent here cannot
+// open a receipt, which is what makes "every production mutation entry passes
+// through the authority" a checkable property rather than a convention.
+var outputMutationEntryKinds = map[OutputMutationEntry]OutputGenerationKind{
+	OutputEntryIndexCtx:                OutputGenerationLegacy,
+	OutputEntryIndexFile:               OutputGenerationLegacy,
+	OutputEntryEvictFile:               OutputGenerationLegacy,
+	OutputEntryReresolveFileScoped:     OutputGenerationLegacy,
+	OutputEntryDeferredPasses:          OutputGenerationLegacy,
+	OutputEntryRepositoryTopology:      OutputGenerationLegacy,
+	OutputEntryIndexMultiRepo:          OutputGenerationLegacy,
+	OutputEntryIndexRepo:               OutputGenerationLegacy,
+	OutputEntryIncrementalDiscoverRepo: OutputGenerationLegacy,
+	OutputEntryGitWatcherFinalize:      OutputGenerationLegacy,
+	OutputEntryPollerFinalizeGitHead:   OutputGenerationLegacy,
+	OutputEntryWatcherDirScan:          OutputGenerationLegacy,
+	OutputEntryWatcherPatchGraph:       OutputGenerationLegacy,
+	OutputEntryWatcherEnqueueReresolve: OutputGenerationLegacy,
+	OutputEntryCheckoutSourceMutation:  OutputGenerationCheckout,
+	OutputEntryRepositoryReconcileLane: OutputGenerationLegacy,
+}
+
+// OutputMutationTarget is the one output generation and owner a mutation
+// writes. OwnerKey is the serialization identity: two mutations that name the
+// same OwnerKey are mutations of the same output, whichever lane raised them.
+type OutputMutationTarget struct {
+	Kind        OutputGenerationKind
+	OwnerKey    string
+	RepoPrefix  string
+	RootPath    string
+	GraphID     string
+	CheckoutID  string
+	Incarnation string
+	// Generation is the output generation identifier. It MUST be zero for a
+	// legacy target and positive for a checkout or dedicated one.
+	Generation int64
+}
+
+func (t OutputMutationTarget) validate() error {
+	if t.OwnerKey == "" {
+		return fmt.Errorf("%w: no owner", ErrOutputMutationTargetInvalid)
+	}
+	switch t.Kind {
+	case OutputGenerationLegacy:
+		// Generation zero is the legacy corpus and is never relabelled as a
+		// committed generation, so a legacy target may not carry one.
+		if t.Generation != 0 {
+			return fmt.Errorf("%w: legacy owner %q named generation %d, which is not generation zero",
+				ErrOutputMutationTargetInvalid, t.OwnerKey, t.Generation)
+		}
+	case OutputGenerationCheckout:
+		if t.Generation <= 0 || t.CheckoutID == "" || t.Incarnation == "" {
+			return fmt.Errorf("%w: checkout owner %q named generation %d without a complete checkout identity",
+				ErrOutputMutationTargetInvalid, t.OwnerKey, t.Generation)
+		}
+	case OutputGenerationDedicated:
+		if t.Generation <= 0 || t.GraphID == "" {
+			return fmt.Errorf("%w: dedicated owner %q named generation %d without a graph",
+				ErrOutputMutationTargetInvalid, t.OwnerKey, t.Generation)
+		}
+	default:
+		return fmt.Errorf("%w: owner %q named no output axis", ErrOutputMutationTargetInvalid, t.OwnerKey)
+	}
+	return nil
+}
+
+type outputGenerationOwnerState struct {
+	latest uint64
+	live   int
+}
+
+// OutputGenerationAuthority is the process-wide authority every repository
+// mutation passes through. One per stack; NewSharedServer installs it on the
+// standalone Indexer and on the MultiIndexer so the owned lanes and the
+// orphan standalone lane cannot name the same output without noticing.
+type OutputGenerationAuthority struct {
+	// leases is the stack's view-lease manager, the same one the publisher
+	// runtime and the request readers share. Nil is allowed and means this
+	// authority takes no source witness.
+	leases *graphview.LeaseManager
+
+	mu         sync.Mutex
+	closed     bool
+	seq        uint64
+	owners     map[string]*outputGenerationOwnerState
+	issued     uint64
+	settled    uint64
+	superseded uint64
+	witnessed  uint64
+}
+
+// NewOutputGenerationAuthority builds the authority over one lease manager.
+// A nil manager is legal: the authority still names output generations and
+// still fences superseded receipts, it simply takes no source witness.
+func NewOutputGenerationAuthority(leases *graphview.LeaseManager) *OutputGenerationAuthority {
+	return &OutputGenerationAuthority{leases: leases, owners: make(map[string]*outputGenerationOwnerState)}
+}
+
+// ViewLeases reports the lease manager this authority witnesses source through.
+func (a *OutputGenerationAuthority) ViewLeases() *graphview.LeaseManager {
+	if a == nil {
+		return nil
+	}
+	return a.leases
+}
+
+// OutputGenerationAuthorityStats is the authority's own counters. Receipts that
+// were issued, receipts that settled, and the subset refused as superseded.
+type OutputGenerationAuthorityStats struct {
+	Issued     uint64
+	Settled    uint64
+	Superseded uint64
+	Witnessed  uint64
+	LiveOwners int
+}
+
+func (a *OutputGenerationAuthority) Stats() OutputGenerationAuthorityStats {
+	if a == nil {
+		return OutputGenerationAuthorityStats{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return OutputGenerationAuthorityStats{
+		Issued: a.issued, Settled: a.settled, Superseded: a.superseded,
+		Witnessed: a.witnessed, LiveOwners: len(a.owners),
+	}
+}
+
+// Close stops admission. Outstanding receipts may still settle: closing must
+// refuse new work, not strand work already running on a lane.
+func (a *OutputGenerationAuthority) Close() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.closed = true
+	a.mu.Unlock()
+}
+
+// OutputMutationReceipt is one admitted mutation's authority over one output
+// generation. It settles exactly once, through Complete or Abandon.
+type OutputMutationReceipt struct {
+	authority *OutputGenerationAuthority
+	entry     OutputMutationEntry
+	target    OutputMutationTarget
+	seq       uint64
+
+	mu      sync.Mutex
+	settled bool
+	source  *graphview.RawRepositoryMutationLease
+}
+
+// OutputMutationReceipts is a batch admitted together, for an entry point that
+// mutates several repositories under one held set of lanes.
+type OutputMutationReceipts []*OutputMutationReceipt
+
+// Begin admits one mutation. It refuses an unregistered entry point, an entry
+// whose declared axis does not match the target, a target that does not name
+// exactly one output generation and owner, and admission after Close.
+func (a *OutputGenerationAuthority) Begin(
+	ctx context.Context, entry OutputMutationEntry, target OutputMutationTarget,
+) (*OutputMutationReceipt, error) {
+	if a == nil {
+		return nil, ErrOutputMutationAuthorityClosed
+	}
+	kind, registered := outputMutationEntryKinds[entry]
+	if !registered {
+		return nil, fmt.Errorf("%w: %q", ErrOutputMutationEntryUnregistered, entry)
+	}
+	if target.Kind != kind {
+		return nil, fmt.Errorf("%w: entry %q writes %s, target named %s",
+			ErrOutputMutationTargetInvalid, entry, kind, target.Kind)
+	}
+	if err := target.validate(); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return nil, ErrOutputMutationAuthorityClosed
+	}
+	a.seq++
+	seq := a.seq
+	state := a.owners[target.OwnerKey]
+	if state == nil {
+		state = &outputGenerationOwnerState{}
+		a.owners[target.OwnerKey] = state
+	}
+	state.latest = seq
+	state.live++
+	a.issued++
+	a.mu.Unlock()
+
+	receipt := &OutputMutationReceipt{authority: a, entry: entry, target: target, seq: seq}
+	// The source gate blocks, so it is taken outside the authority mutex and
+	// only after the caller already owns its repository lane, which is the
+	// order graphview's raw mutation API documents.
+	if err := a.openSourceWitness(ctx, receipt); err != nil {
+		receipt.Abandon()
+		return nil, err
+	}
+	return receipt, nil
+}
+
+// BeginAll admits one mutation per target under a single entry point, in the
+// caller's order. A failure part-way abandons everything it already admitted,
+// so the batch is all-or-nothing at admission.
+func (a *OutputGenerationAuthority) BeginAll(
+	ctx context.Context, entry OutputMutationEntry, targets []OutputMutationTarget,
+) (OutputMutationReceipts, error) {
+	receipts := make(OutputMutationReceipts, 0, len(targets))
+	for _, target := range targets {
+		receipt, err := a.Begin(ctx, entry, target)
+		if err != nil {
+			receipts.Abandon()
+			return nil, err
+		}
+		receipts = append(receipts, receipt)
+	}
+	return receipts, nil
+}
+
+// openSourceWitness takes the repository's exclusive raw-source data gate for
+// the length of a legacy mutation, so a live BasePin sees the revision move.
+//
+// A repository with no registered raw source authority is left unwitnessed on
+// purpose: BasePin reports that as "unknown", and inventing a witness here
+// would let a request claim an exactness nobody observed.
+func (a *OutputGenerationAuthority) openSourceWitness(ctx context.Context, receipt *OutputMutationReceipt) error {
+	if a.leases == nil || receipt.target.Kind != OutputGenerationLegacy {
+		return nil
+	}
+	prefix, root := receipt.target.RepoPrefix, receipt.target.RootPath
+	if prefix == "" || root == "" {
+		return nil
+	}
+	registration, err := a.leases.LookupRawRepositoryRegistration(prefix, root)
+	if err != nil || registration == nil {
+		return nil
+	}
+	lease, err := a.leases.AcquireRawRepositoryMutationAfter(ctx, registration, 0)
+	if err != nil {
+		return err
+	}
+	receipt.source = lease
+	a.mu.Lock()
+	a.witnessed++
+	a.mu.Unlock()
+	return nil
+}
+
+// Entry reports the registered entry point that opened this receipt.
+func (r *OutputMutationReceipt) Entry() OutputMutationEntry {
+	if r == nil {
+		return ""
+	}
+	return r.entry
+}
+
+// Target reports the single output generation and owner this receipt names.
+func (r *OutputMutationReceipt) Target() OutputMutationTarget {
+	if r == nil {
+		return OutputMutationTarget{}
+	}
+	return r.target
+}
+
+// Witnessed reports whether this mutation moved a real source witness.
+func (r *OutputMutationReceipt) Witnessed() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.source != nil
+}
+
+// Superseded reports whether a newer receipt for the same owner was admitted
+// after this one. A superseded receipt can no longer fulfil its generation.
+func (r *OutputMutationReceipt) Superseded() bool {
+	if r == nil || r.authority == nil {
+		return false
+	}
+	a := r.authority
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state := a.owners[r.target.OwnerKey]
+	return state == nil || state.latest != r.seq
+}
+
+// Complete fulfils the output generation this receipt named.
+//
+// It refuses when a newer mutation for the same owner was admitted while this
+// one ran: that work is superseded and must not publish over the newer
+// decision. The source witness is completed only on a fulfilled receipt; a
+// refused or abandoned one deliberately leaves the source marked unavailable,
+// because a mutation that lost its authority may have written part of it.
+func (r *OutputMutationReceipt) Complete() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.settled {
+		return fmt.Errorf("%w: receipt for owner %q", ErrOutputMutationReceiptSettled, r.target.OwnerKey)
+	}
+	r.settled = true
+	superseded := r.authority.settle(r)
+	source := r.source
+	r.source = nil
+	if superseded {
+		if source != nil {
+			source.Release()
+		}
+		return fmt.Errorf("%w: entry %q owner %q generation %d",
+			ErrOutputMutationReceiptSuperseded, r.entry, r.target.OwnerKey, r.target.Generation)
+	}
+	if source != nil {
+		completeErr := source.Complete(fmt.Sprintf("gen0:r%d", source.Revision()))
+		source.Release()
+		if completeErr != nil {
+			return completeErr
+		}
+	}
+	return nil
+}
+
+// Abandon settles a receipt that did not fulfil its generation. Idempotent.
+func (r *OutputMutationReceipt) Abandon() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.settled {
+		return
+	}
+	r.settled = true
+	r.authority.settle(r)
+	if r.source != nil {
+		// No Complete: graphview leaves partial or failed source data
+		// unavailable on purpose, which is exactly what an abandoned mutation
+		// of generation zero is.
+		r.source.Release()
+		r.source = nil
+	}
+}
+
+// Complete fulfils every receipt in the batch. Every receipt is settled even
+// when an earlier one refuses, so no owner is left holding a live receipt.
+func (rs OutputMutationReceipts) Complete() error {
+	var firstErr error
+	for _, receipt := range rs {
+		if err := receipt.Complete(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// Current is the batch's preventive check: it refuses before the payload runs
+// when any receipt in the batch already lost its authority. See
+// runUnderOutputReceipt for why admission and payload start are not the same
+// instant.
+func (rs OutputMutationReceipts) Current() error {
+	for _, receipt := range rs {
+		if receipt.Superseded() {
+			return fmt.Errorf("%w: entry %q owner %q was taken over before its payload started",
+				ErrOutputMutationReceiptSuperseded, receipt.Entry(), receipt.Target().OwnerKey)
+		}
+	}
+	return nil
+}
+
+// Abandon settles every receipt in the batch without fulfilling it.
+func (rs OutputMutationReceipts) Abandon() {
+	for _, receipt := range rs {
+		receipt.Abandon()
+	}
+}
+
+func (a *OutputGenerationAuthority) settle(r *OutputMutationReceipt) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state := a.owners[r.target.OwnerKey]
+	superseded := state == nil || state.latest != r.seq
+	if state != nil {
+		state.live--
+		if state.live <= 0 {
+			delete(a.owners, r.target.OwnerKey)
+		}
+	}
+	a.settled++
+	if superseded {
+		a.superseded++
+	}
+	return superseded
+}
+
+// defaultOutputGenerationAuthority is the fallback for an Indexer or lifecycle
+// nothing installed one on — hand-built fixtures and the embedded paths. It
+// keeps "every mutation names one output generation" true everywhere;
+// NewSharedServer installs a real, lease-backed authority for production.
+var (
+	defaultOutputAuthorityOnce sync.Once
+	defaultOutputAuthority     *OutputGenerationAuthority
+)
+
+func defaultOutputGenerationAuthority() *OutputGenerationAuthority {
+	defaultOutputAuthorityOnce.Do(func() {
+		defaultOutputAuthority = NewOutputGenerationAuthority(nil)
+	})
+	return defaultOutputAuthority
+}
+
+// SetOutputGenerationAuthority installs the process authority on this Indexer.
+func (idx *Indexer) SetOutputGenerationAuthority(a *OutputGenerationAuthority) {
+	if idx == nil {
+		return
+	}
+	idx.outputAuthority.Store(a)
+}
+
+// SetOutputGenerationAuthority installs the process authority on this
+// MultiIndexer, so every per-repository Indexer it owns resolves to it.
+func (mi *MultiIndexer) SetOutputGenerationAuthority(a *OutputGenerationAuthority) {
+	if mi == nil {
+		return
+	}
+	mi.outputAuthority.Store(a)
+}
+
+func (mi *MultiIndexer) outputGenerationAuthority() *OutputGenerationAuthority {
+	if mi != nil {
+		if a := mi.outputAuthority.Load(); a != nil {
+			return a
+		}
+	}
+	return defaultOutputGenerationAuthority()
+}
+
+// outputGenerationAuthority resolves this Indexer's authority: its own if one
+// was installed, otherwise its owning MultiIndexer's, otherwise the default.
+// The owned lane and the orphan standalone lane therefore resolve to the SAME
+// authority in a stack that installed one.
+func (idx *Indexer) outputGenerationAuthority() *OutputGenerationAuthority {
+	if idx == nil {
+		return defaultOutputGenerationAuthority()
+	}
+	if a := idx.outputAuthority.Load(); a != nil {
+		return a
+	}
+	idx.repositoryMutationMu.Lock()
+	owner := idx.repositoryMutationOwner
+	idx.repositoryMutationMu.Unlock()
+	if owner != nil {
+		if a := owner.outputAuthority.Load(); a != nil {
+			return a
+		}
+	}
+	return defaultOutputGenerationAuthority()
+}
+
+// ResolvedOutputGenerationAuthority reports the authority this Indexer admits
+// mutations through, after the owner and default fallbacks. It is the read a
+// wiring test uses to prove the orphan lane and the owned lanes resolve to the
+// one value the stack installed.
+func (idx *Indexer) ResolvedOutputGenerationAuthority() *OutputGenerationAuthority {
+	return idx.outputGenerationAuthority()
+}
+
+// ResolvedOutputGenerationAuthority reports the authority every per-repository
+// lane this MultiIndexer owns admits through.
+func (mi *MultiIndexer) ResolvedOutputGenerationAuthority() *OutputGenerationAuthority {
+	return mi.outputGenerationAuthority()
+}
+
+// legacyOutputTarget names this Indexer's one generation-zero output.
+//
+// The owner key is the repository ROOT when one is known, not the prefix: the
+// standalone Indexer a stack hands to the MCP server carries no prefix, and
+// keying by root is what makes its orphan lane collide with the owned lane for
+// the same repository instead of quietly naming a second owner for one corpus.
+func (idx *Indexer) legacyOutputTarget() OutputMutationTarget {
+	idx.repositoryMutationMu.Lock()
+	root, prefix := idx.rootPath, idx.repoPrefix
+	idx.repositoryMutationMu.Unlock()
+	return legacyOutputTargetFor(outputStoreIdentity(idx.graph), prefix, root, fmt.Sprintf("indexer:%p", idx))
+}
+
+// outputStoreIdentity discriminates the OUTPUT a mutation writes into.
+//
+// A repository identity is NOT an output identity. A sparse generation build
+// constructs a private Indexer over its own store handle with the live
+// repository's prefix (SparseGenerationBuilder.runPass) and indexes the tree
+// into it; that payload is a different output from the live corpus, and two
+// such builds for one prefix are different outputs again. Keying the owner on
+// the repository alone collapses them into one owner, and then two perfectly
+// legitimate concurrent builds supersede each other.
+//
+// The store handle is that identity. Two Indexers writing the same handle for
+// the same repository — the standalone orphan-lane Indexer a stack hands the
+// MCP server and the MultiIndexer-owned per-repository lane — still collide on
+// one owner, which is the case the fence exists for.
+func outputStoreIdentity(store graph.Store) string {
+	if store == nil {
+		return "store:none"
+	}
+	return fmt.Sprintf("store:%T/%p", store, store)
+}
+
+func legacyOutputTargetFor(output, prefix, root, fallback string) OutputMutationTarget {
+	target := OutputMutationTarget{Kind: OutputGenerationLegacy, RepoPrefix: prefix}
+	if root != "" {
+		if abs, err := filepath.Abs(root); err == nil {
+			root = abs
+		}
+		target.RootPath = filepath.Clean(root)
+	}
+	switch {
+	case target.RootPath != "":
+		target.OwnerKey = "root:" + target.RootPath
+	case prefix != "":
+		target.OwnerKey = "prefix:" + prefix
+	default:
+		target.OwnerKey = fallback
+	}
+	if output != "" {
+		target.OwnerKey = output + "|" + target.OwnerKey
+	}
+	return target
+}
+
+// withOutputGeneration runs one mutation body under one receipt. Callers hold
+// their repository lane already, which is the order the source gate requires.
+func (idx *Indexer) withOutputGeneration(ctx context.Context, entry OutputMutationEntry, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	receipt, err := idx.outputGenerationAuthority().Begin(ctx, entry, idx.legacyOutputTarget())
+	if err != nil {
+		return err
+	}
+	return runUnderOutputReceipt(receipt, fn)
+}
+
+// runUnderOutputReceipt runs one mutation body under one already-admitted
+// receipt, and is the PREVENTIVE half of the fence.
+//
+// Admission is not instantaneous: Begin takes the repository's raw-source data
+// gate, which blocks, so a newer mutation for the same owner can be admitted
+// between "this receipt was issued" and "this receipt's payload starts". A
+// receipt that already lost its authority therefore never gets to run its body
+// — the refusal is raised before any byte moves, not reported after the fact.
+// Supersession that happens *while* the body runs can only be caught at
+// Complete; that residual case is the reporting half, and its caller gets the
+// refusal so the work is retried rather than reported as fulfilled.
+func runUnderOutputReceipt(receipt *OutputMutationReceipt, fn func() error) error {
+	if fn == nil {
+		receipt.Abandon()
+		return nil
+	}
+	if receipt.Superseded() {
+		receipt.Abandon()
+		return fmt.Errorf("%w: entry %q owner %q generation %d was taken over before its payload started",
+			ErrOutputMutationReceiptSuperseded, receipt.Entry(), receipt.Target().OwnerKey, receipt.Target().Generation)
+	}
+	if err := fn(); err != nil {
+		receipt.Abandon()
+		return err
+	}
+	return receipt.Complete()
 }

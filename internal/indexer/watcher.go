@@ -1561,7 +1561,7 @@ func (w *Watcher) runDirScan(dirs map[string]struct{}, fn func(map[string]struct
 	if w.discoverReindex != nil {
 		_, err = w.discoverReindex(discoveryPaths)
 	} else {
-		err = w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+		err = w.indexer.coordinateRepositoryMutation(context.Background(), OutputEntryWatcherDirScan, func() error {
 			_, rawErr := w.indexer.incrementalDiscoverWatcherPaths(w.indexer.rootPath, discoveryPaths)
 			return rawErr
 		})
@@ -2354,7 +2354,7 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 	// IndexRepo replacement uses the same lane and cannot change underneath
 	// the raw patch.
 	laneCtx, cancelLane := w.mutationLaneContext()
-	err := w.indexer.coordinateRepositoryMutation(laneCtx, func() error {
+	err := w.indexer.coordinateRepositoryMutation(laneCtx, OutputEntryWatcherPatchGraph, func() error {
 		idx := w.currentMutationIndexer()
 		if idx == nil {
 			return errWatcherIndexerMissing
@@ -2765,7 +2765,7 @@ func (w *Watcher) enqueueReresolve(path string) {
 				// Admit on the watcher's stable lane, then resolve the current
 				// registered Indexer. IndexRepo replacement cannot interleave
 				// between that lookup and the scoped re-resolve loop.
-				err := w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+				err := w.indexer.coordinateRepositoryMutation(context.Background(), OutputEntryWatcherEnqueueReresolve, func() error {
 					idx := w.currentMutationIndexer()
 					if idx == nil {
 						return errWatcherIndexerMissing

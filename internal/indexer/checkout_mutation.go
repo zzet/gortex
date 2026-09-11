@@ -50,6 +50,21 @@ type CheckoutMutation struct {
 	headRef         string
 	headCommit      string
 	headTree        string
+	// receipt is this lease's authority over the routed dirty generation it
+	// withdraws and republishes. Exactly one output generation per mutation.
+	receipt    *OutputMutationReceipt
+	receiptErr error
+}
+
+// lifecycleOutputAuthority resolves the process authority a checkout mutation
+// admits through. It is the MultiIndexer's — the same one every generation-zero
+// lane resolves to — so a checkout source edit and a legacy corpus mutation are
+// ordered by one authority rather than two.
+func lifecycleOutputAuthority(l *CheckoutLifecycle) *OutputGenerationAuthority {
+	if l == nil || l.mi == nil {
+		return defaultOutputGenerationAuthority()
+	}
+	return l.mi.outputGenerationAuthority()
 }
 
 // BeginCheckoutMutation admits a source edit against the exact checkout route
@@ -147,8 +162,65 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	if err := m.validateSnapshot(waitCtx); err != nil {
 		return nil, err
 	}
+	// The lease names exactly one output generation: this checkout's routed
+	// DIRTY generation, the one Prepare withdraws and Refresh republishes. The
+	// receipt is opened last, under the cycle lock, so its issue order is the
+	// order edits are admitted for this checkout; Close settles it.
+	receipt, err := lifecycleOutputAuthority(l).Begin(waitCtx, OutputEntryCheckoutSourceMutation, OutputMutationTarget{
+		Kind:        OutputGenerationCheckout,
+		OwnerKey:    "checkout:" + checkout.CheckoutID,
+		CheckoutID:  checkout.CheckoutID,
+		Incarnation: checkout.Incarnation,
+		Generation:  route.DirtyGenerationID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	m.receipt = receipt
 	admitted, cycleOwned = false, false // Close now owns every acquired resource.
 	return m, nil
+}
+
+// Receipt reports this lease's output-generation receipt, nil once Close has
+// settled it.
+func (m *CheckoutMutation) Receipt() *OutputMutationReceipt {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.receipt
+}
+
+// ReceiptError reports why a fulfilled edit could not fulfil its generation —
+// ErrOutputMutationReceiptSuperseded when a newer mutation for this checkout
+// took the authority over. Nil when the lease settled cleanly.
+func (m *CheckoutMutation) ReceiptError() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.receiptErr
+}
+
+// receiptStillCurrent is the PREVENTIVE half of the output-generation fence on
+// the checkout lane: a lease whose routed dirty generation a newer mutation
+// already took over is refused before it withdraws the route or republishes,
+// so no byte of that generation moves under lost authority. Caller holds m.mu.
+//
+// In today's production shape this can only refuse work in a shape the cycle
+// lock does not already exclude — BeginCheckoutMutation holds c.cycleMu from
+// admission through Close, so two live receipts for one "checkout:<id>" owner
+// do not overlap. The check exists so the invariant survives the lease
+// outliving that lock (asynchronous publication), rather than being an
+// accidental property of the current locking.
+func (m *CheckoutMutation) receiptStillCurrent() error {
+	if m.receipt == nil || !m.receipt.Superseded() {
+		return nil
+	}
+	return fmt.Errorf("%w: checkout %q generation %d was taken over by a newer mutation",
+		ErrOutputMutationReceiptSuperseded, m.checkout.CheckoutID, m.receipt.Target().Generation)
 }
 
 // Prepare withdraws the old dirty generation immediately before the disk
@@ -162,6 +234,9 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	}
 	if m.prepared {
 		return nil
+	}
+	if err := m.receiptStillCurrent(); err != nil {
+		return err
 	}
 	ctx, cancel := checkoutMutationContext(ctx, m.coordinator.lifetimeContext())
 	defer cancel()
@@ -208,6 +283,10 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	defer m.mu.Unlock()
 	if m.closed || !m.prepared || m.refreshQueued {
 		return CheckoutCycle{}, fmt.Errorf("%w: no prepared checkout mutation", ErrCheckoutMutationStale)
+	}
+	// Preventive: a lease that lost its generation does not republish it.
+	if err := m.receiptStillCurrent(); err != nil {
+		return CheckoutCycle{}, err
 	}
 	ctx, cancel := checkoutMutationContext(ctx, m.coordinator.lifetimeContext())
 	defer cancel()
@@ -256,6 +335,22 @@ func (m *CheckoutMutation) Close() {
 	}
 	if m.prepared && !m.fresh {
 		m.coordinator.Signal("source mutation needs a dirty generation refresh")
+	}
+	// A lease that reached a fresh route fulfils its generation; anything else
+	// — a dry run, a failed callback, a withdrawn route left for retry — did
+	// not, and must not claim it. A fulfilment refused as superseded is
+	// reported and rescheduled, never swallowed.
+	if m.receipt != nil {
+		receipt := m.receipt
+		m.receipt = nil
+		if m.fresh {
+			if err := receipt.Complete(); err != nil {
+				m.receiptErr = err
+				m.coordinator.Signal("checkout mutation receipt was superseded")
+			}
+		} else {
+			receipt.Abandon()
+		}
 	}
 	m.coordinator.cycleMu.Unlock()
 	m.coordinator.releaseSourceMutation()

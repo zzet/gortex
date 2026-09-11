@@ -26,7 +26,7 @@ func TestContractRegistryPreloadSkipsEmptyIncrementalWork(t *testing.T) {
 	idx.SetRepoPrefix("fixture")
 	idx.storeRootPath(t.TempDir())
 	require.Nil(t, idx.contractRegistry)
-	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), func() error {
+	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		plan, reparsed, failed, raced := idx.reindexIncrementalFilesBatched(nil, nil, &reparsePendingEnrichmentBatch{}, false)
 		assert.Empty(t, plan.Files)
 		assert.Empty(t, reparsed)
@@ -143,7 +143,7 @@ func testBridgeRegistryRestartFileDeletion(t *testing.T, sameRepo bool) {
 	require.Nil(t, idx.contractRegistry, "restart fixture must not hide lost durable records behind an in-memory registry")
 	require.Len(t, store.GetOutEdges(sourceB.ID), 1, "B must still have its persisted owner after reopen")
 	require.NoError(t, os.Remove(fileA))
-	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), func() error {
+	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		idx.evictFileIncrementalRaw(relativeA)
 		return nil
 	}))
@@ -185,7 +185,7 @@ func testBridgeRegistryRestartFileDeletion(t *testing.T, sameRepo bool) {
 	idx.storeRootPath(rootB)
 	require.Nil(t, idx.contractRegistry, "last-owner deletion also models restart")
 	require.NoError(t, os.Remove(fileB))
-	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), func() error {
+	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		idx.evictFileIncrementalRaw("consumer.go")
 		return nil
 	}))
@@ -300,7 +300,7 @@ func TestBridgeRegistryRestartOffFileCanonicalDeletionPlansContractReconcile(t *
 	require.Equal(t, consumer.FilePath, store.GetNode(provider.ID).FilePath)
 	require.NoError(t, os.Remove(filepath.Join(root, relativeA)))
 	var eviction forcedFileEviction
-	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), func() error {
+	require.NoError(t, idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		eviction = idx.evictFileIncrementalRaw(relativeA)
 		return nil
 	}))
@@ -487,7 +487,7 @@ func TestBridgeRegistryRegisteredRestartDispatchPreservesSurvivors(t *testing.T)
 	require.NotEmpty(t, registeredBridgeMatchSnapshot(t, store, provider.ID, provider.SymbolID, consumer.SymbolID), "deleted pair has a positive persisted match before eviction")
 	require.NoError(t, os.Remove(filepath.Join(root, "provider.go")))
 	var eviction forcedFileEviction
-	require.NoError(t, idx.coordinateRepositoryMutation(ctx, func() error { eviction = idx.evictFileIncrementalRaw("provider.go"); return nil }))
+	require.NoError(t, idx.coordinateRepositoryMutation(ctx, OutputEntryIndexFile, func() error { eviction = idx.evictFileIncrementalRaw("provider.go"); return nil }))
 	require.NotNil(t, eviction.result)
 	plan := eviction.result.DerivedInvalidation
 	require.False(t, plan.LegacyFallback)
@@ -645,7 +645,7 @@ func TestContractFTSFileEvictionPreservesRetainedCanonicalRows(t *testing.T) {
 				// This fixture isolates sidecar accounting; reset the registry so
 				// a cold in-memory registry cannot hide the deletion boundary.
 				f.idx.contractRegistry = nil
-				require.NoError(t, f.idx.coordinateRepositoryMutation(context.Background(), func() error {
+				require.NoError(t, f.idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 					f.idx.evictFileIncrementalRaw("provider.go")
 					return nil
 				}))
@@ -667,7 +667,7 @@ func TestContractFTSFileEvictionPreservesRetainedCanonicalRows(t *testing.T) {
 				// B's initial by-file node set does not include the canonical.
 				f.idx.contractRegistry = nil
 				require.NoError(t, os.Remove(filepath.Join(f.root, "consumer.go")))
-				require.NoError(t, f.idx.coordinateRepositoryMutation(context.Background(), func() error {
+				require.NoError(t, f.idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 					f.idx.evictFileIncrementalRaw("consumer.go")
 					return nil
 				}))

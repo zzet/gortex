@@ -536,6 +536,10 @@ type Indexer struct {
 	repositoryMutationMu    sync.Mutex
 	repositoryMutation      *repositoryMutationCoordinator
 	repositoryMutationOwner *MultiIndexer
+	// outputAuthority is the process-wide output-generation authority. It is
+	// read without repositoryMutationMu, so it is an atomic pointer: a lane
+	// resolving its authority must never wait on the mutation mutex.
+	outputAuthority atomic.Pointer[OutputGenerationAuthority]
 
 	// incrementalResolveFilesHook is a focused test seam for proving a
 	// multi-file watcher batch invokes the scoped resolver exactly once. nil in
@@ -2472,7 +2476,7 @@ func clampParseWeight(size, budget int64) int64 {
 // mutation lane with watcher, polling, reconciliation, and MCP edits.
 func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, error) {
 	var result *IndexResult
-	err := idx.coordinateRepositoryMutation(ctx, func() error {
+	err := idx.coordinateRepositoryMutation(ctx, OutputEntryIndexCtx, func() error {
 		current, currentErr := idx.currentRepositoryMutationIndexer()
 		if currentErr != nil {
 			return currentErr
@@ -4466,7 +4470,7 @@ func (idx *Indexer) IndexFile(filePath string) error {
 	if err := validateRepositoryMutationRegularFile(root, canonical); err != nil {
 		return err
 	}
-	return idx.coordinateRepositoryMutation(context.Background(), func() error {
+	return idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		// The path may be deleted or replaced while this call waits for the
 		// repository lane. Revalidate after admission so IndexFile preserves its
 		// existing-regular-file contract instead of turning a queued update into
@@ -5220,7 +5224,7 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 		return 0, 0
 	}
 	var nodesRemoved, edgesRemoved int
-	err = idx.coordinateRepositoryMutation(context.Background(), func() error {
+	err = idx.coordinateRepositoryMutation(context.Background(), OutputEntryEvictFile, func() error {
 		var evictErr error
 		nodesRemoved, edgesRemoved, evictErr = idx.evictPointMutationRaw(canonical)
 		return evictErr
@@ -5268,7 +5272,7 @@ func (idx *Indexer) ReresolveFileScoped(filePath string) error {
 	if err != nil {
 		return err
 	}
-	return idx.coordinateRepositoryMutation(context.Background(), func() error {
+	return idx.coordinateRepositoryMutation(context.Background(), OutputEntryReresolveFileScoped, func() error {
 		current, currentErr := idx.currentRepositoryMutationIndexer()
 		if currentErr != nil {
 			return currentErr

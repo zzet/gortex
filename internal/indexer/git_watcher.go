@@ -263,7 +263,7 @@ func (gw *GitWatcher) registeredIndexer() *Indexer {
 // after the restamp; failed lane admission therefore leaves the prior SHA for
 // the next ref notification to retry.
 func (gw *GitWatcher) finalizeReconcile(ctx context.Context, newSHA string) error {
-	return gw.indexer.coordinateRepositoryMutation(ctx, func() error {
+	return gw.indexer.coordinateRepositoryMutation(ctx, OutputEntryGitWatcherFinalize, func() error {
 		idx := gw.registeredIndexer()
 		if idx == nil {
 			return fmt.Errorf("git-watcher: repository indexer is no longer registered")

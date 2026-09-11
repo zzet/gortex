@@ -152,6 +152,13 @@ type SharedServer struct {
 	// use this one value. Nil in single-repo standalone and whenever the
 	// backend is not the sqlite store (nothing publishes there).
 	DedicatedBaseRuntime *indexer.DedicatedBaseRuntime
+	// OutputGenerationAuthority is the process-wide authority every repository
+	// mutation admits through: the generation-zero lanes (owned and orphan),
+	// the multi-repo cold batch, the topology transitions and the checkout
+	// source-edit leases. It is installed on the standalone Indexer AND on the
+	// MultiIndexer, so the standalone Indexer this stack hands to the MCP
+	// server cannot mutate on a lane with no named owner. Never nil.
+	OutputGenerationAuthority *indexer.OutputGenerationAuthority
 	// StorePath is the graph store file this stack actually opened: the
 	// caller's BackendPath expanded to an absolute path, or the platform
 	// default when it was empty. Entry points publish it so out-of-band
@@ -672,6 +679,36 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			}
 			s.DedicatedBaseRuntime = runtime
 		}
+	}
+	// The output-generation authority is installed in the same window and for
+	// the same reason as the publisher runtime above: it belongs to the stack,
+	// so the embedded one-shot path shares it instead of repeating the
+	// SetBuildGate asymmetry.
+	//
+	// It is handed the lifecycle's OWN lease manager when there is a lifecycle,
+	// because that is the manager a routed request's BasePin is taken from: a
+	// generation-zero mutation witnessed through any other manager would be
+	// invisible to the request that needs to hear about it.
+	//
+	// Both the standalone Indexer and the MultiIndexer are installed on. The
+	// standalone Indexer mints an ORPHAN mutation lane (no owner, no prefix),
+	// and it is the Indexer this stack hands straight to the MCP server; with
+	// one shared authority its mutations still name an output generation and
+	// owner rather than running on a lane nothing speaks for.
+	{
+		var authorityLeases *graphview.LeaseManager
+		if s.CheckoutLifecycle != nil {
+			authorityLeases = s.CheckoutLifecycle.ViewLeases()
+		}
+		authority := indexer.NewOutputGenerationAuthority(authorityLeases)
+		idx.SetOutputGenerationAuthority(authority)
+		if mi != nil {
+			mi.SetOutputGenerationAuthority(authority)
+		}
+		s.OutputGenerationAuthority = authority
+		// Admission stops with the stack. Outstanding receipts still settle:
+		// closing must refuse new work, not strand work already on a lane.
+		s.cleanup = append(s.cleanup, authority.Close)
 	}
 	// Appended after backendCleanup but before MCP background drain. LIFO
 	// teardown therefore drains background work first, then closes per-repo

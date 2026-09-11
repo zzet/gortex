@@ -1,6 +1,8 @@
 package serverstack
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // TestNewSharedServer_Oneshot asserts the shared constructor builds a
@@ -89,5 +92,61 @@ func TestNewSharedServer_OneshotRefusesSharedStore(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "BackendPath") {
 		t.Errorf("error should name the missing BackendPath, got: %v", err)
+	}
+}
+
+// TestSharedServerInstallsOneOutputGenerationAuthorityOnBothLanes is the
+// production-entrypoint trace for W3.1's install.
+//
+// NewSharedServer is the one constructor both production entry points build
+// through (cmd/gortex/daemon_state.go for the daemon, cmd/gortex/mcp.go for
+// the embedded one-shot server). It always builds a standalone Indexer and
+// hands it straight to the MCP server; that Indexer mints an ORPHAN mutation
+// lane, which is the lane the MultiIndexer's batch gate does not span. The
+// authority is what makes both lanes name their output generation and owner
+// through one process-wide fence, so the install has to happen here rather
+// than in cmd/gortex/daemon.go — the SetBuildGate asymmetry that leaves the
+// one-shot path ungated is the counter-example.
+func TestSharedServerInstallsOneOutputGenerationAuthorityOnBothLanes(t *testing.T) {
+	stack, closeStack := newPublisherStack(t)
+
+	authority := stack.OutputGenerationAuthority
+	if authority == nil {
+		t.Fatal("the stack published no output-generation authority")
+	}
+	if stack.Indexer == nil {
+		t.Fatal("the stack built no standalone Indexer")
+	}
+	// The standalone Indexer — the orphan lane — resolves to the stack's
+	// authority, not to a private one.
+	if got := stack.Indexer.ResolvedOutputGenerationAuthority(); got != authority {
+		t.Fatal("the standalone Indexer does not resolve to the stack's output-generation authority")
+	}
+	if stack.MultiIndexer == nil {
+		t.Fatal("the stack built no MultiIndexer")
+	}
+	// Every owned per-repository lane resolves to the SAME value, so a
+	// mutation raised through the standalone Indexer and one raised through an
+	// owned lane are ordered by one authority rather than two.
+	owned := stack.MultiIndexer.ResolvedOutputGenerationAuthority()
+	if owned != authority {
+		t.Fatal("the MultiIndexer does not resolve to the stack's output-generation authority")
+	}
+	// The authority witnesses source through the lease manager a routed
+	// request's base pin is taken from. A private manager would make a
+	// generation-zero mutation invisible to the request that has to hear
+	// about it.
+	if stack.CheckoutLifecycle != nil {
+		if authority.ViewLeases() != stack.CheckoutLifecycle.ViewLeases() {
+			t.Fatal("the authority was installed with a lease manager the lifecycle does not share")
+		}
+	}
+
+	// Teardown stops admission.
+	closeStack()
+	if _, err := authority.Begin(context.Background(), indexer.OutputEntryIndexFile, indexer.OutputMutationTarget{
+		Kind: indexer.OutputGenerationLegacy, OwnerKey: "root:/tmp/after-close",
+	}); !errors.Is(err, indexer.ErrOutputMutationAuthorityClosed) {
+		t.Fatalf("admission after stack teardown: got %v, want ErrOutputMutationAuthorityClosed", err)
 	}
 }

@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 )
@@ -292,5 +295,200 @@ func BenchmarkCheckoutMutationDryRunAdmission(b *testing.B) {
 			b.Fatal(err)
 		}
 		m.Close()
+	}
+}
+
+// newCheckoutMutationAuthorityFixture is the mutation fixture with a real
+// output-generation authority installed the way NewSharedServer installs it:
+// on the MultiIndexer the lifecycle resolves through.
+func newCheckoutMutationAuthorityFixture(t *testing.T) (*coordinatorFixture, *CheckoutLifecycle, *OutputGenerationAuthority) {
+	t.Helper()
+	f, _, l := newCheckoutMutationFixture(t)
+	authority := NewOutputGenerationAuthority(f.leases)
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), nil, newTestConfigManager(t), zap.NewNop())
+	t.Cleanup(func() { _ = mi.Close(context.Background()) })
+	mi.SetOutputGenerationAuthority(authority)
+	l.mi = mi
+	return f, l, authority
+}
+
+// TestCheckoutMutationNamesItsRoutedDirtyGeneration pins the checkout half of
+// the single output-generation authority.
+//
+// A source edit against a checkout writes exactly one output generation: the
+// routed DIRTY generation Prepare withdraws and Refresh republishes. Nothing
+// else may be named — not the commit generation beside it, and not generation
+// zero. The lease settles that receipt exactly once, on Close.
+func TestCheckoutMutationNamesItsRoutedDirtyGeneration(t *testing.T) {
+	f, l, authority := newCheckoutMutationAuthorityFixture(t)
+	before := f.route()
+
+	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The lease holds this checkout's cycle lock and a source-mutation
+	// admission; a failed assertion must not leave the coordinator undrainable.
+	closed := false
+	defer func() {
+		if !closed {
+			m.Close()
+		}
+	}()
+	receipt := m.Receipt()
+	if receipt == nil {
+		t.Fatal("a checkout source-edit lease opened no output-generation receipt")
+	}
+	target := receipt.Target()
+	if target.Kind != OutputGenerationCheckout {
+		t.Fatalf("target kind = %v, want checkout", target.Kind)
+	}
+	if target.Generation != before.DirtyGenerationID {
+		t.Fatalf("target generation = %d, want the routed dirty generation %d", target.Generation, before.DirtyGenerationID)
+	}
+	if target.Generation == before.CommitGenerationID {
+		t.Fatal("a source edit must not name the commit generation")
+	}
+	if target.CheckoutID != f.checkoutID || target.Incarnation == "" {
+		t.Fatalf("target does not carry the complete checkout identity: %+v", target)
+	}
+	if target.OwnerKey != "checkout:"+f.checkoutID {
+		t.Fatalf("owner key = %q, want the checkout", target.OwnerKey)
+	}
+	if entry := receipt.Entry(); entry != OutputEntryCheckoutSourceMutation {
+		t.Fatalf("entry = %q, want the checkout source-mutation entry point", entry)
+	}
+
+	// A dry run fulfils nothing: it settles the receipt without claiming the
+	// generation it named.
+	m.Close()
+	closed = true
+	if err := m.ReceiptError(); err != nil {
+		t.Fatalf("a dry run must settle cleanly: %v", err)
+	}
+	stats := authority.Stats()
+	if stats.Issued != 1 || stats.Settled != 1 {
+		t.Fatalf("stats = %+v, want one receipt issued and settled", stats)
+	}
+	if stats.LiveOwners != 0 {
+		t.Fatalf("a settled lease must leave no live owner: %+v", stats)
+	}
+}
+
+// TestCheckoutMutationRefusesASupersededGenerationBeforeItWrites is gate 6's
+// last clause on the checkout lane, in its PREVENTIVE form: a lease whose
+// routed dirty generation a newer mutation already took over never withdraws
+// the route and never republishes it. The refusal comes before the bytes move,
+// not after.
+//
+// Reachability, stated plainly: BeginCheckoutMutation holds the checkout's
+// cycleMu from admission through Close (checkout_mutation.go, "Close now owns
+// every acquired resource"), so two live receipts for one "checkout:<id>"
+// owner cannot overlap in today's production shape — this test admits the
+// newer receipt through the authority directly, which is what an asynchronous
+// publication path (or a lease that outlives the cycle lock) would do. The
+// check exists so the invariant is a property of the authority rather than an
+// accident of the current locking.
+func TestCheckoutMutationRefusesASupersededGenerationBeforeItWrites(t *testing.T) {
+	f, l, authority := newCheckoutMutationAuthorityFixture(t)
+	before := f.route()
+
+	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := m.Receipt()
+	if receipt == nil {
+		m.Close()
+		t.Fatal("a checkout source-edit lease opened no output-generation receipt")
+	}
+
+	// A newer mutation takes over this checkout's generation while the lease is
+	// still open and has written nothing.
+	newer, err := authority.Begin(t.Context(), OutputEntryCheckoutSourceMutation, receipt.Target())
+	if err != nil {
+		m.Close()
+		t.Fatalf("admit the newer mutation: %v", err)
+	}
+	defer newer.Abandon()
+
+	// Preventive: Prepare is refused, so the routed dirty generation is never
+	// withdrawn.
+	if err := m.Prepare(t.Context()); !errors.Is(err, ErrOutputMutationReceiptSuperseded) {
+		m.Close()
+		t.Fatalf("Prepare under a superseded receipt: got %v, want ErrOutputMutationReceiptSuperseded", err)
+	}
+	after := f.route()
+	if after.DirtyGenerationID != before.DirtyGenerationID || after.State != before.State || after.RouteEpoch != before.RouteEpoch {
+		m.Close()
+		t.Fatalf("a refused lease moved the route: before=%+v after=%+v", before, after)
+	}
+
+	// Refresh is fenced the same way, so a lease that somehow got past Prepare
+	// still cannot republish the generation.
+	if _, err := m.Refresh(t.Context()); err == nil {
+		m.Close()
+		t.Fatal("Refresh must refuse an unprepared, superseded lease")
+	}
+
+	// And the reporting half still holds: the lease settles without claiming
+	// the generation.
+	m.Close()
+	if err := m.ReceiptError(); err != nil {
+		t.Fatalf("a lease that wrote nothing abandons rather than reporting a refused fulfilment: %v", err)
+	}
+	stats := authority.Stats()
+	if stats.Superseded != 1 {
+		t.Fatalf("superseded count = %d, want 1 (the abandoned lease)", stats.Superseded)
+	}
+	if stats.LiveOwners != 1 {
+		t.Fatalf("the surviving newer receipt must still hold the owner: %+v", stats)
+	}
+}
+
+// TestCheckoutMutationRefusesToFulfilASupersededGeneration is the REPORTING
+// half on the checkout lane: work whose authority a newer mutation took over
+// while it ran cannot fulfil the generation it named, even though its own disk
+// commit and rebuild succeeded. Those bytes are already written; the refusal
+// exists so the lease does not report a fulfilled generation and the
+// coordinator reschedules instead.
+func TestCheckoutMutationRefusesToFulfilASupersededGeneration(t *testing.T) {
+	f, l, authority := newCheckoutMutationAuthorityFixture(t)
+	before := f.route()
+
+	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Prepare(t.Context()); err != nil {
+		m.Close()
+		t.Fatal(err)
+	}
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc SupersededHelper() {}\n")
+	if _, err := m.Refresh(t.Context()); err != nil {
+		m.Close()
+		t.Fatal(err)
+	}
+
+	// The takeover happens after the payload already ran: Prepare and Refresh
+	// both completed, so only Complete can refuse.
+	receipt := m.Receipt()
+	if receipt == nil {
+		m.Close()
+		t.Fatal("a checkout source-edit lease opened no output-generation receipt")
+	}
+	newer, err := authority.Begin(t.Context(), OutputEntryCheckoutSourceMutation, receipt.Target())
+	if err != nil {
+		m.Close()
+		t.Fatalf("admit the newer mutation: %v", err)
+	}
+	defer newer.Abandon()
+
+	m.Close()
+	if err := m.ReceiptError(); !errors.Is(err, ErrOutputMutationReceiptSuperseded) {
+		t.Fatalf("superseded fulfilment: got %v, want ErrOutputMutationReceiptSuperseded", err)
+	}
+	if got := authority.Stats().Superseded; got != 1 {
+		t.Fatalf("superseded count = %d, want 1", got)
 	}
 }
