@@ -265,3 +265,84 @@ func TestRawDataDurableRevisionFloorAndOverflowDoNotReuseOrPoison(t *testing.T) 
 		t.Fatalf("stale durable floor moved local revision backwards: %d", write.Revision())
 	}
 }
+
+// --- W5.3: initial capture and witness validation -----------------------
+
+// TestRawDataInitialCaptureMakesANeverMutatedOwnerPinnable is the hole the
+// capture closes: before it, an owner that was registered and only ever read
+// had no data authority at all, so the read-side acquisition refused it as
+// "changed" and it stayed unpinnable until somebody wrote to it.
+func TestRawDataInitialCaptureMakesANeverMutatedOwnerPinnable(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	if _, err := m.AcquireRawRepositorySnapshot(context.Background(), reg, 0); !errors.Is(err, ErrRawRepositorySourceChanged) {
+		t.Fatalf("snapshot of a never-captured owner = %v, want %v", err, ErrRawRepositorySourceChanged)
+	}
+	revision, err := m.CaptureInitialRawRepositorySource(context.Background(), reg, "source-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision != 1 {
+		t.Fatalf("initial capture revision = %d, want 1", revision)
+	}
+	read, err := m.AcquireRawRepositorySnapshot(context.Background(), reg, revision)
+	if err != nil {
+		t.Fatalf("snapshot after the initial capture: %v", err)
+	}
+	defer read.Release()
+	if got := read.Witness(); got.Revision != revision || got.Fingerprint != "source-a" {
+		t.Fatalf("witness = %+v, want revision %d fingerprint %q", got, revision, "source-a")
+	}
+	if err := read.ValidateCurrent(); err != nil {
+		t.Fatalf("ValidateCurrent() on an unchanged source = %v, want nil", err)
+	}
+}
+
+// TestRawDataInitialCaptureFailsClosed: a capture may never overwrite a
+// witness a reader could already be holding.
+func TestRawDataInitialCaptureFailsClosed(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	if _, err := m.CaptureInitialRawRepositorySource(context.Background(), reg, ""); !errors.Is(err, ErrRawRepositorySourceChanged) {
+		t.Fatalf("capture with no fingerprint = %v, want %v", err, ErrRawRepositorySourceChanged)
+	}
+	if _, err := m.CaptureInitialRawRepositorySource(context.Background(), reg, "source-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CaptureInitialRawRepositorySource(context.Background(), reg, "source-b"); !errors.Is(err, ErrRawRepositorySourceChanged) {
+		t.Fatalf("second capture = %v, want %v", err, ErrRawRepositorySourceChanged)
+	}
+	// A mutated owner is not a never-mutated one either.
+	mutated := privateRawRegistration(t, m, "raw2", "one")
+	privateRawSource(t, m, mutated, "source-x")
+	if _, err := m.CaptureInitialRawRepositorySource(context.Background(), mutated, "source-y"); !errors.Is(err, ErrRawRepositorySourceChanged) {
+		t.Fatalf("capture over a mutated owner = %v, want %v", err, ErrRawRepositorySourceChanged)
+	}
+}
+
+// TestRawDataSnapshotValidateCurrentSeesAMutationAfterHandoff states the
+// lease's real contract: it protects lifetime, not bytes. Once the gate is
+// released the source can move, and a holder that kept the witness has to be
+// able to find that out instead of assuming its capture still stands.
+func TestRawDataSnapshotValidateCurrentSeesAMutationAfterHandoff(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	revision := privateRawSource(t, m, reg, "source-a")
+	read, err := m.AcquireRawRepositorySnapshot(context.Background(), reg, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := read.ValidateCurrent(); err != nil {
+		t.Fatalf("ValidateCurrent() while nothing moved = %v, want nil", err)
+	}
+	// The gate goes; the witness stays. This is the shape a handed-off
+	// consumer is in, and the one a request-lifetime holder is in.
+	read.Release()
+	if err := read.ValidateCurrent(); err != nil {
+		t.Fatalf("ValidateCurrent() after release with no mutation = %v, want nil", err)
+	}
+	privateRawSource(t, m, reg, "source-b")
+	if err := read.ValidateCurrent(); !errors.Is(err, ErrRawRepositorySourceChanged) {
+		t.Fatalf("ValidateCurrent() after the source moved = %v, want %v", err, ErrRawRepositorySourceChanged)
+	}
+}

@@ -42,6 +42,16 @@ type requestView struct {
 	// are bound once at materialization; see bindSources.
 	candidates []query.ViewLayerSource
 	content    *viewContentSearcher
+	// readsBaseCorpus records that generation zero is one of the corpora this
+	// request reads through — it is index 0 of every routed content stack, and
+	// the composed reader's bottom whenever the stack has no dedicated root.
+	// Set by bindSources, which is the one place the base corpus is joined to
+	// a routed view. It is what tells resolveRequestView there is a base to
+	// pin; see pinRequestBaseCorpus.
+	readsBaseCorpus bool
+	// basePin holds generation zero, and the registered owner that speaks for
+	// it, for the lifetime of this request. Released by close().
+	basePin *graphview.BasePin
 	// rider travels on the response whenever the caller named a view or
 	// something other than the base answered.
 	rider *graphview.ViewRider
@@ -85,6 +95,10 @@ type requestView struct {
 	// baseScoped lists capabilities a base-scoped engine answered while
 	// this view served the request.
 	baseScoped []graphview.CapabilityID
+	// baseChanged records that the base corpus this request read was observed
+	// to move while the request was running. It is set once, at rider time,
+	// from the pin's own witness — never inferred.
+	baseChanged bool
 
 	// declared is what a view with no materialized generation stack can
 	// answer: a labelled base selector, a non-strict fallback, or a grace
@@ -158,14 +172,53 @@ func (v *requestView) acceptsBufferOverlay() bool {
 	return v == nil || !v.suppressBufferOverlay
 }
 
-// close releases the generations the view leased and the git child its file
-// surface holds. Idempotent and nil-safe.
+// close releases the generations the view leased, the base corpus it pinned,
+// and the git child its file surface holds. Idempotent and nil-safe.
 func (v *requestView) close() {
 	if v == nil {
 		return
 	}
 	v.files.close()
 	v.materialized.Close()
+	v.basePin.Release()
+}
+
+// noteBaseCorpusChange asks the request's base pin whether generation zero
+// moved while the request ran, and records the answer once.
+//
+// Three outcomes, and the middle one is the point of the pin:
+//
+//   - nil: the witness still describes the corpus, and the answer is as exact
+//     as the route said it was.
+//   - ErrBaseCorpusChanged: the corpus moved under this request, so any result
+//     that read it may be stitched from two states of the world. The rider
+//     stops claiming exactness and says why.
+//   - ErrBaseCorpusUnwitnessed: nothing to compare against — no registered
+//     source authority for this repository. That is not evidence of a change
+//     and must not be reported as one; the rider is left exactly as the route
+//     built it.
+func (v *requestView) noteBaseCorpusChange() bool {
+	if v == nil || v.basePin == nil {
+		return false
+	}
+	changed := errors.Is(v.basePin.ValidateCurrent(), graphview.ErrBaseCorpusChanged)
+	if !changed {
+		return false
+	}
+	v.mu.Lock()
+	v.baseChanged = true
+	v.mu.Unlock()
+	return true
+}
+
+// baseCorpusChanged reports what noteBaseCorpusChange recorded.
+func (v *requestView) baseCorpusChanged() bool {
+	if v == nil {
+		return false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.baseChanged
 }
 
 func withRequestView(ctx context.Context, v *requestView) context.Context {
@@ -471,8 +524,49 @@ func (s *Server) resolveRequestView(
 	policy requestViewPolicy,
 ) (*requestView, error) {
 	view, err := s.selectRequestView(ctx, selector, policy)
+	s.pinRequestBaseCorpus(view, err)
 	s.recordRequestView(view, err)
 	return view, err
+}
+
+// pinRequestBaseCorpus pins the base corpus a routed view reads, for as long
+// as the request holds that view.
+//
+// The materializer leases the derived generations of the stack and generation
+// zero beneath them, but the generation lease is lifetime only. What is missing
+// from it is the registered owner of the repository whose corpus is being read
+// and a witness of that corpus's source state, which is what lets the response
+// say whether the corpus moved while the request ran. Both come from the pin.
+//
+// It is bound to every routed producer at once because bindSources is the one
+// place the base corpus becomes a source of a routed view — the composed
+// reader's bottom in the legacy regime, and index zero of the content stack in
+// every regime. The worktree path (materializeRequestView) and the committed
+// tree path (view_ref.go) both go through it, so both are pinned here without
+// either having to remember to.
+//
+// A view that reads no base corpus — a labelled base selector, a fallback, a
+// request that named no view — is left alone: it reads the corpus the way it
+// did before routed views existed, and pinning it here would claim a request
+// lifetime over the shared corpus that this item is not what changes.
+func (s *Server) pinRequestBaseCorpus(view *requestView, err error) {
+	if err != nil || view == nil || view.basePin != nil || !view.readsBaseCorpus {
+		return
+	}
+	if s == nil || s.materializer == nil || s.materializer.Leases == nil {
+		return
+	}
+	view.basePin = s.materializer.Leases.AcquireBaseCorpus(view.baseRepoPrefix())
+}
+
+// baseRepoPrefix names the repository whose base corpus this view reads. It is
+// the materialized identity's own prefix — the same string the catalog
+// registers an owner under — and empty for a view with no materialized stack.
+func (v *requestView) baseRepoPrefix() string {
+	if v == nil || v.materialized == nil {
+		return ""
+	}
+	return v.materialized.ID.RepoPrefix
 }
 
 // recordRequestView counts what answered this request, and logs the ones that
@@ -1817,6 +1911,11 @@ func (s *Server) attachViewRider(ctx context.Context, res *mcp.CallToolResult) *
 	if view == nil || view.rider == nil {
 		return res
 	}
+	// The last thing the route learns about itself: whether the corpus under
+	// it moved while the handler ran. It is asked here, after the handler and
+	// before the rider is rendered, because that is the only point at which
+	// the whole read is over and the pin is still held.
+	s.markBaseCorpusChange(view)
 	fields := viewRiderFields(view)
 	res = mergeResultMeta(res, map[string]any{"freshness": fields})
 	text, ok := singleTextContent(res)
@@ -1843,6 +1942,34 @@ func (s *Server) attachViewRider(ctx context.Context, res *mcp.CallToolResult) *
 		return res
 	}
 	return rebuildTextResult(res, string(body))
+}
+
+// baseChangedFallbackReason is the rider reason for an answer whose base
+// corpus was observed to move while the request was reading it.
+//
+// It is a rider reason and not a graphview error code on purpose: nothing
+// failed, no substitute view was served, and the request is not retryable in
+// the way a view_building answer is. What changed is the honesty of the
+// exactness claim — the route is still the route the caller asked for, but the
+// corpus under it is no longer the one the answer was assembled from.
+const baseChangedFallbackReason = "base_changed"
+
+// markBaseCorpusChange downgrades an exact rider whose base corpus moved under
+// the request.
+//
+// The route is left named: ActualView stays whatever answered, so a client can
+// still see which stack it read. Only the exactness claim and the reason
+// change, which is the difference between "you got the view you asked for" and
+// "you got results the view can no longer reproduce". A rider that was already
+// inexact keeps its original reason — the first substitution is the one the
+// caller has to act on, and overwriting it would hide it.
+func (s *Server) markBaseCorpusChange(view *requestView) {
+	if !view.noteBaseCorpusChange() || view.rider == nil || !view.rider.Exact {
+		return
+	}
+	if err := view.rider.MarkFallback(view.rider.ActualView, baseChangedFallbackReason); err != nil && s != nil && s.logger != nil {
+		s.logger.Debug("view routing: could not label a base corpus change", zap.Error(err))
+	}
 }
 
 // viewRiderFields renders the rider as response fields. An empty value is
@@ -1874,6 +2001,13 @@ func viewRiderFields(view *requestView) map[string]any {
 	}
 	if view.rider.RetryAfter > 0 {
 		fields["retry_after"] = view.rider.RetryAfter
+	}
+	// The base corpus moved while this request read it. Said as its own flag
+	// rather than only through the reason string, so a client can branch on it
+	// without parsing: exact:false with this set means "re-run for a coherent
+	// answer", not "this view is unavailable".
+	if view.baseCorpusChanged() {
+		fields["base_changed"] = true
 	}
 	// The capability annotations: what the view served thinly, and what a
 	// base-scoped engine answered instead of the view. Both are omitted when

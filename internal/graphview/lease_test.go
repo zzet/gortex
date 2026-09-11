@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 )
 
 // waitDrainInBackground runs WaitDrain in its own goroutine and reports the
@@ -332,5 +333,157 @@ func TestLeaseManagerConcurrentAcquireRelease(t *testing.T) {
 		if m.InUse(id) {
 			t.Errorf("InUse(%d) = true after every lease was released", id)
 		}
+	}
+}
+
+// --- W5.3: the base corpus pin ------------------------------------------
+
+// TestBasePinHoldsGenerationZeroForTheRequest is the first half of the pin's
+// contract: generation zero is in the same refcount every derived generation
+// is leased through, so a mutator or a sweep consulting InUse/WaitDrain sees a
+// reader on the bottom of the stack.
+func TestBasePinHoldsGenerationZeroForTheRequest(t *testing.T) {
+	m := NewLeaseManager()
+	if m.InUse(BaseCorpusGeneration) {
+		t.Fatal("generation zero is pinned before any request took it")
+	}
+	pin := m.AcquireBaseCorpus("")
+	if pin == nil {
+		t.Fatal("AcquireBaseCorpus returned nil")
+	}
+	if !m.InUse(BaseCorpusGeneration) {
+		t.Fatal("generation zero is not pinned while a base pin is live")
+	}
+	if got := pin.Generations(); len(got) != 1 || got[0] != BaseCorpusGeneration {
+		t.Fatalf("pin.Generations() = %v, want [%d]", got, BaseCorpusGeneration)
+	}
+	pin.Release()
+	pin.Release()
+	if m.InUse(BaseCorpusGeneration) {
+		t.Fatal("generation zero is still pinned after the request released")
+	}
+}
+
+// TestBasePinKeepsOwnerCleanupWaitingForTheRequest is the lifetime half: an
+// owner whose admission is closed while a request is reading its corpus does
+// not drain until that request lets go.
+func TestBasePinKeepsOwnerCleanupWaitingForTheRequest(t *testing.T) {
+	m := NewLeaseManager()
+	owner := RepositoryOwner{GraphID: "g1", CheckoutID: "c1", Incarnation: "i1", RepoPrefix: "repo"}
+	if err := m.RegisterRepositoryOwner(owner); err != nil {
+		t.Fatal(err)
+	}
+	pin := m.AcquireBaseCorpus("repo")
+	if !pin.OwnerPinned() {
+		t.Fatal("a registered owner was not pinned by the base pin")
+	}
+	drain, err := m.CloseRepositoryAdmission(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-drain.Done():
+		t.Fatal("the owner drained while a request still held its base corpus")
+	default:
+	}
+	pin.Release()
+	select {
+	case <-drain.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the owner never drained after the request released its base pin")
+	}
+}
+
+// TestBasePinWithoutASourceAuthorityNeverReportsAChange is the honesty half.
+// A dedicated owner carries no source revision authority today, so the pin can
+// neither confirm nor deny a mutation — and "unknown" must never be rendered
+// as "changed", which would make every routed answer inexact on no evidence.
+func TestBasePinWithoutASourceAuthorityNeverReportsAChange(t *testing.T) {
+	m := NewLeaseManager()
+	owner := RepositoryOwner{GraphID: "g1", CheckoutID: "c1", Incarnation: "i1", RepoPrefix: "repo"}
+	if err := m.RegisterRepositoryOwner(owner); err != nil {
+		t.Fatal(err)
+	}
+	pin := m.AcquireBaseCorpus("repo")
+	defer pin.Release()
+	if pin.Witnessed() {
+		t.Fatal("a dedicated owner with no source authority reported a witness")
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusUnwitnessed) {
+		t.Fatalf("ValidateCurrent() = %v, want %v", err, ErrBaseCorpusUnwitnessed)
+	}
+}
+
+// TestBasePinDetectsASourceMutationUnderTheRequest is the detection half, and
+// the one the rider depends on: the pin holds lifetime, the source moves
+// anyway, and the holder finds out.
+func TestBasePinDetectsASourceMutationUnderTheRequest(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "repo", "one")
+	if _, err := m.CaptureInitialRawRepositorySource(context.Background(), reg, "source-a"); err != nil {
+		t.Fatal(err)
+	}
+	pin := m.AcquireBaseCorpus("repo")
+	defer pin.Release()
+	if !pin.Witnessed() {
+		t.Fatal("a captured raw source was not witnessed by the base pin")
+	}
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("ValidateCurrent() before any mutation = %v, want nil", err)
+	}
+	write, err := m.AcquireRawRepositoryMutation(context.Background(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("ValidateCurrent() during a source mutation = %v, want %v", err, ErrBaseCorpusChanged)
+	}
+	if err := write.Complete("source-b"); err != nil {
+		t.Fatal(err)
+	}
+	write.Release()
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("ValidateCurrent() after a completed source mutation = %v, want %v", err, ErrBaseCorpusChanged)
+	}
+}
+
+// TestBasePinDetectsTheFirstMutationOfANeverCapturedOwner covers the gap the
+// initial capture exists for from the other side: a pin taken before any
+// authority existed still sees the authority appear, rather than reading the
+// absence as "unchanged" forever.
+func TestBasePinDetectsTheFirstMutationOfANeverCapturedOwner(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "repo", "one")
+	pin := m.AcquireBaseCorpus("repo")
+	defer pin.Release()
+	if pin.Witnessed() {
+		t.Fatal("an owner with no data authority reported a witness")
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusUnwitnessed) {
+		t.Fatalf("ValidateCurrent() = %v, want %v", err, ErrBaseCorpusUnwitnessed)
+	}
+	privateRawSource(t, m, reg, "source-a")
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("ValidateCurrent() after the first mutation = %v, want %v", err, ErrBaseCorpusChanged)
+	}
+}
+
+// TestBasePinSurvivesAnUnregisteredPrefix: the generation is shared, so
+// reading it is what needs pinning whether or not an owner speaks for it.
+func TestBasePinSurvivesAnUnregisteredPrefix(t *testing.T) {
+	m := NewLeaseManager()
+	pin := m.AcquireBaseCorpus("nobody")
+	if pin == nil || !m.InUse(BaseCorpusGeneration) {
+		t.Fatal("an unregistered prefix left the base corpus unpinned")
+	}
+	if pin.OwnerPinned() {
+		t.Fatal("an unregistered prefix reported an owner pin")
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusUnwitnessed) {
+		t.Fatalf("ValidateCurrent() = %v, want %v", err, ErrBaseCorpusUnwitnessed)
+	}
+	pin.Release()
+	if m.InUse(BaseCorpusGeneration) {
+		t.Fatal("the base corpus stayed pinned after release")
 	}
 }

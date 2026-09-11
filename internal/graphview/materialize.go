@@ -117,6 +117,17 @@ func (v *RepoView) GenerationSources() []GenerationSource {
 	return out
 }
 
+// PinsBaseCorpus reports whether this view's lease holds generation zero as
+// well as its derived stack. Generations() deliberately does not list it — the
+// identity and the composition are about the derived generations — so this is
+// how a caller checks that the bottom of the stack is pinned too.
+func (v *RepoView) PinsBaseCorpus() bool {
+	if v == nil {
+		return false
+	}
+	return slices.Contains(v.lease.IDs(), BaseCorpusGeneration)
+}
+
 // Close releases the view's lease. Calling it twice, or on a nil view,
 // does nothing.
 //
@@ -328,7 +339,12 @@ func (m *Materializer) pinCheckoutRoute(
 		provisional.Release()
 		return nil, false, err
 	}
-	lease := m.Leases.Acquire(ancestry...)
+	pinned, err := m.leaseSet(ctx, ancestry, generations)
+	if err != nil {
+		provisional.Release()
+		return nil, false, err
+	}
+	lease := m.Leases.Acquire(pinned...)
 	provisional.Release()
 
 	// A route can move while ancestry is being resolved. Re-read it after the
@@ -355,9 +371,57 @@ func (m *Materializer) pinGenerationAncestry(ctx context.Context, generations []
 		provisional.Release()
 		return nil, err
 	}
-	lease := m.Leases.Acquire(ancestry...)
+	pinned, err := m.leaseSet(ctx, ancestry, generations)
+	if err != nil {
+		provisional.Release()
+		return nil, err
+	}
+	lease := m.Leases.Acquire(pinned...)
 	provisional.Release()
 	return lease, nil
+}
+
+// leaseSet is what a view's lease must hold: the derived ancestry, plus
+// generation zero when the composed reader actually reads through it.
+//
+// generationAncestry walks BaseGenerationID until it reaches zero and stops
+// there, so the set it returns is the derived generations only. Generation
+// zero is the terminator of that chain, not a link in it — and in the legacy
+// regime it is also the reader's bottom layer, the one thing in the stack a
+// reader held nothing over. assemble decides that with exactly the condition
+// mirrored here: a stack whose ancestry is longer than its routed generations
+// stands on a dedicated root, and so does one whose first row is a dedicated
+// corpus; everything else is composed over Store.AtGeneration(0).
+//
+// Pinning it only in that regime is deliberate. A view that does not read
+// generation zero has no business holding it — an over-broad pin is an
+// untruthful statement about what a reader depends on, and retirement and
+// cleanup bookkeeping read these pins. The corpus at index zero of a routed
+// content search is a separate consumer with a separate hold; see BasePin.
+func (m *Materializer) leaseSet(ctx context.Context, ancestry, generations []int64) ([]int64, error) {
+	composed, err := m.composesBaseCorpus(ctx, ancestry, generations)
+	if err != nil {
+		return nil, err
+	}
+	if !composed || slices.Contains(ancestry, BaseCorpusGeneration) {
+		return ancestry, nil
+	}
+	return append(slices.Clone(ancestry), BaseCorpusGeneration), nil
+}
+
+// composesBaseCorpus reports whether the reader assemble will build reads the
+// shared indexed corpus as its bottom layer. It mirrors assemble's own arm —
+// routedStart > 0 || firstRow.GenerationKind == "dedicated" — so the lease set
+// and the composition cannot disagree about what the view stands on.
+func (m *Materializer) composesBaseCorpus(ctx context.Context, ancestry, generations []int64) (bool, error) {
+	if len(ancestry) == 0 || len(ancestry) != len(generations) {
+		return false, nil
+	}
+	row, err := m.servableGeneration(ctx, ancestry[0])
+	if err != nil {
+		return false, err
+	}
+	return row.GenerationKind != "dedicated", nil
 }
 
 // generationAncestry resolves the physical stack beneath the routed

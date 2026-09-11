@@ -3,6 +3,7 @@ package graphview
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -834,5 +835,134 @@ func setGenerationState(t *testing.T, store *store_sqlite.Store, generationID in
 	t.Helper()
 	if err := store.Catalog().SetViewGenerationState(context.Background(), generationID, next, expected); err != nil {
 		t.Fatalf("SetViewGenerationState(%d, %s): %v", generationID, next, err)
+	}
+}
+
+// TestMaterializeLeasesTheBaseCorpus covers W5.3's graphview half. The
+// ancestry walk stops at generation zero by construction — it is the terminator
+// of the BaseGenerationID chain, not a link in it — so the one layer every
+// composed stack reads without holding anything was the shared mutable corpus.
+// Both materialization paths now lease it with the rest of the stack, and both
+// release it on Close.
+func TestMaterializeLeasesTheBaseCorpus(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "base-corpus-lease")
+	commit, dirty := seedRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+	if materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("the base corpus is pinned before any view was materialized")
+	}
+
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	if !materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("MaterializeCheckout left the base corpus unpinned")
+	}
+	if !view.PinsBaseCorpus() {
+		t.Fatal("the checkout view does not report a base corpus pin")
+	}
+	// The identity and the composition are still about the derived stack: the
+	// base corpus is leased, not listed.
+	if got := view.Generations(); slices.Contains(got, BaseCorpusGeneration) {
+		t.Fatalf("Generations() = %v, must not list the base corpus", got)
+	}
+	if got := view.Generations(); !slices.Contains(got, commit) || !slices.Contains(got, dirty) {
+		t.Fatalf("Generations() = %v, want the routed stack", got)
+	}
+	view.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("Close left the base corpus pinned")
+	}
+
+	ref, err := materializer.MaterializeRefView(ctx, testGraphID, commit)
+	if err != nil {
+		t.Fatalf("MaterializeRefView: %v", err)
+	}
+	if !materializer.Leases.InUse(BaseCorpusGeneration) || !ref.PinsBaseCorpus() {
+		t.Fatal("MaterializeRefView left the base corpus unpinned")
+	}
+	ref.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("ref view Close left the base corpus pinned")
+	}
+}
+
+// TestMaterializeDoesNotLeaseABaseCorpusItNeverReads is the other half of the
+// same truth. A stack standing on a dedicated root composes that root, not the
+// shared corpus, and a pin on something a view does not read is a false
+// statement about what retirement has to wait for.
+func TestMaterializeDoesNotLeaseABaseCorpusItNeverReads(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "dedicated-root-no-base-lease")
+	base, _, _ := seedNonzeroBaseRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	defer view.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) || view.PinsBaseCorpus() {
+		t.Fatal("a stack on a dedicated root pinned the shared corpus it does not read")
+	}
+
+	ref, err := materializer.MaterializeRefView(ctx, testGraphID, base)
+	if err != nil {
+		t.Fatalf("MaterializeRefView(dedicated root): %v", err)
+	}
+	defer ref.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) || ref.PinsBaseCorpus() {
+		t.Fatal("a dedicated-root ref view pinned the shared corpus it does not read")
+	}
+}
+
+// TestMaterializeDoesNotLeaseABaseCorpusUnderADeeperAncestry is the second arm
+// of that decision, and the one the generation kind alone cannot answer: a view
+// whose ancestry runs deeper than the generations it was asked for stands on
+// the oldest ancestor's own handle, whatever kind that ancestor is. assemble
+// reads routedStart > 0 before it reads the kind; the lease set has to agree.
+func TestMaterializeDoesNotLeaseABaseCorpusUnderADeeperAncestry(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "deeper-ancestry-no-base-lease")
+	parent := writeBenchmarkGeneration(t, store, "commit", "chain-parent", 0)
+	child := writeBenchmarkGeneration(t, store, "commit", "chain-child", parent)
+	seedStackControlPlane(t, store)
+	materializer := newTestMaterializer(store)
+
+	ref, err := materializer.MaterializeRefView(ctx, testGraphID, child)
+	if err != nil {
+		t.Fatalf("MaterializeRefView(deeper ancestry): %v", err)
+	}
+	defer ref.Close()
+	if got := ref.Generations(); len(got) != 2 || got[0] != parent || got[1] != child {
+		t.Fatalf("Generations() = %v, want [%d %d]", got, parent, child)
+	}
+	if materializer.Leases.InUse(BaseCorpusGeneration) || ref.PinsBaseCorpus() {
+		t.Fatal("a view standing on its own ancestor pinned the shared corpus it does not read")
+	}
+}
+
+// TestMaterializeBaseCorpusLeaseIsWaitable is what the pin buys a writer: a
+// generation-zero mutator or sweep can block on WaitDrain until the readers
+// standing on the bottom of the stack have gone.
+func TestMaterializeBaseCorpusLeaseIsWaitable(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "base-corpus-waitdrain")
+	seedRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	bounded, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := materializer.Leases.WaitDrain(bounded, BaseCorpusGeneration); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitDrain(base) while a view is open = %v, want %v", err, context.DeadlineExceeded)
+	}
+	view.Close()
+	if err := materializer.Leases.WaitDrain(ctx, BaseCorpusGeneration); err != nil {
+		t.Fatalf("WaitDrain(base) after Close: %v", err)
 	}
 }

@@ -49,6 +49,27 @@ func (l *RawRepositorySnapshotLease) Witness() RawRepositorySourceWitness {
 	return l.witness
 }
 
+// ValidateCurrent reports whether the captured witness still describes the
+// owner's current source state.
+//
+// The gate this lease holds excludes a writer only while it is held; a lease
+// that was taken, validated and handed on protects LIFETIME, not bytes. A
+// holder that needs to state on the wire whether its answer was stitched from
+// one state of the source therefore asks here rather than assuming, and gets
+// ErrRawRepositorySourceChanged when the revision, the fingerprint or the
+// availability moved under it.
+func (l *RawRepositorySnapshotLease) ValidateCurrent() error {
+	if l == nil || l.data == nil {
+		return ErrRawRepositorySourceChanged
+	}
+	current := l.data.observe()
+	if !current.present || !current.available ||
+		current.revision != l.witness.Revision || current.fingerprint != l.witness.Fingerprint {
+		return ErrRawRepositorySourceChanged
+	}
+	return nil
+}
+
 func (l *RawRepositorySnapshotLease) Release() {
 	if l == nil {
 		return
@@ -57,6 +78,118 @@ func (l *RawRepositorySnapshotLease) Release() {
 	// Owner drain notifications can reenter this method. Keep that delivery
 	// outside our Once, just like RepositoryReadLease itself.
 	l.owner.Release()
+}
+
+// rawSourceObservation is one owner's mutable source state at one instant:
+// whether a data authority exists for it at all, and what that authority says.
+//
+// It is a comparison value, not a pin. Two observations that differ mean the
+// source moved between them — including the case where no authority existed at
+// the first observation and one exists at the second, which is the first
+// mutation of a never-mutated owner.
+type rawSourceObservation struct {
+	present     bool
+	revision    uint64
+	fingerprint string
+	available   bool
+}
+
+// observe reads the data state's current witness fields. A nil state is the
+// zero observation: no authority, nothing to compare.
+func (d *rawRepositoryDataState) observe() rawSourceObservation {
+	if d == nil {
+		return rawSourceObservation{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return rawSourceObservation{
+		present:     true,
+		revision:    d.revision,
+		fingerprint: d.fingerprint,
+		available:   d.available,
+	}
+}
+
+// observeRawSource reads the current source observation of one registered
+// owner. The registry mutex guards the rawData pointer; the data mutex guards
+// its fields, and neither is held when this returns.
+func (m *LeaseManager) observeRawSource(state *repositoryOwnerState) rawSourceObservation {
+	if m == nil || state == nil {
+		return rawSourceObservation{}
+	}
+	r := &m.repositories
+	r.mu.Lock()
+	data := state.rawData
+	r.mu.Unlock()
+	return data.observe()
+}
+
+// CaptureInitialRawRepositorySource opens the data authority of a registered
+// owner that has never been mutated, so a reader can pin and validate it.
+//
+// Without this an owner that was registered and then only ever read has no
+// rawRepositoryDataState at all — it is created inside
+// AcquireRawRepositoryMutationAfter — so AcquireRawRepositorySnapshot refuses
+// it as changed and the owner is unpinnable until somebody writes to it. That
+// is the wrong shape: a source nobody has mutated is the easiest state to
+// certify, not the hardest.
+//
+// It fails closed. A second capture, a capture over an authority some mutation
+// already opened, and a capture with no fingerprint are all refused rather
+// than allowed to overwrite a witness a reader may already hold. The exclusive
+// write weight is taken for the capture itself, so it cannot interleave with a
+// mutation that is choosing the next revision.
+func (m *LeaseManager) CaptureInitialRawRepositorySource(
+	ctx context.Context, reg *RawRepositoryRegistration, fingerprint string,
+) (uint64, error) {
+	if m == nil || ctx == nil {
+		return 0, ErrRepositoryOwnerInvalid
+	}
+	if fingerprint == "" {
+		return 0, ErrRawRepositorySourceChanged
+	}
+	r := &m.repositories
+	r.mu.Lock()
+	if r.stopped {
+		r.mu.Unlock()
+		return 0, ErrRepositoryAdmissionsStopped
+	}
+	state, err := m.rawRegistrationLocked(reg)
+	if err != nil {
+		r.mu.Unlock()
+		return 0, err
+	}
+	if state.closing {
+		r.mu.Unlock()
+		return 0, ErrRepositoryAdmissionClosed
+	}
+	if state.rawProvisional {
+		r.mu.Unlock()
+		return 0, ErrRawRepositoryNotReady
+	}
+	if state.rawData == nil {
+		state.rawData = &rawRepositoryDataState{gate: semaphore.NewWeighted(rawRepositoryWriteWeight)}
+	}
+	data := state.rawData
+	owner := r.acquireLocked(m, []*repositoryOwnerState{state}, false)
+	r.mu.Unlock()
+	if err := data.gate.Acquire(ctx, rawRepositoryWriteWeight); err != nil {
+		owner.Release()
+		return 0, err
+	}
+	defer func() {
+		data.gate.Release(rawRepositoryWriteWeight)
+		owner.Release()
+	}()
+	data.mu.Lock()
+	defer data.mu.Unlock()
+	if data.revision != 0 || data.available || data.fingerprint != "" {
+		return 0, ErrRawRepositorySourceChanged
+	}
+	data.revision = 1
+	data.fingerprint = fingerprint
+	data.available = true
+	return data.revision, nil
 }
 
 // AcquireRawRepositorySnapshot pins lifetime before entering the cancellable

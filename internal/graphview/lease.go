@@ -2,10 +2,29 @@ package graphview
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 
 	"github.com/zzet/gortex/internal/viewmetrics"
+)
+
+// BaseCorpusGeneration is the payload generation id of the shared indexed
+// corpus: the mutable bottom of every composed stack, and the corpus at index
+// zero of every routed content search. Nothing derives it and nothing retires
+// it, which is exactly why it was the one generation a reader never pinned.
+const BaseCorpusGeneration int64 = 0
+
+var (
+	// ErrBaseCorpusChanged reports that the base corpus moved under a live
+	// pin. The pin's holder must say so on its answer rather than present a
+	// result stitched from two states of the corpus as an exact one.
+	ErrBaseCorpusChanged = errors.New("graphview: base corpus changed under a live pin")
+	// ErrBaseCorpusUnwitnessed reports that a pin holds the base corpus's
+	// lifetime but has no source witness to compare against, so it can neither
+	// confirm nor deny a change. It is not a change: a caller must not report
+	// one it did not observe.
+	ErrBaseCorpusUnwitnessed = errors.New("graphview: base corpus pin carries no source witness")
 )
 
 // LeaseManager refcounts the graph generations that in-flight requests are
@@ -285,4 +304,143 @@ func (l *Lease) IDs() []int64 {
 		return nil
 	}
 	return slices.Clone(l.ids)
+}
+
+// BasePin is one request's hold on the base corpus.
+//
+// Three things it is, in the order they matter:
+//
+//   - A pin on generation zero in the same manager every derived generation is
+//     leased through, so a mutator or a sweep that consults InUse/WaitDrain can
+//     see that a reader is on the bottom of the stack and wait for it.
+//   - A pin on the registered owner of the repository whose corpus is being
+//     read, so closing that owner's admission drains behind the request instead
+//     of through it.
+//   - A witness of the owner's mutable source state at acquisition, which is
+//     the only half that can answer "did the corpus move under me?".
+//
+// The third is deliberately an observation and not an exclusion. Holding the
+// source read gate for a whole request would make every generation-zero writer
+// queue behind in-flight requests, which trades a labelling problem for a
+// liveness one. A lease protects lifetime, not bytes: ValidateCurrent is how
+// the holder learns the bytes moved, and labelling the answer truthfully is
+// the holder's job.
+//
+// Release is mandatory and idempotent.
+type BasePin struct {
+	mgr   *LeaseManager
+	lease *Lease
+	owner *RepositoryReadLease
+	// state is the registered owner whose source is re-observed by
+	// ValidateCurrent. It is safe to hold for as long as owner is held.
+	state   *repositoryOwnerState
+	witness rawSourceObservation
+	once    sync.Once
+
+	mu       sync.Mutex
+	released bool
+}
+
+// AcquireBaseCorpus pins the base corpus for the lifetime of one request.
+//
+// prefix names the repository whose corpus the request reads; an empty prefix,
+// an unregistered prefix and a closing one all still yield a generation-zero
+// pin, because the generation is shared and reading it is what needs pinning
+// whether or not an owner is registered to speak for it. The returned pin is
+// never nil for a non-nil manager, so a caller never has to branch on it.
+//
+// It takes no context and blocks on nothing: every step is a map lookup or a
+// refcount, so a request cannot be delayed by a base writer merely for saying
+// which corpus it is about to read.
+func (m *LeaseManager) AcquireBaseCorpus(prefix string) *BasePin {
+	if m == nil {
+		return nil
+	}
+	pin := &BasePin{mgr: m, lease: m.Acquire(BaseCorpusGeneration)}
+	if prefix == "" {
+		return pin
+	}
+	r := &m.repositories
+	r.mu.Lock()
+	state := r.byPrefix[prefix]
+	if r.stopped || state == nil || state.closing || state.finalized || state.rawProvisional {
+		r.mu.Unlock()
+		return pin
+	}
+	pin.owner = r.acquireLocked(m, []*repositoryOwnerState{state}, false)
+	pin.state = state
+	r.mu.Unlock()
+	pin.witness = m.observeRawSource(state)
+	return pin
+}
+
+// ValidateCurrent reports whether the base corpus still reads the way it did
+// when this pin was taken.
+//
+// It returns:
+//
+//   - nil when the captured witness still describes the owner's source;
+//   - ErrBaseCorpusChanged when it does not — including the case where no
+//     source authority existed at acquisition and a mutation has opened one
+//     since, which is the first write to a never-mutated owner;
+//   - ErrBaseCorpusUnwitnessed when there is nothing to compare, so the answer
+//     is "unknown" rather than "unchanged". A caller must not report a change
+//     it did not observe, and must not claim exactness it cannot support
+//     either — what it says about an unwitnessed corpus is its own contract.
+func (p *BasePin) ValidateCurrent() error {
+	if p == nil || p.mgr == nil {
+		return ErrBaseCorpusUnwitnessed
+	}
+	p.mu.Lock()
+	released := p.released
+	p.mu.Unlock()
+	if released {
+		return ErrBaseCorpusUnwitnessed
+	}
+	if p.state == nil {
+		return ErrBaseCorpusUnwitnessed
+	}
+	current := p.mgr.observeRawSource(p.state)
+	if current == p.witness {
+		if !p.witness.present {
+			return ErrBaseCorpusUnwitnessed
+		}
+		return nil
+	}
+	return ErrBaseCorpusChanged
+}
+
+// Witnessed reports whether this pin captured a source witness it can compare
+// against later. A pin without one still holds lifetime.
+func (p *BasePin) Witnessed() bool {
+	return p != nil && p.state != nil && p.witness.present
+}
+
+// OwnerPinned reports whether a registered repository owner is held for this
+// pin's lifetime, so that closing its admission drains behind the request.
+func (p *BasePin) OwnerPinned() bool {
+	return p != nil && p.owner != nil
+}
+
+// Generations lists what this pin keeps pinned in the generation manager.
+func (p *BasePin) Generations() []int64 {
+	if p == nil {
+		return nil
+	}
+	return p.lease.IDs()
+}
+
+// Release drops the generation pin and the owner pin. It is idempotent and
+// safe on a nil pin.
+func (p *BasePin) Release() {
+	if p == nil {
+		return
+	}
+	p.once.Do(func() {
+		p.mu.Lock()
+		p.released = true
+		p.mu.Unlock()
+		p.lease.Release()
+		p.owner.Release()
+	})
 }
