@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -9,8 +10,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 )
 
@@ -40,10 +44,18 @@ const (
 //
 // This is the fail-closed half of the freshness contract: a digest over a
 // partial roster is a false certificate — it reads as "these inputs are frozen"
-// while a repository the resolver can actually see is missing from it. Callers
-// must treat the error as "no revision", leave `GenerationIdentity.Dependency-
-// Revision` empty (which `generationIdentityKey` keeps legacy-compatible) and
-// forgo the reuse the revision would have certified.
+// while a repository the resolver can actually see is missing from it.
+//
+// What a caller must NOT do with the error is leave
+// `GenerationIdentity.DependencyRevision` empty: empty is the LEGACY value,
+// which `generationIdentityKey` renders byte-for-byte as the pre-cohort key
+// that every stored generation matches, so two mutually undescribable cohorts
+// would share one identity. A caller that must build anyway stamps
+// `dependencyCohortSource.degradedRevision` instead — outside this vocabulary,
+// so nothing certified is ever reused for it, and stable, so a transient costs
+// at most one rebuild rather than one per cycle. A caller that can wait should
+// defer the build until the cohort is describable; see
+// `CheckoutCoordinator.cohortAllowsBuild` for the bounded form of that policy.
 var ErrDependencyRevisionIncomplete = errors.New("indexer: incomplete dependency-revision cohort")
 
 // DependencyRevisionTarget names the repository a build is for. It is the
@@ -158,9 +170,25 @@ type DependencyRevisionInputs struct {
 	// Target is the repository the generation is being built for.
 	Target DependencyRevisionTarget
 
+	// RosterScope names what "complete" means for this cohort, in the
+	// DependencyRevisionScope* vocabulary.
+	//
+	// Empty is the original claim: Repositories is every registered repository
+	// in the daemon. A non-empty scope narrows that claim to the repositories
+	// the target's resolution may actually consult — a workspace, or the target
+	// repository alone when no workspace topology is available.
+	//
+	// It is digested, so a cohort that enumerated one workspace and a cohort
+	// that enumerated the whole daemon are different claims even when they list
+	// the same repositories. Without it the certificate would be ambiguous: a
+	// reader comparing two revisions could not tell a complete roster from a
+	// scoped one that happened to match.
+	RosterScope string
+
 	// RosterComplete is the caller's assertion that Repositories is the
-	// complete registered roster — the one it just validated under the lease
-	// that produced it, not a filtered or cached subset. False refuses.
+	// complete roster FOR THE DECLARED SCOPE — the one it just validated under
+	// the lease that produced it, not a filtered or cached subset. False
+	// refuses.
 	RosterComplete bool
 
 	// Repositories is the roster, in any order.
@@ -247,6 +275,29 @@ func DependencyRevisionRoster(
 	lease *graphview.RepositoryRosterLease,
 	sourceIdentity func(repoPrefix string) string,
 ) ([]DependencyRevisionRepository, error) {
+	return DependencyRevisionRosterScoped(lease, nil, sourceIdentity)
+}
+
+// DependencyRevisionRosterScoped is DependencyRevisionRoster narrowed to the
+// repositories a scope admits.
+//
+// inScope reports whether one registered repository belongs in this cohort;
+// nil admits every one of them, which is what DependencyRevisionRoster asks
+// for. The narrowing is NOT a relaxation of the completeness rule: the lease is
+// still re-validated against the whole live registration set first, so a roster
+// that gained or lost ANY repository under the digest is refused here, and
+// every admitted member still has to name its bytes. What the scope decides is
+// which repositories are inputs at all — a repository the target's resolution
+// can never consult is not an input, and digesting it would make a commit in an
+// unrelated repository re-key a payload it cannot change.
+//
+// The caller must declare the scope it used in
+// DependencyRevisionInputs.RosterScope; the two together are the claim.
+func DependencyRevisionRosterScoped(
+	lease *graphview.RepositoryRosterLease,
+	inScope func(repoPrefix string) bool,
+	sourceIdentity func(repoPrefix string) string,
+) ([]DependencyRevisionRepository, error) {
 	if lease == nil {
 		return nil, fmt.Errorf("%w: no roster lease", ErrDependencyRevisionIncomplete)
 	}
@@ -258,8 +309,12 @@ func DependencyRevisionRoster(
 	}
 	dedicated := lease.DedicatedOwners()
 	raw := lease.RawRegistrations()
+	admits := func(repoPrefix string) bool { return inScope == nil || inScope(repoPrefix) }
 	out := make([]DependencyRevisionRepository, 0, len(dedicated)+len(raw))
 	for _, owner := range dedicated {
+		if !admits(owner.RepoPrefix) {
+			continue
+		}
 		out = append(out, DependencyRevisionRepository{
 			RepoPrefix:     owner.RepoPrefix,
 			Kind:           DependencyRevisionRepositoryDedicated,
@@ -271,6 +326,9 @@ func DependencyRevisionRoster(
 	}
 	for _, registration := range raw {
 		owner := registration.Owner()
+		if !admits(owner.RepoPrefix) {
+			continue
+		}
 		out = append(out, DependencyRevisionRepository{
 			RepoPrefix:     owner.RepoPrefix,
 			Kind:           DependencyRevisionRepositoryRaw,
@@ -280,6 +338,11 @@ func DependencyRevisionRoster(
 		})
 	}
 	if len(out) == 0 {
+		if inScope != nil {
+			return nil, fmt.Errorf(
+				"%w: the roster lease carries no repository this cohort's scope admits",
+				ErrDependencyRevisionIncomplete)
+		}
 		return nil, fmt.Errorf("%w: roster lease carries no repository", ErrDependencyRevisionIncomplete)
 	}
 	// Refuse at the boundary that read the roster, not only in the digest: the
@@ -349,6 +412,7 @@ func dependencyRevisionPreimage(inputs DependencyRevisionInputs) (string, error)
 	e.field("target.repo", inputs.Target.RepoPrefix)
 	e.field("target.workspace", inputs.Target.WorkspaceID)
 	e.field("target.project", inputs.Target.ProjectID)
+	e.field("roster.scope", inputs.RosterScope)
 
 	e.count("roster", len(repositories))
 	for _, repository := range repositories {
@@ -626,4 +690,441 @@ func (e *dependencyRevisionEncoder) field(label, value string) {
 // than something a reader has to infer from the following fields.
 func (e *dependencyRevisionEncoder) count(label string, n int) {
 	e.field(label+".count", strconv.Itoa(n))
+}
+
+// --- cohort scope ---------------------------------------------------------
+
+// The scope vocabulary a cohort declares. A revision is a certificate over the
+// inputs its scope names, so the scope is digested with them: a cohort that
+// enumerated one workspace and a cohort that enumerated the whole daemon are
+// different claims even when they happen to list the same repositories.
+const (
+	// DependencyRevisionScopeWorkspace prefixes the scope of a cohort that
+	// enumerated the repositories sharing the target's workspace.
+	DependencyRevisionScopeWorkspace = "workspace:"
+	// DependencyRevisionScopeRepository prefixes the scope of a cohort that
+	// could name no workspace topology and enumerated the target repository
+	// alone.
+	DependencyRevisionScopeRepository = "repository:"
+)
+
+// DependencyRevisionDegradedPrefix marks a revision that is NOT a certificate:
+// the cohort could not be described, and the value carries the stable reason
+// instead.
+//
+// It is deliberately outside the DependencyRevisionEncodingVersion vocabulary,
+// so no reader can mistake one for the other, and deliberately STABLE rather
+// than unique: a value minted per coordinator or per call can never be matched
+// again, so every layer stamped with one is permanently unreusable and rebuilds
+// on every cycle for as long as the transient lasts. A stable value costs at
+// most the reuse of one degraded layer by another build whose describable
+// inputs are identical, and re-keys normally the moment the cohort can be
+// described again.
+const DependencyRevisionDegradedPrefix = "cohort-degraded"
+
+// Stable refusal reasons. The vocabulary is closed: the reason rides in a
+// stored identity, so an unbounded reason string would be an unbounded key
+// space, and an error message reworded in another package would silently
+// re-key every degraded layer in the field.
+const (
+	dependencyCohortReasonNoLeases    = "no-lease-manager"
+	dependencyCohortReasonClosing     = "repository-closing"
+	dependencyCohortReasonRawPending  = "raw-repository-provisional"
+	dependencyCohortReasonStopped     = "admissions-stopped"
+	dependencyCohortReasonRosterMoved = "roster-moved"
+	dependencyCohortReasonIncomplete  = "cohort-incomplete"
+	dependencyCohortReasonUnavailable = "cohort-unavailable"
+)
+
+// dependencyCohortRefusalReason classifies a refusal into the closed reason
+// vocabulary above. Unrecognised causes fall to "cohort-unavailable" rather
+// than to the error's own text.
+func dependencyCohortRefusalReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, graphview.ErrRepositoryAdmissionsStopped):
+		return dependencyCohortReasonStopped
+	case errors.Is(err, graphview.ErrRepositoryAdmissionClosed):
+		return dependencyCohortReasonClosing
+	case errors.Is(err, graphview.ErrRawRepositoryNotReady):
+		return dependencyCohortReasonRawPending
+	case errors.Is(err, graphview.ErrRepositoryOwnerConflict):
+		return dependencyCohortReasonRosterMoved
+	case errors.Is(err, ErrDependencyRevisionIncomplete):
+		return dependencyCohortReasonIncomplete
+	default:
+		return dependencyCohortReasonUnavailable
+	}
+}
+
+// dependencyCohortCounters records what describing one cohort cost.
+//
+// It exists so a test can assert the COST rather than infer it: an idle poll
+// must take no roster lease and read no roster member's source, and the only
+// honest way to state that is to count the two operations where they happen.
+type dependencyCohortCounters struct {
+	RosterAcquisitions atomic.Int64
+	MemberSourceReads  atomic.Int64
+}
+
+// dependencyCohortSource is everything one cohort digest needs from its caller.
+//
+// It is a value rather than a method set on the coordinator because two
+// producers need the same digest over the same rules — a checkout's commit and
+// working-tree layers, and a ref view's layer — and a second copy of the
+// enumeration is a second place for the two to drift.
+type dependencyCohortSource struct {
+	// Target is the repository, workspace and project the generation is for.
+	Target DependencyRevisionTarget
+
+	// Leases enumerates the registered roster. nil refuses the cohort: a
+	// producer that cannot see the roster cannot certify it.
+	Leases *graphview.LeaseManager
+	// Catalog names a dedicated roster member's committed corpus.
+	Catalog *store_sqlite.Catalog
+
+	// WorkspaceMembers reports the repositories that share the target's
+	// workspace — MultiIndexer.ReposInWorkspace in production, which is the
+	// established authority on "the complete list of repos a workspace-scoped
+	// session is permitted to see". nil, or an answer that does not contain
+	// the target, narrows the cohort to the target repository alone and says
+	// so in the declared scope.
+	WorkspaceMembers func() map[string]bool
+
+	Config            config.IndexConfig
+	ConfigSections    []DependencyRevisionConfigSection
+	Ownership         []DependencyRevisionOwnership
+	Producers         []DependencyRevisionProducer
+	Capabilities      []string
+	ExtractorVersions string
+
+	// SourceBudget bounds how long naming one raw member's source may take.
+	SourceBudget time.Duration
+
+	// Counters is optional accounting; nil counts nothing.
+	Counters *dependencyCohortCounters
+}
+
+// scope decides which repositories this cohort may name, and what to call the
+// decision.
+//
+// A checkout layer's payload is produced by a build whose resolver runs inside
+// ONE repository (`SparseGenerationBuilder.runPass` constructs a private
+// Indexer with the MultiIndexer link deliberately unset, and `declareProducers`
+// declares CapResolutionCrossRepo incomplete for exactly that reason), and
+// cross-repository resolution is a MultiIndexer pass that no sparse build
+// reaches. What a workspace sibling contains therefore cannot change this
+// payload today.
+//
+// The cohort keeps workspace siblings anyway — conservatively, because
+// workspace-scoped resolution is the boundary the rest of the daemon treats as
+// "what this session may see", and a cohort that named less than the boundary
+// would have to be re-derived the moment cross-repository binding becomes
+// reachable from a sparse build. What it must NOT do is name repositories
+// OUTSIDE the workspace: those can never be consulted, and digesting their
+// tree OIDs makes a commit in any tracked repository re-key and rebuild every
+// checkout layer in the daemon — the write amplification this whole change
+// exists to remove.
+func (s dependencyCohortSource) scope() (string, func(string) bool) {
+	if s.WorkspaceMembers != nil && s.Target.WorkspaceID != "" {
+		if members := s.WorkspaceMembers(); members[s.Target.RepoPrefix] {
+			return DependencyRevisionScopeWorkspace + s.Target.WorkspaceID,
+				func(prefix string) bool { return members[prefix] }
+		}
+	}
+	return DependencyRevisionScopeRepository + s.Target.RepoPrefix,
+		func(prefix string) bool { return prefix == s.Target.RepoPrefix }
+}
+
+// topologyToken is the cheap observation a poll re-checks to decide whether
+// the cached cohort can still be trusted.
+//
+// It reads ONLY the workspace topology — MultiIndexer.ReposInWorkspace, a map
+// walk under that struct's own read lock. No roster lease, no catalog read, no
+// source witness: it is affordable on every poll of every checkout, which is
+// the whole reason the cohort itself is not described there.
+//
+// What it therefore detects is a change in the cohort's MEMBERSHIP — a
+// repository tracked into or untracked out of this checkout's workspace, which
+// is the event that changes which repositories are inputs at all. What it
+// cannot detect is a member's bytes moving; that reaches the cache through
+// InvalidateDependencyCohort, and every build path describes the cohort afresh
+// regardless, so no layer is ever STAMPED with a token-aged revision.
+func (s dependencyCohortSource) topologyToken() string {
+	var e dependencyRevisionEncoder
+	if s.WorkspaceMembers == nil || s.Target.WorkspaceID == "" {
+		e.field("scope", DependencyRevisionScopeRepository+s.Target.RepoPrefix)
+		return e.b.String()
+	}
+	members := s.WorkspaceMembers()
+	if !members[s.Target.RepoPrefix] {
+		e.field("scope", DependencyRevisionScopeRepository+s.Target.RepoPrefix)
+		return e.b.String()
+	}
+	names := make([]string, 0, len(members))
+	for prefix, in := range members {
+		if in {
+			names = append(names, prefix)
+		}
+	}
+	sort.Strings(names)
+	e.field("scope", DependencyRevisionScopeWorkspace+s.Target.WorkspaceID)
+	e.count("members", len(names))
+	for _, name := range names {
+		e.field("member", name)
+	}
+	return e.b.String()
+}
+
+// revision describes the cohort and digests it, or refuses.
+//
+// The roster lease is held across its own validation, the enumeration of every
+// in-scope member's source and the digest — the window DependencyRevisionRoster
+// documents. It is released before the caller's build and its catalog writes:
+// a checkout build indexes a tree, and holding the roster lease across it would
+// block every repository registration and every admission close for the length
+// of a build, which lifecycle teardown would then wait on. What the shorter
+// window costs is bounded by the rule that a changed revision ROOTS a new
+// chain rather than extending one.
+func (s dependencyCohortSource) revision(ctx context.Context) (string, error) {
+	inputs, err := s.describe(ctx)
+	if err != nil {
+		return "", err
+	}
+	return ComputeDependencyRevision(inputs)
+}
+
+// describe assembles the cohort without digesting it, so a test can read the
+// real production cohort and move exactly one dimension of it.
+func (s dependencyCohortSource) describe(ctx context.Context) (DependencyRevisionInputs, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.Leases == nil {
+		return DependencyRevisionInputs{}, fmt.Errorf(
+			"%w: no lease manager to enumerate the roster with", ErrDependencyRevisionIncomplete)
+	}
+	// The scope is resolved BEFORE the roster lease is taken, deliberately.
+	// WorkspaceMembers reads the repository topology under the MultiIndexer's
+	// own lock; taking it while holding a roster lease would nest the two in
+	// one order while a caller that holds the topology lock and then closes a
+	// repository admission nests them in the other.
+	label, member := s.scope()
+	if s.Counters != nil {
+		s.Counters.RosterAcquisitions.Add(1)
+	}
+	lease, err := s.Leases.AcquireRepositoryRoster()
+	if err != nil {
+		return DependencyRevisionInputs{}, fmt.Errorf("%w: acquire the repository roster: %w",
+			ErrDependencyRevisionIncomplete, err)
+	}
+	defer lease.Release()
+	return s.scopedInputs(ctx, lease, label, member)
+}
+
+// inputs assembles the cohort against a roster lease the caller holds.
+func (s dependencyCohortSource) inputs(
+	ctx context.Context, lease *graphview.RepositoryRosterLease,
+) (DependencyRevisionInputs, error) {
+	label, member := s.scope()
+	return s.scopedInputs(ctx, lease, label, member)
+}
+
+// scopedInputs is inputs with the scope already decided, so the caller can
+// resolve it before taking the roster lease.
+func (s dependencyCohortSource) scopedInputs(
+	ctx context.Context, lease *graphview.RepositoryRosterLease,
+	label string, member func(string) bool,
+) (DependencyRevisionInputs, error) {
+	sources, err := s.sourceIdentities(ctx, lease, member)
+	if err != nil {
+		return DependencyRevisionInputs{}, err
+	}
+	repositories, err := DependencyRevisionRosterScoped(lease, member, func(repoPrefix string) string {
+		return sources[repoPrefix]
+	})
+	if err != nil {
+		return DependencyRevisionInputs{}, err
+	}
+	return DependencyRevisionInputs{
+		Target:            s.Target,
+		RosterScope:       label,
+		RosterComplete:    true,
+		Repositories:      repositories,
+		OwnershipComplete: true,
+		Ownership:         s.Ownership,
+		Config:            s.Config,
+		ConfigSections:    s.ConfigSections,
+		Producers:         s.Producers,
+		Capabilities:      s.Capabilities,
+		ExtractorVersions: s.ExtractorVersions,
+	}, nil
+}
+
+// sourceIdentities names what this build can see of each IN-SCOPE roster
+// member's bytes.
+//
+// A dedicated repository's source is the committed corpus its graph is at — the
+// same primary base every layer over that graph is built against, so the cohort
+// and the layer cannot disagree about what the corpus is. A raw repository has
+// no committed tree; its source witness (revision plus content fingerprint) is
+// the equivalent, read under a bounded budget so a concurrent source mutation
+// cannot park the caller.
+//
+// Every refusal is a refusal of the whole cohort — a member whose bytes cannot
+// be named is exactly the false certificate a revision must not issue — but
+// only for members the scope admits. An out-of-scope repository is not read at
+// all: not its catalog row, not its source witness. That is both the
+// correctness fix (its bytes are not an input) and the cost fix (the per-cycle
+// read is bounded by the workspace, not by the daemon).
+func (s dependencyCohortSource) sourceIdentities(
+	ctx context.Context, lease *graphview.RepositoryRosterLease, member func(string) bool,
+) (map[string]string, error) {
+	out := map[string]string{}
+	if s.Catalog == nil {
+		return nil, fmt.Errorf("%w: no catalog to name a roster member's corpus with",
+			ErrDependencyRevisionIncomplete)
+	}
+	budget := s.SourceBudget
+	if budget <= 0 {
+		budget = dependencyRevisionSourceBudget
+	}
+	for _, owner := range lease.DedicatedOwners() {
+		if member != nil && !member(owner.RepoPrefix) {
+			continue
+		}
+		if s.Counters != nil {
+			s.Counters.MemberSourceReads.Add(1)
+		}
+		dedicated, found, err := s.Catalog.GetDedicatedGraph(ctx, owner.GraphID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read dedicated graph %s: %w",
+				ErrDependencyRevisionIncomplete, owner.GraphID, err)
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: dedicated graph %s is not in the catalog",
+				ErrDependencyRevisionIncomplete, owner.GraphID)
+		}
+		base, err := graphBase(ctx, s.Catalog, dedicated)
+		if err != nil {
+			return nil, fmt.Errorf("%w: name the corpus of %s: %w",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix, err)
+		}
+		if base.treeOID == "" {
+			return nil, fmt.Errorf("%w: repository %s names no committed tree",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix)
+		}
+		out[owner.RepoPrefix] = "tree:" + base.treeOID
+	}
+	for _, registration := range lease.RawRegistrations() {
+		owner := registration.Owner()
+		if member != nil && !member(owner.RepoPrefix) {
+			continue
+		}
+		if s.Counters != nil {
+			s.Counters.MemberSourceReads.Add(1)
+		}
+		witnessCtx, cancel := context.WithTimeout(ctx, budget)
+		snapshot, err := s.Leases.AcquireRawRepositorySnapshot(witnessCtx, registration, 0)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("%w: witness the source of raw repository %s: %w",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix, err)
+		}
+		witness := snapshot.Witness()
+		snapshot.Release()
+		if witness.Revision == 0 || witness.Fingerprint == "" {
+			return nil, fmt.Errorf("%w: raw repository %s has no source witness",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix)
+		}
+		out[owner.RepoPrefix] = "raw:" + strconv.FormatUint(witness.Revision, 10) +
+			":" + witness.Fingerprint
+	}
+	return out, nil
+}
+
+// degradedRevision is the value a producer stamps when the cohort cannot be
+// described and the build must go ahead anyway.
+//
+// It is NOT a certificate and says so: the DependencyRevisionDegradedPrefix
+// vocabulary can never equal a computed revision, so nothing built under a
+// described cohort is ever reused for one that was not, in either direction.
+// What it IS, is stable and content-derived — the reason plus everything the
+// producer CAN name (the target, the configuration, the producer policy, the
+// capability vocabulary and the extractor set). Two builds a minute apart under
+// the same transient produce the same value, so a degraded layer is reusable by
+// the next degraded build of the same inputs instead of rebuilding every cycle;
+// and a change in any describable input still re-keys it.
+//
+// The residual is declared rather than hidden: what a degraded revision cannot
+// see is the roster it failed to enumerate, so two degraded builds whose
+// describable inputs match are treated as one even if the roster moved between
+// them. That is bounded by the prefix — the moment the cohort is describable
+// again the identity re-keys to a real revision — and by the caller's own
+// policy of preferring to DEFER a build over stamping one of these.
+func (s dependencyCohortSource) degradedRevision(reason string) string {
+	if reason == "" {
+		reason = dependencyCohortReasonUnavailable
+	}
+	scope, _ := s.scope()
+	configDigest := "unencodable-configuration"
+	if _, digest, err := snapshotDedicatedBaseConfig(
+		s.Config, s.Target.RepoPrefix, s.Target.WorkspaceID, s.Target.ProjectID); err == nil {
+		configDigest = digest
+	}
+	var e dependencyRevisionEncoder
+	e.field("encoding", DependencyRevisionDegradedPrefix)
+	e.field("reason", reason)
+	e.field("scope", scope)
+	e.field("target.repo", s.Target.RepoPrefix)
+	e.field("target.workspace", s.Target.WorkspaceID)
+	e.field("target.project", s.Target.ProjectID)
+	e.field("config.index", configDigest)
+	e.count("config.sections", len(s.ConfigSections))
+	for _, section := range sortedConfigSections(s.ConfigSections) {
+		e.field("config.section.name", section.Name)
+		e.field("config.section.digest", section.Digest)
+	}
+	e.count("producers", len(s.Producers))
+	for _, producer := range sortedProducers(s.Producers) {
+		e.field("producer.id", producer.Producer)
+		e.field("producer.state", producer.State)
+		e.field("producer.reason", producer.Reason)
+	}
+	e.count("capabilities", len(s.Capabilities))
+	for _, capability := range slices.Sorted(slices.Values(s.Capabilities)) {
+		e.field("capability", capability)
+	}
+	e.field("extractors", s.ExtractorVersions)
+	sum := sha256.Sum256([]byte(e.b.String()))
+	return DependencyRevisionDegradedPrefix + ":" + reason + ":" + hex.EncodeToString(sum[:16])
+}
+
+// sortedConfigSections and sortedProducers order the degraded digest's lists
+// the way the certified encoding orders them, so the two agree about what
+// "the same inputs" means.
+func sortedConfigSections(in []DependencyRevisionConfigSection) []DependencyRevisionConfigSection {
+	out := slices.Clone(in)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Digest < out[j].Digest
+	})
+	return out
+}
+
+func sortedProducers(in []DependencyRevisionProducer) []DependencyRevisionProducer {
+	out := slices.Clone(in)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Producer != out[j].Producer {
+			return out[i].Producer < out[j].Producer
+		}
+		if out[i].State != out[j].State {
+			return out[i].State < out[j].State
+		}
+		return out[i].Reason < out[j].Reason
+	})
+	return out
 }

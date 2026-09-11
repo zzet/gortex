@@ -287,6 +287,7 @@ const dependencyRevisionGoldenPreimage = "encoding:9:cohort-v1\x00" +
 	"target.repo:5:alpha\x00" +
 	"target.workspace:2:ws\x00" +
 	"target.project:2:pj\x00" +
+	"roster.scope:0:\x00" +
 	"roster.count:1:2\x00" +
 	"repo.prefix:5:alpha\x00repo.kind:9:dedicated\x00repo.graph:3:g-a\x00" +
 	"repo.checkout:4:co-a\x00repo.incarnation:5:inc-a\x00repo.root:0:\x00repo.source:5:src-a\x00" +
@@ -693,5 +694,113 @@ func TestDependencyRevisionRosterRefusesAnEmptyRegisteredRoster(t *testing.T) {
 	}
 	if repositories != nil {
 		t.Fatalf("a refused roster returned %d entries", len(repositories))
+	}
+}
+
+// TestDependencyRevisionRosterScopedNarrowsToTheAdmittedRepositories pins the
+// scoped enumeration.
+//
+// The narrowing is what stops a commit in an unrelated repository from
+// re-keying — and therefore rebuilding — every checkout layer in the daemon.
+// What it must NOT relax is the completeness rule for the repositories it does
+// admit, or the staleness check over the whole live registration set.
+func TestDependencyRevisionRosterScopedNarrowsToTheAdmittedRepositories(t *testing.T) {
+	manager := graphview.NewLeaseManager()
+	dedicated := graphview.RepositoryOwner{
+		GraphID: "g-a", CheckoutID: "co-a", Incarnation: "inc-a", RepoPrefix: "alpha"}
+	if err := manager.RegisterRepositoryOwner(dedicated); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []graphview.RawRepositoryOwner{
+		{RepoPrefix: "beta", RootIdentity: "root-b", Incarnation: "inc-b"},
+		{RepoPrefix: "gamma", RootIdentity: "root-c", Incarnation: "inc-c"},
+	} {
+		if _, err := manager.RegisterRawRepositoryOwnerPrepared(raw, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lease, err := manager.AcquireRepositoryRoster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+
+	// Only the admitted repositories' bytes are named; the others are not even
+	// asked for, which is both the correctness and the cost half.
+	asked := map[string]int{}
+	identity := func(prefix string) string {
+		asked[prefix]++
+		return "src-" + prefix
+	}
+	inScope := func(prefix string) bool { return prefix == "alpha" || prefix == "beta" }
+
+	repositories, err := DependencyRevisionRosterScoped(lease, inScope, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []DependencyRevisionRepository{
+		{RepoPrefix: "alpha", Kind: DependencyRevisionRepositoryDedicated,
+			GraphID: "g-a", CheckoutID: "co-a", Incarnation: "inc-a", SourceIdentity: "src-alpha"},
+		{RepoPrefix: "beta", Kind: DependencyRevisionRepositoryRaw,
+			Incarnation: "inc-b", RootIdentity: "root-b", SourceIdentity: "src-beta"},
+	}
+	if !slices.Equal(repositories, want) {
+		t.Fatalf("scoped roster = %+v, want %+v", repositories, want)
+	}
+	if asked["gamma"] != 0 {
+		t.Fatalf("an out-of-scope repository's source was read %d times", asked["gamma"])
+	}
+
+	// The completeness rule still holds inside the scope.
+	if _, err := DependencyRevisionRosterScoped(lease, inScope, func(prefix string) string {
+		if prefix == "beta" {
+			return ""
+		}
+		return "src-" + prefix
+	}); !errors.Is(err, ErrDependencyRevisionIncomplete) {
+		t.Fatalf("an in-scope repository with no source identity was accepted: err = %v", err)
+	}
+
+	// A scope that admits nothing is a refusal, not an empty certificate.
+	if _, err := DependencyRevisionRosterScoped(lease, func(string) bool { return false },
+		identity); !errors.Is(err, ErrDependencyRevisionIncomplete) {
+		t.Fatalf("a scope that admits no repository was accepted: err = %v", err)
+	}
+
+	// And the staleness check is still over the WHOLE live registration set: a
+	// repository that joined after the lease was taken refuses the digest even
+	// when the scope would not have admitted it, because the lease no longer
+	// describes a moment that happened.
+	late := graphview.RawRepositoryOwner{
+		RepoPrefix: "delta", RootIdentity: "root-d", Incarnation: "inc-d"}
+	if _, err := manager.RegisterRawRepositoryOwnerPrepared(late, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DependencyRevisionRosterScoped(lease, inScope, identity); !errors.Is(
+		err, ErrDependencyRevisionIncomplete) {
+		t.Fatalf("a moved roster was accepted under a scope: err = %v", err)
+	}
+}
+
+// TestDependencyRevisionScopeIsPartOfTheCertificate pins the declared scope as
+// a digested input. Without it two cohorts that enumerated different worlds —
+// a whole daemon and one workspace — could produce one revision whenever their
+// member lists happened to coincide, and a reader comparing revisions could not
+// tell which claim it was holding.
+func TestDependencyRevisionScopeIsPartOfTheCertificate(t *testing.T) {
+	unscoped := dependencyRevisionCohort()
+	baseline := mustComputeDependencyRevision(t, unscoped)
+
+	workspace := dependencyRevisionCohort()
+	workspace.RosterScope = DependencyRevisionScopeWorkspace + "ws"
+	scoped := mustComputeDependencyRevision(t, workspace)
+	if scoped == baseline {
+		t.Fatal("declaring a roster scope left the revision where it was")
+	}
+
+	repository := dependencyRevisionCohort()
+	repository.RosterScope = DependencyRevisionScopeRepository + "alpha"
+	if narrow := mustComputeDependencyRevision(t, repository); narrow == scoped {
+		t.Fatal("two different roster scopes produced one revision")
 	}
 }

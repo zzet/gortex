@@ -20,6 +20,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search/trigram"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -79,11 +80,19 @@ const (
 	// over and whose repo prefix their payload is stamped with.
 	checkoutLayerOwnerKind = "dedicated_graph"
 
-	// checkoutResolverVersion stamps the resolution contract a coordinator's
-	// generations were built under. Raising it makes every cached commit layer
-	// miss, which is what a change in what resolution emits requires — the
-	// stored payload is not what this binary would produce any more.
-	checkoutResolverVersion = "1"
+	// maxCohortBuildDeferrals bounds how many consecutive cycles may be
+	// deferred because the resolver-visible input cohort could not be
+	// described.
+	//
+	// Deferring is the right first answer to a transient — a repository being
+	// untracked, a raw repository mid-mutation, a sibling that is tracked but
+	// not yet indexed — because a build that goes ahead stamps a layer with a
+	// revision that is not a certificate, and a checkout whose view is a few
+	// seconds behind is a better outcome than a layer nobody can reuse. It is
+	// not the right LAST answer: a transient that does not clear would leave
+	// the checkout's view frozen forever. After this many deferrals the build
+	// proceeds under a stable degraded revision and says so.
+	maxCohortBuildDeferrals = 3
 
 	// checkoutConfigDigestDomain versions the configuration digest a
 	// generation's config_hash carries.
@@ -210,7 +219,21 @@ type CheckoutCoordinatorConfig struct {
 	// refused — which fails closed onto a non-reusable revision rather than
 	// onto a certificate over configuration nobody enumerated.
 	ConfigSections []DependencyRevisionConfigSection
-	Logger         *zap.Logger
+
+	// WorkspaceMembers reports which repositories share this checkout's
+	// workspace, and therefore which of them may appear in its dependency
+	// cohort at all.
+	//
+	// nil takes the production default: the repository topology the builder's
+	// own Indexer belongs to (MultiIndexer.ReposInWorkspace, the same authority
+	// the request surface scopes a workspace session with). A coordinator whose
+	// builder has no such topology — a focused fixture, a transition built by
+	// hand — scopes its cohort to the target repository alone and declares that
+	// scope, rather than silently digesting repositories the target's
+	// resolution can never consult.
+	WorkspaceMembers func() map[string]bool
+
+	Logger *zap.Logger
 	// Gate holds the loop's build cycles while the daemon warms up. nil admits
 	// every cycle at once, which is what a coordinator outside a warmup has.
 	Gate *ViewBuildGate
@@ -232,6 +255,18 @@ type CheckoutCoordinatorConfig struct {
 	// re-sampled, which is the window the supersede rule exists to close.
 	// nil in production.
 	dirtyBarrier func()
+	// snapshotConfig is snapshotDedicatedBaseConfig behind a seam one test can
+	// substitute; nil takes the real function.
+	//
+	// The constructor REFUSES a configuration it cannot freeze, because the
+	// alternative hands the builder the ConfigManager's own nested values
+	// while stamping an identity that names the configuration the build
+	// started with. No config.IndexConfig value json.Marshal rejects exists
+	// today, so without this seam that refusal would be unreachable and
+	// unpinned — and the next lane to add a field that can fail to encode
+	// would find the guard untested. It is a per-construction field rather
+	// than a package-level var so two tests substituting it cannot race.
+	snapshotConfig func(config.IndexConfig, string, string, string) (config.IndexConfig, string, error)
 }
 
 // CheckoutCycle is what one reconcile pass did. Every field is a decision, not
@@ -282,11 +317,12 @@ type CheckoutCoordinator struct {
 	logger  *zap.Logger
 	gate    *ViewBuildGate
 
-	quiet      time.Duration
-	poll       time.Duration
-	retain     int
-	configHash string
-	extractors string
+	quiet           time.Duration
+	poll            time.Duration
+	retain          int
+	configHash      string
+	extractors      string
+	resolverVersion string
 
 	// config is the FROZEN index configuration this coordinator's generations
 	// are built under — the deep snapshot, not the ConfigManager's shallow
@@ -295,21 +331,57 @@ type CheckoutCoordinator struct {
 	config         config.IndexConfig
 	configSections []DependencyRevisionConfigSection
 
-	// cohortFailSafe is the non-reusable revision a refused cohort falls back
-	// to. It is allocated once per coordinator rather than once per identity:
-	// a per-call unique value would defeat this coordinator's own reuse cache
-	// and make every cycle rebuild, which is the write amplification the
-	// revision exists to prevent. Per coordinator is enough to fail closed —
-	// it can never equal a revision another process, another coordinator or an
-	// older binary stored, and it can never equal the legacy empty revision
-	// that the reuse guards treat as matching.
-	cohortFailSafe string
+	// cohort describes the resolver-visible input set this coordinator's
+	// layers are built under. It is a value rather than a set of fields
+	// because a ref view's producer assembles the same one.
+	cohort dependencyCohortSource
 
-	// revisionMu guards the cohort revision the identities carry. It is its
-	// own lock because commitIdentity is called both under mu (retainCommit's
-	// key) and outside it.
+	// cohortCost counts what describing the cohort has cost: one roster lease
+	// and one source read per in-scope member, each time it is described. The
+	// counters are the evidence that an idle poll describes nothing.
+	cohortCost dependencyCohortCounters
+
+	// revisionMu guards the cached cohort the identities carry. It is its own
+	// lock because commitIdentity is called both under mu (retainCommit's key)
+	// and outside it.
+	//
+	// The cohort is CACHED rather than re-described per cycle. Describing it
+	// takes a daemon-wide roster read lease and one catalog read per in-scope
+	// roster member; doing that on every 15-second poll of every checkout is
+	// K×N reads per interval for an answer that changes only when the topology
+	// does. The cache is refreshed on events instead: construction, a build
+	// (reconcile and RehomeTo both describe it afresh, so what a layer is
+	// stamped with is always freshly validated), and InvalidateDependencyCohort
+	// for everything the coordinator cannot see for itself.
 	revisionMu sync.RWMutex
 	revision   string
+	// degraded is the stable revision the identities carry while revision is
+	// empty. It is computed once per description rather than per identity read:
+	// commitIdentity is called several times a cycle, and the degraded value
+	// digests the whole frozen configuration.
+	degraded string
+	// revisionReason is the stable refusal reason when the cohort could not be
+	// described; empty when revision is a real certificate.
+	revisionReason string
+	// cohortStale marks the cached cohort as needing a fresh description at
+	// the next opportunity that is allowed to take one.
+	cohortStale bool
+	// cohortTopology is the workspace topology the cached cohort was described
+	// under (dependencyCohortSource.topologyToken). The poll re-reads the token
+	// — a map walk, no lease and no catalog read — and re-describes when it
+	// moves, so a repository tracked into or out of this checkout's workspace
+	// un-settles the poll without anything having to tell the coordinator.
+	cohortTopology string
+	// cohortDeferrals counts consecutive cycles deferred for want of a
+	// describable cohort, and is reset by the first cycle that describes one.
+	cohortDeferrals int
+	// cohortEverDescribed records that this coordinator has described its
+	// cohort at least once. Deferring is a response to a TRANSIENT — something
+	// that was describable and stopped being so — and a coordinator that has
+	// never described one has no route to keep serving in the meantime, so it
+	// builds under the degraded revision immediately rather than leaving the
+	// checkout with no view at all for several poll intervals.
+	cohortEverDescribed bool
 
 	// signal carries a wake to the run loop. It is buffered to one: a burst of
 	// signals has exactly one thing to say, and the loop re-arms the quiet
@@ -454,42 +526,48 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	// frozen value and is what makes a coordinator constructed by any other
 	// caller — a test, a transition — own its config too, rather than sharing
 	// the ConfigManager's nested maps and slices with whoever else holds them.
-	frozen, configFingerprint, snapshotErr := snapshotDedicatedBaseConfig(
+	snapshot := cfg.snapshotConfig
+	if snapshot == nil {
+		snapshot = snapshotDedicatedBaseConfig
+	}
+	frozen, configFingerprint, snapshotErr := snapshot(
 		cfg.Config, cfg.RepoPrefix, cfg.WorkspaceID, cfg.ProjectID)
 	if snapshotErr != nil {
-		// Same fail-safe indexConfigHash has always used for a configuration
-		// that cannot be encoded: a unique digest, so such a build is its own
-		// identity and reuses nothing. The unencodable value is still carried
-		// as the build's configuration — refusing to construct would take a
-		// checkout's view away over a digest.
-		frozen = cfg.Config
-		configFingerprint = "unhashable-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-		logger.Warn("checkout coordinator: the index configuration could not be frozen; "+
-			"this coordinator's generations reuse nothing",
-			zap.String("checkout", cfg.CheckoutID), zap.Error(snapshotErr))
+		// Fail CLOSED. The alternative — carry on with the caller's value and
+		// a unique digest — keeps the identity honest but leaves the BUILDER
+		// holding the ConfigManager's own nested maps and slices, which the
+		// next configuration reload can change underneath a build that has
+		// already stamped an identity naming the configuration it started
+		// with. That is the exact mis-description this freeze exists to
+		// prevent, so a configuration that cannot be frozen is a refusal to
+		// construct rather than a warning.
+		cancelLifetime()
+		return nil, fmt.Errorf(
+			"indexer: freeze the index configuration for checkout %s: %w", cfg.CheckoutID, snapshotErr)
 	}
 	c := &CheckoutCoordinator{
-		checkoutID:     cfg.CheckoutID,
-		root:           cfg.CheckoutRoot,
-		sampler:        sampler,
-		familyID:       cfg.FamilyID,
-		repoPrefix:     cfg.RepoPrefix,
-		workspaceID:    cfg.WorkspaceID,
-		projectID:      cfg.ProjectID,
-		store:          cfg.Store,
-		catalog:        cfg.Store.Catalog(),
-		builder:        cfg.Builder,
-		leases:         cfg.Leases,
-		logger:         logger,
-		gate:           cfg.Gate,
-		quiet:          cfg.Debounce,
-		poll:           cfg.PollInterval,
-		retain:         cfg.Retain,
-		config:         frozen,
-		configSections: slices.Clone(cfg.ConfigSections),
-		configHash:     checkoutConfigHash(configFingerprint, cfg.ConfigSections),
-		cohortFailSafe: nonReusableDependencyRevision(),
-		extractors:     extractorVersionsFingerprint(),
+		checkoutID:      cfg.CheckoutID,
+		root:            cfg.CheckoutRoot,
+		sampler:         sampler,
+		familyID:        cfg.FamilyID,
+		repoPrefix:      cfg.RepoPrefix,
+		workspaceID:     cfg.WorkspaceID,
+		projectID:       cfg.ProjectID,
+		store:           cfg.Store,
+		catalog:         cfg.Store.Catalog(),
+		builder:         cfg.Builder,
+		leases:          cfg.Leases,
+		logger:          logger,
+		gate:            cfg.Gate,
+		quiet:           cfg.Debounce,
+		poll:            cfg.PollInterval,
+		retain:          cfg.Retain,
+		config:          frozen,
+		configSections:  slices.Clone(cfg.ConfigSections),
+		configHash:      checkoutConfigHash(configFingerprint, cfg.ConfigSections),
+		extractors:      extractorVersionsFingerprint(),
+		resolverVersion: resolverVersionFingerprint(),
+
 		signal:         make(chan struct{}, 1),
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -508,11 +586,41 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	if c.retain <= 0 {
 		c.retain = defaultRetainedCommitLayers
 	}
-	// Freeze the cohort before the loop, and before any caller can ask for an
+	workspaceMembers := cfg.WorkspaceMembers
+	if workspaceMembers == nil {
+		workspaceMembers = builderWorkspaceMembers(cfg.Builder, cfg.WorkspaceID)
+	}
+	c.cohort = dependencyCohortSource{
+		Target: DependencyRevisionTarget{
+			RepoPrefix:  cfg.RepoPrefix,
+			WorkspaceID: cfg.WorkspaceID,
+			ProjectID:   cfg.ProjectID,
+		},
+		Leases:           cfg.Leases,
+		Catalog:          c.catalog,
+		WorkspaceMembers: workspaceMembers,
+		Config:           frozen,
+		ConfigSections:   c.configSections,
+		// The ownership evidence is one measured source; see
+		// goPackageOwnershipTargetEvidence for why that is a fact about this
+		// build rather than an absence nobody looked for.
+		Ownership: []DependencyRevisionOwnership{{
+			RepoPrefix: cfg.RepoPrefix,
+			Language:   "go",
+			Owner:      goPackageOwnershipTargetEvidence,
+		}},
+		Producers:         cohortProducerPolicy(frozen, cfg.Builder != nil && cfg.Builder.Embedder != nil),
+		Capabilities:      cohortCapabilityVocabulary(),
+		ExtractorVersions: c.extractors,
+		SourceBudget:      dependencyRevisionSourceBudget,
+		Counters:          &c.cohortCost,
+	}
+	// Describe the cohort before the loop, and before any caller can ask for an
 	// identity. Every read of the revision after this point sees a real cohort
-	// or this coordinator's own fail-safe; none of them sees an empty revision,
-	// which is the one value the reuse guards read as "matches anything".
-	c.refreshDependencyRevision(lifetime)
+	// or this coordinator's stable degraded revision; none of them sees an
+	// empty revision, which is the one value the reuse guards read as "matches
+	// anything".
+	c.describeDependencyCohort(lifetime)
 	go c.run()
 	return c, nil
 }
@@ -781,11 +889,15 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	if err := ctx.Err(); err != nil {
 		return out, false
 	}
-	// The poll compares identities, so it has to compare against the cohort as
-	// it is now — not the one the last build froze. Refreshing here allocates
-	// nothing and writes nothing; it only decides whether the routed identity
-	// still describes this checkout's inputs.
-	c.refreshDependencyRevision(ctx)
+	// The poll compares identities against the CACHED cohort. It does not
+	// describe one: describing takes a daemon-wide roster read lease and a
+	// catalog read per in-scope roster member, and paying that on every poll of
+	// every checkout is K×N reads per interval — behind a lease every
+	// repository registration and every admission close waits on — for an
+	// answer that moves only when the topology does. Events refresh the cache
+	// (InvalidateDependencyCohort), and every build path describes it afresh,
+	// so what a layer is STAMPED with is always freshly validated.
+	c.ensureDependencyCohort(ctx)
 	base, err := c.primaryBase(ctx)
 	if err != nil {
 		return out, false
@@ -858,10 +970,19 @@ func recordCoordinatorCycle(out CheckoutCycle) {
 func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	var out CheckoutCycle
 
-	// One cohort per cycle. Every identity this cycle mints carries the same
-	// revision, so the layer it builds and the cache entry it files it under
-	// cannot disagree.
-	c.refreshDependencyRevision(ctx)
+	// One cohort per cycle, described afresh. Every identity this cycle mints
+	// carries the same revision, so the layer it builds and the cache entry it
+	// files it under cannot disagree — and the revision a layer is stored with
+	// names inputs that were validated when the build started.
+	//
+	// A cohort that cannot be described defers the cycle rather than stamping a
+	// layer nobody validated the inputs of. Nothing was read and nothing was
+	// written at this point, so a deferred cycle leaves the route exactly as it
+	// found it and the poll retries it.
+	if !c.describeDependencyCohort(ctx) && !c.cohortAllowsBuild() {
+		out.Deferred = true
+		return out
+	}
 	base, err := c.primaryBase(ctx)
 	if err != nil {
 		out.Err = err
@@ -969,9 +1090,12 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
-	// A transition builds a whole stack; it freezes its cohort the same way a
-	// cycle does, and for the same reason.
-	c.refreshDependencyRevision(ctx)
+	// A transition builds a whole stack; it describes its cohort the same way a
+	// cycle does, and for the same reason. A transition is a caller-driven
+	// promise about a route, so it does not defer on an undescribable cohort
+	// the way the loop's own cycle does — it builds under the stable degraded
+	// revision and the Warn says why.
+	c.describeDependencyCohort(ctx)
 
 	dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
@@ -1889,7 +2013,7 @@ func (c *CheckoutCoordinator) commitIdentity(base primaryBase, targetTree string
 		TreeOID:              targetTree,
 		ConfigHash:           c.configHash,
 		ExtractorVersions:    c.extractors,
-		ResolverVersion:      checkoutResolverVersion,
+		ResolverVersion:      c.resolverVersion,
 		DependencyRevision:   c.dependencyRevision(),
 	}
 }
@@ -1908,7 +2032,7 @@ func (c *CheckoutCoordinator) dirtyIdentity(graphID string, commitGeneration int
 		BaseGenerationID:   commitGeneration,
 		ConfigHash:         c.configHash,
 		ExtractorVersions:  c.extractors,
-		ResolverVersion:    checkoutResolverVersion,
+		ResolverVersion:    c.resolverVersion,
 		DependencyRevision: c.dependencyRevision(),
 	}
 }
@@ -1921,204 +2045,244 @@ func (c *CheckoutCoordinator) dirtyIdentity(graphID string, commitGeneration int
 // describe its cohort must not claim that.
 func (c *CheckoutCoordinator) dependencyRevision() string {
 	c.revisionMu.RLock()
-	defer c.revisionMu.RUnlock()
-	if c.revision == "" {
-		return c.cohortFailSafe
+	revision, degraded := c.revision, c.degraded
+	c.revisionMu.RUnlock()
+	switch {
+	case revision != "":
+		return revision
+	case degraded != "":
+		return degraded
+	default:
+		// A coordinator the constructor built has always described its cohort
+		// by now, so this is the hand-assembled shape a focused fixture uses.
+		// It still must not read as the legacy empty revision.
+		return c.cohort.degradedRevision(dependencyCohortReasonUnavailable)
 	}
-	return c.revision
 }
 
-// nonReusableDependencyRevision mints a revision nothing can match.
-//
-// It has the same shape as indexConfigHash's unencodable-configuration
-// fallback — a time-based unique token — for the same reason: a build whose
-// inputs cannot be described completely must be its own identity rather than
-// fall back to a value some stored generation happens to share. The
-// `cohort-refused:` prefix keeps it outside the `cohort-v1:` vocabulary a real
-// revision speaks, so no reader can mistake one for the other.
-func nonReusableDependencyRevision() string {
-	return "cohort-refused:" + strconv.FormatInt(time.Now().UnixNano(), 36)
+// dependencyCohortDescribable reports whether the cached cohort is a real
+// certificate rather than the degraded fallback.
+func (c *CheckoutCoordinator) dependencyCohortDescribable() bool {
+	c.revisionMu.RLock()
+	defer c.revisionMu.RUnlock()
+	return c.revision != ""
 }
 
-// refreshDependencyRevision recomputes the cohort once, for the cycle that is
-// about to run.
+// InvalidateDependencyCohort marks the cached cohort as needing a fresh
+// description.
 //
-// Once per cycle, not once per identity: reconcileCommitSlot and
-// resolveCommitLayer both name the same commit layer, and a revision that
-// moved between the two calls would have the cycle build under one identity
-// and cache it under another.
-func (c *CheckoutCoordinator) refreshDependencyRevision(ctx context.Context) {
-	revision, err := c.computeDependencyRevision(ctx)
-	if err != nil {
-		revision = c.cohortFailSafe
+// It is the event entry point for everything the coordinator cannot observe
+// for itself: a repository registered or closed, a sibling's HEAD or tree
+// moved, the configuration reloaded. Nothing is read here — the next
+// opportunity that is allowed to describe the cohort does the work — so an
+// event source may call it as often as it likes.
+func (c *CheckoutCoordinator) InvalidateDependencyCohort(reason string) {
+	if c == nil {
+		return
 	}
 	c.revisionMu.Lock()
-	previous := c.revision
-	c.revision = revision
+	c.cohortStale = true
 	c.revisionMu.Unlock()
-	if previous == revision {
+	c.logger.Debug("checkout coordinator: dependency cohort invalidated",
+		zap.String("checkout", c.checkoutID), zap.String("reason", reason))
+}
+
+// ensureDependencyCohort describes the cohort only if the cached one is stale.
+//
+// This is what the 15-second poll and the retirement janitor use. Describing a
+// cohort takes a daemon-wide roster read lease and one catalog read per
+// in-scope roster member; a poll that did that would pay K×N reads per interval
+// across the daemon for an answer that moves only when the topology does, and
+// would hold a lease that every repository registration and every admission
+// close has to wait behind. The poll compares identities — it allocates no
+// generation and writes nothing — so a cached cohort is the right input for it.
+// Two things make the cache stale. An EVENT source calls
+// InvalidateDependencyCohort — that is how a member's bytes moving, a
+// configuration reload or an admission close reaches it. And the poll itself
+// re-reads the cheap workspace topology token: a repository tracked into or
+// untracked out of this checkout's workspace changes which repositories are
+// inputs at all, and that one the coordinator can observe for itself without a
+// lease or a catalog read.
+func (c *CheckoutCoordinator) ensureDependencyCohort(ctx context.Context) {
+	token := c.cohort.topologyToken()
+	c.revisionMu.RLock()
+	stale := c.cohortStale || token != c.cohortTopology
+	c.revisionMu.RUnlock()
+	if !stale {
 		return
 	}
+	c.describeDependencyCohort(ctx)
+}
+
+// describeDependencyCohort describes the cohort afresh, whatever the cache
+// says, and reports whether the result is a certificate.
+//
+// Every build path calls it: the identity a layer is STORED with must name
+// inputs that were validated at the moment the build started, not inputs that
+// were validated some cycles ago. Once per cycle, not once per identity —
+// reconcileCommitSlot and resolveCommitLayer both name the same commit layer,
+// and a revision that moved between the two would have the cycle build under
+// one identity and cache it under another.
+func (c *CheckoutCoordinator) describeDependencyCohort(ctx context.Context) bool {
+	// Sampled BEFORE the description, deliberately: a topology that moves
+	// while the cohort is being described leaves the cache marked as described
+	// under the OLDER token, so the next poll re-describes. The other order
+	// would record a token the description had not seen and settle on it.
+	token := c.cohort.topologyToken()
+	revision, err := c.cohort.revision(ctx)
+	reason, degraded := "", ""
 	if err != nil {
-		c.logger.Warn("checkout coordinator: the resolver-visible input cohort could not be "+
-			"described; this checkout's layers reuse nothing until it can",
+		reason = dependencyCohortRefusalReason(err)
+		revision, degraded = "", c.cohort.degradedRevision(reason)
+	}
+	c.revisionMu.Lock()
+	previous, previousReason := c.revision, c.revisionReason
+	c.revision, c.degraded, c.revisionReason = revision, degraded, reason
+	c.cohortStale = false
+	c.cohortTopology = token
+	if revision != "" {
+		c.cohortEverDescribed = true
+		// The deferral budget is per-TRANSIENT, not per-coordinator-lifetime.
+		// It is reset here rather than in cohortAllowsBuild because every
+		// build path short-circuits that call away on the success path
+		// (`!c.describeDependencyCohort(ctx) && !c.cohortAllowsBuild()`), so a
+		// budget reset that lived there would never run after the first
+		// exhausted transient — and every later transient would then stamp a
+		// degraded layer on its FIRST cycle instead of deferring.
+		c.cohortDeferrals = 0
+	}
+	c.revisionMu.Unlock()
+	if err != nil {
+		if previous != "" || previousReason != reason {
+			c.logger.Warn("checkout coordinator: the resolver-visible input cohort could not be "+
+				"described; this checkout's layers carry a degraded revision until it can",
+				zap.String("checkout", c.checkoutID),
+				zap.String("reason", reason), zap.Error(err))
+		}
+		return false
+	}
+	if previous != revision {
+		c.logger.Debug("checkout coordinator: dependency revision updated",
+			zap.String("checkout", c.checkoutID), zap.String("revision", revision))
+	}
+	return true
+}
+
+// cohortAllowsBuild decides what a cycle does when the cohort cannot be
+// described.
+//
+// It prefers to DEFER. A build that goes ahead stamps its layer with a
+// degraded revision — honest, but not a certificate — and a transient
+// (a repository being untracked, a raw repository mid-mutation, a sibling that
+// is tracked but not yet indexed) usually clears within a cycle or two. A
+// checkout whose view is a few seconds behind is a better outcome than a layer
+// stamped with a value that says nobody could name its inputs.
+//
+// It does not defer forever: after maxCohortBuildDeferrals consecutive
+// deferrals the build proceeds under the degraded revision and says so, so a
+// transient that never clears cannot freeze a checkout's view. The counter is
+// reset by describeDependencyCohort on the first cycle that describes a cohort
+// — which is also the cycle that re-keys the layers back onto a real revision —
+// rather than here, because every build path short-circuits this function away
+// on that path.
+func (c *CheckoutCoordinator) cohortAllowsBuild() bool {
+	c.revisionMu.Lock()
+	if c.revision != "" {
+		c.cohortDeferrals = 0
+		c.revisionMu.Unlock()
+		return true
+	}
+	if !c.cohortEverDescribed {
+		reason := c.revisionReason
+		c.revisionMu.Unlock()
+		// Nothing to keep serving: this coordinator has never had a certified
+		// cohort, so deferring would leave the checkout with no view at all
+		// rather than with a slightly stale one. It builds, and says what it
+		// built under.
+		c.logger.Warn("checkout coordinator: building under a degraded dependency revision; "+
+			"the input cohort has never been describable for this checkout",
+			zap.String("checkout", c.checkoutID), zap.String("reason", reason))
+		return true
+	}
+	c.cohortDeferrals++
+	deferrals, reason := c.cohortDeferrals, c.revisionReason
+	c.revisionMu.Unlock()
+	if deferrals <= maxCohortBuildDeferrals {
+		c.logger.Debug("checkout coordinator: build deferred until the input cohort can be described",
 			zap.String("checkout", c.checkoutID),
-			zap.String("revision", revision), zap.Error(err))
-		return
+			zap.String("reason", reason), zap.Int("deferrals", deferrals))
+		return false
 	}
-	c.logger.Debug("checkout coordinator: dependency revision updated",
-		zap.String("checkout", c.checkoutID), zap.String("revision", revision))
+	c.logger.Warn("checkout coordinator: building under a degraded dependency revision; "+
+		"the input cohort has not been describable for several cycles",
+		zap.String("checkout", c.checkoutID),
+		zap.String("reason", reason), zap.Int("deferrals", deferrals))
+	return true
 }
 
-// computeDependencyRevision digests the complete resolver-visible input cohort
-// for this checkout's layers.
+// builderWorkspaceMembers derives the workspace topology a coordinator's
+// cohort is scoped by from the builder it was handed.
 //
-// The roster lease is held across its own validation, the enumeration of every
-// member's source and the digest — the window DependencyRevisionRoster
-// documents: a roster that gains or loses a repository under the digest is
-// refused rather than certified.
+// The builder's Admissions handle is the live per-repository Indexer
+// (`checkout_lifecycle.go` hands it `mi.GetIndexer(prefix)`), and every
+// Indexer a MultiIndexer creates carries a link back to it (`multi.go`,
+// `idx.repositoryMutationOwner = mi`). ReposInWorkspace is that MultiIndexer's
+// own answer to "which repositories share this workspace" — the same one the
+// request surface scopes a workspace-scoped session with — so the cohort and
+// the request surface cannot disagree about the boundary.
 //
-// It is released before the build's own catalog writes rather than held
-// through them, deliberately. A checkout build indexes a tree; holding the
-// roster lease across it would block every repository registration and every
-// admission close for the length of a build, and lifecycle teardown — which
-// closes admissions — would then wait on the very build it is tearing down.
-// What the shorter window costs is bounded by W2.1b's rule that a changed
-// revision ROOTS a new chain: a roster that moves after the digest produces a
-// different revision on the next cycle, and that revision cannot extend the
-// chain this one published.
-func (c *CheckoutCoordinator) computeDependencyRevision(ctx context.Context) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
+// nil when there is no such topology (a focused fixture, a standalone
+// Indexer): the caller then scopes the cohort to the target repository alone
+// and declares that scope.
+func builderWorkspaceMembers(builder *SparseGenerationBuilder, workspaceID string) func() map[string]bool {
+	if builder == nil || builder.Admissions == nil || workspaceID == "" {
+		return nil
 	}
-	if c.leases == nil {
-		return "", fmt.Errorf("%w: no lease manager to enumerate the roster with",
-			ErrDependencyRevisionIncomplete)
+	owner := builder.Admissions.repositoryMutationOwner
+	if owner == nil {
+		return nil
 	}
-	lease, err := c.leases.AcquireRepositoryRoster()
-	if err != nil {
-		return "", fmt.Errorf("%w: acquire the repository roster: %w",
-			ErrDependencyRevisionIncomplete, err)
-	}
-	defer lease.Release()
-
-	inputs, err := c.dependencyRevisionInputs(ctx, lease)
-	if err != nil {
-		return "", err
-	}
-	return ComputeDependencyRevision(inputs)
+	return func() map[string]bool { return owner.ReposInWorkspace(workspaceID) }
 }
 
-// dependencyRevisionInputs assembles the cohort this coordinator builds under,
-// against a roster lease the caller holds.
+// builderConfigSections derives the output-affecting configuration domains
+// that live OUTSIDE config.IndexConfig from the builder a producer was handed.
 //
-// It is separate from the digest so the cohort itself is inspectable: a test
-// asserting that one dimension moves the revision reads the real production
-// cohort and changes exactly that dimension, rather than re-deriving what the
-// coordinator would have said.
-func (c *CheckoutCoordinator) dependencyRevisionInputs(
-	ctx context.Context, lease *graphview.RepositoryRosterLease,
-) (DependencyRevisionInputs, error) {
-	sources, err := c.rosterSourceIdentities(ctx, lease)
-	if err != nil {
-		return DependencyRevisionInputs{}, err
-	}
-	repositories, err := DependencyRevisionRoster(lease, func(repoPrefix string) string {
-		return sources[repoPrefix]
-	})
-	if err != nil {
-		return DependencyRevisionInputs{}, err
-	}
-	return DependencyRevisionInputs{
-		Target: DependencyRevisionTarget{
-			RepoPrefix:  c.repoPrefix,
-			WorkspaceID: c.workspaceID,
-			ProjectID:   c.projectID,
-		},
-		RosterComplete: true,
-		Repositories:   repositories,
-		// The ownership evidence is one measured source; see
-		// goPackageOwnershipTargetEvidence for why that is a fact about this
-		// build rather than an absence nobody looked for.
-		OwnershipComplete: true,
-		Ownership: []DependencyRevisionOwnership{{
-			RepoPrefix: c.repoPrefix,
-			Language:   "go",
-			Owner:      goPackageOwnershipTargetEvidence,
-		}},
-		Config:            c.config,
-		ConfigSections:    c.configSections,
-		Producers:         c.cohortProducerPolicy(),
-		Capabilities:      cohortCapabilityVocabulary(),
-		ExtractorVersions: c.extractors,
-	}, nil
-}
-
-// rosterSourceIdentities names what this build can see of each roster member's
-// bytes.
+// The checkout lifecycle passes them explicitly (`ConfigSections:
+// dedicatedBaseConfigSections(repoCfg)`, checkout_lifecycle.go), because it is
+// holding the repository's whole config.Config at that point. A producer built
+// from the IndexConfig alone — the ref view manager is the one in the tree —
+// has no such value, and an EMPTY section list collapses the widened
+// configuration digest back onto the narrow one: checkoutConfigHash renders a
+// zero-length section list, so an artifacts / semantic / LSP / workspace /
+// project change stops re-keying anything.
 //
-// A dedicated repository's source is the committed corpus its graph is at —
-// the same primaryBase every layer over that graph is built against, so the
-// cohort and the layer cannot disagree about what the corpus is. A raw
-// repository has no committed tree; its source witness (revision plus content
-// fingerprint) is the equivalent, and it is read under a bounded budget so a
-// concurrent source mutation cannot park a coordinator cycle.
+// The same link builderWorkspaceMembers rides — the live per-repository
+// Indexer's MultiIndexer — carries the ConfigManager those sections come from,
+// so the derivation reaches the same value the lifecycle would have passed
+// rather than a second opinion about it.
 //
-// Every refusal is a refusal of the whole cohort. A roster member whose bytes
-// cannot be named is exactly the false certificate the revision must not issue.
-func (c *CheckoutCoordinator) rosterSourceIdentities(
-	ctx context.Context, lease *graphview.RepositoryRosterLease,
-) (map[string]string, error) {
-	out := map[string]string{}
-	for _, owner := range lease.DedicatedOwners() {
-		dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, owner.GraphID)
-		if err != nil {
-			return nil, fmt.Errorf("%w: read dedicated graph %s: %w",
-				ErrDependencyRevisionIncomplete, owner.GraphID, err)
-		}
-		if !found {
-			return nil, fmt.Errorf("%w: dedicated graph %s is not in the catalog",
-				ErrDependencyRevisionIncomplete, owner.GraphID)
-		}
-		base, err := graphBase(ctx, c.catalog, dedicated)
-		if err != nil {
-			return nil, fmt.Errorf("%w: name the corpus of %s: %w",
-				ErrDependencyRevisionIncomplete, owner.RepoPrefix, err)
-		}
-		if base.treeOID == "" {
-			return nil, fmt.Errorf("%w: repository %s names no committed tree",
-				ErrDependencyRevisionIncomplete, owner.RepoPrefix)
-		}
-		out[owner.RepoPrefix] = "tree:" + base.treeOID
+// nil when there is nothing to read (a standalone Indexer, a fixture): the
+// caller keeps whatever it was given.
+func builderConfigSections(
+	builder *SparseGenerationBuilder, repoPrefix string,
+) []DependencyRevisionConfigSection {
+	if builder == nil || builder.Admissions == nil || repoPrefix == "" {
+		return nil
 	}
-	for _, registration := range lease.RawRegistrations() {
-		owner := registration.Owner()
-		witnessCtx, cancel := context.WithTimeout(ctx, dependencyRevisionSourceBudget)
-		snapshot, err := c.leases.AcquireRawRepositorySnapshot(witnessCtx, registration, 0)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("%w: witness the source of raw repository %s: %w",
-				ErrDependencyRevisionIncomplete, owner.RepoPrefix, err)
-		}
-		witness := snapshot.Witness()
-		snapshot.Release()
-		if witness.Revision == 0 || witness.Fingerprint == "" {
-			return nil, fmt.Errorf("%w: raw repository %s has no source witness",
-				ErrDependencyRevisionIncomplete, owner.RepoPrefix)
-		}
-		out[owner.RepoPrefix] = "raw:" + strconv.FormatUint(witness.Revision, 10) +
-			":" + witness.Fingerprint
+	owner := builder.Admissions.repositoryMutationOwner
+	if owner == nil || owner.configMgr == nil {
+		return nil
 	}
-	return out, nil
+	return dedicatedBaseConfigSections(owner.configMgr.GetRepoConfig(repoPrefix))
 }
 
 // cohortProducerPolicy renders the producer policy a build under this
-// coordinator's configuration will declare, as far as the configuration
-// decides it.
+// configuration will declare, as far as the configuration decides it.
 //
-// SparseGenerationBuilder.declareProducers is the authority on what is
-// actually written (builder_generation.go). Two groups of its rows are
-// deliberately NOT digested here:
+// SparseGenerationBuilder.declareProducers is the authority on what is actually
+// written (builder_generation.go). Two groups of its rows are deliberately NOT
+// digested here:
 //
 //   - the rows the IDENTITY decides — search.text and the lsp.* family are a
 //     function of the generation kind, which is already an identity column of
@@ -2128,14 +2292,17 @@ func (c *CheckoutCoordinator) rosterSourceIdentities(
 //     what it was given, and a cohort digest is over inputs.
 //
 // What is left is the policy the configuration fixes before anything is built,
-// which is what a reader comparing two builds' inputs needs.
-func (c *CheckoutCoordinator) cohortProducerPolicy() []DependencyRevisionProducer {
+// which is what a reader comparing two builds' inputs needs. Because it mirrors
+// declareProducers rather than calling it, the mirror is pinned by a test that
+// reads a real build's stored producer rows back and compares them row for row
+// (checkout_identity_revision_test.go).
+func cohortProducerPolicy(cfg config.IndexConfig, hasEmbedder bool) []DependencyRevisionProducer {
 	vector := DependencyRevisionProducer{
 		Producer: string(graphview.CapSearchVector),
 		State:    string(store_sqlite.ProducerStateDisabledByConfig),
 		Reason:   "no embedding provider is configured for the build",
 	}
-	if c.builder != nil && c.builder.Embedder != nil {
+	if hasEmbedder {
 		vector.State = string(store_sqlite.ProducerStateComplete)
 		vector.Reason = ""
 	}
@@ -2144,7 +2311,7 @@ func (c *CheckoutCoordinator) cohortProducerPolicy() []DependencyRevisionProduce
 		State:    string(store_sqlite.ProducerStateDisabledByConfig),
 		Reason:   "near-duplicate detection is switched off for the build",
 	}
-	if c.config.Coverage.IsEnabled("clones") {
+	if cfg.Coverage.IsEnabled("clones") {
 		similarity.State = string(store_sqlite.ProducerStateIncomplete)
 		similarity.Reason = "near-duplicate detection ranks bodies against a corpus; " +
 			"a sparse generation ranks them against its file set"
@@ -2157,7 +2324,11 @@ func (c *CheckoutCoordinator) cohortProducerPolicy() []DependencyRevisionProduce
 	}
 	return []DependencyRevisionProducer{
 		complete(graphview.CapSourceSnapshot),
-		complete(graphview.CapSourceConfig),
+		{
+			Producer: string(graphview.CapSourceConfig),
+			State:    string(store_sqlite.ProducerStateComplete),
+			Reason:   sourceConfigNarrowingReason,
+		},
 		complete(graphview.CapSyntaxGraph),
 		complete(graphview.CapResolutionLocal),
 		complete(graphview.CapIncomingEdges),
@@ -2318,6 +2489,21 @@ func checkoutConfigHash(fingerprint string, sections []DependencyRevisionConfigS
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:16])
 }
+
+// resolverVersionFingerprint stamps the resolution contract a generation was
+// built under, for every producer in this package.
+//
+// It used to be the compile-time literal "1", in two copies (here and in
+// ref_views.go). A literal only invalidates when a human remembers to raise it,
+// and two copies can disagree; resolver.Version derives the value from the
+// resolver's own registered pass set plus its hand-maintained semantics
+// version, so a pass that joins, leaves or is renamed re-keys every stored
+// generation without anyone having to notice.
+//
+// Computed once: the registry is fixed for the life of the process, and a
+// per-call digest over fifty pass names would run on every identity a
+// coordinator mints.
+var resolverVersionFingerprint = sync.OnceValue(resolver.Version)
 
 // extractorVersionsFingerprint renders the extractor policy versions the same
 // way the per-repo freshness row does, so a language whose extractor was

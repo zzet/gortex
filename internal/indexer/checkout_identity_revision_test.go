@@ -88,7 +88,7 @@ func TestCheckoutCohortDimensionsMoveTheIdentity(t *testing.T) {
 		t.Fatalf("acquire the roster: %v", err)
 	}
 	defer lease.Release()
-	base, err := c.dependencyRevisionInputs(context.Background(), lease)
+	base, err := c.cohort.inputs(context.Background(), lease)
 	if err != nil {
 		t.Fatalf("assemble the production cohort: %v", err)
 	}
@@ -222,9 +222,18 @@ func TestCheckoutCohortIsStableAcrossTwoConstructions(t *testing.T) {
 // no registered roster — must not fall back to the empty revision. Empty is the
 // LEGACY identity: generationIdentityKey renders it byte-for-byte as a
 // pre-cohort key, so every stored generation from before this change would
-// match it. The fallback is a value nothing can match instead, stable for the
-// coordinator's lifetime so a refusal costs one rebuild rather than one per
-// cycle.
+// match it.
+//
+// What it falls back to is the STABLE degraded revision: outside the certified
+// vocabulary, so no certified layer is ever reused for an undescribable cohort
+// or the other way round, and identical for two producers over identical
+// describable inputs. Stability is the half W2.4 changed: the first
+// implementation minted `cohort-refused:<nanoseconds>` per coordinator, and a
+// value nothing can ever match again means every layer stamped with one is
+// rebuilt on every following cycle for as long as the transient lasts — the
+// write amplification the revision exists to bound. The cost of stability is
+// declared in the degraded revision's own doc comment: two degraded builds
+// whose describable inputs match are treated as one.
 func TestRefusedCheckoutCohortIsNotReusable(t *testing.T) {
 	f := newCoordinatorFixture(t)
 
@@ -262,11 +271,13 @@ func TestRefusedCheckoutCohortIsNotReusable(t *testing.T) {
 			"which every stored generation matches")
 	case strings.HasPrefix(revision, DependencyRevisionEncodingVersion+":"):
 		t.Fatalf("a refused cohort produced a certificate: %q", revision)
-	case !strings.HasPrefix(revision, "cohort-refused:"):
+	case !strings.HasPrefix(revision, DependencyRevisionDegradedPrefix+":"):
 		t.Fatalf("a refused cohort produced %q, which names neither vocabulary", revision)
 	}
-	if second.dependencyRevision() == revision {
-		t.Fatal("two refused coordinators share one revision; a refusal is reusable across them")
+	if second.dependencyRevision() != revision {
+		t.Fatalf("two refused coordinators over identical inputs disagree:\n first  %q\n second %q\n"+
+			"a per-coordinator value can never be matched again, so every layer stamped with "+
+			"one is rebuilt on the next cycle", revision, second.dependencyRevision())
 	}
 
 	// Stable within the coordinator: the refusal must not re-mint on every read,
@@ -274,9 +285,12 @@ func TestRefusedCheckoutCohortIsNotReusable(t *testing.T) {
 	if again := first.dependencyRevision(); again != revision {
 		t.Fatalf("the refusal re-minted itself: %q then %q", revision, again)
 	}
-	first.refreshDependencyRevision(context.Background())
+	first.describeDependencyCohort(context.Background())
 	if again := first.dependencyRevision(); again != revision {
 		t.Fatalf("a refreshed refusal re-minted itself: %q then %q", revision, again)
+	}
+	if first.dependencyCohortDescribable() {
+		t.Fatal("a coordinator with no roster reported a describable cohort")
 	}
 
 	// And it is a different identity from the legacy one, at both layers.
@@ -301,14 +315,24 @@ func TestRefusedCheckoutCohortIsNotReusable(t *testing.T) {
 //
 // It is driven through settledWithoutBuild, the polling path that decides
 // whether a routed layer still describes the checkout. The poll settles while
-// the cohort is what the build froze, and stops settling once a repository
-// joins the roster: the routed payload was resolved against a corpus that no
-// longer describes the inputs.
+// the cohort is what the build froze, and stops settling once a repository in
+// this checkout's WORKSPACE joins the roster and the cohort is re-described:
+// the routed payload was resolved against a corpus that no longer describes the
+// inputs.
+//
+// The re-description is an explicit event rather than something the poll does
+// for itself — see TestAnIdlePollDescribesNoCohort for why an idle poll must
+// describe nothing — and the sibling is a real indexed repository rather than a
+// name with no catalog row, so what moves the revision is a roster gaining a
+// member and not a refusal.
 func TestCheckoutReuseRefusesALayerBuiltUnderAnotherCohort(t *testing.T) {
 	f := newCoordinatorFixture(t)
 	f.commitTreeB()
 
-	c := f.inertCoordinator(t, cohortCoordinatorConfig())
+	cfg := cohortCoordinatorConfig()
+	workspace := newMutableWorkspace(builderRepoPrefix)
+	cfg.WorkspaceMembers = workspace.seam()
+	c := f.inertCoordinator(t, cfg)
 	cycle := coordinatorReconcile(t, c)
 	if cycle.CommitGenerationID == 0 || cycle.DirtyGenerationID == 0 {
 		t.Fatalf("the cycle did not route both layers: %+v", cycle)
@@ -319,17 +343,13 @@ func TestCheckoutReuseRefusesALayerBuiltUnderAnotherCohort(t *testing.T) {
 		t.Fatal("the poll did not settle on the layers the cycle had just routed")
 	}
 
-	// A second repository joins the resolver-visible roster. Nothing about this
-	// checkout's tree changed; what changed is what its resolution can see.
-	err := f.leases.RegisterRepositoryOwner(graphview.RepositoryOwner{
-		GraphID:     "graph-sibling",
-		CheckoutID:  "checkout-sibling-repo",
-		Incarnation: "incarnation-sibling",
-		RepoPrefix:  "sibling",
-	})
-	if err != nil {
-		t.Fatalf("register a second repository owner: %v", err)
-	}
+	// A second repository joins this workspace's resolver-visible roster.
+	// Nothing about this checkout's tree changed; what changed is what its
+	// resolution can see.
+	// Nothing tells the coordinator: the poll re-reads the workspace topology
+	// itself, which is the production source for this staleness.
+	registerCohortSibling(t, f, "workspace-sibling", "tree-workspace-sibling")
+	workspace.add("workspace-sibling")
 
 	if _, settled := c.settledWithoutBuild(context.Background()); settled {
 		t.Fatal("the poll settled on a layer built under a different input cohort")

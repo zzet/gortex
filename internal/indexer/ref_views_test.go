@@ -3,7 +3,9 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // The ref-view fixture: one repository whose main branch is the base corpus,
@@ -794,7 +797,7 @@ func TestRefViewReclaimsAnAbandonedClaim(t *testing.T) {
 		DesiredTree:        treeB,
 		BaseGenerationID:   base.generationID,
 		EnrichmentProfile:  req.EnrichmentProfile,
-		BuildFingerprint:   refViewBuildFingerprint(manager.identity(viewID, base, treeB), req.EnrichmentProfile),
+		BuildFingerprint:   refViewBuildFingerprint(manager.identity(ctx, req, viewID, base, treeB), req.EnrichmentProfile),
 		CapturedRouteEpoch: view.RouteEpoch,
 		State:              store_sqlite.ViewGenerationBuilding,
 		BuildToken:         "token-abandoned",
@@ -973,4 +976,213 @@ func TestRefViewRecordsAnUnresolvableSelector(t *testing.T) {
 	if generations := f.generations(); len(generations) != 0 {
 		t.Fatalf("a failed selection built %d generations: %+v", len(generations), generations)
 	}
+}
+
+// TestRefViewIdentityCarriesTheCohortAndTheDerivedResolverVersion closes the
+// half of the identity widening that ref views were left out of.
+//
+// A ref view is built by the same builder over the same corpus as a checkout's
+// commit layer, so it is reusable on exactly the same terms — and until this
+// change it was reusable on weaker ones: its config digest covered
+// config.IndexConfig alone (so an artifacts / semantic / LSP / workspace /
+// project change did not invalidate it), its dependency revision was empty
+// (which generationIdentityKey renders byte-for-byte as the legacy pre-cohort
+// key that every stored generation matches), and its resolver version was the
+// compile-time literal "1".
+func TestRefViewIdentityCarriesTheCohortAndTheDerivedResolverVersion(t *testing.T) {
+	f := newRefViewFixture(t)
+	manager := f.manager(t, nil)
+	ctx := context.Background()
+	req := f.request("refs/heads/main")
+	base, err := manager.base(ctx, req.GraphID)
+	if err != nil {
+		t.Fatalf("read the base: %v", err)
+	}
+	identity := manager.identity(ctx, req, f.viewID("refs/heads/main"), base, f.treeA)
+
+	if identity.ResolverVersion != resolver.Version() {
+		t.Errorf("a ref view stamps resolver_version %q, the derived contract is %q",
+			identity.ResolverVersion, resolver.Version())
+	}
+	switch {
+	case identity.DependencyRevision == "":
+		t.Error("a ref view still carries the empty (legacy) dependency revision, " +
+			"which every stored generation matches")
+	case !strings.HasPrefix(identity.DependencyRevision, DependencyRevisionEncodingVersion+":") &&
+		!strings.HasPrefix(identity.DependencyRevision, DependencyRevisionDegradedPrefix+":"):
+		t.Errorf("a ref view's dependency revision %q names neither vocabulary",
+			identity.DependencyRevision)
+	}
+	if identity.ConfigHash == indexConfigHash(config.Default().Index) {
+		t.Error("a ref view's config digest is still the narrow index-configuration digest")
+	}
+
+	// The widened digest is the point: a configuration domain outside
+	// config.IndexConfig now re-keys a ref view's payload.
+	widened := f.managerTuned(t, nil, func(cfg *RefViewManagerConfig) {
+		cfg.ConfigSections = []DependencyRevisionConfigSection{
+			{Name: DependencyRevisionConfigArtifacts, Digest: "artifacts-changed"},
+		}
+	})
+	changed := widened.identity(ctx, req, f.viewID("refs/heads/main"), base, f.treeA)
+	if changed.ConfigHash == identity.ConfigHash {
+		t.Error("a changed configuration domain left a ref view's config digest where it was")
+	}
+	if generationIdentityKey(changed) == generationIdentityKey(identity) {
+		t.Error("a changed configuration domain left a ref view's identity key where it was")
+	}
+
+	// A selection whose own context ended must not pin its degraded answer for
+	// the life of the manager: the failure is a fact about the request, not
+	// about the cohort.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	fresh := f.manager(t, nil)
+	fresh.identity(cancelled, req, f.viewID("refs/heads/main"), base, f.treeA)
+	fresh.identityMu.Lock()
+	pinned := len(fresh.identityKeys)
+	fresh.identityMu.Unlock()
+	if pinned != 0 {
+		t.Errorf("a cancelled selection cached %d identity keys", pinned)
+	}
+
+	// The keys are cached for cost, so there has to be a way to drop them: a
+	// certified revision frozen for the life of the manager is a freshness
+	// certificate that stops being true.
+	manager.InvalidateDependencyCohort("test: the topology moved")
+	manager.identityMu.Lock()
+	cached := len(manager.identityKeys)
+	manager.identityMu.Unlock()
+	if cached != 0 {
+		t.Errorf("invalidation left %d cached identity keys", cached)
+	}
+	if again := manager.identity(ctx, req, f.viewID("refs/heads/main"), base, f.treeA); generationIdentityKey(again) != generationIdentityKey(identity) {
+		t.Error("re-deriving the identity over unchanged inputs produced a different one")
+	}
+
+	// Two managers over identical inputs must agree, or every daemon restart
+	// rebuilds every ref view.
+	again := f.manager(t, nil).identity(ctx, req, f.viewID("refs/heads/main"), base, f.treeA)
+	if generationIdentityKey(again) != generationIdentityKey(identity) {
+		t.Errorf("two managers over identical inputs produced two identities:\n %q\n %q",
+			generationIdentityKey(again), generationIdentityKey(identity))
+	}
+}
+
+// TestRefViewWidenedDigestReachesTheProductionManagerShape closes the half of
+// the widening that a production ref view was still missing.
+//
+// CheckoutLifecycle.refViewManager (ref_view_service.go) builds its manager
+// from the repository's config.IndexConfig alone — Store, Builder, Config,
+// Logger, Gate — because that is all it has at that point; the checkout
+// lifecycle, holding the whole config.Config, passes its coordinator
+// `ConfigSections: dedicatedBaseConfigSections(repoCfg)` instead. An EMPTY
+// section list is not a smaller claim, it is no claim: checkoutConfigHash
+// renders a zero-length section list, so the digest collapses back onto the
+// narrow index-configuration one and an artifacts / semantic / LSP / workspace
+// / project change stops re-keying a ref view at all.
+//
+// The manager therefore derives the sections from the same MultiIndexer link
+// the workspace scope rides when its caller passes none.
+func TestRefViewWidenedDigestReachesTheProductionManagerShape(t *testing.T) {
+	f := newRefViewFixture(t)
+	ctx := context.Background()
+	req := f.request("refs/heads/main")
+	base, err := f.manager(t, nil).base(ctx, req.GraphID)
+	if err != nil {
+		t.Fatalf("read the base: %v", err)
+	}
+
+	// A manager in the exact shape ref_view_service.go builds: no
+	// ConfigSections, no Leases, and a builder whose Admissions handle is the
+	// live per-repository Indexer of a MultiIndexer.
+	productionShape := func(t *testing.T, artifacts []config.ArtifactEntry) *RefViewManager {
+		t.Helper()
+		root := t.TempDir()
+		manager := configManagerWithArtifacts(t, root, builderRepoPrefix, artifacts)
+		mi := &MultiIndexer{
+			repos:     map[string]*RepoMetadata{builderRepoPrefix: {}},
+			indexers:  map[string]*Indexer{},
+			configMgr: manager,
+		}
+		idx := &Indexer{repositoryMutationOwner: mi}
+		idx.SetRepoPrefix(builderRepoPrefix)
+		idx.SetWorkspaceID(builderRepoPrefix)
+		mi.indexers[builderRepoPrefix] = idx
+
+		builder := builderNewBuilder(f.store)
+		builder.Admissions = idx
+		view, err := NewRefViewManager(RefViewManagerConfig{
+			Store:   f.store,
+			Builder: builder,
+			Config:  config.Default().Index,
+			Logger:  zap.NewNop(),
+		})
+		if err != nil {
+			t.Fatalf("NewRefViewManager: %v", err)
+		}
+		return view
+	}
+
+	// The derivation itself reaches a real section list through the link.
+	plain := productionShape(t, nil)
+	if got := builderConfigSections(plain.builder, builderRepoPrefix); len(got) == 0 {
+		t.Fatal("a production-shaped ref view manager derived no configuration sections; " +
+			"its widened config digest is the narrow one")
+	}
+
+	identity := plain.identity(ctx, req, f.viewID("refs/heads/main"), base, f.treeA)
+	if identity.ConfigHash == indexConfigHash(config.Default().Index) {
+		t.Error("a production-shaped ref view's config digest is the narrow " +
+			"index-configuration digest")
+	}
+	// The widened digest is only widened if a domain outside config.IndexConfig
+	// actually moves it.
+	changed := productionShape(t, []config.ArtifactEntry{
+		{Path: "docs/schema.sql", Kind: "schema", Name: "schema"},
+	})
+	moved := changed.identity(ctx, req, f.viewID("refs/heads/main"), base, f.treeA)
+	if moved.ConfigHash == identity.ConfigHash {
+		t.Error("an artifacts change left a production-shaped ref view's config digest " +
+			"where it was; the widened digest does not reach production")
+	}
+	if generationIdentityKey(moved) == generationIdentityKey(identity) {
+		t.Error("an artifacts change left a production-shaped ref view's identity key where it was")
+	}
+
+	// An explicit section list still wins: a caller holding the whole
+	// config.Config is the authority on it, and the derivation is the fallback
+	// for a caller that is not.
+	explicit := productionShape(t, nil)
+	explicit.configSections = []DependencyRevisionConfigSection{
+		{Name: DependencyRevisionConfigArtifacts, Digest: "artifacts-explicit"},
+	}
+	if got := explicit.identity(
+		ctx, req, f.viewID("refs/heads/main"), base, f.treeA); got.ConfigHash == identity.ConfigHash {
+		t.Error("an explicit configuration section list was ignored in favour of the derived one")
+	}
+}
+
+// configManagerWithArtifacts writes a .gortex.yaml carrying an artifacts block
+// — a configuration domain that lives outside config.IndexConfig — and loads it
+// under one repo prefix, which is exactly what MultiIndexer does for a tracked
+// repository.
+func configManagerWithArtifacts(
+	t *testing.T, root, repoPrefix string, artifacts []config.ArtifactEntry,
+) *config.ConfigManager {
+	t.Helper()
+	manager, err := config.NewConfigManager(filepath.Join(root, "global.yaml"))
+	if err != nil {
+		t.Fatalf("build a config manager: %v", err)
+	}
+	body := "index:\n  workers: 2\n"
+	for _, entry := range artifacts {
+		body += "artifacts:\n  - path: " + entry.Path + "\n    kind: " + entry.Kind +
+			"\n    name: " + entry.Name + "\n"
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gortex.yaml"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write the workspace config: %v", err)
+	}
+	manager.LoadWorkspaceConfig(repoPrefix, root)
+	return manager
 }
