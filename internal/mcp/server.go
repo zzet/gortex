@@ -144,8 +144,13 @@ type Server struct {
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	// lifecycle is the shared owner of checkout track / forget side effects.
-	lifecycle     *indexer.CheckoutLifecycle
-	activeProject string
+	lifecycle *indexer.CheckoutLifecycle
+	// freshnessWaiter overrides the checkout settle signal a require_fresh
+	// request waits on. Nil in production, where the lifecycle above is the
+	// waiter; a test installs one to drive the wait's outcomes without a live
+	// coordinator. See checkoutFreshnessWaiter.
+	freshnessWaiter checkoutFreshnessWaiter
+	activeProject   string
 	// testIndexProbe caches, per repo prefix, which language families the
 	// graph carries test symbols for (see testLangsIndexed). The answer
 	// changes with a reindex — and with the test-edge pass that stamps those

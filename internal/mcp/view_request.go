@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
@@ -99,6 +100,16 @@ type requestView struct {
 	// to move while the request was running. It is set once, at rider time,
 	// from the pin's own witness — never inferred.
 	baseChanged bool
+	// freshness is what a require_fresh wait did for this request: whether the
+	// route reached the working copy, how long the request waited, and the
+	// bound it waited under. Nil for every request that did not ask, which is
+	// what keeps the rider of an ordinary request byte-identical.
+	freshness *requestFreshnessOutcome
+	// routeless marks a view that exists only to carry a freshness answer:
+	// selection produced no view at all (freshnessCarrier). Its rider makes no
+	// route claim — viewRiderFields omits actual_view and exact for it —
+	// because a request that selected nothing has no route to be exact about.
+	routeless bool
 
 	// declared is what a view with no materialized generation stack can
 	// answer: a labelled base selector, a non-strict fallback, or a grace
@@ -209,6 +220,17 @@ func (v *requestView) noteBaseCorpusChange() bool {
 	v.baseChanged = true
 	v.mu.Unlock()
 	return true
+}
+
+// freshnessOutcome reports what a require_fresh wait did, nil for a request
+// that asked for nothing.
+func (v *requestView) freshnessOutcome() *requestFreshnessOutcome {
+	if v == nil {
+		return nil
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.freshness
 }
 
 // baseCorpusChanged reports what noteBaseCorpusChange recorded.
@@ -399,10 +421,20 @@ func takeViewSelector(req *mcp.CallToolRequest) (graphview.Selector, error) {
 // use, so a spelling alias cannot accidentally widen grace access.
 type requestViewPolicy struct {
 	allowGraceBaseFallback bool
+	// freshness is what the caller asked about the freshness of the answer:
+	// require_exact, require_fresh and wait_deadline. It is parsed by the
+	// middleware before parameter reconciliation runs and handed in here, so
+	// the alias matcher — which rewrites exactly the keys a tool does not
+	// declare, and these are declared by no tool — cannot take a knob off the
+	// request before the request has read it.
+	freshness requestFreshness
 }
 
-func (s *Server) requestViewPolicy(req *mcp.CallToolRequest) requestViewPolicy {
-	return requestViewPolicy{allowGraceBaseFallback: s.requestAllowsGraceBaseFallback(req)}
+func (s *Server) requestViewPolicy(req *mcp.CallToolRequest, freshness requestFreshness) requestViewPolicy {
+	return requestViewPolicy{
+		allowGraceBaseFallback: s.requestAllowsGraceBaseFallback(req),
+		freshness:              freshness,
+	}
 }
 
 // requestAllowsGraceBaseFallback admits only read-effect graph/search
@@ -523,10 +555,311 @@ func (s *Server) resolveRequestView(
 	selector graphview.Selector,
 	policy requestViewPolicy,
 ) (*requestView, error) {
+	if policy.freshness.err != nil {
+		return nil, policy.freshness.err
+	}
 	view, err := s.selectRequestView(ctx, selector, policy)
+	if policy.freshness.requested() {
+		view, err = s.settleRequestFreshness(ctx, selector, policy, view, err)
+		if err != nil {
+			view.close()
+			return nil, err
+		}
+	}
 	s.pinRequestBaseCorpus(view, err)
 	s.recordRequestView(view, err)
 	return view, err
+}
+
+// settleRequestFreshness answers a require_fresh request.
+//
+// The wait runs after selection, never before it, so that every scope, state
+// and readiness refusal the ordinary path makes is made first: a session that
+// may not see a checkout must not learn its build state from how long a wait
+// took. What is waited on is therefore a checkout that a scope-checked path
+// already named — the routed view's own checkout, or the one an explicit
+// worktree selector was refused for because its route is still building.
+//
+// The view selected before the wait is released BEFORE the wait starts, and
+// selection runs again after it. Two reasons, both load-bearing:
+//
+//   - That view is a lease on a generation stack the caller has just said is
+//     not the one it wants. Holding it for the whole wait_deadline pins the
+//     superseded stack against retirement for as long as the caller is willing
+//     to wait — the wait is the one request shape that is *designed* to be
+//     long, so it is the worst one to hold a stale pin through.
+//   - The answer must be read through the route the caller waited for, not the
+//     one it started from. Re-selecting is what makes that true, and doing it
+//     on every outcome (not only the satisfied one) keeps the expiry answer a
+//     current read of the stale route rather than a read of whatever the stack
+//     looked like before the wait.
+//
+// Nothing here fabricates freshness. A wait that did not end in a coordinator
+// saying "this route describes the tree I sampled" produces fresh:false and the
+// reason; and a wait that DID still only reports fresh:true when the view that
+// answers is that very route — same checkout, served exactly, materialized at
+// the same route epoch, over the generations that route names
+// (servesPublishedRoute). A labelled base fallback, a routeless carrier, a
+// different checkout or a route that moved under the re-selection all mean the
+// thing that went fresh is not the thing that is answering, so they are
+// downgraded to route_withdrawn.
+//
+// require_exact turns every one of those fresh:false outcomes into a refusal.
+// A caller that said both knobs asked for a route that reflects the working
+// copy AND refused substitutes; handing it the stale route with fresh:false
+// would be the substitution, quietly. Without require_exact nothing refuses:
+// the answer is the read-only stale route plus the reason.
+func (s *Server) settleRequestFreshness(
+	ctx context.Context,
+	selector graphview.Selector,
+	policy requestViewPolicy,
+	view *requestView,
+	selectErr error,
+) (*requestView, error) {
+	started := time.Now()
+	deadline := policy.freshness.effectiveDeadline(started, ctx)
+	outcome := &requestFreshnessOutcome{deadline: deadline}
+
+	checkout, notWaitable, waitable := s.freshnessWaitTarget(ctx, selector, view, selectErr)
+	if !waitable {
+		// Nothing this request can wait on. freshnessWaitTarget says which of
+		// the two very different situations that is: the view really reads a
+		// committed base (a fact about the view), or the wait target could not
+		// be resolved (a fact about the lookup). Reporting the second as the
+		// first would put a false claim about the view on the response.
+		outcome.reason = notWaitable
+		if selectErr != nil {
+			return view, selectErr
+		}
+		if policy.freshness.requireExact {
+			view.close()
+			return nil, freshnessExactRefusal(outcome.reason, time.Since(started))
+		}
+		return annotateRequestFreshness(s.freshnessCarrier(selector, view), outcome, started), nil
+	}
+
+	// Release the stale lease before blocking. From here on the pre-wait view
+	// is gone and every return path answers out of a freshly selected one.
+	view.close()
+
+	fresh, reason := s.awaitCheckoutFreshness(ctx, checkout, deadline)
+	outcome.fresh, outcome.reason = fresh, reason
+	if !fresh && reason == freshReasonDeadlineExceeded && policy.freshness.requireExact {
+		return nil, freshnessDeadlineRefusal(deadline, time.Since(started))
+	}
+
+	// The route the coordinator just published, read once and BEFORE the
+	// re-selection so it is the route the wait's success is a statement about
+	// rather than whatever the catalog holds after it. Only the success path
+	// reads it: a wait that did not go fresh has no publication to check an
+	// answer against.
+	published, publishedKnown := store_sqlite.CheckoutRoute{}, false
+	if outcome.fresh {
+		published, publishedKnown = s.publishedCheckoutRoute(ctx, checkout.CheckoutID)
+	}
+
+	refreshed, refreshedErr := s.selectRequestView(ctx, selector, policy)
+	if refreshedErr != nil {
+		return nil, refreshedErr
+	}
+	if outcome.fresh {
+		switch {
+		case !publishedKnown:
+			// The coordinator published and the route behind it cannot be
+			// read back — no catalog, a read that failed, or a route row that
+			// is gone. Nothing here can show that the view about to answer is
+			// that publication, and an unverifiable claim is not made. It is a
+			// fact about the lookup, not about the view, so it rides as
+			// wait_target_unavailable.
+			outcome.fresh, outcome.reason = false, freshReasonWaitTargetUnavailable
+		case !servesPublishedRoute(refreshed, checkout.CheckoutID, published):
+			// The coordinator published, and something else is answering: a
+			// labelled base fallback, a routeless carrier, another checkout,
+			// or a route that moved again under the re-selection. fresh:true
+			// here would claim the wait's success for an answer that is not
+			// the thing waited on — next to actual_view:"base", exact:false.
+			outcome.fresh, outcome.reason = false, freshReasonRouteWithdrawn
+		}
+	}
+	if !outcome.fresh && policy.freshness.requireExact {
+		// Every remaining way the wait failed — an unavailable coordinator, a
+		// failed publication, an interrupted request, a withdrawn route. The
+		// deadline case refused above with its own message; these refuse here
+		// rather than answering out of a route the caller just said it would
+		// not accept. Without this, require_exact silently meant "exact route"
+		// and not "exact AND as fresh as I asked for".
+		refreshed.close()
+		return nil, freshnessExactRefusal(outcome.reason, time.Since(started))
+	}
+	return annotateRequestFreshness(s.freshnessCarrier(selector, refreshed), outcome, started), nil
+}
+
+// freshnessWaitTarget names the checkout a require_fresh wait may advance, and
+// — when there is none — which of the two reasons that is.
+//
+// Both sources are downstream of the scope gate. The rider's checkout id is
+// written by materializeRequestView, which runs only after
+// checkoutInSessionScope; the selector arm is reached only for a view_building
+// refusal, which viewForWorktreeSelector raises after the same gate. Anything
+// else — a base graph, a ref view, a scope or identity refusal — is not a
+// route that a publication can heal.
+//
+// The second return separates the two negatives, because they say opposite
+// things to a caller:
+//
+//   - freshReasonCommittedBaseAdvance — the request named no checkout route at
+//     all. It resolved to the shared corpus, a labelled base graph or a
+//     committed ref/commit view. That IS a statement about the view, and it is
+//     permanent until committed-base advancement is built.
+//   - freshReasonWaitTargetUnavailable — the request DID name a route, and the
+//     checkout behind it could not be resolved: no catalog wired, a catalog
+//     read that failed, a checkout row that is gone, or a worktree selector
+//     that no longer registers. Nothing there is a claim about the view, and a
+//     retry may resolve it.
+func (s *Server) freshnessWaitTarget(
+	ctx context.Context,
+	selector graphview.Selector,
+	view *requestView,
+	selectErr error,
+) (store_sqlite.Checkout, string, bool) {
+	checkoutID := ""
+	switch {
+	case view != nil && view.rider != nil && view.rider.CheckoutID != "":
+		checkoutID = view.rider.CheckoutID
+	case selectErr != nil &&
+		graphview.CodeOf(selectErr) == graphview.CodeViewBuilding &&
+		selector.Kind == graphview.SelectorWorktree:
+		checkout, err := s.registeredWorktreeSelector(ctx, selector)
+		if err != nil {
+			// The selector named a worktree a moment ago and does not now.
+			// That is a lookup that did not answer, not a committed base.
+			return store_sqlite.Checkout{}, freshReasonWaitTargetUnavailable, false
+		}
+		return checkout, "", true
+	}
+	if checkoutID == "" {
+		return store_sqlite.Checkout{}, freshReasonCommittedBaseAdvance, false
+	}
+	if s == nil || s.materializer == nil || s.materializer.Catalog == nil {
+		return store_sqlite.Checkout{}, freshReasonWaitTargetUnavailable, false
+	}
+	checkout, found, err := s.materializer.Catalog.GetCheckout(ctx, checkoutID)
+	if err != nil || !found {
+		return store_sqlite.Checkout{}, freshReasonWaitTargetUnavailable, false
+	}
+	return checkout, "", true
+}
+
+// publishedCheckoutRoute reads the route a successful wait just published.
+//
+// It is the reference the answer is checked against: the coordinator's success
+// means "the active route names a dirty generation whose fingerprint equals the
+// tree I sampled", and that claim belongs to one concrete route snapshot. A
+// second return of false means the snapshot could not be read at all — no
+// catalog wired, a catalog read that failed, or a route row that is gone —
+// which is a fact about the lookup and never about the view.
+func (s *Server) publishedCheckoutRoute(ctx context.Context, checkoutID string) (store_sqlite.CheckoutRoute, bool) {
+	if s == nil || s.materializer == nil || s.materializer.Catalog == nil || checkoutID == "" {
+		return store_sqlite.CheckoutRoute{}, false
+	}
+	route, found, err := s.materializer.Catalog.GetCheckoutRoute(ctx, checkoutID)
+	if err != nil || !found {
+		return store_sqlite.CheckoutRoute{}, false
+	}
+	return route, true
+}
+
+// servesPublishedRoute reports whether the view that is about to answer IS the
+// route the wait published.
+//
+// Four things have to hold, and each of them is a way the previous "the
+// re-selection produced no view at all" check let a false fresh:true through:
+//
+//   - the view is a materialized routed view, not a labelled base fallback and
+//     not a routeless freshness carrier. A fallback renders exact:false and
+//     actual_view:"base" on the same rider that would have said fresh:true —
+//     the substitution this whole item exists to make impossible;
+//   - it is the SAME checkout the wait was admitted against;
+//   - it pinned the SAME route epoch. route_epoch is incremented by every
+//     route write (store_sqlite/catalog.go FlipCheckoutRoute /
+//     FlipCheckoutRouteSlot), so equality is "the route did not move between
+//     the publication and the read", including a move away and back;
+//   - it leases the generations that route names. Epoch equality already
+//     implies this today; asserting it keeps the answer honest if a view ever
+//     composes a route's slots selectively.
+//
+// The check is deliberately one-sided: it can only ever turn fresh:true into
+// fresh:false. A route that advanced past the publication is a route the wait
+// is no longer a statement about, and saying so costs a caller one retry —
+// where the opposite error costs it a stale answer it was told was current.
+func servesPublishedRoute(view *requestView, checkoutID string, route store_sqlite.CheckoutRoute) bool {
+	switch {
+	case view == nil || view.rider == nil || view.materialized == nil:
+		return false
+	case view.routeless || !view.rider.Exact:
+		return false
+	case checkoutID == "" || view.rider.CheckoutID != checkoutID || route.CheckoutID != checkoutID:
+		return false
+	case view.materialized.CheckoutRouteEpoch != route.RouteEpoch:
+		return false
+	}
+	generations := view.materialized.Generations()
+	for _, generation := range []int64{route.CommitGenerationID, route.DirtyGenerationID} {
+		if generation > 0 && !slices.Contains(generations, generation) {
+			return false
+		}
+	}
+	return true
+}
+
+// freshnessCarrier makes sure a require_fresh answer has somewhere to say what
+// the wait did.
+//
+// A request that resolves to the shared corpus carries no view and therefore no
+// rider at all, which is the right default — but a caller that explicitly asked
+// to wait must not be answered with silence. Only require_fresh reaches here,
+// so no request that did not ask for it gains a rider it did not have before.
+//
+// It makes NO route claim. The request produced no view, so there is nothing to
+// be exact or inexact about: viewRiderFields renders a routeless carrier as the
+// requested view plus what the wait did, and omits actual_view / exact
+// entirely. Stamping exact:true here — even for auto, whose resolution really
+// is the shared corpus — would manufacture a positive route claim out of a
+// request that selected nothing, which is precisely the shape a client must be
+// able to trust.
+//
+// The carrier is still restricted to SelectorAuto, because that is the only
+// selector selectRequestView answers (nil, nil) for: its two nil-view arms are
+// "this store carries no view catalog" and viewForSessionCWD finding no
+// automatic checkout to route to. Every other selector kind is answered with a
+// view or an error, so a future producer that starts returning (nil, nil) for a
+// named view gets the silence that was the behaviour before this item rather
+// than a rider speaking for a route nobody selected.
+func (s *Server) freshnessCarrier(selector graphview.Selector, view *requestView) *requestView {
+	if view != nil {
+		return view
+	}
+	if selector.Kind != graphview.SelectorAuto {
+		return nil
+	}
+	return &requestView{
+		kind:      requestViewKindBase,
+		rider:     graphview.NewViewRider(selector),
+		routeless: true,
+		declared:  baseCorpusCompleteness(),
+	}
+}
+
+// annotateRequestFreshness records the wait on the view that will answer.
+func annotateRequestFreshness(view *requestView, outcome *requestFreshnessOutcome, started time.Time) *requestView {
+	if view == nil || outcome == nil {
+		return view
+	}
+	outcome.waited = time.Since(started)
+	view.mu.Lock()
+	view.freshness = outcome
+	view.mu.Unlock()
+	return view
 }
 
 // pinRequestBaseCorpus pins the base corpus a routed view reads, for as long
@@ -1980,6 +2313,13 @@ func viewRiderFields(view *requestView) map[string]any {
 		"actual_view":    view.rider.ActualView,
 		"exact":          view.rider.Exact,
 	}
+	if view.routeless {
+		// A carrier for a freshness answer, not a view: selection produced
+		// nothing, so the only honest fields are what was asked for and what
+		// the wait did. An exactness claim here would be invented.
+		delete(fields, "actual_view")
+		delete(fields, "exact")
+	}
 	if view.rider.FallbackReason != "" {
 		fields["fallback_reason"] = view.rider.FallbackReason
 	}
@@ -2008,6 +2348,22 @@ func viewRiderFields(view *requestView) map[string]any {
 	// answer", not "this view is unavailable".
 	if view.baseCorpusChanged() {
 		fields["base_changed"] = true
+	}
+	// What a require_fresh wait actually did. Emitted only for a request that
+	// asked, and never as a claim: fresh is true exactly when the checkout
+	// coordinator reported a route that describes the working copy it sampled,
+	// and false carries the reason — including
+	// committed_base_advance_unimplemented for a view that reads a committed
+	// base, whose on-demand advancement is not built yet.
+	if outcome := view.freshnessOutcome(); outcome != nil {
+		fields["fresh"] = outcome.fresh
+		fields["waited_ms"] = outcome.waited.Milliseconds()
+		if !outcome.deadline.IsZero() {
+			fields["wait_deadline"] = outcome.deadline.UTC().Format(time.RFC3339)
+		}
+		if !outcome.fresh && outcome.reason != "" {
+			fields["fresh_reason"] = outcome.reason
+		}
 	}
 	// The capability annotations: what the view served thinly, and what a
 	// base-scoped engine answered instead of the view. Both are omitted when

@@ -126,7 +126,31 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read and stripped here so every tool honours it and no handler or
 		// schema has to know about it. Stripping precedes reconciliation so
 		// the alias matcher cannot rewrite it into a tool's own parameter.
-		requireExactView := requestRequiresExactCheckoutView(&req)
+		// The three request-level freshness knobs ride the same seam, for the
+		// same reason, and are parsed HERE rather than beside the view policy
+		// below for two reasons that both have to hold:
+		//   - before reconcileToolParams: no tool declares these names, and
+		//     the alias matcher rewrites exactly the keys a tool does not
+		//     declare, so reading them later risks reading a request a
+		//     spelling heuristic already edited. No SHIPPED tool has a
+		//     parameter inside the matcher's edit-distance budget of a knob
+		//     today (TestNoToolAliasesTheFreshnessKnobs), so this ordering
+		//     buys nothing against the current surface and everything against
+		//     the next tool that grows such a parameter;
+		//     TestFreshnessKnobsAreReadBeforeParameterReconciliation registers
+		//     exactly that collision and fails if the parse moves below.
+		//   - before every branch below: a malformed wait_deadline must refuse
+		//     for EVERY call shape, including the catalog-only checkout
+		//     controls that resolve no view at all and the detect_changes
+		//     carve-out that converts a view error into a degraded answer. A
+		//     knob the server cannot parse is a request the server does not
+		//     understand; answering it anyway is how a caller ends up reading
+		//     a stale route it explicitly bounded.
+		freshness := takeRequestFreshness(&req)
+		if freshness.err != nil {
+			return mcp.NewToolResultError(freshness.err.Error()), nil
+		}
+		requireExactView := freshness.requireExact
 		selector, selectorErr := takeViewSelector(&req)
 		if selectorErr != nil {
 			return mcp.NewToolResultError(selectorErr.Error()), nil
@@ -175,7 +199,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		var view *requestView
 		if !catalogOnlyCheckoutControl(controlOperation) {
 			var viewErr error
-			view, viewErr = s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req))
+			view, viewErr = s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req, freshness))
 			if viewErr != nil {
 				control := checkoutControlFromContext(ctx)
 				if controlOperation != "detect_changes" || control == nil || !control.CheckoutScoped {
