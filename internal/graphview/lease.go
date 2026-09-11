@@ -43,11 +43,28 @@ func (m *LeaseManager) initLocked() {
 	}
 }
 
-// Lease is a pin on a set of generations, held until Release.
+// Lease is a pin on a set of generations, held until every holder releases
+// it.
+//
+// A freshly acquired lease has exactly one holder: the caller of Acquire.
+// Handoff adds a joined consumer — work that outlives the request that
+// acquired the lease — and the pins survive until the acquirer *and* every
+// joined consumer has released. That is the same shape
+// RawRepositorySnapshotLease states for mutable source data ("only until its
+// joined consumer closes it"), applied to payload generations: a detached
+// worker or a cancellation tail keeps reading a live pin until it actually
+// finishes, instead of running over a generation the retirement sweep was
+// free to collect the moment the handler returned.
 type Lease struct {
 	mgr  *LeaseManager
 	ids  []int64
 	once sync.Once
+
+	mu sync.Mutex
+	// holders counts the live holders: the acquirer, plus one per joined
+	// consumer that has not released yet. The manager's per-id refcount is
+	// dropped exactly once, when this reaches zero.
+	holders int
 }
 
 // Acquire pins every id and returns the lease that holds them. The returned
@@ -55,7 +72,7 @@ type Lease struct {
 // Repeating an id in one call pins it that many times, and Release drops each
 // of those pins — the refcount stays balanced either way.
 func (m *LeaseManager) Acquire(ids ...int64) *Lease {
-	l := &Lease{mgr: m, ids: slices.Clone(ids)}
+	l := &Lease{mgr: m, ids: slices.Clone(ids), holders: 1}
 	if len(l.ids) == 0 {
 		return l
 	}
@@ -169,13 +186,97 @@ func (m *LeaseManager) release(ids []int64) {
 	}
 }
 
-// Release drops the lease. It is idempotent: later calls, and calls on a nil
-// lease, do nothing.
+// Release drops the acquirer's hold on the lease. It is idempotent: later
+// calls, and calls on a nil lease, do nothing.
+//
+// It releases the pinned generations only when no joined consumer is live.
+// A handler that hands its view to a detached worker and then returns keeps
+// the payload pinned until that worker closes its own handle.
 func (l *Lease) Release() {
 	if l == nil || l.mgr == nil {
 		return
 	}
-	l.once.Do(func() { l.mgr.release(l.ids) })
+	l.once.Do(l.drop)
+}
+
+// drop retires one holder and, when it was the last one, drops the manager's
+// pins. Each holder calls it at most once — the acquirer through Release's
+// sync.Once, a joined consumer through its own.
+func (l *Lease) drop() {
+	l.mu.Lock()
+	if l.holders == 0 {
+		l.mu.Unlock()
+		return
+	}
+	l.holders--
+	last := l.holders == 0
+	l.mu.Unlock()
+	if last {
+		l.mgr.release(l.ids)
+	}
+}
+
+// Holders reports how many live holders the lease has: the acquirer while it
+// has not released, plus every joined consumer that has not closed. Zero means
+// the pins are gone.
+func (l *Lease) Holders() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.holders
+}
+
+// LeaseHandoff is a joined consumer of a Lease: a second holder of the same
+// pinned generations, handed to work that outlives the request that acquired
+// them — a detached worker, a cancellation tail, a background build.
+//
+// Close is mandatory and idempotent. Until every joined consumer closes, the
+// generations stay pinned, InUse keeps reporting them, retirement keeps
+// refusing them and WaitDrain keeps blocking, even after the acquirer has
+// released.
+type LeaseHandoff struct {
+	lease *Lease
+	once  sync.Once
+}
+
+// Handoff joins a consumer to the lease and returns its handle.
+//
+// It returns nil when there is nothing left to join — the lease is nil, or
+// every holder has already released, so the pins are gone and the payload
+// underneath may already have been collected. A caller that wanted to detach
+// work must treat nil as a refusal and not run that work against this view;
+// it must never treat it as a successful handoff.
+func (l *Lease) Handoff() *LeaseHandoff {
+	if l == nil || l.mgr == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.holders == 0 {
+		return nil
+	}
+	l.holders++
+	return &LeaseHandoff{lease: l}
+}
+
+// Release closes the joined consumer's hold. It is idempotent, and safe on a
+// nil handle. The pinned generations are released once this was the last live
+// holder.
+func (h *LeaseHandoff) Release() {
+	if h == nil || h.lease == nil {
+		return
+	}
+	h.once.Do(h.lease.drop)
+}
+
+// IDs returns a copy of the generations this handle keeps pinned.
+func (h *LeaseHandoff) IDs() []int64 {
+	if h == nil || h.lease == nil {
+		return nil
+	}
+	return h.lease.IDs()
 }
 
 // IDs returns a copy of the generations this lease pins.

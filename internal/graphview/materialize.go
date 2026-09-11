@@ -3,6 +3,7 @@ package graphview
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"go.uber.org/zap"
@@ -118,11 +119,96 @@ func (v *RepoView) GenerationSources() []GenerationSource {
 
 // Close releases the view's lease. Calling it twice, or on a nil view,
 // does nothing.
+//
+// It releases the pinned generations only when no handed-off consumer is
+// still live: a request that detached work through Handoff keeps its payload
+// readable until that work closes its own handle.
 func (v *RepoView) Close() {
 	if v == nil {
 		return
 	}
 	v.closeOnce.Do(func() { v.lease.Release() })
+}
+
+// ViewHandoff is a joined consumer of a RepoView: the same reader over the
+// same pinned generations, handed to work that outlives the request that
+// materialized it — a detached worker, a cancellation tail, a background
+// build.
+//
+// Close is mandatory and idempotent. Until it runs, every generation the
+// original view read stays pinned and retirement of any of them is refused,
+// whether or not the originating view has been closed.
+type ViewHandoff struct {
+	// ID names the exact content this handle reads: the identity the
+	// originating view was materialized under.
+	ID RepoViewID
+	// CheckoutRouteEpoch is the catalog route snapshot the originating view
+	// pinned. It is zero for immutable ref views.
+	CheckoutRouteEpoch int64
+	// Reader is the composed graph the originating view served.
+	Reader graph.Reader
+	// Completeness is what that view could answer.
+	Completeness Completeness
+
+	generations []int64
+	sources     []GenerationSource
+	lease       *LeaseHandoff
+	closeOnce   sync.Once
+}
+
+// Handoff joins a consumer to this view's lease and returns a handle that
+// keeps the whole pinned generation ancestry alive on its own.
+//
+// It returns nil when there is nothing left to join: a nil view, a view with
+// no lease, or a view whose every holder has already released. A caller that
+// wanted to detach work must treat nil as a refusal — the payload underneath
+// may already be gone — and never as a successful handoff.
+func (v *RepoView) Handoff() *ViewHandoff {
+	if v == nil {
+		return nil
+	}
+	joined := v.lease.Handoff()
+	if joined == nil {
+		return nil
+	}
+	return &ViewHandoff{
+		ID:                 v.ID,
+		CheckoutRouteEpoch: v.CheckoutRouteEpoch,
+		Reader:             v.Reader,
+		Completeness:       v.Completeness,
+		generations:        slices.Clone(v.generations),
+		sources:            slices.Clone(v.sources),
+		lease:              joined,
+	}
+}
+
+// Generations lists every payload generation this handle keeps pinned,
+// bottom first, exactly as the originating view reported them.
+func (h *ViewHandoff) Generations() []int64 {
+	if h == nil {
+		return nil
+	}
+	return slices.Clone(h.generations)
+}
+
+// GenerationSources lists the stack's generations bottom first, in the order
+// they compose. The sources are valid for as long as this handle is open:
+// every handle is pinned to a generation the joined lease keeps from
+// retiring, even after the originating view closed.
+func (h *ViewHandoff) GenerationSources() []GenerationSource {
+	if h == nil {
+		return nil
+	}
+	return slices.Clone(h.sources)
+}
+
+// Close releases the joined consumer's hold on the view's generations.
+// Calling it twice, or on a nil handle, does nothing.
+func (h *ViewHandoff) Close() {
+	if h == nil {
+		return
+	}
+	h.closeOnce.Do(h.lease.Release)
 }
 
 // MaterializeCheckout builds the view a checkout's queries currently
