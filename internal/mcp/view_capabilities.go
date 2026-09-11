@@ -283,6 +283,99 @@ func capabilityDefaultsFor(tool string) []graphview.CapabilityID {
 	return capabilityFamilyDefaults[family]
 }
 
+// baseCorpusCompleteness is what the indexed corpus is taken to answer.
+//
+// The base is a plain whole index with no producer rows to read, so its
+// completeness is assumed complete this round; wiring it to the indexer's
+// enrichment state is the successor to this and is what will make a base
+// answer able to fail the contract at all. Stating the assumption as a
+// declaration rather than as a skipped evaluation is the point: a view that
+// declares nothing means "serves nothing" to Completeness, and the reader-less
+// views that used to skip the evaluation — a labelled base selector, a
+// non-strict fallback, a grace answer — were being exempted by accident rather
+// than by a claim anyone had written down.
+func baseCorpusCompleteness() graphview.Completeness {
+	out := make(graphview.Completeness, len(graphview.KnownCapabilities()))
+	for _, id := range graphview.KnownCapabilities() {
+		out[id] = graphview.StateComplete
+	}
+	return out
+}
+
+// baseGraphCompleteness is what a base selector narrowed to one repository
+// answers: the corpus assumption above, minus what this view cannot claim.
+//
+// Cross-repository resolution is incomplete by construction — the references
+// that reach into another repository are dropped at both the node and the edge
+// lane (see baseGraphReader.keepEdges), which is what "may be missing results"
+// names here.
+//
+// Text search is unavailable because the trigram searchers are built per
+// checkout over bytes on disk and fan out over every tracked repository;
+// answering a graph-scoped request from the canonical checkouts of all of them
+// is what the narrowing exists to stop.
+//
+// The five language-server capabilities are downgraded rather than asserted.
+// A base graph carries no producer rows to read an LSP state off — that is the
+// whole reason baseCorpusCompleteness has to assume — and it binds no checkout
+// of its own, so nothing here evidences that a language server ran over this
+// repository at all. Claiming them complete would be the one thing this
+// function exists to stop: a positive claim with nothing behind it, on the
+// view whose rider says exact. Incomplete, not unavailable: a base view does
+// resolve its paths onto the repository's canonical root, so an LSP answer is
+// reachable — it is the completeness of it that is unevidenced.
+func baseGraphCompleteness() graphview.Completeness {
+	out := baseCorpusCompleteness()
+	out[graphview.CapResolutionCrossRepo] = graphview.StateIncomplete
+	out[graphview.CapSearchText] = graphview.StateUnavailable
+	for _, id := range lspCapabilities() {
+		out[id] = graphview.StateIncomplete
+	}
+	return out
+}
+
+// baseFallbackCompleteness is what a view that was asked for one checkout and
+// answered from the base corpus can claim.
+//
+// It is the corpus assumption minus text search. A fallback's rider already
+// says exact:false, but the capability contract said nothing at all: the
+// trigram searchers a text query lands on are built over the canonical
+// checkouts on disk, which are precisely not the checkout this request named
+// and did not get. Declaring that one incomplete is what makes the contract
+// evaluation on a fallback observable instead of a formality — every other
+// capability is answered from the same corpus the request would have fallen
+// back to anyway.
+func baseFallbackCompleteness() graphview.Completeness {
+	out := baseCorpusCompleteness()
+	out[graphview.CapSearchText] = graphview.StateIncomplete
+	return out
+}
+
+// lspCapabilities names the language-server half of the capability set.
+func lspCapabilities() []graphview.CapabilityID {
+	return []graphview.CapabilityID{
+		graphview.CapLSPReferences,
+		graphview.CapLSPDiagnostics,
+		graphview.CapLSPHover,
+		graphview.CapLSPRename,
+		graphview.CapLSPCodeActions,
+	}
+}
+
+// baseGraphUnnarrowedCapabilities names what a base selector answered from the
+// whole corpus when it had no repository prefix to narrow with. It is the
+// honest half of an exact rider on an unnarrowed read.
+func baseGraphUnnarrowedCapabilities() []graphview.CapabilityID {
+	return []graphview.CapabilityID{
+		graphview.CapSyntaxGraph,
+		graphview.CapResolutionLocal,
+		graphview.CapIncomingEdges,
+		graphview.CapSearchSymbols,
+		graphview.CapSearchContent,
+		graphview.CapSearchText,
+	}
+}
+
 // evaluateRequestCapabilities enforces the request's capability contract
 // before the handler runs.
 //
@@ -292,17 +385,19 @@ func capabilityDefaultsFor(tool string) []graphview.CapabilityID {
 // defaults when the caller did not require them, and whatever it named
 // optional — is evaluated too, but reported on the rider instead of refused.
 //
-// A request the base corpus serves is exempt. The base is a plain whole index
-// with no producer rows to read, so its completeness is assumed complete this
-// round; wiring it to the indexer's enrichment state is the successor to this
-// and is what will make a base request able to fail here at all.
+// A request that named no view at all is exempt: there is no rider to report
+// against and no claim to check. A reader-less view that declares no
+// completeness is served and says so on the rider instead — refusing every
+// requirement on the strength of an absent declaration would be a lie in the
+// other direction. A routed view is evaluated against whatever it declares,
+// undeclared included, exactly as it was.
 func (s *Server) evaluateRequestCapabilities(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
 	want capabilityRequest,
 ) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
-	if !view.routed() {
+	if view == nil {
 		return nil
 	}
 	defaults := capabilityDefaultsFor(s.capabilityToolName(req))
@@ -317,6 +412,24 @@ func (s *Server) evaluateRequestCapabilities(
 	annotate = withoutCapabilities(mergeCapabilities(annotate, nil), required)
 
 	completeness := view.completeness()
+	if completeness == nil && !view.routed() {
+		// A labelled view with no reader and no declaration: the indexed
+		// corpus answered it. Nothing here can check that against a claim, so
+		// the response carries the statement instead of a verdict.
+		//
+		// No production producer reaches this today — every &requestView with
+		// no reader sets declared (viewForBaseSelector's unnarrowed arm,
+		// viewFallback, graceBaseFallback) and every one with a reader has a
+		// completeness behind it. It is kept, and exercised directly by
+		// TestUndeclaredReaderlessViewIsServedAndAnnotated, because the
+		// alternative for a future reader-less producer is silent: a nil
+		// Completeness denies every capability it is asked about
+		// (internal/graphview/capability.go, "a capability absent from the map
+		// counts as StateUnavailable"), so forgetting a declaration would turn
+		// into a blanket refusal rather than into this annotation.
+		view.noteBaseScoped(mergeCapabilities(required, annotate))
+		return nil
+	}
 	if err := completeness.Evaluate(required, annotate); err != nil {
 		// The code says which of the two refusals it was — the view cannot
 		// serve the capability at all, or it is still producing it — which is
@@ -368,7 +481,14 @@ func withoutCapabilities(caps, exclude []graphview.CapabilityID) []graphview.Cap
 // comment saying so is invisible to the caller; this puts the same statement
 // on the response, naming the capabilities that were answered from the base.
 //
-// It is a no-op on a base request, where reading the base IS the answer.
+// It is a no-op on an unrouted request, where reading the base IS the answer:
+// no view, or a fallback that says on its rider that the base answered it.
+// A labelled base selector is *not* in that class any more — it reads one
+// repository through baseGraphReader, so an engine that builds its own index
+// over the whole corpus answers about more than the view named, and the
+// annotation is the statement of that. This is a widening of when the
+// annotation fires, and it is the truthful direction: it was a no-op there
+// only while a base selector read the corpus whole.
 func annotateBaseScoped(ctx context.Context, caps ...graphview.CapabilityID) {
 	view := requestViewFromContext(ctx)
 	if !view.routed() {

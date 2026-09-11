@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
+	"maps"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -54,6 +57,22 @@ type requestView struct {
 	// state and session buffers; a normal cold-build fallback may still compose
 	// the caller's live editor buffers over its lower view.
 	suppressBufferOverlay bool
+	// baseNarrowed marks a reader that is a filter over the shared corpus
+	// rather than a route to a checkout: a labelled base selector reading the
+	// one repository its graph owns. Such a view names no working copy, pins
+	// no generation and changes no byte resolution, so every question that
+	// really asks "does this request read a checkout of its own?" — the
+	// source-mutation gate below is the one that matters — must answer the
+	// same as it did when the base corpus was read unnarrowed. routed() alone
+	// cannot tell the two apart, because it is reader-presence.
+	baseNarrowed bool
+	// kind is the shape of view for the routing counters, stated by the
+	// producer rather than inferred from which fields happen to be set.
+	// Reader-presence used to stand in for "a checkout answered", and the
+	// base narrowing broke that inference: a base-scoped view has a reader
+	// and still reads the shared corpus. A producer that names no kind is
+	// classified by requestViewKind's fallback below.
+	kind requestViewKindLabel
 
 	// mu guards the annotations the request collects while it runs. The
 	// capability evaluation writes before the handler starts, but a handler
@@ -66,15 +85,28 @@ type requestView struct {
 	// baseScoped lists capabilities a base-scoped engine answered while
 	// this view served the request.
 	baseScoped []graphview.CapabilityID
+
+	// declared is what a view with no materialized generation stack can
+	// answer: a labelled base selector, a non-strict fallback, or a grace
+	// answer. Those views carry no producer rows to read a completeness off,
+	// and leaving it nil is what let them skip the capability contract
+	// entirely. Ignored whenever materialized is set — a leased stack states
+	// its own completeness and nothing here may soften it.
+	declared graphview.Completeness
 }
 
-// completeness is what the materialized view can answer, nil for a request
-// the base corpus serves.
+// completeness is what the view can answer: the leased stack's own statement
+// when one was materialized, otherwise whatever the reader-less view declared.
+// Nil only for a request that named no view at all.
 func (v *requestView) completeness() graphview.Completeness {
-	if v == nil || v.materialized == nil {
+	switch {
+	case v == nil:
 		return nil
+	case v.materialized != nil:
+		return v.materialized.Completeness
+	default:
+		return v.declared
 	}
-	return v.materialized.Completeness
 }
 
 // noteDegraded records capabilities that shaped the answer without failing
@@ -111,6 +143,12 @@ func (v *requestView) annotations() ([]graphview.CapabilityStatus, []graphview.C
 // routed reports whether a composed checkout view — rather than the base
 // corpus — answers this request.
 func (v *requestView) routed() bool { return v != nil && v.reader != nil }
+
+// readsOwnCheckout reports whether this request reads through a working copy
+// of its own rather than through the shared corpus. It is routed() minus the
+// base narrowing: a base selector has a reader, but the bytes behind it are
+// the same canonical checkouts an unrouted request resolved against.
+func (v *requestView) readsOwnCheckout() bool { return v.routed() && !v.baseNarrowed }
 
 // acceptsBufferOverlay reports whether session-local editor buffers may layer
 // over this answer. A grace fallback deliberately returns the stable primary
@@ -482,18 +520,60 @@ func (s *Server) recordRequestView(view *requestView, err error) {
 	s.logger.Debug("view routing: served a fallback view", fields...)
 }
 
+// requestViewKindLabel is one value of the routing counter's view-kind
+// vocabulary, which viewmetrics declares as {base, worktree, ref} for
+// RequestServedTotal (internal/viewmetrics/catalog.go). The catalog accepts
+// whatever string it is handed, so the vocabulary is checked here instead:
+// only a label a producer can name below is allowed to reach the counter, and
+// anything else falls through to requestViewKind's inference rather than
+// shipping a series nobody declared.
+type requestViewKindLabel string
+
+const (
+	requestViewKindBase     requestViewKindLabel = viewmetrics.ViewBase
+	requestViewKindWorktree requestViewKindLabel = viewmetrics.ViewWorktree
+	requestViewKindRef      requestViewKindLabel = viewmetrics.ViewRef
+)
+
+// declared reports whether this label is in the counter's vocabulary.
+func (k requestViewKindLabel) declared() bool {
+	switch k {
+	case requestViewKindBase, requestViewKindWorktree, requestViewKindRef:
+		return true
+	default:
+		return false
+	}
+}
+
 // requestViewKind names the shape of view that answered: the indexed corpus,
-// a routed working copy, or a committed tree. The file surface is what tells
-// the last two apart — only a view with no working copy reads its bytes out of
-// the object store.
+// a routed working copy, or a committed tree.
+//
+// The producer's own label decides it. Reading it off the reader was right
+// only while the base corpus was the one view with no reader: a labelled base
+// selector now narrows the corpus through a reader of its own, and counting
+// that as a routed worktree would report base traffic as checkout traffic on
+// views_request_served_total — a base answer wearing another view's label in
+// the measurement surface, which is the very thing the narrowing exists to
+// stop on the wire.
+//
+// The inference below is the fallback for a producer that states no kind, and
+// for one that states a label the counter never declared. The committed-tree
+// view (view_ref.go) is the only unlabelled producer left, and the file
+// surface is what only it has: a view with no working copy reads its bytes out
+// of the object store. The reader arm after it keeps a future routed producer
+// that forgets its label counted as routed rather than as base.
 func requestViewKind(view *requestView) string {
 	switch {
-	case view == nil || view.reader == nil:
+	case view == nil:
 		return viewmetrics.ViewBase
+	case view.kind.declared():
+		return string(view.kind)
 	case view.files != nil:
 		return viewmetrics.ViewRef
-	default:
+	case view.reader != nil:
 		return viewmetrics.ViewWorktree
+	default:
+		return viewmetrics.ViewBase
 	}
 }
 
@@ -691,12 +771,24 @@ func graceBaseFallback(
 	rider.CheckoutID = checkout.CheckoutID
 	rider.RequestedState = string(store_sqlite.CheckoutStateReady)
 	rider.ActualState = string(checkout.State)
-	return &requestView{rider: rider, suppressBufferOverlay: true}, nil
+	return &requestView{
+		kind:                  requestViewKindBase,
+		rider:                 rider,
+		declared:              baseFallbackCompleteness(),
+		suppressBufferOverlay: true,
+	}, nil
 }
 
 // viewForBaseSelector pins the request to a named base graph. A dedicated
 // graph is read from the indexed corpus, so the selector's work is proving
 // the graph exists and is ready — and naming it on the response.
+//
+// Naming it is not enough on its own. The indexed corpus holds every
+// repository the store tracks, so a request that asked for graph X and read
+// the corpus whole was answered about every repository at once while its
+// rider said exact:true, graph_id:X. The reader below narrows that corpus to
+// the graph's own repository, which is what makes the label a served view
+// rather than a decoration.
 func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Selector) (*requestView, error) {
 	dedicated, found, err := s.materializer.Catalog.GetDedicatedGraph(ctx, selector.GraphID)
 	switch {
@@ -720,8 +812,737 @@ func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Sel
 	rider := graphview.NewViewRider(selector)
 	rider.MarkExact(selector.String())
 	rider.GraphID = dedicated.GraphID
-	return &requestView{rider: rider}, nil
+	// The kind is stated here and not derived: whichever arm below answers,
+	// this request read the indexed corpus, and the counters must say so even
+	// when the narrowed arm hands it a reader.
+	view := &requestView{kind: requestViewKindBase, rider: rider}
+	if scoped := newBaseGraphReader(s.graph, dedicated.RepoPrefix); scoped != nil {
+		view.reader = scoped
+		view.baseNarrowed = true
+		view.declared = baseGraphCompleteness()
+		return view, nil
+	}
+	// Nothing to narrow with: this store spells the graph's nodes with no
+	// repository prefix, so the corpus either is the graph or is not separable
+	// from it here. Serve it — that is what the label meant before — but say
+	// on the response that a base-scoped corpus answered, rather than let the
+	// exact rider imply a reader the request never got.
+	view.declared = baseCorpusCompleteness()
+	view.noteBaseScoped(baseGraphUnnarrowedCapabilities())
+	return view, nil
 }
+
+// baseGraphReader narrows the indexed corpus to the one repository a named
+// base graph owns.
+//
+// It is a filter, not a composition: there is no generation stack under a base
+// selector, only the corpus every tracked repository shares. Narrowing it is
+// therefore a predicate on what the corpus already holds — a node belongs to
+// this view when the repository it was indexed under is this graph's.
+//
+// It deliberately forwards none of the optional store capabilities (the
+// bounded adjacency projections, the name and file readers, the degree
+// aggregators). Forwarding one without re-applying the predicate would hand a
+// caller rows from every repository through a reader that promised one, so the
+// type assertions fail and each call site takes its plain-Reader path instead.
+// That costs work on those paths; it cannot cost correctness. The one
+// capability that is forwarded is content search, which takes the repository
+// to search as an argument and so can be narrowed exactly — see
+// baseGraphContentReader.
+type baseGraphReader struct {
+	base       graph.Reader
+	repoPrefix string
+	// sites memoizes siteInScope for a path this view's prefix does not
+	// spell. Deciding one asks the corpus what it holds at that path, and an
+	// edge scan asks about the same few thousand paths over and over. The
+	// reader is built per request, so the cache dies with the request; a
+	// sync.Map because a handler may fan its reads out across goroutines.
+	sites sync.Map
+}
+
+// baseGraphNameOverfetch is how much wider than the caller's limit a
+// name-substring scan asks the corpus for on its first try, so the filter
+// below has something to keep. When that is not enough the ask widens (see
+// FindNodesByNameContaining) rather than answering short.
+const baseGraphNameOverfetch = 8
+
+// baseGraphNameOverfetchFloor keeps a one-row request from asking for one row
+// and filtering it away.
+const baseGraphNameOverfetchFloor = 64
+
+// baseGraphNameOverfetchCeiling bounds the widening loop. Reaching it means
+// the corpus holds more than this many matches ranked ahead of the first
+// in-scope one, which is a scan of the whole name index in all but name; the
+// answer is then short rather than unbounded work.
+const baseGraphNameOverfetchCeiling = 1 << 16
+
+// newBaseGraphReader narrows reader to repoPrefix. It returns nil when there
+// is nothing to narrow — no reader at all, or a corpus that spells this
+// graph's nodes with no prefix — so the caller can tell a served narrowing
+// from an unnarrowed corpus instead of shipping a reader that filters nothing.
+func newBaseGraphReader(reader graph.Reader, repoPrefix string) graph.Reader {
+	if reader == nil || repoPrefix == "" {
+		return nil
+	}
+	scoped := &baseGraphReader{base: reader, repoPrefix: repoPrefix}
+	if searcher, ok := reader.(graph.ContentSearcher); ok {
+		return &baseGraphContentReader{baseGraphReader: scoped, content: searcher}
+	}
+	return scoped
+}
+
+// inScope is the view's membership predicate.
+//
+// The repository a node was indexed under decides it. The file fallback covers
+// the one legacy shape that predates prefixed identities: a node the corpus
+// stamped with no repository at all, which is this view's exactly when its
+// path is. A node stamped with another repository is never in scope, whatever
+// its path says.
+func (r *baseGraphReader) inScope(node *graph.Node) bool {
+	switch {
+	case node == nil:
+		return false
+	case node.RepoPrefix == r.repoPrefix:
+		return true
+	case node.RepoPrefix == "":
+		return r.pathInScope(node.FilePath)
+	default:
+		return false
+	}
+}
+
+// pathInScope reports whether a repo-prefixed path names a file of this
+// repository.
+func (r *baseGraphReader) pathInScope(path string) bool {
+	return path == r.repoPrefix || strings.HasPrefix(path, r.repoPrefix+"/")
+}
+
+// edgeInScope decides a whole-corpus edge scan.
+//
+// Both halves have to hold. Both endpoints are checked with endpointInScope:
+// an edge whose far end names a symbol of another repository would put that
+// repository's node id in the answer, which is the leak this reader exists to
+// close. Then the edge's file path is checked — the reference site, which is
+// the repository that owns the edge — because a site outside this repository
+// is not this view's edge at all even when both of its ends are.
+//
+// The endpoints are asked first on purpose, and this is an ordering with a
+// cost attached rather than a style choice. An endpoint decision is a map hit
+// in the batch endpointScope already hydrated; a site decision that the
+// prefix cannot spell has to ask the corpus what it holds at that path, which
+// is a store round-trip. Asking the site half first made an edge the endpoint
+// filter was going to drop anyway pay for that round-trip: on a corpus with a
+// sibling repository of N files, a whole-corpus scan issued N lookups and
+// changed its answer by nothing. && is commutative, so the answer is the same
+// either way and only the work moves.
+//
+// scope memoizes the endpoint decisions for one scan. A whole-corpus scan asks
+// about the same few thousand nodes over and over, and a nil map is a valid
+// unmemoized call for the one-off paths.
+func (r *baseGraphReader) edgeInScope(edge *graph.Edge, scope map[string]bool) bool {
+	switch {
+	case edge == nil:
+		return false
+	case !r.endpointsInScope(edge, scope):
+		return false
+	default:
+		return r.siteInScope(edge.FilePath)
+	}
+}
+
+// endpointsInScope is the cheap half of edgeInScope: both ends, decided out of
+// the batch hydration when there is one.
+func (r *baseGraphReader) endpointsInScope(edge *graph.Edge, scope map[string]bool) bool {
+	if edge == nil {
+		return false
+	}
+	return r.endpointInScope(edge.From, scope) && r.endpointInScope(edge.To, scope)
+}
+
+// siteInScope decides an edge's reference site: the file the reference was
+// written in, which is the repository that owns the edge.
+//
+// A path this repository's prefix spells is this view's, and a synthesized
+// edge carries no site at all, so nothing places it anywhere. What is left is
+// a path spelled some other way — and "not spelled with my prefix" is not the
+// same fact as "another repository's". The node lane already knows that:
+// inScope keeps a node the corpus stamped with no repository when its path is
+// this view's. Its symmetric question for a site is what the corpus itself
+// holds at that path, because a corpus that predates prefixed identities
+// records the site relative to the repository root while still stamping the
+// nodes there with the repository. The nodes at the path are then what says
+// whose file it is, and they are decided by the very same predicate — so the
+// node lane and the edge lane can never disagree about one file.
+//
+// A path the corpus holds nothing at stays out. That is not the same shape as
+// "a file of mine spelled oddly": a node at a path is exactly what attributes
+// that path, so a site the corpus holds nothing at is never a path this view
+// holds a node at — neither endpoint of the edge lives there. Dropping it
+// under-reports a reference the corpus recorded against a file it indexed no
+// symbol in; keeping it would put a path this view cannot attribute to itself
+// on the wire, which is the leak the site half exists to close.
+//
+// Deciding a path costs a store round-trip, so callers with a batch of edges
+// in hand run prefetchSites first and this function then answers from the
+// memo. The per-path door below is the fallback for a backend with no batch
+// primitive and for the one-off paths.
+func (r *baseGraphReader) siteInScope(path string) bool {
+	if path == "" || r.pathInScope(path) {
+		return true
+	}
+	if cached, seen := r.sites.Load(path); seen {
+		decided, _ := cached.(bool)
+		return decided
+	}
+	decided := r.decideSite(r.base.GetFileNodes(path))
+	r.sites.Store(path, decided)
+	return decided
+}
+
+// decideSite turns what the corpus holds at a path into the site decision.
+// The nodes there are judged by the very same predicate the node lane uses, so
+// the node lane and the edge lane can never disagree about one file.
+func (r *baseGraphReader) decideSite(nodes []*graph.Node) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+	for _, node := range nodes {
+		if !r.inScope(node) {
+			return false
+		}
+	}
+	return true
+}
+
+// fileNodesBatchReader is the batched door to the corpus's file index.
+// graph.Store declares GetFileNodesByPaths as the batched sibling of
+// GetFileNodes precisely so a frontier of paths costs bounded IN-queries
+// instead of one round-trip per path (internal/graph/store.go), and both
+// production backends implement it. A reader that does not is answered
+// path by path.
+type fileNodesBatchReader interface {
+	GetFileNodesByPaths(filePaths []string) map[string][]*graph.Node
+}
+
+// prefetchSites decides every still-undecided out-of-prefix site of edges in
+// one round-trip, so the site half of the filters below costs one batched
+// lookup per lane call rather than one point lookup per distinct foreign path.
+//
+// This is the same shape the endpoint half already has: keepEdges hydrates
+// every far id through one GetNodesByIDs, and AllEdges pre-decides both ends
+// of every edge through endpointScope. Leaving the site half un-batched made
+// a single find_usages or whole-corpus scan issue one serial store query per
+// distinct file path of every other tracked repository.
+//
+// Paths already in the memo are skipped, so a second lane over the same edges
+// costs nothing, and a backend with no batch primitive is left to the per-path
+// door in siteInScope.
+func (r *baseGraphReader) prefetchSites(edges []*graph.Edge) {
+	batch, ok := r.base.(fileNodesBatchReader)
+	if !ok {
+		return
+	}
+	var paths []string
+	seen := make(map[string]struct{}, len(edges))
+	for _, edge := range edges {
+		if edge == nil || edge.FilePath == "" || r.pathInScope(edge.FilePath) {
+			continue
+		}
+		if _, duplicate := seen[edge.FilePath]; duplicate {
+			continue
+		}
+		seen[edge.FilePath] = struct{}{}
+		if _, decided := r.sites.Load(edge.FilePath); decided {
+			continue
+		}
+		paths = append(paths, edge.FilePath)
+	}
+	if len(paths) == 0 {
+		return
+	}
+	byPath := batch.GetFileNodesByPaths(paths)
+	for _, path := range paths {
+		r.sites.Store(path, r.decideSite(byPath[path]))
+	}
+}
+
+// endpointInScope decides one end of an edge.
+//
+// An id the corpus does not hydrate is kept: an unresolved reference names no
+// symbol at all, in this repository or any other, so dropping it would delete
+// a fact about this repository without hiding anything foreign. An id that
+// hydrates to another repository's node is the one case that must go — that
+// node id is exactly what a caller under a base selector must never receive.
+func (r *baseGraphReader) endpointInScope(id string, scope map[string]bool) bool {
+	if id == "" {
+		return true
+	}
+	if scope != nil {
+		if decided, seen := scope[id]; seen {
+			return decided
+		}
+	}
+	node := r.base.GetNode(id)
+	decided := node == nil || r.inScope(node)
+	if scope != nil {
+		scope[id] = decided
+	}
+	return decided
+}
+
+// keepEdges drops the edges of an in-scope anchor whose site or far end
+// belongs to another repository, hydrating every far id in one round-trip.
+//
+// The anchor itself is already known to be in scope, so what is decided here
+// is the other end and the site. Both, because they are separate facts: an
+// incoming edge written in another repository's file whose `from` the corpus
+// does not hydrate has no foreign node id to catch, and dropping only on the
+// far end would put that repository's file path in the answer through
+// find_usages. This is the same pair edgeInScope applies to a whole-corpus
+// scan; the two lanes must not disagree about one edge. See endpointInScope
+// for why an id that hydrates to nothing is kept.
+//
+// The far end is decided first and the site second, for the reason
+// edgeInScope spells out: the far end is already hydrated in the batch above,
+// while a site the prefix cannot spell costs a store lookup, so an edge the
+// far end drops must not pay for one. The sites the survivors need are then
+// resolved in a single batched round-trip beside the hydration.
+func (r *baseGraphReader) keepEdges(edges []*graph.Edge, far func(*graph.Edge) string) []*graph.Edge {
+	if len(edges) == 0 {
+		return edges
+	}
+	ids := make([]string, 0, len(edges))
+	for _, edge := range edges {
+		if edge != nil && far(edge) != "" {
+			ids = append(ids, far(edge))
+		}
+	}
+	hydrated := r.base.GetNodesByIDs(ids)
+	local := make([]*graph.Edge, 0, len(edges))
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		id := far(edge)
+		node, found := hydrated[id]
+		if id == "" || !found || node == nil || r.inScope(node) {
+			local = append(local, edge)
+		}
+	}
+	r.prefetchSites(local)
+	out := make([]*graph.Edge, 0, len(local))
+	for _, edge := range local {
+		if r.siteInScope(edge.FilePath) {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+
+func edgeFrom(edge *graph.Edge) string { return edge.From }
+
+func edgeTo(edge *graph.Edge) string { return edge.To }
+
+// keep filters a node slice down to this view.
+func (r *baseGraphReader) keep(nodes []*graph.Node) []*graph.Node {
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if r.inScope(node) {
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
+// anchored reports whether an adjacency walk may start at id — that is,
+// whether the node the walk is about belongs to this view.
+//
+// Starting there is necessary but not sufficient. The walk's own edges are
+// filtered again by keepEdges, because a caller does not only read the nodes
+// this reader hydrates: query.Engine.FindUsagesScoped appends an edge to the
+// answer whether or not its far end hydrated (internal/query/engine.go, the
+// `from == nil` skip is gated on opts.hasScopeFilter()), so an unfiltered edge
+// list puts a foreign symbol id on the wire while the node list omits it.
+// Refusing the far *node* is not containment on its own; refusing the far
+// *edge* is. What that costs is declared: CapResolutionCrossRepo is incomplete
+// for this view precisely because those references were removed.
+func (r *baseGraphReader) anchored(id string) bool {
+	return r.inScope(r.base.GetNode(id))
+}
+
+func (r *baseGraphReader) GetNode(id string) *graph.Node {
+	node := r.base.GetNode(id)
+	if !r.inScope(node) {
+		return nil
+	}
+	return node
+}
+
+func (r *baseGraphReader) GetNodeByQualName(qualName string) *graph.Node {
+	node := r.base.GetNodeByQualName(qualName)
+	if !r.inScope(node) {
+		return nil
+	}
+	return node
+}
+
+func (r *baseGraphReader) FindNodesByName(name string) []*graph.Node {
+	return r.keep(r.base.FindNodesByName(name))
+}
+
+// FindNodesByNameContaining fills the caller's limit from this view.
+//
+// The corpus ranks every repository's matches together, so a fixed over-fetch
+// could be spent entirely on rows this view drops and answer short — an answer
+// that is never wrong but silently missing rows the view does hold, with
+// nothing on the response to say which of the two limits truncated it. The
+// widening loop removes that case instead of annotating it: it asks for more
+// until the filter has the caller's limit, or until the corpus returns fewer
+// rows than it was asked for, which is the corpus saying it has no more.
+func (r *baseGraphReader) FindNodesByNameContaining(substr string, limit int) []*graph.Node {
+	if limit <= 0 {
+		return r.keep(r.base.FindNodesByNameContaining(substr, 0))
+	}
+	ask := limit * baseGraphNameOverfetch
+	if ask < baseGraphNameOverfetchFloor {
+		ask = baseGraphNameOverfetchFloor
+	}
+	for {
+		raw := r.base.FindNodesByNameContaining(substr, ask)
+		out := r.keep(raw)
+		switch {
+		case len(out) >= limit:
+			return out[:limit]
+		case len(raw) < ask:
+			// The corpus is exhausted: this is every match there is.
+			return out
+		case ask >= baseGraphNameOverfetchCeiling:
+			return out
+		}
+		ask *= 4
+	}
+}
+
+func (r *baseGraphReader) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	found := r.base.GetNodesByIDs(ids)
+	out := make(map[string]*graph.Node, len(found))
+	for id, node := range found {
+		if r.inScope(node) {
+			out[id] = node
+		}
+	}
+	return out
+}
+
+func (r *baseGraphReader) GetFileNodes(filePath string) []*graph.Node {
+	return r.keep(r.base.GetFileNodes(filePath))
+}
+
+// GetRepoNodes answers only for this view's repository. A wildcard ("" means
+// every repository on the base graph) is answered as this repository, which is
+// every repository this view has.
+func (r *baseGraphReader) GetRepoNodes(repoPrefix string) []*graph.Node {
+	if repoPrefix != "" && repoPrefix != r.repoPrefix {
+		return nil
+	}
+	return r.keep(r.base.GetRepoNodes(r.repoPrefix))
+}
+
+func (r *baseGraphReader) GetOutEdges(nodeID string) []*graph.Edge {
+	if !r.anchored(nodeID) {
+		return nil
+	}
+	return r.keepEdges(r.base.GetOutEdges(nodeID), edgeTo)
+}
+
+func (r *baseGraphReader) GetInEdges(nodeID string) []*graph.Edge {
+	if !r.anchored(nodeID) {
+		return nil
+	}
+	return r.keepEdges(r.base.GetInEdges(nodeID), edgeFrom)
+}
+
+func (r *baseGraphReader) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	return r.adjacencyByNodeIDs(ids, r.base.GetInEdgesByNodeIDs, edgeFrom)
+}
+
+func (r *baseGraphReader) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	return r.adjacencyByNodeIDs(ids, r.base.GetOutEdgesByNodeIDs, edgeTo)
+}
+
+// adjacencyByNodeIDs runs the batched walk over the in-scope anchors only, in
+// one hydration round-trip rather than one per id, and filters every returned
+// list the same way the single-anchor lanes do.
+func (r *baseGraphReader) adjacencyByNodeIDs(
+	ids []string,
+	walk func([]string) map[string][]*graph.Edge,
+	far func(*graph.Edge) string,
+) map[string][]*graph.Edge {
+	anchors := r.base.GetNodesByIDs(ids)
+	scoped := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if r.inScope(anchors[id]) {
+			scoped = append(scoped, id)
+		}
+	}
+	if len(scoped) == 0 {
+		return map[string][]*graph.Edge{}
+	}
+	walked := walk(scoped)
+	// One batched site lookup for the whole walk, not one per anchor: the
+	// per-list filter below then finds every decision already memoized. The
+	// union is what keeps a fan-out over anchors from reappearing as a fan-out
+	// over batches.
+	union := make([]*graph.Edge, 0, len(walked))
+	for _, edges := range walked {
+		union = append(union, edges...)
+	}
+	r.prefetchSites(union)
+	out := make(map[string][]*graph.Edge, len(walked))
+	for id, edges := range walked {
+		out[id] = r.keepEdges(edges, far)
+	}
+	return out
+}
+
+func (r *baseGraphReader) AllNodes() []*graph.Node {
+	return r.keep(r.base.AllNodes())
+}
+
+func (r *baseGraphReader) AllEdges() []*graph.Edge {
+	edges := r.base.AllEdges()
+	// Hydrate every endpoint the scan will ask about in one round-trip. Asking
+	// per id would turn a whole-corpus scan into one point lookup per endpoint
+	// against a disk-backed store, which is the cost GetNodesByIDs exists to
+	// collapse.
+	scope := r.endpointScope(edges)
+	// Then the same collapse for the other half. Only the edges both
+	// endpoints kept can still be decided by their site, so only their paths
+	// are worth a lookup — and they are worth exactly one, batched, rather
+	// than one apiece.
+	local := make([]*graph.Edge, 0, len(edges))
+	for _, edge := range edges {
+		if r.endpointsInScope(edge, scope) {
+			local = append(local, edge)
+		}
+	}
+	r.prefetchSites(local)
+	out := make([]*graph.Edge, 0, len(local))
+	for _, edge := range local {
+		if r.edgeInScope(edge, scope) {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+
+// endpointScope pre-decides both ends of every edge in one batched hydration.
+//
+// An id the batch returns no row for is decided here too, and decided the way
+// the slow path decides it: an unresolved reference names no symbol at all, so
+// it is kept. Leaving it absent from the map instead sent endpointInScope back
+// to a point lookup per unresolved id — and an unresolved caller is exactly
+// the shape a cross-repository reference has before resolution, so the absent
+// arm was the fan-out, not the rare case.
+func (r *baseGraphReader) endpointScope(edges []*graph.Edge) map[string]bool {
+	ids := make([]string, 0, 2*len(edges))
+	seen := make(map[string]struct{}, 2*len(edges))
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		for _, id := range [...]string{edge.From, edge.To} {
+			if id == "" {
+				continue
+			}
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	hydrated := r.base.GetNodesByIDs(ids)
+	scope := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		node, found := hydrated[id]
+		scope[id] = !found || node == nil || r.inScope(node)
+	}
+	return scope
+}
+
+// baseGraphEdgeWindow is how many edges the streaming scan buffers before it
+// decides them. The buffer is what lets the endpoint hydration and the site
+// lookups be batched at all on a lane that has no slice to start from; it
+// bounds the read-ahead a consumer that stops early pays for.
+const baseGraphEdgeWindow = 512
+
+func (r *baseGraphReader) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		scope := make(map[string]bool)
+		window := make([]*graph.Edge, 0, baseGraphEdgeWindow)
+		// flush decides one window in two batched round-trips and yields what
+		// survives, in the order the corpus produced it.
+		flush := func() bool {
+			if len(window) == 0 {
+				return true
+			}
+			maps.Copy(scope, r.endpointScope(window))
+			local := make([]*graph.Edge, 0, len(window))
+			for _, edge := range window {
+				if r.endpointsInScope(edge, scope) {
+					local = append(local, edge)
+				}
+			}
+			r.prefetchSites(local)
+			window = window[:0]
+			for _, edge := range local {
+				if r.siteInScope(edge.FilePath) && !yield(edge) {
+					return false
+				}
+			}
+			return true
+		}
+		for edge := range r.base.EdgesByKind(kind) {
+			if edge == nil {
+				continue
+			}
+			window = append(window, edge)
+			if len(window) >= baseGraphEdgeWindow && !flush() {
+				return
+			}
+		}
+		flush()
+	}
+}
+
+func (r *baseGraphReader) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		for node := range r.base.NodesByKind(kind) {
+			if r.inScope(node) && !yield(node) {
+				return
+			}
+		}
+	}
+}
+
+func (r *baseGraphReader) NodeCount() int { return r.Stats().TotalNodes }
+
+func (r *baseGraphReader) EdgeCount() int { return r.Stats().TotalEdges }
+
+func (r *baseGraphReader) EdgeIdentityRevisions() int { return r.base.EdgeIdentityRevisions() }
+
+// Stats reports this repository's counters.
+//
+// The per-repo rollup answers it whenever the backend keeps one. When it does
+// not — graph.Graph.RepoStats skips the empty prefix, so a corpus whose nodes
+// carry no repository at all reports nothing — the counters are derived from
+// this reader's own filtered surface instead of borrowed from the corpus.
+// Reporting the corpus here would put every repository's totals behind a rider
+// that says exact:true, graph_id:X: a whole-corpus answer wearing this view's
+// label, which is the exact defect this reader exists to close. Deriving costs
+// one filtered pass and is reached only in that degenerate shape.
+// A rollup that carries no row for this prefix answers zero — the corpus
+// attributes nothing to this repository — and it answers it with allocated
+// counter maps, because a rollup miss is the one path that used to return the
+// zero GraphStats whole: nil ByKind and nil ByLanguage, which every other
+// producer of this type fills in and which a caller that counts into the map
+// it was handed panics on.
+func (r *baseGraphReader) Stats() graph.GraphStats {
+	if perRepo := r.base.RepoStats(); len(perRepo) > 0 {
+		return withCounterMaps(perRepo[r.repoPrefix])
+	}
+	return r.derivedStats()
+}
+
+// withCounterMaps fills in the counter maps a GraphStats value may be missing.
+// It never replaces one the producer built, so a real rollup row is passed
+// through as it was written.
+func withCounterMaps(stats graph.GraphStats) graph.GraphStats {
+	if stats.ByKind == nil {
+		stats.ByKind = map[string]int{}
+	}
+	if stats.ByLanguage == nil {
+		stats.ByLanguage = map[string]int{}
+	}
+	return stats
+}
+
+// derivedStats counts what this view actually holds. It is the fallback for a
+// backend with no per-repo rollup, and it can only ever report a subset of the
+// corpus, never the corpus.
+func (r *baseGraphReader) derivedStats() graph.GraphStats {
+	nodes := r.AllNodes()
+	stats := graph.GraphStats{
+		TotalNodes: len(nodes),
+		ByKind:     make(map[string]int, len(nodes)),
+		ByLanguage: make(map[string]int),
+	}
+	for _, node := range nodes {
+		stats.ByKind[string(node.Kind)]++
+		if node.Language != "" {
+			stats.ByLanguage[node.Language]++
+		}
+	}
+	stats.TotalEdges = len(r.AllEdges())
+	return stats
+}
+
+func (r *baseGraphReader) RepoStats() map[string]graph.GraphStats {
+	perRepo := r.base.RepoStats()
+	if len(perRepo) == 0 {
+		return nil
+	}
+	stats, found := perRepo[r.repoPrefix]
+	if !found {
+		return map[string]graph.GraphStats{}
+	}
+	return map[string]graph.GraphStats{r.repoPrefix: withCounterMaps(stats)}
+}
+
+// baseGraphContentReader adds the one optional capability a narrowed corpus
+// can keep exactly: content search already takes the repository to search, so
+// scoping it is pinning that argument rather than filtering an answer. The
+// write half of graph.ContentSearcher is refused — a request view is a reader,
+// and nothing may append to a corpus through one.
+type baseGraphContentReader struct {
+	*baseGraphReader
+	content graph.ContentSearcher
+}
+
+// errBaseGraphReadOnly is what the content writers answer. A view is a read of
+// the corpus; the corpus is written by whoever indexed it.
+var errBaseGraphReadOnly = errors.New("a base-scoped view reads the indexed corpus and cannot write to it")
+
+func (r *baseGraphContentReader) SearchContent(text, repoPrefix string, limit int) ([]graph.ContentHit, error) {
+	if repoPrefix != "" && repoPrefix != r.repoPrefix {
+		return nil, nil
+	}
+	return r.content.SearchContent(text, r.repoPrefix, limit)
+}
+
+func (r *baseGraphContentReader) ScanContent(repoPrefix string, fn func(nodeID, filePath, body string) bool) error {
+	if repoPrefix != "" && repoPrefix != r.repoPrefix {
+		return nil
+	}
+	return r.content.ScanContent(r.repoPrefix, fn)
+}
+
+func (r *baseGraphContentReader) WipeContent(string) error { return errBaseGraphReadOnly }
+
+func (r *baseGraphContentReader) WipeContentFile(string) error { return errBaseGraphReadOnly }
+
+func (r *baseGraphContentReader) AppendContent(string, []graph.ContentFTSItem) error {
+	return errBaseGraphReadOnly
+}
+
+func (r *baseGraphContentReader) BuildContentIndex() error { return errBaseGraphReadOnly }
+
+var (
+	_ graph.Reader          = (*baseGraphReader)(nil)
+	_ graph.Reader          = (*baseGraphContentReader)(nil)
+	_ graph.ContentSearcher = (*baseGraphContentReader)(nil)
+)
 
 // materializeRequestView turns a routed checkout into the reader that answers
 // the request.
@@ -763,6 +1584,7 @@ func (s *Server) materializeRequestView(
 	rider.GraphID = view.ID.BaseGraphID
 	rider.CheckoutID = checkout.CheckoutID
 	routed := &requestView{
+		kind:         requestViewKindWorktree,
 		reader:       view.Reader,
 		materialized: view,
 		rider:        rider,
@@ -797,7 +1619,11 @@ func viewFallback(strict bool, rider *graphview.ViewRider, err error) (*requestV
 	if markErr := rider.MarkFallback(string(graphview.SelectorBase), reason); markErr != nil {
 		return nil, markErr
 	}
-	return &requestView{rider: rider}, nil
+	return &requestView{
+		kind:     requestViewKindBase,
+		rider:    rider,
+		declared: baseFallbackCompleteness(),
+	}, nil
 }
 
 // viewFamilies lists the checkout families the indexed corpus reaches, one
@@ -942,6 +1768,17 @@ func (s *Server) repoPrefixForCheckoutChecked(ctx context.Context, checkout stor
 // refuseRoutedViewMutation admits only mutations that obtained checkout-local
 // coordination. An inexact fallback is read-only even when it has no routed
 // reader: allowing that case would silently write the primary checkout.
+//
+// A base-narrowed view is admitted for the same reason an unnarrowed base
+// request always was. The gate exists because a routed reader reads bytes at
+// some *other* checkout than the one every path resolver anchors to, so a
+// write through it would land in the wrong working copy unless the checkout
+// coordinator approved it. A base selector re-reads the corpus the request
+// would have read anyway, resolves paths against the repository's canonical
+// root exactly as before (view_paths.go: viewRoot is empty, so
+// requestViewPathRoot is the zero value), and therefore writes where it
+// always wrote. Narrowing what a base selector *reads* must not silently
+// convert every base-labelled edit into a refusal.
 func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp.CallToolResult {
 	view := requestViewFromContext(ctx)
 	if !s.facades.mutatesSource(tool) || view == nil {
@@ -952,7 +1789,7 @@ func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp
 			"%s: source edits require an exact live checkout; this request received a read-only fallback. Retry when the selected checkout is ready.",
 			graphview.CodeViewReadOnly))
 	}
-	if !view.routed() || checkoutMutationFromContext(ctx) != nil {
+	if !view.readsOwnCheckout() || checkoutMutationFromContext(ctx) != nil {
 		return nil
 	}
 	return mcp.NewToolResultError(fmt.Sprintf(
