@@ -92,6 +92,31 @@ func (f *dependencyPublicationFixture) publishAdopt(t *testing.T, claim Dedicate
 	}
 }
 
+// readyGeneration creates and publishes one generation directly, outside the
+// publication protocol. It is the only way to manufacture a chain the protocol
+// itself refuses to certify — the shape a pre-fix binary could have left in a
+// store — without reaching into store internals.
+func (f *dependencyPublicationFixture) readyGeneration(t *testing.T, revision string, base int64, layer, lower string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	identity := f.desire.Identity
+	id, err := f.catalog.CreateViewGeneration(ctx, ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: f.desire.Authority.GraphID,
+		CheckoutID: f.desire.Authority.Owner.CheckoutID, GenerationKind: "dedicated",
+		TreeOID: identity.TreeOID, ConfigHash: identity.ConfigHash,
+		ExtractorVersions: identity.ExtractorVersions, ResolverVersion: identity.ResolverVersion,
+		DependencyRevision: revision, BaseGenerationID: base, LayerID: layer, LowerViewFingerprint: lower,
+		CreatedAt: 2, State: ViewGenerationBuilding,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.catalog.PublishViewGeneration(ctx, id, 3); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func (f *dependencyPublicationFixture) row(t *testing.T, id int64) ViewGeneration {
 	t.Helper()
 	g, found, err := f.catalog.GetViewGeneration(context.Background(), id)
@@ -142,6 +167,11 @@ func (f *dependencyPublicationFixture) noWriteOracle(t *testing.T) func() {
 	}
 }
 
+// A dependency-only change still advances the desire by exactly one epoch and
+// still produces a distinct output identity, but the new output ROOTS: the
+// catalog no longer certifies a chain whose lower was frozen under a different
+// dependency revision, so the caller must claim it with no proposed parent.
+// The historical same-revision root stays reusable with its own metadata.
 func TestDedicatedDependencyRevisionParentAndHistoricalReuse(t *testing.T) {
 	f := newDependencyPublicationFixture(t, "cohort-v1:a")
 	aDesire := f.desire
@@ -151,9 +181,10 @@ func TestDedicatedDependencyRevisionParentAndHistoricalReuse(t *testing.T) {
 	if f.desire.Epoch != aDesire.Epoch+1 || f.desire.Identity.TreeOID != aDesire.Identity.TreeOID {
 		t.Fatal("dependency-only desire did not advance exactly one epoch")
 	}
-	b := f.claim(t, "b", a.GenerationID, a.GenerationID)
-	if b.Status != "allocated" || b.GenerationID == a.GenerationID || b.BaseGenerationID != a.GenerationID {
-		t.Fatalf("dependency-only child=%+v", b)
+	b := f.claim(t, "b", a.GenerationID, 0)
+	if b.Status != "allocated" || b.GenerationID == a.GenerationID || b.BaseGenerationID != 0 ||
+		b.LayerID != "" || b.LowerViewFingerprint != "" {
+		t.Fatalf("dependency-only re-root=%+v", b)
 	}
 	row := f.row(t, b.GenerationID)
 	if row.DependencyRevision != "cohort-v1:b" || row.ConfigHash != aDesire.Identity.ConfigHash || row.TreeOID != aDesire.Identity.TreeOID {
@@ -168,6 +199,86 @@ func TestDedicatedDependencyRevisionParentAndHistoricalReuse(t *testing.T) {
 	reused := f.claim(t, "a-again", b.GenerationID, b.GenerationID)
 	if reused.Status != "ready" || reused.GenerationID != a.GenerationID || reused.BaseGenerationID != 0 || reused.LayerID != "" || reused.LowerViewFingerprint != "" {
 		t.Fatalf("historical reuse=%+v", reused)
+	}
+}
+
+// Ready reuse hands the publisher a complete output to adopt as-is, so every
+// layer it composes must have been frozen under the current dependency inputs.
+// A head that matches over an older lower is a mixed composition: reusing it
+// returns base_generation_id = that lower, which routes the publisher into a
+// delta its builder must refuse — a publication wedge that lasts for as long
+// as the tree is unchanged. The homogeneous arm is the control that proves
+// this does not simply disable ready reuse.
+func TestDedicatedDependencyRevisionReadyReuseRequiresHomogeneousAncestry(t *testing.T) {
+	for _, homogeneous := range []bool{true, false} {
+		name := "mixed-chain-not-reused"
+		if homogeneous {
+			name = "homogeneous-chain-reused"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newDependencyPublicationFixture(t, "cohort-v1:a")
+			a := f.claim(t, "a", 0, 0)
+			f.publishAdopt(t, a)
+			f.observe(t, "cohort-v1:b")
+			lowerRevision := "cohort-v1:a"
+			if homogeneous {
+				lowerRevision = "cohort-v1:b"
+			}
+			lower := f.readyGeneration(t, lowerRevision, 0, "", "")
+			head := f.readyGeneration(t, "cohort-v1:b", lower, "dependency-head", "dependency-head-lower")
+			claim := f.claim(t, "scan", a.GenerationID, 0)
+			if homogeneous {
+				if claim.Status != "ready" || claim.GenerationID != head || claim.BaseGenerationID != lower ||
+					claim.LayerID != "dependency-head" || claim.LowerViewFingerprint != "dependency-head-lower" {
+					t.Fatalf("same-revision chain was not reused: %+v (head=%d lower=%d)", claim, head, lower)
+				}
+				return
+			}
+			if claim.Status != "allocated" || claim.GenerationID == head || claim.GenerationID == lower ||
+				claim.BaseGenerationID != 0 || claim.LayerID != "" || claim.LowerViewFingerprint != "" {
+				t.Fatalf("mixed-revision chain was reused as ready output: %+v (head=%d lower=%d)", claim, head, lower)
+			}
+			if row := f.row(t, head); row.State != ViewGenerationReady || row.DependencyRevision != "cohort-v1:b" {
+				t.Fatalf("refused candidate was mutated: %+v", row)
+			}
+		})
+	}
+}
+
+// The proposed-parent arm deliberately keeps its latitude — the indexer's
+// builder is the guard that refuses to extend a chain across a revision change,
+// and that guard must stay reachable. Certification is the harder fence:
+// adoption validates the whole composition, so a mixed chain can be reserved
+// and built but never becomes the active committed output.
+func TestDedicatedDependencyRevisionMixedCompositionReservesButCannotAdopt(t *testing.T) {
+	ctx := context.Background()
+	f := newDependencyPublicationFixture(t, "cohort-v1:a")
+	a := f.claim(t, "a", 0, 0)
+	f.publishAdopt(t, a)
+	f.observe(t, "cohort-v1:b")
+	mixed := f.claim(t, "mixed", a.GenerationID, a.GenerationID)
+	if mixed.Status != "allocated" || mixed.BaseGenerationID != a.GenerationID {
+		t.Fatalf("proposed-parent reservation is no longer handed out, so the builder guard is dead code: %+v", mixed)
+	}
+	// The builder re-validates its own still-building reservation through the
+	// validation-only claim mode before writing payload. Refusing the mixed
+	// parent there would take the decision away from the builder's typed guard.
+	validated, err := f.catalog.ClaimDedicatedBaseBuild(ctx, ClaimDedicatedBaseBuildRequest{
+		ExistingGenerationID: mixed.GenerationID, Desire: f.desire, ExpectedActiveGenerationID: mixed.ExpectedActiveGenerationID,
+		AttemptToken: mixed.AttemptToken, BaseGenerationID: mixed.BaseGenerationID,
+		LayerID: mixed.LayerID, LowerViewFingerprint: mixed.LowerViewFingerprint})
+	if err != nil || validated.GenerationID != mixed.GenerationID || validated.BaseGenerationID != a.GenerationID {
+		t.Fatalf("building reservation was refused before its builder saw it: %+v err=%v", validated, err)
+	}
+	if err := f.catalog.PublishViewGeneration(ctx, mixed.GenerationID, 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.catalog.AdoptDedicatedBaseGeneration(ctx, AdoptDedicatedBaseGenerationRequest{Claim: mixed}); !errors.Is(err, ErrDedicatedBaseCandidate) {
+		t.Fatalf("mixed composition was adopted: %v", err)
+	}
+	graph, found, err := f.catalog.GetDedicatedGraph(ctx, f.desire.Authority.GraphID)
+	if err != nil || !found || graph.ActiveGenerationID != a.GenerationID {
+		t.Fatalf("refused adoption moved the active pointer: graph=%+v found=%v err=%v", graph, found, err)
 	}
 }
 
@@ -233,6 +344,29 @@ func TestDedicatedDependencyRevisionTamperedOutputCannotValidateOrAdopt(t *testi
 	}
 	if _, err := f.catalog.AdoptDedicatedBaseGeneration(context.Background(), AdoptDedicatedBaseGenerationRequest{Claim: a}); !errors.Is(err, ErrDedicatedBaseCandidate) {
 		t.Fatalf("tampered row adopted: %v", err)
+	}
+	assertUnchanged()
+}
+
+// The building-candidate exception covers the candidate's ANCESTRY only. The
+// candidate's own stored revision is still checked at depth 0, so a builder
+// cannot be told its reservation is live after that row was retagged.
+func TestDedicatedDependencyRevisionTamperedBuildingCandidateCannotValidate(t *testing.T) {
+	ctx := context.Background()
+	f := newDependencyPublicationFixture(t, "cohort-v1:a")
+	a := f.claim(t, "a", 0, 0)
+	if a.Status != "allocated" {
+		t.Fatalf("fixture candidate is not building: %+v", a)
+	}
+	// Deliberately corrupt PRIVATE metadata of a still-building reservation.
+	if _, err := f.catalog.exec(ctx, `UPDATE view_generations SET dependency_revision=? WHERE generation_id=?`, "cohort-v1:wrong", a.GenerationID); err != nil {
+		t.Fatal(err)
+	}
+	assertUnchanged := f.noWriteOracle(t)
+	_, err := f.catalog.ClaimDedicatedBaseBuild(ctx, ClaimDedicatedBaseBuildRequest{
+		Desire: f.desire, ExistingGenerationID: a.GenerationID, AttemptToken: a.AttemptToken})
+	if !errors.Is(err, ErrDedicatedBaseCandidate) {
+		t.Fatalf("tampered building candidate validated: %v", err)
 	}
 	assertUnchanged()
 }

@@ -332,15 +332,23 @@ func validateDedicatedBaseChainTx(ctx context.Context, tx *sql.Tx, desire Dedica
 			g.ConfigHash != desire.Identity.ConfigHash || g.ExtractorVersions != desire.Identity.ExtractorVersions || g.ResolverVersion != desire.Identity.ResolverVersion || g.BaseGenerationID < 0 {
 			return ViewGeneration{}, fmt.Errorf("%w: generation %d has incompatible ownership, policy or state", ErrDedicatedBaseCandidate, id)
 		}
+		// The output candidate must always match current dependency inputs, and
+		// a COMPLETE output must compose only layers frozen under them. A head
+		// that matches over an older lower is a mixed composition: handing one
+		// back as ready — or certifying one at adoption — gives the publisher a
+		// delta parent its builder must refuse, which wedges publication for as
+		// long as the tree is unchanged. Two deliberate exceptions keep their
+		// latitude below depth 0: a merely PROPOSED parent (exactTree=false),
+		// which may still supply the lower for a derived-only refresh, and a
+		// still-BUILDING candidate, whose parent composition belongs to the
+		// builder's own typed refusal before any payload is written.
+		if exactTree && g.DependencyRevision != desire.Identity.DependencyRevision && (depth == 0 || !allowBuildingCandidate) {
+			return ViewGeneration{}, fmt.Errorf("%w: generation %d dependency revision mismatch", ErrDedicatedBaseCandidate, id)
+		}
 		if depth == 0 {
 			first = g
 			if exactTree && g.TreeOID != desire.Identity.TreeOID {
 				return ViewGeneration{}, fmt.Errorf("%w: tree mismatch", ErrDedicatedBaseCandidate)
-			}
-			// Only the output candidate must match current dependency inputs.
-			// A same-policy parent may supply the lower for a derived-only refresh.
-			if exactTree && g.DependencyRevision != desire.Identity.DependencyRevision {
-				return ViewGeneration{}, fmt.Errorf("%w: dependency revision mismatch", ErrDedicatedBaseCandidate)
 			}
 		}
 		id = g.BaseGenerationID

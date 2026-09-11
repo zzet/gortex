@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"testing"
@@ -123,6 +124,44 @@ func TestDedicatedBaseAdvanceRevisionPlanningWritesNothing(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("mixed row: found=%v err=%v", found, err)
 	}
+	// A second synthetic chain whose lower breaks BOTH parse policy and the
+	// revision. It is the only shape that can tell the two verdicts apart, so
+	// it is what pins their ORDER: the ancestry guard must decide it, because a
+	// degrade placed ahead of the guard would discard a corrupt chain as an
+	// ordinary full-root verdict instead of reporting it.
+	brokenRoot, err := catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: f.publisher.authority.GraphID,
+		CheckoutID: f.publisher.authority.Owner.CheckoutID, GenerationKind: "dedicated",
+		TreeOID: active.TreeOID, ConfigHash: "private-config-v2",
+		ExtractorVersions: active.ExtractorVersions, ResolverVersion: active.ResolverVersion,
+		DependencyRevision: "cohort-v1:a", CreatedAt: 4, State: store_sqlite.ViewGenerationBuilding,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.PublishViewGeneration(ctx, brokenRoot, 5); err != nil {
+		t.Fatal(err)
+	}
+	brokenHead, err := catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: f.publisher.authority.GraphID,
+		CheckoutID: f.publisher.authority.Owner.CheckoutID, GenerationKind: "dedicated",
+		TreeOID: active.TreeOID, ConfigHash: active.ConfigHash,
+		ExtractorVersions: active.ExtractorVersions, ResolverVersion: active.ResolverVersion,
+		DependencyRevision: "cohort-v1:b", BaseGenerationID: brokenRoot,
+		LayerID:              "dedicated-delta:broken",
+		LowerViewFingerprint: "dedicated:broken",
+		CreatedAt:            6, State: store_sqlite.ViewGenerationBuilding,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.PublishViewGeneration(ctx, brokenHead, 7); err != nil {
+		t.Fatal(err)
+	}
+	brokenHeadRow, found, err := catalog.GetViewGeneration(ctx, brokenHead)
+	if err != nil || !found {
+		t.Fatalf("broken head row: found=%v err=%v", found, err)
+	}
 	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
@@ -157,77 +196,128 @@ func TestDedicatedBaseAdvanceRevisionPlanningWritesNothing(t *testing.T) {
 	if _, err := dedicatedBaseParentForAdvance(ctx, catalog, f.publisher.authority, brokenPolicy, brokenTarget); !errors.Is(err, store_sqlite.ErrDedicatedBaseCandidate) {
 		t.Fatalf("policy-broken ancestry admitted: %v", err)
 	}
+	// Ordering: this lower is revision-different AND policy-broken, so the two
+	// verdicts compete on the same row. The guard must win; if the degrade ran
+	// first the corrupt chain would come back as a silent (0, nil) full root.
+	if selected, err := dedicatedBaseParentForAdvance(ctx, catalog, f.publisher.authority, brokenHeadRow, changedRevision); !errors.Is(err, store_sqlite.ErrDedicatedBaseCandidate) {
+		t.Fatalf("revision-different policy-broken ancestry was discarded as a full-root verdict: selected=%d err=%v", selected, err)
+	}
 	if err := check(); err != nil {
 		t.Fatalf("planning wrote catalog rows: %v", err)
 	}
 }
 
-// A dependency-revision change must never wedge publication. The catalog can
-// legitimately hold a chain whose lower carries an older revision (its ancestry
-// validation revision-checks only the output candidate), and the ACTIVE pointer
-// can be at the head of exactly such a chain. ensureCurrent must then publish a
-// new full root, not return ErrDedicatedBaseCandidate forever.
-func TestDedicatedBaseAdvanceNonHomogeneousChainStillPublishesAsRoot(t *testing.T) {
-	f := newDedicatedAdvanceFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	catalog := f.builder.Store.Catalog()
-	f.identity.DependencyRevision = "cohort-v1:a"
-	initial := f.ensure(t, ctx)
-	rootID := initial.Claim.GenerationID
-
-	// Build the mixed chain through the catalog's own public API, exactly as a
-	// mixed-binary window or a non-indexer claimer would: an output frozen at
-	// cohort-v1:b whose parent is the cohort-v1:a root. The catalog accepts the
-	// reservation (exactTree=false on the proposed parent) and the adoption
-	// (exactTree=true revision-checks depth 0 only), so this shape is reachable
-	// without touching store internals.
-	f.commitFile(t, "package dedicated\nfunc MixedChainMarker() int { return 1 }\n")
-	mixedTree := f.git(t, "rev-parse", "HEAD^{tree}")
-	publication, found, err := catalog.DedicatedBasePublication(ctx, f.publisher.authority.GraphID)
-	if err != nil || !found {
-		t.Fatalf("publication: found=%v err=%v", found, err)
-	}
-	mixedIdentity := f.identity
-	mixedIdentity.TreeOID, mixedIdentity.DependencyRevision = mixedTree, "cohort-v1:b"
-	desire, err := catalog.RecordDedicatedBaseDesire(ctx, store_sqlite.RecordDedicatedBaseDesireRequest{
-		Authority: f.publisher.authority, ExpectedDesiredEpoch: publication.Desire.Epoch, Identity: mixedIdentity})
+// setDedicatedActiveGeneration moves the active pointer without the publication
+// protocol. AdoptDedicatedBaseGeneration now refuses to certify a chain that is
+// not revision-homogeneous, and upsertDedicatedGraphIdentity deliberately
+// ignores a supplied pointer once publication authority exists, so a direct
+// write is the only way to RECONSTRUCT the state a pre-fix binary could leave
+// behind. It is fixture construction, not an assertion about production paths.
+func setDedicatedActiveGeneration(t *testing.T, ctx context.Context, path, graphID string, generationID int64) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mixedClaim, err := catalog.ClaimDedicatedBaseBuild(ctx, store_sqlite.ClaimDedicatedBaseBuildRequest{
-		Desire: desire, ExpectedActiveGenerationID: rootID, AttemptToken: "mixed-chain-attempt",
-		BaseGenerationID: rootID, LayerID: fmt.Sprintf("dedicated-delta:%d", rootID),
-		LowerViewFingerprint: fmt.Sprintf("dedicated:%s:%d", f.publisher.authority.GraphID, rootID), CreatedAt: 2,
-	})
-	if err != nil || mixedClaim.BaseGenerationID != rootID {
-		t.Fatalf("catalog refused the mixed reservation, so the wedge is unreachable: claim=%+v err=%v", mixedClaim, err)
-	}
-	if err := catalog.PublishViewGeneration(ctx, mixedClaim.GenerationID, 3); err != nil {
+	defer db.Close()
+	result, err := db.ExecContext(ctx, `UPDATE dedicated_graphs SET active_generation_id=? WHERE graph_id=?`, generationID, graphID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := catalog.AdoptDedicatedBaseGeneration(ctx, store_sqlite.AdoptDedicatedBaseGenerationRequest{Claim: mixedClaim}); err != nil {
-		t.Fatal(err)
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		t.Fatalf("active pointer write affected %d rows: %v", affected, err)
 	}
-	graph, found, err := catalog.GetDedicatedGraph(ctx, f.publisher.authority.GraphID)
-	if err != nil || !found || graph.ActiveGenerationID != mixedClaim.GenerationID {
-		t.Fatalf("active pointer is not the mixed head: graph=%+v found=%v err=%v", graph, found, err)
-	}
+}
 
-	// The next observation sees the same revision as the mixed head, so the
-	// planner walks into the older-revision lower. That must re-root, not error.
-	f.commitFile(t, "package dedicated\nfunc MixedChainMarker() int { return 2 }\n")
-	f.identity.DependencyRevision = "cohort-v1:b"
-	next := f.ensure(t, ctx)
-	if next.Claim.BaseGenerationID != 0 || next.Claim.LayerID != "" || next.Claim.LowerViewFingerprint != "" {
-		t.Fatalf("non-homogeneous chain was extended instead of re-rooted: %+v", next.Claim)
-	}
-	nextRow, found, err := catalog.GetViewGeneration(ctx, next.Claim.GenerationID)
-	if err != nil || !found || nextRow.BaseGenerationID != 0 || nextRow.LayerID != "" ||
-		nextRow.LowerViewFingerprint != "" || nextRow.DependencyRevision != "cohort-v1:b" {
-		t.Fatalf("re-rooted row: %+v found=%v err=%v", nextRow, found, err)
-	}
-	if len(f.view(t, ctx, next.Claim.GenerationID).Reader.GetFileNodes(f.request.RepoPrefix+"/advance.go")) == 0 {
-		t.Fatal("re-rooted publication is missing committed source")
+// A dependency-revision change must never wedge publication. A store can hold a
+// chain whose lower carries an older revision — the shape a pre-W2.1d binary
+// could publish, because exact-tree ancestry validation revision-checked only
+// the output candidate — and the ACTIVE pointer can sit at the head of exactly
+// such a chain. Both routes out of that state must publish a new full root:
+// the catalog's ready-reuse scan when the observed identity still matches the
+// mixed head, and the planner when the tree has moved on. Neither may return
+// ErrDedicatedBaseCandidate forever.
+func TestDedicatedBaseAdvanceNonHomogeneousChainStillPublishesAsRoot(t *testing.T) {
+	for _, moved := range []bool{false, true} {
+		name := "same-tree-ready-reuse"
+		if moved {
+			name = "advanced-tree-planner"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newDedicatedAdvanceFixture(t)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			catalog := f.builder.Store.Catalog()
+			f.identity.DependencyRevision = "cohort-v1:a"
+			initial := f.ensure(t, ctx)
+			rootID := initial.Claim.GenerationID
+
+			// The mixed head: an output frozen at cohort-v1:b whose parent is
+			// the cohort-v1:a root, carrying the layer identity the runtime
+			// itself would have produced for that parent.
+			f.commitFile(t, "package dedicated\nfunc MixedChainMarker() int { return 1 }\n")
+			mixedTree := f.git(t, "rev-parse", "HEAD^{tree}")
+			mixedID, err := catalog.CreateViewGeneration(ctx, store_sqlite.ViewGeneration{
+				OwnerKind: "dedicated_graph", GraphID: f.publisher.authority.GraphID,
+				CheckoutID: f.publisher.authority.Owner.CheckoutID, GenerationKind: "dedicated",
+				TreeOID: mixedTree, ConfigHash: f.identity.ConfigHash,
+				ExtractorVersions: f.identity.ExtractorVersions, ResolverVersion: f.identity.ResolverVersion,
+				DependencyRevision: "cohort-v1:b", BaseGenerationID: rootID,
+				LayerID:              fmt.Sprintf("dedicated-delta:%d", rootID),
+				LowerViewFingerprint: fmt.Sprintf("dedicated:%s:%d", f.publisher.authority.GraphID, rootID),
+				CreatedAt:            2, State: store_sqlite.ViewGenerationBuilding,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := catalog.PublishViewGeneration(ctx, mixedID, 3); err != nil {
+				t.Fatal(err)
+			}
+			setDedicatedActiveGeneration(t, ctx, f.request.StorePath, f.publisher.authority.GraphID, mixedID)
+			graph, found, err := catalog.GetDedicatedGraph(ctx, f.publisher.authority.GraphID)
+			if err != nil || !found || graph.ActiveGenerationID != mixedID {
+				t.Fatalf("active pointer is not the mixed head: graph=%+v found=%v err=%v", graph, found, err)
+			}
+
+			// moved=false keeps the observed identity equal to the mixed head's,
+			// so the claim never consults the planner and the catalog's
+			// ready-reuse scan is the only thing standing between the publisher
+			// and a delta parent its builder must refuse.
+			f.identity.DependencyRevision = "cohort-v1:b"
+			if moved {
+				f.commitFile(t, "package dedicated\nfunc MixedChainMarker() int { return 2 }\n")
+			}
+			next := f.ensure(t, ctx)
+			if next.Claim.GenerationID == mixedID || next.Claim.BaseGenerationID != 0 ||
+				next.Claim.LayerID != "" || next.Claim.LowerViewFingerprint != "" {
+				t.Fatalf("non-homogeneous chain was reused or extended instead of re-rooted: %+v", next.Claim)
+			}
+			nextRow, found, err := catalog.GetViewGeneration(ctx, next.Claim.GenerationID)
+			if err != nil || !found || nextRow.BaseGenerationID != 0 || nextRow.LayerID != "" ||
+				nextRow.LowerViewFingerprint != "" || nextRow.DependencyRevision != "cohort-v1:b" {
+				t.Fatalf("re-rooted row: %+v found=%v err=%v", nextRow, found, err)
+			}
+			if len(f.view(t, ctx, next.Claim.GenerationID).Reader.GetFileNodes(f.request.RepoPrefix+"/advance.go")) == 0 {
+				t.Fatal("re-rooted publication is missing committed source")
+			}
+			// It converges: the fresh root is revision-homogeneous, so the next
+			// identical observation coalesces instead of rebuilding every poll.
+			observation, err := f.observe(t, ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replay, err := f.publisher.ensureCurrent(ctx, f.leases, func(context.Context) (dedicatedBaseObservation, error) { return observation, nil })
+			if err != nil || replay.Claim.GenerationID != next.Claim.GenerationID || !replay.Report.Coalesced || !replay.Adoption.AlreadyAdopted {
+				t.Fatalf("re-rooted publication did not converge: %+v err=%v", replay, err)
+			}
+			if err := check(); err != nil {
+				t.Fatalf("converged replay wrote catalog rows: %v", err)
+			}
+		})
 	}
 }
