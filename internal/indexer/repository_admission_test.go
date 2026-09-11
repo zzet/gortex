@@ -225,6 +225,69 @@ func TestLifecycleRepositoryShutdownRefusesRegistrationAndWaitsBroadReader(t *te
 	<-done
 }
 
+// TestLifecycleShutdownFencesTheDivergentCleanupRetryState settles the one
+// reachability question left open by the move to handle identity.
+//
+// restoreRepositoryAdmissionLocked re-registers unconditionally
+// (repository_admission.go:213) and RegisterRepositoryOwnerPrepared refuses a
+// registration whose graphview state is already closing
+// (repository_registration.go:25-27). So a graph that is present in
+// l.repositoryOwners, closing in graphview, and ABSENT from l.repositoryClosing
+// would get an error where a cleanup retry previously got its drain back.
+//
+// Every writer of both maps runs under repositoryAdmissionMu and writes them
+// together (:213-228, repository_cleanup.go:459-466), so the only producer of
+// that divergence is shutdown: stopRepositoryAdmissions (:275-283) closes every
+// graphview registration and records nothing in l.repositoryClosing. This test
+// creates exactly that state and shows it can never be fed to
+// restoreRepositoryAdmissionLocked: both of its entrypoints refuse on
+// repositoryAdmissionsClosed first, BEFORE the durable BeginRepositoryCleanup
+// write. The refusal is therefore unreachable, and the fail-closed ordering
+// that makes it unreachable is what this test pins.
+func TestLifecycleShutdownFencesTheDivergentCleanupRetryState(t *testing.T) {
+	lifecycle, identity := repositoryAdmissionFixture(t)
+	ctx := context.Background()
+	if err := lifecycle.RegisterRepositoryOwner(ctx, identity.GraphID); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle.repositoryAdmissionMu.Lock()
+	_, owned := lifecycle.repositoryOwners[identity.GraphID]
+	_, closing := lifecycle.repositoryClosing[identity.GraphID]
+	lifecycle.repositoryAdmissionMu.Unlock()
+	if !owned || closing {
+		t.Fatalf("registration owned=%v closing=%v", owned, closing)
+	}
+
+	<-lifecycle.stopRepositoryAdmissions()
+	lifecycle.repositoryAdmissionMu.Lock()
+	_, owned = lifecycle.repositoryOwners[identity.GraphID]
+	_, closing = lifecycle.repositoryClosing[identity.GraphID]
+	lifecycle.repositoryAdmissionMu.Unlock()
+	if !owned || closing {
+		t.Fatalf("shutdown did not produce the divergent state: owned=%v closing=%v", owned, closing)
+	}
+	// Shutdown really did close the graphview registration underneath it.
+	if err := lifecycle.leases.RegisterRepositoryOwner(repositoryCleanupOwner(identity)); err == nil {
+		t.Fatal("shutdown left the graphview registration open")
+	}
+
+	if _, _, _, err := lifecycle.closeRepositoryAdmission(ctx, identity.GraphID); !errors.Is(err, graphview.ErrRepositoryAdmissionsStopped) {
+		t.Fatalf("cleanup entered restoration after shutdown: %v", err)
+	}
+	if err := lifecycle.restoreRepositoryAdmissions(ctx); !errors.Is(err, graphview.ErrRepositoryAdmissionsStopped) {
+		t.Fatalf("startup restore entered restoration after shutdown: %v", err)
+	}
+	// The refusal precedes the durable close, so a shutdown race cannot leave a
+	// graph marked closing in the catalog with no cleanup capability for it.
+	graph, found, err := lifecycle.catalog.GetDedicatedGraph(ctx, identity.GraphID)
+	if err != nil || !found {
+		t.Fatalf("graph found=%v err=%v", found, err)
+	}
+	if graph.State == store_sqlite.DedicatedGraphClosing {
+		t.Fatal("refused cleanup still performed the durable closing write")
+	}
+}
+
 // TestLifecycleRefusesNilPublisherRuntimeAndReportsTheInstalledOne pins the
 // installation seam a server stack writes through. Nil must not consume the one
 // pre-owner window (it would leave the publisher/drain half silently unowned),
