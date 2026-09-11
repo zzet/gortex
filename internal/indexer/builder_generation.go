@@ -1231,21 +1231,27 @@ func servesTextSearch(identity GenerationIdentity) bool {
 //     (checkout_text_search.go textCorpus), and the layer that describes the
 //     working copy sits above these.
 //
-// The silence is deliberate and it is load-bearing, not a shortcut. A view's
+// The silence is deliberate and it is load-bearing, not a shortcut, and the
+// reader is what makes it mean something. For every OTHER capability a view's
 // completeness is the WORST state any generation in its stack declares
 // (graphview/materialize.go, Materializer.completeness), and a checkout view is
 // composed of the commit layer, the working-tree layer and the whole ancestry
 // beneath them (MaterializeCheckout -> assemble). A commit layer or dedicated
-// base that narrowed the capability would therefore narrow every live routed
-// view stacked on top of it, and refuse a search the checkout can answer
+// base that narrowed the capability under that rule would narrow every live
+// routed view stacked on top of it, and refuse a search the checkout can answer
 // exactly — a false negative in place of a false positive. Declaring nothing
 // says the honest thing instead: this layer is not the one that answers.
 //
-// What silence cannot say is that a view assembled WITHOUT a working-tree layer
-// is reading a committed tree while the root holds edits it does not describe.
-// That is not a property of any generation — the same commit layer is served
-// both ways — so it is enforced where the route can be read, at
-// GrepCheckout (checkout_text_search.go).
+// For CapSearchText the reader does not worst-case at all: the TOP layer of the
+// stack decides, and its silence is read as a denial rather than as an
+// inheritance (Materializer.completeness). That is what makes a silent commit
+// layer or dedicated base say the one thing silence could not say on its own —
+// a view assembled WITHOUT a working-tree layer over it is reading a committed
+// tree while the root is free to hold edits that tree does not describe — while
+// leaving the same layer harmless underneath a working-tree layer that does
+// claim the capability. GrepCheckout (checkout_text_search.go) enforces the
+// same rule from the route, for the window in which a coordinator has withdrawn
+// the working-tree slot.
 func textSearchProducer(identity GenerationIdentity) (store_sqlite.ProducerCompleteness, bool) {
 	switch {
 	case identity.OwnerKind == refViewOwnerKind:

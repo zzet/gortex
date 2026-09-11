@@ -161,7 +161,10 @@ func TestDedicatedBaseDeclaresNoTextSearchClaim(t *testing.T) {
 
 	generationID, report, err := builderNewBuilder(f.store).Build(ctx, BuildRequest{
 		Identity: GenerationIdentity{
-			OwnerKind: checkoutLayerOwnerKind, GraphID: f.graphID, CheckoutID: f.primaryID,
+			// The literal owner kind builder_dedicated_claimed.go mints, not the
+			// coordinator's alias for the same string; see
+			// TestBuilderIdentityLiteralsMatchTheBuilders.
+			OwnerKind: dedicatedBaseOwnerKind, GraphID: f.graphID, CheckoutID: f.primaryID,
 			GenerationKind: dedicatedBaseGenerationKind, TreeOID: tree,
 			ConfigHash: "capability-config", ExtractorVersions: "capability-extractors",
 			ResolverVersion: "capability-resolver",
@@ -264,6 +267,59 @@ func TestGrepRefusesARouteWithNoWorkingTreeLayer(t *testing.T) {
 	}
 	if matches, served, err := l.GrepCheckout(ctx, query); err != nil || !served || len(matches) != 1 {
 		t.Fatalf("the re-routed checkout did not answer again: served=%v err=%v matches=%v",
+			served, err, grepPaths(matches))
+	}
+}
+
+// TestGrepRefusesAnUnroutedCheckout pins the gate's third arm, which was a
+// fail-OPEN default with no test behind it: a checkout the catalog holds no
+// route for used to be answered straight off its working copy.
+//
+// Nothing has published a view of such a checkout, so no layer vouches for what
+// is on the root, and the corpus a searcher would be built over is the base
+// inventory alone — the state of some other tree. The only production caller
+// reaches GrepCheckout through a materialized view, which cannot exist without
+// a route, so closing the arm costs no live answer; what it buys is that a
+// future caller arriving without one is refused rather than handed bytes no
+// view describes.
+func TestGrepRefusesAnUnroutedCheckout(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	worktreeWrite(t, f.worktree, "island.go",
+		"package fixture\n\nfunc Island() {\n\t// unrouted-marker\n}\n")
+
+	ctx := context.Background()
+	// No cycle is run, so the checkout has no route row at all.
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	if _, found, err := f.catalog.GetCheckoutRoute(ctx, f.checkoutID); err != nil || found {
+		t.Fatalf("the fixture checkout is already routed: found=%v err=%v", found, err)
+	}
+	if describes, err := c.routeDescribesTheWorkingCopy(ctx); err != nil || describes {
+		t.Fatalf("an unrouted checkout claimed its working copy is described: %v %v", describes, err)
+	}
+
+	l := &CheckoutLifecycle{coordinators: map[string]*CheckoutCoordinator{f.checkoutID: c}}
+	matches, served, err := l.GrepCheckout(ctx, CheckoutTextQuery{
+		CheckoutID: f.checkoutID, Query: "unrouted-marker", Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("the gate errored instead of refusing: %v", err)
+	}
+	if served || len(matches) != 0 {
+		t.Fatalf("an unrouted checkout answered off its working copy: served=%v matches=%v",
+			served, grepPaths(matches))
+	}
+
+	// The control: the marker really is on the root, so the refusal above is a
+	// refusal to answer and not an empty tree. One cycle routes the checkout
+	// and the same query answers.
+	if cycle := coordinatorReconcile(t, c); cycle.DirtyGenerationID == 0 {
+		t.Fatalf("the cycle routed no working-tree layer: %+v", cycle)
+	}
+	matches, served, err = l.GrepCheckout(ctx, CheckoutTextQuery{
+		CheckoutID: f.checkoutID, Query: "unrouted-marker", Limit: 10,
+	})
+	if err != nil || !served || len(matches) != 1 || matches[0].Path != "island.go" {
+		t.Fatalf("the routed checkout did not answer: served=%v err=%v matches=%v",
 			served, err, grepPaths(matches))
 	}
 }

@@ -67,6 +67,8 @@ type CheckoutTextQuery struct {
 //     view a caller reads in that window is the committed tree alone, and this
 //     root is free to hold edits that tree does not contain; answering would
 //     return lines the view does not have.
+//   - The checkout has no route at all, so nothing has published a view of it
+//     and no layer vouches for what is on the root.
 func (l *CheckoutLifecycle) GrepCheckout(ctx context.Context, q CheckoutTextQuery) ([]trigram.Match, bool, error) {
 	if l == nil || q.CheckoutID == "" || q.Query == "" {
 		return nil, false, nil
@@ -107,17 +109,22 @@ func (l *CheckoutLifecycle) GrepCheckout(ctx context.Context, q CheckoutTextQuer
 // which the committed tree the caller is reading does not contain — so nothing
 // serves it, and the caller is told that rather than shown them.
 //
-// A checkout with no route at all keeps its answer. Nothing has published a
-// view of it for an answer to disagree with, and the corpus is composed from
-// the base inventory alone in that case (textCorpus), which is the documented
-// behaviour of a checkout the coordinator has not routed yet.
+// A checkout with no route at all is refused too, and this arm is the reason
+// the gate is a predicate on the route rather than on the generation: an
+// unrouted checkout has published nothing, so there is no evidence that any
+// layer describes what is on the root. The only production caller reaches
+// this through a materialized view, which cannot exist without a route
+// (graphview's Materializer.route refuses an unrouted checkout with
+// CodeCheckoutInaccessible), so no live request loses an answer here — and a
+// future caller that arrives without one gets a refusal rather than a raw
+// working-copy answer that no view vouches for.
 func (c *CheckoutCoordinator) routeDescribesTheWorkingCopy(ctx context.Context) (bool, error) {
 	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
 	if err != nil {
 		return false, fmt.Errorf("indexer: read the route of checkout %q: %w", c.checkoutID, err)
 	}
 	if !found {
-		return true, nil
+		return false, nil
 	}
 	return route.DirtyGenerationID > 0, nil
 }

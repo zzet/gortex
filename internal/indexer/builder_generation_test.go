@@ -13,16 +13,51 @@ import (
 // The searcher an answer comes from is built over a checkout root, so the bytes
 // it reports are the working copy's. Only the layer that IS that working copy
 // claims the capability; a ref view, which no checkout holds, withdraws it; and
-// every layer in between says nothing at all, because a narrowing there is
-// worst-cased over the whole stack and would refuse the live routed search the
-// checkout can answer exactly.
+// every layer in between says nothing at all, because a narrowing there would
+// be worst-cased over the whole stack and would refuse the live routed search
+// the checkout can answer exactly.
+//
+// The reader is the other half, and it is what makes the silence a claim rather
+// than an omission: for CapSearchText alone it does NOT worst-case — the top
+// layer of a view's stack decides, and silence at the top is read as a denial
+// (graphview/materialize.go, Materializer.completeness). So a silent layer is
+// harmless under a working-tree layer that claims the capability, and decisive
+// when it IS the top.
 
-// dedicatedBaseGenerationKind is the kind a dedicated graph's own base
-// generation carries. It is spelled as a literal by the builders that write it
-// (builder_dedicated_claimed.go, builder_dedicated_delta.go), and spelled the
-// same way here so a rename that misses one of them shows up as a failure
+// The identity a dedicated graph's own base generation is minted under. Both
+// halves are spelled as literals by the builders that write it
+// (builder_dedicated_claimed.go:90, builder_dedicated_delta.go:98), and spelled
+// the same way here so a rename that misses one of them shows up as a failure
 // rather than as a silently different classification.
-const dedicatedBaseGenerationKind = "dedicated"
+const (
+	dedicatedBaseGenerationKind = "dedicated"
+	dedicatedBaseOwnerKind      = "dedicated_graph"
+)
+
+// TestBuilderIdentityLiteralsMatchTheBuilders keeps the fixtures above honest
+// about the identity production actually mints. checkoutLayerOwnerKind is not
+// a second owner kind beside the dedicated graph's — it IS "dedicated_graph"
+// (checkout_coordinator.go:81) — so a test that spells a dedicated base with it
+// is exercising the production identity and not a lookalike. If that ever stops
+// being true, every classification test in this file is reading a shape no
+// builder writes, and this is where it says so.
+func TestBuilderIdentityLiteralsMatchTheBuilders(t *testing.T) {
+	if checkoutLayerOwnerKind != dedicatedBaseOwnerKind {
+		t.Fatalf("checkoutLayerOwnerKind = %q, want %q: the fixtures below spell a "+
+			"dedicated base with checkoutLayerOwnerKind and would stop being the "+
+			"identity builder_dedicated_claimed.go mints",
+			checkoutLayerOwnerKind, dedicatedBaseOwnerKind)
+	}
+	if refViewOwnerKind == dedicatedBaseOwnerKind {
+		t.Fatalf("refViewOwnerKind = %q collides with the dedicated graph's owner kind; "+
+			"textSearchProducer classifies by exactly that difference", refViewOwnerKind)
+	}
+	if DirtyLayerGenerationKind == dedicatedBaseGenerationKind ||
+		CommitLayerGenerationKind == dedicatedBaseGenerationKind {
+		t.Fatalf("the generation kinds collide: dirty=%q commit=%q dedicated=%q",
+			DirtyLayerGenerationKind, CommitLayerGenerationKind, dedicatedBaseGenerationKind)
+	}
+}
 
 // TestTextSearchProducerIsDeclaredPerIdentityKind pins what every identity kind
 // a build can carry declares, including one outside the vocabulary.
@@ -59,7 +94,7 @@ func TestTextSearchProducerIsDeclaredPerIdentityKind(t *testing.T) {
 		{
 			name: "dedicated base answers for no working copy of its own",
 			identity: GenerationIdentity{
-				OwnerKind:      checkoutLayerOwnerKind,
+				OwnerKind:      dedicatedBaseOwnerKind,
 				GenerationKind: dedicatedBaseGenerationKind,
 				CheckoutID:     "checkout-primary",
 				TreeOID:        strings.Repeat("b", 40),
@@ -134,21 +169,63 @@ func TestTextSearchProducerIsDeclaredPerIdentityKind(t *testing.T) {
 // get to say the capability is whole. A committed tree is not what the checkout
 // root holds the moment the root is edited, and the root is what a search reads.
 func TestCommittedIdentityNeverClaimsCompleteTextSearch(t *testing.T) {
-	committed := []GenerationIdentity{
-		{OwnerKind: checkoutLayerOwnerKind, GenerationKind: CommitLayerGenerationKind},
-		{OwnerKind: checkoutLayerOwnerKind, GenerationKind: dedicatedBaseGenerationKind},
-		{OwnerKind: checkoutLayerOwnerKind, GenerationKind: "something-new"},
-		{OwnerKind: refViewOwnerKind, GenerationKind: CommitLayerGenerationKind},
-		{OwnerKind: refViewOwnerKind, GenerationKind: DirtyLayerGenerationKind},
+	// Every row carries force, in one of the two directions. A committed layer
+	// of a checkout's own stack must stay silent AND must not classify itself
+	// as serving — silence is only safe while the predicate behind it agrees,
+	// because the reader turns silence at the top of a stack into a denial. A
+	// ref view must do the opposite: it names a tree no checkout holds, so it
+	// has to WITHDRAW the capability explicitly rather than fall through to the
+	// silent default.
+	//
+	// Guarding every assertion on `declared`, as this test first did, left the
+	// three silent rows checking nothing at all and the two ref rows checking
+	// nothing if the withdrawal disappeared.
+	cases := []struct {
+		identity     GenerationIdentity
+		wantWithdraw bool
+	}{
+		{GenerationIdentity{OwnerKind: dedicatedBaseOwnerKind, GenerationKind: CommitLayerGenerationKind}, false},
+		{GenerationIdentity{OwnerKind: dedicatedBaseOwnerKind, GenerationKind: dedicatedBaseGenerationKind}, false},
+		{GenerationIdentity{OwnerKind: dedicatedBaseOwnerKind, GenerationKind: "something-new"}, false},
+		{GenerationIdentity{OwnerKind: refViewOwnerKind, GenerationKind: CommitLayerGenerationKind}, true},
+		{GenerationIdentity{OwnerKind: refViewOwnerKind, GenerationKind: DirtyLayerGenerationKind}, true},
 	}
-	for _, identity := range committed {
+	for _, tc := range cases {
+		identity := tc.identity
 		row, declared := textSearchProducer(identity)
-		if declared && row.State == store_sqlite.ProducerStateComplete {
+		if !tc.wantWithdraw {
+			if declared {
+				t.Errorf("%s/%s declared %+v; a layer beneath a working copy stays silent",
+					identity.OwnerKind, identity.GenerationKind, row)
+			}
+			if servesTextSearch(identity) {
+				t.Errorf("%s/%s declares nothing yet classifies itself as serving text "+
+					"search; the reader reads silence at the top of a stack as a denial, "+
+					"so a layer that serves the capability has to say so",
+					identity.OwnerKind, identity.GenerationKind)
+			}
+			continue
+		}
+		if !declared {
+			t.Errorf("%s/%s declared nothing; a tree no checkout holds has to withdraw "+
+				"%s rather than fall through to the silent default",
+				identity.OwnerKind, identity.GenerationKind, graphview.CapSearchText)
+			continue
+		}
+		if row.Producer != string(graphview.CapSearchText) {
+			t.Errorf("%s/%s declared producer %q, want %q",
+				identity.OwnerKind, identity.GenerationKind, row.Producer, graphview.CapSearchText)
+		}
+		if row.State == store_sqlite.ProducerStateComplete {
 			t.Errorf("%s/%s claims complete text search",
 				identity.OwnerKind, identity.GenerationKind)
 		}
-		if declared && row.Reason == "" {
+		if row.Reason == "" {
 			t.Errorf("%s/%s narrows the capability without saying why",
+				identity.OwnerKind, identity.GenerationKind)
+		}
+		if servesTextSearch(identity) {
+			t.Errorf("%s/%s withdraws the capability and still classifies itself as serving it",
 				identity.OwnerKind, identity.GenerationKind)
 		}
 	}
@@ -157,16 +234,18 @@ func TestCommittedIdentityNeverClaimsCompleteTextSearch(t *testing.T) {
 // TestCommittedCheckoutLayerNarrowsNothing is the other half, and it is the one
 // that keeps a live routed search answerable.
 //
-// A view's completeness is the WORST state any generation in its stack declares
-// (graphview.Materializer.completeness), and a checkout view stacks the commit
-// layer, the working-tree layer and the whole ancestry beneath them. A layer
-// under the working-tree layer that declared anything but complete would narrow
-// every routed view built on it — so it declares nothing, and any state at all
-// on one of those identities is a regression.
+// A checkout view stacks the commit layer, the working-tree layer and the whole
+// ancestry beneath them. For CapSearchText the reader reads the top layer alone
+// — so a commit layer under a working-tree layer is not consulted, and it must
+// not become consulted by acquiring a declaration: the moment it declares
+// anything, a stack whose commit layer is the top (a withdrawn working-tree
+// slot, a dedicated base with nothing over it) inherits that declaration
+// instead of the denial its silence earns. Any state at all on one of these
+// identities is a regression.
 func TestCommittedCheckoutLayerNarrowsNothing(t *testing.T) {
 	beneathTheWorkingCopy := []GenerationIdentity{
-		{OwnerKind: checkoutLayerOwnerKind, GenerationKind: CommitLayerGenerationKind},
-		{OwnerKind: checkoutLayerOwnerKind, GenerationKind: dedicatedBaseGenerationKind},
+		{OwnerKind: dedicatedBaseOwnerKind, GenerationKind: CommitLayerGenerationKind},
+		{OwnerKind: dedicatedBaseOwnerKind, GenerationKind: dedicatedBaseGenerationKind},
 	}
 	for _, identity := range beneathTheWorkingCopy {
 		row, declared := textSearchProducer(identity)

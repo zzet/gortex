@@ -310,10 +310,15 @@ func baseCorpusCompleteness() graphview.Completeness {
 // lane (see baseGraphReader.keepEdges), which is what "may be missing results"
 // names here.
 //
-// Text search is unavailable because the trigram searchers are built per
-// checkout over bytes on disk and fan out over every tracked repository;
-// answering a graph-scoped request from the canonical checkouts of all of them
-// is what the narrowing exists to stop.
+// Text search is NOT withdrawn, and it was. The trigram searchers are built
+// per repository over its canonical checkout's bytes and fan out over every
+// tracked one — answering a graph-scoped request out of all of them is what
+// the narrowing exists to stop — but the fan-out takes a repository allow-set,
+// so there is an exact narrowing to take instead of a capability to withdraw
+// (view_search_text.go, searchTextInNarrowedBase). Pinned to this graph's own
+// prefix, the answer is the repository's own canonical checkout, which is the
+// same tree its rows in the corpus were indexed from. Declaring it unavailable
+// refused a search this view answers precisely.
 //
 // The five language-server capabilities are downgraded rather than asserted.
 // A base graph carries no producer rows to read an LSP state off — that is the
@@ -327,7 +332,6 @@ func baseCorpusCompleteness() graphview.Completeness {
 func baseGraphCompleteness() graphview.Completeness {
 	out := baseCorpusCompleteness()
 	out[graphview.CapResolutionCrossRepo] = graphview.StateIncomplete
-	out[graphview.CapSearchText] = graphview.StateUnavailable
 	for _, id := range lspCapabilities() {
 		out[id] = graphview.StateIncomplete
 	}

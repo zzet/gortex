@@ -37,7 +37,15 @@ func (s *Server) searchTextInView(
 	limit int,
 ) ([]trigram.Match, *mcp.CallToolResult) {
 	if err := view.completeness().Evaluate([]graphview.CapabilityID{graphview.CapSearchText}, nil); err != nil {
-		return nil, mcp.NewToolResultError("search_text: " + err.Error())
+		// The evaluation names the capability and the state it is in; on its
+		// own that says a view cannot be searched without saying what about
+		// the view makes it unsearchable. The rider carries the same state,
+		// so the reason is what a caller has that it did not have before.
+		return nil, mcp.NewToolResultError(fmt.Sprintf(
+			"search_text: %s: %s", err.Error(), textSearchRefusalReason(view)))
+	}
+	if view.baseNarrowed {
+		return s.searchTextInNarrowedBase(view, query, useRegexp, limit)
 	}
 	if view.viewRoot == "" {
 		return nil, viewTextUnavailable(view, "it reads a committed tree no working copy holds")
@@ -65,6 +73,86 @@ func (s *Server) searchTextInView(
 		return nil, viewTextUnavailable(view, "nothing indexes its working copy for text search")
 	}
 	return stampRepoPrefix(matches, viewRepoPrefix(view)), nil
+}
+
+// searchTextInNarrowedBase answers a labelled base selector's text search out
+// of the one repository its graph owns.
+//
+// A base selector is not a route to a checkout: it is the indexed corpus with
+// a predicate on it, and the corpus for that repository was built from the
+// repository's own canonical checkout — which is exactly the root the
+// per-repository trigram searcher indexes. So the narrowing has an exact
+// expression here, `RepoAllow = {the graph's prefix}`, and taking it is what
+// stops this lane from being the one place a base selector answers about
+// every tracked repository at once. Withdrawing the capability instead would
+// refuse a search the view can answer precisely; fanning out unnarrowed is
+// the cross-repository answer the narrowing exists to stop. This is neither.
+//
+// The match paths come back already stamped with the repository prefix
+// (MultiIndexer.GrepTextForRepos does it), which is the spelling every other
+// search_text lane and every graph node uses, so nothing restamps them.
+func (s *Server) searchTextInNarrowedBase(
+	view *requestView,
+	query string,
+	useRegexp bool,
+	limit int,
+) ([]trigram.Match, *mcp.CallToolResult) {
+	prefix := baseNarrowedRepoPrefix(view)
+	if prefix == "" || s.multiIndexer == nil {
+		// Nothing to narrow with. Falling through to the unnarrowed searchers
+		// is the one answer this lane must never give, so it refuses instead.
+		return nil, viewTextUnavailable(view,
+			"no per-repository searcher is narrowed to the graph it names")
+	}
+	allow := map[string]bool{prefix: true}
+	if useRegexp {
+		matches, err := s.multiIndexer.GrepRegexpForRepos(query, "", allow, limit)
+		if err != nil {
+			return nil, mcp.NewToolResultError("search_text: invalid regexp: " + err.Error())
+		}
+		return matches, nil
+	}
+	return s.multiIndexer.GrepTextForRepos(query, allow, limit), nil
+}
+
+// scopedRepoPrefix names the repository a base-narrowed reader filters the
+// corpus down to. baseGraphContentReader embeds this type, so both shapes
+// newBaseGraphReader returns answer it.
+func (r *baseGraphReader) scopedRepoPrefix() string {
+	if r == nil {
+		return ""
+	}
+	return r.repoPrefix
+}
+
+// baseNarrowedRepoPrefix reads that prefix off the view, and answers "" for
+// every view that is not a base narrowing — which is what keeps the routed
+// checkout lane out of the arm above.
+func baseNarrowedRepoPrefix(view *requestView) string {
+	if view == nil || !view.baseNarrowed || view.reader == nil {
+		return ""
+	}
+	scoped, ok := view.reader.(interface{ scopedRepoPrefix() string })
+	if !ok {
+		return ""
+	}
+	return scoped.scopedRepoPrefix()
+}
+
+// textSearchRefusalReason says what about this view's shape stops a text
+// search, in the vocabulary the view itself is described in.
+func textSearchRefusalReason(view *requestView) string {
+	switch {
+	case view == nil:
+		return "no view answers this request"
+	case view.baseNarrowed:
+		return "a base graph binds no working copy to search"
+	case view.viewRoot == "":
+		return "it reads a committed tree no working copy holds"
+	default:
+		return "the top layer of its stack is a committed tree, so the working copy " +
+			"at its root is not the snapshot it reads"
+	}
 }
 
 // viewTextUnavailable is the typed refusal a view that cannot be text-searched

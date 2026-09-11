@@ -810,27 +810,75 @@ func dirtyLayerRef(row store_sqlite.ViewGeneration) (LayerRef, error) {
 // than recorded: producer names are a build-side vocabulary and the ones
 // that do not correspond to something a caller can require are build
 // stages, not answers a view offers.
+//
+// CapSearchText is the one capability the union is the wrong rule for.
+// generations is bottom first — assemble opens the ancestry in order and
+// appends the routed layers last — so the final handle is the view's top
+// layer, and for text search that top layer's declaration is the whole
+// answer:
+//
+// Text search is not answered out of the generations at all. A trigram index
+// is built from bytes on a checkout root (indexer/checkout_text_search.go,
+// trigram.Build(c.root, paths)), so what decides whether a search over that
+// root describes this view is whether the view's TOP layer is the working
+// copy the root holds. A working-tree layer is those bytes by construction; a
+// commit layer, a dedicated base and a ref-view generation each name a
+// committed tree that the root is free to have moved on from.
+//
+// Both halves of the union are wrong here, in opposite directions:
+//
+//   - Worst-casing would let a layer BELOW the working-tree layer withdraw a
+//     capability the live checkout answers exactly. That is why the producers
+//     under a working copy declare nothing at all (indexer/builder_generation.go,
+//     textSearchProducer) — and it is also why silence cannot be read as
+//     "inherited" here.
+//   - Seeding every capability at StateComplete and only ever worsting means a
+//     stack whose every layer stays silent contributes Complete. A directly
+//     selected committed identity — a ref view, a dedicated base with no dirty
+//     layer over it, a checkout whose working-tree slot is withdrawn — would
+//     then claim whole text search while the only searcher that could answer
+//     runs over a root that is not that snapshot.
+//
+// So the top layer's declaration is authoritative, and its silence is a
+// denial rather than an inheritance: StateUnavailable, which is what
+// Completeness.State already reports for a capability nothing declared.
 func (m *Materializer) completeness(generations []*store_sqlite.Store) (Completeness, error) {
 	known := KnownCapabilities()
 	out := make(Completeness, len(known))
 	for _, id := range known {
 		out[id] = StateComplete
 	}
-	for _, handle := range generations {
+	topText := StateUnavailable
+	for index, handle := range generations {
 		rows, err := handle.ProducerStates()
 		if err != nil {
 			return nil, WrapViewError(CodeCheckoutInaccessible,
 				fmt.Sprintf("read producer states of generation %d", handle.ViewGeneration()), err)
 		}
+		top := index == len(generations)-1
 		for _, row := range rows {
 			id := CapabilityID(row.Producer)
 			state := capabilityStateOf(row.State)
 			if !id.Valid() || !state.Valid() {
 				continue
 			}
+			if id == CapSearchText {
+				if top {
+					topText = state
+				}
+				continue
+			}
 			out[id] = out[id].worst(state)
 		}
 	}
+	// Unconditional, deliberately. An empty stack has no top layer to read a
+	// declaration off, and "no layer declared it" is exactly the denial this
+	// rule exists to report — letting the seeded StateComplete stand there
+	// would reinstate the false positive at the one moment there is not even a
+	// generation to blame for it. generationAncestry refuses an empty
+	// generation list before this is reached today, so the invariant costs
+	// nothing; it also stops depending on that distant precondition.
+	out[CapSearchText] = topText
 	return out, nil
 }
 

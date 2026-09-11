@@ -517,8 +517,14 @@ func TestMaterializeCheckoutCompletenessRunsBottomUp(t *testing.T) {
 	if got := view.Completeness.State(CapResolutionCrossRepo); got != StateIncomplete {
 		t.Errorf("%s = %q, want %q", CapResolutionCrossRepo, got, StateIncomplete)
 	}
+	// Text search is not part of the union and is not inherited: no layer of
+	// this stack claims it, so the top layer's silence withdraws it. See
+	// TestCheckoutCompletenessReadsTextSearchOffTheTopLayer.
+	if got := view.Completeness.State(CapSearchText); got != StateUnavailable {
+		t.Errorf("%s = %q, want %q", CapSearchText, got, StateUnavailable)
+	}
 	for _, id := range KnownCapabilities() {
-		if id == CapResolutionCrossRepo {
+		if id == CapResolutionCrossRepo || id == CapSearchText {
 			continue
 		}
 		if got := view.Completeness.State(id); got != StateComplete {
@@ -964,5 +970,231 @@ func TestMaterializeBaseCorpusLeaseIsWaitable(t *testing.T) {
 	view.Close()
 	if err := materializer.Leases.WaitDrain(ctx, BaseCorpusGeneration); err != nil {
 		t.Fatalf("WaitDrain(base) after Close: %v", err)
+	}
+}
+
+// --- text search is read off the top layer -------------------------------
+
+// textRow is one CapSearchText declaration a generation writes.
+func textRow(state store_sqlite.ProducerState, reason string) store_sqlite.ProducerCompleteness {
+	return store_sqlite.ProducerCompleteness{
+		Producer: string(CapSearchText), State: state, Reason: reason,
+	}
+}
+
+// TestCheckoutCompletenessReadsTextSearchOffTheTopLayer is the reader half of
+// D5, and it is the half that makes the producers' declaration mean anything.
+//
+// The union seeds every capability at StateComplete and only ever worsts, so a
+// stack whose every layer stays silent about text search contributed Complete —
+// which is what a directly selected committed identity is. The producers were
+// made truthful (indexer/builder_generation.go, textSearchProducer: a
+// working-tree layer claims the capability, a ref view withdraws it, every
+// committed layer declares nothing) and the reader threw that away.
+//
+// So for this one capability the TOP layer decides, and silence at the top is a
+// denial. The rows below prove both directions: a committed top stops claiming
+// a search it cannot answer, and a claim on a layer BELOW the top cannot put
+// the claim back — nor can a withdrawal below the top take a live routed
+// checkout's answer away.
+func TestCheckoutCompletenessReadsTextSearchOffTheTopLayer(t *testing.T) {
+	cases := []struct {
+		name   string
+		commit []store_sqlite.ProducerCompleteness
+		dirty  []store_sqlite.ProducerCompleteness
+		routed bool // route the working-tree slot as well as the commit slot
+		want   CapabilityState
+	}{
+		{
+			name:   "a routed working copy claims it and keeps it",
+			commit: nil,
+			dirty:  []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			routed: true,
+			want:   StateComplete,
+		},
+		{
+			name:   "a withdrawal below the working copy does not reach the top",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy")},
+			dirty:  []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			routed: true,
+			want:   StateComplete,
+		},
+		{
+			name:   "a silent working copy is not vouched for",
+			commit: nil,
+			dirty:  nil,
+			routed: true,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a claim below a silent top does not reach the top",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			dirty:  nil,
+			routed: true,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a committed top claims nothing",
+			commit: nil,
+			dirty:  nil,
+			routed: false,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a committed top that withdraws is honoured",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy")},
+			dirty:  nil,
+			routed: false,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a committed top that claims is honoured too",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			dirty:  nil,
+			routed: false,
+			want:   StateComplete,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStackStore(t, "top-layer-text")
+			seedStackControlPlane(t, store)
+			commit := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000, tc.commit...)
+			dirty := writeProducerGeneration(t, store, "dirty", stackDirtyLayerID, commit, 3000, tc.dirty...)
+			routedDirty := int64(0)
+			if tc.routed {
+				routedDirty = dirty
+			}
+			routeStack(t, store, commit, routedDirty, store_sqlite.RouteActive)
+
+			view, err := newTestMaterializer(store).MaterializeCheckout(context.Background(), testCheckoutID)
+			if err != nil {
+				t.Fatalf("MaterializeCheckout: %v", err)
+			}
+			defer view.Close()
+
+			if got := view.Completeness.State(CapSearchText); got != tc.want {
+				t.Fatalf("%s = %q, want %q", CapSearchText, got, tc.want)
+			}
+			err = view.Completeness.Evaluate([]CapabilityID{CapSearchText}, nil)
+			switch tc.want {
+			case StateComplete:
+				if err != nil {
+					t.Fatalf("a view that serves %s refused it: %v", CapSearchText, err)
+				}
+			default:
+				if code := CodeOf(err); code != CodeCapabilityUnavailable {
+					t.Fatalf("Evaluate(%s) = %v, want %s", CapSearchText, err, CodeCapabilityUnavailable)
+				}
+			}
+		})
+	}
+}
+
+// TestTopLayerRuleAppliesToTextSearchAlone keeps the change from becoming a
+// rewrite of the union. Every other capability is still worst-cased over the
+// whole stack, so a commit layer that narrowed one still narrows the view —
+// which is what TestMaterializeCheckoutCompletenessTakesTheWorstState is
+// about, asserted here in the same fixture that exercises the text-search
+// exception so the two rules are visibly different rules.
+func TestTopLayerRuleAppliesToTextSearchAlone(t *testing.T) {
+	store := openStackStore(t, "one-capability-only")
+	seedStackControlPlane(t, store)
+	commit := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000,
+		store_sqlite.ProducerCompleteness{
+			Producer: string(CapIncomingEdges),
+			State:    store_sqlite.ProducerStateIncomplete,
+			Reason:   "the commit closure stopped at the file budget",
+		},
+		textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy"))
+	dirty := writeProducerGeneration(t, store, "dirty", stackDirtyLayerID, commit, 3000,
+		store_sqlite.ProducerCompleteness{
+			Producer: string(CapIncomingEdges),
+			State:    store_sqlite.ProducerStateComplete,
+		},
+		textRow(store_sqlite.ProducerStateComplete, ""))
+	routeStack(t, store, commit, dirty, store_sqlite.RouteActive)
+
+	view, err := newTestMaterializer(store).MaterializeCheckout(context.Background(), testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	defer view.Close()
+
+	if got := view.Completeness.State(CapIncomingEdges); got != StateIncomplete {
+		t.Errorf("%s = %q, want %q — the union still worst-cases", CapIncomingEdges, got, StateIncomplete)
+	}
+	if got := view.Completeness.State(CapSearchText); got != StateComplete {
+		t.Errorf("%s = %q, want %q — the top layer decides", CapSearchText, got, StateComplete)
+	}
+}
+
+// TestRefViewCompletenessNeverClaimsTextSearch is the same rule read through
+// the other materialization path. A ref view names a tree no checkout holds,
+// so whether its generation withdrew the capability explicitly or said nothing
+// at all, the view must not claim it.
+func TestRefViewCompletenessNeverClaimsTextSearch(t *testing.T) {
+	cases := []struct {
+		name string
+		rows []store_sqlite.ProducerCompleteness
+	}{
+		{"the generation withdrew it", []store_sqlite.ProducerCompleteness{
+			textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy to run a text search over"),
+		}},
+		{"the generation said nothing", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStackStore(t, "refview-text")
+			seedStackControlPlane(t, store)
+			generation := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000, tc.rows...)
+
+			view, err := newTestMaterializer(store).MaterializeRefView(context.Background(), testGraphID, generation)
+			if err != nil {
+				t.Fatalf("MaterializeRefView: %v", err)
+			}
+			defer view.Close()
+
+			if got := view.Completeness.State(CapSearchText); got != StateUnavailable {
+				t.Fatalf("%s = %q, want %q", CapSearchText, got, StateUnavailable)
+			}
+			// The withdrawal is about text search and nothing else: a ref view
+			// still serves the graph it was built for.
+			if err := view.Completeness.Evaluate([]CapabilityID{CapSyntaxGraph}, nil); err != nil {
+				t.Errorf("a ref view refused %s as well: %v", CapSyntaxGraph, err)
+			}
+		})
+	}
+}
+
+// TestCompletenessOfAnEmptyStackDeniesTextSearch pins the one row of the
+// top-layer rule that has no layer to read.
+//
+// completeness seeds every known capability at StateComplete and then worsts;
+// for CapSearchText it overwrites that seed with the top layer's declaration
+// instead. When the handle slice is empty there is no top layer, and the
+// honest answer is the denial the rule exists to report — not the seed, which
+// is precisely the false positive it removes. The assignment is therefore
+// unconditional rather than guarded by len(generations) > 0, so this invariant
+// does not depend on generationAncestry happening to refuse an empty list
+// upstream.
+func TestCompletenessOfAnEmptyStackDeniesTextSearch(t *testing.T) {
+	completeness, err := (&Materializer{}).completeness(nil)
+	if err != nil {
+		t.Fatalf("completeness(nil): %v", err)
+	}
+	if got := completeness.State(CapSearchText); got != StateUnavailable {
+		t.Fatalf("an empty stack reports %s = %q, want %q", CapSearchText, got, StateUnavailable)
+	}
+	// And the denial is scoped to the one capability the rule governs: every
+	// other capability still reads off the seed, which is what keeps a stack
+	// that declares nothing from being refused wholesale.
+	for _, id := range KnownCapabilities() {
+		if id == CapSearchText {
+			continue
+		}
+		if got := completeness.State(id); got != StateComplete {
+			t.Errorf("an empty stack reports %s = %q, want %q", id, got, StateComplete)
+		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -218,10 +219,12 @@ func TestBaseGraphReaderNarrowsEveryLane(t *testing.T) {
 // defect: the selector used to be exempt from the capability contract
 // entirely, so a caller could require anything of it and be told nothing.
 //
-// Narrowing has two prices and the view states both. Cross-repository
-// resolution is incomplete because the repositories those references reach
-// into are exactly what the view removed; text search is unavailable because
-// a base graph binds no working copy for this request to search.
+// Narrowing has a price and the view states it: cross-repository resolution is
+// incomplete because the repositories those references reach into are exactly
+// what the view removed. Text search is NOT one of the prices — the trigram
+// fan-out takes a repository allow-set, so the narrowing has an exact
+// expression there (view_search_text.go, searchTextInNarrowedBase) and the
+// capability is served rather than withdrawn.
 func TestBaseSelectorDeclaresWhatNarrowingCosts(t *testing.T) {
 	stack := newViewStack(t)
 
@@ -239,7 +242,11 @@ func TestBaseSelectorDeclaresWhatNarrowingCosts(t *testing.T) {
 		}
 	})
 
-	t.Run("a required text search is refused as unavailable", func(t *testing.T) {
+	// Text search used to be declared unavailable here, which refused a search
+	// the view can narrow exactly. The declaration and the handler now agree
+	// that it is served; TestBaseSelectorTextSearchNarrowsToItsOwnRepository is
+	// the proof that the answer really is narrowed.
+	t.Run("a required text search is served", func(t *testing.T) {
 		res, err := stack.callWithView(t, stack.repoRoot, "get_symbol",
 			baseSelectorArgs(stack.graphID, map[string]any{
 				requiredCapabilitiesArgName: string(graphview.CapSearchText),
@@ -247,7 +254,9 @@ func TestBaseSelectorDeclaresWhatNarrowingCosts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
-		assertToolError(t, res, graphview.CodeCapabilityUnavailable)
+		if res.IsError {
+			t.Fatalf("a base selector refused %s: %s", graphview.CapSearchText, viewResultText(t, res))
+		}
 	})
 
 	t.Run("an optional cross-repo resolution rides back as degraded", func(t *testing.T) {
@@ -285,19 +294,25 @@ func TestBaseSelectorDeclaresWhatNarrowingCosts(t *testing.T) {
 	})
 }
 
-// TestBaseSelectorTextSearchRefusesInsteadOfAnsweringFromDisk takes the same
+// TestBaseSelectorTextSearchAnswersFromItsOwnRepositoryOnly takes the same
 // claim through the real handler.
 //
 // Before the narrowing, search_text under a base selector fell through to the
-// canonical searchers — bytes on disk in whatever state the tracked checkouts
-// are in — while the rider said exact, graph_id:X. The control is what makes
-// the refusal meaningful: those searchers do hold the query, so a refusal is a
-// refusal to answer and not an empty corpus.
-func TestBaseSelectorTextSearchRefusesInsteadOfAnsweringFromDisk(t *testing.T) {
+// canonical searchers — every tracked repository at once — while the rider said
+// exact, graph_id:X. The first fix withdrew the capability, which refused a
+// search the selector can answer precisely; this one pins the allow-set to the
+// selector's own repository instead, so the answer is the view's and nobody
+// else's. The sibling repository holds the query too, which is what makes the
+// absence below a narrowing rather than an empty corpus.
+func TestBaseSelectorTextSearchAnswersFromItsOwnRepositoryOnly(t *testing.T) {
 	stack := newViewStack(t)
-	const query = "Keeper"
+	const query = "func "
 
-	plain, err := stack.callHandler(t, stack.repoRoot, "search_text",
+	// The session narrows by workspace, and the two fixture repositories are in
+	// different ones, so both calls run from the directory above both: there the
+	// session narrows nothing and the view selector is the only difference.
+	wide := filepath.Dir(stack.repoRoot)
+	plain, err := stack.callHandler(t, wide, "search_text",
 		map[string]any{"query": query}, stack.srv.handleSearchText)
 	if err != nil {
 		t.Fatalf("search the canonical checkouts: %v", err)
@@ -305,18 +320,25 @@ func TestBaseSelectorTextSearchRefusesInsteadOfAnsweringFromDisk(t *testing.T) {
 	if plain.IsError {
 		t.Fatalf("the canonical search failed: %s", viewResultText(t, plain))
 	}
-	if paths := searchTextMatchPaths(t, plain); len(paths) == 0 {
-		t.Fatalf("the canonical searchers hold no match, so a refusal proves nothing: %s", viewResultText(t, plain))
+	whole := searchTextMatchPaths(t, plain)
+	if !containsPathIn(whole, baseSelectorForeignRepo+"/") {
+		t.Fatalf("the canonical search answered %v, which holds nothing of %s", whole, baseSelectorForeignRepo)
 	}
 
-	res, err := stack.callHandler(t, stack.repoRoot, "search_text",
+	res, err := stack.callHandler(t, wide, "search_text",
 		baseSelectorArgs(stack.graphID, map[string]any{"query": query}), stack.srv.handleSearchText)
 	if err != nil {
 		t.Fatalf("search under the base selector: %v", err)
 	}
-	assertToolError(t, res, graphview.CodeCapabilityUnavailable)
-	if text := viewResultText(t, res); !strings.Contains(text, string(graphview.CapSearchText)) {
-		t.Errorf("the refusal does not name the capability:\n%s", text)
+	if res.IsError {
+		t.Fatalf("the base selector refused a search it can narrow: %s", viewResultText(t, res))
+	}
+	scoped := searchTextMatchPaths(t, res)
+	if len(scoped) == 0 {
+		t.Fatalf("the base selector answered nothing: %s", viewResultText(t, res))
+	}
+	if containsPathIn(scoped, baseSelectorForeignRepo+"/") {
+		t.Errorf("a base view of %s answered out of %s: %v", stack.graphID, baseSelectorForeignRepo, scoped)
 	}
 }
 
