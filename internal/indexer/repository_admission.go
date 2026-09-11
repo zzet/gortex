@@ -21,6 +21,11 @@ func (l *CheckoutLifecycle) SetDedicatedBaseCleanupRuntime(runtime DedicatedBase
 	if l == nil {
 		return graphview.ErrRepositoryOwnerUnknown
 	}
+	// A nil installation is never "install nothing later": it would consume the
+	// one pre-owner window and leave the publisher half silently unowned.
+	if runtime == nil {
+		return fmt.Errorf("indexer: publisher cleanup runtime must not be nil")
+	}
 	l.repositoryAdmissionMu.Lock()
 	defer l.repositoryAdmissionMu.Unlock()
 	if l.repositoryAdmissionsClosed {
@@ -31,6 +36,18 @@ func (l *CheckoutLifecycle) SetDedicatedBaseCleanupRuntime(runtime DedicatedBase
 	}
 	l.dedicatedBaseCleanupRuntime = runtime
 	return nil
+}
+
+// DedicatedBasePublisherRuntime reports the installed shared publisher runtime,
+// nil while none is installed. It is a read of the installation seam, not an
+// installation: owners are still registered through RegisterRepositoryOwner.
+func (l *CheckoutLifecycle) DedicatedBasePublisherRuntime() DedicatedBaseCleanupRuntime {
+	if l == nil {
+		return nil
+	}
+	l.repositoryAdmissionMu.Lock()
+	defer l.repositoryAdmissionMu.Unlock()
+	return l.dedicatedBaseCleanupRuntime
 }
 
 var repositoryAlreadyDrained = func() <-chan struct{} { done := make(chan struct{}); close(done); return done }()

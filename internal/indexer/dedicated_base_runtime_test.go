@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 func dedicatedRuntimeFixture(t testing.TB) (*dedicatedBaseRuntime, *dedicatedBasePublisher, dedicatedBaseObservation, dedicatedBuilderFixtureRequest) {
@@ -589,4 +590,35 @@ func BenchmarkDedicatedBaseRuntimeGate(b *testing.B) {
 			}
 		})
 	})
+}
+
+// TestNewDedicatedBaseRuntimeRequiresStoreAndSharedLeases pins the two inputs
+// the process-wide runtime cannot default. A nil store cannot acquire
+// authority, and a substituted lease manager would make every advancement
+// invisible to the retirement sweep while ensureObserved's nil-lease branch
+// degrades the publication to a full root.
+func TestNewDedicatedBaseRuntimeRequiresStoreAndSharedLeases(t *testing.T) {
+	builder, _, _ := privateDedicatedBuilderFixture(t)
+	leases := graphview.NewLeaseManager()
+
+	if _, err := NewDedicatedBaseRuntime(nil, leases); !errors.Is(err, errDedicatedBaseRuntimeInput) {
+		t.Fatalf("runtime without a store = %v, want %v", err, errDedicatedBaseRuntimeInput)
+	}
+	if _, err := NewDedicatedBaseRuntime(builder.Store, nil); !errors.Is(err, errDedicatedBaseRuntimeInput) {
+		t.Fatalf("runtime without shared leases = %v, want %v", err, errDedicatedBaseRuntimeInput)
+	}
+
+	runtime, err := NewDedicatedBaseRuntime(builder.Store, leases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.store != builder.Store {
+		t.Fatal("the runtime did not keep the store it was built over")
+	}
+	if runtime.ViewLeases() != leases {
+		t.Fatal("the runtime did not keep the shared lease domain it was built with")
+	}
+	// It is the value the lifecycle installs, so it must satisfy the seam's
+	// interface without an adapter.
+	var _ DedicatedBaseCleanupRuntime = runtime
 }

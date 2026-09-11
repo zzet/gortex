@@ -34,7 +34,14 @@ func (e *dedicatedBaseAdvanceRequiredError) Unwrap() error { return errDedicated
 // observation callers. It retains no observed config, builder or content source.
 // Startup must call it directly, not through a gate that startup itself opens.
 type dedicatedBaseRuntime struct {
-	store                *store_sqlite.Store
+	store *store_sqlite.Store
+	// leases is the SHARED view-lease domain — the lifecycle's own manager,
+	// the one request readers and retirement already agree on. It is held so
+	// advancement triggers cannot invent a private one: ensureCurrent refuses a
+	// nil manager outright (dedicated_base_advance.go), and a runtime-local
+	// manager would leave every advance invisible to retirement while
+	// ensureObserved's nil-lease branch degrades it to a full root.
+	leases               *graphview.LeaseManager
 	mu                   sync.Mutex
 	gates                map[string]*dedicatedBaseObservationGate
 	ownerAdmissions      map[string]*dedicatedBaseOwnerAdmission
@@ -42,6 +49,40 @@ type dedicatedBaseRuntime struct {
 	admissionClosed      bool
 	admissionDrain       chan struct{}
 	admissionDrainClosed bool
+}
+
+// DedicatedBaseRuntime is the process-wide handle on that runtime: the single
+// publisher owner a server stack constructs once, over the store it opened and
+// the lease manager its lifecycle already shares with request readers and
+// retirement. It is what CheckoutLifecycle.SetDedicatedBaseCleanupRuntime
+// installs, and the same value every later publication trigger must reach —
+// never a per-trigger or per-build value.
+type DedicatedBaseRuntime struct {
+	*dedicatedBaseRuntime
+}
+
+// NewDedicatedBaseRuntime builds that one runtime. Both inputs are mandatory
+// and neither has a safe default: a nil store cannot acquire authority, and a
+// substituted lease manager silently degrades advancement (see the leases
+// field). Callers install the result before any owner can be registered —
+// SetDedicatedBaseCleanupRuntime refuses a late installation.
+func NewDedicatedBaseRuntime(store *store_sqlite.Store, leases *graphview.LeaseManager) (*DedicatedBaseRuntime, error) {
+	if store == nil {
+		return nil, fmt.Errorf("%w: publisher runtime requires the stack's store", errDedicatedBaseRuntimeInput)
+	}
+	if leases == nil {
+		return nil, fmt.Errorf("%w: publisher runtime requires the shared view leases", errDedicatedBaseRuntimeInput)
+	}
+	return &DedicatedBaseRuntime{dedicatedBaseRuntime: &dedicatedBaseRuntime{store: store, leases: leases}}, nil
+}
+
+// ViewLeases exposes the shared lease domain this runtime was installed with,
+// so a caller can prove it is the lifecycle's manager rather than a private one.
+func (r *DedicatedBaseRuntime) ViewLeases() *graphview.LeaseManager {
+	if r == nil || r.dedicatedBaseRuntime == nil {
+		return nil
+	}
+	return r.leases
 }
 
 type dedicatedBaseObservationGate struct {

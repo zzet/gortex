@@ -178,3 +178,40 @@ func TestLifecycleRepositoryShutdownRefusesRegistrationAndWaitsBroadReader(t *te
 	broad.Release()
 	<-done
 }
+
+// TestLifecycleRefusesNilPublisherRuntimeAndReportsTheInstalledOne pins the
+// installation seam a server stack writes through. Nil must not consume the one
+// pre-owner window (it would leave the publisher/drain half silently unowned),
+// and a caller must be able to read back the runtime it installed — that read
+// is how an entry point proves it installed before the first owner instead of
+// discovering the refusal later.
+func TestLifecycleRefusesNilPublisherRuntimeAndReportsTheInstalledOne(t *testing.T) {
+	lifecycle, identity := repositoryAdmissionFixture(t)
+	if got := lifecycle.DedicatedBasePublisherRuntime(); got != nil {
+		t.Fatalf("uninstalled lifecycle reports runtime %v", got)
+	}
+	if err := lifecycle.SetDedicatedBaseCleanupRuntime(nil); err == nil {
+		t.Fatal("a nil publisher runtime consumed the installation window")
+	}
+	if got := lifecycle.DedicatedBasePublisherRuntime(); got != nil {
+		t.Fatalf("refused nil installation still installed %v", got)
+	}
+	runtime := &repositoryAdmissionPublisher{}
+	if err := lifecycle.SetDedicatedBaseCleanupRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if got := lifecycle.DedicatedBasePublisherRuntime(); got != DedicatedBaseCleanupRuntime(runtime) {
+		t.Fatalf("installed runtime reads back as %v", got)
+	}
+	// The refusal after the first owner registration stays the seam's guard:
+	// an entry point installing late gets an error, not a second authority.
+	if err := lifecycle.RegisterRepositoryOwner(context.Background(), identity.GraphID); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.SetDedicatedBaseCleanupRuntime(&repositoryAdmissionPublisher{}); err == nil {
+		t.Fatal("a runtime installed after owner registration")
+	}
+	if got := lifecycle.DedicatedBasePublisherRuntime(); got != DedicatedBaseCleanupRuntime(runtime) {
+		t.Fatalf("late installation replaced the installed runtime with %v", got)
+	}
+}

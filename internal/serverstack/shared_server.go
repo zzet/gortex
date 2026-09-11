@@ -146,6 +146,12 @@ type SharedServer struct {
 	// this stack. Nil in single-repo standalone, where there is no
 	// multi-repo indexer to own a tracked set.
 	CheckoutLifecycle *indexer.CheckoutLifecycle
+	// DedicatedBaseRuntime is the process-wide dedicated-base publisher
+	// runtime this stack constructed and installed on the lifecycle before
+	// any owner could be registered. Every later publication trigger must
+	// use this one value. Nil in single-repo standalone and whenever the
+	// backend is not the sqlite store (nothing publishes there).
+	DedicatedBaseRuntime *indexer.DedicatedBaseRuntime
 	// StorePath is the graph store file this stack actually opened: the
 	// caller's BackendPath expanded to an absolute path, or the platform
 	// default when it was empty. Entry points publish it so out-of-band
@@ -634,6 +640,38 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			return nil, fmt.Errorf("build checkout lifecycle: %w", lerr)
 		}
 		s.CheckoutLifecycle = lifecycle
+		// The dedicated-base publisher runtime is installed here — after the
+		// lifecycle exists and before anything can register an owner. Both
+		// halves of that sentence are load-bearing:
+		//
+		//   - it belongs to the stack, not to `cmd/gortex/daemon.go`. The build
+		//     gate is installed from the daemon alone, so the one-shot embedded
+		//     server runs ungated; installing the publisher owner there would
+		//     repeat that asymmetry and leave the embedded path without an
+		//     authority for the publication it is equally able to reach.
+		//   - SetDedicatedBaseCleanupRuntime refuses installation once any owner
+		//     is registered, and Seed registers owners (via bindDedicatedGraph)
+		//     as soon as the daemon warms up — which is after the lifecycle
+		//     reaches the MCP server, the controller and the janitor below. The
+		//     one window that always precedes every owner is this one.
+		//
+		// It is handed the store this stack opened and the lifecycle's OWN lease
+		// manager: a private manager would make advancement invisible to the
+		// retirement sweep that uses the lifecycle's manager as its in-use
+		// predicate. Installing it does not publish anything; it only gives the
+		// publisher/drain half a live owner.
+		if store, ok := g.(*store_sqlite.Store); ok {
+			runtime, rerr := indexer.NewDedicatedBaseRuntime(store, lifecycle.ViewLeases())
+			if rerr != nil {
+				_ = s.Close()
+				return nil, fmt.Errorf("build dedicated base publisher runtime: %w", rerr)
+			}
+			if rerr := lifecycle.SetDedicatedBaseCleanupRuntime(runtime); rerr != nil {
+				_ = s.Close()
+				return nil, fmt.Errorf("install dedicated base publisher runtime: %w", rerr)
+			}
+			s.DedicatedBaseRuntime = runtime
+		}
 	}
 	// Appended after backendCleanup but before MCP background drain. LIFO
 	// teardown therefore drains background work first, then closes per-repo
