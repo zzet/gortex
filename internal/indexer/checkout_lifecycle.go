@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1903,11 +1905,34 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		return nil, nil
 	}
 
-	index := config.Default().Index
-	watch := config.Default().Watch
+	repoCfg := config.Default()
 	if l.cfgMgr != nil {
-		repoCfg := l.cfgMgr.GetRepoConfig(primary.RepoPrefix)
-		index, watch = repoCfg.Index, repoCfg.Watch
+		repoCfg = l.cfgMgr.GetRepoConfig(primary.RepoPrefix)
+	}
+	index, watch := repoCfg.Index, repoCfg.Watch
+	// GetRepoConfig hands back a SHALLOW result: its nested maps and slices —
+	// FrameworkSynthesizers above all, which is a pointer to a slice — are the
+	// ConfigManager's own values. A builder that kept them would be building
+	// under a configuration the next reload can change underneath it, and the
+	// generation identity it stamped would then name a configuration that is
+	// no longer what the payload was produced from.
+	//
+	// snapshotDedicatedBaseConfig deep-clones the whole struct and re-owns the
+	// synthesizer slice, so what goes into the builder and the coordinator is
+	// this coordinator's for its whole lifetime. Its fingerprint is the same
+	// value the coordinator derives for the identity's config hash.
+	frozen, _, err := snapshotDedicatedBaseConfig(
+		index, primary.RepoPrefix, idx.WorkspaceID(), idx.ProjectID())
+	if err != nil {
+		// The coordinator carries the unencodable-configuration fail-safe of
+		// its own (a unique digest, so nothing is reused); an unfrozen config
+		// would silently share the ConfigManager's values, which is the one
+		// outcome this call exists to prevent.
+		l.logger.Warn("checkout lifecycle: could not freeze the index configuration for a coordinator",
+			zap.String("checkout", checkout.CheckoutID),
+			zap.String("repo", primary.RepoPrefix), zap.Error(err))
+	} else {
+		index = frozen
 	}
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
 		CheckoutID:   checkout.CheckoutID,
@@ -1931,10 +1956,11 @@ func (l *CheckoutLifecycle) buildCoordinator(
 			// rather than one cap per coordinator.
 			Semantic: l.mi.semanticMgr,
 		},
-		Leases: l.leases,
-		Config: index,
-		Logger: l.logger,
-		Gate:   l.buildGate(),
+		Leases:         l.leases,
+		Config:         index,
+		ConfigSections: dedicatedBaseConfigSections(repoCfg),
+		Logger:         l.logger,
+		Gate:           l.buildGate(),
 		// The watcher's own debounce is the quiet window: both coalesce the
 		// same event storms, and a checkout whose watch configuration says how
 		// long to wait means it for its views too.
@@ -1948,6 +1974,91 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	// rebuild they drive with it has landed.
 	l.trackStarted(checkout.CheckoutID, coordinator)
 	return coordinator, nil
+}
+
+// dedicatedBaseConfigSections renders the configuration domains that decide
+// what a payload contains and do NOT live in config.IndexConfig.
+//
+// The index configuration is digested whole by snapshotDedicatedBaseConfig.
+// Everything here is the rest of the output-affecting configuration, named so
+// the dependency cohort and the widened config digest can carry it without
+// this package embedding every configuration struct in the tree:
+//
+//   - artifacts — which non-code files become artifact nodes at all.
+//   - semantic / lsp — which enrichment runs, and how far it sweeps. Split in
+//     two because an LSP-only change and a provider change are different
+//     changes; the two digests overlap, which only ever over-invalidates.
+//   - workspace / project — the namespace every node is stamped with, and the
+//     cross-workspace dependency declarations resolution may follow.
+//   - source-selection — the ignore/include layers and the user rule files
+//     that decide which files are admitted and which detectors run. It is not
+//     one of the five domains the producer requires; the required list is a
+//     floor, and a domain beyond it is digested like any other.
+//
+// The five required domains are always emitted, with the digest of their empty
+// value when a repository configures none: a declared emptiness is a fact
+// about the cohort, and silence is the gap the producer refuses.
+func dedicatedBaseConfigSections(cfg *config.Config) []DependencyRevisionConfigSection {
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	semantic := cfg.Semantic
+	return []DependencyRevisionConfigSection{
+		{Name: DependencyRevisionConfigArtifacts, Digest: configSectionDigest(cfg.Artifacts)},
+		{Name: DependencyRevisionConfigLSP, Digest: configSectionDigest(struct {
+			Sweep                      string   `json:"sweep"`
+			OpenDocs                   string   `json:"open_docs"`
+			MaxParallel                int      `json:"max_parallel"`
+			Eager                      bool     `json:"eager"`
+			AdditionalWorkspaceFolders []string `json:"additional_workspace_folders"`
+		}{
+			Sweep:                      semantic.LSPSweep,
+			OpenDocs:                   semantic.LSPOpenDocs,
+			MaxParallel:                semantic.LSPMaxParallel,
+			Eager:                      semantic.EagerLSP,
+			AdditionalWorkspaceFolders: semantic.AdditionalWorkspaceFolders,
+		})},
+		{Name: DependencyRevisionConfigProject, Digest: configSectionDigest(struct {
+			Project  string               `json:"project"`
+			Projects []config.ProjectGlob `json:"projects"`
+		}{Project: cfg.Project, Projects: cfg.Projects})},
+		{Name: DependencyRevisionConfigSemantic, Digest: configSectionDigest(semantic)},
+		{Name: DependencyRevisionConfigWorkspace, Digest: configSectionDigest(struct {
+			Workspace          string                     `json:"workspace"`
+			CrossWorkspaceDeps []config.CrossWorkspaceDep `json:"cross_workspace_deps"`
+		}{Workspace: cfg.Workspace, CrossWorkspaceDeps: cfg.CrossWorkspaceDeps})},
+		{Name: dedicatedBaseSourceSelectionSection, Digest: configSectionDigest(struct {
+			Exclude          []string `json:"exclude"`
+			Include          []string `json:"include"`
+			RuleFiles        []string `json:"rule_files"`
+			RespectGitignore *bool    `json:"respect_gitignore"`
+		}{
+			Exclude:          cfg.Exclude,
+			Include:          cfg.Include,
+			RuleFiles:        cfg.RuleFiles,
+			RespectGitignore: cfg.RespectGitignore,
+		})},
+	}
+}
+
+// dedicatedBaseSourceSelectionSection names the domain beyond the producer's
+// required five.
+const dedicatedBaseSourceSelectionSection = "source-selection"
+
+// configSectionDigest fingerprints one configuration domain.
+//
+// encoding/json sorts map keys, and every value here is a struct or a slice,
+// so the digest is deterministic. A value that cannot be encoded gets a unique
+// digest rather than a shared one — the same fail-safe direction the index
+// configuration's own digest takes: a domain nobody can compare must not read
+// as "matches everything".
+func configSectionDigest(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "unhashable-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:16])
 }
 
 // trackStarted records a coordinator whose loop is running, and forgets the

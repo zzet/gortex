@@ -92,7 +92,31 @@ func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 		treeA:      treeA,
 	}
 	f.writeCatalogIdentity()
+	f.registerRosterOwner(t)
 	return f
+}
+
+// registerRosterOwner puts the fixture's primary repository in the lease
+// manager's registered roster.
+//
+// Production has no other shape: buildCoordinator takes a repository read lease
+// on the primary graph before it constructs anything, so a coordinator only
+// ever exists for a repository the lease manager already holds. The roster is
+// what the generation identity's dependency cohort is enumerated from, so a
+// fixture without it would run every coordinator under a cohort that cannot be
+// described — see TestRefusedCheckoutCohortIsNotReusable, which drives that
+// case deliberately.
+func (f *coordinatorFixture) registerRosterOwner(t testing.TB) {
+	t.Helper()
+	err := f.leases.RegisterRepositoryOwner(graphview.RepositoryOwner{
+		GraphID:     f.graphID,
+		CheckoutID:  f.primaryID,
+		Incarnation: "incarnation-primary",
+		RepoPrefix:  builderRepoPrefix,
+	})
+	if err != nil {
+		t.Fatalf("register the primary repository owner: %v", err)
+	}
 }
 
 // writeCatalogIdentity records what the reconciler would have recorded: the
@@ -175,6 +199,13 @@ func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorCo
 	}
 	cfg.Leases = f.leases
 	cfg.Config = config.Default().Index
+	if cfg.ConfigSections == nil {
+		// What buildCoordinator supplies in production. Without it the
+		// generation identity's dependency cohort is refused for want of the
+		// configuration domains outside config.IndexConfig, and a refused
+		// cohort is deliberately not reusable across coordinators.
+		cfg.ConfigSections = dedicatedBaseConfigSections(config.Default())
+	}
 	cfg.Logger = zap.NewNop()
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = -1

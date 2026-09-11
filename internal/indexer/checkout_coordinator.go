@@ -84,6 +84,50 @@ const (
 	// miss, which is what a change in what resolution emits requires — the
 	// stored payload is not what this binary would produce any more.
 	checkoutResolverVersion = "1"
+
+	// checkoutConfigDigestDomain versions the configuration digest a
+	// generation's config_hash carries.
+	//
+	// The digest used to cover config.IndexConfig alone (indexConfigHash).
+	// That is not the whole of the configuration a payload is a function of:
+	// the artifacts list decides which non-code files become nodes, the
+	// semantic and LSP settings decide which enrichment runs, and the
+	// workspace/project slugs decide the namespace every node is stamped
+	// with. A generation built under one of those and reused under another is
+	// a payload composed from rules nobody asked for, so they are digested
+	// here alongside the index configuration and the frozen snapshot's own
+	// repo/workspace/project envelope.
+	//
+	// The domain string is versioned because widening the digest re-keys every
+	// stored generation exactly once: nothing built by an older binary matches,
+	// every checkout layer rebuilds on first contact, and from then on the
+	// cache is keyed by the complete configuration.
+	checkoutConfigDigestDomain = "gortex.checkout.config.v2"
+
+	// dependencyRevisionSourceBudget bounds how long naming one roster
+	// member's source identity may take.
+	//
+	// A raw repository's source witness sits behind the same gate a source
+	// mutation takes exclusively, so reading it can wait on a writer. A
+	// coordinator cycle must not park there: the budget turns an unavailable
+	// witness into a refused cohort — which fails closed onto a non-reusable
+	// revision — instead of into a stalled checkout.
+	dependencyRevisionSourceBudget = 2 * time.Second
+
+	// goPackageOwnershipTargetEvidence names the ownership evidence a checkout
+	// layer's resolver consults.
+	//
+	// It is one source, measured rather than assumed: Indexer.prepareGoPackageOwnership
+	// (go_package_ownership_sources.go:31) builds a lookup only for
+	// `prefix == idx.repoPrefix`, and a sparse generation declares
+	// graph.resolution.cross_repo incomplete for exactly that reason
+	// (builder_generation.go, the CapResolutionCrossRepo row). What the
+	// evidence CONTAINS is a function of the target repository's own bytes,
+	// which the roster already names by source identity and which the identity
+	// names again as its tree; what this fact pins is WHICH repositories may
+	// contribute ownership at all, so a build that gains a second ownership
+	// source moves the revision.
+	goPackageOwnershipTargetEvidence = "go-package-ownership:target-repository-source"
 )
 
 // initialCheckoutPollDelay assigns one stable point in the poll interval to a
@@ -154,7 +198,19 @@ type CheckoutCoordinatorConfig struct {
 	// invalidates the cache instead of composing two payloads built under
 	// different rules.
 	Config config.IndexConfig
-	Logger *zap.Logger
+	// ConfigSections carries the configuration domains that are output
+	// affecting but live outside config.IndexConfig — artifacts, semantic,
+	// LSP, workspace, project — as the name/digest pairs the dependency
+	// revision and the widened config digest both consume. The lifecycle
+	// computes them from the same repo configuration it freezes the index
+	// half of (see dedicatedBaseConfigSections).
+	//
+	// A coordinator handed none can still build: its config digest simply
+	// covers the index configuration alone, and its dependency cohort is
+	// refused — which fails closed onto a non-reusable revision rather than
+	// onto a certificate over configuration nobody enumerated.
+	ConfigSections []DependencyRevisionConfigSection
+	Logger         *zap.Logger
 	// Gate holds the loop's build cycles while the daemon warms up. nil admits
 	// every cycle at once, which is what a coordinator outside a warmup has.
 	Gate *ViewBuildGate
@@ -231,6 +287,29 @@ type CheckoutCoordinator struct {
 	retain     int
 	configHash string
 	extractors string
+
+	// config is the FROZEN index configuration this coordinator's generations
+	// are built under — the deep snapshot, not the ConfigManager's shallow
+	// result, so a later edit to the live configuration cannot change what an
+	// already-running coordinator says it built under.
+	config         config.IndexConfig
+	configSections []DependencyRevisionConfigSection
+
+	// cohortFailSafe is the non-reusable revision a refused cohort falls back
+	// to. It is allocated once per coordinator rather than once per identity:
+	// a per-call unique value would defeat this coordinator's own reuse cache
+	// and make every cycle rebuild, which is the write amplification the
+	// revision exists to prevent. Per coordinator is enough to fail closed —
+	// it can never equal a revision another process, another coordinator or an
+	// older binary stored, and it can never equal the legacy empty revision
+	// that the reuse guards treat as matching.
+	cohortFailSafe string
+
+	// revisionMu guards the cohort revision the identities carry. It is its
+	// own lock because commitIdentity is called both under mu (retainCommit's
+	// key) and outside it.
+	revisionMu sync.RWMutex
+	revision   string
 
 	// signal carries a wake to the run loop. It is buffered to one: a burst of
 	// signals has exactly one thing to say, and the loop re-arms the quiet
@@ -370,6 +449,25 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		return nil, fmt.Errorf("indexer: create checkout sampler: %w", err)
 	}
 	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	// The coordinator owns its configuration outright. The lifecycle already
+	// freezes it before handing it over; freezing again here is a no-op on a
+	// frozen value and is what makes a coordinator constructed by any other
+	// caller — a test, a transition — own its config too, rather than sharing
+	// the ConfigManager's nested maps and slices with whoever else holds them.
+	frozen, configFingerprint, snapshotErr := snapshotDedicatedBaseConfig(
+		cfg.Config, cfg.RepoPrefix, cfg.WorkspaceID, cfg.ProjectID)
+	if snapshotErr != nil {
+		// Same fail-safe indexConfigHash has always used for a configuration
+		// that cannot be encoded: a unique digest, so such a build is its own
+		// identity and reuses nothing. The unencodable value is still carried
+		// as the build's configuration — refusing to construct would take a
+		// checkout's view away over a digest.
+		frozen = cfg.Config
+		configFingerprint = "unhashable-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		logger.Warn("checkout coordinator: the index configuration could not be frozen; "+
+			"this coordinator's generations reuse nothing",
+			zap.String("checkout", cfg.CheckoutID), zap.Error(snapshotErr))
+	}
 	c := &CheckoutCoordinator{
 		checkoutID:     cfg.CheckoutID,
 		root:           cfg.CheckoutRoot,
@@ -387,7 +485,10 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		quiet:          cfg.Debounce,
 		poll:           cfg.PollInterval,
 		retain:         cfg.Retain,
-		configHash:     indexConfigHash(cfg.Config),
+		config:         frozen,
+		configSections: slices.Clone(cfg.ConfigSections),
+		configHash:     checkoutConfigHash(configFingerprint, cfg.ConfigSections),
+		cohortFailSafe: nonReusableDependencyRevision(),
 		extractors:     extractorVersionsFingerprint(),
 		signal:         make(chan struct{}, 1),
 		stop:           make(chan struct{}),
@@ -407,6 +508,11 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	if c.retain <= 0 {
 		c.retain = defaultRetainedCommitLayers
 	}
+	// Freeze the cohort before the loop, and before any caller can ask for an
+	// identity. Every read of the revision after this point sees a real cohort
+	// or this coordinator's own fail-safe; none of them sees an empty revision,
+	// which is the one value the reuse guards read as "matches anything".
+	c.refreshDependencyRevision(lifetime)
 	go c.run()
 	return c, nil
 }
@@ -675,6 +781,11 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	if err := ctx.Err(); err != nil {
 		return out, false
 	}
+	// The poll compares identities, so it has to compare against the cohort as
+	// it is now — not the one the last build froze. Refreshing here allocates
+	// nothing and writes nothing; it only decides whether the routed identity
+	// still describes this checkout's inputs.
+	c.refreshDependencyRevision(ctx)
 	base, err := c.primaryBase(ctx)
 	if err != nil {
 		return out, false
@@ -747,6 +858,10 @@ func recordCoordinatorCycle(out CheckoutCycle) {
 func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	var out CheckoutCycle
 
+	// One cohort per cycle. Every identity this cycle mints carries the same
+	// revision, so the layer it builds and the cache entry it files it under
+	// cannot disagree.
+	c.refreshDependencyRevision(ctx)
 	base, err := c.primaryBase(ctx)
 	if err != nil {
 		out.Err = err
@@ -854,6 +969,9 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	if err := ctx.Err(); err != nil {
 		return out, err
 	}
+	// A transition builds a whole stack; it freezes its cohort the same way a
+	// cycle does, and for the same reason.
+	c.refreshDependencyRevision(ctx)
 
 	dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
@@ -1772,6 +1890,7 @@ func (c *CheckoutCoordinator) commitIdentity(base primaryBase, targetTree string
 		ConfigHash:           c.configHash,
 		ExtractorVersions:    c.extractors,
 		ResolverVersion:      checkoutResolverVersion,
+		DependencyRevision:   c.dependencyRevision(),
 	}
 }
 
@@ -1781,16 +1900,289 @@ func (c *CheckoutCoordinator) commitIdentity(base primaryBase, targetTree string
 // own sample, so a caller cannot name one state and build another.
 func (c *CheckoutCoordinator) dirtyIdentity(graphID string, commitGeneration int64) GenerationIdentity {
 	return GenerationIdentity{
-		OwnerKind:         checkoutLayerOwnerKind,
-		GraphID:           graphID,
-		LayerID:           dirtyLayerID(c.checkoutID),
-		CheckoutID:        c.checkoutID,
-		GenerationKind:    DirtyLayerGenerationKind,
-		BaseGenerationID:  commitGeneration,
-		ConfigHash:        c.configHash,
-		ExtractorVersions: c.extractors,
-		ResolverVersion:   checkoutResolverVersion,
+		OwnerKind:          checkoutLayerOwnerKind,
+		GraphID:            graphID,
+		LayerID:            dirtyLayerID(c.checkoutID),
+		CheckoutID:         c.checkoutID,
+		GenerationKind:     DirtyLayerGenerationKind,
+		BaseGenerationID:   commitGeneration,
+		ConfigHash:         c.configHash,
+		ExtractorVersions:  c.extractors,
+		ResolverVersion:    checkoutResolverVersion,
+		DependencyRevision: c.dependencyRevision(),
 	}
+}
+
+// --- the dependency cohort ----------------------------------------------
+
+// dependencyRevision is the cohort revision this coordinator's identities
+// currently carry. It is never empty: an empty revision is the legacy identity
+// the reuse guards treat as matching anything, and a coordinator that cannot
+// describe its cohort must not claim that.
+func (c *CheckoutCoordinator) dependencyRevision() string {
+	c.revisionMu.RLock()
+	defer c.revisionMu.RUnlock()
+	if c.revision == "" {
+		return c.cohortFailSafe
+	}
+	return c.revision
+}
+
+// nonReusableDependencyRevision mints a revision nothing can match.
+//
+// It has the same shape as indexConfigHash's unencodable-configuration
+// fallback — a time-based unique token — for the same reason: a build whose
+// inputs cannot be described completely must be its own identity rather than
+// fall back to a value some stored generation happens to share. The
+// `cohort-refused:` prefix keeps it outside the `cohort-v1:` vocabulary a real
+// revision speaks, so no reader can mistake one for the other.
+func nonReusableDependencyRevision() string {
+	return "cohort-refused:" + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+// refreshDependencyRevision recomputes the cohort once, for the cycle that is
+// about to run.
+//
+// Once per cycle, not once per identity: reconcileCommitSlot and
+// resolveCommitLayer both name the same commit layer, and a revision that
+// moved between the two calls would have the cycle build under one identity
+// and cache it under another.
+func (c *CheckoutCoordinator) refreshDependencyRevision(ctx context.Context) {
+	revision, err := c.computeDependencyRevision(ctx)
+	if err != nil {
+		revision = c.cohortFailSafe
+	}
+	c.revisionMu.Lock()
+	previous := c.revision
+	c.revision = revision
+	c.revisionMu.Unlock()
+	if previous == revision {
+		return
+	}
+	if err != nil {
+		c.logger.Warn("checkout coordinator: the resolver-visible input cohort could not be "+
+			"described; this checkout's layers reuse nothing until it can",
+			zap.String("checkout", c.checkoutID),
+			zap.String("revision", revision), zap.Error(err))
+		return
+	}
+	c.logger.Debug("checkout coordinator: dependency revision updated",
+		zap.String("checkout", c.checkoutID), zap.String("revision", revision))
+}
+
+// computeDependencyRevision digests the complete resolver-visible input cohort
+// for this checkout's layers.
+//
+// The roster lease is held across its own validation, the enumeration of every
+// member's source and the digest — the window DependencyRevisionRoster
+// documents: a roster that gains or loses a repository under the digest is
+// refused rather than certified.
+//
+// It is released before the build's own catalog writes rather than held
+// through them, deliberately. A checkout build indexes a tree; holding the
+// roster lease across it would block every repository registration and every
+// admission close for the length of a build, and lifecycle teardown — which
+// closes admissions — would then wait on the very build it is tearing down.
+// What the shorter window costs is bounded by W2.1b's rule that a changed
+// revision ROOTS a new chain: a roster that moves after the digest produces a
+// different revision on the next cycle, and that revision cannot extend the
+// chain this one published.
+func (c *CheckoutCoordinator) computeDependencyRevision(ctx context.Context) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.leases == nil {
+		return "", fmt.Errorf("%w: no lease manager to enumerate the roster with",
+			ErrDependencyRevisionIncomplete)
+	}
+	lease, err := c.leases.AcquireRepositoryRoster()
+	if err != nil {
+		return "", fmt.Errorf("%w: acquire the repository roster: %w",
+			ErrDependencyRevisionIncomplete, err)
+	}
+	defer lease.Release()
+
+	inputs, err := c.dependencyRevisionInputs(ctx, lease)
+	if err != nil {
+		return "", err
+	}
+	return ComputeDependencyRevision(inputs)
+}
+
+// dependencyRevisionInputs assembles the cohort this coordinator builds under,
+// against a roster lease the caller holds.
+//
+// It is separate from the digest so the cohort itself is inspectable: a test
+// asserting that one dimension moves the revision reads the real production
+// cohort and changes exactly that dimension, rather than re-deriving what the
+// coordinator would have said.
+func (c *CheckoutCoordinator) dependencyRevisionInputs(
+	ctx context.Context, lease *graphview.RepositoryRosterLease,
+) (DependencyRevisionInputs, error) {
+	sources, err := c.rosterSourceIdentities(ctx, lease)
+	if err != nil {
+		return DependencyRevisionInputs{}, err
+	}
+	repositories, err := DependencyRevisionRoster(lease, func(repoPrefix string) string {
+		return sources[repoPrefix]
+	})
+	if err != nil {
+		return DependencyRevisionInputs{}, err
+	}
+	return DependencyRevisionInputs{
+		Target: DependencyRevisionTarget{
+			RepoPrefix:  c.repoPrefix,
+			WorkspaceID: c.workspaceID,
+			ProjectID:   c.projectID,
+		},
+		RosterComplete: true,
+		Repositories:   repositories,
+		// The ownership evidence is one measured source; see
+		// goPackageOwnershipTargetEvidence for why that is a fact about this
+		// build rather than an absence nobody looked for.
+		OwnershipComplete: true,
+		Ownership: []DependencyRevisionOwnership{{
+			RepoPrefix: c.repoPrefix,
+			Language:   "go",
+			Owner:      goPackageOwnershipTargetEvidence,
+		}},
+		Config:            c.config,
+		ConfigSections:    c.configSections,
+		Producers:         c.cohortProducerPolicy(),
+		Capabilities:      cohortCapabilityVocabulary(),
+		ExtractorVersions: c.extractors,
+	}, nil
+}
+
+// rosterSourceIdentities names what this build can see of each roster member's
+// bytes.
+//
+// A dedicated repository's source is the committed corpus its graph is at —
+// the same primaryBase every layer over that graph is built against, so the
+// cohort and the layer cannot disagree about what the corpus is. A raw
+// repository has no committed tree; its source witness (revision plus content
+// fingerprint) is the equivalent, and it is read under a bounded budget so a
+// concurrent source mutation cannot park a coordinator cycle.
+//
+// Every refusal is a refusal of the whole cohort. A roster member whose bytes
+// cannot be named is exactly the false certificate the revision must not issue.
+func (c *CheckoutCoordinator) rosterSourceIdentities(
+	ctx context.Context, lease *graphview.RepositoryRosterLease,
+) (map[string]string, error) {
+	out := map[string]string{}
+	for _, owner := range lease.DedicatedOwners() {
+		dedicated, found, err := c.catalog.GetDedicatedGraph(ctx, owner.GraphID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read dedicated graph %s: %w",
+				ErrDependencyRevisionIncomplete, owner.GraphID, err)
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: dedicated graph %s is not in the catalog",
+				ErrDependencyRevisionIncomplete, owner.GraphID)
+		}
+		base, err := graphBase(ctx, c.catalog, dedicated)
+		if err != nil {
+			return nil, fmt.Errorf("%w: name the corpus of %s: %w",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix, err)
+		}
+		if base.treeOID == "" {
+			return nil, fmt.Errorf("%w: repository %s names no committed tree",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix)
+		}
+		out[owner.RepoPrefix] = "tree:" + base.treeOID
+	}
+	for _, registration := range lease.RawRegistrations() {
+		owner := registration.Owner()
+		witnessCtx, cancel := context.WithTimeout(ctx, dependencyRevisionSourceBudget)
+		snapshot, err := c.leases.AcquireRawRepositorySnapshot(witnessCtx, registration, 0)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("%w: witness the source of raw repository %s: %w",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix, err)
+		}
+		witness := snapshot.Witness()
+		snapshot.Release()
+		if witness.Revision == 0 || witness.Fingerprint == "" {
+			return nil, fmt.Errorf("%w: raw repository %s has no source witness",
+				ErrDependencyRevisionIncomplete, owner.RepoPrefix)
+		}
+		out[owner.RepoPrefix] = "raw:" + strconv.FormatUint(witness.Revision, 10) +
+			":" + witness.Fingerprint
+	}
+	return out, nil
+}
+
+// cohortProducerPolicy renders the producer policy a build under this
+// coordinator's configuration will declare, as far as the configuration
+// decides it.
+//
+// SparseGenerationBuilder.declareProducers is the authority on what is
+// actually written (builder_generation.go). Two groups of its rows are
+// deliberately NOT digested here:
+//
+//   - the rows the IDENTITY decides — search.text and the lsp.* family are a
+//     function of the generation kind, which is already an identity column of
+//     its own; digesting them again would move two fields on one change.
+//   - the rows a build OUTCOME narrows — a truncated closure, a language
+//     server that was cut short. Those describe what a build produced, not
+//     what it was given, and a cohort digest is over inputs.
+//
+// What is left is the policy the configuration fixes before anything is built,
+// which is what a reader comparing two builds' inputs needs.
+func (c *CheckoutCoordinator) cohortProducerPolicy() []DependencyRevisionProducer {
+	vector := DependencyRevisionProducer{
+		Producer: string(graphview.CapSearchVector),
+		State:    string(store_sqlite.ProducerStateDisabledByConfig),
+		Reason:   "no embedding provider is configured for the build",
+	}
+	if c.builder != nil && c.builder.Embedder != nil {
+		vector.State = string(store_sqlite.ProducerStateComplete)
+		vector.Reason = ""
+	}
+	similarity := DependencyRevisionProducer{
+		Producer: string(graphview.CapSimilarity),
+		State:    string(store_sqlite.ProducerStateDisabledByConfig),
+		Reason:   "near-duplicate detection is switched off for the build",
+	}
+	if c.config.Coverage.IsEnabled("clones") {
+		similarity.State = string(store_sqlite.ProducerStateIncomplete)
+		similarity.Reason = "near-duplicate detection ranks bodies against a corpus; " +
+			"a sparse generation ranks them against its file set"
+	}
+	complete := func(capability graphview.CapabilityID) DependencyRevisionProducer {
+		return DependencyRevisionProducer{
+			Producer: string(capability),
+			State:    string(store_sqlite.ProducerStateComplete),
+		}
+	}
+	return []DependencyRevisionProducer{
+		complete(graphview.CapSourceSnapshot),
+		complete(graphview.CapSourceConfig),
+		complete(graphview.CapSyntaxGraph),
+		complete(graphview.CapResolutionLocal),
+		complete(graphview.CapIncomingEdges),
+		complete(graphview.CapSearchSymbols),
+		complete(graphview.CapSearchContent),
+		vector,
+		similarity,
+		{
+			Producer: string(graphview.CapResolutionCrossRepo),
+			State:    string(store_sqlite.ProducerStateIncomplete),
+			Reason:   "a sparse generation is resolved within one repository",
+		},
+	}
+}
+
+// cohortCapabilityVocabulary is the capability set the producer policy is
+// stated over. A capability that joins the vocabulary changes what silence
+// about it means, so it is a cohort member in its own right.
+func cohortCapabilityVocabulary() []string {
+	known := graphview.KnownCapabilities()
+	out := make([]string, 0, len(known))
+	for _, capability := range known {
+		out = append(out, string(capability))
+	}
+	return out
 }
 
 // commitLayerID and dirtyLayerID name a checkout's two layers. They are
@@ -1879,6 +2271,51 @@ func indexConfigHash(cfg config.IndexConfig) string {
 		return "unhashable-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:16])
+}
+
+// checkoutConfigHash widens the configuration digest a generation's identity
+// carries from "the index configuration" to "the configuration".
+//
+// fingerprint is snapshotDedicatedBaseConfig's versioned digest — the index
+// configuration inside an explicit repo/workspace/project envelope, which is
+// what makes the same index settings in two namespaces two identities. The
+// named sections carry the domains that live outside config.IndexConfig and
+// still decide what a payload contains: artifacts, semantic, LSP, workspace,
+// project, source selection.
+//
+// The encoding is the length-delimited one generationIdentityKey uses, so no
+// section name or digest can imitate a delimiter and make two configurations
+// collide. Sections are sorted, so the caller's enumeration order is not part
+// of the answer.
+//
+// The unencodable-configuration fail-safe is preserved by the caller: it hands
+// a unique fingerprint in, and a unique fingerprint makes a unique digest.
+func checkoutConfigHash(fingerprint string, sections []DependencyRevisionConfigSection) string {
+	ordered := slices.Clone(sections)
+	slices.SortFunc(ordered, func(a, b DependencyRevisionConfigSection) int {
+		if a.Name != b.Name {
+			return strings.Compare(a.Name, b.Name)
+		}
+		return strings.Compare(a.Digest, b.Digest)
+	})
+	var b strings.Builder
+	field := func(label, value string) {
+		b.WriteString(label)
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(len(value)))
+		b.WriteByte(':')
+		b.WriteString(value)
+		b.WriteByte(0)
+	}
+	field("domain", checkoutConfigDigestDomain)
+	field("index", fingerprint)
+	field("sections", strconv.Itoa(len(ordered)))
+	for _, section := range ordered {
+		field("section.name", section.Name)
+		field("section.digest", section.Digest)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:16])
 }
 
