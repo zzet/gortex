@@ -214,9 +214,33 @@ const freshnessRetryBackoff = 25 * time.Millisecond
 const (
 	// freshReasonDeadlineExceeded: the bound expired before the route caught
 	// up with the working copy.
+	//
+	// It is a statement about THE CALLER'S bound — wait_deadline, or the
+	// default wait — and it is emitted only when that bound has actually
+	// passed. A context error handed back by the coordinator is not evidence
+	// that it has: RequestCheckoutRefresh installs its own
+	// checkoutRefreshCaptureTimeout over whatever context it is given
+	// (internal/indexer/checkout_refresh.go), and the git sampler wraps that
+	// context's error with %w, so a capture that ran out of ITS bound arrives
+	// here as context.DeadlineExceeded while the caller still has most of its
+	// wait left. Calling that "deadline_exceeded" ends a 60s wait at 5s and
+	// prints a still-future timestamp as the deadline that was not met; it
+	// gets freshReasonRefreshAdmissionAbandoned instead.
 	freshReasonDeadlineExceeded = "deadline_exceeded"
 	// freshReasonInterrupted: the request itself ended first.
 	freshReasonInterrupted = "interrupted"
+	// freshReasonRefreshAdmissionAbandoned: every admission this wait made was
+	// abandoned on a bound the request did not set — the coordinator's own
+	// capture timeout, or its lifetime context — and the caller's bound ran
+	// out before any ticket was admitted.
+	//
+	// It is a fact about the coordinator's admission of THIS checkout, and it
+	// is deliberately neither of its neighbours: nothing about the server is
+	// claimed (the coordinator answered, repeatedly), no build was attempted
+	// so publication_failed would be false, and the caller's bound is not what
+	// prevented the answer, so deadline_exceeded would send the caller to
+	// extend a wait_deadline that was never the problem.
+	freshReasonRefreshAdmissionAbandoned = "refresh_admission_abandoned"
 	// freshReasonCoordinatorUnavailable: nothing on this server can publish a
 	// checkout generation, so there is no settle signal to wait on.
 	//
@@ -355,33 +379,55 @@ func (s *Server) awaitCheckoutFreshness(
 		// advancement is not on demand.
 		return false, freshReasonCommittedBaseAdvance
 	}
+	// abandoned records what the LAST attempt died of: a bound this wait did
+	// not set. It decides what the wait is called if the caller's own bound
+	// then runs out — "the route never caught up" and "no ticket was ever
+	// admitted" are different facts, and only the first is deadline_exceeded.
+	abandoned := false
 	for {
 		if ctx.Err() != nil {
 			return false, freshReasonInterrupted
 		}
 		if !time.Now().Before(deadline) {
-			return false, freshReasonDeadlineExceeded
+			return false, freshnessWaitEnd(ctx, abandoned)
 		}
 		waitCtx, cancel := context.WithDeadline(ctx, deadline)
 		ticket, err := waiter.RequestCheckoutRefresh(waitCtx, checkout.CheckoutID, checkout.RootPath)
 		cancel()
 		if err != nil {
 			if freshnessWaitRetryable(err) {
+				abandoned = false
 				if !freshnessBackoff(ctx, deadline) {
-					return false, freshnessExpiryReason(ctx)
+					return false, freshnessWaitEnd(ctx, abandoned)
 				}
 				continue
 			}
 			if freshnessContextExpiry(err) {
-				// waitCtx carries exactly two bounds — this request's own
-				// context and this wait's deadline — so a context error out
-				// of the admission is one of those two expiring. It is a
-				// fact about the bound, and reporting it as
-				// coordinator_unavailable states something false about the
-				// server: that nothing here can publish a generation. The
-				// retryable check runs first so a busy/superseded refusal
-				// that merely wraps a context error keeps its own meaning.
-				return false, freshnessExpiryReason(ctx)
+				// A context error out of the admission says a bound ended. It
+				// does NOT say which: waitCtx carries this request's context
+				// and this wait's deadline, but the coordinator derives its
+				// own bounds from whatever it is handed
+				// (checkoutRefreshCaptureTimeout, its lifetime context), and
+				// the sampler wraps those with %w. Only the state of this
+				// wait's own two bounds can tell them apart, so they are asked
+				// rather than the error. Reporting it as
+				// coordinator_unavailable would state something false about
+				// the server; reporting someone else's 5s timeout as the
+				// caller's wait_deadline ends the wait ~12x early. The
+				// retryable check runs first so a busy/superseded refusal that
+				// merely wraps a context error keeps its own meaning.
+				if reason, expired := freshnessBoundExpiry(ctx, deadline); expired {
+					return false, reason
+				}
+				// Not one of ours: the coordinator gave up on its own bound
+				// while the caller still has wait left. Ask again — a capture
+				// that timed out sampled nothing, so there is no publication
+				// to report and nothing has been learned about the route.
+				abandoned = true
+				if !freshnessBackoff(ctx, deadline) {
+					return false, freshnessWaitEnd(ctx, abandoned)
+				}
+				continue
 			}
 			if reason, mapped := freshnessCheckoutErrorReason(err); mapped {
 				return false, reason
@@ -391,21 +437,27 @@ func (s *Server) awaitCheckoutFreshness(
 		if ticket == nil || ticket.Ticket == nil || ticket.Ticket.Done == nil {
 			return false, freshReasonCoordinatorUnavailable
 		}
-		fresh, reason, retry := awaitFreshnessTicket(ctx, ticket, deadline)
+		fresh, reason, retry, ticketAbandoned := awaitFreshnessTicket(ctx, ticket, deadline)
 		if !retry {
 			return fresh, reason
 		}
-		// The working copy moved while the coordinator was sampling it. Ask
-		// again against the newer tree rather than reporting the older one's
-		// publication as this request's freshness.
+		abandoned = ticketAbandoned
+		// The working copy moved while the coordinator was sampling it, or the
+		// coordinator abandoned the ticket on a bound of its own. Ask again
+		// against the newer tree rather than reporting the older one's
+		// publication — or someone else's expired bound — as this request's
+		// freshness.
 		if !freshnessBackoff(ctx, deadline) {
-			return false, freshnessExpiryReason(ctx)
+			return false, freshnessWaitEnd(ctx, abandoned)
 		}
 	}
 }
 
 // awaitFreshnessTicket blocks on one admitted ticket. The third return says the
-// wait should be re-admitted against a newer sample.
+// wait should be re-admitted against a newer sample; the fourth says that
+// re-admission is happening because a bound this wait did not set ended the
+// last one, which is what the wait is called if the caller's bound then runs
+// out.
 //
 // ctx is non-nil: awaitCheckoutFreshness, the only caller, normalises it once
 // for the whole wait.
@@ -413,38 +465,45 @@ func awaitFreshnessTicket(
 	ctx context.Context,
 	ticket *indexer.CheckoutRefreshTicket,
 	deadline time.Time,
-) (fresh bool, reason string, retry bool) {
+) (fresh bool, reason string, retry bool, abandoned bool) {
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case result, open := <-ticket.Ticket.Done:
 		if !open {
-			return false, freshReasonCoordinatorUnavailable, false
+			return false, freshReasonCoordinatorUnavailable, false, false
 		}
 		if result.Err == nil {
-			return true, "", false
+			return true, "", false, false
 		}
 		if freshnessWaitRetryable(result.Err) {
-			return false, "", true
+			return false, "", true, false
 		}
 		if freshnessContextExpiry(result.Err) {
-			// The coordinator abandoned the ticket because the context this
-			// wait handed it ended. That is this request's bound expiring,
-			// not a publication that failed.
-			return false, freshnessExpiryReason(ctx), false
+			// The coordinator abandoned the ticket because a context ended.
+			// Whose is not in the error — the coordinator runs the cycle that
+			// completes a ticket under its own context, not the one this wait
+			// handed it — so this wait's two bounds are asked instead. If
+			// neither has expired the bound was the coordinator's, and the
+			// admission is retried rather than reported as this request's
+			// deadline or as a publication that failed.
+			if reason, expired := freshnessBoundExpiry(ctx, deadline); expired {
+				return false, reason, false, false
+			}
+			return false, "", true, true
 		}
 		if reason, mapped := freshnessCheckoutErrorReason(result.Err); mapped {
 			// The coordinator failed the ticket because THIS checkout stopped
 			// being refreshable — it is closing, or its root moved. Reporting
 			// that as publication_failed would say a build was attempted and
 			// broke, which is a different thing to retry.
-			return false, reason, false
+			return false, reason, false, false
 		}
-		return false, freshReasonPublicationFailed, false
+		return false, freshReasonPublicationFailed, false, false
 	case <-timer.C:
-		return false, freshReasonDeadlineExceeded, false
+		return false, freshReasonDeadlineExceeded, false, false
 	case <-ctx.Done():
-		return false, freshReasonInterrupted, false
+		return false, freshReasonInterrupted, false, false
 	}
 }
 
@@ -469,17 +528,54 @@ func freshnessBackoff(ctx context.Context, deadline time.Time) bool {
 	}
 }
 
-func freshnessExpiryReason(ctx context.Context) string {
-	if ctx.Err() != nil {
+// freshnessWaitEnd names a wait that ran out of room: the caller's context
+// ended, or its bound passed. It is called only where one of those is already
+// true — the top of the loop, and a backoff that reported it cannot pause any
+// longer — so it decides between them rather than testing the bound again.
+//
+// abandoned carries the one thing the bounds cannot say: that no ticket was
+// ever admitted because every attempt died on a bound this wait did not set.
+// Without it a coordinator that cannot sample the tree is reported as the
+// caller's wait_deadline being too short, and the caller's next move (a bigger
+// deadline) is the one move that cannot help.
+func freshnessWaitEnd(ctx context.Context, abandoned bool) string {
+	if ctx != nil && ctx.Err() != nil {
 		return freshReasonInterrupted
+	}
+	if abandoned {
+		return freshReasonRefreshAdmissionAbandoned
 	}
 	return freshReasonDeadlineExceeded
 }
 
-// freshnessContextExpiry reports whether an error is one of the two contexts
-// the wait itself imposes ending, rather than anything the coordinator has to
-// say about this checkout. The wait hands the coordinator ctx + deadline and
-// nothing else, so a context error coming back is always one of those.
+// freshnessBoundExpiry reports which of the wait's OWN bounds has expired, and
+// false when neither has.
+//
+// It is the classifier for a context error the coordinator hands back. Such an
+// error proves a context ended; it does not prove the context was one of ours.
+// RequestCheckoutRefresh derives a private checkoutRefreshCaptureTimeout (5s)
+// and a coordinator-lifetime context from whatever it is given
+// (internal/indexer/checkout_refresh.go), the git sampler wraps ctx.Err() with
+// %w (internal/gitstate/dirty.go), and the cycle that completes a ticket runs
+// under the coordinator's context rather than this wait's. So the bounds are
+// asked directly: a live request context and an unreached deadline mean the
+// bound that ended belonged to the coordinator, and this request's wait is not
+// over.
+func freshnessBoundExpiry(ctx context.Context, deadline time.Time) (string, bool) {
+	if ctx != nil && ctx.Err() != nil {
+		return freshReasonInterrupted, true
+	}
+	if !time.Now().Before(deadline) {
+		return freshReasonDeadlineExceeded, true
+	}
+	return "", false
+}
+
+// freshnessContextExpiry reports whether an error is a context ending, rather
+// than anything the coordinator has to say about this checkout. Which context
+// it was is a separate question, answered by freshnessBoundExpiry: the wait
+// hands the coordinator ctx + deadline, but the coordinator adds bounds of its
+// own on top of them.
 func freshnessContextExpiry(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -540,9 +636,10 @@ func freshnessDeadlineRefusal(deadline time.Time, waited time.Duration) error {
 // that also said require_fresh asked for a route that reflects the working
 // copy; answering out of a route that demonstrably does not — because the
 // coordinator is gone, because this checkout's root changed or its coordinator
-// stopped, because publication failed, because the route was withdrawn under
-// the wait, because the view reads a committed base whose advancement is not
-// implemented, or because the wait target could not be resolved — is exactly
+// stopped, because publication failed, because every admission was abandoned on
+// the coordinator's own bound, because the route was withdrawn under the wait,
+// because the view reads a committed base whose advancement is not implemented,
+// or because the wait target could not be resolved — is exactly
 // the substitution require_exact exists to refuse. The
 // expired-deadline case keeps its own refusal (freshnessDeadlineRefusal): it is
 // the one outcome where the actionable next step is a bigger wait_deadline, so

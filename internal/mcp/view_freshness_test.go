@@ -104,6 +104,11 @@ func TestViewsGuideStatesTheRequestLevelFreshnessContract(t *testing.T) {
 		freshReasonWaitTargetUnavailable,
 		freshReasonCheckoutRootChanged,
 		freshReasonCheckoutRefreshStopped,
+		// The reason a caller must be able to tell apart from
+		// deadline_exceeded: extending wait_deadline is the obvious move for
+		// one and the useless move for the other, and the rider is all the
+		// caller sees.
+		freshReasonRefreshAdmissionAbandoned,
 		// fresh:true is a claim about which route answered, not only about
 		// what the coordinator did. A caller cannot check that itself — it
 		// sees one rider — so the condition has to be written down.
@@ -309,6 +314,11 @@ type fakeFreshnessWaiter struct {
 	mu     sync.Mutex
 	calls  []freshnessCall
 	answer func(call int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error)
+	// answerCtx is answer for a case that has to see the context the wait
+	// hands the coordinator. A real coordinator's bounds are derived from it,
+	// so a test that means "the CALLER's bound ended" says so by waiting for
+	// this context rather than by sleeping past a wall-clock instant.
+	answerCtx func(ctx context.Context, call int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error)
 }
 
 func (f *fakeFreshnessWaiter) RequestCheckoutRefresh(
@@ -318,8 +328,11 @@ func (f *fakeFreshnessWaiter) RequestCheckoutRefresh(
 	f.mu.Lock()
 	f.calls = append(f.calls, freshnessCall{checkoutID: checkoutID, root: expectedRoot})
 	n := len(f.calls)
-	answer := f.answer
+	answer, answerCtx := f.answer, f.answerCtx
 	f.mu.Unlock()
+	if answerCtx != nil {
+		return answerCtx(ctx, n, checkoutID, expectedRoot)
+	}
 	if answer == nil {
 		return nil, indexer.ErrCheckoutRefreshStopped
 	}
@@ -1334,30 +1347,49 @@ func TestFreshnessKnobsAreReadBeforeParameterReconciliation(t *testing.T) {
 // CheckoutLifecycle reached the live lifecycle with ~4ms left on a 400ms bound,
 // got context.DeadlineExceeded back from the admission, and rode out as
 // fresh_reason:"coordinator_unavailable" after waiting 396ms.
+// freshnessTestBound is the wait_deadline a case that means to REACH its bound
+// runs under. It is short because the case ends by waiting the bound out, and
+// absolute because every knob is: the fake waits for the context the wait hands
+// it rather than for a wall clock.
+const freshnessTestBound = 400 * time.Millisecond
+
 func TestAnExpiredBoundIsNotReportedAsAnUnavailableCoordinator(t *testing.T) {
 	type expiryCase struct {
-		// answer is what the coordinator hands back.
-		answer func(checkoutID, root string) (*indexer.CheckoutRefreshTicket, error)
+		// answer is what the coordinator hands back. It is given the context
+		// the wait admitted under, and every case here waits for THAT context
+		// to end before failing — which is what a coordinator whose only bound
+		// is the caller's does, and the only way a test can mean "the caller's
+		// bound expired" without racing a wall clock.
+		//
+		// A context error that is NOT one of the caller's bounds is a
+		// different outcome entirely (the coordinator's own capture timeout);
+		// it used to land here, and it is pinned in checkout_binding_test.go.
+		answer func(ctx context.Context, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error)
 		// wrong is the reason the request used to carry.
 		wrong string
 	}
 	cases := map[string]expiryCase{
 		"the admission is cut off by the bound": {
-			answer: func(string, string) (*indexer.CheckoutRefreshTicket, error) {
-				return nil, context.DeadlineExceeded
+			answer: func(ctx context.Context, _, _ string) (*indexer.CheckoutRefreshTicket, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
 			},
 			wrong: freshReasonCoordinatorUnavailable,
 		},
-		"the admission is cut off by cancellation": {
-			answer: func(string, string) (*indexer.CheckoutRefreshTicket, error) {
-				return nil, context.Canceled
+		"the admission is cut off by a wrapped bound": {
+			answer: func(ctx context.Context, _, _ string) (*indexer.CheckoutRefreshTicket, error) {
+				<-ctx.Done()
+				// The live shape: the git sampler wraps the context error it
+				// was cut off by (internal/gitstate/dirty.go).
+				return nil, fmt.Errorf("sample checkout: %w", ctx.Err())
 			},
 			wrong: freshReasonCoordinatorUnavailable,
 		},
 		"the ticket completes with the bound's own error": {
-			answer: func(checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
+			answer: func(ctx context.Context, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
+				<-ctx.Done()
 				done := make(chan indexer.MutationResult, 1)
-				done <- indexer.MutationResult{Err: context.DeadlineExceeded}
+				done <- indexer.MutationResult{Err: ctx.Err()}
 				close(done)
 				return &indexer.CheckoutRefreshTicket{
 					CheckoutID: checkoutID,
@@ -1372,12 +1404,12 @@ func TestAnExpiredBoundIsNotReportedAsAnUnavailableCoordinator(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			stack := newViewStack(t)
 			stack.srv.freshnessWaiter = &fakeFreshnessWaiter{
-				answer: func(_ int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
-					return tc.answer(checkoutID, root)
+				answerCtx: func(ctx context.Context, _ int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
+					return tc.answer(ctx, checkoutID, root)
 				},
 			}
 			res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol",
-				freshArgs(nil, time.Minute), captureReader(stack.srv, new(graph.Reader)))
+				freshArgs(nil, freshnessTestBound), captureReader(stack.srv, new(graph.Reader)))
 			require.NoError(t, err)
 			require.False(t, res.IsError, viewResultText(t, res))
 			rider := resultFreshness(t, res)
@@ -1385,6 +1417,8 @@ func TestAnExpiredBoundIsNotReportedAsAnUnavailableCoordinator(t *testing.T) {
 			require.Equal(t, freshReasonDeadlineExceeded, rider["fresh_reason"],
 				"the request's own bound ending was reported as a fact about the server: rider = %v", rider)
 			require.NotEqual(t, tc.wrong, rider["fresh_reason"], "rider = %v", rider)
+			require.NotEqual(t, freshReasonRefreshAdmissionAbandoned, rider["fresh_reason"],
+				"the caller's OWN bound expiring was blamed on the coordinator: rider = %v", rider)
 		})
 	}
 
