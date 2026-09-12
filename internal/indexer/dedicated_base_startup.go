@@ -333,7 +333,19 @@ func (p *InitialBasePublisher) enqueueLocked(req basePublishRequest) {
 	if p.pendingReq == nil {
 		p.pendingReq = map[string]basePublishRequest{}
 	}
-	if _, queued := p.pendingReq[req.prefix]; queued {
+	if existing, queued := p.pendingReq[req.prefix]; queued {
+		if existing.live && !req.live {
+			// A STARTUP request never downgrades a queued LIVE one. The live
+			// request carries three things this one does not: the commit the
+			// watcher resolved from Git (the checkout row's head_tree still
+			// names the previous tree at this instant — see
+			// dedicatedBaseCommitTree), the `live` flag that lets the worker
+			// admit it before BeginDraining, and the trigger's completion memo,
+			// whose loss makes the next observation of the same commit pay for
+			// a fresh cohort description. Replacement is for a NEWER target of
+			// the same kind, not for an older one arriving late.
+			return
+		}
 		// Same slot, newer target: the depth did not move, so neither does
 		// the accounting. A replaced request's completion callback is dropped
 		// with it — its caller is the trigger, which re-reads the outcome of

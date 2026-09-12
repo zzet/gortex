@@ -100,10 +100,27 @@ func bindCohortSiblingCorpus(t *testing.T, f *coordinatorFixture, sibling cohort
 // commit in that repository does to the cohort's view of it.
 func moveCohortSiblingTree(t *testing.T, f *coordinatorFixture, sibling cohortSibling, headTree string) {
 	t.Helper()
+	moveCheckoutTree(t, f, sibling.checkoutID, sibling.prefix, headTree)
+}
+
+// moveTargetCorpus re-points the TARGET repository's own committed corpus.
+//
+// graphBase resolves a dedicated member's corpus from its published generation,
+// or from its owning checkout's head tree when it has none, so moving the
+// primary checkout's head tree is exactly what a commit in the target does to
+// the cohort's view of ITSELF — the input that used to re-key the target on
+// every one of its own commits.
+func moveTargetCorpus(t *testing.T, f *coordinatorFixture, headTree string) {
+	t.Helper()
+	moveCheckoutTree(t, f, f.primaryID, builderRepoPrefix, headTree)
+}
+
+func moveCheckoutTree(t *testing.T, f *coordinatorFixture, checkoutID, label, headTree string) {
+	t.Helper()
 	ctx := context.Background()
-	row, found, err := f.catalog.GetCheckout(ctx, sibling.checkoutID)
+	row, found, err := f.catalog.GetCheckout(ctx, checkoutID)
 	if err != nil || !found {
-		t.Fatalf("read the %s checkout: %v (found=%v)", sibling.prefix, err, found)
+		t.Fatalf("read the %s checkout: %v (found=%v)", label, err, found)
 	}
 	err = f.catalog.UpdateCheckoutObservation(ctx, store_sqlite.UpdateCheckoutObservationRequest{
 		CheckoutID:  row.CheckoutID,
@@ -116,7 +133,7 @@ func moveCohortSiblingTree(t *testing.T, f *coordinatorFixture, sibling cohortSi
 		HeadTree:    headTree,
 	})
 	if err != nil {
-		t.Fatalf("move the %s checkout's tree: %v", sibling.prefix, err)
+		t.Fatalf("move the %s checkout's tree: %v", label, err)
 	}
 }
 
@@ -850,13 +867,16 @@ func TestTheCohortReadsOnlyInScopeRepositories(t *testing.T) {
 		return c.cohortCost.MemberSourceReads.Load() - before
 	}
 
-	// The floor: a one-repository workspace reads exactly its own corpus.
+	// The floor: a one-repository workspace reads NOTHING. The only member is
+	// the target, and a repository's own corpus is not one of its dependencies
+	// — see DependencyRevisionTargetSourceIdentity.
 	if got := reads(func() {
 		if !c.describeDependencyCohort(context.Background()) {
 			t.Fatal("the production cohort was refused")
 		}
-	}); got != 1 {
-		t.Fatalf("a one-repository workspace read %d roster members' sources, want 1", got)
+	}); got != 0 {
+		t.Fatalf("a one-repository workspace read %d roster members' sources, want 0: "+
+			"the only member is the target, whose corpus is the target rather than an input", got)
 	}
 
 	// Three indexed repositories in other workspaces. They are roster members
@@ -868,7 +888,7 @@ func TestTheCohortReadsOnlyInScopeRepositories(t *testing.T) {
 		if !c.describeDependencyCohort(context.Background()) {
 			t.Fatal("repositories outside the workspace made the cohort undescribable")
 		}
-	}); got != 1 {
+	}); got != 0 {
 		t.Fatalf("a one-repository workspace read %d roster members' sources with three "+
 			"repositories tracked in other workspaces; the per-cycle cost is bounded by "+
 			"the daemon rather than by the workspace", got)
@@ -896,9 +916,114 @@ func TestTheCohortReadsOnlyInScopeRepositories(t *testing.T) {
 			t.Fatalf("a raw repository outside the workspace made this checkout's cohort "+
 				"undescribable: %q", c.dependencyRevision())
 		}
-	}); got != 1 {
+	}); got != 0 {
 		t.Fatalf("a one-repository workspace read %d roster members' sources with a raw "+
-			"repository registered in another workspace, want 1", got)
+			"repository registered in another workspace, want 0", got)
+	}
+
+	// And the positive: a repository that IS in scope and is NOT the target is
+	// read, once. Without this the zeros above would also pass if the scope
+	// filter had swallowed the whole enumeration.
+	cfg.WorkspaceMembers = workspaceOf(builderRepoPrefix, "inside-one")
+	inside := f.inertCoordinator(t, cfg)
+	registerCohortSibling(t, f, "inside-one", "tree-inside-one")
+	before := inside.cohortCost.MemberSourceReads.Load()
+	if !inside.describeDependencyCohort(context.Background()) {
+		t.Fatalf("a workspace with one indexed sibling was refused: %q", inside.dependencyRevision())
+	}
+	if got := inside.cohortCost.MemberSourceReads.Load() - before; got != 1 {
+		t.Fatalf("a two-repository workspace read %d roster members' sources, want exactly 1 "+
+			"(the sibling, not the target)", got)
+	}
+}
+
+// TestARepositorysOwnTreeIsNotAnInputToItsOwnCohort is the fix W5/W4.3-verify
+// (major 1) demanded, at the producer.
+//
+// The cohort named every IN-SCOPE roster member's bytes, and the target is in
+// scope by construction, so the target's own committed corpus was an input to
+// its own dependency revision. graphBase resolves a dedicated member's corpus
+// from its ACTIVE generation, so every published advance moved the target's own
+// revision — and a moved revision roots a new chain rather than extending one.
+// The measured effect was a full committed-tree index on essentially every
+// commit of a running daemon.
+//
+// A sibling's tree is a different matter: that is a genuine cross-repository
+// input and must still move the revision. Both directions are asserted here at
+// the producer, so the rule is pinned independently of the publication chain
+// test that exercises it end to end.
+func TestARepositorysOwnTreeIsNotAnInputToItsOwnCohort(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	cfg := cohortCoordinatorConfig()
+	cfg.WorkspaceMembers = workspaceOf(builderRepoPrefix, "cohort-input")
+	c := f.inertCoordinator(t, cfg)
+
+	sibling := registerCohortSibling(t, f, "cohort-input", "tree-input-1")
+
+	lease, err := f.leases.AcquireRepositoryRoster()
+	if err != nil {
+		t.Fatalf("acquire the roster: %v", err)
+	}
+	inputs, err := c.cohort.inputs(context.Background(), lease)
+	lease.Release()
+	if err != nil {
+		t.Fatalf("assemble the production cohort: %v", err)
+	}
+
+	var target, dependency DependencyRevisionRepository
+	for _, repository := range inputs.Repositories {
+		switch repository.RepoPrefix {
+		case builderRepoPrefix:
+			target = repository
+		case sibling.prefix:
+			dependency = repository
+		}
+	}
+	if target.RepoPrefix == "" {
+		t.Fatalf("the cohort does not carry its own target: %+v", inputs.Repositories)
+	}
+	if got := target.SourceIdentity; got != DependencyRevisionTargetSourceIdentity {
+		t.Fatalf("the target's roster entry names its own bytes (%q); every commit in this "+
+			"repository re-keys its own cohort and forces a full re-root", got)
+	}
+	if dependency.RepoPrefix == "" {
+		t.Fatalf("the cohort dropped its workspace sibling: %+v", inputs.Repositories)
+	}
+	if !strings.HasPrefix(dependency.SourceIdentity, "tree:") {
+		t.Fatalf("a workspace sibling's roster entry does not name its bytes: %q",
+			dependency.SourceIdentity)
+	}
+	if dependency.SourceIdentity == DependencyRevisionTargetSourceIdentity {
+		t.Fatal("a workspace sibling was treated as the target")
+	}
+
+	// The target's own committed corpus moving does not move the revision. The
+	// baseline is taken after a fresh description so it names the roster the
+	// sibling is already in; what moves after it is one input at a time.
+	if !c.describeDependencyCohort(context.Background()) {
+		t.Fatalf("the production cohort was refused: %q", c.dependencyRevision())
+	}
+	baseline := c.dependencyRevision()
+	if !strings.HasPrefix(baseline, DependencyRevisionEncodingVersion+":") {
+		t.Fatalf("the production cohort was refused: %q", baseline)
+	}
+	moveTargetCorpus(t, f, "tree-target-2")
+	if !c.describeDependencyCohort(context.Background()) {
+		t.Fatal("the target's own commit made its cohort undescribable")
+	}
+	if got := c.dependencyRevision(); got != baseline {
+		t.Fatalf("the target's own commit moved its own dependency revision:\n before %q\n after  %q",
+			baseline, got)
+	}
+
+	// The sibling's does.
+	moveCohortSiblingTree(t, f, sibling, "tree-input-2")
+	if !c.describeDependencyCohort(context.Background()) {
+		t.Fatal("a workspace sibling's commit made the cohort undescribable")
+	}
+	if got := c.dependencyRevision(); got == baseline {
+		t.Fatal("a workspace sibling's committed tree moved and the cohort did not; " +
+			"excluding the target must not exclude its dependencies")
 	}
 }
 

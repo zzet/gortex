@@ -396,6 +396,166 @@ func TestInitialBasePublisherScheduleNeverBlocksOnQueueDepth(t *testing.T) {
 	require.Empty(t, publisher.Outcomes())
 }
 
+// TestALiveAdvanceDoesNotReleaseTheStartupQueue pins the one rule that still
+// preserves "ready, then publish" now that a live advance may start the worker.
+//
+// W4.2's ordering was a property of the worker never running before
+// BeginDraining. W4.3 changed that: enqueueAdvance starts the worker itself,
+// because a HEAD change on a daemon whose warmup never reached BeginDraining
+// would otherwise never be published. What keeps the ordering is popLocked's
+// `if !req.live && !p.drainReleased { continue }` — and W5/W4.3-verify (minor 2)
+// showed that deleting it left the whole suite green, including the test the
+// implementer named as its guard.
+//
+// Both halves are pinned here: the dequeue rule itself, and the ordering it
+// exists for, driven through the real worker.
+func TestALiveAdvanceDoesNotReleaseTheStartupQueue(t *testing.T) {
+	t.Run("the dequeue refuses a startup request before BeginDraining", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		defer f.close()
+		installStartupPublisherRuntime(t, f)
+		publisher := startupPublisher(t, f)
+		// Consume the worker Once so nothing drains under the assertions: this
+		// is a statement about popLocked, not about scheduling.
+		publisher.worker.Do(func() {})
+
+		publisher.Schedule("startup-repo")
+		publisher.mu.Lock()
+		_, admitted := publisher.popLocked()
+		publisher.mu.Unlock()
+		require.False(t, admitted,
+			"a startup publication was admitted before BeginDraining released the queue; "+
+				"a full committed-tree index per repository can now precede the readiness flip")
+
+		// A live request in the same queue is admitted regardless: the watchers
+		// that produce one come up after the flip, so there is no ordering left
+		// for the flag to protect.
+		publisher.enqueueAdvance(basePublishRequest{prefix: "live-repo"})
+		publisher.mu.Lock()
+		live, admitted := publisher.popLocked()
+		publisher.mu.Unlock()
+		require.True(t, admitted, "a live advance was held behind the startup queue")
+		require.Equal(t, "live-repo", live.prefix)
+		require.True(t, live.live)
+
+		publisher.BeginDraining()
+		publisher.mu.Lock()
+		startup, admitted := publisher.popLocked()
+		publisher.mu.Unlock()
+		require.True(t, admitted, "BeginDraining did not release the startup queue")
+		require.Equal(t, "startup-repo", startup.prefix)
+		require.False(t, startup.live)
+	})
+
+	t.Run("a live advance running does not drag the startup queue out with it", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		defer f.close()
+		installStartupPublisherRuntime(t, f)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		root := f.gitRepo("ordering")
+		registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+		require.NoError(t, err)
+		graphID := GraphIDFor(registered.Prefix)
+
+		publisher := startupPublisher(t, f)
+		publisher.Schedule(registered.Prefix)
+		require.Equal(t, 1, publisher.Pending())
+
+		// A live advance for a DIFFERENT prefix. It starts the worker, which is
+		// the whole hazard: the worker is now running while the daemon has not
+		// flipped ready.
+		require.True(t, publisher.enqueueAdvance(basePublishRequest{prefix: "no-such-repository"}))
+		require.Eventually(t, func() bool {
+			for _, outcome := range publisher.Outcomes() {
+				if outcome.RepoPrefix == "no-such-repository" {
+					return true
+				}
+			}
+			return false
+		}, 30*time.Second, 5*time.Millisecond, "the live advance never ran")
+
+		// The startup publication must still be waiting.
+		require.Never(t, func() bool { return publisher.Pending() == 0 },
+			2*time.Second, 25*time.Millisecond,
+			"a scheduled startup publication ran while the daemon had not released the queue; "+
+				"a whole-repository committed index is now in front of the readiness flip")
+		require.Empty(t, dedicatedGenerations(t, f, graphID),
+			"a committed base was published before BeginDraining")
+
+		publisher.BeginDraining()
+		require.NoError(t, publisher.Wait(ctx))
+		require.Len(t, dedicatedGenerations(t, f, graphID), 1,
+			"BeginDraining did not publish the queued startup base")
+	})
+}
+
+// TestAStartupScheduleDoesNotDowngradeAQueuedLiveAdvance pins the replacement
+// rule's direction.
+//
+// enqueueLocked replaces a queued request in place so a burst of HEAD changes
+// coalesces to its newest target. Before this item it replaced in BOTH
+// directions, so a Schedule arriving for a prefix whose LIVE advance was already
+// queued silently downgraded it: the git-resolved commit was lost (falling back
+// to the checkout row's head_tree, which still names the PREVIOUS tree at that
+// instant), the live flag was lost (so the advance waited for a drain release it
+// should ignore), and the trigger's completion memo was dropped with the
+// callback, so the next observation of the same commit paid for a fresh cohort
+// description again. Today's daemon orders the two calls so it cannot happen;
+// the ordering is an external invariant, not a local one.
+func TestAStartupScheduleDoesNotDowngradeAQueuedLiveAdvance(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	publisher := startupPublisher(t, f)
+	publisher.worker.Do(func() {}) // nothing drains while the queue is inspected
+
+	const prefix = "downgraded"
+	memo := make(chan InitialBasePublication, 1)
+	publisher.enqueueAdvance(basePublishRequest{
+		prefix: prefix,
+		root:   "/observed/root",
+		target: dedicatedBaseTarget{CommitOID: "0123456789abcdef0123456789abcdef01234567"},
+		done:   func(outcome InitialBasePublication) { memo <- outcome },
+	})
+
+	publisher.Schedule(prefix)
+
+	publisher.mu.Lock()
+	queued := publisher.queued
+	order := append([]string(nil), publisher.pendingOrder...)
+	request := publisher.pendingReq[prefix]
+	publisher.mu.Unlock()
+
+	require.Equal(t, []string{prefix}, order)
+	require.Equal(t, 1, queued, "the startup schedule counted a second queued publication")
+	require.True(t, request.live,
+		"a startup schedule downgraded a queued live advance; it now waits for a drain release "+
+			"and republishes the checkout row's stale head_tree")
+	require.Equal(t, "0123456789abcdef0123456789abcdef01234567", request.target.CommitOID,
+		"the startup schedule discarded the git-resolved target of the queued advance")
+	require.Equal(t, "/observed/root", request.root,
+		"the startup schedule discarded the observed working copy of the queued advance")
+	require.NotNil(t, request.done,
+		"the startup schedule dropped the trigger's completion memo, so the next observation "+
+			"of the same commit pays for a fresh cohort description")
+
+	// The other direction is unchanged: a NEWER live target still replaces.
+	publisher.enqueueAdvance(basePublishRequest{
+		prefix: prefix,
+		root:   "/observed/root",
+		target: dedicatedBaseTarget{CommitOID: "89abcdef0123456789abcdef0123456789abcdef"},
+	})
+	publisher.mu.Lock()
+	newest := publisher.pendingReq[prefix]
+	queued = publisher.queued
+	publisher.mu.Unlock()
+	require.Equal(t, 1, queued)
+	require.Equal(t, "89abcdef0123456789abcdef0123456789abcdef", newest.target.CommitOID,
+		"a newer live advance stopped coalescing onto the queued slot")
+}
+
 // TestInitialBasePublisherWaitAccountsForWorkThatWillNeverRun states Wait's
 // contract explicitly, because it is the join both cmd wiring tests use.
 //

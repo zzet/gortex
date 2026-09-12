@@ -150,6 +150,29 @@ func newDedicatedBaseAdvanceTrigger(publisher *InitialBasePublisher) *DedicatedB
 		accepted:  map[string]string{},
 	}
 	dedicatedBaseAdvanceRegistry.Store(publisher.lifecycle.mi, trigger)
+	// The registry entry's lifetime is bound to the publisher's context, not to
+	// InitialBasePublisher.Close.
+	//
+	// The daemon's shutdown does NOT call Close: `state.shared.Close()` runs the
+	// stack's cleanup chain, whose CheckoutLifecycle.Close closes publisher
+	// admission on the runtime, and that cancels every registered driver
+	// (DedicatedBaseRuntime.publicationContext / CloseDedicatedBaseAdmission).
+	// Before this goroutine existed nothing removed the entry on that path, so a
+	// process-wide sync.Map retained trigger -> publisher -> lifecycle ->
+	// *MultiIndexer for the life of the process — inert (`live()` is false, so a
+	// watcher finds no trigger) but memory-retaining, and wrong for a
+	// long-running process that stops and rebuilds a stack.
+	//
+	// It costs one parked goroutine per publisher, it exits on either stop, and
+	// close() is idempotent and CompareAndDelete-guarded, so a fixture that
+	// builds a second publisher over the same MultiIndexer is never unregistered
+	// by the first one's teardown.
+	if publisher.ctx != nil {
+		go func() {
+			<-publisher.ctx.Done()
+			trigger.close()
+		}()
+	}
 	return trigger
 }
 
@@ -228,31 +251,17 @@ func (t *DedicatedBaseAdvanceTrigger) HeadChanged(repoPrefix, root, commitOID st
 	}
 }
 
-// AdvanceRepo is HeadChanged without the queue: it publishes one advance
-// synchronously and returns its outcome. Production dispatches through
-// HeadChanged; this is the entry point for a caller that already owns the
-// waiting — a one-shot server, or a test.
-func (t *DedicatedBaseAdvanceTrigger) AdvanceRepo(ctx context.Context, repoPrefix, root, commitOID string) DedicatedBaseAdvance {
-	out := DedicatedBaseAdvance{RepoPrefix: repoPrefix, CommitOID: commitOID}
-	if t == nil || t.publisher == nil {
-		out.Skipped = "no advancement trigger"
-		return out
-	}
-	if repoPrefix == "" || commitOID == "" {
-		out.Skipped = "incomplete head observation"
-		return out
-	}
-	if ctx == nil {
-		ctx = t.publisher.ctx
-	}
-	t.publisher.lifecycle.invalidateDependencyCohortsForPrefix(repoPrefix,
-		fmt.Sprintf("git watcher: %s advanced to %s", repoPrefix, shortCommit(commitOID)))
-	outcome := t.publisher.publish(ctx, basePublishRequest{
-		prefix: repoPrefix, root: root, live: true,
-		target: dedicatedBaseTarget{CommitOID: commitOID},
-	})
-	return t.record(commitOID, outcome)
-}
+// There is deliberately NO exported synchronous advance.
+//
+// An `AdvanceRepo(ctx, prefix, root, commit)` used to sit here: HeadChanged
+// without the queue. It had zero production callers, and it was a hole in three
+// invariants at once — it bypassed the single pending list that keeps one
+// committed-base build running at a time, it skipped the accepted-commit memo's
+// pre-check, and it was invisible to
+// TestOnlyTheGitWatcherHeadFinalizeDispatchesAdvancement's census of dispatch
+// sites. A caller that wants to wait queues through HeadChanged and joins
+// InitialBasePublisher.Wait; that is what the tests do now, and it exercises the
+// production path rather than a parallel one.
 
 // record turns one publication outcome into an advance, memoising the commit
 // when the publication settled.
@@ -289,16 +298,6 @@ func (t *DedicatedBaseAdvanceTrigger) Advances() []DedicatedBaseAdvance {
 	out := make([]DedicatedBaseAdvance, len(t.advances))
 	copy(out, t.advances)
 	return out
-}
-
-// Wait blocks until every queued advance (and every queued startup
-// publication) has been attempted. It shares the publisher's accounting
-// because it shares the publisher's queue.
-func (t *DedicatedBaseAdvanceTrigger) Wait(ctx context.Context) error {
-	if t == nil || t.publisher == nil {
-		return nil
-	}
-	return t.publisher.Wait(ctx)
 }
 
 // dedicatedBaseCommitTree resolves the tree a commit names.

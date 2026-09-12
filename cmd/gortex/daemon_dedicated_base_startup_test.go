@@ -310,3 +310,79 @@ func TestDaemonWarmupReadinessIsNotBlockedByPublication(t *testing.T) {
 		t.Fatalf("the publisher settled with %d publications still queued", pending)
 	}
 }
+
+// TestDaemonShutdownStopsTheCommittedBasePublisher is the production-entrypoint
+// trace for the publisher's teardown, and the reason the live advancement
+// trigger can bind its registry entry to the publisher's context instead of to
+// InitialBasePublisher.Close.
+//
+// The daemon never calls Close. Its exit paths converge on the teardown that
+// runs `state.shared.Close()` (daemon.go), which runs the shared stack's
+// cleanup chain, which calls CheckoutLifecycle.Close, whose
+// stopRepositoryPublishers closes publisher admission on the runtime
+// (repository_admission.go) and cancels every registered publication driver.
+//
+// Before this item nothing on that path removed the trigger from the
+// process-wide advancement registry, so a stopped daemon's whole stack —
+// trigger -> publisher -> lifecycle -> *MultiIndexer — stayed reachable for the
+// life of the process (W5/W4.3-verify, minor 5). The registry half is asserted
+// in the indexer package, where the map is visible; what is asserted here is
+// that the daemon's own shutdown really does reach the cancellation the
+// unregistration now hangs off.
+func TestDaemonShutdownStopsTheCommittedBasePublisher(t *testing.T) {
+	base := startupPublicationEnv(t)
+	root := startupPublicationRepo(t, base, "shutdown")
+
+	state, err := buildDaemonState(zap.NewNop())
+	if err != nil {
+		t.Fatalf("buildDaemonState: %v", err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if state.shared != nil && !closed {
+			_ = state.shared.Close()
+		}
+	})
+	if state.basePublisher == nil {
+		t.Fatal("the daemon built no committed-base publisher; there is no teardown to trace")
+	}
+	if state.basePublisher.AdvanceTrigger() == nil {
+		t.Fatal("the daemon's publisher carries no live advancement trigger")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	if _, err := state.lifecycle.Register(ctx, config.RepoEntry{Path: root}, indexer.TrackSourceCLI); err != nil {
+		t.Fatalf("register the repository: %v", err)
+	}
+	if err := state.lifecycle.Seed(ctx); err != nil {
+		t.Fatalf("seed the checkout catalog: %v", err)
+	}
+
+	// Vacuity guard: while the daemon is up, the publisher admits work. Without
+	// this the post-shutdown assertion would also pass for a publisher that
+	// never admitted anything.
+	state.basePublisher.Schedule("pre-shutdown-probe")
+	if pending := state.basePublisher.Pending(); pending != 1 {
+		t.Fatalf("a running daemon's publisher queued %d publications for one schedule; "+
+			"the shutdown assertion below would be vacuous", pending)
+	}
+
+	// The daemon's own teardown, exactly as installDaemonTeardown runs it.
+	closed = true
+	if err := state.shared.Close(); err != nil {
+		t.Fatalf("shut the daemon stack down: %v", err)
+	}
+
+	before := state.basePublisher.Pending()
+	state.basePublisher.Schedule("post-shutdown-probe")
+	if after := state.basePublisher.Pending(); after != before {
+		t.Fatalf("the publisher admitted a publication after the daemon shut down "+
+			"(pending %d -> %d); shutdown did not reach the publication driver's cancellation",
+			before, after)
+	}
+	if err := state.basePublisher.Wait(context.Background()); err == nil {
+		t.Fatal("the publisher reported its abandoned queue as settled after shutdown; " +
+			"its driver was never cancelled")
+	}
+}

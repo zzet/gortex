@@ -38,6 +38,34 @@ const (
 	DependencyRevisionRepositoryRaw       = "raw"
 )
 
+// DependencyRevisionTargetSourceIdentity is the source identity a cohort gives
+// the TARGET repository's own roster entry.
+//
+// A repository's own corpus is not one of its dependencies. It is the thing the
+// generation is OF, and the identity already names it in its own columns: the
+// committed base's TreeOID (`store_sqlite.DedicatedBaseIdentity`, stamped by
+// `InitialBasePublisher.observe`), a checkout commit layer's TreeOID and its
+// LowerViewFingerprint (`CheckoutCoordinator.commitIdentity`), a working-tree
+// layer's content fingerprint. Digesting those same bytes a SECOND time here
+// makes the target's own commit move the target's own dependency revision —
+// and a moved revision ROOTS a new chain rather than extending one
+// (`dedicatedBaseParentForAdvance`). The observable cost is a full
+// committed-tree index on essentially every advance after the first, on a
+// branch whose entire purpose is bounding incremental write amplification.
+//
+// The target's roster ENTRY stays: the target must be a member (the preimage
+// refuses a cohort that does not carry it), and its kind, graph, checkout and
+// incarnation are still digested, so re-admitting the target under a new
+// incarnation still re-keys. What the entry carries instead of its bytes is
+// this constant — a value no repository's real source identity can collide with,
+// because a dedicated member's is "tree:<oid>" and a raw member's is
+// "raw:<revision>:<fingerprint>".
+//
+// Workspace SIBLINGS keep naming their bytes: a sibling's tree is a genuine
+// cross-repository input, and W2.4's scope rule is what bounds how many of them
+// there are.
+const DependencyRevisionTargetSourceIdentity = "target"
+
 // ErrDependencyRevisionIncomplete means the cohort handed to
 // ComputeDependencyRevision does not describe the complete resolver-visible
 // input set, so no revision was produced.
@@ -963,7 +991,7 @@ func (s dependencyCohortSource) scopedInputs(
 }
 
 // sourceIdentities names what this build can see of each IN-SCOPE roster
-// member's bytes.
+// member's bytes — every member EXCEPT the target itself.
 //
 // A dedicated repository's source is the committed corpus its graph is at — the
 // same primary base every layer over that graph is built against, so the cohort
@@ -971,6 +999,14 @@ func (s dependencyCohortSource) scopedInputs(
 // no committed tree; its source witness (revision plus content fingerprint) is
 // the equivalent, read under a bounded budget so a concurrent source mutation
 // cannot park the caller.
+//
+// The TARGET is not read at all. Its own corpus is what the generation is OF,
+// named by the identity's own columns, and naming it here as well would make
+// every commit in the target re-key the target and force a full re-root —
+// see DependencyRevisionTargetSourceIdentity for the whole argument. Skipping
+// it is also the one read this enumeration can drop unconditionally: the target
+// is in scope by construction, so a daemon whose workspaces are all
+// single-repository now reads no roster member's source at all.
 //
 // Every refusal is a refusal of the whole cohort — a member whose bytes cannot
 // be named is exactly the false certificate a revision must not issue — but
@@ -990,8 +1026,18 @@ func (s dependencyCohortSource) sourceIdentities(
 	if budget <= 0 {
 		budget = dependencyRevisionSourceBudget
 	}
+	// self reports whether a roster member is the cohort's own target. An empty
+	// target prefix matches nothing: the preimage refuses such a cohort anyway,
+	// and treating "" as self would silently exempt a member with no prefix.
+	self := func(repoPrefix string) bool {
+		return s.Target.RepoPrefix != "" && repoPrefix == s.Target.RepoPrefix
+	}
 	for _, owner := range lease.DedicatedOwners() {
 		if member != nil && !member(owner.RepoPrefix) {
+			continue
+		}
+		if self(owner.RepoPrefix) {
+			out[owner.RepoPrefix] = DependencyRevisionTargetSourceIdentity
 			continue
 		}
 		if s.Counters != nil {
@@ -1020,6 +1066,13 @@ func (s dependencyCohortSource) sourceIdentities(
 	for _, registration := range lease.RawRegistrations() {
 		owner := registration.Owner()
 		if member != nil && !member(owner.RepoPrefix) {
+			continue
+		}
+		if self(owner.RepoPrefix) {
+			// A raw target's working bytes are its own layer's fingerprint, not
+			// a dependency of itself: witnessing them here would re-key the
+			// target on every save of its own working copy.
+			out[owner.RepoPrefix] = DependencyRevisionTargetSourceIdentity
 			continue
 		}
 		if s.Counters != nil {

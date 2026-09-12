@@ -104,6 +104,27 @@ func (f *advanceFixture) reconcileAndWait(t *testing.T) {
 	require.NoError(t, f.publisher.Wait(ctx))
 }
 
+// dispatchAndWait drives ONE observed HEAD movement through the trigger's
+// production entry point and joins the publication it queued, returning the
+// advance the trigger recorded.
+//
+// It replaces the trigger's old exported AdvanceRepo, which published
+// synchronously outside the shared queue and outside the memo pre-check. Going
+// through HeadChanged means a test asserts on the path the Git watcher actually
+// takes; the join is InitialBasePublisher.Wait, the publisher's own accounting.
+func (f *advanceFixture) dispatchAndWait(t *testing.T, root, commitOID string) DedicatedBaseAdvance {
+	t.Helper()
+	before := len(f.trigger.Advances())
+	f.trigger.HeadChanged(f.prefix, root, commitOID)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	require.NoError(t, f.publisher.Wait(ctx))
+	advances := f.trigger.Advances()
+	require.Greater(t, len(advances), before,
+		"the production dispatch recorded no advance for %s", shortCommit(commitOID))
+	return advances[len(advances)-1]
+}
+
 // generations lists this fixture's committed generations, oldest first.
 func (f *advanceFixture) generations(t *testing.T) []store_sqlite.ViewGeneration {
 	t.Helper()
@@ -178,6 +199,150 @@ func TestGitWatcherHeadChangeAdvancesTheCommittedBase(t *testing.T) {
 	require.False(t, routed, "the dedicated owner must not be routed by publication")
 }
 
+// newestGeneration returns the row a fresh advance just allocated.
+func newestGeneration(t *testing.T, rows []store_sqlite.ViewGeneration) store_sqlite.ViewGeneration {
+	t.Helper()
+	require.NotEmpty(t, rows)
+	newest := rows[0]
+	for _, row := range rows[1:] {
+		if row.GenerationID > newest.GenerationID {
+			newest = row
+		}
+	}
+	return newest
+}
+
+// TestSuccessiveCommitsExtendTheChainRatherThanReRooting is the whole point of
+// the incremental committed base, and it was broken by the cohort's own scope
+// rule until this item.
+//
+// A repository's OWN corpus tree was an input to its OWN dependency revision
+// (dependencyCohortSource.sourceIdentities named every in-scope roster member,
+// target included, and graphBase resolves the target's tree from its active
+// generation). So the target's dependency revision moved on essentially every
+// commit, and a moved revision ROOTS a new chain rather than extending one
+// (dedicatedBaseParentForAdvance). The measured shape was: commit 1 a delta,
+// commit 2 a FULL committed-tree index, commit 3 a FULL committed-tree index —
+// a full re-index of the whole repository on nearly every commit, on a branch
+// whose measured target is write amplification.
+//
+// Three successive commits, driven through the Git watcher's production
+// dispatch, must produce one root and then two deltas, each naming the previous
+// generation as its base, all four under ONE unchanged dependency revision.
+func TestSuccessiveCommitsExtendTheChainRatherThanReRooting(t *testing.T) {
+	f := newAdvanceFixture(t, "chain")
+	rows := f.generations(t)
+	require.Len(t, rows, 1, "the fixture starts from one published base")
+	root := rows[0]
+	require.Zero(t, root.BaseGenerationID, "the first committed generation is a full root")
+	require.True(t, strings.HasPrefix(root.DependencyRevision, DependencyRevisionEncodingVersion+":"),
+		"the fixture's base carries no certified cohort: %q", root.DependencyRevision)
+
+	parent := root
+	for i, name := range []string{"chain-one.go", "chain-two.go", "chain-three.go"} {
+		sha := f.commit(t, name,
+			"package a\n\nfunc Chain"+string(rune('A'+i))+"() {}\n", "chain "+name)
+		f.reconcileAndWait(t)
+
+		rows = f.generations(t)
+		require.Lenf(t, rows, i+2, "commit %d published the wrong number of generations", i+1)
+		published := newestGeneration(t, rows)
+		require.Equalf(t, published.GenerationID, f.activeGeneration(t),
+			"commit %d did not adopt what it published", i+1)
+		require.Equalf(t, gitTree(t, f.root, sha), published.TreeOID,
+			"commit %d published the wrong tree", i+1)
+		require.Equalf(t, parent.DependencyRevision, published.DependencyRevision,
+			"commit %d moved the repository's OWN dependency revision; its own corpus tree is an "+
+				"input to its own cohort again, so every advance re-roots", i+1)
+		require.Equalf(t, parent.GenerationID, published.BaseGenerationID,
+			"commit %d re-rooted (base=%d) instead of extending the chain over generation %d; "+
+				"that is a full committed-tree index per commit",
+			i+1, published.BaseGenerationID, parent.GenerationID)
+		require.NotEmptyf(t, published.LayerID, "commit %d published a root, not a delta", i+1)
+		require.NotEmptyf(t, published.LowerViewFingerprint,
+			"commit %d published a delta with no lower", i+1)
+		parent = published
+	}
+}
+
+// TestARealCohortChangeStillRootsANewChain is the other direction of the same
+// rule, and the reason the fix is "exclude SELF" rather than "stop digesting
+// source identities".
+//
+// A workspace sibling's committed tree IS a cross-repository input: a build of
+// this repository may resolve against it. When one joins the target's workspace
+// the cohort genuinely moved, so the next advance must NOT be spliced under a
+// base that was built against the older cohort — it roots a new chain.
+func TestARealCohortChangeStillRootsANewChain(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	root := f.gitRepo("cohort-target")
+	target, err := f.lc.Register(ctx, config.RepoEntry{
+		Path: root, Name: "cohort-target", Workspace: cohortTestWorkspace,
+	}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, target.CatalogErr)
+
+	publisher := startupPublisher(t, f)
+	initial := publisher.PublishRepo(ctx, target.Prefix)
+	require.NoError(t, initial.Err)
+	require.Empty(t, initial.Skipped)
+	require.Positive(t, initial.GenerationID)
+
+	graphID := GraphIDFor(target.Prefix)
+	idx := f.mi.GetIndexer(target.Prefix)
+	require.NotNil(t, idx)
+	require.Equal(t, cohortTestWorkspace, idx.WorkspaceID(),
+		"the target is not in a workspace, so no sibling can be an input to it")
+	gw, err := NewGitWatcher(root, idx, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = gw.Stop() })
+	gw.mu.Lock()
+	gw.lastSHA = gitHead(t, root)
+	gw.mu.Unlock()
+
+	advance := func(t *testing.T, file, body, message string) store_sqlite.ViewGeneration {
+		t.Helper()
+		writeFile(t, filepath.Join(root, file), body)
+		runGit(t, root, "add", ".")
+		runGit(t, root, "commit", "-q", "-m", message)
+		gw.reconcile("test")
+		require.NoError(t, publisher.Wait(ctx))
+		return newestGeneration(t, dedicatedGenerations(t, f, graphID))
+	}
+
+	// Baseline: with the cohort unchanged, an advance extends.
+	base := newestGeneration(t, dedicatedGenerations(t, f, graphID))
+	extended := advance(t, "before.go", "package a\n\nfunc Before() {}\n", "before the sibling")
+	require.Equal(t, base.GenerationID, extended.BaseGenerationID,
+		"an advance under an unchanged cohort did not extend the chain")
+	require.Equal(t, base.DependencyRevision, extended.DependencyRevision)
+
+	// A second repository is tracked into the SAME workspace and indexed. That
+	// is a real change to what this repository's resolution can see.
+	siblingRoot := f.gitRepo("cohort-input")
+	sibling, err := f.lc.Register(ctx, config.RepoEntry{
+		Path: siblingRoot, Name: "cohort-input", Workspace: cohortTestWorkspace,
+	}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, sibling.CatalogErr)
+
+	rooted := advance(t, "after.go", "package a\n\nfunc After() {}\n", "after the sibling")
+	require.NotEqual(t, extended.DependencyRevision, rooted.DependencyRevision,
+		"a repository joined the target's workspace and its cohort did not move; "+
+			"excluding SELF from the cohort must not exclude siblings")
+	require.True(t, strings.HasPrefix(rooted.DependencyRevision, DependencyRevisionEncodingVersion+":"),
+		"the advance after the sibling joined fell back to a degraded revision: %q",
+		rooted.DependencyRevision)
+	require.Zero(t, rooted.BaseGenerationID,
+		"an advance under a CHANGED cohort was spliced under a base built for the old one")
+	require.Empty(t, rooted.LayerID, "a re-root published a sparse layer")
+}
+
 func rowByID(t *testing.T, rows []store_sqlite.ViewGeneration, id int64) store_sqlite.ViewGeneration {
 	t.Helper()
 	for _, row := range rows {
@@ -204,17 +369,34 @@ func TestGitWatcherSameTreeCommitPublishesNothing(t *testing.T) {
 	require.Len(t, base, 1)
 
 	// An amend with no content change: a new commit object over the same tree.
-	runGit(t, f.root, "commit", "-q", "--amend", "--no-edit")
+	runGit(t, f.root, "commit", "-q", "--amend", "-m", "amended once")
 	amended := gitHead(t, f.root)
 	require.Equal(t, base[0].TreeOID, gitTree(t, f.root, amended),
 		"the amend was supposed to leave the tree alone")
+
+	// The production entry point first, unaudited: the watcher's reconcile
+	// restamps generation-0 freshness on its way to the dispatch, which is a
+	// legitimate write, so the audit cannot span it.
+	f.reconcileAndWait(t)
+	require.Len(t, f.generations(t), 1,
+		"the watcher's own dispatch allocated a generation for a same-tree commit")
+	require.Equal(t, base[0].GenerationID, f.activeGeneration(t))
+
+	// The same fact with the catalog instrumented. A SECOND same-tree amend,
+	// because the trigger memoises the commit that just landed and would drop a
+	// repeat of it before reaching the publisher at all.
+	runGit(t, f.root, "commit", "-q", "--amend", "-m", "amended twice")
+	again := gitHead(t, f.root)
+	require.NotEqual(t, amended, again, "the second amend produced no new commit object")
+	require.Equal(t, base[0].TreeOID, gitTree(t, f.root, again),
+		"the second amend was supposed to leave the tree alone")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	audit, err := installDedicatedWriteAudit(ctx, f.dbPath)
 	require.NoError(t, err)
 
-	advance := f.trigger.AdvanceRepo(ctx, f.prefix, f.root, amended)
+	advance := f.dispatchAndWait(t, f.root, again)
 
 	require.NoError(t, audit(), "a same-tree commit wrote the catalog")
 	require.NoError(t, advance.Err)
@@ -223,13 +405,6 @@ func TestGitWatcherSameTreeCommitPublishesNothing(t *testing.T) {
 	require.True(t, advance.Coalesced, "a same-tree commit ran a physical build")
 	require.Equal(t, base[0].GenerationID, advance.GenerationID)
 	require.Len(t, f.generations(t), 1, "a same-tree commit allocated a generation")
-	require.Equal(t, base[0].GenerationID, f.activeGeneration(t))
-
-	// The same fact through the production entry point: the watcher reconciles
-	// the amended HEAD and the corpus does not move.
-	f.reconcileAndWait(t)
-	require.Len(t, f.generations(t), 1,
-		"the watcher's own dispatch allocated a generation for a same-tree commit")
 	require.Equal(t, base[0].GenerationID, f.activeGeneration(t))
 }
 
@@ -290,18 +465,24 @@ func TestDedicatedBaseAdvanceIgnoresARepeatedObservation(t *testing.T) {
 	f := newAdvanceFixture(t, "repeat")
 	sha := f.commit(t, "repeat.go", "package a\n\nfunc Repeat() {}\n", "repeat")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	first := f.trigger.AdvanceRepo(ctx, f.prefix, f.root, sha)
+	first := f.dispatchAndWait(t, f.root, sha)
 	require.NoError(t, first.Err)
 	require.True(t, first.Published)
 
-	f.publisher.worker.Do(func() {}) // no drain: a dispatch that is accepted would stay queued
+	// queued only ever grows, so comparing it across the repeat is exact even
+	// with the publisher's worker still running: an accepted dispatch has
+	// already incremented it by the time HeadChanged returns.
+	f.publisher.mu.Lock()
+	before := f.publisher.queued
+	f.publisher.mu.Unlock()
+
 	f.trigger.HeadChanged(f.prefix, f.root, sha)
+
 	f.publisher.mu.Lock()
 	queued := f.publisher.queued
 	f.publisher.mu.Unlock()
-	require.Zero(t, queued, "a repeat of the commit that already landed was queued again")
+	require.Equal(t, before, queued, "a repeat of the commit that already landed was queued again")
+	require.Len(t, f.generations(t), 2, "a repeat observation published a second generation")
 }
 
 // TestDedicatedBaseAdvanceRefusesAnObservationFromAnotherWorkingCopy is the
@@ -318,9 +499,7 @@ func TestDedicatedBaseAdvanceRefusesAnObservationFromAnotherWorkingCopy(t *testi
 	runGit(t, sibling, "commit", "-q", "-m", "sibling commit")
 	siblingSHA := gitHead(t, sibling)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	advance := f.trigger.AdvanceRepo(ctx, f.prefix, sibling, siblingSHA)
+	advance := f.dispatchAndWait(t, sibling, siblingSHA)
 	require.NoError(t, advance.Err)
 	require.Equal(t, "observed root is not the dedicated owner", advance.Skipped)
 	require.Len(t, f.generations(t), 1, "a sibling's commit advanced the owner's base")
@@ -455,33 +634,141 @@ func TestWorkingCopyReindexAllocatesNoCommittedGeneration(t *testing.T) {
 // exactly what gate 2 forbids — and it is a one-line mistake to make. This test
 // fails the moment a second production dispatch appears.
 func TestOnlyTheGitWatcherHeadFinalizeDispatchesAdvancement(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	require.NoError(t, err)
-	callers := map[string]int{}
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		body, err := os.ReadFile(name)
+	census := func(t *testing.T, patterns ...string) map[string]int {
+		t.Helper()
+		entries, err := os.ReadDir(".")
 		require.NoError(t, err)
-		for _, line := range strings.Split(string(body), "\n") {
-			code := strings.TrimSpace(line)
-			if strings.HasPrefix(code, "//") {
+		callers := map[string]int{}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 				continue
 			}
-			if strings.Contains(code, ".HeadChanged(") || strings.Contains(code, ".enqueueAdvance(") {
-				callers[name]++
+			body, err := os.ReadFile(name)
+			require.NoError(t, err)
+			for _, line := range strings.Split(string(body), "\n") {
+				code := strings.TrimSpace(line)
+				if strings.HasPrefix(code, "//") {
+					continue
+				}
+				for _, pattern := range patterns {
+					if strings.Contains(code, pattern) {
+						callers[name]++
+						break
+					}
+				}
 			}
 		}
+		return callers
 	}
+
 	require.Equal(t, map[string]int{
 		// the dispatch itself
 		"git_watcher.go": 1,
 		// HeadChanged's own enqueue
 		"dedicated_base_advance_trigger.go": 1,
-	}, callers, "committed advancement gained a production dispatch site outside the "+
-		"git watcher's HEAD-change finalize path")
+	}, census(t, ".HeadChanged(", ".enqueueAdvance("),
+		"committed advancement gained a production dispatch site outside the "+
+			"git watcher's HEAD-change finalize path")
+
+	// The queue-bypass census. A dispatch site is only half the blast radius:
+	// the trigger used to carry an exported AdvanceRepo that published
+	// SYNCHRONOUSLY, outside the shared pending list and outside the memo's
+	// pre-check, and the pattern set above was blind to it (W5/W4.3-verify,
+	// minor 3). Every call of the publisher's own publish must therefore be one
+	// of the two the design admits: the worker draining the queue, and
+	// PublishRepo, the deliberate synchronous entry point for a caller that
+	// owns its own waiting.
+	require.Equal(t, map[string]int{"dedicated_base_startup.go": 2},
+		census(t, "p.publish("),
+		"a committed-base publication path appeared outside InitialBasePublisher.run "+
+			"and InitialBasePublisher.PublishRepo; a synchronous bypass skips the single "+
+			"pending list that keeps one committed build running at a time")
+}
+
+// TestFiveCommitsAllocateFiveGenerationsAndTimersAllocateNone is the plan's
+// named W4.3 verification, at the size the test budget affords: N commits
+// allocate exactly N committed generations, and the two timer-driven paths that
+// could plausibly allocate one — the checkout coordinator's 15 s poll and the
+// hourly reconcile janitor — allocate none.
+//
+// It is the budget claim W8 will freeze, stated as a count rather than inferred
+// from a single-commit test: one root plus five deltas for five commits, no
+// generation per tick, and nothing re-rooted in between.
+func TestFiveCommitsAllocateFiveGenerationsAndTimersAllocateNone(t *testing.T) {
+	f := newAdvanceFixture(t, "budget")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	require.Len(t, f.generations(t), 1, "the fixture starts from one published base")
+
+	const commits = 5
+	for i := 0; i < commits; i++ {
+		name := "budget-" + string(rune('a'+i)) + ".go"
+		f.commit(t, name, "package a\n\nfunc Budget"+string(rune('A'+i))+"() {}\n", "budget "+name)
+		f.reconcileAndWait(t)
+	}
+
+	rows := f.generations(t)
+	require.Len(t, rows, 1+commits,
+		"%d commits did not allocate exactly %d committed generations", commits, commits)
+	roots := 0
+	for _, row := range rows {
+		if row.BaseGenerationID == 0 {
+			roots++
+		}
+	}
+	require.Equal(t, 1, roots,
+		"%d commits produced %d full committed-tree roots; the chain re-rooted instead of extending",
+		commits, roots)
+	settled := len(rows)
+	active := f.activeGeneration(t)
+	require.Equal(t, newestGeneration(t, rows).GenerationID, active)
+
+	// The janitor tick: the checkout sweep plus the whole-workspace reconcile,
+	// exactly what startReconcileJanitor runs every hour. Both do real work —
+	// the reconcile re-reads every tracked repository — and neither is an
+	// observed HEAD movement, so neither may allocate.
+	for i := 0; i < 2; i++ {
+		_, err := f.lc.Sweep(ctx)
+		require.NoError(t, err)
+		f.mi.ReconcileAll()
+	}
+	require.Len(t, f.generations(t), settled,
+		"a janitor tick allocated a committed generation for the passage of time")
+	require.Equal(t, active, f.activeGeneration(t), "a janitor tick moved the active base")
+
+	// The checkout coordinator's poll. It is built after the commits so the
+	// fan-out it reacts to is settled before the count is taken.
+	f.worktreeOf(f.root, "budget-wt")
+	_, err := f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	automatic := f.automaticCheckoutID(f.familyOf(f.prefix).FamilyID, "budget-wt")
+	f.activateAndWait(automatic)
+	coordinator := settledCoordinator(t, f.lc, automatic)
+
+	// One real cycle first, so the polls below have routed layers to settle on
+	// and the no-allocation claim is not vacuous. It builds this checkout's own
+	// layers — which are NOT committed generations of the dedicated graph.
+	routed := coordinator.reconcile(ctx)
+	require.NoError(t, routed.Err)
+	require.NotZerof(t, routed.CommitGenerationID, "the coordinator routed no layers: %+v", routed)
+
+	before := len(f.generations(t))
+	for i := 0; i < 5; i++ {
+		_, ok := coordinator.settledWithoutBuild(ctx)
+		require.Truef(t, ok, "poll %d did not settle on the layers the coordinator had routed; "+
+			"the no-allocation claim below would be vacuous", i)
+	}
+	// And a whole poll cycle, the body the 15 s timer runs.
+	polled := coordinator.reconcile(ctx)
+	require.NoError(t, polled.Err)
+	require.Falsef(t, polled.CommitBuilt || polled.DirtyBuilt,
+		"an idle poll rebuilt the checkout's layers: %+v", polled)
+
+	require.Len(t, f.generations(t), before,
+		"a checkout-coordinator poll allocated a committed generation")
+	require.Equal(t, active, f.activeGeneration(t), "a coordinator poll moved the active base")
 }
 
 // TestCommittedAdvancementRequiresTheSharedLeaseDomain pins the trigger to the
@@ -554,6 +841,20 @@ func TestCommittedAdvancementRequiresTheSharedLeaseDomain(t *testing.T) {
 			"publisher admission closed and a watcher could still reach the trigger")
 		trigger.HeadChanged("any", "/nowhere", "0123456789abcdef")
 		require.Zero(t, publisher.Pending(), "a stopped trigger queued an advance")
+
+		// And the registry ENTRY is gone, not merely dead. This is the daemon's
+		// real shutdown path — `state.shared.Close()` runs the stack cleanup
+		// chain, whose CheckoutLifecycle.Close closes publisher admission — and
+		// nothing on it calls InitialBasePublisher.Close. Before the trigger
+		// bound its registration to the publisher's context, the process-wide
+		// sync.Map retained trigger -> publisher -> lifecycle -> *MultiIndexer
+		// for the life of the process (W5/W4.3-verify, minor 5).
+		require.Eventually(t, func() bool {
+			_, leaked := dedicatedBaseAdvanceRegistry.Load(f.mi)
+			return !leaked
+		}, 10*time.Second, 5*time.Millisecond,
+			"closing publisher admission left the whole lifecycle reachable from the "+
+				"process-wide advancement registry")
 	})
 }
 
