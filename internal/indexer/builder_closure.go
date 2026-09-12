@@ -11,6 +11,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // The affected closure of a change.
@@ -234,6 +235,9 @@ type closureWalk struct {
 	// introduces no import never pays for it.
 	dirIndex     map[string][]string
 	lastDirIndex map[string][]string
+	// fileIndex is the same scan's membership set: what a joined relative
+	// specifier's stem is probed against.
+	fileIndex map[string]struct{}
 }
 
 // admit offers one graph path to the closure. It reports whether the path
@@ -332,7 +336,7 @@ func (w *closureWalk) collectIntroduced(
 
 	refs := closureRefs{
 		names:    map[string]struct{}{},
-		imports:  map[string]struct{}{},
+		imports:  map[string]map[string]struct{}{},
 		defines:  map[string]struct{}{},
 		semantic: &semantic,
 	}
@@ -367,7 +371,7 @@ func (w *closureWalk) collectIntroduced(
 	}
 	sort.Strings(imports)
 	for _, importPath := range imports {
-		for _, graphPath := range w.importedFiles(importPath) {
+		for _, graphPath := range w.importedFiles(importPath, refs.importCallers(importPath)) {
 			out[graphPath] = struct{}{}
 		}
 	}
@@ -624,7 +628,9 @@ func (w *closureWalk) extractInto(rel string, refs *closureRefs) {
 	if result == nil {
 		return
 	}
+	refs.current = rel
 	refs.collect(result)
+	refs.current = ""
 	refs.semantic.record(rel, result)
 }
 
@@ -633,11 +639,52 @@ func (w *closureWalk) extractInto(rel string, refs *closureRefs) {
 // names, and the symbol names it DEFINES. The first two are what the resolver
 // binds from and the third is what it binds to, so a file placed by any of them
 // is a file the pass would have had to see.
+//
+// Every import path is recorded with the files that named it. The resolver's
+// import cascade is not a function of the specifier alone — a relative
+// specifier is joined against the importing file's own directory, and the
+// entry-point rule that keeps a bare JS/TS specifier off an arbitrary in-repo
+// file only applies when the importer is JS/TS (resolver/jsts_imports.go:253,
+// :294). Placing an import without knowing who wrote it is what made the
+// closure's last-component arm wider than the cascade it claims parity with.
 type closureRefs struct {
-	names    map[string]struct{}
-	imports  map[string]struct{}
-	defines  map[string]struct{}
+	names   map[string]struct{}
+	imports map[string]map[string]struct{}
+	defines map[string]struct{}
+	// current is the repo-relative path of the file being collected. It is
+	// what attributes each import path to its importer.
+	current  string
 	semantic *builderSemanticTarget
+}
+
+// addImport records one import specifier against the file currently being
+// collected.
+func (r *closureRefs) addImport(spec string) {
+	if spec == "" {
+		return
+	}
+	callers := r.imports[spec]
+	if callers == nil {
+		callers = map[string]struct{}{}
+		r.imports[spec] = callers
+	}
+	if r.current != "" {
+		callers[r.current] = struct{}{}
+	}
+}
+
+// importCallers returns the sorted repo-relative importers of one specifier.
+func (r *closureRefs) importCallers(spec string) []string {
+	set := r.imports[spec]
+	if len(set) == 0 {
+		return nil
+	}
+	callers := make([]string, 0, len(set))
+	for caller := range set {
+		callers = append(callers, caller)
+	}
+	sort.Strings(callers)
+	return callers
 }
 
 // collect reads one extraction's unresolved references and its definitions.
@@ -657,7 +704,7 @@ func (r *closureRefs) collect(result *parser.ExtractionResult) {
 			continue
 		}
 		if importPath, _ := node.Meta["path"].(string); importPath != "" {
-			r.imports[importPath] = struct{}{}
+			r.addImport(importPath)
 		}
 	}
 	for _, edge := range result.Edges {
@@ -687,11 +734,11 @@ func (r *closureRefs) addEndpoint(id string) {
 	case strings.HasPrefix(name, "extern::"):
 		rest := strings.TrimPrefix(name, "extern::")
 		if i := strings.LastIndex(rest, "::"); i > 0 {
-			r.imports[rest[:i]] = struct{}{}
+			r.addImport(rest[:i])
 			r.addName(rest[i+len("::"):])
 			return
 		}
-		r.imports[rest] = struct{}{}
+		r.addImport(rest)
 	default:
 		r.addName(name)
 	}
@@ -704,9 +751,9 @@ func (r *closureRefs) addImportSpecifier(specifier string) {
 	if specifier == "" {
 		return
 	}
-	r.imports[specifier] = struct{}{}
+	r.addImport(specifier)
 	if i := strings.Index(specifier, "::"); i > 0 {
-		r.imports[specifier[:i]] = struct{}{}
+		r.addImport(specifier[:i])
 	}
 }
 
@@ -732,34 +779,487 @@ func closureBareName(raw string) string {
 }
 
 // importedFiles places an import path on the base corpus's files, by the same
-// cascade the resolver's import binding uses: the exact directory the path
-// names, then — only when that misses — every directory whose last component
-// matches the path's. Being exactly as wide as the resolver is the point: a
-// file the resolver would have bound this import to is a file the generation
-// has to carry, and one it would not is a file the generation does not need.
-func (w *closureWalk) importedFiles(importPath string) []string {
+// cascade the resolver's import binding uses. The generation has to carry
+// every file the resolver could have bound this import to; a file it could
+// not is payload the generation pays for nothing.
+//
+// The two arms mirror resolveImport's candidate scan (resolver.go:3809-3822)
+// one for one:
+//
+//   - `dirIndex[importPath]`, the directory the path names outright. When it
+//     yields a candidate the resolver stops there (`stop()`, resolver.go:3805,
+//     applied at :3812) and so does this.
+//   - `lastDirIndex[lastPathComponent(importPath)]`, every directory whose
+//     last component matches. Reached only when the first arm found nothing.
+//
+// WHICH candidate the resolver then binds is not something the closure can
+// predict, and that asymmetry is the whole reason this is a placement and not
+// a lookup. The same-repo branch takes the FIRST candidate the scan reaches
+// (resolver.go:3784-3792) with no precision test of any kind, in the arbitrary
+// order buildDirIndexes happened to bucket the corpus in — measured, an
+// `import "example.com/fixture/util"` from a Go file binds to a Python
+// `deep/util/__init__.py` when that is the row that sorted first. So every
+// candidate the resolver considers has to be placed, not the one this code
+// would have picked.
+//
+// In particular `dirMatchesImport` (resolver.go:5749-5757) is NOT available as
+// a narrowing here. It reads like the precision rule this wants — dir must be
+// a genuine suffix of the import path — but the resolver applies it at exactly
+// one place, the CROSS-repo arm of `consider` (resolver.go:3798-3800), and its
+// own contract says why (resolver.go:5749-5752): "Used only to authorise
+// *cross-repo* candidates … Same-repo candidates don't need it".
+// jsts_imports.go:290-293 rejects the same idea by name from the other side,
+// and jsts_imports.go:276-277 states the fact plainly: "the same-repo branch
+// of `consider` accepts the first one with no further check". Every candidate
+// this walk can see is same-repo
+// (buildDirIndexes keeps only owned paths), so applying that gate here drops
+// files the resolver binds — which is the one failure mode a closure may not
+// have.
+//
+// What the resolver DOES rule out, and this mirrors, is:
+//
+//   - A RELATIVE specifier that the join ANSWERS is never placed by last
+//     component. For a JS/TS importer the resolver joins `./auth` onto the
+//     importing file's own directory and probes the joined stem
+//     (resolver/jsts_imports.go:132-148, probed at :156-200); when that probe
+//     finds a file it binds it and returns (resolver.go:3679-3688), never
+//     reaching the cascade. The old arm both admitted every `*/auth/`
+//     directory in the repository AND missed `web/auth.ts`, the one file the
+//     resolver actually binds.
+//
+//     Only that arm suppresses the cascade. The relative joins for the other
+//     languages — a C include (relative_imports.go:95-110), a PHP include
+//     (:258-286), a Python/Dart relative import (:24-33) — live in
+//     `resolveRelativeImports`, a serial pass that runs AFTER the whole
+//     resolve loop and therefore after `resolveImport` has already run its
+//     cascade for that edge. So a non-JS/TS importer's join is placement
+//     evidence only, never suppression evidence; conflating the two DROPPED
+//     every cascade candidate behind a `.py`/`.rb`/`.h` sibling.
+//
+//     The join is a FIRST TRY, though, not a terminal arm: `resolveImport`
+//     takes the relative answer only `if to != ""` (resolver.go:3679), so on
+//     a MISS it carries on with the RAW specifier, where
+//     `lastPathComponent("./auth") == "auth"` (resolver.go:5733-5739) and
+//     `bareJSTS` is false (isJSTSBareSpecifier rejects a `./` prefix,
+//     jsts_imports.go:253-264) — so `consider` applies no gate and binds the
+//     first same-repo candidate out of `lastDirIndex` (resolver.go:3815-3822).
+//     A relative miss therefore falls through here too. Refusing to fall
+//     through was measured to DROP `misc/auth/index.ts` for a
+//     `deep/app.ts: import { auth } from './auth'` with no `deep/auth.*`.
+//
+//   - A BARE JS/TS specifier only ever binds a directory ENTRY POINT.
+//     `consider` skips every candidate that is not `index.<ext>`
+//     (resolver.go:3781-3783, the rule stated at jsts_imports.go:277-293),
+//     because Node and tsc load a directory-shaped module through its entry
+//     point and never through an arbitrary file inside it. This is the one
+//     gate `consider` applies to a SAME-repo candidate, so it is the one gate
+//     the closure can apply too. Without it an `import … from 'graphql'`
+//     dragged every file under any `*/graphql/` directory into the generation.
+//
+// Two resolver gates have no counterpart here, both superset-only. The npm
+// manifest gate (declaresExternalNpmDep, resolver.go:3773, applied at :3807)
+// skips the cascade outright for a specifier the importer's package.json
+// declares a dependency; the closure carries no manifest lookup. The Go
+// package-ownership gate (goImportCandidateGate.retainFile,
+// go_package_ownership.go:56-58, called first in `consider` at
+// resolver.go:3778-3780) is installed by the live indexer, not by this walk.
+// Both residuals admit more than the resolver binds; neither can drop.
+//
+// The qualified-name arm (resolver.go:3731-3746) is not mirrored either, and
+// for a different reason: it returns BEFORE this cascade when it hits, but
+// graph.Reader offers only GetNodeByQualName (reader.go:24) where the resolver
+// reads every candidate (cachedFindNodesByQualName, resolver.go:2294-2304), so
+// a mirror that could be shown no-drop is not expressible through LayerBase.
+// Not mirroring it is a superset for the cascade's own candidates — but it is
+// NOT unconditionally superset-safe now that the entry-point gate exists: a
+// BARE JS/TS specifier the qual-name arm binds to a package node whose file
+// sits in a directory holding no `index.<ext>` would be dropped by
+// closureJSTSEntryPoints, because that gate reasons about the cascade the
+// qual-name arm never reaches. No fixture in this repository produces that
+// shape (a JS/TS package node carrying a bare specifier as its qualified
+// name), so it is recorded as an unproven residual rather than a measured
+// one; W6.12 owns the conservative-handling sweep that would close it.
+func (w *closureWalk) importedFiles(importPath string, callers []string) []string {
 	if importPath == "" {
 		return nil
 	}
 	w.buildDirIndexes()
-	if files := w.dirIndex[importPath]; len(files) > 0 {
+	if closureRelativeSpecifier(importPath) {
+		joined, answered := w.relativeImportedFiles(importPath, callers)
+		if answered {
+			return joined
+		}
+		// The join answered for no importer (or not for every one of them),
+		// so the resolver reached the cascade for at least one edge with
+		// this specifier. Union rather than replace: the callers whose join
+		// DID hit keep their placement.
+		return closureUnionPlacements(joined, w.cascadeImportedFiles(importPath, false))
+	}
+	return w.cascadeImportedFiles(importPath, closureBareJSTSImport(importPath, callers))
+}
+
+// cascadeImportedFiles is the dirIndex/lastDirIndex candidate scan itself,
+// keyed exactly as resolveImport keys it (resolver.go:3809-3822): the raw
+// specifier for the exact-directory arm, its last path component for the
+// fallback arm. The first arm short-circuits the second, mirroring `stop()`.
+func (w *closureWalk) cascadeImportedFiles(importPath string, bare bool) []string {
+	if files := closureJSTSEntryPoints(w.dirIndex[importPath], bare); len(files) > 0 {
 		return files
 	}
-	if files := w.dirIndex[builderGraphPath(w.req.RepoPrefix, importPath)]; len(files) > 0 {
+	return closureJSTSEntryPoints(w.lastDirIndex[path.Base(importPath)], bare)
+}
+
+// closureUnionPlacements merges two placements into one sorted, deduplicated
+// list.
+func closureUnionPlacements(a, b []string) []string {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, f := range list {
+			if _, dup := seen[f]; dup {
+				continue
+			}
+			seen[f] = struct{}{}
+			out = append(out, f)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// relativeImportedFiles places a relative specifier the way the resolver does:
+// joined onto each importing file's own directory, then probed against the
+// base corpus's files. A directory-shaped join contributes that directory,
+// which is the specifier naming a package rather than a module file.
+//
+// The second return value is whether the join ANSWERED — whether, for EVERY
+// importer, resolveImport's relative arm terminated at :3679. That is the
+// resolver's own predicate and nothing wider: the importer must be a JS/TS
+// source (jsts_imports.go:99-101) and the joined stem must hit probeJSTSFile's
+// own candidate set (jsts_imports.go:156-200, mirrored by relativeArmProbeHits
+// below). Only then does the resolver skip the dirIndex/lastDirIndex cascade;
+// an importer that misses either half reaches that cascade with the raw `./…`
+// specifier, so the caller must fall through for it. Reporting this separately
+// from the placement is what keeps a miss from being a DROP.
+//
+// Placement is deliberately WIDER than the verdict, in both directions: the
+// join contributes `w.dirIndex[stem]` (the specifier naming a package
+// directory) and every closureModuleProbes hit (including the non-JS/TS
+// module shapes resolveRelativeImports binds in a later pass), none of which
+// is evidence that resolveImport returned early. Over-placing costs a file in
+// the generation; over-answering loses an edge.
+//
+// With no importer to join against there is nothing to join, and the answer
+// is "not answered": the caller then applies the cascade, which is the
+// conservative superset.
+func (w *closureWalk) relativeImportedFiles(spec string, callers []string) ([]string, bool) {
+	spec, _ = closureSplitImportSpec(spec)
+	if spec == "" || len(callers) == 0 {
+		return nil, false
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(graphPath string) {
+		if graphPath == "" {
+			return
+		}
+		if _, dup := seen[graphPath]; dup {
+			return
+		}
+		seen[graphPath] = struct{}{}
+		out = append(out, graphPath)
+	}
+	answered := true
+	for _, caller := range callers {
+		stem := closureJoinRelative(path.Dir(builderGraphPath(w.req.RepoPrefix, caller)), spec)
+		if stem == "" {
+			answered = false
+			continue
+		}
+		for _, file := range w.dirIndex[stem] {
+			add(file)
+		}
+		for _, cand := range closureModuleProbes(stem) {
+			if _, ok := w.fileIndex[cand]; ok {
+				add(cand)
+			}
+		}
+		// PLACEMENT is the wide probe list above; the VERDICT is the
+		// resolver's own relative arm and nothing else. resolveImport
+		// returns at :3679 only when resolveJSTSImportTarget answers, and
+		// that requires BOTH halves of its own precondition:
+		//
+		//   - the importer is a JS/TS source (jsts_imports.go:99-101,
+		//     `if !isJSTSPath(callerFile) { return "" }`). For every other
+		//     importer language the relative arm can never terminate
+		//     resolveImport, so the cascade is ALWAYS reached and the
+		//     closure may never suppress it.
+		//   - the joined stem hits probeJSTSFile's OWN candidate set
+		//     (jsts_imports.go:156-200), which is narrower than
+		//     closureModuleProbes: the extra `.py/.php/.rb/.dart/.h…`
+		//     probes exist to place what resolveRelativeImports
+		//     (relative_imports.go:24-33) binds in a LATER pass, and a hit
+		//     on one of them says nothing about whether resolveImport's
+		//     relative arm terminated.
+		//
+		// Answering on anything wider suppresses a cascade the resolver
+		// demonstrably runs, which is a DROP — the one failure mode the
+		// closure exists to prevent.
+		if !closureJSTSPath(caller) || !w.relativeArmProbeHits(stem) {
+			answered = false
+		}
+	}
+	sort.Strings(out)
+	return out, answered
+}
+
+// relativeArmProbeHits mirrors resolver.probeJSTSFile (jsts_imports.go:156-200)
+// against the base corpus's file set: whether the joined stem names an indexed
+// file by the resolver's own probe order — an author-written module extension
+// verbatim, the TypeScript sources an emitted-JavaScript extension compiles
+// from, the stem plus each module extension, then the stem's directory barrel.
+//
+// It is deliberately NOT closureModuleProbes. This function answers "did
+// resolveImport's relative arm TERMINATE", which is a question about
+// probeJSTSFile alone, including its single-file-component early return: a
+// `.vue` / `.svelte` / `.astro` stem is probed verbatim and never extended
+// (jsts_imports.go:165-172), and a stem carrying no JS/TS extension at all is
+// never probed verbatim, because probeJSTSFile only tries the bare stem inside
+// that switch. Every widening here would suppress a cascade the resolver runs.
+//
+// The probe set is the base corpus's file index MINUS what this change
+// deletes. The two halves of that are not the same corpus and the difference
+// is a correctness one: fileIndex is built from req.Base (buildDirIndexes), so
+// it still carries a file the change removes, while resolveImport runs against
+// the POST-change tree, where the join misses and the cascade runs. Answering
+// on a deleted file therefore suppresses a cascade the resolver demonstrably
+// reaches — a DROP. A file the change ADDS needs no such correction: it is
+// absent from fileIndex, so the verdict is "not answered" and the caller takes
+// the cascade, which is the conservative superset.
+func (w *closureWalk) relativeArmProbeHits(stem string) bool {
+	if stem == "" {
+		return false
+	}
+	isFile := func(id string) bool {
+		if _, ok := w.fileIndex[id]; !ok {
+			return false
+		}
+		if rel, owned := builderRelPath(w.req.RepoPrefix, id); owned {
+			if _, gone := w.deleted[rel]; gone {
+				return false
+			}
+		}
+		return true
+	}
+	switch ext := strings.ToLower(path.Ext(stem)); ext {
+	case ".vue", ".svelte", ".astro":
+		return isFile(stem)
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
+		if isFile(stem) {
+			return true
+		}
+		base := strings.TrimSuffix(stem, ext)
+		for _, srcExt := range resolver.EmittedJSSourceExts(ext) {
+			if isFile(base + srcExt) {
+				return true
+			}
+		}
+	}
+	for _, ext := range closureModuleExts {
+		if isFile(stem + ext) {
+			return true
+		}
+	}
+	for _, ext := range closureModuleExts {
+		if isFile(stem + "/index" + ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// closureSplitImportSpec splits an `import::` payload into the module
+// specifier and the per-binding export name, the way
+// resolver.splitImportSpecSymbol does.
+func closureSplitImportSpec(importPath string) (spec, symbol string) {
+	if i := strings.LastIndex(importPath, "::"); i >= 0 {
+		return importPath[:i], importPath[i+len("::"):]
+	}
+	return importPath, ""
+}
+
+// closureRelativeSpecifier reports whether a specifier addresses the file
+// system relative to its importer rather than naming a package.
+func closureRelativeSpecifier(importPath string) bool {
+	spec, _ := closureSplitImportSpec(importPath)
+	return strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../")
+}
+
+// closureBareJSTSImport mirrors resolver.isJSTSBareSpecifier over a whole
+// importer set: the entry-point gate is the JS/TS module loader's rule, so it
+// applies only when every file that named this specifier is JS/TS. A specifier
+// shared with a non-JS/TS importer keeps the wider set.
+func closureBareJSTSImport(importPath string, callers []string) bool {
+	if len(callers) == 0 {
+		return false
+	}
+	spec, _ := closureSplitImportSpec(importPath)
+	switch {
+	case spec == "", spec == ".", spec == "..":
+		return false
+	case strings.HasPrefix(spec, "./"), strings.HasPrefix(spec, "../"), strings.HasPrefix(spec, "/"):
+		return false
+	}
+	for _, caller := range callers {
+		if !closureJSTSPath(caller) {
+			return false
+		}
+	}
+	return true
+}
+
+// closureJSTSPath mirrors resolver.isJSTSPath — the importer languages whose
+// specifiers the JS/TS module loader's rules describe.
+func closureJSTSPath(p string) bool {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs",
+		".vue", ".svelte", ".astro":
+		return true
+	}
+	return false
+}
+
+// closureJSTSEntryPoints keeps the candidate DIRECTORIES that hold a JS/TS
+// module entry point when the specifier is a bare JS/TS one, and is the
+// identity otherwise.
+//
+// The gate is per directory, not per file, because the two questions differ:
+// the resolver binds the import EDGE to the entry point alone, but what the
+// specifier makes reachable is the whole directory behind it
+// (resolver.importedDirForSpec, resolver.go:5302-5321, which returns
+// filePathDir of the first candidate that clears the same gate). A generation
+// that carried only `index.ts` would leave a call into a sibling the barrel
+// re-exports parked on a stub — a divergence from a whole index, which is the
+// thing the closure exists to avoid. So the entry point is the EVIDENCE the
+// directory is the module, and the directory is what joins.
+func closureJSTSEntryPoints(files []string, bare bool) []string {
+	if !bare || len(files) == 0 {
 		return files
 	}
-	return w.lastDirIndex[path.Base(importPath)]
+	entry := make(map[string]struct{})
+	for _, file := range files {
+		if closureJSTSDirEntryPoint(file) {
+			entry[path.Dir(file)] = struct{}{}
+		}
+	}
+	if len(entry) == 0 {
+		return nil
+	}
+	var kept []string
+	for _, file := range files {
+		if _, ok := entry[path.Dir(file)]; ok {
+			kept = append(kept, file)
+		}
+	}
+	return kept
+}
+
+// closureJSTSDirEntryPoint mirrors resolver.isJSTSDirEntryPoint: a file is its
+// directory's module entry point when it is `index.<ext>` for a JS/TS module
+// extension.
+func closureJSTSDirEntryPoint(filePath string) bool {
+	base := strings.ToLower(path.Base(filePath))
+	for _, ext := range closureModuleExts {
+		if base == "index"+ext {
+			return true
+		}
+	}
+	return false
+}
+
+// closureModuleExts mirrors resolver.jsTSImportExts (jsts_imports.go:36-38),
+// the extensions a resolved JS/TS module specifier may carry on disk.
+var closureModuleExts = []string{
+	".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs",
+}
+
+// closureModuleProbes spells the file candidates one joined relative stem may
+// name, for PLACEMENT only: the stem verbatim, the TypeScript sources an
+// emitted-JavaScript extension compiles from (resolver.EmittedJSSourceExts),
+// each module extension, the directory barrels a package-shaped stem resolves
+// through, and the non-JS/TS module shapes resolveRelativeImports
+// (relative_imports.go:24-33) binds in its own later pass.
+//
+// It is a superset of probeJSTSFile and must never be used to decide whether
+// resolveImport's relative arm terminated — relativeArmProbeHits owns that
+// question. A hit here places a file (cost); a hit there SUPPRESSES the
+// dirIndex/lastDirIndex cascade (correctness).
+func closureModuleProbes(stem string) []string {
+	probes := []string{stem}
+	if ext := strings.ToLower(path.Ext(stem)); ext != "" {
+		base := strings.TrimSuffix(stem, path.Ext(stem))
+		for _, srcExt := range resolver.EmittedJSSourceExts(ext) {
+			probes = append(probes, base+srcExt)
+		}
+	}
+	for _, ext := range closureModuleExts {
+		probes = append(probes, stem+ext)
+	}
+	for _, ext := range closureModuleExts {
+		probes = append(probes, stem+"/index"+ext)
+	}
+	// The non-JS/TS languages whose relative imports name a module file or a
+	// package directory: Python (`__init__.py`), PHP, Ruby, Dart and the
+	// C-family headers a quoted include reaches.
+	for _, ext := range []string{".py", ".php", ".rb", ".dart", ".h", ".hpp", ".hh", ".hxx"} {
+		probes = append(probes, stem+ext)
+	}
+	probes = append(probes, stem+"/__init__.py")
+	return probes
+}
+
+// closureJoinRelative joins a relative specifier onto a directory and
+// collapses `.`/`..`, the way resolver.joinRelativePath does. It returns ""
+// when the specifier walks above the root, which under a repo prefix means
+// above the repository.
+func closureJoinRelative(dir, rel string) string {
+	var parts []string
+	if dir != "" && dir != "." {
+		parts = strings.Split(dir, "/")
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		switch seg {
+		case "", ".":
+		case "..":
+			if len(parts) == 0 {
+				return ""
+			}
+			parts = parts[:len(parts)-1]
+		default:
+			parts = append(parts, seg)
+		}
+	}
+	return strings.Join(parts, "/")
 }
 
 // buildDirIndexes buckets the base corpus's own file nodes by directory. It is
 // one bounded scan of the file nodes — not of the graph — taken at most once
-// per build and only when an import has to be placed.
+// per build and only when an import has to be placed. fileIndex is the same
+// scan's membership set, which is what a joined relative stem is probed
+// against.
 func (w *closureWalk) buildDirIndexes() {
 	if w.dirIndex != nil {
 		return
 	}
 	w.dirIndex = make(map[string][]string)
 	w.lastDirIndex = make(map[string][]string)
+	w.fileIndex = make(map[string]struct{})
 	for node := range w.req.Base.NodesByKind(graph.KindFile) {
 		if node == nil || node.FilePath == "" {
 			continue
@@ -767,6 +1267,7 @@ func (w *closureWalk) buildDirIndexes() {
 		if _, owned := builderRelPath(w.req.RepoPrefix, node.FilePath); !owned {
 			continue
 		}
+		w.fileIndex[node.FilePath] = struct{}{}
 		dir := path.Dir(node.FilePath)
 		w.dirIndex[dir] = append(w.dirIndex[dir], node.FilePath)
 		if last := path.Base(dir); last != "" && last != dir {
