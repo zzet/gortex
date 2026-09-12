@@ -397,6 +397,58 @@ func (c *ServerClient) resolveAuthToken() string {
 	return ""
 }
 
+// ProxyIdentity is the caller-side view identity a proxied tool call carries
+// to the remote.
+//
+// Without it the remote resolves its own view from the body's `cwd` argument
+// alone, so the SAME tools/call answers about a different view depending on
+// whether it was served locally or proxied: the local seam binds the request
+// view from the session's cwd (which arrives as the `X-Gortex-Cwd` header or
+// the transport's session state, not necessarily as a tool argument), while
+// the remote — seeing neither header — falls back to its base corpus. CWD is
+// the session's workspace boundary; SessionID is the caller's real MCP session
+// id, which the remote's /v1/tools handler reads from `Mcp-Session-Id`.
+//
+// Both halves are optional: a zero identity forwards nothing and leaves the
+// remote exactly where it was.
+type ProxyIdentity struct {
+	SessionID string
+	CWD       string
+}
+
+// Empty reports whether this identity would forward nothing.
+func (p ProxyIdentity) Empty() bool { return p.SessionID == "" && p.CWD == "" }
+
+// proxyIdentityCtxKey is the private key ProxyIdentity rides on. It is
+// deliberately a daemon-package key rather than a read of the MCP package's
+// session context values: internal/mcp imports internal/daemon, so the
+// dependency cannot run the other way. Every transport that already knows the
+// caller's session id and cwd attaches it here before it asks the router to
+// decide.
+type proxyIdentityCtxKey struct{}
+
+// WithProxyIdentity returns a context carrying the caller's view identity for
+// any tool call proxied to a remote server. An empty identity returns ctx
+// unchanged so a caller never has to branch.
+func WithProxyIdentity(ctx context.Context, id ProxyIdentity) context.Context {
+	id.SessionID = strings.TrimSpace(id.SessionID)
+	id.CWD = strings.TrimSpace(id.CWD)
+	if ctx == nil || id.Empty() {
+		return ctx
+	}
+	return context.WithValue(ctx, proxyIdentityCtxKey{}, id)
+}
+
+// ProxyIdentityFromContext returns the identity attached by
+// WithProxyIdentity, or the zero identity when none is present.
+func ProxyIdentityFromContext(ctx context.Context) ProxyIdentity {
+	if ctx == nil {
+		return ProxyIdentity{}
+	}
+	id, _ := ctx.Value(proxyIdentityCtxKey{}).(ProxyIdentity)
+	return id
+}
+
 // ProxyTool forwards a single MCP tool invocation to this server's
 // `POST /v1/tools/<name>` endpoint and returns the raw response
 // bytes. Used by the daemon's hybrid-read router when a query's
@@ -432,6 +484,20 @@ func (c *ServerClient) ProxyToolCtx(ctx context.Context, toolName string, body [
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// Forward the caller's view identity so the remote resolves the same
+	// view a local dispatch would have. These are the two headers the
+	// remote's own /v1/tools handler reads (internal/server/handler.go:
+	// handleToolCall reads Mcp-Session-Id, peekRouteContext reads
+	// X-Gortex-Cwd); anything absent here is simply not set, leaving the
+	// remote on the body's `cwd` argument as before.
+	if id := ProxyIdentityFromContext(ctx); !id.Empty() {
+		if id.CWD != "" {
+			req.Header.Set("X-Gortex-Cwd", id.CWD)
+		}
+		if id.SessionID != "" {
+			req.Header.Set("Mcp-Session-Id", id.SessionID)
+		}
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("proxy %s/%s: %w", c.Entry.Slug, toolName, err)
