@@ -44,6 +44,7 @@ not reachable from a default startup, watcher, or Git callback path is `implemen
 | Dirty-manifest sha256 (harness-computed, wave 4 exit suite) | `36afdd22fb92fa7af1f9f6b927cc29a8f0e6dae95d8045e8eae4554a3a8dca0d` over HEAD `47c6efa02d1444eeb2252612b4d8802f58f359ba` — identical on all 14 compiles and all 19 runs of the wave 4 exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave 5 exit suite) | `729d8e727118a5169165310e4f25fe5b14cf9326c44551ff2b3d713d44f9bc70` over HEAD `b899dd211d7516950d73c312bb5368a99b78c22b` — identical on all 15 compiles and all 20 runs of the wave 5 exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave 6 exit suite) | `e2b916f5781fde4f732e28bdd7185e6b23aed883e49dda6b1a1a1e4f350257a2` over HEAD `9c7815ea9e1e08ea04ba42060ad340bb5f17c806` — identical on all 16 compiles and all 21 runs of the wave 6 exit suite; no source drift during the suite |
+| Dirty-manifest sha256 (harness-computed, wave 7 exit suite) | `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` over HEAD `2d39f8b7769be441b96bf618ee30fcd84f8487f5` — identical on all 12 compiles and all 22 runs of the wave 7 exit suite; no source drift during the suite |
 | Recovery branch (do NOT reapply) | `backup/incremental-before-main-20260910-1310` = `a2ccbe07` |
 | Recovery stash (do NOT reapply) | `6e9db642` |
 | Live daemon | `v0.64.1-36-ga2ccbe07-dirty`, pid 18828 — a **pre-rebase** binary. Must not be restarted, re-tracked, or reconfigured. |
@@ -1097,6 +1098,64 @@ Shared fields for all W1 sub-items unless overridden:
   output generation authority*.
 - Verifier verdict: **PASS**.
 
+### W3.1b — Output-generation authority follow-ups: witness a write a closing owner still admits
+
+- State: `wired`. The verifier's `wiring_check` traces `IndexFile` / `IndexAll` →
+  `RepositoryMutationCoordinator.openSourceWitness` on the default path, with no test seam; the
+  repair round adds `TestLifecycleTrackedRepositoryIsWitnessedEndToEnd`, which drives
+  `Register → bindDedicatedGraph → RegisterRepositoryOwner → IndexAll → witness` in one process.
+- Scope/files: `internal/graphview/repository_raw_data.go`,
+  `internal/indexer/repository_mutation_coordinator.go`, `internal/indexer/multi.go`,
+  `internal/indexer/checkout_mutation.go`, `internal/graphview/repository_raw_data_test.go`,
+  `internal/indexer/output_generation_authority_test.go`,
+  `internal/indexer/checkout_mutation_test.go`, `internal/mcp/view_base_pin_test.go`,
+  `internal/serverstack/shared_server_test.go`.
+  `internal/indexer/repository_topology_batch.go`, `internal/indexer/indexer.go`,
+  `internal/serverstack/shared_server.go` and
+  `internal/indexer/repository_mutation_coordinator_test.go` are owned and unchanged.
+- Agent: wave 7, output-authority lane (repair round; round 1 failed on this blocker).
+- Invariant: a generation-zero write that the graphview layer admits must move every live base
+  witness, or the request surface must not present the resulting read as exact. A refusal that
+  means "this caller may not write through the gate" is never read as "no reader is listening".
+- Root cause closed: `openSourceWitness` mapped every refusal to "unwitnessed". Two of them —
+  `ErrRepositoryAdmissionClosed` and `ErrRepositoryAdmissionsStopped` — keep existing leases valid
+  (`repository_lease.go:569-571`) and block finalization while `state.readers != 0` (`:697-699`),
+  so a pin taken before the close survives a real gen-0 write and `ValidateCurrent` returns nil,
+  which `view_request.go:199-215` renders as an exact answer. A third refusal,
+  `ErrRepositoryOwnerUnknown` on a canonical-root mismatch, has the same shape.
+- Change: `baseCorpusOwnerLocked` (`repository_raw_data.go:361`) resolves the lease door once and
+  separates "may not write" from "cannot admit a lease";
+  `InvalidateBaseCorpusSource` (`:437`) moves the observation forward with **no lease and no
+  reader** (a closed owner may already have drained, and `drainLocked` closes its channel exactly
+  once) and **no canonical-root check**; `rawRepositoryDataState.highRevision` /
+  `nextRevisionLocked` (`:25`, `:33`) add a monotone high-water mark so a revision handed back by
+  `CompleteUnchanged` is never reissued for a different source state. Every refusal
+  `AcquireBaseCorpusMutation` returns is byte-for-byte what it was.
+- Acceptance gate(s): G3, G5.
+- Harness evidence: wave 7 exit suite, HEAD `2d39f8b7`, dirty manifest `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` — `internal/indexer` normal six chunks 2873 / 0 / 2,
+  `internal/graphview` normal 493 / 0 / 0, `internal/serverstack` normal 27 / 0 / 0,
+  `internal/mcp` normal 6494 / 0 / 8; race `internal/indexer` 331 / 0 / 0, `internal/graphview`
+  78 / 0 / 0, `internal/mcp` 606 / 0 / 0. Result dirs under
+  `scratchpad/results/{indexer,graphview,internal_serverstack,internal_mcp}-*-W7suite-1`.
+  Item mutation evidence: 6 new mutations (M11–M16), 6 killed, all through `go test -overlay`.
+- Limitations: the asynchronous checkout republish still runs under no receipt of its own (needs
+  the generation identity carried into `checkout_refresh.go:73`, unowned); the checkout receipt
+  settles at `Close`, not inside `Refresh`; only the reconcile lane reports source content, so
+  every other door keeps the conservative revision-derived fingerprint; an `Invalidated` mutation
+  leaves the source unavailable, so a snapshot acquisition for that owner refuses until a
+  lease-taking mutation republishes — already the state of the world for a closing owner;
+  `CompleteUnchanged` still restores the revision downward, so an observation taken mid-mutation
+  still reports a change that did not happen (the conservative direction); a legacy target with a
+  prefix but an empty root is still skipped entirely, audited as unreachable through the
+  production doors.
+- Deviations: one refusal **order** changed — a stopped manager asked about an unregistered prefix
+  now answers `ErrRepositoryOwnerUnknown` where it answered `ErrRepositoryAdmissionsStopped`. Both
+  are in `unwitnessedRepository`, so indexer behaviour is identical and no test in the tree asserts
+  the pairing. `internal/serverstack/shared_server_test.go` is inside the wave's `_test.go`-sibling
+  rule but outside the item's enumerated path list.
+- Verifier verdict: **PASS** (round 2; round 1 was FAIL on the blocker above).
+- Commit: `3bf359ba` — *indexer: move the base witness when a closing owner still admits a write*.
+
 ### W3.5b — `search_text` capability truth at the READER (D5)
 
 - State: `wired`. Round 2 (repair round); the verifier's check is explicit
@@ -1500,6 +1559,66 @@ Shared fields for all W1 sub-items unless overridden:
 - Verifier verdict: **PASS. No blocker.**
 - Commit: `2a2c73c6695fd1e3495ce03d9aa4dddba8a318ac` — *indexer: advance the owner head tree on
   base adoption and fan out to dependents*.
+
+### W4.6 — Catalog-backed layer reuse, observation-fence scoping, census pin
+
+- State: `blocked with evidence`. Implemented, compiled, `tested` and `wired`, but **not correct**:
+  the final verifier verdict is `fail` on a blocker, so nothing of W4.6 was committed. Its six
+  files stay dirty in the worktree at the end of this wave.
+- Blocking evidence: `scratchpad/reports/W7-W4.6-verify.md` BLOCKER-1 — the head fence no longer
+  orders the head across more than two writers, narrowing a guard W4.4 landed.
+  `UpdateCheckoutObservationWithReport` (`catalog.go:551-617`) keeps the head columns when fenced
+  (`:581-586`) but **always writes `last_seen = req.LastSeen`** (`:596`, arg at `:604`), pulling
+  the stored observation clock backwards and destroying the ordering evidence the next writer is
+  compared against. Reproduced with an overlay-added probe against the live worktree (no worktree
+  file created): adoption clock 200 → `head_tree = tree-NEW`, `last_seen = 200`; P1 @150 →
+  `HeadFenced=true`, head kept, `last_seen := 150`; P2 @160 → `HeadFenced=false`,
+  `head_tree := tree-OLD`. The identical three-writer sequence against base `catalog.go` at
+  `2d39f8b7` **passes** — both stale passes are refused with `ErrCatalogStaleGuard` and `head_tree`
+  stays `tree-NEW` — so this is a new narrowing, not a pre-existing hole. Production reachability:
+  `reconcile` stamps one `pass.now` for a whole pass (`reconcile.go:248`, used `:357`, written
+  `:403`) while `CheckoutLifecycle.confirmPresent` stamps its own (`checkout_lifecycle.go:863-864`)
+  — the two overlapping clocked observers the fence's own doc names. The damaged column is
+  `head_tree`, which `graphBase` / `commitIdentity` key every dependent build on, and it is the
+  token `advanceDedicatedBaseOwnerHeadTx` (`catalog_dedicated_base.go:841-866`) documents as making
+  adoption and observation one ordered sequence. The item's accepted-cost section
+  (`catalog.go:466-496`) does not list the head, so the trade as documented is not the trade as
+  implemented.
+- Agent: wave 7, catalog-reuse lane (repair round 2; round 1 was also rejected).
+- Scope/files (all uncommitted): `internal/graph/store_sqlite/catalog.go` (+327),
+  `internal/graph/store_sqlite/catalog_test.go` (+403),
+  `internal/indexer/checkout_coordinator.go` (+85),
+  `internal/indexer/checkout_coordinator_test.go` (+94),
+  `internal/indexer/checkout_layer_reuse_test.go` (new, 326),
+  `internal/indexer/dedicated_base_advance_trigger_test.go` (+9/−2).
+- Invariant: a coordinator restart adopts a stored commit layer it can prove identical instead of
+  rebuilding it, and the observation fence orders the head axis across every clocked writer.
+- Wiring (verified, not the defect): `CheckoutCoordinator.run` (`checkout_coordinator.go:775,:782`)
+  → `cycle` (`:823`) → `reconcileCommitSlot` (`:1045`, `:1388`) → `resolveCommitLayer` (`:1489`) →
+  `storedCommit` (`:1496`, `:1895`) → `Catalog.FindReusableViewGenerations` (`catalog.go:1316`).
+  `TestCoordinatorAdoptsAStoredCommitLayerAfterRestart` drives the real `cycle`.
+- Acceptance gate(s): G2, G4.
+- Harness evidence (wave 7 exit suite, dirty tree — the item's files were present for every run):
+  `internal/graph/store_sqlite` normal 1821 / 0 / 2, race 209 / 0 / 0; `internal/indexer` normal
+  six chunks 2873 / 0 / 2, race 331 / 0 / 0. The item's own cases are green; the suite cannot see
+  the defect, because no test in the tree constructs a three-writer fenced sequence and the item's
+  own tests encode the clock regression as intended behaviour.
+- Limitations: the reuse lookup's own bound is unpinned; the Go identity re-check cannot be pinned
+  (implementer's limitation corroborated by the verifier); `checkout_id` and `layer_id` are not
+  independently pinned in the identity filter.
+- Deviations: the head-only scoping of the fence is the item's chartered escape hatch and its
+  wedge rationale is verified correct (`reconcile.go:403-420` returns `ActionGuardLost` and skips
+  `UpsertCheckoutPathEvidence`; `checkout_lifecycle.go:869-875` returns nil). The defect is the
+  clock regression riding along with it, not the scoping.
+- Next action: on the fenced path write `last_seen = MAX(stored, req.LastSeen)` (or leave
+  `last_seen` alone) instead of `req.LastSeen`; the anti-wedge property comes from the *other*
+  columns always applying, not from regressing the clock, so state, both grace clocks, the removal
+  evidence and `last_error` still move on every pass. Add the three-writer regression above. The
+  fix is **not** drop-in: it contradicts three assertions in the item's own new tests
+  (`catalog_test.go:2629`, `:2735`, `:2827`), all of which encode "the fence must not be durable"
+  and all of which are what the blocker costs.
+- Verifier verdict: **FAIL — one blocker (a landed guard narrowed, reproduced against the live
+  worktree and proven new against `2d39f8b7`), 4 minors.**
 
 ## W5 — Integrate request lifetime and selected readers
 
@@ -2071,6 +2190,152 @@ Shared fields for all W1 sub-items unless overridden:
 - Commit: `1313468039daf075f5ab17f0f6c9695a501e6444` — *mcp: separate the coordinator's capture
   timeout from the caller's deadline*.
 
+### W5.4 — Repository-owner lease on the serving request
+
+- State: `wired`. `wiring_check` traces the request-lifetime acquisition through the tool
+  middleware and through `requestScoped` (resources / prompts), both on default paths, with two
+  production-entrypoint tests.
+- Scope/files: `internal/graphview/repository_lease.go`,
+  `internal/graphview/repository_lease_test.go`, `internal/mcp/overlay.go`,
+  `internal/mcp/tool_deadline.go`, `internal/mcp/owner_lease_serving_test.go` (new).
+  `internal/mcp/view_request.go`, `internal/graphview/materialize.go` and the remaining owned test
+  files are unchanged.
+- Agent: wave 7, request-lifetime lane (repair round 2).
+- Invariant: a serving request holds a repository-owner lifetime for every corpus it reads, and a
+  detached worker keeps exactly the owners behind the payload it inherited — never more.
+- Root cause closed: a request resolving to the shared corpus (no selector, cwd in no automatic
+  checkout — most tool calls and nearly every resource read) materialized no view, took no base
+  pin, and held **no** repository lifetime while reading a corpus whose owner finalization is
+  followed by a physical payload purge (`indexer/repository_cleanup.go`).
+- Change: `AcquireServingRepositoryRead` (`repository_lease.go:299-325`) — an explicit admission to
+  every registered **open** owner for the request's lifetime; it omits closing owners rather than
+  refusing and never fails. `HandoffFor` (`:459-522`) pins a **named subset** afresh, under `l.mu`
+  (which `drop()` also takes), so a worker's lifetime is independent of the acquirer's, cannot
+  widen past the acquired scope, and keeps a closing owner it is genuinely still reading.
+  `handoffRequest` (`overlay.go:536-585`) offers a pin only when the request materialized a
+  payload and names only `payloadRepositories(view)`. `BasePin.Handoff` (`:757-783`) joins both
+  halves under `p.mu`, closing a race that produced a non-nil handle with `OwnerPinned() == false`.
+  The cancellation arm (`tool_deadline.go:216-240`) retains, releases on handler exit and is
+  counted, without touching `abandonedToolCalls`.
+- Acceptance gate(s): G5, G7.
+- Harness evidence: wave 7 exit suite, HEAD `2d39f8b7`, dirty manifest `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` — `internal/mcp` normal 6494 / 0 / 8, race 606 / 0 / 0;
+  `internal/graphview` normal 493 / 0 / 0, race 78 / 0 / 0. Result dirs under
+  `scratchpad/results/{internal_mcp,graphview}-*-W7suite-1`.
+- Limitations: the base-pin handoff's behavioural half is partly masked at the mcp level (the
+  legacy materializer already leases generation zero inside the view's own lease), so the mcp-level
+  proof is white-box and the behavioural proof lives in graphview; the whole-registry scope is
+  bounded by one **handler** lifetime, not by the 60 s firewall, and is non-renewable, so a drain
+  is reachable once currently-running handlers finish; the narrowing is per repository, not per
+  generation; `abandonedToolCalls` still does not count the cancellation arm (by design); the
+  cancellation arm reuses the `abandoned_handler` consumer label because the metrics catalog holds
+  a closed vocabulary and is unowned; `checkout_lifecycle.go:2097` (the background-build half) is
+  untouched — W6.7 owns that file this wave and the coordinator lifetime is W7.1's.
+- Deviations: `BasePin.Handoff` and its guard live in `repository_lease.go` rather than
+  `lease.go`, which is not in the ownership list (same package, no new field added); the plan's
+  claim that "no repository-owner lease covers a serving request at all" is true only for
+  **unrouted** requests, and the implementation follows the source; `AcquireAllRepositoryReads` was
+  deliberately **not** wired, because per request it would make an untrack deny every corpus read
+  until finalize and let request traffic starve every drain globally; the handoff is narrowed
+  rather than whole-scope, delivering the plan's "detached workers keep it" as *keep what they
+  read*.
+- Verifier verdict: **PASS** (round 2).
+- Commit: `897b86fe` — *mcp: hold a repository-owner lease for the lifetime of a serving request*.
+
+### W5.7b — Request-surface follow-ups: withdraw exactness on route drift; pin the ticket arm
+
+- State: `wired`. `noteWorktreeRouteDrift` is reached from `refViewFilesFor` (`view_files.go:248`)
+  on the byte lane and `searchTextInView` (`view_search_text.go:95`) on the text lane; the rider it
+  demotes is the one `attachViewRider` (`overlay.go:336`) renders. A production-entrypoint test
+  drives a real `tools/call` frame through `wrapToolHandler`.
+- Scope/files: `internal/mcp/view_paths.go` (+55/−2),
+  `internal/mcp/view_bytes_coherence_test.go` (+244),
+  `internal/mcp/checkout_binding_test.go` (+59). `view_files.go`, `checkout_binding.go`,
+  `index_health_cache.go` and `server.go` are owned and byte-identical to HEAD.
+- Agent: wave 7, request-surface lane.
+- Invariant: a read stitched across two states of the working copy is never presented as exact;
+  exactness is a property of the answer, not of whichever lane first noticed the drift.
+- Change: `markWorktreeRouteMoved` clears `Exact` and sets `FallbackReason = "route_moved"` as soon
+  as the epoch mismatch is confirmed and **above** the per-capability dedupe (`view_paths.go:310`),
+  so a request whose text lane had already annotated cannot keep `exact:true` when its byte lane
+  finds the same drift. The rider write is mutex-guarded under `requestView.mu` — unlike its named
+  precedent `markBaseCorpusChange`, which runs after the handler returned while this runs inside
+  it, with concurrent readers on the same view. An already-inexact rider keeps its first reason.
+  The abandoned-ticket arm of the freshness wait (`checkout_binding.go:501`) and the
+  `abandoned = false` reset on the retryable arm (`:399`) are pinned; no production change there.
+- Acceptance gate(s): G6.
+- Harness evidence: wave 7 exit suite, HEAD `2d39f8b7`, dirty manifest `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` — `internal/mcp` normal 6494 / 0 / 8, race 606 / 0 / 0.
+  Result dirs `scratchpad/results/internal_mcp-{normal,race}-*-W7suite-1`. Mutation M7 (re-inserting
+  the `CheckoutRouteEpoch <= 0` early return) is RED on six tests.
+- Limitations: `require_exact` still **answers** a drifted read rather than refusing it — parity
+  with the named analogue is reached, but the refusal needs a post-handler gate in `overlay.go`
+  (W5.4's file this wave); `gortex://index-health` scoping is **not implemented** (blocked by
+  ownership, not by design) and is the one part of the coordinator's note this item leaves open;
+  `route_moved` is not published in the shipped freshness vocabulary (`guide.go:127-131`, W5.11's
+  file this wave) — `base_changed` is not either, so the two stay consistent and a follow-up should
+  publish both together.
+- Deviations: the item touched none of `view_files.go`, `checkout_binding.go`,
+  `index_health_cache.go` or `server.go`, so the plan's file list is wider than the change.
+- Verifier verdict: **PASS** (first round; no repair needed).
+- Commit: `67b1529e` — *mcp: withdraw the exactness claim when the worktree route moves under a
+  read*.
+
+### W5.11 — HTTP non-tool endpoints bind a view; view headers forwarded across daemon proxies
+
+- State: `wired`. `composeDaemonHTTPHandler` hands the lease manager to the REST handler
+  (`daemon_streamable.go:33-37`) and `buildDaemonStreamableHandler` wraps the mux with
+  `proxyIdentityMiddleware` (`:251-256`); the only caller is `cmd/gortex/daemon.go:426`.
+- Scope/files: `internal/server/handler.go` (+268/−3), `internal/server/subgraph.go` (+14),
+  `internal/server/dashboard.go` (+57/−11), `internal/daemon/servers.go` (+66),
+  `cmd/gortex/daemon_streamable.go` (+84/−4), `internal/mcp/guide.go` (+1/−1),
+  `internal/server/view_binding_test.go` (new, 10 tests / 60 cases),
+  `internal/server/handler_test.go` (+62), `internal/server/dashboard_test.go` (+81),
+  `internal/daemon/servers_test.go` (new), `cmd/gortex/daemon_streamable_test.go` (new).
+  `cmd/gortex/server_router.go` is owned and byte-identical to HEAD.
+- Agent: wave 7, HTTP-surface lane (repair round).
+- Invariant: no HTTP read of the graph runs without a repository lifetime, and every answer states
+  truthfully what it held; a proxied tool call carries the caller's view identity.
+- Root cause closed: **eight** endpoints read `Handler.graph` directly with no view and no lease —
+  `handleHealth` (`handler.go:292`), `handleStats` (`:584`), `handleGetGraph` (`:724-784`, three
+  separate scans), `handleSubGraph` (`subgraph.go:60,89,99,111`), `handleRepos`
+  (`dashboard.go:202`), `handleWorkspaceRoster` (`:384`), `handleDashboard` (`:1554,1561`) and
+  `handleCaveats`'s enrichment walk (`:1339` → `:1348-1386`), which runs **after** the tool leases
+  have closed. Separately, five tool-backed GETs passed a bare `r.Context()` into
+  `CallToolStrict`, so `SelectorAuto` had neither a session id nor a cwd; and `ProxyToolCtx`
+  (`servers.go:421-445`) forwarded neither `X-Gortex-Cwd` nor `Mcp-Session-Id`.
+- Change: `BaseCorpusLeases` (`handler.go:327`) — a one-method seam `*graphview.LeaseManager`
+  satisfies as-is; `baseRead` / `beginBaseRead` / `close` acquire, hold, release and render a
+  truthful `base_scoped` rider; `baseRead.release()` (`:453`) is the **panic net** every pinning
+  handler defers, deliberately not the normal-path release (it no-ops when `close()` ran, so a
+  `close()` that stopped releasing is still detectable). `singleRepoPrefix` (`:1014`) pins the
+  named repository's owner when `?repo=` / `?project=` names exactly one. `requestToolContext`
+  attaches the same three things `handleToolCall` attaches. `daemon.ProxyIdentity` rides the ctx
+  and becomes the two headers.
+- Acceptance gate(s): G5, G6.
+- Harness evidence: wave 7 exit suite, HEAD `2d39f8b7`, dirty manifest `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` — `internal/server` normal 123 / 0 / 0 and race 123 / 0 / 0;
+  `internal/daemon` normal 289 / 0 / 0, race 17 / 0 / 0; `cmd/gortex` normal 1111 / 0 / 5;
+  `internal/mcp` normal 6494 / 0 / 8. Result dirs under
+  `scratchpad/results/{internal_server,internal_daemon,cmd,internal_mcp}-*-W7suite-1`.
+- Limitations: two proxy producers outside this item's ownership still attach no identity
+  (`internal/mcp/streamable/transport.go:577-585` and `cmd/gortex/daemon_mcp.go:544`, one line
+  each); `gortex mcp --server-api` (`cmd/gortex/mcp.go:451`) builds the handler with no lease
+  manager, so its direct-store reads stay unleased and now **say so** (`pinned:false`) instead of
+  implying a hold; the pin protects lifetime, not bytes — a publication can still land mid-response
+  and is reported as `base_changed`; `base_changed` is observable only for a single-repository
+  read, because a whole-corpus acquisition carries no source witness and "unknown" must not be
+  rendered as "changed"; `/v1/subgraph`'s 404 arm emits no rider though the pin is taken and
+  released; there is no E2E over a real daemon HTTP listener (W8.8 owns that matrix); the
+  `resources/read gortex://stats` ≡ `graph_stats` parity gate is **unmet-by-deferral** to W8.8.
+- Deviations: `internal/mcp/tool_deadline.go` was **not** touched — W5.6 already landed
+  `requestScoped` there and the file is W5.4's this wave; `cmd/gortex/server_router.go` needed no
+  change, because `newLocalToolExecutor` already reaches the wrapped handler and therefore the full
+  seam. Forwarding `X-Gortex-Cwd` onward has **no hop guard** and this item cannot add one: the
+  hazard class is pre-existing (the body `cwd` argument was already relayed verbatim), but a
+  mutually-claiming roster would now cycle for a header-only caller too. Follow-up, unowned: stamp
+  a hop token in `ProxyToolCtx` and refuse a re-proxy in `internal/daemon/router.go`.
+- Verifier verdict: **PASS** (round 2).
+- Commit: `7164bc2f` — *server: pin the base corpus for HTTP reads and forward the caller's view
+  identity*.
+
 ## W6 — Finish bounded reuse and storage maintenance
 
 - State: `proposed`. Dependencies: W2, W3, W4. Items: W6.1–W6.5, W6.7, W6.9–W6.12 in MVI; W6.6 and
@@ -2189,60 +2454,125 @@ Shared fields for all W1 sub-items unless overridden:
 
 ### W6.5 — Import-placement parity harness against the resolver cascade
 
-- State: `blocked with evidence`. Implemented, compiled and `tested` on its own 37 cases, and
-  `wired` through `BuildCommitLayer` — but **not correct**: the final verifier verdict is `fail`
-  on a blocker, so nothing of W6.5 was committed. Its two files stay dirty in the worktree at the
-  end of this wave (`internal/indexer/builder_closure.go`,
-  `internal/indexer/import_placement_parity_test.go`).
-- Blocking evidence: `scratchpad/reports/W6-W6.5-verify.md` §1 — the repaired relative arm still
-  **drops files the resolver binds**. The repair fixed the probe-miss half (fall through to the
-  cascade) but left the probe-hit half unguarded: `relativeImportedFiles` decides `answered` with a
-  predicate strictly broader than the resolver's relative arm, so it suppresses a cascade
-  `resolveImport` demonstrably reaches. Two independent over-answers, both confirmed against the
-  real resolver: (a) no importer-language precondition — `resolveJSTSImportTarget` opens with
-  `if !isJSTSPath(callerFile) { return "" }`, so for a non-JS/TS importer the relative arm can
-  never terminate `resolveImport`; (b) `closureModuleProbes` appends `.py .php .rb .dart .h .hpp
-  .hh .hxx` and `/__init__.py`, which `probeJSTSFile` never probes, so a hit on one of those sets
-  `answered` and suppresses a cascade the resolver ran. Reproduced through the **production** path
-  (`buildClosureCase` → `BuildCommitLayer`): the composed sparse generation leaves the import
-  `external::` where the whole index binds it — the exact failure mode the item exists to prevent.
-  It is a **regression**, not a pre-existing hole: the same probe against
-  `9c7815ea:internal/indexer/builder_closure.go` is green. The item's own parity harness is blind
-  to it by construction — `importParityRelativeArmAnswers` replicates both errors, and
-  `importParityFixture` contains no relative specifier out of a non-JS/TS importer and none with a
-  non-JS/TS sibling.
-- Agent: wave 6, Lane B (repair round; round 1 was also rejected).
-- Scope/files (all uncommitted): `internal/indexer/builder_closure.go` (+417/−20),
-  `internal/indexer/import_placement_parity_test.go` (new, 803 lines, 6 top-level tests).
+- State: `tested` + `wired`. Reached from `BuildCommitLayer` on the default sparse-generation path;
+  the round-4 repair closed the round-3 blocker and the verifier verdict is now `pass`, so the item
+  is committed.
+- Scope/files: `internal/indexer/builder_closure.go` (cumulative vs `2d39f8b7`: +521/−20; this
+  round +18/−4), `internal/indexer/import_placement_parity_test.go` (new, 1097 lines).
   `internal/indexer/builder_closure_test.go` is owned and unchanged.
+- Agent: wave 7, closure lane (round 4; rounds 1–3 were rejected, round 3's blocker is recorded
+  below).
 - Invariant: the import closure is **not wider than the resolver** and never narrower — every file
-  the resolver could bind an import specifier to is placed on the sparse generation, and nothing
-  else is.
-- Change (as it stands, uncommitted): the relative arm becomes a first try rather than a terminal
-  one, `cascadeImportedFiles` is extracted so both the bare and the relative-miss path key on the
-  RAW payload the way `resolveImport` does, and `closureUnionPlacements` merges a mixed caller set.
-  The bare JS/TS entry-point gate stays.
+  the resolver could bind an import specifier to is placed on the sparse generation.
+- Root cause closed (the round-3 blocker): the relative arm read its VERDICT from the wrong corpus.
+  `relativeArmProbeHits` probes `w.fileIndex`, filled by `buildDirIndexes`
+  (`builder_closure.go:1263`) from the **base** corpus, while `resolveImport` runs against the
+  **post-change** tree. The two disagree on exactly one axis that matters: a file the change
+  DELETES is still in `fileIndex`. So a commit that both introduced `import './svc'` into
+  `mixed/app.ts` and deleted `mixed/svc.ts` answered on a file that no longer exists, suppressed
+  the `dirIndex` / `lastDirIndex` cascade, and lost an import edge the whole index binds — a DROP,
+  the failure mode the item exists to prevent.
+- Change: `isFile` inside `relativeArmProbeHits` (`builder_closure.go:1049-1059`) excludes a path
+  the change deletes, plus a doc paragraph (`:1036-1044`) stating which corpus the verdict is read
+  from and why the ADD direction needs no counterpart. Only the VERDICT is corrected; PLACEMENT is
+  untouched by design. The earlier rounds' two resolver-authorised gates stand: the relative arm
+  can only terminate resolution for a JS/TS importer (`resolveJSTSImportTarget` opens with
+  `if !isJSTSPath(callerFile)`), and the wider `closureModuleProbes` extension set may contribute
+  placement but never suppression.
 - Acceptance gate(s): G1, G8.
-- Harness evidence (wave 6 exit suite, dirty tree — the item's files were present for every run):
-  `internal/indexer` normal six chunks 2824 / 0 / 2, race selection 182 / 0 / 0. The item's own 37
-  cases are green; the suite cannot see the defect, because the verifier's probes are overlay-only
-  and the item's fixture has no case of the shape that fails.
-- Limitations: an unproven qualified-name residual (a bare JS/TS specifier bound by the qual-name
-  arm into a directory with no `index.<ext>` would be dropped by the entry-point gate; no fixture
-  in this repository produces that shape); two superset-only residuals deliberately un-mirrored
-  (the npm manifest gate and the Go package-ownership gate); `dirMatchesImport` deliberately not
-  applied, because its own contract restricts it to cross-repo candidates; order-independence is
-  not tested by design.
-- Deviations: the plan's "narrow the basename arm" is implemented as two resolver-authorised gates
-  rather than a suffix-precision test, because a `dirMatchesImport`-style gate on the same-repo
-  branch is a measured DROP.
-- Next action: apply the verifier's verified fix direction — split the probe list and gate
-  suppression on the resolver's own precondition, so `answered` is true only when **every** caller
-  is a JS/TS path **and** a probe from the JS/TS-only set hits; the wider extension list may keep
-  contributing placement, never suppression. Then widen `importParityFixture` with a relative
-  specifier out of a non-JS/TS importer and one with a non-JS/TS sibling, and re-verify.
-- Verifier verdict: **FAIL — one blocker (a production drop reproduced through `BuildCommitLayer`,
-  proven to be a regression against `9c7815ea`).**
+- Harness evidence: wave 7 exit suite, HEAD `2d39f8b7`, dirty manifest `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` — `internal/indexer` normal six chunks 2873 / 0 / 2, race
+  331 / 0 / 0. Result dirs `scratchpad/results/indexer-normal-_Test_*_-W7suite-1` and
+  `scratchpad/results/indexer-race-Authority_Mutation_Receipt_Witness_Reuse_Retire_-W7suite-1`.
+- Limitations: **cost, not correctness** — the verdict is now false more often, so a relative
+  specifier that misses unions the whole `lastDirIndex[basename]` bucket (the added `./W.vue` case
+  places three files where the resolver binds one); every one sits in a directory the resolver's
+  own index offers, so no stray holds, but it pushes against the wave's write-amplification goal.
+  The SFC verbatim HIT is deliberately unpinned, because mutating it widens the union — the
+  direction the closure is allowed to err in; only the drop direction is pinned. Placement still
+  offers deleted paths (harmless: a deleted path is a seed and `planFileSetContext` skips it at
+  `builder_generation.go:639-641`). The qualified-name arm is still not mirrored — a bare JS/TS
+  specifier bound by the qual-name arm into a directory with no `index.<ext>` would be dropped by
+  the entry-point gate; no fixture in this repository produces that shape, and W6.12 owns the
+  conservative-handling sweep. The test-side mirror `importParityRelativeArmAnswers` (`:862`)
+  deliberately carries no deleted-exclusion, because the differential harness indexes one tree and
+  never deletes.
+- Deviations: the plan's "narrow the basename arm" stays vacuously satisfied — `dirMatchesImport`
+  has no call site in `internal/indexer` and `buildDirIndexes` keeps only same-repo paths. The item
+  took scope beyond the verifier's required list (the SFC fixture) because an un-pinned drop risk
+  sat on the very control-flow fact the doc comment advertises. During the item's own runs
+  `^Test[A-C]` had to be split into `^Test[A-B]` + `^TestC` for the 8-minute budget; the exit suite
+  ran the mandated six-chunk shape without a timeout.
+- Verifier verdict: **PASS** (round 4).
+- Commit: `010a96a7` — *indexer: read the import closure's relative-arm verdict from the
+  post-change tree*.
+
+### W6.7 — Mark superseded and retire replaced dedicated chains (D7)
+
+- State: `wired`. Adoption reaches the relabel from `internal/indexer/dedicated_base_runtime.go:411`;
+  the sweep reaches the chain pass from `checkout_promote.go:347`, `checkout_overview.go:689` and
+  `checkout_untrack.go:340,361,366,369`, all via `sweepRetirements` → `orphanedGenerations`; graph
+  deletion reaches it from `checkout_promote.go:381`.
+- Scope/files: `internal/graph/store_sqlite/catalog_dedicated_base.go`,
+  `internal/indexer/checkout_lifecycle.go`,
+  `internal/graph/store_sqlite/catalog_dedicated_base_test.go` (+7 tests),
+  `internal/indexer/dedicated_chain_retirement_test.go` (new, fixture + 11 tests).
+  `internal/indexer/checkout_lifecycle_test.go` is owned and unchanged.
+- Agent: wave 7, dedicated-lifecycle lane (repair round).
+- Invariant: a dedicated head an adoption genuinely replaced is labelled, and a chain no live
+  pointer composes is enumerated by the sweep — so a replaced chain cannot hold its family's
+  cleanup pending forever.
+- Root cause closed, two halves: (a) `AdoptDedicatedBaseGeneration` repointed
+  `dedicated_graphs.active_generation_id` and stamped the publication row, leaving the displaced
+  generation saying `ready`; the only production `SetViewGenerationState(..., Superseded, ...)`
+  callers are on other paths entirely. (b) `readyLayerRetirementCandidates`
+  (`checkout_lifecycle.go:3040-3044`) admits only commit / dirty layers while a dedicated base
+  carries kind `"dedicated"`, and **both** scans in `orphanedGenerations` skip a row whose
+  `CheckoutID` has a live coordinator — which for a dedicated base is always its owner checkout.
+- Change: `supersedeReplacedDedicatedHeadTx` labels, inside the adoption transaction, only a head
+  this adoption genuinely replaced — a previous head the adopted generation still descends from is
+  an ancestor of the live chain, composed into every view the new head serves, so it keeps its
+  state. The common advance (a delta whose base **is** the previous head) is one integer comparison
+  with zero reads; a new full root or a revert walks the chain with `dedicatedBaseAncestorTx`,
+  bounded by `maxDedicatedBaseAncestry`. `restoreAdoptedDedicatedHeadTx` clears the label off a
+  head a revert reinstates. `dedicatedChainRetirementCandidates` decides a dedicated base on its
+  chain rather than on a route or a coordinator (neither of which ever names one): it retains
+  everything the active pointer composes plus a bounded window of recently replaced chains
+  (default 2) so a revert re-adopts instead of rebuilding, retains **nothing** for a graph whose
+  row is gone, offers everything else including the ready ancestry under a replaced head so a
+  re-rooted chain drains in one sweep, always re-offers `retiring` rows, and fails closed when
+  `GetDedicatedGraph` errors.
+- Safety verified in source: `superseded` is already servable everywhere a dedicated base is read
+  (`graphview/dedicated_root.go:14`, `graphview/materialize.go:766`,
+  `indexer/checkout_coordinator.go:2578`, `indexer/dedicated_base_advance.go:65`,
+  `indexer/builder_dedicated_claimed.go:64`, `indexer/builder_dedicated_delta.go:97,108`,
+  `store_sqlite/catalog_dedicated_base.go:351`) and stays a reuse candidate (`:528`). Retirement
+  authority remains the reference predicate (`catalog.go:1692-1700`), not the label. Generation 0
+  can neither be a chain member nor be relabelled (both writes refuse `<= GenerationFloor`).
+- Acceptance gate(s): G4, G9.
+- Harness evidence: wave 7 exit suite, HEAD `2d39f8b7`, dirty manifest `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` — `internal/graph/store_sqlite` normal 1821 / 0 / 2, race
+  209 / 0 / 0; `internal/indexer` normal six chunks 2873 / 0 / 2, race 331 / 0 / 0. Result dirs
+  under `scratchpad/results/{store,indexer}-*-W7suite-1`. Item mutation evidence: 6/6 revert-red
+  mutations bind.
+- Limitations: `restoreAdoptedDedicatedHeadTx`'s `adopted <= 0` arm is unreachable through the
+  public API and only its floor arm is pinned (same for `supersedeReplacedDedicatedHeadTx`'s
+  `previous <= 0`); the `retiring` re-offer clause is pinned at the `orphanedGenerations` level,
+  not at collection, because a state where a retiring row is both retained by a walk *and*
+  unreferenced cannot be constructed — being reachable by the walk **is** a reference; the
+  retention window is a `CheckoutLifecycle` field with a package default and nothing wires it to
+  configuration, so the item's "small configurable window" has a knob that is honoured but no
+  config key reads it; bounded retention is per graph, per sweep, so a large leaked backlog drains
+  over several sweeps (256 candidates per sweep).
+- Deviations: the plan's line numbers had drifted (W4.4 had already touched the adoption
+  transaction for `head_tree`) and the call sites were placed against the current shape. The
+  ancestor check and the mirror restore are additions the source forced — without the first the
+  ordinary delta advance would label the live chain's own ancestry, without the second a revert
+  leaves the live head labelled `superseded`. `readyLayerRetirementCandidates`' kind filter was
+  **not** widened as the coordinator note suggested: widening it would have decided a base on a
+  route (which never names one) and on coordinator liveness (which always defers). The dedicated
+  rows are taken out of both cohorts *before* that function; `checkout_lifecycle.go:3040-3044` is
+  unchanged.
+- Verifier verdict: **PASS** (round 2).
+- Commit: `ab4801bb` — *store: label and retire the dedicated chain an adoption replaced*.
 
 ## W7 — Complete lifecycle/recovery integration
 
@@ -2349,6 +2679,72 @@ Shared fields for all W1 sub-items unless overridden:
 - Commit: `497333942cf11bcf9404e6b6c1041d7a6f920f2c` — *indexer: pin the publisher drain and
   registration-handle contract*.
 - Verifier verdict: **PASS.**
+
+### W7.6 — Consume `SafeStorageFailureReason`; handle ENOSPC on retirement and sweep; budget the sweep (absorbs W7.7)
+
+- State: `wired`. `defaultPayloadSweepBudget()` (`payload_generation_sweep.go:103`) is the single
+  production activation, called from `RetirePayloadGeneration` (`payload_generation.go:701`);
+  `ViewsHealth.StorageFailures` is read in-process by `CheckoutLifecycle.ViewsHealth`, the method
+  `collectViewsStatus` calls.
+- Scope/files: `internal/graph/store_sqlite/storage_error.go`,
+  `internal/graph/store_sqlite/payload_generation.go`,
+  `internal/graph/store_sqlite/payload_generation_sweep.go` (new),
+  `internal/indexer/checkout_health.go`,
+  `internal/graph/store_sqlite/storage_error_test.go` (new),
+  `internal/graph/store_sqlite/payload_generation_sweep_test.go` (new),
+  `internal/graph/store_sqlite/payload_generation_test.go` (one line),
+  `internal/indexer/storage_failure_readiness_test.go` (new).
+  `internal/indexer/checkout_health_test.go` is owned and unchanged.
+- Agent: wave 7, storage-maintenance lane (repair round).
+- Invariant: a retirement that cannot finish states **why** in bounded words, and the sweep is
+  bounded per pass **and** terminates — a pass with no progress never yields.
+- Change: `storageFailure` / `storageFailureReason` (`storage_error.go:142`) become the single
+  consumers of `SafeStorageFailureReason`, which previously had no caller at all — a cancelled
+  context is never a storage failure, a `*StorageError` passes through, and anything unwrapping to
+  a `*sqlite.Error` is wrapped so it reads like the write gate's. The register hangs off the
+  generation's existing `payloadSeal` (`payload_generation.go:69-78`), the one per-generation
+  object every handle already shares and which `RetirePayloadGeneration` already drops on success,
+  so "the reason clears after a successful retry" is the existing lifecycle rather than new
+  bookkeeping; no `Store` / `storeCore` field was added (`store.go` is unowned).
+  `RetirePayloadGeneration` routes its two classifiable post-fence returns through
+  `noteRetirementFailure` and retracts the previous attempt's reason at the head of every attempt.
+  `payloadSweepBudget{maxRows, maxChunks, maxElapsed, now}` is consulted **between** chunks only,
+  so a yield always lands on a committed transaction boundary, and `spent()` returns false while
+  `chunks == 0`, which is what turns "bounded per pass" into "terminates";
+  `ErrPayloadSweepBudgetExhausted` is a yield, not a failure. Resume state is a cursor into the
+  ordered step plan — sound because the generation is sealed `payloadSealRetired` before the first
+  chunk and the catalog refuses new references to a retiring generation. The elapsed axis reads an
+  injectable clock, never a wall-clock fence.
+- Wave constraints honoured: no schema change (the register is in-process); no catalog DML added to
+  any polling / selection / reuse path; committed generations stay immutable; generation 0 is still
+  refused by `generationID <= baseViewGeneration`; a yielded sweep is only ever presented as
+  `retiring`; no fallback presented as exact; no scoped work became `ResolveAll`.
+- Acceptance gate(s): G4, G9.
+- Harness evidence: wave 7 exit suite, HEAD `2d39f8b7`, dirty manifest `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a` — `internal/graph/store_sqlite` normal 1821 / 0 / 2, race
+  209 / 0 / 0; `internal/indexer` normal six chunks 2873 / 0 / 2, race 331 / 0 / 0. Result dirs
+  under `scratchpad/results/{store,indexer}-*-W7suite-1`. A test raises a **real** `SQLITE_FULL`
+  (code 13) from inside the sweep's own transaction; the verifier's own mutation M10
+  (`return payloadSweepBudget{}`) is RED.
+- Limitations: **the census field still has no wire reader** — the reason is readable in-process
+  only; two files, ~15 lines, recommended owner W8.3. `repository_cleanup.go:264` should absorb a
+  budget yield before the budget can be lowered into a scheduler slice (the right fix also covers
+  `ErrPayloadGenerationInUse` and `ErrCatalogGenerationReferenced`); not reachable with the current
+  defaults. **Build-time disk-full is not covered** — this item classifies the retirement / sweep
+  half; the recovery sites at `repository_mutation_coordinator.go:220,304`, `indexer.go:4376` and
+  `watcher.go:1375` hold the generation handle and can now call `Store.RecordStorageFailure`, but
+  they are other items' files. The register is **in-process**, so a restart forgets the reason and
+  the cursor; correctness does not depend on either (the `retiring` fence is the authority), and
+  durability needs a migration. The budget is per generation, per pass, so one janitor pass is
+  bounded by `owed × budget`; bounding the janitor loop belongs to whoever owns
+  `checkout_lifecycle.go:2771` `sweepRetirements`. A budget yield and a storage refusal both count
+  `views_generation_retire_refused_total{reason=error}`, because `internal/viewmetrics/catalog.go`
+  declares a closed label set and is unowned.
+- Deviations: absorbs W7.7 (the budget and resume half). The drain arm of
+  `RetirePayloadGeneration` is a plain return, not a recorded reason, because `drainPayloadWriters`
+  can only fail with a context error (`payload_generation.go:473-479`).
+- Verifier verdict: **PASS** (round 2).
+- Commit: `c7b77aab` — *store: classify storage refusals on retirement and bound the payload
+  sweep*.
 
 ## W8 — Prove end-to-end correctness and I/O benefit
 
@@ -3600,3 +3996,107 @@ Runs executed 2026-09-10/11 local time; the entry is dated by the wave, not by t
 - **Disk.** Recorded in the wave 6 exit report (`scratchpad/reports/W6-suite.md`): `df -h /` before
   and after the stage's cleanup, which deletes the per-run harness homes and compiled test binaries
   and trims Go build-cache entries untouched for more than a day. No shared cache was cleared.
+
+### 2026-09-10 — Wave 7 exit suite (W3.1b, W5.4, W5.7b, W5.11, W6.5, W6.7, W7.6; W4.6 blocked)
+
+Source identity for every command below: HEAD `2d39f8b7769be441b96bf618ee30fcd84f8487f5`,
+dirty-manifest sha256 `ad613b15d2d328e6ff08723e3327992b16ef7b45e6652b0372f1414f9048a00a`
+(harness-computed, recorded in every `result.json` of this suite). Identical on all 12 compiles and
+all 22 runs — no source drift during the suite. Harness
+`scratchpad/harness/validate.sh`, `GXH_TAG=W7suite`; go1.27.0 darwin/arm64, `GOWORK=off`,
+`GOTOOLCHAIN=local`, `GOFLAGS=-mod=mod -buildvcs=false`, `GOPROXY=off`, isolated `HOME` / `TMPDIR`
+/ XDG per run, `GOMAXPROCS=2`, `GOMEMLIMIT=2GiB`, `-test.timeout 8m`.
+
+Build and vet, run in the worktree with the isolation env:
+
+- `go build ./...` — exit 0, no output.
+- `go vet ./internal/indexer/ ./internal/graph/store_sqlite/ ./internal/graphview/ ./internal/mcp/
+  ./internal/server/ ./internal/serverstack/ ./internal/daemon/ ./cmd/gortex/ ./internal/graph/
+  ./internal/reconcile/` — exit 0, no output.
+
+Normal suites (pattern `.`, count 1; result dirs under `scratchpad/results/`):
+
+| run | pass / fail / skip | result dir |
+| --- | --- | --- |
+| `graph` | 530 / 0 / 0 | `graph-normal-_-W7suite-1` |
+| `graphview` | 493 / 0 / 0 | `graphview-normal-_-W7suite-1` |
+| `reconcile` | 93 / 0 / 0 | `reconcile-normal-_-W7suite-1` |
+| `store` | 1821 / 0 / 2 | `store-normal-_-W7suite-1` |
+| `./internal/serverstack` | 27 / 0 / 0 | `internal_serverstack-normal-_-W7suite-1` |
+| `./internal/server` | 123 / 0 / 0 | `internal_server-normal-_-W7suite-1` |
+| `./internal/daemon` | 289 / 0 / 0 | `internal_daemon-normal-_-W7suite-1` |
+| `./internal/mcp` | 6494 / 0 / 8 | `internal_mcp-normal-_-W7suite-1` |
+| `cmd` | 1111 / 0 / 5 | `cmd-normal-_-W7suite-1` |
+| `indexer` `^Test[A-C]` | 621 / 0 / 1 | `indexer-normal-_Test_A_C_-W7suite-1` |
+| `indexer` `^Test[D-H]` | 565 / 0 / 0 | `indexer-normal-_Test_D_H_-W7suite-1` |
+| `indexer` `^Test[I-M]` | 550 / 0 / 1 | `indexer-normal-_Test_I_M_-W7suite-1` |
+| `indexer` `^Test[N-R]` | 629 / 0 / 0 | `indexer-normal-_Test_N_R_-W7suite-1` |
+| `indexer` `^Test[S-T]` | 363 / 0 / 0 | `indexer-normal-_Test_S_T_-W7suite-1` |
+| `indexer` `^Test[U-Z]` | 145 / 0 / 0 | `indexer-normal-_Test_U_Z_-W7suite-1` |
+| **normal total** | **13854 / 0 / 17** | |
+
+`internal/indexer` was run as the mandated six chunks; every chunk finished inside the 8-minute
+per-process budget (longest `^Test[A-C]`, 300.7 s), so no further splitting was needed.
+
+Race selections:
+
+| run | pattern | pass / fail / skip | result dir |
+| --- | --- | --- | --- |
+| `indexer` | `Authority\|Mutation\|Receipt\|Witness\|Reuse\|Retire\|Supersede\|Closure\|Placement\|Storage\|Health\|Fence\|Observation\|Rehome\|CheckoutMutation` | 331 / 0 / 0 | `indexer-race-Authority_Mutation_Receipt_Witness_Reuse_Retire_-W7suite-1` |
+| `store` | `Catalog\|Adopt\|Supersede\|Retire\|Sweep\|Storage\|Reuse\|Fence` | 209 / 0 / 0 | `store-race-Catalog_Adopt_Supersede_Retire_Sweep_Storage_Reu-W7suite-1` |
+| `./internal/mcp` | `BasePin\|Handoff\|OwnerLease\|Cancel\|Drift\|Fresh\|Deadline\|Health\|Bytes` | 606 / 0 / 0 | `internal_mcp-race-BasePin_Handoff_OwnerLease_Cancel_Drift_Fresh_De-W7suite-1` |
+| `graphview` | `Raw\|Pin\|Witness\|Lease\|Drain` | 78 / 0 / 0 | `graphview-race-Raw_Pin_Witness_Lease_Drain-W7suite-1` |
+| `./internal/server` | `.` | 123 / 0 / 0 | `internal_server-race-_-W7suite-1` |
+| `./internal/daemon` | `Proxy\|Servers` | 17 / 0 / 0 | `internal_daemon-race-Proxy_Servers-W7suite-1` |
+| **race total** | | **1364 / 0 / 0** | |
+
+**Suite total: 15218 pass, 0 fail, 17 skip. No failures anywhere.**
+
+Every skip, named with its exact reason (all pre-existing, none added by this wave; no skip is a
+disabled assertion):
+
+| test | reason as printed |
+| --- | --- |
+| `TestBundlePackageKeyNeverUsesOSSeparator` (store) | `bundle_cache_test.go:111: separator matches the contract on this platform` — the Windows path-separator test, one of the two known legitimate store skips |
+| `TestMetaBlobCensus` (store) | `meta_census_probe_test.go:17: set GORTEX_BENCH_STORE to a copied store.sqlite to run` — the copied-store census requiring an explicit fixture, the second known legitimate store skip |
+| `TestAnalyzeScope_AllScopeAwareKinds_NoCrossWorkspaceLeak/{coverage_gaps,coverage_summary}` (mcp) | `analyze_scope_test.go:660: needs a coverage profile (cannot fixture in-memory; emits empty, never leaks)` |
+| `TestAnalyzeScope_AllScopeAwareKinds_NoCrossWorkspaceLeak/{ownership,stale_code}` (mcp) | `analyze_scope_test.go:660: needs git-blame author data / meta.last_authored (cannot fixture in-memory; emits empty, never leaks)` |
+| `TestAnalyzeScope_AllScopeAwareKinds_NoCrossWorkspaceLeak/stale_flags` (mcp) | `analyze_scope_test.go:660: needs feature-flag toggles + git-blame timestamps (cannot fixture in-memory; emits empty, never leaks)` |
+| `TestATradeThatCannotSaveTheOutlineIsGivenBack` (mcp) | `localization_file_outline_test.go:857: the fixture is no longer tight enough to drop the index` |
+| `TestLocalizationTextMatchNormalisesNativePathToGraphKey` (mcp) | `localization_text_index_test.go:120: a native path differs from the graph spelling only on Windows` |
+| `TestCheckoutMutationResolvedRootRejectsFoldedDistinctDirectory` (mcp) | `view_mutation_state_test.go:175: filesystem cannot represent case-distinct directories` |
+| `TestFileCoveragePrefersCanonicalKeysWithoutDoubleCounting` (cmd) | `daemon_controller_coverage_test.go:144: native and slash graph keys coincide on this platform` |
+| `TestSystemdUnitPath_ResolvesUnderHome` (cmd) | `daemon_service_test.go:192: systemd paths only meaningful on linux` |
+| `TestServiceCommands_RejectUnsupportedOS` (cmd) | `daemon_service_test.go:205: this test only runs on unsupported platforms` |
+| `TestIssue767IdleIOIntegration` (cmd) | `issue767_idle_io_integration_test.go:34: set GORTEX_ISSUE767_TEST_BINARY to opt into isolated daemon validation` |
+| `TestIssue767WorktreeReadinessIntegration` (cmd) | `issue767_worktree_readiness_integration_test.go:23: set GORTEX_ISSUE767_READINESS_BINARY for isolated worktree validation` |
+| `TestBackendBench` (indexer) | `zzbench_backends_test.go:39: bench harness; set GORTEX_BENCH_ROOT=<repo> and GORTEX_BENCH_BACKEND=memory\|sqlite` |
+| `TestMeasureEditLatency` (indexer) | `editlatency_measure_test.go:26: set GORTEX_MEASURE_REPO=/abs/path to run` |
+
+Commits, one per item, each staging only that item's files, in dependency order (store → indexer →
+graphview / request surface → HTTP surface):
+
+| item | commit | subject |
+| --- | --- | --- |
+| W7.6 | `c7b77aab` | *store: classify storage refusals on retirement and bound the payload sweep* |
+| W6.7 | `ab4801bb` | *store: label and retire the dedicated chain an adoption replaced* |
+| W3.1b | `3bf359ba` | *indexer: move the base witness when a closing owner still admits a write* |
+| W6.5 | `010a96a7` | *indexer: read the import closure's relative-arm verdict from the post-change tree* |
+| W5.4 | `897b86fe` | *mcp: hold a repository-owner lease for the lifetime of a serving request* |
+| W5.7b | `67b1529e` | *mcp: withdraw the exactness claim when the worktree route moves under a read* |
+| W5.11 | `7164bc2f` | *server: pin the base corpus for HTTP reads and forward the caller's view identity* |
+
+**W4.6 was not committed.** Its final verifier verdict is `fail` on BLOCKER-1 (the head fence's
+`last_seen` regression, which narrows a guard W4.4 landed and is proven new against `2d39f8b7`);
+see the W4.6 row for the reproduction, the production reachability and the fix shape. Its six files
+stay dirty in the worktree at the end of this wave:
+`internal/graph/store_sqlite/catalog.go`, `internal/graph/store_sqlite/catalog_test.go`,
+`internal/indexer/checkout_coordinator.go`, `internal/indexer/checkout_coordinator_test.go`,
+`internal/indexer/checkout_layer_reuse_test.go` (untracked),
+`internal/indexer/dedicated_base_advance_trigger_test.go`. They were present in the tree for every
+run above, so every count in this entry is a count **with** W4.6's changes applied.
+
+After the seven commits, `git status --short` shows exactly those six files plus
+`docs/incremental-indexing-handoff-2026-09-10.md`, the untracked working input that is never
+committed. Nothing owned by this wave remains uncommitted apart from W4.6, and no file outside this
+wave's ownership was touched.
