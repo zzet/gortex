@@ -804,6 +804,25 @@ const (
 	// Reconcile requests merge, so the execution — not the queuing caller — is
 	// the entry point that names an output generation.
 	OutputEntryRepositoryReconcileLane OutputMutationEntry = "indexer.repositoryMutationCoordinator.drain"
+	// OutputEntryEnrichmentCorpus is the enrichment door: blame / churn /
+	// coverage / releases / co-change / LSP semantic enrichment, and the
+	// counter reconciliation the exact status path runs. They stamp derived
+	// meta onto an already-built payload rather than extracting it, and they
+	// write the CORPUS — generation zero — because every derived generation a
+	// reader can reach is published, and publication seals the payload
+	// (store_sqlite.ErrPayloadGenerationSealed). There is deliberately no
+	// checkout-axis enrichment entry: an enrichment raised under a routed view
+	// is refused at the request surface rather than being redirected here.
+	//
+	// One entry covers every producer because this registry keys the output
+	// AXIS, not the payload. Which producer ran rides on the target's owner
+	// key, which is producer-scoped so two runs of one enricher over one output
+	// supersede each other while an enrichment never takes the authority away
+	// from a live index mutation or checkout source edit.
+	//
+	// The call sites are internal/mcp (the tool surface) and cmd/gortex (the
+	// control socket), so no mutation door in this package names it.
+	OutputEntryEnrichmentCorpus OutputMutationEntry = "gortex.enrichment.corpus"
 )
 
 // outputMutationEntryKinds is the registry. An entry that is absent here cannot
@@ -826,6 +845,7 @@ var outputMutationEntryKinds = map[OutputMutationEntry]OutputGenerationKind{
 	OutputEntryWatcherEnqueueReresolve: OutputGenerationLegacy,
 	OutputEntryCheckoutSourceMutation:  OutputGenerationCheckout,
 	OutputEntryRepositoryReconcileLane: OutputGenerationLegacy,
+	OutputEntryEnrichmentCorpus:        OutputGenerationLegacy,
 }
 
 // OutputMutationTarget is the one output generation and owner a mutation
@@ -1225,6 +1245,19 @@ func defaultOutputGenerationAuthority() *OutputGenerationAuthority {
 		defaultOutputAuthority = NewOutputGenerationAuthority(nil)
 	})
 	return defaultOutputAuthority
+}
+
+// DefaultOutputGenerationAuthority is the process fallback above, exported for
+// the mutation doors that live OUTSIDE this package — the MCP enrichment
+// surface and the control socket's `gortex enrich`.
+//
+// It exists so those doors cannot construct a SECOND fallback of their own. Two
+// authorities are two serialization universes: owner keys in one cannot
+// supersede or order owner keys in the other, so an enrichment admitted through
+// a package-local fallback would silently stop colliding with the indexer lanes
+// that name the same corpus. There is one fallback per process, and this is it.
+func DefaultOutputGenerationAuthority() *OutputGenerationAuthority {
+	return defaultOutputGenerationAuthority()
 }
 
 // SetOutputGenerationAuthority installs the process authority on this Indexer.

@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/releases"
@@ -247,10 +248,21 @@ func (c *realController) EnrichChurn(ctx context.Context, p daemon.EnrichChurnPa
 				zap.String("prefix", t.prefix), zap.String("root", t.root))
 			continue
 		}
-		res, err := churn.EnrichGraph(ctx, c.graph, t.root, churn.Options{Branch: branch})
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerChurn, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		res, err := churn.EnrichGraph(ctx, out.Store, out.Root, churn.Options{Branch: branch})
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerChurn, t.prefix, superseded)
 		combined.Files += res.Files
 		combined.Symbols += res.Symbols
 		combined.Branch = res.Branch
@@ -291,7 +303,6 @@ func (c *realController) EnrichReleases(ctx context.Context, p daemon.EnrichRele
 	if len(targets) == 0 {
 		return daemon.EnrichReleasesResult{}, fmt.Errorf("no tracked repo matches %q", p.Path)
 	}
-	_ = ctx // graph mutation is synchronous; no cancellation surface today
 
 	started := time.Now()
 	var combined daemon.EnrichReleasesResult
@@ -304,10 +315,21 @@ func (c *realController) EnrichReleases(ctx context.Context, p daemon.EnrichRele
 			// no default branch can be resolved (e.g. a clone without
 			// origin/HEAD set yet).
 		}
-		count, err := releases.EnrichGraphForBranch(c.graph, t.root, t.prefix, branch)
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerReleases, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		count, err := releases.EnrichGraphForBranch(out.Store, out.Root, t.prefix, branch)
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerReleases, t.prefix, superseded)
 		combined.Files += count
 		combined.Branch = branch
 	}
@@ -351,10 +373,59 @@ func (c *realController) resolveEnrichTargets(path string) ([]enrichTarget, erro
 	return targets, nil
 }
 
+// enrichmentAuthority is the one output-generation authority every mutation in
+// this process admits through — the same one the MCP tool surface and the
+// indexer lanes resolve to.
+func (c *realController) enrichmentAuthority() *indexer.OutputGenerationAuthority {
+	if c == nil || c.multiIndexer == nil {
+		return nil
+	}
+	return c.multiIndexer.ResolvedOutputGenerationAuthority()
+}
+
+// beginBaseEnrichment names this control-socket enrichment's output generation.
+//
+// The control socket has no request view: `gortex enrich` runs against the
+// indexed CORPUS, so it declares generation zero explicitly rather than writing
+// base because nothing selected anything else. That declaration is the whole
+// point — the write is the same write it always was, but it is now a named
+// output with an owner the authority can order and supersede, instead of an
+// unattributed mutation of whatever `c.graph` happened to be.
+func (c *realController) beginBaseEnrichment(
+	ctx context.Context, producer, repoPrefix, root string,
+) (*gortexmcp.EnrichmentOutput, error) {
+	return gortexmcp.BeginBaseEnrichment(ctx, c.enrichmentAuthority(), c.graph, producer, repoPrefix, root)
+}
+
+// logSupersededEnrichment records the one settled outcome that is neither a
+// success to count nor a failure to report: the producer wrote everything it
+// was going to write, and a newer run of the same producer over the same corpus
+// took the authority before this one settled.
+//
+// It exists so the control socket says exactly what the tool surface says. Both
+// doors admit through one authority with one owner key per (producer, corpus),
+// BY DESIGN — that is why the producer names are shared constants — so an agent
+// running `analyze kind=blame` while a hook runs `gortex enrich blame`
+// supersedes one of them every time. The tool surface reports that as
+// `superseded: true` beside the counts; this door used to turn it into a hard
+// error AND discard the repositories it had already enriched, which is a
+// failure mode the pre-item code could not produce.
+func (c *realController) logSupersededEnrichment(producer, prefix string, superseded bool) {
+	if !superseded || c == nil || c.logger == nil {
+		return
+	}
+	c.logger.Debug("daemon: enrichment superseded by a newer run; its stamps are written",
+		zap.String("producer", producer), zap.String("repo", prefix))
+}
+
 // EnrichBlame runs the git-blame authorship enricher against the
 // daemon's graph. Mirrors EnrichChurn — c.mu is held for the duration
 // and targets resolve via the multi-indexer.
-func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlameParams) (daemon.EnrichBlameResult, error) {
+//
+// Output generation: BASE (generation zero), declared explicitly. The control
+// socket serves the corpus; a routed checkout generation is enriched through
+// the MCP tool surface, which is where a request view exists.
+func (c *realController) EnrichBlame(ctx context.Context, p daemon.EnrichBlameParams) (daemon.EnrichBlameResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -366,10 +437,21 @@ func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlamePara
 	started := time.Now()
 	var combined daemon.EnrichBlameResult
 	for _, t := range targets {
-		count, err := blame.EnrichGraph(c.graph, t.root)
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerBlame, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		count, err := blame.EnrichGraph(out.Store, out.Root)
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerBlame, t.prefix, superseded)
 		combined.Nodes += count
 	}
 	combined.DurationMS = time.Since(started).Milliseconds()
@@ -380,7 +462,7 @@ func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlamePara
 // the daemon's graph. The CLI parses the profile (the path is relative
 // to the caller's cwd, not the daemon's), so the daemon only needs the
 // segments and resolves each repo's module path from its working tree.
-func (c *realController) EnrichCoverage(_ context.Context, p daemon.EnrichCoverageParams) (daemon.EnrichCoverageResult, error) {
+func (c *realController) EnrichCoverage(ctx context.Context, p daemon.EnrichCoverageParams) (daemon.EnrichCoverageResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -404,8 +486,18 @@ func (c *realController) EnrichCoverage(_ context.Context, p daemon.EnrichCovera
 	var combined daemon.EnrichCoverageResult
 	combined.Segments = len(segments)
 	for _, t := range targets {
-		modulePath := coverage.ReadModulePath(t.root)
-		combined.Symbols += coverage.EnrichGraph(c.graph, segments, modulePath)
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerCoverage, t.prefix, t.root)
+		if err != nil {
+			return daemon.EnrichCoverageResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		modulePath := coverage.ReadModulePath(out.Root)
+		combined.Symbols += coverage.EnrichGraph(out.Store, segments, modulePath)
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichCoverageResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerCoverage, t.prefix, superseded)
 	}
 	combined.DurationMS = time.Since(started).Milliseconds()
 	return combined, nil
@@ -423,15 +515,24 @@ func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCoch
 	if err != nil {
 		return daemon.EnrichCochangeResult{}, err
 	}
-	_ = ctx // mining is synchronous; no cancellation surface today
-
 	started := time.Now()
 	var combined daemon.EnrichCochangeResult
 	for _, t := range targets {
-		count, err := cochange.EnrichGraph(c.graph, t.root, t.prefix)
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerCochange, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		count, err := cochange.EnrichGraph(out.Store, out.Root, t.prefix)
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerCochange, t.prefix, superseded)
 		combined.Edges += count
 	}
 	combined.DurationMS = time.Since(started).Milliseconds()
@@ -836,9 +937,33 @@ func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse
 	if reconciler, ok := graph.Store(g).(interface {
 		ReconcileRepoCounters(map[string]graph.RepoMemoryEstimate) error
 	}); ok {
-		if err := reconciler.ReconcileRepoCounters(scanned); err != nil {
+		// Writing the recounted per-repo estimates back is a mutation of the
+		// corpus, so it names generation zero through the same authority every
+		// other write does rather than being the one unattributed write left.
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerRepoCounters, "", "")
+		if err != nil {
 			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
 		}
+		if err := reconciler.ReconcileRepoCounters(scanned); err != nil {
+			out.Abandon()
+			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
+		}
+		// A supersession is NOT a failure here, and must not be turned into
+		// one: this method does not hold c.mu, so two concurrent
+		// `gortex status --exact` calls supersede each other by construction,
+		// and the loser's counters are already written (and are the same
+		// measured numbers the winner wrote). Naming the output is how the two
+		// runs are ordered; failing the later-admitted-then-overtaken one
+		// would invent an error the pre-item code could never return.
+		//
+		// Settle is the SAME settlement the enrich doors and the tool surface
+		// use, for the same reason: one spelling of "landed, superseded" across
+		// every door that names this corpus.
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
+		}
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerRepoCounters, "", superseded)
 	}
 	return c.status(ctx, true)
 }
@@ -1539,6 +1664,13 @@ func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsSt
 		}
 		return nil
 	}
+	return viewsStatusFromHealth(health)
+}
+
+// viewsStatusFromHealth is the census → payload projection, split out so the
+// one thing that can go wrong with it is checkable: a field the census carries
+// and the payload silently drops.
+func viewsStatusFromHealth(health indexer.ViewsHealth) *daemon.ViewsStatus {
 	return &daemon.ViewsStatus{
 		Families:     health.Families,
 		Checkouts:    health.Checkouts,
@@ -1546,8 +1678,40 @@ func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsSt
 		Generations:  health.Generations,
 		Leases:       health.Leases,
 		RefViews:     health.RefViews,
-		Counters:     health.Counters,
+		// The counts beside this are unreadable without it: Coordinators says
+		// how many build loops run, and the checkouts that have none are
+		// explained nowhere else. The census already carried the reasons
+		// (indexer.ViewsHealth.CoordinatorStartFailures) and this literal used
+		// to drop them on the floor, which left them with no reader at all — a
+		// background reconciliation has no caller to fail, so the status
+		// payload is the only surface the reason can reach.
+		CoordinatorStartFailures: viewsStartFailures(health.CoordinatorStartFailures),
+		Counters:                 health.Counters,
 	}
+}
+
+// viewsStartFailures translates the lifecycle's start-failure ledger onto the
+// wire. It is a translation rather than an alias because internal/daemon is the
+// protocol package: its payloads are plain structs a client decodes without
+// linking the indexer.
+//
+// A nil ledger stays nil so the field is omitted — "every checkout that wanted
+// a loop has one" must render as absence, not as an empty list that reads like
+// a section someone forgot to fill in.
+func viewsStartFailures(failures []indexer.CoordinatorStartFailure) []daemon.CoordinatorStartFailure {
+	if len(failures) == 0 {
+		return nil
+	}
+	out := make([]daemon.CoordinatorStartFailure, 0, len(failures))
+	for _, f := range failures {
+		out = append(out, daemon.CoordinatorStartFailure{
+			CheckoutID: f.CheckoutID,
+			RootPath:   f.RootPath,
+			Reason:     f.Reason,
+			At:         f.At,
+		})
+	}
+	return out
 }
 
 // collectEnrichmentProgress reflects the semantic manager's per-(repo,

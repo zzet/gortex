@@ -321,6 +321,7 @@ func outputMutationEntryValue(identifier string) (string, bool) {
 		"OutputEntryWatcherEnqueueReresolve": OutputEntryWatcherEnqueueReresolve,
 		"OutputEntryCheckoutSourceMutation":  OutputEntryCheckoutSourceMutation,
 		"OutputEntryRepositoryReconcileLane": OutputEntryRepositoryReconcileLane,
+		"OutputEntryEnrichmentCorpus":        OutputEntryEnrichmentCorpus,
 	}
 	value, ok := known[identifier]
 	return string(value), ok

@@ -11,12 +11,14 @@ import (
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"pgregory.net/rapid"
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 )
@@ -862,5 +864,200 @@ func TestIntegrationGuardRulesLoadedFromConfig(t *testing.T) {
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), cfg.Guards.Rules)
 	if len(srv.guardRules) != 2 {
 		t.Errorf("server has %d guard rules, want 2", len(srv.guardRules))
+	}
+}
+
+// W5.6 handed this consumer over: `analyze kind=hotspots` answers from the
+// server-wide analysis caches and from `s.graph` directly — never from the
+// request's reader — so under a routed view its rows describe the BASE corpus
+// while the rest of the answer reads as view-scoped.
+//
+// It is the same statement get_architecture already makes for the hotspots
+// section it serves out of the same cache; the standalone tool was the site
+// that had no annotation. The scope filter inside the handler narrows which
+// rows a session may SEE; it does not change which corpus they were ranked
+// over, so it is not the answer to this.
+
+// hotspotFixtureNodes seeds enough base nodes to clear the handler's
+// ten-symbol floor. They are ordinary corpus nodes: what is under test is which
+// corpus the ranking describes, not the ranking.
+func seedHotspotCorpus(t *testing.T, stack *viewStack) {
+	t.Helper()
+	nodes := make([]*graph.Node, 0, 12)
+	edges := make([]*graph.Edge, 0, 12)
+	for i := range 12 {
+		id := "repo/hot.go::H" + string(rune('A'+i))
+		nodes = append(nodes, &graph.Node{
+			ID: id, Kind: graph.KindFunction, Name: "H" + string(rune('A'+i)),
+			QualName: "repo." + "H" + string(rune('A'+i)),
+			FilePath: "repo/hot.go", RepoPrefix: "repo", Language: "go",
+			StartLine: i + 1, EndLine: i + 2,
+		})
+		if i > 0 {
+			edges = append(edges, &graph.Edge{
+				From: "repo/hot.go::H" + string(rune('A'+i-1)), To: id,
+				Kind: graph.EdgeCalls, FilePath: "repo/hot.go", Line: i + 1,
+			})
+		}
+	}
+	stack.store.AddBatch(nodes, edges)
+}
+
+// TestRoutedHotspotsSayTheyRankedTheBaseCorpus is the rider pin.
+//
+// Revert-red: delete the annotateBaseScoped call from handleFindHotspots and
+// the routed answer carries no base_scoped entry, so an agent inside a worktree
+// reads a base-corpus ranking as if it described its own checkout.
+func TestRoutedHotspotsSayTheyRankedTheBaseCorpus(t *testing.T) {
+	stack := newViewStack(t)
+	seedHotspotCorpus(t, stack)
+
+	res, err := stack.callHandler(t, stack.worktreeRoot, "analyze",
+		map[string]any{"kind": "hotspots"}, stack.srv.handleFindHotspots)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+
+	rider := resultFreshness(t, res)
+	require.NotNil(t, rider, "a routed answer carries no rider: %s", viewResultText(t, res))
+	named := map[string]bool{}
+	entries, _ := rider["base_scoped"].([]any)
+	for _, entry := range entries {
+		name, _ := entry.(string)
+		named[name] = true
+	}
+	for _, want := range []graphview.CapabilityID{graphview.CapSyntaxGraph, graphview.CapResolutionLocal} {
+		require.Truef(t, named[string(want)],
+			"base_scoped = %v, want it to name %s", rider["base_scoped"], want)
+	}
+}
+
+// TestBaseHotspotsAreNotAnnotated is the control: on a base request the corpus
+// IS the answer, and an annotation there would be noise on every ordinary call.
+func TestBaseHotspotsAreNotAnnotated(t *testing.T) {
+	stack := newViewStack(t)
+	seedHotspotCorpus(t, stack)
+
+	res, err := stack.callHandler(t, stack.repoRoot, "analyze",
+		map[string]any{"kind": "hotspots"}, stack.srv.handleFindHotspots)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.NotContains(t, viewResultText(t, res), "base_scoped",
+		"a base answer was annotated as base-scoped")
+}
+
+// The shipped instructions for `analyze kind=coverage` / `kind=blame` and what
+// those kinds actually do had drifted apart in two places. One of them turned
+// out not to reach an agent at all, and one of them did.
+//
+// NOT shipped: the long `repo` / `scope` prose in the registration above.
+// compactSharedToolParams (params_legend.go:142) replaces both descriptions at
+// registration with the shared gloss ("Repository prefix/path filter
+// (multi-repo); see server instructions."), so the enumerations that listed
+// blame and coverage among the kinds that are "not repo-narrowed" never
+// reached tools/list. They are corrected at the source anyway — a maintainer
+// reads them, and a reworded description that stopped matching the rewrite's
+// discriminator would start shipping them verbatim.
+//
+// SHIPPED, and wrong: the `scope_note` the analyze dispatcher stamps when a
+// caller narrows with `repo` on a kind that is not in analyzeScopeAwareKinds.
+// blame narrows by `repo` for real and coverage REQUIRES it on a multi-repo
+// daemon, so the note told the caller its argument had been ignored on the very
+// call that could not have run without it.
+
+// TestARepoNarrowedCoverageIsNotDisclosedAsANoOp is the wire pin.
+//
+// Revert-red: drop analyzeEnrichmentRepoNarrowedKinds from the predicate at the
+// stamping site and this answer carries
+// `scope_note: kind 'coverage' is not scope-narrowed in v1 …` beside a result
+// that was narrowed by exactly that argument.
+func TestARepoNarrowedCoverageIsNotDisclosedAsANoOp(t *testing.T) {
+	stack := newViewStack(t)
+	writeCoverProfile(t, stack.repoRoot)
+
+	res, err := stack.callHandler(t, stack.repoRoot, "analyze",
+		map[string]any{"kind": "coverage", "profile": "cover.out", "repo": "repo"},
+		stack.srv.handleAnalyze)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+
+	require.Empty(t, scopeNoteOf(res),
+		"the answer was narrowed by `repo` and still says the narrowing was a no-op")
+
+	// And the narrowing it disclaimed is the one that decided the answer.
+	payload := enrichmentPayload(t, res)
+	require.Equal(t, stack.repoRoot, payload["root"])
+}
+
+// TestARepoNarrowedBlameIsNotDisclosedAsANoOp is the same statement for the
+// other enrichment kind, which resolves its targets through the same `repo`.
+func TestARepoNarrowedBlameIsNotDisclosedAsANoOp(t *testing.T) {
+	stack := newViewStack(t)
+
+	res, err := stack.callHandler(t, stack.repoRoot, "analyze",
+		map[string]any{"kind": "blame", "repo": "repo"}, stack.srv.handleAnalyze)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Empty(t, scopeNoteOf(res),
+		"a blame run narrowed to one repository says the narrowing was a no-op")
+
+	perRepo, _ := enrichmentPayload(t, res)["per_repo"].(map[string]any)
+	require.Contains(t, perRepo, "repo")
+	require.NotContains(t, perRepo, "other",
+		"`repo` did not narrow the run it was stamped as a no-op for")
+}
+
+// TestAGenuinelyUnnarrowedKindStillDisclosesTheNoOp is the control: the note is
+// still stamped for the kinds that really do ignore the narrowing, so this is a
+// correction of two entries and not a hole in the disclosure.
+func TestAGenuinelyUnnarrowedKindStillDisclosesTheNoOp(t *testing.T) {
+	stack := newViewStack(t)
+
+	res, err := stack.callHandler(t, stack.repoRoot, "analyze",
+		map[string]any{"kind": "fixes_history", "repo": "repo"}, stack.srv.handleAnalyze)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Contains(t, scopeNoteOf(res), "not scope-narrowed",
+		"a kind that ignores `repo` no longer says so")
+}
+
+// scopeNoteOf reads the _meta scope_note an analyze answer carries, or "".
+func scopeNoteOf(res *mcplib.CallToolResult) string {
+	if res == nil || res.Meta == nil {
+		return ""
+	}
+	note, _ := res.Meta.AdditionalFields["scope_note"].(string)
+	return note
+}
+
+// TestTheScopeNarrowingVocabulariesStayDisjoint guards the one hazard of
+// keeping a second home for a vocabulary.
+//
+// analyzeEnrichmentRepoNarrowedKinds lives here rather than in
+// analyze_kinds.go's analyzeScopeAwareKinds only because that file is outside
+// this item's ownership list; the two sets feed ONE predicate (the stamping
+// site at tools_enhancements.go), and folding them together is a mechanical
+// follow-up. Until it lands, the silent failure is a kind entered in both — the
+// day someone moves `blame` into analyzeScopeAwareKinds and leaves the copy
+// here, the entry below becomes dead weight nobody notices, and the next
+// divergence lands on top of it.
+//
+// So: every entry here must be a real analyze kind, and must be absent from
+// every other set the predicate consults. That makes the fold-together a
+// deletion the suite verifies rather than a judgement call.
+func TestTheScopeNarrowingVocabulariesStayDisjoint(t *testing.T) {
+	known := map[string]bool{}
+	for _, kind := range analyzeKinds {
+		known[kind] = true
+	}
+	require.NotEmpty(t, analyzeEnrichmentRepoNarrowedKinds)
+	for kind := range analyzeEnrichmentRepoNarrowedKinds {
+		require.True(t, known[kind],
+			"%q is narrowing-exempt here and is not an analyze kind at all", kind)
+		require.False(t, analyzeScopeAwareKinds[kind],
+			"%q is now in analyzeScopeAwareKinds; delete it from "+
+				"analyzeEnrichmentRepoNarrowedKinds — the vocabulary has one home again", kind)
+		require.False(t, analyzeWorkspaceClampedKinds[kind],
+			"%q is workspace-clamped; it discloses its own scope and must not be "+
+				"listed as repo-narrowed too", kind)
 	}
 }

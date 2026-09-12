@@ -557,11 +557,46 @@ type ViewsStatus struct {
 	Leases int `json:"leases"`
 	// RefViews counts named views of committed state by state.
 	RefViews map[string]int `json:"ref_views,omitempty"`
+	// CoordinatorStartFailures is the one entry here that is not a count, and
+	// it is the exception the rule above exists for: Coordinators says how many
+	// build loops this daemon runs, and a census reading "three checkouts, one
+	// loop" states a problem it cannot explain. Every path that starts a
+	// coordinator is a background reconciliation with no caller to fail, so
+	// without this the checkout that has no view has its reason stated nowhere
+	// a person can read.
+	//
+	// It stays bounded and it stays honest about cardinality: entries exist
+	// only for checkouts that have no loop AND have been tried, each is
+	// retracted the moment a loop is installed, and the ordinary answer is the
+	// empty one — omitted, not rendered as an empty list. A daemon whose views
+	// are healthy carries exactly the payload it carried before.
+	CoordinatorStartFailures []CoordinatorStartFailure `json:"coordinator_start_failures,omitempty"`
 	// Counters is the view-lifecycle metric registry flattened to series key
 	// and value, zero-valued series omitted. Every label in a key comes from
 	// a fixed vocabulary, so the map's size is a property of the build rather
 	// than of the workload.
 	Counters map[string]int64 `json:"counters,omitempty"`
+}
+
+// CoordinatorStartFailure is one checkout whose build loop could not be
+// started, and why.
+//
+// It mirrors indexer.CoordinatorStartFailure on the wire rather than aliasing
+// it: this package is the daemon PROTOCOL, and every other payload here is a
+// plain struct that an older or newer client can decode without linking the
+// indexer. The controller translates.
+type CoordinatorStartFailure struct {
+	// CheckoutID and RootPath name the working copy that has no view. They are
+	// identities, which the block above otherwise refuses — carried here
+	// because a reason that does not say WHICH checkout it is about cannot be
+	// acted on, and because the list is bounded by failures rather than by the
+	// number of worktrees a user keeps.
+	CheckoutID string `json:"checkout_id"`
+	RootPath   string `json:"root_path,omitempty"`
+	// Reason is what stopped it, as the failing step stated it.
+	Reason string `json:"reason"`
+	// At is when the attempt failed, as a Unix timestamp on the daemon's clock.
+	At int64 `json:"at"`
 }
 
 // SearchBackendStats identifies which search backend is currently
@@ -746,6 +781,12 @@ type EnrichChurnResult struct {
 	Branch     string `json:"branch"`
 	HeadSHA    string `json:"head_sha"`
 	DurationMS int64  `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichReleasesParams is the payload for ControlEnrichReleases.
@@ -768,6 +809,12 @@ type EnrichReleasesResult struct {
 	Files      int    `json:"files"`
 	Branch     string `json:"branch,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichBlameParams is the payload for ControlEnrichBlame.
@@ -785,6 +832,12 @@ type EnrichBlameParams struct {
 type EnrichBlameResult struct {
 	Nodes      int   `json:"nodes"`
 	DurationMS int64 `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichCoverageSegment mirrors coverage.Segment on the wire so the
@@ -819,6 +872,12 @@ type EnrichCoverageResult struct {
 	Symbols    int   `json:"symbols"`
 	Segments   int   `json:"segments"`
 	DurationMS int64 `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichCochangeParams is the payload for ControlEnrichCochange.
@@ -835,6 +894,12 @@ type EnrichCochangeParams struct {
 type EnrichCochangeResult struct {
 	Edges      int   `json:"edges"`
 	DurationMS int64 `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // TrackedRepoStatus is one row in StatusResponse.TrackedRepos.
