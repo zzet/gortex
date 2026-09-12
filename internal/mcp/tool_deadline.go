@@ -17,6 +17,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -308,6 +309,56 @@ func retainedLeaseNote(retained *requestViewPin) string {
 		noun, strings.Join(rendered, ", "), verb)
 }
 
+// requestScoped binds one non-tool request — a resources/read or a
+// prompts/get — to the view its session reads through, then prepares the
+// session's editor buffers over it.
+//
+// It is the second half of the same defect overlayPrepared below fixed. The
+// buffer overlay was installed for resources and prompts, but the *view* was
+// not: nothing called resolveRequestView outside the tools/call middleware
+// (overlay.go:202), so s.readerFor(ctx) fell through to s.graph
+// (overlay_view.go:171-176) for every resource and every prompt. A session
+// bound to a worktree therefore got the base corpus out of gortex://stats
+// while the graph_stats *tool* answered from the routed view — two surfaces
+// documented byte-for-byte equal (tools_core.go:3513-3515) disagreeing
+// whenever a view was in play, because both call the same view-aware builder
+// and only one of them ever had a view on its context.
+//
+// The ordering mirrors the tool middleware exactly: resolve the view first so
+// the buffers layer on top of whatever answers, honour the same
+// acceptsBufferOverlay gate a grace fallback sets (overlay.go:253), and
+// release the lease with the request.
+//
+// A view that cannot be resolved is not fatal here. A resource read names no
+// selector — there is nothing the caller asked for that could be refused, and
+// no rider to report a fallback on — so the base corpus answers exactly as it
+// did before, which is the availability posture bootstrap resources are read
+// under. The lease is closed on that path too.
+func requestScoped[Req, Res any](s *Server, h func(context.Context, Req) (Res, error)) func(context.Context, Req) (Res, error) {
+	overlaid := overlayPrepared(s, h)
+	return func(ctx context.Context, req Req) (Res, error) {
+		view, err := s.resolveRequestView(ctx,
+			graphview.Selector{Kind: graphview.SelectorAuto}, requestViewPolicy{})
+		if err != nil {
+			view.close()
+			return overlaid(ctx, req)
+		}
+		if view == nil {
+			return overlaid(ctx, req)
+		}
+		ctx = withRequestView(ctx, view)
+		// Same reason as the tool path: an abandoned handler keeps reading
+		// through this view, so the firewall joins the lease rather than
+		// leaving a silent pin.
+		noteRetainedView(ctx, view)
+		defer view.close()
+		if !view.acceptsBufferOverlay() {
+			return h(ctx, req)
+		}
+		return overlaid(ctx, req)
+	}
+}
+
 // overlayPrepared installs the calling session's overlay view on the request
 // context before the handler runs — the same installation the tool wrapper
 // applies in wrapToolHandlerMode.
@@ -451,7 +502,7 @@ func (s *Server) addPrompt(prompt mcp.Prompt, handler mcpserver.PromptHandlerFun
 }
 
 func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFunc) mcpserver.ResourceHandlerFunc {
-	bounded := boundHandler(s, "resource", uri, overlayPrepared(s, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h)),
+	bounded := boundHandler(s, "resource", uri, requestScoped(s, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h)),
 		func(stuck int64, timeout time.Duration) ([]mcp.ResourceContents, error) {
 			return nil, errors.New(busyMessage("resource reads", stuck, timeout))
 		},
@@ -482,7 +533,7 @@ func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFun
 }
 
 func (s *Server) boundPromptHandler(name string, h mcpserver.PromptHandlerFunc) mcpserver.PromptHandlerFunc {
-	bounded := boundHandler(s, "prompt", name, overlayPrepared(s, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h)),
+	bounded := boundHandler(s, "prompt", name, requestScoped(s, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h)),
 		func(stuck int64, timeout time.Duration) (*mcp.GetPromptResult, error) {
 			return nil, errors.New(busyMessage("prompt requests", stuck, timeout))
 		},

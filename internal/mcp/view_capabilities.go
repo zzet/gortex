@@ -442,7 +442,48 @@ func (s *Server) evaluateRequestCapabilities(
 		return mcp.NewToolResultError(fmt.Sprintf("%s: %s", req.Params.Name, err.Error()))
 	}
 	view.noteDegraded(completeness.Degraded(annotate))
+	s.annotateBaseScopedEngine(ctx, req)
 	return nil
+}
+
+// baseScopedEngineCapabilities names the operations whose answer is produced
+// by an engine that reads the indexed corpus itself rather than the reader the
+// request selected, and says which capabilities came from there.
+//
+// It is the central half of the same statement the thirteen in-handler
+// annotateBaseScoped calls make. A handler that can reach the fact from its
+// own body says it there, next to the engine that produced it; this table
+// exists for the ones that cannot — where the base-scoped engine sits behind a
+// builder or a cache the handler only consumes, so there is no line in the
+// handler where the fact is visible.
+//
+// Entries are per *legacy tool*, which is what capabilityToolName resolves a
+// facade operation down to, so the four analyze/read operations of one facade
+// are not all tarred with one member's engine.
+var baseScopedEngineCapabilities = map[string][]graphview.CapabilityID{
+	// index_health answers out of a whole-daemon probe: the payload is built
+	// from s.graph.Stats() plus a NodesByKind(KindFile) walk of the corpus and
+	// the indexer's own mtime ledger (tools_enhancements.go,
+	// buildIndexHealthBasePayloadCtx), and it is cached per server for every
+	// session (index_health_cache.go). None of that narrows to a routed view,
+	// so under one the health score, the node count, the stale-file list and
+	// the path-liveness audit all describe the base corpus.
+	"index_health": {graphview.CapSyntaxGraph, graphview.CapSourceSnapshot},
+}
+
+// annotateBaseScopedEngine puts the table's statement on the response.
+//
+// A no-op for an unrouted request and for every tool with no base-scoped
+// engine behind it, so it costs one map lookup on the request path.
+func (s *Server) annotateBaseScopedEngine(ctx context.Context, req *mcp.CallToolRequest) {
+	if s == nil || req == nil {
+		return
+	}
+	caps, scoped := baseScopedEngineCapabilities[s.capabilityToolName(req)]
+	if !scoped {
+		return
+	}
+	annotateBaseScoped(ctx, caps...)
 }
 
 // mergeCapabilities concatenates two requirement sets, keeping first-seen

@@ -2824,10 +2824,22 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 	return ResolveScopedRepos(scope, repo)
 }
 
-// communityCacheToken is the per-graph identity tuple
-// handleAnalyzeClusters checks before re-running the incremental
-// detector. EdgeIdentity moves on provenance churn; NodeCount and EdgeCount
-// cover additions/removals. analysisRevision closes the remaining same-count
+// communityCacheToken is the identity of the INDEXED CORPUS — s.graph,
+// generation zero — at one moment. It is not the identity of a request's view:
+// every per-server analysis it keys (the Leiden partition and the process
+// discovery beneath it) is computed over the corpus and not over whatever view
+// a request selected, which is why the consumers that serve one under a routed
+// view say base_scoped on the rider rather than pretending the answer describes
+// the view (view_capabilities.go, annotateBaseScoped).
+//
+// Reading it is NOT free and it must never be put on a liveness path: on the
+// SQL backend NodeCount and EdgeCount are whole-generation COUNT(*) scans
+// (store_sqlite/store.go, stmtNodeCount / stmtEdgeCount — the O(repos) counter
+// path countsFromIndexState is reachable only through Stats()). It is read once
+// per analysis run, which is what it is priced for.
+//
+// EdgeIdentity moves on provenance churn; NodeCount and EdgeCount cover
+// additions/removals. analysisRevision closes the remaining same-count
 // mutation gap on durable stores (for example a rebind or source-location
 // shift). A zero token is "never populated".
 type communityCacheToken struct {
