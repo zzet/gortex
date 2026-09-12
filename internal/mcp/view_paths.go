@@ -262,8 +262,8 @@ func (s *Server) checkoutRootedPath(ctx context.Context, abs, root, repoPrefix s
 //   - the epoch still matches: the answer is as coherent as the route said.
 //   - the epoch moved: the route this answer was read under is gone, so the
 //     result may be stitched from two states of the working copy. The
-//     capability the caller used is annotated incomplete and rides back as
-//     such.
+//     capability the caller used is annotated incomplete, and the exactness
+//     claim is withdrawn (markWorktreeRouteMoved), so both ride back.
 //   - nothing to compare against — no checkout id, no handle to read the
 //     catalog through, or no route row to read: that is not evidence of a
 //     change and must not be reported as one.
@@ -303,6 +303,11 @@ func noteWorktreeRouteDrift(ctx context.Context, view *requestView, capability g
 	if err != nil || !found || route.RouteEpoch == view.materialized.CheckoutRouteEpoch {
 		return false
 	}
+	// The exactness claim goes first, and it goes before the per-capability
+	// dedupe below: the claim is a property of the whole answer, not of the one
+	// capability whichever lane noticed first happened to be using, so a second
+	// lane finding the same drift must not skip it.
+	markWorktreeRouteMoved(view)
 	if viewAlreadyDegraded(view, capability, graphview.StateIncomplete) {
 		return true
 	}
@@ -310,6 +315,53 @@ func noteWorktreeRouteDrift(ctx context.Context, view *requestView, capability g
 		{Capability: capability, State: graphview.StateIncomplete},
 	})
 	return true
+}
+
+// routeMovedFallbackReason is the rider reason for an answer that was read
+// across a move of the route the view pinned.
+//
+// It is a rider reason and not a graphview error code for the same reason
+// baseChangedFallbackReason (view_request.go) is one: nothing failed, no
+// substitute view was served, and the route named on the rider is still the
+// route the caller asked for. What changed is the honesty of the exactness
+// claim — the working copy under that route was re-sampled and re-published
+// while the request was reading it, so the answer may be stitched from two
+// states of it and the view can no longer reproduce it.
+const routeMovedFallbackReason = "route_moved"
+
+// markWorktreeRouteMoved withdraws the exactness claim of an answer read
+// across a route move.
+//
+// This is the half of the base corpus's pin that the capability annotation
+// alone does not carry. markBaseCorpusChange (view_request.go) reaches for
+// view.rider.MarkFallback for exactly this case — the corpus moved under a
+// request that still got the view it asked for — and a working copy that was
+// re-published mid-answer is the same fact about the other half of the stack.
+// Leaving exact:true on it says the caller got an answer the named view can
+// reproduce, which is the one thing that is no longer true.
+//
+// The route stays named: ActualView is untouched, so a client can still see
+// which stack answered. A rider that is already inexact keeps its original
+// reason — the first substitution is the one the caller has to act on, and
+// overwriting it would hide it.
+//
+// The rider write takes the view's own mutex, which the annotations already
+// use, because unlike markBaseCorpusChange this runs INSIDE the handler: two
+// lanes of one request (the byte lane's refViewFilesFor and the text lane's
+// searchTextInView), or several goroutines of one fanned-out handler, can
+// reach it at once.
+func markWorktreeRouteMoved(view *requestView) {
+	if view == nil {
+		return
+	}
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	if view.rider == nil || !view.rider.Exact {
+		return
+	}
+	// The reason is a non-empty constant, so the only error MarkFallback
+	// defines (a blank reason) is unreachable here.
+	_ = view.rider.MarkFallback(view.rider.ActualView, routeMovedFallbackReason)
 }
 
 // viewRouteCatalog reads the control plane through one of the view's own

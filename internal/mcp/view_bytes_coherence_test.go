@@ -682,3 +682,247 @@ func coherenceHasStatus(
 	}
 	return false
 }
+
+// W5.7b. The route-drift signal must demote the answer's exactness claim, not
+// only annotate the capability.
+//
+// noteWorktreeRouteDrift names the base corpus's pin as its precedent
+// (view_paths.go), and that precedent does two things: markBaseCorpusChange
+// (view_request.go) annotates AND calls view.rider.MarkFallback, which clears
+// Exact and sets fallback_reason. Without the second half a caller reading a
+// routed working copy is told, on the same rider, that it got exactly the view
+// it named — while the working copy under that view was re-sampled and
+// re-published mid-answer. That is the one claim that is no longer true, and
+// it is the claim require_exact / an exactness check on the client side reads.
+func TestRouteDriftWithdrawsTheExactnessClaim(t *testing.T) {
+	stack := newViewStack(t)
+	coherenceWrite(t, filepath.Join(stack.worktreeRoot, "edit.go"),
+		"package repo\n\n// "+coherenceWorkingCopyMarker+"\nfunc Old() {}\n")
+	ctx := context.Background()
+	catalog := stack.store.Catalog()
+
+	materialized, err := stack.srv.Materializer().MaterializeCheckout(ctx, viewTestWorktree)
+	if err != nil {
+		t.Fatalf("materialize the routed checkout: %v", err)
+	}
+	defer materialized.Close()
+	view := &requestView{
+		kind:         requestViewKindWorktree,
+		reader:       materialized.Reader,
+		materialized: materialized,
+		viewRoot:     stack.worktreeRoot,
+		rider:        coherenceRider(viewTestWorktree),
+	}
+	named := view.rider.ActualView
+
+	// The control: a coherent answer keeps the exactness it was given.
+	if res := coherenceReadFile(t, stack.srv, view, "repo/edit.go"); res.IsError {
+		t.Fatalf("the routed read failed before the route moved: %s", viewResultText(t, res))
+	}
+	if !view.rider.Exact || view.rider.FallbackReason != "" {
+		t.Fatalf("a coherent routed answer was demoted: exact=%v reason=%q",
+			view.rider.Exact, view.rider.FallbackReason)
+	}
+
+	if err := catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
+		CheckoutID:         viewTestWorktree,
+		Slot:               store_sqlite.RouteSlotDirty,
+		GenerationID:       stack.dirty,
+		State:              store_sqlite.RouteActive,
+		ExpectedRouteEpoch: materialized.CheckoutRouteEpoch,
+	}); err != nil {
+		t.Fatalf("move the route under the request: %v", err)
+	}
+
+	if res := coherenceReadFile(t, stack.srv, view, "repo/edit.go"); res.IsError {
+		t.Fatalf("the routed read failed after the route moved: %s", viewResultText(t, res))
+	}
+	if view.rider.Exact {
+		t.Fatalf("an answer read across a route move still claims exact:true (reason=%q)",
+			view.rider.FallbackReason)
+	}
+	if view.rider.FallbackReason != routeMovedFallbackReason {
+		t.Errorf("fallback_reason = %q, want %q", view.rider.FallbackReason, routeMovedFallbackReason)
+	}
+	if view.rider.ActualView != named {
+		t.Errorf("the demotion renamed the view: actual_view = %q, want %q", view.rider.ActualView, named)
+	}
+	// The annotation half is not traded away for the exactness half.
+	degraded, _ := view.annotations()
+	if !coherenceHasStatus(degraded, graphview.CapSourceSnapshot, graphview.StateIncomplete) {
+		t.Errorf("the capability annotation was lost: %v", degraded)
+	}
+}
+
+// A rider that is already inexact keeps the reason it already carries: the
+// first substitution is the one the caller has to act on, and a route that
+// then moved under the substitute must not overwrite it.
+func TestRouteDriftKeepsAnEarlierFallbackReason(t *testing.T) {
+	stack := newViewStack(t)
+	ctx := context.Background()
+	catalog := stack.store.Catalog()
+
+	materialized, err := stack.srv.Materializer().MaterializeCheckout(ctx, viewTestWorktree)
+	if err != nil {
+		t.Fatalf("materialize the routed checkout: %v", err)
+	}
+	defer materialized.Close()
+	rider := coherenceRider(viewTestWorktree)
+	if err := rider.MarkFallback(rider.ActualView, string(graphview.CodeViewBuilding)); err != nil {
+		t.Fatalf("pre-demote the rider: %v", err)
+	}
+	view := &requestView{
+		kind:         requestViewKindWorktree,
+		reader:       materialized.Reader,
+		materialized: materialized,
+		viewRoot:     stack.worktreeRoot,
+		rider:        rider,
+	}
+
+	if err := catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
+		CheckoutID:         viewTestWorktree,
+		Slot:               store_sqlite.RouteSlotDirty,
+		GenerationID:       stack.dirty,
+		State:              store_sqlite.RouteActive,
+		ExpectedRouteEpoch: materialized.CheckoutRouteEpoch,
+	}); err != nil {
+		t.Fatalf("move the route under the request: %v", err)
+	}
+	if !noteWorktreeRouteDrift(ctx, view, graphview.CapSourceSnapshot) {
+		t.Fatal("the route moved and the drift check said it had not")
+	}
+	if view.rider.Exact {
+		t.Fatal("an already-inexact rider was re-marked exact")
+	}
+	if got := view.rider.FallbackReason; got != string(graphview.CodeViewBuilding) {
+		t.Errorf("the earlier fallback reason was overwritten: %q", got)
+	}
+}
+
+// The same statement through the production entrypoint: a real tools/call
+// frame, the middleware's own view selection, the real read_file handler, and
+// the rider the middleware renders at the end of it (overlay.go attachViewRider
+// -> viewRiderFields). Without the demotion this response carries exact:true
+// and no fallback_reason at all.
+func TestRouteDriftWithdrawsExactnessThroughTheMiddleware(t *testing.T) {
+	stack := newViewStack(t)
+	coherenceWrite(t, filepath.Join(stack.worktreeRoot, "keep.go"),
+		"package repo\n\n// selected-worktree-bytes\nfunc Keeper() {}\n")
+	catalog := stack.store.Catalog()
+
+	read := func(t *testing.T, moveTheRoute bool) *mcplib.CallToolResult {
+		t.Helper()
+		args := map[string]any{
+			"path": "repo/keep.go",
+			"view": map[string]any{"kind": "worktree", "checkout_id": viewTestWorktree},
+		}
+		res, err := stack.callWithView(t, stack.repoRoot, "read_file", args,
+			func(ctx context.Context) (*mcplib.CallToolResult, error) {
+				view := requestViewFromContext(ctx)
+				if view == nil || view.materialized == nil {
+					t.Fatal("the middleware bound no materialized view to the request")
+				}
+				if !view.rider.Exact {
+					t.Fatalf("the middleware's own selection was not exact: %q", view.rider.FallbackReason)
+				}
+				if moveTheRoute {
+					if err := catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
+						CheckoutID:         viewTestWorktree,
+						Slot:               store_sqlite.RouteSlotDirty,
+						GenerationID:       stack.dirty,
+						State:              store_sqlite.RouteActive,
+						ExpectedRouteEpoch: view.materialized.CheckoutRouteEpoch,
+					}); err != nil {
+						t.Fatalf("move the route under the request: %v", err)
+					}
+				}
+				req := mcplib.CallToolRequest{}
+				req.Params.Name = "read_file"
+				req.Params.Arguments = map[string]any{"path": "repo/keep.go"}
+				return stack.srv.handleReadFile(ctx, req)
+			})
+		if err != nil {
+			t.Fatalf("read_file through the selected worktree: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("the selected worktree was refused: %s", viewResultText(t, res))
+		}
+		return res
+	}
+
+	t.Run("a coherent answer still claims exactness", func(t *testing.T) {
+		rider := metaFreshness(t, read(t, false))
+		if rider == nil {
+			t.Fatal("the response carries no view rider")
+		}
+		if rider["exact"] != true {
+			t.Errorf("a coherent routed answer was demoted: %v", rider)
+		}
+		if _, present := rider["fallback_reason"]; present {
+			t.Errorf("a coherent routed answer carries a fallback reason: %v", rider)
+		}
+	})
+
+	t.Run("an answer read across a route move does not", func(t *testing.T) {
+		rider := metaFreshness(t, read(t, true))
+		if rider == nil {
+			t.Fatal("the response carries no view rider")
+		}
+		if rider["exact"] != false {
+			t.Errorf("an answer read across a route move still claims exact: %v", rider)
+		}
+		if rider["fallback_reason"] != routeMovedFallbackReason {
+			t.Errorf("fallback_reason = %v, want %q", rider["fallback_reason"], routeMovedFallbackReason)
+		}
+		if _, present := rider["degraded_capabilities"]; !present {
+			t.Errorf("the capability annotation did not ride back with the demotion: %v", rider)
+		}
+	})
+}
+
+// The demotion is a property of the answer, not of one capability, so it must
+// happen above the per-capability dedupe: a request whose text lane already
+// annotated search.text and whose byte lane then finds the same drift must
+// still lose its exactness claim. Ordering the two the other way round makes
+// the demotion depend on which lane noticed the move first.
+func TestRouteDriftDemotesPastTheAnnotationDedupe(t *testing.T) {
+	stack := newViewStack(t)
+	ctx := context.Background()
+	catalog := stack.store.Catalog()
+
+	materialized, err := stack.srv.Materializer().MaterializeCheckout(ctx, viewTestWorktree)
+	if err != nil {
+		t.Fatalf("materialize the routed checkout: %v", err)
+	}
+	defer materialized.Close()
+	view := &requestView{
+		kind:         requestViewKindWorktree,
+		reader:       materialized.Reader,
+		materialized: materialized,
+		viewRoot:     stack.worktreeRoot,
+		rider:        coherenceRider(viewTestWorktree),
+	}
+	// What the other lane left behind before this one ran.
+	view.noteDegraded([]graphview.CapabilityStatus{
+		{Capability: graphview.CapSourceSnapshot, State: graphview.StateIncomplete},
+	})
+
+	if err := catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
+		CheckoutID:         viewTestWorktree,
+		Slot:               store_sqlite.RouteSlotDirty,
+		GenerationID:       stack.dirty,
+		State:              store_sqlite.RouteActive,
+		ExpectedRouteEpoch: materialized.CheckoutRouteEpoch,
+	}); err != nil {
+		t.Fatalf("move the route under the request: %v", err)
+	}
+	if !noteWorktreeRouteDrift(ctx, view, graphview.CapSourceSnapshot) {
+		t.Fatal("the route moved and the drift check said it had not")
+	}
+	if view.rider.Exact {
+		t.Fatal("the exactness claim survived because the annotation was already on the rider")
+	}
+	if view.rider.FallbackReason != routeMovedFallbackReason {
+		t.Errorf("fallback_reason = %q, want %q", view.rider.FallbackReason, routeMovedFallbackReason)
+	}
+}

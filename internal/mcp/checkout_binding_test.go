@@ -338,3 +338,62 @@ func TestAnAbandonedAdmissionReachesTheRiderAndTheRefusal(t *testing.T) {
 			"the refusal is still freshnessDeadlineRefusal's: %s", text)
 	})
 }
+
+// W5.7b. The ticket arm of the same contract, which shipped unpinned.
+//
+// awaitCheckoutFreshness reaches a foreign bound two ways: the ADMISSION can
+// fail with a context error (covered by
+// TestAPersistentlyAbandonedAdmissionGetsItsOwnReason), and an ADMITTED ticket
+// can be failed with one — the cycle that completes tickets runs under the
+// coordinator's context, not the caller's (internal/indexer/checkout_refresh.go
+// completeCheckoutRefreshTickets). Only the second path sets awaitFreshnessTicket's
+// fourth return, and flipping that return to false left the whole freshness
+// suite green while production output changed: a wait whose admitted tickets
+// are persistently abandoned on the coordinator's context reported
+// deadline_exceeded — the very defect W5.9c exists to remove — instead of
+// refresh_admission_abandoned. The two reasons ask the caller for different
+// moves, and only one of them can help.
+func TestAPersistentlyAbandonedTicketGetsItsOwnReason(t *testing.T) {
+	stack := newViewStack(t)
+	waiter := &fakeFreshnessWaiter{
+		answer: func(_ int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
+			return foreignBoundTicket(checkoutID, root, context.DeadlineExceeded), nil
+		},
+	}
+	stack.srv.freshnessWaiter = waiter
+
+	fresh, reason := stack.srv.awaitCheckoutFreshness(
+		context.Background(), freshnessWaitCheckout(t, stack), time.Now().Add(250*time.Millisecond))
+	require.False(t, fresh)
+	require.Equal(t, freshReasonRefreshAdmissionAbandoned, reason,
+		"every admitted ticket was abandoned on a bound the caller did not set, and the caller's bound was blamed")
+	require.NotEqual(t, freshReasonDeadlineExceeded, reason)
+	require.GreaterOrEqual(t, len(waiter.observed()), 2,
+		"the wait gave up on the first abandoned ticket instead of retrying until its own bound expired")
+}
+
+// The converse, and the reason the abandoned flag is a LAST-attempt fact
+// rather than a sticky one: a foreign bound followed by ordinary retryable
+// refusals until the caller's deadline is the caller's deadline expiring.
+// Without the reset on the retryable arm, one early coordinator timeout would
+// relabel every later wait_deadline expiry as an abandoned admission.
+func TestAForeignBoundDoesNotStickToALaterDeadline(t *testing.T) {
+	stack := newViewStack(t)
+	waiter := &fakeFreshnessWaiter{
+		answer: func(call int, _, _ string) (*indexer.CheckoutRefreshTicket, error) {
+			if call == 1 {
+				return nil, context.DeadlineExceeded
+			}
+			return nil, fmt.Errorf("%w: lane busy", indexer.ErrCheckoutMutationBusy)
+		},
+	}
+	stack.srv.freshnessWaiter = waiter
+
+	fresh, reason := stack.srv.awaitCheckoutFreshness(
+		context.Background(), freshnessWaitCheckout(t, stack), time.Now().Add(250*time.Millisecond))
+	require.False(t, fresh)
+	require.Equal(t, freshReasonDeadlineExceeded, reason,
+		"a wait that ended on its own bound was reported as an abandoned admission")
+	require.GreaterOrEqual(t, len(waiter.observed()), 2,
+		"the wait did not retry past the first foreign bound")
+}
