@@ -118,6 +118,17 @@ type AdoptDedicatedBaseGenerationRequest struct{ Claim DedicatedBaseBuildClaim }
 // false means a later observation had already moved them past this base, which
 // is not a failure (see AdoptDedicatedBaseGeneration).
 //
+// PreviousSuperseded reports that the head this adoption replaced was labelled
+// superseded in the same transaction. It is false whenever there was nothing to
+// label — a first adoption, a replay, a previous head this adoption still
+// descends from, or one already discarded by an earlier pass.
+//
+// AdoptedRestored reports the mirror write: the generation this adoption
+// installed was itself carrying a superseded label from an earlier replacement
+// and was cleared back to ready, because a graph's live head must not describe
+// itself as replaced. It is false for the ordinary adoption of a generation
+// that was already ready.
+//
 // A replay — AlreadyAdopted, the pointer already installed — reports the
 // pointers alone. It moved nothing, so it reads nothing: the idle
 // observe-claim-adopt cycle a warm daemon runs stays a cycle that performs no
@@ -129,6 +140,8 @@ type DedicatedBaseAdoption struct {
 	CommitOID            string
 	HeadAdvanced         bool
 	AlreadyAdopted       bool
+	PreviousSuperseded   bool
+	AdoptedRestored      bool
 }
 type FailDedicatedBaseBuildRequest struct {
 	Claim DedicatedBaseBuildClaim
@@ -649,6 +662,16 @@ func (c *Catalog) AdoptDedicatedBaseGeneration(ctx context.Context, req AdoptDed
 			return err
 		}
 		out.TreeOID, out.CommitOID = adopted.TreeOID, adopted.ProvenanceCommitOID
+		out.PreviousSuperseded, err = supersedeReplacedDedicatedHeadTx(
+			ctx, tx, claim.Desire.Authority, claim.BaseGenerationID, active, claim.GenerationID)
+		if err != nil {
+			return err
+		}
+		out.AdoptedRestored, err = restoreAdoptedDedicatedHeadTx(
+			ctx, tx, claim.Desire.Authority, claim.GenerationID)
+		if err != nil {
+			return err
+		}
 		out.HeadAdvanced, err = advanceDedicatedBaseOwnerHeadTx(ctx, tx, claim.Desire.Authority.Owner, adopted)
 		return err
 	})
@@ -663,6 +686,151 @@ func (c *Catalog) AdoptDedicatedBaseGeneration(ctx context.Context, req AdoptDed
 		Adoption:   out,
 	})
 	return out, nil
+}
+
+// supersedeReplacedDedicatedHeadTx labels the head an adoption replaced.
+//
+// Until this write existed nothing ever moved an adopted-then-replaced
+// dedicated generation off ready: adoption repointed active_generation_id and
+// stamped the publication adopted, and the generation it displaced kept the
+// label of a live head. Every retirement enumeration reads state, so a chain
+// replaced by a new full root — or by a revert onto an older tree-equal
+// candidate — was unreachable by any sweep and stayed in the database for the
+// life of the installation.
+//
+// It labels only a head this adoption genuinely replaced. A previous head the
+// adopted generation still descends from is an ANCESTOR of the live chain: it
+// is composed into every view the new head serves, so calling it superseded
+// would be a false statement about a generation that is still being read, and
+// would put the whole live ancestry in front of the sweep on every pass. The
+// common advance — a delta whose base IS the previous head — is answered by
+// that first comparison without reading anything.
+//
+// The label is not retirement permission and does not shorten anything's life.
+// A superseded generation stays servable (validateDedicatedBaseChainTx and
+// graphview's dedicated-root check both accept it, and the reuse lookup still
+// offers it), and collection remains the retirement predicate's decision: an
+// ancestor of a live route, a dependent's named base and a leased generation
+// are each refused there until nothing references them.
+//
+// The UPDATE is a guarded CAS on the full dedicated identity, so a legacy or
+// foreign row cannot be relabelled by a graph that does not own it, and a row
+// already superseded, retiring or failed is left exactly as it is. A no-op is
+// therefore an ordinary outcome and reports false rather than an error.
+func supersedeReplacedDedicatedHeadTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	authority DedicatedBaseAuthority,
+	adoptedBase, previous, adopted int64,
+) (bool, error) {
+	// A pointer at or below the owner's publication floor predates this
+	// authority: it is a CAS fence, not a generation this protocol published,
+	// and relabelling it would be a write outside the scope that authorized it.
+	if previous <= 0 || previous == adopted || previous <= authority.GenerationFloor {
+		return false, nil
+	}
+	if adoptedBase == previous {
+		return false, nil
+	}
+	ancestor, err := dedicatedBaseAncestorTx(ctx, tx, adoptedBase, previous)
+	if err != nil {
+		return false, err
+	}
+	if ancestor {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE view_generations SET state=? WHERE generation_id=? AND state=?
+		AND owner_kind='dedicated_graph' AND generation_kind='dedicated' AND graph_id=? AND checkout_id=?`,
+		string(ViewGenerationSuperseded), previous, string(ViewGenerationReady),
+		authority.GraphID, authority.Owner.CheckoutID)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// restoreAdoptedDedicatedHeadTx clears the superseded label off the generation
+// this adoption just installed as the graph's live head.
+//
+// A revert re-adopts a generation an earlier adoption labelled superseded — the
+// reuse lookup deliberately keeps offering those, which is what makes a revert
+// cheap instead of a rebuild. Without this write the row would keep saying
+// "superseded" while dedicated_graphs.active_generation_id names it: a false
+// statement in the catalog that every status and diagnostic surface renders,
+// and one that also hides a live head from the retirement sweep's ready-only
+// deleted-graph cohort, so a graph deleted while its head carried a stale label
+// would leave that head behind.
+//
+// The write is the mirror of supersedeReplacedDedicatedHeadTx and carries the
+// same fences: the publication floor (a pointer at or below it predates this
+// authority and is not a generation this protocol published) and a guarded CAS
+// on the full dedicated identity plus the superseded label itself. So nothing
+// else is ever rewritten, a foreign or legacy row is left exactly as it is, and
+// the ordinary adoption of an already-ready generation is a no-op that reports
+// false rather than an error.
+func restoreAdoptedDedicatedHeadTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	authority DedicatedBaseAuthority,
+	adopted int64,
+) (bool, error) {
+	if adopted <= 0 || adopted <= authority.GenerationFloor {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE view_generations SET state=? WHERE generation_id=? AND state=?
+		AND owner_kind='dedicated_graph' AND generation_kind='dedicated' AND graph_id=? AND checkout_id=?`,
+		string(ViewGenerationReady), adopted, string(ViewGenerationSuperseded),
+		authority.GraphID, authority.Owner.CheckoutID)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// dedicatedBaseAncestorTx reports whether candidate is on the chain under head.
+//
+// It walks base_generation_id, which is the same edge validateDedicatedBaseChainTx
+// has already validated for the adopted generation in this transaction, so the
+// walk is bounded by construction. Every way of failing to finish the walk —
+// a cycle, a chain deeper than the hard ancestry limit, a row that cannot be
+// read — answers true, because the only thing the caller does with false is
+// discard a generation, and a walk that could not prove the candidate is
+// unreachable is not evidence that it is.
+func dedicatedBaseAncestorTx(ctx context.Context, tx *sql.Tx, head, candidate int64) (bool, error) {
+	if head <= 0 || candidate <= 0 {
+		return false, nil
+	}
+	seen := make(map[int64]struct{}, 8)
+	for id := head; id > 0; {
+		if id == candidate {
+			return true, nil
+		}
+		if _, looped := seen[id]; looped || len(seen) >= maxDedicatedBaseAncestry {
+			return true, nil
+		}
+		seen[id] = struct{}{}
+		// base_generation_id is nullable and a full root stores NULL, not 0, so
+		// the walk has to read the column the way every other reader does.
+		var base int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(base_generation_id, 0) FROM view_generations WHERE generation_id=?`, id).Scan(&base)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		id = base
+	}
+	return false, nil
 }
 
 // advanceDedicatedBaseOwnerHeadTx moves the owner checkout's committed head to

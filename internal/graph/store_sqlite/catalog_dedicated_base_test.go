@@ -1437,3 +1437,362 @@ func TestDedicatedBaseAdoptionAnnouncesToObservers(t *testing.T) {
 		t.Fatalf("the observer registered after the last release saw %+v", later)
 	}
 }
+
+func (f *dedicatedPublicationFixture) state(t testing.TB, generationID int64) ViewGenerationState {
+	t.Helper()
+	row, found, err := f.c.GetViewGeneration(context.Background(), generationID)
+	if err != nil || !found {
+		t.Fatalf("generation %d found=%v err=%v", generationID, found, err)
+	}
+	return row.State
+}
+
+// TestDedicatedBaseAdoptionSupersedesTheChainItReplaced is the label the
+// retirement enumeration reads. Before it existed, adoption repointed
+// active_generation_id and left the head it displaced saying "ready", so a
+// chain replaced by a new full root was reachable by no sweep and stayed in the
+// database for the life of the installation.
+func TestDedicatedBaseAdoptionSupersedesTheChainItReplaced(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	a := f.claim(t, "attempt-a", 0, 0)
+	f.publish(t, a)
+	if got := f.adopt(t, a); got.PreviousSuperseded {
+		t.Fatalf("a first adoption replaced nothing: %+v", got)
+	}
+
+	next := f.desire.Identity
+	next.TreeOID = "tree-b"
+	f.observe(t, next)
+	// A new full root: nothing under the adopted generation, so the head it
+	// displaces is genuinely replaced rather than extended.
+	b := f.claim(t, "attempt-b", a.GenerationID, 0)
+	if b.BaseGenerationID != 0 {
+		t.Fatalf("claim = %+v, want a full root", b)
+	}
+	f.publish(t, b)
+	adoption := f.adopt(t, b)
+	if !adoption.PreviousSuperseded || adoption.PreviousGenerationID != a.GenerationID {
+		t.Fatalf("adoption = %+v, want the replaced head labelled", adoption)
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationSuperseded {
+		t.Fatalf("replaced head state = %s, want superseded", got)
+	}
+	if got := f.state(t, b.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("adopted head state = %s, want ready", got)
+	}
+	// The label is not retirement: a superseded base is still a servable chain
+	// member and still a reuse candidate, which is what makes a revert cheap.
+	f.observe(t, DedicatedBaseIdentity{TreeOID: "tree-a", ConfigHash: "config", ExtractorVersions: "extractors", ResolverVersion: "resolver"})
+	if reused := f.claim(t, "attempt-a-again", b.GenerationID, b.GenerationID); reused.GenerationID != a.GenerationID || reused.Status != "ready" {
+		t.Fatalf("superseded reuse = %+v, want the replaced head offered back", reused)
+	}
+}
+
+// TestDedicatedBaseAdoptionRetainsTheAncestorItExtends is the other half. The
+// ordinary advance is a delta whose base IS the previous head: that generation
+// is composed into every view the new head serves, so calling it superseded
+// would be a false statement about a generation that is still being read, and
+// would put the whole live ancestry in front of the sweep on every pass.
+func TestDedicatedBaseAdoptionRetainsTheAncestorItExtends(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	a := f.claim(t, "attempt-a", 0, 0)
+	f.publish(t, a)
+	f.adopt(t, a)
+
+	next := f.desire.Identity
+	next.TreeOID = "tree-b"
+	f.observe(t, next)
+	b := f.claim(t, "attempt-b", a.GenerationID, a.GenerationID)
+	if b.BaseGenerationID != a.GenerationID {
+		t.Fatalf("claim = %+v, want a delta over the live head", b)
+	}
+	f.publish(t, b)
+	adoption := f.adopt(t, b)
+	if adoption.PreviousSuperseded {
+		t.Fatalf("adoption = %+v, want the extended ancestor left alone", adoption)
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("extended ancestor state = %s, want ready", got)
+	}
+}
+
+// TestDedicatedBaseAdoptionSupersedesAHeadARevertMovedOff covers the second way
+// a chain is replaced: the tree goes back to one an older candidate already
+// holds, adoption reuses it, and the head the family moved off is no longer on
+// any chain the active pointer names — even though the generation under it
+// still is.
+func TestDedicatedBaseAdoptionSupersedesAHeadARevertMovedOff(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	aIdentity := f.desire.Identity
+	a := f.claim(t, "attempt-a", 0, 0)
+	f.publish(t, a)
+	f.adopt(t, a)
+
+	bIdentity := aIdentity
+	bIdentity.TreeOID = "tree-b"
+	f.observe(t, bIdentity)
+	b := f.claim(t, "attempt-b", a.GenerationID, a.GenerationID)
+	f.publish(t, b)
+	f.adopt(t, b)
+
+	f.observe(t, aIdentity)
+	reused := f.claim(t, "attempt-a-again", b.GenerationID, b.GenerationID)
+	if reused.GenerationID != a.GenerationID || reused.Status != "ready" {
+		t.Fatalf("revert reuse = %+v, want the historical root", reused)
+	}
+	adoption := f.adopt(t, reused)
+	if !adoption.PreviousSuperseded || adoption.PreviousGenerationID != b.GenerationID {
+		t.Fatalf("adoption = %+v, want the head the revert moved off labelled", adoption)
+	}
+	if got := f.state(t, b.GenerationID); got != ViewGenerationSuperseded {
+		t.Fatalf("abandoned head state = %s, want superseded", got)
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("re-adopted head state = %s, want ready", got)
+	}
+}
+
+// TestDedicatedBaseAdoptionCannotRelabelAGenerationItDoesNotOwn pins the
+// guarded compare-and-set. The label is written on the full dedicated identity,
+// so a row this graph and owner do not own is left exactly as it is and the
+// adoption reports that it relabelled nothing rather than failing.
+func TestDedicatedBaseAdoptionCannotRelabelAGenerationItDoesNotOwn(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	a := f.claim(t, "attempt-a", 0, 0)
+	f.publish(t, a)
+	f.adopt(t, a)
+
+	next := f.desire.Identity
+	next.TreeOID = "tree-b"
+	f.observe(t, next)
+	b := f.claim(t, "attempt-b", a.GenerationID, 0)
+	f.publish(t, b)
+	f.exec(t, `UPDATE view_generations SET graph_id=? WHERE generation_id=?`, "foreign-graph", a.GenerationID)
+
+	adoption := f.adopt(t, b)
+	if adoption.PreviousSuperseded {
+		t.Fatalf("adoption = %+v, want a foreign row left alone", adoption)
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("foreign row state = %s, want ready", got)
+	}
+	if f.active(t) != b.GenerationID {
+		t.Fatal("the adoption itself must still have installed the active pointer")
+	}
+}
+
+// TestDedicatedBaseAdoptionWalksAChainThroughAFullRoot pins the ancestry walk
+// against the column it reads. base_generation_id is nullable and a full root
+// stores NULL rather than 0, so a walk that reached a root through a delta —
+// which is exactly what a revert onto a published-but-not-yet-adopted delta
+// does — has to read it the way every other reader does.
+func TestDedicatedBaseAdoptionWalksAChainThroughAFullRoot(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	aIdentity := f.desire.Identity
+	a := f.claim(t, "attempt-a", 0, 0)
+	f.publish(t, a)
+	f.adopt(t, a)
+
+	bIdentity := aIdentity
+	bIdentity.TreeOID = "tree-b"
+	f.observe(t, bIdentity)
+	b := f.claim(t, "attempt-b", a.GenerationID, a.GenerationID)
+	if b.BaseGenerationID != a.GenerationID {
+		t.Fatalf("claim = %+v, want a delta over the root", b)
+	}
+	f.publish(t, b)
+	f.adopt(t, b)
+
+	// A new full root replaces the b-over-a chain; b is labelled, a stays on
+	// b's ancestry and keeps its label.
+	cIdentity := aIdentity
+	cIdentity.TreeOID = "tree-c"
+	f.observe(t, cIdentity)
+	c := f.claim(t, "attempt-c", b.GenerationID, 0)
+	if c.BaseGenerationID != 0 {
+		t.Fatalf("claim = %+v, want a full root", c)
+	}
+	f.publish(t, c)
+	if adoption := f.adopt(t, c); !adoption.PreviousSuperseded {
+		t.Fatalf("adoption = %+v, want the replaced delta labelled", adoption)
+	}
+
+	// Back to tree-b: the reuse lookup returns the superseded delta, whose own
+	// base is the root. The previous head (c) is not on that chain, so the walk
+	// has to traverse a delta into a NULL-based root before it can say so.
+	f.observe(t, bIdentity)
+	reused := f.claim(t, "attempt-b-again", c.GenerationID, c.GenerationID)
+	if reused.GenerationID != b.GenerationID || reused.BaseGenerationID != a.GenerationID {
+		t.Fatalf("revert reuse = %+v, want the superseded delta over the root", reused)
+	}
+	adoption := f.adopt(t, reused)
+	if !adoption.PreviousSuperseded || adoption.PreviousGenerationID != c.GenerationID {
+		t.Fatalf("adoption = %+v, want the abandoned root labelled", adoption)
+	}
+	if got := f.state(t, c.GenerationID); got != ViewGenerationSuperseded {
+		t.Fatalf("abandoned root state = %s, want superseded", got)
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("live ancestry state = %s, want ready", got)
+	}
+	if !adoption.AdoptedRestored {
+		t.Fatalf("adoption = %+v, want the re-adopted delta's own label cleared", adoption)
+	}
+	if got := f.state(t, b.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("re-adopted delta state = %s, want ready: a live head must not say it was replaced", got)
+	}
+}
+
+// TestDedicatedBaseAdoptionClearsTheLabelOffTheHeadItReinstates is the mirror
+// write. A revert re-adopts a generation an earlier adoption labelled
+// superseded — the reuse lookup keeps offering those on purpose — and without
+// this the catalog would say "superseded" about the row
+// dedicated_graphs.active_generation_id names: a false statement every status
+// surface renders, and one that also hides a live head from the retirement
+// sweep's ready-only deleted-graph cohort.
+func TestDedicatedBaseAdoptionClearsTheLabelOffTheHeadItReinstates(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	aIdentity := f.desire.Identity
+	a := f.claim(t, "attempt-a", 0, 0)
+	f.publish(t, a)
+	if got := f.adopt(t, a); got.AdoptedRestored {
+		t.Fatalf("adoption = %+v, want no relabel of an already-ready head", got)
+	}
+
+	bIdentity := aIdentity
+	bIdentity.TreeOID = "tree-b"
+	f.observe(t, bIdentity)
+	b := f.claim(t, "attempt-b", a.GenerationID, 0)
+	f.publish(t, b)
+	if got := f.adopt(t, b); !got.PreviousSuperseded {
+		t.Fatalf("adoption = %+v, want the replaced root labelled", got)
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationSuperseded {
+		t.Fatalf("replaced root state = %s, want superseded", got)
+	}
+
+	// Revert: the reuse lookup hands back the superseded root and the adoption
+	// reinstates it as the live head.
+	f.observe(t, aIdentity)
+	reused := f.claim(t, "attempt-a-again", b.GenerationID, b.GenerationID)
+	if reused.GenerationID != a.GenerationID {
+		t.Fatalf("revert reuse = %+v, want the superseded root offered back", reused)
+	}
+	adoption := f.adopt(t, reused)
+	if !adoption.AdoptedRestored || !adoption.PreviousSuperseded {
+		t.Fatalf("adoption = %+v, want the reinstated head cleared and the abandoned head labelled", adoption)
+	}
+	if f.active(t) != a.GenerationID {
+		t.Fatalf("active pointer = %d, want the reinstated head %d", f.active(t), a.GenerationID)
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("reinstated head state = %s, want ready", got)
+	}
+	if got := f.state(t, b.GenerationID); got != ViewGenerationSuperseded {
+		t.Fatalf("abandoned head state = %s, want superseded", got)
+	}
+}
+
+// TestDedicatedBaseAdoptionCannotRelabelBelowThePublicationFloor pins the fence
+// both relabel writes carry. A pointer at or below the owner's publication
+// floor names a generation this authority never published — a legacy pointer a
+// pre-authority installation left behind, or generation 0's sentinel — so it is
+// outside the scope that authorized the write and must be left exactly as it
+// is, adoption included.
+func TestDedicatedBaseAdoptionCannotRelabelBelowThePublicationFloor(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	ctx := context.Background()
+	legacy := f.claim(t, "legacy", 0, 0)
+	f.publish(t, legacy)
+	f.adopt(t, legacy)
+
+	// Re-acquire the authority from scratch: the floor is captured once, when
+	// the publication row is created, so the legacy generation only falls below
+	// it after the owner is re-established.
+	if err := f.c.DeleteDedicatedGraph(ctx, f.graph.GraphID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.UpsertDedicatedGraph(ctx, f.graph); err != nil {
+		t.Fatal(err)
+	}
+	// The recreated graph starts with no pointer; the legacy one is what a
+	// pre-authority installation leaves behind.
+	f.exec(t, `UPDATE dedicated_graphs SET active_generation_id=? WHERE graph_id=?`, legacy.GenerationID, f.graph.GraphID)
+	var err error
+	f.authority, err = f.c.AcquireDedicatedBaseAuthority(ctx, AcquireDedicatedBaseAuthorityRequest{
+		GraphID: f.graph.GraphID, Owner: DedicatedBaseOwner{f.owner.CheckoutID, f.owner.Incarnation}, Token: "authority-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.authority.GenerationFloor < legacy.GenerationID {
+		t.Fatalf("floor=%d did not cover legacy generation %d", f.authority.GenerationFloor, legacy.GenerationID)
+	}
+	f.desire, err = f.c.RecordDedicatedBaseDesire(ctx, RecordDedicatedBaseDesireRequest{
+		Authority: f.authority,
+		Identity:  DedicatedBaseIdentity{TreeOID: "tree-b", ConfigHash: "config", ExtractorVersions: "extractors", ResolverVersion: "resolver"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := f.claim(t, "post-floor", legacy.GenerationID, 0)
+	f.publish(t, next)
+
+	adoption := f.adopt(t, next)
+	if adoption.PreviousGenerationID != legacy.GenerationID {
+		t.Fatalf("adoption = %+v, want the legacy pointer reported as replaced", adoption)
+	}
+	if adoption.PreviousSuperseded {
+		t.Fatalf("adoption = %+v, want a generation below the floor left alone", adoption)
+	}
+	if got := f.state(t, legacy.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("legacy generation state = %s, want ready: it is outside this authority's scope", got)
+	}
+	if f.active(t) != next.GenerationID {
+		t.Fatal("the adoption itself must still have installed the active pointer")
+	}
+}
+
+// TestDedicatedBaseRestoreRefusesBelowThePublicationFloor pins the same fence
+// on the mirror write, at the level it can be reached at: the claim allocator
+// already refuses any candidate at or below the floor, so a below-floor adopted
+// id cannot be produced through the public path, and the guard is only
+// observable by calling the write directly. It is not decoration — it is what
+// keeps a legacy pointer a pre-authority installation left behind from being
+// relabelled by an authority that never published it.
+func TestDedicatedBaseRestoreRefusesBelowThePublicationFloor(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	ctx := context.Background()
+	a := f.claim(t, "attempt-a", 0, 0)
+	f.publish(t, a)
+	f.adopt(t, a)
+	f.exec(t, `UPDATE view_generations SET state=? WHERE generation_id=?`, string(ViewGenerationSuperseded), a.GenerationID)
+
+	restore := func(floor int64) bool {
+		t.Helper()
+		authority := f.authority
+		authority.GenerationFloor = floor
+		var restored bool
+		if err := f.c.withTx(ctx, func(tx *sql.Tx) error {
+			var err error
+			restored, err = restoreAdoptedDedicatedHeadTx(ctx, tx, authority, a.GenerationID)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return restored
+	}
+
+	if restore(a.GenerationID) {
+		t.Fatal("a generation at the publication floor was relabelled by an authority that did not publish it")
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationSuperseded {
+		t.Fatalf("below-floor generation state = %s, want superseded", got)
+	}
+	// The same call above the floor fires, so the refusal above is the fence
+	// and not some other guard swallowing the write.
+	if !restore(a.GenerationID - 1) {
+		t.Fatal("an in-scope superseded head was not restored")
+	}
+	if got := f.state(t, a.GenerationID); got != ViewGenerationReady {
+		t.Fatalf("restored head state = %s, want ready", got)
+	}
+}

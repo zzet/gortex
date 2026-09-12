@@ -239,6 +239,13 @@ type CheckoutLifecycle struct {
 	// and the two slots of a checkout whose route is being withdrawn. The
 	// sweep retries them until the catalog stops refusing.
 	owed map[int64]struct{}
+	// supersededChainRetention is how many replaced dedicated base chains this
+	// daemon keeps per graph before the sweep offers them. A small window is
+	// what makes a revert cheap: the reuse lookup accepts a superseded
+	// tree-equal candidate, so the chain a branch just moved off is still there
+	// to be re-adopted instead of rebuilt. Zero takes
+	// defaultSupersededDedicatedChainRetention; negative retains none.
+	supersededChainRetention int
 
 	// admitMu guards initialInventoryTaken alone. It is separate from coordMu
 	// because the admission predicate reads this map and then asks coordMu
@@ -2856,6 +2863,11 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 		out = append(out, row.GenerationID)
 	}
 
+	// A dedicated base is decided on its chain rather than on a route or a
+	// coordinator, so the two scans below hand it here instead of judging it.
+	// See dedicatedChainRetirementCandidates.
+	var dedicated []store_sqlite.ViewGeneration
+
 	const retirementScanPageSize = 512
 
 	// The states a supersede, a failed publish or an interrupted retire leaves
@@ -2877,6 +2889,10 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			break
 		}
 		for _, row := range discarded {
+			if dedicatedBaseGenerationRow(row) {
+				dedicated = append(dedicated, row)
+				continue
+			}
 			if _, live := served[row.CheckoutID]; live {
 				continue
 			}
@@ -2969,6 +2985,16 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			l.logger.Debug("checkout lifecycle: could not scan checkout layers", zap.Error(scanErr))
 			break
 		}
+		// A dedicated base carries the same owner kind as a checkout layer, so
+		// this cohort holds both. Take the bases out before the route pass:
+		// routes name commit and dirty generations only, so a route lookup can
+		// say nothing about a base, and the coordinator whose liveness the pass
+		// defers to does not own one either — the publisher does.
+		for _, row := range layers {
+			if dedicatedBaseGenerationRow(row) {
+				dedicated = append(dedicated, row)
+			}
+		}
 		candidates, routeErr := readyLayerRetirementCandidates(
 			ctx, layers, served, routes, l.catalog.GetCheckoutRoutes,
 		)
@@ -2985,6 +3011,10 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			break
 		}
 		layerBeforeGenerationID = layers[len(layers)-1].GenerationID
+	}
+
+	for _, row := range l.dedicatedChainRetirementCandidates(ctx, dedicated) {
+		collect(row)
 	}
 	return out
 }
@@ -3051,6 +3081,197 @@ func readyLayerRetirementCandidates(
 	// transactional retirement guard; one withdrawn after the read can wait for
 	// the next sweep without compromising correctness.
 	return candidates, nil
+}
+
+// DedicatedBaseGenerationKind is the generation kind a dedicated graph's
+// committed base carries. The builders spell it as a literal
+// (builder_dedicated_claimed.go, builder_dedicated_delta.go) and so does the
+// catalog; it is named here because the retirement sweep has to tell a base
+// apart from the commit and dirty layers that share its owner kind —
+// checkoutLayerOwnerKind IS "dedicated_graph", so owner kind alone cannot.
+const DedicatedBaseGenerationKind = "dedicated"
+
+const (
+	// defaultSupersededDedicatedChainRetention is how many replaced chains per
+	// graph survive the sweep when nothing configures a window.
+	defaultSupersededDedicatedChainRetention = 2
+	// maxDedicatedChainAncestry bounds one chain walk. It matches the catalog's
+	// hard ancestry limit, which no published chain can exceed, so reaching it
+	// means the walk is following something the protocol cannot have built.
+	maxDedicatedChainAncestry = 64
+	// maxDedicatedChainRetirementCandidates bounds what one sweep offers. A
+	// database carrying a long-leaked backlog drains over several passes rather
+	// than in one unbounded one; ordering is newest-first, which is the only
+	// order a chain can be collected in anyway.
+	maxDedicatedChainRetirementCandidates = 256
+)
+
+// dedicatedBaseGenerationRow reports a dedicated graph's committed base.
+func dedicatedBaseGenerationRow(row store_sqlite.ViewGeneration) bool {
+	return row.GenerationID > 0 && row.GraphID != "" &&
+		row.OwnerKind == checkoutLayerOwnerKind &&
+		row.GenerationKind == DedicatedBaseGenerationKind
+}
+
+func (l *CheckoutLifecycle) supersededChainRetentionWindow() int {
+	switch {
+	case l.supersededChainRetention > 0:
+		return l.supersededChainRetention
+	case l.supersededChainRetention < 0:
+		return 0
+	default:
+		return defaultSupersededDedicatedChainRetention
+	}
+}
+
+// dedicatedChainRetirementCandidates decides which of a dedicated graph's bases
+// nothing is left to read.
+//
+// A base is not decided the way a checkout layer is. No route names one — a
+// route points at commit and dirty generations — and no coordinator owns one;
+// the publisher does, and the graph's active pointer is what says which base is
+// current. So the two scans that feed this hand their dedicated rows over
+// undecided, and the decision is made on the chain instead: everything the
+// active pointer still composes is retained, a small window of the most
+// recently replaced chains is retained beside it so a revert can re-adopt
+// rather than rebuild, and what is left is offered. A graph whose row has been
+// deleted has no active pointer and nothing left to revert into, so it retains
+// nothing at all.
+//
+// Offered is not collected. Every candidate still goes through
+// RetirePayloadGeneration, so a generation a dependent's layer still names as
+// its base, one a lease is holding open, and one a publication attempt is still
+// bound to are each refused there and re-offered on the next sweep. This pass
+// decides only what is worth asking about, which is what keeps the ancestry of
+// the live chain — always ready, always referenced — out of the sweep entirely
+// instead of being refused on every pass forever.
+func (l *CheckoutLifecycle) dedicatedChainRetirementCandidates(
+	ctx context.Context,
+	rows []store_sqlite.ViewGeneration,
+) []store_sqlite.ViewGeneration {
+	if l == nil || l.catalog == nil || len(rows) == 0 {
+		return nil
+	}
+	byID := make(map[int64]store_sqlite.ViewGeneration, len(rows))
+	byGraph := map[string][]store_sqlite.ViewGeneration{}
+	graphs := make([]string, 0, 4)
+	for _, row := range rows {
+		if !dedicatedBaseGenerationRow(row) {
+			continue
+		}
+		if _, duplicate := byID[row.GenerationID]; duplicate {
+			continue
+		}
+		byID[row.GenerationID] = row
+		if _, known := byGraph[row.GraphID]; !known {
+			graphs = append(graphs, row.GraphID)
+		}
+		byGraph[row.GraphID] = append(byGraph[row.GraphID], row)
+	}
+	var out []store_sqlite.ViewGeneration
+	for _, graphID := range graphs {
+		out = append(out, l.dedicatedGraphRetirementCandidates(ctx, graphID, byGraph[graphID], byID)...)
+		if len(out) >= maxDedicatedChainRetirementCandidates {
+			return out[:maxDedicatedChainRetirementCandidates]
+		}
+	}
+	return out
+}
+
+// dedicatedGraphRetirementCandidates decides one graph's bases.
+func (l *CheckoutLifecycle) dedicatedGraphRetirementCandidates(
+	ctx context.Context,
+	graphID string,
+	rows []store_sqlite.ViewGeneration,
+	byID map[int64]store_sqlite.ViewGeneration,
+) []store_sqlite.ViewGeneration {
+	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		// A failed read is not evidence that the graph has no live chain. Leave
+		// this graph's bases alone; a later sweep can retry it.
+		l.logger.Debug("checkout lifecycle: could not read dedicated graph for retirement",
+			zap.String("graph_id", graphID), zap.Error(err))
+		return nil
+	}
+	retained := make(map[int64]struct{}, len(rows))
+	window := l.supersededChainRetentionWindow()
+	if found {
+		l.walkDedicatedChain(ctx, graph.ActiveGenerationID, byID, retained)
+	} else {
+		// The graph row is gone: there is no active pointer to compose these
+		// bases into anything, and no revert can re-adopt one, so the whole
+		// reason the window exists is void. Retain nothing. The MissingGraph
+		// scan cannot be relied on to have collected them either — it filters
+		// to ready rows, and a superseded base is exactly what this pass
+		// produces — so every one of them reaches retirement only here.
+		// Offering is still not collecting: RetirePayloadGeneration's reference
+		// predicate remains the authority, so a base a lease or a dependent's
+		// route is still holding is refused there and re-offered later.
+		window = 0
+	}
+	// Newest first: the window keeps the most recently replaced heads, and a
+	// chain can only ever be collected child before parent.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].GenerationID > rows[j].GenerationID })
+	kept := 0
+	for _, row := range rows {
+		if kept >= window {
+			break
+		}
+		if row.State != store_sqlite.ViewGenerationSuperseded {
+			continue
+		}
+		if _, live := retained[row.GenerationID]; live {
+			continue
+		}
+		kept++
+		l.walkDedicatedChain(ctx, row.GenerationID, byID, retained)
+	}
+	out := make([]store_sqlite.ViewGeneration, 0, len(rows))
+	for _, row := range rows {
+		if row.State == store_sqlite.ViewGenerationRetiring {
+			// Its fence is already committed, so the decision was taken on an
+			// earlier pass and what is left is to finish it.
+			out = append(out, row)
+			continue
+		}
+		if _, keep := retained[row.GenerationID]; keep {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// walkDedicatedChain adds a generation and everything under it to into.
+//
+// The rows the sweep already listed answer almost every hop, so a chain the
+// active pointer names normally costs no query at all; a hop that is not among
+// them is read once and cached for the rest of the pass. An id is marked before
+// its row is read, so a row that cannot be read is retained rather than
+// offered: failing to prove a generation is unreachable is not evidence that it
+// is.
+func (l *CheckoutLifecycle) walkDedicatedChain(
+	ctx context.Context,
+	id int64,
+	byID map[int64]store_sqlite.ViewGeneration,
+	into map[int64]struct{},
+) {
+	for depth := 0; id > 0 && depth < maxDedicatedChainAncestry; depth++ {
+		if _, walked := into[id]; walked {
+			return
+		}
+		into[id] = struct{}{}
+		row, cached := byID[id]
+		if !cached {
+			fetched, found, err := l.catalog.GetViewGeneration(ctx, id)
+			if err != nil || !found {
+				return
+			}
+			row = fetched
+			byID[id] = row
+		}
+		id = row.BaseGenerationID
+	}
 }
 
 // --- startup ------------------------------------------------------------
