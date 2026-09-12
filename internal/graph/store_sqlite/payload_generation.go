@@ -41,6 +41,17 @@ var (
 	// ErrPayloadGenerationIncomplete means a publish was refused because a
 	// producer has not finished contributing to the generation.
 	ErrPayloadGenerationIncomplete = errors.New("store_sqlite: payload generation has a producer still building")
+
+	// ErrPayloadGenerationRetired means a derived-plane write was attempted
+	// through a handle whose generation is being retired, or has already been
+	// swept. Payload writes never see this — they are refused earlier and more
+	// coarsely by ErrPayloadGenerationSealed, which covers every non-building
+	// state. The analysis cache needs the finer distinction: it must keep
+	// admitting writes through a PUBLISHED generation's handle (that is the
+	// routed read path's whole point) while refusing them once the retirement
+	// sweep has started, because the sweep snapshots the analysis ids it will
+	// delete and a later write would leave rows for a corpus that is gone.
+	ErrPayloadGenerationRetired = errors.New("store_sqlite: payload generation is being retired")
 )
 
 // payloadSeal is the write-admission flag for one derived payload generation.
@@ -51,7 +62,10 @@ var (
 // catalog point read on its first write, after which the write gate costs one
 // atomic load. A generation with no catalog row at all is open — such rows are
 // written by callers that manage generations themselves, and the lifecycle
-// here does not claim authority over them.
+// here does not claim authority over them. (The analysis plane's own check,
+// refuseRetiredAnalysisWrite, qualifies that further: a missing row for an id
+// the catalog has already minted is a retired generation, not an unmanaged
+// one.)
 type payloadSeal struct {
 	state atomic.Int32
 }
@@ -60,6 +74,13 @@ const (
 	payloadSealUnknown int32 = iota
 	payloadSealOpen
 	payloadSealSealed
+	// payloadSealRetired is a sealed generation whose rows are being deleted.
+	// The payload write gate treats it exactly like payloadSealSealed; only
+	// the derived planes that deliberately bypass that gate — the analysis
+	// cache — read the two apart. Keeping it a distinct verdict is what lets
+	// the fast path stay one atomic load: payloadSealSealed now strictly means
+	// "published", so an analysis write on it needs no catalog read.
+	payloadSealRetired
 )
 
 // payloadSealFor returns the flag shared by every handle on generation g.
@@ -85,7 +106,10 @@ func (s *Store) refuseSealedPayloadWrite() error {
 	switch seal.state.Load() {
 	case payloadSealOpen:
 		return nil
-	case payloadSealSealed:
+	case payloadSealSealed, payloadSealRetired:
+		// Payload writes do not distinguish the two: everything past building
+		// is closed to them, and the error they have always reported is the
+		// one callers match on.
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationSealed, s.viewGen)
 	}
 	return s.resolvePayloadSeal(seal)
@@ -95,19 +119,110 @@ func (s *Store) refuseSealedPayloadWrite() error {
 // verdict. It runs before any write transaction is opened, so it never queries
 // through a connection it is itself holding.
 func (s *Store) resolvePayloadSeal(seal *payloadSeal) error {
+	verdict, state, found, err := s.catalogSealVerdict()
+	if err != nil {
+		return err
+	}
+	if verdict == payloadSealOpen {
+		if !found {
+			// A row-less generation is open to payload writes exactly as it has
+			// always been, but it must not CACHE that verdict when the reason
+			// the row is missing is that retirement deleted it: the analysis
+			// plane's own check reads this same flag, and a cached open there
+			// would let a write into a swept generation through on the fast
+			// path. Leaving the flag unresolved costs a re-read on a handle
+			// nothing legitimate holds.
+			tombstoned, markErr := s.payloadGenerationTombstoned()
+			if markErr != nil {
+				return markErr
+			}
+			if tombstoned {
+				// Declining to cache must not also drop a refusal. This is the
+				// path openPayloadSeal's post-CAS re-read used to cover: a
+				// handle that loaded unknown before RetirePayloadGeneration
+				// sealed the shared flag, and whose catalog read completed
+				// after the same retire deleted the row, reaches here with the
+				// flag already saying retired. Returning nil would ADMIT it to
+				// the payload write gate — past the point drainPayloadWriters
+				// can wait for it — so the shared flag is honoured here exactly
+				// as openPayloadSeal honours it, only without storing a verdict.
+				switch seal.state.Load() {
+				case payloadSealSealed, payloadSealRetired:
+					return fmt.Errorf("%w: generation %d", ErrPayloadGenerationSealed, s.viewGen)
+				}
+				return nil
+			}
+		}
+		return s.openPayloadSeal(seal)
+	}
+	seal.state.CompareAndSwap(payloadSealUnknown, verdict)
+	return fmt.Errorf("%w: generation %d is %s", ErrPayloadGenerationSealed, s.viewGen, state)
+}
+
+// catalogSealVerdict reads this handle's generation state from the catalog
+// once and maps it to a seal verdict. A generation with no catalog row is
+// open: such rows are written by callers that manage generations themselves,
+// and the lifecycle here does not claim authority over them. The third result
+// reports whether a row was found, because "open" alone cannot tell an
+// unmanaged generation apart from one whose row retirement already deleted —
+// see payloadGenerationTombstoned.
+//
+// The retiring state gets its own verdict so payloadSealSealed strictly means
+// "published". That is what keeps the analysis cache's admission check on the
+// cheap atomic path in the routed case, which is the common one.
+func (s *Store) catalogSealVerdict() (int32, string, bool, error) {
 	var state string
 	err := s.db.QueryRow(
 		`SELECT state FROM view_generations WHERE generation_id = ?`, s.viewGen).Scan(&state)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return s.openPayloadSeal(seal)
+		return payloadSealOpen, "", false, nil
 	case err != nil:
-		return err
+		return payloadSealUnknown, "", false, err
 	case ViewGenerationState(state) == ViewGenerationBuilding:
-		return s.openPayloadSeal(seal)
+		return payloadSealOpen, state, true, nil
+	case ViewGenerationState(state) == ViewGenerationRetiring:
+		return payloadSealRetired, state, true, nil
 	}
-	seal.state.CompareAndSwap(payloadSealUnknown, payloadSealSealed)
-	return fmt.Errorf("%w: generation %d is %s", ErrPayloadGenerationSealed, s.viewGen, state)
+	return payloadSealSealed, state, true, nil
+}
+
+// payloadGenerationTombstoned reports whether this handle's generation once had
+// a catalog row that is now gone — the durable tombstone a completed retirement
+// leaves behind.
+//
+// Only the caller that has already established there is no view_generations row
+// may ask. Two shapes produce that: a generation the lifecycle never minted (a
+// caller managing generations itself, which catalogSealVerdict calls open), and
+// one RetirePayloadGeneration swept and deleted. The catalog itself separates
+// them: view_generations.generation_id is INTEGER PRIMARY KEY AUTOINCREMENT
+// (schema.go), so SQLite keeps the highest id ever minted in sqlite_sequence and
+// never lowers it when rows are deleted — DELETE FROM, with or without a WHERE
+// clause, leaves the sequence standing. An id at or below that high-water mark
+// with no row was therefore allocated and then deleted, and the only production
+// caller of Catalog.DeleteViewGeneration is RetirePayloadGeneration itself.
+//
+// A missing sqlite_sequence row means no generation was ever minted, which
+// reads as a high-water mark of 0 and tombstones nothing (generation ids start
+// at 1).
+//
+// The read is not atomic with the caller's own row lookup: a generation being
+// minted concurrently could raise the mark between the two reads and be
+// reported tombstoned. That refuses a write on a handle whose generation
+// another writer is creating right now — conservative, and not a shape any
+// caller produces, since a handle is derived from the id its own begin
+// returned.
+func (s *Store) payloadGenerationTombstoned() (bool, error) {
+	var mark int64
+	err := s.db.QueryRow(
+		`SELECT seq FROM sqlite_sequence WHERE name = 'view_generations'`).Scan(&mark)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return s.viewGen <= mark, nil
 }
 
 // openPayloadSeal caches the open verdict the catalog read produced. A publish
@@ -118,8 +233,71 @@ func (s *Store) openPayloadSeal(seal *payloadSeal) error {
 	if seal.state.CompareAndSwap(payloadSealUnknown, payloadSealOpen) {
 		return nil
 	}
-	if seal.state.Load() == payloadSealSealed {
+	switch seal.state.Load() {
+	case payloadSealSealed, payloadSealRetired:
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationSealed, s.viewGen)
+	}
+	return nil
+}
+
+// refuseRetiredAnalysisWrite is the analysis cache's admission check.
+//
+// The cache's transactions deliberately run on the base handle
+// (beginAnalysisWrite), which is what lets a PUBLISHED generation still cache
+// an analysis. That bypass also skips the one thing that used to refuse a
+// write into a generation being deleted, so the analysis plane has to make the
+// finer decision itself: published is admitted, retiring is not. Without this,
+// a BeginAnalysisGeneration interleaving the retirement sweep — which releases
+// writeMu between chunks and only ever re-checks the PAYLOAD generation's
+// state — leaves manifest, child and pointer rows for a corpus that is gone,
+// and generation ids are never reissued, so nothing ever collects them.
+//
+// The in-memory seal is not enough on its own. RetirePayloadGeneration ends by
+// dropping the shared flag (payloadSeals.Delete), so a handle derived at that
+// id afterwards starts unknown, finds no catalog row, and would read as open.
+// The catalog's own allocation high-water mark is consulted for exactly that
+// case, which is what makes the refusal survive the seal's disposal and a
+// process restart.
+func (s *Store) refuseRetiredAnalysisWrite() error {
+	seal := s.seal
+	if seal == nil {
+		// The base corpus. RetirePayloadGeneration refuses generation ids at
+		// or below baseViewGeneration, so it never retires.
+		return nil
+	}
+	switch seal.state.Load() {
+	case payloadSealOpen, payloadSealSealed:
+		return nil
+	case payloadSealRetired:
+		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationRetired, s.viewGen)
+	}
+	// Unknown: this handle has never resolved its generation, which is the
+	// ordinary case for one that only ever writes the derived plane. One
+	// catalog point read, cached like every other seal verdict.
+	verdict, _, found, err := s.catalogSealVerdict()
+	if err != nil {
+		return err
+	}
+	if !found {
+		// No row. Either a generation the lifecycle never minted — open, as it
+		// has always been — or one retirement swept and deleted.
+		tombstoned, markErr := s.payloadGenerationTombstoned()
+		if markErr != nil {
+			return markErr
+		}
+		if tombstoned {
+			// Deliberately not cached on the shared seal: a retired-and-deleted
+			// id is unreachable for any legitimate caller, and storing a verdict
+			// here would change what the PAYLOAD write gate reports for the same
+			// handle, which this check must leave byte-identical.
+			return fmt.Errorf("%w: generation %d", ErrPayloadGenerationRetired, s.viewGen)
+		}
+	}
+	seal.state.CompareAndSwap(payloadSealUnknown, verdict)
+	// Re-read: a publish or a retire may have stored its own verdict while the
+	// catalog read was in flight, and that verdict is the newer one.
+	if seal.state.Load() == payloadSealRetired {
+		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationRetired, s.viewGen)
 	}
 	return nil
 }
@@ -529,7 +707,11 @@ func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64,
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
 	}
-	s.setPayloadSeal(generationID, payloadSealSealed)
+	// payloadSealRetired, not payloadSealSealed: the payload write gate reads
+	// them identically, but the analysis cache — whose transactions run on the
+	// base handle and so never reach that gate — has to keep admitting writes
+	// through a published generation while refusing them here.
+	s.setPayloadSeal(generationID, payloadSealRetired)
 	// A write admitted before the seal closed would otherwise commit rows into
 	// a generation the sweep has already walked past.
 	if err := s.drainPayloadWriters(ctx); err != nil {
@@ -579,6 +761,15 @@ func refusalReason(refs ViewGenerationReferences) string {
 // sidecar row pointing at a node that is already gone.
 func (s *Store) sweepPayloadGeneration(ctx context.Context, generationID int64) error {
 	base := s.atBase()
+	// The whole-graph analysis cache is stamped with the payload view its
+	// inputs came from, but its rows hang off analysis_generations.generation_id
+	// rather than carrying view_gen themselves, so neither sweep registry names
+	// them. Collect them first: they reference nothing in the payload tables,
+	// and leaving them would strand an analysis describing a corpus that no
+	// longer exists.
+	if err := base.sweepAnalysisGenerations(ctx, generationID); err != nil {
+		return err
+	}
 	for _, docidMap := range generationFTSDocidMaps {
 		if err := base.deletePayloadChunks(ctx, generationID, deleteFTSDocidChunk(docidMap, generationID)); err != nil {
 			return err
@@ -596,6 +787,42 @@ func (s *Store) sweepPayloadGeneration(ctx context.Context, generationID int64) 
 	for _, query := range []string{deleteGenerationEdgesSQL, deleteGenerationNodesSQL} {
 		if err := base.deletePayloadChunks(ctx, generationID, deleteGenerationRowsChunk(query, generationID)); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// sweepAnalysisGenerations removes every analysis generation stamped with the
+// retiring payload view generation, its active pointer included.
+//
+// Unlike PruneAnalysisGenerations — the retention window, which never touches
+// an active generation — this collects the active one too: the corpus it
+// describes is being deleted. The pointer goes first because it holds
+// ON DELETE RESTRICT against the manifest rows, then each generation's
+// children child-first, then its manifest row. Every step rides
+// deletePayloadChunks, so each batch is its own transaction under the mutation
+// gate and re-checks that the generation is still retiring.
+func (s *Store) sweepAnalysisGenerations(ctx context.Context, generationID int64) error {
+	analysisIDs, err := s.analysisGenerationIDsForView(ctx, generationID)
+	if err != nil {
+		return fmt.Errorf("payload generation gc: analysis generations: %w", err)
+	}
+	if len(analysisIDs) == 0 {
+		// No manifest row means no pointer either: the foreign key cannot be
+		// satisfied without one.
+		return nil
+	}
+	if err := s.deletePayloadChunks(ctx, generationID, deleteAnalysisPointerChunk(generationID)); err != nil {
+		return err
+	}
+	for _, analysisID := range analysisIDs {
+		for _, table := range analysisGenerationGCTables {
+			if err := s.deletePayloadChunks(ctx, generationID, deleteAnalysisChildChunk(table, analysisID)); err != nil {
+				return fmt.Errorf("payload generation gc: analysis %d %s: %w", analysisID, table.name, err)
+			}
+		}
+		if err := s.deletePayloadChunks(ctx, generationID, deleteAnalysisManifestChunk(analysisID)); err != nil {
+			return fmt.Errorf("payload generation gc: analysis %d manifest: %w", analysisID, err)
 		}
 	}
 	return nil

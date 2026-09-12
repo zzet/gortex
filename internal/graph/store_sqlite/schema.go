@@ -321,6 +321,43 @@ func nonGeneratedColumns(db schemaColumnDB, table string) ([]string, error) {
 	return out, nil
 }
 
+// analysisActiveGenerationTableBody is the canonical body of the analysis
+// cache's active pointer, shared by schemaSQL and by the v25 migration so the
+// fresh-store and migrated shapes cannot drift.
+//
+// The pointer is keyed by PAYLOAD view generation, not by a single global
+// slot. An analysis is computed over one payload view; the mutation revision
+// that used to be its only concurrency key is a process-local counter on the
+// shared storeCore (store.go, analysis_generation_state.go: "intentionally
+// coarse"), so two analyses over two payload generations can carry the
+// identical build_revision and the old single-slot pointer let the second
+// overwrite — and be read back as — the first. slot stays so the CHECK that
+// pins one row per generation is still readable; view_gen leads the key.
+//
+// generation_id stays UNIQUE: an analysis generation is built inside exactly
+// one payload view and must never be published as two views' active analysis.
+const analysisActiveGenerationTableBody = ` (
+    view_gen      INTEGER NOT NULL DEFAULT 0,
+    slot          INTEGER NOT NULL CHECK (slot = 1),
+    generation_id INTEGER NOT NULL UNIQUE
+        REFERENCES analysis_generations(generation_id) ON DELETE RESTRICT,
+    PRIMARY KEY (view_gen, slot)
+);`
+
+// analysis_generations carries no view_gen index on purpose. schemaSQL runs
+// BEFORE the migration steps (store.go: applyInPlaceMigrations) and is a no-op
+// against a legacy table, so an index naming a column the legacy shape lacks
+// would fail every pre-v25 Open; and PruneAnalysisGenerations keeps only its
+// caller's retention window per view (the daemon passes 2) under a hard cap on
+// how many views keep history at all (analysisRetentionViewCap), so the
+// manifest is bounded at 16 collectable rows plus one active per live view and
+// the view_gen predicates are a scan either way. That 16 is pinned absolutely
+// by TestPruneAnalysisGenerationsBoundsRetainedHistoryAcrossViews, so this
+// rationale cannot be invalidated silently by widening the cap.
+// If it ever grows, the index belongs in createSidecarIndexes — which already
+// runs after applyInPlaceMigrations for exactly this reason, and whose comment
+// names the view_gen (v15) columns as the precedent.
+
 // analysisGenerationSchemaSQL is the normalized, generation-addressed
 // whole-graph analysis cache. Node IDs are copied into generation-local rows:
 // they deliberately do not reference live nodes because incremental reindex
@@ -344,16 +381,13 @@ CREATE TABLE IF NOT EXISTS analysis_generations (
     hub_max                     REAL NOT NULL DEFAULT 0,
     modularity                  REAL NOT NULL DEFAULT 0,
     processes_truncated         INTEGER NOT NULL DEFAULT 0 CHECK (processes_truncated IN (0, 1)),
-    processes_truncation_reason TEXT NOT NULL DEFAULT ''
+    processes_truncation_reason TEXT NOT NULL DEFAULT '',
+    view_gen                    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS analysis_generations_by_state
     ON analysis_generations(state, generation_id DESC);
 
-CREATE TABLE IF NOT EXISTS analysis_active_generation (
-    slot          INTEGER PRIMARY KEY CHECK (slot = 1),
-    generation_id INTEGER NOT NULL UNIQUE
-        REFERENCES analysis_generations(generation_id) ON DELETE RESTRICT
-);
+CREATE TABLE IF NOT EXISTS analysis_active_generation` + analysisActiveGenerationTableBody + `
 
 CREATE TABLE IF NOT EXISTS analysis_generation_components (
     generation_id INTEGER NOT NULL

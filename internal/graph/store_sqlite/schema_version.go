@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 24
+const currentSchemaVersion = 25
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -121,6 +121,121 @@ var schemaMigrations = []schemaMigration{
 	{version: 22, name: "add dedicated base publication intent", inPlace: createDedicatedBasePublicationsTable},
 	{version: 23, name: "persist derived dependency revision", inPlace: addDependencyRevisionColumns},
 	{version: 24, name: "separate node identity-only ownership masks", inPlace: addNodeIdentityMaskKinds},
+	{version: 25, name: "key analysis generations by view generation", inPlace: addAnalysisViewGenerationKeys},
+}
+
+// addAnalysisViewGenerationKeys gives the whole-graph analysis cache a real
+// payload-view-generation axis: analysis_generations gains a view_gen column
+// and analysis_active_generation is re-keyed from one global slot to one slot
+// per view generation.
+//
+// Why a column and not the existing CAS: the build_revision the cache already
+// stores is analysisMutationRevision, an atomic.Uint64 on the storeCore every
+// generation handle shares (store.go), bumped only when a graph mutation
+// commits (analysis_generation_state.go) and reset on reopen. Two analyses
+// computed over two payload generations with no intervening mutation carry the
+// identical revision, so it can never identify which view an analysis belongs
+// to. It stays exactly as it is — the concurrency guard it was written to be.
+//
+// Purely additive for the data: every existing row belongs to the single base
+// corpus, generation 0, which is the column default and the value the pointer
+// copy supplies, so nothing is re-derived and no reindex is needed. The
+// pointer's primary key cannot be altered in place, so that one table is
+// rebuilt from the canonical body; analysis_generations only gains a column
+// and takes a plain ALTER. Both run in the caller's single migration
+// transaction, so a failure anywhere leaves the store exactly as it was.
+//
+// Idempotent: each half probes for its own view_gen column first. schemaSQL
+// runs before the migration steps, so on a fresh store both halves are no-ops.
+func addAnalysisViewGenerationKeys(tx *sql.Tx) error {
+	present, err := analysisTablePresent(tx, "analysis_generations")
+	if err != nil {
+		return err
+	}
+	if !present {
+		// Nothing to migrate: schemaSQL creates both tables in their current
+		// shape, and a store that reaches here without them has no analysis
+		// cache to re-key.
+		return nil
+	}
+	if err := addAnalysisGenerationsViewGenColumn(tx); err != nil {
+		return fmt.Errorf("analysis_generations: %w", err)
+	}
+	return rebuildAnalysisActiveGenerationAtBase(tx)
+}
+
+// analysisTablePresent reports whether an ordinary table exists. The analysis
+// cache arrived in v4 and schemaSQL recreates it on every Open, but the
+// migration registry is also driven directly by tests and by alternate open
+// paths, and an ALTER against a missing table is a migration failure rather
+// than the no-op it should be.
+func analysisTablePresent(tx *sql.Tx, table string) (bool, error) {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
+	).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// addAnalysisGenerationsViewGenColumn appends view_gen to the manifest table.
+// Existing rows take the constant default, generation 0 — the base corpus they
+// already describe. The probe reads pragma_table_xinfo for the same reason
+// addEdgeViewGenerationColumn does: one probe shape that lists every column.
+func addAnalysisGenerationsViewGenColumn(tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('analysis_generations') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE analysis_generations ADD COLUMN ` +
+		viewGenColumnName + ` INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+// rebuildAnalysisActiveGenerationAtBase re-keys the active pointer on
+// (view_gen, slot). A primary key cannot be altered in place, so the table is
+// rebuilt from the canonical body and its single row — if any — is copied at
+// generation 0. The copy names its columns explicitly; the old table's shape
+// is (slot, generation_id) and the new one leads with view_gen, so SELECT *
+// would silently write the slot into the generation column.
+func rebuildAnalysisActiveGenerationAtBase(tx *sql.Tx) error {
+	present, err := analysisTablePresent(tx, "analysis_active_generation")
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('analysis_active_generation') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	const rebuilt = "analysis_active_generation_view_gen_rebuild"
+	if _, err := tx.Exec(`CREATE TABLE ` + rebuilt + analysisActiveGenerationTableBody); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO ` + rebuilt + `(` + viewGenColumnName + `, slot, generation_id)
+SELECT 0, slot, generation_id FROM analysis_active_generation`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE analysis_active_generation`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`ALTER TABLE ` + rebuilt + ` RENAME TO analysis_active_generation`)
+	return err
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are

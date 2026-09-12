@@ -52,7 +52,11 @@ func TestNodeIdentityMaskFullV23OpenAndReopenPreserveBothKinds(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 24 {
+	// The assertion is "Open brought the v23 fixture fully forward", not "the
+	// registry stops at v24" — a later additive step (v25's analysis view axis)
+	// stamps its own version and must not read as a regression here. The
+	// sibling probe at :135 still pins the fixture's own stored version.
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != currentSchemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 	legacy, err := s.AtGeneration(7).NodeIdentityMasks()

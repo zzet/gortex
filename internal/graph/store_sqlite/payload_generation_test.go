@@ -146,10 +146,20 @@ func writePayloadOverlay(t *testing.T, handle *Store) {
 	}
 }
 
-// payloadGenerationTables is every table whose rows carry a view_gen, plus the
-// two core tables the registries do not name.
+// payloadGenerationTables is every table whose rows carry a view_gen: the two
+// core tables the registries do not name, the registry-derived sidecars and
+// masks, and the analysis cache's two view-keyed tables.
+//
+// The analysis pair is swept by sweepAnalysisGenerations rather than by
+// payloadSweepDeleteSQL, because the cache's child rows hang off
+// analysis_generations.generation_id instead of carrying view_gen of their own,
+// so neither registry can name them. They belong in this list all the same:
+// retiring a generation must leave nothing of theirs behind either, and
+// TestPayloadGenerationSweepCoversEveryGenerationTable checks this list against
+// the schema so a future view-keyed table cannot be added without a sweep.
 func payloadGenerationTables() []string {
-	return append([]string{"nodes", "edges"}, payloadSweepTables()...)
+	tables := append([]string{"nodes", "edges"}, payloadSweepTables()...)
+	return append(tables, "analysis_generations", "analysis_active_generation")
 }
 
 func countAtGeneration(t *testing.T, store *Store, table string, generationID int64) int {
