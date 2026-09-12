@@ -193,6 +193,40 @@ func boundHandler[Req, Res any](
 				// The *caller* went away (client cancelled, or the transport's
 				// own request lifetime fired first). Report that, not a
 				// deadline we did not reach.
+				//
+				// This frame returns, but the handler goroutine does not: it
+				// is still running, still reading the view this request
+				// materialized and still inside the repositories it was
+				// admitted to — its own `defer view.close()` and the
+				// middleware's `defer scope.Release()` have not run and will
+				// not until it finally returns. That makes cancellation the
+				// same class of request-outliving work a fired deadline is,
+				// and it was the one such path with no hold and no accounting
+				// at all. Join on the cancelled handler's behalf and release
+				// when it actually exits, counted in the same handoff series
+				// under the same consumer: from the payload's point of view
+				// the two arms are one event — the firewall stopped waiting
+				// for a handler that is still reading.
+				//
+				// Exactly as symmetric with the deadline arm below as that
+				// reading implies: a call that materialized no payload joins
+				// nothing and is recorded as nothing on BOTH arms. Its
+				// repository admission is not lost by that — the middleware
+				// frame holding it is inside the handler goroutine that has
+				// not returned.
+				//
+				// abandonedToolCalls is deliberately NOT incremented here.
+				// That counter gates admission (maxAbandonedToolCalls), and a
+				// client that hangs up must not push the server towards
+				// refusing everyone else's calls; the lifetime hole is the
+				// pin, and the pin is what this fixes.
+				retained := viewNote.retain()
+				if retained != nil {
+					go func() {
+						<-done
+						retained.release()
+					}()
+				}
 				var zero Res
 				return zero, ctx.Err()
 			}
@@ -238,6 +272,10 @@ type retainedViewNoteKey struct{}
 type retainedViewNote struct {
 	mu   sync.Mutex
 	view *requestView
+	// scope is the request's repository admission. It is published beside the
+	// view rather than inside it because an unrouted call materializes no view
+	// at all and still holds one.
+	scope *graphview.RepositoryReadLease
 }
 
 func withRetainedViewNote(ctx context.Context) (context.Context, *retainedViewNote) {
@@ -253,33 +291,43 @@ func retainedViewNoteFrom(ctx context.Context) *retainedViewNote {
 	return note
 }
 
-// noteRetainedView publishes the view answering this call to the deadline
-// firewall bounding it. A call with no firewall frame above it — an unbounded
-// tool timeout, or a handler invoked directly — carries no note and this is a
-// no-op.
-func noteRetainedView(ctx context.Context, view *requestView) {
+// noteRetainedRequest publishes what this call is reading — the view that
+// answers it and the repository admission it holds — to the deadline firewall
+// bounding it. A call with no firewall frame above it — an unbounded tool
+// timeout, or a handler invoked directly — carries no note and this is a
+// no-op. Either half may be nil: an unrouted call has no view, and a server
+// with no owner registry has no scope.
+func noteRetainedRequest(ctx context.Context, view *requestView, scope *graphview.RepositoryReadLease) {
 	note := retainedViewNoteFrom(ctx)
-	if note == nil || view == nil {
+	if note == nil || (view == nil && scope == nil) {
 		return
 	}
 	note.mu.Lock()
 	defer note.mu.Unlock()
-	note.view = view
+	if view != nil {
+		note.view = view
+	}
+	if scope != nil {
+		note.scope = scope
+	}
 }
 
-// retain joins the abandoned handler to the lease of the view it is still
-// reading. It returns nil when this call materialized no generation stack, or
-// when the lease has already drained — both of which the pin's counters
-// separate. The returned pin is released by the waiter that observes the
-// handler goroutine exit.
+// retain joins the still-running handler to the payload it is still reading:
+// the view's generation stack, the base corpus beneath it, and the repository
+// owner that speaks for that stack. It returns nil when this call materialized
+// no payload — the unrouted base-corpus shape, whose repository admission is
+// still held by the middleware frame the handler has not returned from — or
+// when every hold has already been released; the pin's counters separate the
+// two. The returned pin is released by the waiter that observes the handler
+// goroutine exit.
 func (n *retainedViewNote) retain() *requestViewPin {
 	if n == nil {
 		return nil
 	}
 	n.mu.Lock()
-	view := n.view
+	view, scope := n.view, n.scope
 	n.mu.Unlock()
-	return handoffView(view, viewmetrics.HandoffAbandonedHandler)
+	return handoffRequest(view, scope, viewmetrics.HandoffAbandonedHandler)
 }
 
 // retainedLeaseNote states what an abandoned handler is still holding, for
@@ -337,20 +385,29 @@ func retainedLeaseNote(retained *requestViewPin) string {
 func requestScoped[Req, Res any](s *Server, h func(context.Context, Req) (Res, error)) func(context.Context, Req) (Res, error) {
 	overlaid := overlayPrepared(s, h)
 	return func(ctx context.Context, req Req) (Res, error) {
+		// A resource read and a prompt fetch are serving requests too, and
+		// they read the same repositories a tool call does — including on the
+		// base-corpus path below, where no view is resolved at all. Admitted
+		// for the request's lifetime on the same terms as the tool middleware.
+		scope := s.acquireServingRepositoryScope()
+		ctx = withRequestRepositoryScope(ctx, scope)
+		defer scope.Release()
 		view, err := s.resolveRequestView(ctx,
 			graphview.Selector{Kind: graphview.SelectorAuto}, requestViewPolicy{})
 		if err != nil {
 			view.close()
+			noteRetainedRequest(ctx, nil, scope)
 			return overlaid(ctx, req)
 		}
 		if view == nil {
+			noteRetainedRequest(ctx, nil, scope)
 			return overlaid(ctx, req)
 		}
 		ctx = withRequestView(ctx, view)
-		// Same reason as the tool path: an abandoned handler keeps reading
-		// through this view, so the firewall joins the lease rather than
-		// leaving a silent pin.
-		noteRetainedView(ctx, view)
+		// Same reason as the tool path: an abandoned or cancelled handler
+		// keeps reading through this view and inside these repositories, so
+		// the firewall joins both rather than leaving a silent pin.
+		noteRetainedRequest(ctx, view, scope)
 		defer view.close()
 		if !view.acceptsBufferOverlay() {
 			return h(ctx, req)

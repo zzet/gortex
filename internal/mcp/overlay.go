@@ -183,6 +183,23 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// handler chain, but its warn rider must attach AFTER the decorators
 		// below (see attachPendingArgGuardRider).
 		ctx = withArgGuardRiderSlot(ctx)
+		// Repository lifetime for this request, taken BEFORE anything resolves
+		// a view so it also covers selection and materialization.
+		//
+		// The generation lease a materialized view holds is a different
+		// guarantee: it stops a payload generation from being RETIRED. It says
+		// nothing about the owner of the repository underneath, whose
+		// finalization is followed by a physical purge of that repository's
+		// payload — which is why an unrouted request (the base corpus answers,
+		// and no view is materialized at all) held no repository lifetime
+		// whatsoever, and that is the shape most tool calls have.
+		//
+		// Released on handler return, and joined by every worker the handler
+		// leaves running behind it (handoffRequestView below), so the owner
+		// cannot finalize under a detached reader either.
+		scope := s.acquireServingRepositoryScope()
+		ctx = withRequestRepositoryScope(ctx, scope)
+		defer scope.Release()
 		// Which view answers this request: the selector the caller named, the
 		// checkout its cwd sits in, or the base corpus. Resolved before the
 		// overlay so a session's editor buffers layer on top of whatever
@@ -215,15 +232,18 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		if view != nil {
 			ctx = withRequestView(ctx, view)
-			// Tell the deadline firewall what this call is reading. If it
-			// stops waiting for this handler, the handler keeps running and
-			// keeps reading through the view below, so the firewall joins the
-			// lease on the abandoned goroutine's behalf and says so in its
-			// answer instead of leaving a silent pin. Publishing is a no-op
-			// when no firewall frame is above us (an unbounded call).
-			noteRetainedView(ctx, view)
 			defer view.close()
 		}
+		// Tell the deadline firewall what this call is reading and what
+		// repositories it is admitted to. If it stops waiting for this handler
+		// — its deadline fired, or the client hung up — the handler keeps
+		// running and keeps reading through both, so the firewall joins them
+		// on the abandoned goroutine's behalf and says so in its answer
+		// instead of leaving a silent pin. It is published even for an
+		// unrouted call, which has no view but does hold a repository scope.
+		// Publishing is a no-op when no firewall frame is above us (an
+		// unbounded call).
+		noteRetainedRequest(ctx, view, scope)
 		if requireExactView && view != nil && view.rider != nil && !view.rider.Exact {
 			return mcp.NewToolResultError(graphview.NewViewError(graphview.CodeViewBuilding,
 				"the requested exact checkout view is unavailable; retry after publication; no fallback was served").Error()), nil
@@ -409,18 +429,90 @@ var _ sync.Mutex
 // request that materialized no view hands out a nil pin and the call sites
 // stay branch-free.
 type requestViewPin struct {
-	handoff  *graphview.ViewHandoff
+	handoff *graphview.ViewHandoff
+	// base carries the two halves a routed request's base pin holds:
+	// generation zero, and the registered owner that speaks for it. Both used
+	// to die at `defer view.close()` — requestView.close releases the base pin
+	// unconditionally — so a detached worker kept the derived stack pinned and
+	// lost the corpus underneath it.
+	base *graphview.BasePinHandoff
+	// owner is the request's own repository admission, which exists even when
+	// no view was materialized at all.
+	owner    *graphview.RepositoryReadHandoff
 	consumer string
 	once     sync.Once
 }
 
-// handoffRequestView joins consumer to the lease of the view answering ctx.
+// requestRepositoryScopeKey carries the repository admission one `tools/call`
+// holds. Unexported for the same reason the view key is: nothing outside this
+// package may smuggle a lifetime onto an unrelated context.
+type requestRepositoryScopeKey struct{}
+
+// withRequestRepositoryScope publishes the request's repository admission so
+// detached work started inside the handler can join it.
+func withRequestRepositoryScope(ctx context.Context, scope *graphview.RepositoryReadLease) context.Context {
+	if scope == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestRepositoryScopeKey{}, scope)
+}
+
+// requestRepositoryScopeFromContext returns the admission this request holds,
+// nil when it holds none.
+func requestRepositoryScopeFromContext(ctx context.Context) *graphview.RepositoryReadLease {
+	if ctx == nil {
+		return nil
+	}
+	scope, _ := ctx.Value(requestRepositoryScopeKey{}).(*graphview.RepositoryReadLease)
+	return scope
+}
+
+// acquireServingRepositoryScope admits this request to every repository owner
+// it may read, for the request's lifetime.
+//
+// Nil for a server with no view catalog wired (the embedded and test surfaces)
+// and for a process where nothing has registered an owner yet: there is no
+// repository lifetime to hold, which is exactly the state every request was in
+// before this existed. Release and Handoff are nil-safe, so no call site
+// branches on it.
+func (s *Server) acquireServingRepositoryScope() *graphview.RepositoryReadLease {
+	if s == nil || s.materializer == nil || s.materializer.Leases == nil {
+		return nil
+	}
+	return s.materializer.Leases.AcquireServingRepositoryRead()
+}
+
+// payloadRepositories names the repositories whose payload a worker detached
+// from this request keeps reading: the repository the materialized stack
+// belongs to.
+//
+// It is deliberately the stack's repository and not the request's whole
+// admitted scope — see handoffRequest — and it deliberately omits the base
+// corpus's owner, which the base pin carries its own half of and hands off
+// with it (BasePin.Handoff). A view that materialized no stack names nothing,
+// so a detached worker is admitted to nothing rather than to everything.
+func payloadRepositories(view *requestView) []string {
+	if view == nil || view.materialized == nil {
+		return nil
+	}
+	prefix := view.materialized.ID.RepoPrefix
+	if prefix == "" {
+		return nil
+	}
+	return []string{prefix}
+}
+
+// handoffRequestView joins consumer to what the request answering ctx reads:
+// the view's generation stack, the base corpus beneath it, and the repository
+// owners that speak for them.
 //
 // It returns nil in two different situations, which the counters separate:
 //
-//   - there is nothing to pin, because this request materialized no
-//     generation stack (the unrouted base corpus, or a reader-less fallback
-//     view). Nothing is recorded; there is no lifetime to extend.
+//   - there is nothing to pin, because this request materialized no payload
+//     at all — neither a generation stack nor a base pin. That is the
+//     unrouted base-corpus request, the shape most tool calls have: a worker
+//     it leaves behind inherits no payload, so there is no lifetime to
+//     extend and nothing is recorded.
 //   - the view exists but every holder of its lease has already released, so
 //     graphview refuses the join. That is recorded as a refusal, because the
 //     payload underneath may already be gone and the caller is now running
@@ -431,35 +523,69 @@ type requestViewPin struct {
 //
 // A caller must never read a nil pin as a successful handoff.
 func handoffRequestView(ctx context.Context, consumer string) *requestViewPin {
-	return handoffView(requestViewFromContext(ctx), consumer)
+	return handoffRequest(requestViewFromContext(ctx), requestRepositoryScopeFromContext(ctx), consumer)
 }
 
-// handoffView is handoffRequestView for a caller that already holds the view
-// rather than a context carrying it — the deadline firewall, which resolved
-// nothing itself and was handed the view by the middleware it bounds.
-func handoffView(view *requestView, consumer string) *requestViewPin {
-	if view == nil || view.materialized == nil {
+// handoffRequest is handoffRequestView for a caller that already holds what
+// the request read rather than a context carrying it — the deadline firewall,
+// which resolved nothing itself and was handed both by the middleware it
+// bounds.
+//
+// Three holds travel together, because they protect three different ways the
+// payload a worker is reading can disappear underneath it: the derived
+// generation stack (retirement), the base corpus generation (retirement of
+// generation zero), and the repository owner (finalization, then a physical
+// purge of that repository's rows).
+//
+// The owner hold is taken for the repositories this request's payload belongs
+// to (payloadRepositories below), NOT for the whole scope the request itself
+// is admitted to. A serving request cannot know which repositories its handler
+// will read, so it is admitted to all of them — safe for one request lifetime,
+// and NOT safe to hand to work of unbounded duration, which would make one
+// repository's background job block every other repository's drain and the
+// physical purge behind it. A worker names what it reads.
+//
+// "Nothing to pin" and "refused" stay distinct: a request that materialized no
+// payload at all offers nothing and records nothing, while one whose every
+// hold had already been released records a refusal — only reachable from a
+// worker asking after its request ended, which is a wiring bug rather than a
+// routine outcome.
+func handoffRequest(view *requestView, scope *graphview.RepositoryReadLease, consumer string) *requestViewPin {
+	if view == nil || (view.materialized == nil && view.basePin == nil) {
+		// The unrouted base-corpus request: it materialized nothing, so a
+		// worker it leaves behind inherits no payload to keep alive. Its own
+		// repository admission covers it for as long as it is being served
+		// and is deliberately not extended past that.
 		return nil
 	}
-	handoff := view.materialized.Handoff()
-	if handoff == nil {
+	pin := &requestViewPin{consumer: consumer}
+	if view.materialized != nil {
+		pin.handoff = view.materialized.Handoff()
+	}
+	if view.basePin != nil {
+		pin.base = view.basePin.Handoff()
+	}
+	pin.owner = scope.HandoffFor(payloadRepositories(view)...)
+	if pin.handoff == nil && pin.base == nil && pin.owner == nil {
 		viewmetrics.Count(viewmetrics.HandoffTotal, consumer, viewmetrics.HandoffRefused)
 		return nil
 	}
 	viewmetrics.Count(viewmetrics.HandoffTotal, consumer, viewmetrics.HandoffJoined)
 	viewmetrics.AddGauge(viewmetrics.HandoffsOutstanding, 1, consumer)
-	return &requestViewPin{handoff: handoff, consumer: consumer}
+	return pin
 }
 
 // release drops this worker's hold. Idempotent and nil-safe; the generations
 // are unpinned once the request and every other joined consumer have released
 // too.
 func (p *requestViewPin) release() {
-	if p == nil || p.handoff == nil {
+	if p == nil {
 		return
 	}
 	p.once.Do(func() {
 		p.handoff.Close()
+		p.base.Release()
+		p.owner.Release()
 		viewmetrics.AddGauge(viewmetrics.HandoffsOutstanding, -1, p.consumer)
 	})
 }
@@ -467,6 +593,11 @@ func (p *requestViewPin) release() {
 // generations lists the payload generations this pin keeps alive, bottom
 // first. Nil for a pin that was never taken, which is what lets a diagnosis
 // say "nothing is retained" without a second flag.
+//
+// It is the derived stack only, exactly as RepoView.Generations reports it:
+// the base corpus generation the pin may also hold is shared, unretirable and
+// named by nothing, so listing it in an operator-facing "retirement is refused
+// for them" sentence would be noise rather than information.
 func (p *requestViewPin) generations() []int64 {
 	if p == nil {
 		return nil

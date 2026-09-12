@@ -655,3 +655,348 @@ func BenchmarkRepositoryLeaseAcquire(b *testing.B) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W5.4 — the serving request's own repository admission, and the joined
+// consumers that outlive it.
+// ---------------------------------------------------------------------------
+
+// TestServingRepositoryReadAdmitsEveryOpenOwner pins the scope rule: a serving
+// request is admitted to every registered, open owner at once, and to no
+// closing one. Admitting it to a closing owner would cross a boundary no new
+// reader may cross; refusing the whole acquisition because of that owner —
+// which is what the broad path does — would instead make an unrelated
+// repository's untrack deny service to every request in the process.
+func TestServingRepositoryReadAdmitsEveryOpenOwner(t *testing.T) {
+	var m LeaseManager
+	if lease := m.AcquireServingRepositoryRead(); lease != nil {
+		t.Fatal("a manager with no registered owner admitted a serving request to something")
+	}
+	open, closing := repositoryLeaseTestOwner("open"), repositoryLeaseTestOwner("closing")
+	registerRepositoryTestOwner(t, &m, open)
+	registerRepositoryTestOwner(t, &m, closing)
+	drain := closeRepositoryTestOwner(t, &m, closing)
+	assertRepositoryDrain(t, drain.Done(), true)
+
+	lease := m.AcquireServingRepositoryRead()
+	if lease == nil {
+		t.Fatal("a request found no open owner to be admitted to")
+	}
+	if got := lease.Owners(); !reflect.DeepEqual(got, []RepositoryOwner{open}) {
+		t.Fatalf("serving scope = %v, want exactly the open owner %v", got, open)
+	}
+	if lease.broad {
+		t.Fatal("the serving scope is broad; one request would then block every owner's drain")
+	}
+	// The open owner's own drain now waits for the request, and only for it.
+	openDrain := closeRepositoryTestOwner(t, &m, open)
+	assertRepositoryDrain(t, openDrain.Done(), false)
+	lease.Release()
+	assertRepositoryDrain(t, openDrain.Done(), true)
+}
+
+// TestServingRepositoryReadNeverRefusesAServingRequest: once admissions are
+// stopped there is nothing to admit to, and the answer is "no lifetime held",
+// never an error the request surface would have to turn into a refusal.
+func TestServingRepositoryReadNeverRefusesAServingRequest(t *testing.T) {
+	var m LeaseManager
+	owner := repositoryLeaseTestOwner("stopped")
+	registerRepositoryTestOwner(t, &m, owner)
+	<-m.ShutdownRepositoryAdmissions()
+	if lease := m.AcquireServingRepositoryRead(); lease != nil {
+		t.Fatal("a stopped manager still admitted a serving request")
+	}
+	// Nil-safe on every method, so no call site branches on the result.
+	var none *RepositoryReadLease
+	none.Release()
+	if none.Handoff() != nil || none.Owners() != nil || none.Holders() != 0 {
+		t.Fatal("a nil serving scope is not nil-safe")
+	}
+}
+
+// TestRepositoryReadHandoffOutlivesTheAcquirer is the lifetime half: work the
+// request leaves running keeps the repository un-finalizable until it actually
+// finishes, exactly as a joined generation lease keeps payload unretirable.
+func TestRepositoryReadHandoffOutlivesTheAcquirer(t *testing.T) {
+	var m LeaseManager
+	owner := repositoryLeaseTestOwner("joined")
+	registerRepositoryTestOwner(t, &m, owner)
+	lease := acquireRepositoryTestLease(t, &m, owner)
+	joined := lease.Handoff()
+	if joined == nil {
+		t.Fatal("a live lease refused a joined consumer")
+	}
+	if got := lease.Holders(); got != 2 {
+		t.Fatalf("holders after one handoff = %d, want 2", got)
+	}
+	if got := joined.Owners(); !reflect.DeepEqual(got, []RepositoryOwner{owner}) {
+		t.Fatalf("joined scope = %v, want %v", got, []RepositoryOwner{owner})
+	}
+	drain := closeRepositoryTestOwner(t, &m, owner)
+	assertRepositoryDrain(t, drain.Done(), false)
+
+	// The request returns; only the detached worker's hold is left.
+	lease.Release()
+	lease.Release()
+	assertRepositoryDrain(t, drain.Done(), false)
+	if got := lease.Holders(); got != 1 {
+		t.Fatalf("holders after the acquirer released = %d, want 1", got)
+	}
+
+	joined.Release()
+	assertRepositoryDrain(t, drain.Done(), true)
+	joined.Release()
+	if got := m.repositories.readers; got != 0 {
+		t.Fatalf("readers after every holder released = %d, want 0", got)
+	}
+	if lease.Handoff() != nil {
+		t.Fatal("a fully released lease handed out a pin that pins nothing")
+	}
+}
+
+// TestBasePinHandoffCarriesBothHalves is the defect this closes on the read
+// path: a request's base pin holds generation zero AND the owner that speaks
+// for it, and both used to die when the request returned even though the work
+// that borrowed the view was still running.
+func TestBasePinHandoffCarriesBothHalves(t *testing.T) {
+	var m LeaseManager
+	owner := repositoryLeaseTestOwner("base")
+	registerRepositoryTestOwner(t, &m, owner)
+	pin := m.AcquireBaseCorpus(owner.RepoPrefix)
+	if !pin.OwnerPinned() {
+		t.Fatal("the base pin took no owner half to hand off")
+	}
+	joined := pin.Handoff()
+	if joined == nil || !joined.OwnerPinned() {
+		t.Fatal("the handoff dropped the owner half")
+	}
+	if got := joined.Generations(); !reflect.DeepEqual(got, []int64{BaseCorpusGeneration}) {
+		t.Fatalf("joined generations = %v, want [%d]", got, BaseCorpusGeneration)
+	}
+	drain := closeRepositoryTestOwner(t, &m, owner)
+	assertRepositoryDrain(t, drain.Done(), false)
+
+	// The request ends. The detached worker still reads the corpus, so neither
+	// half may be released yet.
+	pin.Release()
+	if !m.InUse(BaseCorpusGeneration) {
+		t.Fatal("generation zero was released under a detached worker")
+	}
+	assertRepositoryDrain(t, drain.Done(), false)
+
+	joined.Release()
+	joined.Release()
+	if m.InUse(BaseCorpusGeneration) {
+		t.Fatal("generation zero stayed pinned after the last holder released")
+	}
+	assertRepositoryDrain(t, drain.Done(), true)
+}
+
+// TestBasePinHandoffIsRefusedOnceTheRequestEnded: a worker that asks after its
+// request is over gets nil — never a handle over a corpus whose owner may
+// already have finalized.
+func TestBasePinHandoffIsRefusedOnceTheRequestEnded(t *testing.T) {
+	var m LeaseManager
+	owner := repositoryLeaseTestOwner("late")
+	registerRepositoryTestOwner(t, &m, owner)
+	pin := m.AcquireBaseCorpus(owner.RepoPrefix)
+	pin.Release()
+	if pin.Handoff() != nil {
+		t.Fatal("a released base pin handed out a joined consumer")
+	}
+	var absent *BasePin
+	if absent.Handoff() != nil {
+		t.Fatal("a nil base pin handed out a joined consumer")
+	}
+	// An unregistered prefix holds the generation half only, and joining it is
+	// a no-op on the owner half rather than a refusal.
+	unowned := m.AcquireBaseCorpus("nobody")
+	joined := unowned.Handoff()
+	if joined == nil {
+		t.Fatal("an owner-less base pin refused a joined consumer")
+	}
+	if joined.OwnerPinned() {
+		t.Fatal("an owner-less base pin invented an owner half")
+	}
+	unowned.Release()
+	if !m.InUse(BaseCorpusGeneration) {
+		t.Fatal("the joined consumer lost the generation half")
+	}
+	joined.Release()
+	if m.InUse(BaseCorpusGeneration) {
+		t.Fatal("generation zero stayed pinned after every holder released")
+	}
+}
+
+// TestServingRepositoryReadConcurrentHandoffAndClose is the race-detector arm:
+// admission, handoff, release and closure all touch the same owner state, and
+// the drain must fire exactly once, after the last holder.
+func TestServingRepositoryReadConcurrentHandoffAndClose(t *testing.T) {
+	var m LeaseManager
+	owner := repositoryLeaseTestOwner("racing")
+	registerRepositoryTestOwner(t, &m, owner)
+
+	// One deterministic in-flight request with a detached worker, so the close
+	// below is guaranteed to have something to wait for however the racing
+	// goroutines are scheduled.
+	held := m.AcquireServingRepositoryRead()
+	if held == nil {
+		t.Fatal("the first request was admitted to nothing")
+	}
+	detached := held.Handoff()
+	if detached == nil {
+		t.Fatal("a live serving scope refused a joined consumer")
+	}
+
+	const readers = 32
+	var wg sync.WaitGroup
+	var joins atomic.Int64
+	start := make(chan struct{})
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			lease := m.AcquireServingRepositoryRead()
+			if lease == nil {
+				return
+			}
+			joined := lease.Handoff()
+			lease.Release()
+			if joined != nil {
+				joins.Add(1)
+				joined.Release()
+			}
+		}()
+	}
+	close(start)
+	drain := closeRepositoryTestOwner(t, &m, owner)
+	wg.Wait()
+	assertRepositoryDrain(t, drain.Done(), false)
+	held.Release()
+	assertRepositoryDrain(t, drain.Done(), false)
+	detached.Release()
+	<-drain.Done()
+	if joins.Load() == 0 {
+		t.Log("no racing request won admission before the close; the deterministic arm still ran")
+	}
+	if m.repositories.readers != 0 || m.repositories.broadReaders != 0 {
+		t.Fatalf("leaked pins: readers=%d broad=%d", m.repositories.readers, m.repositories.broadReaders)
+	}
+}
+
+// TestServingRepositoryHandoffForNarrowsToTheNamedRepositories is the bound on
+// what a detached worker may block.
+//
+// A serving request is admitted to every open owner because it cannot know
+// which one its handler will read. Handing THAT scope to work of unbounded
+// duration would make one repository's background job block every other
+// repository's drain — and the physical payload purge behind an untrack — for
+// as long as it ran. A worker names what it reads, so it is joined to exactly
+// those owners and its handle's lifetime is independent of the acquirer's.
+func TestServingRepositoryHandoffForNarrowsToTheNamedRepositories(t *testing.T) {
+	var m LeaseManager
+	read, unread := repositoryLeaseTestOwner("read"), repositoryLeaseTestOwner("unread")
+	registerRepositoryTestOwner(t, &m, read)
+	registerRepositoryTestOwner(t, &m, unread)
+
+	lease := m.AcquireServingRepositoryRead()
+	if got := len(lease.Owners()); got != 2 {
+		t.Fatalf("the request itself is admitted to %d owners, want both", got)
+	}
+	worker := lease.HandoffFor(read.RepoPrefix)
+	if worker == nil {
+		t.Fatal("a live serving scope refused a narrowed handoff for a repository it holds")
+	}
+	if got := worker.Owners(); !reflect.DeepEqual(got, []RepositoryOwner{read}) {
+		t.Fatalf("narrowed handoff scope = %v, want exactly %v", got, read)
+	}
+	// The request ends; only the worker's named hold is left.
+	lease.Release()
+	unreadDrain := closeRepositoryTestOwner(t, &m, unread)
+	assertRepositoryDrain(t, unreadDrain.Done(), true)
+	readDrain := closeRepositoryTestOwner(t, &m, read)
+	assertRepositoryDrain(t, readDrain.Done(), false)
+
+	worker.Release()
+	worker.Release()
+	assertRepositoryDrain(t, readDrain.Done(), true)
+	if m.repositories.readers != 0 || m.repositories.broadReaders != 0 {
+		t.Fatalf("leaked pins: readers=%d broad=%d", m.repositories.readers, m.repositories.broadReaders)
+	}
+}
+
+// TestServingRepositoryHandoffForRefusesWhatItDoesNotHold: the narrowing is a
+// filter over the admitted scope, never a widening of it. A caller naming a
+// repository the acquisition skipped — a closing one, or one registered after
+// the request started — is admitted to nothing rather than to a boundary no
+// new reader may cross.
+func TestServingRepositoryHandoffForRefusesWhatItDoesNotHold(t *testing.T) {
+	var m LeaseManager
+	held, closing := repositoryLeaseTestOwner("held"), repositoryLeaseTestOwner("skipped")
+	registerRepositoryTestOwner(t, &m, held)
+	registerRepositoryTestOwner(t, &m, closing)
+	drain := closeRepositoryTestOwner(t, &m, closing)
+	assertRepositoryDrain(t, drain.Done(), true)
+
+	lease := m.AcquireServingRepositoryRead()
+	if lease.HandoffFor(closing.RepoPrefix) != nil {
+		t.Fatal("a worker widened its scope to a repository its request was never admitted to")
+	}
+	if lease.HandoffFor() != nil || lease.HandoffFor("") != nil {
+		t.Fatal("a worker that names no repository was admitted to something")
+	}
+	// Nil-safe and refused once every holder has released, exactly as the
+	// unnarrowed Handoff is.
+	var none *RepositoryReadLease
+	if none.HandoffFor(held.RepoPrefix) != nil {
+		t.Fatal("a nil serving scope handed out a narrowed consumer")
+	}
+	lease.Release()
+	if lease.HandoffFor(held.RepoPrefix) != nil {
+		t.Fatal("a released serving scope handed out a narrowed consumer")
+	}
+}
+
+// TestBasePinHandoffIsNeverPartial: a handoff that races the request's own
+// release either carries BOTH halves or is refused. Joining the generation
+// half first and the owner half second used to allow a third outcome — a
+// non-nil handle whose owner half came back nil — which presents as a
+// successful handoff while silently having lost the lifetime that keeps the
+// payload from being purged. The race is reachable in production: the deadline
+// firewall retains on its own goroutine while the handler goroutine may
+// already be running `defer view.close()`.
+func TestBasePinHandoffIsNeverPartial(t *testing.T) {
+	for range 20000 {
+		var m LeaseManager
+		owner := repositoryLeaseTestOwner("partial")
+		registerRepositoryTestOwner(t, &m, owner)
+		pin := m.AcquireBaseCorpus(owner.RepoPrefix)
+		if !pin.OwnerPinned() {
+			t.Fatal("the base pin took no owner half")
+		}
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		var joined *BasePinHandoff
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			joined = pin.Handoff()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			pin.Release()
+		}()
+		close(start)
+		wg.Wait()
+		if joined != nil && !joined.OwnerPinned() {
+			t.Fatal("a handoff presented as successful lost its owner half to a concurrent release")
+		}
+		joined.Release()
+		if m.InUse(BaseCorpusGeneration) {
+			t.Fatal("generation zero stayed pinned after every holder released")
+		}
+	}
+}
