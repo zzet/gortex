@@ -9,6 +9,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // W5.3. The materializer leases the derived generations of a routed stack, and
@@ -113,17 +114,40 @@ func TestBaseCorpusOwnerCleanupWaitsForTheRequest(t *testing.T) {
 // world, and the rider must stop claiming the route was served exactly.
 func TestBaseCorpusMutationMidRequestIsLabelledOnTheRider(t *testing.T) {
 	stack := newViewStack(t)
-	reg, err := stack.leases.RegisterRawRepositoryOwnerPrepared(graphview.RawRepositoryOwner{
-		RepoPrefix:   "repo",
-		RootIdentity: stack.repoRoot,
-		Incarnation:  "inc-raw",
-	}, nil)
-	if err != nil {
-		t.Fatalf("RegisterRawRepositoryOwnerPrepared: %v", err)
+	// The owner is registered the way production registers it: the lifecycle
+	// publishes exactly one DEDICATED owner per tracked repository prefix
+	// (bindDedicatedGraph -> CheckoutLifecycle.RegisterRepositoryOwner), and
+	// nothing in the tree registers a raw repository owner. Driving this test
+	// from a raw registration proved the primitive but not the route a daemon
+	// takes.
+	if err := stack.leases.RegisterRepositoryOwner(viewTestOwner()); err != nil {
+		t.Fatalf("RegisterRepositoryOwner: %v", err)
 	}
-	if _, err := stack.leases.CaptureInitialRawRepositorySource(context.Background(), reg, "source-a"); err != nil {
-		t.Fatalf("CaptureInitialRawRepositorySource: %v", err)
+	// The mutation is admitted through the real output-generation authority,
+	// the one door every generation-zero write in the daemon passes through,
+	// rather than by taking graphview's source gate by hand.
+	authority := indexer.NewOutputGenerationAuthority(stack.leases)
+	mutateBaseCorpus := func(t *testing.T) {
+		t.Helper()
+		receipt, err := authority.Begin(context.Background(), indexer.OutputEntryWatcherDirScan,
+			indexer.OutputMutationTarget{
+				Kind:       indexer.OutputGenerationLegacy,
+				OwnerKey:   "root:" + stack.repoRoot,
+				RepoPrefix: "repo",
+				RootPath:   stack.repoRoot,
+			})
+		if err != nil {
+			t.Fatalf("admit a generation-zero mutation: %v", err)
+		}
+		if !receipt.Witnessed() {
+			t.Fatal("the authority took no source witness for a registered repository owner")
+		}
+		if err := receipt.Complete(); err != nil {
+			t.Fatalf("fulfil the mutation: %v", err)
+		}
 	}
+	// One mutation establishes the witness the control arm compares against.
+	mutateBaseCorpus(t)
 
 	// Control arm: the same routed request with nothing moving underneath it
 	// still reports an exact view, so the downgrade below is the mutation's
@@ -147,15 +171,7 @@ func TestBaseCorpusMutationMidRequestIsLabelledOnTheRider(t *testing.T) {
 			// The base corpus is re-derived under the reader. The request keeps
 			// answering from what it already composed — that is what makes the
 			// label, rather than a refusal, the honest outcome.
-			write, mutErr := stack.leases.AcquireRawRepositoryMutation(context.Background(), reg)
-			if mutErr != nil {
-				t.Errorf("AcquireRawRepositoryMutation: %v", mutErr)
-				return mcplib.NewToolResultText(`{"ok":true}`), nil
-			}
-			if err := write.Complete("source-b"); err != nil {
-				t.Errorf("Complete: %v", err)
-			}
-			write.Release()
+			mutateBaseCorpus(t)
 			return mcplib.NewToolResultText(`{"ok":true}`), nil
 		})
 	if err != nil {

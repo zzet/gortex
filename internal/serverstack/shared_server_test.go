@@ -140,6 +140,16 @@ func TestSharedServerInstallsOneOutputGenerationAuthorityOnBothLanes(t *testing.
 		if authority.ViewLeases() != stack.CheckoutLifecycle.ViewLeases() {
 			t.Fatal("the authority was installed with a lease manager the lifecycle does not share")
 		}
+		// The same manager must also be the materializer's: a routed request's
+		// BasePin is taken from Materializer.Leases, so a generation-zero
+		// mutation witnessed through any other manager is invisible to the
+		// request that has to hear about it, and the source half of the
+		// authority is silently inert again.
+		if stack.MCP != nil && stack.MCP.Materializer() != nil {
+			if stack.MCP.Materializer().Leases != authority.ViewLeases() {
+				t.Fatal("a routed request's base pin is taken from a lease manager the authority does not witness through")
+			}
+		}
 	}
 
 	// Teardown stops admission.

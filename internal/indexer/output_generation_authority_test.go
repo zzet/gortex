@@ -11,9 +11,12 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -21,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/persistence"
 )
 
 // ---------------------------------------------------------------------------
@@ -38,27 +42,41 @@ import (
 // unconditionally by the lane worker (drain -> outputGeneration, bound for both
 // lane flavours), which TestEveryMutationLaneIsBoundToTheAuthority pins.
 var mutationDoorNames = map[string]bool{
-	"coordinateRepositoryMutation": true,
-	"withOutputGeneration":         true,
-	"withRepositoryMutationLanes":  true,
-	"runExclusive":                 true,
-	"runExclusiveLaneOnly":         true,
-	"runExclusiveMode":             true,
+	"coordinateRepositoryMutation":         true,
+	"withOutputGeneration":                 true,
+	"withOutputGenerationSource":           true,
+	"withRepositoryOutputGenerationSource": true,
+	"withRepositoryMutationLanes":          true,
+	"runExclusive":                         true,
+	"runExclusiveLaneOnly":                 true,
+	"runExclusiveMode":                     true,
 }
 
-// authorityPlumbingFunctions are the functions inside the authority's own file
-// that DEFINE the doors rather than walk through one. Each either takes the
-// entry as a parameter or is the lane machinery the wrappers are bound to. The
-// exemption is keyed on that file only: a plumbing-shaped name anywhere else is
-// still scanned.
-var authorityPlumbingFunctions = map[string]bool{
-	"coordinateRepositoryMutation": true, // entry is a parameter
-	"coordinateRepositoryReindex":  true, // the lane worker holds the receipt
-	"withRepositoryMutationLanes":  true, // lane acquisition; callers name entries
-	"runExclusive":                 true,
-	"runExclusiveLaneOnly":         true,
-	"runExclusiveMode":             true,
-	"withOutputGeneration":         true, // entry is a parameter
+// authorityPlumbingDoorCount exempts the functions inside the authority's own
+// file that DEFINE the doors rather than walk through one — each either takes
+// the entry as a parameter or is the lane machinery the wrappers are bound to
+// — and pins HOW MANY doors each of them contains.
+//
+// The count is the point. An exemption keyed on the function alone is the same
+// per-function blind spot the per-door scan exists to remove, one file further
+// in: a second receipt-less arm added inside one of these functions ("batch
+// mode takes the lane only", which is exactly the shape that produced the
+// topology-batch door) would inherit the exemption and never be seen. With the
+// count pinned, any new door inside a plumbing function fails here until it is
+// examined and the number is moved deliberately.
+//
+// The exemption is keyed on that file only: a plumbing-shaped name anywhere
+// else is still scanned door by door.
+var authorityPlumbingDoorCount = map[string]int{
+	"coordinateRepositoryMutation":         2, // entry is a parameter: runExclusive + withOutputGeneration
+	"coordinateRepositoryReindex":          0, // the lane worker holds the receipt
+	"withRepositoryMutationLanes":          1, // lane acquisition; callers name entries
+	"runExclusive":                         1,
+	"runExclusiveLaneOnly":                 1,
+	"runExclusiveMode":                     0,
+	"withOutputGeneration":                 1, // entry is a parameter
+	"withOutputGenerationSource":           0, // entry is a parameter
+	"withRepositoryOutputGenerationSource": 0, // entry is a parameter
 }
 
 const authorityPlumbingFile = "repository_mutation_coordinator.go"
@@ -161,6 +179,69 @@ func scanMutationDoorsIn(t *testing.T, dir string) []mutationDoor {
 	return doors
 }
 
+// plumbingExemptionMismatches reports every exempt plumbing function whose door
+// count no longer matches the pinned number. It is a pure function of the
+// scanned doors so the guard itself can be tested against synthetic input
+// (TestPlumbingExemptionCatchesAnAddedDoor) rather than only against source
+// that happens to be correct today.
+func plumbingExemptionMismatches(doors []mutationDoor, expected map[string]int) []string {
+	counted := map[string]int{}
+	for _, door := range doors {
+		if door.file != authorityPlumbingFile {
+			continue
+		}
+		if _, exempt := expected[door.fn]; exempt {
+			counted[door.fn]++
+		}
+	}
+	names := make([]string, 0, len(expected))
+	for fn := range expected {
+		names = append(names, fn)
+	}
+	sort.Strings(names)
+	var mismatches []string
+	for _, fn := range names {
+		if got := counted[fn]; got != expected[fn] {
+			mismatches = append(mismatches, fmt.Sprintf(
+				"%s: %s contains %d mutation doors, the exemption covers %d; a door added inside a plumbing function must name its own entry, not inherit the exemption",
+				authorityPlumbingFile, fn, got, expected[fn]))
+		}
+	}
+	return mismatches
+}
+
+// TestPlumbingExemptionCatchesAnAddedDoor tests that guard.
+//
+// The exemption used to be keyed on the FUNCTION, which is the same
+// per-function blind spot the per-door scan exists to remove, one file further
+// in: a second receipt-less arm added inside one of the authority's own
+// plumbing functions ("batch mode takes the lane only" — exactly the shape that
+// produced the topology-batch door) would inherit the exemption and never be
+// seen. Pinning the count is what makes that visible.
+func TestPlumbingExemptionCatchesAnAddedDoor(t *testing.T) {
+	expected := map[string]int{"coordinateRepositoryMutation": 2}
+	pristine := []mutationDoor{
+		{file: authorityPlumbingFile, fn: "coordinateRepositoryMutation", door: "runExclusive"},
+		{file: authorityPlumbingFile, fn: "coordinateRepositoryMutation", door: "withOutputGeneration"},
+	}
+	if got := plumbingExemptionMismatches(pristine, expected); len(got) != 0 {
+		t.Fatalf("a plumbing function at its pinned door count must not be reported: %v", got)
+	}
+
+	added := append(append([]mutationDoor(nil), pristine...), mutationDoor{
+		file: authorityPlumbingFile, fn: "coordinateRepositoryMutation", door: "runExclusiveLaneOnly",
+	})
+	got := plumbingExemptionMismatches(added, expected)
+	if len(got) != 1 || !strings.Contains(got[0], "contains 3 mutation doors") {
+		t.Fatalf("an added door inside a plumbing function was not reported: %v", got)
+	}
+
+	removed := plumbingExemptionMismatches(pristine[:1], expected)
+	if len(removed) != 1 {
+		t.Fatalf("a removed door must move the pin deliberately too: %v", removed)
+	}
+}
+
 // TestEveryProductionMutationEntryPointIsRegistered reads the package's own
 // production source and fails when ANY ONE mutation door reaches generation
 // zero without naming a registered output-generation entry point.
@@ -177,10 +258,20 @@ func TestEveryProductionMutationEntryPointIsRegistered(t *testing.T) {
 	}
 
 	doors := scanProductionMutationDoors(t)
+	// Every door inside an exempt plumbing function is counted first, so the
+	// exemption can be applied PER DOOR against a pinned number rather than
+	// per function: an added arm inside one of them is reported here instead of
+	// inheriting the exemption.
+	for _, mismatch := range plumbingExemptionMismatches(doors, authorityPlumbingDoorCount) {
+		t.Error(mismatch)
+	}
+
 	checked := 0
 	for _, door := range doors {
-		if door.file == authorityPlumbingFile && authorityPlumbingFunctions[door.fn] {
-			continue
+		if door.file == authorityPlumbingFile {
+			if _, exempt := authorityPlumbingDoorCount[door.fn]; exempt {
+				continue
+			}
 		}
 		checked++
 		if len(door.entries) == 0 {
@@ -212,7 +303,8 @@ func TestEveryProductionMutationEntryPointIsRegistered(t *testing.T) {
 		{file: "multi.go", fn: "incrementalDiscoverRepo", door: "runExclusive", entries: []string{"OutputEntryIncrementalDiscoverRepo"}},
 		{file: "repository_topology_batch.go", fn: "coordinateRepositoryTopologyMutation", door: "runExclusiveLaneOnly", entries: []string{"OutputEntryRepositoryTopology"}},
 		{file: "repository_topology_batch.go", fn: "coordinateRepositoryTopologyMutation", door: "coordinateRepositoryMutation", entries: []string{"OutputEntryRepositoryTopology"}},
-		{file: authorityPlumbingFile, fn: "bindMutationLaneAuthority", door: "withOutputGeneration", entries: []string{"OutputEntryRepositoryReconcileLane"}},
+		{file: authorityPlumbingFile, fn: "bindMutationLaneAuthority", door: "withOutputGenerationSource", entries: []string{"OutputEntryRepositoryReconcileLane"}},
+		{file: authorityPlumbingFile, fn: "repositoryMutationCoordinator", door: "withRepositoryOutputGenerationSource", entries: []string{"OutputEntryRepositoryReconcileLane"}},
 	}
 	for _, want := range required {
 		found := false
@@ -554,12 +646,13 @@ func TestCoalescedLaneRefusalKeepsTheResultItProduced(t *testing.T) {
 	// The lane wrapper runs the executor and then refuses fulfilment — exactly
 	// what a supersession during the payload does.
 	outcome := executeRepositoryMutationUnderAuthority(
-		func(fn func() error) error {
-			if err := fn(); err != nil {
+		func(fn func(observe func(*OutputSourceContent)) error) error {
+			if err := fn(func(*OutputSourceContent) {}); err != nil {
 				return err
 			}
 			return refusal
 		},
+		true,
 		func(paths []string) (*IndexResult, error) { return produced, nil },
 		[]string{"a.go"},
 	)
@@ -574,7 +667,8 @@ func TestCoalescedLaneRefusalKeepsTheResultItProduced(t *testing.T) {
 	// lose and must report none.
 	executed := false
 	outcome = executeRepositoryMutationUnderAuthority(
-		func(fn func() error) error { return refusal },
+		func(fn func(observe func(*OutputSourceContent)) error) error { return refusal },
+		true,
 		func(paths []string) (*IndexResult, error) { executed = true; return produced, nil },
 		[]string{"a.go"},
 	)
@@ -583,6 +677,65 @@ func TestCoalescedLaneRefusalKeepsTheResultItProduced(t *testing.T) {
 	}
 	if outcome.result != nil || !errors.Is(outcome.err, ErrOutputMutationReceiptSuperseded) {
 		t.Fatalf("preventive refusal outcome = %+v, want no result and the refusal", outcome)
+	}
+}
+
+// TestUnboundProductionLaneFailsClosed pins the fail-closed half of "every
+// mutation names one output generation".
+//
+// A coalescing lane nobody bound to the authority used to fall through to the
+// unfenced executor: it wrote generation zero with no receipt, no named owner,
+// and no error. A lane a PRODUCTION factory minted must refuse instead. A lane
+// a fixture hand-built keeps the unfenced path, because it never claimed to
+// name an output generation in the first place.
+func TestUnboundProductionLaneFailsClosed(t *testing.T) {
+	produced := &IndexResult{FileCount: 3}
+	executed := false
+	executor := func([]string) (*IndexResult, error) { executed = true; return produced, nil }
+
+	outcome := executeRepositoryMutationUnderAuthority(nil, true, executor, []string{"a.go"})
+	if !errors.Is(outcome.err, ErrOutputMutationLaneUnbound) {
+		t.Fatalf("unbound production lane: got %v, want ErrOutputMutationLaneUnbound", outcome.err)
+	}
+	if executed {
+		t.Fatal("an unbound production lane wrote generation zero with no receipt")
+	}
+
+	outcome = executeRepositoryMutationUnderAuthority(nil, false, executor, []string{"a.go"})
+	if outcome.err != nil || outcome.result != produced || !executed {
+		t.Fatalf("a fixture lane must keep running unfenced: %+v", outcome)
+	}
+}
+
+// TestProductionLanesAreBornBoundToTheAuthority proves the fail-closed refusal
+// above can never fire in production: both factories that mint a stable lane
+// bind it and mark it authority-required, so a reconcile can reach neither an
+// unbound lane nor the refusal.
+func TestProductionLanesAreBornBoundToTheAuthority(t *testing.T) {
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), nil, newTestConfigManager(t), zap.NewNop())
+	t.Cleanup(func() { _ = mi.Close(context.Background()) })
+
+	// The MultiIndexer factory: a lane minted before any Indexer attaches.
+	lane := mi.repositoryMutationCoordinator("lane-repo")
+	lane.mu.Lock()
+	bound, required := lane.outputGeneration != nil, lane.authorityRequired
+	lane.mu.Unlock()
+	if !bound {
+		t.Fatal("a lane minted by MultiIndexer.repositoryMutationCoordinator is not bound to the authority")
+	}
+	if !required {
+		t.Fatal("a production lane must require the authority, so losing the binding fails closed")
+	}
+
+	// The orphan factory: a standalone Indexer's own lane.
+	standalone := New(graph.New(), newTestRegistry(), config.IndexConfig{}, zap.NewNop())
+	t.Cleanup(standalone.Close)
+	orphan := standalone.repositoryMutations()
+	orphan.mu.Lock()
+	bound, required = orphan.outputGeneration != nil, orphan.authorityRequired
+	orphan.mu.Unlock()
+	if !bound || !required {
+		t.Fatalf("the orphan lane is bound=%v required=%v, want both", bound, required)
 	}
 }
 
@@ -940,8 +1093,16 @@ func TestRepositoryCleanupLeavesPersistenceSidecarsAlone(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
+	// The primary name is the production one, read from the package that owns
+	// it rather than spelled out here: a rename of the sidecar would otherwise
+	// leave this test guarding a file nothing writes.
+	productionSidecar := filepath.Base(persistence.DefaultSidecarPath(dataDir))
+	if filepath.Dir(persistence.DefaultSidecarPath(dataDir)) != dataDir {
+		t.Fatalf("the production sidecar no longer lives beside the graph store: %q",
+			persistence.DefaultSidecarPath(dataDir))
+	}
 	sidecars := map[string][]byte{
-		"sidecar.sqlite":   []byte("notes + memories + notebooks payload that no generation owns"),
+		productionSidecar:  []byte("notes + memories + notebooks payload that no generation owns"),
 		"memories.sqlite":  []byte("memories payload that no generation owns"),
 		"notebooks.sqlite": []byte("notebook payload that no generation owns"),
 		"scopes.sqlite":    []byte("scope payload that no generation owns"),
@@ -1070,4 +1231,466 @@ func fileDigest(t *testing.T, path string) string {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// ---------------------------------------------------------------------------
+// 6. The SOURCE half, wired: a legacy mutation of a repository a daemon
+//    actually tracks moves that repository's source witness.
+// ---------------------------------------------------------------------------
+
+// TestTrackedRepositoryMutationMovesTheBaseWitnessThroughIndexAll is the
+// production trace the earlier round did not have.
+//
+// The lifecycle registers exactly ONE owner per tracked repository prefix, and
+// it is a DEDICATED owner (bindDedicatedGraph -> RegisterRepositoryOwner ->
+// LeaseManager.RegisterRepositoryOwnerPrepared). Nothing in the tree registers
+// a RAW repository owner, so a witness addressed by raw registration handle
+// could never be found in a real daemon: Stats().Witnessed stayed 0 and every
+// BasePin answered "unwitnessed" no matter how many generation-zero mutations
+// ran. Here the owner is registered the way production registers it, a routed
+// request pins the corpus, MultiIndexer.IndexAll runs, and the pin reports the
+// change.
+func TestTrackedRepositoryMutationMovesTheBaseWitnessThroughIndexAll(t *testing.T) {
+	root := setupRepoDir(t, "witness-repo")
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: root, Name: "witness-repo"}}}
+	gc.SetConfigPath(tmpCfg)
+	if err := gc.Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	cm, err := config.NewConfigManager(tmpCfg)
+	if err != nil {
+		t.Fatalf("config manager: %v", err)
+	}
+
+	leases := graphview.NewLeaseManager()
+	// Exactly what CheckoutLifecycle.RegisterRepositoryOwner publishes.
+	if err := leases.RegisterRepositoryOwner(graphview.RepositoryOwner{
+		GraphID:     "graph-witness-repo",
+		CheckoutID:  "checkout-witness-repo",
+		Incarnation: "inc-1",
+		RepoPrefix:  "witness-repo",
+	}); err != nil {
+		t.Fatalf("RegisterRepositoryOwner: %v", err)
+	}
+
+	authority := NewOutputGenerationAuthority(leases)
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), nil, cm, zap.NewNop())
+	t.Cleanup(func() { _ = mi.Close(context.Background()) })
+	mi.SetOutputGenerationAuthority(authority)
+
+	pin := leases.AcquireBaseCorpus("witness-repo")
+	defer pin.Release()
+	if !pin.OwnerPinned() {
+		t.Fatal("the registered repository owner was not pinned by the base pin")
+	}
+
+	if _, err := mi.IndexAll(); err != nil {
+		t.Fatalf("IndexAll: %v", err)
+	}
+
+	if got := authority.Stats().Witnessed; got == 0 {
+		t.Fatal("a cold index of a tracked repository did not move its source witness; the SOURCE half is unwired")
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, graphview.ErrBaseCorpusChanged) {
+		t.Fatalf("base pin after a tracked-repository mutation: got %v, want ErrBaseCorpusChanged", err)
+	}
+
+	// A pin taken after the mutation sees a stable corpus again: the label
+	// reports movement, not permanent suspicion.
+	fresh := leases.AcquireBaseCorpus("witness-repo")
+	defer fresh.Release()
+	if !fresh.Witnessed() {
+		t.Fatal("the mutation left no witness for the next request to compare against")
+	}
+	if err := fresh.ValidateCurrent(); err != nil {
+		t.Fatalf("a pin taken after the mutation must validate clean: %v", err)
+	}
+}
+
+// TestUnregisteredRepositoryStaysUnwitnessed is the other direction: the new
+// prefix-keyed door must not manufacture a witness for a repository no owner
+// is registered for, and must not refuse the mutation either.
+func TestUnregisteredRepositoryStaysUnwitnessed(t *testing.T) {
+	leases := graphview.NewLeaseManager()
+	idx, authority, root := newAuthorityTestIndexer(t, leases)
+	file := filepath.Join(root, "unregistered.go")
+	if err := os.WriteFile(file, []byte("package main\n\nfunc Unregistered() {}\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := idx.IndexFile(file); err != nil {
+		t.Fatalf("IndexFile: %v", err)
+	}
+	if got := authority.Stats().Witnessed; got != 0 {
+		t.Fatalf("no owner is registered; the authority must take no witness: witnessed=%d", got)
+	}
+}
+
+// TestWitnessedNoOpDoesNotReportTheCorpusMoved is the content-fingerprint
+// claim.
+//
+// The source gate allocates a revision at ADMISSION, before anybody can know
+// whether the payload will move a byte. A fingerprint derived from that
+// revision therefore moves for every admitted mutation, so once the witness is
+// wired every watcher tick over an unchanged repository would tell every live
+// request its base corpus changed. The fingerprint is derived from CONTENT —
+// the mutated path set and those paths' on-disk identities — so a pass that
+// wrote nothing restores the observation readers already hold.
+func TestWitnessedNoOpDoesNotReportTheCorpusMoved(t *testing.T) {
+	leases := graphview.NewLeaseManager()
+	if err := leases.RegisterRepositoryOwner(graphview.RepositoryOwner{
+		GraphID: "graph-noop", CheckoutID: "checkout-noop", Incarnation: "inc-1", RepoPrefix: "authority-repo",
+	}); err != nil {
+		t.Fatalf("RegisterRepositoryOwner: %v", err)
+	}
+	idx, authority, root := newAuthorityTestIndexer(t, leases)
+
+	file := filepath.Join(root, "steady.go")
+	if err := os.WriteFile(file, []byte("package main\n\nfunc Steady() {}\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	// One real pass establishes the witness the no-op below must preserve.
+	if _, err := idx.IncrementalReindexPaths(root, []string{file}); err != nil {
+		t.Fatalf("seed reindex: %v", err)
+	}
+
+	pin := leases.AcquireBaseCorpus("authority-repo")
+	defer pin.Release()
+	if !pin.Witnessed() {
+		t.Fatal("the seeding mutation left no witness")
+	}
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("the pin must start clean: %v", err)
+	}
+	unchangedBefore := authority.Stats().Unchanged
+
+	// The watcher tick: the same path, nothing on disk changed.
+	result, err := idx.IncrementalReindexPaths(root, []string{file})
+	if err != nil {
+		t.Fatalf("no-op reindex: %v", err)
+	}
+	if result == nil || result.StaleFileCount != 0 || result.DeletedFileCount != 0 || result.FullRetrack {
+		t.Fatalf("the fixture no longer reproduces a no-op pass: %+v", result)
+	}
+	if got := authority.Stats().Unchanged; got != unchangedBefore+1 {
+		t.Fatalf("a no-op pass must restore the source witness: unchanged %d -> %d", unchangedBefore, got)
+	}
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("a witnessed no-op told a live request the corpus moved: %v", err)
+	}
+
+	// A pass that DOES move content still reports movement.
+	if err := os.WriteFile(file, []byte("package main\n\nfunc Steady() {}\n\nfunc Moved() {}\n"), 0o644); err != nil {
+		t.Fatalf("rewrite file: %v", err)
+	}
+	if _, err := idx.IncrementalReindexPaths(root, []string{file}); err != nil {
+		t.Fatalf("moving reindex: %v", err)
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, graphview.ErrBaseCorpusChanged) {
+		t.Fatalf("a pass that rewrote a file must report movement: got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 7. Runtime pins for the doors that do NOT go through
+//    coordinateRepositoryMutation.
+// ---------------------------------------------------------------------------
+
+// TestColdBatchOpensOneReceiptPerRepositoryOwner pins the multi-repo cold
+// batch at RUNTIME, not only through the static scan: the batch admits one
+// receipt per output owner under its own entry point, and every one of them
+// settles.
+func TestColdBatchOpensOneReceiptPerRepositoryOwner(t *testing.T) {
+	repoA := setupRepoDir(t, "batch-a")
+	repoB := setupRepoDir(t, "batch-b")
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{
+		{Path: repoA, Name: "batch-a"},
+		{Path: repoB, Name: "batch-b"},
+	}}
+	gc.SetConfigPath(tmpCfg)
+	if err := gc.Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	cm, err := config.NewConfigManager(tmpCfg)
+	if err != nil {
+		t.Fatalf("config manager: %v", err)
+	}
+
+	authority := NewOutputGenerationAuthority(nil)
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), nil, cm, zap.NewNop())
+	t.Cleanup(func() { _ = mi.Close(context.Background()) })
+	mi.SetOutputGenerationAuthority(authority)
+
+	if _, err := mi.IndexAll(); err != nil {
+		t.Fatalf("IndexAll: %v", err)
+	}
+	stats := authority.Stats()
+	if got := stats.Entries[OutputEntryIndexMultiRepo]; got != 2 {
+		t.Fatalf("the cold batch opened %d receipts under %s, want one per repository owner (2)",
+			got, OutputEntryIndexMultiRepo)
+	}
+	if stats.Superseded != 0 || stats.Settled != stats.Issued {
+		t.Fatalf("every batch receipt must settle cleanly: %+v", stats)
+	}
+}
+
+// TestTopologyBatchLaneOpensItsOwnReceipt pins BOTH arms of
+// coordinateRepositoryTopologyMutation at runtime: the coordinated arm and the
+// lane-only arm a topology batch takes. The lane-only arm is the door an
+// earlier per-function scan waved through on the strength of its sibling.
+func TestTopologyBatchLaneOpensItsOwnReceipt(t *testing.T) {
+	authority := NewOutputGenerationAuthority(nil)
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), nil, newTestConfigManager(t), zap.NewNop())
+	t.Cleanup(func() { _ = mi.Close(context.Background()) })
+	mi.SetOutputGenerationAuthority(authority)
+	idx := mi.newPerRepoIndexer(config.IndexConfig{})
+	t.Cleanup(idx.Close)
+	idx.SetRepoPrefix("topology-repo")
+
+	ran := 0
+	// The coordinated arm: no active topology batch in the context.
+	if err := mi.coordinateRepositoryTopologyMutation(context.Background(), idx, func() error {
+		ran++
+		return nil
+	}); err != nil {
+		t.Fatalf("coordinated topology mutation: %v", err)
+	}
+	if got := authority.Stats().Entries[OutputEntryRepositoryTopology]; got != 1 {
+		t.Fatalf("the coordinated arm opened %d receipts, want 1", got)
+	}
+
+	// The lane-only arm: inside a topology batch.
+	if err := mi.RunRepositoryTopologyBatch(context.Background(), func(batchCtx context.Context) error {
+		return mi.coordinateRepositoryTopologyMutation(batchCtx, idx, func() error {
+			ran++
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("batched topology mutation: %v", err)
+	}
+	if ran != 2 {
+		t.Fatalf("both arms must run their payload: ran=%d", ran)
+	}
+	stats := authority.Stats()
+	if got := stats.Entries[OutputEntryRepositoryTopology]; got != 2 {
+		t.Fatalf("the lane-only arm did not open a receipt: %s count = %d, want 2",
+			OutputEntryRepositoryTopology, got)
+	}
+	if stats.Settled != stats.Issued || stats.Superseded != 0 {
+		t.Fatalf("both topology receipts must settle cleanly: %+v", stats)
+	}
+}
+
+// TestOutputStoreIdentityIsAMonotonicIdNotAnAddress pins the output half of the
+// owner key.
+//
+// An address is unique only among LIVE objects: a closed store whose memory a
+// new store of the same type reuses would inherit its identity, and two
+// genuinely independent outputs would then supersede each other. The id is
+// issued once per store and never reused.
+func TestOutputStoreIdentityIsAMonotonicIdNotAnAddress(t *testing.T) {
+	first := graph.New()
+	second := graph.New()
+
+	idFirst := outputStoreIdentity(first)
+	if idFirst != outputStoreIdentity(first) {
+		t.Fatal("one store must keep one identity for its whole life")
+	}
+	if idFirst == outputStoreIdentity(second) {
+		t.Fatal("two stores must be two outputs")
+	}
+	if outputStoreIdentity(nil) != "store:none" {
+		t.Fatalf("a nil store: %q", outputStoreIdentity(nil))
+	}
+
+	// The identity must be an issued NUMBER, not a formatted address: %p
+	// renders "0x..." and would not parse.
+	for _, identity := range []string{idFirst, outputStoreIdentity(second)} {
+		slash := strings.LastIndex(identity, "/")
+		if slash < 0 || !strings.HasPrefix(identity, "store:") {
+			t.Fatalf("store identity %q is not store:<type>/<id>", identity)
+		}
+		issued, err := strconv.ParseUint(identity[slash+1:], 10, 64)
+		if err != nil {
+			t.Fatalf("store identity %q does not carry a monotonically issued id: %v", identity, err)
+		}
+		if issued == 0 {
+			t.Fatalf("store identity %q carries no id", identity)
+		}
+	}
+}
+
+// TestOutputStoreIdentityRetiresADeadStore is the memory-hygiene half of the
+// monotonic id.
+//
+// The registry is keyed by the handle's ADDRESS and holds no reference to the
+// store, so a daemon that builds a private generation handle per sparse build
+// does not accumulate closed stores. Retiring the entry is also what makes the
+// id safe: the runtime frees an object only after its finalizer has run, so an
+// address can never be handed to a new store while the previous store's entry
+// is still in the map.
+func TestOutputStoreIdentityRetiresADeadStore(t *testing.T) {
+	outputStoreIDs.mu.Lock()
+	before := len(outputStoreIDs.ids)
+	outputStoreIDs.mu.Unlock()
+
+	func() {
+		transient := graph.New()
+		if outputStoreIdentity(transient) == "" {
+			t.Error("no identity issued")
+		}
+	}()
+
+	// Finalizers run on their own goroutine after a collection, so the entry
+	// disappears a short time after the GC rather than during it.
+	for attempt := 0; attempt < 50; attempt++ {
+		runtime.GC()
+		outputStoreIDs.mu.Lock()
+		now := len(outputStoreIDs.ids)
+		outputStoreIDs.mu.Unlock()
+		if now <= before {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	outputStoreIDs.mu.Lock()
+	now := len(outputStoreIDs.ids)
+	outputStoreIDs.mu.Unlock()
+	t.Fatalf("a dead store's identity was never retired: entries %d -> %d", before, now)
+}
+
+// TestMutationUnderAClosingOwnerStillMovesALivePin is the false-exact guard on
+// the witness door.
+//
+// Closing an admission refuses NEW leases; it does not invalidate the pins
+// already out, and finalization cannot run until they drain, so a request that
+// pinned the base corpus before the close is still reading and still answering
+// — internal/mcp/view_request.go treats a pin whose ValidateCurrent() is nil as
+// "the answer is as exact as the route said it was". A real generation-zero
+// write admitted while the owner is closing therefore may not be reported as
+// unwitnessed: the corpus under that request has moved, and the honest
+// alternative (ErrBaseCorpusUnwitnessed) is not available once the pin holds a
+// witness. The observation is moved without a lease instead.
+func TestMutationUnderAClosingOwnerStillMovesALivePin(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		close func(t *testing.T, leases *graphview.LeaseManager, owner graphview.RepositoryOwner)
+	}{
+		{
+			name: "closing owner",
+			close: func(t *testing.T, leases *graphview.LeaseManager, owner graphview.RepositoryOwner) {
+				if _, err := leases.CloseRepositoryAdmission(owner); err != nil {
+					t.Fatalf("CloseRepositoryAdmission: %v", err)
+				}
+			},
+		},
+		{
+			name: "stopped manager",
+			close: func(t *testing.T, leases *graphview.LeaseManager, owner graphview.RepositoryOwner) {
+				leases.ShutdownRepositoryAdmissions()
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leases := graphview.NewLeaseManager()
+			owner := graphview.RepositoryOwner{
+				GraphID: "graph-closing", CheckoutID: "checkout-closing",
+				Incarnation: "inc-1", RepoPrefix: "authority-repo",
+			}
+			if err := leases.RegisterRepositoryOwner(owner); err != nil {
+				t.Fatalf("RegisterRepositoryOwner: %v", err)
+			}
+			idx, authority, root := newAuthorityTestIndexer(t, leases)
+			seed := filepath.Join(root, "seed.go")
+			if err := os.WriteFile(seed, []byte("package main\n\nfunc Seed() {}\n"), 0o644); err != nil {
+				t.Fatalf("write seed: %v", err)
+			}
+			// One real pass establishes the witness the pin compares against.
+			if _, err := idx.IncrementalReindexPaths(root, []string{seed}); err != nil {
+				t.Fatalf("seed reindex: %v", err)
+			}
+
+			pin := leases.AcquireBaseCorpus("authority-repo")
+			defer pin.Release()
+			if !pin.Witnessed() {
+				t.Fatal("the seeding mutation left no witness for the pin to compare against")
+			}
+			if err := pin.ValidateCurrent(); err != nil {
+				t.Fatalf("the pin must start clean: %v", err)
+			}
+
+			tc.close(t, leases, owner)
+			if err := pin.ValidateCurrent(); err != nil {
+				t.Fatalf("closing an admission is not itself a source change: %v", err)
+			}
+			invalidatedBefore := authority.Stats().Invalidated
+
+			file := filepath.Join(root, "written-while-closing.go")
+			if err := os.WriteFile(file, []byte("package main\n\nfunc WrittenWhileClosing() {}\n"), 0o644); err != nil {
+				t.Fatalf("write file: %v", err)
+			}
+			if err := idx.IndexFile(file); err != nil {
+				t.Fatalf("IndexFile: %v", err)
+			}
+
+			if got := authority.Stats().Invalidated; got != invalidatedBefore+1 {
+				t.Fatalf("a write admitted under a closed admission must move the witness: invalidated %d -> %d",
+					invalidatedBefore, got)
+			}
+			if err := pin.ValidateCurrent(); !errors.Is(err, graphview.ErrBaseCorpusChanged) {
+				t.Fatalf("pin.ValidateCurrent() after a generation-zero write under a closing owner = %v, want ErrBaseCorpusChanged", err)
+			}
+		})
+	}
+}
+
+// TestLifecycleTrackedRepositoryIsWitnessedEndToEnd joins the two halves that
+// were only ever asserted apart: the LIFECYCLE registers the owner a witness
+// needs (CheckoutLifecycle.Register -> trackCheckout -> bindDedicatedGraph ->
+// RegisterRepositoryOwner), and the AUTHORITY moves that owner's source when a
+// mutation runs. Everything in between is the production code path; the test
+// installs the authority exactly as serverstack.NewSharedServer does
+// (NewOutputGenerationAuthority(lifecycle.ViewLeases())) and then indexes.
+//
+// Registering an owner by hand — which every other test here does — proves the
+// door works, not that anything opens it.
+func TestLifecycleTrackedRepositoryIsWitnessedEndToEnd(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+
+	leases := f.lc.ViewLeases()
+	if leases == nil {
+		t.Fatal("the lifecycle exposes no lease manager for the authority to witness through")
+	}
+	authority := NewOutputGenerationAuthority(leases)
+	f.mi.SetOutputGenerationAuthority(authority)
+
+	root := f.gitRepo("witnessed-e2e")
+	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if tracked.CatalogErr != nil {
+		t.Fatalf("Register catalog: %v", tracked.CatalogErr)
+	}
+
+	pin := leases.AcquireBaseCorpus(tracked.Prefix)
+	defer pin.Release()
+	if !pin.OwnerPinned() {
+		t.Fatalf("tracking %q registered no repository owner for a base pin to hold", tracked.Prefix)
+	}
+
+	witnessedBefore := authority.Stats().Witnessed
+	if _, err := f.mi.IndexAll(); err != nil {
+		t.Fatalf("IndexAll: %v", err)
+	}
+	if got := authority.Stats().Witnessed; got <= witnessedBefore {
+		t.Fatalf("indexing a lifecycle-tracked repository moved no source witness: witnessed %d -> %d",
+			witnessedBefore, got)
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, graphview.ErrBaseCorpusChanged) {
+		t.Fatalf("base pin after indexing a lifecycle-tracked repository = %v, want ErrBaseCorpusChanged", err)
+	}
 }

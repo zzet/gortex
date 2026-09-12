@@ -492,3 +492,102 @@ func TestCheckoutMutationRefusesToFulfilASupersededGeneration(t *testing.T) {
 		t.Fatalf("superseded count = %d, want 1", got)
 	}
 }
+
+// TestCheckoutMutationRefusesToPublishAGenerationTakenOverDuringTheBuildWait
+// pins the fence at the REPUBLISH boundary.
+//
+// Refresh is the one lease operation that builds, so it is the one that queues
+// for the shared build gate — an unbounded wait. A receipt validated only at
+// the top of Refresh is therefore validated before that wait, and a newer
+// mutation admitted while the lease sits in the queue would still get to
+// republish the generation it no longer owns. The check taken after the gate
+// and immediately before the build is what makes "a superseded receipt cannot
+// publish" true rather than approximately true.
+//
+// The window is made deterministic by holding the gate's single build slot:
+// Refresh is provably past its pre-gate check and provably before its build
+// while the newer receipt is admitted.
+func TestCheckoutMutationRefusesToPublishAGenerationTakenOverDuringTheBuildWait(t *testing.T) {
+	f, l, authority := newCheckoutMutationAuthorityFixture(t)
+	c := l.coordinators[f.checkoutID]
+	before := f.route()
+
+	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			m.Close()
+		}
+	}()
+	if err := m.Prepare(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc TakenOverHelper() {}\n")
+	receipt := m.Receipt()
+	if receipt == nil {
+		t.Fatal("a checkout source-edit lease opened no output-generation receipt")
+	}
+	target := receipt.Target()
+
+	withdrawn := f.route()
+	if withdrawn.DirtyGenerationID != 0 {
+		t.Fatalf("Prepare did not withdraw the dirty route: %+v", withdrawn)
+	}
+
+	// Occupy the gate's single build slot, so the Refresh below is past its
+	// pre-gate receipt check and parked in the queue.
+	release, err := c.gate.Acquire(t.Context(), ViewBuildInteractive)
+	if err != nil {
+		t.Fatalf("hold the build gate: %v", err)
+	}
+	type refreshOutcome struct {
+		out CheckoutCycle
+		err error
+	}
+	done := make(chan refreshOutcome, 1)
+	go func() {
+		out, refreshErr := m.Refresh(context.Background())
+		done <- refreshOutcome{out: out, err: refreshErr}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for c.gate.Stats().InteractiveQueued == 0 {
+		if time.Now().After(deadline) {
+			release()
+			<-done
+			t.Fatal("Refresh never queued for the shared build gate; the window under test does not exist")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The takeover happens while the publish waits for the lane.
+	newer, err := authority.Begin(t.Context(), OutputEntryCheckoutSourceMutation, target)
+	if err != nil {
+		release()
+		<-done
+		t.Fatalf("admit the newer mutation: %v", err)
+	}
+	defer newer.Abandon()
+	release()
+
+	outcome := <-done
+	if !errors.Is(outcome.err, ErrOutputMutationReceiptSuperseded) {
+		t.Fatalf("Refresh under a receipt taken over during the build wait: got %v, want ErrOutputMutationReceiptSuperseded", outcome.err)
+	}
+	if after := f.route(); after.DirtyGenerationID != 0 || after.State != withdrawn.State {
+		t.Fatalf("a superseded lease republished the generation it no longer owned: %+v", after)
+	}
+
+	// The lease still settles without claiming the generation, and the
+	// withdrawn route is left for the coordinator to reschedule.
+	m.Close()
+	closed = true
+	if err := m.ReceiptError(); err != nil {
+		t.Fatalf("a lease that published nothing abandons rather than reporting a refused fulfilment: %v", err)
+	}
+	if got := authority.Stats().Superseded; got != 1 {
+		t.Fatalf("superseded count = %d, want 1 (the abandoned lease)", got)
+	}
+}

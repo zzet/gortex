@@ -2147,6 +2147,15 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			}
 			prefix += "-" + shortPathHash(absPath)
 			e.Name = prefix
+			// This prefix is minted for THIS batch and is not the one the
+			// lifecycle registered an owner under, so the receipt opened for
+			// it below finds no owner and the repository is left unwitnessed
+			// (openSourceWitness). That is the honest direction — the nodes
+			// this pass writes carry the disambiguated prefix too, so no pin
+			// taken on the colliding prefix is reading them — but a request
+			// against the disambiguated prefix gets ErrBaseCorpusUnwitnessed
+			// rather than an exactness label until an owner is registered for
+			// the name this batch chose.
 		}
 		seenPrefix[prefix] = absPath
 		resolved = append(resolved, resolvedRepo{entry: e, prefix: prefix, cfg: cfg, absPath: absPath, identity: identity})

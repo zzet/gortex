@@ -346,3 +346,335 @@ func TestRawDataSnapshotValidateCurrentSeesAMutationAfterHandoff(t *testing.T) {
 		t.Fatalf("ValidateCurrent() after the source moved = %v, want %v", err, ErrRawRepositorySourceChanged)
 	}
 }
+
+// --- W3.1b: the prefix-keyed base-corpus source door --------------------
+
+// TestBaseCorpusMutationServesADedicatedOwner is the reachability claim.
+//
+// The lifecycle registers exactly one DEDICATED owner per tracked repository
+// prefix, and a dedicated registration has no RawRepositoryRegistration handle,
+// so the registration-keyed mutation door cannot address it. AcquireBaseCorpus
+// nevertheless pins a request against that same owner state and observes its
+// source, so without a prefix-keyed mutation door the witness of every
+// repository a daemon actually tracks is unreachable and every pin can only
+// answer "unwitnessed".
+func TestBaseCorpusMutationServesADedicatedOwner(t *testing.T) {
+	m := NewLeaseManager()
+	owner := RepositoryOwner{GraphID: "g1", CheckoutID: "c1", Incarnation: "i1", RepoPrefix: "repo"}
+	if err := m.RegisterRepositoryOwner(owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.LookupRawRepositoryRegistration("repo", "/tmp/repo"); err == nil {
+		t.Fatal("a dedicated owner must not resolve to a raw registration; the door under test would be redundant")
+	}
+
+	pin := m.AcquireBaseCorpus("repo")
+	defer pin.Release()
+	if !pin.OwnerPinned() {
+		t.Fatal("the dedicated owner was not pinned")
+	}
+
+	write, err := m.AcquireBaseCorpusMutation(context.Background(), "repo", "/tmp/repo")
+	if err != nil {
+		t.Fatalf("AcquireBaseCorpusMutation over a dedicated owner: %v", err)
+	}
+	if _, err := write.CompleteUnchanged("content-a"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	write.Release()
+
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("pin after a base-corpus mutation = %v, want ErrBaseCorpusChanged", err)
+	}
+	fresh := m.AcquireBaseCorpus("repo")
+	defer fresh.Release()
+	if !fresh.Witnessed() {
+		t.Fatal("the mutation left no witness for the next request")
+	}
+	if err := fresh.ValidateCurrent(); err != nil {
+		t.Fatalf("a pin taken after the mutation = %v, want nil", err)
+	}
+}
+
+// TestBaseCorpusMutationKeepsTheRawRootCheck: a RAW registration is still
+// matched on its canonical root, so a prefix rebound to a different root is
+// refused exactly as LookupRawRepositoryRegistration refuses it. The door is
+// not dedicated-to-raw inference.
+func TestBaseCorpusMutationKeepsTheRawRootCheck(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	root := reg.Owner().RootIdentity
+
+	if _, err := m.AcquireBaseCorpusMutation(context.Background(), "raw", "other-root"); !errors.Is(err, ErrRepositoryOwnerUnknown) {
+		t.Fatalf("wrong canonical root = %v, want ErrRepositoryOwnerUnknown", err)
+	}
+	if _, err := m.AcquireBaseCorpusMutation(context.Background(), "raw", ""); !errors.Is(err, ErrRepositoryOwnerUnknown) {
+		t.Fatalf("missing canonical root = %v, want ErrRepositoryOwnerUnknown", err)
+	}
+	if _, err := m.AcquireBaseCorpusMutation(context.Background(), "absent", root); !errors.Is(err, ErrRepositoryOwnerUnknown) {
+		t.Fatalf("unregistered prefix = %v, want ErrRepositoryOwnerUnknown", err)
+	}
+	write, err := m.AcquireBaseCorpusMutation(context.Background(), "raw", root)
+	if err != nil {
+		t.Fatalf("matching canonical root: %v", err)
+	}
+	if err := write.Complete("source-a"); err != nil {
+		t.Fatal(err)
+	}
+	write.Release()
+
+	// A closing registration is refused rather than mutated.
+	if _, err := m.CloseRawRepositoryAdmission(reg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.AcquireBaseCorpusMutation(context.Background(), "raw", root); !errors.Is(err, ErrRepositoryAdmissionClosed) {
+		t.Fatalf("closing owner = %v, want ErrRepositoryAdmissionClosed", err)
+	}
+}
+
+// TestCompleteUnchangedRestoresTheObservationItDisplaced is the no-op claim.
+//
+// A revision is allocated at ACQUISITION, before anybody can know whether the
+// payload will move a byte, so a mutation that turns out to have written
+// nothing would still tell every live pin the source moved. Completing with the
+// fingerprint that was already there restores the exact observation readers
+// hold; a different fingerprint publishes the new revision as usual.
+func TestCompleteUnchangedRestoresTheObservationItDisplaced(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	first := privateRawSource(t, m, reg, "content-a")
+
+	pin := m.AcquireBaseCorpus("raw")
+	defer pin.Release()
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("the pin must start clean: %v", err)
+	}
+
+	write, err := m.AcquireRawRepositoryMutation(context.Background(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := write.PriorFingerprint(); got != "content-a" {
+		t.Fatalf("PriorFingerprint() = %q, want %q", got, "content-a")
+	}
+	if write.Revision() != first+1 {
+		t.Fatalf("acquisition revision = %d, want %d", write.Revision(), first+1)
+	}
+	restored, err := write.CompleteUnchanged("content-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored {
+		t.Fatal("a mutation that wrote the same content must restore the observation it displaced")
+	}
+	write.Release()
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("a no-op mutation told a live pin the source moved: %v", err)
+	}
+
+	read, err := m.AcquireRawRepositorySnapshot(context.Background(), reg, first)
+	if err != nil {
+		t.Fatalf("the restored revision must still be the current one: %v", err)
+	}
+	read.Release()
+
+	// Content that DID move publishes the new revision.
+	moved, err := m.AcquireRawRepositoryMutation(context.Background(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err = moved.CompleteUnchanged("content-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored {
+		t.Fatal("different content must not be reported as unchanged")
+	}
+	moved.Release()
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("a mutation that moved content = %v, want ErrBaseCorpusChanged", err)
+	}
+}
+
+// TestCompleteUnchangedOnAFirstMutationPublishes: an owner with no available
+// source to restore takes the ordinary publish path, so the first mutation of a
+// never-captured owner is never silently swallowed.
+func TestCompleteUnchangedOnAFirstMutationPublishes(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	write, err := m.AcquireRawRepositoryMutation(context.Background(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := write.PriorFingerprint(); got != "" {
+		t.Fatalf("PriorFingerprint() on a never-captured owner = %q, want empty", got)
+	}
+	restored, err := write.CompleteUnchanged("content-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored {
+		t.Fatal("there was no prior observation to restore")
+	}
+	write.Release()
+	read, err := m.AcquireRawRepositorySnapshot(context.Background(), reg, 0)
+	if err != nil {
+		t.Fatalf("the first mutation must publish: %v", err)
+	}
+	defer read.Release()
+	if got := read.Witness().Fingerprint; got != "content-a" {
+		t.Fatalf("fingerprint = %q, want content-a", got)
+	}
+}
+
+// TestInvalidateBaseCorpusSourceMovesAPinDrainingBehindAClose is the
+// closing-owner half of the source witness.
+//
+// CloseRepositoryAdmission refuses NEW leases and leaves the ones already out
+// valid ("existing leases remain valid"), and finalization cannot run until
+// they drain, so a request that pinned the base corpus before the close is
+// still reading and still answering. A generation-zero write admitted at that
+// moment cannot take a mutation lease — and must not therefore be reported as
+// unwitnessed, because that pin would answer "as exact as the route said it
+// was" about a corpus that has just moved under it.
+func TestInvalidateBaseCorpusSourceMovesAPinDrainingBehindAClose(t *testing.T) {
+	m := NewLeaseManager()
+	owner := RepositoryOwner{GraphID: "g1", CheckoutID: "c1", Incarnation: "i1", RepoPrefix: "repo"}
+	if err := m.RegisterRepositoryOwner(owner); err != nil {
+		t.Fatal(err)
+	}
+
+	// An owner nothing has written to yet has no source data: there is nothing
+	// to move and nothing that could be holding a witness on it.
+	if moved, err := m.InvalidateBaseCorpusSource("repo"); moved || err != nil {
+		t.Fatalf("InvalidateBaseCorpusSource on a never-written owner = (%v, %v), want (false, nil)", moved, err)
+	}
+	if moved, err := m.InvalidateBaseCorpusSource("absent"); moved || !errors.Is(err, ErrRepositoryOwnerUnknown) {
+		t.Fatalf("InvalidateBaseCorpusSource on an unregistered prefix = (%v, %v), want (false, ErrRepositoryOwnerUnknown)", moved, err)
+	}
+
+	write, err := m.AcquireBaseCorpusMutation(context.Background(), "repo", "/tmp/repo")
+	if err != nil {
+		t.Fatalf("AcquireBaseCorpusMutation: %v", err)
+	}
+	if err := write.Complete("content-a"); err != nil {
+		t.Fatal(err)
+	}
+	write.Release()
+
+	pin := m.AcquireBaseCorpus("repo")
+	defer pin.Release()
+	if !pin.Witnessed() {
+		t.Fatal("the pin captured no witness to compare against")
+	}
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("the pin must start clean: %v", err)
+	}
+
+	drain, err := m.CloseRepositoryAdmission(owner)
+	if err != nil {
+		t.Fatalf("CloseRepositoryAdmission: %v", err)
+	}
+	if _, err := m.AcquireBaseCorpusMutation(context.Background(), "repo", "/tmp/repo"); !errors.Is(err, ErrRepositoryAdmissionClosed) {
+		t.Fatalf("a closing owner = %v, want ErrRepositoryAdmissionClosed", err)
+	}
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("closing an admission is not itself a source change: %v", err)
+	}
+
+	moved, err := m.InvalidateBaseCorpusSource("repo")
+	if err != nil {
+		t.Fatalf("InvalidateBaseCorpusSource under a closing owner: %v", err)
+	}
+	if !moved {
+		t.Fatal("the write under a closing owner moved no observation")
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("pin after a write admitted under a closing owner = %v, want ErrBaseCorpusChanged", err)
+	}
+
+	// The witness moved without taking a reader: a closed admission may have
+	// drained already, and a reader taken after that would sit behind a drain
+	// whose channel is closed.
+	pin.Release()
+	select {
+	case <-drain.Done():
+	default:
+		t.Fatal("moving the witness left a reader behind a closed admission")
+	}
+}
+
+// TestARestoredRevisionIsNeverHandedToANewSourceState pins the high-water mark.
+//
+// CompleteUnchanged moves a revision DOWN — it restores the observation it
+// displaced. Without a high-water floor the next mutation reuses the revision
+// number the restore gave back, and a pin taken mid-mutation (revision R+1,
+// nothing available) compares EQUAL to a different source state that happens to
+// wear the same number.
+func TestARestoredRevisionIsNeverHandedToANewSourceState(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	first := privateRawSource(t, m, reg, "content-a")
+
+	write, err := m.AcquireRawRepositoryMutation(context.Background(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A request that pins the corpus while that mutation is in flight.
+	pin := m.AcquireBaseCorpus("raw")
+	defer pin.Release()
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("a pin taken mid-mutation must start clean: %v", err)
+	}
+	restored, err := write.CompleteUnchanged("content-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored {
+		t.Fatal("the no-op mutation did not restore the observation it displaced")
+	}
+	write.Release()
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("the mid-mutation pin must see the restore: %v", err)
+	}
+
+	second, err := m.AcquireRawRepositoryMutation(context.Background(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Revision() <= first+1 {
+		t.Fatalf("the next mutation took revision %d, which the restore already handed out (first=%d)", second.Revision(), first)
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("mid-mutation pin against a reused revision = %v, want ErrBaseCorpusChanged", err)
+	}
+}
+
+// TestInvalidateBaseCorpusSourceIgnoresTheCanonicalRoot: the root check on the
+// lease door decides whether a caller may WRITE through an owner's gate. It is
+// not a reason to leave that owner's readers holding a witness a write has
+// already invalidated, so the witness door does not apply it — the write lands
+// on the prefix those readers pinned either way.
+func TestInvalidateBaseCorpusSourceIgnoresTheCanonicalRoot(t *testing.T) {
+	m := NewLeaseManager()
+	reg := privateRawRegistration(t, m, "raw", "one")
+	privateRawSource(t, m, reg, "content-a")
+
+	pin := m.AcquireBaseCorpus("raw")
+	defer pin.Release()
+	if err := pin.ValidateCurrent(); err != nil {
+		t.Fatalf("the pin must start clean: %v", err)
+	}
+	if _, err := m.AcquireBaseCorpusMutation(context.Background(), "raw", "other-root"); !errors.Is(err, ErrRepositoryOwnerUnknown) {
+		t.Fatalf("the lease door must still refuse a mismatched root: %v", err)
+	}
+
+	moved, err := m.InvalidateBaseCorpusSource("raw")
+	if err != nil || !moved {
+		t.Fatalf("InvalidateBaseCorpusSource = (%v, %v), want (true, nil)", moved, err)
+	}
+	if err := pin.ValidateCurrent(); !errors.Is(err, ErrBaseCorpusChanged) {
+		t.Fatalf("pin after a write the root check refused = %v, want ErrBaseCorpusChanged", err)
+	}
+}

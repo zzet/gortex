@@ -2,9 +2,14 @@ package indexer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"sort"
 	"sync"
 
@@ -104,10 +109,17 @@ type repositoryMutationCoordinator struct {
 	// outputGeneration wraps ONE executed coalesced batch in an
 	// output-generation receipt. The coalescing lane, not the queuing caller,
 	// is the mutation entry point here: many callers merge into one execution,
-	// and it is that execution that names an output generation and owner.
-	outputGeneration func(fn func() error) error
-	closed           bool
-	running          bool
+	// and it is that execution that names an output generation and owner. The
+	// batch reports the source content it moved through the observer it is
+	// handed, which is what keeps the gen0 source fingerprint content-derived.
+	outputGeneration func(fn func(observe func(*OutputSourceContent)) error) error
+	// authorityRequired marks a lane minted by a PRODUCTION factory. Such a
+	// lane must never execute a coalesced batch with no receipt: an unbound
+	// lane fails closed rather than writing generation zero unfenced. Lanes
+	// hand-built by fixtures leave it false and keep running unfenced.
+	authorityRequired bool
+	closed            bool
+	running           bool
 
 	requestedGeneration uint64
 	completedGeneration uint64
@@ -192,9 +204,11 @@ func (c *repositoryMutationCoordinator) drain() {
 		c.waiters = nil
 		executor := c.executor
 		outputGeneration := c.outputGeneration
+		authorityRequired := c.authorityRequired
 		c.mu.Unlock()
 
-		outcome := executeRepositoryMutationUnderAuthority(outputGeneration, executor, paths)
+		outcome := executeRepositoryMutationUnderAuthority(
+			outputGeneration, authorityRequired, executor, paths)
 		c.lane <- struct{}{}
 		if batchMutationGate != nil {
 			batchMutationGate.RUnlock()
@@ -244,17 +258,32 @@ func executeRepositoryMutation(executor repositoryMutationExecutor, paths []stri
 // for work that actually ran. Callers that key on the error (GitWatcher's
 // finalizeReconcile leaves the prior SHA for the next notification) still
 // retry, which is the correct response to an unfulfilled generation.
+// An unbound lane fails CLOSED when the lane was minted by a production
+// factory: writing generation zero with no receipt is a mutation nothing speaks
+// for, and silently degrading to that is exactly the hole the authority exists
+// to close. Fixture lanes (authorityRequired false) keep running unfenced.
 func executeRepositoryMutationUnderAuthority(
-	outputGeneration func(fn func() error) error,
+	outputGeneration func(fn func(observe func(*OutputSourceContent)) error) error,
+	authorityRequired bool,
 	executor repositoryMutationExecutor,
 	paths []string,
 ) repositoryMutationOutcome {
 	if outputGeneration == nil {
+		if authorityRequired {
+			return repositoryMutationOutcome{err: ErrOutputMutationLaneUnbound}
+		}
 		return executeRepositoryMutation(executor, paths)
 	}
 	var outcome repositoryMutationOutcome
-	err := outputGeneration(func() error {
+	err := outputGeneration(func(observe func(*OutputSourceContent)) error {
 		outcome = executeRepositoryMutation(executor, paths)
+		// The coalesced batch is the one door that KNOWS what it wrote — the
+		// path set it took and the result's own stale/deleted/full-retrack
+		// counts — so it is the door that reports content. The reconcile lane
+		// is also the watcher-tick path, which is where a revision-derived
+		// fingerprint would have told every request the corpus moved on every
+		// tick.
+		observe(outputSourceContentFor("", paths, outcome.result, outcome.err))
 		return outcome.err
 	})
 	if err != nil && outcome.err == nil {
@@ -266,7 +295,9 @@ func executeRepositoryMutationUnderAuthority(
 // bindOutputGeneration attaches the receipt wrapper for this lane's coalesced
 // executions. It is set from repositoryMutations, the one place that knows both
 // the coordinator and the Indexer whose output generation it writes.
-func (c *repositoryMutationCoordinator) bindOutputGeneration(wrap func(fn func() error) error) {
+func (c *repositoryMutationCoordinator) bindOutputGeneration(
+	wrap func(fn func(observe func(*OutputSourceContent)) error) error,
+) {
 	if c == nil {
 		return
 	}
@@ -432,9 +463,52 @@ func (mi *MultiIndexer) repositoryMutationCoordinator(repoPrefix string) *reposi
 		// Attach before publishing the slot: every execution through this stable
 		// lane must participate in the owning MultiIndexer's batch transition.
 		coordinator.batchMutationGate = &mi.batchMutationGate
+		// A lane minted here is a PRODUCTION lane, so it is bound to the
+		// authority here rather than only when an Indexer later attaches to it
+		// (attachRepositoryMutationCoordinator / repositoryMutations). Both
+		// halves matter: the binding stops a lane reached before any Indexer
+		// attaches from reconciling unfenced, and authorityRequired makes an
+		// unbound one fail closed instead of degrading silently.
+		coordinator.authorityRequired = true
+		coordinator.outputGeneration = func(fn func(observe func(*OutputSourceContent)) error) error {
+			return mi.withRepositoryOutputGenerationSource(
+				context.Background(), repoPrefix, OutputEntryRepositoryReconcileLane, fn)
+		}
 		mi.repositoryMutations[repoPrefix] = coordinator
 	}
 	return coordinator
+}
+
+// withRepositoryOutputGenerationSource opens a receipt for one tracked
+// repository's generation-zero output without going through its Indexer. It is
+// the MultiIndexer-level binding of a stable lane, used until (and after) a
+// per-repository Indexer attaches its own.
+//
+// The target is resolved lazily, inside the call: repoRootPath takes the
+// registry read lock, and the lane is minted under repositoryMutationMu.
+func (mi *MultiIndexer) withRepositoryOutputGenerationSource(
+	ctx context.Context,
+	repoPrefix string,
+	entry OutputMutationEntry,
+	fn func(observe func(*OutputSourceContent)) error,
+) error {
+	if fn == nil {
+		return nil
+	}
+	target := legacyOutputTargetFor(
+		outputStoreIdentity(mi.graph), repoPrefix, mi.repoRootPath(repoPrefix), "prefix:"+repoPrefix)
+	receipt, err := mi.outputGenerationAuthority().Begin(ctx, entry, target)
+	if err != nil {
+		return err
+	}
+	return runUnderOutputReceipt(receipt, func() error {
+		return fn(func(content *OutputSourceContent) {
+			if content != nil && content.Root == "" {
+				content.Root = target.RootPath
+			}
+			receipt.ObserveSourceContent(content)
+		})
+	})
 }
 
 // withRepositoryMutationLanes acquires a deterministic set of stable lanes.
@@ -587,8 +661,11 @@ func (idx *Indexer) bindMutationLaneAuthority(coordinator *repositoryMutationCoo
 	if coordinator == nil {
 		return
 	}
-	coordinator.bindOutputGeneration(func(fn func() error) error {
-		return idx.withOutputGeneration(context.Background(), OutputEntryRepositoryReconcileLane, fn)
+	coordinator.mu.Lock()
+	coordinator.authorityRequired = true
+	coordinator.mu.Unlock()
+	coordinator.bindOutputGeneration(func(fn func(observe func(*OutputSourceContent)) error) error {
+		return idx.withOutputGenerationSource(context.Background(), OutputEntryRepositoryReconcileLane, fn)
 	})
 }
 
@@ -773,6 +850,11 @@ var (
 	ErrOutputMutationReceiptSettled = errors.New("indexer: mutation receipt has already settled")
 	// ErrOutputMutationAuthorityClosed refuses admission after teardown.
 	ErrOutputMutationAuthorityClosed = errors.New("indexer: output-generation authority is closed")
+	// ErrOutputMutationLaneUnbound refuses a coalesced batch on a production
+	// lane nobody bound to the authority. Such a lane would write generation
+	// zero with no receipt and no named owner, so it fails CLOSED: the batch is
+	// refused rather than degraded into an unfenced write.
+	ErrOutputMutationLaneUnbound = errors.New("indexer: repository mutation lane is not bound to the output-generation authority")
 )
 
 // OutputMutationEntry is the stable name of one production mutation entry
@@ -915,6 +997,19 @@ type OutputGenerationAuthority struct {
 	settled    uint64
 	superseded uint64
 	witnessed  uint64
+	// byEntry counts admissions per registered entry point. It is what makes
+	// "this door opened a receipt" a checkable runtime fact rather than only a
+	// static one: a door whose receipts are deleted stops appearing here.
+	byEntry map[OutputMutationEntry]uint64
+	// unchanged counts fulfilled mutations whose CONTENT fingerprint matched
+	// the one they displaced, so the source witness was restored rather than
+	// moved. A watcher tick over a repository nothing changed lands here.
+	unchanged uint64
+	// invalidated counts mutations admitted against an owner that could no
+	// longer hand out a lease (closing admission, stopped manager) and whose
+	// source observation was therefore moved without one, so the pins draining
+	// behind the close report ErrBaseCorpusChanged rather than nil.
+	invalidated uint64
 }
 
 // NewOutputGenerationAuthority builds the authority over one lease manager.
@@ -939,7 +1034,18 @@ type OutputGenerationAuthorityStats struct {
 	Settled    uint64
 	Superseded uint64
 	Witnessed  uint64
-	LiveOwners int
+	// Unchanged is the subset of witnessed fulfilments whose content
+	// fingerprint matched the source they displaced, so no live BasePin was
+	// told the corpus moved.
+	Unchanged uint64
+	// Invalidated counts admissions whose owner could no longer hand out a
+	// source lease (closing admission, stopped manager) and whose observation
+	// was moved without one. They are NOT counted as Witnessed: no lease was
+	// held, so nothing will certify what the write leaves behind.
+	Invalidated uint64
+	LiveOwners  int
+	// Entries is admissions per entry point, a copy the caller owns.
+	Entries map[OutputMutationEntry]uint64
 }
 
 func (a *OutputGenerationAuthority) Stats() OutputGenerationAuthorityStats {
@@ -948,9 +1054,14 @@ func (a *OutputGenerationAuthority) Stats() OutputGenerationAuthorityStats {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	entries := make(map[OutputMutationEntry]uint64, len(a.byEntry))
+	for entry, count := range a.byEntry {
+		entries[entry] = count
+	}
 	return OutputGenerationAuthorityStats{
 		Issued: a.issued, Settled: a.settled, Superseded: a.superseded,
-		Witnessed: a.witnessed, LiveOwners: len(a.owners),
+		Witnessed: a.witnessed, Unchanged: a.unchanged, Invalidated: a.invalidated,
+		LiveOwners: len(a.owners), Entries: entries,
 	}
 }
 
@@ -976,6 +1087,55 @@ type OutputMutationReceipt struct {
 	mu      sync.Mutex
 	settled bool
 	source  *graphview.RawRepositoryMutationLease
+	content *OutputSourceContent
+}
+
+// OutputSourceContent is what one executed mutation reports about the SOURCE
+// content it moved under generation zero.
+//
+// It is the input to the generation-zero source fingerprint. Without it the
+// fingerprint can only be derived from the revision the gate allocated, and a
+// revision moves for every ADMITTED mutation — so a watcher tick over a file
+// nothing changed would tell every live BasePin the corpus moved. With it the
+// fingerprint is derived from the mutated path set and those paths' content
+// identities, and a mutation that moved nothing restores the observation
+// readers already hold instead of publishing a new one.
+//
+// A door that cannot report (it does not know its path set, or the payload
+// failed) leaves this nil, and the fingerprint stays revision-derived — the
+// conservative direction: it can only over-report movement.
+type OutputSourceContent struct {
+	// Root is the repository root Paths are relative to, or absolute under.
+	Root string
+	// Paths is the path set the mutation wrote. Nil means "a whole-repository
+	// pass": the set is not enumerable, so Stale/Deleted/Full carry the fact.
+	Paths []string
+	// Moved reports whether the payload actually wrote anything. It is the
+	// warm-restart predicate IndexResult already documents: stale files,
+	// deleted files, or a full re-track.
+	Moved bool
+	// Stale, Deleted and Full are the counts behind Moved, folded into the
+	// fingerprint so two passes over one path set with different outcomes are
+	// different content.
+	Stale   int
+	Deleted int
+	Full    bool
+}
+
+// outputSourceContentFor derives the source report of one executed mutation
+// from its IndexResult. A failed or resultless pass reports nothing.
+func outputSourceContentFor(root string, paths []string, result *IndexResult, err error) *OutputSourceContent {
+	if err != nil || result == nil {
+		return nil
+	}
+	return &OutputSourceContent{
+		Root:    root,
+		Paths:   paths,
+		Moved:   result.StaleFileCount > 0 || result.DeletedFileCount > 0 || result.FullRetrack,
+		Stale:   result.StaleFileCount,
+		Deleted: result.DeletedFileCount,
+		Full:    result.FullRetrack,
+	}
 }
 
 // OutputMutationReceipts is a batch admitted together, for an entry point that
@@ -1020,6 +1180,10 @@ func (a *OutputGenerationAuthority) Begin(
 	state.latest = seq
 	state.live++
 	a.issued++
+	if a.byEntry == nil {
+		a.byEntry = make(map[OutputMutationEntry]uint64)
+	}
+	a.byEntry[entry]++
 	a.mu.Unlock()
 
 	receipt := &OutputMutationReceipt{authority: a, entry: entry, target: target, seq: seq}
@@ -1054,9 +1218,34 @@ func (a *OutputGenerationAuthority) BeginAll(
 // openSourceWitness takes the repository's exclusive raw-source data gate for
 // the length of a legacy mutation, so a live BasePin sees the revision move.
 //
-// A repository with no registered raw source authority is left unwitnessed on
-// purpose: BasePin reports that as "unknown", and inventing a witness here
-// would let a request claim an exactness nobody observed.
+// The gate is addressed by PREFIX and ROOT, through
+// graphview.AcquireBaseCorpusMutation, not through a raw registration handle.
+// That is what makes this half reachable in a real daemon: the lifecycle
+// registers one DEDICATED owner per tracked repository prefix
+// (bindDedicatedGraph -> RegisterRepositoryOwner, checkout_lifecycle.go:931/947,
+// repository_admission.go:124), and nothing in the tree ever registers a RAW
+// owner, so a registration-keyed lookup found nothing and every BasePin could
+// only answer "unwitnessed". A raw registration, when one exists, is still
+// matched on its canonical root exactly as before.
+//
+// A repository with NO registered owner at all is left unwitnessed on purpose:
+// BasePin reports that as "unknown", and inventing a witness here would let a
+// request claim an exactness nobody observed.
+//
+// Every OTHER refusal of the lease door is a reason this mutation may not write
+// through the owner's gate, and none of them is a reason to leave that owner's
+// readers holding a witness this write invalidates. The loudest case is a
+// CLOSING admission (or a stopped manager): closing refuses new leases but
+// leaves the pins already out valid and still answering requests, and
+// finalization cannot run until they drain, so a write admitted at that moment
+// really does change the corpus those requests are reading. Leaving it
+// unwitnessed would make a pin taken BEFORE the close answer nil — which
+// internal/mcp/view_request.go reads as "the answer is as exact as the route
+// said it was" — about a corpus that has moved. So a refusal that still leaves
+// a live owner behind moves the witness without a lease
+// (graphview.InvalidateBaseCorpusSource), which is also a no-op for the prefixes
+// nobody is registered for. A mutation is still never REFUSED because its
+// corpus has no live reader authority to notify.
 func (a *OutputGenerationAuthority) openSourceWitness(ctx context.Context, receipt *OutputMutationReceipt) error {
 	if a.leases == nil || receipt.target.Kind != OutputGenerationLegacy {
 		return nil
@@ -1065,12 +1254,11 @@ func (a *OutputGenerationAuthority) openSourceWitness(ctx context.Context, recei
 	if prefix == "" || root == "" {
 		return nil
 	}
-	registration, err := a.leases.LookupRawRepositoryRegistration(prefix, root)
-	if err != nil || registration == nil {
-		return nil
-	}
-	lease, err := a.leases.AcquireRawRepositoryMutationAfter(ctx, registration, 0)
+	lease, err := a.leases.AcquireBaseCorpusMutation(ctx, prefix, root)
 	if err != nil {
+		if unwitnessedRepository(err) {
+			return a.invalidateSourceWitness(prefix)
+		}
 		return err
 	}
 	receipt.source = lease
@@ -1078,6 +1266,42 @@ func (a *OutputGenerationAuthority) openSourceWitness(ctx context.Context, recei
 	a.witnessed++
 	a.mu.Unlock()
 	return nil
+}
+
+// invalidateSourceWitness moves the source observation of an owner that would
+// not hand out a mutation lease, so the pins still reading behind it stop
+// reporting an exactness this write just invalidated. It is a no-op for a
+// prefix no owner is registered for.
+//
+// A refusal that means "there is nobody to notify" (the owner finished closing
+// between the two calls, or was never there) does not fail the mutation: that
+// is the honest unwitnessed case again. Any other refusal does — a witness that
+// cannot be moved and cannot be reported unwitnessed is exactly the false-exact
+// answer this door exists to prevent, so the write is refused rather than
+// admitted behind a stale witness.
+func (a *OutputGenerationAuthority) invalidateSourceWitness(prefix string) error {
+	moved, err := a.leases.InvalidateBaseCorpusSource(prefix)
+	if err != nil && !unwitnessedRepository(err) {
+		return err
+	}
+	if !moved {
+		return nil
+	}
+	a.mu.Lock()
+	a.invalidated++
+	a.mu.Unlock()
+	return nil
+}
+
+// unwitnessedRepository reports the graphview refusals that mean "this
+// repository has no source authority to move right now", as opposed to a real
+// failure of this mutation (a cancelled context, a deadline).
+func unwitnessedRepository(err error) bool {
+	return errors.Is(err, graphview.ErrRepositoryOwnerUnknown) ||
+		errors.Is(err, graphview.ErrRepositoryOwnerInvalid) ||
+		errors.Is(err, graphview.ErrRawRepositoryNotReady) ||
+		errors.Is(err, graphview.ErrRepositoryAdmissionClosed) ||
+		errors.Is(err, graphview.ErrRepositoryAdmissionsStopped)
 }
 
 // Entry reports the registered entry point that opened this receipt.
@@ -1147,13 +1371,102 @@ func (r *OutputMutationReceipt) Complete() error {
 			ErrOutputMutationReceiptSuperseded, r.entry, r.target.OwnerKey, r.target.Generation)
 	}
 	if source != nil {
-		completeErr := source.Complete(fmt.Sprintf("gen0:r%d", source.Revision()))
+		unchanged, completeErr := source.CompleteUnchanged(gen0SourceFingerprint(source, r.content))
 		source.Release()
 		if completeErr != nil {
 			return completeErr
 		}
+		if unchanged {
+			r.authority.countUnchanged()
+		}
 	}
 	return nil
+}
+
+func (a *OutputGenerationAuthority) countUnchanged() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.unchanged++
+	a.mu.Unlock()
+}
+
+// ObserveSourceContent records what this mutation's payload moved, so the
+// generation-zero source fingerprint it completes with is derived from CONTENT
+// rather than from the revision the gate allocated. Calling it more than once
+// keeps the last report; not calling it at all keeps the conservative
+// revision-derived fingerprint.
+func (r *OutputMutationReceipt) ObserveSourceContent(content *OutputSourceContent) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.content = content
+	r.mu.Unlock()
+}
+
+// gen0SourceFingerprint is the CONTENT identity of one generation-zero
+// mutation, used as the source witness's fingerprint.
+//
+// Three cases, in order:
+//
+//   - the mutation reported that it moved NOTHING and the owner already had an
+//     available source: the fingerprint is the one that is already there, which
+//     is what makes CompleteUnchanged restore the prior observation instead of
+//     telling every live BasePin the corpus moved;
+//   - the mutation reported its path set: the digest folds the prior
+//     fingerprint together with each path's on-disk content identity (size,
+//     modification time, mode, existence) and the pass's own outcome counts, so
+//     two passes that wrote different bytes are different content;
+//   - the mutation reported nothing at all: the digest folds the revision, so
+//     the witness moves exactly as it did before any door reported content.
+func gen0SourceFingerprint(source *graphview.RawRepositoryMutationLease, content *OutputSourceContent) string {
+	prior := source.PriorFingerprint()
+	if content != nil && !content.Moved && prior != "" {
+		return prior
+	}
+	h := sha256.New()
+	writeFingerprintString(h, "gortex.gen0.source.v1")
+	writeFingerprintString(h, prior)
+	if content == nil {
+		writeFingerprintString(h, "revision")
+		writeFingerprintUint(h, source.Revision())
+		return "gen0:" + hex.EncodeToString(h.Sum(nil))
+	}
+	writeFingerprintString(h, "content")
+	writeFingerprintBool(h, content.Full)
+	writeFingerprintInt(h, content.Stale)
+	writeFingerprintInt(h, content.Deleted)
+	paths := append([]string(nil), content.Paths...)
+	sort.Strings(paths)
+	writeFingerprintInt(h, len(paths))
+	for _, path := range paths {
+		writeFingerprintString(h, path)
+		writeFingerprintString(h, pathContentIdentity(content.Root, path))
+	}
+	if len(paths) == 0 {
+		// A whole-repository pass names no path set, so the outcome counts
+		// above are the only content it can offer. Fold the revision in too:
+		// two full passes with identical counts are then still distinct, which
+		// keeps the conservative direction for the case that cannot enumerate.
+		writeFingerprintUint(h, source.Revision())
+	}
+	return "gen0:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// pathContentIdentity is one path's on-disk identity: the same size/mtime pair
+// the incremental indexer itself treats as "this file changed", plus the mode
+// and whether the path exists at all (a deletion is content too).
+func pathContentIdentity(root, path string) string {
+	if !filepath.IsAbs(path) && root != "" {
+		path = filepath.Join(root, path)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "absent"
+	}
+	return fmt.Sprintf("%d/%d/%o", info.Size(), info.ModTime().UnixNano(), info.Mode().Perm())
 }
 
 // Abandon settles a receipt that did not fulfil its generation. Idempotent.
@@ -1349,11 +1662,82 @@ func (idx *Indexer) legacyOutputTarget() OutputMutationTarget {
 // the same repository — the standalone orphan-lane Indexer a stack hands the
 // MCP server and the MultiIndexer-owned per-repository lane — still collide on
 // one owner, which is the case the fence exists for.
+//
+// The id is MONOTONICALLY ISSUED, not the handle's address. An address is
+// unique only among live objects: a closed store whose memory is reused by a
+// new store of the same type would inherit its identity, and two genuinely
+// independent outputs would then supersede each other. Ids are issued once per
+// store and never reused, so that cannot happen.
 func outputStoreIdentity(store graph.Store) string {
 	if store == nil {
 		return "store:none"
 	}
-	return fmt.Sprintf("store:%T/%p", store, store)
+	return fmt.Sprintf("store:%T/%d", store, outputStoreIDs.idFor(store))
+}
+
+// outputStoreIDRegistry issues the monotonic store ids above.
+//
+// It is keyed by the handle's ADDRESS and deliberately holds no reference to
+// the store itself: a daemon builds a private generation handle per sparse
+// build, and a registry that retained them would keep every closed store (and
+// its connection pool) alive for the life of the process.
+//
+// Retiring an entry is what makes an id safe to key on. A finalizer on the
+// handle does it, and the runtime frees an object only AFTER its finalizer has
+// run, so an address can never be handed to a new store while the previous
+// store's entry is still in the map. A handle that already carries a finalizer
+// (SetFinalizer panics on a second one) keeps its entry pinned instead; that is
+// the conservative direction and is no weaker than keying on the address alone.
+type outputStoreIDRegistry struct {
+	mu   sync.Mutex
+	next uint64
+	ids  map[uintptr]uint64
+}
+
+var outputStoreIDs = &outputStoreIDRegistry{ids: make(map[uintptr]uint64)}
+
+func (r *outputStoreIDRegistry) idFor(store graph.Store) uint64 {
+	value := reflect.ValueOf(store)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		// A non-pointer store has no stable address to key on. Merging every
+		// such handle of one type into one output is conservative: it can only
+		// make two mutations collide on one owner, never let two mutations of
+		// one output miss each other.
+		return 0
+	}
+	address := value.Pointer()
+	r.mu.Lock()
+	id, known := r.ids[address]
+	if !known {
+		r.next++
+		id = r.next
+		r.ids[address] = id
+	}
+	r.mu.Unlock()
+	if !known {
+		r.retireWith(store, address, id)
+	}
+	return id
+}
+
+func (r *outputStoreIDRegistry) retireWith(store graph.Store, address uintptr, id uint64) {
+	defer func() {
+		// SetFinalizer panics when the handle already carries a finalizer, or
+		// when it is not the start of an allocation. Neither is a reason to
+		// refuse the mutation: the entry simply stays.
+		_ = recover()
+	}()
+	runtime.SetFinalizer(store, func(any) { r.retire(address, id) })
+}
+
+func (r *outputStoreIDRegistry) retire(address uintptr, id uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Only the entry this id was issued for is retired, so a registry rebuilt
+	// for a later store at the same address survives a late finalizer.
+	if r.ids[address] == id {
+		delete(r.ids, address)
+	}
 }
 
 func legacyOutputTargetFor(output, prefix, root, fallback string) OutputMutationTarget {
@@ -1384,11 +1768,36 @@ func (idx *Indexer) withOutputGeneration(ctx context.Context, entry OutputMutati
 	if fn == nil {
 		return nil
 	}
-	receipt, err := idx.outputGenerationAuthority().Begin(ctx, entry, idx.legacyOutputTarget())
+	return idx.withOutputGenerationSource(ctx, entry,
+		func(func(*OutputSourceContent)) error { return fn() })
+}
+
+// withOutputGenerationSource is withOutputGeneration for a door that can report
+// the SOURCE content its payload moved. The body is handed an observer; what it
+// reports becomes the receipt's content-derived gen0 source fingerprint, and a
+// body that never calls the observer keeps the conservative revision-derived
+// one.
+func (idx *Indexer) withOutputGenerationSource(
+	ctx context.Context,
+	entry OutputMutationEntry,
+	fn func(observe func(*OutputSourceContent)) error,
+) error {
+	if fn == nil {
+		return nil
+	}
+	target := idx.legacyOutputTarget()
+	receipt, err := idx.outputGenerationAuthority().Begin(ctx, entry, target)
 	if err != nil {
 		return err
 	}
-	return runUnderOutputReceipt(receipt, fn)
+	return runUnderOutputReceipt(receipt, func() error {
+		return fn(func(content *OutputSourceContent) {
+			if content != nil && content.Root == "" {
+				content.Root = target.RootPath
+			}
+			receipt.ObserveSourceContent(content)
+		})
+	})
 }
 
 // runUnderOutputReceipt runs one mutation body under one already-admitted
