@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1212,5 +1213,227 @@ func TestDedicatedBasePublicationMigrationFutureStoreRefusedBeforeDDL(t *testing
 	}
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name='dedicated_base_publications'`).Scan(&companion); err != nil || companion != 0 {
 		t.Fatalf("future refusal ran publication DDL: table=%d err=%v", companion, err)
+	}
+}
+
+// ownerHead reads the owner checkout's recorded committed head.
+func (f *dedicatedPublicationFixture) ownerHead(t testing.TB) Checkout {
+	t.Helper()
+	row, found, err := f.c.GetCheckout(context.Background(), f.owner.CheckoutID)
+	if err != nil || !found {
+		t.Fatalf("owner checkout found=%v err=%v", found, err)
+	}
+	return row
+}
+
+// claimAt is the fixture's claim with a stated commit provenance and
+// observation clock — what a live publisher supplies, and what the head
+// advance is fenced on.
+func (f *dedicatedPublicationFixture) claimAt(t testing.TB, token, commitOID string, createdAt, active int64) DedicatedBaseBuildClaim {
+	t.Helper()
+	claim, err := f.c.ClaimDedicatedBaseBuild(context.Background(), ClaimDedicatedBaseBuildRequest{
+		Desire: f.desire, AttemptToken: token, ProvenanceCommitOID: commitOID, CreatedAt: createdAt,
+		ExpectedActiveGenerationID: active,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
+// TestDedicatedBaseAdoptionAdvancesTheOwnerHead pins the two identities of one
+// base moving together.
+//
+// dedicated_graphs.active_generation_id and checkouts.head_tree both name the
+// committed state a family's base is at, and until the adoption wrote the
+// second one only a reconciliation pass did — up to an hour later by default.
+// In that window graphBase's unpublished fallback, which reads the checkout row,
+// named a tree the base had already left, and every layer built over it carried
+// that stale identity. They now stand or fall in one transaction.
+func TestDedicatedBaseAdoptionAdvancesTheOwnerHead(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	before := f.ownerHead(t)
+	if before.HeadTree == "tree-a" {
+		t.Fatal("the fixture must start with an owner head that is not the published tree")
+	}
+
+	claim := f.claimAt(t, "attempt-a", "commit-a", 1000, 0)
+	f.publish(t, claim)
+	adoption := f.adopt(t, claim)
+
+	if !adoption.HeadAdvanced || adoption.TreeOID != "tree-a" || adoption.CommitOID != "commit-a" {
+		t.Fatalf("adoption = %+v, want the owner head advanced to the adopted tree", adoption)
+	}
+	if adoption.PreviousGenerationID != 0 || adoption.GenerationID != claim.GenerationID {
+		t.Fatalf("adoption pointers = %+v", adoption)
+	}
+	owner := f.ownerHead(t)
+	if owner.HeadTree != "tree-a" || owner.HeadCommit != "commit-a" {
+		t.Fatalf("owner head = %q/%q, want tree-a/commit-a", owner.HeadTree, owner.HeadCommit)
+	}
+	if owner.LastSeen != 1000 {
+		t.Fatalf("owner observation clock = %d, want the adoption's 1000", owner.LastSeen)
+	}
+	// The identity columns are as untouched by an adoption as they are by an
+	// observation: it states what the base is at, it never re-keys the row.
+	if owner.Incarnation != before.Incarnation || owner.AdminName != before.AdminName ||
+		owner.State != before.State || owner.EffectiveMode != before.EffectiveMode {
+		t.Fatalf("the adoption changed the owner's identity or mode: %+v", owner)
+	}
+
+	// A replay of the pointer that is already installed changes nothing.
+	replay := f.adopt(t, claim)
+	if !replay.AlreadyAdopted || replay.HeadAdvanced {
+		t.Fatalf("replay = %+v, want an already-adopted no-op", replay)
+	}
+}
+
+// TestDedicatedBaseAdoptionHeadAdvanceIsAtomicWithThePointer proves the two
+// writes are one transaction: an adoption whose active-pointer compare-and-set
+// is refused leaves the owner's head exactly where it was, so no checkout row
+// ever advertises a base that was never installed.
+func TestDedicatedBaseAdoptionHeadAdvanceIsAtomicWithThePointer(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	before := f.ownerHead(t)
+	claim := f.claimAt(t, "attempt-a", "commit-a", 1000, 0)
+	f.publish(t, claim)
+
+	// Another actor moved the pointer between this attempt's claim and its
+	// adoption. The adoption is refused as stale.
+	f.exec(t, `UPDATE dedicated_graphs SET active_generation_id=987654 WHERE graph_id=?`, f.graph.GraphID)
+	_, err := f.c.AdoptDedicatedBaseGeneration(context.Background(), AdoptDedicatedBaseGenerationRequest{claim})
+	if err == nil {
+		t.Fatal("a clobbered pointer adopted anyway")
+	}
+	if owner := f.ownerHead(t); owner.HeadTree != before.HeadTree || owner.HeadCommit != before.HeadCommit {
+		t.Fatalf("a refused adoption still advanced the owner head to %q/%q", owner.HeadTree, owner.HeadCommit)
+	}
+}
+
+// TestDedicatedBaseAdoptionCannotRewindALaterObservation is the fence in the
+// other direction.
+//
+// The publisher observes a tree, builds it, and adopts minutes later. If the
+// family committed again in between, a reconciliation pass has already recorded
+// the newer head, and the adoption must not restore the one it was built for —
+// the base is still published and still adopted, the checkout row is simply
+// ahead of it, which is the truth about a family that kept moving.
+func TestDedicatedBaseAdoptionCannotRewindALaterObservation(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	claim := f.claimAt(t, "attempt-a", "commit-a", 1000, 0)
+	f.publish(t, claim)
+
+	err := f.c.UpdateCheckoutObservation(context.Background(), UpdateCheckoutObservationRequest{
+		CheckoutID: f.owner.CheckoutID, Incarnation: f.owner.Incarnation, State: CheckoutStateReady,
+		RootPath: f.owner.RootPath, GitDir: f.owner.GitDir,
+		HeadRef: "refs/heads/main", HeadCommit: "commit-b", HeadTree: "tree-b",
+		LastAccessible: 2000, LastSeen: 2000,
+	})
+	if err != nil {
+		t.Fatalf("record the later observation: %v", err)
+	}
+
+	adoption := f.adopt(t, claim)
+	if adoption.GenerationID != claim.GenerationID || adoption.AlreadyAdopted {
+		t.Fatalf("adoption = %+v, want the generation adopted", adoption)
+	}
+	if adoption.HeadAdvanced {
+		t.Fatal("the adoption rewound a head a later observation had already moved")
+	}
+	if f.active(t) != claim.GenerationID {
+		t.Fatal("the active pointer did not move")
+	}
+	owner := f.ownerHead(t)
+	if owner.HeadTree != "tree-b" || owner.HeadCommit != "commit-b" || owner.LastSeen != 2000 {
+		t.Fatalf("owner head = %q/%q@%d, want the later observation intact", owner.HeadTree, owner.HeadCommit, owner.LastSeen)
+	}
+}
+
+// TestDedicatedBaseAdoptionAnnouncesToObservers pins the reach a published base
+// has to the layer above it.
+//
+// The publisher that adopts and the lifecycle that runs the dependents' build
+// loops share nothing but this database, and a dependent that is not told its
+// base moved finds out on its own poll at best. The announcement carries the
+// fact and nothing else, it is delivered after the transaction commits, and it
+// reaches an observer registered through any handle over the same store.
+func TestDedicatedBaseAdoptionAnnouncesToObservers(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	var mu sync.Mutex
+	var events []DedicatedBaseAdoptionEvent
+	// Registered through a SECOND catalog handle: Catalog() mints a new one per
+	// call, so an observer bound to the handle rather than to the database would
+	// never see the publisher's adoptions.
+	release := f.store.Catalog().ObserveDedicatedBaseAdoptions(func(event DedicatedBaseAdoptionEvent) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	})
+
+	claim := f.claimAt(t, "attempt-a", "commit-a", 1000, 0)
+	f.publish(t, claim)
+	f.adopt(t, claim)
+
+	mu.Lock()
+	seen := slices.Clone(events)
+	mu.Unlock()
+	if len(seen) != 1 {
+		t.Fatalf("adoption announced %d events, want 1", len(seen))
+	}
+	event := seen[0]
+	if !event.Advanced() {
+		t.Fatalf("event = %+v, want an advance", event)
+	}
+	if event.GraphID != f.graph.GraphID || event.FamilyID != f.graph.FamilyID ||
+		event.RepoPrefix != f.graph.RepoPrefix || event.Owner.CheckoutID != f.owner.CheckoutID {
+		t.Fatalf("event names %+v, want the adopted graph's family and owner", event)
+	}
+	if event.Adoption.GenerationID != claim.GenerationID || event.Adoption.TreeOID != "tree-a" ||
+		event.Adoption.PreviousGenerationID != 0 {
+		t.Fatalf("event adoption = %+v", event.Adoption)
+	}
+	// The observer sees a committed state: the pointer it is told about is
+	// already readable when it is told.
+	if f.active(t) != event.Adoption.GenerationID {
+		t.Fatal("the announcement preceded the commit it describes")
+	}
+
+	// A replay is announced as what it is, and nothing takes it for an advance.
+	f.adopt(t, claim)
+	mu.Lock()
+	seen = slices.Clone(events)
+	mu.Unlock()
+	if len(seen) != 2 || seen[1].Advanced() {
+		t.Fatalf("replay announced %d events, last advanced=%v", len(seen), seen[len(seen)-1].Advanced())
+	}
+
+	release()
+	release() // idempotent
+
+	// Releasing the last observer takes the database's registry out of the map
+	// rather than leaving an empty one behind for the life of the process, so
+	// the next registration has to work over a registry that was detached.
+	var laterMu sync.Mutex
+	var later []DedicatedBaseAdoptionEvent
+	defer f.store.Catalog().ObserveDedicatedBaseAdoptions(func(event DedicatedBaseAdoptionEvent) {
+		laterMu.Lock()
+		later = append(later, event)
+		laterMu.Unlock()
+	})()
+
+	f.observe(t, DedicatedBaseIdentity{TreeOID: "tree-c", ConfigHash: "config", ExtractorVersions: "extractors", ResolverVersion: "resolver"})
+	next := f.claimAt(t, "attempt-b", "commit-c", 3000, claim.GenerationID)
+	f.publish(t, next)
+	f.adopt(t, next)
+	mu.Lock()
+	after := len(events)
+	mu.Unlock()
+	if after != 2 {
+		t.Fatalf("a released observer received %d events, want 2", after)
+	}
+	laterMu.Lock()
+	defer laterMu.Unlock()
+	if len(later) != 1 || later[0].Adoption.GenerationID != next.GenerationID || !later[0].Advanced() {
+		t.Fatalf("the observer registered after the last release saw %+v", later)
 	}
 }

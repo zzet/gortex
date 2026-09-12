@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 )
 
 // dedicatedBasePublicationsSchemaSQL is shared by fresh-store initialization
@@ -104,9 +105,30 @@ type DedicatedBaseBuildClaim struct {
 }
 
 type AdoptDedicatedBaseGenerationRequest struct{ Claim DedicatedBaseBuildClaim }
+
+// DedicatedBaseAdoption is what one adoption installed.
+//
+// PreviousGenerationID is the active pointer the adoption replaced, so a caller
+// can tell an advance (previous != GenerationID) from a replay of the pointer
+// that was already installed. TreeOID and CommitOID are the committed point the
+// adopted generation represents, read from the generation row rather than from
+// the request: a claim that resolved to an already-ready candidate names the
+// tree that candidate was built for, which is the tree the base actually holds.
+// HeadAdvanced reports whether the owner checkout's head columns moved with it;
+// false means a later observation had already moved them past this base, which
+// is not a failure (see AdoptDedicatedBaseGeneration).
+//
+// A replay — AlreadyAdopted, the pointer already installed — reports the
+// pointers alone. It moved nothing, so it reads nothing: the idle
+// observe-claim-adopt cycle a warm daemon runs stays a cycle that performs no
+// catalog work beyond the guards it has to check.
 type DedicatedBaseAdoption struct {
-	GenerationID   int64
-	AlreadyAdopted bool
+	GenerationID         int64
+	PreviousGenerationID int64
+	TreeOID              string
+	CommitOID            string
+	HeadAdvanced         bool
+	AlreadyAdopted       bool
 }
 type FailDedicatedBaseBuildRequest struct {
 	Claim DedicatedBaseBuildClaim
@@ -557,10 +579,36 @@ func (c *Catalog) ClaimDedicatedBaseBuild(ctx context.Context, req ClaimDedicate
 	return out, nil
 }
 
+// AdoptDedicatedBaseGeneration installs a built generation as the graph's
+// committed base.
+//
+// It advances two identities for the same base in one transaction. The first is
+// dedicated_graphs.active_generation_id, the pointer every dependent's
+// graphBase reads. The second is the owner checkout's head_tree / head_commit:
+// until this write existed, checkouts.head_tree moved only when a reconciliation
+// pass sampled the working copy (internal/reconcile/reconcile.go applyPresent,
+// observeNew), so between a commit and the next pass — an hour by default — the
+// two identities for one base disagreed, and the fallback that reads the
+// checkout row (checkout_coordinator.go graphBase, for a graph with no published
+// generation) named a tree the family had already moved past. Both pointers now
+// stand or fall together: an adoption that cannot commit leaves the checkout row
+// exactly as it found it.
+//
+// The head advance is fenced three ways. Owner and incarnation come from the
+// claim's authority, which dedicatedBaseOwnerTx has already matched against the
+// live row in this transaction. The previous active pointer is the CAS below.
+// And the observation clock keeps the advance monotonic against the
+// reconciliation passes that write the same columns: an adopted generation
+// carries the clock of the observation it was claimed for, so a base built from
+// an older sample cannot rewind a head a later pass already moved. That last
+// guard is not an error — the checkout row is then AHEAD of this base, which is
+// a true statement about a family that kept committing, and the generation is
+// still adopted.
 func (c *Catalog) AdoptDedicatedBaseGeneration(ctx context.Context, req AdoptDedicatedBaseGenerationRequest) (DedicatedBaseAdoption, error) {
 	claim := req.Claim
 	var out DedicatedBaseAdoption
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		out = DedicatedBaseAdoption{}
 		active, err := dedicatedBaseOwnerTx(ctx, tx, claim.Desire.Authority.GraphID, claim.Desire.Authority.Owner, claim.Desire.Authority)
 		if err != nil {
 			return err
@@ -579,6 +627,7 @@ func (c *Catalog) AdoptDedicatedBaseGeneration(ctx context.Context, req AdoptDed
 			return err
 		}
 		out.GenerationID = claim.GenerationID
+		out.PreviousGenerationID = active
 		if p.AttemptState == "adopted" && active == claim.GenerationID {
 			out.AlreadyAdopted = true
 			return nil
@@ -592,13 +641,197 @@ func (c *Catalog) AdoptDedicatedBaseGeneration(ctx context.Context, req AdoptDed
 		if err := execGuardedTx(ctx, tx, "dedicated base active pointer", `UPDATE dedicated_graphs SET active_generation_id=? WHERE graph_id=? AND COALESCE(active_generation_id,0)=?`, claim.GenerationID, claim.Desire.Authority.GraphID, claim.ExpectedActiveGenerationID); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE dedicated_base_publications SET attempt_state='adopted',error='' WHERE graph_id=?`, claim.Desire.Authority.GraphID)
+		if _, err := tx.ExecContext(ctx, `UPDATE dedicated_base_publications SET attempt_state='adopted',error='' WHERE graph_id=?`, claim.Desire.Authority.GraphID); err != nil {
+			return err
+		}
+		adopted, err := dedicatedBaseGenerationTx(ctx, tx, claim.GenerationID)
+		if err != nil {
+			return err
+		}
+		out.TreeOID, out.CommitOID = adopted.TreeOID, adopted.ProvenanceCommitOID
+		out.HeadAdvanced, err = advanceDedicatedBaseOwnerHeadTx(ctx, tx, claim.Desire.Authority.Owner, adopted)
 		return err
 	})
 	if err != nil {
 		return DedicatedBaseAdoption{}, err
 	}
+	announceDedicatedBaseAdoption(c.store, DedicatedBaseAdoptionEvent{
+		GraphID:    claim.Desire.Authority.GraphID,
+		FamilyID:   claim.Desire.Authority.FamilyID,
+		RepoPrefix: claim.Desire.Authority.RepoPrefix,
+		Owner:      claim.Desire.Authority.Owner,
+		Adoption:   out,
+	})
 	return out, nil
+}
+
+// advanceDedicatedBaseOwnerHeadTx moves the owner checkout's committed head to
+// the point the adopted generation represents, in the adoption's transaction.
+//
+// The clock comparison is the whole fence. created_at on a generation is the
+// clock of the observation the claim was made for (the publisher stamps it when
+// it observes; see internal/indexer), and last_seen on a checkout is the clock
+// of the last observation written for it, which is what
+// UpdateCheckoutObservation is fenced on too. Writing the later of the two back
+// into last_seen is what makes the two writers one ordered sequence instead of
+// two racing ones: a reconciliation pass sampled before this base was observed
+// can no longer overwrite the head this adoption just published.
+//
+// A generation with no tree, and a checkout whose clock has already passed this
+// observation, both leave the row alone and report false. Neither is an error:
+// the first cannot describe a committed point at all, and the second means a
+// later observation already won, which the catalog has no reason to undo.
+// head_commit is written only when the generation carries a provenance commit —
+// a claim satisfied by a tree-equal candidate built for another commit names no
+// commit this owner is at, and the tree is the identity that matters.
+func advanceDedicatedBaseOwnerHeadTx(ctx context.Context, tx *sql.Tx, owner DedicatedBaseOwner, adopted ViewGeneration) (bool, error) {
+	if adopted.TreeOID == "" {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `
+UPDATE checkouts
+   SET head_tree = ?,
+       head_commit = CASE WHEN ? = '' THEN head_commit ELSE ? END,
+       last_seen = CASE WHEN last_seen < ? THEN ? ELSE last_seen END
+ WHERE checkout_id = ? AND incarnation = ? AND last_seen <= ?`,
+		adopted.TreeOID, adopted.ProvenanceCommitOID, adopted.ProvenanceCommitOID,
+		adopted.CreatedAt, adopted.CreatedAt,
+		owner.CheckoutID, owner.Incarnation, adopted.CreatedAt)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// DedicatedBaseAdoptionEvent is one adopted committed base, announced to the
+// observers registered on the store it was adopted in.
+//
+// It exists because the two halves of a base advance are owned by different
+// layers and share nothing but the database. The publisher that adopts holds no
+// coordinator registry; the checkout lifecycle that runs the dependents' build
+// loops never sees a publication. Without an announcement a dependent learns
+// that its base moved only when its own poll comes round, which is the latency
+// this event removes — it carries no payload and no authority, only the fact
+// that the pointer moved and what it moved to.
+type DedicatedBaseAdoptionEvent struct {
+	GraphID    string
+	FamilyID   string
+	RepoPrefix string
+	Owner      DedicatedBaseOwner
+	Adoption   DedicatedBaseAdoption
+}
+
+// Advanced reports an event that moved the active pointer, as opposed to a
+// replay of one that was already installed. A replay changes nothing a
+// dependent could observe, so it is not a reason to wake one.
+func (e DedicatedBaseAdoptionEvent) Advanced() bool {
+	return e.Adoption.GenerationID > 0 && !e.Adoption.AlreadyAdopted &&
+		e.Adoption.PreviousGenerationID != e.Adoption.GenerationID
+}
+
+// dedicatedBaseAdoptionObservers maps one open database — the storeCore every
+// handle over it shares — to the observers registered on it.
+//
+// The key is the core rather than a *Store or a *Catalog because neither of
+// those is stable: Store.Catalog() mints a fresh handle on every call, so the
+// publisher's catalog and the lifecycle's catalog are different values over the
+// same database. Keying on the core is what makes an observer registered
+// through one of them reachable from the other, while two stores in one process
+// — two daemons, two fixtures — keep their announcements apart.
+var dedicatedBaseAdoptionObservers sync.Map // *storeCore -> *dedicatedBaseAdoptionRegistry
+
+type dedicatedBaseAdoptionRegistry struct {
+	mu   sync.Mutex
+	next uint64
+	// detached marks a registry the last release took out of the map. A
+	// registration that raced that release holds a value nothing will ever
+	// announce through, so it retries rather than registering into it.
+	detached  bool
+	observers map[uint64]func(DedicatedBaseAdoptionEvent)
+}
+
+// ObserveDedicatedBaseAdoptions registers fn to receive every adoption made
+// against this catalog's database, and returns the idempotent release that
+// unregisters it. A nil fn registers nothing.
+//
+// Observers run synchronously on the adopting goroutine, AFTER the adoption
+// transaction has committed, so an observer sees a state it can read back — and
+// so an observer that panics or blocks cannot roll back a published base. They
+// must therefore do no more than hand the fact on.
+func (c *Catalog) ObserveDedicatedBaseAdoptions(fn func(DedicatedBaseAdoptionEvent)) func() {
+	if c == nil || c.store == nil || fn == nil {
+		return func() {}
+	}
+	key := c.store.storeCore
+	var registry *dedicatedBaseAdoptionRegistry
+	var id uint64
+	for {
+		value, _ := dedicatedBaseAdoptionObservers.LoadOrStore(key, &dedicatedBaseAdoptionRegistry{})
+		candidate, ok := value.(*dedicatedBaseAdoptionRegistry)
+		if !ok {
+			return func() {}
+		}
+		candidate.mu.Lock()
+		if candidate.detached {
+			// The last release took this one out of the map between the load
+			// and the lock. Nothing announces through it any more, so take the
+			// replacement instead of registering into a value nobody reads.
+			candidate.mu.Unlock()
+			continue
+		}
+		candidate.next++
+		id = candidate.next
+		if candidate.observers == nil {
+			candidate.observers = map[uint64]func(DedicatedBaseAdoptionEvent){}
+		}
+		candidate.observers[id] = fn
+		candidate.mu.Unlock()
+		registry = candidate
+		break
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			registry.mu.Lock()
+			delete(registry.observers, id)
+			if len(registry.observers) == 0 {
+				// The last observer for this database is gone. Detach under the
+				// lock so a concurrent registration sees the flag rather than a
+				// value that has left the map, and delete only this registry —
+				// a replacement another goroutine already stored stays.
+				registry.detached = true
+				dedicatedBaseAdoptionObservers.CompareAndDelete(key, registry)
+			}
+			registry.mu.Unlock()
+		})
+	}
+}
+
+func announceDedicatedBaseAdoption(store *Store, event DedicatedBaseAdoptionEvent) {
+	if store == nil {
+		return
+	}
+	value, found := dedicatedBaseAdoptionObservers.Load(store.storeCore)
+	if !found {
+		return
+	}
+	registry, ok := value.(*dedicatedBaseAdoptionRegistry)
+	if !ok {
+		return
+	}
+	registry.mu.Lock()
+	observers := make([]func(DedicatedBaseAdoptionEvent), 0, len(registry.observers))
+	for _, observer := range registry.observers {
+		observers = append(observers, observer)
+	}
+	registry.mu.Unlock()
+	for _, observer := range observers {
+		observer(event)
+	}
 }
 
 func (c *Catalog) FailDedicatedBaseBuild(ctx context.Context, req FailDedicatedBaseBuildRequest) error {

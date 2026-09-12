@@ -288,6 +288,14 @@ type CheckoutLifecycle struct {
 	batchDepth   int
 	batchPending bool
 
+	// baseAdoptionRelease unregisters this lifecycle's committed-base adoption
+	// observer, installed in the constructor and dropped by Close. It is the
+	// reach from a published base to the dependents that compose over it: the
+	// publisher and the coordinator registry share nothing but the store, so
+	// the announcement travels through the catalog. nil when the backend has no
+	// catalog to observe.
+	baseAdoptionRelease func()
+
 	// transitionCtx owns promotion and demotion workers. Durable transition
 	// rows outlive request contexts; this context instead lives for exactly as
 	// long as the lifecycle, so a disconnected caller cannot abandon work and
@@ -369,7 +377,80 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		return nil, fmt.Errorf("indexer: build checkout reconciler: %w", err)
 	}
 	l.rec = rec
+	// Registered here rather than by whatever builds a publisher: the
+	// coordinator registry is this object's, every publisher in the process
+	// adopts against the same store, and a lifecycle that never publishes
+	// anything itself still serves the dependents a sibling's publication moves.
+	l.baseAdoptionRelease = l.catalog.ObserveDedicatedBaseAdoptions(l.dedicatedBaseAdopted)
 	return l, nil
+}
+
+// dedicatedBaseAdopted wakes the checkouts that compose over a base that has
+// just advanced.
+//
+// A dependent's commit layer is identified by the base it was built over
+// (CheckoutCoordinator.commitIdentity carries the base's committed tree as the
+// layer's lower_view_fingerprint), so an advanced base means every dependent in
+// the family now has a layer whose identity names the previous one. Nothing told
+// them: ensureCoordinator signals on the dependent's OWN head moving, and the
+// base is not that. Without this they would find out on the 15-second poll at
+// best, and in the unpublished regime — where the base identity is the owner
+// checkout's head_tree — not at all until a reconciliation pass rewrote that row.
+//
+// Waking is all it does. The cycle it wakes recomposes over the pointer it finds
+// and flips its route only once the replacement is built, so the route keeps
+// serving the pair it already holds — an old layer over the base generation it
+// names, which is retained and pinned for as long as a reader holds it — until
+// there is something coherent to replace it with. No new base is spliced under
+// an old delta by this signal, and none is by the cycle it starts.
+//
+// The owner is skipped: it is the checkout the base was published FOR, and its
+// own route is not composed over itself. Ref views are not signalled at all,
+// and that is not an omission — RefViewManager resolves the base per selection
+// (EnsureRefView reads it before the identity it keys on, ref_views.go), so it
+// has no cached base to invalidate; what it does cache, the dependency cohort,
+// is invalidated by the observation event that precedes publication.
+func (l *CheckoutLifecycle) dedicatedBaseAdopted(event store_sqlite.DedicatedBaseAdoptionEvent) {
+	if l == nil || !event.Advanced() {
+		return
+	}
+	reason := fmt.Sprintf("committed base of %s advanced to generation %d",
+		event.GraphID, event.Adoption.GenerationID)
+	woken := l.signalFamilyCoordinators(event.FamilyID, event.Owner.CheckoutID, reason)
+	l.logger.Debug("checkout lifecycle: committed base advanced",
+		zap.String("graph", event.GraphID), zap.String("family", event.FamilyID),
+		zap.Int64("generation", event.Adoption.GenerationID),
+		zap.Int64("previous_generation", event.Adoption.PreviousGenerationID),
+		zap.String("tree", event.Adoption.TreeOID),
+		zap.Bool("head_advanced", event.Adoption.HeadAdvanced),
+		zap.Int("dependents_signalled", woken))
+}
+
+// signalFamilyCoordinators signals every live coordinator in one family,
+// skipping the named checkout, and reports how many it reached.
+//
+// The registry snapshot is taken under coordMu and the signals are sent outside
+// it, as every other fan-out here does: Signal is buffered to one and never
+// blocks, but a coordinator's own locks are not this lock's to wait behind. An
+// empty familyID matches nothing — a fan-out that cannot name its family would
+// otherwise wake every checkout in the daemon.
+func (l *CheckoutLifecycle) signalFamilyCoordinators(familyID, skipCheckoutID, reason string) int {
+	if l == nil || familyID == "" {
+		return 0
+	}
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for checkoutID, coordinator := range l.coordinators {
+		if coordinator == nil || checkoutID == skipCheckoutID || coordinator.familyID != familyID {
+			continue
+		}
+		coordinators = append(coordinators, coordinator)
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		coordinator.Signal(reason)
+	}
+	return len(coordinators)
 }
 
 // SetWatcherSource installs the accessor for the live file watcher. The
@@ -2560,6 +2641,12 @@ func (l *CheckoutLifecycle) ViewLeases() *graphview.LeaseManager {
 func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
+	}
+	// Unregistered first: a publication this shutdown is cancelling can still
+	// adopt, and an announcement that reaches a registry being torn down would
+	// signal coordinators this Close is about to join.
+	if l.baseAdoptionRelease != nil {
+		l.baseAdoptionRelease()
 	}
 	readersDrained := l.stopRepositoryAdmissions()
 	publishersDrained := l.stopRepositoryPublishers()

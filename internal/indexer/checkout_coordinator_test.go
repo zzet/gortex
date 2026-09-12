@@ -1971,3 +1971,123 @@ func TestSweepCollectsCrashOrphanedGenerations(t *testing.T) {
 		t.Fatalf("the route moved under the sweep: %+v, want %+v", after, routed)
 	}
 }
+
+// movePrimaryHead advances the primary checkout's recorded committed tree,
+// which is what a committed-base advance looks like to every dependent in the
+// family: graphBase reads the owner checkout's head when the primary graph has
+// no published generation, and AdoptDedicatedBaseGeneration writes that same
+// column when it has.
+func (f *coordinatorFixture) movePrimaryHead(t *testing.T, tree string) {
+	t.Helper()
+	row, found, err := f.catalog.GetCheckout(context.Background(), f.primaryID)
+	if err != nil || !found {
+		t.Fatalf("read the primary checkout: found=%v err=%v", found, err)
+	}
+	err = f.catalog.UpdateCheckoutObservation(context.Background(), store_sqlite.UpdateCheckoutObservationRequest{
+		CheckoutID: row.CheckoutID, Incarnation: row.Incarnation, State: row.State,
+		RootPath: row.RootPath, GitDir: row.GitDir,
+		HeadRef: row.HeadRef, HeadCommit: row.HeadCommit, HeadTree: tree,
+		LastAccessible: row.LastAccessible, LastSeen: row.LastSeen + 60,
+	})
+	if err != nil {
+		t.Fatalf("move the primary's committed tree: %v", err)
+	}
+}
+
+// TestCoordinatorRefusesACommitLayerOverAMovedBase is the base half of the
+// guard TestCoordinatorRefusesAWorkingTreeLayerOverAStaleHead makes for the
+// checkout's own HEAD.
+//
+// A cycle reads the primary's committed base once and builds a layer whose
+// identity names it — the base tree is the left-hand side of the layer's diff
+// and is stamped on the generation as its lower_view_fingerprint. The primary
+// is free to publish a new committed base while that build runs, and routing
+// the result afterwards serves this checkout's OLD delta over the family's NEW
+// base: the paths that moved between the two bases and are not in the delta
+// show through as this checkout's content. The cycle refuses instead, leaves
+// the route on the pair it already serves, and asks for another window.
+//
+// The halves are driven by hand for the same reason the HEAD-move test drives
+// them: the interleaving IS the test.
+func TestCoordinatorRefusesACommitLayerOverAMovedBase(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+
+	// A first cycle brings the checkout up over the base both checkouts share.
+	settled := coordinatorReconcile(t, c)
+	if settled.CommitGenerationID == 0 || settled.DirtyGenerationID == 0 {
+		t.Fatalf("the first cycle did not route a pair: %+v", settled)
+	}
+	routed, found := f.generation(settled.CommitGenerationID)
+	if !found || routed.LowerViewFingerprint != f.treeA || routed.TreeOID != f.treeA {
+		t.Fatalf("the routed commit layer is not the tree-A-over-tree-A pair: %+v", routed)
+	}
+	before := f.route()
+
+	// The checkout commits, and the primary publishes a different committed
+	// base while the layer for the checkout's new tree is being built. The
+	// cycle is still holding the base it read at its start.
+	treeB := f.commitTreeB()
+	stale, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("primaryBase: %v", err)
+	}
+	f.movePrimaryHead(t, treeB)
+
+	route := before
+	var out CheckoutCycle
+	generation, err := c.reconcileCommitSlot(ctx, stale, treeB, &route, &out)
+	if !errors.Is(err, errBaseMoved) {
+		t.Fatalf("reconcileCommitSlot over a moved base = (%d, %v), want errBaseMoved", generation, err)
+	}
+	if !out.Rescheduled || out.CommitBuilt || out.CommitReused {
+		t.Fatalf("the refusal reported a settled slot: %+v", out)
+	}
+	if len(c.signal) != 1 {
+		t.Fatal("the coordinator did not signal itself for another window")
+	}
+
+	// The old route is still served, and it is still a coherent pair: the same
+	// commit generation, over the same base it was built against, with the same
+	// working-tree layer on top. Nothing was spliced.
+	stored := f.route()
+	if stored.CommitGenerationID != before.CommitGenerationID ||
+		stored.DirtyGenerationID != before.DirtyGenerationID ||
+		stored.RouteEpoch != before.RouteEpoch {
+		t.Fatalf("the refused cycle moved the route: %+v, was %+v", stored, before)
+	}
+	if !graphview.RouteReady(stored) {
+		t.Fatalf("the refused cycle left the route unable to serve: %+v", stored)
+	}
+	still, found := f.generation(stored.CommitGenerationID)
+	if !found || still.LowerViewFingerprint != f.treeA {
+		t.Fatalf("the served commit layer no longer names the base it was built over: %+v", still)
+	}
+
+	// Nothing built over the base that was left is routable: the layer the
+	// refusal abandoned is not the one the route names, and it is not servable.
+	for _, row := range f.generations() {
+		if row.GenerationKind != CommitLayerGenerationKind || row.GenerationID == stored.CommitGenerationID {
+			continue
+		}
+		if row.LowerViewFingerprint == f.treeA && row.TreeOID == treeB && servableGeneration(row.State) {
+			t.Fatalf("a layer built over the base the family left is still servable: %+v", row)
+		}
+	}
+
+	// The next cycle is what settles it, over the base that is current. Every
+	// routed pair names one base: never the new base under the old delta.
+	recomposed := coordinatorReconcile(t, c)
+	if !recomposed.CommitBuilt && !recomposed.CommitReused {
+		t.Fatalf("the follow-up cycle did not settle the commit slot: %+v", recomposed)
+	}
+	row, found := f.generation(recomposed.CommitGenerationID)
+	if !found || row.LowerViewFingerprint != treeB || row.TreeOID != treeB {
+		t.Fatalf("the recomposed layer pairs base %q with tree %q, want both at the current base",
+			row.LowerViewFingerprint, row.TreeOID)
+	}
+	if !graphview.RouteReady(f.route()) {
+		t.Fatalf("the checkout did not come back up: %+v", f.route())
+	}
+}

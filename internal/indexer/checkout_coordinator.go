@@ -166,6 +166,17 @@ var errRouteMoved = errors.New("indexer: the checkout route moved under this coo
 // quiet or to give up.
 var errCheckoutUnsettled = errors.New("indexer: the working tree moved under two builds")
 
+// errBaseMoved reports that the primary's committed base advanced between the
+// read that started this cycle and the flip that would have routed its result.
+//
+// It is the base half of the guard reconcileDirtySlot already makes for the
+// checkout's own HEAD. A cycle reads the base once and builds a layer whose
+// identity names it; routing that layer after the base has moved publishes a
+// delta against a base the family has left, which is exactly the splice gate 5
+// forbids. The cycle stops instead, leaving the route on the pair it already
+// serves, and reschedules — the next one composes over the base that is current.
+var errBaseMoved = errors.New("indexer: the committed base advanced under this coordinator")
+
 // CheckoutCoordinatorConfig is what one coordinator needs to serve one
 // automatic checkout.
 type CheckoutCoordinatorConfig struct {
@@ -1030,6 +1041,11 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 			c.rescheduleOnLostRoute("route moved under the commit flip")
 			return out
 		}
+		if errors.Is(err, errBaseMoved) {
+			// Already counted, logged and signalled beside the decision, the
+			// way the HEAD-move guard records its own.
+			return out
+		}
 		out.Err = err
 		return out
 	}
@@ -1055,6 +1071,22 @@ func (c *CheckoutCoordinator) rescheduleOnLostRoute(reason string) {
 	c.logger.Debug("checkout coordinator: route flip lost",
 		zap.String("checkout", c.checkoutID), zap.String("reason", reason))
 	c.Signal(reason)
+}
+
+// rescheduleOnMovedBase records a cycle that refused to route a layer over a
+// base the family has left, and asks for the one that will compose over the
+// base that is current. It counts as rescheduled rather than as a lost
+// compare-and-set: nothing was written and no route was contended, the inputs
+// simply moved — the same shape as the working tree moving under two builds,
+// and it is recorded at the same place that one is, beside the decision.
+func (c *CheckoutCoordinator) rescheduleOnMovedBase(base primaryBase, out *CheckoutCycle) {
+	out.Rescheduled = true
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
+	c.logger.Debug("checkout coordinator: the primary base advanced under the cycle",
+		zap.String("checkout", c.checkoutID),
+		zap.Int64("built_over_generation", base.generationID),
+		zap.String("built_over_tree", base.treeOID))
+	c.Signal("the primary base advanced under the cycle")
 }
 
 // RehomeTo rebuilds this checkout's whole stack over another dedicated graph
@@ -1384,6 +1416,24 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 	if err != nil {
 		return 0, err
 	}
+	// The base half of the HEAD-move guard reconcileDirtySlot makes. A commit
+	// layer takes as long as the tree it indexes, and the primary is free to
+	// publish a new committed base while one is being built over the old one:
+	// routing the result then serves this checkout's delta over a base the
+	// family has left. The route keeps the pair it already holds — coherent,
+	// over a generation that is retained for as long as a reader names it — and
+	// the next cycle composes over the base that is current.
+	if moved, err := c.baseMovedUnderCycle(ctx, base); err != nil || moved {
+		if !reused {
+			c.supersede(ctx, generationID)
+			c.offerRetire(ctx, generationID)
+		}
+		if err != nil {
+			return 0, err
+		}
+		c.rescheduleOnMovedBase(base, out)
+		return 0, fmt.Errorf("%w: built for %s", errBaseMoved, base.treeOID)
+	}
 	if !reused {
 		out.CommitBuilt = true
 	}
@@ -1402,6 +1452,23 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 	c.retainCommit(ctx, key, generationID)
 	c.releaseCommit(ctx, previous)
 	return generationID, nil
+}
+
+// baseMovedUnderCycle re-reads the family's primary base and reports whether it
+// is still the one the cycle was planned against.
+//
+// It is one metadata read, and it is taken on the build path only — after a
+// layer has been built or pulled from the cache, before anything is routed.
+// Comparing the whole primaryBase rather than the generation id alone covers
+// the regime where the base has no published generation: there the base is the
+// owner checkout's recorded committed tree, which moves without any pointer
+// moving with it.
+func (c *CheckoutCoordinator) baseMovedUnderCycle(ctx context.Context, base primaryBase) (bool, error) {
+	current, err := c.primaryBase(ctx)
+	if err != nil {
+		return false, err
+	}
+	return current != base, nil
 }
 
 // resolveCommitLayer reaches a commit generation describing one tree over one

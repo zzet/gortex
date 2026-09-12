@@ -443,6 +443,24 @@ UPDATE checkouts
 // read predates a promotion revert it, because the incarnation guard does not
 // move on a mode transition. The two writers touch disjoint columns instead,
 // so neither can lose the other's update.
+//
+// last_seen is the observation clock, and it fences the write as well as
+// recording it. The incarnation guard says the row is still the same working
+// copy; it says nothing about WHEN the facts being written were sampled, so two
+// passes racing — a janitor tick and an explicit track, or a pass whose git
+// sample was slow — could land in either order and let an older sample overwrite
+// a newer one. head_tree is what a dependent worktree's build identity keys on
+// (checkout_coordinator.go graphBase), so losing that race publishes a base
+// identity the family has already moved past. An observation that carries a
+// clock therefore applies only while the stored clock has not passed it.
+//
+// A request with no clock (LastSeen == 0) is not fenced. That is the unclocked
+// writer — a test or an administrative repair stating one column — and fencing
+// it against a stored clock would refuse every such write for the life of the
+// row. Both production observers stamp their pass clock (reconcile.go, and
+// checkout_lifecycle.go's confirmPresent), so the fence covers the writers that
+// race. A refusal reports ErrCatalogStaleGuard, which every caller already
+// treats as "another actor moved this row first; leave the winner alone".
 func (c *Catalog) UpdateCheckoutObservation(ctx context.Context, req UpdateCheckoutObservationRequest) error {
 	if err := req.validate(); err != nil {
 		return err
@@ -455,13 +473,14 @@ UPDATE checkouts
        last_accessible = ?, unavailable_since = ?, availability_deadline = ?,
        removal_detected_at = ?, removal_deadline = ?, removal_evidence = ?,
        last_seen = ?, last_error = ?
- WHERE checkout_id = ? AND incarnation = ?`,
+ WHERE checkout_id = ? AND incarnation = ? AND (? = 0 OR last_seen <= ?)`,
 		string(req.State),
 		req.RootPath, req.GitDir, catalogBoolInt(req.Locked), catalogBoolInt(req.Prunable),
 		req.HeadRef, req.HeadCommit, req.HeadTree,
 		req.LastAccessible, req.UnavailableSince, req.AvailabilityDeadline,
 		req.RemovalDetectedAt, req.RemovalDeadline, req.RemovalEvidence,
-		req.LastSeen, req.LastError, req.CheckoutID, req.Incarnation)
+		req.LastSeen, req.LastError, req.CheckoutID, req.Incarnation,
+		req.LastSeen, req.LastSeen)
 }
 
 // DeleteCheckout removes a checkout. Its tracking intents, in-flight intent

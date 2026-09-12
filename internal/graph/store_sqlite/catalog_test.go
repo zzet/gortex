@@ -1974,8 +1974,13 @@ func TestCatalogObservationWriteMovesBothClocks(t *testing.T) {
 		RemovalDetectedAt:    40,
 		RemovalDeadline:      50,
 		RemovalEvidence:      "evidence_prunable_confirmed",
-		LastSeen:             60,
-		LastError:            "volume detached",
+		// Later than the seeded row's clock (101): the observation write is
+		// fenced on last_seen, so a pass whose clock predates the one already
+		// stored is refused rather than applied. The other clock axes are
+		// deliberately left at their small arbitrary values — they are the
+		// columns under test here, and none of them fences anything.
+		LastSeen:  160,
+		LastError: "volume detached",
 	}
 	if err := catalog.UpdateCheckoutObservation(ctx, req); err != nil {
 		t.Fatalf("UpdateCheckoutObservation: %v", err)
@@ -2558,5 +2563,72 @@ func TestCatalogWithdrawProducer(t *testing.T) {
 	}
 	if err := catalog.WithdrawProducer(ctx, 0, "source.snapshot", ""); !errors.Is(err, ErrCatalogInvalidValue) {
 		t.Errorf("withdrawing on generation 0 = %v, want %v", err, ErrCatalogInvalidValue)
+	}
+}
+
+// TestCatalogObservationFenceOrdersTheWriters pins the monotonic fence on the
+// observation write.
+//
+// Two observers write these columns — the reconciliation pass and, through
+// AdoptDedicatedBaseGeneration, the committed-base publisher — and the
+// incarnation guard orders neither: it says the row is still the same working
+// copy, not that the facts being written are the newest anybody sampled. Without
+// the fence a pass that started before a newer one, or before an adoption, could
+// land after it and restore the head_tree the family had already moved past —
+// which is the column every dependent worktree's layer identity is keyed on.
+func TestCatalogObservationFenceOrdersTheWriters(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	observation := func(clock int64, tree string) UpdateCheckoutObservationRequest {
+		return UpdateCheckoutObservationRequest{
+			CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateReady,
+			RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git",
+			HeadRef: "refs/heads/main", HeadCommit: "commit-" + tree, HeadTree: tree,
+			LastAccessible: clock, LastSeen: clock,
+		}
+	}
+	headTree := func() string {
+		t.Helper()
+		row, ok, err := catalog.GetCheckout(ctx, "wt")
+		if err != nil || !ok {
+			t.Fatalf("GetCheckout = %v %v", ok, err)
+		}
+		return row.HeadTree
+	}
+
+	if err := catalog.UpdateCheckoutObservation(ctx, observation(200, "tree-newest")); err != nil {
+		t.Fatalf("the newest observation was refused: %v", err)
+	}
+	if got := headTree(); got != "tree-newest" {
+		t.Fatalf("head_tree = %q, want tree-newest", got)
+	}
+
+	// The pass that sampled first, and arrived second.
+	err := catalog.UpdateCheckoutObservation(ctx, observation(150, "tree-older"))
+	if !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("an older observation = %v, want ErrCatalogStaleGuard", err)
+	}
+	if got := headTree(); got != "tree-newest" {
+		t.Fatalf("an older observation rewrote head_tree to %q", got)
+	}
+
+	// A tie is not a reordering: two passes inside one clock tick still write.
+	if err := catalog.UpdateCheckoutObservation(ctx, observation(200, "tree-same-tick")); err != nil {
+		t.Fatalf("an observation on the stored clock was refused: %v", err)
+	}
+	if got := headTree(); got != "tree-same-tick" {
+		t.Fatalf("head_tree = %q, want tree-same-tick", got)
+	}
+
+	// An unclocked writer states no position in the sequence and is not fenced
+	// against one. Both production observers stamp their pass clock.
+	if err := catalog.UpdateCheckoutObservation(ctx, observation(0, "tree-unclocked")); err != nil {
+		t.Fatalf("an unclocked observation was refused: %v", err)
+	}
+	if got := headTree(); got != "tree-unclocked" {
+		t.Fatalf("head_tree = %q, want tree-unclocked", got)
 	}
 }
