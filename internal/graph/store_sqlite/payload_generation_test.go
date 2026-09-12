@@ -700,7 +700,7 @@ func TestPayloadGenerationRetireIsResumable(t *testing.T) {
 	if err := store.Catalog().SetViewGenerationState(ctx, generationID, ViewGenerationRetiring); err != nil {
 		t.Fatalf("SetViewGenerationState: %v", err)
 	}
-	if err := store.sweepPayloadGeneration(ctx, generationID); err != nil {
+	if err := store.sweepPayloadGeneration(ctx, generationID, payloadSweepBudget{}.begin()); err != nil {
 		t.Fatalf("first sweep: %v", err)
 	}
 	if err := store.RetirePayloadGeneration(ctx, generationID, nil); err != nil {

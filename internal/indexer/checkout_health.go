@@ -55,6 +55,28 @@ type ViewsHealth struct {
 	// and the ordinary answer is the empty one, which is why it is omitted
 	// rather than rendered as an empty list.
 	CoordinatorStartFailures []CoordinatorStartFailure `json:"coordinator_start_failures,omitempty"`
+	// StorageFailures is the other entry here that is not a count, and it is
+	// here for the same reason: Generations says how much derived payload this
+	// store is holding and in what state, and a generation that is stuck in
+	// retiring because the volume is full states a problem the count cannot
+	// explain.
+	//
+	// Retirement is a background pass with no caller to fail — the coordinator
+	// backlog and the lifecycle's owed set retry it forever — so a store that
+	// cannot delete anything looks, from every count beside this, exactly like
+	// a store that has nothing to delete. The reasons are bounded (one per
+	// generation whose maintenance last failed, and the ordinary answer is
+	// none), path-free, and each one is retracted at the start of the next
+	// attempt on the same generation.
+	//
+	// The daemon's status payload does not carry them yet, and that is the
+	// last hop rather than a property of this field: cmd/gortex's
+	// viewsStatusFromHealth is a field-by-field projection with no line for
+	// this one, and internal/daemon's ViewsStatus has no field to receive it.
+	// Both are exactly what CoordinatorStartFailures above already has — it
+	// reached the wire by adding a daemon-side mirror plus one projection line
+	// — and both files belong to the daemon lane rather than to this one.
+	StorageFailures []store_sqlite.StorageFailure `json:"storage_failures,omitempty"`
 	// Counters is the view-lifecycle metric registry, flattened: series key to
 	// value, zero-valued series omitted.
 	Counters map[string]int64 `json:"counters,omitempty"`
@@ -79,6 +101,13 @@ func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error
 	// under no catalog read at all: the reasons are what makes that count
 	// legible, so a census that carries one and not the other is the defect.
 	out.CoordinatorStartFailures = l.CoordinatorStartFailures()
+	// Read from the same in-process state and under no catalog read either.
+	// The store is what the retirement sweep reports its refusals to, and a
+	// census that counts retiring generations without saying why they are
+	// still there is the same defect the start failures fixed one field up.
+	if l.store != nil {
+		out.StorageFailures = l.store.StorageFailures()
+	}
 	out.Leases = l.leases.Held()
 
 	families, err := l.catalog.ListRepositoryFamilies(ctx)

@@ -68,6 +68,12 @@ var (
 // one.)
 type payloadSeal struct {
 	state atomic.Int32
+	// sweep is the generation's retirement state — how far the last sweep pass
+	// got and why it stopped. It lives beside the flag because the seal is the
+	// one object every handle on the generation already shares, and because it
+	// is dropped at exactly the moment that state stops being true: when the
+	// generation is finally retired. See payload_generation_sweep.go.
+	sweep payloadSweepState
 }
 
 const (
@@ -93,6 +99,28 @@ func (s *Store) payloadSealFor(g int64) *payloadSeal {
 	}
 	shared, _ := s.payloadSeals.LoadOrStore(g, &payloadSeal{})
 	return shared.(*payloadSeal)
+}
+
+// payloadSealIfPresent is payloadSealFor without the minting half: it answers
+// for a generation this process already holds state about, and nil for one it
+// does not.
+//
+// It exists because the seal map is the only per-generation state the store
+// keeps in memory, and its size is bounded by the generations this process has
+// opened a handle on and not yet retired. A lookup that mints — which is the
+// right default for the write gate, where the caller is holding the generation
+// — would let anything that merely names a generation id grow that map without
+// bound, and the map is ranged on every health census. Every reader that takes
+// an id from outside the lifecycle (the storage-failure register) goes through
+// here instead.
+func (s *Store) payloadSealIfPresent(g int64) *payloadSeal {
+	if s.coreless() || g == baseViewGeneration {
+		return nil
+	}
+	if cached, ok := s.payloadSeals.Load(g); ok {
+		return cached.(*payloadSeal)
+	}
+	return nil
 }
 
 // refuseSealedPayloadWrite is the write gate's generation check. The base
@@ -656,13 +684,44 @@ var generationFTSDocidMaps = []ftsDocidMap{
 // drain writers already past the gate, delete payload in bounded chunks, and
 // delete the catalog row. Every delete is keyed and idempotent; a partial retire
 // leaves its fence in place so the next run can safely continue.
+//
+// The sweep runs under a budget (payload_generation_sweep.go). A pass that
+// spends it stops on a committed chunk boundary and returns
+// ErrPayloadSweepBudgetExhausted with the fence still in place; the next pass
+// resumes where this one stopped. The default budget is a runaway ceiling
+// rather than a fair-share slice precisely so that yield is not an ordinary
+// outcome — one caller (repository_cleanup.go) cannot resume a refused
+// retirement, and the constant block states that dependency in full.
+//
+// A pass the storage layer refuses — a full volume, a failing disk — returns a
+// *StorageError and records a bounded reason against the generation, readable
+// through StorageFailures. Every attempt retracts the previous attempt's
+// reason first, so the register states the present rather than a history.
 func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64, inUse func(int64) bool) error {
+	return s.retirePayloadGeneration(ctx, generationID, inUse, defaultPayloadSweepBudget())
+}
+
+// retirePayloadGeneration is RetirePayloadGeneration with the sweep budget
+// named. Production has exactly one budget — the default above — and the
+// parameter exists so the yield-and-resume behaviour can be driven at a scale
+// a test can assert on, rather than by writing millions of rows.
+func (s *Store) retirePayloadGeneration(
+	ctx context.Context, generationID int64, inUse func(int64) bool, budget payloadSweepBudget,
+) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
 	if generationID <= baseViewGeneration {
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
+	// The register states the outcome of the attempt that just ran, not a
+	// history, so every attempt retracts the last one's reason before it can
+	// produce its own. Retracting here rather than inside the sweep is what
+	// makes that true of the refusals too: a generation that hit a full volume
+	// and is then held by a lease is refused, not failing, and must stop
+	// claiming the volume is the reason it is still there. A retraction that
+	// turns out to be premature is re-derived by this same attempt.
+	s.ClearStorageFailure(generationID)
 	catalog := s.Catalog()
 	row, found, err := catalog.GetViewGeneration(ctx, generationID)
 	if err != nil {
@@ -714,18 +773,31 @@ func (s *Store) RetirePayloadGeneration(ctx context.Context, generationID int64,
 	s.setPayloadSeal(generationID, payloadSealRetired)
 	// A write admitted before the seal closed would otherwise commit rows into
 	// a generation the sweep has already walked past.
+	//
+	// This arm is not classified. drainPayloadWriters takes the mutation gate
+	// and releases it, so the only error it can produce is the caller's own
+	// context expiring while it waits — which is never a storage failure, and
+	// running it through the classifier would leave an arm no failure can ever
+	// reach.
 	if err := s.drainPayloadWriters(ctx); err != nil {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return err
 	}
 
-	if err := s.sweepPayloadGeneration(ctx, generationID); err != nil {
+	// Past this point the generation is fenced, sealed and drained, and every
+	// remaining step is idempotent. A pass that yields on its budget or is
+	// refused by the storage layer therefore stops where it is and returns:
+	// the catalog row stays retiring, which is the state a crash here would
+	// leave and the state the next pass resumes from. Nothing between here and
+	// DeleteViewGeneration makes a half-swept generation visible as anything
+	// other than retiring.
+	if err := s.sweepPayloadGeneration(ctx, generationID, budget.begin()); err != nil {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
-		return err
+		return s.noteRetirementFailure(generationID, err)
 	}
 	if err := catalog.DeleteViewGeneration(ctx, generationID); err != nil {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
-		return err
+		return s.noteRetirementFailure(generationID, err)
 	}
 	s.payloadSeals.Delete(generationID)
 	// Generation ids are never reused, so a handle still holding the lane
@@ -749,83 +821,6 @@ func refusalReason(refs ViewGenerationReferences) string {
 	default:
 		return viewmetrics.LabelOther
 	}
-}
-
-// sweepPayloadGeneration deletes every payload row a generation owns, in
-// bounded chunks. The FTS documents go first, each chunk taking the map rows
-// that addressed it along: a chunk that left them standing would strand the
-// documents past it, because the map is the only handle on an FTS row. The
-// registry sweep visits those two maps again and finds them empty, which is
-// what keeps it derived from the registry rather than from a hand-kept list.
-// The core tables go last, so a sweep interrupted half way never leaves a
-// sidecar row pointing at a node that is already gone.
-func (s *Store) sweepPayloadGeneration(ctx context.Context, generationID int64) error {
-	base := s.atBase()
-	// The whole-graph analysis cache is stamped with the payload view its
-	// inputs came from, but its rows hang off analysis_generations.generation_id
-	// rather than carrying view_gen themselves, so neither sweep registry names
-	// them. Collect them first: they reference nothing in the payload tables,
-	// and leaving them would strand an analysis describing a corpus that no
-	// longer exists.
-	if err := base.sweepAnalysisGenerations(ctx, generationID); err != nil {
-		return err
-	}
-	for _, docidMap := range generationFTSDocidMaps {
-		if err := base.deletePayloadChunks(ctx, generationID, deleteFTSDocidChunk(docidMap, generationID)); err != nil {
-			return err
-		}
-	}
-	for _, table := range payloadSweepTables() {
-		query, err := base.payloadSweepDeleteSQL(table)
-		if err != nil {
-			return fmt.Errorf("payload generation gc: %s: %w", table, err)
-		}
-		if err := base.deletePayloadChunks(ctx, generationID, deleteGenerationRowsChunk(query, generationID)); err != nil {
-			return err
-		}
-	}
-	for _, query := range []string{deleteGenerationEdgesSQL, deleteGenerationNodesSQL} {
-		if err := base.deletePayloadChunks(ctx, generationID, deleteGenerationRowsChunk(query, generationID)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// sweepAnalysisGenerations removes every analysis generation stamped with the
-// retiring payload view generation, its active pointer included.
-//
-// Unlike PruneAnalysisGenerations — the retention window, which never touches
-// an active generation — this collects the active one too: the corpus it
-// describes is being deleted. The pointer goes first because it holds
-// ON DELETE RESTRICT against the manifest rows, then each generation's
-// children child-first, then its manifest row. Every step rides
-// deletePayloadChunks, so each batch is its own transaction under the mutation
-// gate and re-checks that the generation is still retiring.
-func (s *Store) sweepAnalysisGenerations(ctx context.Context, generationID int64) error {
-	analysisIDs, err := s.analysisGenerationIDsForView(ctx, generationID)
-	if err != nil {
-		return fmt.Errorf("payload generation gc: analysis generations: %w", err)
-	}
-	if len(analysisIDs) == 0 {
-		// No manifest row means no pointer either: the foreign key cannot be
-		// satisfied without one.
-		return nil
-	}
-	if err := s.deletePayloadChunks(ctx, generationID, deleteAnalysisPointerChunk(generationID)); err != nil {
-		return err
-	}
-	for _, analysisID := range analysisIDs {
-		for _, table := range analysisGenerationGCTables {
-			if err := s.deletePayloadChunks(ctx, generationID, deleteAnalysisChildChunk(table, analysisID)); err != nil {
-				return fmt.Errorf("payload generation gc: analysis %d %s: %w", analysisID, table.name, err)
-			}
-		}
-		if err := s.deletePayloadChunks(ctx, generationID, deleteAnalysisManifestChunk(analysisID)); err != nil {
-			return fmt.Errorf("payload generation gc: analysis %d manifest: %w", analysisID, err)
-		}
-	}
-	return nil
 }
 
 // payloadSweepTables is every generation-keyed table the sweep walks, taken
@@ -957,14 +952,25 @@ func sqlInt64List(values []int64) string {
 	return b.String()
 }
 
-// deletePayloadChunks runs one chunk until it removes nothing more. Each chunk
-// is its own transaction under the mutation gate, and rechecks that the
-// generation is still retiring — a route flip that adopted the generation
-// again must stop the sweep rather than delete rows out from under a reader.
-func (s *Store) deletePayloadChunks(ctx context.Context, generationID int64, chunk payloadSweepChunk) error {
+// deletePayloadChunks runs one chunk until it removes nothing more, or until
+// the pass has spent its budget. Each chunk is its own transaction under the
+// mutation gate, and rechecks that the generation is still retiring — a route
+// flip that adopted the generation again must stop the sweep rather than
+// delete rows out from under a reader.
+//
+// The budget is checked before a chunk rather than after one, so a yield never
+// splits a transaction and a pass with any budget left always makes at least
+// one chunk of progress. That is what bounds the number of passes: every pass
+// either finishes the step or removes a chunk's worth of it.
+func (s *Store) deletePayloadChunks(
+	ctx context.Context, generationID int64, chunk payloadSweepChunk, pass *payloadSweepPass,
+) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if pass.spent() {
+			return fmt.Errorf("%w: generation %d", ErrPayloadSweepBudgetExhausted, generationID)
 		}
 		removed, retiring, err := s.deletePayloadChunk(ctx, generationID, chunk)
 		if err != nil {
@@ -973,6 +979,7 @@ func (s *Store) deletePayloadChunks(ctx context.Context, generationID int64, chu
 		if !retiring {
 			return fmt.Errorf("payload generation gc: generation %d left the retiring state", generationID)
 		}
+		pass.spend(removed)
 		if removed == 0 {
 			return nil
 		}
