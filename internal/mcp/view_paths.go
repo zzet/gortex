@@ -5,6 +5,9 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // Resolving on-disk paths under a view.
@@ -139,8 +142,91 @@ var errViewHasNoWorkingCopy = errors.New(
 // requestReadsCommittedTree reports whether this request's view serves its
 // content out of the object store rather than a working copy.
 func requestReadsCommittedTree(ctx context.Context) bool {
-	view := requestViewFromContext(ctx)
-	return view != nil && view.files != nil && view.viewRoot == ""
+	return viewReadsCommittedTree(requestViewFromContext(ctx))
+}
+
+// viewReadsCommittedTree reports whether the bytes a view serves live in a
+// committed tree rather than on a working copy. It is the one predicate the
+// byte lane classifies a view by, so refViewFilesFor and every path resolver
+// answer the same question the same way.
+//
+// Two shapes answer yes, and a working copy hides the second:
+//
+//   - A view with no working copy at all: a ref or commit selector. It reads
+//     through a committed-tree file surface and names no root, which is the
+//     shape this predicate has always recognised.
+//   - A routed checkout whose route has withdrawn its working-tree layer. The
+//     stack is then the commit generation alone while the request still
+//     carries the checkout's root, and the bytes on that root are free to have
+//     moved past the tree the view reads. The window is real rather than
+//     theoretical: materializeRequestView's RouteReady check
+//     (view_request.go: "!found || !graphview.RouteReady(route)",
+//     graphview/binding.go RouteReady, which requires DirtyGenerationID > 0)
+//     and MaterializeCheckout's own route read (graphview/materialize.go,
+//     which appends the dirty generation only when the route still names one)
+//     are two separate reads, and CheckoutCoordinator.clearDirtySlot
+//     (indexer/checkout_coordinator.go) between them materializes the commit
+//     generation alone under a root the request keeps.
+//
+// The text lane already refuses that second shape from both ends — the
+// coordinator's route check (indexer/checkout_text_search.go) and the
+// top-layer completeness rule (graphview/materialize.go completeness, whose
+// CapSearchText arm reads the top layer's silence as a denial) — so a byte
+// lane that answered it off the root would serve bytes out of a tree the same
+// request is told it may not search.
+//
+// A rooted view with no materialized stack is NOT classified as committed:
+// nothing produces one in production (view_request.go sets viewRoot and
+// materialized in the same literal, and that is the only assignment of
+// viewRoot), and reading a root is what such a view has always done.
+func viewReadsCommittedTree(v *requestView) bool {
+	if v == nil {
+		return false
+	}
+	if v.viewRoot == "" {
+		return v.files != nil
+	}
+	return viewStackReadsCommittedTree(v.materialized)
+}
+
+// viewStackReadsCommittedTree reports whether the top of a materialized stack
+// names a tree in git history rather than the bytes on a checkout root.
+//
+// Two spellings say yes, and the FIRST is the only one production builds:
+//
+//   - No layer at all. MaterializeCheckout leases the commit generation and
+//     appends the working-tree one only when the route it re-reads still names
+//     it (graphview/materialize.go, "if route.DirtyGenerationID > 0"), and
+//     assemble's layer loop then runs zero times — so a checkout routed to its
+//     commit generation alone materializes with an empty RepoViewID.Layers.
+//     Every LayerRef the checkout path can mint is a LayerDirty (dirtyLayerRef
+//     in graphview/materialize.go is the sole constructor on that path), which
+//     is why an empty stack rather than a commit layer is what a withdrawn
+//     working tree actually looks like.
+//   - An explicit commit layer on top. The kind is in the layer vocabulary
+//     (graphview/view.go) and indexer/builder_commit.go names it, and a
+//     classification that depended on nothing ever minting one would be a
+//     silent hole the day something does.
+//
+// A ref view also materializes with no layers, but it carries no root and is
+// classified by its file surface before this is reached.
+//
+// The precondition is a composed Reader, and it is the same rule as the
+// unwitnessed arm of noteWorktreeRouteDrift: an empty layer list is evidence
+// only when it comes off a stack that was actually leased and composed
+// (Materializer.assemble sets Reader for every stack it builds). A RepoView
+// that composed no reader is an identity-only value carrying a prefix and a
+// base generation, and reading ITS empty Layers as "the working tree was
+// withdrawn" would be treating absence of data as evidence. Such a view keeps
+// the working-copy classification it has always had.
+func viewStackReadsCommittedTree(view *graphview.RepoView) bool {
+	if view == nil || view.Reader == nil {
+		return false
+	}
+	if len(view.ID.Layers) == 0 {
+		return true
+	}
+	return view.ID.Layers[len(view.ID.Layers)-1].Kind == graphview.LayerCommit
 }
 
 // checkoutRootedPath places a resolved path in the checkout that owns it for
@@ -155,4 +241,98 @@ func (s *Server) checkoutRootedPath(ctx context.Context, abs, root, repoPrefix s
 		return view.rooted(abs, root)
 	}
 	return worktreeRootedPath(abs, root, s.multiIndexer)
+}
+
+// noteWorktreeRouteDrift asks whether the route a routed view pinned moved
+// while this request read through it, and records the answer on the rider.
+//
+// It is the working copy's half of the pin the base corpus already has. A
+// request that reads a checkout's live root reads bytes nothing freezes: the
+// route the view was materialized under is the one witness that says which
+// snapshot those bytes were supposed to be, and the catalog bumps its epoch on
+// every flip of either slot (catalog.go:1697, :1718-1726), so a changed epoch
+// is evidence the working copy was re-sampled and re-published under the
+// answer. Reading it costs one indexed row and no lock (catalog.go:1557-1576),
+// which is why this is called once per answer rather than once per resolved
+// path.
+//
+// Three outcomes, and the middle one is the point, exactly as for the base
+// corpus (view_request.go: noteBaseCorpusChange):
+//
+//   - the epoch still matches: the answer is as coherent as the route said.
+//   - the epoch moved: the route this answer was read under is gone, so the
+//     result may be stitched from two states of the working copy. The
+//     capability the caller used is annotated incomplete and rides back as
+//     such.
+//   - nothing to compare against — no checkout id, no handle to read the
+//     catalog through, or no route row to read: that is not evidence of a
+//     change and must not be reported as one.
+//
+// Epoch 0 is a witnessed epoch, not an absent one, and treating it as absent
+// blinded this check for a checkout's entire first route epoch. A route is
+// installed at the zero value — CheckoutCoordinator.installStack takes the
+// UpsertCheckoutRoute arm for a not-yet-routed checkout and ensureRoute does
+// the same on first sight, and that statement writes
+// route_epoch = excluded.route_epoch (store_sqlite/catalog.go
+// UpsertCheckoutRoute) with no epoch set. Such a route is RouteActive with
+// both slots published, so RouteReady holds and requests are served off it
+// pinning epoch 0; the first flip under them (0 -> 1) is exactly "the route
+// moved under this answer" and is the most common instance of it. What says
+// "unwitnessed" is the absence of a route to compare against, which is what
+// the found/catalog/checkout-id guards below test.
+//
+// Limitation, stated because the annotation must not be read as more than it
+// is: the witness is the published route, not the bytes. A write that lands on
+// the root and has not been sampled into a generation yet moves no epoch, so a
+// read racing it is not labelled by this. What it does catch is the case the
+// view identity cannot: the request kept reading while the checkout's route
+// advanced underneath it.
+func noteWorktreeRouteDrift(ctx context.Context, view *requestView, capability graphview.CapabilityID) bool {
+	if ctx == nil || view == nil || !view.readsOwnCheckout() || view.materialized == nil {
+		return false
+	}
+	checkoutID := viewCheckoutID(view)
+	if checkoutID == "" {
+		return false
+	}
+	catalog := viewRouteCatalog(view)
+	if catalog == nil {
+		return false
+	}
+	route, found, err := catalog.GetCheckoutRoute(ctx, checkoutID)
+	if err != nil || !found || route.RouteEpoch == view.materialized.CheckoutRouteEpoch {
+		return false
+	}
+	if viewAlreadyDegraded(view, capability, graphview.StateIncomplete) {
+		return true
+	}
+	view.noteDegraded([]graphview.CapabilityStatus{
+		{Capability: capability, State: graphview.StateIncomplete},
+	})
+	return true
+}
+
+// viewRouteCatalog reads the control plane through one of the view's own
+// pinned generation handles. Every handle is a store over the same database
+// and Catalog() rebases it (store_sqlite/catalog.go:35), so this needs no
+// second store and cannot outlive the view's lease.
+func viewRouteCatalog(view *requestView) *store_sqlite.Catalog {
+	for _, source := range view.materialized.GenerationSources() {
+		if source.Handle != nil {
+			return source.Handle.Catalog()
+		}
+	}
+	return nil
+}
+
+// viewAlreadyDegraded reports whether this exact annotation is already on the
+// rider, so a request whose handlers each check drift says it once.
+func viewAlreadyDegraded(view *requestView, capability graphview.CapabilityID, state graphview.CapabilityState) bool {
+	degraded, _ := view.annotations()
+	for _, status := range degraded {
+		if status.Capability == capability && status.State == state {
+			return true
+		}
+	}
+	return false
 }

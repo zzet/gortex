@@ -47,8 +47,24 @@ func (s *Server) searchTextInView(
 	if view.baseNarrowed {
 		return s.searchTextInNarrowedBase(view, query, useRegexp, limit)
 	}
-	if view.viewRoot == "" {
-		return nil, viewTextUnavailable(view, "it reads a committed tree no working copy holds")
+	// The same predicate the byte lane classifies a view by (view_paths.go),
+	// so the two lanes cannot disagree about whether this view's content is on
+	// a working copy.
+	//
+	// It is a backstop rather than the lane's production refusal, and saying so
+	// is the honest claim: for the shape it names — a routed checkout whose
+	// route withdrew its working-tree layer — the evaluation above refuses
+	// first, because the commit generation on top declares nothing for
+	// search.text (indexer/builder_generation.go textSearchProducer) and the
+	// reader reads that silence as StateUnavailable (graphview/materialize.go
+	// completeness). No production shape reaches here declaring the capability
+	// complete over a committed tree today. What this arm buys is that the two
+	// lanes classify by one predicate: if a future producer or ordering change
+	// lets a committed-tree view declare text search, the searcher still does
+	// not get pointed at a root the view does not read. The test that covers it
+	// sets the completeness by hand and says so.
+	if viewReadsCommittedTree(view) {
+		return nil, viewTextUnavailable(view, textSearchRefusalReason(view))
 	}
 
 	var compiled *regexp.Regexp
@@ -72,6 +88,11 @@ func (s *Server) searchTextInView(
 	case !served:
 		return nil, viewTextUnavailable(view, "nothing indexes its working copy for text search")
 	}
+	// The answer came off a live root, which nothing freezes for the length of
+	// a request. If the route this view pinned advanced while the search ran,
+	// the caller is told the answer is thin rather than left to assume it is
+	// the snapshot the rider names.
+	noteWorktreeRouteDrift(ctx, view, graphview.CapSearchText)
 	return stampRepoPrefix(matches, viewRepoPrefix(view)), nil
 }
 
@@ -150,6 +171,9 @@ func textSearchRefusalReason(view *requestView) string {
 	case view.viewRoot == "":
 		return "it reads a committed tree no working copy holds"
 	default:
+		// The remaining shape this is asked about is a routed checkout whose
+		// route withdrew its working-tree layer (viewReadsCommittedTree): it
+		// has a root, and the root is not what it reads.
 		return "the top layer of its stack is a committed tree, so the working copy " +
 			"at its root is not the snapshot it reads"
 	}
