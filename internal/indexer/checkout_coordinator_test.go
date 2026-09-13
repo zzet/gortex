@@ -38,6 +38,10 @@ type coordinatorFixture struct {
 	store   *store_sqlite.Store
 	catalog *store_sqlite.Catalog
 	leases  *graphview.LeaseManager
+	// storePath is the file the fixture's store is open on, so a test can
+	// instrument the database itself — see checkout_layer_reuse_test.go, which
+	// counts the writes a reuse makes.
+	storePath string
 
 	// primary is the checkout whose working tree the corpus was indexed from.
 	primary string
@@ -75,12 +79,18 @@ func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 	worktree := filepath.Join(family, coordinatorAdminName)
 	builderGit(t, primary, "worktree", "add", "-b", "feature", worktree)
 
-	store := builderOpenStore(t, "base")
+	storePath := filepath.Join(t.TempDir(), "base.sqlite")
+	store, err := store_sqlite.Open(storePath)
+	if err != nil {
+		t.Fatalf("open the fixture store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	builderIndex(t, store, primary)
 
 	f := &coordinatorFixture{
 		t:          t,
 		store:      store,
+		storePath:  storePath,
 		catalog:    store.Catalog(),
 		leases:     graphview.NewLeaseManager(),
 		primary:    primary,
@@ -317,6 +327,28 @@ func coordinatorReconcile(t *testing.T, c *CheckoutCoordinator) CheckoutCycle {
 	if out.Err != nil {
 		t.Fatalf("reconcile: %v", out.Err)
 	}
+	return out
+}
+
+// retirementBacklog reads, without draining, the generations this coordinator
+// owes a retirement for — the set offerRetire files when the catalog refuses a
+// retire.
+//
+// It is the only place a refused offer is observable. A retire the route
+// refuses leaves the generation row untouched, so a coordinator that offered a
+// layer it had no business offering looks identical in the catalog to one that
+// never offered it; the difference is here, and it matters because the backlog
+// is exactly what SweepRetirements retries the moment the refusal lifts.
+// DrainRetirements would answer the same question but empties the set, which a
+// test that wants to assert an absence must not do.
+func (c *CheckoutCoordinator) retirementBacklog() []int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]int64, 0, len(c.backlog))
+	for generationID := range c.backlog {
+		out = append(out, generationID)
+	}
+	slices.Sort(out)
 	return out
 }
 
@@ -1039,6 +1071,13 @@ func TestCoordinatorKeepsThePreviousRouteWhenEveryBuildIsTorn(t *testing.T) {
 // TestCoordinatorRescheduleWhenTheRouteMovesUnderIt pins the compare-and-set:
 // a second coordinator on the same checkout is a legal thing to exist, and the
 // one that loses the flip must leave the winner's route alone.
+//
+// It also pins what the loser does with the layer it resolved. Since the
+// catalog-backed lookup landed, the loser reaches the flip holding the WINNER's
+// generation — same tree, same base, same identity — rather than a duplicate it
+// indexed itself. A cycle that loses a flip must therefore distinguish a layer
+// it built (supersede and offer it) from one it merely routed (leave it alone),
+// which is the `reused` arm of reconcileCommitSlot's error path.
 func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	f := newCoordinatorFixture(t)
 
@@ -1060,6 +1099,20 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	if won.CommitGenerationID == 0 {
 		t.Fatalf("the winner routed nothing: %+v", won)
 	}
+	// The exact row the winner published, read BEFORE the losing cycle. The
+	// assertions below compare against this snapshot rather than against
+	// "still servable", because servableGeneration accepts superseded by
+	// design (checkout_coordinator.go: a route may name a superseded
+	// generation) — so a supersede the loser had no business issuing would
+	// pass a servability check unnoticed.
+	beforeLoss, found := f.generation(won.CommitGenerationID)
+	if !found {
+		t.Fatalf("the winner's generation %d is not in the catalog", won.CommitGenerationID)
+	}
+	if beforeLoss.State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("the winner published generation %d in state %s, want ready",
+			beforeLoss.GenerationID, beforeLoss.State)
+	}
 
 	head := builderGit(t, f.worktree, "rev-parse", "HEAD^{tree}")
 	var out CheckoutCycle
@@ -1070,8 +1123,43 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	if !errors.Is(err, errRouteMoved) {
 		t.Fatalf("the loser failed with %v, want a lost route flip", err)
 	}
-	if !out.CommitBuilt {
-		t.Fatalf("the loser did not build before losing the flip: %+v", out)
+	// The loser resolved a layer before it tried to flip — and since the winner
+	// had just published one with this exact identity, resolving it means
+	// routing that one, not indexing the same tree a second time. (Neither
+	// CommitBuilt nor CommitReused is set on a lost flip: the cycle routed
+	// nothing, and CommitReused is what a cycle that DID route a cached layer
+	// reports. What the flag says here is only that no build happened.)
+	if out.CommitBuilt {
+		t.Fatalf("the loser re-indexed the tree the winner had just published: %+v", out)
+	}
+	// What it reused is the winner's own generation, and a lost flip has to
+	// leave it exactly where it found it. Superseding or retiring a layer this
+	// cycle did not build would pull it out from under the route that won.
+	//
+	// Both halves of the `!reused` arm are pinned separately, because neither
+	// is observable through "is it still servable":
+	//
+	//   supersede — moves ready -> superseded, a state servableGeneration
+	//     still accepts. Only the state comparison against the pre-loss
+	//     snapshot catches it.
+	//   offerRetire — the winning route names the generation, so the catalog
+	//     refuses the retire with ErrCatalogGenerationReferenced and the row
+	//     does not change. What DOES change is the loser's own retirement
+	//     backlog: offerRetire files every refusal there for the janitor to
+	//     retry, so a generation this cycle never built showing up on the
+	//     loser's backlog is the refusal's fingerprint. It would be collected
+	//     the moment the route moved off it.
+	afterLoss, found := f.generation(won.CommitGenerationID)
+	if !found {
+		t.Fatalf("the lost flip removed the winner's routed generation %d", won.CommitGenerationID)
+	}
+	if afterLoss.State != beforeLoss.State {
+		t.Fatalf("the lost flip moved the winner's generation %d from %s to %s",
+			won.CommitGenerationID, beforeLoss.State, afterLoss.State)
+	}
+	if owed := loser.retirementBacklog(); slices.Contains(owed, won.CommitGenerationID) {
+		t.Fatalf("the loser offered the winner's routed generation %d for retirement (backlog %v)",
+			won.CommitGenerationID, owed)
 	}
 
 	route := f.route()

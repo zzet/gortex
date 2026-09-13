@@ -833,6 +833,42 @@ func dedicatedBaseAncestorTx(ctx context.Context, tx *sql.Tx, head, candidate in
 	return false, nil
 }
 
+// adoptedHeadEpochTx reports the clock at which an adoption published the head
+// a checkout currently carries, and 0 when no adoption published it.
+//
+// It is the durable half of the head fence, and it exists because the fact it
+// answers has to survive a restart. The head an adoption published is, by
+// construction, the tree of the generation the owner's dedicated graph is
+// active on: advanceDedicatedBaseOwnerHeadTx writes head_tree from the adopted
+// generation in the same transaction that installs the active pointer. So a
+// stored head that still equals the active generation's tree IS that
+// publication, and the generation's created_at is the sequence it was published
+// at — which a process with no memory of the adoption can read back exactly.
+//
+// A head that does not match the active generation's tree was not published by
+// the standing adoption, and the fence has nothing to hold: 0 means "an
+// ordinary observation put this head here", which any later observation may
+// move. An owner with no dedicated graph, or a graph with no active generation,
+// is the same answer for the same reason.
+func adoptedHeadEpochTx(ctx context.Context, tx *sql.Tx, checkoutID, storedHeadTree string) (int64, error) {
+	if storedHeadTree == "" {
+		return 0, nil
+	}
+	var epoch int64
+	err := tx.QueryRowContext(ctx, `
+SELECT g.created_at
+  FROM dedicated_graphs d
+  JOIN view_generations g ON g.generation_id = d.active_generation_id
+ WHERE d.owner_checkout_id = ? AND g.tree_oid = ?`, checkoutID, storedHeadTree).Scan(&epoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return epoch, nil
+}
+
 // advanceDedicatedBaseOwnerHeadTx moves the owner checkout's committed head to
 // the point the adopted generation represents, in the adoption's transaction.
 //
@@ -844,6 +880,15 @@ func dedicatedBaseAncestorTx(ctx context.Context, tx *sql.Tx, head, candidate in
 // into last_seen is what makes the two writers one ordered sequence instead of
 // two racing ones: a reconciliation pass sampled before this base was observed
 // can no longer overwrite the head this adoption just published.
+//
+// That last sentence is a contract, not a hope, and last_seen alone does not
+// keep it: the observation fence rebases its clock domain after
+// observationRegressionQuorum refusals, so the third pass from behind is
+// accepted. What keeps the contract is that the head axis is excluded from that
+// rebase — adoptedHeadEpochTx above tells the fence that this tree was
+// published here, at this created_at, and a sample behind that sequence is
+// refused on the head axis alone however the clock axes are resolved. See
+// UpdateCheckoutObservation.
 //
 // A generation with no tree, and a checkout whose clock has already passed this
 // observation, both leave the row alone and report false. Neither is an error:

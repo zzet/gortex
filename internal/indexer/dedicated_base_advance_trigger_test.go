@@ -679,8 +679,15 @@ func TestOnlyTheGitWatcherHeadFinalizeDispatchesAdvancement(t *testing.T) {
 	// of the two the design admits: the worker draining the queue, and
 	// PublishRepo, the deliberate synchronous entry point for a caller that
 	// owns its own waiting.
+	//
+	// The pattern is the bare selector, not "p.publish(". The bypass this
+	// census exists for was spelled t.publisher.publish(, and "p.publish(" is
+	// not a substring of it — the byte before .publish( is an r — so the guard
+	// matched only a bypass that happened to be written on a receiver named p.
+	// Matching the call rather than the receiver's spelling is what makes this
+	// a census of shape.
 	require.Equal(t, map[string]int{"dedicated_base_startup.go": 2},
-		census(t, "p.publish("),
+		census(t, ".publish("),
 		"a committed-base publication path appeared outside InitialBasePublisher.run "+
 			"and InitialBasePublisher.PublishRepo; a synchronous bypass skips the single "+
 			"pending list that keeps one committed build running at a time")

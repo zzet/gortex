@@ -1796,3 +1796,281 @@ func TestDedicatedBaseRestoreRefusesBelowThePublicationFloor(t *testing.T) {
 		t.Fatalf("restored head state = %s, want ready", got)
 	}
 }
+
+// observationPass is a reconciliation pass over the fixture's owner checkout:
+// the shape internal/reconcile writes, stating a head and a removal grace it
+// sampled at one clock.
+func (f *dedicatedPublicationFixture) observationPass(clock int64, tree string) UpdateCheckoutObservationRequest {
+	return UpdateCheckoutObservationRequest{
+		CheckoutID: f.owner.CheckoutID, Incarnation: f.owner.Incarnation,
+		State:    CheckoutStateRemovalGrace,
+		RootPath: f.owner.RootPath, GitDir: f.owner.GitDir,
+		HeadRef: "refs/heads/main", HeadCommit: "commit-" + tree, HeadTree: tree,
+		LastAccessible: clock, RemovalDetectedAt: clock, RemovalDeadline: clock + 300,
+		RemovalEvidence: "authoritative_omission",
+		LastSeen:        clock, LastError: "gone",
+	}
+}
+
+// fenceTwice runs the two passes the fence refuses outright, so the next one
+// reaches the quorum rebase. It asserts the refusal rather than assuming it.
+func (f *dedicatedPublicationFixture) fenceTwice(t testing.TB, tree string) {
+	t.Helper()
+	for _, clock := range []int64{1400, 1401} {
+		report, err := f.c.UpdateCheckoutObservationWithReport(context.Background(), f.observationPass(clock, tree))
+		if !errors.Is(err, ErrCatalogObservationFenced) || !report.Fenced() {
+			t.Fatalf("the pass at %d = %+v / %v, want it fenced", clock, report, err)
+		}
+	}
+}
+
+// TestObservationRebaseNeverRegressesAnAdoptedHead is the head axis's half of
+// the observation fence.
+//
+// The clock fence rebases after observationRegressionQuorum refusals, because
+// refusing a stepped-back clock forever wedges the row. That rebase is safe on
+// the state and grace axes and is not safe on the head: the pass that triggers
+// it is one the row's own clock says was sampled BEFORE the adoption published
+// the head, and head_tree is what every dependent worktree's layer identity
+// keys on, so writing it would republish a base the family has moved past —
+// invisibly, since last_seen is MAX(stored, observed) and would still name the
+// newer sample.
+//
+// So the head keeps a floor of its own: the sequence its adoption published it
+// at. A stale sample keeps its other axes and is refused on the head alone,
+// however many times it comes back; a sample from at or past the publication
+// moves it as always.
+func TestObservationRebaseNeverRegressesAnAdoptedHead(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	ctx := context.Background()
+	claim := f.claimAt(t, "attempt-a", "commit-a", 5000, 0)
+	f.publish(t, claim)
+	if adoption := f.adopt(t, claim); !adoption.HeadAdvanced {
+		t.Fatalf("the fixture did not publish a head to defend: %+v", adoption)
+	}
+
+	f.fenceTwice(t, "tree-stale")
+
+	// The third pass from behind is the rebase: the clock domain moved, so the
+	// state and grace axes follow it. The head does not.
+	rebased, err := f.c.UpdateCheckoutObservationWithReport(ctx, f.observationPass(1402, "tree-stale"))
+	if err != nil {
+		t.Fatalf("the pass after the skew = %v", err)
+	}
+	if rebased.Verdict != CheckoutObservationRebased {
+		t.Fatalf("the third pass behind the clock = %+v, want it rebased", rebased)
+	}
+	if !rebased.HeadRefused || rebased.HeadEpoch != 5000 || rebased.HeadTree != "tree-a" {
+		t.Fatalf("rebase report = %+v, want the head refused at the adoption's clock 5000", rebased)
+	}
+	owner := f.ownerHead(t)
+	if owner.HeadTree != "tree-a" || owner.HeadCommit != "commit-a" {
+		t.Fatalf("the rebase regressed the adopted head to %q/%q", owner.HeadTree, owner.HeadCommit)
+	}
+	if owner.State != CheckoutStateRemovalGrace || owner.RemovalDeadline != 1702 {
+		t.Fatalf("the rebase did not move the axes it may move: %+v", owner)
+	}
+	if owner.LastSeen != 5000 {
+		t.Fatalf("last_seen = %d, want the stored 5000 kept", owner.LastSeen)
+	}
+	if !strings.Contains(owner.LastError, CheckoutHeadRefusedMarker) || !strings.Contains(owner.LastError, "gone") {
+		t.Fatalf("last_error = %q, want the refusal traced beside the pass's own diagnosis", owner.LastError)
+	}
+
+	// The clock domain has been adopted, so this pass is an ordinary applied
+	// write — and it still cannot have the head. A refusal that only held for
+	// the pass that triggered the rebase would be no guarantee at all.
+	steady, err := f.c.UpdateCheckoutObservationWithReport(ctx, f.observationPass(1403, "tree-steady"))
+	if err != nil {
+		t.Fatalf("the pass after the rebase = %v", err)
+	}
+	if steady.Verdict != CheckoutObservationApplied || !steady.HeadRefused {
+		t.Fatalf("the pass after the rebase = %+v, want an applied write with the head still held", steady)
+	}
+	if got := f.ownerHead(t).HeadTree; got != "tree-a" {
+		t.Fatalf("head_tree = %q after a fourth stale sample, want the adopted tree-a", got)
+	}
+
+	// A genuine newer observation still advances it: the fence orders the head,
+	// it does not freeze it.
+	newer, err := f.c.UpdateCheckoutObservationWithReport(ctx, f.observationPass(6000, "tree-live"))
+	if err != nil {
+		t.Fatalf("the newer observation = %v", err)
+	}
+	if newer.Verdict != CheckoutObservationApplied || newer.HeadRefused {
+		t.Fatalf("the newer observation = %+v, want the head advanced", newer)
+	}
+	after := f.ownerHead(t)
+	if after.HeadTree != "tree-live" || after.HeadCommit != "commit-tree-live" {
+		t.Fatalf("head = %q/%q after an observation past the publication", after.HeadTree, after.HeadCommit)
+	}
+	if strings.Contains(after.LastError, CheckoutHeadRefusedMarker) {
+		t.Fatalf("last_error = %q, want the trace gone once the head moved", after.LastError)
+	}
+
+	// And the floor is the ADOPTION's, not the row's: the head standing now was
+	// written by an ordinary observation and is no longer the tree the active
+	// generation carries, so nothing published it and the next rebase may move
+	// it. A fence that held every head would wedge the axis it protects.
+	f.fenceTwice(t, "tree-ordinary")
+	ordinary, err := f.c.UpdateCheckoutObservationWithReport(ctx, f.observationPass(1402, "tree-ordinary"))
+	if err != nil {
+		t.Fatalf("the rebase over an unpublished head = %v", err)
+	}
+	if ordinary.Verdict != CheckoutObservationRebased || ordinary.HeadRefused || ordinary.HeadEpoch != 0 {
+		t.Fatalf("the rebase over an unpublished head = %+v, want the head admitted with no floor", ordinary)
+	}
+	if got := f.ownerHead(t).HeadTree; got != "tree-ordinary" {
+		t.Fatalf("head_tree = %q, want the rebase to move a head no adoption published", got)
+	}
+}
+
+// TestObservationAtHeadEpochMovesAnAdoptedHead is the other side of the same
+// fence: the head is ordered, not owned. An observer that can say which
+// publication its sample is from — the Git watcher's HEAD-change path — states
+// the adoption sequence and is believed, even from behind the row's clock.
+func TestObservationAtHeadEpochMovesAnAdoptedHead(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	ctx := context.Background()
+	claim := f.claimAt(t, "attempt-a", "commit-a", 5000, 0)
+	f.publish(t, claim)
+	f.adopt(t, claim)
+
+	f.fenceTwice(t, "tree-after-head-change")
+
+	// The same third pass as the test above, with the one thing that test's
+	// pass could not state.
+	rebased, err := f.c.UpdateCheckoutObservationAtHeadEpoch(ctx,
+		f.observationPass(1402, "tree-after-head-change"), 5000)
+	if err != nil {
+		t.Fatalf("the head-change pass = %v", err)
+	}
+	if rebased.Verdict != CheckoutObservationRebased || rebased.HeadRefused {
+		t.Fatalf("the head-change pass = %+v, want the head admitted", rebased)
+	}
+	owner := f.ownerHead(t)
+	if owner.HeadTree != "tree-after-head-change" {
+		t.Fatalf("head_tree = %q, want the head-change sample's tree", owner.HeadTree)
+	}
+	if strings.Contains(owner.LastError, CheckoutHeadRefusedMarker) {
+		t.Fatalf("last_error = %q, want no refusal traced for an admitted head", owner.LastError)
+	}
+
+	// And an epoch older than the publication buys nothing: stating a sequence
+	// is not the same as stating this one.
+	f.fenceTwice(t, "tree-older-epoch")
+	stale, err := f.c.UpdateCheckoutObservationAtHeadEpoch(ctx,
+		f.observationPass(1402, "tree-older-epoch"), 1)
+	if err != nil {
+		t.Fatalf("the pass stating an older epoch = %v", err)
+	}
+	if !stale.HeadRefused {
+		t.Fatalf("the pass stating an older epoch = %+v, want the head refused", stale)
+	}
+}
+
+// TestAdoptedHeadEpochSurvivesTheProcessThatAdopted pins the durable half.
+//
+// The ledger is process-local, so a head floor that lived only in it would be
+// forgotten by exactly the restart layer reuse exists for — and the first three
+// stale passes after that restart would regress the head the previous process
+// published. The floor is therefore read back from the adoption itself: the
+// active generation's tree and created_at.
+func TestAdoptedHeadEpochSurvivesTheProcessThatAdopted(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	ctx := context.Background()
+
+	// An observation FIRST, so the ledger already holds a fence for this row
+	// when the adoption moves the head under it: the floor has to be re-read
+	// then too, not only when the row is new to the process.
+	first := f.observationPass(100, "tree-before")
+	// Ready, because the adoption below refuses an owner that is not steady
+	// dedicated — the fence, not the checkout state, is what this test is about.
+	first.State, first.RemovalEvidence = CheckoutStateReady, ""
+	first.RemovalDetectedAt, first.RemovalDeadline = 0, 0
+	if err := f.c.UpdateCheckoutObservation(ctx, first); err != nil {
+		t.Fatalf("the first observation = %v", err)
+	}
+	claim := f.claimAt(t, "attempt-a", "commit-a", 5000, 0)
+	f.publish(t, claim)
+	if adoption := f.adopt(t, claim); !adoption.HeadAdvanced {
+		t.Fatalf("the adoption did not move the head: %+v", adoption)
+	}
+
+	f.fenceTwice(t, "tree-stale")
+	rebased, err := f.c.UpdateCheckoutObservationWithReport(ctx, f.observationPass(1402, "tree-stale"))
+	if err != nil || !rebased.HeadRefused {
+		t.Fatalf("the rebase under a known fence = %+v / %v, want the head refused", rebased, err)
+	}
+
+	// Now the process dies. A fresh store over the same file has a fresh
+	// ledger, which remembers no adoption at all.
+	if err := f.store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := Open(f.path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	f.store, f.c = reopened, reopened.Catalog()
+
+	f.fenceTwice(t, "tree-stale-after-restart")
+	restarted, err := f.c.UpdateCheckoutObservationWithReport(ctx,
+		f.observationPass(1402, "tree-stale-after-restart"))
+	if err != nil {
+		t.Fatalf("the rebase after the restart = %v", err)
+	}
+	if restarted.Verdict != CheckoutObservationRebased {
+		t.Fatalf("the pass after the restart = %+v, want it rebased", restarted)
+	}
+	if !restarted.HeadRefused || restarted.HeadEpoch != 5000 {
+		t.Fatalf("the pass after the restart = %+v, want the head refused at the adoption's 5000", restarted)
+	}
+	if got := f.ownerHead(t).HeadTree; got != "tree-a" {
+		t.Fatalf("head_tree = %q after a restart, want the adopted tree-a", got)
+	}
+}
+
+// TestAdoptedHeadEpochTxNamesOnlyTheOwnersPublication pins the durable probe
+// itself: which head it will call published, and which it will not.
+//
+// It answers for ONE checkout and ONE tree. Another owner's active base is
+// another family's business — treating it as this row's publication would fence
+// a head nothing published — and a tree the active generation does not carry
+// was put there by an ordinary observation, which the head fence has no claim
+// over.
+func TestAdoptedHeadEpochTxNamesOnlyTheOwnersPublication(t *testing.T) {
+	f := newDedicatedPublicationFixture(t)
+	ctx := context.Background()
+	claim := f.claimAt(t, "attempt-a", "commit-a", 5000, 0)
+	f.publish(t, claim)
+	f.adopt(t, claim)
+
+	tx, err := f.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	epoch := func(checkoutID, tree string) int64 {
+		t.Helper()
+		got, err := adoptedHeadEpochTx(ctx, tx, checkoutID, tree)
+		if err != nil {
+			t.Fatalf("adoptedHeadEpochTx(%q, %q): %v", checkoutID, tree, err)
+		}
+		return got
+	}
+	if got := epoch(f.owner.CheckoutID, "tree-a"); got != 5000 {
+		t.Fatalf("the owner's own published head = %d, want the adoption's 5000", got)
+	}
+	if got := epoch("another-checkout", "tree-a"); got != 0 {
+		t.Fatalf("another checkout's head = %d, want 0: this publication is not its own", got)
+	}
+	if got := epoch(f.owner.CheckoutID, "tree-somewhere-else"); got != 0 {
+		t.Fatalf("a head the active generation does not carry = %d, want 0", got)
+	}
+	if got := epoch(f.owner.CheckoutID, ""); got != 0 {
+		t.Fatalf("an unsampled head = %d, want 0", got)
+	}
+}

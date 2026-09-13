@@ -1,11 +1,16 @@
 package store_sqlite
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"runtime"
+	"slices"
 	"strings"
+	"sync"
+	"weak"
 
 	sqlite "modernc.org/sqlite"
 
@@ -426,7 +431,9 @@ UPDATE checkouts
 // UpdateCheckoutObservation is the guarded write a reconciliation pass makes
 // after looking at a checkout: it moves the state axis, both durable clock
 // axes and the observed git / filesystem facts in one statement, under the
-// same incarnation guard UpdateCheckoutState uses.
+// same incarnation guard UpdateCheckoutState uses. The statement runs in a
+// transaction with the read the fence decides on, so the pair is as atomic
+// against a concurrent writer as the lone statement was.
 //
 // It exists beside UpdateCheckoutState because the two answer different
 // questions. UpdateCheckoutState is the mode-transition write and touches only
@@ -444,28 +451,297 @@ UPDATE checkouts
 // move on a mode transition. The two writers touch disjoint columns instead,
 // so neither can lose the other's update.
 //
-// last_seen is the observation clock, and it fences the write as well as
-// recording it. The incarnation guard says the row is still the same working
-// copy; it says nothing about WHEN the facts being written were sampled, so two
-// passes racing — a janitor tick and an explicit track, or a pass whose git
-// sample was slow — could land in either order and let an older sample overwrite
-// a newer one. head_tree is what a dependent worktree's build identity keys on
-// (checkout_coordinator.go graphBase), so losing that race publishes a base
-// identity the family has already moved past. An observation that carries a
-// clock therefore applies only while the stored clock has not passed it.
+// # Why the write is ordered, and ordered on every axis
 //
-// A request with no clock (LastSeen == 0) is not fenced. That is the unclocked
-// writer — a test or an administrative repair stating one column — and fencing
-// it against a stored clock would refuse every such write for the life of the
-// row. Both production observers stamp their pass clock (reconcile.go, and
-// checkout_lifecycle.go's confirmPresent), so the fence covers the writers that
-// race. A refusal reports ErrCatalogStaleGuard, which every caller already
-// treats as "another actor moved this row first; leave the winner alone".
+// The incarnation guard says the row is still the same working copy. It says
+// nothing about WHEN the facts being written were sampled, and three writers
+// move these columns from separately taken samples: the reconciliation pass
+// (internal/reconcile), an explicit track (internal/indexer's
+// CheckoutLifecycle.confirmPresent) and the committed-base publisher through
+// AdoptDedicatedBaseGeneration. Two of them racing land in either order, and
+// an older sample landing last does real damage on every axis it carries:
+//
+//   - head_ref / head_commit / head_tree — head_tree is what every dependent
+//     worktree's layer identity keys on (checkout_coordinator.go's graphBase),
+//     so restoring an older one publishes a base the family has moved past.
+//   - state, and both grace clocks with the removal evidence — an earlier
+//     sample took them while the working copy was still present, so landing it
+//     after a newer pass resets the state to ready and zeroes a removal grace
+//     that pass had just opened, restarting the grace interval.
+//   - last_error — the diagnosis of a working copy as it was two samples ago.
+//
+// So an observation is either the newest one this row has seen, in which case
+// all of it lands, or it is not, in which case none of it does and the row is
+// left exactly as it was found. A fence scoped to some axes and not others is
+// the worst of both: a row half-way between two samples, describing a working
+// copy that never looked like that at any instant.
+//
+// # What orders them
+//
+// The ordering token is a monotonic observation position, allocated by the
+// process (checkoutObservationLedger) in the order the catalog accepts
+// observations. It never decreases, so a host clock that jumps — an NTP
+// correction, a VM resume, a restored snapshot — cannot reorder observations
+// that have already been accepted, and it cannot be argued with by a stored
+// clock nothing will reach again.
+//
+// The pass clock (LastSeen) is what a caller states, and it decides only
+// whether a pass may claim the NEXT position; it never orders two accepted
+// observations against each other. A pass at or past the clock the current
+// position was accepted at takes the next position and writes. A pass behind
+// it is refused and reported.
+//
+// A refused pass writes nothing at all, so it cannot move any clock backwards.
+// Neither can an accepted one: last_seen is written as MAX(stored, observed),
+// which is also exactly the invariant advanceDedicatedBaseOwnerHeadTx's
+// `last_seen <= ?` guard reads when it makes adoption and observation one
+// ordered sequence instead of two racing ones.
+//
+// # Why a refusal cannot wedge the row
+//
+// Refusing everything behind the stored clock FOREVER, and refusing it as an
+// error, is a wedge — which is what the whole-row fence this replaces did.
+// Both production callers read ErrCatalogStaleGuard as "another actor
+// owns this row" and return — reconcile's observe turns it into
+// ActionGuardLost and skips its own follow-on path-evidence write,
+// confirmPresent returns nil — so after a clock step back nothing pulls the
+// row forward again: a checkout that cannot leave its removal grace and a
+// state axis frozen, silently, for as long as the skew lasts.
+//
+// The fence separates a stale observer from a stepped-back clock with the only
+// evidence that distinguishes them. A stale sample is transient: the observer
+// that produced it re-samples on its next pass, and each production observer
+// holds at most one sample in flight. A clock that stepped back is persistent:
+// every pass after it is behind the floor. So the fence refuses
+// observationRegressionQuorum consecutive passes behind the floor and adopts
+// the next one as the row's new clock domain — two skipped passes, bounded,
+// reported, and never an operator.
+//
+// # Except the head axis, which is never rebased
+//
+// The rebase is safe on the state, availability and removal axes: they describe
+// the working copy as the observer found it, and adopting a stepped-back clock
+// costs at most a grace interval restated from a slightly older sample. It is
+// NOT safe on the head axis. head_tree is what every dependent worktree's layer
+// identity keys on, and a head an adoption published is the point a whole family
+// was built over — the pass that triggers a rebase is, by definition, one the
+// row's own clock says was sampled before that publication, so letting it write
+// the head would republish a base the family has moved past. That is precisely
+// the damage this fence exists to prevent, and it would be invisible: last_seen
+// is MAX(stored, observed), so the ordering token would still name the newer
+// sample.
+//
+// So the head has a floor of its own, and the rebase does not touch it. A head
+// published by an adoption carries the adoption's sequence — the clock the
+// active generation was created at, read back durably by adoptedHeadEpochTx, so
+// a restart does not forget it — and a pass may overwrite that head only when
+// it is at or past that sequence, or when it states the sequence outright
+// (UpdateCheckoutObservationAtHeadEpoch, which is the HEAD-change path's entry
+// point). A plain reconciliation sample from behind the publication keeps its
+// other axes and is refused on the head alone, which is recorded in the report
+// (HeadRefused) and traced durably in last_error under
+// CheckoutHeadRefusedMarker. A head no adoption published has no floor and moves
+// as it always did.
+//
+// # The diagnostic
+//
+// A refusal is reported two ways, because it has two audiences.
+//
+// To a caller that only takes an error, it is ErrCatalogObservationFenced,
+// which wraps ErrCatalogStaleGuard. That is deliberate and it is what both
+// production callers already do the right thing with: reconcile's observe
+// turns it into ActionGuardLost ("another actor moved this row first; its
+// write is the one that counts") and skips the follow-on path-evidence write
+// it would otherwise make from the same superseded sample, and confirmPresent
+// returns nil and leaves the row to the pass that owns it. Neither records a
+// transition that did not happen. What used to make that handling a wedge was
+// a fence that never let go; the quorum above is what fixes that, so the
+// honest error is safe to return again.
+//
+// To a caller that wants to tell the two apart — a newer observation holds the
+// row, versus the row is no longer keyed the way you read it — the wrapped
+// sentinel and CheckoutObservationReport.Verdict both say which, and
+// UpdateCheckoutObservationWithReport hands back the report on the refusal
+// along with the position and clock that refused it.
+//
+// An unclocked request (LastSeen == 0) states no position in the sequence and
+// is not fenced against one — it is a test or an administrative repair stating
+// one column, and fencing it against a stored clock would refuse it for the
+// life of the row. Both production observers stamp their pass clock.
+//
+// An empty head_tree is not refused here, and must not be: the catalog cannot
+// tell a pass that could not sample the working copy from one that sampled it
+// and found an unborn branch, which is a fact and has to be recorded. That
+// distinction lives where the sample is taken — reconcile.headFor's `sampled`
+// return — and an unsampled pass writes the stored tree back itself.
 func (c *Catalog) UpdateCheckoutObservation(ctx context.Context, req UpdateCheckoutObservationRequest) error {
+	_, err := c.UpdateCheckoutObservationWithReport(ctx, req)
+	return err
+}
+
+// CheckoutObservationVerdict is what an observation write did with the request
+// it was given. It is the diagnostic the error cannot carry: a refused
+// observation is not a failed write, and an accepted one that had to adopt a
+// stepped-back clock is not an ordinary one.
+type CheckoutObservationVerdict string
+
+const (
+	// CheckoutObservationApplied: this observation was the newest the row had
+	// seen, and every column it stated landed.
+	CheckoutObservationApplied CheckoutObservationVerdict = "applied"
+	// CheckoutObservationFenced: a newer observation holds the row, so nothing
+	// was written. The row is intact and the caller's pass is simply not the
+	// one that counts.
+	CheckoutObservationFenced CheckoutObservationVerdict = "fenced"
+	// CheckoutObservationRebased: passes kept arriving behind the row's clock,
+	// which is a host clock that moved and not an observer that is late, so the
+	// fence adopted the new clock domain rather than refusing forever. The
+	// write landed.
+	CheckoutObservationRebased CheckoutObservationVerdict = "rebased"
+)
+
+// CheckoutObservationReport is the diagnostic half of an observation write: it
+// says what the write actually recorded, which the error alone cannot, because
+// a refused observation is not a refused row.
+type CheckoutObservationReport struct {
+	// Verdict says whether the write landed, and why not when it did not.
+	Verdict CheckoutObservationVerdict
+	// Position is the monotonic observation position the row stands at after
+	// the call: this write's, when it landed, and the newer observation's when
+	// it was refused. It never moves backwards, not even when the host clock
+	// does.
+	Position int64
+	// FencedBy and FencingObservation name the observation that refused this
+	// one — its position and the pass clock it was accepted at. Both are 0
+	// when nothing refused anything.
+	FencedBy           int64
+	FencingObservation int64
+	// HeadRef, HeadCommit and HeadTree are the head facts the row holds after
+	// the call, whether this request stated them or the fence kept them.
+	HeadRef, HeadCommit, HeadTree string
+	// HeadRefused says the head axis alone was held back: the rest of the
+	// request landed, but the head the row carries was published by an
+	// adoption this sample is behind, so the sample's head was not written.
+	// The row keeps the published head and the refusal is traced durably in
+	// last_error.
+	HeadRefused bool
+	// HeadEpoch is the clock at which an adoption published the head the row
+	// holds, and 0 when no adoption published it — the sequence a sample has
+	// to reference before it may move that head.
+	HeadEpoch int64
+}
+
+// Fenced reports the refusal, which is the one verdict a caller has to branch
+// on: its sample was superseded and nothing it stated was written.
+func (r CheckoutObservationReport) Fenced() bool {
+	return r.Verdict == CheckoutObservationFenced
+}
+
+// UpdateCheckoutObservationWithReport is UpdateCheckoutObservation with the
+// fence's verdict preserved. See UpdateCheckoutObservation for the contract;
+// this is the entry point for a caller that wants to log or count a refused
+// observation instead of discarding it.
+func (c *Catalog) UpdateCheckoutObservationWithReport(
+	ctx context.Context,
+	req UpdateCheckoutObservationRequest,
+) (CheckoutObservationReport, error) {
+	return c.UpdateCheckoutObservationAtHeadEpoch(ctx, req, 0)
+}
+
+// UpdateCheckoutObservationAtHeadEpoch is UpdateCheckoutObservationWithReport
+// for an observer that can say which published head its sample references.
+//
+// headEpoch is the adoption sequence — the clock the committed base the sample
+// saw was published at. It is the only thing that lets a sample from behind the
+// row's observation floor move the head axis: a plain reconciliation pass
+// states none (0), so it can never rewrite a head an adoption published, while
+// an observer that sampled the working copy AFTER that publication says so and
+// is believed. The Git watcher's HEAD-change path is the observer that has this
+// to state; everything else goes through UpdateCheckoutObservation and is head-
+// fenced against the published head.
+//
+// Nothing else about the write changes: the state, availability and removal
+// axes follow the same fence and the same quorum rebase they always did.
+func (c *Catalog) UpdateCheckoutObservationAtHeadEpoch(
+	ctx context.Context,
+	req UpdateCheckoutObservationRequest,
+	headEpoch int64,
+) (CheckoutObservationReport, error) {
 	if err := req.validate(); err != nil {
-		return err
+		return CheckoutObservationReport{}, err
 	}
-	return c.execGuarded(ctx, fmt.Sprintf("checkout %s incarnation %s", req.CheckoutID, req.Incarnation), `
+	subject := fmt.Sprintf("checkout %s incarnation %s", req.CheckoutID, req.Incarnation)
+	ledger := c.observationLedger()
+	key := checkoutObservationKey{checkoutID: req.CheckoutID, incarnation: req.Incarnation}
+	var report CheckoutObservationReport
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		report = CheckoutObservationReport{}
+		var (
+			storedLastSeen                      int64
+			storedRef, storedCommit, storedTree string
+		)
+		// The read, the fence decision and the write are in one transaction
+		// under the mutation gate, so no other writer can interleave between
+		// them — the same atomicity the single guarded statement had.
+		err := tx.QueryRowContext(ctx, `
+SELECT last_seen, head_ref, head_commit, head_tree
+  FROM checkouts WHERE checkout_id = ? AND incarnation = ?`,
+			req.CheckoutID, req.Incarnation).
+			Scan(&storedLastSeen, &storedRef, &storedCommit, &storedTree)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %s", ErrCatalogStaleGuard, subject)
+		}
+		if err != nil {
+			return err
+		}
+
+		verdict, err := ledger.admit(key, checkoutObservationPass{
+			storedClock: storedLastSeen,
+			passClock:   req.LastSeen,
+			// Only a pass that states something different can regress a head,
+			// and a pass that restates the head the row already holds is not a
+			// head write at all — so it is never traced as a refused one.
+			headStated: req.HeadRef != storedRef || req.HeadCommit != storedCommit ||
+				req.HeadTree != storedTree,
+			headEpoch: headEpoch,
+			publishedHead: func() (int64, error) {
+				return adoptedHeadEpochTx(ctx, tx, req.CheckoutID, storedTree)
+			},
+		})
+		if err != nil {
+			return err
+		}
+		report = CheckoutObservationReport{
+			Verdict:            verdict.verdict,
+			Position:           verdict.position,
+			FencedBy:           verdict.fencedBy,
+			FencingObservation: verdict.fencingObservation,
+			HeadRef:            storedRef,
+			HeadCommit:         storedCommit,
+			HeadTree:           storedTree,
+			HeadEpoch:          verdict.headEpoch,
+		}
+		if report.Fenced() {
+			// Every axis is refused together, so the refusal is the absence of
+			// a statement rather than a statement of the stored values: the
+			// row keeps the newer observation whole, and no clock moves.
+			return fmt.Errorf("%w: %s at clock %d, superseded by observation %d at clock %d",
+				ErrCatalogObservationFenced, subject, req.LastSeen,
+				report.FencedBy, report.FencingObservation)
+		}
+		lastError := req.LastError
+		if verdict.headAdmitted {
+			report.HeadRef, report.HeadCommit, report.HeadTree = req.HeadRef, req.HeadCommit, req.HeadTree
+		} else {
+			// The head axis alone is held: the row keeps the head its adoption
+			// published, and the refusal is written where it outlives the
+			// process that decided it, because the in-band report is a return
+			// value and a regressed head is a durable fact about the row.
+			report.HeadRefused = true
+			lastError = checkoutHeadRefusalTrace(req.LastError, req.LastSeen, verdict.headEpoch, storedTree)
+		}
+
+		result, err := tx.ExecContext(ctx, `
 UPDATE checkouts
    SET state = ?,
        root_path = ?, git_dir = ?, locked = ?, prunable = ?,
@@ -473,14 +749,379 @@ UPDATE checkouts
        last_accessible = ?, unavailable_since = ?, availability_deadline = ?,
        removal_detected_at = ?, removal_deadline = ?, removal_evidence = ?,
        last_seen = ?, last_error = ?
- WHERE checkout_id = ? AND incarnation = ? AND (? = 0 OR last_seen <= ?)`,
-		string(req.State),
-		req.RootPath, req.GitDir, catalogBoolInt(req.Locked), catalogBoolInt(req.Prunable),
-		req.HeadRef, req.HeadCommit, req.HeadTree,
-		req.LastAccessible, req.UnavailableSince, req.AvailabilityDeadline,
-		req.RemovalDetectedAt, req.RemovalDeadline, req.RemovalEvidence,
-		req.LastSeen, req.LastError, req.CheckoutID, req.Incarnation,
-		req.LastSeen, req.LastSeen)
+ WHERE checkout_id = ? AND incarnation = ?`,
+			string(req.State),
+			req.RootPath, req.GitDir, catalogBoolInt(req.Locked), catalogBoolInt(req.Prunable),
+			report.HeadRef, report.HeadCommit, report.HeadTree,
+			req.LastAccessible, req.UnavailableSince, req.AvailabilityDeadline,
+			req.RemovalDetectedAt, req.RemovalDeadline, req.RemovalEvidence,
+			max(storedLastSeen, req.LastSeen), lastError, req.CheckoutID, req.Incarnation)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 {
+			return fmt.Errorf("%w: %s", ErrCatalogStaleGuard, subject)
+		}
+		return nil
+	})
+	if errors.Is(err, ErrCatalogObservationFenced) {
+		// The refusal is a verdict, not a lost row: the report that describes
+		// it rides out with the error rather than being thrown away with it.
+		return report, err
+	}
+	if err != nil {
+		return CheckoutObservationReport{}, err
+	}
+	return report, nil
+}
+
+// ErrCatalogObservationFenced is the refusal: a newer observation already
+// holds the row, so nothing this one stated was written.
+//
+// It wraps ErrCatalogStaleGuard because that is what the outcome IS for a
+// caller that does not distinguish — the write did not apply because the row
+// moved on — and because both production observers already handle that error
+// correctly for a refusal. A caller that wants the distinction tests this
+// sentinel, or reads CheckoutObservationReport.Verdict.
+var ErrCatalogObservationFenced = fmt.Errorf("%w: superseded by a newer observation", ErrCatalogStaleGuard)
+
+// CheckoutHeadRefusedMarker prefixes the durable trace a refused head write
+// leaves in the checkout's last_error.
+//
+// A refused head is the one refusal that does not reach the caller as an error
+// — the rest of the observation landed — so without a trace it would be
+// invisible after the fact: the row would simply carry a head older than the
+// sample that was just written, and nothing would say why. An operator, or a
+// later diagnostic, greps for this.
+const CheckoutHeadRefusedMarker = "head-write-refused"
+
+// checkoutHeadRefusalTrace renders that trace, keeping whatever diagnosis the
+// pass itself carried: the refusal is one more fact about the row, not a reason
+// to drop the observer's own.
+func checkoutHeadRefusalTrace(passError string, passClock, headEpoch int64, keptTree string) string {
+	trace := fmt.Sprintf("%s: sample at clock %d kept the head published at clock %d (tree %q)",
+		CheckoutHeadRefusedMarker, passClock, headEpoch, keptTree)
+	if passError == "" {
+		return trace
+	}
+	return passError + "; " + trace
+}
+
+// observationRegressionQuorum is how many consecutive passes behind a row's
+// observation floor the fence refuses before it concludes that the host clock
+// moved rather than the observers being late.
+//
+// It is 2 because each production observer holds at most one sample in flight:
+// the reconciliation pass and an explicit track can each contribute one write
+// sampled before the newest observation, and nothing else writes these columns
+// from a sample of its own. A third consecutive pass behind the floor cannot
+// be another stale sample from those two, so it is the clock that moved, and
+// refusing it further would wedge the row.
+const observationRegressionQuorum = 2
+
+// maxCheckoutObservationFences bounds the process-local ledger. The live
+// population is one entry per tracked working copy, so the cap is a safety
+// valve for a long-lived process that has seen many incarnations, not a
+// working limit. Losing an entry costs nothing durable: the next observation
+// re-seeds the floor from the row's own last_seen.
+const maxCheckoutObservationFences = 4096
+
+// checkoutObservationKey identifies the row an observation position belongs
+// to. The incarnation is part of it because a re-keyed row is a different
+// working copy, whose observations start their own sequence.
+type checkoutObservationKey struct {
+	checkoutID  string
+	incarnation string
+}
+
+// checkoutObservationFence is one row's place in the observation sequence.
+type checkoutObservationFence struct {
+	// position is the monotonic position of the newest accepted observation.
+	position int64
+	// floor is the pass clock that position was accepted at. A pass behind it
+	// sampled before the observation the row already holds.
+	floor int64
+	// stored is the row's own last_seen as of the last decision. The durable
+	// clock is evidence about the row that this ledger did not produce, so it
+	// raises the floor when it MOVES — a mode transition, a base adoption —
+	// and not merely when it is higher, which it stays after a rebase has
+	// deliberately put the floor below it.
+	stored int64
+	// behind counts the consecutive passes refused against this floor, and
+	// refused is the lowest clock they carried. Both reset on an accepted
+	// write. Together they are how a host clock that moved backwards is told
+	// apart from an observer that is merely late.
+	behind  int
+	refused int64
+	// headEpoch is the clock an adoption published the head this row carries
+	// at, and 0 when no adoption published it. It is a floor of its own,
+	// deliberately not rebased with the rest: the quorum exists so a stepped-
+	// back clock cannot freeze the state axis, and the price of that is that
+	// the pass which triggers the rebase is one the row's own clock says is
+	// old. Letting such a pass rewrite an adopted head would publish a base the
+	// family has moved past, which is the damage the fence exists to prevent,
+	// so the head axis is held until a sample either carries a clock at or past
+	// the publication or states the adoption sequence outright.
+	//
+	// It is seeded durably rather than remembered, so it survives the restart
+	// that a process-local memory would not: the head an adoption published is
+	// the active generation's tree, which the catalog can read back.
+	headEpoch int64
+}
+
+// checkoutObservationLedger orders the observation writes of one database.
+//
+// It is process-local by design rather than by omission. It orders writers
+// that are in flight AT THE SAME TIME, and every such writer is inside this
+// process — the catalog's mutation gate is what serialises them. Across a
+// restart there is nothing left to order: the samples of a dead process are
+// gone with it, and a fresh ledger re-seeds each row's floor from the last_seen
+// the row itself carries, which is the durable half of the same ordering.
+//
+// The positions are allocated per ledger, not per row, so they also order the
+// rows against each other; nothing depends on that, but it makes a position
+// comparable across a diagnostic that names two checkouts.
+type checkoutObservationLedger struct {
+	mu     sync.Mutex
+	next   int64
+	fences map[checkoutObservationKey]*checkoutObservationFence
+}
+
+// checkoutObservationDecision is what the ledger says about one pass.
+type checkoutObservationDecision struct {
+	verdict            CheckoutObservationVerdict
+	position           int64
+	fencedBy           int64
+	fencingObservation int64
+	// headAdmitted says the head axis may take this pass's values. It is false
+	// only for a pass that states a head different from the stored one on a row
+	// whose head an adoption published at a clock this pass is behind.
+	headAdmitted bool
+	// headEpoch is that publication clock, carried out for the report and the
+	// durable trace. Zero when no adoption published the stored head.
+	headEpoch int64
+}
+
+// checkoutObservationPass is one pass presented to the ledger: the two clocks
+// that order it, what it says about the head axis, and how to find out what
+// published the head it would overwrite.
+type checkoutObservationPass struct {
+	// storedClock is the row's own last_seen, read in the same transaction.
+	storedClock int64
+	// passClock is the clock the caller stamped on its sample.
+	passClock int64
+	// headStated is true when the request's head facts differ from the ones the
+	// row holds. A pass that restates the stored head writes no head at all, so
+	// it is never held back and never traced.
+	headStated bool
+	// headEpoch is the adoption sequence the caller states its sample
+	// references. Zero — every caller but the HEAD-change path — states none.
+	headEpoch int64
+	// publishedHead reports the clock an adoption published the head the
+	// row currently holds at, or 0 when no adoption published it. It is a
+	// durable read and is called at most once per row per process: when the
+	// ledger first sees the row, and again when a writer with no position of
+	// its own has moved the row's clock (which is what an adoption is).
+	publishedHead func() (int64, error)
+}
+
+// admitsHead reports whether this pass may move the head axis.
+//
+// An unclocked pass is outside the sequence entirely — it states no position
+// and is not fenced against one — and keeps that carve-out here for the same
+// reason it has it above: it is an administrative repair stating one column,
+// and fencing it against a clock it never claimed would refuse it for the life
+// of the row. Both production observers stamp their pass clock.
+func (f *checkoutObservationFence) admitsHead(pass checkoutObservationPass) bool {
+	switch {
+	case !pass.headStated:
+		return true
+	case f.headEpoch == 0:
+		return true
+	case pass.headEpoch >= f.headEpoch:
+		return true
+	case pass.passClock == 0:
+		return true
+	default:
+		return pass.passClock >= f.headEpoch
+	}
+}
+
+// admit places one pass in the row's observation sequence.
+//
+// storedClock is the row's own last_seen, read in the same transaction: it is
+// the durable floor, and it is what re-seeds a ledger that has never seen this
+// row (a fresh process) or that has been moved by a writer with no sample of
+// its own (a mode transition, a base adoption).
+//
+// The decision is taken inside the caller's transaction, which is what makes
+// it atomic with the write: the mutation gate is held from the read that feeds
+// this call to the commit that follows it, so no two observations can be
+// admitted against the same floor. A transaction that then fails leaves the
+// floor raised for a write that did not land, which costs at most the passes
+// behind it — they are refused, then the quorum adopts them — and never a
+// wedge.
+//
+// pass.publishedHead reads the caller's transaction, and so runs under this
+// ledger's mutex. That is not a lock inversion and not contention: the mutation
+// gate already serialises every writer over one database before it reaches
+// here, and the probe is taken at most twice per row per process — once when
+// the ledger first sees the row, once more if a writer with no position of its
+// own moves the row's clock. A fence whose head floor is derived from the
+// database cannot be re-derived outside the transaction it has to be consistent
+// with.
+func (l *checkoutObservationLedger) admit(
+	key checkoutObservationKey, pass checkoutObservationPass,
+) (checkoutObservationDecision, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.fences == nil {
+		l.fences = make(map[checkoutObservationKey]*checkoutObservationFence)
+	}
+	fence, known := l.fences[key]
+	if !known {
+		// A row this process has never observed takes its own durable clock as
+		// the floor: the ordering a previous process left behind. The head it
+		// carries is read back the same way, from the publication that put it
+		// there — a fresh ledger that forgot the adoption would otherwise let
+		// the very next stale pass regress it.
+		epoch, err := pass.publishedHead()
+		if err != nil {
+			return checkoutObservationDecision{}, err
+		}
+		fence = &checkoutObservationFence{
+			position: l.allocate(), floor: pass.storedClock, stored: pass.storedClock,
+			headEpoch: epoch,
+		}
+		l.remember(key, fence)
+	} else if pass.storedClock > fence.stored {
+		// Somebody with no position of its own pushed the row's clock past the
+		// last observation. It is evidence about the row, so it becomes the
+		// floor, and the refusals standing against the old one no longer mean
+		// anything. An adoption is exactly such a writer, and it may have
+		// republished the head in the same transaction, so the head's own floor
+		// is re-read here rather than inferred from the clock.
+		epoch, err := pass.publishedHead()
+		if err != nil {
+			return checkoutObservationDecision{}, err
+		}
+		fence.floor, fence.behind, fence.refused = pass.storedClock, 0, 0
+		fence.headEpoch = max(fence.headEpoch, epoch)
+	}
+	fence.stored = pass.storedClock
+	// The head axis is decided against its own floor, before the clock axes
+	// below can rebase theirs: an adopted head is never moved by a pass the
+	// row's clock says is older than the publication.
+	admitted := fence.admitsHead(pass)
+	decision := func(verdict CheckoutObservationVerdict) (checkoutObservationDecision, error) {
+		if admitted && pass.headStated {
+			// The head the row will carry is this pass's, so the floor becomes
+			// this pass's: whatever sequence it stated, and none when it stated
+			// none. The adopted head it replaced is gone, and a floor that
+			// outlived it would defend a tree the row no longer holds — the
+			// axis would freeze instead of being ordered. An adoption that
+			// republishes re-seeds the floor through the stored clock above.
+			fence.headEpoch = pass.headEpoch
+		}
+		return checkoutObservationDecision{
+			verdict: verdict, position: fence.position,
+			headAdmitted: admitted, headEpoch: fence.headEpoch,
+		}, nil
+	}
+	switch {
+	case pass.passClock == 0:
+		// An unclocked writer states no position and is not fenced against
+		// one. It still takes a position: it is an observation of the row, and
+		// the next fenced comparison should name it.
+		fence.position = l.allocate()
+		return decision(CheckoutObservationApplied)
+	case pass.passClock >= fence.floor:
+		fence.floor, fence.behind, fence.refused = pass.passClock, 0, 0
+		fence.position = l.allocate()
+		return decision(CheckoutObservationApplied)
+	case fence.behind >= observationRegressionQuorum && pass.passClock >= fence.refused:
+		// The passes kept coming from behind and this one is not falling
+		// further back: the clock domain moved, so the row moves with it
+		// rather than refusing until an operator notices. The head axis does
+		// not move with it — admitsHead has already refused a stated head
+		// against the publication this pass is behind.
+		fence.floor, fence.behind, fence.refused = pass.passClock, 0, 0
+		fence.position = l.allocate()
+		return decision(CheckoutObservationRebased)
+	default:
+		fence.behind++
+		if fence.refused == 0 || pass.passClock < fence.refused {
+			fence.refused = pass.passClock
+		}
+		return checkoutObservationDecision{
+			verdict:            CheckoutObservationFenced,
+			position:           fence.position,
+			fencedBy:           fence.position,
+			fencingObservation: fence.floor,
+			headEpoch:          fence.headEpoch,
+		}, nil
+	}
+}
+
+// allocate hands out the next observation position. Callers hold l.mu.
+func (l *checkoutObservationLedger) allocate() int64 {
+	l.next++
+	return l.next
+}
+
+// remember files a row's fence and keeps the ledger bounded, dropping the
+// entries nothing has observed for the longest. Callers hold l.mu.
+func (l *checkoutObservationLedger) remember(key checkoutObservationKey, fence *checkoutObservationFence) {
+	l.fences[key] = fence
+	if len(l.fences) <= maxCheckoutObservationFences {
+		return
+	}
+	cut := l.next - maxCheckoutObservationFences/2
+	for stale, entry := range l.fences {
+		if entry.position < cut {
+			delete(l.fences, stale)
+		}
+	}
+}
+
+// checkoutObservationLedgers holds one ledger per open database, keyed by the
+// identity of its core.
+//
+// It hangs off the core rather than living in it because it is not part of the
+// store's state: nothing reads it back, it is never persisted, and a handle
+// that never observes a checkout never allocates one. The key is weak and the
+// entry is dropped when the core it belongs to is collected, so a process that
+// opens many databases — a test binary, most of all — does not accumulate
+// ledgers for stores that are gone.
+var checkoutObservationLedgers sync.Map // weak.Pointer[storeCore] -> *checkoutObservationLedger
+
+// observationLedger returns the observation ledger every handle over this
+// database shares.
+func (c *Catalog) observationLedger() *checkoutObservationLedger {
+	core := c.store.storeCore
+	if core == nil {
+		// A handle with nothing behind it cannot write anyway; the write below
+		// fails on its own terms rather than on a nil map here.
+		return &checkoutObservationLedger{}
+	}
+	key := weak.Make(core)
+	if existing, ok := checkoutObservationLedgers.Load(key); ok {
+		return existing.(*checkoutObservationLedger)
+	}
+	fresh := &checkoutObservationLedger{
+		fences: make(map[checkoutObservationKey]*checkoutObservationFence),
+	}
+	if existing, loaded := checkoutObservationLedgers.LoadOrStore(key, fresh); loaded {
+		return existing.(*checkoutObservationLedger)
+	}
+	runtime.AddCleanup(core, func(collected weak.Pointer[storeCore]) {
+		checkoutObservationLedgers.Delete(collected)
+	}, key)
+	return fresh
 }
 
 // DeleteCheckout removes a checkout. Its tracking intents, in-flight intent
@@ -1107,6 +1748,143 @@ func (c *Catalog) GetViewGeneration(ctx context.Context, generationID int64) (Vi
 		return ViewGeneration{}, false, err
 	}
 	return generation, true, nil
+}
+
+// maxReusableViewGenerationCandidates bounds one FindReusableViewGenerations
+// call, the way maxDedicatedBaseReuseCandidates bounds the committed base's
+// own equal-identity lookup. A layer identity that has been built more than a
+// handful of times has a servable row at the top of the list or nowhere.
+const maxReusableViewGenerationCandidates = 16
+
+// reusableViewGenerationMatchSQL finds the servable generations a repeat build
+// request may route instead of rebuilding.
+//
+// It is buildingViewGenerationMatchSQL's sibling and compares exactly the same
+// identity columns — the two must agree about what "the same build" is, or the
+// reuse lookup would route a payload the coalescing rule would not have shared.
+// The only differences are the states (a build that has finished rather than
+// one in flight) and the ordering (newest first: an identical identity built
+// twice is the same payload, and the newest row is the one least likely to be
+// retired under the caller).
+//
+// It reads metadata only — no payload row is touched.
+//
+// It names ONE state, and FindReusableViewGenerations runs it once per servable
+// state rather than folding both into an IN. That is a query-plan decision, not
+// a style one. view_generations_by_graph_state is (graph_id, state,
+// generation_id DESC), so a single-state predicate lets the index supply the
+// ordering too: EXPLAIN QUERY PLAN reports
+//
+//	SEARCH view_generations USING INDEX view_generations_by_graph_state (graph_id=? AND state=?)
+//
+// and nothing else. With `state IN (?, ?)` the index still seeks — the scan is
+// never over the whole table — but the ordering spans two disjoint ranges, so
+// the plan grows a `USE TEMP B-TREE FOR ORDER BY` that materialises and sorts
+// every ready-or-superseded generation of the graph before LIMIT can apply.
+// This is a per-cache-miss cost on the coordinator's hot cycle path, in an item
+// whose whole purpose is to do less work, so the sort is not paid.
+const reusableViewGenerationMatchSQL = `
+SELECT generation_id, ` + viewGenerationColumns + ` FROM view_generations
+ WHERE state = ? AND graph_id = ? AND owner_kind = ? AND generation_kind = ?
+   AND IFNULL(layer_id, '') = ? AND IFNULL(checkout_id, '') = ?
+   AND IFNULL(base_generation_id, 0) = ?
+   AND lower_view_fingerprint = ? AND tree_oid = ?
+   AND IFNULL(provenance_commit_oid, '') = ? AND config_hash = ?
+   AND extractor_versions = ? AND resolver_version = ? AND dependency_revision = ?
+ ORDER BY generation_id DESC LIMIT ?`
+
+// FindReusableViewGenerations returns the servable generations whose build
+// identity is exactly identity's, newest first.
+//
+// This is the durable half of layer reuse. A coordinator's own cache is
+// process-local and a few entries deep, so a daemon restart — or a branch
+// visited once more than the cache is wide — re-indexes a tree whose payload is
+// still sitting in the database. The catalog is where that payload is
+// addressable by identity rather than by pointer.
+//
+// It is a read. Nothing here allocates, adopts, publishes or retires: the
+// caller decides whether to route what it finds, and routing is its own
+// compare-and-set. A generation still being built is deliberately outside the
+// result — it is not servable, and coalescing onto it is
+// AdoptOrCreateViewGeneration's job, not this one's.
+//
+// An identity with no layer id is refused rather than matched, the same
+// exclusion AdoptOrCreateViewGeneration makes: an unnamed build is nobody's
+// layer and must never be handed to a second owner.
+//
+// The two servable states are asked for separately and merged here, so that
+// each seek can ride the index's own generation_id DESC ordering instead of
+// sorting the graph's whole servable population — see
+// reusableViewGenerationMatchSQL for the plan. Each arm is bounded by the same
+// limit and the merge re-applies it, so the call reads at most twice the limit
+// and returns at most the limit, newest first.
+func (c *Catalog) FindReusableViewGenerations(
+	ctx context.Context,
+	identity ViewGeneration,
+	limit int,
+) ([]ViewGeneration, error) {
+	if identity.LayerID == "" {
+		return nil, fmt.Errorf("%w: layer_id is required for reuse", ErrCatalogInvalidValue)
+	}
+	if limit < 0 {
+		return nil, fmt.Errorf("%w: limit %d", ErrCatalogInvalidValue, limit)
+	}
+	if limit == 0 || limit > maxReusableViewGenerationCandidates {
+		limit = maxReusableViewGenerationCandidates
+	}
+	var out []ViewGeneration
+	for _, state := range []ViewGenerationState{ViewGenerationReady, ViewGenerationSuperseded} {
+		found, err := c.reusableViewGenerationsInState(ctx, identity, state, limit)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, found...)
+	}
+	// Each arm is already newest-first; the merge is only between them.
+	slices.SortFunc(out, func(a, b ViewGeneration) int {
+		return cmp.Compare(b.GenerationID, a.GenerationID)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// reusableViewGenerationsInState is one arm of the reuse lookup: the servable
+// generations in exactly one state whose identity is identity's, newest first
+// and bounded.
+func (c *Catalog) reusableViewGenerationsInState(
+	ctx context.Context,
+	identity ViewGeneration,
+	state ViewGenerationState,
+	limit int,
+) ([]ViewGeneration, error) {
+	rows, err := c.store.db.QueryContext(ctx, reusableViewGenerationMatchSQL,
+		string(state),
+		identity.GraphID, identity.OwnerKind, identity.GenerationKind,
+		identity.LayerID, identity.CheckoutID, identity.BaseGenerationID,
+		identity.LowerViewFingerprint, identity.TreeOID, identity.ProvenanceCommitOID,
+		identity.ConfigHash, identity.ExtractorVersions, identity.ResolverVersion,
+		identity.DependencyRevision, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ViewGeneration
+	for rows.Next() {
+		var generation ViewGeneration
+		err := scanViewGeneration(func(dest ...any) error {
+			return rows.Scan(append([]any{&generation.GenerationID}, dest...)...)
+		}, &generation)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, generation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // maxViewGenerationListing bounds one ListViewGenerations call, whether or not

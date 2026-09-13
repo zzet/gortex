@@ -75,6 +75,14 @@ const (
 	// cache into an unbounded ledger of every branch ever visited.
 	defaultRetainedCommitLayers = 4
 
+	// maxStoredCommitLayerCandidates bounds the catalog's equal-identity lookup
+	// for a commit layer, the way maxDedicatedBaseReuseCandidates bounds the
+	// committed base's. The lookup is keyed on the whole build identity, so a
+	// servable row is at the head of the list or there is none; the bound is
+	// what keeps a pathological store from turning one cache miss into an
+	// unbounded read.
+	maxStoredCommitLayerCandidates = 16
+
 	// checkoutLayerOwnerKind names who owns the generations a coordinator
 	// builds: the family's primary dedicated graph, whose corpus they compose
 	// over and whose repo prefix their payload is stamped with.
@@ -1485,6 +1493,9 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 	if cached, ok := c.cachedCommit(ctx, generationIdentityKey(identity)); ok {
 		return cached, true, nil
 	}
+	if stored, ok := c.storedCommit(ctx, identity); ok {
+		return stored, true, nil
+	}
 	started := time.Now()
 	var baseReader LayerBase = c.store.AtGeneration(base.generationID)
 	if base.generationID > 0 {
@@ -1850,6 +1861,96 @@ func (c *CheckoutCoordinator) cachedCommit(ctx context.Context, key string) (int
 		return 0, false
 	}
 	return generationID, true
+}
+
+// storedCommit is the durable half of the reuse cache: the catalog's own
+// equal-identity lookup for a commit layer this checkout has already built.
+//
+// The process-local cache above holds four identities and dies with the
+// process. Everything outside that window — a daemon restart, a branch visited
+// once more than the cache is wide, a transition that dropped the cache
+// wholesale — re-indexed a tree whose payload is still in the database and
+// still servable. The identity is the same string both halves compare
+// (generationIdentityKey), so "the same build" means exactly one thing here,
+// in the cache, and in the catalog's own in-flight coalescing.
+//
+// The adoption itself writes nothing. The lookup is a bounded metadata read;
+// what it returns is adopted by the route flip the caller was going to make
+// anyway. Nothing is allocated, published, superseded or re-keyed, and the
+// adopted row is not touched at all. A row that no longer holds up — retired
+// under the reader, or an identity the renderer disagrees with — is skipped
+// rather than routed.
+//
+// The one write the call can reach is not the adoption's. The adopted
+// generation is filed in the process cache so the next switch back does not pay
+// the read again, and a full cache evicts its tail; retainCommit offers every
+// evicted generation for retirement, which is catalog + payload DML when
+// nothing refuses it. That is the cache's own bookkeeping and is paid
+// identically on the build path — reconcileCommitSlot files the built
+// generation under the same key at the end of the same cycle — so it is a cost
+// reuse moves earlier within a cycle, never one it adds.
+// TestStoredCommitLayerReuseWritesNothing measures the non-evicting case at
+// zero; TestStoredCommitLayerReuseWritesOnlyTheCacheEviction measures the
+// evicting one and attributes every write to the generation the cache gave up.
+func (c *CheckoutCoordinator) storedCommit(ctx context.Context, identity GenerationIdentity) (int64, bool) {
+	key := generationIdentityKey(identity)
+	rows, err := c.catalog.FindReusableViewGenerations(ctx, store_sqlite.ViewGeneration{
+		OwnerKind:            identity.OwnerKind,
+		GraphID:              identity.GraphID,
+		LayerID:              identity.LayerID,
+		CheckoutID:           identity.CheckoutID,
+		GenerationKind:       identity.GenerationKind,
+		BaseGenerationID:     identity.BaseGenerationID,
+		LowerViewFingerprint: identity.LowerViewFingerprint,
+		TreeOID:              identity.TreeOID,
+		ProvenanceCommitOID:  identity.ProvenanceCommitOID,
+		ConfigHash:           identity.ConfigHash,
+		ExtractorVersions:    identity.ExtractorVersions,
+		ResolverVersion:      identity.ResolverVersion,
+		DependencyRevision:   identity.DependencyRevision,
+	}, maxStoredCommitLayerCandidates)
+	if err != nil {
+		// A reuse lookup that cannot be answered is not a failed cycle: the
+		// build below produces the same payload, at the price this item exists
+		// to avoid.
+		c.logger.Debug("checkout coordinator: stored commit layer lookup failed",
+			zap.String("checkout", c.checkoutID), zap.Error(err))
+		return 0, false
+	}
+	generationID, ok := selectReusableCommitGeneration(rows, key)
+	if !ok {
+		return 0, false
+	}
+	c.retainCommit(ctx, key, generationID)
+	return generationID, true
+}
+
+// selectReusableCommitGeneration is the Go half of the identity check: of the
+// candidates the catalog offered, the first one this coordinator will actually
+// route.
+//
+// It is exactly redundant with the lookup's SQL by construction — that filters
+// the same thirteen columns generationRowKey renders, and the same servable
+// states — so against a real catalog no input separates the two halves. It is
+// kept because redundancy is the point: if a column is ever added to the
+// identity and only one side learns about it, the side that did not is wrong,
+// and this is the arm that fails closed. It refuses the candidate instead of
+// routing a payload built under a rule the caller does not know it stated.
+// cachedCommit's re-check is the same guard over the process-local half.
+//
+// It is a function of the rows alone so that the guard can be pinned on its own
+// terms — TestStoredCommitLayerIdentityRecheckRefusesAForeignRow hands it a row
+// no real lookup would return, which is the only way to state "and if the SQL
+// ever did, this refuses it". The SQL half is pinned in its own package, by
+// TestFindReusableViewGenerationsMatchesTheWholeIdentity.
+func selectReusableCommitGeneration(rows []store_sqlite.ViewGeneration, key string) (int64, bool) {
+	for _, row := range rows {
+		if !servableGeneration(row.State) || generationRowKey(row) != key {
+			continue
+		}
+		return row.GenerationID, true
+	}
+	return 0, false
 }
 
 // retainCommit records a commit generation as re-routable and retires whatever
