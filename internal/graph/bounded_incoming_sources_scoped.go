@@ -27,6 +27,110 @@ func (b *IncomingSourceBudget) Remaining() int {
 	return max(0, MaxIncomingSourceCandidateRows-int(b.inspected.Load()))
 }
 
+// IncomingSourceAdmission is the completeness fact one bounded incoming
+// admission leaves behind. It is a fact, not a metric: a caller that cannot
+// tell a refused admission from a complete one cannot tell a bounded
+// incremental pass from one that silently stopped admitting work, and the two
+// leave different graphs behind. It mirrors the shape the bounded affected-by
+// fan-out publishes (internal/indexer/affected_by.go affectedByTruncation).
+//
+// Inspected counts every physical row THIS admission read, refused or not; a
+// budget shared with other admissions holds more. Limit is the ceiling that
+// applied, i.e. MaxIncomingSourceCandidateRows.
+type IncomingSourceAdmission struct {
+	// Keys is the deduplicated key count the admission read for.
+	Keys int
+	// Inspected is the physical row count this admission read and charged.
+	Inspected int
+	// Limit is the shared ceiling that applied.
+	Limit int
+	// Refused is the fact itself: the ceiling fired and NOTHING was admitted.
+	Refused bool
+	// Dropped is the row count the refusal left unadmitted — the size of the
+	// hole a consumer's pass has. Because a refusal is whole-batch it equals
+	// Inspected when Refused and is zero otherwise; it is carried explicitly so
+	// a consumer reporting "how much did this pass not see" never has to infer
+	// it from a counter that a shared budget also feeds.
+	Dropped int
+}
+
+// AdmitIncomingRowsBounded performs ONE incoming-adjacency read for the whole
+// deduplicated key set and charges every returned row against ONE shared
+// IncomingSourceBudget: the same object, the same row units and the same
+// MaxIncomingSourceCandidateRows ceiling filterIncomingSourceSnapshot charges
+// for FindIncomingSourcesScoped. Rows are charged as read, before any
+// caller-side filtering, exactly as the scoped projection charges raw
+// candidates before ownership filtering.
+//
+// The single read is load-bearing, not incidental. The incremental frontier
+// documents — and internal/resolver/batch_hotpaths_test.go guards — a constant
+// number of logical store calls per pass: one file-node read, one
+// outgoing-adjacency read, one incoming-stub read. Splitting the incoming read
+// into key chunks would turn that constant into ceil(keys/chunk) statements on
+// the per-save hot path, so this admission keeps the caller's batch shape and
+// bounds what is ADMITTED — every row it returns is an edge the caller may
+// rebind and durably reindex. Peak read memory is therefore whatever the
+// caller's own unbounded read already cost; the ceiling governs write
+// amplification, not the size of the physical batch.
+//
+// Exceeding the ceiling refuses the WHOLE admission: a nil map, the
+// completeness fact with Refused and Dropped set, and the typed
+// *BoundedLocalizationLimitError — never a partial batch. A partial incoming
+// admission is indistinguishable, to every later pass and to the durable edges
+// it writes back, from a complete one over a smaller corpus; the refusal keeps
+// the unadmitted edges parked exactly as they were instead. Charging the whole
+// batch in one call is also what lets Dropped report the true size of the hole:
+// a chunked early stop can only report the rows it happened to reach.
+//
+// A nil budget gets a fresh one per admission, mirroring
+// FindIncomingSourcesScoped's nil-budget handling. Passing one in is how two
+// admissions share a ceiling.
+func AdmitIncomingRowsBounded[T any](
+	ctx context.Context,
+	read func([]string) map[string][]T,
+	keys []string,
+	budget *IncomingSourceBudget,
+) (map[string][]T, IncomingSourceAdmission, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if budget == nil {
+		budget = &IncomingSourceBudget{}
+	}
+	fact := IncomingSourceAdmission{Limit: MaxIncomingSourceCandidateRows}
+	if err := ctx.Err(); err != nil {
+		return nil, fact, err
+	}
+	ids := boundedIncomingTargetIDs(keys)
+	fact.Keys = len(ids)
+	if len(ids) == 0 || read == nil {
+		return make(map[string][]T), fact, nil
+	}
+	rows := read(ids)
+	if err := ctx.Err(); err != nil {
+		return nil, fact, err
+	}
+	for _, key := range ids {
+		fact.Inspected += len(rows[key])
+	}
+	// A zero-row admission never charges: an empty reverse frontier must not
+	// read as a refusal just because an earlier admission spent the budget.
+	if fact.Inspected > 0 {
+		if err := budget.Charge(fact.Inspected); err != nil {
+			fact.Refused = true
+			fact.Dropped = fact.Inspected
+			return nil, fact, err
+		}
+	}
+	out := make(map[string][]T, len(ids))
+	for _, key := range ids {
+		if batch := rows[key]; len(batch) > 0 {
+			out[key] = batch
+		}
+	}
+	return out, fact, nil
+}
+
 // IncomingSourceNodeQuery permits checked presence reads on the transaction
 // already holding a physical reader's connection. No cursor may remain open
 // while the query is used. handled=false means the reader is a different store.

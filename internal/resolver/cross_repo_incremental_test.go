@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -117,4 +118,90 @@ func hasEdgeKindTo(edges []*graph.Edge, kind graph.EdgeKind, target string) bool
 		}
 	}
 	return false
+}
+
+// F3 — the cross-repository mutation pass builds the same bounded frontier the
+// single-repository legs do. A refusal empties its incoming half, so the pass
+// resolves only the changed files' own outgoing edges while its CrossRepoStats
+// still count a normal-looking resolution. Without the admission fact riding
+// out of the call and a Warn on the way, that reads as a complete pass.
+func TestCrossRepoMutationFrontiersCarriesIncomingRefusal(t *testing.T) {
+	fanIn := graph.MaxIncomingSourceCandidateRows + 1
+	g, changed := incomingFanOutGraph(t, fanIn)
+	stub := graph.UnresolvedMarker + "Close"
+
+	logs, observed := observedResolverLogger()
+	cr := NewCrossRepo(g)
+	cr.SetLogger(logs)
+
+	stats, admission := cr.ResolveMutationFrontiersBounded([]string{changed}, []string{changed}, []string{changed})
+	if stats == nil {
+		t.Fatal("cross-repo pass returned no stats")
+	}
+	var limit *graph.BoundedLocalizationLimitError
+	if !errors.As(admission.Refusal, &limit) {
+		t.Fatalf("cross-repo refusal = %v, want *graph.BoundedLocalizationLimitError", admission.Refusal)
+	}
+	if limit.Limit != graph.MaxIncomingSourceCandidateRows {
+		t.Fatalf("refusal limit = %d, want the shared ceiling %d", limit.Limit, graph.MaxIncomingSourceCandidateRows)
+	}
+	if !admission.Refused {
+		t.Fatalf("completeness fact = %+v, want Refused", admission.IncomingSourceAdmission)
+	}
+	if admission.Dropped != fanIn || admission.Inspected != fanIn {
+		t.Fatalf("admission = %+v, want %d inspected and dropped", admission.IncomingSourceAdmission, fanIn)
+	}
+	if admission.Limit != graph.MaxIncomingSourceCandidateRows {
+		t.Fatalf("admission ceiling = %d, want %d", admission.Limit, graph.MaxIncomingSourceCandidateRows)
+	}
+	// Fail-closed: nothing from the refused leg was rebound.
+	if left := unresolvedInEdgeCount(g, stub); left != fanIn {
+		t.Fatalf("%d of %d parked references were rebound by a refused cross-repo admission", fanIn-left, fanIn)
+	}
+
+	entries := observed.FilterMessage("resolver: incoming stub admission refused").All()
+	if len(entries) != 1 {
+		t.Fatalf("cross-repo refusal log records = %d, want exactly 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["leg"] != "cross_repo_preparation" {
+		t.Fatalf("refusal logged for leg %v, want cross_repo_preparation", fields["leg"])
+	}
+	if fields["dropped"] != int64(fanIn) {
+		t.Fatalf("logged dropped = %v, want %d", fields["dropped"], fanIn)
+	}
+
+	// The unchanged public entrypoint reaches the same fact-and-log path; only
+	// the fact's return value is dropped there.
+	logs, observed = observedResolverLogger()
+	cr = NewCrossRepo(g)
+	cr.SetLogger(logs)
+	if got := cr.ResolveMutationFrontiers([]string{changed}, []string{changed}, []string{changed}); got == nil {
+		t.Fatal("legacy entrypoint returned no stats")
+	}
+	if n := observed.FilterMessage("resolver: incoming stub admission refused").Len(); n != 1 {
+		t.Fatalf("legacy entrypoint logged %d refusals, want 1", n)
+	}
+}
+
+// An in-ceiling cross-repo pass stays a complete pass: no fact, no Warn, and
+// the parked references admitted. Without this the test above is satisfiable by
+// flagging every pass.
+func TestCrossRepoMutationFrontiersKeepsAdmittedPassClean(t *testing.T) {
+	g, changed := incomingFanOutGraph(t, 64)
+
+	logs, observed := observedResolverLogger()
+	cr := NewCrossRepo(g)
+	cr.SetLogger(logs)
+
+	_, admission := cr.ResolveMutationFrontiersBounded([]string{changed}, []string{changed}, []string{changed})
+	if admission.Refusal != nil || admission.Refused || admission.Dropped != 0 {
+		t.Fatalf("a 64-edge fan-out was reported as bounded: %+v %v", admission.IncomingSourceAdmission, admission.Refusal)
+	}
+	if admission.Inspected != 64 {
+		t.Fatalf("inspected rows = %d, want 64", admission.Inspected)
+	}
+	if n := observed.FilterMessage("resolver: incoming stub admission refused").Len(); n != 0 {
+		t.Fatalf("clean cross-repo pass logged %d refusals", n)
+	}
 }

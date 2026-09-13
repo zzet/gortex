@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"os"
@@ -141,6 +142,70 @@ type ResolveStats struct {
 	// reduction is visible. Zero (omitted) on the unscoped whole-graph path.
 	PendingBefore int `json:"pending_before,omitempty"`
 	PendingAfter  int `json:"pending_after,omitempty"`
+	// IncomingAdmission* carry the bounded incoming-stub admission's
+	// completeness fact for this pass (graph.IncomingSourceAdmission). A file
+	// defining a common name parks unbound references from the whole corpus on
+	// its stub ids, so the admission is charged against the shared
+	// incoming-source budget. Refused means the ceiling fired and the pass
+	// admitted NOTHING from the incoming leg — the parked edges are untouched,
+	// not partially rebound. A caller that cannot read this fact cannot tell a
+	// complete reverse pass from a bounded one.
+	IncomingAdmissionInspected int  `json:"incoming_admission_inspected,omitempty"`
+	IncomingAdmissionLimit     int  `json:"incoming_admission_limit,omitempty"`
+	IncomingAdmissionRefused   bool `json:"incoming_admission_refused,omitempty"`
+	// IncomingAdmissionDropped is the size of the hole: the parked references
+	// a refused leg left unadmitted. A pass with Dropped > 0 did LESS work than
+	// a complete one, and it is the number a consumer needs to say so.
+	IncomingAdmissionDropped int `json:"incoming_admission_dropped,omitempty"`
+}
+
+// recordIncomingAdmission puts a bounded incoming admission's completeness
+// fact on the pass stats. Refused is set only for the typed limit error: a
+// cancellation is a different outcome and must not read as "the bound fired".
+//
+// Every consumer of a bounded admission calls this before acting on what the
+// admission returned — including the consumers whose leg then collapses to
+// "nothing to do", because a refused leg and an empty leg are the same shape
+// and only this fact separates them.
+func recordIncomingAdmission(stats *ResolveStats, fact graph.IncomingSourceAdmission, err error) {
+	if stats == nil {
+		return
+	}
+	stats.IncomingAdmissionInspected += fact.Inspected
+	stats.IncomingAdmissionDropped += fact.Dropped
+	if fact.Limit > 0 {
+		stats.IncomingAdmissionLimit = fact.Limit
+	}
+	var limit *graph.BoundedLocalizationLimitError
+	if errors.As(err, &limit) {
+		stats.IncomingAdmissionRefused = true
+	}
+}
+
+// logIncomingAdmissionRefusal is the one Warn shape every bounded incoming leg
+// uses. Nothing else in the package logs a refusal, so a leg that forgets the
+// fact is visible as a missing call site rather than as a differently worded
+// log line. A nil error is not a refusal and logs nothing.
+func logIncomingAdmissionRefusal(logger *zap.Logger, leg string, stubKeys int, fact graph.IncomingSourceAdmission, err error) {
+	if err == nil || logger == nil {
+		return
+	}
+	logger.Warn("resolver: incoming stub admission refused",
+		zap.String("leg", leg),
+		zap.Int("stub_keys", stubKeys),
+		zap.Int("inspected", fact.Inspected),
+		zap.Int("dropped", fact.Dropped),
+		zap.Int("limit", fact.Limit),
+		zap.Error(err))
+}
+
+// recordFrontierIncomingAdmission is the frontier-shaped pair of the two calls
+// above: a consumer that holds an incrementalFileFrontier must publish its
+// incoming leg's completeness fact before it looks at frontier.pending, which
+// a refusal has already emptied of every incoming entry.
+func recordFrontierIncomingAdmission(logger *zap.Logger, stats *ResolveStats, frontier incrementalFileFrontier, leg string) {
+	recordIncomingAdmission(stats, frontier.incomingAdmission, frontier.incomingRefusal)
+	logIncomingAdmissionRefusal(logger, leg, len(frontier.stubKeys), frontier.incomingAdmission, frontier.incomingRefusal)
 }
 
 // Resolver resolves unresolved edge targets to actual graph node IDs.
@@ -2454,10 +2519,22 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// graph that no-op cost can be minutes and holds the shared resolver lock
 	// for the whole duration.
 	pendingStarted := time.Now()
-	pending := r.pendingEdgesForFileAndIncoming(filePath)
+	frontier := r.collectIncrementalFileFrontier([]string{filePath})
+	pending := frontier.pending
 	pendingDuration := time.Since(pendingStarted)
+	stats := &ResolveStats{}
+	// The bound is a fact about THIS save before it is anything else. A refused
+	// incoming leg contributes zero entries to pending, so a changed file with
+	// no outgoing work of its own — the ordinary shape for a widely referenced
+	// definition file — reaches the early return below with a frontier that is
+	// empty for the opposite of the usual reason. Recording (and logging) the
+	// refusal here is what keeps "the save had nothing to do" distinguishable
+	// from "the save refused to look at what there was to do"; both callers of
+	// this entrypoint discard the stats, so the Warn is the channel that
+	// survives for them.
+	recordFrontierIncomingAdmission(r.logger, stats, frontier, "preparation")
 	if len(pending) == 0 {
-		return &ResolveStats{}
+		return stats
 	}
 
 	indexStarted := time.Now()
@@ -2476,12 +2553,12 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	if err := r.warmLookupCache(pending); err != nil {
 		r.clearLookupCache()
 		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
-		return &ResolveStats{Unresolved: len(pending)}
+		stats.Unresolved = len(pending)
+		return stats
 	}
 	warmDuration := time.Since(warmStarted)
 	defer r.clearLookupCache()
 
-	stats := &ResolveStats{}
 	forwardStarted := time.Now()
 	r.resolveFileEdgesLocked(filePath, stats)
 	forwardDuration := time.Since(forwardStarted)
@@ -2506,12 +2583,18 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	return stats
 }
 
-// pendingEdgesForFileAndIncoming gathers the unresolved edges the forward
-// and reverse passes will visit — the file's own outgoing unresolved
-// edges plus the unresolved in-edges parked on the stub ids of the
-// referenceable symbols this file defines. It mirrors the edge walks
-// resolveFileEdgesLocked / resolveIncomingLocked perform, but only to seed
-// warmLookupCache; the result feeds caching, never resolution directly.
+// incrementalFileFrontier gathers the unresolved edges the forward and reverse
+// passes will visit — the files' own outgoing unresolved edges plus the
+// unresolved in-edges parked on the stub ids of the referenceable symbols they
+// define. It mirrors the edge walks resolveFileEdgesLocked /
+// resolveIncomingLocked perform, but only to seed warmLookupCache; the result
+// feeds caching, never resolution directly.
+//
+// It is deliberately the whole struct that travels: an earlier revision handed
+// callers only .pending, and the per-save entrypoint then reported a refused
+// reverse leg as a clean no-op because a refusal and an empty frontier look
+// identical from that field alone. Take the frontier, publish the fact
+// (recordFrontierIncomingAdmission), then read .pending.
 type incrementalFileFrontier struct {
 	paths       []string
 	nodesByFile map[string][]*graph.Node
@@ -2522,16 +2605,24 @@ type incrementalFileFrontier struct {
 	outgoingPending int
 	outgoingCollect time.Duration
 	incomingCollect time.Duration
-}
-
-func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge {
-	return r.collectIncrementalFileFrontier([]string{filePath}).pending
+	// incomingAdmission is the completeness fact of the bounded incoming-stub
+	// admission and incomingRefusal the typed limit error when the shared
+	// ceiling fired. A refused admission contributes ZERO incoming entries to
+	// pending: len(pending) == outgoingPending. Nothing downstream may treat a
+	// refused frontier as an exhaustive one.
+	incomingAdmission graph.IncomingSourceAdmission
+	incomingRefusal   error
 }
 
 // collectIncrementalFileFrontier performs the complete read side of a
 // multi-file incremental resolve with a constant number of logical store
 // calls: one batched file-node read, one outgoing-adjacency read, and one
 // incoming-stub read. Backends may chunk each request at their bind limit.
+// The incoming-stub read stays ONE logical call after the bound was added:
+// graph.AdmitIncomingRowsBounded charges the whole returned batch instead of
+// chunking the key set, so the ceiling governs what is admitted (and therefore
+// written back) without multiplying the pass's statements. See
+// TestIncrementalFrontierKeepsOneIncomingReadPastTheScopedKeyCap.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
 	return collectIncrementalFileFrontierForPreparation(r.graph, filePaths, r.incrementalSkipped)
 }
@@ -2628,8 +2719,24 @@ func collectIncrementalFileFrontierMode(
 	incomingStarted := time.Now()
 	// The unresolved target string is the incoming-edge bucket key even when
 	// no node with that ID exists.
+	//
+	// The admission is bounded: a changed file that defines a common name
+	// (Close, Get, New) parks every unbound reference to that name in the whole
+	// corpus on its stub ids, and admitting them all is the reverse leg's write
+	// amplification. graph.AdmitIncomingRowsBounded charges the physical rows
+	// against the shared incoming-source budget and refuses the WHOLE leg at
+	// the ceiling — the parked edges stay exactly as they are, and the refusal
+	// rides the frontier as a completeness fact instead of being a silent
+	// truncation. It neither widens nor splits the read: the same keys in the
+	// same single batched call, the same rows.
 	if lightweightIncoming {
-		inByStub := graph.InEdgeIdentitiesByNodeIDs(g, frontier.stubKeys)
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(),
+			func(keys []string) map[string][]graph.EdgeIdentity {
+				return graph.InEdgeIdentitiesByNodeIDs(g, keys)
+			},
+			frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
 		for _, key := range frontier.stubKeys {
 			for _, identity := range inByStub[key] {
 				if !graph.IsUnresolvedTarget(identity.To) {
@@ -2644,7 +2751,9 @@ func collectIncrementalFileFrontierMode(
 			}
 		}
 	} else {
-		inByStub := g.GetInEdgesByNodeIDs(frontier.stubKeys)
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
 		for _, key := range frontier.stubKeys {
 			for _, edge := range inByStub[key] {
 				if edge != nil && graph.IsUnresolvedTarget(edge.To) {
@@ -2675,8 +2784,17 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	var outgoingDuration, incomingDuration, attributionDuration time.Duration
 	outcome := "interrupted"
 	defer func() {
+		// A pass whose incoming leg was refused did not finish the work a
+		// complete one does, and "complete" / "no_pending" is the dimension the
+		// phase logging keys on. Relabel it at the one place every exit passes
+		// through, so no future early return can reintroduce the mislabel.
+		if stats.IncomingAdmissionRefused && (outcome == "complete" || outcome == "no_pending") {
+			outcome = "incoming_refused"
+		}
 		logger.Info("resolver: incremental files phases",
 			zap.String("outcome", outcome),
+			zap.Bool("incoming_admission_refused", stats.IncomingAdmissionRefused),
+			zap.Int("incoming_admission_dropped", stats.IncomingAdmissionDropped),
 			zap.Int("files", len(frontier.paths)),
 			zap.Int("pending", len(frontier.pending)),
 			zap.Int("outgoing_pending", frontier.outgoingPending),
@@ -2713,6 +2831,9 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 		zap.Int("stub_keys", len(frontier.stubKeys)),
 		zap.Duration("outgoing_collect", frontier.outgoingCollect),
 		zap.Duration("incoming_collect", frontier.incomingCollect))
+	// The preparation leg's bound is a fact about this batch, not a log line:
+	// the incoming leg admitted nothing and the parked edges stay unresolved.
+	recordFrontierIncomingAdmission(logger, stats, frontier, "preparation")
 	if len(frontier.pending) == 0 {
 		outcome = "no_pending"
 		return stats
@@ -3143,7 +3264,16 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	// materialized read is retained and handed to the resolution helper:
 	// it is exactly the batch that helper needs, and re-reading it doubled
 	// the hit path's store time and allocations at scale.
-	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
+	// The probe's read is the same admission the resolution helper below then
+	// writes back from, so it carries the same bound and the same whole-batch
+	// refusal (graph.AdmitIncomingRowsBounded).
+	inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+		context.Background(), r.graph.GetInEdgesByNodeIDs, stubKeys, nil)
+	recordIncomingAdmission(stats, fact, err)
+	if err != nil {
+		logIncomingAdmissionRefusal(r.logger, "names_probe", len(stubKeys), fact, err)
+		return stats
+	}
 	pending := false
 	for _, edges := range inByStub {
 		for _, edge := range edges {
@@ -3203,7 +3333,18 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 	if len(stubKeys) == 0 {
 		return
 	}
-	r.resolveIncomingStubEdgesLocked(stubKeys, r.graph.GetInEdgesByNodeIDs(stubKeys), stats)
+	// This read is the reverse leg's write amplification: every row it admits
+	// is an edge resolveIncomingStubEdgesLocked may rebind and reindex. It is
+	// charged against the shared incoming-source budget and refuses whole, so a
+	// corpus-wide fan-out on a common name cannot become a corpus-wide write.
+	inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+		context.Background(), r.graph.GetInEdgesByNodeIDs, stubKeys, nil)
+	recordIncomingAdmission(stats, fact, err)
+	if err != nil {
+		logIncomingAdmissionRefusal(r.logger, "resolve", len(stubKeys), fact, err)
+		return
+	}
+	r.resolveIncomingStubEdgesLocked(stubKeys, inByStub, stats)
 }
 
 // resolveIncomingStubEdgesLocked is resolveIncomingStubKeysLocked over a
