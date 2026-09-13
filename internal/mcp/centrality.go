@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strconv"
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
-// personalizedPageRank runs a Random-Walk-with-Restart (Personalized
+// personalizedPageRankScoped runs a Random-Walk-with-Restart (Personalized
 // PageRank) from the given seed node IDs over the adjacency snapshot
 // and returns each reachable node's proximity score. It is the seam the
 // rerank pipeline's ProximitySignal (and context_closure's proximity
@@ -22,23 +24,13 @@ import (
 // CSR. The cache is bypassed when disabled (GORTEX_PPR_CACHE_DISABLE) or
 // when the snapshot has no package roots.
 //
-// This entry point takes no context and so can name no snapshot identity for
-// the walk it runs: its caller built the snapshot from whatever reader its
-// request reads through — a routed view, a session's editor buffers, or the
-// shared corpus — and the walk key is content-addressed on the seed
-// neighbourhood only, so those are all one namespace. Rather than share it,
-// the walk is computed uncached (the zero scope). A caller that CAN name the
-// selected snapshot must call personalizedPageRankScoped, which is what
-// restores caching for it.
-func (s *Server) personalizedPageRank(snap *analysis.AdjacencySnapshot, seeds []string) map[string]float64 {
-	return s.personalizedPageRankScoped(pprCacheScope{}, snap, seeds)
-}
-
-// personalizedPageRankScoped is personalizedPageRank with an explicit cache
-// scope: every entry it stores or reads is namespaced by the snapshot that
-// produced the walk, so one request's ranking can never be served from a
-// different snapshot's cached scores. An uncacheable scope computes the walk
-// and returns it without touching the cache at all.
+// Every entry the walk stores or reads is namespaced by an explicit scope
+// naming the snapshot that produced it, so one request's ranking can never be
+// served from a different snapshot's cached scores. The walk key alone cannot
+// do that job: it is content-addressed on the seed neighbourhood only, so a
+// routed view, a session's editor buffers and the shared corpus all collide on
+// it. A caller that cannot name its snapshot passes the zero scope, which
+// computes the walk and returns it without touching the cache at all.
 func (s *Server) personalizedPageRankScoped(scope pprCacheScope, snap *analysis.AdjacencySnapshot, seeds []string) map[string]float64 {
 	if snap == nil || len(seeds) == 0 {
 		return nil
@@ -138,25 +130,95 @@ const proximityAdjacencyNodeHeadroom = 4096
 // distance alone.
 func (s *Server) requestProximityAdjacency(ctx context.Context, seeds, scored []string) (*analysis.AdjacencySnapshot, pprCacheScope) {
 	if reader := s.selectedSnapshotReader(ctx); reader != nil {
+		// The bounded build is a batched read loop over the selected reader
+		// and BuildBoundedAdjacencySnapshot takes no context of its own, so
+		// the abandonment check happens here, before the loop is entered. A
+		// nil snapshot is the already-supported "no proximity signal"
+		// degrade, so a cancelled request stops paying for a CSR nobody will
+		// read instead of building one for a response that never ships.
+		if ctx != nil && ctx.Err() != nil {
+			return nil, pprCacheScope{}
+		}
 		roots := mergeSortedUniqueIDs(scored, seeds)
 		maxNodes := len(roots) + proximityAdjacencyNodeHeadroom
+		maxEdges := 4 * maxNodes
 		snap, stats := analysis.BuildBoundedAdjacencySnapshot(
-			reader, roots, proximityAdjacencyDepth, maxNodes, 4*maxNodes)
+			reader, roots, proximityAdjacencyDepth, maxNodes, maxEdges)
 		if stats.NodeCount == 0 {
 			return nil, pprCacheScope{}
 		}
-		// The root set is part of this snapshot's identity: the content-
-		// addressed walk key describes the seed neighbourhood only, so two
-		// closures over one view that bounded differently would otherwise
+		// The root set and the caps are part of this snapshot's identity: the
+		// content-addressed walk key describes the seed neighbourhood only, so
+		// two closures over one view that bounded differently would otherwise
 		// share an entry.
 		return snap, walkCacheScope(ctx, pprWalkSourceSelectedReader).
-			withRoots(boundedRootsDigest(roots))
+			withRoots(boundedSnapshotDigest(proximityAdjacencyDepth, maxNodes, maxEdges, roots))
 	}
 	snap := s.getAdjacency()
 	if snap == nil {
 		return nil, pprCacheScope{}
 	}
 	return snap, walkCacheScope(ctx, pprWalkSourceSharedAnalysis)
+}
+
+// rerankBoundedMaxNodes / rerankBoundedMaxEdges are the hard caps the search
+// rerank pass's bounded CSR carries. They are flat (not root-relative like the
+// closure path's headroom) because the rerank candidate set is already capped
+// by the search limit, and a rerank that blew past them would turn an
+// interactive query into a whole-graph materialization.
+const (
+	rerankBoundedMaxNodes = 4096
+	rerankBoundedMaxEdges = 16384
+)
+
+// boundedCentralityForRequest is the rerank pipeline's centrality seam: it
+// builds the bounded call/reference CSR the candidates are scored over from
+// the reader THIS request reads through, and runs the seeded walk over it
+// through the snapshot-scoped walk cache.
+//
+// The memoisation is what makes a repeated query cheap. The walk is the
+// expensive half — BuildBoundedAdjacencySnapshot is a bounded batched read,
+// the walk iterates the CSR to convergence — and without a namespace the
+// walk could not be cached at all: the content-addressed walk key describes
+// the seed neighbourhood only, so the base corpus, a routed checkout and a
+// session's editor buffers all collide on it. The scope supplies the missing
+// identity (which view produced the CSR, and which root set bounded it), so
+// one request's ranking can never be served from another snapshot's scores.
+//
+// The snapshot is determined by the root SET, the reader and the caps —
+// BuildBoundedAdjacencySnapshot sorts and dedupes its roots before expanding
+// (adjacency_bounded.go:46) — so the digest names it exactly, truncated or
+// not.
+func (s *Server) boundedCentralityForRequest(ctx context.Context, seeds, candidateIDs []string) rerank.CentralityResult {
+	// Same reasoning as requestProximityAdjacency: the build is uninterruptible
+	// once entered, so an abandoned request is refused at the door. An empty
+	// result is the shape the caller already handles for an empty neighbourhood.
+	if ctx != nil && ctx.Err() != nil {
+		return rerank.CentralityResult{}
+	}
+	snapshot, stats := analysis.BuildBoundedAdjacencySnapshot(
+		s.readerFor(ctx), candidateIDs, proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges)
+	return rerank.CentralityResult{
+		Scores:      s.personalizedPageRankScoped(boundedCentralityScope(ctx, candidateIDs), snapshot, seeds),
+		NodeCount:   stats.NodeCount,
+		EdgeCount:   stats.EdgeCount,
+		NodeBatches: stats.NodeBatches,
+		EdgeBatches: stats.EdgeBatches,
+		Truncated:   stats.Truncated,
+	}
+}
+
+// boundedCentralityScope names the snapshot boundedCentralityForRequest just
+// built: the view the request reads (empty for the shared corpus, uncacheable
+// for editor buffers) plus the root set and caps that bounded the CSR. A
+// request with no candidates names no snapshot and stays uncacheable.
+func boundedCentralityScope(ctx context.Context, candidateIDs []string) pprCacheScope {
+	roots := mergeSortedUniqueIDs(candidateIDs)
+	if len(roots) == 0 {
+		return pprCacheScope{}
+	}
+	return walkCacheScope(ctx, pprWalkSourceSelectedReader).
+		withRoots(boundedSnapshotDigest(proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges, roots))
 }
 
 // mergeSortedUniqueIDs returns the union of the given ID sets, sorted and
@@ -181,13 +243,23 @@ func mergeSortedUniqueIDs(sets ...[]string) []string {
 	return out
 }
 
-// boundedRootsDigest names a bounded snapshot's root set in a cache key. The
-// IDs arrive sorted and deduplicated, so one root set has one digest.
-func boundedRootsDigest(roots []string) string {
+// boundedSnapshotDigest names a bounded snapshot in a cache key: the caps that
+// bounded it plus its root set. The IDs arrive sorted and deduplicated, and
+// BuildBoundedAdjacencySnapshot sorts and dedupes its own roots before
+// expanding, so one (caps, root set) pair names exactly one snapshot over a
+// given reader — which is what makes an entry under this digest safe to serve
+// to a later request of the same shape.
+//
+// The caps are folded in because two callers bound their CSR differently over
+// one view (the closure path scales max_nodes with the root count; the rerank
+// path uses flat caps) and the walk key itself says nothing about either.
+func boundedSnapshotDigest(depth, maxNodes, maxEdges int, roots []string) string {
 	if len(roots) == 0 {
 		return ""
 	}
 	h := sha256.New()
+	_, _ = h.Write([]byte("d" + strconv.Itoa(depth) + ":n" + strconv.Itoa(maxNodes) + ":e" + strconv.Itoa(maxEdges)))
+	_, _ = h.Write([]byte{0})
 	for _, id := range roots {
 		_, _ = h.Write([]byte(id))
 		_, _ = h.Write([]byte{0})

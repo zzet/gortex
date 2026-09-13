@@ -218,7 +218,19 @@ func (s *Server) populateAnalysisLocked() analysisRunMetrics {
 			s.analysisGenerationReady = generationReady
 			s.communitiesToken = sourceToken
 			s.adjacencyToken = sourceToken
-			if sink, ok := s.backendStore().(graph.BundleFingerprintSink); ok && candidate.leiden != nil {
+			// The fingerprints are derived from candidate.leiden, which was
+			// computed over analysisGraph — s.graph, i.e. the payload view
+			// generation analysisViewGeneration() names. They must be
+			// installed through a handle pinned to THAT generation: the
+			// bundle cache holds one authoritative map per generation and
+			// validates a generation's entries against its own map only
+			// (store_sqlite/bundle_cache.go), so installing through
+			// backendStore() — the indexer's base handle — would stamp the
+			// base corpus with another snapshot's fingerprints and leave the
+			// analysed generation permanently uncacheable. When the two agree
+			// (every unrouted deployment) analysisGenerationStore() returns
+			// the backend unchanged and this is the behaviour it always had.
+			if sink, ok := s.analysisGenerationStore().(graph.BundleFingerprintSink); ok && candidate.leiden != nil {
 				sink.SetBundleFingerprints(candidate.leiden.PackageFingerprints())
 			}
 			s.hotspots = nil

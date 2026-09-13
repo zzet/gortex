@@ -55,19 +55,18 @@ func TestWalkCacheScope_SeparatesViewsAndSources(t *testing.T) {
 		"naming a root set must not make an uncacheable scope cacheable")
 }
 
-// The unscoped wrapper takes no context, so it can name neither the view the
-// request read nor the bound its caller put on the snapshot. Its callers'
-// snapshots are built from readerFor (analysis_lazy_consumers.go:174), which
-// is view- AND editor-buffer-aware, so sharing one namespace across them is
-// the same mixed-view hazard the scoped path closes. It must not cache.
-func TestPersonalizedPageRank_UnscopedWrapperNeverSharesEntries(t *testing.T) {
+// A caller that cannot name the view the request read, or the bound it put on
+// the snapshot, passes the zero scope. Sharing one namespace across snapshots
+// built from readerFor — which is view- AND editor-buffer-aware — is the
+// mixed-view hazard the scoped path closes, so the zero scope must not cache.
+func TestPersonalizedPageRank_ZeroScopeNeverSharesEntries(t *testing.T) {
 	srv := &Server{pprCache: newPPRWalkCache()}
 	snap := analysis.BuildAdjacencySnapshot(walkTestGraph(t))
 	seeds := []string{"a.go::A"}
 	require.NotEmpty(t, snap.WalkCacheKey(seeds, 0), "fixture must produce a content key")
 
-	require.NotEmpty(t, srv.personalizedPageRank(snap, seeds))
-	require.NotEmpty(t, srv.personalizedPageRank(snap, seeds))
+	require.NotEmpty(t, srv.personalizedPageRankScoped(pprCacheScope{}, snap, seeds))
+	require.NotEmpty(t, srv.personalizedPageRankScoped(pprCacheScope{}, snap, seeds))
 
 	hits, _, size, _, _ := srv.pprCache.stats()
 	assert.Zero(t, size, "a walk whose snapshot identity cannot be named must not enter the shared cache")
