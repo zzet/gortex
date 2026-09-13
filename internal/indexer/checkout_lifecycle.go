@@ -409,12 +409,21 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 // best, and in the unpublished regime — where the base identity is the owner
 // checkout's head_tree — not at all until a reconciliation pass rewrote that row.
 //
-// Waking is all it does. The cycle it wakes recomposes over the pointer it finds
-// and flips its route only once the replacement is built, so the route keeps
-// serving the pair it already holds — an old layer over the base generation it
-// names, which is retained and pinned for as long as a reader holds it — until
-// there is something coherent to replace it with. No new base is spliced under
-// an old delta by this signal, and none is by the cycle it starts.
+// Waking is all it does, and what the woken cycle then does is not the same in
+// the two regimes graphBase serves. Where the primary HAS published a
+// generation the dependent stays on the base it was built against — its routed
+// pair still composes to its own tree exactly, so the cycle settles without
+// building anything (CheckoutCoordinator.pinRoutedBase, W4.8) and the wake
+// costs a sample and a few metadata reads. What it buys there is the rest of
+// the cycle: the checkout's own HEAD, its working tree and its configuration
+// are all re-checked, and a base advance is as good a moment as any to do it.
+// Where the primary has NOT published one the base moves without any pointer
+// moving with it, the old delta really does go stale, and the wake is the
+// correctness path: the cycle recomposes over the tree it finds and flips its
+// route only once the replacement is built, so the route keeps serving the
+// pair it already holds until there is something coherent to replace it with.
+// No new base is spliced under an old delta by this signal, and none is by the
+// cycle it starts.
 //
 // The owner is skipped: it is the checkout the base was published FOR, and its
 // own route is not composed over itself. Ref views are not signalled at all,
@@ -3224,6 +3233,19 @@ func (l *CheckoutLifecycle) supersededChainRetentionWindow() int {
 // decides only what is worth asking about, which is what keeps the ancestry of
 // the live chain — always ready, always referenced — out of the sweep entirely
 // instead of being refused on every pass forever.
+//
+// W4.8 makes that last sentence load-bearing rather than incidental. A
+// dependent in the committed regime STAYS on the base it was built against
+// while the family advances past it (CheckoutCoordinator.pinRoutedBase), so a
+// replaced base outside the retention window is now routinely still referenced
+// — by a live checkout's own delta, deliberately and indefinitely. Offering it
+// every pass would be exactly the "refused on every pass forever" this pass
+// exists to avoid, and it would never collect the payload either. So a pinned
+// base is retained like the live chain, and the pin is asked for back instead:
+// the holders are signalled (RequestBaseRelease), they recompose over the
+// current base in one compare-and-set, and the generation is collectable on a
+// later pass. Recomposition therefore happens only when the base must go, and
+// always BEFORE it goes.
 func (l *CheckoutLifecycle) dedicatedChainRetirementCandidates(
 	ctx context.Context,
 	rows []store_sqlite.ViewGeneration,
@@ -3231,6 +3253,8 @@ func (l *CheckoutLifecycle) dedicatedChainRetirementCandidates(
 	if l == nil || l.catalog == nil || len(rows) == 0 {
 		return nil
 	}
+	pins := l.pinnedDedicatedBases()
+	defer pins.requestRelease(l)
 	byID := make(map[int64]store_sqlite.ViewGeneration, len(rows))
 	byGraph := map[string][]store_sqlite.ViewGeneration{}
 	graphs := make([]string, 0, 4)
@@ -3249,12 +3273,96 @@ func (l *CheckoutLifecycle) dedicatedChainRetirementCandidates(
 	}
 	var out []store_sqlite.ViewGeneration
 	for _, graphID := range graphs {
-		out = append(out, l.dedicatedGraphRetirementCandidates(ctx, graphID, byGraph[graphID], byID)...)
+		out = append(out, l.dedicatedGraphRetirementCandidates(ctx, graphID, byGraph[graphID], byID, pins)...)
 		if len(out) >= maxDedicatedChainRetirementCandidates {
 			return out[:maxDedicatedChainRetirementCandidates]
 		}
 	}
 	return out
+}
+
+// basePinRegistry is what the live coordinators' routes are holding: which
+// replaced committed bases are still composed under a served checkout, and who
+// to ask when one of them has to go.
+//
+// It is a snapshot, taken once per sweep. Both ways of being out of date are
+// safe — see CheckoutCoordinator.basePinned — because it only ever RETAINS a
+// candidate and asks for it back. Nothing here is delete authorization; the
+// catalog's own reference guard remains the authority.
+type basePinRegistry struct {
+	holders map[int64][]*CheckoutCoordinator
+	release map[int64][]*CheckoutCoordinator
+	reasons map[int64]string
+}
+
+// pinnedDedicatedBases snapshots the base every live coordinator's route is
+// pinned to.
+//
+// The registry snapshot is taken under coordMu and the coordinators are asked
+// outside it, as every other fan-out here does: a coordinator's own lock is not
+// this lock's to wait behind.
+func (l *CheckoutLifecycle) pinnedDedicatedBases() *basePinRegistry {
+	pins := &basePinRegistry{holders: map[int64][]*CheckoutCoordinator{}}
+	if l == nil {
+		return pins
+	}
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for _, coordinator := range l.coordinators {
+		if coordinator != nil {
+			coordinators = append(coordinators, coordinator)
+		}
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		if generationID := coordinator.PinnedBaseGeneration(); generationID > 0 {
+			pins.holders[generationID] = append(pins.holders[generationID], coordinator)
+		}
+	}
+	return pins
+}
+
+// pinned reports whether a live route is composed over this generation, and
+// records that the pass wanted to offer it: a base the retention window no
+// longer covers is one the holders have to be asked to release.
+func (p *basePinRegistry) pinned(row store_sqlite.ViewGeneration, reason string) bool {
+	if p == nil {
+		return false
+	}
+	holders := p.holders[row.GenerationID]
+	if len(holders) == 0 {
+		return false
+	}
+	if p.release == nil {
+		p.release = map[int64][]*CheckoutCoordinator{}
+		p.reasons = map[int64]string{}
+	}
+	if _, asked := p.release[row.GenerationID]; !asked {
+		p.release[row.GenerationID] = holders
+		p.reasons[row.GenerationID] = reason
+	}
+	return true
+}
+
+// requestRelease asks every holder of a base this pass would have offered to
+// recompose off it. It runs after the decision, outside coordMu, and it makes
+// no catalog write: the recomposition is the coordinator's own next cycle, and
+// the generation is collected by a later sweep once the pin is gone.
+func (p *basePinRegistry) requestRelease(l *CheckoutLifecycle) {
+	if p == nil || l == nil || len(p.release) == 0 {
+		return
+	}
+	for generationID, holders := range p.release {
+		asked := 0
+		for _, coordinator := range holders {
+			if coordinator.RequestBaseRelease(generationID, p.reasons[generationID]) {
+				asked++
+			}
+		}
+		l.logger.Debug("checkout lifecycle: asked dependents to release a replaced committed base",
+			zap.Int64("generation", generationID),
+			zap.Int("holders", len(holders)), zap.Int("asked", asked))
+	}
 }
 
 // dedicatedGraphRetirementCandidates decides one graph's bases.
@@ -3263,6 +3371,7 @@ func (l *CheckoutLifecycle) dedicatedGraphRetirementCandidates(
 	graphID string,
 	rows []store_sqlite.ViewGeneration,
 	byID map[int64]store_sqlite.ViewGeneration,
+	pins *basePinRegistry,
 ) []store_sqlite.ViewGeneration {
 	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
@@ -3314,6 +3423,18 @@ func (l *CheckoutLifecycle) dedicatedGraphRetirementCandidates(
 			continue
 		}
 		if _, keep := retained[row.GenerationID]; keep {
+			continue
+		}
+		// A base a live checkout's routed delta is still composed over (W4.8's
+		// pin) is retained rather than offered, and its holders are asked to
+		// recompose off it. Retaining its chain too: the pinned generation's
+		// own ancestors are what the dependent's view composes, so offering
+		// one of them would be offering a piece of a stack that is being read
+		// right now.
+		if pins.pinned(row, fmt.Sprintf(
+			"the committed base %d this checkout is composed over is past the retention window",
+			row.GenerationID)) {
+			l.walkDedicatedChain(ctx, row.GenerationID, byID, retained)
 			continue
 		}
 		out = append(out, row)

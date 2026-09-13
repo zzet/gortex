@@ -315,6 +315,17 @@ type CheckoutCycle struct {
 	// "the base moved, so the checkout was recomposed over it" — the old pair
 	// keeps serving for the whole of the rebuild.
 	Recomposed bool
+	// BasePinned reports that the cycle served the checkout from the committed
+	// base generation its routed layers were BUILT against, while the family's
+	// primary has already advanced past it. It is W4.8's saving made
+	// observable: the pair is still exactly this checkout's tree (the
+	// materializer composes the ancestry the routed generation itself names),
+	// so the cycle built nothing and wrote nothing.
+	//
+	// It is not an outcome of its own in the metric vocabulary. A pinned cycle
+	// that also had nothing else to do counts as skipped, which is what it is:
+	// the checkout is already serving the right answer.
+	BasePinned bool
 	// Rescheduled reports that the cycle stopped short and signalled itself:
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
@@ -462,6 +473,28 @@ type CheckoutCoordinator struct {
 	retainedDirty []retainedDirtyLayer
 	// backlog holds generations a retire refused. The janitor retries them.
 	backlog map[int64]struct{}
+	// basePinned is the committed base generation this checkout's ROUTE is
+	// composed over while the family's primary has moved past it — W4.8's pin,
+	// as the last cycle resolved it, and 0 when the route is on the family's
+	// current base or the family publishes no generation at all.
+	//
+	// It exists so the retirement sweep can ask a live coordinator what its
+	// route is holding without re-deriving it from the catalog per candidate
+	// base. It is a cache of a catalog fact, and both ways of being wrong are
+	// safe: reporting 0 while pinning offers a base the catalog's own
+	// reference guard then refuses (the route's layer names it as its base),
+	// and reporting a stale id keeps a base one sweep longer and asks a
+	// coordinator to release something it is no longer holding, which is a
+	// no-op. What it must never do is authorize a delete, and it cannot: the
+	// sweep only ever uses it to RETAIN.
+	basePinned int64
+	// basePinRelease is the one pinned base a sweep has asked this coordinator
+	// to stop holding, so the generation can finally retire. The next cycle
+	// refuses to pin it and recomposes over the family's current base instead,
+	// installing the replacement stack in one compare-and-set before the old
+	// one is given up. Requesting the same generation twice is a no-op, so an
+	// hourly sweep does not re-signal a recomposition that is already owed.
+	basePinRelease int64
 	// routedDirty is the working-tree generation the route names. The reuse
 	// cache already remembers the commit half; this is the other one, and
 	// together they are the only record of a checkout's payload once its route
@@ -549,6 +582,18 @@ type primaryBase struct {
 	// treeOID is the committed tree the base corpus holds. It is the left-hand
 	// side of the commit layer's diff.
 	treeOID string
+	// pinned marks a base this coordinator is deliberately staying on rather
+	// than the one the family's active pointer names right now — the committed
+	// regime's W4.8 pin, minted by pinRoutedBase and by nothing else.
+	//
+	// It is a field rather than a caller's side note because the guards read
+	// it: baseMovedUnderCycle's "is this still the base I planned against"
+	// question has a different answer for a pinned base (is the generation
+	// still servable and still the tree I named) than for the family's active
+	// one (is the family still on it), and a value that did not say which it
+	// was would have to be guessed at. graphBase never sets it, so every
+	// unpinned path keeps the exact comparison it always had.
+	pinned bool
 }
 
 // NewCheckoutCoordinator builds a coordinator and starts its loop. The caller
@@ -974,24 +1019,24 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 		route.GraphID != base.graphID || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
 		return out, false
 	}
-	// The routed commit layer has to re-key against the base the family is on
-	// NOW, and deliberately so: a slot whose parent is no longer the active
-	// base is not "settled" HERE, whatever else may be true of it.
+	// The routed commit layer re-keys against the base it is composed over,
+	// which is the base the family is on now UNLESS this checkout is pinned to
+	// the one it was built against — W4.8's committed-regime pin, resolved by
+	// pinRoutedBase, whose doc carries the two-regime argument in full.
 	//
-	// Where the primary publishes no generation, commitIdentity stamps
-	// BaseGenerationID 0 and the layer composes over the shared indexed corpus,
-	// which is rewritten in place as the primary moves — accepting the slot
-	// then serves a delta over a base that has been replaced underneath it.
-	// Where the primary does publish one the old pair is still coherent, since
-	// the materializer walks the routed generation's own immutable ancestry;
-	// but accepting it in this one predicate, with no retention or staleness
-	// policy and no matching arm in reconcileCommitSlot, would freeze the
-	// dependent on that base for as long as nothing else about the checkout
-	// moves, with nothing left that ever refreshes it. Pinning it properly is
-	// W4.8; it is not implemented, and half of it here would be worse than
-	// neither half. Until then a base advance goes to recomposeOverAdvancedBase,
-	// which is bounded, not a settlement. recomposeOverAdvancedBase's doc has
-	// the full two-regime argument.
+	// The short version, because this is the predicate the saving is actually
+	// taken in. In the committed regime the routed pair is B1 + D1 with
+	// D1 = diffTreeChanges(B1_tree, T), the materializer composes the ancestry
+	// the routed generation itself names, and B1 is kept servable by the very
+	// reference the routed delta makes: so the pair still equals this
+	// checkout's tree exactly and the cheapest possible cycle — no build, no
+	// route write, nothing — is the correct one. In the legacy regime there is
+	// no generation to stay on: the base is the owner's recorded tree and the
+	// corpus underneath is rewritten in place, so pinRoutedBase refuses and
+	// this predicate re-keys against the family's current base exactly as it
+	// always did, leaving the base advance to recomposeOverAdvancedBase.
+	base, pinned := c.pinRoutedBase(ctx, base, route)
+	out.BasePinned = pinned
 	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
 	if err != nil || !found || !servableGeneration(commit.State) ||
 		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, sample.HeadTree)) {
@@ -1108,10 +1153,30 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		return out
 	}
 
+	// W4.8: a checkout whose routed layers were built over a committed base the
+	// family has since advanced past stays on that base. The substitution is
+	// the whole mechanism — everything below then finds the route already
+	// describing exactly the state it is asked to reconcile to, so the cheap
+	// arms take themselves: reconcileCommitSlot's "already routed to exactly
+	// this state" returns the routed generation without a build, and
+	// reconcileDirtySlot keeps the working-tree layer sitting on it. A
+	// dependent whose OWN tree moved rebuilds its delta against the base it is
+	// pinned to rather than the family's current one, which is what keeps its
+	// ancestry and its reuse cache stable across its own commits.
+	//
+	// pinRoutedBase refuses in the legacy regime and whenever anything but the
+	// base moved, so both fall through to the paths they always took.
+	base, pinned := c.pinRoutedBase(ctx, base, route)
+	out.BasePinned = pinned
+
 	// A committed base that advanced under a checkout whose own tree did not
 	// move is recomposed, not torn down: both layers are rebuilt off-route and
 	// installed in one write, so the pair the checkout already serves stays
-	// coherent and routed for the whole of the rebuild.
+	// coherent and routed for the whole of the rebuild. With the pin taken
+	// there is nothing here to recompose — recomposableStack finds the routed
+	// identity equal to the one a build would mint and declines — so this path
+	// is now reached by the legacy regime, by a released pin, and by a base
+	// that stopped being servable under the route.
 	if handled, err := c.recomposeOverAdvancedBase(ctx, base, head, &route, &out); handled || err != nil {
 		if err != nil {
 			if errors.Is(err, errRouteMoved) {
@@ -1204,10 +1269,16 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 //     (graphview generationAncestry). So B1 + D1 is still exactly this
 //     checkout's tree after the family moves to B2, and an un-recomposed
 //     dependent is NOT serving stale content. Recomposing here buys currency
-//     and availability, not correctness. Pinning the dependent on B1 until its
-//     own tree moves is therefore a real saving and it is NOT implemented:
-//     that is W4.8, and nothing below closes it. Do not read this path as
-//     "W4.8 is done".
+//     and availability, not correctness — so HERE THE DEPENDENT IS NOT
+//     RECOMPOSED AT ALL. It stays on B1: pinRoutedBase substitutes the base
+//     the route was built against before this path is reached, the routed
+//     identity then equals the one a build would mint, and recomposableStack
+//     declines. That is W4.8, and it costs a base advance zero dependent
+//     builds and zero route writes. This path stays reachable in this regime
+//     for the three cases the pin refuses: a base a retirement sweep has asked
+//     the coordinator to release (RequestBaseRelease), a pinned generation
+//     that stopped being servable, and an identity that moved in more than its
+//     base fields.
 //
 //   - The primary graph has NOT published one (graphBase's second arm: the
 //     base is the owner checkout's recorded committed tree). commitIdentity
@@ -1222,13 +1293,17 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 //     requirement — the same hazard the pre-build guard at reconcileCommitSlot
 //     refuses.
 //
-// settledWithoutBuild must not be taught to accept a slot whose parent is no
-// longer the family's active base as a shortcut to the first bullet's saving.
-// In the second regime that parent is not immutable and the slot is simply
-// wrong. In the first it needs a retention policy that keeps the pinned base
-// servable, a bounded staleness policy, and the matching arm in
-// reconcileCommitSlot, or the dependent freezes on a base nothing ever
-// refreshes. W4.8 is that work, and it is a separate change.
+// settledWithoutBuild accepts a slot whose parent is no longer the family's
+// active base ONLY through pinRoutedBase, and pinRoutedBase refuses the second
+// regime outright: there the parent is not immutable and the slot is simply
+// wrong. In the first regime the pin comes with the three things it needs, and
+// none of them is optional. The base stays servable because the routed delta
+// names it and the catalog refuses to retire a generation another generation
+// is based on; the dependent does not freeze on it because the retirement
+// sweep asks for it back (RequestBaseRelease) as soon as W6.7's retention
+// window stops covering it; and the release lands as one recomposition here,
+// which installs the replacement stack in a single compare-and-set before the
+// old base is given up.
 //
 // So the reuse this path delivers is three narrower guarantees, each of them
 // observable:
@@ -1244,7 +1319,9 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 //     checkout's own dirty set — so a base advance costs each dependent one
 //     bounded delta plus one working-tree layer, never an index of its tree;
 //   - a dependent whose own tree did not move at all still gets that bounded
-//     rebuild rather than a full one.
+//     rebuild rather than a full one — in the legacy regime, where it must be
+//     rebuilt at all. In the committed regime that dependent is pinned and
+//     never reaches this path until its base is asked for back.
 //
 // TestBaseAdvanceRecomposesTwoDependentsOnceEachWithABoundedDelta measures all
 // three: two dependents, one advance, exactly two commit-delta builds and two
@@ -1688,6 +1765,197 @@ func graphBase(
 	return out, nil
 }
 
+// pinRoutedBase substitutes, for one cycle, the committed base this checkout's
+// route was BUILT against for the one the family's primary is on now.
+//
+// THIS IS W4.8, AND IT IS A TWO-REGIME CONTRACT. Which regime a family is in
+// is graphBase's two arms, and the pin is only valid in one of them:
+//
+//   - COMMITTED REGIME (graphBase's first arm, ActiveGenerationID > 0). The
+//     base is an immutable published generation. commitIdentity stamps it as
+//     the layer's BaseGenerationID; the materializer composes the ancestry the
+//     ROUTED generation itself names, walking its own BaseGenerationID chain
+//     and never the family's active pointer (graphview generationAncestry);
+//     and the catalog refuses to retire a generation another generation names
+//     as its base (viewGenerationReferencedSQL's base_generation_id term), so
+//     the routed delta IS the reference that keeps its base servable. A
+//     dependent's routed pair is B1 + D1 where D1 = diffTreeChanges(B1_tree,
+//     T), so B1 + D1 equals this checkout's own tree T exactly, for every
+//     path, however far the primary has advanced past B1. The view stays exact
+//     and the freshness rider stays truthful: the rider answers for this
+//     checkout's own head and working tree, which is what the pair describes.
+//     Staying on B1 is therefore correct, and it is free — no commit-layer
+//     build, no working-tree build, no route write.
+//
+//   - LEGACY REGIME (graphBase's second arm: the base is the owner checkout's
+//     recorded committed tree, generationID 0). There is nothing to pin. The
+//     layer names no immutable ancestor, it composes over the shared indexed
+//     corpus, and that corpus is rewritten IN PLACE as the primary moves —
+//     baseMovedUnderCycle's doc says it: the base "moves without any pointer
+//     moving with it". Keeping the old delta there serves the paths the two
+//     bases differ by from a base that has been replaced underneath it, which
+//     is the staleness TestCoordinatorRefusesACommitLayerOverAMovedBase pins.
+//     So the first clause below refuses the pin outright for generationID 0
+//     and the bounded recomposition path (recomposeOverAdvancedBase) keeps
+//     that regime exactly as it was.
+//
+// Two further refusals keep the pin honest in the regime it does apply to:
+//
+//   - the routed layer's identity must differ from the one a build would mint
+//     now in the BASE fields alone. The probe re-renders the current identity
+//     over the routed row's OWN tree and substitutes the routed row's base
+//     fields, so a configuration change, a cohort change, an extractor bump or
+//     a resolver bump all fail it and fall through to a rebuild against the
+//     base that is current. Substituting the row's tree rather than the
+//     sample's is deliberate: a checkout whose own tree moved still pins, and
+//     rebuilds its delta against the base it is pinned to (the plan's fourth
+//     clause), which is what keeps its ancestry — and its reuse cache — stable
+//     across its own commits.
+//
+//   - a base a sweep has asked this coordinator to release is never pinned
+//     again. That is the bound: the pin holds until W6.7's retention window
+//     decides the base must go, and the recomposition that follows installs
+//     the replacement stack in ONE compare-and-set (installStack) before the
+//     old one is given up, so the base is recomposed off BEFORE it retires and
+//     the checkout never serves a torn route for the length of the rebuild.
+//
+// It reports the base the cycle should use and whether that is a pin. Every
+// refusal — a read that failed, a row that is gone, anything that is not
+// exactly this shape — returns the family's current base unchanged, which is
+// the behaviour this path replaced.
+func (c *CheckoutCoordinator) pinRoutedBase(
+	ctx context.Context, base primaryBase, route store_sqlite.CheckoutRoute,
+) (primaryBase, bool) {
+	pinned, ok, err := c.pinnedBaseFor(ctx, base, route)
+	if err != nil {
+		c.logger.Debug("checkout coordinator: could not resolve the routed base pin",
+			zap.String("checkout", c.checkoutID), zap.Error(err))
+	}
+	if !ok {
+		c.notePinnedBase(0)
+		return base, false
+	}
+	c.notePinnedBase(pinned.generationID)
+	return pinned, true
+}
+
+// pinnedBaseFor is pinRoutedBase's decision, kept apart from its bookkeeping so
+// every clause is one refusal and the whole predicate reads as a list.
+func (c *CheckoutCoordinator) pinnedBaseFor(
+	ctx context.Context, base primaryBase, route store_sqlite.CheckoutRoute,
+) (primaryBase, bool, error) {
+	var out primaryBase
+	if base.generationID <= 0 || base.pinned {
+		// The legacy regime has no immutable ancestor to stay on, and a base
+		// that is already a pin is not re-pinned.
+		return out, false, nil
+	}
+	if route.State != store_sqlite.RouteActive || route.GraphID != base.graphID ||
+		route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return out, false, nil
+	}
+	commitRow, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil {
+		return out, false, err
+	}
+	if !found || !servableGeneration(commitRow.State) ||
+		commitRow.OwnerKind != checkoutLayerOwnerKind ||
+		commitRow.GenerationKind != CommitLayerGenerationKind ||
+		commitRow.CheckoutID != c.checkoutID ||
+		commitRow.GraphID != base.graphID ||
+		commitRow.BaseGenerationID <= 0 ||
+		commitRow.BaseGenerationID == base.generationID {
+		return out, false, nil
+	}
+	if commitRow.BaseGenerationID == c.releaseRequestedBasePin() {
+		return out, false, nil
+	}
+	probe := c.commitIdentity(base, commitRow.TreeOID)
+	probe.BaseGenerationID = commitRow.BaseGenerationID
+	probe.LowerViewFingerprint = commitRow.LowerViewFingerprint
+	if generationIdentityKey(probe) != generationRowKey(commitRow) {
+		return out, false, nil
+	}
+	baseRow, found, err := c.catalog.GetViewGeneration(ctx, commitRow.BaseGenerationID)
+	if err != nil {
+		return out, false, err
+	}
+	if !found || !servableGeneration(baseRow.State) ||
+		baseRow.GenerationKind != DedicatedBaseGenerationKind ||
+		baseRow.GraphID != base.graphID || baseRow.TreeOID == "" ||
+		baseRow.TreeOID != commitRow.LowerViewFingerprint {
+		// The generation is gone, retiring, or is not the tree this delta was
+		// diffed from. Composing over it is no longer the identity the route
+		// claims, so the cycle goes to the base the family is on.
+		return out, false, nil
+	}
+	return primaryBase{
+		graphID:      base.graphID,
+		generationID: baseRow.GenerationID,
+		treeOID:      baseRow.TreeOID,
+		pinned:       true,
+	}, true, nil
+}
+
+// notePinnedBase records what this checkout's route is composed over, for the
+// retirement sweep to read. See the basePinned field.
+func (c *CheckoutCoordinator) notePinnedBase(generationID int64) {
+	c.mu.Lock()
+	c.basePinned = generationID
+	c.mu.Unlock()
+}
+
+// PinnedBaseGeneration reports the replaced committed base this checkout's
+// route is still composed over, 0 when it is on the family's current one.
+//
+// The retirement sweep calls it to decide what it may OFFER, never what it may
+// delete: the authority on that is the catalog's own reference guard, which
+// refuses any generation another generation names as its base.
+func (c *CheckoutCoordinator) PinnedBaseGeneration() int64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.basePinned
+}
+
+// RequestBaseRelease asks this coordinator to stop pinning one committed base
+// so the generation can retire, and reports whether the request was new.
+//
+// It is the only way out of the pin, and it is a REQUEST: the cycle it wakes
+// recomposes over the base the family is on now and installs the replacement
+// stack in one compare-and-set, so the route serves the old, coherent pair for
+// the whole of the rebuild and the base is released only once there is
+// something to replace it with. Nothing here retires anything; the sweep that
+// asked comes back for the generation on its next pass.
+//
+// The same generation asked for twice is not a new request, so an hourly sweep
+// that keeps finding the pin does not keep re-signalling a recomposition that
+// is already owed.
+func (c *CheckoutCoordinator) RequestBaseRelease(generationID int64, reason string) bool {
+	if c == nil || generationID <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	if c.basePinRelease == generationID {
+		c.mu.Unlock()
+		return false
+	}
+	c.basePinRelease = generationID
+	c.mu.Unlock()
+	c.Signal(reason)
+	return true
+}
+
+// releaseRequestedBasePin is the generation a sweep has asked this coordinator
+// to stop holding, 0 when none has.
+func (c *CheckoutCoordinator) releaseRequestedBasePin() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.basePinRelease
+}
+
 // ensureRoute reads the checkout's route, installing one when the checkout has
 // never been routed and repointing one that names a different graph.
 //
@@ -1831,7 +2099,31 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 // the regime where the base has no published generation: there the base is the
 // owner checkout's recorded committed tree, which moves without any pointer
 // moving with it.
+//
+// A PINNED base is the one case where "the family is on another base" is not
+// the question. The cycle chose that base deliberately (pinRoutedBase), the
+// family having moved past it is the premise rather than a hazard, and what
+// has to still hold is what makes composing over it correct: the generation is
+// still servable and still names the tree the delta was diffed from. Anything
+// else — it is retiring, it is gone, it is not that tree — and the layer this
+// cycle built composes over nothing the route can claim, so it is refused
+// exactly as a moved base is. Only a value pinRoutedBase minted takes this
+// arm; graphBase never sets the flag, so every other caller keeps the exact
+// comparison it always had.
 func (c *CheckoutCoordinator) baseMovedUnderCycle(ctx context.Context, base primaryBase) (bool, error) {
+	if base.pinned {
+		if base.generationID <= 0 || base.treeOID == "" {
+			return true, nil
+		}
+		if base.generationID == c.releaseRequestedBasePin() {
+			return true, nil
+		}
+		row, found, err := c.catalog.GetViewGeneration(ctx, base.generationID)
+		if err != nil {
+			return false, err
+		}
+		return !found || !servableGeneration(row.State) || row.TreeOID != base.treeOID, nil
+	}
 	current, err := c.primaryBase(ctx)
 	if err != nil {
 		return false, err
