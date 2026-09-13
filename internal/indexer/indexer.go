@@ -341,6 +341,23 @@ type Indexer struct {
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contractStateSink graph.ContractStateStore
 
+	// passCorpusFilter is the read-only-context mode. When a caller installs
+	// one, the pass corpus it produces is held in memory for the whole
+	// pipeline — parse, resolve, every subpass — and this hook is handed that
+	// corpus once, immediately before the drain that moves it into the durable
+	// store. Whatever the hook removes is never written: the drain is the only
+	// path from the corpus to disk, and the node, edge, symbol-FTS, file,
+	// clone and constant-value projections all come out of it.
+	//
+	// It exists for the sparse generation builder, which must read a change's
+	// affected closure to resolve that change and must NOT persist what it
+	// read. Installing it is also the explicit opt-in that lets a handle
+	// pinned to a derived payload generation take the in-memory path at all
+	// (see the shadow eligibility decision in indexCtxRaw): without it such a
+	// handle is disqualified, because nothing would then bound what the drain
+	// writes.
+	passCorpusFilter func(*graph.Graph) error
+
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
 	// its package defaults.
@@ -1699,6 +1716,72 @@ func (idx *Indexer) SetResolverLSPHelper(h resolver.LSPHelper) {
 	}
 }
 
+// filteredShadowAdmissionWait bounds how long a pass with a corpus filter
+// installed will queue for a process-wide in-memory slot before giving up and
+// running against the store directly.
+//
+// The number is a latency budget, not a capacity estimate: the slot is worth
+// having but never worth waiting on, because the path without it is the one
+// that shipped before the mode existed and is correct on its own.
+const filteredShadowAdmissionWait = 2 * time.Second
+
+// setPassCorpusFilter installs the read-only-context mode described on
+// Indexer.passCorpusFilter. It must be called before IndexCtx: the eligibility
+// decision that routes the pass through an in-memory corpus is taken once, at
+// the top of the pass, and a filter installed afterwards would have nothing to
+// filter.
+//
+// Package-internal on purpose. The hook hands out the live pass corpus, and
+// the only caller that may hold it is the one that also owns the generation
+// the drain writes into.
+func (idx *Indexer) setPassCorpusFilter(fn func(*graph.Graph) error) {
+	idx.passCorpusFilter = fn
+}
+
+// pruneVectorPlanToCorpus drops every prepared embedding whose identity the
+// corpus no longer holds.
+//
+// The plan is prepared from the pass corpus BEFORE the filter runs, because
+// embedding is expensive and the pipeline pays it once. A filter that removes
+// an identity therefore leaves a prepared vector behind, and publishing it
+// would write a vector row for a symbol the generation deliberately does not
+// carry — the orphan the read-only-context mode exists to avoid. Dropping is
+// safe in the other direction too: an identity the corpus still holds keeps
+// its vector, so the change set's search quality is untouched.
+func pruneVectorPlanToCorpus(plan *preparedVectorPlan, corpus *graph.Graph) *preparedVectorPlan {
+	if plan == nil || corpus == nil || len(plan.items) == 0 {
+		return plan
+	}
+	// An item is either a symbol's own vector (ParentID empty, NodeID is the
+	// symbol) or one AST sub-chunk of a symbol (NodeID is synthetic and lives
+	// in no corpus, ParentID is the symbol it belongs to). The identity to ask
+	// the corpus about is therefore the parent when there is one.
+	kept := plan.items[:0]
+	dropped := 0
+	for _, item := range plan.items {
+		owner := item.ParentID
+		if owner == "" {
+			owner = item.NodeID
+		}
+		if owner != "" && corpus.GetNode(owner) == nil {
+			if plan.chunkMap != nil {
+				delete(plan.chunkMap, item.NodeID)
+			}
+			dropped++
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if dropped == 0 {
+		return plan
+	}
+	for i := len(kept); i < len(plan.items); i++ {
+		plan.items[i] = graph.VectorCorpusItem{}
+	}
+	plan.items = kept
+	return plan
+}
+
 // prefixPath prepends the repoPrefix to a relative path when in multi-repo mode.
 // Returns the path unchanged when repoPrefix is empty.
 func (idx *Indexer) prefixPath(relPath string) string {
@@ -2846,13 +2929,29 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
-	// A handle pinned to a derived payload generation is disqualified outright.
-	// The drain evicts the repository's persisted rows before its INSERT-only
-	// bulk load, and that eviction spans every generation — right for a
-	// re-track of the base corpus, and a wipe of the very corpus a sparse
-	// generation exists to leave alone. See derivedGenerationTarget.
+	// A handle pinned to a derived payload generation is disqualified unless
+	// its owner installed a pass-corpus filter.
+	//
+	// The disqualification is about what the drain writes. Without a filter
+	// the drain moves the WHOLE pass corpus into the generation, which is
+	// exactly what the direct path already does, so the in-memory route buys a
+	// sparse build nothing and only adds a second copy of the payload in RAM.
+	// With one, the drain is bounded: the filter empties the read-only half of
+	// the corpus first, and only what survives is ever written. That is the
+	// whole point of the mode — a closure file the pass had to READ to resolve
+	// the change never reaches the store at all, rather than being written and
+	// then withdrawn.
+	//
+	// The eviction the older comment here warned about — "spans every
+	// generation" — reads stale against the code it describes:
+	// evictRepoCurrentGeneration (repo_eviction_scope.go:12) routes to
+	// EvictRepoCurrentGeneration, which is generation-scoped, and the
+	// INSERT-only bulk window is itself gated on a provably empty STORE
+	// (beginBulkLoadLocked / coldGraphStoreEmpty), so a derived generation
+	// over a populated base corpus leaves it a no-op and every row still
+	// lands through the ordinary generation-scoped writer.
 	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes &&
-		!derivedGenerationTarget(idx.graph)
+		(!derivedGenerationTarget(idx.graph) || idx.passCorpusFilter != nil)
 
 	// Acquire a queued shadow slot before the shared repository-memory envelope.
 	// Waiting candidates therefore hold no general memory reservation. Every
@@ -2865,9 +2964,34 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	shadowAdmissionStarted := time.Now()
 	var shadowLease *shadowAdmissionLease
 	if shadowLocallyEligible {
-		shadowLease, err = admission.acquire(ctx, shadowWeight)
+		// For an ordinary cold index the in-memory route is the only
+		// affordable one, so queueing for a slot is right: the alternative is
+		// hours of per-row disk writes.
+		//
+		// For a filtered pass it is an optimisation over a path that already
+		// works, and queueing would be the wrong trade — a layer build is what
+		// a checkout view waits on, and the budget's holder is typically a
+		// whole-repository drain. Bound the wait and fall back to writing the
+		// closure and withdrawing it, which is exactly the behaviour that
+		// shipped before this mode existed.
+		acquireCtx, cancelAcquire := ctx, context.CancelFunc(nil)
+		if idx.passCorpusFilter != nil {
+			acquireCtx, cancelAcquire = context.WithTimeout(ctx, filteredShadowAdmissionWait)
+		}
+		shadowLease, err = admission.acquire(acquireCtx, shadowWeight)
+		if cancelAcquire != nil {
+			cancelAcquire()
+		}
 		if err != nil {
-			return nil, err
+			// Only the caller's own cancellation ends the pass. A filtered
+			// pass that merely ran out of patience keeps going without the
+			// slot; the filter is then never called and the build withdraws.
+			if idx.passCorpusFilter == nil || ctx.Err() != nil {
+				return nil, err
+			}
+			idx.logger.Debug("indexer: no shadow slot for a filtered pass; writing and withdrawing instead",
+				zap.String("repo", idx.RepoPrefix()), zap.Error(err))
+			shadowLease, err = nil, nil
 		}
 	}
 	shadowTaken := shadowLease != nil
@@ -3029,6 +3153,20 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if retErr != nil {
 				return
 			}
+			// The read-only-context mode's one write gate. Everything the
+			// drain below persists — nodes, edges, symbol FTS, the files
+			// inventory, the clone corpus, constant values — is read out of
+			// this corpus, so a path the filter empties here is a path no
+			// durable row is ever written for. It runs before the counts are
+			// taken and before the bulk window opens, so the drain's own
+			// telemetry describes what actually landed.
+			if idx.passCorpusFilter != nil {
+				if err := idx.passCorpusFilter(inMemShadow); err != nil {
+					retErr = fmt.Errorf("indexer: filter pass corpus before persistence: %w", err)
+					return
+				}
+				deferredVectorPlan = pruneVectorPlanToCorpus(deferredVectorPlan, inMemShadow)
+			}
 			reporter.Report("persisting bulk graph", 0, 0)
 			drainStart := time.Now()
 			shadowNodeCount := inMemShadow.NodeCount()
@@ -3087,7 +3225,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 			}
 
+			// The builtin sentinels the drain is about to move, kept aside for
+			// the re-assert below. See restampedBuiltins.
+			var restampedBuiltins []*graph.Node
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
+				if idx.passCorpusFilter != nil {
+					for _, node := range nodes {
+						if node != nil && graph.IsBuiltinStub(node.ID) {
+							copied := *node
+							restampedBuiltins = append(restampedBuiltins, &copied)
+						}
+					}
+				}
 				diskTarget.AddBatch(nodes, nil)
 				if !ftsReady || retErr != nil {
 					nodeRows := len(nodes)
@@ -3141,6 +3290,31 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				diskTarget.AddBatch(nil, edges)
 				edgeRows := len(edges)
 				drainPressure.afterEdgeBatch(edgeRows)
+			}
+			// Re-assert the builtin sentinels the edge drain just overwrote.
+			//
+			// A builtin stub is materialised by whichever write funnel first
+			// sees an edge pointing at it, and the shape it is materialised
+			// with carries no boundary identity. The resolver's attribution
+			// pass materialises the SAME id properly — with the workspace and
+			// project of the symbol that referenced it, deliberately, so a
+			// later file-scoped resolve cannot blank those columns
+			// (resolver/go_builtins_attribution.go) — and the node drain above
+			// has just moved that row onto disk. The edge drain that follows
+			// then hands the durable store a batch full of edges pointing at
+			// those same ids, its own funnel has never seen them, and it
+			// upserts the unattributed shape straight over the good row.
+			//
+			// Bounded to the read-only-context mode on purpose. The mode's
+			// contract is that it changes WHERE the separation happens and
+			// nothing else, and a generation whose builtins lost their
+			// workspace/project columns would be a generation that carries
+			// less than the one the write-then-withdraw path publishes. The
+			// same clobber on an ordinary cold index is older than this
+			// change, is pinned as the expected shape by acceptance tests, and
+			// is not this item's to move.
+			if len(restampedBuiltins) > 0 {
+				diskTarget.AddBatch(restampedBuiltins, nil)
 			}
 
 			flushStart := time.Now()

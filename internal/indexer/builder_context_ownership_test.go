@@ -316,12 +316,14 @@ func TestContextSeparationIsInertWithoutAClosure(t *testing.T) {
 	store := builderOpenStore(t, "inert")
 	builder := builderNewBuilder(store)
 	report := BuildReport{}
-	withdrawn, err := builder.separateContextPayload(
+	plan := buildPlan{indexed: []string{"core.go"}}
+	separation, err := builder.separateContextPayload(
 		context.Background(), BuildRequest{RepoPrefix: builderRepoPrefix, Base: store},
-		buildPlan{indexed: []string{"core.go"}}, store.AtGeneration(1), &report)
-	if err != nil || withdrawn != nil {
-		t.Fatalf("separateContextPayload on a contextless plan = %v, %v", withdrawn, err)
+		plan, store.AtGeneration(1))
+	if err != nil || separation.withheld != nil {
+		t.Fatalf("separateContextPayload on a contextless plan = %v, %v", separation.withheld, err)
 	}
+	separation.record(&plan, &report)
 	if report.ContextMasks != 0 || len(report.ContextPaths) != 0 {
 		t.Fatalf("a contextless plan declared context: %+v", report)
 	}
@@ -494,14 +496,16 @@ func TestContextFileWithAContentSectionIsNeverWithdrawn(t *testing.T) {
 	handle.AddBatch([]*graph.Node{section(), plain()}, nil)
 
 	report := BuildReport{}
-	withdrawn, err := builderNewBuilder(store).separateContextPayload(
+	plan := buildPlan{indexed: []string{contentRel, plainRel}, context: []string{contentRel, plainRel}}
+	separation, err := builderNewBuilder(store).separateContextPayload(
 		context.Background(),
 		BuildRequest{RepoPrefix: builderRepoPrefix, Base: store},
-		buildPlan{indexed: []string{contentRel, plainRel}, context: []string{contentRel, plainRel}},
-		handle, &report)
+		plan, handle)
 	if err != nil {
 		t.Fatalf("separateContextPayload: %v", err)
 	}
+	separation.record(&plan, &report)
+	withdrawn := separation.withheld
 	if _, gone := withdrawn[contentPath]; gone {
 		t.Fatalf("a context path with a content section was withdrawn: %v", report.ContextPaths)
 	}

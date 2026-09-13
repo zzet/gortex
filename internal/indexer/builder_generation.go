@@ -81,6 +81,25 @@ const sparseGenerationBuildActivity = "sparse_generation_build"
 // reported as a completeness fact and narrows the generation's local-resolution
 // producer state, rather than being papered over with a tombstone that would be
 // exactly as incomplete as the closure it came from.
+//
+// # Reading the closure without writing it
+//
+// The file set being wider than the change is what the pass needs; it is not
+// what the generation should carry. The default route therefore holds the
+// whole pass corpus in memory — parse, resolve and every subpass run there, so
+// the closure is as visible to the resolver as it would be on disk — and hands
+// that corpus to withholdContextPayload before the drain moves it into the
+// store. A closure file whose re-derivation matches the layer below is emptied
+// there, so no node, edge, symbol-FTS, files, clone or constant-value row is
+// ever written for it. See runPass (the installation) and BuildReport
+// .ContextHeldInMemory (what actually happened).
+//
+// The route is an optimisation, never a precondition. When the pass cannot
+// take it — an oversized closure, a shadow budget that will not grant a slot
+// inside the latency bound, a backend without the bulk path — the pass writes
+// its whole file set and separateContextPayload withdraws the same set
+// afterwards. The published generation is identical either way; only the
+// writes differ.
 
 // LayerChangeKind is what a change did to one path between the two states a
 // layer spans.
@@ -277,10 +296,12 @@ type BuildReport struct {
 
 	// ContextPaths lists, in sorted order, the closure paths the generation
 	// declared read-only context: files the pass read to resolve the change
-	// set, whose re-derivation matched the layer below exactly, and whose
-	// payload the build therefore withdrew before publishing. ContextMasks is
-	// their count, and ContextWithdrawnNodes / ContextWithdrawnEdges how many
-	// payload rows left the generation with them.
+	// set, whose re-derivation matched the layer below exactly, and which the
+	// generation therefore carries nothing for. ContextMasks is their count,
+	// and ContextWithdrawnNodes / ContextWithdrawnEdges how many payload rows
+	// left the corpus with them — rows that never reached the store at all on
+	// the in-memory route, and rows withdrawn after the fact on the other.
+	// ContextHeldInMemory says which of the two happened.
 	ContextPaths          []string
 	ContextMasks          int
 	ContextWithdrawnNodes int
@@ -292,6 +313,18 @@ type BuildReport struct {
 	// would serve a stale answer. They are read-only in intent and output in
 	// fact, which is exactly why they are named rather than counted.
 	ContextRetainedPaths []string
+
+	// ContextHeldInMemory says WHERE the separation happened, which is the
+	// difference between the two costs of reading a closure.
+	//
+	// True: the pass held its whole corpus in memory, the separation ran
+	// against that corpus before anything was persisted, and the store
+	// therefore received payload for the change set alone — no transient
+	// rows, no withdrawal. False: the pass could not take that route, so it
+	// wrote its whole file set into the generation and the separation
+	// withdrew the read-only half afterwards. Both leave the same durable
+	// generation; only the first removes the write.
+	ContextHeldInMemory bool
 
 	// ReplaceMasks and DeleteMasks are the file-level claims written;
 	// NodeTombstones and EdgeSourceMarkers the identity- and adjacency-level
@@ -507,8 +540,10 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		// deletion-only layer. A recovered adopted generation may carry partial
 		// payload from a vanished writer, so it remains on the established
 		// recovery path and is re-derived in full.
+		var separation contextSeparation
 		if adopted || len(plan.indexed) > 0 {
-			if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
+			var err error
+			if separation, err = b.runPass(ctx, req, plan, handle, &report); err != nil {
 				return err
 			}
 		}
@@ -516,15 +551,18 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		// covered by the claims derived from it, and before the producer states
 		// so what it did is what they describe.
 		b.runEnrichment(req, handle, &report)
-		// The context separation runs between them, for the same reason in
-		// reverse: it decides which of the closure's read-only files the
-		// generation carries nothing for, and it has to have decided before the
-		// masks are derived from what remains.
-		withdrawn, err := b.separateContextPayload(ctx, req, plan, handle, &report)
-		if err != nil {
-			return err
+		// The context separation has to have decided before the masks are
+		// derived from what remains. In the read-only-context mode it already
+		// ran, inside the pass, against the in-memory corpus — the store never
+		// saw the withheld half. Otherwise it runs here, against the
+		// generation the pass wrote, and withdraws the same set.
+		if !separation.applied {
+			var err error
+			if separation, err = b.separateContextPayload(ctx, req, plan, handle); err != nil {
+				return err
+			}
 		}
-		plan.withdrawn = withdrawn
+		separation.record(&plan, &report)
 		if err := b.writeMasks(req, plan, handle, &report); err != nil {
 			return err
 		}
@@ -616,12 +654,14 @@ type buildPlan struct {
 	context []string
 	// deleted is the repo-relative set the generation claims removed, sorted.
 	deleted []string
-	// withdrawn is the graph-path set separateContextPayload emptied, filled
-	// AFTER the pass rather than by a planner — a planner cannot know it,
-	// because it is decided by comparing what the pass actually produced
-	// against the layer below. It rides on the plan so the mask derivation
-	// needs no extra parameter; a plan that never reached the separation
-	// leaves it nil and the derivation is unchanged.
+	// withdrawn is the graph-path set the separation emptied, filled AFTER
+	// the pass rather than by a planner — a planner cannot know it, because
+	// it is decided by comparing what the pass actually produced against the
+	// layer below. Whether the emptying happened in the pass's in-memory
+	// corpus or in the generation afterwards makes no difference here: both
+	// modes fill this through contextSeparation.record. It rides on the plan
+	// so the mask derivation needs no extra parameter; a plan that never
+	// reached the separation leaves it nil and the derivation is unchanged.
 	withdrawn map[string]struct{}
 }
 
@@ -758,9 +798,29 @@ func (b *SparseGenerationBuilder) runPass(
 	plan buildPlan,
 	handle *store_sqlite.Store,
 	report *BuildReport,
-) error {
+) (contextSeparation, error) {
 	idx := New(handle, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
+
+	// The read-only-context mode. Installing the filter is what lets a pass
+	// writing through a derived generation handle hold its corpus in memory at
+	// all, and it is also the bound on what that corpus may persist: the hook
+	// runs once, after resolution and every subpass, immediately before the
+	// drain, and empties the closure files the pass only read. Whatever it
+	// removes is never written — the drain is the only route from the corpus
+	// to the store, and the node, edge, symbol-FTS, files, clone and
+	// constant-value projections all come out of it.
+	//
+	// When the pass cannot take that route (an oversized closure, a refused
+	// admission, a backend without the bulk path) the hook is simply never
+	// called, separation.applied stays false, and the caller falls back to
+	// withdrawing the same set from the generation after the fact.
+	var separation contextSeparation
+	idx.setPassCorpusFilter(func(corpus *graph.Graph) error {
+		var err error
+		separation, err = b.withholdContextPayload(ctx, req, plan, corpus)
+		return err
+	})
 
 	idx.SetRepoPrefix(req.RepoPrefix)
 	idx.SetWorkspaceID(req.WorkspaceID)
@@ -778,13 +838,14 @@ func (b *SparseGenerationBuilder) runPass(
 
 	result, err := idx.IndexCtx(ctx, req.RootPath)
 	if err != nil {
-		return fmt.Errorf("indexer: index generation payload: %w", err)
+		return contextSeparation{}, fmt.Errorf("indexer: index generation payload: %w", err)
 	}
 	if result != nil {
 		report.NodeCount = result.NodeCount
 		report.EdgeCount = result.EdgeCount
 	}
-	return nil
+	report.ContextHeldInMemory = separation.applied
+	return separation, nil
 }
 
 // runEnrichment runs the semantic enrichment stage over the generation's own
@@ -836,30 +897,57 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	out.Partial, out.Disabled, out.Reason = pass.Partial, pass.Disabled, pass.Reason
 }
 
-// separateContextPayload withdraws the payload the pass produced for the
-// closure files it only READ, and returns the graph paths it withdrew.
+// contextSeparation is what one run of the read-only-context separation did.
+// It is the same answer whichever corpus the separation ran against, which is
+// what lets the two modes share one policy: the in-memory mode empties the
+// pass corpus before anything is written, the fallback empties the generation
+// after the pass wrote it, and both produce this.
+type contextSeparation struct {
+	// applied is true once the separation has RUN, including when it decided
+	// to withdraw nothing. It is what distinguishes "the in-memory mode
+	// handled this build" from "no filter ever executed".
+	applied bool
+	// withheld is the graph-path set the generation carries nothing for.
+	withheld map[string]struct{}
+	// withheldPaths is withheld, sorted, for the report.
+	withheldPaths []string
+	// retainedPaths are the candidates whose re-derivation disagreed with the
+	// layer below and therefore keep their payload and their claim.
+	retainedPaths []string
+	// nodes and edges count what left the corpus, edges net of the edges INTO
+	// a withheld identity that were restored.
+	nodes, edges int
+}
+
+// contextCorpus is what the separation needs from the corpus it empties. Both
+// the in-memory pass corpus (*graph.Graph) and a generation handle
+// (*store_sqlite.Store) satisfy it, which is the point: the policy below is
+// written once and cannot drift between the two modes.
 //
-// # Why the pass produces that payload in the first place
+// The identity-keyed sidecars are optional capabilities rather than methods
+// here, because the two corpora keep different ones. The in-memory corpus has
+// no symbol FTS at all (the drain derives it from what survives), while the
+// generation handle has one that must be cleaned explicitly.
+type contextCorpus interface {
+	AllNodes() []*graph.Node
+	AllEdges() []*graph.Edge
+	EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int)
+	AddBatch(nodes []*graph.Node, edges []*graph.Edge)
+	DeleteFileMetasByFiles(repoPrefix string, files []string) error
+}
+
+// withholdContextPayload empties the read-only half of one corpus: the closure
+// files the pass only READ, whose re-derivation agrees with the layer below.
 //
-// Reads through a derived handle are strictly generation-scoped, and the
-// sparse build is disqualified from the in-memory staging shadow precisely
-// because it writes through such a handle (indexer.go's shadow decision tests
-// derivedGenerationTarget). The pass therefore resolves the change set by
-// reading back what it has just written, so every closure file it needs for
-// resolution is on disk by the time resolution runs. Route (b) of the D4
-// determination keeps that arrangement — the CPU cost of re-extracting context
-// stays — and moves the question to what the generation KEEPS.
+// # What may be withheld, and why that is sound
 //
-// # What may be withdrawn, and why that is sound
-//
-// A context file is withdrawn only when the generation's own re-derivation of
+// A context file is withheld only when the generation's own re-derivation of
 // it AGREES WITH THE LAYER BELOW, field for field, node for node and edge for
-// edge. Under that precondition the composed view is unchanged by the
-// withdrawal: what the generation would have served at the path is exactly
-// what the layer below serves once the path is unclaimed. Everything else
-// keeps today's behaviour — a context file whose resolution genuinely moved
-// stays claimed, payload and all, and is named in ContextRetainedPaths rather
-// than quietly narrowed.
+// edge. Under that precondition the composed view is unchanged: what the
+// generation would have served at the path is exactly what the layer below
+// serves once the path is unclaimed. Everything else keeps today's behaviour —
+// a context file whose resolution genuinely moved stays claimed, payload and
+// all, and is named in ContextRetainedPaths rather than quietly narrowed.
 //
 // The comparison is a conservative optimiser, never a correctness argument of
 // its own: any disagreement it cannot rule out — a node only one side holds, an
@@ -868,26 +956,27 @@ func (b *SparseGenerationBuilder) runEnrichment(
 // which nothing compares equal reduces to the behaviour that shipped before
 // this step existed.
 //
-// # What withdrawal costs
+// # The two corpora it runs against
 //
-// The rows are written and then removed, so this removes the DURABLE
-// duplication — the generation carries payload for its change set alone, and a
-// delta chain stops accumulating a copy of every file it ever read — without
-// removing the transient write. Removing the write too needs the pass to stop
-// resolving through the store it is writing, which is a change to the index
-// pipeline rather than to this builder.
-func (b *SparseGenerationBuilder) separateContextPayload(
+// Against the in-memory pass corpus (the read-only-context mode, installed by
+// runPass) nothing has been written yet, so the withheld half never reaches
+// the store: no node rows, no edge rows, no files inventory, no symbol FTS, no
+// clone or constant-value projection, no vectors. Against the generation
+// handle (the fallback, when the pass could not take the in-memory route) the
+// rows were already written and this withdraws them, which removes the durable
+// duplication but not the transient write.
+func (b *SparseGenerationBuilder) withholdContextPayload(
 	ctx context.Context,
 	req BuildRequest,
 	plan buildPlan,
-	handle *store_sqlite.Store,
-	report *BuildReport,
-) (map[string]struct{}, error) {
+	corpus contextCorpus,
+) (contextSeparation, error) {
+	out := contextSeparation{applied: true}
 	if len(plan.context) == 0 {
-		return nil, nil
+		return out, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return contextSeparation{}, err
 	}
 	contextPaths := make([]string, 0, len(plan.context))
 	candidates := make(map[string]struct{}, len(plan.context))
@@ -897,80 +986,128 @@ func (b *SparseGenerationBuilder) separateContextPayload(
 		candidates[graphPath] = struct{}{}
 	}
 
-	carried := newBuilderPathPayload(handle.AllNodes(), handle.AllEdges(), candidates)
+	carried := newBuilderPathPayload(corpus.AllNodes(), corpus.AllEdges(), candidates)
 	if len(carried.nodesByPath) == 0 && len(carried.edgesByPath) == 0 {
-		return nil, nil
+		return out, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return contextSeparation{}, err
 	}
 	baseNodes := req.Base.GetFileNodesByPaths(contextPaths)
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return contextSeparation{}, err
 	}
 	baseEdges := req.Base.GetOutEdgesByNodeIDs(carried.sourceIDs(contextPaths, baseNodes))
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return contextSeparation{}, err
 	}
 
-	withdrawn := make(map[string]struct{}, len(contextPaths))
-	var withdrawnPaths []string
+	withheld := make(map[string]struct{}, len(contextPaths))
+	var withheldPaths []string
 	for _, graphPath := range contextPaths {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return contextSeparation{}, err
 		}
 		if !carried.holdsPath(graphPath) {
 			// The pass produced nothing for the path at all — an admission the
 			// walk refused (unsupported language, excluded, oversized). There is
-			// no payload to withdraw and no re-derivation to compare, so the
+			// no payload to withhold and no re-derivation to compare, so the
 			// generation stays silent about it and PlannedNotCovered keeps
 			// reporting the absence for what it is.
 			continue
 		}
 		if carried.matchesBase(graphPath, baseNodes[graphPath], baseEdges) {
-			withdrawn[graphPath] = struct{}{}
-			withdrawnPaths = append(withdrawnPaths, graphPath)
+			withheld[graphPath] = struct{}{}
+			withheldPaths = append(withheldPaths, graphPath)
 			continue
 		}
-		report.ContextRetainedPaths = append(report.ContextRetainedPaths, graphPath)
+		out.retainedPaths = append(out.retainedPaths, graphPath)
 	}
-	sort.Strings(withdrawnPaths)
-	sort.Strings(report.ContextRetainedPaths)
-	if len(withdrawnPaths) == 0 {
-		return nil, nil
+	sort.Strings(withheldPaths)
+	sort.Strings(out.retainedPaths)
+	if len(withheldPaths) == 0 {
+		return out, nil
 	}
 
-	// The eviction removes every edge touching a withdrawn node, including the
+	// The eviction removes every edge touching a withheld node, including the
 	// re-derived calls the CHANGED files make into one. Those belong to the
 	// change set's own payload — the generation claims their file — so they are
-	// captured first and restored after. Edges LEAVING a withdrawn node are not:
+	// captured first and restored after. Edges LEAVING a withheld node are not:
 	// they are the context file's own adjacency, which the layer below serves
 	// again the moment the path is unclaimed.
-	restore := carried.edgesIntoWithdrawn(withdrawn)
-	nodes, edges := handle.EvictFiles(withdrawnPaths)
+	restore := carried.edgesIntoWithdrawn(withheld)
+	nodes, edges := corpus.EvictFiles(withheldPaths)
 	if len(restore) > 0 {
-		handle.AddBatch(nil, restore)
+		corpus.AddBatch(nil, restore)
 	}
-	if err := handle.DeleteFileMetasByFiles(req.RepoPrefix, withdrawnPaths); err != nil {
-		return nil, fmt.Errorf("indexer: withdraw generation file inventory: %w", err)
+	if err := corpus.DeleteFileMetasByFiles(req.RepoPrefix, withheldPaths); err != nil {
+		return contextSeparation{}, fmt.Errorf("indexer: withhold generation file inventory: %w", err)
 	}
-	if ids := carried.nodeIDsAt(withdrawn); len(ids) > 0 {
-		if err := handle.BatchDeleteSymbolFTS(ids); err != nil {
-			return nil, fmt.Errorf("indexer: withdraw generation symbol index: %w", err)
+	// Constant values are keyed by file and survive a node eviction, so they
+	// are removed by path. A corpus without the capability has none to remove.
+	if deleter, ok := corpus.(interface {
+		DeleteConstantValuesByFiles(repoPrefix string, files []string) error
+	}); ok {
+		if err := deleter.DeleteConstantValuesByFiles(req.RepoPrefix, withheldPaths); err != nil {
+			return contextSeparation{}, fmt.Errorf("indexer: withhold generation constant values: %w", err)
 		}
 	}
-	report.ContextPaths = withdrawnPaths
-	report.ContextMasks = len(withdrawnPaths)
-	report.ContextWithdrawnNodes = nodes
-	report.ContextWithdrawnEdges = edges - len(restore)
-	b.Logger.Debug("indexer: withdrew read-only context payload from the generation",
+	// Symbol FTS is keyed by identity, not by file, so it is removed by id —
+	// and only where the corpus keeps one. The in-memory pass corpus does not:
+	// its FTS rows are derived at the drain from the nodes that survive this
+	// call, so there is nothing to clean.
+	if deleter, ok := corpus.(interface {
+		BatchDeleteSymbolFTS(nodeIDs []string) error
+	}); ok {
+		if ids := carried.nodeIDsAt(withheld); len(ids) > 0 {
+			if err := deleter.BatchDeleteSymbolFTS(ids); err != nil {
+				return contextSeparation{}, fmt.Errorf("indexer: withhold generation symbol index: %w", err)
+			}
+		}
+	}
+	out.withheld = withheld
+	out.withheldPaths = withheldPaths
+	out.nodes = nodes
+	out.edges = edges - len(restore)
+	b.Logger.Debug("indexer: withheld read-only context payload",
 		zap.String("repo", req.RepoPrefix),
 		zap.Int("context_files", len(plan.context)),
-		zap.Int("withdrawn_files", len(withdrawnPaths)),
-		zap.Int("retained_files", len(report.ContextRetainedPaths)),
-		zap.Int("withdrawn_nodes", nodes),
+		zap.Int("withheld_files", len(withheldPaths)),
+		zap.Int("retained_files", len(out.retainedPaths)),
+		zap.Int("withheld_nodes", nodes),
 		zap.Int("restored_edges", len(restore)))
-	return withdrawn, nil
+	return out, nil
+}
+
+// record folds one separation into the build report and the plan the mask
+// derivation reads. Both modes go through it, so the report says the same
+// thing whichever ran.
+func (s contextSeparation) record(plan *buildPlan, report *BuildReport) {
+	if !s.applied {
+		return
+	}
+	plan.withdrawn = s.withheld
+	report.ContextPaths = s.withheldPaths
+	report.ContextMasks = len(s.withheldPaths)
+	report.ContextRetainedPaths = s.retainedPaths
+	report.ContextWithdrawnNodes = s.nodes
+	report.ContextWithdrawnEdges = s.edges
+}
+
+// separateContextPayload is the fallback mode: the pass wrote its whole file
+// set into the generation, and this withdraws the read-only half afterwards.
+//
+// It runs when the pass could not take the in-memory route — an oversized
+// closure, a refused shadow admission, a store that does not offer the bulk
+// path — so the sparse build never depends on the optimisation being available
+// and degrades to exactly the behaviour that shipped before it existed.
+func (b *SparseGenerationBuilder) separateContextPayload(
+	ctx context.Context,
+	req BuildRequest,
+	plan buildPlan,
+	handle *store_sqlite.Store,
+) (contextSeparation, error) {
+	return b.withholdContextPayload(ctx, req, plan, handle)
 }
 
 // builderPathPayload is the generation's own payload, grouped by the candidate
