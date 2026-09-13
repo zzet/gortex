@@ -27,6 +27,12 @@ type sqliteMutationReceiptAccumulator struct {
 	evictedNames       map[string]struct{}
 	targetIDs          map[string]struct{}
 	importCandidates   map[string]struct{}
+	// fanoutTruncations is the per-pass completeness fact set for the bounded
+	// DERIVED passes that ran inside this window. It never feeds complete /
+	// incompleteReason — see graph.MutationReceipt.FanoutTruncations: voiding
+	// Complete here would turn a bounded fan-out into the whole-graph fallback
+	// the bound exists to avoid.
+	fanoutTruncations []graph.ReceiptFanoutTruncation
 }
 
 // noteIncomplete voids the receipt, keeping the FIRST cause.
@@ -70,7 +76,25 @@ func (a *sqliteMutationReceiptAccumulator) receipt() graph.MutationReceipt {
 		EvictedNames:       sortedSQLiteReceiptKeys(a.evictedNames),
 		TargetIDs:          sortedSQLiteReceiptKeys(a.targetIDs),
 		ImportCandidates:   sortedSQLiteReceiptKeys(a.importCandidates),
+		FanoutTruncations:  cloneSQLiteReceiptFanoutTruncations(a.fanoutTruncations),
 	}
+}
+
+// cloneSQLiteReceiptFanoutTruncations detaches the facts from the accumulator
+// so a consumer cannot reach back into a store that is still serving other
+// windows through the returned receipt.
+func cloneSQLiteReceiptFanoutTruncations(
+	facts []graph.ReceiptFanoutTruncation,
+) []graph.ReceiptFanoutTruncation {
+	if len(facts) == 0 {
+		return nil
+	}
+	out := make([]graph.ReceiptFanoutTruncation, len(facts))
+	for i, fact := range facts {
+		out[i] = fact
+		out[i].DroppedFiles = append([]string(nil), fact.DroppedFiles...)
+	}
+	return out
 }
 
 func sortedSQLiteReceiptKeys(values map[string]struct{}) []string {
@@ -120,6 +144,31 @@ func (s *Store) EndMutationReceipt(token graph.MutationReceiptToken) graph.Mutat
 	return acc.receipt()
 }
 
+// RecordMutationFanoutTruncation attaches one bounded derived pass's
+// completeness fact to every receipt currently open on this store.
+//
+// This is the production half of the axis: *Store is the graph.Store the
+// daemon actually holds (serverstack openSqliteBackend -> store_sqlite.Open),
+// so a fact that only the in-memory *graph.Graph could carry reached no
+// shipped consumer at all — a truncated affected-by pass read as a complete
+// one on every real save.
+//
+// It takes writeMu, the same boundary Begin/End take, so a fact is wholly
+// inside or wholly outside a window. It records no row: a fan-out cut is an
+// annotation about work a pass did NOT do, so it is safe to take the write
+// lock without a transaction, and the indexer calls it from the affected-by
+// reporter — outside any store write call — never re-entrantly.
+func (s *Store) RecordMutationFanoutTruncation(fact graph.ReceiptFanoutTruncation) {
+	if s.coreless() {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for _, acc := range s.mutationReceipts.active {
+		acc.fanoutTruncations = graph.MergeReceiptFanoutTruncation(acc.fanoutTruncations, fact)
+	}
+}
+
 func (s *Store) hasActiveMutationReceiptsLocked() bool {
 	return len(s.mutationReceipts.active) != 0
 }
@@ -154,6 +203,12 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 		mergeSQLiteReceiptSet(acc.evictedNames, delta.evictedNames)
 		mergeSQLiteReceiptSet(acc.targetIDs, delta.targetIDs)
 		mergeSQLiteReceiptSet(acc.importCandidates, delta.importCandidates)
+		// Per-pass fan-out facts merge on the union of dropped names, never
+		// by appending, for the same reason they do inside one pass: a
+		// chunked batch re-applies the bound and can reject one file twice.
+		for _, fact := range delta.fanoutTruncations {
+			acc.fanoutTruncations = graph.MergeReceiptFanoutTruncation(acc.fanoutTruncations, fact)
+		}
 	}
 }
 
@@ -359,4 +414,12 @@ func mutationNodeIdentitiesTx(tx *sql.Tx, viewGen int64, ids []string) (map[stri
 	return identities, nil
 }
 
-var _ graph.MutationReceiptStore = (*Store)(nil)
+var (
+	_ graph.MutationReceiptStore = (*Store)(nil)
+	// The bounded-fan-out completeness sink. Asserted here because the
+	// indexer reaches it by optional-interface type assertion
+	// (graph.NoteMutationFanoutTruncation): if this store stopped satisfying
+	// it, a truncated affected-by pass would go back to reading as a complete
+	// one on the production backend instead of failing to compile.
+	_ graph.MutationFanoutRecorder = (*Store)(nil)
+)

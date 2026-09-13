@@ -47,6 +47,13 @@ type mutationReindexOutcome struct {
 	Generation        uint64
 	AppliedGeneration uint64
 	Err               error
+	// DerivedFanout is the completeness fact for the bounded derived passes
+	// the reindex ran. Additive and independent of Reindexed: the graph can
+	// have read these bytes while the affected-by re-resolution over them was
+	// cut, which leaves named dependants holding edges and persisted
+	// reference facts derived against the pre-edit shape. Its zero value says
+	// "not observed", never "complete".
+	DerivedFanout indexer.DerivedFanoutCompleteness
 	// A checkout generation is not reflected in the canonical syntax-health
 	// reader. Do not attach another checkout's parse errors to this result.
 	checkoutScoped      bool
@@ -406,6 +413,11 @@ func (s *Server) resolveReindexedPathReceipts(reindexedPath string, eligible map
 		}
 		receipt.mu.Lock()
 		if receipt.completed && (receipt.result.Err != nil || !receipt.result.Reindexed) {
+			// The repaired result deliberately carries no DerivedFanout: the
+			// pass that repaired this path was a different mutation, and its
+			// bounded-derived verdict is not this receipt's to publish. The
+			// consumer then renders no fan-out key, which is an absent verdict
+			// rather than a wrong one.
 			receipt.result = indexer.MutationResult{
 				RequestedGeneration: receipt.generation,
 				AppliedGeneration:   receipt.generation,
@@ -432,6 +444,14 @@ func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
 		outcome.Reindexed = r.result.Reindexed
 		outcome.AppliedGeneration = r.result.AppliedGeneration
 		outcome.Err = r.result.Err
+		// A mutation that failed, or that never applied, carries no
+		// bounded-derived verdict to publish. The watcher already refuses to
+		// stamp one on those arms; refusing it again here is what keeps a
+		// future producer — or a receipt repaired by another path — from
+		// certifying derived work over bytes the graph never accepted.
+		if r.result.Err == nil && r.result.Reindexed {
+			outcome.DerivedFanout = r.result.DerivedFanout
+		}
 		outcome.Pending = false
 	}
 	return outcome
@@ -705,6 +725,87 @@ func (s *Server) mutationReposForSymbolIDs(ctx context.Context, ids []string) []
 	return result
 }
 
+// derivedFanoutKeyComplete is the wire spelling of the bounded-derived-pass
+// completeness half of a mutation's graph verdict. Keep the key names stable:
+// a client that polls change.receipt reads them next to graph_status.
+const (
+	derivedFanoutKeyComplete = "derived_fanout_complete"
+	derivedFanoutKeyDropped  = "derived_fanout_stale_files"
+	derivedFanoutKeyPasses   = "derived_fanout_bounded_passes"
+	derivedFanoutKeyNote     = "derived_fanout_note"
+)
+
+// attachDerivedFanout renders the completeness fact for the bounded derived
+// passes a reindex ran.
+//
+// graph_status answers "has the graph read these bytes". It does NOT answer
+// "is the graph coherent with them": the affected-by re-resolution that
+// rebinds the edited symbol's dependants is bounded, and when that bound fires
+// the named files keep edges and persisted reference facts derived against the
+// pre-edit shape while graph_status still reads "fresh". The two facts are
+// therefore published side by side, and a complete fan-out is published as a
+// positive answer rather than as an absent key — a caller must be able to tell
+// "the pass finished" from "this path never measured it".
+//
+// An unobserved fact renders nothing at all: a mutation that never reached the
+// graph (admission failure, a storm batch, a checkout refresh) has no fan-out
+// verdict, and rendering one would be an invented certification.
+func attachDerivedFanout(resp map[string]any, fanout indexer.DerivedFanoutCompleteness) {
+	if resp == nil || !fanout.Observed {
+		return
+	}
+	resp[derivedFanoutKeyComplete] = fanout.Complete
+	if fanout.Complete {
+		return
+	}
+	if fanout.Dropped > 0 {
+		resp[derivedFanoutKeyDropped] = fanout.Dropped
+	}
+	if len(fanout.Passes) > 0 {
+		resp[derivedFanoutKeyPasses] = append([]string(nil), fanout.Passes...)
+	}
+	resp[derivedFanoutKeyNote] = "the graph read these bytes, but a bounded derived pass stopped at its cap: " +
+		"the files it dropped still hold edges and reference facts derived from the PRE-edit shape. " +
+		"Waiting does not fix it — re-read or re-resolve a dependant before trusting its call graph, " +
+		"or raise index.affected_by_reresolve_max"
+}
+
+// derivedFanoutForMutation recovers the bounded-fan-out completeness fact for
+// one recorded mutation from the freshness receipt its graph half was stamped
+// from.
+//
+// The lookup is by (path, generation) rather than by receipt id on purpose:
+// mutationReindexState deliberately blanks outcome.Receipt once the ticket has
+// already reported, because there is then nothing left for a client to poll —
+// so the commit ledger keeps no id for exactly the common case. The pair is
+// just as identifying: the watcher allocates one generation per admitted
+// mutation of a path (indexer scheduleFileMutation), and it is what the ledger
+// does retain. Receipts age out sooner than commit records, so an old record
+// simply carries no fan-out verdict, which is the honest answer.
+func (s *Server) derivedFanoutForMutation(absPath string, generation uint64) (indexer.DerivedFanoutCompleteness, bool) {
+	if absPath == "" || generation == 0 {
+		return indexer.DerivedFanoutCompleteness{}, false
+	}
+	clean := filepath.Clean(absPath)
+	var found indexer.DerivedFanoutCompleteness
+	var ok bool
+	s.mutationReceipts.Range(func(_, value any) bool {
+		receipt, isReceipt := value.(*mutationReceipt)
+		if !isReceipt || receipt.generation != generation || filepath.Clean(receipt.path) != clean {
+			return true
+		}
+		receipt.mu.RLock()
+		if receipt.completed && receipt.result.Err == nil && receipt.result.Reindexed &&
+			receipt.result.DerivedFanout.Observed {
+			found = receipt.result.DerivedFanout
+			ok = true
+		}
+		receipt.mu.RUnlock()
+		return !ok
+	})
+	return found, ok
+}
+
 func (s *Server) mutationReceiptState(id string) (mutationReindexOutcome, bool) {
 	value, ok := s.mutationReceipts.Load(id)
 	if !ok {
@@ -732,6 +833,7 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 	// reads next to disk_status (mutation_commit.go) rather than having to be
 	// inferred from the reindexed / reindex_pending / reindex_error triple.
 	resp["graph_status"] = graphStatusFor(outcome)
+	attachDerivedFanout(resp, outcome.DerivedFanout)
 	if outcome.Generation > 0 {
 		resp["reindex_generation"] = outcome.Generation
 	}

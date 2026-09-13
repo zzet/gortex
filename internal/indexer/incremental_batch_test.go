@@ -5,13 +5,17 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -413,4 +417,115 @@ func TestSQLiteIncrementalSingleFileEditKeepsMutationReceiptExact(t *testing.T) 
 		"single-file edit with an external incoming reference voided the receipt (%s) on the SQLite backend", receipt.IncompleteReason)
 	require.True(t, receipt.ResolutionRelevant)
 	require.Contains(t, receipt.ResolutionFiles(), "def.go")
+}
+
+// Every affected-by plan this Indexer hands out carries the batch's bound AND
+// the reporter that puts the cut on the mutation receipt. emptyAffectedByPlan
+// is the single stamp point: a plan built without it loses the receipt fact as
+// well as the log line, and — because boundAffectedByFiles treats a
+// non-positive cap as "no bound" — loses the bound too.
+//
+// Revert-red: drop the notify stamp (or the carry inside
+// reportAffectedByTruncation) and the open receipt reports a complete fan-out
+// while two files went unrefreshed.
+// It runs over BOTH receipt backends. The sqlite arm is the one that matters:
+// *store_sqlite.Store is the graph.Store the daemon holds (serverstack
+// openSqliteBackend), and its receipt accumulator is a separate implementation
+// from the in-memory one — a fact the in-memory graph carries says nothing
+// about what a real save carries.
+func TestBoundedAffectedByPlanCarriesTheCutOntoTheOpenReceipt(t *testing.T) {
+	for _, backend := range receiptBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			g := backend.build(t)
+			store, ok := g.(graph.MutationReceiptStore)
+			require.True(t, ok, "%T does not bear mutation receipts", g)
+			require.True(t, graph.ReceiptFanoutCarrier(g),
+				"%T bears receipts but cannot carry a bounded fan-out completeness fact", g)
+			idx := New(g, nil, testIndexConfigWithAffectedByCap(2), zap.NewNop())
+
+			plan := idx.emptyAffectedByPlan()
+			require.Positive(t, plan.maxFiles, "every plan must carry the batch bound")
+			require.NotNil(t, plan.notify, "every plan must carry the receipt reporter")
+
+			token := store.BeginMutationReceipt()
+			plan.files = []string{"a.go", "b.go", "c.go", "d.go"}
+			bounded := plan.bounded()
+			receipt := store.EndMutationReceipt(token)
+
+			require.True(t, bounded.truncation.Truncated)
+			require.Equal(t, []string{"a.go", "b.go"}, bounded.files)
+
+			fact, ok := receipt.FanoutTruncationFor(affectedByFanoutPass)
+			require.True(t, ok, "the cut never reached the open receipt: %+v", receipt.FanoutTruncations)
+			require.False(t, receipt.DerivedFanoutComplete())
+			require.Equal(t, 2, fact.Cap)
+			require.Equal(t, 4, fact.Considered)
+			require.Equal(t, []string{"c.go", "d.go"}, fact.DroppedFiles)
+
+			// A second, overlapping cut inside the SAME window merges on the
+			// union of names: a deferred batch re-applies the bound per chunk,
+			// so a file two chunks both reject must be counted once.
+			token = store.BeginMutationReceipt()
+			plan.files = []string{"a.go", "b.go", "c.go", "d.go"}
+			plan.bounded()
+			plan.files = []string{"a.go", "b.go", "d.go", "e.go"}
+			plan.bounded()
+			receipt = store.EndMutationReceipt(token)
+			fact, ok = receipt.FanoutTruncationFor(affectedByFanoutPass)
+			require.True(t, ok)
+			require.Equal(t, []string{"c.go", "d.go", "e.go"}, fact.DroppedFiles)
+			require.Equal(t, 3, fact.Dropped, "two cuts over four dropped slots must merge to three files")
+
+			// A fact recorded with no window open must be discarded, never
+			// buffered onto the next receipt.
+			plan.files = []string{"a.go", "b.go", "z.go"}
+			plan.bounded()
+			clean := store.EndMutationReceipt(store.BeginMutationReceipt())
+			require.True(t, clean.DerivedFanoutComplete(),
+				"a cut taken with no window open leaked onto a later receipt: %+v", clean.FanoutTruncations)
+		})
+	}
+}
+
+// Both receipt backends take the fact from concurrent recorders without racing
+// or losing one. The sqlite arm is the reason this test exists: its sink takes
+// writeMu — the same lock Begin/End take and the same lock every graph write
+// takes — so a fact recorded from the derived-pass goroutines has to serialise
+// against them rather than merging into a map unguarded.
+//
+// Run this one under -race.
+func TestFanoutFactRecordingIsConcurrencySafeOnBothBackends(t *testing.T) {
+	for _, backend := range receiptBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			g := backend.build(t)
+			store, ok := g.(graph.MutationReceiptStore)
+			require.True(t, ok)
+
+			token := store.BeginMutationReceipt()
+			var wg sync.WaitGroup
+			for i := 0; i < 8; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					graph.NoteMutationFanoutTruncation(g, graph.ReceiptFanoutTruncation{
+						Pass: affectedByFanoutPass, Cap: 1, Considered: 2, Dropped: 1,
+						DroppedFiles: []string{"src/f" + strconv.Itoa(i) + ".go"},
+					})
+				}(i)
+			}
+			wg.Wait()
+			receipt := store.EndMutationReceipt(token)
+			require.Equal(t, 8, receipt.DroppedFanoutFiles(),
+				"concurrent cuts lost a fact on %T: %+v", g, receipt.FanoutTruncations)
+			require.Len(t, receipt.FanoutTruncations, 1,
+				"one pass must merge into one fact: %+v", receipt.FanoutTruncations)
+		})
+	}
+}
+
+func testIndexConfigWithAffectedByCap(cap int) config.IndexConfig {
+	cfg := config.Default().Index
+	cfg.Workers = 1
+	cfg.AffectedByReresolveMax = cap
+	return cfg
 }

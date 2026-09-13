@@ -1891,6 +1891,11 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.LightEdgeScanner)(nil), probe: "AllEdgesLight"},
 		{iface: (*graph.LightEdgeSequencer)(nil), probe: "EdgesLightSeq"},
 		{iface: (*graph.MemberMethodsByType)(nil), probe: "MemberMethodsByType"},
+		// Annotates the in-process receipt accumulators with a bounded derived
+		// pass's completeness fact. It reads no row and writes none — the
+		// fact describes work a pass did NOT do — so it has nothing to scope
+		// to a generation, exactly like the receipt store it annotates.
+		{iface: (*graph.MutationFanoutRecorder)(nil), skip: skipInMemory},
 		{iface: (*graph.MutationReceiptStore)(nil), skip: skipInMemory},
 		{iface: (*graph.MutationScopedCrossRepoCandidates)(nil), probe: "CrossRepoCandidatesForMutation"},
 		{iface: (*graph.NamedLanguageNodeSequencer)(nil), probe: "NodesInScopeSeq"},

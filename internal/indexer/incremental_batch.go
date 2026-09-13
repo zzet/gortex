@@ -1552,6 +1552,15 @@ type affectedByBatchPlan struct {
 	// constructor that holds the Indexer — so the fact is reported wherever
 	// the bound is applied, including at call sites that discard the bounded
 	// plan (indexer.go's exceptional-file merge does exactly that).
+	//
+	// "Reported" now means carried, not logged: reportAffectedByTruncation
+	// puts the fact on the MUTATION RECEIPT of the window the pass is running
+	// in (affected_by.go carryAffectedByTruncationOnReceipt) and on the
+	// per-mutation observation the calling watcher is holding
+	// (observeDerivedFanoutPass). Every batch site that applies this bound —
+	// reresolveAffectedByStages and mergeDeferredAffected, both reached from
+	// commitStructuralIncrementalBatch — runs inside both, so a plan built
+	// without this stamp loses the mutation's verdict as well as the log line.
 	notify func(affectedByTruncation)
 	// truncation is the completeness fact for this plan: zero until the bound
 	// has been applied, set once it has.
@@ -1563,7 +1572,11 @@ type affectedByBatchPlan struct {
 // sorted.
 func (p affectedByBatchPlan) bounded() affectedByBatchPlan {
 	files, truncation := boundAffectedByFiles(p.files, p.maxFiles)
-	if truncation.Truncated && p.notify != nil {
+	// Notify on EVERY application, not only on a cut. reportAffectedByTruncation
+	// still logs and carries the truncated case alone; what the complete case
+	// adds is the fact that this pass ran at all, which is the only thing that
+	// lets a caller tell a finished fan-out from one that was never attempted.
+	if p.notify != nil {
 		p.notify(truncation)
 	}
 	return affectedByBatchPlan{
