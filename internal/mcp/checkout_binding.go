@@ -658,6 +658,38 @@ func freshnessExactRefusal(reason string, waited time.Duration) error {
 		reason, waited.Milliseconds()))
 }
 
+// exactnessWithdrawnRefusal is the typed refusal for the third way a
+// require_exact call can end without the view it asked for: selection served
+// the named view exactly, and the answer stopped being exact while it was
+// being assembled.
+//
+// Two demotions happen after the pre-handler gate has already passed the call
+// through, and both clear rider.Exact and set a fallback_reason on the way out:
+// the checkout's route moved under the read (markWorktreeRouteMoved,
+// view_paths.go, discovered by the byte and text lanes while the handler runs)
+// and the base corpus moved under it (markBaseCorpusChange, view_request.go,
+// asked once the whole read is over). Neither is a substitution selection made,
+// which is why neither could be seen at selection time — and both mean the same
+// thing to the caller: the answer it is holding is one the named view can no
+// longer reproduce.
+//
+// That is precisely what require_exact rejects, so it is refused rather than
+// answered, and it is refused for both reasons alike: refusing a moved route
+// while answering a moved corpus would make the knob depend on which half of
+// the stack happened to move. The reason is carried verbatim so the refusal
+// text uses the same vocabulary as the fallback_reason a non-exact caller
+// would have received.
+func exactnessWithdrawnRefusal(reason string) error {
+	if reason == "" {
+		reason = "exactness_withdrawn"
+	}
+	return graphview.NewViewError(graphview.CodeViewBuilding, fmt.Sprintf(
+		"the requested view was served exactly and stopped being exact while the answer was "+
+			"assembled (fallback_reason %q); require_exact refused the answer the named view can "+
+			"no longer reproduce, and no fallback was served",
+		reason))
+}
+
 // checkoutForRequestPath is the shared catalog boundary for daemon admission,
 // session scope and request view selection. A cache miss observes only this
 // checkout of an already known Git family; it never tracks a new repository or

@@ -3165,7 +3165,17 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		result, updatedAt, refreshing = s.indexHealthSnapshot()
 	}
 	if result != nil {
-		result = s.refreshIndexHealthFileFailures(ctx, result)
+		// Stamped on the same terms as the resource below, so the PAYLOAD the
+		// resource's description calls "the same payload as the index_health
+		// tool" keeps saying the same thing on both surfaces. The two results
+		// are not byte-equal and never were: a routed tool result additionally
+		// carries the view rider attachViewRider renders around it
+		// (freshness.base_scoped among it), which a resources/read has no
+		// channel for at all. On the tool the stamp is therefore a second copy
+		// of a statement the rider already makes; on the resource it is the
+		// only copy there is, and stamping both is what keeps a caller from
+		// reading two different answers to "which corpus is this".
+		result = withIndexHealthCorpusScope(ctx, s.refreshIndexHealthFileFailures(ctx, result))
 	}
 
 	if isCompact(req) {
@@ -3230,7 +3240,11 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	if err != nil || baseline == nil {
 		return baseline, err
 	}
-	return s.refreshIndexHealthFileFailures(ctx, baseline), nil
+	// The gortex://index-health resource's only channel for saying which corpus
+	// it describes: it reads through requestScoped like gortex://stats does,
+	// but unlike stats the payload underneath is generation zero's whatever the
+	// session is bound to, and a resource carries no rider to say so.
+	return withIndexHealthCorpusScope(ctx, s.refreshIndexHealthFileFailures(ctx, baseline)), nil
 }
 
 func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string]any, error) {

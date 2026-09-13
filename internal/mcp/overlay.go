@@ -300,6 +300,32 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			qStart = time.Now()
 		}
 		res, hErr := h(ctx, req)
+		// require_exact, a second time. The gate above runs before the handler
+		// and can only see the substitutions SELECTION made; an answer that
+		// was selected exactly can still stop being exact while it is being
+		// assembled, and until this ran that outcome was answered with
+		// exact:false + a fallback_reason to a caller that had asked never to
+		// receive one. See refuseWithdrawnExactness.
+		if hErr == nil {
+			if refused := s.refuseWithdrawnExactness(req.Params.Name, requireExactView, view); refused != nil {
+				// A late refusal is still a call that RAN, unlike every other
+				// refusal in this middleware, so the two ledgers that count
+				// calls rather than answers are booked here before the return.
+				// Without this a refused call vanishes from usage telemetry and
+				// from the query log, both of which counted it before the gate
+				// existed. The retrieval savings ledger and the response ring
+				// are deliberately not booked: there is no answer to save
+				// against and nothing to re-cut, exactly as for the
+				// pre-handler gate above.
+				s.recorder.Record("mcp_tool_call", req.Params.Name)
+				if logQuery {
+					// hErr is nil and the result carries IsError, which is what
+					// queryLogger.record reads to log the call as not-OK.
+					s.queryLog.record(s, ctx, req, refused, nil, qStart)
+				}
+				return refused, nil
+			}
+		}
 		// Book the retrieval half of the savings ledger for a DIRECT legacy
 		// call. Facade calls do not reach here under their legacy name — the
 		// facade holds the unwrapped handler (prepareTool) and books in
@@ -357,6 +383,107 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		return res, hErr
 	})
+}
+
+// refuseWithdrawnExactness is require_exact's post-handler half: it refuses an
+// answer whose exactness claim was withdrawn while the handler assembled it.
+//
+// The pre-handler gate (requireExactView, above) reads the rider selection
+// built, so it sees every substitution selection made — a fallback view, a
+// stale route, an expired freshness bound — and refuses those. It cannot see
+// the two demotions that happen later, because neither has happened yet:
+//
+//   - the route the view pinned moved under the read. The byte lane
+//     (view_files.go refViewFilesFor) and the text lane (view_search_text.go
+//     searchTextInView) discover it mid-handler and call markWorktreeRouteMoved
+//     (view_paths.go), which clears Exact and sets fallback_reason
+//     "route_moved".
+//   - the base corpus underneath moved under the read. markBaseCorpusChange
+//     (view_request.go) asks the request's base pin once the whole read is
+//     over and sets fallback_reason "base_changed" the same way.
+//
+// Both were answered rather than refused: a require_exact caller received
+// exact:false with a reason on a response it had asked never to receive. They
+// are refused here together, in the strict direction and on the same terms —
+// require_exact refuses ANY non-exact answer, and which half of the stack moved
+// is not the caller's distinction to make.
+//
+// It refuses only a call that left nothing behind (lateExactnessRefusalIsSafe).
+// The pre-handler gate refuses a call that never ran, so "no fallback was
+// served" is the whole truth there; here the handler HAS run, and telling a
+// client that a call it already applied did not happen is how a write lands
+// twice.
+//
+// The base-corpus question is asked here rather than left to attachViewRider,
+// which is where it normally lands, because a refusal returns before any rider
+// is rendered. Asking twice is cheap rather than free: markBaseCorpusChange
+// evaluates noteBaseCorpusChange FIRST (view_request.go), so BasePin.ValidateCurrent
+// does run a second time — a mutex plus an in-memory witness compare, no I/O
+// and no graph read — and the second call then finds the rider already inexact
+// and leaves it alone. It is idempotent, not elided.
+func (s *Server) refuseWithdrawnExactness(tool string, requireExact bool, view *requestView) *mcp.CallToolResult {
+	if !requireExact || view == nil || view.rider == nil {
+		return nil
+	}
+	if !lateExactnessRefusalIsSafe(tool) {
+		return nil
+	}
+	s.markBaseCorpusChange(view)
+	// The rider read takes the view's own mutex: markWorktreeRouteMoved writes
+	// it from inside the handler, and a handler that fanned out may still have
+	// a lane in flight when this runs.
+	view.mu.Lock()
+	exact, reason := view.rider.Exact, view.rider.FallbackReason
+	view.mu.Unlock()
+	if exact {
+		return nil
+	}
+	// Deliberately no counter: every series in viewmetrics' catalog enumerates
+	// its label values, and a refusal reason invented here would either widen
+	// one of those enumerations or ride under a label that does not describe
+	// it. The refusal is legible in the response, which is where the caller
+	// reads it.
+	return mcp.NewToolResultError(exactnessWithdrawnRefusal(reason).Error())
+}
+
+// lateExactnessRefusalIsSafe reports whether a tool's ANSWER may still be
+// withdrawn after its handler has already run.
+//
+// The distinction is not about exactness, it is about what the refusal claims.
+// Every other refusal in wrapToolHandler returns before the handler, so the
+// error it hands back — "no fallback was served" — is the whole truth: nothing
+// ran, nothing landed, and a client that retries repeats nothing. The
+// post-handler gate is the one place where that sentence would be false. The
+// handler has run; a tool that wrote a memory, a note, a config row, an index,
+// a subscription or a file has already done so, and a client reading an error
+// result as "nothing happened" and resubmitting applies that write twice.
+//
+// So the late gate is read-only by construction. daemon.ToolEffects is the
+// canonical effect registry and states outright that a tool absent from it is
+// read-only from the permission system's point of view
+// (internal/daemon/mutating.go); IsEffectful is the same judgement the
+// planning-mode write gate makes, widened here to session-only effects as well,
+// because a doubled subscribe or overlay_push is a doubled side effect even
+// when nothing durable moved. The two conditional writers that registry
+// documents as DELIBERATELY unclassified — analyze's durable enrichers (blame,
+// coverage, sql_rebuild, temporal_verify) and change_contract's ack=true risk
+// acknowledgement — are named here so this gate does not inherit an exception
+// written for tools/list visibility.
+//
+// An effectful tool is not left lying about its exactness: it answers, and its
+// rider still carries exact:false and the fallback_reason. The caller learns
+// the same fact, on a response that admits the work happened — which is the
+// honest shape for a call that did.
+func lateExactnessRefusalIsSafe(tool string) bool {
+	switch tool {
+	case "analyze", "change_contract":
+		// Conditional writers daemon.ToolEffects leaves unclassified on
+		// purpose. Named, not derived, because the registry cannot express
+		// "writes only for some argument shapes" and this gate must assume the
+		// writing shape.
+		return false
+	}
+	return !daemon.IsEffectful(tool)
 }
 
 // errBaseSHADrift is the structured drift error returned by the
@@ -513,13 +640,14 @@ func payloadRepositories(view *requestView) []string {
 //     unrouted base-corpus request, the shape most tool calls have: a worker
 //     it leaves behind inherits no payload, so there is no lifetime to
 //     extend and nothing is recorded.
-//   - the view exists but every holder of its lease has already released, so
-//     graphview refuses the join. That is recorded as a refusal, because the
-//     payload underneath may already be gone and the caller is now running
-//     unpinned. It is not reachable from inside a live handler — close() is
-//     deferred to handler return — so a non-zero refusal count means a
-//     detached worker asked for a pin after its request had already ended,
-//     which is a wiring bug rather than a routine outcome.
+//   - the view exists and at least one hold it offered could not be joined,
+//     because its holders have already released. That is recorded as a
+//     refusal, whether the drained hold is one of three or all three: the
+//     payload that hold covered may already be gone and the caller would be
+//     running unpinned against it. It is not reachable from inside a live
+//     handler — close() is deferred to handler return — so a non-zero refusal
+//     count means a pin was asked for on the way out of a request or after it
+//     had already ended.
 //
 // A caller must never read a nil pin as a successful handoff.
 func handoffRequestView(ctx context.Context, consumer string) *requestViewPin {
@@ -546,10 +674,11 @@ func handoffRequestView(ctx context.Context, consumer string) *requestViewPin {
 // physical purge behind it. A worker names what it reads.
 //
 // "Nothing to pin" and "refused" stay distinct: a request that materialized no
-// payload at all offers nothing and records nothing, while one whose every
-// hold had already been released records a refusal — only reachable from a
-// worker asking after its request ended, which is a wiring bug rather than a
-// routine outcome.
+// payload at all offers nothing and records nothing, while one that offered a
+// hold which could not be joined records a refusal. The join is never partial —
+// every hold this request holds joins, or none is handed out at all — because a
+// pin that covers two of three disappearances is not a weaker guarantee, it is
+// an unpinned worker reported as a joined one.
 func handoffRequest(view *requestView, scope *graphview.RepositoryReadLease, consumer string) *requestViewPin {
 	if view == nil || (view.materialized == nil && view.basePin == nil) {
 		// The unrouted base-corpus request: it materialized nothing, so a
@@ -566,10 +695,59 @@ func handoffRequest(view *requestView, scope *graphview.RepositoryReadLease, con
 		pin.base = view.basePin.Handoff()
 	}
 	pin.owner = scope.HandoffFor(payloadRepositories(view)...)
-	if pin.handoff == nil && pin.base == nil && pin.owner == nil {
+	// A join is all of the halves this request holds or it is a refusal. The
+	// three protect three different disappearances, so a pin carrying two of
+	// them is not two-thirds of a guarantee — it is a worker running unpinned
+	// against whichever payload the missing half covered, reported to the
+	// counters and to retainedLeaseNote as joined.
+	//
+	// It is reachable on the very race this handoff exists for. The middleware
+	// registers `defer scope.Release()` before `defer view.close()`, so defers
+	// run the other way round: a handler on its way out has already released
+	// the view's generation stack and its base pin while its repository
+	// admission is still held. The deadline firewall's retain() runs on the
+	// firewall goroutine and can land inside exactly that window, and before
+	// this it came back "joined" holding nothing but the owner — no
+	// generations, so retainedLeaseNote says "nothing retained" while
+	// views_handoff_total says the opposite.
+	//
+	// Only the halves the request actually holds are required: a view that
+	// materialized no stack asks for no stack handle, and a request with no
+	// base pin asks for no base handle. The owner half is asked of the scope
+	// itself rather than of the join's result, because HandoffFor comes back
+	// nil for two unlike reasons — the admission has drained (a refusal), and
+	// the stack's repository is simply not in the admitted set or has no
+	// registered owner at all (a no-op, exactly as BasePin.Handoff documents
+	// one level down). Holders() separates them, and it is read only when the
+	// join produced nothing, so a scope released concurrently with a
+	// SUCCESSFUL join is not retroactively turned into a refusal.
+	//
+	// Which clause fires first is an accident of the unwind order, not part of
+	// the rule. Today the middleware's LIFO defers always drop the generation
+	// stack and the base pin before the repository admission, so a shipped call
+	// site reaches the STACK clause; the base-pin and owner clauses hold the
+	// same rule for the windows that order does not produce, and a
+	// re-registration of those defers must not be able to turn a half-joined
+	// pin back into a reported success. All three are pinned individually in
+	// view_lease_handoff_test.go, each by a window built at the half it names.
+	if (view.materialized != nil && pin.handoff == nil) ||
+		(view.basePin != nil && pin.base == nil) ||
+		(scope != nil && pin.owner == nil && scope.Holders() == 0) {
+		// Release whatever did join: nothing was handed to the caller, and the
+		// pin never reached the outstanding gauge, so it cannot be released
+		// through pin.release().
+		pin.handoff.Close()
+		pin.base.Release()
+		pin.owner.Release()
 		viewmetrics.Count(viewmetrics.HandoffTotal, consumer, viewmetrics.HandoffRefused)
 		return nil
 	}
+	// The pre-item "all three came back nil" refusal used to stand here. It is
+	// now unreachable and was removed rather than left as reassurance: the
+	// entry guard above has already established that materialized or basePin is
+	// non-nil, and the disjunction refuses whenever the held half's handle came
+	// back nil — so any path that reaches this line holds at least one joined
+	// handle by construction.
 	viewmetrics.Count(viewmetrics.HandoffTotal, consumer, viewmetrics.HandoffJoined)
 	viewmetrics.AddGauge(viewmetrics.HandoffsOutstanding, 1, consumer)
 	return pin

@@ -926,3 +926,108 @@ func TestRouteDriftDemotesPastTheAnnotationDedupe(t *testing.T) {
 		t.Errorf("fallback_reason = %q, want %q", view.rider.FallbackReason, routeMovedFallbackReason)
 	}
 }
+
+// --------------------------------------------- W5.7c: require_exact ---
+
+// W5.7c. require_exact refuses ANY non-exact answer — including one selection
+// served exactly that stopped being exact while the handler assembled it.
+//
+// The middleware's require_exact gate runs BEFORE the handler, so it sees only
+// the substitutions selection made. Route drift is discovered later, by the
+// lanes that read (view_files.go refViewFilesFor, view_search_text.go
+// searchTextInView), and W5.7b made it demote the rider — which meant a
+// require_exact caller was handed exact:false with fallback_reason
+// "route_moved" on a response it had explicitly asked never to receive. A
+// fallback the caller must notice and a fallback the caller refused are not
+// the same outcome, and require_exact is the knob that says which one this is.
+func TestRequireExactRefusesAnAnswerReadAcrossARouteMove(t *testing.T) {
+	stack := newViewStack(t)
+	coherenceWrite(t, filepath.Join(stack.worktreeRoot, "keep.go"),
+		"package repo\n\n// selected-worktree-bytes\nfunc Keeper() {}\n")
+	catalog := stack.store.Catalog()
+
+	read := func(t *testing.T, requireExact, moveTheRoute bool) *mcplib.CallToolResult {
+		t.Helper()
+		args := map[string]any{
+			"path": "repo/keep.go",
+			"view": map[string]any{"kind": "worktree", "checkout_id": viewTestWorktree},
+		}
+		if requireExact {
+			args[requireExactArgName] = true
+		}
+		res, err := stack.callWithView(t, stack.repoRoot, "read_file", args,
+			func(ctx context.Context) (*mcplib.CallToolResult, error) {
+				view := requestViewFromContext(ctx)
+				if view == nil || view.materialized == nil {
+					t.Error("the middleware bound no materialized view to the request")
+					return mcplib.NewToolResultText(`{}`), nil
+				}
+				if !view.rider.Exact {
+					t.Errorf("the middleware's own selection was not exact: %q", view.rider.FallbackReason)
+					return mcplib.NewToolResultText(`{}`), nil
+				}
+				if moveTheRoute {
+					if err := catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
+						CheckoutID:         viewTestWorktree,
+						Slot:               store_sqlite.RouteSlotDirty,
+						GenerationID:       stack.dirty,
+						State:              store_sqlite.RouteActive,
+						ExpectedRouteEpoch: view.materialized.CheckoutRouteEpoch,
+					}); err != nil {
+						t.Errorf("move the route under the request: %v", err)
+						return mcplib.NewToolResultText(`{}`), nil
+					}
+				}
+				req := mcplib.CallToolRequest{}
+				req.Params.Name = "read_file"
+				req.Params.Arguments = map[string]any{"path": "repo/keep.go"}
+				return stack.srv.handleReadFile(ctx, req)
+			})
+		if err != nil {
+			t.Fatalf("read_file through the selected worktree: %v", err)
+		}
+		return res
+	}
+
+	t.Run("require_exact answers a coherent read", func(t *testing.T) {
+		res := read(t, true, false)
+		if res.IsError {
+			t.Fatalf("require_exact refused an answer that stayed exact: %s", viewResultText(t, res))
+		}
+		if rider := metaFreshness(t, res); rider == nil || rider["exact"] != true {
+			t.Errorf("a coherent routed answer was demoted: %v", rider)
+		}
+	})
+
+	t.Run("without require_exact the same drift still answers", func(t *testing.T) {
+		res := read(t, false, true)
+		if res.IsError {
+			t.Fatalf("a drifted read without require_exact must still answer: %s", viewResultText(t, res))
+		}
+		rider := metaFreshness(t, res)
+		if rider == nil || rider["exact"] != false {
+			t.Errorf("a drifted answer still claims exactness: %v", rider)
+		}
+		if rider["fallback_reason"] != routeMovedFallbackReason {
+			t.Errorf("fallback_reason = %v, want %q", rider["fallback_reason"], routeMovedFallbackReason)
+		}
+	})
+
+	t.Run("require_exact refuses the drifted read", func(t *testing.T) {
+		res := read(t, true, true)
+		if !res.IsError {
+			t.Fatalf("require_exact answered a read taken across a route move: %s", viewResultText(t, res))
+		}
+		text := viewResultText(t, res)
+		for _, want := range []string{
+			graphview.CodeViewBuilding,
+			routeMovedFallbackReason,
+			"require_exact",
+			"no fallback was served",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the refusal does not name %q: %s", want, text)
+			}
+		}
+	})
+}

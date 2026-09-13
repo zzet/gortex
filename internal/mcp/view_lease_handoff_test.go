@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -466,4 +467,372 @@ func retainedGenerationsNamed(t *testing.T, message string) map[int64]bool {
 		out[id] = true
 	}
 	return out
+}
+
+// ------------------------------------------------ W5.7c: never partial ---
+
+// TestADrainedStackIsRefusedWhileTheRepositoryScopeStillHolds pins the
+// never-partial rule at the level the aggregation happens.
+//
+// The three holds a handoff joins protect three different disappearances, so
+// "two of three joined" is not a weaker guarantee — it is a worker running
+// unpinned against whichever payload the missing hold covered, reported to the
+// counters as joined. Before this, handoffRequest only refused when ALL THREE
+// came back nil, so the one window the refusal exists for was reported as a
+// success: the middleware registers `defer scope.Release()` before
+// `defer view.close()`, defers run LIFO, and a handler on its way out has
+// therefore already dropped its generation stack and its base pin while its
+// repository admission is still held. The deadline firewall's retain() runs on
+// its own goroutine and lands inside exactly that window.
+//
+// The symptom is not a nil-deref — the owner hold is real — it is a lie:
+// views_handoff_total{outcome=joined} fires, views_handoffs_outstanding carries
+// a pin that pins no generation, and retainedLeaseNote reports "nothing
+// retained" for the same pin at the same time.
+func TestADrainedStackIsRefusedWhileTheRepositoryScopeStillHolds(t *testing.T) {
+	viewmetrics.Reset()
+	stack := newViewStack(t)
+	// The deadline firewall's retained-view slot only exists when the call is
+	// bounded, and the slot is the production entrypoint under test.
+	stack.srv.ToolCallTimeout = 30 * time.Second
+	// A registered owner is what makes the owner half joinable at all; without
+	// one the middleware acquires no scope and the window cannot be built.
+	owner := registerViewStackOwner(t, stack)
+
+	var (
+		pin            *requestViewPin
+		stackWasLeased bool
+		scopeStillHeld bool
+		reachedRetain  bool
+	)
+	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil,
+		func(hctx context.Context) (*mcplib.CallToolResult, error) {
+			view := requestViewFromContext(hctx)
+			if view == nil || view.materialized == nil {
+				t.Error("the middleware bound no materialized view to the request")
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			}
+			stackWasLeased = true
+			// The LIFO window, built exactly as the middleware unwinds it: the
+			// view's own close has run, the repository admission has not been
+			// released.
+			view.close()
+			scope := requestRepositoryScopeFromContext(hctx)
+			scopeStillHeld = scope != nil && scope.Holders() > 0
+
+			// The production entrypoint: the firewall's own retain(), reached
+			// through the slot the middleware published the view into.
+			if note := retainedViewNoteFrom(hctx); note != nil {
+				reachedRetain = true
+				pin = note.retain()
+			} else {
+				pin = handoffRequestView(hctx, viewmetrics.HandoffAbandonedHandler)
+			}
+			return mcplib.NewToolResultText(`{"ok":true}`), nil
+		}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !stackWasLeased {
+		t.Fatal("the request materialized no generation stack, so nothing could drain")
+	}
+	if !scopeStillHeld {
+		t.Fatal("the request held no live repository admission, so the partial window was never built")
+	}
+	if !reachedRetain {
+		t.Fatal("the deadline firewall published no retained-view slot: the production entrypoint was not reached")
+	}
+	if pin != nil {
+		t.Fatalf("a drained generation stack was handed off as joined: generations=%v, retained note=%q",
+			pin.generations(), retainedLeaseNote(pin))
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffRefused); got != 1 {
+		t.Errorf("refused handoffs = %d, want 1", got)
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffJoined); got != 0 {
+		t.Errorf("joined handoffs = %d, want 0: a partial join is a refusal", got)
+	}
+	assertOutstandingHandoffs(t, viewmetrics.HandoffAbandonedHandler, 0)
+
+	// The halves that DID join are released by the refusal, not leaked: the
+	// pin never reached the outstanding gauge, so nothing else would ever drop
+	// them. Two observables, one per half.
+	stack.dropRoute(t)
+	if err := stack.retireDirty(t); err != nil {
+		t.Fatalf("retire after a refused handoff: %v", err)
+	}
+	// The owner half is the one that DID join in this window, so it is the one
+	// a refusal that forgets to release would strand: the repository would
+	// never drain and its physical purge would never run.
+	drain, err := stack.leases.CloseRepositoryAdmission(owner)
+	if err != nil {
+		t.Fatalf("CloseRepositoryAdmission: %v", err)
+	}
+	assertDrains(t, drain, "a refused handoff released the owner hold it had taken")
+}
+
+// The other direction, so the rule above cannot be satisfied by refusing
+// everything: a request whose holds are all live still joins, and the pin it
+// hands out keeps the generations pinned.
+func TestALiveRequestStillJoinsEveryHoldItHolds(t *testing.T) {
+	viewmetrics.Reset()
+	stack := newViewStack(t)
+	stack.srv.ToolCallTimeout = 30 * time.Second
+	if err := stack.leases.RegisterRepositoryOwner(viewTestOwner()); err != nil {
+		t.Fatalf("RegisterRepositoryOwner: %v", err)
+	}
+
+	var pin *requestViewPin
+	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil,
+		func(hctx context.Context) (*mcplib.CallToolResult, error) {
+			note := retainedViewNoteFrom(hctx)
+			if note == nil {
+				t.Error("the deadline firewall published no retained-view slot")
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			}
+			pin = note.retain()
+			return mcplib.NewToolResultText(`{"ok":true}`), nil
+		}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if pin == nil {
+		t.Fatal("a live request refused to hand off what it holds")
+	}
+	if len(pin.generations()) == 0 {
+		t.Fatal("the joined pin names no generation")
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffJoined); got != 1 {
+		t.Errorf("joined handoffs = %d, want 1", got)
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffRefused); got != 0 {
+		t.Errorf("refused handoffs = %d, want 0", got)
+	}
+	stack.dropRoute(t)
+	if err := stack.retireDirty(t); !errors.Is(err, store_sqlite.ErrPayloadGenerationInUse) {
+		t.Fatalf("retire while the joined pin is outstanding = %v, want %v",
+			err, store_sqlite.ErrPayloadGenerationInUse)
+	}
+	pin.release()
+	assertOutstandingHandoffs(t, viewmetrics.HandoffAbandonedHandler, 0)
+	if err := stack.retireDirty(t); err != nil {
+		t.Fatalf("retire after the pin was released: %v", err)
+	}
+}
+
+// TestADrainedRepositoryScopeIsRefusedWhileTheViewStillHolds pins the OWNER
+// clause of the never-partial rule, on its own.
+//
+// The rule has three clauses because the pin has three halves, and each one
+// covers a different way the payload a detached worker keeps reading can
+// disappear underneath it. Which clause fires first is an accident of the
+// unwind order: the middleware registers `defer scope.Release()` before
+// `defer view.close()`, so a shipped call site on its way out always drops the
+// generation stack and the base pin first and reaches the STACK clause
+// (TestADrainedStackIsRefusedWhileTheRepositoryScopeStillHolds). That means
+// the stack clause alone would keep the whole package green while the other
+// two were deleted — the rule would be pinned by its accident rather than by
+// itself.
+//
+// This builds the opposite window at the half it names: the repository
+// admission has drained while the view it was taken for is untouched, so the
+// generation half and the base half both join and only the owner half is gone.
+// Under the pre-item behaviour, and under any edit that drops this clause, the
+// pin comes back JOINED carrying a repository lifetime that has already
+// expired: the owner can finalize and physically purge the repository's rows
+// while views_handoff_total says a worker is holding them.
+//
+// It also covers the two releases the stack-clause window cannot reach. In
+// THAT window pin.handoff and pin.base are already nil, so only
+// pin.owner.Release() runs; here both are live handles the refusal has to give
+// back, because nothing was handed to the caller and the pin never reached the
+// outstanding gauge, so pin.release() will never run for them.
+func TestADrainedRepositoryScopeIsRefusedWhileTheViewStillHolds(t *testing.T) {
+	viewmetrics.Reset()
+	stack := newViewStack(t)
+	// The firewall's retained-view slot only exists on a bounded call, and the
+	// slot is the production entrypoint under test.
+	stack.srv.ToolCallTimeout = 30 * time.Second
+	// A registered owner is what makes both the serving admission and the base
+	// pin's own owner half real; without one there is no owner hold to drain.
+	registerViewStackOwner(t, stack)
+
+	var (
+		pin           *requestViewPin
+		heldStack     bool
+		heldBase      bool
+		scopeDrained  bool
+		reachedRetain bool
+	)
+	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil,
+		func(hctx context.Context) (*mcplib.CallToolResult, error) {
+			view := requestViewFromContext(hctx)
+			if view == nil || view.materialized == nil || view.basePin == nil {
+				t.Error("the middleware bound no routed view carrying both a stack and a base pin")
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			}
+			heldStack = view.materialized != nil
+			heldBase = stack.leases.InUse(graphview.BaseCorpusGeneration)
+			// The window: the admission drains, the view does not. Released
+			// through the lease's own public Release — the very call the
+			// middleware's deferred release makes, and idempotent, so that
+			// defer becomes a no-op rather than a double drop.
+			scope := requestRepositoryScopeFromContext(hctx)
+			if scope == nil {
+				t.Error("the middleware acquired no repository admission")
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			}
+			scope.Release()
+			scopeDrained = scope.Holders() == 0
+
+			note := retainedViewNoteFrom(hctx)
+			if note == nil {
+				t.Error("the deadline firewall published no retained-view slot")
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			}
+			reachedRetain = true
+			pin = note.retain()
+			return mcplib.NewToolResultText(`{"ok":true}`), nil
+		}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !heldStack {
+		t.Fatal("the request materialized no generation stack")
+	}
+	if !heldBase {
+		t.Fatal("the request pinned no base corpus, so the base half could not join")
+	}
+	if !scopeDrained {
+		t.Fatal("the repository admission still had holders: the owner-drained window was never built")
+	}
+	if !reachedRetain {
+		t.Fatal("the deadline firewall's retain() was not reached: the production entrypoint was skipped")
+	}
+	if pin != nil {
+		t.Fatalf("a drained repository admission was handed off as joined: generations=%v, owner pinned=%v",
+			pin.generations(), pin.owner != nil)
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffRefused); got != 1 {
+		t.Errorf("refused handoffs = %d, want 1", got)
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffJoined); got != 0 {
+		t.Errorf("joined handoffs = %d, want 0: a partial join is a refusal", got)
+	}
+	assertOutstandingHandoffs(t, viewmetrics.HandoffAbandonedHandler, 0)
+
+	// The two halves that DID join are given back by the refusal. One
+	// observable each, so a mutation that drops either release is red on its
+	// own line.
+	if stack.leases.InUse(graphview.BaseCorpusGeneration) {
+		t.Error("the refused handoff kept the base corpus generation pinned: pin.base was never released")
+	}
+	stack.dropRoute(t)
+	if err := stack.retireDirty(t); err != nil {
+		t.Errorf("retire after a refused handoff: %v (the refusal stranded pin.handoff)", err)
+	}
+}
+
+// TestADrainedBaseCorpusPinIsRefusedWhileTheStackStillHolds pins the BASE
+// clause on its own, for the same reason the owner clause is pinned above: the
+// shipped unwind order reaches the stack clause first, so nothing else in the
+// package can tell whether this one exists.
+//
+// The window is the base corpus half released while the derived stack and the
+// repository admission are both untouched. A pin handed out here would carry
+// the generations and the owner but nothing over generation zero — the one
+// layer under every composed reader — so the worker would read a corpus that
+// may be retired or rewritten under it while the counters call it joined.
+//
+// It is also the window where the OWNER half is a live handle the refusal has
+// to give back: the serving admission joined, and if the refusal keeps it the
+// repository never drains and its physical purge never runs.
+func TestADrainedBaseCorpusPinIsRefusedWhileTheStackStillHolds(t *testing.T) {
+	viewmetrics.Reset()
+	stack := newViewStack(t)
+	stack.srv.ToolCallTimeout = 30 * time.Second
+	owner := registerViewStackOwner(t, stack)
+
+	var (
+		pin            *requestViewPin
+		heldStack      bool
+		baseDrained    bool
+		scopeStillHeld bool
+		reachedRetain  bool
+	)
+	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil,
+		func(hctx context.Context) (*mcplib.CallToolResult, error) {
+			view := requestViewFromContext(hctx)
+			if view == nil || view.materialized == nil || view.basePin == nil {
+				t.Error("the middleware bound no routed view carrying both a stack and a base pin")
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			}
+			heldStack = stack.leases.InUse(stack.dirty)
+			// The window: generation zero's pin is released — through BasePin's
+			// own public Release, the call view.close() makes and idempotent
+			// for the same reason — while the derived stack above it and the
+			// repository admission beside it stay held.
+			view.basePin.Release()
+			// Probed through BasePin.Handoff itself rather than through the
+			// generation manager: the materialized stack leases generation zero
+			// too, so InUse(BaseCorpusGeneration) stays true here and would not
+			// witness this half at all. Handoff on a released pin returns nil
+			// without joining anything, which is exactly the half the clause
+			// under test asks about.
+			baseDrained = view.basePin.Handoff() == nil
+			scope := requestRepositoryScopeFromContext(hctx)
+			scopeStillHeld = scope != nil && scope.Holders() > 0
+
+			note := retainedViewNoteFrom(hctx)
+			if note == nil {
+				t.Error("the deadline firewall published no retained-view slot")
+				return mcplib.NewToolResultText(`{"ok":true}`), nil
+			}
+			reachedRetain = true
+			pin = note.retain()
+			return mcplib.NewToolResultText(`{"ok":true}`), nil
+		}); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !heldStack {
+		t.Fatal("the request's derived generation stack was not leased, so the stack half could not join")
+	}
+	if !baseDrained {
+		t.Fatal("the base corpus pin survived its release: the base-drained window was never built")
+	}
+	if !scopeStillHeld {
+		t.Fatal("the repository admission had already drained: this is the owner window, not the base one")
+	}
+	if !reachedRetain {
+		t.Fatal("the deadline firewall's retain() was not reached: the production entrypoint was skipped")
+	}
+	if pin != nil {
+		t.Fatalf("a drained base corpus pin was handed off as joined: generations=%v", pin.generations())
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffRefused); got != 1 {
+		t.Errorf("refused handoffs = %d, want 1", got)
+	}
+	if got := handoffCounter(t, viewmetrics.HandoffTotal,
+		viewmetrics.HandoffAbandonedHandler, viewmetrics.HandoffJoined); got != 0 {
+		t.Errorf("joined handoffs = %d, want 0: a partial join is a refusal", got)
+	}
+	assertOutstandingHandoffs(t, viewmetrics.HandoffAbandonedHandler, 0)
+
+	// The stack half is given back: retirement is not blocked by a pin nobody
+	// holds.
+	stack.dropRoute(t)
+	if err := stack.retireDirty(t); err != nil {
+		t.Errorf("retire after a refused handoff: %v (the refusal stranded pin.handoff)", err)
+	}
+	// The owner half is given back: the repository drains behind the refusal
+	// rather than waiting on a handle no caller ever received.
+	drain, err := stack.leases.CloseRepositoryAdmission(owner)
+	if err != nil {
+		t.Fatalf("CloseRepositoryAdmission: %v", err)
+	}
+	assertDrains(t, drain, "a refused handoff released the owner hold it had taken")
 }
