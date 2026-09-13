@@ -566,3 +566,100 @@ func TestDedicatedBaseCurrentPhysicalFailurePreservesActiveAndCharacterizesRetry
 		t.Fatal("successful retry omitted the committed changed source")
 	}
 }
+
+// TestDedicatedDeltaBuildTakesItsFactHintsFromTheWholeAncestry is W6.10 at the
+// third production site: the committed base's own advance.
+//
+// buildObservedClaim hands the delta build the reader for the parent
+// generation it is stacking on. Scoped to that ONE generation the base answers
+// the closure's durable-hint question from one layer of a stack the structural
+// reads compose in full — and since no sparse generation writes reference
+// facts (ancestryRefFacts documents the census), from a layer that holds none.
+// The closure then adds nothing for the hint and a file the changed one
+// references is left out of the generation: a NARROWER affected set, which is
+// the one direction the closure is not allowed to be wrong in. It is the same
+// blindness the coordinator's two sites had, in the file that advances the
+// base every dependent is a delta against.
+//
+// The hint is the only route from the changed file to base.go: the committed
+// file this advance adds references nothing, so the structural walk over its
+// edges reaches no other file.
+//
+// Revert-red: scope the base's facts back to
+// store.AtGeneration(claim.BaseGenerationID) and the published delta stops
+// claiming base.go.
+func TestDedicatedDeltaBuildTakesItsFactHintsFromTheWholeAncestry(t *testing.T) {
+	f := newDedicatedAdvanceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	initial := f.ensure(t, ctx)
+	if initial.Claim.BaseGenerationID != 0 {
+		t.Fatalf("the initial publication is not a full root: %+v", initial.Claim)
+	}
+	parent := initial.Claim.GenerationID
+	prefix := f.request.RepoPrefix
+	basePath := prefix + "/base.go"
+	advancePath := prefix + "/advance.go"
+
+	// The generation a single-handle scope would read holds no facts of its
+	// own, which is the blindness this pins.
+	parentFacts, err := f.builder.Store.AtGeneration(parent).LoadRefFactsByFiles(prefix, nil)
+	if err != nil {
+		t.Fatalf("read generation %d's facts: %v", parent, err)
+	}
+	if len(parentFacts) != 0 {
+		t.Fatalf("generation %d holds %d facts of its own; the single-handle scope is no longer blind and this test needs rewriting",
+			parent, len(parentFacts))
+	}
+
+	// The hint's target has to be a node the composed base can resolve to a
+	// file, so it is read out of the parent rather than spelled by hand.
+	var target string
+	for _, node := range f.view(t, ctx, parent).Reader.GetFileNodes(basePath) {
+		if node != nil && node.Name == "Committed" {
+			target = node.ID
+			break
+		}
+	}
+	if target == "" {
+		t.Fatalf("the committed base holds no Committed symbol in %s", basePath)
+	}
+
+	// A durable hint at generation zero, where every fact in the database is.
+	hint := graph.RefFact{
+		FromID: advancePath + "::AdvancementMarker", ToID: target,
+		Kind: "calls", RefName: "Committed", Line: 2, Origin: "ast_resolved", Tier: "resolved",
+		FilePath: advancePath, Lang: "go",
+	}
+	if err := f.builder.Store.AtGeneration(0).BulkSetRefFacts(prefix, []graph.RefFact{hint}); err != nil {
+		t.Fatalf("seed the corpus hint: %v", err)
+	}
+
+	// The advance itself: one committed file that references nothing.
+	f.commitFile(t, "package dedicated\n\nfunc AdvancementMarker() int { return 1 }\n")
+	delta := f.ensure(t, ctx)
+	if delta.Claim.BaseGenerationID != parent || delta.Report.Coalesced {
+		t.Fatalf("the advance did not build a sparse delta over %d: %+v", parent, delta.Claim)
+	}
+
+	claimed := map[string]bool{}
+	for _, path := range claimedPaths(t, f.builder.Store, delta.Claim.GenerationID) {
+		claimed[path] = true
+	}
+	if !claimed[advancePath] {
+		t.Fatalf("the delta does not claim the file the advance added (%s): %v", advancePath, claimed)
+	}
+	// The hint pulls base.go in as a file the pass had to READ to re-derive
+	// the changed one, which the ownership split records as read-only context
+	// rather than as a claim. Either way the closure reached it, and that is
+	// the question the scope of the fact hints decides.
+	reached := map[string]bool{}
+	for _, path := range closurePaths(t, f.builder.Store, delta.Claim.GenerationID) {
+		reached[path] = true
+	}
+	if !reached[basePath] {
+		t.Fatalf("the delta left %s out of its closure: the build read its fact hints from one generation, not from the ancestry (reached %v)",
+			basePath, reached)
+	}
+}

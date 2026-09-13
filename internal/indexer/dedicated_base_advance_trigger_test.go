@@ -111,14 +111,20 @@ func (f *advanceFixture) reconcileAndWait(t *testing.T) {
 // It replaces the trigger's old exported AdvanceRepo, which published
 // synchronously outside the shared queue and outside the memo pre-check. Going
 // through HeadChanged means a test asserts on the path the Git watcher actually
-// takes; the join is InitialBasePublisher.Wait, the publisher's own accounting.
+// takes.
+//
+// The join is the FIFO barrier, not InitialBasePublisher.Wait alone. Wait is
+// the publisher's own accounting — it returns when every queued publication has
+// been ATTEMPTED — and the trigger records the advance in a completion callback
+// the worker runs afterwards, so a test that read Advances() straight after
+// Wait was racing the callback it was there to observe. The barrier is a
+// request enqueued behind this one whose own callback cannot run until every
+// earlier request's has returned; see settlePublisher.
 func (f *advanceFixture) dispatchAndWait(t *testing.T, root, commitOID string) DedicatedBaseAdvance {
 	t.Helper()
 	before := len(f.trigger.Advances())
 	f.trigger.HeadChanged(f.prefix, root, commitOID)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	require.NoError(t, f.publisher.Wait(ctx))
+	f.settlePublisher(t)
 	advances := f.trigger.Advances()
 	require.Greater(t, len(advances), before,
 		"the production dispatch recorded no advance for %s", shortCommit(commitOID))

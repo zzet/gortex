@@ -303,6 +303,18 @@ type CheckoutCycle struct {
 	// CommitReused reports that the commit slot was pointed at a generation
 	// built by an earlier cycle — the branch-switch cache hit.
 	CommitReused bool
+	// DirtyReused reports that the working-tree slot was pointed at a
+	// generation built by an earlier cycle — undo/redo, and a working tree
+	// that came back to a state this coordinator has already indexed over the
+	// same commit layer.
+	DirtyReused bool
+	// Recomposed reports that the cycle rebuilt BOTH layers over a committed
+	// base that advanced under a checkout whose own tree did not move, and
+	// installed them in one route write. It is the difference between "the
+	// base moved, so the checkout's view was torn down and put back up" and
+	// "the base moved, so the checkout was recomposed over it" — the old pair
+	// keeps serving for the whole of the rebuild.
+	Recomposed bool
 	// Rescheduled reports that the cycle stopped short and signalled itself:
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
@@ -441,6 +453,13 @@ type CheckoutCoordinator struct {
 	refreshClosed    bool
 	// retained is the commit-layer reuse cache, most recently routed first.
 	retained []retainedCommitLayer
+	// retainedDirty is the working-tree-layer reuse cache, most recently
+	// routed first. It is what makes undo/redo cost nothing: the layer the
+	// route leaves is kept instead of retired, and a working tree that comes
+	// back to a state this coordinator has already indexed — over the same
+	// commit layer, under the same configuration and cohort — is re-routed
+	// rather than re-indexed.
+	retainedDirty []retainedDirtyLayer
 	// backlog holds generations a retire refused. The janitor retries them.
 	backlog map[int64]struct{}
 	// routedDirty is the working-tree generation the route names. The reuse
@@ -499,6 +518,20 @@ func (c *CheckoutCoordinator) PrioritizeSelection() {
 // retainedCommitLayer is one commit generation kept for re-routing, keyed by
 // the build identity that produced it.
 type retainedCommitLayer struct {
+	key          string
+	generationID int64
+}
+
+// retainedDirtyLayer is one working-tree generation kept for re-routing, keyed
+// by the build identity that produced it.
+//
+// It is a separate list from the commit one rather than a shared cache with a
+// kind column: the two are evicted against each other only by accident, and a
+// branch switch that fills the commit cache must not evict the working-tree
+// layer the checkout is about to come back to. The bound is the same, and for
+// the same reason — a retained layer costs the storage of one difference from
+// the layer below it.
+type retainedDirtyLayer struct {
 	key          string
 	generationID int64
 }
@@ -893,12 +926,20 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		c.logger.Warn("checkout coordinator: reconcile failed",
 			zap.String("checkout", c.checkoutID), zap.String("root", c.root),
 			zap.String("reason", reason), zap.Error(out.Err))
-	case out.CommitBuilt || out.DirtyBuilt || out.CommitReused:
+	case out.CommitBuilt || out.DirtyBuilt || out.CommitReused || out.DirtyReused || out.Recomposed:
+		// Every arm that moved the route logs, reuse included. A cycle that
+		// adopted a retained working-tree layer has no outcome label of its
+		// own in the shipped metric vocabulary (recordCoordinatorCycle says
+		// why), so this line is the only place it is visible at all — leaving
+		// it out would make the cheapest cycle the coordinator has the one
+		// that reports nothing anywhere.
 		c.logger.Debug("checkout coordinator: route updated",
 			zap.String("checkout", c.checkoutID), zap.String("reason", reason),
 			zap.Int64("commit_generation", out.CommitGenerationID),
 			zap.Int64("dirty_generation", out.DirtyGenerationID),
-			zap.Bool("commit_reused", out.CommitReused))
+			zap.Bool("commit_reused", out.CommitReused),
+			zap.Bool("dirty_reused", out.DirtyReused),
+			zap.Bool("recomposed", out.Recomposed))
 	}
 	c.reportCheckoutCycle(ctx, through, out)
 }
@@ -933,6 +974,24 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 		route.GraphID != base.graphID || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
 		return out, false
 	}
+	// The routed commit layer has to re-key against the base the family is on
+	// NOW, and deliberately so: a slot whose parent is no longer the active
+	// base is not "settled" HERE, whatever else may be true of it.
+	//
+	// Where the primary publishes no generation, commitIdentity stamps
+	// BaseGenerationID 0 and the layer composes over the shared indexed corpus,
+	// which is rewritten in place as the primary moves — accepting the slot
+	// then serves a delta over a base that has been replaced underneath it.
+	// Where the primary does publish one the old pair is still coherent, since
+	// the materializer walks the routed generation's own immutable ancestry;
+	// but accepting it in this one predicate, with no retention or staleness
+	// policy and no matching arm in reconcileCommitSlot, would freeze the
+	// dependent on that base for as long as nothing else about the checkout
+	// moves, with nothing left that ever refreshes it. Pinning it properly is
+	// W4.8; it is not implemented, and half of it here would be worse than
+	// neither half. Until then a base advance goes to recomposeOverAdvancedBase,
+	// which is bounded, not a settlement. recomposeOverAdvancedBase's doc has
+	// the full two-regime argument.
 	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
 	if err != nil || !found || !servableGeneration(commit.State) ||
 		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, sample.HeadTree)) {
@@ -980,7 +1039,14 @@ func recordCoordinatorCycle(out CheckoutCycle) {
 		// without this arm the third one falls through to "skipped", which is
 		// the label for a cycle that found nothing to do.
 		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeDeferred)
-	case out.CommitBuilt || out.CommitReused || out.DirtyBuilt:
+	case out.CommitBuilt || out.CommitReused || out.DirtyBuilt || out.DirtyReused:
+		// A cycle that adopted a retained working-tree layer did something —
+		// it re-routed the checkout — so it is not the "found nothing to do"
+		// case, and it must not be counted as one. It has no label of its own
+		// in the shipped outcome vocabulary, which is not this file's to
+		// widen, so like the rescheduled arm it is deliberately silent here.
+		// What the measurement reads is built_dirty NOT rising: an undo that
+		// reuses is an undo that did not index.
 		if out.CommitBuilt {
 			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeBuiltCommit)
 		}
@@ -1042,6 +1108,22 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		return out
 	}
 
+	// A committed base that advanced under a checkout whose own tree did not
+	// move is recomposed, not torn down: both layers are rebuilt off-route and
+	// installed in one write, so the pair the checkout already serves stays
+	// coherent and routed for the whole of the rebuild.
+	if handled, err := c.recomposeOverAdvancedBase(ctx, base, head, &route, &out); handled || err != nil {
+		if err != nil {
+			if errors.Is(err, errRouteMoved) {
+				out.Rescheduled = true
+				c.rescheduleOnLostRoute("route moved under the recomposition")
+				return out
+			}
+			out.Err = err
+		}
+		return out
+	}
+
 	commitGeneration, err := c.reconcileCommitSlot(ctx, base, head.HeadTree, &route, &out)
 	if err != nil {
 		if errors.Is(err, errRouteMoved) {
@@ -1068,6 +1150,273 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		out.Err = err
 	}
 	return out
+}
+
+// recomposeOverAdvancedBase rebuilds a dependent checkout's whole stack over a
+// committed base that advanced under it, and installs it in one route write.
+//
+// It is the difference gate 5 asks for between rebuilding and recomposing. The
+// ordinary path settles the commit slot first, and moveCommitSlot clears the
+// working-tree slot in the same compare-and-set, because a working-tree layer
+// over a DIFFERENT commit layer is a state the checkout was never in. That is
+// the right answer when the checkout itself moved: the pair it was serving no
+// longer describes anything. It is the wrong answer when the checkout did not
+// move at all and only the family's base advanced underneath it — the pair it
+// is serving is still exactly this checkout's tree, composed over an immutable
+// ancestor that is pinned for as long as a reader names it, and taking it away
+// for the length of a rebuild costs the checkout its uncommitted edits for no
+// coherence that was at risk.
+//
+// So the two layers are built off-route and installed together. Until that
+// write lands the route names the old pair — old base, old delta, old
+// working-tree layer — which composes to this checkout's tree exactly as it
+// did before the base moved. After it lands the route names the new pair. No
+// reader ever sees the new base under the old delta, which is what the splice
+// prohibition means, and the materializer could not compose one anyway: it
+// walks the routed generation's own immutable BaseGenerationID ancestry
+// (materialize.go pinCheckoutRoute -> generationAncestry), never the primary
+// graph's current active pointer.
+//
+// The new delta is a bounded one. resolveCommitLayer reaches BuildCommitLayer,
+// whose change set is `git diff-tree newBase..thisTree` (builder_commit.go
+// diffTreeChanges) — the difference between the two committed trees, not a
+// fresh index of the checkout.
+//
+// BOUNDED RECOMPOSITION IS WHAT GATE 5'S "while reusing valid payload" MEANS
+// HERE. Why a recomposition is taken at all is NOT the same answer in the two
+// regimes graphBase serves, and the difference is the whole of whether keeping
+// the dependent on the base it was built against is an unimplemented saving or
+// a bug. Stating it unconditionally either way is wrong, so:
+//
+// A dependent's commit layer IS a diff-tree against its base — the base tree
+// is the left-hand side of the diff and is stamped on the generation as its
+// lower_view_fingerprint (commitIdentity) — so the same payload over a
+// DIFFERENT base is not a valid delta and there is no key under which it would
+// be. What the two regimes disagree about is whether the base underneath a
+// routed delta can change at all.
+//
+//   - The primary graph HAS published a generation (graphBase's first arm,
+//     ActiveGenerationID > 0). commitIdentity stamps BaseGenerationID = that
+//     generation; the generation is immutable; retirement refuses one anything
+//     still names (ErrCatalogGenerationReferenced); and the materializer
+//     composes the ancestry the ROUTED generation itself names, walking its own
+//     BaseGenerationID chain rather than the family's current pointer
+//     (graphview generationAncestry). So B1 + D1 is still exactly this
+//     checkout's tree after the family moves to B2, and an un-recomposed
+//     dependent is NOT serving stale content. Recomposing here buys currency
+//     and availability, not correctness. Pinning the dependent on B1 until its
+//     own tree moves is therefore a real saving and it is NOT implemented:
+//     that is W4.8, and nothing below closes it. Do not read this path as
+//     "W4.8 is done".
+//
+//   - The primary graph has NOT published one (graphBase's second arm: the
+//     base is the owner checkout's recorded committed tree). commitIdentity
+//     stamps BaseGenerationID = 0, so the delta names no immutable ancestor at
+//     all — generationAncestry's walk terminates at zero rather than including
+//     it, and what the layer composes over is the shared indexed corpus, which
+//     carries no version identity and is re-indexed in place as the primary
+//     moves. baseMovedUnderCycle exists for exactly this and says so: the base
+//     "moves without any pointer moving with it". Here the old delta really
+//     does go stale at the paths the two bases differ by, because the layer
+//     beneath it was rewritten under it, and recomposition is the correctness
+//     requirement — the same hazard the pre-build guard at reconcileCommitSlot
+//     refuses.
+//
+// settledWithoutBuild must not be taught to accept a slot whose parent is no
+// longer the family's active base as a shortcut to the first bullet's saving.
+// In the second regime that parent is not immutable and the slot is simply
+// wrong. In the first it needs a retention policy that keeps the pinned base
+// servable, a bounded staleness policy, and the matching arm in
+// reconcileCommitSlot, or the dependent freezes on a base nothing ever
+// refreshes. W4.8 is that work, and it is a separate change.
+//
+// So the reuse this path delivers is three narrower guarantees, each of them
+// observable:
+//
+//   - the old stack keeps serving until the new one is installed, in ONE
+//     compare-and-set (installStack). This is what the ordinary slot-by-slot
+//     path cannot offer: moveCommitSlot flips the commit slot with
+//     DirtyGenerationID 0 and State RoutePending, so a dependent taking a base
+//     advance through it serves a commit-only, pending route for the whole
+//     duration of the working-tree rebuild;
+//   - the rebuild never widens beyond the dependent's OWN change sets — the
+//     commit layer is the two trees' diff, the working-tree layer is the
+//     checkout's own dirty set — so a base advance costs each dependent one
+//     bounded delta plus one working-tree layer, never an index of its tree;
+//   - a dependent whose own tree did not move at all still gets that bounded
+//     rebuild rather than a full one.
+//
+// TestBaseAdvanceRecomposesTwoDependentsOnceEachWithABoundedDelta measures all
+// three: two dependents, one advance, exactly two commit-delta builds and two
+// working-tree builds, each claiming exactly the paths its own change set
+// names.
+//
+// It handles the base-advance case ONLY, and says so by returning false for
+// everything else: a checkout that also moved its own HEAD, a route that is
+// not serving a complete pair, or an identity that differs by anything other
+// than the base it names. Those go to the ordinary slot-by-slot path, which
+// already does the right thing for them.
+func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
+	ctx context.Context,
+	base primaryBase,
+	head gitstate.DirtySnapshot,
+	route *store_sqlite.CheckoutRoute,
+	out *CheckoutCycle,
+) (bool, error) {
+	commitRow, dirtyRow, ok, err := c.recomposableStack(ctx, base, head, *route)
+	if err != nil || !ok {
+		return false, err
+	}
+
+	previousCommit, previousDirty := commitRow.GenerationID, dirtyRow.GenerationID
+	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, head.HeadTree)
+	if err != nil {
+		return true, err
+	}
+	// The checkout is free to commit while the delta over the new base is
+	// being built. A working-tree layer built afterwards describes the tree of
+	// a HEAD the layer beneath knows nothing about, so the cycle stops and the
+	// next one rebuilds for the head the checkout is really at — the same
+	// guard, and the same counter, reconcileDirtySlot makes for itself.
+	sample, err := c.sampler.Sample(ctx)
+	if err != nil {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		return true, fmt.Errorf("indexer: sample %s: %w", c.root, err)
+	}
+	c.noteDirtyFingerprint(sample.Fingerprint)
+	if sample.HeadTree != head.HeadTree {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		out.Rescheduled = true
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeHeadMoved)
+		c.logger.Debug("checkout coordinator: the checkout committed under the recomposition",
+			zap.String("checkout", c.checkoutID),
+			zap.String("built_for", head.HeadTree), zap.String("now_at", sample.HeadTree))
+		c.Signal("the checkout moved to another commit under the cycle")
+		return true, nil
+	}
+
+	dirtyGeneration, dirtyKey, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	if err != nil {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		return true, err
+	}
+	if dirtyGeneration == 0 {
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		out.Rescheduled = true
+		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
+		c.Signal("the working tree moved under two builds")
+		return true, nil
+	}
+	// The base may have advanced again while this pair was being built.
+	// Installing now would route a delta over a base the family has already
+	// left, which is the splice this whole path exists to avoid.
+	moved, err := c.baseMovedUnderCycle(ctx, base)
+	if err != nil || moved {
+		c.abandonBuild(ctx, dirtyGeneration, true)
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		if err != nil {
+			return true, err
+		}
+		c.rescheduleOnMovedBase(base, out)
+		return true, nil
+	}
+
+	if err := c.installStack(ctx, *route, true, base.graphID, commitGeneration, dirtyGeneration); err != nil {
+		c.abandonBuild(ctx, dirtyGeneration, true)
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		return true, err
+	}
+	route.RouteEpoch++
+	route.State = store_sqlite.RouteActive
+	route.CommitGenerationID = commitGeneration
+	route.DirtyGenerationID = dirtyGeneration
+	c.rememberRoutedDirty(dirtyGeneration)
+
+	out.Recomposed = true
+	out.CommitGenerationID, out.DirtyGenerationID = commitGeneration, dirtyGeneration
+	out.CommitBuilt, out.CommitReused, out.DirtyBuilt = !reused, reused, true
+	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, head.HeadTree)), commitGeneration)
+	// The recomposed pair is filed in both reuse caches, and the pair it
+	// replaced is RELEASED into them rather than retired. The old
+	// working-tree layer names the old commit layer as its base, so it can
+	// only ever be re-routed over that same layer — but it is exactly what a
+	// checkout coming back to this base (a revert of the advance, a rehome
+	// that lands where it started) would otherwise re-index.
+	c.retainDirty(ctx, dirtyKey, dirtyGeneration)
+	c.releaseCommit(ctx, previousCommit)
+	c.releaseDirty(ctx, previousDirty)
+	return true, nil
+}
+
+// recomposableStack decides whether this cycle is looking at a checkout whose
+// own state did not move and whose base did.
+//
+// Every clause is a refusal to take the recomposition path for a case the
+// ordinary one owns. The route must name a complete, servable pair this
+// coordinator built; the commit layer must describe the tree the checkout is
+// at right now; the working-tree layer must sit on that commit layer and match
+// the fingerprint the cycle just sampled; and the commit layer's identity must
+// differ from the one a build would mint now in the base fields ALONE. That
+// last one is the whole test: rendering the current identity with the routed
+// row's base fields substituted and comparing it against the row's own key
+// says "nothing but the base moved" in terms of the same renderer the reuse
+// cache and the catalog compare, so a configuration change, a cohort change,
+// an extractor bump or a resolver bump all fall through to a rebuild.
+func (c *CheckoutCoordinator) recomposableStack(
+	ctx context.Context,
+	base primaryBase,
+	head gitstate.DirtySnapshot,
+	route store_sqlite.CheckoutRoute,
+) (commitRow, dirtyRow store_sqlite.ViewGeneration, ok bool, err error) {
+	if route.State != store_sqlite.RouteActive || route.GraphID != base.graphID ||
+		route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 ||
+		head.HeadTree == "" || head.Fingerprint == "" {
+		return commitRow, dirtyRow, false, nil
+	}
+	commitRow, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil {
+		return commitRow, dirtyRow, false, err
+	}
+	if !found || !servableGeneration(commitRow.State) ||
+		commitRow.OwnerKind != checkoutLayerOwnerKind ||
+		commitRow.GenerationKind != CommitLayerGenerationKind ||
+		commitRow.CheckoutID != c.checkoutID ||
+		commitRow.GraphID != base.graphID ||
+		// Defence in depth, and knowingly redundant: TreeOID is part of the
+		// commit identity, so the substituted-identity comparison below
+		// refuses a moved HEAD on its own (that is what the moved-HEAD case
+		// in TestRecompositionRefusesAnythingButABaseAdvance binds). It is
+		// kept because this clause is what makes the sentence "the commit
+		// layer must describe the tree the checkout is at right now" true by
+		// reading, and because it stays correct if the identity renderer ever
+		// stops carrying the tree.
+		commitRow.TreeOID != head.HeadTree {
+		return commitRow, dirtyRow, false, nil
+	}
+	current := c.commitIdentity(base, head.HeadTree)
+	routedKey := generationRowKey(commitRow)
+	if generationIdentityKey(current) == routedKey {
+		// Nothing moved at all. The ordinary path recognises this in one read
+		// and keeps the route exactly as it is.
+		return commitRow, dirtyRow, false, nil
+	}
+	pinned := current
+	pinned.BaseGenerationID = commitRow.BaseGenerationID
+	pinned.LowerViewFingerprint = commitRow.LowerViewFingerprint
+	if generationIdentityKey(pinned) != routedKey {
+		return commitRow, dirtyRow, false, nil
+	}
+	dirtyRow, found, err = c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+	if err != nil {
+		return commitRow, dirtyRow, false, err
+	}
+	if !found || !servableGeneration(dirtyRow.State) ||
+		dirtyRow.GenerationKind != DirtyLayerGenerationKind ||
+		dirtyRow.BaseGenerationID != commitRow.GenerationID ||
+		dirtyRow.LowerViewFingerprint != head.Fingerprint {
+		return commitRow, dirtyRow, false, nil
+	}
+	return commitRow, dirtyRow, true, nil
 }
 
 // rescheduleOnLostRoute records a compare-and-set this cycle lost and signals
@@ -1177,7 +1526,9 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	}
 	out.CommitGenerationID, out.CommitBuilt, out.CommitReused = commitGeneration, !reused, reused
 
-	dirtyGeneration, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	// The transition drops the whole working-tree cache below, sparing only
+	// the layer it routes, so the build's key is not filed here.
+	dirtyGeneration, _, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
 	if err != nil {
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return out, err
@@ -1202,6 +1553,11 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	// left, so none of it can ever be routed here again — except the layer
 	// this transition routed, which the cache may have supplied.
 	c.dropRetained(ctx, commitGeneration)
+	// The same is true of every retained working-tree layer, except the one
+	// this transition has just routed. It is not filed under a key here — the
+	// transition never sampled the tree itself, the builder did — so the first
+	// cycle after the transition retains it from the route.
+	c.dropRetainedDirty(ctx, dirtyGeneration)
 	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, head.TreeOID)), commitGeneration)
 	c.rememberRoutedDirty(dirtyGeneration)
 	if routed {
@@ -1377,6 +1733,10 @@ func (c *CheckoutCoordinator) ensureRoute(ctx context.Context, base primaryBase)
 	route.RouteEpoch++
 	route.State = store_sqlite.RoutePending
 	c.dropRetained(ctx, 0)
+	// The working-tree cache goes with it. Every layer it holds was built over
+	// a commit generation composed on the graph this checkout has just left, so
+	// none of them can ever be routed here again.
+	c.dropRetainedDirty(ctx, 0)
 	c.offerRetire(ctx, previousDirty)
 	c.offerRetire(ctx, previousCommit)
 	return route, nil
@@ -1507,9 +1867,12 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 			return 0, false, fmt.Errorf("indexer: open primary generation %d: %w", base.generationID, openErr)
 		}
 		defer view.Close()
-		// Closure reads need the complete committed ancestry. Ref-fact hints
-		// retain their existing corpus scope; they are not a flattened copy.
-		baseReader = commitLayerBase{Reader: view.Reader, corpus: c.store.AtGeneration(base.generationID)}
+		// Closure reads need the complete committed ancestry, and so do the
+		// ref-fact hints: they are scoped to the same materialized stack the
+		// structural reads compose rather than to the base generation alone,
+		// whose handle answers with that one generation's rows — none, for
+		// every generation a sparse build produces. See ancestryLayerBase.
+		baseReader = c.ancestryLayerBase(view)
 	}
 	generationID, report, err := c.builder.BuildCommitLayer(ctx, CommitLayerRequest{
 		Identity:      identity,
@@ -1576,7 +1939,12 @@ func (c *CheckoutCoordinator) moveCommitSlot(
 	route.CommitGenerationID = generationID
 	route.DirtyGenerationID = 0
 	c.rememberRoutedDirty(0)
-	c.offerRetire(ctx, dropped)
+	// Released rather than retired: the layer describes a working tree over
+	// the commit generation it names, and that pair is exactly what a switch
+	// back to this branch composes again. reconcileDirtySlot filed it in the
+	// reuse cache before this write; a layer the cache is not holding is
+	// retired here as it always was.
+	c.releaseDirty(ctx, dropped)
 	return nil
 }
 
@@ -1608,7 +1976,7 @@ func (c *CheckoutCoordinator) clearDirtySlot(ctx context.Context, route *store_s
 	route.State = store_sqlite.RoutePending
 	route.DirtyGenerationID = 0
 	c.rememberRoutedDirty(0)
-	c.offerRetire(ctx, dropped)
+	c.releaseDirty(ctx, dropped)
 	return nil
 }
 
@@ -1656,12 +2024,22 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		c.Signal("the checkout moved to another commit under the cycle")
 		return nil
 	}
+	key := c.dirtySampleKey(route.GraphID, commitGeneration, sample)
 	if route.DirtyGenerationID > 0 {
 		row, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
 		if err != nil {
 			return err
 		}
 		servable := found && servableGeneration(row.State)
+		if servable {
+			// Whatever the route already names is filed in the reuse cache
+			// before anything replaces it — including a layer a fresh
+			// coordinator inherited and has no other record of. Without this
+			// the undo that follows the next edit retires the very payload it
+			// is about to ask for, exactly as reconcileCommitSlot's
+			// route-preserving arm exists to stop on the commit half.
+			c.retainDirty(ctx, generationRowKey(row), row.GenerationID)
+		}
 		if servable && row.BaseGenerationID == commitGeneration {
 			// A layer over the routed commit generation describes a state the
 			// checkout really was in, so it keeps serving while the working
@@ -1676,7 +2054,25 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		}
 	}
 
-	generationID, err := c.buildDirtyLayerOver(ctx, route.GraphID, commitGeneration)
+	// The reuse path, and the whole of D14's in-process half: a working tree
+	// that has come back to a state this coordinator already described over
+	// this commit layer is re-routed rather than re-indexed. The route flip
+	// below is the only write it makes.
+	if cached, ok := c.cachedDirty(ctx, key); ok {
+		previous := route.DirtyGenerationID
+		if err := c.flip(ctx, route, store_sqlite.RouteSlotDirty, cached); err != nil {
+			// A cached generation is another cycle's work, not this one's, so
+			// a lost flip leaves it exactly as it was.
+			return err
+		}
+		out.DirtyReused = true
+		out.DirtyGenerationID = cached
+		c.retainDirty(ctx, key, cached)
+		c.releaseDirty(ctx, previous)
+		return nil
+	}
+
+	generationID, builtKey, err := c.buildDirtyLayerOver(ctx, route.GraphID, commitGeneration)
 	if err != nil {
 		return err
 	}
@@ -1696,8 +2092,42 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		return err
 	}
 	out.DirtyGenerationID = generationID
-	c.offerRetire(ctx, previous)
+	// The built layer is filed under the key the BUILD stamped rather than
+	// the one this cycle looked it up by, and the one the route leaves is
+	// released into the cache rather than retired: together they are what
+	// makes the NEXT undo free.
+	//
+	// The two keys are the same whenever the checkout held still, and when it
+	// did not the build's is the truthful one: the payload describes the tree
+	// the builder sampled, so that is the state a future cycle may re-route it
+	// for. Filing under this cycle's key would put an entry in the cache that
+	// the row cannot render — dead weight in a bounded cache, evicting an
+	// entry that could still be hit.
+	c.retainDirty(ctx, builtKey, generationID)
+	c.releaseDirty(ctx, previous)
 	return nil
+}
+
+// dirtySampleKey renders the reuse key of the working-tree layer a build from
+// one sample would produce, without building it.
+//
+// It is the cache key, and it is assembled from the coordinator's half
+// (dirtyIdentity: who owns the layer, what it sits on, and the configuration
+// and cohort it is built under) plus the builder's own stamping of the sample
+// (StampDirtyLayerIdentity). Using the builder's function rather than a second
+// copy of it is the point: the key a lookup renders and the identity a build
+// stamps cannot drift apart.
+//
+// A sample the builder would refuse to stamp — an unborn branch, with no tree
+// and no fingerprint — renders an empty key, which cachedDirty and retainDirty
+// both decline rather than treat as an identity.
+func (c *CheckoutCoordinator) dirtySampleKey(
+	graphID string, commitGeneration int64, sample gitstate.DirtySnapshot,
+) string {
+	if sample.HeadTree == "" || sample.Fingerprint == "" {
+		return ""
+	}
+	return generationIdentityKey(StampDirtyLayerIdentity(c.dirtyIdentity(graphID, commitGeneration), sample))
 }
 
 // buildDirtyLayerOver builds the working-tree layer over one commit
@@ -1712,15 +2142,23 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 //
 // Like resolveCommitLayer it writes nothing to the route: what the checkout
 // reads is the caller's decision.
+//
+// The second return is the reuse key of the generation that was actually
+// published — rendered from the sample the BUILD took, not from the caller's
+// earlier one. A caller files its result in the working-tree reuse cache under
+// this key and never under a key of its own: the checkout is free to move
+// between the two samples, and an entry filed under a key its row does not
+// render is an entry no lookup can hit.
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
 	ctx context.Context, graphID string, commitGeneration int64,
-) (int64, error) {
+) (int64, string, error) {
 	dirtyBase, releaseBase, err := c.commitLayerReader(ctx, commitGeneration)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer releaseBase()
 	identity := c.dirtyIdentity(graphID, commitGeneration)
+	var stamped GenerationIdentity
 	for attempt := 0; attempt < 2; attempt++ {
 		started := time.Now()
 		generationID, _, err := c.builder.BuildDirtyLayer(ctx, DirtyLayerRequest{
@@ -1731,13 +2169,14 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 			WorkspaceID:  c.workspaceID,
 			ProjectID:    c.projectID,
 			buildBarrier: c.dirtyBarrier,
+			stamped:      &stamped,
 		})
 		viewmetrics.Observe(viewmetrics.CoordinatorBuildSeconds, time.Since(started), viewmetrics.SlotDirty)
 		if err == nil {
-			return generationID, nil
+			return generationID, generationIdentityKey(stamped), nil
 		}
 		if !errors.Is(err, ErrDirtySnapshotChanged) {
-			return 0, err
+			return 0, "", err
 		}
 		// The refused attempt is a whole payload for a state the checkout has
 		// already left. confirmDirtySnapshot superseded it, and nothing will
@@ -1749,7 +2188,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 			c.offerRetire(ctx, torn.GenerationID)
 		}
 	}
-	return 0, nil
+	return 0, "", nil
 }
 
 // commitLayerReader is the reader a dirty-layer build computes its affected
@@ -1770,11 +2209,26 @@ func (c *CheckoutCoordinator) commitLayerReader(ctx context.Context, commitGener
 	if err != nil {
 		return nil, nil, fmt.Errorf("indexer: open commit generation %d: %w", commitGeneration, err)
 	}
-	return commitLayerBase{
-		Reader: view.Reader,
-		// Keep ref-fact hints scoped to the same immediate corpus as before.
-		corpus: c.store.AtGeneration(row.BaseGenerationID),
-	}, view.Close, nil
+	// The hints are scoped to the same ancestry as the structural reads — this
+	// commit generation and everything under it — rather than to the one
+	// generation beneath it. See ancestryLayerBase.
+	return c.ancestryLayerBase(view), view.Close, nil
+}
+
+// ancestryLayerBase is the LayerBase a build reads a materialized view
+// through: the view's own structural reader, plus reference-fact hints scoped
+// to the SAME materialized ancestry that reader composes.
+//
+// There is one definition, and both call sites — the commit-layer build's
+// primary base (resolveCommitLayer) and the working-tree build's commit base
+// (commitLayerReader) — go through it, so neither can drift back into handing
+// a build a single generation handle. That is not a style preference: a handle
+// pinned to one generation answers the closure's fact question from one layer
+// of a stack the structural reads compose in full, and since no sparse
+// generation writes facts at all, it answers "no facts" for every file in the
+// repository. See ancestryRefFacts.
+func (c *CheckoutCoordinator) ancestryLayerBase(view *graphview.RepoView) LayerBase {
+	return commitLayerBase{Reader: view.Reader, facts: newAncestryRefFacts(c.store, view)}
 }
 
 // flip repoints one slot under the route epoch this cycle read, and advances
@@ -2038,6 +2492,147 @@ func (c *CheckoutCoordinator) dropRetained(ctx context.Context, keep int64) {
 	}
 }
 
+// --- the dirty-layer reuse cache ----------------------------------------
+//
+// The working-tree half of the commit cache above, and it exists for the same
+// measured reason: a coordinator that retires the layer its route just left
+// re-indexes the working tree from scratch the moment the tree comes back to a
+// state it has already described. Undo/redo is that case, and so is a save
+// that restores a file's previous bytes, and so is a branch switch back onto a
+// worktree whose uncommitted edits never moved.
+//
+// The key is the whole build identity, rendered by the same function the
+// catalog's coalescing and the commit cache use (generationIdentityKey), with
+// the sample-derived fields stamped by the builder's own definition
+// (StampDirtyLayerIdentity). That makes "the same build" mean exactly one
+// thing across the cache, the builder and the catalog — and it means the
+// commit generation the layer sits on is PART of the key, so a rebuilt commit
+// layer can never hand a working-tree layer to a base it was not built over.
+//
+// The catalog-backed, survive-restart half of this cache — storedCommit's twin
+// — is deliberately NOT implemented. It is a declared limitation of this item:
+// a daemon restart between two identical dirty states pays one rebuild.
+
+// cachedDirty returns a retained working-tree generation for an identity,
+// after confirming the catalog still holds it in a state that can be served
+// and that the row's own identity still renders to the key it was filed under.
+// A generation that has gone, or one the renderer disagrees with, is dropped
+// from the cache rather than re-routed — the same fail-closed guard cachedCommit
+// makes over the commit half.
+func (c *CheckoutCoordinator) cachedDirty(ctx context.Context, key string) (int64, bool) {
+	// An unborn sample renders no key (dirtySampleKey). The guard is a
+	// readability one and is knowingly redundant with the row re-key check
+	// below — a real generation's row never renders the empty key, so a
+	// lookup by it would fail closed there anyway. It is kept so that the two
+	// halves of "the empty key is not an identity" sit beside the cache they
+	// govern rather than being an emergent property of the renderer.
+	if key == "" {
+		return 0, false
+	}
+	c.mu.Lock()
+	var generationID int64
+	for _, entry := range c.retainedDirty {
+		if entry.key == key {
+			generationID = entry.generationID
+			break
+		}
+	}
+	c.mu.Unlock()
+	if generationID == 0 {
+		return 0, false
+	}
+	row, found, err := c.catalog.GetViewGeneration(ctx, generationID)
+	if err != nil || !found || !servableGeneration(row.State) ||
+		row.GenerationKind != DirtyLayerGenerationKind || generationRowKey(row) != key {
+		c.forgetRetainedDirty(generationID)
+		return 0, false
+	}
+	return generationID, true
+}
+
+// retainDirty records a working-tree generation as re-routable and retires
+// whatever the cache had to give up to hold it.
+func (c *CheckoutCoordinator) retainDirty(ctx context.Context, key string, generationID int64) {
+	// As in cachedDirty, the empty key is refused for readability rather than
+	// for safety: an entry filed under it could never be hit, because no row
+	// renders it.
+	if key == "" || generationID <= 0 {
+		return
+	}
+	c.mu.Lock()
+	retained := c.retainedDirty[:0:0]
+	retained = append(retained, retainedDirtyLayer{key: key, generationID: generationID})
+	for _, entry := range c.retainedDirty {
+		if entry.key == key || entry.generationID == generationID {
+			continue
+		}
+		retained = append(retained, entry)
+	}
+	var evicted []int64
+	if len(retained) > c.retain {
+		for _, entry := range retained[c.retain:] {
+			evicted = append(evicted, entry.generationID)
+		}
+		retained = retained[:c.retain]
+	}
+	c.retainedDirty = retained
+	c.mu.Unlock()
+
+	for _, generation := range evicted {
+		c.offerRetire(ctx, generation)
+	}
+}
+
+// releaseDirty is what a replaced working-tree generation gets: a place in the
+// reuse cache rather than immediate retirement. It is releaseCommit's twin,
+// and the generation is retired only when the cache is not holding it.
+func (c *CheckoutCoordinator) releaseDirty(ctx context.Context, generationID int64) {
+	if generationID <= 0 {
+		return
+	}
+	c.mu.Lock()
+	held := false
+	for _, entry := range c.retainedDirty {
+		if entry.generationID == generationID {
+			held = true
+			break
+		}
+	}
+	c.mu.Unlock()
+	if !held {
+		c.offerRetire(ctx, generationID)
+	}
+}
+
+// forgetRetainedDirty drops one generation from the working-tree reuse cache.
+func (c *CheckoutCoordinator) forgetRetainedDirty(generationID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.retainedDirty[:0]
+	for _, entry := range c.retainedDirty {
+		if entry.generationID != generationID {
+			kept = append(kept, entry)
+		}
+	}
+	c.retainedDirty = kept
+}
+
+// dropRetainedDirty empties the working-tree reuse cache and offers everything
+// it held for retirement. keep names the one generation to spare — the layer a
+// transition has just routed. 0 spares nothing.
+func (c *CheckoutCoordinator) dropRetainedDirty(ctx context.Context, keep int64) {
+	c.mu.Lock()
+	retained := c.retainedDirty
+	c.retainedDirty = nil
+	c.mu.Unlock()
+	for _, entry := range retained {
+		if entry.generationID == keep {
+			continue
+		}
+		c.offerRetire(ctx, entry.generationID)
+	}
+}
+
 // --- retirement ---------------------------------------------------------
 
 // offerRetire tries to collect a generation nothing should be reading. A
@@ -2133,16 +2728,24 @@ func (c *CheckoutCoordinator) DrainRetirements() []int64 {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out := make([]int64, 0, len(c.backlog)+len(c.retained)+1)
+	out := make([]int64, 0, len(c.backlog)+len(c.retained)+len(c.retainedDirty)+1)
 	for generationID := range c.backlog {
 		out = append(out, generationID)
 	}
 	for _, entry := range c.retained {
 		out = append(out, entry.generationID)
 	}
+	// The working-tree layers the reuse cache was holding for an undo go for
+	// the same reason the commit layers do: a closed coordinator has no cycle
+	// left to route them, and once the route row is withdrawn nothing in the
+	// catalog can be asked which generations this checkout had.
+	for _, entry := range c.retainedDirty {
+		out = append(out, entry.generationID)
+	}
 	out = append(out, c.routedDirty)
 	c.backlog = map[int64]struct{}{}
 	c.retained = nil
+	c.retainedDirty = nil
 	c.routedDirty = 0
 	return out
 }
@@ -2723,6 +3326,13 @@ func extractorVersionsFingerprint() string {
 // authority on what depends on what.
 type commitLayerBase struct {
 	graph.Reader
+	// facts serves the reference-fact hints from the whole materialized
+	// ancestry. A base assembled with one takes it; a base assembled with a
+	// single corpus handle below keeps the older scope. See ancestryRefFacts
+	// for the evidence that one generation handle is not enough.
+	facts ancestryRefFacts
+	// corpus is the single-generation fact handle the older callers hand in.
+	// It is consulted only when no ancestry was composed.
 	corpus *store_sqlite.Store
 }
 
@@ -2742,12 +3352,155 @@ func (b commitLayerBase) GetFileNodesByPaths(filePaths []string) map[string][]*g
 	return out
 }
 
-// LoadRefFactsByFiles serves the corpus's persisted forward facts.
+// LoadRefFactsByFiles serves the composed ancestry's persisted forward facts,
+// falling back to the single corpus handle for a base assembled without one.
 func (b commitLayerBase) LoadRefFactsByFiles(repoPrefix string, files []string) ([]graph.RefFact, error) {
+	if len(b.facts.handles) > 0 {
+		return b.facts.LoadRefFactsByFiles(repoPrefix, files)
+	}
+	if b.corpus == nil {
+		return []graph.RefFact{}, nil
+	}
 	return b.corpus.LoadRefFactsByFiles(repoPrefix, files)
 }
 
-// LoadRefFactsByTargets serves the corpus's persisted reverse facts.
+// LoadRefFactsByTargets serves the composed ancestry's persisted reverse
+// facts, falling back to the single corpus handle for a base assembled without
+// one.
 func (b commitLayerBase) LoadRefFactsByTargets(repoPrefix string, targetIDs []string) (map[string][]graph.RefFact, error) {
+	if len(b.facts.handles) > 0 {
+		return b.facts.LoadRefFactsByTargets(repoPrefix, targetIDs)
+	}
+	if b.corpus == nil {
+		return map[string][]graph.RefFact{}, nil
+	}
 	return b.corpus.LoadRefFactsByTargets(repoPrefix, targetIDs)
+}
+
+// ancestryRefFacts serves the durable reference-fact hints from every
+// generation the structural reads compose, instead of from one of them.
+//
+// The rows are scoped by generation: ref_facts carries a view_gen column and
+// Store.AtGeneration(g) answers with generation g's rows ALONE
+// (store_reffacts.go LoadRefFactsByFiles / LoadRefFactsByTargets bind
+// s.viewGen; store_generation.go AtGeneration). A base handed one generation
+// handle therefore answers the closure's fact question from one layer of a
+// stack the structural reads compose in full — and today every fact in the
+// database was written by the legacy indexer at generation zero
+// (ref_facts.go persistRefFactsForFiles is reached only from the Indexer's
+// incremental and full paths; the sparse generation builder writes none), so a
+// handle pinned to a published committed base answers "no facts" for every
+// file in the repository. The hint does not fail loudly when that happens: the
+// closure logs nothing, adds nothing, and returns a NARROWER affected set than
+// the resolver will bind over — which is the one direction the closure is not
+// allowed to be wrong in.
+//
+// So the hints are composed from the same materialized ancestry the structural
+// reads use: the view's generation sources, plus the base corpus at generation
+// zero underneath them. The composition is a UNION rather than a
+// topmost-claim-wins mask, deliberately. A fact is a hint the closure adds to
+// its edge walk, never its only source; a stale row from a lower layer can
+// only widen the closure, and a superset is what the closure owes the
+// resolver, while masking a lower layer's rows behind an upper layer that
+// writes none would narrow it to nothing at exactly the changed files the
+// closure exists for.
+//
+// The handles are the view's own — pinned to generations its lease holds — so
+// reading through them is bounded by the caller's view lifetime and needs no
+// pin of its own.
+type ancestryRefFacts struct {
+	handles []*store_sqlite.Store
+}
+
+// newAncestryRefFacts composes the fact readers for one materialized view:
+// generation zero first, then every generation the view stacks on it, bottom
+// first.
+func newAncestryRefFacts(corpus *store_sqlite.Store, view *graphview.RepoView) ancestryRefFacts {
+	var out ancestryRefFacts
+	if corpus != nil {
+		if base := corpus.AtGeneration(0); base != nil {
+			out.handles = append(out.handles, base)
+		}
+	}
+	for _, source := range view.GenerationSources() {
+		if source.Handle != nil {
+			out.handles = append(out.handles, source.Handle)
+		}
+	}
+	return out
+}
+
+// refFactIdentity is what makes two rows from two generations the same fact.
+// Origin, tier and candidates are provenance rather than identity: a later
+// generation re-deriving the same reference with a better tier must not double
+// the row the closure reads.
+type refFactIdentity struct {
+	from, to, kind, refName, filePath string
+	line                              int
+}
+
+func identifyRefFact(fact graph.RefFact) refFactIdentity {
+	return refFactIdentity{
+		from: fact.FromID, to: fact.ToID, kind: fact.Kind,
+		refName: fact.RefName, filePath: fact.FilePath, line: fact.Line,
+	}
+}
+
+// LoadRefFactsByFiles unions the forward facts every composed generation holds
+// for these files. A handle that fails is reported and skipped rather than
+// failing the whole read: the hint is additive, and losing one layer's rows
+// must not lose the others'.
+func (a ancestryRefFacts) LoadRefFactsByFiles(repoPrefix string, files []string) ([]graph.RefFact, error) {
+	out := []graph.RefFact{}
+	seen := map[refFactIdentity]struct{}{}
+	var firstErr error
+	for _, handle := range a.handles {
+		facts, err := handle.LoadRefFactsByFiles(repoPrefix, files)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, fact := range facts {
+			key := identifyRefFact(fact)
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, fact)
+		}
+	}
+	return out, firstErr
+}
+
+// LoadRefFactsByTargets unions the reverse facts every composed generation
+// holds for these targets, keeping the grouping by source file path the
+// caller reads.
+func (a ancestryRefFacts) LoadRefFactsByTargets(
+	repoPrefix string, targetIDs []string,
+) (map[string][]graph.RefFact, error) {
+	out := map[string][]graph.RefFact{}
+	seen := map[refFactIdentity]struct{}{}
+	var firstErr error
+	for _, handle := range a.handles {
+		byFile, err := handle.LoadRefFactsByTargets(repoPrefix, targetIDs)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for file, facts := range byFile {
+			for _, fact := range facts {
+				key := identifyRefFact(fact)
+				if _, duplicate := seen[key]; duplicate {
+					continue
+				}
+				seen[key] = struct{}{}
+				out[file] = append(out[file], fact)
+			}
+		}
+	}
+	return out, firstErr
 }

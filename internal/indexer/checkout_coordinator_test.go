@@ -1259,8 +1259,20 @@ func TestCoordinatorNeverRoutesAWorkingTreeLayerOverAnotherTree(t *testing.T) {
 		t.Fatalf("the routed working-tree generation sits on %d, not on the routed commit generation %d",
 			row.BaseGenerationID, settled.CommitGenerationID)
 	}
-	if _, found := f.generation(first.DirtyGenerationID); found {
-		t.Fatalf("the withdrawn working-tree generation %d was left behind", first.DirtyGenerationID)
+	// The withdrawn layer is retained rather than collected: it describes a
+	// working tree over the commit layer it names, and that pair is exactly
+	// what a switch back to this tree composes again. What has to stay true is
+	// that nothing ROUTES it any more and that it is still reachable for
+	// collection — a payload nothing can name is a leak, and a retained one is
+	// handed back on the way back (dirty_layer_reuse_test.go), offered when
+	// the cache evicts it, and drained when the coordinator is torn down.
+	if settled.DirtyGenerationID == first.DirtyGenerationID {
+		t.Fatalf("the route still names the withdrawn working-tree generation %d",
+			first.DirtyGenerationID)
+	}
+	if !slices.Contains(c.DrainRetirements(), first.DirtyGenerationID) {
+		t.Fatalf("the withdrawn working-tree generation %d is neither collected nor reachable for collection",
+			first.DirtyGenerationID)
 	}
 }
 
@@ -1463,9 +1475,16 @@ func TestCoordinatorLeavesAGenerationAnotherCheckoutRoutes(t *testing.T) {
 // TestCoordinatorRetiresAReplacedGenerationOnceItIsUnleased pins the lease
 // integration: the generation a route left is collectable, and a live view
 // holding it is what stops the collection until the view closes.
+//
+// The working-tree layer a route leaves is now RETAINED for an undo rather
+// than offered for collection straight away, so the offer this test is about
+// is the one the reuse cache makes when it evicts. A cache one layer deep is
+// what puts the replaced generation on the retirement path immediately, which
+// is the state this test has always been describing; the retention policy
+// itself is pinned by dirty_layer_reuse_test.go.
 func TestCoordinatorRetiresAReplacedGenerationOnceItIsUnleased(t *testing.T) {
 	f := newCoordinatorFixture(t)
-	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Retain: 1})
 
 	first := coordinatorReconcile(t, c)
 	materializer := &graphview.Materializer{Store: f.store, Catalog: f.catalog, Leases: f.leases}

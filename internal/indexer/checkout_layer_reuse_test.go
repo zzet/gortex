@@ -157,6 +157,28 @@ func TestStoredCommitLayerReuseWritesOnlyTheCacheEviction(t *testing.T) {
 	// A cache exactly one identity wide: the second adoption must evict the
 	// first. The route names B, so A is what the cache can give up and A is
 	// retirable — nothing routes it, leases it, or sits on it.
+	// The first coordinator is still holding the working-tree layers it built
+	// over A and over B: a layer the route leaves is retained for an undo now
+	// rather than collected (dirty_layer_reuse_test.go). A commit generation
+	// something sits on cannot be retired, so those layers would hide the
+	// eviction this test measures behind a refusal that has nothing to do with
+	// it. Hand them over the way teardown does, newest first — a layer is
+	// always offered before the generation it sits on.
+	// Only the working-tree layers: the commit layers the drain also hands
+	// over are the payload this test is about to adopt from the catalog.
+	handed := first.DrainRetirements()
+	retireNewestFirst(handed)
+	for _, generationID := range handed {
+		if generationID <= 0 {
+			continue
+		}
+		row, found := f.generation(generationID)
+		if !found || row.GenerationKind != DirtyLayerGenerationKind {
+			continue
+		}
+		_ = f.store.RetirePayloadGeneration(ctx, generationID, nil)
+	}
+
 	restarted := f.inertCoordinator(t, CheckoutCoordinatorConfig{Retain: 1})
 	if len(restarted.retained) != 0 {
 		t.Fatalf("a fresh coordinator started with %d cached layers", len(restarted.retained))

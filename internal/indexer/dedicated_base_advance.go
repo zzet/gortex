@@ -218,7 +218,16 @@ func (p *dedicatedBasePublisher) buildObservedClaim(ctx context.Context, observa
 			return 0, BuildReport{}, err
 		}
 		defer view.Close()
-		request.Base = commitLayerBase{Reader: view.Reader, corpus: p.runtime.store.AtGeneration(claim.BaseGenerationID)}
+		// The fact hints are scoped to the SAME materialized ancestry the
+		// structural reads compose, not to the claimed parent generation
+		// alone. A handle pinned to one generation answers the closure's
+		// durable-hint question from one layer of a stack the reader composes
+		// in full — and since no sparse generation writes reference facts at
+		// all, from a layer that holds none, which makes the closure NARROWER
+		// than the resolver will bind over. See ancestryRefFacts for the
+		// evidence; this is the third call site of the same composition, beside
+		// the coordinator's two (ancestryLayerBase).
+		request.Base = commitLayerBase{Reader: view.Reader, facts: newAncestryRefFacts(p.runtime.store, view)}
 	}
 	return observation.Builder.BuildClaimedDedicatedDelta(ctx, request)
 }
