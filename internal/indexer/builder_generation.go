@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -274,6 +275,24 @@ type BuildReport struct {
 	NodeCount int
 	EdgeCount int
 
+	// ContextPaths lists, in sorted order, the closure paths the generation
+	// declared read-only context: files the pass read to resolve the change
+	// set, whose re-derivation matched the layer below exactly, and whose
+	// payload the build therefore withdrew before publishing. ContextMasks is
+	// their count, and ContextWithdrawnNodes / ContextWithdrawnEdges how many
+	// payload rows left the generation with them.
+	ContextPaths          []string
+	ContextMasks          int
+	ContextWithdrawnNodes int
+	ContextWithdrawnEdges int
+
+	// ContextRetainedPaths lists the closure paths the generation kept a
+	// replace claim over because its own re-derivation did NOT match the layer
+	// below — the file's resolution genuinely moved, so serving it from below
+	// would serve a stale answer. They are read-only in intent and output in
+	// fact, which is exactly why they are named rather than counted.
+	ContextRetainedPaths []string
+
 	// ReplaceMasks and DeleteMasks are the file-level claims written;
 	// NodeTombstones and EdgeSourceMarkers the identity- and adjacency-level
 	// ones. The latter two cover exactly the payload that lives in no file.
@@ -497,6 +516,15 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		// covered by the claims derived from it, and before the producer states
 		// so what it did is what they describe.
 		b.runEnrichment(req, handle, &report)
+		// The context separation runs between them, for the same reason in
+		// reverse: it decides which of the closure's read-only files the
+		// generation carries nothing for, and it has to have decided before the
+		// masks are derived from what remains.
+		withdrawn, err := b.separateContextPayload(ctx, req, plan, handle, &report)
+		if err != nil {
+			return err
+		}
+		plan.withdrawn = withdrawn
 		if err := b.writeMasks(req, plan, handle, &report); err != nil {
 			return err
 		}
@@ -564,11 +592,37 @@ func (b *SparseGenerationBuilder) validate(ctx context.Context, req *BuildReques
 }
 
 // buildPlan is the file set one build walks, plus the paths it claims deleted.
+//
+// indexed is deliberately kept BESIDE the context set rather than derived from
+// it at every use: it is the set the pass walks, and the pass walks the whole
+// closure because resolution through a generation-scoped handle can only bind
+// what the same generation carries. The split is what the generation CLAIMS,
+// and the two answer different questions — "what did this build read" and
+// "what does this generation speak for".
+//
+// Only the read-only half is recorded. The change set is `indexed` minus
+// `context` by definition, and deriving it that way rather than storing it is
+// what keeps a planner that fills `indexed` alone — a full dedicated snapshot,
+// which has no layer below to read context from — correct without knowing this
+// field exists: an empty context set means every walked file is output.
 type buildPlan struct {
-	// indexed is the repo-relative file set the pass walks, sorted.
+	// indexed is the repo-relative file set the pass walks, sorted. It is the
+	// union of the change set and context, minus the deleted paths.
 	indexed []string
+	// context is the repo-relative closure the pass reads to resolve the
+	// change set, sorted, disjoint from the change set. A context path is
+	// read-only by intent: the generation claims nothing about it unless its
+	// own re-derivation disagrees with the layer below.
+	context []string
 	// deleted is the repo-relative set the generation claims removed, sorted.
 	deleted []string
+	// withdrawn is the graph-path set separateContextPayload emptied, filled
+	// AFTER the pass rather than by a planner — a planner cannot know it,
+	// because it is decided by comparing what the pass actually produced
+	// against the layer below. It rides on the plan so the mask derivation
+	// needs no extra parameter; a plan that never reached the separation
+	// leaves it nil and the derivation is unchanged.
+	withdrawn map[string]struct{}
 }
 
 func (b *SparseGenerationBuilder) planFileSetContext(
@@ -648,6 +702,12 @@ func (b *SparseGenerationBuilder) planFileSetContext(
 			return buildPlan{}, report, err
 		}
 		plan.indexed = append(plan.indexed, p)
+		if _, isChange := present[p]; isChange {
+			// The change set is the generation's OUTPUT and is exactly
+			// indexed minus context, so it is not stored a second time.
+			continue
+		}
+		plan.context = append(plan.context, p)
 	}
 	for p := range deleted {
 		if err := ctx.Err(); err != nil {
@@ -656,6 +716,7 @@ func (b *SparseGenerationBuilder) planFileSetContext(
 		plan.deleted = append(plan.deleted, p)
 	}
 	sort.Strings(plan.indexed)
+	sort.Strings(plan.context)
 	sort.Strings(plan.deleted)
 	if err := ctx.Err(); err != nil {
 		return buildPlan{}, report, err
@@ -775,6 +836,367 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	out.Partial, out.Disabled, out.Reason = pass.Partial, pass.Disabled, pass.Reason
 }
 
+// separateContextPayload withdraws the payload the pass produced for the
+// closure files it only READ, and returns the graph paths it withdrew.
+//
+// # Why the pass produces that payload in the first place
+//
+// Reads through a derived handle are strictly generation-scoped, and the
+// sparse build is disqualified from the in-memory staging shadow precisely
+// because it writes through such a handle (indexer.go's shadow decision tests
+// derivedGenerationTarget). The pass therefore resolves the change set by
+// reading back what it has just written, so every closure file it needs for
+// resolution is on disk by the time resolution runs. Route (b) of the D4
+// determination keeps that arrangement — the CPU cost of re-extracting context
+// stays — and moves the question to what the generation KEEPS.
+//
+// # What may be withdrawn, and why that is sound
+//
+// A context file is withdrawn only when the generation's own re-derivation of
+// it AGREES WITH THE LAYER BELOW, field for field, node for node and edge for
+// edge. Under that precondition the composed view is unchanged by the
+// withdrawal: what the generation would have served at the path is exactly
+// what the layer below serves once the path is unclaimed. Everything else
+// keeps today's behaviour — a context file whose resolution genuinely moved
+// stays claimed, payload and all, and is named in ContextRetainedPaths rather
+// than quietly narrowed.
+//
+// The comparison is a conservative optimiser, never a correctness argument of
+// its own: any disagreement it cannot rule out — a node only one side holds, an
+// edge recorded at the path whose source does not live there, a content
+// section whose body lives in a separate index — keeps the file. A build in
+// which nothing compares equal reduces to the behaviour that shipped before
+// this step existed.
+//
+// # What withdrawal costs
+//
+// The rows are written and then removed, so this removes the DURABLE
+// duplication — the generation carries payload for its change set alone, and a
+// delta chain stops accumulating a copy of every file it ever read — without
+// removing the transient write. Removing the write too needs the pass to stop
+// resolving through the store it is writing, which is a change to the index
+// pipeline rather than to this builder.
+func (b *SparseGenerationBuilder) separateContextPayload(
+	ctx context.Context,
+	req BuildRequest,
+	plan buildPlan,
+	handle *store_sqlite.Store,
+	report *BuildReport,
+) (map[string]struct{}, error) {
+	if len(plan.context) == 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	contextPaths := make([]string, 0, len(plan.context))
+	candidates := make(map[string]struct{}, len(plan.context))
+	for _, rel := range plan.context {
+		graphPath := builderGraphPath(req.RepoPrefix, rel)
+		contextPaths = append(contextPaths, graphPath)
+		candidates[graphPath] = struct{}{}
+	}
+
+	carried := newBuilderPathPayload(handle.AllNodes(), handle.AllEdges(), candidates)
+	if len(carried.nodesByPath) == 0 && len(carried.edgesByPath) == 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	baseNodes := req.Base.GetFileNodesByPaths(contextPaths)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	baseEdges := req.Base.GetOutEdgesByNodeIDs(carried.sourceIDs(contextPaths, baseNodes))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	withdrawn := make(map[string]struct{}, len(contextPaths))
+	var withdrawnPaths []string
+	for _, graphPath := range contextPaths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !carried.holdsPath(graphPath) {
+			// The pass produced nothing for the path at all — an admission the
+			// walk refused (unsupported language, excluded, oversized). There is
+			// no payload to withdraw and no re-derivation to compare, so the
+			// generation stays silent about it and PlannedNotCovered keeps
+			// reporting the absence for what it is.
+			continue
+		}
+		if carried.matchesBase(graphPath, baseNodes[graphPath], baseEdges) {
+			withdrawn[graphPath] = struct{}{}
+			withdrawnPaths = append(withdrawnPaths, graphPath)
+			continue
+		}
+		report.ContextRetainedPaths = append(report.ContextRetainedPaths, graphPath)
+	}
+	sort.Strings(withdrawnPaths)
+	sort.Strings(report.ContextRetainedPaths)
+	if len(withdrawnPaths) == 0 {
+		return nil, nil
+	}
+
+	// The eviction removes every edge touching a withdrawn node, including the
+	// re-derived calls the CHANGED files make into one. Those belong to the
+	// change set's own payload — the generation claims their file — so they are
+	// captured first and restored after. Edges LEAVING a withdrawn node are not:
+	// they are the context file's own adjacency, which the layer below serves
+	// again the moment the path is unclaimed.
+	restore := carried.edgesIntoWithdrawn(withdrawn)
+	nodes, edges := handle.EvictFiles(withdrawnPaths)
+	if len(restore) > 0 {
+		handle.AddBatch(nil, restore)
+	}
+	if err := handle.DeleteFileMetasByFiles(req.RepoPrefix, withdrawnPaths); err != nil {
+		return nil, fmt.Errorf("indexer: withdraw generation file inventory: %w", err)
+	}
+	if ids := carried.nodeIDsAt(withdrawn); len(ids) > 0 {
+		if err := handle.BatchDeleteSymbolFTS(ids); err != nil {
+			return nil, fmt.Errorf("indexer: withdraw generation symbol index: %w", err)
+		}
+	}
+	report.ContextPaths = withdrawnPaths
+	report.ContextMasks = len(withdrawnPaths)
+	report.ContextWithdrawnNodes = nodes
+	report.ContextWithdrawnEdges = edges - len(restore)
+	b.Logger.Debug("indexer: withdrew read-only context payload from the generation",
+		zap.String("repo", req.RepoPrefix),
+		zap.Int("context_files", len(plan.context)),
+		zap.Int("withdrawn_files", len(withdrawnPaths)),
+		zap.Int("retained_files", len(report.ContextRetainedPaths)),
+		zap.Int("withdrawn_nodes", nodes),
+		zap.Int("restored_edges", len(restore)))
+	return withdrawn, nil
+}
+
+// builderPathPayload is the generation's own payload, grouped by the candidate
+// context paths and nothing else. It is built from the one whole-generation
+// read the mask derivation already performs, so the separation costs no extra
+// query against a sparse generation.
+type builderPathPayload struct {
+	nodesByPath map[string][]*graph.Node
+	edgesByPath map[string][]*graph.Edge
+	nodeIDs     map[string]string
+	// foreignSource marks a candidate path whose recorded adjacency is not
+	// exactly the outgoing set of its own symbols: an edge at the path from a
+	// source that lives elsewhere (an aggregated resolver stub, a synthesised
+	// lane), or an edge out of one of the path's symbols recorded in another
+	// file. Either way the path-keyed comparison below cannot see the whole
+	// picture, so the path is never withdrawn.
+	foreignSource map[string]struct{}
+	// contentBody marks a candidate path with a content section at it. Content
+	// bodies live in a separate index keyed by the file, which this withdrawal
+	// does not reach, so such a path keeps its claim.
+	contentBody map[string]struct{}
+	edges       []*graph.Edge
+}
+
+func newBuilderPathPayload(
+	nodes []*graph.Node, edges []*graph.Edge, candidates map[string]struct{},
+) *builderPathPayload {
+	p := &builderPathPayload{
+		nodesByPath:   make(map[string][]*graph.Node),
+		edgesByPath:   make(map[string][]*graph.Edge),
+		nodeIDs:       make(map[string]string),
+		foreignSource: make(map[string]struct{}),
+		contentBody:   make(map[string]struct{}),
+		edges:         edges,
+	}
+	for _, node := range nodes {
+		if node == nil || node.ID == "" {
+			continue
+		}
+		if _, candidate := candidates[node.FilePath]; !candidate {
+			continue
+		}
+		p.nodesByPath[node.FilePath] = append(p.nodesByPath[node.FilePath], node)
+		p.nodeIDs[node.ID] = node.FilePath
+		if graph.IsContentNode(node) {
+			p.contentBody[node.FilePath] = struct{}{}
+		}
+	}
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		// An edge LEAVING a candidate's symbol but recorded somewhere else is
+		// adjacency the path-keyed comparison below cannot see, and the
+		// withdrawal would drop it without the layer below having a copy that
+		// shows through — the file it was recorded in may itself be claimed.
+		if sourcePath, known := p.nodeIDs[edge.From]; known && sourcePath != edge.FilePath {
+			p.foreignSource[sourcePath] = struct{}{}
+		}
+		if _, candidate := candidates[edge.FilePath]; !candidate {
+			continue
+		}
+		p.edgesByPath[edge.FilePath] = append(p.edgesByPath[edge.FilePath], edge)
+		if p.nodeIDs[edge.From] != edge.FilePath {
+			p.foreignSource[edge.FilePath] = struct{}{}
+		}
+	}
+	return p
+}
+
+// holdsPath reports whether the generation carries any payload at a candidate.
+func (p *builderPathPayload) holdsPath(graphPath string) bool {
+	return len(p.nodesByPath[graphPath]) > 0 || len(p.edgesByPath[graphPath]) > 0
+}
+
+// sourceIDs is the identity set whose base adjacency the comparison needs: the
+// symbols the generation re-derived at a candidate path, plus the ones the
+// layer below still has there, so a symbol only one side holds is compared
+// rather than skipped.
+func (p *builderPathPayload) sourceIDs(paths []string, baseNodes map[string][]*graph.Node) []string {
+	seen := make(map[string]struct{}, len(p.nodeIDs))
+	ids := make([]string, 0, len(p.nodeIDs))
+	add := func(id string) {
+		if id == "" {
+			return
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, graphPath := range paths {
+		for _, node := range p.nodesByPath[graphPath] {
+			add(node.ID)
+		}
+		for _, node := range baseNodes[graphPath] {
+			if node != nil {
+				add(node.ID)
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// matchesBase reports whether the generation's re-derivation of one candidate
+// path agrees with the layer below completely enough for the path to be served
+// from below instead.
+func (p *builderPathPayload) matchesBase(
+	graphPath string, baseNodes []*graph.Node, baseEdges map[string][]*graph.Edge,
+) bool {
+	if _, foreign := p.foreignSource[graphPath]; foreign {
+		return false
+	}
+	if _, content := p.contentBody[graphPath]; content {
+		return false
+	}
+	carriedNodes := p.nodesByPath[graphPath]
+	if len(carriedNodes) != len(baseNodes) {
+		return false
+	}
+	baseByID := make(map[string]*graph.Node, len(baseNodes))
+	for _, node := range baseNodes {
+		if node == nil || node.ID == "" {
+			return false
+		}
+		baseByID[node.ID] = node
+	}
+	for _, node := range carriedNodes {
+		if !builderNodeEquivalent(node, baseByID[node.ID]) {
+			return false
+		}
+	}
+	// Compare the adjacency the path RECORDS, from both sides, keyed the same
+	// way: an edge the generation wrote at the path against the base's edges
+	// out of the path's symbols that the base also recorded there.
+	carriedEdges := p.edgesByPath[graphPath]
+	var baseAtPath []*graph.Edge
+	for _, node := range carriedNodes {
+		for _, edge := range baseEdges[node.ID] {
+			if edge != nil && edge.FilePath == graphPath {
+				baseAtPath = append(baseAtPath, edge)
+			}
+		}
+	}
+	if len(carriedEdges) != len(baseAtPath) {
+		return false
+	}
+	matched := make([]bool, len(baseAtPath))
+	for _, edge := range carriedEdges {
+		found := false
+		for i, candidate := range baseAtPath {
+			if matched[i] || !builderEdgeEquivalent(edge, candidate) {
+				continue
+			}
+			matched[i], found = true, true
+			break
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// edgesIntoWithdrawn returns the edges the eviction will remove that the
+// generation must keep: the ones ENTERING a withdrawn identity from a source
+// that is not itself withdrawn.
+func (p *builderPathPayload) edgesIntoWithdrawn(withdrawn map[string]struct{}) []*graph.Edge {
+	isWithdrawn := func(id string) bool {
+		graphPath, known := p.nodeIDs[id]
+		if !known {
+			return false
+		}
+		_, gone := withdrawn[graphPath]
+		return gone
+	}
+	var out []*graph.Edge
+	for _, edge := range p.edges {
+		if edge == nil || !isWithdrawn(edge.To) || isWithdrawn(edge.From) {
+			continue
+		}
+		out = append(out, edge)
+	}
+	return out
+}
+
+// nodeIDsAt lists the identities the generation carried at the withdrawn
+// paths, sorted, so the sidecars keyed by identity can be withdrawn with them.
+func (p *builderPathPayload) nodeIDsAt(withdrawn map[string]struct{}) []string {
+	ids := make([]string, 0, len(p.nodeIDs))
+	for id, graphPath := range p.nodeIDs {
+		if _, gone := withdrawn[graphPath]; gone {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// builderNodeEquivalent compares two rows for the same identity across the two
+// layers. The two volatile fields are cleared rather than compared: the
+// absolute path is the reader's root, which a content source and a checkout
+// spell differently for the same file, and the fetch timestamp is when a row
+// was read. Everything else — location, language, signature, promoted metadata
+// — must agree, because everything else is something the composed view serves.
+func builderNodeEquivalent(carried, base *graph.Node) bool {
+	if carried == nil || base == nil {
+		return carried == base
+	}
+	left, right := *carried, *base
+	left.AbsoluteFilePath, right.AbsoluteFilePath = "", ""
+	left.FetchedAt, right.FetchedAt = time.Time{}, time.Time{}
+	return reflect.DeepEqual(left, right)
+}
+
+// builderEdgeEquivalent is builderNodeEquivalent for adjacency. An edge
+// carries no reader-dependent field, so every one of them is compared.
+func builderEdgeEquivalent(carried, base *graph.Edge) bool {
+	if carried == nil || base == nil {
+		return carried == base
+	}
+	return reflect.DeepEqual(*carried, *base)
+}
+
 // writeMasks derives the generation's ownership claims from the payload it
 // actually carries, then writes them.
 //
@@ -807,12 +1229,21 @@ func (b *SparseGenerationBuilder) runEnrichment(
 // made about a file outside the generation's set: such a file's payload is
 // unchanged by construction, unless the closure was truncated, which is
 // reported as a completeness fact rather than guessed at here.
+//
+// The fourth claim is the one that says nothing. plan.withdrawn names the
+// closure paths separateContextPayload emptied, and each gets a context mask:
+// an explicit "this generation read the path and claims nothing about it". The
+// derivation is unchanged by it — the replace set still comes from the payload
+// and nothing else, which is exactly why the context masks can be trusted:
+// a path whose payload survived the withdrawal turns up in covered and is
+// claimed, so the two sets cannot both name it.
 func (b *SparseGenerationBuilder) writeMasks(
 	req BuildRequest,
 	plan buildPlan,
 	handle *store_sqlite.Store,
 	report *BuildReport,
 ) error {
+	withdrawn := plan.withdrawn
 	covered := make(map[string]struct{})
 	rows, err := handle.FileMetasForRepo(req.RepoPrefix)
 	if err != nil {
@@ -830,12 +1261,21 @@ func (b *SparseGenerationBuilder) writeMasks(
 		}
 	}
 
-	masks := make([]store_sqlite.FileMask, 0, len(covered)+len(plan.deleted))
+	masks := make([]store_sqlite.FileMask, 0, len(covered)+len(plan.deleted)+len(withdrawn))
 	for graphPath := range covered {
 		masks = append(masks, store_sqlite.FileMask{
 			RepoPrefix: req.RepoPrefix, FilePath: graphPath, Mode: store_sqlite.OwnershipReplace,
 		})
 		report.ReplaceMasks++
+	}
+	for graphPath := range withdrawn {
+		if _, carried := covered[graphPath]; carried {
+			return fmt.Errorf(
+				"indexer: generation carries payload at %q while declaring it read-only context", graphPath)
+		}
+		masks = append(masks, store_sqlite.FileMask{
+			RepoPrefix: req.RepoPrefix, FilePath: graphPath, Mode: store_sqlite.OwnershipContext,
+		})
 	}
 	for _, rel := range plan.deleted {
 		graphPath := builderGraphPath(req.RepoPrefix, rel)
@@ -871,6 +1311,18 @@ func (b *SparseGenerationBuilder) writeMasks(
 	report.NodeTombstones = len(tombstones)
 
 	markers, contested := b.unclaimedEdgeSources(req, handle, covered)
+	for _, marker := range markers {
+		// A marker over a context path would claim an outgoing set the layer
+		// no longer carries, so the composition would serve it empty. The
+		// withdrawal is built to make this unreachable; reaching it means the
+		// two halves disagree, which is a build failure rather than a mask to
+		// write and let publish validation catch.
+		if _, isContext := withdrawn[builderMaskKey(marker.SourceID)]; isContext {
+			return fmt.Errorf(
+				"indexer: generation replaces the adjacency of %q at a path it declared read-only context",
+				marker.SourceID)
+		}
+	}
 	if err := handle.SetEdgeSourceMasks(markers); err != nil {
 		return fmt.Errorf("indexer: write generation edge-source masks: %w", err)
 	}
@@ -878,7 +1330,14 @@ func (b *SparseGenerationBuilder) writeMasks(
 	report.ContestedEdgeSources = contested
 
 	for _, rel := range plan.indexed {
-		if _, ok := covered[builderGraphPath(req.RepoPrefix, rel)]; !ok {
+		graphPath := builderGraphPath(req.RepoPrefix, rel)
+		if _, isContext := withdrawn[graphPath]; isContext {
+			// The generation carries nothing at the path on purpose. That is a
+			// declared claim, not the "the walk would not admit this file"
+			// absence PlannedNotCovered reports.
+			continue
+		}
+		if _, ok := covered[graphPath]; !ok {
 			report.PlannedNotCovered = append(report.PlannedNotCovered, rel)
 		}
 	}
