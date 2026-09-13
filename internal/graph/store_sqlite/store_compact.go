@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,17 @@ import (
 //   - one at a time. maintenanceGate is a context-bounded single token, so a
 //     TRUNCATE checkpoint can never interleave with a VACUUM rewriting the
 //     same file.
+//   - the whole-file jobs are not starved behind the statistics pass. The two
+//     occupants are not alike: VACUUM and the TRUNCATE checkpoint carry
+//     latency budgets of their own (the checkpoint's is walCheckpointTimeout,
+//     10 s, with no retry, and it guards a measured 48x read-performance
+//     boundary), while a planner-statistics pass can legitimately hold the
+//     token for longer than that. So the pass is PRE-EMPTIBLE and those two
+//     are PRIORITY: entering the lane as one of them cancels the pass in
+//     flight and keeps the worker from starting another until it is done. A
+//     cancelled cooperative refresh is a deferral, not a loss — it keeps its
+//     cursor, the worker re-owes the pass, and it resumes as soon as the
+//     whole-file job frees the token.
 //   - not inside somebody else's window. A job that declares quiesce waits
 //     for every publish drain and payload build in flight to finish first, so
 //     a whole-file rewrite never STARTS in the middle of one.
@@ -70,7 +82,8 @@ var ErrMaintenanceBusy = errors.New("store_sqlite: whole-database maintenance de
 var errMaintenanceNoCore = errors.New("store_sqlite: maintenance needs an open store")
 
 // maintenanceJob names one whole-database action. The values are the reason
-// strings the deferral errors carry; nothing switches on them.
+// strings the deferral errors carry; the lane's scheduling asks two questions
+// of the kind and nothing else switches on them.
 type maintenanceJob string
 
 const (
@@ -78,6 +91,18 @@ const (
 	maintenanceVacuum       maintenanceJob = "vacuum"
 	maintenanceCheckpoint   maintenanceJob = "wal_checkpoint_truncate"
 )
+
+// preemptible reports whether a job in flight may be asked to yield the lane.
+// Only the statistics pass may: it is resumable by construction (a cancelled
+// cooperative refresh keeps its cursor and continues at the next boundary) and
+// nothing waits on its result. The two whole-file rewrites are neither — a
+// half-done VACUUM or TRUNCATE is not a thing the lane can ask for.
+func (j maintenanceJob) preemptible() bool { return j == maintenancePlannerStats }
+
+// priority reports whether a job pre-empts the pre-emptible one. The two
+// whole-file jobs do, because each arrives on a latency budget shorter than a
+// statistics pass may legitimately take and each has exactly one attempt.
+func (j maintenanceJob) priority() bool { return !j.preemptible() }
 
 // maintenanceQuiesceTimeout is the whole budget one lane entry gets: the wait
 // for the publishes and builds in flight to finish AND the wait for the lane
@@ -123,6 +148,20 @@ const (
 // context.WithDeadline keeps whichever bound is earlier, so a caller that
 // arrives with a tighter budget (CheckpointWAL's walCheckpointTimeout) keeps
 // its own.
+//
+// Bounding the token is not the same as not waiting behind the wrong thing,
+// which is why a priority job announces itself BEFORE either wait: a
+// statistics pass holding the token is asked to yield right here, and the
+// worker is kept from starting another until this job is done. Without that,
+// a checkpoint arriving behind a pass would spend its whole 10 s budget and
+// skip the WAL drain — a deferral on the boundary that keeps the indexer's
+// global reads off a multi-gigabyte WAL.
+//
+// The same rule runs the other way for the pass: it registers the handle that
+// cancel reaches BEFORE its own first wait, so it is pre-emptible for the
+// whole time it can be occupying the lane — queued for the token, parked in
+// the post-token quiescence wait, or inside its SQL — and not only for the
+// last of those three.
 func (s *Store) runMaintenance(ctx context.Context, job maintenanceJob, quiesce bool, fn func(context.Context) error) error {
 	if s.coreless() {
 		return errMaintenanceNoCore
@@ -130,14 +169,33 @@ func (s *Store) runMaintenance(ctx context.Context, job maintenanceJob, quiesce 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if job.priority() {
+		release := s.beginPriorityMaintenance()
+		defer release()
+	}
+	// The mirror image on the pre-emptible side: the pass registers its
+	// cancel BEFORE it waits for anything, and every wait below then runs
+	// under the context that cancel ends. Registering later — once the token
+	// is held and the second quiescence wait has returned — leaves a pass
+	// that is parked in that wait holding the token with NO handle for a
+	// priority job to cancel, so a checkpoint arriving there waits out the
+	// pass's whole quiescence budget (up to maintenanceQuiesceTimeout, 30 s)
+	// inside its own 10 s one, defers, and skips the WAL drain. That is the
+	// starvation this lane's priority rule exists to prevent, so the
+	// registration has to cover the waits and not just the SQL.
+	runCtx, stopPass := ctx, func() {}
+	if job.preemptible() {
+		runCtx, stopPass = s.beginPreemptiblePass(ctx)
+		defer stopPass()
+	}
 	deadline := time.Now().Add(maintenanceQuiesceTimeout)
 	if quiesce {
-		if err := s.awaitMaintenanceQuiescence(ctx, job, deadline); err != nil {
+		if err := s.awaitMaintenanceQuiescence(runCtx, job, deadline); err != nil {
 			s.maintenanceDeferrals.Add(1)
 			return err
 		}
 	}
-	gateCtx, cancelGate := context.WithDeadline(ctx, deadline)
+	gateCtx, cancelGate := context.WithDeadline(runCtx, deadline)
 	err := s.maintenanceGate.LockContext(gateCtx)
 	cancelGate()
 	if err != nil {
@@ -146,13 +204,169 @@ func (s *Store) runMaintenance(ctx context.Context, job maintenanceJob, quiesce 
 	}
 	defer s.maintenanceGate.Unlock()
 	if quiesce {
-		if err := s.awaitMaintenanceQuiescence(ctx, job, deadline); err != nil {
+		if err := s.awaitMaintenanceQuiescence(runCtx, job, deadline); err != nil {
 			s.maintenanceDeferrals.Add(1)
 			return err
 		}
 	}
+	// Counted here, immediately before fn, because the counter means "reached
+	// its SQL": a pass that yielded at registration never gets this far — its
+	// cancelled context resolves it as a deferral on one of the three paths
+	// above, and it is counted there. Jobs and deferrals therefore partition
+	// the lane entries rather than overlapping on the yield path.
 	s.maintenanceJobs.Add(1)
-	return fn(ctx)
+	runErr := fn(runCtx)
+	// Unregister while the token is still held. The gate release is deferred
+	// and therefore runs after this, so a priority job can never find this
+	// pass's handle at a moment when the token it names is already free —
+	// which would cost a pre-emption count and re-owe a pass that finished.
+	stopPass()
+	return runErr
+}
+
+// maintenancePassHandle is one pre-emptible pass's cancel, held by identity so
+// the pass that unregisters is always the pass that registered.
+type maintenancePassHandle struct {
+	cancel context.CancelFunc
+}
+
+// beginPreemptiblePass registers the job about to enter the lane as the pass a
+// priority job may cancel, and hands it the context that cancel ends. stop
+// unregisters and releases it.
+//
+// The priority re-check under the lock is the race the registration would
+// otherwise lose. claimMaintenancePass declines to open a pass at all while a
+// priority job is waiting or holding the lane, so the ordinary case never gets
+// here — but a pass CLAIMED a moment before that job arrived is already on its
+// way and finds no mark to read at claim time. Between the claim returning
+// true and this lock there is therefore a window in which a priority job can
+// take maintenanceSched, find maintenancePass still nil, and have nothing to
+// cancel. A pass landing in that window must yield on its own rather than run
+// the checkpoint's whole budget out from under it.
+func (s *Store) beginPreemptiblePass(ctx context.Context) (context.Context, func()) {
+	passCtx, cancel := context.WithCancel(ctx)
+	handle := &maintenancePassHandle{cancel: cancel}
+	s.maintenanceSched.Lock()
+	yield := s.maintenancePriority > 0
+	if !yield {
+		s.maintenancePass = handle
+	}
+	s.maintenanceSched.Unlock()
+	if yield {
+		s.maintenancePreemptions.Add(1)
+		cancel()
+	}
+	return passCtx, func() {
+		s.maintenanceSched.Lock()
+		if s.maintenancePass == handle {
+			s.maintenancePass = nil
+		}
+		s.maintenanceSched.Unlock()
+		cancel()
+	}
+}
+
+// beginPriorityMaintenance marks a whole-file job as waiting for or holding
+// the lane and asks the statistics pass in flight, if any, to yield. The
+// returned call retracts the mark; it is idempotent, and the last mark to be
+// retracted re-posts the signal for a pass the worker declined to start.
+//
+// The pass is cleared from the handle as it is cancelled, so a second priority
+// job arriving behind the first neither cancels twice nor double-counts.
+func (s *Store) beginPriorityMaintenance() func() {
+	s.maintenanceSched.Lock()
+	s.maintenancePriority++
+	handle := s.maintenancePass
+	s.maintenancePass = nil
+	s.maintenanceSched.Unlock()
+	if handle != nil {
+		s.maintenancePreemptions.Add(1)
+		handle.cancel()
+	}
+	var once sync.Once
+	return func() { once.Do(s.endPriorityMaintenance) }
+}
+
+func (s *Store) endPriorityMaintenance() {
+	s.maintenanceSched.Lock()
+	if s.maintenancePriority > 0 {
+		s.maintenancePriority--
+	}
+	resume := s.maintenancePriority == 0 && s.maintenancePriorityResume && !s.maintenanceClosed
+	if resume {
+		s.maintenancePriorityResume = false
+	}
+	signal := s.maintenanceSignal
+	s.maintenanceSched.Unlock()
+	if !resume || signal == nil {
+		return
+	}
+	select {
+	case signal <- struct{}{}:
+	default:
+	}
+}
+
+// claimMaintenancePass opens one worker pass, or declines it because a
+// whole-file job is waiting for or holding the lane.
+//
+// Declining rather than queueing is what keeps the pre-emption from being
+// undone one microsecond after it happens: a pass that yielded the token and
+// immediately asked for it again would be back in front of the checkpoint that
+// cancelled it. The request is not lost — it stays owed, and the last priority
+// job to finish re-posts the signal.
+//
+// How long it stays owed is the priority job's business, and one of the two is
+// not short: a checkpoint is bounded by walCheckpointTimeout, but Compact's
+// VACUUM body runs unbounded on purpose (the daemon's own comment calls it
+// minutes on a multi-GB store), and the decline lasts from the moment that job
+// starts WAITING for the lane. So the statistics pass can be owed for the
+// whole of a VACUUM. That is latency and never loss — the pass re-owes and
+// resumes at its cursor — and it is the trade this lane exists to make: the
+// deferrable occupant is the one that defers.
+func (s *Store) claimMaintenancePass() bool {
+	s.maintenanceSched.Lock()
+	defer s.maintenanceSched.Unlock()
+	if s.maintenanceClosed {
+		return false
+	}
+	if s.maintenancePriority > 0 {
+		s.maintenanceOwed = true
+		s.maintenancePriorityResume = true
+		return false
+	}
+	// Owed is cleared as the pass starts, not when it ends: a request
+	// arriving from here on describes payload this pass may not have seen, so
+	// it must owe a further pass rather than coalesce into this one.
+	s.maintenanceOwed = false
+	s.maintenanceRunning = true
+	return true
+}
+
+// releaseMaintenancePass closes one worker pass. A pass that was pre-empted
+// re-owes itself: the refresh it was asked to abandon is still owed, and the
+// cooperative pass resumes at the cursor it kept.
+func (s *Store) releaseMaintenancePass(preempted bool) {
+	s.maintenanceSched.Lock()
+	s.maintenanceRunning = false
+	resume := false
+	if preempted && !s.maintenanceClosed {
+		s.maintenanceOwed = true
+		if s.maintenancePriority > 0 {
+			s.maintenancePriorityResume = true
+		} else {
+			resume = true
+		}
+	}
+	signal := s.maintenanceSignal
+	s.maintenanceSched.Unlock()
+	if !resume || signal == nil {
+		return
+	}
+	select {
+	case signal <- struct{}{}:
+	default:
+	}
 }
 
 // awaitMaintenanceQuiescence blocks until no publish window and no payload
@@ -291,6 +505,11 @@ func (s *Store) startMaintenanceLane() {
 // asks for the planner-statistics refresh it owes, runs one pass through the
 // lane, and parks again. Requests that arrive while a pass runs are served by
 // the single pass that follows it.
+//
+// The pass enters as maintenancePlannerStats, which is what makes it
+// pre-emptible, and it quiesces: a refresh must not start inside a publish
+// window or underneath a payload build in flight, which is the partitioning
+// this whole lane exists to remove.
 func (s *Store) runMaintenanceLane(ctx context.Context, signal <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	for {
@@ -302,15 +521,19 @@ func (s *Store) runMaintenanceLane(ctx context.Context, signal <-chan struct{}, 
 		if ctx.Err() != nil {
 			return
 		}
-		// Owed is cleared as the pass starts, not when it ends: a request
-		// arriving from here on describes payload this pass may not have seen,
-		// so it must owe a further pass rather than coalesce into this one.
-		s.maintenanceSched.Lock()
-		s.maintenanceOwed = false
-		s.maintenanceRunning = true
-		s.maintenanceSched.Unlock()
+		if !s.claimMaintenancePass() {
+			// Closed, or a whole-file job owns the lane. In the second case
+			// the pass stays owed and that job re-posts the signal; parking
+			// again is what keeps this worker from spinning on the token.
+			continue
+		}
 
 		s.maintenancePasses.Add(1)
+		// Sampled around the pass rather than plumbed out of it: the pass's
+		// own context is cancelled by whoever pre-empts it, and this worker
+		// only needs to know that it happened, so that the refresh the pass
+		// abandoned is owed again.
+		preemptions := s.maintenancePreemptions.Load()
 		// The error is deliberately dropped, for the same reason every other
 		// planner-statistics call site drops it: a store that could not
 		// refresh its statistics plans through the cost model it already had,
@@ -320,9 +543,7 @@ func (s *Store) runMaintenanceLane(ctx context.Context, signal <-chan struct{}, 
 			return err
 		})
 
-		s.maintenanceSched.Lock()
-		s.maintenanceRunning = false
-		s.maintenanceSched.Unlock()
+		s.releaseMaintenancePass(s.maintenancePreemptions.Load() != preemptions)
 	}
 }
 

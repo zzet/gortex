@@ -712,3 +712,448 @@ func TestMaintenanceLane_StartsWithTheStoreNotWithAPublish(t *testing.T) {
 		t.Fatal("Close returned without joining the lane worker")
 	}
 }
+
+// The pass the lane schedules for a publish QUIESCES: it waits out the payload
+// builds and publish drains in flight instead of running the database-wide
+// ANALYZE underneath one.
+//
+// That is the property the whole item rests on — a refresh charged to a
+// publish is the partitioning the lane exists to remove, and a refresh that
+// merely moved off the publisher's stack onto a worker that starts underneath
+// the next build has moved the cost, not removed it. The lane's other job kind
+// (VACUUM through Compact) has its own case for the same rule; this one is for
+// the kind the daemon's publish actually schedules, and it is the one the
+// quiesce flag at the worker's own call site decides.
+//
+// Both directions are asserted through real state: a genuine payload build
+// flight is what the pass must wait for, and completing that flight is all the
+// deferred refresh is waiting for. The budget is shortened so the deferral —
+// which is real but 30 s away — is observable as a counter rather than as a
+// wall-clock window that has to be guessed.
+func TestMaintenanceLane_ScheduledPassWaitsOutAPayloadBuild(t *testing.T) {
+	shortenMaintenanceBudget(t, 300*time.Millisecond)
+	ctx := context.Background()
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+	seedPayloadControlPlane(t, store)
+	before := seedStalePlannerStats(t, store)
+	// Grow the store past the statistics that describe it, so the pass the
+	// lane runs has real work: without a stale verdict a pass that ignored
+	// quiescence would refresh nothing and the Refreshes assertions below
+	// would pass for the wrong reason.
+	writeIndexStateCounters(t, store, 0, "repo", 800, 400)
+	if stale := mustHealth(t, store); !stale.Stale {
+		t.Fatalf("fixture is not stale after growth (reason=%q): the lane pass would have nothing to do", stale.Reason)
+	}
+
+	generationID, handle, err := store.BeginPayloadGeneration(ctx, payloadRequest())
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration: %v", err)
+	}
+	writePayloadOverlay(t, handle)
+
+	flight, leader, ready, err := store.JoinPayloadBuildFlight(ctx, generationID, false)
+	if err != nil {
+		t.Fatalf("JoinPayloadBuildFlight: %v", err)
+	}
+	if !leader || ready {
+		t.Fatalf("want the physical build leader, got leader=%v ready=%v", leader, ready)
+	}
+	completed := false
+	complete := func() {
+		if !completed {
+			completed = true
+			flight.Complete(nil)
+		}
+	}
+	defer complete()
+	waitForCondition(t, "the payload build to become visible to the lane", func() bool {
+		return strings.Contains(store.maintenanceBusyReason(), "payload build in flight")
+	})
+
+	deferralsBefore := store.maintenanceDeferrals.Load()
+	store.schedulePublishMaintenance()
+	waitForCondition(t, "the lane pass to start", func() bool {
+		return store.maintenancePasses.Load() >= 1
+	})
+	// The pass has started. It must now resolve as a DEFERRAL, not as a job:
+	// a pass that ignored quiescence would be in its ANALYZE by now.
+	waitForCondition(t, "the scheduled pass to defer or reach its SQL", func() bool {
+		return store.maintenanceJobs.Load() > 0 || store.maintenanceDeferrals.Load() > deferralsBefore
+	})
+	if got := store.maintenanceJobs.Load(); got != 0 {
+		t.Fatalf("%d lane jobs reached their SQL while a payload build was in flight, want 0: the pass a publish schedules must wait the build out, not run the database-wide ANALYZE underneath it", got)
+	}
+	if got := store.maintenanceDeferrals.Load(); got != deferralsBefore+1 {
+		t.Errorf("recorded %d deferrals for the pass that met the build, want 1", got-deferralsBefore)
+	}
+	during := mustHealth(t, store)
+	if during.Refreshes != before.Refreshes {
+		t.Fatalf("the lane refreshed planner statistics underneath a payload build (%d -> %d refreshes)", before.Refreshes, during.Refreshes)
+	}
+
+	// And the deferral is not the end of it: the build finishing is all the
+	// refresh was waiting for.
+	complete()
+	if reason := store.maintenanceBusyReason(); reason != "" {
+		t.Fatalf("the completed build left the lane busy: %s", reason)
+	}
+	store.schedulePublishMaintenance()
+	settleMaintenanceLane(t, store)
+	if got := store.maintenanceJobs.Load(); got != 1 {
+		t.Fatalf("the lane ran %d jobs once the build was done, want exactly 1", got)
+	}
+	after := mustHealth(t, store)
+	if after.Refreshes <= before.Refreshes {
+		t.Fatalf("the lane never ran the refresh it deferred (%d -> %d refreshes); stale=%v reason=%q",
+			before.Refreshes, after.Refreshes, after.Stale, after.Reason)
+	}
+}
+
+// holdTheOnlyReadConnection parks the store's read pool at one connection and
+// takes it, so the next read to reach the pool blocks until the returned
+// release is called. It is how a case holds a REAL planner-statistics pass
+// inside the lane: the refresh's first act is a health probe on the read pool,
+// so a pass that cannot get a connection sits there holding the lane token and
+// nothing else — no write gate, no writer connection — which is exactly the
+// shape a checkpoint has to get past.
+func holdTheOnlyReadConnection(t *testing.T, store *Store) (release func()) {
+	t.Helper()
+	store.db.SetMaxOpenConns(1)
+	conn, err := store.db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("taking the read pool's only connection: %v", err)
+	}
+	released := false
+	release = func() {
+		if !released {
+			released = true
+			_ = conn.Close()
+		}
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// A TRUNCATE checkpoint must not be starved behind a planner-statistics pass.
+//
+// The two lane occupants are not alike. The checkpoint carries the indexer's
+// read boundary (internal/indexer/multi.go): one attempt, a 10 s budget, no
+// retry, and skipping it is what leaves a global read pass running against an
+// undrained multi-gigabyte WAL — a measured 48x. A statistics pass can hold the
+// lane token for its pass budget plus one index's ANALYZE plus a reload, which
+// is longer than that budget. Admitting the checkpoint behind such a pass would
+// therefore turn a statistics refresh into a skipped WAL drain.
+//
+// So the pass yields. This case pins it end to end through the real entry
+// points: the pass is the one the store's own lane worker runs (scheduled the
+// way a publish schedules it, entering the lane the way the worker enters it),
+// and the checkpoint is CheckpointWAL itself — the method internal/indexer
+// calls. The pass is held inside the lane by starving the read pool, so it
+// holds the token and nothing else; the checkpoint's own resources (the writer
+// connection, the write gate) stay free, which is what makes "it waited for the
+// lane" the only possible reading of a failure here.
+func TestCheckpointWAL_PreemptsALanePassRatherThanWaitingBehindIt(t *testing.T) {
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+	release := holdTheOnlyReadConnection(t, store)
+
+	jobsBefore := store.maintenanceJobs.Load()
+	store.schedulePublishMaintenance()
+	waitForCondition(t, "the lane pass to take the lane token", func() bool {
+		return store.maintenanceJobs.Load() > jobsBefore
+	})
+	if got := store.maintenancePreemptions.Load(); got != 0 {
+		t.Fatalf("%d pre-emptions before any priority job asked for the lane, want 0", got)
+	}
+
+	started := time.Now()
+	err := store.CheckpointWAL()
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("CheckpointWAL behind a planner-statistics pass returned %v after %s, want the checkpoint to run: the pass must yield the lane rather than make the read boundary skip its WAL drain", err, elapsed)
+	}
+	if elapsed >= walCheckpointTimeout {
+		t.Errorf("CheckpointWAL waited %s behind a planner-statistics pass, want well under its own %s budget", elapsed, walCheckpointTimeout)
+	}
+	if got := store.maintenancePreemptions.Load(); got != 1 {
+		t.Errorf("the lane recorded %d pre-emptions for one checkpoint, want exactly 1", got)
+	}
+	if got := store.maintenanceJobs.Load(); got < jobsBefore+2 {
+		t.Errorf("the lane ran %d jobs, want at least the pass plus the checkpoint (the re-owed pass may already have added a third)", got-jobsBefore)
+	}
+
+	// The pass is owed again rather than lost: a cancelled cooperative refresh
+	// keeps its cursor, and the worker asks for the pass it abandoned. It is
+	// waiting on the same starved read pool, so handing that back is all it
+	// needs.
+	waitForCondition(t, "the pre-empted pass to be owed again", func() bool {
+		return store.maintenancePasses.Load() >= 2
+	})
+	release()
+	settleMaintenanceLane(t, store)
+}
+
+// The converse of the pre-emption, and the half that keeps it from being undone
+// one microsecond later: while a whole-file job holds the lane, the worker does
+// not start a pass at all.
+//
+// Without it a pre-empted pass would re-own the token the instant it yielded —
+// ahead of the checkpoint that asked for it — and the checkpoint would be back
+// where it started. The request is not dropped: it stays owed, and the job that
+// held the lane re-posts it on the way out.
+func TestMaintenanceLane_StartsNoPassWhileAWholeFileJobHoldsTheLane(t *testing.T) {
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		finished <- store.runMaintenance(context.Background(), maintenanceCheckpoint, false, func(context.Context) error {
+			close(inside)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-inside:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the whole-file job never reached the inside of the lane")
+	}
+
+	store.schedulePublishMaintenance()
+	// Deliberately a window rather than a state: the assertion is that
+	// something does NOT happen, and the worker has had its wakeup by now.
+	time.Sleep(100 * time.Millisecond)
+	if got := store.maintenancePasses.Load(); got != 0 {
+		t.Fatalf("the worker started %d passes while a whole-file job held the lane, want 0: a pass that queues there takes the token back ahead of the job that pre-empted it", got)
+	}
+
+	close(release)
+	if err := <-finished; err != nil {
+		t.Fatalf("the whole-file job: %v", err)
+	}
+	// The pass was owed all along, and the job that held the lane is what
+	// wakes it.
+	waitForCondition(t, "the owed pass to run once the lane is free", func() bool {
+		return store.maintenancePasses.Load() >= 1
+	})
+	settleMaintenanceLane(t, store)
+	if got := store.maintenancePasses.Load(); got != 1 {
+		t.Errorf("the lane ran %d passes for one request, want exactly 1", got)
+	}
+}
+
+// maintenancePassRegistered reports whether a pre-emptible pass currently has
+// a handle a priority job could cancel. It reads the same field under the same
+// mutex beginPriorityMaintenance does, so "registered" here means exactly
+// "cancellable by the next whole-file job to arrive".
+func maintenancePassRegistered(store *Store) bool {
+	store.maintenanceSched.Lock()
+	defer store.maintenanceSched.Unlock()
+	return store.maintenancePass != nil
+}
+
+// requirePreemptibleRegistration blocks until the lane's pass is cancellable,
+// and says what it means when it is not. Separate from waitForCondition so the
+// failure names the defect rather than the poll, and NOT fatal: a case that
+// finds no handle here has more to prove — what the missing handle costs the
+// checkpoint that arrives behind that pass — so it records the defect and
+// carries on into the symptom.
+func requirePreemptibleRegistration(t *testing.T, store *Store) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if maintenancePassRegistered(store) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("the lane pass queued for the lane token registered no pre-emption handle: a priority job arriving now finds nothing to cancel, so a checkpoint would wait out the pass's whole quiescence budget (%s) inside its own %s one and skip the WAL drain", maintenanceQuiesceTimeout, walCheckpointTimeout)
+}
+
+// A pass is pre-emptible for the whole time it can be occupying the lane, not
+// only once it reaches its SQL.
+//
+// The pass's own path through runMaintenance has three stages that can hold or
+// be about to hold the token: the wait for the token, the quiescence wait it
+// performs WITH the token already held, and the SQL itself. A pass parked in
+// the middle one is the dangerous shape — it owns the token and is doing
+// nothing with it, waiting out publishes and builds that can last far longer
+// than a checkpoint's 10 s budget. If its cancel handle is only registered
+// after that wait returns, a checkpoint arriving there finds no pass to
+// pre-empt, waits out the pass's budget instead of its own, defers with no
+// retry, and the indexer's global read pass runs against an undrained WAL (the
+// ~11 s vs ~533 s census at internal/indexer/multi.go).
+//
+// This case builds that exact state without a sleep anywhere: the token is
+// held by the case itself, so the pass the store's own worker starts is pinned
+// between its first quiescence wait (which it clears — the store is idle) and
+// the token. The registration assertion then fires while the pass is in that
+// parked state. A real payload build flight is opened before the token is
+// handed over, so the pass takes the token straight into the post-token
+// quiescence wait, and CheckpointWAL — the method internal/indexer calls — has
+// to get past a pass sitting in precisely the middle stage.
+func TestCheckpointWAL_PreemptsAPassParkedInItsQuiescenceWait(t *testing.T) {
+	ctx := context.Background()
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+	seedPayloadControlPlane(t, store)
+
+	// Hold the lane token, so the pass scheduled below cannot get past it.
+	if err := store.maintenanceGate.LockContext(ctx); err != nil {
+		t.Fatalf("taking the lane token: %v", err)
+	}
+	tokenHeld := true
+	releaseToken := func() {
+		if tokenHeld {
+			tokenHeld = false
+			store.maintenanceGate.Unlock()
+		}
+	}
+	defer releaseToken()
+
+	store.schedulePublishMaintenance()
+	waitForCondition(t, "the lane worker to start its pass", func() bool {
+		return store.maintenancePasses.Load() >= 1
+	})
+	// The pass is queued for the token the case holds. It must ALREADY be
+	// cancellable: everything it does from here on happens with the token in
+	// hand or on the way to it. Recorded rather than fatal — the rest of the
+	// case then shows what an unregistered pass costs the checkpoint.
+	requirePreemptibleRegistration(t, store)
+
+	// Open a real payload build flight, so the quiescence wait the pass
+	// performs after it takes the token blocks. This is the state a publish
+	// window leaves the store in, and the one a pass must not sit on the token
+	// through.
+	generationID, handle, err := store.BeginPayloadGeneration(ctx, payloadRequest())
+	if err != nil {
+		t.Fatalf("BeginPayloadGeneration: %v", err)
+	}
+	writePayloadOverlay(t, handle)
+	flight, leader, ready, err := store.JoinPayloadBuildFlight(ctx, generationID, false)
+	if err != nil {
+		t.Fatalf("JoinPayloadBuildFlight: %v", err)
+	}
+	if !leader || ready {
+		t.Fatalf("want the physical build leader, got leader=%v ready=%v", leader, ready)
+	}
+	completed := false
+	complete := func() {
+		if !completed {
+			completed = true
+			flight.Complete(nil)
+		}
+	}
+	defer complete()
+	waitForCondition(t, "the payload build to become visible to the lane", func() bool {
+		return strings.Contains(store.maintenanceBusyReason(), "payload build in flight")
+	})
+
+	if got := store.maintenancePreemptions.Load(); got != 0 {
+		t.Fatalf("%d pre-emptions before any priority job asked for the lane, want 0", got)
+	}
+	// Hand the token over. The pass takes it (it queued first) and parks in
+	// its post-token quiescence wait, holding the lane and doing nothing.
+	releaseToken()
+
+	started := time.Now()
+	cpErr := store.CheckpointWAL()
+	elapsed := time.Since(started)
+	if cpErr != nil {
+		t.Fatalf("CheckpointWAL met a pass parked in its quiescence wait and returned %v after %s: the pass must yield the lane rather than make the indexer's read boundary skip its WAL drain", cpErr, elapsed)
+	}
+	if elapsed >= walCheckpointTimeout {
+		t.Errorf("CheckpointWAL waited %s behind a parked pass, want well under its own %s budget", elapsed, walCheckpointTimeout)
+	}
+	if got := store.maintenancePreemptions.Load(); got != 1 {
+		t.Errorf("the lane recorded %d pre-emptions for one checkpoint, want exactly 1", got)
+	}
+	// The yielded pass is a deferral, not a job: it never reached its SQL.
+	if got := store.maintenanceJobs.Load(); got != 1 {
+		t.Errorf("the lane counted %d jobs, want exactly 1 (the checkpoint): a pass that yielded reached no SQL and is counted as a deferral", got)
+	}
+
+	// And the refresh is owed again rather than lost. Completing the build is
+	// all the re-owed pass is waiting for.
+	waitForCondition(t, "the pre-empted pass to be owed again", func() bool {
+		return store.maintenancePasses.Load() >= 2
+	})
+	complete()
+	settleMaintenanceLane(t, store)
+}
+
+// The lock-held priority re-check inside beginPreemptiblePass, on its own.
+//
+// claimMaintenancePass refuses to open a pass while a whole-file job is
+// waiting for or holding the lane, which covers every pass that has not
+// started yet. What it cannot cover is the pass claimed one instant BEFORE
+// such a job arrived: that pass read a zero priority mark at claim time and is
+// already on its way to the lane. Between the claim and the registration the
+// priority job can take maintenanceSched, find no pass registered, and have
+// nothing to cancel — so the pass has to re-read the mark under that same lock
+// and yield on its own.
+//
+// The window is microseconds wide through the worker, so the case reproduces
+// the interleaving directly: a real priority job is inside the lane (the shape
+// CheckpointWAL and Compact both enter as), and the pass then enters
+// runMaintenance the way the worker enters it. Without the re-check the pass
+// registers, queues for a token a whole-file job is holding, and spends its
+// entire budget there.
+func TestMaintenanceLane_PassClaimedBeforeAPriorityJobYieldsAtRegistration(t *testing.T) {
+	budget := 2 * time.Second
+	shortenMaintenanceBudget(t, budget)
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		finished <- store.runMaintenance(context.Background(), maintenanceCheckpoint, false, func(context.Context) error {
+			close(inside)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-inside:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the whole-file job never reached the inside of the lane")
+	}
+
+	preemptionsBefore := store.maintenancePreemptions.Load()
+	jobsBefore := store.maintenanceJobs.Load()
+	ran := make(chan error, 1)
+	started := time.Now()
+	err := store.runMaintenance(context.Background(), maintenancePlannerStats, true, func(passCtx context.Context) error {
+		ran <- passCtx.Err()
+		return nil
+	})
+	elapsed := time.Since(started)
+
+	if got := store.maintenancePreemptions.Load(); got != preemptionsBefore+1 {
+		t.Fatalf("the pass recorded %d pre-emptions, want 1: a pass that reaches registration with a priority job already marked must yield on its own, not queue for the token that job is holding", got-preemptionsBefore)
+	}
+	if elapsed >= budget/2 {
+		t.Errorf("the pass spent %s before giving up, want it to yield immediately (budget %s): it queued for the lane token instead of yielding", elapsed, budget)
+	}
+	if !errors.Is(err, ErrMaintenanceBusy) {
+		t.Errorf("the yielded pass returned %v, want a %v deferral", err, ErrMaintenanceBusy)
+	}
+	select {
+	case passErr := <-ran:
+		t.Errorf("the yielded pass ran its SQL (ctx err %v) while a whole-file job held the lane", passErr)
+	default:
+	}
+	if got := store.maintenanceJobs.Load(); got != jobsBefore {
+		t.Errorf("the lane counted %d further jobs for a pass that yielded, want 0", got-jobsBefore)
+	}
+
+	close(release)
+	if err := <-finished; err != nil {
+		t.Fatalf("the whole-file job: %v", err)
+	}
+}

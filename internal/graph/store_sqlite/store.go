@@ -172,25 +172,45 @@ type storeCore struct {
 	// boundaries post to and the lane's worker consumes; maintenanceDone is
 	// closed by that worker when it returns, so Close can join it.
 	// maintenanceSched guards the ctx/cancel pair, the signal slot's companion
-	// owed flag and the running / closed scheduling state.
-	maintenanceSched   sync.Mutex
-	maintenanceCtx     context.Context
-	maintenanceCancel  context.CancelFunc
-	maintenanceSignal  chan struct{}
-	maintenanceDone    chan struct{}
-	maintenanceRunning bool
-	maintenanceOwed    bool
-	maintenanceClosed  bool
+	// owed flag, the running / closed scheduling state and the priority
+	// bookkeeping below.
+	//
+	// maintenancePriority counts the whole-file jobs (VACUUM, TRUNCATE
+	// checkpoint) that are waiting for or holding the lane right now, and
+	// maintenancePass is the planner-statistics pass they pre-empt: those jobs
+	// sit on latency budgets of their own — CheckpointWAL's is 10 s — while a
+	// pass can legitimately hold the token for longer, so a pass yields to
+	// them rather than making them defer. maintenancePriorityResume records
+	// that the worker declined to start a pass because of one, so the last
+	// such job to finish re-posts the signal the worker parked on.
+	maintenanceSched          sync.Mutex
+	maintenanceCtx            context.Context
+	maintenanceCancel         context.CancelFunc
+	maintenanceSignal         chan struct{}
+	maintenanceDone           chan struct{}
+	maintenanceRunning        bool
+	maintenanceOwed           bool
+	maintenanceClosed         bool
+	maintenancePriority       int
+	maintenancePriorityResume bool
+	maintenancePass           *maintenancePassHandle
 
 	// Lane counters. Requests counts scheduling calls, passes counts lane
 	// passes actually started (so a burst of requests collapsing into one
-	// pass is observable), jobs counts actions that reached their SQL, and
-	// deferrals counts actions that gave up because the store never went
-	// quiescent inside their budget.
-	maintenanceRequests  atomic.Int64
-	maintenancePasses    atomic.Int64
-	maintenanceJobs      atomic.Int64
-	maintenanceDeferrals atomic.Int64
+	// pass is observable), jobs counts actions that reached their SQL,
+	// deferrals counts actions that gave up short of it — the store never went
+	// quiescent inside their budget, the lane token never came free, or a
+	// priority job asked a pass to yield — and preemptions counts the passes
+	// asked to yield so a whole-file job could have the token.
+	//
+	// Jobs and deferrals partition every lane entry that got past the
+	// coreless check: an entry is counted in exactly one of them, so a pass
+	// that yields is a deferral and never also a job.
+	maintenanceRequests    atomic.Int64
+	maintenancePasses      atomic.Int64
+	maintenanceJobs        atomic.Int64
+	maintenanceDeferrals   atomic.Int64
+	maintenancePreemptions atomic.Int64
 
 	// publishDrains counts publish windows in flight: a generation that is
 	// sealed but whose transition has not committed yet. A whole-file
@@ -983,6 +1003,21 @@ func passiveCheckpointReport(result walCheckpointResult, err, ctxErr error) stri
 // build-length wait would blow. Failing to enter the lane inside
 // walCheckpointTimeout is reported as a deferral, which every caller already
 // treats as skip-and-continue.
+//
+// It is a PRIORITY job in that lane, and the reason is the cost of the
+// deferral rather than the cost of the checkpoint. This boundary is why the
+// indexer's global read passes are not run against a multi-gigabyte WAL (the
+// census the caller at internal/indexer/multi.go measures went from ~11 s
+// against a checkpointed store to ~533 s against an undrained one), and the
+// checkpoint gets ONE 10 s attempt with no retry. The other occupant of the
+// lane is the planner-statistics pass, which can hold the token for its pass
+// budget plus one index's ANALYZE plus a reload — longer than this budget —
+// so admitting the checkpoint behind it would put that 48x boundary behind a
+// statistics refresh. Instead the pass yields: runMaintenance marks this job
+// priority on entry, which cancels the pass in flight and stops the worker
+// starting another until the checkpoint is done. The pass loses nothing
+// durable — a cancelled cooperative refresh is a deferral that keeps its
+// cursor and resumes at the next boundary.
 func (s *Store) CheckpointWAL() error {
 	ctx, cancel := context.WithTimeout(context.Background(), walCheckpointTimeout)
 	defer cancel()
