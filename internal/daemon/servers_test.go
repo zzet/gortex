@@ -146,3 +146,105 @@ func TestProxyIdentityRoundTripsThroughContext(t *testing.T) {
 		t.Fatalf("identity = %+v, want trimmed halves", got)
 	}
 }
+
+// TestABodyOnlyCwdStillReachesTheRemotesViewSeam is the second half of the
+// header-less-client fix.
+//
+// Not every producer of a proxied call has a transport-level cwd to attach:
+// the unix-socket dispatcher's tryProxyToolCall hands the router a body and no
+// ProxyIdentity at all. The remote's ROUTING peek does read the body's cwd, so
+// the call lands on the right daemon — but its view seam does not:
+// requestViewCWD / requestToolContext (internal/server/handler.go) read the
+// `X-Gortex-Cwd` header and the `?cwd=` query only, so a body-only cwd binds
+// nothing and the answer comes from the remote's base corpus. Completing the
+// identity from the body here is what makes the proxied answer describe the
+// same view the local dispatch would have.
+func TestABodyOnlyCwdStillReachesTheRemotesViewSeam(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"nested under arguments", `{"arguments":{"query":"Foo","cwd":" /work/nested "}}`, "/work/nested"},
+		{"top level", `{"cwd":"/work/top","query":"Foo"}`, "/work/top"},
+		{"arguments outrank top level", `{"arguments":{"cwd":"/work/nested"},"cwd":"/work/top"}`, "/work/nested"},
+		{"explicit null arguments", `{"arguments":null,"cwd":"/work/top"}`, "/work/top"},
+		{"no cwd anywhere", `{"arguments":{"query":"Foo"}}`, ""},
+		{"not json", `not json at all`, ""},
+		{"empty body", ``, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan string, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got <- r.Header.Get("X-Gortex-Cwd")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer srv.Close()
+
+			cli, err := NewServerClient(ServerEntry{Slug: "r2", URL: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := cli.ProxyToolCtx(context.Background(), "search_symbols", []byte(tc.body)); err != nil {
+				t.Fatal(err)
+			}
+			if sent := <-got; sent != tc.want {
+				t.Fatalf("X-Gortex-Cwd = %q, want %q", sent, tc.want)
+			}
+		})
+	}
+}
+
+// TestTheContextIdentityIsNeverOverriddenByTheBody: completion is a fallback,
+// not a re-resolution. The /v1 front door already folds the body's cwd into
+// the ctx identity before it routes; a caller that deliberately scoped the hop
+// must not be second-guessed by a stale `cwd` left in the arguments.
+func TestTheContextIdentityIsNeverOverriddenByTheBody(t *testing.T) {
+	got := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Get("X-Gortex-Cwd")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	cli, err := NewServerClient(ServerEntry{Slug: "r2", URL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithProxyIdentity(context.Background(), ProxyIdentity{CWD: "/work/from-ctx"})
+	if _, _, err := cli.ProxyToolCtx(ctx, "search_symbols", []byte(`{"arguments":{"cwd":"/work/from-body"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if sent := <-got; sent != "/work/from-ctx" {
+		t.Fatalf("X-Gortex-Cwd = %q, want the context identity to win", sent)
+	}
+}
+
+// TestBodyCompletionAddsNoSessionIdentity: the body carries a workspace
+// boundary, never a session id. Completing the cwd must not manufacture an
+// `Mcp-Session-Id` the caller never had — that header drives the remote's
+// tool-policy gate.
+func TestBodyCompletionAddsNoSessionIdentity(t *testing.T) {
+	got := make(chan bool, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, has := r.Header["Mcp-Session-Id"]
+		got <- has
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	cli, err := NewServerClient(ServerEntry{Slug: "r2", URL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cli.ProxyToolCtx(context.Background(), "search_symbols",
+		[]byte(`{"arguments":{"cwd":"/work/nested"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if <-got {
+		t.Fatal("body completion invented a session id")
+	}
+}

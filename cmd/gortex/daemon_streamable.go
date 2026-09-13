@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -246,13 +249,36 @@ func buildDaemonStreamableHandler(disp daemon.MCPDispatcher, reg *daemon.Session
 	// proxyIdentityMiddleware sits INSIDE both, on the request path only:
 	// it costs nothing for a refused request and everything downstream —
 	// including the transport's own tryRouteToolCall, which builds its ctx
-	// from r.Context() — then sees the caller's view identity.
+	// from r.Context() — then sees the caller's view identity. Being inside
+	// auth is also what makes the session-store probe below safe: an
+	// unauthenticated request never reaches it.
+	//
+	// The session lookup is THIS transport's store (the same one the
+	// transport itself reads a moment later), so the cwd the middleware
+	// forwards to a remote is byte-for-byte the cwd the local bind would
+	// have used for the same request.
 	handler := browserOriginGuard(
-		bearerAuthMiddleware(proxyIdentityMiddleware(mux), tokenFn),
+		bearerAuthMiddleware(proxyIdentityMiddleware(mux, sessionCWDLookup(wrapped)), tokenFn),
 		daemonHTTPAllowedOrigins)
 	return &daemonHTTPSurface{
 		Handler:    handler,
 		baseLeases: baseCorpusLeasesFor(disp),
+	}
+}
+
+// sessionCWDLookup adapts a streamable session store to the one question the
+// proxy-identity middleware asks of it: "what cwd did this session declare?".
+// Returns nil for a nil store so the middleware simply skips that source.
+func sessionCWDLookup(store streamable.SessionStore) func(string) string {
+	if store == nil {
+		return nil
+	}
+	return func(sid string) string {
+		state, ok := store.Get(sid)
+		if !ok {
+			return ""
+		}
+		return state.CWD
 	}
 }
 
@@ -297,17 +323,105 @@ func baseCorpusLeasesFor(disp daemon.MCPDispatcher) server.BaseCorpusLeases {
 // /v1 surface agree on what a proxied call tells the remote about the caller's
 // view — before this, a proxied call arrived with neither header and the
 // remote answered from its own base corpus.
-func proxyIdentityMiddleware(next http.Handler) http.Handler {
+//
+// The identity must be derived from the SAME three sources, in the SAME order,
+// that the transport's own local bind uses (internal/mcp/streamable/
+// transport.go, tryRouteToolCall): the tools/call `cwd` argument, then the
+// session's cwd, then the `X-Gortex-Cwd` header. A header-only read covers
+// exactly one client shape — the canonical Streamable-HTTP client supplies its
+// cwd once, in `initialize._meta.cwd`, and sends no cwd header on any later
+// request — so for that (majority) shape the local route bound the session's
+// checkout while the proxied route forwarded nothing at all. sessionCWD is the
+// transport's own session store, read here because the middleware runs before
+// the transport has parsed the frame; nil disables that one source and leaves
+// the other two intact.
+func proxyIdentityMiddleware(next http.Handler, sessionCWD func(sessionID string) string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := daemon.ProxyIdentity{
-			SessionID: r.Header.Get("Mcp-Session-Id"),
-			CWD:       strings.TrimSpace(r.Header.Get("X-Gortex-Cwd")),
+		sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
+		var cwd string
+		// 1. The call's own `cwd` argument. Peeked off the frame without
+		//    consuming it — the transport re-reads r.Body below.
+		cwd, r = peekProxyIdentityCWD(r)
+		// 2. The session's cwd, which is where a canonical client's
+		//    `initialize._meta.cwd` landed.
+		if cwd == "" && sid != "" && sessionCWD != nil {
+			cwd = strings.TrimSpace(sessionCWD(sid))
 		}
+		// 3. The header, for a client that sets one per request.
+		if cwd == "" {
+			cwd = strings.TrimSpace(r.Header.Get("X-Gortex-Cwd"))
+		}
+		id := daemon.ProxyIdentity{SessionID: sid, CWD: cwd}
 		if !id.Empty() {
 			r = r.WithContext(daemon.WithProxyIdentity(r.Context(), id))
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// maxProxyIdentityPeek bounds how much of a request body the identity peek
+// buffers. A JSON-RPC tools/call frame is kilobytes; anything past the bound
+// is streamed through untouched (and simply yields no peeked cwd), so a large
+// body can never be pulled into memory by this middleware.
+const maxProxyIdentityPeek = 1 << 20
+
+// peekProxyIdentityCWD reads the `params.arguments.cwd` of a POST /mcp
+// tools/call frame and hands the request back with its body intact.
+//
+// Non-POST requests (the SSE GET stream, DELETE, OPTIONS) are returned
+// untouched: they carry no frame, and buffering a long-lived GET body would be
+// actively wrong.
+func peekProxyIdentityCWD(r *http.Request) (string, *http.Request) {
+	if r == nil || r.Method != http.MethodPost || r.Body == nil || r.Body == http.NoBody {
+		return "", r
+	}
+	orig := r.Body
+	head, err := io.ReadAll(io.LimitReader(orig, maxProxyIdentityPeek))
+	// Whatever was consumed must go back in front of the remainder, error or
+	// not: the transport is the one that gets to report a broken body.
+	r.Body = &rewoundBody{Reader: io.MultiReader(bytes.NewReader(head), orig), closer: orig}
+	if err != nil {
+		return "", r
+	}
+	return toolCallFrameCWD(head), r
+}
+
+// rewoundBody re-serves already-read bytes ahead of the untouched remainder of
+// the original stream, and closes that original on Close.
+type rewoundBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (b *rewoundBody) Close() error { return b.closer.Close() }
+
+// toolCallFrameCWD extracts the `cwd` argument from a JSON-RPC tools/call
+// frame. Only tools/call is peeked — it is the one method the transport routes
+// — and `arguments` is decoded through json.RawMessage because a missing key
+// and an explicit `null` both mean "no arguments" at the MCP layer.
+func toolCallFrameCWD(frame []byte) string {
+	if len(frame) == 0 {
+		return ""
+	}
+	var envelope struct {
+		Method string `json:"method"`
+		Params struct {
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(frame, &envelope); err != nil || envelope.Method != "tools/call" {
+		return ""
+	}
+	if len(envelope.Params.Arguments) == 0 {
+		return ""
+	}
+	var args struct {
+		Cwd string `json:"cwd"`
+	}
+	if err := json.Unmarshal(envelope.Params.Arguments, &args); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(args.Cwd)
 }
 
 // browserOriginGuard refuses a request carrying a cross-origin Origin header.

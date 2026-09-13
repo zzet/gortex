@@ -449,6 +449,68 @@ func ProxyIdentityFromContext(ctx context.Context) ProxyIdentity {
 	return id
 }
 
+// proxyIdentityForCall is the identity a proxied tool call actually carries:
+// whatever the caller's transport attached to ctx, completed — never
+// overridden — from the call's own `cwd` argument.
+//
+// The completion half exists because not every producer of a proxied call has
+// a transport-level cwd to attach. A front door that only reads headers (the
+// /mcp mount before this wave, and the unix-socket dispatcher's
+// tryProxyToolCall) leaves ctx carrying no CWD at all, and the remote then
+// resolves its view from the body — which is fine for peekRouteContext (it
+// prefers the body's cwd) but NOT for the remote's requestViewCWD /
+// requestToolContext pair (internal/server/handler.go), which read the header
+// and the `?cwd=` query only. So a call whose cwd lives solely in the body
+// reaches the remote's view seam with nothing to bind and is answered from the
+// remote's base corpus.
+//
+// Completion is strictly a fallback: a ctx identity always wins, so a caller
+// that deliberately scoped the hop (the /v1 front door, which already folded
+// the body's cwd into ctx) is never second-guessed here.
+func proxyIdentityForCall(ctx context.Context, body []byte) ProxyIdentity {
+	id := ProxyIdentityFromContext(ctx)
+	if id.CWD == "" {
+		id.CWD = toolCallBodyCWD(body)
+	}
+	return id
+}
+
+// toolCallBodyCWD peeks the `cwd` argument off a `POST /v1/tools/<name>` body
+// in both shapes the endpoint accepts: nested under `arguments` (what every
+// router caller marshals — see the streamable transport's tryRouteToolCall and
+// the daemon dispatcher's tryProxyToolCall, which both wrap the raw arguments
+// under that key) and top-level (what a hand-written client posts). The
+// precedence mirrors internal/server.Handler.peekRouteContext exactly, so the
+// value forwarded here is the one the remote would have peeked anyway.
+//
+// `arguments` is decoded through json.RawMessage because the MCP layer treats
+// a missing key and an explicit `null` alike; decoding it as a struct would
+// make a `"arguments":null` body fail the whole unmarshal and lose a
+// legitimate top-level cwd.
+func toolCallBodyCWD(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var envelope struct {
+		Arguments json.RawMessage `json:"arguments"`
+		Cwd       string          `json:"cwd"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return ""
+	}
+	if len(envelope.Arguments) > 0 {
+		var args struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(envelope.Arguments, &args); err == nil {
+			if cwd := strings.TrimSpace(args.Cwd); cwd != "" {
+				return cwd
+			}
+		}
+	}
+	return strings.TrimSpace(envelope.Cwd)
+}
+
 // ProxyTool forwards a single MCP tool invocation to this server's
 // `POST /v1/tools/<name>` endpoint and returns the raw response
 // bytes. Used by the daemon's hybrid-read router when a query's
@@ -487,10 +549,12 @@ func (c *ServerClient) ProxyToolCtx(ctx context.Context, toolName string, body [
 	// Forward the caller's view identity so the remote resolves the same
 	// view a local dispatch would have. These are the two headers the
 	// remote's own /v1/tools handler reads (internal/server/handler.go:
-	// handleToolCall reads Mcp-Session-Id, peekRouteContext reads
-	// X-Gortex-Cwd); anything absent here is simply not set, leaving the
-	// remote on the body's `cwd` argument as before.
-	if id := ProxyIdentityFromContext(ctx); !id.Empty() {
+	// handleToolCall reads Mcp-Session-Id, requestViewCWD / peekRouteContext
+	// read X-Gortex-Cwd); anything absent here is simply not set, leaving the
+	// remote where it was. The identity is completed from the call's own
+	// `cwd` argument when the caller's transport had none of its own to
+	// attach — see proxyIdentityForCall.
+	if id := proxyIdentityForCall(ctx, body); !id.Empty() {
 		if id.CWD != "" {
 			req.Header.Set("X-Gortex-Cwd", id.CWD)
 		}

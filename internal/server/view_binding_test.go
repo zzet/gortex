@@ -496,3 +496,90 @@ func TestTheNormalPathReleasesThroughCloseNotThroughTheNet(t *testing.T) {
 	require.False(t, leases.InUse(graphview.BaseCorpusGeneration),
 		"release() did not cover a response that never reached close()")
 }
+
+// walkGateStore parks inside the Nth GetNode so a test can inspect the world
+// while a multi-read walk is half-finished.
+type walkGateStore struct {
+	graph.Store
+	at      int
+	mu      sync.Mutex
+	seen    int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *walkGateStore) GetNode(id string) *graph.Node {
+	s.mu.Lock()
+	s.seen++
+	n := s.seen
+	s.mu.Unlock()
+	if n == s.at {
+		close(s.entered)
+		<-s.release
+	}
+	return s.Store.GetNode(id)
+}
+
+// TestCaveatEnrichmentHoldsThePinBetweenItsReads is the /v1/caveats analogue of
+// the /v1/graph two-scan race, and the reason the enrichment walk needed a pin
+// of its own.
+//
+// The walk is not one read: it is GetNode, then GetInEdges, then a GetNode per
+// caller, per caveat — and every tool sub-call above it has already released
+// the request view it held. A gate that only samples "was the base corpus
+// pinned at the instant of each read" cannot tell one pin held across the walk
+// from a pin re-taken per read; a sweep that collected the generation while the
+// handler sat BETWEEN two of those reads would splice two generations into one
+// page. This parks the handler between the first caveat's node lookup and its
+// caller lookup and asserts the pin is live there.
+func TestCaveatEnrichmentHoldsThePinBetweenItsReads(t *testing.T) {
+	leases := graphview.NewLeaseManager()
+	gate := &walkGateStore{
+		Store:   seededGraph(t),
+		at:      2, // the caller lookup, i.e. after GetNode + GetInEdges
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h := viewBindingHandler(t, gate, leases, withCaveatAnalyze)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/caveats", nil))
+		done <- rec
+	}()
+
+	select {
+	case <-gate.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the caveat enrichment walk never reached its second node read")
+	}
+	require.True(t, leases.InUse(graphview.BaseCorpusGeneration),
+		"the base corpus was unpinned while /v1/caveats was mid-enrichment")
+
+	close(gate.release)
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("/v1/caveats never finished")
+	}
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.False(t, leases.InUse(graphview.BaseCorpusGeneration),
+		"/v1/caveats leaked its base-corpus pin past the response")
+
+	// The walk actually ran — otherwise the liveness assertion above would
+	// have been about an empty page.
+	var body struct {
+		Caveats []struct {
+			Symbol   string `json:"symbol"`
+			FilePath string `json:"file_path"`
+			FanIn    int    `json:"fan_in"`
+		} `json:"caveats"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.NotEmpty(t, body.Caveats, "the caveats page was empty; the gate proved nothing")
+	require.Equal(t, "a.go", body.Caveats[0].FilePath,
+		"the enrichment walk did not fill the caveat in")
+	require.Equal(t, 1, body.Caveats[0].FanIn)
+}
