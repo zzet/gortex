@@ -45,7 +45,9 @@ func (cr *CrossRepoResolver) ResolveMutationFrontiers(resolutionFiles, edgeSourc
 
 // ResolveMutationFrontiersBounded is ResolveMutationFrontiers plus the incoming
 // leg's completeness fact. The frontier's incoming admission is charged against
-// the same shared ceiling the single-repository legs use, and a refusal empties
+// the same shared ceiling the single-repository legs use (the constant, not one
+// budget object: every leg passes a nil budget and gets a fresh one), and a
+// refusal empties
 // the incoming half of the frontier: the pass then resolves only the changed
 // files' own outgoing edges, and its CrossRepoStats — which count exactly that
 // — would otherwise read as a complete pass.

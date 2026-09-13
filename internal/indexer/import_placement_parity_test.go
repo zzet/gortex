@@ -31,15 +31,15 @@ import (
 //     the directory the path names, a directory whose last component matches,
 //     or the relative join — and, when the specifier is a bare JS/TS one, in a
 //     directory that holds a module entry point, which is the single gate
-//     `consider` applies to a same-repo candidate (resolver.go:3781-3783).
+//     `consider` applies to a same-repo candidate (resolver.go:4008-4010).
 //     The relative join is the only one of the three that can SUPPRESS the
 //     others, and only when it answers for every importer: resolveImport takes
-//     the relative arm's result only `if to != ""` (resolver.go:3679), so a
+//     the relative arm's result only `if to != ""` (resolver.go:3906), so a
 //     miss reaches the cascade with the raw `./…` payload.
 //
 // NO STRAY is deliberately NOT "every file the resolver actually bound". The
 // resolver's same-repo branch takes the FIRST candidate the scan reaches with
-// no precision test at all (resolver.go:3784-3792; its own words, at
+// no precision test at all (resolver.go:4062-4070; its own words, at
 // jsts_imports.go:276-277: "the same-repo branch of `consider` accepts the
 // first one with no further check"), in whatever order buildDirIndexes
 // bucketed the corpus. Which of several same-named directories that lands on
@@ -121,7 +121,7 @@ export function run() { return log() + auth() + parse(); }
 	// jsts_imports.go:99-117) and resolveImport carries on to the cascade
 	// with the raw `./auth` — where lastPathComponent is `auth`, bareJSTS is
 	// false, and `consider` binds the first misc/auth/ candidate it reaches
-	// (resolver.go:3679, :3766, :3815-3822). A closure that treats the join
+	// (resolver.go:3906, :3766, :3815-3822). A closure that treats the join
 	// as terminal places nothing here and DROPS whatever the resolver bound.
 	// misc/auth/ carries a sibling beside its barrel so the placement has to
 	// be the whole candidate directory, not the entry point alone.
@@ -232,6 +232,88 @@ int main() { return 0; }
 	"native/helper.h":    "#pragma once\nint helper();\n",
 	"native/vecs/impl.h": "#pragma once\nint impl();\n",
 	"extra/vecs/other.h": "#pragma once\nint other();\n",
+
+	// F. The QUALIFIED-NAME arm (resolver.go:3961-3972), which runs ahead of
+	// the whole cascade and binds a node by its QualName with no directory
+	// involved — across language families. The Kubernetes extractor stamps
+	// `<kind>/<name>` as the resource node's qualified name
+	// (parser/languages/kubernetes.go:89), so a bare TypeScript specifier
+	// spelled `Service/logger` binds the YAML resource node in k8s/svc.yaml.
+	// Measured: the indexed graph carries
+	// `imports repo/qual/app.ts -> repo/k8s::Service::_default::logger`.
+	//
+	// Neither cascade key names k8s/: dirIndex has no `Service/logger`
+	// directory, and lastDirIndex["logger"] offers a/logger and b/logger — the
+	// decoys that make the case non-vacuous. A cascade-only closure therefore
+	// DROPS the file the resolver actually bound, which is why the arm is
+	// mirrored rather than declared a superset-only residual.
+	"qual/app.ts": `import { ping } from 'Service/logger';
+
+export function boot() { return ping(); }
+`,
+	"k8s/svc.yaml": `apiVersion: v1
+kind: Service
+metadata:
+  name: logger
+spec:
+  ports:
+    - port: 80
+`,
+
+	// G. The relative-import PASS (relative_imports.go), whose specifiers carry
+	// no `./` prefix and therefore reach neither the relative join nor the
+	// cascade. Three shapes at once — a C-family quoted include of a
+	// same-directory header (resolveCInclude, :96-149), a Python relative import
+	// the extractor has already joined onto its package (resolvePython, :60-68),
+	// and a PHP literal `require __DIR__ . '/lib.php'` (resolvePhpInclude,
+	// :320-…).
+	//
+	// The closure mirrors NONE of them, and these files are what measures why:
+	// every one of these imports is still `external::…` in the indexed fixture,
+	// because resolveImport stamped that target on the edge (resolver.go:4123)
+	// before the pass could test for the `unresolved::import::` prefix its
+	// C-family and PHP arms require. NO DROP is checked against whatever the
+	// real pass did, so the day it binds one of these the differential says so.
+	"csame/main.cpp": `#include "sibling.h"
+
+int csame() { return 0; }
+`,
+	"csame/sibling.h": "#pragma once\nint sibling();\n",
+	"pypkg/__init__.py": `def pkg():
+    return 0
+`,
+	"pypkg/app.py": `from . import leaf
+
+
+def go():
+    return leaf.run()
+`,
+	"pypkg/leaf.py": `def run():
+    return 1
+`,
+	"phpdir/app.php": `<?php
+require_once __DIR__ . '/lib.php';
+`,
+	"phpdir/lib.php": `<?php
+function libfn() { return 1; }
+`,
+
+	// H. The npm-manifest gate (declaresExternalNpmDep, resolver.go:4000),
+	// applied at :3907 to skip the cascade outright for a bare specifier the
+	// importer's package.json declares a registry dependency. The closure reads
+	// no manifest, so it keeps placing the in-repo directory — a SUPERSET, the
+	// direction the closure is allowed to err in, and the differential is what
+	// states that it stays a superset rather than becoming a drop.
+	"npmapp/package.json": `{
+  "name": "npmapp",
+  "dependencies": { "lodashish": "^4.0.0" }
+}
+`,
+	"npmapp/app.ts": `import { chunk } from 'lodashish';
+
+export function boot() { return chunk(); }
+`,
+	"vendored/lodashish/index.ts": "export function chunk() { return 1; }\n",
 }
 
 // TestImportPlacementParityWithResolverCascade is the differential harness.
@@ -271,7 +353,21 @@ func TestImportPlacementParityWithResolverCascade(t *testing.T) {
 			// NO STRAY.
 			for _, p := range placements {
 				specCallers := refs.importCallers(p.spec)
+				// The one arm that never reaches `consider`: the qualified-name
+				// arm. It offers a file in a directory the cascade's own two
+				// keys do not name, and it is not subject to the entry-point
+				// gate. Read off the store's qualified-name index — the
+				// resolver's own primitive — so the exemption cannot be a
+				// restatement of the placement it exempts.
+				// The exemption is per FILE, not per directory: the arm binds a
+				// NODE and the closure places that node's file, so exempting
+				// its whole directory would authorise placements the arm never
+				// offers.
+				offers := importParityQualNameOffers(walk, p.spec)
 				for _, f := range p.placed {
+					if _, offered := offers[f]; offered {
+						continue
+					}
 					if !importParityCandidateDir(walk, p.spec, specCallers, path.Dir(f)) {
 						t.Errorf("closure places %q for specifier %q in %s, but %q is not a directory the "+
 							"resolver's import index offers for that specifier",
@@ -282,9 +378,12 @@ func TestImportPlacementParityWithResolverCascade(t *testing.T) {
 					continue
 				}
 				for _, f := range p.placed {
+					if _, offered := offers[f]; offered {
+						continue
+					}
 					if !importParityDirHasEntryPoint(walk, path.Dir(f)) {
 						t.Errorf("closure places %q for the bare JS/TS specifier %q in %s, but %q holds no "+
-							"module entry point, so `consider` (resolver.go:3781-3783) rejects every "+
+							"module entry point, so `consider` (resolver.go:4008-4010) rejects every "+
 							"candidate in it",
 							f, p.spec, importer, path.Dir(f))
 					}
@@ -298,7 +397,7 @@ func TestImportPlacementParityWithResolverCascade(t *testing.T) {
 // honest about WHICH arm it is pinning.
 //
 // resolveImport answers a package-shaped specifier from the qualified-name
-// index (resolver.go:3732-3746) BEFORE the dirIndex/lastDirIndex cascade is
+// index (resolver.go:3961-3972) BEFORE the dirIndex/lastDirIndex cascade is
 // reached, and from a relative join before that. An agreement between the
 // closure's last-component arm and a resolver answer produced on one of those
 // earlier arms would be a fixture coincidence, not parity — so this asserts
@@ -313,7 +412,7 @@ func TestImportPlacementExercisesTheLastComponentArm(t *testing.T) {
 	} {
 		t.Run(spec, func(t *testing.T) {
 			if node := store.GetNodeByQualName(spec); node != nil {
-				t.Fatalf("the qualified-name arm (resolver.go:3732-3746) can fire for %q — it names %q "+
+				t.Fatalf("the qualified-name arm (resolver.go:3961-3972) can fire for %q — it names %q "+
 					"(kind %s) — so this case does not exercise the last-component arm",
 					spec, node.ID, node.Kind)
 			}
@@ -336,8 +435,8 @@ func TestImportPlacementExercisesTheLastComponentArm(t *testing.T) {
 // closure may not narrow past.
 //
 // The resolver's same-repo branch binds the FIRST candidate its scan reaches
-// (resolver.go:3784-3792, short-circuited by stop() at :3805/:3812) and applies
-// NO precision test to it. dirMatchesImport (resolver.go:5753-5757) looks like
+// (resolver.go:4062-4070, short-circuited by stop() at :3805/:3812) and applies
+// NO precision test to it. dirMatchesImport (resolver.go:5984-5996) looks like
 // that test but is not: its own contract restricts it to authorising
 // CROSS-repo candidates (":5749-5752"), and jsts_imports.go:290-293 rejects
 // applying it to the same-repo branch by name. Every candidate this walk sees
@@ -384,10 +483,10 @@ func TestImportPlacementKeepsEverySameNamedCandidateDirectory(t *testing.T) {
 		// The relative arm is a FIRST TRY, not a terminal one. `mono/` holds
 		// no `auth` module, so resolveJSTSImportTarget returns "" and
 		// resolveImport carries on with the RAW `./auth`
-		// (resolver.go:3679-3688): lastPathComponent is `auth`
-		// (resolver.go:5733-5739), bareJSTS is false for a `./` prefix
+		// (resolver.go:3906-3914): lastPathComponent is `auth`
+		// (resolver.go:5960-5966), bareJSTS is false for a `./` prefix
 		// (jsts_imports.go:253-264) so `consider` applies NO gate, and the
-		// first misc/auth/ candidate binds (resolver.go:3815-3822).
+		// first misc/auth/ candidate binds (resolver.go:4043-4049).
 		// Refusing to fall through here is a DROP, not a narrowing.
 		name:    "relative specifier that misses falls into the last-component arm",
 		spec:    "./auth",
@@ -467,6 +566,36 @@ func TestImportPlacementKeepsEverySameNamedCandidateDirectory(t *testing.T) {
 		want: []string{
 			"repo/sfc/W.vue.ts", "repo/wdir/W.vue/index.ts", "repo/wdir/W.vue/side.ts",
 		},
+	}, {
+		// The QUALIFIED-NAME arm, which the cascade cannot describe at all.
+		// resolveImport binds `Service/logger` to the Kubernetes resource node
+		// in k8s/svc.yaml (QualName `<kind>/<name>`,
+		// parser/languages/kubernetes.go:89) at resolver.go:3961-3972 and
+		// RETURNS — measured in the differential's own oracle, which reports
+		// `resolver binds=[repo/k8s/svc.yaml]` for this importer.
+		//
+		// The two `logger` decoys are what make the case non-vacuous: a
+		// cascade-only closure places exactly them and nothing else, so the
+		// k8s file is a hard DROP rather than a narrowing. They stay placed
+		// because the arm may also FALL THROUGH — pickResolverQualNameCandidate
+		// returning nil on an ambiguous candidate set carries on to the cascade
+		// (resolver.go:3966-3972) — so the union is the only safe answer.
+		name:    "a qualified-name candidate is placed beside the cascade",
+		spec:    "Service/logger",
+		callers: []string{"qual/app.ts"},
+		want: []string{
+			"repo/a/logger/index.ts", "repo/b/logger/index.ts", "repo/k8s/svc.yaml",
+		},
+	}, {
+		// The npm-manifest gate is superset-only. declaresExternalNpmDep
+		// (resolver.go:4000, applied at :4033) makes the resolver skip the
+		// cascade for `lodashish` because npmapp/package.json declares it a
+		// registry dependency; the closure reads no manifest and keeps the
+		// in-repo directory. Over-admission, never a drop.
+		name:    "a manifest-declared npm dependency is still placed",
+		spec:    "lodashish",
+		callers: []string{"npmapp/app.ts"},
+		want:    []string{"repo/vendored/lodashish/index.ts"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertImportPlacement(t, walk, tc.spec, tc.callers, tc.want)
@@ -505,11 +634,26 @@ func TestImportPlacementRefusesUnbindableSameNamedDirectory(t *testing.T) {
 		// …and an entry point carries its whole directory with it: the
 		// resolver binds the edge to index.ts, but what the specifier makes
 		// reachable is the module behind it (importedDirForSpec,
-		// resolver.go:5302-5321).
+		// resolver.go:5528-5546).
 		name:    "bare js specifier with a directory entry point",
 		spec:    "barrel",
 		callers: []string{"mono/app.ts"},
 		want:    []string{"repo/packages/app/barrel/index.ts", "repo/packages/app/barrel/write.ts"},
+	}, {
+		// A quoted include of a sibling header names no directory at all, so
+		// neither cascade key offers a candidate — and the relative-import
+		// pass, which is the arm that WOULD bind it, never reaches the edge:
+		// resolveImport has already stamped `external::helper.h` on it
+		// (resolver.go:4123) by the time resolveRelativeImports tests for the
+		// `unresolved::import::` prefix its C-family arm requires
+		// (relative_imports.go:204-241). Measured — the indexed fixture carries
+		// `imports repo/native/main.cpp -> external::helper.h`, pinned by
+		// TestClosureRelativePassShapesStayExternalInAWholeIndex — so placing
+		// the header would be cost with nothing behind it.
+		name:    "quoted include that names no directory places nothing",
+		spec:    "helper.h",
+		callers: []string{"native/main.cpp"},
+		want:    nil,
 	}, {
 		// A relative specifier whose join finds a module file is placed on
 		// that file, not by last component.
@@ -539,7 +683,7 @@ func TestImportPlacementRefusesUnbindableSameNamedDirectory(t *testing.T) {
 	}, {
 		// The per-binding payload is what the cascade keys on verbatim:
 		// lastPathComponent("./auth::auth") is "auth::auth"
-		// (resolver.go:5733-5739), which no directory carries, so the
+		// (resolver.go:5960-5966), which no directory carries, so the
 		// per-binding edge of a relative MISS binds nothing. The module-half
 		// specifier addImportSpecifier records alongside it is what carries
 		// the placement.
@@ -554,12 +698,6 @@ func TestImportPlacementRefusesUnbindableSameNamedDirectory(t *testing.T) {
 		spec:    "./auth::auth",
 		callers: []string{"web/app.ts"},
 		want:    []string{"repo/web/auth.ts"},
-	}, {
-		// A quoted include of a sibling header names no directory at all.
-		name:    "quoted include that names no directory places nothing",
-		spec:    "helper.h",
-		callers: []string{"native/main.cpp"},
-		want:    nil,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertImportPlacement(t, walk, tc.spec, tc.callers, tc.want)
@@ -598,7 +736,7 @@ func TestImportPlacementRefusesToAnswerOnADeletedJoinTarget(t *testing.T) {
 		// The join's own placement, unchanged.
 		"repo/local/local/impl.ts", "repo/local/local/index.ts",
 		// …plus the cascade the miss now reaches: every directory whose last
-		// component is `local` (resolver.go:3815-3822).
+		// component is `local` (resolver.go:4043-4049).
 		"repo/local/app.ts", "repo/other/local/index.ts",
 	})
 }
@@ -654,7 +792,7 @@ export function run() { return 1; }
 // treeB introduces `import { auth } from './auth'` into deep/app.ts, where no
 // `deep/auth.*` exists. The resolver's relative arm returns "" for that edge
 // and resolveImport carries on with the raw specifier, binding a misc/auth/
-// candidate out of lastDirIndex (resolver.go:3679, :3815-3822). If the closure
+// candidate out of lastDirIndex (resolver.go:3906, :3815-3822). If the closure
 // treats the join as terminal, BuildCommitLayer carries neither file and the
 // composed reader diverges from a whole index on the very import the change
 // introduced — so builderAssertReadersAgree is the other half of the claim.
@@ -696,7 +834,7 @@ export function start() { return 0; }
 	if slices.Contains(c.report.ClosurePaths, "other/local/index.ts") {
 		t.Errorf("the closure carries %q, but `./local` out of local/app.ts joins onto "+
 			"local/local/ and the resolver never reaches the cascade for it "+
-			"(resolver.go:3679); it carries %v",
+			"(resolver.go:3906); it carries %v",
 			"other/local/index.ts", c.report.ClosurePaths)
 	}
 	builderAssertReadersAgree(t, c.composed, c.flat)
@@ -709,7 +847,7 @@ export function start() { return 0; }
 // can see (jsts_imports.go:156-200 probes jsTSImportExts only), so
 // resolveJSTSImportTarget returns "" and resolveImport carries on to the
 // cascade, which binds a svcdir/svc/ candidate out of lastDirIndex
-// (resolver.go:3679, :3815-3822). A closure whose relative arm answers on the
+// (resolver.go:3906, :3815-3822). A closure whose relative arm answers on the
 // wider closureModuleProbes list suppresses that cascade, BuildCommitLayer
 // carries neither svcdir/svc/ file, and the composed reader leaves the import
 // `external::` where a whole index binds it — which is what
@@ -787,6 +925,93 @@ export function boot() { return 0; }
 	c := buildClosureCase(t, treeA, treeB)
 	assertClosureCarries(t, c.report, "svcdir/svc/index.ts", "svcdir/svc/side.ts")
 	builderAssertReadersAgree(t, c.composed, c.flat)
+}
+
+// TestImportPlacementCensusIsBounded is the cost half of the differential,
+// stated as a number rather than as a rule.
+//
+// NO STRAY above bounds each placement by a rule — a directory the resolver's
+// import index offers, or a file its qualified-name arm offers — and a rule can
+// only ever authorise what it describes. This states the OTHER thing a reviewer
+// needs: exactly what the walk places for the whole fixture, file by file. Any
+// arm added, widened, or gated differently moves a row here and has to be
+// justified against the resolver, whatever rule it claims to follow.
+//
+// It is a golden table on purpose. The fixture is fixed, the extraction is the
+// production one, and the placements are deterministic, so a diff in this table
+// is a real change in what a generation carries — 49 files over 36 specifiers
+// as it stands.
+func TestImportPlacementCensusIsBounded(t *testing.T) {
+	_, walk := importParityCase(t, importParityFixture)
+	refs := importParityVocabulary(t, walk, importParityFixture)
+
+	want := map[string][]string{
+		"./W.vue":       {"repo/sfc/W.vue.ts", "repo/wdir/W.vue/index.ts", "repo/wdir/W.vue/side.ts"},
+		"./auth":        {"repo/misc/auth/index.ts", "repo/misc/auth/side.ts", "repo/web/auth.ts"},
+		"./auth::auth":  {"repo/web/auth.ts"},
+		"./cfg":         {"repo/web/cfg.ts"},
+		"./impl":        {"repo/local/local/impl.ts"},
+		"./impl::here":  {"repo/local/local/impl.ts"},
+		"./local":       {"repo/local/local/impl.ts", "repo/local/local/index.ts"},
+		"./local::here": {"repo/local/local/impl.ts", "repo/local/local/index.ts"},
+		"./side": {
+			"repo/misc/auth/side.ts", "repo/svcdir/svc/side.ts", "repo/svcdir2/svc2/side.ts",
+			"repo/svcdir3/svc3/side.ts", "repo/wdir/W.vue/side.ts",
+		},
+		"./side::auth":             {"repo/misc/auth/side.ts"},
+		"./side::svc":              {"repo/svcdir/svc/side.ts"},
+		"./side::svc2":             {"repo/svcdir2/svc2/side.ts"},
+		"./side::svc3":             {"repo/svcdir3/svc3/side.ts"},
+		"./side::widget":           {"repo/wdir/W.vue/side.ts"},
+		"./svc":                    {"repo/mixed/svc.py", "repo/svcdir/svc/index.ts", "repo/svcdir/svc/side.ts"},
+		"./svc2":                   {"repo/rb/svc2.rb", "repo/svcdir2/svc2/index.ts", "repo/svcdir2/svc2/side.ts"},
+		"./svc3":                   {"repo/rbjs/svc3.ts", "repo/svcdir3/svc3/index.ts", "repo/svcdir3/svc3/side.ts"},
+		"./write":                  {"repo/packages/app/barrel/write.ts"},
+		"./write::emit":            {"repo/packages/app/barrel/write.ts"},
+		"/lib.php":                 nil,
+		"Service/logger":           {"repo/a/logger/index.ts", "repo/b/logger/index.ts", "repo/k8s/svc.yaml"},
+		"Service/logger::ping":     nil,
+		"barrel":                   {"repo/packages/app/barrel/index.ts", "repo/packages/app/barrel/write.ts"},
+		"barrel::emit":             nil,
+		"example.com/fixture/util": {"repo/internal/util/helper.go", "repo/util/helper.go"},
+		"graphql":                  nil,
+		"graphql::parse":           nil,
+		"helper.h":                 nil,
+		"leaf":                     nil,
+		"lodashish":                {"repo/vendored/lodashish/index.ts"},
+		"lodashish::chunk":         nil,
+		"pyutil":                   {"repo/deep/pyutil/__init__.py", "repo/pyutil/__init__.py"},
+		"shared/b/logger":          {"repo/a/logger/index.ts", "repo/b/logger/index.ts"},
+		"shared/b/logger::log":     nil,
+		"sibling.h":                nil,
+		"vecs":                     {"repo/extra/vecs/other.h", "repo/native/vecs/impl.h"},
+	}
+
+	specs := make([]string, 0, len(refs.imports))
+	for spec := range refs.imports {
+		specs = append(specs, spec)
+	}
+	sort.Strings(specs)
+	if len(specs) != len(want) {
+		t.Errorf("the fixture now yields %d specifiers, the census pins %d: %v",
+			len(specs), len(want), specs)
+	}
+	placed := 0
+	for _, spec := range specs {
+		got := walk.importedFiles(spec, refs.importCallers(spec))
+		placed += len(got)
+		expected, pinned := want[spec]
+		if !pinned {
+			t.Errorf("specifier %q is not in the census; it places %v", spec, got)
+			continue
+		}
+		if !slices.Equal(got, expected) {
+			t.Errorf("census drift for %q: places %v, pinned %v", spec, got, expected)
+		}
+	}
+	if placed != 49 {
+		t.Errorf("the fixture's whole import placement is %d files, pinned at 49", placed)
+	}
 }
 
 // --- fixture plumbing ---------------------------------------------------
@@ -916,7 +1141,7 @@ func importParityOracle(t *testing.T, store *store_sqlite.Store, graphPath strin
 //
 // It is spelled from the resolver's side, not the closure's:
 // resolver.buildDirIndexes keys every file on its directory and on that
-// directory's last component (resolver.go:1947-1958), resolveImport reads
+// directory's last component (resolver.go:2098-2109), resolveImport reads
 // exactly those two keys (:3809, :3816), and the relative arm ahead of the
 // cascade joins the specifier onto the importer's own directory
 // (jsts_imports.go:132-148, relative_imports.go:95-110).
@@ -928,7 +1153,7 @@ func importParityOracle(t *testing.T, store *store_sqlite.Store, graphPath strin
 // specifier. `callers` is therefore that whole set.
 //
 // The relative arm is a first try, not a terminal one: resolveImport takes its
-// answer only `if to != ""` (resolver.go:3679). When the join probe misses for
+// answer only `if to != ""` (resolver.go:3906). When the join probe misses for
 // ANY importer of the specifier, that importer's edge reaches the cascade with
 // the raw `./…` payload, so the cascade's own two keys are offered for the
 // specifier as well.
@@ -1029,6 +1254,59 @@ func importParityRelativeArmAnswers(walk *closureWalk, module string, callers []
 		}
 	}
 	return true
+}
+
+// importParityQualNameOffers is every in-repo file the resolver's one
+// NON-cascade import arm offers for this specifier.
+//
+// There is exactly one, and it is not spelled from the closure's side: the
+// QUALIFIED-NAME arm binds a node whose QualName IS the specifier
+// (resolver.go:3961-3972), ahead of the cascade and with no directory involved,
+// so the oracle is the resolver's OWN primitive — the store's qualified-name
+// index, which is what cachedFindNodesByQualName reads
+// (resolver.go:2444-2454) — and not a restatement of any control flow in
+// builder_closure.go. Measured in this fixture: a TypeScript
+// `import … from 'Service/logger'` binds the Kubernetes resource node in
+// k8s/svc.yaml, a file no cascade key names.
+//
+// resolveRelativeImports' arms are deliberately absent. Its C-family and PHP
+// arms test for an `unresolved::import::` prefix resolveImport has already
+// overwritten with `external::` (resolver.go:4123) by the time the pass runs
+// (resolver.go:1808), and its python arm probes an unprefixed stem against
+// repository-prefixed node IDs — so in this harness they bind nothing, which
+// TestClosureRelativePassShapesStayExternalInAWholeIndex pins directly and the
+// NO DROP half below re-checks for every importer. An oracle that described
+// those arms anyway would be authorising placements no measurement backs.
+func importParityQualNameOffers(walk *closureWalk, spec string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, node := range importParityQualNameNodes(walk, spec) {
+		if node == nil || node.FilePath == "" {
+			continue
+		}
+		if _, owned := builderRelPath(builderRepoPrefix, node.FilePath); owned {
+			out[node.FilePath] = struct{}{}
+		}
+	}
+	return out
+}
+
+// importParityQualNameNodes is the resolver's own multi-valued qualified-name
+// lookup (cachedFindNodesByQualName, resolver.go:2444-2454), read off the base
+// store the fixture indexed.
+func importParityQualNameNodes(walk *closureWalk, qualName string) []*graph.Node {
+	if qualName == "" {
+		return nil
+	}
+	type batchLookup interface {
+		GetNodesByQualNames(qualNames []string) map[string][]*graph.Node
+	}
+	if batch, ok := walk.req.Base.(batchLookup); ok {
+		return batch.GetNodesByQualNames([]string{qualName})[qualName]
+	}
+	if node := walk.req.Base.GetNodeByQualName(qualName); node != nil {
+		return []*graph.Node{node}
+	}
+	return nil
 }
 
 // importParityBareJSTS mirrors the resolver's own precondition for the

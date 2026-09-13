@@ -354,3 +354,141 @@ func TestIncrementalFrontierKeepsOneIncomingReadPastTheScopedKeyCap(t *testing.T
 		t.Fatalf("an in-ceiling %d-row admission was refused: %+v", files, frontier.incomingAdmission)
 	}
 }
+
+// A refused pass that runs BOTH incoming legs must report the hole ONCE.
+//
+// The two legs read the same stub keys — the preparation frontier
+// (collectIncrementalFileFrontierMode's incoming half) and then the resolution
+// leg (resolveIncomingStubKeysLocked) — and each gets its own budget, so each
+// refuses independently and each leaves the SAME physical rows parked. Summing
+// their Dropped reports twice the hole that exists, and Dropped's contract is a
+// count of references: "the parked references a refused leg left unadmitted …
+// the number a consumer needs to say so". That number ships verbatim in the
+// pass's phase log (`incoming_admission_dropped`), so a doubled value is a
+// wrong answer to a question an operator asks.
+//
+// Inspected is the deliberate contrast and is asserted here too: its contract
+// is admissions, not unique edges, so it DOES accumulate across the legs.
+func TestBothIncomingLegsChargeTheDroppedHoleOnce(t *testing.T) {
+	fanIn := graph.MaxIncomingSourceCandidateRows + 1
+
+	t.Run("batched", func(t *testing.T) {
+		// withOutgoing: the changed file also has forward work, so the pass
+		// does NOT take its empty-frontier early return and the resolution leg
+		// really runs. This is the ordinary production shape and the one the
+		// single-leg oracles could not see.
+		g, changed := incomingFanOutGraphMode(t, fanIn, true)
+		stats := New(g).ResolveFilesAndIncoming([]string{changed})
+		assertIncomingHoleChargedOnce(t, stats, fanIn)
+		if stats.Resolved != 1 {
+			t.Fatalf("the forward leg was collateral: resolved = %d, want 1", stats.Resolved)
+		}
+		if left := unresolvedInEdgeCount(g, graph.UnresolvedMarker+"Close"); left != fanIn {
+			t.Fatalf("%d parked references were rebound by a refused admission", fanIn-left)
+		}
+	})
+
+	t.Run("per-save", func(t *testing.T) {
+		g, changed := incomingFanOutGraphMode(t, fanIn, true)
+		stats := New(g).ResolveFileAndIncoming(changed)
+		assertIncomingHoleChargedOnce(t, stats, fanIn)
+	})
+}
+
+func assertIncomingHoleChargedOnce(t *testing.T, stats *ResolveStats, fanIn int) {
+	t.Helper()
+	if stats == nil || !stats.IncomingAdmissionRefused {
+		t.Fatalf("the pass did not surface a refusal at all: %+v", stats)
+	}
+	if stats.IncomingAdmissionDropped != fanIn {
+		t.Errorf("dropped rows = %d, want the %d parked references counted once — "+
+			"both incoming legs refuse the same physical rows and charging each of "+
+			"them reports twice the hole the pass actually has",
+			stats.IncomingAdmissionDropped, fanIn)
+	}
+	if stats.IncomingAdmissionInspected != 2*fanIn {
+		t.Errorf("inspected rows = %d, want %d: Inspected counts ADMISSIONS, not unique "+
+			"edges, and both legs inspected the whole batch",
+			stats.IncomingAdmissionInspected, 2*fanIn)
+	}
+}
+
+// The dedup is by the admission's KEY SET, not a blanket maximum: two legs over
+// DIFFERENT keys refuse disjoint rows, and both holes are real. A max would
+// under-report the size of the hole, which is the dangerous direction for a
+// completeness fact.
+func TestDisjointIncomingAdmissionsBothChargeTheirHole(t *testing.T) {
+	stats := &ResolveStats{}
+	refusal := &graph.BoundedLocalizationLimitError{
+		Resource: "incoming-source candidate inspections",
+		Limit:    graph.MaxIncomingSourceCandidateRows,
+	}
+	fact := func(rows int) graph.IncomingSourceAdmission {
+		return graph.IncomingSourceAdmission{
+			Keys: 1, Inspected: rows, Dropped: rows, Refused: true,
+			Limit: graph.MaxIncomingSourceCandidateRows,
+		}
+	}
+	// Same key set twice — one hole.
+	recordIncomingAdmission(stats, []string{"unresolved::Close", "unresolved::*.Close"}, fact(100), refusal)
+	recordIncomingAdmission(stats, []string{"unresolved::*.Close", "unresolved::Close"}, fact(100), refusal)
+	if stats.IncomingAdmissionDropped != 100 {
+		t.Errorf("two legs over the same key set charged %d, want 100 (order must not matter)",
+			stats.IncomingAdmissionDropped)
+	}
+	// A different key set — a second, real hole.
+	recordIncomingAdmission(stats, []string{"unresolved::Open"}, fact(7), refusal)
+	if stats.IncomingAdmissionDropped != 107 {
+		t.Errorf("a disjoint refused key set charged %d, want 107 — its rows are a hole of "+
+			"their own and a max would hide them", stats.IncomingAdmissionDropped)
+	}
+	if stats.IncomingAdmissionInspected != 207 {
+		t.Errorf("inspected = %d, want 207 (admissions, not unique edges)",
+			stats.IncomingAdmissionInspected)
+	}
+	// An admission that dropped nothing never charges and never reserves a key.
+	recordIncomingAdmission(stats, []string{"unresolved::Fresh"},
+		graph.IncomingSourceAdmission{Keys: 1, Inspected: 3, Limit: graph.MaxIncomingSourceCandidateRows}, nil)
+	if stats.IncomingAdmissionDropped != 107 {
+		t.Errorf("a clean admission charged the hole: %d", stats.IncomingAdmissionDropped)
+	}
+}
+
+// The charge bookkeeping must survive a whole-struct copy of ResolveStats.
+//
+// The incremental pass copies the struct by value — `beforeIncoming := *stats`
+// (resolver.go:2948) — to read int deltas for its phase log. A set-shaped
+// charge ledger would make that copy ALIAS the original's bookkeeping, so a
+// later edit that charged through the copy would silently consume the
+// original's budget for a hole the original never saw. The ledger is a string
+// for exactly that reason, and this is the property that makes it one.
+func TestResolveStatsChargeLedgerSurvivesAValueCopy(t *testing.T) {
+	refusal := &graph.BoundedLocalizationLimitError{
+		Resource: "incoming-source candidate inspections",
+		Limit:    graph.MaxIncomingSourceCandidateRows,
+	}
+	fact := func(rows int) graph.IncomingSourceAdmission {
+		return graph.IncomingSourceAdmission{
+			Keys: 1, Inspected: rows, Dropped: rows, Refused: true,
+			Limit: graph.MaxIncomingSourceCandidateRows,
+		}
+	}
+	stats := &ResolveStats{}
+	recordIncomingAdmission(stats, []string{"unresolved::Close"}, fact(11), refusal)
+
+	// A value copy, then a charge through it for a key set the ORIGINAL has
+	// never seen.
+	shadow := *stats
+	recordIncomingAdmission(&shadow, []string{"unresolved::Open"}, fact(5), refusal)
+	if shadow.IncomingAdmissionDropped != 16 {
+		t.Fatalf("the copy did not charge its own hole: %d, want 16", shadow.IncomingAdmissionDropped)
+	}
+
+	// The original still owes that hole: the copy's ledger is its own.
+	recordIncomingAdmission(stats, []string{"unresolved::Open"}, fact(5), refusal)
+	if stats.IncomingAdmissionDropped != 16 {
+		t.Errorf("the original charged %d after a value copy consumed the same key set elsewhere, "+
+			"want 16 — a copy of ResolveStats must not share the charge ledger",
+			stats.IncomingAdmissionDropped)
+	}
+}

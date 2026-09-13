@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"path"
 	"sort"
@@ -238,6 +239,18 @@ type closureWalk struct {
 	// fileIndex is the same scan's membership set: what a joined relative
 	// specifier's stem is probed against.
 	fileIndex map[string]struct{}
+
+	// qualNameFiles is the qualified-name arm's per-specifier placement,
+	// filled by prepareQualNames in ONE batched lookup per build. A present
+	// key with a nil value is an ANSWERED specifier that no node carries —
+	// distinguishing it from an unasked one is what keeps the lazy path from
+	// re-issuing a lookup per call.
+	qualNameFiles map[string][]string
+	// qualNamesBatched is the multi-valued lookup the base could offer, and
+	// qualNamesComplete records whether it offered one at all. See
+	// closureBatchedQualNames.
+	qualNamesBatched  closureQualNameLookup
+	qualNamesComplete bool
 }
 
 // admit offers one graph path to the closure. It reports whether the path
@@ -370,6 +383,13 @@ func (w *closureWalk) collectIntroduced(
 		imports = append(imports, importPath)
 	}
 	sort.Strings(imports)
+	// ONE batched qualified-name lookup for the whole specifier set, before any
+	// placement runs. Every specifier goes in, relative ones included: the cost
+	// of a name the placement never reads is a few bytes of one statement's
+	// bind payload, while asking per specifier is a round trip each. One call
+	// per build is the invariant TestClosureQualNameLookupIsBatchedOncePerBuild
+	// holds the walk to.
+	w.prepareQualNames(imports)
 	for _, importPath := range imports {
 		for _, graphPath := range w.importedFiles(importPath, refs.importCallers(importPath)) {
 			out[graphPath] = struct{}{}
@@ -783,11 +803,11 @@ func closureBareName(raw string) string {
 // every file the resolver could have bound this import to; a file it could
 // not is payload the generation pays for nothing.
 //
-// The two arms mirror resolveImport's candidate scan (resolver.go:3809-3822)
+// The two arms mirror resolveImport's candidate scan (resolver.go:4036-4049)
 // one for one:
 //
 //   - `dirIndex[importPath]`, the directory the path names outright. When it
-//     yields a candidate the resolver stops there (`stop()`, resolver.go:3805,
+//     yields a candidate the resolver stops there (`stop()`, resolver.go:4032,
 //     applied at :3812) and so does this.
 //   - `lastDirIndex[lastPathComponent(importPath)]`, every directory whose
 //     last component matches. Reached only when the first arm found nothing.
@@ -795,18 +815,18 @@ func closureBareName(raw string) string {
 // WHICH candidate the resolver then binds is not something the closure can
 // predict, and that asymmetry is the whole reason this is a placement and not
 // a lookup. The same-repo branch takes the FIRST candidate the scan reaches
-// (resolver.go:3784-3792) with no precision test of any kind, in the arbitrary
+// (resolver.go:4062-4070) with no precision test of any kind, in the arbitrary
 // order buildDirIndexes happened to bucket the corpus in — measured, an
 // `import "example.com/fixture/util"` from a Go file binds to a Python
 // `deep/util/__init__.py` when that is the row that sorted first. So every
 // candidate the resolver considers has to be placed, not the one this code
 // would have picked.
 //
-// In particular `dirMatchesImport` (resolver.go:5749-5757) is NOT available as
+// In particular `dirMatchesImport` (resolver.go:5980-5996) is NOT available as
 // a narrowing here. It reads like the precision rule this wants — dir must be
 // a genuine suffix of the import path — but the resolver applies it at exactly
-// one place, the CROSS-repo arm of `consider` (resolver.go:3798-3800), and its
-// own contract says why (resolver.go:5749-5752): "Used only to authorise
+// one place, the CROSS-repo arm of `consider` (resolver.go:4023-4027), and its
+// own contract says why (resolver.go:5980-5983): "Used only to authorise
 // *cross-repo* candidates … Same-repo candidates don't need it".
 // jsts_imports.go:290-293 rejects the same idea by name from the other side,
 // and jsts_imports.go:276-277 states the fact plainly: "the same-repo branch
@@ -822,7 +842,7 @@ func closureBareName(raw string) string {
 //     component. For a JS/TS importer the resolver joins `./auth` onto the
 //     importing file's own directory and probes the joined stem
 //     (resolver/jsts_imports.go:132-148, probed at :156-200); when that probe
-//     finds a file it binds it and returns (resolver.go:3679-3688), never
+//     finds a file it binds it and returns (resolver.go:3906-3914), never
 //     reaching the cascade. The old arm both admitted every `*/auth/`
 //     directory in the repository AND missed `web/auth.ts`, the one file the
 //     resolver actually binds.
@@ -837,19 +857,19 @@ func closureBareName(raw string) string {
 //     every cascade candidate behind a `.py`/`.rb`/`.h` sibling.
 //
 //     The join is a FIRST TRY, though, not a terminal arm: `resolveImport`
-//     takes the relative answer only `if to != ""` (resolver.go:3679), so on
+//     takes the relative answer only `if to != ""` (resolver.go:3906), so on
 //     a MISS it carries on with the RAW specifier, where
-//     `lastPathComponent("./auth") == "auth"` (resolver.go:5733-5739) and
+//     `lastPathComponent("./auth") == "auth"` (resolver.go:5960-5966) and
 //     `bareJSTS` is false (isJSTSBareSpecifier rejects a `./` prefix,
 //     jsts_imports.go:253-264) — so `consider` applies no gate and binds the
-//     first same-repo candidate out of `lastDirIndex` (resolver.go:3815-3822).
+//     first same-repo candidate out of `lastDirIndex` (resolver.go:4043-4049).
 //     A relative miss therefore falls through here too. Refusing to fall
 //     through was measured to DROP `misc/auth/index.ts` for a
 //     `deep/app.ts: import { auth } from './auth'` with no `deep/auth.*`.
 //
 //   - A BARE JS/TS specifier only ever binds a directory ENTRY POINT.
 //     `consider` skips every candidate that is not `index.<ext>`
-//     (resolver.go:3781-3783, the rule stated at jsts_imports.go:277-293),
+//     (resolver.go:4008-4010, the rule stated at jsts_imports.go:277-293),
 //     because Node and tsc load a directory-shaped module through its entry
 //     point and never through an arbitrary file inside it. This is the one
 //     gate `consider` applies to a SAME-repo candidate, so it is the one gate
@@ -857,28 +877,54 @@ func closureBareName(raw string) string {
 //     dragged every file under any `*/graphql/` directory into the generation.
 //
 // Two resolver gates have no counterpart here, both superset-only. The npm
-// manifest gate (declaresExternalNpmDep, resolver.go:3773, applied at :3807)
-// skips the cascade outright for a specifier the importer's package.json
-// declares a dependency; the closure carries no manifest lookup. The Go
-// package-ownership gate (goImportCandidateGate.retainFile,
+// manifest gate (declaresExternalNpmDep, read at resolver.go:4000 and applied
+// at :4033-4034) skips the cascade outright for a specifier the importer's
+// package.json declares a dependency of; the closure carries no manifest
+// lookup. The Go package-ownership gate (goImportCandidateGate.retainFile,
 // go_package_ownership.go:56-58, called first in `consider` at
-// resolver.go:3778-3780) is installed by the live indexer, not by this walk.
-// Both residuals admit more than the resolver binds; neither can drop.
+// resolver.go:4005-4007) is installed by the live indexer, not by this walk.
+// Both residuals admit more than the resolver binds; neither can drop, and each
+// has a differential fixture.
 //
-// The qualified-name arm (resolver.go:3731-3746) is not mirrored either, and
-// for a different reason: it returns BEFORE this cascade when it hits, but
-// graph.Reader offers only GetNodeByQualName (reader.go:24) where the resolver
-// reads every candidate (cachedFindNodesByQualName, resolver.go:2294-2304), so
-// a mirror that could be shown no-drop is not expressible through LayerBase.
-// Not mirroring it is a superset for the cascade's own candidates — but it is
-// NOT unconditionally superset-safe now that the entry-point gate exists: a
-// BARE JS/TS specifier the qual-name arm binds to a package node whose file
-// sits in a directory holding no `index.<ext>` would be dropped by
-// closureJSTSEntryPoints, because that gate reasons about the cascade the
-// qual-name arm never reaches. No fixture in this repository produces that
-// shape (a JS/TS package node carrying a bare specifier as its qualified
-// name), so it is recorded as an unproven residual rather than a measured
-// one; W6.12 owns the conservative-handling sweep that would close it.
+// The qualified-name arm (resolver.go:3961-3972) runs BEFORE this cascade and
+// returns when it hits, so it IS mirrored — by qualNameImportedFiles, unioned
+// in below. Mirroring it is not optional: the arm binds a NODE by its qualified
+// name with no directory involved at all, ACROSS language families (measured on
+// the parity fixture: a TypeScript `import … from 'Service/logger'` binds the
+// Kubernetes resource node in `k8s/svc.yaml`, whose directory neither cascade
+// key names), so a cascade-only placement DROPS what it binds rather than
+// merely narrowing it. The mirror is PLACEMENT only and never suppresses the
+// cascade: whether the arm hits is a question about the POST-change graph the
+// resolver will run on, which this walk cannot answer.
+//
+// resolveRelativeImports' own arms (relative_imports.go) are deliberately NOT
+// mirrored, and the reason is measured rather than assumed. That pass keys on
+// what `e.To` still is when it runs (:171-253), and it runs at
+// resolver.go:1808 — after the resolve loop has already put every
+// `unresolved::import::…` edge through resolveImport, which ends by stamping
+// `e.To = "external::" + importPath` (resolver.go:4123). Only two of the pass's
+// four families survive that rewrite: the `pyrel::` branch (:185-191), whose
+// targets the per-edge resolver leaves untouched by contract
+// (resolver.go:3628-3635), and the `external::` branch's python/dart arms
+// (:192-203). The C-family (:204-241) and PHP (:242-249) arms both test for an
+// `unresolved::import::` prefix the rewrite has already destroyed, so on the
+// whole-index path they bind nothing at all. Measured on the parity fixture,
+// indexed by the real indexer and resolved by the real resolver:
+//
+//	csame/main.cpp   #include "sibling.h"          -> external::sibling.h
+//	native/main.cpp  #include "helper.h"           -> external::helper.h
+//	phpdir/app.php   require __DIR__ . '/lib.php'  -> external::/lib.php
+//	pypkg/app.py     from . import leaf            -> external::pypkg/leaf
+//
+// (the python one misses for a second reason as well: resolvePython probes its
+// stem against node IDs, which carry the repository prefix, while the stem
+// arrives without one.) Mirroring an arm that binds nothing is cost with no
+// no-drop benefit, so the closure places nothing for those shapes — and the
+// differential is the alarm rather than a comment:
+// TestClosureLeavesTheRelativeImportPassShapesUnplaced runs the real build over
+// exactly those three shapes and requires the composed reader to equal a whole
+// index WITHOUT them. The day that pass reaches those edges, it goes red and
+// names the mirror that then has to be written.
 func (w *closureWalk) importedFiles(importPath string, callers []string) []string {
 	if importPath == "" {
 		return nil
@@ -887,19 +933,207 @@ func (w *closureWalk) importedFiles(importPath string, callers []string) []strin
 	if closureRelativeSpecifier(importPath) {
 		joined, answered := w.relativeImportedFiles(importPath, callers)
 		if answered {
+			// resolveImport returned at :3906-3914, ahead of the qualified-name
+			// arm and ahead of the cascade. Nothing further is reachable, so
+			// the qualified-name answer for this specifier is never read — the
+			// per-build batch carries it, but no round trip is spent on it.
 			return joined
 		}
 		// The join answered for no importer (or not for every one of them),
-		// so the resolver reached the cascade for at least one edge with
-		// this specifier. Union rather than replace: the callers whose join
-		// DID hit keep their placement.
-		return closureUnionPlacements(joined, w.cascadeImportedFiles(importPath, false))
+		// so the resolver reached the qualified-name arm and the cascade for
+		// at least one edge with this specifier. Union rather than replace:
+		// the callers whose join DID hit keep their placement.
+		return closureUnionPlacements(joined,
+			closureUnionPlacements(w.qualNameImportedFiles(importPath),
+				w.cascadeImportedFiles(importPath, false)))
 	}
-	return w.cascadeImportedFiles(importPath, closureBareJSTSImport(importPath, callers))
+	// The entry-point gate is the one narrowing the cascade authorises, and it
+	// is NOT conditioned on the qualified-name mirror. The gate filters the
+	// candidates the CASCADE reaches; the arm's own candidates are placed
+	// beside them by the union below. Widening the gate could never stand in
+	// for a qualified-name candidate the mirror failed to see — that candidate
+	// is a node in a file neither cascade key names, which is the whole reason
+	// the arm is mirrored — so switching the gate off on some base shape would
+	// buy no coverage and would disable the issue-#450 cost control for every
+	// bare specifier of every build on that shape.
+	return closureUnionPlacements(w.qualNameImportedFiles(importPath),
+		w.cascadeImportedFiles(importPath, closureBareJSTSImport(importPath, callers)))
+}
+
+// closureQualNameLookup is the multi-valued qualified-name lookup the resolver's
+// own arm reads (cachedFindNodesByQualName, resolver.go:2444, which fans out to
+// graph.Store.GetNodesByQualNames, store.go:193-198). It lives on graph.Store,
+// not on graph.Reader — reader.go:24 offers only the single-valued
+// GetNodeByQualName — so a LayerBase carries it only by luck of its concrete
+// type. Reaching it through an assertion rather than by widening LayerBase is
+// what keeps every base implementation from having to carry it.
+type closureQualNameLookup interface {
+	GetNodesByQualNames(qualNames []string) map[string][]*graph.Node
+}
+
+// closureBatchedQualNames finds the batched lookup a base can answer from,
+// unwrapping one composition layer on the way.
+//
+// Every base the coordinator hands a build is one of two shapes: the store
+// itself (checkout_coordinator.go:1773, a *store_sqlite.Store, taken only when the
+// base generation is zero) or the commitLayerBase ancestryLayerBase mints
+// (:2143-2145), which is what the commit-layer build (:1788) and the
+// dirty-layer reader (:2128) both take — EVERY incremental build.
+// commitLayerBase embeds the graph.Reader INTERFACE (:3240-3251), so the batched method is not in its
+// method set even though the reader inside it always carries it: graphview
+// composes a *graph.OverlaidView (materialize.go:770-802), and OverlaidView
+// implements GetNodesByQualNames by merging every overlay and surviving base
+// candidate (overlay.go:457-505). Unwrapping that one layer is what keeps the
+// mirror's candidate set COMPLETE on the incremental path; without it the
+// mirror degrades to the single-valued lookup exactly where it matters most.
+func closureBatchedQualNames(base LayerBase) closureQualNameLookup {
+	if batch, ok := base.(closureQualNameLookup); ok {
+		return batch
+	}
+	if composed, ok := base.(commitLayerBase); ok {
+		if batch, ok := composed.Reader.(closureQualNameLookup); ok {
+			return batch
+		}
+	}
+	return nil
+}
+
+// prepareQualNames resolves the qualified-name arm for a whole specifier set in
+// ONE batched lookup, and is the only place that lookup is issued.
+//
+// Batching is the point. The store serves GetNodesByQualNames with a single
+// statement whatever the payload (store_lookups.go:164-177), while
+// closureRefs.addImportSpecifier records BOTH a re-export's module half and its
+// `<path>::<export>` half (:770-780) — so a per-specifier call would cost
+// roughly two round trips per distinct import the walk reaches, most of them
+// for a qualified name nothing in the corpus carries.
+//
+// Specifiers already answered are skipped, so a second call adds only what is
+// new, and a specifier asked for outside any prepared batch — a direct
+// importedFiles caller, which is every test that places one specifier — falls
+// back to preparing itself.
+//
+// The relative specifiers go into the batch too, even though a relative
+// specifier whose join ANSWERS never reads the result: importedFiles returns on
+// the relative arm before the qualified-name one is reachable, exactly as
+// resolveImport does. Leaving them out would trade a few bytes of one
+// statement's bind payload for a round trip per relative MISS.
+func (w *closureWalk) prepareQualNames(importPaths []string) {
+	if w.qualNameFiles == nil {
+		w.qualNameFiles = make(map[string][]string, len(importPaths))
+		w.qualNamesBatched = closureBatchedQualNames(w.req.Base)
+		w.qualNamesComplete = w.qualNamesBatched != nil
+		if !w.qualNamesComplete && w.b != nil && w.b.Logger != nil {
+			// Not silent. Every base the coordinator builds answers the batched
+			// lookup (closureBatchedQualNames' own doc enumerates them, and
+			// TestClosureQualNameArmIsEnumerableThroughEveryProductionBaseShape
+			// pins it), so reaching this is a new base shape, and the mirror
+			// sees only ONE of the arm's candidates on it. The conservative
+			// superset for an arm whose candidate set cannot be enumerated is
+			// the whole corpus, which is not a generation — so the closure
+			// reports the shape instead of pretending to cover it.
+			w.b.Logger.Warn("indexer: closure base cannot enumerate qualified-name candidates",
+				zap.String("repo", w.req.RepoPrefix),
+				zap.String("base", fmt.Sprintf("%T", w.req.Base)))
+		}
+	}
+	var want []string
+	for _, spec := range importPaths {
+		if spec == "" {
+			continue
+		}
+		if _, answered := w.qualNameFiles[spec]; answered {
+			continue
+		}
+		w.qualNameFiles[spec] = nil
+		want = append(want, spec)
+	}
+	if len(want) == 0 {
+		return
+	}
+	if w.qualNamesBatched != nil {
+		hits := w.qualNamesBatched.GetNodesByQualNames(want)
+		for _, spec := range want {
+			w.qualNameFiles[spec] = w.ownedCandidateFiles(hits[spec])
+		}
+		return
+	}
+	for _, spec := range want {
+		if node := w.req.Base.GetNodeByQualName(spec); node != nil {
+			w.qualNameFiles[spec] = w.ownedCandidateFiles([]*graph.Node{node})
+		}
+	}
+}
+
+// qualNameImportedFiles mirrors resolveImport's qualified-name arm
+// (resolver.go:3961-3972): every node whose QualName IS this specifier is a
+// candidate the resolver may bind before the directory cascade is ever reached,
+// so the file holding it has to be in the generation.
+//
+// Keyed on the RAW specifier, exactly as the resolver keys it — the per-binding
+// `<path>::<export>` payload is looked up verbatim there too, and the module
+// half travels as its own specifier (closureRefs.addImportSpecifier records
+// both), so splitting here would place the module half twice and look the
+// per-binding half up under the wrong key.
+//
+// The placement is the candidate's FILE, not its directory. The arm binds a
+// NODE, and the generation needs that node to exist for the import edge to bind
+// the way a whole index binds it; there is no barrel/entry-point indirection to
+// cover, which is the only reason closureJSTSEntryPoints places whole
+// directories.
+func (w *closureWalk) qualNameImportedFiles(importPath string) []string {
+	if importPath == "" {
+		return nil
+	}
+	if _, answered := w.qualNameFiles[importPath]; !answered {
+		w.prepareQualNames([]string{importPath})
+	}
+	return w.qualNameFiles[importPath]
+}
+
+// qualNamesEnumerable reports whether the base offered the multi-valued lookup
+// — whether the mirror above saw the arm's WHOLE candidate set or only the one
+// row graph.Reader's single-valued lookup returns. Nothing narrows on it; it is
+// the fact the warning and the production-shape test are about.
+func (w *closureWalk) qualNamesEnumerable() bool {
+	w.prepareQualNames(nil)
+	return w.qualNamesComplete
+}
+
+// ownedCandidateFiles reduces a qualified-name candidate set to the sorted,
+// deduplicated files THIS build could carry.
+//
+// Two filters, both the resolver's own. A candidate with no FilePath, or one
+// belonging to another repository, names nothing this generation can hold — the
+// synthetic external nodes the resolver mints (external_call::<eco>::<path>)
+// carry exactly that shape together with a QualName equal to the import path,
+// so without the ownership filter every external import would place a phantom
+// path. And it is the candidate's FILE that is placed, never its directory.
+func (w *closureWalk) ownedCandidateFiles(candidates []*graph.Node) []string {
+	if len(candidates) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	var out []string
+	for _, node := range candidates {
+		if node == nil || node.FilePath == "" {
+			continue
+		}
+		if _, owned := builderRelPath(w.req.RepoPrefix, node.FilePath); !owned {
+			continue
+		}
+		if _, dup := seen[node.FilePath]; dup {
+			continue
+		}
+		seen[node.FilePath] = struct{}{}
+		out = append(out, node.FilePath)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // cascadeImportedFiles is the dirIndex/lastDirIndex candidate scan itself,
-// keyed exactly as resolveImport keys it (resolver.go:3809-3822): the raw
+// keyed exactly as resolveImport keys it (resolver.go:4036-4049): the raw
 // specifier for the exact-directory arm, its last path component for the
 // fallback arm. The first arm short-circuits the second, mirroring `stop()`.
 func (w *closureWalk) cascadeImportedFiles(importPath string, bare bool) []string {
@@ -1142,7 +1376,7 @@ func closureJSTSPath(p string) bool {
 // The gate is per directory, not per file, because the two questions differ:
 // the resolver binds the import EDGE to the entry point alone, but what the
 // specifier makes reachable is the whole directory behind it
-// (resolver.importedDirForSpec, resolver.go:5302-5321, which returns
+// (resolver.importedDirForSpec, resolver.go:5528-5546, which returns
 // filePathDir of the first candidate that clears the same gate). A generation
 // that carried only `index.ts` would leave a call into a sibling the barrel
 // re-exports parked on a stub — a divergence from a whole index, which is the

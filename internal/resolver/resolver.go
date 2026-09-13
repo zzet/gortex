@@ -2,6 +2,8 @@ package resolver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"iter"
@@ -146,7 +148,11 @@ type ResolveStats struct {
 	// completeness fact for this pass (graph.IncomingSourceAdmission). A file
 	// defining a common name parks unbound references from the whole corpus on
 	// its stub ids, so the admission is charged against the shared
-	// incoming-source budget. Refused means the ceiling fired and the pass
+	// incoming-source CEILING (MaxIncomingSourceCandidateRows). What every leg
+	// shares is that constant, not one budget object: each call site passes a
+	// nil budget and AdmitIncomingRowsBounded then allocates a fresh
+	// IncomingSourceBudget per admission (bounded_incoming_sources_scoped.go:99-101),
+	// so the legs refuse independently. Refused means the ceiling fired and the pass
 	// admitted NOTHING from the incoming leg — the parked edges are untouched,
 	// not partially rebound. A caller that cannot read this fact cannot tell a
 	// complete reverse pass from a bounded one.
@@ -156,7 +162,33 @@ type ResolveStats struct {
 	// IncomingAdmissionDropped is the size of the hole: the parked references
 	// a refused leg left unadmitted. A pass with Dropped > 0 did LESS work than
 	// a complete one, and it is the number a consumer needs to say so.
+	//
+	// Each physical row is counted ONCE, which is what separates it from
+	// Inspected. A pass runs its incoming leg twice over the SAME stub keys —
+	// once in the preparation frontier (recordFrontierIncomingAdmission, reached
+	// from ResolveFileAndIncoming and ResolveFilesAndIncoming) and once in the
+	// resolve leg (resolveIncomingStubKeysLocked:3417, charged at :3428) — and
+	// both refuse independently: each admission gets its own budget. Inspected is
+	// documented as "admissions, not unique edges" and accumulates; Dropped
+	// makes a claim about a count of REFERENCES, so charging the second leg
+	// again would report twice the hole that exists.
 	IncomingAdmissionDropped int `json:"incoming_admission_dropped,omitempty"`
+
+	// incomingAdmissionCharged is the set of refused key sets already charged
+	// to IncomingAdmissionDropped: each admission's key-set digest
+	// (incomingAdmissionChargeKey), appended with a `;` separator. Unexported:
+	// it is bookkeeping for the field above, never part of the wire shape. Two
+	// legs over the same keys refuse the same physical rows; two legs over
+	// DIFFERENT key sets refuse disjoint ones and both are charged.
+	//
+	// A STRING rather than a set, deliberately. ResolveStats is copied whole in
+	// at least one place — `beforeIncoming := *stats` (:2956), which reads the
+	// copy for the phase log's int deltas — and a map field would make that
+	// copy alias this bookkeeping, so a later edit that charged through the
+	// copy would silently corrupt the original's charge set. A string is
+	// immutable: appending to the copy cannot be seen by the original, and the
+	// worst a stray copy can do is re-charge a hole it already owns.
+	incomingAdmissionCharged string
 }
 
 // recordIncomingAdmission puts a bounded incoming admission's completeness
@@ -167,12 +199,28 @@ type ResolveStats struct {
 // admission returned — including the consumers whose leg then collapses to
 // "nothing to do", because a refused leg and an empty leg are the same shape
 // and only this fact separates them.
-func recordIncomingAdmission(stats *ResolveStats, fact graph.IncomingSourceAdmission, err error) {
+//
+// keys is the key set the admission read for, and it is what keeps Dropped a
+// count of references rather than of refusals: a pass that runs both incoming
+// legs refuses the same physical rows twice, and only the identity of the key
+// set can say so. Inspected keeps accumulating — its contract is "admissions,
+// not unique edges".
+func recordIncomingAdmission(stats *ResolveStats, keys []string, fact graph.IncomingSourceAdmission, err error) {
 	if stats == nil {
 		return
 	}
 	stats.IncomingAdmissionInspected += fact.Inspected
-	stats.IncomingAdmissionDropped += fact.Dropped
+	if fact.Dropped > 0 {
+		if charge := incomingAdmissionChargeKey(keys); charge != "" {
+			// Every entry is a fixed-width hex digest followed by `;`, and a
+			// digest carries no `;`, so a substring hit can only be a whole
+			// entry — no boundary-straddling false positive is expressible.
+			if !strings.Contains(stats.incomingAdmissionCharged, charge) {
+				stats.incomingAdmissionCharged += charge + ";"
+				stats.IncomingAdmissionDropped += fact.Dropped
+			}
+		}
+	}
 	if fact.Limit > 0 {
 		stats.IncomingAdmissionLimit = fact.Limit
 	}
@@ -180,6 +228,43 @@ func recordIncomingAdmission(stats *ResolveStats, fact graph.IncomingSourceAdmis
 	if errors.As(err, &limit) {
 		stats.IncomingAdmissionRefused = true
 	}
+}
+
+// incomingAdmissionChargeKey is the identity of one admission's key set: the
+// deduplicated keys in sorted order, hashed so the bookkeeping entry stays a
+// fixed 64 hex characters whatever the frontier's size. The two legs of a pass
+// build their stub keys independently (the frontier's appendStubKey walk vs
+// resolveIncomingLocked's per-node walk), so they agree on the SET and not on
+// the order — sorting is what makes them the same charge.
+//
+// An empty key set can never produce a drop (AdmitIncomingRowsBounded returns
+// before charging), so "" is not a chargeable identity and is reported as such.
+func incomingAdmissionChargeKey(keys []string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	uniq := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		uniq = append(uniq, key)
+	}
+	if len(uniq) == 0 {
+		return ""
+	}
+	sort.Strings(uniq)
+	sum := sha256.New()
+	for _, key := range uniq {
+		_, _ = sum.Write([]byte(key))
+		_, _ = sum.Write([]byte{0})
+	}
+	return hex.EncodeToString(sum.Sum(nil))
 }
 
 // logIncomingAdmissionRefusal is the one Warn shape every bounded incoming leg
@@ -204,7 +289,7 @@ func logIncomingAdmissionRefusal(logger *zap.Logger, leg string, stubKeys int, f
 // incoming leg's completeness fact before it looks at frontier.pending, which
 // a refusal has already emptied of every incoming entry.
 func recordFrontierIncomingAdmission(logger *zap.Logger, stats *ResolveStats, frontier incrementalFileFrontier, leg string) {
-	recordIncomingAdmission(stats, frontier.incomingAdmission, frontier.incomingRefusal)
+	recordIncomingAdmission(stats, frontier.stubKeys, frontier.incomingAdmission, frontier.incomingRefusal)
 	logIncomingAdmissionRefusal(logger, leg, len(frontier.stubKeys), frontier.incomingAdmission, frontier.incomingRefusal)
 }
 
@@ -2724,7 +2809,7 @@ func collectIncrementalFileFrontierMode(
 	// (Close, Get, New) parks every unbound reference to that name in the whole
 	// corpus on its stub ids, and admitting them all is the reverse leg's write
 	// amplification. graph.AdmitIncomingRowsBounded charges the physical rows
-	// against the shared incoming-source budget and refuses the WHOLE leg at
+	// against the shared incoming-source ceiling and refuses the WHOLE leg at
 	// the ceiling — the parked edges stay exactly as they are, and the refusal
 	// rides the frontier as a completeness fact instead of being a silent
 	// truncation. It neither widens nor splits the read: the same keys in the
@@ -3269,7 +3354,7 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	// refusal (graph.AdmitIncomingRowsBounded).
 	inByStub, fact, err := graph.AdmitIncomingRowsBounded(
 		context.Background(), r.graph.GetInEdgesByNodeIDs, stubKeys, nil)
-	recordIncomingAdmission(stats, fact, err)
+	recordIncomingAdmission(stats, stubKeys, fact, err)
 	if err != nil {
 		logIncomingAdmissionRefusal(r.logger, "names_probe", len(stubKeys), fact, err)
 		return stats
@@ -3335,11 +3420,12 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 	}
 	// This read is the reverse leg's write amplification: every row it admits
 	// is an edge resolveIncomingStubEdgesLocked may rebind and reindex. It is
-	// charged against the shared incoming-source budget and refuses whole, so a
+	// charged against the shared incoming-source ceiling — the same constant the
+	// preparation leg charged, against a budget of its own — and refuses whole, so a
 	// corpus-wide fan-out on a common name cannot become a corpus-wide write.
 	inByStub, fact, err := graph.AdmitIncomingRowsBounded(
 		context.Background(), r.graph.GetInEdgesByNodeIDs, stubKeys, nil)
-	recordIncomingAdmission(stats, fact, err)
+	recordIncomingAdmission(stats, stubKeys, fact, err)
 	if err != nil {
 		logIncomingAdmissionRefusal(r.logger, "resolve", len(stubKeys), fact, err)
 		return
