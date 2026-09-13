@@ -13,6 +13,41 @@ import (
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
+// MaxDedicatedBaseChainDepth is how many persisted generations one dedicated
+// base's delta chain may contain, counting its full root.
+//
+// It is a READ-time number that the write side is required to respect, not a
+// storage tuning knob: assemble nests one OverlaidView and opens one full
+// GenerationLayer mask read set per ancestor, so every generation in the chain
+// is another indirection on every node and edge lookup for every reader of
+// that base, forever — the chain is persisted, so the cost is paid long after
+// the advance that added the link. The publisher therefore proposes a new full
+// root instead of extending a chain that already holds this many generations
+// (internal/indexer/dedicated_base_advance.go, maxDedicatedBaseDeltaAncestors,
+// which is defined as this constant so the two sides cannot drift apart).
+//
+// It is deliberately well under the catalog's hard ancestry limit
+// (store_sqlite, maxDedicatedBaseAncestry = 64): the hard limit is the last
+// line of defence against a corrupt chain, and a policy that only stopped
+// there would make every refusal a publication failure instead of a re-root.
+const MaxDedicatedBaseChainDepth = 32
+
+// MaxGenerationAncestryDepth bounds the persisted BaseGenerationID chain a
+// materialized view will compose, counting the identity generation the walk
+// starts from.
+//
+// It is the dedicated chain bound plus the one checkout layer that legitimately
+// stands on a dedicated head: a checkout's commit generation names the
+// dedicated base as its BaseGenerationID (indexer.CheckoutCoordinator's
+// commitIdentity), so materializing a checkout routed over a maximal dedicated
+// chain walks one generation further than materializing that base as a ref
+// view. The working-tree generation is not in this walk — it is a routed
+// generation stacked above the identity generation, and MaxRepoViewLayers
+// bounds that half of the stack.
+//
+// Exceeding it is refused, never truncated: see generationAncestry.
+const MaxGenerationAncestryDepth = MaxDedicatedBaseChainDepth + 1
+
 // Materializer turns a checkout's route into a readable view.
 //
 // It owns none of the three things it needs and holds them by
@@ -424,9 +459,64 @@ func (m *Materializer) composesBaseCorpus(ctx context.Context, ancestry, generat
 	return row.GenerationKind != "dedicated", nil
 }
 
+// AncestryTooDeepError reports a persisted generation chain that is longer
+// than MaxGenerationAncestryDepth, so the view cannot be composed.
+//
+// It is labelled rather than anonymous because the labels are what a diagnosis
+// needs and what a message cannot be parsed for: which view was asked for,
+// which ancestor the walk was standing on when the bound was reached, how deep
+// the chain already was there, and the bound itself. Depth is the depth of
+// Ancestor within the chain, counting Generation itself as depth one; it is
+// the bound plus one whenever the refusal fired, since the walk stops at the
+// first generation past the bound rather than measuring the whole chain.
+//
+// The wire code is CodeViewBuilding, which is the code every other structural
+// refusal in generationAncestry already carries, and it is honest about the
+// remedy: the publisher's allocation policy roots a new full base rather than
+// extending a chain this long, so the condition clears when that base
+// publishes and the retry hint the code carries is the right advice. It is not
+// CodeCheckoutInaccessible — the checkout is perfectly readable and a ref view
+// has no checkout at all — and it is not a new code, because the code list is
+// a wire contract owned by errors.go.
+type AncestryTooDeepError struct {
+	*ViewError
+	// Generation is the identity generation the view was asked for.
+	Generation int64 `json:"generation"`
+	// Ancestor is the generation the walk refused to descend into.
+	Ancestor int64 `json:"ancestor"`
+	// Depth is how deep Ancestor sits, counting Generation as depth one.
+	Depth int `json:"depth"`
+	// Limit is the bound that was exceeded: MaxGenerationAncestryDepth.
+	Limit int `json:"limit"`
+}
+
+// Unwrap puts the embedded *ViewError in the unwrap chain, so errors.Is
+// against ErrViewBuilding and errors.As against **ViewError both match. The
+// promoted Unwrap would otherwise skip it and return the ViewError's own
+// cause.
+func (e *AncestryTooDeepError) Unwrap() error { return e.ViewError }
+
+// newAncestryTooDeep builds the labelled refusal.
+func newAncestryTooDeep(generationID, ancestorID int64, depth int) *AncestryTooDeepError {
+	return &AncestryTooDeepError{
+		ViewError: NewViewError(CodeViewBuilding, fmt.Sprintf(
+			"generation %d stands on a chain at least %d generations deep at ancestor %d, over the %d-generation read bound",
+			generationID, depth, ancestorID, MaxGenerationAncestryDepth)),
+		Generation: generationID,
+		Ancestor:   ancestorID,
+		Depth:      depth,
+		Limit:      MaxGenerationAncestryDepth,
+	}
+}
+
 // generationAncestry resolves the physical stack beneath the routed
 // generations. The first routed generation may sit on a dedicated full base;
 // later routed generations must form an exact chain above it.
+//
+// The BaseGenerationID walk is bounded by MaxGenerationAncestryDepth and the
+// bound is a refusal, never a truncation: a stack this function returned short
+// would be a view silently missing the oldest generations' content, which is a
+// wrong answer rather than a degraded one.
 func (m *Materializer) generationAncestry(ctx context.Context, generations []int64) ([]int64, error) {
 	if len(generations) == 0 {
 		return nil, NewViewError(CodeViewBuilding, "the view has no generations")
@@ -437,6 +527,9 @@ func (m *Materializer) generationAncestry(ctx context.Context, generations []int
 		if _, duplicate := seen[generationID]; duplicate {
 			return nil, NewViewError(CodeViewBuilding,
 				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
+		}
+		if len(ancestry) >= MaxGenerationAncestryDepth {
+			return nil, newAncestryTooDeep(generations[0], generationID, len(ancestry)+1)
 		}
 		seen[generationID] = struct{}{}
 		row, err := m.servableGeneration(ctx, generationID)

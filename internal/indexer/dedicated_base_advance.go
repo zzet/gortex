@@ -15,7 +15,26 @@ import (
 // ancestry. Old routes remain intact; adoption is not retirement permission.
 // This is separate from MaxRepoViewLayers, which names commit/dirty/buffer
 // content layers, not the persisted ancestry inside a committed base.
-const maxDedicatedBaseDeltaAncestors = 32
+//
+// The number is the read side's, not this package's: every link this planner
+// adds is one more OverlaidView nesting and one more mask read set on every
+// lookup by every later reader of the base, so the allocation bound must be
+// exactly the depth the materializer is willing to compose. Defining it as
+// graphview's constant is what makes "bounded" enforceable instead of a pair
+// of numbers two packages are trusted to keep equal
+// (graphview.MaxGenerationAncestryDepth adds the one checkout commit layer
+// that legitimately stands on a dedicated head).
+const maxDedicatedBaseDeltaAncestors = graphview.MaxDedicatedBaseChainDepth
+
+// maxDedicatedBaseActiveAncestryWalk mirrors store_sqlite's hard catalog
+// ancestry limit (maxDedicatedBaseAncestry, unexported there). Walking a stored
+// chain past it means the chain is not a shape this planner or that catalog can
+// have produced, so it is reported rather than re-rooted around: re-rooting
+// would quietly adopt a corrupt graph as a valid starting point.
+// TestDedicatedBaseAncestryBoundsAreOrdered pins the relation to the literal in
+// that file, so raising either number without the other fails a test instead of
+// producing chains the catalog refuses to claim on.
+const maxDedicatedBaseActiveAncestryWalk = 64
 
 func (p *dedicatedBasePublisher) ensureInitial(ctx context.Context, observe func(context.Context) (dedicatedBaseObservation, error)) (dedicatedBaseResult, error) {
 	return p.ensureObserved(ctx, observe, nil)
@@ -57,8 +76,16 @@ func dedicatedBaseParentForAdvance(ctx context.Context, catalog *store_sqlite.Ca
 	seen := make(map[int64]struct{})
 	row := active
 	for {
-		if _, duplicate := seen[row.GenerationID]; duplicate || len(seen) >= 64 {
-			return 0, fmt.Errorf("%w: cyclic or excessive active dedicated ancestry", store_sqlite.ErrDedicatedBaseCandidate)
+		// A cycle and an over-long chain are separate facts with separate
+		// diagnoses, so they no longer share one message. Both are refusals:
+		// the walk never stops early and reports a shorter chain than it found.
+		if _, duplicate := seen[row.GenerationID]; duplicate {
+			return 0, fmt.Errorf("%w: cyclic active dedicated ancestry at generation %d",
+				store_sqlite.ErrDedicatedBaseCandidate, row.GenerationID)
+		}
+		if len(seen) >= maxDedicatedBaseActiveAncestryWalk {
+			return 0, fmt.Errorf("%w: active dedicated ancestry is at least %d generations deep at generation %d, over the %d-generation catalog limit",
+				store_sqlite.ErrDedicatedBaseCandidate, len(seen)+1, row.GenerationID, maxDedicatedBaseActiveAncestryWalk)
 		}
 		if row.GenerationID <= authority.GenerationFloor || row.OwnerKind != "dedicated_graph" || row.GenerationKind != "dedicated" ||
 			row.GraphID != authority.GraphID || row.CheckoutID != authority.Owner.CheckoutID || row.TreeOID == "" || row.BaseGenerationID < 0 ||
@@ -97,10 +124,49 @@ func dedicatedBaseParentForAdvance(ctx context.Context, catalog *store_sqlite.Ca
 		}
 	}
 	if target.ConfigHash != policy.ConfigHash || target.ExtractorVersions != policy.ExtractorVersions || target.ResolverVersion != policy.ResolverVersion ||
-		target.DependencyRevision != policy.DependencyRevision || len(seen) >= maxDedicatedBaseDeltaAncestors {
+		target.DependencyRevision != policy.DependencyRevision {
+		return 0, nil
+	}
+	// The depth arm, stated on its own because it is a different decision from
+	// the policy arms above it. A chain already holding the allocation bound's
+	// worth of generations is not extended and is not truncated either: the
+	// advance proposes a full root, so the new head stands alone and the old
+	// chain keeps serving its own routes until nothing references it. Never
+	// return a parent here on the theory that "one more" is cheap — one more is
+	// paid by every reader of the resulting base on every lookup.
+	if len(seen) >= maxDedicatedBaseDeltaAncestors {
 		return 0, nil
 	}
 	return active.GenerationID, nil
+}
+
+// dedicatedBaseAncestryDepth counts the persisted chain at and beneath row,
+// stopping as soon as the count passes limit. It is metadata only — the same
+// bounded planning read dedicatedBaseParentForAdvance performs — and the
+// returned depth is exact when it is at most limit and "more than limit"
+// otherwise, which is all a bound check needs.
+func dedicatedBaseAncestryDepth(ctx context.Context, catalog *store_sqlite.Catalog, row store_sqlite.ViewGeneration, limit int) (int, error) {
+	seen := make(map[int64]struct{}, limit+1)
+	depth := 0
+	for {
+		if _, duplicate := seen[row.GenerationID]; duplicate {
+			return 0, fmt.Errorf("%w: cyclic dedicated ancestry at generation %d",
+				store_sqlite.ErrDedicatedBaseCandidate, row.GenerationID)
+		}
+		seen[row.GenerationID] = struct{}{}
+		depth++
+		if row.BaseGenerationID == 0 || depth > limit {
+			return depth, nil
+		}
+		next, found, err := catalog.GetViewGeneration(ctx, row.BaseGenerationID)
+		if err != nil {
+			return 0, err
+		}
+		if !found {
+			return 0, fmt.Errorf("%w: dedicated ancestor %d missing", store_sqlite.ErrDedicatedBaseCandidate, row.BaseGenerationID)
+		}
+		row = next
+	}
 }
 
 // buildObservedClaim dispatches by the reservation actually returned by the
@@ -122,6 +188,23 @@ func (p *dedicatedBasePublisher) buildObservedClaim(ctx context.Context, observa
 	}
 	if !found || parent.TreeOID == "" {
 		return 0, BuildReport{}, fmt.Errorf("%w: claimed dedicated parent missing", store_sqlite.ErrDedicatedBaseCandidate)
+	}
+	// The claim's parent is not necessarily the one the planner proposed — a
+	// cached or coalesced reservation names its own valid parent, and the
+	// catalog's own ancestry validation admits any chain under its hard
+	// 64-generation limit. So the depth bound is re-checked here, on the parent
+	// actually claimed, before any payload is written: a delta built over a
+	// chain already at the bound would publish a head no reader can compose,
+	// which is a far worse outcome than refusing the build. Refusing before the
+	// catalog's hard limit also keeps the refusal attributable — the next
+	// advance observes no new head and proposes a full root.
+	depth, err := dedicatedBaseAncestryDepth(ctx, p.runtime.store.Catalog(), parent, maxDedicatedBaseDeltaAncestors)
+	if err != nil {
+		return 0, BuildReport{}, err
+	}
+	if depth >= maxDedicatedBaseDeltaAncestors {
+		return 0, BuildReport{}, fmt.Errorf("%w: claimed dedicated parent %d is %d generations deep; a delta over it would pass the %d-generation ancestry bound",
+			store_sqlite.ErrDedicatedBaseCandidate, claim.BaseGenerationID, depth, maxDedicatedBaseDeltaAncestors)
 	}
 	request := ClaimedDedicatedDeltaRequest{
 		Claim: claim, BaseTreeOID: parent.TreeOID, RepoDir: observation.RootPath,

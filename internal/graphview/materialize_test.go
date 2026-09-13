@@ -3,6 +3,7 @@ package graphview
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -1196,5 +1197,207 @@ func TestCompletenessOfAnEmptyStackDeniesTextSearch(t *testing.T) {
 		if got := completeness.State(id); got != StateComplete {
 			t.Errorf("an empty stack reports %s = %q, want %q", id, got, StateComplete)
 		}
+	}
+}
+
+// --- ancestry depth bound (W6.9) ----------------------------------------
+
+// writeDedicatedChain publishes a dedicated full root plus count-1 deltas over
+// it and returns the generation ids bottom first.
+//
+// Every generation claims its own file, so the composed view can be asked for
+// content that only the BOTTOM generation carries: that is what separates a
+// composition that walked the whole chain from one that silently stopped part
+// way, which is the failure mode the bound must never degrade into.
+func writeDedicatedChain(t testing.TB, store *store_sqlite.Store, count int) []int64 {
+	t.Helper()
+	chain := make([]int64, 0, count)
+	parent := int64(0)
+	for index := range count {
+		file := fmt.Sprintf("%s/chain%d.go", stackRepo, index)
+		parent = writeDedicatedRootGeneration(t, store, fmt.Sprintf("chain-%d", index), parent,
+			[]*graph.Node{
+				dedicatedRootFileNode(file),
+				dedicatedRootSymbol(file, fmt.Sprintf("Chain%d", index), index+1),
+			},
+			[]store_sqlite.FileMask{{RepoPrefix: stackRepo, FilePath: file, Mode: store_sqlite.OwnershipReplace}})
+		chain = append(chain, parent)
+	}
+	return chain
+}
+
+// chainSymbolID names the symbol the generation at index of a writeDedicatedChain
+// stack claims.
+func chainSymbolID(index int) string {
+	return fmt.Sprintf("%s/chain%d.go::Chain%d", stackRepo, index, index)
+}
+
+// TestGenerationAncestryComposesAtTheBoundAndRefusesPastIt pins both halves of
+// the read-time bound. The chain exactly at MaxGenerationAncestryDepth must
+// still compose — and compose completely, down to the root generation's own
+// content — while one generation more is refused with the labelled error
+// rather than served short.
+func TestGenerationAncestryComposesAtTheBoundAndRefusesPastIt(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("at_the_bound_composes_the_whole_chain", func(t *testing.T) {
+		store := openStackStore(t, "ancestry-at-bound")
+		chain := writeDedicatedChain(t, store, MaxGenerationAncestryDepth)
+		seedStackControlPlane(t, store, chain[0])
+		head := chain[len(chain)-1]
+
+		view, err := newTestMaterializer(store).assemble(ctx, testGraphID, stackRepo, []int64{head}, nil)
+		if err != nil {
+			t.Fatalf("assemble a chain of exactly %d generations: %v", MaxGenerationAncestryDepth, err)
+		}
+		defer view.Close()
+		if got := view.Generations(); !slicesEqualInt64(got, chain) {
+			t.Fatalf("composed ancestry=%v, want the whole chain %v", got, chain)
+		}
+		if got := view.GenerationSources(); len(got) != MaxGenerationAncestryDepth {
+			t.Fatalf("composed sources=%d, want one per generation (%d)", len(got), MaxGenerationAncestryDepth)
+		}
+		// The root's content and the head's content both read back: the bound
+		// is a refusal threshold, not a truncation point.
+		for _, index := range []int{0, MaxGenerationAncestryDepth / 2, MaxGenerationAncestryDepth - 1} {
+			if got := view.Reader.GetNode(chainSymbolID(index)); got == nil {
+				t.Errorf("generation %d of %d lost its symbol %q in the composition",
+					index, MaxGenerationAncestryDepth, chainSymbolID(index))
+			}
+		}
+	})
+
+	t.Run("one_past_the_bound_refuses_with_the_labelled_error", func(t *testing.T) {
+		store := openStackStore(t, "ancestry-past-bound")
+		chain := writeDedicatedChain(t, store, MaxGenerationAncestryDepth+1)
+		seedStackControlPlane(t, store, chain[0])
+		head := chain[len(chain)-1]
+
+		view, err := newTestMaterializer(store).assemble(ctx, testGraphID, stackRepo, []int64{head}, nil)
+		if err == nil {
+			view.Close()
+			t.Fatalf("a chain of %d generations composed, want a refusal", MaxGenerationAncestryDepth+1)
+		}
+		var tooDeep *AncestryTooDeepError
+		if !errors.As(err, &tooDeep) {
+			t.Fatalf("refusal is not an *AncestryTooDeepError: %#v", err)
+		}
+		if tooDeep.Generation != head {
+			t.Errorf("labelled generation=%d, want the requested head %d", tooDeep.Generation, head)
+		}
+		if tooDeep.Ancestor != chain[0] {
+			t.Errorf("labelled ancestor=%d, want the generation the walk stopped at (%d)", tooDeep.Ancestor, chain[0])
+		}
+		if tooDeep.Depth != MaxGenerationAncestryDepth+1 {
+			t.Errorf("labelled depth=%d, want %d", tooDeep.Depth, MaxGenerationAncestryDepth+1)
+		}
+		if tooDeep.Limit != MaxGenerationAncestryDepth {
+			t.Errorf("labelled limit=%d, want %d", tooDeep.Limit, MaxGenerationAncestryDepth)
+		}
+		// The wire contract: a stable code callers already switch on, reachable
+		// through both the sentinel and CodeOf.
+		if got := CodeOf(err); got != CodeViewBuilding {
+			t.Errorf("wire code=%q, want %q", got, CodeViewBuilding)
+		}
+		if !errors.Is(err, ErrViewBuilding) {
+			t.Errorf("refusal does not match the %s sentinel", CodeViewBuilding)
+		}
+	})
+
+	t.Run("refusal_survives_the_public_ref_view_entrypoint", func(t *testing.T) {
+		store := openStackStore(t, "ancestry-past-bound-refview")
+		chain := writeDedicatedChain(t, store, MaxGenerationAncestryDepth+1)
+		seedStackControlPlane(t, store, chain[0])
+
+		view, err := newTestMaterializer(store).MaterializeRefView(ctx, testGraphID, chain[len(chain)-1])
+		if err == nil {
+			view.Close()
+			t.Fatal("MaterializeRefView served a chain past the read bound")
+		}
+		var tooDeep *AncestryTooDeepError
+		if !errors.As(err, &tooDeep) {
+			t.Fatalf("MaterializeRefView refusal is not an *AncestryTooDeepError: %#v", err)
+		}
+	})
+}
+
+// TestCheckoutOverAMaximalDedicatedChainComposes is why
+// MaxGenerationAncestryDepth is one more than MaxDedicatedBaseChainDepth
+// rather than equal to it.
+//
+// A checkout's commit generation names the dedicated base as its
+// BaseGenerationID, so routing a checkout over a dedicated chain that the
+// publisher filled right up to its allocation bound walks one generation
+// further than materializing that base directly. A read bound set to the
+// allocation bound would refuse the ordinary steady state of a maximally
+// advanced dedicated graph.
+func TestCheckoutOverAMaximalDedicatedChainComposes(t *testing.T) {
+	store := openStackStore(t, "checkout-over-maximal-chain")
+	seedStackCorpus(t, store)
+	chain := writeDedicatedChain(t, store, MaxDedicatedBaseChainDepth)
+	commit := writeStackCommitGeneration(t, store, chain[len(chain)-1])
+	dirty := writeStackDirtyGeneration(t, store, commit)
+	seedStackControlPlane(t, store, chain[0])
+	routeStack(t, store, commit, dirty, store_sqlite.RouteActive)
+
+	view, err := newTestMaterializer(store).MaterializeCheckout(context.Background(), testCheckoutID)
+	if err != nil {
+		t.Fatalf("materialize a checkout over a maximal dedicated chain: %v", err)
+	}
+	defer view.Close()
+	want := append(slices.Clone(chain), commit, dirty)
+	if got := view.Generations(); !slicesEqualInt64(got, want) {
+		t.Fatalf("composed ancestry=%v, want %v", got, want)
+	}
+	if got := view.Reader.GetNode(chainSymbolID(0)); got == nil {
+		t.Errorf("the dedicated root's own symbol %q did not survive the composition", chainSymbolID(0))
+	}
+}
+
+// TestComposedReadCostByAncestryDepth is the measurement behind the policy
+// number: what one more persisted ancestor actually costs a reader.
+//
+// It is a recorded measurement, not a threshold assertion — the harness runs
+// with GOMAXPROCS=2 on a shared machine, so a timing bound here would be a
+// flake generator. The point is that the numbers exist and are attributable:
+// the chain is otherwise identical at every depth, each generation claims one
+// file, and the probed symbol is the one the BOTTOM generation owns, which is
+// the lookup that pays for every layer above it.
+func TestComposedReadCostByAncestryDepth(t *testing.T) {
+	const lookups = 2000
+	ctx := context.Background()
+	for _, depth := range []int{1, 8, 16, 32} {
+		t.Run(fmt.Sprintf("depth_%d", depth), func(t *testing.T) {
+			store := openStackStore(t, fmt.Sprintf("cost-depth-%d", depth))
+			chain := writeDedicatedChain(t, store, depth)
+			seedStackControlPlane(t, store, chain[0])
+			materializer := newTestMaterializer(store)
+
+			start := time.Now()
+			view, err := materializer.assemble(ctx, testGraphID, stackRepo, []int64{chain[len(chain)-1]}, nil)
+			if err != nil {
+				t.Fatalf("assemble depth %d: %v", depth, err)
+			}
+			defer view.Close()
+			assembled := time.Since(start)
+
+			deepest := chainSymbolID(0)
+			if view.Reader.GetNode(deepest) == nil {
+				t.Fatalf("depth %d lost the root symbol %q", depth, deepest)
+			}
+			start = time.Now()
+			for range lookups {
+				_ = view.Reader.GetNode(deepest)
+			}
+			perNode := time.Since(start) / lookups
+			start = time.Now()
+			for range lookups {
+				_ = view.Reader.GetOutEdges(deepest)
+			}
+			perEdge := time.Since(start) / lookups
+
+			t.Logf("ancestry depth %2d: assemble %8v | GetNode(root symbol) %8v/op | GetOutEdges(root symbol) %8v/op",
+				depth, assembled, perNode, perEdge)
+		})
 	}
 }
