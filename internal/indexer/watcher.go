@@ -2577,6 +2577,17 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	// the same fact, but it would also charge every concurrent writer on the
 	// store for the whole mutation and let a sibling repository's cut land on
 	// this mutation's verdict — see affected_by.go.
+	//
+	// This window is deliberately WIDER than the receipt's own fan-out axis,
+	// which is bounded to the parse/evict batch because that is the window a
+	// receipt describes (incremental_watcher_batch.go opens its own, nested,
+	// batch-scoped observation for it). The two carriers answer different
+	// questions and must not be collapsed: the receipt says what the BATCH's
+	// bounded passes left stale, this says whether the derived work over the
+	// caller's EDIT finished — and the deferred resolver catch-up, which runs
+	// outside the receipt boundary on purpose, is part of that edit's derived
+	// work. Narrowing this one to the batch would hand a caller a positive
+	// "complete" over a catch-up that was cut.
 	observation := beginDerivedFanoutObservation(idx)
 	defer observation.close()
 	result, err := w.reindexPointPathRaw(idx, path)

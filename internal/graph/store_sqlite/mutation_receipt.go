@@ -33,6 +33,18 @@ type sqliteMutationReceiptAccumulator struct {
 	// Complete here would turn a bounded fan-out into the whole-graph fallback
 	// the bound exists to avoid.
 	fanoutTruncations []graph.ReceiptFanoutTruncation
+	// fanoutOwned marks a window that takes fan-out facts ONLY from the
+	// mutation that opened it, addressed by this window's own token
+	// (RecordMutationFanoutTruncationIn). Every other channel — the store-wide
+	// broadcast and a merged write delta — is refused.
+	//
+	// The store is shared by every repository the daemon indexes, so a
+	// broadcast fact carries no attribution at all: under MultiWatcher,
+	// repository B's bounded pass would land on repository A's open window and
+	// A's receipt would name files that are not A's to re-resolve. Ownership is
+	// the attribution: the caller that opened the window is the one that knows
+	// which passes ran inside its own batch.
+	fanoutOwned bool
 }
 
 // noteIncomplete voids the receipt, keeping the FIRST cause.
@@ -117,7 +129,29 @@ func sortedSQLiteReceiptKeys(values map[string]struct{}) []string {
 func (s *Store) BeginMutationReceipt() graph.MutationReceiptToken {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.beginMutationReceiptLocked(false)
+}
 
+// BeginMutationReceiptOwningFanout starts a window that OWNS its bounded-
+// derived-pass axis: it observes the same mutation delta as an ordinary
+// receipt, but its FanoutTruncations set is filled only by
+// RecordMutationFanoutTruncationIn addressed to this token.
+//
+// It exists because a receipt window is per-mutation while this store is
+// per-DAEMON: every repository the daemon indexes mutates the same *Store, so
+// several windows are open at once and the store-wide
+// RecordMutationFanoutTruncation broadcast cannot tell which of them ran the
+// pass. A caller that can attribute its own bounded passes — the incremental
+// pipeline, which opens the window around exactly the batch those passes run
+// in — opens the window here and hands its own facts back by token, so a
+// sibling repository's cut can never land on this mutation's receipt.
+func (s *Store) BeginMutationReceiptOwningFanout() graph.MutationReceiptToken {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.beginMutationReceiptLocked(true)
+}
+
+func (s *Store) beginMutationReceiptLocked(ownsFanout bool) graph.MutationReceiptToken {
 	s.mutationReceipts.next++
 	if s.mutationReceipts.next == 0 {
 		s.mutationReceipts.next++
@@ -126,7 +160,9 @@ func (s *Store) BeginMutationReceipt() graph.MutationReceiptToken {
 		s.mutationReceipts.active = make(map[graph.MutationReceiptToken]*sqliteMutationReceiptAccumulator)
 	}
 	token := s.mutationReceipts.next
-	s.mutationReceipts.active[token] = newSQLiteMutationReceiptAccumulator()
+	acc := newSQLiteMutationReceiptAccumulator()
+	acc.fanoutOwned = ownsFanout
+	s.mutationReceipts.active[token] = acc
 	return token
 }
 
@@ -145,7 +181,13 @@ func (s *Store) EndMutationReceipt(token graph.MutationReceiptToken) graph.Mutat
 }
 
 // RecordMutationFanoutTruncation attaches one bounded derived pass's
-// completeness fact to every receipt currently open on this store.
+// completeness fact to every receipt currently open on this store EXCEPT the
+// windows that own their fan-out axis (BeginMutationReceiptOwningFanout).
+//
+// The broadcast carries no attribution — it names a pass and the files it
+// dropped, never the repository or the mutation that ran it — so a window that
+// can attribute its own passes must not take it: on the daemon's single shared
+// store the next fact to arrive may be a sibling repository's.
 //
 // This is the production half of the axis: *Store is the graph.Store the
 // daemon actually holds (serverstack openSqliteBackend -> store_sqlite.Open),
@@ -165,8 +207,39 @@ func (s *Store) RecordMutationFanoutTruncation(fact graph.ReceiptFanoutTruncatio
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	for _, acc := range s.mutationReceipts.active {
+		if acc.fanoutOwned {
+			continue
+		}
 		acc.fanoutTruncations = graph.MergeReceiptFanoutTruncation(acc.fanoutTruncations, fact)
 	}
+}
+
+// RecordMutationFanoutTruncationIn attaches one bounded derived pass's
+// completeness fact to EXACTLY ONE window: the receipt named by token.
+//
+// This is the attributed half of the axis. The token is the mutation's own
+// identity, so a fact recorded here is a claim about the passes THAT mutation
+// ran, inside the batch its window brackets — never about a concurrent
+// repository's, and never about work done after the window closed (an unknown
+// or already-ended token is a silent no-op, exactly as a late broadcast is).
+//
+// It takes writeMu for the same reason the broadcast does, records no row, and
+// merges through graph.MergeReceiptFanoutTruncation so a chunked batch that
+// re-applies its bound reports the UNION of dropped files, never a sum.
+func (s *Store) RecordMutationFanoutTruncationIn(
+	token graph.MutationReceiptToken,
+	fact graph.ReceiptFanoutTruncation,
+) {
+	if s.coreless() {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	acc := s.mutationReceipts.active[token]
+	if acc == nil {
+		return
+	}
+	acc.fanoutTruncations = graph.MergeReceiptFanoutTruncation(acc.fanoutTruncations, fact)
 }
 
 func (s *Store) hasActiveMutationReceiptsLocked() bool {
@@ -206,8 +279,15 @@ func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulat
 		// Per-pass fan-out facts merge on the union of dropped names, never
 		// by appending, for the same reason they do inside one pass: a
 		// chunked batch re-applies the bound and can reject one file twice.
-		for _, fact := range delta.fanoutTruncations {
-			acc.fanoutTruncations = graph.MergeReceiptFanoutTruncation(acc.fanoutTruncations, fact)
+		//
+		// A window that owns its fan-out axis is excluded here for the same
+		// reason it is excluded from the broadcast: a merged delta is another
+		// writer's traffic on the shared store, and this window takes facts
+		// only from the mutation that opened it.
+		if !acc.fanoutOwned {
+			for _, fact := range delta.fanoutTruncations {
+				acc.fanoutTruncations = graph.MergeReceiptFanoutTruncation(acc.fanoutTruncations, fact)
+			}
 		}
 	}
 }

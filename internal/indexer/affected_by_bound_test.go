@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 )
@@ -981,4 +983,150 @@ func TestPatchGraphObservingFanoutStampsNothingOnAFailedPatch(t *testing.T) {
 		"the bounded pass did not run; the assertion below would be vacuous")
 	assert.Equal(t, DerivedFanoutCompleteness{}, fanout,
 		"a failed patch stamped a fan-out verdict: %+v", fanout)
+}
+
+// ---------------------------------------------------------------------------
+// The receipt's fan-out axis is per-MUTATION, bounded to the receipt batch
+// ---------------------------------------------------------------------------
+//
+// The verdict on the ticket is already per-Indexer (the observation window
+// above). The RECEIPT is the other carrier, and it was not: a bounded pass
+// publishes its cut through a store-wide broadcast
+// (carryAffectedByTruncationOnReceipt -> Store.RecordMutationFanoutTruncation)
+// that names the pass and the files it dropped but never the repository or the
+// mutation that ran it. Every repository the daemon indexes mutates ONE
+// *store_sqlite.Store, so several receipt windows are open at once and the
+// broadcast lands on all of them.
+//
+// incrementalReindexPathsWithReceiptMode now opens a window that OWNS its
+// fan-out axis and hands it exactly the facts this Indexer observed inside the
+// batch the window brackets.
+
+// A sibling repository's cut, taken on the same store while this mutation's
+// receipt window is open, must not appear on this mutation's receipt.
+//
+// Revert-red: open the window with BeginMutationReceipt instead of
+// BeginMutationReceiptOwningFanout (or drop the fanoutOwned skip in
+// store_sqlite RecordMutationFanoutTruncation) and repository A's receipt
+// reports four dropped files, two of which are B's.
+func TestBatchReceiptFanoutRefusesASiblingRepositorysCut(t *testing.T) {
+	shared := newSqliteGraph(t)
+	repoA, _, observedA, obsA, dirA, defPathsA := affectedByBoundFixtureFor(t, shared, "a", 2, 3, 4)
+	repoB := New(shared, parser.NewRegistry(), config.Default().Index, zap.NewNop())
+	repoB.SetRepoPrefix("b")
+
+	// The watcher's wider window, open across the whole mutation. The receipt
+	// window nests inside it and must not steal its facts: the mutation's own
+	// verdict spans the resolver/derived catch-up too, and is carried
+	// separately from the receipt axis.
+	outer := beginDerivedFanoutObservation(repoA)
+
+	foreign := affectedByTruncation{
+		Truncated: true, Cap: 1, Considered: 3,
+		Dropped: []string{"b/one.go", "b/two.go"},
+	}
+	repoA.incrementalCatchupHook = func(kind string, files []string) {
+		obsA.record(kind, files)
+		if kind == "affected_by_truncated" {
+			// B's bounded pass is cut while A's receipt window is open.
+			repoB.reportAffectedByTruncation("b", foreign)
+		}
+	}
+
+	bumpAffectedByDefs(t, defPathsA)
+	_, receipt, _, err := repoA.incrementalReindexPathsWithReceiptMode(dirA, defPathsA, incrementalPathMode{})
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
+	require.Len(t, truncationEntries(observedA), 1,
+		"repository A did not truncate; the assertions below would be vacuous")
+	require.Len(t, obsA.dropped, 1)
+
+	fact, ok := receipt.FanoutTruncationFor(affectedByFanoutPass)
+	require.True(t, ok, "the receipt lost this mutation's own cut: %+v", receipt.FanoutTruncations)
+	assert.ElementsMatch(t, obsA.dropped[0], fact.DroppedFiles,
+		"the receipt must carry exactly the set this mutation's pass dropped")
+	for _, foreignFile := range foreign.Dropped {
+		assert.NotContains(t, fact.DroppedFiles, foreignFile,
+			"a sibling repository's dropped file landed on this mutation's receipt: %+v", fact)
+	}
+	assert.Equal(t, 2, fact.Dropped)
+	assert.Equal(t, 2, receipt.DroppedFanoutFiles())
+	assert.Equal(t, 4, fact.Cap)
+	assert.Equal(t, 6, fact.Considered)
+	assert.True(t, receipt.Complete,
+		"a bounded fan-out voided the delta receipt: %+v", *receipt)
+
+	// The wider window still saw A's own cut: the receipt window consumed it
+	// without absorbing it.
+	verdict := outer.close()
+	require.True(t, verdict.Observed,
+		"the nested receipt window swallowed the mutation's verdict: %+v", verdict)
+	assert.False(t, verdict.Complete)
+	assert.Equal(t, 2, verdict.Dropped)
+}
+
+// The axis is bounded to the RECEIPT BATCH: the window admits only the cuts it
+// OBSERVED, never an unattributed broadcast that merely overlapped it in time.
+//
+// The broadcast below is the shape every producer outside this batch takes on
+// the shared store — a sibling repository's deferred resolver catch-up, which
+// incremental_watcher_batch.go keeps outside the receipt boundary on purpose,
+// or a concurrent full-repo reindex (multi.go) whose passes carry their cuts
+// the same way. None of them is this batch's, and none of them may make this
+// mutation's receipt name files this batch never touched.
+//
+// Revert-red: leave the window unowned and the broadcast lands, so a batch that
+// truncated nothing reports a hole.
+// fanoutBroadcastingStore is the production backend plus one unattributed
+// fan-out broadcast, fired from inside a graph WRITE so it provably lands while
+// the mutation's receipt window is open. The broadcast is the store-wide
+// channel every bounded pass publishes through
+// (graph.NoteMutationFanoutTruncation -> Store.RecordMutationFanoutTruncation);
+// what makes it foreign here is only that this window never observed the pass.
+type fanoutBroadcastingStore struct {
+	*store_sqlite.Store
+	armed atomic.Bool
+	fact  graph.ReceiptFanoutTruncation
+}
+
+func (s *fanoutBroadcastingStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	if s.armed.CompareAndSwap(true, false) {
+		s.Store.RecordMutationFanoutTruncation(s.fact)
+	}
+	s.Store.AddBatch(nodes, edges)
+}
+
+func TestBatchReceiptFanoutAdmitsOnlyWhatItObserved(t *testing.T) {
+	base, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = base.Close() })
+	shared := &fanoutBroadcastingStore{Store: base, fact: graph.ReceiptFanoutTruncation{
+		Pass: affectedByFanoutPass, Cap: 1, Considered: 4, Dropped: 1,
+		DroppedFiles: []string{"elsewhere/stale.go"},
+	}}
+
+	idx, _, observed, _, dir, defPaths := affectedByBoundFixtureOn(t, shared, 2, 2, 8)
+	shared.armed.Store(true)
+
+	bumpAffectedByDefs(t, defPaths)
+	_, receipt, _, err := idx.incrementalReindexPathsWithReceiptMode(dir, defPaths, incrementalPathMode{})
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
+	require.False(t, shared.armed.Load(),
+		"the foreign broadcast never fired inside the window; the assertions would be vacuous")
+	require.Empty(t, truncationEntries(observed),
+		"this batch was supposed to stay under its bound; the assertions would be vacuous")
+
+	assert.True(t, receipt.DerivedFanoutComplete(),
+		"a cut this batch never ran landed on its receipt: %+v", receipt.FanoutTruncations)
+	assert.Empty(t, receipt.FanoutTruncations)
+	assert.Zero(t, receipt.DroppedFanoutFiles())
+
+	// The window is a batch's, so it must be gone with the batch. A stranded
+	// one would silently absorb every later pass's facts on this Indexer — and
+	// one per incremental batch never returns.
+	derivedFanoutObservers.mu.Lock()
+	live := len(derivedFanoutObservers.by[idx])
+	derivedFanoutObservers.mu.Unlock()
+	assert.Zero(t, live, "the batch's fan-out window stayed registered on its Indexer")
 }

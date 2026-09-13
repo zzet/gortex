@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/reach"
 )
 
@@ -43,13 +44,84 @@ func (idx *Indexer) incrementalReindexPathsWithReceiptMode(
 		return result, nil, batch, err
 	}
 
-	token := receiptStore.BeginMutationReceipt()
+	owner, _ := receiptStore.(mutationFanoutOwningReceiptStore)
+	var token graph.MutationReceiptToken
+	if owner != nil {
+		token = owner.BeginMutationReceiptOwningFanout()
+	} else {
+		token = receiptStore.BeginMutationReceipt()
+	}
+	// The receipt's fan-out axis is keyed to THIS mutation and bounded to THIS
+	// batch, and both halves of that need the observation below.
+	//
+	// Bounded: the axis documents "every bounded derived pass that ran inside
+	// this receipt's window", and this window is exactly the parse/evict batch
+	// — the resolver and derived catch-up run after it closes, on purpose (see
+	// the boundary note above). The observation opens and closes with the
+	// window, so a pass that ran outside it contributes nothing here. The
+	// mutation's own verdict, which DOES span the catch-up, is carried
+	// separately by the watcher's wider window (watcher.go
+	// patchGraphWithReceiptStateRawModern) and is unaffected by this.
+	//
+	// Keyed: the store is shared by every repository the daemon indexes, so
+	// the store-wide broadcast a bounded pass emits
+	// (carryAffectedByTruncationOnReceipt) cannot say which open window ran
+	// it. An owning window refuses that broadcast and takes only what this
+	// indexer observed, addressed by this window's own token — so a sibling
+	// repository's cut can never land on this mutation's receipt.
+	fanout := beginDerivedFanoutObservation(idx)
 	defer func() {
+		facts := fanout.closeReceiptFanoutFacts()
+		if owner != nil {
+			for _, fact := range facts {
+				owner.RecordMutationFanoutTruncationIn(token, fact)
+			}
+		}
 		observed := receiptStore.EndMutationReceipt(token)
 		receipt = &observed
 	}()
 	result, err = idx.incrementalReindexPathsMode(root, paths, mode, batch)
 	return result, receipt, batch, err
+}
+
+// mutationFanoutOwningReceiptStore is the OPTIONAL store capability that lets
+// ONE mutation own the bounded-derived-pass axis of its own receipt.
+//
+// It is declared here, at the consumer, rather than widening
+// graph.MutationReceiptStore: a backend that has not implemented it must keep
+// satisfying that interface, or the `store.(graph.MutationReceiptStore)`
+// assertion above would disable receipts entirely and trade an unattributed
+// fan-out fact for a whole-graph fallback on every save. A store without the
+// capability keeps the store-wide broadcast, which can name a sibling
+// repository's dropped files — over-reporting the hole, never hiding one.
+type mutationFanoutOwningReceiptStore interface {
+	BeginMutationReceiptOwningFanout() graph.MutationReceiptToken
+	RecordMutationFanoutTruncationIn(graph.MutationReceiptToken, graph.ReceiptFanoutTruncation)
+}
+
+// The daemon holds exactly one graph.Store — *store_sqlite.Store
+// (serverstack openSqliteBackend) — so if that backend ever stopped satisfying
+// the capability, every shipped mutation would silently fall back to the
+// store-wide axis. Fail to compile instead.
+var _ mutationFanoutOwningReceiptStore = (*store_sqlite.Store)(nil)
+
+// closeReceiptFanoutFacts closes a per-Indexer fan-out observation and returns
+// the RAW per-pass facts it saw, in the shape the receipt axis carries.
+//
+// close() is the same deregistration and seal the verdict path uses — calling
+// it first is what makes reading o.facts afterwards safe, because a sealed
+// window rejects every later record. The lowered verdict it returns is the
+// summary a mutation CALLER reads; a receipt consumer needs the facts
+// themselves (the cap, the union considered, and the file names), so this
+// reads them directly instead of re-deriving them from the summary.
+func (o *derivedFanoutObservation) closeReceiptFanoutFacts() []graph.ReceiptFanoutTruncation {
+	if o == nil {
+		return nil
+	}
+	o.close()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]graph.ReceiptFanoutTruncation(nil), o.facts...)
 }
 
 // incrementalResolutionFrontier chooses the narrowest quality-safe resolver
