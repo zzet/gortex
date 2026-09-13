@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func repositoryLeaseTestOwner(suffix string) RepositoryOwner {
@@ -998,5 +999,76 @@ func TestBasePinHandoffIsNeverPartial(t *testing.T) {
 		if m.InUse(BaseCorpusGeneration) {
 			t.Fatal("generation zero stayed pinned after every holder released")
 		}
+	}
+}
+
+// TestRepositoryOwnerHandleIsOrderedAgainstFinalization pins what makes
+// RegisterRepositoryOwnerHandle's two critical sections one registration.
+//
+// The registration happens under the lease mutex and the handle is resolved
+// under a second hold of it, so the pair is ordered by registerMu instead: the
+// registration holds it across both sections, and FinalizeRepositoryCleanup —
+// the only step that removes a live registration from byPrefix/byGraph, and
+// therefore the only one that can free a prefix for a replacement — takes it
+// too. Without that order, a finalization plus a replacement registration
+// landing between the sections would hand the caller a handle naming the
+// replacement, and closing "its own" registration through it would close
+// somebody else's.
+func TestRepositoryOwnerHandleIsOrderedAgainstFinalization(t *testing.T) {
+	var m LeaseManager
+	owner := repositoryLeaseTestOwner("ordered")
+
+	// Half one: the registration holds the order across the whole call. The
+	// prepare hook runs inside the first critical section, which is exactly
+	// where a second section would be entered from.
+	prepared := false
+	handle, err := m.RegisterRepositoryOwnerHandle(owner, func() error {
+		prepared = true
+		if m.repositories.registerMu.TryLock() {
+			m.repositories.registerMu.Unlock()
+			return fmt.Errorf("registration resolved its handle outside the finalization order")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prepared {
+		t.Fatal("the prepare hook never ran; the order was not probed")
+	}
+	if handle == nil || handle.Owner() != owner {
+		t.Fatalf("handle = %v, want the registration this call opened", handle)
+	}
+	if handle.state != m.repositories.byPrefix[owner.RepoPrefix] {
+		t.Fatal("the handle names a registration this call did not open")
+	}
+
+	// Half two: finalization takes the same order, so it cannot free a prefix
+	// while a registration is between its sections.
+	drain, err := m.CloseRepositoryRegistration(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRepositoryDrain(t, drain.Done(), true)
+	m.repositories.registerMu.Lock()
+	finalized := make(chan error, 1)
+	go func() { finalized <- m.FinalizeRepositoryCleanup(drain) }()
+	select {
+	case err := <-finalized:
+		m.repositories.registerMu.Unlock()
+		t.Fatalf("finalization ran outside the registration order: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	m.repositories.registerMu.Unlock()
+	select {
+	case err := <-finalized:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("finalization never completed after the order was released")
+	}
+	if m.repositories.byPrefix != nil {
+		t.Fatal("finalization left the registration behind")
 	}
 }

@@ -204,6 +204,11 @@ type CheckoutLifecycle struct {
 	coordinatorActivating map[string]struct{}
 	coordinatorClosing    bool
 	coordinatorStartWG    sync.WaitGroup
+	// coordinatorLeaseWG counts the waiters that hold one coordinator's
+	// repository-owner admission for the length of its build loop
+	// (holdRepositoryOwnerRead). Close joins them after the admissions have
+	// drained, which is after every one of them has released.
+	coordinatorLeaseWG sync.WaitGroup
 	// started holds every coordinator this process has started and not yet
 	// seen stop, keyed by checkout. The registry is what can be handed a
 	// cycle; this is what is running. They come apart for the length of a
@@ -2101,6 +2106,10 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	if l.store == nil || l.catalog == nil {
 		return nil, nil
 	}
+	// The construction-time admission. It is handed to the coordinator below
+	// and released here only as the acquirer's own hold, so the repository the
+	// loop reads and writes stays un-finalizable and un-purgeable for as long
+	// as that loop runs — not merely for as long as this constructor does.
 	ownerRead, err := l.AcquireRepositoryRead(primaryGraphID)
 	if err != nil {
 		return nil, err
@@ -2189,7 +2198,80 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	// when the constructor returns, and the transitions register only once the
 	// rebuild they drive with it has landed.
 	l.trackStarted(checkout.CheckoutID, coordinator)
+	l.holdRepositoryOwnerRead(coordinator, ownerRead.Handoff())
+	// A close that began after this constructor was admitted took its first
+	// actor snapshot (repository_cleanup.go:184) before the line above could
+	// record this one, so the cleanup would wait on a drain this coordinator
+	// now holds open for its whole lifetime and nothing would ever close it.
+	// The constructor therefore re-reads the boundary it was admitted through
+	// and closes what it just started. The two orders are exhaustive: either
+	// the close was recorded before this read, and this arm closes the
+	// coordinator, or it was not, and the snapshot after it saw the actor.
+	if l.RepositoryAdmissionClosed(primary.RepoPrefix) {
+		_ = coordinator.Close()
+		l.oweRetirement(coordinator.DrainRetirements()...)
+		return nil, fmt.Errorf(
+			"indexer: repository %s stopped admitting while checkout %s was starting its coordinator",
+			primary.RepoPrefix, checkout.CheckoutID)
+	}
 	return coordinator, nil
+}
+
+// holdRepositoryOwnerRead keeps one coordinator's repository-owner admission
+// for the LIFETIME of its build loop and releases it when that loop ends.
+//
+// The constructor's own admission covers the construction only, and a build
+// loop outlives its constructor by definition: the loop reads the repository's
+// payload and writes generations into it, so an untrack that drained only the
+// constructor would be free to retire those generations and purge the payload
+// while the loop was still running over them. Holding the admission is also
+// what makes the cleanup's own ordering safe to rely on — the owner's drain
+// cannot close while a worker for that repository is still alive.
+//
+// The release is keyed on the loop having ended rather than on any particular
+// close path, because a coordinator is stopped from several of them (the
+// cleanup sweep, dropCoordinator, a lost install race, a failed rehome, this
+// lifecycle's Close) and only some of them live in files that can be taught to
+// release it. The waiter is joined by Close.
+func (l *CheckoutLifecycle) holdRepositoryOwnerRead(
+	coordinator *CheckoutCoordinator, admission *graphview.RepositoryReadHandoff,
+) {
+	if admission == nil {
+		return
+	}
+	if coordinator == nil || coordinator.done == nil {
+		admission.Release()
+		return
+	}
+	l.coordinatorLeaseWG.Add(1)
+	go func() {
+		defer l.coordinatorLeaseWG.Done()
+		<-coordinator.done
+		admission.Release()
+	}()
+}
+
+// closeStartedRepositoryCoordinators stops every build loop this process has
+// started, including the off-route actors a transition drives before anything
+// registers them. It is the shutdown counterpart of the cleanup saga's own
+// actor close, and it must run BEFORE the repository-admission drain is waited
+// on: a started actor holds its repository's owner admission until its loop
+// ends (holdRepositoryOwnerRead), so a drain waited on first would wait on a
+// coordinator this function is the only thing that closes.
+func (l *CheckoutLifecycle) closeStartedRepositoryCoordinators() {
+	l.coordMu.Lock()
+	prefixes := make(map[string]struct{})
+	for _, actors := range l.started {
+		for _, actor := range actors {
+			if actor != nil {
+				prefixes[actor.repoPrefix] = struct{}{}
+			}
+		}
+	}
+	l.coordMu.Unlock()
+	for prefix := range prefixes {
+		l.closeRepositoryCoordinators(prefix)
+	}
 }
 
 // dedicatedBaseConfigSections renders the configuration domains that decide
@@ -2708,22 +2790,19 @@ func (l *CheckoutLifecycle) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	// Constructors admitted just before shutdown record off-route actors in
-	// started even when they never reach the public coordinator registry.
+	// Before the drain, not after it: every started actor holds its
+	// repository's owner admission until its loop ends, so waiting for the
+	// admissions to drain first would wait on coordinators nothing has closed
+	// yet. Registry actors are closed above; these are the off-route ones a
+	// transition drives before anything registers them.
+	l.closeStartedRepositoryCoordinators()
 	<-readersDrained
-	l.coordMu.Lock()
-	prefixes := make(map[string]struct{})
-	for _, actors := range l.started {
-		for _, actor := range actors {
-			if actor != nil {
-				prefixes[actor.repoPrefix] = struct{}{}
-			}
-		}
-	}
-	l.coordMu.Unlock()
-	for prefix := range prefixes {
-		l.closeRepositoryCoordinators(prefix)
-	}
+	// Repeated after the drain for the reason it was originally placed there:
+	// a constructor admitted just before shutdown records its actor in started
+	// after the sweep above may have read it, and the drain is the fence that
+	// proves every such constructor has finished.
+	l.closeStartedRepositoryCoordinators()
+	l.coordinatorLeaseWG.Wait()
 	<-publishersDrained
 	return errors.Join(errs...)
 }

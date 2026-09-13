@@ -38,6 +38,11 @@ func (o RepositoryOwner) valid() bool {
 // Its mutex never nests with the generation lease mutex. In particular, closing
 // repository admission does not change the existing Acquire(ids...) contract.
 type repositoryLeaseState struct {
+	// registerMu orders a registration that must also name the registration
+	// object it opened against every finalization. It is taken BEFORE mu and
+	// by nothing else, so it adds no lock cycle; see
+	// RegisterRepositoryOwnerHandle for what it buys.
+	registerMu     sync.Mutex
 	mu             sync.Mutex
 	byPrefix       map[string]*repositoryOwnerState
 	byGraph        map[string]*repositoryOwnerState
@@ -157,15 +162,31 @@ func (m *LeaseManager) dedicatedRegistrationLocked(registration *RepositoryRegis
 // THAT registration instead of whatever object happens to hold the prefix. Like
 // the raw path it is idempotent for the currently open identical owner.
 //
-// The handle is resolved in a second critical section, so a caller that shares
-// a prefix with a concurrent registrar must serialize its own registration and
-// finalization for that prefix; the lifecycle's admission mutex already does,
-// and it is the only in-tree registrar of this owner domain.
+// The handle is resolved in a second critical section of the lease mutex, so
+// the two are ordered against each other by registerMu instead: this call
+// holds it across BOTH sections, and FinalizeRepositoryCleanup — the only
+// place a live registration is removed from byPrefix/byGraph, and therefore
+// the only step that can free the prefix for a replacement — takes it too.
+//
+// That is what makes the returned handle the registration THIS call opened.
+// Without it, a finalization plus a replacement registration slipping between
+// the two sections would hand the caller a handle naming the replacement, and
+// closing "its own" registration through it would close somebody else's — the
+// exact reuse hazard the handle exists to prevent. A bare
+// RegisterRepositoryOwnerPrepared racing in the same window cannot produce
+// that state: with the prefix still held it is either idempotent for the
+// identical open owner (the same object) or refused, and freeing the prefix
+// requires the finalization registerMu now serializes.
 func (m *LeaseManager) RegisterRepositoryOwnerHandle(owner RepositoryOwner, prepare func() error) (*RepositoryRegistration, error) {
+	if m == nil {
+		return nil, ErrRepositoryOwnerInvalid
+	}
+	r := &m.repositories
+	r.registerMu.Lock()
+	defer r.registerMu.Unlock()
 	if err := m.RegisterRepositoryOwnerPrepared(owner, prepare); err != nil {
 		return nil, err
 	}
-	r := &m.repositories
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := r.byPrefix[owner.RepoPrefix]
@@ -673,6 +694,12 @@ func (m *LeaseManager) FinalizeRepositoryCleanup(drain *RepositoryDrain) error {
 		return ErrRepositoryDrainInvalid
 	}
 	r := &m.repositories
+	// Freeing a prefix is the one step that lets a replacement registration
+	// take it, so it is ordered against RegisterRepositoryOwnerHandle's two
+	// sections — see that function. registerMu is taken before mu here and
+	// nowhere else, so the order is total.
+	r.registerMu.Lock()
+	defer r.registerMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := drain.state
