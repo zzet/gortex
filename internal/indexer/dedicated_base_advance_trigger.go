@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/gitcmd"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // The live committed-base advancement trigger.
@@ -232,10 +233,26 @@ func (t *DedicatedBaseAdvanceTrigger) HeadChanged(repoPrefix, root, commitOID st
 	repeat := t.accepted[repoPrefix] == commitOID
 	t.mu.Unlock()
 	if stopped || repeat {
+		// Both drops are counted, and separately: a repeat is the memo doing
+		// its job (the same commit observed twice costs nothing), while a
+		// refusal is an observation that arrived after advancement stopped and
+		// means the base stays where it is. A sustained repeat count is
+		// healthy; a sustained refusal count is a daemon whose committed base
+		// has silently stopped advancing.
+		outcome := viewmetrics.AdvanceRepeat
+		if stopped {
+			outcome = viewmetrics.AdvanceRefused
+		}
+		viewmetrics.Count(viewmetrics.DedicatedBaseAdvanceTotal, outcome)
 		return
 	}
 	p.lifecycle.invalidateDependencyCohortsForPrefix(repoPrefix,
 		fmt.Sprintf("git watcher: %s advanced to %s", repoPrefix, shortCommit(commitOID)))
+	// The fan-out signal, counted where it is raised. One committed advance
+	// tells every dependent that keys its identity on this repository's bytes
+	// to recompose; without a count, "did the advance reach the dependents"
+	// is only answerable from a debug log that is off by default.
+	viewmetrics.Count(viewmetrics.DependentRecompositionTotal)
 
 	request := basePublishRequest{
 		prefix: repoPrefix,
@@ -245,10 +262,15 @@ func (t *DedicatedBaseAdvanceTrigger) HeadChanged(repoPrefix, root, commitOID st
 			t.record(commitOID, outcome)
 		},
 	}
-	if !p.enqueueAdvance(request) && t.logger != nil {
-		t.logger.Debug("git-watcher: committed-base advancement is stopped; the base stays where it is",
-			zap.String("repo", repoPrefix), zap.String("commit", shortCommit(commitOID)))
+	if !p.enqueueAdvance(request) {
+		viewmetrics.Count(viewmetrics.DedicatedBaseAdvanceTotal, viewmetrics.AdvanceRefused)
+		if t.logger != nil {
+			t.logger.Debug("git-watcher: committed-base advancement is stopped; the base stays where it is",
+				zap.String("repo", repoPrefix), zap.String("commit", shortCommit(commitOID)))
+		}
+		return
 	}
+	viewmetrics.Count(viewmetrics.DedicatedBaseAdvanceTotal, viewmetrics.AdvanceDispatched)
 }
 
 // There is deliberately NO exported synchronous advance.

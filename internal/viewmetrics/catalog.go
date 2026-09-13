@@ -66,6 +66,53 @@ const (
 	// collected that an earlier offer could not.
 	GenerationSweepCollectedTotal = "views_generation_sweep_collected_total"
 
+	// The committed-base (dedicated-base) publication family.
+	//
+	// These six are the measurement evidence for incremental advancement: the
+	// generation lifecycle series above say how much payload exists, and these
+	// say how it came to exist — whether a committed advance paid for a
+	// physical build or re-adopted work that was already there. The ratio
+	// between DedicatedBaseClaimTotal{outcome=built} and its reused/coalesced
+	// siblings is the literal reuse-vs-rebuild figure; before them the only
+	// reuse evidence in the process was CoordinatorCycleTotal{adopted_commit},
+	// which the committed-base path never touches.
+
+	// DedicatedBasePublishTotal counts committed-base generations this
+	// process published and adopted, by the shape of the generation. A root
+	// is self-contained; a delta composes over a parent. A steady state whose
+	// roots keep rising is re-rooting rather than advancing.
+	DedicatedBasePublishTotal = "views_dedicated_base_publish_total"
+	// DedicatedBaseClaimTotal counts committed-base build claims by what the
+	// claim actually cost: a physical build, a coalesced join onto somebody
+	// else's build, or a re-adoption of the generation that was already
+	// active (the zero-catalog-DML replay a warm restart or a same-tree
+	// commit takes).
+	DedicatedBaseClaimTotal = "views_dedicated_base_claim_total"
+	// DedicatedBaseClosureTruncatedTotal counts published committed-base
+	// generations whose affected-by closure hit its cap and was cut. Such a
+	// generation is knowingly incomplete, so this is a correctness level
+	// rather than a cost one: it must stay at zero.
+	DedicatedBaseClosureTruncatedTotal = "views_dedicated_base_closure_truncated_total"
+	// DedicatedBasePublicationTotal counts queued publication outcomes — both
+	// the ones a daemon start scheduled and the ones a live HEAD movement
+	// asked for — by what the publication settled as.
+	DedicatedBasePublicationTotal = "views_dedicated_base_publication_total"
+	// DedicatedBaseAdvanceTotal counts what the live HEAD-movement observer
+	// did with an observation, which is not the same question as what the
+	// publication behind it settled as: a repeat observation of the commit
+	// that already landed never becomes a publication at all.
+	DedicatedBaseAdvanceTotal = "views_dedicated_base_advance_total"
+	// DedicatedBaseDrainTotal counts publisher-admission closures by whether
+	// shutdown had to wait for admitted actors to finish. A waited close is
+	// the shape of a shutdown held open by a running publication.
+	DedicatedBaseDrainTotal = "views_dedicated_base_drain_total"
+
+	// DependentRecompositionTotal counts the cohort-staleness signals a
+	// committed advance raises for the dependents that key their identities
+	// on the moved repository's bytes. It is the fan-out counterpart of
+	// DedicatedBasePublishTotal: one advance, N dependents told to recompose.
+	DependentRecompositionTotal = "views_dependent_recomposition_total"
+
 	// RefViewSelectionTotal counts ref-view selections by what serving the
 	// selector took.
 	RefViewSelectionTotal = "views_ref_view_selection_total"
@@ -140,6 +187,54 @@ const (
 	LabelEvent    = "event"
 	LabelExact    = "exact"
 	LabelConsumer = "consumer"
+	LabelShape    = "shape"
+)
+
+// Committed-base generation shapes: self-contained, or composed over a parent.
+const (
+	DedicatedBaseRoot  = "root"
+	DedicatedBaseDelta = "delta"
+)
+
+// Committed-base claim outcomes — what one claim cost.
+//
+// Built is the only one that represents physical payload work. Coalesced
+// joined a build somebody else was already running (BuildReport.Coalesced).
+// Reused is the catalog's adopted-replay path: the observed identity equalled
+// the active generation's, so adoption re-confirmed it and wrote nothing.
+const (
+	DedicatedBaseBuilt     = "built"
+	DedicatedBaseCoalesced = "coalesced"
+	DedicatedBaseReused    = "reused"
+)
+
+// Publication outcomes, as the publisher's recording point sees them. They are
+// mutually exclusive and one is recorded per settled publication: a failure, a
+// repository nothing was attempted for, a re-adoption, a publication that
+// reused a physical build, or one that paid for it.
+const (
+	PublicationPublished = "published"
+	PublicationCoalesced = "coalesced"
+	PublicationReadopted = "readopted"
+	PublicationSkipped   = "skipped"
+	PublicationFailed    = "failed"
+)
+
+// Live advancement dispatch outcomes: what the HEAD-movement observer did with
+// one observation. Repeat is the accepted-commit memo hit — the commit that
+// already landed, observed again — and Refused is an observation that arrived
+// after advancement stopped.
+const (
+	AdvanceDispatched = "dispatched"
+	AdvanceRepeat     = "repeat"
+	AdvanceRefused    = "refused"
+)
+
+// Publisher-admission drain outcomes: whether closing admission completed on
+// the spot or left shutdown waiting for admitted actors.
+const (
+	DrainImmediate = "immediate"
+	DrainWaited    = "waited"
 )
 
 // Handed-off view consumers: the classes of work a request can leave running
@@ -429,6 +524,31 @@ var catalog = map[string]spec{
 	GenerationSweepCollectedTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelSweep, values: []string{SweepCheckout, SweepRefView}},
 	}},
+
+	DedicatedBasePublishTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelShape, values: []string{DedicatedBaseRoot, DedicatedBaseDelta}},
+	}},
+	DedicatedBaseClaimTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{
+			DedicatedBaseBuilt, DedicatedBaseCoalesced, DedicatedBaseReused,
+		}},
+	}},
+	DedicatedBaseClosureTruncatedTotal: {kind: kindCounter},
+	DedicatedBasePublicationTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{
+			PublicationPublished, PublicationCoalesced, PublicationReadopted,
+			PublicationSkipped, PublicationFailed,
+		}},
+	}},
+	DedicatedBaseAdvanceTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{
+			AdvanceDispatched, AdvanceRepeat, AdvanceRefused,
+		}},
+	}},
+	DedicatedBaseDrainTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{DrainImmediate, DrainWaited}},
+	}},
+	DependentRecompositionTotal: {kind: kindCounter},
 
 	RefViewSelectionTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelOutcome, values: []string{

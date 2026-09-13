@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -1686,8 +1687,35 @@ func viewsStatusFromHealth(health indexer.ViewsHealth) *daemon.ViewsStatus {
 		// background reconciliation has no caller to fail, so the status
 		// payload is the only surface the reason can reach.
 		CoordinatorStartFailures: viewsStartFailures(health.CoordinatorStartFailures),
-		Counters:                 health.Counters,
+		// The same defect one field down, and the one the census itself names:
+		// the lifecycle collects the storage layer's refusals
+		// (indexer.ViewsHealth.StorageFailures) and this literal dropped them,
+		// so a retirement blocked by a full volume reached no reader at all.
+		// Retirement is a background pass with no caller to fail, so — exactly
+		// like the start failures above — the status payload is the only
+		// surface the reason can come out of.
+		StorageFailures: viewsStorageFailures(health.StorageFailures),
+		Counters:        health.Counters,
 	}
+}
+
+// viewsStorageFailures translates the store's maintenance-failure register onto
+// the wire. Like viewsStartFailures it is a translation rather than an alias —
+// internal/daemon is the protocol package — and a nil register stays nil so the
+// field is omitted: "nothing is stuck" must render as absence, not as an empty
+// list that reads like a section someone forgot to fill in.
+func viewsStorageFailures(failures []store_sqlite.StorageFailure) []daemon.StorageFailure {
+	if len(failures) == 0 {
+		return nil
+	}
+	out := make([]daemon.StorageFailure, 0, len(failures))
+	for _, f := range failures {
+		out = append(out, daemon.StorageFailure{
+			GenerationID: f.GenerationID,
+			Reason:       f.Reason,
+		})
+	}
+	return out
 }
 
 // viewsStartFailures translates the lifecycle's start-failure ledger onto the

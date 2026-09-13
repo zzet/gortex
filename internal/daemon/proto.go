@@ -571,11 +571,44 @@ type ViewsStatus struct {
 	// empty one — omitted, not rendered as an empty list. A daemon whose views
 	// are healthy carries exactly the payload it carried before.
 	CoordinatorStartFailures []CoordinatorStartFailure `json:"coordinator_start_failures,omitempty"`
+	// StorageFailures is the second exception, and it is here for the reason
+	// the first one is: Generations says how much derived payload the store is
+	// holding and in what state, and a generation stuck in retiring because
+	// the volume is full states a problem no count beside it can explain.
+	//
+	// Retirement is a background pass with no caller to fail, so a store that
+	// cannot delete anything looks, from every count here, exactly like a
+	// store with nothing to delete. The list is bounded (one entry per
+	// generation whose last maintenance attempt failed), path-free, and each
+	// entry is retracted at the start of the next attempt on that generation —
+	// so the ordinary answer is the absent one.
+	StorageFailures []StorageFailure `json:"storage_failures,omitempty"`
 	// Counters is the view-lifecycle metric registry flattened to series key
 	// and value, zero-valued series omitted. Every label in a key comes from
 	// a fixed vocabulary, so the map's size is a property of the build rather
 	// than of the workload.
 	Counters map[string]int64 `json:"counters,omitempty"`
+}
+
+// StorageFailure is one payload generation's last storage-maintenance failure.
+//
+// Like CoordinatorStartFailure it mirrors the producing type
+// (store_sqlite.StorageFailure) on the wire rather than aliasing it: this
+// package is the daemon PROTOCOL, and a client must be able to decode it
+// without linking the graph store. The controller translates.
+//
+// It carries no error, no path and no SQL. The full cause stays on the
+// *StorageError the failing call returned and in the daemon log; what rides on
+// a status poll is the bounded sentence a person can act on.
+type StorageFailure struct {
+	// GenerationID names the generation whose maintenance failed. It is an
+	// identity, which the counts above otherwise refuse — carried for the same
+	// reason CoordinatorStartFailure carries a checkout id: a reason that does
+	// not say which generation it is about cannot be acted on, and the list is
+	// bounded by failures rather than by how much payload a store holds.
+	GenerationID int64 `json:"generation_id"`
+	// Reason is the bounded, path-free sentence the storage layer rendered.
+	Reason string `json:"reason"`
 }
 
 // CoordinatorStartFailure is one checkout whose build loop could not be

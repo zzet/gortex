@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // The initial committed publication path.
@@ -581,10 +582,43 @@ func (p *InitialBasePublisher) PublishRepo(ctx context.Context, repoPrefix strin
 	return p.publish(ctx, basePublishRequest{prefix: repoPrefix})
 }
 
+// publicationOutcome classifies one settled publication for the counter.
+//
+// The five outcomes are mutually exclusive and ordered by which fact is the
+// stronger one: a failure is a failure whatever else it carried, a skip means
+// nothing was attempted, and between the three successes the reuse facts
+// (re-adoption, then a coalesced build) outrank "published" because a
+// publication that reused work is precisely what the series exists to count.
+func publicationOutcome(out InitialBasePublication) string {
+	switch {
+	case out.Err != nil:
+		return viewmetrics.PublicationFailed
+	case out.Skipped != "":
+		return viewmetrics.PublicationSkipped
+	case out.AlreadyAdopted:
+		return viewmetrics.PublicationReadopted
+	case out.Coalesced:
+		return viewmetrics.PublicationCoalesced
+	default:
+		return viewmetrics.PublicationPublished
+	}
+}
+
 // publish is the whole protocol for one repository.
-func (p *InitialBasePublisher) publish(ctx context.Context, req basePublishRequest) InitialBasePublication {
+func (p *InitialBasePublisher) publish(ctx context.Context, req basePublishRequest) (out InitialBasePublication) {
+	// One publication, one counted outcome, whichever door asked for it. The
+	// queue worker and the synchronous PublishRepo both run this body, so a
+	// seam in only one of them would make the series a property of which door
+	// a caller picked rather than of what the daemon did. The deferred count
+	// also covers the early returns, because a skip is as much an outcome as a
+	// published generation. The one thing it deliberately does NOT count is
+	// the abandoned tail of the pending queue (run's "publisher stopped"
+	// record): that work never entered the protocol at all.
+	defer func() {
+		viewmetrics.Count(viewmetrics.DedicatedBasePublicationTotal, publicationOutcome(out))
+	}()
 	repoPrefix := req.prefix
-	out := InitialBasePublication{RepoPrefix: repoPrefix, Live: req.live}
+	out = InitialBasePublication{RepoPrefix: repoPrefix, Live: req.live}
 	if err := ctx.Err(); err != nil {
 		out.Skipped = "publisher stopped"
 		return out

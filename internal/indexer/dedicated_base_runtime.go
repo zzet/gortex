@@ -10,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 var errDedicatedBaseRuntimeInput = errors.New("invalid dedicated base runtime input")
@@ -137,7 +138,21 @@ func (r *DedicatedBaseRuntime) CloseDedicatedBaseAdmission() <-chan struct{} {
 	if r.dedicatedBaseRuntime == nil {
 		return repositoryAlreadyDrained
 	}
-	return r.dedicatedBaseRuntime.CloseDedicatedBaseAdmission()
+	drain := r.dedicatedBaseRuntime.CloseDedicatedBaseAdmission()
+	// Whether shutdown has to WAIT here is the fact worth counting, and this
+	// is the only place it is observable: the channel is closed under the
+	// runtime's lock before it is returned, so a drain that is already closed
+	// when we look had no admitted actors left. A publication that finishes
+	// between the return and this select is labelled "waited", which
+	// over-reports the slow case and never under-reports it — the direction a
+	// shutdown-latency counter has to err in.
+	select {
+	case <-drain:
+		viewmetrics.Count(viewmetrics.DedicatedBaseDrainTotal, viewmetrics.DrainImmediate)
+	default:
+		viewmetrics.Count(viewmetrics.DedicatedBaseDrainTotal, viewmetrics.DrainWaited)
+	}
+	return drain
 }
 
 // RegisterDedicatedBaseOwner, CloseDedicatedBaseOwner and
@@ -409,5 +424,53 @@ func (p *dedicatedBasePublisher) ensureObserved(ctx context.Context, observe fun
 	// Every successful path, including ready replay and followers, reaches this
 	// same guard. A PrePublish callback cannot replace final adoption fencing.
 	out.Adoption, err = catalog.AdoptDedicatedBaseGeneration(ctx, store_sqlite.AdoptDedicatedBaseGenerationRequest{Claim: out.Claim})
-	return out, err
+	if err != nil {
+		return out, err
+	}
+	recordDedicatedBaseAdoption(out)
+	return out, nil
+}
+
+// recordDedicatedBaseAdoption is the committed-base path's counter seam.
+//
+// It sits after adoption rather than beside the claim on purpose: a claim that
+// never reaches adoption published nothing, and counting it would make the
+// reuse ratio count attempts instead of outcomes. It is also the ONE place
+// this is emitted — ensureInitial and ensureCurrent both funnel through
+// ensureObserved, so a second seam would double-count the warm path.
+//
+// The two series answer different questions and are both recorded for every
+// adoption that is not a replay:
+//
+//   - DedicatedBaseClaimTotal is the cost axis. Reused is the catalog's
+//     adopted-replay path (zero catalog DML, no build); coalesced joined a
+//     build that was already running; built paid for a physical pass. Exactly
+//     one is recorded, in that order, because a replay is also trivially
+//     "not a physical build" and the stronger fact is the useful one.
+//   - DedicatedBasePublishTotal is the shape axis, and a replay is excluded
+//     from it deliberately: re-adopting the active generation publishes
+//     nothing, so counting it as a root would report a full re-index that
+//     never happened.
+func recordDedicatedBaseAdoption(out dedicatedBaseResult) {
+	switch {
+	case out.Adoption.AlreadyAdopted:
+		viewmetrics.Count(viewmetrics.DedicatedBaseClaimTotal, viewmetrics.DedicatedBaseReused)
+		return
+	case out.Report.Coalesced:
+		viewmetrics.Count(viewmetrics.DedicatedBaseClaimTotal, viewmetrics.DedicatedBaseCoalesced)
+	default:
+		viewmetrics.Count(viewmetrics.DedicatedBaseClaimTotal, viewmetrics.DedicatedBaseBuilt)
+	}
+	shape := viewmetrics.DedicatedBaseRoot
+	if out.Claim.BaseGenerationID != 0 {
+		shape = viewmetrics.DedicatedBaseDelta
+	}
+	viewmetrics.Count(viewmetrics.DedicatedBasePublishTotal, shape)
+	if out.Report.ClosureTruncated {
+		// A knowingly incomplete committed generation: the affected-by closure
+		// hit its cap, so dependents past the cut still read the layer below.
+		// It rides here rather than in a log line alone because the count is
+		// the only way to see it happening across a sustained workload.
+		viewmetrics.Count(viewmetrics.DedicatedBaseClosureTruncatedTotal)
+	}
 }

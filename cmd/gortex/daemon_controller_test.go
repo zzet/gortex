@@ -7,6 +7,8 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 )
@@ -419,11 +422,97 @@ func TestViewsStatusStatesWhyACheckoutHasNoBuildLoop(t *testing.T) {
 func TestAHealthyViewCensusCarriesNoFailureList(t *testing.T) {
 	status := viewsStatusFromHealth(indexer.ViewsHealth{Families: 1, Coordinators: 1})
 	require.Nil(t, status.CoordinatorStartFailures)
+	require.Nil(t, status.StorageFailures)
 
 	body, err := json.Marshal(status)
 	require.NoError(t, err)
 	require.NotContains(t, string(body), "coordinator_start_failures",
 		"a healthy census renders the failure key")
+	require.NotContains(t, string(body), "storage_failures",
+		"a healthy census renders the storage-failure key")
+}
+
+// TestViewsStatusStatesWhyAGenerationIsStillThere is the start-failure defect
+// one field down, and the census names it in its own doc comment: the
+// lifecycle collects the storage layer's maintenance refusals and this
+// projection dropped them, so a retirement blocked by a full volume reached no
+// reader at all.
+//
+// Generations says how much derived payload the store holds and in what state.
+// A census reading "four generations, one retiring" states a problem it cannot
+// explain, and retirement is a background pass with no caller to return the
+// error to — so the status payload is the only surface the reason can come out
+// of.
+//
+// Revert-red: delete `StorageFailures:` from the payload literal in
+// viewsStatusFromHealth and the first assertion fails.
+func TestViewsStatusStatesWhyAGenerationIsStillThere(t *testing.T) {
+	health := indexer.ViewsHealth{
+		Families:     1,
+		Coordinators: 1,
+		Generations:  map[string]int{"retiring": 2},
+		StorageFailures: []store_sqlite.StorageFailure{
+			{GenerationID: 41, Reason: "the store volume is full"},
+			{GenerationID: 42, Reason: "the store volume is full"},
+		},
+	}
+
+	status := viewsStatusFromHealth(health)
+	require.Len(t, status.StorageFailures, 2,
+		"the status payload counts retiring generations and says nothing about why they are still there")
+	require.Equal(t, int64(41), status.StorageFailures[0].GenerationID)
+	require.Equal(t, "the store volume is full", status.StorageFailures[0].Reason)
+	require.Equal(t, int64(42), status.StorageFailures[1].GenerationID)
+
+	// The rest of the census still arrives: an added field must not displace
+	// one that was already there.
+	require.Equal(t, 1, status.Families)
+	require.Equal(t, 2, status.Generations["retiring"])
+}
+
+// TestEveryViewsCensusFieldReachesTheStatusPayload is the structural guard
+// behind both reason lists, and the one that turns "a field the census carries
+// and the payload silently drops" from a property of a reviewer's attention
+// into a compile-time-adjacent check.
+//
+// Both defects this item fixed had the same shape: indexer.ViewsHealth grew a
+// field, the projection literal was not extended, and nothing failed — the
+// payload simply carried less than the census did, with no error anywhere. The
+// two types are matched on their JSON tags because that is the contract a
+// client reads, and the daemon side is allowed to carry MORE than the census
+// (it is the protocol), never less.
+func TestEveryViewsCensusFieldReachesTheStatusPayload(t *testing.T) {
+	payload := map[string]bool{}
+	statusType := reflect.TypeOf(daemon.ViewsStatus{})
+	for i := range statusType.NumField() {
+		payload[jsonTagName(statusType.Field(i))] = true
+	}
+
+	censusType := reflect.TypeOf(indexer.ViewsHealth{})
+	require.Positive(t, censusType.NumField())
+	for i := range censusType.NumField() {
+		field := censusType.Field(i)
+		name := jsonTagName(field)
+		require.True(t, payload[name],
+			"indexer.ViewsHealth.%s (json %q) has no field in daemon.ViewsStatus, so the "+
+				"census carries it and `gortex daemon status` drops it", field.Name, name)
+	}
+}
+
+// jsonTagName is the wire name of one struct field: its json tag up to the
+// first option, falling back to the Go field name for an untagged field.
+func jsonTagName(field reflect.StructField) string {
+	tag := field.Tag.Get("json")
+	if tag == "" {
+		return field.Name
+	}
+	if comma := strings.IndexByte(tag, ','); comma >= 0 {
+		tag = tag[:comma]
+	}
+	if tag == "" {
+		return field.Name
+	}
+	return tag
 }
 
 // TestViewsCensusReachesTheStatusPayload is the production trace for the two
