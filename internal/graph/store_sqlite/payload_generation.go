@@ -437,7 +437,44 @@ func (s *Store) BeginPayloadGenerationWithStatus(
 // the catalog on the next write is the only verdict that stays right in every
 // case. A generation that really is still building resolves back to open on
 // that read, so the caller can fix what was refused and retry.
+//
+// This is the daemon's PHYSICAL publish — the one the generation builder calls
+// as its last step (internal/indexer/builder_generation.go, the
+// SparseGenerationBuilder tail) — so it is where the planner-statistics refresh
+// a publish owes is asked for. A published generation adds a whole checkout's
+// payload in one step, and issue #651 is what a store planning against
+// statistics that describe a fraction of itself does: a zero sqlite_stat1 row
+// flips the rebind plan onto the wrong outer loop. The refresh is SCHEDULED
+// onto the maintenance lane (store_compact.go), never run here: sqlite_stat1 is
+// one table for one database file, no generation owns it, and no generation's
+// publish may be charged for it. The lane runs it once the publish drains and
+// payload builds in flight have finished, and coalesces a burst of publishes
+// into a single pass.
+//
+// How close that gets to "after the route flip", stated exactly, because the
+// store cannot see a flip it does not perform: the builder holds its payload
+// build flight across this call (internal/indexer/builder_generation.go joins
+// it before the build and completes it in a defer that runs after this
+// returns), so a pass scheduled here cannot start before the builder has
+// returned to its caller — the checkout coordinator, whose very next act is the
+// flip. What is left is that last hop, and it costs at most latency: the
+// refresh never QUEUES on the write gate (planner_stats_freshness.go try-locks
+// per index and gives up on a busy gate), so a flip arriving mid-pass waits for
+// one index's ANALYZE at worst, bounded by plannerStatsIndexTimeout, and never
+// for a whole pass. A caller that publishes and flips through this package —
+// PublishAndRoute — keeps the stronger property by asking below its own flip.
 func (s *Store) PublishPayloadGeneration(ctx context.Context, generationID, publishedAt int64) error {
+	return s.publishPayloadGeneration(ctx, generationID, publishedAt, true)
+}
+
+// publishPayloadGeneration is the publish half both entry points share.
+//
+// scheduleMaintenance is false for exactly one caller: PublishAndRoute, which
+// owns a WIDER window than the publish — it publishes and then flips a route,
+// and between the two the generation is ready but unrouted. That caller asks
+// the lane itself, after its flip, so one publish window still produces exactly
+// one lane request rather than two.
+func (s *Store) publishPayloadGeneration(ctx context.Context, generationID, publishedAt int64, scheduleMaintenance bool) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
@@ -452,16 +489,38 @@ func (s *Store) PublishPayloadGeneration(ctx context.Context, generationID, publ
 		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
 
-	s.setPayloadSeal(generationID, payloadSealSealed)
-	if err := s.drainPayloadWriters(ctx); err != nil {
-		s.setPayloadSeal(generationID, payloadSealUnknown)
-		return err
-	}
-	if err := s.publishSealedGeneration(ctx, catalog, generationID, publishedAt); err != nil {
-		s.setPayloadSeal(generationID, payloadSealUnknown)
+	// The publish window is the closure below, and nothing but the transition
+	// happens inside it. Whole-database maintenance (ANALYZE / VACUUM /
+	// TRUNCATE checkpoint) reads publishDrains and waits the window out: a
+	// publish must pay no maintenance inside its own transaction window, and
+	// equally no maintenance may rewrite the file underneath a sealed
+	// generation whose transition has not committed yet.
+	if err := func() error {
+		s.publishDrains.Add(1)
+		defer s.publishDrains.Add(-1)
+
+		s.setPayloadSeal(generationID, payloadSealSealed)
+		if err := s.drainPayloadWriters(ctx); err != nil {
+			s.setPayloadSeal(generationID, payloadSealUnknown)
+			return err
+		}
+		if err := s.publishSealedGeneration(ctx, catalog, generationID, publishedAt); err != nil {
+			s.setPayloadSeal(generationID, payloadSealUnknown)
+			return err
+		}
+		return nil
+	}(); err != nil {
 		return err
 	}
 	viewmetrics.Count(viewmetrics.GenerationPublishedTotal, generationOwner(row.OwnerKind))
+	// Asked AFTER the window closed, not inside it: the request itself is two
+	// atomics and at most one goroutine start, but a request made inside the
+	// window would be a publish doing maintenance bookkeeping in its own
+	// transaction span, and the counter it reads would still name itself.
+	// A failed publish asks for nothing — it added no payload to notice.
+	if scheduleMaintenance {
+		s.schedulePublishMaintenance()
+	}
 	return nil
 }
 
@@ -578,7 +637,10 @@ func (s *Store) PublishAndRoute(ctx context.Context, generationID int64, checkou
 	if err != nil {
 		return err
 	}
-	if err := s.PublishPayloadGeneration(ctx, generationID, publishedAt); err != nil {
+	// The publish half deliberately does NOT schedule: this API's window is the
+	// wider one (publish, then flip), and the single request it owes is made at
+	// its tail, below the flip.
+	if err := s.publishPayloadGeneration(ctx, generationID, publishedAt, false); err != nil {
 		return err
 	}
 	if err := s.Catalog().FlipCheckoutRouteSlot(ctx, FlipCheckoutRouteSlotRequest{
@@ -590,29 +652,24 @@ func (s *Store) PublishAndRoute(ctx context.Context, generationID int64, checkou
 	}); err != nil {
 		return err
 	}
-	// Publishing a generation adds a whole repository's payload in one step,
-	// so it is a boundary worth asking at — for a DIRECT caller of this API.
-	// It is not one of the daemon's four live boundaries: the checkout
-	// coordinator flips through FlipCheckoutRouteSlot rather than through
-	// here, and reaches the indexer's own boundaries via the generation
-	// builder's IndexCtx. Keeping the call is what makes this API safe for
-	// callers that do not go through the builder.
+	// The single lane request this window owes, made HERE rather than at the
+	// publish tail: between the publish and the flip the generation is ready
+	// but unrouted, and maintenance taking the write gate inside that window
+	// would widen a documented transient state and stall a caller waiting
+	// behind it. Asking after the flip means the request cannot be served
+	// before the route is live.
 	//
-	// Asked here rather than at the publish tail: between the publish and the
-	// flip the generation is ready but unrouted, and an ANALYZE holding the
-	// write gate inside that window would widen a documented transient state
-	// and stall a coordinator waiting behind it. The refresh is cooperative,
-	// so what this boundary pays is bounded at the pass budget plus one
-	// index's ANALYZE plus one bounded sqlite_schema reload — with the two
-	// health probes, the present-index list and the stat-row set read outside
-	// that bound, on the read pool and under no gate.
+	// SCHEDULED, not run — see PublishPayloadGeneration for why sqlite_stat1
+	// belongs to the file rather than to any generation, and why dropping the
+	// ask (rather than moving it) would be the issue-#651 regression.
 	//
-	// Called directly rather than through graph.MaybeEnsurePlannerStatsFresh:
-	// the receiver IS the implementation, so the helper's type assertion would
-	// only hide a signature drift that should be a compile error here. The
-	// error is discarded for the helper's own reason — a store that could not
-	// refresh its statistics still routes the generation.
-	_, _ = s.EnsurePlannerStatsFresh(ctx)
+	// Reach, stated so it is not over-read: PublishAndRoute has no non-test
+	// caller in this tree. The daemon's physical publish is
+	// PublishPayloadGeneration, which schedules for itself; the checkout
+	// coordinator flips separately through FlipCheckoutRouteSlot. What this
+	// call keeps is the boundary for a DIRECT caller of this API — which is
+	// also the only shape in which the store can observe a route flip at all.
+	s.schedulePublishMaintenance()
 	return nil
 }
 
