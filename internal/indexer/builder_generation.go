@@ -278,6 +278,13 @@ type BuildReport struct {
 	// cap still reads the base layer's stale payload.
 	ClosureTruncated bool
 	ClosureCap       int
+	// ClosureCapSource names WHICH bound produced ClosureCap — the operator's
+	// index.affected_by_reresolve_max, a committed base's change-sized cap, or
+	// the built-in default (ClosureCapFrom* in builder_closure.go). A
+	// truncation is only actionable with it: it says whether an operator has a
+	// lever on this cut, and it is the check that the configured knob was
+	// neither dropped nor exceeded on the committed-base path.
+	ClosureCapSource string
 
 	// IndexedPaths is the repo-relative file set the pass actually walked, and
 	// SourceBytes their total size in the target snapshot.
@@ -985,6 +992,20 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 		contextPaths = append(contextPaths, graphPath)
 		candidates[graphPath] = struct{}{}
 	}
+	// The change set, in graph-path spelling: indexed minus context, plus the
+	// paths the change removed. The comparison needs it to tell a difference
+	// the change caused from one the bounded corpus caused.
+	changedPaths := make(map[string]struct{}, len(plan.indexed)-len(plan.context)+len(plan.deleted))
+	for _, rel := range plan.indexed {
+		graphPath := builderGraphPath(req.RepoPrefix, rel)
+		if _, isContext := candidates[graphPath]; isContext {
+			continue
+		}
+		changedPaths[graphPath] = struct{}{}
+	}
+	for _, rel := range plan.deleted {
+		changedPaths[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
+	}
 
 	carried := newBuilderPathPayload(corpus.AllNodes(), corpus.AllEdges(), candidates)
 	if len(carried.nodesByPath) == 0 && len(carried.edgesByPath) == 0 {
@@ -997,7 +1018,18 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	if err := ctx.Err(); err != nil {
 		return contextSeparation{}, err
 	}
-	baseEdges := req.Base.GetOutEdgesByNodeIDs(carried.sourceIDs(contextPaths, baseNodes))
+	adjacencyIDs := carried.sourceIDs(contextPaths, baseNodes)
+	baseEdges := req.Base.GetOutEdgesByNodeIDs(adjacencyIDs)
+	if err := ctx.Err(); err != nil {
+		return contextSeparation{}, err
+	}
+	// The inbound half of the same question. A path's recorded adjacency is
+	// not only what its symbols point at: an extractor that records incoming
+	// data flow at the destination file puts the edge at THIS path with a
+	// source that lives elsewhere. Reading only the outbound half left every
+	// such path comparing a non-empty carried set against an empty base set,
+	// so nothing was ever withdrawn on a corpus with cross-file value flow.
+	baseInEdges := req.Base.GetInEdgesByNodeIDs(adjacencyIDs)
 	if err := ctx.Err(); err != nil {
 		return contextSeparation{}, err
 	}
@@ -1016,7 +1048,7 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 			// reporting the absence for what it is.
 			continue
 		}
-		if carried.matchesBase(graphPath, baseNodes[graphPath], baseEdges) {
+		if carried.matchesBase(graphPath, baseNodes[graphPath], baseEdges, baseInEdges, changedPaths) {
 			withheld[graphPath] = struct{}{}
 			withheldPaths = append(withheldPaths, graphPath)
 			continue
@@ -1118,12 +1150,22 @@ type builderPathPayload struct {
 	nodesByPath map[string][]*graph.Node
 	edgesByPath map[string][]*graph.Edge
 	nodeIDs     map[string]string
-	// foreignSource marks a candidate path whose recorded adjacency is not
-	// exactly the outgoing set of its own symbols: an edge at the path from a
-	// source that lives elsewhere (an aggregated resolver stub, a synthesised
-	// lane), or an edge out of one of the path's symbols recorded in another
-	// file. Either way the path-keyed comparison below cannot see the whole
-	// picture, so the path is never withdrawn.
+	// foreignSource marks a candidate path whose recorded adjacency reaches
+	// past what a path-keyed comparison can see: an edge recorded at the path
+	// with NEITHER endpoint among the path's own symbols (an aggregated
+	// resolver stub bound to a synthesised lane), or an edge out of one of the
+	// path's symbols recorded in another file. Either way the comparison below
+	// cannot see the whole picture, so the path is never withdrawn.
+	//
+	// An edge recorded at the path that merely ENTERS one of its symbols from
+	// somewhere else is NOT foreign: it is the file's own recorded adjacency
+	// on the inbound side, which the comparison reads from the layer below
+	// with GetInEdgesByNodeIDs exactly as it reads the outbound side with
+	// GetOutEdgesByNodeIDs. Treating it as foreign is what made the
+	// withdrawal inert on any corpus whose extractor records incoming data
+	// flow at the destination file — on the sustained-workload corpus shape
+	// that is every file, so a ten-file commit wrote its whole 200-file
+	// resolve closure.
 	foreignSource map[string]struct{}
 	// contentBody marks a candidate path with a content section at it. Content
 	// bodies live in a separate index keyed by the file, which this withdrawal
@@ -1171,7 +1213,7 @@ func newBuilderPathPayload(
 			continue
 		}
 		p.edgesByPath[edge.FilePath] = append(p.edgesByPath[edge.FilePath], edge)
-		if p.nodeIDs[edge.From] != edge.FilePath {
+		if p.nodeIDs[edge.From] != edge.FilePath && p.nodeIDs[edge.To] != edge.FilePath {
 			p.foreignSource[edge.FilePath] = struct{}{}
 		}
 	}
@@ -1218,7 +1260,9 @@ func (p *builderPathPayload) sourceIDs(paths []string, baseNodes map[string][]*g
 // path agrees with the layer below completely enough for the path to be served
 // from below instead.
 func (p *builderPathPayload) matchesBase(
-	graphPath string, baseNodes []*graph.Node, baseEdges map[string][]*graph.Edge,
+	graphPath string, baseNodes []*graph.Node,
+	baseOutEdges, baseInEdges map[string][]*graph.Edge,
+	changed map[string]struct{},
 ) bool {
 	if _, foreign := p.foreignSource[graphPath]; foreign {
 		return false
@@ -1243,25 +1287,68 @@ func (p *builderPathPayload) matchesBase(
 		}
 	}
 	// Compare the adjacency the path RECORDS, from both sides, keyed the same
-	// way: an edge the generation wrote at the path against the base's edges
-	// out of the path's symbols that the base also recorded there.
+	// way: every edge the generation wrote at the path against every edge the
+	// base recorded there that touches one of the path's symbols.
+	//
+	// Both DIRECTIONS are read, because "recorded at this path" is not the
+	// same question as "leaves one of this path's symbols". An incoming
+	// value-flow edge — a constant, a variable or a function in another file
+	// flowing into a function declared here — is recorded at THIS file with a
+	// source that lives in the other one, and reading only the outbound half
+	// made every such path compare a full carried set against an empty base
+	// set. An edge whose two endpoints both live here appears in both reads,
+	// so the inbound half skips what the outbound half already counted.
 	carriedEdges := p.edgesByPath[graphPath]
-	var baseAtPath []*graph.Edge
+	local := make(map[string]struct{}, len(carriedNodes))
 	for _, node := range carriedNodes {
-		for _, edge := range baseEdges[node.ID] {
+		local[node.ID] = struct{}{}
+	}
+	for _, node := range baseNodes {
+		local[node.ID] = struct{}{}
+	}
+	var baseAtPath []*graph.Edge
+	for id := range local {
+		for _, edge := range baseOutEdges[id] {
 			if edge != nil && edge.FilePath == graphPath {
 				baseAtPath = append(baseAtPath, edge)
 			}
+		}
+	}
+	for id := range local {
+		for _, edge := range baseInEdges[id] {
+			if edge == nil || edge.FilePath != graphPath {
+				continue
+			}
+			if _, counted := local[edge.From]; counted {
+				continue // already taken by the outbound half
+			}
+			baseAtPath = append(baseAtPath, edge)
 		}
 	}
 	if len(carriedEdges) != len(baseAtPath) {
 		return false
 	}
 	matched := make([]bool, len(baseAtPath))
+	var leftover []*graph.Edge
 	for _, edge := range carriedEdges {
 		found := false
 		for i, candidate := range baseAtPath {
 			if matched[i] || !builderEdgeEquivalent(edge, candidate) {
+				continue
+			}
+			matched[i], found = true, true
+			break
+		}
+		if !found {
+			leftover = append(leftover, edge)
+		}
+	}
+	// Second pass over what is left: one import statement, two spellings of
+	// the same fact. See builderSameImportRelation.
+	for _, edge := range leftover {
+		found := false
+		for i, candidate := range baseAtPath {
+			if matched[i] || !builderSameImportRelation(edge, candidate, changed) {
 				continue
 			}
 			matched[i], found = true, true
@@ -1274,9 +1361,65 @@ func (p *builderPathPayload) matchesBase(
 	return true
 }
 
+// builderSameImportRelation reports whether two import edges from the same
+// statement name the same package through different files of it.
+//
+// An import edge runs from the importing file to ONE file of the imported
+// package, and WHICH file is an artefact of the corpus the resolver saw: a
+// whole index of the tree and a bounded generation pass over a subset of it
+// pick different representatives of the same multi-file package, from the same
+// import statement, for a file neither of them changed. The two edges state
+// the same relation — "this file imports that package" — so a path whose only
+// disagreement with the layer below is of this shape is still served correctly
+// from below, and the pass has no better claim to its representative than the
+// whole index had to its own.
+//
+// The equivalence is deliberately narrow. Both edges must be import edges from
+// the same source, at the same line, with the same metadata, and both targets
+// must be files in the SAME directory — the package the statement names. And
+// neither target may be a path the change set touches: a representative that
+// moved because the change added or removed a file of that package is a real
+// difference, and the layer below may be naming a file the target tree no
+// longer holds.
+func builderSameImportRelation(carried, base *graph.Edge, changed map[string]struct{}) bool {
+	if carried == nil || base == nil {
+		return false
+	}
+	if carried.Kind != graph.EdgeImports || base.Kind != graph.EdgeImports {
+		return false
+	}
+	if carried.To == base.To || carried.To == "" || base.To == "" {
+		return false
+	}
+	if _, touched := changed[carried.To]; touched {
+		return false
+	}
+	if _, touched := changed[base.To]; touched {
+		return false
+	}
+	if path.Dir(carried.To) != path.Dir(base.To) {
+		return false
+	}
+	left, right := *carried, *base
+	left.To, right.To = "", ""
+	return reflect.DeepEqual(left, right)
+}
+
 // edgesIntoWithdrawn returns the edges the eviction will remove that the
-// generation must keep: the ones ENTERING a withdrawn identity from a source
-// that is not itself withdrawn.
+// generation must keep: the ones RECORDED AT A FILE THE GENERATION STILL
+// CLAIMS. The generation's claim over a file is a claim over the whole of
+// that file's recorded adjacency, so an edge the eviction happens to reach
+// through a withdrawn identity must come back — otherwise the claimed file's
+// payload is short an edge the layer below can no longer show through.
+//
+// The rule is stated on the recording file rather than on the source identity
+// because that is what ownership is keyed by. An edge recorded AT a withdrawn
+// path is that path's own entry and stays gone: the layer below serves it
+// again the moment the path is unclaimed. That includes every edge leaving a
+// withdrawn identity — a path whose symbol has an out-edge recorded in
+// another file is marked foreignSource and is never withdrawn in the first
+// place, so "recorded at a withdrawn path" and "leaves a withdrawn identity"
+// name the same edges here.
 func (p *builderPathPayload) edgesIntoWithdrawn(withdrawn map[string]struct{}) []*graph.Edge {
 	isWithdrawn := func(id string) bool {
 		graphPath, known := p.nodeIDs[id]
@@ -1288,8 +1431,11 @@ func (p *builderPathPayload) edgesIntoWithdrawn(withdrawn map[string]struct{}) [
 	}
 	var out []*graph.Edge
 	for _, edge := range p.edges {
-		if edge == nil || !isWithdrawn(edge.To) || isWithdrawn(edge.From) {
-			continue
+		if edge == nil || (!isWithdrawn(edge.To) && !isWithdrawn(edge.From)) {
+			continue // the eviction does not reach it
+		}
+		if _, gone := withdrawn[edge.FilePath]; gone {
+			continue // the withdrawn path's own adjacency
 		}
 		out = append(out, edge)
 	}
@@ -1661,8 +1807,9 @@ func (b *SparseGenerationBuilder) declareProducers(
 		// producers are narrowed; the generation is published either way, and
 		// what a knowingly incomplete capability is worth is the reader's call.
 		truncated := fmt.Sprintf(
-			"the affected closure was truncated at %d files; files past the cap were not re-resolved",
-			report.ClosureCap)
+			"the affected closure was truncated at %d files (cap from %s); "+
+				"files past the cap were not re-resolved",
+			report.ClosureCap, builderClosureCapSourceLabel(report.ClosureCapSource))
 		for i := range rows {
 			switch rows[i].Producer {
 			case string(graphview.CapResolutionLocal), string(graphview.CapIncomingEdges):

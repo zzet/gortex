@@ -81,15 +81,113 @@ import (
 // which therefore no file mask can ever replace. Reading a handful of root
 // files is cheaper than any rule that would have to undo that.
 
-// builderClosureCap bounds the closure fan-out. It reuses the incremental
-// pipeline's affected-by cap: both answer the same question — how many files
-// may one change drag into a re-resolve before the bounded pass stops being
-// bounded — and a repository that tuned one has tuned the other.
-func (b *SparseGenerationBuilder) builderClosureCap() int {
-	if n := b.Config.AffectedByReresolveMax; n > 0 {
-		return n
+// Committed-base closure sizing. A dedicated delta's closure is the corpus it
+// READS to resolve its change; since the generation carries payload for the
+// change set alone (see withholdContextPayload), the size of that corpus is a
+// bound on parse and resolve work, not on what is written. Sizing it off the
+// change the build exists for is therefore the right shape: a one-file commit
+// has no business dragging a two-hundred-file re-resolve behind it, and a
+// hundred-file commit needs more room than one.
+const (
+	// builderCommittedBaseClosurePerChange is how many context files one
+	// changed file may pull into a committed-base delta's resolution corpus.
+	builderCommittedBaseClosurePerChange = 32
+	// builderCommittedBaseClosureFloor is the smallest corpus any committed
+	// base gets, so a single-file commit still reaches its dependents and its
+	// manifests. It is the historical default this path used to inherit.
+	builderCommittedBaseClosureFloor = defaultAffectedByMax
+	// builderCommittedBaseClosureCeiling keeps the walk bounded whatever the
+	// change set's size. Past it the build is a reseed, not a delta.
+	builderCommittedBaseClosureCeiling = 4096
+)
+
+// Which bound produced a build's ClosureCap. It rides on the BuildReport
+// beside ClosureTruncated, because "the generation is knowingly incomplete" is
+// only half a completeness fact: an operator who lowered a cap and an operator
+// who never touched one need different answers to "why", and a truncation
+// attributed to the wrong bound sends the second one looking for a knob that
+// was not in force.
+const (
+	// ClosureCapFromOperator says index.affected_by_reresolve_max is the
+	// bound in force. On a committed base it is named whenever the configured
+	// value is at or below the change-sized cap — it is then the constraint
+	// the operator can move.
+	ClosureCapFromOperator = "operator"
+	// ClosureCapFromChangeSized says the committed-base cap computed from the
+	// change set is the bound in force (see builderCommittedBaseClosureCap).
+	ClosureCapFromChangeSized = "change_sized"
+	// ClosureCapFromDefault says no knob was configured and the built-in
+	// defaultAffectedByMax applied.
+	ClosureCapFromDefault = "default"
+)
+
+// builderClosureCap bounds the closure fan-out, and names the bound it used.
+//
+// A committed-base delta gets its OWN computed cap, sized off its change set,
+// because index.affected_by_reresolve_max was chosen against a different
+// question: it tunes the incremental pipeline's re-resolve frontier over the
+// live working copy — a different pass, over a different corpus, with a
+// different failure mode — and the two only ever shared a number. Inheriting
+// it meant a repository that raised the incremental frontier silently widened
+// the resolution corpus of every committed-base build.
+//
+// The knob is still HONOURED, in the one direction an operator sets it for.
+// index.affected_by_reresolve_max is a ceiling on resolve fan-out, so a
+// committed base takes the MINIMUM of the configured value and its own
+// change-sized cap: a repository that lowered the knob to bound resolve cost
+// keeps that bound on this path, and no committed base is ever walked wider
+// than the operator allowed. When the knob is unset the computed cap applies
+// alone. The cap is never RAISED by this path above what the operator asked
+// for, and which of the two fired is recorded on the report.
+//
+// Every other sparse build — commit layers, dirty layers, ref views — reads
+// the configured value directly, because for those the closure IS the write
+// set bound that knob was chosen against.
+func (b *SparseGenerationBuilder) builderClosureCap(req BuildRequest) (int, string) {
+	operator := b.Config.AffectedByReresolveMax
+	if req.Identity.GenerationKind == DedicatedBaseGenerationKind && req.Identity.BaseGenerationID > 0 {
+		sized := builderCommittedBaseClosureCap(len(req.Changes))
+		// At a tie the operator bound is named: it is the value explicitly
+		// set, and lowering it moves the cap.
+		if operator > 0 && operator <= sized {
+			return operator, ClosureCapFromOperator
+		}
+		return sized, ClosureCapFromChangeSized
 	}
-	return defaultAffectedByMax
+	if operator > 0 {
+		return operator, ClosureCapFromOperator
+	}
+	return defaultAffectedByMax, ClosureCapFromDefault
+}
+
+// builderClosureCapSourceLabel spells a ClosureCap source for a reader of the
+// published completeness fact. An unrecorded source is said to be unrecorded
+// rather than guessed at.
+func builderClosureCapSourceLabel(source string) string {
+	switch source {
+	case ClosureCapFromOperator:
+		return "index.affected_by_reresolve_max"
+	case ClosureCapFromChangeSized:
+		return "the change-sized committed-base cap"
+	case ClosureCapFromDefault:
+		return "the built-in default cap"
+	default:
+		return "an unrecorded bound"
+	}
+}
+
+// builderCommittedBaseClosureCap sizes one committed-base delta's resolution
+// corpus off the change it is built for, clamped to a floor and a ceiling so
+// the walk stays bounded at both ends.
+func builderCommittedBaseClosureCap(changed int) int {
+	sized := changed * builderCommittedBaseClosurePerChange
+	if sized < builderCommittedBaseClosureFloor {
+		sized = builderCommittedBaseClosureFloor
+	}
+	if sized > builderCommittedBaseClosureCeiling {
+		sized = builderCommittedBaseClosureCeiling
+	}
+	return sized
 }
 
 func (b *SparseGenerationBuilder) affectedClosureContext(
@@ -101,8 +199,9 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	limit := b.builderClosureCap()
+	limit, capSource := b.builderClosureCap(req)
 	report.ClosureCap = limit
+	report.ClosureCapSource = capSource
 
 	seeds := make([]string, 0, len(present)+len(deleted))
 	for p := range present {
@@ -203,7 +302,8 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 		b.Logger.Warn("indexer: sparse generation closure truncated",
 			zap.String("repo", req.RepoPrefix),
 			zap.Int("closure", len(closure)),
-			zap.Int("cap", limit))
+			zap.Int("cap", limit),
+			zap.String("cap_source", capSource))
 	}
 	report.ClosureFiles = len(closure)
 	report.ClosurePaths = closure
