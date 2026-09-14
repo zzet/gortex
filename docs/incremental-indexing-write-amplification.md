@@ -6,7 +6,7 @@ microbenchmark is not an end-to-end disk-usage verdict.
 
 Execution ledger: [incremental-indexing-execution-ledger.md](incremental-indexing-execution-ledger.md)
 
-## Status 2026-09-15
+## Status 2026-09-14
 
 **The [execution ledger](incremental-indexing-execution-ledger.md) is the authority on current
 state.** This document remains the chronological design and invariant history and is not rewritten:
@@ -18,7 +18,9 @@ the corrections evidence forced on D6, D9 and D15; and a compressed per-wave evi
 paired measurement lives in [incremental-indexing-measurements.md](incremental-indexing-measurements.md)
 and carries two verdicts against one never-re-frozen budget file.
 
-Branch `fix/incremental-index-write-amplification` at `722d4b7b`, 140 commits over `main 56a1c29d`.
+Branch `fix/incremental-index-write-amplification`, 144 commits over `main 56a1c29d`. The final
+source identity — the last commit that changes a `.go` file — is `9fc2e7ce`; the commits above it
+change documentation only.
 
 **No acceptance gate is closed.** All ten remain open, and the ledger's gate table names the evidence
 and the narrowing for each. In one paragraph: G1 (snapshot correctness) and G8 (bounded costs) and G9
@@ -31,11 +33,12 @@ no identified mechanism, a 6,000-file scale axis never re-run after the fixes, a
 closure limit and a vacuous quiescence verdict; G9 on a daemon that does not retry a build lost to a
 full volume, a storage-failure census that stays empty while the log names the failure, and the
 unresolved `internal/persistence` sidecar obligation. G2, G3, G4, G5, G6, G7 and G10 are `tested`:
-each has component-level and end-to-end evidence, but every E2E matrix and both measurement verdicts
-ran against ancestor candidate binaries (`2fd5db82`, `271a9e9f`) rather than the final HEAD, no
-single run has covered every package at `722d4b7b`, and `golangci-lint` has been run over two
-packages only — so none of them reaches `E2E validated`, and the ledger records what each is still
-missing.
+each has component-level and end-to-end evidence, but the item rows' E2E matrices and both
+measurement verdicts ran against ancestor candidate binaries (`2fd5db82`, `271a9e9f`) rather than
+the final source — so none of them reaches `E2E validated`, and the ledger records what each is
+still missing. W9.3's static/suite half is closed at the final source `9fc2e7ce` (19442/0/41, 0
+`DATA RACE`, whole-module `golangci-lint` 0 issues); the E2E re-run there is **4 of 7 matrices
+PASS**, with every red reproducing byte-identically on `gortex-271a9e9f`.
 
 ## 2026-09-10: guarded committed-base advancement component
 

@@ -37,9 +37,12 @@ not reachable from a default startup, watcher, or Git callback path is `implemen
 and never `complete`.
 
 **No item in this ledger is `complete` on the strength of an end-to-end run at the final HEAD.** The
-E2E matrices (W8.5, W8.7, W8.8, W8.10) and the paired measurement (W8.4, F6) were driven against
-earlier candidate binaries — `gortex-2fd5db82`, `gortex-271a9e9f` — which are ancestors of the final
-HEAD, not the final HEAD itself. Where an item row says `complete`, that word is used in its
+E2E matrices (W8.5, W8.7, W8.8, W8.10) and the paired measurement (W8.4, F6) that the item rows cite
+were driven against earlier candidate binaries — `gortex-2fd5db82`, `gortex-271a9e9f` — which are
+ancestors of the final source, not that source itself. The Final-source validation row in the
+evidence log re-ran all seven matrices at `9fc2e7ce`: **4 PASS (4, 5, 6, 7), 3 FAIL (1, 2, 3)**,
+every red reproducing byte-identically on `gortex-271a9e9f`, so it confirms the item rows rather
+than closing a gate. Where an item row says `complete`, that word is used in its
 narrower per-item sense recorded by the wave that landed it (implemented + compiled + tested +
 wired + verifier `pass`); it is **not** a gate closure. The gate table below is the authority on
 what is closed, and it closes nothing.
@@ -50,10 +53,10 @@ what is closed, and it closes nothing.
 | --- | --- |
 | Implementation worktree | `/Users/zzet/code/my/gortex/worktrees/fix-incremental-write-amplification` |
 | Branch | `fix/incremental-index-write-amplification` |
-| Final source identity | `722d4b7b63bcd3a45b765e6c48e275b8e1605a6c` — the last commit that changes a `.go` file, and the identity every count below was taken at |
-| Final HEAD | this document's own consolidation commit, which sits on top of `722d4b7b` and changes **no** `.go` file; `git rev-parse HEAD` is the authority |
+| Final source identity | `9fc2e7ce4ea395c51c53082bdf2ffdecec7384aa` — the last commit that changes a `.go` file, and the identity the Final-source validation row was taken at. Every per-wave count above it was taken at that wave's own identity, which its row names; `722d4b7b` is the consolidation-era identity those counts were quoted against and is **not** the final source |
+| Final HEAD | the documentation commits that sit on top of `9fc2e7ce` and change **no** `.go` file; `git rev-parse HEAD` is the authority |
 | Base | `main` / `origin/main` at `56a1c29d514d8f7d3b5feec455c7b57de358b1d3` (v0.64.3) |
-| Commits ahead of base | **140** source commits plus this documentation commit, zero behind |
+| Commits ahead of base | **144**, zero behind — 120 touch a `.go` file, 45 touch `docs/`, 21 touch both. `git rev-list --count 56a1c29d..HEAD` is the authority |
 | PR 788 merge ancestor | `817373364c1ee74f394f4b8b41c7df499eb811f6` |
 | Branch on origin | Not pushed |
 | Working tree at this revision | Clean except the untracked working input `docs/incremental-indexing-handoff-2026-09-10.md`, which is **never committed** |
@@ -128,7 +131,8 @@ Actions: `compile <alias|./pkg> <normal|race>` · `test <alias|./pkg> <normal|ra
 ```sh
 W=/Users/zzet/code/my/gortex/worktrees/fix-incremental-write-amplification
 S=/private/tmp/claude-501/-Users-zzet-code-my-gortex-gortex/20fa972c-5914-454d-abe4-266b2fdad79d/scratchpad
-cd "$W" && git rev-parse HEAD           # expect 722d4b7b63bcd3a45b765e6c48e275b8e1605a6c
+# the final SOURCE identity; HEAD sits above it and changes no .go file:
+cd "$W" && git rev-list -1 HEAD -- '*.go'   # expect 9fc2e7ce4ea395c51c53082bdf2ffdecec7384aa
 
 export GOWORK=off GOTOOLCHAIN=local GOFLAGS="-mod=mod -buildvcs=false" GOPROXY=off
 go build ./...                          # expect exit 0, no output
@@ -143,8 +147,9 @@ for p in '^Test[A-C]' '^Test[D-H]' '^Test[I-M]' '^Test[N-R]' '^Test[S-T]' '^Test
   GXH_TAG=repro bash "$S/harness/validate.sh" test indexer normal "$p"
 done
 # internal/mcp likewise cannot run whole; use the same six chunks.
-# store_sqlite under -race exceeds the harness budget entirely — run it directly:
-go test -race -timeout 30m ./internal/graph/store_sqlite/
+# store_sqlite under -race exceeds the harness budget entirely — run it directly.
+# 30m is NOT enough at the final source (timed out at 1800.6 s with 0 races); quote 90m:
+go test -race -timeout 90m ./internal/graph/store_sqlite/
 
 # opt-in E2E matrices and the paired measurement CANNOT run through validate.sh:
 # its `env -i` allowlist drops every GXW8_* / GORTEX_ISSUE767_* variable. Use the
@@ -332,8 +337,8 @@ out-of-scope row below.
 - Scope: `internal/mcp/tools_enhancements.go`, `tools_enrich_churn.go`, `tools_enrich_releases.go`, `tools_lsp.go`, `tools_core.go`, `tools_cochange.go`, `internal/indexer/repository_mutation_coordinator.go`, `cmd/gortex/daemon_controller.go`, `internal/daemon/proto.go`, plus six test files.
 - Invariant: every enrichment producer writes through an authority handle naming the generation it writes into; a routed request whose generation is sealed is **refused**, never served from base and never written into a snapshot the request did not read; a refusal is annotated with the capability it could not serve.
 - Evidence: `beginEnrichmentOutput` / `enrichmentTargets` are the single admission door; `settleEnrichment` reports a supersession at `Complete` as a fact rather than an error; `OutputEntryEnrichmentCorpus` names generation zero **explicitly** rather than by omission; `mineCoChange` is brought behind the same view gate instead of sweeping every tracked live worktree from a read path. Counts: mcp 6477/0/8 + race 851/0/0; cmd 1104/0/5; daemon 282/0/0; indexer 2824/0/2. **M15 (stop translating the superseded receipt) goes RED in both packages — the cross-package wiring proof.** Reports `W5-W3.2*.md`, `W6-W3.2*.md`.
-- Limitations: the coordinator start failure reaches the status payload but no rendered CLI surface; one request door still starts the corpus mine under a routed view; the control socket's authority resolution is narrower than the MCP server's; a degraded capability still reports `exact:true` on the rider; `cmd/gortex` still imports `internal/mcp` for `BeginBaseEnrichment` and `enrichmentOutputIdentity` duplicates the indexer's `outputStoreIdentity` format string; the `tools/list` byte ceiling is a hard gate and it bit — the shipped `profile` arg wording is +1 byte and the multi-repo rule lives in the unserialized doc comment.
-- Next: file follow-ups for `EnrichmentOutput`'s relocation into `internal/indexer`, the unrendered start-failure surface, and the control socket's narrower authority resolution.
+- Limitations: the coordinator start failure reaches the status payload but no rendered CLI surface **at this wave's identity** — closed later by W8.3's `renderDaemonViews`; one request door still starts the corpus mine under a routed view; the control socket's authority resolution is narrower than the MCP server's; a degraded capability still reports `exact:true` on the rider; `cmd/gortex` still imports `internal/mcp` for `BeginBaseEnrichment` and `enrichmentOutputIdentity` duplicates the indexer's `outputStoreIdentity` format string; the `tools/list` byte ceiling is a hard gate and it bit — the shipped `profile` arg wording is +1 byte and the multi-repo rule lives in the unserialized doc comment.
+- Next: file follow-ups for `EnrichmentOutput`'s relocation into `internal/indexer` and the control socket's narrower authority resolution. (The start-failure surface is rendered as of W8.3.)
 
 #### W3.3 — Give the analysis cache a real `view_gen` axis (D9)
 - State `tested`; store half `wired`, `internal/mcp` half **seam-wired only** — stated verbatim in source (`analysis_generation.go:58`, "WIRING STATUS: seam only") and confirmed independently · gates G9, G1, G6 · commit `af1832b3` *store: key the analysis cache by the payload view generation* · verifier **PASS**, 3 minors.
@@ -847,9 +852,9 @@ before the candidate was measured.
 ## W9 — Deliver reviewable change
 
 - **W9.1 Execution-ledger rows for every item** — state `complete` in the per-item sense: this document. Every W2–W8 and F item has a row in the state vocabulary above.
-- **W9.2 Atomic commits, one per integration unit, with its evidence** — state `complete` in the per-item sense: 140 commits on the branch, each staged by explicit path list (never `git add -A`), each partitioning its wave's dirty files exactly (assigned / unassigned / assigned-twice verified against `git status --porcelain -uall` before the first `git add` in every wave from W8f onward), each ending with the session trailer. The per-wave commit tables are in the Evidence log appendix.
-- **W9.3 `golangci-lint` + `go vet` + full normal and race suites on final source** — state `blocked with evidence`. `go build ./...` and `go vet` are clean in every wave from W8f onward, and each wave ran the packages it touched; **no single run has covered every package at the final HEAD `722d4b7b`**, and `golangci-lint` has been run only over `./internal/indexer/... ./internal/resolver/...` (W6.12). This is the largest open item in W9.
-- **W9.4 Final diff review** — state `proposed`.
+- **W9.2 Atomic commits, one per integration unit, with its evidence** — state `complete` in the per-item sense: 144 commits on the branch, each staged by explicit path list (never `git add -A`), each partitioning its wave's dirty files exactly (assigned / unassigned / assigned-twice verified against `git status --porcelain -uall` before the first `git add` in every wave from W8f onward), each ending with the session trailer. The per-wave commit tables are in the Evidence log appendix.
+- **W9.3 `golangci-lint` + `go vet` + full normal and race suites on final source** — state `tested`, closed by the Final-source validation row in the Evidence log: at the final source `9fc2e7ce`, 33 compiles and 46 harness runs gave **19442 pass / 0 fail / 41 skip**, 0 `DATA RACE`, no new skip; `golangci-lint` v2.13.1 (the CI pin) over the whole module went 18 → **0 issues** with nothing suppressed; `gofmt -l` over the diff is empty; `go vet ./...` and `go build ./...` exit 0. Residual, named: `internal/graph/store_sqlite` under `-race` needs **`-timeout 90m`**, not the 30m the harness notes quoted (1800.6 s timeout with 0 races, green in 2256.7 s); and the E2E half is separate — three of seven matrices still FAIL, on reds that reproduce byte-identically on `gortex-271a9e9f`.
+- **W9.4 Final diff review** — state `tested`: the whole-branch review at HEAD re-ran the static gates (`go build ./...`, `go vet ./internal/... ./cmd/...`, `gofmt -l` over the 426 changed `.go` files, `golangci-lint` over every touched package — all clean), the affected package suites, and the `-run Compact` tools/list pins; it filed its findings as the PR's limitations rather than as source changes: limitations 26–27 below, neither a blocker. Its only edits are to this ledger and to the design document's status block, correcting the final-source identity, the commit count, the `store_sqlite -race` budget and W9.3's own state.
 - **W9.5 PR text with truthful validation, limitations and the upgrade cost** — state `proposed`. The declared-limitations list below must appear verbatim in the PR body, together with the D8 upgrade cost.
 - Invariant: the PR distinguishes measured improvements from unmeasured dimensions and reports every open gate plainly. **No feature-complete or disk-fixed claim rests on microbenchmarks, private overlays, or old binaries.**
 
@@ -1039,7 +1044,7 @@ named failure. **No gate is `complete`.**
 | **G7** | Lifetime and cleanup — admitted readers, workers and physical builds survive until actual completion; closing rejects new admission, drains, finalizes only the captured registration; deletion/recreation, path/ID reuse, follower cancellation and delayed callbacks cannot resurrect or damage another owner. | **tested** | W1.3, W1.4, W5.1, W5.2, W5.3, W5.4, W7.1, W7.2, W7.4 — each mutation-verified. W8.10's matrix 6 is **8/8 PASS** at candidate `2fd5db82`: untrack/remove/recreate, primary removal with a preserved sibling, drains and late readers (**0 incoherent** answers out of ~90), duplicate triggers (six concurrent reconciles → **one** physical build), cancellation 8/8, failed build and retry, restart and crash (identities survive `SIGKILL`). **Narrowing:** not at the final HEAD; W7.2 is `wired`, not `E2E validated`, by its own statement; W7.3/W7.5 are out of scope (D10), so the raw-registration reuse class is untested; cancellation in matrix 6 is client-side and cannot see the in-daemon cancellation tail. |
 | **G8** | Bounded costs — candidate inspection, ancestry, versions, caches, queues, cleanup backlog and retained storage are bounded; no silent truncation, full-view compatibility materialization, whole-corpus membership rewrite disguised as reuse, or indefinitely deferred garbage. Reseed/compaction peaks measured as well as steady state. | **blocked with evidence** | Served by W1.5, W1.7, W3.6, W3.6b, W6.3, W6.3b, W6.3c, W6.4, W6.7, W6.9, W7.6, F1–F8; F6's second verdict returns `over budget: []`, `incomparable: []` on the 1,500-file protocol with retained bytes 0.86× the baseline and the store 0.83× at run end. **Open, each named**: F3b's own single-phase re-measurement **misses both plan targets** — store delta 7.91 MB against ≤ 1 MB, one-sample burst 83.0 MB against ≤ 20 MB — which blocks F3's contribution; F2's *"second-copy payload ≤ 260 MB (from 841 MB)"* ceiling is a **null result, unverified**; the **6,000-file scale axis was never re-run post-fix**, so `P1@6000` 7.44× and `P4@6000` 674× have no post-fix counterpart; `P4_amend_same_tree` 1.28× survives with **no mechanism**; W8.10 filed `bounded_candidate_work`'s typed-limit half **NOT EXERCISED** (the closure limit did not truncate even at the smallest value the source honours) and its quiescence verdict is **vacuous** because the view-lifecycle counters never appeared; F4's daemon-level "logical writes / 60 s ≤ 0.7 MB" half was not run; **D7/W6.8: there is no real compaction or reseed**, so chain growth is bounded only by W6.7's retention and W6.9's forced-root policy, reported as a measured number, not a proven bound. |
 | **G9** | Storage/recovery safety — shared logical storage stays shared (no database per worktree/generation); supported migration, newer-schema refusal, invalid/missing/foreign generations, crashes and disk-full preserve catalog/tracking integrity with bounded peak space; legacy generation zero is not certified committed content by relabelling. | **blocked with evidence** | Served by W3.3 (additive migration v25, legacy rows copied at `view_gen 0`, newer-schema refusal intact), W7.6 (ENOSPC classified, sweep budgeted and terminating, a **real `SQLITE_FULL`** raised inside the sweep's own transaction), W7.4, W6.7, F8 (the copy never writes or relabels generation zero). W8.10's matrix 6 disk-full row passed on a 34.5 MiB volume filled to 0.9 MiB free with catalog and tracking integrity preserved. **Open, each named**: matrix 6 recorded that the live daemon does **not** retry the build it lost to a full volume (the marker became reachable only after a restart); that SIGINT is not honoured on a filled store volume; and that **`StatusResponse.Views.StorageFailures` stayed empty while the volume was full although the daemon log named it** — the gate-9 census does not surface what the log does. Bookkeeping obligation **B1 is unresolved**: the `internal/persistence` sidecar database (notes, memories, scopes, notebooks) has no generation axis and no item asserted its untrack/retire/cleanup obligation, which is exactly the shape gate 9's own words exclude. Peak space for a reseed was not measured. |
-| **G10** | Reproducible release evidence — actual final-source tests/static checks, isolated public-path E2E and sustained representative I/O comparisons recorded with source identity and commands; all failures and skips explained. No feature-complete or disk-fixed claim based solely on microbenchmarks, private overlays or old binaries. | **tested** | The harness is described above with exact commands; every wave suite recorded HEAD, dirty-manifest sha256, per-run binary sha256, counts, every named failure and **every named skip with its printed reason**; `go build ./...` and `go vet` are clean from wave W8f onward; the measurement record is `docs/incremental-indexing-measurements.md` with two verdicts against one never-re-frozen budget file. **Open**: W9.3 — **no single run has covered every package at the final HEAD `722d4b7b`**, and `golangci-lint` has been run only over `./internal/indexer/... ./internal/resolver/...`; the E2E matrices and both measurement verdicts ran against ancestor candidate binaries, not the final HEAD; the matrices cannot run through `validate.sh` at all (its `env -i` allowlist drops every `GXW8_*` variable) and ran under a scratchpad runner that replicates the isolation stanza verbatim; W8r's suite was taken from a worktree four other agents were editing, so its dirty-manifest hash differs between two evidence runs. |
+| **G10** | Reproducible release evidence — actual final-source tests/static checks, isolated public-path E2E and sustained representative I/O comparisons recorded with source identity and commands; all failures and skips explained. No feature-complete or disk-fixed claim based solely on microbenchmarks, private overlays or old binaries. | **tested** | The harness is described above with exact commands; every wave suite recorded HEAD, dirty-manifest sha256, per-run binary sha256, counts, every named failure and **every named skip with its printed reason**; `go build ./...` and `go vet` are clean from wave W8f onward; the measurement record is `docs/incremental-indexing-measurements.md` with two verdicts against one never-re-frozen budget file. W9.3 is closed at the final source `9fc2e7ce` (Final-source validation row: 19442/0/41, 0 `DATA RACE`, whole-module `golangci-lint` 0 issues, `gofmt -l` over the diff empty), and the seven E2E matrices re-ran there — **4 PASS, 3 FAIL**, every red byte-identical on `gortex-271a9e9f`. **Open**: the three failing matrices (1, 2, 3) are unexplained product reds, not regressions; **both measurement verdicts still ran against ancestor candidate binaries**, and the paired measurement was not re-run at the final source (the whole production delta from `271a9e9f` is the lint/format commit, so no measured quantity can move — an argument, not a measurement); the matrices cannot run through `validate.sh` at all (its `env -i` allowlist drops every `GXW8_*` variable) and ran under a scratchpad runner that replicates the isolation stanza verbatim; W8r's suite was taken from a worktree four other agents were editing, so its dirty-manifest hash differs between two evidence runs. |
 
 ## Declared limitations
 
@@ -1125,9 +1130,13 @@ These must appear **verbatim** in the PR body (W9.5), with their ledger row name
 20. **Two gate-1 divergences found by W8.5's matrix 2** are open and unowned: a withdrawn
     (`untracked_path`) name is still served, and an excluded (`configuration_change`) package's name
     is still served out of that file.
-21. **Unrendered diagnostics** — `ViewsHealth.StorageFailures` and the coordinator start-failure
-    reasons reach the status payload but no CLI surface renders them (W2.4b, W3.2, W7.6), and the
-    view-lifecycle counters W8.10's quiescence verdict depends on **never appeared** in a live run.
+21. **Diagnostics that no live run has exercised** — the view-lifecycle counters W8.10's quiescence
+    verdict depends on **never appeared** in a live run, so that verdict guards nothing it can
+    currently see. (The *unrendered* half of this limitation is closed: W8.3's
+    `renderDaemonViews` (`cmd/gortex/daemon.go:1876`, reached from `daemon status` at `:1310`)
+    renders the levels, the metric series, `ViewsHealth.StorageFailures` and the coordinator
+    start-failure reasons, and omits the whole block for a daemon holding no view lifecycle so a
+    single-repo status keeps its old shape.)
 22. **`X-Gortex-Cwd` has no hop or loop guard** (W5.11, W5.11b). The class is pre-existing — the
     body `cwd` argument was always relayed verbatim — but the header path widens the affected
     population; a mutually-claiming roster would cycle.
@@ -1142,6 +1151,24 @@ These must appear **verbatim** in the PR body (W9.5), with their ledger row name
     stated accelerations. It does not say the write-amplification problem is fixed.**
 25. **Gate 8 is not claimable, and no gate is complete** — the branch's own evidence closes none of
     the ten acceptance gates; see the gate table for what each one is missing.
+26. **The raw-repository owner surface is implemented but has no production registrar** (W9.4).
+    `graphview.PrepareRawRepositoryOwner`, `CommitRawRepositoryOwner`,
+    `RegisterRawRepositoryOwnerPrepared`, `LookupRawRepositoryRegistration`,
+    `CloseRawRepositoryAdmission`, `AcquireMixedRepositoryRead` and
+    `(*RepositoryReadLease).RawOwners` have **zero non-test callers**; the only production readers
+    of the raw half are `AcquireRepositoryRoster` and `AcquireRawRepositorySnapshot`
+    (`indexer/dependency_revision.go:945,1082`), and nothing ever puts a raw owner in the registry
+    for them to find. So a raw roster member cannot exist in a running daemon, and limitation 3's
+    "witnessed, not frozen" describes a path production never takes. This is the shape W7.3 / W7.5
+    declare **out of scope (D10)**, parked rather than deleted — but it ships as exported API with
+    no caller and must not be read as an active mechanism.
+27. **Two mutable package globals exist only as test seams** (W9.4) —
+    `indexer.installCppIncludeSearchPath` (`indexer.go:1518`, a `var` of function type overwritten
+    by `committed_build_side_channels_test.go`) and `store_sqlite.maintenanceQuiesceTimeout`
+    (`store_compact.go:118`, overwritten by `maintenance_lane_test.go`). Neither is guarded against
+    a parallel test writing it, and neither has an injectable non-global alternative. They are the
+    only two the branch adds; every other new process-level registry is pointer-keyed state with a
+    retirement path, not a knob.
 
 ## Decisions D1–D15
 
@@ -1231,8 +1258,8 @@ not the test. Baseline `main 56a1c29d` (`harness/bin/gortex-baseline-56a1c29d`, 
 store `user_version` 21). First candidate `2fd5db82` (`gortex-2fd5db82`, sha256 `68680abc…`,
 `user_version` 25). Second candidate `271a9e9f` (`gortex-271a9e9f`, sha256 `6378b769…`), built by
 `git archive <sha> | tar -x` then `go build ./cmd/gortex/`, with `diff -r -q -x '*_test.go' -x docs`
-against the worktree returning **0 differing files**. **Neither candidate is the final HEAD
-`722d4b7b`.**
+against the worktree returning **0 differing files**. **Neither candidate is the final source
+`9fc2e7ce`**; the delta from `271a9e9f` to it is the lint/format commit alone.
 
 **Protocol.** 1,500-file generated corpus / 60 packages / seed 767 / 10 dependent worktrees / 20
 commits / 10 edits / 60 s idles, the nine-phase workload, three repetitions interleaved
@@ -1344,7 +1371,7 @@ wave suite closed a gate**, and every wave entry said so in its own words.
 | 2026-09-10 | **Wave W8g exit** (F1b, F3b, F4b, F5b, F7b; carried F1, F2) | `bb43b338`, manifest `3c6984f9…` (15 compiles, 29 runs) | suite GREEN; store 1885/0/2, mcp six chunks 6549/0/8, indexer six chunks 3079/0/2, **cmd 1424/0/15** (W8f's two deterministic failures are green, which is what closes F4). One red recorded as **FLAKE** with all four conditions evidenced (`TestBaseSelectorTextSearchAnswersFromItsOwnRepositoryOnly`: unmodified file; green on re-run; green at `-count=3` in isolation; a pristine-HEAD overlay probe alternated with the wave binary gives baseline 0/7 vs wave 1/6, Fisher two-sided **p = 0.46**). **Honest residual**: 1/6 vs 0/7 is indistinguishable, not exonerating, and the failing subsystem is exactly what F1/F1b touch | 7 — `331e64b9`, `bbd2f8dc`, `568618a7`, `905d7a90`, `534a124e`, `e2a1954c`, `daa91e21` |
 | 2026-09-10 | **Wave W8h exit** (F8) | `fe5fae1d`, manifest `20703b51…` (7 compiles, 18 runs) | suite GREEN; store 1899/0/2, graphview 509/0/0, cmd 1424/0/15, indexer seven chunks 3083/0/2, store race 600/0/0 (split), indexer race 236/0/0. Two 8-minute chunk aborts, both wall-clock chunk size under `GOMAXPROCS=2`, neither a red: every named test completed in its split run | 1 — `4ceb40ce`, + ledger |
 | 2026-09-10 | **Wave W8i exit** (F6) | `271a9e9f`, manifest `42cbb249…` (2 compiles, 2 runs) | suite GREEN; cmd normal 1425/0/15 (113.8 s), cmd race `Paired|W8|Sampler` 231/0/10, 0 `DATA RACE`. The four daemon measurement runs sit outside this table and are cited on the F6 row | 1 — `689fe963`, + ledger |
-| 2026-09-15 | Ledger consolidation | `722d4b7b` | documentation only; no suite run | 1 — this document plus the design's status note |
+| 2026-09-14 | Ledger consolidation | `722d4b7b` | documentation only; no suite run | 1 — this document plus the design's status note |
 | 2026-09-14 | **Final-source validation** (static checks + full suites + E2E on the finished branch; no item work) | `9fc2e7ce`, manifest `5fd3990e…` (33 compiles, 46 harness runs) | suite GREEN — **19442 pass / 0 fail / 41 skip**, 0 `DATA RACE`, **no new skip**. golangci-lint v2.13.1 (the CI pin) 18 → **0 issues**, all 18 branch-introduced, none suppressed; `gofmt -l` over the diff empty (nine files formatted, eight branch-authored and `internal/indexer/file_delta.go` a pre-existing hunk inside the diff); `go vet ./...` and `go build ./...` exit 0, no output. `internal/graph/store_sqlite` whole-package `-race` **exceeds the recorded 30-minute budget** (timeout at 1800.6 s, 0 races, 0 assertions failed) and is green at `-timeout 90m` in **2256.7 s**. E2E: **4 of 7 W8 matrices PASS** (4, 5, 6, 7), 3 FAIL (1 no-op, 2 edits, 3 resolution) — every red reproduced **byte-identically** against the pre-lint daemon `gortex-271a9e9f`, so none is a regression of this session; sustained harness smoke **9/9 phases, failed=[]**. Report `final-suite.md` | 2 — `9fc2e7ce`, + ledger |
 
 **E2E outcome table at the final source** (`gortex-e2e` sha256 `28624cd5…` at HEAD `9fc2e7ce`,
