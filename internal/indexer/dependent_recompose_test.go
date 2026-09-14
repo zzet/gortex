@@ -214,6 +214,79 @@ func TestARoutedDependentDeltaNamesNoImmutableBaseWithoutAPublishedGeneration(t 
 	}
 }
 
+// TestADependentOnGenerationZeroRecomposesOntoTheFirstPublishedBase pins the
+// transition the committed-base consumer gate makes ordinary.
+//
+// Publication is now DEFERRED until something can read the base, and the thing
+// that makes a family publishable is a dependent appearing. So the sequence
+// below is the product's normal one, not an edge case: a dependent is routed
+// in the legacy regime over generation 0 (BaseGenerationID 0, composing over
+// the shared corpus), the family's first committed base then lands underneath
+// it, and the dependent has to end up routed over an immutable ancestor.
+//
+// That is the promise the deferral rests on. If the first published base left
+// a routed gen-0 delta where it was, the deferral would be trading a write now
+// for a permanently un-pinned dependent — the exact staleness
+// recomposeOverAdvancedBase's second bullet describes, since the corpus under
+// that delta is re-indexed in place as the primary moves.
+//
+// What is asserted is the END STATE, not which of the two paths reached it:
+// whether the cycle takes the bounded recomposition or the ordinary
+// slot-by-slot flip is a decision recomposableStack owns and the other tests in
+// this file pin. What must be true either way is that the route names a new
+// commit layer and that the layer names the published base.
+func TestADependentOnGenerationZeroRecomposesOntoTheFirstPublishedBase(t *testing.T) {
+	f := newUnpublishedCommittedBaseFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+
+	legacy := coordinatorReconcile(t, c)
+	if legacy.CommitGenerationID == 0 || legacy.DirtyGenerationID == 0 {
+		t.Fatalf("the coordinator did not bring both slots up: %+v", legacy)
+	}
+	before, found := f.generation(legacy.CommitGenerationID)
+	if !found {
+		t.Fatalf("the routed commit generation %d is not in the catalog", legacy.CommitGenerationID)
+	}
+	if before.BaseGenerationID != 0 {
+		t.Fatalf("the premise is the legacy regime; the routed layer already names ancestor %d",
+			before.BaseGenerationID)
+	}
+
+	// The family gains its first committed base, exactly as a consumer's
+	// demand would make it: the same publisher, the same claim, the same
+	// adoption.
+	baseGeneration := f.publishBase(t)
+	if baseGeneration <= 0 {
+		t.Fatalf("the fixture published no base: %d", baseGeneration)
+	}
+
+	recomposed := coordinatorReconcile(t, c)
+	if recomposed.CommitGenerationID == legacy.CommitGenerationID {
+		t.Fatalf("the dependent is still routed over the generation-0 layer %d after the family "+
+			"published base %d; it composes over a corpus that is now re-indexed under it",
+			legacy.CommitGenerationID, baseGeneration)
+	}
+	after, found := f.generation(recomposed.CommitGenerationID)
+	if !found {
+		t.Fatalf("the recomposed commit generation %d is not in the catalog", recomposed.CommitGenerationID)
+	}
+	if after.BaseGenerationID != baseGeneration {
+		t.Fatalf("the recomposed layer names ancestor %d, want the published base %d",
+			after.BaseGenerationID, baseGeneration)
+	}
+	route := f.route()
+	if route.CommitGenerationID != recomposed.CommitGenerationID ||
+		route.DirtyGenerationID != recomposed.DirtyGenerationID ||
+		route.State != store_sqlite.RouteActive {
+		t.Fatalf("the route does not name the recomposed pair: %+v vs %+v", route, recomposed)
+	}
+	// No new base under an old delta: the layer the route names must be the
+	// one stamped against the base the family is on now.
+	if after.LowerViewFingerprint == "" {
+		t.Fatalf("the recomposed layer carries no lower fingerprint: %+v", after)
+	}
+}
+
 // TestBaseAdvanceRecomposesTheStackWithoutDroppingTheRoute is gate 5's
 // "old coherent routes remain available until replacement routes are ready".
 //

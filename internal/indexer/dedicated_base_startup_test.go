@@ -47,6 +47,44 @@ func warmRestart(t *testing.T, f *lifecycleFixture, root string) {
 	require.NoError(t, err)
 }
 
+// allocateDependentCheckout writes one DEPENDENT checkout row into a family:
+// a non-owner identity in the automatic mode, which is exactly what
+// dedicatedBaseConsumers counts and what applyCoordinators would give a
+// coordinator to.
+//
+// It writes the row directly rather than adding a worktree and sweeping,
+// because a sweep also STARTS that checkout's coordinator, and a running
+// coordinator asks for the committed base on its own schedule
+// (CheckoutCoordinator.demandCommittedBase). A test about the CENSUS would
+// then be racing a second, asynchronous demand for the same publication. The
+// coordinator's own ask has its own test — see
+// TestADependentCoordinatorAsksTheDaemonForTheCommittedBase, which drives the
+// whole production chain and asserts on its outcome rather than on a count.
+func allocateDependentCheckout(t *testing.T, f *lifecycleFixture, familyID, adminName string) string {
+	t.Helper()
+	owner, err := f.catalog.ListCheckouts(context.Background(), familyID)
+	require.NoError(t, err)
+	require.NotEmpty(t, owner, "the family holds no checkout to take a head from")
+	checkout := store_sqlite.Checkout{
+		CheckoutID:     "checkout-" + adminName,
+		Incarnation:    "incarnation-" + adminName,
+		FamilyID:       familyID,
+		RootPath:       filepath.Join(f.dir, adminName),
+		GitDir:         filepath.Join(owner[0].RootPath, ".git", "worktrees", adminName),
+		AdminName:      adminName,
+		State:          store_sqlite.CheckoutStateReady,
+		DesiredMode:    store_sqlite.CheckoutModeAutomatic,
+		EffectiveMode:  store_sqlite.CheckoutModeAutomatic,
+		HeadRef:        "refs/heads/" + adminName,
+		HeadCommit:     owner[0].HeadCommit,
+		HeadTree:       owner[0].HeadTree,
+		LastAccessible: time.Now().Unix(),
+		LastSeen:       time.Now().Unix(),
+	}
+	require.NoError(t, f.catalog.AllocateCheckout(context.Background(), checkout))
+	return checkout.CheckoutID
+}
+
 // dedicatedGenerations lists every committed generation one graph holds.
 func dedicatedGenerations(t *testing.T, f *lifecycleFixture, graphID string) []store_sqlite.ViewGeneration {
 	t.Helper()
@@ -129,7 +167,7 @@ func TestInitialBasePublisherColdStartPublishesOneCommittedBasePerRepository(t *
 
 	prefixes := make([]string, 0, 2)
 	for _, name := range []string{"alpha", "beta"} {
-		root := f.gitRepo(name)
+		root := f.gitRepoWithDependent(name)
 		registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 		require.NoError(t, err)
 		require.NotEmpty(t, registered.Prefix)
@@ -188,7 +226,7 @@ func TestInitialBasePublisherWarmRestartReAdoptsWithoutCatalogWrites(t *testing.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	root := f.gitRepo("warm")
+	root := f.gitRepoWithDependent("warm")
 	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 	require.NoError(t, err)
 	prefix := registered.Prefix
@@ -225,7 +263,7 @@ func TestInitialBasePublisherAdvancesACommittedTreeThatMovedWhileDown(t *testing
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	root := f.gitRepo("moved")
+	root := f.gitRepoWithDependent("moved")
 	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 	require.NoError(t, err)
 	prefix := registered.Prefix
@@ -274,7 +312,7 @@ func TestInitialBasePublisherRecoversAnInterruptedPublication(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	root := f.gitRepo("interrupted")
+	root := f.gitRepoWithDependent("interrupted")
 	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 	require.NoError(t, err)
 	prefix := registered.Prefix
@@ -316,7 +354,7 @@ func TestInitialBasePublisherScheduleDoesNotBlockAndShutdownCancelsIt(t *testing
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	root := f.gitRepo("scheduled")
+	root := f.gitRepoWithDependent("scheduled")
 	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 	require.NoError(t, err)
 
@@ -454,7 +492,7 @@ func TestALiveAdvanceDoesNotReleaseTheStartupQueue(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		root := f.gitRepo("ordering")
+		root := f.gitRepoWithDependent("ordering")
 		registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 		require.NoError(t, err)
 		graphID := GraphIDFor(registered.Prefix)
@@ -623,6 +661,184 @@ func TestInitialBasePublisherSkipsRepositoriesWithNothingToPublish(t *testing.T)
 	require.Zero(t, f.familyOf(registered.Prefix).ActiveGenerationID)
 }
 
+// TestInitialBasePublisherPublishesNothingForAnOwnerOnlyFamily is the
+// consumer gate's acceptance case, and the fix for the measured cold-index
+// regression.
+//
+// A committed base is a full index of a committed tree, and NOTHING in an
+// owner-only family can read one: the owning repository's own request route
+// stays on legacy generation 0, so the base exists solely for a dependent
+// checkout or a ref view to key a layer on. Publishing it anyway cost a second
+// whole-repository index — +847 MB of logical writes and a store of 61 -> 122
+// MB on the 1,500-file cold-index phase — for a reader set of size zero.
+//
+// The three assertions are the three things a skip has to be: no generation
+// allocated, no active pointer moved, and NO CATALOG DML AT ALL. The last one
+// is why the gate sits before the authority block rather than inside it —
+// AcquireDedicatedBaseAuthority is the first write on this path.
+//
+// Revert-red: delete the "no dependent checkout" skip from
+// InitialBasePublisher.publish and every assertion here fails.
+func TestInitialBasePublisherPublishesNothingForAnOwnerOnlyFamily(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// gitRepo, NOT gitRepoWithDependent: one checkout, no worktree, no ref view.
+	root := f.gitRepo("owner-only")
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NotEmpty(t, registered.Prefix)
+	checkouts, err := f.catalog.ListCheckouts(ctx, registered.FamilyID)
+	require.NoError(t, err)
+	require.Len(t, checkouts, 1, "the fixture is only owner-only if the family holds one checkout")
+
+	audit, err := installDedicatedWriteAudit(ctx, f.dbPath)
+	require.NoError(t, err)
+
+	out := startupPublisher(t, f).PublishRepo(ctx, registered.Prefix)
+	require.NoError(t, out.Err)
+	require.Equal(t, "no dependent checkout", out.Skipped)
+	require.Zero(t, out.GenerationID)
+	require.NoError(t, audit(), "a declined publication wrote the catalog")
+
+	graph := f.familyOf(registered.Prefix)
+	require.Zero(t, graph.ActiveGenerationID, "nothing was adopted")
+	require.Empty(t, dedicatedGenerations(t, f, graph.GraphID),
+		"a family with no reader allocated a committed generation")
+}
+
+// TestARefViewIsAConsumerOfTheCommittedBase states the other half of the
+// census. A named view resolves its lower snapshot through the same graphBase
+// a dependent checkout does (RefViewManager.base), so a graph with a ref view
+// has a reader even when the family holds nothing but its owner.
+//
+// Revert-red: drop the ListRefViews arm from dedicatedBaseConsumers and the
+// publication is declined.
+func TestARefViewIsAConsumerOfTheCommittedBase(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	root := f.gitRepo("ref-view-only")
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+	publisher := startupPublisher(t, f)
+	require.Equal(t, "no dependent checkout", publisher.PublishRepo(ctx, registered.Prefix).Skipped,
+		"the premise: without the view this family publishes nothing")
+
+	graphID := GraphIDFor(registered.Prefix)
+	_, err = f.catalog.GetOrCreateRefView(ctx, store_sqlite.RefView{
+		RefViewID:         "ref-view-consumer",
+		GraphID:           graphID,
+		SelectorKind:      "git_ref",
+		SelectorValue:     "refs/heads/main",
+		EnrichmentProfile: "default",
+		State:             store_sqlite.RefViewPending,
+		ExactView:         true,
+	})
+	require.NoError(t, err)
+
+	out := publisher.PublishRepo(ctx, registered.Prefix)
+	require.NoError(t, out.Err)
+	require.Empty(t, out.Skipped, "a ref view is a reader of the committed base")
+	require.Positive(t, out.GenerationID)
+	require.Equal(t, out.GenerationID, f.familyOf(registered.Prefix).ActiveGenerationID)
+}
+
+// TestTheFirstDependentGetsTheCommittedBaseThePublisherDeferred is the
+// deferral's other end: the gate is defer, not drop.
+//
+// The sequence is the production one. A daemon start declines an owner-only
+// family; a worktree appears; the family census now holds a dependent, and the
+// consumer's own request (RequestBase — what
+// CheckoutCoordinator.demandCommittedBase calls) publishes the base the start
+// did not. The demand carries no target of its own, so what it publishes is
+// the tree the owner is at NOW, not the one the declined attempt saw.
+//
+// Revert-red: remove RequestBase's bypass of the once-per-daemon `scheduled`
+// memo (make it call Schedule) and the second publication never happens,
+// because the startup Schedule already filed this prefix.
+func TestTheFirstDependentGetsTheCommittedBaseThePublisherDeferred(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	root := f.gitRepo("deferred")
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+
+	publisher := startupPublisher(t, f)
+	publisher.Schedule(registered.Prefix)
+	publisher.BeginDraining()
+	require.NoError(t, publisher.Wait(ctx))
+	outcomes := publisher.Outcomes()
+	require.Len(t, outcomes, 1)
+	require.Equal(t, "no dependent checkout", outcomes[0].Skipped)
+
+	// The owner moves on while no base exists, so the tree the declined
+	// attempt would have published is not the tree the demand must publish.
+	writeFile(t, filepath.Join(root, "after.go"), "package a\n\nfunc After() {}\n")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-q", "-m", "after the declined publication")
+
+	allocateDependentCheckout(t, f, registered.FamilyID, "deferred-dependent")
+
+	require.True(t, publisher.RequestBase(registered.Prefix),
+		"the publisher refused a consumer's demand")
+	require.NoError(t, publisher.Wait(ctx))
+	outcomes = publisher.Outcomes()
+	require.Len(t, outcomes, 2, "the demand was swallowed by the startup schedule memo")
+	demanded := outcomes[1]
+	require.NoError(t, demanded.Err)
+	require.Empty(t, demanded.Skipped)
+	require.True(t, demanded.Demanded, "the outcome does not say a consumer asked for it")
+	require.Positive(t, demanded.GenerationID)
+
+	checkout := f.checkoutOf(registered.Prefix)
+	require.Equal(t, checkout.HeadTree, demanded.TreeOID,
+		"the demand published a stale tree instead of the owner's current one")
+	require.Equal(t, demanded.GenerationID, f.familyOf(registered.Prefix).ActiveGenerationID)
+}
+
+// TestRequestBaseCoalescesOntoAQueuedRequest pins the throttle the coordinator
+// side relies on: a consumer polling every fifteen seconds must cost one queue
+// lookup, not one publication per poll.
+func TestRequestBaseCoalescesOntoAQueuedRequest(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	root := f.gitRepoWithDependent("coalesced")
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+
+	publisher := startupPublisher(t, f)
+	// Nothing is draining yet, so every request stays queued and the
+	// coalescing is observable as a queue depth rather than as an outcome.
+	for i := 0; i < 5; i++ {
+		require.True(t, publisher.RequestBase(registered.Prefix))
+	}
+	require.Equal(t, 1, publisher.Pending(), "five demands queued more than one publication")
+
+	publisher.BeginDraining()
+	require.NoError(t, publisher.Wait(ctx))
+	outcomes := publisher.Outcomes()
+	require.Len(t, outcomes, 1)
+	require.True(t, outcomes[0].Demanded)
+	require.Empty(t, outcomes[0].Skipped)
+	require.Positive(t, outcomes[0].GenerationID)
+	require.Len(t, dedicatedGenerations(t, f, GraphIDFor(registered.Prefix)), 1)
+}
+
 // TestInitialDedicatedBaseAuthorityTokenIsStableAndOwnerScoped pins the token
 // derivation the zero-write warm restart depends on.
 func TestInitialDedicatedBaseAuthorityTokenIsStableAndOwnerScoped(t *testing.T) {
@@ -710,7 +926,7 @@ func TestInitialBasePublisherObservationCarriesTheFrozenIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	root := f.gitRepo("frozen")
+	root := f.gitRepoWithDependent("frozen")
 	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 	require.NoError(t, err)
 	publisher := startupPublisher(t, f)

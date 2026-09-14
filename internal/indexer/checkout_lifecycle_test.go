@@ -451,6 +451,109 @@ func (f *lifecycleFixture) gitRepo(name string) string {
 	return root
 }
 
+// TestADependentCoordinatorAsksTheDaemonForTheCommittedBase is the wiring
+// proof for the on-demand half of the committed-base consumer gate.
+//
+// The primitive works in isolation (TestAnUnpublishedPrimaryAsksTheFamilyForItsCommittedBase
+// drives primaryBase with a stub, TestTheFirstDependentGetsTheCommittedBaseThePublisherDeferred
+// drives RequestBase directly). Neither would catch the state this item's
+// change would otherwise be in: a gate that defers the publication and a
+// coordinator whose RequestBase was never wired, which is a base that is never
+// published at all.
+//
+// So this drives the whole production chain, with nothing stubbed:
+//
+//	InitialBasePublisher.publish declines the owner-only family
+//	  -> a worktree appears on the running daemon
+//	  -> CheckoutLifecycle.Sweep -> applyCoordinators -> ensureCoordinator
+//	  -> buildCoordinator wires RequestBase
+//	  -> the coordinator's cycle -> primaryBase -> demandCommittedBase
+//	  -> CheckoutLifecycle.requestDedicatedBase -> the advance registry
+//	  -> InitialBasePublisher.RequestBase -> publish -> adoption
+//
+// It asserts on the outcome rather than on a count, because the coordinator
+// runs on its own loop: what has to be true is that the base the daemon
+// deferred gets published, that the publication says a CONSUMER asked for it,
+// and that it is adopted.
+func TestADependentCoordinatorAsksTheDaemonForTheCommittedBase(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	root := f.gitRepo("coordinator-demand")
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NotEmpty(t, registered.Prefix)
+
+	publisher := startupPublisher(t, f)
+	publisher.Schedule(registered.Prefix)
+	publisher.BeginDraining()
+	require.NoError(t, publisher.Wait(ctx))
+	outcomes := publisher.Outcomes()
+	require.Len(t, outcomes, 1)
+	require.Equal(t, "no dependent checkout", outcomes[0].Skipped,
+		"the premise: the daemon start deferred this family's committed base")
+	require.Zero(t, f.familyOf(registered.Prefix).ActiveGenerationID)
+
+	// The first sweep marks the startup inventory, so the worktree added after
+	// it is a runtime discovery and is served eagerly rather than left dormant.
+	_, err = f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	f.worktreeOf(root, "coordinator-demand-dependent")
+	report, err := f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	require.Positive(t, report.Coordinators,
+		"the runtime-added worktree got no coordinator, so nothing could ask")
+
+	deadline := time.Now().Add(90 * time.Second)
+	var demanded InitialBasePublication
+	for {
+		for _, outcome := range publisher.Outcomes() {
+			if outcome.Demanded {
+				demanded = outcome
+			}
+		}
+		if demanded.RepoPrefix != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no dependent ever asked for the deferred committed base; outcomes=%+v",
+				publisher.Outcomes())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.NoError(t, demanded.Err)
+	require.Empty(t, demanded.Skipped, "the demanded publication was declined")
+	require.Positive(t, demanded.GenerationID)
+	require.Equal(t, registered.Prefix, demanded.RepoPrefix)
+	require.Equal(t, demanded.GenerationID, f.familyOf(registered.Prefix).ActiveGenerationID,
+		"the on-demand publication was not adopted")
+}
+
+// gitRepoWithDependent is gitRepo plus one linked worktree, so the family the
+// registration creates has a CONSUMER for its committed base.
+//
+// It exists because publication is gated on a reader. A committed base is only
+// ever read by a dependent checkout or a ref view — the owner's own route stays
+// on generation 0 — so InitialBasePublisher.publish declines an owner-only
+// family with "no dependent checkout" (see dedicatedBaseConsumers). A fixture
+// that wants a published base therefore has to be a family that has somewhere
+// to publish one TO, and the cheapest such family is the one the product sees
+// most: a primary plus a linked worktree.
+//
+// The worktree is added BEFORE the caller registers the repository, because the
+// checkout rows are allocated by the family reconciliation Register runs
+// (reconcileFamilyNow), and a worktree created afterwards is not in that
+// family's census until the next sweep.
+func (f *lifecycleFixture) gitRepoWithDependent(name string) string {
+	f.t.Helper()
+	root := f.gitRepo(name)
+	f.worktreeOf(root, name+"-dependent")
+	return root
+}
+
 // worktreeOf adds a linked worktree of an existing repository.
 func (f *lifecycleFixture) worktreeOf(main, name string) string {
 	f.t.Helper()

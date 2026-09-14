@@ -75,6 +75,33 @@ func startupPublicationRepo(t *testing.T, base, name string) string {
 	return root
 }
 
+// startupPublicationConsumer adds a linked worktree to a repository, so the
+// family the daemon registers has a CONSUMER for its committed base.
+//
+// A committed base is published only where something can read one. The owning
+// repository's own request route stays on legacy generation 0, so an
+// owner-only family is declined by InitialBasePublisher.publish's "no
+// dependent checkout" skip and nothing is built. Every test here that asserts
+// a base WAS published therefore has to name the reader it was published for;
+// TestDaemonWarmupPublishesNothingWithoutAConsumer is the deliberately
+// owner-only case.
+//
+// The worktree is added before the daemon registers the repository, because the
+// checkout rows are allocated by the family reconciliation Register runs.
+func startupPublicationConsumer(t *testing.T, base, root, name string) string {
+	t.Helper()
+	path := filepath.Join(base, name)
+	cmd := exec.Command("git", "worktree", "add", "-q", "-b", name, path)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add %s: %v: %s", path, err, out)
+	}
+	return path
+}
+
 // waitForScheduledPublications joins the queue on a budget of its own rather
 // than on the test's whole context. A publication that is never released — a
 // warmup that forgot to call BeginDraining — must surface as a fast, named
@@ -106,6 +133,8 @@ func waitForScheduledPublications(t *testing.T, parent context.Context, state *d
 func TestDaemonWarmupPublishesTheInitialCommittedBase(t *testing.T) {
 	base := startupPublicationEnv(t)
 	root := startupPublicationRepo(t, base, "tracked")
+	// The reader the base is published FOR; without it the family is declined.
+	startupPublicationConsumer(t, base, root, "tracked-dependent")
 
 	state, err := buildDaemonState(zap.NewNop())
 	if err != nil {
@@ -192,6 +221,98 @@ func TestDaemonWarmupPublishesTheInitialCommittedBase(t *testing.T) {
 		t.Fatalf("read the owner's route: %v", err)
 	} else if routed {
 		t.Fatal("publication installed a route for the dedicated owner; that is W4.5, not W4.2")
+	}
+}
+
+// TestDaemonWarmupPublishesNothingWithoutAConsumer is the production-entrypoint
+// trace for the committed-base consumer gate, and for the cold-index regression
+// it removes.
+//
+// The measured shape is this one: a single tracked repository, one checkout,
+// zero routes. The warmup dispatch still schedules the repository — the
+// scheduling is what makes the deferral observable and what a later consumer's
+// demand is measured against — but the publication is declined, so the daemon
+// does NOT pay for a second whole-repository index. On the 1,500-file phase
+// that one decision is +847 MB of logical writes and a store of 61 -> 122 MB.
+//
+// A unit test of publish's skip would not catch a daemon that reached the
+// publisher through some other door; this asserts on the state the real warmup
+// leaves the catalog in.
+//
+// Revert-red: delete the "no dependent checkout" skip from
+// InitialBasePublisher.publish and this test fails on all three assertions.
+func TestDaemonWarmupPublishesNothingWithoutAConsumer(t *testing.T) {
+	base := startupPublicationEnv(t)
+	// No worktree: one checkout, no ref view, nothing that can read a base.
+	root := startupPublicationRepo(t, base, "owner-only")
+
+	state, err := buildDaemonState(zap.NewNop())
+	if err != nil {
+		t.Fatalf("buildDaemonState: %v", err)
+	}
+	t.Cleanup(func() {
+		if state.shared != nil {
+			_ = state.shared.Close()
+		}
+	})
+	if state.basePublisher == nil {
+		t.Fatal("the daemon built no committed-base publisher; the gate would be untested")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	registered, err := state.lifecycle.Register(ctx, config.RepoEntry{Path: root}, indexer.TrackSourceCLI)
+	if err != nil {
+		t.Fatalf("register the repository: %v", err)
+	}
+	if err := state.lifecycle.Seed(ctx); err != nil {
+		t.Fatalf("seed the checkout catalog: %v", err)
+	}
+
+	mw, _ := warmupDaemonState(state, zap.NewNop(), func() {})
+	if mw != nil {
+		t.Cleanup(func() { _ = mw.Stop() })
+	}
+	if err := waitForScheduledPublications(t, ctx, state); err != nil {
+		t.Fatalf("wait for the scheduled publications: %v", err)
+	}
+
+	var attempted indexer.InitialBasePublication
+	for _, outcome := range state.basePublisher.Outcomes() {
+		if outcome.RepoPrefix == registered.Prefix {
+			attempted = outcome
+		}
+	}
+	if attempted.RepoPrefix == "" {
+		t.Fatalf("warmup never reached the publisher for %s, so the deferral is vacuous: outcomes=%+v",
+			registered.Prefix, state.basePublisher.Outcomes())
+	}
+	if attempted.Err != nil {
+		t.Fatalf("the declined publication reported an error: %v", attempted.Err)
+	}
+	if attempted.Skipped != "no dependent checkout" {
+		t.Fatalf("an owner-only family was not declined: %+v", attempted)
+	}
+
+	store, ok := state.graph.(*store_sqlite.Store)
+	if !ok {
+		t.Fatal("the daemon's backend is not the sqlite store")
+	}
+	graph, found, err := store.Catalog().GetDedicatedGraph(ctx, indexer.GraphIDFor(registered.Prefix))
+	if err != nil || !found {
+		t.Fatalf("read the dedicated graph: found=%v err=%v", found, err)
+	}
+	if graph.ActiveGenerationID != 0 {
+		t.Fatalf("an owner-only family adopted committed generation %d", graph.ActiveGenerationID)
+	}
+	rows, err := store.Catalog().ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{})
+	if err != nil {
+		t.Fatalf("list the view generations: %v", err)
+	}
+	for _, row := range rows {
+		if row.GraphID == graph.GraphID && row.GenerationKind == "dedicated" {
+			t.Fatalf("an owner-only family allocated a committed generation: %+v", row)
+		}
 	}
 }
 

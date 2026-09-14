@@ -58,6 +58,24 @@ type committedBaseFixture struct {
 // cannot disagree about what the base is.
 func newCommittedBaseFixture(t *testing.T) *committedBaseFixture {
 	t.Helper()
+	f := newUnpublishedCommittedBaseFixture(t)
+	f.publishBase(t)
+	return f
+}
+
+// newUnpublishedCommittedBaseFixture is newCommittedBaseFixture before its
+// first publication: the authority is claimed and the publisher is wired, but
+// the family's primary graph has published nothing, so every dependent is in
+// the LEGACY regime graphBase's second arm serves.
+//
+// It is the state a family is now in for as long as nothing reads a committed
+// base — the publication is deferred until a consumer exists — so the
+// transition out of it (the first published base landing under a dependent
+// that is already routed over generation 0) is a state the product reaches and
+// has to be pinned. See
+// TestADependentOnGenerationZeroRecomposesOntoTheFirstPublishedBase.
+func newUnpublishedCommittedBaseFixture(t *testing.T) *committedBaseFixture {
+	t.Helper()
 	f := newCoordinatorFixture(t)
 	ctx := context.Background()
 	authority, err := f.catalog.AcquireDedicatedBaseAuthority(ctx, store_sqlite.AcquireDedicatedBaseAuthorityRequest{
@@ -82,7 +100,6 @@ func newCommittedBaseFixture(t *testing.T) *committedBaseFixture {
 		},
 		clock: 1,
 	}
-	out.publishBase(t)
 	return out
 }
 

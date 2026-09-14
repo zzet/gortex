@@ -87,6 +87,27 @@ func dedicatedBaseAdvanceTriggerFor(mi *MultiIndexer) *DedicatedBaseAdvanceTrigg
 	return trigger
 }
 
+// owner is the publisher this trigger shares its queue with, or nil when there
+// is none to reach.
+//
+// It exists so a non-watcher caller can reach the publisher through the same
+// registry the watcher does. The committed-base consumer gate needs exactly
+// that: a dependent checkout's coordinator notices there is no published base,
+// and the lifecycle that built the coordinator has the *MultiIndexer the
+// registry is keyed on but no handle on the publisher, which is constructed by
+// the daemon over that same lifecycle. Going through the registry means a
+// demand reaches the ONE pending list every other door uses, so the invariant
+// that one committed-base build runs at a time holds for it too.
+//
+// It is nil-safe on the receiver on purpose: dedicatedBaseAdvanceTriggerFor
+// returns nil for a stack with no publisher, and the caller chains the two.
+func (t *DedicatedBaseAdvanceTrigger) owner() *InitialBasePublisher {
+	if t == nil {
+		return nil
+	}
+	return t.publisher
+}
+
 // live reports whether this trigger can still publish.
 func (t *DedicatedBaseAdvanceTrigger) live() bool {
 	if t == nil || t.publisher == nil || t.publisher.ctx == nil {
@@ -217,6 +238,21 @@ func (t *DedicatedBaseAdvanceTrigger) close() {
 // It never blocks and it never publishes on the caller's goroutine: the caller
 // is the Git watcher's reconcile goroutine, and the work behind this call is a
 // bounded index of a committed tree.
+//
+// WHETHER THE ADVANCE PUBLISHES ANYTHING IS NOT DECIDED HERE. A family with no
+// dependent checkout and no ref view has nothing that can read a committed
+// base, and publish's "no dependent checkout" skip declines it — so a HEAD
+// movement on such a family allocates no generation and performs zero catalog
+// DML, and the next consumer's demand publishes the tree that is current THEN
+// rather than this one. The census is deliberately read inside publish and not
+// here: it is three indexed catalog reads, this is the watcher's reconcile
+// goroutine, and a census taken here would be a second, staler answer racing
+// the one the publication is actually fenced by. A declined advance leaves no
+// accepted-commit memo, so the next observation re-enters the same attempt.
+//
+// The cohort invalidation in step 1 runs REGARDLESS, and must: it is what the
+// observation means, not a consequence of what the publisher does with it, and
+// it writes nothing.
 func (t *DedicatedBaseAdvanceTrigger) HeadChanged(repoPrefix, root, commitOID string) {
 	if t == nil || repoPrefix == "" || commitOID == "" {
 		return

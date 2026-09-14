@@ -2101,6 +2101,96 @@ func (f *coordinatorFixture) movePrimaryHead(t *testing.T, tree string) {
 	}
 }
 
+// TestAnUnpublishedPrimaryAsksTheFamilyForItsCommittedBase is the on-demand
+// half of the committed-base consumer gate, at the site that first notices the
+// absence.
+//
+// The startup publisher and the live advance trigger both decline to publish a
+// committed base for a family with no reader. This coordinator IS that reader
+// — it exists only for a ready automatic checkout — so when graphBase's second
+// arm answers (no published generation; the base is the owner's recorded tree)
+// the publication has to be asked for here or it never happens at all.
+//
+// The throttle is asserted with it, because the ask sits on a path the 15 s
+// poll takes: settledWithoutBuild reads primaryBase on every no-op cycle, and
+// a demand per poll would re-enter the whole publication protocol — authority
+// claim included, which writes — four times a minute.
+//
+// Revert-red: delete the demandCommittedBase call from primaryBase and the
+// first assertion fails; delete the throttle and the second one does.
+func TestAnUnpublishedPrimaryAsksTheFamilyForItsCommittedBase(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var asked []string
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{
+		RequestBase: func(prefix string) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked = append(asked, prefix)
+		},
+	})
+
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("read the primary base: %v", err)
+	}
+	if base.generationID != 0 {
+		t.Fatalf("the fixture's premise is an unpublished primary; it has generation %d", base.generationID)
+	}
+	mu.Lock()
+	first := slices.Clone(asked)
+	mu.Unlock()
+	if len(first) != 1 || first[0] != builderRepoPrefix {
+		t.Fatalf("an unpublished primary asked for %v, want exactly [%s]", first, builderRepoPrefix)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, err := c.primaryBase(ctx); err != nil {
+			t.Fatalf("re-read the primary base: %v", err)
+		}
+	}
+	mu.Lock()
+	repeated := slices.Clone(asked)
+	mu.Unlock()
+	if len(repeated) != 1 {
+		t.Fatalf("five reads inside the throttle window asked %d times, want 1: %v", len(repeated), repeated)
+	}
+}
+
+// TestAPublishedPrimaryAsksForNothing is the gate's other side at this site. A
+// family that already has a committed base has nothing to demand, and a
+// coordinator that asked anyway would re-enter the publication protocol on
+// every poll of every dependent for the life of the daemon.
+func TestAPublishedPrimaryAsksForNothing(t *testing.T) {
+	f := newCommittedBaseFixture(t)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	asks := 0
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{
+		RequestBase: func(string) {
+			mu.Lock()
+			defer mu.Unlock()
+			asks++
+		},
+	})
+
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("read the primary base: %v", err)
+	}
+	if base.generationID == 0 {
+		t.Fatal("the fixture's premise is a published primary; it has none")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if asks != 0 {
+		t.Fatalf("a published primary was asked for a committed base %d times", asks)
+	}
+}
+
 // TestCoordinatorRefusesACommitLayerOverAMovedBase is the base half of the
 // guard TestCoordinatorRefusesAWorkingTreeLayerOverAStaleHead makes for the
 // checkout's own HEAD.

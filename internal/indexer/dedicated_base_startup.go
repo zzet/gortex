@@ -74,6 +74,12 @@ type InitialBasePublication struct {
 	// Live marks an outcome the git watcher's HEAD-change finalize path asked
 	// for, as opposed to one this daemon start scheduled.
 	Live bool
+	// Demanded marks an outcome a CONSUMER asked for: a dependent checkout
+	// whose coordinator found no published base to compose over. It is the
+	// on-demand half of the consumer gate — a daemon start and a HEAD movement
+	// both decline to publish for a family with no reader, so the first reader
+	// is what asks.
+	Demanded bool
 	// TreeOID is the committed tree the publication was FOR. It is reported
 	// because a live advance resolves its own target from Git rather than
 	// from the checkout row, so "which tree did this publish" is not
@@ -114,6 +120,12 @@ type basePublishRequest struct {
 	target dedicatedBaseTarget
 	root   string
 	live   bool
+	// demand marks a request one CONSUMER asked for (RequestBase). It is
+	// admitted exactly like a startup request — the target is the owner
+	// checkout row's own head — and it exists as a separate flag so the
+	// outcome can say which door asked, and so a consumer's request is not
+	// silenced by the once-per-daemon Schedule memo.
+	demand bool
 	// done, when set, is called with the outcome after the worker records it.
 	// It runs off the publisher's lock.
 	done func(InitialBasePublication)
@@ -294,6 +306,60 @@ func (p *InitialBasePublisher) Schedule(repoPrefix string) {
 	p.enqueueLocked(basePublishRequest{prefix: repoPrefix})
 	p.mu.Unlock()
 	p.nudge()
+}
+
+// RequestBase asks for one repository's committed base because a CONSUMER
+// needs it now.
+//
+// It is the on-demand door the consumer gate makes necessary. publish declines
+// a family with no reader ("no dependent checkout"), so the publication a
+// dependent needs is not already queued and not already done; the first
+// dependent that notices the absence — CheckoutCoordinator.primaryBase's
+// unpublished arm — asks here.
+//
+// Three things separate it from Schedule.
+//
+//   - It does NOT consult the once-per-daemon `scheduled` memo. That memo
+//     exists so an idle restart does not re-observe every repository on every
+//     warmup signal; a repository whose startup publication was DECLINED for
+//     want of a reader has to be publishable again the moment one appears, and
+//     a demand that the memo swallowed would defer the base forever.
+//   - It coalesces on the pending slot instead. A request already queued for
+//     this prefix — startup, live or demand — will publish the current tree,
+//     which is what the caller wants, so a second one would only re-enter the
+//     same protocol. A caller polling every 15 s therefore costs one queue
+//     lookup, not one publication.
+//   - It is admitted by the worker on the same terms as a startup request: a
+//     demand that arrives before BeginDraining waits for the readiness flip.
+//     "Ready, then publish" is an ordering property of the code and a consumer
+//     asking early must not be the hole in it.
+//
+// It never publishes on the caller's goroutine and never blocks; it reports
+// whether the request is now queued (or already was). A stopped publisher
+// accepts nothing.
+func (p *InitialBasePublisher) RequestBase(repoPrefix string) bool {
+	if p == nil || repoPrefix == "" {
+		return false
+	}
+	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return false
+	}
+	if _, queued := p.pendingReq[repoPrefix]; queued {
+		p.mu.Unlock()
+		return true
+	}
+	p.enqueueLocked(basePublishRequest{prefix: repoPrefix, demand: true})
+	p.mu.Unlock()
+	// Start the worker for the same reason enqueueAdvance does: a demand can
+	// arrive on a daemon whose warmup has already released the queue, and the
+	// worker is started once per publisher. popLocked still withholds this
+	// request until BeginDraining has run, so starting the goroutine early
+	// costs one parked goroutine and changes no ordering.
+	p.worker.Do(func() { go p.run() })
+	p.nudge()
+	return true
 }
 
 // enqueueAdvance queues one live committed-base advance, coalescing a burst to
@@ -618,7 +684,7 @@ func (p *InitialBasePublisher) publish(ctx context.Context, req basePublishReque
 		viewmetrics.Count(viewmetrics.DedicatedBasePublicationTotal, publicationOutcome(out))
 	}()
 	repoPrefix := req.prefix
-	out = InitialBasePublication{RepoPrefix: repoPrefix, Live: req.live}
+	out = InitialBasePublication{RepoPrefix: repoPrefix, Live: req.live, Demanded: req.demand}
 	if err := ctx.Err(); err != nil {
 		out.Skipped = "publisher stopped"
 		return out
@@ -668,6 +734,46 @@ func (p *InitialBasePublisher) publish(ctx context.Context, req basePublishReque
 		// named a HEAD tree is not an error; the next start, or the live
 		// advancement trigger, publishes it.
 		out.Skipped = "owner has no committed tree"
+		return out
+	}
+	// The fourth skip: nothing can read this base yet.
+	//
+	// Publication is NOT activation (this file's header). The owning
+	// repository's own request route stays on legacy generation 0, so a
+	// committed base has exactly one purpose — to give a DEPENDENT checkout or
+	// a REF VIEW an immutable lower snapshot to key a layer on. A family with
+	// neither is a reader set of size zero, and publishing for it costs a
+	// second full index of the committed tree: measured at +847 MB of logical
+	// writes and a store of 61 -> 122 MB on the 1,500-file cold-index phase,
+	// for a base no route names.
+	//
+	// This is DEFER, not drop, and the deferral is recoverable by exactly the
+	// mechanisms the three skips above already rely on:
+	//
+	//   - the first dependent asks for it (CheckoutCoordinator.primaryBase ->
+	//     CheckoutLifecycle.requestDedicatedBase -> RequestBase), which is the
+	//     moment the absence first matters to anyone;
+	//   - the live advance trigger re-enters on the next HEAD movement, and by
+	//     then the census is re-read, so a consumer that appeared meanwhile
+	//     gets the CURRENT tree rather than the one this attempt declined;
+	//   - the next daemon start schedules the repository again.
+	//
+	// Until one of those lands, a dependent composes over generation 0 — the
+	// legacy regime graphBase's second arm serves and recomposeOverAdvancedBase
+	// keeps coherent — which is exactly where every dependent was before a
+	// committed base existed at all.
+	//
+	// The gate sits HERE, after the committed-tree check and before the
+	// authority block below, because everything above it is a read and
+	// AcquireDedicatedBaseAuthority is the first thing on this path that can
+	// write. A declined publication therefore performs zero catalog DML.
+	consumers, err := l.dedicatedBaseConsumers(ctx, graph)
+	if err != nil {
+		out.Err = err
+		return out
+	}
+	if !consumers {
+		out.Skipped = "no dependent checkout"
 		return out
 	}
 	owner := store_sqlite.DedicatedBaseOwner{CheckoutID: checkout.CheckoutID, Incarnation: checkout.Incarnation}

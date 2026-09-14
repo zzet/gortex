@@ -57,6 +57,11 @@ func advanceGit(t *testing.T, root string, args ...string) string {
 func TestDaemonLiveHeadChangeAdvancesTheCommittedBase(t *testing.T) {
 	base := startupPublicationEnv(t)
 	root := startupPublicationRepo(t, base, "live")
+	// A committed base is published only where something can read one, so the
+	// family this daemon tracks carries a dependent worktree. Without it the
+	// initial publication is declined ("no dependent checkout") and there is no
+	// base for a live HEAD change to advance.
+	startupPublicationConsumer(t, base, root, "live-dependent")
 
 	state, err := buildDaemonState(zap.NewNop())
 	if err != nil {

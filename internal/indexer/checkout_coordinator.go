@@ -257,6 +257,17 @@ type CheckoutCoordinatorConfig struct {
 	// every cycle at once, which is what a coordinator outside a warmup has.
 	Gate *ViewBuildGate
 
+	// RequestBase asks the committed-base publisher for the primary's base.
+	//
+	// It is called with the PRIMARY's repo prefix from primaryBase's
+	// unpublished arm, and it is how the committed-base consumer gate stays
+	// deferral rather than refusal: a daemon start and a HEAD movement both
+	// decline to publish a base for a family with no reader, so the first
+	// reader asks. The lifecycle supplies it (buildCoordinator); nil means
+	// nothing is asked and the checkout stays in the legacy regime, which is a
+	// correct place for it to be.
+	RequestBase func(repoPrefix string)
+
 	// Debounce is the quiet window; <= 0 takes defaultCheckoutQuietWindow.
 	Debounce time.Duration
 	// PollInterval is how often the coordinator signals itself; < 0 disables
@@ -361,6 +372,19 @@ type CheckoutCoordinator struct {
 	leases  *graphview.LeaseManager
 	logger  *zap.Logger
 	gate    *ViewBuildGate
+
+	// requestBase is CheckoutCoordinatorConfig.RequestBase; nil asks nothing.
+	requestBase func(string)
+	// baseDemandMu guards the throttle below. It is its own lock because
+	// primaryBase is reached from the poll's no-op path, from a build and from
+	// the moved-base guard, and none of those holds the cycle lock in common.
+	baseDemandMu sync.Mutex
+	// lastBaseDemand is when this coordinator last asked for the family's
+	// committed base. The ask is throttled rather than made once: a
+	// publication that FAILS must be re-enterable — the catalog's failed-claim
+	// recovery is built for exactly that — while a 15 s poll over a family
+	// whose publication keeps failing must not re-enter it every 15 s.
+	lastBaseDemand time.Time
 
 	quiet           time.Duration
 	poll            time.Duration
@@ -659,6 +683,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		leases:          cfg.Leases,
 		logger:          logger,
 		gate:            cfg.Gate,
+		requestBase:     cfg.RequestBase,
 		quiet:           cfg.Debounce,
 		poll:            cfg.PollInterval,
 		retain:          cfg.Retain,
@@ -1714,7 +1739,57 @@ func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, err
 	if primary == nil {
 		return primaryBase{}, fmt.Errorf("indexer: family %s has no primary dedicated graph", c.familyID)
 	}
-	return graphBase(ctx, c.catalog, *primary)
+	base, err := graphBase(ctx, c.catalog, *primary)
+	if err == nil && base.generationID == 0 {
+		// graphBase's SECOND arm: the primary has published no generation and
+		// the base is its owner checkout's recorded committed tree.
+		//
+		// This is the one place in the daemon where the absence of a committed
+		// base is noticed by something that would read one. The startup
+		// publisher and the live advance trigger both decline to publish for a
+		// family with no reader (InitialBasePublisher.publish's "no dependent
+		// checkout" skip) — and this coordinator IS that reader: it exists
+		// only for a ready automatic checkout, which is precisely what
+		// dedicatedBaseConsumers counts. So the ask belongs here, at the first
+		// moment the absence matters to anyone.
+		//
+		// Asking changes nothing about THIS cycle. The publication is queued
+		// on the publisher's own list and built off this goroutine; the cycle
+		// carries on over generation 0 in the legacy regime, and when the base
+		// lands the family fan-out (CheckoutLifecycle's base-advance signal)
+		// wakes this coordinator to recompose onto it — bounded, off-route and
+		// installed in one compare-and-set (recomposeOverAdvancedBase).
+		c.demandCommittedBase()
+	}
+	return base, err
+}
+
+// dedicatedBaseDemandInterval bounds how often one coordinator re-asks for its
+// family's committed base. See CheckoutCoordinator.lastBaseDemand.
+const dedicatedBaseDemandInterval = time.Minute
+
+// demandCommittedBase asks the publisher for the family primary's committed
+// base, at most once per dedicatedBaseDemandInterval.
+//
+// The throttle is not a de-duplicator — RequestBase already coalesces onto a
+// queued request, so a burst costs one queue lookup each. It bounds the case
+// the coalescing cannot: a publication that was ATTEMPTED and failed leaves
+// nothing queued, and a 15 s poll would otherwise re-enter the whole protocol
+// (including the authority claim, which writes) four times a minute for as
+// long as the failure lasts.
+func (c *CheckoutCoordinator) demandCommittedBase() {
+	if c == nil || c.requestBase == nil || c.repoPrefix == "" {
+		return
+	}
+	now := time.Now()
+	c.baseDemandMu.Lock()
+	if !c.lastBaseDemand.IsZero() && now.Sub(c.lastBaseDemand) < dedicatedBaseDemandInterval {
+		c.baseDemandMu.Unlock()
+		return
+	}
+	c.lastBaseDemand = now
+	c.baseDemandMu.Unlock()
+	c.requestBase(c.repoPrefix)
 }
 
 // graphBase resolves the corpus state a layer over one dedicated graph sits

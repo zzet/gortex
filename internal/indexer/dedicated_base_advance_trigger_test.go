@@ -24,6 +24,13 @@ import (
 // refuses a late installation), the repository is tracked, the initial base is
 // published, and only then is the watcher built over the same Indexer the
 // MultiWatcher would hand it.
+//
+// The repository carries a linked worktree (gitRepoWithDependent) because a
+// committed base is published only where something can read one: the owner's
+// own route stays on generation 0, so an owner-only family is declined with
+// "no dependent checkout". A fixture about ADVANCEMENT has to be a family that
+// publishes at all — TestAHeadMoveWithoutAConsumerPublishesNothing is the
+// deliberately owner-only case.
 type advanceFixture struct {
 	*lifecycleFixture
 	root      string
@@ -43,7 +50,7 @@ func newAdvanceFixture(t *testing.T, name string) *advanceFixture {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	root := f.gitRepo(name)
+	root := f.gitRepoWithDependent(name)
 	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NotEmpty(t, registered.Prefix)
@@ -140,6 +147,118 @@ func (f *advanceFixture) generations(t *testing.T) []store_sqlite.ViewGeneration
 func (f *advanceFixture) activeGeneration(t *testing.T) int64 {
 	t.Helper()
 	return f.familyOf(f.prefix).ActiveGenerationID
+}
+
+// newOwnerOnlyAdvanceFixture is newAdvanceFixture for a family that has NO
+// consumer: one checkout, no worktree, no ref view, and therefore no published
+// base to advance.
+//
+// It is not a degenerate variant. It is the shape the cold-index measurement
+// found in the field — `checkouts: 1, checkout_routes: 0` — and the one the
+// consumer gate exists for, so the tests that assert a HEAD movement costs
+// nothing need it assembled exactly like the publishing fixture except for the
+// worktree.
+func newOwnerOnlyAdvanceFixture(t *testing.T, name string) *advanceFixture {
+	t.Helper()
+	f := newLifecycleFixture(t)
+	t.Cleanup(f.close)
+	installStartupPublisherRuntime(t, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	root := f.gitRepo(name)
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NotEmpty(t, registered.Prefix)
+
+	publisher := startupPublisher(t, f)
+	initial := publisher.PublishRepo(ctx, registered.Prefix)
+	require.NoError(t, initial.Err)
+	require.Equal(t, "no dependent checkout", initial.Skipped,
+		"the premise: an owner-only family publishes nothing")
+
+	out := &advanceFixture{
+		lifecycleFixture: f,
+		root:             root,
+		prefix:           registered.Prefix,
+		graphID:          GraphIDFor(registered.Prefix),
+		publisher:        publisher,
+		trigger:          publisher.AdvanceTrigger(),
+	}
+	require.NotNil(t, out.trigger)
+	out.watcher = out.newWatcher(t)
+	return out
+}
+
+// TestAHeadMoveWithoutAConsumerPublishesNothing is the live half of the
+// consumer gate, and the reason a ten-file commit on a repository nobody
+// depends on stopped costing a 209-file delta.
+//
+// The dispatch still runs — the cohort invalidation is what the observation
+// MEANS and writes nothing — but the publication it queues is declined by the
+// census, so the movement allocates no generation, moves no pointer and
+// performs ZERO catalog DML. A declined advance leaves no accepted-commit memo
+// either, which is what makes the next observation re-enter the attempt.
+//
+// Revert-red: delete the "no dependent checkout" skip and this test fails on
+// the write audit, on the generation count and on the advance's own Skipped.
+func TestAHeadMoveWithoutAConsumerPublishesNothing(t *testing.T) {
+	f := newOwnerOnlyAdvanceFixture(t, "live-no-consumer")
+	ctx := context.Background()
+
+	sha := f.commit(t, "moved.go", "package a\n\nfunc Moved() {}\n", "move the head")
+	audit, err := installDedicatedWriteAudit(ctx, f.dbPath)
+	require.NoError(t, err)
+
+	advance := f.dispatchAndWait(t, f.root, sha)
+	require.NoError(t, advance.Err)
+	require.Equal(t, "no dependent checkout", advance.Skipped)
+	require.False(t, advance.Published)
+	require.Zero(t, advance.GenerationID)
+	require.NoError(t, audit(), "a HEAD move with no reader wrote the catalog")
+	require.Empty(t, f.generations(t), "a HEAD move with no reader allocated a generation")
+	require.Zero(t, f.activeGeneration(t))
+}
+
+// TestTheNextConsumerPublishesTheCurrentTreeNotTheDeclinedOne completes the
+// live half's contract. A declined HEAD movement is not a lost one: the census
+// is re-read on the NEXT observation, so the first movement after a dependent
+// appears publishes the tree HEAD names then — never the older tree the
+// declined attempt was for.
+//
+// This is the property that makes the deferral safe to take on the live path
+// at all. If a declined advance had to be replayed, the gate would be trading
+// a write now for the same write later; because the publication is always
+// FOR THE CURRENT TREE, the declined movements cost nothing and are not owed.
+func TestTheNextConsumerPublishesTheCurrentTreeNotTheDeclinedOne(t *testing.T) {
+	f := newOwnerOnlyAdvanceFixture(t, "live-then-consumer")
+
+	declined := f.commit(t, "declined.go", "package a\n\nfunc Declined() {}\n", "nobody is reading")
+	declinedTree := gitTree(t, f.root, declined)
+	require.Equal(t, "no dependent checkout", f.dispatchAndWait(t, f.root, declined).Skipped)
+
+	// The dependent's row, not a swept worktree: a sweep would also start that
+	// checkout's coordinator, whose own demand is a second asynchronous
+	// publication racing the live advance this test is about.
+	allocateDependentCheckout(t, f.lifecycleFixture, f.checkoutOf(f.prefix).FamilyID, "live-then-consumer-dependent")
+
+	current := f.commit(t, "current.go", "package a\n\nfunc Current() {}\n", "now somebody is")
+	currentTree := gitTree(t, f.root, current)
+	require.NotEqual(t, declinedTree, currentTree)
+
+	advance := f.dispatchAndWait(t, f.root, current)
+	require.NoError(t, advance.Err)
+	require.Empty(t, advance.Skipped)
+	require.True(t, advance.Published)
+	require.Positive(t, advance.GenerationID)
+
+	rows := f.generations(t)
+	require.Len(t, rows, 1, "the declined movement was replayed as a second generation")
+	require.Equal(t, currentTree, rows[0].TreeOID,
+		"the first publication after a consumer appeared names the declined tree, not the current one")
+	require.Zero(t, rows[0].BaseGenerationID,
+		"the first committed generation of a graph is a self-contained root")
+	require.Equal(t, rows[0].GenerationID, f.activeGeneration(t))
 }
 
 // gitTree resolves a commit's tree the way the trigger does.
@@ -286,7 +405,7 @@ func TestARealCohortChangeStillRootsANewChain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	root := f.gitRepo("cohort-target")
+	root := f.gitRepoWithDependent("cohort-target")
 	target, err := f.lc.Register(ctx, config.RepoEntry{
 		Path: root, Name: "cohort-target", Workspace: cohortTestWorkspace,
 	}, TrackSourceCLI)

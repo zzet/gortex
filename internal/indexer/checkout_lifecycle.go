@@ -1258,6 +1258,112 @@ func (l *CheckoutLifecycle) familyGraphsFor(
 	return owned, primary, nil
 }
 
+// dedicatedBaseConsumers reports whether anything can read one dedicated
+// graph's committed base yet, and names the census it answered from.
+//
+// A committed base is a full index of a committed tree — the single largest
+// write a warm daemon makes — and the OWNER is not one of its readers. The
+// owning repository's own request route stays on legacy generation 0 (the W4.5
+// limitation stated on dedicated_base_startup.go's header and on this file's
+// base-advance fan-out), so a published base exists for exactly two consumers,
+// both of which key a layer on an immutable lower snapshot:
+//
+//   - a DEPENDENT checkout — a non-owner checkout in the family served from the
+//     family's primary corpus. applyCoordinators gives a coordinator to exactly
+//     those (EffectiveMode == CheckoutModeAutomatic) and withdraws the route of
+//     every other one, and a coordinator's commit layer is what composes over
+//     the base (CheckoutCoordinator.primaryBase -> graphBase);
+//   - a REF VIEW rooted in this graph. RefViewManager.base resolves its lower
+//     snapshot through the same graphBase, so a named view is a reader of the
+//     base whether or not any checkout is.
+//
+// A non-owner checkout that owns a dedicated graph of its own is deliberately
+// NOT a consumer: it is served from its own corpus, and applyCoordinators
+// withdraws any route it still holds. A row in one of the two terminal states
+// is not one either — it is on its way out of the catalog and nothing will
+// route it again.
+//
+// It is a CENSUS OF CATALOG ROWS, not of live coordinators. A worktree the
+// startup inventory left dormant has a durable row and no coordinator
+// (TestDormancyColdFanoutInstallsNoAutomaticCoordinators); it is woken by a
+// selection, and making that selection pay for a whole committed base first is
+// the latency this census exists to keep off the wake-up path.
+func (l *CheckoutLifecycle) dedicatedBaseConsumers(
+	ctx context.Context, graph store_sqlite.DedicatedGraph,
+) (bool, error) {
+	if l == nil || l.catalog == nil {
+		return false, nil
+	}
+	if graph.FamilyID != "" {
+		checkouts, err := l.catalog.ListCheckouts(ctx, graph.FamilyID)
+		if err != nil {
+			return false, err
+		}
+		for i := range checkouts {
+			if dependentCheckout(checkouts[i], graph.OwnerCheckoutID) {
+				return true, nil
+			}
+		}
+	}
+	if graph.GraphID == "" {
+		return false, nil
+	}
+	views, err := l.catalog.ListRefViews(ctx, graph.GraphID)
+	if err != nil {
+		return false, err
+	}
+	return len(views) > 0, nil
+}
+
+// dependentCheckout decides whether one catalog row is a checkout that composes
+// over the family primary's committed base. See dedicatedBaseConsumers.
+func dependentCheckout(checkout store_sqlite.Checkout, ownerCheckoutID string) bool {
+	switch {
+	case checkout.CheckoutID == "" || checkout.CheckoutID == ownerCheckoutID:
+		return false
+	case checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic:
+		return false
+	case checkout.State == store_sqlite.CheckoutStateForgetting,
+		checkout.State == store_sqlite.CheckoutStatePrimaryClosureRetiring:
+		return false
+	}
+	return true
+}
+
+// requestDedicatedBase asks the committed-base publisher for one repository's
+// base because a consumer now needs one.
+//
+// It is the ON-DEMAND half of the consumer gate. The startup publisher and the
+// live advance trigger both refuse to publish for a family with no reader
+// (InitialBasePublisher.publish's "no dependent checkout" skip), so the
+// publication a dependent needs has to be asked for at the moment the dependent
+// first notices there is none — which is CheckoutCoordinator.primaryBase's
+// unpublished arm, wired here through buildCoordinator.
+//
+// It NEVER publishes on the caller's goroutine: RequestBase appends to the
+// publisher's single pending list, so the one committed-base build at a time
+// invariant holds whichever door asked. It reports whether the request was
+// accepted; a daemon with no publisher installed (a non-sqlite backend, a stack
+// with no lifecycle) accepts nothing, and the dependent stays in the legacy
+// regime, which is exactly where it was before.
+func (l *CheckoutLifecycle) requestDedicatedBase(repoPrefix, reason string) bool {
+	if l == nil || repoPrefix == "" {
+		return false
+	}
+	publisher := dedicatedBaseAdvanceTriggerFor(l.mi).owner()
+	if publisher == nil {
+		return false
+	}
+	if !publisher.RequestBase(repoPrefix) {
+		return false
+	}
+	if l.logger != nil {
+		l.logger.Debug("checkout lifecycle: a dependent asked for the family's committed base",
+			zap.String("repo", repoPrefix), zap.String("reason", reason))
+	}
+	return true
+}
+
 // demotableNow re-asks, at confirm time, the question the demote plan was
 // chosen by: is the checkout's own graph still not the family's base, and is a
 // different ready primary still there to serve it from.
@@ -2195,6 +2301,15 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		ConfigSections: dedicatedBaseConfigSections(repoCfg),
 		Logger:         l.logger,
 		Gate:           l.buildGate(),
+		// The on-demand half of the committed-base consumer gate. This
+		// coordinator IS a consumer — it is built for a ready automatic
+		// checkout, which is what dedicatedBaseConsumers counts — so the
+		// moment its primaryBase finds no published base, the family has a
+		// reader and the publication the startup path deferred is owed.
+		RequestBase: func(prefix string) {
+			l.requestDedicatedBase(prefix,
+				"checkout "+checkout.CheckoutID+" composes over an unpublished primary")
+		},
 		// The watcher's own debounce is the quiet window: both coalesce the
 		// same event storms, and a checkout whose watch configuration says how
 		// long to wait means it for its views too.
