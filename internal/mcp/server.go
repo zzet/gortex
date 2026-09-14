@@ -820,9 +820,11 @@ type lastSearchState struct {
 }
 
 // tokenStats tracks estimated token savings for the current session. When a
-// savings.Store is attached, each record() call also increments the persistent
-// cumulative totals so "Gortex saved $X this month"-style narratives survive
-// server restarts.
+// savings.Store is attached, each record() call also books the observation
+// into the persistent cumulative totals so "Gortex saved $X this month"-style
+// narratives survive server restarts. That booking is a buffered enqueue, not
+// a database transaction: a read-only tool call must not pay a durable
+// sidecar commit to record its own accounting (see internal/savings).
 //
 // parent, when non-nil, is the process-wide aggregate (s.tokenStats) that
 // every per-session counter feeds. Without the fan-out, a fresh session's
@@ -966,7 +968,8 @@ func (ts *tokenStats) record(node *graph.Node, tool string, returned, fullFile i
 
 	// Forward to the persistent store outside our lock — its own
 	// synchronization guards concurrent writers, and the ledger write
-	// shouldn't block new record() calls on the hot path.
+	// shouldn't block new record() calls on the hot path. Sidecar-backed
+	// stores buffer here and commit one transaction per flush window.
 	if store != nil {
 		store.AddObservation(savings.Observation{
 			Repo:      repo,
@@ -2674,15 +2677,32 @@ func (s *Server) tokenStatsFor(ctx context.Context) *tokenStats {
 	return s.sessions.get(id).tokenStats
 }
 
-// FlushSavings is kept for shutdown-path compatibility. The sidecar-backed
-// ledger commits every observation as it is recorded, so there is nothing
-// buffered to write.
+// FlushSavings commits any buffered savings observations. The sidecar-backed
+// ledger coalesces observations into one transaction per flush window, so
+// this is the shutdown path's job: the daemon's teardown chain calls it
+// (serverstack registers it as a cleanup step) before the sidecar handle is
+// released, and without it the last window of accounting is lost. Reads of
+// the ledger flush on their own, so no reader needs to call this first.
 func (s *Server) FlushSavings() error {
 	store := s.savingsStore()
 	if store == nil {
 		return nil
 	}
 	return store.Flush()
+}
+
+// SetSavingsFlushBounds narrows (or widens) the ledger's coalescing window
+// for this server. The daemon keeps the package default; the one-shot stdio
+// server — which its host SIGKILLs rather than shuts down — tightens it at
+// its entry point so a killed session loses seconds of accounting, not a
+// whole minute. No-op when persistence isn't wired, and an operator's
+// GORTEX_SAVINGS_FLUSH_INTERVAL is never overridden (see savings.Store).
+func (s *Server) SetSavingsFlushBounds(interval time.Duration, max int) {
+	store := s.savingsStore()
+	if store == nil {
+		return
+	}
+	store.SetFlushBounds(interval, max)
 }
 
 // savingsStore extracts the persistent savings store via tokenStats. Returns

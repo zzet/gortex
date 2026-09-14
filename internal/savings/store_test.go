@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/persistence"
 )
 
 // testLedgerPath returns a fresh sidecar DB path. Each test gets its own
@@ -55,6 +57,12 @@ func TestAddObservation_PerLanguageBucket(t *testing.T) {
 	// Empty language is allowed (e.g. record() called with a nil node);
 	// it should accumulate in the totals but not in any per-language bucket.
 	s.AddObservation(Observation{Repo: "/repo-c", Tool: "smart_context", Returned: 10, Saved: 20})
+	// Observations are buffered per Store, so committing the window is what
+	// makes them visible to a second handle on the same file — exactly what
+	// another process reading the ledger sees.
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	reopened, err := Open(path)
 	if err == nil {
@@ -82,10 +90,12 @@ func TestAddObservation_PerLanguageBucket(t *testing.T) {
 	}
 }
 
-// The headline property of the sidecar-backed ledger: an observation is
-// durable the moment it is recorded. No flush, no ticker, no graceful
-// shutdown required — the failure mode that left the flat-file ledger
-// permanently empty under SIGKILLing MCP clients.
+// The headline property of the sidecar-backed ledger as its readers see it:
+// reading through the store is exact with no flush step in the caller. The
+// ledger file exists from the first observation, and the totals and events a
+// reader gets include everything recorded — buffered or already committed —
+// because every read path flushes first. (Durability against a SIGKILL is
+// bounded by the flush window instead; see the package doc.)
 func TestAddObservation_DurableImmediately(t *testing.T) {
 	path := testLedgerPath(t)
 
@@ -141,6 +151,16 @@ func TestConcurrentWriters_SameLedger(t *testing.T) {
 		}(s, "/repo-"+string(rune('a'+i)))
 	}
 	wg.Wait()
+	// Each Store buffers its own window, so a cross-store read is exact only
+	// after every writer has flushed — the same boundary a second process
+	// reading the ledger sees. Flushing here is the assertion that no
+	// observation is lost across writers, not a workaround: without it the
+	// test would be measuring one store's buffer, not the shared ledger.
+	for _, s := range stores {
+		if err := s.Flush(); err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+	}
 
 	snap := mustSnapshot(t, stores[0])
 	wantCalls := int64(len(stores) * perStore)
@@ -591,5 +611,667 @@ func TestImportLegacy_UnreadableEventsAborts(t *testing.T) {
 	}
 	if err := s.ImportLegacy(jsonPath); err != nil {
 		t.Fatalf("retry after fixing permissions: %v", err)
+	}
+}
+
+// waitFor polls until cond holds or the deadline passes. Used for the flush
+// timer, the one part of the ledger that is not caller-driven.
+func waitFor(t *testing.T, d time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return cond()
+}
+
+// The defect this file's coalescing exists to fix: a read-only tool call used
+// to open, write and commit a durable sidecar transaction (~37 KB of WAL) to
+// book its own accounting. N observations inside one flush window must cost
+// ZERO transactions until the window closes, and then exactly one.
+func TestAddObservation_CoalescesIntoOneTransaction(t *testing.T) {
+	s, err := Open(testLedgerPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOnCleanup(t, s)
+
+	const n = 12
+	before := s.sc.SavingsCommitCount()
+	for range n {
+		s.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "search_symbols", Returned: 10, Saved: 100})
+	}
+	if got := s.sc.SavingsCommitCount() - before; got != 0 {
+		t.Errorf("sidecar transactions for %d read-only observations = %d, want 0 before the flush window closes", n, got)
+	}
+	if got := s.Pending(); got != n {
+		t.Errorf("Pending() = %d, want %d buffered", got, n)
+	}
+
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := s.sc.SavingsCommitCount() - before; got != 1 {
+		t.Errorf("sidecar transactions after the flush = %d, want exactly 1", got)
+	}
+	if got := s.Pending(); got != 0 {
+		t.Errorf("Pending() after flush = %d, want 0", got)
+	}
+
+	snap := mustSnapshot(t, s)
+	if snap.Totals.CallsCounted != n || snap.Totals.TokensSaved != n*100 || snap.Totals.TokensReturned != n*10 {
+		t.Errorf("totals after flush = %+v, want calls=%d saved=%d returned=%d",
+			snap.Totals, n, n*100, n*10)
+	}
+	if got := snap.PerRepo["/r"]; got == nil || got.CallsCounted != n {
+		t.Errorf("per-repo totals = %+v, want calls=%d", got, n)
+	}
+	if got := snap.PerLanguage["go"]; got == nil || got.CallsCounted != n {
+		t.Errorf("per-language totals = %+v, want calls=%d", got, n)
+	}
+}
+
+// Coalescing must not make a reader see stale numbers: every read path on the
+// store flushes first, so `gortex savings`, graph_stats and the savings tools
+// reading through this store stay exact however long the window is.
+func TestReadsFlushBufferedObservations(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read func(t *testing.T, s *Store) int64
+	}{
+		{"Snapshot", func(t *testing.T, s *Store) int64 { return mustSnapshot(t, s).Totals.CallsCounted }},
+		{"EventsSince", func(t *testing.T, s *Store) int64 {
+			evs, err := s.EventsSince(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return int64(len(evs))
+		}},
+		{"ToolTotals", func(t *testing.T, s *Store) int64 {
+			rows, err := s.ToolTotals(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls int64
+			for _, r := range rows {
+				calls += r.CallsCounted
+			}
+			return calls
+		}},
+		{"ModelTotals", func(t *testing.T, s *Store) int64 {
+			rows, err := s.ModelTotals(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls int64
+			for _, r := range rows {
+				calls += r.CallsCounted
+			}
+			return calls
+		}},
+		{"ClientTotals", func(t *testing.T, s *Store) int64 {
+			rows, err := s.ClientTotals(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls int64
+			for _, r := range rows {
+				calls += r.CallsCounted
+			}
+			return calls
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Open(testLedgerPath(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeOnCleanup(t, s)
+
+			const n = 5
+			for range n {
+				s.AddObservation(Observation{
+					Repo: "/r", Language: "go", Tool: "read_file",
+					Model: "claude", Client: "claude-code", Returned: 10, Saved: 100,
+				})
+			}
+			if s.Pending() != n {
+				t.Fatalf("precondition: Pending() = %d, want %d buffered", s.Pending(), n)
+			}
+			if got := tc.read(t, s); got != n {
+				t.Errorf("%s saw %d calls, want %d — a read must flush the buffer first", tc.name, got, n)
+			}
+			if got := s.Pending(); got != 0 {
+				t.Errorf("Pending() after a read = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// The shutdown contract: the daemon's teardown chain calls Flush (through
+// Server.FlushSavings) and then Close. Both must persist the window, or the
+// last minute of accounting dies with the process.
+func TestClose_PersistsBufferedObservations(t *testing.T) {
+	path := testLedgerPath(t)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 7
+	for range n {
+		s.AddObservation(Observation{Repo: "/r", Tool: "read_file", Returned: 1, Saved: 10})
+	}
+	if s.Pending() != n {
+		t.Fatalf("precondition: Pending() = %d, want %d", s.Pending(), n)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOnCleanup(t, reopened)
+	snap := mustSnapshot(t, reopened)
+	if snap.Totals.CallsCounted != n || snap.Totals.TokensSaved != n*10 {
+		t.Errorf("totals after close+reopen = %+v, want calls=%d saved=%d", snap.Totals, n, n*10)
+	}
+}
+
+// The count bound. A busy daemon must not accumulate an unbounded buffer
+// waiting for a timer: the buffer flushes itself once it is full.
+func TestFlushMax_BoundsTheBuffer(t *testing.T) {
+	s, err := Open(testLedgerPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOnCleanup(t, s)
+	s.mu.Lock()
+	s.flushMax = 4
+	s.mu.Unlock()
+
+	before := s.sc.SavingsCommitCount()
+	for range 10 {
+		s.AddObservation(Observation{Tool: "search_symbols", Returned: 1, Saved: 10})
+	}
+	if got := s.sc.SavingsCommitCount() - before; got != 2 {
+		t.Errorf("transactions for 10 observations at flushMax=4 = %d, want 2", got)
+	}
+	if got := s.Pending(); got != 2 {
+		t.Errorf("Pending() = %d, want the 2 that did not fill a batch", got)
+	}
+	if got := mustSnapshot(t, s).Totals.CallsCounted; got != 10 {
+		t.Errorf("CallsCounted = %d, want 10 (no observation lost across the max-size flushes)", got)
+	}
+}
+
+// The time bound. Nothing may sit buffered indefinitely just because the
+// caller went quiet: an idle daemon still commits its window.
+func TestFlushTimer_CommitsWithoutAReader(t *testing.T) {
+	s, err := Open(testLedgerPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOnCleanup(t, s)
+	s.mu.Lock()
+	s.flushEvery = 20 * time.Millisecond
+	s.mu.Unlock()
+
+	before := s.sc.SavingsCommitCount()
+	s.AddObservation(Observation{Tool: "search_symbols", Returned: 1, Saved: 10})
+	if !waitFor(t, 5*time.Second, func() bool { return s.sc.SavingsCommitCount() > before }) {
+		t.Fatal("the flush timer never committed the buffered observation")
+	}
+	if got := s.Pending(); got != 0 {
+		t.Errorf("Pending() after the timer fired = %d, want 0", got)
+	}
+	if got := s.sc.SavingsCommitCount() - before; got != 1 {
+		t.Errorf("transactions = %d, want exactly 1 (the timer must not re-arm on an empty buffer)", got)
+	}
+}
+
+// The escape hatch: an operator who wants the old per-call durability can
+// have it, and a typo in the variable must not silently reinstate it either
+// way — an unparseable value keeps the default.
+func TestFlushIntervalEnv(t *testing.T) {
+	t.Run("zero restores a transaction per observation", func(t *testing.T) {
+		t.Setenv(flushIntervalEnv, "0")
+		s, err := Open(testLedgerPath(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeOnCleanup(t, s)
+		before := s.sc.SavingsCommitCount()
+		for range 3 {
+			s.AddObservation(Observation{Tool: "read_file", Returned: 1, Saved: 10})
+		}
+		if got := s.sc.SavingsCommitCount() - before; got != 3 {
+			t.Errorf("transactions with the buffer disabled = %d, want 3", got)
+		}
+		if got := s.Pending(); got != 0 {
+			t.Errorf("Pending() = %d, want 0 with the buffer disabled", got)
+		}
+	})
+	t.Run("garbage falls back to the default", func(t *testing.T) {
+		t.Setenv(flushIntervalEnv, "not-a-duration")
+		s, err := Open(testLedgerPath(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeOnCleanup(t, s)
+		s.AddObservation(Observation{Tool: "read_file", Returned: 1, Saved: 10})
+		if got := s.Pending(); got != 1 {
+			t.Errorf("Pending() = %d, want 1 — an unparseable interval must keep buffering", got)
+		}
+	})
+}
+
+// A reset wipes the ledger; a batch buffered before it must not land after
+// the DELETE and resurrect part of what the user asked to clear.
+func TestReset_DiscardsBufferedObservations(t *testing.T) {
+	s, err := Open(testLedgerPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOnCleanup(t, s)
+
+	s.AddObservation(Observation{Repo: "/r", Tool: "test", Returned: 50, Saved: 500})
+	if s.Pending() != 1 {
+		t.Fatalf("precondition: Pending() = %d, want 1", s.Pending())
+	}
+	if err := s.Reset(); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if got := s.Pending(); got != 0 {
+		t.Errorf("Pending() after reset = %d, want 0", got)
+	}
+	snap := mustSnapshot(t, s)
+	if snap.Totals.CallsCounted != 0 {
+		t.Errorf("CallsCounted after reset = %d, want 0 (a buffered observation must not survive)", snap.Totals.CallsCounted)
+	}
+}
+
+// --- F4b: exactness across handles on one ledger ---------------------------
+//
+// persistence.OpenSidecar caches one connection per absolute path, so two
+// savings.Store values opened on the same ledger share a handle while owning
+// separate buffers. A read through either handle must therefore drain BOTH,
+// or the reader reports a ledger whose live window is sitting in the other
+// store's memory — the `gortex gain` failure this item repairs.
+
+// sharedLedgerCommits reports how many sidecar transactions the ledger at
+// path has taken, through the same cached handle the stores use.
+func sharedLedgerCommits(t *testing.T, path string) int64 {
+	t.Helper()
+	sc, err := persistence.OpenSidecar(path)
+	if err != nil {
+		t.Fatalf("open sidecar: %v", err)
+	}
+	return sc.SavingsCommitCount()
+}
+
+func TestReadsFlushEveryHandleOnTheSameLedger(t *testing.T) {
+	const observations = 12
+	path := testLedgerPath(t)
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for range observations {
+		writer.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "search_symbols", Model: "m", Client: "c", Saved: 10, Returned: 1})
+	}
+	if got := writer.Pending(); got != observations {
+		t.Fatalf("precondition: want %d buffered on the writer, got %d", observations, got)
+	}
+	if got := reader.Pending(); got != 0 {
+		t.Fatalf("precondition: the reader handle buffers nothing of its own, got %d", got)
+	}
+
+	cases := []struct {
+		name string
+		read func() int64
+	}{
+		{"Snapshot", func() int64 {
+			return mustSnapshot(t, reader).Totals.CallsCounted
+		}},
+		{"EventsSince", func() int64 {
+			evs, err := reader.EventsSince(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return int64(len(evs))
+		}},
+		{"ToolTotals", func() int64 {
+			rows, err := reader.ToolTotals(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var n int64
+			for _, r := range rows {
+				n += r.CallsCounted
+			}
+			return n
+		}},
+		{"ModelTotals", func() int64 {
+			rows, err := reader.ModelTotals(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var n int64
+			for _, r := range rows {
+				n += r.CallsCounted
+			}
+			return n
+		}},
+		{"ClientTotals", func() int64 {
+			rows, err := reader.ClientTotals(time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var n int64
+			for _, r := range rows {
+				n += r.CallsCounted
+			}
+			return n
+		}},
+	}
+	// The FIRST read must drain the writer's buffer; the rest confirm each
+	// read path is wired the same way (they re-read an already-drained
+	// ledger, which is exactly what a second reader sees).
+	for i, tc := range cases {
+		if i == 0 {
+			if got := reader.Pending(); got != 0 {
+				t.Fatalf("precondition: reader buffer must be empty before %s, got %d", tc.name, got)
+			}
+		}
+		if got := tc.read(); got != observations {
+			t.Errorf("%s through a second handle must see all %d buffered observations, got %d",
+				tc.name, observations, got)
+		}
+		if got := writer.Pending(); got != 0 {
+			t.Errorf("%s must have drained the writer's buffer, %d still pending", tc.name, got)
+		}
+	}
+	if got := mustSnapshot(t, writer).DroppedObservations; got != 0 {
+		t.Errorf("nothing may be dropped, got %d", got)
+	}
+}
+
+// Draining a peer must not cost a transaction per observation: the whole
+// window is still one commit.
+func TestCrossHandleFlushStaysOneTransaction(t *testing.T) {
+	const observations = 12
+	path := testLedgerPath(t)
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := sharedLedgerCommits(t, path)
+	for range observations {
+		writer.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "read_file", Saved: 5})
+	}
+	if got := sharedLedgerCommits(t, path) - before; got != 0 {
+		t.Fatalf("buffered observations must open no transaction, got %d", got)
+	}
+	if got := mustSnapshot(t, reader).Totals.CallsCounted; got != observations {
+		t.Fatalf("reader must see %d, got %d", observations, got)
+	}
+	if got := sharedLedgerCommits(t, path) - before; got != 1 {
+		t.Errorf("the cross-handle flush must commit the window as ONE transaction, got %d", got)
+	}
+}
+
+// Closing one handle takes the shared connection away from every other
+// store on it, so the close must commit their windows first — otherwise the
+// writer's next flush fails with "database is closed" and the window is
+// dropped, not merely delayed.
+func TestClose_FlushesEveryHandleBeforeReleasingTheLedger(t *testing.T) {
+	path := testLedgerPath(t)
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "get_symbol_source", Saved: 33, Returned: 3})
+	if writer.Pending() != 1 {
+		t.Fatalf("precondition: the observation must still be buffered")
+	}
+
+	if err := reader.Close(); err != nil { // the one-shot CLI reader's defer
+		t.Fatalf("close: %v", err)
+	}
+	if got := writer.Pending(); got != 0 {
+		t.Errorf("closing a peer handle must drain this store's buffer, %d still pending", got)
+	}
+	if got := writer.dropped.Load(); got != 0 {
+		t.Errorf("no observation may be dropped by a peer's close, got %d", got)
+	}
+
+	fresh, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fresh.Close() }()
+	snap := mustSnapshot(t, fresh)
+	if snap.Totals.CallsCounted != 1 || snap.Totals.TokensSaved != 33 {
+		t.Errorf("the window must be on disk after the peer close, got %+v", snap.Totals)
+	}
+}
+
+// A reset must not leave a peer's buffer to flush itself back over the
+// wipe — the same reasoning the single-handle path already carried.
+func TestReset_DiscardsPeerHandleBuffers(t *testing.T) {
+	path := testLedgerPath(t)
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	resetter, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "read_file", Saved: 90})
+	if writer.Pending() != 1 {
+		t.Fatalf("precondition: buffered")
+	}
+	if err := resetter.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if got := writer.Pending(); got != 0 {
+		t.Errorf("a reset must discard peer buffers, %d still pending", got)
+	}
+	if got := mustSnapshot(t, resetter).Totals.CallsCounted; got != 0 {
+		t.Errorf("nothing may survive the reset, got %d calls", got)
+	}
+}
+
+// --- F4b: the one-shot flush bound -----------------------------------------
+
+func TestSetFlushBounds_TightensTheWindow(t *testing.T) {
+	path := testLedgerPath(t)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if every, max := s.FlushBounds(); every != DefaultFlushInterval || max != DefaultFlushMax {
+		t.Fatalf("precondition: want the daemon default, got %v/%d", every, max)
+	}
+
+	s.SetFlushBounds(OneshotFlushInterval, OneshotFlushMax)
+	every, max := s.FlushBounds()
+	if every != OneshotFlushInterval || max != OneshotFlushMax {
+		t.Errorf("SetFlushBounds must apply both bounds, got %v/%d", every, max)
+	}
+	if OneshotFlushInterval >= DefaultFlushInterval || OneshotFlushMax >= DefaultFlushMax {
+		t.Errorf("the one-shot bounds must be tighter than the daemon's: %v/%d vs %v/%d",
+			OneshotFlushInterval, OneshotFlushMax, DefaultFlushInterval, DefaultFlushMax)
+	}
+
+	// A non-positive argument leaves that bound alone.
+	s.SetFlushBounds(0, 0)
+	if every, max = s.FlushBounds(); every != OneshotFlushInterval || max != OneshotFlushMax {
+		t.Errorf("a zero argument must not clobber a bound, got %v/%d", every, max)
+	}
+}
+
+// Tightening must take effect for observations that are ALREADY buffered,
+// or a burst booked before the entry point narrows the window keeps the old
+// exposure.
+func TestSetFlushBounds_AppliesToAnAlreadyArmedBuffer(t *testing.T) {
+	path := testLedgerPath(t)
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	for range 3 {
+		s.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "read_file", Saved: 1})
+	}
+	if s.Pending() != 3 {
+		t.Fatalf("precondition: 3 buffered, got %d", s.Pending())
+	}
+	// A count bound the buffer already meets commits immediately.
+	s.SetFlushBounds(0, 2)
+	if got := s.Pending(); got != 0 {
+		t.Errorf("a count bound already met must commit the buffer, %d still pending", got)
+	}
+	if got := mustSnapshot(t, s).Totals.CallsCounted; got != 3 {
+		t.Errorf("want 3 committed, got %d", got)
+	}
+
+	// A shorter interval re-arms rather than waiting out the old one.
+	s.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "read_file", Saved: 1})
+	s.SetFlushBounds(20*time.Millisecond, 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for s.Pending() > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := s.Pending(); got != 0 {
+		t.Errorf("the re-armed timer must commit inside the new interval, %d still pending", got)
+	}
+}
+
+// Wave constraint: an operator knob is honoured, never silently raised or
+// dropped. An explicit GORTEX_SAVINGS_FLUSH_INTERVAL outranks the entry
+// point's bound in both directions.
+func TestSetFlushBounds_NeverOverridesTheOperatorKnob(t *testing.T) {
+	t.Setenv(flushIntervalEnv, "250ms")
+	s, err := Open(testLedgerPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	s.SetFlushBounds(OneshotFlushInterval, OneshotFlushMax)
+	if every, _ := s.FlushBounds(); every != 250*time.Millisecond {
+		t.Errorf("an operator-set interval must survive SetFlushBounds, got %v", every)
+	}
+
+	// A typo is NOT an operator setting: it falls back to the default and
+	// stays overridable, or a typo would pin the window.
+	t.Setenv(flushIntervalEnv, "not-a-duration")
+	s2, err := Open(testLedgerPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+	s2.SetFlushBounds(OneshotFlushInterval, OneshotFlushMax)
+	if every, _ := s2.FlushBounds(); every != OneshotFlushInterval {
+		t.Errorf("an unparseable value must not pin the window, got %v", every)
+	}
+}
+
+// The cross-handle flush reaches into other stores' buffers, so it has to be
+// safe while those stores are being written, read, opened and closed. Race
+// detector fodder: concurrent writers on one handle, concurrent readers on a
+// second, and handles opening and closing underneath both.
+func TestCrossHandleFlushIsRaceFree(t *testing.T) {
+	const writers, perWriter = 6, 40
+	path := testLedgerPath(t)
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Close() }()
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range perWriter {
+				writer.AddObservation(Observation{Repo: "/r", Language: "go", Tool: "read_file", Saved: 1})
+			}
+		}()
+	}
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				if _, err := reader.Snapshot(); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	// A third handle opening and closing under the other two is the
+	// registry's own churn: gortex gain against a live process.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 5 {
+			transient, err := Open(path)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if _, err := transient.EventsSince(time.Time{}); err != nil {
+				t.Error(err)
+				return
+			}
+			// NOTE: not Close() — closing drops the SHARED handle from the
+			// persistence cache and would pull it out from under the live
+			// writers. That hazard is the caller's, and is documented on
+			// Store.Close; this goroutine exercises the registry, not it.
+		}
+	}()
+	wg.Wait()
+
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	snap := mustSnapshot(t, reader)
+	if want := int64(writers * perWriter); snap.Totals.CallsCounted != want {
+		t.Errorf("every observation must be accounted for: want %d, got %d", want, snap.Totals.CallsCounted)
+	}
+	if snap.DroppedObservations != 0 {
+		t.Errorf("nothing may be dropped, got %d", snap.DroppedObservations)
 	}
 }
