@@ -75,8 +75,15 @@ func privateDedicatedBuilderFixture(t testing.TB) (*SparseGenerationBuilder, ded
 	registry := parser.NewRegistry()
 	languages.RegisterAll(registry)
 	builder := &SparseGenerationBuilder{Store: store, Registry: registry, Config: config.Default().Index, Logger: zap.NewNop()}
+	// ExtractorVersions is the REAL fingerprint rather than a placeholder token,
+	// because it is not an opaque identity component: a reservation's
+	// extractor versions and the repo_index_state row an index pass writes are
+	// the same string from the same snapshot (extractorVersionsFingerprint /
+	// persistRepoIndexState), and the claimed-base copy route refuses when the
+	// two disagree. A placeholder here would make every copy-route test a
+	// version-mismatch refusal test by accident.
 	request := dedicatedBuilderFixtureRequest{
-		Identity:  GenerationIdentity{OwnerKind: "dedicated_graph", GraphID: "private-dedicated-graph", CheckoutID: "private-owner", GenerationKind: "dedicated", TreeOID: tree, ProvenanceCommitOID: commit, ConfigHash: "private-config-v1", ExtractorVersions: "private-extractor-v1", ResolverVersion: "private-resolver-v1"},
+		Identity:  GenerationIdentity{OwnerKind: "dedicated_graph", GraphID: "private-dedicated-graph", CheckoutID: "private-owner", GenerationKind: "dedicated", TreeOID: tree, ProvenanceCommitOID: commit, ConfigHash: "private-config-v1", ExtractorVersions: extractorVersionsFingerprint(), ResolverVersion: "private-resolver-v1"},
 		StorePath: storePath, RootPath: root, RepoPrefix: "private-dedicated", WorkspaceID: "private-workspace", ProjectID: "private-project",
 	}
 	catalog := store.Catalog()
