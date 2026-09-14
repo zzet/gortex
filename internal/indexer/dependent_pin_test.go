@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -705,5 +706,364 @@ func TestALegacyBaseAdvanceIsNeverPinned(t *testing.T) {
 	// route is complete and active, and the refusal is the regime.
 	if _, pinned := c.pinRoutedBase(ctx, base, f.route()); pinned {
 		t.Fatal("pinRoutedBase accepted a base that names no generation")
+	}
+}
+
+// --- W4.8b: the two refusals inside pinnedBaseFor that nothing was holding --
+//
+// The tests above pin what the pin BUYS. These pin what it must refuse, and
+// they exist because the W4.8 verification found both refusals survived
+// deletion with the whole suite green: the substituted-identity probe
+// (checkout_coordinator.go:1877-1882) and the pinned base row's own
+// consistency clauses (:1887-1896).
+//
+// Neither is defensive dressing. The probe is the ONLY thing that distinguishes
+// "the base moved and nothing else did" — which the pin absorbs for free — from
+// "the base moved and so did something the payload is a function of", which is
+// a semantic invalidation and must go to a rebuild against the base the family
+// is on NOW. Without it a configuration reload, an extractor upgrade, a
+// resolver-contract bump or a dependency-cohort move under a pinned dependent
+// would rebuild the delta against the base it happened to be pinned to,
+// carrying the pin — and the divergence it stands for — across the very event
+// that was supposed to end it.
+//
+// Production is unchanged by this item: both refusals are present and correct.
+// What was missing was the test that goes red when they are not.
+
+// pinnedDependent is the shared setup for the refusal tests: one committed-base
+// family, one dependent worktree with its own commit and its own built stack,
+// and then one base advance under it.
+//
+// It returns the dependent's coordinator and working tree, the generation its
+// routed delta was built against (the pin candidate), the family's CURRENT base
+// after the advance, and the dependent's route. The two generations are always
+// different — the fixture asserts it — so a test that cannot tell them apart is
+// failing for the reason it names rather than for a fixture that never moved.
+func pinnedDependent(t *testing.T, f *committedBaseFixture) (
+	c *CheckoutCoordinator, root string, builtAgainst int64,
+	current primaryBase, route store_sqlite.CheckoutRoute,
+) {
+	t.Helper()
+	ctx := context.Background()
+	c, root = f.pinDependent(t, "alpha")
+	if first := c.reconcile(ctx); first.Err != nil || !first.CommitBuilt {
+		t.Fatalf("the first cycle did not build the stack: %+v", first)
+	}
+	route = f.routeOf(t, c.checkoutID)
+	routed, found := f.generation(route.CommitGenerationID)
+	if !found {
+		t.Fatal("the routed commit generation is not in the catalog")
+	}
+	if routed.BaseGenerationID <= 0 {
+		t.Fatalf("the routed delta names ancestor %d; this is the committed regime",
+			routed.BaseGenerationID)
+	}
+	builtAgainst = routed.BaseGenerationID
+
+	f.advanceCommittedBase(t, "advanced.go", "Advanced")
+	current, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("primaryBase after the advance: %v", err)
+	}
+	if current.generationID == builtAgainst {
+		t.Fatalf("the advance left the family on generation %d; there is nothing to pin AGAINST",
+			current.generationID)
+	}
+	return c, root, builtAgainst, current, route
+}
+
+// assertPinsTheBaseItWasBuiltAgainst is the control every refusal arm is read
+// against. A refusal proves nothing unless the same predicate, on the same
+// state with the doctoring undone, takes the pin.
+func assertPinsTheBaseItWasBuiltAgainst(
+	t *testing.T, c *CheckoutCoordinator, current primaryBase,
+	route store_sqlite.CheckoutRoute, builtAgainst int64, when string,
+) {
+	t.Helper()
+	got, pinned := c.pinRoutedBase(context.Background(), current, route)
+	if !pinned {
+		t.Fatalf("%s: the pin was refused on an unchanged identity", when)
+	}
+	if got.generationID != builtAgainst {
+		t.Fatalf("%s: the pin took generation %d, want the base the delta was built against %d",
+			when, got.generationID, builtAgainst)
+	}
+}
+
+// assertRefusesThePin is the arm itself.
+func assertRefusesThePin(
+	t *testing.T, c *CheckoutCoordinator, current primaryBase,
+	route store_sqlite.CheckoutRoute, because string,
+) {
+	t.Helper()
+	got, pinned := c.pinRoutedBase(context.Background(), current, route)
+	if pinned {
+		t.Fatalf("%s: the pin was taken anyway, on generation %d", because, got.generationID)
+	}
+	if got.generationID != current.generationID || got.treeOID != current.treeOID || got.pinned {
+		t.Fatalf("%s: the refusal did not return the family's current base unchanged: %+v want %+v",
+			because, got, current)
+	}
+	if reported := c.PinnedBaseGeneration(); reported != 0 {
+		t.Fatalf("%s: the coordinator still reports pin %d after refusing", because, reported)
+	}
+}
+
+// TestASemanticChangeRefusesToPinTheBaseItWasBuiltAgainst is the substituted-
+// identity probe, one identity input at a time.
+//
+// pinnedBaseFor re-renders the commit identity this coordinator would mint NOW
+// over the routed row's own tree, substitutes ONLY the base the row names, and
+// requires the result to be the key the row already carries. So every field of
+// the identity that is not the base is a refusal: the payload is a function of
+// the configuration, the extractor set, the resolver contract and the
+// dependency cohort, and a pin that ignored any of them would keep serving a
+// payload built under inputs that no longer hold.
+//
+// Revert-red: drop the probe (checkout_coordinator.go:1877-1882) and all four
+// arms take the pin, with the control still green — which is exactly the state
+// the W4.8 verification found the suite in.
+func TestASemanticChangeRefusesToPinTheBaseItWasBuiltAgainst(t *testing.T) {
+	f := newCommittedBaseFixture(t)
+	c, _, builtAgainst, current, route := pinnedDependent(t, f)
+
+	readRevision := func() string {
+		c.revisionMu.RLock()
+		defer c.revisionMu.RUnlock()
+		return c.revision
+	}
+	writeRevision := func(revision string) {
+		c.revisionMu.Lock()
+		c.revision = revision
+		c.revisionMu.Unlock()
+	}
+
+	assertPinsTheBaseItWasBuiltAgainst(t, c, current, route, builtAgainst, "before any semantic change")
+
+	for _, arm := range []struct {
+		name   string
+		change func() func()
+	}{
+		{"the index configuration was reloaded", func() func() {
+			was := c.configHash
+			c.configHash = was + "-reloaded"
+			return func() { c.configHash = was }
+		}},
+		{"an extractor version moved", func() func() {
+			was := c.extractors
+			c.extractors = was + "-upgraded"
+			return func() { c.extractors = was }
+		}},
+		{"the resolver contract moved", func() func() {
+			was := c.resolverVersion
+			c.resolverVersion = was + "-upgraded"
+			return func() { c.resolverVersion = was }
+		}},
+		{"the dependency cohort moved", func() func() {
+			was := readRevision()
+			writeRevision("cohort-moved-" + was)
+			return func() { writeRevision(was) }
+		}},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			restore := arm.change()
+			defer restore()
+			assertRefusesThePin(t, c, current, route, arm.name)
+		})
+		assertPinsTheBaseItWasBuiltAgainst(t, c, current, route, builtAgainst,
+			"after undoing: "+arm.name)
+	}
+}
+
+// TestASemanticChangeUnderAPinRebuildsAgainstTheCurrentBase is the same refusal
+// read as a cycle outcome, which is where it actually costs something.
+//
+// A configuration reload under a pinned dependent is the shape: the routed
+// delta is no longer the payload this coordinator would build, so the cycle
+// rebuilds it — and the base it must be diffed from is the one the family is on
+// NOW, not the one the route happened to be pinned to. Building against the pin
+// instead would be a strictly worse answer than the pre-W4.8 behaviour: the
+// delta would be re-minted under the new inputs and immediately pinned to a
+// base the family left, with no event left that would ever move it off.
+//
+// Revert-red: drop the probe and the rebuilt delta names the pinned base
+// (`builtAgainst`) instead of the family's current one.
+func TestASemanticChangeUnderAPinRebuildsAgainstTheCurrentBase(t *testing.T) {
+	f := newCommittedBaseFixture(t)
+	ctx := context.Background()
+	c, root, builtAgainst, current, route := pinnedDependent(t, f)
+
+	// The pin holds first, so the rebuild below is attributable to the config
+	// change and to nothing else about the advance.
+	if pinned := c.reconcile(ctx); pinned.Err != nil || !pinned.BasePinned || pinned.CommitBuilt {
+		t.Fatalf("the advance was not absorbed by the pin: %+v", pinned)
+	}
+	if got := f.routeOf(t, c.checkoutID); got != route {
+		t.Fatalf("the pinned cycle moved the route\n got: %+v\nwant: %+v", got, route)
+	}
+
+	reloaded := c.configHash + "-reloaded"
+	c.configHash = reloaded
+
+	out := c.reconcile(ctx)
+	if out.Err != nil {
+		t.Fatalf("reconcile after the configuration reload: %v", out.Err)
+	}
+	if out.BasePinned {
+		t.Fatalf("a configuration reload kept the pin: %+v", out)
+	}
+	after := f.routeOf(t, c.checkoutID)
+	if after.CommitGenerationID == route.CommitGenerationID {
+		t.Fatalf("the reload left the stale delta routed: %+v", out)
+	}
+	rebuilt, found := f.generation(after.CommitGenerationID)
+	if !found {
+		t.Fatalf("the rebuilt commit generation %d is not in the catalog", after.CommitGenerationID)
+	}
+	if rebuilt.ConfigHash != reloaded {
+		t.Fatalf("the rebuilt delta carries config hash %q, want the reloaded %q",
+			rebuilt.ConfigHash, reloaded)
+	}
+	if rebuilt.BaseGenerationID != current.generationID {
+		t.Fatalf("the rebuilt delta names base %d, want the family's current %d (it was pinned to %d)",
+			rebuilt.BaseGenerationID, current.generationID, builtAgainst)
+	}
+	if rebuilt.LowerViewFingerprint != current.treeOID {
+		t.Fatalf("the rebuilt delta was diffed from %q, want the family's current base tree %q",
+			rebuilt.LowerViewFingerprint, current.treeOID)
+	}
+	if reported := c.PinnedBaseGeneration(); reported != 0 {
+		t.Fatalf("the coordinator reports pin %d after rebuilding onto the current base", reported)
+	}
+	// And the answer is still this checkout's own tree, which is the only
+	// oracle that can tell a correct rebase of the delta from a splice.
+	assertViewIsItsOwnTree(t, f, c.checkoutID, root)
+}
+
+// doctoredGenerationColumns are the only columns the refusal tests below
+// overwrite. The list is closed so the column name can be interpolated into the
+// statement without a second thought about what it could be.
+var doctoredGenerationColumns = map[string]struct{}{
+	"state":                  {},
+	"generation_kind":        {},
+	"graph_id":               {},
+	"tree_oid":               {},
+	"lower_view_fingerprint": {},
+}
+
+// doctorGenerationColumn overwrites one column of one view_generations row on
+// the fixture's own store file and returns the undo.
+//
+// It writes the store directly for the reason installCheckoutLayerWriteAudit
+// does — instrumenting a test-owned database beats exporting a production-only
+// hook — and for a second reason of its own: the states it has to produce are
+// states the catalog's own API refuses to put a LIVE base into, because the
+// routed delta references it. That refusal is the production guard (and its own
+// test); what is under test here is the coordinator's behaviour when it reads a
+// base row that is not the one its delta was diffed from, whatever put it
+// there — a torn retirement, a graph reset, a restore over a moved store.
+func doctorGenerationColumn(
+	t *testing.T, storePath string, generationID int64, column, value string,
+) func() {
+	t.Helper()
+	if _, ok := doctoredGenerationColumns[column]; !ok {
+		t.Fatalf("doctorGenerationColumn: %q is not one of the columns these tests doctor", column)
+	}
+	read := fmt.Sprintf("SELECT %s FROM view_generations WHERE generation_id = ?", column)
+	write := fmt.Sprintf("UPDATE view_generations SET %s = ? WHERE generation_id = ?", column)
+	exec := func(t *testing.T, statement, argument string) {
+		t.Helper()
+		db, err := sql.Open("sqlite", storePath+"?_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatalf("open the store to doctor %s: %v", column, err)
+		}
+		defer db.Close()
+		if _, err := db.Exec(statement, argument, generationID); err != nil {
+			t.Fatalf("doctor %s of generation %d: %v", column, generationID, err)
+		}
+	}
+
+	db, err := sql.Open("sqlite", storePath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open the store to read %s: %v", column, err)
+	}
+	var previous string
+	err = db.QueryRow(read, generationID).Scan(&previous)
+	_ = db.Close()
+	if err != nil {
+		t.Fatalf("read %s of generation %d: %v", column, generationID, err)
+	}
+	exec(t, write, value)
+	return func() { exec(t, write, previous) }
+}
+
+// TestThePinRefusesABaseRowThatIsNotTheOneTheDeltaWasDiffedFrom pins the pinned
+// base row's own consistency clauses.
+//
+// Staying on a replaced base is only safe because that base is still exactly
+// the corpus the routed delta was diffed from: B1 + diffTreeChanges(B1, T) = T
+// holds for B1 and for nothing else. So before the cycle composes over it,
+// pinnedBaseFor asks the row five questions — is it still servable, is it a
+// dedicated base at all, is it this graph's, does it name a tree at all, and is
+// that tree the one the delta names as its lower view — and any answer but yes
+// sends the cycle to the base the family is on, which is the behaviour this
+// path replaced.
+//
+// Each arm doctors exactly one column and puts it back, with the control run
+// between arms, so a refusal is attributable to the clause it names.
+//
+// Revert-red: drop the clauses (checkout_coordinator.go:1887-1896) and every
+// arm takes the pin over a base that is retiring, is somebody else's, is not a
+// base at all, or is not the tree the delta was diffed from. Dropping any one
+// of the five reddens exactly the arm that names it.
+func TestThePinRefusesABaseRowThatIsNotTheOneTheDeltaWasDiffedFrom(t *testing.T) {
+	f := newCommittedBaseFixture(t)
+	c, _, builtAgainst, current, route := pinnedDependent(t, f)
+	routed, found := f.generation(route.CommitGenerationID)
+	if !found {
+		t.Fatal("the routed commit generation is not in the catalog")
+	}
+
+	assertPinsTheBaseItWasBuiltAgainst(t, c, current, route, builtAgainst, "before any doctoring")
+
+	for _, arm := range []struct {
+		name   string
+		doctor func(t *testing.T) func()
+	}{
+		{"the pinned base is already retiring", func(t *testing.T) func() {
+			return doctorGenerationColumn(t, f.storePath, builtAgainst,
+				"state", string(store_sqlite.ViewGenerationRetiring))
+		}},
+		{"the pinned base is not a dedicated base", func(t *testing.T) func() {
+			return doctorGenerationColumn(t, f.storePath, builtAgainst,
+				"generation_kind", CommitLayerGenerationKind)
+		}},
+		{"the pinned base belongs to another graph", func(t *testing.T) func() {
+			return doctorGenerationColumn(t, f.storePath, builtAgainst,
+				"graph_id", current.graphID+"-elsewhere")
+		}},
+		{"the pinned base is not the tree the delta was diffed from", func(t *testing.T) func() {
+			return doctorGenerationColumn(t, f.storePath, builtAgainst,
+				"tree_oid", routed.LowerViewFingerprint+"-moved")
+		}},
+		{"neither the pinned base nor the delta names a tree at all", func(t *testing.T) func() {
+			// The empty-tree clause is the one the inequality above cannot
+			// stand in for: with both sides empty they are equal, and what
+			// refuses is the base naming no tree. A delta whose lower view
+			// fingerprint is empty still re-keys clean, because the probe
+			// substitutes that very field from the row.
+			undoBase := doctorGenerationColumn(t, f.storePath, builtAgainst, "tree_oid", "")
+			undoDelta := doctorGenerationColumn(t, f.storePath, route.CommitGenerationID,
+				"lower_view_fingerprint", "")
+			return func() { undoDelta(); undoBase() }
+		}},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			undo := arm.doctor(t)
+			defer undo()
+			assertRefusesThePin(t, c, current, route, arm.name)
+		})
+		assertPinsTheBaseItWasBuiltAgainst(t, c, current, route, builtAgainst,
+			"after undoing: "+arm.name)
 	}
 }
