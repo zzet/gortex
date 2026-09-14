@@ -6,6 +6,37 @@ microbenchmark is not an end-to-end disk-usage verdict.
 
 Execution ledger: [incremental-indexing-execution-ledger.md](incremental-indexing-execution-ledger.md)
 
+## Status 2026-09-15
+
+**The [execution ledger](incremental-indexing-execution-ledger.md) is the authority on current
+state.** This document remains the chronological design and invariant history and is not rewritten:
+earlier sections below record what was believed when, and several of them are superseded by later
+ones. The ledger carries one row per work item with its final state, commit, evidence pointers,
+limitations and next action; the ten acceptance gates with the evidence and narrowing for each; the
+declared limitations that must appear verbatim in the PR body; the coordinator decisions D1–D15 with
+the corrections evidence forced on D6, D9 and D15; and a compressed per-wave evidence log. The
+paired measurement lives in [incremental-indexing-measurements.md](incremental-indexing-measurements.md)
+and carries two verdicts against one never-re-frozen budget file.
+
+Branch `fix/incremental-index-write-amplification` at `722d4b7b`, 140 commits over `main 56a1c29d`.
+
+**No acceptance gate is closed.** All ten remain open, and the ledger's gate table names the evidence
+and the narrowing for each. In one paragraph: G1 (snapshot correctness) and G8 (bounded costs) and G9
+(storage/recovery safety) are `blocked with evidence` — G1 on two gate-1 divergences from the edit
+taxonomy (a withdrawn path's name and an excluded package's name are both still served) plus five
+resolution/provenance cases that fail on **both** arms and therefore reproduce on `main 56a1c29d`;
+G8 on F3b's own re-measurement missing both plan targets (7.91 MB against ≤ 1 MB, 83.0 MB against
+≤ 20 MB), F2's unverified second-copy payload ceiling, a `P4_amend_same_tree` 1.28× regression with
+no identified mechanism, a 6,000-file scale axis never re-run after the fixes, an unexercised typed
+closure limit and a vacuous quiescence verdict; G9 on a daemon that does not retry a build lost to a
+full volume, a storage-failure census that stays empty while the log names the failure, and the
+unresolved `internal/persistence` sidecar obligation. G2, G3, G4, G5, G6, G7 and G10 are `tested`:
+each has component-level and end-to-end evidence, but every E2E matrix and both measurement verdicts
+ran against ancestor candidate binaries (`2fd5db82`, `271a9e9f`) rather than the final HEAD, no
+single run has covered every package at `722d4b7b`, and `golangci-lint` has been run over two
+packages only — so none of them reaches `E2E validated`, and the ledger records what each is still
+missing.
+
 ## 2026-09-10: guarded committed-base advancement component
 
 The new `ensureCurrent` primitive shares initial publication's authority and
