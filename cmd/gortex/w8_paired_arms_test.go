@@ -1702,11 +1702,14 @@ func w8IdleArtifact(arm, phase string, quiet, polling uint64, split bool, idleWa
 	}
 	report.WallSeconds = idleWall * 2
 	report.LogicalWrites, report.LogicalWritesExcl = value(quiet+polling), value(quiet+polling)
+	// Polling first, quiet second — the order the harness measures them in
+	// (idleWindows): the judged arm opens the phase where the frozen window
+	// opened.
 	report.Windows = []w8WindowReport{
-		{Phase: phase, Window: quietName, WallSeconds: idleWall, ClientCalls: 0,
-			LogicalWrites: value(quiet), LogicalWritesExcl: value(quiet)},
 		{Phase: phase, Window: pollingName, WallSeconds: idleWall, ClientCalls: 12,
 			LogicalWrites: value(polling), LogicalWritesExcl: value(polling)},
+		{Phase: phase, Window: quietName, WallSeconds: idleWall, ClientCalls: 0,
+			LogicalWrites: value(quiet), LogicalWritesExcl: value(quiet)},
 	}
 	run.Phases = append(run.Phases, report)
 	return run
@@ -2200,9 +2203,11 @@ func TestW8ReducePhaseCarriesSubWindowRowsThroughTheVerdict(t *testing.T) {
 		run.Phases = append(run.Phases, w8PhaseReport{
 			Phase: "P8_idle_warm", Detail: "idle", WallSeconds: 120,
 			LogicalWrites: value(quiet + polling), LogicalWritesExcl: value(quiet + polling),
+			// Polling first, quiet second — the order idleWindows measures them
+			// in, so the fixture has the shape of a real artifact.
 			Windows: []w8WindowReport{
-				{Phase: "P8_idle_warm", Window: w8WindowIdleWarmQuiet, LogicalWrites: value(quiet), LogicalWritesExcl: value(quiet), ClientCalls: quietCalls},
 				{Phase: "P8_idle_warm", Window: w8WindowIdleWarmPolling, LogicalWrites: value(polling), LogicalWritesExcl: value(polling), ClientCalls: pollingCalls},
+				{Phase: "P8_idle_warm", Window: w8WindowIdleWarmQuiet, LogicalWrites: value(quiet), LogicalWritesExcl: value(quiet), ClientCalls: quietCalls},
 			},
 		})
 		return run
@@ -2212,10 +2217,10 @@ func TestW8ReducePhaseCarriesSubWindowRowsThroughTheVerdict(t *testing.T) {
 		t.Fatal(err)
 	}
 	budget := w8FindBudget(t, set, "P8_idle_warm")
-	if len(budget.Windows) != 2 || budget.Windows[0].Window != w8WindowIdleWarmQuiet {
-		t.Fatalf("the baseline's sub-windows were not frozen: %+v", budget.Windows)
+	if len(budget.Windows) != 2 || budget.Windows[0].Window != w8WindowIdleWarmPolling {
+		t.Fatalf("the baseline's sub-windows were not frozen in measurement order: %+v", budget.Windows)
 	}
-	if budget.Windows[0].ClientCalls.Median != 0 || budget.Windows[1].ClientCalls.Median != 12 {
+	if budget.Windows[0].ClientCalls.Median != 12 || budget.Windows[1].ClientCalls.Median != 0 {
 		t.Fatalf("client-call counts did not survive the reduction: %+v", budget.Windows)
 	}
 	verdict, err := w8CompareArms(set, []w8RunArtifact{withWindows("candidate", 120, 1_400_000, 0, 12)})
@@ -2226,11 +2231,17 @@ func TestW8ReducePhaseCarriesSubWindowRowsThroughTheVerdict(t *testing.T) {
 	if len(row.Windows) != 2 {
 		t.Fatalf("the sub-window rows did not reach the verdict: %+v", row.Windows)
 	}
-	quiet := row.Windows[0]
+	polling, quiet := row.Windows[0], row.Windows[1]
+	if polling.Window != w8WindowIdleWarmPolling || quiet.Window != w8WindowIdleWarmQuiet {
+		t.Fatalf("the verdict reordered the sub-windows: %s then %s", polling.Window, quiet.Window)
+	}
 	if quiet.Candidate.Median != 120 || quiet.Baseline.Median != 100 || quiet.CandidateCalls.Median != 0 {
 		t.Fatalf("the quiet window row = %+v", quiet)
 	}
 	if !strings.Contains(quiet.Note, "never judged") {
 		t.Fatalf("a sub-window row must say it carries no ceiling: %q", quiet.Note)
+	}
+	if !strings.Contains(polling.Note, "ceiling is applied to") {
+		t.Fatalf("the judged sub-window row must say it carries the ceiling: %q", polling.Note)
 	}
 }

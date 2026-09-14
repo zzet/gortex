@@ -318,22 +318,26 @@ func w8RequiredTimeout(cfg w8Config, arms int) time.Duration {
 // re-measurement is supposed to be judged against. What the phases gain is
 // named sub-windows, each with its own row, so a phase's own stimulus is
 // separable from the thing the phase is named after without moving a ceiling.
+// The a/b suffix is the order the window is measured in, not a label chosen
+// once: the polling arm of an idle phase runs FIRST (see idleWindows), so it
+// is the `a` window and the quiet arm is the `b` window.
 const (
 	w8WindowCommitTreeChange = "P4a_commit_tree_change"
 	w8WindowAmendSameTree    = "P4b_amend_same_tree"
-	w8WindowIdleColdQuiet    = "P1a_idle_cold_quiet"
-	w8WindowIdleColdPolling  = "P1b_idle_cold_polling"
-	w8WindowIdleWarmQuiet    = "P8a_idle_warm_quiet"
-	w8WindowIdleWarmPolling  = "P8b_idle_warm_polling"
+	w8WindowIdleColdPolling  = "P1a_idle_cold_polling"
+	w8WindowIdleColdQuiet    = "P1b_idle_cold_quiet"
+	w8WindowIdleWarmPolling  = "P8a_idle_warm_polling"
+	w8WindowIdleWarmQuiet    = "P8b_idle_warm_quiet"
 )
 
 // w8WindowPlan is the declared sub-window plan, phase by phase, so the split
 // is pinned by a test rather than discovered by reading three phase bodies.
+// The slice order is the measurement order.
 func w8WindowPlan() map[string][]string {
 	return map[string][]string{
-		"P1_idle_cold":       {w8WindowIdleColdQuiet, w8WindowIdleColdPolling},
+		"P1_idle_cold":       {w8WindowIdleColdPolling, w8WindowIdleColdQuiet},
 		"P4_amend_same_tree": {w8WindowCommitTreeChange, w8WindowAmendSameTree},
-		"P8_idle_warm":       {w8WindowIdleWarmQuiet, w8WindowIdleWarmPolling},
+		"P8_idle_warm":       {w8WindowIdleWarmPolling, w8WindowIdleWarmQuiet},
 	}
 }
 
@@ -355,8 +359,8 @@ func w8PhasePlan(cfg w8Config) []w8Phase {
 		},
 		{
 			Name: "P1_idle_cold",
-			Detail: fmt.Sprintf("idle on the freshly indexed store, measured twice: %s quiet (%s, un-budgeted) then %s polling one read-only search every %s (%s, the arm the frozen ceiling is applied to)",
-				cfg.Idle, w8WindowIdleColdQuiet, cfg.Idle, w8IdlePollInterval, w8WindowIdleColdPolling),
+			Detail: fmt.Sprintf("idle on the freshly indexed store, measured twice: %s polling one read-only search every %s first (%s, the arm the frozen ceiling is applied to, opening where the frozen window opened) then %s quiet (%s, un-budgeted)",
+				cfg.Idle, w8IdlePollInterval, w8WindowIdleColdPolling, cfg.Idle, w8WindowIdleColdQuiet),
 			Run: (*w8Run).phaseIdleCold,
 		},
 		{
@@ -391,8 +395,8 @@ func w8PhasePlan(cfg w8Config) []w8Phase {
 		},
 		{
 			Name: "P8_idle_warm",
-			Detail: fmt.Sprintf("idle on the worked store, measured twice: %s quiet (%s, un-budgeted) then %s polling one read-only search every %s (%s, the arm the frozen ceiling is applied to)",
-				cfg.Idle, w8WindowIdleWarmQuiet, cfg.Idle, w8IdlePollInterval, w8WindowIdleWarmPolling),
+			Detail: fmt.Sprintf("idle on the worked store, measured twice: %s polling one read-only search every %s first (%s, the arm the frozen ceiling is applied to, opening where the frozen window opened) then %s quiet (%s, un-budgeted)",
+				cfg.Idle, w8IdlePollInterval, w8WindowIdleWarmPolling, cfg.Idle, w8WindowIdleWarmQuiet),
 			Run: (*w8Run).phaseIdleWarm,
 		},
 	}
@@ -1273,32 +1277,46 @@ func (r *w8Run) idleAs(duration time.Duration, mode w8IdleMode) {
 // silently absent one is indistinguishable from a zero.
 const w8NoScrapeInsideWindow = "no daemon-status scrape inside this window: the bracket's own round trip is client traffic the enclosing phase would be charged for; the phase-level counter delta covers both idle arms"
 
-// idleWindows measures idle twice: once with no client traffic, once polling.
-// The quiet arm runs first so the polling arm cannot leave its own residue
-// inside the floor.
+// idleWindows measures idle twice: once polling, once with no client traffic.
+//
+// The POLLING arm runs FIRST, because where a window sits inside the run is
+// part of what it measures. The frozen baseline's single idle window opened at
+// the idle phase's own start — immediately after P0_cold_index for P1, after
+// P7_dependent_untrack_retrack for P8 — so whatever the preceding phase left
+// decaying (a deferred WAL drain, a settling publication) was charged to the
+// window the ceiling was frozen over. Running the quiet arm first would have
+// absorbed that tail into the arm that carries NO ceiling and handed the
+// judged arm a window opening one full cfg.Idle further from the work. That
+// bias is one-directional and flatters the candidate, on exactly the two
+// phases whose frozen ceiling is live — the same class of harness-constructed
+// error the split exists to remove, pointed the other way. The quiet arm goes
+// second and inherits the polling arm's residue instead, which costs it
+// nothing it is judged on: it is an un-budgeted floor reading, and one
+// read-only search every 5 s leaves a floor's worth of residue at most.
 //
 // Both arms hold for the FULL duration, not half of it. The polling arm is the
-// frozen protocol byte for byte — the same 60 s, the same 5 s read-only search
-// — so it stays the 1:1 counterpart of the frozen P1/P8 ceiling, which is what
-// the reduction maps the frozen phase name onto (w8JudgedWindows). The quiet
-// arm is an additional measurement of a question the frozen protocol never
-// asked, and it is recorded as its own un-budgeted row rather than folded into
-// a ceiling that was never measured over it. Halving both arms would have kept
-// the phase's wall clock at 60 s and made the judged arm incomparable with the
-// number it is judged against, which is the more expensive mistake.
+// frozen protocol byte for byte — the same 60 s, the same 5 s read-only search,
+// now also opening at the same point in the run — so it stays the 1:1
+// counterpart of the frozen P1/P8 ceiling, which is what the reduction maps the
+// frozen phase name onto (w8JudgedWindows). The quiet arm is an additional
+// measurement of a question the frozen protocol never asked, and it is recorded
+// as its own un-budgeted row rather than folded into a ceiling that was never
+// measured over it. Halving both arms would have kept the phase's wall clock at
+// 60 s and made the judged arm incomparable with the number it is judged
+// against, which is the more expensive mistake.
 //
 // Neither arm's bracket scrapes `daemon status`: an interior scrape is client
 // traffic inside a phase the frozen baseline measured with none.
 func (r *w8Run) idleWindows(quietWindow, pollingWindow string, duration time.Duration) {
 	r.t.Helper()
-	r.inScrapeFreeWindow(quietWindow, fmt.Sprintf("%s idle with no client calls: the daemon's own floor (un-budgeted: the frozen protocol never measured it)", duration), func() {
-		r.idleAs(duration, w8IdleQuiet)
-	})
-	r.inScrapeFreeWindow(pollingWindow, fmt.Sprintf("%s idle polling one read-only search every %s: the frozen protocol's own measurement, unchanged in duration and period", duration, w8IdlePollInterval), func() {
+	r.inScrapeFreeWindow(pollingWindow, fmt.Sprintf("%s idle polling one read-only search every %s: the frozen protocol's own measurement, unchanged in duration, period and position (it opens the phase, as the frozen window did)", duration, w8IdlePollInterval), func() {
 		r.idleAs(duration, w8IdlePolling)
 	})
-	r.note(fmt.Sprintf("idle split: %s and %s each held %s; %s is the arm the frozen %s ceiling is applied to",
-		quietWindow, pollingWindow, duration, pollingWindow, r.phase))
+	r.inScrapeFreeWindow(quietWindow, fmt.Sprintf("%s idle with no client calls: the daemon's own floor (un-budgeted: the frozen protocol never measured it, and it runs second so the judged arm keeps the frozen window's position)", duration), func() {
+		r.idleAs(duration, w8IdleQuiet)
+	})
+	r.note(fmt.Sprintf("idle split: %s ran first and %s second, each holding %s; %s is the arm the frozen %s ceiling is applied to, and it runs first so it opens where the frozen window opened",
+		pollingWindow, quietWindow, duration, pollingWindow, r.phase))
 }
 
 func (r *w8Run) lastProbeFile() string { return r.markerPath(r.f.primary) }
@@ -2833,10 +2851,30 @@ func TestW8WindowPlanIsTheDeclaredSubWindowSplit(t *testing.T) {
 	if w8WindowPlan()["P4_amend_same_tree"][0] != w8WindowCommitTreeChange {
 		t.Fatal("the tree-changing commit must be the first window of P4")
 	}
-	// The quiet arm must come first, so the polling arm's residue cannot land
-	// inside the floor it is being compared with.
-	if w8WindowPlan()["P8_idle_warm"][0] != w8WindowIdleWarmQuiet {
-		t.Fatal("the quiet idle arm must be measured before the polling one")
+	// The POLLING arm must come first, in both idle phases: it is the arm the
+	// frozen ceiling is applied to, and the frozen window opened at the idle
+	// phase's own start. Measuring the quiet arm first pushes the judged window
+	// one full cfg.Idle away from the preceding phase and lets the un-judged
+	// arm absorb its decaying tail — a one-directional bias in the candidate's
+	// favour on the only two phases whose ceiling is live.
+	for _, phase := range []struct{ name, first string }{
+		{"P1_idle_cold", w8WindowIdleColdPolling},
+		{"P8_idle_warm", w8WindowIdleWarmPolling},
+	} {
+		if got := w8WindowPlan()[phase.name][0]; got != phase.first {
+			t.Fatalf("%s measures %s first; the polling arm carries the frozen ceiling and must open the phase", phase.name, got)
+		}
+		if w8JudgedWindows[phase.name] != phase.first {
+			t.Fatalf("%s is judged on %s but measures %s first", phase.name, w8JudgedWindows[phase.name], phase.first)
+		}
+	}
+	// The a/b suffix is the measurement order, so the judged arm is the `a`
+	// window. A name that says `b` while running first is an artifact that
+	// contradicts itself.
+	for _, window := range w8WindowPlan() {
+		if !strings.Contains(window[0], "a_") || !strings.Contains(window[1], "b_") {
+			t.Fatalf("the sub-window names no longer encode their order: %v", window)
+		}
 	}
 }
 
@@ -3167,9 +3205,15 @@ func TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
 	if len(run.windows) != 2 {
 		t.Fatalf("the idle split filed %d window rows", len(run.windows))
 	}
-	quiet, polling := run.windows[0], run.windows[1]
-	if quiet.Window != w8WindowIdleWarmQuiet || polling.Window != w8WindowIdleWarmPolling {
-		t.Fatalf("the arms are out of order: %s then %s", quiet.Window, polling.Window)
+	// The polling arm runs FIRST: it is the arm the frozen ceiling is applied
+	// to, and the frozen window opened at the idle phase's own start. With the
+	// quiet arm first, the judged window opens one full cfg.Idle later than the
+	// number it is compared against and the un-judged arm eats the preceding
+	// phase's decaying tail — a bias that only ever lowers the judged reading.
+	polling, quiet := run.windows[0], run.windows[1]
+	if polling.Window != w8WindowIdleWarmPolling || quiet.Window != w8WindowIdleWarmQuiet {
+		t.Fatalf("the arms are out of order: %s then %s; the judged (polling) arm must open the phase",
+			run.windows[0].Window, run.windows[1].Window)
 	}
 	if quiet.ClientCalls != 0 || polling.ClientCalls != 1 {
 		t.Fatalf("client traffic is misattributed: quiet=%d polling=%d", quiet.ClientCalls, polling.ClientCalls)
@@ -3198,14 +3242,20 @@ func TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
 		w8JudgedWindows["P1_idle_cold"] != w8WindowIdleColdPolling {
 		t.Fatalf("the frozen idle phases must be judged on the polling arm: %+v", w8JudgedWindows)
 	}
-	named := false
+	named, ordered := false, false
 	for _, note := range run.phaseNotes {
 		if strings.Contains(note, w8WindowIdleWarmPolling) && strings.Contains(note, "ceiling is applied to") {
 			named = true
 		}
+		if strings.Contains(note, w8WindowIdleWarmPolling+" ran first") {
+			ordered = true
+		}
 	}
 	if !named {
 		t.Fatalf("the phase does not say which arm carries the frozen ceiling: %v", run.phaseNotes)
+	}
+	if !ordered {
+		t.Fatalf("the phase does not record that the judged arm opened it: %v", run.phaseNotes)
 	}
 }
 
@@ -3281,6 +3331,69 @@ func TestW8InWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *testing.T
 	}
 	if run.windowOpen {
 		t.Fatal("a window outlived its body")
+	}
+}
+
+// TestW8ScrapingBracketTakesBothScrapesAndReportsATrueDelta pins the `true`
+// direction of openBracketScraping, which nothing pinned before.
+//
+// The scrape-free bracket added for the idle arms made the opening scrape
+// conditional. Only the `false` direction was covered — by absence checks — so
+// a bracket that stopped taking its OPENING scrape passed the whole suite. The
+// failure shape is what makes that gap expensive: with opening.counters nil and
+// opening.countersErr nil, closeWindow and closePhase take the `default` arm
+// and publish w8CounterDelta(nil, after) — the daemon's ABSOLUTE counters
+// presented as a per-window delta. Silently wrong, not visibly missing, in
+// exactly the series the idle split nominates as the compensation for the
+// window scrapes it removed.
+//
+// The stub advances one counter per invocation, so a bracket that took both
+// scrapes reports a delta of 1 and a bracket that took only the closing one
+// reports the running total.
+func TestW8ScrapingBracketTakesBothScrapesAndReportsATrueDelta(t *testing.T) {
+	const series = "views_generation_published_total"
+	f := w8StubFixture(t, `
+n=0
+[ -f "$GXW8_STUB_COUNT" ] && n=$(cat "$GXW8_STUB_COUNT")
+n=$((n+1))
+printf '%s' "$n" > "$GXW8_STUB_COUNT"
+printf '{"views": {"counters": {"`+series+`": %d}}}' "$((100 + n))"
+`)
+	f.env = append(f.env, "GXW8_STUB_COUNT="+filepath.Join(t.TempDir(), "count"))
+	run := w8StubRun(t, f, "candidate")
+	run.phase = "P4_amend_same_tree"
+
+	run.inWindow(w8WindowCommitTreeChange, "a scraping window", func() {})
+	run.inScrapeFreeWindow(w8WindowAmendSameTree, "a scrape-free window", func() {})
+	if len(run.windows) != 2 {
+		t.Fatalf("windows = %+v", run.windows)
+	}
+
+	scraping := run.windows[0]
+	if scraping.CountersError != "" {
+		t.Fatalf("a scraping window reported a counter error against a stub that answers: %q", scraping.CountersError)
+	}
+	if len(scraping.CountersDelta) != 1 || scraping.CountersDelta[series] != 1 {
+		t.Fatalf("a scraping window's counter delta is %+v, want %s=1 (one stub tick between the opening and the closing scrape); "+
+			"a delta the size of the running total means the OPENING scrape was skipped and an absolute reading was published as a delta",
+			scraping.CountersDelta, series)
+	}
+	// The bracket's own two round trips are instrumentation, not the window's
+	// traffic: the opening scrape is taken before the client-call mark and the
+	// closing one after it.
+	if scraping.ClientCalls != 0 {
+		t.Fatalf("a scraping window charged itself %d client calls; its own scrapes sit outside its measured span", scraping.ClientCalls)
+	}
+
+	free := run.windows[1]
+	if free.CountersError != w8NoScrapeInsideWindow {
+		t.Fatalf("a scrape-free window does not name why it carries no delta: %q", free.CountersError)
+	}
+	if len(free.CountersDelta) != 0 {
+		t.Fatalf("a scrape-free window published a counter delta, so its bracket scraped: %+v", free.CountersDelta)
+	}
+	if free.ClientCalls != 0 {
+		t.Fatalf("a scrape-free window made %d client calls", free.ClientCalls)
 	}
 }
 
@@ -3477,6 +3590,19 @@ func TestW8PhaseBodiesReachTheInstrumentTheyAreNamedFor(t *testing.T) {
 		if strings.Contains(bodies["idleWindows"], halved) {
 			t.Errorf("idleWindows splits the frozen idle duration between the arms (%q); the polling arm must stay the frozen window", halved)
 		}
+	}
+	// The judged (polling) arm is bracketed FIRST in the source, not just
+	// declared first in w8WindowPlan. Position inside the run is part of the
+	// measurement: the frozen window opened at the idle phase's own start, and
+	// an arm that opens one full cfg.Idle later reads lower for a reason that
+	// has nothing to do with the daemon.
+	polling := strings.Index(bodies["idleWindows"], "r.inScrapeFreeWindow(pollingWindow")
+	quiet := strings.Index(bodies["idleWindows"], "r.inScrapeFreeWindow(quietWindow")
+	switch {
+	case polling < 0 || quiet < 0:
+		t.Errorf("idleWindows no longer brackets both arms scrape-free (polling=%d quiet=%d)", polling, quiet)
+	case quiet < polling:
+		t.Error("idleWindows measures the quiet arm before the polling one; the judged arm must open the phase where the frozen window opened")
 	}
 }
 
