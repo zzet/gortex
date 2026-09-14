@@ -35,7 +35,11 @@ import (
 //   - sqlite_sequence.seq for view_generations does not move. AUTOINCREMENT
 //     hands out a number per INSERT and never reuses it, so an allocation that
 //     was inserted and rolled back or deleted is still visible here. This is the
-//     single strongest external allocation witness.
+//     single strongest external allocation witness. Its ROW is part of the
+//     reading: AUTOINCREMENT writes that row on the first insert and never
+//     drops it, so an absent row is the positive statement "no generation has
+//     ever been allocated in this store" and is reported as such, cross-checked
+//     against an empty view_generations table (w8m5ReadCatalog).
 //   - the catalog's semantic state is byte-identical across the case. That is
 //     state equality, not statement counting: an UPDATE that rewrote a column
 //     with the value it already held is invisible from outside the process. It
@@ -51,6 +55,15 @@ import (
 //     are not: on this fixture a real working-tree content change moves none of
 //     them (see w8m5Calibrate), so without it "nothing allocated" is the same
 //     observation a genuine edit produces and every no-op row is vacuous.
+//
+// The fixture carries a DEPENDENT CHECKOUT for the same reason the calibration
+// exists. Since the consumer gate (internal/indexer/dedicated_base_startup.go,
+// `out.Skipped = "no dependent checkout"`) a family whose only checkout is the
+// primary publishes no committed base and allocates no generation at all, so
+// on a single-checkout fixture every view-catalog witness above is as still for
+// a real committed change as it is for a no-op. The dependent is the consumer
+// that makes the committed-base lane run; the calibration FAILS if the
+// committed half stops allocating, so the dependent cannot be removed quietly.
 //
 // No clause is asserted on faith. The matrix opens with a CALIBRATION that
 // makes a real, view-visible content change — first dirty, then committed — and
@@ -160,6 +173,20 @@ func w8m5TableProblems(rows []w8m5Row) []string {
 	return problems
 }
 
+// w8m5TableFailures lists every row that was marked FAILED, as a reportable
+// sentence. It is pure, and render reports each entry, so a row that a scoring
+// path marked FAILED fails the matrix from the table itself — a scoring path
+// that marks a row and then drops its own report cannot produce a green run.
+func w8m5TableFailures(rows []w8m5Row) []string {
+	var failed []string
+	for _, row := range rows {
+		if row.Status == w8m5StatusFail {
+			failed = append(failed, fmt.Sprintf("%s (%s): %s", row.Case, row.Gate, row.Detail))
+		}
+	}
+	return failed
+}
+
 // render logs the table and, when an artifact directory is configured, writes
 // it as JSON next to the sustained harness's artifacts.
 func (tb *w8m5Table) render() {
@@ -173,6 +200,9 @@ func (tb *w8m5Table) render() {
 	tb.t.Log(b.String())
 	for _, problem := range w8m5TableProblems(tb.rows) {
 		tb.t.Errorf("outcome table is not reportable: %s", problem)
+	}
+	for _, failure := range w8m5TableFailures(tb.rows) {
+		tb.t.Errorf("%s: a row is FAILED: %s", tb.name, failure)
 	}
 	if dir := os.Getenv("GXW8_ARTIFACT_DIR"); dir != "" {
 		path := filepath.Join(dir, tb.name+".json")
@@ -257,7 +287,19 @@ type w8m5Bookkeeping struct {
 
 // w8m5Catalog is one external observation of the catalog.
 type w8m5Catalog struct {
-	Sequence    int64             `json:"view_generations_seq"`
+	Sequence int64 `json:"view_generations_seq"`
+	// SequenceRow says whether sqlite_sequence carries a row for
+	// view_generations at all.
+	//
+	// AUTOINCREMENT writes that row on the table's FIRST insert and never
+	// removes it, so the row's absence is the positive fact "no generation
+	// has ever been allocated in this store" — not a failed read. It is the
+	// NORMAL state of a repository family with no dependent checkout: since
+	// the consumer gate (internal/indexer/dedicated_base_startup.go:776,
+	// `out.Skipped = "no dependent checkout"`) such a family defers its
+	// committed-base publication and performs zero catalog DML, so
+	// view_generations never takes a rowid.
+	SequenceRow bool              `json:"view_generations_seq_row"`
 	Generations []w8m5Generation  `json:"view_generations"`
 	Checkouts   []w8m5Checkout    `json:"checkouts"`
 	Routes      []w8m5Route       `json:"checkout_routes"`
@@ -284,7 +326,25 @@ func w8m5ReadCatalog(ctx context.Context, db *sql.DB) w8m5Catalog {
 			catalog.Errors = append(catalog.Errors, err.Error())
 		}
 	}
-	note(db.QueryRowContext(ctx, "SELECT seq FROM sqlite_sequence WHERE name='view_generations'").Scan(&catalog.Sequence))
+	// An absent sqlite_sequence row is a reading, not a read failure: see
+	// w8m5Catalog.SequenceRow. Reporting sql.ErrNoRows as a catalog read error
+	// made every no-op row in this matrix fail on the INSTRUMENT rather than on
+	// the daemon, once the consumer gate stopped publishing for a family with
+	// no dependent checkout.
+	//
+	// Only the absent row is absorbed, and only as far as it goes: a missing
+	// table, a closed database or any other scan failure is still an error,
+	// because "this store allocated nothing" and "this store cannot be read"
+	// are different facts and only one of them belongs in a census. The census
+	// cross-check below refuses the incoherent third case.
+	switch err := db.QueryRowContext(ctx, "SELECT seq FROM sqlite_sequence WHERE name='view_generations'").Scan(&catalog.Sequence); {
+	case errors.Is(err, sql.ErrNoRows):
+		catalog.Sequence, catalog.SequenceRow = 0, false
+	case err != nil:
+		note(err)
+	default:
+		catalog.SequenceRow = true
+	}
 
 	rows, err := db.QueryContext(ctx, `SELECT generation_id, owner_kind, graph_id, COALESCE(checkout_id,''), generation_kind,
 		base_generation_id, tree_oid, COALESCE(provenance_commit_oid,''), config_hash, resolver_version, dependency_revision,
@@ -309,6 +369,16 @@ func w8m5ReadCatalog(ctx context.Context, db *sql.DB) w8m5Catalog {
 		}
 		note(rows.Err())
 		_ = rows.Close()
+	}
+	// The cross-check that turns "no sqlite_sequence row" from a swallowed
+	// error into a POSITIVE census reading: AUTOINCREMENT writes the sequence
+	// row on the first insert and never drops it, so a store that holds
+	// view_generations rows MUST carry one. A store where the two disagree
+	// cannot be read coherently and is reported as a read error, exactly as a
+	// missing table is.
+	if !catalog.SequenceRow && len(catalog.Generations) > 0 {
+		note(fmt.Errorf("sqlite_sequence carries no view_generations row while view_generations holds %d row(s): the allocation witness and the census disagree",
+			len(catalog.Generations)))
 	}
 
 	rows, err = db.QueryContext(ctx, `SELECT checkout_id, state, desired_mode, effective_mode, head_ref, head_commit, head_tree,
@@ -369,6 +439,12 @@ func w8m5CatalogDiff(before, after w8m5Catalog) []string {
 	var diffs []string
 	if before.Sequence != after.Sequence {
 		diffs = append(diffs, fmt.Sprintf("view_generations seq %d -> %d", before.Sequence, after.Sequence))
+	}
+	// The first allocation a store ever performs is the one case the numeric
+	// delta alone reads as an ordinary step: it is also the moment the store
+	// stops being able to say "nothing was ever allocated here". Name it.
+	if before.SequenceRow != after.SequenceRow {
+		diffs = append(diffs, fmt.Sprintf("view_generations sqlite_sequence row present %v -> %v", before.SequenceRow, after.SequenceRow))
 	}
 	diffs = append(diffs, w8m5DiffRows("view_generations", w8m5KeyedGenerations(before.Generations), w8m5KeyedGenerations(after.Generations))...)
 	diffs = append(diffs, w8m5DiffRows("checkouts", w8m5KeyedCheckouts(before.Checkouts), w8m5KeyedCheckouts(after.Checkouts))...)
@@ -691,6 +767,15 @@ type w8m5NoopObservation struct {
 	CounterDelta  map[string]int64
 	// CountersError is non-empty when `daemon status` could not be read.
 	CountersError string
+	// GenerationsAfter and SequenceRowAfter are the CLOSING census, not a
+	// delta. Together they let a row state the no-allocation fact positively
+	// — "view_generations is empty and AUTOINCREMENT never took a rowid for
+	// it, so no generation was ever allocated in this store" — instead of
+	// resting on a difference of zero between two numbers that were both
+	// absent. They are also the pair the reader cross-checks: rows with no
+	// sequence row is an incoherent census, and that is a failure.
+	GenerationsAfter int
+	SequenceRowAfter bool
 }
 
 // w8m5Verdict is one case's decision: a status, the clauses that failed and the
@@ -740,7 +825,26 @@ func w8m5NoopVerdict(expect w8m5NoopExpect, live w8m5Liveness, obs w8m5NoopObser
 		fail("payload read error: %s", err)
 	}
 
+	// An incoherent closing census is a read failure of the same class as the
+	// two above: AUTOINCREMENT writes the sequence row on the first insert and
+	// never drops it, so view_generations rows with no sequence row means the
+	// store cannot be read coherently — never that it allocated nothing.
+	if !obs.SequenceRowAfter && obs.GenerationsAfter != 0 {
+		fail("census incoherent: view_generations holds %d row(s) with no sqlite_sequence row", obs.GenerationsAfter)
+	}
+
+	// census states the closing allocation fact POSITIVELY, so a row says what
+	// the store looks like rather than only that two numbers were equal.
+	census := func() {
+		if obs.SequenceRowAfter {
+			record("the store has allocated generations before (view_generations holds %d row(s) and AUTOINCREMENT carries a sequence for it)", obs.GenerationsAfter)
+			return
+		}
+		record("no generation was allocated: view_generations is empty and AUTOINCREMENT never took a rowid for it")
+	}
+
 	if expect.Change == w8m5RealChange {
+		census()
 		if len(obs.PayloadDiffs) == 0 {
 			fail("gate2 instrument: a real, view-visible content change moved no payload row at all — the witness every no-op row in this matrix rests on is blind")
 		} else {
@@ -767,6 +871,7 @@ func w8m5NoopVerdict(expect w8m5NoopExpect, live w8m5Liveness, obs w8m5NoopObser
 		record("not measurable: the gate-2 instrument was never calibrated, so no no-op clause can be asserted")
 		return verdict
 	}
+	census()
 
 	asserted := 0
 	if live.DirtyPayload {
@@ -1251,11 +1356,13 @@ func (h *w8m5NoopHarness) run(c w8m5NoopCase) {
 	}
 
 	obs := w8m5NoopObservation{
-		CatalogErrors: after.Errors,
-		PayloadErrors: append(append([]string{}, beforePayload.Errors...), afterPayload.Errors...),
-		SeqDelta:      after.Sequence - before.Sequence,
-		CatalogDiffs:  w8m5CatalogDiff(before, after),
-		PayloadDiffs:  w8m5PayloadDiff(beforePayload, afterPayload),
+		CatalogErrors:    after.Errors,
+		PayloadErrors:    append(append([]string{}, beforePayload.Errors...), afterPayload.Errors...),
+		SeqDelta:         after.Sequence - before.Sequence,
+		CatalogDiffs:     w8m5CatalogDiff(before, after),
+		PayloadDiffs:     w8m5PayloadDiff(beforePayload, afterPayload),
+		GenerationsAfter: len(after.Generations),
+		SequenceRowAfter: after.SequenceRow,
 	}
 	afterCounters, err := h.counters()
 	switch {
@@ -1570,6 +1677,36 @@ func w8m5LivenessFrom(dirty, committed w8m5CalibrationHalf) w8m5Liveness {
 	}
 }
 
+// w8m5CalibrationProblems scores the calibration row itself: what must be true
+// of the INSTRUMENT before any no-op row asserts with it. It is pure so both
+// rules are pinned without a daemon.
+//
+// Rule 1 — a real content change must move SOMETHING this matrix can observe,
+// in one half or the other. If it moves nothing, "nothing moved" is also what a
+// genuine edit produces and no no-op row can carry evidence.
+//
+// Rule 2 — the COMMITTED half must allocate. It is the only half that exercises
+// the committed-base lane, and it is the only half that can make the sequence
+// and allocation-counter clauses live; without it the nine no-op rows fall back
+// to the payload witness alone and same_tree_amend's gate-4 replay assertion
+// has no counters to read. That is precisely the state the fixture's dependent
+// checkout exists to prevent — a family with no dependent checkout defers its
+// committed-base publication (internal/indexer/dedicated_base_startup.go:776) —
+// so reporting it as a FAILURE is what keeps that dependent load-bearing:
+// delete it and this row names the consequence instead of the matrix quietly
+// degrading to "NOT ASSERTED" everywhere.
+func w8m5CalibrationProblems(dirty, committed w8m5CalibrationHalf) []string {
+	var problems []string
+	if !dirty.moved() && !committed.moved() {
+		problems = append(problems, "gate2 instrument: a real content change moved NOTHING this matrix can observe, in either half — no no-op row in this matrix can carry evidence")
+	}
+	if committed.Seq == 0 && len(committed.Counters) == 0 {
+		problems = append(problems, "gate2 instrument: the committed half allocated nothing — no sequence movement and no allocation counter — so the sequence and counter clauses are dead for every no-op row and the gate-4 replay assertion has nothing to read."+
+			" A family with no dependent checkout defers its committed-base publication (internal/indexer/dedicated_base_startup.go:776), so this matrix's fixture must carry one")
+	}
+	return problems
+}
+
 // w8m5Calibrate measures the instrument BEFORE the matrix asserts with it.
 //
 // The adversarial review's blocker: on this fixture a real, same-size,
@@ -1641,10 +1778,12 @@ func w8m5Calibrate(parent *testing.T, h *w8m5NoopHarness, rel string, index int)
 		if !h.live.DirtyPayload {
 			row.Detail += " | the payload witness did NOT move for a working-tree-only change: every working-tree no-op row is reported as not measurable rather than as a pass"
 		}
-		if !dirty.moved() && !committed.moved() {
+		// Both instrument rules live in w8m5CalibrationProblems, pure and
+		// unit-pinned; this site only reports what it returns.
+		for _, problem := range w8m5CalibrationProblems(dirty, committed) {
 			row.Status = w8m5StatusFail
-			row.Detail += " | gate2 instrument: a real content change moved NOTHING this matrix can observe, in either half — no no-op row in this matrix can carry evidence"
-			h.t.Errorf("matrix1 %s: %s", w8m5CalibrationCase, row.Detail)
+			row.Detail += " | " + problem
+			h.t.Errorf("matrix1 %s: %s", w8m5CalibrationCase, problem)
 		}
 		h.table.add(row)
 	})
@@ -1661,6 +1800,32 @@ func TestW8MatrixNoopFamily(t *testing.T) {
 
 	f := w8m5NewFixture(t, binary, spec)
 	defer f.stop()
+
+	// A dependent checkout, added before anything is measured.
+	//
+	// It is not decoration and it is not a case: it is what makes the
+	// view-catalog witnesses this matrix owns LIVE AT ALL. Since the consumer
+	// gate (internal/indexer/dedicated_base_startup.go:774-779, the
+	// `if !consumers { out.Skipped = "no dependent checkout" }` arm) a family
+	// whose only checkout is the primary never publishes a committed base and
+	// therefore never allocates a generation — so on a single-checkout fixture
+	// sqlite_sequence, view_generations and the whole allocation counter
+	// family stay still for a REAL committed change exactly as they do for a
+	// no-op, and every no-op row resting on them says nothing. Measured: the
+	// same calibration that moved `seq +1, catalog 3 change(s), [claim{built}
+	// publish{delta} generation_published{checkout}]` before the gate moved
+	// `seq +0, catalog 1 change(s), []` after it, and the gate-4 replay
+	// assertion of same_tree_amend lost its counters with them.
+	//
+	// One dependent restores the committed-base lane: the family has a
+	// consumer, the calibration's committed half publishes again, and the nine
+	// no-op rows assert against witnesses a real change is proven to move. The
+	// calibration below FAILS if that stops being true, so this cannot be
+	// deleted silently.
+	dependent := filepath.Join(f.root, "w8m5dep")
+	f.git(f.primary, "worktree", "add", "-b", "w8m5-dependent", dependent)
+	f.awaitSymbolAs(dependent, w8PrimaryMarker, filepath.Join(dependent, "marker.go"), w8m5ProbeTimeout, issue767AsAutomaticWorktree)
+	f.settle()
 
 	index := 0
 	rel := w8FilePath(index%spec.Packages, index)
@@ -2399,5 +2564,218 @@ func TestW8m5ReadPayloadSelectsTheBaseRowsOfTheNamedFile(t *testing.T) {
 	}
 	if elsewhere.RepoDigest != moved.RepoDigest {
 		t.Fatal("the repository digest depends on which file was named")
+	}
+}
+
+// TestW8m5ReadCatalogReadsAStoreThatNeverAllocatedAGeneration is the
+// instrument's regression for the consumer gate.
+//
+// Since internal/indexer/dedicated_base_startup.go declines a committed-base
+// publication for a family with no dependent checkout, an isolated fixture can
+// legitimately reach the end of a matrix with view_generations empty — and then
+// sqlite_sequence carries no row for it, because AUTOINCREMENT only writes that
+// row on the first insert. Reporting sql.ErrNoRows as a catalog read error made
+// every case of matrix 1 fail on that one instrument line rather than on the
+// daemon (nine cases, one shared message, with the calibration still passing).
+//
+// The absent row is absorbed as 0 and as the positive reading "nothing was ever
+// allocated here", and NOTHING else is: a missing table is still an error, and
+// so is the incoherent census where view_generations holds rows while the
+// sequence row is gone.
+func TestW8m5ReadCatalogReadsAStoreThatNeverAllocatedAGeneration(t *testing.T) {
+	ctx := t.Context()
+	open := func(name string) *sql.DB {
+		t.Helper()
+		db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		db.SetMaxOpenConns(1)
+		return db
+	}
+	schema := func(db *sql.DB) {
+		t.Helper()
+		for _, statement := range []string{
+			`CREATE TABLE view_generations (generation_id INTEGER PRIMARY KEY AUTOINCREMENT, owner_kind TEXT NOT NULL DEFAULT '',
+				graph_id TEXT NOT NULL DEFAULT '', checkout_id TEXT, generation_kind TEXT NOT NULL DEFAULT '',
+				base_generation_id INTEGER, tree_oid TEXT NOT NULL DEFAULT '', provenance_commit_oid TEXT,
+				config_hash TEXT NOT NULL DEFAULT '', resolver_version TEXT NOT NULL DEFAULT '',
+				dependency_revision TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT '',
+				covered_files INTEGER NOT NULL DEFAULT 0, affected_files INTEGER NOT NULL DEFAULT 0,
+				storage_bytes INTEGER NOT NULL DEFAULT 0, completeness TEXT NOT NULL DEFAULT '',
+				error TEXT NOT NULL DEFAULT '', last_selected INTEGER NOT NULL DEFAULT 0)`,
+			`CREATE TABLE checkouts (checkout_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT '',
+				desired_mode TEXT NOT NULL DEFAULT '', effective_mode TEXT NOT NULL DEFAULT '',
+				head_ref TEXT NOT NULL DEFAULT '', head_commit TEXT NOT NULL DEFAULT '',
+				head_tree TEXT NOT NULL DEFAULT '', locked INTEGER NOT NULL DEFAULT 0,
+				prunable INTEGER NOT NULL DEFAULT 0, removal_evidence TEXT NOT NULL DEFAULT '',
+				last_error TEXT NOT NULL DEFAULT '', last_seen INTEGER NOT NULL DEFAULT 0,
+				last_accessible INTEGER NOT NULL DEFAULT 0)`,
+			`CREATE TABLE checkout_routes (checkout_id TEXT PRIMARY KEY, graph_id TEXT NOT NULL DEFAULT '',
+				commit_generation_id INTEGER, dirty_generation_id INTEGER, route_epoch INTEGER NOT NULL DEFAULT 0,
+				state TEXT NOT NULL DEFAULT '')`,
+			`CREATE TABLE repository_families (family_id TEXT PRIMARY KEY, last_seen INTEGER NOT NULL DEFAULT 0)`,
+			// An unrelated AUTOINCREMENT table, so sqlite_sequence itself
+			// exists and the absent row is the row for view_generations
+			// specifically, not the whole table.
+			`CREATE TABLE unrelated (id INTEGER PRIMARY KEY AUTOINCREMENT)`,
+		} {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("%s: %v", statement, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx, "INSERT INTO unrelated DEFAULT VALUES"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// (1) A family that never allocated: the read succeeds, reports 0, and
+	// says the row is absent rather than inventing one.
+	db := open("never.sqlite")
+	schema(db)
+	never := w8m5ReadCatalog(ctx, db)
+	if len(never.Errors) != 0 {
+		t.Fatalf("a store that never allocated a generation was read as an error: %v", never.Errors)
+	}
+	if never.Sequence != 0 || never.SequenceRow {
+		t.Fatalf("sequence = %d row=%v, want 0 and absent", never.Sequence, never.SequenceRow)
+	}
+	if len(never.Generations) != 0 {
+		t.Fatalf("the census invented generations: %+v", never.Generations)
+	}
+	// The whole matrix hangs off this: a no-op case over such a store must be
+	// decidable, and it must state the no-allocation fact positively.
+	verdict := w8m5NoopVerdict(w8m5NoopExpect{}, w8m5LiveEverything(), w8m5NoopObservation{
+		GenerationsAfter: len(never.Generations), SequenceRowAfter: never.SequenceRow,
+	})
+	if verdict.Status != w8m5StatusPass {
+		t.Fatalf("a no-op over a store that never allocated was scored %s: %+v", verdict.Status, verdict)
+	}
+	if !strings.Contains(strings.Join(verdict.Recorded, " ;; "), "no generation was allocated") {
+		t.Fatalf("the verdict did not state the no-allocation fact positively: %v", verdict.Recorded)
+	}
+
+	// (2) An allocation is still reported as itself, and the sequence row's
+	// arrival is named as a catalog change in its own right.
+	if _, err := db.ExecContext(ctx, "INSERT INTO view_generations(state, tree_oid) VALUES ('ready','tree-a')"); err != nil {
+		t.Fatal(err)
+	}
+	allocated := w8m5ReadCatalog(ctx, db)
+	if len(allocated.Errors) != 0 {
+		t.Fatalf("an allocated store reported %v", allocated.Errors)
+	}
+	if allocated.Sequence != 1 || !allocated.SequenceRow || len(allocated.Generations) != 1 {
+		t.Fatalf("allocation was not observed: seq=%d row=%v rows=%d", allocated.Sequence, allocated.SequenceRow, len(allocated.Generations))
+	}
+	diffs := strings.Join(w8m5CatalogDiff(never, allocated), " ;; ")
+	if !strings.Contains(diffs, "view_generations seq 0 -> 1") {
+		t.Fatalf("the sequence movement was not named: %s", diffs)
+	}
+	if !strings.Contains(diffs, "sqlite_sequence row present false -> true") {
+		t.Fatalf("the first allocation a store ever performs was not named: %s", diffs)
+	}
+	if fail := w8m5NoopVerdict(w8m5NoopExpect{}, w8m5LiveEverything(), w8m5NoopObservation{
+		SeqDelta: allocated.Sequence - never.Sequence, CatalogDiffs: w8m5CatalogDiff(never, allocated),
+		GenerationsAfter: len(allocated.Generations), SequenceRowAfter: allocated.SequenceRow,
+	}); fail.Status != w8m5StatusFail {
+		t.Fatalf("a no-op that allocated a generation was scored %s: %+v", fail.Status, fail)
+	}
+
+	// (3) An incoherent census — rows with no sequence row — is a read error,
+	// not a store that "allocated nothing". This is the clause that keeps the
+	// absorption in (1) from being a blanket swallow.
+	if _, err := db.ExecContext(ctx, "DELETE FROM sqlite_sequence WHERE name='view_generations'"); err != nil {
+		t.Fatal(err)
+	}
+	incoherent := w8m5ReadCatalog(ctx, db)
+	if len(incoherent.Errors) == 0 {
+		t.Fatalf("a census with rows and no sequence row was read as coherent: %+v", incoherent)
+	}
+	if !strings.Contains(strings.Join(incoherent.Errors, " ;; "), "disagree") {
+		t.Fatalf("the incoherent census was not named: %v", incoherent.Errors)
+	}
+	if bad := w8m5NoopVerdict(w8m5NoopExpect{}, w8m5LiveEverything(), w8m5NoopObservation{
+		GenerationsAfter: len(incoherent.Generations), SequenceRowAfter: incoherent.SequenceRow,
+	}); bad.Status != w8m5StatusFail {
+		t.Fatalf("an incoherent census was scored %s: %+v", bad.Status, bad)
+	}
+
+	// (4) A missing table is still an error: "allocated nothing" and "cannot
+	// be read" must never collapse into one reading.
+	if _, err := db.ExecContext(ctx, "DROP TABLE view_generations"); err != nil {
+		t.Fatal(err)
+	}
+	if missing := w8m5ReadCatalog(ctx, db); len(missing.Errors) == 0 {
+		t.Fatalf("a missing view_generations table was read as an empty census: %+v", missing)
+	}
+}
+
+// TestW8m5CalibrationProblemsRequireTheCommittedHalfToAllocate pins the two
+// instrument rules the calibration row is scored on, and in particular the one
+// that keeps matrix 1's dependent checkout load-bearing: a committed half that
+// allocated neither a sequence number nor an allocation counter is a FAILURE,
+// not a quiet degradation to "NOT ASSERTED" on every no-op row.
+func TestW8m5CalibrationProblemsRequireTheCommittedHalfToAllocate(t *testing.T) {
+	dirtyMoved := w8m5CalibrationHalf{Label: "dirty", Payload: []string{"payload row changed: x"}}
+	committedAllocated := w8m5CalibrationHalf{Label: "commit", Seq: 1,
+		Catalog: []string{"seq 0 -> 1"}, Counters: []string{"views_dedicated_base_claim_total{outcome=built}"}}
+
+	// (1) The calibrated shape: both rules hold, nothing to report.
+	if problems := w8m5CalibrationProblems(dirtyMoved, committedAllocated); len(problems) != 0 {
+		t.Fatalf("a calibrated instrument reported problems: %v", problems)
+	}
+
+	// (2) The dependent-checkout rule. A committed half that moved the catalog
+	// but allocated nothing — exactly what a single-checkout family produces
+	// since the consumer gate — must FAIL, and must name the consumer gate.
+	committedSilent := w8m5CalibrationHalf{Label: "commit", Catalog: []string{"HeadCommit a -> b"}}
+	problems := w8m5CalibrationProblems(dirtyMoved, committedSilent)
+	if len(problems) != 1 {
+		t.Fatalf("a committed half that allocated nothing produced %d problem(s): %v", len(problems), problems)
+	}
+	for _, want := range []string{"the committed half allocated nothing", "dependent checkout", "dedicated_base_startup.go:776"} {
+		if !strings.Contains(problems[0], want) {
+			t.Fatalf("the problem did not name %q: %s", want, problems[0])
+		}
+	}
+
+	// (3) Either allocation witness alone satisfies the rule: the sequence...
+	if problems := w8m5CalibrationProblems(dirtyMoved, w8m5CalibrationHalf{Label: "commit", Seq: 1}); len(problems) != 0 {
+		t.Fatalf("a committed half that moved the sequence reported problems: %v", problems)
+	}
+	// ...or an allocation counter.
+	if problems := w8m5CalibrationProblems(dirtyMoved, w8m5CalibrationHalf{Label: "commit",
+		Counters: []string{"views_generation_published_total{owner=checkout}"}}); len(problems) != 0 {
+		t.Fatalf("a committed half that moved an allocation counter reported problems: %v", problems)
+	}
+
+	// (4) A dead instrument reports BOTH rules, so the row says the whole
+	// truth rather than the first thing that went wrong.
+	if problems := w8m5CalibrationProblems(w8m5CalibrationHalf{Label: "dirty"}, w8m5CalibrationHalf{Label: "commit"}); len(problems) != 2 {
+		t.Fatalf("a dead instrument produced %d problem(s), want 2: %v", len(problems), problems)
+	}
+}
+
+// TestW8m5TableFailuresReportEveryFailedRow pins the table-level backstop: a
+// row marked FAILED is reported from the table itself, so a scoring path that
+// marks a row and drops its own report cannot produce a green matrix.
+func TestW8m5TableFailuresReportEveryFailedRow(t *testing.T) {
+	rows := []w8m5Row{
+		{Case: "ok", Gate: "gate2", Status: w8m5StatusPass, Detail: "nothing moved"},
+		{Case: "skipped", Gate: "gate1", Status: w8m5StatusSkip, Detail: "declared gap"},
+		{Case: "broken", Gate: "gate2", Status: w8m5StatusFail, Detail: "an unchanged-content commit allocated a generation"},
+	}
+	failed := w8m5TableFailures(rows)
+	if len(failed) != 1 {
+		t.Fatalf("reported %d failed row(s), want 1: %v", len(failed), failed)
+	}
+	for _, want := range []string{"broken", "gate2", "allocated a generation"} {
+		if !strings.Contains(failed[0], want) {
+			t.Fatalf("the reported failure did not name %q: %s", want, failed[0])
+		}
+	}
+	if none := w8m5TableFailures(rows[:2]); len(none) != 0 {
+		t.Fatalf("a table with no failed row reported %v", none)
 	}
 }

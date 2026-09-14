@@ -802,6 +802,19 @@ func w8m5EditCases() []w8m5EditCase {
 				// file (found=true, repo_prefix=\"issue767\")"), so asserting
 				// its absence here would report a product opinion as a
 				// composition defect. The answer is recorded and compared.
+				//
+				// And the two indexes DISAGREE, which is a gate-1 divergence
+				// and not a product opinion. Measured at the final source, on
+				// three samples a minute apart: W8m5IgnoredSymbol is present in
+				// the incrementally maintained view and absent from a fresh
+				// isolated index of the SAME tree — same bytes on disk, same
+				// .gitignore, and the fresh fixture leaves the file untracked
+				// too (newIssue767FixtureWithCorpus stages with `git add .`,
+				// which honours the ignore). The cold path applies the ignore
+				// to a file that is present when it indexes; the incremental
+				// path admits the same file when the watcher sees it appear.
+				// The row stays RED on purpose: it is the divergence, not the
+				// policy, that this gate exists to catch.
 				h.observe("the ignored, never-committed file", "W8m5IgnoredSymbol", ignored)
 				return w8m5Effect{
 					Files:   []string{h.rel(0)},
@@ -869,18 +882,74 @@ func w8m5EditCases() []w8m5EditCase {
 		{
 			Name: "commit_unchanged_content", Gate: "gate2+gate4",
 			Apply: func(h *w8m5EditHarness) w8m5Effect {
-				// Commit whatever the previous case left dirty, then commit
-				// again over an unchanged tree: the second commit is the
-				// replay the gate names.
-				h.commit("land the pending edits")
+				// Make a real content change, commit it, then commit again
+				// over an unchanged tree: the second commit is the replay the
+				// gate names and the first is this row's CALIBRATION.
+				//
+				// The calibration is not optional. "The unchanged-content
+				// commit did not build" is evidence only where a commit that
+				// really did change content is known to build, and since the
+				// consumer gate (internal/indexer/dedicated_base_startup.go:
+				// 774-779) a family with no dependent checkout builds and
+				// publishes for NEITHER — which is how this row came to fail a
+				// daemon that was doing exactly what the branch promises.
+				// Measuring the landing commit turns each clause into either a
+				// real assertion or a named "not asserted", and never into a
+				// pass that means nothing (w8m5UnchangedCommitVerdict).
+				//
+				// The content change is made HERE rather than inherited from
+				// whatever the previous case left dirty: h.commit stages with
+				// --allow-empty, so borrowing the content would make every
+				// "a commit that really did change content …" sentence depend
+				// on case ordering, which GXW8_MATRIX_CASES can break. The
+				// case advances its own file's revision, and the landing
+				// commit's tree is then compared with its parent's, so the
+				// calibration is credited with content only when git agrees
+				// that content moved.
+				rel, index := h.rel(9), h.index(9)
+				next := h.revision[index] + 1
+				h.rewrite(rel, func(source string) string { return h.edited(source, index, next) })
+				h.waitPresent(w8ProbeName(index, next), rel)
+				h.revision[index] = next
 				h.settle()
-				// Landing the previous case's dirty edit legitimately
-				// publishes; the measured window is the commit AFTER it.
+
+				h.rebaseline()
+				calibrationBefore := h.baseline
+				parentTree, parentErr := h.headTree()
+				h.commit("land a real content change")
+				h.settle()
+				landedTree, landedErr := h.headTree()
+				switch {
+				case parentErr != nil || landedErr != nil:
+					err := parentErr
+					if err == nil {
+						err = landedErr
+					}
+					h.note("gate-4 calibration: the landing commit's tree could not be read, so it is NOT credited with content and every clause resting on it is reported as not asserted: " + err.Error())
+				case parentTree == landedTree:
+					h.note("gate-4 calibration: the landing commit changed no content (tree " + landedTree + " is its parent's), so every clause resting on it is reported as not asserted")
+				default:
+					h.commitCalibrationContent = true
+				}
+				calibrationAfter := h.catalog()
+				if delta, err := h.deltaSince(); err != nil {
+					h.commitCalibrationErr = err.Error()
+				} else {
+					h.commitCalibration = delta
+					h.commitCalibrationSeq = calibrationAfter.Sequence - calibrationBefore.Sequence
+					h.note(fmt.Sprintf("gate-4 calibration — a commit that %s moved observed[%s] build[%s] seq %+d",
+						map[bool]string{true: "really did change content", false: "was NOT measured to change content"}[h.commitCalibrationContent],
+						strings.Join(w8m5MovedSeries(delta, w8m5CommitObservationSeries()), " "),
+						strings.Join(w8m5MovedSeries(delta, w8m5AllocationSeries()), " "),
+						h.commitCalibrationSeq))
+				}
+				// Landing a real content change legitimately publishes; the
+				// measured window is the commit AFTER it.
 				h.rebaseline()
 				h.git("commit", "--allow-empty", "-m", "unchanged content")
 				return w8m5Effect{
-					Files:   []string{h.rel(9)},
-					Present: []w8m5Sighting{{w8ProbeName(h.index(9), h.revision[h.index(9)]), h.rel(9)}},
+					Files:   []string{rel},
+					Present: []w8m5Sighting{{w8ProbeName(index, h.revision[index]), rel}},
 					Note:    "a commit that changes no content at all",
 				}
 			},
@@ -915,6 +984,17 @@ func w8m5EditCases() []w8m5EditCase {
 				// exclude from scratch — agree about the excluded package, and
 				// the oracle compares the excluded leaf on both sides. The
 				// branch's answer is recorded either way.
+				//
+				// And they DISAGREE. Measured at the final source, on three
+				// samples a minute apart: Fn00003S0 (p003/file00003.go, the
+				// package the committed .gortex.yaml excludes) is still served
+				// by the incrementally maintained view and absent from a fresh
+				// isolated index of the same tree. A producer-policy change
+				// that lands as a commit is applied by the cold path and does
+				// not withdraw content the incremental path already holds. The
+				// row stays RED: the two indexes of one tree disagree, which is
+				// the gate, whatever the right withdrawal policy turns out to
+				// be.
 				h.observe("the excluded package", h.leafFor(3), excluded)
 				return w8m5Effect{
 					Files:   []string{h.rel(0)},
@@ -962,6 +1042,19 @@ type w8m5EditHarness struct {
 	// It never fails the row and it never lets it claim a confirmation: the
 	// row becomes a named SKIP saying which claim could not be scored.
 	unmeasurable []string
+
+	// commitCalibration is what a commit that REALLY changed content did, in
+	// this fixture, on this daemon. commit_unchanged_content takes it over
+	// the commit that lands the previous case's dirty edit and scores its own
+	// unchanged-content commit against it, so each of its four clauses is
+	// asserted only where a real commit is shown to move the same witness.
+	commitCalibration    map[string]int64
+	commitCalibrationSeq int64
+	commitCalibrationErr string
+	// commitCalibrationContent is the measured fact that the calibration
+	// commit really did change content (its tree moved), rather than the
+	// assumption that it did.
+	commitCalibrationContent bool
 }
 
 func (h *w8m5EditHarness) index(slot int) int { return h.rotation[slot%len(h.rotation)] }
@@ -1030,6 +1123,18 @@ func (h *w8m5EditHarness) edited(source string, index, revision int) string {
 func (h *w8m5EditHarness) git(args ...string) {
 	h.t.Helper()
 	h.f.git(h.f.primary, args...)
+}
+
+// headTree is the tree object HEAD points at. It is the witness that a commit
+// carried content: commit stages with --allow-empty, so a landing commit whose
+// tree equals its parent's changed nothing, and a calibration taken over it
+// must not be quoted as "a commit that really did change content".
+func (h *w8m5EditHarness) headTree() (string, error) {
+	out, err := h.f.tryGit(h.f.primary, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse HEAD^{tree}: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // commit stages everything and commits; an empty tree difference is allowed so
@@ -1154,6 +1259,188 @@ func (h *w8m5EditHarness) swapT(t *testing.T) func() {
 // instead of as reuse.
 func w8m5DirtyBuildSeries() []string {
 	return []string{w8m5Series(viewmetrics.CoordinatorCycleTotal, "outcome="+viewmetrics.OutcomeBuiltDirty)}
+}
+
+// w8m5CommitObservationSeries is the family that moves when the daemon
+// PROCESSES a HEAD movement, whatever it then decides to do about it.
+//
+// It is the clause that survives the consumer gate. Since
+// internal/indexer/dedicated_base_startup.go:774-779 declines a committed-base
+// publication for a family with no dependent checkout, a single-checkout
+// fixture builds and publishes nothing for ANY commit — so "the build series
+// did not move" carries no information there, and the original gate-4
+// assertion ("some claim/replay counter must move") failed an unchanged-content
+// commit for doing exactly what the branch now promises. What the daemon must
+// still do is SEE the commit and settle it: the advance observer records the
+// dispatch, and the publication records its outcome — including the declined
+// one, whose whole point is that it performed zero catalog DML
+// (publicationOutcome, dedicated_base_startup.go:657-671).
+//
+// A commit the daemon ignored entirely moves none of these, which is what
+// makes the clause falsifiable on a fixture where nothing is ever built.
+func w8m5CommitObservationSeries() []string {
+	return []string{
+		w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched),
+		w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceRepeat),
+		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped),
+		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationReadopted),
+		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationCoalesced),
+		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationPublished),
+		w8m5Series(viewmetrics.CoordinatorCycleTotal, "outcome="+viewmetrics.OutcomeAdoptedCommit),
+	}
+}
+
+// w8m5UnchangedCommitInput is everything the unchanged-content commit row is
+// scored from: one calibration window taken over a commit that really did
+// change content, and one measured window taken over the commit that did not.
+type w8m5UnchangedCommitInput struct {
+	// CalibrationErr is non-empty when the calibration window's counters
+	// could not be read at all.
+	CalibrationErr string
+	// CalibrationContent records that the calibration commit REALLY changed
+	// content: its tree differs from its parent's. It is not assumed, because
+	// the harness commits with --allow-empty and the case would otherwise
+	// borrow its content from whatever the previous case happened to leave
+	// dirty — an undeclared coupling a case filter can break. A calibration
+	// commit that carried no content proves nothing about what a real content
+	// commit does, so every clause that rests on it says so by name instead of
+	// quoting an authority it does not have.
+	CalibrationContent bool
+	Calibration        map[string]int64
+	CalibrationSeq     int64
+	Window             map[string]int64
+	WindowSeq          int64
+}
+
+// w8m5UnchangedCommitVerdict scores gate 2 + gate 4 for a commit that changed
+// no content, against what the same fixture did for a commit that changed some.
+//
+// Every clause is gated on its own calibration, because the three witnesses
+// answer to different lanes and the consumer gate kills two of them on a
+// single-checkout family:
+//
+//   - OBSERVATION (w8m5CommitObservationSeries): the daemon saw the commit and
+//     settled it. Live wherever HEAD movement is observed at all, so this is
+//     the clause that keeps the row from being vacuous.
+//   - BUILD (w8m5AllocationSeries): nothing was built or published.
+//   - REPLAY (w8m5ReplaySeries): where commits do build, an unchanged-content
+//     commit must show the claim/replay family instead — the original gate-4
+//     assertion, now gated on the calibration that makes it mean something.
+//   - ALLOCATION (the sequence): no generation was allocated.
+//
+// The gating is asymmetric, and the asymmetry is the whole point:
+//
+//   - OBSERVATION is a POSITIVE claim — the daemon must have reacted — so it is
+//     sound only where the same witness is shown to move for a commit that
+//     really did change content. Uncalibrated, it is unmeasurable.
+//   - BUILD and ALLOCATION are NEGATIVE claims — an unchanged-content commit
+//     must build, publish and allocate NOTHING. A daemon that does one of those
+//     things has violated gate 2 whether or not this fixture is calibrated, so
+//     the violation is scored FIRST and unconditionally. Only the ABSENCE of a
+//     violation needs a calibration to mean anything, and where the calibration
+//     cannot supply it the absence is recorded as NOT ASSERTED rather than
+//     counted as a pass. Ordering these the other way round — gating first —
+//     deletes the assertion: on a fixture whose calibration never allocates,
+//     every allocating daemon would score PASS.
+//
+// It is pure so that every clause and every gating is pinned without a daemon.
+func w8m5UnchangedCommitVerdict(in w8m5UnchangedCommitInput) (failures, recorded, unmeasurable []string) {
+	if in.CalibrationErr != "" {
+		return nil, nil, []string{"gate2+gate4: the unchanged-content commit could not be scored — the calibration window's counters were unreadable (ledger row W8.3 emits them): " + in.CalibrationErr}
+	}
+	join := func(values []string) string { return strings.Join(values, " ") }
+
+	// void names why the calibration window cannot lend its authority to a
+	// clause. A commit that changed no content is not a calibration at all.
+	void := ""
+	if !in.CalibrationContent {
+		void = "the calibration commit carried no content — its tree is identical to its parent's, so nothing in this fixture is known to have really changed"
+	}
+
+	calObserved := w8m5MovedSeries(in.Calibration, w8m5CommitObservationSeries())
+	windowObserved := w8m5MovedSeries(in.Window, w8m5CommitObservationSeries())
+	switch {
+	case void != "":
+		unmeasurable = append(unmeasurable, "gate4: "+void+
+			", so this row cannot tell an unchanged-content commit the daemon settled from one it never saw")
+	case len(calObserved) == 0:
+		unmeasurable = append(unmeasurable, "gate4: a commit that really did change content moved none of ["+
+			join(w8m5CommitObservationSeries())+"] in this fixture, so this row cannot tell an unchanged-content commit the daemon settled from one it never saw")
+	case len(windowObserved) == 0:
+		failures = append(failures, "gate4: the daemon reported nothing at all for an unchanged-content commit; a real content commit moved ["+
+			join(calObserved)+"] in the same fixture")
+	default:
+		recorded = append(recorded, "gate4: the unchanged-content commit was observed and settled as ["+join(windowObserved)+"]")
+	}
+
+	calBuilt := w8m5MovedSeries(in.Calibration, w8m5AllocationSeries())
+	windowBuilt := w8m5MovedSeries(in.Window, w8m5AllocationSeries())
+	switch {
+	// The violation first, and unconditionally: building or publishing for a
+	// commit that changed nothing is a gate-2 failure on any fixture.
+	case len(windowBuilt) > 0:
+		detail := "gate2: an unchanged-content commit built or published [" + join(windowBuilt) + "]"
+		if void == "" && len(calBuilt) > 0 {
+			detail += ", where a real content commit built [" + join(calBuilt) + "]"
+		}
+		failures = append(failures, detail)
+	case void != "":
+		recorded = append(recorded, "gate2 build clause NOT ASSERTED: "+void+
+			", so the same series staying still over an unchanged-content commit carries no information")
+	case len(calBuilt) == 0:
+		recorded = append(recorded, "gate2 build clause NOT ASSERTED: a commit that really did change content built and published nothing here either — "+
+			"a family with no dependent checkout defers its committed-base publication (internal/indexer/dedicated_base_startup.go:776) — "+
+			"so the same series staying still over an unchanged-content commit carries no information")
+	default:
+		if replayed := w8m5MovedSeries(in.Window, w8m5ReplaySeries()); len(replayed) == 0 {
+			failures = append(failures, "gate4: an unchanged-content commit reported no reuse, while a real content commit in the same fixture built ["+
+				join(calBuilt)+"]")
+		} else {
+			recorded = append(recorded, "gate4: reuse ["+join(replayed)+"] where a real content commit built ["+join(calBuilt)+"]")
+		}
+	}
+
+	switch {
+	// Same ordering, same reason: an allocation over an unchanged tree is a
+	// gate-2 violation whether or not this fixture ever allocates.
+	case in.WindowSeq != 0:
+		detail := fmt.Sprintf("gate2: an unchanged-content commit allocated a generation (seq %+d)", in.WindowSeq)
+		if void == "" && in.CalibrationSeq != 0 {
+			detail += fmt.Sprintf(" where a real content commit moved it %+d", in.CalibrationSeq)
+		} else {
+			detail += " — allocating for a commit that changed no content is a gate-2 violation on any fixture, calibrated or not"
+		}
+		failures = append(failures, detail)
+	case void != "":
+		recorded = append(recorded, "gate2 allocation clause NOT ASSERTED: "+void+
+			", so an unmoved sequence over an unchanged-content commit carries no information")
+	case in.CalibrationSeq == 0:
+		recorded = append(recorded, fmt.Sprintf("gate2 allocation clause NOT ASSERTED: a commit that really did change content allocated no generation here either (seq %+d), so an unmoved sequence over an unchanged-content commit carries no information", in.CalibrationSeq))
+	default:
+		recorded = append(recorded, fmt.Sprintf("gate2: no generation allocated, where a real content commit moved the sequence %+d", in.CalibrationSeq))
+	}
+	return failures, recorded, unmeasurable
+}
+
+// scoreUnchangedCommit folds the unchanged-content verdict into the row and
+// returns the failures for the caller to report.
+//
+// Every routing lives here so that all three are pinned by a unit test: a
+// failure marks the row FAILED and rides on its detail, a scored clause rides
+// on the detail, and a clause this fixture cannot score goes to h.unmeasurable
+// — which is what downgrades a would-be PASS to a named SKIP in file(). The
+// caller only reports the returned failures; the row is already FAILED, and
+// render() reports a FAILED row from the table regardless.
+func (h *w8m5EditHarness) scoreUnchangedCommit(row *w8m5Row, in w8m5UnchangedCommitInput, counters map[string]int64) []string {
+	failures, scored, cannot := w8m5UnchangedCommitVerdict(in)
+	for _, failure := range failures {
+		w8m5MarkFailed(row, failure+"; counters: "+w8m5Truncate(w8m5Canonical(counters), 300))
+	}
+	for _, note := range scored {
+		row.Detail = strings.TrimSpace(row.Detail + " | " + note)
+	}
+	h.unmeasurable = append(h.unmeasurable, cannot...)
+	return failures
 }
 
 // w8m5ReuseVerdict decides what "the build series did not move" means, given
@@ -1407,6 +1694,8 @@ func (h *w8m5EditHarness) run(c w8m5EditCase) {
 	h.t.Helper()
 	started := time.Now()
 	h.notes, h.unmetSteps, h.unmeasurable = nil, nil, nil
+	h.commitCalibration, h.commitCalibrationSeq, h.commitCalibrationErr = nil, 0, ""
+	h.commitCalibrationContent = false
 	h.rebaseline()
 	row := w8m5Row{Case: c.Name, Gate: c.Gate, Status: w8m5StatusPass}
 
@@ -1448,11 +1737,16 @@ func (h *w8m5EditHarness) run(c w8m5EditCase) {
 		row.Detail = strings.TrimSpace(row.Detail + fmt.Sprintf(" | rebuild[%s] reuse[%s] seq %+d",
 			strings.Join(built, " "), strings.Join(replayed, " "), after.Sequence-before.Sequence))
 		if assertsReuse {
-			if len(replayed) == 0 {
-				h.fail(&row, "gate4: an unchanged-content commit reported no reuse; counters: "+w8m5Truncate(w8m5Canonical(delta), 300))
-			}
-			if after.Sequence != before.Sequence {
-				h.fail(&row, fmt.Sprintf("gate2: an unchanged-content commit allocated a generation (seq %+d)", after.Sequence-before.Sequence))
+			failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+				CalibrationErr:     h.commitCalibrationErr,
+				CalibrationContent: h.commitCalibrationContent,
+				Calibration:        h.commitCalibration,
+				CalibrationSeq:     h.commitCalibrationSeq,
+				Window:             delta,
+				WindowSeq:          after.Sequence - before.Sequence,
+			}, delta)
+			for _, failure := range failures {
+				h.t.Errorf("matrix2 %s (%s): %s", row.Case, row.Gate, failure)
 			}
 		}
 	}
@@ -1574,9 +1868,18 @@ func (h *w8m5EditHarness) compareAgainstFreshIndex(probes []w8m5Probe, drop map[
 		Substantive: substantive, Empty: empty}
 }
 
-func (h *w8m5EditHarness) fail(row *w8m5Row, detail string) {
+// w8m5MarkFailed is the row half of fail: it marks the row FAILED and records
+// why. It is pure and separate so a scoring path that produces failures can be
+// exercised by a unit test without reporting them to the test that runs it;
+// render() reports every FAILED row from the table, so marking is what decides
+// the matrix, and fail's Errorf is the immediate, in-place report.
+func w8m5MarkFailed(row *w8m5Row, detail string) {
 	row.Status = w8m5StatusFail
 	row.Detail = strings.TrimSpace(row.Detail + " | " + detail)
+}
+
+func (h *w8m5EditHarness) fail(row *w8m5Row, detail string) {
+	w8m5MarkFailed(row, detail)
 	h.t.Errorf("matrix2 %s (%s): %s", row.Case, row.Gate, detail)
 }
 
@@ -2243,6 +2546,377 @@ func TestW8m5FileDowngradesAnUnmeasurableClaim(t *testing.T) {
 	}
 	if table.rows[2].Status != w8m5StatusFail {
 		t.Fatalf("an unmeasurable claim upgraded a FAIL to %s: %+v", table.rows[2].Status, table.rows[2])
+	}
+	if problems := w8m5TableProblems(table.rows); len(problems) != 0 {
+		t.Fatalf("the filed rows are not reportable: %v", problems)
+	}
+}
+
+// TestW8m5CommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily pins
+// the vocabulary the unchanged-content row's live clause reads.
+//
+// A key that is not in the viewmetrics catalog reads zero forever, which would
+// turn the one clause that survives the consumer gate into an assertion that
+// can only fail. And a series shared with the allocation family would make the
+// same counter both "the daemon saw the commit" and "the daemon built": the
+// row would then contradict itself on a family that really does publish.
+func TestW8m5CommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily(t *testing.T) {
+	declared := map[string]bool{}
+	for _, name := range viewmetrics.SeriesNames() {
+		declared[name] = true
+	}
+	observation := w8m5CommitObservationSeries()
+	if len(observation) < 5 {
+		t.Fatalf("the commit-observation vocabulary shrank to %d series: %v", len(observation), observation)
+	}
+	build := map[string]bool{}
+	for _, key := range w8m5AllocationSeries() {
+		build[key] = true
+	}
+	seen := map[string]bool{}
+	for _, key := range observation {
+		if !declared[w8m5SeriesName(key)] {
+			t.Fatalf("series %q is not declared in the viewmetrics catalog; the clause would silently read zero", key)
+		}
+		if strings.Contains(key, "{") && !strings.HasSuffix(key, "}") {
+			t.Fatalf("series key %q is malformed", key)
+		}
+		if build[key] {
+			t.Fatalf("series %q is in both the commit-observation and the allocation family", key)
+		}
+		if seen[key] {
+			t.Fatalf("series %q is listed twice", key)
+		}
+		seen[key] = true
+	}
+	// The declined publication is the whole point: it is the outcome the
+	// consumer gate records, and it is the evidence that the daemon settled
+	// the commit without writing anything.
+	if !seen[w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)] {
+		t.Fatalf("the declined-publication outcome is not in the observation family: %v", observation)
+	}
+}
+
+// TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration is the
+// unchanged-content row's regression.
+//
+// Before the consumer gate, a committed change published a base and an
+// unchanged-content commit re-adopted it, so "some claim/replay counter moved"
+// was a live assertion. After it, a single-checkout family publishes for
+// neither commit — and the ungated assertion failed the daemon for doing
+// exactly what the branch promises. Each clause now states which calibration
+// it rests on, and a clause with no calibration is recorded or reported as
+// unmeasurable rather than scored.
+func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testing.T) {
+	observed := func(values ...string) map[string]int64 {
+		delta := map[string]int64{}
+		for _, key := range values {
+			delta[key] = 1
+		}
+		return delta
+	}
+	dispatched := w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
+	skipped := w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
+	built := w8m5Series(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseBuilt)
+	published := w8m5Series(viewmetrics.GenerationPublishedTotal, "owner="+viewmetrics.OwnerCheckout)
+	reused := w8m5Series(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseReused)
+	join := func(values []string) string { return strings.Join(values, " ;; ") }
+
+	// (1) The shape the consumer gate produces: a real content commit was
+	// observed and settled without building, and so was the empty one. The
+	// observation clause carries the row; the build and allocation clauses say
+	// out loud that they were not asserted.
+	failures, recorded, cannot := w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        observed(dispatched, skipped),
+		Window:             observed(dispatched, skipped),
+	})
+	if len(failures) != 0 || len(cannot) != 0 {
+		t.Fatalf("a commit the daemon observed and declined was scored as a failure: %v %v", failures, cannot)
+	}
+	for _, want := range []string{"observed and settled", "build clause NOT ASSERTED", "allocation clause NOT ASSERTED"} {
+		if !strings.Contains(join(recorded), want) {
+			t.Fatalf("the verdict did not record %q: %s", want, join(recorded))
+		}
+	}
+
+	// (2) The clause that keeps (1) from being vacuous: a commit the daemon
+	// never reacted to fails, and the failure names what a real commit moved.
+	failures, _, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        observed(dispatched, skipped),
+		Window:             map[string]int64{},
+	})
+	if len(failures) == 0 || len(cannot) != 0 {
+		t.Fatalf("a commit the daemon never saw was not failed: %v %v", failures, cannot)
+	}
+	if !strings.Contains(join(failures), "reported nothing at all") {
+		t.Fatalf("the failure did not name the silence: %s", join(failures))
+	}
+
+	// (3) A fixture where even a real content commit moved nothing at all is
+	// NOT MEASURABLE, never a pass: the row says which claim it could not
+	// score instead of claiming a confirmation.
+	failures, _, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        map[string]int64{},
+		Window:             map[string]int64{},
+	})
+	if len(failures) != 0 {
+		t.Fatalf("an uncalibrated instrument failed the daemon: %v", failures)
+	}
+	if len(cannot) == 0 || !strings.Contains(join(cannot), "cannot tell") {
+		t.Fatalf("an uncalibrated observation clause was not reported as unmeasurable: %v", cannot)
+	}
+
+	// (4) On a family that DOES publish, the pre-gate strength is unchanged:
+	// a real content commit builds, so the unchanged-content commit must show
+	// the claim/replay family and must not build or allocate.
+	calibration := observed(dispatched, built, published)
+	failures, recorded, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        calibration, CalibrationSeq: 1,
+		Window: observed(dispatched, reused), WindowSeq: 0,
+	})
+	if len(failures) != 0 || len(cannot) != 0 {
+		t.Fatalf("a replayed unchanged-content commit was scored as a failure: %v %v", failures, cannot)
+	}
+	if !strings.Contains(join(recorded), "reuse ["+reused) {
+		t.Fatalf("the reuse was not recorded: %s", join(recorded))
+	}
+
+	failures, _, _ = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        calibration, CalibrationSeq: 1,
+		Window: observed(dispatched), WindowSeq: 0,
+	})
+	if len(failures) == 0 || !strings.Contains(join(failures), "reported no reuse") {
+		t.Fatalf("a publishing family that reported no reuse was not failed: %v", failures)
+	}
+
+	failures, _, _ = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        calibration, CalibrationSeq: 1,
+		Window: observed(dispatched, built), WindowSeq: 0,
+	})
+	if len(failures) == 0 || !strings.Contains(join(failures), "built or published") {
+		t.Fatalf("an unchanged-content commit that rebuilt was not failed: %v", failures)
+	}
+
+	failures, _, _ = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        calibration, CalibrationSeq: 1,
+		Window: observed(dispatched, reused), WindowSeq: 1,
+	})
+	if len(failures) == 0 || !strings.Contains(join(failures), "allocated a generation") {
+		t.Fatalf("an unchanged-content commit that allocated a generation was not failed: %v", failures)
+	}
+
+	// (5) Unreadable calibration counters are a named skip, never a pass and
+	// never a fabricated zero.
+	failures, recorded, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+		CalibrationErr: "daemon status --format json unavailable",
+	})
+	if len(failures) != 0 || len(recorded) != 0 || len(cannot) != 1 {
+		t.Fatalf("an unreadable calibration was not a single named skip: %v %v %v", failures, recorded, cannot)
+	}
+	if !strings.Contains(cannot[0], "W8.3") {
+		t.Fatalf("the skip did not point at the ledger row that emits the counters: %s", cannot[0])
+	}
+}
+
+// TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration is the
+// pin on the clause ORDER, which is the whole strength of gate 2 on this row.
+//
+// The BUILD and ALLOCATION clauses are negative claims: an unchanged-content
+// commit must build, publish and allocate nothing. A daemon that does one of
+// those has violated gate 2 on any fixture, so the violation must be scored
+// before — and independently of — the calibration that only the ABSENCE of a
+// violation needs. Scoring the gating first is not a weaker assertion, it is no
+// assertion at all: on the fixture this matrix actually runs, whose calibration
+// allocates nothing (the consumer gate, dedicated_base_startup.go:774-779),
+// every allocating daemon would be scored PASS.
+func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testing.T) {
+	observed := func(values ...string) map[string]int64 {
+		delta := map[string]int64{}
+		for _, key := range values {
+			delta[key] = 1
+		}
+		return delta
+	}
+	dispatched := w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
+	skipped := w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
+	built := w8m5Series(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseBuilt)
+	join := func(values []string) string { return strings.Join(values, " ;; ") }
+
+	// The fixture matrix 2 actually runs: a real content commit is observed
+	// and declined, builds nothing and allocates nothing.
+	consumerGated := w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        observed(dispatched, skipped),
+		CalibrationSeq:     0,
+	}
+
+	// (1) An allocation over an unchanged tree fails even though the
+	// calibration allocated nothing.
+	in := consumerGated
+	in.Window, in.WindowSeq = observed(dispatched, skipped), 1
+	failures, _, cannot := w8m5UnchangedCommitVerdict(in)
+	if len(cannot) != 0 {
+		t.Fatalf("a scorable violation was reported as unmeasurable: %v", cannot)
+	}
+	if len(failures) != 1 || !strings.Contains(join(failures), "allocated a generation") {
+		t.Fatalf("an unchanged-content commit that allocated a generation on an uncalibrated fixture was not failed: %v", failures)
+	}
+	if !strings.Contains(join(failures), "on any fixture, calibrated or not") {
+		t.Fatalf("the failure did not say why it is sound uncalibrated: %s", join(failures))
+	}
+
+	// (2) A build over an unchanged tree fails even though the calibration
+	// built nothing.
+	in = consumerGated
+	in.Window, in.WindowSeq = observed(dispatched, built), 0
+	failures, _, cannot = w8m5UnchangedCommitVerdict(in)
+	if len(cannot) != 0 {
+		t.Fatalf("a scorable violation was reported as unmeasurable: %v", cannot)
+	}
+	if len(failures) != 1 || !strings.Contains(join(failures), "built or published") {
+		t.Fatalf("an unchanged-content commit that built on an uncalibrated fixture was not failed: %v", failures)
+	}
+
+	// (3) A calibration commit that carried no content voids every clause that
+	// rests on it — but NOT the violations, which still fail.
+	void := w8m5UnchangedCommitInput{
+		CalibrationContent: false,
+		Calibration:        observed(dispatched, built),
+		CalibrationSeq:     1,
+		Window:             observed(dispatched, built),
+		WindowSeq:          1,
+	}
+	failures, _, cannot = w8m5UnchangedCommitVerdict(void)
+	if len(failures) != 2 {
+		t.Fatalf("a void calibration suppressed the violations: %v", failures)
+	}
+	if len(cannot) != 1 || !strings.Contains(join(cannot), "carried no content") {
+		t.Fatalf("a void calibration did not make the observation clause unmeasurable: %v", cannot)
+	}
+
+	// (4) …and with no violation, a void calibration scores nothing as a pass:
+	// both negative clauses say out loud that they were not asserted.
+	void.Window, void.WindowSeq = observed(dispatched, skipped), 0
+	failures, recorded, cannot := w8m5UnchangedCommitVerdict(void)
+	if len(failures) != 0 {
+		t.Fatalf("a void calibration failed a clean daemon: %v", failures)
+	}
+	if len(cannot) != 1 {
+		t.Fatalf("a void calibration did not name the unscorable observation clause: %v", cannot)
+	}
+	for _, want := range []string{"build clause NOT ASSERTED", "allocation clause NOT ASSERTED", "carried no content"} {
+		if !strings.Contains(join(recorded), want) {
+			t.Fatalf("a void calibration did not record %q: %s", want, join(recorded))
+		}
+	}
+}
+
+// TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList pins the hand-off from the
+// verdict to the row: failures mark the row FAILED (and come back for the
+// caller to report), scored clauses ride on the detail, and a clause the
+// fixture cannot score reaches h.unmeasurable — the list file() reads to
+// downgrade a would-be PASS to a named SKIP. Dropping any one of the three
+// turns a real finding into a green row.
+func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
+	observed := func(values ...string) map[string]int64 {
+		delta := map[string]int64{}
+		for _, key := range values {
+			delta[key] = 1
+		}
+		return delta
+	}
+	dispatched := w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
+	skipped := w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
+
+	// (1) A violation: the row is FAILED, the detail carries the reason and
+	// the measured counters, and the failure comes back to the caller.
+	table := w8m5NewTable(t, "w8m5_score_routing")
+	h := &w8m5EditHarness{t: t, table: table}
+	row := w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
+	delta := observed(dispatched, skipped)
+	delta[w8m5Series(viewmetrics.GenerationPublishedTotal, "owner="+viewmetrics.OwnerCheckout)] = 1
+	failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        observed(dispatched, skipped),
+		Window:             delta,
+		WindowSeq:          1,
+	}, delta)
+	if len(failures) == 0 {
+		t.Fatalf("a violating window returned no failure to report")
+	}
+	if row.Status != w8m5StatusFail {
+		t.Fatalf("a violating window left the row %s: %+v", row.Status, row)
+	}
+	for _, want := range []string{"built or published", "allocated a generation", "counters: "} {
+		if !strings.Contains(row.Detail, want) {
+			t.Fatalf("the failed row did not carry %q: %s", want, row.Detail)
+		}
+	}
+	if len(h.unmeasurable) != 0 {
+		t.Fatalf("a scorable violation produced unmeasurable claims: %v", h.unmeasurable)
+	}
+
+	// (2) A clean, calibrated window: the row stays a PASS and the scored
+	// clauses ride on the detail.
+	h = &w8m5EditHarness{t: t, table: table}
+	row = w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
+	window := observed(dispatched, skipped)
+	if failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        observed(dispatched, skipped),
+		Window:             window,
+	}, window); len(failures) != 0 {
+		t.Fatalf("a clean window was failed: %v", failures)
+	}
+	h.file(row)
+	if table.rows[len(table.rows)-1].Status != w8m5StatusPass {
+		t.Fatalf("a clean, calibrated window filed %s: %+v", table.rows[len(table.rows)-1].Status, table.rows[len(table.rows)-1])
+	}
+	if !strings.Contains(row.Detail, "observed and settled") {
+		t.Fatalf("the scored clause did not reach the row: %s", row.Detail)
+	}
+
+	// (3) An unscorable clause reaches h.unmeasurable, and file() turns the
+	// would-be PASS into a named SKIP. This is the routing whose deletion
+	// would publish a meaningless confirmation as a pass.
+	h = &w8m5EditHarness{t: t, table: table}
+	row = w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
+	if failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+		CalibrationContent: true,
+		Calibration:        map[string]int64{},
+		Window:             map[string]int64{},
+	}, map[string]int64{}); len(failures) != 0 {
+		t.Fatalf("an uncalibrated window was failed: %v", failures)
+	}
+	if len(h.unmeasurable) != 1 {
+		t.Fatalf("the unscorable clause did not reach the harness: %v", h.unmeasurable)
+	}
+	h.file(row)
+	filed := table.rows[len(table.rows)-1]
+	if filed.Status != w8m5StatusSkip {
+		t.Fatalf("an unscorable clause filed %s instead of a named SKIP: %+v", filed.Status, filed)
+	}
+	if !strings.Contains(filed.Detail, "NOT MEASURABLE") || !strings.Contains(filed.Detail, "cannot tell") {
+		t.Fatalf("the skip did not say which claim could not be scored: %s", filed.Detail)
+	}
+
+	// (4) An unreadable calibration is a single named skip, routed the same way.
+	h = &w8m5EditHarness{t: t, table: table}
+	row = w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
+	if failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+		CalibrationErr: "daemon status --format json unavailable",
+	}, nil); len(failures) != 0 {
+		t.Fatalf("an unreadable calibration failed the daemon: %v", failures)
+	}
+	if len(h.unmeasurable) != 1 || !strings.Contains(h.unmeasurable[0], "W8.3") {
+		t.Fatalf("an unreadable calibration was not a single named skip: %v", h.unmeasurable)
 	}
 	if problems := w8m5TableProblems(table.rows); len(problems) != 0 {
 		t.Fatalf("the filed rows are not reportable: %v", problems)
