@@ -68,14 +68,45 @@ func sqlitePerConnectionPragmas() string {
 // checkpoint; the indexer checkpoints TRUNCATE at the end of each global
 // batch, at Compact and at Close. Readers never append to the WAL, so only
 // the writer DSN carries the override.
-const sqliteWALAutoCheckpointPages = 8000
+const defaultSQLiteWALAutoCheckpointPages = 8000
+
+// sqliteWALAutoCheckpointPages resolves the auto-checkpoint line:
+// GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES overrides the 8,000-page default
+// (0 disables automatic checkpoints entirely — a legitimate SQLite mode, and
+// the one the bulk windows take connection-locally); unparseable or negative
+// input fails open to the default.
+//
+// It is a function rather than a constant because the line is TWO things at
+// once and both have to move together in a measurement: the writer DSN's
+// PRAGMA, and the threshold the finalize residue gate compares a post-drain
+// WAL against before it schedules the follow-up TRUNCATE
+// (scheduleWALDrainAboveLine). A daemon that exits a cold index carrying more
+// frames than this is one commit away from paying the whole accumulated log
+// inside whatever phase happens to run next, which is the non-deterministic
+// residue the gate exists to remove; being able to move the line is what lets
+// that class be toggled in a measurement instead of inferred from WAL
+// arithmetic.
+//
+// Read at DSN-build time (once per store open) and at each residue check, so
+// an override applies to stores opened after it is set.
+func sqliteWALAutoCheckpointPages() int {
+	raw := strings.TrimSpace(os.Getenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES"))
+	if raw == "" {
+		return defaultSQLiteWALAutoCheckpointPages
+	}
+	pages, err := strconv.Atoi(raw)
+	if err != nil || pages < 0 {
+		return defaultSQLiteWALAutoCheckpointPages
+	}
+	return pages
+}
 
 func sqliteWriterDSN(path string) string {
 	// IMMEDIATE reserves the single SQLite writer at BEGIN. It avoids the
 	// un-retryable DEFERRED read-to-write promotion/BUSY_SNAPSHOT class.
 	params := sqliteBusyPragma + "&_pragma=journal_mode(WAL)&" +
 		sqlitePerConnectionPragmas() + "&_pragma=journal_size_limit(67108864)" +
-		fmt.Sprintf("&_pragma=wal_autocheckpoint(%d)", sqliteWALAutoCheckpointPages) +
+		fmt.Sprintf("&_pragma=wal_autocheckpoint(%d)", sqliteWALAutoCheckpointPages()) +
 		"&_txlock=immediate"
 	return sqliteDSN(path, params)
 }

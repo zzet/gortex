@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -464,6 +465,108 @@ func (s *Store) schedulePublishMaintenance() {
 	}
 }
 
+// walDrainAttempts / walDrainRetryDelay bound one scheduled drain. A TRUNCATE
+// waits out readers inside its own walCheckpointTimeout and then defers, and
+// the reader that made it defer is usually the cold load's own, which is
+// leaving; a couple of spaced retries is what turns "the readers had not left
+// yet" into a drained log without turning a reader that stays into a polling
+// storm. Vars, not consts, only so the in-package cases can shorten the wait.
+var (
+	walDrainAttempts   = 3
+	walDrainRetryDelay = 500 * time.Millisecond
+)
+
+// scheduleWALDrain records that the store owes one bounded TRUNCATE checkpoint
+// and wakes the lane worker. It never blocks and never runs SQL, so a finalize
+// can call it while it still holds the write gate: it takes maintenanceSched,
+// which is a leaf, and posts at most one non-blocking wakeup — the same shape,
+// and for the same reason, as schedulePublishMaintenance.
+//
+// Coalesced on one flag: two finalizes that both land above the line owe one
+// drain, not two, and a drain already in flight covers the frames that made
+// the second one ask.
+func (s *Store) scheduleWALDrain(boundary string) {
+	if s.coreless() {
+		return
+	}
+	s.walDrainRequests.Add(1)
+	s.maintenanceSched.Lock()
+	defer s.maintenanceSched.Unlock()
+	if s.maintenanceClosed || s.maintenanceSignal == nil || s.maintenanceDrainOwed {
+		return
+	}
+	s.maintenanceDrainOwed = true
+	s.maintenanceDrainReason = boundary
+	select {
+	case s.maintenanceSignal <- struct{}{}:
+	default:
+	}
+}
+
+// takeWALDrain claims an owed drain for the worker, or reports that none is
+// owed. Claiming marks it running so the lane's settle point can tell a drain
+// that has not started from one that has finished.
+func (s *Store) takeWALDrain() (string, bool) {
+	s.maintenanceSched.Lock()
+	defer s.maintenanceSched.Unlock()
+	if !s.maintenanceDrainOwed || s.maintenanceClosed {
+		return "", false
+	}
+	s.maintenanceDrainOwed = false
+	s.maintenanceDrainRunning = true
+	return s.maintenanceDrainReason, true
+}
+
+func (s *Store) finishWALDrain() {
+	s.maintenanceSched.Lock()
+	s.maintenanceDrainRunning = false
+	s.maintenanceSched.Unlock()
+}
+
+// statsPassOwed reports whether a planner-statistics pass is owed. The worker
+// asks before claiming one because it now parks on a slot two different
+// requests post to: a wakeup that only carried a drain must not also spend an
+// ANALYZE nobody asked for.
+func (s *Store) statsPassOwed() bool {
+	s.maintenanceSched.Lock()
+	defer s.maintenanceSched.Unlock()
+	return s.maintenanceOwed
+}
+
+// runScheduledWALDrain runs the follow-up TRUNCATE through the lane as the
+// priority job it already is, retrying a bounded number of times.
+//
+// It enters the lane exactly as CheckpointWAL does — same job kind, same
+// budget, same pre-emption of the statistics pass — because it IS that job;
+// what the scheduling adds is only that the finalize which measured the
+// residue does not pay for it. A drain that never gets past a reader inside
+// its attempts is a deferral: the residue stays, the counters record the
+// difference between requests and drains, and the next finalize asks again.
+func (s *Store) runScheduledWALDrain(ctx context.Context, boundary string) {
+	defer s.finishWALDrain()
+	for attempt := 1; attempt <= walDrainAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		drainCtx, cancel := context.WithTimeout(ctx, walCheckpointTimeout)
+		err := s.runMaintenance(drainCtx, maintenanceCheckpoint, false, s.checkpointWALWithContext)
+		cancel()
+		if err == nil {
+			s.walDrains.Add(1)
+			return
+		}
+		if attempt == walDrainAttempts {
+			log.Printf("store_sqlite: wal residue drain deferred boundary=%s attempts=%d error=%q", boundary, attempt, err)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(walDrainRetryDelay):
+		}
+	}
+}
+
 // startMaintenanceLane creates the lane's lifetime and its worker. Open calls
 // it once, at the end of a successful open; nothing else does.
 //
@@ -521,6 +624,19 @@ func (s *Store) runMaintenanceLane(ctx context.Context, signal <-chan struct{}, 
 		if ctx.Err() != nil {
 			return
 		}
+		// The drain runs first and outside the pass bookkeeping: it is a
+		// priority job, so claiming a pass ahead of it would only get that
+		// pass cancelled a moment later.
+		if boundary, owed := s.takeWALDrain(); owed {
+			s.runScheduledWALDrain(ctx, boundary)
+			if ctx.Err() != nil {
+				return
+			}
+		}
+		if !s.statsPassOwed() {
+			// The wakeup carried a drain and nothing else.
+			continue
+		}
 		if !s.claimMaintenancePass() {
 			// Closed, or a whole-file job owns the lane. In the second case
 			// the pass stays owed and that job re-posts the signal; parking
@@ -556,7 +672,8 @@ func (s *Store) waitMaintenanceIdle(ctx context.Context) error {
 	}
 	for {
 		s.maintenanceSched.Lock()
-		idle := !s.maintenanceRunning && !s.maintenanceOwed
+		idle := !s.maintenanceRunning && !s.maintenanceOwed &&
+			!s.maintenanceDrainRunning && !s.maintenanceDrainOwed
 		s.maintenanceSched.Unlock()
 		if idle {
 			return nil
@@ -584,6 +701,7 @@ func (s *Store) stopMaintenanceLane() {
 	}
 	s.maintenanceClosed = true
 	s.maintenanceOwed = false
+	s.maintenanceDrainOwed = false
 	cancel := s.maintenanceCancel
 	done := s.maintenanceDone
 	s.maintenanceSched.Unlock()

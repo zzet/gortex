@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -420,6 +421,224 @@ func (s *Store) beginBulkLoadLocked() {
 	s.markMutationReceiptsIncompleteLocked()
 }
 
+// ErrGenerationBulkLoadPopulated refuses a generation-scoped bulk window over
+// a generation that already holds payload rows. The window's whole licence is
+// that nothing can be reading or colliding with the rows it is about to write;
+// a generation with rows has neither property, and a second window over one is
+// the caller's bug, not a condition to work around.
+var ErrGenerationBulkLoadPopulated = errors.New("store_sqlite: generation already holds payload rows")
+
+// BeginGenerationBulkLoad opens the bulk write shape for ONE payload
+// generation that holds no rows yet, and reports whether it engaged.
+//
+// Why it exists. The cold fast path above engages only on a proven-empty store
+// (coldGraphStoreEmpty), which generation 0 consumes. Every later generation
+// payload — a committed base, every delta — is therefore written through the
+// ordinary incremental path at the pooled 32 MiB cache_size, where a working
+// set larger than the cache spills dirty pages to the WAL and re-dirties them,
+// and the same payload that costs ~227-259 MB in bulk shape costs ~841 MB.
+// This window takes the cache half of the fast path's shape, which is where
+// the measured -69% is: the identical payload replayed at cache_size=-262144
+// alone cost 258,812,948 logical writes against 841,300,936 at store defaults.
+//
+// What it deliberately does NOT take, and why. The cold path also drops the
+// dense secondary indexes and runs at synchronous=OFF. Neither is admissible
+// here:
+//
+//   - The indexes are generation-blind, so dropping them would blind every
+//     generation-0 reader for the length of this window and rebuild them
+//     against the whole corpus at the end. The cold path can afford that
+//     because nothing can read an empty store. Scoping a drop/rebuild to a
+//     quiesced window is a separate step; until it exists the indexes stay
+//     live and this window simply does not claim that slice (~31 MB of the
+//     ~614 MB it does claim).
+//   - synchronous=OFF trades power-loss corruption of the WHOLE file for
+//     commit latency. On a fresh store that is a re-index; here generation 0's
+//     published rows are underneath, so the trade is not ours to make — and it
+//     buys no bytes anyway, which is what the replay above measures.
+//
+// wal_autocheckpoint IS taken to 0, so a payload cannot pay an automatic
+// full-log drain halfway through; EndGenerationBulkLoad closes that loop by
+// measuring the residue and scheduling a bounded TRUNCATE when it lands above
+// the auto-checkpoint line.
+//
+// Mutation receipts are left intact for the same reason: this window changes
+// neither durability nor index maintenance, so no write inside it is outside
+// the ordinary row protocol.
+//
+// Preconditions, all refusals rather than silent no-ops:
+//   - a positive generation. Generation 0 is the cold path's business and is
+//     the one generation this window may never be opened on.
+//   - the generation is writable, asked through the ordinary seal machinery
+//     (refuseSealedPayloadWrite), so a published or retiring generation is
+//     refused here exactly as its first write would be.
+//   - the generation holds no nodes and no edges.
+//
+// It is a no-op returning false (not an error) on an in-memory store, which
+// has no WAL or on-disk B-tree pressure to spare, and while another bulk
+// window already owns the pinned connection — those writes already have a bulk
+// shape, and stealing the window from a cold load would drop its deferred
+// indexes on the floor. A false return means no window was opened and
+// EndGenerationBulkLoad must not be called for it.
+func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
+	if s.coreless() {
+		return false, fmt.Errorf("%w: a generation bulk load needs an open store", ErrCatalogInvalidValue)
+	}
+	if generationID <= baseViewGeneration {
+		return false, fmt.Errorf("%w: generation bulk load needs a positive generation, got %d", ErrCatalogInvalidValue, generationID)
+	}
+	if isMemoryPath(s.dbPath) {
+		return false, nil
+	}
+	// Asked before the write gate is taken: resolving a seal reads the catalog
+	// on its own connection, and the pinned writer this method is about to
+	// take is the connection it would otherwise contend with.
+	if err := s.AtGeneration(generationID).refuseSealedPayloadWrite(); err != nil {
+		return false, err
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.bulkConn != nil || s.coordinatedBulkLoad {
+		return false, nil
+	}
+
+	ctx := context.Background()
+	conn, err := s.writerDB.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	empty, err := generationPayloadEmpty(ctx, conn, generationID)
+	if err != nil {
+		_ = conn.Close()
+		return false, err
+	}
+	if !empty {
+		_ = conn.Close()
+		return false, fmt.Errorf("%w: generation %d", ErrGenerationBulkLoadPopulated, generationID)
+	}
+
+	// Capture what has to be restored before changing anything, and decline
+	// the window rather than leave a pooled connection in a shape nobody can
+	// put back.
+	prevSync, err := pragmaInt(ctx, conn, "synchronous")
+	if err != nil {
+		_ = conn.Close()
+		return false, err
+	}
+	prevCache, err := pragmaInt(ctx, conn, "cache_size")
+	if err != nil {
+		_ = conn.Close()
+		return false, err
+	}
+	prevAutoCheckpoint, err := pragmaInt(ctx, conn, "wal_autocheckpoint")
+	if err != nil {
+		_ = conn.Close()
+		return false, err
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", bulkCacheSizeKiB)); err != nil {
+		_ = conn.Close()
+		return false, err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint = 0"); err != nil {
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
+		_ = conn.Close()
+		return false, err
+	}
+
+	s.bulkConn = conn
+	s.generationBulkLoad = generationID
+	s.syncBulkWindowLocked()
+	s.bulkPrevSync = prevSync
+	s.bulkPrevCacheSize = prevCache
+	s.bulkPrevAutoCheckpoint = prevAutoCheckpoint
+	// The dense indexes stay live, so nothing is deferred and no seal is owed;
+	// the row cadence below still bounds WAL growth inside a large payload.
+	s.bulkIndexesDeferred = false
+	s.bulkDeferredNodeRows = 0
+	s.bulkDeferredEdgeRows = 0
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
+	s.bulkRowCheckpointBackoff = false
+	s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "generation_bulk_begin", Name: strconv.FormatInt(generationID, 10)})
+	return true, nil
+}
+
+// EndGenerationBulkLoad closes the window BeginGenerationBulkLoad opened:
+// it restores the connection-local pragmas, releases the pinned writer, and
+// hands the accumulated WAL to the residue gate.
+//
+// The drain is scheduled, not run here. A TRUNCATE waits out every reader, and
+// the readers this window runs beside are generation 0's — the ones a
+// committed-base build exists to keep serving. Charging that wait to the build
+// is the coupling the maintenance lane exists to remove, so the measurement
+// happens inline (one PASSIVE, which never waits for a reader) and the
+// follow-up TRUNCATE runs on the lane.
+//
+// Idempotent and inert when no generation window is open, so a deferred call
+// is always safe.
+func (s *Store) EndGenerationBulkLoad() error {
+	if s.coreless() {
+		return nil
+	}
+	s.writeMu.Lock()
+	if s.generationBulkLoad == 0 || s.bulkConn == nil {
+		s.writeMu.Unlock()
+		return nil
+	}
+	generationID := s.generationBulkLoad
+	result, _ := s.checkpointBulkWALPassiveResultLockedWithin("generation_bulk_end", s.passiveCheckpointWindow())
+	closeErr := s.closeBulkConnectionLocked()
+	s.jsonbIngestBuffers.release()
+	s.writeMu.Unlock()
+	s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "generation_bulk_end", Name: strconv.FormatInt(generationID, 10), WALFrames: result.WALFrames, CheckpointedFrames: result.CheckpointedFrames})
+	s.scheduleWALDrainAboveLine(result, "generation_bulk_load")
+	return closeErr
+}
+
+// generationPayloadEmpty reports whether one payload generation holds no rows.
+// Both probes restate `view_gen > 0` literally because that is the predicate
+// the generation indexes are partial on — SQLite cannot prove a bound
+// parameter is positive, and without the literal both probes degrade to a scan
+// of the whole nodes/edges table, which is precisely the cost this window
+// exists to avoid paying.
+func generationPayloadEmpty(ctx context.Context, conn *sql.Conn, generationID int64) (bool, error) {
+	var empty int
+	err := conn.QueryRowContext(ctx, `
+SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE view_gen > 0 AND view_gen = ?)
+   AND NOT EXISTS(SELECT 1 FROM edges WHERE view_gen > 0 AND view_gen = ?)`,
+		generationID, generationID).Scan(&empty)
+	if err != nil {
+		return false, err
+	}
+	return empty == 1, nil
+}
+
+// scheduleWALDrainAboveLine is the finalize residue gate: a bounded follow-up
+// TRUNCATE is owed exactly when the WAL a finalize leaves behind is above the
+// line SQLite's own automatic checkpoint fires at.
+//
+// Below the line there is nothing to fix — the frames cost the next writer
+// nothing it would not have paid anyway. Above it the daemon is carrying a log
+// that the next commit in whatever phase runs next will drain in full, and
+// that is the non-determinism measured across two arms of the same workload
+// (3,636 frames in one, 15,573 in another): the phase that pays is whichever
+// one happens to cross the line, not the phase that wrote the frames.
+//
+// A disabled auto-checkpoint (0 pages) has no line to exceed, so nothing is
+// owed: an operator who turned automatic drains off did not ask for this one.
+// A checkpoint that never ran at all reports -1 rather than a count (SQLite
+// leaves pnLog/pnCkpt at -1 when it cannot take the checkpointer lock). That is
+// not evidence of a residue, so it schedules nothing: the gate acts on a
+// measurement or not at all.
+func (s *Store) scheduleWALDrainAboveLine(result walCheckpointResult, boundary string) {
+	line := sqliteWALAutoCheckpointPages()
+	if line <= 0 || result.WALFrames < 0 || result.WALFrames <= line {
+		return
+	}
+	s.scheduleWALDrain(boundary)
+}
+
 // FlushBulk exits the bulk-load fast path: it rebuilds every dropped index,
 // restores synchronous + cache_size + wal_autocheckpoint, releases the pinned writer and write gate,
 // then performs one bounded TRUNCATE checkpoint. The ordering matters: the
@@ -519,6 +738,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	// waiting for readers. Committed WAL frames are durable either way; later
 	// passive checkpoints plus SQLite's next WAL reset/journal_size_limit reclaim
 	// the file after the reader leaves.
+	var residue walCheckpointResult
 	if hadBulk {
 		ctx, cancel := context.WithTimeout(context.Background(), bulkFinalCheckpointTimeout)
 		started := time.Now()
@@ -534,9 +754,17 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 			Busy: result.Busy, WALFrames: result.WALFrames,
 			CheckpointedFrames: result.CheckpointedFrames, Err: err,
 		})
+		// This PASSIVE is where the cold load's non-determinism lives: it is
+		// bounded and it explicitly does not wait for the readers a queryable
+		// daemon already has, so what it leaves behind is whatever those
+		// readers allowed. Hand that number to the residue gate rather than
+		// treating "we tried once" as a drained log — the follow-up TRUNCATE
+		// runs on the lane, after this window's readers are gone.
+		residue = result
 	}
 	s.jsonbIngestBuffers.release()
 	s.writeMu.Unlock()
+	s.scheduleWALDrainAboveLine(residue, "cold_load_finalize")
 	return errors.Join(sealErr, statsErr, closeErr)
 }
 
@@ -663,6 +891,7 @@ func (s *Store) closeBulkConnectionLocked() error {
 		return nil
 	}
 	s.bulkConn = nil
+	s.generationBulkLoad = 0
 	ctx := context.Background()
 	_, syncErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", s.bulkPrevSync))
 	_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", s.bulkPrevCacheSize))
@@ -702,6 +931,12 @@ func (s *Store) checkpointBulkWAL() error {
 		Busy: result.Busy, WALFrames: result.WALFrames,
 		CheckpointedFrames: result.CheckpointedFrames, Err: err,
 	})
+	// A TRUNCATE that completed leaves nothing above any line. One that was
+	// deferred (a reader that never left, the lane, a pinned writer) leaves
+	// exactly the residue the gate is for, and the frames it reported are the
+	// measurement — so the gate is asked on both outcomes and answers on the
+	// numbers rather than on the error.
+	s.scheduleWALDrainAboveLine(result, "bulk_flush")
 	if err != nil {
 		return fmt.Errorf("store_sqlite: bulk checkpoint: %w", err)
 	}
@@ -717,8 +952,17 @@ func (s *Store) checkpointBulkWALPassiveLocked(boundary string) error {
 }
 
 func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window time.Duration) error {
+	_, err := s.checkpointBulkWALPassiveResultLockedWithin(boundary, window)
+	return err
+}
+
+// checkpointBulkWALPassiveResultLockedWithin is the same bounded attempt with
+// its counters returned. The residue gate needs the frame count the drain
+// leaves behind, and a checkpoint that reports numbers is the only place that
+// count can be read without opening a second connection.
+func (s *Store) checkpointBulkWALPassiveResultLockedWithin(boundary string, window time.Duration) (walCheckpointResult, error) {
 	if s.bulkConn == nil {
-		return nil
+		return walCheckpointResult{}, nil
 	}
 	nodeRows, edgeRows := s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows
 
@@ -738,7 +982,7 @@ func (s *Store) checkpointBulkWALPassiveLockedWithin(boundary string, window tim
 		Busy: result.Busy, WALFrames: result.WALFrames,
 		CheckpointedFrames: result.CheckpointedFrames, Err: err,
 	})
-	return err
+	return result, err
 }
 
 // noteBulkRowCheckpointResultLocked backs off repeated automatic attempts only

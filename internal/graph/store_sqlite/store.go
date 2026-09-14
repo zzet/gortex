@@ -195,6 +195,19 @@ type storeCore struct {
 	maintenancePriorityResume bool
 	maintenancePass           *maintenancePassHandle
 
+	// maintenanceDrainOwed is the one-slot request for a bounded follow-up
+	// TRUNCATE checkpoint, posted by a finalize that measured a WAL above the
+	// auto-checkpoint line and consumed by the same worker that runs the
+	// statistics pass. It is a separate flag rather than a second signal
+	// channel because the worker parks on exactly one slot, and it is
+	// coalesced for the same reason the pass request is: two finalizes owe one
+	// drain. maintenanceDrainReason names the boundary that asked, for the
+	// log line; maintenanceDrainRunning is what the lane's settle point reads
+	// so a test (or Close) can tell "drain finished" from "drain not started".
+	maintenanceDrainOwed    bool
+	maintenanceDrainRunning bool
+	maintenanceDrainReason  string
+
 	// Lane counters. Requests counts scheduling calls, passes counts lane
 	// passes actually started (so a burst of requests collapsing into one
 	// pass is observable), jobs counts actions that reached their SQL,
@@ -211,6 +224,15 @@ type storeCore struct {
 	maintenanceJobs        atomic.Int64
 	maintenanceDeferrals   atomic.Int64
 	maintenancePreemptions atomic.Int64
+
+	// Follow-up WAL drain counters. Requests counts finalize boundaries that
+	// measured a residue above the auto-checkpoint line, drains counts the
+	// TRUNCATE checkpoints that actually completed. They differ whenever a
+	// drain gave up its bounded attempts against a reader that never left —
+	// which is a deferral, not a loss: the residue is still there and the next
+	// finalize asks again.
+	walDrainRequests atomic.Int64
+	walDrains        atomic.Int64
 
 	// publishDrains counts publish windows in flight: a generation that is
 	// sealed but whose transition has not committed yet. A whole-file
@@ -243,6 +265,15 @@ type storeCore struct {
 	bulkPrevAutoCheckpoint int64
 	coordinatedBulkLoad    bool
 	bulkIndexesDeferred    bool
+	// generationBulkLoad names the payload generation a generation-scoped bulk
+	// window was opened for, or 0 when the pinned connection (if any) belongs
+	// to the cold-load fast path instead. It is the flag that keeps the two
+	// windows apart: the cold one proves the whole STORE is empty and may
+	// therefore drop indexes and durability, while this one proves only that
+	// one GENERATION holds no rows and must leave both alone — generation 0's
+	// readers and its durable rows are live underneath it. See
+	// BeginGenerationBulkLoad.
+	generationBulkLoad int64
 	bulkDeferredNodeRows   int64
 	bulkDeferredEdgeRows   int64
 	bulkCheckpointNodeRows int64
