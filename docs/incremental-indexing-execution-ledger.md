@@ -4139,14 +4139,20 @@ Shared fields for all W1 sub-items unless overridden:
 - **Regressions preserved, not discarded**: `P4_amend_same_tree` **270×** (108 MB against the
   baseline's 401 KB for `git commit --amend --no-edit` over a byte-identical tree; per run 1 delta
   publish, 1 re-adopted publication, sequence +1 where main moves it 0, store +7 MiB) — a real defect
-  in the branch on the cleanest possible no-op; `P2_small_edits` **3.44×** and over its ceiling, with
+  in the branch on the cleanest possible no-op
+  (**corrected by F6**: the number stands, the stimulus named here does not — every byte lands 1–4 s
+  after the ten-file `git commit` the phase performs inside its own window, and the amend proper is
+  below the idle floor with zero DML in all 62 tables; the phase is now split into
+  `P4a_commit_tree_change` / `P4b_amend_same_tree`, and the post-fix arm reads 265,128 and 248,712.
+  See `incremental-indexing-measurements.md` §8.6(2)); `P2_small_edits` **3.44×** and over its ceiling, with
   no coordinator build in the phase's counters (the primary's own re-index writes);
   `P0_cold_index` **1.89×** with a store twice the size, recovered by `P7` (retained bytes 6 % below
   the baseline's); `P8_idle_warm` misses the plan's **absolute** 8 MiB/60 s idle budget at 15.2 MB —
   and so does the baseline at 14.8 MB (ratio 1.02×), with one candidate outlier at 195 MB attributed
   in the artifact to two generations published inside the idle window.
 - The 6,000-file arm, run once per arm, **n = 1, no budgets**: `P0` 1.05× (the 1.89× closes), `P2`
-  0.93× (the 3.44× does not reproduce), `P4` **674×** (the same-tree-amend defect is worse at scale),
+  0.93× (the 3.44× does not reproduce), `P4` **674×** (**corrected by F6**: the commit inside the
+  window, not the same-tree amend — §8.6(2); not re-run post-fix),
   `P1_idle_cold` **7.44×** (the worst candidate number in the measurement), `P5` 0.37× — but the
   candidate **did not finish**: `P5_main_advance` failed at its trailing single-shot isolation probe
   after all 20 commits and all 230 exactness waits succeeded, and the diagnostics show all ten
@@ -4185,8 +4191,12 @@ Shared fields for all W1 sub-items unless overridden:
   from the artifacts, **24/25 mutants bind**, no production code is touched, ownership is clean, and
   the 6,000-file candidate failure is real and honestly reported
   (`scratchpad/reports/W8m-W8.4-verify.md`).
-- Next action: an item for the same-tree-amend defect (`P4`, 270× at 1,500 files and 674× at 6,000)
-  and one for the 6,000-file `P1_idle_cold` 7.44×. Neither has an owner in the plan.
+- Next action: the 6,000-file axis (`P4` 674×, `P1_idle_cold` 7.44×) has **not** been re-run
+  post-fix and still has no owner. The 1,500-file half is taken: F6 re-measured it and reads `P4`
+  **1.28×** on the checkpoint-excluded series with the phase split, `P1_idle_cold` 0.70×. The
+  "same-tree-amend defect" label on both `P4` numbers is corrected above and in
+  `incremental-indexing-measurements.md` §8.6(2): the stimulus is the ten-file commit the phase
+  performs inside its own window, not the amend.
 
 ### W8.5 (absorbing W8.6) — E2E matrix 1 (idle / no-op family) and matrix 2 (edit taxonomy)
 
@@ -4528,10 +4538,11 @@ Shared fields for all W1 sub-items unless overridden:
   a machine-level byte reduction.
 - Next action: none for the item source — the repair items F1b, F3b, F4b, F5b and F7b closed the
   two blockers (F4's cross-handle read regression, F7's round-2 verifier findings) and the whole F
-  set is committed (see the wave W8g Evidence-log entry). What remains is the **measurement** stage:
-  F3's single-phase re-measurement missed both of its plan targets by a wide margin (F3b row), and
-  F2's second-copy payload ceiling, F4's daemon-level 60 s window and F5's phase workloads are all
-  still unmeasured under this harness.
+  set is committed (see the wave W8g Evidence-log entry). The **measurement** stage is now taken by
+  F6 (row below): the paired 1,500-file protocol was re-run against the frozen budgets and returned
+  `over budget: []`, `incomparable: []`, with one preserved regression (`P4_amend_same_tree` 1.28×).
+  What remains unmeasured under this harness: F3's two missed plan targets (F3b row), F2's
+  second-copy payload ceiling, and the 6,000-file scale axis, which has no post-fix counterpart.
 
 ### F1 — publish or advance a committed base only when a consumer exists
 
@@ -4940,6 +4951,106 @@ Shared fields for all W1 sub-items unless overridden:
 - Deviations: none against the plan text; against W8f's shipped behaviour, this row is the repair.
 - Verifier verdict: **PASS** — `scratchpad/reports/W8g-F5b.md`.
 - Next action: none; F6 reads P1/P8 off the polling arm's window rows.
+
+### F6 — the second verdict: the paired 1,500-file protocol re-measured against the frozen budgets
+
+- State: `wired` (implemented, compiled, `tested`; verifier `pass`, wiring check
+  "implemented / compiled / tested / wired"), test-only in `cmd/gortex` plus the measurements
+  document. **Committed** as `689fe9631de49dd8174cddb729ef7e411363f11f` — "cmd: measure the idle
+  arms in judged order and pin the scraping bracket".
+- Agent: wave W8i, Lane F6 (implementer + adversarial verifier, one round, no repair).
+- Scope/files: `cmd/gortex/w8_sustained_io_integration_test.go`, `cmd/gortex/w8_paired_arms_test.go`,
+  `docs/incremental-indexing-measurements.md`. `cmd/gortex/w8_sampler_test.go` is in the ownership
+  list and is **unchanged**: the `query_log` census bucket the measurement needed
+  (`w8BucketQueryLog`, classifier `:447-451`) already exists, so the correction it asks for is
+  documentary only.
+- Invariant: the judged idle arm occupies the same position in the phase that the frozen ceiling was
+  recorded over, and a bracket that publishes a counter delta took both of its scrapes. The polling
+  arm runs first and is the arm the frozen ceiling is applied to; the quiet arm inherits the
+  preceding phase's residue and carries no ceiling; the `a`/`b` suffix in a sub-window name encodes
+  measurement order and agrees with `w8JudgedWindows`. A bracket whose opening scrape was skipped
+  must not publish the daemon's absolute counters as a per-window delta. No frozen artifact is
+  rewritten, no budget is re-frozen, and no phase of the frozen baseline was re-run.
+- Root cause the item closed (W8g/F5b verifier findings F1 and F2, both major): (F2) `idleWindows`
+  measured the quiet arm first, so the judged window opened one full `cfg.Idle` (60 s) after the
+  frozen window's position and the un-judged arm absorbed the preceding phase's decaying tail — a
+  one-directional bias on the only two phases (`P1`, `P8`) whose ceiling binds. (F1) mutant MX17,
+  `openBracketScraping` (`w8_sustained_io_integration_test.go:813-830`) with `if scrape` →
+  `if false`, survived the whole suite: `closeWindow` (`:927-940`) and `closePhase` (`:1029-1032`)
+  take the `w8CounterDelta(opening.counters, after)` arm whenever `opening.countersErr == nil`, so a
+  nil opening reading is published as an absolute-valued "delta".
+- Wiring (verifier-traced): `w8PhasePlan:361-365` → `(*w8Run).phaseIdleCold` (`:1471-1473`) and
+  `phaseIdleWarm` (`:1868-1870`) → `idleWindows` (`:1305-1321`, polling bracket first);
+  `w8JudgedWindows` (`w8_paired_arms_test.go:461-464`) maps the frozen phase name onto the polling
+  sub-window and the verdict follows it (verifier mutant M5). Exercised end to end by the real
+  four-run measurement: every `candidate_rep*` files `P1a_idle_cold_polling` before
+  `P1b_idle_cold_quiet` and `P8a_idle_warm_polling` before `P8b_idle_warm_quiet`, and `verdict.json`
+  records `candidate_judged_source: "window:P1a_idle_cold_polling"` / `"window:P8a_idle_warm_polling"`.
+  Production reach of the measured behaviour is evidenced from the daemon's own log:
+  `internal/indexer/builder_dedicated_claimed.go:220` emitted exactly one
+  `"route":"copy_generation_zero"` line per run in all four runs
+  (`scratchpad/artifacts/W8i-F6/copy-route-evidence.log`).
+- Acceptance gate(s): G8 (I/O benefit) and G10 (truthful reporting). This is the measurement stage
+  those two gates read; it does not close either — see Limitations.
+- Measurement: candidate arm only, 3 repetitions, the frozen protocol (1,500 files / 60 packages /
+  seed 767 / 10 worktrees / 20 commits / 10 edits / 60 s idles, `GXW8_EDIT_INTERVAL=10s`), daemon
+  `harness/bin/gortex-271a9e9f` sha256 `6378b769…` built from HEAD `271a9e9f`
+  (`git archive` + `diff -r -q -x '*_test.go' -x docs` → 0 differing files), artifacts
+  `scratchpad/artifacts/W8i-F6/paired1500-postfix/`, log `scratchpad/logs/W8i-F6/candidate-arm.log`,
+  2,244 s wall. The three frozen `baseline_rep*` directories and `budgets.json` were copied in
+  read-only; `budgets.json` md5 `6caf02683492a65009ffe1ed95bac0b7` **before and after** the
+  reduction, `newly frozen=false`. Verdict: `over budget: []`, `incomparable: []`,
+  `regressions preserved: [P4_amend_same_tree: ri_logical_writes_excl_checkpoint 513840 vs baseline
+  401408 (1.28x)]`. Per phase (judged median, candidate vs baseline): `P0` 1.04× (was 1.89×),
+  `P1` 0.70×, `P2` 0.96× (was 3.44× and over ceiling), `P3` 0.92×, `P4` **1.28×**, `P5` 0.28×
+  against a 0.50× ceiling, `P6` 0.76×, `P7` 0.51×, `P8` 0.85× (was 1.02× and over ceiling).
+  Retained bytes 375,751,391 vs 434,887,204 (ceiling 521,864,644); store after `P0` 1.006× with
+  `view_generations` empty; store at run end 0.83×; `wal_resets` 31/33/29 vs 73/68/73. One
+  confirmatory arm at the product's 1 h janitor default (`GXW8_RECONCILE_INTERVAL=product`,
+  `GXW8_REPS=1`, `scratchpad/artifacts/W8i-F6/confirm-default-interval/`), n = 1, no ceiling.
+- Tests pinning the behaviour change: `TestW8ScrapingBracketTakesBothScrapesAndReportsATrueDelta`
+  (new, `w8_sustained_io_integration_test.go:3335-3398`),
+  `TestW8WindowPlanIsTheDeclaredSubWindowSplit`,
+  `TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing`,
+  `TestW8PhaseBodiesReachTheInstrumentTheyAreNamedFor`,
+  `TestW8ReducePhaseCarriesSubWindowRowsThroughTheVerdict`. Implementer mutations 4 applied / **4
+  killed** (M1 quiet-first `idleWindows`; M2 quiet-first `w8WindowPlan`; M3 the surviving MX17
+  `if scrape` → `if false`, red with the intended absolute-vs-delta message; M4 window-name strings
+  lose the order encoding). Verifier mutation M5 (`w8JudgedWindows["P8_idle_warm"]` → the quiet
+  window) red on two tests. The verifier independently re-ran the reduction against a copy of the
+  artifacts and regenerated `verdict.md` / `verdict.json` **byte-identical** to the published ones.
+- Harness evidence (`GXH_TAG=W8i-F6` / `W8i-F6r`, plus re-run whole in this exit suite): `cmd`
+  normal `^TestW8|^TestIssue767` 264 / 0 / 12 (×3 invocations, identical binary sha256 across the
+  last two), `cmd` race over the W8 selection 22 / 0 / 1, 0 `DATA RACE`; exit-suite counts on the
+  Evidence-log entry below.
+- Limitations: **no fresh baseline arm** — by design, since re-freezing would make the two verdicts
+  incomparable, but the ratios carry uncontrolled host drift that the original interleave shared
+  between the arms (the order-of-magnitude movements are outside it; `P6` 1.05×→0.76× and `P3`
+  0.89×→0.92× are not). The **6,000-file axis was not re-run**, so `P1@6000` 7.44× and `P4@6000`
+  674× have no post-fix counterpart. `P4`'s surviving 1.28× (112,432 median bytes) has **no
+  mechanism**: the counters say what it is not — no publication (6 dispatched, 6 skipped), no
+  generation movement, not the amend alone. The checkpoint-excluded series is an **upper bound** on
+  non-checkpoint work, not a partition (attribution is per 1 Hz sample interval). The idle ratio is
+  not wall-normalised (candidate window 60.0 s vs baseline phase 62–64 s); the per-second correction
+  is recorded and changes no verdict. Darwin, n = 3, accelerated janitor. No gate closes on this row.
+- Deviations: (1) the plan names the artifact directory
+  `scratchpad/artifacts/W8m-W8.6/paired1500-postfix/`; the coordinator's brief names
+  `scratchpad/artifacts/W8i-F6/`, which is what was used. (2) The plan assigns this ledger to the
+  item and asks it to re-point the rows that name the wrong stimulus for the `P4` regression; the
+  ledger is outside the item's ownership (the suite stage is its single writer), so the re-pointing
+  was done **here**, as marked corrections on the W8.4 row above, not by the item. (3) The plan
+  asserts F5's changes are accounting-only "so daemon-side work is unchanged"; that holds for F5 but
+  not for the wave — what must be unchanged for the frozen baseline to stay comparable is the
+  *harness's demand* on the daemon, and the two phases that no longer map 1:1 (`P1`/`P8` idle split,
+  `P4a`/`P4b`) are handled by the reduction's phase→window mapping rather than by re-freezing.
+- Verifier verdict: **PASS** (0 blockers; 2 minor findings, both recorded and neither conclusion-
+  moving) — `scratchpad/reports/W8i-F6-verify.md`. Minor 1: §8.1's `end of P4_amend_same_tree`
+  baseline cell prints the max (61,272,064) where the header declares a median (61,267,968) — 4,096 B,
+  ratio 1.018× either way, and the slip runs against the candidate. Minor 2: the daemon roots whose
+  logs back the "no other route value" half of the copy-route claim were deleted during cleanup, so
+  only the extracted positive evidence survives.
+- Next action: none for this item. Open and unowned: the 6,000-file axis post-fix, and the mechanism
+  behind `P4`'s surviving 1.28×.
 
 ### F7 — first committed base copies generation zero on a clean matching tree
 
@@ -8026,3 +8137,103 @@ source identity on darwin/arm64 at `GOMAXPROCS=2`. It measures no write amplific
 no opt-in probe (`validate.sh`'s `env -i` allowlist drops every `GXW8_*` / `GORTEX_ISSUE767_*` /
 `GORTEX_BENCH_*` variable), so F8's own three write-shape numbers come from its in-lane store test
 (cited on the item row), not from this table. **No gate closes on this suite.**
+
+### 2026-09-10 — Wave W8i exit suite (F6 verified pass) — suite GREEN, one item commit
+
+- Source identity: HEAD `271a9e9f6bf2c3f3a9b491818aa70549c0b5ae6a`, dirty-manifest sha256
+  `42cbb249a181ff55b7f25a989bd91bf63e7cb432fed7110e0024a89bec41d365` — **identical on both compiles
+  and both runs of this suite** (read from each `result.json`), so the whole table below is one
+  tree: three modified tracked files (`cmd/gortex/w8_sustained_io_integration_test.go`,
+  `cmd/gortex/w8_paired_arms_test.go`, `docs/incremental-indexing-measurements.md`) plus the
+  untracked working input `docs/incremental-indexing-handoff-2026-09-10.md`. The lane's own tagged
+  runs (`W8i-F6`, `W8i-F6r`) and the four daemon measurement runs sit outside this table and are
+  cited on the item row. Toolchain go1.27.0 darwin/arm64, `GOWORK=off`, `GOTOOLCHAIN=local`,
+  `GOFLAGS=-mod=mod -buildvcs=false`, `GOPROXY=off`, shared `GOCACHE`/`GOMODCACHE`. Harness tags
+  `GXH_TAG=W8i-suite` (normal) and `W8i-suiteR` (race), `GOMAXPROCS=2`, `GOMEMLIMIT=2GiB`,
+  `-test.timeout 8m`.
+- Commands: `go build ./...` and `go vet ./cmd/gortex/ ./internal/mcp/` from the worktree under the
+  isolated environment; then `bash validate.sh compile cmd {normal,race}` (2 compiles, both OK, no
+  `GOPROXY` fallback) and `bash validate.sh test cmd …` (2 runs).
+
+#### Build and vet
+
+`go build ./...` exit 0, no output, first attempt. `go vet` exit 0 with no diagnostics on
+`./cmd/gortex` and `./internal/mcp` — the only package this wave touches is `./cmd/gortex`, and the
+other three files it changes are documentation.
+
+#### Runs
+
+| run | pass / fail / skip | result dir (`scratchpad/results/…`) |
+| --- | --- | --- |
+| `cmd` normal `.` | 1425 / 0 / 15 | `cmd-normal-_-W8i-suite-1` (113.8 s) |
+| `cmd` race `Paired\|W8\|Sampler` | 231 / 0 / 10 | `cmd-race-Paired_W8_Sampler-W8i-suiteR-1` (32.3 s) |
+
+0 `DATA RACE` reports in the race log (`grep -c 'DATA RACE'` → 0). No chunking was needed: the full
+`cmd` normal run finished in 113.8 s, well inside the 8-minute `-test.timeout`, so the `internal/
+indexer` six-chunk split the brief provides for was not used (no `indexer` run belongs to this
+wave's ownership). No FLAKE was claimed: nothing failed.
+
+#### Every skip, named with its exact reason (no skip is a disabled assertion)
+
+`cmd` normal (15) — the same fifteen as wave W8h's entry above, name for name. No skip was added or
+widened by this wave: the item diff contains no `t.Skip` at all.
+
+- `TestFileCoveragePrefersCanonicalKeysWithoutDoubleCounting` — `daemon_controller_coverage_test.go:144:
+  native and slash graph keys coincide on this platform`.
+- `TestSystemdUnitPath_ResolvesUnderHome` — `daemon_service_test.go:192: systemd paths only
+  meaningful on linux`.
+- `TestServiceCommands_RejectUnsupportedOS` — `daemon_service_test.go:205: this test only runs on
+  unsupported platforms`.
+- `TestW8m5RunGuardedAlwaysFilesARow/aborted` — `w8_matrix_noop_test.go:1981: the guard's abort path:
+  this case leaves its goroutine without filing a row`.
+- Eleven opt-in isolated harnesses whose gate variable the harness's `env -i` allowlist deliberately
+  drops: `TestIssue767IdleIOIntegration` (`issue767_idle_io_integration_test.go:30`,
+  `GORTEX_ISSUE767_TEST_BINARY`), `TestIssue767WorktreeReadinessIntegration`
+  (`issue767_worktree_readiness_integration_test.go:23`, `GORTEX_ISSUE767_READINESS_BINARY`),
+  `TestW8Matrix5MainAdvanceWithTenDependents` (`w8_matrix_advance_test.go:70`),
+  `TestW8Matrix7Adversarial` (`w8_matrix_adversarial_test.go:38`), `TestW8MatrixEditTaxonomy`
+  (`w8_matrix_edits_test.go:1587`), `TestW8Matrix6Lifecycle` (`w8_matrix_lifecycle_test.go:996`),
+  `TestW8MatrixNoopFamily` (`w8_matrix_noop_test.go:1655`),
+  `TestW8MatrixResolutionProvenanceManifests` (`w8_matrix_resolution_test.go:1541`),
+  `TestW8Matrix4ViewLifecycle` (`w8_matrix_views_test.go:655`) — all `GXW8_MATRIX_BINARY` /
+  `GXW8_TEST_BINARY`; `TestW8PairedArmsVerdict` (`w8_paired_arms_test.go:1307`,
+  `GXW8_PAIRED_ARTIFACT_DIR`); `TestW8SustainedWriteAmplification`
+  (`w8_sustained_io_integration_test.go:609`, `GXW8_TEST_BINARY`).
+
+`cmd` race (10): the same set minus the five the `Paired|W8|Sampler` pattern does not select
+(`TestFileCoveragePrefersCanonicalKeysWithoutDoubleCounting`, `TestSystemdUnitPath_ResolvesUnderHome`,
+`TestServiceCommands_RejectUnsupportedOS`, `TestIssue767IdleIOIntegration`,
+`TestIssue767WorktreeReadinessIntegration`), and nothing new.
+
+No `store`, `indexer`, `graphview` or `reconcile` run belongs to this wave: the wave's only package
+is `./cmd/gortex`. The two known legitimate `store` skips (the Windows path-separator test
+`TestBundlePackageKeyNeverUsesOSSeparator` and the copied-store census `TestMetaBlobCensus`) are
+therefore not re-observed here; their last observation stands on the wave W8h entry above.
+
+#### Commits
+
+Two: the single item commit, staged by explicit path list (never `git add -A`), and this ledger.
+
+| # | item | commit | subject |
+| --- | --- | --- | --- |
+| 1 | F6 | `689fe9631de49dd8174cddb729ef7e411363f11f` | cmd: measure the idle arms in judged order and pin the scraping bracket |
+
+No item was skipped or blocked: the wave's one item holds a final verifier verdict of `pass` with a
+wiring check of `wired`, and `all_green` is true. The three dirty tracked files partition exactly
+onto that one commit: 3 assigned, 0 unassigned, 0 assigned twice — verified against
+`git status --porcelain -uall` before the `git add`. After the commit, `git status --short` lists
+**only** the untracked working input `docs/incremental-indexing-handoff-2026-09-10.md` and this
+ledger; nothing outside this wave's ownership was touched. `cmd/gortex/w8_sampler_test.go` is owned
+and unmodified, and was deliberately not staged.
+
+Ledger changes in this entry beyond the F6 row: the W8.4 rows that named the `P4` regression as a
+"same-tree-amend defect" now carry marked corrections pointing at
+`incremental-indexing-measurements.md` §8.6(2) — the original numbers (270× and 674×) are kept, only
+the attributed stimulus changes — and the F-section next action records that the measurement stage
+is taken.
+
+Limitation of what this suite proves: one package's unit surface and one race selection at one
+source identity on darwin/arm64 at `GOMAXPROCS=2`. It measures no write amplification and exercises
+no opt-in probe (`validate.sh`'s `env -i` allowlist drops every `GXW8_*` / `GORTEX_ISSUE767_*`
+variable), so F6's own verdict numbers come from its four tagged daemon runs (cited on the item
+row), not from this table. **No gate closes on this suite.**
