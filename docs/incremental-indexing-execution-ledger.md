@@ -1345,12 +1345,35 @@ wave suite closed a gate**, and every wave entry said so in its own words.
 | 2026-09-10 | **Wave W8h exit** (F8) | `fe5fae1d`, manifest `20703b51…` (7 compiles, 18 runs) | suite GREEN; store 1899/0/2, graphview 509/0/0, cmd 1424/0/15, indexer seven chunks 3083/0/2, store race 600/0/0 (split), indexer race 236/0/0. Two 8-minute chunk aborts, both wall-clock chunk size under `GOMAXPROCS=2`, neither a red: every named test completed in its split run | 1 — `4ceb40ce`, + ledger |
 | 2026-09-10 | **Wave W8i exit** (F6) | `271a9e9f`, manifest `42cbb249…` (2 compiles, 2 runs) | suite GREEN; cmd normal 1425/0/15 (113.8 s), cmd race `Paired|W8|Sampler` 231/0/10, 0 `DATA RACE`. The four daemon measurement runs sit outside this table and are cited on the F6 row | 1 — `689fe963`, + ledger |
 | 2026-09-15 | Ledger consolidation | `722d4b7b` | documentation only; no suite run | 1 — this document plus the design's status note |
+| 2026-09-14 | **Final-source validation** (static checks + full suites + E2E on the finished branch; no item work) | `9fc2e7ce`, manifest `5fd3990e…` (33 compiles, 46 harness runs) | suite GREEN — **19442 pass / 0 fail / 41 skip**, 0 `DATA RACE`, **no new skip**. golangci-lint v2.13.1 (the CI pin) 18 → **0 issues**, all 18 branch-introduced, none suppressed; `gofmt -l` over the diff empty (nine files formatted, eight branch-authored and `internal/indexer/file_delta.go` a pre-existing hunk inside the diff); `go vet ./...` and `go build ./...` exit 0, no output. `internal/graph/store_sqlite` whole-package `-race` **exceeds the recorded 30-minute budget** (timeout at 1800.6 s, 0 races, 0 assertions failed) and is green at `-timeout 90m` in **2256.7 s**. E2E: **4 of 7 W8 matrices PASS** (4, 5, 6, 7), 3 FAIL (1 no-op, 2 edits, 3 resolution) — every red reproduced **byte-identically** against the pre-lint daemon `gortex-271a9e9f`, so none is a regression of this session; sustained harness smoke **9/9 phases, failed=[]**. Report `final-suite.md` | 2 — `9fc2e7ce`, + ledger |
+
+**E2E outcome table at the final source** (`gortex-e2e` sha256 `28624cd5…` at HEAD `9fc2e7ce`,
+test binary sha256 `045dc264…`; runner replicates `validate.sh`'s isolation stanza and adds only
+the `GXW8_*` gates):
+
+| matrix | test | exit | s | outcome |
+| --- | --- | ---: | ---: | --- |
+| 4 — view lifecycle | `TestW8Matrix4ViewLifecycle` | 0 | 93.9 | **PASS** — 12 cases: 11 PASS, 1 OBSERVED (4.8 same-tree branch switch re-keyed the routed pair (3,5)→(12,13), exact again in 68 ms) |
+| 5 — main advance, 10 dependents | `TestW8Matrix5MainAdvanceWithTenDependents` | 0 | 113.6 | **PASS** — 12 cases: 9 PASS, 3 OBSERVED (5.5b, 5.8 the W4.8 pin, 5.11 counters). 16 committed bases over 20 commits; dependents minted zero generations |
+| 6 — checkout lifecycle | `TestW8Matrix6Lifecycle` | 0 | 263.8 | **PASS** — every row PASS; drains: 89 coherent answers, 89 clean refusals, 0 incoherent |
+| 7 — adversarial coherence | `TestW8Matrix7Adversarial` | 0 | 244.7 | **PASS** — every row PASS; 48 committed advances → 1 root + 45 deltas, 49 live generations against a 70 ceiling |
+| 1 — no-op family | `TestW8MatrixNoopFamily` | 1 | 451.2 | **FAIL** — calibration PASS, 9 cases fail on one shared instrument error, `catalog read error: sql: no rows in result set` (`SELECT seq FROM sqlite_sequence WHERE name='view_generations'` — the fixture now allocates no `view_generations` row at all). PASS with `gortex-2fd5db82`, FAIL with `gortex-271a9e9f`: it entered in the W8g/W8h/W8i window, **not** with this session's commit |
+| 2 — edit taxonomy | `TestW8MatrixEditTaxonomy` | 1 | 1107.6 | **FAIL** — 17 cases: 3 PASS, 11 SKIP (the declared W6.1b semantic-metadata gap), 3 FAIL. `untracked_path` and `configuration_change` were already red in W8.5's own rounds; `commit_unchanged_content` entered in the same W8g/W8h/W8i window. Identical 3 at `gortex-271a9e9f` |
+| 3 — resolution / provenance / manifests | `TestW8MatrixResolutionProvenanceManifests` | 1 | 120.7 | **FAIL** — 20 rows: 13 pass, 2 not_exercised (declared), 5 FAIL. Ledger row **W8.7** is already `blocked with evidence`; identical 5 rows at `gortex-271a9e9f` |
+| sustained smoke | `TestW8SustainedWriteAmplification` (40 files / 4 packages / 1 worktree / 2 commits / 2 edits / 5 s idles / 1 repetition) | 0 | 261.6 | **PASS** — 9/9 phases, `failed=[]`, 1 worktree removed, 0 retained. Smoke numbers only: one arm, one repetition, no frozen baseline, no ratio claimed |
+
+**The paired measurement was not re-run.** W8.4's document stands for the identity it was taken at.
+The whole production delta from `271a9e9f` to `9fc2e7ce` is the lint/format commit — three files of
+gofmt whitespace, one dropped ineffectual `err = nil`, one explicit `_ =` on an already-discarded
+return — so no measured quantity can move and the second verdict's numbers carry over unchanged.
 
 **Known chunking and flake facts, recorded once here rather than per wave.** `internal/indexer` and
 `internal/mcp` cannot run whole under the harness's hardcoded 8-minute `-test.timeout`; both use the
 six first-letter chunks, and `^Test[A-C]` needs a further `^Test[A-B]` + `^TestC` split under
 concurrent load (needed in W8f and W8h, not needed in W8g). `internal/graph/store_sqlite` under
-`-race` exceeds the harness budget entirely and is run directly with `-timeout 30m`. The two
+`-race` exceeds the harness budget entirely and is run directly; **`-timeout 30m` is no longer
+enough** — the final-source run timed out at 1800.6 s with 0 races and 0 failing assertions and
+completed in **2256.7 s** at `-timeout 90m`, so 90m is the budget to quote. The two
 legitimate `store` skips are `TestBundlePackageKeyNeverUsesOSSeparator` (the Windows path-separator
 test, vacuous on darwin by construction) and `TestMetaBlobCensus` (needs `GORTEX_BENCH_STORE`); the
 two legitimate `indexer` skips are `TestBackendBench` and `TestMeasureEditLatency`, both env-gated
