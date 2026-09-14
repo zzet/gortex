@@ -48,6 +48,7 @@ not reachable from a default startup, watcher, or Git callback path is `implemen
 | Dirty-manifest sha256 (harness-computed, wave W8b exit suite) | `67a5463b46c5a8a773bef9f0b8bb8ff268c438402de7f93175f60c7d87372d66` over HEAD `9acc9c32061b0bb113b57b5c7a9aaff8fa95d808` — identical on all 15 compiles and all 24 runs of the wave W8b exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave W9a exit suite) | `bc12b670f7dc1fc6bdc7af6d20132cff47e98c0721e3b6aa6447a23d9ce36f8d` over HEAD `b46b7c1bc589d1fc3860825b2f4f4fb631e1afc9` — identical on all 13 compiles and all 25 runs of the wave W9a exit suite; no source drift during the suite |
 | Dirty-manifest sha256 (harness-computed, wave W8m exit suite) | `767b4301a02a7eb0638d247d9e8af58e727431ad33ebc0406984f2852276bf2b` over HEAD `2fd5db821ab0acede84ec0cb8bda65944d088e20` — identical on all 4 compiles and all 9 runs of the wave W8m exit suite; no source drift during the suite |
+| Dirty-manifest sha256 (harness-computed, wave W8g exit suite) | `3c6984f9ed5397c5b45f88e4292632b12613b284bef42ddb1daeee6d56860ee6` over HEAD `bb43b3386624ed181fb6ad258bda91033d599d6c` — identical on all 15 compiles and all 29 runs of the wave W8g exit suite; no source drift during the suite. The suite's seven commits sit on top of that tree, ending at `daa91e21fd625e411828186a08e9df88e3af5789`. |
 | Recovery branch (do NOT reapply) | `backup/incremental-before-main-20260910-1310` = `a2ccbe07` |
 | Recovery stash (do NOT reapply) | `6e9db642` |
 | Live daemon | `v0.64.1-36-ga2ccbe07-dirty`, pid 18828 — a **pre-rebase** binary. Must not be restarted, re-tracked, or reconfigured. |
@@ -4513,7 +4514,9 @@ Shared fields for all W1 sub-items unless overridden:
 
 ## F — Idle and per-edit write-amplification fixes (`scratchpad/reports/io-fix-plan.md`)
 
-- State: `implemented`. Dependencies: W1–W8 machinery; the five P-diagnoses
+- State: `complete` for F1, F2, F3, F4, F5 and F7 as *committed source*; each item's own row
+  below records what its acceptance gate still owes. Dependencies: W1–W8 machinery; the five
+  P-diagnoses
   (`diag-P0_cold_index.md`, `diag-P2_small_edits.md`, `diag-P4_same_tree_amend.md`,
   `diag-P5_6000_isolation.md`, `diag-P8_idle_warm_and_P1.md`). Items F1–F7.
 - Invariant: every item removes writes that no reader can use, and none of them buys the reduction
@@ -4523,13 +4526,18 @@ Shared fields for all W1 sub-items unless overridden:
 - Limitations: the daemon-level per-phase re-measurements these items are judged on belong to the
   measurement stage (F5/F6), not to the item rows; the unit evidence below proves mechanism, never
   a machine-level byte reduction.
-- Next action: repair F4's cross-handle read regression and F7's two verifier findings, then re-run
-  the exit suite; the wave's commits are withheld until then (see the Evidence log entry below).
+- Next action: none for the item source — the repair items F1b, F3b, F4b, F5b and F7b closed the
+  two blockers (F4's cross-handle read regression, F7's round-2 verifier findings) and the whole F
+  set is committed (see the wave W8g Evidence-log entry). What remains is the **measurement** stage:
+  F3's single-phase re-measurement missed both of its plan targets by a wide margin (F3b row), and
+  F2's second-copy payload ceiling, F4's daemon-level 60 s window and F5's phase workloads are all
+  still unmeasured under this harness.
 
 ### F1 — publish or advance a committed base only when a consumer exists
 
 - State: `wired` (implemented, compiled, `tested`; verifier `pass`, wiring proved by mutation M4).
-  **Not committed** — the wave's commit gate did not open (see the Evidence log entry).
+  **Committed** as `331e64b95835504311b36daeb77204008bd5cf77` — "indexer: publish a committed base
+  only for a family with a dependent" — carried unchanged into wave W8g and re-run whole there.
 - Agent: wave W8f, Lane F1 (implementer + adversarial verifier, one round, no repair).
 - Scope/files (all uncommitted in the worktree): `internal/indexer/dedicated_base_startup.go`,
   `internal/indexer/checkout_lifecycle.go`, `internal/indexer/checkout_coordinator.go`,
@@ -4566,15 +4574,58 @@ Shared fields for all W1 sub-items unless overridden:
   `checkout_coordinator.go` rather than the plan's named file, both in the owner list.
 - Verifier verdict: **PASS** (no blocker; 1 major disclosed-limitation finding, 3 minor) —
   `scratchpad/reports/W8f-F1-verify.md`.
-- Next action: commit once F4/F7 clear; then wire ref-view demand (one call to
-  `requestDedicatedBase` from `RefViewManager.base`'s `generationID == 0` arm).
+- Next action: none. The ref-view demand limitation above is **closed** by item F1b (row below),
+  which raises the ask from `EnsureRefView` rather than from `RefViewManager.base` — the naive
+  placement this row proposed turns out to be the defect F1b's verifier blocked on.
+
+### F1b — a ref view raises the committed-base demand after its catalog row exists
+
+- State: `wired` (implemented, compiled, `tested`; verifier `pass` at round 2 after a round-1
+  blocker). **Committed** as `568618a720e044b4658de958e330ca5570ca8c7d` — "indexer: let a ref view
+  demand a committed base after its catalog row exists".
+- Agent: wave W8g, Lane I (implementer + adversarial verifier, two rounds: round 1 `fail`, repair,
+  round 2 `pass`).
+- Scope/files: `internal/indexer/ref_views.go`, `internal/indexer/ref_view_service.go`,
+  `internal/indexer/ref_views_test.go` (3 mechanical call sites for the new `base` arity),
+  `internal/indexer/ref_view_demand_test.go` (new).
+- Invariant: a ref view over a family with no published base raises exactly one throttled demand,
+  and it raises it **after** the `ref_views` row is committed and after the view selector resolves.
+  `RefViewManager.base` is a pure read that NAMES the owed repository and asks for nothing.
+  Polling and selection still allocate no generation; a declined or throttled demand performs zero
+  catalog DML; a view built over an unpublished family still reports `BaseGenerationID == 0`
+  truthfully; no schema change.
+- Root cause the repair closed (round-1 blocker): the demand was raised from inside
+  `RefViewManager.base`, i.e. **before** the `ref_views` row existed. The consumer census that gates
+  publication counts ref-view rows (`checkout_lifecycle.go:1291-1316` →
+  `dedicated_base_startup.go:769-777`), so the ask was declined by the very census it exists to
+  satisfy — and then **spent**, because a declined publication queues nothing and the ask is
+  throttle-stamped for `dedicatedBaseDemandInterval` (one minute). Two minors closed with it: the
+  ask preceded `gitstate.ResolveViewSelector`, so a bogus ref ordered a full base index; and the
+  `lastBaseDemand` map was never pruned.
+- Wiring (verifier-traced): `ref_view_service.go:169-171` sets `RequestBase` to
+  `l.requestDedicatedBase(prefix, …)` on the per-repository cached manager; the selection order is
+  `ref_views.go:417 → :422 → :427 → :460`. `checkout_lifecycle.go` needed **no** edit — the existing
+  `requestDedicatedBase` hook shape sufficed.
+- Acceptance gate(s): G8 (it is the demand door F1's deferral depends on).
+- Harness evidence (`GXH_TAG=W8g-F1b`, plus re-run whole in the exit suite): `indexer` normal over
+  six chunks 3079 / 0 / 2, `indexer` race
+  `DedicatedBase|Startup|Advance|Trigger|Consumer|Demand|Claimed|RefView` 255 / 0 / 0 — result dirs
+  in the Evidence-log entry.
+- Limitations: first-dependent latency for a ref view is still one full base index, not "already
+  done"; a demand raised before `BeginDraining` parks until readiness; the throttle is a single
+  shared one-minute policy across both demand doors.
+- Deviations: none. Finding 3 was marked "no action required" by the verifier and was fixed anyway.
+- Verifier verdict: **PASS** (round 2) — `scratchpad/reports/W8g-F1b.md`.
+- Next action: none.
 
 ### F2 — generation-scoped bulk write window, residue gate and maintenance-lane WAL drain
 
 - State: `tested` for the whole item. The **(B)** half — residue gate + lane drain — is
   additionally `wired` (verifier-traced, end to end). The **(A)** half —
   `BeginGenerationBulkLoad` / `EndGenerationBulkLoad` — has **no production caller** in this diff;
-  its caller is F7, which is `blocked with evidence`. **Not committed.**
+  its caller is F7, whose repair round F7b now supplies it. **Committed** as
+  `bbd2f8dca6a530295818777599f7b43dae165bd8` — "store_sqlite: scope a bulk write window to one
+  generation and drain the WAL off-lane" — carried unchanged into wave W8g and re-run whole there.
 - Agent: wave W8f, Lane S (implementer + adversarial verifier, one round).
 - Scope/files (uncommitted): `internal/graph/store_sqlite/bulk_load.go`,
   `internal/graph/store_sqlite/sqlite_connections.go`, `internal/graph/store_sqlite/store.go`,
@@ -4609,15 +4660,20 @@ Shared fields for all W1 sub-items unless overridden:
 - Verifier verdict: **PASS** — 0 blockers, 0 major, 5 minor
   (`scratchpad/reports/W8f-F2-verify.md`); one minor is that the third residue-gate wiring site is
   pinned by nothing.
-- Next action: commit once the wave's gate opens; the (A) half stays `implemented` until F7's
-  caller lands.
+- Next action: none for the source. The (A) half is no longer caller-less: F7b's deferred close
+  drives `EndGenerationBulkLoad` and a real-store test in `indexer` measures that it drains off-lane
+  rather than checkpointing inline. The second-copy payload ceiling stays **unverified** — see the
+  null result in the limitations above; that is a measurement-stage obligation, not an item one.
 
 ### F3 — a committed-base delta writes the change set, not the resolve closure
 
 - State: `wired` (implemented, compiled, `tested`; verifier `pass`, wiring traced from the daemon
-  and additionally pinned by a test). **Not committed.**
-- Agent: wave W8f, Lane B (implementer + adversarial verifier, one round).
-- Scope/files (uncommitted): `internal/indexer/builder_generation.go`,
+  and additionally pinned by a test). **Committed** as part of
+  `905d7a90cc1cb0753725bc825b6259cbdf51d1fd` together with its repair round F3b (row below), which
+  amends the cap rule this row describes.
+- Agent: wave W8f, Lane B (implementer + adversarial verifier, one round); repaired by wave W8g,
+  Lane B (F3b).
+- Scope/files: `internal/indexer/builder_generation.go`,
   `internal/indexer/builder_closure.go`, `internal/indexer/delta_write_set_test.go` (new).
 - Invariant: the payload a committed-base delta writes is bounded by the change set, not by the
   resolve closure it had to read. A closure path is withheld when the adjacency it *records* — both
@@ -4625,7 +4681,9 @@ Shared fields for all W1 sub-items unless overridden:
   inbound adjacency and is compared, not refused; an edge the eviction reaches is restored iff it is
   recorded at a file the generation still claims. The committed-base closure cap is now its own
   (`clamp(changes × 32, 200, 4096)`) and does not read `Config.AffectedByReresolveMax`, which every
-  other sparse build still reads. `ClosureTruncated` / `ClosureCap` reporting is unchanged, so the
+  other sparse build still reads. **Superseded by F3b**: ignoring the operator knob on this one arm
+  was the defect F3b repairs; the committed rule is `min(knob, change-sized)` whenever the knob is
+  set. `ClosureTruncated` / `ClosureCap` reporting is unchanged, so the
   completeness fact still rides on the report and still counts
   `views_dedicated_base_closure_truncated_total`.
 - Acceptance gate(s): G8.
@@ -4642,17 +4700,64 @@ Shared fields for all W1 sub-items unless overridden:
 - Deviations: recorded in `scratchpad/reports/W8f-F3.md` §10.
 - Verifier verdict: **PASS** (no blocker; 7 findings, none blocking) —
   `scratchpad/reports/W8f-F3-verify.md`.
-- Next action: commit once the wave's gate opens; the import-representative residual is a
-  `internal/resolver` follow-up, outside this item's ownership.
+- Next action: none for the source. The import-representative residual is a `internal/resolver`
+  follow-up outside this item's ownership; the **failed re-measurement** is carried on the F3b row.
+
+### F3b — honour the operator re-resolve bound on the committed-base arm; the single-phase re-measurement
+
+- State: `wired` for the knob half (implemented, compiled, `tested`; verifier `pass`,
+  mutation-pinned). The **re-measurement half is `blocked with evidence`** — it was performed in
+  full and **fails both plan targets**. **Committed** as
+  `905d7a90cc1cb0753725bc825b6259cbdf51d1fd` — "indexer: honour the operator re-resolve bound on a
+  committed-base delta".
+- Agent: wave W8g, Lane B (implementer + adversarial verifier, one round).
+- Scope/files: `internal/indexer/builder_closure.go`, `internal/indexer/builder_generation.go`,
+  `internal/indexer/delta_write_set_test.go`.
+- Invariant: the operator's documented ceiling (`index.affected_by_reresolve_max`) is never exceeded
+  on any build. On a committed-base delta the cap is `min(knob, change-sized)` when the knob is set
+  and the change-sized cap when it is not; every other sparse build reads the knob exactly as
+  before. Which bound fired is a recorded fact, not an inference: `BuildReport.ClosureCapSource`
+  carries `ClosureCapFromOperator` / `ClosureCapFromChangeSized` / `ClosureCapFromDefault`, and at a
+  tie the **operator** bound is named, because that is the value an operator can move. The existing
+  completeness fact is untouched — a truncated closure still narrows the generation's producer
+  states to `ProducerStateIncomplete` with a reason and still counts
+  `views_dedicated_base_closure_truncated_total`.
+- Root cause the repair closed (major 1): W8f's F3 made the committed-base arm return
+  `builderCommittedBaseClosureCap(len(req.Changes))` without ever reading
+  `b.Config.AffectedByReresolveMax`, so an operator-lowered bound was ignored on exactly the build
+  it was meant to bound — and the effective ceiling was simultaneously raised to
+  `clamp(changes × 32, 200, 4096)` against a documented default of 200.
+- **Blocking measurement result** (major 2, performed in full): the single-phase re-measurement
+  **misses both targets** — store delta **7.91 MB** against a ≤ 1 MB target, one-sample burst
+  **83.0 MB** against a ≤ 20 MB target. The item's report attributes the cause to F3's own
+  withholding comparison, **not** to the cap, and carries a ten-second in-process reproduction.
+  This does not block the knob fix, which is independently sound and pinned; it blocks F3's
+  contribution to gate **G8**.
+- Wiring (verifier-traced): `dedicated_base_advance.go:232` `BuildClaimedDedicatedDelta` →
+  `builder_dedicated_delta.go:143,177` `planFileSetContext` → `builder_generation.go:724`
+  `affectedClosureContext` → `builder_closure.go:151` `b.builderClosureCap(req)`;
+  `builderClosureCap` has exactly one production caller.
+- Acceptance gate(s): G8 — **not closed**; see the blocking measurement result above.
+- Harness evidence (`GXH_TAG=W8g-F3b`, plus re-run whole in the exit suite): `indexer` normal over
+  six chunks 3079 / 0 / 2, `indexer` race
+  `Delta|Closure|Context|Pin|Dependent|Recompose|Rehome|CheckoutMutation` 176 / 0 / 0.
+- Limitations: the knob only ever *lowers* the committed-base cap, never raises it above the
+  change-sized value; the residual import-representative disagreement carried on the F3 row is
+  unchanged; the re-measurement is a single-phase, single-machine reading.
+- Deviations: recorded in `scratchpad/reports/W8g-F3b.md`.
+- Verifier verdict: **PASS** — `scratchpad/reports/W8g-F3b.md`.
+- Next action: the measurement stage owns the miss — re-examine F3's withholding comparison (the
+  report's §5–§7 name it and reproduce it), not the cap.
 
 ### F4 — coalesce the savings ledger so a read-only tool call is not a durable sidecar transaction
 
-- State: `blocked with evidence`. The item's own package suites are green and its verifier verdict
-  is `pass`, but the exit suite's `cmd` normal run is **red** on two tests this wave did not touch,
-  and the failure is attributed to this item's three production files by an overlay probe. **Not
-  committed.**
-- Agent: wave W8f, Lane F4 (implementer + adversarial verifier, one round).
-- Scope/files (uncommitted): `internal/persistence/sidecar_savings.go`,
+- State: `wired`. The `blocked with evidence` state this row carried out of wave W8f is
+  **cleared**: the blocking pair below is green in the wave W8g exit suite (`cmd` normal
+  1424 / 0 / 15), fixed by repair round F4b (row below). **Committed** as part of
+  `e2a1954c262b8f3d85844812a9009f253511bbde` together with F4b.
+- Agent: wave W8f, Lane F4 (implementer + adversarial verifier, one round); repaired by wave W8g,
+  Lane F4 (F4b).
+- Scope/files: `internal/persistence/sidecar_savings.go`,
   `internal/savings/store.go`, `internal/mcp/server.go`,
   `internal/persistence/sidecar_savings_test.go`, `internal/savings/store_test.go`,
   `internal/mcp/savings_retrieval_test.go`.
@@ -4661,7 +4766,8 @@ Shared fields for all W1 sub-items unless overridden:
   `GORTEX_SAVINGS_FLUSH_INTERVAL=0` restores the per-call transaction); every read path on the
   owning `Store` flushes first, so an **in-process** reader never sees a stale total; a batch that
   cannot commit is dropped whole and counted, never retained unbounded.
-- **Blocking failure** (this suite, deterministic, `count=3` in isolation):
+- **Blocking failure, now closed by F4b** (recorded as observed in the W8f suite — deterministic,
+  `count=3` in isolation):
   `TestLoadHistory_SinceZeroUsesCumulative` — `cmd/gortex/gain_test.go:161: since=0 should reflect
   cumulative ledger, got &{… Calls:0 Saved:0 Returned:0}` — and
   `TestLoadHistory_WindowFiltersEvents` — `gain_test.go:179: fresh event should fall inside a 24h
@@ -4696,17 +4802,72 @@ Shared fields for all W1 sub-items unless overridden:
 - Verifier verdict: **PASS** (no blocker; 1 major, 3 minor) —
   `scratchpad/reports/W8f-F4-verify.md`. The verifier ran the item's own packages; neither the
   implementer nor the verifier ran `cmd/gortex`, which is where the regression shows.
-- Next action: make a second handle on the same sidecar path observe the first's buffer (a
-  process-wide flush registry keyed by sidecar path, or a flush on handle release before the shared
-  handle is dropped), add a regression test at the two-handle seam, then re-run `cmd` normal.
+- Next action: none. F4b implemented exactly the repair this row named — a flush registry keyed by
+  the shared sidecar **handle pointer** (not the path, so a reopened path gets a fresh set) plus a
+  flush of the co-registered stores on handle release — added the two-handle regression, and `cmd`
+  normal is 1424 / 0 / 15 in the W8g suite. The daemon-level *"logical writes / 60 s ≤ 0.7 MB"* half
+  of the gate is still unmeasured.
+
+### F4b — a second handle on the same savings ledger reads the first's live window
+
+- State: `wired` (implemented, compiled, `tested`; verifier `pass`). **Committed** as
+  `e2a1954c262b8f3d85844812a9009f253511bbde` — "savings: coalesce ledger writes without making a
+  second handle read stale". This is the item that **clears F4's blocked state**.
+- Agent: wave W8g, Lane F4 (implementer + adversarial verifier, one round).
+- Scope/files: `internal/savings/store.go`, `internal/savings/store_test.go`,
+  `internal/persistence/sidecar_savings.go`, `internal/persistence/sidecar_savings_test.go`,
+  `internal/mcp/server.go`, `internal/mcp/savings_retrieval_test.go`, `cmd/gortex/mcp.go`,
+  `cmd/gortex/gain_test.go`. `cmd/gortex/gain.go` is owned and **unchanged** — the fix is in the
+  store, not in its caller.
+- Invariant: within one process, a read through any handle on a savings ledger observes every live
+  handle's buffered window, and releasing a handle never destroys another handle's buffered
+  accounting. Observations are still committed one transaction per flush window; a batch that
+  cannot commit is dropped whole and counted, never retained unbounded; setting the flush interval
+  to zero still restores the per-call transaction.
+- Root cause the repair closed (W8f's F4 regression, and its verifier's MAJOR): two `savings.Store`
+  values on the same path share ONE cached `*persistence.SidecarStore` but own **private** buffers,
+  so a reader flushed only its own empty buffer and read zeroes; then the reader's `Close` released
+  the shared handle under the still-buffered writer, whose next flush failed with
+  `sql: database is closed` and **dropped** the window. A loss, not a lag. The fix is a registry
+  `map[*persistence.SidecarStore]map[*Store]struct{}`: keying on the handle **pointer** rather than
+  the path is generation-correct, because closing a handle evicts it from the persistence cache and
+  a later `Open` on the same path allocates a different handle. A read flushes every co-registered
+  store; handle release flushes the others first.
+  The MAJOR half bounds exposure by process shape: `cmd/gortex/mcp.go`'s `LifecycleOneshot` stack —
+  verified the tree's only such construction — gets a short window plus an explicit flush that does
+  not depend on the teardown chain reaching its savings step, while the daemon
+  (`cmd/gortex/daemon_state.go:106`) keeps the minute-scale default.
+- Wiring: the daemon's teardown chain calls `Server.FlushSavings` (`serverstack` cleanup step);
+  `SharedServer.Close` runs the chain before releasing sidecars.
+- Acceptance gate(s): G8. Measured half, in the gate's own unit (carried from F4): 12 observations
+  one-by-one = 395,520 B of sidecar WAL, as one batch = 32,960 B — 12.0×, inside the
+  ≤ 60 KB / 12 calls ceiling.
+- Harness evidence (`GXH_TAG=W8g-F4b`, plus re-run whole in the exit suite): `./internal/savings`
+  normal 67 / 0 / 0 and race 67 / 0 / 0; `./internal/persistence` normal 61 / 0 / 0 and race
+  61 / 0 / 0; `./internal/mcp` normal 6549 / 0 / 8 over six chunks and race `Savings|Server`
+  38 / 0 / 0; **`cmd` normal 1424 / 0 / 15** — the two W8f failures are green.
+- Limitations: the registry is per **process**; cross-process readers still lag by up to one flush
+  window; durability remains bounded rather than per-call (a SIGKILL loses at most one window, and
+  for the one-shot server a much shorter one); a failed flush still drops a whole batch;
+  `gortex savings --reset` from the CLI races a live daemon over a wider window than before;
+  `GORTEX_SAVINGS_FLUSH_INTERVAL` is still undocumented in `docs/`; the daemon-level
+  *"logical writes / 60 s ≤ 0.7 MB"* half of the gate was not run.
+- Deviations: recorded in `scratchpad/reports/W8g-F4b.md`.
+- Verifier verdict: **PASS**, and the wiring check confirms the production entrypoints —
+  `scratchpad/reports/W8g-F4b.md`.
+- Next action: none for the source; document `GORTEX_SAVINGS_FLUSH_INTERVAL` when `docs/` next
+  opens (the Suite stage owns the ledger, not `docs/` at large).
 
 ### F5 — make the W8 harness measure what it names
 
 - State: `wired` (implemented, compiled, `tested`; verifier `pass`), with the qualification that
   the daemon-workload phase bodies are wired by a source-level assertion plus option-plumbing
-  tests and are never executed under the harness. **Not committed.**
-- Agent: wave W8f, Lane F5 (implementer + adversarial verifier, one round).
-- Scope/files (uncommitted, all test-only in `cmd/gortex`): `w8_sampler_test.go`,
+  tests and are never executed under the harness. **Committed** as part of
+  `daa91e21fd625e411828186a08e9df88e3af5789` together with its repair round F5b (row below), which
+  corrects the idle split this row introduced.
+- Agent: wave W8f, Lane F5 (implementer + adversarial verifier, one round); repaired by wave W8g,
+  Lane F5 (F5b).
+- Scope/files (all test-only in `cmd/gortex`): `w8_sampler_test.go`,
   `w8_sustained_io_integration_test.go`, `w8_paired_arms_test.go`,
   `issue767_fixture_shared_test.go`. `cmd/gortex/w8_fixture_generator_test.go` is owned and
   unchanged.
@@ -4728,21 +4889,71 @@ Shared fields for all W1 sub-items unless overridden:
 - Limitations: the exclusion is per sample interval and therefore as coarse as the sample rate
   (P0 reads 1.89x total vs 2.38x excluded, P5 0.26x vs 0.64x); P8's excluded ratio is unstable at
   n=3; sub-window rows carry no ceiling and are explicitly recorded-never-judged; the phase-body
-  wiring test is source-level and skips under `-trimpath`; the idle split doubles idle wall time;
-  the phase total now contains both idle arms, so F6 must read per-arm numbers off the window rows.
+  wiring test is source-level and skips under `-trimpath`; the idle split doubles idle wall time
+  (unchanged by F5b — both arms still hold the full window, deliberately); the phase total contains
+  both idle arms, so F6 must read per-arm numbers off the window rows. The last clause of this row
+  — the frozen ceiling applied to the SUM of the arms — is the defect **F5b repairs**.
 - Deviations: recorded in `scratchpad/reports/W8f-F5.md` §7.
 - Verifier verdict: **PASS** (no blockers; 1 major, 5 minor) —
   `scratchpad/reports/W8f-F5-verify.md`.
-- Next action: commit once the wave's gate opens; F6 reads P1/P8 off the per-arm window rows.
+- Next action: none for the source. F6 reads P1/P8 off the **polling** arm, which F5b makes the
+  arm the frozen ceiling is applied to; the quiet arm is un-budgeted by construction.
+
+### F5b — the idle arms are judged over the frozen window, and no bracket scrapes inside a phase
+
+- State: `wired` (implemented, compiled, `tested`; verifier `pass`), test-only in `cmd/gortex`.
+  **Committed** as `daa91e21fd625e411828186a08e9df88e3af5789` — "cmd: judge each idle arm over the
+  frozen window and stop scraping inside it".
+- Agent: wave W8g, Lane F5 (implementer + adversarial verifier, one round).
+- Scope/files (all test-only in `cmd/gortex`): `w8_sustained_io_integration_test.go`,
+  `w8_paired_arms_test.go`, `w8_sampler_test.go`, `issue767_fixture_shared_test.go`.
+  `cmd/gortex/w8_fixture_generator_test.go` is owned and unchanged.
+- Invariant: a phase is judged against a ceiling frozen over a window of the **same** length and the
+  **same** protocol. The polling arm reproduces the frozen protocol byte for byte and is the arm the
+  frozen ceiling and the idle byte budget are applied to; the quiet arm is a separate, explicitly
+  un-budgeted row. No bracket inside an idle phase scrapes `daemon status`, and a scrape-free window
+  records a named marker (`w8NoScrapeInsideWindow`) as its `viewmetrics_error`, so the absent
+  counter series is a stated fact rather than a silent zero. The frozen artifacts are untouched and
+  their budget digest is byte-identical before and after.
+- Root cause the repair closed (verifier finding F1, major): W8f's F5 gave **both** idle arms the
+  full `cfg.Idle` while still applying the frozen `P1_idle_cold` / `P8_idle_warm` ceilings to their
+  **sum**, so a post-fix candidate reported ~124 s of idle against a ceiling frozen over a 62 s
+  window — a by-construction failure invisible in the number. Each sub-window bracket also took its
+  own `daemon status` scrape, four extra client round trips inside a phase the frozen baseline
+  measured with none, and `enforceIdleBudget` was applied to the doubled phase total.
+- Rejected alternative, recorded: halving the two arms. It keeps the phase wall at the frozen 60 s
+  but makes the **judged** arm a 30 s window judged against a 60 s ceiling — the same error
+  inverted.
+- Wiring: this is measurement instrumentation, not production code; `wired` here means the harness's
+  own reduction path reaches it, proven by an offline re-reduction of the existing frozen
+  `paired1500` artifacts with no daemon run.
+- Acceptance gate(s): G8 and G10 — this is the instrument the F6 measurement stage reads; no gate
+  closes on it.
+- Harness evidence (`GXH_TAG=W8g-F5b`, plus re-run whole in the exit suite): `cmd` normal
+  1424 / 0 / 15 and `cmd` race
+  `W8|Issue767|Sampler|Paired|DedicatedBase|Advance|Gain|LoadHistory` 275 / 0 / 12.
+- Limitations: idle wall time is still doubled (both arms hold the full window — deliberate, it is
+  what keeps the judged arm comparable); the quiet arm carries no ceiling and is recorded-never-
+  judged; the scrape-free windows have no counter series at all, by construction; every phase body
+  remains opt-in and skips under the harness's `env -i` allowlist, so none of this ran against a
+  real daemon here.
+- Deviations: none against the plan text; against W8f's shipped behaviour, this row is the repair.
+- Verifier verdict: **PASS** — `scratchpad/reports/W8g-F5b.md`.
+- Next action: none; F6 reads P1/P8 off the polling arm's window rows.
 
 ### F7 — first committed base copies generation zero on a clean matching tree
 
-- State: `blocked with evidence`. Two adversarial rounds; the repair round closed round 1's blocker
-  and major, and round 2 returned **FAIL** again. **Not committed.**
-- Agent: wave W8f, Lane F7 (implementer + adversarial verifier, two rounds).
-- Scope/files (uncommitted): `internal/indexer/builder_dedicated_claimed.go`,
+- State: `wired`. The `blocked with evidence` state this row carried out of wave W8f is
+  **cleared** by repair round F7b (row below), which closed both round-2 findings and whose verifier
+  returned `pass`. **Committed** as part of `534a124e094734e1ffd376dc59b6614fac56fc57` together with
+  F7b.
+- Agent: wave W8f, Lane F7 (implementer + adversarial verifier, two rounds); repaired by wave W8g,
+  Lane F7 (F7b, one round, verifier `pass`).
+- Scope/files: `internal/indexer/builder_dedicated_claimed.go`,
   `internal/indexer/builder_dedicated_claimed_copy_test.go` (new).
-  `internal/indexer/builder_dedicated_claimed_test.go` was owned and left untouched.
+  `internal/indexer/builder_dedicated_claimed_test.go` was owned and left untouched by W8f; F7b
+  touched one fixture line of it and added
+  `internal/indexer/builder_dedicated_claimed_bracket_test.go` (new).
 - Invariant (as implemented): when generation zero already describes the committed tree — proven by
   its own `repo_index_state` clean bit, a readable HEAD, a **provable** clean working tree, a tree
   match, and payload containment — the reserved committed base may be materialised by copying
@@ -4750,7 +4961,7 @@ Shared fields for all W1 sub-items unless overridden:
   reason and re-parses. Generation zero is never relabelled: the copy writes into the
   already-reserved positive generation, and the copied generation records its own
   `repo_index_state`.
-- Round-2 blocking findings (`scratchpad/reports/W8f-F7-verify.md`): the repair's own claimed fix
+- Round-2 blocking findings, **both closed by F7b** (`scratchpad/reports/W8f-F7-verify.md`): the repair's own claimed fix
   for round-1 minor M-1 — the bulk bracket must sit inside the leader-only payload preparation — is
   asserted by a test that does not turn red when the bracket moves back out; and a second, new
   soundness hole in the predicate that the item's §8.7 rationale explicitly and wrongly claims is
@@ -4775,8 +4986,64 @@ Shared fields for all W1 sub-items unless overridden:
 - Deviations: the plan asked for the bracket around both routes; source evidence overrode it.
 - Verifier verdict: **FAIL** (round 2: 1 blocker, 1 major, 3 minor) —
   `scratchpad/reports/W8f-F7-verify.md`; round 1 archived at `W8f-F7-verify-r1.md`.
-- Next action: make the leader-only-bracket pin actually red when the bracket moves out, close the
-  predicate hole the verifier names, then a third round.
+- Next action: none. F7b did exactly that — the leader-only pin now counts contended asks and is
+  red 5/5 when the bracket moves out, and the predicate hole is closed by two new refusal clauses on
+  extractor-version provenance. Production behaviour is still unchanged (no store implements
+  `CopyPayloadGeneration`), so G8 remains unapproached for the copy route; what F7b *does* change in
+  production is the bulk-window close, which is now `defer`-driven and `Goexit`-safe.
+
+### F7b — the generation bulk bracket closes on every exit and drains off-lane
+
+- State: `wired` for the bracket half (implemented, compiled, `tested`; verifier `pass`, closing
+  W8f's round-2 FAIL). The **copy route itself remains inert in production** by design. **Committed**
+  as `534a124e094734e1ffd376dc59b6614fac56fc57` — "indexer: close the generation bulk window on every
+  exit path".
+- Agent: wave W8g, Lane F7 (implementer + adversarial verifier, one round after W8f's two).
+- Scope/files: `internal/indexer/builder_dedicated_claimed.go`,
+  `internal/indexer/builder_dedicated_claimed_test.go` (one fixture line),
+  `internal/indexer/builder_dedicated_claimed_copy_test.go`,
+  `internal/indexer/builder_dedicated_claimed_bracket_test.go` (new).
+- Invariant: a generation bulk window is closed on **every** exit path of the build it brackets, and
+  it is closed through F2's deferred-drain door, never through an inline TRUNCATE in the publish
+  window. A destination generation that is not provably empty over nodes **and** edges fails the
+  build instead of writing unbracketed. A copy plan is refused unless generation zero's rows came
+  from the reservation's own extractor versions. Generation zero is never relabelled.
+- Root cause the repair closed: the close was a statement after `run()` plus a `recover()`/`panic()`
+  pair — which covers return, error and panic but **not `runtime.Goexit`**, which unwinds through
+  deferred calls and skips both. A missed close leaves the store holding a pinned writer connection
+  with `wal_autocheckpoint = 0`: an unbounded log with no owner, because
+  `EndGenerationBulkLoad` is inert for everybody else and the next `FlushBulk` adopts the window and
+  charges that unrelated build the TRUNCATE. It is now a single deferred close with a named result
+  (`builder_dedicated_claimed.go:416-429`), preserving both prior error rules.
+- Round-2 findings closed: the leader-only placement is now pinned by **counting contended asks and
+  asserting zero** — the verifier's own "bracket around the whole build" shape is mutation M2 and is
+  RED 5/5; and the predicate hole is closed by two new refusal clauses on extractor-version
+  provenance (M3/M4 RED). Two minors closed with them: the store's emptiness refusal is now
+  fail-closed rather than warn-and-proceed (M5), and the `IndexedAt` re-stamp is pinned by a
+  backdated source generation (M6).
+- Wiring: the bracket's close is live production behaviour and is measured, not asserted — a
+  real-store test shows the WAL non-empty after the bracket's close and zero after a control
+  `FlushBulk` on the same store, which is the difference between the off-lane drain door and the
+  inline-checkpoint door. The **copy** route is still inert: `generationCopier` returns
+  `(nil, false)` because no store implements `CopyPayloadGeneration`, so the predicate
+  short-circuits at zero cost.
+- Acceptance gate(s): G8 — the bracket half contributes; the copy half is **not approached**, the
+  route being dead in production.
+- Harness evidence (`GXH_TAG=W8g-F7b`, plus re-run whole in the exit suite): `indexer` normal over
+  six chunks 3079 / 0 / 2, `indexer` race
+  `DedicatedBase|Startup|Advance|Trigger|Consumer|Demand|Claimed|RefView` 255 / 0 / 0; `store`
+  normal 1885 / 0 / 2 and race 520 / 0 / 0 for the door it drives.
+- Limitations: the bracket still is not around **both** routes (widening it needs `FlushBulk` to
+  leave a generation-scoped window to its owner, a `store_sqlite` change F2 owns); the documented
+  payload delta between the two routes (a pathless `KindBuiltin` sentinel carrying blank
+  `workspace_id`/`project_id` on the copy) is asserted rather than excluded; the predicate proves
+  containment, not equality; the copy route has no production caller, so none of its refusals runs
+  outside tests.
+- Deviations: the plan asked for the bracket around both routes; source evidence overrode it, as in
+  W8f.
+- Verifier verdict: **PASS** — `scratchpad/reports/W8g-F7b.md`.
+- Next action: none for this item; implementing `CopyPayloadGeneration` in `store_sqlite` is F2's
+  half and is not scheduled.
 
 ## Plan (execution-plan-v2)
 
@@ -7312,3 +7579,205 @@ independently green. It measures no write amplification and exercises no opt-in 
 `env -i` allowlist drops every `GXW8_*` / `GORTEX_ISSUE767_*` / `GORTEX_BENCH_*` variable), so F2's
 second-copy payload ceiling, F4's daemon-level 60 s window and F5's phase workloads remain
 unmeasured here. No gate closes on this suite.
+
+### 2026-09-10 — Wave W8g exit suite (F1b, F3b, F4b, F5b, F7b; carried F1, F2) — suite GREEN, seven commits
+
+- Source identity: HEAD `bb43b3386624ed181fb6ad258bda91033d599d6c`, dirty-manifest sha256
+  `3c6984f9ed5397c5b45f88e4292632b12613b284bef42ddb1daeee6d56860ee6` — **identical on all 15
+  compiles and all 29 runs of this suite** (read from each `result.json`), so the whole table below
+  is one tree. 35 modified tracked `.go` files + 5 untracked (`bulk_load_generation_test.go`,
+  `builder_dedicated_claimed_bracket_test.go`, `builder_dedicated_claimed_copy_test.go`,
+  `delta_write_set_test.go`, `ref_view_demand_test.go`) plus the untracked working input
+  `docs/incremental-indexing-handoff-2026-09-10.md`. The five lanes' own tagged runs
+  (`W8g-F1b` / `W8g-F3b` / `W8g-F4b` / `W8g-F5b` / `W8g-F7b`) sit at *earlier* dirty manifests and
+  are cited on the item rows, never mixed into this table. Toolchain go1.27.0 darwin/arm64,
+  `GOWORK=off`, `GOTOOLCHAIN=local`, `GOFLAGS=-mod=mod -buildvcs=false`, `GOPROXY=off`, shared
+  `GOCACHE`/`GOMODCACHE`. Harness tag `GXH_TAG=W8g`, `GOMAXPROCS=2`, `GOMEMLIMIT=2GiB`.
+- Commands: `go build ./...` and `go vet` over the nine packages this wave touches, from the
+  worktree under the isolated environment; then `bash validate.sh compile <alias> {normal,race}`
+  (15 compiles, all OK, no `GOPROXY` fallback) and `bash validate.sh test …` (29 runs).
+
+#### Build and vet
+
+`go build ./...` exit 0, no output, first attempt. `go vet` exit 0 with no diagnostics on all of
+`./internal/graph`, `./internal/graph/store_sqlite`, `./internal/graphview`, `./internal/indexer`,
+`./internal/reconcile`, `./internal/mcp`, `./internal/persistence`, `./internal/savings`,
+`./cmd/gortex`.
+
+#### Normal runs
+
+| run | pass / fail / skip | result dir (`scratchpad/results/…`) |
+| --- | --- | --- |
+| `graph` `.` | 539 / 0 / 0 | `graph-normal-_-W8g-1` |
+| `graphview` `.` | 509 / 0 / 0 | `graphview-normal-_-W8g-1` |
+| `reconcile` `.` | 93 / 0 / 0 | `reconcile-normal-_-W8g-1` |
+| `store` `.` | 1885 / 0 / 2 | `store-normal-_-W8g-1` |
+| `./internal/persistence` `.` | 61 / 0 / 0 | `internal_persistence-normal-_-W8g-1` |
+| `./internal/savings` `.` | 67 / 0 / 0 | `internal_savings-normal-_-W8g-1` |
+| `./internal/mcp` `^Test[A-C]` | 1224 / **1** / 7 | `internal_mcp-normal-_Test_A_C_-W8g-1` (the FLAKE, below) |
+| `./internal/mcp` `^Test[A-C]` (re-run) | 1225 / 0 / 7 | `internal_mcp-normal-_Test_A_C_-W8g-2` |
+| `./internal/mcp` `^Test[D-H]` | 1627 / 0 / 0 | `internal_mcp-normal-_Test_D_H_-W8g-1` |
+| `./internal/mcp` `^Test[I-M]` | 521 / 0 / 1 | `internal_mcp-normal-_Test_I_M_-W8g-1` |
+| `./internal/mcp` `^Test[N-R]` | 2029 / 0 / 0 | `internal_mcp-normal-_Test_N_R_-W8g-1` |
+| `./internal/mcp` `^Test[S-T]` | 557 / 0 / 0 | `internal_mcp-normal-_Test_S_T_-W8g-1` |
+| `./internal/mcp` `^Test[U-Z]` | 590 / 0 / 0 | `internal_mcp-normal-_Test_U_Z_-W8g-1` |
+| **`./internal/mcp` total** (clean A–C re-run) | **6549 / 0 / 8** | |
+| `indexer` `^Test[A-C]` | 746 / 0 / 1 | `indexer-normal-_Test_A_C_-W8g-1` |
+| `indexer` `^Test[D-H]` | 593 / 0 / 0 | `indexer-normal-_Test_D_H_-W8g-1` |
+| `indexer` `^Test[I-M]` | 564 / 0 / 1 | `indexer-normal-_Test_I_M_-W8g-1` |
+| `indexer` `^Test[N-R]` | 649 / 0 / 0 | `indexer-normal-_Test_N_R_-W8g-1` |
+| `indexer` `^Test[S-T]` | 379 / 0 / 0 | `indexer-normal-_Test_S_T_-W8g-1` |
+| `indexer` `^Test[U-Z]` | 148 / 0 / 0 | `indexer-normal-_Test_U_Z_-W8g-1` |
+| **`indexer` total** | **3079 / 0 / 2** | |
+| `cmd` `.` | **1424 / 0 / 15** | `cmd-normal-_-W8g-1` |
+
+`cmd` normal is the row that matters against the previous entry: W8f's two deterministic
+`TestLoadHistory_*` failures are **green**, which is what closes F4's `blocked with evidence`.
+
+#### Race runs
+
+| run | pass / fail / skip | result dir |
+| --- | --- | --- |
+| `store` `BulkLoad\|Generation\|Checkpoint\|Maintenance\|Drain` | 520 / 0 / 0 | `store-race-BulkLoad_Generation_Checkpoint_Maintenance_Drain-W8g-1` |
+| `indexer` `DedicatedBase\|Startup\|Advance\|Trigger\|Consumer\|Demand\|Claimed\|RefView` | 255 / 0 / 0 | `indexer-race-DedicatedBase_Startup_Advance_Trigger_Consumer_D-W8g-1` |
+| `indexer` `Delta\|Closure\|Context\|Pin\|Dependent\|Recompose\|Rehome\|CheckoutMutation` | 176 / 0 / 0 | `indexer-race-Delta_Closure_Context_Pin_Dependent_Recompose_Re-W8g-1` |
+| `./internal/mcp` `Savings\|Server` | 38 / 0 / 0 | `internal_mcp-race-Savings_Server-W8g-1` |
+| `./internal/persistence` `.` | 61 / 0 / 0 | `internal_persistence-race-_-W8g-1` |
+| `./internal/savings` `.` | 67 / 0 / 0 | `internal_savings-race-_-W8g-1` |
+| `cmd` `W8\|Issue767\|Sampler\|Paired\|DedicatedBase\|Advance\|Gain\|LoadHistory` | 275 / 0 / 12 | `cmd-race-W8_Issue767_Sampler_Paired_DedicatedBase_Advance-W8g-1` |
+
+0 `DATA RACE` reports in any race log. Both prescribed `indexer` race selections fit one process
+this wave; unlike W8f neither needed splitting.
+
+#### Chunking deviation, forced by the harness's 8-minute `-test.timeout`
+
+`./internal/mcp` **cannot be run whole**: `test ./internal/mcp normal '.'` reached
+`panic: test timed out after 8m0s` inside
+`TestCheckoutSourceSymbolPrimitiveUsesSelectedPhysicalSpan`
+(`internal_mcp-normal-_-W8g-1`, exit 2, 6468 passes at the abort) and was re-run as the same six
+first-letter chunks the `indexer` prescription uses. The aborted run is kept for audit and
+contributed no failure. `internal/indexer` ran as the prescribed six chunks with **no** further
+split — `^Test[A-C]` fit at 426.7 s, where W8f had to break it into `^Test[AB]` + `^TestC`.
+
+#### The one red: `TestBaseSelectorTextSearchAnswersFromItsOwnRepositoryOnly` — recorded as FLAKE
+
+`internal_mcp-normal-_Test_A_C_-W8g-1`, `view_base_selector_test.go:321`:
+
+> the canonical search failed: view_building: automatic checkout discovery is still pending; retry
+> this request: indexer: checkout mutation lane is busy; retry: selected checkout discovery is
+> pending: context deadline exceeded
+
+All four conditions of the FLAKE rule are met, each with its evidence:
+
+1. **The test's file is unmodified by this wave.**
+   `git status --porcelain -- internal/mcp/view_base_selector_test.go` is empty; the file is in no
+   item's ownership list.
+2. **The same run passes on a re-run.** `internal_mcp-normal-_Test_A_C_-W8g-2`: 1225 / 0 / 7,
+   exit 0.
+3. **It passes in isolation at `-count=3`.**
+   `internal_mcp-normal-_TestBaseSelectorTextSearchAnswersFromItsOwnRepo-W8g-1`, exit 0.
+4. **The attribution probe cannot distinguish the wave from the baseline.** A pristine-HEAD
+   `./internal/mcp` binary was built with `go test -c -overlay` mapping **all 40** dirty `.go` files
+   back to their HEAD state (35 modified → their HEAD blob, 5 untracked → deleted); no binary was
+   written into the worktree and the worktree was never mutated. Wave and baseline binaries were
+   then run **alternately** on `^Test[A-C]` under the harness's own `env -i` environment:
+   baseline **0 failures in 7 runs**, wave **1 failure in 6 runs**. Fisher exact two-sided
+   **p = 0.46** — indistinguishable. Probe logs: `scratchpad/probe-W8g/{wave,head}-AC-*.log`.
+
+Independent corroboration, stronger than the four conditions: the **F4b lane's own** suite hit the
+*same error string* on a *different* test of the same family —
+`TestBaseSelectorTextSearchNarrowsToItsOwnRepository`
+(`view_search_text_reader_truth_test.go:205`) in `internal_mcp-normal-_Test_A_F_-W8g-F4b-1` — at a
+**different dirty manifest** (`a2dcfdf4…`), and it too passed on re-run
+(`…-W8g-F4b-2`, 2345 / 0 / 7). So the failure is a load-sensitive timing family affecting a class of
+base-selector tests across multiple source identities, not a behaviour this wave introduced.
+
+`all_green` is therefore **true** for the commit gate. **Honest residual**: `1/6` versus `0/7` is
+indistinguishable, not exonerating, and the failing subsystem — checkout discovery / the checkout
+mutation lane — is exactly what F1 and F1b touch. The follow-up row below exists for that reason.
+
+**Follow-up row.** `TestBaseSelectorTextSearchAnswersFromItsOwnRepositoryOnly` /
+`TestBaseSelectorTextSearchNarrowsToItsOwnRepository` wait on automatic checkout discovery with a
+wall-clock deadline and fail under `GOMAXPROCS=2` contention. Owner: unassigned. Action: give the
+base-selector fixtures an injected clock or a discovery-settled barrier instead of a deadline, and
+re-check whether F1's consumer census lengthens the discovery path. Until then, a single red from
+this family on a loaded machine must be re-run before it is treated as a regression.
+
+#### Every skip, named with its exact reason (no skip is a disabled assertion)
+
+`store` (2, both the known-legitimate pair): `TestBundlePackageKeyNeverUsesOSSeparator` —
+`bundle_cache_test.go:112: separator matches the contract on this platform` (the Windows
+path-separator test); `TestMetaBlobCensus` — `meta_census_probe_test.go:17: set GORTEX_BENCH_STORE
+to a copied store.sqlite to run` (the copied-store census requiring an explicit fixture).
+
+`indexer` (2, pre-existing opt-in harnesses): `TestBackendBench` — `zzbench_backends_test.go:39:
+bench harness; set GORTEX_BENCH_ROOT=<repo> and GORTEX_BENCH_BACKEND=memory|sqlite`;
+`TestMeasureEditLatency` — `editlatency_measure_test.go:26: set GORTEX_MEASURE_REPO=/abs/path to
+run`.
+
+`./internal/mcp` (8, all pre-existing and unchanged from the W8f entry): five subtests of
+`TestAnalyzeScope_AllScopeAwareKinds_NoCrossWorkspaceLeak` at `analyze_scope_test.go:660`
+(`coverage_gaps` / `coverage_summary` need a coverage profile; `ownership` / `stale_code` /
+`stale_flags` need git-blame data — each printed as "cannot fixture in-memory; emits empty, never
+leaks"); `TestATradeThatCannotSaveTheOutlineIsGivenBack` —
+`localization_file_outline_test.go:857: the fixture is no longer tight enough to drop the index`;
+`TestLocalizationTextMatchNormalisesNativePathToGraphKey` —
+`localization_text_index_test.go:120: a native path differs from the graph spelling only on
+Windows`; `TestCheckoutMutationResolvedRootRejectsFoldedDistinctDirectory` —
+`view_mutation_state_test.go:175: filesystem cannot represent case-distinct directories`.
+
+`cmd` normal (15) / race (12) — the same opt-in E2E and platform set as the W8f entry, at the
+current line numbers. Normal-only (3): `TestFileCoveragePrefersCanonicalKeysWithoutDoubleCounting`
+(`daemon_controller_coverage_test.go:144`, "native and slash graph keys coincide on this
+platform"), `TestSystemdUnitPath_ResolvesUnderHome` (`daemon_service_test.go:192`, "systemd paths
+only meaningful on linux"), `TestServiceCommands_RejectUnsupportedOS`
+(`daemon_service_test.go:205`, "this test only runs on unsupported platforms"). In both flavours
+(12): `TestIssue767IdleIOIntegration` (`issue767_idle_io_integration_test.go:30`),
+`TestIssue767WorktreeReadinessIntegration` (`issue767_worktree_readiness_integration_test.go:23`),
+`TestW8Matrix5MainAdvanceWithTenDependents` (`w8_matrix_advance_test.go:70`),
+`TestW8Matrix7Adversarial` (`w8_matrix_adversarial_test.go:38`), `TestW8MatrixEditTaxonomy`
+(`w8_matrix_edits_test.go:1587`), `TestW8Matrix6Lifecycle` (`w8_matrix_lifecycle_test.go:996`),
+`TestW8MatrixNoopFamily` (`w8_matrix_noop_test.go:1655`),
+`TestW8m5RunGuardedAlwaysFilesARow/aborted` (`w8_matrix_noop_test.go:1981`, "the guard's abort
+path: this case leaves its goroutine without filing a row"),
+`TestW8MatrixResolutionProvenanceManifests` (`w8_matrix_resolution_test.go:1541`),
+`TestW8Matrix4ViewLifecycle` (`w8_matrix_views_test.go:655`), `TestW8PairedArmsVerdict`
+(`w8_paired_arms_test.go:1307` — moved from `:1090` with F5b's edit) and
+`TestW8SustainedWriteAmplification` (`w8_sustained_io_integration_test.go:605`), each with the
+`set GXW8_*` / `GORTEX_ISSUE767_*` opt-in reason it prints.
+
+#### Commits
+
+Seven, in dependency order, each staged by explicit path list (never `git add -A`), each ending
+with the session trailer. The two carried items go first.
+
+| # | item | commit | subject |
+| --- | --- | --- | --- |
+| 1 | F1 (carried) | `331e64b95835504311b36daeb77204008bd5cf77` | indexer: publish a committed base only for a family with a dependent |
+| 2 | F2 (carried) | `bbd2f8dca6a530295818777599f7b43dae165bd8` | store_sqlite: scope a bulk write window to one generation and drain the WAL off-lane |
+| 3 | F1b | `568618a720e044b4658de958e330ca5570ca8c7d` | indexer: let a ref view demand a committed base after its catalog row exists |
+| 4 | F3b | `905d7a90cc1cb0753725bc825b6259cbdf51d1fd` | indexer: honour the operator re-resolve bound on a committed-base delta |
+| 5 | F7b | `534a124e094734e1ffd376dc59b6614fac56fc57` | indexer: close the generation bulk window on every exit path |
+| 6 | F4b | `e2a1954c262b8f3d85844812a9009f253511bbde` | savings: coalesce ledger writes without making a second handle read stale |
+| 7 | F5b | `daa91e21fd625e411828186a08e9df88e3af5789` | cmd: judge each idle arm over the frozen window and stop scraping inside it |
+
+No item was skipped: all five wave items and both carried items hold a final verifier verdict of
+`pass`, and `all_green` is true. F1b reached `pass` only at round 2 (round 1 `fail` on an ordering
+blocker, repaired in-lane). The ordering is the dependency ordering — F1 before F1b (the demand
+door before its ref-view caller), F2 before F7b (the generation-scoped window before the builder
+that brackets with it).
+
+The 40 dirty `.go` files partition exactly across the seven commits: 40 assigned, 0 unassigned,
+0 assigned twice — verified programmatically against `git status --porcelain -uall` before the
+first `git add`. After the seventh commit, `git status --short` lists **only** the untracked
+working input `docs/incremental-indexing-handoff-2026-09-10.md`; nothing outside this wave's
+ownership was touched. This ledger is the only other file this stage wrote, committed last.
+
+Limitation of what this suite proves: nine packages' unit and race surface at one source identity on
+darwin/arm64 at `GOMAXPROCS=2`, from a worktree that held all seven items at once — so a green
+package here is not evidence that any single item is independently green. It measures no write
+amplification and exercises no opt-in probe (`validate.sh`'s `env -i` allowlist drops every
+`GXW8_*` / `GORTEX_ISSUE767_*` / `GORTEX_BENCH_*` variable), so F2's second-copy payload ceiling,
+F4's daemon-level 60 s window and F5's phase workloads remain unmeasured here. F3b's own
+single-phase re-measurement, which *was* performed, **missed both of its targets** (7.91 MB against
+≤ 1 MB; 83.0 MB against ≤ 20 MB) — see the F3b row. **No gate closes on this suite.**
