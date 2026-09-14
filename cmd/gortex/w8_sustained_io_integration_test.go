@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -958,11 +959,49 @@ func (r *w8Run) phaseMainAdvance() {
 		if err != nil {
 			r.t.Fatalf("dependent isolation query failed: %v", err)
 		}
-		if leaked {
-			r.t.Fatalf("main-only symbol %s leaked into dependent %s", r.lastProbe, r.dependents[0])
-		}
+		r.requireIsolation("main-only symbol "+r.lastProbe+" in dependent "+filepath.Base(r.dependents[0]), leaked)
 	}
 	r.f.settle()
+}
+
+// requireIsolation applies w8IsolationOutcome and records it either way.
+func (r *w8Run) requireIsolation(subject string, leaked bool) {
+	r.t.Helper()
+	fatal, note := w8IsolationOutcome(r.arm, leaked)
+	r.note(subject + ": " + note)
+	if fatal {
+		r.t.Fatalf("%s: %s", subject, note)
+	}
+	if leaked {
+		r.t.Logf("%s/%s: %s", r.arm, subject, note)
+	}
+}
+
+// w8IsolationOutcome says what a leaked symbol means for an arm.
+//
+// Gate 5 — "a workload with ten dependent worktrees updates every logical view
+// correctly" — is a claim about the branch. The baseline binary predates it:
+// main 56a1c29d serves a discovered dependent out of the family's advancing
+// base, so the commit that moves main is visible inside a worktree whose own
+// tree never moved. That is the defect under repair, and on the baseline arm it
+// is the measurement, not a harness failure. Stopping the baseline there would
+// end the arm at P5 and leave the headline phase — and every phase after it —
+// with nothing to compare the candidate against, which is the one outcome this
+// item exists to prevent.
+//
+// So a leak is recorded by name on the baseline and fatal everywhere else.
+// "Everywhere else" is deliberate: any arm whose name is not exactly "baseline"
+// is held to the gate, so a renamed or mistyped arm can never inherit the
+// exemption.
+func w8IsolationOutcome(arm string, leaked bool) (fatal bool, note string) {
+	if !leaked {
+		return false, "isolation held"
+	}
+	if arm == "baseline" {
+		return false, "BASELINE ISOLATION VIOLATION: the symbol is visible where it must not be; " +
+			"this is gate 5's pre-repair behaviour on main 56a1c29d, recorded as evidence, and it is not a budget"
+	}
+	return true, "ISOLATION VIOLATION: the symbol is visible where it must not be (gate 5)"
 }
 
 func (r *w8Run) phaseDependentEdits() {
@@ -980,9 +1019,7 @@ func (r *w8Run) phaseDependentEdits() {
 		if err != nil {
 			r.t.Fatalf("primary isolation query failed: %v", err)
 		}
-		if leaked {
-			r.t.Fatalf("dependent edit %s leaked into the primary view", marker)
-		}
+		r.requireIsolation("dependent edit "+marker+" in the primary view", leaked)
 	}
 	r.f.settle()
 }
@@ -1177,6 +1214,15 @@ func w8GitOutput(t *testing.T, f *issue767Fixture, args ...string) (string, erro
 
 // w8SourceIdentity records which tree the harness itself came from. It is best
 // effort: the harness may run from an exported tree with no git metadata.
+//
+// The digest covers `git status --porcelain=v1 -uall` AND `git diff HEAD`.
+// The status alone lists paths and status letters, never contents, so two
+// different working trees with the same modified-file list hash identically —
+// which is how a run's manifest can claim a source identity it does not have
+// while a neighbouring agent rewrites a file in the same worktree. Hashing the
+// diff as well is what makes the identity answer "which bytes", not "which
+// filenames". Untracked contents remain outside both (git diff does not carry
+// them); the file list still names them.
 func w8SourceIdentity() (commit, dirty string) {
 	run := func(args ...string) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -1188,12 +1234,17 @@ func w8SourceIdentity() (commit, dirty string) {
 		return strings.TrimSpace(string(output))
 	}
 	commit = run("rev-parse", "HEAD")
-	status := run("status", "--porcelain=v1", "-uall")
-	if status != "" {
-		sum := sha256.Sum256([]byte(status))
-		dirty = hex.EncodeToString(sum[:])
+	return commit, w8DirtyDigest(run("status", "--porcelain=v1", "-uall"), run("diff", "HEAD"))
+}
+
+// w8DirtyDigest is the content-sensitive half of the source identity: the
+// modified-file list AND the modified bytes. A clean tree digests to "".
+func w8DirtyDigest(status, diff string) string {
+	if status == "" && diff == "" {
+		return ""
 	}
-	return commit, dirty
+	sum := sha256.Sum256([]byte(status + "\x00" + diff))
+	return hex.EncodeToString(sum[:])
 }
 
 func w8WriteJSON(t *testing.T, path string, value any) {
@@ -1497,6 +1548,227 @@ func TestW8RunSamplerIsSafeWhileTheFixtureStartsItsChild(t *testing.T) {
 	}
 }
 
+// TestW8IsolationOutcomeExemptsOnlyTheBaselineArm pins the one arm-conditional
+// rule in the harness.
+//
+// An exemption that spreads is worse than no measurement: if the candidate
+// could ever inherit it, the paired run would report a write reduction that was
+// partly bought by serving the wrong corpus, and gate 5 would be untested by
+// the only workload that exercises ten dependents at once.
+func TestW8IsolationOutcomeExemptsOnlyTheBaselineArm(t *testing.T) {
+	for _, arm := range []string{"candidate", "baseline", "", "Baseline", "baseline2", "control"} {
+		fatal, note := w8IsolationOutcome(arm, false)
+		if fatal || note != "isolation held" {
+			t.Fatalf("arm %q with no leak: fatal=%v note=%q", arm, fatal, note)
+		}
+	}
+	fatal, note := w8IsolationOutcome("baseline", true)
+	if fatal {
+		t.Fatal("a baseline leak stopped the arm; the headline phase and everything after it would have no baseline")
+	}
+	if !strings.Contains(note, "BASELINE ISOLATION VIOLATION") || !strings.Contains(note, "not a budget") {
+		t.Fatalf("the baseline leak is not recorded loudly enough: %q", note)
+	}
+	// Every other arm name, including near-misses, is held to the gate.
+	for _, arm := range []string{"candidate", "", "Baseline", "baseline2", "baseline ", "control"} {
+		fatal, note := w8IsolationOutcome(arm, true)
+		if !fatal {
+			t.Fatalf("arm %q inherited the baseline exemption: %q", arm, note)
+		}
+		if !strings.Contains(note, "gate 5") {
+			t.Fatalf("arm %q's violation does not name the gate it breaks: %q", arm, note)
+		}
+	}
+}
+
+// TestW8DirtyDigestSeesContentNotOnlyFilenames pins the source identity a
+// measurement manifest claims.
+//
+// Five agents edit _test.go files in this worktree while a measured run is in
+// flight, so "which tree produced this number" is a real question. A digest
+// over `git status --porcelain` alone answers a different one: it hashes paths
+// and status letters, so two trees whose files differ in every byte but agree
+// on which files are modified hash identically — and a manifest that cannot
+// distinguish them is not a source identity, it is a file list.
+func TestW8DirtyDigestSeesContentNotOnlyFilenames(t *testing.T) {
+	const status = " M cmd/gortex/w8_sustained_io_integration_test.go\n M internal/indexer/multi.go\n"
+	first := w8DirtyDigest(status, "@@ -1 +1 @@\n-a\n+b\n")
+	second := w8DirtyDigest(status, "@@ -1 +1 @@\n-a\n+c\n")
+	if first == "" || second == "" {
+		t.Fatal("a dirty tree digested to the clean-tree sentinel")
+	}
+	if first == second {
+		t.Fatal("two trees with the same modified-file list and different contents digested identically; " +
+			"the manifest cannot tell which bytes produced its numbers")
+	}
+	if same := w8DirtyDigest(status, "@@ -1 +1 @@\n-a\n+b\n"); same != first {
+		t.Fatal("the digest is not stable for one tree state")
+	}
+	if w8DirtyDigest("", "") != "" {
+		t.Fatal("a clean tree must digest to the empty sentinel, not to a hash of nothing")
+	}
+	// A status-only change still moves it: neither half may be dropped.
+	if w8DirtyDigest(status+"?? new.go\n", "@@ -1 +1 @@\n-a\n+b\n") == first {
+		t.Fatal("an added untracked file did not move the digest")
+	}
+}
+
+// TestW8NewRunSamplerWiresEveryProductionReader pins the production wiring
+// itself, reader by reader.
+//
+// w8NewRunSampler is the only place the measured child, the measured store and
+// the measured WAL are connected to the instrument, and each connection is one
+// deletable line. With defaults in newW8Sampler each deletion used to leave the
+// whole suite green while the corresponding series read zero for an entire
+// measured run — a missing PID, a store/WAL/log size series stuck at 0, or a
+// wal_resets count of 0 that no sample_failure contradicted. Zeros are exactly
+// what a quiet phase looks like, so the deletion was unobservable in the
+// artifact as well as in the suite.
+//
+// So this test builds the sampler the way w8RunWorkload does, over a fixture
+// with a real WAL-mode store, a real log file and a real live child, and
+// asserts that every series carries the value that reader is supposed to
+// deliver — plus that nothing is reported as unwired.
+func TestW8NewRunSamplerWiresEveryProductionReader(t *testing.T) {
+	root := t.TempDir()
+	f := &issue767Fixture{t: t, root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Skipf("driver refused WAL journal mode (got %q); the readWAL wiring cannot be pinned on this host", mode)
+	}
+	if _, err := db.Exec("CREATE TABLE probe(id INTEGER PRIMARY KEY, payload BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 64; i++ {
+		if _, err := db.Exec("INSERT INTO probe(payload) VALUES (?)", make([]byte, 4096)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	log, err := os.Create(f.logPathFor(f.nextRun()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = log.Close() }()
+	logBytes := strings.Repeat("daemon log line\n", 64)
+	if _, err := log.WriteString(logBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	// A real, live, own child: the process reader needs a process, and the pid
+	// wiring is only proven by a pid that is not the zero an absent child gives.
+	child := exec.Command("/bin/sleep", "60")
+	if err := child.Start(); err != nil {
+		t.Skipf("cannot start a probe child on this host: %v", err)
+	}
+	defer func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	}()
+	f.setChild(child, make(chan error, 1), func() {}, log)
+
+	var out bytes.Buffer
+	sampler := w8NewRunSampler(f, &out, time.Hour)
+	sampler.SetPhase("P_wiring")
+	sample := sampler.Sample()
+
+	if len(sample.Unwired) != 0 {
+		t.Fatalf("w8NewRunSampler left %v unwired; the production wiring is the only thing that connects the instrument to the measured process and store", sample.Unwired)
+	}
+	if sample.PID == 0 || sample.PID != child.Process.Pid {
+		t.Fatalf("pid wiring: sample pid %d, want the live child %d", sample.PID, child.Process.Pid)
+	}
+	if storeBytes := issue767FileSize(f.store); sample.StoreBytes == 0 || sample.StoreBytes != storeBytes {
+		t.Fatalf("readSize wiring: store_bytes %d, want the store's own %d", sample.StoreBytes, storeBytes)
+	}
+	if sample.LogBytes != int64(len(logBytes)) {
+		t.Fatalf("readSize wiring: log_bytes %d, want the child log's %d", sample.LogBytes, len(logBytes))
+	}
+	if !sample.WALPresent || sample.WALBytes == 0 {
+		t.Fatalf("readWAL wiring: present=%v wal_bytes=%d, want the store's live WAL", sample.WALPresent, sample.WALBytes)
+	}
+	if walBytes := issue767FileSize(f.store + "-wal"); sample.WALBytes != walBytes {
+		t.Fatalf("readSize wiring: wal_bytes %d, want %d", sample.WALBytes, walBytes)
+	}
+	if sample.Phase != "P_wiring" {
+		t.Fatalf("sample carries phase %q, want the label SetPhase installed", sample.Phase)
+	}
+	// readIO is wired (nothing is named unwired above). Whether this host lets
+	// it answer is a separate, named condition: an error here is the reader
+	// reporting, not the reader missing.
+	if sample.Error != "" {
+		t.Logf("process reader wired but unavailable on this host: %s", sample.Error)
+	} else if runtime.GOOS == "darwin" && sample.LogicalWrites == nil {
+		t.Fatal("readIO wiring: the darwin reader answered without ri_logical_writes, the harness's primary series")
+	}
+
+	var decoded w8Sample
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &decoded); err != nil {
+		t.Fatalf("sample line is not JSON: %v (%s)", err, out.String())
+	}
+	if decoded.PID != sample.PID || decoded.StoreBytes != sample.StoreBytes || decoded.Phase != sample.Phase {
+		t.Fatalf("the written sample line lost a series: %+v", decoded)
+	}
+}
+
+// TestW8ExecuteLabelsItsSamplesWithThePhaseItIsRunning pins the other half of
+// the phase attribution: the run-level call that tells the sampler which phase
+// its ticks belong to. Without it every sample in a run carries "init", and
+// every per-phase series in samples.ndjson silently becomes unattributable —
+// while the phase reports, which take their deltas from Samples()/Resets()
+// counters rather than from the labels, stay exactly as green as before.
+func TestW8ExecuteLabelsItsSamplesWithThePhaseItIsRunning(t *testing.T) {
+	root := t.TempDir()
+	f := &issue767Fixture{t: t, binary: filepath.Join(root, "no-such-gortex"), root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
+	if err := os.MkdirAll(f.primary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
+	var out bytes.Buffer
+	sampler := newW8Sampler(&out, time.Hour)
+	sampler.readSize = func() w8FileSizes { return w8FileSizes{Store: 1} }
+	sampler.readWAL = func() (w8WALHeader, error) { return w8WALHeader{}, nil }
+	sampler.pid = func() int { return 0 }
+	sampler.readIO = func() (issue767ProcessIO, error) { return issue767ProcessIO{}, errW8NoChild }
+	run := &w8Run{t: t, f: f, arm: "candidate", artifactDir: t.TempDir(), db: db, sampler: sampler}
+
+	var duringPhase string
+	run.execute(w8Phase{
+		Name:   "P4_amend_same_tree",
+		Detail: "a phase that samples itself",
+		Run: func(r *w8Run) {
+			duringPhase = r.sampler.Sample().Phase
+		},
+	})
+	if duringPhase != "P4_amend_same_tree" {
+		t.Fatalf("a sample taken inside the phase is labelled %q, want the phase's own name", duringPhase)
+	}
+	run.execute(w8Phase{
+		Name:   "P8_idle_warm",
+		Detail: "the next phase relabels the series",
+		Run:    func(r *w8Run) { duringPhase = r.sampler.Sample().Phase },
+	})
+	if duringPhase != "P8_idle_warm" {
+		t.Fatalf("the second phase's sample is labelled %q; the label does not follow the phase", duringPhase)
+	}
+}
+
 // TestW8ClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun is the F3
 // regression: a phase that fails must not take the run-level artifact with it.
 // It drives closePhase and finish the way the failure defer in execute does,
@@ -1613,6 +1885,100 @@ func TestW8ExecuteFilesTheReportOfAFailingPhase(t *testing.T) {
 	if phases, _ := summary["phases"].([]any); len(phases) != 1 {
 		t.Fatalf("report.json carries %d phases, want the one that ran", len(phases))
 	}
+}
+
+// w8IsolationChildEnv switches TestW8RequireIsolationStopsTheCandidatePhase
+// into its child role, for the same reason the failing-phase test has one: the
+// thing under test ends in t.Fatal, and a t.Fatal can only be observed for real
+// from outside the process it kills.
+const w8IsolationChildEnv = "GXW8_INTERNAL_ISOLATION_DIR"
+
+// TestW8RequireIsolationStopsTheCandidatePhase pins the wiring between the
+// isolation rule and the phase, not just the rule.
+//
+// w8IsolationOutcome returning fatal=true is worth nothing if requireIsolation
+// does not act on it: the exemption would then be universal in practice while
+// the rule's own unit test stayed green, which is precisely how a gate gets
+// retired without anything going red. So this drives the real call — baseline
+// arm first, which must survive and record, then candidate arm, which must take
+// the phase down — and reads both filed phase reports back.
+func TestW8RequireIsolationStopsTheCandidatePhase(t *testing.T) {
+	if dir := os.Getenv(w8IsolationChildEnv); dir != "" {
+		w8RunIsolationChild(t, dir)
+		return
+	}
+	dir := t.TempDir()
+	child := exec.Command(os.Args[0], "-test.run=^TestW8RequireIsolationStopsTheCandidatePhase$", "-test.v=true")
+	child.Env = append(os.Environ(), w8IsolationChildEnv+"="+dir)
+	output, err := child.CombinedOutput()
+	if err == nil {
+		t.Fatalf("a leak on the candidate arm did not fail the phase:\n%s", output)
+	}
+	if !strings.Contains(string(output), "ISOLATION VIOLATION") || !strings.Contains(string(output), "gate 5") {
+		t.Fatalf("the child failed for the wrong reason:\n%s", output)
+	}
+
+	var recorded w8PhaseReport
+	w8ReadJSON(t, filepath.Join(dir, "phase_PB_isolation.json"), &recorded)
+	if recorded.Failed {
+		t.Error("the baseline arm's leak stopped its phase; the baseline would end at P5 with nothing to compare")
+	}
+	if !w8NotesContain(recorded.Notes, "BASELINE ISOLATION VIOLATION") {
+		t.Errorf("the baseline arm's leak was not recorded in its phase report: %v", recorded.Notes)
+	}
+
+	var failed w8PhaseReport
+	w8ReadJSON(t, filepath.Join(dir, "phase_PC_isolation.json"), &failed)
+	if !failed.Failed {
+		t.Error("the candidate arm's phase report does not record the isolation failure")
+	}
+	if !w8NotesContain(failed.Notes, "ISOLATION VIOLATION") {
+		t.Errorf("the candidate arm's leak was not recorded in its phase report: %v", failed.Notes)
+	}
+}
+
+func w8NotesContain(notes []string, want string) bool {
+	for _, note := range notes {
+		if strings.Contains(note, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func w8RunIsolationChild(t *testing.T, dir string) {
+	root := t.TempDir()
+	f := &issue767Fixture{t: t, binary: filepath.Join(root, "no-such-gortex"), root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
+	if err := os.MkdirAll(f.primary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(1)
+	newRun := func(arm string) *w8Run {
+		return &w8Run{t: t, f: f, arm: arm, artifactDir: dir, db: db, sampler: newW8Sampler(io.Discard, time.Hour)}
+	}
+	// The baseline arm records the leak and keeps going.
+	baseline := newRun("baseline")
+	w8WithRunArtifacts(baseline, w8Manifest{RunID: "isolation-baseline"}, func() {
+		baseline.execute(w8Phase{Name: "PB_isolation", Detail: "a baseline leak", Run: func(r *w8Run) {
+			r.requireIsolation("main-only symbol X in dependent wt01", true)
+		}})
+	})
+	if len(baseline.reports) != 1 || baseline.reports[0].Failed {
+		t.Fatalf("the baseline arm did not complete its phase: %+v", baseline.reports)
+	}
+	// The candidate arm does not.
+	candidate := newRun("candidate")
+	w8WithRunArtifacts(candidate, w8Manifest{RunID: "isolation-candidate"}, func() {
+		candidate.execute(w8Phase{Name: "PC_isolation", Detail: "a candidate leak", Run: func(r *w8Run) {
+			r.requireIsolation("main-only symbol X in dependent wt01", true)
+		}})
+	})
+	t.Fatal("the candidate arm's isolation violation did not stop its phase")
 }
 
 func w8RunFailingPhaseChild(t *testing.T, dir string) {

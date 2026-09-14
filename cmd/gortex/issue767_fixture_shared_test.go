@@ -716,7 +716,25 @@ func issue767ReadGenerations(ctx context.Context, db *sql.DB) (issue767Generatio
 	if err != nil {
 		return result, err
 	}
+	// sqlite_sequence carries a row for an AUTOINCREMENT table only once that
+	// table has taken a rowid. "No generation has ever been allocated in this
+	// store" is therefore a legitimate reading of 0, not a failed read — and it
+	// is the NORMAL reading on a baseline arm whose binary predates generation
+	// allocation entirely (main 56a1c29d indexes 404 nodes into a store whose
+	// view_generations table stays empty).
+	//
+	// Reporting ErrNoRows here made the whole snapshot unreadable on that arm,
+	// so settle() never saw three stable samples and every baseline phase died
+	// on its two-minute wait: the paired measurement had no baseline at all.
+	// Only the absence of the row is absorbed; a missing table, a closed
+	// database or any other scan failure is still an error, so a store that
+	// genuinely cannot be read is never reported as a store with no
+	// generations.
 	err = db.QueryRowContext(ctx, "SELECT seq FROM sqlite_sequence WHERE name='view_generations'").Scan(&result.Sequence)
+	if errors.Is(err, sql.ErrNoRows) {
+		result.Sequence = 0
+		return result, nil
+	}
 	if err != nil {
 		return result, err
 	}
@@ -826,4 +844,132 @@ func issue767FileSize(path string) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+// TestIssue767SpellingForIsTheExactnessDemandingDefault pins the dispatcher
+// every default wait in both harnesses routes through.
+//
+// awaitSymbol, awaitSymbolIn, trySearchSymbolIn, w8Run.awaitProbe and therefore
+// every exactness wait in P0/P1/P2/P5/P6/P8 call spellingFor(root) rather than
+// naming a spelling. issue767AsOwnCorpus is strictly weaker than
+// issue767AsAutomaticWorktree — it carries no freshness label and its verdict
+// cannot demand one — so a one-word change here would retire the harness's
+// central guarantee ("every checkout answer in a measured run is proven exact")
+// across the whole measured run with no test going red, and every number the
+// run produced would silently be a number about a possibly-stale view.
+//
+// The identity assertions alone would not catch that: the pin is the
+// consequence. For a non-primary root the default route must (a) carry the
+// worktree view selector and (b) refuse an answer that does not prove exact
+// freshness. Both are asserted through the same public shapes the waits use.
+func TestIssue767SpellingForIsTheExactnessDemandingDefault(t *testing.T) {
+	root := t.TempDir()
+	f := &issue767Fixture{t: t, root: root, primary: filepath.Join(root, "repo"), linked: filepath.Join(root, "linked")}
+
+	if got := f.spellingFor(f.primary); got != issue767AsPrimary {
+		t.Fatalf("spellingFor(primary) = %v, want %v", got, issue767AsPrimary)
+	}
+	for _, root := range []string{f.linked, filepath.Join(f.root, "wt01"), f.primary + "-sibling"} {
+		got := f.spellingFor(root)
+		if got != issue767AsAutomaticWorktree {
+			t.Fatalf("spellingFor(%q) = %v, want %v: a default wait over a checkout must take the automatic lane", root, got, issue767AsAutomaticWorktree)
+		}
+		// (a) the default route addresses the checkout as a view.
+		request := issue767SearchRequest(root, "Marker", got)
+		view, ok := request["view"].(map[string]any)
+		if !ok {
+			t.Fatalf("the default spelling for %q sends no view selector: %v", root, request)
+		}
+		if view["kind"] != "worktree" || view["path"] != root {
+			t.Fatalf("the default spelling for %q selects %v, want the worktree itself", root, view)
+		}
+		// (b) the default route refuses an answer that proves no freshness.
+		stale := issue767Answer{Found: true, FromExpectedFile: true, Exact: false}
+		if ok, err := issue767Verdict(stale, got); ok || err == nil {
+			t.Fatalf("the default spelling for %q accepted an answer with no exactness label (ok=%v err=%v); "+
+				"every default wait in the harness would stop demanding exactness", root, ok, err)
+		}
+		if ok, err := issue767Verdict(issue767Answer{Found: true, FromExpectedFile: true, Exact: true}, got); !ok || err != nil {
+			t.Fatalf("the default spelling for %q rejected an exact answer: ok=%v err=%v", root, ok, err)
+		}
+	}
+}
+
+// TestIssue767ReadGenerationsAcceptsAStoreThatNeverAllocatedAGeneration is the
+// baseline arm's regression.
+//
+// The paired I/O protocol runs the same harness against two binaries whose
+// stores differ by four schema versions. A binary that predates generation
+// allocation leaves view_generations empty, so sqlite_sequence has no row for
+// it — and a snapshot read that calls that an error takes settle() down with
+// it, which takes every phase of the baseline arm down with it, which leaves
+// the measurement with nothing to compare the candidate against.
+//
+// The absent row is absorbed as 0 and nothing else is: a store whose
+// view_generations table is missing altogether is still a failed read, because
+// "this store has no generations" and "this store cannot be read" are different
+// facts and only one of them belongs in a census.
+func TestIssue767ReadGenerationsAcceptsAStoreThatNeverAllocatedAGeneration(t *testing.T) {
+	open := func(name string, schema ...string) *sql.DB {
+		path := filepath.Join(t.TempDir(), name)
+		db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		db.SetMaxOpenConns(1)
+		for _, statement := range schema {
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatalf("%s: %v", statement, err)
+			}
+		}
+		return db
+	}
+	const generations = "CREATE TABLE view_generations (generation_id INTEGER PRIMARY KEY AUTOINCREMENT, state TEXT, storage_bytes INTEGER, covered_files INTEGER, affected_files INTEGER)"
+	rest := []string{
+		"CREATE TABLE nodes (id TEXT)",
+		"CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+		"CREATE TABLE ref_facts (view_gen INTEGER, repo_prefix TEXT)",
+	}
+
+	// A pre-generation store: the tables exist, nothing was ever allocated.
+	db := open("baseline.sqlite", append([]string{generations}, rest...)...)
+	if _, err := db.Exec("INSERT INTO edges DEFAULT VALUES"); err != nil {
+		t.Fatal(err) // so sqlite_sequence exists, but with no view_generations row
+	}
+	snapshot, err := issue767ReadGenerations(t.Context(), db)
+	if err != nil {
+		t.Fatalf("a store that never allocated a generation must read, not fail: %v", err)
+	}
+	if snapshot.Sequence != 0 {
+		t.Fatalf("sequence = %d, want 0 for a store with no allocated generation", snapshot.Sequence)
+	}
+	if snapshot.Count != 0 || snapshot.Max != 0 {
+		t.Fatalf("snapshot invented generations: %+v", snapshot)
+	}
+	// Two identical reads must compare equal, which is the only thing settle()
+	// asks of the snapshot: an arm that cannot produce a stable sample has no
+	// phase boundaries and therefore no measurement.
+	again, err := issue767ReadGenerations(t.Context(), db)
+	if err != nil || again != snapshot {
+		t.Fatalf("repeated read is not stable: %+v vs %+v (err %v)", again, snapshot, err)
+	}
+
+	// An allocated generation is still reported as itself.
+	if _, err := db.Exec("INSERT INTO view_generations(state) VALUES ('committed')"); err != nil {
+		t.Fatal(err)
+	}
+	allocated, err := issue767ReadGenerations(t.Context(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocated.Sequence != 1 || allocated.Count != 1 || allocated.Max != 1 {
+		t.Fatalf("an allocated generation read back as %+v", allocated)
+	}
+
+	// A store without the table at all is still an error.
+	broken := open("broken.sqlite", rest...)
+	if _, err := issue767ReadGenerations(t.Context(), broken); err == nil {
+		t.Fatal("a store with no view_generations table must fail the read, not report zero generations")
+	}
 }

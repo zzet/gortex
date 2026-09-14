@@ -153,6 +153,12 @@ type w8Sample struct {
 	WALSalt1         uint32  `json:"wal_salt1"`
 	WALResets        int     `json:"wal_resets"`
 	Error            string  `json:"error,omitempty"`
+	// Unwired names every reader this sampler was never given. A sampler with
+	// a missing wiring cannot produce the series that reader feeds, and the
+	// only honest report of that is the reader's name — not the zero value the
+	// series would otherwise carry, which is indistinguishable from a real
+	// measurement of zero.
+	Unwired []string `json:"unwired_readers,omitempty"`
 }
 
 // w8Sampler writes one w8Sample per tick to an ndjson stream. The stream must
@@ -175,6 +181,17 @@ type w8Sampler struct {
 	failed  int
 }
 
+// newW8Sampler builds a sampler with no readers. Every reader is wired by the
+// caller (w8NewRunSampler in production, the unit tests here with fakes), and
+// an unwired one is reported by name in every sample it touches rather than
+// defaulted.
+//
+// The defaults it does NOT have are the point. A silent default is worse than
+// no reader at all: `readWAL` returning a zero header and a nil error made the
+// checkpoint counter observe nothing, so `wal_resets` read 0 for a whole run
+// while `sample_failures` stayed 0 and the series reported itself healthy —
+// the shape in which a deleted production wiring becomes a measurement of
+// zero. The same held for the store/WAL/SHM/log sizes and the PID.
 func newW8Sampler(out io.Writer, interval time.Duration) *w8Sampler {
 	if interval <= 0 {
 		interval = time.Second
@@ -184,10 +201,6 @@ func newW8Sampler(out io.Writer, interval time.Duration) *w8Sampler {
 		now:      time.Now,
 		out:      out,
 		phase:    "init",
-		readIO:   func() (issue767ProcessIO, error) { return issue767ProcessIO{}, errors.New("no process reader") },
-		readSize: func() w8FileSizes { return w8FileSizes{} },
-		readWAL:  func() (w8WALHeader, error) { return w8WALHeader{}, nil },
-		pid:      func() int { return 0 },
 	}
 }
 
@@ -219,24 +232,40 @@ func (s *w8Sampler) Sample() w8Sample {
 	if s.start.IsZero() {
 		s.start = s.now()
 	}
-	sizes := s.readSize()
+	var unwired []string
+	sizes := w8FileSizes{}
+	if s.readSize != nil {
+		sizes = s.readSize()
+	} else {
+		unwired = append(unwired, "readSize")
+	}
+	pid := 0
+	if s.pid != nil {
+		pid = s.pid()
+	} else {
+		unwired = append(unwired, "pid")
+	}
 	sample := w8Sample{
 		T:              s.now().UTC().Format(time.RFC3339Nano),
 		Phase:          s.phase,
 		ElapsedSeconds: s.now().Sub(s.start).Seconds(),
-		PID:            s.pid(),
+		PID:            pid,
 		StoreBytes:     sizes.Store,
 		WALBytes:       sizes.WAL,
 		SHMBytes:       sizes.SHM,
 		LogBytes:       sizes.Log,
 	}
-	if header, err := s.readWAL(); err != nil {
+	if s.readWAL == nil {
+		unwired = append(unwired, "readWAL")
+	} else if header, err := s.readWAL(); err != nil {
 		sample.Error = err.Error()
 	} else {
 		s.counter.Observe(header)
 		sample.WALPresent, sample.WALCheckpointSeq, sample.WALSalt1 = header.Present, header.CheckpointSeq, header.Salt1
 	}
-	if usage, err := s.readIO(); err != nil {
+	if s.readIO == nil {
+		unwired = append(unwired, "readIO")
+	} else if usage, err := s.readIO(); err != nil {
 		sample.Error = strings.TrimSpace(sample.Error + " " + err.Error())
 	} else {
 		sample.DiskBytesWritten, sample.DiskBytesRead = usage.BytesWritten, usage.BytesRead
@@ -244,6 +273,13 @@ func (s *w8Sampler) Sample() w8Sample {
 		sample.LogicalWrites = usage.LogicalBytesWritten
 	}
 	sample.WALResets = s.counter.Resets()
+	// A missing wiring is an unavailability with a name, and it counts against
+	// the series' own health exactly like a failed read: a phase whose sampler
+	// was never wired must not present itself as a phase that measured zero.
+	if len(unwired) > 0 {
+		sample.Unwired = unwired
+		sample.Error = strings.TrimSpace(sample.Error + " sampler readers not wired: " + strings.Join(unwired, ","))
+	}
 	if sample.Error != "" {
 		s.failed++
 	}
@@ -782,6 +818,67 @@ func TestW8SamplerRecordsReaderFailuresInsteadOfDroppingTheSample(t *testing.T) 
 	}
 	if _, failures := sampler.Samples(); failures != 1 {
 		t.Fatal("a failed read must count against sampler health")
+	}
+	// The three readers this test never wired are named, not defaulted.
+	if len(sample.Unwired) != 3 {
+		t.Fatalf("a sampler with one wired reader named %v as unwired, want the other three", sample.Unwired)
+	}
+}
+
+// TestW8SamplerNamesEveryUnwiredReaderInsteadOfReportingZero is the guard
+// behind the w8NewRunSampler wiring pin: whatever else changes, a reader that
+// is not wired must be named in the sample and must cost the series its health,
+// so a deleted production wiring can never present itself as a measurement.
+func TestW8SamplerNamesEveryUnwiredReaderInsteadOfReportingZero(t *testing.T) {
+	var out bytes.Buffer
+	sampler := newW8Sampler(&out, time.Hour)
+	sample := sampler.Sample()
+
+	want := map[string]bool{"readSize": true, "pid": true, "readWAL": true, "readIO": true}
+	if len(sample.Unwired) != len(want) {
+		t.Fatalf("a bare sampler named %v, want all of %v", sample.Unwired, want)
+	}
+	for _, name := range sample.Unwired {
+		if !want[name] {
+			t.Fatalf("unexpected unwired reader %q", name)
+		}
+		delete(want, name)
+	}
+	for _, field := range []struct {
+		name string
+		zero bool
+	}{
+		{"store_bytes", sample.StoreBytes == 0},
+		{"wal_bytes", sample.WALBytes == 0},
+		{"log_bytes", sample.LogBytes == 0},
+		{"pid", sample.PID == 0},
+		{"wal_present", !sample.WALPresent},
+		{"ri_logical_writes", sample.LogicalWrites == nil},
+	} {
+		if !field.zero {
+			t.Fatalf("an unwired sampler produced a value for %s: %+v", field.name, sample)
+		}
+	}
+	// The zeros above are exactly why the naming has to exist: without it they
+	// are indistinguishable from a real quiet phase.
+	for _, name := range []string{"readSize", "pid", "readWAL", "readIO"} {
+		if !strings.Contains(sample.Error, name) {
+			t.Fatalf("sample error %q does not name the unwired reader %q", sample.Error, name)
+		}
+	}
+	if _, failures := sampler.Samples(); failures != 1 {
+		t.Fatal("an unwired sampler must count the sample against its own health")
+	}
+	// wal_resets must stay a lower bound that never advanced, not a count.
+	if sampler.Resets() != 0 {
+		t.Fatalf("an unwired sampler counted %d WAL resets", sampler.Resets())
+	}
+	var decoded w8Sample
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Unwired) != 4 {
+		t.Fatalf("the written sample line lost the unavailability: %s", out.String())
 	}
 }
 
