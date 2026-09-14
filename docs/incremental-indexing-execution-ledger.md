@@ -4259,70 +4259,106 @@ Shared fields for all W1 sub-items unless overridden:
 - Next action: the two matrix-2 FAILs (a withdrawn path and an excluded package both still served)
   want an owning item; neither is this item's to fix.
 
-### W8.7 — E2E matrix 3 (resolution / provenance / manifests) — **not committed**
+### W8.7 — E2E matrix 3 (resolution / provenance / manifests)
 
-- State: `blocked with evidence`. The file exists, compiles, vets and its 22 offline tests pass, and
-  the opt-in matrix ran end to end — but the adversarial verifier returned **FAIL** at the repair
-  round with one blocker, so the item was **not committed** and
-  `cmd/gortex/w8_matrix_resolution_test.go` remains the only wave-owned path left uncommitted in the
-  worktree (2,670 lines, md5 `a0c61dbad710c554c0dc837f9bf46788`).
-- Agent: wave W8m, lane I (implementer, one repair round; adversarial verifier **fail** at round 2).
-- Blocking failure, named: `mixed_language_imports` (G1, hazard "H8 mixed-language imports") is
-  recorded `pass` although the assertion cannot fail — a **new instance of the same vacuity class
-  the repair round existed to eliminate** (`scratchpad/reports/W8m-W8.7-verify.md`, blocker, plus
-  4 minors). Round 1's findings were all accepted and fixed; the round introduced this one.
-- Scope/files (uncommitted): `cmd/gortex/w8_matrix_resolution_test.go` (new). No production file, no
-  doc, no other test file.
-- What the round did establish, and is worth carrying: the **oversized-manifest arm is unexercisable
-  in the branch's own code** and is now declared so in source rather than recorded as a pass — the
-  size cap is reached only after a language claim (`walk_source.go:83-91`), the scoped walk's
-  manifest escape hatch passes no size at all (`:99-112`), only a root-relative `go.mod` / `go.work`
-  is a manifest (`incremental_contracts.go:103-109`), and the census computes
-  `oversize := supported && …` (`indexer.go:9450-9469`). A validator now **requires** a case declared
-  unexercisable to be recorded `not_exercised` with its reason verbatim, and fails the run for a
-  `pass`.
-- A defect found on the way, load-bearing beyond this item: **the user-level `config.yaml`'s
-  `index:` block never reaches a repository's indexer** (`internal/config/manager.go:281-286` returns
-  the repository's own `.gortex.yaml` or compiled `Default()`), so `index.max_file_size` was never in
-  force in any earlier run of this matrix. The cap now travels in the corpus as `.gortex.yaml`, and
-  the same assertion **failed** when the cap was not in force and **passed** when it was (runs 7 and
-  8) — the new `oversized_source_is_size_skipped` arm is failure-observed, not vacuous.
-- Matrix outcome at run 8 against `gortex-2fd5db82`: **13 pass, 5 FAIL, 2 not_exercised**
-  (`results/W8.7-matrix-run8/outcomes.txt`). The five findings, recorded as observations on the
-  candidate and **not** attributed to the branch: a withdrawn definition rebinds the importer to an
-  unrelated same-named module with `origin=text_matched`; restoring it byte-identically does **not**
-  restore the binding; a fresh-index oracle of the same final tree binds correctly
-  (`origin=lsp_resolved conf=1.0`), so this is a reuse divergence; the comment-only re-parse measured
-  **alone** drops provenance-bearing `value_flow` rows and gains nothing (a moved row is reported
-  `moved`, not as a loss); and a dynamically reached bind is indistinguishable from a proof (both
-  `-calls-> origin=text_matched tier=`).
-- Harness evidence (`GXH_TAG=W8.7`, HEAD `2fd5db82`):
-  `results/cmd-normal-TestW8Res_TestW8MatrixResolutionProvenanceManife-W8.7-4` **22 / 0 / 1**;
-  `results/cmd-race-TestW8Res-W8.7-3` **22 / 0 / 0**, 0 `DATA RACE`; whole package
-  `results/cmd-normal-_-W8.7-3` **1350 / 0 / 15**. Mutation: 14 mutants, 14 killed, with two honest
-  records — M13 and the first M4 failed to apply and were re-run; **M15's first form SURVIVED** the
-  whole-query `view_gen` check, which is why the offline rule was tightened to per-UNION-arm and
-  re-run as M15b.
-- Limitations: (1) whether the five findings pre-date the branch is **not determined**. (2) Seven of
-  the ten derived outputs are compared but not exercised on this corpus (four identical on both
-  arms, three empty in the served generation); the non-served rows are written to a
-  record-only projection rather than dropped. (3) `provider_mutation_evidence` is `not_exercised` —
-  no enrichment provider runs in this isolated build. (4) The oracle compares the primary repository
-  only. (5) One corpus, one host, one repetition. (6) `manifest_only_invalidation` **did** allocate a
-  generation here (payload 1→2, sequence 1→2), recorded as a measurement, not the "no allocation"
-  an earlier round recorded.
-- Deviations: the oversized-manifest arm is `not_exercised` by declaration rather than a result; the
-  unreadable-manifest arm is built from an unreadable **source** file (a manifest below the
-  repository root earns no node even when readable); the compared projections are scoped to the
-  served generation with the non-served rows recorded-not-compared; four cases beyond the plan's
-  bullet were added because H8 names them.
-- Verifier verdict: **FAIL** (round 2) — one blocker (above), four minors. The E2E outcome table
-  reproduced exactly on an independent run and every round-1 finding is closed; the blocker is a new
-  one. **Do not read "E2E validated" for G1, G3, G4 or for W6.11/W6.1b from this evidence**, and do
-  not read gate 8's manifest bullet from it at all.
-- Next action: fix `mixed_language_imports` so it can fail (or declare it unexercisable and record
-  it `not_exercised`), re-verify, then commit. The five matrix findings and the config-reach defect
-  want rows of their own before the PR text is written.
+- State: `wired` (implemented, compiled, vetted, `tested`, `wired`). "Wired" is recorded on the
+  verifier's wiring finding, not on source reading: the round's new guards are reached on the **live**
+  E2E path, from artifacts — the unreadable-projection guard fired at `w8_matrix_resolution_test.go:1589`
+  on both arms (`logs/W8.7-r3-guardmut.log:10-11`), and the size-skip probe and the mixed-language
+  verdict each drove their arm to FAIL under a live mutation (`logs/W8.7-r3-mutrun.log:4` and `:6`).
+  The item adds **no production surface**; the wiring claim is about the matrix's own readers.
+- Agent: wave W8r, lane I (implementer, third round; adversarial verifier **PASS**, six minors).
+- Scope/files: `cmd/gortex/w8_matrix_resolution_test.go` (new, 3,302 lines, md5
+  `796fc201218a803c78a19424d6a20a28`, 30 `func Test…` = 29 offline + 1 opt-in). No production file,
+  no doc, no other test file.
+- Invariant the item pins: **no assertion that cannot fail.** Every case declares, in source, the
+  concrete row that would have to appear or disappear for it to come out false (`w8ResCase.Falsifier`,
+  `:392-405`), checked offline (`TestW8ResEveryCaseSaysHowItCouldFail`) and at run time inside
+  `w8ResValidateOutcomes` (`:615-624`); a case that can fail but is skipped must say in its own row
+  that it asserted nothing (`skip()` / `skipMeasured()`, `:539`, `:551`); a case declared
+  unexercisable must be recorded `not_exercised` with its reason verbatim, never `pass`; and a
+  projection whose query errors is reported as unreadable rather than counted as an empty comparison
+  (`w8ResUnreadableProjections`, `:950`, installed at `:1589` and `:1846`).
+- Round-2 blocker, closed: `mixed_language_imports` (hazard H8) filtered a predicate that was always
+  false. The case now judges the edge's **target** through `w8ResMixedVerdict` (`:1456`), requires the
+  named cross-language bind `issue767/mixed/app.ts::mixedEntry -calls-> issue767/mixed/helper.js::mixedHelperValue`,
+  requires the corpus's new same-named **TypeScript decoy** (`mixeddecoy/helper.ts`) to be in the
+  graph, and requires no bind to have landed on it — three independent ways to fail, two of them
+  proved (offline mutation V1, and the live named-bind mutation).
+- Acceptance gates: 29 offline tests green and race-clean; the opt-in matrix runs end to end under
+  `GXW8_MATRIX_BINARY`; the verifier's mutation battery kills every clause the round claims.
+  **11 mutations, 9 RED**; the 2 GREEN are exactly the two clauses the implementer disclosed as
+  E2E-path-only (`!w8ResSizeSkipMarked(controlStub)`, live-proved load-bearing by the R2 run, and
+  `len(mixedDecoyNode) == 1`, which nothing on this corpus distinguishes).
+- Harness evidence (`GXH_TAG=W8r-suite`, HEAD `cff31fdc`): `cmd` race `W8Res|Matrix3|Resolution`
+  **29 / 0 / 1** (`results/cmd-race-W8Res_Matrix3_Resolution-W8r-suite-1`, 0 `DATA RACE`); whole `cmd`
+  package normal `.` **1385 / 4 / 15** (`results/cmd-normal-_-W8r-suite-1`) — the four failures are
+  **foreign**, owned by other waves' uncommitted files and attributed in this wave's Evidence-log
+  entry; none is in this item's file. Verifier runs in place: 29 `--- PASS` + 1 opt-in skip, race
+  clean, whole package `ok 80.4 s`, `gofmt -l` and `go vet ./cmd/gortex/` clean.
+- Matrix outcome (round 3, `results/W8.7-r3-evidence/outcomes.txt`): **12 pass · 5 FAIL ·
+  3 not_exercised** over 20 cases. A baseline arm was run for attribution
+  (`results/W8.7-r3-baseline/outcomes.txt`): **9 pass · 8 FAIL · 3 not_exercised** on the verifier's
+  independent recount (the implementer's report transposes this to "8 pass · 9 FAIL"; the per-case
+  attribution table is correct). Five cases FAIL on **both** arms — recorded as **pre-existing product
+  defects reproducing on `main 56a1c29d`, not branch regressions** — and three FAIL on baseline and
+  pass on the branch.
+- Two cases are recorded `not_exercised` with their measurement, never `pass`: `oversized_manifest`
+  (unexercisable by declaration — the size cap is reached only after a language claim, and the scoped
+  walk's manifest escape hatch passes no size), and `vendor_manifest` (the vendored tree contributes
+  **zero nodes** to the served generation on this corpus, so the absence is guaranteed by exclusion
+  rather than observed; the equally nested non-vendored decoy **is** indexed, as the control).
+  `provider_mutation_evidence` is `not_exercised` — no enrichment provider runs in this isolated build.
+- Load-bearing defect found on the way, beyond this item: the user-level `config.yaml`'s `index:`
+  block never reaches a repository's indexer (`internal/config/manager.go:281-286`), so
+  `index.max_file_size` was never in force in earlier runs of this matrix. The cap now travels in the
+  corpus `.gortex.yaml`, and `oversized_source_is_size_skipped` now **reads the telemetry it cites**
+  (`skipped_due_to_size` probed as a BLOB `instr` over `nodes.meta`, `w8ResSizeSkipRows`, `:1431`),
+  with the in-spec control required **not** to carry the marker: live run `big.go size_skip=1`,
+  `small.go size_skip=0`.
+- `nonserved_generation_markers` coverage is **derived, not asserted**: 11 arms, one per
+  generation-keyed table any compared projection reads, and
+  `TestW8ResNonServedMarkersCoverEveryComparedGenerationTable` extracts every `FROM`/`JOIN` table from
+  the compared queries themselves, so a projection added later cannot narrow the observation silently.
+  Evidence run: 145 rows incremental / 149 fresh across 7 tables, recorded and compared against nothing.
+- Limitations: (1) `manifest_only_invalidation` measured payload generations **2→2 and sequence 2→2**
+  — the manifest-only edit allocated **no** generation here (this corrects the earlier row's 1→2).
+  (2) Seven of the ten derived outputs are compared but only three exercised (four identical on both
+  arms, three empty in the served generation). (3) The oracle compares the primary repository only;
+  the second repository's same-module-path facts are asserted separately by
+  `cross_repository_producer_control`. (4) One corpus, one host, one repetition per arm — a
+  correctness matrix with no timing, no byte counts, no budgets. (5) `index.max_file_size` is
+  configured, not default.
+- Deviations: two cases recorded `not_exercised` rather than asserted (above); the unreadable-manifest
+  arm is built from an unreadable **source** file, because a nested manifest earns no node at all; the
+  compared projections stay scoped to the served generation with the non-served rows
+  recorded-not-compared; four cases beyond the plan's bullet remain (`mixed_language_imports`,
+  `manifest_only_invalidation`, `oversized_source_is_size_skipped`,
+  `declared_gaps_are_caused_by_the_reparse_alone`); a baseline arm was run although the item did not
+  require one.
+- Verifier verdict: **PASS, no blocker** (`scratchpad/reports/W8r-W8.7-verify.md`), six minors carried
+  forward, none invalidating: (1) the matrix runs outside `validate.sh` because the harness's `env -i`
+  allowlist drops `GXW8_*`; (2) `manifest_only_invalidation`'s 90 s await returns `false` without
+  failing and `saw` is rendered but not asserted, so a run that never ingests the edit would record a
+  `pass` with no stimulus (this run recorded `observed=true`); (3) `unreadable_manifest` passes on a
+  disjunct (`len(unreadableNodes) > 0`) satisfied precisely when the premise did **not** hold (this
+  run earned its pass through `permission_denied=1`); (4) `Falsifier` is prose, mechanically checked
+  only for length and inequality, with a falsifier↔assertion link for `mixed_language_imports` alone;
+  (5) two E2E-path clauses are unpinned offline (V6 live-proved, V7 unproven); (6) two of the plan's
+  five manifest shapes end `not_exercised`.
+- **Do not read "E2E validated" from this evidence** for gate 1, gate 3, gate 4, or for W6.11/W6.1b —
+  five cases fail and three declared gaps reproduce; nor for gate 8's manifest bullet
+  (`oversized_manifest`, declared unexercisable) or its vendor bullet (`vendor_manifest`, unexercised
+  by measurement on this corpus). What **is** new E2E evidence: H8 "mixed-language imports" — the
+  named cross-language bind exists, nothing crossed to the same-named decoy, and the failing shape was
+  demonstrated under mutation. The round-2 caveat is lifted.
+- Next action: the five matrix findings (a withdrawn definition rebinding to an unrelated same-named
+  module with `origin=text_matched`; a byte-identical restore not restoring the binding; a fresh-index
+  oracle of the same tree binding correctly; the comment-only re-parse dropping provenance-bearing
+  `value_flow` rows; a dynamically reached bind indistinguishable from a proof) reproduce on
+  `main 56a1c29d` and have **no owning item** — they want rows of their own before the PR text is
+  written, as does the `config.yaml` `index:` reach defect. The verifier's minors 2 and 3 are the two
+  remaining places a `pass` can be recorded without the stimulus holding.
 
 ### W8.8 (absorbing W8.9) — E2E matrix 4 (view lifecycle over both front doors) and matrix 5 (main advancement with ten dependents)
 
@@ -6744,3 +6780,113 @@ NOT-MEASURABLE `edit_undo_redo`; W8.8's two self-downgrading rows and the refusa
 sample; W8.10's seven recorded lifecycle facts, in particular the missing view-lifecycle counters
 that make its quiescence verdict vacuous; W4.8b's untouched sweep/release half of W4.8; and W8.7 in
 full, blocked.
+
+### 2026-09-10 — Wave W8r exit suite (W8.7 verified pass) — one commit; four FOREIGN reds, attributed
+
+- Source identity: HEAD `cff31fdc3f407b9384fe8b078268368e5ca090f0` on every compile and every run.
+  Dirty-manifest sha256 **drifted during the suite** — `33da1c2cf468500172ffb5fe04f2ab4bfa5ba303fed8d43e5610f3c92d76ad11`
+  at the `cmd` normal compile, `46303bc0e16264a30bddf83387b330014320eb583bc32a40139686f2582be7a3` at
+  the normal run, `b23a5eeed9cd06aca3a5290401c138901d8ba0212607cc4875311b6cc4e1abb9` at the race
+  compile and run (read from each `result.json`). The drift is **not** this wave's: W8.7's file was
+  byte-identical throughout (md5 `796fc201218a803c78a19424d6a20a28` before and after every run);
+  concurrent wave items were editing `internal/indexer/`, `internal/graph/store_sqlite/`,
+  `internal/savings/`, `internal/persistence/` and `internal/mcp/` in the same worktree.
+  Toolchain go1.27.0 darwin/arm64, `GOPROXY=off`, `GOWORK=off`, `GOFLAGS=-mod=mod -buildvcs=false`.
+- Commands: `go build ./...` and `go vet ./cmd/gortex/ ./internal/mcp/` from the worktree under the
+  isolated environment; then `GXH_TAG=W8r-suite bash validate.sh compile cmd {normal,race}` (2) and
+  `GXH_TAG=W8r-suite bash validate.sh test …` (2 evidence runs + 1 isolation re-run).
+
+#### Build and vet
+
+`go build ./...` exit 0, no output — but only on the **third** attempt. Attempts 1 and 2 failed in
+files owned by other concurrent wave items, mid-edit, and were retried per the wave's
+wait-and-retry rule rather than repaired: `internal/indexer/builder_dedicated_claimed.go:6,7,12`
+(unused imports) with `:195,196,198,210,211` and `internal/indexer/checkout_lifecycle.go:1353`
+(undefined methods on `*SparseGenerationBuilder` / `*DedicatedBaseAdvanceTrigger`), then
+`internal/graph/store_sqlite/bulk_load.go:635` (`s.scheduleWALDrain` undefined). The race compile hit
+the same class twice more (`internal/indexer/builder_generation.go:1329` undefined `changed`;
+`cmd/gortex/w8_sustained_io_integration_test.go:2616,2626` `r.requireIsolation` undefined) and
+succeeded on retry. `go vet ./cmd/gortex/ ./internal/mcp/` exit 0, no diagnostics. Nothing in this
+wave's file was implicated in any of them.
+
+#### The runs
+
+| run | pass / fail / skip | result dir |
+| --- | --- | --- |
+| `cmd` normal `.` | 1385 / **4** / 15 | `cmd-normal-_-W8r-suite-1` |
+| `cmd` race `W8Res\|Matrix3\|Resolution` | 29 / 0 / 1 | `cmd-race-W8Res_Matrix3_Resolution-W8r-suite-1` |
+
+No chunking was needed: `cmd` ran whole in 111.4 s; `internal/indexer` was not in this wave's scope
+and was not run. 0 `DATA RACE` in the race log.
+
+#### The four reds are FOREIGN — attribution, not a flake claim
+
+The FLAKE rule was **considered and does not apply**: the four failures are deterministic
+(`count=3` in isolation, `results/cmd-normal-TestDaemonLiveHeadChangeAdvancesTheCommittedBase-W8r-suite-1`,
+4 / 4 red). They were instead attributed by three `go test -overlay` probes, none of which wrote a
+binary:
+
+| probe | overlay | outcome |
+| --- | --- | --- |
+| wave-file-absent | this wave's only file removed | all four still **FAIL** — the wave cannot be the cause |
+| pristine-HEAD | all 29 dirty `.go` files mapped back to their HEAD blobs (untracked ones removed) | all four **pass** (`ok 3.19 s`) — the branch at HEAD is green here |
+| targeted revert | only `internal/savings/store.go`, `internal/persistence/sidecar_savings.go`, `internal/mcp/server.go` (+ their tests) reverted | `TestLoadHistory_SinceZeroUsesCumulative` and `TestLoadHistory_WindowFiltersEvents` **pass** |
+| targeted revert | only the twelve dirty `internal/indexer/` files reverted | `TestDaemonWarmupPublishesTheInitialCommittedBase` and `TestDaemonLiveHeadChangeAdvancesTheCommittedBase` **pass** |
+
+Named failures, with their first failure line and the item whose files are implicated — **none is
+W8.7's**:
+
+| test | first failure | implicated files (other waves, uncommitted) |
+| --- | --- | --- |
+| `TestDaemonLiveHeadChangeAdvancesTheCommittedBase` | `daemon_dedicated_base_advance_test.go:110: warmup published no committed base to advance: {… ActiveGenerationID:0 State:graph_ready}` | `internal/indexer/dedicated_base_advance_trigger.go`, `dedicated_base_startup.go`, `checkout_lifecycle.go`, `checkout_coordinator.go`, `builder_generation.go`, `builder_dedicated_claimed.go` |
+| `TestDaemonWarmupPublishesTheInitialCommittedBase` | `daemon_dedicated_base_startup_test.go:162: publication skipped: no dependent checkout` | same set |
+| `TestLoadHistory_SinceZeroUsesCumulative` | `gain_test.go:161: since=0 should reflect cumulative ledger, got &{… Calls:0 Saved:0 Returned:0}` | `internal/savings/store.go`, `internal/persistence/sidecar_savings.go`, `internal/mcp/server.go` |
+| `TestLoadHistory_WindowFiltersEvents` | `gain_test.go:179: fresh event should fall inside a 24h window, got &{… Calls:0}` | same set |
+
+No production code was fixed in response, per the wave's rule. These reds belong to the owning
+waves' exit suites; they are recorded here so the next suite does not re-derive the attribution.
+The commit gate was therefore read as green **for this wave's item only**, on evidence strictly
+stronger than the FLAKE rule's (the wave's file is provably not the cause, and HEAD is green), and
+the wave's own surface — `cmd` race `W8Res|Matrix3|Resolution` 29 / 0 / 1 and the 29 offline tests
+inside the whole-package run — is 0 fail.
+
+Every skip, named with its exact reason (15 normal, 1 race; no skip is a disabled assertion):
+
+| test | reason as printed |
+| --- | --- |
+| `TestFileCoveragePrefersCanonicalKeysWithoutDoubleCounting` | `daemon_controller_coverage_test.go:144: native and slash graph keys coincide on this platform` |
+| `TestSystemdUnitPath_ResolvesUnderHome` | `daemon_service_test.go:192: systemd paths only meaningful on linux` |
+| `TestServiceCommands_RejectUnsupportedOS` | `daemon_service_test.go:205: this test only runs on unsupported platforms` |
+| `TestIssue767IdleIOIntegration` | `issue767_idle_io_integration_test.go:30: set GORTEX_ISSUE767_TEST_BINARY to opt into isolated daemon validation` |
+| `TestIssue767WorktreeReadinessIntegration` | `issue767_worktree_readiness_integration_test.go:23: set GORTEX_ISSUE767_READINESS_BINARY for isolated worktree validation` |
+| `TestW8SustainedWriteAmplification` | `w8_sustained_io_integration_test.go:570: set GXW8_TEST_BINARY to opt into the isolated sustained-workload I/O harness` |
+| `TestW8PairedArmsVerdict` | `w8_paired_arms_test.go:618: set GXW8_PAIRED_ARTIFACT_DIR to reduce a completed paired run into frozen budgets and a verdict` |
+| `TestW8MatrixNoopFamily` | `w8_matrix_noop_test.go:1655: set GXW8_TEST_BINARY (or GXW8_MATRIX_BINARY) to opt into the isolated end-to-end matrix (a private daemon binary; never the user's daemon)` |
+| `TestW8MatrixEditTaxonomy` | `w8_matrix_edits_test.go:1587:` same reason |
+| `TestW8m5RunGuardedAlwaysFilesARow/aborted` | `w8_matrix_noop_test.go:1981: the guard's abort path: this case leaves its goroutine without filing a row` |
+| `TestW8Matrix4ViewLifecycle` | `w8_matrix_views_test.go:655: set GXW8_MATRIX_BINARY to a candidate daemon binary to opt into the isolated view-lifecycle / advancement matrix (ledger row: W8.8 E2E matrix 4+5)` |
+| `TestW8Matrix5MainAdvanceWithTenDependents` | `w8_matrix_advance_test.go:70:` same reason |
+| `TestW8Matrix6Lifecycle` | `w8_matrix_lifecycle_test.go:996: set GXW8_MATRIX_BINARY to opt into the isolated end-to-end matrix` |
+| `TestW8Matrix7Adversarial` | `w8_matrix_adversarial_test.go:38:` same reason |
+| `TestW8MatrixResolutionProvenanceManifests` (normal **and** race) | `w8_matrix_resolution_test.go:1541: set GXW8_MATRIX_BINARY to opt into the W8.7 isolated resolution/provenance/manifest matrix (ledger row W8.7)` — **this wave's**, now committed (the line moved `:1304` → `:1541` as the round-3 file grew) |
+
+#### Commits
+
+| item | verifier verdict | state recorded | commit |
+| --- | --- | --- | --- |
+| W8.7 | **PASS** (round 3, six minors) | `wired` | `f046bb8d` — *cmd: add an end-to-end matrix for resolution, provenance and manifests* (1 file, 3,302 insertions) |
+| — | — | — | this ledger, committed last as *docs: record wave results in the incremental indexing execution ledger* |
+
+`git add` named the single path; nothing else was staged. After the item commit,
+`git status --short` still listed the other waves' in-flight paths and the untracked working input
+`docs/incremental-indexing-handoff-2026-09-10.md`, all left untouched. W8.7 was the last wave-owned
+path outstanding from wave W8m; the worktree now carries no uncommitted file owned by W8.
+
+Limitation of what this suite proves: the `cmd` package's unit and race surface at one HEAD on
+darwin/arm64, taken from a worktree that **four other agents were editing during the runs** — the
+dirty-manifest hash differs between the two evidence runs, so the two runs are not the same tree
+outside this item's file. It does not run `internal/indexer`, `internal/mcp` (vetted only),
+`internal/graph`, `internal/graph/store_sqlite`, `internal/graphview` or `internal/reconcile`, and it
+exercises no opt-in probe: W8.7's matrix ran outside the harness under a runner that adds the `GXW8_*`
+variables `validate.sh`'s `env -i` allowlist drops, and that run's numbers are evidence on the W8.7
+row, not on this suite's counts. No gate closes on this suite.
