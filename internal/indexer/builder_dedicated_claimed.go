@@ -58,8 +58,8 @@ const generationZero int64 = 0
 // included — pays per-row B-tree maintenance and page-cache spill at the
 // pooled cache size instead. The generation-scoped window's precondition is
 // "THIS generation holds no rows", which is true of every reserved candidate
-// this builder is handed. Where the window is actually taken — and why that is
-// the copy route only for now — is documented on withGenerationBulkLoad.
+// this builder is handed. Where the window is opened and closed, and why it
+// now covers both build routes, is documented on generationBulkWindow.
 //
 // What the window takes and what it deliberately leaves is the store's own
 // decision, documented beside BeginGenerationBulkLoad: it takes the page cache
@@ -106,16 +106,18 @@ type GenerationPayloadCopier interface {
 // are for the build report and the log line; the authoritative description of
 // what landed is the destination generation's own payload, which the caller
 // reads back rather than trusting these numbers.
-type GenerationCopyCounts struct {
-	Nodes int64
-	Edges int64
-	Rows  int64
-}
+//
+// It is an ALIAS of the store's own type rather than a second declaration of
+// the same three fields, and that is what lets *store_sqlite.Store satisfy
+// GenerationPayloadCopier: an interface method's result type must be identical,
+// not merely identically shaped, so a separate struct here would leave the
+// production copier permanently unbindable and the copy route permanently dead.
+type GenerationCopyCounts = store_sqlite.GenerationCopyCounts
 
 // BuildClaimedDedicatedBase consumes the positive reserved generation rather
 // than allocating a second one. It is an initial-full-snapshot primitive, not
 // the later incremental committed-base advancement path.
-func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context, request ClaimedDedicatedBaseRequest) (int64, BuildReport, error) {
+func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context, request ClaimedDedicatedBaseRequest) (builtGeneration int64, builtReport BuildReport, buildErr error) {
 	started := time.Now()
 	claim := request.Claim
 	if ctx == nil || b == nil || b.Store == nil || b.Registry == nil || b.Logger == nil {
@@ -199,13 +201,12 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		validation.Target = target
 		return prepareOwnedDedicatedSnapshot(ctx, target, func() error { return b.validate(ctx, &validation) })
 	}
-	prepare := reparse
+	route := reparse
 	copier, hasCopier := b.generationCopier(request)
 	takeCopy, zeroState, why := b.claimedBaseCopyPlan(ctx, handle, request.RootPath, req.RepoPrefix,
 		identity.TreeOID, identity.ExtractorVersions, hasCopier)
 	if takeCopy {
-		loader, _ := b.generationBulkLoader(request)
-		prepare = b.prepareCopiedDedicatedBase(loader, copier, req.RepoPrefix, claim.GenerationID, handle, zeroState)
+		route = b.prepareCopiedDedicatedBase(copier, req.RepoPrefix, claim.GenerationID, handle, zeroState)
 		// The copy route re-derives the whole generation from generation zero
 		// and has just proved the reservation carries no rows of its own, which
 		// is exactly the property the runner's recovery gate protects: an
@@ -221,6 +222,54 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		zap.String("graph", claim.Desire.Authority.GraphID),
 		zap.String("route", claimedBaseRouteName(takeCopy)),
 		zap.String("reason", why))
+
+	// One bracket, both routes. See generationBulkWindow for why it is opened
+	// from inside the payload preparation and closed from out here.
+	loader, _ := b.generationBulkLoader(request)
+	window := &generationBulkWindow{
+		loader: loader, generationID: claim.GenerationID, logger: b.Logger,
+		wholeGeneration: takeCopy,
+	}
+	defer func() {
+		closeErr := window.close()
+		if closeErr == nil {
+			return
+		}
+		if buildErr != nil {
+			// The build already failed; the close failure is recorded beside
+			// it rather than substituted for it.
+			b.Logger.Warn("close generation bulk load after a failed claimed base build",
+				zap.Int64("generation", claim.GenerationID), zap.Error(closeErr))
+			return
+		}
+		buildErr = closeErr
+	}()
+	prepare := func(ctx context.Context) (source.ContentSource, buildPlan, BuildReport, error) {
+		if err := window.open(); err != nil {
+			return nil, buildPlan{}, BuildReport{}, err
+		}
+		return route(ctx)
+	}
+	callerPrePublish := request.PrePublish
+	req.PrePublish = func(ctx context.Context, generationID int64) error {
+		// The publication is the heaviest catalog write this build makes and
+		// the one whose latency a waiting reader feels, so the pinned writer
+		// goes back to the pool before it rather than after. close is
+		// idempotent: the deferred close above still covers every path that
+		// never reaches a publication, including a caller's hook that refuses
+		// one.
+		//
+		// The caller's own hook runs FIRST, so it still observes the state the
+		// build had while it was writing — a hook is the last place a caller
+		// can look at the generation it reserved, and moving the close in front
+		// of it would change what that hook sees for no gain.
+		if callerPrePublish != nil {
+			if err := callerPrePublish(ctx, generationID); err != nil {
+				return err
+			}
+		}
+		return window.close()
+	}
 	failed := func(ctx context.Context, cause error) error {
 		return b.Store.Catalog().FailDedicatedBaseBuild(ctx, store_sqlite.FailDedicatedBaseBuildRequest{
 			Claim: claim, Error: cause.Error(),
@@ -314,120 +363,131 @@ func (b *SparseGenerationBuilder) generationCopier(request ClaimedDedicatedBaseR
 	return copier, true
 }
 
-// withGenerationBulkLoad runs ONE payload write inside the generation-scoped
-// bulk-load bracket when the store offers one.
+// generationBulkWindow is one claimed-base build's generation-scoped bulk-load
+// bracket. It exists as a small object rather than a `with...(run func())`
+// wrapper because its two halves belong at two different depths of the build,
+// and no single call frame spans exactly the payload write.
 //
-// # Why the window is taken around the copy and not around the whole build
+// # Where it opens: inside the payload preparation, leader-only
 //
 // The window is a store-level singleton: opening it pins one writer connection
-// on the store (store_sqlite/bulk_load.go, BeginGenerationBulkLoad — `s.bulkConn`
-// plus `s.generationBulkLoad`) and its owner is whoever closes it. The re-parse
-// route's payload write is NOT this builder's: it happens inside the index
-// pass, which opens and closes the store's own cold bracket around its shadow
-// drain (indexer.go, `bl.BeginBulkLoad()` … `bl.FlushBulk()`). FlushBulk closes
-// whatever bulk connection it finds — it reads `hadBulk := s.bulkConn != nil`
-// and calls closeBulkConnectionLocked, which clears `s.generationBulkLoad` too
-// — and then, because it believes it had a bulk window, runs a bounded TRUNCATE
-// checkpoint that waits out live readers.
+// (store_sqlite/bulk_load.go, BeginGenerationBulkLoad — `s.bulkConn` plus
+// `s.generationBulkLoad`), and the store refuses a second one while it is held.
+// A build joins a payload flight, and only the physical LEADER writes rows; the
+// coalescing followers run the same function and then wait. Opening from the
+// call's own frame would let a follower win the window and hold the pinned
+// writer across its wait while the leader — the only goroutine that writes —
+// is refused and writes unbracketed. The payload preparation is the first thing
+// the flight runs for the leader and for nobody else, so that is where open()
+// is called from.
 //
-// So a window opened around a build that runs an index pass would be:
+// # Where it closes: a deferred close on the build, plus the pre-publication one
 //
-//   - closed by a foreign owner half way through, leaving EndGenerationBulkLoad
-//     inert (it early-returns when no window is open), so the store's residue
-//     gate — the PASSIVE measurement plus the scheduled off-lane WAL drain —
-//     never runs for it; and
-//   - charged a synchronous TRUNCATE on the build's critical path that the same
-//     build does not pay without it, because on a warm store BeginBulkLoad is a
-//     no-op and FlushBulk returns before the checkpoint.
+// The close is DEFERRED on BuildClaimedDedicatedBase, so it runs on every exit
+// the build has: the ordinary return, an error return, a panic, and a
+// runtime.Goexit. Only a deferred close covers the last two, and any missed
+// close leaves the store holding a pinned writer connection with automatic
+// checkpoints disabled — an unbounded WAL nobody owns, which the next foreign
+// FlushBulk would then adopt and pay for.
 //
-// That is exactly the build/TRUNCATE coupling the maintenance lane exists to
-// remove, so the bracket is taken only where this builder owns the whole write:
-// the copy route, which runs no pass at all. Widening it to the re-parse route
-// needs a store-side change first — FlushBulk has to leave a generation-scoped
-// window (`s.generationBulkLoad != 0`) to its owner. A test in this package
-// pins the current FlushBulk behaviour so that the day it changes, this comment
-// and the scope are revisited rather than silently stale.
+// A successful build closes earlier than that, from the pre-publication hook,
+// so the publication's catalog transaction — the heaviest write the build makes
+// and the one a waiting reader feels — runs on the ordinary pool rather than
+// behind the pinned writer. close is idempotent, so the deferred close is a
+// no-op after it and the "closed on every exit" property is unchanged.
 //
-// The bracket is also taken INSIDE the payload preparation, which the build
-// flight runs for the physical leader only. Taken around the whole call a
-// coalescing follower could win the window and hold the pinned writer across
-// its wait while the leader — the only goroutine that writes rows — is refused
-// the window (the store returns false when one is already open) and writes
-// unbracketed.
-//
-// A refused begin is not an error: an in-memory store has no log to spare, and
-// another bulk window may already own the pinned writer; in both cases the
-// ordinary write path is correct.
-//
-// # The two halves of the close
-//
-// The close is DEFERRED, so it runs on every exit this function has: the
-// ordinary return, an error return, a panic, and a runtime.Goexit. Only a
-// deferred close covers the last two — a close written after run() is skipped
-// by both, and a recover/re-panic pair covers the panic but not the Goexit —
-// and any of them would leave the store holding a pinned writer connection
-// with automatic checkpoints disabled, i.e. an unbounded WAL nobody owns.
-//
-// And it closes through EndGenerationBulkLoad, which is the store's DEFERRED
-// drain door: it measures the residue with one bounded PASSIVE (which never
-// waits for a reader) and hands the follow-up TRUNCATE to the maintenance lane
+// Either way it closes through EndGenerationBulkLoad, which is the store's
+// DEFERRED drain door: one bounded PASSIVE (which never waits for a reader) and
+// the follow-up TRUNCATE handed to the maintenance lane
 // (store_sqlite/bulk_load.go, EndGenerationBulkLoad → scheduleWALDrainAboveLine).
-// The other door — FlushBulk — runs the TRUNCATE inline, on the caller's
-// thread, waiting out the live readers of the generations underneath. A
-// committed base is published beside those readers, so that wait would land
-// squarely inside the publish window. This bracket must never be closed that
-// way, and a test pins the difference against the real store.
+// The other door — FlushBulk — runs the TRUNCATE inline, waiting out the live
+// readers of the generations underneath, which is exactly the wait a committed
+// base's publication must not take.
 //
-// # A populated generation is a refusal, not a warning
+// # Why it now covers the re-parse route too
 //
-// ErrGenerationBulkLoadPopulated says the destination generation already holds
-// rows. The predicate proved it empty before choosing this route, so this can
-// only mean the proof no longer holds — the store's own check covers nodes AND
-// edges (generationPayloadEmpty), which is strictly wider than the builder's
-// node probe, and a writer that vanished can leave an edges-only residue. A
-// whole-generation copy on top of that residue would publish a base that is
-// neither generation zero's payload nor a re-parse of the tree, so the build
-// fails here and the reservation is retried from a clean generation. Every
-// other refusal keeps the ordinary unbracketed write, which is correct.
-func (b *SparseGenerationBuilder) withGenerationBulkLoad(
-	loader GenerationBulkLoader,
-	generationID int64,
-	run func() error,
-) (err error) {
-	if loader == nil {
-		return run()
+// It used to cover the copy route only, because the re-parse route's payload
+// write is not this builder's: it happens inside the index pass, which brackets
+// its own shadow drain with the store's cold window (indexer.go,
+// `bl.BeginBulkLoad()` … `bl.FlushBulk()`). BeginBulkLoad was already a no-op
+// inside a held window, but FlushBulk closed whatever bulk connection it found
+// — taking the window from its owner mid-payload, leaving EndGenerationBulkLoad
+// inert so the residue gate never ran, and charging the pass a synchronous
+// TRUNCATE. FlushBulk now leaves a generation-scoped window to its owner
+// (store_sqlite/bulk_load.go, the `s.generationBulkLoad != 0` arm), so the
+// bracket spans the pass as well and both routes get the shape.
+//
+// # A populated destination is a refusal only when the build writes the whole
+// generation
+//
+// ErrGenerationBulkLoadPopulated says the destination already holds rows. On
+// the COPY route that contradicts the predicate that chose the route — the
+// store's check covers nodes AND edges, which is strictly wider than the
+// builder's node probe, so an edges-only residue from a writer that vanished
+// reaches here — and a whole-generation copy on top of that residue would
+// publish a base that is neither generation zero's payload nor a re-parse of
+// the tree. So the build fails and the reservation is retried from a clean
+// generation. On the RE-PARSE route a populated destination is the ordinary
+// recovery case (an adopted generation carrying partial payload from a vanished
+// writer, which the pass re-derives in full), so it costs the window and
+// nothing else.
+//
+// Every other refused begin is not an error either: an in-memory store has no
+// log to spare and another bulk window may already own the pinned writer. In
+// both cases the ordinary write path is correct, and losing a build because the
+// store could not take a cheaper shape would be a worse answer than a slower
+// build.
+//
+// It is not safe for concurrent use and does not need to be: open runs in the
+// leader's payload preparation and close runs in the leader's own pre-publish
+// hook or in its deferred build exit, all on one goroutine.
+type generationBulkWindow struct {
+	loader       GenerationBulkLoader
+	generationID int64
+	logger       *zap.Logger
+
+	// wholeGeneration says this build materialises the destination generation
+	// in one piece, which is what makes a populated destination a contradiction
+	// rather than a recovery.
+	wholeGeneration bool
+
+	opened bool
+}
+
+// open takes the window for this build's generation, or reports why the build
+// must stop. A refusal that is not a contradiction leaves opened false and the
+// ordinary unbracketed write path in place.
+func (w *generationBulkWindow) open() error {
+	if w == nil || w.loader == nil || w.opened {
+		return nil
 	}
-	opened, beginErr := loader.BeginGenerationBulkLoad(generationID)
-	if beginErr != nil {
-		if errors.Is(beginErr, store_sqlite.ErrGenerationBulkLoadPopulated) {
+	opened, err := w.loader.BeginGenerationBulkLoad(w.generationID)
+	if err != nil {
+		if w.wholeGeneration && errors.Is(err, store_sqlite.ErrGenerationBulkLoadPopulated) {
 			return fmt.Errorf("indexer: refuse to copy into generation %d over existing payload: %w",
-				generationID, beginErr)
+				w.generationID, err)
 		}
-		// The window is an optimisation over a write that is correct without
-		// it. Losing the whole build because the store could not take a
-		// cheaper shape would be a worse answer than a slower build, so this
-		// is reported and stepped over rather than returned.
-		b.Logger.Warn("generation bulk load refused",
-			zap.Int64("generation", generationID), zap.Error(beginErr))
+		if w.logger != nil {
+			w.logger.Warn("generation bulk load refused",
+				zap.Int64("generation", w.generationID), zap.Error(err))
+		}
 	}
-	if !opened {
-		return run()
+	w.opened = opened
+	return nil
+}
+
+// close releases a window this build holds. It is idempotent and inert for a
+// window that was never opened, which is what makes it safe both as the
+// pre-publication release and as the deferred catch-all.
+func (w *generationBulkWindow) close() error {
+	if w == nil || !w.opened {
+		return nil
 	}
-	defer func() {
-		endErr := loader.EndGenerationBulkLoad()
-		if endErr == nil {
-			return
-		}
-		if err != nil {
-			// The write already failed; the close failure is recorded rather
-			// than substituted for it.
-			b.Logger.Warn("close generation bulk load after a failed payload write",
-				zap.Int64("generation", generationID), zap.Error(endErr))
-			return
-		}
-		err = fmt.Errorf("indexer: close generation %d bulk load: %w", generationID, endErr)
-	}()
-	return run()
+	w.opened = false
+	if err := w.loader.EndGenerationBulkLoad(); err != nil {
+		return fmt.Errorf("indexer: close generation %d bulk load: %w", w.generationID, err)
+	}
+	return nil
 }
 
 // claimedBaseCopyPlan decides whether this initial committed base can be
@@ -448,7 +508,7 @@ func (b *SparseGenerationBuilder) withGenerationBulkLoad(
 //     the copy materialises a whole generation rather than completing a
 //     partial one. This clause reads nodes only, because it is a cheap
 //     predicate and not the authority: the store re-proves emptiness over
-//     nodes AND edges when the bulk window opens, and withGenerationBulkLoad
+//     nodes AND edges when the bulk window opens, and generationBulkWindow
 //     turns that refusal into a failed build rather than an unbracketed write
 //     onto the residue;
 //  2. generation zero recorded a CLEAN index at a known commit — the indexer
@@ -654,19 +714,18 @@ func (b *SparseGenerationBuilder) generationZeroPathsOutsideTree(
 // masks are not derived from the plan either: writeMasks reads the generation's
 // own file inventory and node set back out of the handle, so the copied payload
 // produces exactly the replacement claims its own rows justify.
-// The whole write happens inside the generation-scoped bulk-load bracket, and
-// the bracket is here rather than around the build for two reasons the build
-// flight makes concrete: a preparation runs for the physical leader only, so
-// the goroutine that holds the window is the one that writes the rows; and
-// nothing on this route runs an index pass, so no foreign FlushBulk can take
-// the window away from its owner. Both are argued in full on
-// withGenerationBulkLoad.
+// The whole write happens inside the generation-scoped bulk-load bracket that
+// the build opened just before calling this preparation, and the bracket is
+// opened there rather than here because the RE-PARSE route needs the same one
+// and has no preparation of its own to hang it on. Everything the bracket has
+// to be true of is argued on generationBulkWindow; what matters here is only
+// that a copy is one write and it is inside it.
 //
-// Everything after the copy — enrichment, context separation, masks, producer
-// states and publication — runs outside the window, on the shared lifecycle the
-// re-parse route uses too, so the two routes finish identically.
+// Everything after the copy — enrichment, context separation, masks and
+// producer states — runs inside the same window, and the publication runs
+// outside it, on the shared lifecycle the re-parse route uses too, so the two
+// routes finish identically.
 func (b *SparseGenerationBuilder) prepareCopiedDedicatedBase(
-	loader GenerationBulkLoader,
 	copier GenerationPayloadCopier,
 	repoPrefix string,
 	generationID int64,
@@ -674,30 +733,22 @@ func (b *SparseGenerationBuilder) prepareCopiedDedicatedBase(
 	zeroState graph.RepoIndexState,
 ) generationPayloadPreparation {
 	return func(ctx context.Context) (source.ContentSource, buildPlan, BuildReport, error) {
-		var report BuildReport
-		err := b.withGenerationBulkLoad(loader, generationID, func() error {
-			counts, err := copier.CopyPayloadGeneration(ctx, generationZero, generationID, repoPrefix)
-			if err != nil {
-				return fmt.Errorf("indexer: copy generation %d into claimed base %d: %w",
-					generationZero, generationID, err)
-			}
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := writeCopiedGenerationIndexState(handle, repoPrefix, zeroState, counts); err != nil {
-				return err
-			}
-			landed, err := copiedDedicatedBaseReport(handle, repoPrefix)
-			if err != nil {
-				return err
-			}
-			landed.NodeCount, landed.EdgeCount = int(counts.Nodes), int(counts.Edges)
-			report = landed
-			return nil
-		})
+		counts, err := copier.CopyPayloadGeneration(ctx, generationZero, generationID, repoPrefix)
+		if err != nil {
+			return nil, buildPlan{}, BuildReport{}, fmt.Errorf("indexer: copy generation %d into claimed base %d: %w",
+				generationZero, generationID, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, buildPlan{}, BuildReport{}, err
+		}
+		if err := writeCopiedGenerationIndexState(handle, repoPrefix, zeroState, counts); err != nil {
+			return nil, buildPlan{}, BuildReport{}, err
+		}
+		report, err := copiedDedicatedBaseReport(handle, repoPrefix)
 		if err != nil {
 			return nil, buildPlan{}, BuildReport{}, err
 		}
+		report.NodeCount, report.EdgeCount = int(counts.Nodes), int(counts.Edges)
 		return copiedGenerationSource{identity: fmt.Sprintf("generation-copy:%d->%d", generationZero, generationID)},
 			buildPlan{}, report, nil
 	}

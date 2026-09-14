@@ -669,10 +669,53 @@ func TestClaimedDedicatedBaseRejectsInvalidRequestsWithoutWrites(t *testing.T) {
 	}
 }
 
+// settledWALStat returns the write-ahead log's stat once it has stopped
+// changing, so a caller can measure an interval that starts from a store with
+// no outstanding maintenance. It is bounded: a log that never settles is
+// reported rather than waited on forever, because a store that keeps writing
+// is itself the finding.
+func settledWALStat(path string) (os.FileInfo, error) {
+	const (
+		poll   = 20 * time.Millisecond
+		stable = 3
+		limit  = 10 * time.Second
+	)
+	deadline := time.Now().Add(limit)
+	var last os.FileInfo
+	steady := 0
+	for {
+		info, err := os.Stat(path + "-wal")
+		if err != nil {
+			return nil, err
+		}
+		if last != nil && info.Size() == last.Size() && info.ModTime().Equal(last.ModTime()) {
+			steady++
+			if steady >= stable {
+				return info, nil
+			}
+		} else {
+			steady = 0
+		}
+		last = info
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("the write-ahead log %s-wal never settled in %s, so a write audit "+
+				"starting here would measure another caller's work", path, limit)
+		}
+		time.Sleep(poll)
+	}
+}
+
 // installDedicatedWriteAudit instruments only a test-owned database. Keeping
 // this in the indexer test package avoids exporting production-only test hooks
 // from store_sqlite. All DDL commits before the measured interval starts.
 func installDedicatedWriteAudit(ctx context.Context, path string) (func() error, error) {
+	// Settle BEFORE the instrumentation, not just before the measurement: this
+	// helper's own DDL runs on a second connection with no busy timeout, so a
+	// maintenance pass still holding the writer fails it outright with
+	// SQLITE_BUSY.
+	if _, err := settledWALStat(path); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -701,7 +744,18 @@ func installDedicatedWriteAudit(ctx context.Context, path string) (func() error,
 	if err := db.Close(); err != nil {
 		return nil, err
 	}
-	before, err := os.Stat(path + "-wal")
+	// The measured interval must start from a QUIESCED store. A build that has
+	// already returned can still owe the maintenance lane work its own thread
+	// deliberately did not do — a payload written inside a bulk window defers
+	// its planner-statistics refresh (planner_stats_freshness.go,
+	// plannerStatsBulkWindowReason) and the publication schedules it on the
+	// lane — and that refresh writes sqlite_stat1, which is a real write to the
+	// write-ahead log that no trigger here can see. Starting the audit while it
+	// is still owed attributes the previous build's tail to the interval under
+	// test. Waiting for the log to stop moving is what makes the audit's answer
+	// about the caller's interval and nothing else; it never hides a write made
+	// AFTER this point, which is the only thing the audit claims.
+	before, err := settledWALStat(path)
 	if err != nil {
 		return nil, err
 	}

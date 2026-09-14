@@ -425,6 +425,76 @@ func TestEndGenerationBulkLoadIsInertWithoutAWindow(t *testing.T) {
 	}
 }
 
+// GenerationBulkLoadShape is evidence, not a restatement.
+//
+// It is the only door a caller a package away has onto "the write is in the
+// bulk shape", as distinct from "a window is open" — the startup wiring test in
+// internal/indexer asserts the production build's PRAGMAs entirely through it.
+// Those assertions are worth exactly as much as this property: a getter that
+// echoed what BeginGenerationBulkLoad ASKED for would satisfy them while the
+// pinned connection sat in any shape at all.
+//
+// So the test puts the shape back the way a foreign caller would, on the
+// store's own pinned connection, and requires the getter to report the new
+// values. It also requires the closed-window answer to be a decline rather than
+// a zero pair, because a caller cannot tell those apart from the values alone.
+func TestGenerationBulkLoadShapeReadsTheConnectionBack(t *testing.T) {
+	store, _ := openTempStore(t)
+	ctx := context.Background()
+
+	if cacheSize, autoCheckpoint, ok := store.GenerationBulkLoadShape(); ok {
+		t.Fatalf("GenerationBulkLoadShape = (%d, %d, true) with no window open, want a decline", cacheSize, autoCheckpoint)
+	}
+
+	engaged, err := store.BeginGenerationBulkLoad(3)
+	if err != nil || !engaged {
+		t.Fatalf("BeginGenerationBulkLoad = (%v, %v), want it engaged", engaged, err)
+	}
+	defer func() { _ = store.EndGenerationBulkLoad() }()
+
+	cacheSize, autoCheckpoint, ok := store.GenerationBulkLoadShape()
+	if !ok || cacheSize != bulkCacheSizeKiB || autoCheckpoint != 0 {
+		t.Fatalf("a fresh window reports (%d, %d, %v), want (%d, 0, true)", cacheSize, autoCheckpoint, ok, bulkCacheSizeKiB)
+	}
+
+	// A foreign caller puts the shape back on the very connection the window
+	// pinned. Neither value is one BeginGenerationBulkLoad ever asks for, so an
+	// echoing getter cannot answer with them by accident.
+	const foreignCacheSize = -2048
+	const foreignAutoCheckpoint = 977
+	store.writeMu.Lock()
+	conn := store.bulkConn
+	if conn == nil {
+		store.writeMu.Unlock()
+		t.Fatal("the window engaged without pinning a connection")
+	}
+	_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", foreignCacheSize))
+	_, checkpointErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", foreignAutoCheckpoint))
+	store.writeMu.Unlock()
+	if cacheErr != nil || checkpointErr != nil {
+		t.Fatalf("put the shape back: cache_size=%v wal_autocheckpoint=%v", cacheErr, checkpointErr)
+	}
+
+	cacheSize, autoCheckpoint, ok = store.GenerationBulkLoadShape()
+	if !ok {
+		t.Fatal("GenerationBulkLoadShape declined while the window is still open")
+	}
+	if cacheSize != foreignCacheSize || autoCheckpoint != foreignAutoCheckpoint {
+		t.Fatalf("GenerationBulkLoadShape = (%d, %d), want the connection's own (%d, %d): the getter must read "+
+			"the PRAGMAs back off the pinned writer rather than echo what BeginGenerationBulkLoad asked for — "+
+			"otherwise every PRAGMA assertion made through it, including the production startup wiring test's, "+
+			"is asserting a constant",
+			cacheSize, autoCheckpoint, foreignCacheSize, foreignAutoCheckpoint)
+	}
+
+	if err := store.EndGenerationBulkLoad(); err != nil {
+		t.Fatalf("EndGenerationBulkLoad: %v", err)
+	}
+	if cacheSize, autoCheckpoint, ok := store.GenerationBulkLoadShape(); ok {
+		t.Fatalf("GenerationBulkLoadShape = (%d, %d, true) after the window closed, want a decline", cacheSize, autoCheckpoint)
+	}
+}
+
 // An in-memory store has no WAL and no on-disk B-tree pressure to spare, so the
 // window declines rather than pinning a connection it cannot help.
 func TestGenerationBulkLoadInMemoryIsNoOp(t *testing.T) {

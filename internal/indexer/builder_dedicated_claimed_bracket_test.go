@@ -14,57 +14,73 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
-// bracketBuilder is the smallest builder withGenerationBulkLoad needs: the
-// bracket touches the loader and the logger and nothing else, so a fixture
-// store would only hide which of the two the behaviour comes from.
-func bracketBuilder() *SparseGenerationBuilder {
-	return &SparseGenerationBuilder{Logger: zap.NewNop()}
+// exitCopyProbe is a copy primitive that leaves the build the way one exit
+// path leaves it. A nil exit performs the real copy, so the success arm below
+// is a genuinely published base and not a stub.
+type exitCopyProbe struct {
+	real *copyProbe
+	exit func() error
 }
 
-// A window that is opened must be closed on EVERY way out of the bracket.
+func (p *exitCopyProbe) CopyPayloadGeneration(ctx context.Context, from, to int64, repoPrefix string) (GenerationCopyCounts, error) {
+	if p.exit == nil {
+		return p.real.CopyPayloadGeneration(ctx, from, to, repoPrefix)
+	}
+	if err := p.exit(); err != nil {
+		return GenerationCopyCounts{}, err
+	}
+	return GenerationCopyCounts{}, nil
+}
+
+// A window that is opened must be closed on EVERY way out of the build.
 //
 // The store's generation window pins one writer connection and disables that
 // connection's automatic checkpoints (store_sqlite/bulk_load.go,
 // BeginGenerationBulkLoad), so a leaked window is a pinned writer in front of
 // an unbounded WAL that no later caller owns: EndGenerationBulkLoad is inert
-// for anybody else, and the next FlushBulk would close it as if it were its
-// own and charge that build a TRUNCATE it never asked for.
+// for anybody else, and FlushBulk now deliberately declines to adopt it, so
+// nothing else in the process will ever close it.
 //
-// The four exits are not the same mechanism. A close written after run() is
-// reached by the ordinary return and by an error return, but skipped by a
+// The four exits are not the same mechanism. A close written after the build
+// is reached by the ordinary return and by an error return, but skipped by a
 // panic and by a runtime.Goexit; a recover/re-panic pair adds the panic and
 // still misses the Goexit. Only a deferred close covers all four, which is why
 // this test enumerates them rather than trusting the happy path.
+//
+// Every arm drives the production entry point — the window is opened inside
+// the payload preparation and closed from BuildClaimedDedicatedBase's own
+// defer, which no single frame spans, so a test of one helper could not state
+// this property at all.
 func TestGenerationBulkBracketClosesOnEveryExitPath(t *testing.T) {
 	failed := errors.New("the payload write failed")
 	for _, tc := range []struct {
 		name string
-		// drive runs the bracket the way this exit path leaves it.
-		drive func(t *testing.T, b *SparseGenerationBuilder, loader *bulkLoadProbe)
+		// drive runs the build the way this exit path leaves it.
+		drive func(t *testing.T, run func(GenerationPayloadCopier) error, real *copyProbe)
 	}{
 		{
 			name: "returns",
-			drive: func(t *testing.T, b *SparseGenerationBuilder, loader *bulkLoadProbe) {
-				if err := b.withGenerationBulkLoad(loader, 7, func() error { return nil }); err != nil {
-					t.Fatalf("a successful write reported %v", err)
+			drive: func(t *testing.T, run func(GenerationPayloadCopier) error, real *copyProbe) {
+				if err := run(&exitCopyProbe{real: real}); err != nil {
+					t.Fatalf("a successful build reported %v", err)
 				}
 			},
 		},
 		{
 			name: "fails",
-			drive: func(t *testing.T, b *SparseGenerationBuilder, loader *bulkLoadProbe) {
-				err := b.withGenerationBulkLoad(loader, 7, func() error { return failed })
+			drive: func(t *testing.T, run func(GenerationPayloadCopier) error, real *copyProbe) {
+				err := run(&exitCopyProbe{exit: func() error { return failed }})
 				if !errors.Is(err, failed) {
-					t.Fatalf("bracket error = %v, want the write's own failure", err)
+					t.Fatalf("build error = %v, want the write's own failure", err)
 				}
 			},
 		},
 		{
 			name: "panics",
-			drive: func(t *testing.T, b *SparseGenerationBuilder, loader *bulkLoadProbe) {
+			drive: func(t *testing.T, run func(GenerationPayloadCopier) error, real *copyProbe) {
 				recovered := func() (recovered any) {
 					defer func() { recovered = recover() }()
-					_ = b.withGenerationBulkLoad(loader, 7, func() error { panic(failed) })
+					_ = run(&exitCopyProbe{exit: func() error { panic(failed) }})
 					return nil
 				}()
 				// The panic must still reach the caller: closing the window is
@@ -77,32 +93,43 @@ func TestGenerationBulkBracketClosesOnEveryExitPath(t *testing.T) {
 		},
 		{
 			name: "goexits",
-			drive: func(t *testing.T, b *SparseGenerationBuilder, loader *bulkLoadProbe) {
+			drive: func(t *testing.T, run func(GenerationPayloadCopier) error, real *copyProbe) {
 				// runtime.Goexit is how a t.Fatal inside a helper goroutine,
 				// and any future early exit, leaves a function: its deferred
 				// calls run and its return statements do not.
 				done := make(chan struct{})
 				go func() {
 					defer close(done)
-					_ = b.withGenerationBulkLoad(loader, 7, func() error {
+					_ = run(&exitCopyProbe{exit: func() error {
 						runtime.Goexit()
 						return nil
-					})
+					}})
 				}()
 				<-done
 			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			builder, request, claim, _ := claimedCopyFixture(t)
+			indexGenerationZero(t, builder, request)
 			loader := &bulkLoadProbe{}
-			tc.drive(t, bracketBuilder(), loader)
+			real := &copyProbe{store: builder.Store, bulk: loader}
+			run := func(copier GenerationPayloadCopier) error {
+				_, _, err := builder.BuildClaimedDedicatedBase(context.Background(), ClaimedDedicatedBaseRequest{
+					Claim: claim, RootPath: request.RootPath, WorkspaceID: request.WorkspaceID,
+					ProjectID: request.ProjectID, BulkLoad: loader, CopySource: copier,
+				})
+				return err
+			}
+			tc.drive(t, run, real)
 			begun, ended := loader.counts()
-			if len(begun) != 1 || begun[0] != 7 {
-				t.Fatalf("windows begun = %v, want exactly one on generation 7", begun)
+			if len(begun) != 1 || begun[0] != claim.GenerationID {
+				t.Fatalf("windows begun = %v, want exactly one on generation %d", begun, claim.GenerationID)
 			}
 			if ended != 1 {
 				t.Fatalf("the %s exit closed the window %d time(s), want exactly one close: a leaked "+
-					"window pins the store's writer with automatic checkpoints disabled", tc.name, ended)
+					"window pins the store's writer with automatic checkpoints disabled, and a second "+
+					"close would release a window this build no longer owns", tc.name, ended)
 			}
 			if loader.isOpen() {
 				t.Fatalf("the %s exit left the generation bulk window open", tc.name)
@@ -203,10 +230,15 @@ func TestGenerationBulkBracketEndsThroughTheDeferredDrainDoor(t *testing.T) {
 	store := builder.Store
 	wal := request.StorePath + "-wal"
 
-	if err := builder.withGenerationBulkLoad(store, claim.GenerationID, func() error {
-		return writeBracketProbeRows(store, request.RepoPrefix, "deferred")
-	}); err != nil {
-		t.Fatalf("the bracket over the real store failed: %v", err)
+	window := &generationBulkWindow{loader: store, generationID: claim.GenerationID, logger: zap.NewNop()}
+	if err := window.open(); err != nil {
+		t.Fatalf("open the bracket over the real store: %v", err)
+	}
+	if err := writeBracketProbeRows(store, request.RepoPrefix, "deferred"); err != nil {
+		t.Fatalf("write the bracketed payload: %v", err)
+	}
+	if err := window.close(); err != nil {
+		t.Fatalf("close the bracket over the real store: %v", err)
 	}
 	deferred := walBytes(t, wal)
 	if deferred == 0 {
@@ -223,16 +255,85 @@ func TestGenerationBulkBracketEndsThroughTheDeferredDrainDoor(t *testing.T) {
 		t.Fatal("the bracket returned with the generation window still open")
 	}
 
-	// The control, on the same store and the same log: the other door.
+	if err := store.EndGenerationBulkLoad(); err != nil {
+		t.Fatalf("close the reopened window: %v", err)
+	}
+
+	// The control, on the same store and the same log: an inline TRUNCATE.
+	// Without it "the log is not empty" would pass with either door, because a
+	// log nobody ever truncates is not evidence of anything.
 	if err := writeBracketProbeRows(store, request.RepoPrefix, "inline"); err != nil {
 		t.Fatalf("write the control payload: %v", err)
 	}
-	if err := store.FlushBulk(); err != nil {
-		t.Fatalf("flush the index-pass bracket: %v", err)
+	if err := store.CheckpointWAL(); err != nil {
+		t.Fatalf("run the control TRUNCATE: %v", err)
 	}
 	if inline := walBytes(t, wal); inline != 0 {
 		t.Fatalf("the control door left %d WAL bytes, so this test cannot tell the two doors apart; "+
 			"the deferred arm's %d bytes prove nothing", inline, deferred)
+	}
+}
+
+// An index pass's FlushBulk must leave a generation-scoped window to its owner.
+//
+// This is the store-side half that lets the bracket cover the RE-PARSE route.
+// A pass run inside a generation window reaches FlushBulk at the end of its
+// shadow drain, holding a pinned writer it never opened (beginBulkLoadLocked
+// is a no-op while one is held). Adopting it there would close the window
+// mid-build — leaving EndGenerationBulkLoad inert, so the residue gate and the
+// off-lane drain never run for it — and charge the pass an inline TRUNCATE
+// that waits out the readers of the generations underneath.
+//
+// The assertion is on both halves of that: the window survives, and the log is
+// not truncated on the caller's thread.
+func TestAnIndexPassFlushLeavesAGenerationBulkWindowToItsOwner(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "1000000")
+	builder, request, claim := privateClaimedDedicatedFixture(t)
+	store := builder.Store
+	wal := request.StorePath + "-wal"
+
+	opened, err := store.BeginGenerationBulkLoad(claim.GenerationID)
+	if err != nil {
+		t.Fatalf("open the generation window: %v", err)
+	}
+	if !opened {
+		// The claimed-base fixture is an on-disk store with an empty
+		// reservation, which is exactly the shape the window accepts. A
+		// refusal here means the fixture changed under this test, not that
+		// there is nothing to pin.
+		t.Fatal("the fixture store refused a generation bulk window; this test can no longer pin the scope decision")
+	}
+	if err := writeBracketProbeRows(store, request.RepoPrefix, "pass"); err != nil {
+		t.Fatalf("write the pass's payload: %v", err)
+	}
+
+	// This is exactly what runPass reaches at the end of its shadow drain.
+	if err := store.FlushBulk(); err != nil {
+		t.Fatalf("flush the index pass bracket: %v", err)
+	}
+
+	if generation, held := store.InGenerationBulkLoad(); !held || generation != claim.GenerationID {
+		t.Fatalf("after a foreign FlushBulk the store holds window %d (held=%v); want generation %d still "+
+			"owned by the build that opened it", generation, held, claim.GenerationID)
+	}
+	if bytes := walBytes(t, wal); bytes == 0 {
+		t.Fatal("a foreign FlushBulk truncated the log inside the generation window: the build is paying " +
+			"an inline checkpoint that waits out the readers of the generations underneath it")
+	}
+	// A second window may only be opened once the first is really gone, so
+	// this is what proves the owner still holds it.
+	stolen, err := store.BeginGenerationBulkLoad(claim.GenerationID)
+	if err != nil {
+		t.Fatalf("ask for the generation window after a foreign flush: %v", err)
+	}
+	if stolen {
+		t.Fatal("FlushBulk released the generation-scoped window, so a second caller was handed it")
+	}
+	if err := store.EndGenerationBulkLoad(); err != nil {
+		t.Fatalf("close the window: %v", err)
+	}
+	if _, held := store.InGenerationBulkLoad(); held {
+		t.Fatal("the owner's close left the window open")
 	}
 }
 

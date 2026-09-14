@@ -3,12 +3,16 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -967,4 +971,116 @@ func TestInitialBasePublisherRefusesAMissingLifecycle(t *testing.T) {
 	require.Nil(t, nilPublisher.Outcomes())
 	require.NoError(t, nilPublisher.Wait(context.Background()))
 	require.Equal(t, "no publisher", nilPublisher.PublishRepo(context.Background(), "x").Skipped)
+}
+
+// The publication driver builds a committed base inside ONE generation bulk
+// window, on both routes, with nothing handed to it.
+//
+// This is the wiring assertion for the whole item. Every other test of the
+// route and the bracket supplies a CopySource / BulkLoad of its own, so a green
+// suite said nothing about whether a daemon ever reaches either: both are
+// resolved from the builder's own store, and until *store_sqlite.Store
+// implemented CopyPayloadGeneration the copy route — and with it the bracket —
+// could not execute in production at all.
+//
+// The path here is the production one: dedicatedBasePublisher.ensureInitial →
+// buildObservedClaim → BuildClaimedDedicatedBase, over a real on-disk store and
+// a real git checkout. The observation's own PrePublish hook is the sampling
+// point because it is a PRODUCTION callback that runs on the physical leader
+// after the payload write, the enrichment and the masks — so a window that is
+// open there is a window that spanned the write.
+func TestTheStartupPublisherBuildsInsideOneGenerationBulkWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		route string
+		dirty bool
+	}{
+		{name: "copy", route: "copy_generation_zero"},
+		{name: "reparse", route: "reparse_git_tree", dirty: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A low automatic-checkpoint line is what makes the log a witness:
+			// outside the window the writer connection drains at the line, so
+			// a log far above it can only mean automatic checkpoints were
+			// suspended for the length of the payload. The byte-level A/B with
+			// a real unwindowed control arm lives at store level
+			// (store_sqlite.TestCopyPayloadGenerationWriteShapeAgainstTheTwoWriteRoutes).
+			const line = 32
+			t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", strconv.Itoa(line))
+			runtime, publisher, observation, request := dedicatedRuntimeFixture(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			core, logs := observer.New(zap.InfoLevel)
+			observation.Builder.Logger = zap.New(core)
+			indexGenerationZero(t, &observation.Builder, request)
+			if tc.dirty {
+				// An uncommitted edit is the cheapest way to send the build
+				// down the re-parse route while leaving the committed tree —
+				// the bytes the base describes — exactly as it was.
+				const uncommitted = "package dedicated\n\nfunc UncommittedOnly() string { return \"uncommitted\" }\n"
+				require.NoError(t, os.WriteFile(filepath.Join(request.RootPath, "uncommitted.go"), []byte(uncommitted), 0o600))
+			}
+			store := runtime.store
+			require.NoError(t, store.CheckpointWAL())
+
+			var (
+				windowGeneration int64
+				windowHeld       bool
+				cacheSize        int64
+				autoCheckpoint   int64
+				shapeHeld        bool
+				walAtPrePublish  int64
+				hooks            int
+			)
+			observation.PrePublish = func(context.Context, int64) error {
+				hooks++
+				windowGeneration, windowHeld = store.InGenerationBulkLoad()
+				cacheSize, autoCheckpoint, shapeHeld = store.GenerationBulkLoadShape()
+				walAtPrePublish = walBytes(t, request.StorePath+"-wal")
+				return nil
+			}
+
+			result, err := publisher.ensureInitial(ctx, dedicatedRuntimeObserver(runtime, publisher, observation))
+			require.NoError(t, err)
+			require.Positive(t, result.Adoption.GenerationID)
+
+			route, reason := claimedRoute(t, logs)
+			require.Equalf(t, tc.route, route, "route reason = %q", reason)
+			require.Equal(t, 1, hooks, "the production pre-publication hook ran %d times", hooks)
+			require.Truef(t, windowHeld,
+				"no generation bulk window was open at the pre-publication boundary, so the %s route's "+
+					"payload write was not bracketed", tc.name)
+			require.Equal(t, result.Adoption.GenerationID, windowGeneration,
+				"the window was opened on a generation other than the one being built")
+
+			// Closed on the way out, by the build itself and not by anybody
+			// else: nothing in the process will adopt a leaked generation
+			// window, so a build that returns still holding one strands the
+			// store's writer behind an unbounded log.
+			generation, stillHeld := store.InGenerationBulkLoad()
+			require.Falsef(t, stillHeld, "the build returned still holding the window on generation %d", generation)
+
+			// The write audit proper: the shape is read back off the pinned
+			// writer connection, so this is what the payload was actually
+			// written through and not what the window asked for. -262144 is
+			// the window's ~256 MiB page-cache budget (SQLite reads a negative
+			// cache_size as KiB) and 0 is automatic checkpoints suspended for
+			// the length of the payload — the two halves of the bulk shape a
+			// window over a LIVE store may take.
+			require.Truef(t, shapeHeld, "no pinned writer was holding a shape at the pre-publication boundary")
+			require.Equalf(t, int64(-262144), cacheSize,
+				"the payload was written at cache_size=%d, so the %s route did not get the window's page cache",
+				cacheSize, tc.name)
+			require.Equalf(t, int64(0), autoCheckpoint,
+				"the payload was written with automatic checkpoints at %d pages, so it was being drained "+
+					"mid-flight — the cost the window exists to defer", autoCheckpoint)
+			t.Logf("%s route: bulk shape at the pre-publication boundary cache_size=%d wal_autocheckpoint=%d; "+
+				"log = %d bytes against a %d-page line",
+				tc.name, cacheSize, autoCheckpoint, walAtPrePublish, line)
+			require.Greaterf(t, walAtPrePublish, int64(line*4096),
+				"the log held %d bytes at the pre-publication boundary, under the %d-page line's worth: "+
+					"the payload never accumulated at all", walAtPrePublish, line)
+		})
+	}
 }

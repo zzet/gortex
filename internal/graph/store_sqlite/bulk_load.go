@@ -596,6 +596,62 @@ func (s *Store) EndGenerationBulkLoad() error {
 	return closeErr
 }
 
+// InGenerationBulkLoad reports the generation whose bulk window this store is
+// currently holding, and whether it holds one at all.
+//
+// It is the observable half of the bracket: a caller that opened a window has
+// no other way to state "the window was open AROUND this write" from outside
+// the package, and the two facts a bracket is worth anything for — that it was
+// opened before the payload and closed after it — are otherwise invisible to
+// everything but the WAL. It reads the same field the window itself is, under
+// the same gate, so it can never disagree with the store's own state.
+//
+// Not a licence: nothing may act on the answer to decide whether to write. The
+// window is an optimisation over a write that is correct without it.
+func (s *Store) InGenerationBulkLoad() (int64, bool) {
+	if s.coreless() {
+		return 0, false
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.generationBulkLoad, s.generationBulkLoad != 0 && s.bulkConn != nil
+}
+
+// GenerationBulkLoadShape reports the connection-local write shape an open
+// generation window is actually holding: the pinned writer's page cache (a
+// negative SQLite cache_size is a KiB budget) and its automatic-checkpoint
+// line in pages. ok is false when no generation window is open.
+//
+// It reads the PRAGMAs back off the connection rather than echoing what
+// BeginGenerationBulkLoad asked for, so it is evidence and not a restatement:
+// a window that failed to take the shape, or one a foreign caller has since
+// put back, answers differently. That distinction is the whole point — "a
+// window is open" and "the write is in the bulk shape" are two claims, and a
+// caller a package away can otherwise check only the first.
+//
+// The read runs under the write gate, so it cannot interleave with a write on
+// the same pinned connection.
+func (s *Store) GenerationBulkLoadShape() (cacheSize, walAutoCheckpoint int64, ok bool) {
+	if s.coreless() {
+		return 0, 0, false
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.generationBulkLoad == 0 || s.bulkConn == nil {
+		return 0, 0, false
+	}
+	ctx := context.Background()
+	cacheSize, err := pragmaInt(ctx, s.bulkConn, "cache_size")
+	if err != nil {
+		return 0, 0, false
+	}
+	walAutoCheckpoint, err = pragmaInt(ctx, s.bulkConn, "wal_autocheckpoint")
+	if err != nil {
+		return 0, 0, false
+	}
+	return cacheSize, walAutoCheckpoint, true
+}
+
 // generationPayloadEmpty reports whether one payload generation holds no rows.
 // Both probes restate `view_gen > 0` literally because that is the predicate
 // the generation indexes are partial on — SQLite cannot prove a bound
@@ -653,6 +709,27 @@ func (s *Store) FlushBulk() error {
 		// repository boundary can coincide with an unrelated read snapshot and
 		// spend the full passive-checkpoint timeout without advancing the WAL;
 		// repeating that timeout once per repository only stalls the cold path.
+		s.writeMu.Unlock()
+		return nil
+	}
+	if s.generationBulkLoad != 0 {
+		// A generation-scoped window belongs to whoever opened it, exactly as
+		// the coordinated window above belongs to its outer owner, and for a
+		// sharper reason: this flush is not the window's caller at all. An
+		// index pass run INSIDE a generation window reaches here at the end of
+		// its shadow drain, having found a pinned writer it did not open
+		// (beginBulkLoadLocked is a no-op while one is held). Closing it here
+		// would take the connection away from its owner mid-payload, leave
+		// EndGenerationBulkLoad inert — so the residue gate, the PASSIVE
+		// measurement and the off-lane drain would never run for that window —
+		// and charge this pass a synchronous TRUNCATE that waits out the live
+		// readers of the generations underneath, which is exactly the wait a
+		// committed-base publication must not take.
+		//
+		// Nothing is owed here either way: a generation window defers no dense
+		// index (bulkIndexesDeferred is false for it) and its WAL is already
+		// bounded inside the payload by noteBulkRowsLocked's row intervals, so
+		// leaving it open costs the pass nothing it would otherwise have paid.
 		s.writeMu.Unlock()
 		return nil
 	}

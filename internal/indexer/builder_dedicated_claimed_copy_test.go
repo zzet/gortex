@@ -331,14 +331,26 @@ func TestClaimedDedicatedBaseCopiesGenerationZeroOnACleanMatchingTree(t *testing
 	// generation zero was indexed the same way, built through the re-parse
 	// route. The two arms then differ in exactly one thing — where the base's
 	// rows came from.
+	//
+	// The reference arm is sent down the re-parse route by an UNCOMMITTED file
+	// written after its generation zero was indexed. That is the cheapest
+	// refusal that leaves the committed tree — the bytes both arms describe —
+	// untouched: a re-parse reads the tree at the reserved TreeOID, which has
+	// never seen this file. (Before the store carried the copy primitive this
+	// arm got its re-parse for free, by passing no CopySource; it cannot any
+	// more, which is the whole point of the wiring this item lands.)
 	reference, referenceRequest, referenceClaim, referenceLogs := claimedCopyFixture(t)
 	indexGenerationZero(t, reference, referenceRequest)
+	const uncommitted = "package dedicated\n\nfunc UncommittedOnly() string { return \"uncommitted\" }\n"
+	if err := os.WriteFile(filepath.Join(referenceRequest.RootPath, "uncommitted.go"), []byte(uncommitted), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	referenceID, referenceReport := buildClaimedBaseWithReport(t, reference, ClaimedDedicatedBaseRequest{
 		Claim: referenceClaim, RootPath: referenceRequest.RootPath,
 		WorkspaceID: referenceRequest.WorkspaceID, ProjectID: referenceRequest.ProjectID,
 	})
 	if route, reason := claimedRoute(t, referenceLogs); route != "reparse_git_tree" {
-		t.Fatalf("reference route = %q (%s), want the re-parse plan without a copy primitive", route, reason)
+		t.Fatalf("reference route = %q (%s), want the re-parse plan the uncommitted file forces", route, reason)
 	}
 
 	// The build report is part of what the route produces. Without an
@@ -879,124 +891,191 @@ func TestClaimedDedicatedBaseReparsesWhenGenerationZeroCarriesUntrackedPayload(t
 	}
 }
 
-// Without a copy primitive nothing changes: the predicate short-circuits and
-// no git probe runs at all, so a store that never gains the primitive pays
-// exactly what it paid before this route existed.
-func TestClaimedDedicatedBaseWithoutACopyPrimitiveReparses(t *testing.T) {
+// The production store IS the copy primitive, and the production entry point
+// reaches it without being handed one.
+//
+// This is the wiring assertion the route's tests could not make while no type
+// implemented CopyPayloadGeneration: every one of them supplied a probe, so a
+// green suite said nothing about whether a daemon would ever take the route.
+// Here the request carries neither CopySource nor BulkLoad, so both are
+// resolved from the builder's own store — which is what buildObservedClaim
+// constructs — and the logged route is the one a real build takes.
+func TestTheProductionStoreIsTheGenerationCopyPrimitive(t *testing.T) {
 	builder, request, claim, logs := claimedCopyFixture(t)
 	indexGenerationZero(t, builder, request)
 
-	buildClaimedBase(t, builder, ClaimedDedicatedBaseRequest{
+	copier, hasCopier := builder.generationCopier(ClaimedDedicatedBaseRequest{})
+	if !hasCopier {
+		t.Fatal("the builder's own store does not satisfy GenerationPayloadCopier, so every production " +
+			"build re-parses and the copy route is dead")
+	}
+	if copier != any(builder.Store) {
+		t.Fatalf("generationCopier resolved %T, want the builder's own store", copier)
+	}
+
+	id := buildClaimedBase(t, builder, ClaimedDedicatedBaseRequest{
 		Claim: claim, RootPath: request.RootPath, WorkspaceID: request.WorkspaceID,
 		ProjectID: request.ProjectID,
 	})
 
 	route, reason := claimedRoute(t, logs)
-	if route != "reparse_git_tree" || reason != "no generation copy primitive on this store" {
-		t.Fatalf("route = %q reason = %q, want the re-parse plan named by the absent primitive", route, reason)
+	if route != "copy_generation_zero" {
+		t.Fatalf("route = %q (%s), want the copy plan from a store that carries the primitive", route, reason)
+	}
+	view := materializeClaimedBase(t, builder, request.Identity.GraphID, id)
+	if node := view.Reader.GetNode(request.RepoPrefix + "/base.go::Committed"); node == nil {
+		t.Fatal("the store's own copy lost the committed symbol")
+	}
+	gotNodes, gotEdges := claimedBasePayload(view.Reader)
+	if len(gotNodes) == 0 || len(gotEdges) == 0 {
+		t.Fatalf("the store's own copy composed empty: %d nodes, %d edges", len(gotNodes), len(gotEdges))
+	}
+
+	// The gate-1 oracle against the REAL primitive: an independent fixture over
+	// byte-identical content, built through the re-parse route, must compose
+	// the same payload. The probe-driven oracle above
+	// (TestClaimedDedicatedBaseCopiesGenerationZeroOnACleanMatchingTree) says
+	// the ROUTE is sound; this one says the store's SQL is.
+	reference, referenceRequest, referenceClaim, referenceLogs := claimedCopyFixture(t)
+	indexGenerationZero(t, reference, referenceRequest)
+	const uncommitted = "package dedicated\n\nfunc UncommittedOnly() string { return \"uncommitted\" }\n"
+	if err := os.WriteFile(filepath.Join(referenceRequest.RootPath, "uncommitted.go"), []byte(uncommitted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	referenceID := buildClaimedBase(t, reference, ClaimedDedicatedBaseRequest{
+		Claim: referenceClaim, RootPath: referenceRequest.RootPath,
+		WorkspaceID: referenceRequest.WorkspaceID, ProjectID: referenceRequest.ProjectID,
+	})
+	if route, reason := claimedRoute(t, referenceLogs); route != "reparse_git_tree" {
+		t.Fatalf("reference route = %q (%s), want the re-parse plan", route, reason)
+	}
+	referenceView := materializeClaimedBase(t, reference, referenceRequest.Identity.GraphID, referenceID)
+	wantNodes, wantEdges := claimedBasePayload(referenceView.Reader)
+	if strings.Join(gotEdges, "\n") != strings.Join(wantEdges, "\n") {
+		t.Fatalf("the store's copy produced different edges from a re-parse:\ngot=%v\nwant=%v", gotEdges, wantEdges)
+	}
+	if strings.Join(gotNodes, "\n") != strings.Join(wantNodes, "\n") {
+		assertOnlyBuiltinStampingDiffers(t, view.Reader, referenceView.Reader)
+	}
+
+	// The symbol FTS projection is part of what a generation carries, and it is
+	// the one the copy has to re-address rather than carry: a docid names one
+	// row of one shared virtual table. A copied base whose corpus were empty
+	// would answer every symbol search with nothing while every other
+	// assertion here stayed green.
+	copied, err := builder.Store.AtGeneration(id).SymbolFTSCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reparsed, err := reference.Store.AtGeneration(referenceID).SymbolFTSCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied == 0 || copied != reparsed {
+		t.Fatalf("the copied base carries %d symbol-FTS documents against the re-parsed base's %d", copied, reparsed)
 	}
 }
 
-// The bulk-load bracket belongs to the payload write this builder OWNS, and
-// only to it. This is the wiring proof in both directions:
+// The absent-primitive clause is still a clause: it is the first thing the
+// predicate asks and it costs nothing at all, so a store that never gains the
+// primitive pays exactly what it paid before this route existed. It is asserted
+// on the predicate directly because no production store can be made to lack the
+// method any more.
+func TestClaimedBaseCopyPlanRefusesWithoutACopyPrimitive(t *testing.T) {
+	builder, request, claim, _ := claimedCopyFixture(t)
+	indexGenerationZero(t, builder, request)
+	handle, err := builder.Store.AtManagedGeneration(claim.GenerationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	take, _, reason := builder.claimedBaseCopyPlan(context.Background(), handle, request.RootPath,
+		request.RepoPrefix, claim.Desire.Identity.TreeOID, claim.Desire.Identity.ExtractorVersions, false)
+	if take || reason != "no generation copy primitive on this store" {
+		t.Fatalf("copy plan = (%v, %q), want the short-circuit on the absent primitive", take, reason)
+	}
+	// The control: the same inputs with a primitive present take the route, so
+	// the refusal above is the primitive clause and not some other one.
+	if take, _, reason := builder.claimedBaseCopyPlan(context.Background(), handle, request.RootPath,
+		request.RepoPrefix, claim.Desire.Identity.TreeOID, claim.Desire.Identity.ExtractorVersions, true); !take {
+		t.Fatalf("copy plan with a primitive = (%v, %q), want the copy route so the clause above is isolated", take, reason)
+	}
+}
+
+// The bulk-load bracket covers BOTH routes of a claimed base build.
 //
-//   - on the copy route the production entry point — not a direct call to the
-//     helper — must open the window on the reserved generation exactly once,
-//     with the window OPEN while the copy runs, and close it exactly once;
-//   - on the re-parse route it must not open one at all, because that route's
-//     payload write happens inside the index pass, which owns the store's bulk
-//     connection through BeginBulkLoad/FlushBulk. FlushBulk closes whatever
-//     bulk connection it finds and then runs a TRUNCATE checkpoint, so a window
-//     opened here would be taken over by a foreign owner and would charge the
-//     build a reader-waiting checkpoint it does not otherwise pay. The
-//     tripwire test below pins that FlushBulk behaviour directly.
-func TestClaimedDedicatedBaseBracketsOnlyThePayloadWriteItOwns(t *testing.T) {
+// It used to cover the copy route only, because an index pass's FlushBulk
+// adopted and closed any window it found — taking it from its owner mid-payload
+// and charging the pass an inline TRUNCATE. FlushBulk now leaves a
+// generation-scoped window alone (pinned by
+// TestAnIndexPassFlushLeavesAGenerationBulkWindowToItsOwner), so the re-parse
+// route gets the same shape the copy route does.
+//
+// Both arms drive the production entry point and assert three things: the
+// window is opened exactly once on the RESERVED generation, it is still open at
+// the pre-publication boundary — which is AFTER the payload write, the
+// enrichment and the masks, so it really did span the write — and it is closed
+// exactly once.
+func TestClaimedDedicatedBaseBracketsBothRoutes(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		copied  bool
-		route   string
-		windows int
+		name  string
+		dirty bool
+		route string
 	}{
-		{name: "copy", copied: true, route: "copy_generation_zero", windows: 1},
-		{name: "reparse", copied: false, route: "reparse_git_tree", windows: 0},
+		{name: "copy", route: "copy_generation_zero"},
+		{name: "reparse", dirty: true, route: "reparse_git_tree"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			builder, request, claim, logs := claimedCopyFixture(t)
 			indexGenerationZero(t, builder, request)
+			if tc.dirty {
+				// An uncommitted edit is the cheapest way to send the build
+				// down the re-parse route without changing anything else: the
+				// re-parse reads the committed tree, so the payload it writes
+				// is the same one the copy arm moves.
+				const dirty = "package dedicated\n\nfunc DirtyOnly() string { return \"dirty\" }\n"
+				if err := os.WriteFile(filepath.Join(request.RootPath, "dirty.go"), []byte(dirty), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			loader := &bulkLoadProbe{}
 			probe := &copyProbe{store: builder.Store, bulk: loader}
-			build := ClaimedDedicatedBaseRequest{
+			openAtPrePublish := make([]bool, 0, 1)
+			id := buildClaimedBase(t, builder, ClaimedDedicatedBaseRequest{
 				Claim: claim, RootPath: request.RootPath, WorkspaceID: request.WorkspaceID,
-				ProjectID: request.ProjectID, BulkLoad: loader,
-			}
-			if tc.copied {
-				build.CopySource = probe
-			}
-			id := buildClaimedBase(t, builder, build)
+				ProjectID: request.ProjectID, BulkLoad: loader, CopySource: probe,
+				PrePublish: func(context.Context, int64) error {
+					openAtPrePublish = append(openAtPrePublish, loader.isOpen())
+					return nil
+				},
+			})
 			if route, reason := claimedRoute(t, logs); route != tc.route {
 				t.Fatalf("route = %q (%s), want %q", route, reason, tc.route)
 			}
-			// The logged route is not the only witness: on the copy arm the
-			// primitive must actually have been reached.
-			if want := map[bool]int{true: 1, false: 0}[tc.copied]; len(probe.calls) != want {
+			// The logged route is not the only witness: the copy primitive
+			// must have been reached on the copy arm and left alone otherwise.
+			if want := map[bool]int{false: 1, true: 0}[tc.dirty]; len(probe.calls) != want {
 				t.Fatalf("copy primitive reached %d time(s), want %d: %+v", len(probe.calls), want, probe.calls)
 			}
 			begun, ended := loader.counts()
-			if len(begun) != tc.windows || ended != tc.windows {
-				t.Fatalf("bulk windows begun=%v closed=%d, want %d begin(s) and %d close(s)",
-					begun, ended, tc.windows, tc.windows)
-			}
-			if tc.windows == 0 {
-				return
+			if len(begun) != 1 || ended != 1 {
+				t.Fatalf("bulk windows begun=%v closed=%d, want exactly one begin and one close on the %s route",
+					begun, ended, tc.name)
 			}
 			if begun[0] != id {
 				t.Fatalf("bulk load begun on generation %d, want the reserved %d", begun[0], id)
+			}
+			if len(openAtPrePublish) != 1 || !openAtPrePublish[0] {
+				t.Fatalf("the window was not open at the pre-publication boundary (%v), so it did not span "+
+					"the %s route's payload write", openAtPrePublish, tc.name)
+			}
+			if tc.dirty {
+				return
 			}
 			if len(probe.openDuringCopy) != 1 || !probe.openDuringCopy[0] {
 				t.Fatalf("the window was not open while the copy ran: %v", probe.openDuringCopy)
 			}
 		})
-	}
-}
-
-// The store's index-pass bracket takes over any open bulk window. This is the
-// reason the generation window is scoped to the copy route, pinned against the
-// REAL store rather than a probe, so the scope decision is a checked fact.
-//
-// If FlushBulk ever learns to leave a generation-scoped window to its owner,
-// this test fails — and that failure is the signal to widen the bracket in
-// BuildClaimedDedicatedBase to the re-parse route as well.
-func TestAnIndexPassFlushTakesOverAGenerationBulkWindow(t *testing.T) {
-	builder, _, claim := privateClaimedDedicatedFixture(t)
-	store := builder.Store
-	opened, err := store.BeginGenerationBulkLoad(claim.GenerationID)
-	if err != nil {
-		t.Fatalf("open the generation window: %v", err)
-	}
-	if !opened {
-		// The claimed-base fixture is an on-disk store with an empty
-		// reservation, which is exactly the shape the window accepts. A
-		// refusal here means the fixture changed under this test, not that
-		// there is nothing to pin.
-		t.Fatal("the fixture store refused a generation bulk window; this test can no longer pin the scope decision")
-	}
-	// This is exactly what runPass reaches at the end of its shadow drain.
-	if err := store.FlushBulk(); err != nil {
-		t.Fatalf("flush the index pass bracket: %v", err)
-	}
-	// A second window can only be opened if the first one is gone: the store
-	// refuses while one is held. So this returning true IS the theft.
-	stolen, err := store.BeginGenerationBulkLoad(claim.GenerationID)
-	if err != nil {
-		t.Fatalf("reopen the generation window after a flush: %v", err)
-	}
-	if !stolen {
-		t.Fatal("FlushBulk no longer closes a generation-scoped bulk window: " +
-			"widen the bracket in BuildClaimedDedicatedBase to cover the re-parse route " +
-			"and delete this test")
-	}
-	if err := store.EndGenerationBulkLoad(); err != nil {
-		t.Fatalf("close the reopened window: %v", err)
 	}
 }
 
