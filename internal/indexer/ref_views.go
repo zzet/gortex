@@ -231,6 +231,23 @@ type RefViewManagerConfig struct {
 	// Gate holds a claimed build's pass while the daemon warms up. nil admits
 	// every build at once, which is what a manager outside a warmup has.
 	Gate *ViewBuildGate
+	// RequestBase asks the committed-base publisher for the base of one
+	// repository because a ref view of it now needs one.
+	//
+	// It is the ref view's half of the committed-base consumer gate. The
+	// startup publisher and the live advance trigger both decline a family
+	// with no reader (InitialBasePublisher.publish's "no dependent checkout"
+	// skip), and a ref view IS one of the two readers that gate counts
+	// (CheckoutLifecycle.dedicatedBaseConsumers) — so a view created on a
+	// running daemon whose family has no other consumer finds generation 0 and
+	// nothing would ever publish for it. This is what asks.
+	//
+	// The same shape a checkout coordinator is wired with
+	// (CheckoutCoordinatorConfig.RequestBase): it takes the repository prefix,
+	// must never publish on the caller's goroutine and must never block. nil
+	// asks nothing, which is the manager a test or a non-lifecycle caller
+	// builds, and leaves the view exactly in the legacy regime it had before.
+	RequestBase func(repoPrefix string)
 
 	// buildBarrier is a test seam: it runs between a build pass finishing and
 	// the publish step re-resolving the selector, which is exactly the window
@@ -288,6 +305,21 @@ type RefViewManager struct {
 
 	buildBarrier func()
 
+	// requestBase is RefViewManagerConfig.RequestBase; nil asks nothing.
+	requestBase func(string)
+	// baseDemandMu guards the throttle below. It is its own lock because the
+	// ask happens on a selection's goroutine, before anything else the
+	// selection does, and many selections run at once.
+	baseDemandMu sync.Mutex
+	// lastBaseDemand is when this manager last asked for one repository's
+	// committed base. Keyed by repository prefix rather than held as a single
+	// stamp because base() derives the prefix from the graph row it just read:
+	// a manager is cached per repository today, and a throttle that assumed it
+	// would silently start starving the second repository if that ever stopped
+	// being true. Stamps older than the interval are dropped as they are
+	// passed, so the map holds only what it can still refuse.
+	lastBaseDemand map[string]time.Time
+
 	buildGrace     time.Duration
 	buildHeartbeat time.Duration
 	buildLiveness  time.Duration
@@ -330,6 +362,8 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 		identityKeys:      map[string]refViewIdentityKeys{},
 		identityRefused:   map[string]refViewIdentityKeys{},
 		buildBarrier:      cfg.buildBarrier,
+		requestBase:       cfg.RequestBase,
+		lastBaseDemand:    map[string]time.Time{},
 		buildGrace:        refViewWindow(cfg.buildGrace, refViewBuildGrace),
 		buildHeartbeat:    refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
 		buildLiveness:     refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
@@ -380,7 +414,7 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 		return RefViewResult{}, err
 	}
 	defer release()
-	base, err := m.base(ctx, req.GraphID)
+	base, owedBase, err := m.base(ctx, req.GraphID)
 	if err != nil {
 		return RefViewResult{}, err
 	}
@@ -394,6 +428,36 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 	if err != nil {
 		return m.failed(ctx, view, err)
 	}
+
+	// The ask for a committed base the family has not published, placed HERE
+	// and not where the absence was noticed (m.base, above).
+	//
+	// AFTER m.row, because the publication it triggers is itself
+	// consumer-gated and THIS view is the consumer: InitialBasePublisher.publish
+	// re-reads the census (CheckoutLifecycle.dedicatedBaseConsumers, whose ref
+	// view arm is ListRefViews(graph) len > 0) on the publisher's own worker.
+	// Asking before the row is written races that worker: it sees zero ref
+	// views, skips with "no dependent checkout", and the ask is SPENT — the
+	// publisher's pending list no longer holds the prefix and the throttle
+	// below refuses the next one for dedicatedBaseDemandInterval. Since
+	// nothing re-selects a ref view on its own, a one-shot client could end
+	// with no base published at all. The row is committed by the time m.row
+	// returns, so a publication demanded from here always finds its consumer.
+	//
+	// AFTER resolution, because a selector naming a ref that does not exist
+	// must not trigger the daemon's single largest write. That selection
+	// returns through m.failed above; the row it leaves behind makes the
+	// family a census consumer, so the base is still owed and the next
+	// publication attempt — a HEAD movement, a daemon start, or the next
+	// selection that actually resolves — will publish it.
+	//
+	// It changes nothing about THIS selection either way: the publication is
+	// queued on the publisher's own list and built off this goroutine, this
+	// view is built over generation 0, and when the base lands the view
+	// re-selects onto it — the build fingerprint carries the base
+	// (refViewBuildFingerprint over identity), so activeIsCurrent says no and
+	// the next selection rebuilds over the published base.
+	m.demandCommittedBase(owedBase)
 
 	identity := m.identity(ctx, req, viewID, base, resolved.TreeOID)
 	fingerprint := refViewBuildFingerprint(identity, req.EnrichmentProfile)
@@ -485,16 +549,87 @@ func (m *RefViewManager) validate(req *RefViewRequest) error {
 	return nil
 }
 
-// base resolves the corpus a view's layer sits on.
-func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase, error) {
+// base resolves the corpus a view's layer sits on, and names the repository
+// that is OWED a committed base because the graph has published none.
+//
+// It only names it: base is a read and stays one. The ask itself belongs
+// strictly later in the selection, after the view's catalog row exists — see
+// EnsureRefView's demand paragraph for why the order is load-bearing.
+//
+// A graph whose base is already a published generation returns an empty
+// prefix, which is what "nothing to ask for" is.
+func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase, string, error) {
 	dedicated, found, err := m.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
-		return primaryBase{}, err
+		return primaryBase{}, "", err
 	}
 	if !found {
-		return primaryBase{}, fmt.Errorf("indexer: graph %s has no dedicated-graph row to build over", graphID)
+		return primaryBase{}, "", fmt.Errorf("indexer: graph %s has no dedicated-graph row to build over", graphID)
 	}
-	return graphBase(ctx, m.catalog, dedicated)
+	base, err := graphBase(ctx, m.catalog, dedicated)
+	if err != nil || base.generationID != 0 {
+		return base, "", err
+	}
+	// graphBase's SECOND arm: the graph has published no generation, so this
+	// view composes over the shared indexed corpus — which is rewritten IN
+	// PLACE as the primary moves (pinRoutedBase's LEGACY REGIME paragraph).
+	// That is a supported regime and the selection carries on in it,
+	// truthfully; what it must not be is PERMANENT.
+	//
+	// Since the committed base became consumer-gated, nothing publishes for a
+	// family whose only reader is a ref view unless something asks: a daemon
+	// start and a HEAD movement both decline ("no dependent checkout"), and
+	// dedicatedBaseConsumers counts this view only once a publication is
+	// already being attempted. A view created on a running daemon would
+	// therefore wait for the next HEAD movement or the next daemon start,
+	// unbounded on an idle-HEAD repository.
+	return base, dedicated.RepoPrefix, nil
+}
+
+// demandCommittedBase asks the publisher for one repository's committed base,
+// at most once per dedicatedBaseDemandInterval.
+//
+// The throttle is not a de-duplicator — InitialBasePublisher.RequestBase
+// already coalesces onto a queued request, so a burst costs one queue lookup
+// each. It bounds the case the coalescing cannot: a publication that was
+// ATTEMPTED and failed leaves nothing queued, and selection is the only thing
+// that ever notices a ref moved, so a client polling a building view would
+// otherwise re-enter the whole publication protocol (including the authority
+// claim, which writes) once per poll for as long as the failure lasts.
+//
+// Same interval as the dependent checkout's ask, and for the same reason: the
+// two are one policy about how often a reader may re-ask for a base that is
+// not there.
+func (m *RefViewManager) demandCommittedBase(repoPrefix string) {
+	if m == nil || m.requestBase == nil || repoPrefix == "" {
+		return
+	}
+	now := time.Now()
+	m.baseDemandMu.Lock()
+	if m.lastBaseDemand == nil {
+		// A manager built by struct literal rather than by NewRefViewManager
+		// (no test does today, and the constructor is the only production
+		// door) still throttles instead of panicking on the write below.
+		m.lastBaseDemand = map[string]time.Time{}
+	}
+	// Drop stamps the throttle can no longer act on. An entry older than the
+	// interval refuses nothing, so deleting it changes no decision, and it
+	// keeps a map written on a CLIENT-DRIVEN path from being unbounded: the
+	// map holds at most the repositories asked for within the last interval,
+	// however many prefixes a manager is ever handed. The scan is over that
+	// same tiny set, on a path that runs at most once per selection.
+	for prefix, at := range m.lastBaseDemand {
+		if now.Sub(at) >= dedicatedBaseDemandInterval {
+			delete(m.lastBaseDemand, prefix)
+		}
+	}
+	if last, asked := m.lastBaseDemand[repoPrefix]; asked && now.Sub(last) < dedicatedBaseDemandInterval {
+		m.baseDemandMu.Unlock()
+		return
+	}
+	m.lastBaseDemand[repoPrefix] = now
+	m.baseDemandMu.Unlock()
+	m.requestBase(repoPrefix)
 }
 
 // activeIsCurrent reports whether the generation the view already serves was

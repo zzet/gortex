@@ -784,7 +784,7 @@ func TestRefViewReclaimsAnAbandonedClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed the ref view: %v", err)
 	}
-	base, err := manager.base(ctx, req.GraphID)
+	base, _, err := manager.base(ctx, req.GraphID)
 	if err != nil {
 		t.Fatalf("read the base: %v", err)
 	}
@@ -994,7 +994,7 @@ func TestRefViewIdentityCarriesTheCohortAndTheDerivedResolverVersion(t *testing.
 	manager := f.manager(t, nil)
 	ctx := context.Background()
 	req := f.request("refs/heads/main")
-	base, err := manager.base(ctx, req.GraphID)
+	base, _, err := manager.base(ctx, req.GraphID)
 	if err != nil {
 		t.Fatalf("read the base: %v", err)
 	}
@@ -1088,7 +1088,7 @@ func TestRefViewWidenedDigestReachesTheProductionManagerShape(t *testing.T) {
 	f := newRefViewFixture(t)
 	ctx := context.Background()
 	req := f.request("refs/heads/main")
-	base, err := f.manager(t, nil).base(ctx, req.GraphID)
+	base, _, err := f.manager(t, nil).base(ctx, req.GraphID)
 	if err != nil {
 		t.Fatalf("read the base: %v", err)
 	}

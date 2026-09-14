@@ -149,6 +149,26 @@ func (l *CheckoutLifecycle) refViewManager(repoPrefix string, idx *Indexer) (*Re
 		Leases:            l.leases,
 		Logger:            l.logger,
 		Gate:              l.buildGate(),
+		// The ref view's half of the committed-base consumer gate, wired the
+		// same way buildCoordinator wires a dependent checkout's.
+		//
+		// A ref view IS a consumer of the base — dedicatedBaseConsumers counts
+		// one, because RefViewManager.base resolves its lower snapshot through
+		// the same graphBase a commit layer does — so the moment a selection
+		// finds the graph has published none, the family has a reader and the
+		// publication the startup path deferred is owed. Without this a view
+		// created on a running daemon whose family has no dependent checkout
+		// composes over mutable generation 0 until the next HEAD movement or
+		// the next daemon start, and on an idle-HEAD repository that is
+		// forever.
+		//
+		// The reason names no graph: the manager is cached per repository for
+		// the life of the daemon and serves every ref view of it, so a graph
+		// id captured here would be whichever one happened to build it.
+		// requestDedicatedBase logs the prefix the closure is handed.
+		RequestBase: func(prefix string) {
+			l.requestDedicatedBase(prefix, "a ref view composes over an unpublished primary")
+		},
 	})
 	if err != nil {
 		return nil, err
