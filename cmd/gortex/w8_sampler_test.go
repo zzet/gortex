@@ -136,8 +136,13 @@ type w8FileSizes struct {
 
 // w8Sample is one line of samples.ndjson.
 type w8Sample struct {
-	T                string  `json:"t"`
-	Phase            string  `json:"phase"`
+	T     string `json:"t"`
+	Phase string `json:"phase"`
+	// Window names the sub-window of the phase this sample was taken in, or
+	// "" outside one. A phase that performs its own stimulus — a commit, a
+	// track, a poll — needs the series cut where the stimulus was, otherwise
+	// the phase's name is a claim about work the phase did not do.
+	Window           string  `json:"window,omitempty"`
 	ElapsedSeconds   float64 `json:"elapsed_s"`
 	PID              int     `json:"pid"`
 	LogicalWrites    *uint64 `json:"ri_logical_writes,omitempty"`
@@ -152,7 +157,13 @@ type w8Sample struct {
 	WALCheckpointSeq uint32  `json:"wal_ckpt_seq"`
 	WALSalt1         uint32  `json:"wal_salt1"`
 	WALResets        int     `json:"wal_resets"`
-	Error            string  `json:"error,omitempty"`
+	// CheckpointBytes is the running total of logical writes this sampler
+	// attributed to WAL checkpoints: the logical-write delta of every sample
+	// on which wal_resets moved. It is a derived series and is written into
+	// the stream so the same reduction can be recomputed offline from the
+	// samples of a run whose report predates the field.
+	CheckpointBytes uint64 `json:"wal_checkpoint_bytes_cumulative,omitempty"`
+	Error           string `json:"error,omitempty"`
 	// Unwired names every reader this sampler was never given. A sampler with
 	// a missing wiring cannot produce the series that reader feeds, and the
 	// only honest report of that is the reader's name — not the zero value the
@@ -176,9 +187,20 @@ type w8Sampler struct {
 	out     io.Writer
 	start   time.Time
 	phase   string
+	window  string
 	samples int
 	counter w8CheckpointCounter
 	failed  int
+
+	// The checkpoint-bytes derivation, carried across samples: the previous
+	// sample's cumulative logical writes and reset count. A sample on which
+	// the reset count moved had a checkpoint inside its interval, so its
+	// logical-write delta is booked to the checkpoint rather than to the
+	// phase's own work.
+	lastLogical     uint64
+	haveLastLogical bool
+	lastResets      int
+	checkpointBytes uint64
 }
 
 // newW8Sampler builds a sampler with no readers. Every reader is wired by the
@@ -207,7 +229,16 @@ func newW8Sampler(out io.Writer, interval time.Duration) *w8Sampler {
 func (s *w8Sampler) SetPhase(phase string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.phase = phase
+	s.phase, s.window = phase, ""
+}
+
+// SetWindow labels every subsequent sample with a sub-window of the current
+// phase. SetPhase clears it, so a window can never leak past the phase that
+// opened it.
+func (s *w8Sampler) SetWindow(window string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.window = window
 }
 
 // Resets is the running WAL-reset count; Samples and Failures describe the
@@ -222,6 +253,15 @@ func (s *w8Sampler) Samples() (samples, failures int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.samples, s.failed
+}
+
+// CheckpointBytes is the running total of logical writes booked to WAL
+// checkpoints. A window's cost is the difference of two readings, exactly as
+// Resets is.
+func (s *w8Sampler) CheckpointBytes() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checkpointBytes
 }
 
 // Sample takes and writes exactly one sample. Run calls it on a ticker; a
@@ -248,6 +288,7 @@ func (s *w8Sampler) Sample() w8Sample {
 	sample := w8Sample{
 		T:              s.now().UTC().Format(time.RFC3339Nano),
 		Phase:          s.phase,
+		Window:         s.window,
 		ElapsedSeconds: s.now().Sub(s.start).Seconds(),
 		PID:            pid,
 		StoreBytes:     sizes.Store,
@@ -273,6 +314,24 @@ func (s *w8Sampler) Sample() w8Sample {
 		sample.LogicalWrites = usage.LogicalBytesWritten
 	}
 	sample.WALResets = s.counter.Resets()
+	// Book this interval's logical writes to the checkpoint when the log was
+	// restarted inside it. The attribution is per sample interval, so it is as
+	// coarse as the sample rate: a phase whose own work runs concurrently with
+	// a drain has that work booked to the drain too. That coarseness is why
+	// this series is reported beside the total rather than in place of it, and
+	// why only the low-activity phases are judged on it.
+	if sample.LogicalWrites == nil {
+		// A sample with no reading breaks the chain: the next delta would span
+		// a gap nobody measured, and a gap is not a checkpoint.
+		s.haveLastLogical = false
+	} else {
+		if s.haveLastLogical && sample.WALResets > s.lastResets && *sample.LogicalWrites > s.lastLogical {
+			s.checkpointBytes += *sample.LogicalWrites - s.lastLogical
+		}
+		s.lastLogical, s.haveLastLogical = *sample.LogicalWrites, true
+	}
+	s.lastResets = sample.WALResets
+	sample.CheckpointBytes = s.checkpointBytes
 	// A missing wiring is an unavailability with a name, and it counts against
 	// the series' own health exactly like a failed read: a phase whose sampler
 	// was never wired must not present itself as a phase that measured zero.
@@ -358,6 +417,7 @@ const (
 	w8BucketTelemetry    = "telemetry"
 	w8BucketGitignore    = "gitignore"
 	w8BucketConfig       = "config"
+	w8BucketQueryLog     = "query_log"
 	w8BucketCache        = "cache"
 	w8BucketData         = "data"
 	w8BucketFixtureGit   = "fixture_git"
@@ -382,6 +442,12 @@ func w8ClassifyPath(rel string) string {
 	case strings.Contains(base, ".sqlite"):
 		// Every other SQLite file under the root: the daemon's sidecars.
 		return w8BucketSidecar
+	case strings.HasPrefix(base, "query-log"):
+		// internal/mcp/query_log.go:126 puts query-log.jsonl under the cache
+		// dir. Folding it into `cache` hid a per-call write behind a bucket
+		// named for something disposable, which is exactly the attribution an
+		// idle floor has to be read off.
+		return w8BucketQueryLog
 	case strings.Contains(rel, "/models/"):
 		// The embedding model is materialised under the data dir even with
 		// --embeddings=false; tens of megabytes that are not store traffic.
@@ -473,6 +539,87 @@ func w8WalkCensus(root string) (w8Census, error) {
 		return census.Unclassified[i].Path < census.Unclassified[j].Path
 	})
 	return census, err
+}
+
+// ------------------------------------------------- checkpoint attribution ---
+
+// w8SampleSeries is what a samples stream reduces to once the checkpoint
+// intervals are separated from the rest: bytes booked to a WAL checkpoint, per
+// phase and per phase/window.
+//
+// The reduction is defined on the stream rather than only inside the running
+// sampler on purpose: a run whose report predates the series — every artifact
+// already frozen — still carries its samples.ndjson, and the same rule applied
+// to those bytes yields the same numbers. A derived series that can only be
+// produced live is a series nobody can check.
+type w8SampleSeries struct {
+	// Phases maps phase name to bytes booked to checkpoints inside it.
+	Phases map[string]uint64 `json:"phases"`
+	// Windows maps "<phase>/<window>" to the same, for the sub-windows a
+	// phase cut its own stimulus into.
+	Windows map[string]uint64 `json:"windows,omitempty"`
+	// Samples and Attributed say how much of the stream the rule saw and how
+	// many intervals it booked, so a zero can be told apart from a series the
+	// rule never got to look at.
+	Samples    int `json:"samples"`
+	Attributed int `json:"attributed_intervals"`
+}
+
+// w8WindowKey is the name a sub-window is reported under.
+func w8WindowKey(phase, window string) string { return phase + "/" + window }
+
+// w8CheckpointSeries books each sample interval on which wal_resets moved to
+// that sample's phase (and window). A sample with no logical-writes reading
+// breaks the chain: the next interval would span a gap nobody measured.
+func w8CheckpointSeries(samples []w8Sample) w8SampleSeries {
+	series := w8SampleSeries{Phases: map[string]uint64{}, Windows: map[string]uint64{}, Samples: len(samples)}
+	var lastLogical uint64
+	haveLast := false
+	lastResets := 0
+	seeded := false
+	for _, sample := range samples {
+		if sample.LogicalWrites == nil {
+			haveLast = false
+			lastResets, seeded = sample.WALResets, true
+			continue
+		}
+		if haveLast && seeded && sample.WALResets > lastResets && *sample.LogicalWrites > lastLogical {
+			delta := *sample.LogicalWrites - lastLogical
+			series.Phases[sample.Phase] += delta
+			if sample.Window != "" {
+				series.Windows[w8WindowKey(sample.Phase, sample.Window)] += delta
+			}
+			series.Attributed++
+		}
+		lastLogical, haveLast = *sample.LogicalWrites, true
+		lastResets, seeded = sample.WALResets, true
+	}
+	return series
+}
+
+// w8ReadSamples parses a samples.ndjson stream. A truncated last line is
+// tolerated — a run killed mid-sample still has every sample before it — and
+// reported by count rather than swallowed.
+func w8ReadSamples(path string) ([]w8Sample, int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	var samples []w8Sample
+	skipped := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var sample w8Sample
+		if err := json.Unmarshal([]byte(line), &sample); err != nil {
+			skipped++
+			continue
+		}
+		samples = append(samples, sample)
+	}
+	return samples, skipped, nil
 }
 
 // -------------------------------------------------------------- manifest ---
@@ -1129,5 +1276,150 @@ func TestW8ProcessIOSamplerReadsThisProcess(t *testing.T) {
 	}
 	if last.PhysFootprint == 0 || last.UserTimeNS == 0 {
 		t.Errorf("extended rusage fields are empty: %+v", last)
+	}
+}
+
+// ----------------------------------------- checkpoint-attribution tests ---
+
+// w8ScriptedSampler wires a sampler to a scripted series of process-IO and WAL
+// readings, so the checkpoint attribution can be exercised without a daemon.
+func w8ScriptedSampler(out io.Writer, logical []uint64, headers []w8WALHeader) *w8Sampler {
+	sampler := newW8Sampler(out, time.Hour)
+	tick := 0
+	sampler.pid = func() int { return 4242 }
+	sampler.readSize = func() w8FileSizes { return w8FileSizes{} }
+	// Sample() reads the WAL header before the process counters, so the tick
+	// advances on the LAST reader: both must describe the same instant.
+	sampler.readWAL = func() (w8WALHeader, error) {
+		return headers[min(tick, len(headers)-1)], nil
+	}
+	sampler.readIO = func() (issue767ProcessIO, error) {
+		value := logical[min(tick, len(logical)-1)]
+		tick++
+		return issue767ProcessIO{LogicalBytesWritten: &value, StartTicks: 1}, nil
+	}
+	return sampler
+}
+
+// TestW8SamplerBooksOnlyTheCheckpointIntervalToTheCheckpointSeries is the
+// derivation §F5(1) rests on: bytes written in the interval a WAL reset landed
+// in are the checkpoint's; everything else is the phase's own work.
+//
+// The numbers are the frozen candidate_rep2 P2 row: 58,040,984 total, of which
+// 42,607,016 is one drain, leaving 15,433,968 — 0.91x of the baseline's
+// 16,879,664, inside the ceiling the total-series reading put it 3.44x outside.
+func TestW8SamplerBooksOnlyTheCheckpointIntervalToTheCheckpointSeries(t *testing.T) {
+	present := func(seq uint32) w8WALHeader { return w8WALHeader{Present: true, CheckpointSeq: seq, Salt1: 0x1111} }
+	// Four intervals: work, work, the drain, work.
+	logical := []uint64{0, 5_000_000, 10_000_000, 52_607_016, 58_040_984}
+	headers := []w8WALHeader{present(0), present(0), present(0), present(1), present(1)}
+	var out bytes.Buffer
+	sampler := w8ScriptedSampler(&out, logical, headers)
+	sampler.SetPhase("P2_small_edits")
+	for range logical {
+		sampler.Sample()
+	}
+	if got := sampler.CheckpointBytes(); got != 42_607_016 {
+		t.Fatalf("checkpoint bytes = %d, want the 42,607,016 of the drain interval alone", got)
+	}
+	if got := sampler.Resets(); got != 1 {
+		t.Fatalf("wal resets = %d, want 1", got)
+	}
+	total := logical[len(logical)-1]
+	excluded := w8ExcludeCheckpoint(&total, sampler.CheckpointBytes())
+	if excluded == nil || *excluded != 15_433_968 {
+		t.Fatalf("excluded series = %v, want 15,433,968", excluded)
+	}
+	// The same rule applied offline to the stream it just wrote must agree:
+	// the derived series is not allowed to exist only inside the process.
+	samples, skipped, err := w8ReadSamplesFromString(out.String())
+	if err != nil || skipped != 0 {
+		t.Fatalf("stream re-read: err=%v skipped=%d", err, skipped)
+	}
+	series := w8CheckpointSeries(samples)
+	if series.Phases["P2_small_edits"] != 42_607_016 || series.Attributed != 1 {
+		t.Fatalf("offline reduction = %+v, want one 42,607,016 interval", series)
+	}
+}
+
+// w8ReadSamplesFromString is w8ReadSamples over an in-memory stream.
+func w8ReadSamplesFromString(stream string) ([]w8Sample, int, error) {
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("w8-samples-%d.ndjson", time.Now().UnixNano()))
+	if err := os.WriteFile(path, []byte(stream), 0o600); err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = os.Remove(path) }()
+	return w8ReadSamples(path)
+}
+
+// TestW8CheckpointSeriesAttributesPerPhaseAndPerWindow pins the offline rule,
+// including the sub-window attribution the P4 split depends on, and the gap
+// rule: a sample with no reading breaks the chain rather than producing a
+// delta that spans a hole.
+func TestW8CheckpointSeriesAttributesPerPhaseAndPerWindow(t *testing.T) {
+	value := func(v uint64) *uint64 { return &v }
+	samples := []w8Sample{
+		{Phase: "P4_amend_same_tree", Window: "P4a_commit_tree_change", LogicalWrites: value(100), WALResets: 0},
+		{Phase: "P4_amend_same_tree", Window: "P4a_commit_tree_change", LogicalWrites: value(200), WALResets: 0},
+		{Phase: "P4_amend_same_tree", Window: "P4a_commit_tree_change", LogicalWrites: value(900), WALResets: 1},
+		{Phase: "P4_amend_same_tree", Window: "P4b_amend_same_tree", LogicalWrites: value(950), WALResets: 1},
+		{Phase: "P4_amend_same_tree", Window: "P4b_amend_same_tree", LogicalWrites: nil, WALResets: 1},
+		// The chain is broken, so this interval is not booked even though the
+		// reset count moved: nobody measured the bytes it would claim.
+		{Phase: "P4_amend_same_tree", Window: "P4b_amend_same_tree", LogicalWrites: value(9000), WALResets: 2},
+		{Phase: "P8_idle_warm", LogicalWrites: value(9100), WALResets: 2},
+		{Phase: "P8_idle_warm", LogicalWrites: value(9500), WALResets: 3},
+	}
+	series := w8CheckpointSeries(samples)
+	if series.Phases["P4_amend_same_tree"] != 700 {
+		t.Fatalf("P4 checkpoint bytes = %d, want the 700 of the reset interval", series.Phases["P4_amend_same_tree"])
+	}
+	if series.Windows[w8WindowKey("P4_amend_same_tree", "P4a_commit_tree_change")] != 700 {
+		t.Fatalf("the commit window did not take the drain: %+v", series.Windows)
+	}
+	if _, ok := series.Windows[w8WindowKey("P4_amend_same_tree", "P4b_amend_same_tree")]; ok {
+		t.Fatalf("the amend window was charged for a drain it did not carry: %+v", series.Windows)
+	}
+	if series.Phases["P8_idle_warm"] != 400 {
+		t.Fatalf("P8 checkpoint bytes = %d, want 400", series.Phases["P8_idle_warm"])
+	}
+	if series.Attributed != 2 || series.Samples != len(samples) {
+		t.Fatalf("series health = %+v", series)
+	}
+}
+
+// TestW8SamplerWindowLabelsTheStreamAndClearsOnPhaseChange pins the sub-window
+// label: a window may never outlive the phase that opened it, otherwise a
+// later phase's samples would be attributed to a window that closed.
+func TestW8SamplerWindowLabelsTheStreamAndClearsOnPhaseChange(t *testing.T) {
+	var out bytes.Buffer
+	sampler := w8ScriptedSampler(&out, []uint64{0, 1, 2}, []w8WALHeader{{Present: true}, {Present: true}, {Present: true}})
+	sampler.SetPhase("P4_amend_same_tree")
+	sampler.SetWindow(w8WindowCommitTreeChange)
+	first := sampler.Sample()
+	sampler.SetPhase("P5_main_advance")
+	second := sampler.Sample()
+	if first.Window != w8WindowCommitTreeChange {
+		t.Fatalf("first sample window = %q", first.Window)
+	}
+	if second.Window != "" || second.Phase != "P5_main_advance" {
+		t.Fatalf("the window leaked past its phase: %+v", second)
+	}
+}
+
+// TestW8ClassifyPathSeparatesTheQueryLogFromTheCache pins the attribution
+// correction §F5(3) needs: query-log.jsonl lives under the cache dir
+// (internal/mcp/query_log.go:126) and was being counted as disposable cache,
+// which is exactly the per-call write an idle floor has to be read off.
+func TestW8ClassifyPathSeparatesTheQueryLogFromTheCache(t *testing.T) {
+	for _, tc := range []struct{ rel, want string }{
+		{"cache/gortex/query-log.jsonl", w8BucketQueryLog},
+		{"cache/gortex/query-log.jsonl.1", w8BucketQueryLog},
+		{"cache/gortex/searcher.bin", w8BucketCache},
+		{"data/gortex/sidecar.sqlite-wal", w8BucketSidecar},
+	} {
+		if got := w8ClassifyPath(tc.rel); got != tc.want {
+			t.Errorf("w8ClassifyPath(%q) = %q, want %q", tc.rel, got, tc.want)
+		}
 	}
 }

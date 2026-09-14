@@ -54,6 +54,42 @@ type issue767Fixture struct {
 	log        *os.File
 	run        int
 	lastOutput string
+	// clientCalls counts every invocation of the measured binary this fixture
+	// made — the harness's own traffic against the daemon. An "idle" window is
+	// only idle if this number does not move inside it, and a floor attributed
+	// to the daemon while a client was polling it twelve times is not a floor.
+	// It is counted in tryCommand because that is the single door every CLI
+	// call goes through, including the ones awaitSymbol makes on the harness's
+	// behalf, which a caller-side counter cannot see.
+	clientCalls int
+}
+
+// issue767FixtureOption adjusts how the private daemon is configured before it
+// is started. Options exist for the knobs a measurement must be able to state
+// and vary; everything else about the isolation is fixed.
+type issue767FixtureOption func(*issue767FixtureOptions)
+
+// issue767ProductReconcileInterval selects the product's own reconcile
+// interval by leaving GORTEX_RECONCILE_INTERVAL unset, so a confirmatory arm
+// can be run at the default the shipped daemon uses.
+const issue767ProductReconcileInterval = "default"
+
+// issue767DefaultTestReconcileInterval is what the measurement harnesses have
+// always run with: a 5 s janitor, 720x faster than the product default, which
+// accelerates reconciliation so a 60 s window sees it at all. It is a
+// measurement choice and every artifact taken under it says so.
+const issue767DefaultTestReconcileInterval = "5s"
+
+type issue767FixtureOptions struct {
+	reconcileInterval string
+}
+
+// issue767WithReconcileInterval sets GORTEX_RECONCILE_INTERVAL for the private
+// daemon. The empty string keeps the harness default (5s);
+// issue767ProductReconcileInterval omits the variable entirely so the product
+// default applies.
+func issue767WithReconcileInterval(interval string) issue767FixtureOption {
+	return func(o *issue767FixtureOptions) { o.reconcileInterval = interval }
 }
 
 func newIssue767Fixture(t *testing.T, binary string) *issue767Fixture {
@@ -65,8 +101,15 @@ func newIssue767Fixture(t *testing.T, binary string) *issue767Fixture {
 // contents supplied by the caller. The private root, environment, gitconfig,
 // first commit and tracking configuration are identical either way: a harness
 // may change what the repository contains, never how it is isolated.
-func newIssue767FixtureWithCorpus(t *testing.T, binary string, corpus issue767Corpus) *issue767Fixture {
+func newIssue767FixtureWithCorpus(t *testing.T, binary string, corpus issue767Corpus, opts ...issue767FixtureOption) *issue767Fixture {
 	t.Helper()
+	settings := issue767FixtureOptions{reconcileInterval: issue767DefaultTestReconcileInterval}
+	for _, opt := range opts {
+		opt(&settings)
+	}
+	if settings.reconcileInterval == "" {
+		settings.reconcileInterval = issue767DefaultTestReconcileInterval
+	}
 	parent := os.Getenv("GORTEX_ISSUE767_ARTIFACT_DIR")
 	preserve := parent != ""
 	if !preserve {
@@ -101,12 +144,15 @@ func newIssue767FixtureWithCorpus(t *testing.T, binary string, corpus issue767Co
 	}
 	f.env = append(f.env,
 		"XDG_CONFIG_HOME="+filepath.Join(root, "config"), "XDG_DATA_HOME="+filepath.Join(root, "data"), "XDG_CACHE_HOME="+filepath.Join(root, "cache"),
-		"GORTEX_DAEMON_PPROF_ADDR=127.0.0.1:0", "GORTEX_RECONCILE_INTERVAL=5s",
+		"GORTEX_DAEMON_PPROF_ADDR=127.0.0.1:0",
 		// Telemetry is off by default and dormant without an endpoint, but a
 		// measured run states it: the consent/rollup files under the private
 		// data dir are writes like any other.
 		"GORTEX_TELEMETRY=0",
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+filepath.Join(root, "gitconfig"), "GIT_TERMINAL_PROMPT=0", "GOWORK=off", "NO_COLOR=1", "CI=1")
+	if settings.reconcileInterval != issue767ProductReconcileInterval {
+		f.env = append(f.env, "GORTEX_RECONCILE_INTERVAL="+settings.reconcileInterval)
+	}
 	f.write(filepath.Join(root, "gitconfig"), "[user]\n\tname = Issue767 Test\n\temail = issue767@example.invalid\n[commit]\n\tgpgsign = false\n")
 	corpus(f)
 	f.git(f.primary, "init", "-b", "main")
@@ -180,6 +226,9 @@ func (f *issue767Fixture) tryCommand(timeout time.Duration, dir string, args ...
 	defer cancel()
 	cmd := exec.CommandContext(ctx, f.binary, args...)
 	cmd.Dir, cmd.Env = dir, f.env
+	f.mu.Lock()
+	f.clientCalls++
+	f.mu.Unlock()
 	output, err := cmd.CombinedOutput()
 	tail := string(output)
 	if len(tail) > 4096 {
@@ -189,6 +238,15 @@ func (f *issue767Fixture) tryCommand(timeout time.Duration, dir string, args ...
 	f.lastOutput = tail
 	f.mu.Unlock()
 	return output, err
+}
+
+// clientCallCount is the number of CLI invocations this fixture has made. A
+// window's delta is the client traffic that window carried, which is what
+// separates a daemon's idle floor from a poller's cost.
+func (f *issue767Fixture) clientCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.clientCalls
 }
 
 // lastResponse is the tail of the most recent CLI response, read under the
@@ -458,12 +516,30 @@ func issue767SearchRequest(root, name string, spelling issue767Spelling) map[str
 // generation fails the rule. Which corpus served the answer is recorded
 // separately (issue767Answer.Prefix) rather than asserted — a measurement, not
 // a contract the harness invents.
+// errIssue767Inexact marks the half of that rule that means "ask again", not
+// "this is wrong".
+//
+// A fallback rider (`base_changed`, `route_moved`) and a missing exact label
+// are the product telling the truth about a view that is still moving:
+// view_request.go labels the answer instead of blocking, and the label clears
+// on its own in well under a second once the base settles. A caller that
+// polls — awaitSymbol and every bounded await built on it — must retry those;
+// a caller that judges an answer once must know it has not been given a
+// judgeable one. Distinguishing them is not a relaxation: the rule that an
+// automatic checkout must prove exact freshness is unchanged, and an answer
+// that comes out of the wrong file is still a flat failure.
+var errIssue767Inexact = errors.New("view answered inexactly; the answer is not judgeable yet")
+
+// issue767Inexact reports whether an error from issue767Verdict (or from a
+// helper built on it) is the retryable kind.
+func issue767Inexact(err error) bool { return errors.Is(err, errIssue767Inexact) }
+
 func issue767Verdict(answer issue767Answer, spelling issue767Spelling) (bool, error) {
 	if answer.Fallback {
-		return false, errors.New("search returned fallback or tool error")
+		return false, fmt.Errorf("search returned fallback or tool error: %w", errIssue767Inexact)
 	}
 	if spelling == issue767AsAutomaticWorktree && !answer.Exact {
-		return false, errors.New("automatic checkout search did not prove exact freshness")
+		return false, fmt.Errorf("automatic checkout search did not prove exact freshness: %w", errIssue767Inexact)
 	}
 	if answer.Found && !answer.FromExpectedFile {
 		return false, errors.New("symbol did not belong to selected source file and repository")
@@ -531,6 +607,69 @@ func issue767JSONPrefix(value any, name, file string) string {
 		}
 	}
 	return ""
+}
+
+// issue767Probe is one bounded question and everything the harness needs to
+// say what happened: the last answer, whether the rule could be applied to it
+// at all, how many times it had to ask, and how long it waited.
+type issue767Probe struct {
+	Answer    issue767Answer `json:"answer"`
+	Found     bool           `json:"found"`
+	Judgeable bool           `json:"judgeable"`
+	Polls     int            `json:"polls"`
+	Seconds   float64        `json:"wait_s"`
+	Err       string         `json:"error,omitempty"`
+}
+
+// awaitJudgeable asks one symbol question until the spelling's evidence rule
+// can actually be applied to the answer, or until the timeout.
+//
+// It is the bounded sibling of awaitSymbolAs for the callers that judge an
+// answer once rather than wait for a particular one: an isolation probe asks
+// "is this symbol visible here", and an inexact answer is not a "no" — it is
+// the product saying the view moved under the question. Judging it either way
+// invents a fact. The wait is returned so the caller can account for it
+// exactly as it accounts for an exactness wait.
+//
+// Judgeable=false at the deadline is an unavailability with a name, never a
+// pass: the caller is told the rule could not be applied, and the last answer
+// travels with it.
+func (f *issue767Fixture) awaitJudgeable(root, name, file string, spelling issue767Spelling, timeout time.Duration) issue767Probe {
+	started := time.Now()
+	deadline := started.Add(timeout)
+	probe := issue767Probe{}
+	for {
+		probe.Polls++
+		answer, err := f.askSymbol(root, name, file, spelling)
+		probe.Answer = answer
+		if err == nil {
+			found, verdictErr := issue767Verdict(answer, spelling)
+			if !issue767Inexact(verdictErr) {
+				probe.Found, probe.Judgeable = found, true
+				if verdictErr != nil {
+					probe.Err = verdictErr.Error()
+				} else {
+					probe.Err = ""
+				}
+				probe.Seconds = time.Since(started).Seconds()
+				return probe
+			}
+			probe.Err = verdictErr.Error()
+		} else {
+			probe.Err = err.Error()
+		}
+		if !time.Now().Before(deadline) {
+			probe.Seconds = time.Since(started).Seconds()
+			return probe
+		}
+		select {
+		case <-f.t.Context().Done():
+			probe.Err = f.t.Context().Err().Error()
+			probe.Seconds = time.Since(started).Seconds()
+			return probe
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // trySearchSymbolAs applies the spelling's evidence rule to one answer.
