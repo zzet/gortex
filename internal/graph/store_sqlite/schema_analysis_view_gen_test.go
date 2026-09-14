@@ -1237,7 +1237,7 @@ func TestPruneAnalysisGenerationsBoundsRetainedHistoryAcrossViews(t *testing.T) 
 	// The aggregate statement: collectable history is bounded by the cap, not
 	// by the number of views.
 	total := scalarInt(t, store.db, `SELECT COUNT(*) FROM analysis_generations`)
-	wantTotal := analysisRetentionViewCap*(keep+1) + (views-analysisRetentionViewCap)
+	wantTotal := analysisRetentionViewCap*(keep+1) + (views - analysisRetentionViewCap)
 	if total != wantTotal {
 		t.Fatalf("store kept %d analyses across %d views, want %d (cap %d × keep %d, plus one active per view)",
 			total, views, wantTotal, analysisRetentionViewCap, keep)

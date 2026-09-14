@@ -368,7 +368,7 @@ func TestClosingPublisherAdmissionCountsWhetherShutdownWaited(t *testing.T) {
 
 		// One admitted actor, exactly as a running publication holds one.
 		owner := store_sqlite.DedicatedBaseOwner{CheckoutID: "chk-metrics", Incarnation: "inc-1"}
-		release, _, err := runtime.dedicatedBaseRuntime.admitOwnerState(
+		release, _, err := runtime.admitOwnerState(
 			context.Background(), "graph-metrics", owner, nil)
 		require.NoError(t, err)
 		// Registered AFTER the fixture's own cleanup so it runs BEFORE it

@@ -123,6 +123,10 @@ func generationScopedTables(t *testing.T, db *sql.DB) []string {
 				break
 			}
 		}
+		if err := cols.Err(); err != nil {
+			_ = cols.Close()
+			t.Fatalf("column rows for %s: %v", name, err)
+		}
 		_ = cols.Close()
 	}
 	sort.Strings(scoped)
@@ -190,6 +194,9 @@ func tableHasColumn(t *testing.T, db *sql.DB, table, column string) bool {
 		if name == column {
 			return true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("column rows for %s: %v", table, err)
 	}
 	return false
 }

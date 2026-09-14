@@ -427,7 +427,6 @@ func TestOverlayLayerFallsBackToTheCorpusForANarrowedBaseReader(t *testing.T) {
 		"base identities still come from the corpus this view reads")
 }
 
-
 // TestOverlayContentForServesTheRoutedCheckoutSpelling pins the raw-bytes half.
 //
 // The three source-reading handlers (get_symbol_source, get_editing_context,

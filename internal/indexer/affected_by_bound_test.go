@@ -1091,7 +1091,7 @@ type fanoutBroadcastingStore struct {
 
 func (s *fanoutBroadcastingStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 	if s.armed.CompareAndSwap(true, false) {
-		s.Store.RecordMutationFanoutTruncation(s.fact)
+		s.RecordMutationFanoutTruncation(s.fact)
 	}
 	s.Store.AddBatch(nodes, edges)
 }

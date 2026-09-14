@@ -543,9 +543,10 @@ func BenchmarkIncomingCompositeIndexActualAddBatch(b *testing.B) {
 					writer.AddBatch([]*graph.Node{nodes[1]}, nil)
 					batches := make([][]*graph.Edge, b.N)
 					for i := range batches {
-						if operation == "insert_edges" {
+						switch operation {
+						case "insert_edges":
 							batches[i] = incomingCompositeEdgeBatch(i*256, 256)
-						} else if operation == "replay_edges" {
+						case "replay_edges":
 							if i == 0 {
 								batches[0] = incomingCompositeEdgeBatch(0, 256)
 							}
@@ -569,9 +570,10 @@ func BenchmarkIncomingCompositeIndexActualAddBatch(b *testing.B) {
 					b.StopTimer()
 					mid := incomingCompositeFileBytes(b, f.path)
 					want := 0
-					if operation == "insert_edges" {
+					switch operation {
+					case "insert_edges":
 						want = b.N * 256
-					} else if operation == "replay_edges" {
+					case "replay_edges":
 						want = 256
 					}
 					if got := incomingCompositeWriterCount(b, f, generation); got != want {

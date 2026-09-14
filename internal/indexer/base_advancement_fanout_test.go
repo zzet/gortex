@@ -95,7 +95,7 @@ func (f *fanoutFixture) dependent(checkoutID, adminName string) store_sqlite.Che
 		RootPath: "/tmp/" + adminName, GitDir: "/tmp/" + adminName + "/.git", AdminName: adminName,
 		State:       store_sqlite.CheckoutStateReady,
 		DesiredMode: store_sqlite.CheckoutModeAutomatic, EffectiveMode: store_sqlite.CheckoutModeAutomatic,
-		HeadRef:     "refs/heads/" + adminName,
+		HeadRef: "refs/heads/" + adminName,
 	}
 	require.NoError(f.t, f.catalog.UpsertCheckout(context.Background(), checkout))
 	return checkout

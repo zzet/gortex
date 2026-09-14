@@ -2991,7 +2991,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 			idx.logger.Debug("indexer: no shadow slot for a filtered pass; writing and withdrawing instead",
 				zap.String("repo", idx.RepoPrefix()), zap.Error(err))
-			shadowLease, err = nil, nil
+			shadowLease = nil
 		}
 	}
 	shadowTaken := shadowLease != nil

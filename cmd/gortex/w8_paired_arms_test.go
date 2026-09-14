@@ -363,12 +363,7 @@ func w8FreezeBudgets(runs []w8RunArtifact) (w8BudgetSet, error) {
 		budget.GenerationSeq = w8Statistic(labels, sequence)
 		budget.WallSeconds = series.WallSeconds
 		for _, window := range series.Windows {
-			budget.Windows = append(budget.Windows, w8WindowBudget{
-				Window: window.Window, Detail: window.Detail,
-				LogicalWrites: window.LogicalWrites, LogicalWritesExcl: window.LogicalWritesExcl,
-				CheckpointBytes: window.CheckpointBytes, ClientCalls: window.ClientCalls,
-				WallSeconds: window.WallSeconds,
-			})
+			budget.Windows = append(budget.Windows, w8WindowBudget(window))
 		}
 		budget.JudgedSeries, budget.JudgedSource, budget.JudgedWall = w8BudgetJudgment(budget)
 		budget.Limit, budget.LimitRule = w8LimitFor(phase, budget)
@@ -747,12 +742,7 @@ func w8AugmentFrozenBudgets(set w8BudgetSet, runs []w8RunArtifact) (w8BudgetSet,
 		budget.CheckpointBytes = series.CheckpointBytes
 		budget.Windows = nil
 		for _, window := range series.Windows {
-			budget.Windows = append(budget.Windows, w8WindowBudget{
-				Window: window.Window, Detail: window.Detail,
-				LogicalWrites: window.LogicalWrites, LogicalWritesExcl: window.LogicalWritesExcl,
-				CheckpointBytes: window.CheckpointBytes, ClientCalls: window.ClientCalls,
-				WallSeconds: window.WallSeconds,
-			})
+			budget.Windows = append(budget.Windows, w8WindowBudget(window))
 		}
 		budget.JudgedSeries, budget.JudgedSource, budget.JudgedWall = w8BudgetJudgment(*budget)
 		budget.Limit, budget.LimitRule = w8LimitFor(budget.Phase, *budget)
@@ -1192,7 +1182,7 @@ func w8RenderVerdictTable(verdict w8Verdict) string {
 	rows := append(append([]w8PhaseVerdict{}, verdict.Phases...), verdict.Unbudgeted...)
 	for _, row := range rows {
 		baselineJudged, candidateJudged := row.BaselineJudged, row.CandidateJudged
-		state := "incomparable"
+		var state string
 		switch {
 		case !row.Comparable && row.Incomparable == "":
 			state = "unbudgeted: recorded, not judged"
@@ -1218,10 +1208,10 @@ func w8RenderVerdictTable(verdict w8Verdict) string {
 		if row.RatioTotal > 0 {
 			totalRatio = fmt.Sprintf("%.2fx", row.RatioTotal)
 		}
-		out.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+		fmt.Fprintf(&out, "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
 			row.Phase, row.JudgedSeries, w8FormatJudgedRows(row), w8FormatStat(baselineJudged), w8FormatStat(candidateJudged), ratio, totalRatio,
 			w8FormatStat(row.BaselineCheckpoint), w8FormatStat(row.CandidateCheckpoint), ceiling, state,
-			w8FormatStat(row.BaselineDisk), w8FormatStat(row.CandidateDisk)))
+			w8FormatStat(row.BaselineDisk), w8FormatStat(row.CandidateDisk))
 	}
 	windows := w8RenderWindowTable(rows)
 	if windows != "" {
@@ -1243,10 +1233,10 @@ func w8RenderWindowTable(rows []w8PhaseVerdict) string {
 				out.WriteString("|---|---|---|---|---|---|---|---|\n")
 				any = true
 			}
-			out.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			fmt.Fprintf(&out, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
 				row.Phase, window.Window, w8FormatStat(window.Baseline), w8FormatStat(window.Candidate),
 				w8FormatStat(window.CandidateExcl), w8FormatStat(window.CandidateCheckpoint),
-				w8FormatStat(window.CandidateCalls), window.Note))
+				w8FormatStat(window.CandidateCalls), window.Note)
 		}
 	}
 	return out.String()

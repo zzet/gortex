@@ -584,15 +584,15 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		}
 	}
 	return fileDeltaFingerprints{
-			metadata: stableFingerprintDigests(metadataRows),
-			semantic: stableFingerprintDigests(semanticRows),
-			core:     stableFingerprintDigests(coreRows),
-		}, derivedFingerprints{
-			declarations: stableFingerprintDigests(declarations),
-			imports:      stableFingerprintDigests(imports),
-			runtime:      stableFingerprintDigests(runtimeRows),
-			artifacts:    stableFingerprintDigests(artifacts),
-		}, true
+		metadata: stableFingerprintDigests(metadataRows),
+		semantic: stableFingerprintDigests(semanticRows),
+		core:     stableFingerprintDigests(coreRows),
+	}, derivedFingerprints{
+		declarations: stableFingerprintDigests(declarations),
+		imports:      stableFingerprintDigests(imports),
+		runtime:      stableFingerprintDigests(runtimeRows),
+		artifacts:    stableFingerprintDigests(artifacts),
+	}, true
 }
 
 func stampExtractionGraphFingerprints(result *parser.ExtractionResult, fingerprints fileDeltaFingerprints) {

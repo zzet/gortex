@@ -670,10 +670,9 @@ func TestMalformedWaitDeadlineRefusesTheRequest(t *testing.T) {
 // branch.
 func TestMalformedWaitDeadlineRefusesEveryCallShape(t *testing.T) {
 	type shape struct {
-		tool     string
-		args     func(stack *viewStack) map[string]any
-		prepare  func(t *testing.T, stack *viewStack)
-		facadeV1 bool
+		tool    string
+		args    func(stack *viewStack) map[string]any
+		prepare func(t *testing.T, stack *viewStack)
 	}
 	shapes := map[string]shape{
 		"an ordinary routed read": {
@@ -1593,9 +1592,9 @@ func TestServesPublishedRouteAcceptsOnlyThePublishedRoute(t *testing.T) {
 		"an inexact rider over a materialized stack": {view: routed(func(v *requestView) {
 			require.NoError(t, v.rider.MarkFallback(string(graphview.SelectorBase), string(graphview.CodeViewBuilding)))
 		}), route: published},
-		"a routeless freshness carrier": {view: routed(func(v *requestView) { v.routeless = true }), route: published},
-		"another checkout":              {view: routed(func(v *requestView) { v.rider.CheckoutID = "co-other" }), route: published},
-		"a route that moved again":      {view: routed(nil), route: moved},
+		"a routeless freshness carrier":     {view: routed(func(v *requestView) { v.routeless = true }), route: published},
+		"another checkout":                  {view: routed(func(v *requestView) { v.rider.CheckoutID = "co-other" }), route: published},
+		"a route that moved again":          {view: routed(nil), route: moved},
 		"a generation the stack never read": {view: routed(nil), route: unread},
 	}
 	for name, tc := range cases {

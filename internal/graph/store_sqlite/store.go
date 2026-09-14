@@ -273,7 +273,7 @@ type storeCore struct {
 	// one GENERATION holds no rows and must leave both alone — generation 0's
 	// readers and its durable rows are live underneath it. See
 	// BeginGenerationBulkLoad.
-	generationBulkLoad int64
+	generationBulkLoad     int64
 	bulkDeferredNodeRows   int64
 	bulkDeferredEdgeRows   int64
 	bulkCheckpointNodeRows int64

@@ -1236,11 +1236,6 @@ func (m w8IdleMode) String() string {
 // protocol so the polling window stays comparable with the frozen phases.
 const w8IdlePollInterval = 5 * time.Second
 
-func (r *w8Run) idle(duration time.Duration) {
-	r.t.Helper()
-	r.idleAs(duration, w8IdlePolling)
-}
-
 // idleAs holds the workload still for duration. The quiet arm touches nothing:
 // it does not even ask whether the symbol is still there, because asking is
 // the cost the other arm exists to measure.

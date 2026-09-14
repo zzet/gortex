@@ -463,14 +463,14 @@ func (s *Store) AddObservation(o Observation) {
 		s.mu.Lock()
 		if s.flushEvery <= 0 {
 			s.mu.Unlock()
-			s.commit([]persistence.SavingsEvent{ev})
+			_ = s.commit([]persistence.SavingsEvent{ev})
 			return
 		}
 		s.buf = append(s.buf, ev)
 		if s.flushMax > 0 && len(s.buf) >= s.flushMax {
 			batch := s.takeLocked()
 			s.mu.Unlock()
-			s.commit(batch)
+			_ = s.commit(batch)
 			return
 		}
 		s.armLocked()

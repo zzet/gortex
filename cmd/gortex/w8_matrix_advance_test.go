@@ -575,9 +575,9 @@ func TestW8M89MintedForCountsOnlyNewDependentLayers(t *testing.T) {
 	after := map[int64]w8m88Generation{
 		11: {ID: 11, Kind: "commit", CheckoutID: "c1"},
 		12: {ID: 12, Kind: "dirty", CheckoutID: "c1"},
-		20: {ID: 20, Kind: "dedicated"},                          // the family's new base, not a dependent rebuild
-		21: {ID: 21, Kind: "commit", CheckoutID: "other"},        // a checkout this matrix does not own
-		22: {ID: 22, Kind: "commit", CheckoutID: "c1"},           // a real dependent rebuild
+		20: {ID: 20, Kind: "dedicated"},                   // the family's new base, not a dependent rebuild
+		21: {ID: 21, Kind: "commit", CheckoutID: "other"}, // a checkout this matrix does not own
+		22: {ID: 22, Kind: "commit", CheckoutID: "c1"},    // a real dependent rebuild
 	}
 	owners := map[string]bool{"c1": true}
 	if minted := w8m89MintedFor(owners, before, after); minted != 1 {

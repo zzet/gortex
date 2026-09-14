@@ -511,11 +511,12 @@ func (w *generationBulkWindow) close() error {
 //     nodes AND edges when the bulk window opens, and generationBulkWindow
 //     turns that refusal into a failed build rather than an unbracketed write
 //     onto the residue;
+//
 //  2. generation zero recorded a CLEAN index at a known commit — the indexer
 //     stamps repo_index_state.dirty at the end of every pass, so this is the
 //     index's own statement about the bytes it read;
 //
-//  2a. generation zero's rows were produced by the EXTRACTOR VERSIONS this
+//     2a. generation zero's rows were produced by the EXTRACTOR VERSIONS this
 //     reservation's identity claims. repo_index_state.extractor_versions and
 //     the reservation identity are the same string from the same function
 //     (index_state.go persistRepoIndexState marshals extractorVersionsSnapshot;
@@ -530,6 +531,7 @@ func (w *generationBulkWindow) close() error {
 //     process's extractors. Neither ResolverVersion, ConfigHash nor
 //     DependencyRevision is recorded in repo_index_state, so only this one
 //     component of the identity can be proved from generation zero's row;
+//
 //  3. the working tree still sits on exactly that commit and is PROVABLY
 //     unmodified — git status --porcelain lists untracked files too, so an
 //     untracked source file that generation zero indexed shows up here. The
@@ -540,6 +542,7 @@ func (w *generationBulkWindow) close() error {
 //     wrong here — a status that timed out on a contended index lock would
 //     admit a copy over a tracked-file edit made after generation zero's clean
 //     pass — so this predicate uses its own prove-or-refuse probe;
+//
 //  4. the commit's tree is the tree this base reserved, and generation zero
 //     carries payload at no path outside it.
 //

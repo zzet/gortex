@@ -740,7 +740,7 @@ func TestMaintenanceCheckpointAndBulkWindowsRaceSelection(t *testing.T) {
 		defer wg.Done()
 		for i := range rounds {
 			payload, _ := bulkFixture(64, 0)
-			store.AtGeneration(int64(100 + i)).AddBatch(payload, nil)
+			store.AtGeneration(int64(100+i)).AddBatch(payload, nil)
 		}
 	}()
 	go func() {

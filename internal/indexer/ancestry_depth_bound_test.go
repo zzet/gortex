@@ -142,12 +142,12 @@ func TestDedicatedBaseAdvanceRootsOnceTheChainHoldsTheBound(t *testing.T) {
 		if err != nil {
 			t.Fatalf("depth %d: %v", depth, err)
 		}
-		switch {
-		case selected == head.GenerationID:
+		switch selected {
+		case head.GenerationID:
 			if firstRoot != 0 {
 				t.Fatalf("depth %d extended the chain again after rooting at depth %d", depth, firstRoot)
 			}
-		case selected == 0:
+		case 0:
 			if firstRoot == 0 {
 				firstRoot = depth
 			}

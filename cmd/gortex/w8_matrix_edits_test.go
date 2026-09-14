@@ -1487,10 +1487,10 @@ func (h *w8m5EditHarness) run(c w8m5EditCase) {
 		Differences: differences, Residual: residual,
 		Attempts: w8m5OracleAttempts, Backoff: h.backoff,
 	})
-	switch {
-	case verdict.Status == w8m5StatusPass:
+	switch verdict.Status {
+	case w8m5StatusPass:
 		row.Detail = strings.TrimSpace(row.Detail + " | " + strings.Join(verdict.Recorded, " | "))
-	case verdict.Status == w8m5StatusSkip:
+	case w8m5StatusSkip:
 		// Every difference is the measured semantic-metadata gap. The row is
 		// a named skip pointing at the ledger row that owns it, and the full
 		// difference still rides on the row.
