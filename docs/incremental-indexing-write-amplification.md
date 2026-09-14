@@ -18,7 +18,7 @@ the corrections evidence forced on D6, D9 and D15; and a compressed per-wave evi
 paired measurement lives in [incremental-indexing-measurements.md](incremental-indexing-measurements.md)
 and carries two verdicts against one never-re-frozen budget file.
 
-Branch `fix/incremental-index-write-amplification`, 144 commits over `main 56a1c29d`. The final
+Branch `fix/incremental-index-write-amplification`, 146 commits over `main 56a1c29d` (`git rev-list --count 56a1c29d..HEAD` is the authority). The final
 source identity — the last commit that changes a `.go` file — is `9fc2e7ce`; the commits above it
 change documentation only.
 
