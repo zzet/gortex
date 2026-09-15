@@ -155,7 +155,7 @@ func TestComputeDependencyRevisionDeterministicAndOrderInsensitive(t *testing.T)
 
 // TestComputeDependencyRevisionSensitiveToEveryCohortDimension mutates one
 // cohort member at a time and requires the revision to move. Every dimension
-// the handoff names as resolver-visible is represented: roster membership and
+// that is resolver-visible is represented: roster membership and
 // identity, cross-repository source identity, ownership, the deep index
 // configuration, the named configuration domains, producer policy, the
 // capability set and extractor versions.

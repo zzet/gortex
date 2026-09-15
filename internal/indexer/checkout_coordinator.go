@@ -1885,9 +1885,8 @@ func graphBase(
 //     a resolver bump all fail it and fall through to a rebuild against the
 //     base that is current. Substituting the row's tree rather than the
 //     sample's is deliberate: a checkout whose own tree moved still pins, and
-//     rebuilds its delta against the base it is pinned to (the plan's fourth
-//     clause), which is what keeps its ancestry — and its reuse cache — stable
-//     across its own commits.
+//     rebuilds its delta against the base it is pinned to, which is what keeps
+//     its ancestry — and its reuse cache — stable across its own commits.
 //
 //   - a base a sweep has asked this coordinator to release is never pinned
 //     again. That is the bound: the pin holds until the superseded-chain

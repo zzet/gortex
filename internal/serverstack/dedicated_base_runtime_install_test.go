@@ -162,8 +162,8 @@ func TestSharedServerInstallsPublisherRuntimeBeforeOwnerRegistration(t *testing.
 		t.Fatalf("re-registering the live owner is not idempotent: %v", err)
 	}
 
-	// And the seam is now closed: this is the state the plan's revert-red
-	// describes — an install attempted after the first bindDedicatedGraph.
+	// And the seam is now closed: this is the state that goes red without the
+	// guard — an install attempted after the first bindDedicatedGraph.
 	late, err := indexer.NewDedicatedBaseRuntime(store, lifecycle.ViewLeases())
 	if err != nil {
 		t.Fatalf("NewDedicatedBaseRuntime: %v", err)

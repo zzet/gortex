@@ -28,7 +28,10 @@ import (
 // pair is coherent — the layer names an immutable ancestor, the materializer
 // composes the ancestry the routed generation itself names, retirement refuses
 // a generation anything still names — and pinning the dependent there is the
-// unimplemented dependent-pin saving, not something these tests claim. Where
+// dependent pin's saving, which pinRoutedBase implements and
+// dependent_pin_test.go pins. It is a separate mechanism from recomposition,
+// in-process only and not carried across a restart, and it is not something
+// these tests claim. Where
 // it does not (the regime this fixture is in, and the one these tests drive)
 // the delta names no immutable ancestor at all: BaseGenerationID is 0 and the
 // layer composes over the shared indexed corpus, which is rewritten in place

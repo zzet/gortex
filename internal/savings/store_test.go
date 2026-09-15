@@ -1172,7 +1172,7 @@ func TestSetFlushBounds_AppliesToAnAlreadyArmedBuffer(t *testing.T) {
 	}
 }
 
-// Wave constraint: an operator knob is honoured, never silently raised or
+// The constraint: an operator knob is honoured, never silently raised or
 // dropped. An explicit GORTEX_SAVINGS_FLUSH_INTERVAL outranks the entry
 // point's bound in both directions.
 func TestSetFlushBounds_NeverOverridesTheOperatorKnob(t *testing.T) {

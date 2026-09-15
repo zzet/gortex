@@ -378,8 +378,8 @@ func seedCrossRepoCall(t *testing.T, stack *viewStack) {
 	})
 }
 
-// TestBaseSelectorEdgesNeverNameAnotherGraphsSymbol is the plan's own
-// acceptance criterion taken through the production entrypoint: a
+// TestBaseSelectorEdgesNeverNameAnotherGraphsSymbol takes the acceptance
+// criterion through the production entrypoint: a
 // view:{kind:"base",graph_id:A} request must not return a symbol that lives
 // only in graph B.
 //
@@ -1144,8 +1144,8 @@ func resolvedSiblingCorpus() *graph.Graph {
 // Deciding a site the prefix cannot spell asks the corpus what it holds at
 // that path. Asking it one path at a time turns a single find_usages into one
 // serial store query per distinct file path of every other tracked repository
-// — the amplification this wave exists to remove, introduced by the fix for
-// the leak. graph.Store declares GetFileNodesByPaths as the batched sibling of
+// — the per-path amplification this test exists to refuse, introduced by the
+// fix for the leak. graph.Store declares GetFileNodesByPaths as the batched sibling of
 // GetFileNodes for exactly this, and the endpoint half of the same filters
 // already collapses its round-trips that way.
 //

@@ -33,9 +33,9 @@ import (
 //
 // These tests drive the PRODUCTION entry points — an explicit track, a registry
 // teardown, a configuration reload — and assert the mark lands on the consumer.
-// The primitive working in isolation is exactly the state this wave inherited:
-// both InvalidateDependencyCohort methods existed with zero production callers,
-// so a poll could never re-describe.
+// The primitive working in isolation is exactly the state these tests were
+// written against: both InvalidateDependencyCohort methods existed with zero
+// production callers, so a poll could never re-describe.
 
 // cohortStale reads a coordinator's stale mark under the lock that guards it.
 func cohortStale(c *CheckoutCoordinator) bool {

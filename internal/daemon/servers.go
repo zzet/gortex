@@ -455,7 +455,7 @@ func ProxyIdentityFromContext(ctx context.Context) ProxyIdentity {
 //
 // The completion half exists because not every producer of a proxied call has
 // a transport-level cwd to attach. A front door that only reads headers (the
-// /mcp mount before this wave, and the unix-socket dispatcher's
+// /mcp mount before the body-cwd fold below, and the unix-socket dispatcher's
 // tryProxyToolCall) leaves ctx carrying no CWD at all, and the remote then
 // resolves its view from the body — which is fine for peekRouteContext (it
 // prefers the body's cwd) but NOT for the remote's requestViewCWD /
