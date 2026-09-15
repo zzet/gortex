@@ -96,10 +96,10 @@ recorded in `scratchpad/logs/w84-arm-store-schema.log`.
 
 ## 3. The instrument
 
-The harness is `cmd/gortex/w8_sustained_io_integration_test.go` plus
-`w8_sampler_test.go`, `w8_fixture_generator_test.go` and the shared private-daemon fixture in
-`issue767_fixture_shared_test.go`. It is opt-in: without `GXW8_TEST_BINARY` it skips with a named
-reason and never runs in a default `go test ./...`.
+The harness is `cmd/gortex/sustained_io_integration_test.go` plus `sustained_io_sampler_test.go`,
+`sustained_io_fixture_generator_test.go` and the shared private-daemon fixture in
+`issue767_fixture_shared_test.go`. It is opt-in: without `GX_SUSTAINED_IO_TEST_BINARY` it skips with
+a named reason and never runs in a default `go test ./...`.
 
 **Series recorded per phase, per arm**
 
@@ -115,9 +115,10 @@ reason and never runs in a default `go test ./...`.
 | destination census | walk of the private root, every byte attributed to a named writer bucket | catches bytes the process counters cannot attribute |
 
 The sampler runs on its own goroutine at 1 Hz across the daemon's start and stop. Every reader it
-uses (`pid`, `readIO`, `readSize`, `readWAL`) is wired explicitly by `w8NewRunSampler`; a reader
-that is not wired is named in every sample (`unwired_readers`) and costs the sample its health,
-because a zero from a missing wiring is indistinguishable from a real measurement of zero.
+uses (`pid`, `readIO`, `readSize`, `readWAL`) is wired explicitly when the run sampler is
+constructed; a reader that is not wired is named in every sample (`unwired_readers`) and costs the
+sample its health, because a zero from a missing wiring is indistinguishable from a real measurement
+of zero.
 
 On the Linux arm the process reader would use `/proc/<pid>/io write_bytes`; this measurement ran on
 Darwin only.
@@ -145,7 +146,7 @@ Knobs in force, both arms, each of which changes the numbers:
 | `GORTEX_TELEMETRY=0` | off | fixture env (`:106`) | telemetry is dormant without an endpoint, but its consent/rollup files under the private data dir are writes like any other. |
 | `GORTEX_DAEMON_PPROF_ADDR` | `127.0.0.1:0` | fixture env (`:104`) | an ephemeral local pprof listener; it writes nothing unless profiled, and it is identical on both arms. |
 | `--backend sqlite --backend-path <root>/store.sqlite`, `--no-progress` | — | daemon start flags (`:215`) | the measured store is one named file inside the private root, so the destination census can attribute it. |
-| `GXW8_EDIT_INTERVAL` | `10s` (harness default `30s`) | harness knob, not a product knob | six arm-repetitions at 30 s between edits add 20 minutes of pure waiting. The edits themselves are unchanged; only the quiet time between them is shorter, which makes `P2_small_edits` a denser workload than the default and is applied identically to both arms. |
+| `GX_SUSTAINED_IO_EDIT_INTERVAL` | `10s` (harness default `30s`) | harness knob, not a product knob | six arm-repetitions at 30 s between edits add 20 minutes of pure waiting. The edits themselves are unchanged; only the quiet time between them is shorter, which makes `P2_small_edits` a denser workload than the default and is applied identically to both arms. |
 
 Two knobs the execution plan's hazard list asks for are **not** applied, and this is deliberate:
 
@@ -175,8 +176,8 @@ drift in host load is shared by adjacent repetitions instead of being absorbed e
 
 ## 5. Protocol
 
-**Corpus.** Generated, not cloned, so a manifest can rebuild it byte for byte:
-`w8GenerateFixture{Files: 1500, Packages: 60, Seed: 767}` — one `go.mod`, a root package holding the
+**Corpus.** Generated, not cloned, so a manifest can rebuild it byte for byte: the harness's fixture
+generator at `{Files: 1500, Packages: 60, Seed: 767}` — one `go.mod`, a root package holding the
 call target, one `marker.go` per checkout, and 1,500 package files spread round-robin over 60
 packages with intra-package and cross-package calls (cross-package imports always point at a higher
 package index, so the import graph is acyclic by construction). The fixture digest is recorded in
@@ -209,10 +210,10 @@ median — never folded in as a zero.
 **The freeze.** Budgets are derived from the baseline arm only and written to `budgets.json`, which
 refuses to be overwritten; the file carries a SHA-256 of its own canonical contents, and the verdict
 refuses to judge against a budget set whose contents no longer match its digest. The reduction step
-(`TestW8PairedArmsVerdict` in `cmd/gortex/w8_paired_arms_test.go`) is run twice: once with
-`GXW8_BUDGETS_ONLY=1`, which reads only the `baseline_rep*` artifacts and stops, and once without,
-which produces the verdict. Section 6 was written from the first run's output before the second was
-started.
+(`TestSustainedIOPairedArmsVerdict` in `cmd/gortex/sustained_io_paired_arms_test.go`) is run twice:
+once with `GX_SUSTAINED_IO_BUDGETS_ONLY=1`, which reads only the `baseline_rep*` artifacts and
+stops, and once without, which produces the verdict. Section 6 was written from the first run's
+output before the second was started.
 
 **Ceilings**, from the execution plan's paired-I/O protocol:
 
@@ -238,15 +239,16 @@ recomputes it and refuses to judge against a set whose bytes have moved. The fil
 rewritten.
 
 **What "frozen before the candidate was read" means here, exactly.** The ordering is enforced by
-code, not by memory: `w8FreezeBudgets` (`cmd/gortex/w8_paired_arms_test.go:215-228`) refuses any run
-whose manifest is not the baseline arm, so no budget can absorb a candidate number even by accident;
-`w8WriteFrozenBudgets` (`:373-395`) never overwrites; the ceiling formulas in `w8LimitFor`
-(`:299-320`) were written before any number existed. The freeze pass is a separate invocation with
-`GXW8_BUDGETS_ONLY=1` that stops before loading the candidate directories, and this section was
-written from its output (`logs/w84-freeze.log`) before the verdict pass ran. The one thing the
-operator is **not** blind to is the run's own console log, which prints both arms as they interleave;
-that is inherent to an A/B/A/B/A/B run in one process, and it is why the mechanism lives in the code
-rather than in a claim about who looked at what.
+code, not by memory: the budget-freeze reducer
+(`cmd/gortex/sustained_io_paired_arms_test.go:307-320`) refuses any run whose manifest is not the
+baseline arm, so no budget can absorb a candidate number even by accident; the frozen-budget writer
+(`:653-671`) never overwrites; the ceiling formulas (`:569-597`) were written before any number
+existed. The freeze pass is a separate invocation with `GX_SUSTAINED_IO_BUDGETS_ONLY=1` that stops
+before loading the candidate directories, and this section was written from its output
+(`logs/w84-freeze.log`) before the verdict pass ran. The one thing the operator is **not** blind to
+is the run's own console log, which prints both arms as they interleave; that is inherent to an
+A/B/A/B/A/B run in one process, and it is why the mechanism lives in the code rather than in a claim
+about who looked at what.
 
 | phase | baseline `ri_logical_writes` median (min / max) | ≈ | `ri_diskio_byteswritten` median (min / max) | WAL bytes at phase end (median) | WAL resets | wall s | frozen ceiling |
 |---|---|---|---|---|---|---|---|
@@ -279,11 +281,11 @@ The ceilings, in the words that travel with them in `budgets.json`:
 phases with no failed phase, 250 exactness waits each, and one sample failure each (the first 1 Hz
 sample, taken before the child daemon has a pid — it is named in the sample line, not counted as a
 zero). Per-run WAL resets: 73 / 68 / 73. The `view_generations` sequence on `main` moves by +1 at
-`P0`, **0** across `P1`, `P2`, `P3`, `P4` and `P8` in all three repetitions, +66/+62/+66 at `P5`,
-+3 at `P6` and +2 at `P7` — so on the baseline the twenty commits of `P5` are what produce
-generations, and the dirty-edit, no-op and idle phases produce none. Dependent isolation held in
-every baseline repetition; the harness's baseline-only isolation exemption
-(`w8_sustained_io_integration_test.go:996-1005`) was never exercised.
+`P0`, **0** across `P1`, `P2`, `P3`, `P4` and `P8` in all three repetitions, +66/+62/+66 at `P5`, +3
+at `P6` and +2 at `P7` — so on the baseline the twenty commits of `P5` are what produce generations,
+and the dirty-edit, no-op and idle phases produce none. Dependent isolation held in every baseline
+repetition; the harness's baseline-only isolation exemption
+(`sustained_io_integration_test.go:1690-1699`) was never exercised.
 
 **The one number to keep in view**: on the baseline, `P5_main_advance` — twenty commits on main with
 ten dependent worktrees discovered — accounts for 4.79 GiB of process-accounted writes, 60 % of the
@@ -294,7 +296,7 @@ anything about the candidate was read.
 
 > **This is the FIRST verdict, on candidate `2fd5db82`.** It is kept unedited except for the marked
 > corrections below. The branch's current numbers are in **§8**, which re-runs the candidate arm
-> against this same frozen baseline after the fix wave. The corrections are collected in §8.6.
+> against this same frozen baseline after the round of fixes. The corrections are collected in §8.6.
 
 Judged against the digest-`aca00104…` budget set. Artifacts: `verdict.json`, `verdict.md`; console
 log `logs/w84-verdict.log`. Three candidate repetitions, medians with min/max, `ri_logical_writes`
@@ -449,16 +451,16 @@ three other phases got worse in ways the branch should answer for.
 > phase performs inside its own window and not to "a same-tree amend that `main` handles for
 > nothing"; and the shared idle-budget miss was read off the series that carries the periodic
 > checkpoint. The **1.89x cold index and the store twice as large were real** — and are the single
-> largest thing the fix wave closed. §8's one-paragraph verdict replaces this one for the branch's
-> current state; this paragraph stands as what was believed on 2026-09-13.
+> largest thing the round of fixes closed. §8's one-paragraph verdict replaces this one for the
+> branch's current state; this paragraph stands as what was believed on 2026-09-13.
 
 ### 7.5 The 6,000-file arm — one repetition, and the candidate did not finish it
 
 The plan's scale axis asks for `{1500, 6000}`. With 56 GiB free the 6,000-file pair was run **once**
-(`GXW8_FIXTURE_FILES=6000 GXW8_FIXTURE_PACKAGES=120 GXW8_REPS=1`, everything else identical),
-artifacts under `artifacts/W8m-W8.4/paired6000`, log `logs/w84-paired6000.log`. One repetition is a
-single reading, not a median: it is reported to show where the 1,500-file conclusions do and do not
-survive a 4× corpus, and nothing here is a budget.
+(`GX_SUSTAINED_IO_FIXTURE_FILES=6000 GX_SUSTAINED_IO_FIXTURE_PACKAGES=120 GX_SUSTAINED_IO_REPS=1`,
+everything else identical), artifacts under `artifacts/W8m-W8.4/paired6000`, log
+`logs/w84-paired6000.log`. One repetition is a single reading, not a median: it is reported to show
+where the 1,500-file conclusions do and do not survive a 4× corpus, and nothing here is a budget.
 
 **The baseline completed all nine phases. The candidate failed at `P5_main_advance` and stopped**, so
 it has no `P6`–`P8` reading.
@@ -546,11 +548,11 @@ same nine phases, the same knobs (§4) and the same fixture. Two phases no longe
 frozen protocol, and both are handled by mapping rather than by re-freezing:
 
 - `P1_idle_cold` and `P8_idle_warm` now measure idle **twice** — a polling arm that reproduces the
-  frozen protocol exactly (60 s, one read-only search every 5 s) and a quiet arm that makes no client
-  calls at all. The polling arm runs **first**, so it opens where the frozen window opened; the
-  reduction judges the frozen phase name on it (`w8JudgedWindows`,
-  `cmd/gortex/w8_paired_arms_test.go:461-464`) and leaves the quiet arm as an un-budgeted row.
-  Judging the phase *total* would compare ~120 s of candidate against ~62 s of baseline.
+  frozen protocol exactly (60 s, one read-only search every 5 s) and a quiet arm that makes no
+  client calls at all. The polling arm runs **first**, so it opens where the frozen window opened;
+  the reduction judges the frozen phase name on it (the judged-window mapping,
+  `cmd/gortex/sustained_io_paired_arms_test.go:443-459`) and leaves the quiet arm as an un-budgeted
+  row. Judging the phase *total* would compare ~120 s of candidate against ~62 s of baseline.
 - `P4_amend_same_tree` is split into `P4a_commit_tree_change` (the tree-changing commit the amend
   needs, which the phase performs inside its own window) and `P4b_amend_same_tree` (the amend). The
   **phase** row is still what the frozen budget names and what is judged; the two sub-windows are
@@ -583,10 +585,11 @@ median then candidate median: `P0` 1,001,312,256 / 1,055,571,968; `P1` 0 / 0; `P
 `P3` 0 / 36,876,288; `P4` 0 / 0; `P5` 7,395,172,352 / 1,714,257,920; `P6` 327,680 / 0;
 `P7` 1,888,002,048 / 735,490,048; `P8` 9,142,272 / 0 (0/150,515,712).
 
-**over budget: none. incomparable: none. regressions preserved: `P4_amend_same_tree` 1.28×.**
-All nine phases completed in all three repetitions; no failed phase; 256 exactness waits per run
-(baseline 250 — the extra six are the bounded isolation-probe retries §F5 added); one sample failure
-per run (the first 1 Hz sample, before the child has a pid, named in the sample line).
+**over budget: none. incomparable: none. regressions preserved: `P4_amend_same_tree` 1.28×.** All
+nine phases completed in all three repetitions; no failed phase; 256 exactness waits per run
+(baseline 250 — the extra six are the bounded isolation-probe retries the harness corrections
+added); one sample failure per run (the first 1 Hz sample, before the child has a pid, named in the
+sample line).
 
 **Sub-window rows** (candidate only — the frozen baseline predates the split and is judged on its
 phase row, which is what the frozen protocol measured):
@@ -619,75 +622,79 @@ the candidate's store is 61.6 MB against the baseline's 61.3 MB, `view_generatio
 
 **Destination census after teardown** (medians; the 14-bucket attribution of every retained byte):
 `store` 324,927,488 → 270,340,096; `store_wal` 67,108,864 → 64,193,752; `sidecar_db` 4,695,192 →
-**2,516,768** (0.54 ×, F4's ledger coalescing); `embedding_model` 33,514,412 on both arms (identical,
-cancels); `query_log` 0 → **126,673** — see the correction in §8.6(4), this is a bucket that did not
-exist when §4 was written, not new traffic.
+**2,516,768** (0.54 ×, the coalesced savings ledger); `embedding_model` 33,514,412 on both arms
+(identical, cancels); `query_log` 0 → **126,673** — see the correction in §8.6(4), this is a bucket
+that did not exist when §4 was written, not new traffic.
 
 ### 8.2 What changed since the first verdict
 
 Six items landed between the two arms. Each one's own single-phase measurement is cited; none of
 those numbers is restated as if it were this arm's.
 
-1. **F1 — a committed base is published only when something can read it.** `daemon_state.go` used to
-   schedule an initial committed-base publication for **every** configured repository as soon as its
-   generation-0 index completed, and `DedicatedBaseAdvanceTrigger.HeadChanged` enqueued on every HEAD
-   move, in both cases with a reader set of size zero in the measured shape (`checkouts: 1,
-   checkout_routes: 0`). A fourth skip — *"no dependent checkout"* — plus an on-demand schedule from
-   the first reader's claim replaces it. F1's own paired single-phase re-measurement of `P0` put
-   `ri_logical_writes` at 995,418,813 against a same-session baseline of 1,038,370,756 = **0.959×**,
-   store 61,579,264 against 61,603,840, `view_generations.Count` 0, node rows 14,989 (one copy).
-   In this arm the same shape holds across the whole run: `P0` 1.04 × (989,877,036 against the frozen
-   949,066,148) instead of 1.89 ×, and `P4`'s counters show the gate firing on the live path —
-   6 advances dispatched across three repetitions, **6 publications skipped, 0 published**.
-2. **F2 — the generation-scoped bulk write shape, and a deterministic cold-load WAL drain.** A
-   generation payload no longer pays per-row B-tree maintenance across 19 secondary indexes at the
-   pooled 32 MiB `cache_size`; the replay that motivated it measured the identical payload at
-   841,300,936 bytes at store defaults against 258,812,948 with `cache_size=-262144` alone (−69 %)
-   and 227,337,572 with the full fast-path shape. What this arm can say about the drain half is
-   narrow: the candidate leaves `P0` with a WAL of 15,281,112 / 15,487,112 / 15,569,512 bytes
-   (≈3,709 / 3,759 / 3,779 frames, a band of ±35 frames) where the diagnosis measured 3,636 against
-   15,573 frames on the same workload — **but the frozen baseline's three runs are equally tight**
-   (15,042,152 / 14,980,352 / 15,128,672), so these three repetitions do not exhibit the lottery and
-   cannot be used to say F2 removed it. The difference that *is* paired is checkpoint frequency:
-   `wal_resets` **31 / 33 / 29** per candidate run against the baseline's 73 / 68 / 73, i.e. the
-   candidate restarts the log about half as often (§7.3 recorded 38/35/33 for the first verdict's
-   candidate, so this is a continuation, not a new effect). `wal_resets` is a lower bound on
-   checkpoints (§9(4)) and a count, not a byte figure.
-3. **F3 / F3b — a committed-base delta's write set is bounded by the change, and the operator knob is
-   honoured.** F3b's single-phase re-measurement through the `diag-P4` S2 driver is the one item in
-   the wave that **missed its targets and says so**: store delta across the commit window
-   +7,905,280 B against a ≤1 MB target (the frozen S2 baseline was +8,224,768 B, so 0.96 ×), and a
-   one-sample burst of 82,983,960 B against a ≤20 MB target (frozen S2: 104,400,000 B, 0.79 ×). The
-   mechanism it names is F3's own withholding comparison, not the cap: the delta still writes 193
-   unchanged closure files for a ten-file commit (203 payload paths / 2,039 nodes). What the knob fix
-   buys is that `index.affected_by_reresolve_max` now reaches the committed-base arm at all, and the
-   closure cap is `change_sized` rather than a raised built-in. That item's report
+1. **The consumer-gated on-demand publication — a committed base is published only when something
+   can read it.** `daemon_state.go` used to schedule an initial committed-base publication for
+   **every** configured repository as soon as its generation-0 index completed, and
+   `DedicatedBaseAdvanceTrigger.HeadChanged` enqueued on every HEAD move, in both cases with a
+   reader set of size zero in the measured shape (`checkouts: 1, checkout_routes: 0`). A fourth skip
+   — *"no dependent checkout"* — plus an on-demand schedule from the first reader's claim replaces
+   it. Its own paired single-phase re-measurement of `P0` put `ri_logical_writes` at 995,418,813
+   against a same-session baseline of 1,038,370,756 = **0.959×**, store 61,579,264 against
+   61,603,840, `view_generations.Count` 0, node rows 14,989 (one copy). In this arm the same shape
+   holds across the whole run: `P0` 1.04 × (989,877,036 against the frozen 949,066,148) instead of
+   1.89 ×, and `P4`'s counters show the gate firing on the live path — 6 advances dispatched across
+   three repetitions, **6 publications skipped, 0 published**.
+2. **The generation bulk window, and a deterministic cold-load WAL drain.** A generation payload no
+   longer pays per-row B-tree maintenance across 19 secondary indexes at the pooled 32 MiB
+   `cache_size`; the replay that motivated it measured the identical payload at 841,300,936 bytes at
+   store defaults against 258,812,948 with `cache_size=-262144` alone (−69 %) and 227,337,572 with
+   the full fast-path shape. What this arm can say about the drain half is narrow: the candidate
+   leaves `P0` with a WAL of 15,281,112 / 15,487,112 / 15,569,512 bytes (≈3,709 / 3,759 / 3,779
+   frames, a band of ±35 frames) where the diagnosis measured 3,636 against 15,573 frames on the
+   same workload — **but the frozen baseline's three runs are equally tight** (15,042,152 /
+   14,980,352 / 15,128,672), so these three repetitions do not exhibit the lottery and cannot be
+   used to say the bulk window and drain removed it. The difference that *is* paired is checkpoint
+   frequency: `wal_resets` **31 / 33 / 29** per candidate run against the baseline's 73 / 68 / 73,
+   i.e. the candidate restarts the log about half as often (§7.3 recorded 38/35/33 for the first
+   verdict's candidate, so this is a continuation, not a new effect). `wal_resets` is a lower bound
+   on checkpoints (§9(4)) and a count, not a byte figure.
+3. **The change-bounded dedicated delta with the operator bound — a committed-base delta's write set
+   is bounded by the change, and the operator knob is honoured.** Its single-phase re-measurement
+   through the `diag-P4` S2 driver is the one item in the round of fixes that **missed its targets
+   and says so**: store delta across the commit window +7,905,280 B against a ≤1 MB target (the
+   frozen S2 baseline was +8,224,768 B, so 0.96 ×), and a one-sample burst of 82,983,960 B against a
+   ≤20 MB target (frozen S2: 104,400,000 B, 0.79 ×). The mechanism it names is the delta's own
+   withholding comparison, not the cap: the delta still writes 193 unchanged closure files for a
+   ten-file commit (203 payload paths / 2,039 nodes). What the knob fix buys is that
+   `index.affected_by_reresolve_max` now reaches the committed-base arm at all, and the closure cap
+   is `change_sized` rather than a raised built-in. That item's report
    (`scratchpad/reports/W8g-F3b.md` §5–§6) is the record; this arm does not re-measure it.
-4. **F4 / F4b — the savings ledger coalesces.** A read-only tool call used to write a durable ~37 KB
-   sidecar transaction of its own; the ledger now buffers and commits once per window, with the
-   one-shot flush wired from `runMCP` (N read-only calls → 0 transactions in the window, exactly 1 on
-   flush). In this arm the retained `sidecar_db` bucket is **2,516,768 B against the baseline's
-   4,695,192 B**, 0.54 ×.
-5. **F7b / F8 — the copy route, and the bulk bracket that closes on every exit.** When the claimed
-   base's tree matches generation zero's, the payload is now **copied** (`INSERT … SELECT` inside the
-   generation bulk window) instead of re-parsed, and the bracket closes through a deferred drain on
-   every exit path including `runtime.Goexit`. F8's write-shape measurement on a 1,500-file-sized
-   payload (6,000 nodes / 12,000 edges): copy 12,607,232 WAL bytes against re-parse 36,309,592 =
-   **0.35 ×** of the log, 23.7 MB less, before counting the parse the copy does not do. In this arm
-   `P5`'s counters show what route the 20 commits took: 60 advances dispatched, 63 claims built,
-   **60 `publish{shape=delta}` and 3 `publish{shape=root}`** — one root per run, which is the first
-   dependent's on-demand base that F1 defers rather than drops. **And each of those three roots took
-   the copy route in production**, not the re-parse one: each run's daemon log carries exactly one
-   `claimed dedicated base source plan … "route":"copy_generation_zero","reason":"the working tree is
-   clean at the reserved tree"` (`internal/indexer/builder_dedicated_claimed.go:220`) and no other
-   route value, in all three repetitions.
-6. **F5 / F5b — the accounting the other five are read through.** The checkpoint-excluded series, the
-   per-window envelope, the per-arm idle budget, the bounded isolation probe. These add no daemon
-   work; what they add is the ability to say which bytes are a deferred drain of already-committed
-   work and which are the phase's own. `P3` in this arm is the clearest case: the total series reads
-   89.09 × the baseline and the judged series reads **0.92 ×**, because 32,178,256 of the candidate's
-   32,477,360 bytes are a WAL checkpoint landing inside a phase that touches a file with identical
-   bytes, stages it and resets it. Both numbers are in the table; neither is presented alone.
+4. **The coalesced savings ledger.** A read-only tool call used to write a durable ~37 KB sidecar
+   transaction of its own; the ledger now buffers and commits once per window, with the one-shot
+   flush wired from `runMCP` (N read-only calls → 0 transactions in the window, exactly 1 on flush).
+   In this arm the retained `sidecar_db` bucket is **2,516,768 B against the baseline's 4,695,192
+   B**, 0.54 ×.
+5. **The store-side payload copy route, and the bulk bracket that closes on every exit.** When the
+   claimed base's tree matches generation zero's, the payload is now **copied** (`INSERT … SELECT`
+   inside the generation bulk window) instead of re-parsed, and the bracket closes through a
+   deferred drain on every exit path including `runtime.Goexit`. The copy route's write-shape
+   measurement on a 1,500-file-sized payload (6,000 nodes / 12,000 edges): copy 12,607,232 WAL bytes
+   against re-parse 36,309,592 = **0.35 ×** of the log, 23.7 MB less, before counting the parse the
+   copy does not do. In this arm `P5`'s counters show what route the 20 commits took: 60 advances
+   dispatched, 63 claims built, **60 `publish{shape=delta}` and 3 `publish{shape=root}`** — one root
+   per run, which is the first dependent's on-demand base that the consumer gate defers rather than
+   drops. **And each of those three roots took the copy route in production**, not the re-parse one:
+   each run's daemon log carries exactly one `claimed dedicated base source plan …
+   "route":"copy_generation_zero","reason":"the working tree is clean at the reserved tree"`
+   (`internal/indexer/builder_dedicated_claimed.go:220`) and no other route value, in all three
+   repetitions.
+6. **The harness corrections — the accounting the other five are read through.** The
+   checkpoint-excluded series, the per-window envelope, the per-arm idle budget, the bounded
+   isolation probe. These add no daemon work; what they add is the ability to say which bytes are a
+   deferred drain of already-committed work and which are the phase's own. `P3` in this arm is the
+   clearest case: the total series reads 89.09 × the baseline and the judged series reads **0.92
+   ×**, because 32,178,256 of the candidate's 32,477,360 bytes are a WAL checkpoint landing inside a
+   phase that touches a file with identical bytes, stages it and resets it. Both numbers are in the
+   table; neither is presented alone.
 
 ### 8.3 The one regression, and the one phase whose total series moved
 
@@ -722,10 +729,11 @@ than at the 1 h product default.
 ### 8.4 The confirmatory default-interval arm
 
 §9(1) records that the execution plan's confirmatory arm at the product's 1 h janitor default had
-never been run. F5 made the interval a harness knob (`GXW8_RECONCILE_INTERVAL=product`, which leaves
-`GORTEX_RECONCILE_INTERVAL` unset so the daemon takes its own default), and it has now been run
-**once**, same binary, same fixture digest, `GXW8_REPS=1`:
-`artifacts/W8i-F6/confirm-default-interval/candidate_rep1`, log `logs/W8i-F6/confirm-arm.log`.
+never been run. The harness corrections made the interval a harness knob
+(`GX_SUSTAINED_IO_RECONCILE_INTERVAL=product`, which leaves `GORTEX_RECONCILE_INTERVAL` unset so the
+daemon takes its own default), and it has now been run **once**, same binary, same fixture digest,
+`GX_SUSTAINED_IO_REPS=1`: `artifacts/W8i-F6/confirm-default-interval/candidate_rep1`, log
+`logs/W8i-F6/confirm-arm.log`.
 
 This is **one reading, under a different configuration, against no ceiling** — the frozen budgets were
 measured at 5 s and none of them applies here. It is reported to answer one question: how much of the
@@ -763,25 +771,26 @@ none should be inferred from it.
 
 ### 8.5 Design costs, re-measured
 
-The six design costs the fix wave declared rather than fixed
+The six design costs the round of fixes declared rather than fixed
 (`scratchpad/reports/io-fix-plan.md` §2), each re-read against this arm.
 
 1. **A committed base carries its own payload** — still true of the model, but it is no longer paid
-   speculatively and it is no longer paid by re-parsing. F1 makes the base **built on demand**: in
-   `P0`–`P4` this arm publishes none at all (`view_generations` 0, store 61.6 MB against the
-   baseline's 61.3 MB, one copy of the corpus at 14,989 node rows), and `P5` publishes 3 roots across
-   3 runs — one per family, at the first dependent's claim — against 60 deltas. F8 makes the root
-   **bulk-copied when the tree matches generation zero's** rather than re-parsed: 12,607,232 WAL bytes
-   against 36,309,592, 0.35 ×, on a payload the size of this fixture's — and §8.2(5) shows the route
-   actually being taken here, once per run, from the daemon's own log. That 0.35 × is F8's isolated
-   measurement of the two write routes, not a figure this arm re-derives: `P5` carries one copied root
-   and sixty deltas, and nothing in the phase separates their bytes. The first verdict's
-   "+62,402,560 B of store per full base, at index time, for a reader set of size zero" is gone from
-   the measured workload; the cost that remains is one base per family when a dependent asks for one.
+   speculatively and it is no longer paid by re-parsing. The consumer gate makes the base **built on
+   demand**: in `P0`–`P4` this arm publishes none at all (`view_generations` 0, store 61.6 MB
+   against the baseline's 61.3 MB, one copy of the corpus at 14,989 node rows), and `P5` publishes 3
+   roots across 3 runs — one per family, at the first dependent's claim — against 60 deltas. The
+   copy route makes the root **bulk-copied when the tree matches generation zero's** rather than
+   re-parsed: 12,607,232 WAL bytes against 36,309,592, 0.35 ×, on a payload the size of this
+   fixture's — and §8.2(5) shows the route actually being taken here, once per run, from the
+   daemon's own log. That 0.35 × is the copy route's isolated measurement of the two write routes,
+   not a figure this arm re-derives: `P5` carries one copied root and sixty deltas, and nothing in
+   the phase separates their bytes. The first verdict's "+62,402,560 B of store per full base, at
+   index time, for a reader set of size zero" is gone from the measured workload; the cost that
+   remains is one base per family when a dependent asks for one.
 2. **The doubled store re-paid at every future checkpoint** — **the premise no longer holds and the
    number is withdrawn.** It was measured as `ri_diskio_byteswritten` 86,151,168 (baseline) against
-   119,119,872 (candidate) = 1.38 × over the same two checkpoints, *because the flush scales with the
-   store/mmap view* and the candidate's store was 123.0 MB against 61.7 MB. This arm's store is
+   119,119,872 (candidate) = 1.38 × over the same two checkpoints, *because the flush scales with
+   the store/mmap view* and the candidate's store was 123.0 MB against 61.7 MB. This arm's store is
    **61,648,896 bytes at the end of `P0` against the baseline's 61,267,968 (1.006 ×)** and
    **270,340,096 at the end of the run against 324,927,488 (0.83 ×)**; retained bytes after teardown
    are 375,751,391 against 434,887,204 (0.86 ×). The store does **not** double any more, at any
@@ -793,18 +802,18 @@ The six design costs the fix wave declared rather than fixed
    unexplained idle regression.** In the first verdict it was 11,481,168 of the 15,181,176-byte `P8`
    median (75.6 %). Here `P8`'s judged (excluded) median is 2,799,664 with a checkpoint median of 0
    and a max of 108,840,832; the confirmatory arm at the product janitor interval concentrates it
-   —93,642,392 checkpoint bytes in one 60 s window (§8.4). The plan's gate-2 wording ("idle must write
-   nothing beyond bounded bookkeeping") is still unsatisfiable for any WAL store and still has to
-   admit the deferred drain of already-committed work; what the checkpoint-excluded series adds is
-   that the admission is now a number, not a concession.
+   —93,642,392 checkpoint bytes in one 60 s window (§8.4). The plan's gate-2 wording ("idle must
+   write nothing beyond bounded bookkeeping") is still unsatisfiable for any WAL store and still has
+   to admit the deferred drain of already-committed work; what the checkpoint-excluded series adds
+   is that the admission is now a number, not a concession.
 4. **`base_changed` on a dependent read overlapping a committed-base advance** — **not re-measured
    here.** The mechanism is arm-independent (`view_request.go`, `lease.go` unchanged), the recorded
    figures stand (3 of 14 single shots at 6,000 files, self-healing in 0.45–1.31 s, 0 leaks in 159
    parsed samples), and the harness now retries a bounded number of times instead of failing a phase
    on one inexact answer. **The retry was not exercised in this arm**: all twelve isolation probes
    (four per run) returned a judgeable answer on their first poll, `leaked: false`, `judged: true`.
-   That is a 1,500-file result and says nothing about 6,000, where the single-shot probe lost the race
-   (§7.5). Whether the candidate *widens* that window relative to `main` remains open
+   That is a 1,500-file result and says nothing about 6,000, where the single-shot probe lost the
+   race (§7.5). Whether the candidate *widens* that window relative to `main` remains open
    (`io-fix-plan` §3).
 5. **Amplification per publish** — `P5_main_advance` is 1,447,530,384 against the baseline's
    5,147,295,504, **0.28 ×**, with 674,583,712 of the candidate's bytes attributed to checkpoints
@@ -823,12 +832,12 @@ misled. **The original numbers are kept; what changes is what they are attribute
 1. **§7.2(2) — "these writes are the primary's own re-index path" is wrong.** The `P2_small_edits`
    3.44 × (16,879,664 → 58,040,984) was not the edit path. 103 % of the delta is one SQLite
    `wal_autocheckpoint(8000)` drain landing inside the window because the candidate entered `P2`
-   about 1,120 WAL frames deeper. Re-reducing the **same frozen artifacts** on the checkpoint-excluded
-   series moves the row to 15,433,968 (0.91 ×) with 42,607,016 booked as checkpoint bytes, and a
-   controlled 40-edit re-run collapsed the ratio to 1.042 × with the candidate's edit path at 0.91 ×
-   of the baseline's. The phase's own claim in §7.2(2) — "the counters show no coordinator build at
-   all" — was true and was the clue; the conclusion drawn from it was not. This arm reads 0.96 ×
-   with **0** checkpoint bytes on either side.
+   about 1,120 WAL frames deeper. Re-reducing the **same frozen artifacts** on the
+   checkpoint-excluded series moves the row to 15,433,968 (0.91 ×) with 42,607,016 booked as
+   checkpoint bytes, and a controlled 40-edit re-run collapsed the ratio to 1.042 × with the
+   candidate's edit path at 0.91 × of the baseline's. The phase's own claim in §7.2(2) — "the
+   counters show no coordinator build at all" — was true and was the clue; the conclusion drawn from
+   it was not. This arm reads 0.96 × with **0** checkpoint bytes on either side.
 2. **§7.2(1), §7.3, §7.4 and §7.5 — the `P4` bytes are a ten-file commit, not the amend.** The
    diagnosis found that every byte of the 108,454,232 lands 1–4 s after the `git add -A && git
    commit` the phase itself performs inside its own window, and that the amend proper is below the
@@ -837,7 +846,8 @@ misled. **The original numbers are kept; what changes is what they are attribute
    amplification. So "a 270 × regression on a same-tree amend that `main` handles for nothing"
    (§7.4) names the wrong stimulus: the amend met the no-op contract; the *commit inside the window*
    did not. The phase is now split (`P4a_commit_tree_change` / `P4b_amend_same_tree`) precisely so
-   this is not re-derivable only from a diagnosis, and this arm reads 265,128 and 248,712 respectively.
+   this is not re-derivable only from a diagnosis, and this arm reads 265,128 and 248,712
+   respectively.
 3. **§7.5 — "We cannot say from this artifact whether the dependent's view leaked" is superseded.**
    It did not leak. The isolation probe returned a truthful, self-healing `fallback_reason:
    "base_changed"` label — reproduced 3 of 14 single shots at 6,000 files, healing in 0.45 / 1.31 /
@@ -847,12 +857,12 @@ misled. **The original numbers are kept; what changes is what they are attribute
 4. **§4 — "no query-log bytes appear in either arm's destination census" is wrong.** They do. The
    query log is written under the cache directory, and the census folded it into the `cache` bucket,
    which is why it was invisible. It now has a bucket of its own
-   (`cmd/gortex/w8_sampler_test.go` `w8BucketQueryLog`), and the two arms show the correction
-   directly: the baseline runs — measured before the bucket existed — carry 127,455 / 128,165 /
-   128,508 bytes in `cache` and 0 in `query_log`, while this arm's candidate runs carry 84 / 84 / 88
-   in `cache` and **136,818 / 120,862 / 126,673 in `query_log`**. Same bytes, previously mislabelled.
-   The rest of §4's paragraph stands: the query log belongs to the MCP surface, the harness drives the
-   CLI, and `GORTEX_QUERY_LOG_DISABLE` remains unreachable through this fixture.
+   (`cmd/gortex/sustained_io_sampler_test.go`, its own census bucket), and the two arms show the
+   correction directly: the baseline runs — measured before the bucket existed — carry 127,455 /
+   128,165 / 128,508 bytes in `cache` and 0 in `query_log`, while this arm's candidate runs carry 84
+   / 84 / 88 in `cache` and **136,818 / 120,862 / 126,673 in `query_log`**. Same bytes, previously
+   mislabelled. The rest of §4's paragraph stands: the query log belongs to the MCP surface, the
+   harness drives the CLI, and `GORTEX_QUERY_LOG_DISABLE` remains unreachable through this fixture.
 5. **§7's `P8_idle_warm` "OVER BUDGET" verdict was read off the wrong series.** The row failed the
    absolute idle ceiling on `ri_logical_writes` (15,181,176 against 8,639,500) at a moment when
    11,481,168 of the baseline's own comparable figure was a periodic checkpoint. On the
@@ -875,29 +885,29 @@ It does not say the write-amplification problem is solved. It is one candidate a
 with the host's load uncontrolled. The 6,000-file scale axis has **not** been re-run post-fix, so
 §7.5's two worst numbers — `P1@6000` 7.44 × and `P4@6000` 674 × — have no post-fix counterpart in
 this document, even though both of their mechanisms (a speculative base publish, and a commit
-misattributed to an amend) are the ones F1 and the `P4` split address. F3b's own targets were missed
-and stay missed. And every caveat of §1 applies to §8 exactly as it applies to §7: process-accounted
-writes are not NAND writes, a WAL size is not cumulative writes, and a small-fixture replay is not
-sustained daemon behaviour.
+misattributed to an amend) are the ones the consumer gate and the `P4` split address. The
+change-bounded delta's own targets were missed and stay missed. And every caveat of §1 applies to §8
+exactly as it applies to §7: process-accounted writes are not NAND writes, a WAL size is not
+cumulative writes, and a small-fixture replay is not sustained daemon behaviour.
 
 ## 9. Limitations and deviations
 
 Each of these narrows what the numbers above may be used for. None of them is a reason to discard
 the comparison; all of them are reasons not to extend it.
 
-1. **Accelerated janitor.** Every measured daemon in §6-§7 runs with
-   `GORTEX_RECONCILE_INTERVAL=5s`, 720x the product's own 1 h default, and so does §8's candidate arm
-   — that is what keeps it comparable with the frozen baseline. When §7 was written the plan's
-   confirmatory arm at the product default had **not** been run and could not be: the fixture set the
-   interval unconditionally and dropped every inherited `GORTEX_*` variable. The interval is now a
-   harness knob (`GXW8_RECONCILE_INTERVAL=product` leaves the variable unset so the daemon takes its
-   own default) and **one confirmatory arm has been run — §8.4**. It remains a single reading under a
-   different configuration against no ceiling, and it is not a second candidate arm: at the 1 h
-   default the janitor does not fire inside an ~11-minute phase set at all, so the two
-   configurations answer different questions. What §8.4 establishes is the size of the acceleration's
-   contribution to the idle floor (`P1` polling 360,448 B/60 s at the default against the frozen
-   baseline's 1,490,944 B/64 s; quiet 53,248 B/60 s) and that the deferred checkpoint drain
-   concentrates instead of spreading.
+1. **Accelerated janitor.** Every measured daemon in §6-§7 runs with `GORTEX_RECONCILE_INTERVAL=5s`,
+   720x the product's own 1 h default, and so does §8's candidate arm — that is what keeps it
+   comparable with the frozen baseline. When §7 was written the plan's confirmatory arm at the
+   product default had **not** been run and could not be: the fixture set the interval
+   unconditionally and dropped every inherited `GORTEX_*` variable. The interval is now a harness
+   knob (`GX_SUSTAINED_IO_RECONCILE_INTERVAL=product` leaves the variable unset so the daemon takes
+   its own default) and **one confirmatory arm has been run — §8.4**. It remains a single reading
+   under a different configuration against no ceiling, and it is not a second candidate arm: at the
+   1 h default the janitor does not fire inside an ~11-minute phase set at all, so the two
+   configurations answer different questions. What §8.4 establishes is the size of the
+   acceleration's contribution to the idle floor (`P1` polling 360,448 B/60 s at the default against
+   the frozen baseline's 1,490,944 B/64 s; quiet 53,248 B/60 s) and that the deferred checkpoint
+   drain concentrates instead of spreading.
 2. **Cold/warm is within a run, not across arms.** Every arm-repetition builds a new fixture, store
    and daemon, so all six runs are cold. "Warm" is `P8_idle_warm` against `P1_idle_cold` inside one
    run. The plan's `{cold, warm}` axis is therefore half-covered.
@@ -925,7 +935,7 @@ the comparison; all of them are reasons not to extend it.
 9. **Two knobs the plan's hazard list asks for are not applied** (§4): `GORTEX_SKIP_STORE_COMPACT`
    and `GORTEX_QUERY_LOG_DISABLE`. Both are unreachable through this fixture, and both were shown by
    source to be inert at this store size and through this surface. No boot VACUUM ran in either arm.
-10. **The reduction step reports; it does not gate.** `TestW8PairedArmsVerdict` writes
+10. **The reduction step reports; it does not gate.** `TestSustainedIOPairedArmsVerdict` writes
     `budgets.json`, `verdict.json` and `verdict.md` and logs every over-budget phase and every
     regression; it does not fail the suite on them. The verdict is evidence for the ledger's gate-8
     row, and a regression is preserved in the artifact rather than turned into a red test that a
@@ -946,37 +956,38 @@ The five below narrow **§8** specifically.
 14. **§8 re-uses the frozen baseline; it does not re-run it.** The three `baseline_rep*` directories
     judged in §8 are byte-for-byte the ones frozen on 2026-09-13, copied read-only into the new
     artifact directory, and `budgets.json` is the same file (md5 `6caf0268…` before and after the
-    reduction). That is deliberate — re-freezing against a fresh baseline would make the two verdicts
-    incomparable — but it means §8's ratios carry **fourteen days of host drift** that the original
-    `A/B/A/B/A/B` interleave was designed to share between the arms. Differences of a few per cent in
-    §8 are worth less than the same difference in §7. The order-of-magnitude movements (`P0` 1.89x →
-    1.04x, `P2` 3.44x → 0.96x, `P4` 270x → 1.28x) are far outside that drift; `P6`'s 1.05x → 0.76x
-    and `P3`'s 0.89x → 0.92x are not.
+    reduction). That is deliberate — re-freezing against a fresh baseline would make the two
+    verdicts incomparable — but it means §8's ratios carry **fourteen days of host drift** that the
+    original `A/B/A/B/A/B` interleave was designed to share between the arms. Differences of a few
+    per cent in §8 are worth less than the same difference in §7. The order-of-magnitude movements
+    (`P0` 1.89x → 1.04x, `P2` 3.44x → 0.96x, `P4` 270x → 1.28x) are far outside that drift; `P6`'s
+    1.05x → 0.76x and `P3`'s 0.89x → 0.92x are not.
 15. **The checkpoint attribution is per sample interval, so the excluded series is a bound, not a
     partition.** `wal_checkpoint_bytes` books the whole `ri_logical_writes` delta of a 1 Hz sample
     interval in which the WAL header showed a reset. A drain spanning several samples leaves the
-    neighbouring samples' bytes unattributed (the confirmatory arm's 18,812,680 unattributed bytes in
-    §8.4 are the clearest instance), and a bracket shorter than one sample can be handed an interval
-    carrying more bytes than the bracket's own delta — which is why `w8ExcludeCheckpoint` clamps at
-    zero rather than going negative. The excluded series is therefore an **upper** bound on
-    non-checkpoint work, and both series are always printed together.
+    neighbouring samples' bytes unattributed (the confirmatory arm's 18,812,680 unattributed bytes
+    in §8.4 are the clearest instance), and a bracket shorter than one sample can be handed an
+    interval carrying more bytes than the bracket's own delta — which is why the
+    checkpoint-exclusion reducer clamps at zero rather than going negative. The excluded series is
+    therefore an **upper** bound on non-checkpoint work, and both series are always printed
+    together.
 16. **§8's idle rows are judged on a sub-window, the baseline's on its phase.** The candidate's
-    `P1`/`P8` ceilings are applied to a 60.0 s polling window; the frozen baseline's are its 64 s and
-    62 s phase rows, which also contain the phase's own bracket overhead. The polling window now runs
-    **first** in the phase, so it opens where the frozen window opened and inherits the preceding
-    phase's decaying tail the way the frozen one did — but the walls are still unequal, and the ratio
-    is not wall-normalised. Per second: `P1` 23,296 B/s baseline against 17,340 B/s candidate
-    (0.74x, where the raw ratio reads 0.70x); `P8` 53,215 B/s against 46,661 B/s (0.88x, raw 0.85x).
-    Neither correction changes a verdict.
-17. **The 6,000-file axis was not re-run after the fix wave.** §7.5's two worst candidate numbers —
-    `P1@6000` 7.44x and `P4@6000` 674x — have **no** post-fix counterpart anywhere in this document,
-    and F1 and the `P4` split address exactly the mechanisms behind both. Whether they are closed at
-    4x the corpus is **unmeasured**, not answered. §7.5 stands as the only 6,000-file evidence and it
-    is n = 1 with an unfinished candidate arm.
-18. **`P4_amend_same_tree`'s 1.28x is preserved without a mechanism.** §8 can say what it is not — no
-    publication (6 dispatched, 6 skipped), no generation movement, not the amend alone (the two
-    sub-windows are 265,128 and 248,712) — but the counters do not name what the extra 112,432 median
-    bytes above the baseline are. It is recorded as a regression rather than explained.
+    `P1`/`P8` ceilings are applied to a 60.0 s polling window; the frozen baseline's are its 64 s
+    and 62 s phase rows, which also contain the phase's own bracket overhead. The polling window now
+    runs **first** in the phase, so it opens where the frozen window opened and inherits the
+    preceding phase's decaying tail the way the frozen one did — but the walls are still unequal,
+    and the ratio is not wall-normalised. Per second: `P1` 23,296 B/s baseline against 17,340 B/s
+    candidate (0.74x, where the raw ratio reads 0.70x); `P8` 53,215 B/s against 46,661 B/s (0.88x,
+    raw 0.85x). Neither correction changes a verdict.
+17. **The 6,000-file axis was not re-run after the round of fixes.** §7.5's two worst candidate
+    numbers — `P1@6000` 7.44x and `P4@6000` 674x — have **no** post-fix counterpart anywhere in this
+    document, and the consumer gate and the `P4` split address exactly the mechanisms behind both.
+    Whether they are closed at 4x the corpus is **unmeasured**, not answered. §7.5 stands as the
+    only 6,000-file evidence and it is n = 1 with an unfinished candidate arm.
+18. **`P4_amend_same_tree`'s 1.28x is preserved without a mechanism.** §8 can say what it is not —
+    no publication (6 dispatched, 6 skipped), no generation movement, not the amend alone (the two
+    sub-windows are 265,128 and 248,712) — but the counters do not name what the extra 112,432
+    median bytes above the baseline are. It is recorded as a regression rather than explained.
 
 ## 10. Reproduction
 
@@ -998,8 +1009,8 @@ done
 **2. Build the harness (one test binary, from this branch's `cmd/gortex`).**
 
 ```bash
-go test -c -o "$R/w84.test" ./cmd/gortex/     # or: harness/validate.sh compile cmd normal
-shasum -a 256 "$R/w84.test"
+go test -c -o "$R/sustained_io.test" ./cmd/gortex/   # or: harness/validate.sh compile cmd normal
+shasum -a 256 "$R/sustained_io.test"
 ```
 
 **3. Run the paired workload.** `env -i` plus an explicit allowlist; nothing is inherited.
@@ -1009,27 +1020,29 @@ mkdir -p "$R/paired1500"/{home,tmp,fixtures} "$SP/artifacts/W8m-W8.4/paired1500"
 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin \
   HOME="$R/paired1500/home" TMPDIR="$R/paired1500/tmp" \
   GORTEX_ISSUE767_ARTIFACT_DIR="$R/paired1500/fixtures" \
-  GXW8_BASELINE_BINARY="$SP/harness/bin/gortex-baseline-56a1c29d" \
-  GXW8_TEST_BINARY="$SP/harness/bin/gortex-2fd5db82" \
-  GXW8_ARTIFACT_DIR="$SP/artifacts/W8m-W8.4/paired1500" \
-  GXW8_REPS=3 GXW8_EDIT_INTERVAL=10s \
-  "$R/w84.test" -test.run '^TestW8SustainedWriteAmplification$' -test.v -test.timeout 8h
+  GX_SUSTAINED_IO_BASELINE_BINARY="$SP/harness/bin/gortex-baseline-56a1c29d" \
+  GX_SUSTAINED_IO_TEST_BINARY="$SP/harness/bin/gortex-2fd5db82" \
+  GX_SUSTAINED_IO_ARTIFACT_DIR="$SP/artifacts/W8m-W8.4/paired1500" \
+  GX_SUSTAINED_IO_REPS=3 GX_SUSTAINED_IO_EDIT_INTERVAL=10s \
+  "$R/sustained_io.test" -test.run '^TestSustainedIOSustainedWriteAmplification$' -test.v -test.timeout 8h
 ```
 
-Without `GXW8_TEST_BINARY` the test skips with a named reason, so it never runs in a default
-`go test ./...`. `GXW8_BASELINE_BINARY` is what makes the run paired; without it only the candidate
-arm runs. The defaults the run used (1,500 files / 60 packages / seed 767 / 10 worktrees /
-20 commits / 10 edits / 60 s idles / 1 s sampling) come from `w8ConfigFromEnv` and every one of them
-has a `GXW8_*` override with bounds that are refused by name.
+Without `GX_SUSTAINED_IO_TEST_BINARY` the test skips with a named reason, so it never runs in a
+default `go test ./...`. `GX_SUSTAINED_IO_BASELINE_BINARY` is what makes the run paired; without it
+only the candidate arm runs. The defaults the run used (1,500 files / 60 packages / seed 767 / 10
+worktrees / 20 commits / 10 edits / 60 s idles / 1 s sampling) come from the harness's
+environment-driven config and every one of them has a `GX_SUSTAINED_IO_*` override with bounds that
+are refused by name.
 
 **4. Freeze the budgets, then judge.** Two invocations, in this order — the first one is the freeze
 and it never reads the candidate:
 
 ```bash
-env ... GXW8_PAIRED_ARTIFACT_DIR="$SP/artifacts/W8m-W8.4/paired1500" GXW8_BUDGETS_ONLY=1 \
-  "$R/w84.test" -test.run '^TestW8PairedArmsVerdict$' -test.v     # writes budgets.json
-env ... GXW8_PAIRED_ARTIFACT_DIR="$SP/artifacts/W8m-W8.4/paired1500" \
-  "$R/w84.test" -test.run '^TestW8PairedArmsVerdict$' -test.v     # writes verdict.json + verdict.md
+env ... GX_SUSTAINED_IO_PAIRED_ARTIFACT_DIR="$SP/artifacts/W8m-W8.4/paired1500" \
+  GX_SUSTAINED_IO_BUDGETS_ONLY=1 \
+  "$R/sustained_io.test" -test.run '^TestSustainedIOPairedArmsVerdict$' -test.v   # writes budgets.json
+env ... GX_SUSTAINED_IO_PAIRED_ARTIFACT_DIR="$SP/artifacts/W8m-W8.4/paired1500" \
+  "$R/sustained_io.test" -test.run '^TestSustainedIOPairedArmsVerdict$' -test.v   # writes verdict.json + verdict.md
 ```
 
 `budgets.json` refuses to be rewritten by the second pass, and the verdict refuses to judge against
@@ -1058,7 +1071,7 @@ diff -r -q -x '.git' -x '*_test.go' -x docs "$R/src" "$W" | grep '^Files .* diff
 ```
 
 **2. Stage the frozen baseline into a NEW artifact directory, then run the candidate arm alone.**
-`GXW8_BASELINE_BINARY` is deliberately unset: without it only the candidate arm runs.
+`GX_SUSTAINED_IO_BASELINE_BINARY` is deliberately unset: without it only the candidate arm runs.
 
 ```bash
 A="$SP/artifacts/W8i-F6/paired1500-postfix"; mkdir -p "$A"
@@ -1070,17 +1083,17 @@ env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin CI=1 NO_COLOR=1 GORTEX_
   XDG_DATA_HOME="$R/data" GORTEX_ISSUE767_ARTIFACT_DIR="$R/fixtures" \
   GOWORK=off GOTOOLCHAIN=local GOFLAGS="-mod=mod -buildvcs=false" GOPROXY=off \
   GOCACHE="$HOME/Library/Caches/go-build" GOMODCACHE="$HOME/go/pkg/mod" \
-  GXW8_TEST_BINARY="$SP/harness/bin/gortex-271a9e9f" GXW8_ARTIFACT_DIR="$A" \
-  GXW8_REPS=3 GXW8_EDIT_INTERVAL=10s \
-  go test -C "$W" -count=1 -timeout 240m -v -run '^TestW8SustainedWriteAmplification$' ./cmd/gortex/
+  GX_SUSTAINED_IO_TEST_BINARY="$SP/harness/bin/gortex-271a9e9f" GX_SUSTAINED_IO_ARTIFACT_DIR="$A" \
+  GX_SUSTAINED_IO_REPS=3 GX_SUSTAINED_IO_EDIT_INTERVAL=10s \
+  go test -C "$W" -count=1 -timeout 240m -v -run '^TestSustainedIOSustainedWriteAmplification$' ./cmd/gortex/
 ```
 
 **3. Judge.** One invocation — the freeze pass is unnecessary because `budgets.json` is already
-there, and `w8WriteFrozenBudgets` reads an existing file rather than overwriting it.
+there, and the frozen-budget writer reads an existing file rather than overwriting it.
 
 ```bash
-env ... GXW8_PAIRED_ARTIFACT_DIR="$A" \
-  go test -C "$W" -count=1 -v -run '^TestW8PairedArmsVerdict$' ./cmd/gortex/
+env ... GX_SUSTAINED_IO_PAIRED_ARTIFACT_DIR="$A" \
+  go test -C "$W" -count=1 -v -run '^TestSustainedIOPairedArmsVerdict$' ./cmd/gortex/
 ```
 
 The reduction logs `augmented_from=aca00104…` and `digest=cbc3794a…`, writes `verdict.json` and
@@ -1089,7 +1102,7 @@ if the candidate's fixture digest differs from the frozen one, if either arm's m
 wrong arm, or if the budget set's contents no longer match the digest recorded inside it.
 
 **The confirmatory default-interval arm (§8.4)** is the same step 2 with
-`GXW8_RECONCILE_INTERVAL=product GXW8_REPS=1` and its own artifact directory
+`GX_SUSTAINED_IO_RECONCILE_INTERVAL=product GX_SUSTAINED_IO_REPS=1` and its own artifact directory
 (`artifacts/W8i-F6/confirm-default-interval`); it is **not** reduced against the frozen budgets,
 because those were frozen at a 5 s janitor and no ceiling in them applies to it.
 
