@@ -132,7 +132,8 @@ configuration are never addressed.**
 
 The fixture builds the daemon's environment itself. It **drops every inherited `GORTEX_*`, `XDG_*`
 and `GIT_*` variable** and appends its own list
-(`cmd/gortex/issue767_fixture_shared_test.go:94-107`), so the only product knobs in force are the
+(the env list `newIssue767FixtureWithCorpus` builds in `cmd/gortex/issue767_fixture_shared_test.go`),
+so the only product knobs in force are the
 ones below; a variable exported by the operator around the run cannot reach either daemon. Each
 run's `manifest.json` records the child's environment verbatim, which is where this table is
 checkable.
@@ -141,21 +142,21 @@ Knobs in force, both arms, each of which changes the numbers:
 
 | knob | value | where | why, and what it costs |
 |---|---|---|---|
-| `GORTEX_RECONCILE_INTERVAL` | `5s` (default `1h`) | fixture env (`issue767_fixture_shared_test.go:104`) | the janitor has to run inside a ~10-minute workload at all. **These are not default-configuration numbers**; the default interval would move almost all reconcile work outside every measured phase. |
-| `--embeddings=false` | off | daemon start flag (`issue767_fixture_shared_test.go:215`) | embeddings are a separate, much larger I/O source and are not what this measures. Note this suppresses embedding *work*, not the model file: both arms retain an identical 33,514,412-byte `embedding_model` bucket in the destination census, which therefore cancels in every comparison. |
-| `GORTEX_TELEMETRY=0` | off | fixture env (`:106`) | telemetry is dormant without an endpoint, but its consent/rollup files under the private data dir are writes like any other. |
-| `GORTEX_DAEMON_PPROF_ADDR` | `127.0.0.1:0` | fixture env (`:104`) | an ephemeral local pprof listener; it writes nothing unless profiled, and it is identical on both arms. |
-| `--backend sqlite --backend-path <root>/store.sqlite`, `--no-progress` | — | daemon start flags (`:215`) | the measured store is one named file inside the private root, so the destination census can attribute it. |
+| `GORTEX_RECONCILE_INTERVAL` | `5s` (default `1h`) | fixture env (`issue767_fixture_shared_test.go`, `newIssue767FixtureWithCorpus`) | the janitor has to run inside a ~10-minute workload at all. **These are not default-configuration numbers**; the default interval would move almost all reconcile work outside every measured phase. |
+| `--embeddings=false` | off | daemon start flag (`issue767_fixture_shared_test.go`, `(*issue767Fixture).start`) | embeddings are a separate, much larger I/O source and are not what this measures. Note this suppresses embedding *work*, not the model file: both arms retain an identical 33,514,412-byte `embedding_model` bucket in the destination census, which therefore cancels in every comparison. |
+| `GORTEX_TELEMETRY=0` | off | fixture env (`newIssue767FixtureWithCorpus`) | telemetry is dormant without an endpoint, but its consent/rollup files under the private data dir are writes like any other. |
+| `GORTEX_DAEMON_PPROF_ADDR` | `127.0.0.1:0` | fixture env (`newIssue767FixtureWithCorpus`) | an ephemeral local pprof listener; it writes nothing unless profiled, and it is identical on both arms. |
+| `--backend sqlite --backend-path <root>/store.sqlite`, `--no-progress` | — | daemon start flags (`(*issue767Fixture).start`) | the measured store is one named file inside the private root, so the destination census can attribute it. |
 | `GX_SUSTAINED_IO_EDIT_INTERVAL` | `10s` (harness default `30s`) | harness knob, not a product knob | six arm-repetitions at 30 s between edits add 20 minutes of pure waiting. The edits themselves are unchanged; only the quiet time between them is shorter, which makes `P2_small_edits` a denser workload than the default and is applied identically to both arms. |
 
-Two knobs the execution plan's hazard list asks for are **not** applied, and this is deliberate:
+Two knobs the measurement protocol's hazard list asks for are **not** applied, and this is deliberate:
 
 - **`GORTEX_SKIP_STORE_COMPACT=1`** cannot reach the daemon (the fixture drops inherited `GORTEX_*`),
   and it would be a no-op here in any case: `maybeCompactStore` VACUUMs only when the freelist is
   **both** larger than 1 GiB and more than half the file's pages
   (`cmd/gortex/daemon_compact.go:47-65`, byte-identical at `56a1c29d`), while the largest store any
   arm reached is ~330 MB. The boot VACUUM never ran in either arm, so nothing was suppressed and
-  nothing the plan wanted excluded was measured. Verified by source, not by absence of evidence.
+  nothing the hazard list wanted excluded was measured. Verified by source, not by absence of evidence.
 - **`GORTEX_QUERY_LOG_DISABLE=1`** is likewise unreachable, and the query log belongs to the MCP
   surface (`internal/mcp/query_log.go:121`). The harness drives the CLI; no query-log bytes appear
   in either arm's destination census, whose 14 buckets account for every retained byte.
@@ -215,7 +216,7 @@ once with `GX_SUSTAINED_IO_BUDGETS_ONLY=1`, which reads only the `baseline_rep*`
 stops, and once without, which produces the verdict. Section 6 was written from the first run's
 output before the second was started.
 
-**Ceilings**, from the execution plan's paired-I/O protocol:
+**Ceilings**, from the paired-I/O protocol:
 
 | phase | ceiling |
 |---|---|
@@ -269,8 +270,8 @@ The ceilings, in the words that travel with them in `budgets.json`:
 
 - `P1_idle_cold` — `min(baseline median 1,490,944, 8 MiB per 60 s scaled to 64 s = 8,878,313)`.
 - `P8_idle_warm` — `min(baseline median 14,820,872, 8 MiB per 60 s scaled to 62 s = 8,639,500)`.
-  Note which way this one binds: the baseline itself **exceeds** the plan's absolute idle budget, so
-  the ceiling the candidate is judged against is the plan's 8 MiB figure, not the baseline's
+  Note which way this one binds: the baseline itself **exceeds** the protocol's absolute idle budget,
+  so the ceiling the candidate is judged against is the protocol's 8 MiB figure, not the baseline's
   behaviour.
 - `P2_small_edits` — at most the baseline median, 16,879,664.
 - `P5_main_advance` — the headline: 0.50 × 5,147,295,504 = 2,573,647,752.
@@ -370,7 +371,7 @@ These are not rounded away. Two of them are over a frozen ceiling.
    in the primary. The phase's counters show no coordinator build at all — no
    `views_coordinator_cycle_total{built_dirty}`, no dedicated-base activity — so these writes are the
    primary's own re-index path, not the view machinery. The candidate's store also grows during the
-   phase (116 MB vs the baseline's flat 58 MB). The plan's own budget for this phase was "at most the
+   phase (116 MB vs the baseline's flat 58 MB). The protocol's own budget for this phase was "at most the
    baseline"; it is missed by more than 3 ×.
 
    > **Correction (§8.6(1)).** "These writes are the primary's own re-index path" is **wrong**.
@@ -391,9 +392,9 @@ These are not rounded away. Two of them are over a frozen ceiling.
 And one ceiling miss that is not a regression against the baseline:
 
 4. **`P8_idle_warm` over the absolute idle ceiling** — 15.2 MB median against 8,639,500. The ratio to
-   the baseline is 1.02 ×, i.e. the two arms idle almost identically; what fails is the plan's
+   the baseline is 1.02 ×, i.e. the two arms idle almost identically; what fails is the protocol's
    absolute 8 MiB/60 s figure, which **the baseline also exceeds** (14.8 MB). Both binaries write
-   more than the plan's idle budget on a worked store, so this is an absolute-budget miss shared by
+   more than the protocol's idle budget on a worked store, so this is an absolute-budget miss shared by
    the arms rather than something the branch introduced. One candidate repetition is an outlier —
    **194,968,104 bytes** in a 62-second idle window — and its cause is visible in the artifact: that
    repetition's idle phase published two generations (`seq_delta=2`, one `built_commit` and one
@@ -418,7 +419,7 @@ And one ceiling miss that is not a regression against the baseline:
   the noise of three repetitions. `P3` (touch with identical bytes, `git add -A`, `git reset`) is a
   true no-op on both arms — 0.33 MB and 0.36 MB, with zero disk-counter bytes and no generation
   movement anywhere.
-- **Generation sequence across idle and no-op phases** (the plan's `sqlite_sequence.seq` invariant,
+- **Generation sequence across idle and no-op phases** (the protocol's `sqlite_sequence.seq` invariant,
   recorded here, asserted in the no-op matrix): `+0` for `P1`, `P2`, `P3` in all three candidate
   repetitions and `+0` for `P8` in two of three — the third is the outlier above. The baseline is
   `+0` for `P1`–`P4` and `P8`. Note `P4`: the candidate moves the sequence by **+1** on a same-tree
@@ -440,7 +441,7 @@ process-accounted writes of the phase it targets — main advancing under ten de
 leaves **less** retained storage behind. It pays for that with **1.89 ×** the writes of a cold index
 and a store twice as large until the workload works it down, **3.44 ×** the writes of ten dirty edits
 (over its frozen ceiling), and a **270 ×** regression on a same-tree amend that `main` handles for
-nothing. Idle behaviour is unchanged within noise, and both binaries exceed the plan's absolute idle
+nothing. Idle behaviour is unchanged within noise, and both binaries exceed the protocol's absolute idle
 budget on a worked store. Nothing here says the write-amplification problem is fixed; it says one
 named phase improved by a measured factor on one fixture, under the accelerations of §4, and that
 three other phases got worse in ways the branch should answer for.
@@ -456,7 +457,7 @@ three other phases got worse in ways the branch should answer for.
 
 ### 7.5 The 6,000-file arm — one repetition, and the candidate did not finish it
 
-The plan's scale axis asks for `{1500, 6000}`. With 56 GiB free the 6,000-file pair was run **once**
+The protocol's scale axis asks for `{1500, 6000}`. With 56 GiB free the 6,000-file pair was run **once**
 (`GX_SUSTAINED_IO_FIXTURE_FILES=6000 GX_SUSTAINED_IO_FIXTURE_PACKAGES=120 GX_SUSTAINED_IO_REPS=1`,
 everything else identical), artifacts under `artifacts/W8m-W8.4/paired6000`, log
 `logs/w84-paired6000.log`. One repetition is a single reading, not a median: it is reported to show
@@ -482,7 +483,7 @@ is not a like-for-like teardown).
 exactness waits on the primary and the ten dependents having succeeded — the phase's trailing
 isolation probe asks dependent `wt01` for the main-only symbol and expects "not found". That single
 probe came back carrying a non-exact / tool-error label, and `issue767Verdict`
-(`issue767_fixture_shared_test.go:461-464`) turns any such answer into an error rather than a
+(`cmd/gortex/issue767_fixture_shared_test.go`) turns any such answer into an error rather than a
 verdict; `requireIsolation` is fatal on any arm that is not the baseline, so the phase failed. The
 diagnostics the harness wrote at that moment
 (`paired6000/candidate_rep1/diagnostics_P5_main_advance.json`) show all ten dependents
@@ -728,7 +729,7 @@ than at the 1 h product default.
 
 ### 8.4 The confirmatory default-interval arm
 
-§9(1) records that the execution plan's confirmatory arm at the product's 1 h janitor default had
+§9(1) records that the confirmatory arm at the product's 1 h janitor default had
 never been run. The harness corrections made the interval a harness knob
 (`GX_SUSTAINED_IO_RECONCILE_INTERVAL=product`, which leaves `GORTEX_RECONCILE_INTERVAL` unset so the
 daemon takes its own default), and it has now been run **once**, same binary, same fixture digest,
@@ -802,7 +803,7 @@ The six design costs the round of fixes declared rather than fixed
    unexplained idle regression.** In the first verdict it was 11,481,168 of the 15,181,176-byte `P8`
    median (75.6 %). Here `P8`'s judged (excluded) median is 2,799,664 with a checkpoint median of 0
    and a max of 108,840,832; the confirmatory arm at the product janitor interval concentrates it
-   —93,642,392 checkpoint bytes in one 60 s window (§8.4). The plan's gate-2 wording ("idle must
+   —93,642,392 checkpoint bytes in one 60 s window (§8.4). The gate-2 wording ("idle must
    write nothing beyond bounded bookkeeping") is still unsatisfiable for any WAL store and still has
    to admit the deferred drain of already-committed work; what the checkpoint-excluded series adds
    is that the admission is now a number, not a concession.
@@ -897,7 +898,7 @@ the comparison; all of them are reasons not to extend it.
 
 1. **Accelerated janitor.** Every measured daemon in §6-§7 runs with `GORTEX_RECONCILE_INTERVAL=5s`,
    720x the product's own 1 h default, and so does §8's candidate arm — that is what keeps it
-   comparable with the frozen baseline. When §7 was written the plan's confirmatory arm at the
+   comparable with the frozen baseline. When §7 was written the confirmatory arm at the
    product default had **not** been run and could not be: the fixture set the interval
    unconditionally and dropped every inherited `GORTEX_*` variable. The interval is now a harness
    knob (`GX_SUSTAINED_IO_RECONCILE_INTERVAL=product` leaves the variable unset so the daemon takes
@@ -910,7 +911,7 @@ the comparison; all of them are reasons not to extend it.
    drain concentrates instead of spreading.
 2. **Cold/warm is within a run, not across arms.** Every arm-repetition builds a new fixture, store
    and daemon, so all six runs are cold. "Warm" is `P8_idle_warm` against `P1_idle_cold` inside one
-   run. The plan's `{cold, warm}` axis is therefore half-covered.
+   run. The protocol's `{cold, warm}` axis is therefore half-covered.
 3. **Darwin only.** The primary series comes from `proc_pid_rusage(RUSAGE_INFO_V4)`. The Linux
    `/proc/<pid>/io` path exists in the sampler and is exercised by unit tests, but no Linux arm was
    run, so nothing here describes Linux behaviour.
@@ -932,7 +933,7 @@ the comparison; all of them are reasons not to extend it.
 8. **Host load was not controlled.** Other agents compiled and ran test suites throughout. The
    `A/B/A/B/A/B` interleave shares that drift between the arms instead of concentrating it in one,
    and the per-repetition min/max show how much of it there was.
-9. **Two knobs the plan's hazard list asks for are not applied** (§4): `GORTEX_SKIP_STORE_COMPACT`
+9. **Two knobs the hazard list asks for are not applied** (§4): `GORTEX_SKIP_STORE_COMPACT`
    and `GORTEX_QUERY_LOG_DISABLE`. Both are unreachable through this fixture, and both were shown by
    source to be inert at this store size and through this surface. No boot VACUUM ran in either arm.
 10. **The reduction step reports; it does not gate.** `TestSustainedIOPairedArmsVerdict` writes

@@ -28,7 +28,7 @@ evidence and the narrowing for each. In one paragraph: G1 (snapshot correctness)
 costs) and G9 (storage/recovery safety) are `blocked with evidence` — G1 on two gate-1 divergences
 from the edit taxonomy (a withdrawn path's name and an excluded package's name are both still
 served) plus five resolution/provenance cases that fail on **both** arms and therefore reproduce on
-`main 56a1c29d`; G8 on the change-bounded dedicated delta's own re-measurement missing both plan
+`main 56a1c29d`; G8 on the change-bounded dedicated delta's own re-measurement missing both of its
 targets (7.91 MB against ≤ 1 MB, 83.0 MB against ≤ 20 MB), the generation bulk window's unverified
 second-copy payload ceiling, a `P4_amend_same_tree` 1.28× regression with no identified mechanism, a
 6,000-file scale axis never re-run after the fixes, an unexercised typed closure limit and a vacuous
