@@ -47,6 +47,32 @@ narrower per-item sense recorded by the wave that landed it (implemented + compi
 wired + verifier `pass`); it is **not** a gate closure. The gate table below is the authority on
 what is closed, and it closes nothing.
 
+## September 16: Windows fixture verification
+
+The CI run [35025560023](https://github.com/zzet/gortex/actions/runs/35025560023) for PR head `6e7b2db8ca39499c4321dff6ba534eef26078b2a` is finished: ten of twelve test partitions pass, including all Linux and macOS partitions. All ancillary jobs pass. The Windows remaining-packages job fails only `TestFilesystemSafeRegularFileWindows/in_root_parent_link`; Windows indexer fails the source-rebind test and three failed-file accounting tests. Its actual checkout is merge `388b65f3496993afc1379833d4a520473de9587b`, whose tree `55065ac9d819bfe7be48804a6a085baa3872bac4` equals the PR head tree. The original failure logs and complete run archives are retained.
+
+Two test corrections are saved. The confined Windows parent-symlink fixture now uses a relative target, as required by Go 1.27 `os.Root`; its outside-root control uses a real relative sibling escape and requires both rejection and no bytes. Only the explicit missing-symlink-privilege error allows a creation skip. The ownership-rebind test now expects working filesystem ownership on Windows and exercises the existing same-source update/invalidation assertions there. Explicit sparse-source `Unknown` controls and Git-rebind assertions remain. Neither change alters production code or the Windows parent-directory oplock limitation.
+
+The other three Windows failures remain unresolved. Their existing Windows helper already opens an exclusive native file handle; the POSIX `chmod` explanation is incorrect for this source. The helper blob in the working copy equals the committed blob, and a Go 1.27 Windows/amd64 package-selection query selects it. This reconstructs selection; the CI job did not publish its own compiler-input manifest. Source inspection shows that a read error after admission must enter `FailedFiles`; the unresolved boundary is before that read or in source selection.
+
+One existing batch regression now logs and checks fixture preconditions after read denial: stale state, scoped admission, successful metadata lookup, failed content read, and the fixture's default filesystem source. The original failed-file, sibling-commit, retained graph/watermark and retry assertions remain. The other two failing tests are unchanged. This is diagnostic evidence for the next Windows run, **not a claim that those three failures are repaired**. The proposed synthetic content-source replacement was held because it could bypass the unresolved default-filesystem boundary.
+
+The physical test-source identities before this follow-up push are:
+
+| File | SHA-256 |
+| --- | --- |
+| `internal/indexer/source/safe_regular_file_windows_test.go` | `95b32af6dbe57c1a0651afdffa8e0d2abc4141f6715fff9696d4f8a1c6c1ce75` |
+| `internal/indexer/go_package_ownership_binding_test.go` | `af64a73ca71bfcdd1a3e13387f9751b3ee27b074f808101f4a401f9249166076` |
+| `internal/indexer/incremental_batch_test.go` | `de1275af5b7d952961583775d0bbfb417c942709c1df7accc56700916802ddf7` |
+
+The four affected indexer tests pass locally with no skips or failures: normal `0.621s` package / `24.359s` command time; race plus coverage `3.532s` / `41.161s`. Declared inputs remain stable for each run. The preconditions hold on Darwin; these runs do not execute Windows behavior. The separate Windows source-package test binary compiles with Go 1.27 and was removed after hashing; compilation is not Windows runtime proof.
+
+Fresh whole-module build, vet, test compilation and lint pass; lint reports no issues. All 154 test packages compile and 40 packages have no tests; compile-only events are not executed test counts. Formatting passes for the three changed Go files. The fresh indexer and MCP inventories contain the same 2,090 and 3,629 ordinary test names as the preceding source. Static/census input identity is `aab8a25dbfb9764a8600a7f41789a290b17cdcc2362516f598c3f4dccc02c281`; the formatter additionally records the platform-excluded Windows test. The isolated Go 1.27 Darwin checks use the recorded private home/Git/temp configuration, shared caches, `GOMAXPROCS=2`, and `GOMEMLIMIT=2GiB`.
+
+A new reuse assessment retains 26 previous Go results whose declared repository inputs are unchanged: all 3,382 distinct repository inputs in that scope were rehashed with zero mismatches. The six static/census checks and formatter are refreshed. The prior full indexer normal run and seven full race/coverage chunks remain historical evidence at the earlier source; they are not relabeled as full-suite runs of these diagnostic edits. The manifests are not hermetic coverage of external caches, system SDKs or runtime-discovered inputs.
+
+Evidence is in the durable validation directory: `ci-repair-head-root-resume-20260915T2205Z/final-ci-report.json`, `windows-helper-ci-source-provenance.json`, `windows-parent-link-ci-repair-20260915T2142Z/`, `windows-binding-ci-repair-20260915T2208Z/`, and `windows-followup-final-20260915T220602Z/` (source freeze, per-run manifests, summaries and reuse assessment). This row supplements G10 evidence. It precedes the diagnostic push; fresh Windows CI is pending. All existing acceptance-gate states and historical product/E2E measurement boundaries are retained.
+
 ## September 15: portability repairs and maintenance validation
 
 This entry records completed local validation at 2026-09-15T21:13:00.996583+00:00. The repairs had not yet been pushed at preparation time; platform CI is recorded separately below.
