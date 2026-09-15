@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -88,8 +89,19 @@ func writeSideChannelTree(t *testing.T, root string, files map[string]string) {
 // compileDBFor renders a one-TU compile database whose include search path is
 // the given repo-relative directory.
 func compileDBFor(dir, includeDir string) string {
-	return `[{"directory": "` + dir + `", "file": "src/main.c",` +
-		` "arguments": ["cc", "-I` + includeDir + `", "-c", "src/main.c"]}]`
+	data, err := json.Marshal([]struct {
+		Directory string   `json:"directory"`
+		File      string   `json:"file"`
+		Arguments []string `json:"arguments"`
+	}{{
+		Directory: dir,
+		File:      "src/main.c",
+		Arguments: []string{"cc", "-I" + includeDir, "-c", "src/main.c"},
+	}})
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }
 
 // cppIncludeDirsCached reports what the process-wide, root-keyed compile-DB
@@ -488,6 +500,9 @@ func TestHeuristicIncludeRootFollowsASymlinkOnTheWorkingCopy(t *testing.T) {
 // same divergence: the conventional-root clause never needed a listing of the
 // repo root, so a root that can be traversed but not enumerated still answers.
 func TestHeuristicIncludeRootsSurviveAnUnlistableRoot(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("Windows chmod does not deny directory enumeration")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores the directory read bit")
 	}
