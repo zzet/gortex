@@ -40,8 +40,7 @@ type fanoutFixture struct {
 func newFanoutFixture(t *testing.T) *fanoutFixture {
 	t.Helper()
 	dir := t.TempDir()
-	store, err := store_sqlite.Open(filepath.Join(dir, "catalog.sqlite"))
-	require.NoError(t, err)
+	store := builderOpenStoreAt(t, filepath.Join(dir, "catalog.sqlite"))
 	t.Cleanup(func() { _ = store.Close() })
 
 	mi := NewMultiIndexer(store, newTestRegistry(), search.NewNull(), nil, zap.NewNop())

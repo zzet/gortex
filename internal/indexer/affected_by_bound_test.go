@@ -1097,8 +1097,7 @@ func (s *fanoutBroadcastingStore) AddBatch(nodes []*graph.Node, edges []*graph.E
 }
 
 func TestBatchReceiptFanoutAdmitsOnlyWhatItObserved(t *testing.T) {
-	base, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
-	require.NoError(t, err)
+	base := builderOpenStoreAt(t, filepath.Join(t.TempDir(), "graph.sqlite"))
 	t.Cleanup(func() { _ = base.Close() })
 	shared := &fanoutBroadcastingStore{Store: base, fact: graph.ReceiptFanoutTruncation{
 		Pass: affectedByFanoutPass, Cap: 1, Considered: 4, Dropped: 1,

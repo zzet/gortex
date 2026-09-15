@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"go.uber.org/zap"
@@ -184,17 +185,152 @@ func builderWriteTree(t testing.TB, dir string, tree map[string]string) {
 
 func builderOpenStore(t testing.TB, name string) *store_sqlite.Store {
 	t.Helper()
-	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), name+".sqlite"))
-	if err != nil {
-		t.Fatalf("open %s store: %v", name, err)
-	}
+	store := builderOpenStoreAt(t, filepath.Join(t.TempDir(), name+".sqlite"))
 	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
 
+// builderOpenStoreAt opens a private, writable store, seeding only a new path.
+//
+// store_sqlite.Open on a path that does not exist yet has to run the whole
+// schema creation, which costs a few hundred milliseconds under -race, and
+// this package's fixtures do it hundreds of times for the same empty
+// database. builderStoreTemplate pays for that once and hands back the bytes;
+// writing them out first means Open finds a file already at
+// currentSchemaVersion and reconciles nothing. The store that comes back is a
+// separate file with its own connections — nothing is shared but the initial
+// bytes — so a caller may write to it exactly as before.
+//
+// The caller owns the returned store and must close it; builderOpenStore is
+// the variant that registers the close for you.
+func builderOpenStoreAt(t testing.TB, path string) *store_sqlite.Store {
+	t.Helper()
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		if seed, err := builderStoreTemplate(); err == nil {
+			// Never truncate an existing database or follow a symlink while
+			// seeding, including one created after the Lstat above.
+			file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if err == nil {
+				_, writeErr := file.Write(seed)
+				closeErr := file.Close()
+				if writeErr != nil {
+					t.Fatalf("seed the store at %s: %v", path, writeErr)
+				}
+				if closeErr != nil {
+					t.Fatalf("close the seeded store at %s: %v", path, closeErr)
+				}
+			} else if !errors.Is(err, os.ErrExist) {
+				t.Fatalf("create the store at %s: %v", path, err)
+			}
+		}
+	} else if err != nil {
+		t.Fatalf("lstat the store at %s: %v", path, err)
+	}
+	store, err := store_sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("open the store at %s: %v", path, err)
+	}
+	return store
+}
+
+// Reusing immutable schema bytes must not turn a reopen into a reset or leak
+// one fixture's writes into a later fixture cloned from the same template.
+func TestBuilderStoreTemplatePreservesReopenedDataAndPrivateCopies(t *testing.T) {
+	repoDir := builderTempDir(t, "repo")
+	builderWriteTree(t, repoDir, map[string]string{
+		"keep.go": "package fixture\nfunc Keep() {}\n",
+	})
+	path := filepath.Join(t.TempDir(), "reopen.sqlite")
+	first := builderOpenStoreAt(t, path)
+	t.Cleanup(func() { _ = first.Close() })
+	builderIndex(t, first, repoDir)
+	const keepID = builderRepoPrefix + "/keep.go::Keep"
+	if first.GetNode(keepID) == nil {
+		t.Fatal("fixture index did not persist Keep")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close the first store: %v", err)
+	}
+
+	reopened := builderOpenStoreAt(t, path)
+	t.Cleanup(func() { _ = reopened.Close() })
+	if reopened.GetNode(keepID) == nil {
+		t.Fatal("opening an existing store discarded its indexed data")
+	}
+
+	independent := builderOpenStore(t, "independent")
+	if independent.GetNode(keepID) != nil {
+		t.Fatal("a fresh template copy inherited another store's writes")
+	}
+	builderWriteTree(t, repoDir, map[string]string{
+		"other.go": "package fixture\nfunc Other() {}\n",
+	})
+	builderIndex(t, independent, repoDir)
+	const otherID = builderRepoPrefix + "/other.go::Other"
+	if independent.GetNode(otherID) == nil {
+		t.Fatal("independent store did not persist Other")
+	}
+	if reopened.GetNode(keepID) == nil || reopened.GetNode(otherID) != nil {
+		t.Fatal("writing a private template copy changed the reopened store")
+	}
+}
+
+var (
+	builderStoreTemplateOnce  sync.Once
+	builderStoreTemplateBytes []byte
+	builderStoreTemplateErr   error
+)
+
+// builderStoreTemplate returns the bytes of an empty database that has already
+// been through store_sqlite.Open. A failure is not fatal — builderOpenStoreAt
+// falls back to letting Open build the schema itself — so the helper degrades
+// into exactly the behaviour it replaced rather than failing a test.
+func builderStoreTemplate() ([]byte, error) {
+	builderStoreTemplateOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "gortex-indexer-store-template")
+		if err != nil {
+			builderStoreTemplateErr = err
+			return
+		}
+		defer func() { _ = os.RemoveAll(dir) }()
+		path := filepath.Join(dir, "template.sqlite")
+		store, err := store_sqlite.Open(path)
+		if err != nil {
+			builderStoreTemplateErr = err
+			return
+		}
+		if err := store.Close(); err != nil {
+			builderStoreTemplateErr = err
+			return
+		}
+		// A close that left a write-ahead log behind would make the bytes an
+		// incomplete database; refuse the template rather than seed one.
+		for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+			if info, err := os.Stat(sidecar); err == nil && info.Size() > 0 {
+				builderStoreTemplateErr = fmt.Errorf("store template left %s behind", filepath.Base(sidecar))
+				return
+			}
+		}
+		builderStoreTemplateBytes, builderStoreTemplateErr = os.ReadFile(path)
+	})
+	return builderStoreTemplateBytes, builderStoreTemplateErr
+}
+
+// builderRegistry returns a fully populated registry owned by its caller.
+// Extractors have mutable configuration and lifetimes even when the registry's
+// lookup maps are read-only, so fixtures must not share them across tests or
+// independent indexers.
 func builderRegistry() *parser.Registry {
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
+	return reg
+}
+
+// builderGoRegistry is for fixtures whose complete source inventory is Go.
+// It owns a fresh Go extractor and does not narrow generic fixture coverage.
+func builderGoRegistry() *parser.Registry {
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
 	return reg
 }
 

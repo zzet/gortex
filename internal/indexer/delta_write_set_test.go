@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 // The committed-base delta's WRITE SET.
@@ -206,8 +207,13 @@ type deltaWriteSetFixture struct {
 
 func newDeltaWriteSetFixture(t testing.TB, tree map[string]string) deltaWriteSetFixture {
 	t.Helper()
+	return newDeltaWriteSetFixtureWithRegistry(t, tree, builderRegistry())
+}
+
+func newDeltaWriteSetFixtureWithRegistry(t testing.TB, tree map[string]string, registry *parser.Registry) deltaWriteSetFixture {
+	t.Helper()
 	ctx := context.Background()
-	builder, request, git := privateDedicatedBuilderFixture(t)
+	builder, request, git := privateDedicatedBuilderFixtureWithRegistry(t, registry)
 	deltaWriteSetWriteTree(t, request.RootPath, tree)
 	git("add", "-A")
 	git("-c", "user.name=Delta Test", "-c", "user.email=delta@example.invalid",
@@ -353,8 +359,17 @@ func TestDedicatedDeltaWriteSetIsTheChangeNotTheClosure(t *testing.T) {
 // package the closure walk reaches is not fixed; what is fixed is that the
 // write set tracks the change and not the closure.
 func TestDedicatedDeltaWriteSetOnACrossPackageCorpus(t *testing.T) {
-	const files, packages = 240, 12
-	fixture := newDeltaWriteSetFixture(t, deltaWriteSetPkgTree(files, packages, false))
+	// The corpus only has to be wide enough that the closure dwarfs the
+	// ten-file change set; the assertions below are ratios, so the shape
+	// matters and the absolute size does not. Twelve packages keep every arm
+	// of deltaWriteSetPkgSource — the aliased cross-package import, the
+	// intra-package calls, the inbound value flow — present at ten files each.
+	const files, packages = 120, 12
+	// wideClosure is five eighths of the corpus: the same proportion the
+	// original 240-file fixture expressed as a flat 150, so the gate is no
+	// looser for the corpus being smaller.
+	const wideClosure = files * 5 / 8
+	fixture := newDeltaWriteSetFixtureWithRegistry(t, deltaWriteSetPkgTree(files, packages, false), builderGoRegistry())
 	before := deltaWriteSetStoreBytes(t, fixture.request.StorePath)
 	generationID, report := fixture.advance(t, deltaWriteSetPkgTree(files, packages, true))
 	after := deltaWriteSetStoreBytes(t, fixture.request.StorePath)
@@ -370,8 +385,9 @@ func TestDedicatedDeltaWriteSetOnACrossPackageCorpus(t *testing.T) {
 		len(carried), nodes, len(handle.AllEdges()),
 		report.ContextMasks, len(report.ContextRetainedPaths), report.ContextHeldInMemory)
 
-	if len(report.ClosurePaths) < 150 {
-		t.Fatalf("closure spans %d files; the measurement needs a wide closure", len(report.ClosurePaths))
+	if len(report.ClosurePaths) < wideClosure {
+		t.Fatalf("closure spans %d files, want at least %d; the measurement needs a wide closure",
+			len(report.ClosurePaths), wideClosure)
 	}
 	for _, want := range deltaWriteSetPkgChangedPaths(fixture.request.RepoPrefix, packages) {
 		if !slices.Contains(carried, want) {

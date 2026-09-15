@@ -13,10 +13,7 @@ import (
 func repositoryAdmissionFixture(t *testing.T) (*CheckoutLifecycle, store_sqlite.RepositoryCleanupIdentity) {
 	t.Helper()
 	root := t.TempDir()
-	store, err := store_sqlite.Open(filepath.Join(root, "admissions.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := builderOpenStoreAt(t, filepath.Join(root, "admissions.sqlite"))
 	t.Cleanup(func() { _ = store.Close() })
 	ctx := context.Background()
 	catalog := store.Catalog()

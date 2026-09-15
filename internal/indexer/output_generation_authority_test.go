@@ -22,7 +22,6 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/persistence"
 )
@@ -1087,10 +1086,7 @@ func TestRepositoryCleanupLeavesPersistenceSidecarsAlone(t *testing.T) {
 	}
 
 	dataDir := t.TempDir()
-	store, err := store_sqlite.Open(filepath.Join(dataDir, "graph.sqlite"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
+	store := builderOpenStoreAt(t, filepath.Join(dataDir, "graph.sqlite"))
 	t.Cleanup(func() { _ = store.Close() })
 
 	// The primary name is the production one, read from the package that owns

@@ -22,7 +22,6 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
-	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/testdsn"
 )
 
@@ -56,6 +55,11 @@ type dedicatedBuilderFixtureRequest struct {
 
 func privateDedicatedBuilderFixture(t testing.TB) (*SparseGenerationBuilder, dedicatedBuilderFixtureRequest, func(...string) string) {
 	t.Helper()
+	return privateDedicatedBuilderFixtureWithRegistry(t, builderRegistry())
+}
+
+func privateDedicatedBuilderFixtureWithRegistry(t testing.TB, registry *parser.Registry) (*SparseGenerationBuilder, dedicatedBuilderFixtureRequest, func(...string) string) {
+	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
 	git := func(args ...string) string {
@@ -83,17 +87,12 @@ func privateDedicatedBuilderFixture(t testing.TB) (*SparseGenerationBuilder, ded
 	git("-c", "user.name=Private Test", "-c", "user.email=private@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "initial committed snapshot")
 	tree, commit := git("rev-parse", "HEAD^{tree}"), git("rev-parse", "HEAD")
 	storePath := filepath.Join(t.TempDir(), "store.sqlite")
-	store, err := store_sqlite.Open(storePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := builderOpenStoreAt(t, storePath)
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
 			t.Error(err)
 		}
 	})
-	registry := parser.NewRegistry()
-	languages.RegisterAll(registry)
 	builder := &SparseGenerationBuilder{Store: store, Registry: registry, Config: config.Default().Index, Logger: zap.NewNop()}
 	// ExtractorVersions is the REAL fingerprint rather than a placeholder token,
 	// because it is not an opaque identity component: a reservation's
@@ -886,17 +885,13 @@ func TestPrivateEmptyCommittedDedicatedBaseAcceptance(t *testing.T) {
 		t.Fatalf("fixture tree is not empty: %q", got)
 	}
 	storePath := filepath.Join(t.TempDir(), "store.sqlite")
-	store, err := store_sqlite.Open(storePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := builderOpenStoreAt(t, storePath)
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
 			t.Error(err)
 		}
 	})
-	registry := parser.NewRegistry()
-	languages.RegisterAll(registry)
+	registry := builderRegistry()
 	builder := &SparseGenerationBuilder{Store: store, Registry: registry, Config: config.Default().Index, Logger: zap.NewNop()}
 	catalog := store.Catalog()
 	const prefix = "private-empty"

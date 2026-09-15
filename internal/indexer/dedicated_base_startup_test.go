@@ -899,8 +899,7 @@ func TestDedicatedBaseRuntimeTypedNilHandleDegradesInsteadOfPanicking(t *testing
 // focused unit behind the shutdown bound above.
 func TestInitialBasePublisherPublicationContextIsCancelledByAdmissionClose(t *testing.T) {
 	dir := t.TempDir()
-	store, err := store_sqlite.Open(filepath.Join(dir, "store.sqlite"))
-	require.NoError(t, err)
+	store := builderOpenStoreAt(t, filepath.Join(dir, "store.sqlite"))
 	t.Cleanup(func() { _ = store.Close() })
 	runtime, err := NewDedicatedBaseRuntime(store, graphview.NewLeaseManager())
 	require.NoError(t, err)

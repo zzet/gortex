@@ -254,10 +254,7 @@ func (f dedicatedDeltaFixture) assertColdStructure(t *testing.T, ctx context.Con
 // remains above; its observed builtin scope difference is not normalized away.
 func (f dedicatedDeltaFixture) coldPositive(t *testing.T, ctx context.Context, request ClaimedDedicatedDeltaRequest) graph.Reader {
 	t.Helper()
-	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "cold-positive.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := builderOpenStoreAt(t, filepath.Join(t.TempDir(), "cold-positive.sqlite"))
 	t.Cleanup(func() { _ = store.Close() })
 	catalog := store.Catalog()
 	owner := request.Claim.Desire.Authority

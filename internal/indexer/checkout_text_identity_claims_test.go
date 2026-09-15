@@ -13,10 +13,7 @@ import (
 // search route or immutable positive-base corpus selection. All storage is
 // explicit and private. Root's isolated package harness supplies init isolation.
 func TestCheckoutTextLayerClaimsKeepIdentitySeparateFromFileInventory(t *testing.T) {
-	s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "text-identity.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := builderOpenStoreAt(t, filepath.Join(t.TempDir(), "text-identity.sqlite"))
 	t.Cleanup(func() { _ = s.Close() })
 	newGeneration := func() (int64, *store_sqlite.Store) {
 		t.Helper()

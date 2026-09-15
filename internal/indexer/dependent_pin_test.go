@@ -45,6 +45,10 @@ type committedBaseFixture struct {
 	publisher *dedicatedBasePublisher
 	identity  store_sqlite.DedicatedBaseIdentity
 	clock     int64
+
+	// Optional per-fixture factory; each invocation owns a new registry.
+	// Other tests retain the fully populated builder through the nil fallback.
+	newBuilder func(*store_sqlite.Store) *SparseGenerationBuilder
 }
 
 // newCommittedBaseFixture publishes the family's first committed base from the
@@ -103,6 +107,13 @@ func newUnpublishedCommittedBaseFixture(t *testing.T) *committedBaseFixture {
 	return out
 }
 
+func (f *committedBaseFixture) generationBuilder() *SparseGenerationBuilder {
+	if f.newBuilder != nil {
+		return f.newBuilder(f.store)
+	}
+	return builderNewBuilder(f.store)
+}
+
 // publishBase publishes and adopts one committed base for the primary's
 // current HEAD tree, and returns the generation it installed.
 func (f *committedBaseFixture) publishBase(t *testing.T) int64 {
@@ -125,7 +136,7 @@ func (f *committedBaseFixture) publishBase(t *testing.T) int64 {
 			ProjectID:                  builderRepoPrefix,
 			ProvenanceCommitOID:        builderGit(t, f.primary, "rev-parse", "HEAD"),
 			CreatedAt:                  f.clock,
-			Builder:                    *builderNewBuilder(f.store),
+			Builder:                    *f.generationBuilder(),
 		}, nil
 	})
 	if err != nil {
@@ -196,7 +207,7 @@ func (f *committedBaseFixture) pinDependent(t *testing.T, adminName string) (*Ch
 		WorkspaceID:    builderRepoPrefix,
 		ProjectID:      builderRepoPrefix,
 		Store:          f.store,
-		Builder:        builderNewBuilder(f.store),
+		Builder:        f.generationBuilder(),
 		Leases:         f.leases,
 		Config:         config.Default().Index,
 		ConfigSections: dedicatedBaseConfigSections(config.Default()),
@@ -273,6 +284,15 @@ func assertViewIsItsOwnTree(t *testing.T, f *committedBaseFixture, checkoutID, r
 // this test demands zero.
 func TestACommittedBaseAdvanceCostsAPinnedDependentNothing(t *testing.T) {
 	f := newCommittedBaseFixture(t)
+	// builderTreeA, the three dependents and every advanced file are Go-only.
+	// Keep the initial full-registry setup and independent oracle unchanged;
+	// subsequent subject builders each own a fresh Go extractor.
+	f.newBuilder = func(store *store_sqlite.Store) *SparseGenerationBuilder {
+		return &SparseGenerationBuilder{
+			Store: store, Registry: builderGoRegistry(),
+			Config: config.Default().Index, Logger: zap.NewNop(),
+		}
+	}
 	ctx := context.Background()
 
 	type dependent struct {

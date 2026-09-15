@@ -80,10 +80,7 @@ func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 	builderGit(t, primary, "worktree", "add", "-b", "feature", worktree)
 
 	storePath := filepath.Join(t.TempDir(), "base.sqlite")
-	store, err := store_sqlite.Open(storePath)
-	if err != nil {
-		t.Fatalf("open the fixture store: %v", err)
-	}
+	store := builderOpenStoreAt(t, storePath)
 	t.Cleanup(func() { _ = store.Close() })
 	builderIndex(t, store, primary)
 

@@ -21,10 +21,7 @@ type graphBaseCatalogFixture struct {
 func newGraphBaseCatalogFixture(t testing.TB, scenario string) graphBaseCatalogFixture {
 	t.Helper()
 	root := t.TempDir()
-	store, err := store_sqlite.Open(filepath.Join(root, "catalog.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := builderOpenStoreAt(t, filepath.Join(root, "catalog.sqlite"))
 	t.Cleanup(func() { _ = store.Close() })
 	catalog := store.Catalog()
 	ctx := context.Background()

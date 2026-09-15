@@ -114,8 +114,7 @@ func TestMetadataRefreshRefusesAmbiguousOrChangedTargets(t *testing.T) {
 func TestMetadataRefreshPreservesForeignFileRows(t *testing.T) {
 	for _, mode := range []string{"point", "batch"} {
 		t.Run(mode, func(t *testing.T) {
-			g, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.db"))
-			require.NoError(t, err)
+			g := builderOpenStoreAt(t, filepath.Join(t.TempDir(), "graph.db"))
 			t.Cleanup(func() { require.NoError(t, g.Close()) })
 			nodes := metadataRegressionNodes()
 			foreign := &graph.Edge{From: "sample.go::Caller", To: "sample.go::A", Kind: graph.EdgeCalls, FilePath: "foreign.go", Line: 77, Origin: "foreign-resolver", Confidence: 0.7}
@@ -179,8 +178,7 @@ func newMetadataProductionFixture(tb testing.TB, source string, prime bool) meta
 	require.NoError(tb, os.WriteFile(path, []byte(source), 0600))
 	require.NoError(tb, os.WriteFile(filepath.Join(root, "other.go"), []byte("package sample\nfunc Foreign() { A() }\n"), 0600))
 	dbPath := filepath.Join(tb.TempDir(), "graph.db")
-	raw, err := store_sqlite.Open(dbPath)
-	require.NoError(tb, err)
+	raw := builderOpenStoreAt(tb, dbPath)
 	tb.Cleanup(func() { require.NoError(tb, raw.Close()) })
 	store := &metadataRecordingStore{Store: raw}
 	reg := parser.NewRegistry()
@@ -188,7 +186,7 @@ func newMetadataProductionFixture(tb testing.TB, source string, prime bool) meta
 	cfg := config.Default()
 	cfg.Index.Workers = 1
 	idx := New(store, reg, cfg.Index, zap.NewNop())
-	_, err = idx.Index(root)
+	_, err := idx.Index(root)
 	require.NoError(tb, err)
 	if prime {
 		require.NoError(tb, os.WriteFile(path, []byte("// primed\n"+source), 0600))
