@@ -7,7 +7,7 @@ import (
 )
 
 func TestGenerationDependencyRevisionBeginCoalescingAndListing(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "generation.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "generation.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestGenerationDependencyRevisionBeginCoalescingAndListing(t *testing.T) {
 }
 
 func TestGenerationDependencyRevisionUnnamedAndCreateRemainDistinct(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "generation.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "generation.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,7 +13,7 @@ import (
 
 func payloadFlightHandles(t testing.TB) (*Store, *Store, int64) {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "flight.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "flight.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestPayloadBuildFlightsAreDistinctByGenerationAndStore(t *testing.T) {
 }
 
 func TestPayloadBuildFlightRechecksReadyAdoptionAfterFlightRemoval(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "ready-race.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "ready-race.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

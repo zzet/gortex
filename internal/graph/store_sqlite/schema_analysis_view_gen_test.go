@@ -37,7 +37,7 @@ const legacyAnalysisActiveGenerationBody = ` (
 
 func openAnalysisViewGenStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "analysis_view_gen.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "analysis_view_gen.sqlite"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

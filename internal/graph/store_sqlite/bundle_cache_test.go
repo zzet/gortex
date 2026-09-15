@@ -122,7 +122,7 @@ func TestBundlePackageKeyNeverUsesOSSeparator(t *testing.T) {
 
 func newBundleTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "b.sqlite"))
+	s, err := openPristine(t, filepath.Join(t.TempDir(), "b.sqlite"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

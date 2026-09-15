@@ -133,7 +133,7 @@ func writeGenerationPayload(t *testing.T, bulk bool, line, nNodes, nEdges int) g
 	t.Helper()
 	const generationID = int64(1)
 	path := filepath.Join(t.TempDir(), "generation.sqlite")
-	store, err := Open(path)
+	store, err := openPristine(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -163,7 +163,7 @@ func writeGenerationPayload(t *testing.T, bulk bool, line, nNodes, nEdges int) g
 
 	handle := store.AtGeneration(generationID)
 	nodes, edges := bulkFixture(nNodes, nEdges)
-	const nodeChunk, edgeChunk = 1000, 2000
+	const nodeChunk, edgeChunk = 200, 400
 	for i := 0; i < len(nodes); i += nodeChunk {
 		nodeEnd := min(i+nodeChunk, len(nodes))
 		edgeStart := min(i/nodeChunk*edgeChunk, len(edges))
@@ -206,10 +206,18 @@ func writeGenerationPayload(t *testing.T, bulk bool, line, nNodes, nEdges int) g
 // the incremental arm's; drop the residue gate from EndGenerationBulkLoad and
 // the accumulated log is never paid off at all.
 func TestGenerationBulkLoadDefersTheAutomaticDrainToOneAtItsEnd(t *testing.T) {
-	const line = 200
+	// The line, the batch and the payload are one shape, not three numbers: a
+	// batch has to be several times the line for the incremental arm to be
+	// drained inside it at all, and the payload has to be several batches for
+	// the window's accumulated log to clear the same 5x bar the incremental
+	// arm's single batch must stay under. They are scaled down together from
+	// the corpus's measured ~4 symbols and ~8 edges per file — the ratios that
+	// make the comparison, and every count below, are the same as at 30x this
+	// size, which costs half a minute of race-detector time to write.
+	const line = 100
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", strconv.Itoa(line))
 
-	const nodes, edges = 6000, 12000
+	const nodes, edges = 1200, 2400
 	incremental := writeGenerationPayload(t, false, line, nodes, edges)
 	bulked := writeGenerationPayload(t, true, line, nodes, edges)
 
@@ -367,7 +375,8 @@ func TestGenerationBulkLoadLeavesBaseReadersAndIndexesAlone(t *testing.T) {
 	if node := store.GetNode(probe); node == nil {
 		t.Fatalf("a generation-0 read returned nothing while the window was open: %s", probe)
 	}
-	payloadNodes, payloadEdges := bulkFixture(2048, 4096)
+	const payloadNodeCount, payloadEdgeCount = 512, 1024
+	payloadNodes, payloadEdges := bulkFixture(payloadNodeCount, payloadEdgeCount)
 	if err := store.AtGeneration(4).AddBatchChecked(payloadNodes, payloadEdges); err != nil {
 		t.Fatalf("AddBatchChecked inside the window: %v", err)
 	}
@@ -397,7 +406,7 @@ func TestGenerationBulkLoadLeavesBaseReadersAndIndexesAlone(t *testing.T) {
 		}
 	}
 	nodes, edges := generationRowCounts(t, store, 4)
-	if nodes != 2048 || edges == 0 {
+	if nodes != payloadNodeCount || edges == 0 {
 		t.Fatalf("generation 4 holds %d nodes / %d edges after the window", nodes, edges)
 	}
 	if node := store.GetNode(probe); node == nil {
@@ -556,8 +565,11 @@ func coldLoadOverAHeldSnapshot(t *testing.T, store *Store, path string, pageSize
 	if !store.BeginCoordinatedBulkLoad() {
 		t.Fatal("the coordinated cold window did not engage on a fresh store")
 	}
-	nodes, edges := bulkFixture(6000, 12000)
-	const chunk = 1000
+	// Several batches, each several times the 64-page line this case runs at,
+	// so the load leaves a log far above it while the held snapshot keeps the
+	// finalize's PASSIVE from copying any of it back.
+	nodes, edges := bulkFixture(1200, 2400)
+	const chunk = 200
 	for i := 0; i < len(nodes); i += chunk {
 		end := min(i+chunk, len(nodes))
 		if err := store.AddBatchChecked(nodes[i:end], nil); err != nil {

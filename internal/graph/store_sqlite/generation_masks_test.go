@@ -13,7 +13,7 @@ const maskTestRepo = "repo"
 
 func openMaskStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "generation_masks.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "generation_masks.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

@@ -13,7 +13,7 @@ import (
 
 func newIncomingCandidateStore(t testing.TB) (*Store, *Store, int64) {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "incoming-candidates.sqlite"))
+	s, err := openPristine(t, filepath.Join(t.TempDir(), "incoming-candidates.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}

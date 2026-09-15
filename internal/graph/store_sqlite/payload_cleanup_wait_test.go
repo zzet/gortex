@@ -23,7 +23,7 @@ func (c *payloadCleanupQueuedContext) Done() <-chan struct{} {
 }
 
 func TestWaitPayloadBuildFlightsJoinsExistingOwnerWithoutRecovery(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "flights.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "flights.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestWaitPayloadBuildFlightsJoinsExistingOwnerWithoutRecovery(t *testing.T) 
 }
 
 func TestWaitPayloadBuildFlightsRejectsGenerationZero(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "invalid-flight.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "invalid-flight.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestWaitPayloadBuildFlightsRejectsGenerationZero(t *testing.T) {
 }
 
 func BenchmarkWaitPayloadBuildFlightsAlreadyDrained(b *testing.B) {
-	store, err := Open(filepath.Join(b.TempDir(), "drained.sqlite"))
+	store, err := openPristine(b, filepath.Join(b.TempDir(), "drained.sqlite"))
 	if err != nil {
 		b.Fatal(err)
 	}

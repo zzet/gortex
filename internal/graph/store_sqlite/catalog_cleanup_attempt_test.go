@@ -11,7 +11,7 @@ import (
 
 func cleanupAttemptCatalog(t *testing.T) *Catalog {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "attempt.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "attempt.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestCleanupAttemptConcurrentLegacyUpgradeHasOneWinner(t *testing.T) {
 
 func TestCleanupAttemptIdentitySurvivesStoreReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "attempt.sqlite")
-	store, err := Open(path)
+	store, err := openPristine(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -187,7 +187,7 @@ type sealedEmissionFixture struct {
 func newSealedEmissionFixture(t *testing.T) sealedEmissionFixture {
 	t.Helper()
 	root := t.TempDir()
-	s, err := Open(filepath.Join(root, "sealed-emission.sqlite"))
+	s, err := openPristine(t, filepath.Join(root, "sealed-emission.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,7 +16,7 @@ import (
 
 func newIdentityMaskStore(t testing.TB) (*Store, *Store) {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "mask.sqlite"))
+	s, err := openPristine(t, filepath.Join(t.TempDir(), "mask.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}

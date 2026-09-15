@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,15 +26,52 @@ type incomingCompositeCase struct {
 	name                         string
 	generations, selected, noise int
 	distinct, absent             bool
+	edgesPerGeneration           int
 }
 
+// incomingCompositeCases is the research corpus. It is what the benchmarks in
+// this file measure, and it is deliberately large: the access-cost question
+// they exist to answer is only visible across dozens of retained generations
+// and tens of thousands of same-generation unrelated endpoints.
 var incomingCompositeCases = []incomingCompositeCase{
-	{"single_distinct", 1, 0, 0, true, false},
-	{"retained_distinct_newest", 32, 31, 0, true, false},
-	{"retained_noisy_distinct_newest", 32, 31, 16_384, true, false},
-	{"retained_noisy_distinct_oldest", 32, 0, 16_384, true, false},
-	{"retained_noisy_repeated", 32, 31, 16_384, false, false},
-	{"retained_noisy_absent", 32, 31, 16_384, true, true},
+	{"single_distinct", 1, 0, 0, true, false, 1024},
+	{"retained_distinct_newest", 32, 31, 0, true, false, 1024},
+	{"retained_noisy_distinct_newest", 32, 31, 16_384, true, false, 1024},
+	{"retained_noisy_distinct_oldest", 32, 0, 16_384, true, false, 1024},
+	{"retained_noisy_repeated", 32, 31, 16_384, false, false, 1024},
+	{"retained_noisy_absent", 32, 31, 16_384, true, true, 1024},
+}
+
+// incomingCompositeSmallCases carries every shape of the research corpus —
+// single versus retained history, newest versus oldest selection, distinct
+// versus repeated sources, present versus absent target, quiet versus noisy
+// generation — at the smallest fixture that still separates them: more than one
+// retained generation on each side of the selected one, and an order of
+// magnitude more unrelated same-generation endpoints than selected rows, laid
+// down before the selected rows in rowid order.
+//
+// The corpus size is not what any of the assertions in this file read. They
+// read row budgets, page parity against the public Store path, and the plan of
+// queries that name their index with INDEXED BY, and all three are the same at
+// either size. Building the research corpus instead costs ~11 minutes under the
+// race detector, so the tests run this one and the benchmarks keep the other.
+var incomingCompositeSmallCases = []incomingCompositeCase{
+	{"single_distinct", 1, 0, 0, true, false, 64},
+	{"retained_distinct_newest", 8, 7, 0, true, false, 64},
+	{"retained_noisy_distinct_newest", 8, 7, 1024, true, false, 64},
+	{"retained_noisy_distinct_oldest", 8, 0, 1024, true, false, 64},
+	{"retained_noisy_repeated", 8, 7, 1024, false, false, 64},
+	{"retained_noisy_absent", 8, 7, 1024, true, true, 64},
+}
+
+// incomingCompositeTestCases is what the tests iterate. Set
+// GORTEX_STORE_RESEARCH_CORPUS to re-run exactly the same assertions over the
+// full research corpus.
+func incomingCompositeTestCases() []incomingCompositeCase {
+	if os.Getenv("GORTEX_STORE_RESEARCH_CORPUS") != "" {
+		return incomingCompositeCases
+	}
+	return incomingCompositeSmallCases
 }
 
 type incomingCompositeBytes struct{ DB, WAL, SHM int64 }
@@ -60,20 +98,80 @@ func incomingCompositeFileBytes(tb testing.TB, path string) incomingCompositeByt
 	return out
 }
 
+// incomingCompositeSeeds holds one built database per distinct case, so the
+// arms that ask for the same corpus (the installed and uninstalled arms of one
+// case, and the same case across tests) build it once and copy it afterwards.
+// Every caller still gets a private database it may index, ANALYZE, checkpoint
+// and write to.
+type incomingCompositeSeed struct {
+	path        string
+	generations []int64
+}
+
+var (
+	incomingCompositeSeedMu sync.Mutex
+	incomingCompositeSeeded = map[incomingCompositeCase]incomingCompositeSeed{}
+)
+
+func incomingCompositeSeedFor(tb testing.TB, tc incomingCompositeCase) incomingCompositeSeed {
+	tb.Helper()
+	incomingCompositeSeedMu.Lock()
+	defer incomingCompositeSeedMu.Unlock()
+	// Labels and absent-target queries do not change the constructed corpus.
+	// Reuse its closed seed while each caller still receives a private copy.
+	key := tc
+	key.name = ""
+	key.absent = false
+	if seed, ok := incomingCompositeSeeded[key]; ok {
+		return seed
+	}
+	dir, err := os.MkdirTemp(packageScratch(tb), "composite-seed")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	seed := incomingCompositeSeed{path: filepath.Join(dir, "incoming-composite-research.sqlite")}
+	seed.generations = buildIncomingCompositeFixture(tb, tc, seed.path)
+	incomingCompositeSeeded[key] = seed
+	return seed
+}
+
 // This is the frozen Fa3 fixture's real Store/catalog construction with bounded
 // unrelated endpoints inserted BEFORE publication in the selected generation.
 func prepareIncomingCompositeFixture(tb testing.TB, tc incomingCompositeCase) incomingGenerationFanoutFixture {
 	tb.Helper()
-	if tc.generations < 1 || tc.generations > 32 || tc.selected < 0 || tc.selected >= tc.generations || tc.noise < 0 || tc.noise > 16_384 {
+	if tc.generations < 1 || tc.generations > 32 || tc.selected < 0 || tc.selected >= tc.generations || tc.noise < 0 || tc.noise > 16_384 || tc.edgesPerGeneration < 1 || tc.edgesPerGeneration > 1024 {
 		tb.Fatal("invalid bounded composite fixture")
 	}
+	seed := incomingCompositeSeedFor(tb, tc)
 	path := filepath.Join(tb.TempDir(), "incoming-composite-research.sqlite")
+	if err := copyStoreFile(seed.path, path); err != nil {
+		tb.Fatal(err)
+	}
 	s, err := Open(path)
 	if err != nil {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { _ = s.Close() })
-	f := incomingGenerationFanoutFixture{control: s, path: path, target: "fanout/target.go::Target", edgesPerGeneration: 1024, distinct: tc.distinct}
+	f := incomingGenerationFanoutFixture{control: s, path: path, target: "fanout/target.go::Target", edgesPerGeneration: tc.edgesPerGeneration, distinct: tc.distinct, generations: seed.generations}
+	f.assertDiskBudget(tb)
+	return f
+}
+
+// buildIncomingCompositeFixture populates one database at path and closes it,
+// returning the generation ids it published.
+func buildIncomingCompositeFixture(tb testing.TB, tc incomingCompositeCase, path string) []int64 {
+	tb.Helper()
+	s, err := openPristine(tb, path)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = s.Close()
+		}
+	}()
+	f := incomingGenerationFanoutFixture{control: s, path: path, target: "fanout/target.go::Target", edgesPerGeneration: tc.edgesPerGeneration, distinct: tc.distinct}
 	s.AddBatch([]*graph.Node{{ID: "generation0-poison", Name: "Poison", RepoPrefix: "fanout", FilePath: "fanout/poison.go", Kind: graph.KindType}}, []*graph.Edge{{From: "generation0-poison", To: f.target, Kind: graph.EdgeKind("calls"), FilePath: "fanout/poison.go", Line: 1}})
 	for generation := 0; generation < tc.generations; generation++ {
 		id, err := s.Catalog().CreateViewGeneration(tb.Context(), ViewGeneration{OwnerKind: "dedicated_graph", GraphID: "incoming-composite-research", GenerationKind: "dedicated", TreeOID: fmt.Sprintf("source-%02d", generation), ConfigHash: "policy", State: ViewGenerationBuilding, CreatedAt: 1})
@@ -119,7 +217,11 @@ func prepareIncomingCompositeFixture(tb testing.TB, tc incomingCompositeCase) in
 		}
 	}
 	f.assertDiskBudget(tb)
-	return f
+	closed = true
+	if err := s.Close(); err != nil {
+		tb.Fatal(err)
+	}
+	return f.generations
 }
 
 func incomingCompositeDiagnostic(tb testing.TB, f incomingGenerationFanoutFixture) *sql.DB {
@@ -276,7 +378,7 @@ func checkIncomingCompositeRead(tb testing.TB, f incomingGenerationFanoutFixture
 }
 
 func TestIncomingCompositeIndexQueryParityIsolationAndPlans(t *testing.T) {
-	for _, tc := range incomingCompositeCases {
+	for _, tc := range incomingCompositeTestCases() {
 		for _, installed := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/new_index_%t", tc.name, installed), func(t *testing.T) {
 				f := prepareIncomingCompositeFixture(t, tc)
@@ -335,7 +437,7 @@ var incomingCompositeRowsSink int
 var incomingCompositeErrorSink error
 
 func BenchmarkIncomingCompositeCurrentPublicControl(b *testing.B) {
-	tc := incomingCompositeCase{"public_current", 32, 31, 16_384, true, false}
+	tc := incomingCompositeCase{"public_current", 32, 31, 16_384, true, false, 1024}
 	for _, installed := range []bool{false, true} {
 		b.Run(fmt.Sprintf("new_index_%t", installed), func(b *testing.B) {
 			f := prepareIncomingCompositeFixture(b, tc)
@@ -429,7 +531,7 @@ func BenchmarkIncomingCompositeIndexSQLAccess(b *testing.B) {
 }
 
 func TestIncomingCompositeIndexFailedQueriesAndGenZeroRefusal(t *testing.T) {
-	f := prepareIncomingCompositeFixture(t, incomingCompositeCases[0])
+	f := prepareIncomingCompositeFixture(t, incomingCompositeTestCases()[0])
 	diagnostic := incomingCompositeDiagnostic(t, f)
 	incomingCompositeInstall(t, diagnostic, f)
 	query := incomingCompositeQueries(t, true)[3]
@@ -485,7 +587,7 @@ func TestIncomingCompositeIndexActualAddBatchReplayAndNodeUpdate(t *testing.T) {
 	for _, installed := range []bool{false, true} {
 		for _, zero := range []bool{false, true} {
 			t.Run(fmt.Sprintf("new_index_%t/gen0_%t", installed, zero), func(t *testing.T) {
-				f := prepareIncomingCompositeFixture(t, incomingCompositeCases[0])
+				f := prepareIncomingCompositeFixture(t, incomingCompositeTestCases()[0])
 				diagnostic := incomingCompositeDiagnostic(t, f)
 				if installed {
 					incomingCompositeInstall(t, diagnostic, f)

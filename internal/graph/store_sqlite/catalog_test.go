@@ -33,7 +33,7 @@ var catalogTables = []string{
 
 func openCatalogStore(t testing.TB) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -179,7 +179,11 @@ func seedBuildingGeneration(t *testing.T, catalog *Catalog, graphID string) int6
 // preserves every column — including the nullable ones whose empty Go value
 // must come back as an empty value rather than a scan error.
 func TestCatalogSchemaAppliesOnFreshStore(t *testing.T) {
-	store := openCatalogStore(t)
+	store, err := Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
+	if err != nil {
+		t.Fatalf("Open fresh store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	for _, name := range catalogTables {
 		if !hasTable(t, store.writerDB, name) {
 			t.Fatalf("fresh store is missing catalog table %s", name)
@@ -2924,7 +2928,7 @@ func TestCatalogObservationClockStepBackDoesNotWedge(t *testing.T) {
 // seen a row takes the row's own clock as its floor.
 func TestCatalogObservationFenceIsPerRowAndSeededFromTheRow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fence.sqlite")
-	store, err := Open(path)
+	store, err := openPristine(t, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

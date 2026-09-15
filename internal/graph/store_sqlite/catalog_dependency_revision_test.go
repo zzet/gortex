@@ -22,7 +22,7 @@ func newDependencyPublicationFixture(t *testing.T, revision string) *dependencyP
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "catalog.sqlite")
-	s, err := Open(path)
+	s, err := openPristine(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}

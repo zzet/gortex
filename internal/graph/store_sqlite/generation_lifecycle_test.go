@@ -33,7 +33,7 @@ type catalogAdmissionRouteSnapshot struct {
 func newCatalogAdmissionFixture(t *testing.T) *catalogAdmissionFixture {
 	t.Helper()
 	root := t.TempDir()
-	s, err := Open(filepath.Join(root, "routes.sqlite"))
+	s, err := openPristine(t, filepath.Join(root, "routes.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +694,7 @@ type dedicatedIdentityAdmissionFixture struct {
 func newDedicatedIdentityAdmissionFixture(t *testing.T) *dedicatedIdentityAdmissionFixture {
 	t.Helper()
 	root := t.TempDir()
-	s, err := Open(filepath.Join(root, "identity-admission.sqlite"))
+	s, err := openPristine(t, filepath.Join(root, "identity-admission.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -933,7 +933,7 @@ type publicationRetirementFixture struct {
 func newPublicationRetirementFixture(t *testing.T) *publicationRetirementFixture {
 	t.Helper()
 	root := t.TempDir()
-	s, err := Open(filepath.Join(root, "publication-retirement.sqlite"))
+	s, err := openPristine(t, filepath.Join(root, "publication-retirement.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1145,7 +1145,7 @@ func privateNewManagedTxFixture(t testing.TB, mode string) privateManagedTxFixtu
 	if mode == "memory" {
 		dbPath = ":memory:"
 	}
-	s, err := Open(dbPath)
+	s, err := openPristine(t, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}

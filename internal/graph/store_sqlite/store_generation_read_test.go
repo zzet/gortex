@@ -219,7 +219,7 @@ func genReadEdges(mark string) []*graph.Edge {
 // returns the base handle plus a handle pinned to generation 1.
 func openGenerationReadPair(t *testing.T) (base, derived *Store) {
 	t.Helper()
-	base, err := Open(filepath.Join(t.TempDir(), "generation_read.sqlite"))
+	base, err := openPristine(t, filepath.Join(t.TempDir(), "generation_read.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -2108,7 +2108,7 @@ func isStoreNilConversion(expr ast.Expr) bool {
 // generation 0. The cold path rebuilds the base corpus; a derived generation's
 // rows are not what it is deciding about.
 func TestColdGraphStoreEmptyIgnoresDerivedGenerations(t *testing.T) {
-	base, err := Open(filepath.Join(t.TempDir(), "cold_gate.sqlite"))
+	base, err := openPristine(t, filepath.Join(t.TempDir(), "cold_gate.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

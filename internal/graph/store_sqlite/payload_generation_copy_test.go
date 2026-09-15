@@ -622,17 +622,23 @@ type copyArmMeasurement struct {
 // carries; the assertions are relations between the arms rather than absolute
 // figures, because the absolute figures are a property of this fixture's size.
 func TestCopyPayloadGenerationWriteShapeAgainstTheTwoWriteRoutes(t *testing.T) {
-	const line = 200
+	const line = 100
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", strconv.Itoa(line))
-	// 1,500 files' worth of symbols at the corpus's measured ~4 symbols and
-	// ~8 edges per file. Large enough that the incremental arm crosses the
-	// auto-checkpoint line many times, which is the cost being compared.
-	const nodes, edges = 6000, 12000
+	// 300 files' worth of symbols at the corpus's measured ~4 symbols and ~8
+	// edges per file, written in batches several times the auto-checkpoint
+	// line. The line, the batch and the payload move together: the incremental
+	// arm still crosses the line inside every batch — which is the cost being
+	// compared — and the payload is still several batches, so the window arms
+	// still accumulate a log the incremental arm never gets to hold. Every
+	// comparison below is between arms, so it reads the same here as it does
+	// at five times this size, which costs 80 s of race-detector time.
+	const nodes, edges = 1200, 2400
 
+	seed := buildCopyArmSeed(t, nodes, edges)
 	arms := []copyArmMeasurement{
-		measureCopyArm(t, "incremental", nodes, edges, false, false),
-		measureCopyArm(t, "reparse_in_window", nodes, edges, true, false),
-		measureCopyArm(t, "copy_in_window", nodes, edges, true, true),
+		measureCopyArm(t, seed, "incremental", nodes, edges, false, false),
+		measureCopyArm(t, seed, "reparse_in_window", nodes, edges, true, false),
+		measureCopyArm(t, seed, "copy_in_window", nodes, edges, true, true),
 	}
 	for _, arm := range arms {
 		t.Logf("generation write shape: arm=%s wal_bytes=%d wal_frames=%d nodes=%d edges=%d",
@@ -676,12 +682,40 @@ func TestCopyPayloadGenerationWriteShapeAgainstTheTwoWriteRoutes(t *testing.T) {
 	}
 }
 
+// buildCopyArmSeed writes generation zero's payload once, drains the log and
+// closes the store. Every arm below starts from a byte copy of it, so the three
+// of them are seeded identically by construction and the payload is written
+// once instead of three times.
+//
+// Generation zero has to carry the payload in the copy arm and has to exist at
+// all in the others, or the cold fast path would engage on the destination
+// write and the arms would not be the same measurement.
+func buildCopyArmSeed(t *testing.T, nNodes, nEdges int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "copy-arm-seed.sqlite")
+	store, err := openPristine(t, path)
+	if err != nil {
+		t.Fatalf("open the arm seed: %v", err)
+	}
+	seedGenerationZero(t, store, copyFixtureRepo, nNodes, nEdges)
+	if err := store.CheckpointWAL(); err != nil {
+		t.Fatalf("drain the seed WAL: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close the arm seed: %v", err)
+	}
+	return path
+}
+
 // measureCopyArm writes one arm's payload into a freshly reserved generation of
 // an equally seeded store and reports the log the payload itself left, measured
 // before anything finalizes.
-func measureCopyArm(t *testing.T, name string, nNodes, nEdges int, window, copyRoute bool) copyArmMeasurement {
+func measureCopyArm(t *testing.T, seed, name string, nNodes, nEdges int, window, copyRoute bool) copyArmMeasurement {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name+".sqlite")
+	if err := copyStoreFile(seed, path); err != nil {
+		t.Fatalf("seed arm %s: %v", name, err)
+	}
 	store, err := Open(path)
 	if err != nil {
 		t.Fatalf("open %s: %v", name, err)
@@ -689,12 +723,10 @@ func measureCopyArm(t *testing.T, name string, nNodes, nEdges int, window, copyR
 	defer func() { _ = store.Close() }()
 	pageSize := pragmaIntDB(t, store.db, "page_size")
 
-	// Generation zero has to carry the payload in the copy arm and has to
-	// exist at all in the others, or the cold fast path would engage on the
-	// destination write and the arms would not be the same measurement.
-	seedGenerationZero(t, store, copyFixtureRepo, nNodes, nEdges)
+	// Opening the seed copy can write (the planner-statistics repair does).
+	// Drain that, so what the arm is measured on is only what the arm wrote.
 	if err := store.CheckpointWAL(); err != nil {
-		t.Fatalf("drain the seed WAL: %v", err)
+		t.Fatalf("drain arm %s's open: %v", name, err)
 	}
 	if got := walFileBytes(t, path); got != 0 {
 		t.Fatalf("arm %s starts with a %d-byte WAL, so its growth is not its own", name, got)
@@ -733,7 +765,7 @@ func measureCopyArm(t *testing.T, name string, nNodes, nEdges int, window, copyR
 			edge.To = copyFixtureRepo + "/" + edge.To
 			edge.FilePath = copyFixtureRepo + "/" + edge.FilePath
 		}
-		const nodeChunk, edgeChunk = 1000, 2000
+		const nodeChunk, edgeChunk = 200, 400
 		for i := 0; i < len(nodes); i += nodeChunk {
 			nodeEnd := min(i+nodeChunk, len(nodes))
 			edgeStart := min(i/nodeChunk*edgeChunk, len(edges))

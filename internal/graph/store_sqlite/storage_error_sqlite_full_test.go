@@ -149,7 +149,7 @@ func TestPrivateSQLiteFullAddBatchClassification(t *testing.T) {
 // constructors, repeated timed database filling, or production replacements.
 func privateCaptureRealSQLiteFull(t testing.TB) *sqlite.Error {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "emitter.sqlite"))
+	s, err := openPristine(t, filepath.Join(t.TempDir(), "emitter.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}

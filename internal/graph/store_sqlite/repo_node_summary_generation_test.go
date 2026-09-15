@@ -16,7 +16,7 @@ var legacyNodeSummaryQuery = "SELECT " + lookupNodeSummaryCols + " FROM nodes WH
 
 func summaryGenerationFixture(tb testing.TB, baseNodes, siblingNodes, targetNodes int) (*Store, *Store) {
 	tb.Helper()
-	store, err := Open(filepath.Join(tb.TempDir(), "node-summary.sqlite"))
+	store, err := openPristine(tb, filepath.Join(tb.TempDir(), "node-summary.sqlite"))
 	if err != nil {
 		tb.Fatal(err)
 	}

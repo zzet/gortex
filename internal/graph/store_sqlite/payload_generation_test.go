@@ -41,7 +41,7 @@ const (
 
 func openPayloadStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "payload_generation.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "payload_generation.sqlite"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

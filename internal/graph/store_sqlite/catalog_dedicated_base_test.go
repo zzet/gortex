@@ -28,7 +28,7 @@ type dedicatedPublicationFixture struct {
 func newDedicatedPublicationFixture(t testing.TB) *dedicatedPublicationFixture {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "catalog.sqlite")
-	s, err := Open(path)
+	s, err := openPristine(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}

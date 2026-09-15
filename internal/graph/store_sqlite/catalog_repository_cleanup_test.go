@@ -22,7 +22,7 @@ func newRepositoryCleanupFixture(t *testing.T) *repositoryCleanupFixture {
 	root := t.TempDir()
 	f := &repositoryCleanupFixture{path: filepath.Join(root, "catalog.sqlite")}
 	var err error
-	f.store, err = Open(f.path)
+	f.store, err = openPristine(t, f.path)
 	if err != nil {
 		t.Fatal(err)
 	}

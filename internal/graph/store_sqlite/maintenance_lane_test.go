@@ -319,7 +319,7 @@ func TestCompact_WaitsForAPayloadBuildInFlight(t *testing.T) {
 // tear down, and must stay closed: a request arriving after it is dropped
 // rather than starting a goroutine on a dead store.
 func TestMaintenanceLane_ClosedStoreSchedulesNothing(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "maintenance_lane_close.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "maintenance_lane_close.sqlite"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -676,7 +676,7 @@ func TestCompactAndCheckpointWALExcludeEachOther(t *testing.T) {
 // holds that bubble's fake clock still. Creating both with the store puts the
 // create and the cancel on the same side of every such boundary.
 func TestMaintenanceLane_StartsWithTheStoreNotWithAPublish(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "maintenance_lane_start.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "maintenance_lane_start.sqlite"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

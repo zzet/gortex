@@ -12,7 +12,7 @@ import (
 
 func openMutationReceiptStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "mutation-receipt.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "mutation-receipt.sqlite"))
 	if err != nil {
 		t.Fatalf("open SQLite store: %v", err)
 	}

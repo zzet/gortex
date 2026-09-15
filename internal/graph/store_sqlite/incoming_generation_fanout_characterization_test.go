@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -26,17 +27,82 @@ type incomingGenerationFanoutRange struct {
 	before, after int
 }
 
+// incomingGenerationFanoutShape is the corpus a fanout fixture holds. Fixtures
+// for the same shape are built once and copied, so a test that wants a second
+// private database over the same corpus pays a file copy rather than tens of
+// thousands of AddBatch rows again.
+type incomingGenerationFanoutShape struct {
+	generations, edgesPerGeneration int
+	distinct                        bool
+}
+
+var (
+	incomingGenerationFanoutMu    sync.Mutex
+	incomingGenerationFanoutSeeds = map[incomingGenerationFanoutShape]incomingCompositeSeed{}
+)
+
+// incomingGenerationFanoutLadder is the retained-history ladder the tests walk.
+// Set GORTEX_STORE_RESEARCH_CORPUS to walk the research ladder — 1, 10 and 32
+// generations of 256 edges — instead. Every assertion in this file is a row
+// count derived from the ladder's own numbers, so it holds at either size; the
+// research ladder writes 22,016 edges and the default one 1,088.
+func incomingGenerationFanoutLadder() (generations []int, edgesPerGeneration int) {
+	if os.Getenv("GORTEX_STORE_RESEARCH_CORPUS") != "" {
+		return []int{1, 10, 32}, 256
+	}
+	return []int{1, 4, 12}, 64
+}
+
 func prepareIncomingGenerationFanout(tb testing.TB, generations, edgesPerGeneration int, distinct bool) incomingGenerationFanoutFixture {
 	tb.Helper()
 	if generations < 1 || generations > 32 || edgesPerGeneration < 1 || edgesPerGeneration > 1024 {
 		tb.Fatal("fanout fixture exceeds its explicit size bound")
 	}
+	shape := incomingGenerationFanoutShape{generations: generations, edgesPerGeneration: edgesPerGeneration, distinct: distinct}
+	seed := func() incomingCompositeSeed {
+		incomingGenerationFanoutMu.Lock()
+		defer incomingGenerationFanoutMu.Unlock()
+		seed, ok := incomingGenerationFanoutSeeds[shape]
+		if !ok {
+			dir, err := os.MkdirTemp(packageScratch(tb), "fanout-seed")
+			if err != nil {
+				tb.Fatal(err)
+			}
+			seed = incomingCompositeSeed{path: filepath.Join(dir, "incoming-generation-fanout.sqlite")}
+			seed.generations = buildIncomingGenerationFanout(tb, shape, seed.path)
+			incomingGenerationFanoutSeeds[shape] = seed
+		}
+		return seed
+	}()
 	path := filepath.Join(tb.TempDir(), "incoming-generation-fanout.sqlite")
+	if err := copyStoreFile(seed.path, path); err != nil {
+		tb.Fatal(err)
+	}
 	s, err := Open(path)
 	if err != nil {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { _ = s.Close() })
+	f := incomingGenerationFanoutFixture{control: s, path: path, target: "fanout/target.go::Target", edgesPerGeneration: edgesPerGeneration, distinct: distinct, generations: seed.generations}
+	f.assertDiskBudget(tb)
+	return f
+}
+
+// buildIncomingGenerationFanout populates one database at path and closes it,
+// returning the generation ids it published.
+func buildIncomingGenerationFanout(tb testing.TB, shape incomingGenerationFanoutShape, path string) []int64 {
+	tb.Helper()
+	generations, edgesPerGeneration, distinct := shape.generations, shape.edgesPerGeneration, shape.distinct
+	s, err := openPristine(tb, path)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = s.Close()
+		}
+	}()
 	f := incomingGenerationFanoutFixture{control: s, path: path, target: "fanout/target.go::Target", edgesPerGeneration: edgesPerGeneration, distinct: distinct}
 	// Insert before every positive row so even an oldest selection must reject
 	// a same-endpoint/kind generation0 record, not merely miss a later poison.
@@ -79,7 +145,11 @@ func prepareIncomingGenerationFanout(tb testing.TB, generations, edgesPerGenerat
 		tb.Fatalf("negative generation0 prerequisite: %+v %v", poison, err)
 	}
 	f.assertDiskBudget(tb)
-	return f
+	closed = true
+	if err := s.Close(); err != nil {
+		tb.Fatal(err)
+	}
+	return f.generations
 }
 
 func (f incomingGenerationFanoutFixture) assertDiskBudget(tb testing.TB) int64 {
@@ -151,10 +221,11 @@ func checkIncomingGenerationFanout(tb testing.TB, f incomingGenerationFanoutFixt
 }
 
 func TestIncomingSourceGenerationFanoutSeparatesSelectedRowsFromIndexRanges(t *testing.T) {
-	for _, generations := range []int{1, 10, 32} {
+	ladder, edgesPerGeneration := incomingGenerationFanoutLadder()
+	for _, generations := range ladder {
 		for _, distinct := range []bool{false, true} {
 			t.Run(fmt.Sprintf("generations_%d_distinct_%t", generations, distinct), func(t *testing.T) {
-				f := prepareIncomingGenerationFanout(t, generations, 256, distinct)
+				f := prepareIncomingGenerationFanout(t, generations, edgesPerGeneration, distinct)
 				for _, selected := range []int{0, generations - 1} {
 					budget := &graph.IncomingSourceBudget{}
 					page, err := f.control.AtGeneration(f.generations[selected]).FindIncomingSourcesScoped(t.Context(), []string{f.target}, graph.EdgeKind("calls"), 1, graph.IncomingSourceScope{}, budget)
@@ -219,7 +290,8 @@ func incomingGenerationFanoutRawProbe(t *testing.T, db *sql.DB, query string, ta
 }
 
 func TestIncomingSourceGenerationFanoutRecordsExistingIndexAlternatives(t *testing.T) {
-	f := prepareIncomingGenerationFanout(t, 32, 256, true)
+	ladder, edgesPerGeneration := incomingGenerationFanoutLadder()
+	f := prepareIncomingGenerationFanout(t, ladder[len(ladder)-1], edgesPerGeneration, true)
 	// Only this untimed diagnostic needs a statistics-writing connection. Do
 	// not assume the configured Store read pool permits ANALYZE. The database
 	// is the exact disposable Store fixture, never a copied or live store.
