@@ -14,8 +14,22 @@ standing as the historical record including the attributions that later turned o
 **§8 is the second verdict**, on candidate `271a9e9f` after the six fix items of
 `scratchpad/reports/io-fix-plan.md`, judged against the **same frozen baseline and the same
 `budgets.json`** — never re-frozen. Every correction §8 makes to §7 is listed in §8.6 and marked
-again at the point in §7 where it applies. A reader who needs the branch's current numbers wants §8;
-a reader who needs to know what was believed when, and on what evidence, wants §7 with those marks.
+again at the point in §7 where it applies. A reader who needs the latest recorded historical numbers
+wants §8; a reader who needs to know what was believed when, and on what evidence, wants §7 with
+those marks.
+
+**Current-source boundary (September 15, 2026).** Both paired verdicts predate the merge of `main`
+at `a4b5c4df` and the subsequent publication correction in
+[`SparseGenerationBuilder.withholdContextPayload`](../internal/indexer/builder_generation.go#L975).
+That correction conservatively retains contract-bearing context paths as explicit output so that
+canonical contracts and surviving ownership edges remain coherent with generation masks. It can
+retain extra unchanged payload. No phase of the paired protocol has run after this change; the
+ratios, budgets and regressions below describe only the recorded historical candidates. Current
+package tests and successful live publication do not measure that write cost. The later
+[`OverlaidView.detachedBaseNodes`](../internal/graph/overlay.go#L1023) correction also postdates these
+runs: aggregate totals now resolve base identities before applying file-coverage adjustments. Its
+additional lookup work is bounded by overlay candidates and has not been benchmarked. The execution
+ledger records current validation separately.
 
 ## 1. What this document is, and what it is not
 
