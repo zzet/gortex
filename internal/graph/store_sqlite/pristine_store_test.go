@@ -156,6 +156,13 @@ func openPristine(tb testing.TB, path string, opts ...Option) (*Store, error) {
 	return Open(path, opts...)
 }
 
+// OpenPristineForConformance gives the external-package Store conformance test
+// a private file-backed copy of the current empty schema. The caller owns Close.
+// Keep this bridge in a _test.go file so production callers still exercise Open.
+func OpenPristineForConformance(tb testing.TB, path string) (*Store, error) {
+	return openPristine(tb, path)
+}
+
 func TestOpenPristinePreservesReopenedDataAndPrivateCopies(t *testing.T) {
 	firstPath := filepath.Join(t.TempDir(), "first.sqlite")
 	first, err := openPristine(t, firstPath)
