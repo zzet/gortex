@@ -3094,26 +3094,23 @@ func TestSustainedIOCensusDeltaNamesEveryWriterThatMoved(t *testing.T) {
 	}
 }
 
-// sustainedIOStubFixture builds a fixture whose "daemon binary" is a shell script, so
+// sustainedIOStubFixture builds a fixture whose "daemon binary" is this native test executable, so
 // the harness's own client-facing behaviour — how many calls it makes, how it
 // reacts to an inexact answer — can be exercised without a daemon.
 //
 // It deliberately does NOT go through newIssue767FixtureWithCorpus: that
 // recipe builds a git repository and a config for a real daemon. What is under
 // test here is the harness, not the product.
-func sustainedIOStubFixture(t *testing.T, script string) *issue767Fixture {
+func sustainedIOStubFixture(t *testing.T, mode string) *issue767Fixture {
 	t.Helper()
 	root := t.TempDir()
 	primary := filepath.Join(root, "repo")
 	if err := os.MkdirAll(primary, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	binary := filepath.Join(root, "stub-gortex")
-	if err := os.WriteFile(binary, []byte("#!/bin/sh\n"+script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	binary := portableHarnessStubBinary(t)
 	f := &issue767Fixture{t: t, binary: binary, root: root, primary: primary,
-		linked: filepath.Join(root, "linked"), store: filepath.Join(root, "store.sqlite"), env: os.Environ()}
+		linked: filepath.Join(root, "linked"), store: filepath.Join(root, "store.sqlite"), env: append(os.Environ(), portableHarnessModeEnv+"="+mode)}
 	if err := os.WriteFile(f.markerFileForTest(primary), []byte("package fixture\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -3143,7 +3140,7 @@ func sustainedIOStubRun(t *testing.T, f *issue767Fixture, arm string) *sustained
 // does this daemon write when nobody asks it anything"; if it makes any client
 // call at all, it is measuring the other question.
 func TestSustainedIOIdleQuietArmMakesNoClientCallsAtAll(t *testing.T) {
-	f := sustainedIOStubFixture(t, `printf '{"exact": true, "results": [{"name": "`+sustainedIOPrimaryMarker+`", "absolute_file_path": "'"$GX_SUSTAINED_IO_STUB_MARKER"'", "repo_prefix": "issue767"}]}'`+"\n")
+	f := sustainedIOStubFixture(t, "search")
 	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_MARKER="+f.markerFileForTest(f.primary))
 	run := sustainedIOStubRun(t, f, "candidate")
 
@@ -3185,7 +3182,7 @@ func TestSustainedIOIdleQuietArmMakesNoClientCallsAtAll(t *testing.T) {
 // (sustainedIOJudgedWindows), and opens both arms scrape-free, so the only client
 // traffic inside an idle phase is the polling arm's own searches.
 func TestSustainedIOIdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
-	f := sustainedIOStubFixture(t, `printf '{"exact": true, "results": [{"name": "`+sustainedIOPrimaryMarker+`", "absolute_file_path": "'"$GX_SUSTAINED_IO_STUB_MARKER"'", "repo_prefix": "issue767"}]}'`+"\n")
+	f := sustainedIOStubFixture(t, "search")
 	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_MARKER="+f.markerFileForTest(f.primary))
 	run := sustainedIOStubRun(t, f, "candidate")
 	run.cfg.Idle = time.Second
@@ -3301,7 +3298,7 @@ func TestSustainedIOIdleBudgetIsAppliedToEachIdleArmNotToTheirSum(t *testing.T) 
 // body fails still files its row, because the numbers of a failing window are
 // exactly the ones a reader wants.
 func TestSustainedIOInWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *testing.T) {
-	f := sustainedIOStubFixture(t, "exit 0\n")
+	f := sustainedIOStubFixture(t, "noop")
 	run := sustainedIOStubRun(t, f, "candidate")
 	run.phase = "P4_amend_same_tree"
 
@@ -3351,13 +3348,7 @@ func TestSustainedIOInWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *
 // reports the running total.
 func TestSustainedIOScrapingBracketTakesBothScrapesAndReportsATrueDelta(t *testing.T) {
 	const series = "views_generation_published_total"
-	f := sustainedIOStubFixture(t, `
-n=0
-[ -f "$GX_SUSTAINED_IO_STUB_COUNT" ] && n=$(cat "$GX_SUSTAINED_IO_STUB_COUNT")
-n=$((n+1))
-printf '%s' "$n" > "$GX_SUSTAINED_IO_STUB_COUNT"
-printf '{"views": {"counters": {"`+series+`": %d}}}' "$((100 + n))"
-`)
+	f := sustainedIOStubFixture(t, "counter")
 	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_COUNT="+filepath.Join(t.TempDir(), "count"))
 	run := sustainedIOStubRun(t, f, "candidate")
 	run.phase = "P4_amend_same_tree"
@@ -3406,18 +3397,7 @@ printf '{"views": {"counters": {"`+series+`": %d}}}' "$((100 + n))"
 // and the single shot turned it into a failed phase that took P6, P7 and P8
 // with it. A single-shot probe fails this test on the first answer.
 func TestSustainedIOProbeIsolationRetriesAnInexactAnswerAndJudgesOnlyAJudgeableOne(t *testing.T) {
-	f := sustainedIOStubFixture(t, `
-count_file="$GX_SUSTAINED_IO_STUB_COUNT"
-n=0
-[ -f "$count_file" ] && n=$(cat "$count_file")
-n=$((n+1))
-printf '%s' "$n" > "$count_file"
-if [ "$n" -le 2 ]; then
-  printf '{"exact": false, "fallback_reason": "base_changed"}'
-else
-  printf '{"exact": true, "results": []}'
-fi
-`)
+	f := sustainedIOStubFixture(t, "inexact-then-empty")
 	counter := filepath.Join(f.root, "stub-count")
 	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_COUNT="+counter)
 	run := sustainedIOStubRun(t, f, "candidate")
@@ -3492,7 +3472,7 @@ func TestIssue767VerdictSeparatesRetryableInexactnessFromAWrongAnswer(t *testing
 // cold-index hold through the run object that calls it, with a stub daemon
 // whose publication family is already quiet.
 func TestSustainedIOAwaitIndexTimeWorkSettledAccountsItsWaitOnTheRun(t *testing.T) {
-	f := sustainedIOStubFixture(t, `printf '{"views": {"counters": {"views_dedicated_base_publication_total{outcome=skipped}": 1}}}'`+"\n")
+	f := sustainedIOStubFixture(t, "settled")
 	run := sustainedIOStubRun(t, f, "candidate")
 	run.phase = "P0_cold_index"
 	before := f.clientCallCount()

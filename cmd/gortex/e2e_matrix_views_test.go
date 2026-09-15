@@ -1252,12 +1252,13 @@ func TestE2EMatrixViewsStatsReaderAndDiff(t *testing.T) {
 // could be measuring a daemon that never got --http-addr and a CLI that got one
 // it does not accept.
 func TestE2EMatrixViewsLauncherInjectsTheFlagOnlyForDaemonStart(t *testing.T) {
-	dir := t.TempDir()
-	stub := filepath.Join(dir, "stub")
-	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0700); err != nil {
-		t.Fatal(err)
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("the launcher is a POSIX exec script and requires a sh interpreter: %v", err)
 	}
-	launcher := e2eViewsHTTPWrapper(t, dir, stub, "127.0.0.1:65001")
+	dir := t.TempDir()
+	stub := portableHarnessStubBinary(t)
+	launcher := e2eViewsHTTPWrapper(t, dir, filepath.ToSlash(stub), "127.0.0.1:65001")
 	for _, tc := range []struct {
 		name string
 		argv []string
@@ -1273,7 +1274,7 @@ func TestE2EMatrixViewsLauncherInjectsTheFlagOnlyForDaemonStart(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
-			output, err := execCommandForE2EViews(ctx, launcher, tc.argv)
+			output, err := execCommandForE2EViews(ctx, shell, append([]string{filepath.ToSlash(launcher)}, tc.argv...))
 			if err != nil {
 				t.Fatalf("launcher %v: %v\n%s", tc.argv, err, output)
 			}
@@ -1319,12 +1320,13 @@ func TestE2EMatrixViewsStoreCensusReadsTheColumnsTheCatalogDeclares(t *testing.T
 	if len(routes) != 2 {
 		t.Fatalf("routes = %v, want both checkouts (a checkout with no route must still be seen)", routes)
 	}
-	one := routes["/w/one"]
-	if one.CheckoutID != "c1" || one.HeadTree != "treeA" || one.Mode != "automatic" || one.pair() != "(11,12)" {
-		t.Fatalf("route = %+v", one)
+	one, found := routes[filepath.Clean("/w/one")]
+	if !found || one.CheckoutID != "c1" || one.RootPath != "/w/one" || one.HeadTree != "treeA" || one.Mode != "automatic" || one.pair() != "(11,12)" {
+		t.Fatalf("route = %+v, found=%v", one, found)
 	}
-	if two := routes["/w/two"]; two.pair() != "(0,0)" {
-		t.Fatalf("an unrouted checkout must read as pair (0,0), got %s", two.pair())
+	two, found := routes[filepath.Clean("/w/two")]
+	if !found || two.CheckoutID != "c2" || two.RootPath != "/w/two" || two.HeadTree != "treeB" || two.Mode != "automatic" || two.pair() != "(0,0)" {
+		t.Fatalf("an unrouted checkout must remain present with pair (0,0), got %+v, found=%v", two, found)
 	}
 	generations := e2eViewsGenerations(t, ctx, db)
 	if len(generations) != 3 {
@@ -1388,9 +1390,10 @@ func TestE2EMatrixViewsTableRendersEveryOutcomeClassDistinctly(t *testing.T) {
 }
 
 // execCommandForE2EViews runs one command and returns its combined output. It is
-// used only by the launcher test above, against a stub in a temp directory.
+// used only by the launcher test above, against the native argv stub.
 func execCommandForE2EViews(ctx context.Context, binary string, argv []string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, binary, argv...)
+	cmd.Env = append(os.Environ(), portableHarnessModeEnv+"=argv")
 	return cmd.CombinedOutput()
 }
 

@@ -2208,9 +2208,7 @@ func TestE2EMatrixCopyTreeReproducesTheServedBytes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(from, ".git", "objects", "junk"), []byte("no"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join("p000", "a.go"), filepath.Join(from, "link.go")); err != nil {
-		t.Skipf("this host refuses symlinks: %v", err)
-	}
+	symlinkErr := os.Symlink(filepath.Join("p000", "a.go"), filepath.Join(from, "link.go"))
 	e2eMatrixCopyTree(t, from, to)
 
 	if source, err := os.ReadFile(filepath.Join(to, "p000", "a.go")); err != nil || string(source) != "package p000\n" {
@@ -2220,15 +2218,23 @@ func TestE2EMatrixCopyTreeReproducesTheServedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o100 == 0 {
-		t.Fatalf("the executable bit was lost: %v", info.Mode())
+	if source, err := os.ReadFile(filepath.Join(to, "p000", "x.sh")); err != nil || string(source) != "#!/bin/sh\n" {
+		t.Fatalf("copied executable content: %q %v", source, err)
 	}
-	if _, err := os.Lstat(filepath.Join(to, "link.go")); err != nil {
-		t.Fatalf("the symlink was not reproduced: %v", err)
-	}
-	if target, err := os.Readlink(filepath.Join(to, "link.go")); err != nil || target != filepath.Join("p000", "a.go") {
-		t.Fatalf("symlink target %q %v", target, err)
-	}
+	t.Run("POSIX executable permission", func(t *testing.T) {
+		portableHarnessAssertExecutableBit(t, info.Mode())
+	})
+	t.Run("symlink", func(t *testing.T) {
+		if symlinkErr != nil {
+			t.Skipf("this host refuses symlinks: %v", symlinkErr)
+		}
+		if _, err := os.Lstat(filepath.Join(to, "link.go")); err != nil {
+			t.Fatalf("the symlink was not reproduced: %v", err)
+		}
+		if target, err := os.Readlink(filepath.Join(to, "link.go")); err != nil || target != filepath.Join("p000", "a.go") {
+			t.Fatalf("symlink target %q %v", target, err)
+		}
+	})
 	if _, err := os.Stat(filepath.Join(to, ".git")); !os.IsNotExist(err) {
 		t.Fatalf("the Git directory was copied into the oracle fixture: %v", err)
 	}
