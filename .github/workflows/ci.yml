@@ -24,11 +24,25 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The Pi extension is TypeScript and its behaviour is covered by a
+      # node:test suite that TestPiExtensionHarness drives. Node 24 imports
+      # index.ts directly under type stripping, so there is no build step and
+      # no package.json in the tree.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
       - name: Build
         run: go build -o gortex ./cmd/gortex/
 
+      # GORTEX_REQUIRE_NODE turns a missing toolchain into a failure: the
+      # harness skips itself off-CI, and a runner that skipped it silently
+      # would drop the extension's only coverage. Both test steps set it —
+      # the matrix splits them, so an omission here disarms one shard.
       - name: Test
         if: matrix.os != 'windows-latest'
+        env:
+          GORTEX_REQUIRE_NODE: "1"
         run: go test -race -timeout=45m -coverprofile=coverage.out ./...
 
       # The Windows shard checks the platform contract, not the race
@@ -44,6 +58,8 @@ jobs:
       # the job failed on an unresolvable package before any test ran.
       - name: Test (windows, no race detector)
         if: matrix.os == 'windows-latest'
+        env:
+          GORTEX_REQUIRE_NODE: "1"
         run: go test -v -timeout=45m ./...
 
       - name: Upload coverage
