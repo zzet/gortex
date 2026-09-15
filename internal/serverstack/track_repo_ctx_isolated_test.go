@@ -86,25 +86,34 @@ func runTrackRepoCtxIsolatedChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	pathDirs := []string{filepath.Dir(gitPath)}
-	childEnv := []string{
-		trackRepoCtxChildEnv + "=" + token,
-		"GORTEX_TEST_ISOLATION_ROOT=" + isolation,
-		"XDG_CONFIG_HOME=" + filepath.Join(isolation, "config"),
-		"XDG_DATA_HOME=" + filepath.Join(isolation, "data"),
-		"XDG_CACHE_HOME=" + filepath.Join(isolation, "cache"),
-		"XDG_STATE_HOME=" + filepath.Join(isolation, "state"),
-		"TMPDIR=" + filepath.Join(isolation, "tmp"),
-		"TMP=" + filepath.Join(isolation, "tmp"),
-		"TEMP=" + filepath.Join(isolation, "tmp"),
+	childEnv := append(trackRepoCtxInheritedEnv(),
+		trackRepoCtxChildEnv+"="+token,
+		"GORTEX_TEST_ISOLATION_ROOT="+isolation,
+		"XDG_CONFIG_HOME="+filepath.Join(isolation, "config"),
+		"XDG_DATA_HOME="+filepath.Join(isolation, "data"),
+		"XDG_CACHE_HOME="+filepath.Join(isolation, "cache"),
+		"XDG_STATE_HOME="+filepath.Join(isolation, "state"),
+		"TMPDIR="+filepath.Join(isolation, "tmp"),
+		"TMP="+filepath.Join(isolation, "tmp"),
+		"TEMP="+filepath.Join(isolation, "tmp"),
 		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=" + os.DevNull,
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_NO_LAZY_FETCH=1",
-		"GIT_CEILING_DIRECTORIES=" + isolation,
+		"GIT_CEILING_DIRECTORIES="+isolation,
+		// The fixture's own git helper inherits this environment rather than
+		// building one, and the isolation above hides every configured
+		// user.name/user.email. Without an explicit identity git falls back to
+		// guessing one from the hostname, which a CI runner's unqualified
+		// hostname turns into a fatal "Author identity unknown".
+		"GIT_AUTHOR_NAME=Isolated Test",
+		"GIT_AUTHOR_EMAIL=isolated@example.test",
+		"GIT_COMMITTER_NAME=Isolated Test",
+		"GIT_COMMITTER_EMAIL=isolated@example.test",
 		"GOMAXPROCS=2",
 		"LANG=C",
 		"LC_ALL=C",
-	}
+	)
 	if runtime.GOOS == "windows" {
 		// Do not inherit a user profile. Windows standard-library locations
 		// remain private even if a provider uses them instead of XDG paths.
@@ -121,6 +130,16 @@ func runTrackRepoCtxIsolatedChild(t *testing.T) {
 		}
 	} else {
 		pathDirs = append(pathDirs, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+	}
+	// The parent's PATH stays on the end, behind the directories named above.
+	// The child is this CGo-linked test binary, and on Windows its own DLL
+	// imports are resolved from PATH by the loader before the process reaches
+	// main: with only the directories above, the toolchain runtime DLLs are
+	// unreachable and the child dies at load time with STATUS_DLL_NOT_FOUND
+	// (0xc0000135), which the parent reports as "isolated tracking child
+	// failed". Only the parent's PATH names the directories that carry them.
+	if inherited := os.Getenv("PATH"); inherited != "" {
+		pathDirs = append(pathDirs, inherited)
 	}
 	childEnv = append(childEnv, "PATH="+strings.Join(pathDirs, string(filepath.ListSeparator)))
 	executable, err := os.Executable()
@@ -145,6 +164,53 @@ func runTrackRepoCtxIsolatedChild(t *testing.T) {
 	if strings.Count(string(output), trackRepoCtxChildMarker+token) != 1 {
 		t.Fatal("isolated tracking child did not report one post-cleanup success marker")
 	}
+}
+
+// trackRepoCtxOwnedEnv are the variables this fixture supplies itself, so an
+// inherited value would either break the child's own preconditions (HOME must
+// be unset, the XDG roots must be the private ones) or leak the developer's
+// state into it. trackRepoCtxOwnedEnvPrefixes are the same thing by family.
+var (
+	trackRepoCtxOwnedEnv         = []string{"HOME", "TMPDIR", "TMP", "TEMP", "APPDATA", "LOCALAPPDATA", "USERPROFILE"}
+	trackRepoCtxOwnedEnvPrefixes = []string{"GORTEX_", "XDG_", "GIT_"}
+)
+
+// trackRepoCtxInheritedEnv is the parent's environment with everything this
+// fixture owns removed.
+//
+// A process environment built from nothing but the isolation variables is not
+// a loadable one: a Windows process needs SystemRoot, COMSPEC, PATHEXT and the
+// PATH entries carrying the CGo toolchain's runtime DLLs before its own main
+// runs, and the child here is this very test binary. Handing it a bare list
+// killed it on the CI runner with STATUS_DLL_NOT_FOUND (0xc0000135) before a
+// single test line was printed. Keeping the parent environment and dropping
+// only the owned names costs nothing in isolation — every dropped name is
+// re-supplied by the caller, and exec dedupes an environment to the last value
+// for each key — while giving the child whatever else its platform needs to
+// start. Names are compared case-insensitively because Windows environment
+// variables are.
+func trackRepoCtxInheritedEnv() []string {
+	var kept []string
+environ:
+	for _, entry := range os.Environ() {
+		key, _, found := strings.Cut(entry, "=")
+		if !found {
+			continue
+		}
+		upper := strings.ToUpper(key)
+		for _, prefix := range trackRepoCtxOwnedEnvPrefixes {
+			if strings.HasPrefix(upper, prefix) {
+				continue environ
+			}
+		}
+		for _, owned := range trackRepoCtxOwnedEnv {
+			if upper == owned {
+				continue environ
+			}
+		}
+		kept = append(kept, entry)
+	}
+	return kept
 }
 
 // This verified fixture invokes public TrackRepoCtx directly. It does not
