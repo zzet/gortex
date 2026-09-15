@@ -326,6 +326,22 @@ func TestIncrementalMultiFileBatchKeepsFailedFileAndCommitsSiblings(t *testing.T
 	require.NoError(t, os.Chtimes(bad, future, future))
 	allowBadRead := denyFileRead(t, bad)
 
+	// Check the default filesystem fixture before the batch runs. A Windows
+	// sharing handle must leave this regular Go file discoverable and stale,
+	// while denying the same read the indexer will make.
+	stale := idx.IsStale(idx.relKey(bad))
+	admitted := idx.admitScopedWalkFile(dir, bad)
+	_, statErr := os.Stat(bad)
+	_, readErr := os.ReadFile(bad)
+	filesystemSource := idx.contentSource() == nil
+	t.Logf("failed-file fixture: stale=%t admitted=%t statErr=%v readErr=%v filesystemSource=%t",
+		stale, admitted, statErr, readErr, filesystemSource)
+	require.True(t, stale, "the failed file must enter the stale batch")
+	require.True(t, admitted, "the failed file must pass scoped admission")
+	require.NoError(t, statErr, "the failed file must remain discoverable")
+	require.Error(t, readErr, "the filesystem read must fail before reindexing")
+	require.True(t, filesystemSource, "this fixture must exercise the default filesystem read")
+
 	result, err := idx.IncrementalReindexPaths(dir, []string{good, bad})
 	require.NoError(t, err)
 	require.Contains(t, result.FailedFiles, bad)
