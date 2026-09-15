@@ -1007,7 +1007,19 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 		changedPaths[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
 	}
 
-	carried := newBuilderPathPayload(corpus.AllNodes(), corpus.AllEdges(), candidates)
+	carriedNodes := corpus.AllNodes()
+	carried := newBuilderPathPayload(carriedNodes, corpus.AllEdges(), candidates)
+	// File eviction preserves canonical contracts when another owner survives,
+	// including their original FilePath. Context withdrawal requires the whole
+	// path's payload to disappear. Until the corpus offers a separate exact
+	// payload eviction, keep contract-bearing paths as explicit output rather
+	// than partially evicting them and claiming they are read-only context.
+	contractPaths := make(map[string]struct{})
+	for _, node := range carriedNodes {
+		if node != nil && node.Kind == graph.KindContract {
+			contractPaths[node.FilePath] = struct{}{}
+		}
+	}
 	if len(carried.nodesByPath) == 0 && len(carried.edgesByPath) == 0 {
 		return out, nil
 	}
@@ -1046,6 +1058,10 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 			// no payload to withhold and no re-derivation to compare, so the
 			// generation stays silent about it and PlannedNotCovered keeps
 			// reporting the absence for what it is.
+			continue
+		}
+		if _, hasContract := contractPaths[graphPath]; hasContract {
+			out.retainedPaths = append(out.retainedPaths, graphPath)
 			continue
 		}
 		if carried.matchesBase(graphPath, baseNodes[graphPath], baseEdges, baseInEdges, changedPaths) {
