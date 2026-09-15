@@ -854,6 +854,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(platform.MemoriesDir()))
 	srv.InitMemories(sideCfg.NotesDir, sideCfg.NotesRepo)
 	srv.InitSuppressions(sideCfg.NotesDir, sideCfg.NotesRepo)
+	// The notebook keeps its sidecar below the repository-local .gortex
+	// directory, independently of the other side-store directories above.
+	if sideCfg.NotebookPath != "" {
+		s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(filepath.Join(sideCfg.NotebookPath, ".gortex")))
+	}
 	srv.InitNotebook(sideCfg.NotebookPath)
 	srv.InitCombo(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)
 	srv.InitFrecency(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)

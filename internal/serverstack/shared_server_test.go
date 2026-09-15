@@ -12,7 +12,93 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/persistence"
 )
+
+func TestSharedServerCloseReleasesNotebookSidecar(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		lifecycle Lifecycle
+	}{
+		{"daemon", LifecycleDaemon},
+		{"oneshot", LifecycleOneshot},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			home := filepath.Join(base, "home")
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+			t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+			t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+
+			notebookPath := filepath.Join(base, "notebook")
+			sidecarPath := persistence.DefaultSidecarPath(filepath.Join(notebookPath, ".gortex"))
+			// Also release the handle if an assertion fails before stack teardown.
+			t.Cleanup(func() { _ = persistence.CloseSidecar(sidecarPath) })
+			conf := config.Default()
+			conf.Semantic.Enabled = false
+			stack, err := NewSharedServer(SharedServerConfig{
+				Lifecycle:         tc.lifecycle,
+				BackendPath:       filepath.Join(base, "store.sqlite"),
+				Config:            conf,
+				Logger:            zap.NewNop(),
+				Embedder:          EmbedderRequest{FlagChanged: true, FlagEnabled: false},
+				SideStores:        SideStores{NotebookPath: notebookPath},
+				SavingsPath:       filepath.Join(base, "savings.sqlite"),
+				SavingsLegacyJSON: filepath.Join(base, "savings.json"),
+			})
+			if err != nil {
+				t.Fatalf("NewSharedServer: %v", err)
+			}
+			closed := false
+			t.Cleanup(func() {
+				if !closed {
+					_ = stack.Close()
+				}
+			})
+
+			if _, err := os.Stat(sidecarPath); err != nil {
+				t.Fatalf("the stack did not create its notebook sidecar: %v", err)
+			}
+			// OpenSidecar returns the handle the notebook manager already owns.
+			sidecar, err := persistence.OpenSidecar(sidecarPath)
+			if err != nil {
+				t.Fatalf("get notebook sidecar: %v", err)
+			}
+			repoKey := persistence.RepoCacheKey(notebookPath)
+			entry := persistence.NotebookRow{ID: "close-regression", Body: "survives stack teardown"}
+			if err := sidecar.UpsertNotebook(repoKey, entry); err != nil {
+				t.Fatalf("write notebook: %v", err)
+			}
+			stack.cleanup = append(stack.cleanup, func() {
+				if _, err := sidecar.LoadNotebookRows(repoKey); err != nil {
+					t.Errorf("notebook sidecar closed before teardown finished: %v", err)
+				}
+			})
+
+			if err := stack.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			closed = true
+			if _, err := sidecar.LoadNotebookRows(repoKey); err == nil || !strings.Contains(err.Error(), "database is closed") {
+				t.Fatalf("notebook handle after stack teardown: got %v, want a closed database", err)
+			}
+			reopened, err := persistence.OpenSidecar(sidecarPath)
+			if err != nil {
+				t.Fatalf("reopen notebook: %v", err)
+			}
+			if reopened == sidecar {
+				t.Fatal("stack teardown left the closed notebook handle in the shared cache")
+			}
+			rows, err := reopened.LoadNotebookRows(repoKey)
+			if err != nil || len(rows) != 1 || rows[0].ID != entry.ID || rows[0].Body != entry.Body {
+				t.Fatalf("notebook after reopening: rows=%+v err=%v", rows, err)
+			}
+		})
+	}
+}
 
 // TestNewSharedServer_Oneshot asserts the shared constructor builds a
 // working stack over a tmp repo: the graph indexes, and the engine /
