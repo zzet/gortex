@@ -45,18 +45,18 @@ func FileURI(path, rawQuery string) string {
 	if absolute, err := filepath.Abs(path); err == nil {
 		path = absolute
 	}
-	return fileURI(path, rawQuery)
+	return fileURI(path, rawQuery, filepath.Separator)
 }
 
-// fileURI is FileURI's rendering half, split out so it can be exercised with
-// an absolute path in the *other* platform's spelling. filepath.Abs and
-// filepath.ToSlash both answer for the running OS, which would make a
-// Windows-path test on a POSIX host prove nothing; this half folds backslashes
-// on every platform instead. The cost is that a POSIX file whose name
-// genuinely contains a backslash would be re-spelled — no store path a test
-// hands this helper does.
-func fileURI(path, rawQuery string) string {
-	slashed := strings.ReplaceAll(path, `\`, "/")
+// fileURI renders an absolute path using its platform's separator. Passing the
+// separator explicitly lets tests exercise Windows spelling on a POSIX host
+// while preserving literal backslashes in POSIX filenames, as filepath.ToSlash
+// does in the production builder.
+func fileURI(path, rawQuery string, separator byte) string {
+	slashed := path
+	if separator == '\\' {
+		slashed = strings.ReplaceAll(path, `\`, "/")
+	}
 	if !strings.HasPrefix(slashed, "/") {
 		slashed = "/" + slashed
 	}

@@ -1,6 +1,7 @@
 package testdsn
 
 import (
+	"net/url"
 	"path/filepath"
 	"testing"
 )
@@ -12,27 +13,31 @@ import (
 // query string or escaping is wrong.
 func TestFileURIRendersBothPlatformSpellings(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		path  string
-		query string
-		want  string
+		name      string
+		path      string
+		query     string
+		want      string
+		separator byte
 	}{
 		{
-			name:  "windows drive letter",
-			path:  `C:\Users\x\store.sqlite`,
-			query: "mode=ro",
-			want:  "file:///C:/Users/x/store.sqlite?mode=ro",
+			name:      "windows drive letter",
+			path:      `C:\Users\x\store.sqlite`,
+			query:     "mode=ro",
+			want:      "file:///C:/Users/x/store.sqlite?mode=ro",
+			separator: '\\',
 		},
 		{
-			name: "windows drive letter without a query",
-			path: `D:\work\gortex\store.sqlite`,
-			want: "file:///D:/work/gortex/store.sqlite",
+			name:      "windows drive letter without a query",
+			path:      `D:\work\gortex\store.sqlite`,
+			want:      "file:///D:/work/gortex/store.sqlite",
+			separator: '\\',
 		},
 		{
-			name:  "windows path with a space",
-			path:  `C:\Users\RUNNER~1\App Data\store.sqlite`,
-			query: "mode=ro",
-			want:  "file:///C:/Users/RUNNER~1/App%20Data/store.sqlite?mode=ro",
+			name:      "windows path with a space",
+			path:      `C:\Users\RUNNER~1\App Data\store.sqlite`,
+			query:     "mode=ro",
+			want:      "file:///C:/Users/RUNNER~1/App%20Data/store.sqlite?mode=ro",
+			separator: '\\',
 		},
 		{
 			name:  "posix path",
@@ -51,9 +56,16 @@ func TestFileURIRendersBothPlatformSpellings(t *testing.T) {
 			query: "mode=ro",
 			want:  "file:///tmp/gortex%20fixture/store.sqlite?mode=ro",
 		},
+		{
+			name:      "posix literal backslash and URI delimiters",
+			path:      `/tmp/store\?#%.sqlite`,
+			query:     "mode=ro",
+			want:      "file:///tmp/store%5C%3F%23%25.sqlite?mode=ro",
+			separator: '/',
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := fileURI(tc.path, tc.query); got != tc.want {
+			if got := fileURI(tc.path, tc.query, tc.separator); got != tc.want {
 				t.Fatalf("fileURI(%q, %q) = %q; want %q", tc.path, tc.query, got, tc.want)
 			}
 		})
@@ -68,7 +80,7 @@ func TestFileURIAbsolutePathForThisPlatform(t *testing.T) {
 	if !filepath.IsAbs(path) {
 		t.Fatalf("t.TempDir() is not absolute: %q", path)
 	}
-	want := fileURI(path, "mode=ro")
+	want := fileURI(path, "mode=ro", filepath.Separator)
 	if got := FileURI(path, "mode=ro"); got != want {
 		t.Fatalf("FileURI(%q) = %q; want %q", path, got, want)
 	}
@@ -82,8 +94,23 @@ func TestFileURIMakesRelativePathsAbsolute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := fileURI(absolute, ""); got != want {
+	if want := fileURI(absolute, "", filepath.Separator); got != want {
 		t.Fatalf("FileURI(relative) = %q; want %q", got, want)
+	}
+}
+
+// The public helper must select the host's separator before rendering.
+func TestFileURIPreservesPOSIXBackslash(t *testing.T) {
+	if filepath.Separator != '/' {
+		t.Skip("backslash is a path separator on this platform")
+	}
+	path := filepath.Join(t.TempDir(), `store\?#%.sqlite`)
+	got, err := url.Parse(FileURI(path, "mode=ro"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != path || got.RawQuery != "mode=ro" || got.Host != "" || got.Fragment != "" {
+		t.Fatalf("URI changed the filename or query: %+v; want path %q", got, path)
 	}
 }
 
