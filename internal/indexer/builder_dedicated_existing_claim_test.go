@@ -38,7 +38,7 @@ func TestDedicatedExistingClaimFailedReplacementCannotAllocate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, fixture.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, builder.Store, fixture.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestDedicatedExistingClaimLiveStatesAreReadOnly(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			check, err := installDedicatedWriteAudit(ctx, fixture.StorePath)
+			check, err := installDedicatedWriteAudit(ctx, builder.Store, fixture.StorePath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,7 +111,7 @@ func TestDedicatedExistingClaimLiveStatesAreReadOnly(t *testing.T) {
 func TestDedicatedExistingClaimRejectsWrongIDTokenAndNegative(t *testing.T) {
 	builder, fixture, claim := privateClaimedDedicatedFixture(t)
 	ctx := context.Background()
-	check, err := installDedicatedWriteAudit(ctx, fixture.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, builder.Store, fixture.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestDedicatedExistingClaimDirectFailureIsReadOnly(t *testing.T) {
 	if err := builder.Store.Catalog().FailDedicatedBaseBuild(ctx, store_sqlite.FailDedicatedBaseBuildRequest{Claim: claim, Error: "failed"}); err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, fixture.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, builder.Store, fixture.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func BenchmarkDedicatedExistingClaimValidation(b *testing.B) {
 			if mode == "ordinary" {
 				request.ExistingGenerationID = 0
 			}
-			check, err := installDedicatedWriteAudit(ctx, fixture.StorePath)
+			check, err := installDedicatedWriteAudit(ctx, builder.Store, fixture.StorePath)
 			if err != nil {
 				b.Fatal(err)
 			}

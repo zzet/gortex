@@ -118,7 +118,7 @@ func TestDedicatedBaseRuntimeFinalizeKeepsHeldPublisherRevoked(t *testing.T) {
 	if err := r.FinalizeDedicatedBaseOwner(graphID, owner, drained); err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(t.Context(), request.StorePath)
+	check, err := installDedicatedWriteAudit(t.Context(), b.Store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}

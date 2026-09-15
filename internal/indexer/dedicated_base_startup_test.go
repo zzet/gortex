@@ -241,7 +241,7 @@ func TestInitialBasePublisherWarmRestartReAdoptsWithoutCatalogWrites(t *testing.
 
 	warmRestart(t, f, root)
 
-	audit, err := installDedicatedWriteAudit(ctx, f.dbPath)
+	audit, err := installDedicatedWriteAudit(ctx, f.store, f.dbPath)
 	require.NoError(t, err)
 
 	second := startupPublisher(t, f).PublishRepo(ctx, prefix)
@@ -699,7 +699,7 @@ func TestInitialBasePublisherPublishesNothingForAnOwnerOnlyFamily(t *testing.T) 
 	require.NoError(t, err)
 	require.Len(t, checkouts, 1, "the fixture is only owner-only if the family holds one checkout")
 
-	audit, err := installDedicatedWriteAudit(ctx, f.dbPath)
+	audit, err := installDedicatedWriteAudit(ctx, f.store, f.dbPath)
 	require.NoError(t, err)
 
 	out := startupPublisher(t, f).PublishRepo(ctx, registered.Prefix)

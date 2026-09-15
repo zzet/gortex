@@ -72,7 +72,7 @@ func TestDedicatedBaseAdvanceRevisionChangeRootsNewChain(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+			check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -162,7 +162,7 @@ func TestDedicatedBaseAdvanceRevisionPlanningWritesNothing(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("broken head row: found=%v err=%v", found, err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,6 +275,12 @@ func TestDedicatedBaseAdvanceNonHomogeneousChainStillPublishesAsRoot(t *testing.
 			if err := catalog.PublishViewGeneration(ctx, mixedID, 3); err != nil {
 				t.Fatal(err)
 			}
+			// The initial full root scheduled Store maintenance before returning.
+			// Join it before this fixture's second SQLite connection takes the
+			// writer lock for the reconstructed mixed-head pointer.
+			if err := f.builder.Store.AwaitMaintenanceIdle(ctx); err != nil {
+				t.Fatal(err)
+			}
 			setDedicatedActiveGeneration(t, ctx, f.request.StorePath, f.publisher.authority.GraphID, mixedID)
 			graph, found, err := catalog.GetDedicatedGraph(ctx, f.publisher.authority.GraphID)
 			if err != nil || !found || graph.ActiveGenerationID != mixedID {
@@ -308,7 +314,7 @@ func TestDedicatedBaseAdvanceNonHomogeneousChainStillPublishesAsRoot(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+			check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 			if err != nil {
 				t.Fatal(err)
 			}

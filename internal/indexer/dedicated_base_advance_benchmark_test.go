@@ -27,7 +27,7 @@ func BenchmarkDedicatedBaseCurrentReadyReplay(b *testing.B) {
 	}
 	observation.RootPath = filepath.Join(b.TempDir(), "unavailable-git-root")
 	observe := func(context.Context) (dedicatedBaseObservation, error) { return observation, nil }
-	checkWrites, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	checkWrites, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -247,7 +247,7 @@ func BenchmarkPrivateClaimedDedicatedReadyCycle(b *testing.B) {
 	if _, err := catalog.AdoptDedicatedBaseGeneration(ctx, store_sqlite.AdoptDedicatedBaseGenerationRequest{Claim: claim}); err != nil {
 		b.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, builder.Store, request.StorePath)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -347,7 +347,7 @@ func TestPrivateClaimedDedicatedBaseReadyCyclesDoNotWrite(t *testing.T) {
 	if _, err := catalog.AdoptDedicatedBaseGeneration(ctx, store_sqlite.AdoptDedicatedBaseGenerationRequest{Claim: claim}); err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, builder.Store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,7 +637,7 @@ func TestPrivateReservedGenerationOnlyLeaderPreparesAndClosesSource(t *testing.T
 func TestClaimedDedicatedBaseRejectsInvalidRequestsWithoutWrites(t *testing.T) {
 	builder, request, claim := privateClaimedDedicatedFixture(t)
 	ctx := context.Background()
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, builder.Store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,51 +688,15 @@ func TestClaimedDedicatedBaseRejectsInvalidRequestsWithoutWrites(t *testing.T) {
 	}
 }
 
-// settledWALStat returns the write-ahead log's stat once it has stopped
-// changing, so a caller can measure an interval that starts from a store with
-// no outstanding maintenance. It is bounded: a log that never settles is
-// reported rather than waited on forever, because a store that keeps writing
-// is itself the finding.
-func settledWALStat(path string) (os.FileInfo, error) {
-	const (
-		poll   = 20 * time.Millisecond
-		stable = 3
-		limit  = 10 * time.Second
-	)
-	deadline := time.Now().Add(limit)
-	var last os.FileInfo
-	steady := 0
-	for {
-		info, err := os.Stat(path + "-wal")
-		if err != nil {
-			return nil, err
-		}
-		if last != nil && info.Size() == last.Size() && info.ModTime().Equal(last.ModTime()) {
-			steady++
-			if steady >= stable {
-				return info, nil
-			}
-		} else {
-			steady = 0
-		}
-		last = info
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("the write-ahead log %s-wal never settled in %s, so a write audit "+
-				"starting here would measure another caller's work", path, limit)
-		}
-		time.Sleep(poll)
-	}
-}
-
 // installDedicatedWriteAudit instruments only a test-owned database. Keeping
 // this in the indexer test package avoids exporting production-only test hooks
 // from store_sqlite. All DDL commits before the measured interval starts.
-func installDedicatedWriteAudit(ctx context.Context, path string) (func() error, error) {
-	// Settle BEFORE the instrumentation, not just before the measurement: this
-	// helper's own DDL runs on a second connection with no busy timeout, so a
-	// maintenance pass still holding the writer fails it outright with
-	// SQLITE_BUSY.
-	if _, err := settledWALStat(path); err != nil {
+func installDedicatedWriteAudit(ctx context.Context, store *store_sqlite.Store, path string) (func() error, error) {
+	// The preceding full build scheduled its planner-statistics work before
+	// returning. Join that owed work before this second connection's DDL tries
+	// to take the writer lock; a quiet WAL sample alone cannot prove the lane
+	// has finished.
+	if err := store.AwaitMaintenanceIdle(ctx); err != nil {
 		return nil, err
 	}
 	db, err := sql.Open("sqlite", path)
@@ -763,18 +727,14 @@ func installDedicatedWriteAudit(ctx context.Context, path string) (func() error,
 	if err := db.Close(); err != nil {
 		return nil, err
 	}
-	// The measured interval must start from a QUIESCED store. A build that has
-	// already returned can still owe the maintenance lane work its own thread
-	// deliberately did not do — a payload written inside a bulk window defers
-	// its planner-statistics refresh (planner_stats_freshness.go,
-	// plannerStatsBulkWindowReason) and the publication schedules it on the
-	// lane — and that refresh writes sqlite_stat1, which is a real write to the
-	// write-ahead log that no trigger here can see. Starting the audit while it
-	// is still owed attributes the previous build's tail to the interval under
-	// test. Waiting for the log to stop moving is what makes the audit's answer
-	// about the caller's interval and nothing else; it never hides a write made
-	// AFTER this point, which is the only thing the audit claims.
-	before, err := settledWALStat(path)
+	// A completed build can owe asynchronous planner statistics that write
+	// sqlite_stat1 outside these table triggers. The Store barrier observes
+	// queued and running lane work; it does not hide a write made after this
+	// baseline by a ready-reuse caller.
+	if err := store.AwaitMaintenanceIdle(ctx); err != nil {
+		return nil, err
+	}
+	before, err := os.Stat(path + "-wal")
 	if err != nil {
 		return nil, err
 	}
@@ -999,7 +959,7 @@ func TestPrivateEmptyCommittedDedicatedBaseAcceptance(t *testing.T) {
 		t.Logf("empty-view metadata node (no root-node policy assumed): %+v", node)
 	}
 	t.Logf("empty committed acceptance: commit=%s tree=%s generation=%d report_nodes=%d view_nodes=%d mutable_nodes=%d", commit, tree, id, report.NodeCount, len(nodes), len(store.AllNodes()))
-	checkWrites, err := installDedicatedWriteAudit(ctx, storePath)
+	checkWrites, err := installDedicatedWriteAudit(ctx, builder.Store, storePath)
 	if err != nil {
 		t.Fatal(err)
 	}

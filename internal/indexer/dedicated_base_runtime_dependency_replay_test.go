@@ -36,7 +36,7 @@ func TestDedicatedRuntimeDependencyRevisionReadyReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+			check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -78,7 +78,7 @@ func TestDedicatedRuntimeDependencyOnlyChangePreservesInitialGuard(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func BenchmarkDedicatedRuntimeDependencyRevisionReplay(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+			check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 			if err != nil {
 				b.Fatal(err)
 			}

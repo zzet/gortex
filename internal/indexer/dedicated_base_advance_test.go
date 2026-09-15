@@ -132,7 +132,7 @@ func TestDedicatedBaseCurrentInitialDeltaAndReadyReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	observation.RootPath = filepath.Join(t.TempDir(), "absent-git-root")
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -686,6 +686,28 @@ func (s *Store) waitMaintenanceIdle(ctx context.Context) error {
 	}
 }
 
+// AwaitMaintenanceIdle waits until the Store's maintenance lane has no queued
+// or running pass or WAL drain at the observed idle point. It joins work a
+// completed publication already scheduled; it does not block a later publisher
+// or any independent writer from scheduling new work after it returns.
+// Cancellation observed before return produces the context error, including
+// when cancellation and the lane's idle transition happen together.
+func (s *Store) AwaitMaintenanceIdle(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("await maintenance idle: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s == nil {
+		return fmt.Errorf("await maintenance idle: nil store")
+	}
+	if err := s.waitMaintenanceIdle(ctx); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
 // stopMaintenanceLane closes the lane for good: no further pass can be
 // scheduled, the pass in flight is cancelled, and Close joins the worker before
 // the pools it writes through are torn down. Idempotent, and inert on a store

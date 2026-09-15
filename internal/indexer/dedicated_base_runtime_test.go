@@ -71,7 +71,7 @@ func TestDedicatedBaseRuntimeReadyReplayAndNoWrites(t *testing.T) {
 	if err != nil || first.Adoption.GenerationID <= 0 || first.Adoption.AlreadyAdopted {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestDedicatedBaseRuntimeAdvanceRequiredPreservesDesire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestDedicatedBaseRuntimeFreshBuilderRequired(t *testing.T) {
 	if _, err := publisher.ensureInitial(ctx, dedicatedRuntimeObserver(runtime, publisher, observation)); err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestDedicatedBaseRuntimeExternalAdoptionDuringObservation(t *testing.T) {
 	if err != nil || p.Desire != desire || p.AttemptState != "adopted" {
 		t.Fatalf("external adoption lost: %+v %v", p, err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +539,7 @@ func BenchmarkDedicatedBaseRuntimeReadyReplay(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, runtime.store, request.StorePath)
 	if err != nil {
 		b.Fatal(err)
 	}

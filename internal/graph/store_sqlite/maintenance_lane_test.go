@@ -34,6 +34,25 @@ func settleMaintenanceLane(t *testing.T, store *Store) {
 	}
 }
 
+// A canceled caller cannot treat an already-idle lane as a successful wait.
+// The public boundary checks cancellation independently of lane state.
+func TestAwaitMaintenanceIdleReturnsCanceledContext(t *testing.T) {
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "idle.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.AwaitMaintenanceIdle(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled idle wait returned %v, want context.Canceled", err)
+	}
+}
+
 // waitForCondition polls a predicate until it holds. Used for states another
 // goroutine publishes (a publish window opening, a lane pass starting) where
 // the only alternative is a sleep long enough to be a flake either way.

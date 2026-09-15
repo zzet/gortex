@@ -533,7 +533,7 @@ func TestClaimedDedicatedDeltaStaleAndPolicyGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := f.reserve(t, f.commit(t))
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +606,7 @@ func TestClaimedDedicatedDeltaOnePhysicalAndReadyReplay(t *testing.T) {
 	if callbacks.Load() != 1 {
 		t.Fatalf("physical publication callbacks=%d", callbacks.Load())
 	}
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +632,7 @@ func BenchmarkClaimedDedicatedDeltaReadyReplay(b *testing.B) {
 	if _, _, err := f.builder.BuildClaimedDedicatedDelta(ctx, request); err != nil {
 		b.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -659,7 +659,7 @@ func TestClaimedDedicatedDeltaTreeEquivalentCommitReusesBase(t *testing.T) {
 	if tree != f.request.Identity.TreeOID || f.git("rev-parse", "HEAD") == f.request.Identity.ProvenanceCommitOID {
 		t.Fatal("fixture did not create a distinct tree-equivalent commit")
 	}
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +688,7 @@ func TestClaimedDedicatedDeltaPolicyChangeRequiresReseed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,7 +741,7 @@ func TestClaimedDedicatedDeltaParentRevisionChangeRefused(t *testing.T) {
 	}
 	request := ClaimedDedicatedDeltaRequest{Claim: claim, Base: f.base, BaseTreeOID: f.request.Identity.TreeOID,
 		RepoDir: f.request.RootPath, RootPath: f.request.RootPath, WorkspaceID: f.request.WorkspaceID, ProjectID: f.request.ProjectID}
-	check, err := installDedicatedWriteAudit(ctx, f.request.StorePath)
+	check, err := installDedicatedWriteAudit(ctx, f.builder.Store, f.request.StorePath)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -207,7 +207,7 @@ func TestAHeadMoveWithoutAConsumerPublishesNothing(t *testing.T) {
 	ctx := context.Background()
 
 	sha := f.commit(t, "moved.go", "package a\n\nfunc Moved() {}\n", "move the head")
-	audit, err := installDedicatedWriteAudit(ctx, f.dbPath)
+	audit, err := installDedicatedWriteAudit(ctx, f.store, f.dbPath)
 	require.NoError(t, err)
 
 	advance := f.dispatchAndWait(t, f.root, sha)
@@ -518,7 +518,7 @@ func TestGitWatcherSameTreeCommitPublishesNothing(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	audit, err := installDedicatedWriteAudit(ctx, f.dbPath)
+	audit, err := installDedicatedWriteAudit(ctx, f.store, f.dbPath)
 	require.NoError(t, err)
 
 	advance := f.dispatchAndWait(t, f.root, again)
