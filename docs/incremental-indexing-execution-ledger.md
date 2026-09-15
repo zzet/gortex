@@ -1163,7 +1163,7 @@ These must appear **verbatim** in the PR body (W9.5), with their ledger row name
    W6.5 additionally widens the relative arm's union in the direction the closure is allowed to err.
 7. **W3.5 / `gortex repos`** — repository freshness is read at `view_gen = 0` by construction:
    `RepoIndexStateBaseViewGen` is declared at
-   `internal/graph/store_sqlite/read_index_state.go:12` and bound into the
+   `internal/graph/store_sqlite/read_index_state.go:21` and bound into the
    `WHERE view_gen = ?` predicate at `:77`, so the read does not reflect worktree or derived
    generations. W5.12 makes the door **declare** this in three places rather than changing it.
 8. **D8** — W2.1c and W2.4 each invalidate every cached generation once on first deploy. Bundled
