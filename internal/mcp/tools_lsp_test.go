@@ -11,7 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/semantic"
 )
 
-// W3.2 — the LSP half of the enrichment-output item.
+// The LSP half of the enrichment-output rule.
 //
 // enrichNodeOnDemand and confirmSymbolRefsOnDemand are WRITES raised from READ
 // paths: get_symbol faults in an LSP-grade semantic_type, and
@@ -167,9 +167,9 @@ func TestOnDemandLSPEnrichmentUnderARoutedViewTouchesNothing(t *testing.T) {
 //
 // Scope note: the fixture registers no language server, so the corpus arm
 // cannot be used as the positive control here — a run with no provider has
-// never marked the ledger, before this item or after (the pre-item body
-// returned on the same lspProviderForPath error). What this pins is that the
-// OUTPUT refusal returns on the same terms, ahead of the ledger write.
+// never marked the ledger, before the refusal was added or after (the earlier
+// body returned on the same lspProviderForPath error). What this pins is that
+// the OUTPUT refusal returns on the same terms, ahead of the ledger write.
 func TestRoutedSymbolRefsRefusalDoesNotBurnTheConfirmationLedger(t *testing.T) {
 	s := newLSPEnrichmentStack(t)
 	ctx := routedEnrichmentCtx(t, s.viewStack)

@@ -16,7 +16,8 @@ import (
 )
 
 // The analysis cache's request-surface half of the payload-view-generation
-// axis (W3.3 / D9).
+// axis: the cache is keyed by the payload view generation it was computed
+// over, because the store's coarse mutation revision cannot stand in for one.
 //
 // backendStore() hands back the INDEXER's handle, which reads the base corpus.
 // The analysis passes walk s.graph (analysis_persistence.go:

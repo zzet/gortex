@@ -250,7 +250,7 @@ func TestGainCmd_Registered(t *testing.T) {
 	}
 }
 
-// --- F4b: the gain reader must see the live window ------------------------
+// --- the gain reader must see every live handle's buffered window ----------
 //
 // `gortex gain` opens a SECOND savings.Store on the ledger a writer in the
 // same process is already buffering into. The two handles share one sidecar
@@ -341,7 +341,7 @@ func TestLoadHistory_CloseDoesNotDropTheWritersWindow(t *testing.T) {
 	}
 }
 
-// --- F4b: the one-shot stdio server flushes on every exit path ------------
+// --- the one-shot stdio server flushes on every exit path -----------------
 
 // installOneshotSavingsFlush is the seam; runMCP is the production entry
 // point that has to reach it. Parsing the source is the only way to assert

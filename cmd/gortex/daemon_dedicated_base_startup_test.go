@@ -114,12 +114,13 @@ func waitForScheduledPublications(t *testing.T, parent context.Context, state *d
 }
 
 // TestDaemonWarmupPublishesTheInitialCommittedBase is the production-entrypoint
-// trace for W4.2.
+// trace for the initial committed publication on cold and warm startup.
 //
 // The chain it exercises end to end is:
 //
 //	buildDaemonState (daemon_state.go)
-//	  -> serverstack.NewSharedServer installs the DedicatedBaseRuntime (W4.1)
+//	  -> serverstack.NewSharedServer installs the DedicatedBaseRuntime, which
+//	     must precede every owner registration
 //	  -> indexer.NewInitialBasePublisher binds to it over the shared leases
 //	CheckoutLifecycle.Seed registers the repository owner
 //	warmupDaemonState's cold/warm dispatch indexes the repository into
@@ -216,11 +217,12 @@ func TestDaemonWarmupPublishesTheInitialCommittedBase(t *testing.T) {
 		t.Fatalf("the published generation is not a complete committed root: %+v", row)
 	}
 	// Publication is not activation: the owner's own route is untouched, and
-	// generation 0 is still the legacy corpus (W4.5 is the declared limit).
+	// generation 0 is still the legacy corpus — the declared limit on the
+	// primary's own working route.
 	if _, routed, err := store.Catalog().GetCheckoutRoute(ctx, graph.OwnerCheckoutID); err != nil {
 		t.Fatalf("read the owner's route: %v", err)
 	} else if routed {
-		t.Fatal("publication installed a route for the dedicated owner; that is W4.5, not W4.2")
+		t.Fatal("publication installed a route for the dedicated owner; publication must not activate the owner's own route")
 	}
 }
 
@@ -443,11 +445,11 @@ func TestDaemonWarmupReadinessIsNotBlockedByPublication(t *testing.T) {
 // stopRepositoryPublishers closes publisher admission on the runtime
 // (repository_admission.go) and cancels every registered publication driver.
 //
-// Before this item nothing on that path removed the trigger from the
-// process-wide advancement registry, so a stopped daemon's whole stack —
+// Previously nothing on that path removed the trigger from the process-wide
+// advancement registry, so a stopped daemon's whole stack —
 // trigger -> publisher -> lifecycle -> *MultiIndexer — stayed reachable for the
-// life of the process (W5/W4.3-verify, minor 5). The registry half is asserted
-// in the indexer package, where the map is visible; what is asserted here is
+// life of the process, leaking it. The registry half is asserted in the
+// indexer package, where the map is visible; what is asserted here is
 // that the daemon's own shutdown really does reach the cancellation the
 // unregistration now hangs off.
 func TestDaemonShutdownStopsTheCommittedBasePublisher(t *testing.T) {

@@ -35,8 +35,9 @@ func advanceGit(t *testing.T, root string, args ...string) string {
 // TestDaemonLiveHeadChangeAdvancesTheCommittedBase is the production-entrypoint
 // trace for the live half of committed publication.
 //
-// W4.2 proved a daemon start publishes a committed base. This proves a RUNNING
-// daemon keeps it current, through the real chain and nothing simulated:
+// Startup publication proves a daemon start publishes a committed base. This
+// proves a RUNNING daemon keeps it current, through the real chain and nothing
+// simulated:
 //
 //	warmupDaemonState brings up the MultiWatcher (its last step, after the
 //	  readiness flip and after BeginDraining)
@@ -170,10 +171,11 @@ func TestDaemonLiveHeadChangeAdvancesTheCommittedBase(t *testing.T) {
 	}
 
 	// Advancement is not activation: the owning repository's own request route
-	// is still untouched (W4.5 stays the declared limitation).
+	// is still untouched — it stays on legacy generation 0, which is the
+	// declared limitation of committed publication.
 	if _, routed, err := catalog.GetCheckoutRoute(ctx, advanced.OwnerCheckoutID); err != nil {
 		t.Fatalf("read the owner's route: %v", err)
 	} else if routed {
-		t.Fatal("a live advance installed a route for the dedicated owner; that is W4.5")
+		t.Fatal("a live advance installed a route for the dedicated owner; the owner's own route must stay on legacy generation 0")
 	}
 }

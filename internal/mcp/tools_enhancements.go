@@ -1041,10 +1041,9 @@ func requestWithoutArgs(req mcp.CallToolRequest, keys ...string) mcp.CallToolReq
 // the same class of untruth the note exists to prevent, in the other direction.
 //
 // The honest home for these two entries is analyzeScopeAwareKinds in
-// analyze_kinds.go, beside the rest of the vocabulary. That file is outside
-// this item's ownership list, so the predicate is extended at the one site that
-// reads it (this file's dispatcher) instead of editing another item's file;
-// folding the two sets together is a mechanical follow-up.
+// analyze_kinds.go, beside the rest of the vocabulary. The predicate is
+// extended at the one site that reads it (this file's dispatcher) rather than
+// there; folding the two sets together is a mechanical follow-up.
 var analyzeEnrichmentRepoNarrowedKinds = map[string]bool{
 	"blame":    true,
 	"coverage": true,
@@ -1240,8 +1239,8 @@ func (s *Server) handleAnalyzeCoverage(ctx context.Context, req mcp.CallToolRequ
 		// candidate is unambiguous; more than one means the caller must name
 		// the repository with `repo`, because picking one here would read a
 		// profile out of — and stamp coverage onto — a repository the call
-		// never named. That is the same wrong-root input read this item
-		// exists to close, and it does not get re-opened as a convenience.
+		// never named. That is the same wrong-root input read the enrichment
+		// narrowing closes, and it does not get re-opened as a convenience.
 		targets := s.enrichmentTargets(ctx, strings.TrimSpace(req.GetString("repo", "")))
 		switch len(targets) {
 		case 0:
@@ -5459,7 +5458,7 @@ func lastAuthoredTSFrom(blame map[string]graph.BlameEnrichment, n *graph.Node) (
 }
 
 // ---------------------------------------------------------------------------
-// Enrichment output generation (W3.2 / W3.7)
+// Enrichment output generation
 // ---------------------------------------------------------------------------
 //
 // Blame, churn, coverage, release and LSP enrichment all WRITE: they stamp
@@ -5489,7 +5488,7 @@ func lastAuthoredTSFrom(blame map[string]graph.BlameEnrichment, n *graph.Node) (
 // request read" is not implementable at this layer; naming the corpus and
 // refusing anything else is.
 //
-// The same refusal closes the INPUT side channel (W3.7). The enrichment inputs
+// The same refusal closes the INPUT side channel. The enrichment inputs
 // that read a working copy — `git blame` of the live tree, cover profiles on
 // disk — ran against the TRACKED repository root no matter which checkout the
 // request had selected. A routed request no longer reaches them at all, so a
@@ -5587,7 +5586,7 @@ func (o *EnrichmentOutput) Complete() error {
 // producer stamps meta as it goes and has published everything it is going to
 // publish before Complete is called. Reporting that repository as "skipped" or
 // as an error would under-report work that demonstrably happened, which is the
-// opposite lie from the one this item removes. So a superseded settlement is
+// opposite lie from the one the authority removes. So a superseded settlement is
 // reported as such, alongside the counts the run actually wrote, and only a
 // genuine settlement failure is an error.
 //
@@ -5641,7 +5640,7 @@ func enrichmentOwnerKey(store graph.Store, producer, scope string) string {
 // keys in another. A package-local `sync.Once` here would mean an enrichment
 // admitted on a server with no indexer named an output nothing else in the
 // process could see, which is exactly the "every mutation names ONE output
-// generation" property this item exists to establish. There is one fallback per
+// generation" property the authority establishes. There is one fallback per
 // process and it lives in internal/indexer.
 func fallbackEnrichmentAuthority() *indexer.OutputGenerationAuthority {
 	return indexer.DefaultOutputGenerationAuthority()
@@ -5722,8 +5721,8 @@ func (s *Server) beginEnrichmentOutput(
 //
 // A request reading a checkout of its own covers NOTHING: it has no writable
 // generation, and sweeping the tracked repositories on its behalf is exactly
-// the mixed-snapshot write this item removes. Every other request covers the
-// tracked repositories, as before.
+// the mixed-snapshot write the output-generation rule removes. Every other
+// request covers the tracked repositories, as before.
 func (s *Server) enrichmentTargets(ctx context.Context, scope string) map[string]string {
 	if requestViewFromContext(ctx).readsOwnCheckout() {
 		return nil

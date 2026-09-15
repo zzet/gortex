@@ -12,7 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
-// W5.4 — the repository-owner lease on the serving request.
+// The repository-owner lease on the serving request.
 //
 // The generation lease a materialized view holds stops a payload generation
 // from being RETIRED. Repository lifetime is a different guarantee: owner
@@ -252,8 +252,9 @@ func TestDetachedWorkerIsNotAdmittedToRepositoriesItDoesNotRead(t *testing.T) {
 	<-workerDone
 }
 
-// TestRoutedRequestHandsOffTheBasePin closes the W5.3 minor: requestView.close
-// released the base pin unconditionally while the handoff joined only the
+// TestRoutedRequestHandsOffTheBasePin closes a gap the base-corpus pin left:
+// requestView.close released the base pin unconditionally while the handoff
+// joined only the
 // derived generation lease, so a detached worker kept the stack and lost both
 // halves of the corpus underneath it — generation zero and the owner that
 // speaks for it.

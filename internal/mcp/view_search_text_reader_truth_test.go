@@ -13,7 +13,10 @@ import (
 	"github.com/zzet/gortex/internal/search/trigram"
 )
 
-// What the READER says about text search, which is the half D5 did not have.
+// What the READER says about text search — the half the producer-side
+// declaration did not cover. A view must not answer search_text out of a
+// working copy its identity does not describe, and must not assert a
+// capability it cannot vouch for.
 //
 // The producers were made truthful first (indexer/builder_generation.go,
 // textSearchProducer), and it changed nothing a caller could see: the
@@ -114,7 +117,8 @@ func TestCommittedTopViewRefusesTextSearchAsACapability(t *testing.T) {
 }
 
 // TestCommittedTreeRefusalExplainsItself is the "and the rider explains" half
-// of D5 on the one committed identity the MCP surface reaches today.
+// of the text-search withdrawal, on the one committed identity the MCP surface
+// reaches today.
 //
 // A ref view's generation withdraws the capability outright, so the refusal was
 // already the capability evaluation's — but the evaluation's message is a

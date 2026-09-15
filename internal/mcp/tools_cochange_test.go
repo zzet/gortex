@@ -151,7 +151,7 @@ func TestCoChange_PersistedEdgesTakeFastPath(t *testing.T) {
 	require.Equal(t, 5, counts["a.go"]["b.go"])
 }
 
-// W3.2 — the co-change mine was the last enrichment write in this package that
+// The co-change mine was the last enrichment write in this package that
 // named no output generation at all.
 //
 // `mineCoChange` is raised lazily from a READ path (find_co_changing_symbols

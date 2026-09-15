@@ -21,7 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/semantic/lsp"
 )
 
-// W5.6 — the consumers that answered every request out of the base corpus, and
+// The consumers that answered every request out of the base corpus, and
 // what each of them does now: the non-tool surfaces (resources/read,
 // prompts/get) read the request's view; the whole-daemon health probe stays a
 // store-free liveness call and says base_scoped under a view; the speculative

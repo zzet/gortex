@@ -19,10 +19,10 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-// W3.2 / W3.7 — enrichment writes name one output generation, and no enrichment
+// Enrichment writes name one output generation, and no enrichment
 // input reads a working copy the request did not select.
 //
-// Before this item every enrichment producer wrote `s.graph` — generation zero,
+// Previously every enrichment producer wrote `s.graph` — generation zero,
 // the shared corpus — whatever view the request had read, and blame/coverage
 // read the TRACKED repository root rather than the selected checkout's. A
 // request routed to a worktree therefore read one snapshot and enriched
@@ -148,7 +148,8 @@ func TestUnroutedEnrichmentNamesGenerationZeroExplicitly(t *testing.T) {
 	}
 }
 
-// TestRequestReadingItsOwnCheckoutIsNotEnriched is the item's core refusal.
+// TestRequestReadingItsOwnCheckoutIsNotEnriched is the core refusal: a request
+// that reads a checkout of its own has no writable output generation.
 //
 // Revert-red: with beginEnrichmentOutput returning the base output for every
 // request (what every producer did before), this returns a usable generation-0
@@ -260,10 +261,10 @@ func TestCoverageToolUnderARoutedViewRefusesBeforeReadingTheProfile(t *testing.T
 	}
 }
 
-// TestCorpusCoverageDeclaresItsUnboundInput is the declared narrowing (W3.7's
-// second arm): a cover profile is a caller-supplied producer input and nothing
-// ties it to the snapshot it is stamped onto, so the answer says so rather than
-// claiming snapshot exactness.
+// TestCorpusCoverageDeclaresItsUnboundInput is the declared narrowing on the
+// enrichment INPUT side: a cover profile is a caller-supplied producer input
+// and nothing ties it to the snapshot it is stamped onto, so the answer says
+// so rather than claiming snapshot exactness.
 //
 // The profile is REAL and the repository is NAMED, so the handler takes its
 // success path — the only path that carries the declaration. (An earlier
@@ -304,14 +305,15 @@ func TestCorpusCoverageDeclaresItsUnboundInput(t *testing.T) {
 }
 
 // TestCoverageRefusesToPickARepositoryTheCallNeverNamed is the other half of
-// W3.7's input side, and it closes a hole this item's first attempt opened.
+// the enrichment input side, and it closes a hole the first attempt at this
+// narrowing opened.
 //
 // The root a coverage run resolves is load-bearing twice: it resolves the
 // relative `profile` path, and it supplies the module path that decides which
 // symbols the write lands on. A multi-repo daemon has no lone indexer to take
 // it from, and picking the alphabetically first tracked prefix reads a profile
 // out of — and stamps coverage onto — a repository the caller never mentioned.
-// That is the same wrong-root input read the item exists to close, so the
+// That is the same wrong-root input read the narrowing exists to close, so the
 // ambiguity is refused and named instead.
 //
 // Revert-red: with `slices.Sorted(maps.Keys(targets))[0]` back, the fixture's
@@ -345,7 +347,7 @@ func TestCoverageRefusesToPickARepositoryTheCallNeverNamed(t *testing.T) {
 // blame.EnrichGraph has written everything it is going to write before Complete
 // is called, so a supersession there is an ORDERING statement — "a newer run
 // owns this output" — not "the write did not happen". Reporting the repository
-// as an error (which is what the first version of this item did) under-reports
+// as an error (which is what the first version of this code did) under-reports
 // work that demonstrably landed.
 //
 // The rival is admitted from inside the producer's own first store read, which

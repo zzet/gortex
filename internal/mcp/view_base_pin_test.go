@@ -12,7 +12,8 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-// W5.3. The materializer leases the derived generations of a routed stack, and
+// The layer a request actually reads must be held for the request's lifetime.
+// The materializer leases the derived generations of a routed stack, and
 // the ancestry walk terminates at generation zero rather than including it — so
 // the one layer under every composed reader, and the corpus at index zero of
 // every routed content search, was the one nothing held. These tests drive the

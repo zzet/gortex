@@ -20,9 +20,9 @@ func centralityTestServer(t *testing.T) *Server {
 }
 
 // The rerank pass runs one bounded CSR + one seeded walk per query. The walk
-// is the expensive half, and W5.10 left it uncacheable (the zero scope), so a
-// repeated query re-walked the CSR every time. Memoising it under the
-// snapshot's own identity is what restores the hit.
+// is the expensive half, and keying caches by the selected snapshot identity
+// left it uncacheable (the zero scope), so a repeated query re-walked the CSR
+// every time. Memoising it under the snapshot's own identity restores the hit.
 func TestBoundedCentralityForRequest_MemoisesTheWalkPerSnapshot(t *testing.T) {
 	srv := centralityTestServer(t)
 	ctx := context.Background()

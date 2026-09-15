@@ -14,7 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
-// W5.7c. The base-corpus half of the same require_exact rule the route-drift
+// The base-corpus half of the same require_exact rule the route-drift
 // half is pinned by in view_bytes_coherence_test.go.
 //
 // markBaseCorpusChange (view_request.go) is the precedent markWorktreeRouteMoved

@@ -608,7 +608,7 @@ func TestCommittedTreeClassificationCoversEveryViewShape(t *testing.T) {
 // TestRacedTextSearchOverALiveRootIsLabelled is the text lane's half of the
 // route pin, end to end: a real worktree, the coordinator production starts,
 // and the searcher it owns. The search keeps answering off the live root —
-// that is the behaviour this item keeps — and when the route the view pinned
+// that is the behaviour the route pin keeps — and when the route the view pinned
 // advances while the view is still open, the answer rides back labelled.
 func TestRacedTextSearchOverALiveRootIsLabelled(t *testing.T) {
 	stack := newWorktreeSearchStack(t)
@@ -683,8 +683,9 @@ func coherenceHasStatus(
 	return false
 }
 
-// W5.7b. The route-drift signal must demote the answer's exactness claim, not
-// only annotate the capability.
+// The route-drift signal must demote the answer's exactness claim, not
+// only annotate the capability: exactness is a property of the ANSWER, not of
+// whichever lane first noticed the drift.
 //
 // noteWorktreeRouteDrift names the base corpus's pin as its precedent
 // (view_paths.go), and that precedent does two things: markBaseCorpusChange
@@ -927,15 +928,15 @@ func TestRouteDriftDemotesPastTheAnnotationDedupe(t *testing.T) {
 	}
 }
 
-// --------------------------------------------- W5.7c: require_exact ---
+// ------------------------------------------------------ require_exact ---
 
-// W5.7c. require_exact refuses ANY non-exact answer — including one selection
+// require_exact refuses ANY non-exact answer — including one selection
 // served exactly that stopped being exact while the handler assembled it.
 //
 // The middleware's require_exact gate runs BEFORE the handler, so it sees only
 // the substitutions selection made. Route drift is discovered later, by the
 // lanes that read (view_files.go refViewFilesFor, view_search_text.go
-// searchTextInView), and W5.7b made it demote the rider — which meant a
+// searchTextInView), and the drift signal demotes the rider — which meant a
 // require_exact caller was handed exact:false with fallback_reason
 // "route_moved" on a response it had explicitly asked never to receive. A
 // fallback the caller must notice and a fallback the caller refused are not

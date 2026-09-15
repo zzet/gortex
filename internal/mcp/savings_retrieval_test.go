@@ -370,7 +370,7 @@ func TestCumulativeSavingsSnapshotIsExactWithoutAnExplicitFlush(t *testing.T) {
 	require.Greater(t, out["tokens_saved"].(int64), int64(0))
 }
 
-// --- F4b: the flush window is settable from the entry point ----------------
+// --- the flush window is settable from the entry point --------------------
 
 // The daemon's minute-scale coalescing is wrong for the one-shot stdio
 // server, whose host SIGKILLs it. Server.SetSavingsFlushBounds is the seam

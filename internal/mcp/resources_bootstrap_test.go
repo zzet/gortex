@@ -62,8 +62,8 @@ func payloadScope(t *testing.T, payload map[string]any) []string {
 	return out
 }
 
-// W5.7c. gortex://index-health answers out of the indexed corpus whatever view
-// the session is bound to, and until this it had no way to say so.
+// gortex://index-health answers out of the indexed corpus whatever view
+// the session is bound to, and until now it had no way to say so.
 //
 // gortex://stats is view-scoped — handleResourceStats -> buildGraphStatsPayload
 // reads s.engineFor(ctx) / s.readerFor(ctx), and requestScoped puts the

@@ -330,8 +330,8 @@ func TestTrackRepositoryPinsTheViewForItsDetachedIndex(t *testing.T) {
 	if _, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", nil,
 		func(hctx context.Context) (*mcplib.CallToolResult, error) {
 			// An already-spent deadline makes the handler answer `accepted`
-			// while its index keeps running, which is the state this item is
-			// about. WithoutCancel drops the deadline for the detached work.
+			// while its index keeps running, which is the state a detached
+			// worker is in. WithoutCancel drops the deadline for that work.
 			deadlined, cancel := context.WithDeadline(hctx, time.Now().Add(-time.Second))
 			defer cancel()
 			return stack.srv.handleTrackRepository(deadlined, req)
@@ -469,7 +469,7 @@ func retainedGenerationsNamed(t *testing.T, message string) map[int64]bool {
 	return out
 }
 
-// ------------------------------------------------ W5.7c: never partial ---
+// ------------------------------------------------------- never partial ---
 
 // TestADrainedStackIsRefusedWhileTheRepositoryScopeStillHolds pins the
 // never-partial rule at the level the aggregation happens.

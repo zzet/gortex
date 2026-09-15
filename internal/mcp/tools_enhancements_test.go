@@ -867,8 +867,9 @@ func TestIntegrationGuardRulesLoadedFromConfig(t *testing.T) {
 	}
 }
 
-// W5.6 handed this consumer over: `analyze kind=hotspots` answers from the
-// server-wide analysis caches and from `s.graph` directly — never from the
+// A consumer that cannot read through the request's view must say so in its
+// answer. `analyze kind=hotspots` answers from the server-wide analysis
+// caches and from `s.graph` directly — never from the
 // request's reader — so under a routed view its rows describe the BASE corpus
 // while the rest of the answer reads as view-scoped.
 //
@@ -1033,9 +1034,9 @@ func scopeNoteOf(res *mcplib.CallToolResult) string {
 // keeping a second home for a vocabulary.
 //
 // analyzeEnrichmentRepoNarrowedKinds lives here rather than in
-// analyze_kinds.go's analyzeScopeAwareKinds only because that file is outside
-// this item's ownership list; the two sets feed ONE predicate (the stamping
-// site at tools_enhancements.go), and folding them together is a mechanical
+// analyze_kinds.go's analyzeScopeAwareKinds only for now; the two sets feed
+// ONE predicate (the stamping site at tools_enhancements.go), and folding
+// them together is a mechanical
 // follow-up. Until it lands, the silent failure is a kind entered in both — the
 // day someone moves `blame` into analyzeScopeAwareKinds and leaves the copy
 // here, the entry below becomes dead weight nobody notices, and the next

@@ -21,8 +21,8 @@ import (
 // the workspaces, the repos, the sessions and the servers, and the whole view
 // block — families, levels, the metric registry, and the two reason lists that
 // explain a level no count can — fell on the floor at the CLI. The counters in
-// it are the W8 measurement's reuse evidence, so "shipped but never rendered"
-// is the same as not existing.
+// it are the reuse evidence the sustained-I/O measurement harness reads, so
+// "shipped but never rendered" is the same as not existing.
 //
 // These tests cover both doors: the text renderer a person reads, and the
 // `--format json` payload a harness parses.
@@ -195,7 +195,8 @@ func TestDaemonStatusFormatChoiceRefusesAnUnknownFormat(t *testing.T) {
 //
 // Revert-red: delete the renderDaemonViews line from renderDaemonStatusTo and
 // the first two assertions fail while the renderer's own tests above still
-// pass — which is exactly the state the CLI was in before this item.
+// pass — which is exactly the state the CLI was in before the views block was
+// wired into the renderer.
 func TestTheOneShotStatusRendererReachesTheViewsBlock(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, renderDaemonStatusTo(&buf, countersStatus(), "text"))
@@ -306,7 +307,8 @@ func TestAStorageFailureReachesTheStatusPayload(t *testing.T) {
 // realController.Status under its own flattened key.
 //
 // It counts a committed-base series rather than an arbitrary one because that
-// is the family this item added and the family the W8 ledger cites — a status
+// is the family the committed-base machinery emits and the family the
+// sustained-I/O measurement reads for its reuse-vs-rebuild ratio — a status
 // payload that carried the older coordinator series and dropped these would
 // look healthy and measure nothing.
 func TestTheViewCountersReachTheStatusPayload(t *testing.T) {

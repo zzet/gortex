@@ -14,8 +14,9 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-// W5.9c. A require_fresh wait bounds itself twice: the caller's request
-// context, and the caller's wait_deadline. The coordinator it waits on bounds
+// A freshness wait must end on a bound the request itself set. A require_fresh
+// wait bounds itself twice: the caller's request context, and the caller's
+// wait_deadline. The coordinator it waits on bounds
 // itself a third time — RequestCheckoutRefresh wraps whatever context it is
 // handed in its own checkoutRefreshCaptureTimeout (5s) and in its lifetime
 // context (internal/indexer/checkout_refresh.go), and the git sampler wraps
@@ -339,7 +340,7 @@ func TestAnAbandonedAdmissionReachesTheRiderAndTheRefusal(t *testing.T) {
 	})
 }
 
-// W5.7b. The ticket arm of the same contract, which shipped unpinned.
+// The ticket arm of the same contract, which shipped unpinned.
 //
 // awaitCheckoutFreshness reaches a foreign bound two ways: the ADMISSION can
 // fail with a context error (covered by
@@ -350,7 +351,8 @@ func TestAnAbandonedAdmissionReachesTheRiderAndTheRefusal(t *testing.T) {
 // fourth return, and flipping that return to false left the whole freshness
 // suite green while production output changed: a wait whose admitted tickets
 // are persistently abandoned on the coordinator's context reported
-// deadline_exceeded — the very defect W5.9c exists to remove — instead of
+// deadline_exceeded — the very defect separating the two bounds exists to
+// remove — instead of
 // refresh_admission_abandoned. The two reasons ask the caller for different
 // moves, and only one of them can help.
 func TestAPersistentlyAbandonedTicketGetsItsOwnReason(t *testing.T) {

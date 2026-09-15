@@ -23,12 +23,12 @@ import (
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 )
 
-// W3.2 / W5.12 — the CLI enrich path declares BASE as its output.
+// The CLI enrich path declares BASE as its output generation.
 //
 // `gortex enrich <kind>` reaches the daemon over the control socket, which has
-// no request view at all: it runs against the indexed corpus. Before this item
-// that was true only by omission — every enricher wrote `c.graph` because
-// nothing selected anything else, and no receipt named the output, so nothing
+// no request view at all: it runs against the indexed corpus. Previously that
+// was true only by omission — every enricher wrote `c.graph` because nothing
+// selected anything else, and no receipt named the output, so nothing
 // could order two enrichments of one corpus or tell an enrichment apart from an
 // index mutation. Now the declaration is explicit and checkable.
 //
@@ -475,7 +475,7 @@ func TestViewsStatusStatesWhyAGenerationIsStillThere(t *testing.T) {
 // and the payload silently drops" from a property of a reviewer's attention
 // into a compile-time-adjacent check.
 //
-// Both defects this item fixed had the same shape: indexer.ViewsHealth grew a
+// Both defects this guard closes had the same shape: indexer.ViewsHealth grew a
 // field, the projection literal was not extended, and nothing failed — the
 // payload simply carried less than the census did, with no error anywhere. The
 // two types are matched on their JSON tags because that is the contract a
@@ -622,7 +622,7 @@ func trackCoupledEnrichRepo(t *testing.T, c *realController, dir, name string) (
 }
 
 // TestEveryControllerEnrichDoorReportsASupersededRunAsLanded is the
-// door-by-door pin behind the one settlement rule this item added.
+// door-by-door pin behind the one settlement rule the enrich doors share.
 //
 // The five doors are textually identical and each one was independently
 // capable of the defect: `if err := out.Complete(); err != nil { return

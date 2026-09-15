@@ -64,9 +64,9 @@ func (s *Server) analysisViewGeneration() int64 {
 // analysis is therefore still written and read at view_gen 0 in production
 // today, and this selector short-circuits on the equality below. The divergence
 // it corrects is constructed by hand in analysis_generation_test.go via
-// store.AtGeneration. Routing a view to a non-base generation is W4/W8 work;
-// until that lands, "routed analysis caching works end to end" would be an
-// over-read of this function.
+// store.AtGeneration. Routing a request view onto a non-base payload
+// generation is not implemented yet; until it is, "routed analysis caching
+// works end to end" would be an over-read of this function.
 func (s *Server) analysisGenerationStore() graph.Store {
 	backend := s.backendStore()
 	scoped, ok := backend.(*store_sqlite.Store)

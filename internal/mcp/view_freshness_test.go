@@ -19,9 +19,9 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-// W5.9. The shipped agent instructions advertise three request-level knobs —
-// require_exact, require_fresh and an absolute RFC3339 wait_deadline. Before
-// this item require_fresh and wait_deadline were implemented nowhere, and
+// The shipped agent instructions advertise three request-level knobs —
+// require_exact, require_fresh and an absolute RFC3339 wait_deadline.
+// Previously require_fresh and wait_deadline were implemented nowhere, and
 // require_exact was refused on every guarded tool (closed schema +
 // wrapToolArgGuard), which made the already-shipped knob unusable.
 //
@@ -1681,7 +1681,7 @@ func TestACheckoutThatCannotRefreshIsNotAnUnavailableCoordinator(t *testing.T) {
 
 // A wait target that names no checkout or no root is a lookup that did not
 // answer, not a server with no coordinator. It is the last
-// coordinator_unavailable this item takes away from a fact about one checkout.
+// coordinator_unavailable taken away from a fact about one checkout.
 func TestAnEmptyWaitTargetIsNotAnUnavailableCoordinator(t *testing.T) {
 	stack := newViewStack(t)
 	stack.srv.freshnessWaiter = &fakeFreshnessWaiter{}
