@@ -152,7 +152,12 @@ func TestOverlaidViewFindNodesByNameBoundedFailsClosedAboveInspectionLimit(t *te
 	layer := NewOverlayLayer()
 	layer.MarkFile("repo/generated.go", false)
 	for index := 0; index <= overlayExactNameInspectionLimit; index++ {
-		layer.MarkRemoved("handle", fmt.Sprintf("repo/generated.go::handle:%04d", index))
+		// The budget bounds matching node inspection, not unrelated removal
+		// markers that are already covered by a file mask.
+		layer.AddNode("repo/generated.go", &Node{
+			ID: fmt.Sprintf("repo/generated.go::handle:%04d", index), Name: "handle",
+			Kind: KindFunction, FilePath: "repo/generated.go",
+		})
 	}
 
 	page, err := NewOverlaidView(recording, layer).FindNodesByNameBounded(
@@ -195,8 +200,8 @@ func TestOverlaidViewFindNodesByNameBoundedAllowsDetachedShadowLimit(t *testing.
 	if err != nil {
 		t.Fatalf("bounded overlay lookup: %v", err)
 	}
-	if len(recording.limits) != 1 || recording.limits[0] != 8+overlayDetachedShadowLimit {
-		t.Fatalf("base limits = %v, want exact detached-shadow compensation", recording.limits)
+	if len(recording.limits) != 1 || recording.limits[0] != 8 {
+		t.Fatalf("base limits = %v, want ownership filtering before unchanged limit 8", recording.limits)
 	}
 	if page.Total != 1 || page.Truncated || len(page.Nodes) != 1 || page.Nodes[0].ID != visible.ID {
 		t.Fatalf("page = %#v, want only the visible base homonym", page)
@@ -210,23 +215,28 @@ func TestOverlaidViewFindNodesByNameBoundedFailsClosedAboveDetachedShadowLimit(t
 	base := New()
 	recording := &recordingBoundedExactNameReader{Reader: base, bounded: base}
 	layer := NewOverlayLayer()
-	for index := 0; index <= overlayDetachedShadowLimit; index++ {
-		layer.MarkRemoved("handle", fmt.Sprintf("repo/old-%03d.go::handle", index))
+	for index := 0; index <= overlayExactNameInspectionLimit; index++ {
+		stale := &Node{
+			ID: fmt.Sprintf("repo/old-%04d.go::handle", index), Name: "handle",
+			Kind: KindFunction, FilePath: fmt.Sprintf("repo/old-%04d.go", index),
+		}
+		base.AddNode(stale)
+		layer.MarkRemoved(stale.Name, stale.ID)
 	}
 
 	page, err := NewOverlaidView(recording, layer).FindNodesByNameBounded(
 		context.Background(), "handle", LocalizationNodeScope{}, 8,
 	)
 	var limitErr *BoundedLocalizationLimitError
-	if !errors.As(err, &limitErr) || limitErr.Resource != "detached overlay shadow identities" ||
-		limitErr.Limit != overlayDetachedShadowLimit {
-		t.Fatalf("error = %v, want typed detached-shadow limit error", err)
+	if !errors.As(err, &limitErr) || limitErr.Resource != "identity-filtered node inspections" ||
+		limitErr.Limit != overlayExactNameInspectionLimit {
+		t.Fatalf("error = %v, want typed matching-candidate inspection limit error", err)
 	}
 	if len(page.Nodes) != 0 || page.Total != 0 || page.Truncated {
 		t.Fatalf("overflow returned a partial page: %#v", page)
 	}
-	if len(recording.limits) != 0 {
-		t.Fatalf("overflow called base with limits %v", recording.limits)
+	if len(recording.limits) != 1 || recording.limits[0] != 8 {
+		t.Fatalf("base limits = %v, want bounded lower inspection at limit 8", recording.limits)
 	}
 }
 
@@ -236,7 +246,10 @@ func TestOverlaidViewFindNodesByNameBoundedCancelsDuringOverlayInspection(t *tes
 	layer := NewOverlayLayer()
 	layer.MarkFile("repo/generated.go", false)
 	for index := 0; index < 512; index++ {
-		layer.MarkRemoved("handle", fmt.Sprintf("repo/generated.go::handle:%04d", index))
+		layer.AddNode("repo/generated.go", &Node{
+			ID: fmt.Sprintf("repo/generated.go::handle:%04d", index), Name: "handle",
+			Kind: KindFunction, FilePath: "repo/generated.go",
+		})
 	}
 	ctx := &cancelAfterLocalizationChecksContext{
 		Context: context.Background(), remaining: 3, done: make(chan struct{}),
@@ -337,8 +350,8 @@ func TestOverlaidViewFindNodesByNameBoundedHonorsDetachedRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bounded overlay lookup: %v", err)
 	}
-	if len(recording.limits) != 1 || recording.limits[0] != 9 {
-		t.Fatalf("base limits = %v, want one detached-shadow refill slot", recording.limits)
+	if len(recording.limits) != 1 || recording.limits[0] != 8 {
+		t.Fatalf("base limits = %v, want identity exclusion before unchanged limit 8", recording.limits)
 	}
 	if page.Total != 0 || len(page.Nodes) != 0 || page.Truncated {
 		t.Fatalf("detached removal leaked stale base node: %#v", page)

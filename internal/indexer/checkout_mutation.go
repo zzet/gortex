@@ -50,6 +50,21 @@ type CheckoutMutation struct {
 	headRef         string
 	headCommit      string
 	headTree        string
+	// receipt is this lease's authority over the routed dirty generation it
+	// withdraws and republishes. Exactly one output generation per mutation.
+	receipt    *OutputMutationReceipt
+	receiptErr error
+}
+
+// lifecycleOutputAuthority resolves the process authority a checkout mutation
+// admits through. It is the MultiIndexer's — the same one every generation-zero
+// lane resolves to — so a checkout source edit and a legacy corpus mutation are
+// ordered by one authority rather than two.
+func lifecycleOutputAuthority(l *CheckoutLifecycle) *OutputGenerationAuthority {
+	if l == nil || l.mi == nil {
+		return defaultOutputGenerationAuthority()
+	}
+	return l.mi.outputGenerationAuthority()
 }
 
 // BeginCheckoutMutation admits a source edit against the exact checkout route
@@ -147,8 +162,78 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	if err := m.validateSnapshot(waitCtx); err != nil {
 		return nil, err
 	}
+	// The lease names exactly one output generation: this checkout's routed
+	// DIRTY generation, the one Prepare withdraws and Refresh republishes. The
+	// receipt is opened last, under the cycle lock, so its issue order is the
+	// order edits are admitted for this checkout; Close settles it.
+	receipt, err := lifecycleOutputAuthority(l).Begin(waitCtx, OutputEntryCheckoutSourceMutation, OutputMutationTarget{
+		Kind:        OutputGenerationCheckout,
+		OwnerKey:    "checkout:" + checkout.CheckoutID,
+		CheckoutID:  checkout.CheckoutID,
+		Incarnation: checkout.Incarnation,
+		Generation:  route.DirtyGenerationID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	m.receipt = receipt
 	admitted, cycleOwned = false, false // Close now owns every acquired resource.
 	return m, nil
+}
+
+// Receipt reports this lease's output-generation receipt, nil once Close has
+// settled it.
+func (m *CheckoutMutation) Receipt() *OutputMutationReceipt {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.receipt
+}
+
+// ReceiptError reports why a fulfilled edit could not fulfil its generation —
+// ErrOutputMutationReceiptSuperseded when a newer mutation for this checkout
+// took the authority over. Nil when the lease settled cleanly.
+func (m *CheckoutMutation) ReceiptError() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.receiptErr
+}
+
+// receiptStillCurrent is the PREVENTIVE half of the output-generation fence on
+// the checkout lane: a lease whose routed dirty generation a newer mutation
+// already took over is refused before it withdraws the route or republishes,
+// so no byte of that generation moves under lost authority. Caller holds m.mu.
+//
+// It is called three times: before Prepare withdraws the route, before Refresh
+// starts, and again inside Refresh AFTER the shared build gate is acquired and
+// immediately before the build that republishes — the gate is an unbounded
+// wait, so a check taken before it does not cover the publish.
+//
+// In today's production shape this can only refuse work in a shape the cycle
+// lock does not already exclude — BeginCheckoutMutation holds c.cycleMu from
+// admission through Close, so two live receipts for one "checkout:<id>" owner
+// do not overlap. The check exists so the invariant survives the lease
+// outliving that lock (asynchronous publication), rather than being an
+// accidental property of the current locking.
+//
+// LIMITATION: the asynchronous route (Prepare -> disk write -> EnqueueRefresh
+// -> Close) hands the republish to the coordinator loop, which runs after this
+// lease is gone. Close abandons the receipt there, correctly — this lease
+// fulfilled no generation — but the republish that follows carries no receipt
+// of its own. Covering it means carrying the generation identity into
+// enqueueCheckoutRefresh (internal/indexer/checkout_refresh.go) and the
+// coordinator loop (checkout_coordinator.go), neither of which this item owns.
+func (m *CheckoutMutation) receiptStillCurrent() error {
+	if m.receipt == nil || !m.receipt.Superseded() {
+		return nil
+	}
+	return fmt.Errorf("%w: checkout %q generation %d was taken over by a newer mutation",
+		ErrOutputMutationReceiptSuperseded, m.checkout.CheckoutID, m.receipt.Target().Generation)
 }
 
 // Prepare withdraws the old dirty generation immediately before the disk
@@ -162,6 +247,9 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	}
 	if m.prepared {
 		return nil
+	}
+	if err := m.receiptStillCurrent(); err != nil {
+		return err
 	}
 	ctx, cancel := checkoutMutationContext(ctx, m.coordinator.lifetimeContext())
 	defer cancel()
@@ -209,6 +297,10 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	if m.closed || !m.prepared || m.refreshQueued {
 		return CheckoutCycle{}, fmt.Errorf("%w: no prepared checkout mutation", ErrCheckoutMutationStale)
 	}
+	// Preventive: a lease that lost its generation does not republish it.
+	if err := m.receiptStillCurrent(); err != nil {
+		return CheckoutCycle{}, err
+	}
 	ctx, cancel := checkoutMutationContext(ctx, m.coordinator.lifetimeContext())
 	defer cancel()
 	if err := m.validateCheckout(ctx); err != nil {
@@ -219,6 +311,16 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 		return CheckoutCycle{}, checkoutMutationAdmissionError(ctx, "shared view-build gate", err)
 	}
 	defer releaseLane()
+	// The receipt must cover the REPUBLISH, not merely the lease. Acquiring the
+	// shared build gate blocks — that is the whole reason Refresh is the one
+	// lease operation that queues — so the check at the top of this method was
+	// taken before an unbounded wait. Re-check here, after the gate and
+	// immediately before the build that publishes the new generations: a lease
+	// whose generation a newer mutation took over during the wait must not
+	// publish over that newer decision.
+	if err := m.receiptStillCurrent(); err != nil {
+		return CheckoutCycle{}, err
+	}
 	out := m.coordinator.reconcile(ctx)
 	recordCoordinatorCycle(out)
 	if out.Err != nil {
@@ -236,6 +338,29 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	}
 	m.route, m.fresh = route, true
 	return out, nil
+}
+
+// settleReceipt fulfils or abandons this lease's receipt exactly once, and
+// records a refused fulfilment on the lease. Caller holds m.mu.
+//
+// A lease that reached a fresh route fulfils its generation; anything else — a
+// dry run, a failed callback, a withdrawn route left for retry, a publication
+// handed to the coordinator loop — did not, and must not claim it. A fulfilment
+// refused as superseded is reported and rescheduled, never swallowed.
+func (m *CheckoutMutation) settleReceipt() {
+	if m.receipt == nil {
+		return
+	}
+	receipt := m.receipt
+	m.receipt = nil
+	if !m.fresh {
+		receipt.Abandon()
+		return
+	}
+	if err := receipt.Complete(); err != nil {
+		m.receiptErr = err
+		m.coordinator.Signal("checkout mutation receipt was superseded")
+	}
 }
 
 // Close releases a lease once. Any prepared edit that did not reach a fresh
@@ -257,6 +382,16 @@ func (m *CheckoutMutation) Close() {
 	if m.prepared && !m.fresh {
 		m.coordinator.Signal("source mutation needs a dirty generation refresh")
 	}
+	// The settle stays here rather than moving into Refresh. Close is the only
+	// point that knows whether this lease fulfilled anything: the asynchronous
+	// route hands publication to the coordinator loop and fulfils nothing, and
+	// keeping the receipt live from admission through Close is what makes a
+	// CONCURRENT newer edit for this checkout supersede this one instead of
+	// interleaving with it. What Refresh gained is the fence itself — the
+	// receipt is re-validated after the build gate and immediately before the
+	// republish — so a superseded receipt cannot publish even though it settles
+	// later.
+	m.settleReceipt()
 	m.coordinator.cycleMu.Unlock()
 	m.coordinator.releaseSourceMutation()
 }

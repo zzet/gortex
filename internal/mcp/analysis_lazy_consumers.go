@@ -171,15 +171,7 @@ func (s *Server) processSummariesForEntries(entryIDs map[string]bool, scoped boo
 }
 
 func (s *Server) rerankBoundedCentrality(ctx context.Context, seeds, candidateIDs []string) rerank.CentralityResult {
-	snapshot, stats := analysis.BuildBoundedAdjacencySnapshot(s.readerFor(ctx), candidateIDs, 2, 4096, 16384)
-	return rerank.CentralityResult{
-		Scores:      s.personalizedPageRank(snapshot, seeds),
-		NodeCount:   stats.NodeCount,
-		EdgeCount:   stats.EdgeCount,
-		NodeBatches: stats.NodeBatches,
-		EdgeBatches: stats.EdgeBatches,
-		Truncated:   stats.Truncated,
-	}
+	return s.boundedCentralityForRequest(ctx, seeds, candidateIDs) // bounded build + memoised walk: centrality.go
 }
 
 // rerankAnalysisMetrics returns exactly the requested candidates and global

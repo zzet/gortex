@@ -599,11 +599,9 @@ func (v *OverlaidView) FindNodesByNameContaining(substr string, limit int) []*No
 	return out
 }
 
-// GetFileNodes: if the path is overlaid, return overlay's nodes
-// (empty for tombstones). Otherwise base's, minus the rows the layer
-// speaks for anyway — a node tombstone removes one identity without
-// claiming the file it lives in, so an uncovered path can still lose a
-// symbol.
+// GetFileNodes returns a covered path from the layer alone. An uncovered
+// path merges surviving lower identities with any explicit detached rows;
+// row-only replacement neither hides siblings nor claims the whole file.
 func (v *OverlaidView) GetFileNodes(filePath string) []*Node {
 	if v.layer != nil && v.layer.HasFile(filePath) {
 		// The layer owns its slice, so hand callers their own copy.
@@ -626,12 +624,15 @@ func (v *OverlaidView) GetFileNodes(filePath string) []*Node {
 		}
 		out = append(out, n)
 	}
+	if rows, ok := v.layer.(OverlayDetachedNodeReader); ok {
+		out = append(out, rows.DetachedFileNodes(filePath)...)
+	}
 	return out
 }
 
-// GetRepoNodes filters base's per-repo node list by dropping every
-// identity the layer speaks for and appending the overlay's nodes for
-// any overlaid file inside the requested repo prefix.
+// GetRepoNodes filters lower identities, then appends covered-file rows
+// and the optional detached identity rows in this repository. File and
+// node-identity ownership remain independent.
 func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 	if v.base == nil {
 		return nil
@@ -657,6 +658,9 @@ func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 			continue
 		}
 		out = append(out, v.layer.FileNodes(path)...)
+	}
+	if rows, ok := v.layer.(OverlayDetachedNodeReader); ok {
+		out = append(out, rows.DetachedRepoNodes(repoPrefix)...)
 	}
 	return out
 }
@@ -1003,16 +1007,19 @@ func (v *OverlaidView) nodeCountDelta() int {
 		}
 		delta += len(v.layer.FileNodes(path)) - baseCount
 	}
+	for range v.detachedNodeSummaries() {
+		delta++
+	}
 	return delta - len(v.detachedBaseNodes())
 }
 
 // detachedBaseNodes resolves the base rows the layer hides from outside
-// every file it covers: an identity it tombstoned, and one it carries at
-// a path other than the ID's own. Neither is priced by a covered file's
-// node trade — that term only sees the paths in the layer's own file
-// list — so the counters resolve them here, in one batched base read
-// over the layer's removal set and its per-file node lists. Both are
-// already in hand: the file lists are what the trade above walks.
+// every file it covers. Covered files already account for their base
+// rows, so only identities removed or re-emitted from an uncovered base
+// path need a separate subtraction. Resolve the layer's candidates in
+// one batched base read and check each row's actual FilePath: canonical
+// IDs need not encode a path, and relocated IDs may encode a different
+// path. The work remains bounded by the layer's own footprint.
 func (v *OverlaidView) detachedBaseNodes() []*Node {
 	if v.base == nil || v.layer == nil {
 		return nil
@@ -1020,7 +1027,7 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	seen := make(map[string]struct{})
 	var ids []string
 	claim := func(id string) {
-		if id == "" || v.layer.CoversNodeID(id) {
+		if id == "" {
 			return
 		}
 		if _, dup := seen[id]; dup {
@@ -1031,6 +1038,9 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	}
 	for id := range v.layer.RemovedIDs() {
 		claim(id)
+	}
+	for node := range v.detachedNodeSummaries() {
+		claim(node.ID)
 	}
 	for _, path := range v.layer.FilePaths() {
 		for _, n := range v.layer.FileNodes(path) {
@@ -1044,7 +1054,7 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	}
 	out := make([]*Node, 0, len(ids))
 	for _, n := range v.base.GetNodesByIDs(ids) {
-		if n != nil {
+		if n != nil && !v.layer.HasFile(n.FilePath) {
 			out = append(out, n)
 		}
 	}
@@ -1225,6 +1235,11 @@ func (v *OverlaidView) repoCountDeltas() (map[string]int, map[string]int) {
 			if n != nil && n.RepoPrefix != "" {
 				edges[n.RepoPrefix] -= lostBySource[id]
 			}
+		}
+	}
+	for node := range v.detachedNodeSummaries() {
+		if node.RepoPrefix != "" {
+			nodes[node.RepoPrefix]++
 		}
 	}
 	for _, n := range v.detachedBaseNodes() {

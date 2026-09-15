@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // The ownership-mask accessors.
@@ -22,8 +24,8 @@ import (
 // gate every durable write in this package takes, and nothing more.
 
 // OwnershipMode is what a generation claims about a masked path or source. The
-// two vocabularies below differ: a file may be replaced or deleted, while an
-// edge source may only be replaced.
+// two vocabularies below differ: a file may be replaced, deleted or declared
+// read-only context, while an edge source may only be replaced.
 type OwnershipMode string
 
 const (
@@ -32,9 +34,23 @@ const (
 	OwnershipReplace OwnershipMode = "replace"
 	// OwnershipDelete claims the path is gone and nothing below shows through.
 	OwnershipDelete OwnershipMode = "delete"
+	// OwnershipContext claims NOTHING. It records that the generation needed
+	// the path to resolve its own change set and deliberately carries no
+	// payload of its own for it, so the layer below keeps answering for the
+	// file whole — identity, adjacency, derived outputs and all.
+	//
+	// It is the third mode rather than the absence of a mask because the two
+	// statements are different: an unmentioned path is one nothing was ever
+	// said about, while a context path is one a generation read, decided was
+	// unchanged by its own change, and declined to claim. The difference is
+	// what makes "a generation claims exactly its change set" checkable at
+	// publish instead of being an agreement between two lists — see the
+	// context arm of ValidateGenerationMasks, which refuses the mask over any
+	// payload at all.
+	OwnershipContext OwnershipMode = "context"
 )
 
-var fileOwnershipModes = []OwnershipMode{OwnershipReplace, OwnershipDelete}
+var fileOwnershipModes = []OwnershipMode{OwnershipReplace, OwnershipDelete, OwnershipContext}
 
 // edgeSourceOwnershipModes is deliberately narrower than fileOwnershipModes:
 // withdrawing a source's edges without replacing them is what an empty
@@ -208,37 +224,22 @@ SELECT ownership_mode FROM generation_file_masks
 // SetNodeTombstones records node identities this generation removes without
 // claiming their whole file. Idempotent on (view_gen, node_id).
 func (s *Store) SetNodeTombstones(nodeIDs []string) error {
-	if err := s.requireDerivedGeneration(); err != nil {
-		return err
-	}
-	for _, nodeID := range nodeIDs {
-		if err := requireMaskID("node_id", nodeID); err != nil {
-			return err
-		}
-	}
-	return s.writeMaskRows(`INSERT OR REPLACE INTO generation_node_tombstones (view_gen, node_id) VALUES `,
-		len(nodeIDs), func(i int) []any {
-			return []any{s.viewGen, nodeIDs[i]}
-		})
+	return s.setNodeIdentityMasks(nodeIDs, NodeIdentityMaskLegacy)
 }
 
 // NodeTombstones returns every node identity this generation removes.
 func (s *Store) NodeTombstones() ([]string, error) {
-	rows, err := s.db.Query(
-		`SELECT node_id FROM generation_node_tombstones WHERE view_gen = ? ORDER BY node_id`, s.viewGen)
+	masks, err := s.NodeIdentityMasks()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []string{}
-	for rows.Next() {
-		var nodeID string
-		if err := rows.Scan(&nodeID); err != nil {
-			return nil, err
+	out := make([]string, 0, len(masks))
+	for _, mask := range masks {
+		if mask.Kind == NodeIdentityMaskLegacy {
+			out = append(out, mask.NodeID)
 		}
-		out = append(out, nodeID)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // SetEdgeSourceMasks upserts edge-set replacement markers for this generation.
@@ -342,6 +343,12 @@ func (s *Store) ProducerStates() ([]ProducerCompleteness, error) {
 // width, so the VALUES fragment is built once. Empty input opens no
 // transaction.
 func (s *Store) writeMaskRows(insert string, total int, row func(i int) []any) error {
+	return s.writeMaskRowsWithSuffix(insert, "", total, row)
+}
+
+// writeMaskRowsWithSuffix keeps the same mutation gate and single transaction,
+// with an optional trailing conflict policy after each bounded VALUES batch.
+func (s *Store) writeMaskRowsWithSuffix(insert, suffix string, total int, row func(i int) []any) error {
 	if total == 0 {
 		return nil
 	}
@@ -369,11 +376,91 @@ func (s *Store) writeMaskRows(insert string, total int, row func(i int) []any) e
 			stmt.WriteString(placeholders)
 			args = append(args, row(i)...)
 		}
+		stmt.WriteString(suffix)
 		if _, err := tx.Exec(stmt.String(), args...); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// ContextMaskPaths returns the paths this generation declared read-only
+// context, sorted by the primary key. It reads only the context rows, so a
+// generation that declares none pays one empty indexed range scan.
+func (s *Store) ContextMaskPaths() ([]string, error) {
+	rows, err := s.db.Query(`
+SELECT file_path FROM generation_file_masks
+ WHERE view_gen = ? AND ownership_mode = ?
+ ORDER BY repo_prefix, file_path`, s.viewGen, string(OwnershipContext))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var filePath string
+		if err := rows.Scan(&filePath); err != nil {
+			return nil, err
+		}
+		out = append(out, filePath)
+	}
+	return out, rows.Err()
+}
+
+// validateContextMaskClaims refuses the one contradiction the file-mask probe
+// cannot see: an edge-source marker standing over a context-masked path.
+//
+// The two claims are opposites. A context mask says the layer below answers
+// for the path whole; an edge-source marker says THIS generation replaces the
+// named node's outgoing set. graphview honours the marker for any id whose
+// file the generation does not claim — and a context path is, deliberately,
+// not claimed — so the pair would make the composition serve an empty edge
+// set for a node whose edges only the layer below still holds. That is a
+// silent drop, which is why it is refused at publish rather than resolved by
+// precedence at read time.
+//
+// The check is skipped outright when the generation writes no edge-source
+// markers, which is every ordinary file delta; when it does write them there
+// are a handful (the resolver's pathless stubs), so the context rows are read
+// once and probed in memory.
+func (s *Store) validateContextMaskClaims() error {
+	sources, err := s.EdgeSourceMasks()
+	if err != nil {
+		return err
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	contextPaths, err := s.ContextMaskPaths()
+	if err != nil {
+		return err
+	}
+	if len(contextPaths) == 0 {
+		return nil
+	}
+	declared := make(map[string]struct{}, len(contextPaths))
+	for _, filePath := range contextPaths {
+		declared[filePath] = struct{}{}
+	}
+	var violations []string
+	for _, source := range sources {
+		key := graph.IDFile(source.SourceID)
+		if key == "" {
+			key = source.SourceID
+		}
+		if _, isContext := declared[key]; !isContext {
+			continue
+		}
+		violations = append(violations,
+			fmt.Sprintf("edge-source marker on %q claims adjacency at context path %q", source.SourceID, key))
+		if len(violations) == generationMaskViolationLimit {
+			break
+		}
+	}
+	if len(violations) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: generation %d: %s", ErrGenerationMaskIntegrity, s.viewGen, strings.Join(violations, "; "))
 }
 
 // ValidateGenerationMasks checks this generation's file masks against the
@@ -399,6 +486,19 @@ func (s *Store) writeMaskRows(insert string, total int, row func(i int) []any) e
 //     content document indexed at it. A generation that carries a file and
 //     simultaneously claims to have deleted it is self-contradictory, and the
 //     two claims cannot both be served.
+//   - a 'context' mask takes the SAME emptiness probe as 'delete', for a
+//     different reason: the mask says the generation read the path only to
+//     resolve its own change set and claims nothing about it, so the layer
+//     below must be the one answering. A context mask standing over payload
+//     would be exactly the duplicate-payload defect it exists to forbid — the
+//     generation would carry a second copy of rows it does not speak for — so
+//     the probe is the guard that makes "read-only context gains no payload"
+//     a checked fact rather than a convention.
+//   - a mode outside the vocabulary above is a violation in itself. The column
+//     is plain TEXT validated in Go (see schema.go), so a row written by a
+//     newer binary with a wider vocabulary reaches this reader as an
+//     unrecognised claim; refusing it is the only sound answer, because every
+//     other arm would have to guess whether it hides the layer below.
 //
 // The edge and content probes belong to the delete arm alone. An edge or a
 // document at a path is payload the delete claim contradicts, but neither is
@@ -425,6 +525,12 @@ func (s *Store) writeMaskRows(insert string, total int, row func(i int) []any) e
 //
 // A base handle has no masks, so this reports nothing rather than refusing.
 func (s *Store) ValidateGenerationMasks() error {
+	if err := s.validateNodeIdentityMasks(); err != nil {
+		return err
+	}
+	if err := s.validateContextMaskClaims(); err != nil {
+		return err
+	}
 	rows, err := s.db.Query(`
 WITH masked(repo_prefix, file_path, ownership_mode, covered) AS (
     SELECT m.repo_prefix, m.file_path, m.ownership_mode,
@@ -439,15 +545,18 @@ WITH masked(repo_prefix, file_path, ownership_mode, covered) AS (
 )
 SELECT repo_prefix, file_path, ownership_mode FROM masked
  WHERE (ownership_mode = ? AND covered = 0)
-    OR (ownership_mode = ? AND (covered = 1
+    OR (ownership_mode IN (?, ?) AND (covered = 1
         OR EXISTS (SELECT 1 FROM edges AS e
                     WHERE e.file_path = masked.file_path AND e.view_gen = ?)
         OR EXISTS (SELECT 1 FROM content_fts_rowid AS c
                     WHERE c.view_gen = ? AND c.file_path = masked.file_path)))
+    OR ownership_mode NOT IN (?, ?, ?)
  ORDER BY repo_prefix, file_path
  LIMIT ?`,
-		s.viewGen, string(OwnershipReplace), string(OwnershipDelete),
-		s.viewGen, s.viewGen, generationMaskViolationLimit)
+		s.viewGen, string(OwnershipReplace), string(OwnershipDelete), string(OwnershipContext),
+		s.viewGen, s.viewGen,
+		string(OwnershipReplace), string(OwnershipDelete), string(OwnershipContext),
+		generationMaskViolationLimit)
 	if err != nil {
 		return err
 	}
@@ -459,8 +568,14 @@ SELECT repo_prefix, file_path, ownership_mode FROM masked
 			return err
 		}
 		reason := "no payload row at this generation"
-		if OwnershipMode(mode) == OwnershipDelete {
+		switch OwnershipMode(mode) {
+		case OwnershipDelete:
 			reason = "payload rows still present at this generation"
+		case OwnershipContext:
+			reason = "context masks claim nothing, so the generation must carry no payload for the path"
+		case OwnershipReplace:
+		default:
+			reason = "ownership mode is outside this reader's vocabulary"
 		}
 		violations = append(violations, fmt.Sprintf("%s mask on %s/%s: %s", mode, repoPrefix, filePath, reason))
 	}

@@ -53,9 +53,38 @@ type refViewFiles struct {
 	closed  bool
 }
 
-// available reports whether this request can read file content at all.
+// available reports whether this surface can produce bytes: a tree to read,
+// and a repository to read it out of.
+//
+// It is NOT the test for "does this request read a committed tree" — that is
+// viewReadsCommittedTree, and the two were the same predicate until a surface
+// that could not open its tree meant the request fell back to a working copy
+// instead of being told. See refViewFilesFor.
 func (f *refViewFiles) available() bool {
 	return f != nil && f.repoDir != "" && f.treeOID != ""
+}
+
+// sourceUnavailable is what a committed-tree view answers when it holds no
+// tree to read bytes out of.
+//
+// It is a refusal rather than a miss, and it is the same code and capability
+// name the capability evaluation would have refused a caller that required
+// source.snapshot with: the alternative is to resolve the path against a
+// working copy, which returns real bytes of some other state of the world and
+// looks exactly like a correct read.
+func (f *refViewFiles) sourceUnavailable() error {
+	missing := "the repository its objects live in is not reachable"
+	switch {
+	case f == nil:
+		missing = "no file surface is bound to it"
+	case f.treeOID == "" && f.repoDir == "":
+		missing = "neither the tree it reads nor the repository holding it is known"
+	case f.treeOID == "":
+		missing = "no committed tree is bound to it"
+	}
+	return graphview.NewViewError(graphview.CodeCapabilityUnavailable, fmt.Sprintf(
+		"this request reads a committed tree and cannot serve %s: %s",
+		graphview.CapSourceSnapshot, missing))
 }
 
 // uri renders the identity of one file inside this view.
@@ -81,6 +110,9 @@ func (f *refViewFiles) graphPath(relPath string) string {
 // can no longer produce bytes, and a caller that requires them must be told
 // before it asks again.
 func (f *refViewFiles) read(ctx context.Context, relPath string) ([]byte, error) {
+	if !f.available() {
+		return nil, f.sourceUnavailable()
+	}
 	tree, err := f.open(ctx)
 	if err != nil {
 		return nil, err
@@ -106,6 +138,11 @@ func (f *refViewFiles) open(ctx context.Context) (*source.GitTreeSource, error) 
 	defer f.mu.Unlock()
 	if f.closed {
 		return nil, errors.New("the view's file source is closed")
+	}
+	if !f.available() {
+		// No git child is ever spawned for a surface with nothing to open, so
+		// a view that carries one holds no process to release.
+		return nil, f.sourceUnavailable()
 	}
 	if !f.opened {
 		f.opened = true
@@ -190,12 +227,52 @@ func (f *refViewFiles) relPath(raw string) (string, error) {
 
 // refViewFilesFor returns the committed-tree file surface this request reads
 // through, nil when the request reads a working copy as it always has.
+//
+// Every view that reads a committed tree gets a surface, including one that
+// cannot produce bytes. Returning nil for those is what put the byte lane and
+// the text lane on different snapshots: nil sends the caller down the
+// working-copy resolvers (tools_fileops.go: resolveFilePath has no
+// committed-tree guard of its own, unlike resolveNodePath:487 and
+// resolveGraphPath:556), and the bytes that come back are the canonical
+// checkout's — a different state of the world, returned under a rider that
+// says the request was served exactly the ref it asked for. A surface that
+// refuses says so instead; see sourceUnavailable.
+//
+// A request that reads a working copy is also where the working copy's own
+// coherence is checked: this is the one place on the byte lane that runs
+// exactly once per answer, so the route the view pinned is revalidated here
+// rather than once per resolved path.
 func refViewFilesFor(ctx context.Context) *refViewFiles {
 	view := requestViewFromContext(ctx)
-	if view == nil || !view.files.available() {
+	if !viewReadsCommittedTree(view) {
+		noteWorktreeRouteDrift(ctx, view, graphview.CapSourceSnapshot)
 		return nil
 	}
-	return view.files
+	if view.files != nil {
+		return view.files
+	}
+	return committedTreeWithoutASource(view)
+}
+
+// committedTreeWithoutASource is the surface a committed-tree view that was
+// never given one reads through: a routed checkout whose working-tree layer
+// the route withdrew after the request bound it (see viewReadsCommittedTree).
+//
+// It carries the view's identity so a refusal names the right view, and no
+// repository or tree, so every read refuses rather than opening anything. That
+// is deliberately the whole of it: minting a real tree source here would need
+// the top layer's TreeOID off the catalog and would spawn a git child on a
+// value no request lifecycle closes, because the view was built without a file
+// surface for close() to release (view_request.go: close releases v.files).
+// Serving those bytes belongs where the view is constructed; refusing to serve
+// the wrong ones belongs here.
+func committedTreeWithoutASource(view *requestView) *refViewFiles {
+	surface := &refViewFiles{}
+	if view.materialized != nil {
+		surface.fingerprint = view.materialized.ID.Fingerprint()
+		surface.repoPrefix = view.materialized.ID.RepoPrefix
+	}
+	return surface
 }
 
 // readViewFile resolves a caller's path against the pinned tree and returns

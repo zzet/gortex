@@ -144,8 +144,13 @@ type Server struct {
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	// lifecycle is the shared owner of checkout track / forget side effects.
-	lifecycle     *indexer.CheckoutLifecycle
-	activeProject string
+	lifecycle *indexer.CheckoutLifecycle
+	// freshnessWaiter overrides the checkout settle signal a require_fresh
+	// request waits on. Nil in production, where the lifecycle above is the
+	// waiter; a test installs one to drive the wait's outcomes without a live
+	// coordinator. See checkoutFreshnessWaiter.
+	freshnessWaiter checkoutFreshnessWaiter
+	activeProject   string
 	// testIndexProbe caches, per repo prefix, which language families the
 	// graph carries test symbols for (see testLangsIndexed). The answer
 	// changes with a reindex — and with the test-edge pass that stamps those
@@ -815,9 +820,11 @@ type lastSearchState struct {
 }
 
 // tokenStats tracks estimated token savings for the current session. When a
-// savings.Store is attached, each record() call also increments the persistent
-// cumulative totals so "Gortex saved $X this month"-style narratives survive
-// server restarts.
+// savings.Store is attached, each record() call also books the observation
+// into the persistent cumulative totals so "Gortex saved $X this month"-style
+// narratives survive server restarts. That booking is a buffered enqueue, not
+// a database transaction: a read-only tool call must not pay a durable
+// sidecar commit to record its own accounting (see internal/savings).
 //
 // parent, when non-nil, is the process-wide aggregate (s.tokenStats) that
 // every per-session counter feeds. Without the fan-out, a fresh session's
@@ -961,7 +968,8 @@ func (ts *tokenStats) record(node *graph.Node, tool string, returned, fullFile i
 
 	// Forward to the persistent store outside our lock — its own
 	// synchronization guards concurrent writers, and the ledger write
-	// shouldn't block new record() calls on the hot path.
+	// shouldn't block new record() calls on the hot path. Sidecar-backed
+	// stores buffer here and commit one transaction per flush window.
 	if store != nil {
 		store.AddObservation(savings.Observation{
 			Repo:      repo,
@@ -2669,15 +2677,32 @@ func (s *Server) tokenStatsFor(ctx context.Context) *tokenStats {
 	return s.sessions.get(id).tokenStats
 }
 
-// FlushSavings is kept for shutdown-path compatibility. The sidecar-backed
-// ledger commits every observation as it is recorded, so there is nothing
-// buffered to write.
+// FlushSavings commits any buffered savings observations. The sidecar-backed
+// ledger coalesces observations into one transaction per flush window, so
+// this is the shutdown path's job: the daemon's teardown chain calls it
+// (serverstack registers it as a cleanup step) before the sidecar handle is
+// released, and without it the last window of accounting is lost. Reads of
+// the ledger flush on their own, so no reader needs to call this first.
 func (s *Server) FlushSavings() error {
 	store := s.savingsStore()
 	if store == nil {
 		return nil
 	}
 	return store.Flush()
+}
+
+// SetSavingsFlushBounds narrows (or widens) the ledger's coalescing window
+// for this server. The daemon keeps the package default; the one-shot stdio
+// server — which its host SIGKILLs rather than shuts down — tightens it at
+// its entry point so a killed session loses seconds of accounting, not a
+// whole minute. No-op when persistence isn't wired, and an operator's
+// GORTEX_SAVINGS_FLUSH_INTERVAL is never overridden (see savings.Store).
+func (s *Server) SetSavingsFlushBounds(interval time.Duration, max int) {
+	store := s.savingsStore()
+	if store == nil {
+		return
+	}
+	store.SetFlushBounds(interval, max)
 }
 
 // savingsStore extracts the persistent savings store via tokenStats. Returns
@@ -2819,10 +2844,22 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 	return ResolveScopedRepos(scope, repo)
 }
 
-// communityCacheToken is the per-graph identity tuple
-// handleAnalyzeClusters checks before re-running the incremental
-// detector. EdgeIdentity moves on provenance churn; NodeCount and EdgeCount
-// cover additions/removals. analysisRevision closes the remaining same-count
+// communityCacheToken is the identity of the INDEXED CORPUS — s.graph,
+// generation zero — at one moment. It is not the identity of a request's view:
+// every per-server analysis it keys (the Leiden partition and the process
+// discovery beneath it) is computed over the corpus and not over whatever view
+// a request selected, which is why the consumers that serve one under a routed
+// view say base_scoped on the rider rather than pretending the answer describes
+// the view (view_capabilities.go, annotateBaseScoped).
+//
+// Reading it is NOT free and it must never be put on a liveness path: on the
+// SQL backend NodeCount and EdgeCount are whole-generation COUNT(*) scans
+// (store_sqlite/store.go, stmtNodeCount / stmtEdgeCount — the O(repos) counter
+// path countsFromIndexState is reachable only through Stats()). It is read once
+// per analysis run, which is what it is priced for.
+//
+// EdgeIdentity moves on provenance churn; NodeCount and EdgeCount cover
+// additions/removals. analysisRevision closes the remaining same-count
 // mutation gap on durable stores (for example a rebind or source-location
 // shift). A zero token is "never populated".
 type communityCacheToken struct {

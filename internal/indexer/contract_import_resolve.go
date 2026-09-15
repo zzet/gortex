@@ -1,8 +1,11 @@
 package indexer
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -10,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser/tsalias"
 )
 
@@ -303,6 +307,14 @@ func (mi *MultiIndexer) rustImportCandidateNames(srcFile, name string, srcCache 
 // reused across all import resolutions in the same session. A nil
 // entry means "scanned, no usable config" — distinct from "not yet
 // scanned" (missing key).
+//
+// It holds WORKING-COPY answers only. The key is a root, and a root cannot
+// tell two snapshots of one checkout apart, so a build that reads a committed
+// tree neither consults this cache nor fills it: it loads its own scopes out
+// of its own source and memoises them on the Indexer that owns that source
+// (Indexer.tsAliasCollection). Sharing this map between the live index and a
+// committed build is exactly how the checkout's tsconfig would have decided a
+// committed generation's alias edges.
 var (
 	tsAliasCache   = map[string]*tsalias.Collection{}
 	tsAliasCacheMu sync.Mutex
@@ -331,7 +343,7 @@ func (mi *MultiIndexer) tsAliasMapFor(srcFile string) (*tsalias.Map, string) {
 			continue
 		}
 		rel := strings.TrimPrefix(srcFile, prefix+"/")
-		coll := loadTSAliasCollection(m.RootPath)
+		coll := mi.tsAliasCollectionFor(prefix, m.RootPath)
 		if coll == nil {
 			return nil, prefix
 		}
@@ -340,6 +352,30 @@ func (mi *MultiIndexer) tsAliasMapFor(srcFile string) (*tsalias.Map, string) {
 	return nil, ""
 }
 
+// tsAliasCollectionFor returns the tsconfig / jsconfig alias scopes a tracked
+// repository's path-alias lookups must go through.
+//
+// The scopes come from the tracked-repo metadata's root, which is where this
+// scan always read: only a registered indexer that has declared SOURCE
+// authority takes over, and then through that indexer's own memo, because a
+// snapshot's scopes must neither be looked up in nor written to the
+// process-wide root-keyed cache. An indexer with no source installed reads the
+// same working copy the metadata root names, so deferring to it would swap the
+// root for no gain — the same preference readFileFromAnyRepo's manifestTreeFor
+// applies, for the same reason.
+func (mi *MultiIndexer) tsAliasCollectionFor(prefix, root string) *tsalias.Collection {
+	// GetIndexer holds mi.mu only for this lookup; no I/O happens under it.
+	if idx := mi.GetIndexer(prefix); idx != nil {
+		if tree := idx.manifestTree(); tree.sourced() {
+			return idx.tsAliasCollection()
+		}
+	}
+	return loadTSAliasCollection(root)
+}
+
+// loadTSAliasCollection returns the WORKING COPY's alias scopes at rootPath,
+// cached process-wide by root. Only an unsourced tree may ask: see the note on
+// tsAliasCache.
 func loadTSAliasCollection(rootPath string) *tsalias.Collection {
 	tsAliasCacheMu.Lock()
 	defer tsAliasCacheMu.Unlock()
@@ -351,9 +387,32 @@ func loadTSAliasCollection(rootPath string) *tsalias.Collection {
 	return c
 }
 
-// readFileFromAnyRepo finds the on-disk bytes for a repo-prefixed
-// file path by walking tracked-repo metadata. Mirrors readNodeSource
-// but takes the path directly so callers don't need a graph node.
+// tsAliasCollectionForTree loads the alias scopes out of one tree.
+//
+// A working-copy tree keeps the process-wide root-keyed cache it has always
+// used. A sourced tree is loaded through tsalias.LoadTree over the snapshot
+// itself — every config file it holds, read out of it, with its multi-target
+// aliases grounded in its own bytes — and never touches that cache. A sourced
+// tree that cannot enumerate answers "no scopes" rather than falling back to
+// the checkout: a build that declared source authority must not read the
+// working copy, and a wrong alias scope is a wrong EDGE, not a missing one.
+func tsAliasCollectionForTree(tree manifestTree) *tsalias.Collection {
+	if !tree.sourced() {
+		return loadTSAliasCollection(tree.root())
+	}
+	if src, ok := tree.(tsalias.Tree); ok {
+		return tsalias.LoadTree(src)
+	}
+	return nil
+}
+
+// readFileFromAnyRepo finds the bytes for a repo-prefixed file path by
+// walking tracked-repo metadata. Mirrors readNodeSource but takes the path
+// directly so callers don't need a graph node.
+//
+// The read goes through the owning repository's manifest tree, so a repo
+// whose indexer is reading a snapshot is read out of that snapshot rather
+// than off its checkout.
 func (mi *MultiIndexer) readFileFromAnyRepo(filePath string) ([]byte, bool) {
 	if filePath == "" {
 		return nil, false
@@ -364,7 +423,7 @@ func (mi *MultiIndexer) readFileFromAnyRepo(filePath string) ([]byte, bool) {
 			continue
 		}
 		rel := strings.TrimPrefix(filePath, prefix+"/")
-		data, ok := readDiskFile(joinPath(m.RootPath, rel))
+		data, ok := mi.manifestTreeFor(prefix, m.RootPath).readFile(rel)
 		if ok {
 			return data, true
 		}
@@ -372,9 +431,33 @@ func (mi *MultiIndexer) readFileFromAnyRepo(filePath string) ([]byte, bool) {
 	return nil, false
 }
 
-// joinPath joins a root and relative path with a single separator,
-// avoiding the import of "path/filepath" inside this leaf helper so
-// the file's surface-area stays minimal.
+// manifestTreeFor returns the tree a tracked repository's out-of-payload
+// reads must go through.
+//
+// The read root stays the tracked-repo metadata's, which is where this read
+// always came from: only a registered indexer that has declared SOURCE
+// authority takes over, because that is the one case where reading the
+// working copy would hand a committed build the checkout's bytes. An indexer
+// with no source installed reads the same working copy as the metadata root,
+// so deferring to it would swap the root for no gain — and the two roots are
+// only guaranteed to agree because every registration site derives both from
+// one filepath.Abs. Preferring the metadata root keeps that coincidence from
+// being load-bearing.
+func (mi *MultiIndexer) manifestTreeFor(prefix, root string) manifestTree {
+	// GetIndexer holds mi.mu only for this lookup; no I/O happens under it.
+	if idx := mi.GetIndexer(prefix); idx != nil {
+		if tree := idx.manifestTree(); tree.sourced() {
+			return tree
+		}
+	}
+	return newDiskManifestTree(root)
+}
+
+// joinPath joins a root and relative path with a single separator. It
+// stays a string operation rather than a filepath.Join: the relative half
+// is a repo-relative slash path addressed the way a content source keys
+// its entries, and cleaning it here would fold a name a snapshot holds
+// verbatim.
 func joinPath(root, rel string) string {
 	if root == "" {
 		return rel
@@ -393,6 +476,357 @@ var readDiskFile = func(absPath string) ([]byte, bool) {
 		return nil, false
 	}
 	return data, true
+}
+
+// manifestTree serves the build-configuration files the resolver reads
+// outside the indexed file set — compile_commands.json, package.json,
+// tsconfig.json / jsconfig.json, and the directory probes that go with them —
+// for one repository root.
+//
+// These reads are the last place a build can pick up bytes that do not
+// belong to the tree it describes. A generation built from a committed tree
+// parses its payload through the installed content source, but a compile
+// database or a package manifest read straight off the checkout describes
+// whatever the working copy happens to hold at that instant, and an edge
+// derived from it is then not reproducible from the tree the generation
+// claims. A tree backed by a source answers out of that snapshot and never
+// falls back to the working copy: a path the source cannot serve is absent,
+// not looked up on disk.
+type manifestTree interface {
+	// root is the repository root the tree is addressed against. A compile
+	// database records absolute paths, so normalising them still needs it.
+	root() string
+	// sourced reports whether a content source backs the tree, which is what
+	// decides whether a process-wide, root-keyed cache may hold an answer.
+	sourced() bool
+	// readFile returns the content at a repo-relative slash path.
+	readFile(rel string) ([]byte, bool)
+	// isFile reports whether a repo-relative slash path is readable content.
+	isFile(rel string) bool
+	// isDir reports whether a repo-relative slash path is a directory, FOLLOWING
+	// a symlink on the working copy. It is deliberately not answerable from
+	// topLevelDirs: that probe reports what a directory listing calls a
+	// directory (a symlink is a symlink), and the conventional-include-root
+	// question has always been "does this name resolve to a directory", which
+	// a symlinked include/ answers yes.
+	isDir(rel string) bool
+	// matchFiles expands a repo-relative slash glob to the files it matches,
+	// in lexicographic order.
+	matchFiles(glob string) []string
+	// matchDirs expands a repo-relative slash glob to the directories it
+	// matches, in lexicographic order.
+	matchDirs(glob string) []string
+	// topLevelDirs returns the tree's top-level directories, each mapped to
+	// whether it DIRECTLY holds a file with one of the given extensions.
+	// Directories whose name starts with a dot are not reported. Presence and
+	// contents are answered together because a source can only answer either
+	// by enumerating, and one enumeration per index pass is the budget.
+	topLevelDirs(exts ...string) map[string]bool
+}
+
+// diskManifestTree reads the working copy at a root. It is what the live
+// index uses, and what a build with no content source installed falls back
+// to, so its answers are byte-for-byte the ones these readers gave before a
+// tree stood between them and the os package.
+type diskManifestTree struct{ rootPath string }
+
+var _ manifestTree = diskManifestTree{}
+
+// newDiskManifestTree returns the working-copy tree at root. An empty root
+// answers nothing rather than resolving against the process CWD.
+func newDiskManifestTree(root string) diskManifestTree {
+	return diskManifestTree{rootPath: root}
+}
+
+func (t diskManifestTree) root() string  { return t.rootPath }
+func (t diskManifestTree) sourced() bool { return false }
+
+func (t diskManifestTree) readFile(rel string) ([]byte, bool) {
+	if t.rootPath == "" || rel == "" {
+		return nil, false
+	}
+	return readDiskFile(joinPath(t.rootPath, rel))
+}
+
+func (t diskManifestTree) isFile(rel string) bool {
+	if t.rootPath == "" || rel == "" {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(t.rootPath, filepath.FromSlash(rel)))
+	return err == nil && !fi.IsDir()
+}
+
+// isDir is os.Stat, so it follows a symlink, and it needs no listing of the
+// parent — byte-for-byte the probe the conventional-include-root clause used
+// before a tree stood in front of it. A root that cannot be listed at all
+// (readable children, unlistable directory) still answers here.
+func (t diskManifestTree) isDir(rel string) bool {
+	if t.rootPath == "" || rel == "" {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(t.rootPath, filepath.FromSlash(rel)))
+	return err == nil && fi.IsDir()
+}
+
+func (t diskManifestTree) matchFiles(glob string) []string { return t.match(glob, false) }
+func (t diskManifestTree) matchDirs(glob string) []string  { return t.match(glob, true) }
+
+// match expands a slash glob against the working copy, keeping only the
+// matches whose kind — file or directory — the caller asked for.
+func (t diskManifestTree) match(glob string, wantDir bool) []string {
+	if t.rootPath == "" || glob == "" {
+		return nil
+	}
+	matches, err := filepath.Glob(filepath.Join(t.rootPath, filepath.FromSlash(glob)))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, abs := range matches {
+		fi, statErr := os.Stat(abs)
+		if statErr != nil || fi.IsDir() != wantDir {
+			continue
+		}
+		rel, relErr := filepath.Rel(t.rootPath, abs)
+		if relErr != nil {
+			continue
+		}
+		out = append(out, filepath.ToSlash(rel))
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (t diskManifestTree) topLevelDirs(exts ...string) map[string]bool {
+	if t.rootPath == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(t.rootPath)
+	if err != nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if !e.IsDir() || strings.HasPrefix(name, ".") {
+			continue
+		}
+		out[name] = dirHoldsExt(filepath.Join(t.rootPath, name), exts)
+	}
+	return out
+}
+
+// sourceManifestTree reads one immutable snapshot through a content source.
+// rootPath is carried for path normalisation only — no answer of this tree
+// touches the working copy, and a nil source answers nothing, because a
+// build that declared source authority must not silently fall back to disk.
+type sourceManifestTree struct {
+	rootPath string
+	src      source.ContentSource
+}
+
+var (
+	_ manifestTree = sourceManifestTree{}
+	_ tsalias.Tree = sourceManifestTree{}
+)
+
+func (t sourceManifestTree) root() string  { return t.rootPath }
+func (t sourceManifestTree) sourced() bool { return true }
+
+// Files, Read and Exists are the tsalias.Tree view of the snapshot: they let
+// the tsconfig / jsconfig path-alias scan read the tree the generation
+// describes instead of walking the checkout. Files is the one probe here that
+// costs a whole walk, so its caller memoises the Collection it builds.
+//
+// A snapshot has no directories to prune, so it offers every path and lets
+// the loader apply the skip rule (tsalias.LoadTree does, to every path it is
+// offered) — which is what keeps the two trees agreeing about which configs a
+// repository HAS. A symlink is skipped for the reason isFile gives: a source
+// hands back link text, not the file's bytes.
+func (t sourceManifestTree) Files(visit func(rel string)) {
+	if t.src == nil || visit == nil {
+		return
+	}
+	t.scan("", func(meta source.FileMeta) {
+		if meta.Symlink {
+			return
+		}
+		visit(meta.Path)
+	})
+}
+
+func (t sourceManifestTree) Read(rel string) ([]byte, bool) { return t.readFile(rel) }
+func (t sourceManifestTree) Exists(rel string) bool         { return t.isFile(rel) }
+
+func (t sourceManifestTree) readFile(rel string) ([]byte, bool) {
+	if t.src == nil || rel == "" {
+		return nil, false
+	}
+	data, _, err := readSourceFile(t.src, rel)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// isFile reports content the snapshot can serve. A symlink is not content:
+// a source hands back the link text rather than following it, so treating
+// one as a file would offer a reader bytes that are not the file's.
+func (t sourceManifestTree) isFile(rel string) bool {
+	if t.src == nil || rel == "" {
+		return false
+	}
+	meta, err := t.src.Stat(rel)
+	return err == nil && !meta.Symlink
+}
+
+// isDir reports whether the snapshot holds anything under rel. A source has no
+// directory entries of its own — a directory exists exactly when something in
+// it does, which is git's rule and the one matchDirs already applies. A
+// symlink is therefore never a directory here: a source hands back its link
+// text as a blob and never descends it, so nothing is ever under it.
+func (t sourceManifestTree) isDir(rel string) bool {
+	if t.src == nil || rel == "" {
+		return false
+	}
+	found := false
+	t.scan(rel+"/", func(source.FileMeta) { found = true })
+	return found
+}
+
+// matchFiles keeps only entries the snapshot can serve as content, which is
+// the same question isFile answers: a symlink's bytes are its link text, so
+// matching one would hand its reader something that is not the file. Without
+// this the two probes disagree and a symlinked build/compile_commands.json is
+// matched, read as a path string and silently dropped by the JSON decode.
+func (t sourceManifestTree) matchFiles(glob string) []string {
+	if glob == "" {
+		return nil
+	}
+	var out []string
+	t.scan(globLiteralPrefix(glob), func(meta source.FileMeta) {
+		if meta.Symlink {
+			return
+		}
+		if ok, err := path.Match(glob, meta.Path); ok && err == nil {
+			out = append(out, meta.Path)
+		}
+	})
+	sort.Strings(out)
+	return out
+}
+
+// matchDirs matches the ancestor directories of the snapshot's entries. A
+// directory exists in a source exactly when something in it does, which is
+// also git's rule, so an empty directory is not a match here or on disk.
+func (t sourceManifestTree) matchDirs(glob string) []string {
+	if glob == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	t.scan(globLiteralPrefix(glob), func(meta source.FileMeta) {
+		for dir := path.Dir(meta.Path); dir != "." && dir != "/" && dir != ""; dir = path.Dir(dir) {
+			if _, done := seen[dir]; done {
+				// Every ancestor of a directory already considered has
+				// itself already been considered.
+				break
+			}
+			seen[dir] = struct{}{}
+			if ok, err := path.Match(glob, dir); ok && err == nil {
+				out = append(out, dir)
+			}
+		}
+	})
+	sort.Strings(out)
+	return out
+}
+
+func (t sourceManifestTree) topLevelDirs(exts ...string) map[string]bool {
+	want := make(map[string]struct{}, len(exts))
+	for _, e := range exts {
+		want[e] = struct{}{}
+	}
+	out := map[string]bool{}
+	t.scan("", func(meta source.FileMeta) {
+		p := meta.Path
+		slash := strings.Index(p, "/")
+		if slash <= 0 {
+			return // a file at the root names no directory
+		}
+		top := p[:slash]
+		if strings.HasPrefix(top, ".") {
+			return
+		}
+		if _, present := out[top]; !present {
+			out[top] = false
+		}
+		// Only a DIRECT child counts, which is the shape the working-copy
+		// probe reads with one ReadDir per top-level entry.
+		if strings.Contains(p[slash+1:], "/") {
+			return
+		}
+		if _, ok := want[path.Ext(p)]; ok {
+			out[top] = true
+		}
+	})
+	return out
+}
+
+// errManifestScanDone ends a scan that has passed every path its glob's
+// literal prefix could still match. It never escapes scan.
+var errManifestScanDone = errors.New("indexer: manifest scan complete")
+
+// scan visits the snapshot's paths in lexicographic order and stops at the
+// first path that has left lit behind. Walk's ordering is part of the
+// ContentSource contract, so a scan for `build*/compile_commands.json` reads
+// the "build" block of a tree and nothing after it; an empty lit is a whole
+// walk, which only the top-level directory probe asks for.
+func (t sourceManifestTree) scan(lit string, visit func(source.FileMeta)) {
+	if t.src == nil {
+		return
+	}
+	_ = t.src.Walk(context.Background(), func(meta source.FileMeta) error {
+		p := meta.Path
+		if lit != "" && !strings.HasPrefix(p, lit) {
+			if p > lit {
+				return errManifestScanDone
+			}
+			return nil
+		}
+		visit(meta)
+		return nil
+	})
+}
+
+// globLiteralPrefix returns the leading portion of a slash glob that no
+// metacharacter can alter — the prefix every match is guaranteed to carry.
+func globLiteralPrefix(glob string) string {
+	if i := strings.IndexAny(glob, `*?[\`); i >= 0 {
+		return glob[:i]
+	}
+	return glob
+}
+
+// dirHoldsExt reports whether dir directly holds a file with one of the
+// given extensions.
+func dirHoldsExt(dir string, exts []string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(e.Name())
+		for _, want := range exts {
+			if ext == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // tsImportRe matches `import { A, B as C } from '...'`,

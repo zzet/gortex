@@ -311,12 +311,25 @@ func trackedReposReach(st daemon.StatusResponse, p string) bool {
 }
 
 // checkoutBindsCWD asks the daemon whether abs sits inside a registered
-// checkout — a working copy the catalog binds to its family's view.
+// checkout the family's shared automatic lane serves — the only shape of
+// checkout the MCP dispatcher's own gate admits.
 //
 // file_coverage is the control-surface answer to "which graph serves this
-// path", and its view block names the checkout that owns the path. It has to
-// be the control surface: the tool surface is what this pre-flight guards, so
-// asking it here would be circular.
+// path", and its view block names both the checkout that owns the path and the
+// kind of view that answered for it. It has to be the control surface: the tool
+// surface is what this pre-flight guards, so asking it here would be circular.
+//
+// The verdict is probeViewServesAutomaticLane, not "the answer named a
+// checkout". Those two differ for exactly the cases the dispatcher refuses — a
+// live dedicated checkout, the family primary, and any checkout sitting in a
+// grace or transition state — all of which carry a CheckoutID on a
+// ProbeViewBase answer. Admitting them here made this pre-flight looser than
+// the dispatcher's CheckoutServesCWDChecked, which is the divergence
+// trackedReposReach's comment above calls a user-visible defect class. A
+// dedicated checkout and the family primary are tracked repositories, so
+// trackedReposReach has already admitted them before this arm runs; what this
+// narrows is the registered-but-unserved checkout, whose remedy is the family
+// reconcile below.
 //
 // A daemon too old to know the verb reports no checkout, leaving the caller
 // with exactly the verdict it reached before this arm existed. A daemon too
@@ -337,7 +350,7 @@ func checkoutBindsCWD(c *daemon.Client, abs string) bool {
 	if err := json.Unmarshal(resp.Result, &out); err != nil {
 		return false
 	}
-	return out.View != nil && out.View.CheckoutID != ""
+	return probeViewServesAutomaticLane(out.View)
 }
 
 // worktreeFamily identifies the set of working copies a linked git worktree

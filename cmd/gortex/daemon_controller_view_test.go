@@ -216,6 +216,16 @@ func (f *probeFixture) routeWorktreeFile(t *testing.T, key string) {
 // state, which is how a test moves it into a grace window or re-homes it.
 func (f *probeFixture) upsertWorktree(t *testing.T, root string, state store_sqlite.CheckoutState) {
 	t.Helper()
+	f.upsertWorktreeMode(t, root, state, store_sqlite.CheckoutModeAutomatic)
+}
+
+// upsertWorktreeMode is upsertWorktree with the serving mode as a parameter,
+// so a test can move the checkout across BOTH axes graphview.ServesAutomaticView
+// reads.
+func (f *probeFixture) upsertWorktreeMode(
+	t *testing.T, root string, state store_sqlite.CheckoutState, mode store_sqlite.CheckoutMode,
+) {
+	t.Helper()
 	require.NoError(t, f.catalog.UpsertCheckout(context.Background(), store_sqlite.Checkout{
 		CheckoutID:    probeWorktreeID,
 		Incarnation:   "inc-worktree",
@@ -224,8 +234,8 @@ func (f *probeFixture) upsertWorktree(t *testing.T, root string, state store_sql
 		GitDir:        filepath.Join(f.primaryRoot, ".git", "worktrees", "worktree"),
 		AdminName:     "worktree",
 		State:         state,
-		DesiredMode:   store_sqlite.CheckoutModeAutomatic,
-		EffectiveMode: store_sqlite.CheckoutModeAutomatic,
+		DesiredMode:   mode,
+		EffectiveMode: mode,
 		LastSeen:      102,
 	}))
 	f.worktreeRoot = root
@@ -662,4 +672,102 @@ func TestTopologyNudgePanicReleasesCurrentAndPending(t *testing.T) {
 	assert.True(t, seen["current"])
 	assert.True(t, seen["pending"])
 	assert.Empty(t, controller.topologyNudges)
+}
+
+// TestProbeViewKindAgreesWithTheAutomaticLanePredicate is the binding between
+// the probe's view vocabulary and the predicate the MCP dispatcher's admission
+// gate answers with.
+//
+// probeViewServesAutomaticLane is what the CLI pre-flight reads a probe answer
+// with, and it claims to be the wire-side spelling of
+// graphview.ServesAutomaticView. That claim is only worth anything if the two
+// move together across both axes ServesAutomaticView reads — the checkout's
+// state and its effective mode — which is what this walks.
+//
+// The `want` side is computed from the catalog row itself, not from the table,
+// so this cannot drift into agreeing with a wrong answer about what the
+// predicate says.
+func TestProbeViewKindAgreesWithTheAutomaticLanePredicate(t *testing.T) {
+	f := newProbeFixture(t)
+	f.controller.probeReconcile = func(string) {}
+	f.controller.probeActivateCheckout = func(string) bool { return true }
+	ctx := context.Background()
+	root := f.worktreeRoot
+	probed := filepath.Join(root, probeFile)
+
+	states := []store_sqlite.CheckoutState{
+		store_sqlite.CheckoutStateReady,
+		store_sqlite.CheckoutStateAvailabilityGrace,
+		store_sqlite.CheckoutStateRemovalGrace,
+		store_sqlite.CheckoutStateUnavailable,
+		store_sqlite.CheckoutStateReconciling,
+		store_sqlite.CheckoutStateDemoting,
+	}
+	modes := []store_sqlite.CheckoutMode{
+		store_sqlite.CheckoutModeAutomatic,
+		store_sqlite.CheckoutModeDedicated,
+	}
+
+	served := 0
+	for _, state := range states {
+		for _, mode := range modes {
+			t.Run(string(state)+"/"+string(mode), func(t *testing.T) {
+				f.upsertWorktreeMode(t, root, state, mode)
+
+				checkout, found, err := f.catalog.GetCheckout(ctx, probeWorktreeID)
+				require.NoError(t, err)
+				require.True(t, found)
+				want := graphview.ServesAutomaticView(checkout)
+
+				coverage, err := f.controller.FileCoverage(ctx, daemon.FileCoverageParams{Path: probed})
+				require.NoError(t, err)
+				got := probeViewServesAutomaticLane(coverage.View)
+
+				assert.Equal(t, want, got,
+					"the probe answer (kind %q) disagrees with graphview.ServesAutomaticView for state=%s mode=%s; "+
+						"the CLI pre-flight and the MCP dispatcher would admit this path differently",
+					probeViewKindOf(coverage.View), state, mode)
+				if want {
+					served++
+				}
+			})
+		}
+	}
+	// A table in which nothing is served would pass vacuously.
+	assert.Equal(t, 1, served,
+		"exactly the ready/automatic cell is served by the shared lane; the table proved %d", served)
+}
+
+// TestProbeViewServesAutomaticLaneRejectsANamedButUnservedCheckout is the
+// narrowing itself, stated on the predicate rather than through a probe.
+//
+// Every one of these answers carries a checkout id, which is what the CLI
+// pre-flight used to admit on. None of them is a working copy the shared
+// automatic lane serves.
+func TestProbeViewServesAutomaticLaneRejectsANamedButUnservedCheckout(t *testing.T) {
+	assert.False(t, probeViewServesAutomaticLane(nil),
+		"no view block at all is not a served checkout")
+	assert.False(t, probeViewServesAutomaticLane(
+		exactProbeView(daemon.ProbeViewBase, probePrimaryID, probePrefix)),
+		"a dedicated checkout / family primary is named but read from the base corpus")
+	assert.False(t, probeViewServesAutomaticLane(
+		fallbackProbeView(daemon.ProbeViewBase, probeWorktreeID, probePrefix,
+			string(store_sqlite.CheckoutStateAvailabilityGrace))),
+		"a checkout in a grace window is named but not served")
+	assert.True(t, probeViewServesAutomaticLane(
+		exactProbeView(daemon.ProbeViewWorktree, probeWorktreeID, probePrefix)),
+		"a composed automatic checkout is served")
+	assert.True(t, probeViewServesAutomaticLane(
+		fallbackProbeView(daemon.ProbeViewUnrouted, probeWorktreeID, probePrefix,
+			daemon.FallbackViewBuilding)),
+		"a ready automatic checkout whose view is still building is served — the dispatcher admits it too")
+}
+
+// probeViewKindOf names a probe answer's kind for a failure message, including
+// the absent case.
+func probeViewKindOf(answer *daemon.ProbeView) string {
+	if answer == nil {
+		return "(no view)"
+	}
+	return answer.Kind
 }

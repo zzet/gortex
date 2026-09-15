@@ -12,6 +12,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/lsp"
@@ -36,23 +37,77 @@ func nodeHasSemanticType(n *graph.Node) bool {
 // no LSP server serves its language, or the semantic manager is off. Mutates
 // the passed node in place (and persists) so the caller's response reflects the
 // fresh type.
-func (s *Server) enrichNodeOnDemand(node *graph.Node) {
+func (s *Server) enrichNodeOnDemand(ctx context.Context, node *graph.Node) {
 	if node == nil || s.semanticMgr == nil || s.graph == nil || nodeHasSemanticType(node) {
 		return
 	}
-	absPath, err := s.absolutePath(node.FilePath)
-	if err != nil {
+	// The stamp is a WRITE, so it names its output generation like every other
+	// enrichment. A request reading a checkout of its own is not stamped at all
+	// rather than having the shared corpus enriched behind its back from a
+	// language server rooted in a different tree.
+	_, out, provider := s.lspEnrichmentTarget(ctx, EnrichProducerSemanticType, node)
+	if out == nil {
 		return
 	}
-	provider, _, err := s.lspProviderForPath(absPath)
-	if err != nil || provider == nil {
+	if _, err := provider.EnrichNode(out.Store, out.Root, node); err != nil {
+		out.Abandon()
 		return
+	}
+	_ = out.Complete()
+}
+
+// lspEnrichmentTarget resolves the three things an on-demand LSP enrichment
+// needs: the output generation it writes, the workspace root it hovers, and a
+// language server rooted there.
+//
+// The output is resolved BEFORE the server is spawned, and that order is the
+// point: a request reading a checkout of its own has no writable output, so it
+// must not spawn a server or hover any bytes at all. Returns a nil output for
+// that case, for a path that cannot be placed on disk, and when no server
+// serves the language.
+func (s *Server) lspEnrichmentTarget(
+	ctx context.Context, producer string, node *graph.Node,
+) (string, *EnrichmentOutput, *lsp.Provider) {
+	absPath, err := s.absolutePath(node.FilePath)
+	if err != nil {
+		return "", nil, nil
 	}
 	root, err := s.workspaceRootFor(absPath)
 	if err != nil {
-		return
+		return "", nil, nil
 	}
-	_, _ = provider.EnrichNode(s.graph, root, node)
+	out, err := s.beginEnrichmentOutput(ctx, producer, node.RepoPrefix, root)
+	if err != nil {
+		// The caller's answer is genuinely thinner for this — no hover-grade
+		// semantic_type, no compiler-confirmed callers — so the request says
+		// so instead of returning a quietly degraded answer that still reads
+		// as complete. This is the only place the on-demand fault-in can be
+		// refused, so it is the only place that has to annotate.
+		requestViewFromContext(ctx).noteDegraded([]graphview.CapabilityStatus{
+			{Capability: lspEnrichmentCapability(producer), State: graphview.StateUnavailable},
+		})
+		return "", nil, nil
+	}
+	if out.Root == "" {
+		out.Abandon()
+		return "", nil, nil
+	}
+	provider, _, err := s.lspProviderForPath(absPath)
+	if err != nil || provider == nil {
+		out.Abandon()
+		return "", nil, nil
+	}
+	return absPath, out, provider
+}
+
+// lspEnrichmentCapability names what an on-demand enrichment would have served
+// had it been admitted, so a refusal annotates the request against the right
+// capability rather than against the whole surface.
+func lspEnrichmentCapability(producer string) graphview.CapabilityID {
+	if producer == EnrichProducerSymbolRefs {
+		return graphview.CapLSPReferences
+	}
+	return graphview.CapLSPHover
 }
 
 // confirmSymbolRefsOnDemand faults in a callable symbol's INCOMING references
@@ -63,7 +118,7 @@ func (s *Server) enrichNodeOnDemand(node *graph.Node) {
 // usages accuracy. Idempotent per session via the refsConfirmed ledger; a
 // no-op for non-callable nodes, when no call-hierarchy server serves the
 // language, or when already confirmed.
-func (s *Server) confirmSymbolRefsOnDemand(node *graph.Node) {
+func (s *Server) confirmSymbolRefsOnDemand(ctx context.Context, node *graph.Node) {
 	if node == nil || s.semanticMgr == nil || s.graph == nil {
 		return
 	}
@@ -73,19 +128,15 @@ func (s *Server) confirmSymbolRefsOnDemand(node *graph.Node) {
 	if _, done := s.refsConfirmed.Load(node.ID); done {
 		return
 	}
-	absPath, err := s.absolutePath(node.FilePath)
-	if err != nil {
+	_, out, provider := s.lspEnrichmentTarget(ctx, EnrichProducerSymbolRefs, node)
+	if out == nil {
 		return
 	}
-	provider, _, err := s.lspProviderForPath(absPath)
-	if err != nil || provider == nil {
-		return
+	if _, err := provider.ConfirmSymbolRefs(out.Store, out.Root, node); err != nil {
+		out.Abandon()
+	} else {
+		_ = out.Complete()
 	}
-	root, err := s.workspaceRootFor(absPath)
-	if err != nil {
-		return
-	}
-	_, _ = provider.ConfirmSymbolRefs(s.graph, root, node)
 	// Record after the attempt (even on 0/err) so a query doesn't re-spawn the
 	// server every call; a file re-index clears staleness through the normal
 	// restub path. Durable-ledger + retry semantics are the fuller version.

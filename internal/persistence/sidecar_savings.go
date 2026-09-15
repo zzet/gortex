@@ -3,6 +3,9 @@ package persistence
 import (
 	"database/sql"
 	"fmt"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,9 +16,10 @@ import (
 //
 // Three tables, one job each:
 //   - savings_events: one row per recorded source-reading tool call.
-//     Durable at the call (single INSERT inside the observation tx), so
-//     a SIGKILLed server loses nothing — the property the flat-file
-//     ledger's batched flush could not give.
+//     Written inside the observation transaction, which may carry a whole
+//     batch of observations (see AddSavingsObservations): durability is at
+//     the transaction, and the in-process buffer in internal/savings decides
+//     how many calls share one.
 //   - savings_totals: running aggregates keyed by bucket ('' top-line,
 //     'repo:<prefix>', 'lang:<code>'), updated transactionally with the
 //     event insert so reads are point lookups instead of full scans.
@@ -46,10 +50,61 @@ type SavingsTotalsRow struct {
 
 const savingsLegacyMigrationKind = "savings_files"
 
+// savingsCommits counts the savings-ledger transactions each sidecar store
+// has committed, keyed by store. The ledger is the one sidecar writer on the
+// read-only tool path, so "how many durable transactions did N observations
+// cost" is the number that decides whether accounting is free or is the idle
+// floor; without a counter it can only be inferred from -wal file growth.
+//
+// Kept beside the ledger rather than on SidecarStore so the accounting
+// bookkeeping stays in one file. Entries are bounded by the number of sidecar
+// stores a process opens (OpenSidecar caches one handle per absolute path).
+var savingsCommits sync.Map // *SidecarStore -> *atomic.Int64
+
+// SavingsCommitCount reports how many savings-ledger transactions this store
+// has committed since it was opened. Zero for a nil store. Diagnostic: it is
+// what makes "N observations, one transaction" checkable.
+func (s *SidecarStore) SavingsCommitCount() int64 {
+	if s == nil {
+		return 0
+	}
+	v, ok := savingsCommits.Load(s)
+	if !ok {
+		return 0
+	}
+	return v.(*atomic.Int64).Load()
+}
+
+func (s *SidecarStore) noteSavingsCommit() {
+	v, _ := savingsCommits.LoadOrStore(s, new(atomic.Int64))
+	v.(*atomic.Int64).Add(1)
+}
+
 // AddSavingsObservation books one observation: the event row, the
 // affected totals buckets, and the meta stamps, in a single transaction.
+// Equivalent to AddSavingsObservations with a one-element batch.
 func (s *SidecarStore) AddSavingsObservation(ev SavingsEvent) error {
-	if s == nil {
+	return s.AddSavingsObservations([]SavingsEvent{ev})
+}
+
+// AddSavingsObservations books a whole batch of observations in ONE
+// transaction: every event row, the aggregated totals buckets, and the meta
+// stamps. The per-observation transaction this replaced cost ~37 KB of
+// sidecar WAL each, so a read-only tool call — which books one observation —
+// paid a durable multi-page commit for accounting alone; batching makes that
+// cost per flush instead of per call.
+//
+// Totals are folded in Go first so a batch touching the same bucket N times
+// performs one upsert, not N. Bucket order is sorted for a deterministic
+// write order. The meta stamps take the batch's earliest ts for first_seen
+// and its latest for last_updated, and both are combined with MIN/MAX against
+// what is already stored: a buffered batch can reach the database after a
+// concurrent writer's newer observation, and a plain overwrite would then walk
+// last_updated backwards.
+//
+// An empty batch commits nothing (no transaction, no commit counted).
+func (s *SidecarStore) AddSavingsObservations(evs []SavingsEvent) error {
+	if s == nil || len(evs) == 0 {
 		return nil
 	}
 	s.writeMu.Lock()
@@ -61,44 +116,85 @@ func (s *SidecarStore) AddSavingsObservation(ev SavingsEvent) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	ts := ev.TS
-	if ts.IsZero() {
-		ts = time.Now()
-	}
-	tsN := ts.UTC().UnixNano()
-
-	if _, err := tx.Exec(
+	insert, err := tx.Prepare(
 		`INSERT INTO savings_events (ts, session_id, tool, repo, language, model, client, returned, saved) VALUES (?,?,?,?,?,?,?,?,?)`,
-		tsN, ev.SessionID, ev.Tool, ev.Repo, ev.Language, ev.Model, ev.Client, ev.Returned, ev.Saved,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("persistence: savings event: %w", err)
 	}
+	defer func() { _ = insert.Close() }()
 
-	buckets := []string{""}
-	if ev.Repo != "" {
-		buckets = append(buckets, "repo:"+ev.Repo)
+	totals := make(map[string]*SavingsTotalsRow, 3)
+	bump := func(bucket string, saved, returned int64) {
+		r := totals[bucket]
+		if r == nil {
+			r = &SavingsTotalsRow{}
+			totals[bucket] = r
+		}
+		r.Saved += saved
+		r.Returned += returned
+		r.Calls++
 	}
-	if ev.Language != "" {
-		buckets = append(buckets, "lang:"+ev.Language)
+
+	var minTS, maxTS int64
+	for _, ev := range evs {
+		ts := ev.TS
+		if ts.IsZero() {
+			ts = time.Now()
+		}
+		tsN := ts.UTC().UnixNano()
+		if minTS == 0 || tsN < minTS {
+			minTS = tsN
+		}
+		if tsN > maxTS {
+			maxTS = tsN
+		}
+
+		if _, err := insert.Exec(
+			tsN, ev.SessionID, ev.Tool, ev.Repo, ev.Language, ev.Model, ev.Client, ev.Returned, ev.Saved,
+		); err != nil {
+			return fmt.Errorf("persistence: savings event: %w", err)
+		}
+
+		bump("", ev.Saved, ev.Returned)
+		if ev.Repo != "" {
+			bump("repo:"+ev.Repo, ev.Saved, ev.Returned)
+		}
+		if ev.Language != "" {
+			bump("lang:"+ev.Language, ev.Saved, ev.Returned)
+		}
 	}
+
+	buckets := make([]string, 0, len(totals))
+	for bucket := range totals {
+		buckets = append(buckets, bucket)
+	}
+	sort.Strings(buckets)
 	for _, bucket := range buckets {
-		if err := upsertSavingsBucket(tx, bucket, ev.Saved, ev.Returned, 1); err != nil {
+		r := totals[bucket]
+		if err := upsertSavingsBucket(tx, bucket, r.Saved, r.Returned, r.Calls); err != nil {
 			return err
 		}
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO savings_meta (key, value) VALUES ('first_seen', ?) ON CONFLICT(key) DO NOTHING`, tsN,
+		`INSERT INTO savings_meta (key, value) VALUES ('first_seen', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = MIN(savings_meta.value, excluded.value)`, minTS,
 	); err != nil {
 		return fmt.Errorf("persistence: savings meta: %w", err)
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO savings_meta (key, value) VALUES ('last_updated', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, tsN,
+		`INSERT INTO savings_meta (key, value) VALUES ('last_updated', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = MAX(savings_meta.value, excluded.value)`, maxTS,
 	); err != nil {
 		return fmt.Errorf("persistence: savings meta: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.noteSavingsCommit()
+	return nil
 }
 
 func upsertSavingsBucket(tx *sql.Tx, bucket string, saved, returned, calls int64) error {

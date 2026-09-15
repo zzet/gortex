@@ -3,6 +3,8 @@ package graphview
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -516,8 +518,14 @@ func TestMaterializeCheckoutCompletenessRunsBottomUp(t *testing.T) {
 	if got := view.Completeness.State(CapResolutionCrossRepo); got != StateIncomplete {
 		t.Errorf("%s = %q, want %q", CapResolutionCrossRepo, got, StateIncomplete)
 	}
+	// Text search is not part of the union and is not inherited: no layer of
+	// this stack claims it, so the top layer's silence withdraws it. See
+	// TestCheckoutCompletenessReadsTextSearchOffTheTopLayer.
+	if got := view.Completeness.State(CapSearchText); got != StateUnavailable {
+		t.Errorf("%s = %q, want %q", CapSearchText, got, StateUnavailable)
+	}
 	for _, id := range KnownCapabilities() {
-		if id == CapResolutionCrossRepo {
+		if id == CapResolutionCrossRepo || id == CapSearchText {
 			continue
 		}
 		if got := view.Completeness.State(id); got != StateComplete {
@@ -834,5 +842,563 @@ func setGenerationState(t *testing.T, store *store_sqlite.Store, generationID in
 	t.Helper()
 	if err := store.Catalog().SetViewGenerationState(context.Background(), generationID, next, expected); err != nil {
 		t.Fatalf("SetViewGenerationState(%d, %s): %v", generationID, next, err)
+	}
+}
+
+// TestMaterializeLeasesTheBaseCorpus covers the base-corpus pin's graphview
+// half. The ancestry walk stops at generation zero by construction — it is the
+// terminator of the BaseGenerationID chain, not a link in it — so the one layer
+// every composed stack reads without holding anything was the shared mutable
+// corpus. Both materialization paths now lease it with the rest of the stack,
+// and both release it on Close.
+func TestMaterializeLeasesTheBaseCorpus(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "base-corpus-lease")
+	commit, dirty := seedRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+	if materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("the base corpus is pinned before any view was materialized")
+	}
+
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	if !materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("MaterializeCheckout left the base corpus unpinned")
+	}
+	if !view.PinsBaseCorpus() {
+		t.Fatal("the checkout view does not report a base corpus pin")
+	}
+	// The identity and the composition are still about the derived stack: the
+	// base corpus is leased, not listed.
+	if got := view.Generations(); slices.Contains(got, BaseCorpusGeneration) {
+		t.Fatalf("Generations() = %v, must not list the base corpus", got)
+	}
+	if got := view.Generations(); !slices.Contains(got, commit) || !slices.Contains(got, dirty) {
+		t.Fatalf("Generations() = %v, want the routed stack", got)
+	}
+	view.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("Close left the base corpus pinned")
+	}
+
+	ref, err := materializer.MaterializeRefView(ctx, testGraphID, commit)
+	if err != nil {
+		t.Fatalf("MaterializeRefView: %v", err)
+	}
+	if !materializer.Leases.InUse(BaseCorpusGeneration) || !ref.PinsBaseCorpus() {
+		t.Fatal("MaterializeRefView left the base corpus unpinned")
+	}
+	ref.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) {
+		t.Fatal("ref view Close left the base corpus pinned")
+	}
+}
+
+// TestMaterializeDoesNotLeaseABaseCorpusItNeverReads is the other half of the
+// same truth. A stack standing on a dedicated root composes that root, not the
+// shared corpus, and a pin on something a view does not read is a false
+// statement about what retirement has to wait for.
+func TestMaterializeDoesNotLeaseABaseCorpusItNeverReads(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "dedicated-root-no-base-lease")
+	base, _, _ := seedNonzeroBaseRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	defer view.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) || view.PinsBaseCorpus() {
+		t.Fatal("a stack on a dedicated root pinned the shared corpus it does not read")
+	}
+
+	ref, err := materializer.MaterializeRefView(ctx, testGraphID, base)
+	if err != nil {
+		t.Fatalf("MaterializeRefView(dedicated root): %v", err)
+	}
+	defer ref.Close()
+	if materializer.Leases.InUse(BaseCorpusGeneration) || ref.PinsBaseCorpus() {
+		t.Fatal("a dedicated-root ref view pinned the shared corpus it does not read")
+	}
+}
+
+// TestMaterializeDoesNotLeaseABaseCorpusUnderADeeperAncestry is the second arm
+// of that decision, and the one the generation kind alone cannot answer: a view
+// whose ancestry runs deeper than the generations it was asked for stands on
+// the oldest ancestor's own handle, whatever kind that ancestor is. assemble
+// reads routedStart > 0 before it reads the kind; the lease set has to agree.
+func TestMaterializeDoesNotLeaseABaseCorpusUnderADeeperAncestry(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "deeper-ancestry-no-base-lease")
+	parent := writeBenchmarkGeneration(t, store, "commit", "chain-parent", 0)
+	child := writeBenchmarkGeneration(t, store, "commit", "chain-child", parent)
+	seedStackControlPlane(t, store)
+	materializer := newTestMaterializer(store)
+
+	ref, err := materializer.MaterializeRefView(ctx, testGraphID, child)
+	if err != nil {
+		t.Fatalf("MaterializeRefView(deeper ancestry): %v", err)
+	}
+	defer ref.Close()
+	if got := ref.Generations(); len(got) != 2 || got[0] != parent || got[1] != child {
+		t.Fatalf("Generations() = %v, want [%d %d]", got, parent, child)
+	}
+	if materializer.Leases.InUse(BaseCorpusGeneration) || ref.PinsBaseCorpus() {
+		t.Fatal("a view standing on its own ancestor pinned the shared corpus it does not read")
+	}
+}
+
+// TestMaterializeBaseCorpusLeaseIsWaitable is what the pin buys a writer: a
+// generation-zero mutator or sweep can block on WaitDrain until the readers
+// standing on the bottom of the stack have gone.
+func TestMaterializeBaseCorpusLeaseIsWaitable(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "base-corpus-waitdrain")
+	seedRoutedStack(t, store)
+	materializer := newTestMaterializer(store)
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	bounded, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := materializer.Leases.WaitDrain(bounded, BaseCorpusGeneration); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitDrain(base) while a view is open = %v, want %v", err, context.DeadlineExceeded)
+	}
+	view.Close()
+	if err := materializer.Leases.WaitDrain(ctx, BaseCorpusGeneration); err != nil {
+		t.Fatalf("WaitDrain(base) after Close: %v", err)
+	}
+}
+
+// --- text search is read off the top layer -------------------------------
+
+// textRow is one CapSearchText declaration a generation writes.
+func textRow(state store_sqlite.ProducerState, reason string) store_sqlite.ProducerCompleteness {
+	return store_sqlite.ProducerCompleteness{
+		Producer: string(CapSearchText), State: state, Reason: reason,
+	}
+}
+
+// TestCheckoutCompletenessReadsTextSearchOffTheTopLayer is the reader half of
+// the text-search capability truth, and it is the half that makes the
+// producers' declaration mean anything.
+//
+// The union seeds every capability at StateComplete and only ever worsts, so a
+// stack whose every layer stays silent about text search contributed Complete —
+// which is what a directly selected committed identity is. The producers were
+// made truthful (indexer/builder_generation.go, textSearchProducer: a
+// working-tree layer claims the capability, a ref view withdraws it, every
+// committed layer declares nothing) and the reader threw that away.
+//
+// So for this one capability the TOP layer decides, and silence at the top is a
+// denial. The rows below prove both directions: a committed top stops claiming
+// a search it cannot answer, and a claim on a layer BELOW the top cannot put
+// the claim back — nor can a withdrawal below the top take a live routed
+// checkout's answer away.
+func TestCheckoutCompletenessReadsTextSearchOffTheTopLayer(t *testing.T) {
+	cases := []struct {
+		name   string
+		commit []store_sqlite.ProducerCompleteness
+		dirty  []store_sqlite.ProducerCompleteness
+		routed bool // route the working-tree slot as well as the commit slot
+		want   CapabilityState
+	}{
+		{
+			name:   "a routed working copy claims it and keeps it",
+			commit: nil,
+			dirty:  []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			routed: true,
+			want:   StateComplete,
+		},
+		{
+			name:   "a withdrawal below the working copy does not reach the top",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy")},
+			dirty:  []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			routed: true,
+			want:   StateComplete,
+		},
+		{
+			name:   "a silent working copy is not vouched for",
+			commit: nil,
+			dirty:  nil,
+			routed: true,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a claim below a silent top does not reach the top",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			dirty:  nil,
+			routed: true,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a committed top claims nothing",
+			commit: nil,
+			dirty:  nil,
+			routed: false,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a committed top that withdraws is honoured",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy")},
+			dirty:  nil,
+			routed: false,
+			want:   StateUnavailable,
+		},
+		{
+			name:   "a committed top that claims is honoured too",
+			commit: []store_sqlite.ProducerCompleteness{textRow(store_sqlite.ProducerStateComplete, "")},
+			dirty:  nil,
+			routed: false,
+			want:   StateComplete,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStackStore(t, "top-layer-text")
+			seedStackControlPlane(t, store)
+			commit := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000, tc.commit...)
+			dirty := writeProducerGeneration(t, store, "dirty", stackDirtyLayerID, commit, 3000, tc.dirty...)
+			routedDirty := int64(0)
+			if tc.routed {
+				routedDirty = dirty
+			}
+			routeStack(t, store, commit, routedDirty, store_sqlite.RouteActive)
+
+			view, err := newTestMaterializer(store).MaterializeCheckout(context.Background(), testCheckoutID)
+			if err != nil {
+				t.Fatalf("MaterializeCheckout: %v", err)
+			}
+			defer view.Close()
+
+			if got := view.Completeness.State(CapSearchText); got != tc.want {
+				t.Fatalf("%s = %q, want %q", CapSearchText, got, tc.want)
+			}
+			err = view.Completeness.Evaluate([]CapabilityID{CapSearchText}, nil)
+			switch tc.want {
+			case StateComplete:
+				if err != nil {
+					t.Fatalf("a view that serves %s refused it: %v", CapSearchText, err)
+				}
+			default:
+				if code := CodeOf(err); code != CodeCapabilityUnavailable {
+					t.Fatalf("Evaluate(%s) = %v, want %s", CapSearchText, err, CodeCapabilityUnavailable)
+				}
+			}
+		})
+	}
+}
+
+// TestTopLayerRuleAppliesToTextSearchAlone keeps the change from becoming a
+// rewrite of the union. Every other capability is still worst-cased over the
+// whole stack, so a commit layer that narrowed one still narrows the view —
+// which is what TestMaterializeCheckoutCompletenessTakesTheWorstState is
+// about, asserted here in the same fixture that exercises the text-search
+// exception so the two rules are visibly different rules.
+func TestTopLayerRuleAppliesToTextSearchAlone(t *testing.T) {
+	store := openStackStore(t, "one-capability-only")
+	seedStackControlPlane(t, store)
+	commit := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000,
+		store_sqlite.ProducerCompleteness{
+			Producer: string(CapIncomingEdges),
+			State:    store_sqlite.ProducerStateIncomplete,
+			Reason:   "the commit closure stopped at the file budget",
+		},
+		textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy"))
+	dirty := writeProducerGeneration(t, store, "dirty", stackDirtyLayerID, commit, 3000,
+		store_sqlite.ProducerCompleteness{
+			Producer: string(CapIncomingEdges),
+			State:    store_sqlite.ProducerStateComplete,
+		},
+		textRow(store_sqlite.ProducerStateComplete, ""))
+	routeStack(t, store, commit, dirty, store_sqlite.RouteActive)
+
+	view, err := newTestMaterializer(store).MaterializeCheckout(context.Background(), testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	defer view.Close()
+
+	if got := view.Completeness.State(CapIncomingEdges); got != StateIncomplete {
+		t.Errorf("%s = %q, want %q — the union still worst-cases", CapIncomingEdges, got, StateIncomplete)
+	}
+	if got := view.Completeness.State(CapSearchText); got != StateComplete {
+		t.Errorf("%s = %q, want %q — the top layer decides", CapSearchText, got, StateComplete)
+	}
+}
+
+// TestRefViewCompletenessNeverClaimsTextSearch is the same rule read through
+// the other materialization path. A ref view names a tree no checkout holds,
+// so whether its generation withdrew the capability explicitly or said nothing
+// at all, the view must not claim it.
+func TestRefViewCompletenessNeverClaimsTextSearch(t *testing.T) {
+	cases := []struct {
+		name string
+		rows []store_sqlite.ProducerCompleteness
+	}{
+		{"the generation withdrew it", []store_sqlite.ProducerCompleteness{
+			textRow(store_sqlite.ProducerStateUnavailable, "a committed tree has no working copy to run a text search over"),
+		}},
+		{"the generation said nothing", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStackStore(t, "refview-text")
+			seedStackControlPlane(t, store)
+			generation := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000, tc.rows...)
+
+			view, err := newTestMaterializer(store).MaterializeRefView(context.Background(), testGraphID, generation)
+			if err != nil {
+				t.Fatalf("MaterializeRefView: %v", err)
+			}
+			defer view.Close()
+
+			if got := view.Completeness.State(CapSearchText); got != StateUnavailable {
+				t.Fatalf("%s = %q, want %q", CapSearchText, got, StateUnavailable)
+			}
+			// The withdrawal is about text search and nothing else: a ref view
+			// still serves the graph it was built for.
+			if err := view.Completeness.Evaluate([]CapabilityID{CapSyntaxGraph}, nil); err != nil {
+				t.Errorf("a ref view refused %s as well: %v", CapSyntaxGraph, err)
+			}
+		})
+	}
+}
+
+// TestCompletenessOfAnEmptyStackDeniesTextSearch pins the one row of the
+// top-layer rule that has no layer to read.
+//
+// completeness seeds every known capability at StateComplete and then worsts;
+// for CapSearchText it overwrites that seed with the top layer's declaration
+// instead. When the handle slice is empty there is no top layer, and the
+// honest answer is the denial the rule exists to report — not the seed, which
+// is precisely the false positive it removes. The assignment is therefore
+// unconditional rather than guarded by len(generations) > 0, so this invariant
+// does not depend on generationAncestry happening to refuse an empty list
+// upstream.
+func TestCompletenessOfAnEmptyStackDeniesTextSearch(t *testing.T) {
+	completeness, err := (&Materializer{}).completeness(nil)
+	if err != nil {
+		t.Fatalf("completeness(nil): %v", err)
+	}
+	if got := completeness.State(CapSearchText); got != StateUnavailable {
+		t.Fatalf("an empty stack reports %s = %q, want %q", CapSearchText, got, StateUnavailable)
+	}
+	// And the denial is scoped to the one capability the rule governs: every
+	// other capability still reads off the seed, which is what keeps a stack
+	// that declares nothing from being refused wholesale.
+	for _, id := range KnownCapabilities() {
+		if id == CapSearchText {
+			continue
+		}
+		if got := completeness.State(id); got != StateComplete {
+			t.Errorf("an empty stack reports %s = %q, want %q", id, got, StateComplete)
+		}
+	}
+}
+
+// --- ancestry depth bound ------------------------------------------------
+
+// writeDedicatedChain publishes a dedicated full root plus count-1 deltas over
+// it and returns the generation ids bottom first.
+//
+// Every generation claims its own file, so the composed view can be asked for
+// content that only the BOTTOM generation carries: that is what separates a
+// composition that walked the whole chain from one that silently stopped part
+// way, which is the failure mode the bound must never degrade into.
+func writeDedicatedChain(t testing.TB, store *store_sqlite.Store, count int) []int64 {
+	t.Helper()
+	chain := make([]int64, 0, count)
+	parent := int64(0)
+	for index := range count {
+		file := fmt.Sprintf("%s/chain%d.go", stackRepo, index)
+		parent = writeDedicatedRootGeneration(t, store, fmt.Sprintf("chain-%d", index), parent,
+			[]*graph.Node{
+				dedicatedRootFileNode(file),
+				dedicatedRootSymbol(file, fmt.Sprintf("Chain%d", index), index+1),
+			},
+			[]store_sqlite.FileMask{{RepoPrefix: stackRepo, FilePath: file, Mode: store_sqlite.OwnershipReplace}})
+		chain = append(chain, parent)
+	}
+	return chain
+}
+
+// chainSymbolID names the symbol the generation at index of a writeDedicatedChain
+// stack claims.
+func chainSymbolID(index int) string {
+	return fmt.Sprintf("%s/chain%d.go::Chain%d", stackRepo, index, index)
+}
+
+// TestGenerationAncestryComposesAtTheBoundAndRefusesPastIt pins both halves of
+// the read-time bound. The chain exactly at MaxGenerationAncestryDepth must
+// still compose — and compose completely, down to the root generation's own
+// content — while one generation more is refused with the labelled error
+// rather than served short.
+func TestGenerationAncestryComposesAtTheBoundAndRefusesPastIt(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("at_the_bound_composes_the_whole_chain", func(t *testing.T) {
+		store := openStackStore(t, "ancestry-at-bound")
+		chain := writeDedicatedChain(t, store, MaxGenerationAncestryDepth)
+		seedStackControlPlane(t, store, chain[0])
+		head := chain[len(chain)-1]
+
+		view, err := newTestMaterializer(store).assemble(ctx, testGraphID, stackRepo, []int64{head}, nil)
+		if err != nil {
+			t.Fatalf("assemble a chain of exactly %d generations: %v", MaxGenerationAncestryDepth, err)
+		}
+		defer view.Close()
+		if got := view.Generations(); !slicesEqualInt64(got, chain) {
+			t.Fatalf("composed ancestry=%v, want the whole chain %v", got, chain)
+		}
+		if got := view.GenerationSources(); len(got) != MaxGenerationAncestryDepth {
+			t.Fatalf("composed sources=%d, want one per generation (%d)", len(got), MaxGenerationAncestryDepth)
+		}
+		// The root's content and the head's content both read back: the bound
+		// is a refusal threshold, not a truncation point.
+		for _, index := range []int{0, MaxGenerationAncestryDepth / 2, MaxGenerationAncestryDepth - 1} {
+			if got := view.Reader.GetNode(chainSymbolID(index)); got == nil {
+				t.Errorf("generation %d of %d lost its symbol %q in the composition",
+					index, MaxGenerationAncestryDepth, chainSymbolID(index))
+			}
+		}
+	})
+
+	t.Run("one_past_the_bound_refuses_with_the_labelled_error", func(t *testing.T) {
+		store := openStackStore(t, "ancestry-past-bound")
+		chain := writeDedicatedChain(t, store, MaxGenerationAncestryDepth+1)
+		seedStackControlPlane(t, store, chain[0])
+		head := chain[len(chain)-1]
+
+		view, err := newTestMaterializer(store).assemble(ctx, testGraphID, stackRepo, []int64{head}, nil)
+		if err == nil {
+			view.Close()
+			t.Fatalf("a chain of %d generations composed, want a refusal", MaxGenerationAncestryDepth+1)
+		}
+		var tooDeep *AncestryTooDeepError
+		if !errors.As(err, &tooDeep) {
+			t.Fatalf("refusal is not an *AncestryTooDeepError: %#v", err)
+		}
+		if tooDeep.Generation != head {
+			t.Errorf("labelled generation=%d, want the requested head %d", tooDeep.Generation, head)
+		}
+		if tooDeep.Ancestor != chain[0] {
+			t.Errorf("labelled ancestor=%d, want the generation the walk stopped at (%d)", tooDeep.Ancestor, chain[0])
+		}
+		if tooDeep.Depth != MaxGenerationAncestryDepth+1 {
+			t.Errorf("labelled depth=%d, want %d", tooDeep.Depth, MaxGenerationAncestryDepth+1)
+		}
+		if tooDeep.Limit != MaxGenerationAncestryDepth {
+			t.Errorf("labelled limit=%d, want %d", tooDeep.Limit, MaxGenerationAncestryDepth)
+		}
+		// The wire contract: a stable code callers already switch on, reachable
+		// through both the sentinel and CodeOf.
+		if got := CodeOf(err); got != CodeViewBuilding {
+			t.Errorf("wire code=%q, want %q", got, CodeViewBuilding)
+		}
+		if !errors.Is(err, ErrViewBuilding) {
+			t.Errorf("refusal does not match the %s sentinel", CodeViewBuilding)
+		}
+	})
+
+	t.Run("refusal_survives_the_public_ref_view_entrypoint", func(t *testing.T) {
+		store := openStackStore(t, "ancestry-past-bound-refview")
+		chain := writeDedicatedChain(t, store, MaxGenerationAncestryDepth+1)
+		seedStackControlPlane(t, store, chain[0])
+
+		view, err := newTestMaterializer(store).MaterializeRefView(ctx, testGraphID, chain[len(chain)-1])
+		if err == nil {
+			view.Close()
+			t.Fatal("MaterializeRefView served a chain past the read bound")
+		}
+		var tooDeep *AncestryTooDeepError
+		if !errors.As(err, &tooDeep) {
+			t.Fatalf("MaterializeRefView refusal is not an *AncestryTooDeepError: %#v", err)
+		}
+	})
+}
+
+// TestCheckoutOverAMaximalDedicatedChainComposes is why
+// MaxGenerationAncestryDepth is one more than MaxDedicatedBaseChainDepth
+// rather than equal to it.
+//
+// A checkout's commit generation names the dedicated base as its
+// BaseGenerationID, so routing a checkout over a dedicated chain that the
+// publisher filled right up to its allocation bound walks one generation
+// further than materializing that base directly. A read bound set to the
+// allocation bound would refuse the ordinary steady state of a maximally
+// advanced dedicated graph.
+func TestCheckoutOverAMaximalDedicatedChainComposes(t *testing.T) {
+	store := openStackStore(t, "checkout-over-maximal-chain")
+	seedStackCorpus(t, store)
+	chain := writeDedicatedChain(t, store, MaxDedicatedBaseChainDepth)
+	commit := writeStackCommitGeneration(t, store, chain[len(chain)-1])
+	dirty := writeStackDirtyGeneration(t, store, commit)
+	seedStackControlPlane(t, store, chain[0])
+	routeStack(t, store, commit, dirty, store_sqlite.RouteActive)
+
+	view, err := newTestMaterializer(store).MaterializeCheckout(context.Background(), testCheckoutID)
+	if err != nil {
+		t.Fatalf("materialize a checkout over a maximal dedicated chain: %v", err)
+	}
+	defer view.Close()
+	want := append(slices.Clone(chain), commit, dirty)
+	if got := view.Generations(); !slicesEqualInt64(got, want) {
+		t.Fatalf("composed ancestry=%v, want %v", got, want)
+	}
+	if got := view.Reader.GetNode(chainSymbolID(0)); got == nil {
+		t.Errorf("the dedicated root's own symbol %q did not survive the composition", chainSymbolID(0))
+	}
+}
+
+// TestComposedReadCostByAncestryDepth is the measurement behind the policy
+// number: what one more persisted ancestor actually costs a reader.
+//
+// It is a recorded measurement, not a threshold assertion — the harness runs
+// with GOMAXPROCS=2 on a shared machine, so a timing bound here would be a
+// flake generator. The point is that the numbers exist and are attributable:
+// the chain is otherwise identical at every depth, each generation claims one
+// file, and the probed symbol is the one the BOTTOM generation owns, which is
+// the lookup that pays for every layer above it.
+func TestComposedReadCostByAncestryDepth(t *testing.T) {
+	const lookups = 2000
+	ctx := context.Background()
+	for _, depth := range []int{1, 8, 16, 32} {
+		t.Run(fmt.Sprintf("depth_%d", depth), func(t *testing.T) {
+			store := openStackStore(t, fmt.Sprintf("cost-depth-%d", depth))
+			chain := writeDedicatedChain(t, store, depth)
+			seedStackControlPlane(t, store, chain[0])
+			materializer := newTestMaterializer(store)
+
+			start := time.Now()
+			view, err := materializer.assemble(ctx, testGraphID, stackRepo, []int64{chain[len(chain)-1]}, nil)
+			if err != nil {
+				t.Fatalf("assemble depth %d: %v", depth, err)
+			}
+			defer view.Close()
+			assembled := time.Since(start)
+
+			deepest := chainSymbolID(0)
+			if view.Reader.GetNode(deepest) == nil {
+				t.Fatalf("depth %d lost the root symbol %q", depth, deepest)
+			}
+			start = time.Now()
+			for range lookups {
+				_ = view.Reader.GetNode(deepest)
+			}
+			perNode := time.Since(start) / lookups
+			start = time.Now()
+			for range lookups {
+				_ = view.Reader.GetOutEdges(deepest)
+			}
+			perEdge := time.Since(start) / lookups
+
+			t.Logf("ancestry depth %2d: assemble %8v | GetNode(root symbol) %8v/op | GetOutEdges(root symbol) %8v/op",
+				depth, assembled, perNode, perEdge)
+		})
 	}
 }

@@ -38,6 +38,10 @@ type coordinatorFixture struct {
 	store   *store_sqlite.Store
 	catalog *store_sqlite.Catalog
 	leases  *graphview.LeaseManager
+	// storePath is the file the fixture's store is open on, so a test can
+	// instrument the database itself — see checkout_layer_reuse_test.go, which
+	// counts the writes a reuse makes.
+	storePath string
 
 	// primary is the checkout whose working tree the corpus was indexed from.
 	primary string
@@ -75,12 +79,15 @@ func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 	worktree := filepath.Join(family, coordinatorAdminName)
 	builderGit(t, primary, "worktree", "add", "-b", "feature", worktree)
 
-	store := builderOpenStore(t, "base")
+	storePath := filepath.Join(t.TempDir(), "base.sqlite")
+	store := builderOpenStoreAt(t, storePath)
+	t.Cleanup(func() { _ = store.Close() })
 	builderIndex(t, store, primary)
 
 	f := &coordinatorFixture{
 		t:          t,
 		store:      store,
+		storePath:  storePath,
 		catalog:    store.Catalog(),
 		leases:     graphview.NewLeaseManager(),
 		primary:    primary,
@@ -92,7 +99,31 @@ func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 		treeA:      treeA,
 	}
 	f.writeCatalogIdentity()
+	f.registerRosterOwner(t)
 	return f
+}
+
+// registerRosterOwner puts the fixture's primary repository in the lease
+// manager's registered roster.
+//
+// Production has no other shape: buildCoordinator takes a repository read lease
+// on the primary graph before it constructs anything, so a coordinator only
+// ever exists for a repository the lease manager already holds. The roster is
+// what the generation identity's dependency cohort is enumerated from, so a
+// fixture without it would run every coordinator under a cohort that cannot be
+// described — see TestRefusedCheckoutCohortIsNotReusable, which drives that
+// case deliberately.
+func (f *coordinatorFixture) registerRosterOwner(t testing.TB) {
+	t.Helper()
+	err := f.leases.RegisterRepositoryOwner(graphview.RepositoryOwner{
+		GraphID:     f.graphID,
+		CheckoutID:  f.primaryID,
+		Incarnation: "incarnation-primary",
+		RepoPrefix:  builderRepoPrefix,
+	})
+	if err != nil {
+		t.Fatalf("register the primary repository owner: %v", err)
+	}
 }
 
 // writeCatalogIdentity records what the reconciler would have recorded: the
@@ -175,6 +206,13 @@ func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorCo
 	}
 	cfg.Leases = f.leases
 	cfg.Config = config.Default().Index
+	if cfg.ConfigSections == nil {
+		// What buildCoordinator supplies in production. Without it the
+		// generation identity's dependency cohort is refused for want of the
+		// configuration domains outside config.IndexConfig, and a refused
+		// cohort is deliberately not reusable across coordinators.
+		cfg.ConfigSections = dedicatedBaseConfigSections(config.Default())
+	}
 	cfg.Logger = zap.NewNop()
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = -1
@@ -286,6 +324,28 @@ func coordinatorReconcile(t *testing.T, c *CheckoutCoordinator) CheckoutCycle {
 	if out.Err != nil {
 		t.Fatalf("reconcile: %v", out.Err)
 	}
+	return out
+}
+
+// retirementBacklog reads, without draining, the generations this coordinator
+// owes a retirement for — the set offerRetire files when the catalog refuses a
+// retire.
+//
+// It is the only place a refused offer is observable. A retire the route
+// refuses leaves the generation row untouched, so a coordinator that offered a
+// layer it had no business offering looks identical in the catalog to one that
+// never offered it; the difference is here, and it matters because the backlog
+// is exactly what SweepRetirements retries the moment the refusal lifts.
+// DrainRetirements would answer the same question but empties the set, which a
+// test that wants to assert an absence must not do.
+func (c *CheckoutCoordinator) retirementBacklog() []int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]int64, 0, len(c.backlog))
+	for generationID := range c.backlog {
+		out = append(out, generationID)
+	}
+	slices.Sort(out)
 	return out
 }
 
@@ -1008,6 +1068,13 @@ func TestCoordinatorKeepsThePreviousRouteWhenEveryBuildIsTorn(t *testing.T) {
 // TestCoordinatorRescheduleWhenTheRouteMovesUnderIt pins the compare-and-set:
 // a second coordinator on the same checkout is a legal thing to exist, and the
 // one that loses the flip must leave the winner's route alone.
+//
+// It also pins what the loser does with the layer it resolved. Since the
+// catalog-backed lookup landed, the loser reaches the flip holding the WINNER's
+// generation — same tree, same base, same identity — rather than a duplicate it
+// indexed itself. A cycle that loses a flip must therefore distinguish a layer
+// it built (supersede and offer it) from one it merely routed (leave it alone),
+// which is the `reused` arm of reconcileCommitSlot's error path.
 func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	f := newCoordinatorFixture(t)
 
@@ -1029,6 +1096,20 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	if won.CommitGenerationID == 0 {
 		t.Fatalf("the winner routed nothing: %+v", won)
 	}
+	// The exact row the winner published, read BEFORE the losing cycle. The
+	// assertions below compare against this snapshot rather than against
+	// "still servable", because servableGeneration accepts superseded by
+	// design (checkout_coordinator.go: a route may name a superseded
+	// generation) — so a supersede the loser had no business issuing would
+	// pass a servability check unnoticed.
+	beforeLoss, found := f.generation(won.CommitGenerationID)
+	if !found {
+		t.Fatalf("the winner's generation %d is not in the catalog", won.CommitGenerationID)
+	}
+	if beforeLoss.State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("the winner published generation %d in state %s, want ready",
+			beforeLoss.GenerationID, beforeLoss.State)
+	}
 
 	head := builderGit(t, f.worktree, "rev-parse", "HEAD^{tree}")
 	var out CheckoutCycle
@@ -1039,8 +1120,43 @@ func TestCoordinatorRescheduleWhenTheRouteMovesUnderIt(t *testing.T) {
 	if !errors.Is(err, errRouteMoved) {
 		t.Fatalf("the loser failed with %v, want a lost route flip", err)
 	}
-	if !out.CommitBuilt {
-		t.Fatalf("the loser did not build before losing the flip: %+v", out)
+	// The loser resolved a layer before it tried to flip — and since the winner
+	// had just published one with this exact identity, resolving it means
+	// routing that one, not indexing the same tree a second time. (Neither
+	// CommitBuilt nor CommitReused is set on a lost flip: the cycle routed
+	// nothing, and CommitReused is what a cycle that DID route a cached layer
+	// reports. What the flag says here is only that no build happened.)
+	if out.CommitBuilt {
+		t.Fatalf("the loser re-indexed the tree the winner had just published: %+v", out)
+	}
+	// What it reused is the winner's own generation, and a lost flip has to
+	// leave it exactly where it found it. Superseding or retiring a layer this
+	// cycle did not build would pull it out from under the route that won.
+	//
+	// Both halves of the `!reused` arm are pinned separately, because neither
+	// is observable through "is it still servable":
+	//
+	//   supersede — moves ready -> superseded, a state servableGeneration
+	//     still accepts. Only the state comparison against the pre-loss
+	//     snapshot catches it.
+	//   offerRetire — the winning route names the generation, so the catalog
+	//     refuses the retire with ErrCatalogGenerationReferenced and the row
+	//     does not change. What DOES change is the loser's own retirement
+	//     backlog: offerRetire files every refusal there for the janitor to
+	//     retry, so a generation this cycle never built showing up on the
+	//     loser's backlog is the refusal's fingerprint. It would be collected
+	//     the moment the route moved off it.
+	afterLoss, found := f.generation(won.CommitGenerationID)
+	if !found {
+		t.Fatalf("the lost flip removed the winner's routed generation %d", won.CommitGenerationID)
+	}
+	if afterLoss.State != beforeLoss.State {
+		t.Fatalf("the lost flip moved the winner's generation %d from %s to %s",
+			won.CommitGenerationID, beforeLoss.State, afterLoss.State)
+	}
+	if owed := loser.retirementBacklog(); slices.Contains(owed, won.CommitGenerationID) {
+		t.Fatalf("the loser offered the winner's routed generation %d for retirement (backlog %v)",
+			won.CommitGenerationID, owed)
 	}
 
 	route := f.route()
@@ -1140,8 +1256,20 @@ func TestCoordinatorNeverRoutesAWorkingTreeLayerOverAnotherTree(t *testing.T) {
 		t.Fatalf("the routed working-tree generation sits on %d, not on the routed commit generation %d",
 			row.BaseGenerationID, settled.CommitGenerationID)
 	}
-	if _, found := f.generation(first.DirtyGenerationID); found {
-		t.Fatalf("the withdrawn working-tree generation %d was left behind", first.DirtyGenerationID)
+	// The withdrawn layer is retained rather than collected: it describes a
+	// working tree over the commit layer it names, and that pair is exactly
+	// what a switch back to this tree composes again. What has to stay true is
+	// that nothing ROUTES it any more and that it is still reachable for
+	// collection — a payload nothing can name is a leak, and a retained one is
+	// handed back on the way back (dirty_layer_reuse_test.go), offered when
+	// the cache evicts it, and drained when the coordinator is torn down.
+	if settled.DirtyGenerationID == first.DirtyGenerationID {
+		t.Fatalf("the route still names the withdrawn working-tree generation %d",
+			first.DirtyGenerationID)
+	}
+	if !slices.Contains(c.DrainRetirements(), first.DirtyGenerationID) {
+		t.Fatalf("the withdrawn working-tree generation %d is neither collected nor reachable for collection",
+			first.DirtyGenerationID)
 	}
 }
 
@@ -1344,9 +1472,16 @@ func TestCoordinatorLeavesAGenerationAnotherCheckoutRoutes(t *testing.T) {
 // TestCoordinatorRetiresAReplacedGenerationOnceItIsUnleased pins the lease
 // integration: the generation a route left is collectable, and a live view
 // holding it is what stops the collection until the view closes.
+//
+// The working-tree layer a route leaves is now RETAINED for an undo rather
+// than offered for collection straight away, so the offer this test is about
+// is the one the reuse cache makes when it evicts. A cache one layer deep is
+// what puts the replaced generation on the retirement path immediately, which
+// is the state this test has always been describing; the retention policy
+// itself is pinned by dirty_layer_reuse_test.go.
 func TestCoordinatorRetiresAReplacedGenerationOnceItIsUnleased(t *testing.T) {
 	f := newCoordinatorFixture(t)
-	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Retain: 1})
 
 	first := coordinatorReconcile(t, c)
 	materializer := &graphview.Materializer{Store: f.store, Catalog: f.catalog, Leases: f.leases}
@@ -1521,11 +1656,12 @@ func TestCommitLayerReaderUsesRecordedNonzeroBase(t *testing.T) {
 		t.Fatalf("PublishPayloadGeneration(commit): %v", err)
 	}
 
-	coordinator := &CheckoutCoordinator{store: f.store, catalog: f.catalog}
-	reader, err := coordinator.commitLayerReader(ctx, commitGeneration)
+	coordinator := &CheckoutCoordinator{store: f.store, catalog: f.catalog, leases: f.leases, logger: zap.NewNop()}
+	reader, release, err := coordinator.commitLayerReader(ctx, commitGeneration)
 	if err != nil {
 		t.Fatalf("commitLayerReader: %v", err)
 	}
+	defer release()
 	if got := reader.GetNode(nodeID); got == nil || got.StartLine != 5 {
 		t.Fatalf("unchanged node = %+v, want catalog-recorded base line 5", got)
 	}
@@ -1937,5 +2073,215 @@ func TestSweepCollectsCrashOrphanedGenerations(t *testing.T) {
 	}
 	if after := f.route(); after != routed {
 		t.Fatalf("the route moved under the sweep: %+v, want %+v", after, routed)
+	}
+}
+
+// movePrimaryHead advances the primary checkout's recorded committed tree,
+// which is what a committed-base advance looks like to every dependent in the
+// family: graphBase reads the owner checkout's head when the primary graph has
+// no published generation, and AdoptDedicatedBaseGeneration writes that same
+// column when it has.
+func (f *coordinatorFixture) movePrimaryHead(t *testing.T, tree string) {
+	t.Helper()
+	row, found, err := f.catalog.GetCheckout(context.Background(), f.primaryID)
+	if err != nil || !found {
+		t.Fatalf("read the primary checkout: found=%v err=%v", found, err)
+	}
+	err = f.catalog.UpdateCheckoutObservation(context.Background(), store_sqlite.UpdateCheckoutObservationRequest{
+		CheckoutID: row.CheckoutID, Incarnation: row.Incarnation, State: row.State,
+		RootPath: row.RootPath, GitDir: row.GitDir,
+		HeadRef: row.HeadRef, HeadCommit: row.HeadCommit, HeadTree: tree,
+		LastAccessible: row.LastAccessible, LastSeen: row.LastSeen + 60,
+	})
+	if err != nil {
+		t.Fatalf("move the primary's committed tree: %v", err)
+	}
+}
+
+// TestAnUnpublishedPrimaryAsksTheFamilyForItsCommittedBase is the on-demand
+// half of the committed-base consumer gate, at the site that first notices the
+// absence.
+//
+// The startup publisher and the live advance trigger both decline to publish a
+// committed base for a family with no reader. This coordinator IS that reader
+// — it exists only for a ready automatic checkout — so when graphBase's second
+// arm answers (no published generation; the base is the owner's recorded tree)
+// the publication has to be asked for here or it never happens at all.
+//
+// The throttle is asserted with it, because the ask sits on a path the 15 s
+// poll takes: settledWithoutBuild reads primaryBase on every no-op cycle, and
+// a demand per poll would re-enter the whole publication protocol — authority
+// claim included, which writes — four times a minute.
+//
+// Revert-red: delete the demandCommittedBase call from primaryBase and the
+// first assertion fails; delete the throttle and the second one does.
+func TestAnUnpublishedPrimaryAsksTheFamilyForItsCommittedBase(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var asked []string
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{
+		RequestBase: func(prefix string) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked = append(asked, prefix)
+		},
+	})
+
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("read the primary base: %v", err)
+	}
+	if base.generationID != 0 {
+		t.Fatalf("the fixture's premise is an unpublished primary; it has generation %d", base.generationID)
+	}
+	mu.Lock()
+	first := slices.Clone(asked)
+	mu.Unlock()
+	if len(first) != 1 || first[0] != builderRepoPrefix {
+		t.Fatalf("an unpublished primary asked for %v, want exactly [%s]", first, builderRepoPrefix)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, err := c.primaryBase(ctx); err != nil {
+			t.Fatalf("re-read the primary base: %v", err)
+		}
+	}
+	mu.Lock()
+	repeated := slices.Clone(asked)
+	mu.Unlock()
+	if len(repeated) != 1 {
+		t.Fatalf("five reads inside the throttle window asked %d times, want 1: %v", len(repeated), repeated)
+	}
+}
+
+// TestAPublishedPrimaryAsksForNothing is the gate's other side at this site. A
+// family that already has a committed base has nothing to demand, and a
+// coordinator that asked anyway would re-enter the publication protocol on
+// every poll of every dependent for the life of the daemon.
+func TestAPublishedPrimaryAsksForNothing(t *testing.T) {
+	f := newCommittedBaseFixture(t)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	asks := 0
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{
+		RequestBase: func(string) {
+			mu.Lock()
+			defer mu.Unlock()
+			asks++
+		},
+	})
+
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("read the primary base: %v", err)
+	}
+	if base.generationID == 0 {
+		t.Fatal("the fixture's premise is a published primary; it has none")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if asks != 0 {
+		t.Fatalf("a published primary was asked for a committed base %d times", asks)
+	}
+}
+
+// TestCoordinatorRefusesACommitLayerOverAMovedBase is the base half of the
+// guard TestCoordinatorRefusesAWorkingTreeLayerOverAStaleHead makes for the
+// checkout's own HEAD.
+//
+// A cycle reads the primary's committed base once and builds a layer whose
+// identity names it — the base tree is the left-hand side of the layer's diff
+// and is stamped on the generation as its lower_view_fingerprint. The primary
+// is free to publish a new committed base while that build runs, and routing
+// the result afterwards serves this checkout's OLD delta over the family's NEW
+// base: the paths that moved between the two bases and are not in the delta
+// show through as this checkout's content. The cycle refuses instead, leaves
+// the route on the pair it already serves, and asks for another window.
+//
+// The halves are driven by hand for the same reason the HEAD-move test drives
+// them: the interleaving IS the test.
+func TestCoordinatorRefusesACommitLayerOverAMovedBase(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+
+	// A first cycle brings the checkout up over the base both checkouts share.
+	settled := coordinatorReconcile(t, c)
+	if settled.CommitGenerationID == 0 || settled.DirtyGenerationID == 0 {
+		t.Fatalf("the first cycle did not route a pair: %+v", settled)
+	}
+	routed, found := f.generation(settled.CommitGenerationID)
+	if !found || routed.LowerViewFingerprint != f.treeA || routed.TreeOID != f.treeA {
+		t.Fatalf("the routed commit layer is not the tree-A-over-tree-A pair: %+v", routed)
+	}
+	before := f.route()
+
+	// The checkout commits, and the primary publishes a different committed
+	// base while the layer for the checkout's new tree is being built. The
+	// cycle is still holding the base it read at its start.
+	treeB := f.commitTreeB()
+	stale, err := c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("primaryBase: %v", err)
+	}
+	f.movePrimaryHead(t, treeB)
+
+	route := before
+	var out CheckoutCycle
+	generation, err := c.reconcileCommitSlot(ctx, stale, treeB, &route, &out)
+	if !errors.Is(err, errBaseMoved) {
+		t.Fatalf("reconcileCommitSlot over a moved base = (%d, %v), want errBaseMoved", generation, err)
+	}
+	if !out.Rescheduled || out.CommitBuilt || out.CommitReused {
+		t.Fatalf("the refusal reported a settled slot: %+v", out)
+	}
+	if len(c.signal) != 1 {
+		t.Fatal("the coordinator did not signal itself for another window")
+	}
+
+	// The old route is still served, and it is still a coherent pair: the same
+	// commit generation, over the same base it was built against, with the same
+	// working-tree layer on top. Nothing was spliced.
+	stored := f.route()
+	if stored.CommitGenerationID != before.CommitGenerationID ||
+		stored.DirtyGenerationID != before.DirtyGenerationID ||
+		stored.RouteEpoch != before.RouteEpoch {
+		t.Fatalf("the refused cycle moved the route: %+v, was %+v", stored, before)
+	}
+	if !graphview.RouteReady(stored) {
+		t.Fatalf("the refused cycle left the route unable to serve: %+v", stored)
+	}
+	still, found := f.generation(stored.CommitGenerationID)
+	if !found || still.LowerViewFingerprint != f.treeA {
+		t.Fatalf("the served commit layer no longer names the base it was built over: %+v", still)
+	}
+
+	// Nothing built over the base that was left is routable: the layer the
+	// refusal abandoned is not the one the route names, and it is not servable.
+	for _, row := range f.generations() {
+		if row.GenerationKind != CommitLayerGenerationKind || row.GenerationID == stored.CommitGenerationID {
+			continue
+		}
+		if row.LowerViewFingerprint == f.treeA && row.TreeOID == treeB && servableGeneration(row.State) {
+			t.Fatalf("a layer built over the base the family left is still servable: %+v", row)
+		}
+	}
+
+	// The next cycle is what settles it, over the base that is current. Every
+	// routed pair names one base: never the new base under the old delta.
+	recomposed := coordinatorReconcile(t, c)
+	if !recomposed.CommitBuilt && !recomposed.CommitReused {
+		t.Fatalf("the follow-up cycle did not settle the commit slot: %+v", recomposed)
+	}
+	row, found := f.generation(recomposed.CommitGenerationID)
+	if !found || row.LowerViewFingerprint != treeB || row.TreeOID != treeB {
+		t.Fatalf("the recomposed layer pairs base %q with tree %q, want both at the current base",
+			row.LowerViewFingerprint, row.TreeOID)
+	}
+	if !graphview.RouteReady(f.route()) {
+		t.Fatalf("the checkout did not come back up: %+v", f.route())
 	}
 }

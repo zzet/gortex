@@ -427,6 +427,15 @@ func (r *Reconciler) reconcileKnown(
 // came back" means: the row was matched by (family, admin name) and its
 // incarnation never changed, so whatever the pass thought was removed is the
 // very thing that just answered.
+//
+// The head tree is the one observed fact this pass will not state unless it
+// actually learned it. Ref and commit come from the inventory that listed the
+// worktree, so the pass has them either way; the tree comes only from a live
+// `git` sample of the working copy. Since the committed-base publisher advances
+// the same column when it adopts, a pass that wrote "" for a sample it could
+// not take would be demolishing a published base identity rather than observing
+// one — so an unsampled pass leaves the recorded tree exactly as it found it
+// (observationFrom has already seeded it) and the next pass states it.
 func (r *Reconciler) applyPresent(
 	ctx context.Context,
 	pass *familyPass,
@@ -445,7 +454,11 @@ func (r *Reconciler) applyPresent(
 	req.GitDir = pass.gitDirFor(record)
 	req.Locked = record.Locked
 	req.Prunable = record.Prunable
-	req.HeadRef, req.HeadCommit, req.HeadTree = r.headFor(ctx, record)
+	ref, commit, tree, sampled := r.headFor(ctx, record)
+	req.HeadRef, req.HeadCommit = ref, commit
+	if sampled {
+		req.HeadTree = tree
+	}
 	req.LastError = ""
 
 	switch {
@@ -602,7 +615,7 @@ func (r *Reconciler) observeNew(
 		LastAccessible: pass.now.Unix(),
 		LastSeen:       pass.now.Unix(),
 	}
-	checkout.HeadRef, checkout.HeadCommit, checkout.HeadTree = r.headFor(ctx, record)
+	checkout.HeadRef, checkout.HeadCommit, checkout.HeadTree, _ = r.headFor(ctx, record)
 	if err := r.catalog.AllocateCheckout(ctx, checkout); err != nil {
 		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
 			// Another actor allocated this administrative name between this
@@ -735,14 +748,24 @@ func (r *Reconciler) recordClassification(
 // inventory already reported. The inventory carries a ref and a commit but no
 // tree, so a successful sample is the only way the tree oid gets filled in;
 // a failed one is not worth failing the pass over.
-func (r *Reconciler) headFor(ctx context.Context, record *gitstate.WorktreeRecord) (ref, commit, tree string) {
+//
+// sampled separates the two ways the tree comes back empty. A working copy that
+// answered and has no tree is an unborn branch — a fact, and one worth writing.
+// A root that could not be reached, or a sample that failed, said nothing at
+// all, and the tree it did not report is not evidence that the checkout has
+// none. The caller needs the difference because the committed base publisher
+// now writes the same column (AdoptDedicatedBaseGeneration): a pass that
+// answered "" for want of a successful `git` call would otherwise erase a base
+// identity the publisher had just recorded, and every dependent worktree in the
+// family keys its layers on that column.
+func (r *Reconciler) headFor(ctx context.Context, record *gitstate.WorktreeRecord) (ref, commit, tree string, sampled bool) {
 	ref, commit = record.HEADRef, record.HEADOID
 	if !record.RootAccessible {
-		return ref, commit, ""
+		return ref, commit, "", false
 	}
 	state, err := r.sampleHEAD(ctx, record.Path)
 	if err != nil {
-		return ref, commit, ""
+		return ref, commit, "", false
 	}
 	if state.Ref != "" {
 		ref = state.Ref
@@ -750,7 +773,7 @@ func (r *Reconciler) headFor(ctx context.Context, record *gitstate.WorktreeRecor
 	if state.CommitOID != "" {
 		commit = state.CommitOID
 	}
-	return ref, commit, state.TreeOID
+	return ref, commit, state.TreeOID, true
 }
 
 // gitDirFor spells out a record's own git directory. The main worktree reads

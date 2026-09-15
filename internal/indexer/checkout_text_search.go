@@ -24,6 +24,19 @@ import (
 // searches never pays for an index — and it is keyed by the working tree it
 // was built for, so the next search after an edit rebuilds it instead of
 // answering out of stale postings.
+//
+// What that means for the capability a generation declares is the other half of
+// this file's contract, and it lives at textSearchProducer in
+// builder_generation.go: the bytes below are the working copy's, so only the
+// layer that IS the working copy claims graphview.CapSearchText, and the layers
+// under it say nothing rather than narrowing a stack they do not answer for.
+//
+// The claim a generation cannot make is made here instead. Whether an answer
+// off this root describes the view a caller is reading is a property of the
+// checkout's ROUTE, not of any one generation in its stack — the same commit
+// layer is served both with a working-tree layer over it and, for the window a
+// commit slot is being moved, alone. GrepCheckout reads the route and refuses
+// the second case.
 
 // CheckoutTextQuery is one text search over a routed checkout's working tree.
 type CheckoutTextQuery struct {
@@ -45,10 +58,17 @@ type CheckoutTextQuery struct {
 // GrepCheckout runs a text search over one routed checkout's working tree and
 // reports whether anything served it.
 //
-// served is false when no coordinator holds the checkout. That is the whole of
-// the answer rather than a reason to look elsewhere: nothing else in the daemon
-// indexes that working copy, and the canonical checkout's bytes describe a
-// different tree.
+// served is false in two cases, and neither is a reason to look elsewhere:
+// nothing else in the daemon indexes that working copy, and the canonical
+// checkout's bytes describe a different tree.
+//
+//   - No coordinator holds the checkout, so no searcher exists for it.
+//   - The checkout is routed, and its route names no working-tree layer. The
+//     view a caller reads in that window is the committed tree alone, and this
+//     root is free to hold edits that tree does not contain; answering would
+//     return lines the view does not have.
+//   - The checkout has no route at all, so nothing has published a view of it
+//     and no layer vouches for what is on the root.
 func (l *CheckoutLifecycle) GrepCheckout(ctx context.Context, q CheckoutTextQuery) ([]trigram.Match, bool, error) {
 	if l == nil || q.CheckoutID == "" || q.Query == "" {
 		return nil, false, nil
@@ -59,6 +79,13 @@ func (l *CheckoutLifecycle) GrepCheckout(ctx context.Context, q CheckoutTextQuer
 	if coordinator == nil {
 		return nil, false, nil
 	}
+	describes, err := coordinator.routeDescribesTheWorkingCopy(ctx)
+	if err != nil {
+		return nil, true, err
+	}
+	if !describes {
+		return nil, false, nil
+	}
 	searcher, err := coordinator.textSearcher(ctx)
 	if err != nil {
 		return nil, true, err
@@ -67,6 +94,39 @@ func (l *CheckoutLifecycle) GrepCheckout(ctx context.Context, q CheckoutTextQuer
 		return searcher.GrepRegexp(q.Regexp, extractRegexLiterals(q.Query), "", q.Limit), true, nil
 	}
 	return searcher.Grep(q.Query, q.Limit), true, nil
+}
+
+// routeDescribesTheWorkingCopy reports whether some routed layer of this
+// checkout describes the bytes on its root.
+//
+// The working-tree slot is that layer. A coordinator withdraws it whenever the
+// commit slot moves under it (checkout_coordinator.go, moveCommitSlot and
+// clearDirtySlot both flip the route to RoutePending with
+// DirtyGenerationID = 0), and a view materialized in that window is the commit
+// layer alone: graphview's MaterializeCheckout appends the dirty generation
+// only when the route names one, and it serves a pending route. Searching this
+// root for that view would answer with the working copy's uncommitted lines,
+// which the committed tree the caller is reading does not contain — so nothing
+// serves it, and the caller is told that rather than shown them.
+//
+// A checkout with no route at all is refused too, and this arm is the reason
+// the gate is a predicate on the route rather than on the generation: an
+// unrouted checkout has published nothing, so there is no evidence that any
+// layer describes what is on the root. The only production caller reaches
+// this through a materialized view, which cannot exist without a route
+// (graphview's Materializer.route refuses an unrouted checkout with
+// CodeCheckoutInaccessible), so no live request loses an answer here — and a
+// future caller that arrives without one gets a refusal rather than a raw
+// working-copy answer that no view vouches for.
+func (c *CheckoutCoordinator) routeDescribesTheWorkingCopy(ctx context.Context) (bool, error) {
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil {
+		return false, fmt.Errorf("indexer: read the route of checkout %q: %w", c.checkoutID, err)
+	}
+	if !found {
+		return false, nil
+	}
+	return route.DirtyGenerationID > 0, nil
 }
 
 // textSearcher returns the checkout's trigram searcher, building it when there
