@@ -4125,6 +4125,16 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 }
 
 func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *ResolveStats) {
+	// A restubbed C# using-static bind keeps its tag through the restub;
+	// the tier re-stamps it on a rebind, and nothing else may inherit it.
+	csharpDropStaleUsingStaticTag(e)
+	// A C# simple name the caller's own declaration space binds (local
+	// function, delegate parameter, local) is that binding, which no tier
+	// below can point at — the stub stays, honestly unresolved.
+	if csharpLocalShadowed(e) {
+		stats.Unresolved++
+		return
+	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
 	if len(candidates) == 0 {
@@ -4231,6 +4241,17 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 			e.Confidence = 0.9
 		}
 		stats.Resolved++
+		return
+	}
+
+	// C# `using static Ns.Cls;` puts Cls's static members in scope by
+	// simple name — an explicit directive naming the owner, which
+	// outranks every locality tier below (directory means nothing in
+	// C#). Behind the same-file pick on purpose: the graph records no
+	// outer-type chain, and a nested type's call to an enclosing type's
+	// static member is exactly what the same-file tier already binds
+	// right. Member calls never take it — they carry a receiver.
+	if !csharpMember && r.csharpBindUsingStaticCall(e, funcName, candidates, stats) {
 		return
 	}
 

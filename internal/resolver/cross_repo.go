@@ -1269,6 +1269,14 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 		stats.Unresolved++
 		return
 	}
+	// A C# simple name the caller's own declaration space binds (local
+	// function, delegate parameter, local) has no in-graph callee; the
+	// per-repo pass left it unresolved on purpose and the same-repo tier
+	// below must not overturn that with a name-only pick.
+	if csharpLocalShadowed(e) {
+		stats.Unresolved++
+		return
+	}
 
 	callerRepo := cr.callerRepoPrefix(e)
 	callerWS := cr.callerWorkspaceID(e)

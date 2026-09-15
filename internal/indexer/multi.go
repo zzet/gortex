@@ -3334,6 +3334,24 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		mi.mu.Unlock()
 		installed = true
 
+		// Warm routes other than census_noop (which restores via
+		// cleanCensusResult) and full_retrack (which publishes via
+		// indexCtxRaw) never publish to the vector channel, leaving a
+		// daemon with a durable corpus serving text-only (#790).
+		// Restore the durable corpus so the shared search backend
+		// carries the hybrid on every warm route.
+		if mi.embedder != nil && route != "census_noop" && route != "full_retrack" {
+			restored, rErr := idx.restoreDurableVectorBackend(ctx, mi.graph)
+			switch {
+			case rErr != nil:
+				mi.logger.Warn("durable vector restore after warm reconcile failed",
+					zap.String("repo", prefix), zap.String("route", route), zap.Error(rErr))
+			case restored:
+				mi.logger.Info("restored durable vector corpus after warm reconcile",
+					zap.String("repo", prefix), zap.String("route", route))
+			}
+		}
+
 		entry.Path = absPath
 		if err := mi.configMgr.Global().AddRepo(entry); err != nil {
 			mi.logger.Warn("failed to add repo to config", zap.Error(err))

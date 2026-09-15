@@ -174,6 +174,13 @@ func csharpCollectExtraBindingScopes(root *sitter.Node, src []byte, funcRanges *
 			// parameters are invisible to paramsByOwner - this index is
 			// the only place they can refuse anything.
 			addParams(n.ChildByFieldName("parameters"), spanOf(n))
+			// The local function's own NAME is a member of the enclosing
+			// block's declaration space, in scope over the whole block
+			// (before its declaration too), and it shadows a same-named
+			// field or method exactly like a local does. Recorded here so a
+			// receiverless call to it can be stamped as locally bound - the
+			// resolver would otherwise hand it to an outer candidate.
+			add(n.ChildByFieldName("name"), csharpLocalScopeOf(n.Parent()))
 		case "catch_declaration":
 			// The catch variable binds over its catch clause.
 			sc := spanOf(n)

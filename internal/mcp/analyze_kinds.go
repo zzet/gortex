@@ -270,7 +270,7 @@ var analyzeKindDescriptions = map[string]string{
 	"models":                      "ORM model→table edges (gorm/SQLAlchemy/Django/ActiveRecord/JPA/TypeORM/Ecto); orm/table/model filters",
 	"named":                       "Run a named query bundle — built-ins cover sql-injection/xss/ssrf/hardcoded-secrets/…; repo bundles from .gortex.yaml",
 	"orphan_tables":               "Tables queried but missing a migration that provides them",
-	"ownership":                   "Per-author rollup with symbol/file counts and oldest/newest timestamps",
+	"ownership":                   "Per-author rollup with symbol/file counts and oldest/newest timestamps. An empty or partial answer carries data_state saying whether blame was ever mined for the scope — a zero without it is not absence evidence",
 	"pagerank":                    "PageRank centrality — symbols ranked by random-walk authority",
 	"pubsub":                      "Pub/sub topics with publishers + subscribers (NATS/Kafka/RabbitMQ/Redis/EventEmitter/Socket.IO)",
 	"race_writes":                 "Concurrent-write race detection",

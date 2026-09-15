@@ -41,6 +41,37 @@ type reuseVal struct {
 	confLabel  string
 	origin     string
 	tier       string
+	// resolution is the C# visibility tag (extension_method or
+	// using_static) when the captured bind carries one. It rides the reuse
+	// because the visibility restub (restubCSharpExtensionBinds) finds the
+	// edges to re-price BY this tag: a reused bind that lost it would never
+	// be re-priced again. Every other resolver-authored tag is left to the
+	// fresh resolve, as before.
+	resolution string
+}
+
+// reuseResolutionTag reads the provenance tag a reuse must carry —
+// exactly the two the visibility restub consumes, nothing else.
+func reuseResolutionTag(e *graph.Edge) string {
+	if e == nil || e.Meta == nil {
+		return ""
+	}
+	switch res, _ := e.Meta["resolution"].(string); res {
+	case "extension_method", "using_static":
+		return res
+	}
+	return ""
+}
+
+// applyReuseResolutionTag re-stamps a reused edge with its captured tag.
+func applyReuseResolutionTag(e *graph.Edge, res string) {
+	if res == "" {
+		return
+	}
+	if e.Meta == nil {
+		e.Meta = map[string]any{}
+	}
+	e.Meta["resolution"] = res
 }
 
 // captureIncrementalState snapshots, in one walk of the file's outgoing edges:
@@ -123,6 +154,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 				confLabel:  e.ConfidenceLabel,
 				origin:     e.Origin,
 				tier:       e.Tier,
+				resolution: reuseResolutionTag(e),
 			}
 		}
 	}
@@ -201,6 +233,7 @@ func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]
 		e.ConfidenceLabel = v.confLabel
 		e.Origin = v.origin
 		e.Tier = v.tier
+		applyReuseResolutionTag(e, v.resolution)
 		reused++
 	}
 	return reused
@@ -270,9 +303,12 @@ func csharpVisibilityStampForNodes(nodes []*graph.Node) csharpVisibilityStamp {
 // visibility also feeds type-reference narrowing, whose already-
 // resolved edges are NOT restubbed (known simplification — a global
 // using swap between same-named types keeps the old type-ref target
-// until the referencing file is next edited). The edges keep their
-// receiver stamps and the extension tag, which routes them straight
-// back through the rule.
+// until the referencing file is next edited). Same simplification for a
+// directive ADDED to a warm store: a receiverless call the locality
+// cascade already bound (untagged) is not re-priced by the new
+// `global using static` until its file is next edited or the store is
+// rebuilt. The edges keep their receiver stamps and the tag, which
+// routes them straight back through their rule.
 func (idx *Indexer) restubCSharpExtensionBinds(files []string) int {
 	var batch []graph.EdgeReindex
 	for _, f := range files {
@@ -294,7 +330,10 @@ func (idx *Indexer) restubCSharpExtensionBinds(files []string) int {
 				if e == nil || e.Meta == nil || e.To == "" || graph.IsUnresolvedTarget(e.To) {
 					continue
 				}
-				if res, _ := e.Meta["resolution"].(string); res != "extension_method" {
+				// The using-static bind of a receiverless call is priced
+				// by the same visibility — a `global using static` swap
+				// re-prices it exactly like an extension bind.
+				if res, _ := e.Meta["resolution"].(string); res != "extension_method" && res != "using_static" {
 					continue
 				}
 				extEdges = append(extEdges, e)

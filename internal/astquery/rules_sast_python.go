@@ -1,6 +1,9 @@
 package astquery
 
-import "github.com/zzet/gortex/internal/parser"
+import (
+	"github.com/zzet/gortex/internal/parser"
+	sitter "github.com/zzet/gortex/internal/parser/tsitter"
+)
 
 // Bandit-parity Python SAST ruleset. Patterns target the tree-sitter
 // Python grammar; capture names follow the convention
@@ -822,6 +825,7 @@ func registerPythonSQLi() {
                                 arguments: (argument_list (string (interpolation)))) @match
                               (#match? @fn "^(execute|executemany|raw|fetch|fetchall|fetchone)$"))`,
 			},
+			PostFilter: fstringInterpolatesNonConstant,
 		},
 		sastRule{
 			Name:        "py-sqlalchemy-text-with-fstring",
@@ -835,8 +839,129 @@ func registerPythonSQLi() {
                                 arguments: (argument_list (string (interpolation)))) @match
                               (#eq? @fn "text"))`,
 			},
+			PostFilter: fstringInterpolatesNonConstant,
 		},
 	)
+}
+
+// fstringInterpolatesNonConstant keeps an f-string SQLi match unless every
+// `{expr}` in the call's f-string arguments is a constant by PEP 8
+// convention. SQL placeholders cannot bind identifiers, so column lists
+// and table names are routinely interpolated from module constants:
+//
+//	COLUMNS = "id, name"
+//	conn.execute(f"SELECT {COLUMNS} FROM t WHERE id = ?", (i,))
+//
+// An expression counts as constant when it is an UPPER_CASE name or an
+// attribute ending in one (`schema.COLUMNS`), or a name bound by an
+// enclosing `for` over such a constant within the same function:
+//
+//	for column, sql_type in _ADDED_COLUMNS:
+//	    conn.execute(f"ALTER TABLE t ADD COLUMN {column} {sql_type}")
+//
+// Anything else — a parameter, a call, a subscript, a lower-case name —
+// keeps the match. The check is syntactic: a constant reassigned from user
+// input is not detected, which is the convention's own failure mode.
+func fstringInterpolatesNonConstant(qr parser.QueryResult, src []byte) bool {
+	m, ok := qr.Captures["match"]
+	if !ok || m.Node == nil {
+		return true
+	}
+	args := m.Node.ChildByFieldName("arguments")
+	if args == nil {
+		return true
+	}
+	for arg := range args.NamedChildren() {
+		if arg.Type() != "string" {
+			continue
+		}
+		for part := range arg.NamedChildren() {
+			if part.Type() != "interpolation" {
+				continue
+			}
+			expr := part.ChildByFieldName("expression")
+			if expr == nil || !pyConstantExpr(expr, src, true) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pyConstantExpr reports whether expr is an UPPER_CASE name, an attribute
+// ending in one, or (when followLoops is set) a name bound by an enclosing
+// `for` loop whose iterable is itself constant.
+func pyConstantExpr(expr *sitter.Node, src []byte, followLoops bool) bool {
+	switch expr.Type() {
+	case "attribute":
+		attr := expr.ChildByFieldName("attribute")
+		return attr != nil && isPyConstantName(attr.Content(src))
+	case "identifier":
+		name := expr.Content(src)
+		if isPyConstantName(name) {
+			return true
+		}
+		return followLoops && boundByLoopOverConstant(expr, name, src)
+	}
+	return false
+}
+
+// boundByLoopOverConstant walks outwards from n to the nearest enclosing
+// scope boundary, looking for a `for` statement whose target binds name.
+// The innermost such loop decides: it binds name to an element of its
+// iterable, so the name is constant exactly when the iterable is.
+func boundByLoopOverConstant(n *sitter.Node, name string, src []byte) bool {
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		switch p.Type() {
+		case "function_definition", "lambda", "class_definition":
+			return false
+		case "for_statement":
+			if !pyTargetBinds(p.ChildByFieldName("left"), name, src) {
+				continue
+			}
+			right := p.ChildByFieldName("right")
+			return right != nil && pyConstantExpr(right, src, false)
+		}
+	}
+	return false
+}
+
+// pyTargetBinds reports whether a `for` target (a name, or a possibly nested
+// tuple/list pattern) binds name.
+func pyTargetBinds(target *sitter.Node, name string, src []byte) bool {
+	if target == nil {
+		return false
+	}
+	if target.Type() == "identifier" {
+		return target.Content(src) == name
+	}
+	for child := range target.NamedChildren() {
+		if pyTargetBinds(child, name, src) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPyConstantName matches PEP 8 constant names: optional leading
+// underscores, then an upper-case letter and at least one more upper-case
+// letter, digit or underscore. A single capital (`Q`) is too ambiguous.
+func isPyConstantName(s string) bool {
+	i := 0
+	for i < len(s) && s[i] == '_' {
+		i++
+	}
+	rest := s[i:]
+	if len(rest) < 2 || rest[0] < 'A' || rest[0] > 'Z' {
+		return false
+	}
+	for j := 1; j < len(rest); j++ {
+		c := rest[j]
+		if (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------

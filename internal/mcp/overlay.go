@@ -205,7 +205,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// overlay so a session's editor buffers layer on top of whatever
 		// answers here. The lease the materialized view holds is released
 		// with the request, on the same lifecycle that discards the overlay.
-		controlOperation := s.checkoutControlOperation(&req)
+		// A facade call is lowered to its legacy name once here; both of the
+		// gates below read that name rather than resolving it twice.
+		legacyName, _ := s.legacyToolName(&req)
+		controlOperation := checkoutControlOperationName(legacyName)
 		if controlOperation != "" {
 			control, controlErr := s.resolveCheckoutControlScope(ctx, selector, &req)
 			if controlErr != nil {
@@ -213,8 +216,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			}
 			ctx = withCheckoutControl(ctx, control)
 		}
+		// Catalog authority that needs no view at all: a recovery or receipt
+		// read that must stay reachable while publication is pending, and the
+		// tools that must not be hostage to the binding they exist to fix.
+		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
 		var view *requestView
-		if !catalogOnlyCheckoutControl(controlOperation) {
+		if !viewless {
 			var viewErr error
 			view, viewErr = s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req, freshness))
 			if viewErr != nil {
@@ -263,12 +270,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// What the view can answer, checked against what this operation
 		// needs, before the handler runs — a thin view must refuse rather
 		// than answer thinly and look complete doing it.
-		if !catalogOnlyCheckoutControl(controlOperation) {
+		if !viewless {
 			if refused := s.evaluateRequestCapabilities(ctx, &req, capabilities); refused != nil {
 				return refused, nil
 			}
 		}
-		if injectOverlay && !catalogOnlyCheckoutControl(controlOperation) && view.acceptsBufferOverlay() {
+		if injectOverlay && !viewless && view.acceptsBufferOverlay() {
 			var err error
 			ctx, _, err = s.prepareOverlayRequest(ctx)
 			if err != nil {

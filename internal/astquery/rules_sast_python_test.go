@@ -36,6 +36,56 @@ func TestPythonRulesCompile(t *testing.T) {
 	}
 }
 
+// TestPythonSQLiFStringConstants pins the f-string SQLi PostFilter: an
+// interpolation of a PEP 8 constant, or of a loop variable drawn from one, is
+// a table/column identifier (which placeholders cannot bind), not injection.
+// Any other interpolated expression must still fire.
+func TestPythonSQLiFStringConstants(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want int
+	}{
+		{"module constant", `COLUMNS = "id, name"
+conn.execute(f"SELECT {COLUMNS} FROM t WHERE id = ?", (i,))`, 0},
+		{"private constant", `conn.execute(f"SELECT {_COLUMNS} FROM t")`, 0},
+		{"attribute constant", `conn.execute(f"SELECT {schema.COLUMNS} FROM t")`, 0},
+		{"loop over constant", `for column, sql_type in _ADDED_COLUMNS:
+    conn.execute(f"ALTER TABLE t ADD COLUMN {column} {sql_type}")`, 0},
+		{"nested loop target", `for i, (column, kind) in PAIRS:
+    conn.execute(f"ALTER TABLE t ADD COLUMN {column} {kind}")`, 0},
+		{"sqlalchemy text constant", `text(f"SELECT {COLUMNS} FROM t")`, 0},
+
+		{"lower-case name", `cursor.execute(f"SELECT * FROM t WHERE x = {v}")`, 1},
+		{"single capital", `cursor.execute(f"SELECT * FROM t WHERE x = {Q}")`, 1},
+		{"one constant, one value", `cursor.execute(f"SELECT {COLUMNS} FROM t WHERE x = {v}")`, 1},
+		{"call", `cursor.execute(f"SELECT * FROM t WHERE x = {get(v)}")`, 1},
+		{"subscript of constant", `cursor.execute(f"SELECT * FROM t WHERE x = {ROWS[i]}")`, 1},
+		{"loop over non-constant", `for column in request.args:
+    conn.execute(f"ALTER TABLE t ADD COLUMN {column}")`, 1},
+		{"loop over constant, other name", `for column in COLUMNS:
+    conn.execute(f"SELECT {column} FROM t WHERE x = {v}")`, 1},
+		{"inner loop shadows constant loop", `for column in COLUMNS:
+    for column in user_columns:
+        conn.execute(f"SELECT {column} FROM t")`, 1},
+		{"loop outside the function", `for column in COLUMNS:
+    def f(column):
+        conn.execute(f"SELECT {column} FROM t")`, 1},
+		{"sqlalchemy text value", `text(f"SELECT * FROM t WHERE x = {v}")`, 1},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			rule := "py-sqli-execute-fstring"
+			if len(c.src) >= 5 && c.src[:5] == "text(" {
+				rule = "py-sqlalchemy-text-with-fstring"
+			}
+			res := runDetector(t, rule, "python", "case.py", c.src)
+			require.Equal(t, c.want, res.Total, "%s on:\n%s", rule, c.src)
+		})
+	}
+}
+
 // Per-rule firing tests. Table-driven: each entry pairs the rule
 // name with (a) source that MUST trigger the rule and (b) source
 // that MUST NOT trigger the rule.

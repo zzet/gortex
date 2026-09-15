@@ -1202,6 +1202,21 @@ func (e *CSharpExtractor) extractCSharp(filePath string, src []byte) (*parser.Ex
 			}
 			edge.Meta["type_arg_count"] = c.typeArgCount
 		}
+		// A simple name the enclosing method's own declaration space binds
+		// — a parameter, a local, a local function — IS that binding (C#
+		// spec §12.8.4: the local declaration spaces come before members,
+		// bases and every using-static import). A local function mints no
+		// node and a delegate-typed parameter or local is not a callee the
+		// graph can point at, so the stub stays; the stamp is what lets
+		// every resolver tier refuse to hand the call to an outer
+		// same-named candidate. Asked at the call's offset, like the
+		// receiver shadow above.
+		if paramsByOwner[callerID][c.name] || localScopes.shadows(callerID, c.name, c.offset) {
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta["local_shadow"] = true
+		}
 		stampReturnUsage(edge, c.returnUsage)
 		result.Edges = append(result.Edges, edge)
 	}

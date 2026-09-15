@@ -133,6 +133,11 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		if r.csharpExtensionGuardKeep(j.edge, callerFile, target) {
 			continue
 		}
+		// Same shape for a receiverless call bound through `using static`:
+		// the directive is the scope evidence, never an import edge.
+		if r.csharpUsingStaticGuardKeep(j.edge, callerFile, target) {
+			continue
+		}
 		// Not reachable — revert to the unresolved placeholder and
 		// re-index against the resolved target we are abandoning.
 		// SetEdgeProvenance("") drops the resolution provenance so

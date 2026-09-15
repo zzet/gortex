@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
@@ -110,6 +113,60 @@ func TestRenderDaemonHeader_SearchBackendRow_SymbolSearcher(t *testing.T) {
 	assert.Contains(t, out, "48572")
 	assert.Contains(t, out, "disk-resident")
 	assert.NotContains(t, out, "heap=0 B", "must not print a fabricated zero heap size")
+}
+
+// stubVectorDelegate backs a delegated vector backend for status tests; the
+// resolver never queries it, it only needs to be non-nil.
+type stubVectorDelegate struct{}
+
+func (stubVectorDelegate) SimilarTo([]float32, int) ([]graph.VectorHit, error) { return nil, nil }
+
+// statusEmbedder satisfies embedding.Provider for hybrid construction.
+type statusEmbedder struct{}
+
+func (statusEmbedder) Embed(context.Context, string) ([]float32, error) { return []float32{1, 0, 0}, nil }
+func (statusEmbedder) EmbedBatch(context.Context, []string) ([][]float32, error) {
+	return nil, nil
+}
+func (statusEmbedder) Dimensions() int { return 3 }
+func (statusEmbedder) Close() error     { return nil }
+
+func TestResolveSearchBackend_ReportsHybridVectorChannel(t *testing.T) {
+	// #790 triage failure: the status row names only the peeled text backend,
+	// so a live hybrid is indistinguishable from a text-only daemon. The
+	// resolver must disclose the vector channel and its corpus size.
+	text := search.NewSymbolSearcherBackend(countingSymbolSearcher{count: 48572})
+	vector := search.NewDelegatedVector(3, stubVectorDelegate{}, 298050, 6269)
+	sw := search.NewSwappable(search.NewHybrid(text, vector, statusEmbedder{}))
+
+	raw, err := json.Marshal(resolveSearchBackend(sw))
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"hybrid":true`,
+		"a live hybrid must be visible in status")
+	assert.Contains(t, string(raw), `"vector_count":298050`,
+		"the restored corpus size must be visible in status")
+}
+
+func TestRenderDaemonHeader_SearchBackendRow_ShowsHybridVectors(t *testing.T) {
+	// Round-trip the resolver output through JSON into the stats struct the
+	// renderer consumes, exercising the real populate → render pipeline.
+	text := search.NewSymbolSearcherBackend(countingSymbolSearcher{count: 328627})
+	vector := search.NewDelegatedVector(3, stubVectorDelegate{}, 298050, 6269)
+	raw, err := json.Marshal(resolveSearchBackend(
+		search.NewSwappable(search.NewHybrid(text, vector, statusEmbedder{}))))
+	require.NoError(t, err)
+
+	var sb daemon.SearchBackendStats
+	require.NoError(t, json.Unmarshal(raw, &sb))
+
+	st := sampleStatus()
+	st.SearchBackend = sb
+	var buf bytes.Buffer
+	renderDaemonHeader(&buf, st)
+	out := buf.String()
+	assert.Contains(t, out, "sqlite-fts5", "the row still names the text backend")
+	assert.Contains(t, out, "vectors=298050",
+		"the status row must show the live vector channel")
 }
 
 func TestRenderDaemonHeader_OmitsUnknownDocCount(t *testing.T) {

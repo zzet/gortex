@@ -165,6 +165,17 @@ func newViewStack(t *testing.T) *viewStack {
 	})
 	srv.SetMaterializer(&graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: stack.leases})
 	stack.srv = srv
+	// A request whose cwd is not already a registered checkout shells out to
+	// git on a background observation goroutine with a five-second budget of
+	// its own. Registered last so LIFO cleanup drains it FIRST: the store below
+	// closes next and t.TempDir unlinks the tree it is reading last, and doing
+	// either under a live observation is the teardown order that turns a
+	// background git read into a cleanup failure.
+	t.Cleanup(func() {
+		if srv.lifecycle != nil {
+			_ = srv.lifecycle.Close()
+		}
+	})
 	return stack
 }
 

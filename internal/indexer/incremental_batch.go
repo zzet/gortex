@@ -702,6 +702,7 @@ func captureIncrementalStateFromView(
 			reuse[key] = &reuseVal{
 				to: edge.To, confidence: edge.Confidence,
 				confLabel: edge.ConfidenceLabel, origin: edge.Origin, tier: edge.Tier,
+				resolution: reuseResolutionTag(edge),
 			}
 		}
 	}
@@ -739,6 +740,7 @@ func applyResolvedOutEdgesFromView(
 		edge.ConfidenceLabel = value.confLabel
 		edge.Origin = value.origin
 		edge.Tier = value.tier
+		applyReuseResolutionTag(edge, value.resolution)
 		reused++
 	}
 	return reused

@@ -1,7 +1,8 @@
 // Package entrypoints detects framework entry points — symbols and
 // files reachable only from a framework runtime, never from
-// application code. Alembic migrations, Next.js pages / routes, and
-// ASP.NET host files all look unreachable to a call-graph walk; left
+// application code. Alembic migrations, Pydantic validators, Next.js
+// pages / routes, and ASP.NET host files all look unreachable to a
+// call-graph walk; left
 // unmarked they become dead-code false positives. Detect stamps
 // Meta["entry_point"] / Meta["entry_point_kind"] so the dead-code
 // analyzer treats them as live roots.
@@ -30,7 +31,7 @@ func Detect(relPath, lang string, nodes []*graph.Node, edges []*graph.Edge) int 
 	slashed := path.Clean(strings.ReplaceAll(relPath, "\\", "/"))
 	switch lang {
 	case "python":
-		return detectAlembic(nodes)
+		return detectAlembic(nodes) + detectPydantic(nodes, edges)
 	case "typescript", "javascript":
 		return detectNextJS(slashed, nodes)
 	case "csharp":
@@ -84,6 +85,79 @@ func detectAlembic(nodes []*graph.Node) int {
 			if stamp(n, "alembic:migration") {
 				count++
 			}
+		}
+	}
+	return count
+}
+
+// pydanticCallbackDecorators are the Pydantic decorators whose target
+// method is invoked by the model machinery (validation, serialization)
+// rather than by application code, so it never has a written call site.
+// `validator` / `root_validator` are the v1 spellings, still accepted by
+// v2. `validate_call` is deliberately absent: it wraps a function that
+// application code does call.
+var pydanticCallbackDecorators = map[string]string{
+	"field_validator":  "pydantic:validator",
+	"model_validator":  "pydantic:validator",
+	"validator":        "pydantic:validator",
+	"root_validator":   "pydantic:validator",
+	"field_serializer": "pydantic:serializer",
+	"model_serializer": "pydantic:serializer",
+	"computed_field":   "pydantic:computed_field",
+}
+
+const (
+	pyAnnoPrefix       = "annotation::python::"
+	pyImportPrefix     = "unresolved::import::"
+	pydanticModuleRoot = "pydantic"
+)
+
+// detectPydantic flags Pydantic validator / serializer / computed-field
+// methods from their decorator edges. Like detectJava it stamps only the
+// decorated members, never the file: a model module can still hold
+// genuinely dead helpers. The file must import pydantic, because
+// `validator` alone is too generic a name to trust.
+func detectPydantic(nodes []*graph.Node, edges []*graph.Edge) int {
+	importsPydantic := false
+	for _, e := range edges {
+		if e.Kind != graph.EdgeImports {
+			continue
+		}
+		mod, ok := strings.CutPrefix(e.To, pyImportPrefix)
+		if ok && (mod == pydanticModuleRoot || strings.HasPrefix(mod, pydanticModuleRoot+".")) {
+			importsPydantic = true
+			break
+		}
+	}
+	if !importsPydantic {
+		return 0
+	}
+
+	kinds := map[string]string{} // symbol ID → entry kind
+	for _, e := range edges {
+		if e.Kind != graph.EdgeAnnotated {
+			continue
+		}
+		name, ok := strings.CutPrefix(e.To, pyAnnoPrefix)
+		if !ok {
+			continue
+		}
+		// `@pydantic.field_validator` arrives as a dotted name.
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		if kind, ok := pydanticCallbackDecorators[name]; ok {
+			kinds[e.From] = kind
+		}
+	}
+
+	count := 0
+	for _, n := range nodes {
+		if !isFnOrMethod(n.Kind) {
+			continue
+		}
+		if kind, ok := kinds[n.ID]; ok && stamp(n, kind) {
+			count++
 		}
 	}
 	return count

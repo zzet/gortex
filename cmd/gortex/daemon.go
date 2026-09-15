@@ -1449,6 +1449,15 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			}
 			return fmt.Sprintf("docs=%d  ", sb.DocCount)
 		}
+		// A live vector channel is a first-class fact about the backend:
+		// text-only and hybrid ranking were indistinguishable here before
+		// #790, which made hybrid outages untriageable from status.
+		formatSearchHybrid := func(sb daemon.SearchBackendStats) string {
+			if !sb.Hybrid {
+				return ""
+			}
+			return fmt.Sprintf("  hybrid vectors=%d", sb.VectorCount)
+		}
 		switch {
 		case sb.DiskResident:
 			// No heap footprint to report — the index lives inside the
@@ -1456,11 +1465,11 @@ func renderDaemonHeader(w io.Writer, st daemon.StatusResponse) {
 			// structure. Printing "heap=0 B" here would read as "this
 			// backend costs nothing", which is false.
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  %sdisk-resident (indexed in the graph store)",
-				sb.Name, formatSearchDocs(sb))})
+				"%s  %sdisk-resident (indexed in the graph store)%s",
+				sb.Name, formatSearchDocs(sb), formatSearchHybrid(sb))})
 		default:
 			t.AppendRow(table.Row{"search", fmt.Sprintf(
-				"%s  %sheap=%s", sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes))})
+				"%s  %sheap=%s%s", sb.Name, formatSearchDocs(sb), formatBytes(sb.Bytes), formatSearchHybrid(sb))})
 		}
 	}
 	if tc := st.TrigramCache; tc != nil {

@@ -43,15 +43,31 @@ func withCheckoutControl(ctx context.Context, scope *checkoutControlScope) conte
 	return context.WithValue(ctx, checkoutControlKey{}, scope)
 }
 
-func (s *Server) checkoutControlOperation(req *mcp.CallToolRequest) string {
+// legacyToolName lowers a facade call to the legacy tool it dispatches, so a
+// gate keyed on tool identity sees the same name through either door. The
+// second result is false only for a facade request that names no operation
+// this server can resolve.
+func (s *Server) legacyToolName(req *mcp.CallToolRequest) (string, bool) {
 	name := req.Params.Name
-	if isFacadeToolName(name) {
-		spec, ok := s.viewFacadeOperation(req)
-		if !ok {
-			return ""
-		}
-		name = spec.Legacy
+	if !isFacadeToolName(name) {
+		return name, true
 	}
+	spec, ok := s.viewFacadeOperation(req)
+	if !ok {
+		return "", false
+	}
+	return spec.Legacy, true
+}
+
+func (s *Server) checkoutControlOperation(req *mcp.CallToolRequest) string {
+	name, _ := s.legacyToolName(req)
+	return checkoutControlOperationName(name)
+}
+
+// checkoutControlOperationName is the same decision over an already lowered
+// name, so a caller that lowers once can reach both this and the removal gate
+// without resolving the facade operation twice.
+func checkoutControlOperationName(name string) string {
 	switch name {
 	case "mutation_status", "reindex_repository", "detect_changes":
 		return name
@@ -62,6 +78,35 @@ func (s *Server) checkoutControlOperation(req *mcp.CallToolRequest) string {
 
 func catalogOnlyCheckoutControl(operation string) bool {
 	return operation == "mutation_status" || operation == "reindex_repository"
+}
+
+// viewlessCatalogTool reports a tool that answers from catalog rows alone. To
+// qualify a tool must name its target explicitly rather than inferring it from
+// the session, and read no graph — so it runs without binding the session's
+// working directory to a checkout view.
+//
+// These are the tools a user reaches for when a binding is already broken, and
+// binding the cwd first makes each one unavailable in exactly the state it
+// exists for. Automatic discovery gets a 250ms slice per request; a working
+// copy git is slow to answer for — a Windows checkout behind a virus scanner,
+// a network share, a tree that no longer answers at all — spends it without
+// finishing, and the call is refused with a retryable view_building error:
+//
+//   - removal (untrack_repository, forget_checkout) would depend on
+//     discovering the very checkout it removes, and no amount of retrying a
+//     removal makes that checkout easier to discover;
+//   - explain_view exists to say why a path cannot be served, so refusing it
+//     for the reason it was called to report leaves nothing to diagnose with.
+//
+// A read that answers off the graph does NOT belong here, however convenient:
+// serving it through an unbound cwd would answer from the wrong corpus.
+func viewlessCatalogTool(name string) bool {
+	switch name {
+	case "untrack_repository", "forget_checkout", "explain_view":
+		return true
+	default:
+		return false
+	}
 }
 
 // Catalog lookup must not depend on a ready corpus listing its repository:

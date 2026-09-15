@@ -115,3 +115,48 @@ public class UserController {
 	require.False(t, dead["listUsers"], "a public @GetMapping handler is not dead")
 	require.False(t, dead["main"], "main is the JVM entry point, not dead")
 }
+
+// TestIndex_PydanticValidatorsNotDead is the end-to-end check for the
+// Pydantic detector: validators and serializers are invoked by the model
+// machinery, so they must not be reported dead, while an uncalled helper
+// on the same model still is.
+func TestIndex_PydanticValidatorsNotDead(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "models.py"), `from pydantic import BaseModel, field_serializer, field_validator, model_validator
+
+
+class Offer(BaseModel):
+    price: float
+
+    @field_validator("price")
+    @classmethod
+    def _positive(cls, value: float) -> float:
+        return value
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "Offer":
+        return self
+
+    @field_serializer("price")
+    def _money_out(self, value: float) -> str:
+        return f"{value:.2f}"
+
+    def _unused_helper(self) -> None:
+        pass
+`)
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewPythonExtractor())
+	idx := New(g, reg, config.Default().Index, zap.NewNop())
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	dead := map[string]bool{}
+	for _, d := range analysis.FindDeadCode(g, nil, nil) {
+		dead[d.Name] = true
+	}
+	require.False(t, dead["_positive"], "@field_validator is invoked by pydantic, not dead")
+	require.False(t, dead["_consistent"], "@model_validator is invoked by pydantic, not dead")
+	require.False(t, dead["_money_out"], "@field_serializer is invoked by pydantic, not dead")
+	require.True(t, dead["_unused_helper"], "an uncalled helper on the model must still be reported dead")
+}

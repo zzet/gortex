@@ -654,6 +654,15 @@ type SearchBackendStats struct {
 	// graph store's own file — and no cheap byte count is available
 	// either. Rendering must not print a fabricated "heap=0 B" for it.
 	DiskResident bool `json:"disk_resident,omitempty"`
+	// Hybrid marks a backend whose live query path carries a vector
+	// (semantic) channel alongside the text one — a restored or freshly
+	// built HybridBackend. Its absence means text-only ranking; the two
+	// states were indistinguishable from status before #790, which made
+	// hybrid outages untriageable.
+	Hybrid bool `json:"hybrid,omitempty"`
+	// VectorCount is how many vectors the hybrid's vector channel can
+	// serve (durable corpus or in-process index).
+	VectorCount int `json:"vector_count,omitempty"`
 }
 
 // SearchSymbolsParams is the payload for ControlSearchSymbols.

@@ -442,7 +442,9 @@ func (c *realController) EnrichBlame(ctx context.Context, p daemon.EnrichBlamePa
 		if err != nil {
 			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
-		count, err := blame.EnrichGraph(out.Store, out.Root)
+		// t.prefix scopes the pass: without it the walk over one repo's root
+		// can stamp another repo's identically-pathed nodes.
+		count, err := blame.EnrichGraph(out.Store, out.Root, t.prefix)
 		if err != nil {
 			out.Abandon()
 			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
@@ -789,6 +791,10 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 	//    drilling into the text side for name/doc-count identification.
 	if hyb, ok := inner.(*search.HybridBackend); ok {
 		out.vectorBytes = hyb.VectorSizeBytes()
+		out.Hybrid = true
+		if vi := hyb.VectorIndex(); vi != nil {
+			out.VectorCount = vi.Count()
+		}
 		inner = hyb.TextBackend()
 		// TextBackend() itself could be a Swappable in some setups. Pin it
 		// too so a nested replacement cannot invalidate this inspection.
