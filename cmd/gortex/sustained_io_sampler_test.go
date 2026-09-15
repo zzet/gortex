@@ -21,6 +21,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/testdsn"
 )
 
 // The instrument the sustained-workload harness measures with: a 1 Hz
@@ -841,7 +843,7 @@ func TestSustainedIOCheckpointCounterCountsResetsNotAppends(t *testing.T) {
 func TestSustainedIOWALCheckpointSequenceAdvancesOnReset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "probe.sqlite")
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	db, err := sql.Open("sqlite", testdsn.FileURI(path, ""))
 	if err != nil {
 		t.Fatal(err)
 	}

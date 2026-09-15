@@ -22,6 +22,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/testdsn"
 )
 
 // The sustained-workload I/O harness.
@@ -2265,7 +2267,7 @@ func TestSustainedIOCollectDiagnosticsAsksTheExplainingQuestions(t *testing.T) {
 
 func TestSustainedIOStoreCensusSurvivesAMissingSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty.sqlite")
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	db, err := sql.Open("sqlite", testdsn.FileURI(path, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2425,7 +2427,7 @@ func TestSustainedIONewRunSamplerWiresEveryProductionReader(t *testing.T) {
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
 
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	db, err := sql.Open("sqlite", testdsn.FileURI(f.store, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2525,7 +2527,7 @@ func TestSustainedIOExecuteLabelsItsSamplesWithThePhaseItIsRunning(t *testing.T)
 	if err := os.MkdirAll(f.primary, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	db, err := sql.Open("sqlite", testdsn.FileURI(f.store, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2575,7 +2577,7 @@ func TestSustainedIOClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun(t *tes
 	}
 	// The closing half reads the store census, so it needs a database handle;
 	// an empty one exercises the same "name what is missing" path.
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	db, err := sql.Open("sqlite", testdsn.FileURI(f.store, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2745,7 +2747,7 @@ func sustainedIORunIsolationChild(t *testing.T, dir string) {
 	if err := os.MkdirAll(f.primary, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	db, err := sql.Open("sqlite", testdsn.FileURI(f.store, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2780,7 +2782,7 @@ func sustainedIORunFailingPhaseChild(t *testing.T, dir string) {
 	if err := os.MkdirAll(f.primary, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(f.store))
+	db, err := sql.Open("sqlite", testdsn.FileURI(f.store, ""))
 	if err != nil {
 		t.Fatal(err)
 	}

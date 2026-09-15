@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/testdsn"
 )
 
 // privateGitIdentityEnv gives a fixture's git subprocess an author and
@@ -780,8 +780,7 @@ func installDedicatedWriteAudit(ctx context.Context, path string) (func() error,
 		return nil, err
 	}
 	return func() error {
-		uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
-		probe, err := sql.Open("sqlite", uri)
+		probe, err := sql.Open("sqlite", testdsn.FileURI(path, "mode=ro"))
 		if err != nil {
 			return err
 		}

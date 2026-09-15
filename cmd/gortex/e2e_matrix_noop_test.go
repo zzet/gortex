@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zzet/gortex/internal/testdsn"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -2488,7 +2489,7 @@ func TestE2EMatrixLivenessComesFromTheRightHalf(t *testing.T) {
 // selection is pinned rather than trusted.
 func TestE2EMatrixReadPayloadSelectsTheBaseRowsOfTheNamedFile(t *testing.T) {
 	dir := t.TempDir()
-	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "payload.db"))
+	dsn := testdsn.FileURI(filepath.Join(dir, "payload.db"), "")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -2586,7 +2587,7 @@ func TestE2EMatrixReadCatalogReadsAStoreThatNeverAllocatedAGeneration(t *testing
 	ctx := t.Context()
 	open := func(name string) *sql.DB {
 		t.Helper()
-		db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), name)))
+		db, err := sql.Open("sqlite", testdsn.FileURI(filepath.Join(t.TempDir(), name), ""))
 		if err != nil {
 			t.Fatal(err)
 		}

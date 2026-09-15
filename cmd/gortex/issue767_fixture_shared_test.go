@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	_ "modernc.org/sqlite"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/testdsn"
 )
 
 // The isolated-daemon fixture shared by every opt-in end-to-end measurement in
@@ -812,8 +813,7 @@ func (f *issue767Fixture) awaitSymbolAs(root, name, file string, timeout time.Du
 
 func (f *issue767Fixture) openReadOnly() *sql.DB {
 	f.t.Helper()
-	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(f.store), RawQuery: "mode=ro"}
-	db, err := sql.Open("sqlite", u.String())
+	db, err := sql.Open("sqlite", testdsn.FileURI(f.store, "mode=ro"))
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -1051,7 +1051,7 @@ func TestIssue767SpellingForIsTheExactnessDemandingDefault(t *testing.T) {
 func TestIssue767ReadGenerationsAcceptsAStoreThatNeverAllocatedAGeneration(t *testing.T) {
 	open := func(name string, schema ...string) *sql.DB {
 		path := filepath.Join(t.TempDir(), name)
-		db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+		db, err := sql.Open("sqlite", testdsn.FileURI(path, ""))
 		if err != nil {
 			t.Fatal(err)
 		}

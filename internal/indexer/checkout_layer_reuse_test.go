@@ -4,10 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"net/url"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/testdsn"
 )
 
 // The durable half of commit-layer reuse.
@@ -333,8 +333,7 @@ func installCheckoutLayerWriteAudit(t *testing.T, path string) func(*testing.T) 
 	}
 	return func(t *testing.T) int {
 		t.Helper()
-		uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
-		probe, err := sql.Open("sqlite", uri)
+		probe, err := sql.Open("sqlite", testdsn.FileURI(path, "mode=ro"))
 		if err != nil {
 			t.Fatalf("open the audit probe: %v", err)
 		}
