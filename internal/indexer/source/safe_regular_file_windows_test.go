@@ -8,8 +8,19 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
+
+func createWindowsSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if errors.Is(err, syscall.ERROR_PRIVILEGE_NOT_HELD) {
+			t.Skipf("Windows symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+}
 
 func TestFilesystemSafeRegularFileWindows(t *testing.T) {
 	root := t.TempDir()
@@ -69,9 +80,7 @@ func TestFilesystemSafeRegularFileWindows(t *testing.T) {
 		}
 	})
 	t.Run("final_reparse_point", func(t *testing.T) {
-		if err := os.Symlink(filepath.Join(root, "go.mod"), filepath.Join(root, "alias.mod")); err != nil {
-			t.Skipf("Windows symlink privilege unavailable: %v", err)
-		}
+		createWindowsSymlink(t, "go.mod", filepath.Join(root, "alias.mod"))
 		// Exercise the native opener directly: the public read's initial Lstat
 		// already rejects a stable link before NtCreateFile reaches the leaf.
 		file, err := openRootRegularFile(src.root, "alias.mod")
@@ -91,25 +100,32 @@ func TestFilesystemSafeRegularFileWindows(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(realDir, "go.mod"), []byte("module example.test/inner\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(realDir, filepath.Join(root, "inside")); err != nil {
-			t.Skipf("Windows directory symlink privilege unavailable: %v", err)
-		}
+		// os.Root permits a parent link only when its target is relative and
+		// resolves inside the root. An absolute target is refused even here.
+		createWindowsSymlink(t, "real", filepath.Join(root, "inside"))
 		data, _, err := src.ReadRegularFile(context.Background(), "inside/go.mod", 64)
 		if err != nil || string(data) != "module example.test/inner\n" {
 			t.Fatalf("confined parent link: data=%q err=%v", data, err)
 		}
 	})
 	t.Run("outside_root_parent_link", func(t *testing.T) {
-		outside := t.TempDir()
+		outside, err := os.MkdirTemp(filepath.Dir(root), "source-outside-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.RemoveAll(outside); err != nil {
+				t.Errorf("remove outside fixture: %v", err)
+			}
+		})
 		if err := os.WriteFile(filepath.Join(outside, "go.mod"), []byte("module example.test/outside\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
-			t.Skipf("Windows directory symlink privilege unavailable: %v", err)
-		}
-		_, _, err := src.ReadRegularFile(context.Background(), "escape/go.mod", 64)
-		if !errors.Is(err, ErrOutsideRoot) {
-			t.Fatalf("outside parent link: got %v, want ErrOutsideRoot", err)
+		// This relative target reaches an existing sibling if confinement fails.
+		createWindowsSymlink(t, filepath.Join("..", filepath.Base(outside)), filepath.Join(root, "escape"))
+		data, _, err := src.ReadRegularFile(context.Background(), "escape/go.mod", 64)
+		if len(data) != 0 || !errors.Is(err, ErrOutsideRoot) {
+			t.Fatalf("outside parent link: data=%q err=%v, want no bytes and ErrOutsideRoot", data, err)
 		}
 	})
 }

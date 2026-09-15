@@ -85,10 +85,9 @@ func TestGoPackageOwnershipIndexerAndMasterObserveSourceRebind(t *testing.T) {
 	check("unknown explicit source never uses working tree", "example.test/second", resolver.GoPackageOwnershipUnknown)
 	idx.SetContentSource(nil)
 	if runtime.GOOS == "windows" {
-		// The existing safe FilesystemSource regular-reader implementation is
-		// intentionally unsupported on Windows. Git snapshot coverage above is
-		// still mandatory; fallback must remain Unknown, never stale Git facts.
-		check("filesystem unsupported is conservative", "example.test/second", resolver.GoPackageOwnershipUnknown)
+		// The Windows regular-file reader now permits current filesystem
+		// manifest authority; a nil source must not retain stale Git facts.
+		check("Windows current filesystem manifest", "example.test/second", resolver.GoPackageOwnershipExact)
 	} else {
 		check("nil source returns to current filesystem", "example.test/second", resolver.GoPackageOwnershipExact)
 	}
@@ -98,12 +97,10 @@ func TestGoPackageOwnershipIndexerAndMasterObserveSourceRebind(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = fs.Close() })
 	idx.SetContentSource(fs)
-	if runtime.GOOS != "windows" {
-		check("same source initial manifest", "example.test/second", resolver.GoPackageOwnershipExact)
-		builderWriteFile(t, root, "go.mod", "module example.test/third\n\ngo 1.23\n")
-		check("same source manifest update", "example.test/third", resolver.GoPackageOwnershipExact)
-		check("same source old module invalidated", "example.test/second", resolver.GoPackageOwnershipDifferent)
-	}
+	check("same source initial manifest", "example.test/second", resolver.GoPackageOwnershipExact)
+	builderWriteFile(t, root, "go.mod", "module example.test/third\n\ngo 1.23\n")
+	check("same source manifest update", "example.test/third", resolver.GoPackageOwnershipExact)
+	check("same source old module invalidated", "example.test/second", resolver.GoPackageOwnershipDifferent)
 	// Exercise the actual master constructor and pass, not only its factory
 	// method. The full Git target stays first while the working tree is third.
 	idx.SetContentSource(first)
