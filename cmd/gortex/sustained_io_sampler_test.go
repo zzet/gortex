@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// The instrument the W8 sustained-workload harness measures with: a 1 Hz
+// The instrument the sustained-workload harness measures with: a 1 Hz
 // process/file sampler, a WAL-header checkpoint counter, a run manifest, and a
 // destination census that attributes every byte under the private daemon root
 // to a named writer.
@@ -34,14 +34,14 @@ import (
 
 // ------------------------------------------------------------ WAL header ---
 
-// w8WALHeader is the 32-byte SQLite write-ahead-log header. All fields are
+// sustainedIOWALHeader is the 32-byte SQLite write-ahead-log header. All fields are
 // big-endian (file-format spec: magic@0, format@4, page size@8,
 // checkpoint sequence@12, salt-1@16, salt-2@20, checksums@24/@28).
 //
 // Whether modernc.org/sqlite actually advances CheckpointSeq on a WAL reset is
-// answered experimentally by TestW8WALCheckpointSequenceAdvancesOnReset in this
+// answered experimentally by TestSustainedIOWALCheckpointSequenceAdvancesOnReset in this
 // file rather than assumed from the specification.
-type w8WALHeader struct {
+type sustainedIOWALHeader struct {
 	Present       bool
 	Magic         uint32
 	Format        uint32
@@ -52,16 +52,16 @@ type w8WALHeader struct {
 }
 
 const (
-	w8WALMagicBE = 0x377f0683
-	w8WALMagicLE = 0x377f0682
+	sustainedIOWALMagicBE = 0x377f0683
+	sustainedIOWALMagicLE = 0x377f0682
 )
 
-// w8ReadWALHeader reads the header of a -wal file. An absent or truncated WAL
+// sustainedIOReadWALHeader reads the header of a -wal file. An absent or truncated WAL
 // is a legitimate state (a TRUNCATE checkpoint leaves a zero-length file), so it
 // returns Present=false and no error; only an unreadable file or a foreign
 // magic is an error.
-func w8ReadWALHeader(path string) (w8WALHeader, error) {
-	var header w8WALHeader
+func sustainedIOReadWALHeader(path string) (sustainedIOWALHeader, error) {
+	var header sustainedIOWALHeader
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -83,7 +83,7 @@ func w8ReadWALHeader(path string) (w8WALHeader, error) {
 		return header, err
 	}
 	header.Magic = binary.BigEndian.Uint32(raw[0:4])
-	if header.Magic != w8WALMagicBE && header.Magic != w8WALMagicLE {
+	if header.Magic != sustainedIOWALMagicBE && header.Magic != sustainedIOWALMagicLE {
 		return header, fmt.Errorf("wal header magic %#x is not a SQLite WAL", header.Magic)
 	}
 	header.Present = true
@@ -95,7 +95,7 @@ func w8ReadWALHeader(path string) (w8WALHeader, error) {
 	return header, nil
 }
 
-// w8CheckpointCounter turns a series of WAL-header samples into a count of WAL
+// sustainedIOCheckpointCounter turns a series of WAL-header samples into a count of WAL
 // resets — the externally observable form of "a checkpoint restarted the log",
 // since a successful checkpoint emits no log line and no in-process counter
 // (map-e2e-io.md §4.5, §5.3).
@@ -103,13 +103,13 @@ func w8ReadWALHeader(path string) (w8WALHeader, error) {
 // A PASSIVE checkpoint that does not restart the log is invisible here by
 // construction, so this is a lower bound and is reported as "wal_resets", never
 // as "checkpoints".
-type w8CheckpointCounter struct {
-	last   w8WALHeader
+type sustainedIOCheckpointCounter struct {
+	last   sustainedIOWALHeader
 	seeded bool
 	resets int
 }
 
-func (c *w8CheckpointCounter) Observe(header w8WALHeader) {
+func (c *sustainedIOCheckpointCounter) Observe(header sustainedIOWALHeader) {
 	defer func() { c.last, c.seeded = header, true }()
 	if !c.seeded || !c.last.Present {
 		return
@@ -124,18 +124,18 @@ func (c *w8CheckpointCounter) Observe(header w8WALHeader) {
 	}
 }
 
-func (c *w8CheckpointCounter) Resets() int { return c.resets }
+func (c *sustainedIOCheckpointCounter) Resets() int { return c.resets }
 
 // --------------------------------------------------------------- sampler ---
 
-// w8FileSizes is the store-side series, taken with os.Stat so sampling can
+// sustainedIOFileSizes is the store-side series, taken with os.Stat so sampling can
 // never perturb the writer with a second SQLite connection.
-type w8FileSizes struct {
+type sustainedIOFileSizes struct {
 	Store, WAL, SHM, Log int64
 }
 
-// w8Sample is one line of samples.ndjson.
-type w8Sample struct {
+// sustainedIOSample is one line of samples.ndjson.
+type sustainedIOSample struct {
 	T     string `json:"t"`
 	Phase string `json:"phase"`
 	// Window names the sub-window of the phase this sample was taken in, or
@@ -172,15 +172,15 @@ type w8Sample struct {
 	Unwired []string `json:"unwired_readers,omitempty"`
 }
 
-// w8Sampler writes one w8Sample per tick to an ndjson stream. The stream must
+// sustainedIOSampler writes one sustainedIOSample per tick to an ndjson stream. The stream must
 // live outside the daemon's private root, so the sampler's own bytes are never
-// counted as fixture writes; w8ArtifactPath enforces that.
-type w8Sampler struct {
+// counted as fixture writes; sustainedIOArtifactPath enforces that.
+type sustainedIOSampler struct {
 	interval time.Duration
 	now      func() time.Time
 	readIO   func() (issue767ProcessIO, error)
-	readSize func() w8FileSizes
-	readWAL  func() (w8WALHeader, error)
+	readSize func() sustainedIOFileSizes
+	readWAL  func() (sustainedIOWALHeader, error)
 	pid      func() int
 
 	mu      sync.Mutex
@@ -189,7 +189,7 @@ type w8Sampler struct {
 	phase   string
 	window  string
 	samples int
-	counter w8CheckpointCounter
+	counter sustainedIOCheckpointCounter
 	failed  int
 
 	// The checkpoint-bytes derivation, carried across samples: the previous
@@ -203,8 +203,8 @@ type w8Sampler struct {
 	checkpointBytes uint64
 }
 
-// newW8Sampler builds a sampler with no readers. Every reader is wired by the
-// caller (w8NewRunSampler in production, the unit tests here with fakes), and
+// newSustainedIOSampler builds a sampler with no readers. Every reader is wired by the
+// caller (sustainedIONewRunSampler in production, the unit tests here with fakes), and
 // an unwired one is reported by name in every sample it touches rather than
 // defaulted.
 //
@@ -214,11 +214,11 @@ type w8Sampler struct {
 // while `sample_failures` stayed 0 and the series reported itself healthy —
 // the shape in which a deleted production wiring becomes a measurement of
 // zero. The same held for the store/WAL/SHM/log sizes and the PID.
-func newW8Sampler(out io.Writer, interval time.Duration) *w8Sampler {
+func newSustainedIOSampler(out io.Writer, interval time.Duration) *sustainedIOSampler {
 	if interval <= 0 {
 		interval = time.Second
 	}
-	return &w8Sampler{
+	return &sustainedIOSampler{
 		interval: interval,
 		now:      time.Now,
 		out:      out,
@@ -226,7 +226,7 @@ func newW8Sampler(out io.Writer, interval time.Duration) *w8Sampler {
 	}
 }
 
-func (s *w8Sampler) SetPhase(phase string) {
+func (s *sustainedIOSampler) SetPhase(phase string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.phase, s.window = phase, ""
@@ -235,7 +235,7 @@ func (s *w8Sampler) SetPhase(phase string) {
 // SetWindow labels every subsequent sample with a sub-window of the current
 // phase. SetPhase clears it, so a window can never leak past the phase that
 // opened it.
-func (s *w8Sampler) SetWindow(window string) {
+func (s *sustainedIOSampler) SetWindow(window string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.window = window
@@ -243,13 +243,13 @@ func (s *w8Sampler) SetWindow(window string) {
 
 // Resets is the running WAL-reset count; Samples and Failures describe the
 // series' own health so a phase with a broken sampler is visible as such.
-func (s *w8Sampler) Resets() int {
+func (s *sustainedIOSampler) Resets() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.counter.Resets()
 }
 
-func (s *w8Sampler) Samples() (samples, failures int) {
+func (s *sustainedIOSampler) Samples() (samples, failures int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.samples, s.failed
@@ -258,7 +258,7 @@ func (s *w8Sampler) Samples() (samples, failures int) {
 // CheckpointBytes is the running total of logical writes booked to WAL
 // checkpoints. A window's cost is the difference of two readings, exactly as
 // Resets is.
-func (s *w8Sampler) CheckpointBytes() uint64 {
+func (s *sustainedIOSampler) CheckpointBytes() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.checkpointBytes
@@ -266,14 +266,14 @@ func (s *w8Sampler) CheckpointBytes() uint64 {
 
 // Sample takes and writes exactly one sample. Run calls it on a ticker; a
 // caller may also take a sample at a phase boundary.
-func (s *w8Sampler) Sample() w8Sample {
+func (s *sustainedIOSampler) Sample() sustainedIOSample {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.start.IsZero() {
 		s.start = s.now()
 	}
 	var unwired []string
-	sizes := w8FileSizes{}
+	sizes := sustainedIOFileSizes{}
 	if s.readSize != nil {
 		sizes = s.readSize()
 	} else {
@@ -285,7 +285,7 @@ func (s *w8Sampler) Sample() w8Sample {
 	} else {
 		unwired = append(unwired, "pid")
 	}
-	sample := w8Sample{
+	sample := sustainedIOSample{
 		T:              s.now().UTC().Format(time.RFC3339Nano),
 		Phase:          s.phase,
 		Window:         s.window,
@@ -353,7 +353,7 @@ func (s *w8Sampler) Sample() w8Sample {
 }
 
 // Run samples until the context is cancelled.
-func (s *w8Sampler) Run(ctx context.Context) {
+func (s *sustainedIOSampler) Run(ctx context.Context) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 	s.Sample()
@@ -367,10 +367,10 @@ func (s *w8Sampler) Run(ctx context.Context) {
 	}
 }
 
-// w8ArtifactPath joins an artifact file under artifactDir and refuses any
+// sustainedIOArtifactPath joins an artifact file under artifactDir and refuses any
 // destination inside the daemon's private root: an artifact written into the
 // measured tree would be counted as the daemon's own write.
-func w8ArtifactPath(artifactDir, daemonRoot, name string) (string, error) {
+func sustainedIOArtifactPath(artifactDir, daemonRoot, name string) (string, error) {
 	dir, err := filepath.Abs(artifactDir)
 	if err != nil {
 		return "", err
@@ -389,121 +389,121 @@ func w8ArtifactPath(artifactDir, daemonRoot, name string) (string, error) {
 // ------------------------------------------------------- writer attribution ---
 
 // Destination buckets. Every file under the private root lands in exactly one;
-// anything unrecognised lands in w8BucketUnclassified and is listed by name and
+// anything unrecognised lands in sustainedIOBucketUnclassified and is listed by name and
 // size, so ri_logical_writes can be reconciled against named destinations
 // rather than against a residue nobody looked at.
-// w8StoreRel is the measured store's path relative to the private root. The
+// sustainedIOStoreRel is the measured store's path relative to the private root. The
 // fixture always puts it there (issue767Fixture.store), and attribution is
 // anchored on it rather than on a "*.sqlite" suffix: the daemon keeps several
 // OTHER SQLite databases under the same root (data/gortex/sidecar.sqlite,
 // data/gortex/memories/sidecar.sqlite, a notebook cache), and folding their
 // WAL traffic into the measured store's line would overstate exactly the number
 // this harness exists to report.
-const w8StoreRel = "store.sqlite"
+const sustainedIOStoreRel = "store.sqlite"
 
 const (
-	w8BucketStore        = "store"
-	w8BucketStoreWAL     = "store_wal"
-	w8BucketStoreSHM     = "store_shm"
-	w8BucketStoreLock    = "store_lock"
-	w8BucketSidecar      = "sidecar_db"
-	w8BucketModel        = "embedding_model"
-	w8BucketDaemonLog    = "daemon_log"
-	w8BucketDaemonPID    = "daemon_pid"
-	w8BucketDaemonSocket = "daemon_socket"
-	w8BucketDaemonState  = "daemon_state"
-	w8BucketSnapshot     = "daemon_snapshot"
-	w8BucketStopIntent   = "stop_intent"
-	w8BucketTelemetry    = "telemetry"
-	w8BucketGitignore    = "gitignore"
-	w8BucketConfig       = "config"
-	w8BucketQueryLog     = "query_log"
-	w8BucketCache        = "cache"
-	w8BucketData         = "data"
-	w8BucketFixtureGit   = "fixture_git"
-	w8BucketFixtureSrc   = "fixture_source"
-	w8BucketArtifact     = "harness_artifact"
-	w8BucketUnclassified = "unclassified"
+	sustainedIOBucketStore        = "store"
+	sustainedIOBucketStoreWAL     = "store_wal"
+	sustainedIOBucketStoreSHM     = "store_shm"
+	sustainedIOBucketStoreLock    = "store_lock"
+	sustainedIOBucketSidecar      = "sidecar_db"
+	sustainedIOBucketModel        = "embedding_model"
+	sustainedIOBucketDaemonLog    = "daemon_log"
+	sustainedIOBucketDaemonPID    = "daemon_pid"
+	sustainedIOBucketDaemonSocket = "daemon_socket"
+	sustainedIOBucketDaemonState  = "daemon_state"
+	sustainedIOBucketSnapshot     = "daemon_snapshot"
+	sustainedIOBucketStopIntent   = "stop_intent"
+	sustainedIOBucketTelemetry    = "telemetry"
+	sustainedIOBucketGitignore    = "gitignore"
+	sustainedIOBucketConfig       = "config"
+	sustainedIOBucketQueryLog     = "query_log"
+	sustainedIOBucketCache        = "cache"
+	sustainedIOBucketData         = "data"
+	sustainedIOBucketFixtureGit   = "fixture_git"
+	sustainedIOBucketFixtureSrc   = "fixture_source"
+	sustainedIOBucketArtifact     = "harness_artifact"
+	sustainedIOBucketUnclassified = "unclassified"
 )
 
-// w8ClassifyPath names the writer of one path relative to the private root.
-func w8ClassifyPath(rel string) string {
+// sustainedIOClassifyPath names the writer of one path relative to the private root.
+func sustainedIOClassifyPath(rel string) string {
 	rel = filepath.ToSlash(rel)
 	base := rel[strings.LastIndexByte(rel, '/')+1:]
 	switch {
-	case rel == w8StoreRel:
-		return w8BucketStore
-	case rel == w8StoreRel+"-wal":
-		return w8BucketStoreWAL
-	case rel == w8StoreRel+"-shm":
-		return w8BucketStoreSHM
-	case strings.HasPrefix(rel, w8StoreRel+".") && strings.HasSuffix(base, ".lock"):
-		return w8BucketStoreLock
+	case rel == sustainedIOStoreRel:
+		return sustainedIOBucketStore
+	case rel == sustainedIOStoreRel+"-wal":
+		return sustainedIOBucketStoreWAL
+	case rel == sustainedIOStoreRel+"-shm":
+		return sustainedIOBucketStoreSHM
+	case strings.HasPrefix(rel, sustainedIOStoreRel+".") && strings.HasSuffix(base, ".lock"):
+		return sustainedIOBucketStoreLock
 	case strings.Contains(base, ".sqlite"):
 		// Every other SQLite file under the root: the daemon's sidecars.
-		return w8BucketSidecar
+		return sustainedIOBucketSidecar
 	case strings.HasPrefix(base, "query-log"):
 		// internal/mcp/query_log.go:126 puts query-log.jsonl under the cache
 		// dir. Folding it into `cache` hid a per-call write behind a bucket
 		// named for something disposable, which is exactly the attribution an
 		// idle floor has to be read off.
-		return w8BucketQueryLog
+		return sustainedIOBucketQueryLog
 	case strings.Contains(rel, "/models/"):
 		// The embedding model is materialised under the data dir even with
 		// --embeddings=false; tens of megabytes that are not store traffic.
-		return w8BucketModel
+		return sustainedIOBucketModel
 	case base == "daemon.pid":
-		return w8BucketDaemonPID
+		return sustainedIOBucketDaemonPID
 	case base == "daemon.sock" || strings.HasSuffix(base, ".sock"):
-		return w8BucketDaemonSocket
+		return sustainedIOBucketDaemonSocket
 	case base == "daemon.stopped":
-		return w8BucketStopIntent
+		return sustainedIOBucketStopIntent
 	case strings.HasPrefix(base, "daemon.state"):
-		return w8BucketDaemonState
+		return sustainedIOBucketDaemonState
 	case base == "daemon.gob.gz" || strings.HasPrefix(base, "daemon.snapshot"):
-		return w8BucketSnapshot
+		return sustainedIOBucketSnapshot
 	case strings.HasPrefix(base, "daemon") && strings.HasSuffix(base, ".log"):
-		return w8BucketDaemonLog
+		return sustainedIOBucketDaemonLog
 	case base == "consent.json" || base == "install-id" || base == "last-send" ||
 		strings.HasPrefix(base, "rollup-") || strings.Contains(rel, "/telemetry/"):
-		return w8BucketTelemetry
+		return sustainedIOBucketTelemetry
 	case base == ".gitignore":
-		return w8BucketGitignore
+		return sustainedIOBucketGitignore
 	case strings.HasPrefix(rel, ".git/") || strings.Contains(rel, "/.git/") || base == ".git":
 		// base == ".git" is a linked worktree's gitlink file.
-		return w8BucketFixtureGit
+		return sustainedIOBucketFixtureGit
 	case rel == "gitconfig":
-		return w8BucketFixtureGit
+		return sustainedIOBucketFixtureGit
 	case strings.HasPrefix(rel, "config/"):
-		return w8BucketConfig
+		return sustainedIOBucketConfig
 	case strings.HasSuffix(base, ".ndjson") || strings.HasSuffix(base, ".manifest.json"):
-		return w8BucketArtifact
+		return sustainedIOBucketArtifact
 	case strings.HasSuffix(base, ".go") || base == "go.mod" || base == "go.sum":
-		return w8BucketFixtureSrc
+		return sustainedIOBucketFixtureSrc
 	case strings.HasPrefix(rel, "cache/"):
-		return w8BucketCache
+		return sustainedIOBucketCache
 	case strings.HasPrefix(rel, "data/"):
-		return w8BucketData
+		return sustainedIOBucketData
 	default:
-		return w8BucketUnclassified
+		return sustainedIOBucketUnclassified
 	}
 }
 
-type w8CensusEntry struct {
+type sustainedIOCensusEntry struct {
 	Path  string `json:"path"`
 	Bytes int64  `json:"bytes"`
 }
 
-// w8Census is the on-disk destination census of one private root.
-type w8Census struct {
-	TotalBytes   int64            `json:"total_bytes"`
-	Bytes        map[string]int64 `json:"bytes_by_writer"`
-	Files        map[string]int   `json:"files_by_writer"`
-	Unclassified []w8CensusEntry  `json:"unclassified,omitempty"`
+// sustainedIOCensus is the on-disk destination census of one private root.
+type sustainedIOCensus struct {
+	TotalBytes   int64                    `json:"total_bytes"`
+	Bytes        map[string]int64         `json:"bytes_by_writer"`
+	Files        map[string]int           `json:"files_by_writer"`
+	Unclassified []sustainedIOCensusEntry `json:"unclassified,omitempty"`
 }
 
-func w8WalkCensus(root string) (w8Census, error) {
-	census := w8Census{Bytes: map[string]int64{}, Files: map[string]int{}}
+func sustainedIOWalkCensus(root string) (sustainedIOCensus, error) {
+	census := sustainedIOCensus{Bytes: map[string]int64{}, Files: map[string]int{}}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			// A file the daemon deleted mid-walk is not a census failure.
@@ -526,12 +526,12 @@ func w8WalkCensus(root string) (w8Census, error) {
 		if err != nil {
 			return err
 		}
-		bucket := w8ClassifyPath(rel)
+		bucket := sustainedIOClassifyPath(rel)
 		census.Bytes[bucket] += info.Size()
 		census.Files[bucket]++
 		census.TotalBytes += info.Size()
-		if bucket == w8BucketUnclassified {
-			census.Unclassified = append(census.Unclassified, w8CensusEntry{Path: filepath.ToSlash(rel), Bytes: info.Size()})
+		if bucket == sustainedIOBucketUnclassified {
+			census.Unclassified = append(census.Unclassified, sustainedIOCensusEntry{Path: filepath.ToSlash(rel), Bytes: info.Size()})
 		}
 		return nil
 	})
@@ -543,7 +543,7 @@ func w8WalkCensus(root string) (w8Census, error) {
 
 // ------------------------------------------------- checkpoint attribution ---
 
-// w8SampleSeries is what a samples stream reduces to once the checkpoint
+// sustainedIOSampleSeries is what a samples stream reduces to once the checkpoint
 // intervals are separated from the rest: bytes booked to a WAL checkpoint, per
 // phase and per phase/window.
 //
@@ -552,7 +552,7 @@ func w8WalkCensus(root string) (w8Census, error) {
 // already frozen — still carries its samples.ndjson, and the same rule applied
 // to those bytes yields the same numbers. A derived series that can only be
 // produced live is a series nobody can check.
-type w8SampleSeries struct {
+type sustainedIOSampleSeries struct {
 	// Phases maps phase name to bytes booked to checkpoints inside it.
 	Phases map[string]uint64 `json:"phases"`
 	// Windows maps "<phase>/<window>" to the same, for the sub-windows a
@@ -565,14 +565,14 @@ type w8SampleSeries struct {
 	Attributed int `json:"attributed_intervals"`
 }
 
-// w8WindowKey is the name a sub-window is reported under.
-func w8WindowKey(phase, window string) string { return phase + "/" + window }
+// sustainedIOWindowKey is the name a sub-window is reported under.
+func sustainedIOWindowKey(phase, window string) string { return phase + "/" + window }
 
-// w8CheckpointSeries books each sample interval on which wal_resets moved to
+// sustainedIOCheckpointSeries books each sample interval on which wal_resets moved to
 // that sample's phase (and window). A sample with no logical-writes reading
 // breaks the chain: the next interval would span a gap nobody measured.
-func w8CheckpointSeries(samples []w8Sample) w8SampleSeries {
-	series := w8SampleSeries{Phases: map[string]uint64{}, Windows: map[string]uint64{}, Samples: len(samples)}
+func sustainedIOCheckpointSeries(samples []sustainedIOSample) sustainedIOSampleSeries {
+	series := sustainedIOSampleSeries{Phases: map[string]uint64{}, Windows: map[string]uint64{}, Samples: len(samples)}
 	var lastLogical uint64
 	haveLast := false
 	lastResets := 0
@@ -587,7 +587,7 @@ func w8CheckpointSeries(samples []w8Sample) w8SampleSeries {
 			delta := *sample.LogicalWrites - lastLogical
 			series.Phases[sample.Phase] += delta
 			if sample.Window != "" {
-				series.Windows[w8WindowKey(sample.Phase, sample.Window)] += delta
+				series.Windows[sustainedIOWindowKey(sample.Phase, sample.Window)] += delta
 			}
 			series.Attributed++
 		}
@@ -597,22 +597,22 @@ func w8CheckpointSeries(samples []w8Sample) w8SampleSeries {
 	return series
 }
 
-// w8ReadSamples parses a samples.ndjson stream. A truncated last line is
+// sustainedIOReadSamples parses a samples.ndjson stream. A truncated last line is
 // tolerated — a run killed mid-sample still has every sample before it — and
 // reported by count rather than swallowed.
-func w8ReadSamples(path string) ([]w8Sample, int, error) {
+func sustainedIOReadSamples(path string) ([]sustainedIOSample, int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, 0, err
 	}
-	var samples []w8Sample
+	var samples []sustainedIOSample
 	skipped := 0
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		var sample w8Sample
+		var sample sustainedIOSample
 		if err := json.Unmarshal([]byte(line), &sample); err != nil {
 			skipped++
 			continue
@@ -624,34 +624,34 @@ func w8ReadSamples(path string) ([]w8Sample, int, error) {
 
 // -------------------------------------------------------------- manifest ---
 
-// w8Manifest is what makes a number reproducible: which binary, built from
+// sustainedIOManifest is what makes a number reproducible: which binary, built from
 // which tree, on which toolchain, against which fixture, with which
 // environment. A report without one is an anecdote.
-type w8Manifest struct {
-	RunID         string            `json:"run_id"`
-	Arm           string            `json:"arm"`
-	StartedAt     string            `json:"started_at"`
-	Binary        string            `json:"binary"`
-	BinarySHA256  string            `json:"binary_sha256"`
-	BinaryVersion string            `json:"binary_version,omitempty"`
-	SourceCommit  string            `json:"source_commit,omitempty"`
-	DirtyDigest   string            `json:"dirty_tree_digest,omitempty"`
-	Toolchain     string            `json:"toolchain"`
-	GOOS          string            `json:"goos"`
-	GOARCH        string            `json:"goarch"`
-	Python        string            `json:"python,omitempty"`
-	Fixture       w8FixtureSpec     `json:"fixture"`
-	FixtureDigest string            `json:"fixture_digest"`
-	Worktrees     int               `json:"worktrees"`
-	Commits       int               `json:"commits"`
-	Edits         int               `json:"edits"`
-	Repetitions   int               `json:"repetitions"`
-	Cold          bool              `json:"cold"`
-	Env           map[string]string `json:"env"`
-	Notes         []string          `json:"notes,omitempty"`
+type sustainedIOManifest struct {
+	RunID         string                 `json:"run_id"`
+	Arm           string                 `json:"arm"`
+	StartedAt     string                 `json:"started_at"`
+	Binary        string                 `json:"binary"`
+	BinarySHA256  string                 `json:"binary_sha256"`
+	BinaryVersion string                 `json:"binary_version,omitempty"`
+	SourceCommit  string                 `json:"source_commit,omitempty"`
+	DirtyDigest   string                 `json:"dirty_tree_digest,omitempty"`
+	Toolchain     string                 `json:"toolchain"`
+	GOOS          string                 `json:"goos"`
+	GOARCH        string                 `json:"goarch"`
+	Python        string                 `json:"python,omitempty"`
+	Fixture       sustainedIOFixtureSpec `json:"fixture"`
+	FixtureDigest string                 `json:"fixture_digest"`
+	Worktrees     int                    `json:"worktrees"`
+	Commits       int                    `json:"commits"`
+	Edits         int                    `json:"edits"`
+	Repetitions   int                    `json:"repetitions"`
+	Cold          bool                   `json:"cold"`
+	Env           map[string]string      `json:"env"`
+	Notes         []string               `json:"notes,omitempty"`
 }
 
-func w8FileSHA256(path string) (string, error) {
+func sustainedIOFileSHA256(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -664,12 +664,12 @@ func w8FileSHA256(path string) (string, error) {
 	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
-// w8RecordedEnv keeps the variables that change what is measured and drops
+// sustainedIORecordedEnv keeps the variables that change what is measured and drops
 // everything else. Anything whose name looks like a credential is dropped even
 // when its prefix is on the list: a manifest is an artifact that gets copied
 // around.
-func w8RecordedEnv(environ []string) map[string]string {
-	prefixes := []string{"GXW8_", "GORTEX_", "XDG_", "GIT_", "GO", "TMPDIR", "HOME", "PATH", "LANG", "LC_", "CI", "NO_COLOR"}
+func sustainedIORecordedEnv(environ []string) map[string]string {
+	prefixes := []string{"GX_SUSTAINED_IO_", "GX_E2E_MATRIX_", "GORTEX_", "XDG_", "GIT_", "GO", "TMPDIR", "HOME", "PATH", "LANG", "LC_", "CI", "NO_COLOR"}
 	secrets := []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"}
 	recorded := map[string]string{}
 	for _, entry := range environ {
@@ -701,21 +701,21 @@ func w8RecordedEnv(environ []string) map[string]string {
 	return recorded
 }
 
-// w8BuildManifest fills in everything derivable from the machine. Fields the
+// sustainedIOBuildManifest fills in everything derivable from the machine. Fields the
 // caller owns (RunID, Arm, Fixture, Cold, Notes …) are taken from the template.
-func w8BuildManifest(template w8Manifest, binary string, environ []string, fixture []w8FixtureFile) w8Manifest {
+func sustainedIOBuildManifest(template sustainedIOManifest, binary string, environ []string, fixture []sustainedIOFixtureFile) sustainedIOManifest {
 	manifest := template
 	manifest.StartedAt = time.Now().UTC().Format(time.RFC3339)
 	manifest.Binary = binary
-	if sum, err := w8FileSHA256(binary); err == nil {
+	if sum, err := sustainedIOFileSHA256(binary); err == nil {
 		manifest.BinarySHA256 = sum
 	} else {
 		manifest.Notes = append(manifest.Notes, "binary sha256 unavailable: "+err.Error())
 	}
 	manifest.Toolchain = runtime.Version()
 	manifest.GOOS, manifest.GOARCH = runtime.GOOS, runtime.GOARCH
-	manifest.Env = w8RecordedEnv(environ)
-	manifest.FixtureDigest = w8FixtureDigest(fixture)
+	manifest.Env = sustainedIORecordedEnv(environ)
+	manifest.FixtureDigest = sustainedIOFixtureDigest(fixture)
 	if path, err := exec.LookPath("python3"); err == nil {
 		manifest.Python = path
 	}
@@ -724,12 +724,13 @@ func w8BuildManifest(template w8Manifest, binary string, environ []string, fixtu
 
 // ------------------------------------------------- daemon counter scraping ---
 
-// w8ParseStatusCounters pulls views.counters out of `daemon status --format
-// json`. A binary without the flag (every pre-W8.3 baseline arm) fails the
+// sustainedIOParseStatusCounters pulls views.counters out of `daemon status --format
+// json`. A binary without the flag (every baseline arm built before the
+// counters landed) fails the
 // command outright; the caller records the unavailability by name instead of
 // substituting zeros, because a missing series and a zero series are different
 // facts.
-func w8ParseStatusCounters(output []byte) (map[string]int64, error) {
+func sustainedIOParseStatusCounters(output []byte) (map[string]int64, error) {
 	var payload struct {
 		Views *struct {
 			Counters map[string]int64 `json:"counters"`
@@ -747,9 +748,9 @@ func w8ParseStatusCounters(output []byte) (map[string]int64, error) {
 	return payload.Views.Counters, nil
 }
 
-// w8CounterDelta subtracts two counter snapshots, keeping every series either
+// sustainedIOCounterDelta subtracts two counter snapshots, keeping every series either
 // side names.
-func w8CounterDelta(before, after map[string]int64) map[string]int64 {
+func sustainedIOCounterDelta(before, after map[string]int64) map[string]int64 {
 	delta := map[string]int64{}
 	for key, value := range after {
 		if d := value - before[key]; d != 0 {
@@ -766,9 +767,9 @@ func w8CounterDelta(before, after map[string]int64) map[string]int64 {
 
 // ----------------------------------------------------------------- tests ---
 
-func TestW8ReadWALHeaderParsesTheDocumentedLayout(t *testing.T) {
+func TestSustainedIOReadWALHeaderParsesTheDocumentedLayout(t *testing.T) {
 	raw := make([]byte, 64)
-	binary.BigEndian.PutUint32(raw[0:4], w8WALMagicBE)
+	binary.BigEndian.PutUint32(raw[0:4], sustainedIOWALMagicBE)
 	binary.BigEndian.PutUint32(raw[4:8], 3007000)
 	binary.BigEndian.PutUint32(raw[8:12], 4096)
 	binary.BigEndian.PutUint32(raw[12:16], 9)
@@ -778,7 +779,7 @@ func TestW8ReadWALHeaderParsesTheDocumentedLayout(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	header, err := w8ReadWALHeader(path)
+	header, err := sustainedIOReadWALHeader(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -788,9 +789,9 @@ func TestW8ReadWALHeaderParsesTheDocumentedLayout(t *testing.T) {
 	}
 }
 
-func TestW8ReadWALHeaderTreatsAbsentAndTruncatedAsNotPresent(t *testing.T) {
+func TestSustainedIOReadWALHeaderTreatsAbsentAndTruncatedAsNotPresent(t *testing.T) {
 	dir := t.TempDir()
-	header, err := w8ReadWALHeader(filepath.Join(dir, "missing-wal"))
+	header, err := sustainedIOReadWALHeader(filepath.Join(dir, "missing-wal"))
 	if err != nil || header.Present {
 		t.Fatalf("absent wal: header=%+v err=%v", header, err)
 	}
@@ -798,7 +799,7 @@ func TestW8ReadWALHeaderTreatsAbsentAndTruncatedAsNotPresent(t *testing.T) {
 	if err := os.WriteFile(empty, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	header, err = w8ReadWALHeader(empty)
+	header, err = sustainedIOReadWALHeader(empty)
 	if err != nil || header.Present {
 		t.Fatalf("truncated wal: header=%+v err=%v", header, err)
 	}
@@ -806,17 +807,17 @@ func TestW8ReadWALHeaderTreatsAbsentAndTruncatedAsNotPresent(t *testing.T) {
 	if err := os.WriteFile(foreign, make([]byte, 32), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w8ReadWALHeader(foreign); err == nil {
+	if _, err := sustainedIOReadWALHeader(foreign); err == nil {
 		t.Fatal("a foreign magic must be an error, not a silent zero header")
 	}
 }
 
-func TestW8CheckpointCounterCountsResetsNotAppends(t *testing.T) {
-	present := func(seq, salt uint32) w8WALHeader {
-		return w8WALHeader{Present: true, CheckpointSeq: seq, Salt1: salt}
+func TestSustainedIOCheckpointCounterCountsResetsNotAppends(t *testing.T) {
+	present := func(seq, salt uint32) sustainedIOWALHeader {
+		return sustainedIOWALHeader{Present: true, CheckpointSeq: seq, Salt1: salt}
 	}
-	var counter w8CheckpointCounter
-	for _, header := range []w8WALHeader{
+	var counter sustainedIOCheckpointCounter
+	for _, header := range []sustainedIOWALHeader{
 		{},                 // no WAL yet
 		present(0, 0x1111), // WAL created: not a reset
 		present(0, 0x1111), // appended to: not a reset
@@ -833,12 +834,12 @@ func TestW8CheckpointCounterCountsResetsNotAppends(t *testing.T) {
 	}
 }
 
-// TestW8WALCheckpointSequenceAdvancesOnReset is the experiment map-e2e-io.md
+// TestSustainedIOWALCheckpointSequenceAdvancesOnReset is the experiment map-e2e-io.md
 // §5.3 asks for before the harness relies on the header field: does the WAL
 // checkpoint-sequence at offset 12 actually move under modernc.org/sqlite?
 // The answer is recorded in the test's own failure text so a future change of
 // driver is caught here rather than silently zeroing a measured series.
-func TestW8WALCheckpointSequenceAdvancesOnReset(t *testing.T) {
+func TestSustainedIOWALCheckpointSequenceAdvancesOnReset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "probe.sqlite")
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
@@ -860,13 +861,13 @@ func TestW8WALCheckpointSequenceAdvancesOnReset(t *testing.T) {
 	fill := func(rows int) {
 		t.Helper()
 		for i := 0; i < rows; i++ {
-			if _, err := db.Exec("INSERT INTO probe(payload) VALUES (?)", bytes.Repeat([]byte("w8"), 512)); err != nil {
+			if _, err := db.Exec("INSERT INTO probe(payload) VALUES (?)", bytes.Repeat([]byte("gx"), 512)); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
 	fill(64)
-	before, err := w8ReadWALHeader(path + "-wal")
+	before, err := sustainedIOReadWALHeader(path + "-wal")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,13 +879,13 @@ func TestW8WALCheckpointSequenceAdvancesOnReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	fill(8)
-	after, err := w8ReadWALHeader(path + "-wal")
+	after, err := sustainedIOReadWALHeader(path + "-wal")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("wal_checkpoint(RESTART): busy=%d frames=%d checkpointed=%d; header ckpt_seq %d -> %d, salt1 %#x -> %#x",
 		busy, walFrames, checkpointed, before.CheckpointSeq, after.CheckpointSeq, before.Salt1, after.Salt1)
-	var counter w8CheckpointCounter
+	var counter sustainedIOCheckpointCounter
 	counter.Observe(before)
 	counter.Observe(after)
 	if counter.Resets() != 1 {
@@ -894,9 +895,9 @@ func TestW8WALCheckpointSequenceAdvancesOnReset(t *testing.T) {
 	}
 }
 
-func TestW8SamplerWritesOneLinePerTickWithPhaseLabels(t *testing.T) {
+func TestSustainedIOSamplerWritesOneLinePerTickWithPhaseLabels(t *testing.T) {
 	var out bytes.Buffer
-	sampler := newW8Sampler(&out, time.Millisecond)
+	sampler := newSustainedIOSampler(&out, time.Millisecond)
 	logical := uint64(4096)
 	clock := time.Unix(1_700_000_000, 0)
 	sampler.now = func() time.Time { clock = clock.Add(time.Second); return clock }
@@ -906,11 +907,11 @@ func TestW8SamplerWritesOneLinePerTickWithPhaseLabels(t *testing.T) {
 		value := logical
 		return issue767ProcessIO{BytesWritten: logical / 2, LogicalBytesWritten: &value, PhysFootprint: 99}, nil
 	}
-	sampler.readSize = func() w8FileSizes { return w8FileSizes{Store: 10, WAL: 20, SHM: 30, Log: 40} }
+	sampler.readSize = func() sustainedIOFileSizes { return sustainedIOFileSizes{Store: 10, WAL: 20, SHM: 30, Log: 40} }
 	seq := uint32(0)
-	sampler.readWAL = func() (w8WALHeader, error) {
+	sampler.readWAL = func() (sustainedIOWALHeader, error) {
 		seq++
-		return w8WALHeader{Present: true, CheckpointSeq: seq, Salt1: seq}, nil
+		return sustainedIOWALHeader{Present: true, CheckpointSeq: seq, Salt1: seq}, nil
 	}
 	sampler.SetPhase("P0_cold_index")
 	sampler.Sample()
@@ -924,7 +925,7 @@ func TestW8SamplerWritesOneLinePerTickWithPhaseLabels(t *testing.T) {
 	}
 	phases := []string{"P0_cold_index", "P1_idle_cold", "P1_idle_cold"}
 	for i, line := range lines {
-		var sample w8Sample
+		var sample sustainedIOSample
 		if err := json.Unmarshal([]byte(line), &sample); err != nil {
 			t.Fatalf("line %d is not JSON: %v", i, err)
 		}
@@ -949,14 +950,14 @@ func TestW8SamplerWritesOneLinePerTickWithPhaseLabels(t *testing.T) {
 	}
 }
 
-func TestW8SamplerRecordsReaderFailuresInsteadOfDroppingTheSample(t *testing.T) {
+func TestSustainedIOSamplerRecordsReaderFailuresInsteadOfDroppingTheSample(t *testing.T) {
 	var out bytes.Buffer
-	sampler := newW8Sampler(&out, time.Millisecond)
+	sampler := newSustainedIOSampler(&out, time.Millisecond)
 	sampler.readIO = func() (issue767ProcessIO, error) {
 		return issue767ProcessIO{}, errors.New("proc_pid_rusage: no such process")
 	}
 	sampler.Sample()
-	var sample w8Sample
+	var sample sustainedIOSample
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &sample); err != nil {
 		t.Fatal(err)
 	}
@@ -972,13 +973,13 @@ func TestW8SamplerRecordsReaderFailuresInsteadOfDroppingTheSample(t *testing.T) 
 	}
 }
 
-// TestW8SamplerNamesEveryUnwiredReaderInsteadOfReportingZero is the guard
-// behind the w8NewRunSampler wiring pin: whatever else changes, a reader that
+// TestSustainedIOSamplerNamesEveryUnwiredReaderInsteadOfReportingZero is the guard
+// behind the sustainedIONewRunSampler wiring pin: whatever else changes, a reader that
 // is not wired must be named in the sample and must cost the series its health,
 // so a deleted production wiring can never present itself as a measurement.
-func TestW8SamplerNamesEveryUnwiredReaderInsteadOfReportingZero(t *testing.T) {
+func TestSustainedIOSamplerNamesEveryUnwiredReaderInsteadOfReportingZero(t *testing.T) {
 	var out bytes.Buffer
-	sampler := newW8Sampler(&out, time.Hour)
+	sampler := newSustainedIOSampler(&out, time.Hour)
 	sample := sampler.Sample()
 
 	want := map[string]bool{"readSize": true, "pid": true, "readWAL": true, "readIO": true}
@@ -1020,7 +1021,7 @@ func TestW8SamplerNamesEveryUnwiredReaderInsteadOfReportingZero(t *testing.T) {
 	if sampler.Resets() != 0 {
 		t.Fatalf("an unwired sampler counted %d WAL resets", sampler.Resets())
 	}
-	var decoded w8Sample
+	var decoded sustainedIOSample
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &decoded); err != nil {
 		t.Fatal(err)
 	}
@@ -1029,9 +1030,9 @@ func TestW8SamplerNamesEveryUnwiredReaderInsteadOfReportingZero(t *testing.T) {
 	}
 }
 
-func TestW8SamplerRunTicksUntilCancelled(t *testing.T) {
+func TestSustainedIOSamplerRunTicksUntilCancelled(t *testing.T) {
 	var out bytes.Buffer
-	sampler := newW8Sampler(&out, 2*time.Millisecond)
+	sampler := newSustainedIOSampler(&out, 2*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { sampler.Run(ctx); close(done) }()
@@ -1052,16 +1053,16 @@ func TestW8SamplerRunTicksUntilCancelled(t *testing.T) {
 	<-done
 }
 
-func TestW8ArtifactPathRefusesADestinationInsideTheMeasuredRoot(t *testing.T) {
+func TestSustainedIOArtifactPathRefusesADestinationInsideTheMeasuredRoot(t *testing.T) {
 	root := t.TempDir()
-	if _, err := w8ArtifactPath(filepath.Join(root, "artifacts"), root, "samples.ndjson"); err == nil {
+	if _, err := sustainedIOArtifactPath(filepath.Join(root, "artifacts"), root, "samples.ndjson"); err == nil {
 		t.Fatal("an artifact dir inside the daemon root must be refused")
 	}
-	if _, err := w8ArtifactPath(root, root, "samples.ndjson"); err == nil {
+	if _, err := sustainedIOArtifactPath(root, root, "samples.ndjson"); err == nil {
 		t.Fatal("the daemon root itself must be refused")
 	}
 	outside := t.TempDir()
-	path, err := w8ArtifactPath(outside, root, "samples.ndjson")
+	path, err := sustainedIOArtifactPath(outside, root, "samples.ndjson")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1070,46 +1071,46 @@ func TestW8ArtifactPathRefusesADestinationInsideTheMeasuredRoot(t *testing.T) {
 	}
 }
 
-func TestW8ClassifyPathAttributesEveryKnownWriter(t *testing.T) {
+func TestSustainedIOClassifyPathAttributesEveryKnownWriter(t *testing.T) {
 	for _, tc := range []struct{ rel, want string }{
-		{"store.sqlite", w8BucketStore},
-		{"store.sqlite-wal", w8BucketStoreWAL},
-		{"store.sqlite-shm", w8BucketStoreSHM},
-		{"store.sqlite.lock", w8BucketStoreLock},
-		{"data/gortex/sidecar.sqlite", w8BucketSidecar},
-		{"data/gortex/sidecar.sqlite-wal", w8BucketSidecar},
-		{"data/gortex/memories/sidecar.sqlite-shm", w8BucketSidecar},
-		{"data/gortex/notebook-cache/.gortex/sidecar.sqlite", w8BucketSidecar},
-		{"data/gortex/models/potion-code-16M-v2/model.safetensors", w8BucketModel},
-		{"data/gortex/models/potion-code-16M-v2/tokenizer.json", w8BucketModel},
-		{"wt01/.git", w8BucketFixtureGit},
-		{"daemon-1.log", w8BucketDaemonLog},
-		{"cache/gortex/daemon.pid", w8BucketDaemonPID},
-		{"cache/gortex/daemon.sock", w8BucketDaemonSocket},
-		{"cache/gortex/daemon.stopped", w8BucketStopIntent},
-		{"cache/gortex/daemon.state.json", w8BucketDaemonState},
-		{"cache/gortex/daemon.gob.gz", w8BucketSnapshot},
-		{"data/gortex/consent.json", w8BucketTelemetry},
-		{"data/gortex/install-id", w8BucketTelemetry},
-		{"data/gortex/last-send", w8BucketTelemetry},
-		{"data/gortex/telemetry/rollup-2026-09-13.json", w8BucketTelemetry},
-		{"data/gortex/store/.gitignore", w8BucketGitignore},
-		{"config/gortex/config.yaml", w8BucketConfig},
-		{"repo/.git/index", w8BucketFixtureGit},
-		{"gitconfig", w8BucketFixtureGit},
-		{"repo/p001/file00001.go", w8BucketFixtureSrc},
-		{"repo/go.mod", w8BucketFixtureSrc},
-		{"cache/gortex/searcher.bin", w8BucketCache},
-		{"data/gortex/memories.db", w8BucketData},
-		{"something/unexpected.bin", w8BucketUnclassified},
+		{"store.sqlite", sustainedIOBucketStore},
+		{"store.sqlite-wal", sustainedIOBucketStoreWAL},
+		{"store.sqlite-shm", sustainedIOBucketStoreSHM},
+		{"store.sqlite.lock", sustainedIOBucketStoreLock},
+		{"data/gortex/sidecar.sqlite", sustainedIOBucketSidecar},
+		{"data/gortex/sidecar.sqlite-wal", sustainedIOBucketSidecar},
+		{"data/gortex/memories/sidecar.sqlite-shm", sustainedIOBucketSidecar},
+		{"data/gortex/notebook-cache/.gortex/sidecar.sqlite", sustainedIOBucketSidecar},
+		{"data/gortex/models/potion-code-16M-v2/model.safetensors", sustainedIOBucketModel},
+		{"data/gortex/models/potion-code-16M-v2/tokenizer.json", sustainedIOBucketModel},
+		{"wt01/.git", sustainedIOBucketFixtureGit},
+		{"daemon-1.log", sustainedIOBucketDaemonLog},
+		{"cache/gortex/daemon.pid", sustainedIOBucketDaemonPID},
+		{"cache/gortex/daemon.sock", sustainedIOBucketDaemonSocket},
+		{"cache/gortex/daemon.stopped", sustainedIOBucketStopIntent},
+		{"cache/gortex/daemon.state.json", sustainedIOBucketDaemonState},
+		{"cache/gortex/daemon.gob.gz", sustainedIOBucketSnapshot},
+		{"data/gortex/consent.json", sustainedIOBucketTelemetry},
+		{"data/gortex/install-id", sustainedIOBucketTelemetry},
+		{"data/gortex/last-send", sustainedIOBucketTelemetry},
+		{"data/gortex/telemetry/rollup-2026-09-13.json", sustainedIOBucketTelemetry},
+		{"data/gortex/store/.gitignore", sustainedIOBucketGitignore},
+		{"config/gortex/config.yaml", sustainedIOBucketConfig},
+		{"repo/.git/index", sustainedIOBucketFixtureGit},
+		{"gitconfig", sustainedIOBucketFixtureGit},
+		{"repo/p001/file00001.go", sustainedIOBucketFixtureSrc},
+		{"repo/go.mod", sustainedIOBucketFixtureSrc},
+		{"cache/gortex/searcher.bin", sustainedIOBucketCache},
+		{"data/gortex/memories.db", sustainedIOBucketData},
+		{"something/unexpected.bin", sustainedIOBucketUnclassified},
 	} {
-		if got := w8ClassifyPath(tc.rel); got != tc.want {
-			t.Errorf("w8ClassifyPath(%q) = %q, want %q", tc.rel, got, tc.want)
+		if got := sustainedIOClassifyPath(tc.rel); got != tc.want {
+			t.Errorf("sustainedIOClassifyPath(%q) = %q, want %q", tc.rel, got, tc.want)
 		}
 	}
 }
 
-func TestW8WalkCensusListsUnclassifiedBytesByName(t *testing.T) {
+func TestSustainedIOWalkCensusListsUnclassifiedBytesByName(t *testing.T) {
 	root := t.TempDir()
 	write := func(rel string, size int) {
 		t.Helper()
@@ -1128,30 +1129,30 @@ func TestW8WalkCensusListsUnclassifiedBytesByName(t *testing.T) {
 	write("mystery.bin", 7)
 	write("nested/other.dat", 3)
 
-	census, err := w8WalkCensus(root)
+	census, err := sustainedIOWalkCensus(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if census.TotalBytes != 195 {
 		t.Errorf("total = %d, want 195", census.TotalBytes)
 	}
-	if census.Bytes[w8BucketStore] != 100 || census.Bytes[w8BucketStoreWAL] != 50 || census.Bytes[w8BucketDaemonLog] != 25 {
+	if census.Bytes[sustainedIOBucketStore] != 100 || census.Bytes[sustainedIOBucketStoreWAL] != 50 || census.Bytes[sustainedIOBucketDaemonLog] != 25 {
 		t.Errorf("store/wal/log attribution wrong: %+v", census.Bytes)
 	}
-	if census.Bytes[w8BucketUnclassified] != 10 || len(census.Unclassified) != 2 {
+	if census.Bytes[sustainedIOBucketUnclassified] != 10 || len(census.Unclassified) != 2 {
 		t.Fatalf("unclassified residue not itemised: %+v %+v", census.Bytes, census.Unclassified)
 	}
 	if census.Unclassified[0].Path != "mystery.bin" || census.Unclassified[0].Bytes != 7 {
 		t.Errorf("unclassified entries = %+v", census.Unclassified)
 	}
-	if census.Files[w8BucketFixtureSrc] != 1 {
+	if census.Files[sustainedIOBucketFixtureSrc] != 1 {
 		t.Errorf("file counts wrong: %+v", census.Files)
 	}
 }
 
-func TestW8RecordedEnvKeepsKnobsAndDropsCredentials(t *testing.T) {
-	env := w8RecordedEnv([]string{
-		"GXW8_FIXTURE_FILES=1500",
+func TestSustainedIORecordedEnvKeepsKnobsAndDropsCredentials(t *testing.T) {
+	env := sustainedIORecordedEnv([]string{
+		"GX_SUSTAINED_IO_FIXTURE_FILES=1500",
 		"GORTEX_RECONCILE_INTERVAL=5s",
 		"GORTEX_TELEMETRY=0",
 		"XDG_DATA_HOME=/tmp/x",
@@ -1161,7 +1162,7 @@ func TestW8RecordedEnvKeepsKnobsAndDropsCredentials(t *testing.T) {
 		"GITHUB_TOKEN=secret",
 		"UNRELATED=1",
 	})
-	for _, want := range []string{"GXW8_FIXTURE_FILES", "GORTEX_RECONCILE_INTERVAL", "GORTEX_TELEMETRY", "XDG_DATA_HOME", "GOFLAGS"} {
+	for _, want := range []string{"GX_SUSTAINED_IO_FIXTURE_FILES", "GORTEX_RECONCILE_INTERVAL", "GORTEX_TELEMETRY", "XDG_DATA_HOME", "GOFLAGS"} {
 		if _, ok := env[want]; !ok {
 			t.Errorf("manifest dropped %s", want)
 		}
@@ -1173,21 +1174,21 @@ func TestW8RecordedEnvKeepsKnobsAndDropsCredentials(t *testing.T) {
 	}
 }
 
-func TestW8BuildManifestRecordsBinaryIdentity(t *testing.T) {
+func TestSustainedIOBuildManifestRecordsBinaryIdentity(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "gortex-fake")
 	payload := []byte("not really a binary")
 	if err := os.WriteFile(binary, payload, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	spec := w8FixtureSpec{Files: 20, Packages: 4, Seed: 11}
-	fixture := w8GenerateFixture(spec)
-	manifest := w8BuildManifest(w8Manifest{RunID: "r1", Arm: "candidate", Fixture: spec.normalize(), Cold: true},
-		binary, []string{"GXW8_REPS=1", "AWS_SECRET_ACCESS_KEY=x"}, fixture)
+	spec := sustainedIOFixtureSpec{Files: 20, Packages: 4, Seed: 11}
+	fixture := sustainedIOGenerateFixture(spec)
+	manifest := sustainedIOBuildManifest(sustainedIOManifest{RunID: "r1", Arm: "candidate", Fixture: spec.normalize(), Cold: true},
+		binary, []string{"GX_SUSTAINED_IO_REPS=1", "AWS_SECRET_ACCESS_KEY=x"}, fixture)
 	want := sha256.Sum256(payload)
 	if manifest.BinarySHA256 != hex.EncodeToString(want[:]) {
 		t.Errorf("binary sha256 = %q", manifest.BinarySHA256)
 	}
-	if manifest.FixtureDigest != w8FixtureDigest(fixture) {
+	if manifest.FixtureDigest != sustainedIOFixtureDigest(fixture) {
 		t.Error("fixture digest not recorded")
 	}
 	if manifest.Toolchain != runtime.Version() || manifest.GOOS != runtime.GOOS || manifest.GOARCH != runtime.GOARCH {
@@ -1196,7 +1197,7 @@ func TestW8BuildManifestRecordsBinaryIdentity(t *testing.T) {
 	if _, ok := manifest.Env["AWS_SECRET_ACCESS_KEY"]; ok {
 		t.Error("manifest recorded a credential")
 	}
-	if manifest.Env["GXW8_REPS"] != "1" {
+	if manifest.Env["GX_SUSTAINED_IO_REPS"] != "1" {
 		t.Error("manifest dropped a harness knob")
 	}
 	if manifest.StartedAt == "" || manifest.RunID != "r1" || manifest.Arm != "candidate" || !manifest.Cold {
@@ -1204,8 +1205,8 @@ func TestW8BuildManifestRecordsBinaryIdentity(t *testing.T) {
 	}
 }
 
-func TestW8ParseStatusCountersReadsViewsBlock(t *testing.T) {
-	counters, err := w8ParseStatusCounters([]byte(`{"views":{"counters":{"views_dedicated_base_claim_total|outcome=reused":3,"views_coordinator_cycle_total|outcome=built_commit":7}}}`))
+func TestSustainedIOParseStatusCountersReadsViewsBlock(t *testing.T) {
+	counters, err := sustainedIOParseStatusCounters([]byte(`{"views":{"counters":{"views_dedicated_base_claim_total|outcome=reused":3,"views_coordinator_cycle_total|outcome=built_commit":7}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1217,14 +1218,14 @@ func TestW8ParseStatusCountersReadsViewsBlock(t *testing.T) {
 		{"no_views", `{"pid":1}`},
 		{"no_counters", `{"views":{"families":2}}`},
 	} {
-		if _, err := w8ParseStatusCounters([]byte(tc.payload)); err == nil {
+		if _, err := sustainedIOParseStatusCounters([]byte(tc.payload)); err == nil {
 			t.Errorf("%s: expected a named unavailability, got none", tc.name)
 		}
 	}
 }
 
-func TestW8CounterDeltaKeepsSeriesFromBothSides(t *testing.T) {
-	delta := w8CounterDelta(
+func TestSustainedIOCounterDeltaKeepsSeriesFromBothSides(t *testing.T) {
+	delta := sustainedIOCounterDelta(
 		map[string]int64{"a": 1, "b": 5, "gone": 2},
 		map[string]int64{"a": 4, "b": 5, "new": 9},
 	)
@@ -1236,10 +1237,10 @@ func TestW8CounterDeltaKeepsSeriesFromBothSides(t *testing.T) {
 	}
 }
 
-// TestW8ProcessIOSamplerReadsThisProcess proves the measurement primitive
+// TestSustainedIOProcessIOSamplerReadsThisProcess proves the measurement primitive
 // itself works on this machine — the python3 + ctypes proc_pid_rusage shim on
 // Darwin, /proc/<pid>/io on Linux — before any harness trusts its deltas.
-func TestW8ProcessIOSamplerReadsThisProcess(t *testing.T) {
+func TestSustainedIOProcessIOSamplerReadsThisProcess(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("process I/O sampler supports Darwin and Linux")
 	}
@@ -1255,7 +1256,7 @@ func TestW8ProcessIOSamplerReadsThisProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	scratch := filepath.Join(t.TempDir(), "burn.bin")
-	if err := os.WriteFile(scratch, bytes.Repeat([]byte("w8"), 512*1024), 0o600); err != nil {
+	if err := os.WriteFile(scratch, bytes.Repeat([]byte("gx"), 512*1024), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	last, err := issue767ReadProcessIO(ctx, os.Getpid())
@@ -1281,16 +1282,16 @@ func TestW8ProcessIOSamplerReadsThisProcess(t *testing.T) {
 
 // ----------------------------------------- checkpoint-attribution tests ---
 
-// w8ScriptedSampler wires a sampler to a scripted series of process-IO and WAL
+// sustainedIOScriptedSampler wires a sampler to a scripted series of process-IO and WAL
 // readings, so the checkpoint attribution can be exercised without a daemon.
-func w8ScriptedSampler(out io.Writer, logical []uint64, headers []w8WALHeader) *w8Sampler {
-	sampler := newW8Sampler(out, time.Hour)
+func sustainedIOScriptedSampler(out io.Writer, logical []uint64, headers []sustainedIOWALHeader) *sustainedIOSampler {
+	sampler := newSustainedIOSampler(out, time.Hour)
 	tick := 0
 	sampler.pid = func() int { return 4242 }
-	sampler.readSize = func() w8FileSizes { return w8FileSizes{} }
+	sampler.readSize = func() sustainedIOFileSizes { return sustainedIOFileSizes{} }
 	// Sample() reads the WAL header before the process counters, so the tick
 	// advances on the LAST reader: both must describe the same instant.
-	sampler.readWAL = func() (w8WALHeader, error) {
+	sampler.readWAL = func() (sustainedIOWALHeader, error) {
 		return headers[min(tick, len(headers)-1)], nil
 	}
 	sampler.readIO = func() (issue767ProcessIO, error) {
@@ -1301,20 +1302,22 @@ func w8ScriptedSampler(out io.Writer, logical []uint64, headers []w8WALHeader) *
 	return sampler
 }
 
-// TestW8SamplerBooksOnlyTheCheckpointIntervalToTheCheckpointSeries is the
-// derivation §F5(1) rests on: bytes written in the interval a WAL reset landed
+// TestSustainedIOSamplerBooksOnlyTheCheckpointIntervalToTheCheckpointSeries is the
+// derivation the checkpoint-excluded series rests on: bytes written in the interval a WAL reset landed
 // in are the checkpoint's; everything else is the phase's own work.
 //
 // The numbers are the frozen candidate_rep2 P2 row: 58,040,984 total, of which
 // 42,607,016 is one drain, leaving 15,433,968 — 0.91x of the baseline's
 // 16,879,664, inside the ceiling the total-series reading put it 3.44x outside.
-func TestW8SamplerBooksOnlyTheCheckpointIntervalToTheCheckpointSeries(t *testing.T) {
-	present := func(seq uint32) w8WALHeader { return w8WALHeader{Present: true, CheckpointSeq: seq, Salt1: 0x1111} }
+func TestSustainedIOSamplerBooksOnlyTheCheckpointIntervalToTheCheckpointSeries(t *testing.T) {
+	present := func(seq uint32) sustainedIOWALHeader {
+		return sustainedIOWALHeader{Present: true, CheckpointSeq: seq, Salt1: 0x1111}
+	}
 	// Four intervals: work, work, the drain, work.
 	logical := []uint64{0, 5_000_000, 10_000_000, 52_607_016, 58_040_984}
-	headers := []w8WALHeader{present(0), present(0), present(0), present(1), present(1)}
+	headers := []sustainedIOWALHeader{present(0), present(0), present(0), present(1), present(1)}
 	var out bytes.Buffer
-	sampler := w8ScriptedSampler(&out, logical, headers)
+	sampler := sustainedIOScriptedSampler(&out, logical, headers)
 	sampler.SetPhase("P2_small_edits")
 	for range logical {
 		sampler.Sample()
@@ -1326,39 +1329,39 @@ func TestW8SamplerBooksOnlyTheCheckpointIntervalToTheCheckpointSeries(t *testing
 		t.Fatalf("wal resets = %d, want 1", got)
 	}
 	total := logical[len(logical)-1]
-	excluded := w8ExcludeCheckpoint(&total, sampler.CheckpointBytes())
+	excluded := sustainedIOExcludeCheckpoint(&total, sampler.CheckpointBytes())
 	if excluded == nil || *excluded != 15_433_968 {
 		t.Fatalf("excluded series = %v, want 15,433,968", excluded)
 	}
 	// The same rule applied offline to the stream it just wrote must agree:
 	// the derived series is not allowed to exist only inside the process.
-	samples, skipped, err := w8ReadSamplesFromString(out.String())
+	samples, skipped, err := sustainedIOReadSamplesFromString(out.String())
 	if err != nil || skipped != 0 {
 		t.Fatalf("stream re-read: err=%v skipped=%d", err, skipped)
 	}
-	series := w8CheckpointSeries(samples)
+	series := sustainedIOCheckpointSeries(samples)
 	if series.Phases["P2_small_edits"] != 42_607_016 || series.Attributed != 1 {
 		t.Fatalf("offline reduction = %+v, want one 42,607,016 interval", series)
 	}
 }
 
-// w8ReadSamplesFromString is w8ReadSamples over an in-memory stream.
-func w8ReadSamplesFromString(stream string) ([]w8Sample, int, error) {
-	path := filepath.Join(os.TempDir(), fmt.Sprintf("w8-samples-%d.ndjson", time.Now().UnixNano()))
+// sustainedIOReadSamplesFromString is sustainedIOReadSamples over an in-memory stream.
+func sustainedIOReadSamplesFromString(stream string) ([]sustainedIOSample, int, error) {
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("sustained-io-samples-%d.ndjson", time.Now().UnixNano()))
 	if err := os.WriteFile(path, []byte(stream), 0o600); err != nil {
 		return nil, 0, err
 	}
 	defer func() { _ = os.Remove(path) }()
-	return w8ReadSamples(path)
+	return sustainedIOReadSamples(path)
 }
 
-// TestW8CheckpointSeriesAttributesPerPhaseAndPerWindow pins the offline rule,
+// TestSustainedIOCheckpointSeriesAttributesPerPhaseAndPerWindow pins the offline rule,
 // including the sub-window attribution the P4 split depends on, and the gap
 // rule: a sample with no reading breaks the chain rather than producing a
 // delta that spans a hole.
-func TestW8CheckpointSeriesAttributesPerPhaseAndPerWindow(t *testing.T) {
+func TestSustainedIOCheckpointSeriesAttributesPerPhaseAndPerWindow(t *testing.T) {
 	value := func(v uint64) *uint64 { return &v }
-	samples := []w8Sample{
+	samples := []sustainedIOSample{
 		{Phase: "P4_amend_same_tree", Window: "P4a_commit_tree_change", LogicalWrites: value(100), WALResets: 0},
 		{Phase: "P4_amend_same_tree", Window: "P4a_commit_tree_change", LogicalWrites: value(200), WALResets: 0},
 		{Phase: "P4_amend_same_tree", Window: "P4a_commit_tree_change", LogicalWrites: value(900), WALResets: 1},
@@ -1370,14 +1373,14 @@ func TestW8CheckpointSeriesAttributesPerPhaseAndPerWindow(t *testing.T) {
 		{Phase: "P8_idle_warm", LogicalWrites: value(9100), WALResets: 2},
 		{Phase: "P8_idle_warm", LogicalWrites: value(9500), WALResets: 3},
 	}
-	series := w8CheckpointSeries(samples)
+	series := sustainedIOCheckpointSeries(samples)
 	if series.Phases["P4_amend_same_tree"] != 700 {
 		t.Fatalf("P4 checkpoint bytes = %d, want the 700 of the reset interval", series.Phases["P4_amend_same_tree"])
 	}
-	if series.Windows[w8WindowKey("P4_amend_same_tree", "P4a_commit_tree_change")] != 700 {
+	if series.Windows[sustainedIOWindowKey("P4_amend_same_tree", "P4a_commit_tree_change")] != 700 {
 		t.Fatalf("the commit window did not take the drain: %+v", series.Windows)
 	}
-	if _, ok := series.Windows[w8WindowKey("P4_amend_same_tree", "P4b_amend_same_tree")]; ok {
+	if _, ok := series.Windows[sustainedIOWindowKey("P4_amend_same_tree", "P4b_amend_same_tree")]; ok {
 		t.Fatalf("the amend window was charged for a drain it did not carry: %+v", series.Windows)
 	}
 	if series.Phases["P8_idle_warm"] != 400 {
@@ -1388,18 +1391,18 @@ func TestW8CheckpointSeriesAttributesPerPhaseAndPerWindow(t *testing.T) {
 	}
 }
 
-// TestW8SamplerWindowLabelsTheStreamAndClearsOnPhaseChange pins the sub-window
+// TestSustainedIOSamplerWindowLabelsTheStreamAndClearsOnPhaseChange pins the sub-window
 // label: a window may never outlive the phase that opened it, otherwise a
 // later phase's samples would be attributed to a window that closed.
-func TestW8SamplerWindowLabelsTheStreamAndClearsOnPhaseChange(t *testing.T) {
+func TestSustainedIOSamplerWindowLabelsTheStreamAndClearsOnPhaseChange(t *testing.T) {
 	var out bytes.Buffer
-	sampler := w8ScriptedSampler(&out, []uint64{0, 1, 2}, []w8WALHeader{{Present: true}, {Present: true}, {Present: true}})
+	sampler := sustainedIOScriptedSampler(&out, []uint64{0, 1, 2}, []sustainedIOWALHeader{{Present: true}, {Present: true}, {Present: true}})
 	sampler.SetPhase("P4_amend_same_tree")
-	sampler.SetWindow(w8WindowCommitTreeChange)
+	sampler.SetWindow(sustainedIOWindowCommitTreeChange)
 	first := sampler.Sample()
 	sampler.SetPhase("P5_main_advance")
 	second := sampler.Sample()
-	if first.Window != w8WindowCommitTreeChange {
+	if first.Window != sustainedIOWindowCommitTreeChange {
 		t.Fatalf("first sample window = %q", first.Window)
 	}
 	if second.Window != "" || second.Phase != "P5_main_advance" {
@@ -1407,19 +1410,19 @@ func TestW8SamplerWindowLabelsTheStreamAndClearsOnPhaseChange(t *testing.T) {
 	}
 }
 
-// TestW8ClassifyPathSeparatesTheQueryLogFromTheCache pins the attribution
-// correction §F5(3) needs: query-log.jsonl lives under the cache dir
+// TestSustainedIOClassifyPathSeparatesTheQueryLogFromTheCache pins the attribution
+// correction the idle floor needs: query-log.jsonl lives under the cache dir
 // (internal/mcp/query_log.go:126) and was being counted as disposable cache,
 // which is exactly the per-call write an idle floor has to be read off.
-func TestW8ClassifyPathSeparatesTheQueryLogFromTheCache(t *testing.T) {
+func TestSustainedIOClassifyPathSeparatesTheQueryLogFromTheCache(t *testing.T) {
 	for _, tc := range []struct{ rel, want string }{
-		{"cache/gortex/query-log.jsonl", w8BucketQueryLog},
-		{"cache/gortex/query-log.jsonl.1", w8BucketQueryLog},
-		{"cache/gortex/searcher.bin", w8BucketCache},
-		{"data/gortex/sidecar.sqlite-wal", w8BucketSidecar},
+		{"cache/gortex/query-log.jsonl", sustainedIOBucketQueryLog},
+		{"cache/gortex/query-log.jsonl.1", sustainedIOBucketQueryLog},
+		{"cache/gortex/searcher.bin", sustainedIOBucketCache},
+		{"data/gortex/sidecar.sqlite-wal", sustainedIOBucketSidecar},
 	} {
-		if got := w8ClassifyPath(tc.rel); got != tc.want {
-			t.Errorf("w8ClassifyPath(%q) = %q, want %q", tc.rel, got, tc.want)
+		if got := sustainedIOClassifyPath(tc.rel); got != tc.want {
+			t.Errorf("sustainedIOClassifyPath(%q) = %q, want %q", tc.rel, got, tc.want)
 		}
 	}
 }

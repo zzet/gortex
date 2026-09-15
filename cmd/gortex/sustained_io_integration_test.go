@@ -35,10 +35,10 @@ import (
 // own viewmetrics counters and a destination census of every byte under the
 // private root.
 //
-// It is opt-in (GXW8_TEST_BINARY) and never runs in a default `go test ./...`.
+// It is opt-in (GX_SUSTAINED_IO_TEST_BINARY) and never runs in a default `go test ./...`.
 // The instrument itself — generator, sampler, checkpoint counter, manifest,
 // attribution, phase plan, timeout arithmetic — is unit-tested in
-// w8_fixture_generator_test.go, w8_sampler_test.go and at the bottom of this
+// sustained_io_fixture_generator_test.go, sustained_io_sampler_test.go and at the bottom of this
 // file, so the parts that can be wrong without a daemon are checked without one.
 //
 // Caveats that travel with every number this produces:
@@ -55,23 +55,23 @@ import (
 //     budgets are frozen from a baseline arm by a later item.
 
 const (
-	w8AdvanceMarkerFormat  = "W8Advance%03dMarker"
-	w8DependentMarkerForm  = "W8Dependent%02dMarker"
-	w8DefaultProbeTimeout  = 3 * time.Minute
-	w8PhaseCommandTimeout  = 30 * time.Second
-	w8StatusScrapeTimeout  = 30 * time.Second
-	w8MinimumFixtureFiles  = 10
-	w8MaximumFixtureFiles  = 20000
-	w8CommitFilesPerCommit = 3
+	sustainedIOAdvanceMarkerFormat  = "GxAdvance%03dMarker"
+	sustainedIODependentMarkerForm  = "GxDependent%02dMarker"
+	sustainedIODefaultProbeTimeout  = 3 * time.Minute
+	sustainedIOPhaseCommandTimeout  = 30 * time.Second
+	sustainedIOStatusScrapeTimeout  = 30 * time.Second
+	sustainedIOMinimumFixtureFiles  = 10
+	sustainedIOMaximumFixtureFiles  = 20000
+	sustainedIOCommitFilesPerCommit = 3
 )
 
-// errW8NoChild is the "there is no daemon process to read" case, which is not
+// errSustainedIONoChild is the "there is no daemon process to read" case, which is not
 // a measurement failure: a phase that starts the child has no earlier process
 // to take a baseline from, and the child's own counters start at zero.
-var errW8NoChild = errors.New("no running child")
+var errSustainedIONoChild = errors.New("no running child")
 
-// w8ProcessWindow is one phase's process-accounted cost.
-type w8ProcessWindow struct {
+// sustainedIOProcessWindow is one phase's process-accounted cost.
+type sustainedIOProcessWindow struct {
 	OK            bool
 	Logical       *uint64
 	DiskWritten   uint64
@@ -82,22 +82,22 @@ type w8ProcessWindow struct {
 	Notes         []string
 }
 
-// w8ProcessDelta turns a phase's two rusage reads into a delta, and says in
+// sustainedIOProcessDelta turns a phase's two rusage reads into a delta, and says in
 // words why it could not when it could not.
 //
 // The one case that looks like a failure but is not: the phase that starts the
 // daemon has no process to read at its start. The child's counters begin at
 // zero, so the end read IS the delta — that is how the cold-index phase gets a
 // write series at all instead of an "unavailable".
-func w8ProcessDelta(before issue767ProcessIO, beforeErr error, after issue767ProcessIO, afterErr error) w8ProcessWindow {
-	window := w8ProcessWindow{}
+func sustainedIOProcessDelta(before issue767ProcessIO, beforeErr error, after issue767ProcessIO, afterErr error) sustainedIOProcessWindow {
+	window := sustainedIOProcessWindow{}
 	if afterErr != nil {
 		window.Notes = append(window.Notes, "process I/O unavailable at phase end: "+afterErr.Error())
 		return window
 	}
 	lifetime := false
 	if beforeErr != nil {
-		if !errors.Is(beforeErr, errW8NoChild) {
+		if !errors.Is(beforeErr, errSustainedIONoChild) {
 			window.Notes = append(window.Notes, "process I/O unavailable at phase start: "+beforeErr.Error())
 			return window
 		}
@@ -110,10 +110,10 @@ func w8ProcessDelta(before issue767ProcessIO, beforeErr error, after issue767Pro
 		return window
 	}
 	window.OK = true
-	window.DiskWritten = w8Delta(before.BytesWritten, after.BytesWritten)
-	window.DiskRead = w8Delta(before.BytesRead, after.BytesRead)
-	window.CPUUserNS = w8Delta(before.UserTimeNS, after.UserTimeNS)
-	window.CPUSystemNS = w8Delta(before.SystemTimeNS, after.SystemTimeNS)
+	window.DiskWritten = sustainedIODelta(before.BytesWritten, after.BytesWritten)
+	window.DiskRead = sustainedIODelta(before.BytesRead, after.BytesRead)
+	window.CPUUserNS = sustainedIODelta(before.UserTimeNS, after.UserTimeNS)
+	window.CPUSystemNS = sustainedIODelta(before.SystemTimeNS, after.SystemTimeNS)
 	window.PhysFootprint = after.PhysFootprint
 	if after.LogicalBytesWritten != nil {
 		start := uint64(0)
@@ -122,30 +122,30 @@ func w8ProcessDelta(before issue767ProcessIO, beforeErr error, after issue767Pro
 		} else if !lifetime {
 			return window
 		}
-		delta := w8Delta(start, *after.LogicalBytesWritten)
+		delta := sustainedIODelta(start, *after.LogicalBytesWritten)
 		window.Logical = &delta
 	}
 	return window
 }
 
-// w8Diagnostics is what the harness collects when a phase fails. A bare
+// sustainedIODiagnostics is what the harness collects when a phase fails. A bare
 // "timed out waiting for symbol X" tells the next reader nothing about why the
 // view never became exact; the daemon's own status, the family census and the
 // per-path route explanation do.
-type w8Diagnostics struct {
+type sustainedIODiagnostics struct {
 	Phase    string            `json:"phase"`
 	Commands map[string]string `json:"commands"`
 	LogTail  string            `json:"daemon_log_tail,omitempty"`
 	// Isolation carries every isolation answer this phase judged, in full. A
 	// phase that failed on an isolation question is unreadable without the
 	// answer it failed on.
-	Isolation []w8IsolationRecord `json:"isolation,omitempty"`
+	Isolation []sustainedIOIsolationRecord `json:"isolation,omitempty"`
 }
 
-// w8CollectDiagnostics runs the explain-the-view command set. run must never
+// sustainedIOCollectDiagnostics runs the explain-the-view command set. run must never
 // fail the test: this executes while a failure is already unwinding.
-func w8CollectDiagnostics(phase string, run func(args ...string) string, logTail string, paths []string, isolation []w8IsolationRecord) w8Diagnostics {
-	diagnostics := w8Diagnostics{Phase: phase, Commands: map[string]string{}, LogTail: logTail, Isolation: isolation}
+func sustainedIOCollectDiagnostics(phase string, run func(args ...string) string, logTail string, paths []string, isolation []sustainedIOIsolationRecord) sustainedIODiagnostics {
+	diagnostics := sustainedIODiagnostics{Phase: phase, Commands: map[string]string{}, LogTail: logTail, Isolation: isolation}
 	// The checkout verbs live under `repos` (checkouts_cmd.go registers them
 	// on reposCmd), and explain-view answers "which graph serves this path,
 	// and why" — the exact question a timed-out exactness wait raises.
@@ -162,9 +162,9 @@ func w8CollectDiagnostics(phase string, run func(args ...string) string, logTail
 	return diagnostics
 }
 
-// w8Config is every knob the workload takes.
-type w8Config struct {
-	Fixture        w8FixtureSpec
+// sustainedIOConfig is every knob the workload takes.
+type sustainedIOConfig struct {
+	Fixture        sustainedIOFixtureSpec
 	Worktrees      int
 	Commits        int
 	Edits          int
@@ -182,37 +182,37 @@ type w8Config struct {
 	ReconcileInterval string
 }
 
-// w8DefaultReconcileInterval is the paired protocol's janitor interval, kept
+// sustainedIODefaultReconcileInterval is the paired protocol's janitor interval, kept
 // as the default so an unset environment reproduces the frozen arms.
-const w8DefaultReconcileInterval = issue767DefaultTestReconcileInterval
+const sustainedIODefaultReconcileInterval = issue767DefaultTestReconcileInterval
 
-// w8ValidateReconcileInterval accepts the product default by name and any
+// sustainedIOValidateReconcileInterval accepts the product default by name and any
 // duration inside the range a measurement can survive. It refuses rather than
 // clamps: a run whose janitor is not what the operator typed is not
 // reproducible from its own manifest.
-func w8ValidateReconcileInterval(raw string) (string, error) {
+func sustainedIOValidateReconcileInterval(raw string) (string, error) {
 	switch raw {
 	case "":
-		return w8DefaultReconcileInterval, nil
+		return sustainedIODefaultReconcileInterval, nil
 	case issue767ProductReconcileInterval, "product":
 		return issue767ProductReconcileInterval, nil
 	}
 	value, err := time.ParseDuration(raw)
 	if err != nil {
-		return "", fmt.Errorf("GXW8_RECONCILE_INTERVAL: %w", err)
+		return "", fmt.Errorf("GX_SUSTAINED_IO_RECONCILE_INTERVAL: %w", err)
 	}
 	if value < time.Second || value > 24*time.Hour {
-		return "", fmt.Errorf("GXW8_RECONCILE_INTERVAL=%s is outside [1s,24h]", raw)
+		return "", fmt.Errorf("GX_SUSTAINED_IO_RECONCILE_INTERVAL=%s is outside [1s,24h]", raw)
 	}
 	return raw, nil
 }
 
-// w8ConfigFromEnv reads the GXW8_* knobs. Bounds are refused by name rather
+// sustainedIOConfigFromEnv reads the GX_SUSTAINED_IO_* knobs. Bounds are refused by name rather
 // than clamped silently: a run whose parameters are not what the operator typed
 // is not reproducible from its own manifest.
-func w8ConfigFromEnv(lookup func(string) string) (w8Config, error) {
-	cfg := w8Config{
-		Fixture:           w8FixtureSpec{}.normalize(),
+func sustainedIOConfigFromEnv(lookup func(string) string) (sustainedIOConfig, error) {
+	cfg := sustainedIOConfig{
+		Fixture:           sustainedIOFixtureSpec{}.normalize(),
 		Worktrees:         10,
 		Commits:           20,
 		Edits:             10,
@@ -220,7 +220,7 @@ func w8ConfigFromEnv(lookup func(string) string) (w8Config, error) {
 		Idle:              60 * time.Second,
 		SampleInterval:    time.Second,
 		Repetitions:       1,
-		ReconcileInterval: w8DefaultReconcileInterval,
+		ReconcileInterval: sustainedIODefaultReconcileInterval,
 	}
 	intKnob := func(name string, target *int, low, high int) error {
 		raw := lookup(name)
@@ -254,31 +254,31 @@ func w8ConfigFromEnv(lookup func(string) string) (w8Config, error) {
 	}
 	seed := int(cfg.Fixture.Seed)
 	for _, err := range []error{
-		intKnob("GXW8_FIXTURE_FILES", &cfg.Fixture.Files, w8MinimumFixtureFiles, w8MaximumFixtureFiles),
-		intKnob("GXW8_FIXTURE_PACKAGES", &cfg.Fixture.Packages, 1, 1000),
-		intKnob("GXW8_FIXTURE_SEED", &seed, 1, 1<<30),
-		intKnob("GXW8_WORKTREES", &cfg.Worktrees, 0, 50),
-		intKnob("GXW8_COMMITS", &cfg.Commits, 0, 200),
-		intKnob("GXW8_EDITS", &cfg.Edits, 0, 200),
-		intKnob("GXW8_REPS", &cfg.Repetitions, 1, 10),
-		durationKnob("GXW8_EDIT_INTERVAL", &cfg.EditInterval, 0, 10*time.Minute),
-		durationKnob("GXW8_IDLE", &cfg.Idle, time.Second, time.Hour),
-		durationKnob("GXW8_SAMPLE_INTERVAL", &cfg.SampleInterval, 100*time.Millisecond, time.Minute),
+		intKnob("GX_SUSTAINED_IO_FIXTURE_FILES", &cfg.Fixture.Files, sustainedIOMinimumFixtureFiles, sustainedIOMaximumFixtureFiles),
+		intKnob("GX_SUSTAINED_IO_FIXTURE_PACKAGES", &cfg.Fixture.Packages, 1, 1000),
+		intKnob("GX_SUSTAINED_IO_FIXTURE_SEED", &seed, 1, 1<<30),
+		intKnob("GX_SUSTAINED_IO_WORKTREES", &cfg.Worktrees, 0, 50),
+		intKnob("GX_SUSTAINED_IO_COMMITS", &cfg.Commits, 0, 200),
+		intKnob("GX_SUSTAINED_IO_EDITS", &cfg.Edits, 0, 200),
+		intKnob("GX_SUSTAINED_IO_REPS", &cfg.Repetitions, 1, 10),
+		durationKnob("GX_SUSTAINED_IO_EDIT_INTERVAL", &cfg.EditInterval, 0, 10*time.Minute),
+		durationKnob("GX_SUSTAINED_IO_IDLE", &cfg.Idle, time.Second, time.Hour),
+		durationKnob("GX_SUSTAINED_IO_SAMPLE_INTERVAL", &cfg.SampleInterval, 100*time.Millisecond, time.Minute),
 	} {
 		if err != nil {
 			return cfg, err
 		}
 	}
 	cfg.Fixture.Seed = int64(seed)
-	interval, err := w8ValidateReconcileInterval(lookup("GXW8_RECONCILE_INTERVAL"))
+	interval, err := sustainedIOValidateReconcileInterval(lookup("GX_SUSTAINED_IO_RECONCILE_INTERVAL"))
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ReconcileInterval = interval
-	if raw := lookup("GXW8_IDLE_BUDGET_BYTES"); raw != "" {
+	if raw := lookup("GX_SUSTAINED_IO_IDLE_BUDGET_BYTES"); raw != "" {
 		budget, err := strconv.ParseUint(raw, 10, 64)
 		if err != nil {
-			return cfg, fmt.Errorf("GXW8_IDLE_BUDGET_BYTES: %w", err)
+			return cfg, fmt.Errorf("GX_SUSTAINED_IO_IDLE_BUDGET_BYTES: %w", err)
 		}
 		cfg.IdleBudget = budget
 	}
@@ -286,21 +286,21 @@ func w8ConfigFromEnv(lookup func(string) string) (w8Config, error) {
 	return cfg, nil
 }
 
-// w8ReconcileNote states the janitor setting the run was taken under, in the
+// sustainedIOReconcileNote states the janitor setting the run was taken under, in the
 // manifest, in the operator's words. The accelerated interval is a measurement
 // choice and has to travel with every number it produced; the product default
 // is equally a choice and says so too.
-func w8ReconcileNote(interval string) string {
+func sustainedIOReconcileNote(interval string) string {
 	if interval == issue767ProductReconcileInterval {
 		return "GORTEX_RECONCILE_INTERVAL is unset: the janitor runs at the product default; this is the confirmatory configuration"
 	}
 	return "GORTEX_RECONCILE_INTERVAL=" + interval + " accelerates the janitor (the product default is 1h); these are not default-configuration numbers"
 }
 
-// w8RequiredTimeout is a floor on `go test -timeout` for one invocation. It is
+// sustainedIORequiredTimeout is a floor on `go test -timeout` for one invocation. It is
 // deliberately generous: the failure mode of an under-budgeted run is a killed
 // child daemon and a wasted hour, not a smaller number.
-func w8RequiredTimeout(cfg w8Config, arms int) time.Duration {
+func sustainedIORequiredTimeout(cfg sustainedIOConfig, arms int) time.Duration {
 	if arms < 1 {
 		arms = 1
 	}
@@ -322,88 +322,88 @@ func w8RequiredTimeout(cfg w8Config, arms int) time.Duration {
 // once: the polling arm of an idle phase runs FIRST (see idleWindows), so it
 // is the `a` window and the quiet arm is the `b` window.
 const (
-	w8WindowCommitTreeChange = "P4a_commit_tree_change"
-	w8WindowAmendSameTree    = "P4b_amend_same_tree"
-	w8WindowIdleColdPolling  = "P1a_idle_cold_polling"
-	w8WindowIdleColdQuiet    = "P1b_idle_cold_quiet"
-	w8WindowIdleWarmPolling  = "P8a_idle_warm_polling"
-	w8WindowIdleWarmQuiet    = "P8b_idle_warm_quiet"
+	sustainedIOWindowCommitTreeChange = "P4a_commit_tree_change"
+	sustainedIOWindowAmendSameTree    = "P4b_amend_same_tree"
+	sustainedIOWindowIdleColdPolling  = "P1a_idle_cold_polling"
+	sustainedIOWindowIdleColdQuiet    = "P1b_idle_cold_quiet"
+	sustainedIOWindowIdleWarmPolling  = "P8a_idle_warm_polling"
+	sustainedIOWindowIdleWarmQuiet    = "P8b_idle_warm_quiet"
 )
 
-// w8WindowPlan is the declared sub-window plan, phase by phase, so the split
+// sustainedIOWindowPlan is the declared sub-window plan, phase by phase, so the split
 // is pinned by a test rather than discovered by reading three phase bodies.
 // The slice order is the measurement order.
-func w8WindowPlan() map[string][]string {
+func sustainedIOWindowPlan() map[string][]string {
 	return map[string][]string{
-		"P1_idle_cold":       {w8WindowIdleColdPolling, w8WindowIdleColdQuiet},
-		"P4_amend_same_tree": {w8WindowCommitTreeChange, w8WindowAmendSameTree},
-		"P8_idle_warm":       {w8WindowIdleWarmPolling, w8WindowIdleWarmQuiet},
+		"P1_idle_cold":       {sustainedIOWindowIdleColdPolling, sustainedIOWindowIdleColdQuiet},
+		"P4_amend_same_tree": {sustainedIOWindowCommitTreeChange, sustainedIOWindowAmendSameTree},
+		"P8_idle_warm":       {sustainedIOWindowIdleWarmPolling, sustainedIOWindowIdleWarmQuiet},
 	}
 }
 
-// w8Phase is one step of the workload. Detail is what the phase did, in the
+// sustainedIOPhase is one step of the workload. Detail is what the phase did, in the
 // operator's vocabulary, and it lands in the artifact next to the numbers.
-type w8Phase struct {
+type sustainedIOPhase struct {
 	Name   string
 	Detail string
-	Run    func(r *w8Run)
+	Run    func(r *sustainedIORun)
 }
 
-// w8PhasePlan is the nine-phase workload, in order.
-func w8PhasePlan(cfg w8Config) []w8Phase {
-	return []w8Phase{
+// sustainedIOPhasePlan is the nine-phase workload, in order.
+func sustainedIOPhasePlan(cfg sustainedIOConfig) []sustainedIOPhase {
+	return []sustainedIOPhase{
 		{
 			Name:   "P0_cold_index",
 			Detail: fmt.Sprintf("cold index of %d generated files in %d packages, to the first exact primary answer", cfg.Fixture.Files, cfg.Fixture.Packages),
-			Run:    (*w8Run).phaseColdIndex,
+			Run:    (*sustainedIORun).phaseColdIndex,
 		},
 		{
 			Name: "P1_idle_cold",
 			Detail: fmt.Sprintf("idle on the freshly indexed store, measured twice: %s polling one read-only search every %s first (%s, the arm the frozen ceiling is applied to, opening where the frozen window opened) then %s quiet (%s, un-budgeted)",
-				cfg.Idle, w8IdlePollInterval, w8WindowIdleColdPolling, cfg.Idle, w8WindowIdleColdQuiet),
-			Run: (*w8Run).phaseIdleCold,
+				cfg.Idle, sustainedIOIdlePollInterval, sustainedIOWindowIdleColdPolling, cfg.Idle, sustainedIOWindowIdleColdQuiet),
+			Run: (*sustainedIORun).phaseIdleCold,
 		},
 		{
 			Name:   "P2_small_edits",
 			Detail: fmt.Sprintf("%d edits %s apart, rotating over the corpus; each rewrites one function body and renames a one-line revision stub (the only declaration that moves, and the only thing a symbol search can wait on), awaited to exact from the edited file", cfg.Edits, cfg.EditInterval),
-			Run:    (*w8Run).phaseSmallEdits,
+			Run:    (*sustainedIORun).phaseSmallEdits,
 		},
 		{
 			Name:   "P3_touch_stage_unstage",
 			Detail: "touch with identical bytes, then git add -A, then git reset",
-			Run:    (*w8Run).phaseTouchStageUnstage,
+			Run:    (*sustainedIORun).phaseTouchStageUnstage,
 		},
 		{
 			Name:   "P4_amend_same_tree",
-			Detail: "the tree-changing commit the amend needs (" + w8WindowCommitTreeChange + "), then git commit --amend --no-edit: a new commit id over an unchanged tree (" + w8WindowAmendSameTree + ")",
-			Run:    (*w8Run).phaseAmendSameTree,
+			Detail: "the tree-changing commit the amend needs (" + sustainedIOWindowCommitTreeChange + "), then git commit --amend --no-edit: a new commit id over an unchanged tree (" + sustainedIOWindowAmendSameTree + ")",
+			Run:    (*sustainedIORun).phaseAmendSameTree,
 		},
 		{
 			Name:   "P5_main_advance",
-			Detail: fmt.Sprintf("%d dependent worktrees discovered (never tracked), then %d commits on main touching %d files each, each awaited to exact on the primary and on every dependent", cfg.Worktrees, cfg.Commits, w8CommitFilesPerCommit),
-			Run:    (*w8Run).phaseMainAdvance,
+			Detail: fmt.Sprintf("%d dependent worktrees discovered (never tracked), then %d commits on main touching %d files each, each awaited to exact on the primary and on every dependent", cfg.Worktrees, cfg.Commits, sustainedIOCommitFilesPerCommit),
+			Run:    (*sustainedIORun).phaseMainAdvance,
 		},
 		{
 			Name:   "P6_dependent_edits",
 			Detail: "dirty edits in the dependent worktrees, awaited to exact, with primary isolation rechecked",
-			Run:    (*w8Run).phaseDependentEdits,
+			Run:    (*sustainedIORun).phaseDependentEdits,
 		},
 		{
 			Name:   "P7_dependent_untrack_retrack",
 			Detail: "explicitly track one dependent, then untrack it back to automatic discovery",
-			Run:    (*w8Run).phaseDependentUntrackRetrack,
+			Run:    (*sustainedIORun).phaseDependentUntrackRetrack,
 		},
 		{
 			Name: "P8_idle_warm",
 			Detail: fmt.Sprintf("idle on the worked store, measured twice: %s polling one read-only search every %s first (%s, the arm the frozen ceiling is applied to, opening where the frozen window opened) then %s quiet (%s, un-budgeted)",
-				cfg.Idle, w8IdlePollInterval, w8WindowIdleWarmPolling, cfg.Idle, w8WindowIdleWarmQuiet),
-			Run: (*w8Run).phaseIdleWarm,
+				cfg.Idle, sustainedIOIdlePollInterval, sustainedIOWindowIdleWarmPolling, cfg.Idle, sustainedIOWindowIdleWarmQuiet),
+			Run: (*sustainedIORun).phaseIdleWarm,
 		},
 	}
 }
 
-// w8PhaseReport is one phase's evidence.
-type w8PhaseReport struct {
+// sustainedIOPhaseReport is one phase's evidence.
+type sustainedIOPhaseReport struct {
 	Phase            string  `json:"phase"`
 	Detail           string  `json:"detail"`
 	Failed           bool    `json:"failed,omitempty"`
@@ -424,13 +424,13 @@ type w8PhaseReport struct {
 	Samples          int     `json:"samples"`
 	SampleFailures   int     `json:"sample_failures"`
 
-	StoreCensusBefore w8StoreCensus `json:"store_census_before"`
-	StoreCensusAfter  w8StoreCensus `json:"store_census_after"`
+	StoreCensusBefore sustainedIOStoreCensus `json:"store_census_before"`
+	StoreCensusAfter  sustainedIOStoreCensus `json:"store_census_after"`
 
 	CountersDelta map[string]int64 `json:"viewmetrics_delta,omitempty"`
 	CountersError string           `json:"viewmetrics_error,omitempty"`
 
-	CensusAfter w8Census `json:"destination_census_after"`
+	CensusAfter sustainedIOCensus `json:"destination_census_after"`
 
 	ExactnessWaits   int      `json:"exactness_waits"`
 	ExactnessSeconds float64  `json:"exactness_wait_s"`
@@ -455,13 +455,13 @@ type w8PhaseReport struct {
 	CensusDelta map[string]int64 `json:"destination_census_delta,omitempty"`
 
 	// Windows are the named sub-windows this phase cut itself into.
-	Windows []w8WindowReport `json:"windows,omitempty"`
+	Windows []sustainedIOWindowReport `json:"windows,omitempty"`
 
 	// Isolation records every isolation probe the phase judged, in full.
-	Isolation []w8IsolationRecord `json:"isolation,omitempty"`
+	Isolation []sustainedIOIsolationRecord `json:"isolation,omitempty"`
 }
 
-// w8WindowReport is one named sub-window of a phase: the same envelope, over a
+// sustainedIOWindowReport is one named sub-window of a phase: the same envelope, over a
 // smaller bracket.
 //
 // A phase that performs its own stimulus has to say where the stimulus was.
@@ -469,7 +469,7 @@ type w8PhaseReport struct {
 // `git add -A && git commit` the phase runs first so the amend has a clean
 // tree to amend over. The commit is real work and belongs in the artifact —
 // under its own name, not under the amend's.
-type w8WindowReport struct {
+type sustainedIOWindowReport struct {
 	Phase             string           `json:"phase"`
 	Window            string           `json:"window"`
 	Detail            string           `json:"detail,omitempty"`
@@ -494,11 +494,11 @@ type w8WindowReport struct {
 	Notes             []string         `json:"notes,omitempty"`
 }
 
-// w8IsolationRecord is one isolation question and the whole answer it was
+// sustainedIOIsolationRecord is one isolation question and the whole answer it was
 // judged on — spelling, found, exact label, fallback label, source file,
 // answering corpus, error — plus how long the harness waited for an answer it
 // could judge at all.
-type w8IsolationRecord struct {
+type sustainedIOIsolationRecord struct {
 	Subject string         `json:"subject"`
 	Probe   issue767Probe  `json:"probe"`
 	Answer  issue767Answer `json:"answer"`
@@ -507,29 +507,29 @@ type w8IsolationRecord struct {
 	Judged  bool           `json:"judged"`
 }
 
-// w8StoreCensus is the SQL side of a phase boundary. Every sub-query is
+// sustainedIOStoreCensus is the SQL side of a phase boundary. Every sub-query is
 // tolerated individually: a baseline binary on an older schema must still
 // produce a report, with the missing series named rather than zeroed.
-type w8StoreCensus struct {
-	PageSize      int64                      `json:"page_size"`
-	PageCount     int64                      `json:"page_count"`
-	FreelistCount int64                      `json:"freelist_count"`
-	Generations   issue767GenerationSnapshot `json:"generations"`
-	ByState       map[string]w8StateCensus   `json:"generations_by_state,omitempty"`
-	Checkouts     int64                      `json:"checkouts"`
-	Routes        int64                      `json:"checkout_routes"`
-	Errors        []string                   `json:"errors,omitempty"`
+type sustainedIOStoreCensus struct {
+	PageSize      int64                             `json:"page_size"`
+	PageCount     int64                             `json:"page_count"`
+	FreelistCount int64                             `json:"freelist_count"`
+	Generations   issue767GenerationSnapshot        `json:"generations"`
+	ByState       map[string]sustainedIOStateCensus `json:"generations_by_state,omitempty"`
+	Checkouts     int64                             `json:"checkouts"`
+	Routes        int64                             `json:"checkout_routes"`
+	Errors        []string                          `json:"errors,omitempty"`
 }
 
-type w8StateCensus struct {
+type sustainedIOStateCensus struct {
 	Count        int64 `json:"count"`
 	StorageBytes int64 `json:"storage_bytes"`
 	Covered      int64 `json:"covered_files"`
 	Affected     int64 `json:"affected_files"`
 }
 
-func w8ReadStoreCensus(ctx context.Context, db *sql.DB) w8StoreCensus {
-	census := w8StoreCensus{ByState: map[string]w8StateCensus{}}
+func sustainedIOReadStoreCensus(ctx context.Context, db *sql.DB) sustainedIOStoreCensus {
+	census := sustainedIOStoreCensus{ByState: map[string]sustainedIOStateCensus{}}
 	note := func(err error) {
 		if err != nil {
 			census.Errors = append(census.Errors, err.Error())
@@ -554,7 +554,7 @@ func w8ReadStoreCensus(ctx context.Context, db *sql.DB) w8StoreCensus {
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var state string
-		var entry w8StateCensus
+		var entry sustainedIOStateCensus
 		if err := rows.Scan(&state, &entry.Count, &entry.StorageBytes, &entry.Covered, &entry.Affected); err != nil {
 			note(err)
 			break
@@ -565,15 +565,15 @@ func w8ReadStoreCensus(ctx context.Context, db *sql.DB) w8StoreCensus {
 	return census
 }
 
-// w8Run is one arm of one repetition.
-type w8Run struct {
+// sustainedIORun is one arm of one repetition.
+type sustainedIORun struct {
 	t           *testing.T
 	f           *issue767Fixture
-	cfg         w8Config
+	cfg         sustainedIOConfig
 	arm         string
 	artifactDir string
 	db          *sql.DB
-	sampler     *w8Sampler
+	sampler     *sustainedIOSampler
 	samples     *os.File
 
 	revisions  map[int]int
@@ -594,40 +594,40 @@ type w8Run struct {
 	windowSeconds float64
 	windowNotes   []string
 	windowOpen    bool
-	windows       []w8WindowReport
+	windows       []sustainedIOWindowReport
 
-	isolation      []w8IsolationRecord
-	phaseIsolation []w8IsolationRecord
+	isolation      []sustainedIOIsolationRecord
+	phaseIsolation []sustainedIOIsolationRecord
 
-	reports []w8PhaseReport
+	reports []sustainedIOPhaseReport
 }
 
-// TestW8SustainedWriteAmplification is the opt-in sustained-workload run.
-func TestW8SustainedWriteAmplification(t *testing.T) {
-	candidate := os.Getenv("GXW8_TEST_BINARY")
+// TestSustainedIOSustainedWriteAmplification is the opt-in sustained-workload run.
+func TestSustainedIOSustainedWriteAmplification(t *testing.T) {
+	candidate := os.Getenv("GX_SUSTAINED_IO_TEST_BINARY")
 	if candidate == "" {
-		t.Skip("set GXW8_TEST_BINARY to opt into the isolated sustained-workload I/O harness")
+		t.Skip("set GX_SUSTAINED_IO_TEST_BINARY to opt into the isolated sustained-workload I/O harness")
 	}
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("process I/O sampler supports Darwin and Linux")
 	}
-	cfg, err := w8ConfigFromEnv(os.Getenv)
+	cfg, err := sustainedIOConfigFromEnv(os.Getenv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	arms := []struct{ name, binary string }{}
-	if baseline := os.Getenv("GXW8_BASELINE_BINARY"); baseline != "" {
+	if baseline := os.Getenv("GX_SUSTAINED_IO_BASELINE_BINARY"); baseline != "" {
 		arms = append(arms, struct{ name, binary string }{"baseline", baseline})
 	}
 	arms = append(arms, struct{ name, binary string }{"candidate", candidate})
-	required := w8RequiredTimeout(cfg, len(arms))
+	required := sustainedIORequiredTimeout(cfg, len(arms))
 	if deadline, ok := t.Deadline(); ok && time.Until(deadline) < required {
 		t.Fatalf("sustained workload needs at least %s remaining; run with go test -timeout %s or longer", required, required.Round(time.Minute))
 	}
-	artifactRoot := os.Getenv("GXW8_ARTIFACT_DIR")
+	artifactRoot := os.Getenv("GX_SUSTAINED_IO_ARTIFACT_DIR")
 	if artifactRoot == "" {
 		artifactRoot = t.TempDir()
-		t.Logf("GXW8_ARTIFACT_DIR is unset; artifacts go to %s and are removed with the test", artifactRoot)
+		t.Logf("GX_SUSTAINED_IO_ARTIFACT_DIR is unset; artifacts go to %s and are removed with the test", artifactRoot)
 	}
 	for repetition := 1; repetition <= cfg.Repetitions; repetition++ {
 		for _, arm := range arms {
@@ -640,24 +640,24 @@ func TestW8SustainedWriteAmplification(t *testing.T) {
 				if _, err := os.Stat(binary); err != nil {
 					t.Fatal(err)
 				}
-				w8RunWorkload(t, cfg, arm.name, binary, filepath.Join(artifactRoot, name))
+				sustainedIORunWorkload(t, cfg, arm.name, binary, filepath.Join(artifactRoot, name))
 			})
 		}
 	}
 }
 
-func w8RunWorkload(t *testing.T, cfg w8Config, arm, binary, artifactDir string) {
+func sustainedIORunWorkload(t *testing.T, cfg sustainedIOConfig, arm, binary, artifactDir string) {
 	t.Helper()
 	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fixture := w8GenerateFixture(cfg.Fixture)
+	fixture := sustainedIOGenerateFixture(cfg.Fixture)
 	f := newIssue767FixtureWithCorpus(t, binary, func(f *issue767Fixture) {
 		for _, file := range fixture {
 			f.write(filepath.Join(f.primary, filepath.FromSlash(file.Path)), file.Content)
 		}
 	}, issue767WithReconcileInterval(cfg.ReconcileInterval))
-	samplesPath, err := w8ArtifactPath(artifactDir, f.root, "samples.ndjson")
+	samplesPath, err := sustainedIOArtifactPath(artifactDir, f.root, "samples.ndjson")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,7 +667,7 @@ func w8RunWorkload(t *testing.T, cfg w8Config, arm, binary, artifactDir string) 
 	}
 	defer func() { _ = samples.Close() }()
 
-	manifest := w8BuildManifest(w8Manifest{
+	manifest := sustainedIOBuildManifest(sustainedIOManifest{
 		RunID:       filepath.Base(artifactDir),
 		Arm:         arm,
 		Fixture:     cfg.Fixture,
@@ -677,34 +677,34 @@ func w8RunWorkload(t *testing.T, cfg w8Config, arm, binary, artifactDir string) 
 		Repetitions: cfg.Repetitions,
 		Cold:        true,
 		Notes: []string{
-			w8ReconcileNote(cfg.ReconcileInterval),
+			sustainedIOReconcileNote(cfg.ReconcileInterval),
 			"ri_logical_writes is the primary series; ri_diskio_byteswritten is reported beside it and never alone",
 			"process-accounted writes are not SSD NAND writes; a current WAL size is not cumulative writes",
 			"wal_resets is a lower bound on checkpoints: a PASSIVE checkpoint that does not restart the log is invisible",
 		},
 	}, binary, f.env, fixture)
-	if output, err := f.tryCommand(w8PhaseCommandTimeout, f.root, "version", "--short"); err == nil {
+	if output, err := f.tryCommand(sustainedIOPhaseCommandTimeout, f.root, "version", "--short"); err == nil {
 		manifest.BinaryVersion = strings.TrimSpace(string(output))
 	} else {
 		manifest.Notes = append(manifest.Notes, "binary version unavailable: "+err.Error())
 	}
 	var identityNotes []string
-	manifest.SourceCommit, manifest.DirtyDigest, identityNotes = w8SourceIdentity()
+	manifest.SourceCommit, manifest.DirtyDigest, identityNotes = sustainedIOSourceIdentity()
 	manifest.Notes = append(manifest.Notes, identityNotes...)
 	if manifest.SourceCommit == "" {
 		t.Logf("manifest carries no source commit: %v", identityNotes)
 	}
-	w8WriteJSON(t, filepath.Join(artifactDir, "manifest.json"), manifest)
+	sustainedIOWriteJSON(t, filepath.Join(artifactDir, "manifest.json"), manifest)
 
-	run := &w8Run{
+	run := &sustainedIORun{
 		t: t, f: f, cfg: cfg, arm: arm, artifactDir: artifactDir,
 		samples:   samples,
 		revisions: map[int]int{},
-		rotation:  w8RotationTargets(cfg.Fixture, max(cfg.Edits, 1)+w8CommitFilesPerCommit),
-		lastProbe: w8PrimaryMarker,
+		rotation:  sustainedIORotationTargets(cfg.Fixture, max(cfg.Edits, 1)+sustainedIOCommitFilesPerCommit),
+		lastProbe: sustainedIOPrimaryMarker,
 	}
 	run.db = f.openReadOnly()
-	run.sampler = w8NewRunSampler(f, samples, cfg.SampleInterval)
+	run.sampler = sustainedIONewRunSampler(f, samples, cfg.SampleInterval)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sampling := make(chan struct{})
@@ -714,59 +714,59 @@ func w8RunWorkload(t *testing.T, cfg w8Config, arm, binary, artifactDir string) 
 		<-sampling
 	})
 	defer stopSampling()
-	// The phases run inside w8WithRunArtifacts, which files the run-level
+	// The phases run inside sustainedIOWithRunArtifacts, which files the run-level
 	// artifact whether they finish or unwind: a phase's t.Fatal is a
 	// runtime.Goexit, and a run whose last phase failed must still keep
 	// report.json, the retained census and the totals of every phase that did
 	// run — and must still remove the worktrees it created.
-	w8WithRunArtifacts(run, manifest, func() {
+	sustainedIOWithRunArtifacts(run, manifest, func() {
 		defer stopSampling()
-		for _, phase := range w8PhasePlan(cfg) {
+		for _, phase := range sustainedIOPhasePlan(cfg) {
 			run.execute(phase)
 		}
 	})
 }
 
-// w8WithRunArtifacts runs the phases and files the run-level artifact
+// sustainedIOWithRunArtifacts runs the phases and files the run-level artifact
 // afterwards, on both exits.
-func w8WithRunArtifacts(run *w8Run, manifest w8Manifest, phases func()) {
+func sustainedIOWithRunArtifacts(run *sustainedIORun, manifest sustainedIOManifest, phases func()) {
 	defer run.finish(manifest)
 	phases()
 }
 
-// w8NewRunSampler is the production wiring between a fixture and the 1 Hz
+// sustainedIONewRunSampler is the production wiring between a fixture and the 1 Hz
 // sampler: the child's process counters, the store/WAL/SHM/log sizes and the
 // WAL header. Every fixture field it reads goes through a guarded accessor,
 // because this sampler runs on its own goroutine across the fixture's
 // start/stop.
-func w8NewRunSampler(f *issue767Fixture, out io.Writer, interval time.Duration) *w8Sampler {
-	sampler := newW8Sampler(out, interval)
+func sustainedIONewRunSampler(f *issue767Fixture, out io.Writer, interval time.Duration) *sustainedIOSampler {
+	sampler := newSustainedIOSampler(out, interval)
 	sampler.pid = f.pid
 	sampler.readIO = func() (issue767ProcessIO, error) {
 		pid := f.pid()
 		if pid == 0 {
-			return issue767ProcessIO{}, errW8NoChild
+			return issue767ProcessIO{}, errSustainedIONoChild
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return issue767ReadProcessIO(ctx, pid)
 	}
-	sampler.readSize = func() w8FileSizes {
-		return w8FileSizes{
+	sampler.readSize = func() sustainedIOFileSizes {
+		return sustainedIOFileSizes{
 			Store: issue767FileSize(f.store),
 			WAL:   issue767FileSize(f.store + "-wal"),
 			SHM:   issue767FileSize(f.store + "-shm"),
 			Log:   issue767FileSize(f.logPath()),
 		}
 	}
-	sampler.readWAL = func() (w8WALHeader, error) { return w8ReadWALHeader(f.store + "-wal") }
+	sampler.readWAL = func() (sustainedIOWALHeader, error) { return sustainedIOReadWALHeader(f.store + "-wal") }
 	return sampler
 }
 
-// w8PhaseOpening is everything execute reads before a phase runs. It is a
+// sustainedIOPhaseOpening is everything execute reads before a phase runs. It is a
 // value, not fields on the run, so the closing half can be reached from the
 // success path and from the failure unwind with the same arguments.
-type w8PhaseOpening struct {
+type sustainedIOPhaseOpening struct {
 	started     time.Time
 	io          issue767ProcessIO
 	ioErr       error
@@ -779,7 +779,7 @@ type w8PhaseOpening struct {
 	clientCalls int
 	storeBytes  int64
 	walBytes    int64
-	census      w8Census
+	census      sustainedIOCensus
 	// scraped says whether this bracket took a `daemon status` scrape. A
 	// scrape is a client call: taking it before the clock keeps it out of the
 	// bracket it opens, but it is still inside every bracket that ENCLOSES it.
@@ -796,7 +796,7 @@ type w8PhaseOpening struct {
 // the process counters are read. Taking it after (which is what the harness
 // did) put one `daemon status` round trip inside every phase's own window and
 // charged the phase for it.
-func (r *w8Run) openBracket() w8PhaseOpening {
+func (r *sustainedIORun) openBracket() sustainedIOPhaseOpening {
 	return r.openBracketScraping(true)
 }
 
@@ -810,12 +810,12 @@ func (r *w8Run) openBracket() w8PhaseOpening {
 // are judged against, had none of them. So an idle sub-window opens a
 // scrape-free bracket: the counter delta for the idle phase is still taken by
 // the PHASE bracket, whose own scrapes sit outside the phase's measured span.
-func (r *w8Run) openBracketScraping(scrape bool) w8PhaseOpening {
-	opening := w8PhaseOpening{scraped: scrape}
+func (r *sustainedIORun) openBracketScraping(scrape bool) sustainedIOPhaseOpening {
+	opening := sustainedIOPhaseOpening{scraped: scrape}
 	if scrape {
 		opening.counters, opening.countersErr = r.counters()
 	}
-	if census, err := w8WalkCensus(r.f.root); err == nil {
+	if census, err := sustainedIOWalkCensus(r.f.root); err == nil {
 		opening.census = census
 	}
 	opening.storeBytes = issue767FileSize(r.f.store)
@@ -829,13 +829,13 @@ func (r *w8Run) openBracketScraping(scrape bool) w8PhaseOpening {
 	return opening
 }
 
-// w8ExcludeCheckpoint is the checkpoint-excluded write series: the window's
+// sustainedIOExcludeCheckpoint is the checkpoint-excluded write series: the window's
 // logical writes less the part its own samples booked to a WAL checkpoint.
 // It is nil exactly when the total is, and it never goes below zero — the
 // sample-interval attribution is coarse enough that a checkpoint interval can
 // carry more bytes than the bracket's own delta when the bracket is shorter
 // than one sample.
-func w8ExcludeCheckpoint(total *uint64, checkpoint uint64) *uint64 {
+func sustainedIOExcludeCheckpoint(total *uint64, checkpoint uint64) *uint64 {
 	if total == nil {
 		return nil
 	}
@@ -846,8 +846,8 @@ func w8ExcludeCheckpoint(total *uint64, checkpoint uint64) *uint64 {
 	return &excluded
 }
 
-// w8CensusDelta is the per-writer change between two destination censuses.
-func w8CensusDelta(before, after w8Census) map[string]int64 {
+// sustainedIOCensusDelta is the per-writer change between two destination censuses.
+func sustainedIOCensusDelta(before, after sustainedIOCensus) map[string]int64 {
 	delta := map[string]int64{}
 	for bucket, bytes := range after.Bytes {
 		if d := bytes - before.Bytes[bucket]; d != 0 {
@@ -869,7 +869,7 @@ func w8CensusDelta(before, after w8Census) map[string]int64 {
 // files its row on both exits: a t.Fatal inside body is a runtime.Goexit, and
 // a window whose work failed is exactly the window a reader wants the numbers
 // of.
-func (r *w8Run) inWindow(name, detail string, body func()) {
+func (r *sustainedIORun) inWindow(name, detail string, body func()) {
 	r.t.Helper()
 	r.inWindowScraping(name, detail, true, body)
 }
@@ -879,21 +879,21 @@ func (r *w8Run) inWindow(name, detail string, body func()) {
 // scrape would be client traffic inside the phase the frozen ceiling measured
 // without any, and the quiet arm's whole claim is that it made no client calls
 // at all.
-func (r *w8Run) inScrapeFreeWindow(name, detail string, body func()) {
+func (r *sustainedIORun) inScrapeFreeWindow(name, detail string, body func()) {
 	r.t.Helper()
 	r.inWindowScraping(name, detail, false, body)
 }
 
-func (r *w8Run) inWindowScraping(name, detail string, scrape bool, body func()) {
+func (r *sustainedIORun) inWindowScraping(name, detail string, scrape bool, body func()) {
 	r.t.Helper()
 	r.sampler.SetWindow(name)
 	r.windowWaits, r.windowSeconds, r.windowNotes = 0, 0, nil
 	r.windowOpen = true
 	opening := r.openBracketScraping(scrape)
-	report := w8WindowReport{Phase: r.phase, Window: name, Detail: detail,
+	report := sustainedIOWindowReport{Phase: r.phase, Window: name, Detail: detail,
 		StoreBytesBefore: opening.storeBytes, WALBefore: opening.walBytes}
 	if !scrape {
-		report.CountersError = w8NoScrapeInsideWindow
+		report.CountersError = sustainedIONoScrapeInsideWindow
 	}
 	completed := false
 	defer func() {
@@ -906,10 +906,10 @@ func (r *w8Run) inWindowScraping(name, detail string, scrape bool, body func()) 
 
 // closeWindow takes the closing half of a sub-window's envelope. Like
 // closePhase it never calls t.Fatal: it runs during a failure unwind.
-func (r *w8Run) closeWindow(report *w8WindowReport, opening w8PhaseOpening) {
+func (r *sustainedIORun) closeWindow(report *sustainedIOWindowReport, opening sustainedIOPhaseOpening) {
 	report.WallSeconds = time.Since(opening.started).Seconds()
 	afterIO, afterErr := r.processIO()
-	window := w8ProcessDelta(opening.io, opening.ioErr, afterIO, afterErr)
+	window := sustainedIOProcessDelta(opening.io, opening.ioErr, afterIO, afterErr)
 	report.Notes = append(report.Notes, window.Notes...)
 	report.LogicalWrites = window.Logical
 	report.DiskWritten = window.DiskWritten
@@ -919,7 +919,7 @@ func (r *w8Run) closeWindow(report *w8WindowReport, opening w8PhaseOpening) {
 	report.Samples = samples - opening.samples
 	report.WALResets = r.sampler.Resets() - opening.resets
 	report.CheckpointBytes = r.sampler.CheckpointBytes() - opening.checkpoint
-	report.LogicalWritesExcl = w8ExcludeCheckpoint(report.LogicalWrites, report.CheckpointBytes)
+	report.LogicalWritesExcl = sustainedIOExcludeCheckpoint(report.LogicalWrites, report.CheckpointBytes)
 	report.ClientCalls = r.f.clientCallCount() - opening.clientCalls
 	report.ExactnessWaits, report.ExactnessSeconds = r.windowWaits, r.windowSeconds
 	report.Notes = append(report.Notes, r.windowNotes...)
@@ -928,18 +928,18 @@ func (r *w8Run) closeWindow(report *w8WindowReport, opening w8PhaseOpening) {
 	// scrape at all, because the enclosing phase would be charged for it.
 	switch {
 	case !opening.scraped:
-		report.CountersError = w8NoScrapeInsideWindow
+		report.CountersError = sustainedIONoScrapeInsideWindow
 	default:
 		if afterCounters, err := r.counters(); err != nil {
 			report.CountersError = strings.TrimSpace(opening.errorText() + " " + err.Error())
 		} else if opening.countersErr == nil {
-			report.CountersDelta = w8CounterDelta(opening.counters, afterCounters)
+			report.CountersDelta = sustainedIOCounterDelta(opening.counters, afterCounters)
 		} else {
 			report.CountersError = opening.countersErr.Error()
 		}
 	}
-	if census, err := w8WalkCensus(r.f.root); err == nil {
-		report.CensusDelta = w8CensusDelta(opening.census, census)
+	if census, err := sustainedIOWalkCensus(r.f.root); err == nil {
+		report.CensusDelta = sustainedIOCensusDelta(opening.census, census)
 	}
 	r.windows = append(r.windows, *report)
 	r.sampler.SetWindow("")
@@ -954,7 +954,7 @@ func (r *w8Run) closeWindow(report *w8WindowReport, opening w8PhaseOpening) {
 		report.CheckpointBytes, report.ClientCalls, report.StoreBytesBefore, report.StoreBytesAfter)
 }
 
-func (o w8PhaseOpening) errorText() string {
+func (o sustainedIOPhaseOpening) errorText() string {
 	if o.countersErr == nil {
 		return ""
 	}
@@ -962,16 +962,16 @@ func (o w8PhaseOpening) errorText() string {
 }
 
 // execute brackets one phase with the whole measurement envelope.
-func (r *w8Run) execute(phase w8Phase) {
+func (r *sustainedIORun) execute(phase sustainedIOPhase) {
 	r.t.Helper()
 	r.sampler.SetPhase(phase.Name)
 	r.phase = phase.Name
 	r.phaseWaits, r.phaseSeconds, r.phaseNotes = 0, 0, nil
 	r.windows, r.phaseIsolation = nil, nil
-	report := w8PhaseReport{Phase: phase.Name, Detail: phase.Detail}
+	report := sustainedIOPhaseReport{Phase: phase.Name, Detail: phase.Detail}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	report.StoreCensusBefore = w8ReadStoreCensus(ctx, r.db)
+	report.StoreCensusBefore = sustainedIOReadStoreCensus(ctx, r.db)
 	cancel()
 	report.LogBefore = r.daemonLogBytes()
 
@@ -1002,7 +1002,7 @@ func (r *w8Run) execute(phase w8Phase) {
 
 // closePhase takes the closing half of the envelope and files the phase
 // report. It never calls t.Fatal: it runs during a failure unwind.
-func (r *w8Run) closePhase(report *w8PhaseReport, opening w8PhaseOpening) {
+func (r *sustainedIORun) closePhase(report *sustainedIOPhaseReport, opening sustainedIOPhaseOpening) {
 	report.WallSeconds = time.Since(opening.started).Seconds()
 
 	afterIO, afterErr := r.processIO()
@@ -1012,7 +1012,7 @@ func (r *w8Run) closePhase(report *w8PhaseReport, opening w8PhaseOpening) {
 	// must not be charged for its own instrumentation in one series while the
 	// other series excludes it.
 	report.ClientCalls = r.f.clientCallCount() - opening.clientCalls
-	window := w8ProcessDelta(opening.io, opening.ioErr, afterIO, afterErr)
+	window := sustainedIOProcessDelta(opening.io, opening.ioErr, afterIO, afterErr)
 	report.Notes = append(report.Notes, window.Notes...)
 	report.LogicalWrites = window.Logical
 	report.DiskWritten, report.DiskRead = window.DiskWritten, window.DiskRead
@@ -1020,7 +1020,7 @@ func (r *w8Run) closePhase(report *w8PhaseReport, opening w8PhaseOpening) {
 	report.PhysFootprint = window.PhysFootprint
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	report.StoreCensusAfter = w8ReadStoreCensus(ctx, r.db)
+	report.StoreCensusAfter = sustainedIOReadStoreCensus(ctx, r.db)
 	cancel()
 	report.StoreBytesAfter = issue767FileSize(r.f.store)
 	report.WALAfter = issue767FileSize(r.f.store + "-wal")
@@ -1028,9 +1028,9 @@ func (r *w8Run) closePhase(report *w8PhaseReport, opening w8PhaseOpening) {
 	if afterCounters, err := r.counters(); err != nil {
 		report.CountersError = strings.TrimSpace(report.CountersError + " " + err.Error())
 	} else if opening.countersErr == nil {
-		report.CountersDelta = w8CounterDelta(opening.counters, afterCounters)
+		report.CountersDelta = sustainedIOCounterDelta(opening.counters, afterCounters)
 	}
-	if census, err := w8WalkCensus(r.f.root); err != nil {
+	if census, err := sustainedIOWalkCensus(r.f.root); err != nil {
 		report.Notes = append(report.Notes, "destination census failed: "+err.Error())
 	} else {
 		report.CensusAfter = census
@@ -1040,8 +1040,8 @@ func (r *w8Run) closePhase(report *w8PhaseReport, opening w8PhaseOpening) {
 	report.SampleFailures = afterFailures - opening.failures
 	report.WALResets = r.sampler.Resets() - opening.resets
 	report.CheckpointBytes = r.sampler.CheckpointBytes() - opening.checkpoint
-	report.LogicalWritesExcl = w8ExcludeCheckpoint(report.LogicalWrites, report.CheckpointBytes)
-	report.CensusDelta = w8CensusDelta(opening.census, report.CensusAfter)
+	report.LogicalWritesExcl = sustainedIOExcludeCheckpoint(report.LogicalWrites, report.CheckpointBytes)
+	report.CensusDelta = sustainedIOCensusDelta(opening.census, report.CensusAfter)
 	report.Windows = append(report.Windows, r.windows...)
 	report.Isolation = append(report.Isolation, r.phaseIsolation...)
 	report.ExactnessWaits, report.ExactnessSeconds = r.phaseWaits, r.phaseSeconds
@@ -1051,7 +1051,7 @@ func (r *w8Run) closePhase(report *w8PhaseReport, opening w8PhaseOpening) {
 		r.enforceIdleBudget(report)
 	}
 	r.reports = append(r.reports, *report)
-	if err := w8TryWriteJSON(filepath.Join(r.artifactDir, "phase_"+report.Phase+".json"), *report); err != nil {
+	if err := sustainedIOTryWriteJSON(filepath.Join(r.artifactDir, "phase_"+report.Phase+".json"), *report); err != nil {
 		r.t.Logf("phase artifact for %s not written: %v", report.Phase, err)
 	}
 	logical := "unavailable"
@@ -1071,7 +1071,7 @@ func (r *w8Run) closePhase(report *w8PhaseReport, opening w8PhaseOpening) {
 // finish removes what the run created and writes the run-level artifact. Like
 // closePhase it must survive a failure unwind, so every step here reports
 // rather than fails.
-func (r *w8Run) finish(manifest w8Manifest) {
+func (r *sustainedIORun) finish(manifest sustainedIOManifest) {
 	removed, retained := 0, []string{}
 	for _, dependent := range r.dependents {
 		if _, err := os.Stat(dependent); err != nil {
@@ -1084,7 +1084,7 @@ func (r *w8Run) finish(manifest w8Manifest) {
 		}
 		removed++
 	}
-	census, err := w8WalkCensus(r.f.root)
+	census, err := sustainedIOWalkCensus(r.f.root)
 	if err != nil {
 		r.t.Logf("final census failed: %v", err)
 	}
@@ -1096,7 +1096,7 @@ func (r *w8Run) finish(manifest w8Manifest) {
 		}
 	}
 	path := filepath.Join(r.artifactDir, "report.json")
-	if err := w8TryWriteJSON(path, map[string]any{
+	if err := sustainedIOTryWriteJSON(path, map[string]any{
 		"manifest":               manifest,
 		"phases":                 r.reports,
 		"failed_phases":          failed,
@@ -1121,17 +1121,17 @@ func (r *w8Run) finish(manifest w8Manifest) {
 
 // ------------------------------------------------------------- run helpers ---
 
-func w8Delta(before, after uint64) uint64 {
+func sustainedIODelta(before, after uint64) uint64 {
 	if after < before {
 		return 0
 	}
 	return after - before
 }
 
-func (r *w8Run) processIO() (issue767ProcessIO, error) {
+func (r *sustainedIORun) processIO() (issue767ProcessIO, error) {
 	pid := r.f.pid()
 	if pid == 0 {
-		return issue767ProcessIO{}, errW8NoChild
+		return issue767ProcessIO{}, errSustainedIONoChild
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1139,41 +1139,41 @@ func (r *w8Run) processIO() (issue767ProcessIO, error) {
 }
 
 // counters scrapes the daemon's own viewmetrics through `daemon status
-// --format json`. A binary without the flag — every pre-W8.3 baseline arm —
-// returns an error, which is recorded by name; it is never substituted with
+// --format json`. A binary without the flag — every baseline arm built before
+// the counters landed — returns an error, which is recorded by name; it is never substituted with
 // zeros.
-func (r *w8Run) counters() (map[string]int64, error) {
-	output, err := r.f.tryCommand(w8StatusScrapeTimeout, r.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+func (r *sustainedIORun) counters() (map[string]int64, error) {
+	output, err := r.f.tryCommand(sustainedIOStatusScrapeTimeout, r.f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		return nil, fmt.Errorf("daemon status --format json unavailable on this arm: %w", err)
 	}
-	return w8ParseStatusCounters(output)
+	return sustainedIOParseStatusCounters(output)
 }
 
-func (r *w8Run) daemonLogBytes() int64 {
+func (r *sustainedIORun) daemonLogBytes() int64 {
 	return issue767FileSize(r.f.logPath())
 }
 
 // awaitProbe waits for one exact answer and accounts for the wait, so a phase's
 // cost includes how long the daemon made a reader wait for exactness.
-func (r *w8Run) awaitProbe(root, name, file string) {
+func (r *sustainedIORun) awaitProbe(root, name, file string) {
 	r.t.Helper()
 	r.awaitProbeAs(root, name, file, r.f.spellingFor(root))
 }
 
 // awaitProbeAs is awaitProbe with the request spelling named explicitly, for
 // the phase that changes a checkout's mode under the harness's feet.
-func (r *w8Run) awaitProbeAs(root, name, file string, spelling issue767Spelling) {
+func (r *sustainedIORun) awaitProbeAs(root, name, file string, spelling issue767Spelling) {
 	r.t.Helper()
 	started := time.Now()
-	r.f.awaitSymbolAs(root, name, file, w8DefaultProbeTimeout, spelling)
+	r.f.awaitSymbolAs(root, name, file, sustainedIODefaultProbeTimeout, spelling)
 	r.accountWait(time.Since(started).Seconds())
 }
 
 // accountWait books one bounded wait to the run, the phase and the open
 // sub-window. Every wait the harness takes is part of what the phase cost,
 // including the ones spent waiting for an answer that could be judged at all.
-func (r *w8Run) accountWait(elapsed float64) {
+func (r *sustainedIORun) accountWait(elapsed float64) {
 	r.waits++
 	r.phaseWaits++
 	r.windowWaits++
@@ -1182,15 +1182,15 @@ func (r *w8Run) accountWait(elapsed float64) {
 	r.windowSeconds += elapsed
 }
 
-func (r *w8Run) markerPath(root string) string { return filepath.Join(root, "marker.go") }
+func (r *sustainedIORun) markerPath(root string) string { return filepath.Join(root, "marker.go") }
 
-func (r *w8Run) filePath(index int) string {
-	return filepath.Join(r.f.primary, filepath.FromSlash(w8FilePath(index%r.cfg.Fixture.Packages, index)))
+func (r *sustainedIORun) filePath(index int) string {
+	return filepath.Join(r.f.primary, filepath.FromSlash(sustainedIOFilePath(index%r.cfg.Fixture.Packages, index)))
 }
 
 // editFile advances one corpus file's revision and waits for the new probe to
 // answer exactly out of that same file.
-func (r *w8Run) editFile(index int) {
+func (r *sustainedIORun) editFile(index int) {
 	r.t.Helper()
 	path := r.filePath(index)
 	source, err := os.ReadFile(path)
@@ -1198,60 +1198,60 @@ func (r *w8Run) editFile(index int) {
 		r.t.Fatal(err)
 	}
 	revision := r.revisions[index] + 1
-	edited, err := w8EditFileSource(string(source), index, revision)
+	edited, err := sustainedIOEditFileSource(string(source), index, revision)
 	if err != nil {
 		r.t.Fatal(err)
 	}
 	r.f.write(path, edited)
 	r.revisions[index] = revision
-	r.awaitProbe(r.f.primary, w8ProbeName(index, revision), path)
+	r.awaitProbe(r.f.primary, sustainedIOProbeName(index, revision), path)
 }
 
-// w8IdleMode is what "idle" means for one idle window.
+// sustainedIOIdleMode is what "idle" means for one idle window.
 //
 // The harness has always called one read-only `call search` every 5 s inside
 // an idle phase — twelve daemon round trips per 60 s window — and reported the
-// result as an idle floor. It is not one: §F4's per-call sidecar transaction
+// result as an idle floor. It is not one: the per-call sidecar transaction
 // (37,080 B of WAL per read-only call) and the query log are client-driven
 // writes, and a floor that includes them cannot answer "what does this daemon
 // write when nobody asks it anything". Both questions are real, so both are
 // measured, each in its own window with its own client-call count.
-type w8IdleMode int
+type sustainedIOIdleMode int
 
 const (
-	// w8IdleQuiet issues no client calls at all: the daemon's own floor.
-	w8IdleQuiet w8IdleMode = iota
-	// w8IdlePolling is the historical arm: one read-only search every 5 s.
-	w8IdlePolling
+	// sustainedIOIdleQuiet issues no client calls at all: the daemon's own floor.
+	sustainedIOIdleQuiet sustainedIOIdleMode = iota
+	// sustainedIOIdlePolling is the historical arm: one read-only search every 5 s.
+	sustainedIOIdlePolling
 )
 
-func (m w8IdleMode) String() string {
-	if m == w8IdleQuiet {
+func (m sustainedIOIdleMode) String() string {
+	if m == sustainedIOIdleQuiet {
 		return "quiet"
 	}
 	return "polling"
 }
 
-// w8IdlePollInterval is the polling arm's period, unchanged from the frozen
+// sustainedIOIdlePollInterval is the polling arm's period, unchanged from the frozen
 // protocol so the polling window stays comparable with the frozen phases.
-const w8IdlePollInterval = 5 * time.Second
+const sustainedIOIdlePollInterval = 5 * time.Second
 
 // idleAs holds the workload still for duration. The quiet arm touches nothing:
 // it does not even ask whether the symbol is still there, because asking is
 // the cost the other arm exists to measure.
-func (r *w8Run) idleAs(duration time.Duration, mode w8IdleMode) {
+func (r *sustainedIORun) idleAs(duration time.Duration, mode sustainedIOIdleMode) {
 	r.t.Helper()
 	deadline := time.Now().Add(duration)
 	polls := 0
 	for time.Now().Before(deadline) {
-		if mode == w8IdlePolling {
+		if mode == sustainedIOIdlePolling {
 			polls++
 			found, err := r.f.trySearchSymbolIn(r.f.primary, r.lastProbe, r.lastProbeFile())
 			if err != nil || !found {
 				r.t.Fatalf("idle read-only query lost the selected ready symbol %s: found=%v err=%v", r.lastProbe, found, err)
 			}
 		}
-		wait := w8IdlePollInterval
+		wait := sustainedIOIdlePollInterval
 		if remaining := time.Until(deadline); remaining < wait {
 			wait = remaining
 		}
@@ -1267,10 +1267,10 @@ func (r *w8Run) idleAs(duration time.Duration, mode w8IdleMode) {
 	r.note(fmt.Sprintf("idle arm %s: %s held with %d harness read-only searches", mode, duration, polls))
 }
 
-// w8NoScrapeInsideWindow is why a sub-window carries no viewmetrics delta. It
+// sustainedIONoScrapeInsideWindow is why a sub-window carries no viewmetrics delta. It
 // is recorded by name: a missing series is a fact about the measurement, and a
 // silently absent one is indistinguishable from a zero.
-const w8NoScrapeInsideWindow = "no daemon-status scrape inside this window: the bracket's own round trip is client traffic the enclosing phase would be charged for; the phase-level counter delta covers both idle arms"
+const sustainedIONoScrapeInsideWindow = "no daemon-status scrape inside this window: the bracket's own round trip is client traffic the enclosing phase would be charged for; the phase-level counter delta covers both idle arms"
 
 // idleWindows measures idle twice: once polling, once with no client traffic.
 //
@@ -1293,7 +1293,7 @@ const w8NoScrapeInsideWindow = "no daemon-status scrape inside this window: the 
 // frozen protocol byte for byte — the same 60 s, the same 5 s read-only search,
 // now also opening at the same point in the run — so it stays the 1:1
 // counterpart of the frozen P1/P8 ceiling, which is what the reduction maps the
-// frozen phase name onto (w8JudgedWindows). The quiet arm is an additional
+// frozen phase name onto (sustainedIOJudgedWindows). The quiet arm is an additional
 // measurement of a question the frozen protocol never asked, and it is recorded
 // as its own un-budgeted row rather than folded into a ceiling that was never
 // measured over it. Halving both arms would have kept the phase's wall clock at
@@ -1302,34 +1302,34 @@ const w8NoScrapeInsideWindow = "no daemon-status scrape inside this window: the 
 //
 // Neither arm's bracket scrapes `daemon status`: an interior scrape is client
 // traffic inside a phase the frozen baseline measured with none.
-func (r *w8Run) idleWindows(quietWindow, pollingWindow string, duration time.Duration) {
+func (r *sustainedIORun) idleWindows(quietWindow, pollingWindow string, duration time.Duration) {
 	r.t.Helper()
-	r.inScrapeFreeWindow(pollingWindow, fmt.Sprintf("%s idle polling one read-only search every %s: the frozen protocol's own measurement, unchanged in duration, period and position (it opens the phase, as the frozen window did)", duration, w8IdlePollInterval), func() {
-		r.idleAs(duration, w8IdlePolling)
+	r.inScrapeFreeWindow(pollingWindow, fmt.Sprintf("%s idle polling one read-only search every %s: the frozen protocol's own measurement, unchanged in duration, period and position (it opens the phase, as the frozen window did)", duration, sustainedIOIdlePollInterval), func() {
+		r.idleAs(duration, sustainedIOIdlePolling)
 	})
 	r.inScrapeFreeWindow(quietWindow, fmt.Sprintf("%s idle with no client calls: the daemon's own floor (un-budgeted: the frozen protocol never measured it, and it runs second so the judged arm keeps the frozen window's position)", duration), func() {
-		r.idleAs(duration, w8IdleQuiet)
+		r.idleAs(duration, sustainedIOIdleQuiet)
 	})
 	r.note(fmt.Sprintf("idle split: %s ran first and %s second, each holding %s; %s is the arm the frozen %s ceiling is applied to, and it runs first so it opens where the frozen window opened",
 		pollingWindow, quietWindow, duration, pollingWindow, r.phase))
 }
 
-func (r *w8Run) lastProbeFile() string { return r.markerPath(r.f.primary) }
+func (r *sustainedIORun) lastProbeFile() string { return r.markerPath(r.f.primary) }
 
 // ------------------------------------------------------------------ phases ---
 
-func (r *w8Run) phaseColdIndex() {
+func (r *sustainedIORun) phaseColdIndex() {
 	r.f.start()
-	r.f.command(w8PhaseCommandTimeout, r.f.primary, "daemon", "status", "--no-progress")
-	r.awaitProbe(r.f.primary, w8PrimaryMarker, r.markerPath(r.f.primary))
+	r.f.command(sustainedIOPhaseCommandTimeout, r.f.primary, "daemon", "status", "--no-progress")
+	r.awaitProbe(r.f.primary, sustainedIOPrimaryMarker, r.markerPath(r.f.primary))
 	r.f.settle()
 	r.awaitIndexTimeWorkSettled()
 }
 
-// w8IndexSettleCounters are the counter families whose movement means index-
+// sustainedIOIndexSettleCounters are the counter families whose movement means index-
 // time work is still in flight. Names are matched by prefix because each
 // carries labels (`views_dedicated_base_publication_total{outcome=published}`).
-var w8IndexSettleCounters = []string{
+var sustainedIOIndexSettleCounters = []string{
 	"views_dedicated_base_publication_total",
 	"views_dedicated_base_publish_total",
 	"views_dedicated_base_claim_total",
@@ -1337,16 +1337,16 @@ var w8IndexSettleCounters = []string{
 }
 
 const (
-	// w8IndexSettlePoll is how often the publication family is re-read, and
-	// w8IndexSettleQuiet how many consecutive unchanged reads end the wait.
-	w8IndexSettlePoll  = 5 * time.Second
-	w8IndexSettleQuiet = 4
+	// sustainedIOIndexSettlePoll is how often the publication family is re-read, and
+	// sustainedIOIndexSettleQuiet how many consecutive unchanged reads end the wait.
+	sustainedIOIndexSettlePoll  = 5 * time.Second
+	sustainedIOIndexSettleQuiet = 4
 )
 
 // awaitIndexTimeWorkSettled holds the cold-index phase open until any
 // dedicated-base publication scheduled by the daemon start has settled — or
 // until the publication family has demonstrably not moved for
-// w8IndexSettleQuiet consecutive reads, which is the shape of a daemon that
+// sustainedIOIndexSettleQuiet consecutive reads, which is the shape of a daemon that
 // scheduled none.
 //
 // The phase used to end at the first exact primary answer plus settle(), which
@@ -1355,20 +1355,20 @@ const (
 // inside the next window and was reported as a 7.44x idle regression. Booking
 // it to the phase that caused it is the difference between a measurement and a
 // mislabel.
-func (r *w8Run) awaitIndexTimeWorkSettled() {
+func (r *sustainedIORun) awaitIndexTimeWorkSettled() {
 	started := time.Now()
-	result := w8AwaitCountersQuiet(r.counters, w8IndexSettleCounters, w8IndexSettlePoll, w8IndexSettleQuiet,
-		time.Now().Add(w8DefaultProbeTimeout), r.sleepOrFail)
+	result := sustainedIOAwaitCountersQuiet(r.counters, sustainedIOIndexSettleCounters, sustainedIOIndexSettlePoll, sustainedIOIndexSettleQuiet,
+		time.Now().Add(sustainedIODefaultProbeTimeout), r.sleepOrFail)
 	r.accountWait(time.Since(started).Seconds())
 	r.note(fmt.Sprintf("index-time settle: %s", result))
 	if !result.Settled {
-		r.t.Logf("%s/%s: index-time work did not go quiet inside %s: %s", r.arm, r.phase, w8DefaultProbeTimeout, result)
+		r.t.Logf("%s/%s: index-time work did not go quiet inside %s: %s", r.arm, r.phase, sustainedIODefaultProbeTimeout, result)
 	}
 }
 
 // sleepOrFail waits, and fails the phase if the test's context is cancelled
 // underneath the wait.
-func (r *w8Run) sleepOrFail(d time.Duration) {
+func (r *sustainedIORun) sleepOrFail(d time.Duration) {
 	select {
 	case <-r.t.Context().Done():
 		r.t.Fatal(r.t.Context().Err())
@@ -1376,8 +1376,8 @@ func (r *w8Run) sleepOrFail(d time.Duration) {
 	}
 }
 
-// w8SettleResult is what one quiescence wait observed.
-type w8SettleResult struct {
+// sustainedIOSettleResult is what one quiescence wait observed.
+type sustainedIOSettleResult struct {
 	Polls      int      `json:"polls"`
 	Activity   int64    `json:"activity"`
 	Moved      int64    `json:"moved"`
@@ -1388,16 +1388,16 @@ type w8SettleResult struct {
 	Errors     []string `json:"errors,omitempty"`
 }
 
-func (s w8SettleResult) String() string {
+func (s sustainedIOSettleResult) String() string {
 	return fmt.Sprintf("settled=%v polls=%d activity=%d moved=%d stable_for=%d unreadable=%d",
 		s.Settled, s.Polls, s.Activity, s.Moved, s.StableFor, s.Unreadable)
 }
 
-// w8CounterActivity sums every counter whose name starts with one of the named
+// sustainedIOCounterActivity sums every counter whose name starts with one of the named
 // families. A family that does not appear contributes nothing, which is the
 // same as a family at zero — for a monotone counter the distinction does not
 // change whether it MOVED, which is the only question here.
-func w8CounterActivity(counters map[string]int64, prefixes []string) int64 {
+func sustainedIOCounterActivity(counters map[string]int64, prefixes []string) int64 {
 	total := int64(0)
 	for name, value := range counters {
 		for _, prefix := range prefixes {
@@ -1410,21 +1410,21 @@ func w8CounterActivity(counters map[string]int64, prefixes []string) int64 {
 	return total
 }
 
-// w8AwaitCountersQuiet polls read until the named counter families have not
+// sustainedIOAwaitCountersQuiet polls read until the named counter families have not
 // moved across `quiet` consecutive readings, or until the deadline.
 //
 // A reading that fails is not a quiet reading: it resets the streak and is
 // counted, because "the daemon did not answer" and "the daemon answered the
 // same number again" are different facts and only the second one ends a wait.
-func w8AwaitCountersQuiet(
+func sustainedIOAwaitCountersQuiet(
 	read func() (map[string]int64, error),
 	prefixes []string,
 	interval time.Duration,
 	quiet int,
 	deadline time.Time,
 	sleep func(time.Duration),
-) w8SettleResult {
-	result := w8SettleResult{}
+) sustainedIOSettleResult {
+	result := sustainedIOSettleResult{}
 	started := time.Now()
 	var previous int64
 	seeded := false
@@ -1438,7 +1438,7 @@ func w8AwaitCountersQuiet(
 				result.Errors = append(result.Errors, err.Error())
 			}
 		} else {
-			activity := w8CounterActivity(counters, prefixes)
+			activity := sustainedIOCounterActivity(counters, prefixes)
 			result.Activity = activity
 			if seeded {
 				if activity == previous {
@@ -1463,11 +1463,11 @@ func w8AwaitCountersQuiet(
 	}
 }
 
-func (r *w8Run) phaseIdleCold() {
-	r.idleWindows(w8WindowIdleColdQuiet, w8WindowIdleColdPolling, r.cfg.Idle)
+func (r *sustainedIORun) phaseIdleCold() {
+	r.idleWindows(sustainedIOWindowIdleColdQuiet, sustainedIOWindowIdleColdPolling, r.cfg.Idle)
 }
 
-func (r *w8Run) phaseSmallEdits() {
+func (r *sustainedIORun) phaseSmallEdits() {
 	for i := 0; i < r.cfg.Edits; i++ {
 		started := time.Now()
 		r.editFile(r.rotation[i%len(r.rotation)])
@@ -1482,7 +1482,7 @@ func (r *w8Run) phaseSmallEdits() {
 	r.f.settle()
 }
 
-func (r *w8Run) phaseTouchStageUnstage() {
+func (r *sustainedIORun) phaseTouchStageUnstage() {
 	index := r.rotation[0]
 	path := r.filePath(index)
 	source, err := os.ReadFile(path)
@@ -1497,7 +1497,7 @@ func (r *w8Run) phaseTouchStageUnstage() {
 	r.f.git(r.f.primary, "reset")
 	r.settleShort()
 	if revision := r.revisions[index]; revision > 0 {
-		r.awaitProbe(r.f.primary, w8ProbeName(index, revision), path)
+		r.awaitProbe(r.f.primary, sustainedIOProbeName(index, revision), path)
 	} else {
 		r.awaitProbe(r.f.primary, r.lastProbe, r.lastProbeFile())
 	}
@@ -1520,8 +1520,8 @@ func (r *w8Run) phaseTouchStageUnstage() {
 // total — the frozen ceiling stays comparable — and the artifact carries
 // P4a_commit_tree_change and P4b_amend_same_tree as their own rows, which is
 // where the amend's number can honestly be read.
-func (r *w8Run) phaseAmendSameTree() {
-	r.inWindow(w8WindowCommitTreeChange,
+func (r *sustainedIORun) phaseAmendSameTree() {
+	r.inWindow(sustainedIOWindowCommitTreeChange,
 		"git add -A && git commit of whatever the edit phases left dirty: a tree-changing commit, not the amend",
 		func() {
 			r.f.git(r.f.primary, "add", "-A")
@@ -1532,7 +1532,7 @@ func (r *w8Run) phaseAmendSameTree() {
 			// its bytes are booked here and not to the amend.
 			r.awaitIndexTimeWorkSettled()
 		})
-	r.inWindow(w8WindowAmendSameTree,
+	r.inWindow(sustainedIOWindowAmendSameTree,
 		"git commit --amend --no-edit: a new commit id over an unchanged tree",
 		func() {
 			treeBefore := r.gitOutput("rev-parse", "HEAD^{tree}")
@@ -1552,19 +1552,19 @@ func (r *w8Run) phaseAmendSameTree() {
 		})
 }
 
-func (r *w8Run) phaseMainAdvance() {
+func (r *sustainedIORun) phaseMainAdvance() {
 	for i := 1; i <= r.cfg.Worktrees; i++ {
 		path := filepath.Join(r.f.root, fmt.Sprintf("wt%02d", i))
 		r.f.git(r.f.primary, "worktree", "add", "-b", fmt.Sprintf("w%02d", i), path)
 		r.dependents = append(r.dependents, path)
 		// Discovered, never tracked: no track call, no config edit.
-		r.awaitProbe(path, w8PrimaryMarker, r.markerPath(path))
+		r.awaitProbe(path, sustainedIOPrimaryMarker, r.markerPath(path))
 	}
 	r.f.settle()
 	for commit := 1; commit <= r.cfg.Commits; commit++ {
-		marker := fmt.Sprintf(w8AdvanceMarkerFormat, commit)
-		r.f.write(r.markerPath(r.f.primary), issue767MarkerSource(w8PrimaryMarker, marker))
-		for offset := 0; offset < w8CommitFilesPerCommit-1; offset++ {
+		marker := fmt.Sprintf(sustainedIOAdvanceMarkerFormat, commit)
+		r.f.write(r.markerPath(r.f.primary), issue767MarkerSource(sustainedIOPrimaryMarker, marker))
+		for offset := 0; offset < sustainedIOCommitFilesPerCommit-1; offset++ {
 			index := r.rotation[(commit+offset)%len(r.rotation)]
 			path := r.filePath(index)
 			source, err := os.ReadFile(path)
@@ -1572,7 +1572,7 @@ func (r *w8Run) phaseMainAdvance() {
 				r.t.Fatal(err)
 			}
 			revision := r.revisions[index] + 1
-			edited, err := w8EditFileSource(string(source), index, revision)
+			edited, err := sustainedIOEditFileSource(string(source), index, revision)
 			if err != nil {
 				r.t.Fatal(err)
 			}
@@ -1587,7 +1587,7 @@ func (r *w8Run) phaseMainAdvance() {
 		for _, dependent := range r.dependents {
 			// The dependent's own tree did not move; its base did. It must
 			// still answer exactly for its own committed marker.
-			r.awaitProbe(dependent, w8PrimaryMarker, r.markerPath(dependent))
+			r.awaitProbe(dependent, sustainedIOPrimaryMarker, r.markerPath(dependent))
 		}
 	}
 	if len(r.dependents) > 0 && r.commits > 0 {
@@ -1609,17 +1609,17 @@ func (r *w8Run) phaseMainAdvance() {
 // these phases already goes through a bounded await; this one now does too.
 //
 // What does NOT change is what an answer means once it can be judged:
-// w8IsolationOutcome is untouched, a leak is still a leak, and a question that
+// sustainedIOIsolationOutcome is untouched, a leak is still a leak, and a question that
 // never becomes judgeable inside the probe timeout is a failure with the whole
 // answer attached — never a quiet pass.
-func (r *w8Run) probeIsolation(subject, root, name, file string) {
+func (r *sustainedIORun) probeIsolation(subject, root, name, file string) {
 	r.t.Helper()
-	probe := r.f.awaitJudgeable(root, name, file, r.f.spellingFor(root), w8DefaultProbeTimeout)
+	probe := r.f.awaitJudgeable(root, name, file, r.f.spellingFor(root), sustainedIODefaultProbeTimeout)
 	r.accountWait(probe.Seconds)
-	record := w8IsolationRecord{Subject: subject, Probe: probe, Answer: probe.Answer, Judged: probe.Judgeable, Leaked: probe.Found}
+	record := sustainedIOIsolationRecord{Subject: subject, Probe: probe, Answer: probe.Answer, Judged: probe.Judgeable, Leaked: probe.Found}
 	if !probe.Judgeable {
 		record.Outcome = fmt.Sprintf("NOT JUDGEABLE: no answer the rule applies to within %s after %d asks (%.2fs); last answer %+v; last error %q",
-			w8DefaultProbeTimeout, probe.Polls, probe.Seconds, probe.Answer, probe.Err)
+			sustainedIODefaultProbeTimeout, probe.Polls, probe.Seconds, probe.Answer, probe.Err)
 		r.recordIsolation(record)
 		r.t.Fatalf("%s: %s", subject, record.Outcome)
 		return
@@ -1633,11 +1633,11 @@ func (r *w8Run) probeIsolation(subject, root, name, file string) {
 	r.judgeIsolation(record)
 }
 
-// requireIsolation applies w8IsolationOutcome to an answer the caller already
+// requireIsolation applies sustainedIOIsolationOutcome to an answer the caller already
 // judged, and records it either way.
-func (r *w8Run) requireIsolation(subject string, leaked bool) {
+func (r *sustainedIORun) requireIsolation(subject string, leaked bool) {
 	r.t.Helper()
-	r.judgeIsolation(w8IsolationRecord{
+	r.judgeIsolation(sustainedIOIsolationRecord{
 		Subject: subject, Judged: true, Leaked: leaked,
 		Answer: issue767Answer{Found: leaked},
 	})
@@ -1645,9 +1645,9 @@ func (r *w8Run) requireIsolation(subject string, leaked bool) {
 
 // judgeIsolation is the one place gate 5's rule is applied. It is unchanged:
 // what the bounded probe changed is WHEN the harness may reach it.
-func (r *w8Run) judgeIsolation(record w8IsolationRecord) {
+func (r *sustainedIORun) judgeIsolation(record sustainedIOIsolationRecord) {
 	r.t.Helper()
-	fatal, note := w8IsolationOutcome(r.arm, record.Leaked)
+	fatal, note := sustainedIOIsolationOutcome(r.arm, record.Leaked)
 	record.Outcome = note
 	r.recordIsolation(record)
 	if fatal {
@@ -1662,7 +1662,7 @@ func (r *w8Run) judgeIsolation(record w8IsolationRecord) {
 // fallback label, source file, answering corpus, error, asks and wait — on the
 // phase note, on the phase report and on the run, so it is in the artifact
 // whether or not the phase went on to fail.
-func (r *w8Run) recordIsolation(record w8IsolationRecord) {
+func (r *sustainedIORun) recordIsolation(record sustainedIOIsolationRecord) {
 	r.note(fmt.Sprintf("%s: %s [spelling=%s found=%v exact_label=%v fallback=%v from_expected_file=%v answered_by=%q asks=%d waited=%.2fs error=%q]",
 		record.Subject, record.Outcome, record.Answer.Spelling, record.Answer.Found, record.Answer.Exact,
 		record.Answer.Fallback, record.Answer.FromExpectedFile, record.Answer.Prefix,
@@ -1671,7 +1671,7 @@ func (r *w8Run) recordIsolation(record w8IsolationRecord) {
 	r.isolation = append(r.isolation, record)
 }
 
-// w8IsolationOutcome says what a leaked symbol means for an arm.
+// sustainedIOIsolationOutcome says what a leaked symbol means for an arm.
 //
 // Gate 5 — "a workload with ten dependent worktrees updates every logical view
 // correctly" — is a claim about the branch. The baseline binary predates it:
@@ -1687,7 +1687,7 @@ func (r *w8Run) recordIsolation(record w8IsolationRecord) {
 // "Everywhere else" is deliberate: any arm whose name is not exactly "baseline"
 // is held to the gate, so a renamed or mistyped arm can never inherit the
 // exemption.
-func w8IsolationOutcome(arm string, leaked bool) (fatal bool, note string) {
+func sustainedIOIsolationOutcome(arm string, leaked bool) (fatal bool, note string) {
 	if !leaked {
 		return false, "isolation held"
 	}
@@ -1698,7 +1698,7 @@ func w8IsolationOutcome(arm string, leaked bool) (fatal bool, note string) {
 	return true, "ISOLATION VIOLATION: the symbol is visible where it must not be (gate 5)"
 }
 
-func (r *w8Run) phaseDependentEdits() {
+func (r *sustainedIORun) phaseDependentEdits() {
 	if len(r.dependents) == 0 {
 		r.t.Log("no dependents configured; phase is a no-op")
 		return
@@ -1706,8 +1706,8 @@ func (r *w8Run) phaseDependentEdits() {
 	edited := min(len(r.dependents), 3)
 	for i := 0; i < edited; i++ {
 		dependent := r.dependents[i]
-		marker := fmt.Sprintf(w8DependentMarkerForm, i+1)
-		r.f.write(r.markerPath(dependent), issue767MarkerSource(w8PrimaryMarker, marker))
+		marker := fmt.Sprintf(sustainedIODependentMarkerForm, i+1)
+		r.f.write(r.markerPath(dependent), issue767MarkerSource(sustainedIOPrimaryMarker, marker))
 		r.awaitProbe(dependent, marker, r.markerPath(dependent))
 		r.probeIsolation("dependent edit "+marker+" in the primary view",
 			r.f.primary, marker, r.markerPath(r.f.primary))
@@ -1752,13 +1752,13 @@ func (r *w8Run) phaseDependentEdits() {
 // untrack then demotes the dedicated checkout back into the family's automatic
 // lane, which runs outright because the primary corpus survives to serve it
 // (untrackCmd's Long, track.go:60-68); only a row-removing plan needs --confirm.
-func (r *w8Run) phaseDependentUntrackRetrack() {
+func (r *sustainedIORun) phaseDependentUntrackRetrack() {
 	if len(r.dependents) == 0 {
 		r.t.Log("no dependents configured; phase is a no-op")
 		return
 	}
 	dependent := r.dependents[0]
-	marker := fmt.Sprintf(w8DependentMarkerForm, 1)
+	marker := fmt.Sprintf(sustainedIODependentMarkerForm, 1)
 	file := r.markerPath(dependent)
 
 	// Automatic, before anything changes: the routed view answers exactly.
@@ -1771,7 +1771,7 @@ func (r *w8Run) phaseDependentUntrackRetrack() {
 	if err != nil {
 		r.t.Fatalf("track --as-worktree %s: %v\n%s", dependent, err, output)
 	}
-	r.note("track --as-worktree: " + w8Tail(output))
+	r.note("track --as-worktree: " + sustainedIOTail(output))
 
 	// Dedicated: asked as its own repository.
 	r.awaitProbeAs(dependent, marker, file, issue767AsOwnCorpus)
@@ -1783,7 +1783,7 @@ func (r *w8Run) phaseDependentUntrackRetrack() {
 	if err != nil {
 		r.t.Fatalf("untrack %s: %v\n%s", dependent, err, output)
 	}
-	r.note("untrack: " + w8Tail(output))
+	r.note("untrack: " + sustainedIOTail(output))
 	// Demoted back to automatic discovery: the primary survives, so the routed
 	// spelling must answer exactly from the dependent's own working copy again.
 	r.awaitProbeAs(dependent, marker, file, issue767AsAutomaticWorktree)
@@ -1796,10 +1796,10 @@ func (r *w8Run) phaseDependentUntrackRetrack() {
 // rather than as an assertion. A spelling the product refuses is recorded with
 // its refusal; a spelling that answers is recorded with which labels the answer
 // did and did not carry.
-func (r *w8Run) noteAnswer(subject, root, name, file string, spelling issue767Spelling) {
+func (r *sustainedIORun) noteAnswer(subject, root, name, file string, spelling issue767Spelling) {
 	answer, err := r.f.askSymbol(root, name, file, spelling)
 	if err != nil {
-		r.note(fmt.Sprintf("%s asked via %s: refused: %s", subject, spelling, w8Tail([]byte(err.Error()))))
+		r.note(fmt.Sprintf("%s asked via %s: refused: %s", subject, spelling, sustainedIOTail([]byte(err.Error()))))
 		return
 	}
 	r.note(fmt.Sprintf("%s asked via %s: found=%v exact_label=%v fallback=%v from_expected_file=%v answered_by=%q",
@@ -1807,7 +1807,7 @@ func (r *w8Run) noteAnswer(subject, root, name, file string, spelling issue767Sp
 }
 
 // dumpDiagnostics writes the failure evidence next to the phase artifacts.
-func (r *w8Run) dumpDiagnostics(phase string) {
+func (r *sustainedIORun) dumpDiagnostics(phase string) {
 	run := func(args ...string) string {
 		output, err := r.f.tryCommand(60*time.Second, r.f.primary, args...)
 		if err != nil {
@@ -1816,7 +1816,7 @@ func (r *w8Run) dumpDiagnostics(phase string) {
 		return string(output)
 	}
 	paths := append([]string{r.f.primary}, r.dependents...)
-	diagnostics := w8CollectDiagnostics(phase, run, r.daemonLogTail(), paths, r.phaseIsolation)
+	diagnostics := sustainedIOCollectDiagnostics(phase, run, r.daemonLogTail(), paths, r.phaseIsolation)
 	data, err := json.MarshalIndent(diagnostics, "", "  ")
 	if err != nil {
 		return
@@ -1829,7 +1829,7 @@ func (r *w8Run) dumpDiagnostics(phase string) {
 }
 
 // daemonLogTail is the last 8 KiB of the running child's log.
-func (r *w8Run) daemonLogTail() string {
+func (r *sustainedIORun) daemonLogTail() string {
 	data, err := os.ReadFile(r.f.logPath())
 	if err != nil {
 		return "daemon log unavailable: " + err.Error()
@@ -1843,16 +1843,16 @@ func (r *w8Run) daemonLogTail() string {
 // note records a phase-scoped observation; execute folds it into the report.
 // While a sub-window is open the note lands on that window's row too, so a
 // window's evidence is readable without reassembling it from the phase.
-func (r *w8Run) note(text string) {
+func (r *sustainedIORun) note(text string) {
 	r.phaseNotes = append(r.phaseNotes, text)
 	if r.windowOpen {
 		r.windowNotes = append(r.windowNotes, text)
 	}
 }
 
-// w8Tail keeps a command's last line or two, so a phase note carries the
+// sustainedIOTail keeps a command's last line or two, so a phase note carries the
 // outcome without carrying a screenful of progress output.
-func w8Tail(output []byte) string {
+func sustainedIOTail(output []byte) string {
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(lines) > 2 {
 		lines = lines[len(lines)-2:]
@@ -1860,8 +1860,8 @@ func w8Tail(output []byte) string {
 	return strings.TrimSpace(strings.Join(lines, " / "))
 }
 
-func (r *w8Run) phaseIdleWarm() {
-	r.idleWindows(w8WindowIdleWarmQuiet, w8WindowIdleWarmPolling, r.cfg.Idle)
+func (r *sustainedIORun) phaseIdleWarm() {
+	r.idleWindows(sustainedIOWindowIdleWarmQuiet, sustainedIOWindowIdleWarmPolling, r.cfg.Idle)
 }
 
 // enforceIdleBudget is the only budget in this item, and it is off unless the
@@ -1870,11 +1870,11 @@ func (r *w8Run) phaseIdleWarm() {
 // applies to the idle phases only, on the candidate arm only, and it records
 // the reason when the series it needs is unavailable rather than passing by
 // default.
-func (r *w8Run) enforceIdleBudget(report *w8PhaseReport) {
+func (r *sustainedIORun) enforceIdleBudget(report *sustainedIOPhaseReport) {
 	if r.cfg.IdleBudget == 0 || r.arm != "candidate" || !strings.Contains(report.Phase, "_idle_") {
 		return
 	}
-	breaches, note := w8IdleBudgetBreaches(report, r.cfg.IdleBudget)
+	breaches, note := sustainedIOIdleBudgetBreaches(report, r.cfg.IdleBudget)
 	if note != "" {
 		report.Notes = append(report.Notes, note)
 	}
@@ -1883,7 +1883,7 @@ func (r *w8Run) enforceIdleBudget(report *w8PhaseReport) {
 	}
 }
 
-// w8IdleBudgetBreaches applies an operator's idle byte budget to an idle
+// sustainedIOIdleBudgetBreaches applies an operator's idle byte budget to an idle
 // phase's report, and it applies it to each idle ARM rather than to their sum.
 //
 // The budget names a number of bytes per idle window. Since the phase measures
@@ -1894,11 +1894,11 @@ func (r *w8Run) enforceIdleBudget(report *w8PhaseReport) {
 // it says, and it is strictly stronger than the phase-total check it replaces:
 // every window has to be inside the budget, and a phase with no windows is
 // still judged as a whole.
-func w8IdleBudgetBreaches(report *w8PhaseReport, budget uint64) ([]string, string) {
+func sustainedIOIdleBudgetBreaches(report *sustainedIOPhaseReport, budget uint64) ([]string, string) {
 	if budget == 0 {
 		return nil, ""
 	}
-	windows := []w8WindowReport{}
+	windows := []sustainedIOWindowReport{}
 	for _, window := range report.Windows {
 		if window.LogicalWrites != nil {
 			windows = append(windows, window)
@@ -1923,7 +1923,7 @@ func w8IdleBudgetBreaches(report *w8PhaseReport, budget uint64) ([]string, strin
 	return breaches, fmt.Sprintf("idle budget %d applied to each of the %d idle windows, not to their sum", budget, len(windows))
 }
 
-func (r *w8Run) settleShort() {
+func (r *sustainedIORun) settleShort() {
 	select {
 	case <-r.t.Context().Done():
 		r.t.Fatal(r.t.Context().Err())
@@ -1931,16 +1931,16 @@ func (r *w8Run) settleShort() {
 	}
 }
 
-func (r *w8Run) gitOutput(args ...string) string {
+func (r *sustainedIORun) gitOutput(args ...string) string {
 	r.t.Helper()
-	output, err := w8GitOutput(r.t, r.f, args...)
+	output, err := sustainedIOGitOutput(r.t, r.f, args...)
 	if err != nil {
 		r.t.Fatalf("git %v: %v", args, err)
 	}
 	return output
 }
 
-func w8GitOutput(t *testing.T, f *issue767Fixture, args ...string) (string, error) {
+func sustainedIOGitOutput(t *testing.T, f *issue767Fixture, args ...string) (string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -1950,7 +1950,7 @@ func w8GitOutput(t *testing.T, f *issue767Fixture, args ...string) (string, erro
 	return strings.TrimSpace(string(output)), err
 }
 
-// w8SourceIdentity records which tree the harness itself came from. It is best
+// sustainedIOSourceIdentity records which tree the harness itself came from. It is best
 // effort: the harness may run from an exported tree with no git metadata.
 //
 // The digest covers `git status --porcelain=v1 -uall` AND `git diff HEAD`.
@@ -1964,29 +1964,29 @@ func w8GitOutput(t *testing.T, f *issue767Fixture, args ...string) (string, erro
 // The cwd it must NOT use is the process's. A measurement run compiles this
 // package into a test binary and executes it from a private root under /tmp —
 // `go test -c` plus a short run directory is the whole protocol — and git run
-// there answers nothing, so every frozen manifest in
-// scratchpad/artifacts/W8m-W8.4/paired1500 carries no source_commit and no
+// there answers nothing, so every frozen manifest in the paired1500 artifact
+// set carries no source_commit and no
 // dirty_tree_digest at all. A manifest whose whole job is "which tree produced
 // this number" silently recorded nothing. The tree is resolved from the
 // compiled-in path of this source file instead, which is where the harness
 // actually came from.
-func w8SourceIdentity() (commit, dirty string, notes []string) {
-	dir, note := w8HarnessSourceDir()
+func sustainedIOSourceIdentity() (commit, dirty string, notes []string) {
+	dir, note := sustainedIOHarnessSourceDir()
 	if note != "" {
 		notes = append(notes, note)
 	}
 	if dir == "" {
 		return "", "", notes
 	}
-	commit, dirty, gitNotes := w8GitIdentity(dir)
+	commit, dirty, gitNotes := sustainedIOGitIdentity(dir)
 	return commit, dirty, append(notes, gitNotes...)
 }
 
-// w8HarnessSourceDir is the directory this file was compiled from. Under
+// sustainedIOHarnessSourceDir is the directory this file was compiled from. Under
 // -trimpath the recorded path is relative to the module root and no longer
 // resolves, which is reported by name rather than papered over with the
 // process's working directory.
-func w8HarnessSourceDir() (string, string) {
+func sustainedIOHarnessSourceDir() (string, string) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok || file == "" {
 		return "", "source identity unavailable: runtime.Caller gave no file for the harness"
@@ -2001,10 +2001,10 @@ func w8HarnessSourceDir() (string, string) {
 	return dir, ""
 }
 
-// w8GitIdentity reads the commit and the dirty digest of the tree that owns
+// sustainedIOGitIdentity reads the commit and the dirty digest of the tree that owns
 // dir. A directory that is not in a work tree is named as such: an empty
 // identity with no explanation is what produced the frozen artifacts' silence.
-func w8GitIdentity(dir string) (commit, dirty string, notes []string) {
+func sustainedIOGitIdentity(dir string) (commit, dirty string, notes []string) {
 	run := func(args ...string) (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -2026,12 +2026,12 @@ func w8GitIdentity(dir string) (commit, dirty string, notes []string) {
 	if diffErr != nil {
 		notes = append(notes, "dirty diff unavailable for "+dir+": "+diffErr.Error())
 	}
-	return commit, w8DirtyDigest(status, diff), notes
+	return commit, sustainedIODirtyDigest(status, diff), notes
 }
 
-// w8DirtyDigest is the content-sensitive half of the source identity: the
+// sustainedIODirtyDigest is the content-sensitive half of the source identity: the
 // modified-file list AND the modified bytes. A clean tree digests to "".
-func w8DirtyDigest(status, diff string) string {
+func sustainedIODirtyDigest(status, diff string) string {
 	if status == "" && diff == "" {
 		return ""
 	}
@@ -2039,16 +2039,16 @@ func w8DirtyDigest(status, diff string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func w8WriteJSON(t *testing.T, path string, value any) {
+func sustainedIOWriteJSON(t *testing.T, path string, value any) {
 	t.Helper()
-	if err := w8TryWriteJSON(path, value); err != nil {
+	if err := sustainedIOTryWriteJSON(path, value); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// w8TryWriteJSON is w8WriteJSON without the test handle, for the code paths
+// sustainedIOTryWriteJSON is sustainedIOWriteJSON without the test handle, for the code paths
 // that run while a failure is already unwinding.
-func w8TryWriteJSON(path string, value any) error {
+func sustainedIOTryWriteJSON(path string, value any) error {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
@@ -2058,8 +2058,8 @@ func w8TryWriteJSON(path string, value any) error {
 
 // ------------------------------------------------------------------ tests ---
 
-func TestW8ConfigFromEnvDefaultsAndBounds(t *testing.T) {
-	cfg, err := w8ConfigFromEnv(func(string) string { return "" })
+func TestSustainedIOConfigFromEnvDefaultsAndBounds(t *testing.T) {
+	cfg, err := sustainedIOConfigFromEnv(func(string) string { return "" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2069,19 +2069,19 @@ func TestW8ConfigFromEnvDefaultsAndBounds(t *testing.T) {
 		t.Fatalf("defaults drifted: %+v", cfg)
 	}
 	env := map[string]string{
-		"GXW8_FIXTURE_FILES":     "6000",
-		"GXW8_FIXTURE_PACKAGES":  "120",
-		"GXW8_FIXTURE_SEED":      "99",
-		"GXW8_WORKTREES":         "2",
-		"GXW8_COMMITS":           "3",
-		"GXW8_EDITS":             "4",
-		"GXW8_EDIT_INTERVAL":     "2s",
-		"GXW8_IDLE":              "5s",
-		"GXW8_SAMPLE_INTERVAL":   "500ms",
-		"GXW8_REPS":              "2",
-		"GXW8_IDLE_BUDGET_BYTES": "8388608",
+		"GX_SUSTAINED_IO_FIXTURE_FILES":     "6000",
+		"GX_SUSTAINED_IO_FIXTURE_PACKAGES":  "120",
+		"GX_SUSTAINED_IO_FIXTURE_SEED":      "99",
+		"GX_SUSTAINED_IO_WORKTREES":         "2",
+		"GX_SUSTAINED_IO_COMMITS":           "3",
+		"GX_SUSTAINED_IO_EDITS":             "4",
+		"GX_SUSTAINED_IO_EDIT_INTERVAL":     "2s",
+		"GX_SUSTAINED_IO_IDLE":              "5s",
+		"GX_SUSTAINED_IO_SAMPLE_INTERVAL":   "500ms",
+		"GX_SUSTAINED_IO_REPS":              "2",
+		"GX_SUSTAINED_IO_IDLE_BUDGET_BYTES": "8388608",
 	}
-	cfg, err = w8ConfigFromEnv(func(key string) string { return env[key] })
+	cfg, err = sustainedIOConfigFromEnv(func(key string) string { return env[key] })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2092,15 +2092,15 @@ func TestW8ConfigFromEnvDefaultsAndBounds(t *testing.T) {
 		t.Fatalf("knobs not applied: %+v", cfg)
 	}
 	for _, tc := range []struct{ key, value string }{
-		{"GXW8_FIXTURE_FILES", "1"},
-		{"GXW8_FIXTURE_FILES", "nonsense"},
-		{"GXW8_WORKTREES", "-1"},
-		{"GXW8_REPS", "0"},
-		{"GXW8_IDLE", "10ms"},
-		{"GXW8_IDLE", "nope"},
-		{"GXW8_IDLE_BUDGET_BYTES", "huge"},
+		{"GX_SUSTAINED_IO_FIXTURE_FILES", "1"},
+		{"GX_SUSTAINED_IO_FIXTURE_FILES", "nonsense"},
+		{"GX_SUSTAINED_IO_WORKTREES", "-1"},
+		{"GX_SUSTAINED_IO_REPS", "0"},
+		{"GX_SUSTAINED_IO_IDLE", "10ms"},
+		{"GX_SUSTAINED_IO_IDLE", "nope"},
+		{"GX_SUSTAINED_IO_IDLE_BUDGET_BYTES", "huge"},
 	} {
-		if _, err := w8ConfigFromEnv(func(key string) string {
+		if _, err := sustainedIOConfigFromEnv(func(key string) string {
 			if key == tc.key {
 				return tc.value
 			}
@@ -2111,12 +2111,12 @@ func TestW8ConfigFromEnvDefaultsAndBounds(t *testing.T) {
 	}
 }
 
-func TestW8PhasePlanIsTheDeclaredNinePhaseWorkload(t *testing.T) {
-	cfg, err := w8ConfigFromEnv(func(string) string { return "" })
+func TestSustainedIOPhasePlanIsTheDeclaredNinePhaseWorkload(t *testing.T) {
+	cfg, err := sustainedIOConfigFromEnv(func(string) string { return "" })
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := w8PhasePlan(cfg)
+	plan := sustainedIOPhasePlan(cfg)
 	want := []string{
 		"P0_cold_index",
 		"P1_idle_cold",
@@ -2156,47 +2156,47 @@ func TestW8PhasePlanIsTheDeclaredNinePhaseWorkload(t *testing.T) {
 			t.Errorf("edit phase detail does not say it %q: %q", want, plan[2].Detail)
 		}
 	}
-	scaled, err := w8ConfigFromEnv(func(key string) string {
-		return map[string]string{"GXW8_WORKTREES": "2", "GXW8_COMMITS": "3"}[key]
+	scaled, err := sustainedIOConfigFromEnv(func(key string) string {
+		return map[string]string{"GX_SUSTAINED_IO_WORKTREES": "2", "GX_SUSTAINED_IO_COMMITS": "3"}[key]
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail := w8PhasePlan(scaled)[5].Detail; !strings.Contains(detail, "2 dependent worktrees") || !strings.Contains(detail, "3 commits") {
+	if detail := sustainedIOPhasePlan(scaled)[5].Detail; !strings.Contains(detail, "2 dependent worktrees") || !strings.Contains(detail, "3 commits") {
 		t.Errorf("phase detail does not follow the config: %q", detail)
 	}
 }
 
-func TestW8RequiredTimeoutScalesWithTheWorkload(t *testing.T) {
-	small := w8Config{Worktrees: 1, Commits: 1, Edits: 1, EditInterval: time.Second, Idle: 5 * time.Second, Repetitions: 1}
-	large := w8Config{Worktrees: 10, Commits: 20, Edits: 10, EditInterval: 30 * time.Second, Idle: time.Minute, Repetitions: 1}
-	if w8RequiredTimeout(small, 1) >= w8RequiredTimeout(large, 1) {
+func TestSustainedIORequiredTimeoutScalesWithTheWorkload(t *testing.T) {
+	small := sustainedIOConfig{Worktrees: 1, Commits: 1, Edits: 1, EditInterval: time.Second, Idle: 5 * time.Second, Repetitions: 1}
+	large := sustainedIOConfig{Worktrees: 10, Commits: 20, Edits: 10, EditInterval: 30 * time.Second, Idle: time.Minute, Repetitions: 1}
+	if sustainedIORequiredTimeout(small, 1) >= sustainedIORequiredTimeout(large, 1) {
 		t.Fatal("a larger workload must require a larger timeout")
 	}
-	if w8RequiredTimeout(large, 2) != 2*w8RequiredTimeout(large, 1) {
+	if sustainedIORequiredTimeout(large, 2) != 2*sustainedIORequiredTimeout(large, 1) {
 		t.Fatal("a second arm must double the requirement")
 	}
 	paired := large
 	paired.Repetitions = 3
-	if w8RequiredTimeout(paired, 1) != 3*w8RequiredTimeout(large, 1) {
+	if sustainedIORequiredTimeout(paired, 1) != 3*sustainedIORequiredTimeout(large, 1) {
 		t.Fatal("repetitions must multiply the requirement")
 	}
-	if w8RequiredTimeout(large, 0) != w8RequiredTimeout(large, 1) {
+	if sustainedIORequiredTimeout(large, 0) != sustainedIORequiredTimeout(large, 1) {
 		t.Fatal("an arm count below one must be treated as one arm")
 	}
 }
 
-// TestW8ProcessDeltaHandlesTheStartingChildAndTheRestart pins the three cases
+// TestSustainedIOProcessDeltaHandlesTheStartingChildAndTheRestart pins the three cases
 // the phase envelope must tell apart: an ordinary window, the phase that starts
 // the daemon (no baseline process, so the child's own counters ARE the delta),
 // and a child that was replaced mid-phase (deltas are meaningless and must not
 // be reported as a measurement).
-func TestW8ProcessDeltaHandlesTheStartingChildAndTheRestart(t *testing.T) {
+func TestSustainedIOProcessDeltaHandlesTheStartingChildAndTheRestart(t *testing.T) {
 	logical := func(v uint64) *uint64 { return &v }
 	before := issue767ProcessIO{BytesWritten: 100, BytesRead: 10, UserTimeNS: 5, SystemTimeNS: 6, StartTicks: 7, LogicalBytesWritten: logical(1000)}
 	after := issue767ProcessIO{BytesWritten: 400, BytesRead: 30, UserTimeNS: 15, SystemTimeNS: 26, StartTicks: 7, PhysFootprint: 42, LogicalBytesWritten: logical(4000)}
 
-	window := w8ProcessDelta(before, nil, after, nil)
+	window := sustainedIOProcessDelta(before, nil, after, nil)
 	if !window.OK || window.Logical == nil || *window.Logical != 3000 || window.DiskWritten != 300 ||
 		window.DiskRead != 20 || window.CPUUserNS != 10 || window.CPUSystemNS != 20 || window.PhysFootprint != 42 {
 		t.Fatalf("ordinary window = %+v (logical=%v)", window, window.Logical)
@@ -2206,7 +2206,7 @@ func TestW8ProcessDeltaHandlesTheStartingChildAndTheRestart(t *testing.T) {
 	}
 
 	// The cold-index phase: nothing to read before the child exists.
-	window = w8ProcessDelta(issue767ProcessIO{}, errW8NoChild, after, nil)
+	window = sustainedIOProcessDelta(issue767ProcessIO{}, errSustainedIONoChild, after, nil)
 	if !window.OK || window.Logical == nil || *window.Logical != 4000 || window.DiskWritten != 400 {
 		t.Fatalf("starting-child window lost the cold series: %+v", window)
 	}
@@ -2217,7 +2217,7 @@ func TestW8ProcessDeltaHandlesTheStartingChildAndTheRestart(t *testing.T) {
 	// A restart mid-phase: the counters belong to a different process.
 	restarted := after
 	restarted.StartTicks = 9
-	window = w8ProcessDelta(before, nil, restarted, nil)
+	window = sustainedIOProcessDelta(before, nil, restarted, nil)
 	if window.OK || window.Logical != nil || window.DiskWritten != 0 {
 		t.Fatalf("a restarted child must not produce a delta: %+v", window)
 	}
@@ -2226,25 +2226,25 @@ func TestW8ProcessDeltaHandlesTheStartingChildAndTheRestart(t *testing.T) {
 	}
 
 	// Unreadable ends stay unavailable, by name, on both sides.
-	if window = w8ProcessDelta(before, nil, after, errors.New("boom")); window.OK || !strings.Contains(window.Notes[0], "boom") {
+	if window = sustainedIOProcessDelta(before, nil, after, errors.New("boom")); window.OK || !strings.Contains(window.Notes[0], "boom") {
 		t.Errorf("end failure = %+v", window)
 	}
-	if window = w8ProcessDelta(before, errors.New("kaput"), after, nil); window.OK || !strings.Contains(window.Notes[0], "kaput") {
+	if window = sustainedIOProcessDelta(before, errors.New("kaput"), after, nil); window.OK || !strings.Contains(window.Notes[0], "kaput") {
 		t.Errorf("start failure = %+v", window)
 	}
 }
 
-// TestW8CollectDiagnosticsAsksTheExplainingQuestions pins the failure-evidence
+// TestSustainedIOCollectDiagnosticsAsksTheExplainingQuestions pins the failure-evidence
 // command set: a timed-out exactness wait must leave behind the daemon status
 // payload, the family census and one route explanation per checkout in play.
-func TestW8CollectDiagnosticsAsksTheExplainingQuestions(t *testing.T) {
+func TestSustainedIOCollectDiagnosticsAsksTheExplainingQuestions(t *testing.T) {
 	var calls []string
 	run := func(args ...string) string {
 		joined := strings.Join(args, " ")
 		calls = append(calls, joined)
 		return "output of " + joined
 	}
-	diagnostics := w8CollectDiagnostics("P7_dependent_untrack_retrack", run, "log tail", []string{"/tmp/repo", "/tmp/wt01"}, nil)
+	diagnostics := sustainedIOCollectDiagnostics("P7_dependent_untrack_retrack", run, "log tail", []string{"/tmp/repo", "/tmp/wt01"}, nil)
 	if diagnostics.Phase != "P7_dependent_untrack_retrack" || diagnostics.LogTail != "log tail" {
 		t.Fatalf("diagnostics envelope = %+v", diagnostics)
 	}
@@ -2263,7 +2263,7 @@ func TestW8CollectDiagnosticsAsksTheExplainingQuestions(t *testing.T) {
 	}
 }
 
-func TestW8StoreCensusSurvivesAMissingSchema(t *testing.T) {
+func TestSustainedIOStoreCensusSurvivesAMissingSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty.sqlite")
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
 	if err != nil {
@@ -2276,7 +2276,7 @@ func TestW8StoreCensusSurvivesAMissingSchema(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	census := w8ReadStoreCensus(ctx, db)
+	census := sustainedIOReadStoreCensus(ctx, db)
 	if census.PageSize == 0 || census.PageCount == 0 {
 		t.Errorf("page pragmas must still be read: %+v", census)
 	}
@@ -2285,8 +2285,8 @@ func TestW8StoreCensusSurvivesAMissingSchema(t *testing.T) {
 	}
 }
 
-// TestW8RunSamplerIsSafeWhileTheFixtureStartsItsChild exercises the production
-// wiring — w8NewRunSampler, the same call w8RunWorkload makes — against the
+// TestSustainedIORunSamplerIsSafeWhileTheFixtureStartsItsChild exercises the production
+// wiring — sustainedIONewRunSampler, the same call sustainedIORunWorkload makes — against the
 // fixture's own start/stop handle mutations, on two goroutines.
 //
 // It is a regression test for a real defect: the sampler goroutine is started
@@ -2295,11 +2295,11 @@ func TestW8StoreCensusSurvivesAMissingSchema(t *testing.T) {
 // were placed under a mutex this pattern tripped the race detector, which made
 // the whole harness unrunnable under -race. No daemon is needed: the child
 // handle is never started, so pid() reports 0 and the process reader returns
-// errW8NoChild — the fields being raced are the same ones either way.
-func TestW8RunSamplerIsSafeWhileTheFixtureStartsItsChild(t *testing.T) {
+// errSustainedIONoChild — the fields being raced are the same ones either way.
+func TestSustainedIORunSamplerIsSafeWhileTheFixtureStartsItsChild(t *testing.T) {
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
-	sampler := w8NewRunSampler(f, io.Discard, time.Millisecond)
+	sampler := sustainedIONewRunSampler(f, io.Discard, time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sampling := make(chan struct{})
@@ -2340,21 +2340,21 @@ func TestW8RunSamplerIsSafeWhileTheFixtureStartsItsChild(t *testing.T) {
 	}
 }
 
-// TestW8IsolationOutcomeExemptsOnlyTheBaselineArm pins the one arm-conditional
+// TestSustainedIOIsolationOutcomeExemptsOnlyTheBaselineArm pins the one arm-conditional
 // rule in the harness.
 //
 // An exemption that spreads is worse than no measurement: if the candidate
 // could ever inherit it, the paired run would report a write reduction that was
 // partly bought by serving the wrong corpus, and gate 5 would be untested by
 // the only workload that exercises ten dependents at once.
-func TestW8IsolationOutcomeExemptsOnlyTheBaselineArm(t *testing.T) {
+func TestSustainedIOIsolationOutcomeExemptsOnlyTheBaselineArm(t *testing.T) {
 	for _, arm := range []string{"candidate", "baseline", "", "Baseline", "baseline2", "control"} {
-		fatal, note := w8IsolationOutcome(arm, false)
+		fatal, note := sustainedIOIsolationOutcome(arm, false)
 		if fatal || note != "isolation held" {
 			t.Fatalf("arm %q with no leak: fatal=%v note=%q", arm, fatal, note)
 		}
 	}
-	fatal, note := w8IsolationOutcome("baseline", true)
+	fatal, note := sustainedIOIsolationOutcome("baseline", true)
 	if fatal {
 		t.Fatal("a baseline leak stopped the arm; the headline phase and everything after it would have no baseline")
 	}
@@ -2363,7 +2363,7 @@ func TestW8IsolationOutcomeExemptsOnlyTheBaselineArm(t *testing.T) {
 	}
 	// Every other arm name, including near-misses, is held to the gate.
 	for _, arm := range []string{"candidate", "", "Baseline", "baseline2", "baseline ", "control"} {
-		fatal, note := w8IsolationOutcome(arm, true)
+		fatal, note := sustainedIOIsolationOutcome(arm, true)
 		if !fatal {
 			t.Fatalf("arm %q inherited the baseline exemption: %q", arm, note)
 		}
@@ -2373,7 +2373,7 @@ func TestW8IsolationOutcomeExemptsOnlyTheBaselineArm(t *testing.T) {
 	}
 }
 
-// TestW8DirtyDigestSeesContentNotOnlyFilenames pins the source identity a
+// TestSustainedIODirtyDigestSeesContentNotOnlyFilenames pins the source identity a
 // measurement manifest claims.
 //
 // Five agents edit _test.go files in this worktree while a measured run is in
@@ -2382,10 +2382,10 @@ func TestW8IsolationOutcomeExemptsOnlyTheBaselineArm(t *testing.T) {
 // and status letters, so two trees whose files differ in every byte but agree
 // on which files are modified hash identically — and a manifest that cannot
 // distinguish them is not a source identity, it is a file list.
-func TestW8DirtyDigestSeesContentNotOnlyFilenames(t *testing.T) {
-	const status = " M cmd/gortex/w8_sustained_io_integration_test.go\n M internal/indexer/multi.go\n"
-	first := w8DirtyDigest(status, "@@ -1 +1 @@\n-a\n+b\n")
-	second := w8DirtyDigest(status, "@@ -1 +1 @@\n-a\n+c\n")
+func TestSustainedIODirtyDigestSeesContentNotOnlyFilenames(t *testing.T) {
+	const status = " M cmd/gortex/sustained_io_integration_test.go\n M internal/indexer/multi.go\n"
+	first := sustainedIODirtyDigest(status, "@@ -1 +1 @@\n-a\n+b\n")
+	second := sustainedIODirtyDigest(status, "@@ -1 +1 @@\n-a\n+c\n")
 	if first == "" || second == "" {
 		t.Fatal("a dirty tree digested to the clean-tree sentinel")
 	}
@@ -2393,35 +2393,35 @@ func TestW8DirtyDigestSeesContentNotOnlyFilenames(t *testing.T) {
 		t.Fatal("two trees with the same modified-file list and different contents digested identically; " +
 			"the manifest cannot tell which bytes produced its numbers")
 	}
-	if same := w8DirtyDigest(status, "@@ -1 +1 @@\n-a\n+b\n"); same != first {
+	if same := sustainedIODirtyDigest(status, "@@ -1 +1 @@\n-a\n+b\n"); same != first {
 		t.Fatal("the digest is not stable for one tree state")
 	}
-	if w8DirtyDigest("", "") != "" {
+	if sustainedIODirtyDigest("", "") != "" {
 		t.Fatal("a clean tree must digest to the empty sentinel, not to a hash of nothing")
 	}
 	// A status-only change still moves it: neither half may be dropped.
-	if w8DirtyDigest(status+"?? new.go\n", "@@ -1 +1 @@\n-a\n+b\n") == first {
+	if sustainedIODirtyDigest(status+"?? new.go\n", "@@ -1 +1 @@\n-a\n+b\n") == first {
 		t.Fatal("an added untracked file did not move the digest")
 	}
 }
 
-// TestW8NewRunSamplerWiresEveryProductionReader pins the production wiring
+// TestSustainedIONewRunSamplerWiresEveryProductionReader pins the production wiring
 // itself, reader by reader.
 //
-// w8NewRunSampler is the only place the measured child, the measured store and
+// sustainedIONewRunSampler is the only place the measured child, the measured store and
 // the measured WAL are connected to the instrument, and each connection is one
-// deletable line. With defaults in newW8Sampler each deletion used to leave the
+// deletable line. With defaults in newSustainedIOSampler each deletion used to leave the
 // whole suite green while the corresponding series read zero for an entire
 // measured run — a missing PID, a store/WAL/log size series stuck at 0, or a
 // wal_resets count of 0 that no sample_failure contradicted. Zeros are exactly
 // what a quiet phase looks like, so the deletion was unobservable in the
 // artifact as well as in the suite.
 //
-// So this test builds the sampler the way w8RunWorkload does, over a fixture
+// So this test builds the sampler the way sustainedIORunWorkload does, over a fixture
 // with a real WAL-mode store, a real log file and a real live child, and
 // asserts that every series carries the value that reader is supposed to
 // deliver — plus that nothing is reported as unwired.
-func TestW8NewRunSamplerWiresEveryProductionReader(t *testing.T) {
+func TestSustainedIONewRunSamplerWiresEveryProductionReader(t *testing.T) {
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
 
@@ -2470,12 +2470,12 @@ func TestW8NewRunSamplerWiresEveryProductionReader(t *testing.T) {
 	f.setChild(child, make(chan error, 1), func() {}, log)
 
 	var out bytes.Buffer
-	sampler := w8NewRunSampler(f, &out, time.Hour)
+	sampler := sustainedIONewRunSampler(f, &out, time.Hour)
 	sampler.SetPhase("P_wiring")
 	sample := sampler.Sample()
 
 	if len(sample.Unwired) != 0 {
-		t.Fatalf("w8NewRunSampler left %v unwired; the production wiring is the only thing that connects the instrument to the measured process and store", sample.Unwired)
+		t.Fatalf("sustainedIONewRunSampler left %v unwired; the production wiring is the only thing that connects the instrument to the measured process and store", sample.Unwired)
 	}
 	if sample.PID == 0 || sample.PID != child.Process.Pid {
 		t.Fatalf("pid wiring: sample pid %d, want the live child %d", sample.PID, child.Process.Pid)
@@ -2504,7 +2504,7 @@ func TestW8NewRunSamplerWiresEveryProductionReader(t *testing.T) {
 		t.Fatal("readIO wiring: the darwin reader answered without ri_logical_writes, the harness's primary series")
 	}
 
-	var decoded w8Sample
+	var decoded sustainedIOSample
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &decoded); err != nil {
 		t.Fatalf("sample line is not JSON: %v (%s)", err, out.String())
 	}
@@ -2513,13 +2513,13 @@ func TestW8NewRunSamplerWiresEveryProductionReader(t *testing.T) {
 	}
 }
 
-// TestW8ExecuteLabelsItsSamplesWithThePhaseItIsRunning pins the other half of
+// TestSustainedIOExecuteLabelsItsSamplesWithThePhaseItIsRunning pins the other half of
 // the phase attribution: the run-level call that tells the sampler which phase
 // its ticks belong to. Without it every sample in a run carries "init", and
 // every per-phase series in samples.ndjson silently becomes unattributable —
 // while the phase reports, which take their deltas from Samples()/Resets()
 // counters rather than from the labels, stay exactly as green as before.
-func TestW8ExecuteLabelsItsSamplesWithThePhaseItIsRunning(t *testing.T) {
+func TestSustainedIOExecuteLabelsItsSamplesWithThePhaseItIsRunning(t *testing.T) {
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, binary: filepath.Join(root, "no-such-gortex"), root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
 	if err := os.MkdirAll(f.primary, 0o700); err != nil {
@@ -2533,39 +2533,40 @@ func TestW8ExecuteLabelsItsSamplesWithThePhaseItIsRunning(t *testing.T) {
 	db.SetMaxOpenConns(1)
 
 	var out bytes.Buffer
-	sampler := newW8Sampler(&out, time.Hour)
-	sampler.readSize = func() w8FileSizes { return w8FileSizes{Store: 1} }
-	sampler.readWAL = func() (w8WALHeader, error) { return w8WALHeader{}, nil }
+	sampler := newSustainedIOSampler(&out, time.Hour)
+	sampler.readSize = func() sustainedIOFileSizes { return sustainedIOFileSizes{Store: 1} }
+	sampler.readWAL = func() (sustainedIOWALHeader, error) { return sustainedIOWALHeader{}, nil }
 	sampler.pid = func() int { return 0 }
-	sampler.readIO = func() (issue767ProcessIO, error) { return issue767ProcessIO{}, errW8NoChild }
-	run := &w8Run{t: t, f: f, arm: "candidate", artifactDir: t.TempDir(), db: db, sampler: sampler}
+	sampler.readIO = func() (issue767ProcessIO, error) { return issue767ProcessIO{}, errSustainedIONoChild }
+	run := &sustainedIORun{t: t, f: f, arm: "candidate", artifactDir: t.TempDir(), db: db, sampler: sampler}
 
 	var duringPhase string
-	run.execute(w8Phase{
+	run.execute(sustainedIOPhase{
 		Name:   "P4_amend_same_tree",
 		Detail: "a phase that samples itself",
-		Run: func(r *w8Run) {
+		Run: func(r *sustainedIORun) {
 			duringPhase = r.sampler.Sample().Phase
 		},
 	})
 	if duringPhase != "P4_amend_same_tree" {
 		t.Fatalf("a sample taken inside the phase is labelled %q, want the phase's own name", duringPhase)
 	}
-	run.execute(w8Phase{
+	run.execute(sustainedIOPhase{
 		Name:   "P8_idle_warm",
 		Detail: "the next phase relabels the series",
-		Run:    func(r *w8Run) { duringPhase = r.sampler.Sample().Phase },
+		Run:    func(r *sustainedIORun) { duringPhase = r.sampler.Sample().Phase },
 	})
 	if duringPhase != "P8_idle_warm" {
 		t.Fatalf("the second phase's sample is labelled %q; the label does not follow the phase", duringPhase)
 	}
 }
 
-// TestW8ClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun is the F3
-// regression: a phase that fails must not take the run-level artifact with it.
+// TestSustainedIOClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun is the
+// artifact-durability regression: a phase that fails must not take the
+// run-level artifact with it.
 // It drives closePhase and finish the way the failure defer in execute does,
 // with no test handle available to fail on.
-func TestW8ClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun(t *testing.T) {
+func TestSustainedIOClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun(t *testing.T) {
 	artifacts := t.TempDir()
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, binary: filepath.Join(root, "no-such-gortex"), root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
@@ -2580,14 +2581,14 @@ func TestW8ClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
-	run := &w8Run{t: t, f: f, arm: "candidate", artifactDir: artifacts, db: db, sampler: newW8Sampler(io.Discard, time.Hour)}
-	report := w8PhaseReport{Phase: "P7_dependent_untrack_retrack", Detail: "the phase that failed"}
+	run := &sustainedIORun{t: t, f: f, arm: "candidate", artifactDir: artifacts, db: db, sampler: newSustainedIOSampler(io.Discard, time.Hour)}
+	report := sustainedIOPhaseReport{Phase: "P7_dependent_untrack_retrack", Detail: "the phase that failed"}
 	report.Failed = true
 	run.phaseNotes = []string{"the note the failing phase left"}
-	run.closePhase(&report, w8PhaseOpening{started: time.Now(), ioErr: errW8NoChild})
+	run.closePhase(&report, sustainedIOPhaseOpening{started: time.Now(), ioErr: errSustainedIONoChild})
 
-	var filed w8PhaseReport
-	w8ReadJSON(t, filepath.Join(artifacts, "phase_P7_dependent_untrack_retrack.json"), &filed)
+	var filed sustainedIOPhaseReport
+	sustainedIOReadJSON(t, filepath.Join(artifacts, "phase_P7_dependent_untrack_retrack.json"), &filed)
 	if !filed.Failed {
 		t.Error("the filed phase report does not record that the phase failed")
 	}
@@ -2599,9 +2600,9 @@ func TestW8ClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun(t *testing.T) {
 	}
 
 	run.dependents = []string{filepath.Join(root, "never-created-worktree")}
-	run.finish(w8Manifest{RunID: "unit"})
+	run.finish(sustainedIOManifest{RunID: "unit"})
 	var summary map[string]any
-	w8ReadJSON(t, filepath.Join(artifacts, "report.json"), &summary)
+	sustainedIOReadJSON(t, filepath.Join(artifacts, "report.json"), &summary)
 	phases, _ := summary["phases"].([]any)
 	if len(phases) != 1 {
 		t.Fatalf("report.json carries %d phases, want the one that ran", len(phases))
@@ -2615,7 +2616,7 @@ func TestW8ClosePhaseFilesAFailedPhaseAndFinishStillWritesTheRun(t *testing.T) {
 	}
 }
 
-func w8ReadJSON(t *testing.T, path string, into any) {
+func sustainedIOReadJSON(t *testing.T, path string, into any) {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -2626,25 +2627,25 @@ func w8ReadJSON(t *testing.T, path string, into any) {
 	}
 }
 
-// w8FailingPhaseDirEnv switches TestW8ExecuteFilesTheReportOfAFailingPhase into
+// sustainedIOFailingPhaseDirEnv switches TestSustainedIOExecuteFilesTheReportOfAFailingPhase into
 // its child role. The child deliberately fails, so it has to run in its own
 // process: a phase failure is a runtime.Goexit on the test goroutine, and the
 // only way to assert what survives it is to let it happen for real.
-const w8FailingPhaseDirEnv = "GXW8_INTERNAL_FAILING_PHASE_DIR"
+const sustainedIOFailingPhaseDirEnv = "GX_SUSTAINED_IO_INTERNAL_FAILING_PHASE_DIR"
 
-// TestW8ExecuteFilesTheReportOfAFailingPhase proves the wiring, not just the
+// TestSustainedIOExecuteFilesTheReportOfAFailingPhase proves the wiring, not just the
 // primitive: execute's own failure path must reach closePhase. Before it did,
 // a phase's t.Fatal unwound straight out of the run and everything the failing
 // phase measured — and every earlier phase's totals, which only report.json
 // carries — was lost with it.
-func TestW8ExecuteFilesTheReportOfAFailingPhase(t *testing.T) {
-	if dir := os.Getenv(w8FailingPhaseDirEnv); dir != "" {
-		w8RunFailingPhaseChild(t, dir)
+func TestSustainedIOExecuteFilesTheReportOfAFailingPhase(t *testing.T) {
+	if dir := os.Getenv(sustainedIOFailingPhaseDirEnv); dir != "" {
+		sustainedIORunFailingPhaseChild(t, dir)
 		return
 	}
 	dir := t.TempDir()
-	child := exec.Command(os.Args[0], "-test.run=^TestW8ExecuteFilesTheReportOfAFailingPhase$", "-test.v=true")
-	child.Env = append(os.Environ(), w8FailingPhaseDirEnv+"="+dir)
+	child := exec.Command(os.Args[0], "-test.run=^TestSustainedIOExecuteFilesTheReportOfAFailingPhase$", "-test.v=true")
+	child.Env = append(os.Environ(), sustainedIOFailingPhaseDirEnv+"="+dir)
 	output, err := child.CombinedOutput()
 	if err == nil {
 		t.Fatalf("the child test was supposed to fail its phase:\n%s", output)
@@ -2652,8 +2653,8 @@ func TestW8ExecuteFilesTheReportOfAFailingPhase(t *testing.T) {
 	if !strings.Contains(string(output), "deliberate phase failure") {
 		t.Fatalf("the child failed for the wrong reason:\n%s", output)
 	}
-	var filed w8PhaseReport
-	w8ReadJSON(t, filepath.Join(dir, "phase_PX_failing.json"), &filed)
+	var filed sustainedIOPhaseReport
+	sustainedIOReadJSON(t, filepath.Join(dir, "phase_PX_failing.json"), &filed)
 	if !filed.Failed {
 		t.Error("the failing phase's report does not record the failure")
 	}
@@ -2669,7 +2670,7 @@ func TestW8ExecuteFilesTheReportOfAFailingPhase(t *testing.T) {
 	// The run-level artifact is the half that carries every EARLIER phase's
 	// totals; a failing last phase must not take it down.
 	var summary map[string]any
-	w8ReadJSON(t, filepath.Join(dir, "report.json"), &summary)
+	sustainedIOReadJSON(t, filepath.Join(dir, "report.json"), &summary)
 	failed, _ := summary["failed_phases"].([]any)
 	if len(failed) != 1 || failed[0] != "PX_failing" {
 		t.Fatalf("report.json does not name the failed phase: %v", summary["failed_phases"])
@@ -2679,29 +2680,29 @@ func TestW8ExecuteFilesTheReportOfAFailingPhase(t *testing.T) {
 	}
 }
 
-// w8IsolationChildEnv switches TestW8RequireIsolationStopsTheCandidatePhase
+// sustainedIOIsolationChildEnv switches TestSustainedIORequireIsolationStopsTheCandidatePhase
 // into its child role, for the same reason the failing-phase test has one: the
 // thing under test ends in t.Fatal, and a t.Fatal can only be observed for real
 // from outside the process it kills.
-const w8IsolationChildEnv = "GXW8_INTERNAL_ISOLATION_DIR"
+const sustainedIOIsolationChildEnv = "GX_SUSTAINED_IO_INTERNAL_ISOLATION_DIR"
 
-// TestW8RequireIsolationStopsTheCandidatePhase pins the wiring between the
+// TestSustainedIORequireIsolationStopsTheCandidatePhase pins the wiring between the
 // isolation rule and the phase, not just the rule.
 //
-// w8IsolationOutcome returning fatal=true is worth nothing if requireIsolation
+// sustainedIOIsolationOutcome returning fatal=true is worth nothing if requireIsolation
 // does not act on it: the exemption would then be universal in practice while
 // the rule's own unit test stayed green, which is precisely how a gate gets
 // retired without anything going red. So this drives the real call — baseline
 // arm first, which must survive and record, then candidate arm, which must take
 // the phase down — and reads both filed phase reports back.
-func TestW8RequireIsolationStopsTheCandidatePhase(t *testing.T) {
-	if dir := os.Getenv(w8IsolationChildEnv); dir != "" {
-		w8RunIsolationChild(t, dir)
+func TestSustainedIORequireIsolationStopsTheCandidatePhase(t *testing.T) {
+	if dir := os.Getenv(sustainedIOIsolationChildEnv); dir != "" {
+		sustainedIORunIsolationChild(t, dir)
 		return
 	}
 	dir := t.TempDir()
-	child := exec.Command(os.Args[0], "-test.run=^TestW8RequireIsolationStopsTheCandidatePhase$", "-test.v=true")
-	child.Env = append(os.Environ(), w8IsolationChildEnv+"="+dir)
+	child := exec.Command(os.Args[0], "-test.run=^TestSustainedIORequireIsolationStopsTheCandidatePhase$", "-test.v=true")
+	child.Env = append(os.Environ(), sustainedIOIsolationChildEnv+"="+dir)
 	output, err := child.CombinedOutput()
 	if err == nil {
 		t.Fatalf("a leak on the candidate arm did not fail the phase:\n%s", output)
@@ -2710,26 +2711,26 @@ func TestW8RequireIsolationStopsTheCandidatePhase(t *testing.T) {
 		t.Fatalf("the child failed for the wrong reason:\n%s", output)
 	}
 
-	var recorded w8PhaseReport
-	w8ReadJSON(t, filepath.Join(dir, "phase_PB_isolation.json"), &recorded)
+	var recorded sustainedIOPhaseReport
+	sustainedIOReadJSON(t, filepath.Join(dir, "phase_PB_isolation.json"), &recorded)
 	if recorded.Failed {
 		t.Error("the baseline arm's leak stopped its phase; the baseline would end at P5 with nothing to compare")
 	}
-	if !w8NotesContain(recorded.Notes, "BASELINE ISOLATION VIOLATION") {
+	if !sustainedIONotesContain(recorded.Notes, "BASELINE ISOLATION VIOLATION") {
 		t.Errorf("the baseline arm's leak was not recorded in its phase report: %v", recorded.Notes)
 	}
 
-	var failed w8PhaseReport
-	w8ReadJSON(t, filepath.Join(dir, "phase_PC_isolation.json"), &failed)
+	var failed sustainedIOPhaseReport
+	sustainedIOReadJSON(t, filepath.Join(dir, "phase_PC_isolation.json"), &failed)
 	if !failed.Failed {
 		t.Error("the candidate arm's phase report does not record the isolation failure")
 	}
-	if !w8NotesContain(failed.Notes, "ISOLATION VIOLATION") {
+	if !sustainedIONotesContain(failed.Notes, "ISOLATION VIOLATION") {
 		t.Errorf("the candidate arm's leak was not recorded in its phase report: %v", failed.Notes)
 	}
 }
 
-func w8NotesContain(notes []string, want string) bool {
+func sustainedIONotesContain(notes []string, want string) bool {
 	for _, note := range notes {
 		if strings.Contains(note, want) {
 			return true
@@ -2738,7 +2739,7 @@ func w8NotesContain(notes []string, want string) bool {
 	return false
 }
 
-func w8RunIsolationChild(t *testing.T, dir string) {
+func sustainedIORunIsolationChild(t *testing.T, dir string) {
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, binary: filepath.Join(root, "no-such-gortex"), root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
 	if err := os.MkdirAll(f.primary, 0o700); err != nil {
@@ -2750,13 +2751,13 @@ func w8RunIsolationChild(t *testing.T, dir string) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	db.SetMaxOpenConns(1)
-	newRun := func(arm string) *w8Run {
-		return &w8Run{t: t, f: f, arm: arm, artifactDir: dir, db: db, sampler: newW8Sampler(io.Discard, time.Hour)}
+	newRun := func(arm string) *sustainedIORun {
+		return &sustainedIORun{t: t, f: f, arm: arm, artifactDir: dir, db: db, sampler: newSustainedIOSampler(io.Discard, time.Hour)}
 	}
 	// The baseline arm records the leak and keeps going.
 	baseline := newRun("baseline")
-	w8WithRunArtifacts(baseline, w8Manifest{RunID: "isolation-baseline"}, func() {
-		baseline.execute(w8Phase{Name: "PB_isolation", Detail: "a baseline leak", Run: func(r *w8Run) {
+	sustainedIOWithRunArtifacts(baseline, sustainedIOManifest{RunID: "isolation-baseline"}, func() {
+		baseline.execute(sustainedIOPhase{Name: "PB_isolation", Detail: "a baseline leak", Run: func(r *sustainedIORun) {
 			r.requireIsolation("main-only symbol X in dependent wt01", true)
 		}})
 	})
@@ -2765,15 +2766,15 @@ func w8RunIsolationChild(t *testing.T, dir string) {
 	}
 	// The candidate arm does not.
 	candidate := newRun("candidate")
-	w8WithRunArtifacts(candidate, w8Manifest{RunID: "isolation-candidate"}, func() {
-		candidate.execute(w8Phase{Name: "PC_isolation", Detail: "a candidate leak", Run: func(r *w8Run) {
+	sustainedIOWithRunArtifacts(candidate, sustainedIOManifest{RunID: "isolation-candidate"}, func() {
+		candidate.execute(sustainedIOPhase{Name: "PC_isolation", Detail: "a candidate leak", Run: func(r *sustainedIORun) {
 			r.requireIsolation("main-only symbol X in dependent wt01", true)
 		}})
 	})
 	t.Fatal("the candidate arm's isolation violation did not stop its phase")
 }
 
-func w8RunFailingPhaseChild(t *testing.T, dir string) {
+func sustainedIORunFailingPhaseChild(t *testing.T, dir string) {
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, binary: filepath.Join(root, "no-such-gortex"), root: root, primary: filepath.Join(root, "repo"), store: filepath.Join(root, "store.sqlite")}
 	if err := os.MkdirAll(f.primary, 0o700); err != nil {
@@ -2785,12 +2786,12 @@ func w8RunFailingPhaseChild(t *testing.T, dir string) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	db.SetMaxOpenConns(1)
-	run := &w8Run{t: t, f: f, arm: "candidate", artifactDir: dir, db: db, sampler: newW8Sampler(io.Discard, time.Hour)}
-	w8WithRunArtifacts(run, w8Manifest{RunID: "failing-phase-child"}, func() {
-		run.execute(w8Phase{
+	run := &sustainedIORun{t: t, f: f, arm: "candidate", artifactDir: dir, db: db, sampler: newSustainedIOSampler(io.Discard, time.Hour)}
+	sustainedIOWithRunArtifacts(run, sustainedIOManifest{RunID: "failing-phase-child"}, func() {
+		run.execute(sustainedIOPhase{
 			Name:   "PX_failing",
 			Detail: "a phase that fails after doing measurable work",
-			Run: func(r *w8Run) {
+			Run: func(r *sustainedIORun) {
 				r.note("the note the failing phase left")
 				time.Sleep(10 * time.Millisecond)
 				r.t.Fatal("deliberate phase failure")
@@ -2800,22 +2801,22 @@ func w8RunFailingPhaseChild(t *testing.T, dir string) {
 	t.Fatal("execute returned from a phase that called t.Fatal")
 }
 
-// ------------------------------------------------- F5 instrument tests ---
+// ----------------------------------------------- instrument unit tests ---
 
-// TestW8WindowPlanIsTheDeclaredSubWindowSplit pins the sub-window names and,
+// TestSustainedIOWindowPlanIsTheDeclaredSubWindowSplit pins the sub-window names and,
 // just as importantly, that the PHASE names did not move.
 //
 // The frozen budgets.json of the paired protocol is keyed by phase name, and
 // the post-fix re-measurement reuses it. Splitting P4 or the idle phases into
 // new phases would orphan three frozen ceilings; splitting them into named
 // sub-windows of the same phases costs none.
-func TestW8WindowPlanIsTheDeclaredSubWindowSplit(t *testing.T) {
-	plan := w8PhasePlan(w8Config{Fixture: w8FixtureSpec{}.normalize(), Idle: time.Minute})
+func TestSustainedIOWindowPlanIsTheDeclaredSubWindowSplit(t *testing.T) {
+	plan := sustainedIOPhasePlan(sustainedIOConfig{Fixture: sustainedIOFixtureSpec{}.normalize(), Idle: time.Minute})
 	names := map[string]bool{}
 	for _, phase := range plan {
 		names[phase.Name] = true
 	}
-	for phase, windows := range w8WindowPlan() {
+	for phase, windows := range sustainedIOWindowPlan() {
 		if !names[phase] {
 			t.Fatalf("the window plan names phase %q, which the phase plan does not contain", phase)
 		}
@@ -2824,15 +2825,15 @@ func TestW8WindowPlanIsTheDeclaredSubWindowSplit(t *testing.T) {
 		}
 	}
 	for _, want := range [][2]string{
-		{"P4_amend_same_tree", w8WindowCommitTreeChange},
-		{"P4_amend_same_tree", w8WindowAmendSameTree},
-		{"P1_idle_cold", w8WindowIdleColdQuiet},
-		{"P1_idle_cold", w8WindowIdleColdPolling},
-		{"P8_idle_warm", w8WindowIdleWarmQuiet},
-		{"P8_idle_warm", w8WindowIdleWarmPolling},
+		{"P4_amend_same_tree", sustainedIOWindowCommitTreeChange},
+		{"P4_amend_same_tree", sustainedIOWindowAmendSameTree},
+		{"P1_idle_cold", sustainedIOWindowIdleColdQuiet},
+		{"P1_idle_cold", sustainedIOWindowIdleColdPolling},
+		{"P8_idle_warm", sustainedIOWindowIdleWarmQuiet},
+		{"P8_idle_warm", sustainedIOWindowIdleWarmPolling},
 	} {
 		found := false
-		for _, window := range w8WindowPlan()[want[0]] {
+		for _, window := range sustainedIOWindowPlan()[want[0]] {
 			if window == want[1] {
 				found = true
 			}
@@ -2843,7 +2844,7 @@ func TestW8WindowPlanIsTheDeclaredSubWindowSplit(t *testing.T) {
 	}
 	// The commit window must come first: it is what the amend needs a clean
 	// tree from, and a reader has to see the order the bytes were produced in.
-	if w8WindowPlan()["P4_amend_same_tree"][0] != w8WindowCommitTreeChange {
+	if sustainedIOWindowPlan()["P4_amend_same_tree"][0] != sustainedIOWindowCommitTreeChange {
 		t.Fatal("the tree-changing commit must be the first window of P4")
 	}
 	// The POLLING arm must come first, in both idle phases: it is the arm the
@@ -2853,29 +2854,29 @@ func TestW8WindowPlanIsTheDeclaredSubWindowSplit(t *testing.T) {
 	// arm absorb its decaying tail — a one-directional bias in the candidate's
 	// favour on the only two phases whose ceiling is live.
 	for _, phase := range []struct{ name, first string }{
-		{"P1_idle_cold", w8WindowIdleColdPolling},
-		{"P8_idle_warm", w8WindowIdleWarmPolling},
+		{"P1_idle_cold", sustainedIOWindowIdleColdPolling},
+		{"P8_idle_warm", sustainedIOWindowIdleWarmPolling},
 	} {
-		if got := w8WindowPlan()[phase.name][0]; got != phase.first {
+		if got := sustainedIOWindowPlan()[phase.name][0]; got != phase.first {
 			t.Fatalf("%s measures %s first; the polling arm carries the frozen ceiling and must open the phase", phase.name, got)
 		}
-		if w8JudgedWindows[phase.name] != phase.first {
-			t.Fatalf("%s is judged on %s but measures %s first", phase.name, w8JudgedWindows[phase.name], phase.first)
+		if sustainedIOJudgedWindows[phase.name] != phase.first {
+			t.Fatalf("%s is judged on %s but measures %s first", phase.name, sustainedIOJudgedWindows[phase.name], phase.first)
 		}
 	}
 	// The a/b suffix is the measurement order, so the judged arm is the `a`
 	// window. A name that says `b` while running first is an artifact that
 	// contradicts itself.
-	for _, window := range w8WindowPlan() {
+	for _, window := range sustainedIOWindowPlan() {
 		if !strings.Contains(window[0], "a_") || !strings.Contains(window[1], "b_") {
 			t.Fatalf("the sub-window names no longer encode their order: %v", window)
 		}
 	}
 }
 
-// TestW8CounterActivitySumsOnlyTheNamedFamilies pins the settle predicate's
+// TestSustainedIOCounterActivitySumsOnlyTheNamedFamilies pins the settle predicate's
 // input: labelled series are matched by family prefix, and nothing else counts.
-func TestW8CounterActivitySumsOnlyTheNamedFamilies(t *testing.T) {
+func TestSustainedIOCounterActivitySumsOnlyTheNamedFamilies(t *testing.T) {
 	counters := map[string]int64{
 		"views_dedicated_base_publication_total{outcome=published}": 1,
 		"views_dedicated_base_publication_total{outcome=skipped}":   2,
@@ -2884,22 +2885,22 @@ func TestW8CounterActivitySumsOnlyTheNamedFamilies(t *testing.T) {
 		"views_request_served_total{kind=base}":                     99,
 		"views_family_discovery_lag_seconds|count":                  42,
 	}
-	if got := w8CounterActivity(counters, w8IndexSettleCounters); got != 7 {
+	if got := sustainedIOCounterActivity(counters, sustainedIOIndexSettleCounters); got != 7 {
 		t.Fatalf("activity = %d, want the 7 of the publication families alone", got)
 	}
-	if got := w8CounterActivity(nil, w8IndexSettleCounters); got != 0 {
+	if got := sustainedIOCounterActivity(nil, sustainedIOIndexSettleCounters); got != 0 {
 		t.Fatalf("an empty scrape = %d", got)
 	}
 }
 
-// TestW8AwaitCountersQuietEndsOnAStreakAndNeverOnAFailedRead is the guard
-// §F5(4) needs: the cold-index phase holds until the publication family stops
+// TestSustainedIOAwaitCountersQuietEndsOnAStreakAndNeverOnAFailedRead is the guard
+// the cold-index settle needs: the phase holds until the publication family stops
 // moving, and a scrape that could not be read is not a quiet scrape.
 //
 // The 6,000-file arm's `shape=root` publication had not finished when the phase
 // ended at the first exact answer, so index-time work was booked to a phase
 // named idle and read as a 7.44x idle regression.
-func TestW8AwaitCountersQuietEndsOnAStreakAndNeverOnAFailedRead(t *testing.T) {
+func TestSustainedIOAwaitCountersQuietEndsOnAStreakAndNeverOnAFailedRead(t *testing.T) {
 	series := []struct {
 		counters map[string]int64
 		err      error
@@ -2922,7 +2923,7 @@ func TestW8AwaitCountersQuietEndsOnAStreakAndNeverOnAFailedRead(t *testing.T) {
 		return entry.counters, entry.err
 	}
 	slept := 0
-	result := w8AwaitCountersQuiet(read, w8IndexSettleCounters, time.Millisecond, 3,
+	result := sustainedIOAwaitCountersQuiet(read, sustainedIOIndexSettleCounters, time.Millisecond, 3,
 		time.Now().Add(time.Minute), func(time.Duration) { slept++ })
 	if !result.Settled {
 		t.Fatalf("the wait did not settle: %+v", result)
@@ -2947,37 +2948,37 @@ func TestW8AwaitCountersQuietEndsOnAStreakAndNeverOnAFailedRead(t *testing.T) {
 		moving++
 		return map[string]int64{"views_dedicated_base_publish_total{shape=root}": moving}, nil
 	}
-	timed := w8AwaitCountersQuiet(busy, w8IndexSettleCounters, time.Millisecond, 3,
+	timed := sustainedIOAwaitCountersQuiet(busy, sustainedIOIndexSettleCounters, time.Millisecond, 3,
 		time.Now().Add(20*time.Millisecond), func(d time.Duration) { time.Sleep(d) })
 	if timed.Settled {
 		t.Fatalf("a family that never stops moving must not report settled: %+v", timed)
 	}
 }
 
-// TestW8ValidateReconcileIntervalNamesTheProductDefault pins §F5(6): the
-// janitor interval is an option, the paired protocol's 5 s is the default, and
+// TestSustainedIOValidateReconcileIntervalNamesTheProductDefault pins the reconcile-interval
+// contract: the janitor interval is an option, the paired protocol's 5 s is the default, and
 // the product's own default is selectable by name so a confirmatory arm can be
 // run at all.
-func TestW8ValidateReconcileIntervalNamesTheProductDefault(t *testing.T) {
+func TestSustainedIOValidateReconcileIntervalNamesTheProductDefault(t *testing.T) {
 	for raw, want := range map[string]string{
-		"":        w8DefaultReconcileInterval,
+		"":        sustainedIODefaultReconcileInterval,
 		"default": issue767ProductReconcileInterval,
 		"product": issue767ProductReconcileInterval,
 		"30s":     "30s",
 		"1h":      "1h",
 	} {
-		got, err := w8ValidateReconcileInterval(raw)
+		got, err := sustainedIOValidateReconcileInterval(raw)
 		if err != nil || got != want {
-			t.Errorf("w8ValidateReconcileInterval(%q) = %q, %v; want %q", raw, got, err, want)
+			t.Errorf("sustainedIOValidateReconcileInterval(%q) = %q, %v; want %q", raw, got, err, want)
 		}
 	}
 	for _, raw := range []string{"nonsense", "500ms", "48h"} {
-		if _, err := w8ValidateReconcileInterval(raw); err == nil {
-			t.Errorf("w8ValidateReconcileInterval(%q) was accepted", raw)
+		if _, err := sustainedIOValidateReconcileInterval(raw); err == nil {
+			t.Errorf("sustainedIOValidateReconcileInterval(%q) was accepted", raw)
 		}
 	}
-	cfg, err := w8ConfigFromEnv(func(name string) string {
-		if name == "GXW8_RECONCILE_INTERVAL" {
+	cfg, err := sustainedIOConfigFromEnv(func(name string) string {
+		if name == "GX_SUSTAINED_IO_RECONCILE_INTERVAL" {
 			return "default"
 		}
 		return ""
@@ -2985,13 +2986,13 @@ func TestW8ValidateReconcileIntervalNamesTheProductDefault(t *testing.T) {
 	if err != nil || cfg.ReconcileInterval != issue767ProductReconcileInterval {
 		t.Fatalf("config reconcile interval = %q, %v", cfg.ReconcileInterval, err)
 	}
-	if defaults, err := w8ConfigFromEnv(func(string) string { return "" }); err != nil || defaults.ReconcileInterval != "5s" {
+	if defaults, err := sustainedIOConfigFromEnv(func(string) string { return "" }); err != nil || defaults.ReconcileInterval != "5s" {
 		t.Fatalf("the default protocol interval moved: %q, %v", defaults.ReconcileInterval, err)
 	}
-	if note := w8ReconcileNote(issue767ProductReconcileInterval); !strings.Contains(note, "product default") {
+	if note := sustainedIOReconcileNote(issue767ProductReconcileInterval); !strings.Contains(note, "product default") {
 		t.Fatalf("the manifest note does not state the product default: %q", note)
 	}
-	if note := w8ReconcileNote("5s"); !strings.Contains(note, "GORTEX_RECONCILE_INTERVAL=5s") || !strings.Contains(note, "not default-configuration") {
+	if note := sustainedIOReconcileNote("5s"); !strings.Contains(note, "GORTEX_RECONCILE_INTERVAL=5s") || !strings.Contains(note, "not default-configuration") {
 		t.Fatalf("the manifest note does not state the accelerated janitor: %q", note)
 	}
 }
@@ -3001,8 +3002,8 @@ func TestW8ValidateReconcileIntervalNamesTheProductDefault(t *testing.T) {
 // change what is measured.
 func TestIssue767FixtureOmitsTheReconcileVariableForTheProductDefault(t *testing.T) {
 	tiny := func(f *issue767Fixture) {
-		f.write(filepath.Join(f.primary, "go.mod"), "module example.invalid/w8\n\ngo 1.24\n")
-		f.write(filepath.Join(f.primary, "marker.go"), issue767MarkerSource("W8OptionMarker"))
+		f.write(filepath.Join(f.primary, "go.mod"), "module example.invalid/issue767\n\ngo 1.24\n")
+		f.write(filepath.Join(f.primary, "marker.go"), issue767MarkerSource("GxOptionMarker"))
 	}
 	binary := filepath.Join(t.TempDir(), "unused-gortex")
 	countReconcile := func(env []string) []string {
@@ -3028,21 +3029,22 @@ func TestIssue767FixtureOmitsTheReconcileVariableForTheProductDefault(t *testing
 	}
 }
 
-// TestW8SourceIdentityResolvesTheHarnessTreeNotTheProcessWorkingDirectory is
-// the revert-red of §F5(7).
+// TestSustainedIOSourceIdentityResolvesTheHarnessTreeNotTheProcessWorkingDirectory is
+// the revert-red of the source-identity correction.
 //
 // A measurement run executes the compiled test binary from a private root under
 // /tmp, where `git rev-parse HEAD` answers nothing — which is why every frozen
-// manifest in W8m-W8.4/paired1500 carries an empty source_commit and an empty
+// manifest in the paired1500 artifact set carries an empty source_commit and an
+// empty
 // dirty_tree_digest. Resolving the tree from the compiled-in path of the
 // harness source fixes it; running git in the process's working directory does
 // not, and this test fails in that case.
-func TestW8SourceIdentityResolvesTheHarnessTreeNotTheProcessWorkingDirectory(t *testing.T) {
-	dir, note := w8HarnessSourceDir()
+func TestSustainedIOSourceIdentityResolvesTheHarnessTreeNotTheProcessWorkingDirectory(t *testing.T) {
+	dir, note := sustainedIOHarnessSourceDir()
 	if dir == "" {
 		t.Skipf("the harness source path does not resolve here: %s", note)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "w8_sustained_io_integration_test.go")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "sustained_io_integration_test.go")); err != nil {
 		t.Fatalf("the resolved harness dir %s is not this package: %v", dir, err)
 	}
 	if _, err := exec.LookPath("git"); err != nil {
@@ -3052,10 +3054,10 @@ func TestW8SourceIdentityResolvesTheHarnessTreeNotTheProcessWorkingDirectory(t *
 	// measurement run does.
 	elsewhere := t.TempDir()
 	t.Chdir(elsewhere)
-	if _, _, err := w8GitIdentity(elsewhere); err == nil {
+	if _, _, err := sustainedIOGitIdentity(elsewhere); err == nil {
 		t.Skip("the temporary directory is inside a git work tree; this machine cannot distinguish the two")
 	}
-	commit, _, notes := w8SourceIdentity()
+	commit, _, notes := sustainedIOSourceIdentity()
 	if commit == "" {
 		t.Fatalf("the manifest would record no source commit from %s: %v", elsewhere, notes)
 	}
@@ -3064,40 +3066,40 @@ func TestW8SourceIdentityResolvesTheHarnessTreeNotTheProcessWorkingDirectory(t *
 	}
 	// A directory that is not a work tree must be named as such rather than
 	// producing a silent empty identity.
-	if _, _, notes := w8GitIdentity(elsewhere); len(notes) == 0 {
+	if _, _, notes := sustainedIOGitIdentity(elsewhere); len(notes) == 0 {
 		t.Fatal("a non-worktree directory produced an empty identity with no explanation")
 	}
 }
 
-// TestW8CensusDeltaNamesEveryWriterThatMoved pins the per-writer attribution
+// TestSustainedIOCensusDeltaNamesEveryWriterThatMoved pins the per-writer attribution
 // an idle floor is read off: the sidecar and the query log by name, including
 // a bucket that disappeared.
-func TestW8CensusDeltaNamesEveryWriterThatMoved(t *testing.T) {
-	before := w8Census{Bytes: map[string]int64{w8BucketSidecar: 100, w8BucketQueryLog: 10, w8BucketStore: 5, w8BucketDaemonLog: 7}}
-	after := w8Census{Bytes: map[string]int64{w8BucketSidecar: 137, w8BucketQueryLog: 365, w8BucketStore: 5}}
-	delta := w8CensusDelta(before, after)
-	if delta[w8BucketSidecar] != 37 || delta[w8BucketQueryLog] != 355 {
+func TestSustainedIOCensusDeltaNamesEveryWriterThatMoved(t *testing.T) {
+	before := sustainedIOCensus{Bytes: map[string]int64{sustainedIOBucketSidecar: 100, sustainedIOBucketQueryLog: 10, sustainedIOBucketStore: 5, sustainedIOBucketDaemonLog: 7}}
+	after := sustainedIOCensus{Bytes: map[string]int64{sustainedIOBucketSidecar: 137, sustainedIOBucketQueryLog: 365, sustainedIOBucketStore: 5}}
+	delta := sustainedIOCensusDelta(before, after)
+	if delta[sustainedIOBucketSidecar] != 37 || delta[sustainedIOBucketQueryLog] != 355 {
 		t.Fatalf("delta = %+v", delta)
 	}
-	if _, ok := delta[w8BucketStore]; ok {
+	if _, ok := delta[sustainedIOBucketStore]; ok {
 		t.Fatalf("an unchanged writer must not appear: %+v", delta)
 	}
-	if delta[w8BucketDaemonLog] != -7 {
+	if delta[sustainedIOBucketDaemonLog] != -7 {
 		t.Fatalf("a writer that vanished must be reported: %+v", delta)
 	}
-	if w8CensusDelta(before, before) != nil {
+	if sustainedIOCensusDelta(before, before) != nil {
 		t.Fatal("an unchanged census must produce no delta map at all")
 	}
 }
 
-// w8StubFixture builds a fixture whose "daemon binary" is a shell script, so
+// sustainedIOStubFixture builds a fixture whose "daemon binary" is a shell script, so
 // the harness's own client-facing behaviour — how many calls it makes, how it
 // reacts to an inexact answer — can be exercised without a daemon.
 //
 // It deliberately does NOT go through newIssue767FixtureWithCorpus: that
 // recipe builds a git repository and a config for a real daemon. What is under
 // test here is the harness, not the product.
-func w8StubFixture(t *testing.T, script string) *issue767Fixture {
+func sustainedIOStubFixture(t *testing.T, script string) *issue767Fixture {
 	t.Helper()
 	root := t.TempDir()
 	primary := filepath.Join(root, "repo")
@@ -3121,16 +3123,16 @@ func (f *issue767Fixture) markerFileForTest(root string) string {
 	return filepath.Join(root, "marker.go")
 }
 
-// w8StubRun wires a run around a stub fixture with a sampler that never ticks.
-func w8StubRun(t *testing.T, f *issue767Fixture, arm string) *w8Run {
+// sustainedIOStubRun wires a run around a stub fixture with a sampler that never ticks.
+func sustainedIOStubRun(t *testing.T, f *issue767Fixture, arm string) *sustainedIORun {
 	t.Helper()
-	return &w8Run{t: t, f: f, arm: arm, artifactDir: t.TempDir(),
-		cfg:       w8Config{Idle: 2 * time.Second, ReconcileInterval: w8DefaultReconcileInterval},
-		sampler:   newW8Sampler(io.Discard, time.Hour),
-		revisions: map[int]int{}, lastProbe: w8PrimaryMarker}
+	return &sustainedIORun{t: t, f: f, arm: arm, artifactDir: t.TempDir(),
+		cfg:       sustainedIOConfig{Idle: 2 * time.Second, ReconcileInterval: sustainedIODefaultReconcileInterval},
+		sampler:   newSustainedIOSampler(io.Discard, time.Hour),
+		revisions: map[int]int{}, lastProbe: sustainedIOPrimaryMarker}
 }
 
-// TestW8IdleQuietArmMakesNoClientCallsAtAll is the revert-red of §F5(3).
+// TestSustainedIOIdleQuietArmMakesNoClientCallsAtAll is the revert-red of the quiet-idle-arm correction.
 //
 // `idle()` has always issued one read-only `call search` every 5 s and the
 // result was reported as an idle floor. Twelve daemon round trips per 60 s
@@ -3138,20 +3140,20 @@ func w8StubRun(t *testing.T, f *issue767Fixture, arm string) *w8Run {
 // transaction plus a query-log append. The quiet arm is what answers "what
 // does this daemon write when nobody asks it anything"; if it makes any client
 // call at all, it is measuring the other question.
-func TestW8IdleQuietArmMakesNoClientCallsAtAll(t *testing.T) {
-	f := w8StubFixture(t, `printf '{"exact": true, "results": [{"name": "`+w8PrimaryMarker+`", "absolute_file_path": "'"$GXW8_STUB_MARKER"'", "repo_prefix": "issue767"}]}'`+"\n")
-	f.env = append(f.env, "GXW8_STUB_MARKER="+f.markerFileForTest(f.primary))
-	run := w8StubRun(t, f, "candidate")
+func TestSustainedIOIdleQuietArmMakesNoClientCallsAtAll(t *testing.T) {
+	f := sustainedIOStubFixture(t, `printf '{"exact": true, "results": [{"name": "`+sustainedIOPrimaryMarker+`", "absolute_file_path": "'"$GX_SUSTAINED_IO_STUB_MARKER"'", "repo_prefix": "issue767"}]}'`+"\n")
+	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_MARKER="+f.markerFileForTest(f.primary))
+	run := sustainedIOStubRun(t, f, "candidate")
 
 	before := f.clientCallCount()
-	run.idleAs(2*time.Second, w8IdleQuiet)
+	run.idleAs(2*time.Second, sustainedIOIdleQuiet)
 	if got := f.clientCallCount() - before; got != 0 {
 		t.Fatalf("the quiet idle arm made %d client calls; a floor with client traffic in it is not a floor", got)
 	}
 	before = f.clientCallCount()
-	run.idleAs(2*time.Second, w8IdlePolling)
+	run.idleAs(2*time.Second, sustainedIOIdlePolling)
 	if got := f.clientCallCount() - before; got != 1 {
-		t.Fatalf("the polling idle arm made %d client calls, want 1 in a 2s window at a %s interval", got, w8IdlePollInterval)
+		t.Fatalf("the polling idle arm made %d client calls, want 1 in a 2s window at a %s interval", got, sustainedIOIdlePollInterval)
 	}
 	quiet, polling := false, false
 	for _, note := range run.phaseNotes {
@@ -3167,7 +3169,7 @@ func TestW8IdleQuietArmMakesNoClientCallsAtAll(t *testing.T) {
 	}
 }
 
-// TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing is the repair of
+// TestSustainedIOIdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing is the repair of
 // the idle split, and it is two claims at once.
 //
 // The split measured idle twice but left the frozen ceiling applied to the sum:
@@ -3178,17 +3180,17 @@ func TestW8IdleQuietArmMakesNoClientCallsAtAll(t *testing.T) {
 //
 // The repair keeps each arm at the FULL cfg.Idle, so the polling arm remains
 // the frozen measurement byte for byte and can be judged against it 1:1
-// (w8JudgedWindows), and opens both arms scrape-free, so the only client
+// (sustainedIOJudgedWindows), and opens both arms scrape-free, so the only client
 // traffic inside an idle phase is the polling arm's own searches.
-func TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
-	f := w8StubFixture(t, `printf '{"exact": true, "results": [{"name": "`+w8PrimaryMarker+`", "absolute_file_path": "'"$GXW8_STUB_MARKER"'", "repo_prefix": "issue767"}]}'`+"\n")
-	f.env = append(f.env, "GXW8_STUB_MARKER="+f.markerFileForTest(f.primary))
-	run := w8StubRun(t, f, "candidate")
+func TestSustainedIOIdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
+	f := sustainedIOStubFixture(t, `printf '{"exact": true, "results": [{"name": "`+sustainedIOPrimaryMarker+`", "absolute_file_path": "'"$GX_SUSTAINED_IO_STUB_MARKER"'", "repo_prefix": "issue767"}]}'`+"\n")
+	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_MARKER="+f.markerFileForTest(f.primary))
+	run := sustainedIOStubRun(t, f, "candidate")
 	run.cfg.Idle = time.Second
 	run.phase = "P8_idle_warm"
 
 	before := f.clientCallCount()
-	run.idleWindows(w8WindowIdleWarmQuiet, w8WindowIdleWarmPolling, run.cfg.Idle)
+	run.idleWindows(sustainedIOWindowIdleWarmQuiet, sustainedIOWindowIdleWarmPolling, run.cfg.Idle)
 	calls := f.clientCallCount() - before
 
 	// One poll, from the polling arm. A scraping bracket would add two per
@@ -3206,7 +3208,7 @@ func TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
 	// number it is compared against and the un-judged arm eats the preceding
 	// phase's decaying tail — a bias that only ever lowers the judged reading.
 	polling, quiet := run.windows[0], run.windows[1]
-	if polling.Window != w8WindowIdleWarmPolling || quiet.Window != w8WindowIdleWarmQuiet {
+	if polling.Window != sustainedIOWindowIdleWarmPolling || quiet.Window != sustainedIOWindowIdleWarmQuiet {
 		t.Fatalf("the arms are out of order: %s then %s; the judged (polling) arm must open the phase",
 			run.windows[0].Window, run.windows[1].Window)
 	}
@@ -3226,23 +3228,23 @@ func TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
 		}
 	}
 	for _, window := range run.windows {
-		if window.CountersError != w8NoScrapeInsideWindow {
+		if window.CountersError != sustainedIONoScrapeInsideWindow {
 			t.Fatalf("%s does not record why it carries no viewmetrics delta: %q", window.Window, window.CountersError)
 		}
 		if len(window.CountersDelta) != 0 {
 			t.Fatalf("%s carries a viewmetrics delta, so its bracket scraped: %+v", window.Window, window.CountersDelta)
 		}
 	}
-	if w8JudgedWindows["P8_idle_warm"] != w8WindowIdleWarmPolling ||
-		w8JudgedWindows["P1_idle_cold"] != w8WindowIdleColdPolling {
-		t.Fatalf("the frozen idle phases must be judged on the polling arm: %+v", w8JudgedWindows)
+	if sustainedIOJudgedWindows["P8_idle_warm"] != sustainedIOWindowIdleWarmPolling ||
+		sustainedIOJudgedWindows["P1_idle_cold"] != sustainedIOWindowIdleColdPolling {
+		t.Fatalf("the frozen idle phases must be judged on the polling arm: %+v", sustainedIOJudgedWindows)
 	}
 	named, ordered := false, false
 	for _, note := range run.phaseNotes {
-		if strings.Contains(note, w8WindowIdleWarmPolling) && strings.Contains(note, "ceiling is applied to") {
+		if strings.Contains(note, sustainedIOWindowIdleWarmPolling) && strings.Contains(note, "ceiling is applied to") {
 			named = true
 		}
-		if strings.Contains(note, w8WindowIdleWarmPolling+" ran first") {
+		if strings.Contains(note, sustainedIOWindowIdleWarmPolling+" ran first") {
 			ordered = true
 		}
 	}
@@ -3254,64 +3256,64 @@ func TestW8IdleWindowsHoldTheFrozenIdleDurationAndScrapeNothing(t *testing.T) {
 	}
 }
 
-// TestW8IdleBudgetIsAppliedToEachIdleArmNotToTheirSum pins the operator's idle
+// TestSustainedIOIdleBudgetIsAppliedToEachIdleArmNotToTheirSum pins the operator's idle
 // byte budget against the same doubling.
 //
 // The budget names bytes per idle window. Applied to a phase that now measures
 // idle twice, the sum would fail an arm that is inside its budget — and
 // doubling the number to compensate would let one arm write twice what the
 // operator allowed.
-func TestW8IdleBudgetIsAppliedToEachIdleArmNotToTheirSum(t *testing.T) {
+func TestSustainedIOIdleBudgetIsAppliedToEachIdleArmNotToTheirSum(t *testing.T) {
 	value := func(v uint64) *uint64 { return &v }
-	report := &w8PhaseReport{
+	report := &sustainedIOPhaseReport{
 		Phase: "P8_idle_warm", LogicalWrites: value(900),
-		Windows: []w8WindowReport{
-			{Phase: "P8_idle_warm", Window: w8WindowIdleWarmQuiet, LogicalWrites: value(400)},
-			{Phase: "P8_idle_warm", Window: w8WindowIdleWarmPolling, LogicalWrites: value(500)},
+		Windows: []sustainedIOWindowReport{
+			{Phase: "P8_idle_warm", Window: sustainedIOWindowIdleWarmQuiet, LogicalWrites: value(400)},
+			{Phase: "P8_idle_warm", Window: sustainedIOWindowIdleWarmPolling, LogicalWrites: value(500)},
 		},
 	}
-	breaches, note := w8IdleBudgetBreaches(report, 600)
+	breaches, note := sustainedIOIdleBudgetBreaches(report, 600)
 	if len(breaches) != 0 {
 		t.Fatalf("two arms inside the per-window budget were failed on their sum: %v", breaches)
 	}
 	if !strings.Contains(note, "each of the 2 idle windows") {
 		t.Fatalf("the report does not record how the budget was applied: %q", note)
 	}
-	breaches, _ = w8IdleBudgetBreaches(report, 450)
-	if len(breaches) != 1 || !strings.Contains(breaches[0], w8WindowIdleWarmPolling) {
+	breaches, _ = sustainedIOIdleBudgetBreaches(report, 450)
+	if len(breaches) != 1 || !strings.Contains(breaches[0], sustainedIOWindowIdleWarmPolling) {
 		t.Fatalf("the arm over the per-window budget was not named: %v", breaches)
 	}
 	// A phase that cut no windows is still judged whole, exactly as before.
-	plain := &w8PhaseReport{Phase: "P1_idle_cold", LogicalWrites: value(900)}
-	if breaches, _ := w8IdleBudgetBreaches(plain, 600); len(breaches) != 1 {
+	plain := &sustainedIOPhaseReport{Phase: "P1_idle_cold", LogicalWrites: value(900)}
+	if breaches, _ := sustainedIOIdleBudgetBreaches(plain, 600); len(breaches) != 1 {
 		t.Fatalf("a phase with no windows must still be judged as a whole: %v", breaches)
 	}
-	if breaches, note := w8IdleBudgetBreaches(&w8PhaseReport{Phase: "P1_idle_cold"}, 600); len(breaches) != 0 ||
+	if breaches, note := sustainedIOIdleBudgetBreaches(&sustainedIOPhaseReport{Phase: "P1_idle_cold"}, 600); len(breaches) != 0 ||
 		!strings.Contains(note, "ri_logical_writes unavailable") {
 		t.Fatalf("a missing series must be named, never passed by default: %v / %q", breaches, note)
 	}
 }
 
-// TestW8InWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes pins the
+// TestSustainedIOInWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes pins the
 // sub-window envelope, including the path that matters most: a window whose
 // body fails still files its row, because the numbers of a failing window are
 // exactly the ones a reader wants.
-func TestW8InWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *testing.T) {
-	f := w8StubFixture(t, "exit 0\n")
-	run := w8StubRun(t, f, "candidate")
+func TestSustainedIOInWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *testing.T) {
+	f := sustainedIOStubFixture(t, "exit 0\n")
+	run := sustainedIOStubRun(t, f, "candidate")
 	run.phase = "P4_amend_same_tree"
 
-	run.inWindow(w8WindowCommitTreeChange, "the commit", func() {
+	run.inWindow(sustainedIOWindowCommitTreeChange, "the commit", func() {
 		_, _ = f.tryCommand(5*time.Second, f.primary, "noop")
 		_, _ = f.tryCommand(5*time.Second, f.primary, "noop")
 		run.accountWait(1.5)
 	})
-	run.inWindow(w8WindowAmendSameTree, "the amend", func() {})
+	run.inWindow(sustainedIOWindowAmendSameTree, "the amend", func() {})
 	if len(run.windows) != 2 {
 		t.Fatalf("windows = %+v", run.windows)
 	}
 	commit := run.windows[0]
-	if commit.Phase != "P4_amend_same_tree" || commit.Window != w8WindowCommitTreeChange {
+	if commit.Phase != "P4_amend_same_tree" || commit.Window != sustainedIOWindowCommitTreeChange {
 		t.Fatalf("the window row is not labelled with its phase: %+v", commit)
 	}
 	if commit.ClientCalls != 2 {
@@ -3329,7 +3331,7 @@ func TestW8InWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *testing.T
 	}
 }
 
-// TestW8ScrapingBracketTakesBothScrapesAndReportsATrueDelta pins the `true`
+// TestSustainedIOScrapingBracketTakesBothScrapesAndReportsATrueDelta pins the `true`
 // direction of openBracketScraping, which nothing pinned before.
 //
 // The scrape-free bracket added for the idle arms made the opening scrape
@@ -3337,7 +3339,7 @@ func TestW8InWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *testing.T
 // a bracket that stopped taking its OPENING scrape passed the whole suite. The
 // failure shape is what makes that gap expensive: with opening.counters nil and
 // opening.countersErr nil, closeWindow and closePhase take the `default` arm
-// and publish w8CounterDelta(nil, after) — the daemon's ABSOLUTE counters
+// and publish sustainedIOCounterDelta(nil, after) — the daemon's ABSOLUTE counters
 // presented as a per-window delta. Silently wrong, not visibly missing, in
 // exactly the series the idle split nominates as the compensation for the
 // window scrapes it removed.
@@ -3345,21 +3347,21 @@ func TestW8InWindowFilesARowWithItsOwnClientCallsAndCheckpointBytes(t *testing.T
 // The stub advances one counter per invocation, so a bracket that took both
 // scrapes reports a delta of 1 and a bracket that took only the closing one
 // reports the running total.
-func TestW8ScrapingBracketTakesBothScrapesAndReportsATrueDelta(t *testing.T) {
+func TestSustainedIOScrapingBracketTakesBothScrapesAndReportsATrueDelta(t *testing.T) {
 	const series = "views_generation_published_total"
-	f := w8StubFixture(t, `
+	f := sustainedIOStubFixture(t, `
 n=0
-[ -f "$GXW8_STUB_COUNT" ] && n=$(cat "$GXW8_STUB_COUNT")
+[ -f "$GX_SUSTAINED_IO_STUB_COUNT" ] && n=$(cat "$GX_SUSTAINED_IO_STUB_COUNT")
 n=$((n+1))
-printf '%s' "$n" > "$GXW8_STUB_COUNT"
+printf '%s' "$n" > "$GX_SUSTAINED_IO_STUB_COUNT"
 printf '{"views": {"counters": {"`+series+`": %d}}}' "$((100 + n))"
 `)
-	f.env = append(f.env, "GXW8_STUB_COUNT="+filepath.Join(t.TempDir(), "count"))
-	run := w8StubRun(t, f, "candidate")
+	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_COUNT="+filepath.Join(t.TempDir(), "count"))
+	run := sustainedIOStubRun(t, f, "candidate")
 	run.phase = "P4_amend_same_tree"
 
-	run.inWindow(w8WindowCommitTreeChange, "a scraping window", func() {})
-	run.inScrapeFreeWindow(w8WindowAmendSameTree, "a scrape-free window", func() {})
+	run.inWindow(sustainedIOWindowCommitTreeChange, "a scraping window", func() {})
+	run.inScrapeFreeWindow(sustainedIOWindowAmendSameTree, "a scrape-free window", func() {})
 	if len(run.windows) != 2 {
 		t.Fatalf("windows = %+v", run.windows)
 	}
@@ -3381,7 +3383,7 @@ printf '{"views": {"counters": {"`+series+`": %d}}}' "$((100 + n))"
 	}
 
 	free := run.windows[1]
-	if free.CountersError != w8NoScrapeInsideWindow {
+	if free.CountersError != sustainedIONoScrapeInsideWindow {
 		t.Fatalf("a scrape-free window does not name why it carries no delta: %q", free.CountersError)
 	}
 	if len(free.CountersDelta) != 0 {
@@ -3392,8 +3394,8 @@ printf '{"views": {"counters": {"`+series+`": %d}}}' "$((100 + n))"
 	}
 }
 
-// TestW8ProbeIsolationRetriesAnInexactAnswerAndJudgesOnlyAJudgeableOne is the
-// revert-red of §F5(5).
+// TestSustainedIOProbeIsolationRetriesAnInexactAnswerAndJudgesOnlyAJudgeableOne is the
+// revert-red of the probe-isolation correction.
 //
 // The probe it replaces was single-shot and t.Fatal'd on any error, while
 // issue767Verdict turns any inexact answer into one. A `base_changed` rider on
@@ -3401,9 +3403,9 @@ printf '{"views": {"counters": {"`+series+`": %d}}}' "$((100 + n))"
 // self-healing — 3 of 14 single shots at 6,000 files, clearing in 0.45–1.31 s —
 // and the single shot turned it into a failed phase that took P6, P7 and P8
 // with it. A single-shot probe fails this test on the first answer.
-func TestW8ProbeIsolationRetriesAnInexactAnswerAndJudgesOnlyAJudgeableOne(t *testing.T) {
-	f := w8StubFixture(t, `
-count_file="$GXW8_STUB_COUNT"
+func TestSustainedIOProbeIsolationRetriesAnInexactAnswerAndJudgesOnlyAJudgeableOne(t *testing.T) {
+	f := sustainedIOStubFixture(t, `
+count_file="$GX_SUSTAINED_IO_STUB_COUNT"
 n=0
 [ -f "$count_file" ] && n=$(cat "$count_file")
 n=$((n+1))
@@ -3415,16 +3417,16 @@ else
 fi
 `)
 	counter := filepath.Join(f.root, "stub-count")
-	f.env = append(f.env, "GXW8_STUB_COUNT="+counter)
-	run := w8StubRun(t, f, "candidate")
+	f.env = append(f.env, "GX_SUSTAINED_IO_STUB_COUNT="+counter)
+	run := sustainedIOStubRun(t, f, "candidate")
 	run.phase = "P5_main_advance"
 	dependent := filepath.Join(f.root, "wt01")
 	if err := os.MkdirAll(dependent, 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	run.probeIsolation("main-only symbol W8AdvanceMarker in dependent wt01",
-		dependent, "W8Advance001Marker", filepath.Join(dependent, "marker.go"))
+	run.probeIsolation("main-only symbol GxAdvanceMarker in dependent wt01",
+		dependent, "GxAdvance001Marker", filepath.Join(dependent, "marker.go"))
 
 	if len(run.phaseIsolation) != 1 {
 		t.Fatalf("the probe filed %d records", len(run.phaseIsolation))
@@ -3450,7 +3452,7 @@ fi
 			t.Fatalf("the phase note does not carry %q: %s", want, joined)
 		}
 	}
-	diagnostics := w8CollectDiagnostics("P5_main_advance", func(...string) string { return "" }, "", nil, run.phaseIsolation)
+	diagnostics := sustainedIOCollectDiagnostics("P5_main_advance", func(...string) string { return "" }, "", nil, run.phaseIsolation)
 	if len(diagnostics.Isolation) != 1 || diagnostics.Isolation[0].Probe.Polls != 3 {
 		t.Fatalf("the diagnostics envelope lost the isolation answer: %+v", diagnostics.Isolation)
 	}
@@ -3484,20 +3486,20 @@ func TestIssue767VerdictSeparatesRetryableInexactnessFromAWrongAnswer(t *testing
 	}
 }
 
-// TestW8AwaitIndexTimeWorkSettledAccountsItsWaitOnTheRun exercises the
+// TestSustainedIOAwaitIndexTimeWorkSettledAccountsItsWaitOnTheRun exercises the
 // cold-index hold through the run object that calls it, with a stub daemon
 // whose publication family is already quiet.
-func TestW8AwaitIndexTimeWorkSettledAccountsItsWaitOnTheRun(t *testing.T) {
-	f := w8StubFixture(t, `printf '{"views": {"counters": {"views_dedicated_base_publication_total{outcome=skipped}": 1}}}'`+"\n")
-	run := w8StubRun(t, f, "candidate")
+func TestSustainedIOAwaitIndexTimeWorkSettledAccountsItsWaitOnTheRun(t *testing.T) {
+	f := sustainedIOStubFixture(t, `printf '{"views": {"counters": {"views_dedicated_base_publication_total{outcome=skipped}": 1}}}'`+"\n")
+	run := sustainedIOStubRun(t, f, "candidate")
 	run.phase = "P0_cold_index"
 	before := f.clientCallCount()
 	run.awaitIndexTimeWorkSettled()
 	if run.waits != 1 || run.phaseWaits != 1 {
 		t.Fatalf("the settle wait was not accounted: waits=%d phase=%d", run.waits, run.phaseWaits)
 	}
-	if calls := f.clientCallCount() - before; calls < w8IndexSettleQuiet {
-		t.Fatalf("the hold scraped the publication family %d times, want at least the %d that prove a streak", calls, w8IndexSettleQuiet)
+	if calls := f.clientCallCount() - before; calls < sustainedIOIndexSettleQuiet {
+		t.Fatalf("the hold scraped the publication family %d times, want at least the %d that prove a streak", calls, sustainedIOIndexSettleQuiet)
 	}
 	settled := false
 	for _, note := range run.phaseNotes {
@@ -3510,7 +3512,7 @@ func TestW8AwaitIndexTimeWorkSettledAccountsItsWaitOnTheRun(t *testing.T) {
 	}
 }
 
-// TestW8PhaseBodiesReachTheInstrumentTheyAreNamedFor is the wiring pin.
+// TestSustainedIOPhaseBodiesReachTheInstrumentTheyAreNamedFor is the wiring pin.
 //
 // Every instrument in this item is reachable and unit-tested on its own; what
 // a unit test of a primitive cannot show is that the phase which is supposed to
@@ -3518,17 +3520,17 @@ func TestW8AwaitIndexTimeWorkSettledAccountsItsWaitOnTheRun(t *testing.T) {
 // production path cannot be exercised here — but it can be read, and a phase
 // that stops calling its instrument is exactly the regression that produced
 // the artifacts this item exists to correct.
-func TestW8PhaseBodiesReachTheInstrumentTheyAreNamedFor(t *testing.T) {
-	dir, note := w8HarnessSourceDir()
+func TestSustainedIOPhaseBodiesReachTheInstrumentTheyAreNamedFor(t *testing.T) {
+	dir, note := sustainedIOHarnessSourceDir()
 	if dir == "" {
 		t.Skipf("the harness source path does not resolve here: %s", note)
 	}
-	path := filepath.Join(dir, "w8_sustained_io_integration_test.go")
+	path := filepath.Join(dir, "sustained_io_integration_test.go")
 	source, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bodies, err := w8FunctionBodies(path, source)
+	bodies, err := sustainedIOFunctionBodies(path, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3541,20 +3543,20 @@ func TestW8PhaseBodiesReachTheInstrumentTheyAreNamedFor(t *testing.T) {
 		// separately, in that order. The wants are call-shaped on purpose: a
 		// body that still mentions the window constants but no longer brackets
 		// with them is exactly the regression this phase was split to prevent.
-		"phaseAmendSameTree": {"r.inWindow(w8WindowCommitTreeChange", "r.inWindow(w8WindowAmendSameTree", "commit\", \"--amend\""},
+		"phaseAmendSameTree": {"r.inWindow(sustainedIOWindowCommitTreeChange", "r.inWindow(sustainedIOWindowAmendSameTree", "commit\", \"--amend\""},
 		// Both idle phases measure a quiet arm and a polling arm.
-		"phaseIdleCold": {"idleWindows(w8WindowIdleColdQuiet, w8WindowIdleColdPolling"},
-		"phaseIdleWarm": {"idleWindows(w8WindowIdleWarmQuiet, w8WindowIdleWarmPolling"},
+		"phaseIdleCold": {"idleWindows(sustainedIOWindowIdleColdQuiet, sustainedIOWindowIdleColdPolling"},
+		"phaseIdleWarm": {"idleWindows(sustainedIOWindowIdleWarmQuiet, sustainedIOWindowIdleWarmPolling"},
 		// Both idle arms are bracketed scrape-free and each holds the whole
 		// configured idle: a scraping bracket puts four daemon round trips
 		// inside the phase, and a halved arm is no longer the frozen window.
 		"idleWindows": {"r.inScrapeFreeWindow(quietWindow", "r.inScrapeFreeWindow(pollingWindow",
-			"r.idleAs(duration, w8IdleQuiet)", "r.idleAs(duration, w8IdlePolling)"},
+			"r.idleAs(duration, sustainedIOIdleQuiet)", "r.idleAs(duration, sustainedIOIdlePolling)"},
 		// Both isolation questions go through the bounded probe.
 		"phaseMainAdvance":    {"r.probeIsolation("},
 		"phaseDependentEdits": {"r.probeIsolation("},
 		// The janitor interval reaches the measured daemon.
-		"w8RunWorkload": {"issue767WithReconcileInterval(cfg.ReconcileInterval)", "w8SourceIdentity()"},
+		"sustainedIORunWorkload": {"issue767WithReconcileInterval(cfg.ReconcileInterval)", "sustainedIOSourceIdentity()"},
 	} {
 		body, ok := bodies[name]
 		if !ok {
@@ -3587,7 +3589,7 @@ func TestW8PhaseBodiesReachTheInstrumentTheyAreNamedFor(t *testing.T) {
 		}
 	}
 	// The judged (polling) arm is bracketed FIRST in the source, not just
-	// declared first in w8WindowPlan. Position inside the run is part of the
+	// declared first in sustainedIOWindowPlan. Position inside the run is part of the
 	// measurement: the frozen window opened at the idle phase's own start, and
 	// an arm that opens one full cfg.Idle later reads lower for a reason that
 	// has nothing to do with the daemon.
@@ -3601,9 +3603,9 @@ func TestW8PhaseBodiesReachTheInstrumentTheyAreNamedFor(t *testing.T) {
 	}
 }
 
-// w8FunctionBodies maps every top-level func (and method) in a file to its
+// sustainedIOFunctionBodies maps every top-level func (and method) in a file to its
 // source text.
-func w8FunctionBodies(path string, source []byte) (map[string]string, error) {
+func sustainedIOFunctionBodies(path string, source []byte) (map[string]string, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, source, 0)
 	if err != nil {

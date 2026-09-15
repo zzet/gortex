@@ -58,8 +58,8 @@ import (
 //     provenance behaviour is matrix 3's subject.
 //   - etag / fetched_at, which are per-process cache identity, not content.
 //
-// Opt-in through GXW8_TEST_BINARY (see w8_matrix_noop_test.go), private daemon,
-// private store, private git. GXW8_MATRIX_ORACLE=0 records every fresh-index
+// Opt-in through GX_SUSTAINED_IO_TEST_BINARY (see e2e_matrix_noop_test.go), private daemon,
+// private store, private git. GX_E2E_MATRIX_ORACLE=0 records every fresh-index
 // comparison as a named skip for a fast structural smoke run.
 
 // The oracle re-reads both sides when they disagree: an enrichment pass that
@@ -70,30 +70,30 @@ import (
 // chance to land on both sides. The budget is a knob because "how long did you
 // wait" is part of what a reported difference means.
 const (
-	w8m5OracleAttempts       = 3
-	w8m5DefaultOracleBackoff = time.Minute
+	e2eMatrixOracleAttempts       = 3
+	e2eMatrixDefaultOracleBackoff = time.Minute
 )
 
-// w8m5OracleBackoff is how long the oracle waits between two disagreeing
-// samples. GXW8_MATRIX_ORACLE_BACKOFF overrides it; the value in force is
+// e2eMatrixOracleBackoff is how long the oracle waits between two disagreeing
+// samples. GX_E2E_MATRIX_ORACLE_BACKOFF overrides it; the value in force is
 // reported on every row that reports a difference.
-func w8m5OracleBackoff(t *testing.T) time.Duration {
+func e2eMatrixOracleBackoff(t *testing.T) time.Duration {
 	t.Helper()
-	raw := os.Getenv("GXW8_MATRIX_ORACLE_BACKOFF")
+	raw := os.Getenv("GX_E2E_MATRIX_ORACLE_BACKOFF")
 	if raw == "" {
-		return w8m5DefaultOracleBackoff
+		return e2eMatrixDefaultOracleBackoff
 	}
 	parsed, err := time.ParseDuration(raw)
 	if err != nil || parsed < 0 || parsed > 10*time.Minute {
-		t.Fatalf("GXW8_MATRIX_ORACLE_BACKOFF=%q is not a duration in [0,10m]", raw)
+		t.Fatalf("GX_E2E_MATRIX_ORACLE_BACKOFF=%q is not a duration in [0,10m]", raw)
 	}
 	return parsed
 }
 
 // ------------------------------------------------------------- projections ---
 
-// w8m5Probe is one product-surface question asked of both indexes.
-type w8m5Probe struct {
+// e2eMatrixProbe is one product-surface question asked of both indexes.
+type e2eMatrixProbe struct {
 	// Key names the probe in the comparison report.
 	Key string
 	// Clause is the gate-1 vocabulary this probe evidences.
@@ -102,16 +102,16 @@ type w8m5Probe struct {
 	Facade  string
 	Payload map[string]any
 	// Name, when set, reduces the answer to the rows that ARE this symbol
-	// (see w8m5ReduceToName). Only the symbol-search probe sets it.
+	// (see e2eMatrixReduceToName). Only the symbol-search probe sets it.
 	Name string
 }
 
-// w8m5ReduceToName keeps the rows of a search answer that are the named symbol
+// e2eMatrixReduceToName keeps the rows of a search answer that are the named symbol
 // and returns them as the whole answer, dropping the page around them.
 //
 // Why the page itself is not the comparison: `search symbols` answers a RANKED
 // PAGE. The generated corpus carries one revision probe per file
-// (W8Probe00000Rev0, W8Probe00013Rev0, W8Probe00021Rev0 …), so a query for one
+// (GxProbe00000Rev0, GxProbe00013Rev0, GxProbe00021Rev0 …), so a query for one
 // of them matches dozens of identically-shaped names and the ten rows that come
 // back are a tie-break among equals — two correct indexes of the same tree
 // legitimately return different members of that tie, at different ranks. That
@@ -125,7 +125,7 @@ type w8m5Probe struct {
 // the metadata of the symbol, and a name that is gone reduces to no rows at all.
 // What is deliberately NOT compared is the ranking of unrelated symbols, which
 // is not a property of the tree.
-func w8m5ReduceToName(value any, name string) any {
+func e2eMatrixReduceToName(value any, name string) any {
 	// Non-nil: "the name answers with nothing" has to render as an empty list,
 	// not as null, so an absent symbol and an unanswered probe stay different
 	// facts in the comparison.
@@ -155,22 +155,22 @@ func w8m5ReduceToName(value any, name string) any {
 		}
 	}
 	walk(value)
-	sort.Slice(rows, func(i, j int) bool { return w8m5Canonical(rows[i]) < w8m5Canonical(rows[j]) })
+	sort.Slice(rows, func(i, j int) bool { return e2eMatrixCanonical(rows[i]) < e2eMatrixCanonical(rows[j]) })
 	return rows
 }
 
-// w8m5VolatileKeys are per-process cache identity, never content.
-func w8m5VolatileKeys() map[string]bool {
+// e2eMatrixVolatileKeys are per-process cache identity, never content.
+func e2eMatrixVolatileKeys() map[string]bool {
 	return map[string]bool{"etag": true, "fetched_at": true}
 }
 
-// w8m5ProvenanceKeys are the asynchronous enrichment axis. They are dropped
+// e2eMatrixProvenanceKeys are the asynchronous enrichment axis. They are dropped
 // from the asserted structural comparison and compared separately.
-func w8m5ProvenanceKeys() map[string]bool {
+func e2eMatrixProvenanceKeys() map[string]bool {
 	return map[string]bool{"origin": true, "tier": true, "confidence_label": true}
 }
 
-// w8m5SemanticMetadataKeys is a MEASURED GAP of this branch, not a normalization
+// e2eMatrixSemanticMetadataKeys is a MEASURED GAP of this branch, not a normalization
 // convenience.
 //
 // A file this daemon rebuilt after an edit carries no go/types semantic
@@ -184,34 +184,34 @@ func w8m5ProvenanceKeys() map[string]bool {
 // keys.
 //
 // A case whose ONLY difference from the fresh index is these keys is therefore
-// filed as a named skip pointing at the ledger row that OWNS the gap — see
-// w8m5KnownGapReason for which row that is, and which rows do not. Any
+// filed as a named skip pointing at what OWNS the gap — see
+// e2eMatrixKnownGapReason for what that is, and what does not. Any
 // difference outside these keys stays a hard gate-1 failure, and the full
 // difference is recorded in the row either way — a skipped row is a reported
 // gap, never a silent pass.
-func w8m5SemanticMetadataKeys() map[string]bool {
+func e2eMatrixSemanticMetadataKeys() map[string]bool {
 	return map[string]bool{"semantic_source": true, "semantic_type": true, "return_type": true}
 }
 
-// w8m5KnownGapReason is the sentence a skipped row carries.
+// e2eMatrixKnownGapReason is the sentence a skipped row carries.
 //
 // The attribution was corrected after the adversarial review checked it against
-// the ledger. The owner is W6.1b's own declared limitation (2), and the
-// mechanism fits exactly: go/types needs a package's other files to type-check
-// one of them, and W6.1b's in-memory route runs enrichment "after the pass,
-// when the read-only half is already gone", so the closure a rebuilt file needs
-// is no longer there — which is why the rebuilt file loses the metadata while
-// an untouched file in the same graph keeps it.
+// the ledger. The owner is the in-memory incremental-build route's own declared
+// limitation, and the mechanism fits exactly: go/types needs a package's other
+// files to type-check one of them, and that route runs enrichment "after the
+// pass, when the read-only half is already gone", so the closure a rebuilt file
+// needs is no longer there — which is why the rebuilt file loses the metadata
+// while an untouched file in the same graph keeps it.
 //
-// The rows the first draft cited do NOT own it and are named here so the ledger
-// cannot inherit the mistake: W3.2 is state `wired`
-// (docs/incremental-indexing-execution-ledger.md:1213-1216) and W6.11 is
-// `wired`, absorbed into W6.1b and committed as 2b76f61a (:3024-3027, :6145),
-// its G3 second clause discharged by census. W3.7 is genuinely unstarted
-// (:926) but covers the blame / coverage INPUT side channel, not go/types.
-const w8m5KnownGapReason = "the branch does not carry go/types semantic metadata (meta.semantic_source / semantic_type / return_type) onto a rebuilt file: the incremental view lacks what a fresh isolated index of the same tree has, while an untouched file in the same graph still carries it. Owner: ledger row W6.1b (absorbing W6.11) declared limitation (2) — 'semantic enrichment now sees the change set, not the closure' — so the go/types pass over a rebuilt file no longer has the package closure it needs. W3.2 and W6.11 are 'wired' and do NOT own this; W3.7 is open but covers the blame/coverage input channel"
+// The owners the first draft cited do NOT own it and are named here so the
+// ledger cannot inherit the mistake: the semantic-enrichment pass and the
+// enrichment-census work are both `wired` (the latter absorbed into the
+// incremental-build route and committed as 2b76f61a), the census having
+// discharged its second clause. The blame / coverage input side channel is
+// genuinely unstarted, but it is an input channel, not go/types.
+const e2eMatrixKnownGapReason = "the branch does not carry go/types semantic metadata (meta.semantic_source / semantic_type / return_type) onto a rebuilt file: the incremental view lacks what a fresh isolated index of the same tree has, while an untouched file in the same graph still carries it. Owner: the in-memory incremental-build route's declared limitation — 'semantic enrichment now sees the change set, not the closure' — so the go/types pass over a rebuilt file no longer has the package closure it needs. The semantic-enrichment pass and the enrichment census are 'wired' and do NOT own this; the blame/coverage input channel is open but is an input channel"
 
-func w8m5MergedKeys(sets ...map[string]bool) map[string]bool {
+func e2eMatrixMergedKeys(sets ...map[string]bool) map[string]bool {
 	out := map[string]bool{}
 	for _, set := range sets {
 		for key := range set {
@@ -221,11 +221,11 @@ func w8m5MergedKeys(sets ...map[string]bool) map[string]bool {
 	return out
 }
 
-// w8m5Normalize makes one answer comparable across two daemons: the answering
+// e2eMatrixNormalize makes one answer comparable across two daemons: the answering
 // daemon's own root becomes <ROOT>, the named keys are dropped, and every list
 // is ordered by its canonical rendering so ranking cannot masquerade as a
 // content difference.
-func w8m5Normalize(value any, root string, drop map[string]bool) any {
+func e2eMatrixNormalize(value any, root string, drop map[string]bool) any {
 	switch value := value.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(value))
@@ -233,15 +233,15 @@ func w8m5Normalize(value any, root string, drop map[string]bool) any {
 			if drop[key] {
 				continue
 			}
-			out[key] = w8m5Normalize(child, root, drop)
+			out[key] = e2eMatrixNormalize(child, root, drop)
 		}
 		return out
 	case []any:
 		out := make([]any, 0, len(value))
 		for _, child := range value {
-			out = append(out, w8m5Normalize(child, root, drop))
+			out = append(out, e2eMatrixNormalize(child, root, drop))
 		}
-		sort.Slice(out, func(i, j int) bool { return w8m5Canonical(out[i]) < w8m5Canonical(out[j]) })
+		sort.Slice(out, func(i, j int) bool { return e2eMatrixCanonical(out[i]) < e2eMatrixCanonical(out[j]) })
 		return out
 	case string:
 		if root != "" {
@@ -253,9 +253,9 @@ func w8m5Normalize(value any, root string, drop map[string]bool) any {
 	}
 }
 
-// w8m5Canonical renders a normalized value deterministically. encoding/json
+// e2eMatrixCanonical renders a normalized value deterministically. encoding/json
 // sorts map keys, so this is a stable identity for comparison and for diffing.
-func w8m5Canonical(value any) string {
+func e2eMatrixCanonical(value any) string {
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Sprintf("%v", value)
@@ -263,44 +263,44 @@ func w8m5Canonical(value any) string {
 	return string(raw)
 }
 
-// w8m5Difference is one probe whose two answers disagree.
-type w8m5Difference struct {
+// e2eMatrixDifference is one probe whose two answers disagree.
+type e2eMatrixDifference struct {
 	Probe       string `json:"probe"`
 	Clause      string `json:"gate1_clause"`
 	Incremental string `json:"incremental"`
 	Fresh       string `json:"fresh_isolated_index"`
 }
 
-// w8m5Compare reports the probes whose normalized answers differ. It is pure so
+// e2eMatrixCompare reports the probes whose normalized answers differ. It is pure so
 // the comparison rule is tested without a daemon.
-func w8m5Compare(incremental, fresh map[string]string, probes []w8m5Probe) []w8m5Difference {
-	var differences []w8m5Difference
+func e2eMatrixCompare(incremental, fresh map[string]string, probes []e2eMatrixProbe) []e2eMatrixDifference {
+	var differences []e2eMatrixDifference
 	for _, probe := range probes {
 		left, hasLeft := incremental[probe.Key]
 		right, hasRight := fresh[probe.Key]
 		switch {
 		case !hasLeft || !hasRight:
-			differences = append(differences, w8m5Difference{Probe: probe.Key, Clause: probe.Clause,
-				Incremental: w8m5Missing(hasLeft, left), Fresh: w8m5Missing(hasRight, right)})
+			differences = append(differences, e2eMatrixDifference{Probe: probe.Key, Clause: probe.Clause,
+				Incremental: e2eMatrixMissing(hasLeft, left), Fresh: e2eMatrixMissing(hasRight, right)})
 		case left != right:
-			differences = append(differences, w8m5Difference{Probe: probe.Key, Clause: probe.Clause,
+			differences = append(differences, e2eMatrixDifference{Probe: probe.Key, Clause: probe.Clause,
 				Incremental: left, Fresh: right})
 		}
 	}
 	return differences
 }
 
-// w8m5TrivialAnswer reports whether a projected answer carries no evidence of
+// e2eMatrixTrivialAnswer reports whether a projected answer carries no evidence of
 // its own — an empty reduction, or a transport/decode failure recorded as the
 // answer.
 //
-// Why it matters: w8m5Project stores "call error: …" as the answer so that two
+// Why it matters: e2eMatrixProject stores "call error: …" as the answer so that two
 // daemons which both refuse a probe agree rather than the harness inventing a
 // difference. That is the right rule for a probe, and the wrong rule for a
 // CASE: a case whose whole comparison is two error strings, or two empty row
 // lists, reports "N probes equal" while neither index answered anything. The
 // review found file_deleted resting on exactly one such probe.
-func w8m5TrivialAnswer(value string) bool {
+func e2eMatrixTrivialAnswer(value string) bool {
 	trimmed := strings.TrimSpace(value)
 	switch trimmed {
 	case "", "[]", "{}", "null":
@@ -314,18 +314,18 @@ func w8m5TrivialAnswer(value string) bool {
 	return false
 }
 
-// w8m5SubstantiveProbes counts the probes BOTH indexes answered with something,
+// e2eMatrixSubstantiveProbes counts the probes BOTH indexes answered with something,
 // and names the ones that carry no evidence. A comparison with no substantive
-// probe is refused by w8m5GateOneVerdict.
-func w8m5SubstantiveProbes(incremental, fresh map[string]string, probes []w8m5Probe) (substantive int, empty []string) {
+// probe is refused by e2eMatrixGateOneVerdict.
+func e2eMatrixSubstantiveProbes(incremental, fresh map[string]string, probes []e2eMatrixProbe) (substantive int, empty []string) {
 	for _, probe := range probes {
 		left, hasLeft := incremental[probe.Key]
 		right, hasRight := fresh[probe.Key]
 		switch {
 		case !hasLeft || !hasRight:
 			// A probe one side never produced is a difference, not agreement;
-			// w8m5Compare reports it and it is neither substantive nor empty.
-		case w8m5TrivialAnswer(left) && w8m5TrivialAnswer(right):
+			// e2eMatrixCompare reports it and it is neither substantive nor empty.
+		case e2eMatrixTrivialAnswer(left) && e2eMatrixTrivialAnswer(right):
 			empty = append(empty, probe.Key)
 		default:
 			substantive++
@@ -335,89 +335,89 @@ func w8m5SubstantiveProbes(incremental, fresh map[string]string, probes []w8m5Pr
 	return substantive, empty
 }
 
-// w8m5OracleResult is what one oracle round produced: the surviving
+// e2eMatrixOracleResult is what one oracle round produced: the surviving
 // differences, how many of them are not the named gap, how many probes differ
 // once provenance is included, and how much of the comparison was substantive.
-type w8m5OracleResult struct {
-	Differences []w8m5Difference
-	Residual    []w8m5Difference
+type e2eMatrixOracleResult struct {
+	Differences []e2eMatrixDifference
+	Residual    []e2eMatrixDifference
 	Provenance  int
 	Substantive int
 	Empty       []string
 }
 
-// w8m5OracleInput is everything the gate-1 decision is made from.
-type w8m5OracleInput struct {
+// e2eMatrixOracleInput is everything the gate-1 decision is made from.
+type e2eMatrixOracleInput struct {
 	Probes      int
 	Substantive int
 	Empty       []string
-	Differences []w8m5Difference
-	Residual    []w8m5Difference
+	Differences []e2eMatrixDifference
+	Residual    []e2eMatrixDifference
 	Attempts    int
 	Backoff     time.Duration
 }
 
-// w8m5GateOneVerdict is matrix 2's decision, separated from the daemon so the
+// e2eMatrixGateOneVerdict is matrix 2's decision, separated from the daemon so the
 // rule that turns a surviving difference into a FAIL — rather than into the
 // named-gap SKIP beside it — is pinned by an ordinary unit test. The review
 // found that converting this branch to a skip left the whole suite green.
-func w8m5GateOneVerdict(in w8m5OracleInput) w8m5Verdict {
+func e2eMatrixGateOneVerdict(in e2eMatrixOracleInput) e2eMatrixVerdict {
 	switch {
 	case in.Probes == 0:
-		return w8m5Verdict{Status: w8m5StatusFail,
+		return e2eMatrixVerdict{Status: e2eMatrixStatusFail,
 			Failures: []string{"gate1: the case declared no projection to compare"}}
 	case in.Substantive == 0:
-		return w8m5Verdict{Status: w8m5StatusFail, Failures: []string{fmt.Sprintf(
+		return e2eMatrixVerdict{Status: e2eMatrixStatusFail, Failures: []string{fmt.Sprintf(
 			"gate1: the comparison rests on no substantive answer — all %d probe(s) are empty or were refused by both daemons (%s), and two indexes that answered nothing agree for free",
 			in.Probes, strings.Join(in.Empty, " "))}}
 	case len(in.Differences) == 0:
-		return w8m5Verdict{Status: w8m5StatusPass, Recorded: []string{fmt.Sprintf(
+		return e2eMatrixVerdict{Status: e2eMatrixStatusPass, Recorded: []string{fmt.Sprintf(
 			"gate1 oracle: %d probes equal (%d substantive, %d carrying no evidence)",
 			in.Probes, in.Substantive, len(in.Empty))}}
 	case len(in.Residual) == 0:
-		return w8m5Verdict{Status: w8m5StatusSkip, Recorded: []string{fmt.Sprintf(
+		return e2eMatrixVerdict{Status: e2eMatrixStatusSkip, Recorded: []string{fmt.Sprintf(
 			"gate1: %d probe(s) differ (%d substantive probe(s) compared) and every difference is %s",
-			len(in.Differences), in.Substantive, w8m5KnownGapReason)}}
+			len(in.Differences), in.Substantive, e2eMatrixKnownGapReason)}}
 	default:
 		rendered := make([]string, 0, len(in.Residual))
 		for _, difference := range in.Residual {
 			rendered = append(rendered, fmt.Sprintf("%s [%s]: %s", difference.Probe, difference.Clause,
-				w8m5DescribeDifference(difference.Incremental, difference.Fresh)))
+				e2eMatrixDescribeDifference(difference.Incremental, difference.Fresh)))
 		}
-		return w8m5Verdict{Status: w8m5StatusFail, Failures: []string{fmt.Sprintf(
+		return e2eMatrixVerdict{Status: e2eMatrixStatusFail, Failures: []string{fmt.Sprintf(
 			"gate1: the incremental view still differs from a fresh isolated index of the same tree after %d samples %s apart, beyond the known semantic-metadata gap: %s",
 			in.Attempts, in.Backoff, strings.Join(rendered, " ;; "))}}
 	}
 }
 
-func w8m5Missing(present bool, value string) string {
+func e2eMatrixMissing(present bool, value string) string {
 	if present {
 		return value
 	}
 	return "<probe not answered>"
 }
 
-// w8m5DescribeDifference says WHAT differs between two canonical answers
+// e2eMatrixDescribeDifference says WHAT differs between two canonical answers
 // instead of printing both of them. Two 4 KB edge lists that differ by one edge
 // are unreadable side by side and unactionable truncated; the set difference is
 // one line and names the edge.
-func w8m5DescribeDifference(left, right string) string {
+func e2eMatrixDescribeDifference(left, right string) string {
 	var leftValue, rightValue any
 	if json.Unmarshal([]byte(left), &leftValue) != nil || json.Unmarshal([]byte(right), &rightValue) != nil {
-		return fmt.Sprintf("incremental=%s fresh=%s", w8m5Truncate(left, 300), w8m5Truncate(right, 300))
+		return fmt.Sprintf("incremental=%s fresh=%s", e2eMatrixTruncate(left, 300), e2eMatrixTruncate(right, 300))
 	}
-	parts := w8m5DescribeValue("", leftValue, rightValue)
+	parts := e2eMatrixDescribeValue("", leftValue, rightValue)
 	if len(parts) == 0 {
 		return "the two answers render differently but compare equal"
 	}
 	return strings.Join(parts, "; ")
 }
 
-// w8m5DescribeValue walks two decoded answers in parallel and names the first
+// e2eMatrixDescribeValue walks two decoded answers in parallel and names the first
 // level at which they part company: a missing key, a scalar that moved, or the
 // entries that exist on only one side of a list.
-func w8m5DescribeValue(path string, left, right any) []string {
-	if w8m5Canonical(left) == w8m5Canonical(right) {
+func e2eMatrixDescribeValue(path string, left, right any) []string {
+	if e2eMatrixCanonical(left) == e2eMatrixCanonical(right) {
 		return nil
 	}
 	name := path
@@ -445,11 +445,11 @@ func w8m5DescribeValue(path string, left, right any) []string {
 			rightChild, hasRight := rightMap[key]
 			switch {
 			case !hasLeft:
-				parts = append(parts, fmt.Sprintf("%s.%s only in fresh: %s", name, key, w8m5Truncate(w8m5Canonical(rightChild), 200)))
+				parts = append(parts, fmt.Sprintf("%s.%s only in fresh: %s", name, key, e2eMatrixTruncate(e2eMatrixCanonical(rightChild), 200)))
 			case !hasRight:
-				parts = append(parts, fmt.Sprintf("%s.%s only in incremental: %s", name, key, w8m5Truncate(w8m5Canonical(leftChild), 200)))
+				parts = append(parts, fmt.Sprintf("%s.%s only in incremental: %s", name, key, e2eMatrixTruncate(e2eMatrixCanonical(leftChild), 200)))
 			default:
-				parts = append(parts, w8m5DescribeValue(path+"."+key, leftChild, rightChild)...)
+				parts = append(parts, e2eMatrixDescribeValue(path+"."+key, leftChild, rightChild)...)
 			}
 		}
 		return parts
@@ -457,14 +457,14 @@ func w8m5DescribeValue(path string, left, right any) []string {
 	leftList, leftIsList := left.([]any)
 	rightList, rightIsList := right.([]any)
 	if leftIsList && rightIsList {
-		onlyLeft := w8m5ListMinus(leftList, rightList)
-		onlyRight := w8m5ListMinus(rightList, leftList)
+		onlyLeft := e2eMatrixListMinus(leftList, rightList)
+		onlyRight := e2eMatrixListMinus(rightList, leftList)
 		var parts []string
 		if len(onlyLeft) > 0 {
-			parts = append(parts, fmt.Sprintf("%s: %d entr(ies) only in incremental: %s", name, len(onlyLeft), w8m5Truncate(strings.Join(onlyLeft, " "), 600)))
+			parts = append(parts, fmt.Sprintf("%s: %d entr(ies) only in incremental: %s", name, len(onlyLeft), e2eMatrixTruncate(strings.Join(onlyLeft, " "), 600)))
 		}
 		if len(onlyRight) > 0 {
-			parts = append(parts, fmt.Sprintf("%s: %d entr(ies) only in the fresh index: %s", name, len(onlyRight), w8m5Truncate(strings.Join(onlyRight, " "), 600)))
+			parts = append(parts, fmt.Sprintf("%s: %d entr(ies) only in the fresh index: %s", name, len(onlyRight), e2eMatrixTruncate(strings.Join(onlyRight, " "), 600)))
 		}
 		if len(parts) == 0 {
 			parts = append(parts, fmt.Sprintf("%s: same entries in a different multiplicity (%d vs %d)", name, len(leftList), len(rightList)))
@@ -472,18 +472,18 @@ func w8m5DescribeValue(path string, left, right any) []string {
 		return parts
 	}
 	return []string{fmt.Sprintf("%s: incremental=%s fresh=%s", name,
-		w8m5Truncate(w8m5Canonical(left), 200), w8m5Truncate(w8m5Canonical(right), 200))}
+		e2eMatrixTruncate(e2eMatrixCanonical(left), 200), e2eMatrixTruncate(e2eMatrixCanonical(right), 200))}
 }
 
-// w8m5ListMinus is the multiset difference of two decoded lists, rendered.
-func w8m5ListMinus(left, right []any) []string {
+// e2eMatrixListMinus is the multiset difference of two decoded lists, rendered.
+func e2eMatrixListMinus(left, right []any) []string {
 	counts := map[string]int{}
 	for _, item := range right {
-		counts[w8m5Canonical(item)]++
+		counts[e2eMatrixCanonical(item)]++
 	}
 	var only []string
 	for _, item := range left {
-		key := w8m5Canonical(item)
+		key := e2eMatrixCanonical(item)
 		if counts[key] > 0 {
 			counts[key]--
 			continue
@@ -495,18 +495,18 @@ func w8m5ListMinus(left, right []any) []string {
 
 // --------------------------------------------------------------- the cases ---
 
-// w8m5Sighting is one "this name must (not) answer out of this file" fact.
-type w8m5Sighting struct {
+// e2eMatrixSighting is one "this name must (not) answer out of this file" fact.
+type e2eMatrixSighting struct {
 	Name string
 	Rel  string // repo-relative, slash-separated
 }
 
-// w8m5Effect is what a case changed and what has to be probed afterwards.
-type w8m5Effect struct {
-	Files   []string       // repo-relative files to project (must exist after the case)
-	Symbols []w8m5Sighting // symbols to project through usages/source
-	Present []w8m5Sighting // names that must answer from their file
-	Absent  []w8m5Sighting // names that must NOT answer (deletion absence)
+// e2eMatrixEffect is what a case changed and what has to be probed afterwards.
+type e2eMatrixEffect struct {
+	Files   []string            // repo-relative files to project (must exist after the case)
+	Symbols []e2eMatrixSighting // symbols to project through usages/source
+	Present []e2eMatrixSighting // names that must answer from their file
+	Absent  []e2eMatrixSighting // names that must NOT answer (deletion absence)
 	// Observe are names the oracle projects without the case asserting
 	// anything about them. They are how a case asks a question whose answer
 	// is a product behaviour rather than a gate: "is a gitignored file
@@ -514,21 +514,21 @@ type w8m5Effect struct {
 	// whether the composed view and a fresh isolated index of the same tree
 	// AGREE about it. The case records which way the branch answered, and the
 	// oracle still compares the name on both sides.
-	Observe []w8m5Sighting
+	Observe []e2eMatrixSighting
 	Texts   []string // literals for the text lane
 	Note    string
 }
 
-// w8m5EditCase is one row of matrix 2.
-type w8m5EditCase struct {
+// e2eMatrixEditCase is one row of matrix 2.
+type e2eMatrixEditCase struct {
 	Name  string
 	Gate  string
-	Apply func(h *w8m5EditHarness) w8m5Effect
+	Apply func(h *e2eMatrixEditHarness) e2eMatrixEffect
 }
 
-// w8m5EditCaseNames is the handoff's own vocabulary for this matrix. The case
+// e2eMatrixEditCaseNames is the handoff's own vocabulary for this matrix. The case
 // table is pinned to it so a class cannot quietly leave the taxonomy.
-func w8m5EditCaseNames() []string {
+func e2eMatrixEditCaseNames() []string {
 	return []string{
 		"comment_only",
 		"presentation_only",
@@ -550,20 +550,20 @@ func w8m5EditCaseNames() []string {
 	}
 }
 
-// w8m5EditCases is matrix 2, in the order the handoff lists the classes.
-func w8m5EditCases() []w8m5EditCase {
-	return []w8m5EditCase{
+// e2eMatrixEditCases is matrix 2, in the order the handoff lists the classes.
+func e2eMatrixEditCases() []e2eMatrixEditCase {
+	return []e2eMatrixEditCase{
 		{
 			Name: "comment_only", Gate: "gate1+gate3",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(0)
 				h.rewrite(rel, func(source string) string {
-					return "// w8m5: a comment-only change carries no declaration.\n" + source
+					return "// e2eMatrix: a comment-only change carries no declaration.\n" + source
 				})
 				h.commit("comment only")
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{h.leaf(0), rel}},
-					Present: []w8m5Sighting{{h.probe(0), rel}},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{h.leaf(0), rel}},
+					Present: []e2eMatrixSighting{{h.probe(0), rel}},
 					Texts:   []string{"a comment-only change carries no declaration"},
 					Note:    "a comment line added above the package clause",
 				}
@@ -571,7 +571,7 @@ func w8m5EditCases() []w8m5EditCase {
 		},
 		{
 			Name: "presentation_only", Gate: "gate1+gate3",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(1)
 				h.rewrite(rel, func(source string) string {
 					// One more blank line wherever there was one: every byte
@@ -580,36 +580,36 @@ func w8m5EditCases() []w8m5EditCase {
 					return strings.ReplaceAll(source, "\n\n", "\n\n\n")
 				})
 				h.commit("presentation only")
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{h.leaf(1), rel}},
-					Present: []w8m5Sighting{{h.probe(1), rel}},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{h.leaf(1), rel}},
+					Present: []e2eMatrixSighting{{h.probe(1), rel}},
 					Note:    "vertical whitespace only; every declaration keeps its name and its order",
 				}
 			},
 		},
 		{
 			Name: "directive_added", Gate: "gate1+gate3",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(2)
 				h.rewrite(rel, func(source string) string {
-					return strings.Replace(source, "\nfunc ", "\n//go:generate echo w8m5\nfunc ", 1)
+					return strings.Replace(source, "\nfunc ", "\n//go:generate echo e2eMatrix\nfunc ", 1)
 				})
 				h.commit("directive added")
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{h.leaf(2), rel}},
-					Present: []w8m5Sighting{{h.probe(2), rel}},
-					Texts:   []string{"go:generate echo w8m5"},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{h.leaf(2), rel}},
+					Present: []e2eMatrixSighting{{h.probe(2), rel}},
+					Texts:   []string{"go:generate echo e2eMatrix"},
 					Note:    "a //go:generate directive above the first function",
 				}
 			},
 		},
 		{
 			Name: "body_change", Gate: "gate1+gate4",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(3)
 				index := h.index(3)
 				h.rewriteFile(rel, func(source string) string {
-					edited, err := w8EditFileSource(source, index, 1)
+					edited, err := sustainedIOEditFileSource(source, index, 1)
 					if err != nil {
 						h.t.Fatal(err)
 					}
@@ -617,17 +617,17 @@ func w8m5EditCases() []w8m5EditCase {
 				})
 				h.commit("body change")
 				h.revision[index] = 1
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{h.leaf(3), rel}},
-					Present: []w8m5Sighting{{w8ProbeName(index, 1), rel}},
-					Absent:  []w8m5Sighting{{w8ProbeName(index, 0), rel}},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{h.leaf(3), rel}},
+					Present: []e2eMatrixSighting{{sustainedIOProbeName(index, 1), rel}},
+					Absent:  []e2eMatrixSighting{{sustainedIOProbeName(index, 0), rel}},
 					Note:    "one function body and the revision stub",
 				}
 			},
 		},
 		{
 			Name: "signature_change", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel, index := h.rel(4), h.index(4)
 				leaf := h.leaf(4)
 				h.rewrite(rel, func(source string) string {
@@ -636,70 +636,70 @@ func w8m5EditCases() []w8m5EditCase {
 					// real call-site rewrite rather than a broken file.
 					source = strings.Replace(source,
 						fmt.Sprintf("func %s() int { return ", leaf),
-						fmt.Sprintf("func %s(w8m5Bias int) int { return w8m5Bias + ", leaf), 1)
+						fmt.Sprintf("func %s(e2eMatrixBias int) int { return e2eMatrixBias + ", leaf), 1)
 					return strings.ReplaceAll(source, leaf+"()", leaf+"(1)")
 				})
 				h.commit("signature change")
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{leaf, rel}},
-					Present: []w8m5Sighting{{w8ProbeName(index, h.revision[index]), rel}, {leaf, rel}},
-					Texts:   []string{"w8m5Bias"},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{leaf, rel}},
+					Present: []e2eMatrixSighting{{sustainedIOProbeName(index, h.revision[index]), rel}, {leaf, rel}},
+					Texts:   []string{"e2eMatrixBias"},
 					Note:    "a parameter added to the leaf function and every same-file call site rewritten",
 				}
 			},
 		},
 		{
 			Name: "export_change", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(5)
 				old := h.leaf(5)
-				renamed := "w8m5Unexported" + strings.TrimPrefix(old, "Fn")
+				renamed := "e2eMatrixUnexported" + strings.TrimPrefix(old, "Fn")
 				h.rewrite(rel, func(source string) string { return strings.ReplaceAll(source, old, renamed) })
 				h.commit("export change")
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{renamed, rel}},
-					Present: []w8m5Sighting{{renamed, rel}},
-					Absent:  []w8m5Sighting{{old, rel}},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{renamed, rel}},
+					Present: []e2eMatrixSighting{{renamed, rel}},
+					Absent:  []e2eMatrixSighting{{old, rel}},
 					Note:    "an exported leaf made unexported; visibility and every same-file edge move with it",
 				}
 			},
 		},
 		{
 			Name: "import_change", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(6)
 				// A new file in package p000 that imports p001 and calls into
 				// it: a new cross-package import and a new resolved edge.
-				importer := "p000/w8m5_import.go"
-				h.write(importer, "package p000\n\nimport w8m5cross \""+w8Module+"/p001\"\n\n"+
-					"// W8m5ImportedCaller is the import-change probe.\nfunc W8m5ImportedCaller() int { return w8m5cross."+h.leafFor(1)+"() }\n")
+				importer := "p000/e2eMatrix_import.go"
+				h.write(importer, "package p000\n\nimport e2eMatrixcross \""+sustainedIOModule+"/p001\"\n\n"+
+					"// GxEditsImportedCaller is the import-change probe.\nfunc GxEditsImportedCaller() int { return e2eMatrixcross."+h.leafFor(1)+"() }\n")
 				h.commit("import change")
-				return w8m5Effect{
-					Files: []string{importer, "p001/" + filepath.Base(h.relFor(1))}, Symbols: []w8m5Sighting{{"W8m5ImportedCaller", importer}},
-					Present: []w8m5Sighting{{"W8m5ImportedCaller", importer}, {h.probe(6), rel}},
-					Texts:   []string{"W8m5ImportedCaller"},
+				return e2eMatrixEffect{
+					Files: []string{importer, "p001/" + filepath.Base(h.relFor(1))}, Symbols: []e2eMatrixSighting{{"GxEditsImportedCaller", importer}},
+					Present: []e2eMatrixSighting{{"GxEditsImportedCaller", importer}, {h.probe(6), rel}},
+					Texts:   []string{"GxEditsImportedCaller"},
 					Note:    "a new file adding a cross-package import and a resolved cross-package call",
 				}
 			},
 		},
 		{
 			Name: "file_added", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
-				added := "p002/w8m5_added.go"
-				h.write(added, "package p002\n\n// W8m5AddedSymbol is the added-file probe.\nfunc W8m5AddedSymbol() int { return 8005 }\n")
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
+				added := "p002/e2eMatrix_added.go"
+				h.write(added, "package p002\n\n// GxEditsAddedSymbol is the added-file probe.\nfunc GxEditsAddedSymbol() int { return 8005 }\n")
 				h.commit("file added")
-				return w8m5Effect{
-					Files: []string{added}, Symbols: []w8m5Sighting{{"W8m5AddedSymbol", added}},
-					Present: []w8m5Sighting{{"W8m5AddedSymbol", added}},
-					Texts:   []string{"W8m5AddedSymbol"},
+				return e2eMatrixEffect{
+					Files: []string{added}, Symbols: []e2eMatrixSighting{{"GxEditsAddedSymbol", added}},
+					Present: []e2eMatrixSighting{{"GxEditsAddedSymbol", added}},
+					Texts:   []string{"GxEditsAddedSymbol"},
 					Note:    "one new file in an existing package",
 				}
 			},
 		},
 		{
 			Name: "file_deleted", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
-				deleted := "p002/w8m5_added.go"
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
+				deleted := "p002/e2eMatrix_added.go"
 				h.git("rm", "-q", "-f", filepath.FromSlash(deleted))
 				h.commit("file deleted")
 				// The deletion probe reduces to an EMPTY row list on both
@@ -712,54 +712,54 @@ func w8m5EditCases() []w8m5EditCase {
 				// a source span that are non-empty on both sides. run() now
 				// refuses a comparison that has none.
 				control := h.rel(10)
-				return w8m5Effect{
+				return e2eMatrixEffect{
 					Files:   []string{control},
-					Symbols: []w8m5Sighting{{h.leaf(10), control}},
-					Present: []w8m5Sighting{{h.probe(10), control}},
-					Absent:  []w8m5Sighting{{"W8m5AddedSymbol", deleted}},
+					Symbols: []e2eMatrixSighting{{h.leaf(10), control}},
+					Present: []e2eMatrixSighting{{h.probe(10), control}},
+					Absent:  []e2eMatrixSighting{{"GxEditsAddedSymbol", deleted}},
 					Note:    "the added file removed again; deletion absence is the assertion, beside an untouched control file so the comparison is not two empty answers",
 				}
 			},
 		},
 		{
 			Name: "file_renamed", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
-				from, to := "p000/w8m5_import.go", "p000/w8m5_renamed.go"
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
+				from, to := "p000/e2eMatrix_import.go", "p000/e2eMatrix_renamed.go"
 				h.git("mv", filepath.FromSlash(from), filepath.FromSlash(to))
 				h.commit("file renamed")
-				return w8m5Effect{
-					Files: []string{to}, Symbols: []w8m5Sighting{{"W8m5ImportedCaller", to}},
-					Present: []w8m5Sighting{{"W8m5ImportedCaller", to}},
-					Absent:  []w8m5Sighting{{"W8m5ImportedCaller", from}},
+				return e2eMatrixEffect{
+					Files: []string{to}, Symbols: []e2eMatrixSighting{{"GxEditsImportedCaller", to}},
+					Present: []e2eMatrixSighting{{"GxEditsImportedCaller", to}},
+					Absent:  []e2eMatrixSighting{{"GxEditsImportedCaller", from}},
 					Note:    "the same declaration under a new path: the old location must be gone",
 				}
 			},
 		},
 		{
 			Name: "mode_change", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(7)
 				path := h.path(rel)
 				if err := os.Chmod(path, 0o700); err != nil {
 					h.t.Fatal(err)
 				}
 				h.commit("mode change")
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{h.leaf(7), rel}},
-					Present: []w8m5Sighting{{h.probe(7), rel}},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{h.leaf(7), rel}},
+					Present: []e2eMatrixSighting{{h.probe(7), rel}},
 					Note:    "the file mode changed and not one byte of content",
 				}
 			},
 		},
 		{
 			Name: "symlink_added", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel := h.rel(8)
 				// The link deliberately does not end in .go: a second path to
 				// the same Go file inside the same package would duplicate
 				// every declaration in it, and the case would then be about
 				// duplicate declarations rather than about symlinks.
-				link := "p000/w8m5_link.txt"
+				link := "p000/e2eMatrix_link.txt"
 				linkPath := h.path(link)
 				_ = os.Remove(linkPath)
 				target, err := filepath.Rel(filepath.Dir(linkPath), h.path(rel))
@@ -770,17 +770,17 @@ func w8m5EditCases() []w8m5EditCase {
 					h.t.Skipf("this host refuses symlinks in the fixture: %v", err)
 				}
 				h.commit("symlink added")
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{h.leaf(8), rel}},
-					Present: []w8m5Sighting{{h.probe(8), rel}},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{h.leaf(8), rel}},
+					Present: []e2eMatrixSighting{{h.probe(8), rel}},
 					Note:    "a symlink pointing at an indexed file; both indexes must reach the same verdict about it",
 				}
 			},
 		},
 		{
 			Name: "untracked_path", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
-				ignored := "w8m5_ignored/ignored.go"
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
+				ignored := "e2eMatrix_ignored/ignored.go"
 				// Order matters for what this case can be said to show, and
 				// the review corrected the first description of it: the
 				// .gitignore is written BEFORE the file, so the file is
@@ -790,8 +790,8 @@ func w8m5EditCases() []w8m5EditCase {
 				// view and a fresh isolated index of the same tree AGREE about
 				// it. (The "already-indexed content withdrawn by a newly
 				// committed exclusion" shape is configuration_change, below.)
-				h.write(".gitignore", "w8m5_ignored/\n")
-				h.write(ignored, "package w8m5ignored\n\n// W8m5IgnoredSymbol is the untracked-path probe.\nfunc W8m5IgnoredSymbol() int { return 1 }\n")
+				h.write(".gitignore", "e2eMatrix_ignored/\n")
+				h.write(ignored, "package e2eMatrixignored\n\n// GxEditsIgnoredSymbol is the untracked-path probe.\nfunc GxEditsIgnoredSymbol() int { return 1 }\n")
 				h.commit("gitignore the untracked path")
 				h.settle()
 				// Whether an ignored, never-committed file is indexed at all
@@ -805,7 +805,7 @@ func w8m5EditCases() []w8m5EditCase {
 				//
 				// And the two indexes DISAGREE, which is a gate-1 divergence
 				// and not a product opinion. Measured at the final source, on
-				// three samples a minute apart: W8m5IgnoredSymbol is present in
+				// three samples a minute apart: GxEditsIgnoredSymbol is present in
 				// the incrementally maintained view and absent from a fresh
 				// isolated index of the SAME tree — same bytes on disk, same
 				// .gitignore, and the fresh fixture leaves the file untracked
@@ -815,17 +815,17 @@ func w8m5EditCases() []w8m5EditCase {
 				// path admits the same file when the watcher sees it appear.
 				// The row stays RED on purpose: it is the divergence, not the
 				// policy, that this gate exists to catch.
-				h.observe("the ignored, never-committed file", "W8m5IgnoredSymbol", ignored)
-				return w8m5Effect{
+				h.observe("the ignored, never-committed file", "GxEditsIgnoredSymbol", ignored)
+				return e2eMatrixEffect{
 					Files:   []string{h.rel(0)},
-					Observe: []w8m5Sighting{{"W8m5IgnoredSymbol", ignored}},
+					Observe: []e2eMatrixSighting{{"GxEditsIgnoredSymbol", ignored}},
 					Note:    "a path ignored before it ever existed, present in the working tree",
 				}
 			},
 		},
 		{
 			Name: "edit_undo_redo", Gate: "gate4",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				rel, index := h.rel(9), h.index(9)
 				original := h.read(rel)
 				// Edit, undo to the exact original bytes, then redo. Every
@@ -845,43 +845,43 @@ func w8m5EditCases() []w8m5EditCase {
 				// information while the row claimed gate 4 confirmed. With it,
 				// a silent calibration makes the undo/redo readings
 				// NOT MEASURABLE and the row a named skip
-				// (w8m5ReuseVerdict, and the harness's unmeasurable list).
+				// (e2eMatrixReuseVerdict, and the harness's unmeasurable list).
 				h.rebaseline()
 				h.rewriteFile(rel, func(string) string { return h.edited(original, index, 1) })
-				h.waitPresent(w8ProbeName(index, 1), rel)
+				h.waitPresent(sustainedIOProbeName(index, 1), rel)
 				h.settle()
 				calibration, calibrationErr := h.deltaSince()
 				if calibrationErr != nil {
 					h.note("the gate-4 reuse instrument could not be calibrated: " + calibrationErr.Error())
 				} else {
 					h.note("gate-4 calibration — a real dirty rebuild moved [" +
-						strings.Join(w8m5MovedSeries(calibration, w8m5DirtyBuildSeries()), " ") + "]")
+						strings.Join(e2eMatrixMovedSeries(calibration, e2eMatrixDirtyBuildSeries()), " ") + "]")
 				}
 
 				h.rebaseline()
 				h.rewriteFile(rel, func(string) string { return original })
-				h.waitPresent(w8ProbeName(index, 0), rel)
+				h.waitPresent(sustainedIOProbeName(index, 0), rel)
 				h.settle()
-				undo := h.reuseSince("undo to the byte-identical original", calibration, w8m5DirtyBuildSeries())
+				undo := h.reuseSince("undo to the byte-identical original", calibration, e2eMatrixDirtyBuildSeries())
 
 				h.rebaseline()
 				h.rewriteFile(rel, func(string) string { return h.edited(original, index, 1) })
-				h.waitPresent(w8ProbeName(index, 1), rel)
+				h.waitPresent(sustainedIOProbeName(index, 1), rel)
 				h.settle()
-				redo := h.reuseSince("redo of the already-seen edit", calibration, w8m5DirtyBuildSeries())
+				redo := h.reuseSince("redo of the already-seen edit", calibration, e2eMatrixDirtyBuildSeries())
 
 				h.revision[index] = 1
-				return w8m5Effect{
-					Files: []string{rel}, Symbols: []w8m5Sighting{{h.leaf(9), rel}},
-					Present: []w8m5Sighting{{w8ProbeName(index, 1), rel}},
-					Absent:  []w8m5Sighting{{w8ProbeName(index, 0), rel}},
+				return e2eMatrixEffect{
+					Files: []string{rel}, Symbols: []e2eMatrixSighting{{h.leaf(9), rel}},
+					Present: []e2eMatrixSighting{{sustainedIOProbeName(index, 1), rel}},
+					Absent:  []e2eMatrixSighting{{sustainedIOProbeName(index, 0), rel}},
 					Note:    "dirty edit, undo to the byte-identical original, redo | " + undo + " | " + redo,
 				}
 			},
 		},
 		{
 			Name: "commit_unchanged_content", Gate: "gate2+gate4",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				// Make a real content change, commit it, then commit again
 				// over an unchanged tree: the second commit is the replay the
 				// gate names and the first is this row's CALIBRATION.
@@ -895,13 +895,13 @@ func w8m5EditCases() []w8m5EditCase {
 				// daemon that was doing exactly what the branch promises.
 				// Measuring the landing commit turns each clause into either a
 				// real assertion or a named "not asserted", and never into a
-				// pass that means nothing (w8m5UnchangedCommitVerdict).
+				// pass that means nothing (e2eMatrixUnchangedCommitVerdict).
 				//
 				// The content change is made HERE rather than inherited from
 				// whatever the previous case left dirty: h.commit stages with
 				// --allow-empty, so borrowing the content would make every
 				// "a commit that really did change content …" sentence depend
-				// on case ordering, which GXW8_MATRIX_CASES can break. The
+				// on case ordering, which GX_E2E_MATRIX_CASES can break. The
 				// case advances its own file's revision, and the landing
 				// commit's tree is then compared with its parent's, so the
 				// calibration is credited with content only when git agrees
@@ -909,7 +909,7 @@ func w8m5EditCases() []w8m5EditCase {
 				rel, index := h.rel(9), h.index(9)
 				next := h.revision[index] + 1
 				h.rewrite(rel, func(source string) string { return h.edited(source, index, next) })
-				h.waitPresent(w8ProbeName(index, next), rel)
+				h.waitPresent(sustainedIOProbeName(index, next), rel)
 				h.revision[index] = next
 				h.settle()
 
@@ -939,38 +939,38 @@ func w8m5EditCases() []w8m5EditCase {
 					h.commitCalibrationSeq = calibrationAfter.Sequence - calibrationBefore.Sequence
 					h.note(fmt.Sprintf("gate-4 calibration — a commit that %s moved observed[%s] build[%s] seq %+d",
 						map[bool]string{true: "really did change content", false: "was NOT measured to change content"}[h.commitCalibrationContent],
-						strings.Join(w8m5MovedSeries(delta, w8m5CommitObservationSeries()), " "),
-						strings.Join(w8m5MovedSeries(delta, w8m5AllocationSeries()), " "),
+						strings.Join(e2eMatrixMovedSeries(delta, e2eMatrixCommitObservationSeries()), " "),
+						strings.Join(e2eMatrixMovedSeries(delta, e2eMatrixAllocationSeries()), " "),
 						h.commitCalibrationSeq))
 				}
 				// Landing a real content change legitimately publishes; the
 				// measured window is the commit AFTER it.
 				h.rebaseline()
 				h.git("commit", "--allow-empty", "-m", "unchanged content")
-				return w8m5Effect{
+				return e2eMatrixEffect{
 					Files:   []string{rel},
-					Present: []w8m5Sighting{{w8ProbeName(index, h.revision[index]), rel}},
+					Present: []e2eMatrixSighting{{sustainedIOProbeName(index, h.revision[index]), rel}},
 					Note:    "a commit that changes no content at all",
 				}
 			},
 		},
 		{
 			Name: "manifest_only_change", Gate: "gate1+gate3",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				h.rewrite("go.mod", func(source string) string {
-					return source + "\n// w8m5: manifest-only change\n"
+					return source + "\n// e2eMatrix: manifest-only change\n"
 				})
 				h.commit("manifest only")
-				return w8m5Effect{
-					Files: []string{h.rel(0), "go.mod"}, Symbols: []w8m5Sighting{{h.leaf(0), h.rel(0)}},
-					Present: []w8m5Sighting{{h.probe(0), h.rel(0)}},
+				return e2eMatrixEffect{
+					Files: []string{h.rel(0), "go.mod"}, Symbols: []e2eMatrixSighting{{h.leaf(0), h.rel(0)}},
+					Present: []e2eMatrixSighting{{h.probe(0), h.rel(0)}},
 					Note:    "the module manifest changed and no source file did",
 				}
 			},
 		},
 		{
 			Name: "configuration_change", Gate: "gate1",
-			Apply: func(h *w8m5EditHarness) w8m5Effect {
+			Apply: func(h *e2eMatrixEditHarness) e2eMatrixEffect {
 				// A repo-local .gortex.yaml exclude is a producer-policy
 				// change: the excluded package must leave both indexes.
 				h.write(".gortex.yaml", "exclude:\n  - \"p003/**\"\n")
@@ -996,10 +996,10 @@ func w8m5EditCases() []w8m5EditCase {
 				// the gate, whatever the right withdrawal policy turns out to
 				// be.
 				h.observe("the excluded package", h.leafFor(3), excluded)
-				return w8m5Effect{
+				return e2eMatrixEffect{
 					Files:   []string{h.rel(0)},
-					Observe: []w8m5Sighting{{h.leafFor(3), excluded}},
-					Present: []w8m5Sighting{{h.probe(0), h.rel(0)}},
+					Observe: []e2eMatrixSighting{{h.leafFor(3), excluded}},
+					Present: []e2eMatrixSighting{{h.probe(0), h.rel(0)}},
 					Note:    "an exclude added to the repository's own configuration",
 				}
 			},
@@ -1009,13 +1009,13 @@ func w8m5EditCases() []w8m5EditCase {
 
 // ---------------------------------------------------------------- harness ---
 
-type w8m5EditHarness struct {
+type e2eMatrixEditHarness struct {
 	t       *testing.T
 	f       *issue767Fixture
 	db      *sql.DB
-	table   *w8m5Table
+	table   *e2eMatrixTable
 	binary  string
-	spec    w8FixtureSpec
+	spec    sustainedIOFixtureSpec
 	oracle  bool
 	backoff time.Duration
 
@@ -1028,7 +1028,7 @@ type w8m5EditHarness struct {
 	// opens on. A case whose setup legitimately publishes before the part it
 	// measures (committing what an earlier case left dirty, say) re-opens
 	// the window with rebaseline so the setup is not charged to it.
-	baseline     w8m5Catalog
+	baseline     e2eMatrixCatalog
 	countersBase map[string]int64
 	countersErr  error
 
@@ -1057,28 +1057,28 @@ type w8m5EditHarness struct {
 	commitCalibrationContent bool
 }
 
-func (h *w8m5EditHarness) index(slot int) int { return h.rotation[slot%len(h.rotation)] }
+func (h *e2eMatrixEditHarness) index(slot int) int { return h.rotation[slot%len(h.rotation)] }
 
-func (h *w8m5EditHarness) relFor(index int) string {
-	return w8FilePath(index%h.spec.Packages, index)
+func (h *e2eMatrixEditHarness) relFor(index int) string {
+	return sustainedIOFilePath(index%h.spec.Packages, index)
 }
 
-func (h *w8m5EditHarness) rel(slot int) string { return h.relFor(h.index(slot)) }
+func (h *e2eMatrixEditHarness) rel(slot int) string { return h.relFor(h.index(slot)) }
 
-func (h *w8m5EditHarness) leafFor(index int) string { return fmt.Sprintf("Fn%05dS0", index) }
+func (h *e2eMatrixEditHarness) leafFor(index int) string { return fmt.Sprintf("Fn%05dS0", index) }
 
-func (h *w8m5EditHarness) leaf(slot int) string { return h.leafFor(h.index(slot)) }
+func (h *e2eMatrixEditHarness) leaf(slot int) string { return h.leafFor(h.index(slot)) }
 
-func (h *w8m5EditHarness) probe(slot int) string {
+func (h *e2eMatrixEditHarness) probe(slot int) string {
 	index := h.index(slot)
-	return w8ProbeName(index, h.revision[index])
+	return sustainedIOProbeName(index, h.revision[index])
 }
 
-func (h *w8m5EditHarness) path(rel string) string {
+func (h *e2eMatrixEditHarness) path(rel string) string {
 	return filepath.Join(h.f.primary, filepath.FromSlash(rel))
 }
 
-func (h *w8m5EditHarness) read(rel string) string {
+func (h *e2eMatrixEditHarness) read(rel string) string {
 	h.t.Helper()
 	source, err := os.ReadFile(h.path(rel))
 	if err != nil {
@@ -1087,14 +1087,14 @@ func (h *w8m5EditHarness) read(rel string) string {
 	return string(source)
 }
 
-func (h *w8m5EditHarness) write(rel, content string) {
+func (h *e2eMatrixEditHarness) write(rel, content string) {
 	h.t.Helper()
 	h.f.write(h.path(rel), content)
 }
 
 // rewrite applies a transformation and refuses a no-change rewrite: a case that
 // silently edited nothing would pass its own oracle comparison for free.
-func (h *w8m5EditHarness) rewrite(rel string, edit func(string) string) {
+func (h *e2eMatrixEditHarness) rewrite(rel string, edit func(string) string) {
 	h.t.Helper()
 	source := h.read(rel)
 	edited := edit(source)
@@ -1106,21 +1106,21 @@ func (h *w8m5EditHarness) rewrite(rel string, edit func(string) string) {
 
 // rewriteFile is rewrite without the change check, for the undo half of a round
 // trip (which is allowed to restore the original bytes exactly).
-func (h *w8m5EditHarness) rewriteFile(rel string, edit func(string) string) {
+func (h *e2eMatrixEditHarness) rewriteFile(rel string, edit func(string) string) {
 	h.t.Helper()
 	h.write(rel, edit(h.read(rel)))
 }
 
-func (h *w8m5EditHarness) edited(source string, index, revision int) string {
+func (h *e2eMatrixEditHarness) edited(source string, index, revision int) string {
 	h.t.Helper()
-	out, err := w8EditFileSource(source, index, revision)
+	out, err := sustainedIOEditFileSource(source, index, revision)
 	if err != nil {
 		h.t.Fatal(err)
 	}
 	return out
 }
 
-func (h *w8m5EditHarness) git(args ...string) {
+func (h *e2eMatrixEditHarness) git(args ...string) {
 	h.t.Helper()
 	h.f.git(h.f.primary, args...)
 }
@@ -1129,7 +1129,7 @@ func (h *w8m5EditHarness) git(args ...string) {
 // carried content: commit stages with --allow-empty, so a landing commit whose
 // tree equals its parent's changed nothing, and a calibration taken over it
 // must not be quoted as "a commit that really did change content".
-func (h *w8m5EditHarness) headTree() (string, error) {
+func (h *e2eMatrixEditHarness) headTree() (string, error) {
 	out, err := h.f.tryGit(h.f.primary, "rev-parse", "HEAD^{tree}")
 	if err != nil {
 		return "", fmt.Errorf("git rev-parse HEAD^{tree}: %v: %s", err, strings.TrimSpace(string(out)))
@@ -1140,37 +1140,37 @@ func (h *w8m5EditHarness) headTree() (string, error) {
 // commit stages everything and commits; an empty tree difference is allowed so
 // a case that only changed a file mode or nothing at all still produces a
 // commit.
-func (h *w8m5EditHarness) commit(message string) {
+func (h *e2eMatrixEditHarness) commit(message string) {
 	h.t.Helper()
 	h.git("add", "-A")
-	h.git("commit", "--allow-empty", "-m", "w8m5: "+message)
+	h.git("commit", "--allow-empty", "-m", "e2eMatrix: "+message)
 }
 
 // settle waits for the daemon to go quiet, without failing anything: a busy
 // host that keeps a generation counter moving has not, by that fact, broken a
 // gate. Non-convergence is recorded on the row instead (see the soft-wait note
-// in w8_matrix_noop_test.go).
-func (h *w8m5EditHarness) settle() {
-	if !w8m5SoftSettle(h.t.Context(), h.db, 2*time.Minute) {
+// in e2e_matrix_noop_test.go).
+func (h *e2eMatrixEditHarness) settle() {
+	if !e2eMatrixSoftSettle(h.t.Context(), h.db, 2*time.Minute) {
 		h.note("the daemon never produced three stable generation samples within 2m: this step's observation was taken over a moving target")
 	}
 }
 
 // observe records what the daemon currently says about one name and one file,
 // without asserting it. It is how a case states a product-behaviour question
-// whose answer is not a gate (see w8m5Effect.Observe): the row carries the
+// whose answer is not a gate (see e2eMatrixEffect.Observe): the row carries the
 // branch's answer, and the gate-1 oracle still compares that name across both
 // indexes.
-func (h *w8m5EditHarness) observe(label, name, rel string) {
-	if w8m5AbsentFrom(h.f, name, h.path(rel)) {
+func (h *e2eMatrixEditHarness) observe(label, name, rel string) {
+	if e2eMatrixAbsentFrom(h.f, name, h.path(rel)) {
 		h.note(label + ": not served — " + name + " does not answer from " + rel)
 		return
 	}
-	h.note(label + ": " + w8m5AbsenceEvidence(h.f, name, h.path(rel)))
+	h.note(label + ": " + e2eMatrixAbsenceEvidence(h.f, name, h.path(rel)))
 }
 
 // note records something a reader has to know about this row without failing it.
-func (h *w8m5EditHarness) note(text string) {
+func (h *e2eMatrixEditHarness) note(text string) {
 	h.notes = append(h.notes, text)
 }
 
@@ -1179,48 +1179,48 @@ func (h *w8m5EditHarness) note(text string) {
 // row is failed with this reason and the gate-1 oracle is skipped: comparing a
 // view that never reached the state the case asked for would report a
 // difference the harness invented rather than one the branch produced.
-func (h *w8m5EditHarness) unmet(format string, args ...any) {
+func (h *e2eMatrixEditHarness) unmet(format string, args ...any) {
 	h.unmetSteps = append(h.unmetSteps, fmt.Sprintf(format, args...))
 }
 
 // waitPresent and waitAbsent are the fixture's symbol waits made non-fatal, so
 // an unmet wait fails one row instead of ending the matrix.
-func (h *w8m5EditHarness) waitPresent(name, rel string) {
+func (h *e2eMatrixEditHarness) waitPresent(name, rel string) {
 	h.t.Helper()
-	ok := w8m5SoftAwait(h.t.Context(), w8m5ProbeTimeout, 500*time.Millisecond, func() bool {
+	ok := e2eMatrixSoftAwait(h.t.Context(), e2eMatrixProbeTimeout, 500*time.Millisecond, func() bool {
 		found, err := h.f.trySearchSymbolIn(h.f.primary, name, h.path(rel))
 		return err == nil && found
 	})
 	if !ok {
-		h.unmet("%s never answered from %s within %s", name, rel, w8m5ProbeTimeout)
+		h.unmet("%s never answered from %s within %s", name, rel, e2eMatrixProbeTimeout)
 	}
 }
 
-func (h *w8m5EditHarness) waitAbsent(name, rel string) {
+func (h *e2eMatrixEditHarness) waitAbsent(name, rel string) {
 	h.t.Helper()
-	ok := w8m5SoftAwait(h.t.Context(), w8m5AbsenceTimeout, 500*time.Millisecond, func() bool {
-		return w8m5AbsentFrom(h.f, name, h.path(rel))
+	ok := e2eMatrixSoftAwait(h.t.Context(), e2eMatrixAbsenceTimeout, 500*time.Millisecond, func() bool {
+		return e2eMatrixAbsentFrom(h.f, name, h.path(rel))
 	})
 	if !ok {
-		h.unmet("%s was never withdrawn from %s within %s: %s", name, rel, w8m5AbsenceTimeout,
-			w8m5AbsenceEvidence(h.f, name, h.path(rel)))
+		h.unmet("%s was never withdrawn from %s within %s: %s", name, rel, e2eMatrixAbsenceTimeout,
+			e2eMatrixAbsenceEvidence(h.f, name, h.path(rel)))
 	}
 }
 
-func (h *w8m5EditHarness) counters() (map[string]int64, error) {
-	output, err := h.f.tryCommand(w8m5CommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+func (h *e2eMatrixEditHarness) counters() (map[string]int64, error) {
+	output, err := h.f.tryCommand(e2eMatrixCommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		return nil, fmt.Errorf("daemon status --format json unavailable: %w", err)
 	}
-	return w8ParseStatusCounters(output)
+	return sustainedIOParseStatusCounters(output)
 }
 
-func (h *w8m5EditHarness) resetCounters() { h.countersBase, h.countersErr = h.counters() }
+func (h *e2eMatrixEditHarness) resetCounters() { h.countersBase, h.countersErr = h.counters() }
 
 // rebaseline re-opens the measurement window: both the catalog observation and
 // the counter snapshot the closing half subtracts from. A case calls it when
 // its own setup had to publish something before the behaviour it measures.
-func (h *w8m5EditHarness) rebaseline() {
+func (h *e2eMatrixEditHarness) rebaseline() {
 	h.baseline = h.catalog()
 	h.resetCounters()
 }
@@ -1235,13 +1235,13 @@ func (h *w8m5EditHarness) rebaseline() {
 // remaining cases are still measured and reported. The restore is not optional:
 // the parent's cleanup calls the fixture back after the subtests are over, and
 // a stale subtest T would panic there.
-func (h *w8m5EditHarness) swapT(t *testing.T) func() {
+func (h *e2eMatrixEditHarness) swapT(t *testing.T) func() {
 	previous, previousFixture := h.t, h.f.t
 	h.t, h.f.t = t, t
 	return func() { h.t, h.f.t = previous, previousFixture }
 }
 
-// w8m5DirtyBuildSeries is the series that says a working-tree layer was built
+// e2eMatrixDirtyBuildSeries is the series that says a working-tree layer was built
 // from scratch. Re-adopting a retained layer has no outcome label of its own in
 // the shipped vocabulary, so reuse is read as this series NOT rising
 // (internal/indexer/checkout_coordinator.go:1087-1092, which says so in those
@@ -1253,15 +1253,15 @@ func (h *w8m5EditHarness) swapT(t *testing.T) func() {
 // the matrix-1 control where a dirty rebuild provably happened. The emitter
 // exists (checkout_coordinator.go:1094-1098, `if out.DirtyBuilt`) but this
 // fixture's dirty builds never reach it. So a gate-4 reuse claim is no longer
-// read straight off this series: w8m5ReuseVerdict requires a CALIBRATION — the
+// read straight off this series: e2eMatrixReuseVerdict requires a CALIBRATION — the
 // same series over a step that really did rebuild — and, when the calibration
 // shows the series stayed still there too, reports the claim as NOT MEASURABLE
 // instead of as reuse.
-func w8m5DirtyBuildSeries() []string {
-	return []string{w8m5Series(viewmetrics.CoordinatorCycleTotal, "outcome="+viewmetrics.OutcomeBuiltDirty)}
+func e2eMatrixDirtyBuildSeries() []string {
+	return []string{e2eMatrixSeries(viewmetrics.CoordinatorCycleTotal, "outcome="+viewmetrics.OutcomeBuiltDirty)}
 }
 
-// w8m5CommitObservationSeries is the family that moves when the daemon
+// e2eMatrixCommitObservationSeries is the family that moves when the daemon
 // PROCESSES a HEAD movement, whatever it then decides to do about it.
 //
 // It is the clause that survives the consumer gate. Since
@@ -1278,22 +1278,22 @@ func w8m5DirtyBuildSeries() []string {
 //
 // A commit the daemon ignored entirely moves none of these, which is what
 // makes the clause falsifiable on a fixture where nothing is ever built.
-func w8m5CommitObservationSeries() []string {
+func e2eMatrixCommitObservationSeries() []string {
 	return []string{
-		w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched),
-		w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceRepeat),
-		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped),
-		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationReadopted),
-		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationCoalesced),
-		w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationPublished),
-		w8m5Series(viewmetrics.CoordinatorCycleTotal, "outcome="+viewmetrics.OutcomeAdoptedCommit),
+		e2eMatrixSeries(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched),
+		e2eMatrixSeries(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceRepeat),
+		e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped),
+		e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationReadopted),
+		e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationCoalesced),
+		e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationPublished),
+		e2eMatrixSeries(viewmetrics.CoordinatorCycleTotal, "outcome="+viewmetrics.OutcomeAdoptedCommit),
 	}
 }
 
-// w8m5UnchangedCommitInput is everything the unchanged-content commit row is
+// e2eMatrixUnchangedCommitInput is everything the unchanged-content commit row is
 // scored from: one calibration window taken over a commit that really did
 // change content, and one measured window taken over the commit that did not.
-type w8m5UnchangedCommitInput struct {
+type e2eMatrixUnchangedCommitInput struct {
 	// CalibrationErr is non-empty when the calibration window's counters
 	// could not be read at all.
 	CalibrationErr string
@@ -1312,18 +1312,18 @@ type w8m5UnchangedCommitInput struct {
 	WindowSeq          int64
 }
 
-// w8m5UnchangedCommitVerdict scores gate 2 + gate 4 for a commit that changed
+// e2eMatrixUnchangedCommitVerdict scores gate 2 + gate 4 for a commit that changed
 // no content, against what the same fixture did for a commit that changed some.
 //
 // Every clause is gated on its own calibration, because the three witnesses
 // answer to different lanes and the consumer gate kills two of them on a
 // single-checkout family:
 //
-//   - OBSERVATION (w8m5CommitObservationSeries): the daemon saw the commit and
+//   - OBSERVATION (e2eMatrixCommitObservationSeries): the daemon saw the commit and
 //     settled it. Live wherever HEAD movement is observed at all, so this is
 //     the clause that keeps the row from being vacuous.
-//   - BUILD (w8m5AllocationSeries): nothing was built or published.
-//   - REPLAY (w8m5ReplaySeries): where commits do build, an unchanged-content
+//   - BUILD (e2eMatrixAllocationSeries): nothing was built or published.
+//   - REPLAY (e2eMatrixReplaySeries): where commits do build, an unchanged-content
 //     commit must show the claim/replay family instead — the original gate-4
 //     assertion, now gated on the calibration that makes it mean something.
 //   - ALLOCATION (the sequence): no generation was allocated.
@@ -1344,9 +1344,9 @@ type w8m5UnchangedCommitInput struct {
 //     every allocating daemon would score PASS.
 //
 // It is pure so that every clause and every gating is pinned without a daemon.
-func w8m5UnchangedCommitVerdict(in w8m5UnchangedCommitInput) (failures, recorded, unmeasurable []string) {
+func e2eMatrixUnchangedCommitVerdict(in e2eMatrixUnchangedCommitInput) (failures, recorded, unmeasurable []string) {
 	if in.CalibrationErr != "" {
-		return nil, nil, []string{"gate2+gate4: the unchanged-content commit could not be scored — the calibration window's counters were unreadable (ledger row W8.3 emits them): " + in.CalibrationErr}
+		return nil, nil, []string{"gate2+gate4: the unchanged-content commit could not be scored — the calibration window's counters were unreadable (the daemon-status views counter block emits them): " + in.CalibrationErr}
 	}
 	join := func(values []string) string { return strings.Join(values, " ") }
 
@@ -1357,15 +1357,15 @@ func w8m5UnchangedCommitVerdict(in w8m5UnchangedCommitInput) (failures, recorded
 		void = "the calibration commit carried no content — its tree is identical to its parent's, so nothing in this fixture is known to have really changed"
 	}
 
-	calObserved := w8m5MovedSeries(in.Calibration, w8m5CommitObservationSeries())
-	windowObserved := w8m5MovedSeries(in.Window, w8m5CommitObservationSeries())
+	calObserved := e2eMatrixMovedSeries(in.Calibration, e2eMatrixCommitObservationSeries())
+	windowObserved := e2eMatrixMovedSeries(in.Window, e2eMatrixCommitObservationSeries())
 	switch {
 	case void != "":
 		unmeasurable = append(unmeasurable, "gate4: "+void+
 			", so this row cannot tell an unchanged-content commit the daemon settled from one it never saw")
 	case len(calObserved) == 0:
 		unmeasurable = append(unmeasurable, "gate4: a commit that really did change content moved none of ["+
-			join(w8m5CommitObservationSeries())+"] in this fixture, so this row cannot tell an unchanged-content commit the daemon settled from one it never saw")
+			join(e2eMatrixCommitObservationSeries())+"] in this fixture, so this row cannot tell an unchanged-content commit the daemon settled from one it never saw")
 	case len(windowObserved) == 0:
 		failures = append(failures, "gate4: the daemon reported nothing at all for an unchanged-content commit; a real content commit moved ["+
 			join(calObserved)+"] in the same fixture")
@@ -1373,8 +1373,8 @@ func w8m5UnchangedCommitVerdict(in w8m5UnchangedCommitInput) (failures, recorded
 		recorded = append(recorded, "gate4: the unchanged-content commit was observed and settled as ["+join(windowObserved)+"]")
 	}
 
-	calBuilt := w8m5MovedSeries(in.Calibration, w8m5AllocationSeries())
-	windowBuilt := w8m5MovedSeries(in.Window, w8m5AllocationSeries())
+	calBuilt := e2eMatrixMovedSeries(in.Calibration, e2eMatrixAllocationSeries())
+	windowBuilt := e2eMatrixMovedSeries(in.Window, e2eMatrixAllocationSeries())
 	switch {
 	// The violation first, and unconditionally: building or publishing for a
 	// commit that changed nothing is a gate-2 failure on any fixture.
@@ -1392,7 +1392,7 @@ func w8m5UnchangedCommitVerdict(in w8m5UnchangedCommitInput) (failures, recorded
 			"a family with no dependent checkout defers its committed-base publication (internal/indexer/dedicated_base_startup.go:776) — "+
 			"so the same series staying still over an unchanged-content commit carries no information")
 	default:
-		if replayed := w8m5MovedSeries(in.Window, w8m5ReplaySeries()); len(replayed) == 0 {
+		if replayed := e2eMatrixMovedSeries(in.Window, e2eMatrixReplaySeries()); len(replayed) == 0 {
 			failures = append(failures, "gate4: an unchanged-content commit reported no reuse, while a real content commit in the same fixture built ["+
 				join(calBuilt)+"]")
 		} else {
@@ -1431,10 +1431,10 @@ func w8m5UnchangedCommitVerdict(in w8m5UnchangedCommitInput) (failures, recorded
 // — which is what downgrades a would-be PASS to a named SKIP in file(). The
 // caller only reports the returned failures; the row is already FAILED, and
 // render() reports a FAILED row from the table regardless.
-func (h *w8m5EditHarness) scoreUnchangedCommit(row *w8m5Row, in w8m5UnchangedCommitInput, counters map[string]int64) []string {
-	failures, scored, cannot := w8m5UnchangedCommitVerdict(in)
+func (h *e2eMatrixEditHarness) scoreUnchangedCommit(row *e2eMatrixRow, in e2eMatrixUnchangedCommitInput, counters map[string]int64) []string {
+	failures, scored, cannot := e2eMatrixUnchangedCommitVerdict(in)
 	for _, failure := range failures {
-		w8m5MarkFailed(row, failure+"; counters: "+w8m5Truncate(w8m5Canonical(counters), 300))
+		e2eMatrixMarkFailed(row, failure+"; counters: "+e2eMatrixTruncate(e2eMatrixCanonical(counters), 300))
 	}
 	for _, note := range scored {
 		row.Detail = strings.TrimSpace(row.Detail + " | " + note)
@@ -1443,15 +1443,15 @@ func (h *w8m5EditHarness) scoreUnchangedCommit(row *w8m5Row, in w8m5UnchangedCom
 	return failures
 }
 
-// w8m5ReuseVerdict decides what "the build series did not move" means, given
+// e2eMatrixReuseVerdict decides what "the build series did not move" means, given
 // what a step that really did rebuild did to the SAME series.
 //
 // It is pure so the decision is pinned without a daemon: calibration silent →
 // not measurable; calibration moved and the window moved → rebuilt; calibration
 // moved and the window did not → reused.
-func w8m5ReuseVerdict(label string, calibration, window map[string]int64, series []string) (text string, measurable, reused bool) {
-	movedInCalibration := w8m5MovedSeries(calibration, series)
-	movedInWindow := w8m5MovedSeries(window, series)
+func e2eMatrixReuseVerdict(label string, calibration, window map[string]int64, series []string) (text string, measurable, reused bool) {
+	movedInCalibration := e2eMatrixMovedSeries(calibration, series)
+	movedInWindow := e2eMatrixMovedSeries(window, series)
 	if len(movedInCalibration) == 0 {
 		return label + ": NOT MEASURABLE — a step that really did rebuild moved none of [" +
 			strings.Join(series, " ") + "] in this fixture, so the same series staying still here carries no information", false, false
@@ -1466,7 +1466,7 @@ func w8m5ReuseVerdict(label string, calibration, window map[string]int64, series
 // deltaSince closes a measurement sub-window a case opened with rebaseline and
 // returns the counter delta over it. An unreadable counter set is reported as
 // an error rather than as a fabricated zero.
-func (h *w8m5EditHarness) deltaSince() (map[string]int64, error) {
+func (h *e2eMatrixEditHarness) deltaSince() (map[string]int64, error) {
 	h.t.Helper()
 	after, err := h.counters()
 	if h.countersErr != nil {
@@ -1475,7 +1475,7 @@ func (h *w8m5EditHarness) deltaSince() (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	return w8CounterDelta(h.countersBase, after), nil
+	return sustainedIOCounterDelta(h.countersBase, after), nil
 }
 
 // reuseSince closes a sub-window and scores a gate-4 reuse claim against a
@@ -1483,19 +1483,19 @@ func (h *w8m5EditHarness) deltaSince() (map[string]int64, error) {
 // case scopes a gate-4 claim to one step of a multi-step body — the undo half
 // of an edit/undo/redo round trip is a reuse claim, the edit before it is not.
 //
-// Unreadable counters are a named skip sentence pointing at the ledger row that
+// Unreadable counters are a named skip sentence pointing at the block that
 // emits them, never a silent pass and never a fabricated zero. A claim the
 // instrument cannot carry is recorded as unmeasurable, which turns the row into
 // a named SKIP rather than leaving a "confirmed" that means nothing.
-func (h *w8m5EditHarness) reuseSince(label string, calibration map[string]int64, forbidden []string) string {
+func (h *e2eMatrixEditHarness) reuseSince(label string, calibration map[string]int64, forbidden []string) string {
 	h.t.Helper()
 	delta, err := h.deltaSince()
 	if err != nil {
-		reason := label + ": not scored — daemon status views counters unavailable (ledger row W8.3 emits them): " + err.Error()
+		reason := label + ": not scored — daemon status views counters unavailable (the daemon-status views counter block emits them): " + err.Error()
 		h.unmeasurable = append(h.unmeasurable, reason)
 		return reason
 	}
-	text, measurable, reused := w8m5ReuseVerdict(label, calibration, delta, forbidden)
+	text, measurable, reused := e2eMatrixReuseVerdict(label, calibration, delta, forbidden)
 	switch {
 	case !measurable:
 		h.unmeasurable = append(h.unmeasurable, text)
@@ -1505,48 +1505,48 @@ func (h *w8m5EditHarness) reuseSince(label string, calibration map[string]int64,
 	return text
 }
 
-func (h *w8m5EditHarness) catalog() w8m5Catalog {
+func (h *e2eMatrixEditHarness) catalog() e2eMatrixCatalog {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	return w8m5ReadCatalog(ctx, h.db)
+	return e2eMatrixReadCatalog(ctx, h.db)
 }
 
 // ----------------------------------------------------------- the oracle ---
 
-// w8m5RootToken is the placeholder a probe payload carries where an absolute
+// e2eMatrixRootToken is the placeholder a probe payload carries where an absolute
 // path belongs. Each daemon is asked with the token replaced by ITS OWN root:
 // the two indexes live under different roots, and a payload built from one
 // daemon's root is answered by the other with "file_not_indexed" — a difference
 // the harness would have invented rather than observed.
-const w8m5RootToken = "<ROOT>"
+const e2eMatrixRootToken = "<ROOT>"
 
-// w8m5ProbesFor turns a case's effect into the projection set. Every probe
+// e2eMatrixProbesFor turns a case's effect into the projection set. Every probe
 // names the gate-1 clause it evidences.
-func w8m5ProbesFor(effect w8m5Effect) []w8m5Probe {
-	var probes []w8m5Probe
+func e2eMatrixProbesFor(effect e2eMatrixEffect) []e2eMatrixProbe {
+	var probes []e2eMatrixProbe
 	for _, rel := range effect.Files {
-		probes = append(probes, w8m5Probe{
+		probes = append(probes, e2eMatrixProbe{
 			Key: "summary:" + rel, Clause: "locations+metadata+edges+ownership+visibility",
 			Facade:  "read",
-			Payload: map[string]any{"operation": "summary", "path": w8m5RootToken + string(filepath.Separator) + filepath.FromSlash(rel)},
+			Payload: map[string]any{"operation": "summary", "path": e2eMatrixRootToken + string(filepath.Separator) + filepath.FromSlash(rel)},
 		})
 	}
 	for _, symbol := range effect.Symbols {
-		id := w8m5SymbolID(symbol.Rel, symbol.Name)
+		id := e2eMatrixSymbolID(symbol.Rel, symbol.Name)
 		probes = append(probes,
-			w8m5Probe{Key: "usages:" + id, Clause: "incoming edges",
+			e2eMatrixProbe{Key: "usages:" + id, Clause: "incoming edges",
 				Facade:  "relations",
 				Payload: map[string]any{"operation": "usages", "target": map[string]any{"symbol": id}}},
-			w8m5Probe{Key: "source:" + id, Clause: "source bytes + span",
+			e2eMatrixProbe{Key: "source:" + id, Clause: "source bytes + span",
 				Facade:  "read",
 				Payload: map[string]any{"operation": "source", "target": map[string]any{"symbol": id}}},
 		)
 	}
-	named := append([]w8m5Sighting{}, effect.Present...)
+	named := append([]e2eMatrixSighting{}, effect.Present...)
 	named = append(named, effect.Absent...)
 	named = append(named, effect.Observe...)
 	for _, sighting := range named {
-		probes = append(probes, w8m5Probe{
+		probes = append(probes, e2eMatrixProbe{
 			Key: "symbols:" + sighting.Name, Clause: "resolved target + deletion absence",
 			Facade: "search", Name: sighting.Name,
 			Payload: map[string]any{"operation": "symbols", "query": sighting.Name,
@@ -1554,18 +1554,18 @@ func w8m5ProbesFor(effect w8m5Effect) []w8m5Probe {
 		})
 	}
 	for _, text := range effect.Texts {
-		probes = append(probes, w8m5Probe{
+		probes = append(probes, e2eMatrixProbe{
 			Key: "text:" + text, Clause: "text lane",
 			Facade:  "search",
 			Payload: map[string]any{"operation": "text", "query": text},
 		})
 	}
-	return w8m5DedupeProbes(probes)
+	return e2eMatrixDedupeProbes(probes)
 }
 
-func w8m5DedupeProbes(probes []w8m5Probe) []w8m5Probe {
+func e2eMatrixDedupeProbes(probes []e2eMatrixProbe) []e2eMatrixProbe {
 	seen := map[string]bool{}
-	out := make([]w8m5Probe, 0, len(probes))
+	out := make([]e2eMatrixProbe, 0, len(probes))
 	for _, probe := range probes {
 		if seen[probe.Key] {
 			continue
@@ -1576,17 +1576,17 @@ func w8m5DedupeProbes(probes []w8m5Probe) []w8m5Probe {
 	return out
 }
 
-// w8m5SymbolID is the graph identity of a declaration, as the product spells
+// e2eMatrixSymbolID is the graph identity of a declaration, as the product spells
 // it: "<repo prefix>/<repo-relative path>::<name>".
-func w8m5SymbolID(rel, name string) string {
+func e2eMatrixSymbolID(rel, name string) string {
 	return issue767FixturePrefix + "/" + rel + "::" + name
 }
 
-// w8m5Project asks one daemon every probe and returns the canonical rendering
+// e2eMatrixProject asks one daemon every probe and returns the canonical rendering
 // of each answer. A transport failure is recorded as the answer rather than
 // failing the test: two daemons that both refuse a probe agree, and a daemon
 // that refuses one the other answered is exactly the difference to report.
-func w8m5Project(f *issue767Fixture, probes []w8m5Probe, drop map[string]bool) map[string]string {
+func e2eMatrixProject(f *issue767Fixture, probes []e2eMatrixProbe, drop map[string]bool) map[string]string {
 	out := make(map[string]string, len(probes))
 	for _, probe := range probes {
 		payload, err := json.Marshal(probe.Payload)
@@ -1596,33 +1596,33 @@ func w8m5Project(f *issue767Fixture, probes []w8m5Probe, drop map[string]bool) m
 		}
 		// The payload is written against <ROOT>; every daemon is asked about
 		// its own checkout.
-		request := strings.ReplaceAll(string(payload), w8m5RootToken, f.primary)
-		output, err := f.tryCommand(w8m5CommandTimeout, f.primary, "call", probe.Facade,
+		request := strings.ReplaceAll(string(payload), e2eMatrixRootToken, f.primary)
+		output, err := f.tryCommand(e2eMatrixCommandTimeout, f.primary, "call", probe.Facade,
 			"--index", f.primary, "--json", request, "--format", "json")
 		if err != nil {
-			out[probe.Key] = "call error: " + err.Error() + ": " + w8Tail(output)
+			out[probe.Key] = "call error: " + err.Error() + ": " + sustainedIOTail(output)
 			continue
 		}
 		var value any
 		if err := json.Unmarshal(output, &value); err != nil {
-			out[probe.Key] = "decode error: " + err.Error() + ": " + w8Tail(output)
+			out[probe.Key] = "decode error: " + err.Error() + ": " + sustainedIOTail(output)
 			continue
 		}
-		normalized := w8m5Normalize(value, f.primary, drop)
+		normalized := e2eMatrixNormalize(value, f.primary, drop)
 		if probe.Name != "" {
-			normalized = w8m5ReduceToName(normalized, probe.Name)
+			normalized = e2eMatrixReduceToName(normalized, probe.Name)
 		}
-		out[probe.Key] = w8m5Canonical(normalized)
+		out[probe.Key] = e2eMatrixCanonical(normalized)
 	}
 	return out
 }
 
-// w8m5CopyTree copies a checkout's working tree — the exact bytes the
+// e2eMatrixCopyTree copies a checkout's working tree — the exact bytes the
 // incremental daemon is serving — into a fresh fixture's root. The Git
 // directory is deliberately not copied: the oracle commits the same content
 // under its own history, and gate 1 compares the index of a tree, not the
 // commit that produced it.
-func w8m5CopyTree(t *testing.T, from, to string) {
+func e2eMatrixCopyTree(t *testing.T, from, to string) {
 	t.Helper()
 	err := filepath.WalkDir(from, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -1668,20 +1668,20 @@ func w8m5CopyTree(t *testing.T, from, to string) {
 	}
 }
 
-// w8m5FreshIndex starts a throwaway isolated daemon over a copy of the tree and
+// e2eMatrixFreshIndex starts a throwaway isolated daemon over a copy of the tree and
 // returns it ready. The caller stops it as soon as the comparison is done: one
 // extra daemon at a time, never seventeen.
-func w8m5FreshIndex(t *testing.T, binary, tree string) *issue767Fixture {
+func e2eMatrixFreshIndex(t *testing.T, binary, tree string) *issue767Fixture {
 	t.Helper()
 	fresh := newIssue767FixtureWithCorpus(t, binary, func(f *issue767Fixture) {
-		w8m5CopyTree(t, tree, f.primary)
+		e2eMatrixCopyTree(t, tree, f.primary)
 	})
 	fresh.start()
-	fresh.awaitSymbolIn(fresh.primary, w8PrimaryMarker, filepath.Join(fresh.primary, "marker.go"), w8m5ProbeTimeout)
+	fresh.awaitSymbolIn(fresh.primary, sustainedIOPrimaryMarker, filepath.Join(fresh.primary, "marker.go"), e2eMatrixProbeTimeout)
 	// A fresh index that has not gone quiet is still sampled: the oracle
 	// re-samples on difference, so a converging index costs a retry rather
 	// than a wrong verdict, while a hard failure here would cost the case.
-	if !w8m5SoftSettle(t.Context(), fresh.openReadOnly(), 2*time.Minute) {
+	if !e2eMatrixSoftSettle(t.Context(), fresh.openReadOnly(), 2*time.Minute) {
 		t.Logf("the fresh isolated index did not produce three stable generation samples within 2m; sampling it anyway")
 	}
 	return fresh
@@ -1690,14 +1690,14 @@ func w8m5FreshIndex(t *testing.T, binary, tree string) *issue767Fixture {
 // run executes one case, files its row and — unless the oracle is switched off
 // — compares the incremental view against a fresh isolated index of the tree
 // the case produced.
-func (h *w8m5EditHarness) run(c w8m5EditCase) {
+func (h *e2eMatrixEditHarness) run(c e2eMatrixEditCase) {
 	h.t.Helper()
 	started := time.Now()
 	h.notes, h.unmetSteps, h.unmeasurable = nil, nil, nil
 	h.commitCalibration, h.commitCalibrationSeq, h.commitCalibrationErr = nil, 0, ""
 	h.commitCalibrationContent = false
 	h.rebaseline()
-	row := w8m5Row{Case: c.Name, Gate: c.Gate, Status: w8m5StatusPass}
+	row := e2eMatrixRow{Case: c.Name, Gate: c.Gate, Status: e2eMatrixStatusPass}
 
 	effect := c.Apply(h)
 	for _, sighting := range effect.Present {
@@ -1710,34 +1710,34 @@ func (h *w8m5EditHarness) run(c w8m5EditCase) {
 
 	before, after := h.baseline, h.catalog()
 	row.Seconds = time.Since(started).Seconds()
-	row.Bookkeeping = w8m5BookkeepingDelta(before, after)
+	row.Bookkeeping = e2eMatrixBookkeepingDelta(before, after)
 	row.Detail = effect.Note
 
 	// Gate 4: what did this case cost — reuse or rebuild? Recorded for every
 	// case from the daemon's own counters; the replay case asserts on it.
 	// A case that asserts on a series it could not read is a named skip
-	// pointing at the ledger row that emits it, never a silent pass.
+	// pointing at the counter block that emits it, never a silent pass.
 	assertsReuse := c.Name == "commit_unchanged_content"
 	afterCounters, err := h.counters()
 	switch {
 	case h.countersErr != nil || err != nil:
-		reason := "daemon status views counters unavailable (ledger row W8.3 emits them)"
+		reason := "daemon status views counters unavailable (the daemon-status views counter block emits them)"
 		row.Detail = strings.TrimSpace(row.Detail + " | " + reason)
 		if assertsReuse {
-			row.Status = w8m5StatusSkip
+			row.Status = e2eMatrixStatusSkip
 			row.Detail = reason + "; the gate-4 reuse assertion could not run"
 			h.file(row)
 			return
 		}
 	default:
-		delta := w8CounterDelta(h.countersBase, afterCounters)
+		delta := sustainedIOCounterDelta(h.countersBase, afterCounters)
 		row.Counters = delta
-		built := w8m5MovedSeries(delta, w8m5AllocationSeries())
-		replayed := w8m5MovedSeries(delta, w8m5ReplaySeries())
+		built := e2eMatrixMovedSeries(delta, e2eMatrixAllocationSeries())
+		replayed := e2eMatrixMovedSeries(delta, e2eMatrixReplaySeries())
 		row.Detail = strings.TrimSpace(row.Detail + fmt.Sprintf(" | rebuild[%s] reuse[%s] seq %+d",
 			strings.Join(built, " "), strings.Join(replayed, " "), after.Sequence-before.Sequence))
 		if assertsReuse {
-			failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+			failures := h.scoreUnchangedCommit(&row, e2eMatrixUnchangedCommitInput{
 				CalibrationErr:     h.commitCalibrationErr,
 				CalibrationContent: h.commitCalibrationContent,
 				Calibration:        h.commitCalibration,
@@ -1765,30 +1765,30 @@ func (h *w8m5EditHarness) run(c w8m5EditCase) {
 	}
 
 	if !h.oracle {
-		row.Status = w8m5StatusSkip
-		row.Detail = "fresh-index oracle disabled by GXW8_MATRIX_ORACLE=0; " + row.Detail
+		row.Status = e2eMatrixStatusSkip
+		row.Detail = "fresh-index oracle disabled by GX_E2E_MATRIX_ORACLE=0; " + row.Detail
 		h.file(row)
 		return
 	}
 
-	probes := w8m5ProbesFor(effect)
-	drop := w8m5MergedKeys(w8m5VolatileKeys(), w8m5ProvenanceKeys())
+	probes := e2eMatrixProbesFor(effect)
+	drop := e2eMatrixMergedKeys(e2eMatrixVolatileKeys(), e2eMatrixProvenanceKeys())
 	result := h.compareAgainstFreshIndex(probes, drop)
 	differences, residual, provenance := result.Differences, result.Residual, result.Provenance
 	row.Differences = differences
-	verdict := w8m5GateOneVerdict(w8m5OracleInput{
+	verdict := e2eMatrixGateOneVerdict(e2eMatrixOracleInput{
 		Probes: len(probes), Substantive: result.Substantive, Empty: result.Empty,
 		Differences: differences, Residual: residual,
-		Attempts: w8m5OracleAttempts, Backoff: h.backoff,
+		Attempts: e2eMatrixOracleAttempts, Backoff: h.backoff,
 	})
 	switch verdict.Status {
-	case w8m5StatusPass:
+	case e2eMatrixStatusPass:
 		row.Detail = strings.TrimSpace(row.Detail + " | " + strings.Join(verdict.Recorded, " | "))
-	case w8m5StatusSkip:
+	case e2eMatrixStatusSkip:
 		// Every difference is the measured semantic-metadata gap. The row is
 		// a named skip pointing at the ledger row that owns it, and the full
 		// difference still rides on the row.
-		row.Status = w8m5StatusSkip
+		row.Status = e2eMatrixStatusSkip
 		row.Detail = strings.TrimSpace(row.Detail + " | " + strings.Join(verdict.Recorded, " | "))
 		h.t.Logf("matrix2 %s (%s): SKIP — %s", row.Case, row.Gate, row.Detail)
 	default:
@@ -1804,10 +1804,10 @@ func (h *w8m5EditHarness) run(c w8m5EditCase) {
 // claim this instrument cannot carry. A gate-4 reuse reading whose series a
 // real rebuild did not move is not a confirmation, so the row says which claim
 // could not be scored instead of quietly keeping the PASS.
-func (h *w8m5EditHarness) file(row w8m5Row) {
+func (h *e2eMatrixEditHarness) file(row e2eMatrixRow) {
 	if len(h.unmeasurable) > 0 {
-		if row.Status == w8m5StatusPass {
-			row.Status = w8m5StatusSkip
+		if row.Status == e2eMatrixStatusPass {
+			row.Status = e2eMatrixStatusSkip
 		}
 		row.Detail = strings.TrimSpace(row.Detail + " | NOT MEASURABLE: " + strings.Join(h.unmeasurable, " ;; "))
 	}
@@ -1818,42 +1818,42 @@ func (h *w8m5EditHarness) file(row w8m5Row) {
 // and compares it with the incremental view, retrying while the two are still
 // converging. It returns the surviving structural differences and how many
 // probes differ once provenance is included.
-func (h *w8m5EditHarness) compareAgainstFreshIndex(probes []w8m5Probe, drop map[string]bool) w8m5OracleResult {
-	var residual []w8m5Difference
+func (h *e2eMatrixEditHarness) compareAgainstFreshIndex(probes []e2eMatrixProbe, drop map[string]bool) e2eMatrixOracleResult {
+	var residual []e2eMatrixDifference
 	var substantive int
 	var empty []string
 	structural := drop
-	volatileOnly := w8m5VolatileKeys()
+	volatileOnly := e2eMatrixVolatileKeys()
 	// residualKeys additionally hides the measured semantic-metadata gap, so
 	// the harness can say whether a difference is ONLY that gap or something
 	// else as well.
-	residualKeys := w8m5MergedKeys(structural, w8m5SemanticMetadataKeys())
+	residualKeys := e2eMatrixMergedKeys(structural, e2eMatrixSemanticMetadataKeys())
 
-	var differences []w8m5Difference
+	var differences []e2eMatrixDifference
 	provenance := 0
-	for attempt := 1; attempt <= w8m5OracleAttempts; attempt++ {
-		fresh := w8m5FreshIndex(h.t, h.binary, h.f.primary)
-		incrementalStructural := w8m5Project(h.f, probes, structural)
-		freshStructural := w8m5Project(fresh, probes, structural)
-		differences = w8m5Compare(incrementalStructural, freshStructural, probes)
-		substantive, empty = w8m5SubstantiveProbes(incrementalStructural, freshStructural, probes)
-		provenance = len(w8m5Compare(w8m5Project(h.f, probes, volatileOnly), w8m5Project(fresh, probes, volatileOnly), probes))
+	for attempt := 1; attempt <= e2eMatrixOracleAttempts; attempt++ {
+		fresh := e2eMatrixFreshIndex(h.t, h.binary, h.f.primary)
+		incrementalStructural := e2eMatrixProject(h.f, probes, structural)
+		freshStructural := e2eMatrixProject(fresh, probes, structural)
+		differences = e2eMatrixCompare(incrementalStructural, freshStructural, probes)
+		substantive, empty = e2eMatrixSubstantiveProbes(incrementalStructural, freshStructural, probes)
+		provenance = len(e2eMatrixCompare(e2eMatrixProject(h.f, probes, volatileOnly), e2eMatrixProject(fresh, probes, volatileOnly), probes))
 		if len(differences) > 0 {
-			residual = w8m5Compare(w8m5Project(h.f, probes, residualKeys), w8m5Project(fresh, probes, residualKeys), probes)
+			residual = e2eMatrixCompare(e2eMatrixProject(h.f, probes, residualKeys), e2eMatrixProject(fresh, probes, residualKeys), probes)
 		} else {
 			residual = nil
 		}
 		fresh.stop()
 		if len(differences) == 0 {
-			return w8m5OracleResult{Provenance: provenance, Substantive: substantive, Empty: empty}
+			return e2eMatrixOracleResult{Provenance: provenance, Substantive: substantive, Empty: empty}
 		}
 		if len(residual) == 0 {
 			// The only difference is the characterized semantic-metadata
 			// gap, which is sustained rather than converging: sampling
 			// again would cost two more fresh indexes to learn nothing.
-			return w8m5OracleResult{Differences: differences, Provenance: provenance, Substantive: substantive, Empty: empty}
+			return e2eMatrixOracleResult{Differences: differences, Provenance: provenance, Substantive: substantive, Empty: empty}
 		}
-		if attempt < w8m5OracleAttempts {
+		if attempt < e2eMatrixOracleAttempts {
 			h.t.Logf("gate1 oracle attempt %d: %d probe(s) still differ after %s of convergence; sampling again",
 				attempt, len(differences), h.backoff)
 			select {
@@ -1864,67 +1864,67 @@ func (h *w8m5EditHarness) compareAgainstFreshIndex(probes []w8m5Probe, drop map[
 			h.settle()
 		}
 	}
-	return w8m5OracleResult{Differences: differences, Residual: residual, Provenance: provenance,
+	return e2eMatrixOracleResult{Differences: differences, Residual: residual, Provenance: provenance,
 		Substantive: substantive, Empty: empty}
 }
 
-// w8m5MarkFailed is the row half of fail: it marks the row FAILED and records
+// e2eMatrixMarkFailed is the row half of fail: it marks the row FAILED and records
 // why. It is pure and separate so a scoring path that produces failures can be
 // exercised by a unit test without reporting them to the test that runs it;
 // render() reports every FAILED row from the table, so marking is what decides
 // the matrix, and fail's Errorf is the immediate, in-place report.
-func w8m5MarkFailed(row *w8m5Row, detail string) {
-	row.Status = w8m5StatusFail
+func e2eMatrixMarkFailed(row *e2eMatrixRow, detail string) {
+	row.Status = e2eMatrixStatusFail
 	row.Detail = strings.TrimSpace(row.Detail + " | " + detail)
 }
 
-func (h *w8m5EditHarness) fail(row *w8m5Row, detail string) {
-	w8m5MarkFailed(row, detail)
+func (h *e2eMatrixEditHarness) fail(row *e2eMatrixRow, detail string) {
+	e2eMatrixMarkFailed(row, detail)
 	h.t.Errorf("matrix2 %s (%s): %s", row.Case, row.Gate, detail)
 }
 
 // ------------------------------------------------------------ opt-in entry ---
 
-// TestW8MatrixEditTaxonomy is matrix 2.
-func TestW8MatrixEditTaxonomy(t *testing.T) {
-	binary := w8m5Binary(t)
-	spec := w8m5FixtureSpec(t)
-	filter := w8m5CaseFilter(t)
+// TestE2EMatrixEditTaxonomy is matrix 2.
+func TestE2EMatrixEditTaxonomy(t *testing.T) {
+	binary := e2eMatrixBinary(t)
+	spec := e2eMatrixFixtureSpec(t)
+	filter := e2eMatrixCaseFilter(t)
 
-	table := w8m5NewTable(t, "w8_matrix2_edits")
+	table := e2eMatrixNewTable(t, "e2e_matrix_edits")
 	defer table.render()
 
-	f := w8m5NewFixture(t, binary, spec)
+	f := e2eMatrixNewFixture(t, binary, spec)
 	defer f.stop()
 
 	// Every case edits its own file: a difference a later case reports must
 	// not be explainable by an earlier case's edit to the same file.
-	rotation := w8RotationTargets(spec, len(w8m5EditCaseNames()))
-	if len(rotation) < len(w8m5EditCaseNames()) {
-		t.Fatalf("the corpus has %d rotation targets for %d cases; raise GXW8_MATRIX_FILES to at least %d",
-			len(rotation), len(w8m5EditCaseNames()), len(w8m5EditCaseNames()))
+	rotation := sustainedIORotationTargets(spec, len(e2eMatrixEditCaseNames()))
+	if len(rotation) < len(e2eMatrixEditCaseNames()) {
+		t.Fatalf("the corpus has %d rotation targets for %d cases; raise GX_E2E_MATRIX_FILES to at least %d",
+			len(rotation), len(e2eMatrixEditCaseNames()), len(e2eMatrixEditCaseNames()))
 	}
-	h := &w8m5EditHarness{
+	h := &e2eMatrixEditHarness{
 		t: t, f: f, db: f.openReadOnly(), table: table, binary: binary, spec: spec,
-		oracle:   os.Getenv("GXW8_MATRIX_ORACLE") != "0",
-		backoff:  w8m5OracleBackoff(t),
+		oracle:   os.Getenv("GX_E2E_MATRIX_ORACLE") != "0",
+		backoff:  e2eMatrixOracleBackoff(t),
 		rotation: rotation,
 		revision: map[int]int{},
 	}
-	for _, c := range w8m5EditCases() {
+	for _, c := range e2eMatrixEditCases() {
 		if filter != nil && !filter.MatchString(c.Name) {
-			table.add(w8m5Row{Case: c.Name, Gate: c.Gate, Status: w8m5StatusSkip,
-				Detail: "not selected by GXW8_MATRIX_CASES"})
+			table.add(e2eMatrixRow{Case: c.Name, Gate: c.Gate, Status: e2eMatrixStatusSkip,
+				Detail: "not selected by GX_E2E_MATRIX_CASES"})
 			continue
 		}
 		t.Logf("matrix2 case %s (%s)", c.Name, c.Gate)
-		w8m5RunGuarded(t, table, c.Name, c.Gate, h.swapT, func() { h.run(c) })
+		e2eMatrixRunGuarded(t, table, c.Name, c.Gate, h.swapT, func() { h.run(c) })
 	}
 }
 
 // ------------------------------------------------------------------ tests ---
 
-func TestW8m5NormalizeMakesTwoDaemonsComparable(t *testing.T) {
+func TestE2EMatrixNormalizeMakesTwoDaemonsComparable(t *testing.T) {
 	left := map[string]any{
 		"etag":  "aaaa",
 		"nodes": []any{map[string]any{"id": "issue767/p000/a.go::B", "absolute_file_path": "/roots/left/p000/a.go"}},
@@ -1942,14 +1942,14 @@ func TestW8m5NormalizeMakesTwoDaemonsComparable(t *testing.T) {
 			map[string]any{"from": "x", "to": "y", "kind": "calls", "line": 8.0, "origin": "ast_resolved", "tier": "ast"},
 		},
 	}
-	drop := w8m5MergedKeys(w8m5VolatileKeys(), w8m5ProvenanceKeys())
-	if got, want := w8m5Canonical(w8m5Normalize(left, "/roots/left", drop)), w8m5Canonical(w8m5Normalize(right, "/roots/right", drop)); got != want {
+	drop := e2eMatrixMergedKeys(e2eMatrixVolatileKeys(), e2eMatrixProvenanceKeys())
+	if got, want := e2eMatrixCanonical(e2eMatrixNormalize(left, "/roots/left", drop)), e2eMatrixCanonical(e2eMatrixNormalize(right, "/roots/right", drop)); got != want {
 		t.Fatalf("structural normalization did not make the two answers comparable:\n%s\n%s", got, want)
 	}
 	// With provenance kept, the same pair must differ: dropping it is a
 	// deliberate, named exception, not an accident of the normalizer.
-	volatile := w8m5VolatileKeys()
-	if w8m5Canonical(w8m5Normalize(left, "/roots/left", volatile)) == w8m5Canonical(w8m5Normalize(right, "/roots/right", volatile)) {
+	volatile := e2eMatrixVolatileKeys()
+	if e2eMatrixCanonical(e2eMatrixNormalize(left, "/roots/left", volatile)) == e2eMatrixCanonical(e2eMatrixNormalize(right, "/roots/right", volatile)) {
 		t.Fatal("provenance difference vanished even when provenance was kept")
 	}
 	// A real content difference must survive normalization.
@@ -1958,7 +1958,7 @@ func TestW8m5NormalizeMakesTwoDaemonsComparable(t *testing.T) {
 		"nodes": []any{map[string]any{"id": "issue767/p000/a.go::B", "absolute_file_path": "/roots/right/p000/a.go"}},
 		"edges": []any{map[string]any{"from": "a", "to": "b", "kind": "reads", "line": 2.0, "origin": "ast_resolved"}},
 	}
-	if w8m5Canonical(w8m5Normalize(left, "/roots/left", drop)) == w8m5Canonical(w8m5Normalize(changed, "/roots/right", drop)) {
+	if e2eMatrixCanonical(e2eMatrixNormalize(left, "/roots/left", drop)) == e2eMatrixCanonical(e2eMatrixNormalize(changed, "/roots/right", drop)) {
 		t.Fatal("a dropped edge was normalized away")
 	}
 	moved := map[string]any{
@@ -1969,23 +1969,23 @@ func TestW8m5NormalizeMakesTwoDaemonsComparable(t *testing.T) {
 			map[string]any{"from": "a", "to": "b", "kind": "reads", "line": 2.0, "origin": "ast_resolved"},
 		},
 	}
-	if w8m5Canonical(w8m5Normalize(left, "/roots/left", drop)) == w8m5Canonical(w8m5Normalize(moved, "/roots/right", drop)) {
+	if e2eMatrixCanonical(e2eMatrixNormalize(left, "/roots/left", drop)) == e2eMatrixCanonical(e2eMatrixNormalize(moved, "/roots/right", drop)) {
 		t.Fatal("a moved location was normalized away")
 	}
 }
 
-func TestW8m5CompareNamesTheProbeAndTheClause(t *testing.T) {
-	probes := []w8m5Probe{
+func TestE2EMatrixCompareNamesTheProbeAndTheClause(t *testing.T) {
+	probes := []e2eMatrixProbe{
 		{Key: "summary:p000/a.go", Clause: "locations"},
 		{Key: "usages:issue767/p000/a.go::B", Clause: "incoming edges"},
 		{Key: "symbols:B", Clause: "resolved target + deletion absence"},
 	}
 	same := map[string]string{"summary:p000/a.go": "{}", "usages:issue767/p000/a.go::B": "[]", "symbols:B": "{}"}
-	if differences := w8m5Compare(same, same, probes); len(differences) != 0 {
+	if differences := e2eMatrixCompare(same, same, probes); len(differences) != 0 {
 		t.Fatalf("identical projections differed: %v", differences)
 	}
 	other := map[string]string{"summary:p000/a.go": "{}", "usages:issue767/p000/a.go::B": "[1]"}
-	differences := w8m5Compare(same, other, probes)
+	differences := e2eMatrixCompare(same, other, probes)
 	if len(differences) != 2 {
 		t.Fatalf("want a difference for the changed probe and the missing one, got %v", differences)
 	}
@@ -1997,17 +1997,17 @@ func TestW8m5CompareNamesTheProbeAndTheClause(t *testing.T) {
 	}
 }
 
-func TestW8m5ProbesForCoverEveryGate1Clause(t *testing.T) {
-	effect := w8m5Effect{
+func TestE2EMatrixProbesForCoverEveryGate1Clause(t *testing.T) {
+	effect := e2eMatrixEffect{
 		Files:   []string{"p000/file00000.go"},
-		Symbols: []w8m5Sighting{{"Fn00000S0", "p000/file00000.go"}},
-		Present: []w8m5Sighting{{"W8Probe00000Rev1", "p000/file00000.go"}},
-		Absent:  []w8m5Sighting{{"W8Probe00000Rev0", "p000/file00000.go"}},
-		Observe: []w8m5Sighting{{"W8m5IgnoredSymbol", "w8m5_ignored/ignored.go"}},
-		Texts:   []string{"w8Salt00000"},
+		Symbols: []e2eMatrixSighting{{"Fn00000S0", "p000/file00000.go"}},
+		Present: []e2eMatrixSighting{{"GxProbe00000Rev1", "p000/file00000.go"}},
+		Absent:  []e2eMatrixSighting{{"GxProbe00000Rev0", "p000/file00000.go"}},
+		Observe: []e2eMatrixSighting{{"GxEditsIgnoredSymbol", "e2eMatrix_ignored/ignored.go"}},
+		Texts:   []string{"gxSalt00000"},
 	}
-	probes := w8m5ProbesFor(effect)
-	byKey := map[string]w8m5Probe{}
+	probes := e2eMatrixProbesFor(effect)
+	byKey := map[string]e2eMatrixProbe{}
 	for _, probe := range probes {
 		byKey[probe.Key] = probe
 	}
@@ -2015,12 +2015,12 @@ func TestW8m5ProbesForCoverEveryGate1Clause(t *testing.T) {
 		"summary:p000/file00000.go",
 		"usages:issue767/p000/file00000.go::Fn00000S0",
 		"source:issue767/p000/file00000.go::Fn00000S0",
-		"symbols:W8Probe00000Rev1",
-		"symbols:W8Probe00000Rev0",
+		"symbols:GxProbe00000Rev1",
+		"symbols:GxProbe00000Rev0",
 		// An observed name is projected exactly like an asserted one: the
 		// case does not judge it, the oracle still compares it.
-		"symbols:W8m5IgnoredSymbol",
-		"text:w8Salt00000",
+		"symbols:GxEditsIgnoredSymbol",
+		"text:gxSalt00000",
 	} {
 		probe, ok := byKey[want]
 		if !ok {
@@ -2031,24 +2031,24 @@ func TestW8m5ProbesForCoverEveryGate1Clause(t *testing.T) {
 		}
 	}
 	// The path is written against the <ROOT> placeholder, not against one
-	// daemon's root: w8m5Project substitutes the answering daemon's own root,
+	// daemon's root: e2eMatrixProject substitutes the answering daemon's own root,
 	// and a payload hard-wired to the other daemon's root would be answered
 	// "file_not_indexed" — a difference the harness invented rather than
 	// observed.
 	summary := byKey["summary:p000/file00000.go"]
 	path, _ := summary.Payload["path"].(string)
-	if want := w8m5RootToken + string(filepath.Separator) + filepath.FromSlash("p000/file00000.go"); path != want {
+	if want := e2eMatrixRootToken + string(filepath.Separator) + filepath.FromSlash("p000/file00000.go"); path != want {
 		t.Fatalf("the summary probe path is %q, want the placeholder form %q", path, want)
 	}
 	for _, probe := range probes {
-		rendered := w8m5Canonical(probe.Payload)
+		rendered := e2eMatrixCanonical(probe.Payload)
 		if strings.Contains(rendered, "/private/") || strings.Contains(rendered, "gx767-") {
 			t.Fatalf("probe %q carries a concrete daemon root: %s", probe.Key, rendered)
 		}
 	}
 	// Asking the same question twice would double the cost and report one
 	// difference twice.
-	if doubled := w8m5ProbesFor(effect); len(doubled) != len(probes) {
+	if doubled := e2eMatrixProbesFor(effect); len(doubled) != len(probes) {
 		t.Fatalf("probe set is not stable: %d vs %d", len(doubled), len(probes))
 	}
 	seen := map[string]bool{}
@@ -2060,9 +2060,9 @@ func TestW8m5ProbesForCoverEveryGate1Clause(t *testing.T) {
 	}
 }
 
-func TestW8m5EditCasesCoverTheDeclaredTaxonomy(t *testing.T) {
-	declared := w8m5EditCaseNames()
-	cases := w8m5EditCases()
+func TestE2EMatrixEditCasesCoverTheDeclaredTaxonomy(t *testing.T) {
+	declared := e2eMatrixEditCaseNames()
+	cases := e2eMatrixEditCases()
 	if len(cases) != len(declared) {
 		t.Fatalf("matrix 2 has %d cases, the declared taxonomy has %d", len(cases), len(declared))
 	}
@@ -2095,7 +2095,7 @@ func TestW8m5EditCasesCoverTheDeclaredTaxonomy(t *testing.T) {
 	}
 }
 
-func TestW8m5ReduceToNameKeepsTheSymbolAndDropsThePage(t *testing.T) {
+func TestE2EMatrixReduceToNameKeepsTheSymbolAndDropsThePage(t *testing.T) {
 	row := func(name, file string, line float64) map[string]any {
 		return map[string]any{"id": "issue767/" + file + "::" + name, "name": name,
 			"file_path": "issue767/" + file, "start_line": line, "visibility": "public"}
@@ -2107,24 +2107,24 @@ func TestW8m5ReduceToNameKeepsTheSymbolAndDropsThePage(t *testing.T) {
 		}
 		return map[string]any{"results": out, "total": float64(len(out)), "truncated": true}
 	}
-	wanted := row("W8Probe00006Rev0", "p002/file00006.go", 45)
+	wanted := row("GxProbe00006Rev0", "p002/file00006.go", 45)
 
 	// Two correct indexes whose ranked pages tie differently on unrelated
 	// same-shaped names must compare equal: the ranking of symbols the case
 	// never touched is not a property of the tree.
-	left := page(wanted, row("W8Probe00013Rev0", "p001/file00013.go", 44), row("W8Probe00021Rev0", "p001/file00021.go", 44))
-	right := page(row("W8Probe00000Rev0", "p000/file00000.go", 45), wanted, row("W8Probe00004Rev0", "p000/file00004.go", 45))
-	if a, b := w8m5Canonical(w8m5ReduceToName(left, "W8Probe00006Rev0")), w8m5Canonical(w8m5ReduceToName(right, "W8Probe00006Rev0")); a != b {
+	left := page(wanted, row("GxProbe00013Rev0", "p001/file00013.go", 44), row("GxProbe00021Rev0", "p001/file00021.go", 44))
+	right := page(row("GxProbe00000Rev0", "p000/file00000.go", 45), wanted, row("GxProbe00004Rev0", "p000/file00004.go", 45))
+	if a, b := e2eMatrixCanonical(e2eMatrixReduceToName(left, "GxProbe00006Rev0")), e2eMatrixCanonical(e2eMatrixReduceToName(right, "GxProbe00006Rev0")); a != b {
 		t.Fatalf("tie-break noise survived the reduction:\n%s\n%s", a, b)
 	}
 
 	// Deletion absence: a page that no longer carries the name reduces to
 	// nothing, and that is different from a page that carries it.
-	gone := page(row("W8Probe00013Rev0", "p001/file00013.go", 44))
-	if got := w8m5Canonical(w8m5ReduceToName(gone, "W8Probe00006Rev0")); got != "[]" {
+	gone := page(row("GxProbe00013Rev0", "p001/file00013.go", 44))
+	if got := e2eMatrixCanonical(e2eMatrixReduceToName(gone, "GxProbe00006Rev0")); got != "[]" {
 		t.Fatalf("a withdrawn symbol reduced to %s", got)
 	}
-	if w8m5Canonical(w8m5ReduceToName(gone, "W8Probe00006Rev0")) == w8m5Canonical(w8m5ReduceToName(left, "W8Probe00006Rev0")) {
+	if e2eMatrixCanonical(e2eMatrixReduceToName(gone, "GxProbe00006Rev0")) == e2eMatrixCanonical(e2eMatrixReduceToName(left, "GxProbe00006Rev0")) {
 		t.Fatal("present and absent reduced to the same answer; the probe would prove nothing")
 	}
 
@@ -2134,12 +2134,12 @@ func TestW8m5ReduceToNameKeepsTheSymbolAndDropsThePage(t *testing.T) {
 		name string
 		row  map[string]any
 	}{
-		{"moved to another file", row("W8Probe00006Rev0", "p002/other.go", 45)},
-		{"moved line", row("W8Probe00006Rev0", "p002/file00006.go", 61)},
+		{"moved to another file", row("GxProbe00006Rev0", "p002/other.go", 45)},
+		{"moved line", row("GxProbe00006Rev0", "p002/file00006.go", 61)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			changed := page(tc.row, row("W8Probe00013Rev0", "p001/file00013.go", 44))
-			if w8m5Canonical(w8m5ReduceToName(changed, "W8Probe00006Rev0")) == w8m5Canonical(w8m5ReduceToName(left, "W8Probe00006Rev0")) {
+			changed := page(tc.row, row("GxProbe00013Rev0", "p001/file00013.go", 44))
+			if e2eMatrixCanonical(e2eMatrixReduceToName(changed, "GxProbe00006Rev0")) == e2eMatrixCanonical(e2eMatrixReduceToName(left, "GxProbe00006Rev0")) {
 				t.Fatalf("%s was reduced away", tc.name)
 			}
 		})
@@ -2147,17 +2147,17 @@ func TestW8m5ReduceToNameKeepsTheSymbolAndDropsThePage(t *testing.T) {
 	// Two rows for the same name (a duplicate the incremental view invented)
 	// must not collapse into one.
 	duplicated := page(wanted, wanted)
-	if w8m5Canonical(w8m5ReduceToName(duplicated, "W8Probe00006Rev0")) == w8m5Canonical(w8m5ReduceToName(left, "W8Probe00006Rev0")) {
+	if e2eMatrixCanonical(e2eMatrixReduceToName(duplicated, "GxProbe00006Rev0")) == e2eMatrixCanonical(e2eMatrixReduceToName(left, "GxProbe00006Rev0")) {
 		t.Fatal("a duplicated row was reduced away")
 	}
 	// A row without an id is not a symbol row (a facet count, a suggestion).
-	if got := w8m5Canonical(w8m5ReduceToName(map[string]any{"facets": []any{map[string]any{"name": "W8Probe00006Rev0", "count": 3.0}}}, "W8Probe00006Rev0")); got != "[]" {
+	if got := e2eMatrixCanonical(e2eMatrixReduceToName(map[string]any{"facets": []any{map[string]any{"name": "GxProbe00006Rev0", "count": 3.0}}}, "GxProbe00006Rev0")); got != "[]" {
 		t.Fatalf("a non-symbol row was taken for a symbol: %s", got)
 	}
 }
 
-func TestW8m5DirtyBuildSeriesIsABuildSeries(t *testing.T) {
-	series := w8m5DirtyBuildSeries()
+func TestE2EMatrixDirtyBuildSeriesIsABuildSeries(t *testing.T) {
+	series := e2eMatrixDirtyBuildSeries()
 	if len(series) != 1 {
 		t.Fatalf("the gate-4 reuse instrument is %d series: %v", len(series), series)
 	}
@@ -2165,33 +2165,33 @@ func TestW8m5DirtyBuildSeriesIsABuildSeries(t *testing.T) {
 	for _, name := range viewmetrics.SeriesNames() {
 		declared[name] = true
 	}
-	if !declared[w8m5SeriesName(series[0])] {
+	if !declared[e2eMatrixSeriesName(series[0])] {
 		t.Fatalf("series %q is not declared in the viewmetrics catalog; the reuse claim would read a permanent zero", series[0])
 	}
 	// It has to be a series that only a BUILD moves. A reuse claim phrased
 	// against a series that also moves on reuse — or on merely serving a
 	// request — would pass no matter what the daemon did.
 	allocation := map[string]bool{}
-	for _, key := range w8m5AllocationSeries() {
+	for _, key := range e2eMatrixAllocationSeries() {
 		allocation[key] = true
 	}
 	if !allocation[series[0]] {
 		t.Fatalf("series %q is not in the allocation family, so 'it did not move' is not evidence of reuse", series[0])
 	}
-	for _, key := range w8m5ReplaySeries() {
+	for _, key := range e2eMatrixReplaySeries() {
 		if key == series[0] {
 			t.Fatalf("series %q is the replay family's own series; reuse would look like a rebuild", key)
 		}
 	}
 }
 
-func TestW8m5SymbolIDIsTheProductSpelling(t *testing.T) {
-	if got, want := w8m5SymbolID("p000/file00000.go", "Fn00000S0"), "issue767/p000/file00000.go::Fn00000S0"; got != want {
+func TestE2EMatrixSymbolIDIsTheProductSpelling(t *testing.T) {
+	if got, want := e2eMatrixSymbolID("p000/file00000.go", "Fn00000S0"), "issue767/p000/file00000.go::Fn00000S0"; got != want {
 		t.Fatalf("symbol id %q, want %q", got, want)
 	}
 }
 
-func TestW8m5CopyTreeReproducesTheServedBytes(t *testing.T) {
+func TestE2EMatrixCopyTreeReproducesTheServedBytes(t *testing.T) {
 	from, to := t.TempDir(), t.TempDir()
 	if err := os.MkdirAll(filepath.Join(from, "p000"), 0o700); err != nil {
 		t.Fatal(err)
@@ -2211,7 +2211,7 @@ func TestW8m5CopyTreeReproducesTheServedBytes(t *testing.T) {
 	if err := os.Symlink(filepath.Join("p000", "a.go"), filepath.Join(from, "link.go")); err != nil {
 		t.Skipf("this host refuses symlinks: %v", err)
 	}
-	w8m5CopyTree(t, from, to)
+	e2eMatrixCopyTree(t, from, to)
 
 	if source, err := os.ReadFile(filepath.Join(to, "p000", "a.go")); err != nil || string(source) != "package p000\n" {
 		t.Fatalf("copied content: %q %v", source, err)
@@ -2234,10 +2234,10 @@ func TestW8m5CopyTreeReproducesTheServedBytes(t *testing.T) {
 	}
 }
 
-func TestW8m5DescribeDifferenceNamesTheEntryThatDiffers(t *testing.T) {
+func TestE2EMatrixDescribeDifferenceNamesTheEntryThatDiffers(t *testing.T) {
 	left := `{"edges":[{"from":"A","kind":"calls","line":8,"to":"B"},{"from":"A","kind":"reads","line":2,"to":"C"}],"total_edges":2}`
 	right := `{"edges":[{"from":"A","kind":"calls","line":8,"to":"B"},{"from":"A","kind":"reads","line":2,"to":"C"},{"from":"A","kind":"value_flow","line":8,"to":"D"}],"total_edges":3}`
-	described := w8m5DescribeDifference(left, right)
+	described := e2eMatrixDescribeDifference(left, right)
 	if !strings.Contains(described, "value_flow") {
 		t.Fatalf("the differing edge was not named: %s", described)
 	}
@@ -2252,50 +2252,50 @@ func TestW8m5DescribeDifferenceNamesTheEntryThatDiffers(t *testing.T) {
 	}
 	// The other direction, and the "only on the incremental side" wording,
 	// which is the shape that says the incremental view GAINED something.
-	if described := w8m5DescribeDifference(right, left); !strings.Contains(described, "only in incremental") {
+	if described := e2eMatrixDescribeDifference(right, left); !strings.Contains(described, "only in incremental") {
 		t.Fatalf("the incremental-only side was not named: %s", described)
 	}
 	// A missing key, not a differing one.
-	if described := w8m5DescribeDifference(`{"a":1}`, `{"a":1,"b":2}`); !strings.Contains(described, ".b only in fresh") {
+	if described := e2eMatrixDescribeDifference(`{"a":1}`, `{"a":1,"b":2}`); !strings.Contains(described, ".b only in fresh") {
 		t.Fatalf("a key present on one side only was not named: %s", described)
 	}
 	// Equal answers describe nothing, and a non-JSON answer still renders.
-	if described := w8m5DescribeDifference(left, left); !strings.Contains(described, "compare equal") {
+	if described := e2eMatrixDescribeDifference(left, left); !strings.Contains(described, "compare equal") {
 		t.Fatalf("equal answers described as %q", described)
 	}
-	if described := w8m5DescribeDifference("call error: boom", `{"a":1}`); !strings.Contains(described, "call error: boom") {
+	if described := e2eMatrixDescribeDifference("call error: boom", `{"a":1}`); !strings.Contains(described, "call error: boom") {
 		t.Fatalf("a non-JSON answer was swallowed: %s", described)
 	}
 }
 
-func TestW8m5ListMinusIsAMultisetDifference(t *testing.T) {
+func TestE2EMatrixListMinusIsAMultisetDifference(t *testing.T) {
 	left := []any{"a", "b", "b"}
 	right := []any{"b", "c"}
-	if got := w8m5ListMinus(left, right); len(got) != 2 || got[0] != `"a"` || got[1] != `"b"` {
+	if got := e2eMatrixListMinus(left, right); len(got) != 2 || got[0] != `"a"` || got[1] != `"b"` {
 		t.Fatalf("multiset difference %v", got)
 	}
-	if got := w8m5ListMinus(right, left); len(got) != 1 || got[0] != `"c"` {
+	if got := e2eMatrixListMinus(right, left); len(got) != 1 || got[0] != `"c"` {
 		t.Fatalf("reverse multiset difference %v", got)
 	}
-	if got := w8m5ListMinus(left, left); len(got) != 0 {
+	if got := e2eMatrixListMinus(left, left); len(got) != 0 {
 		t.Fatalf("a list differed from itself: %v", got)
 	}
 }
 
-func TestW8m5SemanticMetadataGapIsNamedAndNarrow(t *testing.T) {
+func TestE2EMatrixSemanticMetadataGapIsNamedAndNarrow(t *testing.T) {
 	// The gap hides exactly three keys and nothing else: widening it would
 	// blind the gate-1 oracle to real differences.
-	gap := w8m5SemanticMetadataKeys()
+	gap := e2eMatrixSemanticMetadataKeys()
 	if len(gap) != 3 || !gap["semantic_source"] || !gap["semantic_type"] || !gap["return_type"] {
 		t.Fatalf("the known-gap key set drifted: %v", gap)
 	}
-	for key := range w8m5MergedKeys(w8m5VolatileKeys(), w8m5ProvenanceKeys()) {
+	for key := range e2eMatrixMergedKeys(e2eMatrixVolatileKeys(), e2eMatrixProvenanceKeys()) {
 		if gap[key] {
 			t.Fatalf("key %q is in two exclusion families; a reader cannot tell which rule hid it", key)
 		}
 	}
-	if strings.TrimSpace(w8m5KnownGapReason) == "" || !strings.Contains(w8m5KnownGapReason, "W6.11") {
-		t.Fatalf("the skip reason must name the ledger row that owns the gap: %q", w8m5KnownGapReason)
+	if strings.TrimSpace(e2eMatrixKnownGapReason) == "" || !strings.Contains(e2eMatrixKnownGapReason, "incremental-build route") {
+		t.Fatalf("the skip reason must name what owns the gap: %q", e2eMatrixKnownGapReason)
 	}
 
 	// A node that differs ONLY in those keys is explained by the gap; a node
@@ -2304,33 +2304,33 @@ func TestW8m5SemanticMetadataGapIsNamedAndNarrow(t *testing.T) {
 		"meta": map[string]any{"signature": "func A() int"}}}}
 	fresh := map[string]any{"nodes": []any{map[string]any{"id": "A", "start_line": 6.0,
 		"meta": map[string]any{"signature": "func A() int", "semantic_source": "go-types", "semantic_type": "func() int", "return_type": "(int)"}}}}
-	structural := w8m5MergedKeys(w8m5VolatileKeys(), w8m5ProvenanceKeys())
-	residual := w8m5MergedKeys(structural, gap)
-	if w8m5Canonical(w8m5Normalize(incremental, "", structural)) == w8m5Canonical(w8m5Normalize(fresh, "", structural)) {
+	structural := e2eMatrixMergedKeys(e2eMatrixVolatileKeys(), e2eMatrixProvenanceKeys())
+	residual := e2eMatrixMergedKeys(structural, gap)
+	if e2eMatrixCanonical(e2eMatrixNormalize(incremental, "", structural)) == e2eMatrixCanonical(e2eMatrixNormalize(fresh, "", structural)) {
 		t.Fatal("the semantic-metadata difference was already invisible to the structural comparison")
 	}
-	if w8m5Canonical(w8m5Normalize(incremental, "", residual)) != w8m5Canonical(w8m5Normalize(fresh, "", residual)) {
+	if e2eMatrixCanonical(e2eMatrixNormalize(incremental, "", residual)) != e2eMatrixCanonical(e2eMatrixNormalize(fresh, "", residual)) {
 		t.Fatal("the residual comparison did not attribute the difference to the known gap")
 	}
 	moved := map[string]any{"nodes": []any{map[string]any{"id": "A", "start_line": 7.0,
 		"meta": map[string]any{"signature": "func A() int", "semantic_source": "go-types", "semantic_type": "func() int", "return_type": "(int)"}}}}
-	if w8m5Canonical(w8m5Normalize(incremental, "", residual)) == w8m5Canonical(w8m5Normalize(moved, "", residual)) {
+	if e2eMatrixCanonical(e2eMatrixNormalize(incremental, "", residual)) == e2eMatrixCanonical(e2eMatrixNormalize(moved, "", residual)) {
 		t.Fatal("a moved location was excused by the known-gap exclusion")
 	}
 }
 
-// TestW8m5ReuseVerdictRefusesADeadInstrument pins the gate-4 decision: a
+// TestE2EMatrixReuseVerdictRefusesADeadInstrument pins the gate-4 decision: a
 // "did not move" reading is reuse only when a step that really did rebuild
 // moved the same series. The review found the shipped reading unfalsifiable —
 // no dirty build in either matrix ever moved a coordinator_cycle series, so
 // "built_dirty did not move" carried no information while the row claimed gate 4
 // confirmed.
-func TestW8m5ReuseVerdictRefusesADeadInstrument(t *testing.T) {
-	series := w8m5DirtyBuildSeries()
+func TestE2EMatrixReuseVerdictRefusesADeadInstrument(t *testing.T) {
+	series := e2eMatrixDirtyBuildSeries()
 	key := series[0]
 
 	t.Run("dead instrument is not measurable", func(t *testing.T) {
-		text, measurable, reused := w8m5ReuseVerdict("undo", map[string]int64{}, map[string]int64{}, series)
+		text, measurable, reused := e2eMatrixReuseVerdict("undo", map[string]int64{}, map[string]int64{}, series)
 		if measurable || reused {
 			t.Fatalf("a silent calibration reported measurable=%v reused=%v: %s", measurable, reused, text)
 		}
@@ -2340,7 +2340,7 @@ func TestW8m5ReuseVerdictRefusesADeadInstrument(t *testing.T) {
 	})
 
 	t.Run("live instrument that did not move is reuse", func(t *testing.T) {
-		text, measurable, reused := w8m5ReuseVerdict("undo", map[string]int64{key: 1}, map[string]int64{}, series)
+		text, measurable, reused := e2eMatrixReuseVerdict("undo", map[string]int64{key: 1}, map[string]int64{}, series)
 		if !measurable || !reused {
 			t.Fatalf("a live calibration with a still window reported measurable=%v reused=%v: %s", measurable, reused, text)
 		}
@@ -2350,7 +2350,7 @@ func TestW8m5ReuseVerdictRefusesADeadInstrument(t *testing.T) {
 	})
 
 	t.Run("live instrument that moved is a rebuild", func(t *testing.T) {
-		text, measurable, reused := w8m5ReuseVerdict("redo", map[string]int64{key: 1}, map[string]int64{key: 1}, series)
+		text, measurable, reused := e2eMatrixReuseVerdict("redo", map[string]int64{key: 1}, map[string]int64{key: 1}, series)
 		if !measurable || reused {
 			t.Fatalf("a moved window reported measurable=%v reused=%v: %s", measurable, reused, text)
 		}
@@ -2360,34 +2360,34 @@ func TestW8m5ReuseVerdictRefusesADeadInstrument(t *testing.T) {
 	})
 
 	t.Run("a calibration that moved an unrelated series is still dead", func(t *testing.T) {
-		unrelated := map[string]int64{w8m5Series(viewmetrics.FamilyInventorySeconds): 3}
-		if _, measurable, _ := w8m5ReuseVerdict("undo", unrelated, map[string]int64{}, series); measurable {
+		unrelated := map[string]int64{e2eMatrixSeries(viewmetrics.FamilyInventorySeconds): 3}
+		if _, measurable, _ := e2eMatrixReuseVerdict("undo", unrelated, map[string]int64{}, series); measurable {
 			t.Fatal("movement outside the named series was accepted as calibration")
 		}
 	})
 }
 
-// TestW8m5TrivialAnswerKnowsAnEmptyOrRefusedAnswer pins what does not count as
+// TestE2EMatrixTrivialAnswerKnowsAnEmptyOrRefusedAnswer pins what does not count as
 // evidence: an empty reduction and a transport failure recorded as the answer.
-func TestW8m5TrivialAnswerKnowsAnEmptyOrRefusedAnswer(t *testing.T) {
+func TestE2EMatrixTrivialAnswerKnowsAnEmptyOrRefusedAnswer(t *testing.T) {
 	for _, value := range []string{"", "  ", "[]", "{}", "null",
 		"call error: exit status 1: file_not_indexed", "decode error: unexpected end of JSON input",
 		"marshal error: unsupported type"} {
-		if !w8m5TrivialAnswer(value) {
+		if !e2eMatrixTrivialAnswer(value) {
 			t.Fatalf("%q was counted as evidence", value)
 		}
 	}
 	for _, value := range []string{`[{"id":"a"}]`, `{"nodes":[]}`, `{"summary":{"kind":"function"}}`} {
-		if w8m5TrivialAnswer(value) {
+		if e2eMatrixTrivialAnswer(value) {
 			t.Fatalf("%q was discarded as carrying no evidence", value)
 		}
 	}
 }
 
-// TestW8m5SubstantiveProbesCountsOnlyRealAgreement is the F8 rule: two empty
+// TestE2EMatrixSubstantiveProbesCountsOnlyRealAgreement is the agreement rule: two empty
 // answers, or two error strings, are not a probe that agreed.
-func TestW8m5SubstantiveProbesCountsOnlyRealAgreement(t *testing.T) {
-	probes := []w8m5Probe{
+func TestE2EMatrixSubstantiveProbesCountsOnlyRealAgreement(t *testing.T) {
+	probes := []e2eMatrixProbe{
 		{Key: "symbols:Gone", Clause: "resolved target + deletion absence"},
 		{Key: "summary:p000/file00000.go", Clause: "locations"},
 		{Key: "source:broken", Clause: "source bytes + span"},
@@ -2404,7 +2404,7 @@ func TestW8m5SubstantiveProbesCountsOnlyRealAgreement(t *testing.T) {
 		"summary:p000/file00000.go": `{"kind":"file"}`,
 		"source:broken":             "call error: exit status 1",
 	}
-	substantive, empty := w8m5SubstantiveProbes(incremental, fresh, probes)
+	substantive, empty := e2eMatrixSubstantiveProbes(incremental, fresh, probes)
 	if substantive != 1 {
 		t.Fatalf("substantive = %d, want 1 (only the summary)", substantive)
 	}
@@ -2413,25 +2413,25 @@ func TestW8m5SubstantiveProbesCountsOnlyRealAgreement(t *testing.T) {
 	}
 }
 
-// TestW8m5GateOneVerdictKeepsAResidualDifferenceAFailure pins matrix 2's own
+// TestE2EMatrixGateOneVerdictKeepsAResidualDifferenceAFailure pins matrix 2's own
 // decision. The review's mutation — turning the residual arm into a skip — must
 // turn this red.
-func TestW8m5GateOneVerdictKeepsAResidualDifferenceAFailure(t *testing.T) {
-	gap := []w8m5Difference{{Probe: "summary:p000/file00000.go", Clause: "metadata",
+func TestE2EMatrixGateOneVerdictKeepsAResidualDifferenceAFailure(t *testing.T) {
+	gap := []e2eMatrixDifference{{Probe: "summary:p000/file00000.go", Clause: "metadata",
 		Incremental: `{"meta":{}}`, Fresh: `{"meta":{"semantic_source":"go-types"}}`}}
-	residual := []w8m5Difference{{Probe: "usages:x", Clause: "incoming edges",
+	residual := []e2eMatrixDifference{{Probe: "usages:x", Clause: "incoming edges",
 		Incremental: `{"edges":[]}`, Fresh: `{"edges":[{"from":"y"}]}`}}
 
 	t.Run("no projection", func(t *testing.T) {
-		got := w8m5GateOneVerdict(w8m5OracleInput{Probes: 0})
-		if got.Status != w8m5StatusFail || !strings.Contains(strings.Join(got.Failures, " "), "no projection") {
+		got := e2eMatrixGateOneVerdict(e2eMatrixOracleInput{Probes: 0})
+		if got.Status != e2eMatrixStatusFail || !strings.Contains(strings.Join(got.Failures, " "), "no projection") {
 			t.Fatalf("verdict = %+v, want a FAIL naming the missing projection", got)
 		}
 	})
 
 	t.Run("nothing substantive", func(t *testing.T) {
-		got := w8m5GateOneVerdict(w8m5OracleInput{Probes: 2, Substantive: 0, Empty: []string{"symbols:Gone", "source:broken"}})
-		if got.Status != w8m5StatusFail {
+		got := e2eMatrixGateOneVerdict(e2eMatrixOracleInput{Probes: 2, Substantive: 0, Empty: []string{"symbols:Gone", "source:broken"}})
+		if got.Status != e2eMatrixStatusFail {
 			t.Fatalf("a comparison of two empty answers = %s, want FAIL: %+v", got.Status, got)
 		}
 		if !strings.Contains(strings.Join(got.Failures, " "), "agree for free") {
@@ -2440,8 +2440,8 @@ func TestW8m5GateOneVerdictKeepsAResidualDifferenceAFailure(t *testing.T) {
 	})
 
 	t.Run("equal", func(t *testing.T) {
-		got := w8m5GateOneVerdict(w8m5OracleInput{Probes: 4, Substantive: 3, Empty: []string{"symbols:Gone"}})
-		if got.Status != w8m5StatusPass {
+		got := e2eMatrixGateOneVerdict(e2eMatrixOracleInput{Probes: 4, Substantive: 3, Empty: []string{"symbols:Gone"}})
+		if got.Status != e2eMatrixStatusPass {
 			t.Fatalf("verdict = %+v, want PASS", got)
 		}
 		if !strings.Contains(strings.Join(got.Recorded, " "), "3 substantive") {
@@ -2450,15 +2450,15 @@ func TestW8m5GateOneVerdictKeepsAResidualDifferenceAFailure(t *testing.T) {
 	})
 
 	t.Run("only the named gap is a named skip", func(t *testing.T) {
-		got := w8m5GateOneVerdict(w8m5OracleInput{Probes: 4, Substantive: 3, Differences: gap})
-		if got.Status != w8m5StatusSkip {
+		got := e2eMatrixGateOneVerdict(e2eMatrixOracleInput{Probes: 4, Substantive: 3, Differences: gap})
+		if got.Status != e2eMatrixStatusSkip {
 			t.Fatalf("verdict = %+v, want SKIP", got)
 		}
 		joined := strings.Join(got.Recorded, " ")
-		if !strings.Contains(joined, "W6.1b") {
-			t.Fatalf("the skip did not name the ledger row that owns the gap: %s", joined)
+		if !strings.Contains(joined, "incremental-build route") {
+			t.Fatalf("the skip did not name what owns the gap: %s", joined)
 		}
-		for _, wrong := range []string{"ledger rows W3.2 + W3.7"} {
+		for _, wrong := range []string{"Owner: the blame/coverage input channel"} {
 			if strings.Contains(joined, wrong) {
 				t.Fatalf("the skip still cites a row that does not own the gap (%q): %s", wrong, joined)
 			}
@@ -2466,10 +2466,10 @@ func TestW8m5GateOneVerdictKeepsAResidualDifferenceAFailure(t *testing.T) {
 	})
 
 	t.Run("a residual difference is a failure", func(t *testing.T) {
-		got := w8m5GateOneVerdict(w8m5OracleInput{Probes: 4, Substantive: 3,
-			Differences: append(append([]w8m5Difference{}, gap...), residual...),
-			Residual:    residual, Attempts: w8m5OracleAttempts, Backoff: time.Minute})
-		if got.Status != w8m5StatusFail {
+		got := e2eMatrixGateOneVerdict(e2eMatrixOracleInput{Probes: 4, Substantive: 3,
+			Differences: append(append([]e2eMatrixDifference{}, gap...), residual...),
+			Residual:    residual, Attempts: e2eMatrixOracleAttempts, Backoff: time.Minute})
+		if got.Status != e2eMatrixStatusFail {
 			t.Fatalf("a difference beyond the named gap = %s, want FAIL: %+v", got.Status, got)
 		}
 		joined := strings.Join(got.Failures, " ")
@@ -2479,80 +2479,81 @@ func TestW8m5GateOneVerdictKeepsAResidualDifferenceAFailure(t *testing.T) {
 	})
 }
 
-// TestW8m5KnownGapReasonNamesTheRowThatOwnsIt pins the attribution the review
-// found contradicted by the ledger: W3.2 and W6.11 are `wired` and do not own
-// this gap; W6.1b's declared limitation (2) does.
-func TestW8m5KnownGapReasonNamesTheRowThatOwnsIt(t *testing.T) {
-	if !strings.Contains(w8m5KnownGapReason, "W6.1b") {
-		t.Fatalf("the skip reason does not name the owning ledger row: %s", w8m5KnownGapReason)
+// TestE2EMatrixKnownGapReasonNamesTheRowThatOwnsIt pins the attribution the review
+// found contradicted by the ledger: the semantic-enrichment pass and the
+// enrichment census are `wired` and do not own this gap; the in-memory
+// incremental-build route's declared limitation does.
+func TestE2EMatrixKnownGapReasonNamesTheRowThatOwnsIt(t *testing.T) {
+	if !strings.Contains(e2eMatrixKnownGapReason, "incremental-build route") {
+		t.Fatalf("the skip reason does not name what owns the gap: %s", e2eMatrixKnownGapReason)
 	}
-	if !strings.Contains(w8m5KnownGapReason, "not the closure") {
-		t.Fatalf("the skip reason does not quote the limitation it rests on: %s", w8m5KnownGapReason)
+	if !strings.Contains(e2eMatrixKnownGapReason, "not the closure") {
+		t.Fatalf("the skip reason does not quote the limitation it rests on: %s", e2eMatrixKnownGapReason)
 	}
-	if !strings.Contains(w8m5KnownGapReason, "do NOT own this") {
-		t.Fatalf("the skip reason does not retract the rows that do not own the gap: %s", w8m5KnownGapReason)
+	if !strings.Contains(e2eMatrixKnownGapReason, "do NOT own this") {
+		t.Fatalf("the skip reason does not retract the rows that do not own the gap: %s", e2eMatrixKnownGapReason)
 	}
 }
 
-// TestW8m5EditCasesDeclareAComparableProjection pins that every case projects
+// TestE2EMatrixEditCasesDeclareAComparableProjection pins that every case projects
 // something a fresh index can be compared against — the precondition
-// w8m5GateOneVerdict refuses at run time.
-func TestW8m5EditCasesDeclareAComparableProjection(t *testing.T) {
+// e2eMatrixGateOneVerdict refuses at run time.
+func TestE2EMatrixEditCasesDeclareAComparableProjection(t *testing.T) {
 	// An absence-only effect — the shape file_deleted had when the review
 	// found it resting on two empty row lists — can only produce probes that
-	// reduce to nothing on both sides. w8m5GateOneVerdict refuses such a
-	// comparison at run time (TestW8m5GateOneVerdictKeepsAResidualDifferenceAFailure
+	// reduce to nothing on both sides. e2eMatrixGateOneVerdict refuses such a
+	// comparison at run time (TestE2EMatrixGateOneVerdictKeepsAResidualDifferenceAFailure
 	// /nothing_substantive); this pins that the projection really is that thin,
 	// so the refusal is the only thing standing between it and a free PASS.
-	deleted := w8m5Effect{Absent: []w8m5Sighting{{"Gone", "p002/gone.go"}}}
-	if probes := w8m5ProbesFor(deleted); len(probes) != 1 {
+	deleted := e2eMatrixEffect{Absent: []e2eMatrixSighting{{"Gone", "p002/gone.go"}}}
+	if probes := e2eMatrixProbesFor(deleted); len(probes) != 1 {
 		t.Fatalf("an absence-only effect produced %d probes, want 1", len(probes))
 	}
-	withControl := w8m5Effect{
+	withControl := e2eMatrixEffect{
 		Files:   []string{"p000/file00000.go"},
-		Symbols: []w8m5Sighting{{"Fn00000S0", "p000/file00000.go"}},
-		Absent:  []w8m5Sighting{{"Gone", "p002/gone.go"}},
+		Symbols: []e2eMatrixSighting{{"Fn00000S0", "p000/file00000.go"}},
+		Absent:  []e2eMatrixSighting{{"Gone", "p002/gone.go"}},
 	}
-	if probes := w8m5ProbesFor(withControl); len(probes) < 4 {
+	if probes := e2eMatrixProbesFor(withControl); len(probes) < 4 {
 		t.Fatalf("an effect with a control produced %d probes, want at least 4", len(probes))
 	}
 }
 
-// TestW8m5FileDowngradesAnUnmeasurableClaim pins that a case which asked for a
+// TestE2EMatrixFileDowngradesAnUnmeasurableClaim pins that a case which asked for a
 // claim this instrument cannot carry never files a PASS: the row becomes a
 // named SKIP saying which claim could not be scored.
-func TestW8m5FileDowngradesAnUnmeasurableClaim(t *testing.T) {
-	table := w8m5NewTable(t, "w8m5_file_rule")
-	h := &w8m5EditHarness{t: t, table: table}
+func TestE2EMatrixFileDowngradesAnUnmeasurableClaim(t *testing.T) {
+	table := e2eMatrixNewTable(t, "e2eMatrix_file_rule")
+	h := &e2eMatrixEditHarness{t: t, table: table}
 
 	h.unmeasurable = nil
-	h.file(w8m5Row{Case: "measurable", Gate: "gate4", Status: w8m5StatusPass, Detail: "reused"})
+	h.file(e2eMatrixRow{Case: "measurable", Gate: "gate4", Status: e2eMatrixStatusPass, Detail: "reused"})
 
 	h.unmeasurable = []string{"undo: NOT MEASURABLE — a step that really did rebuild moved none of [views_coordinator_cycle_total{outcome=built_dirty}]"}
-	h.file(w8m5Row{Case: "unmeasurable", Gate: "gate4", Status: w8m5StatusPass, Detail: "reused"})
-	h.file(w8m5Row{Case: "already failing", Gate: "gate4", Status: w8m5StatusFail, Detail: "gate1: differs"})
+	h.file(e2eMatrixRow{Case: "unmeasurable", Gate: "gate4", Status: e2eMatrixStatusPass, Detail: "reused"})
+	h.file(e2eMatrixRow{Case: "already failing", Gate: "gate4", Status: e2eMatrixStatusFail, Detail: "gate1: differs"})
 
 	if len(table.rows) != 3 {
 		t.Fatalf("filed %d rows, want 3", len(table.rows))
 	}
-	if table.rows[0].Status != w8m5StatusPass {
+	if table.rows[0].Status != e2eMatrixStatusPass {
 		t.Fatalf("a measurable PASS was downgraded: %+v", table.rows[0])
 	}
-	if table.rows[1].Status != w8m5StatusSkip {
+	if table.rows[1].Status != e2eMatrixStatusSkip {
 		t.Fatalf("an unmeasurable claim still filed %s: %+v", table.rows[1].Status, table.rows[1])
 	}
 	if !strings.Contains(table.rows[1].Detail, "NOT MEASURABLE") {
 		t.Fatalf("the skip did not say which claim could not be scored: %+v", table.rows[1])
 	}
-	if table.rows[2].Status != w8m5StatusFail {
+	if table.rows[2].Status != e2eMatrixStatusFail {
 		t.Fatalf("an unmeasurable claim upgraded a FAIL to %s: %+v", table.rows[2].Status, table.rows[2])
 	}
-	if problems := w8m5TableProblems(table.rows); len(problems) != 0 {
+	if problems := e2eMatrixTableProblems(table.rows); len(problems) != 0 {
 		t.Fatalf("the filed rows are not reportable: %v", problems)
 	}
 }
 
-// TestW8m5CommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily pins
+// TestE2EMatrixCommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily pins
 // the vocabulary the unchanged-content row's live clause reads.
 //
 // A key that is not in the viewmetrics catalog reads zero forever, which would
@@ -2560,22 +2561,22 @@ func TestW8m5FileDowngradesAnUnmeasurableClaim(t *testing.T) {
 // can only fail. And a series shared with the allocation family would make the
 // same counter both "the daemon saw the commit" and "the daemon built": the
 // row would then contradict itself on a family that really does publish.
-func TestW8m5CommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily(t *testing.T) {
+func TestE2EMatrixCommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily(t *testing.T) {
 	declared := map[string]bool{}
 	for _, name := range viewmetrics.SeriesNames() {
 		declared[name] = true
 	}
-	observation := w8m5CommitObservationSeries()
+	observation := e2eMatrixCommitObservationSeries()
 	if len(observation) < 5 {
 		t.Fatalf("the commit-observation vocabulary shrank to %d series: %v", len(observation), observation)
 	}
 	build := map[string]bool{}
-	for _, key := range w8m5AllocationSeries() {
+	for _, key := range e2eMatrixAllocationSeries() {
 		build[key] = true
 	}
 	seen := map[string]bool{}
 	for _, key := range observation {
-		if !declared[w8m5SeriesName(key)] {
+		if !declared[e2eMatrixSeriesName(key)] {
 			t.Fatalf("series %q is not declared in the viewmetrics catalog; the clause would silently read zero", key)
 		}
 		if strings.Contains(key, "{") && !strings.HasSuffix(key, "}") {
@@ -2592,12 +2593,12 @@ func TestW8m5CommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily(t *
 	// The declined publication is the whole point: it is the outcome the
 	// consumer gate records, and it is the evidence that the daemon settled
 	// the commit without writing anything.
-	if !seen[w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)] {
+	if !seen[e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)] {
 		t.Fatalf("the declined-publication outcome is not in the observation family: %v", observation)
 	}
 }
 
-// TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration is the
+// TestE2EMatrixUnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration is the
 // unchanged-content row's regression.
 //
 // Before the consumer gate, a committed change published a base and an
@@ -2607,7 +2608,7 @@ func TestW8m5CommitObservationSeriesAreDeclaredAndDisjointFromTheBuildFamily(t *
 // exactly what the branch promises. Each clause now states which calibration
 // it rests on, and a clause with no calibration is recorded or reported as
 // unmeasurable rather than scored.
-func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testing.T) {
+func TestE2EMatrixUnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testing.T) {
 	observed := func(values ...string) map[string]int64 {
 		delta := map[string]int64{}
 		for _, key := range values {
@@ -2615,18 +2616,18 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 		}
 		return delta
 	}
-	dispatched := w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
-	skipped := w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
-	built := w8m5Series(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseBuilt)
-	published := w8m5Series(viewmetrics.GenerationPublishedTotal, "owner="+viewmetrics.OwnerCheckout)
-	reused := w8m5Series(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseReused)
+	dispatched := e2eMatrixSeries(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
+	skipped := e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
+	built := e2eMatrixSeries(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseBuilt)
+	published := e2eMatrixSeries(viewmetrics.GenerationPublishedTotal, "owner="+viewmetrics.OwnerCheckout)
+	reused := e2eMatrixSeries(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseReused)
 	join := func(values []string) string { return strings.Join(values, " ;; ") }
 
 	// (1) The shape the consumer gate produces: a real content commit was
 	// observed and settled without building, and so was the empty one. The
 	// observation clause carries the row; the build and allocation clauses say
 	// out loud that they were not asserted.
-	failures, recorded, cannot := w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, recorded, cannot := e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        observed(dispatched, skipped),
 		Window:             observed(dispatched, skipped),
@@ -2642,7 +2643,7 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 
 	// (2) The clause that keeps (1) from being vacuous: a commit the daemon
 	// never reacted to fails, and the failure names what a real commit moved.
-	failures, _, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, _, cannot = e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        observed(dispatched, skipped),
 		Window:             map[string]int64{},
@@ -2657,7 +2658,7 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 	// (3) A fixture where even a real content commit moved nothing at all is
 	// NOT MEASURABLE, never a pass: the row says which claim it could not
 	// score instead of claiming a confirmation.
-	failures, _, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, _, cannot = e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        map[string]int64{},
 		Window:             map[string]int64{},
@@ -2673,7 +2674,7 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 	// a real content commit builds, so the unchanged-content commit must show
 	// the claim/replay family and must not build or allocate.
 	calibration := observed(dispatched, built, published)
-	failures, recorded, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, recorded, cannot = e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        calibration, CalibrationSeq: 1,
 		Window: observed(dispatched, reused), WindowSeq: 0,
@@ -2685,7 +2686,7 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 		t.Fatalf("the reuse was not recorded: %s", join(recorded))
 	}
 
-	failures, _, _ = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, _, _ = e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        calibration, CalibrationSeq: 1,
 		Window: observed(dispatched), WindowSeq: 0,
@@ -2694,7 +2695,7 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 		t.Fatalf("a publishing family that reported no reuse was not failed: %v", failures)
 	}
 
-	failures, _, _ = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, _, _ = e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        calibration, CalibrationSeq: 1,
 		Window: observed(dispatched, built), WindowSeq: 0,
@@ -2703,7 +2704,7 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 		t.Fatalf("an unchanged-content commit that rebuilt was not failed: %v", failures)
 	}
 
-	failures, _, _ = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, _, _ = e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        calibration, CalibrationSeq: 1,
 		Window: observed(dispatched, reused), WindowSeq: 1,
@@ -2714,18 +2715,18 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 
 	// (5) Unreadable calibration counters are a named skip, never a pass and
 	// never a fabricated zero.
-	failures, recorded, cannot = w8m5UnchangedCommitVerdict(w8m5UnchangedCommitInput{
+	failures, recorded, cannot = e2eMatrixUnchangedCommitVerdict(e2eMatrixUnchangedCommitInput{
 		CalibrationErr: "daemon status --format json unavailable",
 	})
 	if len(failures) != 0 || len(recorded) != 0 || len(cannot) != 1 {
 		t.Fatalf("an unreadable calibration was not a single named skip: %v %v %v", failures, recorded, cannot)
 	}
-	if !strings.Contains(cannot[0], "W8.3") {
-		t.Fatalf("the skip did not point at the ledger row that emits the counters: %s", cannot[0])
+	if !strings.Contains(cannot[0], "views counter block") {
+		t.Fatalf("the skip did not point at what emits the counters: %s", cannot[0])
 	}
 }
 
-// TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration is the
+// TestE2EMatrixUnchangedCommitVerdictScoresAViolationWithoutACalibration is the
 // pin on the clause ORDER, which is the whole strength of gate 2 on this row.
 //
 // The BUILD and ALLOCATION clauses are negative claims: an unchanged-content
@@ -2736,7 +2737,7 @@ func TestW8m5UnchangedCommitVerdictGatesEveryClauseOnItsOwnCalibration(t *testin
 // assertion at all: on the fixture this matrix actually runs, whose calibration
 // allocates nothing (the consumer gate, dedicated_base_startup.go:774-779),
 // every allocating daemon would be scored PASS.
-func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testing.T) {
+func TestE2EMatrixUnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testing.T) {
 	observed := func(values ...string) map[string]int64 {
 		delta := map[string]int64{}
 		for _, key := range values {
@@ -2744,14 +2745,14 @@ func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testin
 		}
 		return delta
 	}
-	dispatched := w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
-	skipped := w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
-	built := w8m5Series(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseBuilt)
+	dispatched := e2eMatrixSeries(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
+	skipped := e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
+	built := e2eMatrixSeries(viewmetrics.DedicatedBaseClaimTotal, "outcome="+viewmetrics.DedicatedBaseBuilt)
 	join := func(values []string) string { return strings.Join(values, " ;; ") }
 
 	// The fixture matrix 2 actually runs: a real content commit is observed
 	// and declined, builds nothing and allocates nothing.
-	consumerGated := w8m5UnchangedCommitInput{
+	consumerGated := e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        observed(dispatched, skipped),
 		CalibrationSeq:     0,
@@ -2761,7 +2762,7 @@ func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testin
 	// calibration allocated nothing.
 	in := consumerGated
 	in.Window, in.WindowSeq = observed(dispatched, skipped), 1
-	failures, _, cannot := w8m5UnchangedCommitVerdict(in)
+	failures, _, cannot := e2eMatrixUnchangedCommitVerdict(in)
 	if len(cannot) != 0 {
 		t.Fatalf("a scorable violation was reported as unmeasurable: %v", cannot)
 	}
@@ -2776,7 +2777,7 @@ func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testin
 	// built nothing.
 	in = consumerGated
 	in.Window, in.WindowSeq = observed(dispatched, built), 0
-	failures, _, cannot = w8m5UnchangedCommitVerdict(in)
+	failures, _, cannot = e2eMatrixUnchangedCommitVerdict(in)
 	if len(cannot) != 0 {
 		t.Fatalf("a scorable violation was reported as unmeasurable: %v", cannot)
 	}
@@ -2786,14 +2787,14 @@ func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testin
 
 	// (3) A calibration commit that carried no content voids every clause that
 	// rests on it — but NOT the violations, which still fail.
-	void := w8m5UnchangedCommitInput{
+	void := e2eMatrixUnchangedCommitInput{
 		CalibrationContent: false,
 		Calibration:        observed(dispatched, built),
 		CalibrationSeq:     1,
 		Window:             observed(dispatched, built),
 		WindowSeq:          1,
 	}
-	failures, _, cannot = w8m5UnchangedCommitVerdict(void)
+	failures, _, cannot = e2eMatrixUnchangedCommitVerdict(void)
 	if len(failures) != 2 {
 		t.Fatalf("a void calibration suppressed the violations: %v", failures)
 	}
@@ -2804,7 +2805,7 @@ func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testin
 	// (4) …and with no violation, a void calibration scores nothing as a pass:
 	// both negative clauses say out loud that they were not asserted.
 	void.Window, void.WindowSeq = observed(dispatched, skipped), 0
-	failures, recorded, cannot := w8m5UnchangedCommitVerdict(void)
+	failures, recorded, cannot := e2eMatrixUnchangedCommitVerdict(void)
 	if len(failures) != 0 {
 		t.Fatalf("a void calibration failed a clean daemon: %v", failures)
 	}
@@ -2818,13 +2819,13 @@ func TestW8m5UnchangedCommitVerdictScoresAViolationWithoutACalibration(t *testin
 	}
 }
 
-// TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList pins the hand-off from the
+// TestE2EMatrixScoreUnchangedCommitRoutesEveryVerdictList pins the hand-off from the
 // verdict to the row: failures mark the row FAILED (and come back for the
 // caller to report), scored clauses ride on the detail, and a clause the
 // fixture cannot score reaches h.unmeasurable — the list file() reads to
 // downgrade a would-be PASS to a named SKIP. Dropping any one of the three
 // turns a real finding into a green row.
-func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
+func TestE2EMatrixScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 	observed := func(values ...string) map[string]int64 {
 		delta := map[string]int64{}
 		for _, key := range values {
@@ -2832,17 +2833,17 @@ func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 		}
 		return delta
 	}
-	dispatched := w8m5Series(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
-	skipped := w8m5Series(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
+	dispatched := e2eMatrixSeries(viewmetrics.DedicatedBaseAdvanceTotal, "outcome="+viewmetrics.AdvanceDispatched)
+	skipped := e2eMatrixSeries(viewmetrics.DedicatedBasePublicationTotal, "outcome="+viewmetrics.PublicationSkipped)
 
 	// (1) A violation: the row is FAILED, the detail carries the reason and
 	// the measured counters, and the failure comes back to the caller.
-	table := w8m5NewTable(t, "w8m5_score_routing")
-	h := &w8m5EditHarness{t: t, table: table}
-	row := w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
+	table := e2eMatrixNewTable(t, "e2eMatrix_score_routing")
+	h := &e2eMatrixEditHarness{t: t, table: table}
+	row := e2eMatrixRow{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: e2eMatrixStatusPass}
 	delta := observed(dispatched, skipped)
-	delta[w8m5Series(viewmetrics.GenerationPublishedTotal, "owner="+viewmetrics.OwnerCheckout)] = 1
-	failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+	delta[e2eMatrixSeries(viewmetrics.GenerationPublishedTotal, "owner="+viewmetrics.OwnerCheckout)] = 1
+	failures := h.scoreUnchangedCommit(&row, e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        observed(dispatched, skipped),
 		Window:             delta,
@@ -2851,7 +2852,7 @@ func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 	if len(failures) == 0 {
 		t.Fatalf("a violating window returned no failure to report")
 	}
-	if row.Status != w8m5StatusFail {
+	if row.Status != e2eMatrixStatusFail {
 		t.Fatalf("a violating window left the row %s: %+v", row.Status, row)
 	}
 	for _, want := range []string{"built or published", "allocated a generation", "counters: "} {
@@ -2865,10 +2866,10 @@ func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 
 	// (2) A clean, calibrated window: the row stays a PASS and the scored
 	// clauses ride on the detail.
-	h = &w8m5EditHarness{t: t, table: table}
-	row = w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
+	h = &e2eMatrixEditHarness{t: t, table: table}
+	row = e2eMatrixRow{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: e2eMatrixStatusPass}
 	window := observed(dispatched, skipped)
-	if failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+	if failures := h.scoreUnchangedCommit(&row, e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        observed(dispatched, skipped),
 		Window:             window,
@@ -2876,7 +2877,7 @@ func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 		t.Fatalf("a clean window was failed: %v", failures)
 	}
 	h.file(row)
-	if table.rows[len(table.rows)-1].Status != w8m5StatusPass {
+	if table.rows[len(table.rows)-1].Status != e2eMatrixStatusPass {
 		t.Fatalf("a clean, calibrated window filed %s: %+v", table.rows[len(table.rows)-1].Status, table.rows[len(table.rows)-1])
 	}
 	if !strings.Contains(row.Detail, "observed and settled") {
@@ -2886,9 +2887,9 @@ func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 	// (3) An unscorable clause reaches h.unmeasurable, and file() turns the
 	// would-be PASS into a named SKIP. This is the routing whose deletion
 	// would publish a meaningless confirmation as a pass.
-	h = &w8m5EditHarness{t: t, table: table}
-	row = w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
-	if failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+	h = &e2eMatrixEditHarness{t: t, table: table}
+	row = e2eMatrixRow{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: e2eMatrixStatusPass}
+	if failures := h.scoreUnchangedCommit(&row, e2eMatrixUnchangedCommitInput{
 		CalibrationContent: true,
 		Calibration:        map[string]int64{},
 		Window:             map[string]int64{},
@@ -2900,7 +2901,7 @@ func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 	}
 	h.file(row)
 	filed := table.rows[len(table.rows)-1]
-	if filed.Status != w8m5StatusSkip {
+	if filed.Status != e2eMatrixStatusSkip {
 		t.Fatalf("an unscorable clause filed %s instead of a named SKIP: %+v", filed.Status, filed)
 	}
 	if !strings.Contains(filed.Detail, "NOT MEASURABLE") || !strings.Contains(filed.Detail, "cannot tell") {
@@ -2908,17 +2909,17 @@ func TestW8m5ScoreUnchangedCommitRoutesEveryVerdictList(t *testing.T) {
 	}
 
 	// (4) An unreadable calibration is a single named skip, routed the same way.
-	h = &w8m5EditHarness{t: t, table: table}
-	row = w8m5Row{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: w8m5StatusPass}
-	if failures := h.scoreUnchangedCommit(&row, w8m5UnchangedCommitInput{
+	h = &e2eMatrixEditHarness{t: t, table: table}
+	row = e2eMatrixRow{Case: "commit_unchanged_content", Gate: "gate2+gate4", Status: e2eMatrixStatusPass}
+	if failures := h.scoreUnchangedCommit(&row, e2eMatrixUnchangedCommitInput{
 		CalibrationErr: "daemon status --format json unavailable",
 	}, nil); len(failures) != 0 {
 		t.Fatalf("an unreadable calibration failed the daemon: %v", failures)
 	}
-	if len(h.unmeasurable) != 1 || !strings.Contains(h.unmeasurable[0], "W8.3") {
+	if len(h.unmeasurable) != 1 || !strings.Contains(h.unmeasurable[0], "views counter block") {
 		t.Fatalf("an unreadable calibration was not a single named skip: %v", h.unmeasurable)
 	}
-	if problems := w8m5TableProblems(table.rows); len(problems) != 0 {
+	if problems := e2eMatrixTableProblems(table.rows); len(problems) != 0 {
 		t.Fatalf("the filed rows are not reportable: %v", problems)
 	}
 }

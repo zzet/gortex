@@ -12,20 +12,20 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 )
 
-// W8.10 — matrix 7 of the isolated end-to-end matrix (handoff §8, seventh
+// Matrix 7 of the isolated end-to-end matrix (handoff §8, seventh
 // bullet): adversarial fan-out, cycles and pathless identities, bounded
 // physical candidate work, chain maintenance and old-route retention, and
 // cross-surface coherence.
 //
 // The scaffolding (rows, gates, outcome table, private-daemon environment and
-// every pure verdict) lives in w8_matrix_lifecycle_test.go; this file is the
-// rows. The same three rules hold: opt-in behind GXW8_MATRIX_BINARY, private
+// every pure verdict) lives in e2e_matrix_lifecycle_test.go; this file is the
+// rows. The same three rules hold: opt-in behind GX_E2E_MATRIX_BINARY, private
 // daemon and private store, and every assertion names the acceptance gate it
 // serves.
 
 // The matrix-7 bullets, from the coordinator's brief. Every one is claimed by
-// exactly one row below; w8lcValidateRows enforces that before anything runs.
-var w8advMatrix7Bullets = []string{
+// exactly one row below; e2eLifecycleValidateRows enforces that before anything runs.
+var e2eAdversarialMatrix7Bullets = []string{
 	"adversarial high fan-out",
 	"cycles and pathless identities",
 	"bounded physical candidate work: typed limit and completeness fact",
@@ -33,55 +33,55 @@ var w8advMatrix7Bullets = []string{
 	"source, graph, text, health/stats and caches coherent",
 }
 
-// TestW8Matrix7Adversarial is the opt-in run.
-func TestW8Matrix7Adversarial(t *testing.T) {
-	binary := w8lcRequireBinary(t)
-	w8lcRunMatrix(t, "matrix7_adversarial", w8advMatrix7Rows(binary), w8advMatrix7Bullets, w8lcArtifactDir(t))
+// TestE2EMatrix7Adversarial is the opt-in run.
+func TestE2EMatrix7Adversarial(t *testing.T) {
+	binary := e2eLifecycleRequireBinary(t)
+	e2eLifecycleRunMatrix(t, "matrix7_adversarial", e2eAdversarialMatrix7Rows(binary), e2eAdversarialMatrix7Bullets, e2eLifecycleArtifactDir(t))
 }
 
-func w8advMatrix7Rows(binary string) []w8lcRow {
-	return []w8lcRow{
+func e2eAdversarialMatrix7Rows(binary string) []e2eLifecycleRow {
+	return []e2eLifecycleRow{
 		{
 			Name:   "high_fanout",
 			Bullet: "adversarial high fan-out",
-			Gates:  []string{w8lcGateAdvance, w8lcGateBounded, w8lcGateSnapshot},
-			Run:    func(t *testing.T, rec *w8lcRecorder) { w8advRowHighFanout(t, rec, binary) },
+			Gates:  []string{e2eLifecycleGateAdvance, e2eLifecycleGateBounded, e2eLifecycleGateSnapshot},
+			Run:    func(t *testing.T, rec *e2eLifecycleRecorder) { e2eAdversarialRowHighFanout(t, rec, binary) },
 		},
 		{
 			Name:   "cycles_and_pathless_identities",
 			Bullet: "cycles and pathless identities",
-			Gates:  []string{w8lcGateSnapshot, w8lcGateBounded},
-			Run:    func(t *testing.T, rec *w8lcRecorder) { w8advRowCyclesAndPathless(t, rec, binary) },
+			Gates:  []string{e2eLifecycleGateSnapshot, e2eLifecycleGateBounded},
+			Run:    func(t *testing.T, rec *e2eLifecycleRecorder) { e2eAdversarialRowCyclesAndPathless(t, rec, binary) },
 		},
 		{
 			Name:   "bounded_candidate_work",
 			Bullet: "bounded physical candidate work: typed limit and completeness fact",
-			Gates:  []string{w8lcGateBounded, w8lcGateSnapshot},
-			Run:    func(t *testing.T, rec *w8lcRecorder) { w8advRowBoundedCandidateWork(t, rec, binary) },
+			Gates:  []string{e2eLifecycleGateBounded, e2eLifecycleGateSnapshot},
+			Run:    func(t *testing.T, rec *e2eLifecycleRecorder) { e2eAdversarialRowBoundedCandidateWork(t, rec, binary) },
 		},
 		{
 			Name:   "chain_maintenance_and_old_routes",
 			Bullet: "chain maintenance, depth bound and old-route retention",
-			Gates:  []string{w8lcGateBounded, w8lcGateAdvance},
-			Run:    func(t *testing.T, rec *w8lcRecorder) { w8advRowChainMaintenance(t, rec, binary) },
+			Gates:  []string{e2eLifecycleGateBounded, e2eLifecycleGateAdvance},
+			Run:    func(t *testing.T, rec *e2eLifecycleRecorder) { e2eAdversarialRowChainMaintenance(t, rec, binary) },
 		},
 		{
 			Name:   "cross_surface_coherence",
 			Bullet: "source, graph, text, health/stats and caches coherent",
-			Gates:  []string{w8lcGateSnapshot, w8lcGateEvidence},
-			Run:    func(t *testing.T, rec *w8lcRecorder) { w8advRowCrossSurfaceCoherence(t, rec, binary) },
+			Gates:  []string{e2eLifecycleGateSnapshot, e2eLifecycleGateEvidence},
+			Run:    func(t *testing.T, rec *e2eLifecycleRecorder) { e2eAdversarialRowCrossSurfaceCoherence(t, rec, binary) },
 		},
 	}
 }
 
-// w8advFanout is how many dependent checkouts the fan-out row creates. The
+// e2eAdversarialFanout is how many dependent checkouts the fan-out row creates. The
 // brief's own workload is ten dependents (gate 5); this row is the adversarial
 // neighbour of it, so it uses the same order of magnitude and asks a harder
 // question of each: not only "did every dependent update" but "did anything
 // from main leak into one".
-const w8advFanout = 10
+const e2eAdversarialFanout = 10
 
-// w8advRowHighFanout advances main under a wide fan of discovered checkouts.
+// e2eAdversarialRowHighFanout advances main under a wide fan of discovered checkouts.
 //
 // Two facts are asserted, and they pull in opposite directions, which is why
 // both are here. Every dependent has to stay correct — it answers exactly for
@@ -90,14 +90,14 @@ const w8advFanout = 10
 // second is the isolation half: a fan-out implementation that recomposed
 // dependents by splicing main's new base under them would pass the first and
 // fail this one.
-func w8advRowHighFanout(t *testing.T, rec *w8lcRecorder, binary string) {
-	e := w8lcNewEnv(t, binary, w8lcSmallSpec(8111), "")
+func e2eAdversarialRowHighFanout(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
+	e := e2eLifecycleNewEnv(t, binary, e2eLifecycleSmallSpec(8111), "")
 	e.start()
 
-	dependents := make([]string, 0, w8advFanout)
-	markers := make([]string, 0, w8advFanout)
-	for i := 1; i <= w8advFanout; i++ {
-		marker := fmt.Sprintf("W8Adversarial01Dep%02d", i)
+	dependents := make([]string, 0, e2eAdversarialFanout)
+	markers := make([]string, 0, e2eAdversarialFanout)
+	for i := 1; i <= e2eAdversarialFanout; i++ {
+		marker := fmt.Sprintf("GxAdversarial01Dep%02d", i)
 		path := e.addWorktree(fmt.Sprintf("wt%02d", i), fmt.Sprintf("w%02d", i), marker)
 		dependents, markers = append(dependents, path), append(markers, marker)
 	}
@@ -110,7 +110,7 @@ func w8advRowHighFanout(t *testing.T, rec *w8lcRecorder, binary string) {
 
 	lastMain := ""
 	for commit := 1; commit <= 3; commit++ {
-		lastMain = fmt.Sprintf("W8Adversarial01Main%02d", commit)
+		lastMain = fmt.Sprintf("GxAdversarial01Main%02d", commit)
 		e.commitEdit(11+commit, commit, lastMain, fmt.Sprintf("fan-out advance %d", commit))
 		e.awaitExact(e.f.primary, lastMain, e.markerPath(e.f.primary), issue767AsPrimary)
 		for i, path := range dependents {
@@ -126,17 +126,17 @@ func w8advRowHighFanout(t *testing.T, rec *w8lcRecorder, binary string) {
 
 	e.f.settle()
 	after := e.counters()
-	delta := w8lcCounterDelta(before, after)
-	rec.note("fan-out counters: %s", w8lcCounterLine(delta,
+	delta := e2eLifecycleCounterDelta(before, after)
+	rec.note("fan-out counters: %s", e2eLifecycleCounterLine(delta,
 		"views_dedicated_base_publish_total", "views_dedicated_base_claim_total",
 		"views_dependent_recomposition_total", "views_coordinator_cycle_total"))
-	if err := w8lcClosureComplete(after); err != nil {
+	if err := e2eLifecycleClosureComplete(after); err != nil {
 		t.Error(err)
 	}
-	if err := w8lcQuiescedWithEvidence(rec, after); err != nil {
+	if err := e2eLifecycleQuiescedWithEvidence(rec, after); err != nil {
 		t.Error(err)
 	}
-	if err := w8lcNoStorageFailures(e.status().Views); err != nil {
+	if err := e2eLifecycleNoStorageFailures(e.status().Views); err != nil {
 		t.Error(err)
 	}
 	// Bounded: a fan of ten dependents over three commits must not leave one
@@ -161,10 +161,10 @@ func w8advRowHighFanout(t *testing.T, rec *w8lcRecorder, binary string) {
 	}
 }
 
-// w8advCyclicCorpus is a deliberately hostile little repository.
+// e2eAdversarialCyclicCorpus is a deliberately hostile little repository.
 //
 //   - Two packages import each other. The generated corpus is acyclic by
-//     construction (w8GenerateFixture only ever imports a HIGHER package
+//     construction (sustainedIOGenerateFixture only ever imports a HIGHER package
 //     index), so a cycle has to be written by hand — and it is the shape the
 //     handoff's ancestry hazard warns about, one level down: a resolver walk
 //     that does not remember where it has been does not terminate on this.
@@ -174,11 +174,11 @@ func w8advRowHighFanout(t *testing.T, rec *w8lcRecorder, binary string) {
 //     a pathless identity comes from without inventing one.
 //   - One file references a symbol that is never defined anywhere, which parks
 //     an unresolved reference in the graph.
-func w8advCyclicCorpus(f *issue767Fixture) {
+func e2eAdversarialCyclicCorpus(f *issue767Fixture) {
 	write := func(name, body string) { f.write(filepath.Join(f.primary, filepath.FromSlash(name)), body) }
 	write("go.mod", "module example.invalid/issue767\n\ngo 1.24\n")
-	write("root.go", w8RootSource())
-	write("marker.go", issue767MarkerSource(w8PrimaryMarker))
+	write("root.go", sustainedIORootSource())
+	write("marker.go", issue767MarkerSource(sustainedIOPrimaryMarker))
 	write("cyc/a/a.go", `package a
 
 import (
@@ -186,14 +186,14 @@ import (
 	"example.invalid/absent/vendorless"
 )
 
-// W8CycleAlpha calls into b, which calls back into a: the import cycle.
-func W8CycleAlpha() int { return b.W8CycleBeta() + 1 }
+// GxCycleAlpha calls into b, which calls back into a: the import cycle.
+func GxCycleAlpha() int { return b.GxCycleBeta() + 1 }
 
-// W8CycleAlphaSelf is the intra-package leg of the cycle.
-func W8CycleAlphaSelf() int { return W8CycleAlpha() }
+// GxCycleAlphaSelf is the intra-package leg of the cycle.
+func GxCycleAlphaSelf() int { return GxCycleAlpha() }
 
-// W8CycleAlphaExternal calls a module that does not exist: a pathless stub.
-func W8CycleAlphaExternal() int { return vendorless.Absent() }
+// GxCycleAlphaExternal calls a module that does not exist: a pathless stub.
+func GxCycleAlphaExternal() int { return vendorless.Absent() }
 `)
 	write("cyc/b/b.go", `package b
 
@@ -202,26 +202,26 @@ import (
 	"example.invalid/absent/vendorless"
 )
 
-// W8CycleBeta closes the cycle back into a.
-func W8CycleBeta() int { return a.W8CycleAlphaSelf() + 1 }
+// GxCycleBeta closes the cycle back into a.
+func GxCycleBeta() int { return a.GxCycleAlphaSelf() + 1 }
 
-// W8CycleBetaExternal is the second pathless reference.
-func W8CycleBetaExternal() int { return vendorless.AlsoAbsent() }
+// GxCycleBetaExternal is the second pathless reference.
+func GxCycleBetaExternal() int { return vendorless.AlsoAbsent() }
 
-// W8CycleBetaDangling references a symbol that is defined nowhere at all.
-func W8CycleBetaDangling() int { return W8NeverDefinedAnywhere() }
+// GxCycleBetaDangling references a symbol that is defined nowhere at all.
+func GxCycleBetaDangling() int { return GxNeverDefinedAnywhere() }
 `)
 	for i := 0; i < 8; i++ {
 		write(fmt.Sprintf("cyc/c/c%02d.go", i), fmt.Sprintf(`package c
 
 import "example.invalid/issue767/cyc/a"
 
-func W8CycleGamma%02d() int { return a.W8CycleAlpha() + %d }
+func GxCycleGamma%02d() int { return a.GxCycleAlpha() + %d }
 `, i, i))
 	}
 }
 
-// w8advRowCyclesAndPathless indexes that repository and asks whether the view
+// e2eAdversarialRowCyclesAndPathless indexes that repository and asks whether the view
 // is still a view.
 //
 // The assertion is gate 1's, kept to what a public surface can prove: the
@@ -230,17 +230,17 @@ func W8CycleGamma%02d() int { return a.W8CycleAlpha() + %d }
 // holds them nor drag the build into a truncated closure. A daemon that hung
 // on the cycle never reaches the first wait; one that dropped the files fails
 // it.
-func w8advRowCyclesAndPathless(t *testing.T, rec *w8lcRecorder, binary string) {
-	f := newIssue767FixtureWithCorpus(t, binary, w8advCyclicCorpus)
-	e := &w8lcEnv{t: t, f: f, spec: w8FixtureSpec{}.normalize(), marker: w8PrimaryMarker}
+func e2eAdversarialRowCyclesAndPathless(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
+	f := newIssue767FixtureWithCorpus(t, binary, e2eAdversarialCyclicCorpus)
+	e := &e2eLifecycleEnv{t: t, f: f, spec: sustainedIOFixtureSpec{}.normalize(), marker: sustainedIOPrimaryMarker}
 	e.start()
 
 	for _, probe := range []struct{ name, file string }{
-		{"W8CycleAlpha", "cyc/a/a.go"},
-		{"W8CycleAlphaExternal", "cyc/a/a.go"},
-		{"W8CycleBeta", "cyc/b/b.go"},
-		{"W8CycleBetaDangling", "cyc/b/b.go"},
-		{"W8CycleGamma07", "cyc/c/c07.go"},
+		{"GxCycleAlpha", "cyc/a/a.go"},
+		{"GxCycleAlphaExternal", "cyc/a/a.go"},
+		{"GxCycleBeta", "cyc/b/b.go"},
+		{"GxCycleBetaDangling", "cyc/b/b.go"},
+		{"GxCycleGamma07", "cyc/c/c07.go"},
 	} {
 		e.awaitExact(e.f.primary, probe.name, filepath.Join(e.f.primary, filepath.FromSlash(probe.file)), issue767AsPrimary)
 	}
@@ -248,9 +248,9 @@ func w8advRowCyclesAndPathless(t *testing.T, rec *w8lcRecorder, binary string) {
 
 	// A discovered checkout over the same hostile tree: the composition is the
 	// half that has to walk the cycle again.
-	worktree := e.addWorktree("wt01", "w01", "W8Adversarial02Dep")
-	e.awaitExact(worktree, "W8Adversarial02Dep", e.markerPath(worktree), issue767AsAutomaticWorktree)
-	e.awaitExact(worktree, "W8CycleBeta", filepath.Join(worktree, filepath.FromSlash("cyc/b/b.go")), issue767AsAutomaticWorktree)
+	worktree := e.addWorktree("wt01", "w01", "GxAdversarial02Dep")
+	e.awaitExact(worktree, "GxAdversarial02Dep", e.markerPath(worktree), issue767AsAutomaticWorktree)
+	e.awaitExact(worktree, "GxCycleBeta", filepath.Join(worktree, filepath.FromSlash("cyc/b/b.go")), issue767AsAutomaticWorktree)
 	rec.note("the composed checkout view answers for the cyclic packages too")
 
 	// Now move one leg of the cycle and watch the other leg follow. This is the
@@ -262,36 +262,36 @@ import (
 	"example.invalid/absent/vendorless"
 )
 
-func W8CycleAlpha() int { return b.W8CycleBeta() + 2 }
+func GxCycleAlpha() int { return b.GxCycleBeta() + 2 }
 
-func W8CycleAlphaSelf() int { return W8CycleAlpha() }
+func GxCycleAlphaSelf() int { return GxCycleAlpha() }
 
-func W8CycleAlphaExternal() int { return vendorless.Absent() }
+func GxCycleAlphaExternal() int { return vendorless.Absent() }
 
-// W8CycleAlphaRevised is the moved declaration the wait watches for.
-func W8CycleAlphaRevised() int { return W8CycleAlphaSelf() }
+// GxCycleAlphaRevised is the moved declaration the wait watches for.
+func GxCycleAlphaRevised() int { return GxCycleAlphaSelf() }
 `)
 	e.f.git(e.f.primary, "add", "-A")
 	e.f.git(e.f.primary, "commit", "-m", "move one leg of the cycle")
-	e.awaitExact(e.f.primary, "W8CycleAlphaRevised", filepath.Join(e.f.primary, filepath.FromSlash("cyc/a/a.go")), issue767AsPrimary)
-	e.awaitExact(e.f.primary, "W8CycleBeta", filepath.Join(e.f.primary, filepath.FromSlash("cyc/b/b.go")), issue767AsPrimary)
+	e.awaitExact(e.f.primary, "GxCycleAlphaRevised", filepath.Join(e.f.primary, filepath.FromSlash("cyc/a/a.go")), issue767AsPrimary)
+	e.awaitExact(e.f.primary, "GxCycleBeta", filepath.Join(e.f.primary, filepath.FromSlash("cyc/b/b.go")), issue767AsPrimary)
 	rec.note("after one leg of the cycle moved, both legs still answer from their own files")
 
 	e.f.settle()
 	counters := e.counters()
-	rec.note("cycle counters: %s", w8lcCounterLine(counters, "views_dedicated_base_publish_total", "views_dedicated_base_closure_truncated_total"))
-	if err := w8lcClosureComplete(counters); err != nil {
+	rec.note("cycle counters: %s", e2eLifecycleCounterLine(counters, "views_dedicated_base_publish_total", "views_dedicated_base_closure_truncated_total"))
+	if err := e2eLifecycleClosureComplete(counters); err != nil {
 		t.Error(err)
 	}
-	if err := w8lcQuiescedWithEvidence(rec, counters); err != nil {
+	if err := e2eLifecycleQuiescedWithEvidence(rec, counters); err != nil {
 		t.Error(err)
 	}
-	if err := w8lcNoStorageFailures(e.status().Views); err != nil {
+	if err := e2eLifecycleNoStorageFailures(e.status().Views); err != nil {
 		t.Error(err)
 	}
 }
 
-// w8advNarrowCapConfig is the repo-local configuration that narrows the typed
+// e2eAdversarialNarrowCapConfig is the repo-local configuration that narrows the typed
 // limit to something a small corpus can actually reach. The key is the one the
 // source documents: "Configured under `index.affected_by_reresolve_max` in
 // .gortex.yaml" (internal/config/config.go, IndexConfig.AffectedByReresolveMax),
@@ -304,9 +304,9 @@ func W8CycleAlphaRevised() int { return W8CycleAlphaSelf() }
 // truncated nothing on a 48-file corpus whose every file calls into the edited
 // root.go; 1 gives the arm its best chance of reaching the limit, and the row
 // records it when even that does not.
-const w8advNarrowCapConfig = "index:\n  affected_by_reresolve_max: 1\n"
+const e2eAdversarialNarrowCapConfig = "index:\n  affected_by_reresolve_max: 1\n"
 
-// w8advRowBoundedCandidateWork is the typed-limit-and-completeness-fact row.
+// e2eAdversarialRowBoundedCandidateWork is the typed-limit-and-completeness-fact row.
 //
 // Two arms, and the second is the point:
 //
@@ -322,7 +322,7 @@ const w8advNarrowCapConfig = "index:\n  affected_by_reresolve_max: 1\n"
 //     answer exactly for the edited declaration out of its own file — a
 //     partial projection must never be served as an exact answer.
 //
-// The honesty rule is lane-scoped on purpose, and w8advTruncationLanes is why:
+// The honesty rule is lane-scoped on purpose, and e2eAdversarialTruncationLanes is why:
 // THREE code paths log a truncated closure and only ONE of them counts it.
 // viewmetrics.DedicatedBaseClosureTruncatedTotal is incremented exactly once,
 // beside the dedicated-base publish counters
@@ -332,16 +332,16 @@ const w8advNarrowCapConfig = "index:\n  affected_by_reresolve_max: 1\n"
 // they are different lanes, and the census does not claim to cover them. A rule
 // that demanded the counter move for ANY truncation line in the log would fail
 // this row for a lane the branch never promised to count.
-func w8advRowBoundedCandidateWork(t *testing.T, rec *w8lcRecorder, binary string) {
+func e2eAdversarialRowBoundedCandidateWork(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
 	t.Run("shipped_cap_publishes_a_complete_closure", func(t *testing.T) {
-		e := w8lcNewEnv(t, binary, w8lcSmallSpec(8113), "")
+		e := e2eLifecycleNewEnv(t, binary, e2eLifecycleSmallSpec(8113), "")
 		e.start()
 		e.f.settle()
-		w8advEditTheMostReferencedFile(t, e, "W8Adversarial03Wide")
+		e2eAdversarialEditTheMostReferencedFile(t, e, "GxAdversarial03Wide")
 		e.f.settle()
 		counters := e.counters()
-		rec.note("shipped cap: %s", w8lcCounterLine(counters, "views_dedicated_base_publish_total", "views_dedicated_base_closure_truncated_total"))
-		if err := w8lcClosureComplete(counters); err != nil {
+		rec.note("shipped cap: %s", e2eLifecycleCounterLine(counters, "views_dedicated_base_publish_total", "views_dedicated_base_closure_truncated_total"))
+		if err := e2eLifecycleClosureComplete(counters); err != nil {
 			t.Error(err)
 		}
 		if strings.Contains(e.daemonLog(), "closure truncated") {
@@ -350,20 +350,20 @@ func w8advRowBoundedCandidateWork(t *testing.T, rec *w8lcRecorder, binary string
 	})
 
 	t.Run("narrow_cap_reports_what_it_cut", func(t *testing.T) {
-		e := w8lcNewEnv(t, binary, w8lcSmallSpec(8114), w8advNarrowCapConfig)
+		e := e2eLifecycleNewEnv(t, binary, e2eLifecycleSmallSpec(8114), e2eAdversarialNarrowCapConfig)
 		e.start()
 		e.f.settle()
-		w8advEditTheMostReferencedFile(t, e, "W8Adversarial03Narrow")
+		e2eAdversarialEditTheMostReferencedFile(t, e, "GxAdversarial03Narrow")
 		e.f.settle()
 		counters := e.counters()
-		cut := w8lcCounterSum(counters, "views_dedicated_base_closure_truncated_total")
-		lanes := w8advTruncationLanes(e.daemonLog())
+		cut := e2eLifecycleCounterSum(counters, "views_dedicated_base_closure_truncated_total")
+		lanes := e2eAdversarialTruncationLanes(e.daemonLog())
 		rec.note("narrow cap (%s): truncated counter=%d, lanes that logged a cut: %s",
-			strings.TrimSpace(strings.ReplaceAll(w8advNarrowCapConfig, "\n", " ")), cut, lanes)
+			strings.TrimSpace(strings.ReplaceAll(e2eAdversarialNarrowCapConfig, "\n", " ")), cut, lanes)
 		// The completeness fact has to travel with the generation. A build
 		// that cut its closure and told nobody is exactly the silent
 		// divergence the source says it refuses to be.
-		if err := w8advTruncationHonest(lanes, cut); err != nil {
+		if err := e2eAdversarialTruncationHonest(lanes, cut); err != nil {
 			t.Error(err)
 		}
 		if !lanes.any() && cut == 0 {
@@ -372,24 +372,24 @@ func w8advRowBoundedCandidateWork(t *testing.T, rec *w8lcRecorder, binary string
 			// and on this corpus, through repo-local configuration, nothing
 			// did — so the arm says so in the outcome table rather than
 			// collecting the green.
-			rec.note("NOT EXERCISED: with the cap narrowed to its smallest honoured value, no lane truncated a closure on this corpus, so the typed-limit half of the bounded-candidate-work bullet was not driven; only the honesty rule and the no-partial-projection wait above are evidence (ledger row W8.10 matrix7 bounded_candidate_work)")
+			rec.note("NOT EXERCISED: with the cap narrowed to its smallest honoured value, no lane truncated a closure on this corpus, so the typed-limit half of the bounded-candidate-work bullet was not driven; only the honesty rule and the no-partial-projection wait above are evidence (ledger row: matrix 7 bounded_candidate_work)")
 		}
 		// Whatever the closure cost, the answer may not be a partial
 		// projection wearing an exact label.
-		if err := w8lcQuiescedWithEvidence(rec, counters); err != nil {
+		if err := e2eLifecycleQuiescedWithEvidence(rec, counters); err != nil {
 			t.Error(err)
 		}
-		if err := w8lcNoStorageFailures(e.status().Views); err != nil {
+		if err := e2eLifecycleNoStorageFailures(e.status().Views); err != nil {
 			t.Error(err)
 		}
 	})
 }
 
-// w8advTruncationLanesSeen is which of the three lanes that can cut a closure
+// e2eAdversarialTruncationLanesSeen is which of the three lanes that can cut a closure
 // said so in the daemon log. The three messages are verbatim from the source,
 // so a rename of one of them shows up here as a lane that stopped reporting
 // rather than as a row that quietly stopped checking.
-type w8advTruncationLanesSeen struct {
+type e2eAdversarialTruncationLanesSeen struct {
 	// Builder is the sparse generation builder's own line, emitted by whichever
 	// lane asked it to build (internal/indexer/builder_closure.go:202-206).
 	Builder bool
@@ -403,9 +403,9 @@ type w8advTruncationLanesSeen struct {
 	RefView     bool
 }
 
-func (l w8advTruncationLanesSeen) any() bool { return l.Builder || l.Coordinator || l.RefView }
+func (l e2eAdversarialTruncationLanesSeen) any() bool { return l.Builder || l.Coordinator || l.RefView }
 
-func (l w8advTruncationLanesSeen) String() string {
+func (l e2eAdversarialTruncationLanesSeen) String() string {
 	var seen []string
 	if l.Builder {
 		seen = append(seen, "sparse-generation-builder")
@@ -422,15 +422,15 @@ func (l w8advTruncationLanesSeen) String() string {
 	return strings.Join(seen, ",")
 }
 
-func w8advTruncationLanes(log string) w8advTruncationLanesSeen {
-	return w8advTruncationLanesSeen{
+func e2eAdversarialTruncationLanes(log string) e2eAdversarialTruncationLanesSeen {
+	return e2eAdversarialTruncationLanesSeen{
 		Builder:     strings.Contains(log, "sparse generation closure truncated"),
 		Coordinator: strings.Contains(log, "commit layer closure truncated"),
 		RefView:     strings.Contains(log, "build closure truncated"),
 	}
 }
 
-// w8advTruncationHonest is the completeness-fact rule, scoped to the lane the
+// e2eAdversarialTruncationHonest is the completeness-fact rule, scoped to the lane the
 // census covers.
 //
 // Two directions, and both are failures of the same promise:
@@ -446,7 +446,7 @@ func w8advTruncationLanes(log string) w8advTruncationLanesSeen {
 //
 // A cut on the coordinator or ref-view lane with a zero counter is NOT a
 // failure and is returned as nil: those lanes log and do not count, by design.
-func w8advTruncationHonest(lanes w8advTruncationLanesSeen, counted int64) error {
+func e2eAdversarialTruncationHonest(lanes e2eAdversarialTruncationLanesSeen, counted int64) error {
 	if counted > 0 && !lanes.Builder {
 		return fmt.Errorf("views_dedicated_base_closure_truncated_total is %d but no build logged a truncated closure: the census reports a cut nothing performed", counted)
 	}
@@ -456,21 +456,21 @@ func w8advTruncationHonest(lanes w8advTruncationLanesSeen, counted int64) error 
 	return nil
 }
 
-// w8advEditTheMostReferencedFile changes root.go — the file every generated
-// package file calls into (w8FileSource emits a call to w8RootTarget) — and
+// e2eAdversarialEditTheMostReferencedFile changes root.go — the file every generated
+// package file calls into (sustainedIOFileSource emits a call to sustainedIORootTarget) — and
 // waits for the moved declaration. A change here has the widest affected-by
 // closure the corpus can offer, which is what makes it the right probe for a
 // cap.
-func w8advEditTheMostReferencedFile(t *testing.T, e *w8lcEnv, marker string) {
+func e2eAdversarialEditTheMostReferencedFile(t *testing.T, e *e2eLifecycleEnv, marker string) {
 	t.Helper()
-	source := w8RootSource() + fmt.Sprintf("\n// %s is the moved declaration this edit is waited on.\nfunc %s() int { return %s() }\n", marker, marker, w8RootTarget)
+	source := sustainedIORootSource() + fmt.Sprintf("\n// %s is the moved declaration this edit is waited on.\nfunc %s() int { return %s() }\n", marker, marker, sustainedIORootTarget)
 	e.f.write(filepath.Join(e.f.primary, "root.go"), source)
 	e.f.git(e.f.primary, "add", "-A")
 	e.f.git(e.f.primary, "commit", "-m", "widen the closure: "+marker)
 	e.awaitExact(e.f.primary, marker, filepath.Join(e.f.primary, "root.go"), issue767AsPrimary)
 }
 
-// w8advChainCommits is how many committed advances the chain row makes. It has
+// e2eAdversarialChainCommits is how many committed advances the chain row makes. It has
 // to exceed the publisher's delta-chain bound so the policy is observed doing
 // the thing it exists to do: proposing a new full root instead of extending a
 // chain that already holds MaxDedicatedBaseChainDepth generations
@@ -482,9 +482,9 @@ func w8advEditTheMostReferencedFile(t *testing.T, e *w8lcEnv, marker string) {
 // every advance publishes, so an advance count barely over the bound cannot
 // reach it. The row records whether the bound was reached either way — see the
 // NOT EXERCISED note below — but it is worth giving it the chance.
-var w8advChainCommits = graphview.MaxDedicatedBaseChainDepth + 16
+var e2eAdversarialChainCommits = graphview.MaxDedicatedBaseChainDepth + 16
 
-// w8advRowChainMaintenance drives enough committed advances to exercise the
+// e2eAdversarialRowChainMaintenance drives enough committed advances to exercise the
 // chain's own maintenance, and watches an old route while it happens.
 //
 // Three claims, each read from a public surface:
@@ -500,17 +500,17 @@ var w8advChainCommits = graphview.MaxDedicatedBaseChainDepth + 16
 //     committed marker through every advance. "Old coherent routes remain
 //     available with truthful freshness until replacement routes are ready"
 //     (handoff §7, gate 5).
-func w8advRowChainMaintenance(t *testing.T, rec *w8lcRecorder, binary string) {
-	e := w8lcNewEnv(t, binary, w8lcSmallSpec(8115), "")
+func e2eAdversarialRowChainMaintenance(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
+	e := e2eLifecycleNewEnv(t, binary, e2eLifecycleSmallSpec(8115), "")
 	e.start()
-	holder := e.addWorktree("wt01", "w01", "W8Adversarial04Held")
-	held, heldFile := "W8Adversarial04Held", e.markerPath(holder)
+	holder := e.addWorktree("wt01", "w01", "GxAdversarial04Held")
+	held, heldFile := "GxAdversarial04Held", e.markerPath(holder)
 	e.awaitExact(holder, held, heldFile, issue767AsAutomaticWorktree)
 	e.f.settle()
 	before := e.counters()
 
-	for commit := 1; commit <= w8advChainCommits; commit++ {
-		marker := fmt.Sprintf("W8Adversarial04Chain%02d", commit)
+	for commit := 1; commit <= e2eAdversarialChainCommits; commit++ {
+		marker := fmt.Sprintf("GxAdversarial04Chain%02d", commit)
 		e.commitEdit(20+commit, commit, marker, fmt.Sprintf("chain advance %d", commit))
 		e.awaitExact(e.f.primary, marker, e.markerPath(e.f.primary), issue767AsPrimary)
 		// The old route, on every single advance: it must still answer, and it
@@ -521,17 +521,17 @@ func w8advRowChainMaintenance(t *testing.T, rec *w8lcRecorder, binary string) {
 	e.f.settle()
 
 	after := e.counters()
-	delta := w8lcCounterDelta(before, after)
-	roots := w8lcCounterWith(delta, "views_dedicated_base_publish_total", "shape=root")
-	deltas := w8lcCounterWith(delta, "views_dedicated_base_publish_total", "shape=delta")
-	retired := w8lcCounterSum(delta, "views_generation_retired_total")
-	swept := w8lcCounterSum(delta, "views_generation_sweep_collected_total")
-	superseded := w8lcCounterSum(delta, "views_generation_superseded_total")
+	delta := e2eLifecycleCounterDelta(before, after)
+	roots := e2eLifecycleCounterWith(delta, "views_dedicated_base_publish_total", "shape=root")
+	deltas := e2eLifecycleCounterWith(delta, "views_dedicated_base_publish_total", "shape=delta")
+	retired := e2eLifecycleCounterSum(delta, "views_generation_retired_total")
+	swept := e2eLifecycleCounterSum(delta, "views_generation_sweep_collected_total")
+	superseded := e2eLifecycleCounterSum(delta, "views_generation_superseded_total")
 	rec.note("%d committed advances published %d root(s) and %d delta(s); superseded=%d retired=%d swept=%d",
-		w8advChainCommits, roots, deltas, superseded, retired, swept)
-	rec.note("chain counters: %s", w8lcCounterLine(delta, "views_generation_retire_refused_total", "views_dedicated_base_claim_total"))
+		e2eAdversarialChainCommits, roots, deltas, superseded, retired, swept)
+	rec.note("chain counters: %s", e2eLifecycleCounterLine(delta, "views_generation_retire_refused_total", "views_dedicated_base_claim_total"))
 
-	if err := w8advChainBounded(roots, deltas, graphview.MaxDedicatedBaseChainDepth); err != nil {
+	if err := e2eAdversarialChainBounded(roots, deltas, graphview.MaxDedicatedBaseChainDepth); err != nil {
 		t.Error(err)
 	}
 	// The bound is asserted above whether or not it was approached. Whether the
@@ -541,19 +541,19 @@ func w8advRowChainMaintenance(t *testing.T, rec *w8lcRecorder, binary string) {
 	// different question, and it is only observed when the window actually
 	// published a root after filling a chain.
 	if roots == 0 && deltas < int64(graphview.MaxDedicatedBaseChainDepth) {
-		rec.note("NOT EXERCISED: %d committed advances published %d deltas and no root, short of the %d-generation depth at which a new root is proposed; the depth bound held but the new-root-at-depth policy was not observed (ledger row W8.10 matrix7 chain_maintenance_and_old_routes)",
-			w8advChainCommits, deltas, graphview.MaxDedicatedBaseChainDepth)
+		rec.note("NOT EXERCISED: %d committed advances published %d deltas and no root, short of the %d-generation depth at which a new root is proposed; the depth bound held but the new-root-at-depth policy was not observed (ledger row: matrix 7 chain_maintenance_and_old_routes)",
+			e2eAdversarialChainCommits, deltas, graphview.MaxDedicatedBaseChainDepth)
 	} else if roots > 0 {
 		rec.note("the window published %d root(s) alongside %d delta(s): the allocation policy proposed a new full root rather than extending the chain past its depth", roots, deltas)
 	}
 	// Retirement is RECORDED, not asserted. The execution plan is explicit
-	// that real compaction and reseed (W6.8) are out of this branch's scope
-	// and that gate 8 is claimed only as "measured chain growth under W6.7's
-	// retention" — so a window in which nothing retired is the documented
+	// that real compaction and reseed are out of this branch's scope
+	// and that gate 8 is claimed only as "measured chain growth under the
+	// generation-retention policy" — so a window in which nothing retired is the documented
 	// behaviour, and a row that failed on it would be failing the branch for a
 	// promise it never made. What IS asserted is the bound below.
 	if superseded+retired+swept == 0 {
-		rec.note("RECORDED: %d committed advances retired nothing in this window (retention, not compaction; real compaction/reseed is out of scope)", w8advChainCommits)
+		rec.note("RECORDED: %d committed advances retired nothing in this window (retention, not compaction; real compaction/reseed is out of scope)", e2eAdversarialChainCommits)
 	}
 	// The bound that does hold: live payload is the checkouts' content layers
 	// plus the chains the window can legally hold. A run that allocated a
@@ -568,26 +568,26 @@ func w8advRowChainMaintenance(t *testing.T, rec *w8lcRecorder, binary string) {
 		}
 		checkouts := 2 // the primary and the one holder this row creates
 		ceiling := checkouts*graphview.MaxRepoViewLayers + int((roots+1)*int64(graphview.MaxDedicatedBaseChainDepth))
-		rec.note("live generations after %d advances: %d (ceiling %d)", w8advChainCommits, live, ceiling)
+		rec.note("live generations after %d advances: %d (ceiling %d)", e2eAdversarialChainCommits, live, ceiling)
 		if live > ceiling {
-			t.Errorf("%d live generations after %d advances exceeds the %d the layer and chain bounds allow: payload is accumulating per advance rather than per chain", live, w8advChainCommits, ceiling)
+			t.Errorf("%d live generations after %d advances exceeds the %d the layer and chain bounds allow: payload is accumulating per advance rather than per chain", live, e2eAdversarialChainCommits, ceiling)
 		}
 	}
-	if err := w8lcClosureComplete(after); err != nil {
+	if err := e2eLifecycleClosureComplete(after); err != nil {
 		t.Error(err)
 	}
-	if err := w8lcQuiescedWithEvidence(rec, after); err != nil {
+	if err := e2eLifecycleQuiescedWithEvidence(rec, after); err != nil {
 		t.Error(err)
 	}
-	if err := w8lcNoStorageFailures(e.status().Views); err != nil {
+	if err := e2eLifecycleNoStorageFailures(e.status().Views); err != nil {
 		t.Error(err)
 	}
 	if views := e.status().Views; views != nil {
-		rec.note("generations after %d advances: %v (leases %d)", w8advChainCommits, views.Generations, views.Leases)
+		rec.note("generations after %d advances: %v (leases %d)", e2eAdversarialChainCommits, views.Generations, views.Leases)
 	}
 }
 
-// w8advChainBounded is the depth rule as arithmetic over what the census can
+// e2eAdversarialChainBounded is the depth rule as arithmetic over what the census can
 // see.
 //
 // The census counts publications by SHAPE, not by chain: it says how many
@@ -601,7 +601,7 @@ func w8advRowChainMaintenance(t *testing.T, rec *w8lcRecorder, binary string) {
 // The +1 is the measurement's honesty, not slack: the cold index publishes its
 // root before any of these rows opens its counter window, so a rule without it
 // would fail every run for the chain it inherited.
-func w8advChainBounded(roots, deltas int64, depth int) error {
+func e2eAdversarialChainBounded(roots, deltas int64, depth int) error {
 	if deltas == 0 {
 		return nil
 	}
@@ -611,7 +611,7 @@ func w8advChainBounded(roots, deltas int64, depth int) error {
 	return nil
 }
 
-// w8advRowCrossSurfaceCoherence asks one settled state through every public
+// e2eAdversarialRowCrossSurfaceCoherence asks one settled state through every public
 // surface at once, then moves it and asks again.
 //
 // "Caches and sidecars must be keyed by selected snapshot/capability identity.
@@ -620,16 +620,16 @@ func w8advChainBounded(roots, deltas int64, depth int) error {
 // this row is shaped to catch: each surface can be individually right while the
 // set of them is incoherent, so the rule is applied to the SET — same graph,
 // same checkout, exact everywhere — rather than to any one answer.
-func w8advRowCrossSurfaceCoherence(t *testing.T, rec *w8lcRecorder, binary string) {
-	e := w8lcNewEnv(t, binary, w8lcSmallSpec(8116), "")
+func e2eAdversarialRowCrossSurfaceCoherence(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
+	e := e2eLifecycleNewEnv(t, binary, e2eLifecycleSmallSpec(8116), "")
 	e.start()
-	worktree := e.addWorktree("wt01", "w01", "W8Adversarial05First")
-	first, file := "W8Adversarial05First", e.markerPath(worktree)
+	worktree := e.addWorktree("wt01", "w01", "GxAdversarial05First")
+	first, file := "GxAdversarial05First", e.markerPath(worktree)
 	e.awaitExact(worktree, first, file, issue767AsAutomaticWorktree)
 	e.f.settle()
 
-	answers := w8advAskEverySurface(t, rec, e, worktree, first)
-	if err := w8lcCoherent(answers); err != nil {
+	answers := e2eAdversarialAskEverySurface(t, rec, e, worktree, first)
+	if err := e2eLifecycleCoherent(answers); err != nil {
 		t.Fatalf("the surfaces disagreed about the settled state: %v", err)
 	}
 	rec.note("settled state: %d surfaces answered from graph %s / checkout %s", len(answers), answers[0].GraphID, answers[0].CheckoutID)
@@ -646,36 +646,36 @@ func w8advRowCrossSurfaceCoherence(t *testing.T, rec *w8lcRecorder, binary strin
 	// Now move the working tree and re-ask. Every surface has to move
 	// together: the graph, the text index and the file bytes are three indexes
 	// over one snapshot, and one of them lagging is the mixed view.
-	second := "W8Adversarial05Second"
+	second := "GxAdversarial05Second"
 	e.f.write(file, issue767MarkerSource(e.marker, second))
 	e.awaitExact(worktree, second, file, issue767AsAutomaticWorktree)
 
-	moved := w8advAskEverySurface(t, rec, e, worktree, second)
-	if err := w8lcCoherent(moved); err != nil {
+	moved := e2eAdversarialAskEverySurface(t, rec, e, worktree, second)
+	if err := e2eLifecycleCoherent(moved); err != nil {
 		t.Fatalf("the surfaces disagreed after the edit: %v", err)
 	}
 	// The bytes surface is the one that can silently serve the old snapshot,
 	// so it is checked against the file rather than only against its label.
-	if body := w8advReadFile(t, e, worktree, "marker.go"); !strings.Contains(body, second) {
+	if body := e2eAdversarialReadFile(t, e, worktree, "marker.go"); !strings.Contains(body, second) {
 		t.Fatalf("the source surface served bytes without the edited declaration:\n%s", body)
 	}
-	if !w8advTextSearchFinds(t, e, worktree, second) {
+	if !e2eAdversarialTextSearchFinds(t, e, worktree, second) {
 		t.Fatal("the text surface does not carry the edited declaration the graph surface answered for")
 	}
 	rec.note("after the edit all surfaces carry %s and still name one graph/checkout pair", second)
 
 	e.f.settle()
-	if err := w8lcQuiescedWithEvidence(rec, e.counters()); err != nil {
+	if err := e2eLifecycleQuiescedWithEvidence(rec, e.counters()); err != nil {
 		t.Error(err)
 	}
-	if err := w8lcNoStorageFailures(e.status().Views); err != nil {
+	if err := e2eLifecycleNoStorageFailures(e.status().Views); err != nil {
 		t.Error(err)
 	}
 }
 
-// w8advAskEverySurface asks the graph, the text index and the file bytes for
+// e2eAdversarialAskEverySurface asks the graph, the text index and the file bytes for
 // one state and returns each answer's view label.
-func w8advAskEverySurface(t *testing.T, rec *w8lcRecorder, e *w8lcEnv, root, name string) []w8lcFreshness {
+func e2eAdversarialAskEverySurface(t *testing.T, rec *e2eLifecycleRecorder, e *e2eLifecycleEnv, root, name string) []e2eLifecycleFreshness {
 	t.Helper()
 	requests := []struct {
 		surface string
@@ -686,7 +686,7 @@ func w8advAskEverySurface(t *testing.T, rec *w8lcRecorder, e *w8lcEnv, root, nam
 		{"text", "search", map[string]any{"operation": "text", "query": name, "options": map[string]any{"limit": 5}}},
 		{"source", "read", map[string]any{"operation": "file", "target": map[string]any{"file": "marker.go"}}},
 	}
-	answers := make([]w8lcFreshness, 0, len(requests))
+	answers := make([]e2eLifecycleFreshness, 0, len(requests))
 	for _, request := range requests {
 		answer, err := e.freshnessOf(request.surface, root, request.tool, request.request)
 		if err != nil {
@@ -698,7 +698,7 @@ func w8advAskEverySurface(t *testing.T, rec *w8lcRecorder, e *w8lcEnv, root, nam
 	return answers
 }
 
-func w8advReadFile(t *testing.T, e *w8lcEnv, root, file string) string {
+func e2eAdversarialReadFile(t *testing.T, e *e2eLifecycleEnv, root, file string) string {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{"operation": "file", "target": map[string]any{"file": file}})
 	if err != nil {
@@ -706,12 +706,12 @@ func w8advReadFile(t *testing.T, e *w8lcEnv, root, file string) string {
 	}
 	output, err := e.f.tryCommand(60*time.Second, root, "call", "read", "--index", root, "--json", string(payload), "--format", "json")
 	if err != nil {
-		t.Fatalf("read %s: %v\n%s", file, err, w8Tail(output))
+		t.Fatalf("read %s: %v\n%s", file, err, sustainedIOTail(output))
 	}
 	return string(output)
 }
 
-func w8advTextSearchFinds(t *testing.T, e *w8lcEnv, root, needle string) bool {
+func e2eAdversarialTextSearchFinds(t *testing.T, e *e2eLifecycleEnv, root, needle string) bool {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{"operation": "text", "query": needle, "options": map[string]any{"limit": 5}})
 	if err != nil {
@@ -732,17 +732,17 @@ func w8advTextSearchFinds(t *testing.T, e *w8lcEnv, root, needle string) bool {
 // The non-opt-in tests for this file's own rules.
 // ---------------------------------------------------------------------------
 
-func TestW8Matrix7RowsCoverEveryBriefBulletAndNameTheirGates(t *testing.T) {
-	rows := w8advMatrix7Rows("/nonexistent/gortex")
-	if err := w8lcValidateRows("matrix7_adversarial", rows, w8advMatrix7Bullets); err != nil {
+func TestE2EMatrix7RowsCoverEveryBriefBulletAndNameTheirGates(t *testing.T) {
+	rows := e2eAdversarialMatrix7Rows("/nonexistent/gortex")
+	if err := e2eLifecycleValidateRows("matrix7_adversarial", rows, e2eAdversarialMatrix7Bullets); err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != len(w8advMatrix7Bullets) {
-		t.Fatalf("%d rows for %d brief bullets", len(rows), len(w8advMatrix7Bullets))
+	if len(rows) != len(e2eAdversarialMatrix7Bullets) {
+		t.Fatalf("%d rows for %d brief bullets", len(rows), len(e2eAdversarialMatrix7Bullets))
 	}
-	// The execution plan files W8.11's bullets under gates 8, 1 and 10; a row
+	// This matrix's bullets are filed under gates 8, 1 and 10; a row
 	// set that named none of them could not be read as evidence for any.
-	for _, gate := range []string{w8lcGateBounded, w8lcGateSnapshot, w8lcGateEvidence} {
+	for _, gate := range []string{e2eLifecycleGateBounded, e2eLifecycleGateSnapshot, e2eLifecycleGateEvidence} {
 		named := false
 		for _, row := range rows {
 			for _, declared := range row.Gates {
@@ -757,7 +757,7 @@ func TestW8Matrix7RowsCoverEveryBriefBulletAndNameTheirGates(t *testing.T) {
 	}
 }
 
-func TestW8AdversarialChainBoundIsTheReadSidesOwnNumber(t *testing.T) {
+func TestE2EMatrixAdversarialChainBoundIsTheReadSidesOwnNumber(t *testing.T) {
 	// The bound the row asserts must be the constant the publisher is defined
 	// in terms of, not a number this test picked: the allocation policy IS the
 	// read side's depth (internal/indexer/dedicated_base_advance.go defines
@@ -768,34 +768,34 @@ func TestW8AdversarialChainBoundIsTheReadSidesOwnNumber(t *testing.T) {
 	if graphview.MaxGenerationAncestryDepth != graphview.MaxDedicatedBaseChainDepth+1 {
 		t.Fatalf("the ancestry walk bound is %d, want the chain bound plus the one checkout layer that stands on a dedicated head", graphview.MaxGenerationAncestryDepth)
 	}
-	if w8advChainCommits <= graphview.MaxDedicatedBaseChainDepth {
-		t.Fatalf("the chain row makes %d advances, which cannot reach the %d-generation bound it exists to exercise", w8advChainCommits, graphview.MaxDedicatedBaseChainDepth)
+	if e2eAdversarialChainCommits <= graphview.MaxDedicatedBaseChainDepth {
+		t.Fatalf("the chain row makes %d advances, which cannot reach the %d-generation bound it exists to exercise", e2eAdversarialChainCommits, graphview.MaxDedicatedBaseChainDepth)
 	}
 }
 
-func TestW8AdversarialChainBoundedArithmetic(t *testing.T) {
-	if err := w8advChainBounded(0, 0, 32); err != nil {
+func TestE2EMatrixAdversarialChainBoundedArithmetic(t *testing.T) {
+	if err := e2eAdversarialChainBounded(0, 0, 32); err != nil {
 		t.Fatalf("a window that published nothing was refused: %v", err)
 	}
 	// One root in the window plus the chain that was already there: two chains,
 	// so 64 deltas is the ceiling and 65 is over it.
-	if err := w8advChainBounded(1, 64, 32); err != nil {
+	if err := e2eAdversarialChainBounded(1, 64, 32); err != nil {
 		t.Fatalf("a window that filled both its chains was refused: %v", err)
 	}
-	if err := w8advChainBounded(1, 65, 32); err == nil {
+	if err := e2eAdversarialChainBounded(1, 65, 32); err == nil {
 		t.Fatal("a chain one generation past the bound was accepted")
 	}
 	// A window that rooted nothing can only have extended the inherited chain,
 	// which still cannot pass the bound.
-	if err := w8advChainBounded(0, 32, 32); err != nil {
+	if err := e2eAdversarialChainBounded(0, 32, 32); err != nil {
 		t.Fatalf("a window that extended only the inherited chain was refused: %v", err)
 	}
-	if err := w8advChainBounded(0, 33, 32); err == nil {
+	if err := e2eAdversarialChainBounded(0, 33, 32); err == nil {
 		t.Fatal("an inherited chain past the bound was accepted")
 	}
 }
 
-func TestW8AdversarialTruncationHonestyIsScopedToTheLaneTheCensusCovers(t *testing.T) {
+func TestE2EMatrixAdversarialTruncationHonestyIsScopedToTheLaneTheCensusCovers(t *testing.T) {
 	// The three lines, verbatim from the three call sites. They are repeated
 	// here rather than shared with the probe so a rename in the source that the
 	// probe silently stopped matching fails this test too.
@@ -805,30 +805,30 @@ func TestW8AdversarialTruncationHonestyIsScopedToTheLaneTheCensusCovers(t *testi
 		refViewLine     = `ref view manager: build closure truncated	{"ref": "refs/heads/main", "cap": 2}`
 	)
 	t.Run("lanes are told apart", func(t *testing.T) {
-		if got := w8advTruncationLanes("nothing interesting happened"); got.any() {
+		if got := e2eAdversarialTruncationLanes("nothing interesting happened"); got.any() {
 			t.Fatalf("a clean log reported lanes %s", got)
 		}
-		got := w8advTruncationLanes(builderLine)
+		got := e2eAdversarialTruncationLanes(builderLine)
 		if !got.Builder || got.Coordinator || got.RefView {
 			t.Fatalf("the builder line was read as %s", got)
 		}
 		// The coordinator always logs AFTER the builder it called, so the real
 		// log carries both lines; the probe must still name both lanes.
-		got = w8advTruncationLanes(builderLine + "\n" + coordinatorLine)
+		got = e2eAdversarialTruncationLanes(builderLine + "\n" + coordinatorLine)
 		if !got.Builder || !got.Coordinator || got.RefView {
 			t.Fatalf("the coordinator lane was read as %s", got)
 		}
-		got = w8advTruncationLanes(builderLine + "\n" + refViewLine)
+		got = e2eAdversarialTruncationLanes(builderLine + "\n" + refViewLine)
 		if !got.Builder || !got.RefView {
 			t.Fatalf("the ref-view lane was read as %s", got)
 		}
 	})
 	t.Run("the publish lane must reach the census", func(t *testing.T) {
-		lanes := w8advTruncationLanes(builderLine)
-		if err := w8advTruncationHonest(lanes, 1); err != nil {
+		lanes := e2eAdversarialTruncationLanes(builderLine)
+		if err := e2eAdversarialTruncationHonest(lanes, 1); err != nil {
 			t.Fatalf("a counted cut on the publish lane was refused: %v", err)
 		}
-		if err := w8advTruncationHonest(lanes, 0); err == nil {
+		if err := e2eAdversarialTruncationHonest(lanes, 0); err == nil {
 			t.Fatal("a cut that only the dedicated-base publish lane can have asked for went uncounted and was accepted")
 		}
 	})
@@ -837,32 +837,32 @@ func TestW8AdversarialTruncationHonestyIsScopedToTheLaneTheCensusCovers(t *testi
 		// checkout coordinator's commit layer and the ref view manager log a
 		// truncation and increment nothing, so a zero counter beside their
 		// lines is the documented behaviour, not a missing fact.
-		if err := w8advTruncationHonest(w8advTruncationLanes(builderLine+"\n"+coordinatorLine), 0); err != nil {
+		if err := e2eAdversarialTruncationHonest(e2eAdversarialTruncationLanes(builderLine+"\n"+coordinatorLine), 0); err != nil {
 			t.Fatalf("a cut on the checkout-coordinator lane was read as a missing census fact: %v", err)
 		}
-		if err := w8advTruncationHonest(w8advTruncationLanes(builderLine+"\n"+refViewLine), 0); err != nil {
+		if err := e2eAdversarialTruncationHonest(e2eAdversarialTruncationLanes(builderLine+"\n"+refViewLine), 0); err != nil {
 			t.Fatalf("a cut on the ref-view lane was read as a missing census fact: %v", err)
 		}
 	})
 	t.Run("the census may not invent a cut", func(t *testing.T) {
-		if err := w8advTruncationHonest(w8advTruncationLanes("clean"), 2); err == nil {
+		if err := e2eAdversarialTruncationHonest(e2eAdversarialTruncationLanes("clean"), 2); err == nil {
 			t.Fatal("a counter that moved with no build behind it was accepted")
 		}
 	})
 	t.Run("a clean run is clean", func(t *testing.T) {
-		if err := w8advTruncationHonest(w8advTruncationLanes("clean"), 0); err != nil {
+		if err := e2eAdversarialTruncationHonest(e2eAdversarialTruncationLanes("clean"), 0); err != nil {
 			t.Fatalf("a run that truncated nothing was refused: %v", err)
 		}
 	})
 }
 
-func TestW8AdversarialCyclicCorpusReallyContainsTheHostileShapes(t *testing.T) {
+func TestE2EMatrixAdversarialCyclicCorpusReallyContainsTheHostileShapes(t *testing.T) {
 	// The corpus is the row's whole premise: a "cycle" fixture that is
 	// accidentally acyclic, or a "pathless" fixture whose imports all resolve,
 	// would leave the row passing while testing nothing.
 	root := t.TempDir()
 	f := &issue767Fixture{t: t, root: root, primary: filepath.Join(root, "repo")}
-	w8advCyclicCorpus(f)
+	e2eAdversarialCyclicCorpus(f)
 	read := func(name string) string {
 		body, err := os.ReadFile(filepath.Join(f.primary, filepath.FromSlash(name)))
 		if err != nil {
@@ -877,13 +877,13 @@ func TestW8AdversarialCyclicCorpusReallyContainsTheHostileShapes(t *testing.T) {
 	if !strings.Contains(a, "example.invalid/absent/vendorless") || !strings.Contains(b, "example.invalid/absent/vendorless") {
 		t.Fatal("no import of a module that does not exist: there is no pathless identity")
 	}
-	if !strings.Contains(b, "W8NeverDefinedAnywhere") {
+	if !strings.Contains(b, "GxNeverDefinedAnywhere") {
 		t.Fatal("no reference to an undefined symbol: there is no dangling reference")
 	}
 	// The generated corpus cannot supply the cycle, which is why this one is
-	// written by hand; pin that, so a later "just use w8GenerateFixture" edit
+	// written by hand; pin that, so a later "just use sustainedIOGenerateFixture" edit
 	// fails here instead of silently removing the hostility.
-	for _, file := range w8GenerateFixture(w8FixtureSpec{Files: 12, Packages: 3, Seed: 1}) {
+	for _, file := range sustainedIOGenerateFixture(sustainedIOFixtureSpec{Files: 12, Packages: 3, Seed: 1}) {
 		if strings.Contains(file.Content, "p000\"") && strings.Contains(file.Path, "p002/") {
 			t.Fatal("the generated corpus now imports a lower package index; it is no longer acyclic by construction")
 		}

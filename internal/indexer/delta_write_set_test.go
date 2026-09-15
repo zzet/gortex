@@ -68,7 +68,7 @@ func deltaWriteSetChangedPaths(prefix string) []string {
 	return paths
 }
 
-// deltaWriteSetPkgTree mirrors the sustained-workload corpus (w8GenerateFixture
+// deltaWriteSetPkgTree mirrors the sustained-workload corpus (sustainedIOGenerateFixture
 // in cmd/gortex): package-per-directory, an aliased cross-package import in
 // every file, a const and a var block for bulk, four intra-package calls, one
 // cross-package call and a revision probe. It is the shape the P4 diagnosis
@@ -93,23 +93,23 @@ func deltaWriteSetPkgSource(pkg, index, callee, crossPkg, crossFile int, changed
 	if crossPkg != pkg {
 		out += fmt.Sprintf("import cross %q\n\n", fmt.Sprintf("example.invalid/dedicated/p%03d", crossPkg))
 	}
-	out += fmt.Sprintf("const w8Salt%05d = %d\n\n", index, index*7919%100003)
+	out += fmt.Sprintf("const gxSalt%05d = %d\n\n", index, index*7919%100003)
 	out += "var (\n"
 	for i := range 12 {
-		out += fmt.Sprintf("\tw8Data%05dN%02d = %d\n", index, i, (index+i*7919)%100003)
+		out += fmt.Sprintf("\tgxData%05dN%02d = %d\n", index, i, (index+i*7919)%100003)
 	}
 	out += ")\n\n"
 	if changed {
-		out += fmt.Sprintf("func Fn%05dS0() int { return w8Salt%05d + 1 }\n\n", index, index)
+		out += fmt.Sprintf("func Fn%05dS0() int { return gxSalt%05d + 1 }\n\n", index, index)
 	} else {
-		out += fmt.Sprintf("func Fn%05dS0() int { return w8Salt%05d }\n\n", index, index)
+		out += fmt.Sprintf("func Fn%05dS0() int { return gxSalt%05d }\n\n", index, index)
 	}
 	for i := 1; i <= 4; i++ {
 		if callee == index {
-			out += fmt.Sprintf("func Fn%05dS%d() int { return Fn%05dS0() + w8Data%05dN%02d }\n\n", index, i, index, index, i)
+			out += fmt.Sprintf("func Fn%05dS%d() int { return Fn%05dS0() + gxData%05dN%02d }\n\n", index, i, index, index, i)
 			continue
 		}
-		out += fmt.Sprintf("func Fn%05dS%d() int { return Fn%05dS0() + Fn%05dS0() + w8Data%05dN%02d }\n\n", index, i, callee, index, index, i)
+		out += fmt.Sprintf("func Fn%05dS%d() int { return Fn%05dS0() + Fn%05dS0() + gxData%05dN%02d }\n\n", index, i, callee, index, index, i)
 	}
 	if crossPkg != pkg {
 		out += fmt.Sprintf("func Fn%05dS5() int { return cross.Fn%05dS0() + cross.Fn%05dS1() }\n\n", index, crossFile, crossFile)
@@ -120,7 +120,7 @@ func deltaWriteSetPkgSource(pkg, index, callee, crossPkg, crossFile int, changed
 	if changed {
 		probe = 1
 	}
-	out += fmt.Sprintf("func W8Probe%05dRev%d() int { return Fn%05dS0() }\n", index, probe, index)
+	out += fmt.Sprintf("func GxProbe%05dRev%d() int { return Fn%05dS0() }\n", index, probe, index)
 	return out
 }
 
@@ -308,7 +308,7 @@ func (f deltaWriteSetFixture) advance(t *testing.T, tree map[string]string) (int
 
 // -------------------------------------------------------- the entrypoint ---
 
-// TestDedicatedDeltaWriteSetIsTheChangeNotTheClosure is the F3 acceptance on
+// TestDedicatedDeltaWriteSetIsTheChangeNotTheClosure is the acceptance test on
 // the production entrypoint: a ten-file body-only commit over a dedicated base
 // leaves the published delta carrying payload rows for the ten changed files,
 // not for the two hundred closure files the pass had to read to resolve them.

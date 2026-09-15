@@ -22,7 +22,7 @@ import (
 // The isolated-daemon fixture shared by every opt-in end-to-end measurement in
 // this package. It was extracted verbatim from
 // issue767_idle_io_integration_test.go so the idle harness, the worktree
-// readiness harness and the W8 sustained-workload harness drive one private
+// readiness harness and the sustained-workload harness drive one private
 // daemon recipe instead of three drifting copies. Behaviour is unchanged; the
 // only additions are the corpus hook (so a harness can supply a generated
 // corpus in place of the 32-file default), the path-scoped removal wait, the
@@ -988,7 +988,7 @@ func issue767FileSize(path string) int64 {
 // TestIssue767SpellingForIsTheExactnessDemandingDefault pins the dispatcher
 // every default wait in both harnesses routes through.
 //
-// awaitSymbol, awaitSymbolIn, trySearchSymbolIn, w8Run.awaitProbe and therefore
+// awaitSymbol, awaitSymbolIn, trySearchSymbolIn, sustainedIORun.awaitProbe and therefore
 // every exactness wait in P0/P1/P2/P5/P6/P8 call spellingFor(root) rather than
 // naming a spelling. issue767AsOwnCorpus is strictly weaker than
 // issue767AsAutomaticWorktree — it carries no freshness label and its verdict

@@ -14,14 +14,14 @@ import (
 	"testing"
 )
 
-// The deterministic Go corpus the W8 sustained-workload harness indexes.
+// The deterministic Go corpus the sustained-workload harness indexes.
 //
 // It is generated rather than cloned: a clone is neither reproducible across
 // machines nor small enough to keep two arms plus ten worktrees plus two stores
 // on a disk with tens of gigabytes free. Everything here is a pure function of
 // the spec, so a run's manifest can record `{seed, files, packages}` and a later
 // run can rebuild the identical tree — byte for byte, verified by
-// w8FixtureDigest.
+// sustainedIOFixtureDigest.
 //
 // Shape, per map-e2e-io.md §6.1: one go.mod, a root `fixture` package carrying
 // the call target the checkout probe resolves against, one marker.go per
@@ -31,20 +31,20 @@ import (
 // so the generated import graph is acyclic by construction.
 
 const (
-	w8Module        = "example.invalid/issue767"
-	w8PrimaryMarker = "Issue767PrimaryMarker"
-	w8RootTarget    = "Issue767Target00"
+	sustainedIOModule        = "example.invalid/issue767"
+	sustainedIOPrimaryMarker = "Issue767PrimaryMarker"
+	sustainedIORootTarget    = "Issue767Target00"
 )
 
-// w8FixtureSpec is the whole identity of a generated corpus.
-type w8FixtureSpec struct {
+// sustainedIOFixtureSpec is the whole identity of a generated corpus.
+type sustainedIOFixtureSpec struct {
 	Files    int   // package files, excluding go.mod, root.go and marker.go
 	Packages int   // packages the files are spread over
 	Seed     int64 // every pseudo-random choice derives from this
 	Marker   string
 }
 
-func (s w8FixtureSpec) normalize() w8FixtureSpec {
+func (s sustainedIOFixtureSpec) normalize() sustainedIOFixtureSpec {
 	if s.Files < 1 {
 		s.Files = 1500
 	}
@@ -58,26 +58,26 @@ func (s w8FixtureSpec) normalize() w8FixtureSpec {
 		s.Seed = 767
 	}
 	if s.Marker == "" {
-		s.Marker = w8PrimaryMarker
+		s.Marker = sustainedIOPrimaryMarker
 	}
 	return s
 }
 
-// w8FixtureFile is one generated file: a slash-separated path relative to the
+// sustainedIOFixtureFile is one generated file: a slash-separated path relative to the
 // checkout root, and its complete content.
-type w8FixtureFile struct {
+type sustainedIOFixtureFile struct {
 	Path    string
 	Content string
 }
 
-// w8GenerateFixture builds the corpus. Same spec, same bytes, always.
-func w8GenerateFixture(spec w8FixtureSpec) []w8FixtureFile {
+// sustainedIOGenerateFixture builds the corpus. Same spec, same bytes, always.
+func sustainedIOGenerateFixture(spec sustainedIOFixtureSpec) []sustainedIOFixtureFile {
 	spec = spec.normalize()
 	rng := rand.New(rand.NewPCG(uint64(spec.Seed), uint64(spec.Seed)^0x9e3779b97f4a7c15))
 
-	files := []w8FixtureFile{
-		{Path: "go.mod", Content: "module " + w8Module + "\n\ngo 1.24\n"},
-		{Path: "root.go", Content: w8RootSource()},
+	files := []sustainedIOFixtureFile{
+		{Path: "go.mod", Content: "module " + sustainedIOModule + "\n\ngo 1.24\n"},
+		{Path: "root.go", Content: sustainedIORootSource()},
 		{Path: "marker.go", Content: issue767MarkerSource(spec.Marker)},
 	}
 	// Files are dealt round-robin, so every package holds at least one file
@@ -99,68 +99,68 @@ func w8GenerateFixture(spec w8FixtureSpec) []w8FixtureFile {
 		if next := pkg + 1; next < spec.Packages {
 			crossPkg, crossFile = next, next
 		}
-		files = append(files, w8FixtureFile{
-			Path:    w8FilePath(pkg, index),
-			Content: w8FileSource(pkg, index, callee, crossPkg, crossFile, rng.IntN(1<<20)),
+		files = append(files, sustainedIOFixtureFile{
+			Path:    sustainedIOFilePath(pkg, index),
+			Content: sustainedIOFileSource(pkg, index, callee, crossPkg, crossFile, rng.IntN(1<<20)),
 		})
 	}
 	return files
 }
 
-func w8PackageName(pkg int) string { return fmt.Sprintf("p%03d", pkg) }
+func sustainedIOPackageName(pkg int) string { return fmt.Sprintf("p%03d", pkg) }
 
-func w8FilePath(pkg, index int) string {
-	return fmt.Sprintf("%s/file%05d.go", w8PackageName(pkg), index)
+func sustainedIOFilePath(pkg, index int) string {
+	return fmt.Sprintf("%s/file%05d.go", sustainedIOPackageName(pkg), index)
 }
 
-// w8ProbeName is the per-file exactness probe. The sustained harness edits a
+// sustainedIOProbeName is the per-file exactness probe. The sustained harness edits a
 // file by advancing its revision, then waits until a search for the new probe
 // name answers exactly from that exact file — so the wait proves the edited
 // bytes reached the view, not merely that the daemon answered.
-func w8ProbeName(index, revision int) string {
-	return fmt.Sprintf("W8Probe%05dRev%d", index, revision)
+func sustainedIOProbeName(index, revision int) string {
+	return fmt.Sprintf("GxProbe%05dRev%d", index, revision)
 }
 
-func w8RootSource() string {
+func sustainedIORootSource() string {
 	var b strings.Builder
 	b.WriteString("package fixture\n\n")
 	b.WriteString("// Package fixture is the checkout-root package every marker probe resolves\n")
-	b.WriteString("// against. Generated by w8GenerateFixture; do not edit by hand.\n\n")
-	fmt.Fprintf(&b, "func %s() int { return 0 }\n\n", w8RootTarget)
+	b.WriteString("// against. Generated by sustainedIOGenerateFixture; do not edit by hand.\n\n")
+	fmt.Fprintf(&b, "func %s() int { return 0 }\n\n", sustainedIORootTarget)
 	for i := 0; i < 8; i++ {
-		fmt.Fprintf(&b, "func Issue767RootCaller%02d() int { return %s() + %d }\n", i, w8RootTarget, i)
+		fmt.Fprintf(&b, "func Issue767RootCaller%02d() int { return %s() + %d }\n", i, sustainedIORootTarget, i)
 	}
 	return b.String()
 }
 
-// w8FileSource is one generated package file: six exported functions, four
+// sustainedIOFileSource is one generated package file: six exported functions, four
 // intra-package calls, two cross-package calls, a seeded data block that gives
 // the file realistic bulk, and the revision-0 probe.
-func w8FileSource(pkg, index, callee, crossPkg, crossFile, salt int) string {
+func sustainedIOFileSource(pkg, index, callee, crossPkg, crossFile, salt int) string {
 	var b strings.Builder
-	self := w8PackageName(pkg)
+	self := sustainedIOPackageName(pkg)
 	fmt.Fprintf(&b, "package %s\n\n", self)
 	if crossPkg != pkg {
-		fmt.Fprintf(&b, "import cross %q\n\n", w8Module+"/"+w8PackageName(crossPkg))
+		fmt.Fprintf(&b, "import cross %q\n\n", sustainedIOModule+"/"+sustainedIOPackageName(crossPkg))
 	}
 	fmt.Fprintf(&b, "// File %05d of package %s. Generated; every identifier is derived\n", index, self)
 	fmt.Fprintf(&b, "// from the fixture seed so the corpus is reproducible.\n\n")
-	fmt.Fprintf(&b, "const w8Salt%05d = %d\n\n", index, salt)
+	fmt.Fprintf(&b, "const gxSalt%05d = %d\n\n", index, salt)
 	b.WriteString("var (\n")
 	for i := 0; i < 12; i++ {
-		fmt.Fprintf(&b, "\tw8Data%05dN%02d = %d\n", index, i, (salt+i*7919)%100003)
+		fmt.Fprintf(&b, "\tgxData%05dN%02d = %d\n", index, i, (salt+i*7919)%100003)
 	}
 	b.WriteString(")\n\n")
 
 	fmt.Fprintf(&b, "// Fn%05dS0 is the file's own leaf value.\n", index)
-	fmt.Fprintf(&b, "func Fn%05dS0() int { return w8Salt%05d }\n\n", index, index)
+	fmt.Fprintf(&b, "func Fn%05dS0() int { return gxSalt%05d }\n\n", index, index)
 	for i := 1; i <= 4; i++ {
 		fmt.Fprintf(&b, "// Fn%05dS%d calls inside its own package.\n", index, i)
 		if callee == index {
-			fmt.Fprintf(&b, "func Fn%05dS%d() int { return Fn%05dS0() + w8Data%05dN%02d }\n\n", index, i, index, index, i)
+			fmt.Fprintf(&b, "func Fn%05dS%d() int { return Fn%05dS0() + gxData%05dN%02d }\n\n", index, i, index, index, i)
 			continue
 		}
-		fmt.Fprintf(&b, "func Fn%05dS%d() int { return Fn%05dS0() + Fn%05dS0() + w8Data%05dN%02d }\n\n", index, i, callee, index, index, i)
+		fmt.Fprintf(&b, "func Fn%05dS%d() int { return Fn%05dS0() + Fn%05dS0() + gxData%05dN%02d }\n\n", index, i, callee, index, index, i)
 	}
 	fmt.Fprintf(&b, "// Fn%05dS5 calls across a package boundary.\n", index)
 	if crossPkg != pkg {
@@ -168,21 +168,21 @@ func w8FileSource(pkg, index, callee, crossPkg, crossFile, salt int) string {
 	} else {
 		fmt.Fprintf(&b, "func Fn%05dS5() int { return Fn%05dS0() + Fn%05dS1() }\n\n", index, crossFile, crossFile)
 	}
-	fmt.Fprintf(&b, "// %s is the revision probe the harness advances on every edit.\n", w8ProbeName(index, 0))
-	fmt.Fprintf(&b, "func %s() int { return Fn%05dS0() }\n", w8ProbeName(index, 0), index)
+	fmt.Fprintf(&b, "// %s is the revision probe the harness advances on every edit.\n", sustainedIOProbeName(index, 0))
+	fmt.Fprintf(&b, "func %s() int { return Fn%05dS0() }\n", sustainedIOProbeName(index, 0), index)
 	return b.String()
 }
 
-// w8EditFileSource is the small edit the sustained workload applies. It is
+// sustainedIOEditFileSource is the small edit the sustained workload applies. It is
 // exactly two things, and the distinction is load-bearing for what the P2 phase
 // can be said to measure:
 //
 //  1. A body change. The leaf function Fn…S0 keeps its name, its signature and
 //     its position; only the expression inside its braces moves
-//     ("return w8Salt00042" → "return w8Salt00042 + 3"). No declaration is
+//     ("return gxSalt00042" → "return gxSalt00042 + 3"). No declaration is
 //     added, removed or renamed by this half, and the const and var blocks are
 //     byte-identical afterwards.
-//  2. A one-line revision stub rename, W8Probe…Rev(n-1) → W8Probe…Rev(n).
+//  2. A one-line revision stub rename, GxProbe…Rev(n-1) → GxProbe…Rev(n).
 //
 // The stub exists only so the wait has something to look for: a symbol search
 // cannot observe a body, so an edit with no declaration change has no name a
@@ -190,9 +190,9 @@ func w8FileSource(pkg, index, callee, crossPkg, crossFile, salt int) string {
 // on evidence. Every edit therefore carries the same one-line rename overhead —
 // identical on both arms of a paired run — on top of the body change that is
 // the edit class being measured.
-func w8EditFileSource(source string, index, revision int) (string, error) {
-	previous := w8ProbeName(index, revision-1)
-	next := w8ProbeName(index, revision)
+func sustainedIOEditFileSource(source string, index, revision int) (string, error) {
+	previous := sustainedIOProbeName(index, revision-1)
+	next := sustainedIOProbeName(index, revision)
 	if !strings.Contains(source, previous) {
 		return "", fmt.Errorf("file %d does not carry probe %s", index, previous)
 	}
@@ -206,13 +206,13 @@ func w8EditFileSource(source string, index, revision int) (string, error) {
 	if end < 0 {
 		return "", fmt.Errorf("file %d leaf function is unterminated", index)
 	}
-	body := fmt.Sprintf("%sw8Salt%05d + %d }", leaf, index, revision)
+	body := fmt.Sprintf("%sgxSalt%05d + %d }", leaf, index, revision)
 	return edited[:start] + body + edited[start+end:], nil
 }
 
-// w8RotationTargets picks count files to rotate edits over, spread across the
+// sustainedIORotationTargets picks count files to rotate edits over, spread across the
 // corpus rather than clustered in one package, deterministically.
-func w8RotationTargets(spec w8FixtureSpec, count int) []int {
+func sustainedIORotationTargets(spec sustainedIOFixtureSpec, count int) []int {
 	spec = spec.normalize()
 	if count > spec.Files {
 		count = spec.Files
@@ -237,9 +237,9 @@ func w8RotationTargets(spec w8FixtureSpec, count int) []int {
 	return targets
 }
 
-// w8FixtureDigest is the corpus identity recorded in a run manifest.
-func w8FixtureDigest(files []w8FixtureFile) string {
-	sorted := append([]w8FixtureFile(nil), files...)
+// sustainedIOFixtureDigest is the corpus identity recorded in a run manifest.
+func sustainedIOFixtureDigest(files []sustainedIOFixtureFile) string {
+	sorted := append([]sustainedIOFixtureFile(nil), files...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
 	sum := sha256.New()
 	for _, file := range sorted {
@@ -251,10 +251,10 @@ func w8FixtureDigest(files []w8FixtureFile) string {
 
 // ---------------------------------------------------------------- tests ---
 
-func TestW8GenerateFixtureIsDeterministic(t *testing.T) {
-	spec := w8FixtureSpec{Files: 120, Packages: 7, Seed: 42}
-	first, second := w8GenerateFixture(spec), w8GenerateFixture(spec)
-	if w8FixtureDigest(first) != w8FixtureDigest(second) {
+func TestSustainedIOGenerateFixtureIsDeterministic(t *testing.T) {
+	spec := sustainedIOFixtureSpec{Files: 120, Packages: 7, Seed: 42}
+	first, second := sustainedIOGenerateFixture(spec), sustainedIOGenerateFixture(spec)
+	if sustainedIOFixtureDigest(first) != sustainedIOFixtureDigest(second) {
 		t.Fatal("same spec produced different corpora")
 	}
 	if len(first) != spec.Files+3 {
@@ -262,7 +262,7 @@ func TestW8GenerateFixtureIsDeterministic(t *testing.T) {
 	}
 	other := spec
 	other.Seed = 43
-	if w8FixtureDigest(w8GenerateFixture(other)) == w8FixtureDigest(first) {
+	if sustainedIOFixtureDigest(sustainedIOGenerateFixture(other)) == sustainedIOFixtureDigest(first) {
 		t.Fatal("a different seed produced an identical corpus")
 	}
 	seen := map[string]bool{}
@@ -284,30 +284,30 @@ func TestW8GenerateFixtureIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestW8GenerateFixtureDefaultsMatchTheDocumentedShape(t *testing.T) {
-	spec := w8FixtureSpec{}.normalize()
-	if spec.Files != 1500 || spec.Packages != 60 || spec.Seed != 767 || spec.Marker != w8PrimaryMarker {
+func TestSustainedIOGenerateFixtureDefaultsMatchTheDocumentedShape(t *testing.T) {
+	spec := sustainedIOFixtureSpec{}.normalize()
+	if spec.Files != 1500 || spec.Packages != 60 || spec.Seed != 767 || spec.Marker != sustainedIOPrimaryMarker {
 		t.Fatalf("defaults drifted: %+v", spec)
 	}
-	if clamped := (w8FixtureSpec{Files: 4, Packages: 60}).normalize(); clamped.Packages != 4 {
+	if clamped := (sustainedIOFixtureSpec{Files: 4, Packages: 60}).normalize(); clamped.Packages != 4 {
 		t.Fatalf("package count must clamp to the file count, got %+v", clamped)
 	}
 }
 
-// TestW8GenerateFixtureFillsEveryPackageForAwkwardSplits is the round-robin
+// TestSustainedIOGenerateFixtureFillsEveryPackageForAwkwardSplits is the round-robin
 // layout's reason to exist: a block layout (ceil(Files/Packages) per package)
 // leaves trailing packages empty whenever the split is not clean, and a file in
 // the last non-empty package then imports a package directory that was never
 // generated — an unresolvable import silently changes what the corpus measures.
-func TestW8GenerateFixtureFillsEveryPackageForAwkwardSplits(t *testing.T) {
-	for _, spec := range []w8FixtureSpec{
+func TestSustainedIOGenerateFixtureFillsEveryPackageForAwkwardSplits(t *testing.T) {
+	for _, spec := range []sustainedIOFixtureSpec{
 		{Files: 10, Packages: 6, Seed: 1},
 		{Files: 7, Packages: 4, Seed: 2},
 		{Files: 13, Packages: 5, Seed: 3},
 		{Files: 200, Packages: 60, Seed: 4},
 	} {
 		t.Run(fmt.Sprintf("files%d_packages%d", spec.Files, spec.Packages), func(t *testing.T) {
-			files := w8GenerateFixture(spec)
+			files := sustainedIOGenerateFixture(spec)
 			present := map[string]bool{}
 			for _, file := range files {
 				if dir := filepath.Dir(file.Path); dir != "." {
@@ -338,8 +338,8 @@ func TestW8GenerateFixtureFillsEveryPackageForAwkwardSplits(t *testing.T) {
 	}
 }
 
-func TestW8GenerateFixtureParsesAndKeepsImportsAcyclic(t *testing.T) {
-	files := w8GenerateFixture(w8FixtureSpec{Files: 200, Packages: 11, Seed: 9})
+func TestSustainedIOGenerateFixtureParsesAndKeepsImportsAcyclic(t *testing.T) {
+	files := sustainedIOGenerateFixture(sustainedIOFixtureSpec{Files: 200, Packages: 11, Seed: 9})
 	fset := token.NewFileSet()
 	imports := 0
 	for _, file := range files {
@@ -365,8 +365,8 @@ func TestW8GenerateFixtureParsesAndKeepsImportsAcyclic(t *testing.T) {
 	}
 }
 
-func TestW8GenerateFixtureCarriesCallEdges(t *testing.T) {
-	files := w8GenerateFixture(w8FixtureSpec{Files: 40, Packages: 4, Seed: 5})
+func TestSustainedIOGenerateFixtureCarriesCallEdges(t *testing.T) {
+	files := sustainedIOGenerateFixture(sustainedIOFixtureSpec{Files: 40, Packages: 4, Seed: 5})
 	var sample string
 	for _, file := range files {
 		if strings.HasPrefix(file.Path, "p001/") {
@@ -387,11 +387,11 @@ func TestW8GenerateFixtureCarriesCallEdges(t *testing.T) {
 	}
 }
 
-// w8DeclaredNames is every top-level declared name in a Go source file, and
-// w8LeafBody is the source line of the leaf function the edit rewrites. The
+// sustainedIODeclaredNames is every top-level declared name in a Go source file, and
+// sustainedIOLeafBody is the source line of the leaf function the edit rewrites. The
 // edit test compares names, not counts: a count survives a rename, and a rename
 // is a different — heavier — edit class than a body change.
-func w8DeclaredNames(t *testing.T, label, source string) (map[string]bool, []string) {
+func sustainedIODeclaredNames(t *testing.T, label, source string) (map[string]bool, []string) {
 	t.Helper()
 	fset := token.NewFileSet()
 	parsed, err := parser.ParseFile(fset, label, source, parser.AllErrors)
@@ -423,7 +423,7 @@ func w8DeclaredNames(t *testing.T, label, source string) (map[string]bool, []str
 	return names, imports
 }
 
-func w8LeafBody(source string, index int) string {
+func sustainedIOLeafBody(source string, index int) string {
 	prefix := fmt.Sprintf("func Fn%05dS0() int {", index)
 	start := strings.Index(source, prefix)
 	if start < 0 {
@@ -436,34 +436,34 @@ func w8LeafBody(source string, index int) string {
 	return source[start : start+end]
 }
 
-func TestW8EditFileSourceChangesOneBodyAndTheRevisionStub(t *testing.T) {
-	files := w8GenerateFixture(w8FixtureSpec{Files: 10, Packages: 2, Seed: 3})
+func TestSustainedIOEditFileSourceChangesOneBodyAndTheRevisionStub(t *testing.T) {
+	files := sustainedIOGenerateFixture(sustainedIOFixtureSpec{Files: 10, Packages: 2, Seed: 3})
 	index := 4
 	var original string
 	for _, file := range files {
-		if file.Path == w8FilePath(index%2, index) {
+		if file.Path == sustainedIOFilePath(index%2, index) {
 			original = file.Content
 		}
 	}
 	if original == "" {
 		t.Fatalf("no generated file for index %d", index)
 	}
-	edited, err := w8EditFileSource(original, index, 1)
+	edited, err := sustainedIOEditFileSource(original, index, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if edited == original {
 		t.Fatal("edit was a no-op")
 	}
-	if strings.Contains(edited, w8ProbeName(index, 0)) {
+	if strings.Contains(edited, sustainedIOProbeName(index, 0)) {
 		t.Error("edited file still carries the previous revision probe")
 	}
-	if !strings.Contains(edited, w8ProbeName(index, 1)) {
+	if !strings.Contains(edited, sustainedIOProbeName(index, 1)) {
 		t.Error("edited file does not carry the new revision probe")
 	}
 
 	// (1) The leaf function's BODY moved, and its declaration did not.
-	beforeBody, afterBody := w8LeafBody(original, index), w8LeafBody(edited, index)
+	beforeBody, afterBody := sustainedIOLeafBody(original, index), sustainedIOLeafBody(edited, index)
 	if beforeBody == "" || afterBody == "" {
 		t.Fatalf("leaf function not found: before=%q after=%q", beforeBody, afterBody)
 	}
@@ -477,15 +477,15 @@ func TestW8EditFileSourceChangesOneBodyAndTheRevisionStub(t *testing.T) {
 
 	// (2) The ONLY declared name that moved is the revision stub. A count
 	// comparison would let a rename of any other declaration through.
-	beforeNames, beforeImports := w8DeclaredNames(t, "before.go", original)
-	afterNames, afterImports := w8DeclaredNames(t, "after.go", edited)
+	beforeNames, beforeImports := sustainedIODeclaredNames(t, "before.go", original)
+	afterNames, afterImports := sustainedIODeclaredNames(t, "after.go", edited)
 	for name := range beforeNames {
-		if !afterNames[name] && name != "func "+w8ProbeName(index, 0) {
+		if !afterNames[name] && name != "func "+sustainedIOProbeName(index, 0) {
 			t.Errorf("edit removed declaration %q", name)
 		}
 	}
 	for name := range afterNames {
-		if !beforeNames[name] && name != "func "+w8ProbeName(index, 1) {
+		if !beforeNames[name] && name != "func "+sustainedIOProbeName(index, 1) {
 			t.Errorf("edit added declaration %q", name)
 		}
 	}
@@ -497,7 +497,7 @@ func TestW8EditFileSourceChangesOneBodyAndTheRevisionStub(t *testing.T) {
 	// byte-identical, so the edit is not a file rewrite wearing a body's name.
 	for _, line := range strings.Split(original, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "const w8Salt") && !strings.HasPrefix(trimmed, "w8Data") {
+		if !strings.HasPrefix(trimmed, "const gxSalt") && !strings.HasPrefix(trimmed, "gxData") {
 			continue
 		}
 		if !strings.Contains(edited, line) {
@@ -506,31 +506,31 @@ func TestW8EditFileSourceChangesOneBodyAndTheRevisionStub(t *testing.T) {
 	}
 
 	// Advancing again must chain off the previous revision, never off zero.
-	second, err := w8EditFileSource(edited, index, 2)
+	second, err := sustainedIOEditFileSource(edited, index, 2)
 	if err != nil {
 		t.Fatalf("second edit: %v", err)
 	}
-	if w8LeafBody(second, index) == afterBody {
+	if sustainedIOLeafBody(second, index) == afterBody {
 		t.Error("the second edit left the leaf body where the first put it")
 	}
-	if _, err := w8EditFileSource(original, index, 3); err == nil {
+	if _, err := sustainedIOEditFileSource(original, index, 3); err == nil {
 		t.Error("editing to revision 3 from revision 0 source must be refused")
 	}
 }
 
-// TestW8FileContentBulkIsSeeded pins the per-file data block to the seed.
+// TestSustainedIOFileContentBulkIsSeeded pins the per-file data block to the seed.
 // Without it a generator that emitted the SAME data block in every file (a
 // constant in place of the per-file salt) stays green — the corpus still
 // parses, still spans the packages and still differs between seeds through the
 // callee choice alone — while what the corpus costs to index changes
 // underneath every measurement taken with it.
-func TestW8FileContentBulkIsSeeded(t *testing.T) {
-	spec := w8FixtureSpec{Files: 24, Packages: 4, Seed: 11}
-	salts := func(spec w8FixtureSpec) map[string]string {
+func TestSustainedIOFileContentBulkIsSeeded(t *testing.T) {
+	spec := sustainedIOFixtureSpec{Files: 24, Packages: 4, Seed: 11}
+	salts := func(spec sustainedIOFixtureSpec) map[string]string {
 		out := map[string]string{}
-		for _, file := range w8GenerateFixture(spec) {
+		for _, file := range sustainedIOGenerateFixture(spec) {
 			for _, line := range strings.Split(file.Content, "\n") {
-				if strings.HasPrefix(line, "const w8Salt") {
+				if strings.HasPrefix(line, "const gxSalt") {
 					_, value, _ := strings.Cut(line, "= ")
 					out[file.Path] = strings.TrimSpace(value)
 				}
@@ -568,9 +568,9 @@ func TestW8FileContentBulkIsSeeded(t *testing.T) {
 	}
 }
 
-func TestW8RotationTargetsAreSpreadAndStable(t *testing.T) {
-	spec := w8FixtureSpec{Files: 100, Packages: 10, Seed: 1}
-	first := w8RotationTargets(spec, 10)
+func TestSustainedIORotationTargetsAreSpreadAndStable(t *testing.T) {
+	spec := sustainedIOFixtureSpec{Files: 100, Packages: 10, Seed: 1}
+	first := sustainedIORotationTargets(spec, 10)
 	if len(first) != 10 {
 		t.Fatalf("got %d targets, want 10", len(first))
 	}
@@ -589,13 +589,13 @@ func TestW8RotationTargetsAreSpreadAndStable(t *testing.T) {
 	if len(packages) < 2 {
 		t.Fatalf("targets clustered into %d package(s)", len(packages))
 	}
-	second := w8RotationTargets(spec, 10)
+	second := sustainedIORotationTargets(spec, 10)
 	for i := range first {
 		if first[i] != second[i] {
 			t.Fatalf("rotation targets are not stable: %v vs %v", first, second)
 		}
 	}
-	if got := w8RotationTargets(w8FixtureSpec{Files: 3, Packages: 1, Seed: 1}, 10); len(got) != 3 {
+	if got := sustainedIORotationTargets(sustainedIOFixtureSpec{Files: 3, Packages: 1, Seed: 1}, 10); len(got) != 3 {
 		t.Fatalf("target count must clamp to the corpus size, got %v", got)
 	}
 }
