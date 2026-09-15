@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -1753,14 +1752,10 @@ func e2eLifecycleFillVolume(path string, keepFree int64) error {
 }
 
 // e2eLifecycleFreeBytes is the free space on the volume holding path. Only the
-// disk-full row uses it, and only against a volume this file created.
-func e2eLifecycleFreeBytes(path string) (int64, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0, err
-	}
-	return int64(uint64(stat.Bavail) * uint64(stat.Bsize)), nil
-}
+// disk-full row uses it, and only against a volume this file created. Its two
+// implementations live in e2e_matrix_diskspace_unix_test.go and
+// e2e_matrix_diskspace_windows_test.go: statfs is POSIX-only, and the whole
+// cmd/gortex test package failed to build on Windows while it was named here.
 
 func e2eLifecycleVolumeFree(path string) string {
 	free, err := e2eLifecycleFreeBytes(path)
