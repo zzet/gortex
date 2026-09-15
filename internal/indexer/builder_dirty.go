@@ -71,6 +71,43 @@ type DirtyLayerRequest struct {
 	// before the checkout is re-sampled, which is exactly the window the
 	// fingerprint check exists to close. nil in production.
 	buildBarrier func()
+
+	// stamped, when non-nil, receives the identity this build actually
+	// stamped from its OWN sample, on every attempt.
+	//
+	// It is not a seam: the coordinator files the built generation in its
+	// working-tree reuse cache under the key this renders, and it has to be
+	// the build's key rather than the one the coordinator's earlier sample
+	// would render. The two samples are taken at different instants, and a
+	// tree that moves between them would otherwise file the generation under
+	// a key its own row does not render — an entry no lookup can ever hit,
+	// occupying a slot that would have held a real one. The retry loop
+	// overwrites it per attempt, so the value after a successful return is
+	// the identity of the generation that was published.
+	stamped *GenerationIdentity
+}
+
+// StampDirtyLayerIdentity fills in the four fields of a working-tree layer's
+// identity that are a function of the sample it is built from, and nothing
+// else.
+//
+// It exists because two callers have to agree on them exactly. BuildDirtyLayer
+// stamps them from its OWN sample, so a caller cannot name one working-tree
+// state and build another; the coordinator's reuse cache has to render the
+// same identity from the sample it took to decide whether to build at all. Two
+// separate copies of "which fields the builder stamps" would drift, and the
+// drift would show up as a reuse cache that silently never hits — or, worse,
+// as a key that claims two different working trees are the same build. There
+// is one definition, and it is here, beside the builder that owns it.
+//
+// The content fingerprint is the lower view: a dirty layer's lower view IS the
+// working tree it was read from, and the fingerprint is what identifies it.
+func StampDirtyLayerIdentity(identity GenerationIdentity, snap gitstate.DirtySnapshot) GenerationIdentity {
+	identity.GenerationKind = DirtyLayerGenerationKind
+	identity.TreeOID = snap.HeadTree
+	identity.ProvenanceCommitOID = snap.HeadCommit
+	identity.LowerViewFingerprint = snap.Fingerprint
+	return identity
 }
 
 // BuildDirtyLayer builds the sparse generation that turns a checkout's
@@ -100,11 +137,10 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	}
 	defer target.Close() //nolint:errcheck // the source is read-only; a close failure cannot lose work
 
-	identity := req.Identity
-	identity.GenerationKind = DirtyLayerGenerationKind
-	identity.TreeOID = before.HeadTree
-	identity.ProvenanceCommitOID = before.HeadCommit
-	identity.LowerViewFingerprint = before.Fingerprint
+	identity := StampDirtyLayerIdentity(req.Identity, before)
+	if req.stamped != nil {
+		*req.stamped = identity
+	}
 
 	changes, err := dirtyLayerChangesContext(ctx, before)
 	if err != nil {

@@ -36,6 +36,18 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	force bool,
 	finalize func(*RepoMetadata) error,
 ) (nodesRemoved, edgesRemoved int, err error) {
+	return mi.untrackRepoCheckedRetainingAdmission(ctx, repoPrefix, force, finalize, false)
+}
+
+// untrackRepoCheckedRetainingAdmission is the lifecycle-only continuation path.
+// Legacy callers keep the four-argument wrapper and release admission normally.
+func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
+	ctx context.Context,
+	repoPrefix string,
+	force bool,
+	finalize func(*RepoMetadata) error,
+	retainAdmission bool,
+) (nodesRemoved, edgesRemoved int, err error) {
 	if repoPrefix == "" {
 		return 0, 0, fmt.Errorf("indexer: repository teardown refuses an empty prefix")
 	}
@@ -129,6 +141,7 @@ func (mi *MultiIndexer) untrackRepoChecked(
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	state.retainAdmission = state.retainAdmission || retainAdmission
 	if state.finalize == nil && finalize != nil {
 		state.finalize = finalize
 	}
@@ -193,6 +206,9 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	// holds its pointer observes completed=true; a fresh track cannot enter
 	// until the exact closed coordinator is detached immediately afterwards.
 	state.completed = true
+	if state.retainAdmission {
+		return state.nodesRemoved, state.edgesRemoved, nil
+	}
 	mi.mu.Lock()
 	if mi.pendingRepositoryUntracks[repoPrefix] == state {
 		delete(mi.pendingRepositoryUntracks, repoPrefix)

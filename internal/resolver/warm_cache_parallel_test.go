@@ -106,7 +106,9 @@ func TestWarmCacheParallel_WarmLookupCacheContents(t *testing.T) {
 	}
 
 	r := New(g)
-	r.warmLookupCache(pending)
+	if err := r.warmLookupCache(pending); err != nil {
+		t.Fatal(err)
+	}
 	defer r.clearLookupCache()
 
 	// Every edge endpoint id is cached to its node.

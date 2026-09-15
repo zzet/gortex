@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -141,5 +142,165 @@ func TestSavings_ImportIsIdempotent(t *testing.T) {
 	}
 	if got := buckets[""].Calls; got != 1 {
 		t.Errorf("calls after double import = %d, want 1", got)
+	}
+}
+
+// The cost that made accounting the dominant writer on an idle machine: one
+// durable transaction per recorded tool call. A batch is ONE transaction
+// however many observations it carries, and it must fold repeated buckets
+// into a single upsert rather than one per event.
+func TestAddSavingsObservations_OneTransactionPerBatch(t *testing.T) {
+	sc, _ := openTestSidecar(t)
+	defer sc.Close()
+
+	base := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	const n = 12
+	batch := make([]SavingsEvent, 0, n)
+	for i := range n {
+		batch = append(batch, SavingsEvent{
+			TS:        base.Add(time.Duration(i) * time.Second),
+			SessionID: "sess",
+			Tool:      "search_symbols",
+			Repo:      "repo-a",
+			Language:  "go",
+			Returned:  10,
+			Saved:     100,
+		})
+	}
+	before := sc.SavingsCommitCount()
+	if err := sc.AddSavingsObservations(batch); err != nil {
+		t.Fatal(err)
+	}
+	if got := sc.SavingsCommitCount() - before; got != 1 {
+		t.Errorf("commits for a %d-observation batch = %d, want 1", n, got)
+	}
+
+	buckets, firstSeen, lastUpdated, err := sc.SavingsTotals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if top := buckets[""]; top.Calls != n || top.Saved != n*100 || top.Returned != n*10 {
+		t.Errorf("top-line bucket = %+v, want calls=%d saved=%d returned=%d", top, n, n*100, n*10)
+	}
+	if r := buckets["repo:repo-a"]; r.Calls != n || r.Saved != n*100 {
+		t.Errorf("repo bucket = %+v, want calls=%d saved=%d", r, n, n*100)
+	}
+	if l := buckets["lang:go"]; l.Calls != n || l.Saved != n*100 {
+		t.Errorf("lang bucket = %+v, want calls=%d saved=%d", l, n, n*100)
+	}
+	if !firstSeen.Equal(base) {
+		t.Errorf("first_seen = %v, want the batch's earliest ts %v", firstSeen, base)
+	}
+	if want := base.Add((n - 1) * time.Second); !lastUpdated.Equal(want) {
+		t.Errorf("last_updated = %v, want the batch's latest ts %v", lastUpdated, want)
+	}
+
+	evs, err := sc.SavingsEventsSince(time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != n {
+		t.Errorf("event rows = %d, want %d (batching must not collapse the event log)", len(evs), n)
+	}
+}
+
+// Physical evidence for the same claim, in the unit the diagnosis measured:
+// sidecar WAL bytes. Twelve one-observation transactions cost ~12x what one
+// twelve-observation transaction costs; the assertion is deliberately loose
+// (half, not a twelfth) so page-layout differences between platforms cannot
+// make it flake while a reverted batch still fails it.
+func TestAddSavingsObservations_WALCostFarBelowPerCall(t *testing.T) {
+	const n = 12
+	base := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	event := func(i int) SavingsEvent {
+		return SavingsEvent{
+			TS: base.Add(time.Duration(i) * time.Second), SessionID: "sess",
+			Tool: "search_symbols", Repo: "repo-a", Language: "go", Returned: 10, Saved: 100,
+		}
+	}
+	walSize := func(t *testing.T, path string) int64 {
+		t.Helper()
+		fi, err := os.Stat(path + "-wal")
+		if err != nil {
+			return 0
+		}
+		return fi.Size()
+	}
+
+	scPer, perPath := openTestSidecar(t)
+	defer scPer.Close()
+	startPer := walSize(t, perPath)
+	for i := range n {
+		if err := scPer.AddSavingsObservation(event(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	perCall := walSize(t, perPath) - startPer
+
+	scBatch, batchPath := openTestSidecar(t)
+	defer scBatch.Close()
+	startBatch := walSize(t, batchPath)
+	batch := make([]SavingsEvent, 0, n)
+	for i := range n {
+		batch = append(batch, event(i))
+	}
+	if err := scBatch.AddSavingsObservations(batch); err != nil {
+		t.Fatal(err)
+	}
+	batched := walSize(t, batchPath) - startBatch
+
+	t.Logf("sidecar WAL growth: %d observations one-by-one = %d B, as one batch = %d B", n, perCall, batched)
+	if perCall <= 0 {
+		t.Skip("no measurable WAL growth on this filesystem; the transaction-count assertion carries the contract")
+	}
+	if batched >= perCall/2 {
+		t.Errorf("batched WAL growth = %d B, want well under half of the per-call %d B", batched, perCall)
+	}
+}
+
+// A buffered batch can reach the database after another process has already
+// recorded a NEWER observation. Overwriting the stamps would walk
+// last_updated backwards (and a late first batch would overwrite an earlier
+// first_seen), so both stamps combine with what is stored.
+func TestAddSavingsObservations_StampsNeverMoveBackwards(t *testing.T) {
+	sc, _ := openTestSidecar(t)
+	defer sc.Close()
+
+	newer := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	older := newer.Add(-2 * time.Hour)
+	if err := sc.AddSavingsObservations([]SavingsEvent{{TS: newer, Tool: "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.AddSavingsObservations([]SavingsEvent{{TS: older, Tool: "a"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, firstSeen, lastUpdated, err := sc.SavingsTotals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !firstSeen.Equal(older) {
+		t.Errorf("first_seen = %v, want the earliest observed %v", firstSeen, older)
+	}
+	if !lastUpdated.Equal(newer) {
+		t.Errorf("last_updated = %v, want the latest observed %v (a late batch must not rewind it)", lastUpdated, newer)
+	}
+}
+
+// An empty flush must not open a transaction: the flush timer fires on a
+// store whose buffer a reader already drained, and that must cost nothing.
+func TestAddSavingsObservations_EmptyBatchCommitsNothing(t *testing.T) {
+	sc, _ := openTestSidecar(t)
+	defer sc.Close()
+
+	before := sc.SavingsCommitCount()
+	if err := sc.AddSavingsObservations(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.AddSavingsObservations([]SavingsEvent{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := sc.SavingsCommitCount() - before; got != 0 {
+		t.Errorf("commits for empty batches = %d, want 0", got)
 	}
 }

@@ -9,8 +9,22 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+// RepoIndexStateBaseViewGen is the view generation ReadRepoIndexStates reads,
+// and the only one it will ever read: the base corpus a plain index writes.
+//
+// It is exported so the callers that PRESENT these rows — `gortex repos` is the
+// one in tree — can declare the scope of what they show from the same constant
+// the query is built with, instead of restating "base only" in prose that can
+// drift away from the predicate. A daemon serving routed worktree views holds
+// derived generations beside these rows; nothing here reads them, so nothing
+// that renders them may imply it did.
+const RepoIndexStateBaseViewGen = 0
+
 // ReadRepoIndexStates opens the SQLite store at path read-only and returns
 // every repo_index_state freshness row keyed by repo_prefix.
+//
+// The rows are BASE-ONLY by construction — see RepoIndexStateBaseViewGen and
+// the query below.
 //
 // It is a deliberately lightweight side door for read-only callers (notably
 // `gortex repos`) that must inspect index freshness WITHOUT going through
@@ -51,14 +65,16 @@ func ReadRepoIndexStates(path string) (map[string]graph.RepoIndexState, error) {
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 
-	// view_gen = 0 is spelled out rather than inherited from a Store handle:
-	// this door never opens one, and every caller of it wants the base corpus
-	// a plain index writes, not whatever derived view a daemon happens to be
-	// serving. A store that predates the column holds only base rows, so the
+	// The base generation is spelled out rather than inherited from a Store
+	// handle: this door never opens one, and every caller of it wants the base
+	// corpus a plain index writes, not whatever derived view a daemon happens
+	// to be serving. It is bound from RepoIndexStateBaseViewGen so a caller
+	// that declares the scope of these rows and this predicate cannot drift
+	// apart. A store that predates the column holds only base rows, so the
 	// fallback below reads exactly the same set.
 	rows, err := db.Query(`
 SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions
-  FROM repo_index_state WHERE view_gen = 0`)
+  FROM repo_index_state WHERE view_gen = ?`, RepoIndexStateBaseViewGen)
 	if err != nil && isMissingColumnErr(err, "view_gen") {
 		rows, err = db.Query(`
 SELECT repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions

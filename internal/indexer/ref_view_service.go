@@ -41,6 +41,11 @@ func (l *CheckoutLifecycle) EnsureRefView(ctx context.Context, sel RefViewSelect
 	if l == nil || l.store == nil || l.catalog == nil {
 		return RefViewResult{}, fmt.Errorf("indexer: this daemon serves no ref views")
 	}
+	ownerRead, err := l.AcquireRepositoryRead(sel.GraphID)
+	if err != nil {
+		return RefViewResult{}, err
+	}
+	defer ownerRead.Release()
 	dedicated, found, err := l.catalog.GetDedicatedGraph(ctx, sel.GraphID)
 	if err != nil {
 		return RefViewResult{}, err
@@ -89,13 +94,17 @@ func (l *CheckoutLifecycle) RefViewGeneration(ctx context.Context, refViewID str
 func (l *CheckoutLifecycle) refViewManager(repoPrefix string, idx *Indexer) (*RefViewManager, error) {
 	l.refViewMu.Lock()
 	defer l.refViewMu.Unlock()
+	if _, closing := l.closingRefViews[repoPrefix]; l.refViewsClosed || closing {
+		return nil, ErrRefViewManagerClosed
+	}
 	if manager, cached := l.refViews[repoPrefix]; cached {
 		return manager, nil
 	}
-	index := config.Default().Index
+	repoCfg := config.Default()
 	if l.cfgMgr != nil {
-		index = l.cfgMgr.GetRepoConfig(repoPrefix).Index
+		repoCfg = l.cfgMgr.GetRepoConfig(repoPrefix)
 	}
+	index := repoCfg.Index
 	manager, err := NewRefViewManager(RefViewManagerConfig{
 		Store: l.store,
 		Builder: &SparseGenerationBuilder{
@@ -107,8 +116,59 @@ func (l *CheckoutLifecycle) refViewManager(repoPrefix string, idx *Indexer) (*Re
 			Embedder:   l.mi.embedder,
 		},
 		Config: index,
-		Logger: l.logger,
-		Gate:   l.buildGate(),
+		// The two inputs a ref view's generation identity needs to be a real
+		// claim rather than a degraded one. The lifecycle holds both — it hands
+		// a checkout coordinator exactly the same pair — and a ref view
+		// composes over the same corpus under the same rules.
+		//
+		// Leases is what moves the revision: without it
+		// dependencyCohortSource.describe refuses before it reads anything, so
+		// EVERY ref-view generation carried the degraded revision.
+		//
+		// The configuration sections are passed as a SOURCE rather than as a
+		// value, and that is the load-bearing part. A manager is cached per
+		// repository for the life of the daemon while a reload swaps that
+		// repository's whole config.Config underneath it, so a list frozen here
+		// would keep keying generations on the artifacts / semantic / LSP /
+		// workspace / project domains as they stood when some first selection
+		// happened to build this manager — and a view built after the reload
+		// would reuse a generation produced under rules that no longer apply.
+		// repoConfigSections re-reads the ConfigManager on each description, so
+		// a configuration change re-keys. The frozen list stays as the fallback
+		// for a lifecycle with no ConfigManager at all, where the source
+		// answers nothing and an empty section list would otherwise collapse
+		// the widened digest back onto config.IndexConfig alone.
+		//
+		// Safe to certify here only because the manager's memo now refreshes:
+		// the lifecycle invalidates it on owner registration, registry teardown
+		// and configuration reload, a membership change is self-observed
+		// through the topology token, and a refusal is never cached. The
+		// sibling HEAD/tree source is still the git watcher's to wire.
+		ConfigSections:    dedicatedBaseConfigSections(repoCfg),
+		ConfigSectionsFor: l.repoConfigSections,
+		Leases:            l.leases,
+		Logger:            l.logger,
+		Gate:              l.buildGate(),
+		// The ref view's half of the committed-base consumer gate, wired the
+		// same way buildCoordinator wires a dependent checkout's.
+		//
+		// A ref view IS a consumer of the base — dedicatedBaseConsumers counts
+		// one, because RefViewManager.base resolves its lower snapshot through
+		// the same graphBase a commit layer does — so the moment a selection
+		// finds the graph has published none, the family has a reader and the
+		// publication the startup path deferred is owed. Without this a view
+		// created on a running daemon whose family has no dependent checkout
+		// composes over mutable generation 0 until the next HEAD movement or
+		// the next daemon start, and on an idle-HEAD repository that is
+		// forever.
+		//
+		// The reason names no graph: the manager is cached per repository for
+		// the life of the daemon and serves every ref view of it, so a graph
+		// id captured here would be whichever one happened to build it.
+		// requestDedicatedBase logs the prefix the closure is handed.
+		RequestBase: func(prefix string) {
+			l.requestDedicatedBase(prefix, "a ref view composes over an unpublished primary")
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -118,4 +178,23 @@ func (l *CheckoutLifecycle) refViewManager(repoPrefix string, idx *Indexer) (*Re
 	}
 	l.refViews[repoPrefix] = manager
 	return manager, nil
+}
+
+// repoConfigSections renders one repository's output-affecting configuration
+// domains as they stand NOW.
+//
+// This is the source a cached ref-view manager describes its cohort through,
+// so the answer follows a configuration reload instead of the manager's
+// construction. It reads the same ConfigManager the reload refreshed
+// (MultiIndexer.RefreshRepoConfigs re-reads each repository's `.gortex.yaml`
+// into it), which is what makes ApplyReload's invalidation produce a new
+// digest rather than the same one recomputed.
+//
+// nil for a lifecycle with no ConfigManager: the caller then keeps the list it
+// was constructed with.
+func (l *CheckoutLifecycle) repoConfigSections(repoPrefix string) []DependencyRevisionConfigSection {
+	if l == nil || l.cfgMgr == nil || repoPrefix == "" {
+		return nil
+	}
+	return dedicatedBaseConfigSections(l.cfgMgr.GetRepoConfig(repoPrefix))
 }

@@ -50,7 +50,7 @@ func (s *Store) invalidateAnalysisGenerationLocked() error {
 	if !s.analysisGenerationPresent {
 		return nil
 	}
-	tx, err := s.beginWrite()
+	tx, err := s.beginAnalysisWrite()
 	if err != nil {
 		return err
 	}
@@ -77,6 +77,14 @@ func (s *Store) invalidateAnalysisGenerationLocked() error {
 // graph rows atomically on one pinned connection. That is required when the
 // pool has MaxOpenConns=1: checking out a second transaction while a pinned
 // connection is held would otherwise deadlock.
+//
+// Deliberately NOT scoped to the mutating handle's view generation, even
+// though the cache now carries one. The revision this fires from,
+// analysisMutationRevision, is one counter for the whole storeCore, so an
+// in-flight build in any view is already rejected by a mutation in any other;
+// clearing every view's pointer keeps the durable state matching that counter.
+// Scoping it would be the unsound direction — it can only leave a pointer
+// standing that the revision check has already invalidated in memory.
 func invalidateAnalysisGenerationTx(tx *sql.Tx) error {
 	if _, err := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE state = ? OR generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale, analysisGenerationBuilding); err != nil {
 		return err

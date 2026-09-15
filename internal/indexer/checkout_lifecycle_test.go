@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -350,17 +352,64 @@ func TestCheckoutLifecycleCloseWaitsForAdmittedFamilyRetry(t *testing.T) {
 		t.Fatal("family retry did not finish")
 	}
 
+	// Close is terminal: draining the admitted retry does not reopen the gate.
+	// A retry admitted after Close would reconcile against a Store its owner is
+	// already releasing, which is why the gate stays shut for the life of the
+	// object — see the Close doc comment in checkout_lifecycle.go, and the
+	// coordinator/transition/observation/repository gates, none of which reopen
+	// either. The barrier stays installed as a fired-work detector: from here on
+	// nothing may run it again.
+	var lateAdmissions atomic.Int64
 	fixture.lc.retryMu.Lock()
-	fixture.lc.familyRetryBarrier = nil
+	fixture.lc.familyRetryBarrier = func() { lateAdmissions.Add(1) }
 	fixture.lc.retryMu.Unlock()
+
+	// New admission after Close is refused — on the retry gate, and with the
+	// typed closed error on the repository-admission surface.
 	afterCloseDeadline := fixture.lc.now().Add(time.Hour).Unix()
 	fixture.lc.scheduleFamilyRetryAt("after-close", afterCloseDeadline)
 	fixture.lc.retryMu.Lock()
-	afterClose, scheduledAfterClose := fixture.lc.familyRetries["after-close"]
+	_, scheduledAfterClose := fixture.lc.familyRetries["after-close"]
+	gateStillClosed := fixture.lc.retryClosing
 	fixture.lc.retryMu.Unlock()
-	require.True(t, scheduledAfterClose, "Close must restore retry admission for lifecycle reuse")
-	require.Equal(t, afterCloseDeadline, afterClose.deadline)
-	require.NoError(t, fixture.lc.Close())
+	require.False(t, scheduledAfterClose, "Close must keep rejecting family retries after the drain")
+	require.True(t, gateStillClosed, "Close must leave retry admission closed")
+	_, readErr := fixture.lc.AcquireRepositoryRead()
+	require.ErrorIs(t, readErr, graphview.ErrRepositoryAdmissionsStopped)
+	require.ErrorIs(t,
+		fixture.lc.RegisterRepositoryOwner(context.Background(), "graph-after-close"),
+		graphview.ErrRepositoryAdmissionsStopped)
+	require.True(t, fixture.lc.RepositoryAdmissionClosed("prefix-after-close"),
+		"every prefix is closed to admission once the lifecycle is closed")
+
+	// A timer callback delayed past Close cannot resurrect the retry it was
+	// scheduled for, in either window: after Close removed the entry, and in the
+	// race where the callback still sees an entry Close has not yet cleared.
+	fixture.lc.runFamilyRetry("admitted-family-retry", deadline)
+	lateTimer := time.NewTimer(time.Hour)
+	defer lateTimer.Stop()
+	fixture.lc.retryMu.Lock()
+	fixture.lc.familyRetries["late-callback"] = familyRetry{deadline: afterCloseDeadline, timer: lateTimer}
+	fixture.lc.retryMu.Unlock()
+	fixture.lc.runFamilyRetry("late-callback", afterCloseDeadline)
+	require.Zero(t, lateAdmissions.Load(), "a callback delayed past Close must not be admitted")
+
+	// Close is idempotent: the second call returns promptly, joins nothing and
+	// re-runs no drained work, and it still clears the entry the late callback
+	// left behind.
+	secondClose := make(chan error, 1)
+	go func() { secondClose <- fixture.lc.Close() }()
+	select {
+	case err := <-secondClose:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a second Close blocked instead of returning")
+	}
+	require.Zero(t, lateAdmissions.Load(), "a second Close must not re-drain admitted work")
+	fixture.lc.retryMu.Lock()
+	remainingRetries := len(fixture.lc.familyRetries)
+	fixture.lc.retryMu.Unlock()
+	require.Zero(t, remainingRetries, "Close must leave no family retry timers behind")
 }
 
 // volumeEvidenceUsable reports whether this platform's path evidence carries
@@ -399,6 +448,109 @@ func (f *lifecycleFixture) gitRepo(name string) string {
 	writeFile(f.t, filepath.Join(root, name+".go"), "package a\n\nfunc A() {}\n")
 	runGit(f.t, root, "add", ".")
 	runGit(f.t, root, "commit", "-q", "-m", "init")
+	return root
+}
+
+// TestADependentCoordinatorAsksTheDaemonForTheCommittedBase is the wiring
+// proof for the on-demand half of the committed-base consumer gate.
+//
+// The primitive works in isolation (TestAnUnpublishedPrimaryAsksTheFamilyForItsCommittedBase
+// drives primaryBase with a stub, TestTheFirstDependentGetsTheCommittedBaseThePublisherDeferred
+// drives RequestBase directly). Neither would catch the state this item's
+// change would otherwise be in: a gate that defers the publication and a
+// coordinator whose RequestBase was never wired, which is a base that is never
+// published at all.
+//
+// So this drives the whole production chain, with nothing stubbed:
+//
+//	InitialBasePublisher.publish declines the owner-only family
+//	  -> a worktree appears on the running daemon
+//	  -> CheckoutLifecycle.Sweep -> applyCoordinators -> ensureCoordinator
+//	  -> buildCoordinator wires RequestBase
+//	  -> the coordinator's cycle -> primaryBase -> demandCommittedBase
+//	  -> CheckoutLifecycle.requestDedicatedBase -> the advance registry
+//	  -> InitialBasePublisher.RequestBase -> publish -> adoption
+//
+// It asserts on the outcome rather than on a count, because the coordinator
+// runs on its own loop: what has to be true is that the base the daemon
+// deferred gets published, that the publication says a CONSUMER asked for it,
+// and that it is adopted.
+func TestADependentCoordinatorAsksTheDaemonForTheCommittedBase(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	root := f.gitRepo("coordinator-demand")
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NotEmpty(t, registered.Prefix)
+
+	publisher := startupPublisher(t, f)
+	publisher.Schedule(registered.Prefix)
+	publisher.BeginDraining()
+	require.NoError(t, publisher.Wait(ctx))
+	outcomes := publisher.Outcomes()
+	require.Len(t, outcomes, 1)
+	require.Equal(t, "no dependent checkout", outcomes[0].Skipped,
+		"the premise: the daemon start deferred this family's committed base")
+	require.Zero(t, f.familyOf(registered.Prefix).ActiveGenerationID)
+
+	// The first sweep marks the startup inventory, so the worktree added after
+	// it is a runtime discovery and is served eagerly rather than left dormant.
+	_, err = f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	f.worktreeOf(root, "coordinator-demand-dependent")
+	report, err := f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	require.Positive(t, report.Coordinators,
+		"the runtime-added worktree got no coordinator, so nothing could ask")
+
+	deadline := time.Now().Add(90 * time.Second)
+	var demanded InitialBasePublication
+	for {
+		for _, outcome := range publisher.Outcomes() {
+			if outcome.Demanded {
+				demanded = outcome
+			}
+		}
+		if demanded.RepoPrefix != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no dependent ever asked for the deferred committed base; outcomes=%+v",
+				publisher.Outcomes())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.NoError(t, demanded.Err)
+	require.Empty(t, demanded.Skipped, "the demanded publication was declined")
+	require.Positive(t, demanded.GenerationID)
+	require.Equal(t, registered.Prefix, demanded.RepoPrefix)
+	require.Equal(t, demanded.GenerationID, f.familyOf(registered.Prefix).ActiveGenerationID,
+		"the on-demand publication was not adopted")
+}
+
+// gitRepoWithDependent is gitRepo plus one linked worktree, so the family the
+// registration creates has a CONSUMER for its committed base.
+//
+// It exists because publication is gated on a reader. A committed base is only
+// ever read by a dependent checkout or a ref view — the owner's own route stays
+// on generation 0 — so InitialBasePublisher.publish declines an owner-only
+// family with "no dependent checkout" (see dedicatedBaseConsumers). A fixture
+// that wants a published base therefore has to be a family that has somewhere
+// to publish one TO, and the cheapest such family is the one the product sees
+// most: a primary plus a linked worktree.
+//
+// The worktree is added BEFORE the caller registers the repository, because the
+// checkout rows are allocated by the family reconciliation Register runs
+// (reconcileFamilyNow), and a worktree created afterwards is not in that
+// family's census until the next sweep.
+func (f *lifecycleFixture) gitRepoWithDependent(name string) string {
+	f.t.Helper()
+	root := f.gitRepo(name)
+	f.worktreeOf(root, name+"-dependent")
 	return root
 }
 

@@ -9,14 +9,15 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # The suite runs ~30m on the ubuntu runners and slower on macos, so the
-    # per-step budget needs headroom; this job-level cap still bounds a hang.
+    # Give the largest packages separate runners so they do not compete for
+    # CPU and memory. Keep the existing package and job time limits.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go-version: ['1.27']
+        partition: [remaining, store, indexer, mcp]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -27,24 +28,40 @@ jobs:
       - name: Build
         run: go build -o gortex ./cmd/gortex/
 
+      # Derive each platform's package census and assign every package once.
+      # Linux and macOS retain race/coverage checks; Windows retains its
+      # normal verbose run, whose per-test timings expose slow fixtures.
       - name: Test
-        if: matrix.os != 'windows-latest'
-        run: go test -race -timeout=45m -coverprofile=coverage.out ./...
-
-      # The Windows shard checks the platform contract, not the race
-      # contract: the race detector multiplies runtime several times over and
-      # the windows runners are already the slowest of the three, so the two
-      # together overran the job cap before the suite finished. Linux and
-      # macOS keep -race, which is where a data race would surface anyway.
-      # -v is temporary: per-test timings are how we find which packages hang
-      # here, and it comes out once the shard is reliably green.
-      # It writes no coverage profile either: nothing uploads one from this
-      # shard, and the runner's default PowerShell tokenises
-      # -coverprofile=coverage.out into an extra ".out" package argument, so
-      # the job failed on an unresolvable package before any test ran.
-      - name: Test (windows, no race detector)
-        if: matrix.os == 'windows-latest'
-        run: go test -v -timeout=45m ./...
+        shell: bash
+        env:
+          TEST_PARTITION: ${{ matrix.partition }}
+          TEST_WINDOWS: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          set -euo pipefail
+          module="$(go list -m)"
+          packages="$(go list ./...)"
+          selected=()
+          while IFS= read -r package; do
+            case "$package" in
+              "$module/internal/indexer") partition=indexer ;;
+              "$module/internal/graph/store_sqlite") partition=store ;;
+              "$module/internal/mcp") partition=mcp ;;
+              *) partition=remaining ;;
+            esac
+            if [[ "$partition" == "$TEST_PARTITION" ]]; then
+              selected+=("$package")
+            fi
+          done <<< "$packages"
+          if [[ ${#selected[@]} -eq 0 ]]; then
+            echo "No packages selected for $TEST_PARTITION" >&2
+            exit 1
+          fi
+          printf 'Running %s packages in %s partition\n' "${#selected[@]}" "$TEST_PARTITION"
+          if [[ "$TEST_WINDOWS" == true ]]; then
+            go test -v -timeout=45m "${selected[@]}"
+          else
+            go test -race -timeout=45m -coverprofile=coverage.out "${selected[@]}"
+          fi
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'

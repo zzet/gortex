@@ -155,7 +155,9 @@ func TestPrepareReusesPageSourceHydration(t *testing.T) {
 		if sources == nil {
 			t.Fatalf("page %d did not publish its source hydration", page)
 		}
-		r.warmLookupCacheWithSources(pending, sources)
+		if err := r.warmLookupCacheWithSources(t.Context(), pending, sources); err != nil {
+			t.Fatal(err)
+		}
 		if got := r.cachedGetNode(pending[0].From); got == nil || got.ID != pending[0].From {
 			t.Fatalf("page %d source cache miss: %+v", page, got)
 		}
@@ -189,7 +191,9 @@ func TestWarmLookupCacheAuthoritativeMissingSourcesAvoidPointNPlusOne(t *testing
 		}
 	}
 
-	r.warmLookupCache(pending)
+	if err := r.warmLookupCache(pending); err != nil {
+		t.Fatal(err)
+	}
 	if r.nodeByID == nil {
 		t.Fatal("nil backend result was not normalized to a completed positive cache")
 	}
@@ -248,7 +252,9 @@ func TestFullUnscopedPrepareDefersOneSourceHydrationToWarm(t *testing.T) {
 	if !indexes.dirAll || indexes.depAll {
 		t.Fatalf("directory-only shape prepared dir/dep = %v/%v, want true/false", indexes.dirAll, indexes.depAll)
 	}
-	r.warmLookupCacheWithSources(pending, nil)
+	if err := r.warmLookupCacheWithSources(t.Context(), pending, nil); err != nil {
+		t.Fatal(err)
+	}
 	if got := counting.nodeIDBatchesContaining(sourceID); got != 1 {
 		t.Fatalf("full unscoped prepare+warm source batches = %d, want 1", got)
 	}
@@ -275,7 +281,9 @@ func TestSourceNegativesRecomputeAcrossForcedAndGenerationRefresh(t *testing.T) 
 	}}
 
 	sources := indexes.prepare(pending)
-	r.warmLookupCacheWithSources(pending, sources)
+	if err := r.warmLookupCacheWithSources(t.Context(), pending, sources); err != nil {
+		t.Fatal(err)
+	}
 	if _, missing := r.missingNodeByID[lateID]; !missing {
 		t.Fatal("initial missing source was not negatively cached")
 	}
@@ -285,7 +293,9 @@ func TestSourceNegativesRecomputeAcrossForcedAndGenerationRefresh(t *testing.T) 
 	g.AddBatch([]*graph.Node{{
 		ID: lateID, Kind: graph.KindFunction, Name: "late", RepoPrefix: "repo", Language: "go", FilePath: "repo/late.go",
 	}}, nil)
-	if !indexes.refreshAfterInterleave(pending, true) {
+	if refreshed, err := indexes.refreshAfterInterleave(t.Context(), pending, true); err != nil {
+		t.Fatal(err)
+	} else if !refreshed {
 		t.Fatal("forced refresh did not rebuild the current page")
 	}
 	if _, missing := r.missingNodeByID[lateID]; missing {
@@ -300,7 +310,9 @@ func TestSourceNegativesRecomputeAcrossForcedAndGenerationRefresh(t *testing.T) 
 	generationPending := []*graph.Edge{{
 		From: neverID, To: graph.UnresolvedMarker + "Work", Kind: graph.EdgeCalls, FilePath: "repo/never.go",
 	}}
-	if !indexes.refreshAfterInterleave(generationPending, false) {
+	if refreshed, err := indexes.refreshAfterInterleave(t.Context(), generationPending, false); err != nil {
+		t.Fatal(err)
+	} else if !refreshed {
 		t.Fatal("generation change did not rebuild the current page")
 	}
 	if _, missing := r.missingNodeByID[neverID]; !missing {

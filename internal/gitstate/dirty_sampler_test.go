@@ -77,6 +77,9 @@ func TestDirtySamplerAttachedDerivesHeadAndDirtyFromStatus(t *testing.T) {
 			"1 .M N... 100644 100644 100644 "+testBlob+" "+testBlob+" tracked.go",
 			"? loose.go")},
 		{out: []byte(testTreeA + "\n")},
+		{out: porcelainBranch(testCommitA, "main",
+			"1 .M N... 100644 100644 100644 "+testBlob+" "+testBlob+" tracked.go",
+			"? loose.go")},
 	}}
 	sampler := newDirtySampler(root, "", "", commands.run)
 
@@ -94,12 +97,15 @@ func TestDirtySamplerAttachedDerivesHeadAndDirtyFromStatus(t *testing.T) {
 		t.Fatalf("untracked entry = %+v", got)
 	}
 	calls := commands.snapshotCalls()
-	if len(calls) != 2 {
-		t.Fatalf("commands = %d, want status + tree", len(calls))
+	if len(calls) != 3 {
+		t.Fatalf("commands = %d, want status + tree + status fence", len(calls))
 	}
 	wantStatus := []string{"--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames"}
 	if !reflect.DeepEqual(calls[0].args, wantStatus) {
 		t.Fatalf("status args = %q, want %q", calls[0].args, wantStatus)
+	}
+	if !reflect.DeepEqual(calls[2].args, wantStatus) {
+		t.Fatalf("status fence args = %q, want %q", calls[2].args, wantStatus)
 	}
 	wantTree := []string{"rev-parse", "--verify", "-q", testCommitA + "^{tree}"}
 	if !reflect.DeepEqual(calls[1].args, wantTree) {
@@ -162,6 +168,7 @@ func TestDirtySamplerDetachedAndUnbornHeads(t *testing.T) {
 	t.Run("unborn", func(t *testing.T) {
 		commands := &scriptedDirtyCommands{results: []dirtyCommandResult{
 			{out: porcelainBranch("(initial)", "main", "? first.go")},
+			{out: porcelainBranch("(initial)", "main", "? first.go")},
 		}}
 		sampler := newDirtySampler(t.TempDir(), testCommitA, testTreeA, commands.run)
 		snap, err := sampler.Sample(context.Background())
@@ -174,8 +181,8 @@ func TestDirtySamplerDetachedAndUnbornHeads(t *testing.T) {
 		if got := dirtyEntryFor(t, snap, "first.go"); got.Kind != DirtyUntracked {
 			t.Fatalf("unborn entry = %+v", got)
 		}
-		if got := len(commands.snapshotCalls()); got != 1 {
-			t.Fatalf("unborn sample ran %d commands, want status only", got)
+		if got := len(commands.snapshotCalls()); got != 2 {
+			t.Fatalf("unborn dirty sample ran %d commands, want status + status fence", got)
 		}
 	})
 }

@@ -230,6 +230,13 @@ func (r *Reconciler) CommitAuthorizedDemotion(
 }
 
 func (r *Reconciler) pendingCleanupEntry(target sagaTarget) (store_sqlite.CleanupEntry, error) {
+	if target.AttemptID == "" {
+		var err error
+		target.AttemptID, err = newCleanupAttemptID()
+		if err != nil {
+			return store_sqlite.CleanupEntry{}, err
+		}
+	}
 	payload, err := json.Marshal(target)
 	if err != nil {
 		return store_sqlite.CleanupEntry{}, fmt.Errorf(

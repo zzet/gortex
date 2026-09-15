@@ -2,6 +2,9 @@ package resolver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"iter"
 	"os"
@@ -141,6 +144,153 @@ type ResolveStats struct {
 	// reduction is visible. Zero (omitted) on the unscoped whole-graph path.
 	PendingBefore int `json:"pending_before,omitempty"`
 	PendingAfter  int `json:"pending_after,omitempty"`
+	// IncomingAdmission* carry the bounded incoming-stub admission's
+	// completeness fact for this pass (graph.IncomingSourceAdmission). A file
+	// defining a common name parks unbound references from the whole corpus on
+	// its stub ids, so the admission is charged against the shared
+	// incoming-source CEILING (MaxIncomingSourceCandidateRows). What every leg
+	// shares is that constant, not one budget object: each call site passes a
+	// nil budget and AdmitIncomingRowsBounded then allocates a fresh
+	// IncomingSourceBudget per admission (bounded_incoming_sources_scoped.go:99-101),
+	// so the legs refuse independently. Refused means the ceiling fired and the pass
+	// admitted NOTHING from the incoming leg — the parked edges are untouched,
+	// not partially rebound. A caller that cannot read this fact cannot tell a
+	// complete reverse pass from a bounded one.
+	IncomingAdmissionInspected int  `json:"incoming_admission_inspected,omitempty"`
+	IncomingAdmissionLimit     int  `json:"incoming_admission_limit,omitempty"`
+	IncomingAdmissionRefused   bool `json:"incoming_admission_refused,omitempty"`
+	// IncomingAdmissionDropped is the size of the hole: the parked references
+	// a refused leg left unadmitted. A pass with Dropped > 0 did LESS work than
+	// a complete one, and it is the number a consumer needs to say so.
+	//
+	// Each physical row is counted ONCE, which is what separates it from
+	// Inspected. A pass runs its incoming leg twice over the SAME stub keys —
+	// once in the preparation frontier (recordFrontierIncomingAdmission, reached
+	// from ResolveFileAndIncoming and ResolveFilesAndIncoming) and once in the
+	// resolve leg (resolveIncomingStubKeysLocked:3417, charged at :3428) — and
+	// both refuse independently: each admission gets its own budget. Inspected is
+	// documented as "admissions, not unique edges" and accumulates; Dropped
+	// makes a claim about a count of REFERENCES, so charging the second leg
+	// again would report twice the hole that exists.
+	IncomingAdmissionDropped int `json:"incoming_admission_dropped,omitempty"`
+
+	// incomingAdmissionCharged is the set of refused key sets already charged
+	// to IncomingAdmissionDropped: each admission's key-set digest
+	// (incomingAdmissionChargeKey), appended with a `;` separator. Unexported:
+	// it is bookkeeping for the field above, never part of the wire shape. Two
+	// legs over the same keys refuse the same physical rows; two legs over
+	// DIFFERENT key sets refuse disjoint ones and both are charged.
+	//
+	// A STRING rather than a set, deliberately. ResolveStats is copied whole in
+	// at least one place — `beforeIncoming := *stats` (:2956), which reads the
+	// copy for the phase log's int deltas — and a map field would make that
+	// copy alias this bookkeeping, so a later edit that charged through the
+	// copy would silently corrupt the original's charge set. A string is
+	// immutable: appending to the copy cannot be seen by the original, and the
+	// worst a stray copy can do is re-charge a hole it already owns.
+	incomingAdmissionCharged string
+}
+
+// recordIncomingAdmission puts a bounded incoming admission's completeness
+// fact on the pass stats. Refused is set only for the typed limit error: a
+// cancellation is a different outcome and must not read as "the bound fired".
+//
+// Every consumer of a bounded admission calls this before acting on what the
+// admission returned — including the consumers whose leg then collapses to
+// "nothing to do", because a refused leg and an empty leg are the same shape
+// and only this fact separates them.
+//
+// keys is the key set the admission read for, and it is what keeps Dropped a
+// count of references rather than of refusals: a pass that runs both incoming
+// legs refuses the same physical rows twice, and only the identity of the key
+// set can say so. Inspected keeps accumulating — its contract is "admissions,
+// not unique edges".
+func recordIncomingAdmission(stats *ResolveStats, keys []string, fact graph.IncomingSourceAdmission, err error) {
+	if stats == nil {
+		return
+	}
+	stats.IncomingAdmissionInspected += fact.Inspected
+	if fact.Dropped > 0 {
+		if charge := incomingAdmissionChargeKey(keys); charge != "" {
+			// Every entry is a fixed-width hex digest followed by `;`, and a
+			// digest carries no `;`, so a substring hit can only be a whole
+			// entry — no boundary-straddling false positive is expressible.
+			if !strings.Contains(stats.incomingAdmissionCharged, charge) {
+				stats.incomingAdmissionCharged += charge + ";"
+				stats.IncomingAdmissionDropped += fact.Dropped
+			}
+		}
+	}
+	if fact.Limit > 0 {
+		stats.IncomingAdmissionLimit = fact.Limit
+	}
+	var limit *graph.BoundedLocalizationLimitError
+	if errors.As(err, &limit) {
+		stats.IncomingAdmissionRefused = true
+	}
+}
+
+// incomingAdmissionChargeKey is the identity of one admission's key set: the
+// deduplicated keys in sorted order, hashed so the bookkeeping entry stays a
+// fixed 64 hex characters whatever the frontier's size. The two legs of a pass
+// build their stub keys independently (the frontier's appendStubKey walk vs
+// resolveIncomingLocked's per-node walk), so they agree on the SET and not on
+// the order — sorting is what makes them the same charge.
+//
+// An empty key set can never produce a drop (AdmitIncomingRowsBounded returns
+// before charging), so "" is not a chargeable identity and is reported as such.
+func incomingAdmissionChargeKey(keys []string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	uniq := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		uniq = append(uniq, key)
+	}
+	if len(uniq) == 0 {
+		return ""
+	}
+	sort.Strings(uniq)
+	sum := sha256.New()
+	for _, key := range uniq {
+		_, _ = sum.Write([]byte(key))
+		_, _ = sum.Write([]byte{0})
+	}
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+// logIncomingAdmissionRefusal is the one Warn shape every bounded incoming leg
+// uses. Nothing else in the package logs a refusal, so a leg that forgets the
+// fact is visible as a missing call site rather than as a differently worded
+// log line. A nil error is not a refusal and logs nothing.
+func logIncomingAdmissionRefusal(logger *zap.Logger, leg string, stubKeys int, fact graph.IncomingSourceAdmission, err error) {
+	if err == nil || logger == nil {
+		return
+	}
+	logger.Warn("resolver: incoming stub admission refused",
+		zap.String("leg", leg),
+		zap.Int("stub_keys", stubKeys),
+		zap.Int("inspected", fact.Inspected),
+		zap.Int("dropped", fact.Dropped),
+		zap.Int("limit", fact.Limit),
+		zap.Error(err))
+}
+
+// recordFrontierIncomingAdmission is the frontier-shaped pair of the two calls
+// above: a consumer that holds an incrementalFileFrontier must publish its
+// incoming leg's completeness fact before it looks at frontier.pending, which
+// a refusal has already emptied of every incoming entry.
+func recordFrontierIncomingAdmission(logger *zap.Logger, stats *ResolveStats, frontier incrementalFileFrontier, leg string) {
+	recordIncomingAdmission(stats, frontier.stubKeys, frontier.incomingAdmission, frontier.incomingRefusal)
+	logIncomingAdmissionRefusal(logger, leg, len(frontier.stubKeys), frontier.incomingAdmission, frontier.incomingRefusal)
 }
 
 // Resolver resolves unresolved edge targets to actual graph node IDs.
@@ -159,10 +309,13 @@ type ResolveStats struct {
 // Indexer.IndexFile) crash the daemon with "concurrent map writes"
 // in buildDirIndexes.
 type Resolver struct {
-	graph        graph.Store
-	logger       *zap.Logger
-	dirIndex     map[string][]graph.FileNodeIdentity
-	lastDirIndex map[string][]graph.FileNodeIdentity
+	goPackageOwnership         GoPackageOwnershipLookup
+	goPackageOwnershipFactory  GoPackageOwnershipFactory
+	goPackageOwnershipPrepared map[string]GoPackageOwnershipLookup
+	graph                      graph.Store
+	logger                     *zap.Logger
+	dirIndex                   map[string][]graph.FileNodeIdentity
+	lastDirIndex               map[string][]graph.FileNodeIdentity
 	// OnComputeDone, when set, fires once per ResolveAll immediately after
 	// the parallel compute loop has committed — BEFORE the deferred LSP
 	// batch and the serial refinement tail (guard, attribution, dispatch
@@ -887,7 +1040,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			sources := passIndexes.prepare(pending)
 			prepareElapsed += time.Since(prepareStart)
 			warmStart := time.Now()
-			r.warmLookupCacheWithSources(pending, sources)
+			if err := r.warmLookupCacheWithSources(ctx, pending, sources); err != nil {
+				return resolveError(err)
+			}
 			warmElapsed += time.Since(warmStart)
 		}
 		for base := 0; base < len(pending); base += superChunk {
@@ -1139,7 +1294,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					// the old generation; rebuild it with the rest.
 					r.clearCSharpVisibilityCaches()
 				}
-				passIndexes.refreshAfterInterleave(pending, forceRefresh)
+				if _, err := passIndexes.refreshAfterInterleave(ctx, pending, forceRefresh); err != nil {
+					return resolveError(err)
+				}
 				r.bulkMode = true
 			}
 		}
@@ -1964,8 +2121,8 @@ func (r *Resolver) clearDirIndexes() {
 // the two batched queries the Store exposes. Workers consult the
 // resulting maps via cachedGetNode / cachedFindNodesByName; misses
 // fall through to the underlying store.
-func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
-	r.warmLookupCacheWithSources(pending, nil)
+func (r *Resolver) warmLookupCache(pending []*graph.Edge) error {
+	return r.warmLookupCacheWithSources(context.Background(), pending, nil)
 }
 
 // warmLookupCacheWithSources reuses source nodes already hydrated while
@@ -1973,9 +2130,9 @@ func (r *Resolver) warmLookupCache(pending []*graph.Edge) {
 // hydration, even when empty; requested IDs absent from that result become
 // authoritative negatives only for the current page/generation, preventing a
 // dangling source from falling into a point-query N+1.
-func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map[string]*graph.Node) {
+func (r *Resolver) warmLookupCacheWithSources(ctx context.Context, pending []*graph.Edge, sources map[string]*graph.Node) error {
 	if len(pending) == 0 {
-		return
+		return nil
 	}
 	warmStart := time.Now()
 	idSet := make(map[string]struct{}, len(pending))
@@ -2028,6 +2185,9 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 		r.missingNodeByID = nil
 	}
 	idElapsed := time.Since(idStart)
+	if err := r.prepareGoPackageOwnership(ctx, pending, r.nodeByID); err != nil {
+		return err
+	}
 	nameStart := time.Now()
 	nameGroups, names, nameErr := r.warmRepoLanguageNameCache(pending)
 	nameElapsed := time.Since(nameStart)
@@ -2103,6 +2263,7 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 		zap.Duration("candidate_fold", foldElapsed),
 		zap.Duration("qual_lookup", qualElapsed),
 		zap.Duration("elapsed", time.Since(warmStart)))
+	return nil
 }
 
 // parallelGetNodesByIDs is the concurrent form of Store.GetNodesByIDs used to
@@ -2384,6 +2545,7 @@ func (r *Resolver) buildPassIndexes() (clear func()) {
 }
 
 func (r *Resolver) clearPassIndexes() {
+	r.clearGoPackageOwnership()
 	r.scratchGeneration++
 	r.clearDirIndexes()
 	r.clearDepModuleIndex()
@@ -2442,10 +2604,22 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// graph that no-op cost can be minutes and holds the shared resolver lock
 	// for the whole duration.
 	pendingStarted := time.Now()
-	pending := r.pendingEdgesForFileAndIncoming(filePath)
+	frontier := r.collectIncrementalFileFrontier([]string{filePath})
+	pending := frontier.pending
 	pendingDuration := time.Since(pendingStarted)
+	stats := &ResolveStats{}
+	// The bound is a fact about THIS save before it is anything else. A refused
+	// incoming leg contributes zero entries to pending, so a changed file with
+	// no outgoing work of its own — the ordinary shape for a widely referenced
+	// definition file — reaches the early return below with a frontier that is
+	// empty for the opposite of the usual reason. Recording (and logging) the
+	// refusal here is what keeps "the save had nothing to do" distinguishable
+	// from "the save refused to look at what there was to do"; both callers of
+	// this entrypoint discard the stats, so the Warn is the channel that
+	// survives for them.
+	recordFrontierIncomingAdmission(r.logger, stats, frontier, "preparation")
 	if len(pending) == 0 {
-		return &ResolveStats{}
+		return stats
 	}
 
 	indexStarted := time.Now()
@@ -2461,11 +2635,15 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// FindNodesByNames, like ResolveAll) materialises each candidate once
 	// and the passes read it from memory.
 	warmStarted := time.Now()
-	r.warmLookupCache(pending)
+	if err := r.warmLookupCache(pending); err != nil {
+		r.clearLookupCache()
+		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
+		stats.Unresolved = len(pending)
+		return stats
+	}
 	warmDuration := time.Since(warmStarted)
 	defer r.clearLookupCache()
 
-	stats := &ResolveStats{}
 	forwardStarted := time.Now()
 	r.resolveFileEdgesLocked(filePath, stats)
 	forwardDuration := time.Since(forwardStarted)
@@ -2490,12 +2668,18 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	return stats
 }
 
-// pendingEdgesForFileAndIncoming gathers the unresolved edges the forward
-// and reverse passes will visit — the file's own outgoing unresolved
-// edges plus the unresolved in-edges parked on the stub ids of the
-// referenceable symbols this file defines. It mirrors the edge walks
-// resolveFileEdgesLocked / resolveIncomingLocked perform, but only to seed
-// warmLookupCache; the result feeds caching, never resolution directly.
+// incrementalFileFrontier gathers the unresolved edges the forward and reverse
+// passes will visit — the files' own outgoing unresolved edges plus the
+// unresolved in-edges parked on the stub ids of the referenceable symbols they
+// define. It mirrors the edge walks resolveFileEdgesLocked /
+// resolveIncomingLocked perform, but only to seed warmLookupCache; the result
+// feeds caching, never resolution directly.
+//
+// It is deliberately the whole struct that travels: an earlier revision handed
+// callers only .pending, and the per-save entrypoint then reported a refused
+// reverse leg as a clean no-op because a refusal and an empty frontier look
+// identical from that field alone. Take the frontier, publish the fact
+// (recordFrontierIncomingAdmission), then read .pending.
 type incrementalFileFrontier struct {
 	paths       []string
 	nodesByFile map[string][]*graph.Node
@@ -2506,16 +2690,24 @@ type incrementalFileFrontier struct {
 	outgoingPending int
 	outgoingCollect time.Duration
 	incomingCollect time.Duration
-}
-
-func (r *Resolver) pendingEdgesForFileAndIncoming(filePath string) []*graph.Edge {
-	return r.collectIncrementalFileFrontier([]string{filePath}).pending
+	// incomingAdmission is the completeness fact of the bounded incoming-stub
+	// admission and incomingRefusal the typed limit error when the shared
+	// ceiling fired. A refused admission contributes ZERO incoming entries to
+	// pending: len(pending) == outgoingPending. Nothing downstream may treat a
+	// refused frontier as an exhaustive one.
+	incomingAdmission graph.IncomingSourceAdmission
+	incomingRefusal   error
 }
 
 // collectIncrementalFileFrontier performs the complete read side of a
 // multi-file incremental resolve with a constant number of logical store
 // calls: one batched file-node read, one outgoing-adjacency read, and one
 // incoming-stub read. Backends may chunk each request at their bind limit.
+// The incoming-stub read stays ONE logical call after the bound was added:
+// graph.AdmitIncomingRowsBounded charges the whole returned batch instead of
+// chunking the key set, so the ceiling governs what is admitted (and therefore
+// written back) without multiplying the pass's statements. See
+// TestIncrementalFrontierKeepsOneIncomingReadPastTheScopedKeyCap.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
 	return collectIncrementalFileFrontierForPreparation(r.graph, filePaths, r.incrementalSkipped)
 }
@@ -2612,8 +2804,24 @@ func collectIncrementalFileFrontierMode(
 	incomingStarted := time.Now()
 	// The unresolved target string is the incoming-edge bucket key even when
 	// no node with that ID exists.
+	//
+	// The admission is bounded: a changed file that defines a common name
+	// (Close, Get, New) parks every unbound reference to that name in the whole
+	// corpus on its stub ids, and admitting them all is the reverse leg's write
+	// amplification. graph.AdmitIncomingRowsBounded charges the physical rows
+	// against the shared incoming-source ceiling and refuses the WHOLE leg at
+	// the ceiling — the parked edges stay exactly as they are, and the refusal
+	// rides the frontier as a completeness fact instead of being a silent
+	// truncation. It neither widens nor splits the read: the same keys in the
+	// same single batched call, the same rows.
 	if lightweightIncoming {
-		inByStub := graph.InEdgeIdentitiesByNodeIDs(g, frontier.stubKeys)
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(),
+			func(keys []string) map[string][]graph.EdgeIdentity {
+				return graph.InEdgeIdentitiesByNodeIDs(g, keys)
+			},
+			frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
 		for _, key := range frontier.stubKeys {
 			for _, identity := range inByStub[key] {
 				if !graph.IsUnresolvedTarget(identity.To) {
@@ -2628,7 +2836,9 @@ func collectIncrementalFileFrontierMode(
 			}
 		}
 	} else {
-		inByStub := g.GetInEdgesByNodeIDs(frontier.stubKeys)
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
 		for _, key := range frontier.stubKeys {
 			for _, edge := range inByStub[key] {
 				if edge != nil && graph.IsUnresolvedTarget(edge.To) {
@@ -2659,8 +2869,17 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	var outgoingDuration, incomingDuration, attributionDuration time.Duration
 	outcome := "interrupted"
 	defer func() {
+		// A pass whose incoming leg was refused did not finish the work a
+		// complete one does, and "complete" / "no_pending" is the dimension the
+		// phase logging keys on. Relabel it at the one place every exit passes
+		// through, so no future early return can reintroduce the mislabel.
+		if stats.IncomingAdmissionRefused && (outcome == "complete" || outcome == "no_pending") {
+			outcome = "incoming_refused"
+		}
 		logger.Info("resolver: incremental files phases",
 			zap.String("outcome", outcome),
+			zap.Bool("incoming_admission_refused", stats.IncomingAdmissionRefused),
+			zap.Int("incoming_admission_dropped", stats.IncomingAdmissionDropped),
 			zap.Int("files", len(frontier.paths)),
 			zap.Int("pending", len(frontier.pending)),
 			zap.Int("outgoing_pending", frontier.outgoingPending),
@@ -2697,6 +2916,9 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 		zap.Int("stub_keys", len(frontier.stubKeys)),
 		zap.Duration("outgoing_collect", frontier.outgoingCollect),
 		zap.Duration("incoming_collect", frontier.incomingCollect))
+	// The preparation leg's bound is a fact about this batch, not a log line:
+	// the incoming leg admitted nothing and the parked edges stay unresolved.
+	recordFrontierIncomingAdmission(logger, stats, frontier, "preparation")
 	if len(frontier.pending) == 0 {
 		outcome = "no_pending"
 		return stats
@@ -2706,7 +2928,13 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	indexDuration = finish(zap.Int("pending", len(frontier.pending)))
 	defer clear()
 	finish = startIncrementalPhase(logger, "warm_lookup")
-	r.warmLookupCache(frontier.pending)
+	if err := r.warmLookupCache(frontier.pending); err != nil {
+		r.clearLookupCache()
+		outcome = "metadata_error"
+		stats.Unresolved = len(frontier.pending)
+		logger.Warn("resolver: Go package preparation failed", zap.Error(err))
+		return stats
+	}
 	warmDuration = finish()
 	defer r.clearLookupCache()
 	repos, omittedRepos, omittedAdmissions := incrementalAdmissionSummary(frontier, r.nodeByID)
@@ -2873,6 +3101,11 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	outByNode map[string][]*graph.Edge,
 	stats *ResolveStats,
 ) {
+	if pending, err := r.prepareGoPackageFileFrontier(filePaths, nodesByFile, outByNode); err != nil {
+		stats.Unresolved += pending
+		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
+		return
+	}
 	var jobs []reindexJob
 	var reindexBatch []graph.EdgeReindex
 	for _, filePath := range filePaths {
@@ -3116,7 +3349,16 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	// materialized read is retained and handed to the resolution helper:
 	// it is exactly the batch that helper needs, and re-reading it doubled
 	// the hit path's store time and allocations at scale.
-	inByStub := r.graph.GetInEdgesByNodeIDs(stubKeys)
+	// The probe's read is the same admission the resolution helper below then
+	// writes back from, so it carries the same bound and the same whole-batch
+	// refusal (graph.AdmitIncomingRowsBounded).
+	inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+		context.Background(), r.graph.GetInEdgesByNodeIDs, stubKeys, nil)
+	recordIncomingAdmission(stats, stubKeys, fact, err)
+	if err != nil {
+		logIncomingAdmissionRefusal(r.logger, "names_probe", len(stubKeys), fact, err)
+		return stats
+	}
 	pending := false
 	for _, edges := range inByStub {
 		for _, edge := range edges {
@@ -3176,7 +3418,19 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 	if len(stubKeys) == 0 {
 		return
 	}
-	r.resolveIncomingStubEdgesLocked(stubKeys, r.graph.GetInEdgesByNodeIDs(stubKeys), stats)
+	// This read is the reverse leg's write amplification: every row it admits
+	// is an edge resolveIncomingStubEdgesLocked may rebind and reindex. It is
+	// charged against the shared incoming-source ceiling — the same constant the
+	// preparation leg charged, against a budget of its own — and refuses whole, so a
+	// corpus-wide fan-out on a common name cannot become a corpus-wide write.
+	inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+		context.Background(), r.graph.GetInEdgesByNodeIDs, stubKeys, nil)
+	recordIncomingAdmission(stats, stubKeys, fact, err)
+	if err != nil {
+		logIncomingAdmissionRefusal(r.logger, "resolve", len(stubKeys), fact, err)
+		return
+	}
+	r.resolveIncomingStubEdgesLocked(stubKeys, inByStub, stats)
 }
 
 // resolveIncomingStubEdgesLocked is resolveIncomingStubKeysLocked over a
@@ -3184,6 +3438,11 @@ func (r *Resolver) resolveIncomingStubKeysLocked(stubKeys []string, stats *Resol
 // the frontier (the names-pass probe). Caller holds r.mu.
 func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub map[string][]*graph.Edge, stats *ResolveStats) {
 	if len(stubKeys) == 0 {
+		return
+	}
+	if pending, err := r.prepareGoPackageIncomingFrontier(stubKeys, inByStub); err != nil {
+		stats.Unresolved += pending
+		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
 		return
 	}
 	var reindexBatch []graph.EdgeReindex
@@ -3504,6 +3763,7 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	}
 	importPath := spec[:sep]
 	symbol := spec[sep+2:]
+	goOwnership := r.goImportGateForEdge(e, importPath)
 
 	// Pass 1: does the symbol live in a file under this import path?
 	// Reuse dirIndex populated by buildDirIndexes — no extra scan.
@@ -3521,6 +3781,9 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	}
 	for _, c := range candidates {
 		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod && c.Kind != graph.KindType && c.Kind != graph.KindInterface {
+			continue
+		}
+		if !goOwnership.retainNode(c) {
 			continue
 		}
 		dir := r.dirFor(c.FilePath)
@@ -3622,6 +3885,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	callerWorkspace := r.callerWorkspaceID(e)
+	goOwnership := r.goImportGateForEdge(e, importPath)
 	ambiguousQualName := false
 
 	// JS/TS relative + tsconfig-path-alias / baseUrl import: resolve the
@@ -3639,7 +3903,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
 	// the in-repo source, not on its own installed dist inside
 	// node_modules.
-	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
+	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
 		e.To = to
 		if callerRepo != "" {
 			if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -3657,10 +3921,11 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// instead of falling through to an external stub. A no-op for
 	// non-aliased specifiers and non-JS/TS callers.
 	importPath, npmAliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, importPath)
+	goOwnership.query.ImportPath = importPath
 	if npmAliased {
 		// The rewritten specifier may itself be tsconfig-paths/relative
 		// resolvable (an alias onto a workspace member).
-		if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
+		if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
 			e.To = to
 			if callerRepo != "" {
 				if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -3679,7 +3944,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// unreachable. The extractor records the fully-qualified name on the edge;
 	// binding it to the class node makes that class's directory reachable.
 	if fqn := phpEdgeMetaString(e, "fqn"); fqn != "" {
-		if matches := r.phpFindByFQN(fqn, callerRepo); len(matches) == 1 {
+		if matches := r.phpFindByFQN(fqn, callerRepo); len(matches) == 1 && goOwnership.retainNode(matches[0]) {
 			node := matches[0]
 			e.To = node.ID
 			if callerRepo != "" && node.RepoPrefix != "" && node.RepoPrefix != callerRepo {
@@ -3693,7 +3958,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// Look for every package node with this qualified name. The same import
 	// path may legitimately exist in several tracked repositories/workspaces;
 	// bind the caller-local instance instead of whichever row sorted first.
-	if candidates := r.cachedFindNodesByQualName(importPath); len(candidates) > 0 {
+	if candidates := goOwnership.filterNodes(r.cachedFindNodesByQualName(importPath)); len(candidates) > 0 {
 		node, ambiguous := pickResolverQualNameCandidate(candidates, callerRepo, callerWorkspace)
 		if node != nil {
 			e.To = node.ID
@@ -3737,6 +4002,9 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	var sameRepoFound, crossRepoFound bool
 	var sameRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
+		if !goOwnership.retainFile(file) {
+			return
+		}
 		if bareJSTS && !isJSTSDirEntryPoint(file.FilePath) {
 			return
 		}
@@ -3829,7 +4097,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// sub-module the importer reached for.
 	if npmAliased {
 		if pkg := npmPackagePrefix(importPath); pkg != "" {
-			if candidates := r.cachedFindNodesByQualName(pkg); len(candidates) > 0 {
+			if candidates := goOwnership.filterNodes(r.cachedFindNodesByQualName(pkg)); len(candidates) > 0 {
 				node, ambiguous := pickResolverQualNameCandidate(candidates, callerRepo, callerWorkspace)
 				if node != nil {
 					e.To = node.ID

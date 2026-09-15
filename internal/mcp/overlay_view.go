@@ -213,17 +213,82 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	return s.engine
 }
 
-// overlayLayerCacheEntry is one (sessionID, content-hash sum) bucket
-// in s.overlayLayerCache. The hash is over (sorted) overlay files'
+// overlayLayerCacheEntry is one (sessionID, view identity, content-hash sum)
+// bucket in s.overlayLayerCache. The hash is over (sorted) overlay files'
 // (path, content, deleted, base_sha) tuples; identical pushes from a
 // long sequence of tool calls hit the same entry and reuse the same
 // parsed layer without re-running the per-language extractors.
 type overlayLayerCacheEntry struct {
-	hash  string
-	layer *graph.OverlayLayer
+	hash string
+	// viewKey names the request view the layer was built against. The layer
+	// is *not* base-independent: its removal markers are base identities read
+	// through the request's reader, its edges were resolved against that
+	// reader, and its graph paths were spelled against that checkout. Reusing
+	// one session's layer under a different view would serve a worktree's
+	// parse over the shared corpus (or the reverse), so the key separates
+	// them. Empty for a request that reads the base corpus, which is the
+	// identity every unrouted request has always cached under.
+	viewKey string
+	layer   *graph.OverlayLayer
 	// Files captured in the entry, for invalidation lookups and for
 	// the diff tool's enumeration.
 	files []string
+}
+
+// overlayViewCacheKey names the view an overlay layer was built against.
+//
+// A materialized stack states its own identity, which is the generation-exact
+// answer. A view with no materialized stack — a labelled base selector, a
+// non-strict fallback — still names a reader and possibly a working copy, so
+// it is keyed by the identity its rider reports plus the checkout root, which
+// is what actually changes the paths and the bytes the layer is built from.
+func overlayViewCacheKey(view *requestView) string {
+	if view == nil || !view.routed() {
+		return ""
+	}
+	if view.materialized != nil {
+		return "view\x00" + view.materialized.ID.Fingerprint() + "\x00" + view.viewRoot
+	}
+	if view.rider != nil {
+		return strings.Join([]string{
+			"rider",
+			view.rider.GraphID,
+			view.rider.CheckoutID,
+			view.rider.ViewFingerprint,
+			view.viewRoot,
+		}, "\x00")
+	}
+	return "root\x00" + view.viewRoot
+}
+
+// requestOverlayViewCacheKey is overlayViewCacheKey for the view riding ctx.
+func requestOverlayViewCacheKey(ctx context.Context) string {
+	return overlayViewCacheKey(requestViewFromContext(ctx))
+}
+
+// overlayBaseReaderFor is the reader the buffer-layer build reads base
+// identities and unresolved edge targets through: the request's own reader.
+//
+// Both reads are bounded localization projections, which are optional
+// capabilities rather than part of graph.Reader, and both fail closed when the
+// reader underneath does not serve them. Every routed checkout reader is a
+// composed OverlaidView and serves both. The one request reader that does not
+// is the narrowed filter a labelled `base` selector installs — and that view
+// reads the same checkout and the same corpus an unrouted request reads, so
+// falling through to the corpus there returns the answer it already had rather
+// than refusing the caller's buffers outright. A routed checkout never takes
+// this branch, so nothing that needed re-rooting is lost to it.
+func (s *Server) overlayBaseReaderFor(ctx context.Context) graph.Reader {
+	reader := s.requestBaseReader(ctx)
+	if reader == nil {
+		return s.graph
+	}
+	_, boundedFile := reader.(graph.BoundedFileNodeReader)
+	_, boundedName := reader.(graph.BoundedExactNameReader)
+	if boundedFile && boundedName {
+		return reader
+	}
+	return s.graph
 }
 
 func (s *Server) snapshotOverlayRequestForCtx(ctx context.Context) (*overlayRequestSnapshot, error) {
@@ -289,7 +354,7 @@ func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *g
 	if view := OverlayViewFromContext(ctx); view != nil && !snapshot.canonical {
 		return ctx, nil, fmt.Errorf("overlay view has a non-canonical request snapshot")
 	}
-	if err := s.canonicalizeOverlayRequestSnapshot(snapshot); err != nil {
+	if err := s.canonicalizeOverlayRequestSnapshot(ctx, snapshot); err != nil {
 		return ctx, nil, err
 	}
 	ctx = withOverlayRequestSnapshot(ctx, snapshot)
@@ -323,7 +388,7 @@ func canonicalOverlayGraphPath(candidate string) string {
 // only when their replacement state is identical. SnapshotFor does not retain
 // push chronology, so conflicting aliases fail closed instead of guessing
 // which editor state is newer.
-func (s *Server) canonicalizeOverlayRequestSnapshot(snapshot *overlayRequestSnapshot) error {
+func (s *Server) canonicalizeOverlayRequestSnapshot(ctx context.Context, snapshot *overlayRequestSnapshot) error {
 	if snapshot == nil || snapshot.canonical {
 		return nil
 	}
@@ -342,18 +407,22 @@ func (s *Server) canonicalizeOverlayRequestSnapshot(snapshot *overlayRequestSnap
 	byPath := make(map[string]canonicalRecord, len(snapshot.files))
 	for _, file := range snapshot.files {
 		rawPath := file.Path
-		absPath, err := s.resolveOverlayAbsPath(rawPath)
+		absPath, err := s.resolveOverlayRequestAbsPath(ctx, rawPath)
 		if err != nil {
 			return err
 		}
-		owner := s.pickIndexerForPath(absPath)
+		// An editor with the routed worktree open spells its buffers under
+		// that checkout, which is deliberately not a registered indexer root.
+		// Ownership, workspace admission and the graph spelling are still the
+		// owning repository's to state, so ask it through the canonical root.
+		owner := s.pickIndexerForPath(s.overlayOwnerAbsPath(ctx, absPath))
 		if absPath == "" || owner == nil {
 			return fmt.Errorf("overlay path %q is outside the registered workspace", rawPath)
 		}
 		if snapshot.workspace != "" && owner.WorkspaceID() != snapshot.workspace {
 			return fmt.Errorf("overlay path %q belongs to workspace %q, not registered workspace %q", rawPath, owner.WorkspaceID(), snapshot.workspace)
 		}
-		graphPath := canonicalOverlayGraphPath(s.resolveOverlayGraphPath(rawPath, absPath))
+		graphPath := canonicalOverlayGraphPath(s.resolveOverlayGraphPathForRequest(ctx, rawPath, absPath))
 		if graphPath == "" {
 			return fmt.Errorf("overlay path %q has no canonical graph path", rawPath)
 		}
@@ -401,7 +470,11 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 		if ov.BaseSHA == "" {
 			continue
 		}
-		abs, resolveErr := s.resolveOverlayAbsPath(ov.Path)
+		// Drift is a property of the working copy THIS request reads. Stating
+		// it against the repository's canonical checkout would refuse a buffer
+		// that matches the worktree it was opened from, and accept one that
+		// drifted from it.
+		abs, resolveErr := s.resolveOverlayRequestAbsPath(ctx, ov.Path)
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
@@ -416,15 +489,17 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	hash := hashOverlayFiles(files)
 	// The buffer layer composes over whatever answers THIS request — the
 	// indexed corpus, or the routed checkout view the session's cwd bound to.
-	// The parsed layer itself is base-independent, which is what lets the
-	// cache below stay keyed by content alone.
+	// The layer is built against that same reader (removal markers, edge
+	// resolution) and against that same checkout (paths), so the cache below
+	// is keyed by the view identity as well as by content.
 	base := s.requestBaseReader(ctx)
+	viewKey := requestOverlayViewCacheKey(ctx)
 
-	// Cache hit: same session pushed the same buffers; reuse the
-	// parsed layer. The cache stores up to one entry per session; a
-	// changed content hash evicts the prior entry.
+	// Cache hit: same session pushed the same buffers while reading the same
+	// view; reuse the parsed layer. The cache stores up to one entry per
+	// session; a changed content hash or a changed view evicts the prior entry.
 	if v, ok := s.overlayLayerCache.Load(sessID); ok {
-		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash {
+		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash && entry.viewKey == viewKey {
 			return graph.NewOverlaidView(base, entry.layer), nil
 		}
 		s.overlayLayerCache.Delete(sessID)
@@ -436,7 +511,7 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	s.overlayLayerBuildMu.Lock()
 	defer s.overlayLayerBuildMu.Unlock()
 	if v, ok := s.overlayLayerCache.Load(sessID); ok {
-		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash {
+		if entry := v.(*overlayLayerCacheEntry); entry.hash == hash && entry.viewKey == viewKey {
 			return graph.NewOverlaidView(base, entry.layer), nil
 		}
 	}
@@ -449,9 +524,10 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 		return nil, nil
 	}
 	s.overlayLayerCache.Store(sessID, &overlayLayerCacheEntry{
-		hash:  hash,
-		layer: layer,
-		files: paths,
+		hash:    hash,
+		viewKey: viewKey,
+		layer:   layer,
+		files:   paths,
 	})
 	return graph.NewOverlaidView(base, layer), nil
 }
@@ -480,6 +556,76 @@ func (s *Server) resolveOverlayAbsPath(p string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// resolveOverlayRequestAbsPath is resolveOverlayAbsPath placed in the checkout
+// this request reads. Every registered indexer root is the repository's
+// canonical checkout, so the legacy resolver always lands in it — which is the
+// wrong tree, and the wrong bytes, for a request routed to a worktree view.
+//
+// Returns ("", nil) exactly where resolveOverlayAbsPath does, and the legacy
+// answer unchanged for every request that is not routed to a working copy.
+func (s *Server) resolveOverlayRequestAbsPath(ctx context.Context, p string) (string, error) {
+	abs, err := s.resolveOverlayAbsPath(p)
+	if err != nil || abs == "" {
+		return abs, err
+	}
+	return s.overlayRequestAbsPath(ctx, abs), nil
+}
+
+// overlayRequestAbsPath moves one already-resolved absolute path into the view's
+// working copy. A path that is already inside it, a request with no working copy
+// of its own, and a repository the view does not serve are all identity.
+func (s *Server) overlayRequestAbsPath(ctx context.Context, abs string) string {
+	view := requestViewPathRoot(ctx)
+	if view.root == "" || abs == "" || view.contains(abs) {
+		return abs
+	}
+	owner := s.pickIndexerForPath(abs)
+	if owner == nil || !view.serves(owner.RepoPrefix()) {
+		return abs
+	}
+	return view.rooted(abs, owner.RootPath())
+}
+
+// overlayOwnerAbsPath is the inverse: an editor that has the routed worktree
+// open spells its buffers under that checkout, and the worktree is deliberately
+// not a registered MultiIndexer root, so no owner lookup can resolve those
+// paths. Map such a path back onto the owning repository's canonical root so
+// the registered indexer — its registry, its repo prefix, its workspace slugs —
+// is still the one that answers. Identity for every other path.
+func (s *Server) overlayOwnerAbsPath(ctx context.Context, abs string) string {
+	view := requestViewPathRoot(ctx)
+	if view.root == "" || abs == "" || !view.contains(abs) {
+		return abs
+	}
+	owner := s.indexerForRepoPrefix(view.repoPrefix)
+	if owner == nil {
+		return abs
+	}
+	root := owner.RootPath()
+	if root == "" {
+		return abs
+	}
+	rel, ok := relativeWithinRoot(view.root, abs)
+	if !ok {
+		return abs
+	}
+	return filepath.Clean(filepath.Join(root, rel))
+}
+
+// indexerForRepoPrefix returns the registered indexer for a repo prefix, or the
+// sole single-repo indexer when the view names no prefix.
+func (s *Server) indexerForRepoPrefix(repoPrefix string) *indexer.Indexer {
+	if s == nil {
+		return nil
+	}
+	if s.multiIndexer != nil && repoPrefix != "" {
+		if idx := s.multiIndexer.GetIndexer(repoPrefix); idx != nil {
+			return idx
+		}
+	}
+	return s.indexer
 }
 
 // resolveOverlayGraphPath turns the overlay path into the
@@ -585,7 +731,11 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 	// Stage every bounded read and extraction before constructing the layer.
 	// Extractors may reuse result pointers, so no prefix or graph mutation is
 	// allowed until every file has passed its caps and cancellation checks.
-	baseReader, _ := s.graph.(graph.BoundedFileNodeReader)
+	// The identities a removal marker hides are the ones THIS request's reader
+	// carries for the file. Reading them off the shared corpus while the
+	// request answers from a worktree view hides symbols the request never saw
+	// and leaves the ones it did see standing.
+	baseReader, _ := s.overlayBaseReaderFor(ctx).(graph.BoundedFileNodeReader)
 	staged := make([]stagedOverlayFile, 0, len(files))
 	coveredPaths := make([]string, 0, len(files))
 	baseNodeCount := 0
@@ -597,14 +747,19 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		absPath, err := s.resolveOverlayAbsPath(ov.Path)
+		// Two spellings of one file, and they differ only under a routed view:
+		// absPath is the working copy this request reads (bytes, language
+		// detection, the graph-path identity), ownerAbs is the repository's
+		// canonical checkout, which is what the registered indexer roots own.
+		absPath, err := s.resolveOverlayRequestAbsPath(ctx, ov.Path)
 		if err != nil {
 			return nil, nil, err
 		}
 		if absPath == "" {
 			continue // untracked file — silent skip, matches disk path
 		}
-		graphPath := s.resolveOverlayGraphPath(ov.Path, absPath)
+		ownerAbs := s.overlayOwnerAbsPath(ctx, absPath)
+		graphPath := s.resolveOverlayGraphPathForRequest(ctx, ov.Path, absPath)
 		coveredPaths = append(coveredPaths, graphPath)
 
 		if ov.Deleted {
@@ -620,7 +775,7 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 			continue
 		}
 
-		idx := s.pickIndexerForPath(absPath)
+		idx := s.pickIndexerForPath(ownerAbs)
 		if idx == nil {
 			continue
 		}
@@ -638,7 +793,9 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		if idx.RepoPrefix() != "" {
 			relPath = strings.TrimPrefix(graphPath, idx.RepoPrefix()+"/")
 		} else if root != "" {
-			if r, ok := relativeWithinRoot(root, absPath); ok {
+			// Against the owner spelling: root is the registered checkout, and
+			// under a routed view absPath sits in a different one.
+			if r, ok := relativeWithinRoot(root, ownerAbs); ok {
 				relPath = filepath.ToSlash(r)
 			}
 		}
@@ -794,7 +951,11 @@ func (s *Server) constructOverlayLayer(ctx context.Context, files []daemon.Overl
 		}
 	}
 
-	if err := resolveOverlayEdges(ctx, s.graph, layer); err != nil {
+	// Resolve against the reader that answers this request: a call the buffer
+	// makes to a symbol that exists only in the routed worktree must bind, and
+	// one that exists only in the shared corpus the request is not reading must
+	// not.
+	if err := resolveOverlayEdges(ctx, s.overlayBaseReaderFor(ctx), layer); err != nil {
 		return nil, nil, err
 	}
 	return layer, coveredPaths, nil
@@ -1238,6 +1399,13 @@ func hashOverlayFiles(files []daemon.OverlayFile) string {
 // on a hit, ("", false) otherwise — including the deleted-overlay
 // case, since a tombstone has no content to return and callers
 // should treat the file as absent.
+//
+// absPath is what resolveNodePath handed the caller, which is re-rooted onto
+// the checkout this request reads (checkoutRootedPath). The snapshot holds
+// canonical graph paths, so the comparison spelling has to be re-rooted the
+// same way: resolving them against the registered root alone would miss under
+// every routed view, and a miss here is not "stale bytes" — it is the file's
+// on-disk text sliced at line numbers minted from the buffer's parse.
 func (s *Server) overlayContentFor(ctx context.Context, absPath string) (string, bool) {
 	if s == nil || ctx == nil {
 		return "", false
@@ -1251,7 +1419,7 @@ func (s *Server) overlayContentFor(ctx context.Context, absPath string) (string,
 		if ov.Deleted {
 			continue
 		}
-		ovAbs, _ := s.resolveOverlayAbsPath(ov.Path)
+		ovAbs, _ := s.resolveOverlayRequestAbsPath(ctx, ov.Path)
 		if ovAbs == "" {
 			continue
 		}

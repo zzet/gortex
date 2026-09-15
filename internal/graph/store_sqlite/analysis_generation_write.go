@@ -71,6 +71,26 @@ func validateAnalysisHeader(header graph.AnalysisGenerationHeader) error {
 	return nil
 }
 
+// beginAnalysisWrite opens the analysis cache's write transaction on the BASE
+// handle while its callers keep stamping their own s.viewGen into the rows.
+//
+// The analysis cache is a derived plane, not payload: analysisGenerationSchemaSQL
+// copies node IDs into generation-local rows precisely so it references no live
+// node, and checkoutCatalogSchemaSQL says in as many words that "the same
+// reasoning keeps analysis generations detached". Payload writes through a
+// published generation's handle are refused by its seal
+// (refuseSealedPayloadWrite / resolvePayloadSeal: anything past building is
+// sealed), and an analysis computed over a published view is exactly the case
+// that must still be cacheable. atBase exists for the catalog for this reason
+// (store_generation.go) and the analysis cache is the same kind of plane.
+//
+// atBase drops only viewGen, the seal, the resolve lane and the managed-write
+// restriction; writeMu, the pools and the pinned bulk connection all live on
+// the shared core, so the transaction is the same one a base write would take.
+func (s *Store) beginAnalysisWrite() (*sql.Tx, error) {
+	return s.atBase().beginWrite()
+}
+
 func validateAnalysisChunkSize(kind string, size int) error {
 	if size > analysisGenerationChunkLimit {
 		return fmt.Errorf("analysis generation: %s chunk has %d rows, limit is %d", kind, size, analysisGenerationChunkLimit)
@@ -98,7 +118,13 @@ func (s *Store) BeginAnalysisGeneration(expectedRevision uint64, header graph.An
 	if s.analysisMutationRevision.Load() != expectedRevision {
 		return 0, false, nil
 	}
-	tx, err := s.beginWrite()
+	// A new analysis over a view the retirement sweep is already walking would
+	// never be collected: the sweep snapshots the ids it deletes, and the
+	// payload generation is gone by the time it finishes.
+	if err := s.refuseRetiredAnalysisWrite(); err != nil {
+		return 0, false, err
+	}
+	tx, err := s.beginAnalysisWrite()
 	if err != nil {
 		return 0, false, err
 	}
@@ -108,17 +134,22 @@ func (s *Store) BeginAnalysisGeneration(expectedRevision uint64, header graph.An
 			_ = tx.Rollback()
 		}
 	}()
+	// view_gen stamps the analysis with the payload view its inputs were read
+	// from. The projection this generation is computed over is already scoped
+	// to s.viewGen (analysis_projection.go binds it on every cursor), so the
+	// cache row has to carry the same axis or two views' analyses collide on
+	// the one active pointer.
 	result, err := tx.Exec(`
 		INSERT INTO analysis_generations(
 			format_version, build_revision, created_at_unix, state,
 			node_count, community_count, process_count, concept_count,
 			pagerank_max, authority_max, hub_max, modularity,
-			processes_truncated, processes_truncation_reason
-		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			processes_truncated, processes_truncation_reason, view_gen
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		header.FormatVersion, int64(expectedRevision), createdAt, analysisGenerationBuilding,
 		header.NodeCount, header.CommunityCount, header.ProcessCount, header.ConceptCount,
 		header.PageRankMax, header.AuthorityMax, header.HubMax, header.Modularity,
-		analysisBool(header.ProcessesTruncated), header.ProcessesTruncationReason)
+		analysisBool(header.ProcessesTruncated), header.ProcessesTruncationReason, s.viewGen)
 	if err != nil {
 		return 0, false, err
 	}
@@ -146,12 +177,25 @@ func (s *Store) beginAnalysisGenerationWrite(expectedRevision uint64, generation
 	if s.analysisMutationRevision.Load() != expectedRevision {
 		return nil, false, nil
 	}
-	tx, err := s.beginWrite()
+	// Same gate as BeginAnalysisGeneration, and it has to be here too: an
+	// analysis begun before the retirement started can still be appended to,
+	// sealed or activated while the sweep runs.
+	if err := s.refuseRetiredAnalysisWrite(); err != nil {
+		return nil, false, err
+	}
+	tx, err := s.beginAnalysisWrite()
 	if err != nil {
 		return nil, false, err
 	}
+	// The view_gen predicate is what keeps one handle from appending to,
+	// sealing or activating an analysis generation another payload view is
+	// building. Generation ids are globally unique, so a mismatch reads as
+	// "does not exist" for this handle, which is exactly what it is.
 	var state int
-	if err := tx.QueryRow(`SELECT state FROM analysis_generations WHERE generation_id = ?`, generationID).Scan(&state); err != nil {
+	if err := tx.QueryRow(
+		`SELECT state FROM analysis_generations WHERE generation_id = ? AND view_gen = ?`,
+		generationID, s.viewGen,
+	).Scan(&state); err != nil {
 		_ = tx.Rollback()
 		if err == sql.ErrNoRows {
 			return nil, false, fmt.Errorf("analysis generation: generation %d does not exist", generationID)
@@ -752,9 +796,13 @@ func (s *Store) ActivateAnalysisGeneration(expectedRevision uint64, generationID
 	if _, err := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ? AND state = ?`, analysisGenerationReady, generationID, analysisGenerationBuilding); err != nil {
 		return false, err
 	}
+	// One active analysis per payload view generation: the conflict target is
+	// the pointer's (view_gen, slot) key, so activating this view's analysis
+	// never displaces another view's.
 	if _, err := tx.Exec(`
-		INSERT INTO analysis_active_generation(slot, generation_id) VALUES(1, ?)
-		ON CONFLICT(slot) DO UPDATE SET generation_id=excluded.generation_id`, generationID); err != nil {
+		INSERT INTO analysis_active_generation(view_gen, slot, generation_id) VALUES(?, 1, ?)
+		ON CONFLICT(view_gen, slot) DO UPDATE SET generation_id=excluded.generation_id`,
+		s.viewGen, generationID); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -771,7 +819,7 @@ func (s *Store) AbortAnalysisGeneration(generationID int64) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.writerDB.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ? AND state = ?`, analysisGenerationStale, generationID, analysisGenerationBuilding)
+	result, err := s.writerDB.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ? AND view_gen = ? AND state = ?`, analysisGenerationStale, generationID, s.viewGen, analysisGenerationBuilding)
 	if err != nil {
 		return err
 	}
@@ -781,7 +829,7 @@ func (s *Store) AbortAnalysisGeneration(generationID int64) error {
 	}
 	if changed == 0 {
 		var state int
-		if err := s.writerDB.QueryRow(`SELECT state FROM analysis_generations WHERE generation_id = ?`, generationID).Scan(&state); err != nil {
+		if err := s.writerDB.QueryRow(`SELECT state FROM analysis_generations WHERE generation_id = ? AND view_gen = ?`, generationID, s.viewGen).Scan(&state); err != nil {
 			if err == sql.ErrNoRows {
 				return fmt.Errorf("analysis generation: generation %d does not exist", generationID)
 			}

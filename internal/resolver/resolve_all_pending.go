@@ -248,6 +248,7 @@ func (p *resolveAllPassIndexes) prepare(pending []*graph.Edge) map[string]*graph
 }
 
 func (p *resolveAllPassIndexes) resetAfterInterleave() {
+	p.resolver.clearGoPackageOwnership()
 	p.dirAll = false
 	p.depAll = false
 	p.providesAll = false
@@ -262,9 +263,9 @@ func (p *resolveAllPassIndexes) resetAfterInterleave() {
 // ResolveAll yielded mu. The generation equality fast path adds no graph reads
 // to the common case; a real same-instance interactive pass rebuilds the
 // current page's bounded indexes and lookup cache exactly once after relock.
-func (p *resolveAllPassIndexes) refreshAfterInterleave(pending []*graph.Edge, force bool) bool {
+func (p *resolveAllPassIndexes) refreshAfterInterleave(ctx context.Context, pending []*graph.Edge, force bool) (bool, error) {
 	if !force && p.generation == p.resolver.scratchGeneration {
-		return false
+		return false, nil
 	}
 	// A forced store-generation refresh may not have passed through this
 	// Resolver's clearLookupCache. Drop page-local negatives before rebuilding
@@ -275,8 +276,10 @@ func (p *resolveAllPassIndexes) refreshAfterInterleave(pending []*graph.Edge, fo
 	p.resolver.missingNodeByID = nil
 	p.resetAfterInterleave()
 	sources := p.prepare(pending)
-	p.resolver.warmLookupCacheWithSources(pending, sources)
-	return true
+	if err := p.resolver.warmLookupCacheWithSources(ctx, pending, sources); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (p *resolveAllPassIndexes) clearPage() {

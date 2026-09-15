@@ -361,7 +361,7 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 		// 1. Resolve the WorkspaceEdit into per-file (absPath,
 		//    overlayPath, newContent) tuples. Each tuple replaces
 		//    `current[path]` for downstream steps.
-		fileEdits, err := s.groupEditByFile(edit)
+		fileEdits, err := s.groupEditByFileCtx(ctx, edit)
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", stepIdx, err)
 		}
@@ -447,13 +447,20 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 		if layerErr != nil {
 			return nil, fmt.Errorf("step %d: overlay parse: %w", stepIdx, layerErr)
 		}
-		// The shadow view composes the step's layer onto the base graph, not
-		// onto whatever view answers this request, so every verdict below —
-		// the graph diff, the broken callers, the impact rollup — describes
-		// the base corpus. Under a view the response says so.
-		view := graph.NewOverlaidView(s.graph, layer)
-		annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
-		s.fillStepImpact(&step, layer, view, step.touchedFiles)
+		// The shadow view composes the step's layer onto the same reader the
+		// layer's own removal markers were read through (simulationBaseReader).
+		//
+		// This line alone changes nothing observable today, and the comment
+		// must not claim otherwise: every read through this view is a
+		// GetFileNodes on a path the layer covers, and OverlaidView answers
+		// those from the layer without consulting the base at all
+		// (graph/overlay.go, GetFileNodes). What actually fixed the phantom
+		// removals and the phantom broken callers under a worktree view is the
+		// base reader inside fillStepImpact below. The reader is passed here so
+		// the composed view cannot silently revert to the corpus the first time
+		// a read through it does reach the base.
+		view := graph.NewOverlaidView(s.simulationBaseReader(ctx), layer)
+		s.fillStepImpact(ctx, &step, layer, view, step.touchedFiles)
 
 		for _, id := range step.symbolsAdded {
 			cumulativeAdded[id] = struct{}{}
@@ -486,6 +493,54 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 	return sim, nil
 }
 
+// simulationBaseReader is the pre-edit state a simulation is diffed against.
+//
+// The invariant it exists to hold: this MUST be the same reader the step's
+// overlay layer read its base identities through, because those identities are
+// the layer's removal markers. Minting the markers off one corpus and taking
+// the diff against another produces removals for symbols the answer never
+// contained and misses the ones it did — a mixed-view answer.
+//
+// The layer build reads through overlayBaseReaderFor (overlay_view.go), which
+// hands back the request's own reader only when it serves BOTH bounded
+// localization projections, and the indexed corpus otherwise. A routed
+// checkout's reader is a composed OverlaidView and serves both. The one
+// request reader that does not is the narrowed filter a labelled `base`
+// selector installs — and that is exactly the view readsOwnCheckout()
+// (view_request.go) reports false for, because its bytes and its corpus are
+// the ones an unrouted request reads. So readsOwnCheckout is the predicate
+// that keeps the two sides in step, and it says what it means rather than
+// re-deriving the layer build's capability probe here.
+func (s *Server) simulationBaseReader(ctx context.Context) graph.Reader {
+	if view := requestViewFromContext(ctx); view.readsOwnCheckout() {
+		return view.reader
+	}
+	return s.graph
+}
+
+// simulationLSPAnchorPath is the spelling of a simulated file that the
+// language-server lookup must be keyed on: the owning repository's canonical
+// checkout, never the routed worktree the bytes come from.
+//
+// A routed checkout is deliberately not a registered MultiIndexer root — that
+// is why overlayOwnerAbsPath (overlay_view.go) exists at all — so
+// workspaceRootFor (tools_lsp.go) matches it against no tracked repo and falls
+// through to its last-resort "the file's own directory" arm. The router keys
+// its provider cache on (spec, workspace), so passing the worktree spelling
+// spawns one language server per touched DIRECTORY, each rooted below the
+// module root and each answering with degraded or empty diagnostics, while the
+// correctly-rooted server for that repository sits idle beside it.
+//
+// The bytes stay the view's: the caller opens, reads and restores the re-rooted
+// path. Only the workspace the analysis runs in is anchored back. Identity for
+// every request that selected no working copy of its own.
+func (s *Server) simulationLSPAnchorPath(ctx context.Context, absPath string) string {
+	if anchored := s.overlayOwnerAbsPath(ctx, absPath); anchored != "" {
+		return anchored
+	}
+	return absPath
+}
+
 // fillStepImpact computes the per-step impact summary against the
 // overlay layer built for that step. The graph diff is between base
 // (for the touched file paths) and the overlay layer's view of those
@@ -495,12 +550,44 @@ func (s *Server) buildSimulation(ctx context.Context, edits []lsp.WorkspaceEdit,
 // and comparing to base; any caller that exists in base but whose
 // target symbol is gone from overlay (or whose signature changed
 // incompatibly) is flagged.
-func (s *Server) fillStepImpact(step *simulationStep, layer *graph.OverlayLayer, view *graph.OverlaidView, _ []string) {
+func (s *Server) fillStepImpact(ctx context.Context, step *simulationStep, layer *graph.OverlayLayer, view *graph.OverlaidView, _ []string) {
 	if layer == nil || view == nil {
 		step.summary = "simulation: no overlay layer constructed (no covered paths)"
 		return
 	}
+	// "base" here is the pre-edit state every verdict below is taken against,
+	// and it must be the reader the LAYER's removal markers were minted from
+	// or the answer mixes two corpora. simulationBaseReader is that reader;
+	// its doc comment carries the rule and the one case that is not the view.
+	base := s.simulationBaseReader(ctx)
+	requested := requestViewFromContext(ctx)
 	baseEng := s.engine
+	if requested.readsOwnCheckout() {
+		// Built off the same seam every other routed handler uses
+		// (engineFor, overlay_view.go): WithReader on its own CLEARS the
+		// layer stack (query/engine.go — "a reader swap re-decides which
+		// corpora answer"), so an engine built that way enumerates
+		// candidates from the base search index even while it reads the
+		// view. GetCallers below is a pure walk and does not enumerate, so
+		// this is seam consistency rather than an observable fix — and it is
+		// what keeps the next query added here from being wrong.
+		//
+		// readsOwnCheckout, not routed(): a labelled base selector is routed
+		// and still reads the shared corpus, only narrowed to one repository
+		// (view_request.go, baseNarrowed). Swapping the engine for THAT reader
+		// would silently shrink the cross-repo broken-caller and broken-
+		// implementor contract this tool advertises to the one repo the label
+		// named — the foreign in-edges are filtered out by newBaseGraphReader
+		// (view_request.go) before GetCallers ever sees them.
+		baseEng = s.engine.WithViewLayers(requested.reader, requested.candidateLayers())
+	}
+	if requested.routed() && !requested.readsOwnCheckout() {
+		// Routed, but reading the shared corpus: the layer's removal markers,
+		// the diff, the callers and the impact rollup below all describe the
+		// indexed corpus rather than the narrowed view the caller selected.
+		// Say so — this is the one arm on which CapResolutionLocal is true.
+		annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
+	}
 	overlayEng := s.engine.WithReader(view)
 
 	addedSet := map[string]struct{}{}
@@ -511,7 +598,7 @@ func (s *Server) fillStepImpact(step *simulationStep, layer *graph.OverlayLayer,
 	testTargetSet := map[string]struct{}{}
 
 	for _, graphPath := range layer.FilePaths() {
-		baseNodes := s.graph.GetFileNodes(graphPath)
+		baseNodes := base.GetFileNodes(graphPath)
 		overlayNodes := view.GetFileNodes(graphPath)
 
 		baseByID := map[string]*graph.Node{}
@@ -577,7 +664,7 @@ func (s *Server) fillStepImpact(step *simulationStep, layer *graph.OverlayLayer,
 			// method of an interface, surface every other
 			// implementor that may now drift.
 			if n.Kind == graph.KindMethod {
-				for _, e := range s.graph.GetInEdges(id) {
+				for _, e := range base.GetInEdges(id) {
 					if e.Kind == graph.EdgeImplements {
 						brokenImpls[e.From+"->"+id] = map[string]any{
 							"implementor_id": e.From,
@@ -663,7 +750,15 @@ func (s *Server) fillStepImpact(step *simulationStep, layer *graph.OverlayLayer,
 		comms := s.communities
 		procs := s.processes
 		s.analysisMu.RUnlock()
-		impact := analysis.AnalyzeImpact(s.graph, seedIDs, comms, procs)
+		// The dependency walk runs over the view. The community partition and
+		// the process discovery that grade it do not: both are the per-server
+		// analysis of the indexed corpus (server.go, communityCacheToken names
+		// exactly that corpus), so the risk band and the community-crossing
+		// term of this rollup are base-scoped even now that the walk is not.
+		if comms != nil || procs != nil {
+			annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
+		}
+		impact := analysis.AnalyzeImpact(base, seedIDs, comms, procs)
 		step.impact = map[string]any{
 			"risk":              string(impact.Risk),
 			"summary":           impact.Summary,
@@ -807,21 +902,37 @@ type simulationFileEdit struct {
 	deleted     bool
 }
 
-// groupEditByFile resolves a WorkspaceEdit's TextEdits into per-file
+// groupEditByFile is groupEditByFileCtx for a caller with no request context.
+// It anchors every edit in the repository's canonical checkout, which is what
+// the whole surface did before views existed.
+func (s *Server) groupEditByFile(edit lsp.WorkspaceEdit) ([]simulationFileEdit, error) {
+	return s.groupEditByFileCtx(context.Background(), edit)
+}
+
+// groupEditByFileCtx resolves a WorkspaceEdit's TextEdits into per-file
 // tuples keyed by absolute path. URI scheme is recognised; otherwise
 // the path is taken verbatim. Files that don't resolve to any
 // tracked workspace fall through with empty absPath — the simulator
 // still tracks them as "touched_files" but the graph layer will skip
 // them (silently, matching the disk path's behaviour for untracked
 // files).
-func (s *Server) groupEditByFile(edit lsp.WorkspaceEdit) ([]simulationFileEdit, error) {
+//
+// The absolute path is placed in the checkout THIS request reads
+// (resolveOverlayRequestAbsPath, overlay_view.go:561-574), not in the
+// repository's canonical checkout. It is what the pre-edit content is then
+// read from (contentForSim → readSimFile), so a simulation under a worktree
+// view applies the caller's TextEdits to the worktree's bytes instead of to a
+// different branch's bytes that happen to live at the same repo-relative path.
+// Identity for every request that selected no working copy of its own, so the
+// unrouted answer is unchanged.
+func (s *Server) groupEditByFileCtx(ctx context.Context, edit lsp.WorkspaceEdit) ([]simulationFileEdit, error) {
 	bucket := map[string]*simulationFileEdit{}
 	addEdits := func(rawURI string, edits []lsp.TextEdit) error {
 		path := normaliseEditURI(rawURI)
 		if path == "" {
 			return fmt.Errorf("workspace_edit entry has empty path or unsupported URI: %q", rawURI)
 		}
-		abs, err := s.resolveOverlayAbsPath(path)
+		abs, err := s.resolveOverlayRequestAbsPath(ctx, path)
 		if err != nil {
 			return err
 		}
@@ -997,15 +1108,39 @@ func (s *Server) simulateDiagnostics(ctx context.Context, sim *simulation, touch
 	return s.simulateDiagnosticsAtStep(ctx, sim, len(sim.snapshots)-1, touched, timeout)
 }
 
-func (s *Server) simulateDiagnosticsAtStep(_ context.Context, sim *simulation, stepIdx int, touched []string, timeout time.Duration) []map[string]any {
+// simulateDiagnosticsAtStep drives the language server. The paths it opens are
+// placed in the checkout this request reads, so the on-disk content it reads to
+// restore afterwards is the content it displaced.
+//
+// What it deliberately does NOT place there is the language server itself: the
+// provider is resolved off the canonical-checkout spelling of the same file
+// (simulationLSPAnchorPath), because a routed worktree is not a registered root
+// and keying the provider cache on it would spawn a per-directory server rooted
+// below the module root. The consequence is that the analysis behind these
+// diagnostics — every other file in the workspace, the module graph, the type
+// information — is the canonical checkout's, not the view's, even though the
+// simulated buffer pushed into it is the view's. That is a base-scoped answer
+// inside a routed request and it says so.
+//
+// The statement is made once, where this request decides to consult a language
+// server at all, and not per resolved provider. Where the server is rooted is a
+// property of this daemon's workspace registry; whether a provider then answers
+// for one file is that server's availability (installed, spawned, handshaked).
+// Keying the rider on the second would make two otherwise identical routed
+// requests disagree about the scope of their answer because a subprocess was
+// slow to start.
+func (s *Server) simulateDiagnosticsAtStep(ctx context.Context, sim *simulation, stepIdx int, touched []string, timeout time.Duration) []map[string]any {
 	if s.semanticMgr == nil || sim == nil || stepIdx < 0 || stepIdx >= len(sim.snapshots) {
 		return nil
+	}
+	if len(touched) > 0 {
+		annotateBaseScoped(ctx, graphview.CapLSPDiagnostics)
 	}
 	snapshot := sim.snapshots[stepIdx]
 	// Build a lookup from absPath -> overlay content for this step.
 	bySnapshotPath := map[string]daemon.OverlayFile{}
 	for _, f := range snapshot {
-		abs, _ := s.resolveOverlayAbsPath(f.Path)
+		abs, _ := s.resolveOverlayRequestAbsPath(ctx, f.Path)
 		if abs == "" {
 			continue
 		}
@@ -1014,11 +1149,14 @@ func (s *Server) simulateDiagnosticsAtStep(_ context.Context, sim *simulation, s
 
 	out := []map[string]any{}
 	for _, overlayPath := range touched {
-		absPath, err := s.resolveOverlayAbsPath(overlayPath)
+		absPath, err := s.resolveOverlayRequestAbsPath(ctx, overlayPath)
 		if err != nil || absPath == "" {
 			continue
 		}
-		provider, _, perr := s.lspProviderForPath(absPath)
+		// The provider is selected off the canonical-checkout spelling so the
+		// SERVER stays repo-rooted; every path handed to it below is still the
+		// view's (simulationLSPAnchorPath).
+		provider, _, perr := s.lspProviderForPath(s.simulationLSPAnchorPath(ctx, absPath))
 		if perr != nil || provider == nil {
 			continue
 		}

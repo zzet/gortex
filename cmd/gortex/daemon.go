@@ -107,6 +107,20 @@ var daemonReloadCmd = &cobra.Command{
 // counters and into a full recount. See the flag help for the cost.
 var daemonStatusExact bool
 
+// daemonStatusFormat selects the one-shot renderer.
+//
+// The text tables are written for a person and are free to drop, round and
+// re-shape what the payload carries. `--format json` is the other contract:
+// the StatusResponse exactly as the daemon sent it, which is what a
+// measurement harness or a script has to read — the view-lifecycle counters in
+// particular are a map of series keys that no table can render without
+// choosing which ones matter.
+var daemonStatusFormat string
+
+// daemonStatusFormats is the accepted vocabulary, listed once so the flag help
+// and the validation cannot drift.
+var daemonStatusFormats = []string{"text", "json"}
+
 var daemonStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show daemon PID, uptime, tracked repos, memory, sessions",
@@ -164,6 +178,9 @@ func init() {
 		"continuously refresh the status until interrupted (alt-screen buffer)")
 	daemonStatusCmd.Flags().DurationVar(&daemonStatusInterval, "interval", 2*time.Second,
 		"refresh interval in --watch mode (clamped to >=200ms)")
+	daemonStatusCmd.Flags().StringVar(&daemonStatusFormat, "format", "text",
+		"output format: text (human tables) or json (the raw status payload, including the "+
+			"view-lifecycle counters). Not available with --watch")
 
 	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
@@ -725,8 +742,9 @@ func startReconcileJanitor(
 		logger.Info("daemon: reconcile janitor disabled")
 		return func() {}
 	}
-	stop := make(chan struct{})
+	janitorCtx, janitorDone, stop := newReconcileJanitorLifetime()
 	go func() {
+		defer close(janitorDone)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		logger.Info("daemon: reconcile janitor running", zap.Duration("interval", interval))
@@ -739,7 +757,7 @@ func startReconcileJanitor(
 
 					swept := 0
 					if lifecycle != nil {
-						report, err := lifecycle.Sweep(context.Background())
+						report, err := lifecycle.Sweep(janitorCtx)
 						if err != nil {
 							logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
 						}
@@ -749,6 +767,9 @@ func startReconcileJanitor(
 								zap.Int("count", swept),
 								zap.Int("families", report.Families))
 						}
+					}
+					if janitorCtx.Err() != nil {
+						return swept, 0
 					}
 					results := mi.ReconcileAll()
 					reconciled := 0
@@ -764,12 +785,12 @@ func startReconcileJanitor(
 				if reconciled > 0 || gcedCount > 0 {
 					releaseMemoryToOS(logger, "reconcile_janitor")
 				}
-			case <-stop:
+			case <-janitorCtx.Done():
 				return
 			}
 		}
 	}()
-	return func() { close(stop) }
+	return stop
 }
 
 // daemonStartAcceptedFlags returns every flag the re-exec'd `daemon start`
@@ -1253,20 +1274,73 @@ func runDaemonReload(_ *cobra.Command, _ []string) error {
 }
 
 func runDaemonStatus(cmd *cobra.Command, _ []string) error {
+	format, err := daemonStatusFormatChoice(daemonStatusFormat)
+	if err != nil {
+		return err
+	}
 	if daemonStatusWatch {
+		if format != "text" {
+			// The watch mode is an alt-screen TUI; there is no honest way to
+			// also be a machine-readable stream. Refuse rather than silently
+			// ignoring one of the two flags.
+			return fmt.Errorf("--format %s cannot be combined with --watch", format)
+		}
 		return runDaemonStatusWatch(cmd)
 	}
 	st, err := fetchDaemonStatusWithOptions(daemon.StatusParams{Exact: daemonStatusExact})
 	if err != nil {
 		return err
 	}
-	w := cmd.OutOrStdout()
+	return renderDaemonStatusTo(cmd.OutOrStdout(), st, format)
+}
+
+// renderDaemonStatusTo is the whole of the one-shot status output minus the
+// socket dial, so the section order — and the fact that the views block is in
+// it at all — is checkable without a live daemon.
+//
+// json REPLACES the tables rather than being appended to them: a payload with
+// a table header in front of it is not JSON.
+func renderDaemonStatusTo(w io.Writer, st daemon.StatusResponse, format string) error {
+	if format == "json" {
+		return renderDaemonStatusJSON(w, st)
+	}
 	renderDaemonHeader(w, st)
 	renderDaemonWorkspaces(w, st)
 	renderDaemonRepos(w, st)
+	renderDaemonViews(w, st)
 	renderDaemonSessions(w, st)
 	renderDaemonServers(w, st)
 	return nil
+}
+
+// daemonStatusFormatChoice normalises and validates --format. An unknown value
+// is refused by name with the accepted set, rather than falling back to text:
+// a script that asked for json and silently got tables would parse garbage.
+func daemonStatusFormatChoice(raw string) (string, error) {
+	choice := strings.ToLower(strings.TrimSpace(raw))
+	if choice == "" {
+		return "text", nil
+	}
+	for _, allowed := range daemonStatusFormats {
+		if choice == allowed {
+			return choice, nil
+		}
+	}
+	return "", fmt.Errorf("unknown --format %q (want one of: %s)",
+		raw, strings.Join(daemonStatusFormats, ", "))
+}
+
+// renderDaemonStatusJSON writes the status payload verbatim.
+//
+// It marshals the decoded StatusResponse rather than echoing the raw control
+// frame so the output is this binary's declared schema — a field an older
+// daemon did not send is absent, not silently passed through — and it is
+// indented because the one thing a person does with it is read one field out
+// of it.
+func renderDaemonStatusJSON(w io.Writer, st daemon.StatusResponse) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(st)
 }
 
 // fetchDaemonStatusForCLI dials the control socket once and returns a parsed
@@ -1794,6 +1868,98 @@ func renderDaemonWorkspaces(w io.Writer, st daemon.StatusResponse) {
 		t.AppendRow(table.Row{ws.Slug, len(ws.Repos), projects, ws.Files, ws.Nodes, ws.Edges})
 	}
 	t.Render()
+}
+
+// renderDaemonViews writes the checkout-view lifecycle census: the levels, the
+// metric series behind them, and the two reason lists that explain a level no
+// count can.
+//
+// Before this the whole block was shipped over the socket and rendered by
+// nobody — `daemon status` had no reader for StatusResponse.Views at all, so
+// the counters that say whether committed advancement is reusing payload or
+// rebuilding it existed only inside the daemon's heap.
+//
+// It is omitted entirely when the daemon holds no view lifecycle (no families,
+// no coordinators, no series, nothing stuck), so a single-repo daemon's status
+// keeps exactly the shape it had.
+func renderDaemonViews(w io.Writer, st daemon.StatusResponse) {
+	v := st.Views
+	if v == nil {
+		return
+	}
+	if v.Families == 0 && v.Coordinators == 0 && v.Leases == 0 &&
+		len(v.Counters) == 0 && len(v.CoordinatorStartFailures) == 0 && len(v.StorageFailures) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nviews:")
+	fmt.Fprintf(w, "  families=%d  coordinators=%d  leases=%d\n",
+		v.Families, v.Coordinators, v.Leases)
+	for _, section := range []struct {
+		label  string
+		counts map[string]int
+	}{
+		{"checkouts", v.Checkouts},
+		{"generations", v.Generations},
+		{"ref views", v.RefViews},
+	} {
+		if line := formatViewCounts(section.counts); line != "" {
+			fmt.Fprintf(w, "  %s: %s\n", section.label, line)
+		}
+	}
+	if len(v.Counters) > 0 {
+		fmt.Fprintln(w, "  counters:")
+		for _, key := range sortedCounterKeys(v.Counters) {
+			fmt.Fprintf(w, "    %-58s %d\n", key, v.Counters[key])
+		}
+	}
+	if len(v.CoordinatorStartFailures) > 0 {
+		fmt.Fprintln(w, "  checkouts with no build loop:")
+		for _, f := range v.CoordinatorStartFailures {
+			root := f.RootPath
+			if root == "" {
+				root = "(unknown path)"
+			}
+			fmt.Fprintf(w, "    %s  %s: %s\n", f.CheckoutID, root, f.Reason)
+		}
+	}
+	if len(v.StorageFailures) > 0 {
+		fmt.Fprintln(w, "  generations whose storage maintenance failed:")
+		for _, f := range v.StorageFailures {
+			fmt.Fprintf(w, "    generation %d: %s\n", f.GenerationID, f.Reason)
+		}
+	}
+}
+
+// formatViewCounts renders one state→count map as "ready=3  retiring=1", in a
+// stable key order. An empty map renders as nothing so the caller can drop the
+// whole line: a census section with no instances is absent, not "{}".
+func formatViewCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))
+	}
+	return strings.Join(parts, "  ")
+}
+
+// sortedCounterKeys orders the metric series by name. Map iteration order
+// would make two consecutive `daemon status` runs on an unchanged daemon
+// produce different output, which is the one property a diff-and-watch
+// workflow needs this block not to have.
+func sortedCounterKeys(counters map[string]int64) []string {
+	keys := make([]string, 0, len(counters))
+	for key := range counters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // renderDaemonSessions lists every connected MCP client. Skipped

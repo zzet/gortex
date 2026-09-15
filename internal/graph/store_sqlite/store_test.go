@@ -19,9 +19,9 @@ import (
 func TestSQLiteStoreConformance(t *testing.T) {
 	storetest.RunConformance(t, func(t *testing.T) graph.Store {
 		dir := t.TempDir()
-		s, err := store_sqlite.Open(filepath.Join(dir, "test.sqlite"))
+		s, err := store_sqlite.OpenPristineForConformance(t, filepath.Join(dir, "test.sqlite"))
 		if err != nil {
-			t.Fatalf("Open: %v", err)
+			t.Fatalf("OpenPristineForConformance: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Close() })
 		return s
