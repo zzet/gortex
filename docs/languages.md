@@ -281,6 +281,7 @@ What is **not** covered:
 | Pascal / Delphi | `.pas`, `.pp`, `.dpr` | Units, procedures, functions, classes |
 | ABAP (SAP) | `.abap` | `FORM` / `FUNCTION` / `METHOD` / `CLASS…DEFINITION`, `INCLUDE` |
 | Apex (Salesforce) | `.cls`, `.trigger`, `.apex` | Classes, triggers, methods |
+| VB.NET | `.vb` | `Namespace` / `Class` / `Module` / `Structure` / `Interface` / `Enum`, `Sub` / `Function` / `Property`, `Imports`, `Inherits` / `Implements` |
 
 ## Emerging languages
 

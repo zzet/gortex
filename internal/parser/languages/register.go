@@ -149,6 +149,10 @@ func RegisterAll(reg *parser.Registry) {
 	// Scientific / enterprise
 	reg.Register(NewApexExtractor())
 	reg.Register(NewABAPExtractor())
+	// VB.NET — keyword-block regex extraction; go-sitter-forest carries no VB
+	// grammar. Member IDs follow csharp.go's owner-qualified shape so a VB
+	// graph reads the same as a C# one in a mixed .NET store.
+	reg.Register(NewVBNetExtractor())
 	reg.Register(NewMatlabExtractor())
 	reg.Register(NewMathematicaExtractor())
 	reg.Register(NewSASExtractor())
