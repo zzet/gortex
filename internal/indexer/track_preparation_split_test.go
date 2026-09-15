@@ -45,6 +45,7 @@ func newTrackPreparationSplitFixture(t *testing.T) (*MultiIndexer, config.RepoEn
 		cmd.Env = append(os.Environ(),
 			"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
 			"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+		cmd.Env = append(cmd.Env, privateGitIdentityEnv...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("private git %v: %v: %s", args, err, out)
 		}

@@ -18,13 +18,20 @@ import (
 
 // advanceGit runs one git command in a repository the test owns, isolated from
 // any machine-global configuration.
+//
+// The isolation hides every configured user.name/user.email, which leaves git
+// auto-detecting an identity from the passwd entry and the hostname. A CI
+// runner's unqualified hostname makes that guess bogus and the commit dies with
+// "Author identity unknown", so the fixture names its own author and committer.
 func advanceGit(t *testing.T, root string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(),
 		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
-		"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+		"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1",
+		"GIT_AUTHOR_NAME=Advance Test", "GIT_AUTHOR_EMAIL=advance@example.invalid",
+		"GIT_COMMITTER_NAME=Advance Test", "GIT_COMMITTER_EMAIL=advance@example.invalid")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)

@@ -1215,6 +1215,7 @@ func rawGitInFixture(t *testing.T, root string, args ...string) (string, error) 
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+	cmd.Env = append(cmd.Env, privateGitIdentityEnv...)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }

@@ -75,7 +75,14 @@ func TestPrivatePublicBuilderSQLiteFull(t *testing.T) {
 				t.Helper()
 				cmd := exec.CommandContext(ctx, "git", args...)
 				cmd.Dir = root
-				cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+				// The isolation above hides every configured user.name, which
+				// leaves git auto-detecting an identity from the hostname. A CI
+				// runner's unqualified hostname makes that guess bogus and every
+				// commit here dies with "Author identity unknown", so the fixture
+				// names its own author and committer.
+				cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1",
+					"GIT_AUTHOR_NAME=Private Test", "GIT_AUTHOR_EMAIL=private@example.invalid",
+					"GIT_COMMITTER_NAME=Private Test", "GIT_COMMITTER_EMAIL=private@example.invalid")
 				out, err := cmd.CombinedOutput()
 				if err != nil {
 					t.Fatalf("private git %v: %v: %s", args, err, out)

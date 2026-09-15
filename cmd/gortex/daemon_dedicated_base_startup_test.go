@@ -56,9 +56,16 @@ func startupPublicationRepo(t *testing.T, base, name string) string {
 		t.Helper()
 		cmd := exec.Command("git", args...)
 		cmd.Dir = root
+		// The repository-local user.name/user.email below are what this fixture
+		// commits under, but they only exist once `git config` has run. Naming
+		// the identity in the environment as well means no git subcommand here
+		// can fall back to auto-detection, which a CI runner's unqualified
+		// hostname turns into "Author identity unknown".
 		cmd.Env = append(os.Environ(),
 			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
-			"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+			"GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1",
+			"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.invalid",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.invalid")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}

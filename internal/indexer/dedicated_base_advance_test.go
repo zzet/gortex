@@ -41,6 +41,7 @@ func (f *dedicatedAdvanceFixture) git(t testing.TB, args ...string) string {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = f.request.RootPath
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(cmd.Env, privateGitIdentityEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("private git %v: %v: %s", args, err, out)

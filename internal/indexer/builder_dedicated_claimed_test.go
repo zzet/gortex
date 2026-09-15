@@ -26,6 +26,25 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 )
 
+// privateGitIdentityEnv gives a fixture's git subprocess an author and
+// committer identity of its own.
+//
+// GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM deliberately hide every configured
+// user.name/user.email, which leaves git auto-detecting one from the passwd
+// entry and the hostname. A developer machine has a hostname git accepts, so
+// the auto-detected identity works and the fixture looks hermetic; a CI runner
+// has an unqualified hostname, git marks the guess bogus, and every commit in
+// the fixture dies with "Author identity unknown". Naming the identity in the
+// environment rather than as `-c user.name=` arguments covers every git
+// subcommand that writes an object — commit, merge, am, rebase — instead of
+// only the call sites that remembered to pass the flags.
+var privateGitIdentityEnv = []string{
+	"GIT_AUTHOR_NAME=Private Test",
+	"GIT_AUTHOR_EMAIL=private@example.invalid",
+	"GIT_COMMITTER_NAME=Private Test",
+	"GIT_COMMITTER_EMAIL=private@example.invalid",
+}
+
 type dedicatedBuilderFixtureRequest struct {
 	Identity    GenerationIdentity
 	RootPath    string
@@ -44,6 +63,7 @@ func privateDedicatedBuilderFixture(t testing.TB) (*SparseGenerationBuilder, ded
 		cmd := exec.CommandContext(ctx, "git", args...)
 		cmd.Dir = root
 		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+		cmd.Env = append(cmd.Env, privateGitIdentityEnv...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
@@ -849,6 +869,7 @@ func TestPrivateEmptyCommittedDedicatedBaseAcceptance(t *testing.T) {
 		cmd := exec.CommandContext(ctx, "git", args...)
 		cmd.Dir = root
 		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1")
+		cmd.Env = append(cmd.Env, privateGitIdentityEnv...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
