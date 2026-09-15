@@ -81,6 +81,13 @@ type InstallOpts struct {
 	// ReleasesBranch is the rev whose reachable tags bound the
 	// timeline. Empty means "resolve at hook run time".
 	ReleasesBranch string
+	// HookTimeoutSeconds bounds every gortex invocation the hook makes.
+	// When > 0 the generated block defines a gortex_hook_run watchdog
+	// (GNU timeout, else perl alarm, else the bare call) and routes
+	// each action through it, so a busy daemon cannot hang the git
+	// operation. The zero value preserves the legacy unbounded lines —
+	// the CLI flag owns the default, not withDefaults().
+	HookTimeoutSeconds int
 }
 
 func (o InstallOpts) withDefaults() InstallOpts {
@@ -117,39 +124,85 @@ func hookCommands(hook string, opts InstallOpts) []string {
 	var cmds []string
 	cmds = append(cmds, fmt.Sprintf("# Auto-regenerate gortex artefacts on %s.", hook))
 	cmds = append(cmds, "# Failures are tolerated so the hook always completes.")
+	var actions []string
 	if opts.RegenMermaid {
-		cmds = append(cmds, fmt.Sprintf("(%s export --format mermaid --scope all --out-dir %q --on-commit) >/dev/null 2>&1 || true",
+		actions = append(actions, fmt.Sprintf("%s export --format mermaid --scope all --out-dir %q --on-commit",
 			opts.Binary, opts.MermaidOutDir))
 	}
 	if opts.RegenWiki {
-		cmds = append(cmds, fmt.Sprintf("(%s wiki . --output %q) >/dev/null 2>&1 || true",
+		actions = append(actions, fmt.Sprintf("%s wiki . --output %q",
 			opts.Binary, opts.WikiOutDir))
 	}
 	if opts.RegenDocs {
-		cmds = append(cmds, fmt.Sprintf("(%s docs . --out %q) >/dev/null 2>&1 || true",
+		actions = append(actions, fmt.Sprintf("%s docs . --out %q",
 			opts.Binary, opts.DocsOutPath))
 	}
 	if opts.RegenChurn {
 		if strings.TrimSpace(opts.ChurnBranch) == "" {
-			cmds = append(cmds, fmt.Sprintf("(%s enrich churn) >/dev/null 2>&1 || true", opts.Binary))
+			actions = append(actions, fmt.Sprintf("%s enrich churn", opts.Binary))
 		} else {
-			cmds = append(cmds, fmt.Sprintf("(%s enrich churn --branch=%q) >/dev/null 2>&1 || true",
-				opts.Binary, opts.ChurnBranch))
+			actions = append(actions, fmt.Sprintf("%s enrich churn --branch=%q", opts.Binary, opts.ChurnBranch))
 		}
 	}
 	if opts.RegenReleases {
 		if strings.TrimSpace(opts.ReleasesBranch) == "" {
-			cmds = append(cmds, fmt.Sprintf("(%s enrich releases) >/dev/null 2>&1 || true", opts.Binary))
+			actions = append(actions, fmt.Sprintf("%s enrich releases", opts.Binary))
 		} else {
-			cmds = append(cmds, fmt.Sprintf("(%s enrich releases --branch=%q) >/dev/null 2>&1 || true",
-				opts.Binary, opts.ReleasesBranch))
+			actions = append(actions, fmt.Sprintf("%s enrich releases --branch=%q", opts.Binary, opts.ReleasesBranch))
 		}
 	}
-	if len(cmds) == 2 {
-		// No actions selected — note it explicitly.
+
+	switch {
+	case len(actions) == 0:
+		// No actions selected — note it explicitly. No gortex call, no
+		// hang surface, so no watchdog helper either.
 		cmds = append(cmds, "# (no regeneration actions enabled)")
+	case opts.HookTimeoutSeconds > 0:
+		cmds = append(cmds, boundedRunHelper()...)
+		for _, a := range actions {
+			cmds = append(cmds, fmt.Sprintf("gortex_hook_run %d %s >/dev/null 2>&1 || true",
+				opts.HookTimeoutSeconds, a))
+		}
+	default:
+		// Zero timeout: legacy unbounded lines, byte-identical to the
+		// pre-watchdog generator output.
+		for _, a := range actions {
+			cmds = append(cmds, fmt.Sprintf("(%s) >/dev/null 2>&1 || true", a))
+		}
 	}
 	return cmds
+}
+
+// boundedRunHelper returns the shell lines defining gortex_hook_run,
+// the watchdog every generated invocation routes through when
+// HookTimeoutSeconds > 0. The cascade probes for a usable GNU timeout
+// via `timeout --version </dev/null` — stdin closed so a stdin-waiting
+// fake cannot hang the probe, and version output (not mere PATH
+// presence) so Git-for-Windows sh cannot mistake
+// C:\Windows\System32\timeout.exe (a delay command) for a usable
+// runner. The GNU lane runs `timeout -k 2`: TERM at the deadline, then
+// KILL 2s later. The perl lane (macOS and Git-for-Windows both ship
+// perl) forks the child and delivers SIGKILL on alarm — the only
+// signal a Go runtime cannot defer (Go swallows SIGALRM, and TERM
+// alone is deferrable). The final lane runs the call unbounded —
+// never worse than a hook without a watchdog.
+// Redirection and failure tolerance live at the call site, not here.
+func boundedRunHelper() []string {
+	return []string{
+		"# Bound each gortex invocation so a busy daemon cannot hang git.",
+		"# Escalates to SIGKILL so even a wedged or signal-immune process",
+		"# (the Go runtime ignores SIGALRM) cannot outlive the bound.",
+		"gortex_hook_run() {",
+		"  _gortex_hook_t=\"$1\"; shift",
+		"  if timeout --version </dev/null >/dev/null 2>&1; then",
+		"    timeout -k 2 \"$_gortex_hook_t\" \"$@\"",
+		"  elif command -v perl >/dev/null 2>&1; then",
+		"    perl -e '$t=shift; $p=fork(); if(!$p){ exec @ARGV } $SIG{ALRM}=sub{ kill 9,$p; exit 124 }; alarm $t; waitpid($p,0); exit $?>>8' \"$_gortex_hook_t\" \"$@\"",
+		"  else",
+		"    \"$@\"",
+		"  fi",
+		"}",
+	}
 }
 
 // HookPathFor resolves the absolute path of the named hook file in

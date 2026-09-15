@@ -23,22 +23,28 @@ var (
 	githookChurnBranch    string
 	githookReleasesBranch string
 	githookBinary         string
+	githookHookTimeout    int
 )
 
 var githookCmd = &cobra.Command{
 	Use:   "githook",
 	Short: "Manage local git hooks that regenerate gortex artefacts",
 	Long: `Install, uninstall, and inspect git hooks that re-run gortex
-commands. Supported hooks: post-commit, post-merge.
+commands. Supported hooks: post-commit, post-merge, post-checkout.
 
 The hook is idempotent: re-running install replaces only the gortex
 block, leaving any other hook content intact. Uninstall removes the
-block and deletes the hook file when it contains nothing else.`,
+block and deletes the hook file when it contains nothing else.
+
+Every gortex invocation the hook makes is bounded by a watchdog
+(default 30s per command; --hook-timeout to change; 0 restores the old
+unbounded lines) when GNU timeout or perl is available, so a busy
+daemon cannot hang the git operation indefinitely.`,
 }
 
 var githookInstallCmd = &cobra.Command{
 	Use:   "install <hook>",
-	Short: "Install a git hook (post-commit or post-merge)",
+	Short: "Install a git hook (post-commit, post-merge, or post-checkout)",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runGithookInstall,
 }
@@ -80,6 +86,8 @@ func init() {
 		"output path for the docs bundle")
 	githookInstallCmd.Flags().StringVar(&githookBinary, "binary", "gortex",
 		"gortex binary name (resolved from $PATH at runtime)")
+	githookInstallCmd.Flags().IntVar(&githookHookTimeout, "hook-timeout", 30,
+		"seconds a hook-invoked gortex command may run before the watchdog kills it (0 = unbounded)")
 
 	githookCmd.AddCommand(githookInstallCmd)
 	githookCmd.AddCommand(githookUninstallCmd)
@@ -102,6 +110,9 @@ func runGithookInstall(cmd *cobra.Command, args []string) error {
 	if err := supportedHook(hook); err != nil {
 		return err
 	}
+	if githookHookTimeout < 0 {
+		return fmt.Errorf("--hook-timeout must be >= 0 (got %d; 0 = unbounded)", githookHookTimeout)
+	}
 	repoRoot, err := resolveGithookRepoRoot()
 	if err != nil {
 		return err
@@ -112,24 +123,25 @@ func runGithookInstall(cmd *cobra.Command, args []string) error {
 		githookRegenMermaid = true
 	}
 	path, err := githooks.InstallHook(repoRoot, hook, githooks.InstallOpts{
-		Binary:         githookBinary,
-		RegenMermaid:   githookRegenMermaid,
-		RegenWiki:      githookRegenWiki,
-		RegenDocs:      githookRegenDocs,
-		RegenChurn:     githookRegenChurn,
-		ChurnBranch:    githookChurnBranch,
-		RegenReleases:  githookRegenReleases,
-		ReleasesBranch: githookReleasesBranch,
-		MermaidOutDir:  githookMermaidOutDir,
-		WikiOutDir:     githookWikiOutDir,
-		DocsOutPath:    githookDocsOutPath,
+		Binary:             githookBinary,
+		RegenMermaid:       githookRegenMermaid,
+		RegenWiki:          githookRegenWiki,
+		RegenDocs:          githookRegenDocs,
+		RegenChurn:         githookRegenChurn,
+		ChurnBranch:        githookChurnBranch,
+		RegenReleases:      githookRegenReleases,
+		ReleasesBranch:     githookReleasesBranch,
+		MermaidOutDir:      githookMermaidOutDir,
+		WikiOutDir:         githookWikiOutDir,
+		DocsOutPath:        githookDocsOutPath,
+		HookTimeoutSeconds: githookHookTimeout,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(cmd.OutOrStdout(),
-		"installed %s hook at %s\nactions: mermaid=%t wiki=%t docs=%t churn=%t releases=%t\n",
-		hook, path, githookRegenMermaid, githookRegenWiki, githookRegenDocs, githookRegenChurn, githookRegenReleases)
+		"installed %s hook at %s\nactions: mermaid=%t wiki=%t docs=%t churn=%t releases=%t timeout=%ds\n",
+		hook, path, githookRegenMermaid, githookRegenWiki, githookRegenDocs, githookRegenChurn, githookRegenReleases, githookHookTimeout)
 	return nil
 }
 

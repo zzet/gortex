@@ -28,7 +28,7 @@ gortex review [path]         Review a changeset and print line-anchored inline c
 gortex wiki [path]           Generate a multi-page markdown wiki (per-community + processes + analysis)
 gortex docs [path]           Generate a "living docs" bundle (recent changes + ownership + stale + blame)
 gortex export [path]         Export the graph to Cypher, GraphML, or Mermaid (--format mermaid --scope all)
-gortex githook <sub>         install / uninstall / status — manage the post-commit hook
+gortex githook <sub>         install / uninstall / status — manage post-commit, post-merge, and post-checkout hooks
 gortex clean                 Remove Gortex files from a project
 gortex telemetry <sub>       on / off / status — control anonymous, opt-in usage telemetry (off by default; honours DO_NOT_TRACK)
 gortex guide [topic]         Print the reference guide (providers, capabilities, tokens, analyze, search_ast, resources, workflow) — same content as the gortex://guide resource
@@ -470,7 +470,9 @@ wiki/
   _workspace/                 # reserved for multi-repo pages
 ```
 
-Pair with `gortex githook install post-commit --regen-mermaid --regen-wiki` to keep diagrams and docs in sync after every commit. The hook is idempotent and preserves any non-gortex content in the existing hook file.
+Pair with `gortex githook install post-commit --regen-mermaid --regen-wiki` to keep diagrams and docs in sync after every commit; post-merge and post-checkout hooks are supported as well. The hook is idempotent and preserves any non-gortex content in the existing hook file.
+
+`githook install` accepts `--hook-timeout SECONDS` (default 30): every hook-invoked gortex command is wrapped in a watchdog that kills it at the bound, with SIGKILL escalation, so a busy daemon cannot hang the git operation indefinitely. The bound applies per command — a hook with all five regen actions enabled can still spend actions × timeout in the worst case. `0` emits the previous unbounded lines unchanged, and negative values are rejected. New installs are bounded by default; existing hooks pick the bound up by re-running `gortex githook install <hook>`.
 
 For CI, drop `examples/.github/workflows/gortex-architecture.yml` into your repo: it re-runs `gortex export --format mermaid --scope all` on every push and opens a PR when the diagrams drift.
 
