@@ -23,14 +23,14 @@ import (
 // (issue767_fixture_shared_test.go), plus the offline unit tests for this
 // file's own pure logic, which run in every ordinary `go test` of this package.
 //
-// The matrix bullet this item owns (handoff §8):
+// The matrix bullet this item owns:
 //
 //	real imported consumers versus unrelated same-named modules;
 //	nested/vendor/invalid/oversized/unreadable manifests; missing metadata;
 //	dynamic-language and cross-repository producer controls; exact
 //	restub/provenance behaviour.
 //
-// It is handoff hazard H8 — "module-root/directory-mismatch placement,
+// It is hazard H8 — "module-root/directory-mismatch placement,
 // manifest-only invalidation, mixed-language imports and provider mutation
 // evidence remain distinct from the implemented positive Go ownership
 // rejection gate" — which gets one case each here.
@@ -356,9 +356,9 @@ func e2eResolutionOtherRepoFiles() []e2eResolutionSourceFile {
 type e2eResolutionCase struct {
 	// ID is the outcome table's key and the name a ledger row cites.
 	ID string
-	// Gate is the acceptance gate this case serves, in the handoff's numbering.
+	// Gate is the acceptance gate this case serves, in the matrix's numbering.
 	Gate string
-	// Hazard is the handoff §6 hazard this case covers, when it covers one.
+	// Hazard is the resolution hazard this case covers, when it covers one.
 	Hazard string
 	// Needs are the corpus paths the case reads. They are checked against
 	// e2eResolutionCorpusFiles offline so a corpus edit cannot orphan a case.
@@ -743,9 +743,9 @@ const (
 // as "this exact fact was present in the fresh index and absent here".
 //
 // Everything is scoped to view_gen = 0. That is the generation the primary
-// actually serves from on this branch — the plan states it plainly ("the
-// primary's own working route stays on legacy generation 0 until the
-// working-route promotion lands (deferred)") and the probe run confirmed it: a dirty edit lands in view_gen 0
+// actually serves from on this branch: the primary's own working route stays on
+// legacy generation 0 until the working-route promotion lands, which this
+// branch defers. The probe run confirmed it: a dirty edit lands in view_gen 0
 // while the published committed base stays frozen at the commit.
 func e2eResolutionOutputs() []e2eResolutionOutput {
 	return []e2eResolutionOutput{
@@ -2196,7 +2196,7 @@ func TestE2EMatrixResolutionEveryCaseHasItsCorpus(t *testing.T) {
 	}
 	for _, hazard := range []string{"H8 module-root mismatch", "H8 manifest-only invalidation", "H8 mixed-language imports", "H8 provider mutation evidence", "H8 dynamic placement"} {
 		if !hazards[hazard] {
-			t.Errorf("handoff hazard %q has no case", hazard)
+			t.Errorf("resolution hazard %q has no case", hazard)
 		}
 	}
 }

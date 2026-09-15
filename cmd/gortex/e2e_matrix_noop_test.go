@@ -19,9 +19,9 @@ import (
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
-// E2E matrix 1 — the idle / no-op family (handoff section 8, first bullet).
+// E2E matrix 1 — the idle / no-op family.
 //
-// The workload is the one the acceptance brief names: clean and dirty idle
+// The workload is the one the acceptance gates name: clean and dirty idle
 // polling, repeated samples, touch, stage/unstage, a same-tree amend, same-size
 // changed bytes with a restored mtime, atomic replacement, and an uncertain
 // filesystem identity (identical bytes arriving on a new inode). Each case
@@ -956,9 +956,9 @@ type e2eMatrixNoopCase struct {
 	Expect e2eMatrixNoopExpect
 }
 
-// e2eMatrixNoopCaseNames is the handoff's own vocabulary for this matrix, in the
-// order the bullet lists it. The case table is pinned to it so a case cannot
-// quietly disappear from the matrix.
+// e2eMatrixNoopCaseNames is the declared vocabulary for this matrix, in the
+// order the no-op family lists it. The case table is pinned to it so a case
+// cannot quietly disappear from the matrix.
 func e2eMatrixNoopCaseNames() []string {
 	return []string{
 		"clean_idle_polling",
@@ -1628,7 +1628,7 @@ func e2eMatrixNewFixture(t *testing.T, binary string, spec sustainedIOFixtureSpe
 // ------------------------------------------------------------ calibration ---
 
 // e2eMatrixCalibrationCase is the name the calibration's own outcome row carries. It
-// is not one of the handoff's nine cases; it is the measurement that makes the
+// is not one of the matrix's nine cases; it is the measurement that makes the
 // nine mean something, and it is reported as a row of the same table so a
 // reader can see what the instrument could and could not see.
 const e2eMatrixCalibrationCase = "instrument_calibration"
@@ -1926,7 +1926,7 @@ func TestE2EMatrixNoopCasesCoverTheDeclaredFamily(t *testing.T) {
 	}
 	for i, name := range declared {
 		if cases[i].Name != name {
-			t.Fatalf("case %d is %q, want %q (the handoff's own order)", i, cases[i].Name, name)
+			t.Fatalf("case %d is %q, want %q (the declared matrix order)", i, cases[i].Name, name)
 		}
 		if cases[i].Apply == nil {
 			t.Fatalf("case %q has no body", name)

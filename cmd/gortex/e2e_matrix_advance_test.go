@@ -17,7 +17,7 @@ import (
 // The shared opt-in gate, outcome table, rider readers and store census live in
 // e2e_matrix_views_test.go; this file is the second workload of the same item.
 //
-// What this matrix exists to prove (handoff §7 gate 5):
+// What this matrix exists to prove — the advancing-main acceptance gate:
 //
 //   - every logical view stays equal to its OWN tree while main advances —
 //     a composed pair is never newBase + oldDelta;
@@ -45,9 +45,11 @@ import (
 // and commit.tree == the checkout's own head tree.
 
 const (
-	// e2eAdvanceDependents is the plan's ten dependent worktrees.
+	// e2eAdvanceDependents is how many dependent worktrees the workload
+	// discovers and then holds unchanged while main advances.
 	e2eAdvanceDependents = 10
-	// e2eAdvanceCommits is the plan's twenty commits on main.
+	// e2eAdvanceCommits is how many commits the workload lands on main, enough
+	// that a dependent that rebuilds per commit is unmistakable.
 	e2eAdvanceCommits = 20
 	// e2eAdvanceBurstFrom/e2eAdvanceBurstTo bound the rapid-HEAD window: commits landed
 	// back to back with no wait between them, so a build that completes is

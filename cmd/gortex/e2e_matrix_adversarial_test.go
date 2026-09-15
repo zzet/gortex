@@ -12,8 +12,8 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 )
 
-// Matrix 7 of the isolated end-to-end matrix (handoff §8, seventh
-// bullet): adversarial fan-out, cycles and pathless identities, bounded
+// Matrix 7 of the isolated end-to-end matrix, the adversarial
+// family: adversarial fan-out, cycles and pathless identities, bounded
 // physical candidate work, chain maintenance and old-route retention, and
 // cross-surface coherence.
 //
@@ -23,8 +23,10 @@ import (
 // daemon and private store, and every assertion names the acceptance gate it
 // serves.
 
-// The matrix-7 bullets, from the coordinator's brief. Every one is claimed by
-// exactly one row below; e2eLifecycleValidateRows enforces that before anything runs.
+// The matrix-7 bullets: the adversarial conditions this matrix owes evidence
+// for. Every one is claimed by exactly one row below; e2eLifecycleValidateRows
+// enforces that before anything runs, so narrowing the matrix means deleting a
+// bullet in the open rather than quietly dropping a row.
 var e2eAdversarialMatrix7Bullets = []string{
 	"adversarial high fan-out",
 	"cycles and pathless identities",
@@ -75,7 +77,7 @@ func e2eAdversarialMatrix7Rows(binary string) []e2eLifecycleRow {
 }
 
 // e2eAdversarialFanout is how many dependent checkouts the fan-out row creates. The
-// brief's own workload is ten dependents (gate 5); this row is the adversarial
+// advancing-main workload is ten dependents; this row is the adversarial
 // neighbour of it, so it uses the same order of magnitude and asks a harder
 // question of each: not only "did every dependent update" but "did anything
 // from main leak into one".
@@ -166,7 +168,7 @@ func e2eAdversarialRowHighFanout(t *testing.T, rec *e2eLifecycleRecorder, binary
 //   - Two packages import each other. The generated corpus is acyclic by
 //     construction (sustainedIOGenerateFixture only ever imports a HIGHER package
 //     index), so a cycle has to be written by hand — and it is the shape the
-//     handoff's ancestry hazard warns about, one level down: a resolver walk
+//     ancestry hazard this matrix guards, one level down: a resolver walk
 //     that does not remember where it has been does not terminate on this.
 //   - Both packages import modules that do not exist. An import that resolves
 //     to nothing mints a repo-scoped stub whose id carries no path
@@ -497,9 +499,9 @@ var e2eAdversarialChainCommits = graphview.MaxDedicatedBaseChainDepth + 16
 //     of the live states as the chain advances;
 //   - an old route stays available with truthful freshness while it does: a
 //     checkout whose own tree never moved keeps answering exactly for its own
-//     committed marker through every advance. "Old coherent routes remain
-//     available with truthful freshness until replacement routes are ready"
-//     (handoff §7, gate 5).
+//     committed marker through every advance. Old coherent routes remain
+//     available with truthful freshness until replacement routes are ready —
+//     the advancing-main gate this row serves.
 func e2eAdversarialRowChainMaintenance(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
 	e := e2eLifecycleNewEnv(t, binary, e2eLifecycleSmallSpec(8115), "")
 	e.start()
@@ -546,12 +548,12 @@ func e2eAdversarialRowChainMaintenance(t *testing.T, rec *e2eLifecycleRecorder, 
 	} else if roots > 0 {
 		rec.note("the window published %d root(s) alongside %d delta(s): the allocation policy proposed a new full root rather than extending the chain past its depth", roots, deltas)
 	}
-	// Retirement is RECORDED, not asserted. The execution plan is explicit
-	// that real compaction and reseed are out of this branch's scope
-	// and that gate 8 is claimed only as "measured chain growth under the
-	// generation-retention policy" — so a window in which nothing retired is the documented
-	// behaviour, and a row that failed on it would be failing the branch for a
-	// promise it never made. What IS asserted is the bound below.
+	// Retirement is RECORDED, not asserted. Real compaction and reseed are out
+	// of this branch's scope, and the bounded-cost gate is claimed only as
+	// measured chain growth under the generation-retention policy — so a window
+	// in which nothing retired is the documented behaviour, and a row that
+	// failed on it would be failing the branch for a promise it never made.
+	// What IS asserted is the bound below.
 	if superseded+retired+swept == 0 {
 		rec.note("RECORDED: %d committed advances retired nothing in this window (retention, not compaction; real compaction/reseed is out of scope)", e2eAdversarialChainCommits)
 	}
@@ -614,9 +616,9 @@ func e2eAdversarialChainBounded(roots, deltas int64, depth int) error {
 // e2eAdversarialRowCrossSurfaceCoherence asks one settled state through every public
 // surface at once, then moves it and asks again.
 //
-// "Caches and sidecars must be keyed by selected snapshot/capability identity.
-// A selected graph plus global source/search/cache data can produce a mixed
-// view even if the graph itself is correct" (handoff §6). That is the failure
+// Caches and sidecars must be keyed by selected snapshot/capability identity:
+// a selected graph plus global source/search/cache data can produce a mixed
+// view even if the graph itself is correct. That is the failure
 // this row is shaped to catch: each surface can be individually right while the
 // set of them is incoherent, so the rule is applied to the SET — same graph,
 // same checkout, exact everywhere — rather than to any one answer.

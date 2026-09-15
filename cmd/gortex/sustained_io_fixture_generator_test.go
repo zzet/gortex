@@ -23,7 +23,7 @@ import (
 // run can rebuild the identical tree — byte for byte, verified by
 // sustainedIOFixtureDigest.
 //
-// Shape, per map-e2e-io.md §6.1: one go.mod, a root `fixture` package carrying
+// Shape: one go.mod, a root `fixture` package carrying
 // the call target the checkout probe resolves against, one marker.go per
 // checkout (the exactness probe), and Files package files spread over Packages
 // packages, each with intra-package and cross-package calls so resolution has

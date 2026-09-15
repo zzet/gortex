@@ -282,9 +282,9 @@ type sustainedIOBudgetSet struct {
 	Digest        string `json:"digest"`
 }
 
-// The idle ceiling from the plan: 8 MiB per 60 s of idling, scaled by the
-// phase's own measured length so a longer idle is not judged by a shorter
-// phase's number.
+// The idle ceiling the harness holds an arm to: 8 MiB per 60 s of idling,
+// scaled by the phase's own measured length so a longer idle is not judged by a
+// shorter phase's number.
 const (
 	sustainedIOIdleBudgetPerMinute = 8 << 20
 	// The headline claim: main advancement under ten dependents at most half
@@ -565,7 +565,7 @@ func sustainedIOBudgetJudgment(budget sustainedIOPhaseBudget) (string, string, f
 	return selection.Series, selection.Source, selection.Wall
 }
 
-// sustainedIOLimitFor is the plan's ceiling table, in one place.
+// sustainedIOLimitFor is the harness's ceiling table, in one place.
 func sustainedIOLimitFor(phase string, budget sustainedIOPhaseBudget) (uint64, string) {
 	selection := sustainedIOBudgetJudged(budget)
 	judged, series := selection.Stat, selection.Series

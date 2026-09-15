@@ -97,8 +97,7 @@ func sustainedIOReadWALHeader(path string) (sustainedIOWALHeader, error) {
 
 // sustainedIOCheckpointCounter turns a series of WAL-header samples into a count of WAL
 // resets — the externally observable form of "a checkpoint restarted the log",
-// since a successful checkpoint emits no log line and no in-process counter
-// (map-e2e-io.md §4.5, §5.3).
+// since a successful checkpoint emits no log line and no in-process counter.
 //
 // A PASSIVE checkpoint that does not restart the log is invisible here by
 // construction, so this is a lower bound and is reported as "wal_resets", never
@@ -834,8 +833,8 @@ func TestSustainedIOCheckpointCounterCountsResetsNotAppends(t *testing.T) {
 	}
 }
 
-// TestSustainedIOWALCheckpointSequenceAdvancesOnReset is the experiment map-e2e-io.md
-// §5.3 asks for before the harness relies on the header field: does the WAL
+// TestSustainedIOWALCheckpointSequenceAdvancesOnReset is the experiment the
+// harness owes before it relies on the header field: does the WAL
 // checkpoint-sequence at offset 12 actually move under modernc.org/sqlite?
 // The answer is recorded in the test's own failure text so a future change of
 // driver is caught here rather than silently zeroing a measured series.

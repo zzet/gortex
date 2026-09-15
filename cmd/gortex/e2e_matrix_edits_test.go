@@ -16,7 +16,8 @@ import (
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
-// E2E matrix 2 — the edit taxonomy (handoff section 8, second bullet).
+// E2E matrix 2 — the edit taxonomy: every class of source change a view has to
+// carry.
 //
 // Comments, presentation and directives; body, signature, export, import and
 // configuration changes; added, deleted, renamed, mode-changed, symlinked and
@@ -526,7 +527,7 @@ type e2eMatrixEditCase struct {
 	Apply func(h *e2eMatrixEditHarness) e2eMatrixEffect
 }
 
-// e2eMatrixEditCaseNames is the handoff's own vocabulary for this matrix. The case
+// e2eMatrixEditCaseNames is the declared vocabulary for this matrix. The case
 // table is pinned to it so a class cannot quietly leave the taxonomy.
 func e2eMatrixEditCaseNames() []string {
 	return []string{
@@ -550,7 +551,7 @@ func e2eMatrixEditCaseNames() []string {
 	}
 }
 
-// e2eMatrixEditCases is matrix 2, in the order the handoff lists the classes.
+// e2eMatrixEditCases is matrix 2, in the declared order of the taxonomy.
 func e2eMatrixEditCases() []e2eMatrixEditCase {
 	return []e2eMatrixEditCase{
 		{
@@ -2068,7 +2069,7 @@ func TestE2EMatrixEditCasesCoverTheDeclaredTaxonomy(t *testing.T) {
 	}
 	for i, name := range declared {
 		if cases[i].Name != name {
-			t.Fatalf("case %d is %q, want %q (the handoff's own order)", i, cases[i].Name, name)
+			t.Fatalf("case %d is %q, want %q (the declared taxonomy order)", i, cases[i].Name, name)
 		}
 		if cases[i].Apply == nil {
 			t.Fatalf("case %q has no body", name)
@@ -2077,8 +2078,7 @@ func TestE2EMatrixEditCasesCoverTheDeclaredTaxonomy(t *testing.T) {
 			t.Fatalf("case %q names no acceptance gate, got %q", name, cases[i].Gate)
 		}
 	}
-	// The taxonomy's own classes, as the handoff spells them, each have to be
-	// represented by at least one case.
+	// Every class of the taxonomy has to be represented by at least one case.
 	for _, class := range []string{"comment", "presentation", "directive", "body", "signature", "export",
 		"import", "added", "deleted", "renamed", "mode", "symlink", "untracked", "undo", "unchanged",
 		"manifest", "configuration"} {

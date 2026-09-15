@@ -33,7 +33,7 @@ import (
 // reach the user's daemon, store or configuration, and nothing here starts a
 // daemon the fixture does not also stop.
 //
-// Every case names the acceptance gate it serves (handoff §7):
+// Every case names the acceptance gate it serves:
 //
 //	gate 1  snapshot correctness — a composed view matches the snapshot it claims
 //	gate 4  same-branch reuse — compatible switches reuse rather than rebuild
@@ -752,7 +752,7 @@ func TestE2EMatrix4ViewLifecycle(t *testing.T) {
 
 	// --- case 4.5 (gate 1): resources/read gortex://stats ≡ the graph_stats tool.
 	//
-	// This is the criterion an earlier item left unmet-by-deferral (its §7.7): the
+	// This is the criterion an earlier item left unmet by deferral: the
 	// resource and the tool are documented byte-for-byte equal — one
 	// buildGraphStatsPayload, internal/mcp/tools_core.go:3513-3515 — and that
 	// payload is context-scoped (engineFor(ctx) / readerFor(ctx), :3517-3531),

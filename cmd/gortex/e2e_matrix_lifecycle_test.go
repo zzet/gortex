@@ -18,7 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 )
 
-// The isolated end-to-end matrix, rows 6 and 7 of handoff §8.
+// The isolated end-to-end matrix, rows 6 and 7.
 //
 // This file carries matrix 6 (lifecycle: untrack / remove / recreate, primary
 // removal beside a preserved dedicated sibling, drains and late readers,
@@ -36,7 +36,7 @@ import (
 //     XDG directories, its own SQLite store, its own Git fixture and gitconfig
 //     under a private /private/tmp root. The user's daemon, store and
 //     configuration are never addressed.
-//  3. NAMED GATES. Every row declares which acceptance gate (handoff §7) its
+//  3. NAMED GATES. Every row declares which acceptance gate its
 //     assertions serve, and the run writes an outcome table naming, per row,
 //     the gate and what happened. A row is never asserted against a node count:
 //     what it compares is the answer a public surface gives — the symbol, the
@@ -62,10 +62,10 @@ const (
 	e2eLifecycleChildEnv = "GX_SUSTAINED_IO_INTERNAL_MATRIX_DRIVER_DIR"
 )
 
-// The acceptance gates, in handoff §7's own numbering and words. A row names
-// the gate its assertions serve; e2eLifecycleValidateRows refuses a row that names a
-// gate outside this vocabulary, so an outcome table can never claim a gate the
-// brief does not have.
+// The acceptance gates this matrix answers to, in their own numbering and
+// words. A row names the gate its assertions serve; e2eLifecycleValidateRows
+// refuses a row that names a gate outside this vocabulary, so an outcome table
+// can never claim a gate that does not exist.
 const (
 	e2eLifecycleGateSnapshot  = "gate-1 snapshot correctness"
 	e2eLifecycleGateNoop      = "gate-2 no-op behaviour"
@@ -84,8 +84,8 @@ var e2eLifecycleGateVocabulary = []string{
 	e2eLifecycleGateEvidence,
 }
 
-// The matrix-6 bullets, verbatim from the coordinator's brief (handoff §8's
-// sixth bullet, split into the units this file exercises). e2eLifecycleValidateRows
+// The matrix-6 bullets: the lifecycle conditions this matrix owes evidence for,
+// split into the units this file exercises. e2eLifecycleValidateRows
 // requires every one of them to be claimed by exactly one row, so narrowing
 // the matrix means deleting a bullet in the open rather than quietly dropping
 // a row.
@@ -133,7 +133,7 @@ type e2eLifecycleRow struct {
 // e2eLifecycleRecorder collects a row's evidence. Notes are measurements — what a
 // counter said, which corpus answered, what a CLI replied — recorded whether
 // the row passes or fails. Skip records a named reason AND the row: a skip
-// with no row name is exactly the silent pass the brief forbids.
+// with no row name is exactly the silent pass this matrix must never file.
 type e2eLifecycleRecorder struct {
 	mu    sync.Mutex
 	notes []string
@@ -631,7 +631,7 @@ type e2eLifecycleFreshness struct {
 // It is the readable form of "one request never mixes generations": the graph,
 // the text index and the file bytes are three indexes over one snapshot, and a
 // pair of answers naming two graphs or two checkouts is the mixed view the
-// handoff's cache hazard describes, whatever either answer says on its own.
+// cache-keying hazard describes, whatever either answer says on its own.
 func e2eLifecycleCoherent(answers []e2eLifecycleFreshness) error {
 	if len(answers) == 0 {
 		return errors.New("no surfaces answered")
@@ -1086,7 +1086,7 @@ func e2eLifecycleMatrix6Rows(binary string) []e2eLifecycleRow {
 //
 // The recreation is the part that matters. "stale publishers / drain handles /
 // cleanup callbacks must not affect replacement registrations at the same path
-// or with reused IDs" (handoff §6) — so after the path is reused, the OLD
+// or with reused IDs" — so after the path is reused, the OLD
 // checkout's marker must not answer from it, and the NEW one's must, exactly.
 func e2eLifecycleRowUntrackRemoveRecreate(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
 	e := e2eLifecycleNewEnv(t, binary, e2eLifecycleSmallSpec(8101), "")
@@ -1367,7 +1367,7 @@ func e2eLifecycleRowDuplicateTriggers(t *testing.T, rec *e2eLifecycleRecorder, b
 //
 // "Borrowed readers and source providers must remain alive until actual worker
 // completion, including cancellation tails. Do not release on handler return
-// while workers still use the payload" (handoff §6). A caller that walks away
+// while workers still use the payload". A caller that walks away
 // is the ordinary shape of that, and the public evidence is that the next
 // request is answered exactly and nothing is left outstanding.
 func e2eLifecycleRowCancellation(t *testing.T, rec *e2eLifecycleRecorder, binary string) {
@@ -2105,7 +2105,7 @@ func TestE2EMatrixDriverFilesTheTableOfAFailingRow(t *testing.T) {
 // test, and it drives the same production entrypoint through the trap Go's
 // runner sets: a subtest excluded by -test.run is never executed, and t.Run
 // still reports true for it. A driver that believed that would file a table in
-// which a row nobody ran is a pass — the exact silent pass the brief forbids,
+// which a row nobody ran is a pass — the exact silent pass the matrix must never file,
 // arriving through the runner rather than through a skip.
 //
 // The child is real: it re-execs this binary with a row filter, so the
