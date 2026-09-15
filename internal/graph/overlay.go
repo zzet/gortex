@@ -1014,12 +1014,12 @@ func (v *OverlaidView) nodeCountDelta() int {
 }
 
 // detachedBaseNodes resolves the base rows the layer hides from outside
-// every file it covers: an identity it tombstoned, and one it carries at
-// a path other than the ID's own. Neither is priced by a covered file's
-// node trade — that term only sees the paths in the layer's own file
-// list — so the counters resolve them here, in one batched base read
-// over the layer's removal set and its per-file node lists. Both are
-// already in hand: the file lists are what the trade above walks.
+// every file it covers. Covered files already account for their base
+// rows, so only identities removed or re-emitted from an uncovered base
+// path need a separate subtraction. Resolve the layer's candidates in
+// one batched base read and check each row's actual FilePath: canonical
+// IDs need not encode a path, and relocated IDs may encode a different
+// path. The work remains bounded by the layer's own footprint.
 func (v *OverlaidView) detachedBaseNodes() []*Node {
 	if v.base == nil || v.layer == nil {
 		return nil
@@ -1027,7 +1027,7 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	seen := make(map[string]struct{})
 	var ids []string
 	claim := func(id string) {
-		if id == "" || v.layer.CoversNodeID(id) {
+		if id == "" {
 			return
 		}
 		if _, dup := seen[id]; dup {
@@ -1054,7 +1054,7 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	}
 	out := make([]*Node, 0, len(ids))
 	for _, n := range v.base.GetNodesByIDs(ids) {
-		if n != nil {
+		if n != nil && !v.layer.HasFile(n.FilePath) {
 			out = append(out, n)
 		}
 	}
