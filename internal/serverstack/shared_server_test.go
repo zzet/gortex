@@ -96,7 +96,7 @@ func TestNewSharedServer_OneshotRefusesSharedStore(t *testing.T) {
 }
 
 // TestSharedServerInstallsOneOutputGenerationAuthorityOnBothLanes is the
-// production-entrypoint trace for W3.1's install.
+// production-entrypoint trace for the output-generation authority's install.
 //
 // NewSharedServer is the one constructor both production entry points build
 // through (cmd/gortex/daemon_state.go for the daemon, cmd/gortex/mcp.go for

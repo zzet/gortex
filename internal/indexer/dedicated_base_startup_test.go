@@ -441,12 +441,12 @@ func TestInitialBasePublisherScheduleNeverBlocksOnQueueDepth(t *testing.T) {
 // TestALiveAdvanceDoesNotReleaseTheStartupQueue pins the one rule that still
 // preserves "ready, then publish" now that a live advance may start the worker.
 //
-// W4.2's ordering was a property of the worker never running before
-// BeginDraining. W4.3 changed that: enqueueAdvance starts the worker itself,
-// because a HEAD change on a daemon whose warmup never reached BeginDraining
-// would otherwise never be published. What keeps the ordering is popLocked's
-// `if !req.live && !p.drainReleased { continue }` — and W5/W4.3-verify (minor 2)
-// showed that deleting it left the whole suite green, including the test the
+// The startup publication's ordering was a property of the worker never
+// running before BeginDraining. The live advance changed that: enqueueAdvance
+// starts the worker itself, because a HEAD change on a daemon whose warmup
+// never reached BeginDraining would otherwise never be published. What keeps
+// the ordering is popLocked's `if !req.live && !p.drainReleased { continue }`
+// — and deleting it left the whole suite green, including the test the
 // implementer named as its guard.
 //
 // Both halves are pinned here: the dequeue rule itself, and the ordering it

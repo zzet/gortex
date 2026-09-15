@@ -20,12 +20,13 @@ import (
 // The read-only-context mode, and what the generation it produces still owes
 // its readers.
 //
-// W6.1 separated a sparse generation's OUTPUT from the closure it had to READ,
-// but only after the fact: the pass wrote payload for every closure file and
-// the build withdrew it before publishing. The durable generation shrank; the
-// writes did not. This file pins the other half — the pass holds its corpus in
-// memory, the separation runs against that corpus before anything is
-// persisted, and the store therefore receives rows for the change set alone.
+// The context ownership mode separated a sparse generation's OUTPUT from the
+// closure it had to READ, but only after the fact: the pass wrote payload for
+// every closure file and the build withdrew it before publishing. The durable
+// generation shrank; the writes did not. This file pins the other half — the
+// pass holds its corpus in memory, the separation runs against that corpus
+// before anything is persisted, and the store therefore receives rows for the
+// change set alone.
 //
 // Two properties are load-bearing and both are pinned here:
 //

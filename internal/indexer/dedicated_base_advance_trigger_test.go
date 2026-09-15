@@ -318,7 +318,7 @@ func TestGitWatcherHeadChangeAdvancesTheCommittedBase(t *testing.T) {
 		rowByID(t, after, before[0].GenerationID).State)
 
 	// Publication is not activation: the owning repository's own request route
-	// is untouched (the declared W4.5 limitation).
+	// is untouched (a declared limitation of this branch).
 	_, routed, err := f.catalog.GetCheckoutRoute(context.Background(), f.checkoutOf(f.prefix).CheckoutID)
 	require.NoError(t, err)
 	require.False(t, routed, "the dedicated owner must not be routed by publication")
@@ -632,9 +632,10 @@ func TestDedicatedBaseAdvanceRefusesAnObservationFromAnotherWorkingCopy(t *testi
 }
 
 // TestGitWatcherHeadChangeInvalidatesTheWorkspaceCohort closes the one cohort
-// source W2.4b's wiring deliberately left open: a workspace member's committed
-// tree moving is not a lifecycle event, so nothing but the ref-transition
-// observer can tell a cached cohort it has stopped being current.
+// source the lifecycle-event invalidation wiring deliberately left open: a
+// workspace member's committed tree moving is not a lifecycle event, so
+// nothing but the ref-transition observer can tell a cached cohort it has
+// stopped being current.
 //
 // Without it a certified dependency revision names a sibling tree OID that has
 // since moved, and every consumer keyed on it keeps answering from a
@@ -799,11 +800,10 @@ func TestOnlyTheGitWatcherHeadFinalizeDispatchesAdvancement(t *testing.T) {
 	// The queue-bypass census. A dispatch site is only half the blast radius:
 	// the trigger used to carry an exported AdvanceRepo that published
 	// SYNCHRONOUSLY, outside the shared pending list and outside the memo's
-	// pre-check, and the pattern set above was blind to it (W5/W4.3-verify,
-	// minor 3). Every call of the publisher's own publish must therefore be one
-	// of the two the design admits: the worker draining the queue, and
-	// PublishRepo, the deliberate synchronous entry point for a caller that
-	// owns its own waiting.
+	// pre-check, and the pattern set above was blind to it. Every call of the
+	// publisher's own publish must therefore be one of the two the design
+	// admits: the worker draining the queue, and PublishRepo, the deliberate
+	// synchronous entry point for a caller that owns its own waiting.
 	//
 	// The pattern is the bare selector, not "p.publish(". The bypass this
 	// census exists for was spelled t.publisher.publish(, and "p.publish(" is
@@ -818,15 +818,17 @@ func TestOnlyTheGitWatcherHeadFinalizeDispatchesAdvancement(t *testing.T) {
 			"pending list that keeps one committed build running at a time")
 }
 
-// TestFiveCommitsAllocateFiveGenerationsAndTimersAllocateNone is the plan's
-// named W4.3 verification, at the size the test budget affords: N commits
+// TestFiveCommitsAllocateFiveGenerationsAndTimersAllocateNone is the named
+// verification for advancing the committed base from the Git watcher's
+// HEAD-change finalize path, at the size the test budget affords: N commits
 // allocate exactly N committed generations, and the two timer-driven paths that
 // could plausibly allocate one — the checkout coordinator's 15 s poll and the
 // hourly reconcile janitor — allocate none.
 //
-// It is the budget claim W8 will freeze, stated as a count rather than inferred
-// from a single-commit test: one root plus five deltas for five commits, no
-// generation per tick, and nothing re-rooted in between.
+// It is the budget claim the sustained-I/O measurement freezes, stated as a
+// count rather than inferred from a single-commit test: one root plus five
+// deltas for five commits, no generation per tick, and nothing re-rooted in
+// between.
 func TestFiveCommitsAllocateFiveGenerationsAndTimersAllocateNone(t *testing.T) {
 	f := newAdvanceFixture(t, "budget")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -980,7 +982,7 @@ func TestCommittedAdvancementRequiresTheSharedLeaseDomain(t *testing.T) {
 		// nothing on it calls InitialBasePublisher.Close. Before the trigger
 		// bound its registration to the publisher's context, the process-wide
 		// sync.Map retained trigger -> publisher -> lifecycle -> *MultiIndexer
-		// for the life of the process (W5/W4.3-verify, minor 5).
+		// for the life of the process.
 		require.Eventually(t, func() bool {
 			_, leaked := dedicatedBaseAdvanceRegistry.Load(f.mi)
 			return !leaked

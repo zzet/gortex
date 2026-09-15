@@ -16,10 +16,10 @@ import (
 
 // The live committed-base advancement trigger.
 //
-// W4.2 made a committed base exist: one publication per dedicated repository
-// per daemon start, plus an advance for a tree that moved while the process
-// was down. Nothing advanced it while the daemon was UP, so a running daemon's
-// committed base aged out the moment somebody committed.
+// The startup publication made a committed base exist: one publication per
+// dedicated repository per daemon start, plus an advance for a tree that moved
+// while the process was down. Nothing advanced it while the daemon was UP, so
+// a running daemon's committed base aged out the moment somebody committed.
 //
 // This file is the live half. It has exactly one source — the Git watcher's
 // HEAD-change finalize path (GitWatcher.finalizeReconcile) — and it deliberately
@@ -40,7 +40,7 @@ import (
 // Advancement is not activation. Adoption moves
 // `dedicated_graphs.active_generation_id` so DEPENDENT checkouts key on an
 // immutable lower snapshot; the owning repository's own request route stays on
-// legacy generation 0 until W4.5.
+// legacy generation 0, which is a declared limitation of this branch.
 
 // dedicatedBaseAdvanceRegistry binds one daemon's watchers to that daemon's
 // trigger, keyed on the MultiIndexer.

@@ -937,8 +937,8 @@ func TestTheCohortReadsOnlyInScopeRepositories(t *testing.T) {
 	}
 }
 
-// TestARepositorysOwnTreeIsNotAnInputToItsOwnCohort is the fix W5/W4.3-verify
-// (major 1) demanded, at the producer.
+// TestARepositorysOwnTreeIsNotAnInputToItsOwnCohort pins the fix at the
+// producer.
 //
 // The cohort named every IN-SCOPE roster member's bytes, and the target is in
 // scope by construction, so the target's own committed corpus was an input to

@@ -57,7 +57,7 @@ func Island() {
 }
 `
 
-// TestUndoReusesTheRetainedDirtyLayer is D14's acceptance case.
+// TestUndoReusesTheRetainedDirtyLayer is the dirty-layer reuse acceptance case.
 //
 // Edit, reconcile, undo, reconcile. The second reconcile describes a working
 // tree this coordinator has already indexed over the same commit layer, under
@@ -312,7 +312,7 @@ func TestRetainedDirtyLayersAreDrainedOnTeardown(t *testing.T) {
 	}
 }
 
-// --- the ref-fact hint scope (W6.10) ------------------------------------
+// --- the ref-fact hint scope --------------------------------------------
 
 // TestCommitLayerReaderComposesRefFactHintsOverTheAncestry pins what a dirty
 // build's base reads its reference-fact hints from.
@@ -610,8 +610,8 @@ func TestTheBuiltWorkingTreeLayerIsFiledUnderTheKeyItStamped(t *testing.T) {
 	}
 }
 
-// TestCommitLayerBuildTakesItsFactHintsFromTheWholeAncestry is W6.10 at the
-// commit half's production entrypoint.
+// TestCommitLayerBuildTakesItsFactHintsFromTheWholeAncestry is the ref-fact
+// hint scope at the commit half's production entrypoint.
 //
 // resolveCommitLayer hands the build the primary base to compute its affected
 // closure against. Scoped to the base generation ALONE that base answers the

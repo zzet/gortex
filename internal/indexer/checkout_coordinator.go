@@ -328,8 +328,8 @@ type CheckoutCycle struct {
 	Recomposed bool
 	// BasePinned reports that the cycle served the checkout from the committed
 	// base generation its routed layers were BUILT against, while the family's
-	// primary has already advanced past it. It is W4.8's saving made
-	// observable: the pair is still exactly this checkout's tree (the
+	// primary has already advanced past it. It is the dependent pin's saving
+	// made observable: the pair is still exactly this checkout's tree (the
 	// materializer composes the ancestry the routed generation itself names),
 	// so the cycle built nothing and wrote nothing.
 	//
@@ -498,9 +498,9 @@ type CheckoutCoordinator struct {
 	// backlog holds generations a retire refused. The janitor retries them.
 	backlog map[int64]struct{}
 	// basePinned is the committed base generation this checkout's ROUTE is
-	// composed over while the family's primary has moved past it — W4.8's pin,
-	// as the last cycle resolved it, and 0 when the route is on the family's
-	// current base or the family publishes no generation at all.
+	// composed over while the family's primary has moved past it — the
+	// dependent pin, as the last cycle resolved it, and 0 when the route is on
+	// the family's current base or the family publishes no generation at all.
 	//
 	// It exists so the retirement sweep can ask a live coordinator what its
 	// route is holding without re-deriving it from the catalog per candidate
@@ -608,7 +608,7 @@ type primaryBase struct {
 	treeOID string
 	// pinned marks a base this coordinator is deliberately staying on rather
 	// than the one the family's active pointer names right now — the committed
-	// regime's W4.8 pin, minted by pinRoutedBase and by nothing else.
+	// regime's dependent pin, minted by pinRoutedBase and by nothing else.
 	//
 	// It is a field rather than a caller's side note because the guards read
 	// it: baseMovedUnderCycle's "is this still the base I planned against"
@@ -1046,12 +1046,13 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	}
 	// The routed commit layer re-keys against the base it is composed over,
 	// which is the base the family is on now UNLESS this checkout is pinned to
-	// the one it was built against — W4.8's committed-regime pin, resolved by
-	// pinRoutedBase, whose doc carries the two-regime argument in full.
+	// the one it was built against — the committed-regime dependent pin,
+	// resolved by pinRoutedBase, whose doc carries the two-regime argument in
+	// full.
 	//
 	// The short version, because this is the predicate the saving is actually
-	// taken in. In the committed regime the routed pair is B1 + D1 with
-	// D1 = diffTreeChanges(B1_tree, T), the materializer composes the ancestry
+	// taken in. In the committed regime the routed pair is the base B1 plus the
+	// delta diffTreeChanges(B1_tree, T), the materializer composes the ancestry
 	// the routed generation itself names, and B1 is kept servable by the very
 	// reference the routed delta makes: so the pair still equals this
 	// checkout's tree exactly and the cheapest possible cycle — no build, no
@@ -1178,12 +1179,12 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		return out
 	}
 
-	// W4.8: a checkout whose routed layers were built over a committed base the
-	// family has since advanced past stays on that base. The substitution is
-	// the whole mechanism — everything below then finds the route already
-	// describing exactly the state it is asked to reconcile to, so the cheap
-	// arms take themselves: reconcileCommitSlot's "already routed to exactly
-	// this state" returns the routed generation without a build, and
+	// The dependent pin: a checkout whose routed layers were built over a
+	// committed base the family has since advanced past stays on that base. The
+	// substitution is the whole mechanism — everything below then finds the
+	// route already describing exactly the state it is asked to reconcile to,
+	// so the cheap arms take themselves: reconcileCommitSlot's "already routed
+	// to exactly this state" returns the routed generation without a build, and
 	// reconcileDirtySlot keeps the working-tree layer sitting on it. A
 	// dependent whose OWN tree moved rebuilds its delta against the base it is
 	// pinned to rather than the family's current one, which is what keeps its
@@ -1291,19 +1292,19 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 //     still names (ErrCatalogGenerationReferenced); and the materializer
 //     composes the ancestry the ROUTED generation itself names, walking its own
 //     BaseGenerationID chain rather than the family's current pointer
-//     (graphview generationAncestry). So B1 + D1 is still exactly this
-//     checkout's tree after the family moves to B2, and an un-recomposed
+//     (graphview generationAncestry). So B1 plus that delta is still exactly
+//     this checkout's tree after the family moves to B2, and an un-recomposed
 //     dependent is NOT serving stale content. Recomposing here buys currency
 //     and availability, not correctness — so HERE THE DEPENDENT IS NOT
-//     RECOMPOSED AT ALL. It stays on B1: pinRoutedBase substitutes the base
-//     the route was built against before this path is reached, the routed
-//     identity then equals the one a build would mint, and recomposableStack
-//     declines. That is W4.8, and it costs a base advance zero dependent
+//     RECOMPOSED AT ALL. It stays on B1: pinRoutedBase substitutes the base the
+//     route was built against before this path is reached, the routed identity
+//     then equals the one a build would mint, and recomposableStack declines.
+//     That is the dependent pin, and it costs a base advance zero dependent
 //     builds and zero route writes. This path stays reachable in this regime
 //     for the three cases the pin refuses: a base a retirement sweep has asked
-//     the coordinator to release (RequestBaseRelease), a pinned generation
-//     that stopped being servable, and an identity that moved in more than its
-//     base fields.
+//     the coordinator to release (RequestBaseRelease), a pinned generation that
+//     stopped being servable, and an identity that moved in more than its base
+//     fields.
 //
 //   - The primary graph has NOT published one (graphBase's second arm: the
 //     base is the owner checkout's recorded committed tree). commitIdentity
@@ -1325,10 +1326,10 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 // none of them is optional. The base stays servable because the routed delta
 // names it and the catalog refuses to retire a generation another generation
 // is based on; the dependent does not freeze on it because the retirement
-// sweep asks for it back (RequestBaseRelease) as soon as W6.7's retention
-// window stops covering it; and the release lands as one recomposition here,
-// which installs the replacement stack in a single compare-and-set before the
-// old base is given up.
+// sweep asks for it back (RequestBaseRelease) as soon as the superseded-chain
+// retention window stops covering it; and the release lands as one
+// recomposition here, which installs the replacement stack in a single
+// compare-and-set before the old base is given up.
 //
 // So the reuse this path delivers is three narrower guarantees, each of them
 // observable:
@@ -1843,8 +1844,9 @@ func graphBase(
 // pinRoutedBase substitutes, for one cycle, the committed base this checkout's
 // route was BUILT against for the one the family's primary is on now.
 //
-// THIS IS W4.8, AND IT IS A TWO-REGIME CONTRACT. Which regime a family is in
-// is graphBase's two arms, and the pin is only valid in one of them:
+// THIS IS THE DEPENDENT PIN, AND IT IS A TWO-REGIME CONTRACT. Which regime a
+// family is in is graphBase's two arms, and the pin is only valid in one of
+// them:
 //
 //   - COMMITTED REGIME (graphBase's first arm, ActiveGenerationID > 0). The
 //     base is an immutable published generation. commitIdentity stamps it as
@@ -1854,8 +1856,8 @@ func graphBase(
 //     and the catalog refuses to retire a generation another generation names
 //     as its base (viewGenerationReferencedSQL's base_generation_id term), so
 //     the routed delta IS the reference that keeps its base servable. A
-//     dependent's routed pair is B1 + D1 where D1 = diffTreeChanges(B1_tree,
-//     T), so B1 + D1 equals this checkout's own tree T exactly, for every
+//     dependent's routed pair is B1 plus the delta diffTreeChanges(B1_tree,
+//     T), so the pair equals this checkout's own tree T exactly, for every
 //     path, however far the primary has advanced past B1. The view stays exact
 //     and the freshness rider stays truthful: the rider answers for this
 //     checkout's own head and working tree, which is what the pair describes.
@@ -1888,11 +1890,12 @@ func graphBase(
 //     across its own commits.
 //
 //   - a base a sweep has asked this coordinator to release is never pinned
-//     again. That is the bound: the pin holds until W6.7's retention window
-//     decides the base must go, and the recomposition that follows installs
-//     the replacement stack in ONE compare-and-set (installStack) before the
-//     old one is given up, so the base is recomposed off BEFORE it retires and
-//     the checkout never serves a torn route for the length of the rebuild.
+//     again. That is the bound: the pin holds until the superseded-chain
+//     retention window decides the base must go, and the recomposition that
+//     follows installs the replacement stack in ONE compare-and-set
+//     (installStack) before the old one is given up, so the base is recomposed
+//     off BEFORE it retires and the checkout never serves a torn route for the
+//     length of the rebuild.
 //
 // It reports the base the cycle should use and whether that is a pin. Every
 // refusal — a read that failed, a row that is gone, anything that is not
@@ -2421,10 +2424,11 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		}
 	}
 
-	// The reuse path, and the whole of D14's in-process half: a working tree
-	// that has come back to a state this coordinator already described over
-	// this commit layer is re-routed rather than re-indexed. The route flip
-	// below is the only write it makes.
+	// The reuse path, and the whole of dirty-layer reuse as it ships — an
+	// in-process, fingerprint-keyed cache with no catalog-backed,
+	// survive-restart half: a working tree that has come back to a state this
+	// coordinator already described over this commit layer is re-routed rather
+	// than re-indexed. The route flip below is the only write it makes.
 	if cached, ok := c.cachedDirty(ctx, key); ok {
 		previous := route.DirtyGenerationID
 		if err := c.flip(ctx, route, store_sqlite.RouteSlotDirty, cached); err != nil {

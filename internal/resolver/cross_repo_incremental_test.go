@@ -120,7 +120,7 @@ func hasEdgeKindTo(edges []*graph.Edge, kind graph.EdgeKind, target string) bool
 	return false
 }
 
-// F3 — the cross-repository mutation pass builds the same bounded frontier the
+// The cross-repository mutation pass builds the same bounded frontier the
 // single-repository legs do. A refusal empties its incoming half, so the pass
 // resolves only the changed files' own outgoing edges while its CrossRepoStats
 // still count a normal-looking resolution. Without the admission fact riding

@@ -69,9 +69,10 @@ func analysisGenerationViewGen(t *testing.T, store *Store, generationID int64) i
 	return viewGen
 }
 
-// TestAnalysisGenerationsDoNotCollideAcrossViewGenerations is the D9 case: two
-// analyses over two payload view generations of the same store, built with no
-// graph mutation between them so their build_revision is byte-identical, stay
+// TestAnalysisGenerationsDoNotCollideAcrossViewGenerations is the case that
+// forced the analysis cache onto its own view-generation axis: two analyses
+// over two payload view generations of the same store, built with no graph
+// mutation between them so their build_revision is byte-identical, stay
 // separately addressable. Each handle reads its own and refuses the other's.
 //
 // Revert-red: drop the `a.view_gen = ?` predicate from

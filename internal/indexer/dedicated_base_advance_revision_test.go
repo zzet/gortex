@@ -231,12 +231,13 @@ func setDedicatedActiveGeneration(t *testing.T, ctx context.Context, path, graph
 }
 
 // A dependency-revision change must never wedge publication. A store can hold a
-// chain whose lower carries an older revision — the shape a pre-W2.1d binary
-// could publish, because exact-tree ancestry validation revision-checked only
-// the output candidate — and the ACTIVE pointer can sit at the head of exactly
-// such a chain. Both routes out of that state must publish a new full root:
-// the catalog's ready-reuse scan when the observed identity still matches the
-// mixed head, and the planner when the tree has moved on. Neither may return
+// chain whose lower carries an older revision — the shape a binary that
+// predates the revision-homogeneous ancestry requirement could publish, because
+// exact-tree ancestry validation revision-checked only the output candidate —
+// and the ACTIVE pointer can sit at the head of exactly such a chain. Both
+// routes out of that state must publish a new full root: the catalog's
+// ready-reuse scan when the observed identity still matches the mixed head, and
+// the planner when the tree has moved on. Neither may return
 // ErrDedicatedBaseCandidate forever.
 func TestDedicatedBaseAdvanceNonHomogeneousChainStillPublishesAsRoot(t *testing.T) {
 	for _, moved := range []bool{false, true} {

@@ -62,8 +62,8 @@ const (
 // "raw:<revision>:<fingerprint>".
 //
 // Workspace SIBLINGS keep naming their bytes: a sibling's tree is a genuine
-// cross-repository input, and W2.4's scope rule is what bounds how many of them
-// there are.
+// cross-repository input, and the workspace scope rule is what bounds how many
+// of them there are.
 const DependencyRevisionTargetSourceIdentity = "target"
 
 // ErrDependencyRevisionIncomplete means the cohort handed to

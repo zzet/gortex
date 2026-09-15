@@ -895,7 +895,7 @@ func TestReset_DiscardsBufferedObservations(t *testing.T) {
 	}
 }
 
-// --- F4b: exactness across handles on one ledger ---------------------------
+// --- exactness across handles on one ledger --------------------------------
 //
 // persistence.OpenSidecar caches one connection per absolute path, so two
 // savings.Store values opened on the same ledger share a handle while owning
@@ -1105,7 +1105,7 @@ func TestReset_DiscardsPeerHandleBuffers(t *testing.T) {
 	}
 }
 
-// --- F4b: the one-shot flush bound -----------------------------------------
+// --- the one-shot flush bound ----------------------------------------------
 
 func TestSetFlushBounds_TightensTheWindow(t *testing.T) {
 	path := testLedgerPath(t)

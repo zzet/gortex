@@ -740,7 +740,7 @@ func (idx *Indexer) coordinateRepositoryMutation(ctx context.Context, entry Outp
 }
 
 // ---------------------------------------------------------------------------
-// Output-generation authority (D12, gate 6)
+// Output-generation authority (gate 6)
 // ---------------------------------------------------------------------------
 //
 // coordinateRepositoryMutation and BeginCheckoutMutation are the two lanes a

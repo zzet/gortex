@@ -266,7 +266,7 @@ func TestRawDataDurableRevisionFloorAndOverflowDoNotReuseOrPoison(t *testing.T) 
 	}
 }
 
-// --- W5.3: initial capture and witness validation -----------------------
+// --- initial capture and witness validation -----------------------------
 
 // TestRawDataInitialCaptureMakesANeverMutatedOwnerPinnable is the hole the
 // capture closes: before it, an owner that was registered and only ever read
@@ -347,7 +347,7 @@ func TestRawDataSnapshotValidateCurrentSeesAMutationAfterHandoff(t *testing.T) {
 	}
 }
 
-// --- W3.1b: the prefix-keyed base-corpus source door --------------------
+// --- the prefix-keyed base-corpus source door ---------------------------
 
 // TestBaseCorpusMutationServesADedicatedOwner is the reachability claim.
 //

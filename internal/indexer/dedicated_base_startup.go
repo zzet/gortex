@@ -18,7 +18,8 @@ import (
 
 // The initial committed publication path.
 //
-// Everything below drives the publication runtime that W4.1 installed. The
+// Everything below drives the publication runtime installed once per process
+// in serverstack.NewSharedServer, ahead of every owner registration. The
 // runtime owns the authority, the per-graph observation gate and the drain;
 // this file is the only production caller that asks it to publish, and it asks
 // exactly once per dedicated repository per daemon start.
@@ -26,7 +27,7 @@ import (
 // Publication is NOT activation. Adopting a committed base moves
 // `dedicated_graphs.active_generation_id` so DEPENDENT checkouts can key their
 // commit layers on an immutable lower snapshot; the owning repository's own
-// request route stays on legacy generation 0 (the W4.5 limitation). Nothing
+// request route stays on legacy generation 0, a declared limitation. Nothing
 // here relabels generation 0, and nothing here routes a request.
 
 var errInitialBasePublisherInput = errors.New("indexer: invalid initial dedicated base publisher")
@@ -83,7 +84,8 @@ type InitialBasePublication struct {
 	// TreeOID is the committed tree the publication was FOR. It is reported
 	// because a live advance resolves its own target from Git rather than
 	// from the checkout row, so "which tree did this publish" is not
-	// answerable from the catalog's checkouts table alone until W4.4.
+	// answerable from the catalog's checkouts table alone until adoption
+	// advances head_tree with it.
 	TreeOID string
 }
 
@@ -96,13 +98,13 @@ type InitialBasePublication struct {
 // A LIVE advance cannot use it. `checkouts.head_tree` is written by the
 // reconciler's family pass (internal/reconcile/reconcile.go:448, :605 through
 // `headFor`) and by nothing on the ref-transition path, so at the instant the
-// git watcher observes a new commit the row still names the PREVIOUS tree —
-// the window W4.4 closes by advancing head_tree with adoption. The trigger
-// therefore resolves the target from Git itself and hands it in. Publishing
-// ahead of the row is coherent for every reader: once a base is adopted,
-// `primaryBase` reads the tree off the GENERATION row and not off the checkout
-// (checkout_coordinator.go:1258-1281), and only the unpublished fallback below
-// it reads `owner.HeadTree`.
+// git watcher observes a new commit the row still names the PREVIOUS tree — a
+// window that closes only when adoption advances head_tree with it. The
+// trigger therefore resolves the target from Git itself and hands it in.
+// Publishing ahead of the row is coherent for every reader: once a base is
+// adopted, `primaryBase` reads the tree off the GENERATION row and not off the
+// checkout (checkout_coordinator.go:1258-1281), and only the unpublished
+// fallback below it reads `owner.HeadTree`.
 type dedicatedBaseTarget struct {
 	CommitOID string
 	TreeOID   string

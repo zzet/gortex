@@ -227,13 +227,14 @@ func TestCheckoutCohortIsStableAcrossTwoConstructions(t *testing.T) {
 // What it falls back to is the STABLE degraded revision: outside the certified
 // vocabulary, so no certified layer is ever reused for an undescribable cohort
 // or the other way round, and identical for two producers over identical
-// describable inputs. Stability is the half W2.4 changed: the first
-// implementation minted `cohort-refused:<nanoseconds>` per coordinator, and a
-// value nothing can ever match again means every layer stamped with one is
-// rebuilt on every following cycle for as long as the transient lasts — the
-// write amplification the revision exists to bound. The cost of stability is
-// declared in the degraded revision's own doc comment: two degraded builds
-// whose describable inputs match are treated as one.
+// describable inputs. Stability is the half that changed once the degraded
+// value became content-derived: the first implementation minted
+// `cohort-refused:<nanoseconds>` per coordinator, and a value nothing can ever
+// match again means every layer stamped with one is rebuilt on every following
+// cycle for as long as the transient lasts — the write amplification the
+// revision exists to bound. The cost of stability is declared in the degraded
+// revision's own doc comment: two degraded builds whose describable inputs
+// match are treated as one.
 func TestRefusedCheckoutCohortIsNotReusable(t *testing.T) {
 	f := newCoordinatorFixture(t)
 

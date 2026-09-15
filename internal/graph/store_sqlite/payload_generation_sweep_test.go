@@ -32,7 +32,7 @@ func generationState(t *testing.T, store *Store, generationID int64) (ViewGenera
 	return row.State, true
 }
 
-// TestASweepYieldsOnItsBudgetAndFinishesOnResume is W7.7's pin.
+// TestASweepYieldsOnItsBudgetAndFinishesOnResume pins the sweep's budget.
 //
 // The sweep used to drain every table until a chunk removed nothing, with no
 // total row, chunk or elapsed bound: one retirement held the janitor for as
@@ -271,8 +271,8 @@ func TestASweepPassAlwaysRemovesAChunk(t *testing.T) {
 	}
 }
 
-// TestPrivateRetirementSweepStopsCleanlyOnAFullVolume is W7.6's disk-full arm
-// and acceptance gate 9's.
+// TestPrivateRetirementSweepStopsCleanlyOnAFullVolume is the storage-refusal
+// classification's disk-full arm and acceptance gate 9's.
 //
 // The failure is real, not a stub: the database's own page ceiling is pinned
 // at its current size, and a BEFORE DELETE trigger on `nodes` makes the

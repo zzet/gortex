@@ -17,7 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
-// W4.8 — a routed dependent pins the committed base it was built against.
+// A routed dependent pins the committed base it was built against.
 //
 // These tests drive the COMMITTED regime, which is the one the pin applies to
 // and the one no other test in this package has ever set up: the family's
@@ -247,8 +247,8 @@ func assertViewIsItsOwnTree(t *testing.T, f *committedBaseFixture, checkoutID, r
 	builderAssertReadersAgree(t, view.Reader, flatStore.AtGeneration(0))
 }
 
-// TestACommittedBaseAdvanceCostsAPinnedDependentNothing is W4.8's headline
-// measurement, and the plan's own verification for the item: advance the
+// TestACommittedBaseAdvanceCostsAPinnedDependentNothing is the pin's headline
+// measurement, and the named verification for it: advance the
 // family's committed base twenty times, with three dependent worktrees whose
 // own trees never move, and every one of them keeps serving without building
 // anything at all.
@@ -308,7 +308,7 @@ func TestACommittedBaseAdvanceCostsAPinnedDependentNothing(t *testing.T) {
 	// is read around the DEPENDENTS' cycles alone: the publication that
 	// precedes them is the primary's own work and writes a generation by
 	// definition. What this measures is the marginal cost of a base advance to
-	// a dependent, which is the number W4.8 is about.
+	// a dependent, which is the number the pin is about.
 	writes := installCheckoutLayerWriteAudit(t, f.storePath)
 	// The counter evidence, beside the cycle's own decisions and the write
 	// audit: CoordinatorBuildSeconds is observed inside resolveCommitLayer and
@@ -627,8 +627,8 @@ func TestTheRetirementSweepOffersAReplacedBaseNothingIsHolding(t *testing.T) {
 	}
 }
 
-// TestTheRetirementSweepKeepsAPinnedBaseAndAsksForItBack is W4.8's retention
-// half, driven through the production entrypoint.
+// TestTheRetirementSweepKeepsAPinnedBaseAndAsksForItBack is the pin's
+// retention half, driven through the production entrypoint.
 //
 // A dependent that stays on the base it was built against holds that base
 // servable — its own delta is the catalog reference that refuses the
@@ -726,10 +726,10 @@ func TestALegacyBaseAdvanceIsNeverPinned(t *testing.T) {
 	}
 }
 
-// --- W4.8b: the two refusals inside pinnedBaseFor that nothing was holding --
+// --- the two refusals inside pinnedBaseFor that nothing was holding --------
 //
 // The tests above pin what the pin BUYS. These pin what it must refuse, and
-// they exist because the W4.8 verification found both refusals survived
+// they exist because the pin's own verification found both refusals survived
 // deletion with the whole suite green: the substituted-identity probe
 // (checkout_coordinator.go:1877-1882) and the pinned base row's own
 // consistency clauses (:1887-1896).
@@ -839,7 +839,7 @@ func assertRefusesThePin(
 //
 // Revert-red: drop the probe (checkout_coordinator.go:1877-1882) and all four
 // arms take the pin, with the control still green — which is exactly the state
-// the W4.8 verification found the suite in.
+// the pin's own verification found the suite in.
 func TestASemanticChangeRefusesToPinTheBaseItWasBuiltAgainst(t *testing.T) {
 	f := newCommittedBaseFixture(t)
 	c, _, builtAgainst, current, route := pinnedDependent(t, f)
@@ -899,8 +899,8 @@ func TestASemanticChangeRefusesToPinTheBaseItWasBuiltAgainst(t *testing.T) {
 // delta is no longer the payload this coordinator would build, so the cycle
 // rebuilds it — and the base it must be diffed from is the one the family is on
 // NOW, not the one the route happened to be pinned to. Building against the pin
-// instead would be a strictly worse answer than the pre-W4.8 behaviour: the
-// delta would be re-minted under the new inputs and immediately pinned to a
+// instead would be a strictly worse answer than the behaviour before the pin:
+// the delta would be re-minted under the new inputs and immediately pinned to a
 // base the family left, with no event left that would ever move it off.
 //
 // Revert-red: drop the probe and the rebuilt delta names the pinned base

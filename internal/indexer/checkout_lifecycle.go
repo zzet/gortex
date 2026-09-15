@@ -413,17 +413,17 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 // the two regimes graphBase serves. Where the primary HAS published a
 // generation the dependent stays on the base it was built against — its routed
 // pair still composes to its own tree exactly, so the cycle settles without
-// building anything (CheckoutCoordinator.pinRoutedBase, W4.8) and the wake
-// costs a sample and a few metadata reads. What it buys there is the rest of
-// the cycle: the checkout's own HEAD, its working tree and its configuration
-// are all re-checked, and a base advance is as good a moment as any to do it.
-// Where the primary has NOT published one the base moves without any pointer
-// moving with it, the old delta really does go stale, and the wake is the
-// correctness path: the cycle recomposes over the tree it finds and flips its
-// route only once the replacement is built, so the route keeps serving the
-// pair it already holds until there is something coherent to replace it with.
-// No new base is spliced under an old delta by this signal, and none is by the
-// cycle it starts.
+// building anything (CheckoutCoordinator.pinRoutedBase, the dependent pin) and
+// the wake costs a sample and a few metadata reads. What it buys there is the
+// rest of the cycle: the checkout's own HEAD, its working tree and its
+// configuration are all re-checked, and a base advance is as good a moment as
+// any to do it. Where the primary has NOT published one the base moves without
+// any pointer moving with it, the old delta really does go stale, and the wake
+// is the correctness path: the cycle recomposes over the tree it finds and
+// flips its route only once the replacement is built, so the route keeps
+// serving the pair it already holds until there is something coherent to
+// replace it with. No new base is spliced under an old delta by this signal,
+// and none is by the cycle it starts.
 //
 // The owner is skipped: it is the checkout the base was published FOR, and its
 // own route is not composed over itself. Ref views are not signalled at all,
@@ -1263,10 +1263,10 @@ func (l *CheckoutLifecycle) familyGraphsFor(
 //
 // A committed base is a full index of a committed tree — the single largest
 // write a warm daemon makes — and the OWNER is not one of its readers. The
-// owning repository's own request route stays on legacy generation 0 (the W4.5
-// limitation stated on dedicated_base_startup.go's header and on this file's
-// base-advance fan-out), so a published base exists for exactly two consumers,
-// both of which key a layer on an immutable lower snapshot:
+// owning repository's own request route stays on legacy generation 0 (the
+// declared limitation stated on dedicated_base_startup.go's header and on this
+// file's base-advance fan-out), so a published base exists for exactly two
+// consumers, both of which key a layer on an immutable lower snapshot:
 //
 //   - a DEPENDENT checkout — a non-owner checkout in the family served from the
 //     family's primary corpus. applyCoordinators gives a coordinator to exactly
@@ -3349,18 +3349,19 @@ func (l *CheckoutLifecycle) supersededChainRetentionWindow() int {
 // the live chain — always ready, always referenced — out of the sweep entirely
 // instead of being refused on every pass forever.
 //
-// W4.8 makes that last sentence load-bearing rather than incidental. A
-// dependent in the committed regime STAYS on the base it was built against
-// while the family advances past it (CheckoutCoordinator.pinRoutedBase), so a
-// replaced base outside the retention window is now routinely still referenced
-// — by a live checkout's own delta, deliberately and indefinitely. Offering it
-// every pass would be exactly the "refused on every pass forever" this pass
-// exists to avoid, and it would never collect the payload either. So a pinned
-// base is retained like the live chain, and the pin is asked for back instead:
-// the holders are signalled (RequestBaseRelease), they recompose over the
-// current base in one compare-and-set, and the generation is collectable on a
-// later pass. Recomposition therefore happens only when the base must go, and
-// always BEFORE it goes.
+// The dependent pin makes that last sentence load-bearing rather than
+// incidental. A dependent in the committed regime STAYS on the base it was
+// built against while the family advances past it
+// (CheckoutCoordinator.pinRoutedBase), so a replaced base outside the
+// retention window is now routinely still referenced — by a live checkout's
+// own delta, deliberately and indefinitely. Offering it every pass would be
+// exactly the "refused on every pass forever" this pass exists to avoid, and
+// it would never collect the payload either. So a pinned base is retained like
+// the live chain, and the pin is asked for back instead: the holders are
+// signalled (RequestBaseRelease), they recompose over the current base in one
+// compare-and-set, and the generation is collectable on a later pass.
+// Recomposition therefore happens only when the base must go, and always
+// BEFORE it goes.
 func (l *CheckoutLifecycle) dedicatedChainRetirementCandidates(
 	ctx context.Context,
 	rows []store_sqlite.ViewGeneration,
@@ -3540,12 +3541,12 @@ func (l *CheckoutLifecycle) dedicatedGraphRetirementCandidates(
 		if _, keep := retained[row.GenerationID]; keep {
 			continue
 		}
-		// A base a live checkout's routed delta is still composed over (W4.8's
-		// pin) is retained rather than offered, and its holders are asked to
-		// recompose off it. Retaining its chain too: the pinned generation's
-		// own ancestors are what the dependent's view composes, so offering
-		// one of them would be offering a piece of a stack that is being read
-		// right now.
+		// A base a live checkout's routed delta is still composed over (the
+		// dependent pin) is retained rather than offered, and its holders are
+		// asked to recompose off it. Retaining its chain too: the pinned
+		// generation's own ancestors are what the dependent's view composes,
+		// so offering one of them would be offering a piece of a stack that
+		// is being read right now.
 		if pins.pinned(row, fmt.Sprintf(
 			"the committed base %d this checkout is composed over is past the retention window",
 			row.GenerationID)) {

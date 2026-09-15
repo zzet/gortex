@@ -28,11 +28,12 @@ import (
 // pair is coherent — the layer names an immutable ancestor, the materializer
 // composes the ancestry the routed generation itself names, retirement refuses
 // a generation anything still names — and pinning the dependent there is the
-// unimplemented W4.8 saving, not something these tests claim. Where it does
-// not (the regime this fixture is in, and the one these tests drive) the delta
-// names no immutable ancestor at all: BaseGenerationID is 0 and the layer
-// composes over the shared indexed corpus, which is rewritten in place as the
-// primary moves. TestARoutedDependentDeltaNamesNoImmutableBaseWithoutAPublishedGeneration
+// unimplemented dependent-pin saving, not something these tests claim. Where
+// it does not (the regime this fixture is in, and the one these tests drive)
+// the delta names no immutable ancestor at all: BaseGenerationID is 0 and the
+// layer composes over the shared indexed corpus, which is rewritten in place
+// as the primary moves.
+// TestARoutedDependentDeltaNamesNoImmutableBaseWithoutAPublishedGeneration
 // pins that, because it is the premise everything below stands on.
 //
 // Either way a base advance here is a RECOMPOSITION: both layers are rebuilt
@@ -418,9 +419,9 @@ func TestBaseAdvanceRecomposesTheStackWithoutDroppingTheRoute(t *testing.T) {
 }
 
 // buildSeconds reads how many builds one slot has observed. The duration
-// series' COUNT is the build counter W8.3 ships: resolveCommitLayer observes
-// one sample per commit-layer build and buildDirtyLayerOver one per
-// working-tree build attempt, so a delta of 1 is one build.
+// series' COUNT is the committed-base build counter: resolveCommitLayer
+// observes one sample per commit-layer build and buildDirtyLayerOver one
+// per working-tree build attempt, so a delta of 1 is one build.
 func buildSeconds(s viewmetrics.Snapshot, slot string) int64 {
 	return s.Durations[viewmetrics.CoordinatorBuildSeconds+"{"+viewmetrics.LabelSlot+"="+slot+"}"].Count
 }
@@ -463,8 +464,9 @@ func dirtyGraphPaths(t *testing.T, root string) []string {
 // on the old base is not):
 //
 //   - EXACTLY two commit-delta builds and two working-tree builds for one
-//     advance across two dependents — counted twice over, by the W8.3 build
-//     counters and by the generations that appeared in the store;
+//     advance across two dependents — counted twice over, by the
+//     committed-base build counters and by the generations that appeared in
+//     the store;
 //   - each commit delta claims exactly the paths its own two committed trees
 //     differ by — not an index of its tree;
 //   - each working-tree layer claims exactly the paths its own dirty set

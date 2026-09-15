@@ -75,15 +75,16 @@ func TestDependencyRevisionOrdinaryBuilderCarriesMetadata(t *testing.T) {
 	}
 }
 
-// This uses a REAL local source change as well as D1->D2. It tests initial and
-// delta output propagation/parent compatibility, not a dependency-only stage.
+// This uses a REAL local source change as well as a dependency-revision change
+// (cohort-v1:a -> cohort-v1:b). It tests initial and delta output
+// propagation/parent compatibility, not a dependency-only stage.
 //
-// D2: a dependency-revision change roots a NEW chain and never extends one. The
-// three arms are the whole contract: a delta over a MATCHING-revision parent
-// still builds and still coalesces on ready replay; a CHANGED revision is
-// published as a full root; and the composition D2 forbids (an output frozen at
-// one revision over a parent frozen at another) is refused by the builder with
-// the typed sentinel, writing nothing.
+// The contract: a dependency-revision change roots a NEW chain and never
+// extends one. The three arms are the whole of it: a delta over a
+// MATCHING-revision parent still builds and still coalesces on ready replay; a
+// CHANGED revision is published as a full root; and the composition it forbids
+// (an output frozen at one revision over a parent frozen at another) is refused
+// by the builder with the typed sentinel, writing nothing.
 func TestDependencyRevisionClaimedFullAndDeltaOutput(t *testing.T) {
 	builder, fixture, git := privateDedicatedBuilderFixture(t)
 	ctx := context.Background()
@@ -192,9 +193,10 @@ func TestDependencyRevisionClaimedFullAndDeltaOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Arm 3 — the composition D2 forbids. The catalog hands the reservation out
-	// (its ancestry validation revision-checks only the output candidate), so
-	// this guard is reachable production code and the builder must refuse it.
+	// Arm 3 — the composition that rule forbids. The catalog hands the
+	// reservation out (its ancestry validation revision-checks only the output
+	// candidate), so this guard is reachable production code and the builder
+	// must refuse it.
 	identity.TreeOID = commit("package dedicated\n\nfunc Committed() string { return \"forbidden\" }\nfunc AddedByForbiddenDelta() {}\n", "dependency revision forbidden composition")
 	desire, err = catalog.RecordDedicatedBaseDesire(ctx, store_sqlite.RecordDedicatedBaseDesireRequest{Authority: authority, ExpectedDesiredEpoch: desire.Epoch, Identity: identity})
 	if err != nil {

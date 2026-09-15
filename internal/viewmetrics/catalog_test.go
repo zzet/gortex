@@ -20,11 +20,11 @@ import (
 // yields an empty snapshot, and a value outside the vocabulary yields an
 // {…=other} key instead of the one asserted.
 
-// committedBaseSeries is the vocabulary W8's measurement cites. Each row is a
-// series, one of its declared label values, and the flattened key that value
-// must produce. The keys are spelled out rather than composed because the
-// flattened key is what a status payload and a ledger row carry: renaming a
-// label while keeping the constants compiling has to fail here.
+// committedBaseSeries is the vocabulary the sustained-I/O measurement cites.
+// Each row is a series, one of its declared label values, and the flattened
+// key that value must produce. The keys are spelled out rather than composed
+// because the flattened key is what a status payload and a ledger row carry:
+// renaming a label while keeping the constants compiling has to fail here.
 var committedBaseSeries = []struct {
 	name   string
 	labels []string

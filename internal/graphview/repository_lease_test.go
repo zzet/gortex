@@ -658,8 +658,8 @@ func BenchmarkRepositoryLeaseAcquire(b *testing.B) {
 }
 
 // ---------------------------------------------------------------------------
-// W5.4 — the serving request's own repository admission, and the joined
-// consumers that outlive it.
+// The serving request's own repository admission, and the joined consumers
+// that outlive it.
 // ---------------------------------------------------------------------------
 
 // TestServingRepositoryReadAdmitsEveryOpenOwner pins the scope rule: a serving

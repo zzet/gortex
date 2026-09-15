@@ -23,10 +23,11 @@ import (
 // re-adopt one" was answerable only by reading the catalog afterwards.
 //
 // Every test here drives a REAL publication or advance and asserts on the
-// delta of the process registry, because that is what the W8 measurement will
-// read. The keys are spelled out rather than composed from the catalog
-// constants on purpose: the flattened series key is the wire format the ledger
-// cites, so a rename that keeps the code compiling still fails here.
+// delta of the process registry, because that is what the sustained-I/O
+// measurement reads. The keys are spelled out rather than composed from the
+// catalog constants on purpose: the flattened series key is the wire format
+// the ledger cites, so a rename that keeps the code compiling still fails
+// here.
 const (
 	metricClaimBuilt          = "views_dedicated_base_claim_total{outcome=built}"
 	metricClaimCoalesced      = "views_dedicated_base_claim_total{outcome=coalesced}"
@@ -185,9 +186,9 @@ func TestColdCommittedBasePublicationCountsARootBuild(t *testing.T) {
 }
 
 // TestAnObservedCommitCountsADeltaPublishAndTellsTheDependents is the live
-// half and the one the W8 measurement reads: a HEAD movement the running
-// daemon observed publishes a DELTA over the base it already had, and raises
-// exactly one dependent-recomposition signal for it.
+// half and the one the sustained-I/O measurement reads: a HEAD movement the
+// running daemon observed publishes a DELTA over the base it already had,
+// and raises exactly one dependent-recomposition signal for it.
 //
 // It runs through GitWatcher.reconcile — the production entry point — so it
 // fails if the dispatch is removed from finalizeReconcile even though the

@@ -17,9 +17,9 @@ import (
 // describe — it has to admit the candidate rather than narrow.
 //
 // The cases below state that rule for the arms the import-placement parity
-// harness declared as unproven residuals (W6.5 §7.4, builder_closure.go's own
-// doc): the qualified-name arm, which IS mirrored and has to stay enumerable on
-// every base the coordinator builds, and the relative-import pass, which is NOT
+// harness declared as unproven residuals (builder_closure.go's own doc): the
+// qualified-name arm, which IS mirrored and has to stay enumerable on every
+// base the coordinator builds, and the relative-import pass, which is NOT
 // mirrored because it binds nothing on the whole-index path — a claim this file
 // pins against the real resolver rather than asserting in a comment.
 

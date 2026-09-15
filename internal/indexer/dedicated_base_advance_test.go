@@ -567,8 +567,8 @@ func TestDedicatedBaseCurrentPhysicalFailurePreservesActiveAndCharacterizesRetry
 	}
 }
 
-// TestDedicatedDeltaBuildTakesItsFactHintsFromTheWholeAncestry is W6.10 at the
-// third production site: the committed base's own advance.
+// TestDedicatedDeltaBuildTakesItsFactHintsFromTheWholeAncestry is the ref-fact
+// hint scope at the third production site: the committed base's own advance.
 //
 // buildObservedClaim hands the delta build the reader for the parent
 // generation it is stacking on. Scoped to that ONE generation the base answers

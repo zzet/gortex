@@ -934,7 +934,7 @@ func TestOutputOwnerIsTheStoreNotOnlyTheRepository(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestLegacyMutationMovesTheBaseCorpusWitnessUnderALivePin is the end-to-end
-// proof of the mutation-label half of W5.3.
+// proof of the mutation-label half of the base-corpus pin.
 //
 // graphview.BasePin is what a routed request holds for its lifetime, and
 // internal/mcp/view_request.go:210 turns exactly ErrBaseCorpusChanged into the

@@ -336,7 +336,7 @@ func TestLeaseManagerConcurrentAcquireRelease(t *testing.T) {
 	}
 }
 
-// --- W5.3: the base corpus pin ------------------------------------------
+// --- the base corpus pin ------------------------------------------------
 
 // TestBasePinHoldsGenerationZeroForTheRequest is the first half of the pin's
 // contract: generation zero is in the same refcount every derived generation

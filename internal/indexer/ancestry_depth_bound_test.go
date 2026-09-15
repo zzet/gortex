@@ -111,9 +111,9 @@ func deepDedicatedChain(t testing.TB, ctx context.Context, catalog *store_sqlite
 // TestDedicatedBaseAdvanceRootsOnceTheChainHoldsTheBound walks the allocation
 // policy across its boundary one generation at a time.
 //
-// The statement being pinned is the whole of W6.9's write half: the planner
-// extends a chain only while doing so keeps it inside the bound, and the
-// generation that would pass the bound is published as a new full root instead
+// The statement being pinned is the whole of the ancestry bound's write half:
+// the planner extends a chain only while doing so keeps it inside the bound,
+// and the generation that would pass it is published as a new full root instead
 // — never as a silently longer chain, and never as a refusal, since a full root
 // is always available and refusing would wedge publication for good.
 func TestDedicatedBaseAdvanceRootsOnceTheChainHoldsTheBound(t *testing.T) {

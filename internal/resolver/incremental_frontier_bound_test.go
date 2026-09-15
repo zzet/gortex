@@ -184,7 +184,7 @@ func TestIncrementalFrontierRefusesAdversarialIncomingFanOut(t *testing.T) {
 	}
 }
 
-// F1 — ResolveFileAndIncoming is the per-save hot path and the most exposed
+// ResolveFileAndIncoming is the per-save hot path and the most exposed
 // entrypoint to this bound. When the changed file holds no outgoing unresolved
 // edge, a refused incoming leg empties the whole pending frontier and the pass
 // takes its "nothing to do" early return. Without the fact recorded before that
@@ -256,7 +256,7 @@ func TestResolveFileAndIncomingKeepsAdmittedPassClean(t *testing.T) {
 	}
 }
 
-// F6 — the phase logging keys on `outcome`. A pass whose incoming leg was
+// The phase logging keys on `outcome`. A pass whose incoming leg was
 // refused must never be reported as complete, nor as having had no pending work
 // at all.
 func TestResolveFilesAndIncomingNeverLabelsARefusedPassComplete(t *testing.T) {
@@ -306,7 +306,7 @@ func TestResolveFilesAndIncomingNeverLabelsARefusedPassComplete(t *testing.T) {
 	}
 }
 
-// F2 — the frontier's documented "one incoming-stub read" is the invariant the
+// The frontier's documented "one incoming-stub read" is the invariant the
 // batch hot-path guard (batch_hotpaths_test.go) protects, and that guard runs
 // under the 256-key scoped cap where any chunking is invisible. Pin the real
 // call count past the cap.

@@ -845,12 +845,12 @@ func setGenerationState(t *testing.T, store *store_sqlite.Store, generationID in
 	}
 }
 
-// TestMaterializeLeasesTheBaseCorpus covers W5.3's graphview half. The
-// ancestry walk stops at generation zero by construction — it is the terminator
-// of the BaseGenerationID chain, not a link in it — so the one layer every
-// composed stack reads without holding anything was the shared mutable corpus.
-// Both materialization paths now lease it with the rest of the stack, and both
-// release it on Close.
+// TestMaterializeLeasesTheBaseCorpus covers the base-corpus pin's graphview
+// half. The ancestry walk stops at generation zero by construction — it is the
+// terminator of the BaseGenerationID chain, not a link in it — so the one layer
+// every composed stack reads without holding anything was the shared mutable
+// corpus. Both materialization paths now lease it with the rest of the stack,
+// and both release it on Close.
 func TestMaterializeLeasesTheBaseCorpus(t *testing.T) {
 	ctx := context.Background()
 	store := openStackStore(t, "base-corpus-lease")
@@ -984,7 +984,8 @@ func textRow(state store_sqlite.ProducerState, reason string) store_sqlite.Produ
 }
 
 // TestCheckoutCompletenessReadsTextSearchOffTheTopLayer is the reader half of
-// D5, and it is the half that makes the producers' declaration mean anything.
+// the text-search capability truth, and it is the half that makes the
+// producers' declaration mean anything.
 //
 // The union seeds every capability at StateComplete and only ever worsts, so a
 // stack whose every layer stays silent about text search contributed Complete —
@@ -1200,7 +1201,7 @@ func TestCompletenessOfAnEmptyStackDeniesTextSearch(t *testing.T) {
 	}
 }
 
-// --- ancestry depth bound (W6.9) ----------------------------------------
+// --- ancestry depth bound ------------------------------------------------
 
 // writeDedicatedChain publishes a dedicated full root plus count-1 deltas over
 // it and returns the generation ids bottom first.

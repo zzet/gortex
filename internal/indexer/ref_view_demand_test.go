@@ -187,7 +187,8 @@ func TestARefViewOverAPublishedBaseComposesOverItAndAsksForNothing(t *testing.T)
 // The primitive works in isolation above, with RequestBase stubbed. What that
 // cannot catch is the state this item would otherwise be in: a manager that
 // asks and a ref_view_service that never wired RequestBase, which is a base
-// that is never published at all — exactly the shape the F1 verifier found.
+// that is never published at all — exactly the shape the consumer-gated
+// publication's verification found.
 //
 // So this drives the production chain with nothing stubbed:
 //
