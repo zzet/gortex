@@ -96,6 +96,7 @@ var extractorSaltExtLang = map[string]string{
 	".exs":    "elixir",
 	".sh":     "bash",
 	".bash":   "bash",
+	".qik":    "qikbasic",
 	".jl":     "julia",
 }
 

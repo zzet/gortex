@@ -56,6 +56,10 @@ func RegisterAll(reg *parser.Registry) {
 	// detect_content.go.
 	reg.Register(NewMyBatisExtractor())
 	reg.Register(NewSpringContextExtractor())
+	// ABA/Sabre QIK LocalDescRef DATAITEM/TABLE descriptors share .xml with
+	// MyBatis/Spring/generic XML; content-sniffed via detect_content.go
+	// (Extensions empty — never claims the bare extension).
+	reg.Register(NewQikXMLExtractor())
 	reg.Register(NewMarkdownExtractor())
 	reg.Register(NewQuartoExtractor())
 	// Multimodal assets — image files and PDF documents become graph
@@ -149,6 +153,9 @@ func RegisterAll(reg *parser.Registry) {
 	// Scientific / enterprise
 	reg.Register(NewApexExtractor())
 	reg.Register(NewABAPExtractor())
+	// ABA/Sabre QIK (.qik) — mid-office script dialect (call/label/goto/
+	// build_local_data_item). Regex only; claims .qik exclusively.
+	reg.Register(NewQikBasicExtractor())
 	reg.Register(NewMatlabExtractor())
 	reg.Register(NewMathematicaExtractor())
 	reg.Register(NewSASExtractor())

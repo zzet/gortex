@@ -24,6 +24,7 @@ func ambiguityRegistry() *Registry {
 	// never overrides the .xml default).
 	r.Register(&mockExtractor{lang: "mybatis"})
 	r.Register(&mockExtractor{lang: "spring"})
+	r.Register(&mockExtractor{lang: "qikxml"})
 	r.Register(&mockExtractor{lang: "xml", exts: []string{".xml"}})
 	// .json defaults to the generic json extractor; a Shopify OS 2.0 theme
 	// template is content+path-routed to "liquid_json" (which claims no
@@ -269,4 +270,22 @@ func TestDetectLanguageContent_NilContentMatchesNameOnly(t *testing.T) {
 	lang, ok := r.DetectLanguageContent("script.py", []byte("#!/usr/bin/env bash\n"))
 	assert.True(t, ok)
 	assert.Equal(t, "python", lang)
+}
+
+func TestDetectLanguageContent_QikXML(t *testing.T) {
+	r := ambiguityRegistry()
+	src := []byte(`<?xml version="1.0"?><LocalDescRef version="1.1"><name>x</name><AppObjectDesc class="DATAITEM"><name>x</name></AppObjectDesc></LocalDescRef>`)
+	lang, ok := r.DetectLanguageContent("DATAITEM/x.xml", src)
+	assert.True(t, ok)
+	assert.Equal(t, "qikxml", lang)
+
+	table := []byte(`<?xml version="1.0"?><LocalDescRef><name>t</name><AppObjectDesc class="TABLE"><name>t</name></AppObjectDesc></LocalDescRef>`)
+	lang, ok = r.DetectLanguageContent("TABLE/t.xml", table)
+	assert.True(t, ok)
+	assert.Equal(t, "qikxml", lang)
+
+	// Plain XML stays on the generic default.
+	lang, ok = r.DetectLanguageContent("conf/plain.xml", []byte(`<?xml version="1.0"?><config/>`))
+	assert.True(t, ok)
+	assert.Equal(t, "xml", lang)
 }
