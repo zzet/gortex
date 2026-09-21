@@ -1736,7 +1736,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	// in this symbol's precise type now — one hover on the lazy-spawned server,
 	// cached in the graph. No-op when it already has a type or no server serves
 	// the language.
-	s.enrichNodeOnDemand(node)
+	s.enrichNodeOnDemand(ctx, node)
 
 	detail := req.GetString("detail", "brief")
 	if detail == "brief" {
@@ -2794,7 +2794,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	// Lazy enrichment: confirm this symbol's callers on demand before
 	// answering, so a graph indexed without the eager LSP sweep still returns
 	// compiler-grade callers. No-op when already confirmed or eager ran.
-	s.confirmSymbolRefsOnDemand(eng.GetSymbol(id))
+	s.confirmSymbolRefsOnDemand(ctx, eng.GetSymbol(id))
 	s.hydrateProxyTargets(ctx, id)
 	sg := eng.GetCallers(id, opts)
 	sg = filterSubGraphByResolvedScope(sg, resolved)
@@ -3073,7 +3073,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// before answering, so a graph indexed without the eager LSP sweep still
 	// converges to compiler-grade usages. No-op when already confirmed or eager
 	// ran.
-	s.confirmSymbolRefsOnDemand(node)
+	s.confirmSymbolRefsOnDemand(ctx, node)
 	opts := query.QueryOptions{
 		WorkspaceID:  resolved.WorkspaceID,
 		ProjectID:    resolved.ProjectID,

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -80,6 +81,25 @@ const sparseGenerationBuildActivity = "sparse_generation_build"
 // reported as a completeness fact and narrows the generation's local-resolution
 // producer state, rather than being papered over with a tombstone that would be
 // exactly as incomplete as the closure it came from.
+//
+// # Reading the closure without writing it
+//
+// The file set being wider than the change is what the pass needs; it is not
+// what the generation should carry. The default route therefore holds the
+// whole pass corpus in memory — parse, resolve and every subpass run there, so
+// the closure is as visible to the resolver as it would be on disk — and hands
+// that corpus to withholdContextPayload before the drain moves it into the
+// store. A closure file whose re-derivation matches the layer below is emptied
+// there, so no node, edge, symbol-FTS, files, clone or constant-value row is
+// ever written for it. See runPass (the installation) and BuildReport
+// .ContextHeldInMemory (what actually happened).
+//
+// The route is an optimisation, never a precondition. When the pass cannot
+// take it — an oversized closure, a shadow budget that will not grant a slot
+// inside the latency bound, a backend without the bulk path — the pass writes
+// its whole file set and separateContextPayload withdraws the same set
+// afterwards. The published generation is identical either way; only the
+// writes differ.
 
 // LayerChangeKind is what a change did to one path between the two states a
 // layer spans.
@@ -134,6 +154,7 @@ type GenerationIdentity struct {
 	ConfigHash           string
 	ExtractorVersions    string
 	ResolverVersion      string
+	DependencyRevision   string
 
 	CreatedAt int64 // unix seconds; 0 stamps the wall clock
 }
@@ -257,6 +278,13 @@ type BuildReport struct {
 	// cap still reads the base layer's stale payload.
 	ClosureTruncated bool
 	ClosureCap       int
+	// ClosureCapSource names WHICH bound produced ClosureCap — the operator's
+	// index.affected_by_reresolve_max, a committed base's change-sized cap, or
+	// the built-in default (ClosureCapFrom* in builder_closure.go). A
+	// truncation is only actionable with it: it says whether an operator has a
+	// lever on this cut, and it is the check that the configured knob was
+	// neither dropped nor exceeded on the committed-base path.
+	ClosureCapSource string
 
 	// IndexedPaths is the repo-relative file set the pass actually walked, and
 	// SourceBytes their total size in the target snapshot.
@@ -272,6 +300,38 @@ type BuildReport struct {
 	// NodeCount and EdgeCount are what the generation carries.
 	NodeCount int
 	EdgeCount int
+
+	// ContextPaths lists, in sorted order, the closure paths the generation
+	// declared read-only context: files the pass read to resolve the change
+	// set, whose re-derivation matched the layer below exactly, and which the
+	// generation therefore carries nothing for. ContextMasks is their count,
+	// and ContextWithdrawnNodes / ContextWithdrawnEdges how many payload rows
+	// left the corpus with them — rows that never reached the store at all on
+	// the in-memory route, and rows withdrawn after the fact on the other.
+	// ContextHeldInMemory says which of the two happened.
+	ContextPaths          []string
+	ContextMasks          int
+	ContextWithdrawnNodes int
+	ContextWithdrawnEdges int
+
+	// ContextRetainedPaths lists the closure paths the generation kept a
+	// replace claim over because its own re-derivation did NOT match the layer
+	// below — the file's resolution genuinely moved, so serving it from below
+	// would serve a stale answer. They are read-only in intent and output in
+	// fact, which is exactly why they are named rather than counted.
+	ContextRetainedPaths []string
+
+	// ContextHeldInMemory says WHERE the separation happened, which is the
+	// difference between the two costs of reading a closure.
+	//
+	// True: the pass held its whole corpus in memory, the separation ran
+	// against that corpus before anything was persisted, and the store
+	// therefore received payload for the change set alone — no transient
+	// rows, no withdrawal. False: the pass could not take that route, so it
+	// wrote its whole file set into the generation and the separation
+	// withdrew the read-only half afterwards. Both leave the same durable
+	// generation; only the first removes the write.
+	ContextHeldInMemory bool
 
 	// ReplaceMasks and DeleteMasks are the file-level claims written;
 	// NodeTombstones and EdgeSourceMarkers the identity- and adjacency-level
@@ -362,26 +422,52 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		return 0, report, err
 	}
 
+	return b.buildPlannedGeneration(ctx, req, plan, report, started)
+}
+
+// buildPlannedGeneration is the existing sparse builder's physical lifecycle,
+// shared by sparse and initial full plans. Claimed full builds join an already
+// reserved candidate through the preparation-aware runner below.
+func (b *SparseGenerationBuilder) buildPlannedGeneration(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time) (int64, BuildReport, error) {
 	generationID, handle, adopted, err := b.Store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
-		OwnerKind:            req.Identity.OwnerKind,
-		GraphID:              req.Identity.GraphID,
-		LayerID:              req.Identity.LayerID,
-		CheckoutID:           req.Identity.CheckoutID,
-		GenerationKind:       req.Identity.GenerationKind,
-		BaseGenerationID:     req.Identity.BaseGenerationID,
-		LowerViewFingerprint: req.Identity.LowerViewFingerprint,
-		TreeOID:              req.Identity.TreeOID,
-		ProvenanceCommitOID:  req.Identity.ProvenanceCommitOID,
-		ConfigHash:           req.Identity.ConfigHash,
-		ExtractorVersions:    req.Identity.ExtractorVersions,
-		ResolverVersion:      req.Identity.ResolverVersion,
-		CreatedAt:            req.Identity.CreatedAt,
+		OwnerKind: req.Identity.OwnerKind, GraphID: req.Identity.GraphID,
+		LayerID: req.Identity.LayerID, CheckoutID: req.Identity.CheckoutID,
+		GenerationKind: req.Identity.GenerationKind, BaseGenerationID: req.Identity.BaseGenerationID,
+		LowerViewFingerprint: req.Identity.LowerViewFingerprint, TreeOID: req.Identity.TreeOID,
+		ProvenanceCommitOID: req.Identity.ProvenanceCommitOID, ConfigHash: req.Identity.ConfigHash,
+		ExtractorVersions: req.Identity.ExtractorVersions, ResolverVersion: req.Identity.ResolverVersion,
+		DependencyRevision: req.Identity.DependencyRevision,
+		CreatedAt:          req.Identity.CreatedAt,
 	})
 	if err != nil {
 		return 0, BuildReport{}, fmt.Errorf("indexer: begin payload generation: %w", err)
 	}
-	report.GenerationID = generationID
+	return b.buildReservedGeneration(ctx, req, plan, report, started, generationID, handle, adopted)
+}
 
+// buildReservedGeneration runs one already-allocated candidate. The dedicated
+// catalog path will supply its transactionally associated reservation here;
+// ordinary sparse callers continue to allocate through their existing API.
+// This helper is private and assumes its caller validated reservation identity.
+func (b *SparseGenerationBuilder) buildReservedGeneration(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time, generationID int64, handle *store_sqlite.Store, adopted bool) (int64, BuildReport, error) {
+	return b.buildReservedGenerationWithPreparation(ctx, req, plan, report, started, generationID, handle, adopted, nil)
+}
+
+// A preparation callback transfers ownership of its returned source to the
+// physical leader. Followers never construct a source or enumerate its tree.
+type generationPayloadPreparation func(context.Context) (source.ContentSource, buildPlan, BuildReport, error)
+
+// A failure callback belongs to the physical leader only. It runs after payload
+// abandonment, within the same bounded cleanup context, before flight completion.
+// Ordinary builders have no dedicated publication association and pass nil.
+type generationPayloadFailure func(context.Context, error) error
+
+func (b *SparseGenerationBuilder) buildReservedGenerationWithPreparation(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time, generationID int64, handle *store_sqlite.Store, adopted bool, prepare generationPayloadPreparation) (int64, BuildReport, error) {
+	return b.buildReservedGenerationWithCallbacks(ctx, req, plan, report, started, generationID, handle, adopted, prepare, nil)
+}
+
+func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx context.Context, req BuildRequest, plan buildPlan, report BuildReport, started time.Time, generationID int64, handle *store_sqlite.Store, adopted bool, prepare generationPayloadPreparation, failed generationPayloadFailure) (int64, BuildReport, error) {
+	report.GenerationID = generationID
 	flight, leader, ready, err := b.Store.JoinPayloadBuildFlight(ctx, generationID, adopted)
 	if err != nil {
 		report.Coalesced = adopted
@@ -399,16 +485,15 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		report.Duration = time.Since(started)
 		return generationID, report, err
 	}
-
 	// Only the physical flight leader owns process activity. Ready reuse and
 	// followers do no payload work; counting them would unnecessarily suppress
-	// runtime maintenance. This guard spans preparation, planning, every store
-	// write, publication/abandonment and terminal flight completion, and its
-	// defer balances success, ordinary error, converted storage panic and
-	// re-panicked programmer faults alike.
+	// runtime maintenance. Ordinary sparse planning precedes this guard; claimed
+	// full-build preparation and planning run inside it, for the leader only.
+	// The guard spans store writes, publication/abandonment and terminal flight
+	// completion. Its defer balances success, ordinary error, converted storage
+	// panic and re-panicked programmer faults alike.
 	runtimeactivity.Begin(sparseGenerationBuildActivity)
 	defer runtimeactivity.End(sparseGenerationBuildActivity)
-
 	report.Coalesced = false
 	var buildErr error
 	defer func() {
@@ -418,7 +503,7 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		}
 		flight.Complete(buildErr)
 	}()
-	buildErr = func() error {
+	buildErr = func() (physicalErr error) {
 		// A physical build that dies part way must not leave a generation in the
 		// only mutable state forever. Cleanup completes before followers wake, so
 		// a retry cannot re-adopt payload the failed writer left behind.
@@ -428,16 +513,44 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generationAbandonTimeout)
 				defer cancel()
 				b.abandon(cleanupCtx, generationID)
+				if failed != nil {
+					cause := physicalErr
+					if cause == nil {
+						// Panic unwinding has no named return error. The outer defer
+						// still completes the flight and re-panics the original value.
+						cause = fmt.Errorf("indexer: payload generation %d exited before publication", generationID)
+					}
+					if err := failed(cleanupCtx, cause); err != nil && physicalErr != nil {
+						// Retain errors.Is for the physical failure. A refused/lost
+						// notification must not make the failed build successful.
+						physicalErr = fmt.Errorf("%w; recording claimed payload failure: %v", physicalErr, err)
+					}
+				}
 			}
 		}()
-
+		if prepare != nil {
+			target, preparedPlan, preparedReport, err := prepare(ctx)
+			if target != nil {
+				defer target.Close()
+			}
+			if err != nil {
+				return err
+			}
+			if target == nil {
+				return fmt.Errorf("indexer: generation preparation returned no content source")
+			}
+			req.Target, plan, report = target, preparedPlan, preparedReport
+			report.GenerationID, report.Coalesced = generationID, false
+		}
 		// A newly allocated generation cannot carry payload yet. When the plan
 		// has no files to index, the masks below completely describe a no-op or
 		// deletion-only layer. A recovered adopted generation may carry partial
 		// payload from a vanished writer, so it remains on the established
 		// recovery path and is re-derived in full.
+		var separation contextSeparation
 		if adopted || len(plan.indexed) > 0 {
-			if err := b.runPass(ctx, req, plan, handle, &report); err != nil {
+			var err error
+			if separation, err = b.runPass(ctx, req, plan, handle, &report); err != nil {
 				return err
 			}
 		}
@@ -445,6 +558,18 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 		// covered by the claims derived from it, and before the producer states
 		// so what it did is what they describe.
 		b.runEnrichment(req, handle, &report)
+		// The context separation has to have decided before the masks are
+		// derived from what remains. In the read-only-context mode it already
+		// ran, inside the pass, against the in-memory corpus — the store never
+		// saw the withheld half. Otherwise it runs here, against the
+		// generation the pass wrote, and withdraws the same set.
+		if !separation.applied {
+			var err error
+			if separation, err = b.separateContextPayload(ctx, req, plan, handle); err != nil {
+				return err
+			}
+		}
+		separation.record(&plan, &report)
 		if err := b.writeMasks(req, plan, handle, &report); err != nil {
 			return err
 		}
@@ -512,11 +637,39 @@ func (b *SparseGenerationBuilder) validate(ctx context.Context, req *BuildReques
 }
 
 // buildPlan is the file set one build walks, plus the paths it claims deleted.
+//
+// indexed is deliberately kept BESIDE the context set rather than derived from
+// it at every use: it is the set the pass walks, and the pass walks the whole
+// closure because resolution through a generation-scoped handle can only bind
+// what the same generation carries. The split is what the generation CLAIMS,
+// and the two answer different questions — "what did this build read" and
+// "what does this generation speak for".
+//
+// Only the read-only half is recorded. The change set is `indexed` minus
+// `context` by definition, and deriving it that way rather than storing it is
+// what keeps a planner that fills `indexed` alone — a full dedicated snapshot,
+// which has no layer below to read context from — correct without knowing this
+// field exists: an empty context set means every walked file is output.
 type buildPlan struct {
-	// indexed is the repo-relative file set the pass walks, sorted.
+	// indexed is the repo-relative file set the pass walks, sorted. It is the
+	// union of the change set and context, minus the deleted paths.
 	indexed []string
+	// context is the repo-relative closure the pass reads to resolve the
+	// change set, sorted, disjoint from the change set. A context path is
+	// read-only by intent: the generation claims nothing about it unless its
+	// own re-derivation disagrees with the layer below.
+	context []string
 	// deleted is the repo-relative set the generation claims removed, sorted.
 	deleted []string
+	// withdrawn is the graph-path set the separation emptied, filled AFTER
+	// the pass rather than by a planner — a planner cannot know it, because
+	// it is decided by comparing what the pass actually produced against the
+	// layer below. Whether the emptying happened in the pass's in-memory
+	// corpus or in the generation afterwards makes no difference here: both
+	// modes fill this through contextSeparation.record. It rides on the plan
+	// so the mask derivation needs no extra parameter; a plan that never
+	// reached the separation leaves it nil and the derivation is unchanged.
+	withdrawn map[string]struct{}
 }
 
 func (b *SparseGenerationBuilder) planFileSetContext(
@@ -596,6 +749,12 @@ func (b *SparseGenerationBuilder) planFileSetContext(
 			return buildPlan{}, report, err
 		}
 		plan.indexed = append(plan.indexed, p)
+		if _, isChange := present[p]; isChange {
+			// The change set is the generation's OUTPUT and is exactly
+			// indexed minus context, so it is not stored a second time.
+			continue
+		}
+		plan.context = append(plan.context, p)
 	}
 	for p := range deleted {
 		if err := ctx.Err(); err != nil {
@@ -604,6 +763,7 @@ func (b *SparseGenerationBuilder) planFileSetContext(
 		plan.deleted = append(plan.deleted, p)
 	}
 	sort.Strings(plan.indexed)
+	sort.Strings(plan.context)
 	sort.Strings(plan.deleted)
 	if err := ctx.Err(); err != nil {
 		return buildPlan{}, report, err
@@ -645,9 +805,29 @@ func (b *SparseGenerationBuilder) runPass(
 	plan buildPlan,
 	handle *store_sqlite.Store,
 	report *BuildReport,
-) error {
+) (contextSeparation, error) {
 	idx := New(handle, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
+
+	// The read-only-context mode. Installing the filter is what lets a pass
+	// writing through a derived generation handle hold its corpus in memory at
+	// all, and it is also the bound on what that corpus may persist: the hook
+	// runs once, after resolution and every subpass, immediately before the
+	// drain, and empties the closure files the pass only read. Whatever it
+	// removes is never written — the drain is the only route from the corpus
+	// to the store, and the node, edge, symbol-FTS, files, clone and
+	// constant-value projections all come out of it.
+	//
+	// When the pass cannot take that route (an oversized closure, a refused
+	// admission, a backend without the bulk path) the hook is simply never
+	// called, separation.applied stays false, and the caller falls back to
+	// withdrawing the same set from the generation after the fact.
+	var separation contextSeparation
+	idx.setPassCorpusFilter(func(corpus *graph.Graph) error {
+		var err error
+		separation, err = b.withholdContextPayload(ctx, req, plan, corpus)
+		return err
+	})
 
 	idx.SetRepoPrefix(req.RepoPrefix)
 	idx.SetWorkspaceID(req.WorkspaceID)
@@ -661,17 +841,18 @@ func (b *SparseGenerationBuilder) runPass(
 		idx.parseAdmission.Store(b.Admissions.parseAdmission.Load())
 		idx.nativeParseAdmission.Store(b.Admissions.nativeParseAdmission.Load())
 	}
-	idx.SetContentSource(newFileSetSource(req.Target, plan.indexed))
+	idx.setContentSourceWithManifests(newFileSetSource(req.Target, plan.indexed), req.Target)
 
 	result, err := idx.IndexCtx(ctx, req.RootPath)
 	if err != nil {
-		return fmt.Errorf("indexer: index generation payload: %w", err)
+		return contextSeparation{}, fmt.Errorf("indexer: index generation payload: %w", err)
 	}
 	if result != nil {
 		report.NodeCount = result.NodeCount
 		report.EdgeCount = result.EdgeCount
 	}
-	return nil
+	report.ContextHeldInMemory = separation.applied
+	return separation, nil
 }
 
 // runEnrichment runs the semantic enrichment stage over the generation's own
@@ -723,6 +904,598 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	out.Partial, out.Disabled, out.Reason = pass.Partial, pass.Disabled, pass.Reason
 }
 
+// contextSeparation is what one run of the read-only-context separation did.
+// It is the same answer whichever corpus the separation ran against, which is
+// what lets the two modes share one policy: the in-memory mode empties the
+// pass corpus before anything is written, the fallback empties the generation
+// after the pass wrote it, and both produce this.
+type contextSeparation struct {
+	// applied is true once the separation has RUN, including when it decided
+	// to withdraw nothing. It is what distinguishes "the in-memory mode
+	// handled this build" from "no filter ever executed".
+	applied bool
+	// withheld is the graph-path set the generation carries nothing for.
+	withheld map[string]struct{}
+	// withheldPaths is withheld, sorted, for the report.
+	withheldPaths []string
+	// retainedPaths are the candidates whose re-derivation disagreed with the
+	// layer below and therefore keep their payload and their claim.
+	retainedPaths []string
+	// nodes and edges count what left the corpus, edges net of the edges INTO
+	// a withheld identity that were restored.
+	nodes, edges int
+}
+
+// contextCorpus is what the separation needs from the corpus it empties. Both
+// the in-memory pass corpus (*graph.Graph) and a generation handle
+// (*store_sqlite.Store) satisfy it, which is the point: the policy below is
+// written once and cannot drift between the two modes.
+//
+// The identity-keyed sidecars are optional capabilities rather than methods
+// here, because the two corpora keep different ones. The in-memory corpus has
+// no symbol FTS at all (the drain derives it from what survives), while the
+// generation handle has one that must be cleaned explicitly.
+type contextCorpus interface {
+	AllNodes() []*graph.Node
+	AllEdges() []*graph.Edge
+	EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int)
+	AddBatch(nodes []*graph.Node, edges []*graph.Edge)
+	DeleteFileMetasByFiles(repoPrefix string, files []string) error
+}
+
+// withholdContextPayload empties the read-only half of one corpus: the closure
+// files the pass only READ, whose re-derivation agrees with the layer below.
+//
+// # What may be withheld, and why that is sound
+//
+// A context file is withheld only when the generation's own re-derivation of
+// it AGREES WITH THE LAYER BELOW, field for field, node for node and edge for
+// edge. Under that precondition the composed view is unchanged: what the
+// generation would have served at the path is exactly what the layer below
+// serves once the path is unclaimed. Everything else keeps today's behaviour —
+// a context file whose resolution genuinely moved stays claimed, payload and
+// all, and is named in ContextRetainedPaths rather than quietly narrowed.
+//
+// The comparison is a conservative optimiser, never a correctness argument of
+// its own: any disagreement it cannot rule out — a node only one side holds, an
+// edge recorded at the path whose source does not live there, a content
+// section whose body lives in a separate index — keeps the file. A build in
+// which nothing compares equal reduces to the behaviour that shipped before
+// this step existed.
+//
+// # The two corpora it runs against
+//
+// Against the in-memory pass corpus (the read-only-context mode, installed by
+// runPass) nothing has been written yet, so the withheld half never reaches
+// the store: no node rows, no edge rows, no files inventory, no symbol FTS, no
+// clone or constant-value projection, no vectors. Against the generation
+// handle (the fallback, when the pass could not take the in-memory route) the
+// rows were already written and this withdraws them, which removes the durable
+// duplication but not the transient write.
+func (b *SparseGenerationBuilder) withholdContextPayload(
+	ctx context.Context,
+	req BuildRequest,
+	plan buildPlan,
+	corpus contextCorpus,
+) (contextSeparation, error) {
+	out := contextSeparation{applied: true}
+	if len(plan.context) == 0 {
+		return out, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return contextSeparation{}, err
+	}
+	contextPaths := make([]string, 0, len(plan.context))
+	candidates := make(map[string]struct{}, len(plan.context))
+	for _, rel := range plan.context {
+		graphPath := builderGraphPath(req.RepoPrefix, rel)
+		contextPaths = append(contextPaths, graphPath)
+		candidates[graphPath] = struct{}{}
+	}
+	// The change set, in graph-path spelling: indexed minus context, plus the
+	// paths the change removed. The comparison needs it to tell a difference
+	// the change caused from one the bounded corpus caused.
+	changedPaths := make(map[string]struct{}, len(plan.indexed)-len(plan.context)+len(plan.deleted))
+	for _, rel := range plan.indexed {
+		graphPath := builderGraphPath(req.RepoPrefix, rel)
+		if _, isContext := candidates[graphPath]; isContext {
+			continue
+		}
+		changedPaths[graphPath] = struct{}{}
+	}
+	for _, rel := range plan.deleted {
+		changedPaths[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
+	}
+
+	carriedNodes := corpus.AllNodes()
+	carried := newBuilderPathPayload(carriedNodes, corpus.AllEdges(), candidates)
+	// File eviction preserves canonical contracts when another owner survives,
+	// including their original FilePath. Context withdrawal requires the whole
+	// path's payload to disappear. Until the corpus offers a separate exact
+	// payload eviction, keep contract-bearing paths as explicit output rather
+	// than partially evicting them and claiming they are read-only context.
+	contractPaths := make(map[string]struct{})
+	for _, node := range carriedNodes {
+		if node != nil && node.Kind == graph.KindContract {
+			contractPaths[node.FilePath] = struct{}{}
+		}
+	}
+	if len(carried.nodesByPath) == 0 && len(carried.edgesByPath) == 0 {
+		return out, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return contextSeparation{}, err
+	}
+	baseNodes := req.Base.GetFileNodesByPaths(contextPaths)
+	if err := ctx.Err(); err != nil {
+		return contextSeparation{}, err
+	}
+	adjacencyIDs := carried.sourceIDs(contextPaths, baseNodes)
+	baseEdges := req.Base.GetOutEdgesByNodeIDs(adjacencyIDs)
+	if err := ctx.Err(); err != nil {
+		return contextSeparation{}, err
+	}
+	// The inbound half of the same question. A path's recorded adjacency is
+	// not only what its symbols point at: an extractor that records incoming
+	// data flow at the destination file puts the edge at THIS path with a
+	// source that lives elsewhere. Reading only the outbound half left every
+	// such path comparing a non-empty carried set against an empty base set,
+	// so nothing was ever withdrawn on a corpus with cross-file value flow.
+	baseInEdges := req.Base.GetInEdgesByNodeIDs(adjacencyIDs)
+	if err := ctx.Err(); err != nil {
+		return contextSeparation{}, err
+	}
+
+	withheld := make(map[string]struct{}, len(contextPaths))
+	var withheldPaths []string
+	for _, graphPath := range contextPaths {
+		if err := ctx.Err(); err != nil {
+			return contextSeparation{}, err
+		}
+		if !carried.holdsPath(graphPath) {
+			// The pass produced nothing for the path at all — an admission the
+			// walk refused (unsupported language, excluded, oversized). There is
+			// no payload to withhold and no re-derivation to compare, so the
+			// generation stays silent about it and PlannedNotCovered keeps
+			// reporting the absence for what it is.
+			continue
+		}
+		if _, hasContract := contractPaths[graphPath]; hasContract {
+			out.retainedPaths = append(out.retainedPaths, graphPath)
+			continue
+		}
+		if carried.matchesBase(graphPath, baseNodes[graphPath], baseEdges, baseInEdges, changedPaths) {
+			withheld[graphPath] = struct{}{}
+			withheldPaths = append(withheldPaths, graphPath)
+			continue
+		}
+		out.retainedPaths = append(out.retainedPaths, graphPath)
+	}
+	sort.Strings(withheldPaths)
+	sort.Strings(out.retainedPaths)
+	if len(withheldPaths) == 0 {
+		return out, nil
+	}
+
+	// The eviction removes every edge touching a withheld node, including the
+	// re-derived calls the CHANGED files make into one. Those belong to the
+	// change set's own payload — the generation claims their file — so they are
+	// captured first and restored after. Edges LEAVING a withheld node are not:
+	// they are the context file's own adjacency, which the layer below serves
+	// again the moment the path is unclaimed.
+	restore := carried.edgesIntoWithdrawn(withheld)
+	nodes, edges := corpus.EvictFiles(withheldPaths)
+	if len(restore) > 0 {
+		corpus.AddBatch(nil, restore)
+	}
+	if err := corpus.DeleteFileMetasByFiles(req.RepoPrefix, withheldPaths); err != nil {
+		return contextSeparation{}, fmt.Errorf("indexer: withhold generation file inventory: %w", err)
+	}
+	// Constant values are keyed by file and survive a node eviction, so they
+	// are removed by path. A corpus without the capability has none to remove.
+	if deleter, ok := corpus.(interface {
+		DeleteConstantValuesByFiles(repoPrefix string, files []string) error
+	}); ok {
+		if err := deleter.DeleteConstantValuesByFiles(req.RepoPrefix, withheldPaths); err != nil {
+			return contextSeparation{}, fmt.Errorf("indexer: withhold generation constant values: %w", err)
+		}
+	}
+	// Symbol FTS is keyed by identity, not by file, so it is removed by id —
+	// and only where the corpus keeps one. The in-memory pass corpus does not:
+	// its FTS rows are derived at the drain from the nodes that survive this
+	// call, so there is nothing to clean.
+	if deleter, ok := corpus.(interface {
+		BatchDeleteSymbolFTS(nodeIDs []string) error
+	}); ok {
+		if ids := carried.nodeIDsAt(withheld); len(ids) > 0 {
+			if err := deleter.BatchDeleteSymbolFTS(ids); err != nil {
+				return contextSeparation{}, fmt.Errorf("indexer: withhold generation symbol index: %w", err)
+			}
+		}
+	}
+	out.withheld = withheld
+	out.withheldPaths = withheldPaths
+	out.nodes = nodes
+	out.edges = edges - len(restore)
+	b.Logger.Debug("indexer: withheld read-only context payload",
+		zap.String("repo", req.RepoPrefix),
+		zap.Int("context_files", len(plan.context)),
+		zap.Int("withheld_files", len(withheldPaths)),
+		zap.Int("retained_files", len(out.retainedPaths)),
+		zap.Int("withheld_nodes", nodes),
+		zap.Int("restored_edges", len(restore)))
+	return out, nil
+}
+
+// record folds one separation into the build report and the plan the mask
+// derivation reads. Both modes go through it, so the report says the same
+// thing whichever ran.
+func (s contextSeparation) record(plan *buildPlan, report *BuildReport) {
+	if !s.applied {
+		return
+	}
+	plan.withdrawn = s.withheld
+	report.ContextPaths = s.withheldPaths
+	report.ContextMasks = len(s.withheldPaths)
+	report.ContextRetainedPaths = s.retainedPaths
+	report.ContextWithdrawnNodes = s.nodes
+	report.ContextWithdrawnEdges = s.edges
+}
+
+// separateContextPayload is the fallback mode: the pass wrote its whole file
+// set into the generation, and this withdraws the read-only half afterwards.
+//
+// It runs when the pass could not take the in-memory route — an oversized
+// closure, a refused shadow admission, a store that does not offer the bulk
+// path — so the sparse build never depends on the optimisation being available
+// and degrades to exactly the behaviour that shipped before it existed.
+func (b *SparseGenerationBuilder) separateContextPayload(
+	ctx context.Context,
+	req BuildRequest,
+	plan buildPlan,
+	handle *store_sqlite.Store,
+) (contextSeparation, error) {
+	return b.withholdContextPayload(ctx, req, plan, handle)
+}
+
+// builderPathPayload is the generation's own payload, grouped by the candidate
+// context paths and nothing else. It is built from the one whole-generation
+// read the mask derivation already performs, so the separation costs no extra
+// query against a sparse generation.
+type builderPathPayload struct {
+	nodesByPath map[string][]*graph.Node
+	edgesByPath map[string][]*graph.Edge
+	nodeIDs     map[string]string
+	// foreignSource marks a candidate path whose recorded adjacency reaches
+	// past what a path-keyed comparison can see: an edge recorded at the path
+	// with NEITHER endpoint among the path's own symbols (an aggregated
+	// resolver stub bound to a synthesised lane), or an edge out of one of the
+	// path's symbols recorded in another file. Either way the comparison below
+	// cannot see the whole picture, so the path is never withdrawn.
+	//
+	// An edge recorded at the path that merely ENTERS one of its symbols from
+	// somewhere else is NOT foreign: it is the file's own recorded adjacency
+	// on the inbound side, which the comparison reads from the layer below
+	// with GetInEdgesByNodeIDs exactly as it reads the outbound side with
+	// GetOutEdgesByNodeIDs. Treating it as foreign is what made the
+	// withdrawal inert on any corpus whose extractor records incoming data
+	// flow at the destination file — on the sustained-workload corpus shape
+	// that is every file, so a ten-file commit wrote its whole 200-file
+	// resolve closure.
+	foreignSource map[string]struct{}
+	// contentBody marks a candidate path with a content section at it. Content
+	// bodies live in a separate index keyed by the file, which this withdrawal
+	// does not reach, so such a path keeps its claim.
+	contentBody map[string]struct{}
+	edges       []*graph.Edge
+}
+
+func newBuilderPathPayload(
+	nodes []*graph.Node, edges []*graph.Edge, candidates map[string]struct{},
+) *builderPathPayload {
+	p := &builderPathPayload{
+		nodesByPath:   make(map[string][]*graph.Node),
+		edgesByPath:   make(map[string][]*graph.Edge),
+		nodeIDs:       make(map[string]string),
+		foreignSource: make(map[string]struct{}),
+		contentBody:   make(map[string]struct{}),
+		edges:         edges,
+	}
+	for _, node := range nodes {
+		if node == nil || node.ID == "" {
+			continue
+		}
+		if _, candidate := candidates[node.FilePath]; !candidate {
+			continue
+		}
+		p.nodesByPath[node.FilePath] = append(p.nodesByPath[node.FilePath], node)
+		p.nodeIDs[node.ID] = node.FilePath
+		if graph.IsContentNode(node) {
+			p.contentBody[node.FilePath] = struct{}{}
+		}
+	}
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		// An edge LEAVING a candidate's symbol but recorded somewhere else is
+		// adjacency the path-keyed comparison below cannot see, and the
+		// withdrawal would drop it without the layer below having a copy that
+		// shows through — the file it was recorded in may itself be claimed.
+		if sourcePath, known := p.nodeIDs[edge.From]; known && sourcePath != edge.FilePath {
+			p.foreignSource[sourcePath] = struct{}{}
+		}
+		if _, candidate := candidates[edge.FilePath]; !candidate {
+			continue
+		}
+		p.edgesByPath[edge.FilePath] = append(p.edgesByPath[edge.FilePath], edge)
+		if p.nodeIDs[edge.From] != edge.FilePath && p.nodeIDs[edge.To] != edge.FilePath {
+			p.foreignSource[edge.FilePath] = struct{}{}
+		}
+	}
+	return p
+}
+
+// holdsPath reports whether the generation carries any payload at a candidate.
+func (p *builderPathPayload) holdsPath(graphPath string) bool {
+	return len(p.nodesByPath[graphPath]) > 0 || len(p.edgesByPath[graphPath]) > 0
+}
+
+// sourceIDs is the identity set whose base adjacency the comparison needs: the
+// symbols the generation re-derived at a candidate path, plus the ones the
+// layer below still has there, so a symbol only one side holds is compared
+// rather than skipped.
+func (p *builderPathPayload) sourceIDs(paths []string, baseNodes map[string][]*graph.Node) []string {
+	seen := make(map[string]struct{}, len(p.nodeIDs))
+	ids := make([]string, 0, len(p.nodeIDs))
+	add := func(id string) {
+		if id == "" {
+			return
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, graphPath := range paths {
+		for _, node := range p.nodesByPath[graphPath] {
+			add(node.ID)
+		}
+		for _, node := range baseNodes[graphPath] {
+			if node != nil {
+				add(node.ID)
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// matchesBase reports whether the generation's re-derivation of one candidate
+// path agrees with the layer below completely enough for the path to be served
+// from below instead.
+func (p *builderPathPayload) matchesBase(
+	graphPath string, baseNodes []*graph.Node,
+	baseOutEdges, baseInEdges map[string][]*graph.Edge,
+	changed map[string]struct{},
+) bool {
+	if _, foreign := p.foreignSource[graphPath]; foreign {
+		return false
+	}
+	if _, content := p.contentBody[graphPath]; content {
+		return false
+	}
+	carriedNodes := p.nodesByPath[graphPath]
+	if len(carriedNodes) != len(baseNodes) {
+		return false
+	}
+	baseByID := make(map[string]*graph.Node, len(baseNodes))
+	for _, node := range baseNodes {
+		if node == nil || node.ID == "" {
+			return false
+		}
+		baseByID[node.ID] = node
+	}
+	for _, node := range carriedNodes {
+		if !builderNodeEquivalent(node, baseByID[node.ID]) {
+			return false
+		}
+	}
+	// Compare the adjacency the path RECORDS, from both sides, keyed the same
+	// way: every edge the generation wrote at the path against every edge the
+	// base recorded there that touches one of the path's symbols.
+	//
+	// Both DIRECTIONS are read, because "recorded at this path" is not the
+	// same question as "leaves one of this path's symbols". An incoming
+	// value-flow edge — a constant, a variable or a function in another file
+	// flowing into a function declared here — is recorded at THIS file with a
+	// source that lives in the other one, and reading only the outbound half
+	// made every such path compare a full carried set against an empty base
+	// set. An edge whose two endpoints both live here appears in both reads,
+	// so the inbound half skips what the outbound half already counted.
+	carriedEdges := p.edgesByPath[graphPath]
+	local := make(map[string]struct{}, len(carriedNodes))
+	for _, node := range carriedNodes {
+		local[node.ID] = struct{}{}
+	}
+	for _, node := range baseNodes {
+		local[node.ID] = struct{}{}
+	}
+	var baseAtPath []*graph.Edge
+	for id := range local {
+		for _, edge := range baseOutEdges[id] {
+			if edge != nil && edge.FilePath == graphPath {
+				baseAtPath = append(baseAtPath, edge)
+			}
+		}
+	}
+	for id := range local {
+		for _, edge := range baseInEdges[id] {
+			if edge == nil || edge.FilePath != graphPath {
+				continue
+			}
+			if _, counted := local[edge.From]; counted {
+				continue // already taken by the outbound half
+			}
+			baseAtPath = append(baseAtPath, edge)
+		}
+	}
+	if len(carriedEdges) != len(baseAtPath) {
+		return false
+	}
+	matched := make([]bool, len(baseAtPath))
+	var leftover []*graph.Edge
+	for _, edge := range carriedEdges {
+		found := false
+		for i, candidate := range baseAtPath {
+			if matched[i] || !builderEdgeEquivalent(edge, candidate) {
+				continue
+			}
+			matched[i], found = true, true
+			break
+		}
+		if !found {
+			leftover = append(leftover, edge)
+		}
+	}
+	// Second pass over what is left: one import statement, two spellings of
+	// the same fact. See builderSameImportRelation.
+	for _, edge := range leftover {
+		found := false
+		for i, candidate := range baseAtPath {
+			if matched[i] || !builderSameImportRelation(edge, candidate, changed) {
+				continue
+			}
+			matched[i], found = true, true
+			break
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// builderSameImportRelation reports whether two import edges from the same
+// statement name the same package through different files of it.
+//
+// An import edge runs from the importing file to ONE file of the imported
+// package, and WHICH file is an artefact of the corpus the resolver saw: a
+// whole index of the tree and a bounded generation pass over a subset of it
+// pick different representatives of the same multi-file package, from the same
+// import statement, for a file neither of them changed. The two edges state
+// the same relation — "this file imports that package" — so a path whose only
+// disagreement with the layer below is of this shape is still served correctly
+// from below, and the pass has no better claim to its representative than the
+// whole index had to its own.
+//
+// The equivalence is deliberately narrow. Both edges must be import edges from
+// the same source, at the same line, with the same metadata, and both targets
+// must be files in the SAME directory — the package the statement names. And
+// neither target may be a path the change set touches: a representative that
+// moved because the change added or removed a file of that package is a real
+// difference, and the layer below may be naming a file the target tree no
+// longer holds.
+func builderSameImportRelation(carried, base *graph.Edge, changed map[string]struct{}) bool {
+	if carried == nil || base == nil {
+		return false
+	}
+	if carried.Kind != graph.EdgeImports || base.Kind != graph.EdgeImports {
+		return false
+	}
+	if carried.To == base.To || carried.To == "" || base.To == "" {
+		return false
+	}
+	if _, touched := changed[carried.To]; touched {
+		return false
+	}
+	if _, touched := changed[base.To]; touched {
+		return false
+	}
+	if path.Dir(carried.To) != path.Dir(base.To) {
+		return false
+	}
+	left, right := *carried, *base
+	left.To, right.To = "", ""
+	return reflect.DeepEqual(left, right)
+}
+
+// edgesIntoWithdrawn returns the edges the eviction will remove that the
+// generation must keep: the ones RECORDED AT A FILE THE GENERATION STILL
+// CLAIMS. The generation's claim over a file is a claim over the whole of
+// that file's recorded adjacency, so an edge the eviction happens to reach
+// through a withdrawn identity must come back — otherwise the claimed file's
+// payload is short an edge the layer below can no longer show through.
+//
+// The rule is stated on the recording file rather than on the source identity
+// because that is what ownership is keyed by. An edge recorded AT a withdrawn
+// path is that path's own entry and stays gone: the layer below serves it
+// again the moment the path is unclaimed. That includes every edge leaving a
+// withdrawn identity — a path whose symbol has an out-edge recorded in
+// another file is marked foreignSource and is never withdrawn in the first
+// place, so "recorded at a withdrawn path" and "leaves a withdrawn identity"
+// name the same edges here.
+func (p *builderPathPayload) edgesIntoWithdrawn(withdrawn map[string]struct{}) []*graph.Edge {
+	isWithdrawn := func(id string) bool {
+		graphPath, known := p.nodeIDs[id]
+		if !known {
+			return false
+		}
+		_, gone := withdrawn[graphPath]
+		return gone
+	}
+	var out []*graph.Edge
+	for _, edge := range p.edges {
+		if edge == nil || (!isWithdrawn(edge.To) && !isWithdrawn(edge.From)) {
+			continue // the eviction does not reach it
+		}
+		if _, gone := withdrawn[edge.FilePath]; gone {
+			continue // the withdrawn path's own adjacency
+		}
+		out = append(out, edge)
+	}
+	return out
+}
+
+// nodeIDsAt lists the identities the generation carried at the withdrawn
+// paths, sorted, so the sidecars keyed by identity can be withdrawn with them.
+func (p *builderPathPayload) nodeIDsAt(withdrawn map[string]struct{}) []string {
+	ids := make([]string, 0, len(p.nodeIDs))
+	for id, graphPath := range p.nodeIDs {
+		if _, gone := withdrawn[graphPath]; gone {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// builderNodeEquivalent compares two rows for the same identity across the two
+// layers. The two volatile fields are cleared rather than compared: the
+// absolute path is the reader's root, which a content source and a checkout
+// spell differently for the same file, and the fetch timestamp is when a row
+// was read. Everything else — location, language, signature, promoted metadata
+// — must agree, because everything else is something the composed view serves.
+func builderNodeEquivalent(carried, base *graph.Node) bool {
+	if carried == nil || base == nil {
+		return carried == base
+	}
+	left, right := *carried, *base
+	left.AbsoluteFilePath, right.AbsoluteFilePath = "", ""
+	left.FetchedAt, right.FetchedAt = time.Time{}, time.Time{}
+	return reflect.DeepEqual(left, right)
+}
+
+// builderEdgeEquivalent is builderNodeEquivalent for adjacency. An edge
+// carries no reader-dependent field, so every one of them is compared.
+func builderEdgeEquivalent(carried, base *graph.Edge) bool {
+	if carried == nil || base == nil {
+		return carried == base
+	}
+	return reflect.DeepEqual(*carried, *base)
+}
+
 // writeMasks derives the generation's ownership claims from the payload it
 // actually carries, then writes them.
 //
@@ -755,12 +1528,21 @@ func (b *SparseGenerationBuilder) runEnrichment(
 // made about a file outside the generation's set: such a file's payload is
 // unchanged by construction, unless the closure was truncated, which is
 // reported as a completeness fact rather than guessed at here.
+//
+// The fourth claim is the one that says nothing. plan.withdrawn names the
+// closure paths separateContextPayload emptied, and each gets a context mask:
+// an explicit "this generation read the path and claims nothing about it". The
+// derivation is unchanged by it — the replace set still comes from the payload
+// and nothing else, which is exactly why the context masks can be trusted:
+// a path whose payload survived the withdrawal turns up in covered and is
+// claimed, so the two sets cannot both name it.
 func (b *SparseGenerationBuilder) writeMasks(
 	req BuildRequest,
 	plan buildPlan,
 	handle *store_sqlite.Store,
 	report *BuildReport,
 ) error {
+	withdrawn := plan.withdrawn
 	covered := make(map[string]struct{})
 	rows, err := handle.FileMetasForRepo(req.RepoPrefix)
 	if err != nil {
@@ -778,12 +1560,21 @@ func (b *SparseGenerationBuilder) writeMasks(
 		}
 	}
 
-	masks := make([]store_sqlite.FileMask, 0, len(covered)+len(plan.deleted))
+	masks := make([]store_sqlite.FileMask, 0, len(covered)+len(plan.deleted)+len(withdrawn))
 	for graphPath := range covered {
 		masks = append(masks, store_sqlite.FileMask{
 			RepoPrefix: req.RepoPrefix, FilePath: graphPath, Mode: store_sqlite.OwnershipReplace,
 		})
 		report.ReplaceMasks++
+	}
+	for graphPath := range withdrawn {
+		if _, carried := covered[graphPath]; carried {
+			return fmt.Errorf(
+				"indexer: generation carries payload at %q while declaring it read-only context", graphPath)
+		}
+		masks = append(masks, store_sqlite.FileMask{
+			RepoPrefix: req.RepoPrefix, FilePath: graphPath, Mode: store_sqlite.OwnershipContext,
+		})
 	}
 	for _, rel := range plan.deleted {
 		graphPath := builderGraphPath(req.RepoPrefix, rel)
@@ -819,6 +1610,18 @@ func (b *SparseGenerationBuilder) writeMasks(
 	report.NodeTombstones = len(tombstones)
 
 	markers, contested := b.unclaimedEdgeSources(req, handle, covered)
+	for _, marker := range markers {
+		// A marker over a context path would claim an outgoing set the layer
+		// no longer carries, so the composition would serve it empty. The
+		// withdrawal is built to make this unreachable; reaching it means the
+		// two halves disagree, which is a build failure rather than a mask to
+		// write and let publish validation catch.
+		if _, isContext := withdrawn[builderMaskKey(marker.SourceID)]; isContext {
+			return fmt.Errorf(
+				"indexer: generation replaces the adjacency of %q at a path it declared read-only context",
+				marker.SourceID)
+		}
+	}
 	if err := handle.SetEdgeSourceMasks(markers); err != nil {
 		return fmt.Errorf("indexer: write generation edge-source masks: %w", err)
 	}
@@ -826,7 +1629,14 @@ func (b *SparseGenerationBuilder) writeMasks(
 	report.ContestedEdgeSources = contested
 
 	for _, rel := range plan.indexed {
-		if _, ok := covered[builderGraphPath(req.RepoPrefix, rel)]; !ok {
+		graphPath := builderGraphPath(req.RepoPrefix, rel)
+		if _, isContext := withdrawn[graphPath]; isContext {
+			// The generation carries nothing at the path on purpose. That is a
+			// declared claim, not the "the walk would not admit this file"
+			// absence PlannedNotCovered reports.
+			continue
+		}
+		if _, ok := covered[graphPath]; !ok {
 			report.PlannedNotCovered = append(report.PlannedNotCovered, rel)
 		}
 	}
@@ -904,6 +1714,30 @@ func builderMaskKey(id string) string {
 	return id
 }
 
+// sourceConfigNarrowingReason is what CapSourceConfig says about the
+// build-configuration inputs that do not come from the state the pass
+// describes. Every such input is named here rather than left as a coverage
+// the generation never had.
+//
+// Both are ADMISSION rules, and both are inert under a content source — what
+// they leave behind is an absence, never a wrong fact. The hierarchical ignore
+// matcher reads per-directory ignore files off disk, and a source serves a
+// revision whose ignore files may differ from the checkout's — or not be on
+// disk at all. The untracked-asset gate asks `git ls-files` of the checkout,
+// which describes a different tree.
+//
+// The compile database, the include-root heuristic, the npm / workspace
+// manifests and the tsconfig / jsconfig path-alias scopes are read through the
+// installed content source and are deliberately absent from this list. They
+// belong on a different axis anyway: each of them decides where an import or
+// an include BINDS, so a reader off the wrong tree lands a present, wrong edge
+// — a resolution defect, not a configuration absence — and naming that risk
+// here, under a capability whose payload is admission, would have pointed a
+// consumer at the wrong claim. There is no residual reader, so there is
+// nothing to declare on resolution either.
+const sourceConfigNarrowingReason = "per-directory ignore files and the untracked-asset gate " +
+	"are not applied under a content source"
+
 // declareProducers records how complete each capability is for this
 // generation. A capability nothing is said about is inherited from the layer
 // below, so silence is a claim too — every capability this build narrows is
@@ -913,16 +1747,6 @@ func (b *SparseGenerationBuilder) declareProducers(
 	handle *store_sqlite.Store,
 	report *BuildReport,
 ) error {
-	// Two admission rules read the working tree rather than the state the pass
-	// describes, so both are inert under a content source and both are named
-	// here rather than left as a coverage the generation never had. The
-	// hierarchical ignore matcher reads per-directory ignore files off disk,
-	// and a source serves a revision whose ignore files may differ from the
-	// checkout's — or not be on disk at all. The untracked-asset gate asks
-	// `git ls-files` of the checkout, which describes a different tree.
-	const configReason = "per-directory ignore files and the untracked-asset gate " +
-		"are not applied under a content source"
-
 	vector := store_sqlite.ProducerCompleteness{
 		Producer: string(graphview.CapSearchVector),
 		State:    store_sqlite.ProducerStateDisabledByConfig,
@@ -957,23 +1781,14 @@ func (b *SparseGenerationBuilder) declareProducers(
 	}
 
 	// Literal and regex search is answered over a working copy on disk rather
-	// than out of the generation: the checkout's coordinator builds a trigram
-	// index over its checkout root and searches that. A generation describing
-	// a checkout therefore serves the capability whole, and one describing a
-	// committed tree nobody has checked out cannot serve it at all — there is
-	// no root to index, and the canonical checkout holds a different tree.
-	text := store_sqlite.ProducerCompleteness{
-		Producer: string(graphview.CapSearchText),
-		State:    store_sqlite.ProducerStateComplete,
-	}
-	if !servesTextSearch(req.Identity) {
-		text.State = store_sqlite.ProducerStateUnavailable
-		text.Reason = "a committed tree has no working copy to run a text search over"
-	}
+	// than out of the generation, so what a generation may say about it — and
+	// whether it may say anything — is decided by textSearchProducer rather
+	// than by the build reaching publish.
+	text, declaresText := textSearchProducer(req.Identity)
 
 	rows := []store_sqlite.ProducerCompleteness{
 		{Producer: string(graphview.CapSourceSnapshot), State: store_sqlite.ProducerStateComplete},
-		{Producer: string(graphview.CapSourceConfig), State: store_sqlite.ProducerStateComplete, Reason: configReason},
+		{Producer: string(graphview.CapSourceConfig), State: store_sqlite.ProducerStateComplete, Reason: sourceConfigNarrowingReason},
 		{Producer: string(graphview.CapSyntaxGraph), State: store_sqlite.ProducerStateComplete},
 		{Producer: string(graphview.CapResolutionLocal), State: store_sqlite.ProducerStateComplete},
 		{Producer: string(graphview.CapIncomingEdges), State: store_sqlite.ProducerStateComplete},
@@ -981,12 +1796,14 @@ func (b *SparseGenerationBuilder) declareProducers(
 		{Producer: string(graphview.CapSearchContent), State: store_sqlite.ProducerStateComplete},
 		vector,
 		similarity,
-		text,
 		{
 			Producer: string(graphview.CapResolutionCrossRepo),
 			State:    store_sqlite.ProducerStateIncomplete,
 			Reason:   "a sparse generation is resolved within one repository",
 		},
+	}
+	if declaresText {
+		rows = append(rows, text)
 	}
 	lsp := lspProducerRow(req.Identity, report.Enrichment)
 	for _, capability := range []graphview.CapabilityID{
@@ -1006,8 +1823,9 @@ func (b *SparseGenerationBuilder) declareProducers(
 		// producers are narrowed; the generation is published either way, and
 		// what a knowingly incomplete capability is worth is the reader's call.
 		truncated := fmt.Sprintf(
-			"the affected closure was truncated at %d files; files past the cap were not re-resolved",
-			report.ClosureCap)
+			"the affected closure was truncated at %d files (cap from %s); "+
+				"files past the cap were not re-resolved",
+			report.ClosureCap, builderClosureCapSourceLabel(report.ClosureCapSource))
 		for i := range rows {
 			switch rows[i].Producer {
 			case string(graphview.CapResolutionLocal), string(graphview.CapIncomingEdges):
@@ -1132,12 +1950,83 @@ func enrichesWorkingCopy(identity GenerationIdentity) bool {
 	return identity.OwnerKind != refViewOwnerKind
 }
 
-// servesTextSearch reports whether a generation describes a state some working
-// copy holds on disk. A checkout's layers describe a checkout, whose
-// coordinator indexes its root; a ref view describes a committed tree nobody
-// has checked out, and nothing on disk holds it.
+// noWorkingCopyTextSearchReason is why a ref view cannot serve text search at
+// all: no checkout holds its tree, so there is no root to index.
+const noWorkingCopyTextSearchReason = "a committed tree has no working copy to run a text search over"
+
+// servesTextSearch reports whether a generation's own bytes are the working
+// copy a text search reads.
+//
+// Only a working-tree layer's are. The searcher an answer comes from is built
+// over a checkout root (checkout_text_search.go, trigram.Build(c.root, paths)),
+// so it describes the bytes on disk and nothing else, and a dirty layer IS
+// those bytes by construction — its lower-view fingerprint is sampled from the
+// same working copy. Every other identity names a committed tree: a commit
+// layer names the checkout's HEAD tree, a dedicated base the tree the graph's
+// corpus was built at, a ref view a tree nobody has checked out at all.
 func servesTextSearch(identity GenerationIdentity) bool {
-	return identity.OwnerKind != refViewOwnerKind
+	if identity.OwnerKind == refViewOwnerKind {
+		return false
+	}
+	return identity.GenerationKind == DirtyLayerGenerationKind
+}
+
+// textSearchProducer is what a generation declares about literal and regex
+// search, and whether it declares anything at all.
+//
+// Three answers, and the third one is silence:
+//
+//   - A working-tree layer IS the working copy the searcher reads, so it claims
+//     the capability whole.
+//   - A ref view names a tree no checkout holds. Nothing on disk can answer for
+//     it, so it withdraws the capability outright — that withdrawal is what
+//     makes a committed-tree view refuse a text search instead of answering out
+//     of somebody else's working copy.
+//   - Every other identity — a checkout's commit layer, a dedicated base, a
+//     kind this build does not recognise — declares NOTHING. It neither serves
+//     the capability nor withdraws it, because the capability is a property of
+//     the CHECKOUT rather than of any one layer in its stack: the searcher is
+//     addressed by checkout id, over a corpus composed from every routed layer
+//     (checkout_text_search.go textCorpus), and the layer that describes the
+//     working copy sits above these.
+//
+// The silence is deliberate and it is load-bearing, not a shortcut, and the
+// reader is what makes it mean something. For every OTHER capability a view's
+// completeness is the WORST state any generation in its stack declares
+// (graphview/materialize.go, Materializer.completeness), and a checkout view is
+// composed of the commit layer, the working-tree layer and the whole ancestry
+// beneath them (MaterializeCheckout -> assemble). A commit layer or dedicated
+// base that narrowed the capability under that rule would narrow every live
+// routed view stacked on top of it, and refuse a search the checkout can answer
+// exactly — a false negative in place of a false positive. Declaring nothing
+// says the honest thing instead: this layer is not the one that answers.
+//
+// For CapSearchText the reader does not worst-case at all: the TOP layer of the
+// stack decides, and its silence is read as a denial rather than as an
+// inheritance (Materializer.completeness). That is what makes a silent commit
+// layer or dedicated base say the one thing silence could not say on its own —
+// a view assembled WITHOUT a working-tree layer over it is reading a committed
+// tree while the root is free to hold edits that tree does not describe — while
+// leaving the same layer harmless underneath a working-tree layer that does
+// claim the capability. GrepCheckout (checkout_text_search.go) enforces the
+// same rule from the route, for the window in which a coordinator has withdrawn
+// the working-tree slot.
+func textSearchProducer(identity GenerationIdentity) (store_sqlite.ProducerCompleteness, bool) {
+	switch {
+	case identity.OwnerKind == refViewOwnerKind:
+		return store_sqlite.ProducerCompleteness{
+			Producer: string(graphview.CapSearchText),
+			State:    store_sqlite.ProducerStateUnavailable,
+			Reason:   noWorkingCopyTextSearchReason,
+		}, true
+	case servesTextSearch(identity):
+		return store_sqlite.ProducerCompleteness{
+			Producer: string(graphview.CapSearchText),
+			State:    store_sqlite.ProducerStateComplete,
+		}, true
+	default:
+		return store_sqlite.ProducerCompleteness{}, false
+	}
 }
 
 // builderGraphPath prefixes a repo-relative slash path into the graph

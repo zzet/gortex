@@ -13,10 +13,19 @@ import (
 // jsconfig `compilerOptions.paths` alias (or a `baseUrl`-rooted bare
 // specifier) declared in the importing file's nearest-ancestor config to
 // the repo-prefixed, extension-stripped file stem it targets. Returns ""
-// when no alias applies. The tsconfig alias collection is loaded once,
-// lazily, and shared via the package-level cache keyed on repo root path.
+// when no alias applies.
+//
+// The collection comes from the tree this Indexer is indexing — the installed
+// content source when there is one, the working copy otherwise — so a
+// generation built from a committed tree expands its aliases through that
+// tree's tsconfig / jsconfig rather than through whatever the checkout holds.
+// Reading the checkout here would not leave an edge missing: it would land a
+// present, WRONG edge, on the file the checkout's config names. The
+// working-copy collection is still loaded once, lazily, and shared via the
+// package-level cache keyed on repo root path; a snapshot's is memoised on the
+// Indexer that owns the source (see Indexer.tsAliasCollection).
 func (idx *Indexer) resolvePathAliasImport(callerFile, specifier string) string {
-	return resolveTSPathAlias(loadTSAliasCollection(idx.rootPath), idx.repoPrefix, callerFile, specifier)
+	return resolveTSPathAlias(idx.tsAliasCollection(), idx.repoPrefix, callerFile, specifier)
 }
 
 // pathAliasResolver builds the resolver.PathAliasResolver for the

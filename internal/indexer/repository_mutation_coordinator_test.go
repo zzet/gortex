@@ -439,7 +439,7 @@ func TestIndexCtxWaitsForRepositoryMutationLane(t *testing.T) {
 	release := make(chan struct{})
 	holderDone := make(chan error, 1)
 	go func() {
-		holderDone <- idx.coordinateRepositoryMutation(context.Background(), func() error {
+		holderDone <- idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 			close(entered)
 			<-release
 			return nil
@@ -482,7 +482,7 @@ func TestRepositoryMutationLaneSurvivesIndexerReplacement(t *testing.T) {
 	releaseOriginal := make(chan struct{})
 	originalDone := make(chan error, 1)
 	go func() {
-		originalDone <- original.coordinateRepositoryMutation(context.Background(), func() error {
+		originalDone <- original.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 			close(enteredOriginal)
 			<-releaseOriginal
 			return nil
@@ -502,7 +502,7 @@ func TestRepositoryMutationLaneSurvivesIndexerReplacement(t *testing.T) {
 	enteredReplacement := make(chan struct{})
 	replacementDone := make(chan error, 1)
 	go func() {
-		replacementDone <- replacement.coordinateRepositoryMutation(context.Background(), func() error {
+		replacementDone <- replacement.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 			close(enteredReplacement)
 			return nil
 		})
@@ -537,7 +537,7 @@ func TestRepositoryMutationKeepsExistingWatcherOnSharedLaneAfterReplacement(t *t
 	mi.indexers[prefix] = replacement
 
 	var called atomic.Bool
-	err := existing.coordinateRepositoryMutation(context.Background(), func() error {
+	err := existing.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		called.Store(true)
 		return nil
 	})

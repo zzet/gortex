@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -105,6 +107,17 @@ func maybeCompactStore(g graph.Store, logger *zap.Logger) {
 		zap.Uint64("disk_avail_bytes", avail))
 	start := time.Now()
 	if err := c.Compact(); err != nil {
+		// A deferral is not a failure and must not be logged as one: the store
+		// was mid-publish or mid-build, the maintenance lane declined to
+		// rewrite the file underneath it, and the freelist is still there to
+		// reclaim at the next boot. Distinguishing the two is what keeps the
+		// warning meaningful — an operator seeing it should be able to trust
+		// that VACUUM actually tried and lost.
+		if errors.Is(err, store_sqlite.ErrMaintenanceBusy) {
+			logger.Info("daemon: store compaction deferred — the store was busy",
+				zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+			return
+		}
 		// Non-fatal by design: a failed VACUUM leaves the store exactly as it
 		// was (the freelist remains reusable), so boot continues.
 		logger.Warn("daemon: store compaction failed — continuing boot",

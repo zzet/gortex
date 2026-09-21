@@ -71,6 +71,13 @@ type daemonState struct {
 	// teardown chain (savings flush, backend close) at daemon shutdown.
 	shared *serverstack.SharedServer
 
+	// basePublisher publishes each dedicated repository's initial committed
+	// base once that repository's warmup index is complete. It is held here
+	// because warmup is where the per-repository completion signal is, and
+	// because a test needs to join the publications the daemon started.
+	// nil when the stack installed no publisher runtime.
+	basePublisher *indexer.InitialBasePublisher
+
 	// backendPath is the graph store file this daemon actually opened, with
 	// --backend-path already resolved. Published in the daemon's runtime
 	// record so out-of-band readers (`gortex repos`) can find the same store
@@ -125,7 +132,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 		return nil, fmt.Errorf("build server stack: %w", err)
 	}
 
-	return &daemonState{
+	state := &daemonState{
 		graph:               ss.Graph,
 		indexer:             ss.Indexer,
 		multiIndexer:        ss.MultiIndexer,
@@ -137,7 +144,22 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 		backendPath:         ss.StorePath,
 		resolverLSPRegistry: ss.ResolverLSPRegistry,
 		lspRouter:           ss.LSPRouter,
-	}, nil
+	}
+	// Bind the initial committed-base publisher to the runtime NewSharedServer
+	// installed. Constructing it here publishes nothing: warmup schedules one
+	// publication per repository once that repository's generation-0 index is
+	// complete. A stack without the runtime (a non-sqlite backend, or no
+	// MultiIndexer at all) has nothing to publish under, and the daemon runs
+	// exactly as it did before.
+	if state.lifecycle != nil {
+		publisher, perr := indexer.NewInitialBasePublisher(state.lifecycle)
+		if perr != nil {
+			logger.Warn("daemon: no committed-base publisher; dedicated bases stay unpublished", zap.Error(perr))
+		} else {
+			state.basePublisher = publisher
+		}
+	}
+	return state, nil
 }
 
 const daemonStartupHeartbeatInterval = 2 * time.Second
@@ -700,6 +722,15 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							priorMtimes = nil
 						}
 						pathFn := "track"
+						// indexed names the repo prefix whose generation-0
+						// index this dispatch just brought up to date, and is
+						// empty when it did not. It is the completion signal
+						// the committed-base publication waits on: a base is
+						// published from a Git tree, not from generation 0,
+						// but its identity names the checkout's committed tree
+						// and its builder runs against this repository's own
+						// admissions, so both must be settled first.
+						indexed := ""
 						if priorMtimes != nil {
 							pathFn = "reconcile"
 							res, err := state.multiIndexer.ReconcileRepoCtx(batchCtx, entry, priorMtimes)
@@ -717,6 +748,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 								changedRepos.Add(1)
 								filesReindexed.Add(int64(reconcileFileCount(res)))
 								deltaFrontier.record(res)
+								indexed = warmupRepoPrefix(state, entry, res.RepoPrefix)
 								if res.RepoPrefix != "" {
 									changedPrefixes.Store(res.RepoPrefix, struct{}{})
 								} else {
@@ -726,6 +758,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 								// Warm no-op path: the repo re-indexed nothing, so its
 								// graph is served straight from the persisted store and
 								// no global pass has to re-run for it.
+								prefix := ""
+								if res != nil {
+									prefix = res.RepoPrefix
+								}
+								indexed = warmupRepoPrefix(state, entry, prefix)
 							}
 						} else {
 							// No prior mtimes → full cold (re)index of this repo,
@@ -741,9 +778,22 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 								// FileCount is the whole repo's file-level work.
 								filesReindexed.Add(int64(res.FileCount))
 								changedPrefixes.Store(res.RepoPrefix, struct{}{})
+								indexed = warmupRepoPrefix(state, entry, res.RepoPrefix)
 							} else {
 								scopeUnknown.Store(true)
 							}
+						}
+						// Schedule, do not publish. A committed base is a full
+						// index of a committed tree; running it here would put
+						// a second whole-repository index in front of the
+						// readiness flip. Schedule only appends to an unbounded
+						// pending list — it cannot park this worker, whatever
+						// the repository count — and nothing is drained until
+						// BeginDraining below, which runs after markReady. The
+						// runtime cancels the publisher the moment publisher
+						// admission closes, so shutdown stays bounded.
+						if indexed != "" {
+							state.basePublisher.Schedule(indexed)
 						}
 						elapsed := time.Since(repoStart)
 						if elapsed > 2*time.Second {
@@ -976,6 +1026,19 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if markReady != nil && resolveOK {
 		markReady()
 	}
+
+	// Committed-base publication starts HERE, after the readiness flip, and
+	// not in the dispatch that scheduled it. The dispatch runs upstream of
+	// markReady, so draining there would put one full index of a committed
+	// tree per dedicated repository in front of the moment the graph becomes
+	// queryable. Releasing the queue after the flip makes "ready, then
+	// publish" an ordering the code guarantees rather than one the scheduler
+	// usually wins.
+	//
+	// Unconditional on purpose: a resolve that failed (resolveOK == false) or
+	// a caller that passed no markReady still gets its bases published —
+	// readiness is what publication must not precede, not what it depends on.
+	state.basePublisher.BeginDraining()
 
 	// Drain deferred per-repo passes (semantic enrich / contract
 	// extract+commit). These finish after ready: enrichment is a precision
@@ -1322,6 +1385,23 @@ func publishReadinessPhase(state *daemonState, phase string, ready bool, extra m
 // mtimes for the repo (fresh cold start). When non-nil it short-
 // circuits the gob-snapshot lookup so the warm path is driven by
 // data the backend persisted itself.
+// warmupRepoPrefix names the repository one warmup dispatch just indexed.
+//
+// The indexer's own result is authoritative when it carries a prefix; a warm
+// no-op reconcile does not always produce one, so the configured entry's
+// effective prefix is the fallback. It is the same derivation the resolver-LSP
+// helper registration above uses, so the two cannot disagree about which
+// repository an entry is.
+func warmupRepoPrefix(state *daemonState, entry config.RepoEntry, reported string) string {
+	if reported != "" {
+		return reported
+	}
+	if state == nil || state.configManager == nil {
+		return ""
+	}
+	return strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
+}
+
 func priorMtimesFromStore(g graph.Store, cm *config.ConfigManager, entry config.RepoEntry, logger *zap.Logger) map[string]int64 {
 	reader, ok := g.(graph.FileMtimeReader)
 	if !ok {

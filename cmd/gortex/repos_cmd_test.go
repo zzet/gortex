@@ -559,3 +559,68 @@ func TestRunWorkspaceList_JSON(t *testing.T) {
 	assert.Equal(t, "default", p.Source)
 	assert.Contains(t, p.Workspace, "default")
 }
+
+// TestRunRepos_DeclaresItsFreshnessIsBaseOnly pins the declaration, not the
+// limitation.
+//
+// `gortex repos` reads repo_index_state through a door that is base-only by
+// construction (store_sqlite.RepoIndexStateBaseViewGen), so a daemon serving
+// routed worktree views reports those working copies from their family's BASE
+// rows. That is deliberate and stays. What must not happen is presenting it as
+// the checkout's own freshness, so every output shape says what it is:
+// --json carries freshness_scope on every entry, the table form declares it,
+// and the help text explains it.
+func TestRunRepos_DeclaresItsFreshnessIsBaseOnly(t *testing.T) {
+	base := t.TempDir()
+	repoDir := filepath.Join(base, "alpha")
+	head := gitInitRepo(t, repoDir)
+	reposTestEnv(t, []config.RepoEntry{{Path: repoDir, Name: "alpha"}})
+	seedIndexState(t, "alpha", head, false, time.Now().Truncate(time.Second))
+
+	t.Run("json entries carry the scope", func(t *testing.T) {
+		reposJSON = true
+		t.Cleanup(func() { reposJSON = false })
+		cmd, buf := newReposCmd()
+		require.NoError(t, runRepos(cmd, nil))
+
+		var got []repoStatus
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+		require.Len(t, got, 1)
+		assert.Equal(t, daemon.ProbeViewBase, got[0].FreshnessScope,
+			"the scope must be named in the machine-readable shape, with the probe surface's own word for this corpus")
+
+		// Emitted unconditionally: an absent field means "an older gortex that
+		// did not say", which a consumer must be able to tell from "base".
+		var raw []map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &raw))
+		_, present := raw[0]["freshness_scope"]
+		assert.True(t, present, "freshness_scope must not be omitted when it holds the default")
+	})
+
+	t.Run("the table form declares it", func(t *testing.T) {
+		reposJSON = false
+		cmd, buf := newReposCmd()
+		require.NoError(t, runRepos(cmd, nil))
+		out := buf.String()
+		assert.Contains(t, out, "base",
+			"the table form must name the corpus its freshness columns describe: %q", out)
+		assert.Contains(t, out, "explain-view",
+			"the note must point at the verb that answers the worktree's own view: %q", out)
+	})
+
+	t.Run("the help text explains it", func(t *testing.T) {
+		assert.Contains(t, reposCmd.Long, "BASE corpus only",
+			"the command's own help must declare the scope of what it reports")
+		assert.Contains(t, reposCmd.Long, "explain-view")
+	})
+}
+
+// TestReposFreshnessScopeIsDerivedFromTheReadDoor keeps the declaration and the
+// predicate from drifting apart: the label is computed from the same constant
+// the SQL predicate is built with, so a door that started reading a different
+// generation would relabel itself rather than keep saying "base".
+func TestReposFreshnessScopeIsDerivedFromTheReadDoor(t *testing.T) {
+	assert.Equal(t, daemon.ProbeViewBase, reposScopeName(store_sqlite.RepoIndexStateBaseViewGen))
+	assert.Equal(t, "view_gen:7", reposScopeName(7),
+		"a non-base generation must not keep the base label")
+}

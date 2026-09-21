@@ -2,21 +2,17 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
-	"fmt"
-	_ "modernc.org/sqlite"
-	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 )
+
+// The private-daemon fixture this test drives lives in
+// issue767_fixture_shared_test.go; only the idle measurement itself is here.
 
 // TestIssue767IdleIOIntegration launches only explicitly supplied binaries.
 // Every process owns private XDG directories, SQLite storage and a Git fixture.
@@ -122,451 +118,6 @@ func issue767RequiredTimeout(idle time.Duration, baseline bool) time.Duration {
 	return time.Duration(variants) * (min(idle, time.Minute) + idle + 3*time.Minute)
 }
 
-type issue767Fixture struct {
-	t                                    *testing.T
-	binary, root, primary, linked, store string
-	env                                  []string
-	cmd                                  *exec.Cmd
-	cancel                               context.CancelFunc
-	done                                 chan error
-	log                                  *os.File
-	run                                  int
-	lastOutput                           string
-}
-
-func newIssue767Fixture(t *testing.T, binary string) *issue767Fixture {
-	t.Helper()
-	parent := os.Getenv("GORTEX_ISSUE767_ARTIFACT_DIR")
-	preserve := parent != ""
-	if !preserve {
-		parent = "/tmp"
-	}
-	var err error
-	parent, err = filepath.Abs(parent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(parent, 0700); err != nil {
-		t.Fatal(err)
-	}
-	root, err := os.MkdirTemp(parent, "gx767-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err = filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !preserve {
-		t.Cleanup(func() { _ = os.RemoveAll(root) })
-	}
-	f := &issue767Fixture{t: t, binary: binary, root: root, primary: filepath.Join(root, "repo"), linked: filepath.Join(root, "linked"), store: filepath.Join(root, "store.sqlite")}
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "GORTEX_") || strings.HasPrefix(key, "XDG_") || strings.HasPrefix(key, "GIT_") {
-			continue
-		}
-		f.env = append(f.env, entry)
-	}
-	f.env = append(f.env,
-		"XDG_CONFIG_HOME="+filepath.Join(root, "config"), "XDG_DATA_HOME="+filepath.Join(root, "data"), "XDG_CACHE_HOME="+filepath.Join(root, "cache"),
-		"GORTEX_DAEMON_PPROF_ADDR=127.0.0.1:0", "GORTEX_RECONCILE_INTERVAL=5s",
-		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+filepath.Join(root, "gitconfig"), "GIT_TERMINAL_PROMPT=0", "GOWORK=off", "NO_COLOR=1", "CI=1")
-	f.write(filepath.Join(root, "gitconfig"), "[user]\n\tname = Issue767 Test\n\temail = issue767@example.invalid\n[commit]\n\tgpgsign = false\n")
-	f.write(filepath.Join(f.primary, "go.mod"), "module example.invalid/issue767\n\ngo 1.24\n")
-	f.write(filepath.Join(f.primary, "marker.go"), issue767MarkerSource("Issue767PrimaryMarker"))
-	for i := 0; i < 32; i++ {
-		f.write(filepath.Join(f.primary, fmt.Sprintf("file%02d.go", i)), fmt.Sprintf("package fixture\nfunc Issue767Target%02d() int { return %d }\nfunc Issue767Caller%02d() int { return Issue767Target00() }\n", i, i, i))
-	}
-	f.git(f.primary, "init", "-b", "main")
-	f.git(f.primary, "add", ".")
-	f.git(f.primary, "commit", "-m", "isolated fixture")
-	// Match configured cold startup; runtime track is a separate scenario.
-	f.write(filepath.Join(root, "config", "gortex", "config.yaml"), "repos:\n  - path: "+strconv.Quote(f.primary)+"\n    name: issue767\n")
-	t.Cleanup(f.stop)
-	t.Logf("isolated fixture artifacts: %s", root)
-	return f
-}
-
-func issue767MarkerSource(names ...string) string {
-	source := "package fixture\n"
-	for _, name := range names {
-		source += "func " + name + "() int { return Issue767Target00() }\n"
-	}
-	return source
-}
-
-func (f *issue767Fixture) write(path, content string) {
-	f.t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		f.t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		f.t.Fatal(err)
-	}
-}
-
-func (f *issue767Fixture) git(dir string, args ...string) {
-	f.t.Helper()
-	ctx, cancel := context.WithTimeout(f.t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir, cmd.Env = dir, f.env
-	if output, err := cmd.CombinedOutput(); err != nil {
-		f.t.Fatalf("fixture git %v: %v\n%s", args, err, output)
-	}
-}
-
-func (f *issue767Fixture) command(timeout time.Duration, dir string, args ...string) []byte {
-	f.t.Helper()
-	output, err := f.tryCommand(timeout, dir, args...)
-	if err != nil {
-		f.t.Fatalf("isolated CLI %v: %v\n%s", args, err, output)
-	}
-	return output
-}
-
-func (f *issue767Fixture) tryCommand(timeout time.Duration, dir string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(f.t.Context(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, f.binary, args...)
-	cmd.Dir, cmd.Env = dir, f.env
-	output, err := cmd.CombinedOutput()
-	f.lastOutput = string(output)
-	if len(f.lastOutput) > 4096 {
-		f.lastOutput = f.lastOutput[len(f.lastOutput)-4096:]
-	}
-	return output, err
-}
-
-func (f *issue767Fixture) start() {
-	f.t.Helper()
-	f.run++
-	var err error
-	f.log, err = os.Create(filepath.Join(f.root, fmt.Sprintf("daemon-%d.log", f.run)))
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(f.t.Context())
-	if deadline, ok := f.t.Deadline(); ok {
-		cancel()
-		ctx, cancel = context.WithDeadline(f.t.Context(), deadline.Add(-time.Minute))
-	}
-	f.cancel = cancel
-	cmd := exec.CommandContext(ctx, f.binary, "daemon", "start", "--embeddings=false", "--backend", "sqlite", "--backend-path", f.store, "--no-progress")
-	// Global testing timeout bypasses Cleanup. This captured child receives
-	// SIGINT and a bounded forced exit before the parent testing deadline.
-	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
-	cmd.WaitDelay = 10 * time.Second
-	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = f.primary, f.env, f.log, f.log
-	if err := cmd.Start(); err != nil {
-		cancel()
-		_ = f.log.Close()
-		f.t.Fatal(err)
-	}
-	f.cmd, f.done = cmd, make(chan error, 1)
-	done := f.done
-	go func() { done <- cmd.Wait() }()
-	f.await("isolated daemon socket", time.Minute, func() bool {
-		select {
-		case err := <-f.done:
-			f.cmd = nil
-			_ = f.log.Close()
-			f.t.Fatalf("isolated daemon exited during start: %v; log %s", err, f.log.Name())
-		default:
-		}
-		_, err := f.tryCommand(5*time.Second, f.primary, "daemon", "status", "--no-progress")
-		return err == nil
-	})
-}
-
-func (f *issue767Fixture) stop() {
-	if cancel := f.cancel; cancel != nil {
-		f.cancel = nil
-		defer cancel()
-	}
-	if f.cmd == nil {
-		return
-	}
-	cmd, done := f.cmd, f.done
-	f.cmd = nil
-	_ = cmd.Process.Signal(os.Interrupt)
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		_ = cmd.Process.Kill()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			f.t.Errorf("isolated child %d did not exit after kill", cmd.Process.Pid)
-		}
-		f.t.Errorf("isolated child %d required force kill", cmd.Process.Pid)
-	}
-	_ = f.log.Close()
-}
-
-func (f *issue767Fixture) await(label string, timeout time.Duration, ready func() bool) {
-	f.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ready() {
-			return
-		}
-		select {
-		case <-f.t.Context().Done():
-			f.t.Fatal(f.t.Context().Err())
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
-	f.t.Fatalf("timed out waiting for %s; artifacts %s; last CLI response: %s", label, f.root, f.lastOutput)
-}
-
-func (f *issue767Fixture) searchHasSymbol(root, name string) bool {
-	found, err := f.trySearchSymbol(root, name)
-	return err == nil && found
-}
-
-func (f *issue767Fixture) trySearchSymbol(root, name string) (bool, error) {
-	request := map[string]any{"operation": "symbols", "query": name, "options": map[string]any{"limit": 10, "query_class": "symbol", "expand": "off"}}
-	if root != f.primary {
-		request["view"] = map[string]any{"kind": "worktree", "path": root}
-	}
-	payload, err := json.Marshal(request)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	output, err := f.tryCommand(10*time.Second, root, "call", "search", "--index", root, "--json", string(payload), "--format", "json")
-	if err != nil {
-		return false, fmt.Errorf("search command: %w: %s", err, output)
-	}
-	var value any
-	if err := json.Unmarshal(output, &value); err != nil {
-		return false, fmt.Errorf("search response: %w: %s", err, output)
-	}
-	found, fallback := issue767JSONEvidence(value, name)
-	if fallback {
-		return false, errors.New("search returned fallback or tool error")
-	}
-	if root != f.primary && !issue767JSONExact(value) {
-		return false, errors.New("automatic checkout search did not prove exact freshness")
-	}
-	if found && !issue767JSONSource(value, name, root) {
-		return false, errors.New("symbol did not belong to selected source root and repository")
-	}
-	return found, nil
-}
-
-func issue767JSONEvidence(value any, name string) (found, fallback bool) {
-	merge := func(child any) {
-		childFound, childFallback := issue767JSONEvidence(child, name)
-		found, fallback = found || childFound, fallback || childFallback
-	}
-	switch value := value.(type) {
-	case map[string]any:
-		exact, hasExact := value["exact"].(bool)
-		fallback = hasExact && !exact
-		if code, ok := value["error_code"].(string); ok && code != "" {
-			fallback = true
-		}
-		if isError, ok := value["isError"].(bool); ok && isError {
-			fallback = true
-		}
-		found = value["name"] == name
-		for _, child := range value {
-			merge(child)
-		}
-	case []any:
-		for _, child := range value {
-			merge(child)
-		}
-	case string:
-		var child any
-		if strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[") {
-			if json.Unmarshal([]byte(value), &child) == nil {
-				merge(child)
-			}
-		}
-	}
-	return found, fallback
-}
-
-func issue767JSONExact(value any) bool {
-	switch value := value.(type) {
-	case map[string]any:
-		if exact, ok := value["exact"].(bool); ok && exact {
-			return true
-		}
-		for _, child := range value {
-			if issue767JSONExact(child) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range value {
-			if issue767JSONExact(child) {
-				return true
-			}
-		}
-	case string:
-		var child any
-		if (strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[")) && json.Unmarshal([]byte(value), &child) == nil {
-			return issue767JSONExact(child)
-		}
-	}
-	return false
-}
-
-func issue767JSONSource(value any, name, root string) bool {
-	switch value := value.(type) {
-	case map[string]any:
-		if value["name"] == name && value["repo_prefix"] == "issue767" {
-			path, ok := value["absolute_file_path"].(string)
-			if ok && filepath.Clean(path) == filepath.Join(root, "marker.go") {
-				return true
-			}
-		}
-		for _, child := range value {
-			if issue767JSONSource(child, name, root) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range value {
-			if issue767JSONSource(child, name, root) {
-				return true
-			}
-		}
-	case string:
-		var child any
-		if (strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[")) && json.Unmarshal([]byte(value), &child) == nil {
-			return issue767JSONSource(child, name, root)
-		}
-	}
-	return false
-}
-
-func (f *issue767Fixture) awaitSymbol(root, name string) {
-	f.t.Helper()
-	f.await("selected symbol "+name, 2*time.Minute, func() bool { return f.searchHasSymbol(root, name) })
-}
-
-func (f *issue767Fixture) openReadOnly() *sql.DB {
-	f.t.Helper()
-	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(f.store), RawQuery: "mode=ro"}
-	db, err := sql.Open("sqlite", u.String())
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	f.t.Cleanup(func() { _ = db.Close() })
-	return db
-}
-
-func (f *issue767Fixture) awaitRemoved() {
-	db := f.openReadOnly()
-	defer db.Close()
-	f.await("removed checkout cleanup", 2*time.Minute, func() bool {
-		ctx, cancel := context.WithTimeout(f.t.Context(), time.Second)
-		defer cancel()
-		var count int
-		return db.QueryRowContext(ctx, "SELECT COUNT(*) FROM checkouts WHERE root_path=?", f.linked).Scan(&count) == nil && count == 0
-	})
-}
-
-type issue767GenerationSnapshot struct {
-	Count, Max, Sequence                    int64
-	Nodes, Edges, RefFacts, PrimaryRefFacts int64
-}
-
-func issue767ReadGenerations(ctx context.Context, db *sql.DB) (issue767GenerationSnapshot, error) {
-	result := issue767GenerationSnapshot{Sequence: -1}
-	err := db.QueryRowContext(ctx, "SELECT COUNT(*), COALESCE(MAX(generation_id),0) FROM view_generations").Scan(&result.Count, &result.Max)
-	if err != nil {
-		return result, err
-	}
-	err = db.QueryRowContext(ctx, "SELECT (SELECT COUNT(*) FROM nodes), (SELECT COUNT(*) FROM edges), (SELECT COUNT(*) FROM ref_facts), (SELECT COUNT(*) FROM ref_facts WHERE view_gen=0 AND repo_prefix='issue767')").Scan(&result.Nodes, &result.Edges, &result.RefFacts, &result.PrimaryRefFacts)
-	if err != nil {
-		return result, err
-	}
-	err = db.QueryRowContext(ctx, "SELECT seq FROM sqlite_sequence WHERE name='view_generations'").Scan(&result.Sequence)
-	if err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-func (f *issue767Fixture) settle() {
-	db := f.openReadOnly()
-	defer db.Close()
-	var previous issue767GenerationSnapshot
-	stable := 0
-	f.await("three stable generation samples", 2*time.Minute, func() bool {
-		ctx, cancel := context.WithTimeout(f.t.Context(), 3*time.Second)
-		defer cancel()
-		current, err := issue767ReadGenerations(ctx, db)
-		if err != nil {
-			return false
-		}
-		if current == previous {
-			stable++
-		} else {
-			stable = 0
-		}
-		previous = current
-		if stable < 3 {
-			time.Sleep(5 * time.Second)
-		}
-		return stable >= 3
-	})
-}
-
-type issue767ProcessIO struct {
-	BytesWritten        uint64
-	LogicalBytesWritten *uint64
-	StartTicks          uint64
-}
-
-const issue767DarwinIOScript = "import ctypes,json,sys\nfields='user_time system_time pkg_idle_wkups interrupt_wkups pageins wired_size resident_size phys_footprint proc_start_abstime proc_exit_abstime child_user_time child_system_time child_pkg_idle_wkups child_interrupt_wkups child_pageins child_elapsed_abstime diskio_bytesread diskio_byteswritten cpu_time_qos_default cpu_time_qos_maintenance cpu_time_qos_background cpu_time_qos_utility cpu_time_qos_legacy cpu_time_qos_user_initiated cpu_time_qos_user_interactive billed_system_time serviced_system_time logical_writes lifetime_max_phys_footprint instructions cycles billed_energy serviced_energy interval_max_phys_footprint runnable_time'.split()\nclass R(ctypes.Structure):\n _fields_=[('uuid',ctypes.c_uint8*16)]+[(n,ctypes.c_uint64) for n in fields]\nr=R();lib=ctypes.CDLL('/usr/lib/libproc.dylib',use_errno=True);fn=lib.proc_pid_rusage;fn.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_void_p];fn.restype=ctypes.c_int\nif fn(int(sys.argv[1]),4,ctypes.byref(r))!=0: raise OSError(ctypes.get_errno(),'proc_pid_rusage')\nprint(json.dumps({'BytesWritten':r.diskio_byteswritten,'LogicalBytesWritten':r.logical_writes,'StartTicks':r.proc_start_abstime}))\n"
-
-func issue767ReadProcessIO(ctx context.Context, pid int) (issue767ProcessIO, error) {
-	var result issue767ProcessIO
-	if runtime.GOOS == "darwin" {
-		output, err := exec.CommandContext(ctx, "python3", "-c", issue767DarwinIOScript, strconv.Itoa(pid)).Output()
-		if err != nil {
-			return result, err
-		}
-		err = json.Unmarshal(output, &result)
-		return result, err
-	}
-	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return result, err
-	}
-	end := strings.LastIndexByte(string(stat), ')')
-	if end < 0 {
-		return result, errors.New("invalid process stat")
-	}
-	fields := strings.Fields(string(stat[end+1:]))
-	if len(fields) < 20 {
-		return result, errors.New("process starttime missing")
-	}
-	result.StartTicks, err = strconv.ParseUint(fields[19], 10, 64)
-	if err != nil {
-		return result, err
-	}
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/io", pid))
-	if err != nil {
-		return result, err
-	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if value, found := strings.CutPrefix(line, "write_bytes:"); found {
-			result.BytesWritten, err = strconv.ParseUint(strings.TrimSpace(value), 10, 64)
-			return result, err
-		}
-	}
-	return result, errors.New("process write_bytes counter not found")
-}
-
 type issue767IdleReport struct {
 	Phase                         string
 	ElapsedSeconds                float64
@@ -586,7 +137,7 @@ func (f *issue767Fixture) measureIdle(phase string, duration time.Duration) issu
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	first, err := issue767ReadProcessIO(ctx, f.cmd.Process.Pid)
+	first, err := issue767ReadProcessIO(ctx, f.pid())
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -605,7 +156,7 @@ func (f *issue767Fixture) measureIdle(phase string, duration time.Duration) issu
 		case <-time.After(5 * time.Second):
 		}
 	}
-	last, err := issue767ReadProcessIO(ctx, f.cmd.Process.Pid)
+	last, err := issue767ReadProcessIO(ctx, f.pid())
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -643,14 +194,6 @@ func (f *issue767Fixture) measureIdle(phase string, duration time.Duration) issu
 	return report
 }
 
-func issue767FileSize(path string) int64 {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return info.Size()
-}
-
 func TestIssue767JSONEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name                   string
@@ -672,6 +215,61 @@ func TestIssue767JSONEvidence(t *testing.T) {
 	}
 }
 
+// TestIssue767JSONSourceMatchesTheNamedFile pins the file-scoped source check
+// the sustained harness depends on: a hit only counts when it comes from the
+// exact file the caller named, so an edit probe cannot be satisfied by the same
+// name in the checkout's marker file or in a sibling checkout.
+func TestIssue767JSONSourceMatchesTheNamedFile(t *testing.T) {
+	root := filepath.Join("/tmp", "gx767-source")
+	hit := func(file string) map[string]any {
+		return map[string]any{"results": []any{map[string]any{
+			"name": "Probe", "repo_prefix": "issue767", "absolute_file_path": file,
+		}}}
+	}
+	marker := filepath.Join(root, "marker.go")
+	nested := filepath.Join(root, "p001", "file00042.go")
+	for _, tc := range []struct {
+		name  string
+		value any
+		file  string
+		want  bool
+	}{
+		{"marker_file", hit(marker), marker, true},
+		{"nested_file", hit(nested), nested, true},
+		{"nested_hit_for_marker_probe", hit(nested), marker, false},
+		{"marker_hit_for_nested_probe", hit(marker), nested, false},
+		{"sibling_checkout", hit(filepath.Join("/tmp", "gx767-other", "p001", "file00042.go")), nested, false},
+		{"foreign_repo", map[string]any{"results": []any{map[string]any{
+			"name": "Probe", "repo_prefix": "other", "absolute_file_path": nested,
+		}}}, nested, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := issue767JSONSource(tc.value, "Probe", tc.file); got != tc.want {
+				t.Fatalf("issue767JSONSource = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIssue767PrefixMatchesTheFixtureFamily pins which repo prefixes count as
+// this fixture: the family prefix and the worktree-instance prefixes an
+// explicit `track --as-worktree` creates, and nothing else.
+func TestIssue767PrefixMatchesTheFixtureFamily(t *testing.T) {
+	for prefix, want := range map[string]bool{
+		"issue767":        true,
+		"issue767@wt01":   true,
+		"issue767@linked": true,
+		"issue767x":       false,
+		"other":           false,
+		"":                false,
+		"@issue767":       false,
+	} {
+		if got := issue767PrefixMatches(prefix); got != want {
+			t.Errorf("issue767PrefixMatches(%q) = %v, want %v", prefix, got, want)
+		}
+	}
+}
+
 func TestIssue767RequiredTimeout(t *testing.T) {
 	for _, tc := range []struct {
 		idle     time.Duration
@@ -686,5 +284,145 @@ func TestIssue767RequiredTimeout(t *testing.T) {
 		if got := issue767RequiredTimeout(tc.idle, tc.baseline); got != tc.want {
 			t.Errorf("idle=%s baseline=%v: got %s, want %s", tc.idle, tc.baseline, got, tc.want)
 		}
+	}
+}
+
+// TestIssue767DefaultCorpusIsTheOriginalFixture pins the extraction: the shared
+// fixture must still write the exact 34-file corpus the idle and readiness
+// harnesses were validated against — one go.mod, one marker.go carrying the
+// primary probe, and file00..file31 with their intra-package call edges.
+func TestIssue767DefaultCorpusIsTheOriginalFixture(t *testing.T) {
+	f := &issue767Fixture{t: t, primary: t.TempDir()}
+	issue767DefaultCorpus(f)
+	entries, err := os.ReadDir(f.primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 34 {
+		t.Fatalf("default corpus wrote %d entries, want 34", len(entries))
+	}
+	for _, tc := range []struct{ path, want string }{
+		{"go.mod", "module example.invalid/issue767\n\ngo 1.24\n"},
+		{"marker.go", "package fixture\nfunc Issue767PrimaryMarker() int { return Issue767Target00() }\n"},
+		{"file00.go", "package fixture\nfunc Issue767Target00() int { return 0 }\nfunc Issue767Caller00() int { return Issue767Target00() }\n"},
+		{"file31.go", "package fixture\nfunc Issue767Target31() int { return 31 }\nfunc Issue767Caller31() int { return Issue767Target00() }\n"},
+	} {
+		got, err := os.ReadFile(filepath.Join(f.primary, tc.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestIssue767SpellingCarriesAViewSelectorOnlyForAnAutomaticCheckout pins the
+// request shape per checkout mode.
+//
+// The worktree view selector is the automatic lane's spelling. A dedicated
+// (explicitly tracked) checkout owns no checkout_routes row, so the same
+// selector reaches materializeRequestView with strict=true and is refused —
+// "checkout %q is not fully routed yet" — for as long as it stays dedicated
+// (internal/mcp/view_request.go:1995-2001). It is served from its own indexed
+// corpus instead (internal/mcp/view_request.go:1038-1041), which is a request
+// with no view selector at all.
+func TestIssue767SpellingCarriesAViewSelectorOnlyForAnAutomaticCheckout(t *testing.T) {
+	root := "/private/tmp/gx767/wt01"
+	for _, tc := range []struct {
+		spelling issue767Spelling
+		wantView bool
+		label    string
+	}{
+		{issue767AsPrimary, false, "primary"},
+		{issue767AsAutomaticWorktree, true, "worktree_view_selector"},
+		{issue767AsOwnCorpus, false, "own_corpus_no_view_selector"},
+	} {
+		t.Run(tc.spelling.String(), func(t *testing.T) {
+			request := issue767SearchRequest(root, "Marker", tc.spelling)
+			view, hasView := request["view"]
+			if hasView != tc.wantView {
+				t.Fatalf("view selector present=%v, want %v (request %v)", hasView, tc.wantView, request)
+			}
+			if tc.wantView {
+				selector, _ := view.(map[string]any)
+				if selector["kind"] != "worktree" || selector["path"] != root {
+					t.Fatalf("automatic spelling must select the worktree by path, got %v", view)
+				}
+			}
+			if request["query"] != "Marker" || request["operation"] != "symbols" {
+				t.Fatalf("request lost its query: %v", request)
+			}
+			if tc.spelling.String() != tc.label {
+				t.Fatalf("spelling %d prints as %q, want %q", tc.spelling, tc.spelling, tc.label)
+			}
+		})
+	}
+}
+
+// TestIssue767VerdictKeepsExactnessWhereTheProductOffersIt is the other half:
+// relaxing the exactness demand for the dedicated lane must not relax anything
+// else. A fallback answer stays a failure in every spelling, and the
+// own-corpus spelling still has to be answered out of the asked checkout's own
+// file — that physical check is what stops a base-corpus answer from passing
+// for a dedicated one.
+func TestIssue767VerdictKeepsExactnessWhereTheProductOffersIt(t *testing.T) {
+	exact := issue767Answer{Found: true, Exact: true, FromExpectedFile: true}
+	unlabelled := issue767Answer{Found: true, FromExpectedFile: true}
+	wrongFile := issue767Answer{Found: true, FromExpectedFile: false}
+	fallback := issue767Answer{Found: true, Fallback: true, FromExpectedFile: true}
+
+	if found, err := issue767Verdict(exact, issue767AsAutomaticWorktree); !found || err != nil {
+		t.Errorf("an exact automatic answer must pass: %v %v", found, err)
+	}
+	if _, err := issue767Verdict(unlabelled, issue767AsAutomaticWorktree); err == nil {
+		t.Error("an automatic checkout answer without the exact label must be refused")
+	}
+	if found, err := issue767Verdict(unlabelled, issue767AsOwnCorpus); !found || err != nil {
+		t.Errorf("a dedicated checkout answers without a freshness label; that spelling must accept it: %v %v", found, err)
+	}
+	if found, err := issue767Verdict(unlabelled, issue767AsPrimary); !found || err != nil {
+		t.Errorf("the primary corpus answer must pass: %v %v", found, err)
+	}
+	for _, spelling := range []issue767Spelling{issue767AsPrimary, issue767AsAutomaticWorktree, issue767AsOwnCorpus} {
+		if _, err := issue767Verdict(fallback, spelling); err == nil {
+			t.Errorf("%s accepted a fallback answer", spelling)
+		}
+		if _, err := issue767Verdict(wrongFile, spelling); err == nil {
+			t.Errorf("%s accepted an answer from another file", spelling)
+		}
+	}
+	if found, err := issue767Verdict(issue767Answer{}, issue767AsOwnCorpus); found || err != nil {
+		t.Errorf("a not-found answer is not an error, it is a retry: %v %v", found, err)
+	}
+}
+
+// TestIssue767JSONPrefixNamesTheCorpusThatAnswered records which corpus served
+// a request, which is the measurement that distinguishes the family base from
+// a checkout's own graph.
+//
+// Both shapes are real and were observed with the same question against the
+// same worktree: served automatically the answer is
+// repo_prefix "issue767" with the checkout's absolute path; tracked as an
+// independent instance it is repo_prefix "issue767@wt01" with the same path.
+func TestIssue767JSONPrefixNamesTheCorpusThatAnswered(t *testing.T) {
+	file := filepath.Join("/private/tmp", "gx767", "wt01", "marker.go")
+	answer := func(prefix, path string) any {
+		return map[string]any{"results": []any{map[string]any{
+			"name": "Probe", "repo_prefix": prefix, "absolute_file_path": path,
+		}}}
+	}
+	if got := issue767JSONPrefix(answer("issue767", file), "Probe", file); got != "issue767" {
+		t.Errorf("automatic answer attributed to %q, want the family prefix", got)
+	}
+	if got := issue767JSONPrefix(answer("issue767@wt01", file), "Probe", file); got != "issue767@wt01" {
+		t.Errorf("dedicated answer attributed to %q, want the instance prefix", got)
+	}
+	other := filepath.Join("/private/tmp", "gx767", "repo", "marker.go")
+	if got := issue767JSONPrefix(answer("issue767", other), "Probe", file); got != "" {
+		t.Errorf("an answer from another file was attributed as %q", got)
+	}
+	if got := issue767JSONPrefix(answer("issue767", file), "Other", file); got != "" {
+		t.Errorf("an answer for another symbol was attributed as %q", got)
 	}
 }

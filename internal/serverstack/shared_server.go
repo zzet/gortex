@@ -146,6 +146,19 @@ type SharedServer struct {
 	// this stack. Nil in single-repo standalone, where there is no
 	// multi-repo indexer to own a tracked set.
 	CheckoutLifecycle *indexer.CheckoutLifecycle
+	// DedicatedBaseRuntime is the process-wide dedicated-base publisher
+	// runtime this stack constructed and installed on the lifecycle before
+	// any owner could be registered. Every later publication trigger must
+	// use this one value. Nil in single-repo standalone and whenever the
+	// backend is not the sqlite store (nothing publishes there).
+	DedicatedBaseRuntime *indexer.DedicatedBaseRuntime
+	// OutputGenerationAuthority is the process-wide authority every repository
+	// mutation admits through: the generation-zero lanes (owned and orphan),
+	// the multi-repo cold batch, the topology transitions and the checkout
+	// source-edit leases. It is installed on the standalone Indexer AND on the
+	// MultiIndexer, so the standalone Indexer this stack hands to the MCP
+	// server cannot mutate on a lane with no named owner. Never nil.
+	OutputGenerationAuthority *indexer.OutputGenerationAuthority
 	// StorePath is the graph store file this stack actually opened: the
 	// caller's BackendPath expanded to an absolute path, or the platform
 	// default when it was empty. Entry points publish it so out-of-band
@@ -309,9 +322,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	}
 
 	// allowRebuild is gated on actually holding the store lock: only then may
-	// the sqlite backend drop and recreate an incompatible-schema DB.
+	// the sqlite backend rebuild a supported older schema when necessary.
 	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, logger, storeLockHeld, cfg.MigrationObserver)
 	if err != nil {
+		// Backend initialization can fail after the store lock was acquired.
+		_ = s.Close()
 		return nil, err
 	}
 	s.cleanup = append(s.cleanup, backendCleanup)
@@ -632,6 +647,68 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			return nil, fmt.Errorf("build checkout lifecycle: %w", lerr)
 		}
 		s.CheckoutLifecycle = lifecycle
+		// The dedicated-base publisher runtime is installed here — after the
+		// lifecycle exists and before anything can register an owner. Both
+		// halves of that sentence are load-bearing:
+		//
+		//   - it belongs to the stack, not to `cmd/gortex/daemon.go`. The build
+		//     gate is installed from the daemon alone, so the one-shot embedded
+		//     server runs ungated; installing the publisher owner there would
+		//     repeat that asymmetry and leave the embedded path without an
+		//     authority for the publication it is equally able to reach.
+		//   - SetDedicatedBaseCleanupRuntime refuses installation once any owner
+		//     is registered, and Seed registers owners (via bindDedicatedGraph)
+		//     as soon as the daemon warms up — which is after the lifecycle
+		//     reaches the MCP server, the controller and the janitor below. The
+		//     one window that always precedes every owner is this one.
+		//
+		// It is handed the store this stack opened and the lifecycle's OWN lease
+		// manager: a private manager would make advancement invisible to the
+		// retirement sweep that uses the lifecycle's manager as its in-use
+		// predicate. Installing it does not publish anything; it only gives the
+		// publisher/drain half a live owner.
+		if store, ok := g.(*store_sqlite.Store); ok {
+			runtime, rerr := indexer.NewDedicatedBaseRuntime(store, lifecycle.ViewLeases())
+			if rerr != nil {
+				_ = s.Close()
+				return nil, fmt.Errorf("build dedicated base publisher runtime: %w", rerr)
+			}
+			if rerr := lifecycle.SetDedicatedBaseCleanupRuntime(runtime); rerr != nil {
+				_ = s.Close()
+				return nil, fmt.Errorf("install dedicated base publisher runtime: %w", rerr)
+			}
+			s.DedicatedBaseRuntime = runtime
+		}
+	}
+	// The output-generation authority is installed in the same window and for
+	// the same reason as the publisher runtime above: it belongs to the stack,
+	// so the embedded one-shot path shares it instead of repeating the
+	// SetBuildGate asymmetry.
+	//
+	// It is handed the lifecycle's OWN lease manager when there is a lifecycle,
+	// because that is the manager a routed request's BasePin is taken from: a
+	// generation-zero mutation witnessed through any other manager would be
+	// invisible to the request that needs to hear about it.
+	//
+	// Both the standalone Indexer and the MultiIndexer are installed on. The
+	// standalone Indexer mints an ORPHAN mutation lane (no owner, no prefix),
+	// and it is the Indexer this stack hands straight to the MCP server; with
+	// one shared authority its mutations still name an output generation and
+	// owner rather than running on a lane nothing speaks for.
+	{
+		var authorityLeases *graphview.LeaseManager
+		if s.CheckoutLifecycle != nil {
+			authorityLeases = s.CheckoutLifecycle.ViewLeases()
+		}
+		authority := indexer.NewOutputGenerationAuthority(authorityLeases)
+		idx.SetOutputGenerationAuthority(authority)
+		if mi != nil {
+			mi.SetOutputGenerationAuthority(authority)
+		}
+		s.OutputGenerationAuthority = authority
+		// Admission stops with the stack. Outstanding receipts still settle:
+		// closing must refuse new work, not strand work already on a lane.
+		s.cleanup = append(s.cleanup, authority.Close)
 	}
 	// Appended after backendCleanup but before MCP background drain. LIFO
 	// teardown therefore drains background work first, then closes per-repo
@@ -644,6 +721,16 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			}
 		}
 		idx.Close()
+	})
+	// LIFO: MCP detached work -> lifecycle admissions/producers/retry joins ->
+	// MI parser workers -> standalone Indexer -> backend and store lock.
+	// This must remain after MI cleanup registration and before MCP drain.
+	s.cleanup = append(s.cleanup, func() {
+		if s.CheckoutLifecycle != nil {
+			if err := s.CheckoutLifecycle.Close(); err != nil {
+				logger.Warn("serverstack: checkout lifecycle shutdown failed", zap.Error(err))
+			}
+		}
 	})
 
 	toolPolicyCfg := gortexmcp.ToolPolicyConfig{
@@ -767,6 +854,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(platform.MemoriesDir()))
 	srv.InitMemories(sideCfg.NotesDir, sideCfg.NotesRepo)
 	srv.InitSuppressions(sideCfg.NotesDir, sideCfg.NotesRepo)
+	// The notebook keeps its sidecar below the repository-local .gortex
+	// directory, independently of the other side-store directories above.
+	if sideCfg.NotebookPath != "" {
+		s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(filepath.Join(sideCfg.NotebookPath, ".gortex")))
+	}
 	srv.InitNotebook(sideCfg.NotebookPath)
 	srv.InitCombo(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)
 	srv.InitFrecency(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)

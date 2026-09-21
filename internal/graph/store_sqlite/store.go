@@ -150,6 +150,96 @@ type storeCore struct {
 	checkpointDone chan struct{} // closed by the loop when it returns
 	stopOnce       sync.Once     // makes stopCheckpointLoop idempotent
 
+	// Whole-database maintenance lane (store_compact.go). ANALYZE, VACUUM and
+	// TRUNCATE checkpoints are one-per-file actions: no generation owns them,
+	// so none of them may be charged to a generation's publish. The lane is
+	// the single admission point — maintenanceGate admits one action at a
+	// time, and the scheduling fields below coalesce publish requests so a
+	// burst of publishes owes at most one further pass.
+	//
+	// Lock order: the maintenance gate is taken BEFORE writeMu and never
+	// after. Every writeMu holder inside this package therefore stays free to
+	// finish; nothing that holds the write gate may enter the lane.
+	maintenanceGate sqliteWriteGate
+
+	// maintenanceCtx is the lane's own lifetime, created with the store and
+	// cancelled by Close. It lives on the core deliberately: a scheduled pass
+	// outlives the caller that asked for it, so it must not borrow that
+	// caller's context — a publish returning must never cancel the maintenance
+	// it just requested.
+	//
+	// maintenanceSignal is the coalescing slot (capacity one) the publish
+	// boundaries post to and the lane's worker consumes; maintenanceDone is
+	// closed by that worker when it returns, so Close can join it.
+	// maintenanceSched guards the ctx/cancel pair, the signal slot's companion
+	// owed flag, the running / closed scheduling state and the priority
+	// bookkeeping below.
+	//
+	// maintenancePriority counts the whole-file jobs (VACUUM, TRUNCATE
+	// checkpoint) that are waiting for or holding the lane right now, and
+	// maintenancePass is the planner-statistics pass they pre-empt: those jobs
+	// sit on latency budgets of their own — CheckpointWAL's is 10 s — while a
+	// pass can legitimately hold the token for longer, so a pass yields to
+	// them rather than making them defer. maintenancePriorityResume records
+	// that the worker declined to start a pass because of one, so the last
+	// such job to finish re-posts the signal the worker parked on.
+	maintenanceSched          sync.Mutex
+	maintenanceCtx            context.Context
+	maintenanceCancel         context.CancelFunc
+	maintenanceSignal         chan struct{}
+	maintenanceDone           chan struct{}
+	maintenanceRunning        bool
+	maintenanceOwed           bool
+	maintenanceClosed         bool
+	maintenancePriority       int
+	maintenancePriorityResume bool
+	maintenancePass           *maintenancePassHandle
+
+	// maintenanceDrainOwed is the one-slot request for a bounded follow-up
+	// TRUNCATE checkpoint, posted by a finalize that measured a WAL above the
+	// auto-checkpoint line and consumed by the same worker that runs the
+	// statistics pass. It is a separate flag rather than a second signal
+	// channel because the worker parks on exactly one slot, and it is
+	// coalesced for the same reason the pass request is: two finalizes owe one
+	// drain. maintenanceDrainReason names the boundary that asked, for the
+	// log line; maintenanceDrainRunning is what the lane's settle point reads
+	// so a test (or Close) can tell "drain finished" from "drain not started".
+	maintenanceDrainOwed    bool
+	maintenanceDrainRunning bool
+	maintenanceDrainReason  string
+
+	// Lane counters. Requests counts scheduling calls, passes counts lane
+	// passes actually started (so a burst of requests collapsing into one
+	// pass is observable), jobs counts actions that reached their SQL,
+	// deferrals counts actions that gave up short of it — the store never went
+	// quiescent inside their budget, the lane token never came free, or a
+	// priority job asked a pass to yield — and preemptions counts the passes
+	// asked to yield so a whole-file job could have the token.
+	//
+	// Jobs and deferrals partition every lane entry that got past the
+	// coreless check: an entry is counted in exactly one of them, so a pass
+	// that yields is a deferral and never also a job.
+	maintenanceRequests    atomic.Int64
+	maintenancePasses      atomic.Int64
+	maintenanceJobs        atomic.Int64
+	maintenanceDeferrals   atomic.Int64
+	maintenancePreemptions atomic.Int64
+
+	// Follow-up WAL drain counters. Requests counts finalize boundaries that
+	// measured a residue above the auto-checkpoint line, drains counts the
+	// TRUNCATE checkpoints that actually completed. They differ whenever a
+	// drain gave up its bounded attempts against a reader that never left —
+	// which is a deferral, not a loss: the residue is still there and the next
+	// finalize asks again.
+	walDrainRequests atomic.Int64
+	walDrains        atomic.Int64
+
+	// publishDrains counts publish windows in flight: a generation that is
+	// sealed but whose transition has not committed yet. A whole-file
+	// maintenance action waits them out rather than rewriting the file
+	// underneath one.
+	publishDrains atomic.Int64
+
 	// bundles is the content-addressed package-scoped cache over
 	// SearchSymbolBundles: a query serves cached Node + in/out edges for
 	// packages whose content fingerprint is unchanged and skips the node
@@ -175,6 +265,15 @@ type storeCore struct {
 	bulkPrevAutoCheckpoint int64
 	coordinatedBulkLoad    bool
 	bulkIndexesDeferred    bool
+	// generationBulkLoad names the payload generation a generation-scoped bulk
+	// window was opened for, or 0 when the pinned connection (if any) belongs
+	// to the cold-load fast path instead. It is the flag that keeps the two
+	// windows apart: the cold one proves the whole STORE is empty and may
+	// therefore drop indexes and durability, while this one proves only that
+	// one GENERATION holds no rows and must leave both alone — generation 0's
+	// readers and its durable rows are live underneath it. See
+	// BeginGenerationBulkLoad.
+	generationBulkLoad     int64
 	bulkDeferredNodeRows   int64
 	bulkDeferredEdgeRows   int64
 	bulkCheckpointNodeRows int64
@@ -319,7 +418,7 @@ type storeCore struct {
 // and write gate are shared by every handle over the same database.
 //
 // Open returns the owning handle. AtGeneration derives further handles that
-// differ only in viewGen; a derived handle must never tear the core down, so
+// select a payload view; a derived handle must never tear the core down, so
 // only the owning handle's Close does any work (see ownsCore).
 type Store struct {
 	*storeCore
@@ -327,6 +426,10 @@ type Store struct {
 	// viewGen is the payload view generation this handle reads and writes.
 	// Generation 0 is the base corpus every store starts with.
 	viewGen int64
+
+	// managedPayloadGeneration requires fresh lifecycle admission for writes.
+	// It is immutable per handle, not shared write authority or a seal verdict.
+	managedPayloadGeneration bool
 
 	// seal is the write-admission flag for viewGen, shared with every other
 	// handle over the same generation. It is nil on the base handle, which is
@@ -485,6 +588,12 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 }
 
 func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
+	// Refuse unsupported newer schemas before a writer connection can change
+	// journal mode or checkpoint their WAL. WithRebuild does not override this.
+	if err := checkSchemaDowngrade(path, current); err != nil {
+		return nil, err
+	}
+
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
 	// embedded tradeoff. cache_size(-32768) gives each pooled connection a
 	// 32 MiB page cache; temp_store(MEMORY) keeps GROUP BY / ORDER BY scratch
@@ -510,17 +619,20 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// A separate bounded query pool is opened after schema reconciliation.
 	configureWriterPool(db)
 
-	// Reconcile the on-disk schema version before applying schemaSQL. The graph
-	// store is a rebuildable cache, so an incompatible (older needing a rebuild
-	// step, or newer) DB is dropped and reindexed rather than migrated in place
-	// (see schema_version.go). The daemon holds an exclusive store.lock around
-	// Open, so wiping the file here cannot race another process.
+	// Recheck on the writer handle before applying schemaSQL, including for
+	// shared in-memory stores and a version changed after the read-only probe.
+	// Only known older rebuild boundaries may use destructive rebuild authority.
+	// The daemon holds an exclusive store.lock around Open and that rebuild.
 	stored, err := readUserVersion(db)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite read schema version: %w", err)
 	}
 	plan := planSchemaMigrationWith(stored, current, migrations)
+	if plan.err != nil {
+		_ = db.Close()
+		return nil, plan.err
+	}
 	// A rebuild migration applies to an existing pre-versioning database, but
 	// not to the brand-new empty file sql.Open just created. Distinguish those
 	// two user_version=0 cases before requiring destructive-rebuild authority.
@@ -719,6 +831,13 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		s.checkpointDone = make(chan struct{})
 		go s.runCheckpointLoop(walCheckpointInterval)
 	}
+	// Start the whole-database maintenance lane with the store rather than with
+	// the first publish that needs it — see startMaintenanceLane for why the
+	// worker's birthplace matters. Unconditional, unlike the checkpoint loop
+	// above: an in-memory store has no WAL to drain, but it does have the one
+	// sqlite_stat1 a publish can outgrow. Last, so no failed Open above leaves
+	// a worker behind a closed pool.
+	s.startMaintenanceLane()
 	return s, nil
 }
 
@@ -905,10 +1024,35 @@ func passiveCheckpointReport(result walCheckpointResult, err, ctxErr error) stri
 // zero. It is the explicit/final maintenance boundary; the timer uses PASSIVE.
 // Acquisition and incomplete-checkpoint retries are context bounded and
 // serialized with the sole SQLite writer.
+//
+// A TRUNCATE checkpoint is a whole-file action, so it goes through the
+// maintenance lane and can never interleave with a VACUUM rewriting the same
+// file. It does NOT wait for the store to go quiescent: the checkpoint is
+// serialized against writers by the write gate it already takes and is already
+// deferred while a bulk connection is pinned, and its callers (the indexer's
+// read boundary, Compact's tail) reach it inside latency budgets that a
+// build-length wait would blow. Failing to enter the lane inside
+// walCheckpointTimeout is reported as a deferral, which every caller already
+// treats as skip-and-continue.
+//
+// It is a PRIORITY job in that lane, and the reason is the cost of the
+// deferral rather than the cost of the checkpoint. This boundary is why the
+// indexer's global read passes are not run against a multi-gigabyte WAL (the
+// census the caller at internal/indexer/multi.go measures went from ~11 s
+// against a checkpointed store to ~533 s against an undrained one), and the
+// checkpoint gets ONE 10 s attempt with no retry. The other occupant of the
+// lane is the planner-statistics pass, which can hold the token for its pass
+// budget plus one index's ANALYZE plus a reload — longer than this budget —
+// so admitting the checkpoint behind it would put that 48x boundary behind a
+// statistics refresh. Instead the pass yields: runMaintenance marks this job
+// priority on entry, which cancels the pass in flight and stops the worker
+// starting another until the checkpoint is done. The pass loses nothing
+// durable — a cancelled cooperative refresh is a deferral that keeps its
+// cursor and resumes at the next boundary.
 func (s *Store) CheckpointWAL() error {
 	ctx, cancel := context.WithTimeout(context.Background(), walCheckpointTimeout)
 	defer cancel()
-	return s.checkpointWALWithContext(ctx)
+	return s.runMaintenance(ctx, maintenanceCheckpoint, false, s.checkpointWALWithContext)
 }
 
 func (s *Store) checkpointWALWithContext(ctx context.Context) error {
@@ -997,6 +1141,11 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.stopCheckpointLoop()
+	// Join the maintenance lane before anything is torn down: a pass in flight
+	// writes through the same pools this method is about to close, and it runs
+	// on a goroutine no caller holds. stopMaintenanceLane cancels it and waits
+	// for it under its own bound.
+	s.stopMaintenanceLane()
 	// A caller normally ends an outer cold-load window explicitly, but Close is
 	// also the last durability boundary on cancellation or startup failure.
 	// Flush while the database and pinned connection are still live so a
@@ -2790,6 +2939,11 @@ func panicOnFatal(err error) {
 	// being dropped), so treat these as non-fatal.
 	if errors.Is(err, sql.ErrConnDone) || isStoreClosedErr(err) {
 		return
+	}
+	// Keep sealed lifecycle refusals and actual SQLite-full failures typed so
+	// index/build recovery recognizes them without absorbing other panics.
+	if errors.Is(err, ErrPayloadGenerationSealed) || isSQLiteFullFailure(err) {
+		panic(&StorageError{err: err})
 	}
 	panic(fmt.Errorf("store_sqlite: %w", err))
 }

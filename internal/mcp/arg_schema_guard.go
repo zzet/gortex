@@ -183,6 +183,19 @@ func wrapToolArgGuard(tool mcp.Tool, handler server.ToolHandlerFunc) server.Tool
 			if _, shaping := toolArgShapingKeys[k]; shaping {
 				continue
 			}
+			// The request-level freshness knobs are arguments of the request,
+			// not of any tool: the view middleware reads require_exact /
+			// require_fresh / wait_deadline for EVERY call and no handler
+			// ever does. A closed schema must not refuse a key dispatch
+			// demonstrably honours — that is what made the already-shipped
+			// require_exact unusable on every guarded tool. They are admitted
+			// here rather than published per tool because publishing three
+			// properties on every registered tool grows every tools/list, and
+			// the compact / agent / localization surfaces are byte budgeted.
+			// The contract is stated once in guide.go and profiles/bodies.go.
+			if _, requestLevel := requestFreshnessArgKeys[k]; requestLevel {
+				continue
+			}
 			if _, ok := allowed[k]; !ok {
 				unknown = append(unknown, k)
 			}

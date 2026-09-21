@@ -30,7 +30,7 @@ func analysisPlaceholders(count int) string {
 func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGenerationHeader, bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	tx, err := s.beginWrite()
+	tx, err := s.beginAnalysisWrite()
 	if err != nil {
 		return graph.AnalysisGenerationHeader{}, false, err
 	}
@@ -41,7 +41,10 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 		}
 	}()
 	var generationID int64
-	if err := tx.QueryRow(`SELECT generation_id FROM analysis_active_generation WHERE slot = 1`).Scan(&generationID); err != nil {
+	if err := tx.QueryRow(
+		`SELECT generation_id FROM analysis_active_generation WHERE view_gen = ? AND slot = 1`,
+		s.viewGen,
+	).Scan(&generationID); err != nil {
 		if err == sql.ErrNoRows {
 			return graph.AnalysisGenerationHeader{}, false, nil
 		}
@@ -56,17 +59,27 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 		if reason == nil {
 			reason = fmt.Errorf("state is %d, want ready", state)
 		}
-		if _, clearErr := tx.Exec(`DELETE FROM analysis_active_generation WHERE slot = 1 AND generation_id = ?`, generationID); clearErr != nil {
+		if _, clearErr := tx.Exec(`DELETE FROM analysis_active_generation WHERE view_gen = ? AND slot = 1 AND generation_id = ?`, s.viewGen, generationID); clearErr != nil {
 			return graph.AnalysisGenerationHeader{}, false, clearErr
 		}
 		if _, staleErr := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ?`, analysisGenerationStale, generationID); staleErr != nil {
 			return graph.AnalysisGenerationHeader{}, false, staleErr
 		}
+		// analysisGenerationPresent is the mutation hot path's latch and it
+		// lives on the shared storeCore, so it may only be cleared once NO
+		// view's pointer remains. Dropping it because this view's pointer went
+		// away would let the next graph mutation skip durable invalidation
+		// while another view still has an active analysis — the one way a
+		// restart could resurrect stale analysis.
+		remaining, remainingErr := analysisPointerPresentTx(tx)
+		if remainingErr != nil {
+			return graph.AnalysisGenerationHeader{}, false, remainingErr
+		}
 		if commitErr := tx.Commit(); commitErr != nil {
 			return graph.AnalysisGenerationHeader{}, false, commitErr
 		}
 		committed = true
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = remaining
 		return graph.AnalysisGenerationHeader{}, false, fmt.Errorf("%w: generation %d: %v", graph.ErrAnalysisGenerationCorrupt, generationID, reason)
 	}
 	if header.FormatVersion != formatVersion {
@@ -82,16 +95,33 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 	return header, true, nil
 }
 
+// ensureAnalysisGenerationReadableLocked is the single gate every bounded
+// analysis query passes. The view_gen predicate is the generation axis on the
+// read side: an analysis built over another payload view is not merely stale
+// for this handle, it describes a different corpus, so it reads as inactive
+// rather than as a hit.
 func (s *Store) ensureAnalysisGenerationReadableLocked(generationID int64) error {
 	var one int
 	err := s.db.QueryRow(`
 		SELECT 1 FROM analysis_active_generation a
 		JOIN analysis_generations g ON g.generation_id = a.generation_id
-		WHERE a.slot = 1 AND a.generation_id = ? AND g.state = ?`, generationID, analysisGenerationReady).Scan(&one)
+		WHERE a.view_gen = ? AND a.slot = 1 AND a.generation_id = ? AND g.state = ?`,
+		s.viewGen, generationID, analysisGenerationReady).Scan(&one)
 	if err == sql.ErrNoRows {
 		return graph.ErrAnalysisGenerationInactive
 	}
 	return err
+}
+
+// analysisPointerPresentTx reports whether any view generation still has an
+// active analysis pointer. It is the durable half of the shared
+// analysisGenerationPresent latch.
+func analysisPointerPresentTx(tx *sql.Tx) (bool, error) {
+	var present int
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM analysis_active_generation LIMIT 1)`).Scan(&present); err != nil {
+		return false, err
+	}
+	return present != 0, nil
 }
 
 func scanAnalysisNode(scanner interface{ Scan(...any) error }) (graph.AnalysisNodeMetric, error) {

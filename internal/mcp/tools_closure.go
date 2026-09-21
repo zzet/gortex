@@ -131,8 +131,11 @@ func (s *Server) handleContextClosure(ctx context.Context, req mcp.CallToolReque
 
 	// proximity carries a seeded random-walk-with-restart score per
 	// member; nil under the default distance ranking. Feature wired in
-	// the seeded-random-walk change.
-	proximity := s.closureProximity(rankMode, closure.SeedIDs)
+	// the seeded-random-walk change. The member set goes in because it is
+	// the set the walk must be able to score — a snapshot that does not
+	// contain a member scores it zero, which is indistinguishable from
+	// "unreachable" in the emitted row below.
+	proximity := s.closureProximity(ctx, rankMode, closure.SeedIDs, members)
 
 	ordered := orderClosureMembers(members, proximity, rankMode)
 
@@ -191,21 +194,41 @@ func (s *Server) handleContextClosure(ctx context.Context, req mcp.CallToolReque
 // closureProximity returns a per-node seeded random-walk-with-restart
 // score for ranking closure members by their proximity to the seed
 // set. A nil result means "no proximity signal available" — the caller
-// then orders purely by graph distance. The seeded random walk runs
-// over the precomputed CSR adjacency snapshot; until that snapshot
-// exists (analysis has not run) this returns nil and "proximity"
-// ranking degrades to distance ranking.
-func (s *Server) closureProximity(rankMode string, seeds []string) map[string]float64 {
+// then orders purely by graph distance.
+//
+// The walk runs over the snapshot that describes the graph THIS request
+// read: the shared analysis pass's CSR for a request the indexed corpus
+// answers, and a bounded CSR built from the request's own reader for a
+// request that selected a checkout of its own or composed editor buffers.
+// Ranking a selected view with the shared pass's scores would score a
+// correct graph from a snapshot it never contained. Until a snapshot exists
+// at all (analysis has not run, or no seed resolves in the selected view)
+// this returns nil and "proximity" ranking degrades to distance ranking.
+//
+// members is the set the caller emits a score for, and is what the bounded
+// snapshot is rooted on. A CSR rooted on the seeds alone reaches only
+// `depth` hops, so every member past that horizon would come back with no
+// score — emitted as proximity 0, a number the caller cannot tell from a
+// genuinely unreachable member, and one that sinks every truncated member to
+// the bottom of the ranking in a tie.
+func (s *Server) closureProximity(ctx context.Context, rankMode string, seeds []string, members []query.ClosureNode) map[string]float64 {
 	if rankMode != "proximity" {
 		return nil
 	}
-	snap := s.getAdjacency()
+	memberIDs := make([]string, 0, len(members))
+	for _, m := range members {
+		if m.Node != nil {
+			memberIDs = append(memberIDs, m.Node.ID)
+		}
+	}
+	snap, scope := s.requestProximityAdjacency(ctx, seeds, memberIDs)
 	if snap == nil {
 		return nil
 	}
 	// Route through the Merkle-keyed walk cache (restart 0 -> the
-	// snapshot's default restart probability).
-	return s.personalizedPageRank(snap, seeds)
+	// snapshot's default restart probability), namespaced by the snapshot
+	// that produced the walk so no two views share an entry.
+	return s.personalizedPageRankScoped(scope, snap, seeds)
 }
 
 // normalizeClosureFilePath converts a seed file argument into the

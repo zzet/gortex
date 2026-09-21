@@ -3,16 +3,21 @@ package gitstate
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/zzet/gortex/internal/gitcmd"
 )
@@ -88,8 +93,8 @@ type DirtySnapshot struct {
 	HeadTree string
 	// Entries are the differing paths, ordered by path and then kind.
 	Entries []DirtyEntry
-	// Fingerprint is a hex sha256 that changes whenever the snapshot
-	// does. See SampleDirty for what it covers and what bounds it.
+	// Fingerprint hashes reported effective content over HeadTree. HeadCommit
+	// and staging remain diagnostics; see SampleDirty for admission/cache bounds.
 	Fingerprint string
 }
 
@@ -106,8 +111,8 @@ const (
 type dirtyCommandFunc func(context.Context, string, ...string) ([]byte, error)
 
 // DirtySampler samples a known worktree root without rediscovering it on every
-// poll. It retains only the immutable tree oid associated with the last
-// successfully resolved commit oid. Branch names are deliberately not cached:
+// poll. It retains the last immutable tree oid and a bounded digest-only cache,
+// never file bytes. Branch names are deliberately not cached:
 // two branches may point at the same commit, and porcelain is authoritative for
 // which one is checked out now.
 type DirtySampler struct {
@@ -117,6 +122,12 @@ type DirtySampler struct {
 	mu        sync.Mutex
 	commitOID string
 	treeOID   string
+
+	// Initialized under mu; the channel lease protects HEAD and digest caches
+	// while allowing canceled callers to stop waiting for another sample.
+	sampling         chan struct{}
+	contentCache     map[string]dirtyContentMemo
+	contentCacheRoot os.FileInfo
 }
 
 // NewDirtySampler constructs a sampler for a path already known to be the
@@ -140,20 +151,29 @@ func newDirtySampler(root, seedCommit, seedTree string, run dirtyCommandFunc) *D
 	return s
 }
 
-// Sample reports the checkout's HEAD and dirty paths. An unchanged committed
-// checkout costs one git process: porcelain v2's branch headers carry the ref
-// and commit, and the tree is reused by exact commit oid. A changed commit costs
-// one additional rev-parse of that exact oid, never of the mutable HEAD name.
+// Sample reports HEAD and dirty paths. A clean committed checkout costs one Git
+// command; dirty samples add a final status fence. An exact-commit tree lookup
+// is needed only after its OID changes, never by resolving mutable HEAD twice.
 func (s *DirtySampler) Sample(ctx context.Context) (DirtySnapshot, error) {
 	if s == nil || s.run == nil || strings.TrimSpace(s.root) == "" {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: dirty sampler is not initialized: %w", ErrDirtyUnavailable)
 	}
 
-	// Serialize the command and cache update. Coordinators sample serially, but
-	// making the sampler safe on its own prevents two first samples from both
-	// resolving the same immutable tree.
+	if err := ctx.Err(); err != nil {
+		return DirtySnapshot{}, fmt.Errorf("gitstate: sample canceled: %w: %w", ErrDirtyUnavailable, err)
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.sampling == nil {
+		s.sampling = make(chan struct{}, 1)
+	}
+	sampling := s.sampling
+	s.mu.Unlock()
+	select {
+	case sampling <- struct{}{}:
+		defer func() { <-sampling }()
+	case <-ctx.Done():
+		return DirtySnapshot{}, fmt.Errorf("gitstate: wait for sampler: %w: %w", ErrDirtyUnavailable, ctx.Err())
+	}
 
 	out, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
 	if err != nil {
@@ -210,7 +230,14 @@ func (s *DirtySampler) Sample(ctx context.Context) (DirtySnapshot, error) {
 		Entries:    parseStatusZ(out),
 	}
 	slices.SortStableFunc(snap.Entries, compareDirtyEntries)
-	snap.Fingerprint = fingerprintDirty(s.root, snap.HeadCommit, snap.Entries)
+	identityTree := snap.HeadTree
+	if identityTree == "" && snap.HeadCommit != "" {
+		identityTree = "unresolved-commit:" + snap.HeadCommit
+	}
+	snap.Fingerprint, err = s.contentFingerprint(ctx, identityTree, snap.Entries, out)
+	if err != nil {
+		return DirtySnapshot{}, fmt.Errorf("gitstate: fingerprint dirty content in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
+	}
 	return snap, nil
 }
 
@@ -262,9 +289,21 @@ func parseBranchStatusZ(out []byte) (ref, commit string, err error) {
 // Ignored paths are absent because --ignored is not passed. The status call
 // runs under --no-optional-locks so observation never writes to the index.
 //
-// Fingerprint is a hex sha256 over a canonical encoding of HeadCommit and every
-// entry plus the path's lstat size and modification time where bytes exist. The
-// filesystem's modification-time granularity remains the sensitivity bound.
+// Fingerprint hashes HeadTree and actual reported raw bytes, type, executable
+// mode and existence. Staging, timestamp and commit-only changes do not change
+// regular-file or symlink identity. Only raw HEAD-blob equality removes staged
+// residue; clean filters are never applied. Git-hidden changes and filter/CRLF
+// equivalence are outside this guarantee. Opaque gitlinks/directories retain
+// the existing diagnostic/stat contract, without recursive traversal.
+// A clean filter can hide unchanged raw bytes after staging, removing a path
+// from status; identity across that admission boundary is not guaranteed.
+//
+// The bounded digest-only cache requires the opened file's known-local FS and
+// a digest freshly hashed after a quiet change-time window. Young, future,
+// unsupported or observably clock-rolled-back evidence causes rereading, not
+// waiting. Root, file and status fences reject detected inconsistent samples.
+// These are ordinary local-kernel assumptions, not an atomic FS snapshot or
+// proof against arbitrary concurrent writers; publication guards still apply.
 func SampleDirty(ctx context.Context, dir string) (DirtySnapshot, error) {
 	abs, err := absDir(dir)
 	if err != nil {
@@ -283,6 +322,354 @@ func SampleDirty(ctx context.Context, dir string) (DirtySnapshot, error) {
 		return DirtySnapshot{}, err
 	}
 	return sampler.Sample(ctx)
+}
+
+// Dirty content identity is deliberately separate from porcelain diagnostics.
+const (
+	dirtyContentCacheLimit = 4096
+	// A digest hashed during the uncertain window must never become reusable
+	// merely because it ages: a fresh hash after the window is required.
+	dirtyContentQuietWindow    = 2 * time.Second
+	dirtyContentClockTolerance = 10 * time.Millisecond
+)
+
+type dirtyFileVersion struct {
+	size, mtime, changeSec, changeNsec int64
+	mode                               os.FileMode
+	device, inode                      uint64
+	cacheable                          bool
+}
+type dirtyContentMemo struct {
+	version            dirtyFileVersion
+	mode, sha1, sha256 string
+	hashedAt           time.Time
+	reusable           bool
+}
+type dirtyContentEvidence struct {
+	info            os.FileInfo
+	memo            dirtyContentMemo
+	missing, opaque bool
+}
+type dirtyHeadEntry struct{ mode, oid string }
+
+func dirtyVersion(info os.FileInfo) dirtyFileVersion {
+	v := dirtyFileVersion{size: info.Size(), mtime: info.ModTime().UnixNano(), mode: info.Mode()}
+	v.device, v.inode, v.changeSec, v.changeNsec, v.cacheable = dirtyChangeIdentity(info)
+	return v
+}
+
+// A staged rename's HEAD blob belongs to the source, not its new destination.
+// Unmerged records do not identify HEAD reliably and remain conservative.
+func dirtyHeadEntries(status []byte) map[string]dirtyHeadEntry {
+	head := make(map[string]dirtyHeadEntry)
+	chunks := bytes.Split(status, []byte{0})
+	for i := 0; i < len(chunks); i++ {
+		record := string(chunks[i])
+		switch {
+		case strings.HasPrefix(record, "1 "):
+			if fields, path, ok := splitRecord(record, 8); ok {
+				head[path] = dirtyHeadEntry{mode: fields[3], oid: fields[6]}
+			}
+		case strings.HasPrefix(record, "2 "):
+			fields, path, ok := splitRecord(record, 9)
+			if !ok || i+1 >= len(chunks) {
+				continue
+			}
+			i++
+			if strings.HasPrefix(fields[8], "R") {
+				head[string(chunks[i])] = dirtyHeadEntry{mode: fields[3], oid: fields[6]}
+			}
+			head[path] = dirtyHeadEntry{mode: absentMode}
+		}
+	}
+	return head
+}
+
+func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entries []DirtyEntry, status []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	var canonical dirtyCanonical
+	canonical.str("gortex.gitstate.dirty.content.v2")
+	canonical.str(tree)
+	if len(entries) == 0 {
+		s.contentCache = nil
+		s.contentCacheRoot = nil
+		sum := sha256.Sum256(canonical.buf)
+		return hex.EncodeToString(sum[:]), nil
+	}
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	pinnedRoot, err := root.Open(".")
+	if err != nil {
+		return "", err
+	}
+	rootInfo, err := pinnedRoot.Stat()
+	closeErr := pinnedRoot.Close()
+	if err != nil || closeErr != nil {
+		return "", errors.Join(err, closeErr)
+	}
+	cacheRootMatches := s.contentCacheRoot != nil && os.SameFile(rootInfo, s.contentCacheRoot)
+	head := dirtyHeadEntries(status)
+	paths := make([]string, 0, len(entries))
+	byPath := make(map[string][]DirtyEntry, len(entries))
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+		byPath[entry.Path] = append(byPath[entry.Path], entry)
+	}
+	slices.Sort(paths)
+	paths = slices.Compact(paths)
+	nextCache := make(map[string]dirtyContentMemo, min(len(paths), dirtyContentCacheLimit))
+	evidence := make(map[string]dirtyContentEvidence, len(paths))
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		info, err := root.Lstat(path)
+		if os.IsNotExist(err) {
+			evidence[path] = dirtyContentEvidence{missing: true}
+			if prior, ok := head[path]; ok && prior.mode == absentMode {
+				continue
+			}
+			canonical.str(path)
+			canonical.str(absentMode)
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("stat dirty path %q: %w", path, err)
+		}
+		if info.IsDir() {
+			// Preserve the existing opaque gitlink/nested-repository contract.
+			// Do not introduce recursive traversal or require initialized submodules.
+			evidence[path] = dirtyContentEvidence{info: info, opaque: true}
+			canonical.str(path)
+			canonical.str("opaque-directory")
+			canonical.str(fingerprintDirty(s.root, "", byPath[path]))
+			continue
+		}
+		cached, found := s.contentCache[path]
+		memo, _, err := dirtyContentForPath(ctx, root, path, info, cached, found && cacheRootMatches)
+		if err != nil {
+			return "", err
+		}
+		evidence[path] = dirtyContentEvidence{info: info, memo: memo}
+		if len(nextCache) < dirtyContentCacheLimit {
+			nextCache[path] = memo
+		}
+		if prior, ok := head[path]; ok && prior.mode == memo.mode && (prior.oid == memo.sha1 || prior.oid == memo.sha256) {
+			continue // Only actual raw HEAD-blob equality removes staged residue.
+		}
+		canonical.str(path)
+		canonical.str(memo.mode)
+		canonical.str(memo.sha256)
+	}
+	// Fence HEAD/index and reported paths, then revalidate file evidence.
+	after, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
+	if err != nil {
+		return "", err
+	}
+	if !bytes.Equal(status, after) {
+		return "", errors.New("git dirty status changed while sampling")
+	}
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		observed := evidence[path]
+		info, err := root.Lstat(path)
+		if observed.missing {
+			if !os.IsNotExist(err) {
+				return "", fmt.Errorf("dirty path %q appeared while sampling", path)
+			}
+			continue
+		}
+		if err != nil || dirtyVersion(info) != dirtyVersion(observed.info) {
+			return "", fmt.Errorf("dirty path %q changed while sampling", path)
+		}
+		if !observed.opaque && !observed.memo.reusable {
+			// Young, unsupported or incomplete evidence must not certify bytes.
+			current, err := readDirtyContent(ctx, root, path, info)
+			if err != nil {
+				return "", err
+			}
+			if current.mode != observed.memo.mode || current.sha256 != observed.memo.sha256 {
+				return "", fmt.Errorf("dirty path %q changed while sampling", path)
+			}
+		}
+	}
+	currentRoot, err := os.OpenFile(s.root, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", err
+	}
+	currentRootInfo, statErr := currentRoot.Stat()
+	closeErr = currentRoot.Close()
+	if statErr != nil || closeErr != nil || !currentRootInfo.IsDir() || !os.SameFile(rootInfo, currentRootInfo) {
+		return "", errors.New("checkout root changed while sampling dirty content")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	// Commit the bounded cache and its physical-root scope only after all fences.
+	s.contentCache = nextCache
+	s.contentCacheRoot = rootInfo
+	sum := sha256.Sum256(canonical.buf)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func dirtyStampQuiet(version dirtyFileVersion, now time.Time) bool {
+	if !version.cacheable {
+		return false
+	}
+	stamp := time.Unix(version.changeSec, version.changeNsec)
+	return !stamp.After(now) && now.Sub(stamp) >= dirtyContentQuietWindow
+}
+func dirtyClockContinuous(wallElapsed, monotonicElapsed time.Duration) bool {
+	if wallElapsed < 0 || monotonicElapsed < 0 {
+		return false
+	}
+	drift := wallElapsed - monotonicElapsed
+	return drift >= -dirtyContentClockTolerance && drift <= dirtyContentClockTolerance
+}
+func dirtyMemoReusable(memo dirtyContentMemo, version dirtyFileVersion, now time.Time) bool {
+	if !memo.reusable || memo.version != version || !dirtyStampQuiet(version, now) {
+		return false
+	}
+	// This detects observable realtime jumps, not unobservable clock excursions
+	// or arbitrary concurrent writers, and does not create an FS snapshot.
+	return dirtyClockContinuous(time.Duration(now.UnixNano()-memo.hashedAt.UnixNano()), now.Sub(memo.hashedAt))
+}
+func dirtyContentForPath(ctx context.Context, root *os.Root, path string, info os.FileInfo, cached dirtyContentMemo, found bool) (dirtyContentMemo, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return dirtyContentMemo{}, false, err
+	}
+	version := dirtyVersion(info)
+	if found && dirtyMemoReusable(cached, version, time.Now()) {
+		// Verify the actual opened file's filesystem, not merely the root mount.
+		current, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return dirtyContentMemo{}, false, err
+		}
+		opened, statErr := current.Stat()
+		local := statErr == nil && dirtyLocalFilesystem(current)
+		closeErr := current.Close()
+		if statErr != nil || closeErr != nil || !opened.Mode().IsRegular() || dirtyVersion(opened) != version {
+			return dirtyContentMemo{}, false, fmt.Errorf("dirty file %q changed before cache lookup", path)
+		}
+		if local {
+			return cached, true, nil
+		}
+	}
+	memo, err := readDirtyContent(ctx, root, path, info)
+	return memo, false, err
+}
+func readDirtyContent(ctx context.Context, root *os.Root, path string, before os.FileInfo) (dirtyContentMemo, error) {
+	memo := dirtyContentMemo{version: dirtyVersion(before), hashedAt: time.Now()}
+	if err := ctx.Err(); err != nil {
+		return memo, err
+	}
+	var reader io.Reader
+	var file *os.File
+	readSize := before.Size()
+	switch {
+	case before.Mode()&os.ModeSymlink != 0:
+		target, err := root.Readlink(path)
+		if err != nil {
+			return memo, err
+		}
+		memo.mode = symlinkMode
+		readSize = int64(len(target)) // Windows link stat size need not equal text bytes.
+		reader = strings.NewReader(target)
+	case before.Mode().IsRegular():
+		var err error
+		// NONBLOCK closes the regular-file to FIFO race before fstat can reject it.
+		file, err = root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return memo, err
+		}
+		defer file.Close()
+		opened, err := file.Stat()
+		if err != nil || !opened.Mode().IsRegular() || dirtyVersion(opened) != memo.version {
+			return memo, fmt.Errorf("dirty file %q changed before reading", path)
+		}
+		memo.reusable = memo.version.cacheable && dirtyLocalFilesystem(file) && dirtyStampQuiet(memo.version, memo.hashedAt)
+		memo.mode = "100644"
+		if before.Mode()&0o100 != 0 {
+			memo.mode = "100755"
+		}
+		reader = file
+	default:
+		return memo, fmt.Errorf("unsupported dirty file type at %q: %s", path, before.Mode())
+	}
+	var err error
+	memo.sha1, memo.sha256, err = hashDirtyReader(ctx, reader, readSize)
+	if err != nil {
+		return memo, fmt.Errorf("read dirty path %q: %w", path, err)
+	}
+	after, err := root.Lstat(path)
+	if err != nil || dirtyVersion(after) != memo.version {
+		return memo, fmt.Errorf("dirty file %q changed while reading", path)
+	}
+	if file != nil {
+		current, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return memo, err
+		}
+		currentInfo, statErr := current.Stat()
+		closeErr := current.Close()
+		originalInfo, originalErr := file.Stat()
+		if statErr != nil || closeErr != nil || originalErr != nil || !currentInfo.Mode().IsRegular() || !os.SameFile(originalInfo, currentInfo) || dirtyVersion(currentInfo) != memo.version || dirtyVersion(originalInfo) != memo.version {
+			return memo, fmt.Errorf("dirty file %q was replaced while reading", path)
+		}
+	}
+	return memo, nil
+}
+func hashDirtyReader(ctx context.Context, reader io.Reader, size int64) (string, string, error) {
+	if size < 0 {
+		return "", "", errors.New("invalid dirty file size")
+	}
+	one, two := sha1.New(), sha256.New()
+	header := "blob " + strconv.FormatInt(size, 10) + "\x00"
+	_, _ = io.WriteString(one, header)
+	_, _ = io.WriteString(two, header)
+	writer := io.MultiWriter(one, two)
+	var buffer [32 * 1024]byte
+	var count int64
+	empty := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
+		n, err := reader.Read(buffer[:])
+		if n > 0 {
+			empty = 0
+			if int64(n) > size-count {
+				return "", "", errors.New("dirty file grew while reading")
+			}
+			count += int64(n)
+			_, _ = writer.Write(buffer[:n])
+		} else if err == nil {
+			empty++
+			if empty >= 100 {
+				return "", "", io.ErrNoProgress
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if count != size {
+		return "", "", errors.New("dirty file changed length while reading")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	return hex.EncodeToString(one.Sum(nil)), hex.EncodeToString(two.Sum(nil)), nil
 }
 
 // compareDirtyEntries orders entries by path, breaking ties on kind so

@@ -104,8 +104,12 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 						ErrCatalogStaleGuard, req.Cleanup.CleanupID,
 						entry.PrimaryEpoch, req.ExpectedPrimaryEpoch)
 				}
+				entry, err = authorizeCleanupAttemptTx(ctx, tx, entry, *req.Cleanup)
+				if err != nil {
+					return err
+				}
 				out.Cleanup, out.Existing = &entry, true
-				return nil
+				return closeAuthorizedUntrackGraphTx(ctx, tx, req)
 			}
 		}
 
@@ -177,6 +181,9 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 		out.Revoked = candidates
 
 		if req.Cleanup != nil {
+			if err := closeAuthorizedUntrackGraphTx(ctx, tx, req); err != nil {
+				return err
+			}
 			if err := insertCleanupEntryTx(ctx, tx, *req.Cleanup); err != nil {
 				return err
 			}
@@ -246,6 +253,9 @@ func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthor
 				ErrCatalogStaleGuard, req.CheckoutID, active)
 		}
 		if req.Cleanup != nil {
+			if err := closeDedicatedGraphAdmissionTx(ctx, tx, req.OwnedGraphID); err != nil {
+				return err
+			}
 			entry, exists, err := cleanupEntryTx(ctx, tx, req.Cleanup.CleanupID)
 			if err != nil {
 				return err

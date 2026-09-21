@@ -1,9 +1,11 @@
 package indexer
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"go.uber.org/zap"
 
@@ -57,12 +59,300 @@ import (
 // carries no explicit cap. See IndexConfig.AffectedByReresolveMax.
 const defaultAffectedByMax = 200
 
-// affectedByMaxFiles returns the effective fan-out cap.
+// affectedByMaxFiles returns the effective fan-out cap. The cap bounds ONE
+// pass — for a batch that is the whole batch, not each changed file in it: a
+// per-file cap over N changed files is a bound of N*cap, which is not a bound
+// at all on the batches this path actually sees (a branch switch reindexes
+// hundreds of paths at once). The sparse builder reads the same config key for
+// the same reason and applies it to the whole closure walk, not per seed
+// (builder_closure.go builderClosureCap).
 func (idx *Indexer) affectedByMaxFiles() int {
 	if n := idx.config.AffectedByReresolveMax; n > 0 {
 		return n
 	}
 	return defaultAffectedByMax
+}
+
+// affectedByTruncation is the completeness fact a bounded affected-by pass
+// emits. It is a fact, not a metric: a truncated pass leaves the dropped files
+// holding edges and persisted reference facts derived against the OLD shape,
+// so a caller that cannot tell a truncated fan-out from a complete one cannot
+// tell a coherent graph from an incoherent one. It mirrors
+// BuildReport.ClosureTruncated / ClosureCap on the sparse path, which publishes
+// a cut closure as knowingly incomplete rather than silently diverging
+// (builder_closure.go, builder_generation.go).
+type affectedByTruncation struct {
+	// Truncated is the fact itself: the bound fired.
+	Truncated bool
+	// Cap is the bound that fired and Considered the size of the union
+	// before it.
+	Cap        int
+	Considered int
+	// Dropped lists, sorted, the referencing files the pass did NOT
+	// re-resolve. They still hold stale edges and stale durable facts.
+	Dropped []string
+}
+
+// boundAffectedByFiles applies the whole-batch bound to an already-sorted
+// union of referencing files and returns the kept prefix plus the completeness
+// fact.
+//
+// Sorting is the caller's job and is load-bearing: keeping the
+// lexicographically smallest cap entries makes a truncated batch the same
+// batch on every run of the same inputs, and — because that choice is
+// order-independent — makes an incrementally maintained bound identical to a
+// one-shot bound over the same union. It is the same determinism rule
+// closureWalk.admitAll relies on (builder_closure.go).
+//
+// A non-positive cap is treated as "no bound": affectedByMaxFiles never
+// returns one, but an explicit zero must not mean "re-resolve nothing".
+func boundAffectedByFiles(files []string, maxFiles int) ([]string, affectedByTruncation) {
+	fact := affectedByTruncation{Cap: maxFiles, Considered: len(files)}
+	if maxFiles <= 0 || len(files) <= maxFiles {
+		return files, fact
+	}
+	fact.Truncated = true
+	fact.Dropped = append([]string(nil), files[maxFiles:]...)
+	return files[:maxFiles], fact
+}
+
+// reportAffectedByTruncation surfaces the completeness fact exactly once per
+// bound application.
+//
+// It is a Warn, not the Debug the pass used to emit: the sparse builder logs
+// its own cut closure at Warn (builder_closure.go), and the two say the same
+// thing — the pass knowingly left dependents reading a stale resolution. The
+// message and the affected/cap/dropped field names are the pre-existing
+// contract (affected_by_e2e_test.go reads them); scope replaces the single
+// changed-file name, which a whole-batch bound no longer has.
+//
+// The dropped set also rides the pass-observation hook, so a caller can name
+// the files that were not re-resolved without parsing logs.
+func (idx *Indexer) reportAffectedByTruncation(scope string, fact affectedByTruncation) {
+	if idx == nil {
+		return
+	}
+	// Record the pass FIRST and unconditionally. A caller asking "was the
+	// derived work over my edit finished" needs the positive answer as much as
+	// the negative one, and the only moment that can be answered honestly is
+	// the moment the bound was applied: a pass that never ran (global passes
+	// deferred, an inert commit) must read as "not measured", never as
+	// "complete". Everything below this line is the TRUNCATED case only.
+	idx.observeDerivedFanoutPass(affectedByFanoutPass, fact)
+	if !fact.Truncated {
+		return
+	}
+	idx.logger.Warn("affected-by: re-resolve set truncated",
+		zap.String("repo", idx.repoPrefix),
+		zap.String("scope", scope),
+		zap.Int("affected", fact.Considered),
+		zap.Int("cap", fact.Cap),
+		zap.Int("dropped", len(fact.Dropped)))
+	idx.observeIncrementalCatchup("affected_by_truncated", fact.Dropped)
+	idx.carryAffectedByTruncationOnReceipt(fact)
+}
+
+// affectedByFanoutPass is the pass name the completeness fact rides under on
+// the mutation receipt. It is the wire spelling; keep it stable.
+const affectedByFanoutPass = "affected_by"
+
+// carryAffectedByTruncationOnReceipt puts the cut on the MUTATION RECEIPT for
+// the window the pass ran in, which is the only channel that outlives the
+// pass.
+//
+// Before this, the fact stopped at a Warn line and a pass-observation hook
+// whose only setters are tests: nothing a caller, an API or a receipt consumer
+// can read could tell a truncated fan-out from a complete one, so the bound
+// was invisible to everything except a human tailing logs. The receipt is
+// already the object every incremental mutation hands its resolution decision
+// (incremental_watcher_batch.go incrementalResolutionFrontier), and the
+// affected-by pass runs INSIDE that window — commitStructuralIncrementalBatch
+// merges or executes the plan while the token is still open — so the fact
+// lands on the receipt the mutation actually returns.
+//
+// It rides its own additive axis, never Complete. Voiding Complete would make
+// every truncated fan-out force the conservative whole-frontier fallback this
+// path exists to avoid, and would also lie: the store described the mutation
+// delta exactly; it was the derived pass over that delta that was cut.
+//
+// A store that bears receipts but cannot carry the fact is reported, loudly
+// and by name. Silence there would be the same defect one layer down.
+//
+// The outcome is read as the three-way MutationFanoutNote, not as a boolean:
+// "nothing to carry" and "this store drops the fact" are different answers,
+// and only the second one is a gap. Collapsing them would make a producer that
+// reports a size without names — the shape receiptDroppedCount's count
+// fallback exists for — indict the store for a hole of its own making.
+func (idx *Indexer) carryAffectedByTruncationOnReceipt(fact affectedByTruncation) {
+	if idx == nil || idx.graph == nil || !fact.Truncated {
+		return
+	}
+	truncation := receiptFanoutTruncationFor(affectedByFanoutPass, fact)
+	dropped := truncation.DroppedFiles
+	note := graph.NoteMutationFanoutTruncation(idx.graph, truncation)
+	if note != graph.MutationFanoutNoteNoCarrier {
+		return
+	}
+	if _, bearsReceipts := idx.graph.(graph.MutationReceiptStore); !bearsReceipts {
+		// A store with no receipt capability at all never promised the fact a
+		// carrier; its callers already take the conservative frontier.
+		return
+	}
+	idx.logger.Warn("affected-by: truncation has no mutation-receipt carrier",
+		zap.String("repo", idx.repoPrefix),
+		zap.Int("dropped", len(dropped)),
+		zap.String("store", fmt.Sprintf("%T", idx.graph)))
+	idx.observeIncrementalCatchup("affected_by_truncated_uncarried", dropped)
+}
+
+// receiptFanoutTruncationFor lowers the pass's in-process completeness fact
+// into the single wire shape BOTH carriers take — the store's mutation receipt
+// and the per-mutation observation below. One lowering, so the two channels can
+// never disagree about what was dropped.
+func receiptFanoutTruncationFor(pass string, fact affectedByTruncation) graph.ReceiptFanoutTruncation {
+	dropped := append([]string(nil), fact.Dropped...)
+	return graph.ReceiptFanoutTruncation{
+		Pass:         pass,
+		Cap:          fact.Cap,
+		Considered:   fact.Considered,
+		Dropped:      len(dropped),
+		DroppedFiles: dropped,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The per-mutation observation channel
+// ---------------------------------------------------------------------------
+//
+// carryAffectedByTruncationOnReceipt puts the cut on the STORE's mutation
+// receipt, which is the durable record a receipt consumer reads. That channel
+// must NOT be the one a single mutation's caller reads, for two reasons the
+// store's own modules state:
+//
+//   - A receipt window is STORE-WIDE. store_sqlite/mutation_receipt.go records
+//     a cut into every receipt open on the store, so under MultiWatcher one
+//     repository's bounded pass would land on a sibling repository's window and
+//     that sibling's edit response would name a hole that is not its own.
+//   - A receipt-active store leaves its read-free fast paths
+//     (reindex_receipt.go "no-op when no receipt window is active, keeping the
+//     normal reindex path read-free", plus the receipt-active arms in
+//     add_batch_set.go and file_batch_evict.go). Holding a window open across a
+//     whole point mutation — the resolver and derived catch-up included, which
+//     incremental_watcher_batch.go keeps deliberately OUTSIDE the receipt
+//     boundary — would tax every concurrent writer on that store for the
+//     mutation's full duration, on the exact hot path this work exists to
+//     shrink.
+//
+// The observation below is the cheap, repo-scoped alternative: the pass writes
+// into it directly (one mutex, one merge), it is keyed by the Indexer that ran
+// the pass, and it costs a store with no observer open exactly nothing.
+//
+// It lives in a package-level side table rather than in an Indexer field only
+// because the Indexer struct is not this change's to widen. The lifetime is a
+// field's: every begin is paired with a deferred close that deregisters, and a
+// window whose Indexer was swapped underneath it simply observes nothing, which
+// is the safe direction.
+type derivedFanoutObservation struct {
+	idx    *Indexer
+	mu     sync.Mutex
+	closed bool
+	// ran is the discriminator. It is set when a bounded derived pass APPLIED
+	// ITS BOUND inside this window, truncated or not — which is the only event
+	// that distinguishes "the pass finished" from "the pass never ran".
+	ran   bool
+	facts []graph.ReceiptFanoutTruncation
+}
+
+var derivedFanoutObservers = struct {
+	mu sync.Mutex
+	by map[*Indexer][]*derivedFanoutObservation
+}{by: make(map[*Indexer][]*derivedFanoutObservation)}
+
+// beginDerivedFanoutObservation opens a window on one Indexer's bounded derived
+// passes. A nil Indexer observes nothing; so does a nil window, so callers need
+// no nil checks.
+func beginDerivedFanoutObservation(idx *Indexer) *derivedFanoutObservation {
+	if idx == nil {
+		return nil
+	}
+	observation := &derivedFanoutObservation{idx: idx}
+	derivedFanoutObservers.mu.Lock()
+	derivedFanoutObservers.by[idx] = append(derivedFanoutObservers.by[idx], observation)
+	derivedFanoutObservers.mu.Unlock()
+	return observation
+}
+
+// close deregisters the window and returns its verdict. It is idempotent in
+// both directions, and that is load-bearing: it is deferred as a panic leak
+// guard — a stranded window would silently absorb every later pass's facts —
+// while the same call is made inline to read the verdict. The second call must
+// report NOTHING observed rather than re-report the first call's answer, so a
+// leak guard can never be mistaken for a measurement.
+func (o *derivedFanoutObservation) close() DerivedFanoutCompleteness {
+	if o == nil {
+		return DerivedFanoutCompleteness{}
+	}
+	derivedFanoutObservers.mu.Lock()
+	if live := derivedFanoutObservers.by[o.idx]; len(live) > 0 {
+		kept := live[:0]
+		for _, candidate := range live {
+			if candidate != o {
+				kept = append(kept, candidate)
+			}
+		}
+		if len(kept) == 0 {
+			delete(derivedFanoutObservers.by, o.idx)
+		} else {
+			derivedFanoutObservers.by[o.idx] = kept
+		}
+	}
+	derivedFanoutObservers.mu.Unlock()
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed || !o.ran {
+		o.closed = true
+		return DerivedFanoutCompleteness{}
+	}
+	o.closed = true
+	// Lower through the same receipt lowering the store axis uses, so the two
+	// carriers report one fact in one shape.
+	return DerivedFanoutFromReceipt(graph.MutationReceipt{FanoutTruncations: o.facts})
+}
+
+func (o *derivedFanoutObservation) record(truncation *graph.ReceiptFanoutTruncation) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return
+	}
+	o.ran = true
+	if truncation != nil {
+		o.facts = graph.MergeReceiptFanoutTruncation(o.facts, *truncation)
+	}
+}
+
+// observeDerivedFanoutPass tells every window open on THIS Indexer that a
+// bounded derived pass applied its bound, and what it dropped if it dropped
+// anything. A repository with no window open pays one map lookup.
+func (idx *Indexer) observeDerivedFanoutPass(pass string, fact affectedByTruncation) {
+	if idx == nil {
+		return
+	}
+	derivedFanoutObservers.mu.Lock()
+	live := append([]*derivedFanoutObservation(nil), derivedFanoutObservers.by[idx]...)
+	derivedFanoutObservers.mu.Unlock()
+	if len(live) == 0 {
+		return
+	}
+	var truncation *graph.ReceiptFanoutTruncation
+	if fact.Truncated {
+		lowered := receiptFanoutTruncationFor(pass, fact)
+		truncation = &lowered
+	}
+	for _, observation := range live {
+		observation.record(truncation)
+	}
 }
 
 // symbolShape is the per-symbol contract the delta compares under the
@@ -83,6 +373,18 @@ type symbolShape struct {
 // rewrites its `name@<line>` / `..._L<line>` ID.
 func stableSymbolKey(n *graph.Node) string {
 	return string(n.Kind) + "\x00" + n.Name
+}
+
+// stableSymbolKeyName recovers the NAME half of a stable key. Callers that
+// reason about what a referrer in another file can bind to need the name
+// rather than the (kind, name) pair: a referrer parked under
+// `unresolved::<name>` is offered every kind that answers for that name, so a
+// contract change on ANY kind of that name is a change for all of them.
+func stableSymbolKeyName(key string) string {
+	if i := strings.IndexByte(key, 0); i >= 0 {
+		return key[i+1:]
+	}
+	return key
 }
 
 // symbolShapeAdjacency is the file-bounded graph slice needed to derive every
@@ -553,14 +855,8 @@ func (idx *Indexer) reresolveAffectedBy(changedPath string, snap *affectedBySnap
 	if len(files) == 0 {
 		return
 	}
-	if maxFiles := idx.affectedByMaxFiles(); len(files) > maxFiles {
-		idx.logger.Debug("affected-by: re-resolve set truncated",
-			zap.String("file", changedPath),
-			zap.Int("affected", len(files)),
-			zap.Int("cap", maxFiles),
-			zap.Int("dropped", len(files)-maxFiles))
-		files = files[:maxFiles]
-	}
+	files, truncation := boundAffectedByFiles(files, idx.affectedByMaxFiles())
+	idx.reportAffectedByTruncation(changedPath, truncation)
 	idx.resolver.ResolveFilesAndIncoming(files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), files)
 	idx.persistRefFactsForFiles(files)

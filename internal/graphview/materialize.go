@@ -3,6 +3,7 @@ package graphview
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"go.uber.org/zap"
@@ -11,6 +12,41 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
+
+// MaxDedicatedBaseChainDepth is how many persisted generations one dedicated
+// base's delta chain may contain, counting its full root.
+//
+// It is a READ-time number that the write side is required to respect, not a
+// storage tuning knob: assemble nests one OverlaidView and opens one full
+// GenerationLayer mask read set per ancestor, so every generation in the chain
+// is another indirection on every node and edge lookup for every reader of
+// that base, forever — the chain is persisted, so the cost is paid long after
+// the advance that added the link. The publisher therefore proposes a new full
+// root instead of extending a chain that already holds this many generations
+// (internal/indexer/dedicated_base_advance.go, maxDedicatedBaseDeltaAncestors,
+// which is defined as this constant so the two sides cannot drift apart).
+//
+// It is deliberately well under the catalog's hard ancestry limit
+// (store_sqlite, maxDedicatedBaseAncestry = 64): the hard limit is the last
+// line of defence against a corrupt chain, and a policy that only stopped
+// there would make every refusal a publication failure instead of a re-root.
+const MaxDedicatedBaseChainDepth = 32
+
+// MaxGenerationAncestryDepth bounds the persisted BaseGenerationID chain a
+// materialized view will compose, counting the identity generation the walk
+// starts from.
+//
+// It is the dedicated chain bound plus the one checkout layer that legitimately
+// stands on a dedicated head: a checkout's commit generation names the
+// dedicated base as its BaseGenerationID (indexer.CheckoutCoordinator's
+// commitIdentity), so materializing a checkout routed over a maximal dedicated
+// chain walks one generation further than materializing that base as a ref
+// view. The working-tree generation is not in this walk — it is a routed
+// generation stacked above the identity generation, and MaxRepoViewLayers
+// bounds that half of the stack.
+//
+// Exceeding it is refused, never truncated: see generationAncestry.
+const MaxGenerationAncestryDepth = MaxDedicatedBaseChainDepth + 1
 
 // Materializer turns a checkout's route into a readable view.
 //
@@ -116,13 +152,109 @@ func (v *RepoView) GenerationSources() []GenerationSource {
 	return out
 }
 
+// PinsBaseCorpus reports whether this view's lease holds generation zero as
+// well as its derived stack. Generations() deliberately does not list it — the
+// identity and the composition are about the derived generations — so this is
+// how a caller checks that the bottom of the stack is pinned too.
+func (v *RepoView) PinsBaseCorpus() bool {
+	if v == nil {
+		return false
+	}
+	return slices.Contains(v.lease.IDs(), BaseCorpusGeneration)
+}
+
 // Close releases the view's lease. Calling it twice, or on a nil view,
 // does nothing.
+//
+// It releases the pinned generations only when no handed-off consumer is
+// still live: a request that detached work through Handoff keeps its payload
+// readable until that work closes its own handle.
 func (v *RepoView) Close() {
 	if v == nil {
 		return
 	}
 	v.closeOnce.Do(func() { v.lease.Release() })
+}
+
+// ViewHandoff is a joined consumer of a RepoView: the same reader over the
+// same pinned generations, handed to work that outlives the request that
+// materialized it — a detached worker, a cancellation tail, a background
+// build.
+//
+// Close is mandatory and idempotent. Until it runs, every generation the
+// original view read stays pinned and retirement of any of them is refused,
+// whether or not the originating view has been closed.
+type ViewHandoff struct {
+	// ID names the exact content this handle reads: the identity the
+	// originating view was materialized under.
+	ID RepoViewID
+	// CheckoutRouteEpoch is the catalog route snapshot the originating view
+	// pinned. It is zero for immutable ref views.
+	CheckoutRouteEpoch int64
+	// Reader is the composed graph the originating view served.
+	Reader graph.Reader
+	// Completeness is what that view could answer.
+	Completeness Completeness
+
+	generations []int64
+	sources     []GenerationSource
+	lease       *LeaseHandoff
+	closeOnce   sync.Once
+}
+
+// Handoff joins a consumer to this view's lease and returns a handle that
+// keeps the whole pinned generation ancestry alive on its own.
+//
+// It returns nil when there is nothing left to join: a nil view, a view with
+// no lease, or a view whose every holder has already released. A caller that
+// wanted to detach work must treat nil as a refusal — the payload underneath
+// may already be gone — and never as a successful handoff.
+func (v *RepoView) Handoff() *ViewHandoff {
+	if v == nil {
+		return nil
+	}
+	joined := v.lease.Handoff()
+	if joined == nil {
+		return nil
+	}
+	return &ViewHandoff{
+		ID:                 v.ID,
+		CheckoutRouteEpoch: v.CheckoutRouteEpoch,
+		Reader:             v.Reader,
+		Completeness:       v.Completeness,
+		generations:        slices.Clone(v.generations),
+		sources:            slices.Clone(v.sources),
+		lease:              joined,
+	}
+}
+
+// Generations lists every payload generation this handle keeps pinned,
+// bottom first, exactly as the originating view reported them.
+func (h *ViewHandoff) Generations() []int64 {
+	if h == nil {
+		return nil
+	}
+	return slices.Clone(h.generations)
+}
+
+// GenerationSources lists the stack's generations bottom first, in the order
+// they compose. The sources are valid for as long as this handle is open:
+// every handle is pinned to a generation the joined lease keeps from
+// retiring, even after the originating view closed.
+func (h *ViewHandoff) GenerationSources() []GenerationSource {
+	if h == nil {
+		return nil
+	}
+	return slices.Clone(h.sources)
+}
+
+// Close releases the joined consumer's hold on the view's generations.
+// Calling it twice, or on a nil handle, does nothing.
+func (h *ViewHandoff) Close() {
+	if h == nil {
+		return
+	}
+	h.closeOnce.Do(h.lease.Release)
 }
 
 // MaterializeCheckout builds the view a checkout's queries currently
@@ -242,7 +374,12 @@ func (m *Materializer) pinCheckoutRoute(
 		provisional.Release()
 		return nil, false, err
 	}
-	lease := m.Leases.Acquire(ancestry...)
+	pinned, err := m.leaseSet(ctx, ancestry, generations)
+	if err != nil {
+		provisional.Release()
+		return nil, false, err
+	}
+	lease := m.Leases.Acquire(pinned...)
 	provisional.Release()
 
 	// A route can move while ancestry is being resolved. Re-read it after the
@@ -269,14 +406,117 @@ func (m *Materializer) pinGenerationAncestry(ctx context.Context, generations []
 		provisional.Release()
 		return nil, err
 	}
-	lease := m.Leases.Acquire(ancestry...)
+	pinned, err := m.leaseSet(ctx, ancestry, generations)
+	if err != nil {
+		provisional.Release()
+		return nil, err
+	}
+	lease := m.Leases.Acquire(pinned...)
 	provisional.Release()
 	return lease, nil
+}
+
+// leaseSet is what a view's lease must hold: the derived ancestry, plus
+// generation zero when the composed reader actually reads through it.
+//
+// generationAncestry walks BaseGenerationID until it reaches zero and stops
+// there, so the set it returns is the derived generations only. Generation
+// zero is the terminator of that chain, not a link in it — and in the legacy
+// regime it is also the reader's bottom layer, the one thing in the stack a
+// reader held nothing over. assemble decides that with exactly the condition
+// mirrored here: a stack whose ancestry is longer than its routed generations
+// stands on a dedicated root, and so does one whose first row is a dedicated
+// corpus; everything else is composed over Store.AtGeneration(0).
+//
+// Pinning it only in that regime is deliberate. A view that does not read
+// generation zero has no business holding it — an over-broad pin is an
+// untruthful statement about what a reader depends on, and retirement and
+// cleanup bookkeeping read these pins. The corpus at index zero of a routed
+// content search is a separate consumer with a separate hold; see BasePin.
+func (m *Materializer) leaseSet(ctx context.Context, ancestry, generations []int64) ([]int64, error) {
+	composed, err := m.composesBaseCorpus(ctx, ancestry, generations)
+	if err != nil {
+		return nil, err
+	}
+	if !composed || slices.Contains(ancestry, BaseCorpusGeneration) {
+		return ancestry, nil
+	}
+	return append(slices.Clone(ancestry), BaseCorpusGeneration), nil
+}
+
+// composesBaseCorpus reports whether the reader assemble will build reads the
+// shared indexed corpus as its bottom layer. It mirrors assemble's own arm —
+// routedStart > 0 || firstRow.GenerationKind == "dedicated" — so the lease set
+// and the composition cannot disagree about what the view stands on.
+func (m *Materializer) composesBaseCorpus(ctx context.Context, ancestry, generations []int64) (bool, error) {
+	if len(ancestry) == 0 || len(ancestry) != len(generations) {
+		return false, nil
+	}
+	row, err := m.servableGeneration(ctx, ancestry[0])
+	if err != nil {
+		return false, err
+	}
+	return row.GenerationKind != "dedicated", nil
+}
+
+// AncestryTooDeepError reports a persisted generation chain that is longer
+// than MaxGenerationAncestryDepth, so the view cannot be composed.
+//
+// It is labelled rather than anonymous because the labels are what a diagnosis
+// needs and what a message cannot be parsed for: which view was asked for,
+// which ancestor the walk was standing on when the bound was reached, how deep
+// the chain already was there, and the bound itself. Depth is the depth of
+// Ancestor within the chain, counting Generation itself as depth one; it is
+// the bound plus one whenever the refusal fired, since the walk stops at the
+// first generation past the bound rather than measuring the whole chain.
+//
+// The wire code is CodeViewBuilding, which is the code every other structural
+// refusal in generationAncestry already carries, and it is honest about the
+// remedy: the publisher's allocation policy roots a new full base rather than
+// extending a chain this long, so the condition clears when that base
+// publishes and the retry hint the code carries is the right advice. It is not
+// CodeCheckoutInaccessible — the checkout is perfectly readable and a ref view
+// has no checkout at all — and it is not a new code, because the code list is
+// a wire contract owned by errors.go.
+type AncestryTooDeepError struct {
+	*ViewError
+	// Generation is the identity generation the view was asked for.
+	Generation int64 `json:"generation"`
+	// Ancestor is the generation the walk refused to descend into.
+	Ancestor int64 `json:"ancestor"`
+	// Depth is how deep Ancestor sits, counting Generation as depth one.
+	Depth int `json:"depth"`
+	// Limit is the bound that was exceeded: MaxGenerationAncestryDepth.
+	Limit int `json:"limit"`
+}
+
+// Unwrap puts the embedded *ViewError in the unwrap chain, so errors.Is
+// against ErrViewBuilding and errors.As against **ViewError both match. The
+// promoted Unwrap would otherwise skip it and return the ViewError's own
+// cause.
+func (e *AncestryTooDeepError) Unwrap() error { return e.ViewError }
+
+// newAncestryTooDeep builds the labelled refusal.
+func newAncestryTooDeep(generationID, ancestorID int64, depth int) *AncestryTooDeepError {
+	return &AncestryTooDeepError{
+		ViewError: NewViewError(CodeViewBuilding, fmt.Sprintf(
+			"generation %d stands on a chain at least %d generations deep at ancestor %d, over the %d-generation read bound",
+			generationID, depth, ancestorID, MaxGenerationAncestryDepth)),
+		Generation: generationID,
+		Ancestor:   ancestorID,
+		Depth:      depth,
+		Limit:      MaxGenerationAncestryDepth,
+	}
 }
 
 // generationAncestry resolves the physical stack beneath the routed
 // generations. The first routed generation may sit on a dedicated full base;
 // later routed generations must form an exact chain above it.
+//
+// The BaseGenerationID walk is bounded by MaxGenerationAncestryDepth and the
+// bound is a refusal, never a truncation: a stack this function returned short
+// would be a view silently missing the oldest generations' content, which is a
+// wrong answer rather than a degraded one.
 func (m *Materializer) generationAncestry(ctx context.Context, generations []int64) ([]int64, error) {
 	if len(generations) == 0 {
 		return nil, NewViewError(CodeViewBuilding, "the view has no generations")
@@ -287,6 +527,9 @@ func (m *Materializer) generationAncestry(ctx context.Context, generations []int
 		if _, duplicate := seen[generationID]; duplicate {
 			return nil, NewViewError(CodeViewBuilding,
 				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
+		}
+		if len(ancestry) >= MaxGenerationAncestryDepth {
+			return nil, newAncestryTooDeep(generations[0], generationID, len(ancestry)+1)
 		}
 		seen[generationID] = struct{}{}
 		row, err := m.servableGeneration(ctx, generationID)
@@ -504,17 +747,29 @@ func (m *Materializer) assemble(
 		return handle, layer, row, openErr
 	}
 
-	var base graph.Reader = m.Store.AtGeneration(0)
-	firstOverlay := 0
-	if routedStart > 0 {
-		handle, _, _, err := open(ancestry[0])
-		if err != nil {
+	firstHandle, firstLayer, firstRow, err := open(ancestry[0])
+	if err != nil {
+		return nil, err
+	}
+	if firstRow.GenerationKind == "dedicated" {
+		binding, found, bindingErr := m.Catalog.GetDedicatedGraph(ctx, graphID)
+		if bindingErr != nil {
+			return nil, WrapViewError(CodeCheckoutInaccessible, "read dedicated root graph "+graphID, bindingErr)
+		}
+		if !found {
+			return nil, NewViewError(CodeViewBuilding, "dedicated root graph is not in the catalog")
+		}
+		if err := validateDedicatedFullRoot(firstRow, binding, graphID, repoPrefix); err != nil {
 			return nil, err
 		}
-		base = handle
-		firstOverlay = 1
 	}
-	for index := firstOverlay; index <= routedStart; index++ {
+	var base graph.Reader
+	if routedStart > 0 || firstRow.GenerationKind == "dedicated" {
+		base = firstHandle
+	} else {
+		base = graph.NewOverlaidViewWithLayer(m.Store.AtGeneration(0), firstLayer)
+	}
+	for index := 1; index <= routedStart; index++ {
 		_, layer, _, err := open(ancestry[index])
 		if err != nil {
 			return nil, err
@@ -648,27 +903,75 @@ func dirtyLayerRef(row store_sqlite.ViewGeneration) (LayerRef, error) {
 // than recorded: producer names are a build-side vocabulary and the ones
 // that do not correspond to something a caller can require are build
 // stages, not answers a view offers.
+//
+// CapSearchText is the one capability the union is the wrong rule for.
+// generations is bottom first — assemble opens the ancestry in order and
+// appends the routed layers last — so the final handle is the view's top
+// layer, and for text search that top layer's declaration is the whole
+// answer:
+//
+// Text search is not answered out of the generations at all. A trigram index
+// is built from bytes on a checkout root (indexer/checkout_text_search.go,
+// trigram.Build(c.root, paths)), so what decides whether a search over that
+// root describes this view is whether the view's TOP layer is the working
+// copy the root holds. A working-tree layer is those bytes by construction; a
+// commit layer, a dedicated base and a ref-view generation each name a
+// committed tree that the root is free to have moved on from.
+//
+// Both halves of the union are wrong here, in opposite directions:
+//
+//   - Worst-casing would let a layer BELOW the working-tree layer withdraw a
+//     capability the live checkout answers exactly. That is why the producers
+//     under a working copy declare nothing at all (indexer/builder_generation.go,
+//     textSearchProducer) — and it is also why silence cannot be read as
+//     "inherited" here.
+//   - Seeding every capability at StateComplete and only ever worsting means a
+//     stack whose every layer stays silent contributes Complete. A directly
+//     selected committed identity — a ref view, a dedicated base with no dirty
+//     layer over it, a checkout whose working-tree slot is withdrawn — would
+//     then claim whole text search while the only searcher that could answer
+//     runs over a root that is not that snapshot.
+//
+// So the top layer's declaration is authoritative, and its silence is a
+// denial rather than an inheritance: StateUnavailable, which is what
+// Completeness.State already reports for a capability nothing declared.
 func (m *Materializer) completeness(generations []*store_sqlite.Store) (Completeness, error) {
 	known := KnownCapabilities()
 	out := make(Completeness, len(known))
 	for _, id := range known {
 		out[id] = StateComplete
 	}
-	for _, handle := range generations {
+	topText := StateUnavailable
+	for index, handle := range generations {
 		rows, err := handle.ProducerStates()
 		if err != nil {
 			return nil, WrapViewError(CodeCheckoutInaccessible,
 				fmt.Sprintf("read producer states of generation %d", handle.ViewGeneration()), err)
 		}
+		top := index == len(generations)-1
 		for _, row := range rows {
 			id := CapabilityID(row.Producer)
 			state := capabilityStateOf(row.State)
 			if !id.Valid() || !state.Valid() {
 				continue
 			}
+			if id == CapSearchText {
+				if top {
+					topText = state
+				}
+				continue
+			}
 			out[id] = out[id].worst(state)
 		}
 	}
+	// Unconditional, deliberately. An empty stack has no top layer to read a
+	// declaration off, and "no layer declared it" is exactly the denial this
+	// rule exists to report — letting the seeded StateComplete stand there
+	// would reinstate the false positive at the one moment there is not even a
+	// generation to blame for it. generationAncestry refuses an empty
+	// generation list before this is reached today, so the invariant costs
+	// nothing; it also stops depending on that distant precondition.
+	out[CapSearchText] = topText
 	return out, nil
 }
 
