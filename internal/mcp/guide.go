@@ -22,12 +22,12 @@ import (
 //     (sharedParamLegend) — the guide points at it, it is not repeated here.
 
 // guideProviders is the LLM-provider matrix + the `ask` delegation surface,
-// relocated verbatim out of the installed rule block. The 13-provider
+// relocated verbatim out of the installed rule block. The 14-provider
 // enumeration is the single-home marker asserted by the gates.
 const guideProviders = `## LLM providers (powers ` + "`ask`" + ` and ` + "`search_symbols assist:`" + ` modes)
 
 Selected via ` + "`llm.provider`" + ` in ` + "`.gortex.yaml`" + ` or ` + "`~/.gortex/config.yaml`" + `, or ` + "`GORTEX_LLM_PROVIDER`" + ` / ` + "`GORTEX_LLM_MODEL`" + `. One of:
-` + "`local`" + ` / ` + "`anthropic`" + ` / ` + "`openai`" + ` / ` + "`azure`" + ` / ` + "`ollama`" + ` / ` + "`claudecli`" + ` / ` + "`codex`" + ` / ` + "`copilot`" + ` / ` + "`cursor`" + ` / ` + "`opencode`" + ` / ` + "`gemini`" + ` / ` + "`bedrock`" + ` / ` + "`deepseek`" + `.
+` + "`local`" + ` / ` + "`anthropic`" + ` / ` + "`openai`" + ` / ` + "`azure`" + ` / ` + "`ollama`" + ` / ` + "`claudecli`" + ` / ` + "`codex`" + ` / ` + "`copilot`" + ` / ` + "`cursor`" + ` / ` + "`opencode`" + ` / ` + "`gemini`" + ` / ` + "`bedrock`" + ` / ` + "`deepseek`" + ` / ` + "`requesty`" + `.
 Only ` + "`local`" + ` needs a ` + "`-tags llama`" + ` build; the HTTP and subprocess adapters are pure Go, available in every binary.
 
 | Provider | Backend | Requires |
@@ -41,6 +41,7 @@ Only ` + "`local`" + ` needs a ` + "`-tags llama`" + ` build; the HTTP and subpr
 | ` + "`gemini`" + ` | Gemini ` + "`generateContent`" + ` | ` + "`llm.gemini.model`" + ` + ` + "`GEMINI_API_KEY`" + ` |
 | ` + "`bedrock`" + ` | AWS Bedrock Converse (SigV4) | ` + "`llm.bedrock.model_id`" + ` + AWS creds (region default ` + "`us-east-1`" + `) |
 | ` + "`deepseek`" + ` | DeepSeek Chat Completions | ` + "`llm.deepseek.model`" + ` + ` + "`DEEPSEEK_API_KEY`" + ` |
+| ` + "`requesty`" + ` | Requesty gateway (OpenAI-compatible) | ` + "`llm.requesty.model`" + ` + ` + "`REQUESTY_API_KEY`" + ` |
 
 Custom OpenAI-compatible endpoints register by name with ` + "`gortex provider add/list/show/remove`" + `. Anthropic accepts the tier sentinels ` + "`claude-haiku`" + ` / ` + "`claude-sonnet`" + ` / ` + "`claude-opus`" + ` and opt-in prompt caching / thinking / effort. ` + "`llm.routing`" + ` (off by default) routes ` + "`ask`" + ` to a cheaper or more capable model by graph-derived task complexity.
 

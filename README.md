@@ -55,7 +55,7 @@ High-quality parsing 257 languages/grammars through tree-sitter AST analysis, in
 - **Live editor overlays** — push unsaved buffers as a shadow graph; tools read through it. Branching for parallel speculative sessions
 - **GCX1 wire format** — published, round-trippable. **An additional −27% tokens vs JSON** at same fidelity → [docs/wire-format.md](docs/wire-format.md)
 - **Long-living daemon** — one process serves every IDE window; live fsnotify, an on-disk SQLite graph store, incremental restart, OS-supervised lifecycle
-- **9 LLM providers (optional)** — local llama.cpp, Anthropic, OpenAI, Ollama, Claude / Codex CLI subprocess, Gemini, Bedrock, DeepSeek → [docs/llm.md](docs/llm.md)
+- **9 LLM providers (optional)** — local llama.cpp, Anthropic, OpenAI, Ollama, Claude / Codex CLI subprocess, Gemini, Bedrock, DeepSeek, Requesty → [docs/llm.md](docs/llm.md)
 - **Composable safety** — `verify_change`, `check_guards`, `audit_agent_config` flag broken callers, guard violations, stale docs before they ship
 - **PR review, end to end** — `gortex prs` triages open PRs (per-PR blast radius, merge-order conflicts via shared communities, AI-ranked queue, reviewer suggestions); `gortex review` emits line-anchored findings with a BLOCK/REVIEW/APPROVE verdict from a graph-grounded rulepack; MCP tools (`pr_risk`, `get_pr_impact`, `review`, `review_pack`, `post_review`, …) expose it to agents → [docs/cli.md](docs/cli.md)
 - **HTTP server + Web UI** — versioned `/v1/*` API + MCP 2026 Streamable HTTP; standalone Next.js 15 UI with five 3D graph modes → [docs/server.md](docs/server.md)
