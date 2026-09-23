@@ -76,3 +76,5 @@ bench/run-linux-rest.sh
 internal/indexer/bench_vscode_test.go
 docs/worktree-branch-overlays.md
 docs/specs/
+# Local Pi runtime state
+.atl/

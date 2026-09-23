@@ -203,6 +203,11 @@ func RegisterAll(reg *parser.Registry) {
 	// claim that wins over the YAML extractor's `.yaml` extension since
 	// basenames are resolved first.
 	reg.Register(NewHelmExtractor())
+	// MQL4/MQL5 (.mq4/.mq5/.mqh) — bespoke tree-sitter via the
+	// davalillo/tree-sitter-mql5 fork (tree-sitter-cpp + MQL5 extensions).
+	// Registered before registerForestLanguages; one grammar serves all
+	// three extensions (modern MQL4 shares MQL5 syntax since build 600).
+	reg.Register(NewMQLExtractor())
 	registerForestLanguages(reg)
 
 	// ObjC registered last so it wins the `.m` extension over Matlab.

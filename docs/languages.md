@@ -1,17 +1,17 @@
 # Supported Languages
 
-Gortex currently indexes **256 languages**. Each language has an extractor that
+Gortex currently indexes **257 languages**. Each language has an extractor that
 walks the source, emits symbols (functions, methods, types, interfaces,
 variables) into the graph, and records `imports` / `calls` edges.
 
 Three engine tiers are used, in order of decreasing extraction depth:
 
-- **bespoke tree-sitter** (~30 languages) — full concrete syntax tree via a
+- **bespoke tree-sitter** (~31 languages) — full concrete syntax tree via a
   vendored grammar with hand-tuned S-expression queries. Produces high-fidelity
   symbols, resolved call edges, ORM/contract/dataflow extraction, and accurate
   node ranges. Languages: Go, TypeScript, JavaScript, Python, Rust, Java, C#,
   Kotlin, Swift, Scala, PHP, Ruby, Elixir, C, C++, Dart, OCaml, Lua, Bash, SQL,
-  HTML, CSS, Markdown, OrgMode, Protobuf, YAML, TOML, HCL, Dockerfile, Julia.
+  HTML, CSS, Markdown, OrgMode, Protobuf, YAML, TOML, HCL, Dockerfile, Julia, MQL4/MQL5.
 - **regex** (~60 languages) — pattern-matched line scanning with indent / brace /
   keyword block heuristics. Captures top-level symbols and imports; call edges
   vary per language. Used where no upstream tree-sitter grammar is available
@@ -37,7 +37,7 @@ server matrix, install commands, lifecycle knobs, and config schema.
 
 | Category | Count | Languages |
 |---|---|---|
-| Core programming | 10 | Go, TypeScript, JavaScript, Python, Rust, Java, C#, C, C++, Kotlin |
+| Core programming | 11 | Go, TypeScript, JavaScript, Python, Rust, Java, C#, C, C++, Kotlin, MQL4/MQL5 |
 | JVM, .NET, systems | 10 | Scala, Swift, PHP, Ruby, Groovy, F#, D, Zig, Vala, Objective-C |
 | Scripting & shell | 10 | Bash, PowerShell, Batch, Perl, Raku, Lua, Tcl, VimScript, AutoHotkey, CoffeeScript |
 | Functional | 8 | Haskell, OCaml, Elixir, Clojure, Erlang, Racket, Gleam, Emacs Lisp |
@@ -57,7 +57,7 @@ server matrix, install commands, lifecycle knobs, and config schema.
 | Forest — DB / query | 8 | SPARQL, SurrealQL, PromQL, Kusto, SOQL, SOSL, PRQL, Turtle |
 | Forest — data / lockfiles / shells / configs | ~28 | TSV, PSV, textproto, .po, PGN, todo.txt, go.mod / go.sum / go.work, Fish, Nushell, jq, Awk, Elvish, gitconfig / gitattributes / gitcommit / gitignore, Hyprlang, nftables, passwd, PEM, PoE filter, Puppet, ssh_config, sxhkdrc, tmux |
 | Forest — misc | ~14 | DOT, gnuplot, GPG, Strace, VRL, Zeek, Ziggy + Schema, Starlark, SourcePawn, SCSS, RBS, OCamllex, DataWeave, USD, WIT |
-| **Total** | **256** | |
+| **Total** | **257** | |
 
 ## Core programming — deep extraction
 
@@ -85,6 +85,7 @@ on interface nodes stores the expected method set for implementation matching.
 | OCaml | Full | Full (class) | Types/Modules | Module types | open | Full | Full |
 | Lua | Full | Full (M.func/M:method) | - | - | require() | Full | Full |
 | Julia | Full (long + short form, `where` syntax) | Full (qualified `Base.show`, operators) | Structs/abstract/primitive + fields | - | Full (`using`/`import`/`include`, selective lists incl. macros/operators) | Full (incl. broadcast, macro calls, `Vector{Int}` constructors) | `const` (with `member_of`) |
+| MQL4/MQL5 | Full | Full (in-body, receiver) | Classes/Structs/Enums | Full + Meta["methods"] | Full (`#include`) | Full (incl. templates) | `input`/`sinput`/`extern` (with `storage_class`) |
 
 ### Rust specifics
 
@@ -189,6 +190,43 @@ What is **not** covered:
   `unresolved::` names, and binding them to definitions in another file —
   including qualified calls into another file's module, and constructor
   call sites to `<Type>.<init>` — is resolver work, not attempted here.
+
+### MQL specifics
+
+MQL4 and MQL5 (`.mq4`/`.mq5`/`.mqh`) index through one bespoke extractor over
+`davalillo/tree-sitter-mql5` — independently maintained since 2026 (it began
+as a fork of the dormant `mskelton/tree-sitter-mql5`; full git history and
+per-contribution attribution preserved). The grammar is tree-sitter-cpp
+v0.23.4 plus the MQL5 `input` storage class, `sinput`, an
+`interface_specifier` rule, and the MQL-native `C'255,0,0'` / `D'2024.01.01'`
+literals. Its external scanner is the C-only scanner of the cpp base
+(renamed `tree_sitter_mql5_*`): the build needs no C++ toolchain. Modern MQL4
+(build 600+) shares MQL5 syntax and pre-600 legacy sources are a C subset, so
+one grammar serves all three extensions.
+
+- The file node carries `Meta["dialect"]` (`mql4`/`mql5`; `.mqh` is
+  content-sniffed with the same MQL5 markers mql-language-server uses,
+  defaulting to `mql4`).
+- `input` / `sinput` / `extern` top-level variables mint `variable` nodes with
+  `Meta["storage_class"]` — an EA's user-facing configuration surface.
+- `interface` declarations index as interfaces with `Meta["methods"]`
+  (declared method names) for implementation matching; interface methods mint
+  no method nodes of their own.
+- Class/struct bodies mint methods with `member_of` edges; `#include
+  "file.mqh"` emits `imports` edges to `unresolved::import::` targets.
+- Calls attribute to the enclosing function/method; member calls target
+  `unresolved::*.<method>` with the receiver text available for resolver work.
+
+What is **not** covered:
+
+- **Declarations that only become valid after macro expansion** (the Controls
+  event map — `ON_EVENT` / `EVENT_MAP_BEGIN` — or project macros like
+  `EA_INPUT`) stay ERROR nodes in the parse tree and mint nothing. This is the
+  same boundary mql-language-server enforces with its macro layer.
+- **Out-of-line member definitions** (`void CAccountProtector::OnStop() {…}`
+  outside the class body) emit as free functions under their bare name;
+  dedicated out-of-line member handling is a follow-up.
+- `#property` directives mint nothing.
 
 ## Data, config, build
 

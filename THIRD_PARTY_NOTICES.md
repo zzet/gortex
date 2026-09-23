@@ -266,6 +266,7 @@ For an automated license-aware report, run a tool such as
 - `github.com/coder/hnsw` @ v0.6.1
 - `github.com/cpuguy83/go-md2man/v2` @ v2.0.6
 - `github.com/daulet/tokenizers` @ v1.27.0
+- `github.com/davalillo/tree-sitter-mql5` @ v0.2.0
 - `github.com/davecgh/go-spew` @ v1.1.2-0.20180830191138-d8f796af33cc
 - `github.com/dlclark/regexp2` @ v1.12.0
 - `github.com/dmarkham/enumer` @ v1.6.1

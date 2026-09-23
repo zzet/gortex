@@ -714,6 +714,28 @@ var Servers = []ServerSpec{
 		Daemon:      true,
 		MaxParallel: 4,
 	},
+	{
+		Name:       "mql-lsp-server",
+		Command:    "mql-lsp-server",
+		Languages:  []string{"mql"},
+		Extensions: []string{".mq4", ".mq5", ".mqh"},
+		LanguageIDs: map[string]string{
+			".mq4": "mql4",
+			".mq5": "mql5",
+			// A header's dialect is not knowable from its extension, so
+			// .mqh maps to a languageId the server does not short-circuit
+			// on: its LanguageDetection then routes the file by content
+			// sniffing (the server's documented .mqh fallback).
+			".mqh": "mqh",
+		},
+		Priority:    5,
+		Daemon:      true,
+		MaxParallel: 4,
+		// davalillo/mql-language-server: an OmniSharp-based stdio LSP that
+		// speaks plain LSP with no args (the --stdio flag its docs show is
+		// accepted and ignored; the server always listens on stdio).
+		// Workspace indexing and include resolution are server-side.
+	},
 }
 
 // extToSpecs resolves a file extension (with leading dot, lower case)
