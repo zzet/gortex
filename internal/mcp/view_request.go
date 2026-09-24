@@ -532,6 +532,19 @@ func (s *Server) selectRequestView(
 // Only an automatic checkout is routed here. A dedicated checkout and the
 // family's primary are served from the indexed corpus, which is exactly what
 // the base path already does for them.
+//
+// A session whose cwd sits inside an automatic worktree checkout MUST never
+// be served silently from the base corpus: the path resolvers would then
+// anchor repo-relative and prefixed paths against the main checkout's root
+// and, for a file that exists in both checkouts, the worktreeRootedPath
+// existence heuristic would write the MAIN copy — the silent wrong-checkout
+// edit this lane exists to prevent (2026-09-19 incident). When the checkout
+// is ready+automatic but its route is not (yet) materializable on this
+// request, the cwd binding now fails LOUD with the same view_building code
+// an explicit worktree selector already produces, instead of degrading to
+// base. A soft fallback (base + labelled rider) remains available only for
+// tools the caller declared read-only: a base read is a degraded answer, a
+// base write would be a wrong one.
 func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 	cwd := SessionCWDFromContext(ctx)
 	if cwd == "" {
@@ -541,14 +554,47 @@ func (s *Server) viewForSessionCWD(ctx context.Context) (*requestView, error) {
 	if err != nil {
 		return s.viewForCWDLookupError(cwd, err)
 	}
-	if !found || !graphview.ServesAutomaticView(checkout) {
+	if !found {
+		return nil, nil
+	}
+	if !graphview.ServesAutomaticView(checkout) {
 		return nil, nil
 	}
 	if err := s.checkoutInSessionScope(ctx, checkout); err != nil {
 		return nil, err
 	}
 	requested := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID}
+	route, routeFound, routeErr := s.materializer.Catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
+	if routeErr == nil && routeFound && !graphview.RouteReady(route) {
+		// Route exists but is not serving both generation slots. Mutative
+		// tools refuse (writing the base corpus instead of this checkout is
+		// the wrong-corpus hazard); read tools fall back with the reason
+		// attached, so a degraded answer is at least visible.
+		s.activateSelectedCheckout(checkout.CheckoutID, "session cwd bound but route not ready")
+		if s.requestIsMutationFromContext(ctx) {
+			return nil, graphview.NewViewError(graphview.CodeViewBuilding,
+				fmt.Sprintf("checkout %q is not fully routed yet", checkout.CheckoutID))
+		}
+		rider := graphview.NewViewRider(graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID})
+		rider.GraphID = route.GraphID
+		rider.CheckoutID = checkout.CheckoutID
+		if markErr := rider.MarkFallback(string(graphview.SelectorBase), graphview.CodeViewBuilding); markErr != nil {
+			return nil, markErr
+		}
+		return &requestView{rider: rider}, nil
+	}
 	return s.materializeRequestView(ctx, requested, checkout, false)
+}
+
+// requestIsMutationFromContext reports whether the current request's tool has
+// write effects against the source. Used by the cwd-binding route-not-ready
+// gate, so a session anchored inside a worktree checkout refuses a mutation
+// loudly instead of writing the base corpus's copy of a file that exists in
+// both checkouts. Best-effort: without the call marker the request is treated
+// as read-only, the same posture refuseRoutedViewMutation takes.
+func (s *Server) requestIsMutationFromContext(ctx context.Context) bool {
+	name := authorizedToolCallFromContext(ctx)
+	return name != "" && s.facades.mutatesSource(name)
 }
 
 // A lookup error is not proof that the canonical corpus owns this CWD. Only

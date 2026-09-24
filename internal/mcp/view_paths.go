@@ -150,9 +150,9 @@ func requestReadsCommittedTree(ctx context.Context) bool {
 // so the existence heuristic must not get a vote — it would happily move the
 // path into a third checkout that happens to carry the file. Every other
 // request keeps the heuristic it has always had.
-func (s *Server) checkoutRootedPath(ctx context.Context, abs, root, repoPrefix string) string {
+func (s *Server) checkoutRootedPath(ctx context.Context, abs, root, repoPrefix string, refuseAmbiguous bool) (string, error) {
 	if view := requestViewPathRoot(ctx); view.serves(repoPrefix) {
-		return view.rooted(abs, root)
+		return view.rooted(abs, root), nil
 	}
-	return worktreeRootedPath(abs, root, s.multiIndexer)
+	return worktreeRootedPath(abs, root, s.multiIndexer, refuseAmbiguous)
 }

@@ -243,7 +243,8 @@ func TestWorktreeRootedPath(t *testing.T) {
 	t.Run("re-roots a file that lives only in the worktree", func(t *testing.T) {
 		// Resolved under the main checkout, but the file is not there.
 		abs := filepath.Join(mainRepo, "only_wt.go")
-		got := worktreeRootedPath(abs, mainRepo, mi)
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, resolvePath(t, filepath.Join(worktree, "only_wt.go")),
 			resolvePath(t, got),
 			"a file present only in the worktree must be re-rooted there")
@@ -251,16 +252,37 @@ func TestWorktreeRootedPath(t *testing.T) {
 
 	t.Run("leaves a file that exists in the resolved root", func(t *testing.T) {
 		abs := filepath.Join(mainRepo, "in_main.go")
-		got := worktreeRootedPath(abs, mainRepo, mi)
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, abs, got,
 			"a file that exists under the resolved root must not be moved")
+	})
+
+	// TestWorktreeRootedPath/refuses-a-file-that-exists-in-both-main-and-a-worktree
+	// pins the 2026-09-24 live incident: a session ran `git worktree add`,
+	// never moved its cwd into the new worktree, then issued an unrouted
+	// mutating edit for a path that git worktree add had copied into BOTH
+	// checkouts. worktreeRootedPath used to short-circuit on the first
+	// os.Stat hit against main and silently return main's path without ever
+	// looking at the linked worktrees — landing the edit in main while the
+	// caller's real intent was the worktree. It must now refuse instead.
+	t.Run("refuses a file that exists in both main and a worktree", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(filepath.Join(worktree, "in_main.go"),
+			[]byte("package main\n"), 0o644))
+		abs := filepath.Join(mainRepo, "in_main.go")
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		assert.Empty(t, got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errPathAmbiguousCheckout,
+			"a file present in both main and a ready worktree must be refused, not silently defaulted to main")
 	})
 
 	t.Run("leaves a brand-new file under the named prefix", func(t *testing.T) {
 		// A file in no checkout — a fresh write_file. It must stay
 		// where the caller addressed it.
 		abs := filepath.Join(mainRepo, "brand_new.go")
-		got := worktreeRootedPath(abs, mainRepo, mi)
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, abs, got,
 			"a new file must land under the prefix the caller named")
 	})
@@ -269,13 +291,16 @@ func TestWorktreeRootedPath(t *testing.T) {
 		// Root is the worktree itself — the file is already in the
 		// right checkout, nothing to re-root.
 		abs := filepath.Join(worktree, "only_wt.go")
-		got := worktreeRootedPath(abs, worktree, mi)
+		got, err := worktreeRootedPath(abs, worktree, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, abs, got,
 			"a path resolved against a worktree root must be left untouched")
 	})
 
 	t.Run("nil lookup is a no-op", func(t *testing.T) {
 		abs := filepath.Join(mainRepo, "only_wt.go")
-		assert.Equal(t, abs, worktreeRootedPath(abs, mainRepo, nil))
+		got, err := worktreeRootedPath(abs, mainRepo, nil, true)
+		require.NoError(t, err)
+		assert.Equal(t, abs, got)
 	})
 }

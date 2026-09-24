@@ -36,6 +36,12 @@ var errPathUnresolved = errors.New("path is not absolute and no indexed repo cou
 // responsible for the location.
 var errPathEscape = errors.New("relative path escapes the indexed repo root")
 
+// errPathAmbiguousCheckout is returned when an unrouted path resolves to
+// existing files in both the main checkout and a linked worktree. Silently
+// preferring main here is the 2026-09-24 live incident: an unrouted mutation
+// landed in the main checkout while a ready worktree also carried the file.
+var errPathAmbiguousCheckout = errors.New("path exists in more than one active checkout; specify an explicit view")
+
 // resolveFilePath turns a user-supplied path into the absolute filesystem
 // path the write should target. Accepts:
 //   - absolute paths (still confined: refused if outside every repo root)
@@ -105,7 +111,16 @@ func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, 
 				if !pathContainedIn(abs, root) {
 					return "", "", fmt.Errorf("%w: %q resolves to %q, outside repo root %q", errPathEscape, rawPath, abs, root)
 				}
-				abs = s.checkoutRootedPath(ctx, abs, root, soleRepo)
+				var rootErr error
+				// refuseAmbiguous=true: rawPath carries no explicit repo
+				// prefix here, so the anchoring to soleRepo is inferred,
+				// not caller-stated — exactly the 2026-09-24 incident
+				// shape (an unrouted, unprefixed edit that can silently
+				// land in main while a ready worktree also has the file).
+				abs, rootErr = s.checkoutRootedPath(ctx, abs, root, soleRepo, true)
+				if rootErr != nil {
+					return "", "", rootErr
+				}
 				// relPath is the GRAPH's spelling, not the caller's: it is
 				// what downstream node lookups (get_file_summary, savings
 				// recording, session bookkeeping) key on, and graph file
@@ -122,7 +137,11 @@ func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, 
 			// learning the prefix. A brand-new file (matches == 0) still
 			// requires an explicit prefix; a path present in several
 			// repos (matches > 1) is reported as such.
-			if abs, rel, matches := anchorUnprefixedExisting(s.multiIndexer, requestViewPathRoot(ctx), rawPath); matches == 1 {
+			abs, rel, matches, anchorErr := anchorUnprefixedExisting(s.multiIndexer, requestViewPathRoot(ctx), rawPath)
+			if anchorErr != nil {
+				return "", "", anchorErr
+			}
+			if matches == 1 {
 				return abs, rel, nil
 			} else if matches > 1 {
 				return "", "", fmt.Errorf("%w: path %q names a file in multiple tracked repos; prefix it with one of: %s/",
@@ -153,7 +172,17 @@ func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, 
 		// index identity with one. relPath stays the repo-prefixed form
 		// for session bookkeeping — the prefix names the same repo
 		// regardless of which worktree the bytes land in.
-		abs = s.checkoutRootedPath(ctx, abs, root, prefix)
+		//
+		// refuseAmbiguous=false: prefix came from matchedRepoPrefix
+		// against the caller's OWN rawPath — an explicit, caller-stated
+		// checkout selection, not an inferred one. Refusing here would
+		// break a legitimate "edit this exact named checkout" request
+		// (see TestEditFile_MainCheckoutPrefixStillEditsMainCheckout).
+		var rootErr error
+		abs, rootErr = s.checkoutRootedPath(ctx, abs, root, prefix, false)
+		if rootErr != nil {
+			return "", "", rootErr
+		}
 		return abs, rawPath, nil
 	}
 
@@ -246,22 +275,30 @@ type multiRepoLookup interface {
 //     a fresh write_file lands under the prefix the caller named.
 //   - It re-roots only when the match is unambiguous (exactly one
 //     worktree contains the file); two candidates leave abs untouched.
-func worktreeRootedPath(abs, root string, mi multiRepoLookup) string {
+// refuseAmbiguous distinguishes a caller-stated checkout selection (an
+// explicit repo prefix, or a prefix recovered from graph metadata) from
+// an inferred one (the sole-tracked-repo and anchorUnprefixedExisting
+// fallbacks, where the caller's path carried no prefix at all). Only the
+// inferred case is refused on ambiguity — refusing an explicit selection
+// would break a legitimate "edit this exact named checkout" request.
+func worktreeRootedPath(abs, root string, mi multiRepoLookup, refuseAmbiguous bool) (string, error) {
 	if abs == "" || root == "" || mi == nil {
-		return abs
+		return abs, nil
 	}
 	// Already inside a linked worktree — nothing to re-root.
 	if indexer.ResolveWorktree(root).IsWorktree {
-		return abs
+		return abs, nil
 	}
-	// The file is physically present where it resolved — the resolved
-	// root owns it.
+	mainExists := false
 	if _, err := os.Stat(abs); err == nil {
-		return abs
+		mainExists = true
+		if !refuseAmbiguous {
+			return abs, nil
+		}
 	}
 	rel, ok := relativeWithinRoot(root, abs)
 	if !ok {
-		return abs
+		return abs, nil
 	}
 	match := ""
 	for _, wt := range mi.LinkedWorktreeRoots(root) {
@@ -270,16 +307,26 @@ func worktreeRootedPath(abs, root string, mi multiRepoLookup) string {
 			continue
 		}
 		if match != "" && match != candidate {
-			// Ambiguous — more than one worktree carries this file.
-			// Leave the path at its originally-resolved location.
-			return abs
+			// Ambiguous among worktrees themselves — leave the path at
+			// its originally-resolved location, as before.
+			return abs, nil
 		}
 		match = candidate
 	}
-	if match != "" {
-		return match
+	// The file exists both where it resolved (main) and in a linked
+	// worktree: silently preferring main here is exactly the 2026-09-24
+	// live incident (an unrouted edit landed in main while a ready
+	// worktree also carried the file). Refuse rather than guess.
+	if mainExists && match != "" {
+		return "", fmt.Errorf("%w: %q resolves to both %q and %q", errPathAmbiguousCheckout, rel, abs, match)
 	}
-	return abs
+	if mainExists {
+		return abs, nil
+	}
+	if match != "" {
+		return match, nil
+	}
+	return abs, nil
 }
 
 // anchorUnprefixedExisting tries to anchor a bare repo-relative path —
@@ -297,9 +344,9 @@ func worktreeRootedPath(abs, root string, mi multiRepoLookup) string {
 // view is the checkout the calling request reads: the zero value keeps the
 // canonical anchoring, and a routed one moves both the existence probe and the
 // answer into its own working copy.
-func anchorUnprefixedExisting(mi multiRepoLookup, view viewPathRoot, rawPath string) (absPath, relPath string, matches int) {
+func anchorUnprefixedExisting(mi multiRepoLookup, view viewPathRoot, rawPath string) (absPath, relPath string, matches int, err error) {
 	if mi == nil || rawPath == "" || filepath.IsAbs(rawPath) {
-		return "", "", 0
+		return "", "", 0, nil
 	}
 	for _, prefix := range mi.RepoPrefixes() {
 		if prefix == "" {
@@ -323,9 +370,16 @@ func anchorUnprefixedExisting(mi multiRepoLookup, view viewPathRoot, rawPath str
 			resolved = view.rooted(cand, root)
 			probe = resolved
 		} else {
-			resolved = worktreeRootedPath(cand, root, mi)
+			// refuseAmbiguous=true: rawPath here carries no repo prefix —
+			// this whole function exists only to anchor an unprefixed
+			// path, so any checkout ambiguity is inferred, not stated.
+			var werr error
+			resolved, werr = worktreeRootedPath(cand, root, mi, true)
+			if werr != nil {
+				return "", "", 0, werr
+			}
 		}
-		if _, err := os.Stat(probe); err != nil {
+		if _, statErr := os.Stat(probe); statErr != nil {
 			continue
 		}
 		matches++
@@ -333,9 +387,9 @@ func anchorUnprefixedExisting(mi multiRepoLookup, view viewPathRoot, rawPath str
 		relPath = prefix + "/" + rawPath
 	}
 	if matches != 1 {
-		return "", "", matches
+		return "", "", matches, nil
 	}
-	return absPath, relPath, matches
+	return absPath, relPath, matches, nil
 }
 
 // pathContainedIn reports whether abs sits at or beneath root, after
@@ -503,7 +557,9 @@ func (s *Server) resolveNodePath(ctx context.Context, node *graph.Node) (string,
 			// same reasoning as resolveFilePath: worktrees of one repo
 			// share an index identity, so a node's resolved path can
 			// land on a sibling checkout.
-			return s.checkoutRootedPath(ctx, abs, root, node.RepoPrefix), nil
+			// refuseAmbiguous=false: node.RepoPrefix comes from the graph's
+			// own indexed metadata, not an inferred/unprefixed caller path.
+			return s.checkoutRootedPath(ctx, abs, root, node.RepoPrefix, false)
 		}
 		return "", fmt.Errorf("could not resolve repo root for node %q (repo_prefix=%q)", node.ID, node.RepoPrefix)
 	}
@@ -568,7 +624,13 @@ func (s *Server) resolveGraphPath(ctx context.Context, graphPath string) (string
 			// recover that root so the checkout choice has an anchor.
 			if prefix := matchedRepoPrefix(s.multiIndexer, graphPath); prefix != "" {
 				if root, ok := s.multiIndexer.RepoRoot(prefix); ok {
-					abs = s.checkoutRootedPath(ctx, abs, root, prefix)
+					var rootErr error
+					// refuseAmbiguous=false: prefix was recovered from the
+					// graph's matchedRepoPrefix, not an inferred anchor.
+					abs, rootErr = s.checkoutRootedPath(ctx, abs, root, prefix, false)
+					if rootErr != nil {
+						return "", rootErr
+					}
 				}
 			} else if _, root, ok := soleTrackedRepo(s.multiIndexer); ok {
 				// A lone repo's graph paths are spelled without a prefix, so
