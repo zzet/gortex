@@ -9,10 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// providerMatrixMarker is the 13-provider enumeration — the single-home
+// providerMatrixMarker is the 14-provider enumeration — the single-home
 // marker for the LLM-provider matrix. It must appear in the guide and NOWHERE
 // in the installed CLAUDE.md sections (asserted by the single-home gate).
-const providerMatrixMarker = "`local` / `anthropic` / `openai` / `azure` / `ollama` / `claudecli` / `codex` / `copilot` / `cursor` / `opencode` / `gemini` / `bedrock` / `deepseek`"
+const providerMatrixMarker = "`local` / `anthropic` / `openai` / `azure` / `ollama` / `claudecli` / `codex` / `copilot` / `cursor` / `opencode` / `gemini` / `bedrock` / `deepseek` / `requesty`"
 
 // formatDeepDiveMarker is a phrase unique to the wire-format deep-dive in the
 // server instructions (sharedParamLegend). It is the single-home marker for

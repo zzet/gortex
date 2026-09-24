@@ -129,11 +129,15 @@ func NewAPIProvider(url, model string) *APIProvider {
 	// OpenAI-compatible gateways). Ollama on localhost is keyless, so the
 	// key stays optional and an unset value just omits the header. Prefer
 	// an explicit GORTEX_EMBEDDINGS_API_KEY; fall back to OPENAI_API_KEY
-	// only when the endpoint is api.openai.com, so a stray OPENAI_API_KEY
-	// can never leak to an arbitrary third-party URL.
+	// only when the endpoint is api.openai.com (and to REQUESTY_API_KEY
+	// only for a router.requesty.ai host), so a stray vendor key can
+	// never leak to an arbitrary third-party URL.
 	apiKey := os.Getenv("GORTEX_EMBEDDINGS_API_KEY")
 	if apiKey == "" && strings.Contains(url, "openai.com") {
 		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if apiKey == "" && strings.Contains(url, "requesty.ai") {
+		apiKey = os.Getenv("REQUESTY_API_KEY")
 	}
 
 	return &APIProvider{
@@ -507,7 +511,8 @@ func (p *APIProvider) embedOpenAI(ctx context.Context, texts []string) ([][]floa
 
 	// OpenAI-compatible bases are conventionally given WITH the version
 	// segment (OpenAI "https://api.openai.com/v1", OpenRouter
-	// "https://openrouter.ai/api/v1"). Append "/v1" only when it is absent,
+	// "https://openrouter.ai/api/v1", Requesty "https://router.requesty.ai/v1").
+	// Append "/v1" only when it is absent,
 	// so a "…/v1" base does not become "…/v1/v1/embeddings" (a 404 that
 	// silently degrades the whole vector index to BM25).
 	endpoint := "/v1/embeddings"

@@ -131,7 +131,7 @@ func init() {
 	daemonStartCmd.Flags().BoolVar(&daemonEmbeddings, "embeddings", false,
 		"load a semantic embedding provider (opt-in — adds ~87 MB model download on first use and ~60 ms/symbol warmup)")
 	daemonStartCmd.Flags().StringVar(&daemonEmbeddingsURL, "embeddings-url", "",
-		"OpenAI-compatible (or Ollama) embedding API base URL (e.g. https://api.openai.com/v1). A non-empty URL forces the api provider, overriding the embedding: config. Key via $GORTEX_EMBEDDINGS_API_KEY or $OPENAI_API_KEY (openai.com only).")
+		"OpenAI-compatible (or Ollama) embedding API base URL (e.g. https://api.openai.com/v1). A non-empty URL forces the api provider, overriding the embedding: config. Key via $GORTEX_EMBEDDINGS_API_KEY, $OPENAI_API_KEY (openai.com only) or $REQUESTY_API_KEY (requesty.ai only).")
 	daemonStartCmd.Flags().StringVar(&daemonEmbeddingsModel, "embeddings-model", "",
 		"embedding model for --embeddings-url (default: auto-detect — text-embedding-3-small for OpenAI, nomic-embed-text for Ollama)")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAddr, "http-addr", "",
