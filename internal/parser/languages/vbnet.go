@@ -368,7 +368,11 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	// the call scan below can skip it, and emitted as a type reference.
 	type vbSpan struct{ start, end int }
 	var newSpans []vbSpan
-	for _, m := range vbNewRe.FindAllSubmatchIndex(src, -1) {
+	// Comments and string literals are blanked first so call-shaped text in
+	// them (`' obj.Delete()`, `"x.Drop("`) is not scanned. The masked copy
+	// keeps every byte offset, so names and lines are still read from src.
+	code := vbMaskCommentsAndStrings(src)
+	for _, m := range vbNewRe.FindAllSubmatchIndex(code, -1) {
 		newSpans = append(newSpans, vbSpan{start: m[2], end: m[3]})
 		if n := vbSimpleName(string(src[m[2]:m[3]])); n != "" {
 			result.Edges = append(result.Edges, &graph.Edge{
@@ -399,17 +403,120 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: line,
 		})
 	}
-	for _, m := range vbQualifiedCallRe.FindAllSubmatchIndex(src, -1) {
+	for _, m := range vbQualifiedCallRe.FindAllSubmatchIndex(code, -1) {
 		if inNewSpan(m[2]) {
 			continue // `New X.Y(` — already emitted as a type reference
 		}
 		emitCall(string(src[m[2]:m[3]]), lineAt(src, m[0]))
 	}
-	for _, m := range vbCallStmtRe.FindAllSubmatchIndex(src, -1) {
+	for _, m := range vbCallStmtRe.FindAllSubmatchIndex(code, -1) {
 		emitCall(string(src[m[2]:m[3]]), lineAt(src, m[0]))
 	}
 
 	return result, nil
+}
+
+// vbMaskCommentsAndStrings returns a copy of src in which comments and
+// string literals are blanked to spaces. Newlines are kept, so the copy has
+// the same length and every offset and line number still indexes src.
+//
+// Comments are `'` to end of line, and `REM` when it opens a statement (at
+// line start or after a `:` separator). String literals are `"..."` with
+// `""` as the escaped quote, and may span lines as they can since VB 14. In
+// an interpolated string `$"..."`, the `{...}` holes are code and stay
+// visible, except for a `:format` clause, which is blanked with the text.
+func vbMaskCommentsAndStrings(src []byte) []byte {
+	out := make([]byte, len(src))
+	copy(out, src)
+	blank := func(i int) {
+		if out[i] != '\n' {
+			out[i] = ' '
+		}
+	}
+	const (
+		inCode = iota
+		inString
+		inInterpolated
+		inFormat
+	)
+	mode := inCode
+	// holes holds the `{` nesting depth of each open interpolation hole,
+	// innermost last. Code inside a hole may use braces of its own.
+	var holes []int
+	stmtStart := true
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		next := byte(0)
+		if i+1 < len(src) {
+			next = src[i+1]
+		}
+		switch mode {
+		case inString, inInterpolated:
+			switch {
+			case c == '"' && next == '"', mode == inInterpolated && c == '{' && next == '{':
+				blank(i)
+				blank(i + 1)
+				i++
+			case c == '"':
+				blank(i)
+				mode = inCode
+			case mode == inInterpolated && c == '{':
+				blank(i)
+				holes = append(holes, 0)
+				mode = inCode
+			default:
+				blank(i)
+			}
+		case inFormat:
+			blank(i)
+			if c == '}' {
+				mode = inInterpolated
+			}
+		default:
+			top := len(holes) - 1
+			atStart := stmtStart
+			stmtStart = c == '\n' || c == ':' ||
+				(stmtStart && (c == ' ' || c == '\t' || c == '\r'))
+			switch {
+			case c == '\'' || (atStart && vbIsRem(src, i)):
+				for ; i < len(src) && src[i] != '\n'; i++ {
+					blank(i)
+				}
+				i-- // leave the newline for the next iteration
+			case c == '"':
+				blank(i)
+				mode = inString
+			case c == '$' && next == '"':
+				blank(i)
+				blank(i + 1)
+				i++
+				mode = inInterpolated
+			case top >= 0 && holes[top] == 0 && (c == '}' || (c == ':' && next != '=')):
+				blank(i)
+				holes = holes[:top]
+				stmtStart = false
+				mode = inInterpolated
+				if c == ':' {
+					mode = inFormat
+				}
+			case top >= 0 && c == '{':
+				holes[top]++
+			case top >= 0 && c == '}':
+				holes[top]--
+			}
+		}
+	}
+	return out
+}
+
+// vbIsRem reports whether a case-insensitive REM keyword starts at i and is
+// followed by whitespace or the end of input.
+func vbIsRem(src []byte, i int) bool {
+	if i+3 > len(src) || !strings.EqualFold(string(src[i:i+3]), "rem") {
+		return false
+	}
+	return i+3 == len(src) || src[i+3] == ' ' || src[i+3] == '\t' ||
+		src[i+3] == '\r' || src[i+3] == '\n'
 }
 
 // vbContainerEnd returns the line of the terminator that closes the

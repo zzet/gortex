@@ -643,6 +643,90 @@ End Class
 		"indexed property access is currently emitted as a call (documented limitation)")
 }
 
+// Call-shaped text inside a comment or a string literal is not executable, so
+// it must not become a CALLS edge. The apostrophe in "don't" sits inside a
+// string and must not swallow the real call after it, and `Remote.` is an
+// identifier, not a REM comment.
+func TestVBNetExtractor_CommentsAndStringsAreNotCalls(t *testing.T) {
+	src := []byte(`Public Class Worker
+    Public Sub Run()
+        ' client.Delete()
+        REM client.Remove()
+        Rem client.Purge()
+        Dim example = "client.Delete("
+        Dim quoted = "say ""x.Drop("" now"
+        Dim label = "don't" : client.Save() ' client.Erase()
+        Remote.Connect()
+        Call Audit("log.Write(")
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("w.vb", src)
+	require.NoError(t, err)
+
+	run := vbFind(res.Nodes, "Run")
+	require.NotNil(t, run)
+
+	got := map[string]bool{}
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeCalls && e.From == run.ID {
+			got[e.To] = true
+		}
+	}
+	assert.Equal(t, map[string]bool{
+		"unresolved::Save":    true,
+		"unresolved::Connect": true,
+		"unresolved::Audit":   true,
+	}, got, "only executable calls become CALLS edges")
+
+	save := false
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeCalls && e.To == "unresolved::Save" {
+			save = true
+			assert.Equal(t, 8, e.Line, "masking must keep line numbers")
+		}
+	}
+	assert.True(t, save)
+}
+
+// The same masking covers the forms that need more than a line scan: a REM
+// after a `:` separator, a string literal spanning lines, and an interpolated
+// string, whose `{...}` holes are code and must keep their calls. A `New` in a
+// comment must not become a type reference either.
+func TestVBNetExtractor_MaskingKeepsInterpolationHoles(t *testing.T) {
+	src := []byte(`Public Class Report
+    Public Sub Render()
+        Dim n = 1 : REM cache.Flush()
+        Dim sql = "SELECT dbo.Total(
+                   FROM dbo.Rows(t)"
+        Dim s = $"{order.GetTotal():N2} of {{x.Skip()}} {If(ok, "a.Bad(", "b")} {d:HH':'mm} {log.Tag()}"
+        ' Dim f = New Legacy.Form()
+        doc.Print()
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("r.vb", src)
+	require.NoError(t, err)
+
+	render := vbFind(res.Nodes, "Render")
+	require.NotNil(t, render)
+
+	got := map[string]bool{}
+	for _, e := range res.Edges {
+		if e.Kind == graph.EdgeCalls && e.From == render.ID {
+			got[e.To] = true
+		}
+	}
+	assert.Equal(t, map[string]bool{
+		"unresolved::GetTotal": true,
+		"unresolved::Tag":      true,
+		"unresolved::Print":    true,
+	}, got, "calls in holes survive; calls in text, strings and comments do not")
+
+	assert.False(t, vbHasEdge(res.Edges, graph.EdgeReferences, "", "unresolved::Form"),
+		"New in a comment is not a type reference")
+}
+
 // Malformed, truncated and non-UTF8 input must not panic, and degradation must
 // stay local: the extractor should still return the file node and whatever
 // declarations it could recognise.
