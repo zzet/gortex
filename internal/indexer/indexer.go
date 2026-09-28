@@ -3229,12 +3229,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// the re-assert below. See restampedBuiltins.
 			var restampedBuiltins []*graph.Node
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
-				if idx.passCorpusFilter != nil {
-					for _, node := range nodes {
-						if node != nil && graph.IsBuiltinStub(node.ID) {
-							copied := *node
-							restampedBuiltins = append(restampedBuiltins, &copied)
-						}
+				for _, node := range nodes {
+					if node != nil && graph.IsBuiltinStub(node.ID) {
+						copied := *node
+						restampedBuiltins = append(restampedBuiltins, &copied)
 					}
 				}
 				diskTarget.AddBatch(nodes, nil)
@@ -3305,14 +3303,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// those same ids, its own funnel has never seen them, and it
 			// upserts the unattributed shape straight over the good row.
 			//
-			// Bounded to the read-only-context mode on purpose. The mode's
-			// contract is that it changes WHERE the separation happens and
-			// nothing else, and a generation whose builtins lost their
-			// workspace/project columns would be a generation that carries
-			// less than the one the write-then-withdraw path publishes. The
-			// same clobber on an ordinary cold index is older than this
-			// change, is pinned as the expected shape by acceptance tests, and
-			// is not this item's to move.
+			// Every drain re-asserts, the ordinary whole index included. A
+			// builtin is a repository-owned identity: the resolver stamps it
+			// with the boundary of the symbol that referenced it, a sparse
+			// generation carries and claims it with those columns, and an
+			// independent whole index of the same tree has to serve the same
+			// row or no composed view can equal it. The set is one row per
+			// distinct builtin the repository references, so the copy is
+			// bounded by the language's builtin vocabulary, not by corpus size.
 			if len(restampedBuiltins) > 0 {
 				diskTarget.AddBatch(restampedBuiltins, nil)
 			}

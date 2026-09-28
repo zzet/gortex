@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -349,12 +350,13 @@ func builderIndex(t testing.TB, store *store_sqlite.Store, dir string) {
 }
 
 func builderNewBuilder(store *store_sqlite.Store) *SparseGenerationBuilder {
-	return &SparseGenerationBuilder{
+	b := &SparseGenerationBuilder{
 		Store:    store,
 		Registry: builderRegistry(),
 		Config:   config.Default().Index,
 		Logger:   zap.NewNop(),
 	}
+	return b
 }
 
 // builderComposed stacks one published generation over the base corpus, the
@@ -404,7 +406,27 @@ func builderRenderNode(n *graph.Node) string {
 	}
 	copied := *n
 	copied.AbsoluteFilePath = ""
-	return fmt.Sprintf("%+v", copied)
+	// Metadata is rendered as JSON: %+v prints a pointer held in Meta (a
+	// contract type's shape snapshot, say) as its address, which differs
+	// between two readers of equal rows; json.Marshal follows pointers and
+	// orders map keys. The per-file extraction fingerprints are compared
+	// like any other metadata: a whole index writes them too.
+	meta := copied.Meta
+	copied.Meta = nil
+	return fmt.Sprintf("%+v", copied) + " meta=" + builderRenderMeta(meta)
+}
+
+// builderRenderMeta renders node or edge metadata as JSON (see
+// builderRenderNode).
+func builderRenderMeta(meta map[string]any) string {
+	if len(meta) == 0 {
+		return "{}"
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Sprintf("%v", meta)
+	}
+	return string(data)
 }
 
 // builderRenderEdge prints every field of an edge except the ones response
@@ -419,7 +441,9 @@ func builderRenderEdge(e *graph.Edge) string {
 	copied.Via = ""
 	copied.Alias = ""
 	copied.NameOnly = false
-	return fmt.Sprintf("%+v", copied)
+	meta := copied.Meta
+	copied.Meta = nil
+	return fmt.Sprintf("%+v", copied) + " meta=" + builderRenderMeta(meta)
 }
 
 func builderRenderNodes(nodes []*graph.Node) []string {
@@ -1012,19 +1036,22 @@ func Calculate() int {
 	if got := slices.Compact(slices.Clone(composedRepoIDs)); len(got) != len(composedRepoIDs) {
 		t.Errorf("GetRepoNodes repeats an identity: %v", composedRepoIDs)
 	}
-	// The row served for the pathless id is the layer's re-materialised copy,
-	// not base's. BuildCommitLayer stamps the workspace/project it was given
-	// onto every node it writes; a plain index of a checkout leaves a builtin's
-	// unstamped, so that field is what tells the two copies of one id apart.
+	// The row served for the pathless id is the one a flat index of the same
+	// tree serves, field for field, boundary columns included: the layer's
+	// re-materialised copy and a plain index's copy are both stamped with the
+	// repository's workspace/project (builtin_stub_parity_test.go pins the
+	// plain-index half).
 	var servedBuiltin *graph.Node
 	for _, n := range composedRepo {
 		if n != nil && n.ID == builtinID {
 			servedBuiltin = n
 		}
 	}
-	if servedBuiltin == nil || servedBuiltin.WorkspaceID != builderRepoPrefix {
-		t.Errorf("GetRepoNodes serves %+v for the claimed builtin — want the layer's carried row "+
-			"(WorkspaceID %q), not base's", servedBuiltin, builderRepoPrefix)
+	if servedBuiltin == nil || servedBuiltin.WorkspaceID != builderRepoPrefix || servedBuiltin.ProjectID != builderRepoPrefix {
+		t.Errorf("GetRepoNodes serves %+v for the claimed builtin — want the repository-stamped row "+
+			"(workspace/project %q)", servedBuiltin, builderRepoPrefix)
+	} else if got, want := builderRenderNode(servedBuiltin), builderRenderNode(flat.GetNode(builtinID)); got != want {
+		t.Errorf("GetRepoNodes serves\n  %s\nfor the claimed builtin; the flat index serves\n  %s", got, want)
 	}
 	// Every reader on the composed view answers with the same identity set,
 	// and the counter prices that set once.
@@ -1049,8 +1076,8 @@ func Calculate() int {
 		builderRepoPrefix + "/core.go::Compute",
 		builtinID,
 	})
-	if n := base.GetNode(builtinID); n == nil || n.WorkspaceID != "" {
-		t.Errorf("the base-only view serves %+v for the pathless id — the layer's carried row leaked down", n)
+	if n := base.GetNode(builtinID); n == nil || n.WorkspaceID != builderRepoPrefix || n.ProjectID != builderRepoPrefix {
+		t.Errorf("the base-only view serves %+v for the pathless id — want base's own repository-stamped copy", n)
 	}
 	if got, want := base.NodeCount(), len(baseRepoIDs); got != want {
 		t.Errorf("base NodeCount = %d, its own identity set has %d", got, want)
