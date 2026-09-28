@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -226,6 +227,7 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 
 	walk := &closureWalk{
 		b:       b,
+		ctx:     ctx,
 		req:     req,
 		limit:   limit,
 		deleted: deleted,
@@ -255,6 +257,9 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 
 	frontier := make(map[string]struct{})
 	targetEvidence := walk.collectIntroduced(present, frontier)
+	if walk.err != nil {
+		return nil, walk.err
+	}
 	seedNodeIDs, err := builderSemanticSeedNodeIDs(ctx, req, seeds, deleted, targetEvidence)
 	if err != nil {
 		return nil, err
@@ -315,6 +320,8 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 // lookups from.
 type closureWalk struct {
 	b     *SparseGenerationBuilder
+	ctx   context.Context
+	err   error
 	req   BuildRequest
 	limit int
 
@@ -457,6 +464,9 @@ func (w *closureWalk) collectIntroduced(
 		w.extractInto(rel, &refs)
 	}
 	w.collectPlaceholderReferrers(refs.defines, out)
+	if w.err != nil {
+		return semantic
+	}
 
 	names := make([]string, 0, len(refs.names))
 	for name := range refs.names {
@@ -467,7 +477,11 @@ func (w *closureWalk) collectIntroduced(
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		for _, node := range w.req.Base.FindNodesByName(name) {
+		nodes := w.findNodesByName(name)
+		if w.err != nil {
+			return semantic
+		}
+		for _, node := range nodes {
 			if node == nil || node.FilePath == "" || !graph.IsReferenceableSymbol(node.Kind) {
 				continue
 			}
@@ -516,10 +530,24 @@ func (w *closureWalk) collectIntroduced(
 // replay; re-offering it would hand the closure every file in the repository
 // holding an unbound call to a common method name.
 func (w *closureWalk) collectPlaceholderReferrers(defines map[string]struct{}, out map[string]struct{}) {
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		w.err = err
+		return
+	}
 	names := make([]string, 0, len(defines))
 	for name := range defines {
-		if name == "" || w.baseDefinesName(name) {
+		if name == "" {
 			continue
+		}
+		if w.baseDefinesName(name) {
+			continue
+		}
+		if w.err != nil {
+			return
 		}
 		names = append(names, name)
 	}
@@ -584,7 +612,15 @@ func (w *closureWalk) collectPlaceholderReferrers(defines map[string]struct{}, o
 	builderAddNodeFiles(w.req.Base, endpoints, out)
 
 	if reader, ok := w.req.Base.(graph.RefFactsReader); ok {
-		byFile, err := reader.LoadRefFactsByTargets(w.req.RepoPrefix, placeholders)
+		byFile, err := loadRefFactsByTargetsContext(ctx, reader, w.req.RepoPrefix, placeholders)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			w.err = ctxErr
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			w.err = err
+			return
+		}
 		if err != nil {
 			w.b.Logger.Debug("indexer: closure placeholder fact lookup failed", zap.Error(err))
 		}
@@ -599,16 +635,42 @@ func (w *closureWalk) collectPlaceholderReferrers(defines map[string]struct{}, o
 // baseDefinesName reports whether the base layer carries a definition of this
 // name in a file of this repository.
 func (w *closureWalk) baseDefinesName(name string) bool {
-	for _, node := range w.req.Base.FindNodesByName(name) {
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	found := false
+	err := graph.VisitNodesByNameContext(ctx, w.req.Base, name, func(node *graph.Node) bool {
 		if node == nil || node.FilePath == "" || !graph.IsReferenceableSymbol(node.Kind) {
-			continue
+			return true
 		}
 		if node.RepoPrefix != "" && node.RepoPrefix != w.req.RepoPrefix {
-			continue
+			return true
 		}
-		return true
+		found = true
+		return false
+	})
+	if err != nil {
+		w.err = err
+		return false
 	}
-	return false
+	return found
+}
+
+// findNodesByName carries the build request context through every closure name
+// lookup. Any lookup error is authoritative: callers stop the closure and let
+// affectedClosureContext return it rather than consuming a partial result.
+func (w *closureWalk) findNodesByName(name string) []*graph.Node {
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	nodes, err := graph.FindNodesByNameContext(ctx, w.req.Base, name)
+	if err != nil {
+		w.err = err
+		return nil
+	}
+	return nodes
 }
 
 // closurePlaceholderIDs spells every id an unbound reference to name parks on.
@@ -1683,9 +1745,12 @@ func (b *SparseGenerationBuilder) collectDependents(
 	}
 
 	if reader, ok := req.Base.(graph.RefFactsReader); ok {
-		byFile, err := reader.LoadRefFactsByTargets(req.RepoPrefix, seedNodeIDs)
+		byFile, err := loadRefFactsByTargetsContext(ctx, reader, req.RepoPrefix, seedNodeIDs)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
 		}
 		if err != nil {
 			b.Logger.Debug("indexer: closure reverse fact lookup failed", zap.Error(err))
