@@ -11,13 +11,14 @@ import (
 
 // The cost of building symbol_fts_rowid_by_generation (view_gen, fts_rowid)
 // over an existing sidecar, per 100,000 rows: its time and the WAL bytes it
-// writes. Set A1_INDEX_COST=1 to run it (a measurement): the sidecar grows by
-// 100,000 rows at a time to 500,000, and after each step the index is dropped,
-// the WAL truncated, and the index built again on one writer connection with
-// the automatic checkpoint off, so the WAL holds exactly what the build wrote.
+// writes. Set GORTEX_FTS_INDEX_COST=1 to run it (a measurement): the sidecar
+// grows by 100,000 rows at a time to 500,000, and after each step the index
+// is dropped, the WAL truncated, and the index built again on one writer
+// connection with the automatic checkpoint off, so the WAL holds exactly what
+// the build wrote.
 func TestSymbolFTSRowidGenerationIndexBuildCost(t *testing.T) {
-	if os.Getenv("A1_INDEX_COST") != "1" {
-		t.Skip("set A1_INDEX_COST=1")
+	if os.Getenv("GORTEX_FTS_INDEX_COST") != "1" {
+		t.Skip("set GORTEX_FTS_INDEX_COST=1")
 	}
 	ctx := context.Background()
 	store := openPayloadStore(t)

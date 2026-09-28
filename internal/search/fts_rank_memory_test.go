@@ -130,7 +130,7 @@ func TestKeptBytesEstimateAgainstTheHeap(t *testing.T) {
 	ctx := context.Background()
 	o := newOwnedFTSTable(t)
 	docs := 20_000
-	if raw := os.Getenv("A1_KEPT_DOCS"); raw != "" { // a larger run, e.g. 240000
+	if raw := os.Getenv("GORTEX_FTS_KEPT_DOCS"); raw != "" { // a larger run, e.g. 240000
 		n, err := strconv.Atoi(raw)
 		if err != nil {
 			t.Fatal(err)

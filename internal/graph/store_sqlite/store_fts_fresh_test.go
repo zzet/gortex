@@ -122,12 +122,12 @@ func TestFreshSymbolFTSRowsBounds(t *testing.T) {
 }
 
 // Rows written per second through the batch path with and without the
-// fresh-rows buffer. Set A1_FRESH_RATE=1 to run it (it is a measurement, not a
-// check): edit-sized batches of 400 documents, 20 per round, alternating the
-// buffer off and on for 10 rounds on one store.
+// fresh-rows buffer. Set GORTEX_FTS_FRESH_RATE=1 to run it (it is a
+// measurement, not a check): edit-sized batches of 400 documents, 20 per
+// round, alternating the buffer off and on for 10 rounds on one store.
 func TestFreshSymbolFTSRowsWriteRate(t *testing.T) {
-	if os.Getenv("A1_FRESH_RATE") != "1" {
-		t.Skip("set A1_FRESH_RATE=1")
+	if os.Getenv("GORTEX_FTS_FRESH_RATE") != "1" {
+		t.Skip("set GORTEX_FTS_FRESH_RATE=1")
 	}
 	store, generationID, handle := beginManifestGeneration(t)
 	_ = store
