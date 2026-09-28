@@ -435,15 +435,21 @@ func TestBaseViewCandidatesAreUnchanged(t *testing.T) {
 // TestWithViewLayersEmptyIsTheBasePath: binding an empty stack is the base
 // engine, not a composed one — the guard every hot path relies on.
 func TestWithViewLayersEmptyIsTheBasePath(t *testing.T) {
+	// Measure the clone path before opening the SQLite-backed fixture below.
+	// AllocsPerRun observes process-wide allocations, so background store work
+	// must not overlap this assertion.
+	quietGraph := graph.New()
+	quietBase := NewEngine(quietGraph)
+	if allocs := testing.AllocsPerRun(100, func() { _ = quietBase.WithViewLayers(quietGraph, nil) }); allocs > 1 {
+		t.Errorf("binding an empty stack allocated %v times, want the single WithReader clone", allocs)
+	}
+
 	stack := newViewStack(t)
 	base := stack.baseEngine()
 
 	empty := base.WithViewLayers(stack.store, nil)
 	if empty.viewLayersActive() {
 		t.Fatalf("an empty layer slice bound a composed view")
-	}
-	if allocs := testing.AllocsPerRun(100, func() { _ = base.WithViewLayers(stack.store, nil) }); allocs > 1 {
-		t.Errorf("binding an empty stack allocated %v times, want the single WithReader clone", allocs)
 	}
 
 	swapped := stack.viewEngine().WithReader(stack.store)
@@ -501,4 +507,196 @@ func (b *countingVectorBackend) SearchSymbolBundles(q string, limit int) []searc
 func (b *countingVectorBackend) VectorChannelOnly(string, int) ([]string, search.ChannelTimings) {
 	b.vectorCalls++
 	return nil, search.ChannelTimings{}
+}
+
+// viewBatchFixtureBackend isolates the query-layer batch/fallback contract.
+// Only the receiver's batch hook is used; ordinary Search calls are counted so
+// tests can prove authoritative empty answers do not retry sequentially.
+type viewBatchFixtureBackend struct {
+	responses   map[int][][]search.SearchResult
+	handled     bool
+	cancel      context.CancelFunc
+	batchCalls  []int
+	searchCalls int
+}
+
+func (b *viewBatchFixtureBackend) Add(string, ...string) {}
+func (b *viewBatchFixtureBackend) Remove(string)         {}
+func (b *viewBatchFixtureBackend) Search(string, int) []search.SearchResult {
+	b.searchCalls++
+	return []search.SearchResult{{ID: "sequential"}}
+}
+func (b *viewBatchFixtureBackend) Count() int { return 0 }
+func (b *viewBatchFixtureBackend) Close()     {}
+func (b *viewBatchFixtureBackend) SearchViewBatchContext(_ context.Context, _ string, peers []search.Backend, limit int) ([][]search.SearchResult, bool) {
+	b.batchCalls = append(b.batchCalls, limit)
+	if b.cancel != nil {
+		b.cancel()
+	}
+	if !b.handled {
+		return nil, false
+	}
+	answer := b.responses[limit]
+	out := make([][]search.SearchResult, len(answer))
+	for i := range answer {
+		out[i] = append([]search.SearchResult(nil), answer[i]...)
+	}
+	return out, true
+}
+
+func TestRequestViewTextBatchPreservesPositionsAndSliceOwnership(t *testing.T) {
+	batch := &viewBatchFixtureBackend{handled: true, responses: map[int][][]search.SearchResult{
+		4: {
+			{{ID: "commit", Score: 1}},
+			{{ID: "dirty", Score: 2}},
+		},
+	}}
+	peer := &viewBatchFixtureBackend{}
+	layers := []ViewLayerSource{{Search: batch}, {}, {Search: peer}}
+
+	got, handled := requestViewTextBatch(context.Background(), layers, "query", 4)
+	if !handled || len(got) != 3 || len(got[0]) != 1 || got[1] != nil || len(got[2]) != 1 {
+		t.Fatalf("batch result = %#v, handled=%v", got, handled)
+	}
+	got[0][0].ID = "mutated"
+	if got[2][0].ID != "dirty" {
+		t.Fatalf("mutating one position changed another: %#v", got)
+	}
+	if batch.searchCalls != 0 || peer.searchCalls != 0 {
+		t.Fatalf("batch path issued sequential searches: first=%d peer=%d", batch.searchCalls, peer.searchCalls)
+	}
+}
+
+func TestViewTextCandidatesBatchRefillsAllActiveLayers(t *testing.T) {
+	batch := &viewBatchFixtureBackend{handled: true, responses: map[int][][]search.SearchResult{
+		3: {
+			{{ID: "shared"}, {ID: "shared"}, {ID: "shared"}},
+			{{ID: "shared"}, {ID: "shared"}, {ID: "shared"}},
+		},
+		6: {
+			{{ID: "shared"}, {ID: "lower-2"}, {ID: "lower-3"}, {ID: "lower-4"}, {ID: "lower-5"}, {ID: "lower-6"}},
+			{{ID: "shared"}, {ID: "upper-2"}, {ID: "upper-3"}, {ID: "upper-4"}, {ID: "upper-5"}, {ID: "upper-6"}},
+		},
+	}}
+	peer := &viewBatchFixtureBackend{}
+	e := &Engine{viewLayers: []ViewLayerSource{{Search: batch}, {Search: peer}}}
+
+	got := e.viewTextCandidatesContext(context.Background(), "query", 3, nil, nil)
+	if len(got) != 3 {
+		t.Fatalf("candidate count = %d, want 3: %#v", len(got), got)
+	}
+	if len(batch.batchCalls) != 2 || batch.batchCalls[0] != 3 || batch.batchCalls[1] != 6 {
+		t.Fatalf("batch widths = %v, want [3 6]", batch.batchCalls)
+	}
+	if batch.searchCalls != 0 || peer.searchCalls != 0 {
+		t.Fatalf("batch path issued sequential searches: first=%d peer=%d", batch.searchCalls, peer.searchCalls)
+	}
+}
+
+func TestViewTextCandidatesFallsBackOnlyWhenUnsupported(t *testing.T) {
+	unsupported := &viewBatchFixtureBackend{handled: false}
+	peer := &viewBatchFixtureBackend{}
+	e := &Engine{viewLayers: []ViewLayerSource{{Search: unsupported}, {Search: peer}}}
+
+	got := e.viewTextCandidatesContext(context.Background(), "query", 2, nil, nil)
+	if len(got) != 1 || got[0].ID != "sequential" {
+		t.Fatalf("fallback candidates = %#v", got)
+	}
+	if unsupported.searchCalls != 1 || peer.searchCalls != 1 {
+		t.Fatalf("fallback searches = first:%d peer:%d, want one each", unsupported.searchCalls, peer.searchCalls)
+	}
+}
+
+func TestViewTextCandidatesDoesNotRetryAuthoritativeEmptyBatch(t *testing.T) {
+	batch := &viewBatchFixtureBackend{handled: true, responses: map[int][][]search.SearchResult{
+		2: {nil, nil},
+	}}
+	peer := &viewBatchFixtureBackend{}
+	e := &Engine{viewLayers: []ViewLayerSource{{Search: batch}, {Search: peer}}}
+
+	if got := e.viewTextCandidatesContext(context.Background(), "query", 2, nil, nil); got != nil {
+		t.Fatalf("authoritative empty batch = %#v, want nil", got)
+	}
+	if batch.searchCalls != 0 || peer.searchCalls != 0 {
+		t.Fatalf("authoritative empty batch retried sequentially: first=%d peer=%d", batch.searchCalls, peer.searchCalls)
+	}
+}
+
+func TestViewTextCandidatesCancellationDuringBatchDoesNotRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	batch := &viewBatchFixtureBackend{handled: true, cancel: cancel}
+	peer := &viewBatchFixtureBackend{}
+	e := &Engine{viewLayers: []ViewLayerSource{{Search: batch}, {Search: peer}}}
+
+	if got := e.viewTextCandidatesContext(ctx, "query", 2, nil, nil); got != nil {
+		t.Fatalf("canceled batch = %#v, want nil", got)
+	}
+	if batch.searchCalls != 0 || peer.searchCalls != 0 {
+		t.Fatalf("canceled batch retried sequentially: first=%d peer=%d", batch.searchCalls, peer.searchCalls)
+	}
+}
+
+func TestViewTextCandidatesRefillsPastOwnershipMaskedFirstPage(t *testing.T) {
+	stack := newViewStack(t)
+	e := &Engine{viewLayers: stack.layers}
+	base := []search.SearchResult{{ID: viewOldID}, {ID: viewDoomedID}}
+	refillWidths := []int{}
+	refill := func(limit int) []search.SearchResult {
+		refillWidths = append(refillWidths, limit)
+		return []search.SearchResult{
+			{ID: viewOldID}, {ID: viewDoomedID},
+			{ID: viewStayerID}, {ID: "repo/other.go::Other"},
+		}
+	}
+
+	got := e.viewTextCandidatesContext(context.Background(), "no-such-batch-token", 2, base, refill)
+	if len(got) != 2 || got[0].ID != viewStayerID || got[1].ID != "repo/other.go::Other" {
+		t.Fatalf("refilled candidates = %#v", got)
+	}
+	if len(refillWidths) != 1 || refillWidths[0] != 4 {
+		t.Fatalf("refill widths = %v, want [4]", refillWidths)
+	}
+}
+
+func TestSymbolSearcherViewBatchPreservesDuplicateGenerations(t *testing.T) {
+	stack := newViewStack(t)
+	batcher, ok := stack.layers[0].Search.(search.ContextViewBatchSearcherBackend)
+	if !ok {
+		t.Fatal("SymbolSearcherBackend does not expose the view batch capability")
+	}
+	peers := []search.Backend{stack.layers[0].Search, stack.layers[1].Search, stack.layers[1].Search}
+	got, handled := batcher.SearchViewBatchContext(context.Background(), viewProseQuery, peers, 20)
+	if !handled || len(got) != len(peers) || len(got[1]) == 0 || len(got[2]) == 0 {
+		t.Fatalf("batch result = %#v, handled=%v", got, handled)
+	}
+	if len(got[1]) != len(got[2]) {
+		t.Fatalf("duplicate generation lengths differ: %d vs %d", len(got[1]), len(got[2]))
+	}
+	original := got[2][0]
+	got[1][0].ID = "mutated"
+	if got[2][0] != original {
+		t.Fatalf("duplicate generation results alias: %#v", got)
+	}
+}
+
+func TestSymbolSearcherViewBatchRejectsMixedFamily(t *testing.T) {
+	stack := newViewStack(t)
+	batcher := stack.layers[0].Search.(search.ContextViewBatchSearcherBackend)
+	got, handled := batcher.SearchViewBatchContext(context.Background(), viewProseQuery,
+		[]search.Backend{stack.layers[0].Search, &viewBatchFixtureBackend{}}, 20)
+	if handled || got != nil {
+		t.Fatalf("mixed family result = %#v, handled=%v; want unsupported", got, handled)
+	}
+}
+
+func TestSymbolSearcherViewBatchCancellationIsAuthoritative(t *testing.T) {
+	stack := newViewStack(t)
+	batcher := stack.layers[0].Search.(search.ContextViewBatchSearcherBackend)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, handled := batcher.SearchViewBatchContext(ctx, viewProseQuery,
+		[]search.Backend{stack.layers[0].Search, stack.layers[1].Search}, 20)
+	if !handled || len(got) != 2 || got[0] != nil || got[1] != nil {
+		t.Fatalf("canceled batch result = %#v, handled=%v", got, handled)
+	}
 }

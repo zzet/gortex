@@ -50,6 +50,51 @@ func (e *Engine) WithViewLayers(r graph.Reader, layers []ViewLayerSource) *Engin
 // composed view's stack rather than the base corpus alone.
 func (e *Engine) viewLayersActive() bool { return len(e.viewLayers) > 0 }
 
+// requestViewTextBatch asks one capable layer backend to search all non-nil
+// peers in a single Store operation. The returned slices are copied into the
+// original layer positions so nil layers and duplicate generations preserve
+// their identities without sharing mutable slice storage.
+//
+// handled=false is reserved for an unsupported or mixed backend family. A
+// capable backend treats cancellation and runtime failure as authoritative
+// empty answers, which prevents this helper from repeating the work through
+// the sequential fallback after an error.
+func requestViewTextBatch(
+	ctx context.Context,
+	layers []ViewLayerSource,
+	query string,
+	limit int,
+) ([][]search.SearchResult, bool) {
+	aligned := make([][]search.SearchResult, len(layers))
+	peers := make([]search.Backend, 0, len(layers))
+	positions := make([]int, 0, len(layers))
+	for i, layer := range layers {
+		if layer.Search == nil {
+			continue
+		}
+		peers = append(peers, layer.Search)
+		positions = append(positions, i)
+	}
+	if len(peers) == 0 {
+		return aligned, true
+	}
+	batcher, ok := peers[0].(search.ContextViewBatchSearcherBackend)
+	if !ok {
+		return nil, false
+	}
+	batched, handled := batcher.SearchViewBatchContext(ctx, query, peers, limit)
+	if !handled {
+		return nil, false
+	}
+	if ctx.Err() != nil || len(batched) != len(peers) {
+		return aligned, true
+	}
+	for i, results := range batched {
+		aligned[positions[i]] = append([]search.SearchResult(nil), results...)
+	}
+	return aligned, true
+}
+
 // viewTextCandidates enumerates the text channel across the whole stack and
 // returns one merged ranked list.
 //
@@ -95,18 +140,35 @@ func (e *Engine) viewTextCandidatesContext(
 	raw[0] = base
 	exhausted[0] = refillBase == nil || len(base) < fetch
 	for i, layer := range e.viewLayers {
-		if ctx.Err() != nil {
-			return nil
-		}
 		if layer.Search == nil {
 			exhausted[i+1] = true
-			continue
 		}
-		raw[i+1] = requestTextSearch(ctx, layer.Search, query, fetch)
+	}
+	if batched, handled := requestViewTextBatch(ctx, e.viewLayers, query, fetch); handled {
 		if ctx.Err() != nil {
 			return nil
 		}
-		exhausted[i+1] = len(raw[i+1]) < fetch
+		for i, layer := range e.viewLayers {
+			if layer.Search == nil {
+				continue
+			}
+			raw[i+1] = batched[i]
+			exhausted[i+1] = len(raw[i+1]) < fetch
+		}
+	} else {
+		for i, layer := range e.viewLayers {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if layer.Search == nil {
+				continue
+			}
+			raw[i+1] = requestTextSearch(ctx, layer.Search, query, fetch)
+			if ctx.Err() != nil {
+				return nil
+			}
+			exhausted[i+1] = len(raw[i+1]) < fetch
+		}
 	}
 
 	compose := func() ([][]search.SearchResult, []search.SearchResult) {
@@ -138,27 +200,67 @@ func (e *Engine) viewTextCandidatesContext(
 		}
 		active := false
 		grew := false
-		for i := range raw {
-			if exhausted[i] {
-				continue
-			}
+		if !exhausted[0] {
 			if ctx.Err() != nil {
 				return nil
 			}
 			active = true
-			previous := len(raw[i])
-			if i == 0 {
-				raw[i] = refillBase(nextFetch)
-			} else {
-				raw[i] = requestTextSearch(ctx, e.viewLayers[i-1].Search, query, nextFetch)
-			}
+			previous := len(raw[0])
+			raw[0] = refillBase(nextFetch)
 			if ctx.Err() != nil {
 				return nil
 			}
-			if len(raw[i]) > previous {
+			if len(raw[0]) > previous {
 				grew = true
 			}
-			exhausted[i] = len(raw[i]) < nextFetch || len(raw[i]) <= previous
+			exhausted[0] = len(raw[0]) < nextFetch || len(raw[0]) <= previous
+		}
+
+		pendingLayers := make([]ViewLayerSource, len(e.viewLayers))
+		pending := false
+		for i, layer := range e.viewLayers {
+			if exhausted[i+1] || layer.Search == nil {
+				continue
+			}
+			pendingLayers[i] = layer
+			pending = true
+			active = true
+		}
+		if pending {
+			if batched, handled := requestViewTextBatch(ctx, pendingLayers, query, nextFetch); handled {
+				if ctx.Err() != nil {
+					return nil
+				}
+				for i, layer := range pendingLayers {
+					if layer.Search == nil {
+						continue
+					}
+					previous := len(raw[i+1])
+					raw[i+1] = batched[i]
+					if len(raw[i+1]) > previous {
+						grew = true
+					}
+					exhausted[i+1] = len(raw[i+1]) < nextFetch || len(raw[i+1]) <= previous
+				}
+			} else {
+				for i, layer := range pendingLayers {
+					if layer.Search == nil {
+						continue
+					}
+					if ctx.Err() != nil {
+						return nil
+					}
+					previous := len(raw[i+1])
+					raw[i+1] = requestTextSearch(ctx, layer.Search, query, nextFetch)
+					if ctx.Err() != nil {
+						return nil
+					}
+					if len(raw[i+1]) > previous {
+						grew = true
+					}
+					exhausted[i+1] = len(raw[i+1]) < nextFetch || len(raw[i+1]) <= previous
+				}
+			}
 		}
 		if !active {
 			return finish(sources, merged)

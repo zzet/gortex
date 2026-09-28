@@ -43,6 +43,15 @@ type ContextVectorChannelOnly interface {
 	VectorChannelOnlyContext(ctx context.Context, query string, limit int) ([]string, ChannelTimings)
 }
 
+// ContextViewBatchSearcherBackend searches several pinned view backends in one
+// request. Results are position-aligned with peers. handled=false means the
+// peer set is unsupported or spans backend families; cancellation and runtime
+// failure are authoritative handled=true empty answers and must not trigger a
+// sequential retry.
+type ContextViewBatchSearcherBackend interface {
+	SearchViewBatchContext(ctx context.Context, query string, peers []Backend, limit int) (results [][]SearchResult, handled bool)
+}
+
 type contextSymbolSearcher interface {
 	SearchSymbolsContext(ctx context.Context, query string, limit int) ([]graph.SymbolHit, error)
 }
@@ -53,6 +62,16 @@ type contextSymbolBundleSearcher interface {
 
 type scopedContextSymbolBundleSearcher interface {
 	SearchSymbolBundlesRepoScopedContext(ctx context.Context, query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error)
+}
+
+// contextViewGenerationSymbolSearcher is the Store-side batch contract used by
+// SymbolSearcherBackend. Identity checks stay inside the Store so derived
+// handles can compare their shared storeCore pointer without exposing it or
+// substituting a database path string.
+type contextViewGenerationSymbolSearcher interface {
+	SearchSymbolsViewGenerationsRepoScopedContext(ctx context.Context, query string, repoPrefixes []string, viewGens []int64, limit int) (map[int64][]graph.SymbolHit, error)
+	SymbolSearchViewGeneration() int64
+	SharesSymbolSearchCore(other any) bool
 }
 
 func liveSearchContext(ctx context.Context) context.Context {
@@ -71,6 +90,54 @@ func symbolHitsToSearchResults(hits []graph.SymbolHit) []SearchResult {
 		out[i] = SearchResult{ID: hit.NodeID, Score: hit.Score}
 	}
 	return out
+}
+
+func emptyViewBatch(peers []Backend) [][]SearchResult {
+	return make([][]SearchResult, len(peers))
+}
+
+// SearchViewBatchContext unwraps a same-family set of pinned Store adapters,
+// issues one Store batch, and maps each generation back to its peer position.
+// Duplicate generations receive independent slices so later composition or
+// refill cannot mutate another position through shared storage.
+func (b *SymbolSearcherBackend) SearchViewBatchContext(ctx context.Context, query string, peers []Backend, limit int) ([][]SearchResult, bool) {
+	ctx = liveSearchContext(ctx)
+	if b == nil || b.s == nil || len(peers) == 0 {
+		return nil, false
+	}
+	first, ok := peers[0].(*SymbolSearcherBackend)
+	if !ok || first != b {
+		return nil, false
+	}
+	batcher, ok := b.s.(contextViewGenerationSymbolSearcher)
+	if !ok {
+		return nil, false
+	}
+	viewGens := make([]int64, len(peers))
+	for i, peer := range peers {
+		adapter, ok := peer.(*SymbolSearcherBackend)
+		if !ok || adapter == nil || adapter.s == nil {
+			return nil, false
+		}
+		view, ok := adapter.s.(contextViewGenerationSymbolSearcher)
+		if !ok || !batcher.SharesSymbolSearchCore(adapter.s) {
+			return nil, false
+		}
+		viewGens[i] = view.SymbolSearchViewGeneration()
+	}
+	empty := emptyViewBatch(peers)
+	if strings.TrimSpace(query) == "" || limit <= 0 || ctx.Err() != nil {
+		return empty, true
+	}
+	hitsByGeneration, err := batcher.SearchSymbolsViewGenerationsRepoScopedContext(ctx, query, nil, viewGens, limit)
+	if err != nil || ctx.Err() != nil {
+		return empty, true
+	}
+	out := make([][]SearchResult, len(peers))
+	for i, viewGen := range viewGens {
+		out[i] = append([]SearchResult(nil), symbolHitsToSearchResults(hitsByGeneration[viewGen])...)
+	}
+	return out, true
 }
 
 // SearchContext forwards a live request context to a capable graph searcher.
@@ -382,6 +449,7 @@ var (
 	_ ContextBackend                           = (*SymbolSearcherBackend)(nil)
 	_ ContextSymbolBundleSearcherBackend       = (*SymbolSearcherBackend)(nil)
 	_ ScopedContextSymbolBundleSearcherBackend = (*SymbolSearcherBackend)(nil)
+	_ ContextViewBatchSearcherBackend          = (*SymbolSearcherBackend)(nil)
 	_ ContextBackend                           = (*HybridBackend)(nil)
 	_ ContextChannelSearcher                   = (*HybridBackend)(nil)
 	_ ContextTimedChannelSearcher              = (*HybridBackend)(nil)
