@@ -19,7 +19,7 @@ import (
 )
 
 // Gated: GX_FOLD_LARGE_TREE names a git clone of a real repository (the
-// gortex tree the r16 base was built from). GX_FOLD_LARGE_FILES names the
+// Gortex repository, for example). GX_FOLD_LARGE_FILES names the
 // widely used files every edit rewrites (comma-separated; default
 // internal/graph/store_sqlite/store.go); GX_FOLD_LARGE_PACE the pause between
 // edits (a Go duration, default 1.5s; 0: each edit is sent as soon as the one
@@ -28,13 +28,13 @@ import (
 // full list capped at 32 MB); GX_PARITY_RESIDUALS the residual list. The test
 // indexes the clone three times (the corpus, the primary per-save oracle and
 // the clean oracle), so it takes minutes: run it once per change of the fold
-// and before every measurement window, not in the ordinary suite.
+// and before a measurement, not in the ordinary suite.
 const (
 	foldLargeTreeEnv  = "GX_FOLD_LARGE_TREE"
 	foldLargeFilesEnv = "GX_FOLD_LARGE_FILES"
 	foldLargePaceEnv  = "GX_FOLD_LARGE_PACE"
 	foldLargeOutEnv   = "GX_FOLD_LARGE_OUT"
-	// foldLargeResidualsEnv names the residual list (lanes/j1/engine-residuals.md).
+	// foldLargeResidualsEnv names the residual list file.
 	foldLargeResidualsEnv = "GX_PARITY_RESIDUALS"
 	// foldLargeEditsEnv is the number of burst edits (default 12).
 	foldLargeEditsEnv = "GX_FOLD_LARGE_EDITS"
@@ -191,6 +191,9 @@ func TestSteppedFoldInFlightUnderLargeLayersWithTheDaemonsDefaults(t *testing.T)
 	gate := NewViewBuildGate()
 	gate.Open()
 	c := f.coordinator(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true})
+	// The daemon's build-lane predicate (installBuildLaneBusy): the store's
+	// editing state, its marks and its checkpoints key on it.
+	installDaemonBuildLaneBusy(f, c)
 	if out := c.reconcile(context.Background()); out.Err != nil {
 		t.Fatalf("initial reconcile: %+v", out)
 	}

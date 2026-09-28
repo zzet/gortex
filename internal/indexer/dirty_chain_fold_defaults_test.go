@@ -8,7 +8,8 @@ import (
 
 // mcpChainFixtureDefaults is mcpChainFixture with the compactor's production
 // settings: the quiet interval, the attempt count and the schedule are the
-// daemon's. Overrides, named: the loop is parked (Debounce of an hour, demand
+// daemon's, and the store has the daemon's build-lane predicate. Overrides,
+// named: the loop is parked (Debounce of an hour, demand
 // debounced) so every cycle is an MCP edit's republish, as in the daemon's
 // edit path; background compactions are scheduled by those republishes.
 func mcpChainFixtureDefaults(t *testing.T, tree map[string]string) (*coordinatorFixture, *CheckoutCoordinator, *CheckoutLifecycle) {
@@ -17,6 +18,9 @@ func mcpChainFixtureDefaults(t *testing.T, tree map[string]string) (*coordinator
 	gate := NewViewBuildGate()
 	gate.Open()
 	c := f.coordinator(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true})
+	// The daemon's build-lane predicate (installBuildLaneBusy): the store's
+	// editing state, its marks and its checkpoints key on it.
+	installDaemonBuildLaneBusy(f, c)
 	if out := c.reconcile(context.Background()); out.Err != nil {
 		t.Fatalf("initial reconcile: %+v", out)
 	}
