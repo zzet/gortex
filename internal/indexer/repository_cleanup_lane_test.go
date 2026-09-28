@@ -78,9 +78,59 @@ func TestRepositoryCleanupLaneCachesDrainAcrossCanceledRetries(t *testing.T) {
 }
 
 func TestRepositoryCleanupLaneOldFinalizerCannotDetachReplacement(t *testing.T) {
-	coordinator := newRepositoryMutationCoordinator(nil)
-	mi := &MultiIndexer{}
-	lane := &repositoryCleanupLane{owner: mi, prefix: "repo", coordinator: coordinator, finalized: true}
+	const prefix = "repo"
+	mi := &MultiIndexer{
+		pendingRepositoryUntracks: make(map[string]*repositoryUntrackState),
+		repositoryMutations:       make(map[string]*repositoryMutationCoordinator),
+	}
+	lane, err := mi.beginRepositoryCleanupLane(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalState := &repositoryUntrackState{
+		coordinator:     lane.coordinator,
+		completed:       true,
+		retainAdmission: true,
+	}
+	replacementCoordinator := newRepositoryMutationCoordinator(nil)
+	replacementReservation := new(byte)
+	replacementState := &repositoryUntrackState{
+		coordinator:     replacementCoordinator,
+		completed:       true,
+		retainAdmission: true,
+	}
+
+	mi.mu.Lock()
+	mi.repositoryMutationMu.Lock()
+	replacementCoordinator.mu.Lock()
+	replacementCoordinator.cleanupReservation = replacementReservation
+	replacementCoordinator.mu.Unlock()
+	mi.pendingRepositoryUntracks[prefix] = replacementState
+	mi.repositoryMutations[prefix] = replacementCoordinator
+	mi.repositoryMutationMu.Unlock()
+	mi.mu.Unlock()
+
+	if err := mi.finalizeRepositoryCleanupLane(lane); err == nil {
+		t.Fatal("stale finalizer detached replacement")
+	}
+	mi.mu.RLock()
+	mi.repositoryMutationMu.Lock()
+	replacementCoordinator.mu.Lock()
+	if mi.pendingRepositoryUntracks[prefix] != replacementState ||
+		mi.repositoryMutations[prefix] != replacementCoordinator ||
+		replacementCoordinator.cleanupReservation != replacementReservation {
+		t.Fatal("stale finalizer changed replacement ownership")
+	}
+	replacementCoordinator.mu.Unlock()
+	mi.repositoryMutationMu.Unlock()
+	mi.mu.RUnlock()
+
+	mi.mu.Lock()
+	mi.repositoryMutationMu.Lock()
+	mi.pendingRepositoryUntracks[prefix] = originalState
+	mi.repositoryMutations[prefix] = lane.coordinator
+	mi.repositoryMutationMu.Unlock()
+	mi.mu.Unlock()
 	if err := mi.finalizeRepositoryCleanupLane(lane); err != nil {
 		t.Fatal(err)
 	}

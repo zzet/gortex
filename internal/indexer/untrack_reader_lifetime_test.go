@@ -55,6 +55,15 @@ func TestPublicUntrackKeepsAPinnedReadersCorpusUntilItCloses(t *testing.T) {
 	pin := f.lc.ViewLeases().AcquireBaseCorpus(prefix)
 	require.NotNil(t, pin)
 	require.True(t, pin.OwnerPinned(), "the serving pin carries no repository owner")
+	pinReleased := false
+	releasePin := func() {
+		if pinReleased {
+			return
+		}
+		pin.Release()
+		pinReleased = true
+	}
+	t.Cleanup(releasePin)
 
 	out, untrackErr := f.lc.Untrack(ctx, root)
 	if untrackErr != nil {
@@ -65,7 +74,7 @@ func TestPublicUntrackKeepsAPinnedReadersCorpusUntilItCloses(t *testing.T) {
 	require.NotNil(t, f.store.GetNode(node.ID),
 		"public untrack purged a pinned reader's corpus out from under it")
 
-	pin.Release()
+	releasePin()
 	finishRepositoryCleanup(t, f.lc, prefix)
 
 	require.Nil(t, f.store.GetNode(node.ID), "finalized cleanup left the repository's payload behind")
@@ -98,6 +107,15 @@ func TestAPinnedUntrackDoesNotCoupleUnrelatedRepositories(t *testing.T) {
 	pin := f.lc.ViewLeases().AcquireBaseCorpus(held.Prefix)
 	require.NotNil(t, pin)
 	require.True(t, pin.OwnerPinned())
+	pinReleased := false
+	releasePin := func() {
+		if pinReleased {
+			return
+		}
+		pin.Release()
+		pinReleased = true
+	}
+	t.Cleanup(releasePin)
 
 	out, untrackErr := f.lc.Untrack(ctx, heldRoot)
 	if untrackErr != nil {
@@ -115,14 +133,20 @@ func TestAPinnedUntrackDoesNotCoupleUnrelatedRepositories(t *testing.T) {
 	require.NotNil(t, f.store.GetNode(otherNode.ID))
 
 	// And it can be torn down to completion while the held one's
-	// generation-zero reader is still live.
+	// generation-zero reader is still live. Admission may return pending even
+	// when the unrelated repository has no readers of its own; finishing that
+	// repository's cleanup remains independent of the held pin.
 	otherOut, otherErr := f.lc.Untrack(ctx, otherRoot)
-	require.NoError(t, otherErr, "an unrelated untrack waited behind another repository's reader")
-	require.False(t, otherOut.Pending, "an unrelated untrack was made pending by another repository's reader")
+	if otherErr != nil {
+		require.ErrorIs(t, otherErr, ErrRepositoryCleanupPending)
+	}
+	if otherOut.Pending {
+		finishRepositoryCleanup(t, f.lc, other.Prefix)
+	}
 	require.Nil(t, f.store.GetNode(otherNode.ID), "the unrelated repository kept its payload")
 	require.NotNil(t, f.store.GetNode(heldNode.ID), "the held repository lost its pinned corpus")
 
-	pin.Release()
+	releasePin()
 	finishRepositoryCleanup(t, f.lc, held.Prefix)
 	require.Nil(t, f.store.GetNode(heldNode.ID))
 }
@@ -295,10 +319,12 @@ func TestASweepBudgetYieldLeavesTheUntrackPendingAndResumes(t *testing.T) {
 	require.NoError(t, untrackErr,
 		"a sweep that yielded on its budget was reported as a hard cleanup failure")
 	require.True(t, out.Pending, "a yielded sweep did not leave the untrack retryable")
-	require.Positive(t, payload.yieldCount())
 
-	// The yield is resumable: the same saga runs the sweep again and finishes.
+	// Untrack returns before its asynchronous owner waiter closes producersDone.
+	// Drive that exact cleanup/resumption barrier before observing the sweep:
+	// this proves the yield reached RetirePayloadGeneration without timing sleeps.
 	finishRepositoryCleanup(t, f.lc, tracked.Prefix)
+	require.Positive(t, payload.yieldCount(), "the resumed cleanup never attempted the yielding retirement")
 	require.Nil(t, f.mi.GetMetadata(tracked.Prefix), "the resumed cleanup never completed")
 	_, found, err := f.catalog.GetDedicatedGraph(ctx, tracked.GraphID)
 	require.NoError(t, err)

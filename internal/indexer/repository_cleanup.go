@@ -151,14 +151,16 @@ func (l *CheckoutLifecycle) pendingRepositoryCleanup(ctx context.Context, graphI
 		return runtime, nil, false, nil
 	}
 	state.identity, state.owner = identity, owner
-	state.publisher, err = l.closeRepositoryPublisher(identity, owner)
-	if err != nil {
-		return runtime, state, true, err
-	}
-	state.refs = l.closeRepositoryRefViews(identity.RepoPrefix)
-	state.lane, err = l.mi.beginRepositoryCleanupLane(identity.RepoPrefix)
-	if err != nil {
-		return runtime, state, true, err
+	if state.lane == nil {
+		state.publisher, err = l.closeRepositoryPublisher(identity, owner)
+		if err != nil {
+			return runtime, state, true, err
+		}
+		state.refs = l.closeRepositoryRefViews(identity.RepoPrefix)
+		state.lane, err = l.mi.beginRepositoryCleanupLane(identity.RepoPrefix)
+		if err != nil {
+			return runtime, state, true, err
+		}
 	}
 	runtime.mu.Lock()
 	if runtime.closed {

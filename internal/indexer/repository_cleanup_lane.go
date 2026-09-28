@@ -29,13 +29,16 @@ type repositoryCleanupLane struct {
 	owner       *MultiIndexer
 	prefix      string
 	coordinator *repositoryMutationCoordinator
+	reservation *byte
 	done        <-chan struct{}
 	finalized   bool
 }
 
-// beginRepositoryCleanupLane closes mutation admission without waiting for a
-// captured tail and without deleting the registry that tail still uses. New
-// serving requests are already refused by the repository owner admission gate.
+// beginRepositoryCleanupLane reserves the exact stable mutation coordinator
+// before closing admission. Reservation and ordinary detach use the same lock
+// order, so either cleanup owns this coordinator or selection restarts after a
+// completed detach; a stale coordinator is never rebound to a later prefix
+// generation.
 func (mi *MultiIndexer) beginRepositoryCleanupLane(prefix string) (*repositoryCleanupLane, error) {
 	if prefix == "" {
 		return nil, fmt.Errorf("indexer: cleanup refuses an empty prefix")
@@ -43,33 +46,70 @@ func (mi *MultiIndexer) beginRepositoryCleanupLane(prefix string) (*repositoryCl
 	if mi.isClosed() {
 		return nil, errMultiIndexerClosed
 	}
-	mi.mu.RLock()
-	state := mi.pendingRepositoryUntracks[prefix]
-	meta, tracked := mi.repos[prefix]
-	idx := mi.indexers[prefix]
-	mi.mu.RUnlock()
-	var coordinator *repositoryMutationCoordinator
-	if state != nil {
-		coordinator = state.coordinator
-	} else if tracked {
-		var current bool
-		coordinator, current = mi.repositoryMutationCoordinatorForTeardownSnapshot(prefix, meta, idx)
-		if !current {
-			mi.mu.RLock()
-			state = mi.pendingRepositoryUntracks[prefix]
-			mi.mu.RUnlock()
-			if state == nil {
-				return nil, fmt.Errorf("indexer: cleanup lane for %s was superseded", prefix)
-			}
+	for {
+		mi.mu.RLock()
+		state := mi.pendingRepositoryUntracks[prefix]
+		meta, tracked := mi.repos[prefix]
+		idx := mi.indexers[prefix]
+		mi.mu.RUnlock()
+
+		var coordinator *repositoryMutationCoordinator
+		if state != nil {
 			coordinator = state.coordinator
+		} else if tracked {
+			var current bool
+			coordinator, current = mi.repositoryMutationCoordinatorForTeardownSnapshot(prefix, meta, idx)
+			if !current {
+				continue
+			}
+		} else {
+			coordinator = mi.repositoryMutationCoordinator(prefix)
 		}
-	} else {
-		coordinator = mi.repositoryMutationCoordinator(prefix)
+		if coordinator == nil {
+			return nil, fmt.Errorf("indexer: cleanup for %s has no mutation lane", prefix)
+		}
+
+		mi.mu.RLock()
+		mi.repositoryMutationMu.Lock()
+		coordinator.mu.Lock()
+		currentState := mi.pendingRepositoryUntracks[prefix]
+		currentMeta, currentTracked := mi.repos[prefix]
+		currentIdx := mi.indexers[prefix]
+		current := mi.repositoryMutations[prefix] == coordinator
+		switch {
+		case currentState != nil:
+			current = current && currentState.coordinator == coordinator
+		case tracked:
+			current = current && currentTracked && currentMeta == meta && currentIdx == idx
+		default:
+			current = current && !currentTracked
+		}
+		if !current {
+			coordinator.mu.Unlock()
+			mi.repositoryMutationMu.Unlock()
+			mi.mu.RUnlock()
+			continue
+		}
+		if coordinator.cleanupReservation != nil {
+			coordinator.mu.Unlock()
+			mi.repositoryMutationMu.Unlock()
+			mi.mu.RUnlock()
+			return nil, fmt.Errorf("indexer: cleanup lane for %s is already reserved", prefix)
+		}
+		reservation := new(byte)
+		coordinator.cleanupReservation = reservation
+		coordinator.mu.Unlock()
+		mi.repositoryMutationMu.Unlock()
+		mi.mu.RUnlock()
+
+		return &repositoryCleanupLane{
+			owner:       mi,
+			prefix:      prefix,
+			coordinator: coordinator,
+			reservation: reservation,
+			done:        coordinator.closeAndDrain(),
+		}, nil
 	}
-	if coordinator == nil {
-		return nil, fmt.Errorf("indexer: cleanup for %s has no mutation lane", prefix)
-	}
-	return &repositoryCleanupLane{owner: mi, prefix: prefix, coordinator: coordinator, done: coordinator.closeAndDrain()}, nil
 }
 
 // purgeRepoForCleanup completes payload/config phases but retains the exact
@@ -80,7 +120,7 @@ func (mi *MultiIndexer) purgeRepoForCleanup(ctx context.Context, prefix string, 
 }
 
 func (mi *MultiIndexer) finalizeRepositoryCleanupLane(lane *repositoryCleanupLane) error {
-	if lane == nil || lane.owner != mi {
+	if lane == nil || lane.owner != mi || lane.reservation == nil {
 		return fmt.Errorf("indexer: invalid cleanup lane handle")
 	}
 	lane.mu.Lock()
@@ -99,14 +139,12 @@ func (mi *MultiIndexer) finalizeRepositoryCleanupLane(lane *repositoryCleanupLan
 	if state.coordinator != lane.coordinator || !state.completed || !state.retainAdmission {
 		return fmt.Errorf("indexer: cleanup continuation for %s is not finalizable", lane.prefix)
 	}
-	mi.mu.Lock()
-	if mi.pendingRepositoryUntracks[lane.prefix] != state {
-		mi.mu.Unlock()
+	_, detached := mi.detachRepositoryUntrackContinuation(
+		lane.prefix, state, lane.coordinator, lane.reservation,
+	)
+	if !detached {
 		return fmt.Errorf("indexer: cleanup continuation changed for %s", lane.prefix)
 	}
-	delete(mi.pendingRepositoryUntracks, lane.prefix)
-	mi.mu.Unlock()
-	mi.detachRepositoryMutationCoordinator(lane.prefix, lane.coordinator)
 	lane.finalized = true
 	return nil
 }

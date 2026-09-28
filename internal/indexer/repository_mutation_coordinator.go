@@ -117,9 +117,10 @@ type repositoryMutationCoordinator struct {
 	// lane must never execute a coalesced batch with no receipt: an unbound
 	// lane fails closed rather than writing generation zero unfenced. Lanes
 	// hand-built by fixtures leave it false and keep running unfenced.
-	authorityRequired bool
-	closed            bool
-	running           bool
+	authorityRequired  bool
+	cleanupReservation *byte
+	closed             bool
+	running            bool
 
 	requestedGeneration uint64
 	completedGeneration uint64
@@ -633,6 +634,42 @@ func (mi *MultiIndexer) detachRepositoryMutationCoordinator(
 	}
 	delete(mi.repositoryMutations, repoPrefix)
 	return true
+}
+
+// detachRepositoryUntrackContinuation atomically chooses between a cleanup
+// reservation and detaching the exact completed untrack continuation. The
+// caller owns state.mu, so a retained result becomes sticky before another
+// continuation can observe the state.
+func (mi *MultiIndexer) detachRepositoryUntrackContinuation(
+	repoPrefix string,
+	state *repositoryUntrackState,
+	coordinator *repositoryMutationCoordinator,
+	reservation *byte,
+) (retained, detached bool) {
+	if state == nil || coordinator == nil || state.coordinator != coordinator {
+		return false, false
+	}
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	mi.repositoryMutationMu.Lock()
+	defer mi.repositoryMutationMu.Unlock()
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if mi.pendingRepositoryUntracks[repoPrefix] != state ||
+		mi.repositoryMutations[repoPrefix] != coordinator {
+		return false, false
+	}
+	if reservation == nil {
+		if coordinator.cleanupReservation != nil {
+			return true, false
+		}
+	} else if coordinator.cleanupReservation != reservation {
+		return false, false
+	}
+	delete(mi.pendingRepositoryUntracks, repoPrefix)
+	delete(mi.repositoryMutations, repoPrefix)
+	coordinator.cleanupReservation = nil
+	return false, true
 }
 
 func (idx *Indexer) hasRepositoryMutationCoordinator(expected *repositoryMutationCoordinator) bool {
