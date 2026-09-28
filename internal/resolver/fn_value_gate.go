@@ -61,6 +61,13 @@ func ResolveFnValueCallbacksScoped(g graph.Store, scope map[string]bool) int {
 }
 
 func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
+	return resolveFnValueCallbacksWithPrior(g, scope, nil)
+}
+
+// resolveFnValueCallbacksWithPrior is resolveFnValueCallbacks that republishes
+// the prior registrations of every candidate a save cannot have moved
+// (FnValuePrior) instead of resolving it again.
+func resolveFnValueCallbacksWithPrior(g graph.Store, scope map[string]bool, prior *FnValuePrior) int {
 	if g == nil {
 		return 0
 	}
@@ -106,9 +113,40 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 			}
 		}
 	}
+	return resolveFnValueCandidates(g, candidates, prior)
+}
+
+// resolveFnValueCandidates gates the collected candidates and lands their
+// registrations, republishing from prior what the save cannot have moved.
+func resolveFnValueCandidates(g graph.Store, candidates []*graph.Edge, prior *FnValuePrior) int {
 	if len(candidates) == 0 {
 		return 0
 	}
+
+	var landed []*graph.Edge
+	if prior != nil {
+		changed := prior.changedNames(g)
+		resolve := candidates[:0:0]
+		for _, edge := range candidates {
+			name, _ := edge.Meta[metaFnValueName].(string)
+			regs, ok := prior.reusable(edge, name, changed)
+			if !ok {
+				resolve = append(resolve, edge)
+				continue
+			}
+			seenTarget := make(map[string]struct{}, len(regs))
+			for _, reg := range regs {
+				if _, dup := seenTarget[reg.To]; dup || reg.To == edge.From {
+					continue
+				}
+				seenTarget[reg.To] = struct{}{}
+				landed = append(landed, republishFnValueRegistration(reg, edge))
+			}
+		}
+		fnValueReused.Add(int64(len(candidates) - len(resolve)))
+		candidates = resolve
+	}
+	fnValueResolved.Add(int64(len(candidates)))
 
 	sameFileTarget := newFnValueSameFileTargetLookup(g, candidates)
 	// Resolve global names lazily. Most candidates bind within their file, so a
@@ -117,7 +155,6 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 	// negative lookups to one bounded store query per distinct global name.
 	nameMemo := make(map[string][]*graph.Node)
 	prefetchCertainFnValueNames(g, candidates, nameMemo)
-	var landed []*graph.Edge
 	for _, edge := range candidates {
 		name, _ := edge.Meta[metaFnValueName].(string)
 		// Resolution scope depends on the captured form. A special form's

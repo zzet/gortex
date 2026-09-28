@@ -270,6 +270,13 @@ func (idx *Indexer) reindexIncrementalChunk(
 				}
 				storedDerived = d
 			}
+		} else if idx.priorFingerprints != nil && storedDerived.complete() && storedDerived.hierarchy == "" {
+			// A row stamped before the hierarchy fingerprint existed takes
+			// it from the same content source, when that content is the
+			// rows' own parse (priorFingerprints checks it).
+			if _, d, ok := idx.priorFingerprints(filePath, priorNodes); ok && d.declarations == storedDerived.declarations {
+				storedDerived.hierarchy = d.hierarchy
+			}
 		}
 		priorFingerprintTime += time.Since(fingerprintStarted)
 		// Once this chunk retains a prepared result, never block while
@@ -2022,6 +2029,9 @@ func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affect
 	filesByChanged := make(map[string]map[string]struct{})
 	for _, stage := range stages {
 		delta := affectedByDeltaFromExtraction(stage.abSnap, stage.result.Nodes, stage.result.Edges)
+		if hook := idx.affectedByDeltaHook; hook != nil {
+			hook(stage.graphPath, delta)
+		}
 		if len(delta) == 0 {
 			continue
 		}
@@ -2137,6 +2147,9 @@ func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
 }
 
 func (idx *Indexer) reresolveAffectedByStages(stages []*incrementalBatchStage) {
+	// The plan (the changed declarations' referrers, read from the reference
+	// facts) is its own observed stage.
+	idx.observeIncrementalCatchup("affected_plan", nil)
 	plan := idx.planAffectedByStages(stages).bounded()
 	idx.executeAffectedByPlan(plan)
 	if len(plan.files) > 0 {

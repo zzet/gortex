@@ -54,6 +54,16 @@ type frameworkSeedDeclaration struct {
 	// elsewhere that the pass enumerates by kind.
 	nameKinds []graph.EdgeKind
 	nameEdge  func(*graph.Edge) bool
+	// candidateEdge, when set, narrows nameEdge for the candidate gate
+	// (passCandidate): the rows whose presence in a change means the
+	// pass can re-decide something. A row the pass only joins against — a
+	// construction-site marker whose dispatch lives elsewhere — is still
+	// seeded by nameEdge but does not by itself make the pass run.
+	candidateEdge func(*graph.Edge) bool
+	// candidateKinds, when set, are the kinds the candidate gate reads the
+	// changed files' own rows of, for a pass that seeds nothing
+	// (frameworkSeedNone) and so declares no nameKinds.
+	candidateKinds []graph.EdgeKind
 	// nameKeys restricts a candidate edge's join keys to these Meta keys (and
 	// its placeholder target's name); nil takes every Meta value.
 	nameKeys []string
@@ -107,6 +117,20 @@ var frameworkSynthSeedDeclarations = map[string]frameworkSeedDeclaration{
 			}
 			return strings.HasPrefix(frameworkEdgeVia(e), "temporal.")
 		},
+		// An executor-field marker is emitted for every keyed literal of
+		// a composite (every config struct literal carries them); it
+		// only rewrites a temporal.stub that reads the same type and
+		// field, and a scoped run sees such a stub only as a changed or
+		// incoming row, which selects the pass itself. So a change whose
+		// only temporal rows are markers has nothing to re-decide.
+		candidateEdge: func(e *graph.Edge) bool {
+			if e.Kind == graph.EdgeAnnotated {
+				role, method := temporalRoleForJavaAnnotation(e.To)
+				return role != "" || method != ""
+			}
+			via := frameworkEdgeVia(e)
+			return strings.HasPrefix(via, "temporal.") && via != temporalExecutorFieldVia
+		},
 	},
 	// Joins a changed registrar's handler names to their definitions.
 	SynthGinMiddleware: {
@@ -153,7 +177,13 @@ var frameworkSynthSeedDeclarations = map[string]frameworkSeedDeclaration{
 	},
 	// Acts only on the changed files' own placeholders and looks every hop
 	// up by name itself.
-	SynthFactoryChain: frameworkSeedNone,
+	// Walks the changed files' own unresolved calls and references that
+	// carry a factory chain's receiver expression and looks every
+	// declaration up itself; a change without one has nothing to walk.
+	SynthFactoryChain: {
+		candidateKinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
+		candidateEdge:  factoryChainCandidate,
+	},
 	// Binds each captured value to a definition in its own file, or looks
 	// it up by name itself.
 	SynthFnValue: frameworkSeedNone,
@@ -634,41 +664,58 @@ func (s *frameworkScopedSeed) ensureIncident(kind graph.EdgeKind) {
 // exactly the rows their declaration's nameEdge selects, among the changed
 // files' own rows and (for a declared incoming kind) the rows into them: a
 // run whose change carries none has nothing to re-decide, and the pass does
-// not run (passHasCandidates).
+// not run (passCandidate).
+// temporalExecutorFieldVia marks a composite literal's keyed string field,
+// the construction-site half of the executor-field join.
+const temporalExecutorFieldVia = "temporal.executor-field"
+
 var frameworkCandidateGatedPasses = map[string]bool{
+	SynthFactoryChain:    true,
 	SynthGRPCStub:        true,
 	SynthTemporalStub:    true,
 	SynthGodotConnection: true,
 }
 
-// passHasCandidates reports whether a candidate-gated pass has a row to
+// passCandidate reports whether a candidate-gated pass has a row to
 // re-decide in this run: a changed file's row, or a row into a changed node
-// of a declared incoming kind, that the declaration's nameEdge selects.
-// Passes that are not candidate-gated always report true.
-func (d *frameworkDeclaredSeed) passHasCandidates(name string) bool {
+// of a declared incoming kind, that the declaration selects (candidateEdge
+// over candidateKinds when declared, else nameEdge over nameKinds). Passes
+// that are not candidate-gated always report true.
+//
+// The row that made the pass run comes back with it (nil when the pass is not
+// candidate-gated or has no declared selector), so a run can name why a gated
+// pass was not skipped.
+func (d *frameworkDeclaredSeed) passCandidate(name string) (bool, *graph.Edge) {
 	if !frameworkCandidateGatedPasses[name] {
-		return true
+		return true, nil
 	}
 	decl := frameworkSynthSeedDeclarationFor(name)
-	if decl.legacy || decl.nameEdge == nil {
-		return true
+	selects, kinds := decl.nameEdge, decl.nameKinds
+	if decl.candidateEdge != nil {
+		selects = decl.candidateEdge
+	}
+	if len(decl.candidateKinds) > 0 {
+		kinds = decl.candidateKinds
+	}
+	if decl.legacy || selects == nil {
+		return true, nil
 	}
 	if len(decl.languages) > 0 && !d.touchesLanguage(decl.languages) {
-		return false
+		return false, nil
 	}
-	for _, kind := range decl.nameKinds {
+	for _, kind := range kinds {
 		for _, edge := range d.fileEdgesOf(kind) {
-			if edge != nil && edge.Meta != nil && decl.nameEdge(edge) {
-				return true
+			if edge != nil && edge.Meta != nil && selects(edge) {
+				return true, edge
 			}
 		}
 		if decl.declaresIncoming(kind) {
 			for _, edge := range d.incomingOf(kind) {
-				if edge != nil && edge.Meta != nil && decl.nameEdge(edge) {
-					return true
+				if edge != nil && edge.Meta != nil && selects(edge) {
+					return true, edge
 				}
 			}
 		}
 	}
-	return false
+	return false, nil
 }

@@ -137,6 +137,11 @@ type EditDeltaReport struct {
 	// SharedRowEmitters are the unchanged files the delta re-derived because
 	// a shared registry row's kept copy moved to them.
 	SharedRowEmitters []string
+	// DependentsWalked reports that planning the dependents ran the closure
+	// walk, which extracts the changed files again (a file was deleted);
+	// false when the plan was read from the pass's own rows
+	// (editDeltaDependents).
+	DependentsWalked bool
 	// LayerRowsByRead splits the delta's layer rows by the read that
 	// composed them; BelowRowsServed counts the rows the payload's
 	// comparisons took from the stack's below-rows source.
@@ -159,6 +164,12 @@ type EditDeltaReport struct {
 	// major page faults the process took meanwhile.
 	// PhaseFaults are the major page faults per delta phase (Phases).
 	PhaseFaults map[string]int64
+	// AffectedByKeys is how many declarations of the changed files the
+	// affected-by plan found changed in shape, AffectedByKeySample the first
+	// of them, and AffectedByFiles how many referrer files it re-resolved.
+	AffectedByKeys      int
+	AffectedByKeySample []string
+	AffectedByFiles     int
 	// ChainLayersOverlaid is how many dirty-chain layers the delta composed
 	// per read over the per-stack caches kept for the stack below them.
 	ChainLayersOverlaid int
@@ -570,9 +581,22 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// resolve, dataflow, affected_by, ref_facts, semantic and derived, each a
 	// phase with its own fault count. passStage names the running one.
 	passPrefix, passStage := "pass", "reconcile"
-	idx.incrementalCatchupHook = func(kind string, _ []string) {
+	idx.affectedByDeltaHook = func(_ string, keys []string) {
+		out.AffectedByKeys += len(keys)
+		for _, key := range keys {
+			if len(out.AffectedByKeySample) < 20 {
+				// The plan's keys join kind and name with a NUL byte; the
+				// sample goes to logs and reports, so it is rendered as text.
+				out.AffectedByKeySample = append(out.AffectedByKeySample, strings.ReplaceAll(key, "\x00", ":"))
+			}
+		}
+	}
+	idx.incrementalCatchupHook = func(kind string, files []string) {
+		if kind == "affected_by" {
+			out.AffectedByFiles += len(files)
+		}
 		switch kind {
-		case "resolve", "dataflow", "affected_by", "ref_facts", "semantic", "derived":
+		case "resolve", "dataflow", "affected_plan", "affected_by", "ref_facts", "semantic", "derived":
 		default:
 			return
 		}
@@ -655,10 +679,11 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		lap("shared_rows_plan")
 		passPrefix = "dependents"
 	}
-	dependents, err := b.editDeltaDependents(ctx, req, plan)
+	dependents, walked, err := b.editDeltaDependents(ctx, req, plan, dw)
 	if err != nil {
 		return nil, err
 	}
+	out.DependentsWalked = walked
 	lap("dependents_plan")
 	if len(dependents) > 0 {
 		if err := rederive("dependent", dependents); err != nil {
@@ -842,6 +867,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Int("whole_layer_loads", out.WholeLayerLoads),
 			zap.Int("whole_layer_rows", out.WholeLayerRows),
 			zap.Int("layer_rows_read", out.LayerRowsRead),
+			zap.Bool("dependents_walked", out.DependentsWalked),
 			zap.Any("layer_rows_by_read", out.LayerRowsByRead),
 			zap.Int("below_rows_served", out.BelowRowsServed),
 			zap.Int("resolve_frontier", out.ResolveFrontier),

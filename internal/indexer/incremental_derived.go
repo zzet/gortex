@@ -31,32 +31,56 @@ type IncrementalDerivedReport struct {
 	// Framework preserves the legacy attempted/landed count. It is not an
 	// inserted-edge delta; FrameworkPer and the phase timings expose the actual
 	// owner of a slow incremental settle without changing that compatibility.
-	Framework              int
-	FrameworkPer           []resolver.SynthCount
-	FrameworkGated         int
-	FrameworkReceiverGated int
-	FrameworkCensusMs      int64
-	FrameworkScopeMs       int64
-	FrameworkGateMs        int64
-	FrameworkClaimMs       int64
-	FrameworkDemoteMs      int64
-	FrameworkScopeRows     int
-	FrameworkScopeBytes    int
-	ExternalCalls          int
-	CrossRepo              int
-	Contracts              int
-	DurationMs             int64
+	Framework                 int
+	FrameworkPer              []resolver.SynthCount
+	FrameworkGated            int
+	FrameworkReceiverGated    int
+	FrameworkCandidateGated   []string
+	FrameworkCandidateWitness map[string]string
+	// FactoryChainPriorSkipped counts the chains the factory-chain pass did
+	// not walk again (resolver.FactoryChainPrior).
+	FactoryChainPriorSkipped  int64
+	FrameworkCandidateCheckMs int64
+	// FnValueReused / FnValueResolved count the fn-value candidates the
+	// framework pass republished from the prior and resolved;
+	// FnValuePriorUsed reports that the prior was handed to it.
+	FnValueReused       int64
+	FnValueResolved     int64
+	FnValuePriorUsed    bool
+	FrameworkCensusMs   int64
+	FrameworkScopeMs    int64
+	FrameworkGateMs     int64
+	FrameworkClaimMs    int64
+	FrameworkDemoteMs   int64
+	FrameworkScopeRows  int
+	FrameworkScopeBytes int
+	ExternalCalls       int
+	CrossRepo           int
+	Contracts           int
+	DurationMs          int64
 	// Per-family wall times of the passes above, so a slow settle names its
 	// owner: hierarchy (implements/overrides/entry-point propagation), test
 	// projection, capability synthesis, framework dispatch, external-call and
 	// cross-repository synthesis, and contract reconciliation.
-	HierarchyMs     int64
-	TestsMs         int64
-	CapabilityMs    int64
-	FrameworkMs     int64
-	ExternalCallsMs int64
-	CrossRepoMs     int64
-	ContractsMs     int64
+	HierarchyMs  int64
+	TestsMs      int64
+	CapabilityMs int64
+	// CapabilitySourcesReused / CapabilityRowsReused / CapabilityRoots /
+	// CapabilityExpanded are the capability pass's reuse counters for this
+	// run (capability_edges_scoped.go): methods not evaluated as roots,
+	// indirect rows taken from the prior, roots evaluated, and roots whose
+	// mutated-field set changed.
+	CapabilitySourcesReused int64
+	CapabilityRowsReused    int64
+	CapabilityRoots         int64
+	CapabilityExpanded      int64
+	// HierarchyRepublished counts the implements/overrides rows republished
+	// from the prior instead of re-inferred.
+	HierarchyRepublished int
+	FrameworkMs          int64
+	ExternalCallsMs      int64
+	CrossRepoMs          int64
+	ContractsMs          int64
 }
 
 // runStandaloneIncrementalDerivedPasses reuses the exact MultiIndexer derived
@@ -256,7 +280,28 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 	}
 	mi.mu.RUnlock()
 
-	if merged.Flags.Has(DerivedInvalidatesDeclarations) && len(merged.TypeIDs) > 0 {
+	republishHierarchy := merged.hierarchyUnchanged() && prior.covers(merged.Files)
+	// A save the plan does not flag for declarations still re-derived its
+	// files (the eviction took the rows recorded at them): their hierarchy,
+	// unchanged, is republished as well, or a delta that covers the path
+	// masks the lower copy and the rows are lost.
+	if !merged.Flags.Has(DerivedInvalidatesDeclarations) && republishHierarchy && len(prior.hierarchy) > 0 {
+		phase := time.Now()
+		mi.graph.AddBatch(nil, prior.hierarchy)
+		report.HierarchyRepublished = len(prior.hierarchy)
+		report.HierarchyMs += time.Since(phase).Milliseconds()
+	} else if merged.Flags.Has(DerivedInvalidatesDeclarations) && len(merged.TypeIDs) > 0 && republishHierarchy {
+		// The files' hierarchy is as it was, so the inference would land
+		// exactly the rows it landed before the eviction took them: they are
+		// republished instead of re-inferred over the repository's
+		// interfaces.
+		phase := time.Now()
+		if len(prior.hierarchy) > 0 {
+			mi.graph.AddBatch(nil, prior.hierarchy)
+		}
+		report.HierarchyRepublished = len(prior.hierarchy)
+		report.HierarchyMs += time.Since(phase).Milliseconds()
+	} else if merged.Flags.Has(DerivedInvalidatesDeclarations) && len(merged.TypeIDs) > 0 {
 		typeFrontier := make(map[string]bool, len(merged.TypeIDs))
 		for _, id := range merged.TypeIDs {
 			typeFrontier[id] = true
@@ -297,6 +342,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		report.EntryPointHierarchy = entrypoints.PropagateEntryPointsDownHierarchyScoped(mi.graph, merged.TypeIDs)
 		report.HierarchyMs += time.Since(phase).Milliseconds()
 	}
+	capabilityAt := capabilityReuseCounts()
 	if merged.Flags.Has(DerivedInvalidatesRuntime) {
 		phase = time.Now()
 		var readsEnv, execProc, fields int
@@ -318,21 +364,49 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		report.Capability = readsEnv + execProc + fields
 		report.CapabilityMs = time.Since(phase).Milliseconds()
 	}
+	frameworkRuns := merged.Flags.Has(DerivedInvalidatesDeclarations) ||
+		merged.Flags.Has(DerivedInvalidatesImports) ||
+		merged.Flags.Has(DerivedInvalidatesRuntime)
+	if !frameworkRuns && prior.covers(merged.Files) && prior.fnValue != nil {
+		// The files were re-parsed, so their fn-value registrations went with
+		// the eviction; no framework pass runs to land them again.
+		phase = time.Now()
+		report.Framework = resolver.ResolveFnValueCallbacksForFiles(mi.graph, merged.Files, prior.fnValue)
+		report.FrameworkMs = time.Since(phase).Milliseconds()
+	}
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) ||
 		merged.Flags.Has(DerivedInvalidatesImports) ||
 		merged.Flags.Has(DerivedInvalidatesRuntime) {
 		phase = time.Now()
+		frameworkSelection := mi.frameworkSynthesizerSelection(scopedPrefixes)
+		if prior.covers(merged.Files) && prior.fnValue != nil {
+			// The fn-value gate republishes what the save cannot have moved
+			// (resolver.FnValuePrior).
+			frameworkSelection = frameworkSelection.WithFnValuePrior(prior.fnValue)
+		}
+		if prior.covers(merged.Files) && prior.factoryChain != nil {
+			frameworkSelection = frameworkSelection.WithFactoryChainPrior(prior.factoryChain)
+		}
+		factoryChainSkippedAt := resolver.FactoryChainPriorSkipped()
+		fnReusedAt, fnResolvedAt := resolver.FnValueGateCounts()
 		framework := resolver.RunFrameworkSynthesizersScopedForFilesWithSelection(
 			mi.graph,
 			scopedPrefixes,
 			merged.Files,
 			merged.CSharpHierarchyChanged,
-			mi.frameworkSynthesizerSelection(scopedPrefixes),
+			frameworkSelection,
 		)
 		report.Framework = framework.Total
 		report.FrameworkPer = framework.Per
 		report.FrameworkGated = framework.Gated
 		report.FrameworkReceiverGated = framework.ReceiverGated
+		report.FrameworkCandidateGated = framework.CandidateGated
+		report.FrameworkCandidateWitness = framework.CandidateWitness
+		report.FactoryChainPriorSkipped = resolver.FactoryChainPriorSkipped() - factoryChainSkippedAt
+		report.FrameworkCandidateCheckMs = framework.CandidateCheckMillis
+		fnReused, fnResolved := resolver.FnValueGateCounts()
+		report.FnValueReused, report.FnValueResolved = fnReused-fnReusedAt, fnResolved-fnResolvedAt
+		report.FnValuePriorUsed = prior.covers(merged.Files) && prior.fnValue != nil
 		report.FrameworkCensusMs = framework.CensusMillis
 		report.FrameworkScopeMs = framework.ScopeMillis
 		report.FrameworkGateMs = framework.GateMillis
@@ -356,6 +430,11 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		report.ContractsMs = time.Since(phase).Milliseconds()
 	}
 
+	capabilityNow := capabilityReuseCounts()
+	report.CapabilitySourcesReused = capabilityNow[0] - capabilityAt[0]
+	report.CapabilityRowsReused = capabilityNow[1] - capabilityAt[1]
+	report.CapabilityRoots = capabilityNow[2] - capabilityAt[2]
+	report.CapabilityExpanded = capabilityNow[3] - capabilityAt[3]
 	report.DurationMs = time.Since(started).Milliseconds()
 	mi.logIncrementalDerived(report, merged)
 	return report
@@ -381,6 +460,13 @@ func (mi *MultiIndexer) logIncrementalDerived(report IncrementalDerivedReport, p
 		zap.Any("framework_per_synth", report.FrameworkPer),
 		zap.Int("framework_gated", report.FrameworkGated),
 		zap.Int("framework_receiver_gated", report.FrameworkReceiverGated),
+		zap.Strings("framework_candidate_gated", report.FrameworkCandidateGated),
+		zap.Any("framework_candidate_witness", report.FrameworkCandidateWitness),
+		zap.Int64("factory_chain_prior_skipped", report.FactoryChainPriorSkipped),
+		zap.Int64("framework_candidate_check_ms", report.FrameworkCandidateCheckMs),
+		zap.Bool("fn_value_prior_used", report.FnValuePriorUsed),
+		zap.Int64("fn_value_reused", report.FnValueReused),
+		zap.Int64("fn_value_resolved", report.FnValueResolved),
 		zap.Int64("framework_census_ms", report.FrameworkCensusMs),
 		zap.Int64("framework_scope_ms", report.FrameworkScopeMs),
 		zap.Int64("framework_gate_ms", report.FrameworkGateMs),
@@ -394,9 +480,14 @@ func (mi *MultiIndexer) logIncrementalDerived(report IncrementalDerivedReport, p
 		zap.Int64("hierarchy_ms", report.HierarchyMs),
 		zap.Int64("tests_ms", report.TestsMs),
 		zap.Int64("capability_ms", report.CapabilityMs),
+		zap.Int64("capability_sources_reused", report.CapabilitySourcesReused),
+		zap.Int64("capability_rows_reused", report.CapabilityRowsReused),
+		zap.Int64("capability_roots", report.CapabilityRoots),
+		zap.Int64("capability_expanded", report.CapabilityExpanded),
 		zap.Int64("framework_ms", report.FrameworkMs),
 		zap.Int64("external_calls_ms", report.ExternalCallsMs),
 		zap.Int64("cross_repo_ms", report.CrossRepoMs),
 		zap.Int64("contracts_ms", report.ContractsMs),
+		zap.Int("hierarchy_republished", report.HierarchyRepublished),
 		zap.Int64("duration_ms", report.DurationMs))
 }

@@ -197,6 +197,27 @@ func UnstampSynthesized(e *graph.Edge) {
 type FrameworkSynthesizerSelection struct {
 	configured bool
 	names      map[string]struct{}
+	// fnValuePrior, on a scoped run, lets the fn-value gate republish what a
+	// save cannot have moved (WithFnValuePrior).
+	fnValuePrior *FnValuePrior
+	// factoryChainPrior, on a scoped run, lets the factory-chain pass skip
+	// the chains that failed before a declaration-preserving save
+	// (WithFactoryChainPrior).
+	factoryChainPrior *FactoryChainPrior
+}
+
+// WithFactoryChainPrior returns the selection with the changed files'
+// factory-chain prior for a scoped run (FactoryChainPrior).
+func (s FrameworkSynthesizerSelection) WithFactoryChainPrior(prior *FactoryChainPrior) FrameworkSynthesizerSelection {
+	s.factoryChainPrior = prior
+	return s
+}
+
+// WithFnValuePrior returns the selection with the changed files' fn-value
+// prior for a scoped run (FnValuePrior).
+func (s FrameworkSynthesizerSelection) WithFnValuePrior(prior *FnValuePrior) FrameworkSynthesizerSelection {
+	s.fnValuePrior = prior
+	return s
 }
 
 // AllFrameworkSynthesizers returns the legacy, all-enabled selection.
@@ -1243,9 +1264,13 @@ type FrameworkSynthReport struct {
 	// the edge's receiver_type.
 	ReceiverGated int `json:"receiver_type_gated,omitempty"`
 	// CandidateGated names the scoped passes that did not run because the
-	// change carries no row they select (passHasCandidates).
+	// change carries no row they select (passCandidate).
 	CandidateGated []string `json:"candidate_gated,omitempty"`
-	// CandidateCheckMillis times the candidate checks (passHasCandidates),
+	// CandidateWitness names, for each candidate-gated pass that ran, the row
+	// that made it run ("kind from -> to via=…"), so a pass that should have
+	// been skipped can be traced to its row.
+	CandidateWitness map[string]string `json:"candidate_witness,omitempty"`
+	// CandidateCheckMillis times the candidate checks (passCandidate),
 	// which read the run's shared seed; it is not in any pass's row.
 	CandidateCheckMillis int64 `json:"candidate_check_ms,omitempty"`
 	// GDScriptReceiverGated counts the same demotion for GDScript, where the
@@ -1452,7 +1477,15 @@ func runFrameworkSynthesizersScoped(
 		candidateGated := false
 		if genericSeed != nil && executionScope != nil && frameworkCandidateGatedPasses[s.Name()] {
 			checkStart := time.Now()
-			candidateGated = !genericSeed.passHasCandidates(s.Name())
+			has, witness := genericSeed.passCandidate(s.Name())
+			candidateGated = !has
+			if witness != nil {
+				if rep.CandidateWitness == nil {
+					rep.CandidateWitness = make(map[string]string)
+				}
+				via, _ := witness.Meta["via"].(string)
+				rep.CandidateWitness[s.Name()] = fmt.Sprintf("%s %s -> %s via=%s", witness.Kind, witness.From, witness.To, via)
+			}
 			rep.CandidateCheckMillis += time.Since(checkStart).Milliseconds()
 		}
 		start, startFaults := time.Now(), processMajorFaults()
@@ -1477,6 +1510,18 @@ func runFrameworkSynthesizersScoped(
 				case candidateGated:
 					// The change carries no row this pass selects.
 					rep.CandidateGated = append(rep.CandidateGated, sf.name)
+				case sf.name == SynthFnValue && selection.fnValuePrior != nil:
+					passScope = genericSeed.passStore(sf.name)
+					prior := selection.fnValuePrior
+					n = runLegacyFrameworkSynth(passScope, func(store graph.Store) int {
+						return resolveFnValueCallbacksWithPrior(store, nil, prior)
+					})
+				case sf.name == SynthFactoryChain && selection.factoryChainPrior != nil:
+					passScope = genericSeed.passStore(sf.name)
+					prior := selection.factoryChainPrior
+					n = runLegacyFrameworkSynth(passScope, func(store graph.Store) int {
+						return resolveFactoryChainsWithPrior(store, prior)
+					})
 				default:
 					passScope = genericSeed.passStore(sf.name)
 					n = runLegacyFrameworkSynth(passScope, sf.fn)

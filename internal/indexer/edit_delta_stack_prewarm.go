@@ -887,7 +887,8 @@ func warmLikelyReferrers(dw *graph.DeltaWriter, repoPrefix, file string, deadlin
 }
 
 // warmLikelyPriorFingerprints makes the prior-fingerprint read a delta editing
-// file makes when the file's prior rows carry no derived fingerprints: its HEAD content's, parsed and kept per stack
+// file makes when the file's prior rows carry no (or no hierarchy) derived
+// fingerprints: its HEAD content's, parsed and kept per stack
 // (edit_delta_prior_fingerprints.go). Nothing is read when the rows carry
 // them, or the checkout's HEAD is unknown.
 func warmLikelyPriorFingerprints(idx *Indexer, base graph.Reader, store any, repoPrefix, file string, priorNodes []*graph.Node, head prewarmHead) {
@@ -895,7 +896,8 @@ func warmLikelyPriorFingerprints(idx *Indexer, base graph.Reader, store any, rep
 		return
 	}
 	stored := storedDerivedFingerprints(priorNodes)
-	needed := !stored.complete() && derivedFingerprintSideExists(priorNodes)
+	needed := (!stored.complete() && derivedFingerprintSideExists(priorNodes)) ||
+		(stored.complete() && stored.hierarchy == "")
 	if !needed {
 		return
 	}

@@ -299,7 +299,8 @@ func isFingerprintMeta(key string) bool {
 	switch key {
 	case sourceSemanticFingerprintMeta, sourceMetadataFingerprintMeta, sourceCoreFingerprintMeta,
 		sourceDerivedDeclFingerprintMeta, sourceDerivedImportFingerprintMeta,
-		sourceDerivedRuntimeFingerprintMeta, sourceDerivedArtifactFingerprintMeta:
+		sourceDerivedRuntimeFingerprintMeta, sourceDerivedArtifactFingerprintMeta,
+		sourceDerivedHierarchyFingerprintMeta:
 		return true
 	default:
 		return false
@@ -507,7 +508,7 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 	metadataRows := make([]fingerprintDigest, 0, capacity)
 	semanticRows := make([]fingerprintDigest, 0, capacity)
 	coreRows := make([]fingerprintDigest, 0, capacity)
-	var declarations, imports, runtimeRows, artifacts []fingerprintDigest
+	var declarations, imports, runtimeRows, artifacts, hierarchy []fingerprintDigest
 	h := sha256.New()
 	for _, node := range result.Nodes {
 		if node == nil {
@@ -536,6 +537,9 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		semanticRows = append(semanticRows, semantic)
 		if isDeclarationNodeKind(node.Kind) {
 			declarations = append(declarations, derived)
+		}
+		if isHierarchyNodeKind(node.Kind) {
+			hierarchy = append(hierarchy, derived)
 		}
 		if isImportNodeKind(node.Kind) {
 			imports = append(imports, derived)
@@ -572,6 +576,7 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		semanticRows = append(semanticRows, semantic)
 		if isDeclarationEdgeKind(edge.Kind) {
 			declarations = append(declarations, derived)
+			hierarchy = append(hierarchy, derived)
 		}
 		if isImportEdgeKind(edge.Kind) {
 			imports = append(imports, derived)
@@ -592,6 +597,7 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		imports:      stableFingerprintDigests(imports),
 		runtime:      stableFingerprintDigests(runtimeRows),
 		artifacts:    stableFingerprintDigests(artifacts),
+		hierarchy:    stableFingerprintDigests(hierarchy),
 	}, true
 }
 

@@ -609,6 +609,9 @@ type Indexer struct {
 	// It is nil in production and lets focused tests prove a watcher storm runs
 	// each tail once after the bounded mutation batch, never once per chunk.
 	incrementalCatchupHook func(kind string, files []string)
+	// affectedByDeltaHook observes, per changed file, the declaration keys
+	// whose shape the affected-by plan found changed (planAffectedByStages).
+	affectedByDeltaHook func(graphPath string, keys []string)
 	// contractRegistryLoad is the time ensureIncrementalContractRegistry
 	// spent reading the registry from the graph (a per-file delta reports it).
 	contractRegistryLoad time.Duration

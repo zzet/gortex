@@ -32,7 +32,7 @@ func (idx *Indexer) refFactsWriter() (graph.RefFactsWriter, bool) {
 // walkRefFacts derives resolved-reference facts from bounded node/edge/target
 // batches and yields at most refFactEdgeBatch rows at a time. It never issues
 // per-node adjacency or per-edge target lookups.
-func walkRefFacts(g graph.Store, nodes []*graph.Node, yield func([]graph.RefFact) error) error {
+func walkRefFacts(g graph.Store, nodes []*graph.Node, legs *refFactLegs, yield func([]graph.RefFact) error) error {
 	facts := make([]graph.RefFact, 0, refFactEdgeBatch)
 	emit := func(fact graph.RefFact) error {
 		facts = append(facts, fact)
@@ -62,7 +62,9 @@ func walkRefFacts(g graph.Store, nodes []*graph.Node, yield func([]graph.RefFact
 		if len(ids) == 0 {
 			continue
 		}
+		legs.lap("walk")
 		out := g.GetOutEdgesByNodeIDs(ids)
+		legs.lap("out_edges")
 		selected := make([]*graph.Edge, 0, refFactEdgeBatch)
 		flush := func() error {
 			if len(selected) == 0 {
@@ -72,16 +74,15 @@ func walkRefFacts(g graph.Store, nodes []*graph.Node, yield func([]graph.RefFact
 			for _, edge := range selected {
 				targetIDs = append(targetIDs, edge.To)
 			}
-			targets := g.GetNodesByIDs(targetIDs)
+			legs.lap("walk")
+			targets := refFactTargetNames(g, targetIDs)
+			legs.lap("targets")
 			for _, edge := range selected {
 				source := nodeByID[edge.From]
 				if source == nil {
 					continue
 				}
-				refName := ""
-				if target := targets[edge.To]; target != nil {
-					refName = target.Name
-				}
+				refName := targets[edge.To]
 				origin := edge.Origin
 				if origin == "" {
 					semanticSource, _ := edge.Meta["semantic_source"].(string)
@@ -146,10 +147,13 @@ func (idx *Indexer) persistRefFactsForFiles(graphPaths []string) {
 	if !ok {
 		return
 	}
+	legs := newRefFactLegs()
+	defer func() { idx.logger.Info("ref-facts: persisted", legs.fields(len(graphPaths))...) }()
 	for start := 0; start < len(graphPaths); start += refFactFileBatch {
 		end := min(start+refFactFileBatch, len(graphPaths))
 		paths := graphPaths[start:end]
 		byPath := idx.graph.GetFileNodesByPaths(paths)
+		legs.lap("file_nodes")
 		nodesByRepo := make(map[string][]*graph.Node)
 		filesByRepo := make(map[string]map[string]struct{})
 		for _, path := range paths {
@@ -183,7 +187,10 @@ func (idx *Indexer) persistRefFactsForFiles(graphPaths []string) {
 				idx.logger.Debug("ref-facts: delete failed", zap.Error(err))
 				continue
 			}
-			if err := walkRefFacts(idx.graph, nodesByRepo[repo], func(facts []graph.RefFact) error {
+			legs.lap("delete")
+			if err := walkRefFacts(idx.graph, nodesByRepo[repo], legs, func(facts []graph.RefFact) error {
+				legs.lap("walk")
+				defer legs.lap("write")
 				return w.BulkSetRefFacts(repo, facts)
 			}); err != nil {
 				idx.logger.Debug("ref-facts: persist failed", zap.Error(err))
@@ -287,4 +294,25 @@ func (l *refFactLegs) fields(files int) []zap.Field {
 		fields = append(fields, zap.Duration(name, l.took[name]), zap.Int64(name+"_faults", l.faults[name]))
 	}
 	return fields
+}
+
+// refFactNameReader is the name-only node read a store may offer: a fact
+// needs only its target's name, not the target's row.
+type refFactNameReader interface {
+	NodeNamesByIDs(ids []string) map[string]string
+}
+
+// refFactTargetNames returns id -> name for the targets g holds, through the
+// name-only read when g has one and from full rows otherwise.
+func refFactTargetNames(g graph.Store, ids []string) map[string]string {
+	if names, ok := g.(refFactNameReader); ok {
+		return names.NodeNamesByIDs(ids)
+	}
+	out := make(map[string]string, len(ids))
+	for id, n := range g.GetNodesByIDs(ids) {
+		if n != nil {
+			out[id] = n.Name
+		}
+	}
+	return out
 }

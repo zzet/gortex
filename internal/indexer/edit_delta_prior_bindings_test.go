@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -28,7 +29,7 @@ func TestPriorBindingsCarryUnchangedReferencesAcrossAReparse(t *testing.T) {
 	builderGit(t, root, "init", "--initial-branch=main")
 	builderWriteTree(t, root, map[string]string{
 		"go.mod": "module example.test/m\n\ngo 1.23\n",
-		"p/a.go": "package p\n\nimport (\n\t\"example.test/m/q\"\n\t\"example.test/m/r\"\n)\n\nfunc First() int {\n\ta := q.Helper()\n\tb := r.Helper()\n\treturn a + b + Local()\n}\n\nfunc Local() int { return 1 }\n\nfunc Second() int {\n\treturn q.Helper() + Local() + Gone()\n}\n\nfunc Gone() int { return 2 }\n",
+		"p/a.go": "package p\n\nimport (\n\t\"strings\"\n\n\t\"example.test/m/q\"\n\t\"example.test/m/r\"\n)\n\nfunc First() int {\n\ta := q.Helper()\n\tb := r.Helper()\n\t_ = strings.ToUpper(\"x\")\n\treturn a + b + Local() + Unknown()\n}\n\nfunc Local() int { return 1 }\n\nfunc Second() int {\n\treturn q.Helper() + Local() + Gone() + Later()\n}\n\nfunc Gone() int { return 2 }\n",
 		"q/q.go": "package q\n\nfunc Helper() int { return 3 }\n",
 		"r/r.go": "package r\n\nfunc Helper() int { return 4 }\n",
 	})
@@ -64,7 +65,7 @@ func TestPriorBindingsCarryUnchangedReferencesAcrossAReparse(t *testing.T) {
 	// A declaration inserted above First shifts every later line; Gone is
 	// renamed, so Second's call to it must not carry.
 	aPath := filepath.Join(root, "p", "a.go")
-	bumpMtime(t, aPath, "package p\n\nimport (\n\t\"example.test/m/q\"\n\t\"example.test/m/r\"\n)\n\nfunc Zero() int { return 0 }\n\nfunc First() int {\n\ta := q.Helper()\n\tb := r.Helper()\n\treturn a + b + Local()\n}\n\nfunc Local() int { return 1 }\n\nfunc Second() int {\n\treturn q.Helper() + Local() + Gone2()\n}\n\nfunc Gone2() int { return 2 }\n")
+	bumpMtime(t, aPath, "package p\n\nimport (\n\t\"strings\"\n\n\t\"example.test/m/q\"\n\t\"example.test/m/r\"\n)\n\nfunc Zero() int { return 0 }\n\nfunc First() int {\n\ta := q.Helper()\n\tb := r.Helper()\n\t_ = strings.ToUpper(\"x\")\n\treturn a + b + Local() + Unknown()\n}\n\nfunc Local() int { return 1 }\n\nfunc Second() int {\n\treturn q.Helper() + Local() + Gone2() + Later()\n}\n\nfunc Gone2() int { return 2 }\n\nfunc Later() int { return 5 }\n")
 	_, err := idx.IncrementalReindexPaths(root, []string{aPath})
 	require.NoError(t, err)
 
@@ -75,6 +76,8 @@ func TestPriorBindingsCarryUnchangedReferencesAcrossAReparse(t *testing.T) {
 		}
 	}
 	require.Positive(t, carried, "no reference carried its prior binding across the reparse")
+	// Later, unresolved before, is declared by the edit and must bind.
 	fresh, _ := index(nil)
 	require.Equal(t, rows(fresh), rows(g), "the carried rows must equal a whole index of the edited tree")
+	require.Contains(t, strings.Join(rows(g), "\n"), "-calls-> "+builderRepoPrefix+"/p/a.go::Later", "the reference the edit made resolvable is bound")
 }
