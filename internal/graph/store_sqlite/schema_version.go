@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 28
+const currentSchemaVersion = 29
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -125,6 +125,7 @@ var schemaMigrations = []schemaMigration{
 	{version: 26, name: "scope hot graph indexes by view generation", inPlace: scopeHotGraphIndexesByViewGeneration},
 	{version: 27, name: "scope kind and fn-value indexes by view generation", inPlace: scopeKindAndFnValueIndexesByViewGeneration},
 	{version: 28, name: "lead edge candidate indexes with view generation", inPlace: scopeEdgeCandidateIndexesByViewGeneration},
+	{version: 29, name: "persist admitted-input manifests per generation", inPlace: createGenerationInputManifestTables},
 }
 
 // generationFirstEdgeCandidateIndexNames covers precisely the indexes used by
@@ -439,6 +440,18 @@ SELECT 0, slot, generation_id FROM analysis_active_generation`); err != nil {
 // unversioned side effect of Open.
 func createGenerationMaskTables(tx *sql.Tx) error {
 	_, err := tx.Exec(generationMaskSchemaSQL)
+	return err
+}
+
+// createGenerationInputManifestTables is the explicit v29 migration. Like the
+// v18 masks the manifest tables are purely additive and re-key nothing, so an
+// older store gains them in place with no reindex and no backfill: a
+// generation published before the upgrade simply has no manifest, which a
+// reader reports as absent rather than empty. schemaSQL creates the same
+// objects first on every Open; this step repeats the idempotent DDL so the
+// addition is part of the versioned contract.
+func createGenerationInputManifestTables(tx *sql.Tx) error {
+	_, err := tx.Exec(generationInputManifestSchemaSQL)
 	return err
 }
 

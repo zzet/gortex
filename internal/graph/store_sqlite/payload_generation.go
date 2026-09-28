@@ -881,15 +881,19 @@ func refusalReason(refs ViewGenerationReferences) string {
 }
 
 // payloadSweepTables is every generation-keyed table the sweep walks, taken
-// from the two registries that declare them, so a sidecar or mask added later
-// is collected without being named here as well.
+// from the three registries that declare them (sidecars, ownership masks, and
+// the admitted-input manifest), so a table added to any of them later is
+// collected without being named here as well.
 func payloadSweepTables() []string {
-	tables := make([]string, 0, len(viewGenSidecars)+len(generationMaskTables))
+	tables := make([]string, 0, len(viewGenSidecars)+len(generationMaskTables)+len(generationInputManifestTables))
 	for _, sidecar := range viewGenSidecars {
 		tables = append(tables, sidecar.table)
 	}
 	for _, mask := range generationMaskTables {
 		tables = append(tables, mask.table)
+	}
+	for _, manifest := range generationInputManifestTables {
+		tables = append(tables, manifest.table)
 	}
 	return tables
 }
