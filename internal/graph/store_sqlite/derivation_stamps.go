@@ -387,10 +387,11 @@ func (c *DerivedCorrection) ReplaceSourceEdges(ctx context.Context, sources []st
 			return err
 		}
 		// The corrected generation's analyses are stale: invalidate them
-		// durably in the same transaction.
+		// durably in the same transaction, scoped to the generation.
+		view := s.AtGeneration(c.req.GenerationID)
 		invalidated := s.analysisGenerationPresent
 		if invalidated {
-			if err := invalidateAnalysisGenerationTx(tx); err != nil {
+			if err := view.invalidateAnalysisViewTx(tx); err != nil {
 				return err
 			}
 		}
@@ -443,9 +444,9 @@ func (c *DerivedCorrection) ReplaceSourceEdges(ctx context.Context, sources []st
 			return err
 		}
 		if invalidated {
-			s.analysisGenerationPresent = false
+			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
-		s.finishAnalysisMutationLocked(true)
+		s.bumpAnalysisViewRevision(c.req.GenerationID)
 		c.stats.ChangedChunks++
 		c.stats.Chunks++
 		c.stats.Sources += len(sourceSet)

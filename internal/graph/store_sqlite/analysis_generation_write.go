@@ -116,7 +116,7 @@ func (s *Store) BeginAnalysisGeneration(expectedRevision uint64, header graph.An
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.analysisMutationRevision.Load() != expectedRevision {
+	if s.analysisRevision() != expectedRevision {
 		return 0, false, nil
 	}
 	// A new analysis over a view the retirement sweep is already walking would
@@ -175,7 +175,7 @@ func (s *Store) beginAnalysisGenerationWrite(expectedRevision uint64, generation
 	if generationID <= 0 {
 		return nil, false, fmt.Errorf("analysis generation: invalid generation id %d", generationID)
 	}
-	if s.analysisMutationRevision.Load() != expectedRevision {
+	if s.analysisRevision() != expectedRevision {
 		return nil, false, nil
 	}
 	// Same gate as BeginAnalysisGeneration, and it has to be here too: an

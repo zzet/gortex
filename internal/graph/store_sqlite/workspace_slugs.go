@@ -84,7 +84,7 @@ func (s *Store) BackfillWorkspaceSlugsWithImpact(slugs []graph.WorkspaceSlug) gr
 
 	invalidatedAnalysis := false
 	if backfill.Changed > 0 && s.analysisGenerationPresent {
-		if err := invalidateAnalysisGenerationTx(tx); err != nil {
+		if err := s.invalidateAnalysisViewTx(tx); err != nil {
 			_ = tx.Rollback()
 			panicOnFatal(err)
 			return graph.WorkspaceSlugBackfillResult{}
@@ -96,7 +96,7 @@ func (s *Store) BackfillWorkspaceSlugsWithImpact(slugs []graph.WorkspaceSlug) gr
 		return graph.WorkspaceSlugBackfillResult{}
 	}
 	if invalidatedAnalysis {
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(backfill.Changed > 0)
 	return backfill

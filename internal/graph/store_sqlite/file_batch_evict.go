@@ -230,7 +230,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	changed := nodesRemoved > 0 || edgesRemoved > 0 || scalarChanges > 0
 	invalidatedAnalysis := false
 	if changed && s.analysisGenerationPresent {
-		if err := invalidateAnalysisGenerationTx(tx); err != nil {
+		if err := s.invalidateAnalysisViewTx(tx); err != nil {
 			return 0, 0, err
 		}
 		invalidatedAnalysis = true
@@ -240,7 +240,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	}
 
 	if invalidatedAnalysis {
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(changed)
 	if changed {

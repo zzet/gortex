@@ -173,6 +173,9 @@ type storeCore struct {
 	resolveMu sync.Mutex
 
 	edgeIdentityRevs atomic.Int64
+	// edgeIdentityRevsByView is edgeIdentityRevs per view generation
+	// (generation id → *atomic.Int64; EdgeIdentityRevisions).
+	edgeIdentityRevsByView sync.Map
 	// edgeMutationRevision is a coarse monotonic generation for every durable
 	// edge payload/topology mutation, including same-key replacements. Resolver
 	// liveness snapshots use it to reject stale work after watcher interleaves.
@@ -184,6 +187,13 @@ type storeCore struct {
 	// DELETE on every row after the first fail-closed invalidation.
 	analysisMutationRevision  atomic.Uint64
 	analysisGenerationPresent bool
+	// analysisViewRevisions is the per-view-generation mutation clock
+	// (generation id → *atomic.Uint64; AnalysisViewRevision).
+	analysisViewRevisions sync.Map
+	// analysisLatchRemaining is what the last scoped durable invalidation
+	// left for the latch: whether any view still holds a pointer or a
+	// building analysis. Guarded by writeMu.
+	analysisLatchRemaining bool
 
 	// wiped records that Open dropped an incompatible on-disk DB and
 	// recreated it empty (a schema-version mismatch that an in-place ALTER
@@ -486,6 +496,10 @@ type Store struct {
 	// managedPayloadGeneration requires fresh lifecycle admission for writes.
 	// It is immutable per handle, not shared write authority or a seal verdict.
 	managedPayloadGeneration bool
+
+	// analysisViewScoped keys this handle's analysis protocol on its view
+	// generation's clock (ViewScopedAnalysis).
+	analysisViewScoped bool
 
 	// seal is the write-admission flag for viewGen, shared with every other
 	// handle over the same generation. It is nil on the base handle, which is
@@ -2307,7 +2321,7 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 	if e.Tier != "" {
 		e.Tier = newTier
 	}
-	s.edgeIdentityRevs.Add(1)
+	s.noteEdgeIdentityRevisions(1)
 	s.finishAnalysisMutationLocked(true)
 	return true
 }
@@ -2426,7 +2440,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 		// signal, so an idempotent warm pass keeps its active generation.
 		invalidatedAnalysis := false
 		if chunkChanged && s.analysisGenerationPresent {
-			if err := invalidateAnalysisGenerationTx(tx); err != nil {
+			if err := s.invalidateAnalysisViewTx(tx); err != nil {
 				_ = tx.Rollback()
 				return statements, err
 			}
@@ -2436,7 +2450,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 			return statements, err
 		}
 		if invalidatedAnalysis {
-			s.analysisGenerationPresent = false
+			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
 		s.finishAnalysisMutationLocked(chunkChanged)
 	}
@@ -3266,8 +3280,43 @@ func (s *Store) RepoPrefixes() []string {
 
 // -- provenance verification ---------------------------------------------
 
+// EdgeIdentityRevisions counts the provenance-bearing edge-identity changes
+// visible to this handle's view: those committed at its generation plus those
+// at the base generation (every view composes over it). A change in another
+// generation — a worktree's layer — leaves it unchanged, so an analysis over
+// the base view (the incremental Leiden cache) is not forced into a full
+// recompute by a worktree edit. EdgeIdentityRevisionsAll is the whole store's
+// count.
 func (s *Store) EdgeIdentityRevisions() int {
+	if s.coreless() {
+		return 0
+	}
+	n := s.edgeIdentityCounter(s.viewGen).Load()
+	if s.viewGen != baseViewGeneration {
+		n += s.edgeIdentityCounter(baseViewGeneration).Load()
+	}
+	return int(n)
+}
+
+// EdgeIdentityRevisionsAll is the whole store's count of edge-identity
+// changes, whatever the handle.
+func (s *Store) EdgeIdentityRevisionsAll() int {
 	return int(s.edgeIdentityRevs.Load())
+}
+
+func (s *Store) edgeIdentityCounter(g int64) *atomic.Int64 {
+	if v, ok := s.edgeIdentityRevsByView.Load(g); ok {
+		return v.(*atomic.Int64)
+	}
+	v, _ := s.edgeIdentityRevsByView.LoadOrStore(g, &atomic.Int64{})
+	return v.(*atomic.Int64)
+}
+
+// noteEdgeIdentityRevisions records n edge-identity changes committed through
+// this handle, on the whole-store count and on its generation's.
+func (s *Store) noteEdgeIdentityRevisions(n int64) {
+	s.edgeIdentityRevs.Add(n)
+	s.edgeIdentityCounter(s.viewGen).Add(n)
 }
 
 // VerifyEdgeIdentities is a no-op for the SQL backend: the in-memory

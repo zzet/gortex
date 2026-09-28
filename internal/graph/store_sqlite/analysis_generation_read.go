@@ -91,7 +91,7 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 	committed = true
 	// A persisted build revision belongs to the previous process after reopen.
 	// Return the current process revision as the publication receipt instead.
-	header.GraphRevision = s.analysisMutationRevision.Load()
+	header.GraphRevision = s.analysisRevision()
 	return header, true, nil
 }
 

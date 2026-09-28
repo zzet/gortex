@@ -144,7 +144,7 @@ func (s *Store) reindexEdgesSetChunk(chunk []graph.EdgeReindex) (sqliteReindexSe
 		return sqliteReindexSetStats{}, err
 	}
 	if invalidatedAnalysis {
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(changed)
 	if changed {
@@ -253,7 +253,7 @@ func (s *Store) reindexEdgesSetTransactionLocked(ctx context.Context, batch []gr
 	// take that fallback directly, preserving first-candidate-wins semantics.
 	changed = stats.updatedRows > 0 || stats.deletedRows > 0 || stats.insertedRows > 0
 	if changed && s.analysisGenerationPresent {
-		if err := invalidateAnalysisGenerationTx(tx); err != nil {
+		if err := s.invalidateAnalysisViewTx(tx); err != nil {
 			return stats, false, false, nil, err
 		}
 		invalidatedAnalysis = true
