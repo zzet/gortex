@@ -364,6 +364,9 @@ type BuildReport struct {
 	PlanningDuration time.Duration
 	// Duration is the wall time of the whole build.
 	Duration time.Duration
+
+	// Work is the build's physical work accounting (generation_work_counters.go).
+	Work *GenerationWorkCounters
 }
 
 // SparseGenerationBuilder builds sparse payload generations over one store.
@@ -414,6 +417,8 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	if err := b.validate(ctx, &req); err != nil {
 		return 0, BuildReport{}, err
 	}
+	work := newGenerationWorkCounters(req)
+	req.Target = work.admissionSource(req.Target)
 
 	planningStarted := time.Now()
 	plan, report, err := b.planFileSetContext(ctx, req)
@@ -421,6 +426,8 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	if err != nil {
 		return 0, report, err
 	}
+	report.Work = work
+	work.recordPlan(plan, report, report.PlanningDuration)
 
 	return b.buildPlannedGeneration(ctx, req, plan, report, started)
 }
@@ -594,6 +601,7 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		if err := b.declareProducers(req, handle, &report); err != nil {
 			return err
 		}
+		report.Work.mark("separate_masks_producers")
 		if req.PrePublish != nil {
 			if err := req.PrePublish(ctx, generationID); err != nil {
 				return err
@@ -602,12 +610,15 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		if err := window.close(); err != nil {
 			return err
 		}
+		report.Work.mark("bulk_window_close")
 		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)
 		}
+		report.Work.mark("publish")
 		published = true
 		return nil
 	}()
+	report.Work.finish(b.Store, generationID, &report)
 	// No planner-statistics check here on purpose. runPass builds a full
 	// Indexer on the generation handle, and that pass ends with the same check
 	// every other index pass does — at a point where the payload is already on
@@ -862,7 +873,7 @@ func (b *SparseGenerationBuilder) runPass(
 		idx.parseAdmission.Store(b.Admissions.parseAdmission.Load())
 		idx.nativeParseAdmission.Store(b.Admissions.nativeParseAdmission.Load())
 	}
-	idx.setContentSourceWithManifests(newFileSetSource(req.Target, plan.indexed), req.Target)
+	idx.setContentSourceWithManifests(report.Work.extractionSource(newFileSetSource(req.Target, plan.indexed)), req.Target)
 
 	result, err := idx.IndexCtx(ctx, req.RootPath)
 	if err != nil {

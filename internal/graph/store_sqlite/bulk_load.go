@@ -243,6 +243,7 @@ func (s *Store) beginWriteOnContext(ctx context.Context, beginner sqliteTxBeginn
 	if err != nil {
 		return tx, err
 	}
+	writeTransactionsBegun.Add(1)
 	if s.managedPayloadGeneration {
 		if err := checkManagedPayloadWriteTx(ctx, tx, s.viewGen); err != nil {
 			if tx != nil {
@@ -589,6 +590,7 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 	s.bulkCheckpointEdgeRows = 0
 	s.bulkRowCheckpointBackoff = false
 	opened = true
+	s.noteGenerationWriteWindowOpen(ctx, conn, generationID)
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "generation_bulk_begin", Name: strconv.FormatInt(generationID, 10)})
 	return true, nil
 }
@@ -923,6 +925,7 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 	if s.bulkConn == nil {
 		return nil
 	}
+	s.noteGenerationBulkRows(nodeRows, edgeRows)
 	nodeDelta, edgeDelta := int64(nodeRows), int64(edgeRows)
 	if !s.bulkRowCheckpointBackoff {
 		s.bulkCheckpointNodeRows += nodeDelta
