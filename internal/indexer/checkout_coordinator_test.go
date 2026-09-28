@@ -61,6 +61,20 @@ type coordinatorFixture struct {
 // catalog identity a coordinator needs to exist.
 func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 	t.Helper()
+	return newCoordinatorFixtureWithTree(t, builderTreeA())
+}
+
+// newCoordinatorFixtureWithTree is newCoordinatorFixture over a committed tree
+// of the caller's choosing (tree A by default).
+func newCoordinatorFixtureWithTree(t testing.TB, tree map[string]string) *coordinatorFixture {
+	t.Helper()
+	return newCoordinatorFixtureIndexedBy(t, tree, builderIndex)
+}
+
+// newCoordinatorFixtureIndexedBy is newCoordinatorFixtureWithTree with the
+// base corpus indexed by index (a semantic-enabled index, say).
+func newCoordinatorFixtureIndexedBy(t testing.TB, tree map[string]string, index func(testing.TB, *store_sqlite.Store, string)) *coordinatorFixture {
+	t.Helper()
 	builderIsolateGit(t)
 
 	family := builderTempDir(t, "family")
@@ -69,7 +83,7 @@ func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 		t.Fatalf("mkdir primary: %v", err)
 	}
 	builderGit(t, primary, "init", "--initial-branch=main")
-	builderWriteTree(t, primary, builderTreeA())
+	builderWriteTree(t, primary, tree)
 	builderGit(t, primary, "add", "-A")
 	builderGit(t, primary, "commit", "-m", "A")
 	treeA := builderGit(t, primary, "rev-parse", "HEAD^{tree}")
@@ -82,7 +96,7 @@ func newCoordinatorFixture(t testing.TB) *coordinatorFixture {
 	storePath := filepath.Join(t.TempDir(), "base.sqlite")
 	store := builderOpenStoreAt(t, storePath)
 	t.Cleanup(func() { _ = store.Close() })
-	builderIndex(t, store, primary)
+	index(t, store, primary)
 
 	f := &coordinatorFixture{
 		t:          t,
@@ -996,7 +1010,12 @@ func Sneaked() {
 	// The torn attempt was thrown away AND collected. Nothing routes it, so
 	// leaving its payload behind would cost one sparse generation per edit that
 	// lands while a build is running — which is what an editor saving twice in
-	// a second does.
+	// a second does. The collection is the background sweep's, never the
+	// cycle's: the cycle only owes it.
+	if owed := c.retirementBacklog(); len(owed) == 0 {
+		t.Fatal("the torn attempt was not owed a retirement")
+	}
+	c.SweepRetirements(context.Background())
 	route := f.route()
 	for _, row := range f.generations() {
 		if row.State == store_sqlite.ViewGenerationBuilding {
@@ -1405,8 +1424,8 @@ func TestCoordinatorSweepCollectsATornAttempt(t *testing.T) {
 	if !found {
 		t.Fatalf("generation %d was collected while a reader still held it", torn)
 	}
-	if row.State != store_sqlite.ViewGenerationSuperseded {
-		t.Fatalf("the torn attempt is %q, want superseded", row.State)
+	if row.State != store_sqlite.ViewGenerationFailed {
+		t.Fatalf("the torn attempt is %q, want failed (never servable, never a chain parent)", row.State)
 	}
 	if retired := c.SweepRetirements(ctx); retired != 0 {
 		t.Fatalf("the sweep collected %d leased generations", retired)
@@ -1449,8 +1468,14 @@ func TestCoordinatorLeavesAGenerationAnotherCheckoutRoutes(t *testing.T) {
 	if second.CommitGenerationID == first.CommitGenerationID {
 		t.Fatal("the commit slot did not move")
 	}
-	if retired := c.SweepRetirements(ctx); retired != 0 {
-		t.Fatalf("the sweep collected %d generations another checkout is routed to", retired)
+	// The working-tree layer the commit move withdrew is owed to the sweep
+	// too (a cycle never retires payload itself); it is the one generation
+	// the sweep may collect here, and nothing routes it.
+	if retired := c.SweepRetirements(ctx); retired != 1 {
+		t.Fatalf("the sweep collected %d generations, want only the withdrawn working-tree layer", retired)
+	}
+	if _, found := f.generation(first.DirtyGenerationID); found {
+		t.Fatalf("the withdrawn working-tree layer %d was not collected", first.DirtyGenerationID)
 	}
 	if _, found := f.generation(first.CommitGenerationID); !found {
 		t.Fatalf("generation %d was collected out from under the sibling's route", first.CommitGenerationID)

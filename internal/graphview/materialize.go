@@ -48,6 +48,30 @@ const MaxDedicatedBaseChainDepth = 32
 // Exceeding it is refused, never truncated: see generationAncestry.
 const MaxGenerationAncestryDepth = MaxDedicatedBaseChainDepth + 1
 
+// MaxDirtyChainDepth bounds how many working-tree ("dirty") generations one
+// checkout may stack above its routed commit generation, counting the routed
+// top itself: a dirty generation may name the previously published dirty
+// generation of the same checkout as its BaseGenerationID, and the chain of
+// such parents must reach the route's commit generation within this many
+// hops.
+//
+// Like MaxDedicatedBaseChainDepth it is a READ-time number the write side must
+// respect: every chain member is another GenerationLayer mask read set and
+// another OverlaidView indirection on every read of the checkout. The builder
+// that chooses a dirty parent refuses to extend a chain that already holds
+// this many generations and builds directly over the commit instead, so the
+// indexer reads this constant rather than keeping its own.
+//
+// The checkout walk is therefore bounded by MaxGenerationAncestryDepth on the
+// commit side plus MaxDirtyChainDepth on the working-tree side, and so is a
+// ref view of a dirty generation. Exceeding either half is refused, never
+// truncated: see generationAncestry.
+const MaxDirtyChainDepth = 8
+
+// dirtyGenerationKind is the catalog generation kind of a working-tree layer
+// (indexer.DirtyLayerGenerationKind; graphview cannot import the indexer).
+const dirtyGenerationKind = "dirty"
+
 // Materializer turns a checkout's route into a readable view.
 //
 // It owns none of the three things it needs and holds them by
@@ -371,12 +395,12 @@ func (m *Materializer) pinCheckoutRoute(
 		provisional.Release()
 		return nil, true, nil
 	}
-	ancestry, err := m.generationAncestry(ctx, generations)
+	ancestry, commitIndex, err := m.generationAncestry(ctx, generations)
 	if err != nil {
 		provisional.Release()
 		return nil, false, err
 	}
-	pinned, err := m.leaseSet(ctx, ancestry, generations)
+	pinned, err := m.leaseSet(ctx, ancestry, commitIndex)
 	if err != nil {
 		provisional.Release()
 		return nil, false, err
@@ -403,12 +427,12 @@ func (m *Materializer) pinCheckoutRoute(
 // provisionally pinned while the immutable BaseGenerationID chain is read.
 func (m *Materializer) pinGenerationAncestry(ctx context.Context, generations []int64) (*Lease, error) {
 	provisional := m.Leases.Acquire(generations...)
-	ancestry, err := m.generationAncestry(ctx, generations)
+	ancestry, commitIndex, err := m.generationAncestry(ctx, generations)
 	if err != nil {
 		provisional.Release()
 		return nil, err
 	}
-	pinned, err := m.leaseSet(ctx, ancestry, generations)
+	pinned, err := m.leaseSet(ctx, ancestry, commitIndex)
 	if err != nil {
 		provisional.Release()
 		return nil, err
@@ -426,17 +450,20 @@ func (m *Materializer) pinGenerationAncestry(ctx context.Context, generations []
 // zero is the terminator of that chain, not a link in it — and in the legacy
 // regime it is also the reader's bottom layer, the one thing in the stack a
 // reader held nothing over. assemble decides that with exactly the condition
-// mirrored here: a stack whose ancestry is longer than its routed generations
-// stands on a dedicated root, and so does one whose first row is a dedicated
-// corpus; everything else is composed over Store.AtGeneration(0).
+// mirrored here: a stack whose commit-side ancestry is deeper than the commit
+// generation itself stands on that ancestry's root, and so does one whose
+// first row is a dedicated corpus; everything else is composed over
+// Store.AtGeneration(0). The working-tree chain above the commit generation
+// never decides it — a dirty chain in the legacy regime still reads the
+// shared corpus beneath its commit generation.
 //
 // Pinning it only in that regime is deliberate. A view that does not read
 // generation zero has no business holding it — an over-broad pin is an
 // untruthful statement about what a reader depends on, and retirement and
 // cleanup bookkeeping read these pins. The corpus at index zero of a routed
 // content search is a separate consumer with a separate hold; see BasePin.
-func (m *Materializer) leaseSet(ctx context.Context, ancestry, generations []int64) ([]int64, error) {
-	composed, err := m.composesBaseCorpus(ctx, ancestry, generations)
+func (m *Materializer) leaseSet(ctx context.Context, ancestry []int64, commitIndex int) ([]int64, error) {
+	composed, err := m.composesBaseCorpus(ctx, ancestry, commitIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -448,10 +475,16 @@ func (m *Materializer) leaseSet(ctx context.Context, ancestry, generations []int
 
 // composesBaseCorpus reports whether the reader assemble will build reads the
 // shared indexed corpus as its bottom layer. It mirrors assemble's own arm —
-// routedStart > 0 || firstRow.GenerationKind == "dedicated" — so the lease set
+// commitIndex > 0 || firstRow.GenerationKind == "dedicated" — so the lease set
 // and the composition cannot disagree about what the view stands on.
-func (m *Materializer) composesBaseCorpus(ctx context.Context, ancestry, generations []int64) (bool, error) {
-	if len(ancestry) == 0 || len(ancestry) != len(generations) {
+//
+// commitIndex is the position of the commit-side identity generation in the
+// ancestry (generationAncestry): everything at or below it is the committed
+// ancestry, everything above it the working-tree chain and routed layers. The
+// decision reads only the commit side, so a longer dirty chain can never make
+// a legacy-regime view drop the corpus it stands on.
+func (m *Materializer) composesBaseCorpus(ctx context.Context, ancestry []int64, commitIndex int) (bool, error) {
+	if len(ancestry) == 0 || commitIndex != 0 {
 		return false, nil
 	}
 	row, err := m.servableGeneration(ctx, ancestry[0])
@@ -511,59 +544,205 @@ func newAncestryTooDeep(generationID, ancestorID int64, depth int) *AncestryTooD
 	}
 }
 
+// newDirtyChainTooDeep builds the same labelled refusal for the working-tree
+// half of the walk: Generation is the dirty generation the chain was walked
+// from, Depth counts it as depth one, and Limit is MaxDirtyChainDepth. The
+// remedy is the same retryable one — the builder re-roots a chain at this
+// depth directly over the commit generation.
+func newDirtyChainTooDeep(generationID, ancestorID int64, depth int) *AncestryTooDeepError {
+	return &AncestryTooDeepError{
+		ViewError: NewViewError(CodeViewBuilding, fmt.Sprintf(
+			"dirty generation %d stands on a working-tree chain at least %d generations deep at ancestor %d, over the %d-generation chain bound",
+			generationID, depth, ancestorID, MaxDirtyChainDepth)),
+		Generation: generationID,
+		Ancestor:   ancestorID,
+		Depth:      depth,
+		Limit:      MaxDirtyChainDepth,
+	}
+}
+
 // generationAncestry resolves the physical stack beneath the routed
-// generations. The first routed generation may sit on a dedicated full base;
-// later routed generations must form an exact chain above it.
+// generations and reports where the commit side of it ends.
 //
-// The BaseGenerationID walk is bounded by MaxGenerationAncestryDepth and the
-// bound is a refusal, never a truncation: a stack this function returned short
-// would be a view silently missing the oldest generations' content, which is a
-// wrong answer rather than a degraded one.
-func (m *Materializer) generationAncestry(ctx context.Context, generations []int64) ([]int64, error) {
+// The stack has two halves, walked with separate bounds:
+//
+//   - The commit side: generations[0] (for a ref view of a dirty generation,
+//     the generation its working-tree chain stands on) and its
+//     BaseGenerationID ancestry down to zero — at most a dedicated full root,
+//     its deltas, and the commit layer — bounded by MaxGenerationAncestryDepth.
+//   - The working-tree side: each later routed generation, walked down its own
+//     BaseGenerationID through dirty parents until it reaches the routed
+//     generation below it, bounded by MaxDirtyChainDepth. Every parent in that
+//     walk must be a servable dirty generation of the same checkout, layer,
+//     graph and policy identity as the routed generation it was reached from;
+//     anything else is a foreign chain and is refused.
+//
+// The result is bottom first: the commit side oldest to newest, then each
+// routed generation's chain oldest to newest ending in the routed generation
+// itself. commitIndex is the position of the commit-side identity generation,
+// so ancestry[:commitIndex+1] is the commit side and everything above it is
+// the working-tree side.
+//
+// Both bounds are refusals, never truncations: a stack this function returned
+// short would be a view silently missing the oldest generations' content,
+// which is a wrong answer rather than a degraded one.
+func (m *Materializer) generationAncestry(ctx context.Context, generations []int64) ([]int64, int, error) {
 	if len(generations) == 0 {
-		return nil, NewViewError(CodeViewBuilding, "the view has no generations")
+		return nil, 0, NewViewError(CodeViewBuilding, "the view has no generations")
 	}
-	ancestry := make([]int64, 0, len(generations)+1)
 	seen := make(map[int64]struct{}, len(generations)+1)
-	for generationID := generations[0]; generationID > 0; {
-		if _, duplicate := seen[generationID]; duplicate {
-			return nil, NewViewError(CodeViewBuilding,
-				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
-		}
-		if len(ancestry) >= MaxGenerationAncestryDepth {
-			return nil, newAncestryTooDeep(generations[0], generationID, len(ancestry)+1)
-		}
-		seen[generationID] = struct{}{}
-		row, err := m.servableGeneration(ctx, generationID)
+
+	// A ref view of a dirty generation stands on the commit its chain reaches.
+	commitRoot := generations[0]
+	var refChain []int64
+	if len(generations) == 1 {
+		top, err := m.servableGeneration(ctx, generations[0])
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		ancestry = append(ancestry, generationID)
-		generationID = row.BaseGenerationID
-	}
-	for left, right := 0, len(ancestry)-1; left < right; left, right = left+1, right-1 {
-		ancestry[left], ancestry[right] = ancestry[right], ancestry[left]
+		if top.GenerationKind == dirtyGenerationKind {
+			chain, root, err := m.dirtyChain(ctx, generations[0], 0, seen)
+			if err != nil {
+				return nil, 0, err
+			}
+			refChain, commitRoot = chain, root
+		}
 	}
 
+	commitSide := make([]int64, 0, len(generations)+1)
+	for generationID := commitRoot; generationID > 0; {
+		if _, duplicate := seen[generationID]; duplicate {
+			return nil, 0, NewViewError(CodeViewBuilding,
+				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
+		}
+		if len(commitSide) >= MaxGenerationAncestryDepth {
+			return nil, 0, newAncestryTooDeep(commitRoot, generationID, len(commitSide)+1)
+		}
+		seen[generationID] = struct{}{}
+		row, err := m.servableGeneration(ctx, generationID)
+		if err != nil {
+			return nil, 0, err
+		}
+		commitSide = append(commitSide, generationID)
+		generationID = row.BaseGenerationID
+	}
+	slices.Reverse(commitSide)
+	commitIndex := len(commitSide) - 1
+
+	ancestry := make([]int64, 0, len(commitSide)+len(refChain)+len(generations))
+	ancestry = append(ancestry, commitSide...)
+	if len(refChain) > 0 {
+		return append(ancestry, refChain...), commitIndex, nil
+	}
 	lower := generations[0]
 	for _, generationID := range generations[1:] {
+		chain, _, err := m.dirtyChain(ctx, generationID, lower, seen)
+		if err != nil {
+			return nil, 0, err
+		}
+		ancestry = append(ancestry, chain...)
+		lower = generationID
+	}
+	return ancestry, commitIndex, nil
+}
+
+// dirtyChain walks one working-tree chain down from top and returns it oldest
+// first, ending with top, plus the generation it stands on.
+//
+// With lower > 0 the walk must reach exactly lower (the routed generation
+// beneath top) within MaxDirtyChainDepth generations; lower itself is not part
+// of the chain. With lower == 0 the chain's root is discovered instead: the
+// walk stops at the first generation that is not a dirty generation, or that
+// stands on generation zero, and returns that generation as the root without
+// including it. Every generation the chain includes is marked in seen.
+//
+// A routed generation sitting directly on lower is accepted exactly as it
+// always was, with no identity check; the checks apply only to a generation
+// reached as a chain parent and to the routed top that names one.
+func (m *Materializer) dirtyChain(ctx context.Context, top, lower int64, seen map[int64]struct{}) ([]int64, int64, error) {
+	var (
+		chain []int64
+		head  store_sqlite.ViewGeneration
+	)
+	for generationID := top; ; {
 		if _, duplicate := seen[generationID]; duplicate {
-			return nil, NewViewError(CodeViewBuilding,
+			return nil, 0, NewViewError(CodeViewBuilding,
 				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
 		}
 		row, err := m.servableGeneration(ctx, generationID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		if row.BaseGenerationID != lower {
-			return nil, NewViewError(CodeViewBuilding, fmt.Sprintf(
-				"generation %d sits on %d, want %d", generationID, row.BaseGenerationID, lower))
+		if lower == 0 && len(chain) > 0 && (row.GenerationKind != dirtyGenerationKind || row.BaseGenerationID <= 0) {
+			slices.Reverse(chain)
+			return chain, generationID, nil
+		}
+		if len(chain) >= MaxDirtyChainDepth {
+			return nil, 0, newDirtyChainTooDeep(top, generationID, len(chain)+1)
+		}
+		if len(chain) == 0 {
+			head = row
+		} else if err := sameDirtyChain(head, row); err != nil {
+			return nil, 0, err
 		}
 		seen[generationID] = struct{}{}
-		ancestry = append(ancestry, generationID)
-		lower = generationID
+		chain = append(chain, generationID)
+
+		next := row.BaseGenerationID
+		switch {
+		case lower > 0 && next == lower:
+			slices.Reverse(chain)
+			return chain, lower, nil
+		case lower > 0 && next <= 0:
+			return nil, 0, NewViewError(CodeViewBuilding, fmt.Sprintf(
+				"generation %d sits on a chain that ends at %d, want %d", top, generationID, lower))
+		case lower == 0 && next <= 0:
+			// Only reachable for top itself: a dirty generation standing
+			// directly on the corpus is its own root, which the commit-side
+			// walk then visits.
+			delete(seen, generationID)
+			return nil, generationID, nil
+		}
+		if len(chain) == 1 && head.GenerationKind != dirtyGenerationKind {
+			return nil, 0, NewViewError(CodeViewBuilding, fmt.Sprintf(
+				"generation %d sits on %d, want %d", top, next, lower))
+		}
+		generationID = next
 	}
-	return ancestry, nil
+}
+
+// sameDirtyChain refuses a chain parent that does not belong to the chain it
+// was reached from: it must be a working-tree generation of the same checkout,
+// layer and graph, built under the same extraction, resolution and dependency
+// policy. A chain spliced across checkouts or policies would compose payload
+// no build of this checkout ever derived.
+func sameDirtyChain(head, parent store_sqlite.ViewGeneration) error {
+	mismatch := ""
+	switch {
+	case parent.GenerationKind != dirtyGenerationKind:
+		mismatch = "kind " + parent.GenerationKind
+	case parent.OwnerKind != head.OwnerKind:
+		mismatch = "owner " + parent.OwnerKind
+	case parent.CheckoutID != head.CheckoutID:
+		mismatch = "checkout " + parent.CheckoutID
+	case parent.LayerID != head.LayerID:
+		mismatch = "layer " + parent.LayerID
+	case parent.GraphID != head.GraphID:
+		mismatch = "graph " + parent.GraphID
+	case parent.ConfigHash != head.ConfigHash:
+		mismatch = "config hash"
+	case parent.ExtractorVersions != head.ExtractorVersions:
+		mismatch = "extractor versions"
+	case parent.ResolverVersion != head.ResolverVersion:
+		mismatch = "resolver version"
+	case parent.DependencyRevision != head.DependencyRevision:
+		mismatch = "dependency revision"
+	default:
+		return nil
+	}
+	return NewViewError(CodeViewBuilding, fmt.Sprintf(
+		"dirty generation %d names parent %d from a foreign chain (%s)",
+		head.GenerationID, parent.GenerationID, mismatch))
 }
 
 // MaterializeRefView builds the view one ref-view generation serves.
@@ -717,7 +896,11 @@ func (m *Materializer) repoPrefix(ctx context.Context, graphID string) (string, 
 // The routed commit generation remains the identity base. Its physical
 // BaseGenerationID ancestry is a storage concern: the oldest nonzero ancestor
 // is a flat dedicated corpus, any descendants compose above it, and all of them
-// are exposed and leased as generation sources.
+// are exposed and leased as generation sources. A routed working-tree
+// generation's own dirty parents are storage too: they compose into the base
+// reader exactly like commit-side ancestry, and only the routed generation
+// itself becomes a LayerDirty layer, so the view's identity and layer count do
+// not depend on how deep the chain beneath it is.
 func (m *Materializer) assemble(
 	ctx context.Context,
 	graphID string,
@@ -725,13 +908,16 @@ func (m *Materializer) assemble(
 	generations []int64,
 	lease *Lease,
 ) (*RepoView, error) {
-	ancestry, err := m.generationAncestry(ctx, generations)
+	ancestry, commitIndex, err := m.generationAncestry(ctx, generations)
 	if err != nil {
 		return nil, err
 	}
-	routedStart := len(ancestry) - len(generations)
-	if routedStart < 0 {
+	if commitIndex < 0 || len(ancestry)-commitIndex < len(generations) {
 		return nil, NewViewError(CodeViewBuilding, "generation ancestry is incomplete")
+	}
+	routedLayer := make(map[int64]struct{}, len(generations))
+	for _, generationID := range generations[1:] {
+		routedLayer[generationID] = struct{}{}
 	}
 
 	handles := make([]*store_sqlite.Store, 0, len(ancestry))
@@ -766,28 +952,32 @@ func (m *Materializer) assemble(
 		}
 	}
 	var base graph.Reader
-	if routedStart > 0 || firstRow.GenerationKind == "dedicated" {
+	if commitIndex > 0 || firstRow.GenerationKind == "dedicated" {
 		base = firstHandle
 	} else {
 		base = graph.NewOverlaidViewWithLayer(m.Store.AtGeneration(0), firstLayer)
-	}
-	for index := 1; index <= routedStart; index++ {
-		_, layer, _, err := open(ancestry[index])
-		if err != nil {
-			return nil, err
-		}
-		base = graph.NewOverlaidViewWithLayer(base, layer)
 	}
 
 	var (
 		layers    []graph.OverlayLayerReader
 		layerRefs []LayerRef
 	)
-	for index := routedStart + 1; index < len(ancestry); index++ {
+	for index := 1; index < len(ancestry); index++ {
 		generationID := ancestry[index]
 		_, layer, row, err := open(generationID)
 		if err != nil {
 			return nil, err
+		}
+		if _, routed := routedLayer[generationID]; !routed || index <= commitIndex {
+			// Commit-side ancestry and working-tree chain parents compose
+			// into the base. A chain parent above a routed layer would have
+			// to sit between two layers, which no route can name.
+			if len(layers) > 0 {
+				return nil, NewViewError(CodeViewBuilding, fmt.Sprintf(
+					"generation %d is a chain parent above a routed layer", generationID))
+			}
+			base = graph.NewOverlaidViewWithLayer(base, layer)
+			continue
 		}
 		ref, err := dirtyLayerRef(row)
 		if err != nil {

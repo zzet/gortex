@@ -478,7 +478,16 @@ func (c *CheckoutCoordinator) checkRoutedSnapshot(ctx context.Context, route sto
 	if err != nil {
 		return err
 	}
-	if !found || !servableGeneration(dirty.State) || dirty.BaseGenerationID != route.CommitGenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
+	if !found || !servableGeneration(dirty.State) || dirty.LowerViewFingerprint != sample.Fingerprint {
+		return fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
+	}
+	// The routed working-tree layer must be rooted at the routed commit layer,
+	// directly or through a chain of this checkout's working-tree generations.
+	rooted, err := c.dirtyRootedAtCommit(ctx, dirty, commit)
+	if err != nil {
+		return err
+	}
+	if !rooted {
 		return fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
 	}
 	return nil

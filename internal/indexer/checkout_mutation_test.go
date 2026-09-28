@@ -21,7 +21,9 @@ func newCheckoutMutationFixture(t testing.TB) (*coordinatorFixture, *CheckoutCoo
 	f := newCoordinatorFixture(t)
 	gate := NewViewBuildGate()
 	gate.Open()
-	c := f.coordinator(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour})
+	// The hour-long window parks the loop so every cycle is driven by hand;
+	// refresh tickets' demand wakes take the same window here.
+	c := f.coordinator(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true})
 	if out := c.reconcile(context.Background()); out.Err != nil || out.DirtyGenerationID == 0 {
 		t.Fatalf("initial reconcile: %+v", out)
 	}

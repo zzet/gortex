@@ -629,6 +629,17 @@ type ReviewRule struct {
 	Disabled bool `mapstructure:"disabled" yaml:"disabled,omitempty"`
 }
 
+// DirtyChainConfig is `index.dirty_chain`.
+//
+// A working-tree layer is always built as a per-file delta chained over the
+// checkout's previous working-tree layer, and its go/types pass is always
+// rooted at the packages the delta carries, with sibling bodies stripped and
+// the checkout's type-check state retained and warmed. What remains
+// configurable is the budget of that retained state and the resolver's
+// evidence scoping.
+type DirtyChainConfig struct {
+}
+
 type IndexConfig struct {
 	Languages []string `mapstructure:"languages" yaml:"languages,omitempty"`
 	// Exclude is deprecated — use top-level Config.Exclude instead.
@@ -770,6 +781,13 @@ type IndexConfig struct {
 	// default) uses the built-in cap of 200 files. Configured under
 	// `index.affected_by_reresolve_max` in .gortex.yaml.
 	AffectedByReresolveMax int `mapstructure:"affected_by_reresolve_max" yaml:"affected_by_reresolve_max,omitempty"`
+	// DirtyChain holds the remaining knobs of an automatic checkout's
+	// working-tree build (DirtyChainConfig). Configured under
+	// `index.dirty_chain` in .gortex.yaml; nil takes every default. It is
+	// exempt from the configuration digest (it decides how a layer is built,
+	// not what it contains), so no value of it changes a stored generation's
+	// configuration identity.
+	DirtyChain *DirtyChainConfig `mapstructure:"dirty_chain" yaml:"dirty_chain,omitempty" json:",omitempty"`
 	// Transforms are pluggable pre-ingestion content processors. Each
 	// rewrites a matching file's bytes before the parser sees them —
 	// expanding minified bundles, normalising SVG/TOON, converting a

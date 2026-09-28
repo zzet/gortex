@@ -537,7 +537,7 @@ func TestAnInheritedWorkingTreeLayerIsFiledBeforeItIsReplaced(t *testing.T) {
 // would have used.
 //
 // The barrier moves the tree after the first attempt's payload is written,
-// which is exactly the window confirmDirtySnapshot refuses in: the attempt is
+// which is exactly the window confirmDirtySnapshotWith refuses in: the attempt is
 // torn, and the retry samples — and stamps — the state the barrier left.
 //
 // Revert-red: file the build under the cycle's own key and the lookup by the

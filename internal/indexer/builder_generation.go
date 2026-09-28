@@ -212,6 +212,19 @@ type BuildRequest struct {
 	// the publish and supersedes the generation, so a build whose inputs moved
 	// underneath it never becomes readable. nil skips the step.
 	PrePublish func(ctx context.Context, generationID int64) error
+	// inputManifest, when set, is the admitted-input manifest the generation
+	// records for the sample it was built from. It is written through the
+	// generation handle after the producer states and before PrePublish, so it
+	// is sealed with the payload and never outlives a build that did not
+	// publish. Only a working-tree build sets it.
+	inputManifest *generationInputManifest
+}
+
+// generationInputManifest is one build's manifest write: its meta row and the
+// entry rows (see dirty_chain_manifest.go).
+type generationInputManifest struct {
+	meta    store_sqlite.InputManifestMeta
+	entries []store_sqlite.InputManifestEntry
 }
 
 // EnrichmentStage names the checkout a build's enrichment pass describes.
@@ -224,6 +237,22 @@ type EnrichmentStage struct {
 	// what the marker records in place of a commit sha, because a tree with
 	// uncommitted edits in it is a state no commit names.
 	Fingerprint string
+	// ChainCensus, set for a working-tree build over a working-tree parent,
+	// is the per-file language census of the parent chain (file -> language
+	// -> enrichable nodes, newest generation wins per file). The admission
+	// floor is then judged against the whole working-tree state — the chain
+	// plus this generation's own files, the census a direct build of the same
+	// state counts — rather than against the delta alone, which is a handful
+	// of nodes and would never clear it. nil (a direct build) judges the
+	// generation's own census, as always.
+	ChainCensus map[string]map[string]int
+	// BaseCensus, when set, adds the language totals of the committed state
+	// beneath the working tree (the base corpus the checkout composes over),
+	// so the floor asks whether a language is a real language of the
+	// CHECKOUT, not of its dirty set: a one-file edit to a Go repository runs
+	// the Go pass like an edit to twenty files does. Set by a coordinator
+	// with working-tree chaining on, for every working-tree build it makes.
+	BaseCensus map[string]int
 }
 
 // EnrichmentOutcome is what a build's enrichment stage did. It is the evidence
@@ -367,6 +396,19 @@ type BuildReport struct {
 
 	// Work is the build's physical work accounting (generation_work_counters.go).
 	Work *GenerationWorkCounters
+	// ParentGenerationID is the working-tree generation a working-tree build
+	// was a delta over, 0 for a build direct over its commit generation.
+	// ChainDepth is the published generation's working-tree chain depth (1 =
+	// direct), 0 for a build that is not a working-tree layer.
+	// ChainFallbackReason is why a chained attempt for the same state was
+	// refused and this build went direct instead, empty when none was.
+	ParentGenerationID  int64
+	ChainDepth          int
+	ChainFallbackReason string
+	// ManifestEntriesWritten is how many admitted-input manifest rows the
+	// generation stored: every sampled path for a full manifest, only the
+	// paths that differ from the parent's for a delta.
+	ManifestEntriesWritten int
 }
 
 // SparseGenerationBuilder builds sparse payload generations over one store.
@@ -600,6 +642,12 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		}
 		if err := b.declareProducers(req, handle, &report); err != nil {
 			return err
+		}
+		if req.inputManifest != nil {
+			if err := handle.WriteInputManifest(ctx, req.inputManifest.meta, req.inputManifest.entries); err != nil {
+				return fmt.Errorf("indexer: write input manifest for generation %d: %w", generationID, err)
+			}
+			report.ManifestEntriesWritten = len(req.inputManifest.entries)
 		}
 		report.Work.mark("separate_masks_producers")
 		if req.PrePublish != nil {
@@ -1889,15 +1937,19 @@ func (b *SparseGenerationBuilder) abandon(ctx context.Context, generationID int6
 	}
 }
 
-// supersede records that a generation must not be read, without publishing it.
+// tear records that a build the working tree moved under must never be read:
+// it leaves building for failed, not superseded.
 //
-// MarkPayloadGenerationSuperseded only accepts a generation that already
-// reached ready, and a build that aborts before publishing never does — so the
-// transition is made through the catalog's guarded setter instead, from the
-// building state the abort leaves it in.
-func (b *SparseGenerationBuilder) supersede(ctx context.Context, generationID int64) error {
+// Superseded means "a ready generation a newer one replaced", and it is both
+// servable (servableGeneration) and a valid working-tree chain hop
+// (dirtyChainHopMatches): a torn build marked superseded after its input
+// manifest was written was therefore an admissible chain parent, kept out
+// only by caller discipline. Failed is neither, so a torn build can never be
+// routed, served or chained on; the retirement sweeps collect failed
+// generations like superseded ones, leases respected.
+func (b *SparseGenerationBuilder) tear(ctx context.Context, generationID int64) error {
 	return b.Store.Catalog().SetViewGenerationState(
-		ctx, generationID, store_sqlite.ViewGenerationSuperseded, store_sqlite.ViewGenerationBuilding)
+		ctx, generationID, store_sqlite.ViewGenerationFailed, store_sqlite.ViewGenerationBuilding)
 }
 
 // derivedGenerationTarget reports whether a store handle is pinned to a

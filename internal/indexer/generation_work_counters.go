@@ -71,7 +71,11 @@ type GenerationWorkCounters struct {
 	// from extraction.
 	CompilerContext CompilerContextCounters
 
-	RebuiltFiles int
+	// ReusedPriorPayloadFiles is the number of files whose payload this build
+	// took physically from a prior generation instead of re-deriving it.
+	// RebuiltFiles is the number it re-derived (parsed) instead.
+	ReusedPriorPayloadFiles int
+	RebuiltFiles            int
 
 	// Context separation outcome: closure files parsed and withheld because
 	// their re-derivation matched the layer below, and those retained because
@@ -117,6 +121,8 @@ type CompilerContextCounters struct {
 	Requested bool
 	Ran       []string
 	Measured  bool
+	Packages  int
+	Files     int
 	Reason    string
 }
 

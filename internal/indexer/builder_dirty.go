@@ -8,6 +8,8 @@ import (
 	"sort"
 
 	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
 )
 
@@ -85,6 +87,53 @@ type DirtyLayerRequest struct {
 	// overwrites it per attempt, so the value after a successful return is
 	// the identity of the generation that was published.
 	stamped *GenerationIdentity
+
+	// Sampler, when set, is the checkout's own working-copy sampler. The build
+	// samples through it instead of discovering the worktree and hashing every
+	// dirty file afresh: it carries the resolved HEAD tree and the digest memo
+	// of quiet files, so a sample costs its git status and the young files
+	// only. nil samples with gitstate.SampleDirty.
+	Sampler *gitstate.DirtySampler
+
+	// before, when set, is the sample the build's change set and identity come
+	// from: the caller's own sample of the same cycle, taken after every
+	// ticket the build serves arrived. The pre-publish fence still takes a
+	// fresh sample. nil samples first.
+	before *gitstate.DirtySnapshot
+
+	// parent, when > 0, is the published working-tree generation this build is
+	// a delta over: Base reads its composed view and Identity.BaseGenerationID
+	// names it. parentManifest is its chain's resolved input manifest and
+	// parentDepth its chain depth. The build plans only the paths whose
+	// manifest entry differs from the parent's, writes the delta manifest, and
+	// refuses with a *DirtyChainFallbackError when the delta must not be used.
+	parent         int64
+	parentManifest resolvedManifest
+	parentDepth    int
+
+	// chainFallbackReason is the reason a chained attempt for this state was
+	// refused, carried into the direct build that replaces it so the report
+	// says why the build went direct.
+	chainFallbackReason string
+
+	// baseCensus, when non-nil, is the language census of the committed state
+	// beneath the working tree; the semantic admission floor is then judged
+	// against the checkout's whole language surface (EnrichmentStage.
+	// BaseCensus) rather than this build's own files.
+	baseCensus map[string]int
+}
+
+// DirtyChainFallbackError reports that a working-tree build over a
+// working-tree parent refused to use the delta: the state has to be built
+// direct over the commit generation instead. Nothing was written. Reason is
+// one of the fallback reason codes (dirty_chain_manifest.go).
+type DirtyChainFallbackError struct {
+	Parent int64
+	Reason string
+}
+
+func (e *DirtyChainFallbackError) Error() string {
+	return fmt.Sprintf("indexer: working-tree build over generation %d falls back direct: %s", e.Parent, e.Reason)
 }
 
 // StampDirtyLayerIdentity fills in the four fields of a working-tree layer's
@@ -127,7 +176,20 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	if req.CheckoutRoot == "" {
 		return 0, BuildReport{}, errors.New("indexer: dirty layer build needs a checkout root")
 	}
-	before, err := gitstate.SampleDirty(ctx, req.CheckoutRoot)
+	if req.parent > 0 && req.Identity.BaseGenerationID != req.parent {
+		return 0, BuildReport{}, fmt.Errorf(
+			"indexer: working-tree build over parent %d names base generation %d", req.parent, req.Identity.BaseGenerationID)
+	}
+	var before gitstate.DirtySnapshot
+	var err error
+	switch {
+	case req.before != nil:
+		before = *req.before
+	case req.Sampler != nil:
+		before, err = req.Sampler.Sample(ctx)
+	default:
+		before, err = gitstate.SampleDirty(ctx, req.CheckoutRoot)
+	}
 	if err != nil {
 		return 0, BuildReport{}, fmt.Errorf("indexer: sample %s: %w", req.CheckoutRoot, err)
 	}
@@ -142,16 +204,68 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		*req.stamped = identity
 	}
 
-	changes, err := dirtyLayerChangesContext(ctx, before)
-	if err != nil {
-		return 0, BuildReport{}, err
+	policy := b.dirtyManifestPolicyDigest(identity)
+	var (
+		changes  []LayerPathChange
+		manifest *generationInputManifest
+		reused   int
+	)
+	if req.parent > 0 {
+		// A delta over the parent: plan only the paths whose admitted input
+		// differs from the parent chain's resolved manifest, and record exactly
+		// that difference as this generation's manifest.
+		admit := chainManifestAdmitter(req.parentManifest, before, b.manifestAdmitter(req.CheckoutRoot, target))
+		nextMeta, nextEntries := admittedManifest(before, admit, policy)
+		next := resolvedFromFull(nextMeta, nextEntries)
+		headHolds, err := dirtyChainHeadHolds(ctx, req.CheckoutRoot, before, req.parentManifest, next)
+		if err != nil {
+			return 0, BuildReport{}, err
+		}
+		delta, reason := planDelta(req.parentManifest, next, headHolds)
+		if reason != "" {
+			return 0, BuildReport{}, &DirtyChainFallbackError{Parent: req.parent, Reason: reason}
+		}
+		changes = delta
+		entries := manifestDeltaEntries(req.parentManifest, next)
+		manifest = &generationInputManifest{
+			meta: store_sqlite.InputManifestMeta{
+				ManifestVersion: store_sqlite.InputManifestVersion,
+				IsFull:          false,
+				EntryCount:      len(entries),
+				PolicyDigest:    policy,
+			},
+			entries: entries,
+		}
+		reused = reusedParentPaths(req.parentManifest, delta)
+	} else {
+		changes, err = dirtyLayerChangesContext(ctx, before)
+		if err != nil {
+			return 0, BuildReport{}, err
+		}
+		// The generation records the full admitted-input manifest of the same
+		// sample its change set and fingerprint come from, so a later build
+		// can diff against it. It changes nothing this build plans or
+		// publishes.
+		meta, entries := admittedManifest(before, b.manifestAdmitter(req.CheckoutRoot, target), policy)
+		manifest = &generationInputManifest{meta: meta, entries: entries}
 	}
 	changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
 	if err != nil {
 		return 0, BuildReport{}, err
 	}
+	// A delta over a parent is judged for semantic enrichment by the census of
+	// the whole working-tree state, as a direct build of it would be; only
+	// read when a semantic manager could use it.
+	var chainCensus map[string]map[string]int
+	var baseCensus map[string]int
+	if b.Semantic != nil {
+		if req.parent > 0 {
+			chainCensus = dirtyChainLanguageCensus(ctx, b.Store, req.parent, req.RepoPrefix)
+		}
+		baseCensus = req.baseCensus
+	}
 
-	return b.Build(ctx, BuildRequest{
+	generationID, report, err := b.Build(ctx, BuildRequest{
 		Identity:    identity,
 		Base:        req.Base,
 		Target:      target,
@@ -168,31 +282,223 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		Enrich: &EnrichmentStage{
 			CheckoutID:  identity.CheckoutID,
 			Fingerprint: before.Fingerprint,
+			ChainCensus: chainCensus,
+			BaseCensus:  baseCensus,
 		},
 		PrePublish: func(ctx context.Context, generationID int64) error {
 			if req.buildBarrier != nil {
 				req.buildBarrier()
 			}
-			return b.confirmDirtySnapshot(ctx, req.CheckoutRoot, generationID, before.Fingerprint)
+			return b.confirmDirtySnapshotWith(ctx, req.Sampler, req.CheckoutRoot, generationID, before.Fingerprint)
 		},
+		inputManifest: manifest,
 	})
+	report.ChainFallbackReason = req.chainFallbackReason
+	report.ChainDepth = 1
+	if req.parent > 0 {
+		report.ParentGenerationID = req.parent
+		report.ChainDepth = req.parentDepth + 1
+	}
+	if report.Work != nil {
+		report.Work.ParentGenerationID = report.ParentGenerationID
+		report.Work.ChainDepth = report.ChainDepth
+		report.Work.ManifestEntriesWritten = report.ManifestEntriesWritten
+		report.Work.ReusedPriorPayloadFiles = reused
+		report.Work.noteChainFallback(req.chainFallbackReason)
+	}
+	return generationID, report, err
 }
 
-// confirmDirtySnapshot re-samples the checkout and refuses the publish when the
-// state moved. A sample that cannot be taken at all is refused too: an
-// unavailable snapshot carries no information, and reading its empty entry list
-// as "nothing changed" would publish exactly the torn generation the check
-// exists to stop.
-func (b *SparseGenerationBuilder) confirmDirtySnapshot(
+// dirtyChainLanguageCensus is the per-file language census of a working-tree
+// chain, top first: each generation's own node counts (a generation-scoped
+// grouped projection, no node decoding), the newest generation winning per
+// file. It walks at most maxDirtyChainDepth working-tree generations and stops
+// at the first row that is not one.
+func dirtyChainLanguageCensus(ctx context.Context, store *store_sqlite.Store, top int64, repoPrefix string) map[string]map[string]int {
+	census := map[string]map[string]int{}
+	if store == nil {
+		return census
+	}
+	catalog := store.Catalog()
+	id := top
+	for depth := 0; id > 0 && depth < maxDirtyChainDepth; depth++ {
+		row, found, err := catalog.GetViewGeneration(ctx, id)
+		if err != nil || !found || row.GenerationKind != DirtyLayerGenerationKind {
+			break
+		}
+		generation := map[string]map[string]int{}
+		for _, count := range graph.ReadRepoLanguageFileCounts(store.AtGeneration(id), []string{repoPrefix}) {
+			if count.Language == "" || count.Count <= 0 {
+				continue
+			}
+			if generation[count.FilePath] == nil {
+				generation[count.FilePath] = map[string]int{}
+			}
+			generation[count.FilePath][count.Language] += count.Count
+		}
+		for file, languages := range generation {
+			if _, newer := census[file]; !newer {
+				census[file] = languages
+			}
+		}
+		id = row.BaseGenerationID
+	}
+	return census
+}
+
+// reusedParentPaths counts the parent chain's working-tree paths a delta
+// leaves alone: their payload is the parent's, read through the composed view
+// and never parsed or written again.
+func reusedParentPaths(parent resolvedManifest, delta []LayerPathChange) int {
+	touched := 0
+	for _, change := range delta {
+		if _, dirty := parent.entry(change.Path); dirty {
+			touched++
+		}
+	}
+	return parent.dirtyCount() - touched
+}
+
+// chainManifestAdmitter reuses the parent's recorded admission for a path whose
+// bytes and mode are unchanged — same bytes under the same policy digest get
+// the same verdict — and asks the builder's own admission for anything else.
+// It keeps the admission work of a delta build proportional to what changed.
+func chainManifestAdmitter(parent resolvedManifest, snap gitstate.DirtySnapshot, admit manifestAdmitFunc) manifestAdmitFunc {
+	contents := make(map[string]gitstate.DirtyContent, len(snap.Contents))
+	for _, content := range snap.Contents {
+		contents[path.Clean(content.Path)] = content
+	}
+	return func(p string) store_sqlite.InputManifestAdmission {
+		if prior, ok := parent.entry(p); ok && prior.State == store_sqlite.InputManifestPresent {
+			if content, sampled := contents[p]; sampled && prior.Mode == content.Mode && prior.ContentSHA256 == content.SHA256 {
+				return prior.Admission
+			}
+		}
+		if admit == nil {
+			return store_sqlite.InputManifestAdmitted
+		}
+		return admit(p)
+	}
+}
+
+// dirtyChainHeadHolds answers planDelta's HEAD-membership question for the
+// paths whose entry differs between the parent's resolved manifest and next.
+//
+// Most answers come from the sample itself: a path sampled absent differs from
+// HEAD, so HEAD holds it; a path sampled equal to HEAD holds it exactly when
+// it has bytes; a path git reports only as modified is in HEAD, and one it
+// reports only as added or untracked is not. The rest — a path that left the
+// sample (it is back at its committed state, whether or not HEAD holds it)
+// and a path with conflicting status records — are asked of the HEAD tree in
+// one git call. Nothing is inferred: a wrong answer here would turn an undo
+// into a stale payload or a missing file.
+func dirtyChainHeadHolds(
+	ctx context.Context, root string, snap gitstate.DirtySnapshot, parent, next resolvedManifest,
+) (func(string) bool, error) {
+	known := make(map[string]bool)
+	kinds := make(map[string][]gitstate.DirtyKind)
+	for _, entry := range snap.Entries {
+		clean := path.Clean(entry.Path)
+		kinds[clean] = append(kinds[clean], entry.Kind)
+	}
+	for _, content := range snap.Contents {
+		clean := path.Clean(content.Path)
+		switch {
+		case content.State == gitstate.DirtyContentAbsent && !content.HeadEqual:
+			known[clean] = true
+		case content.HeadEqual:
+			known[clean] = content.State == gitstate.DirtyContentPresent
+		case content.State == gitstate.DirtyContentPresent:
+			if held, ok := headHoldsFromKinds(kinds[clean]); ok {
+				known[clean] = held
+			}
+		}
+	}
+	var ask []string
+	consider := func(p string) {
+		if _, ok := known[p]; ok {
+			return
+		}
+		pe, pDirty := parent.entry(p)
+		ne, nDirty := next.entry(p)
+		if pDirty && nDirty && manifestEntriesEqual(pe, ne) {
+			return
+		}
+		known[p] = false
+		ask = append(ask, p)
+	}
+	for p := range parent.entries {
+		consider(p)
+	}
+	for p := range next.entries {
+		consider(p)
+	}
+	if len(ask) > 0 {
+		sort.Strings(ask)
+		held, err := gitstate.TreeHoldsPaths(ctx, root, snap.HeadTree, ask)
+		if err != nil {
+			return nil, fmt.Errorf("indexer: read HEAD membership for a working-tree delta: %w", err)
+		}
+		for _, p := range ask {
+			known[p] = held[p]
+		}
+	}
+	return func(p string) bool { return known[p] }, nil
+}
+
+// headHoldsFromKinds reads HEAD membership off git's status records for one
+// present path when they agree: modified-family records mean HEAD holds it,
+// added or untracked records mean it does not. Mixed records (a staged delete
+// beside an untracked copy, say) are not answered.
+func headHoldsFromKinds(kinds []gitstate.DirtyKind) (bool, bool) {
+	if len(kinds) == 0 {
+		return false, false
+	}
+	held, lacks := 0, 0
+	for _, kind := range kinds {
+		switch kind {
+		case gitstate.DirtyModified, gitstate.DirtyModeChanged, gitstate.DirtySymlinkChanged:
+			held++
+		case gitstate.DirtyAdded, gitstate.DirtyUntracked:
+			lacks++
+		default:
+			return false, false
+		}
+	}
+	switch {
+	case held > 0 && lacks == 0:
+		return true, true
+	case lacks > 0 && held == 0:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// confirmDirtySnapshotWith re-samples the checkout — through the checkout's
+// own sampler when one is given — and refuses the publish when the state
+// moved. The sample is always a new one: it is the fence that proves the
+// payload describes a state that still exists after it was written. A sample
+// that cannot be taken at all is refused too: an unavailable snapshot carries
+// no information, and reading its empty entry list as "nothing changed" would
+// publish exactly the torn generation the check exists to stop.
+func (b *SparseGenerationBuilder) confirmDirtySnapshotWith(
 	ctx context.Context,
+	sampler *gitstate.DirtySampler,
 	root string,
 	generationID int64,
 	before string,
 ) error {
-	after, err := gitstate.SampleDirty(ctx, root)
+	var after gitstate.DirtySnapshot
+	var err error
+	if sampler != nil {
+		after, err = sampler.Sample(ctx)
+	} else {
+		after, err = gitstate.SampleDirty(ctx, root)
+	}
 	if err != nil {
-		if superseded := b.supersede(ctx, generationID); superseded != nil {
-			return fmt.Errorf("indexer: re-sample %s: %w (supersede: %v)", root, err, superseded)
+		if torn := b.tear(ctx, generationID); torn != nil {
+			return fmt.Errorf("indexer: re-sample %s: %w (tear: %v)", root, err, torn)
 		}
 		return fmt.Errorf("indexer: re-sample %s: %w", root, err)
 	}
@@ -205,8 +511,8 @@ func (b *SparseGenerationBuilder) confirmDirtySnapshot(
 		Before:       before,
 		After:        after.Fingerprint,
 	}
-	if superseded := b.supersede(ctx, generationID); superseded != nil {
-		return fmt.Errorf("%w (supersede: %v)", changed, superseded)
+	if torn := b.tear(ctx, generationID); torn != nil {
+		return fmt.Errorf("%w (tear: %v)", changed, torn)
 	}
 	return changed
 }

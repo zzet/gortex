@@ -36,6 +36,11 @@ func snapshotDedicatedBaseConfig(
 	}
 
 	fingerprinted := owned
+	// Hash-exempt: index.dirty_chain tunes how a working-tree layer is built
+	// (the retained type-check budget, the resolver's evidence scoping), never
+	// what any layer contains, so it is not part of the output identity. The
+	// snapshot above still carries it.
+	fingerprinted.DirtyChain = nil
 	if owned.FrameworkSynthesizers != nil {
 		frameworks := slices.Clone(*owned.FrameworkSynthesizers)
 		slices.Sort(frameworks)

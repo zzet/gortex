@@ -317,7 +317,16 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 		c.failCheckoutRefreshRequests(requests, err)
 		return
 	}
-	if !found || !servableGeneration(dirty.State) || dirty.BaseGenerationID != out.CommitGenerationID {
+	if !found || !servableGeneration(dirty.State) {
+		return
+	}
+	// Rooted at the routed commit generation, directly or through a chain.
+	rooted, err := c.dirtyRootedAt(ctx, dirty, out.CommitGenerationID)
+	if err != nil {
+		c.failCheckoutRefreshRequests(requests, err)
+		return
+	}
+	if !rooted {
 		return
 	}
 	sample, err := c.sampler.Sample(ctx)

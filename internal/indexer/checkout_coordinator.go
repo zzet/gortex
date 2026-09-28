@@ -280,6 +280,11 @@ type CheckoutCoordinatorConfig struct {
 	// cycleDone is a test seam: it runs at the end of every reconcile cycle
 	// with what that cycle did. nil in production.
 	cycleDone func(CheckoutCycle)
+	// debounceDemand is a test seam: demand wakes (SignalDemand) take the
+	// quiet window like any other signal, so a fixture that parks the loop
+	// behind a long window keeps driving every cycle by hand. false in
+	// production.
+	debounceDemand bool
 	// dirtyBarrier is a test seam handed to the dirty build: it runs inside
 	// the window between a payload being complete and the checkout being
 	// re-sampled, which is the window the supersede rule exists to close.
@@ -349,6 +354,35 @@ type CheckoutCycle struct {
 	// 15-second coordinator poll retries the demand. Nothing was read or
 	// written, so every other field is zero.
 	Deferred bool
+	// DirtyParentCandidate and DirtyChainReason report, for a cycle that
+	// reached a working-tree build, which generation a chained build could
+	// stand on (selectDirtyParent) and, when none, the fallback reason code.
+	DirtyParentCandidate int64
+	DirtyChainReason     string
+	// DirtyParentGenerationID is the physical parent the cycle's working-tree
+	// build actually stood on when it was built over a working-tree parent,
+	// and DirtyChainDepth the published generation's chain depth (1 = built
+	// direct over the commit generation). Both are 0 when nothing was built.
+	// A chained attempt the builder refused carries its reason in
+	// DirtyChainReason and was rebuilt direct.
+	DirtyParentGenerationID int64
+	DirtyChainDepth         int
+	// DirtyParentPreferred reports that the working-tree build stood on the
+	// coordinator's preferred parent — a compacted generation the route did
+	// not name yet, or the generation an edit lease withdrew from the route —
+	// rather than on the routed top.
+	DirtyParentPreferred bool
+	// DirtyWork is the physical work of the cycle's working-tree build, nil
+	// when the cycle built none.
+	DirtyWork *GenerationWorkCounters
+	// Admission is how long the cycle waited before it could build, by
+	// stage, and what held the build lane when it queued for it. Zero for a
+	// cycle that never queued (a settled one) or was driven by hand.
+	Admission cycleAdmission
+	// cycleStarted is when the cycle began: every refresh ticket it serves
+	// was admitted before it, so a working-copy sample taken after it is
+	// taken after each ticket arrived. Zero outside a loop cycle.
+	cycleStarted time.Time
 	// Err is what stopped the cycle, nil when it settled both slots.
 	Err error
 }
@@ -372,6 +406,14 @@ type CheckoutCoordinator struct {
 	leases  *graphview.LeaseManager
 	logger  *zap.Logger
 	gate    *ViewBuildGate
+
+	// baseViewsOnce and baseViews are the one materializer every build of
+	// this checkout opens its layer below through: it keeps each published
+	// generation's masks between builds (graphview's per-generation layer
+	// cache), so an edit's plan opens only the levels it has not seen
+	// instead of re-reading the identity masks of the whole chain.
+	baseViewsOnce sync.Once
+	baseViews     *graphview.Materializer
 
 	// requestBase is CheckoutCoordinatorConfig.RequestBase; nil asks nothing.
 	requestBase func(string)
@@ -548,6 +590,21 @@ type CheckoutCoordinator struct {
 	// selectionDemand promotes a queued build independently of the debounce
 	// signal. mu guards initialization; the buffered channel coalesces demand.
 	selectionDemand chan struct{}
+
+	// demand wakes the loop for a cycle without a quiet window: a refresh
+	// ticket (an MCP edit's committed content, or a request that needs a
+	// fresh answer) is demand, not an event storm, and waiting for the
+	// window proves nothing its cycle does not prove again. Buffered to one:
+	// a burst coalesces into one cycle, and demand that arrives during a
+	// cycle is answered by exactly one more.
+	demand chan struct{}
+	// retireCalled is a test seam: it observes every generation offerRetire
+	// retires inline. nil in production.
+	retireCalled func(int64)
+
+	// compaction is the background working-tree chain compaction's state
+	// (dirty_chain_compaction.go).
+	compaction dirtyChainCompactor
 }
 
 func (c *CheckoutCoordinator) selectionRequests() chan struct{} {
@@ -702,6 +759,9 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		cycleDone:      cfg.cycleDone,
 		dirtyBarrier:   cfg.dirtyBarrier,
 	}
+	if !cfg.debounceDemand {
+		c.demand = make(chan struct{}, 1)
+	}
 	if c.quiet <= 0 {
 		c.quiet = defaultCheckoutQuietWindow
 	}
@@ -764,6 +824,19 @@ func (c *CheckoutCoordinator) Signal(reason string) {
 	select {
 	case c.signal <- struct{}{}:
 	default:
+	}
+}
+
+// signalWindow wakes the loop through the quiet window. claim records the
+// wake as a claim that the checkout moved (signaledAt), which a cycle's
+// shared sample must postdate; a ticket's demand routed through the window
+// (debounceDemand) claims nothing its ticket does not already bound.
+func (c *CheckoutCoordinator) signalWindow(reason string, claim bool) {
+	c.mu.Lock()
+	c.reason = reason
+	c.mu.Unlock()
+	select {
+	case c.signal <- struct{}{}:
 	}
 }
 
@@ -865,6 +938,26 @@ func (c *CheckoutCoordinator) run() {
 			stopTimer(quiet)
 			quiet.Reset(c.quiet)
 			armed = quiet.C
+		case <-c.demand:
+			// Demand is owed only while a ticket waits. A ticket the
+			// previous cycle already answered (one admitted while that
+			// cycle's build was in flight, completed by its pre-publish
+			// sample) leaves a spent wake behind: running a cycle for it
+			// would only sample to find nothing owed. An armed window is
+			// left armed.
+			if c.checkoutRefreshHighWater() == 0 {
+				continue
+			}
+			// Demand runs now. An armed window is spent by this cycle: the
+			// cycle samples after every claim the window was coalescing.
+			stopTimer(quiet)
+			armed = nil
+			if admitted != nil {
+				claimed = true
+				c.deferCycle()
+				continue
+			}
+			c.cycle(lifetime)
 		case <-pollC:
 			c.Signal("poll")
 			pollTimer.Reset(c.poll)
@@ -928,6 +1021,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		ctx = context.Background()
 	}
 	through := c.checkoutRefreshHighWater()
+	// Taken after through: every ticket at or below it was admitted before
+	// this instant, which is what lets the cycle's steps share one sample.
+	cycleStarted := time.Now()
 	defer c.guardCheckoutRefreshCycle(ctx, through)
 	c.mu.Lock()
 	reason := c.reason
@@ -990,6 +1086,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 	out := c.reconcile(ctx)
+	out.cycleStarted = cycleStarted
 	recordCoordinatorCycle(out)
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
@@ -1012,6 +1109,12 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 			zap.Bool("recomposed", out.Recomposed))
 	}
 	c.reportCheckoutCycle(ctx, through, out)
+}
+
+// resetBackgroundLaneYields records a background cycle that ran to an outcome.
+func (c *CheckoutCoordinator) resetBackgroundLaneYields() {
+	c.mu.Lock()
+	c.mu.Unlock()
 }
 
 // settledWithoutBuild recognizes the overwhelmingly common poll result before
@@ -1069,8 +1172,13 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 		return out, false
 	}
 	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
-	if err != nil || !found || !servableGeneration(dirty.State) ||
-		dirty.BaseGenerationID != commit.GenerationID || dirty.LowerViewFingerprint != sample.Fingerprint {
+	if err != nil || !found || !servableGeneration(dirty.State) || dirty.LowerViewFingerprint != sample.Fingerprint {
+		return out, false
+	}
+	// The routed working-tree layer must be rooted at the routed commit layer:
+	// built directly over it, or a chain of this checkout's working-tree
+	// generations that ends at it (dirtyChainRoot).
+	if rooted, err := c.dirtyRootedAtCommit(ctx, dirty, commit); err != nil || !rooted {
 		return out, false
 	}
 
@@ -1515,8 +1623,17 @@ func (c *CheckoutCoordinator) recomposableStack(
 	}
 	if !found || !servableGeneration(dirtyRow.State) ||
 		dirtyRow.GenerationKind != DirtyLayerGenerationKind ||
-		dirtyRow.BaseGenerationID != commitRow.GenerationID ||
 		dirtyRow.LowerViewFingerprint != head.Fingerprint {
+		return commitRow, dirtyRow, false, nil
+	}
+	// Rooted at the routed commit layer, directly or through a chain. The
+	// recomposition that follows always rebuilds the working tree DIRECT over
+	// the new commit layer: a chain is never re-parented onto another commit.
+	rooted, err := c.dirtyRootedAtCommit(ctx, dirtyRow, commitRow)
+	if err != nil {
+		return commitRow, dirtyRow, false, err
+	}
+	if !rooted {
 		return commitRow, dirtyRow, false, nil
 	}
 	return commitRow, dirtyRow, true, nil
@@ -2375,7 +2492,7 @@ func (c *CheckoutCoordinator) clearDirtySlot(ctx context.Context, route *store_s
 	route.State = store_sqlite.RoutePending
 	route.DirtyGenerationID = 0
 	c.rememberRoutedDirty(0)
-	c.releaseDirty(ctx, dropped)
+	c.releaseDirtyChain(ctx, dropped, 0)
 	return nil
 }
 
@@ -2430,16 +2547,33 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 			return err
 		}
 		servable := found && servableGeneration(row.State)
+		rooted := false
+		if servable {
+			// Rooted at the routed commit generation: built directly over it,
+			// or a chain of this checkout's working-tree generations ending at
+			// it. A chain that passes keeps serving exactly like a direct
+			// layer; one that does not is foreign or unservable and is
+			// withdrawn below as before.
+			if rooted, err = c.dirtyRootedAt(ctx, row, commitGeneration); err != nil {
+				return err
+			}
+		}
 		if servable {
 			// Whatever the route already names is filed in the reuse cache
 			// before anything replaces it — including a layer a fresh
 			// coordinator inherited and has no other record of. Without this
 			// the undo that follows the next edit retires the very payload it
 			// is about to ask for, exactly as reconcileCommitSlot's
-			// route-preserving arm exists to stop on the commit half.
-			c.retainDirty(ctx, generationRowKey(row), row.GenerationID)
+			// route-preserving arm exists to stop on the commit half. A rooted
+			// layer is filed under its logical key (logicalDirtyKey), which is
+			// what this cycle's lookup renders whatever its physical parent.
+			filed := generationRowKey(row)
+			if rooted {
+				filed = logicalDirtyKey(row, commitGeneration)
+			}
+			c.retainDirty(ctx, filed, row.GenerationID)
 		}
-		if servable && row.BaseGenerationID == commitGeneration {
+		if rooted {
 			// A layer over the routed commit generation describes a state the
 			// checkout really was in, so it keeps serving while the working
 			// tree it no longer matches is rebuilt underneath the route.
@@ -2468,11 +2602,12 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		out.DirtyReused = true
 		out.DirtyGenerationID = cached
 		c.retainDirty(ctx, key, cached)
-		c.releaseDirty(ctx, previous)
+		c.releaseDirtyChain(ctx, previous, cached)
 		return nil
 	}
 
-	generationID, builtKey, err := c.buildDirtyLayerOver(ctx, route.GraphID, commitGeneration)
+	selection := c.reportDirtyParent(ctx, *route, commitGeneration, sample, out)
+	generationID, builtKey, err := c.buildDirtyLayerForSlot(ctx, route.GraphID, commitGeneration, selection, sample, out)
 	if err != nil {
 		return err
 	}
@@ -2488,7 +2623,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	previous := route.DirtyGenerationID
 	if err := c.flip(ctx, route, store_sqlite.RouteSlotDirty, generationID); err != nil {
 		c.supersede(ctx, generationID)
-		c.offerRetire(ctx, generationID)
+		c.deferRetire(generationID, "lost route flip")
 		return err
 	}
 	out.DirtyGenerationID = generationID
@@ -2552,49 +2687,138 @@ func (c *CheckoutCoordinator) dirtySampleKey(
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
 	ctx context.Context, graphID string, commitGeneration int64,
 ) (int64, string, error) {
-	dirtyBase, releaseBase, err := c.commitLayerReader(ctx, commitGeneration)
+	generationID, key, _, err := c.buildDirtyLayerOverParent(ctx, graphID, commitGeneration, dirtyParentSelection{}, nil, "")
+	return generationID, key, err
+}
+
+// buildDirtyLayerOverParent is buildDirtyLayerOver with a physical parent: a
+// selection with Parent > 0 builds the working tree as a delta over that
+// published working-tree generation (its composed view is the base reader,
+// leased for the whole build, and it is the new row's BaseGenerationID), and a
+// zero selection builds direct over the commit generation. first, when set, is
+// the cycle's own sample and is the first attempt's change set; a second
+// attempt samples afresh.
+//
+// A chained attempt the builder refuses returns the reason with no error and
+// no generation, before anything was written; the caller then builds direct.
+// fallbackReason is carried into a direct build's report.
+//
+// The key returned is the LOGICAL reuse key (the identity over the commit
+// generation) whatever the physical parent, which is what the undo cache
+// looks states up by.
+func (c *CheckoutCoordinator) buildDirtyLayerOverParent(
+	ctx context.Context, graphID string, commitGeneration int64,
+	parent dirtyParentSelection, first *gitstate.DirtySnapshot, fallbackReason string,
+) (int64, string, string, error) {
+	built, err := c.buildDirtyLayerAttempts(ctx, graphID, commitGeneration, parent, first, fallbackReason)
+	return built.GenerationID, built.Key, built.Reason, err
+}
+
+// buildDirtyLayerAttempts is buildDirtyLayerOverParent reporting the build's
+// work counters as well. A chained parent whose view can no longer be opened
+// (retired or unservable since it was selected) is a no_parent refusal, not a
+// cycle failure: the caller builds direct instead.
+func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
+	ctx context.Context, graphID string, commitGeneration int64,
+	parent dirtyParentSelection, first *gitstate.DirtySnapshot, fallbackReason string,
+) (dirtyLayerBuild, error) {
+	baseGeneration := commitGeneration
+	if parent.Parent > 0 {
+		baseGeneration = parent.Parent
+	}
+	dirtyBase, releaseBase, err := c.generationLayerReader(ctx, baseGeneration)
 	if err != nil {
-		return 0, "", err
+		if parent.Parent > 0 && ctx.Err() == nil {
+			return dirtyLayerBuild{Reason: dirtyChainFallbackNoParent}, nil
+		}
+		return dirtyLayerBuild{}, err
 	}
 	defer releaseBase()
 	identity := c.dirtyIdentity(graphID, commitGeneration)
+	identity.BaseGenerationID = baseGeneration
+	var baseCensus map[string]int
+	if c.builder != nil && c.builder.Semantic != nil {
+		baseCensus = c.checkoutLanguageCensus(ctx, commitGeneration)
+	}
 	var stamped GenerationIdentity
+	var work *GenerationWorkCounters
 	for attempt := 0; attempt < 2; attempt++ {
+		req := DirtyLayerRequest{
+			Identity:            identity,
+			Base:                dirtyBase,
+			CheckoutRoot:        c.root,
+			RepoPrefix:          c.repoPrefix,
+			WorkspaceID:         c.workspaceID,
+			ProjectID:           c.projectID,
+			buildBarrier:        c.dirtyBarrier,
+			stamped:             &stamped,
+			Sampler:             c.sampler,
+			chainFallbackReason: fallbackReason,
+			baseCensus:          baseCensus,
+		}
+		if attempt == 0 {
+			req.before = first
+		}
+		if parent.Parent > 0 {
+			req.parent, req.parentManifest, req.parentDepth = parent.Parent, parent.Manifest, parent.Depth
+		}
 		started := time.Now()
-		generationID, _, err := c.builder.BuildDirtyLayer(ctx, DirtyLayerRequest{
-			Identity:     identity,
-			Base:         dirtyBase,
-			CheckoutRoot: c.root,
-			RepoPrefix:   c.repoPrefix,
-			WorkspaceID:  c.workspaceID,
-			ProjectID:    c.projectID,
-			buildBarrier: c.dirtyBarrier,
-			stamped:      &stamped,
-		})
+		generationID, report, err := c.builder.BuildDirtyLayer(ctx, req)
 		viewmetrics.Observe(viewmetrics.CoordinatorBuildSeconds, time.Since(started), viewmetrics.SlotDirty)
+		if report.Work != nil {
+			work = report.Work
+		}
 		if err == nil {
-			return generationID, generationIdentityKey(stamped), nil
+			stamped.BaseGenerationID = commitGeneration
+			return dirtyLayerBuild{GenerationID: generationID, Key: generationIdentityKey(stamped), Work: work}, nil
+		}
+		var fallback *DirtyChainFallbackError
+		if errors.As(err, &fallback) {
+			return dirtyLayerBuild{Reason: fallback.Reason, Work: work}, nil
 		}
 		if !errors.Is(err, ErrDirtySnapshotChanged) {
-			return 0, "", err
+			// A build that died part way left its generation failed; it is
+			// owed a retirement like a torn attempt, so a failed edit leaks
+			// no payload.
+			c.deferFailedGeneration(ctx, generationID)
+			return dirtyLayerBuild{Work: work}, err
 		}
 		// The refused attempt is a whole payload for a state the checkout has
-		// already left. confirmDirtySnapshot superseded it, and nothing will
-		// ever route it, so it is collected here — an editor saving over a
+		// already left. confirmDirtySnapshotWith superseded it, and nothing will
+		// ever route it, so it is owed a retirement — an editor saving over a
 		// build would otherwise leak one payload per save for the life of the
-		// daemon.
+		// daemon. The retirement runs off the cycle, from the backlog.
 		var torn *DirtySnapshotChangedError
 		if errors.As(err, &torn) {
-			c.offerRetire(ctx, torn.GenerationID)
+			c.deferRetire(torn.GenerationID, "torn working-tree build")
 		}
 	}
-	return 0, "", nil
+	return dirtyLayerBuild{Work: work}, nil
+}
+
+// dirtyLayerBuild is what buildDirtyLayerAttempts produced: the published
+// generation and its logical reuse key, or the chained delta's refusal reason,
+// and the physical work of the attempt that decided it.
+type dirtyLayerBuild struct {
+	GenerationID int64
+	Key          string
+	Reason       string
+	Work         *GenerationWorkCounters
 }
 
 // commitLayerReader is the reader a dirty-layer build computes its affected
 // closure against: the checkout's commit generation and its complete ancestry.
 // The caller must release the pinned view after every build attempt has ended.
 func (c *CheckoutCoordinator) commitLayerReader(ctx context.Context, commitGeneration int64) (LayerBase, func(), error) {
+	return c.generationLayerReader(ctx, commitGeneration)
+}
+
+// generationLayerReader is the reader a working-tree build stands on: the
+// composed view of one published generation and its whole ancestry — the
+// commit generation for a direct build, a working-tree parent (its chain, the
+// commit generation and the base beneath) for a chained one. The view's lease
+// is held until the returned release runs.
+func (c *CheckoutCoordinator) generationLayerReader(ctx context.Context, commitGeneration int64) (LayerBase, func(), error) {
 	row, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
 	if err != nil {
 		return nil, nil, fmt.Errorf("indexer: read commit generation %d: %w", commitGeneration, err)
@@ -2602,10 +2826,7 @@ func (c *CheckoutCoordinator) commitLayerReader(ctx context.Context, commitGener
 	if !found || !servableGeneration(row.State) {
 		return nil, nil, fmt.Errorf("indexer: commit generation %d is not servable", commitGeneration)
 	}
-	materializer := graphview.Materializer{
-		Store: c.store, Catalog: c.catalog, Leases: c.leases, Logger: c.logger,
-	}
-	view, err := materializer.MaterializeRefView(ctx, row.GraphID, commitGeneration)
+	view, err := c.baseViewMaterializer().MaterializeRefView(ctx, row.GraphID, commitGeneration)
 	if err != nil {
 		return nil, nil, fmt.Errorf("indexer: open commit generation %d: %w", commitGeneration, err)
 	}
@@ -2613,6 +2834,17 @@ func (c *CheckoutCoordinator) commitLayerReader(ctx context.Context, commitGener
 	// commit generation and everything under it — rather than to the one
 	// generation beneath it. See ancestryLayerBase.
 	return c.ancestryLayerBase(view), view.Close, nil
+}
+
+// baseViewMaterializer is the checkout's long-lived materializer for the
+// layer below its builds (see baseViews).
+func (c *CheckoutCoordinator) baseViewMaterializer() *graphview.Materializer {
+	c.baseViewsOnce.Do(func() {
+		c.baseViews = &graphview.Materializer{
+			Store: c.store, Catalog: c.catalog, Leases: c.leases, Logger: c.logger,
+		}
+	})
+	return c.baseViews
 }
 
 // ancestryLayerBase is the LayerBase a build reads a materialized view
@@ -2943,7 +3175,7 @@ func (c *CheckoutCoordinator) cachedDirty(ctx context.Context, key string) (int6
 	}
 	row, found, err := c.catalog.GetViewGeneration(ctx, generationID)
 	if err != nil || !found || !servableGeneration(row.State) ||
-		row.GenerationKind != DirtyLayerGenerationKind || generationRowKey(row) != key {
+		row.GenerationKind != DirtyLayerGenerationKind || !c.dirtyRowRendersKey(ctx, row, key) {
 		c.forgetRetainedDirty(generationID)
 		return 0, false
 	}
@@ -2978,8 +3210,10 @@ func (c *CheckoutCoordinator) retainDirty(ctx context.Context, key string, gener
 	c.retainedDirty = retained
 	c.mu.Unlock()
 
+	// An evicted layer is owed a retirement, not given one here: the payload
+	// delete is a background sweep's work, never a foreground cycle's.
 	for _, generation := range evicted {
-		c.offerRetire(ctx, generation)
+		c.deferRetire(generation, "evicted from the working-tree reuse cache")
 	}
 }
 
@@ -3000,7 +3234,7 @@ func (c *CheckoutCoordinator) releaseDirty(ctx context.Context, generationID int
 	}
 	c.mu.Unlock()
 	if !held {
-		c.offerRetire(ctx, generationID)
+		c.deferRetire(generationID, "released by the working-tree route")
 	}
 }
 
@@ -3043,6 +3277,9 @@ func (c *CheckoutCoordinator) dropRetainedDirty(ctx context.Context, keep int64)
 func (c *CheckoutCoordinator) offerRetire(ctx context.Context, generationID int64) {
 	if generationID <= 0 {
 		return
+	}
+	if c.retireCalled != nil {
+		c.retireCalled(generationID)
 	}
 	if err := c.store.RetirePayloadGeneration(ctx, generationID, c.inUse()); err != nil {
 		if errors.Is(err, store_sqlite.ErrCatalogNotFound) {
