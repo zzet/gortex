@@ -27,6 +27,11 @@ type layerRows struct {
 	byID   map[string]*Node
 	byFrom map[string][]*Edge
 	byTo   map[string][]*Edge
+	// byName, byNodeFile and byEdgeFile index a kept chain layer's rows
+	// (ChainLayerRows); nil otherwise.
+	byName     map[string][]*Node
+	byNodeFile map[string][]*Node
+	byEdgeFile map[string][]*Edge
 }
 
 // rowsFor returns a layer's rows. The delta's own layer is answered live from
@@ -50,7 +55,7 @@ func (dw *DeltaWriter) rowsFor(l OverlayLayerReader) *layerRows {
 	rows.once.Do(func() {
 		defer func() {
 			dw.noteWholeLayerLoad(len(rows.nodes) + len(rows.edges))
-			dw.noteLayerRows(len(rows.nodes) + len(rows.edges))
+			dw.noteLayerRowsFor("whole_layer", len(rows.nodes)+len(rows.edges))
 		}()
 		for n := range l.Nodes() {
 			if n != nil {
@@ -82,9 +87,12 @@ func (dw *DeltaWriter) layerNodesInScope(l OverlayLayerReader, repoPrefixes, fil
 		}
 		return out
 	}
+	if rows, ok := dw.chainRowsFor(l); ok {
+		return rows.nodes
+	}
 	if p, ok := l.(OverlayLayerProjectionReader); ok {
 		nodes := p.LayerNodesInScope(repoPrefixes, filePaths, light, kinds...)
-		dw.noteLayerRows(len(nodes))
+		dw.noteLayerRowsFor("nodes_in_scope"+layerRowKinds(nodeKindNames(kinds)), len(nodes))
 		return nodes
 	}
 	return dw.rowsFor(l).nodes
@@ -109,10 +117,13 @@ func (dw *DeltaWriter) layerAdjacency(l OverlayLayerReader, ids []string, incomi
 		}
 		return out
 	}
-	if p, ok := l.(OverlayLayerProjectionReader); ok {
-		return dw.cachedLayerAdjacency(l, p, ids, incoming)
+	rows, kept := dw.chainRowsFor(l)
+	if !kept {
+		if p, ok := l.(OverlayLayerProjectionReader); ok {
+			return dw.cachedLayerAdjacency(l, p, ids, incoming)
+		}
+		rows = dw.rowsFor(l)
 	}
-	rows := dw.rowsFor(l)
 	index := rows.byFrom
 	if incoming {
 		index = rows.byTo
@@ -139,9 +150,22 @@ func (dw *DeltaWriter) layerEdgesOfKinds(l OverlayLayerReader, kinds []EdgeKind)
 		}
 		return out
 	}
+	if rows, ok := dw.chainRowsFor(l); ok {
+		want := make(map[EdgeKind]struct{}, len(kinds))
+		for _, k := range kinds {
+			want[k] = struct{}{}
+		}
+		var out []*Edge
+		for _, e := range rows.edges {
+			if _, ok := want[e.Kind]; ok {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
 	if p, ok := l.(OverlayLayerProjectionReader); ok {
 		edges := p.LayerEdgesByKinds(kinds)
-		dw.noteLayerRows(len(edges))
+		dw.noteLayerRowsFor("edges_by_kinds"+layerRowKinds(edgeKindNames(kinds)), len(edges))
 		return edges
 	}
 	return dw.rowsFor(l).edges
@@ -334,7 +358,22 @@ func (dw *DeltaWriter) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds .
 			return
 		}
 		var rows []ScopedEdgeRow
-		for row := range seq.EdgesInScopeSeq(repoPrefixes, filePaths, kinds...) {
+		baseRows, cached := dw.stackBaseScopedEdges(repoPrefixes, filePaths, kinds, func() []ScopedEdgeRow {
+			var all []ScopedEdgeRow
+			for row := range seq.EdgesInScopeSeq(repoPrefixes, filePaths, kinds...) {
+				all = append(all, row)
+			}
+			return all
+		})
+		if !cached {
+			for row := range seq.EdgesInScopeSeq(repoPrefixes, filePaths, kinds...) {
+				if row.Edge == nil || !s.edgeVisibleFrom(row.Edge, 0) {
+					continue
+				}
+				rows = append(rows, row)
+			}
+		}
+		for _, row := range baseRows {
 			if row.Edge == nil || !s.edgeVisibleFrom(row.Edge, 0) {
 				continue
 			}
@@ -595,6 +634,9 @@ type layerAdjacencyCache struct {
 }
 
 func (dw *DeltaWriter) cachedLayerAdjacency(l OverlayLayerReader, p OverlayLayerProjectionReader, ids []string, incoming bool) map[string][]*Edge {
+	if out, ok := dw.stackLayerAdjacency(l, p, ids, incoming); ok {
+		return out
+	}
 	dw.nameIndexMu.Lock()
 	if dw.adjacencyCache == nil {
 		dw.adjacencyCache = make(map[OverlayLayerReader]*layerAdjacencyCache)
@@ -641,7 +683,11 @@ func (dw *DeltaWriter) cachedLayerAdjacency(l OverlayLayerReader, p OverlayLayer
 			known[id] = edges
 		}
 		dw.nameIndexMu.Unlock()
-		dw.noteLayerRows(n)
+		if incoming {
+			dw.noteLayerRowsFor("in_edges_by_ids", n)
+		} else {
+			dw.noteLayerRowsFor("out_edges_by_ids", n)
+		}
 	}
 	out := make(map[string][]*Edge, len(seen))
 	dw.nameIndexMu.Lock()

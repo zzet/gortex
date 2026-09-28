@@ -22,6 +22,13 @@ import (
 // Generation zero is the one mutable generation, so a view that composes it
 // (commitLayerBase.stack is nil) is never cached.
 //
+// A working-tree edit stands on the dirty chain the previous edits published
+// (commitLayerBase.chainDepth): the per-stack caches are keyed by the stack
+// below the chain, so consecutive edits on one commit share them, and each
+// delta composes the chain's layers per read (graph.DeltaWriter's
+// SetChainGenerations). The contract registry alone is not composed per read
+// and stays keyed by the whole stack.
+//
 // The registry is loaded before the engine writes anything, so it is the
 // view below's registry exactly; each delta gets its own copy, which its
 // engine then edits.
@@ -49,7 +56,14 @@ func editDeltaContractCacheKey(base graph.Reader, store any, repoPrefix, workspa
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%p\x00%s\x00%s\x00%s", store, repoPrefix, workspaceID, projectID)
-	for _, gen := range layer.stack {
+	// Over a dirty chain the key is the stack below the chain: a delta
+	// composes the chain's layers over the kept answers per read, so every
+	// consecutive edit on one commit shares them.
+	stack := layer.commitStack()
+	if len(stack) == 0 {
+		return "", false
+	}
+	for _, gen := range stack {
 		if gen <= 0 {
 			return "", false
 		}
@@ -181,4 +195,147 @@ func editDeltaBaseCache(key string) *graph.BaseProjectionCache {
 		editDeltaBaseCaches.keys = editDeltaBaseCaches.keys[1:]
 	}
 	return c
+}
+
+// editDeltaRegistryKey is the contract registry's key for a delta over base:
+// the whole stack's, the dirty chain included, since the registry is not
+// composed per read.
+func editDeltaRegistryKey(base graph.Reader, store any, repoPrefix, workspaceID, projectID string) (string, bool) {
+	return editDeltaContractCacheKey(wholeStack(base), store, repoPrefix, workspaceID, projectID)
+}
+
+// wholeStack is base keyed by its whole stack, the dirty chain included: the
+// key of a cache the chain is not composed over per read.
+func wholeStack(base graph.Reader) graph.Reader {
+	if layer, ok := base.(commitLayerBase); ok && layer.chainDepth > 0 {
+		layer.chainDepth = 0
+		return layer
+	}
+	return base
+}
+
+// installEditDeltaStackCache installs the per-stack projection cache on a
+// delta over base. Over a dirty chain (base's chainDepth) the cache is the
+// one kept for the stack below the chain and the delta is told the chain's
+// generations, so it composes them per read; a view whose layers do not end
+// in those generations is keyed by its whole stack instead. keyBase is the
+// base the delta's per-stack keys are then taken from, and cacheBase the view
+// its caches are loaded from (the view below the chain, or base).
+func installEditDeltaStackCache(dw *graph.DeltaWriter, base graph.Reader, store any) (keyBase, cacheBase graph.Reader) {
+	keyBase, cacheBase = base, base
+	if layer, ok := base.(commitLayerBase); ok && layer.chainDepth > 0 {
+		if key, ok := editDeltaBaseCacheKey(base, store); ok {
+			chain := layer.chainGenerations()
+			epochs := make([]uint64, len(chain))
+			if withEpochs, ok := store.(interface{ GenerationCorrectionEpoch(int64) uint64 }); ok {
+				for i, gen := range chain {
+					epochs[i] = withEpochs.GenerationCorrectionEpoch(gen)
+				}
+			}
+			dw.SetChainGenerations(chain, epochs)
+			dw.SetBaseProjectionCache(editDeltaBaseCache(key))
+			if below, split := dw.ChainSplitBase(); split {
+				dw.SetChainLayerRows(editDeltaChainLayerRowsFor(store))
+				return base, below
+			}
+			dw.SetChainGenerations(nil, nil)
+			dw.SetBaseProjectionCache(nil)
+		}
+		keyBase, cacheBase = wholeStack(base), base
+	}
+	if key, ok := editDeltaBaseCacheKey(keyBase, store); ok {
+		dw.SetBaseProjectionCache(editDeltaBaseCache(key))
+	}
+	return keyBase, cacheBase
+}
+
+// The dirty chain's layers kept across deltas (graph.ChainLayerRows), one
+// keeper per store: a chain layer is a published generation of that store,
+// keyed there by its id and correction epoch.
+var editDeltaChainLayers struct {
+	sync.Mutex
+	byStore map[any]*graph.ChainLayerRows
+}
+
+// editDeltaChainLayerRowsFor returns store's keeper, creating it on first use.
+func editDeltaChainLayerRowsFor(store any) *graph.ChainLayerRows {
+	editDeltaChainLayers.Lock()
+	defer editDeltaChainLayers.Unlock()
+	if editDeltaChainLayers.byStore == nil {
+		editDeltaChainLayers.byStore = make(map[any]*graph.ChainLayerRows)
+	}
+	keeper := editDeltaChainLayers.byStore[store]
+	if keeper == nil {
+		keeper = graph.NewChainLayerRows(0, 0)
+		editDeltaChainLayers.byStore[store] = keeper
+	}
+	return keeper
+}
+
+// forgetEditDeltaChainLayer drops a generation that stopped being servable
+// from store's keeper.
+func forgetEditDeltaChainLayer(store any, generation int64) {
+	editDeltaChainLayers.Lock()
+	keeper := editDeltaChainLayers.byStore[store]
+	editDeltaChainLayers.Unlock()
+	keeper.Forget(generation)
+}
+
+// resetEditDeltaChainLayers empties every keeper (tests).
+func resetEditDeltaChainLayers() {
+	editDeltaChainLayers.Lock()
+	editDeltaChainLayers.byStore = nil
+	editDeltaChainLayers.Unlock()
+}
+
+// Carrying the registry forward.
+//
+// The contract registry is not composed per read over a dirty chain
+// (editDeltaRegistryKey), so a chained edit would reload it on every new
+// stack. A delta keeps its registry exact as it goes
+// (commitIncrementalContractFiles), and the generation it publishes is
+// exactly the stack the next edit over it stands on: the delta's final
+// registry is filed under that stack's key when the generation publishes. A
+// correction of the generation moves its epoch, and with it the key.
+
+// editDeltaRegistryCarry returns the function the build calls with the
+// published generation's id, or nil when idx's registry was not keyed.
+func editDeltaRegistryCarry(idx *Indexer, base graph.Reader, store any, repoPrefix, workspaceID, projectID string) func(int64) {
+	layer, ok := base.(commitLayerBase)
+	if !ok || len(layer.stack) == 0 || idx == nil || idx.contractRegistry == nil {
+		return nil
+	}
+	if _, keyed := editDeltaRegistryKey(base, store, repoPrefix, workspaceID, projectID); !keyed {
+		return nil
+	}
+	snapshot := copyContracts(idx.contractRegistry.ByRepo(repoPrefix))
+	stack := append([]int64(nil), layer.stack...)
+	return func(generation int64) {
+		if generation <= 0 {
+			return
+		}
+		next := commitLayerBase{stack: append(append([]int64(nil), stack...), generation)}
+		key, ok := editDeltaRegistryKey(next, store, repoPrefix, workspaceID, projectID)
+		if !ok {
+			return
+		}
+		storeEditDeltaContractRegistry(key, snapshot)
+	}
+}
+
+// storeEditDeltaContractRegistry files contracts under key, replacing an
+// entry already there.
+func storeEditDeltaContractRegistry(key string, list []contracts.Contract) {
+	editDeltaContractCache.Lock()
+	defer editDeltaContractCache.Unlock()
+	for i, entry := range editDeltaContractCache.entries {
+		if entry.key == key {
+			editDeltaContractCache.entries = append(editDeltaContractCache.entries[:i:i], editDeltaContractCache.entries[i+1:]...)
+			break
+		}
+	}
+	editDeltaContractCache.entries = append(editDeltaContractCache.entries, editDeltaContractCacheEntry{key: key, contracts: list})
+	if over := len(editDeltaContractCache.entries) - editDeltaContractCacheEntries; over > 0 {
+		editDeltaContractCache.entries = append([]editDeltaContractCacheEntry(nil), editDeltaContractCache.entries[over:]...)
+	}
 }

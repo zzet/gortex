@@ -67,6 +67,12 @@ type dirtyChainBuilder struct {
 	// samples through, as the coordinator's are (so the prepublish fence can
 	// confirm by read set). nil samples afresh.
 	sampler *gitstate.DirtySampler
+	// open, when set, opens the base a build stands on as the coordinator does
+	// (a materialized view through ancestryLayerBase): of rootGeneration for a
+	// direct build, of the parent for a chained one. nil stands every build on
+	// the base corpus (generation zero), where the per-stack caches are off.
+	open           func(ctx context.Context, generationID int64) (LayerBase, func(), error)
+	rootGeneration int64
 }
 
 func newDirtyChainBuilder(t testing.TB, builder *SparseGenerationBuilder, store *store_sqlite.Store, repoDir string, chained bool) *dirtyChainBuilder {
@@ -104,10 +110,14 @@ func (h *dirtyChainBuilder) build() (int64, BuildReport, []int64) {
 		default:
 			parent := h.chain[len(h.chain)-1]
 			req := h.request()
-			req.Base = commitLayerBase{Reader: dirtyChainComposed(h.t, h.store, h.chain), corpus: h.store}
+			if h.open == nil {
+				req.Base = commitLayerBase{Reader: dirtyChainComposed(h.t, h.store, h.chain), corpus: h.store}
+			}
+			release := h.standOn(&req, parent)
 			req.Identity.BaseGenerationID = parent
 			req.parent, req.parentManifest, req.parentDepth = parent, manifest, len(h.chain)
 			id, report, err := h.builder.BuildDirtyLayer(ctx, req)
+			release()
 			var fallback *DirtyChainFallbackError
 			switch {
 			case err == nil:
@@ -123,7 +133,9 @@ func (h *dirtyChainBuilder) build() (int64, BuildReport, []int64) {
 	}
 	req := h.request()
 	req.chainFallbackReason = reason
+	release := h.standOn(&req, h.rootGeneration)
 	id, report, err := h.builder.BuildDirtyLayer(ctx, req)
+	release()
 	if err != nil {
 		h.t.Fatalf("direct BuildDirtyLayer: %v", err)
 	}
@@ -144,7 +156,10 @@ func (h *dirtyChainBuilder) settle() {
 	if !h.compact || len(h.chain) < dirtyChainCompactionDepth {
 		return
 	}
-	id, _, err := h.builder.BuildDirtyLayer(context.Background(), h.request())
+	req := h.request()
+	release := h.standOn(&req, h.rootGeneration)
+	id, _, err := h.builder.BuildDirtyLayer(context.Background(), req)
+	release()
 	if err != nil {
 		h.t.Fatalf("compacting BuildDirtyLayer: %v", err)
 	}
@@ -285,4 +300,20 @@ func parityComposeFTSChain(t *testing.T, db *sql.DB, chain []int64) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// standOn points req at the base h.open opens for generationID, and returns
+// the release of that base's view. Without h.open it leaves req as it is.
+func (h *dirtyChainBuilder) standOn(req *DirtyLayerRequest, generationID int64) func() {
+	h.t.Helper()
+	if h.open == nil {
+		return func() {}
+	}
+	base, release, err := h.open(context.Background(), generationID)
+	if err != nil {
+		h.t.Fatalf("open the base of generation %d: %v", generationID, err)
+	}
+	req.Base = base
+	req.Identity.BaseGenerationID = generationID
+	return release
 }

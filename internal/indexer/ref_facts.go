@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"sort"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -249,4 +250,41 @@ func (idx *Indexer) deleteRefFactsForFiles(repoPrefix string, graphPaths []strin
 	if err := w.DeleteRefFactsByFiles(repoPrefix, graphPaths); err != nil {
 		idx.logger.Debug("ref-facts: delete-on-evict failed", zap.Error(err))
 	}
+}
+
+// refFactLegs times the legs of one ref-facts persistence (the files' nodes,
+// their out-edges, the targets' names, the delete and the write), each with
+// the major page faults it took. A nil *refFactLegs records nothing.
+type refFactLegs struct {
+	last   time.Time
+	io     editDeltaIO
+	took   map[string]time.Duration
+	faults map[string]int64
+	order  []string
+}
+
+func newRefFactLegs() *refFactLegs {
+	return &refFactLegs{last: time.Now(), io: editDeltaProcessIO(),
+		took: make(map[string]time.Duration), faults: make(map[string]int64)}
+}
+
+func (l *refFactLegs) lap(name string) {
+	if l == nil {
+		return
+	}
+	now, io := time.Now(), editDeltaProcessIO()
+	if _, seen := l.took[name]; !seen {
+		l.order = append(l.order, name)
+	}
+	l.took[name] += now.Sub(l.last)
+	l.faults[name] += io.since(l.io).majorFaults
+	l.last, l.io = now, io
+}
+
+func (l *refFactLegs) fields(files int) []zap.Field {
+	fields := []zap.Field{zap.Int("files", files)}
+	for _, name := range l.order {
+		fields = append(fields, zap.Duration(name, l.took[name]), zap.Int64(name+"_faults", l.faults[name]))
+	}
+	return fields
 }

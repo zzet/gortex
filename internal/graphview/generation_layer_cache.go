@@ -223,6 +223,23 @@ func (m *Materializer) ForgetGeneration(generation int64) {
 		return
 	}
 	m.layerCacheFor().forget(generation)
+	m.forgetMu.Lock()
+	observers := append([]func(int64){}, m.forgetObservers...)
+	m.forgetMu.Unlock()
+	for _, observe := range observers {
+		observe(generation)
+	}
+}
+
+// OnForgetGeneration registers fn to be told every generation ForgetGeneration
+// drops (a generation that stopped being servable).
+func (m *Materializer) OnForgetGeneration(fn func(generation int64)) {
+	if m == nil || fn == nil {
+		return
+	}
+	m.forgetMu.Lock()
+	m.forgetObservers = append(m.forgetObservers, fn)
+	m.forgetMu.Unlock()
 }
 
 // LayerCacheStats reports the generation-layer cache's hits, misses and

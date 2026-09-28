@@ -3308,6 +3308,12 @@ func (c *CheckoutCoordinator) baseViewMaterializer() *graphview.Materializer {
 		c.baseViews = &graphview.Materializer{
 			Store: c.store, Catalog: c.catalog, Leases: c.leases, Logger: c.logger,
 		}
+		// A generation that stopped being servable leaves the dirty chain's
+		// kept layers too (edit_delta_contract_cache.go).
+		store := c.store
+		c.baseViews.OnForgetGeneration(func(generation int64) {
+			forgetEditDeltaChainLayer(store, generation)
+		})
 	})
 	return c.baseViews
 }
@@ -4521,6 +4527,50 @@ type commitLayerBase struct {
 	// generation zero); nil otherwise. Equal stacks read equal rows, so a
 	// per-file delta keys what it derives from the base by it.
 	stack []int64
+	// chainDepth is how many generations at the top of stack are the dirty
+	// chain a working-tree build stands on (its parent and the parent's
+	// chain); zero for a base that is a commit stack. The per-stack caches
+	// are kept for the generations below them (edit_delta_contract_cache.go),
+	// and a delta composes the chain over them per read.
+	chainDepth int
+}
+
+// commitStack is the part of the stack the per-stack caches are kept for:
+// every generation below the dirty chain.
+func (b commitLayerBase) commitStack() []int64 {
+	if b.chainDepth <= 0 || b.chainDepth >= len(b.stack) {
+		if b.chainDepth > 0 {
+			return nil
+		}
+		return b.stack
+	}
+	return b.stack[:len(b.stack)-b.chainDepth]
+}
+
+// chainGenerations is the dirty chain's generations, bottom first.
+func (b commitLayerBase) chainGenerations() []int64 {
+	if b.chainDepth <= 0 || b.chainDepth >= len(b.stack) {
+		return nil
+	}
+	return b.stack[len(b.stack)-b.chainDepth:]
+}
+
+// editDeltaChainOverlay turns the keying below a dirty chain on; off, a
+// chained build's caches are keyed by its whole stack, the chain included
+// (the measurements of the keying compare the two).
+var editDeltaChainOverlay = true
+
+// withChainDepth marks base's top depth generations as the dirty chain a
+// build over parent stands on. A base whose stack does not end in parent, or
+// is not deeper than the chain, is returned unmarked: its caches stay keyed
+// by the whole stack.
+func withChainDepth(base LayerBase, parent int64, depth int) LayerBase {
+	layer, ok := base.(commitLayerBase)
+	if !ok || !editDeltaChainOverlay || parent <= 0 || depth <= 0 || len(layer.stack) <= depth || layer.stack[len(layer.stack)-1] != parent {
+		return base
+	}
+	layer.chainDepth = depth
+	return layer
 }
 
 var _ LayerBase = commitLayerBase{}
@@ -4562,6 +4612,20 @@ func (b commitLayerBase) LoadRefFactsByTargets(repoPrefix string, targetIDs []st
 		return map[string][]graph.RefFact{}, nil
 	}
 	return b.corpus.LoadRefFactsByTargets(repoPrefix, targetIDs)
+}
+
+var _ graph.RefFactsChainSplitter = commitLayerBase{}
+
+// RefFactsSplitAt implements graph.RefFactsChainSplitter: the facts of the
+// generations below the top chainLayers, and the top ones' union over them.
+func (b commitLayerBase) RefFactsSplitAt(chainLayers int) (graph.RefFactsReader, graph.RefFactsChainOverlay, bool) {
+	if chainLayers <= 0 || len(b.facts.handles) <= chainLayers {
+		return nil, nil, false
+	}
+	cut := len(b.facts.handles) - chainLayers
+	below := ancestryRefFacts{handles: b.facts.handles[:cut]}
+	chain := ancestryRefFacts{handles: b.facts.handles[cut:]}
+	return below, chain.overlayByTargets, true
 }
 
 // ancestryRefFacts serves the durable reference-fact hints from every
@@ -4690,4 +4754,33 @@ func (a ancestryRefFacts) LoadRefFactsByTargets(
 		}
 	}
 	return out, firstErr
+}
+
+// overlayByTargets adds a's facts for targets to the facts the generations
+// below a hold for them (below): the union LoadRefFactsByTargets composes
+// over every generation, with below's rows first and a's in generation order
+// after, each fact kept once.
+func (a ancestryRefFacts) overlayByTargets(
+	repoPrefix string, targetIDs []string, below map[string][]graph.RefFact,
+) (map[string][]graph.RefFact, error) {
+	out := make(map[string][]graph.RefFact, len(below))
+	seen := map[refFactIdentity]struct{}{}
+	for file, facts := range below {
+		for _, fact := range facts {
+			seen[identifyRefFact(fact)] = struct{}{}
+		}
+		out[file] = append([]graph.RefFact(nil), facts...)
+	}
+	chain, err := a.LoadRefFactsByTargets(repoPrefix, targetIDs)
+	for file, facts := range chain {
+		for _, fact := range facts {
+			key := identifyRefFact(fact)
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			out[file] = append(out[file], fact)
+		}
+	}
+	return out, err
 }

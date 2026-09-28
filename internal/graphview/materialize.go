@@ -104,6 +104,11 @@ type Materializer struct {
 	// generationLayerCache.
 	layerCacheOnce sync.Once
 	layerCache     *generationLayerCache
+
+	// forgetObservers are told every generation ForgetGeneration drops, so a
+	// cache kept beside the materializer (the search ranker's) drops it too.
+	forgetMu        sync.Mutex
+	forgetObservers []func(generation int64)
 }
 
 // GenerationSource is one persisted generation of a view's stack seen by

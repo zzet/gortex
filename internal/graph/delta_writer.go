@@ -4,7 +4,9 @@ import (
 	"iter"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 )
 
 // DeltaWriter is a graph.Store whose reads are a checkout's composed view and
@@ -49,11 +51,29 @@ import (
 // of a cache other readers see, which is the same isolation a SQLite store
 // gives by decoding a fresh row per read.
 type DeltaWriter struct {
+	// fileNodeReads counts the delta's file-node reads
+	// (delta_writer_file_node_reads.go).
+	fileNodeReads fileNodeReadStats
 	// baseCache memoizes the bottom store's projections across deltas over
 	// one immutable stack (delta_writer_base_cache.go); nil when none.
 	baseCache *BaseProjectionCache
+	// chainLayers is how many layers directly below the delta's own belong
+	// to the dirty chain above the stack baseCache is kept for
+	// (delta_writer_chain_split.go).
+	chainLayers int
+	chainGens   []int64
+	chainEpochs []uint64
+	// chainRows keeps the chain's layers' rows across deltas
+	// (delta_writer_chain_layer_rows.go); nil reads them per delta.
+	chainRows *ChainLayerRows
 	below     Reader
 	sidecar   any
+	// belowFileRows answers the payload's per-path comparisons against the
+	// view below when installed (SetBelowFileRows).
+	belowFileRows BelowFileRows
+	// coverServedPaths are the paths coverFromBelowRows served in the
+	// coverPaths call in progress (writeMu held).
+	coverServedPaths []string
 
 	work  *Graph
 	layer *deltaLayer
@@ -103,6 +123,12 @@ type DeltaWriterStats struct {
 	// LayerRowsRead counts every row the delta read from the immutable layers
 	// below it, wholesale or through their generation-scoped projections.
 	LayerRowsRead int
+	// LayerRowsByRead splits LayerRowsRead by the read that composed the
+	// rows (and the kinds it asked for).
+	LayerRowsByRead map[string]int
+	// BelowRowsServed counts the rows the payload's comparisons took from an
+	// installed BelowFileRows source instead of the layers.
+	BelowRowsServed int
 	// SlowReads counts reads answered by a scan of the whole view (a
 	// repository or corpus listing) because neither the view below nor the
 	// delta has a bounded form of it. Each one is a per-save cost that grows
@@ -147,6 +173,10 @@ func (dw *DeltaWriter) DeltaStats() DeltaWriterStats {
 	dw.statsMu.Lock()
 	defer dw.statsMu.Unlock()
 	out := dw.stats
+	out.LayerRowsByRead = make(map[string]int, len(dw.stats.LayerRowsByRead))
+	for k, v := range dw.stats.LayerRowsByRead {
+		out.LayerRowsByRead[k] = v
+	}
 	out.SlowReads = make(map[string]int, len(dw.stats.SlowReads))
 	for k, v := range dw.stats.SlowReads {
 		out.SlowReads[k] = v
@@ -171,13 +201,55 @@ func (dw *DeltaWriter) noteWholeLayerLoad(rows int) {
 	dw.statsMu.Unlock()
 }
 
-func (dw *DeltaWriter) noteLayerRows(rows int) {
+// noteLayerRowsFor counts rows read from the layers below by the named read.
+func (dw *DeltaWriter) noteLayerRowsFor(read string, rows int) {
 	if rows == 0 {
 		return
 	}
 	dw.statsMu.Lock()
 	dw.stats.LayerRowsRead += rows
+	if dw.stats.LayerRowsByRead == nil {
+		dw.stats.LayerRowsByRead = make(map[string]int)
+	}
+	dw.stats.LayerRowsByRead[read] += rows
 	dw.statsMu.Unlock()
+}
+
+func (dw *DeltaWriter) noteBelowRowsServed(rows int) {
+	dw.statsMu.Lock()
+	dw.stats.BelowRowsServed += rows
+	dw.statsMu.Unlock()
+}
+
+// layerRowsRead is the running total of rows read from the layers below.
+func (dw *DeltaWriter) layerRowsRead() int {
+	dw.statsMu.Lock()
+	defer dw.statsMu.Unlock()
+	return dw.stats.LayerRowsRead
+}
+
+func layerRowKinds(kinds []string) string {
+	if len(kinds) == 0 {
+		return ""
+	}
+	sort.Strings(kinds)
+	return "[" + strings.Join(kinds, ",") + "]"
+}
+
+func nodeKindNames(kinds []NodeKind) []string {
+	out := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		out = append(out, string(k))
+	}
+	return out
+}
+
+func edgeKindNames(kinds []EdgeKind) []string {
+	out := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		out = append(out, string(k))
+	}
+	return out
 }
 
 func (dw *DeltaWriter) noteSlowRead(op string) {
@@ -346,12 +418,29 @@ func (dw *DeltaWriter) coverPaths(paths []string) {
 		return
 	}
 	var nodes []*Node
+	var edges []*Edge
+	// While the delta has written and claimed nothing, the composed view at
+	// a path is the view below's, which the stack's below-rows source keeps
+	// (delta_writer_cover_below.go): the first eviction of a delta — the
+	// changed files' own — is served from it instead of scanning the stack.
+	fresh, nodes, edges = dw.coverFromBelowRows(fresh)
+	if len(fresh) == 0 {
+		dw.noteBuiltinTargets(edges)
+		dw.layer.mu.Lock()
+		dw.work.materializeRows(nodes, edges)
+		for _, p := range dw.coverServedPaths {
+			dw.layer.covered[p] = false
+		}
+		dw.coverServedPaths = nil
+		dw.layer.mu.Unlock()
+		dw.noteMaterialized(len(nodes), len(edges))
+		return
+	}
 	for _, p := range fresh {
 		nodes = append(nodes, cloneDeltaNodes(dw.view.GetFileNodes(p))...)
 	}
-	var edges []*Edge
 	if recorded, ok := RecordedEdgesOf(dw.view); ok {
-		edges = cloneDeltaEdges(recorded.RecordedEdgesAt(fresh))
+		edges = append(edges, cloneDeltaEdges(recorded.RecordedEdgesAt(fresh))...)
 	} else {
 		// Without a by-file reader the recorded set is approximated by the
 		// edges the path's own nodes hold there; a source outside the path
@@ -382,6 +471,10 @@ func (dw *DeltaWriter) coverPaths(paths []string) {
 	for _, p := range fresh {
 		dw.layer.covered[p] = false
 	}
+	for _, p := range dw.coverServedPaths {
+		dw.layer.covered[p] = false
+	}
+	dw.coverServedPaths = nil
 	dw.layer.mu.Unlock()
 	dw.noteMaterialized(len(nodes), len(edges))
 }
@@ -930,11 +1023,19 @@ func (dw *DeltaWriter) FindNodesByNameContaining(substr string, limit int) []*No
 
 // GetFileNodes implements Store.
 func (dw *DeltaWriter) GetFileNodes(filePath string) []*Node {
+	defer dw.noteFileNodeRead(time.Now())
 	return cloneDeltaNodes(dw.view.GetFileNodes(filePath))
 }
 
 // GetFileNodesByPaths implements Store.
 func (dw *DeltaWriter) GetFileNodesByPaths(filePaths []string) map[string][]*Node {
+	defer dw.noteFileNodeRead(time.Now())
+	return dw.getFileNodesByPaths(filePaths)
+}
+
+// getFileNodesByPaths is GetFileNodesByPaths without the read count, for the
+// delta's own composite reads (each counted once, by its caller).
+func (dw *DeltaWriter) getFileNodesByPaths(filePaths []string) map[string][]*Node {
 	if composed, ok := dw.composedFileNodesByPaths(filePaths); ok {
 		out := make(map[string][]*Node, len(composed))
 		for p, nodes := range composed {
@@ -1039,8 +1140,10 @@ func (dw *DeltaWriter) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 	return out
 }
 
-// GetEdgeCandidates implements Store from the sources' composed out-edges.
-func (dw *DeltaWriter) GetEdgeCandidates(endpoints []EdgeEndpoint, sites []EdgeSite) EdgeCandidateSet {
+// getEdgeCandidatesByAdjacency answers a candidate batch from the sources'
+// composed out-edges (GetEdgeCandidates' form for a bottom store with no
+// candidate probe).
+func (dw *DeltaWriter) getEdgeCandidatesByAdjacency(endpoints []EdgeEndpoint, sites []EdgeSite) EdgeCandidateSet {
 	out := NewEdgeCandidateSet()
 	endpointWanted := make(map[EdgeEndpoint]struct{}, len(endpoints))
 	siteWanted := make(map[EdgeSite]struct{}, len(sites))
@@ -1248,6 +1351,14 @@ func (dw *DeltaWriter) RepoStats() map[string]GraphStats { return dw.view.RepoSt
 
 // RepoPrefixes implements Store.
 func (dw *DeltaWriter) RepoPrefixes() []string {
+	if dw.baseCache != nil {
+		// The bottom store's listing is a distinct scan; the stack's is kept.
+		return append([]string(nil), dw.baseCache.stackRepoPrefixes(dw.repoPrefixesOfBase)...)
+	}
+	return dw.repoPrefixesOfBase()
+}
+
+func (dw *DeltaWriter) repoPrefixesOfBase() []string {
 	if lister, ok := innermostReader(dw.below).(interface{ RepoPrefixes() []string }); ok {
 		return lister.RepoPrefixes()
 	}
@@ -1295,6 +1406,9 @@ func (dw *DeltaWriter) ResolveMutex() *sync.Mutex { return &dw.resolveMu }
 
 // RecordedEdges serves the by-file full-row reader through the composed view.
 func (dw *DeltaWriter) RecordedEdges() (RecordedEdgeReader, bool) {
+	if reader, ok := dw.stackRecordedEdges(); ok {
+		return deltaRecordedEdges{inner: reader}, true
+	}
 	reader, ok := RecordedEdgesOf(dw.view)
 	if !ok {
 		return nil, false

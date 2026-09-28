@@ -86,6 +86,26 @@ func (l *GenerationLayer) LayerNodesByNames(names []string) map[string][]*graph.
 	return out
 }
 
+// LayerNodesByNamesInRepoLanguages is LayerNodesByNames scoped in the store's
+// query to one repository and, when languages is nonempty, those languages:
+// only the rows a repository name read keeps are read and decoded
+// (graph.OverlayLayerScopedNameReader).
+func (l *GenerationLayer) LayerNodesByNamesInRepoLanguages(names []string, repoPrefix string, languages []string) map[string][]*graph.Node {
+	if len(names) == 0 || l.noNodeRows() {
+		return nil
+	}
+	batch := l.handle.FindNodesByNamesInRepoLanguages(names, repoPrefix, languages)
+	out := make(map[string][]*graph.Node, len(batch))
+	for name, nodes := range batch {
+		if served := l.serveNodes(nodes); len(served) > 0 {
+			out[name] = served
+		}
+	}
+	return out
+}
+
+var _ graph.OverlayLayerScopedNameReader = (*GenerationLayer)(nil)
+
 // LayerRepoEdgesByKinds implements graph.OverlayLayerProjectionReader.
 func (l *GenerationLayer) LayerRepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) []graph.RepoEdgeRow {
 	if l.noEdgeRows() {

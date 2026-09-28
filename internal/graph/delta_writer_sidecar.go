@@ -127,7 +127,33 @@ func (dw *DeltaWriter) LoadRefFactsByFiles(repoPrefix string, files []string) ([
 func (dw *DeltaWriter) LoadRefFactsByTargets(repoPrefix string, targetIDs []string) (map[string][]RefFact, error) {
 	out := make(map[string][]RefFact)
 	if r, ok := dw.below.(RefFactsReader); ok {
-		below, err := r.LoadRefFactsByTargets(repoPrefix, targetIDs)
+		load := r.LoadRefFactsByTargets
+		if dw.baseCache != nil {
+			// The view below is an immutable stack: its facts per target are
+			// kept per stack (the affected-by planner asks for the changed
+			// declarations' targets on every save of a file). Over a dirty
+			// chain they are kept for the stack below the chain, and the
+			// chain's own facts are added per read.
+			kept, overlay := r.LoadRefFactsByTargets, RefFactsChainOverlay(nil)
+			if dw.chainLayers > 0 {
+				kept = nil
+				if splitter, ok := dw.below.(RefFactsChainSplitter); ok {
+					if below, chain, ok := splitter.RefFactsSplitAt(dw.chainLayers); ok {
+						kept, overlay = below.LoadRefFactsByTargets, chain
+					}
+				}
+			}
+			if kept != nil {
+				load = func(repo string, ids []string) (map[string][]RefFact, error) {
+					facts, err := dw.baseCache.stackRefFactsByTargets(repo, ids, kept)
+					if err != nil || overlay == nil {
+						return facts, err
+					}
+					return overlay(repo, ids, facts)
+				}
+			}
+		}
+		below, err := load(repoPrefix, targetIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -302,3 +328,15 @@ var (
 	_ ContentFTSBatchReplacer = (*DeltaWriter)(nil)
 	_ CloneShingleWriter      = (*DeltaWriter)(nil)
 )
+
+// RefFactsChainOverlay adds a dirty chain's reference facts for targets to
+// the facts the stack below the chain holds for them (below), as the view
+// below the delta composes the two.
+type RefFactsChainOverlay func(repoPrefix string, targetIDs []string, below map[string][]RefFact) (map[string][]RefFact, error)
+
+// RefFactsChainSplitter is a view below a delta whose reference facts compose
+// a stack of generations: it answers for the generations below the top
+// chainLayers alone, and composes the top ones over such an answer.
+type RefFactsChainSplitter interface {
+	RefFactsSplitAt(chainLayers int) (below RefFactsReader, chain RefFactsChainOverlay, ok bool)
+}

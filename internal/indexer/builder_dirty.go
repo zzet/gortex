@@ -334,8 +334,11 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	clock.lap("prepare_chain_census")
 
 	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
-		Identity:    identity,
-		Base:        req.Base,
+		Identity: identity,
+		// A delta over a parent stands on the parent's dirty chain: its
+		// per-stack caches are the commit stack's, with the chain composed
+		// per read (edit_delta_contract_cache.go).
+		Base:        withChainDepth(req.Base, req.parent, req.parentDepth),
 		Target:      target,
 		Changes:     changes,
 		RootPath:    req.CheckoutRoot,

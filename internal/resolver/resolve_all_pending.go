@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"iter"
 	"sort"
 	"strings"
 	"time"
@@ -424,7 +425,11 @@ func (p *resolveAllPassIndexes) ensureDep(prefixes []string) {
 	if p.resolver.depModuleIndex == nil {
 		p.resolver.depModuleIndex = make(map[string][]depModuleEntry)
 	}
-	for node := range graph.RepoNodeIdentitiesSeq(p.resolver.graph, missing, graph.KindContract) {
+	contracts := graph.RepoNodeIdentitiesSeq(p.resolver.graph, missing, graph.KindContract)
+	if source := p.resolver.depContractSource; source != nil {
+		contracts = source(missing)
+	}
+	for node := range contracts {
 		if !strings.HasPrefix(node.ID, "dep::") {
 			continue
 		}
@@ -450,7 +455,20 @@ func (p *resolveAllPassIndexes) ensureProvides(prefixes []string) {
 		return
 	}
 	if (p.fullPass && len(p.resolver.scope) == 0) || hasEmptyPrefix(prefixes) {
-		p.resolver.buildProvidesForIndex()
+		if p.resolver.providesRowsSource != nil {
+			// The installed source answers every repository's rows: the
+			// whole index is built from them, not from a scan.
+			if p.resolver.providesForIdx == nil {
+				p.resolver.providesForIdx = make(map[string]map[string]struct{})
+			}
+			for _, rows := range p.providesRowsByRepo() {
+				for _, edge := range rows {
+					p.resolver.indexProvidesEdge(edge)
+				}
+			}
+		} else {
+			p.resolver.buildProvidesForIndex()
+		}
 		p.providesAll = true
 		return
 	}
@@ -480,6 +498,13 @@ func (p *resolveAllPassIndexes) ensureProvides(prefixes []string) {
 // node is missing belongs to no repository, as in the scoped read's join.
 func (p *resolveAllPassIndexes) providesRowsByRepo() map[string][]*graph.Edge {
 	if p.providesByRepo != nil {
+		return p.providesByRepo
+	}
+	if source := p.resolver.providesRowsSource; source != nil {
+		p.providesByRepo = source()
+		if p.providesByRepo == nil {
+			p.providesByRepo = make(map[string][]*graph.Edge)
+		}
 		return p.providesByRepo
 	}
 	var rows []*graph.Edge
@@ -615,4 +640,20 @@ func (r *Resolver) prepareResolveAllStream(ctx context.Context) *unresolvedEdgeS
 		return &unresolvedEdgeStream{ctx: ctx, initErr: ctxErr}
 	}
 	return newUnresolvedEdgeStreamContext(ctx, r.graph)
+}
+
+// SetProvidesRowsSource installs the answer to the pass indexes' provides
+// read: every EdgeProvides row of the resolver's graph, bucketed by the
+// repository of its source node (nil restores the scan). It is setup-only,
+// like the other factories: the source must answer for the graph as the
+// resolver reads it.
+func (r *Resolver) SetProvidesRowsSource(source func() map[string][]*graph.Edge) {
+	r.providesRowsSource = source
+}
+
+// SetDepContractSource installs the answer to the pass indexes' dependency
+// module read: the dep:: contract identities of the given repositories (nil
+// restores the store read). Setup-only, like SetProvidesRowsSource.
+func (r *Resolver) SetDepContractSource(source func(repoPrefixes []string) iter.Seq[graph.RepoNodeIdentity]) {
+	r.depContractSource = source
 }

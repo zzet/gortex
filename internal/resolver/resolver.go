@@ -354,6 +354,13 @@ type Resolver struct {
 	// empty-but-non-nil when the graph has no @Module bindings, so
 	// callers can short-circuit with len().
 	providesForIdx map[string]map[string]struct{}
+	// providesRowsSource, when set, answers the pass's provides rows by
+	// source repository instead of a scan of every provides edge
+	// (SetProvidesRowsSource).
+	providesRowsSource func() map[string][]*graph.Edge
+	// depContractSource, when set, answers the pass's dependency-module
+	// contract read (SetDepContractSource).
+	depContractSource func(repoPrefixes []string) iter.Seq[graph.RepoNodeIdentity]
 	// reachableDirsByFile maps caller-file ID → set of directories
 	// reachable from that file (own dir ∪ directories of files reached
 	// via EdgeImports). Populated once at the start of ResolveAll/

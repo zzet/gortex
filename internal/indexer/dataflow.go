@@ -179,6 +179,13 @@ type pendingReturnsTo struct {
 // query, one call-adjacency query, and one ReindexEdges call are made for a
 // batch, regardless of how many arg_of / returns_to edges it contains.
 func rewriteDataflowBatch(g graph.Store, edges []*graph.Edge) int {
+	return rewriteDataflowBatchLegs(g, edges, nil, nil)
+}
+
+// rewriteDataflowBatchLegs is rewriteDataflowBatch timing its legs (the
+// callee parameter index, the caller call index, the reindex) on legs, and
+// reading the callee parameter index through params when set.
+func rewriteDataflowBatchLegs(g graph.Store, edges []*graph.Edge, legs *refFactLegs, params *editDeltaParamIndex) int {
 	if len(edges) == 0 {
 		return 0
 	}
@@ -207,8 +214,16 @@ func rewriteDataflowBatch(g graph.Store, edges []*graph.Edge) int {
 		}
 	}
 
-	paramIdx := buildParamPositionIndex(g, callees)
+	legs.lap("classify")
+	var paramIdx map[string]map[int]string
+	if params != nil {
+		paramIdx = params.index(g, callees)
+	} else {
+		paramIdx = buildParamPositionIndex(g, callees)
+	}
+	legs.lap("param_index")
 	callIdx := buildCallTargetIndex(g, callers)
+	legs.lap("call_index")
 	reindexes := make([]graph.EdgeReindex, 0, len(argEdges)+len(returns))
 	// A bounded input batch can contain duplicate pointers when a synthetic
 	// source is shared. Stage each stored identity once so ordered delete/insert
@@ -250,9 +265,11 @@ func rewriteDataflowBatch(g graph.Store, edges []*graph.Edge) int {
 			RefreshIdentity: true, OldFilePath: oldFilePath, OldLine: oldLine,
 		})
 	}
+	legs.lap("rewrite")
 	if len(reindexes) > 0 {
 		g.ReindexEdges(reindexes)
 	}
+	legs.lap("reindex")
 	return len(reindexes)
 }
 

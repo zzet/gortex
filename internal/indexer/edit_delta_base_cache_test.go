@@ -66,8 +66,11 @@ func TestBaseProjectionCacheServesLaterDeltasAndComposesTheDelta(t *testing.T) {
 		t.Fatalf("the second cached delta differs from an uncached one:\n cached:\n%s\n uncached:\n%s", got, want)
 	}
 	fileHits2, fileMisses2, importHits2, importMisses2 := cache.Stats()
-	if fileMisses2 != fileMisses || importMisses2 != importMisses || fileHits2 == 0 || importHits2 == 0 {
-		t.Fatalf("second delta read the store again: file %d/%d, imports %d/%d (hits/misses)", fileHits2, fileMisses2, importHits2, importMisses2)
+	// The second delta's imports are answered by the stack-level entry
+	// (the layers composed over the store) or the store-level one.
+	stackHits, _ := cache.StackStats()
+	if fileMisses2 != fileMisses || importMisses2 != importMisses || fileHits2 == 0 || importHits2+stackHits == 0 {
+		t.Fatalf("second delta read the store again: file %d/%d, imports %d/%d (hits/misses), stack hits %d", fileHits2, fileMisses2, importHits2, importMisses2, stackHits)
 	}
 
 	// A delta that adds a file and an import composes them over the cache.

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -250,12 +251,27 @@ func (idx *Indexer) reindexIncrementalChunk(
 	nodeCount, edgeCount := 0, 0
 	var retainedBytes int64
 	var readFailed []string
+	var priorFingerprintTime time.Duration
 	consumed := 0
 	for i, filePath := range files {
 		graphPath := graphPaths[i]
 		priorNodes := priorByFile[graphPath]
 		storedGraph := storedExtractionGraphFingerprints(priorNodes)
 		storedDerived := storedDerivedFingerprints(priorNodes)
+		// A prior row stamped before derived fingerprints existed is given
+		// its content's fingerprints when a source for them is installed
+		// (edit_delta_prior_fingerprints.go), instead of invalidating every
+		// derived family.
+		fingerprintStarted := time.Now()
+		if idx.priorFingerprints != nil && !storedDerived.complete() && derivedFingerprintSideExists(priorNodes) {
+			if g, d, ok := idx.priorFingerprints(filePath, priorNodes); ok {
+				if storedGraph == (fileDeltaFingerprints{}) {
+					storedGraph = g
+				}
+				storedDerived = d
+			}
+		}
+		priorFingerprintTime += time.Since(fingerprintStarted)
 		// Once this chunk retains a prepared result, never block while
 		// asking the shared budget for another. Admission pressure flushes
 		// the partial chunk and retries this file in the next chunk; this
@@ -334,7 +350,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 
 	parseTiming.complete(nil, zap.Int("consumed_files", consumed), zap.Int("staged_files", len(stages)),
 		zap.Int("inert_files", plan.InertFiles), zap.Int("read_failed_files", len(readFailed)),
-		zap.Int("fallback_files", len(fallbacks)), zap.Int("nodes", nodeCount), zap.Int("edges", edgeCount))
+		zap.Int("fallback_files", len(fallbacks)), zap.Int("nodes", nodeCount), zap.Int("edges", edgeCount),
+		zap.Duration("prior_fingerprints", priorFingerprintTime))
 	if len(stages) > 0 {
 		plan.Merge(idx.commitIncrementalStages(stages, markerBatch))
 		for _, stage := range stages {
@@ -448,8 +465,14 @@ func loadIncrementalPriorView(g graph.Store, stages []*incrementalBatchStage) in
 		}
 	}
 	if len(ids) > 0 {
-		view.inByNode = g.GetInEdgesByNodeIDs(ids)
-		view.outByNode = g.GetOutEdgesByNodeIDs(ids)
+		kept := false
+		if source := priorEdgesSourceOf(g); source != nil {
+			view.inByNode, view.outByNode, kept = source(ids)
+		}
+		if !kept {
+			view.inByNode = g.GetInEdgesByNodeIDs(ids)
+			view.outByNode = g.GetOutEdgesByNodeIDs(ids)
+		}
 	}
 
 	missingTargets := make(map[string]struct{})
@@ -1637,7 +1660,7 @@ func (idx *Indexer) materializeDataflowParamsForStages(stages []*incrementalBatc
 			}
 		}
 	}
-	rewriteDataflowBatch(idx.graph, edges)
+	rewriteDataflowBatchLegs(idx.graph, edges, nil, idx.dataflowParams)
 }
 
 // materializeDataflowParamsForFiles is the receipt-frontier counterpart of the
@@ -1646,10 +1669,21 @@ func (idx *Indexer) materializeDataflowParamsForStages(stages []*incrementalBatc
 // switch does not retain 1,000 parse trees or issue one query per file.
 func (idx *Indexer) materializeDataflowParamsForFiles(graphPaths []string) {
 	graphPaths = appendUniqueSorted(nil, graphPaths...)
+	legs := newRefFactLegs()
+	defer func() {
+		if idx.logger != nil && len(graphPaths) > 0 {
+			fields := legs.fields(len(graphPaths))
+			if p := idx.dataflowParams; p != nil {
+				fields = append(fields, zap.Int("param_hits", p.hits), zap.Int("param_misses", p.misses))
+			}
+			idx.logger.Info("dataflow: params materialized", fields...)
+		}
+	}()
 	for start := 0; start < len(graphPaths); start += deletedBatchFiles {
 		end := min(start+deletedBatchFiles, len(graphPaths))
 		paths := graphPaths[start:end]
 		nodesByFile := idx.graph.GetFileNodesByPaths(paths)
+		legs.lap("file_nodes")
 		fromSet := make(map[string]struct{})
 		fileSet := make(map[string]struct{}, len(paths))
 		for _, graphPath := range paths {
@@ -1665,8 +1699,10 @@ func (idx *Indexer) materializeDataflowParamsForFiles(graphPaths []string) {
 			froms = append(froms, id)
 		}
 		var edges []*graph.Edge
-		for _, outgoing := range idx.graph.GetOutEdgesByNodeIDs(froms) {
-			for _, edge := range outgoing {
+		outgoing := idx.graph.GetOutEdgesByNodeIDs(froms)
+		legs.lap("out_edges")
+		for _, rows := range outgoing {
+			for _, edge := range rows {
 				if edge == nil || (edge.Kind != graph.EdgeArgOf && edge.Kind != graph.EdgeReturnsTo) {
 					continue
 				}
@@ -1675,7 +1711,7 @@ func (idx *Indexer) materializeDataflowParamsForFiles(graphPaths []string) {
 				}
 			}
 		}
-		rewriteDataflowBatch(idx.graph, edges)
+		rewriteDataflowBatchLegs(idx.graph, edges, legs, idx.dataflowParams)
 	}
 }
 

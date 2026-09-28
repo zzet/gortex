@@ -93,8 +93,9 @@ func (dw *DeltaWriter) lostForeignNodes() []*Node {
 	dw.layer.mu.RUnlock()
 	sort.Strings(covered)
 	var out []*Node
+	belowNodes := dw.belowNodesAt(covered)
 	for _, p := range covered {
-		for _, n := range dw.below.GetFileNodes(p) {
+		for _, n := range belowNodes[p] {
 			if n == nil || n.ID == "" || n.ID == p {
 				continue
 			}

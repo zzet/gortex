@@ -154,7 +154,7 @@ func (dw *DeltaWriter) composedFindNodesByNames(names []string) (map[string][]*N
 		}
 		if p, ok := l.(OverlayLayerProjectionReader); ok {
 			for name, nodes := range p.LayerNodesByNames(names) {
-				dw.noteLayerRows(len(nodes))
+				dw.noteLayerRowsFor("nodes_by_names", len(nodes))
 				for _, n := range nodes {
 					if n != nil && !s.hiddenAbove(n.ID, i+1) {
 						out[name] = append(out[name], n)
@@ -196,6 +196,11 @@ func (dw *DeltaWriter) composedFileNodesByPaths(paths []string) (map[string][]*N
 	base, ok := s.base.(batchedFileNodesReader)
 	if !ok {
 		return nil, false
+	}
+	if k, ok := dw.cacheSplit(s); ok {
+		if below := dw.viewBelowLevel(k); below != nil {
+			return dw.stackComposedFileNodes(s, k, below, base, paths), true
+		}
 	}
 	var clean, dirty []string
 	for _, p := range UniqueRecordingPaths(paths) {
@@ -248,6 +253,11 @@ func (dw *DeltaWriter) composedFileNodesByPaths(paths []string) (map[string][]*N
 // stack's batched name read, filtered to one repository and a language
 // allow-list (empty: every language), each bucket ordered by identity.
 func (dw *DeltaWriter) FindNodesByNamesInRepoLanguages(names []string, repoPrefix string, languages []string) map[string][]*Node {
+	if names := uniqueNonEmptyNames(names); len(names) > 0 {
+		if hits, ok := dw.stackCachedRepoNames(dw.stack(), names, repoPrefix, languages, true); ok {
+			return hits
+		}
+	}
 	hits := dw.FindNodesByNames(names)
 	wantLang := make(map[string]struct{}, len(languages))
 	for _, l := range languages {
@@ -301,31 +311,32 @@ func (dw *DeltaWriter) composedEdgesByNodeIDs(ids []string, incoming, withDelta 
 	if !withDelta && len(s.layers) > 0 && s.layers[len(s.layers)-1] == OverlayLayerReader(dw.layer) {
 		s.layers = s.layers[:len(s.layers)-1]
 	}
+	return dw.composeEdgesOver(s, ids, incoming)
+}
+
+// composeEdgesOver is composedEdgesByNodeIDs over stack s.
+func (dw *DeltaWriter) composeEdgesOver(s deltaStack, ids []string, incoming bool) (map[string][]*Edge, bool) {
 	base, ok := s.base.(batchedAdjacencyReader)
 	if !ok {
 		return nil, false
 	}
-	uniq := make([]string, 0, len(ids))
-	seen := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		uniq = append(uniq, id)
-	}
+	uniq := uniqueIDs(ids)
 	out := make(map[string][]*Edge, len(uniq))
 	if len(uniq) == 0 {
 		return out, true
 	}
-	var rows map[string][]*Edge
-	if incoming {
-		rows = base.GetInEdgesByNodeIDs(uniq)
-	} else {
-		rows = base.GetOutEdgesByNodeIDs(uniq)
+	load := func(ids []string) map[string][]*Edge {
+		if incoming {
+			return base.GetInEdgesByNodeIDs(ids)
+		}
+		return base.GetOutEdgesByNodeIDs(ids)
+	}
+	// The bottom store's rows are kept per stack (unfiltered: the loop
+	// below filters them against the full stack, this delta's layer
+	// included).
+	rows, cached := dw.stackBaseAdjacency(uniq, incoming, load)
+	if !cached {
+		rows = load(uniq)
 	}
 	for _, id := range uniq {
 		for _, e := range rows[id] {
@@ -356,7 +367,11 @@ func (dw *DeltaWriter) composedEdgesByNodeIDs(ids []string, incoming, withDelta 
 // the working graph's rows, each kept only when no layer above hides it. ok
 // is false when a layer below has no generation-scoped projection.
 func (dw *DeltaWriter) composedEdgesByKind(kind EdgeKind) ([]*Edge, bool) {
-	s := dw.stack()
+	return dw.composeEdgesByKindOver(dw.stack(), kind)
+}
+
+// composeEdgesByKindOver is composedEdgesByKind over stack s.
+func (dw *DeltaWriter) composeEdgesByKindOver(s deltaStack, kind EdgeKind) ([]*Edge, bool) {
 	if s.base == nil {
 		return nil, false
 	}
@@ -448,7 +463,7 @@ func (dw *DeltaWriter) RepoEdgesByKinds(repoPrefixes []string, kinds []EdgeKind)
 	for i, l := range s.layers {
 		if p, ok := l.(OverlayLayerProjectionReader); ok {
 			layerRows := p.LayerRepoEdgesByKinds(repoPrefixes, kinds)
-			dw.noteLayerRows(len(layerRows))
+			dw.noteLayerRowsFor("repo_edges_by_kinds"+layerRowKinds(edgeKindNames(kinds)), len(layerRows))
 			for _, row := range layerRows {
 				if row.Edge != nil && s.edgeVisibleFrom(row.Edge, i+1) {
 					out = append(out, row)
@@ -519,6 +534,102 @@ func (dw *DeltaWriter) StackShape() []string {
 			name += "+projections"
 		}
 		out = append(out, name)
+	}
+	return out
+}
+
+// stackComposedFileNodes is composedFileNodesByPaths with the stack below
+// layer k kept per stack: a path's nodes as that immutable part composes them
+// are read once per stack (its per-path file-node read, the changed file's
+// prior graph among them), and every layer from k up — the dirty chain's and
+// the delta's own — is applied per read: its hiding and its detached rows, or,
+// for a path one of them covers, the delta's composed view as before. view is
+// the composed view below layer k.
+func (dw *DeltaWriter) stackComposedFileNodes(s deltaStack, k int, view Reader, base batchedFileNodesReader, paths []string) map[string][]*Node {
+	below := deltaStack{base: s.base, layers: s.layers[:k]}
+	var clean, own []string
+	for _, p := range UniqueRecordingPaths(paths) {
+		if p == "" {
+			continue
+		}
+		if s.coveredFrom(p, k) {
+			own = append(own, p)
+		} else {
+			clean = append(clean, p)
+		}
+	}
+	out := make(map[string][]*Node, len(paths))
+	if len(clean) > 0 {
+		kept := dw.baseCache.stackFileNodesByPath(clean, func(missing []string) map[string][]*Node {
+			return dw.composeFileNodesOver(below, base, view, missing)
+		})
+		for _, p := range clean {
+			for _, n := range kept[p] {
+				if n != nil && !s.hiddenAbove(n.ID, k) {
+					out[p] = append(out[p], n)
+				}
+			}
+			for i := k; i < len(s.layers); i++ {
+				for _, n := range dw.layerDetachedFileNodes(s.layers[i], p) {
+					if n != nil && !s.hiddenAbove(n.ID, i+1) {
+						out[p] = append(out[p], n)
+					}
+				}
+			}
+		}
+	}
+	for _, p := range own {
+		if nodes := dw.view.GetFileNodes(p); len(nodes) > 0 {
+			out[p] = nodes
+		}
+	}
+	for p, nodes := range out {
+		if len(nodes) == 0 {
+			delete(out, p)
+		}
+	}
+	return out
+}
+
+// composeFileNodesOver is the file-node composition over stack st whose
+// composed view is view: the bottom store's rows at paths no layer covers,
+// each layer's detached rows there, and the view's answer at covered paths.
+func (dw *DeltaWriter) composeFileNodesOver(st deltaStack, base batchedFileNodesReader, view Reader, paths []string) map[string][]*Node {
+	var clean, covered []string
+	for _, p := range paths {
+		if st.coveredByAny(p) {
+			covered = append(covered, p)
+		} else {
+			clean = append(clean, p)
+		}
+	}
+	out := make(map[string][]*Node, len(paths))
+	if len(clean) > 0 {
+		for p, nodes := range base.GetFileNodesByPaths(clean) {
+			for _, n := range nodes {
+				if n != nil && !st.hiddenAbove(n.ID, 0) {
+					out[p] = append(out[p], n)
+				}
+			}
+		}
+		for i, l := range st.layers {
+			detached, ok := l.(OverlayDetachedNodeReader)
+			if !ok {
+				continue
+			}
+			for _, p := range clean {
+				for _, n := range detached.DetachedFileNodes(p) {
+					if n != nil && !st.hiddenAbove(n.ID, i+1) {
+						out[p] = append(out[p], n)
+					}
+				}
+			}
+		}
+	}
+	for _, p := range covered {
+		if nodes := view.GetFileNodes(p); len(nodes) > 0 {
+			out[p] = nodes
+		}
 	}
 	return out
 }

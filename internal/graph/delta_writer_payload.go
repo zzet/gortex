@@ -207,11 +207,12 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 	for _, p := range covered {
 		nodes := dw.work.GetFileNodes(p)
 		edges := recordedAt[p]
-		if _, fixed := fixedPaths[p]; !fixed && belowRecorded != nil &&
-			deltaNodeSetsEqual(nodes, dw.below.GetFileNodes(p)) &&
-			deltaEdgeSetsEqual(edges, belowRecorded.RecordedEdgesAt([]string{p})) {
-			out.DroppedPaths++
-			continue
+		if _, fixed := fixedPaths[p]; !fixed && belowRecorded != nil {
+			belowNodes, belowEdges := dw.belowRowsAt([]string{p}, belowRecorded)
+			if deltaNodeSetsEqual(nodes, belowNodes[p]) && deltaEdgeSetsEqual(edges, belowEdges[p]) {
+				out.DroppedPaths++
+				continue
+			}
 		}
 		if len(nodes) == 0 {
 			emptied[p] = struct{}{}
@@ -397,6 +398,69 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 	return out
 }
 
+// BelowFileRows answers, for paths the view below holds, the rows it holds
+// there: its nodes at each path and the edges recorded at each path, as
+// Reader.GetFileNodes and RecordedEdgeReader.RecordedEdgesAt answer them.
+// ok=false for a path means the source does not hold it.
+type BelowFileRows interface {
+	BelowFileRows(path string) (nodes []*Node, recorded []*Edge, ok bool)
+}
+
+// SetBelowFileRows installs a source of the view below's rows at a path: the
+// payload's comparisons of a path against the view below read it instead of
+// composing the layers again.
+func (dw *DeltaWriter) SetBelowFileRows(source BelowFileRows) {
+	dw.writeMu.Lock()
+	dw.belowFileRows = source
+	dw.writeMu.Unlock()
+}
+
+// belowRowsAt is the view below's rows at paths, from the installed source
+// where it holds them and composed from the layers otherwise.
+func (dw *DeltaWriter) belowRowsAt(paths []string, recorded RecordedEdgeReader) (map[string][]*Node, map[string][]*Edge) {
+	nodes := make(map[string][]*Node, len(paths))
+	edges := make(map[string][]*Edge, len(paths))
+	var missing []string
+	for _, p := range paths {
+		if dw.belowFileRows != nil {
+			if n, e, ok := dw.belowFileRows.BelowFileRows(p); ok {
+				nodes[p], edges[p] = n, e
+				dw.noteBelowRowsServed(len(n) + len(e))
+				continue
+			}
+		}
+		missing = append(missing, p)
+	}
+	for _, p := range missing {
+		nodes[p] = dw.below.GetFileNodes(p)
+	}
+	if recorded != nil && len(missing) > 0 {
+		for _, e := range recorded.RecordedEdgesAt(missing) {
+			if e != nil {
+				edges[e.FilePath] = append(edges[e.FilePath], e)
+			}
+		}
+	}
+	return nodes, edges
+}
+
+// belowNodesAt is the view below's nodes at paths, from the installed source
+// where it holds them and read from the view below otherwise.
+func (dw *DeltaWriter) belowNodesAt(paths []string) map[string][]*Node {
+	out := make(map[string][]*Node, len(paths))
+	for _, p := range paths {
+		if dw.belowFileRows != nil {
+			if n, _, ok := dw.belowFileRows.BelowFileRows(p); ok {
+				out[p] = n
+				dw.noteBelowRowsServed(len(n))
+				continue
+			}
+		}
+		out[p] = dw.below.GetFileNodes(p)
+	}
+	return out
+}
+
 func inFinalPath(final map[string]struct{}, p string) bool {
 	_, ok := final[p]
 	return ok
@@ -405,9 +469,10 @@ func inFinalPath(final map[string]struct{}, p string) bool {
 // restatedRows counts the rows at replaced paths identical to the rows the
 // view below holds there.
 func (dw *DeltaWriter) restatedRows(paths []string, recordedAt map[string][]*Edge, below RecordedEdgeReader) (nodes, edges int) {
+	nodesAt, edgesAt := dw.belowRowsAt(paths, below)
 	belowNodes := make(map[string]*Node)
 	for _, p := range paths {
-		for _, n := range dw.below.GetFileNodes(p) {
+		for _, n := range nodesAt[p] {
 			if n != nil {
 				belowNodes[n.ID] = n
 			}
@@ -421,9 +486,11 @@ func (dw *DeltaWriter) restatedRows(paths []string, recordedAt map[string][]*Edg
 		}
 	}
 	belowEdges := make(map[edgeHash]*Edge)
-	for _, e := range below.RecordedEdgesAt(paths) {
-		if e != nil {
-			belowEdges[hashEdgeKey(keyOf(e))] = e
+	for _, p := range paths {
+		for _, e := range edgesAt[p] {
+			if e != nil {
+				belowEdges[hashEdgeKey(keyOf(e))] = e
+			}
 		}
 	}
 	for _, p := range paths {

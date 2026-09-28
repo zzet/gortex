@@ -130,6 +130,11 @@ type EditDeltaReport struct {
 	// SharedRowEmitters are the unchanged files the delta re-derived because
 	// a shared registry row's kept copy moved to them.
 	SharedRowEmitters []string
+	// LayerRowsByRead splits the delta's layer rows by the read that
+	// composed them; BelowRowsServed counts the rows the payload's
+	// comparisons took from the stack's below-rows source.
+	LayerRowsByRead map[string]int
+	BelowRowsServed int
 	// Dependents are the unchanged files the delta re-derived because the
 	// change can move their own rows (editDeltaDependents).
 	Dependents []string
@@ -147,6 +152,20 @@ type EditDeltaReport struct {
 	// major page faults the process took meanwhile.
 	// PhaseFaults are the major page faults per delta phase (Phases).
 	PhaseFaults map[string]int64
+	// ChainLayersOverlaid is how many dirty-chain layers the delta composed
+	// per read over the per-stack caches kept for the stack below them.
+	ChainLayersOverlaid int
+	// ChainKeeper is the per-layer keeper's counters after the delta:
+	// layers, rows, hits, loads, declined.
+	ChainKeeper [5]int
+	// carryRegistry files the delta's final contract registry under the
+	// published generation's stack (edit_delta_contract_cache.go); nil when
+	// the delta's registry was not keyed.
+	carryRegistry func(generation int64)
+	// StackCacheKey is the key the delta's per-stack caches were kept under
+	// (edit_delta_contract_cache.go), empty when the stack below has none.
+	StackCacheKey string
+
 	// PhaseWALBytes / PhaseWriteTx are the WAL bytes appended and the write
 	// transactions begun during each phase (process-wide, as PageFaults).
 	// ContractRegistryCached reports that the delta's contract registry came
@@ -160,10 +179,14 @@ type EditDeltaReport struct {
 	// WholeLayerLoads / WholeLayerRows: layers below read wholesale
 	// (graph.DeltaWriterStats).
 	WholeLayerLoads int
-	WholeLayerRows  int
-	LayerRowsRead   int
-	SlowReads       map[string]int
-	Phases          []GenerationPhase
+	// StackPathNodeHits / StackPathNodeMisses are this delta's per-path
+	// file-node reads served from, and loaded into, the stack's cache.
+	StackPathNodeHits   int
+	StackPathNodeMisses int
+	WholeLayerRows      int
+	LayerRowsRead       int
+	SlowReads           map[string]int
+	Phases              []GenerationPhase
 
 	ownership editDeltaOwnership
 }
@@ -314,6 +337,9 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)
 		}
+		if delta.carryRegistry != nil {
+			delta.carryRegistry(generationID)
+		}
 		report.Work.mark("publish")
 		markPublicationPhase(ctx, PublicationPublished)
 		published = true
@@ -405,13 +431,31 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		walLast, txLast = walNow, txNow
 	}
 	dw := graph.NewDeltaWriter(req.Base, handle)
+	// The per-stack caches (edit_delta_contract_cache.go). Over a dirty chain
+	// they are kept for the stack below it and the delta composes the chain's
+	// layers per read; keyBase is the base every key below is taken from, and
+	// cacheBase the view the caches are loaded from.
+	keyBase, cacheBase := installEditDeltaStackCache(dw, req.Base, b.Store)
+	out.ChainLayersOverlaid = dw.ChainLayers()
+	// The payload's comparisons read the view below's rows at the changed
+	// paths once per stack (edit_delta_below_rows.go).
+	if key, ok := editDeltaBaseCacheKey(keyBase, b.Store); ok {
+		source := editDeltaBelowRowsSource{key: key, base: cacheBase}
+		if dw.ChainLayers() > 0 {
+			source.chain = dw
+		}
+		dw.SetBelowFileRows(source)
+	}
 	var baseCache *graph.BaseProjectionCache
 	var baseFileHits, baseFileMisses, baseImportHits, baseImportMisses int
-	if key, ok := editDeltaBaseCacheKey(req.Base, b.Store); ok {
+	var pathNodeHits, pathNodeMisses int
+	if key, ok := editDeltaBaseCacheKey(keyBase, b.Store); ok {
+		out.StackCacheKey = key
 		baseCache = editDeltaBaseCache(key)
-		dw.SetBaseProjectionCache(baseCache)
 		baseFileHits, baseFileMisses, baseImportHits, baseImportMisses = baseCache.Stats()
+		pathNodeHits, pathNodeMisses = baseCache.StackFileNodeStats()
 	}
+	chainTouched := dw.ChainTouchedPaths()
 	idx := New(dw, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
@@ -440,9 +484,54 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	lap("open")
 	// The repository's contract registry as the view below holds it, kept
 	// across deltas over the same immutable stack (edit_delta_contract_cache.go).
-	if key, ok := editDeltaContractCacheKey(req.Base, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID); ok {
+	// The registry is kept for the whole stack below the delta, the chain
+	// included: it is not composed per read (edit_delta_contract_cache.go).
+	if key, ok := editDeltaRegistryKey(keyBase, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID); ok {
 		out.ContractRegistryCached = seedEditDeltaContractRegistry(idx, key)
 		lap("contract_registry")
+	}
+	// Prior rows without fingerprints are given their HEAD content's
+	// (edit_delta_prior_fingerprints.go).
+	if key, ok := editDeltaContractCacheKey(keyBase, b.Store, req.RepoPrefix, "", ""); ok && req.headProvenance != nil {
+		if absRoot, err := filepath.Abs(req.RootPath); err == nil {
+			idx.priorFingerprints = headPriorFingerprintsExcept(idx, absRoot, req.headProvenance.sha, key, func(rel string) bool {
+				_, touched := chainTouched[idx.prefixPath(rel)]
+				return touched
+			})
+		}
+	}
+	// The changed files' prior adjacency, kept the same way
+	// (edit_delta_prior_view.go).
+	if key, ok := editDeltaBaseCacheKey(keyBase, b.Store); ok {
+		setPriorEdgesSource(dw, editDeltaPriorEdges(dw, key))
+		defer setPriorEdgesSource(dw, nil)
+	}
+	// The stack's dependency-module contracts, kept the same way
+	// (edit_delta_dep_contracts.go).
+	if key, ok := editDeltaBaseCacheKey(keyBase, b.Store); ok {
+		installEditDeltaDeps(idx, key, append(append([]string(nil), plan.indexed...), plan.deleted...), chainTouched)
+	}
+	// The stack's callee parameter index (the dataflow pass), kept the same
+	// way (edit_delta_param_index.go); a path the chain speaks for is read
+	// like the change set's.
+	if key, ok := editDeltaBaseCacheKey(keyBase, b.Store); ok {
+		changed := make([]string, 0, len(plan.indexed)+len(plan.deleted))
+		for _, rel := range append(append([]string(nil), plan.indexed...), plan.deleted...) {
+			changed = append(changed, idx.prefixPath(rel))
+		}
+		idx.dataflowParams = newEditDeltaParamIndexOver(dw, key, changed)
+	}
+	// The stack's provides rows (the resolver's DI index), kept the same way
+	// (edit_delta_provides.go).
+	if key, ok := editDeltaBaseCacheKey(keyBase, b.Store); ok {
+		installEditDeltaProvides(idx, cacheBase, key, append(append([]string(nil), plan.indexed...), plan.deleted...))
+	}
+	// The stack's Go file inventory behind package ownership, kept the same
+	// way (edit_delta_go_ownership.go); read before the delta writes.
+	if key, ok := editDeltaContractCacheKey(keyBase, b.Store, req.RepoPrefix, "", ""); ok {
+		if primeEditDeltaGoOwnership(idx, key, append(append([]string(nil), plan.indexed...), plan.deleted...)) != nil {
+			lap("go_ownership_inventory")
+		}
 	}
 
 	absPaths := make([]string, 0, len(plan.indexed)+len(plan.deleted))
@@ -705,6 +794,8 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	out.SlowReads = stats.SlowReads
 	out.WholeLayerLoads, out.WholeLayerRows = stats.WholeLayerLoads, stats.WholeLayerRows
 	out.LayerRowsRead = stats.LayerRowsRead
+	out.LayerRowsByRead = stats.LayerRowsByRead
+	out.BelowRowsServed = stats.BelowRowsServed
 	out.PayloadNodes, out.PayloadEdges = len(payload.Nodes), len(payload.Edges)
 	out.ReplacePaths, out.DeletePaths = len(payload.ReplacePaths), len(payload.DeletePaths)
 	out.EdgeSources, out.Tombstones = len(payload.EdgeSources), len(payload.Tombstones)
@@ -738,6 +829,8 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Int("whole_layer_loads", out.WholeLayerLoads),
 			zap.Int("whole_layer_rows", out.WholeLayerRows),
 			zap.Int("layer_rows_read", out.LayerRowsRead),
+			zap.Any("layer_rows_by_read", out.LayerRowsByRead),
+			zap.Int("below_rows_served", out.BelowRowsServed),
 			zap.Int("resolve_frontier", out.ResolveFrontier),
 			zap.Float64("resolve_ms", float64(out.ResolveDuration.Microseconds())/1000),
 			zap.Int64("resolve_major_faults", out.ResolveFaults),
@@ -749,11 +842,39 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Any("phase_write_tx", out.PhaseWriteTx),
 			zap.Strings("stack", dw.StackShape()),
 		}
+		fields = append(fields, zap.Int("chain_layers_overlaid", out.ChainLayersOverlaid))
+		if keeper := dw.ChainLayerRowsKeeper(); keeper != nil {
+			layers, rows, hits, loads, declined := keeper.Counters()
+			out.ChainKeeper = [5]int{layers, rows, hits, loads, declined}
+			fields = append(fields, zap.Ints("chain_keeper_layers_rows_hits_loads_declined", []int{layers, rows, hits, loads, declined}))
+		}
 		if baseCache != nil {
 			fh, fm, ih, im := baseCache.Stats()
 			fields = append(fields,
 				zap.Int("base_file_index_hits", fh-baseFileHits), zap.Int("base_file_index_misses", fm-baseFileMisses),
 				zap.Int("base_import_hits", ih-baseImportHits), zap.Int("base_import_misses", im-baseImportMisses))
+			// The stack-level entries (the layers below the delta composed
+			// over the store), cumulative over the stack's deltas.
+			sih, sim := baseCache.StackStats()
+			sfh, sfm := baseCache.StackFileStats()
+			snh, snm := baseCache.StackNodeStats()
+			sah, sam := baseCache.StackNameStats()
+			srh, srm := baseCache.StackRefFactStats()
+			fields = append(fields, zap.Ints("stack_cache_hits_import_file_node_name_fact", []int{sih, sfh, snh, sah, srh}),
+				zap.Ints("stack_cache_misses_import_file_node_name_fact", []int{sim, sfm, snm, sam, srm}))
+			ph, pm := baseCache.StackFileNodeStats()
+			out.StackPathNodeHits, out.StackPathNodeMisses = ph-pathNodeHits, pm-pathNodeMisses
+			fields = append(fields, zap.Int("stack_path_node_hits", out.StackPathNodeHits),
+				zap.Int("stack_path_node_misses", out.StackPathNodeMisses))
+			// Cumulative over the stack's deltas (delta_writer_stack_recorded.go).
+			rh, rm := baseCache.StackRecordedEdgeStats()
+			fields = append(fields, zap.Int("stack_recorded_edge_hits", rh), zap.Int("stack_recorded_edge_misses", rm))
+			// Cumulative over the stack's deltas: the bottom store's
+			// adjacency (identities) and scoped rows (scopes) kept per stack.
+			bah, bam := baseCache.StackBaseAdjacencyStats()
+			bsh, bsm := baseCache.StackBaseScopedStats()
+			fields = append(fields, zap.Ints("stack_base_adjacency_scoped_hits", []int{bah, bsh}),
+				zap.Ints("stack_base_adjacency_scoped_misses", []int{bam, bsm}))
 		}
 		io := editDeltaProcessIO().since(ioStarted)
 		out.PageFaults, out.BlockReads = io.majorFaults, io.blockReads
@@ -761,6 +882,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		fields = append(fields, phaseFields("delta_", out.Phases)...)
 		b.Logger.Info("indexer: working-tree edit delta", fields...)
 	}
+	out.carryRegistry = editDeltaRegistryCarry(idx, req.Base, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID)
 	return out, nil
 }
 

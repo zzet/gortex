@@ -526,6 +526,13 @@ type Indexer struct {
 	// nothing changed what the file's references bind to). forcedReparse, by
 	// contrast, also drops the file's reuse snapshot.
 	reparseKeepingResolutions map[string]struct{}
+	// priorFingerprints, when set, supplies the content fingerprints of a
+	// changed file's prior rows when they carry none (a per-file delta over a
+	// stack written before fingerprints were stamped).
+	priorFingerprints func(absPath string, priorNodes []*graph.Node) (fileDeltaFingerprints, derivedFingerprints, bool)
+	// dataflowParams, when set, is the per-stack callee parameter index a
+	// per-file delta reads (edit_delta_param_index.go).
+	dataflowParams *editDeltaParamIndex
 	// deletionReparsePaths names the files (graph paths) the same batch
 	// re-derives from source; the deletion leaves their references to the
 	// reparse instead of parking them.
