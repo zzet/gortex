@@ -271,15 +271,13 @@ var walCopyWriteWrapper = func(tls *libc.TLS, pFile, pBuf uintptr, iAmt int32, i
 	}
 	// Only files of the wrapped table call here, so its original is the one.
 	fp := walCopyWriteOrig.Load()
-	return (*(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{fp})))(tls, pFile, pBuf, iAmt, iOfst)
-}
-
-// funcPointer is the C function pointer modernc's generated code calls for a
-// Go func value: the data word of an interface holding it (the same encoding
-// as the generated __ccgo_fp).
-func funcPointer(f any) uintptr {
-	type iface [2]uintptr
-	return (*iface)(unsafe.Pointer(&f))[1]
+	if !vfsIOInstalled.Load() {
+		return (*(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{fp})))(tls, pFile, pBuf, iAmt, iOfst)
+	}
+	start := time.Now()
+	rc := (*(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{fp})))(tls, pFile, pBuf, iAmt, iOfst)
+	noteVFSWrite(tls, pFile, iAmt, time.Since(start))
+	return rc
 }
 
 func fileAt(p uintptr) *sqlite3.Tsqlite3_file {
@@ -318,6 +316,13 @@ func driverConnHandles(dc any) (db uintptr, tls *libc.TLS, ok bool) {
 // mainFileMethods returns the io_methods table of the connection's main
 // database file.
 func mainFileMethods(db uintptr, tls *libc.TLS) (uintptr, error) {
+	return fileMethodsOf(db, tls, sqlite3.SQLITE_FCNTL_FILE_POINTER)
+}
+
+// fileMethodsOf returns the io_methods table of the file a file-control op
+// points at: FILE_POINTER (the main database) or JOURNAL_POINTER (the log in
+// WAL mode).
+func fileMethodsOf(db uintptr, tls *libc.TLS, op int32) (uintptr, error) {
 	name, err := libc.CString("main")
 	if err != nil {
 		return 0, err
@@ -326,12 +331,12 @@ func mainFileMethods(db uintptr, tls *libc.TLS) (uintptr, error) {
 	out := tls.Alloc(8)
 	defer tls.Free(8)
 	setUintptrAt(out, 0)
-	if rc := sqlite3.Xsqlite3_file_control(tls, db, name, sqlite3.SQLITE_FCNTL_FILE_POINTER, out); rc != sqlite3.SQLITE_OK {
-		return 0, fmt.Errorf("file_control(FILE_POINTER) rc=%d", rc)
+	if rc := sqlite3.Xsqlite3_file_control(tls, db, name, op, out); rc != sqlite3.SQLITE_OK {
+		return 0, fmt.Errorf("file_control(%d) rc=%d", op, rc)
 	}
 	pFile := uintptrAt(out)
 	if pFile == 0 {
-		return 0, fmt.Errorf("no main file")
+		return 0, fmt.Errorf("no file")
 	}
 	return fileAt(pFile).FpMethods, nil
 }
@@ -365,17 +370,25 @@ func installWALCopyPause() {
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		if _, err := conn.ExecContext(ctx, `PRAGMA user_version`); err != nil {
-			log.Printf("store_sqlite: wal copy pause not installed: %v", err)
-			return
+		// In WAL mode with one write, so the probe also has a log file open:
+		// its io_methods table (SQLite's lockless one for non-main files) is
+		// wrapped for the I/O counters (vfs_io_counters.go).
+		for _, q := range []string{`PRAGMA journal_mode=WAL`, `CREATE TABLE IF NOT EXISTS probe (v)`, `INSERT INTO probe VALUES (1)`} {
+			if _, err := conn.ExecContext(ctx, q); err != nil {
+				log.Printf("store_sqlite: wal copy pause not installed: %v", err)
+				return
+			}
 		}
-		var methods uintptr
+		var methods, walMethods uintptr
 		err = conn.Raw(func(dc any) error {
 			h, tls, ok := driverConnHandles(dc)
 			if !ok {
 				return fmt.Errorf("unrecognised driver connection %T", dc)
 			}
 			methods, err = mainFileMethods(h, tls)
+			if err == nil {
+				walMethods, _ = fileMethodsOf(h, tls, sqlite3.SQLITE_FCNTL_JOURNAL_POINTER)
+			}
 			return err
 		})
 		if err != nil || methods == 0 {
@@ -390,6 +403,9 @@ func installWALCopyPause() {
 		walCopyWriteOrig.Store(m.FxWrite)
 		m.FxWrite = wrapper
 		walCopyMethods.Store(methods)
+		probeTLS := libc.NewTLS()
+		installVFSIOCounters(probeTLS, methods, walMethods)
+		probeTLS.Close()
 		// The same table's xFetch (io_methods version 3) counts the pages
 		// served from the memory map (ReaderWaitMark.MappedPages).
 		if m.FiVersion >= 3 && m.FxFetch != 0 {

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	modernsqlite "modernc.org/sqlite"
 )
 
 // sqliteReadGate is the admission point every physical connection of the
@@ -69,6 +71,18 @@ type sqliteReadGate struct {
 	waits       atomic.Int64
 	waitNanos   atomic.Int64
 	maxWaitNano atomic.Int64
+
+	// Read-transaction accounting: the wall time from a pooled connection's
+	// first statement to its return to the pool (ReaderWaitMark.ReadTxn*).
+	readTxns  atomic.Int64
+	readNanos atomic.Int64
+
+	// Page-cache accounting, summed over the pool's connections: each read
+	// transaction's SQLITE_DBSTATUS_CACHE_HIT / _MISS / _SPILL, read with
+	// reset when the connection returns to the pool (ReaderWaitMark.Cache*).
+	cacheHits   atomic.Int64
+	cacheMisses atomic.Int64
+	cacheSpills atomic.Int64
 }
 
 func newSQLiteReadGate() *sqliteReadGate {
@@ -393,6 +407,11 @@ func (c *gatedConn) enter(ctx context.Context) error {
 
 func (c *gatedConn) release() {
 	if c.entered.CompareAndSwap(true, false) {
+		if since := c.since.Load(); since > 0 {
+			c.gate.readTxns.Add(1)
+			c.gate.readNanos.Add(time.Now().UnixNano() - since)
+		}
+		c.gate.collectCacheCounters(c.inner)
 		c.gate.untrack(c)
 		c.gate.leaveEpoch(c.epoch)
 	}
@@ -599,4 +618,30 @@ func (g *sqliteReadGate) oldestOlderThan(epoch uint64, now time.Time) (activeRea
 		}
 	}
 	return best, found
+}
+
+// collectCacheCounters adds a connection's page-cache counters since its last
+// read transaction to the gate's sums and resets them. It runs when the
+// connection returns to the pool, with no statement active on it.
+//
+// What they count: a page SQLite looks up in the connection's page cache,
+// found (hit) or read with a pread from the log or the database file (miss),
+// or a dirty page written out to make room (spill). A page served from the
+// memory map (the first mmap_size bytes of the database file, when its latest
+// version is not in the log) bypasses the page cache and is in neither count;
+// sqliteMappedPages counts those.
+func (g *sqliteReadGate) collectCacheCounters(inner driver.Conn) {
+	st, ok := inner.(modernsqlite.DBStatus)
+	if !ok {
+		return
+	}
+	if n, _, err := st.Status(modernsqlite.DBStatusCacheHit, true); err == nil {
+		g.cacheHits.Add(int64(n))
+	}
+	if n, _, err := st.Status(modernsqlite.DBStatusCacheMiss, true); err == nil {
+		g.cacheMisses.Add(int64(n))
+	}
+	if n, _, err := st.Status(modernsqlite.DBStatusCacheSpill, true); err == nil {
+		g.cacheSpills.Add(int64(n))
+	}
 }

@@ -97,6 +97,8 @@ type storeCore struct {
 	walReclaim walReclaimState
 	// walCopy is the reclaim copy's budget and counters (wal_copy_pause.go).
 	walCopy walCopyState
+	// writerCache sums the writer connection's page-cache counters.
+	writerCache writerCacheCounters
 	// walReclaimRequestedAt: when a writer refused on the log's size last
 	// asked for the reclaim (wal_reclaim_pressure.go), unix nanos.
 	walReclaimRequestedAt atomic.Int64
@@ -727,6 +729,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// it), which is how a 535 MB DB ends up with an 11 GB -wal. This bounds
 	// the file even between the explicit TRUNCATE checkpoints runCheckpointLoop
 	// issues, and even if that loop is not running.
+	installSQLiteSleepGauge()
 	installWALCopyPause()
 	writerDSN := sqliteWriterDSN(path)
 	db, err := sql.Open("sqlite", writerDSN)
@@ -920,6 +923,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// own mutex-guarded maps, not on the Store field. The cache stays
 	// inert (every lookup a miss) until the daemon supplies fingerprints.
 	s.bundles = newBundleCache()
+	s.installWriterCacheCounters()
 	if err := s.initAnalysisGenerationState(); err != nil {
 		_ = closeSQLitePools(readDB, db)
 		return nil, fmt.Errorf("sqlite analysis generation state: %w", err)
