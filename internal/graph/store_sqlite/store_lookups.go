@@ -555,9 +555,12 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 
 // The three candidate-query builders are pure string assembly (no I/O) so
 // the plan-lock test can EXPLAIN the exact SQL GetEdgeCandidates executes
-// (store_bfs.go precedent). Every shape drives the edges side of the VALUES
-// join through edges_by_from(from_id, kind); the wanted CTE is the scanned
-// side by construction.
+// (store_bfs.go precedent). The wanted CTE is the scanned side by construction.
+// Endpoint batches CROSS JOIN to the logical endpoint unique index
+// (from_id,to_id): +view_gen remains a residual filter, so generation-first
+// edges_by_from cannot turn a hot source into the probe's fan-out. Exact and
+// any-site batches use their ordinary view_gen predicates and therefore seek
+// the generation-first (view_gen,from_id,line[,kind]) site prefixes.
 
 func edgeCandidatesValues(rows int, row string) string {
 	return strings.TrimSuffix(strings.Repeat(row+",", rows), ",")
@@ -569,11 +572,17 @@ func edgeCandidatesValues(rows int, row string) string {
 // are still the ones the planner sees first.
 
 func edgeCandidatesEndpointQuery(pairs int) string {
+	// Unary + keeps the generation predicate while preventing SQLite from
+	// preferring a target-only index over the logical endpoint-key index.
+	// view_gen is stored as INTEGER and this path binds Store.viewGen as int64.
+	// The former target index yielded each endpoint bucket by kind then row ID;
+	// preserve that order because EdgeCandidateSet's first-match accessors use it.
 	return `WITH wanted(from_id, to_id) AS (VALUES ` + edgeCandidatesValues(pairs, "(?, ?)") + `)
 	      SELECT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.to_id = w.to_id
-	       WHERE e.view_gen = ?`
+	        CROSS JOIN edges AS e INDEXED BY sqlite_autoindex_edges_1 ON e.from_id = w.from_id AND e.to_id = w.to_id
+	       WHERE +e.view_gen = ?
+	       ORDER BY e.kind, e.id`
 }
 
 func edgeCandidatesExactSiteQuery(triples int) string {
