@@ -181,6 +181,9 @@ type dirtyChainCompactor struct {
 	// forceDirect sends the next working-tree build direct: an inline fold
 	// failed its background verification.
 	forceDirect atomic.Bool
+	// starvation is a test seam: how long a stepped fold may go without a
+	// committed step (0: dirtyChainFoldStarvation).
+	starvation time.Duration
 }
 
 // CompactionInFlight reports whether a chain fold of this checkout holds the

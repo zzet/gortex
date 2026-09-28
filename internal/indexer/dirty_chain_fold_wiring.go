@@ -115,11 +115,11 @@ func (c *CheckoutCoordinator) copyChainInSteps(ctx context.Context, oldestFirst 
 		hook(ctx, 0)
 	}
 	started := time.Now()
-	steps, retries, err := runChainFoldSteps(ctx, fold, backend.StepRetryable, func(step int) {
+	steps, retries, err := runChainFoldStepsWatched(ctx, fold, backend.StepRetryable, func(step int) {
 		if hook != nil {
 			hook(ctx, step)
 		}
-	})
+	}, c.newFoldStepWatch(to))
 	var counts store_sqlite.GenerationCopyCounts
 	if stepped, ok := fold.(interface {
 		Counts() (store_sqlite.GenerationCopyCounts, int, int)
@@ -271,7 +271,8 @@ func (c *CheckoutCoordinator) compactDirtyChainStepped(
 		}
 	case ctx.Err() != nil:
 		report.Outcome, report.Canceled = dirtyChainCompactionCanceled, true
-	case errors.Is(err, errFlattenRefused), errors.Is(err, store_sqlite.ErrChainFoldBusy), errors.Is(err, store_sqlite.ErrChainFoldStale):
+	case errors.Is(err, errFlattenRefused), errors.Is(err, store_sqlite.ErrChainFoldBusy), errors.Is(err, store_sqlite.ErrChainFoldStale),
+		errors.Is(err, errChainFoldStarved):
 		c.logger.Debug("checkout coordinator: stepped chain fold refused; the chain stays routed",
 			zap.String("checkout", c.checkoutID), zap.Error(err))
 		report.Outcome, report.Err = dirtyChainCompactionFoldRefused, err

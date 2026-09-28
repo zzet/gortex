@@ -33,7 +33,10 @@ import (
 //   - an edit chains above the chain, a running fold or not, up to the
 //     physical cap; only at the cap does it fold in its own cycle, as the last
 //     resort, bounded in time and unverified (chainBoundAction,
-//     dirty_chain_fold_bound.go).
+//     dirty_chain_fold_bound.go);
+//   - a step the store refuses or gives back is asked for again, the refusals
+//     are logged by reason, and a fold that makes no progress for
+//     dirtyChainFoldStarvation gives up (foldStepWatch).
 
 // foldStepRetryPoll is how long the driver waits before it asks for the next
 // step after the store gave a step back to an edit or refused one on a WAL
@@ -77,30 +80,7 @@ type chainFoldBackend interface {
 // refuses on a WAL mark is asked for again after foldStepRetryPoll. A ctx that
 // ends leaves the fold resumable within the process (Release it, or keep it).
 func runChainFoldSteps(ctx context.Context, fold chainFoldSteps, retryable func(error) bool, afterStep func(step int)) (steps, retries int, err error) {
-	for {
-		done, err := fold.Step(ctx)
-		if err != nil {
-			if ctx.Err() == nil && retryable != nil && retryable(err) {
-				retries++
-				timer := time.NewTimer(foldStepRetryPoll)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return steps, retries, ctx.Err()
-				case <-timer.C:
-				}
-				continue
-			}
-			return steps, retries, err
-		}
-		steps++
-		if afterStep != nil {
-			afterStep(steps)
-		}
-		if done {
-			return steps, retries, nil
-		}
-	}
+	return runChainFoldStepsWatched(ctx, fold, retryable, afterStep, nil)
 }
 
 // foldLanding is how a finished fold enters the route.
