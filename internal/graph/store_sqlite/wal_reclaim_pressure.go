@@ -36,6 +36,9 @@ import (
 var (
 	// walReclaimPressureHold caps the writer step taken inside a busy lane.
 	walReclaimPressureHold = 50 * time.Millisecond
+	// walReclaimPressureWriterWait bounds how long that step queues for the
+	// writer.
+	walReclaimPressureWriterWait = 3 * time.Second
 	// walReclaimResetHold caps every other hold of the writer the reclaim
 	// takes (the last copy and the reset); the wait for readers never holds
 	// it.
@@ -80,16 +83,28 @@ func (s *Store) RequestWALReclaim() {
 	}
 	s.walReclaimRequestedAt.Store(time.Now().UnixNano())
 	s.walReclaimNudged.Store(true)
+	// Wake the loop now rather than at its next poll (5 s).
+	if wake := s.walReclaimWake.Load(); wake != nil {
+		select {
+		case *wake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // walReclaimRequested reports a request inside its window with the log over
 // the reclaim threshold.
 func (s *Store) walReclaimRequested(now time.Time, size int64, cfg walReclaimConfig) bool {
-	at := s.walReclaimRequestedAt.Load()
-	if at == 0 || now.Sub(time.Unix(0, at)) > walReclaimRequestWindow {
+	return s.walReclaimRequestPending(now) && cfg.thresholdBytes > 0 && size > cfg.thresholdBytes
+}
+
+// walReclaimRequestPending reports a request inside its window.
+func (s *Store) walReclaimRequestPending(now time.Time) bool {
+	if s.coreless() {
 		return false
 	}
-	return cfg.thresholdBytes > 0 && size > cfg.thresholdBytes
+	at := s.walReclaimRequestedAt.Load()
+	return at != 0 && now.Sub(time.Unix(0, at)) <= walReclaimRequestWindow
 }
 
 // walPressureMark is the log size over which the reclaim runs through a busy
@@ -110,9 +125,11 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 	if c := res.convergence; c != nil && c.rateFramesPerS > 0 {
 		allowed = max(allowed, uint32(c.rateFramesPerS*(walReclaimPressureHold/2).Seconds()))
 	}
-	// The writer: an edit that holds it keeps it; this waits at most the
-	// hold cap for it, then gives up.
-	wctx, wcancel := context.WithTimeout(ctx, walReclaimPressureHold)
+	// The writer: an edit that holds it keeps it; this queues for it up to
+	// walReclaimPressureWriterWait (one edit statement holds the gate for up
+	// to about 2.4 s in a burst), then gives up. The hold itself stays
+	// walReclaimPressureHold.
+	wctx, wcancel := context.WithTimeout(ctx, walReclaimPressureWriterWait)
 	err := s.writeMu.LockContext(wctx)
 	wcancel()
 	if err != nil {

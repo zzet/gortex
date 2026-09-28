@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,6 +106,124 @@ func TestARefusedFoldGetsTheReclaimInsideABusyLane(t *testing.T) {
 	require.Positive(t, after.PressureResets-before.PressureResets)
 }
 
+// A pass that began in a gap between edits and was paused by the next edit
+// holds the loop inside its attempt. A writer refused on the log's size then
+// asks for the reclaim: the pass stops pausing at the request, its attempt
+// ends, and the loop runs the pressure attempt that resets the log inside the
+// busy lane. Without that the request waits for the pause cap (3 min).
+// Scaled as the test above; the log sits between the fold's mark and the
+// pressure mark, where only a request lets the reclaim through the lane.
+func TestARequestEndsAPausedCopy(t *testing.T) {
+	prevMark := chainFoldWALMarkEditing
+	chainFoldWALMarkEditing = 4 << 20
+	t.Cleanup(func() { chainFoldWALMarkEditing = prevMark })
+	s, _, lane := pressureStore(t, 0)
+	fold := beginTestFold(t, s)
+	logBytes := func() int64 {
+		m := s.WALWriteMark()
+		return int64(m.MxFrame) * (int64(m.PageSize) + walFrameHeaderBytes)
+	}
+	// Catch a pass mid-copy: grow the log with the lane held (nothing
+	// reclaims it), free the lane until the loop's next pass has begun, and
+	// hold it again. A pass that finished first (the log reset) or had not
+	// begun is tried again.
+	caught := false
+	for try := 0; try < 50 && !caught; try++ {
+		lane.held.Store(true)
+		for k := 0; logBytes() <= 12<<20 && k < 256; k++ {
+			require.NoError(t, churnWriteOnce(s, k))
+		}
+		require.Less(t, logBytes(), int64(16<<20), "precondition: under the pressure mark")
+		lane.held.Store(false)
+		for wait := time.Now().Add(2 * time.Second); time.Now().Before(wait) && walCopyPacersActive.Load() == 0; {
+			time.Sleep(20 * time.Microsecond)
+		}
+		lane.held.Store(true)
+		time.Sleep(100 * time.Millisecond)
+		caught = walCopyPacersActive.Load() > 0 && logBytes() > 4<<20
+	}
+	require.True(t, caught, "precondition: a pass paused by the lane")
+	before := s.WALCopyStats()
+	done, refusals := stepFoldAgainstABusyLane(t, s, lane, fold, 20*time.Second)
+	after := s.WALCopyStats()
+	t.Logf("fold done=%t refusals=%d request_resumed_passes=%d pressure_runs=%d pressure_resets=%d",
+		done, refusals, after.RequestResumedPasses-before.RequestResumedPasses, after.PressureRuns-before.PressureRuns, after.PressureResets-before.PressureResets)
+	require.True(t, done, "the fold waited on a paused copy")
+	require.Positive(t, refusals, "precondition: the fold was refused at first")
+	require.Positive(t, after.RequestResumedPasses-before.RequestResumedPasses, "the paused pass did not end at the request")
+	require.Positive(t, after.PressureResets-before.PressureResets)
+}
+
+// An attempt that began before the lane's predicate was installed (the
+// daemon installs it after Open; a test store installs it after seeding) is
+// not watched and its passes do not pause. If an edit then holds the lane, it
+// waits inside the edit for a gap: its writer-free rounds go on until the
+// reader wait (30 s) runs out, and the loop, inside it, serves no request. A
+// writer refused on the log's size now ends such an attempt, and the loop
+// runs the pressure attempt that resets the log inside the busy lane. Scaled
+// as the tests above.
+func TestARequestEndsAnAttemptWaitingForAGap(t *testing.T) {
+	prevMark := chainFoldWALMarkEditing
+	chainFoldWALMarkEditing = 4 << 20
+	t.Cleanup(func() { chainFoldWALMarkEditing = prevMark })
+	// Every PASSIVE is counted; an armed observer installs the lane's
+	// predicate at the next one, so the attempt that ran it began without
+	// it and is inside an edit from then on.
+	var passives atomic.Int64
+	var armed atomic.Bool
+	var store atomic.Pointer[Store]
+	var laneRef atomic.Pointer[fakeBuildLane]
+	prevObserver := walCheckpointCallObserver
+	walCheckpointCallObserver = func(mode string, _ time.Time, _ time.Duration) {
+		if mode != "PASSIVE" {
+			return
+		}
+		passives.Add(1)
+		if armed.CompareAndSwap(true, false) {
+			if st, l := store.Load(), laneRef.Load(); st != nil && l != nil {
+				l.install(st)
+			}
+		}
+	}
+	t.Cleanup(func() { walCheckpointCallObserver = prevObserver })
+	s, _, lane := pressureStore(t, 0)
+	store.Store(s)
+	laneRef.Store(lane)
+	fold := beginTestFold(t, s)
+	logBytes := func() int64 {
+		m := s.WALWriteMark()
+		return int64(m.MxFrame) * (int64(m.PageSize) + walFrameHeaderBytes)
+	}
+	caught := false
+	for try := 0; try < 20 && !caught; try++ {
+		lane.held.Store(true)
+		for k := 0; logBytes() <= 8<<20 && k < 256; k++ {
+			require.NoError(t, churnWriteOnce(s, k))
+		}
+		require.Less(t, logBytes(), int64(16<<20), "precondition: under the pressure mark")
+		armed.Store(true)
+		s.SetBuildLaneBusy(nil) // the next attempt begins without the predicate
+		for wait := time.Now().Add(2 * time.Second); time.Now().Before(wait) && armed.Load(); {
+			time.Sleep(100 * time.Microsecond)
+		}
+		if armed.Swap(false) {
+			lane.install(s)
+		}
+		time.Sleep(100 * time.Millisecond)
+		mid := passives.Load()
+		time.Sleep(100 * time.Millisecond)
+		caught = passives.Load() > mid && logBytes() > 4<<20
+	}
+	require.True(t, caught, "precondition: an attempt waiting for a gap inside the edit")
+	before := s.WALCopyStats()
+	done, refusals := stepFoldAgainstABusyLane(t, s, lane, fold, 20*time.Second)
+	after := s.WALCopyStats()
+	t.Logf("fold done=%t refusals=%d pressure_runs=%d pressure_resets=%d", done, refusals, after.PressureRuns-before.PressureRuns, after.PressureResets-before.PressureResets)
+	require.True(t, done, "the fold waited on an attempt waiting for a gap")
+	require.Positive(t, refusals, "precondition: the fold was refused at first")
+	require.Positive(t, after.PressureResets-before.PressureResets)
+}
+
 // The same with the daemon's defaults: no environment override, the
 // production marks (256 MiB for the fold while editing, 256 MiB reclaim
 // threshold, 1 GiB pressure mark), budget and 5 s poll. Only the lane and the
@@ -135,7 +254,7 @@ func TestARefusedFoldGetsTheReclaimWithTheDaemonDefaults(t *testing.T) {
 // 440 MB/min of measured edit bursts). The log is reset inside the busy lane and
 // its size in frames stays under the mark plus one attempt. It writes more
 // than 1 GiB, so it runs only with GORTEX_STORE_DEFAULTS_BURST=1: once per
-// window, not in the ordinary suite.
+// measurement run, not in the ordinary suite.
 func TestReclaimResetsDuringABurstWithTheDaemonDefaults(t *testing.T) {
 	if os.Getenv("GORTEX_STORE_DEFAULTS_BURST") != "1" {
 		t.Skip("set GORTEX_STORE_DEFAULTS_BURST=1 (writes a >1 GiB log)")

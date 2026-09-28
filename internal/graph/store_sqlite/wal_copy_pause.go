@@ -55,6 +55,11 @@ import (
 //   - a pass stops pausing after walCopyPauseMax of pausing in total (it then
 //     copies under the budget below, lane or not), and a leaked announcement
 //     stops counting as busy after editIntentStandDownMax anyway;
+//   - a pass stops pausing, and does not pause again, at the pressure mark
+//     and while a reclaim request is pending (RequestWALReclaim): the loop is
+//     inside this pass's attempt, so a writer refused on the log's size would
+//     otherwise wait for the pause cap before the loop could run the attempt
+//     it asked for;
 //   - between edits, while the checkout is being edited (the lane was busy
 //     within walCopyEditSession), the copy is limited to walCopyBudget bytes
 //     written to the database file per minute; idle, it runs at full speed;
@@ -115,7 +120,9 @@ type walCopyState struct {
 	written   atomic.Int64 // bytes the paced passes wrote to the database file
 	whileBusy atomic.Int64 // bytes written while the lane was busy (after the pause cap)
 	overruns  atomic.Int64 // passes that hit walCopyPauseMax
-	discarded atomic.Int64 // attempts that ended with a pass cut short (any pass, any cause)
+	// requestResumes: passes that stopped pausing for a reclaim request.
+	requestResumes atomic.Int64
+	discarded      atomic.Int64 // attempts that ended with a pass cut short (any pass, any cause)
 	// Pressure mode (wal_reclaim_pressure.go): attempts run through a busy
 	// lane, resets taken inside it, and resets given up for the hold cap.
 	pressureRuns, pressureResets, pressureGiveUps atomic.Int64
@@ -195,6 +202,17 @@ func (p *walCopyPacer) stopped() bool {
 	}
 }
 
+// resumeForRequest ends the pass's pausing for a pending reclaim request. The
+// pass then completes (paced by the budget as between edits), its attempt
+// ends at the next pass that would start inside the edit, and the loop, woken
+// by the request, runs the pressure attempt that resets the log through the
+// busy lane. The backfill this pass completes is kept.
+func (p *walCopyPacer) resumeForRequest() {
+	p.overran = true
+	p.store.walCopy.requestResumes.Add(1)
+	log.Printf("store_sqlite: wal reclaim copy resumed despite the lane at a reclaim request wal_bytes=%d", walFileSize(p.walPath))
+}
+
 // beforeWrite runs before each page write of the pass. The lane is checked
 // once per page, so an edit that begins between the check and the write lets
 // that one page through; every later page waits.
@@ -204,6 +222,10 @@ func (p *walCopyPacer) beforeWrite(n int64) {
 	if busy && p.hardCapBytes > 0 && !p.overran && walFileSize(p.walPath) >= p.hardCapBytes {
 		// Already over the mark: the pass does not pause at all.
 		p.overran = true
+	}
+	if busy && !p.noPause && !p.overran && st.walReclaimRequestPending(time.Now()) {
+		// A request is pending: the pass does not pause at all.
+		p.resumeForRequest()
 	}
 	if busy && !p.noPause && !p.overran && !p.stopped() && !walCopyInterruptInsteadOfPause {
 		start := time.Now()
@@ -219,6 +241,10 @@ func (p *walCopyPacer) beforeWrite(n int64) {
 				p.overran = true
 				st.walCopy.overruns.Add(1)
 				log.Printf("store_sqlite: wal reclaim copy resumed despite the lane at the pressure mark wal_bytes=%d mark=%d", walFileSize(p.walPath), p.hardCapBytes)
+				break
+			}
+			if st.walReclaimRequestPending(time.Now()) {
+				p.resumeForRequest()
 				break
 			}
 			time.Sleep(walCopyPausePoll)
@@ -563,6 +589,9 @@ type WALCopyStats struct {
 	PressureRuns, PressureResets, PressureGiveUps, PressureLaneResets            int64
 	Paused, BudgetWait                                                           time.Duration
 	WrittenBytes, WrittenWhileBusyBytes                                          int64
+
+	// RequestResumedPasses: passes that stopped pausing for a reclaim request.
+	RequestResumedPasses int64
 }
 
 // WALCopyStats returns the paced copy's counters.
@@ -574,8 +603,8 @@ func (s *Store) WALCopyStats() WALCopyStats {
 	return WALCopyStats{
 		Passes: c.passes.Load(), PausedPasses: c.paused.Load(), PauseCapOverruns: c.overruns.Load(), DiscardedPasses: c.discarded.Load(), PacedPassesCutShort: c.pacedDiscarded.Load(),
 		PressureRuns: c.pressureRuns.Load(), PressureResets: c.pressureResets.Load(), PressureGiveUps: c.pressureGiveUps.Load(),
-		PressureLaneResets: c.pressureLaneResets.Load(),
-		Paused:             time.Duration(c.pauseNs.Load()), BudgetWait: time.Duration(c.budgetNs.Load()),
+		PressureLaneResets: c.pressureLaneResets.Load(), RequestResumedPasses: c.requestResumes.Load(),
+		Paused: time.Duration(c.pauseNs.Load()), BudgetWait: time.Duration(c.budgetNs.Load()),
 		WrittenBytes: c.written.Load(), WrittenWhileBusyBytes: c.whileBusy.Load(),
 	}
 }

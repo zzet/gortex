@@ -680,6 +680,12 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			}
 			result, perr := s.pacedPassive(pctx, ckptDB, attempt)
 			pcancel()
+			if s.walAttemptHandsOverToRequest(&res) {
+				// A request is pending and this attempt may not reset inside
+				// the busy lane: hand over to the loop (below).
+				res.openGateWaited = time.Since(started)
+				break
+			}
 			if wctx.Err() != nil && attempt.ctx.Err() == nil && !errors.Is(perr, errWALCheckpointYieldedToCycle) {
 				res.lastResort = true // the log reached the last resort's mark
 			}
@@ -749,6 +755,11 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			}
 		}
 	}
+	if !res.resetWriterFree && s.walAttemptHandsOverToRequest(&res) {
+		res.outcome, res.reason = walReclaimSkipped, "reclaim_request"
+		res.bytesAfter = walFileSize(walPath)
+		return res
+	}
 	if res.resetWriterFree {
 		res.openGate = true
 		res.outcome = walReclaimReset
@@ -773,6 +784,11 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	}
 	if attempt.copy != nil && attempt.copy.pausable.Load() && !attempt.copy.pressure && s.buildLaneBusy() {
 		res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
+		res.bytesAfter = walFileSize(walPath)
+		return res
+	}
+	if s.walAttemptHandsOverToRequest(&res) {
+		res.outcome, res.reason = walReclaimSkipped, "reclaim_request"
 		res.bytesAfter = walFileSize(walPath)
 		return res
 	}
@@ -832,6 +848,17 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		res.outcome = walReclaimFailed
 	}
 	return res
+}
+
+// walAttemptHandsOverToRequest reports an attempt that should end so the loop
+// can serve a reclaim request: one that may not reset inside a busy lane
+// (neither pressure nor hard cap), while an edit holds the lane and a writer
+// refused on the log's size has asked for the reclaim. Without it such an
+// attempt goes on waiting for a gap between edits (its writer-free rounds
+// until the reader wait runs out) while the loop, inside it, cannot run the
+// pressure attempt the request asked for.
+func (s *Store) walAttemptHandsOverToRequest(res *walReclaimResult) bool {
+	return !res.pressure && !res.hardCap && s.buildLaneBusy() && s.walReclaimRequestPending(time.Now())
 }
 
 func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult) error {
@@ -1173,9 +1200,12 @@ func (s *Store) startWALReclaimLoop(walPath string) (join func()) {
 		st.CeilingBytes = cfg.ceilingBytes
 	})
 	done := make(chan struct{})
+	wake := make(chan struct{}, 1)
+	s.walReclaimWake.Store(&wake)
 	s.walReclaim.cycle.loopThreshold.Store(cfg.thresholdBytes)
 	go func() {
 		defer s.walReclaim.cycle.loopThreshold.Store(0)
+		defer s.walReclaimWake.Store(nil)
 		s.runWALReclaimLoop(cfg, walPath, walReclaimPollInterval, done)
 	}()
 	return func() { <-done }
@@ -1195,11 +1225,16 @@ func (s *Store) runWALReclaimLoop(cfg walReclaimConfig, walPath string, poll tim
 	var skipLog walReclaimSkipLog
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
+	var wake chan struct{}
+	if w := s.walReclaimWake.Load(); w != nil {
+		wake = *w
+	}
 	for {
 		select {
 		case <-s.stopCheckpoint:
 			return
 		case <-ticker.C:
+		case <-wake: // a request (RequestWALReclaim): attempt now
 		}
 		now := time.Now()
 		if s.walReclaimNudged.Swap(false) {

@@ -153,6 +153,9 @@ type storeCore struct {
 	// walReclaimNudged asks the WAL reclaim loop to attempt at its next poll
 	// regardless of backoff (a residue drain handed it a busy TRUNCATE).
 	walReclaimNudged atomic.Bool
+	// walReclaimWake wakes the reclaim loop at a request (RequestWALReclaim)
+	// instead of at its next poll; nil while no loop runs.
+	walReclaimWake atomic.Pointer[chan struct{}]
 	// writeIntents counts mutations announced through AnnounceWrite.
 	writeIntents atomic.Int32
 	// intentsSince is when writeIntents last rose from zero (unix nanos, 0
