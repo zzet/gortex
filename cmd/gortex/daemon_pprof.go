@@ -5,6 +5,8 @@ import (
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof/* on http.DefaultServeMux
 	"os"
+	"runtime"
+	"strconv"
 	"sync/atomic"
 
 	"go.uber.org/zap"
@@ -57,6 +59,7 @@ func startPProfIfEnabled(logger *zap.Logger) {
 	}
 	bound := ln.Addr().String()
 	pprofAddr.Store(bound)
+	applyContentionProfiling(logger, os.Getenv, runtime.SetBlockProfileRate, runtime.SetMutexProfileFraction)
 	logger.Info("daemon: pprof endpoint open",
 		zap.String("addr", bound),
 		zap.String("hint", "go tool pprof -http=: http://"+bound+"/debug/pprof/heap"))
@@ -66,4 +69,22 @@ func startPProfIfEnabled(logger *zap.Logger) {
 			logger.Warn("daemon: pprof serve exited", zap.Error(err))
 		}
 	}()
+}
+
+// applyContentionProfiling turns on the block and mutex profiles the pprof
+// listener serves (/debug/pprof/block, /debug/pprof/mutex) when asked:
+// GORTEX_DAEMON_BLOCK_PROFILE_RATE is runtime.SetBlockProfileRate's rate (a
+// blocking event of that many nanoseconds or longer is sampled) and
+// GORTEX_DAEMON_MUTEX_PROFILE_FRACTION is runtime.SetMutexProfileFraction's.
+// Both are off by default: they cost on every contended operation, and they
+// exist to attribute a stall, not to run all the time.
+func applyContentionProfiling(logger *zap.Logger, getenv func(string) string, setBlock func(int), setMutex func(int) int) {
+	if rate, err := strconv.Atoi(getenv("GORTEX_DAEMON_BLOCK_PROFILE_RATE")); err == nil && rate > 0 {
+		setBlock(rate)
+		logger.Info("daemon: block profile on", zap.Int("rate_ns", rate))
+	}
+	if fraction, err := strconv.Atoi(getenv("GORTEX_DAEMON_MUTEX_PROFILE_FRACTION")); err == nil && fraction > 0 {
+		setMutex(fraction)
+		logger.Info("daemon: mutex profile on", zap.Int("fraction", fraction))
+	}
 }
