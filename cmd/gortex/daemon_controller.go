@@ -1840,6 +1840,10 @@ const (
 // base corpus answers and the response carries no view block at all, which is
 // what every client that predates routed views sends and still receives.
 func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
+	}
+
 	// No mu: graph is write-once at construction (see the field comment), and
 	// this is the probe path a hook calls on a sub-second budget. Taking mu
 	// here is what made it wait out an in-flight reindex.
@@ -1854,6 +1858,9 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 	// receives outlives the generations that produced it.
 	view := c.resolveProbeView(ctx, p.Path)
 	defer view.release()
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
+	}
 	if !view.servable {
 		// A registered working copy with no composed view. Reporting the
 		// primary's symbols would cite another working copy's code as
@@ -1879,7 +1886,11 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 	// a hash bucket per shard, so this is a handful of map lookups rather
 	// than a walk over every name in the graph — the difference between
 	// microseconds and blowing the hook's probe budget on a large graph.
-	for _, n := range g.FindNodesByName(p.Query) {
+	candidates, err := graph.FindNodesByNameContext(ctx, g, p.Query)
+	if err != nil {
+		return daemon.SearchSymbolsResult{}, err
+	}
+	for _, n := range candidates {
 		if !probeSymbolCandidate(n, p.Repo) {
 			continue
 		}
@@ -1887,6 +1898,9 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 		if len(hits) >= limit {
 			break
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
 	}
 	if len(hits) > 0 {
 		return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
@@ -1908,10 +1922,16 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 		fetch = limit * searchSymbolsRepoFetchFactor
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return daemon.SearchSymbolsResult{}, err
+		}
 		if fetch > searchSymbolsMaxFetch {
 			fetch = searchSymbolsMaxFetch
 		}
-		candidates := g.FindNodesByNameContaining(p.Query, fetch)
+		candidates, err = graph.FindNodesByNameContainingContext(ctx, g, p.Query, fetch)
+		if err != nil {
+			return daemon.SearchSymbolsResult{}, err
+		}
 		hits = hits[:0]
 		for _, n := range candidates {
 			if !probeSymbolCandidate(n, p.Repo) {
@@ -1925,11 +1945,17 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 				break
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return daemon.SearchSymbolsResult{}, err
+		}
 		// Enough hits, the index is exhausted, or the bound is reached.
 		if len(hits) >= limit || len(candidates) < fetch || fetch >= searchSymbolsMaxFetch {
 			break
 		}
 		fetch *= 4
+	}
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
 	}
 	return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
 }

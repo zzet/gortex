@@ -72,6 +72,8 @@ type Materializer struct {
 	// stack was being built from, which is what makes the code
 	// diagnosable. nil silences it.
 	Logger *zap.Logger
+
+	newGenerationLayer func(context.Context, *store_sqlite.Store) (*GenerationLayer, error)
 }
 
 // GenerationSource is one persisted generation of a view's stack seen by
@@ -828,7 +830,11 @@ func (m *Materializer) openGeneration(ctx context.Context, generationID int64) (
 		return nil, nil, row, err
 	}
 	handle := m.Store.AtGeneration(generationID)
-	layer, err := NewGenerationLayer(handle)
+	newLayer := m.newGenerationLayer
+	if newLayer == nil {
+		newLayer = NewGenerationLayerContext
+	}
+	layer, err := newLayer(ctx, handle)
 	if err != nil {
 		return nil, nil, row, WrapViewError(CodeCheckoutInaccessible,
 			fmt.Sprintf("open generation %d", generationID), err)

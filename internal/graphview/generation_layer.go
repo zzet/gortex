@@ -156,21 +156,35 @@ var _ graph.OverlayLayerReader = (*GenerationLayer)(nil)
 // covers nothing, so it is refused rather than silently serving an empty
 // overlay.
 func NewGenerationLayer(handle *store_sqlite.Store) (*GenerationLayer, error) {
+	return NewGenerationLayerContext(context.Background(), handle)
+}
+
+// NewGenerationLayerContext builds one immutable generation layer while
+// honoring cancellation across every mask read. NewGenerationLayer preserves
+// the historical background-context behavior for callers without a request
+// lifetime to propagate.
+func NewGenerationLayerContext(ctx context.Context, handle *store_sqlite.Store) (*GenerationLayer, error) {
 	if handle == nil {
 		return nil, fmt.Errorf("graphview: generation layer needs a store handle")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	generation := handle.ViewGeneration()
 	if generation <= 0 {
 		return nil, fmt.Errorf("graphview: generation layer needs a derived generation, got %d", generation)
 	}
 
-	fileMasks, err := handle.FileMasks()
+	fileMasks, err := handle.FileMasksContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read file masks of generation %d: %w", generation, err)
 	}
 	// Read the node masks once. Derive legacy removals from the same checked
 	// enumeration rather than adding a second query for identity-only masks.
-	identityMasks, err := handle.NodeIdentityMasksContext(context.Background())
+	identityMasks, err := handle.NodeIdentityMasksContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read node identity masks of generation %d: %w", generation, err)
 	}
@@ -180,15 +194,18 @@ func NewGenerationLayer(handle *store_sqlite.Store) (*GenerationLayer, error) {
 			tombstones = append(tombstones, mask.NodeID)
 		}
 	}
-	edgeSources, err := handle.EdgeSourceMasks()
+	edgeSources, err := handle.EdgeSourceMasksContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read edge-source masks of generation %d: %w", generation, err)
 	}
 	// Fetch only explicit marker IDs, never enumerate the upper payload.
 	// An empty marker set performs no node query.
-	summaries, err := handle.NodeIdentityMaskSummariesContext(context.Background(), identityMasks)
+	summaries, err := handle.NodeIdentityMaskSummariesContext(ctx, identityMasks)
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read node identities of generation %d: %w", generation, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	l := &GenerationLayer{
@@ -246,6 +263,9 @@ func NewGenerationLayer(handle *store_sqlite.Store) (*GenerationLayer, error) {
 		l.detachedNodes = append(l.detachedNodes, *node)
 		l.detachedPaths[node.FilePath] = struct{}{}
 		l.detachedRepos[node.RepoPrefix] = struct{}{}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return l, nil
 }
@@ -460,6 +480,23 @@ func (l *GenerationLayer) NodeByQualName(qualName string) *graph.Node {
 	return node
 }
 
+// GetNodesByQualNames reads only candidates for the requested qualified names.
+// The handle binds the generation; context-only payload stays invisible just
+// as it does in the point and whole-layer reads. This deliberately leaves the
+// whole-generation node cache untouched.
+func (l *GenerationLayer) GetNodesByQualNames(qualNames []string) map[string][]*graph.Node {
+	hits := l.handle.GetNodesByQualNames(qualNames)
+	for name, nodes := range hits {
+		visible := l.serveNodes(nodes)
+		if len(visible) == 0 {
+			delete(hits, name)
+		} else {
+			hits[name] = visible
+		}
+	}
+	return hits
+}
+
 // NodesByName returns the generation's nodes carrying one short name.
 func (l *GenerationLayer) NodesByName(name string) []*graph.Node {
 	if name == "" {
@@ -481,11 +518,64 @@ func (l *GenerationLayer) NamedNodes() iter.Seq2[string, []*graph.Node] {
 	}
 }
 
+// VisitNodesByNameContainingFolded streams matching payload rows through the
+// generation's context mask. The Store applies the exact Unicode-folded name
+// predicate; filtering context rows here lets the caller count only rows this
+// layer is allowed to serve.
+func (l *GenerationLayer) VisitNodesByNameContainingFolded(substr string, yield func(*graph.Node) bool) {
+	l.handle.VisitNodesByNameContainingFolded(substr, func(node *graph.Node) bool {
+		if !l.servesNode(node) {
+			return true
+		}
+		return yield(node)
+	})
+}
+
+// GetOutEdgesByNodeIDs is the batched sibling of OutEdges. It preserves an
+// entry for every distinct non-empty requested ID and filters each adjacency
+// through the same context-path predicate as the point read.
+func (l *GenerationLayer) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	if len(ids) == 0 {
+		return nil
+	}
+	batch := l.handle.GetOutEdgesByNodeIDs(ids)
+	out := make(map[string][]*graph.Edge, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		out[id] = l.serveEdges(batch[id])
+	}
+	return out
+}
+
 // Nodes iterates every node the generation carries.
 func (l *GenerationLayer) Nodes() iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
 		l.loadNodes()
 		for _, n := range l.nodes {
+			if !yield(n) {
+				return
+			}
+		}
+	}
+}
+
+// NodesByKind iterates only payload rows of kind. Unlike Nodes, it does not
+// populate the whole-generation node/name cache: composed kind readers need
+// neither the other kinds nor the bulk-name index. The Store may materialize
+// this bounded kind result before yielding it.
+func (l *GenerationLayer) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		for n := range l.handle.NodesByKind(kind) {
+			if n == nil || !l.servesNode(n) {
+				continue
+			}
 			if !yield(n) {
 				return
 			}

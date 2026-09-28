@@ -493,8 +493,16 @@ func (v *OverlaidView) GetNodesByQualNames(qualNames []string) map[string][]*Nod
 	}
 
 	if v.layer != nil {
-		for n := range v.layer.Nodes() {
-			add(n)
+		if batch, ok := v.layer.(qualifiedNameBatchReader); ok {
+			for _, hits := range batch.GetNodesByQualNames(qualNames) {
+				for _, n := range hits {
+					add(n)
+				}
+			}
+		} else {
+			for n := range v.layer.Nodes() {
+				add(n)
+			}
 		}
 	}
 	if v.base != nil {
@@ -561,15 +569,28 @@ func (v *OverlaidView) FindNodesByNameContaining(substr string, limit int) []*No
 	}
 	needle := strings.ToLower(substr)
 	var out []*Node
-	// Overlay-side: walk the layer's nodesByName index — the same
-	// bucket FindNodesByName reads from — and accept any name whose
-	// lowercase form contains the needle.
 	if v.layer != nil {
-		for name, bucket := range v.layer.NamedNodes() {
-			if strings.Contains(strings.ToLower(name), needle) {
-				out = append(out, bucket...)
-				if limit > 0 && len(out) >= limit {
-					return out[:limit]
+		if bounded, ok := v.layer.(interface {
+			VisitNodesByNameContainingFolded(string, func(*Node) bool)
+		}); ok {
+			bounded.VisitNodesByNameContainingFolded(substr, func(node *Node) bool {
+				if node == nil || node.Name == "" || !strings.Contains(strings.ToLower(node.Name), needle) {
+					return true
+				}
+				out = append(out, node)
+				return limit <= 0 || len(out) < limit
+			})
+			if limit > 0 && len(out) >= limit {
+				return out[:limit]
+			}
+		} else {
+			// In-memory and third-party layers retain the name-bucket fallback.
+			for name, bucket := range v.layer.NamedNodes() {
+				if strings.Contains(strings.ToLower(name), needle) {
+					out = append(out, bucket...)
+					if limit > 0 && len(out) >= limit {
+						return out[:limit]
+					}
 				}
 			}
 		}
@@ -577,26 +598,51 @@ func (v *OverlaidView) FindNodesByNameContaining(substr string, limit int) []*No
 	if v.base == nil {
 		return out
 	}
-	// Base-side: fetch with an inflated limit so overlay-mask drops
-	// don't leave a short page. Then re-apply the same overlaid-file
-	// + name-removed mask FindNodesByName uses.
-	fetch := limit
-	if fetch > 0 {
+	if limit <= 0 {
+		for _, node := range v.base.FindNodesByNameContaining(substr, 0) {
+			if v.baseNodeVisible(node) {
+				out = append(out, node)
+			}
+		}
+		return out
+	}
+
+	// Re-fetch a larger ordered prefix when overlay ownership masks more rows
+	// than the first page allowed for. Each pass rebuilds only the base suffix,
+	// so no candidate is duplicated. Saturating growth prevents integer wrap.
+	overlayLen := len(out)
+	remaining := limit - overlayLen
+	if remaining <= 0 {
+		return out[:limit]
+	}
+	maxInt := int(^uint(0) >> 1)
+	fetch := remaining
+	if fetch <= maxInt/2 {
 		fetch *= 2
+	} else {
+		fetch = maxInt
 	}
-	for _, n := range v.base.FindNodesByNameContaining(substr, fetch) {
-		if !v.baseNodeVisible(n) {
-			continue
+	for {
+		candidates := v.base.FindNodesByNameContaining(substr, fetch)
+		out = out[:overlayLen]
+		for _, node := range candidates {
+			if !v.baseNodeVisible(node) {
+				continue
+			}
+			out = append(out, node)
+			if len(out) >= limit {
+				return out[:limit]
+			}
 		}
-		out = append(out, n)
-		if limit > 0 && len(out) >= limit {
-			return out[:limit]
+		if len(candidates) < fetch || fetch == maxInt {
+			return out
+		}
+		if fetch > maxInt/2 {
+			fetch = maxInt
+		} else {
+			fetch *= 2
 		}
 	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
 }
 
 // GetFileNodes returns a covered path from the layer alone. An uncovered
@@ -776,6 +822,9 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 	if len(uniq) == 0 {
 		return out
 	}
+	for _, id := range uniq {
+		out[id] = nil
+	}
 	if v.base != nil {
 		base := v.base.GetOutEdgesByNodeIDs(uniq)
 		for _, id := range uniq {
@@ -795,9 +844,16 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 		}
 	}
 	if v.layer != nil {
-		for _, id := range uniq {
-			if extras := v.layer.OutEdges(id); len(extras) > 0 {
-				out[id] = append(out[id], extras...)
+		if batch, ok := v.layer.(interface {
+			GetOutEdgesByNodeIDs([]string) map[string][]*Edge
+		}); ok {
+			extras := batch.GetOutEdgesByNodeIDs(uniq)
+			for _, id := range uniq {
+				out[id] = append(out[id], extras[id]...)
+			}
+		} else {
+			for _, id := range uniq {
+				out[id] = append(out[id], v.layer.OutEdges(id)...)
 			}
 		}
 	}

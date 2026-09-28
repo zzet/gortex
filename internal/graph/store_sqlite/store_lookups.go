@@ -158,6 +158,56 @@ func (s *Store) FindNodesByNameContaining(substr string, limit int) []*graph.Nod
 	return s.queryNodesSQL(q, pattern, s.viewGen)
 }
 
+// VisitNodesByNameContainingFolded streams this generation's nodes whose
+// names contain substr under Go's Unicode lower-case semantics. SQLite LIKE
+// supplies the ASCII candidates; every non-ASCII name remains a candidate so
+// folds such as Kelvin sign to "k" and Greek case pairs cannot be missed.
+// The exact predicate is then applied in Go. Returning false from yield closes
+// the cursor immediately, so a caller can impose its own post-filtered limit
+// without materializing the generation.
+func (s *Store) VisitNodesByNameContainingFolded(substr string, yield func(*graph.Node) bool) {
+	if substr == "" || yield == nil {
+		return
+	}
+	needle := strings.ToLower(substr)
+	nonASCII := false
+	for i := 0; i < len(needle); i++ {
+		if needle[i] >= 0x80 {
+			nonASCII = true
+			break
+		}
+	}
+
+	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE view_gen = ? AND length(name) != length(CAST(name AS BLOB)) ORDER BY id`
+	args := []any{s.viewGen}
+	if !nonASCII {
+		q = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE view_gen = ? AND (name LIKE ? ESCAPE '\' OR length(name) != length(CAST(name AS BLOB))) ORDER BY id`
+		args = append(args, "%"+escapeLikePattern(needle)+"%")
+	}
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		node, scanErr := scanNodeCursor(rows)
+		if scanErr != nil {
+			panicOnFatal(scanErr)
+			return
+		}
+		if node == nil || node.Name == "" || !strings.Contains(strings.ToLower(node.Name), needle) {
+			continue
+		}
+		if !yield(node) {
+			return
+		}
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
+}
+
 // GetNodesByQualNames returns every candidate for each requested qualified
 // name. The query orders by qual_name then ID, so each candidate slice is
 // deterministic and repository/workspace-aware callers can disambiguate it.
