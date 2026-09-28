@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -42,6 +43,18 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 		owed = append(owed, generationID)
 	}
 	l.coordMu.Unlock()
+
+	// Interactive work that wants the writer goes first — before the
+	// catalog scan for candidates as well as before a slice: nothing of the
+	// sweep runs while an edit cycle holds the lane or a writer waits
+	// (checkout_deferred_retirement_preempt.go), unless the sweep has been
+	// starved for too long to keep yielding.
+	started := time.Now()
+	armed := l.retirementPreemptionArmed(started)
+	if l.retirementShouldStandDown(armed, coordinators) {
+		deferredRetirementPreemptions.Add(1)
+		return 0, true, nil
+	}
 
 	discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, deferredRetirementDiscoveryTimeout)
 	discovered, discoveryErr := l.discoverDeferredRetirements(discoveryCtx, served, owed)
@@ -83,6 +96,20 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 		ordered = append(ordered, generationID)
 	}
 	retireNewestFirst(ordered)
+	// A generation the catalog still references waits, parked, for a
+	// reference to go (checkout_deferred_retirement_parked.go).
+	offered := ordered[:0:0]
+	for _, generationID := range ordered {
+		if !l.retirementParkedNow(generationID, started) {
+			offered = append(offered, generationID)
+		}
+	}
+	ordered = offered
+	// While a checkout is being edited: smallest first, large ones held for a
+	// longer idle, shorter slices (checkout_deferred_retirement_pacing.go).
+	pace := l.retirementPaceNow(started, !armed)
+	ordered = orderForPace(pace, ordered, l.generationStorageBytes(ctx))
+	sliceBudget := pace.sliceBudget()
 
 	if len(ordered) == 0 {
 		if discoveryErr != nil {
@@ -90,23 +117,61 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 		}
 		return 0, false, nil
 	}
+	if l.retirementShouldStandDown(armed, coordinators) {
+		deferredRetirementPreemptions.Add(1)
+		return 0, true, discoveryErr
+	}
+	parentCtx := ctx
+	{
+		// A starved sweep stops yielding to waiting writers, never to an
+		// edit cycle: the edit cycle always cancels a chunk in flight.
+		var stop func()
+		ctx, stop = l.preemptOnInteractiveWriteWhen(ctx, func() bool {
+			return l.retirementShouldStandDown(armed, coordinators)
+		})
+		defer stop()
+	}
+	defer func() {
+		if err != nil && retirementPreempted(parentCtx, ctx) {
+			deferredRetirementPreemptions.Add(1)
+			pending, err = true, discoveryErr
+			return
+		}
+		// A slice that ran its chunks (to the end, to its budget, or to a
+		// lease refusal) was not starved; only preemption stops the clock.
+		if err == nil || retired > 0 {
+			l.noteRetirementProgress(time.Now())
+		}
+	}()
 
-	generationID := l.nextDeferredRetirement(ordered)
+	generationID := ordered[0]
+	if !pace.active() {
+		generationID = l.nextDeferredRetirement(ordered)
+	}
 	if coordinator := owners[generationID]; coordinator != nil {
 		var stillPending bool
 		retiredOne, stillPending, retireErr := coordinator.retirePayloadGenerationSlice(
-			ctx, generationID, deferredRetirementSliceBudget,
+			ctx, generationID, sliceBudget,
 		)
 		if retiredOne {
 			retired = 1
 			l.removeOwedRetirement(generationID)
 		}
+		if retireErr != nil && retirementStillReferenced(retireErr) {
+			l.parkReferencedRetirement(generationID, time.Now())
+			retireErr, stillPending = nil, false
+		}
 		pending = stillPending || len(ordered) > 1
 		err = retireErr
 	} else {
-		retireErr := l.store.RetirePayloadGenerationSlice(
-			ctx, generationID, l.deferredRetirementInUse, deferredRetirementSliceBudget,
-		)
+		var retireErr error
+		if l.retireOwedSlice != nil {
+			retireErr = l.retireOwedSlice(ctx, generationID)
+		} else {
+			retireErr = l.store.RetirePayloadGenerationSlice(
+				ctx, generationID, l.deferredRetirementInUse, sliceBudget,
+			)
+		}
 		stillPending := false
 		switch {
 		case retireErr == nil:
@@ -118,11 +183,19 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 			errors.Is(retireErr, store_sqlite.ErrPayloadGenerationInUse):
 			stillPending = true
 			retireErr = nil
+		case retirementStillReferenced(retireErr):
+			l.parkReferencedRetirement(generationID, time.Now())
+			retireErr = nil
 		default:
 			stillPending = true
 		}
 		pending = len(ordered) > 1 || stillPending
 		err = retireErr
+	}
+	if retired > 0 {
+		// A retired generation may have been the last one built on another.
+		l.unparkRetirement(generationID)
+		noteRetirementReferenceReleased()
 	}
 	// Recheck live state after the physical slice. New backlog/owed work may
 	// arrive while the slice commits and must keep the worker on its base pause.
@@ -199,19 +272,28 @@ func (l *CheckoutLifecycle) deferredRetirementInUse(generationID int64) bool {
 }
 
 func (l *CheckoutLifecycle) hasDeferredRetirementWork() bool {
+	now := time.Now()
 	l.coordMu.Lock()
-	if len(l.owed) > 0 {
-		l.coordMu.Unlock()
-		return true
+	owed := make([]int64, 0, len(l.owed))
+	for generationID := range l.owed {
+		owed = append(owed, generationID)
 	}
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
 	for _, coordinator := range l.coordinators {
 		coordinators = append(coordinators, coordinator)
 	}
 	l.coordMu.Unlock()
-	for _, coordinator := range coordinators {
-		if len(coordinator.pendingRetirementGenerations()) > 0 {
+	// A parked generation is not work: it waits for a reference to go.
+	for _, generationID := range owed {
+		if !l.retirementParkedNow(generationID, now) {
 			return true
+		}
+	}
+	for _, coordinator := range coordinators {
+		for _, generationID := range coordinator.pendingRetirementGenerations() {
+			if !l.retirementParkedNow(generationID, now) {
+				return true
+			}
 		}
 	}
 	return false
@@ -220,6 +302,10 @@ func (l *CheckoutLifecycle) hasDeferredRetirementWork() bool {
 // discoverDeferredRetirements mirrors the lifecycle inventory rules while
 // returning partial candidates and every catalog error. An incomplete scan is
 // retryable work, never evidence that startup cleanup is empty.
+// deferredRetirementScans counts the catalog scans for retirement
+// candidates (tests and measurement).
+var deferredRetirementScans atomic.Int64
+
 type deferredGenerationList func(context.Context, store_sqlite.ViewGenerationFilter) ([]store_sqlite.ViewGeneration, error)
 
 func (l *CheckoutLifecycle) discoverDeferredRetirements(
@@ -230,6 +316,7 @@ func (l *CheckoutLifecycle) discoverDeferredRetirements(
 	if l.catalog == nil {
 		return nil, nil
 	}
+	deferredRetirementScans.Add(1)
 	return l.discoverDeferredRetirementsWith(
 		ctx, served, known, l.catalog.ListViewGenerations, l.dedicatedChainRetirementCandidates,
 	)

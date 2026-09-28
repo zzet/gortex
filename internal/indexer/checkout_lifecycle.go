@@ -267,11 +267,29 @@ type CheckoutLifecycle struct {
 	deferSeedRetirements     bool
 	retirementSweepMu        sync.Mutex
 	deferredRetirementCursor int64 // guarded by coordMu
-	// interactiveDemand is a test seam: the interactive write predicate.
+	// deferredRetirementProgress is the last time (unix nanos) a deferred
+	// slice made progress; preemption by interactive writers is suspended
+	// once it is older than retirementStarvationLimit
+	// (checkout_deferred_retirement_preempt.go). A negative limit disables
+	// preemption; zero takes the default.
+	deferredRetirementProgress atomic.Int64
+	retirementStarvationLimit  time.Duration
+	// interactiveDemand and retireOwedSlice are test seams: the interactive
+	// write predicate and the owed-generation slice runner.
 	interactiveDemand func() bool
+	retireOwedSlice   func(ctx context.Context, generationID int64) error
 	// derivationEnvHook replaces derivationEnvFor (tests): the environment
 	// the startup correction re-derives a generation in.
 	derivationEnvHook func(row store_sqlite.ViewGeneration) (derivationEnv, bool)
+	// foregroundWork and walBytes are test seams for the sweep's pacing
+	// (checkout_deferred_retirement_pacing.go): the foreground activity and
+	// the WAL the log holds since its last reset.
+	foregroundWork func() (string, time.Time)
+	walBytes       func() int64
+	// retirementParked holds, per generation a retirement found still
+	// referenced, the reference-release hint it was parked at
+	// (checkout_deferred_retirement_parked.go). Guarded by coordMu.
+	retirementParked map[int64]retirementPark
 	// derivedCorrectionPreempted counts the startup correction's runs given
 	// up to interactive work.
 	derivedCorrectionPreempted atomic.Int64

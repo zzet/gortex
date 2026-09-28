@@ -7,6 +7,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
@@ -114,7 +115,9 @@ func (w *deferredRetirementWorker) run(ctx context.Context, sweep deferredRetire
 
 		retired, pending, err := sweep(ctx)
 		if retired > 0 {
-			logger.Info("daemon: deferred startup retirement progress", zap.Int("retired_generations", retired), zap.Bool("pending", pending))
+			logger.Info("daemon: deferred startup retirement progress", zap.Int("retired_generations", retired), zap.Bool("pending", pending),
+				zap.Int64("interactive_preemptions", indexer.DeferredRetirementPreemptions()),
+				zap.Int64("parked_generations", indexer.DeferredRetirementParked()))
 		}
 		if err != nil && ctx.Err() == nil {
 			logger.Warn("daemon: deferred startup retirement will retry", zap.Error(err), zap.Duration("retry_after", errorBackoff))

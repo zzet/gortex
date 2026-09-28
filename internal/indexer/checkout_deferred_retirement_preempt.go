@@ -3,13 +3,43 @@ package indexer
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
-const deferredRetirementPreemptPoll = 2 * time.Millisecond
+// A deferred retirement slice gives the store's writer back to interactive
+// work within a few milliseconds, including in the middle of a chunk.
+//
+// The store already yields between chunks while a writer waits, but one
+// chunk — a thousand-row delete from the edges or nodes table of a large
+// store — measured two seconds and more, once about thirty, and an edit's
+// route withdrawal waited the whole chunk out. So the background slice runs
+// under a context that a watcher cancels the moment an interactive writer
+// waits: the driver interrupts the running statement, the chunk's
+// transaction rolls back, and the gate is free again. Nothing is lost that
+// matters: the generation keeps its retiring fence and seal, every sweep step
+// is idempotent, and the next pass resumes the same generation.
+//
+// A slice that cannot finish a chunk between edits must still finish some
+// time, so preemption is suspended once the sweep has made no progress for
+// deferredRetirementStarvationLimit; that slice keeps the between-chunk
+// yield but runs its chunks to completion.
+
+const (
+	deferredRetirementPreemptPoll     = 2 * time.Millisecond
+	deferredRetirementStarvationLimit = 2 * time.Minute
+)
 
 // errRetirementPreempted is the cause a preempted slice's context carries.
 var errRetirementPreempted = errors.New("deferred retirement: preempted by an interactive writer")
+
+// deferredRetirementPreemptions counts the slices given back to an
+// interactive writer (skipped before starting or cancelled mid-chunk).
+var deferredRetirementPreemptions atomic.Int64
+
+// DeferredRetirementPreemptions reports how many deferred retirement slices
+// yielded to interactive writers in this process.
+func DeferredRetirementPreemptions() int64 { return deferredRetirementPreemptions.Load() }
 
 // writeDemandReporter is a store that can say a writer is waiting for it: a
 // caller parked on the write gate or an announced mutation.
@@ -60,6 +90,42 @@ func (c *CheckoutCoordinator) interactiveWritePending() bool {
 		return true
 	}
 	return c.gate != nil && c.gate.Stats().InteractiveQueued > 0
+}
+
+// retirementPreemptionArmed reports whether this slice may be preempted: the
+// sweep made progress (or started) within the starvation limit.
+func (l *CheckoutLifecycle) retirementPreemptionArmed(now time.Time) bool {
+	limit := l.retirementStarvationLimit
+	if limit == 0 {
+		limit = deferredRetirementStarvationLimit
+	}
+	if limit < 0 {
+		return false
+	}
+	last := l.deferredRetirementProgress.Load()
+	if last == 0 {
+		l.deferredRetirementProgress.CompareAndSwap(0, now.UnixNano())
+		return true
+	}
+	return now.Sub(time.Unix(0, last)) < limit
+}
+
+// noteRetirementProgress restarts the starvation clock.
+func (l *CheckoutLifecycle) noteRetirementProgress(now time.Time) {
+	l.deferredRetirementProgress.Store(now.UnixNano())
+}
+
+// retirementShouldStandDown is the sweep's yield rule: it never runs while an
+// edit cycle holds the build lane; while its preemption is armed (it has not
+// been starved) it also gives way to every other interactive writer.
+func (l *CheckoutLifecycle) retirementShouldStandDown(armed bool, coordinators []*CheckoutCoordinator) bool {
+	if l.editCycleHoldsBuildLane() {
+		return true
+	}
+	if l.retirementPacedStandDown(!armed) != "" {
+		return true
+	}
+	return armed && l.interactiveWriteWanted(coordinators)
 }
 
 // preemptOnInteractiveWrite returns ctx wrapped so that it is cancelled with

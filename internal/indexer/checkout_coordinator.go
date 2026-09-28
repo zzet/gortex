@@ -2948,6 +2948,7 @@ func (c *CheckoutCoordinator) clearDirtySlot(ctx context.Context, route *store_s
 	route.DirtyGenerationID = 0
 	c.rememberRoutedDirty(0)
 	c.releaseDirtyChain(ctx, dropped, 0)
+	noteRetirementReferenceReleased()
 	return nil
 }
 
@@ -3426,6 +3427,7 @@ func (c *CheckoutCoordinator) flip(
 	}
 	route.RouteEpoch++
 	route.State = store_sqlite.RouteActive
+	noteRetirementReferenceReleased()
 	switch slot {
 	case store_sqlite.RouteSlotCommit:
 		route.CommitGenerationID = generationID
