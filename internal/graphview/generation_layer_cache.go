@@ -27,10 +27,29 @@ const defaultLayerCacheWeight = 2_000_000
 // change once it is published, but an id is not a promise across a catalog
 // that was rebuilt underneath the process, and the stamps make a reused id a
 // different key rather than a stale hit.
+//
+// correctionEpoch is the store's GenerationCorrectionEpoch for the generation
+// when the entry was opened. A derived-row correction rewrites a published
+// generation's edges and node versions in place and advances the epoch, so a
+// mask set or row preload cached before the correction is a different key
+// from every open after it and is never served again. The epoch is read before
+// the load: a correction that finishes during the load leaves the entry keyed
+// at the older epoch, which the next open no longer asks for.
 type layerCacheKey struct {
-	generation  int64
-	createdAt   int64
-	publishedAt int64
+	generation      int64
+	createdAt       int64
+	publishedAt     int64
+	correctionEpoch uint64
+}
+
+// layerCacheKeyFor is the cache key of generation's catalog row at the
+// correction epoch the store reports for it now.
+func layerCacheKeyFor(store *store_sqlite.Store, generation int64, row store_sqlite.ViewGeneration) layerCacheKey {
+	key := layerCacheKey{generation: generation, createdAt: row.CreatedAt, publishedAt: row.PublishedAt}
+	if store != nil {
+		key.correctionEpoch = store.GenerationCorrectionEpoch(generation)
+	}
+	return key
 }
 
 // layerCacheEntry is one cached or in-flight mask load. ready closes when the
@@ -134,6 +153,7 @@ func (c *generationLayerCache) open(
 		if c.entries[key] == entry {
 			entry.elem = c.lru.PushFront(entry)
 			c.weight += entry.weight
+			c.dropCorrectedLocked(key)
 			c.evictLocked()
 		}
 		close(entry.ready)
@@ -152,6 +172,20 @@ func (c *generationLayerCache) evictLocked() {
 		c.lru.Remove(back)
 		c.weight -= entry.weight
 		delete(c.entries, entry.key)
+	}
+}
+
+// dropCorrectedLocked drops the settled entries of key's generation cached at
+// an older correction epoch: no open asks for them again, and a row preload
+// must not land in them.
+func (c *generationLayerCache) dropCorrectedLocked(key layerCacheKey) {
+	for other, entry := range c.entries {
+		if other.generation != key.generation || other.correctionEpoch >= key.correctionEpoch || entry.elem == nil {
+			continue
+		}
+		c.lru.Remove(entry.elem)
+		c.weight -= entry.weight
+		delete(c.entries, other)
 	}
 }
 
@@ -192,6 +226,7 @@ func (l *GenerationLayer) masksOnly() *GenerationLayer {
 		detachedFileIndexes: l.detachedFileIndexes,
 		detachedPaths:       l.detachedPaths,
 		detachedRepos:       l.detachedRepos,
+		rowsRef:             l.rowsRef,
 	}
 }
 

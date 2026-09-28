@@ -36,5 +36,27 @@ func (m *Materializer) WarmRoute(ctx context.Context, generations ...int64) (loa
 			loaded++
 		}
 	}
+	// The route's newest generation (its working-tree layer, or the commit
+	// generation of a clean checkout) is the one no request has read yet:
+	// preload its rows when it is small, so the first request over the new
+	// route answers its node and edge reads from memory (generation_layer_rows.go).
+	if n := len(generations); n > 0 {
+		top := generations[n-1]
+		cache.preloadRows(ctx, top, m.Store.GenerationCorrectionEpoch(top), m.Store.AtGeneration(top))
+	}
 	return loaded, nil
+}
+
+// RouteAncestry is the catalog ancestry of a route naming generations (commit
+// first, then the working-tree layer): every generation WarmRoute opens for
+// it, the route's own included.
+func (m *Materializer) RouteAncestry(ctx context.Context, generations ...int64) ([]int64, error) {
+	if err := m.validate(); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ancestry, _, err := m.generationAncestry(ctx, generations)
+	return ancestry, err
 }

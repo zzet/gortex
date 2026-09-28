@@ -158,6 +158,11 @@ type GenerationLayer struct {
 	presenceOnce sync.Once
 	hasNodes     bool
 	hasEdges     bool
+
+	// rowsRef is the generation's shared row slot (generation_layer_rows.go):
+	// when a small generation's rows are preloaded, the layer answers its
+	// point and batch row reads from them instead of SQL.
+	rowsRef *generationRowsRef
 }
 
 // payloadPresence reports, once per layer, whether the generation carries
@@ -249,6 +254,7 @@ func NewGenerationLayerContext(ctx context.Context, handle *store_sqlite.Store) 
 		edgeSources: make(map[string]struct{}, len(edgeSources)),
 		nodeByID:    make(map[string]*graph.Node),
 		fileNodes:   make(map[string][]*graph.Node),
+		rowsRef:     &generationRowsRef{},
 	}
 	for _, mask := range fileMasks {
 		switch mask.Mode {
@@ -503,6 +509,9 @@ func (l *GenerationLayer) NodeByID(id string) *graph.Node {
 	if id == "" {
 		return nil
 	}
+	if rows := l.preloadedRows(); rows != nil {
+		return l.rowsNode(rows, id)
+	}
 	l.mu.Lock()
 	cached, ok := l.nodeByID[id]
 	l.mu.Unlock()
@@ -593,7 +602,11 @@ func (l *GenerationLayer) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph
 		return nil
 	}
 	var batch map[string][]*graph.Edge
-	if !l.noEdgeRows() {
+	rows := l.preloadedRows()
+	switch {
+	case rows != nil:
+		batch = rows.outBatch
+	case !l.noEdgeRows():
 		batch = l.handle.GetOutEdgesByNodeIDs(ids)
 	}
 	out := make(map[string][]*graph.Edge, len(ids))
@@ -606,6 +619,10 @@ func (l *GenerationLayer) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph
 			continue
 		}
 		seen[id] = struct{}{}
+		if rows != nil {
+			out[id] = l.copyServedEdges(batch[id])
+			continue
+		}
 		out[id] = l.serveEdges(batch[id])
 	}
 	return out
@@ -682,6 +699,9 @@ func (l *GenerationLayer) FileNodes(graphPath string) []*graph.Node {
 
 // OutEdges returns the generation's edges leaving one node.
 func (l *GenerationLayer) OutEdges(nodeID string) []*graph.Edge {
+	if rows := l.preloadedRows(); rows != nil && nodeID != "" {
+		return l.copyServedEdges(rows.outLine[nodeID])
+	}
 	if nodeID == "" || l.noEdgeRows() {
 		return nil
 	}
@@ -690,6 +710,9 @@ func (l *GenerationLayer) OutEdges(nodeID string) []*graph.Edge {
 
 // InEdges returns the generation's edges entering one node.
 func (l *GenerationLayer) InEdges(nodeID string) []*graph.Edge {
+	if rows := l.preloadedRows(); rows != nil && nodeID != "" {
+		return l.copyServedEdges(rows.inKind[nodeID])
+	}
 	if nodeID == "" || l.noEdgeRows() {
 		return nil
 	}

@@ -1045,8 +1045,7 @@ func (m *Materializer) openGeneration(ctx context.Context, generationID int64) (
 	if newLayer := m.newGenerationLayer; newLayer != nil {
 		layer, err = newLayer(ctx, handle)
 	} else {
-		key := layerCacheKey{generation: generationID, createdAt: row.CreatedAt, publishedAt: row.PublishedAt}
-		layer, err = m.layerCacheFor().open(ctx, key, handle, NewGenerationLayerContext)
+		layer, err = m.layerCacheFor().open(ctx, layerCacheKeyFor(m.Store, generationID, row), handle, NewGenerationLayerContext)
 	}
 	if err != nil {
 		return nil, nil, row, WrapViewError(CodeCheckoutInaccessible,
