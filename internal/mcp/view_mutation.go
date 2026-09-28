@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -68,25 +69,39 @@ func (s *Server) prepareRoutedViewMutation(
 	mutation, err := s.lifecycle.BeginCheckoutMutation(ctx, view.rider.CheckoutID,
 		view.viewRoot, view.materialized.CheckoutRouteEpoch)
 	release := noop
-	if errors.Is(err, indexer.ErrCheckoutMutationRouteMoved) {
-		// The route (or the base under it) moved between this request's view
-		// selection and its admission — a base advance or a rebuild published
-		// in between. Nothing is written yet and nothing the edit reads came
-		// from the old route, so select the view once more and admit against
-		// that. Once only: a route that keeps moving is refused as before, and
-		// a HEAD change is refused by the lease's own pre-write sample.
-		if reselected, retryErr := s.reselectMutationView(ctx, selector, policy, view); retryErr == nil {
-			var retried *indexer.CheckoutMutation
-			retried, err = s.lifecycle.BeginCheckoutMutation(ctx, reselected.rider.CheckoutID,
-				reselected.viewRoot, reselected.materialized.CheckoutRouteEpoch)
-			if err == nil {
-				mutation, view = retried, reselected
-				ctx = withRequestView(ctx, reselected)
-				release = reselected.close
-			} else {
-				reselected.close()
-			}
+	// The route (or the base under it) moved between this request's view
+	// selection and its admission — a base advance or a rebuild published in
+	// between. Nothing is written yet and nothing the edit reads came from
+	// the old route, so select the view again and admit against that.
+	//
+	// The first retry reselects at once, which is enough when a rebuild has
+	// already published the new route. When only the primary base moved (the
+	// committed base was just published or advanced), the route still names
+	// a commit layer over the old base until the checkout's coordinator
+	// recomposes it, and an immediate reselection returns that same route:
+	// the second retry asks the coordinator for a refresh, which recomposes
+	// the route over the new base, waits for it (bounded), and reselects.
+	// A route that keeps moving after that is refused as before, and a HEAD
+	// change is refused by the lease's own pre-write sample.
+	for attempt := 0; attempt < 2 && errors.Is(err, indexer.ErrCheckoutMutationRouteMoved); attempt++ {
+		if attempt == 1 && !s.awaitRouteRecomposition(ctx, view) {
+			break
 		}
+		reselected, retryErr := s.reselectMutationView(ctx, selector, policy, view)
+		if retryErr != nil {
+			break
+		}
+		var retried *indexer.CheckoutMutation
+		retried, err = s.lifecycle.BeginCheckoutMutation(ctx, reselected.rider.CheckoutID,
+			reselected.viewRoot, reselected.materialized.CheckoutRouteEpoch)
+		if err != nil {
+			reselected.close()
+			continue
+		}
+		release()
+		mutation, view = retried, reselected
+		ctx = withRequestView(ctx, reselected)
+		release = reselected.close
 	}
 	if err != nil {
 		s.activateSelectedCheckout(view.rider.CheckoutID, "source mutation needs a fresh checkout view")
@@ -97,6 +112,34 @@ func (s *Server) prepareRoutedViewMutation(
 		mutation.Close()
 		release()
 	}, nil
+}
+
+// routeRecompositionWait bounds how long an edit waits for its checkout's
+// route to be recomposed over a moved base before its last admission retry.
+var routeRecompositionWait = 30 * time.Second
+
+// awaitRouteRecomposition asks the checkout's coordinator for a refresh and
+// waits (bounded by the request and routeRecompositionWait) until the refresh
+// has published: a cycle over a moved primary base recomposes the route over
+// it. It reports whether the refresh completed.
+func (s *Server) awaitRouteRecomposition(ctx context.Context, view *requestView) bool {
+	if s == nil || s.lifecycle == nil || view == nil || view.rider == nil {
+		return false
+	}
+	ticket, err := s.lifecycle.RequestCheckoutRefresh(ctx, view.rider.CheckoutID, view.viewRoot)
+	if err != nil || ticket == nil || ticket.Ticket == nil {
+		return false
+	}
+	wait := time.NewTimer(routeRecompositionWait)
+	defer wait.Stop()
+	select {
+	case result := <-ticket.Ticket.Done:
+		return result.Err == nil
+	case <-wait.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // mutationBeforeAdmission, when set, runs between a mutation's view selection

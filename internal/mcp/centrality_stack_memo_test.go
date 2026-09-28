@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -142,6 +143,9 @@ func newAdjacencyMemoFixture(t *testing.T) (*realCheckoutMutationFixture, string
 	})
 	srv.SetMaterializer(&graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases})
 	srv.lifecycle = lifecycle
+	// Publications prewarm the route they flip to, masks and the newest
+	// generation's rows, as the daemon wires it.
+	srv.wireRoutePrewarm()
 	f := &realCheckoutMutationFixture{
 		srv: srv, store: store,
 		primary: primary, worktree: worktree, checkoutID: checkoutID,
@@ -201,8 +205,12 @@ func centralityThroughBoth(t testing.TB, f *realCheckoutMutationFixture, ctx con
 	t.Helper()
 	require.NotNil(t, f.srv.stackedAdjacencyReader(ctx), "the routed view must be served through the stacked memo")
 	memoResult := f.srv.boundedCentralityForRequest(ctx, seeds, candidates)
+	// The old path: no stacked memo and no preloaded rows — every level read
+	// with SQL.
 	stackedAdjacencyDisabledForTest = true
+	restoreRows := graphview.DisableGenerationRowsForTest()
 	directResult := f.srv.boundedCentralityForRequest(ctx, seeds, candidates)
+	restoreRows()
 	stackedAdjacencyDisabledForTest = false
 	return observeCentrality(memoResult), observeCentrality(directResult)
 }
@@ -255,6 +263,139 @@ type centralityObservation struct {
 
 func observeCentrality(r rerank.CentralityResult) centralityObservation {
 	return centralityObservation{Scores: r.Scores, Nodes: r.NodeCount, Edges: r.EdgeCount, Truncated: r.Truncated}
+}
+
+func TestStackedAdjacencyMemoRanksLikeTheViewReader(t *testing.T) {
+	f, primaryID := newAdjacencyMemoFixture(t)
+	f.srv.pprCache.enabled = false // compare fresh walks, never a cached one
+
+	ctx, view := adjacencyMemoView(t, f)
+	sources := view.materialized.GenerationSources()
+	t.Logf("generations before the edit: %v", view.materialized.Generations())
+	t.Logf("stack: %d generation(s), composes base corpus: %v", len(sources), view.materialized.ComposesBaseCorpus())
+	require.False(t, view.materialized.ComposesBaseCorpus(), "fixture precondition: the stack is rooted in the dedicated base")
+	candidates := adjacencyMemoCandidates(t, view)
+	seeds := candidates[:4]
+
+	memo, direct := centralityThroughBoth(t, f, ctx, seeds, candidates)
+	requireEdgeBatchesMatchTheView(t, f, ctx, view, candidates)
+	require.NotEmpty(t, direct.Scores)
+	require.Equal(t, direct, memo, "the memoized build must equal the view reader's build")
+
+	// A second request reads nothing below: every answer is a memo hit.
+	_, nodeMissesBefore, _, edgeMissesBefore := f.srv.stackAdjacencyMemoFor().counts()
+	again := observeCentrality(f.srv.boundedCentralityForRequest(ctx, seeds, candidates))
+	_, nodeMissesAfter, _, edgeMissesAfter := f.srv.stackAdjacencyMemoFor().counts()
+	require.Equal(t, direct, again)
+	require.Zero(t, nodeMissesAfter-nodeMissesBefore, "a repeated build read node rows again")
+	require.Zero(t, edgeMissesAfter-edgeMissesBefore, "a repeated build read edge rows again")
+
+	// An edit publishes a new top generation. The next build through the new
+	// route equals the new view's own build, and reads only the new top level.
+	written := f.edit(t, f.worktree, map[string]any{
+		"path": "repo/widget3.go", "old_string": "\tRenderWidget4(w)\n", "new_string": "\tRenderWidget6(w)\n\tBuildWidget0()\n",
+	})
+	require.False(t, written.IsError, viewResultText(t, written))
+	f.awaitMutation(t, f.worktree, written)
+
+	ctx2, view2 := adjacencyMemoView(t, f)
+	require.NotEqual(t, view.materialized.ID.Fingerprint(), view2.materialized.ID.Fingerprint(), "the edit must publish a new route")
+	t.Logf("generations after the edit: %v", view2.materialized.Generations())
+	sources2 := view2.materialized.GenerationSources()
+	top, ok := sources2[len(sources2)-1].Layer.(*graphview.GenerationLayer)
+	require.True(t, ok && top.RowsPreloaded(), "the publication's prewarm did not preload the new top generation's rows")
+	candidates2 := adjacencyMemoCandidates(t, view2)
+	// The first build after the publication reads the new top level only:
+	// every level the previous route composed answers from its memo.
+	before := stackMemoLevelSizes(f.srv.stackAdjacencyMemoFor())
+	require.NotEmpty(t, f.srv.boundedCentralityForRequest(ctx2, seeds, candidates2).Scores)
+	after := stackMemoLevelSizes(f.srv.stackAdjacencyMemoFor())
+	grown := 0
+	for key, size := range after {
+		if old, existed := before[key]; existed {
+			require.Equal(t, old, size, "level %s was read again after the publication", key)
+			continue
+		}
+		grown++
+	}
+	require.Equal(t, 1, grown, "the publication's build must add exactly the new top level: %v -> %v", before, after)
+	memo2, direct2 := centralityThroughBoth(t, f, ctx2, seeds, candidates2)
+	requireEdgeBatchesMatchTheView(t, f, ctx2, view2, candidates2)
+	require.Equal(t, direct2, memo2, "after a route flip the memoized build must equal the new view's build")
+	require.NotEqual(t, direct.Scores, direct2.Scores, "the edit must change the neighbourhood, or this test proves nothing")
+
+	// The second worktree's stack shares the dedicated root and nothing
+	// else: its levels are other generations at the same depths, and must
+	// never be answered from the first worktree's memo.
+	require.NotEmpty(t, primaryID)
+	require.True(t, f.srv.lifecycle.ActivateCheckout(primaryID, "adjacency-memo-test"))
+	var primaryView *requestView
+	require.Eventually(t, func() bool {
+		v, selectErr := f.srv.selectRequestView(context.Background(),
+			graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: primaryID}, requestViewPolicy{})
+		if selectErr != nil || v == nil {
+			return false
+		}
+		primaryView = v
+		return true
+	}, 40*time.Second, 50*time.Millisecond, "the second worktree was never routed")
+	require.NotNil(t, primaryView)
+	t.Cleanup(primaryView.close)
+	t.Logf("second worktree generations: %v", primaryView.materialized.Generations())
+	primaryCtx := withRequestView(context.Background(), primaryView)
+	if primaryView.materialized.ComposesBaseCorpus() {
+		t.Fatal("fixture precondition: the second worktree's stack is rooted in the dedicated base")
+	}
+	candidates3 := adjacencyMemoCandidates(t, primaryView)
+	memo3, direct3 := centralityThroughBoth(t, f, primaryCtx, seeds, candidates3)
+	requireEdgeBatchesMatchTheView(t, f, primaryCtx, primaryView, candidates3)
+	require.Equal(t, direct3, memo3, "the second worktree's memoized build must equal its own view's build")
+	require.NotEqual(t, direct2.Scores, direct3.Scores, "the two checkouts' neighbourhoods must differ, or this proves nothing")
+}
+
+// TestSymbolSearchRanksAlikeThroughTheStackedMemo drives the whole symbol
+// search through the handler, before and after an edit, with and without the
+// memo, and requires the same ranked answer.
+func TestSymbolSearchRanksAlikeThroughTheStackedMemo(t *testing.T) {
+	f, _ := newAdjacencyMemoFixture(t)
+	f.srv.pprCache.enabled = false // compare fresh walks, never a cached one
+	search := func(query string) string {
+		req := mcplib.CallToolRequest{}
+		req.Params.Name = "search_symbols"
+		req.Params.Arguments = map[string]any{
+			"query": query, "limit": 20,
+			"view": map[string]any{"kind": "worktree", "checkout_id": f.checkoutID},
+		}
+		ctx := WithSessionCWD(WithSessionID(context.Background(), "adjacency-memo-search"), f.primary)
+		result, err := f.srv.wrapToolHandler(f.srv.handleSearchSymbols)(ctx, req)
+		require.NoError(t, err)
+		require.False(t, result.IsError, viewResultText(t, result))
+		return viewResultText(t, result)
+	}
+	compare := func(label string) {
+		for _, q := range []string{"Widget", "RenderWidget3", "BuildWidget", "render widget"} {
+			hitsBefore, missesBefore, edgeHitsBefore, edgeMissesBefore := f.srv.stackAdjacencyMemoFor().counts()
+			withMemo := search(q)
+			restoreRows := graphview.DisableGenerationRowsForTest()
+			hitsAfter, missesAfter, edgeHitsAfter, edgeMissesAfter := f.srv.stackAdjacencyMemoFor().counts()
+			// The fixture's null text backend answers a multi-word query with
+			// no candidates, so only the identifier queries reach the rerank.
+			require.True(t, strings.Contains(q, " ") || (hitsAfter-hitsBefore)+(missesAfter-missesBefore)+(edgeHitsAfter-edgeHitsBefore)+(edgeMissesAfter-edgeMissesBefore) > 0,
+				"%s: query %q never read through the stacked memo", label, q)
+			stackedAdjacencyDisabledForTest = true
+			withoutMemo := search(q)
+			stackedAdjacencyDisabledForTest = false
+			restoreRows()
+			require.Equal(t, withoutMemo, withMemo, "%s: query %q ranked differently through the memo", label, q)
+		}
+	}
+	compare("before the edit")
+	written := f.edit(t, f.worktree, map[string]any{
+		"path": "repo/widget5.go", "old_string": "func RenderWidget5(", "new_string": "func RenderWidgetRenamed5(",
+	})
+	require.False(t, written.IsError, viewResultText(t, written))
+	f.awaitMutation(t, f.worktree, written)
+	compare("after the edit")
 }
 
 // failingLevelReader answers a batch partially and reports an error, the shape
