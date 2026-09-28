@@ -68,6 +68,9 @@ type storeCore struct {
 	// derivedCorrectionEpochs counts finished derived-row corrections per
 	// generation (generation id → *atomic.Uint64); see derivation_stamps.go.
 	derivedCorrectionEpochs sync.Map
+	// walShrinkPending: the WAL reclaim reset a big log in place and its
+	// file still has to be shrunk in slices (wal_shrink.go).
+	walShrinkPending atomic.Bool
 	// rowCountersReady: generation_row_counts is installed and seeded, so
 	// NodeCount / EdgeCount read it (row_counters.go).
 	rowCountersReady atomic.Bool

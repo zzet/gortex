@@ -36,6 +36,16 @@ import (
 var (
 	// walReclaimPressureHold caps the writer step taken inside a busy lane.
 	walReclaimPressureHold = 50 * time.Millisecond
+	// walReclaimIdleResetHold caps the writer hold of the writer-free
+	// rounds' reset (the log already copied, no reader pinning it).
+	walReclaimIdleResetHold = walReclaimPressureHold
+	// walIdleResetHook, when set by a test, runs once the idle reset holds
+	// the write gate. nil in production.
+	walIdleResetHook func()
+	// walIdleResetResultHook, when set by a test, replaces the idle reset's
+	// error (an interrupt that arrives after the reset completed). nil in
+	// production.
+	walIdleResetResultHook func(error) error
 	// walReclaimPressureSmallFrames: the remainder the writer step may copy.
 	walReclaimPressureSmallFrames uint32 = 256
 	// walPressureOff disables the pressure mode, for the mutation checks
@@ -141,7 +151,7 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 		s.walCopy.pressureGiveUps.Add(1)
 		return fmt.Errorf("%w: %w", errWALPressureHold, err)
 	}
-	result, err := checkpointWALOnceOn(hctx, ckptDB, "TRUNCATE")
+	result, err := s.resetWALForReclaim(hctx)
 	if err != nil {
 		res.reason = fmt.Sprintf("pressure_reset busy=%d wal_frames=%d checkpointed=%d error=%v", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
 		s.walCopy.pressureGiveUps.Add(1)

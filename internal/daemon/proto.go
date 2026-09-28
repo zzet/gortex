@@ -559,6 +559,12 @@ type WALReclaimStatus struct {
 	RetirementWaits        int64 `json:"retirement_waits"`
 	RetirementWaitTimeouts int64 `json:"retirement_wait_timeouts"`
 	LeaseOverrides         int64 `json:"lease_overrides"`
+	// The incremental shrink: big logs reset in place, the slices that
+	// shrank their file, the bytes returned, the longest slice's writer hold.
+	ShrinkInPlaceResets  int64   `json:"shrink_in_place_resets"`
+	ShrinkSlices         int64   `json:"shrink_slices"`
+	ShrinkBytes          int64   `json:"shrink_bytes"`
+	ShrinkSliceHoldMaxMS float64 `json:"shrink_slice_hold_max_ms"`
 }
 
 // BuildLaneStatus is the view-build lane's state for daemon status.

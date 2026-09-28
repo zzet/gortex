@@ -1788,6 +1788,10 @@ func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus 
 		RetirementWaits:             st.RetirementWaits,
 		RetirementWaitTimeouts:      st.RetirementWaitTimeouts,
 		LeaseOverrides:              st.LeaseOverrides,
+		ShrinkInPlaceResets:         st.ShrinkInPlaceResets,
+		ShrinkSlices:                st.ShrinkSlices,
+		ShrinkBytes:                 st.ShrinkBytes,
+		ShrinkSliceHoldMaxMS:        durationMS(st.ShrinkSliceHoldMax),
 	}
 	if st.PauseCount > 0 {
 		out.PauseAvgMS = durationMS(st.PauseTotal / time.Duration(st.PauseCount))

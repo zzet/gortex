@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -874,7 +875,13 @@ func (s *Store) drainWALResidue(ctx context.Context) error {
 		return errWALCheckpointDeferredBulk
 	}
 	tctx, cancel := context.WithTimeout(ctx, walResidueTruncateBudget)
-	result, err := checkpointWALOnceOn(tctx, ckpt, "TRUNCATE")
+	// On the writer connection: see resetWALForReclaim.
+	var result walCheckpointResult
+	err = s.withWriterResetConn(tctx, func(conn *sql.Conn) error {
+		var err error
+		result, err = checkpointWALOnceOn(tctx, conn, "TRUNCATE")
+		return err
+	})
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {

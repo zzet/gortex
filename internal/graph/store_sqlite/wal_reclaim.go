@@ -40,8 +40,11 @@ import (
 //     refuse while a bulk connection is pinned, and PASSIVE the small delta;
 //  3. close the read-pool gate (sqliteReadGate): new reads wait, reads already
 //     in flight are waited for up to the drain deadline (default 250 ms);
-//  4. PRAGMA wal_checkpoint(TRUNCATE) on a dedicated checkpoint connection
-//     with a 100 ms busy timeout and its own budget, then reopen the gate.
+//  4. PRAGMA wal_checkpoint(TRUNCATE) on the writer connection (held under
+//     the write gate) with a 100 ms busy timeout and its own budget, then
+//     reopen the gate. The copies (PASSIVE) run on a dedicated checkpoint
+//     connection; the reset does not, because a log reset by another
+//     connection empties the writer connection's page cache.
 //
 // If the readers do not drain inside the deadline the gate reopens, nothing is
 // checkpointed, and the next attempt backs off exponentially (5 s .. 5 min).
@@ -267,6 +270,13 @@ type WALReclaimStats struct {
 	// gate); RetirementEditYieldTimeouts the waits that ran out.
 	RetirementEditYields        int64
 	RetirementEditYieldTimeouts int64
+	// The incremental shrink (wal_shrink.go): big logs reset in place, the
+	// slices that shrank their file afterwards, the bytes those slices
+	// returned, and the longest writer hold of one slice.
+	ShrinkInPlaceResets int64
+	ShrinkSlices        int64
+	ShrinkBytes         int64
+	ShrinkSliceHoldMax  time.Duration
 }
 
 type walReclaimState struct {
@@ -623,15 +633,43 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 				break
 			}
 			complete := perr == nil && !result.incomplete()
-			if complete && !s.writeWanted() {
+			if complete && !s.writeWanted() && walFileSize(walPath) < walShrinkInPlaceBytes {
 				// Let SQLite decide first: readers that began after a
 				// complete backfill hold slot 0 and do not block a reset. The
 				// TRUNCATE takes SQLite's write lock only for the reset
 				// itself (the log is already copied); a busy one returns
 				// within the checkpoint connection's busy timeout. Not while
 				// a mutation is waiting for the writer.
+				// The reset runs on the writer connection
+				// (resetWALForReclaim), so under the write gate: taken only
+				// if free within the budget, held at most
+				// walReclaimIdleResetHold, and handed back as soon as a
+				// write wants it.
 				tctx, tcancel := context.WithTimeout(wctx, cfg.truncateBudget)
-				_, terr := checkpointWALOnceOn(tctx, ckptDB, "TRUNCATE")
+				terr := s.writeMu.LockContext(tctx)
+				if terr == nil {
+					held := time.Now()
+					if hook := walIdleResetHook; hook != nil {
+						hook()
+					}
+					hctx, hcancel := context.WithTimeout(tctx, walReclaimIdleResetHold)
+					yctx, stopYield := s.yieldToWriters(hctx)
+					_, terr = s.resetWALForReclaim(yctx)
+					if hook := walIdleResetResultHook; hook != nil {
+						terr = hook(terr)
+					}
+					stopYield()
+					hcancel()
+					if terr != nil && walLogIsReset(s.dbPath, walPath) {
+						// The reset completed and the interrupt (a writer
+						// queued, or the hold ran out) arrived after it: the
+						// log is reset, and counted so. Checked before the
+						// gate is released, so no write can refill it first.
+						terr = nil
+					}
+					res.writerHold = time.Since(held)
+					s.writeMu.Unlock()
+				}
 				tcancel()
 				if terr == nil {
 					res.resetWriterFree = true
@@ -844,7 +882,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 			// gets the rest of the hold cap rather than a fixed slice: a big
 			// -wal can take longer than walReclaimTruncateBudget to free.
 			tctx, tcancel := context.WithDeadline(yctx, capAt)
-			_, terr := checkpointWALOnceOn(tctx, ckptDB, "TRUNCATE")
+			_, terr := s.resetWALForReclaim(tctx)
 			tcancel()
 			if terr == nil {
 				res.openGate = true
@@ -870,7 +908,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 			}
 		}
 		tctx, tcancel := context.WithDeadline(yctx, capAt)
-		result, terr := checkpointWALOnceOn(tctx, ckptDB, "TRUNCATE")
+		result, terr := s.resetWALForReclaim(tctx)
 		tcancel()
 		if terr == nil {
 			res.openGate = true
@@ -899,7 +937,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		}
 	}
 	tctx, tcancel := context.WithTimeout(yctx, cfg.truncateBudget)
-	result, err := checkpointWALOnceOn(tctx, ckptDB, "TRUNCATE")
+	result, err := s.resetWALForReclaim(tctx)
 	tcancel()
 	reopen()
 	res.pause, res.pauseClosed = time.Since(start), quiesce
@@ -1075,6 +1113,19 @@ func (s *Store) runWALReclaimLoop(cfg walReclaimConfig, walPath string, poll tim
 			// A residue drain handed its busy TRUNCATE over: try now.
 			schedule.nextAt = now
 		}
+		if s.walShrinkNeeded() {
+			// A log reset in place is shrunk in slices before anything
+			// else: its file is what the threshold measures.
+			if ckptDB == nil {
+				if db, err := openWALReclaimCheckpointDB(s.dbPath); err == nil {
+					ckptDB = db
+				}
+			}
+			if ckptDB != nil {
+				s.shrinkWALUntilStopped(ckptDB)
+			}
+			now = time.Now()
+		}
 		if !schedule.ready(now) || walFileSize(walPath) <= cfg.thresholdBytes {
 			continue
 		}
@@ -1091,7 +1142,27 @@ func (s *Store) runWALReclaimLoop(cfg walReclaimConfig, walPath string, poll tim
 		schedule.observeProgress(now, res.outcome, res.progressed)
 		s.walReclaim.update(func(st *WALReclaimStats) { st.Backoff = schedule.backoff })
 		logWALReclaimOutcome(res, schedule.nextAt.Sub(now), &skipLog, now)
+		if res.outcome == walReclaimReset && s.walShrinkNeeded() {
+			s.shrinkWALUntilStopped(ckptDB)
+		}
 	}
+}
+
+// shrinkWALUntilStopped runs the incremental shrink on the reclaim loop's
+// goroutine, cancelled by shutdown.
+func (s *Store) shrinkWALUntilStopped(ckptDB *sql.DB) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case <-s.stopCheckpoint:
+			cancel()
+		case <-finished:
+		}
+	}()
+	_, _, _ = s.shrinkWAL(ctx, ckptDB)
 }
 
 // walReclaimSkipLog rate-limits the skip line: a skip (someone else's bulk
@@ -1175,4 +1246,14 @@ func (s *Store) watchWALUrgency(parent context.Context, walPath string, urgentBy
 		}
 	}()
 	return ctx, cancel
+}
+
+// walLogIsReset reports whether the log is at its start: an empty file, or a
+// wal-index with no frames. The caller holds the write gate.
+func walLogIsReset(dbPath, walPath string) bool {
+	if walFileSize(walPath) == 0 {
+		return true
+	}
+	snap, ok := readWALIndexSnapshot(dbPath)
+	return ok && snap.MxFrame == 0
 }
