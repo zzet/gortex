@@ -524,8 +524,13 @@ func TestMaterializeCheckoutCompletenessRunsBottomUp(t *testing.T) {
 	if got := view.Completeness.State(CapSearchText); got != StateUnavailable {
 		t.Errorf("%s = %q, want %q", CapSearchText, got, StateUnavailable)
 	}
+	// graph.semantic is not seeded either: no layer of this stack declares
+	// it. See TestSemanticCompletenessNeedsEveryLayerToDeclareIt.
+	if got := view.Completeness.State(CapSemantic); got != StateUnavailable {
+		t.Errorf("%s = %q, want %q", CapSemantic, got, StateUnavailable)
+	}
 	for _, id := range KnownCapabilities() {
-		if id == CapResolutionCrossRepo || id == CapSearchText {
+		if id == CapResolutionCrossRepo || id == CapSearchText || id == CapSemantic {
 			continue
 		}
 		if got := view.Completeness.State(id); got != StateComplete {
@@ -1191,8 +1196,11 @@ func TestCompletenessOfAnEmptyStackDeniesTextSearch(t *testing.T) {
 	// And the denial is scoped to the one capability the rule governs: every
 	// other capability still reads off the seed, which is what keeps a stack
 	// that declares nothing from being refused wholesale.
+	if got := completeness.State(CapSemantic); got != StateUnavailable {
+		t.Errorf("an empty stack reports %s = %q, want %q", CapSemantic, got, StateUnavailable)
+	}
 	for _, id := range KnownCapabilities() {
-		if id == CapSearchText {
+		if id == CapSearchText || id == CapSemantic {
 			continue
 		}
 		if got := completeness.State(id); got != StateComplete {

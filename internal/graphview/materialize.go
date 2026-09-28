@@ -1160,14 +1160,22 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 		out[id] = StateComplete
 	}
 	topText := StateUnavailable
+	semanticSilent := len(generations) == 0
+	stack := make([]producerLayer, len(generations))
 	for index, handle := range generations {
 		rows, err := handle.ProducerStates()
 		if err != nil {
 			return nil, WrapViewError(CodeCheckoutInaccessible,
 				fmt.Sprintf("read producer states of generation %d", handle.ViewGeneration()), err)
 		}
+		stack[index].rows = rows
+	}
+	for index, handle := range generations {
 		top := index == len(generations)-1
-		for _, row := range rows {
+		if !declares(stack[index].rows, CapSemantic) {
+			semanticSilent = true
+		}
+		for _, row := range stack[index].rows {
 			id := CapabilityID(row.Producer)
 			state := capabilityStateOf(row.State)
 			if !id.Valid() || !state.Valid() {
@@ -1179,8 +1187,28 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 				}
 				continue
 			}
+			if row.State == store_sqlite.ProducerStateIncomplete && row.Reason == ReasonDeferredToFollowup {
+				satisfied, err := followupSatisfied(generations, stack, index, id)
+				if err != nil {
+					return nil, WrapViewError(CodeCheckoutInaccessible,
+						fmt.Sprintf("read file masks of generation %d", handle.ViewGeneration()), err)
+				}
+				if satisfied {
+					continue
+				}
+			}
 			out[id] = out[id].worst(state)
 		}
+	}
+	// graph.semantic has no seed to stand on: it is complete only when every
+	// generation of the stack declares it, and a silent generation reads as
+	// not complete. A base an older binary built never declares it (the
+	// capability did not exist then), and neither does a build without a
+	// semantic manager or whose stage the admission floor declined; none of
+	// them may read as holding the type checker's rows. Like text search, an
+	// empty stack denies it.
+	if semanticSilent {
+		out[CapSemantic] = out[CapSemantic].worst(StateUnavailable)
 	}
 	// Unconditional, deliberately. An empty stack has no top layer to read a
 	// declaration off, and "no layer declared it" is exactly the denial this
@@ -1191,6 +1219,16 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 	// nothing; it also stops depending on that distant precondition.
 	out[CapSearchText] = topText
 	return out, nil
+}
+
+// declares reports whether a generation's producer rows name id.
+func declares(rows []store_sqlite.ProducerCompleteness, id CapabilityID) bool {
+	for _, row := range rows {
+		if CapabilityID(row.Producer) == id {
+			return true
+		}
+	}
+	return false
 }
 
 // capabilityStateOf maps a producer's contribution state onto what a
@@ -1212,4 +1250,81 @@ func capabilityStateOf(state store_sqlite.ProducerState) CapabilityState {
 	default:
 		return CapabilityState("")
 	}
+}
+
+// producerLayer is one generation of a materialized stack as completeness
+// reads it: its producer rows, and (read on demand) the paths its file masks
+// cover.
+type producerLayer struct {
+	rows    []store_sqlite.ProducerCompleteness
+	covered map[string]struct{}
+	deleted map[string]struct{}
+	read    bool
+}
+
+func (l *producerLayer) coveredPaths(handle *store_sqlite.Store) (map[string]struct{}, error) {
+	if l.read {
+		return l.covered, nil
+	}
+	masks, err := handle.FileMasks()
+	if err != nil {
+		return nil, err
+	}
+	l.covered = make(map[string]struct{}, len(masks))
+	l.deleted = make(map[string]struct{})
+	for _, m := range masks {
+		if m.Mode == store_sqlite.OwnershipDelete {
+			l.deleted[m.FilePath] = struct{}{}
+			continue
+		}
+		l.covered[m.FilePath] = struct{}{}
+	}
+	l.read = true
+	return l.covered, nil
+}
+
+// followupSatisfied is the landing rule for data left behind to the
+// post-publication follow-up. A generation that recorded a producer
+// incomplete with ReasonDeferredToFollowup is satisfied, for this view, when
+// generations above it in the same stack that record the producer complete
+// cover every path it replaces (its deletions owe nothing; a path removed
+// above owes nothing either). Nothing sealed is rewritten: a view whose stack
+// lacks the follow-up's layer still reads incomplete, and an older binary,
+// which does not apply this rule, reads incomplete too (the cautious side).
+func followupSatisfied(generations []*store_sqlite.Store, stack []producerLayer, index int, id CapabilityID) (bool, error) {
+	owed, err := stack[index].coveredPaths(generations[index])
+	if err != nil {
+		return false, err
+	}
+	remaining := make(map[string]struct{}, len(owed))
+	for p := range owed {
+		remaining[p] = struct{}{}
+	}
+	for j := index + 1; j < len(generations) && len(remaining) > 0; j++ {
+		if _, err := stack[j].coveredPaths(generations[j]); err != nil {
+			return false, err
+		}
+		for p := range stack[j].deleted {
+			// A file removed above owes nothing.
+			delete(remaining, p)
+		}
+		complete := false
+		for _, row := range stack[j].rows {
+			if CapabilityID(row.Producer) == id && row.State == store_sqlite.ProducerStateComplete {
+				complete = true
+				break
+			}
+		}
+		if !complete {
+			continue
+		}
+		covered, err := stack[j].coveredPaths(generations[j])
+		if err != nil {
+			return false, err
+		}
+		for p := range covered {
+			delete(remaining, p)
+		}
+	}
+	return len(remaining) == 0, nil
 }

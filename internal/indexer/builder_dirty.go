@@ -57,6 +57,13 @@ func (e *DirtySnapshotChangedError) Retryable() bool { return true }
 type DirtyLayerRequest struct {
 	// RecomputeDerivedPaths: see BuildRequest.RecomputeDerivedPaths.
 	RecomputeDerivedPaths []string
+	// deferEnrichment: see BuildRequest.deferEnrichment.
+	deferEnrichment bool
+	// followupPaths makes the build the enrichment follow-up
+	// (enrichment_followup.go): these repository-relative paths join the
+	// change set as modified even when their input equals the parent's, and
+	// the build re-derives them with enrichment on.
+	followupPaths []string
 	// Identity names the generation. GenerationKind, TreeOID,
 	// ProvenanceCommitOID and LowerViewFingerprint are stamped by the builder
 	// from the dirty sample, so two builds of the same working-tree state
@@ -292,6 +299,9 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		next = resolvedFromFull(meta, entries)
 	}
 	clock.lap("prepare_manifest")
+	if len(req.followupPaths) > 0 {
+		changes = withFollowupPaths(changes, req.followupPaths, target)
+	}
 	changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
 	if err != nil {
 		return 0, BuildReport{}, err
@@ -335,9 +345,27 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	}
 	clock.lap("prepare_chain_census")
 
+	var enrich *EnrichmentStage
+	if !req.deferEnrichment {
+		// The working-tree layer is the one generation whose root is a
+		// directory a language server can be rooted at, and the one whose
+		// content nothing else on disk holds. Whether the stage actually
+		// runs is the enrichment manager's call — the build only says it has
+		// a working copy to offer. A deferred build offers none: its
+		// follow-up does (enrichment_followup.go).
+		enrich = &EnrichmentStage{
+			CheckoutID:     identity.CheckoutID,
+			Fingerprint:    identity.LowerViewFingerprint,
+			ChainCensus:    chainCensus,
+			BaseCensus:     baseCensus,
+			BaseCensusFunc: baseCensusFunc,
+		}
+	}
 	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
 		Identity:              identity,
 		RecomputeDerivedPaths: req.RecomputeDerivedPaths,
+		deferEnrichment:       req.deferEnrichment,
+		followup:              len(req.followupPaths) > 0,
 		// A delta over a parent stands on the parent's dirty chain: its
 		// per-stack caches are the commit stack's, with the chain composed
 		// per read (edit_delta_contract_cache.go).
@@ -348,18 +376,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		RepoPrefix:  req.RepoPrefix,
 		WorkspaceID: req.WorkspaceID,
 		ProjectID:   req.ProjectID,
-		// The working-tree layer is the one generation whose root is a
-		// directory a language server can be rooted at, and the one whose
-		// content nothing else on disk holds. Whether the stage actually runs
-		// is the enrichment manager's call — the build only says it has a
-		// working copy to offer.
-		Enrich: &EnrichmentStage{
-			CheckoutID:     identity.CheckoutID,
-			Fingerprint:    identity.LowerViewFingerprint,
-			ChainCensus:    chainCensus,
-			BaseCensus:     baseCensus,
-			BaseCensusFunc: baseCensusFunc,
-		},
+		Enrich:      enrich,
 		PrePublish: func(ctx context.Context, generationID int64) error {
 			if req.buildBarrier != nil {
 				req.buildBarrier()
@@ -854,4 +871,28 @@ func partialWorkingTreeManifest(
 		},
 		entries: entries,
 	}, "partial:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// withFollowupPaths adds the follow-up's owed paths to a change set as
+// modified: the tree has not moved, so the plan found nothing to change there,
+// but the follow-up re-derives them to enrich them. A path already in the
+// change set keeps its own change; one gone from the working copy is left to
+// the change set (its deletion is already published).
+func withFollowupPaths(changes []LayerPathChange, followup []string, target source.ContentSource) []LayerPathChange {
+	have := make(map[string]struct{}, len(changes))
+	for _, change := range changes {
+		have[change.Path] = struct{}{}
+	}
+	for _, p := range followup {
+		if _, dup := have[p]; dup {
+			continue
+		}
+		if _, err := target.Stat(p); err != nil {
+			continue
+		}
+		have[p] = struct{}{}
+		changes = append(changes, LayerPathChange{Path: p, Kind: LayerPathModified})
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	return changes
 }

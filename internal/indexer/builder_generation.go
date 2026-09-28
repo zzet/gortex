@@ -183,6 +183,17 @@ type BuildRequest struct {
 	// clone rows are recomputed, never carried (clone_carry.go).
 	RecomputeDerivedPaths []string
 
+	// deferEnrichment publishes the generation without the semantic
+	// enrichment stage (enrichment after publication): Enrich is left nil
+	// and graph.semantic is declared incomplete with
+	// graphview.ReasonDeferredToFollowup, so the follow-up
+	// (enrichment_followup.go) owes the generation's paths.
+	deferEnrichment bool
+	// followup marks the follow-up build itself: it re-derives the owed
+	// paths with enrichment on and declares graph.semantic and
+	// graph.similarity complete for them.
+	followup bool
+
 	// Base is the reader the affected closure is computed against: the layer
 	// the generation will sit on. It is read, never written.
 	Base LayerBase
@@ -2570,7 +2581,12 @@ func (b *SparseGenerationBuilder) declareProducers(
 		similarity.Reason = "near-duplicate detection ranks bodies against a corpus; " +
 			"a sparse generation ranks them against its file set"
 	}
-	if similarity.State == store_sqlite.ProducerStateIncomplete && len(report.ChangedBodyFiles) > 0 {
+	if req.followup && similarity.State == store_sqlite.ProducerStateIncomplete {
+		// The follow-up recomputed the owed paths' clone rows
+		// (RecomputeDerivedPaths): it completes what the layers below it
+		// deferred to it (graphview.followupSatisfied).
+		similarity.State, similarity.Reason = store_sqlite.ProducerStateComplete, ""
+	} else if similarity.State == store_sqlite.ProducerStateIncomplete && len(report.ChangedBodyFiles) > 0 {
 		// The generation holds a body whose clone rows were not carried
 		// (clone_carry.go): they are owed to the follow-up, which is what the
 		// token says; a layer without one keeps the reason above for good.
@@ -2601,6 +2617,9 @@ func (b *SparseGenerationBuilder) declareProducers(
 	}
 	if declaresText {
 		rows = append(rows, text)
+	}
+	if semanticRow, ok := b.semanticProducerRow(req, report); ok {
+		rows = append(rows, semanticRow)
 	}
 	lsp := lspProducerRow(req.Identity, report.Enrichment)
 	for _, capability := range []graphview.CapabilityID{
@@ -2934,6 +2953,32 @@ func (s *fileSetSource) Walk(ctx context.Context, fn func(source.FileMeta) error
 		}
 	}
 	return nil
+}
+
+// semanticProducerRow is the graph.semantic row of a working-tree generation.
+// A build that deferred its enrichment owes it to the follow-up (incomplete,
+// with the token); the follow-up, and a build whose enrichment ran inline,
+// declare it complete for the paths they cover. A build with no semantic
+// manager, or whose stage the admission floor declined, declares nothing: the
+// composition's default for a silent generation.
+func (b *SparseGenerationBuilder) semanticProducerRow(req BuildRequest, report *BuildReport) (store_sqlite.ProducerCompleteness, bool) {
+	if b.Semantic == nil || !enrichesWorkingCopy(req.Identity) {
+		return store_sqlite.ProducerCompleteness{}, false
+	}
+	switch {
+	case req.deferEnrichment:
+		return store_sqlite.ProducerCompleteness{
+			Producer: string(graphview.CapSemantic),
+			State:    store_sqlite.ProducerStateIncomplete,
+			Reason:   graphview.ReasonDeferredToFollowup,
+		}, true
+	case req.followup || len(report.Enrichment.Ran) > 0:
+		return store_sqlite.ProducerCompleteness{
+			Producer: string(graphview.CapSemantic),
+			State:    store_sqlite.ProducerStateComplete,
+		}, true
+	}
+	return store_sqlite.ProducerCompleteness{}, false
 }
 
 // measurePrepublish runs a build's pre-publish check and records its CPU,

@@ -686,6 +686,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// The load is minutes-long on a big module; bracket it so the log never
 	// goes silent between the manager's "starting" line and the result.
 	loadStart := time.Now()
+	loadUsage := readProcessUsage()
 	patterns := []string{"./..."}
 	var parseFile func(*token.FileSet, string, []byte) (*ast.File, error)
 	if useHandleRoots {
@@ -843,6 +844,9 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.String("targeted_wait", c.TargetedWait),
 				zap.String("warmup_state", c.WarmupState))
 		}
+		used := readProcessUsage().since(loadUsage)
+		fields = append(fields, zap.Int64("major_faults", used.majorFaults), zap.Int64("minor_faults", used.minorFaults),
+			zap.Float64("cpu_ms", float64(used.cpu.Microseconds())/1000))
 		p.logger.Info("go-types: package load done", fields...)
 	}
 	// A pass that loads zero (or only broken) packages completes "cleanly"
@@ -924,6 +928,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// aggregate hold time, longest hold, and slice count. refs_walk INCLUDES
 	// its inner write times (add_batch / reindex / confirm).
 	applyStarted := time.Now()
+	applyUsage, applyStore := readProcessUsage(), storeIOMarkOf(g)
 	var applyProjectionDur, applyDefsDur, applyRefsDur time.Duration
 	var applyAddBatchDur, applyReindexDur, applyConfirmDur time.Duration
 	var applyImplementsDur, applyStampsDur time.Duration
@@ -1354,8 +1359,13 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	result.LockWaitMs = resolveSlices.waited.Milliseconds()
 	if p.logger != nil {
+		used := readProcessUsage().since(applyUsage)
+		storeIO := storeIOSince(g, applyStore)
 		p.logger.Info("go-types: apply subphases",
 			zap.String("repo_prefix", repoPrefix),
+			zap.Int64("major_faults", used.majorFaults), zap.Int64("minor_faults", used.minorFaults),
+			zap.Float64("cpu_ms", float64(used.cpu.Microseconds())/1000),
+			zap.Any("store_io", storeIO),
 			zap.Duration("gate_parked", applyGateParked),
 			zap.Duration("apply_wall", time.Since(applyStarted)),
 			zap.Duration("mutex_waited", resolveSlices.waited),

@@ -701,6 +701,10 @@ type CheckoutCoordinator struct {
 	// (dirty_chain_compaction.go).
 	compaction dirtyChainCompactor
 
+	// followup is the enrichment follow-up's schedule
+	// (enrichment_followup.go).
+	followup enrichmentFollowup
+
 	// motion is what the checkout's file watcher reported, and the admission
 	// state of background cycles over a moving working tree
 	// (checkout_motion.go).
@@ -989,6 +993,7 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 		c.sourceMutationsClosing = true
 		c.mu.Unlock()
 		c.closeDirtyChainCompactor()
+		c.cancelEnrichmentFollowup()
 		if c.cancelLifetime != nil {
 			c.cancelLifetime()
 		}
@@ -1002,6 +1007,9 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 		if err := c.waitDirtyChainCompactions(ctx); err != nil {
 			return err
 		}
+		// A follow-up was canceled with the lifetime; its goroutine ends at
+		// its next step.
+		c.waitEnrichmentFollowups()
 		return c.waitSourceMutations(ctx)
 	case <-ctx.Done():
 		return ctx.Err()
@@ -1397,6 +1405,11 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	c.logSlowAdmission(reason, through, admission)
 	if out.CompactionScheduled {
 		c.scheduleDirtyChainCompaction(out)
+	}
+	if out.DirtyBuilt && out.Err == nil {
+		// The edit published without its semantic enrichment: the
+		// follow-up owes it once the checkout is quiet.
+		c.scheduleEnrichmentFollowup()
 	}
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
@@ -3239,6 +3252,7 @@ type dirtyLayerBuild struct {
 func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 	ctx context.Context, graphID string, commitGeneration int64,
 	parent dirtyParentSelection, first *gitstate.DirtySnapshot, fallbackReason string,
+	options ...func(*DirtyLayerRequest),
 ) (dirtyLayerBuild, error) {
 	baseGeneration := commitGeneration
 	if parent.Parent > 0 {
@@ -3290,6 +3304,11 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 			// stays one delta.
 			importLarge:    true,
 			continueImport: c.importInProgress(ctx, parent.Parent),
+			// Enrichment after publication (enrichment_followup.go).
+			deferEnrichment: c.defersEnrichment(),
+		}
+		for _, option := range options {
+			option(&req)
 		}
 		if attempt == 0 {
 			req.before = first
