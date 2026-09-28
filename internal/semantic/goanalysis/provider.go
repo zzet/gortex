@@ -516,6 +516,10 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		loadAttempted              bool
 		compilerProjectionComplete bool
 		projectedUseCount          int
+		usePackagesScanned         int
+		usePackagesSkipped         int
+		useIdentsScanned           int
+		useIdentsSkipped           int
 	)
 	var compilerHeapBaseline runtime.MemStats
 	if largeAdmission {
@@ -575,6 +579,10 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.Bool("projection_complete", compilerProjectionComplete),
 				zap.Bool("forced_gc", forceGC),
 				zap.Int("projected_uses", projectedUseCount),
+				zap.Int("use_packages_scanned", usePackagesScanned),
+				zap.Int("use_packages_skipped", usePackagesSkipped),
+				zap.Int("use_idents_scanned", useIdentsScanned),
+				zap.Int("use_idents_skipped", useIdentsSkipped),
 				zap.Uint64("heap_alloc_before_load", compilerHeapBaseline.HeapAlloc),
 				zap.Uint64("heap_alloc_before_release", heapBeforeRelease.HeapAlloc),
 				zap.Uint64("heap_growth", heapGrowth),
@@ -801,7 +809,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// external string identities only. Clearing each packages.Package afterwards
 	// breaks AST/types/import closures while preserving Name/PkgPath/Module for
 	// the externals metadata map.
-	usePlan, err := projectGoUsesAndReleaseCompilerState(
+	usePlan, useStats, err := projectGoUsesAndReleaseCompilerStateWithStats(
 		ctx, pkgs, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals,
 	)
 	if err != nil {
@@ -809,6 +817,10 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	defer usePlan.release()
 	projectedUseCount = usePlan.len()
+	usePackagesScanned = useStats.packagesScanned
+	usePackagesSkipped = useStats.packagesSkipped
+	useIdentsScanned = useStats.identsScanned
+	useIdentsSkipped = useStats.identsSkipped
 	compilerProjectionComplete = true
 	externalNodeIDs = nil
 
@@ -927,7 +939,23 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 
 			if err := resolveSlices.with(ctx, func() error {
+				lookupStarted := time.Now()
 				candidates := graph.LookupEdgeCandidates(g, endpoints, sites)
+				lookupElapsed := time.Since(lookupStarted)
+				// Slow-page records expose candidate reads that were previously
+				// included only in refs_walk and mutex_held. They deliberately
+				// exclude lock wait and do not claim to measure all lookup time.
+				if p.logger != nil && lookupElapsed >= time.Second {
+					p.logger.Info("go-types: slow candidate lookup",
+						zap.String("repo_prefix", repoPrefix),
+						zap.String("backend", fmt.Sprintf("%T", g)),
+						zap.Int("package_index", pkgIndex),
+						zap.Int("use_offset", chunkStart),
+						zap.Int("uses", len(chunk)),
+						zap.Int("endpoint_requests", len(endpoints)),
+						zap.Int("site_requests", len(sites)),
+						zap.Duration("elapsed", lookupElapsed))
+				}
 				externals.edgeCandidates = &candidates
 				defer func() { externals.edgeCandidates = nil }()
 
@@ -1929,6 +1957,13 @@ func reclaimAndReleaseGoCompiler(sever func(), forceGC bool, collect, afterColle
 // ast/types walk. Returning from this helper, in addition to clearing every
 // packages.Package, guarantees range temporaries cannot remain GC roots when
 // the caller performs its one large-program reclamation cycle.
+type goUseProjectionStats struct {
+	packagesScanned int
+	packagesSkipped int
+	identsScanned   int
+	identsSkipped   int
+}
+
 func projectGoUsesAndReleaseCompilerState(
 	ctx context.Context,
 	pkgs []*packages.Package,
@@ -1938,17 +1973,44 @@ func projectGoUsesAndReleaseCompilerState(
 	objToNode map[types.Object]string,
 	externals *externalsAttribution,
 ) (*goUsePlan, error) {
+	plan, _, err := projectGoUsesAndReleaseCompilerStateWithStats(
+		ctx, pkgs, fset, absRoot, repoPrefix, funcIndex, objToNode, externals,
+	)
+	return plan, err
+}
+
+func projectGoUsesAndReleaseCompilerStateWithStats(
+	ctx context.Context,
+	pkgs []*packages.Package,
+	fset *token.FileSet,
+	absRoot, repoPrefix string,
+	funcIndex map[string]*fileFuncIndex,
+	objToNode map[types.Object]string,
+	externals *externalsAttribution,
+) (*goUsePlan, goUseProjectionStats, error) {
 	plan := newGoUsePlan(len(pkgs))
+	var stats goUseProjectionStats
 	for pkgIndex, pkg := range pkgs {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 		if pkg == nil || pkg.TypesInfo == nil {
 			releaseGoPackageCompilerState(pkg)
 			pkgs[pkgIndex] = nil
 			continue
 		}
-		packageUses := make([]resolvedGoUse, 0, len(pkg.TypesInfo.Uses))
+		uses := len(pkg.TypesInfo.Uses)
+		if !packageMayContainGraphVisibleGoCaller(pkg, fset, absRoot, repoPrefix, funcIndex) {
+			stats.packagesSkipped++
+			stats.identsSkipped += uses
+			plan.setPackage(pkgIndex, nil)
+			releaseGoPackageCompilerState(pkg)
+			pkgs[pkgIndex] = nil
+			continue
+		}
+		stats.packagesScanned++
+		stats.identsScanned += uses
+		packageUses := make([]resolvedGoUse, 0, uses)
 		for ident, obj := range pkg.TypesInfo.Uses {
 			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndex, objToNode, externals)
 			if ok {
@@ -1959,7 +2021,44 @@ func projectGoUsesAndReleaseCompilerState(
 		releaseGoPackageCompilerState(pkg)
 		pkgs[pkgIndex] = nil
 	}
-	return plan, nil
+	return plan, stats, nil
+}
+
+// packageMayContainGraphVisibleGoCaller retains packages with a graph-visible
+// caller and conservatively retains //line or /*line-directed syntax.
+// resolveGoUse maps each identifier's final position, which can differ from
+// file.Pos after a directive, so those packages must keep the exact
+// per-identifier walk.
+func packageMayContainGraphVisibleGoCaller(
+	pkg *packages.Package,
+	fset *token.FileSet,
+	absRoot, repoPrefix string,
+	funcIndex map[string]*fileFuncIndex,
+) bool {
+	if len(pkg.Syntax) == 0 {
+		return len(pkg.TypesInfo.Uses) > 0
+	}
+	for _, file := range pkg.Syntax {
+		if file == nil {
+			continue
+		}
+		for _, group := range file.Comments {
+			for _, comment := range group.List {
+				if strings.HasPrefix(comment.Text, "//line") || strings.HasPrefix(comment.Text, "/*line") {
+					return true
+				}
+			}
+		}
+		pos := fset.Position(file.Pos())
+		relPath := relativePath(pos.Filename, absRoot)
+		if relPath == "" {
+			continue
+		}
+		if funcIndex[scopedGraphPath(repoPrefix, relPath)] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveGoUse is the query-free normalization shared by both package walks
