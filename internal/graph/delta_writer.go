@@ -81,7 +81,7 @@ type DeltaWriter struct {
 
 	// writeMu serialises every write, so a claim's read-materialize-mark
 	// sequence is never interleaved with another write to the same source.
-	writeMu sync.Mutex
+	writeMu waitTimedMutex
 	// resolveMu is ResolveMutex's answer.
 	resolveMu sync.Mutex
 

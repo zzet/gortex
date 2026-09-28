@@ -189,7 +189,11 @@ func TestEditDeltaMatchesPrimaryPerSave(t *testing.T) {
 			if LastEditDeltaReport() == nil {
 				t.Fatalf("seed %d: not built by the delta path", seed)
 			}
-			t.Logf("delta: %+v", *LastEditDeltaReport())
+			// The stack cache key joins its parts with NUL bytes; the log
+			// carries its digest, so the output stays text.
+			logged := *LastEditDeltaReport()
+			logged.StackCacheKey = editDeltaKeyDigest(logged.StackCacheKey)
+			t.Logf("delta: %+v", logged)
 			if _, err := idx.IncrementalReindexPaths(repo.dir, touched); err != nil {
 				t.Fatalf("primary per-save: %v", err)
 			}

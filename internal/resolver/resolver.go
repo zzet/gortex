@@ -553,6 +553,9 @@ type Resolver struct {
 	priorBindings  map[string]PriorBinding
 	carriedReindex []graph.EdgeReindex
 	carriedJobs    []reindexJob
+	// applyLegs, when set, times the reindex apply's legs for the resolve
+	// leg running it (the "resolver: resolve legs" record).
+	applyLegs *attributionLegs
 
 	// priorDeclarations holds the changed files' declaration surfaces as they
 	// were immediately before the mutation an incremental resolve catches up,
@@ -3314,9 +3317,19 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	stats *ResolveStats,
 	detached ...*graph.Edge,
 ) {
+	legs := newAttributionLegs()
+	r.applyLegs = legs
+	attempted := 0
+	defer func() {
+		r.applyLegs = nil
+		r.logger.Info("resolver: resolve legs", append(legs.fields(),
+			zap.String("leg", "outgoing"), zap.Int("attempted", attempted))...)
+	}()
 	// Carried bindings (prior_bindings.go) ride this leg's single apply.
 	reindexBatch, jobs := r.takeCarriedReindexes()
-	if pending, err := r.prepareGoPackageFileFrontier(filePaths, nodesByFile, outByNode); err != nil {
+	pending, err := r.prepareGoPackageFileFrontier(filePaths, nodesByFile, outByNode)
+	legs.lap("go_package_prepare")
+	if err != nil {
 		stats.Unresolved += pending
 		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
 		r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
@@ -3327,6 +3340,7 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 			return
 		}
 		oldKind := edge.Kind
+		attempted++
 		oldTo, changed := r.resolveEdge(edge, stats)
 		if !changed {
 			return
@@ -3355,6 +3369,7 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	for _, edge := range detached {
 		resolveOne(edge)
 	}
+	legs.lap("resolve_edges")
 	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
 
@@ -3363,15 +3378,18 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	jobs []reindexJob,
 	stats *ResolveStats,
 ) {
+	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
 		r.graph.ReindexEdges(reindexBatch)
+		legs.lap("reindex")
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
 		reconcilePlaceholderSources(r.graph, nil, reindexBatch)
 		for _, ri := range reindexBatch {
 			r.noteRetargetedCall(ri.Edge)
 		}
+		legs.lap("placeholder_reconcile")
 	}
 	// Cross-package name-match guard — same contract as in ResolveAll.
 	if len(jobs) == 0 {
@@ -3385,7 +3403,10 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 			callerFiles = append(callerFiles, file)
 		}
 	}
-	if closure := r.buildImportClosureForCallerFiles(callerFiles); len(closure) > 0 {
+	closure := r.buildImportClosureForCallerFiles(callerFiles)
+	legs.lap("import_closure")
+	defer legs.lap("cross_package_guard")
+	if len(closure) > 0 {
 		if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
 			if stats.Resolved >= guarded {
 				stats.Resolved -= guarded
@@ -3668,10 +3689,21 @@ func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub ma
 	if len(stubKeys) == 0 {
 		return
 	}
+	legs := newAttributionLegs()
+	prevLegs := r.applyLegs
+	r.applyLegs = legs
+	attempted := 0
+	defer func() {
+		r.applyLegs = prevLegs
+		r.logger.Info("resolver: resolve legs", append(legs.fields(),
+			zap.String("leg", "incoming"), zap.Int("keys", len(stubKeys)), zap.Int("attempted", attempted))...)
+	}()
 	// A carried key's parked references were last attempted against the same
 	// candidates; only the restubbed ones are re-attempted (and prepared).
 	inByStub = r.incomingCarried.filter(stubKeys, inByStub)
-	if pending, err := r.prepareGoPackageIncomingFrontier(stubKeys, inByStub); err != nil {
+	pending, err := r.prepareGoPackageIncomingFrontier(stubKeys, inByStub)
+	legs.lap("go_package_prepare")
+	if err != nil {
 		stats.Unresolved += pending
 		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
 		return
@@ -3684,6 +3716,7 @@ func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub ma
 				continue
 			}
 			oldKind := edge.Kind
+			attempted++
 			stashed, prevTo := restubStash(edge)
 			oldTo, changed := r.resolveEdge(edge, stats)
 			// Restore the provenance the restub stashed when the stub rebound
@@ -3722,6 +3755,7 @@ func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub ma
 			}
 		}
 	}
+	legs.lap("resolve_edges")
 	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
 

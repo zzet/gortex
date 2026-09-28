@@ -341,3 +341,38 @@ func TestIncomingLegReadsFullRowsOnlyForParkedKeys(t *testing.T) {
 		t.Error("the parked key was never read in full")
 	}
 }
+
+// Each resolve leg of an incremental pass reports its sub-legs (the Go
+// package preparation, the per-reference resolution, the reindex and the
+// import closure) with the references it attempted, so a profile of a slow
+// leg is attributed by leg.
+func TestResolveLegsAreReportedPerLeg(t *testing.T) {
+	g, parked := declarationFixture(t, nil)
+	prior := priorOf(g.GetFileNodes("pkg/changed.go")...)
+	parked.To = "pkg/changed.go::Target"
+	graph.StashRestubProvenance(parked)
+	parked.To = "unresolved::Target"
+	core, logs := observer.New(zap.InfoLevel)
+	r := scopedResolver(t, g)
+	r.SetLogger(zap.New(core))
+	r.SetPriorDeclarations(prior)
+	r.ResolveFilesAndIncoming([]string{"pkg/changed.go"})
+	r.SetPriorDeclarations(nil)
+	legs := map[string]map[string]any{}
+	for _, entry := range logs.FilterMessage("resolver: resolve legs").All() {
+		fields := entry.ContextMap()
+		legs[fields["leg"].(string)] = fields
+	}
+	incoming, ok := legs["incoming"]
+	if !ok {
+		t.Fatalf("no incoming resolve legs record: %v", legs)
+	}
+	if incoming["attempted"] != int64(1) {
+		t.Fatalf("incoming attempted = %v, want the one restubbed reference", incoming["attempted"])
+	}
+	for _, leg := range []string{"go_package_prepare", "resolve_edges", "reindex", "import_closure"} {
+		if _, ok := incoming[leg]; !ok {
+			t.Errorf("incoming legs lack %s: %v", leg, incoming)
+		}
+	}
+}

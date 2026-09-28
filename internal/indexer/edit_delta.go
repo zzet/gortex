@@ -142,11 +142,17 @@ type EditDeltaReport struct {
 	// false when the plan was read from the pass's own rows
 	// (editDeltaDependents).
 	DependentsWalked bool
-	// LayerRowsByRead splits the delta's layer rows by the read that
-	// composed them; BelowRowsServed counts the rows the payload's
-	// comparisons took from the stack's below-rows source.
-	LayerRowsByRead map[string]int
-	BelowRowsServed int
+	// PayloadRows attributes the payload's rows by owner and edge kind, and
+	// PayloadSteps times Payload's steps (graph.DeltaPayload).
+	PayloadRows  graph.DeltaPayloadRows
+	PayloadSteps map[string]float64
+	// PayloadStepLayerRows / PhaseLayerRows are the rows read from the
+	// layers below per Payload step and per delta phase; LayerRowsByRead
+	// splits the delta's total by the read that composed them.
+	PayloadStepLayerRows map[string]int
+	PhaseLayerRows       map[string]int
+	LayerRowsByRead      map[string]int
+	BelowRowsServed      int
 	// Dependents are the unchanged files the delta re-derived because the
 	// change can move their own rows (editDeltaDependents).
 	Dependents []string
@@ -164,18 +170,35 @@ type EditDeltaReport struct {
 	// major page faults the process took meanwhile.
 	// PhaseFaults are the major page faults per delta phase (Phases).
 	PhaseFaults map[string]int64
-	// AffectedByKeys is how many declarations of the changed files the
-	// affected-by plan found changed in shape, AffectedByKeySample the first
-	// of them, and AffectedByFiles how many referrer files it re-resolved.
-	AffectedByKeys      int
-	AffectedByKeySample []string
-	AffectedByFiles     int
+	// PhaseCPU is the process CPU (every goroutine's, RUSAGE_SELF) and
+	// PhaseReaderWait the store readers' gate and pool wait during each
+	// phase. A phase whose wall is close to PhaseCPU was working; one whose
+	// wall far exceeds both was waiting for the processor or on I/O.
+	PhaseCPU        map[string]time.Duration
+	PhaseReaderWait map[string]time.Duration
+	// PhaseStoreWaits is each phase's store waits by kind (the writer pool,
+	// SQLite's busy and WAL-retry sleeps, read-transaction time).
+	PhaseStoreWaits map[string]store_sqlite.ReaderWaitSplit
+	// PhaseSchedWait / PhaseSchedWaits are the runnable waits (for a
+	// processor) that ended during each phase, process-wide: their estimated
+	// total and their count (sched_latency_mark.go).
+	PhaseSchedWait  map[string]time.Duration
+	PhaseSchedWaits map[string]int64
+	// SleepGaugeInstalled is the store's SQLite sleep gauge state at the
+	// delta: a zero busy or WAL-retry sleep is a measured zero only when set.
+	SleepGaugeInstalled bool
 	// ChainLayersOverlaid is how many dirty-chain layers the delta composed
 	// per read over the per-stack caches kept for the stack below them.
 	ChainLayersOverlaid int
 	// ChainKeeper is the per-layer keeper's counters after the delta:
 	// layers, rows, hits, loads, declined.
 	ChainKeeper [5]int
+	// AffectedByKeys is how many declarations of the changed files the
+	// affected-by plan found changed in shape, AffectedByKeySample the first
+	// of them, and AffectedByFiles how many referrer files it re-resolved.
+	AffectedByKeys      int
+	AffectedByKeySample []string
+	AffectedByFiles     int
 	// carryRegistry files the delta's final contract registry under the
 	// published generation's stack (edit_delta_contract_cache.go); nil when
 	// the delta's registry was not keyed.
@@ -315,7 +338,9 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 			return err
 		}
 		enrichWAL, enrichTx, enrichIO, enrichStarted := handle.WALWriteMark(), store_sqlite.WriteTransactionsBegun(), editDeltaProcessIO(), time.Now()
+		enrichCPU, enrichStore := processCPUTime(), b.storeWaitMark()
 		b.runEnrichment(ctx, req, handle, &report)
+		enrichStageMs := float64(time.Since(enrichStarted).Microseconds()) / 1000
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -327,6 +352,13 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 				zap.Strings("paths", delta.Paths),
 				zap.Strings("ran", report.Enrichment.Ran),
 				zap.Float64("ms", float64(time.Since(enrichStarted).Microseconds())/1000),
+				// stage_ms is the enrichment stage itself (the go/types load
+				// and apply, each with its own faults, CPU and store I/O on
+				// the provider's lines); the rest of ms settles and claims
+				// the stage's rows.
+				zap.Float64("stage_ms", enrichStageMs),
+				zap.Float64("cpu_ms", float64((processCPUTime()-enrichCPU).Microseconds())/1000),
+				zap.Any("store_io", storeWaitMillis(b.storeWaitMark().Split(enrichStore))),
 				zap.Int64("major_faults", editDeltaProcessIO().since(enrichIO).majorFaults),
 				zap.Int64("wal_bytes", store_sqlite.WALWrittenBetween(enrichWAL, handle.WALWriteMark()).Bytes),
 				zap.Int64("write_tx", store_sqlite.WriteTransactionsBegun()-enrichTx),
@@ -345,7 +377,9 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		}
 		report.Work.mark("separate_masks_producers")
 		if req.PrePublish != nil {
-			if err := req.PrePublish(withBuildReadSet(ctx, plan.indexed, nil, plan.deleted), generationID); err != nil {
+			if err := b.measurePrepublish(&report, func() error {
+				return req.PrePublish(withBuildReadSet(ctx, plan.indexed, nil, plan.deleted), generationID)
+			}); err != nil {
 				return err
 			}
 		}
@@ -439,14 +473,66 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	ioStarted := editDeltaProcessIO()
 	ioLast := ioStarted
 	out.PhaseFaults = make(map[string]int64)
+	out.PhaseCPU = make(map[string]time.Duration)
+	out.PhaseReaderWait = make(map[string]time.Duration)
+	out.PhaseStoreWaits = make(map[string]store_sqlite.ReaderWaitSplit)
+	out.PhaseSchedWait = make(map[string]time.Duration)
+	out.PhaseSchedWaits = make(map[string]int64)
+	schedLast := readSchedMark()
+	storeMark := func() store_sqlite.ReaderWaitMark {
+		if b.Store == nil {
+			return store_sqlite.ReaderWaitMark{}
+		}
+		return b.Store.ReaderWaitMark()
+	}
+	cpuLast, storeLast := processCPUTime(), storeMark()
 	out.PhaseWALBytes = make(map[string]int64)
 	out.PhaseWriteTx = make(map[string]int64)
+	out.PhaseLayerRows = make(map[string]int)
 	walLast, txLast := handle.WALWriteMark(), store_sqlite.WriteTransactionsBegun()
+	layerRowsLast := 0
+	var layerRowsOf func() int
 	lap := func(name string) {
 		clock.lap(name)
+		if layerRowsOf != nil {
+			if rows := layerRowsOf(); rows > layerRowsLast {
+				out.PhaseLayerRows[name] += rows - layerRowsLast
+				layerRowsLast = rows
+			}
+		}
 		now := editDeltaProcessIO()
 		out.PhaseFaults[name] += now.since(ioLast).majorFaults
 		ioLast = now
+		cpuNow, storeNow := processCPUTime(), storeMark()
+		out.PhaseCPU[name] += cpuNow - cpuLast
+		split := storeNow.Split(storeLast)
+		out.PhaseReaderWait[name] += split.Gate + split.ReadPool
+		acc := out.PhaseStoreWaits[name]
+		acc.Gate += split.Gate
+		acc.ReadPool += split.ReadPool
+		acc.WriterPool += split.WriterPool
+		acc.BusySleep += split.BusySleep
+		acc.WALRetrySleep += split.WALRetrySleep
+		acc.BusySleeps += split.BusySleeps
+		acc.WALRetries += split.WALRetries
+		acc.ReadTxn += split.ReadTxn
+		acc.ReadTxns += split.ReadTxns
+		acc.CacheHits += split.CacheHits
+		acc.CacheMisses += split.CacheMisses
+		acc.CacheSpills += split.CacheSpills
+		acc.MappedPages += split.MappedPages
+		acc.WriterCacheHits += split.WriterCacheHits
+		acc.WriterCacheMisses += split.WriterCacheMisses
+		acc.WriterCacheSpills += split.WriterCacheSpills
+		acc.VFS = addVFSIOSplit(acc.VFS, split.VFS)
+		out.PhaseStoreWaits[name] = acc
+		cpuLast, storeLast = cpuNow, storeNow
+		schedNow := readSchedMark()
+		waits, waited := schedNow.since(schedLast)
+		out.PhaseSchedWait[name] += waited
+		out.PhaseSchedWaits[name] += waits
+		schedLast = schedNow
+		out.SleepGaugeInstalled = storeNow.Sleep.Installed
 		walNow, txNow := handle.WALWriteMark(), store_sqlite.WriteTransactionsBegun()
 		if wal := store_sqlite.WALWrittenBetween(walLast, walNow); wal.Bytes > 0 {
 			out.PhaseWALBytes[name] += wal.Bytes
@@ -457,6 +543,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		walLast, txLast = walNow, txNow
 	}
 	dw := graph.NewDeltaWriter(req.Base, handle)
+	layerRowsOf = func() int { return dw.DeltaStats().LayerRowsRead }
 	// The per-stack caches (edit_delta_contract_cache.go). Over a dirty chain
 	// they are kept for the stack below it and the delta composes the chain's
 	// layers per read; keyBase is the base every key below is taken from, and
@@ -485,6 +572,9 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	idx := New(dw, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
+	if store := b.Store; store != nil {
+		idx.storeWaits = store.ReaderWaitMark
+	}
 	// The project name shapes every symbol search document (a whole index
 	// detects it from the root it walks); the per-save engine never walks.
 	if absRoot, err := filepath.Abs(req.RootPath); err == nil {
@@ -786,6 +876,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		handle.AddBatch(rows, nil)
 		sort.Strings(identityClaims)
 	}
+	lap("write_sentinels")
 	masks := make([]store_sqlite.FileMask, 0, len(payload.ReplacePaths)+len(payload.DeletePaths)+len(plan.deleted))
 	claimed := make(map[string]struct{}, len(payload.ReplacePaths)+len(payload.DeletePaths))
 	for _, p := range payload.ReplacePaths {
@@ -846,14 +937,16 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	out.SlowReads = stats.SlowReads
 	out.WholeLayerLoads, out.WholeLayerRows = stats.WholeLayerLoads, stats.WholeLayerRows
 	out.LayerRowsRead = stats.LayerRowsRead
-	out.LayerRowsByRead = stats.LayerRowsByRead
-	out.BelowRowsServed = stats.BelowRowsServed
 	out.PayloadNodes, out.PayloadEdges = len(payload.Nodes), len(payload.Edges)
 	out.ReplacePaths, out.DeletePaths = len(payload.ReplacePaths), len(payload.DeletePaths)
 	out.EdgeSources, out.Tombstones = len(payload.EdgeSources), len(payload.Tombstones)
 	out.DroppedPaths, out.DroppedSources, out.DroppedNodes = payload.DroppedPaths, payload.DroppedSources, payload.DroppedNodes
 	out.OrphanEdges = payload.OrphanEdges
 	out.RestatedNodes, out.RestatedEdges = payload.RestatedNodes, payload.RestatedEdges
+	out.PayloadRows, out.PayloadSteps = payload.Rows, payload.Steps
+	out.PayloadStepLayerRows = payload.StepLayerRows
+	out.LayerRowsByRead = stats.LayerRowsByRead
+	out.BelowRowsServed = stats.BelowRowsServed
 	out.IdentityClaims = len(identityClaims)
 
 	report.NodeCount, report.EdgeCount = len(payload.Nodes), len(payload.Edges)
@@ -886,8 +979,13 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Int("whole_layer_rows", out.WholeLayerRows),
 			zap.Int("layer_rows_read", out.LayerRowsRead),
 			zap.Bool("dependents_walked", out.DependentsWalked),
+			zap.Any("payload_rows", out.PayloadRows),
+			zap.Any("payload_steps", out.PayloadSteps),
+			zap.Any("payload_step_layer_rows", out.PayloadStepLayerRows),
+			zap.Any("phase_layer_rows", out.PhaseLayerRows),
 			zap.Any("layer_rows_by_read", out.LayerRowsByRead),
 			zap.Int("below_rows_served", out.BelowRowsServed),
+			zap.Strings("dependents", out.Dependents),
 			zap.Int("resolve_frontier", out.ResolveFrontier),
 			zap.Float64("resolve_ms", float64(out.ResolveDuration.Microseconds())/1000),
 			zap.Int64("resolve_major_faults", out.ResolveFaults),
@@ -895,11 +993,23 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Bool("contract_registry_cached", out.ContractRegistryCached),
 			zap.Bool("base_projection_cache", baseCache != nil),
 			zap.Any("phase_major_faults", out.PhaseFaults),
+			zap.Any("phase_cpu_ms", editDeltaPhaseMillis(out.PhaseCPU)),
+			zap.Any("phase_reader_wait_ms", editDeltaPhaseMillis(out.PhaseReaderWait)),
+			zap.Any("phase_store_waits", editDeltaPhaseStoreWaits(out.PhaseStoreWaits)),
+			zap.Any("phase_sched_wait_ms", editDeltaPhaseMillis(out.PhaseSchedWait)),
+			zap.Any("phase_sched_waits", out.PhaseSchedWaits),
+			zap.Bool("sqlite_sleep_gauge_installed", out.SleepGaugeInstalled),
 			zap.Any("phase_wal_bytes", out.PhaseWALBytes),
 			zap.Any("phase_write_tx", out.PhaseWriteTx),
 			zap.Strings("stack", dw.StackShape()),
+			// chain_depth is the number of layers the delta composes over the
+			// store (the commit layer and the working-tree chain above it): a
+			// file's rows sit beside every generation's copy of them, so the
+			// delta's writes and evictions grow with it until a fold.
+			zap.Int("chain_depth", len(dw.StackShape())-1),
 		}
-		fields = append(fields, zap.Int("chain_layers_overlaid", out.ChainLayersOverlaid))
+		fields = append(fields, zap.String("stack_cache_key", editDeltaKeyDigest(out.StackCacheKey)),
+			zap.Int("chain_layers_overlaid", out.ChainLayersOverlaid))
 		if keeper := dw.ChainLayerRowsKeeper(); keeper != nil {
 			layers, rows, hits, loads, declined := keeper.Counters()
 			out.ChainKeeper = [5]int{layers, rows, hits, loads, declined}
@@ -973,3 +1083,21 @@ func editDeltaResolverRowFTS(idx *Indexer, handle *store_sqlite.Store, nodes []*
 // facts the base adds are served by the delta through graph.RefFactsReader on
 // the base itself, which Unwrap does not bypass.
 func (b commitLayerBase) Unwrap() graph.Reader { return b.Reader }
+
+// editDeltaPhaseMillis renders per-phase durations in milliseconds.
+func editDeltaPhaseMillis(phases map[string]time.Duration) map[string]float64 {
+	out := make(map[string]float64, len(phases))
+	for name, d := range phases {
+		out[name] = float64(d.Microseconds()) / 1000
+	}
+	return out
+}
+
+// editDeltaPhaseStoreWaits renders each phase's store waits by kind.
+func editDeltaPhaseStoreWaits(phases map[string]store_sqlite.ReaderWaitSplit) map[string]map[string]float64 {
+	out := make(map[string]map[string]float64, len(phases))
+	for name, w := range phases {
+		out[name] = storeWaitMillis(w)
+	}
+	return out
+}

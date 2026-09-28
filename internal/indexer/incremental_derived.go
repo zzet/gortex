@@ -77,10 +77,17 @@ type IncrementalDerivedReport struct {
 	// HierarchyRepublished counts the implements/overrides rows republished
 	// from the prior instead of re-inferred.
 	HierarchyRepublished int
-	FrameworkMs          int64
-	ExternalCallsMs      int64
-	CrossRepoMs          int64
-	ContractsMs          int64
+	// PassFaults is the major page faults per derived pass, keyed like the
+	// *Ms fields (hierarchy, tests, capability, framework, …).
+	PassFaults map[string]int64
+	// PassCPUMs is the process CPU per derived pass, keyed like PassFaults:
+	// set beside the pass's wall time, it says whether a slow pass worked or
+	// waited.
+	PassCPUMs       map[string]int64
+	FrameworkMs     int64
+	ExternalCallsMs int64
+	CrossRepoMs     int64
+	ContractsMs     int64
 }
 
 // runStandaloneIncrementalDerivedPasses reuses the exact MultiIndexer derived
@@ -244,6 +251,21 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 	report.Files = len(merged.Files)
 	report.TypeIDs = len(merged.TypeIDs)
 	report.LegacyFallback = merged.LegacyFallback
+	// Major page faults per pass (the store's pages read from disk), keyed
+	// like the *_ms fields.
+	report.PassFaults = map[string]int64{}
+	faultsAt, cpuAt := editDeltaProcessIO(), processCPUTime()
+	notePassFaults := func(pass string) {
+		now, cpu := editDeltaProcessIO(), processCPUTime()
+		if f := now.since(faultsAt).majorFaults; f > 0 {
+			report.PassFaults[pass] += f
+		}
+		if report.PassCPUMs == nil {
+			report.PassCPUMs = make(map[string]int64)
+		}
+		report.PassCPUMs[pass] += (cpu - cpuAt).Milliseconds()
+		faultsAt, cpuAt = now, cpu
+	}
 
 	// A single unprefixed repo cannot use repo-scoped readers. Falling back to
 	// nil here preserves the old whole-graph behavior, which is still bounded
@@ -314,6 +336,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		report.Implements = r.InferImplementsForFrontier(typeFrontier)
 		report.Overrides = r.InferOverridesForFrontier(typeFrontier)
 		report.HierarchyMs += time.Since(phase).Milliseconds()
+		notePassFaults("hierarchy")
 	}
 
 	// The resolution step of this same apply may have bound pending calls
@@ -322,6 +345,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 	// only). Drain that retargeted frontier and reconcile those callers
 	// regardless of plan flags — without it a call that resolves later
 	// than its projection pass never gains its EdgeTests.
+	notePassFaults("prelude")
 	phase := time.Now()
 	retargeted := mi.drainRetargetedTestCallFiles(prefixSet)
 	if merged.Flags.Has(DerivedInvalidatesRuntime) || merged.Flags.Has(DerivedInvalidatesTests) {
@@ -334,6 +358,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, retargeted...)
 	}
 	report.TestsMs = time.Since(phase).Milliseconds()
+	notePassFaults("tests")
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) && len(merged.TypeIDs) > 0 {
 		phase = time.Now()
 		// A save that adds/re-parents a type can hang a new derived type
@@ -341,6 +366,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		// frontier drives seed discovery, like the scoped passes above.
 		report.EntryPointHierarchy = entrypoints.PropagateEntryPointsDownHierarchyScoped(mi.graph, merged.TypeIDs)
 		report.HierarchyMs += time.Since(phase).Milliseconds()
+		notePassFaults("hierarchy")
 	}
 	capabilityAt := capabilityReuseCounts()
 	if merged.Flags.Has(DerivedInvalidatesRuntime) {
@@ -353,6 +379,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		}
 		report.Capability = readsEnv + execProc + fields
 		report.CapabilityMs = time.Since(phase).Milliseconds()
+		notePassFaults("capability")
 	} else if prior.covers(merged.Files) {
 		// The runtime fingerprint is unchanged, but every file here was
 		// structurally re-parsed: the eviction deleted the capability rows its
@@ -363,6 +390,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		readsEnv, execProc, fields := synthesizeCapabilityEdgesForFilesWithPrior(mi.graph, prior, merged.Files)
 		report.Capability = readsEnv + execProc + fields
 		report.CapabilityMs = time.Since(phase).Milliseconds()
+		notePassFaults("capability")
 	}
 	frameworkRuns := merged.Flags.Has(DerivedInvalidatesDeclarations) ||
 		merged.Flags.Has(DerivedInvalidatesImports) ||
@@ -373,6 +401,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		phase = time.Now()
 		report.Framework = resolver.ResolveFnValueCallbacksForFiles(mi.graph, merged.Files, prior.fnValue)
 		report.FrameworkMs = time.Since(phase).Milliseconds()
+		notePassFaults("framework")
 	}
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) ||
 		merged.Flags.Has(DerivedInvalidatesImports) ||
@@ -415,19 +444,23 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
 		report.FrameworkScopeRows = framework.ScopeRows
 		report.FrameworkScopeBytes = framework.ScopeBytes
 		report.FrameworkMs = time.Since(phase).Milliseconds()
+		notePassFaults("framework")
 		phase = time.Now()
 		report.ExternalCalls = resolver.SynthesizeExternalCallsForFiles(
 			mi.graph, mi.externalCallSynthesisEnabled(), merged.Files,
 		)
 		report.ExternalCallsMs = time.Since(phase).Milliseconds()
+		notePassFaults("external_calls")
 		phase = time.Now()
 		report.CrossRepo = resolver.DetectCrossRepoEdgesForFiles(mi.graph, merged.Files)
 		report.CrossRepoMs = time.Since(phase).Milliseconds()
+		notePassFaults("cross_repo")
 	}
 	if merged.Flags.Has(DerivedInvalidatesContracts) {
 		phase = time.Now()
 		report.Contracts = mi.ReconcileContractEdgesForFrontier(merged)
 		report.ContractsMs = time.Since(phase).Milliseconds()
+		notePassFaults("contracts")
 	}
 
 	capabilityNow := capabilityReuseCounts()
@@ -488,6 +521,8 @@ func (mi *MultiIndexer) logIncrementalDerived(report IncrementalDerivedReport, p
 		zap.Int64("external_calls_ms", report.ExternalCallsMs),
 		zap.Int64("cross_repo_ms", report.CrossRepoMs),
 		zap.Int64("contracts_ms", report.ContractsMs),
+		zap.Any("derived_faults", report.PassFaults),
+		zap.Any("derived_cpu_ms", report.PassCPUMs),
 		zap.Int("hierarchy_republished", report.HierarchyRepublished),
 		zap.Int64("duration_ms", report.DurationMs))
 }

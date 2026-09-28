@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"time"
 )
 
 // DeltaPayload is what a delta publishes: the rows that differ from the view
@@ -48,6 +49,28 @@ type DeltaPayload struct {
 	// generation to restate because it replaces the whole path.
 	RestatedNodes int
 	RestatedEdges int
+
+	// Rows attributes the payload's rows to where they come from and what
+	// they are (DeltaPayloadRows); Steps times Payload's own steps, in ms.
+	Rows  DeltaPayloadRows
+	Steps map[string]float64
+	// StepLayerRows is, per step, the rows read from the layers below.
+	StepLayerRows map[string]int
+}
+
+// DeltaPayloadRows attributes a payload's rows by owner: the replaced paths'
+// own rows (the whole-file replace mask's minimum for those paths), rows of
+// identities outside them (detached nodes, carried with a tombstone), and the
+// outgoing rows of claimed sources the payload republishes whole because
+// their final outgoing set outside the replaced paths moved. Edge counts are
+// also split by edge kind.
+type DeltaPayloadRows struct {
+	OwnNodes          int            `json:"own_nodes"`
+	OwnEdges          int            `json:"own_edges"`
+	DetachedNodes     int            `json:"detached_nodes"`
+	SourceEdges       int            `json:"source_edges"`
+	OwnEdgesByKind    map[string]int `json:"own_edges_by_kind,omitempty"`
+	SourceEdgesByKind map[string]int `json:"source_edges_by_kind,omitempty"`
 }
 
 // deltaEdgeRender is an edge's persisted content, the fields a store keeps.
@@ -169,6 +192,19 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 	defer dw.writeMu.Unlock()
 	defer dw.claimingFor("Payload")()
 	var out DeltaPayload
+	out.Steps = make(map[string]float64)
+	out.Rows.OwnEdgesByKind = make(map[string]int)
+	out.Rows.SourceEdgesByKind = make(map[string]int)
+	out.StepLayerRows = make(map[string]int)
+	stepAt, rowsAt := time.Now(), dw.layerRowsRead()
+	step := func(name string) {
+		now, rows := time.Now(), dw.layerRowsRead()
+		out.Steps[name] += float64(now.Sub(stepAt).Microseconds()) / 1000
+		if rows > rowsAt {
+			out.StepLayerRows[name] += rows - rowsAt
+		}
+		stepAt, rowsAt = now, rows
+	}
 
 	dw.layer.mu.RLock()
 	covered := make([]string, 0, len(dw.layer.covered))
@@ -224,8 +260,10 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 		final[p] = struct{}{}
 		out.ReplacePaths = append(out.ReplacePaths, p)
 	}
+	step("covered")
 
 	emitted := make(map[edgeHash]struct{})
+	ownEdges := true
 	emit := func(e *Edge) {
 		h := hashEdgeKey(keyOf(e))
 		if _, dup := emitted[h]; dup {
@@ -233,13 +271,22 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 		}
 		emitted[h] = struct{}{}
 		out.Edges = append(out.Edges, cloneDeltaEdge(e))
+		if ownEdges {
+			out.Rows.OwnEdges++
+			out.Rows.OwnEdgesByKind[string(e.Kind)]++
+		} else {
+			out.Rows.SourceEdges++
+			out.Rows.SourceEdgesByKind[string(e.Kind)]++
+		}
 	}
 	if belowRecorded != nil && len(out.ReplacePaths) > 0 {
 		out.RestatedNodes, out.RestatedEdges = dw.restatedRows(out.ReplacePaths, recordedAt, belowRecorded)
 	}
+	step("restated")
 	for _, p := range out.ReplacePaths {
 		for _, n := range dw.work.GetFileNodes(p) {
 			out.Nodes = append(out.Nodes, cloneDeltaNode(n))
+			out.Rows.OwnNodes++
 			if key := deltaPathKey(n.ID); n.ID != p && !inFinalPath(final, key) {
 				if _, gone := emptied[key]; !gone {
 					out.IdentityClaims = append(out.IdentityClaims, n.ID)
@@ -251,6 +298,8 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 		}
 	}
 
+	step("own_rows")
+	ownEdges = false
 	inFinal := func(p string) bool {
 		_, ok := final[p]
 		return ok
@@ -285,6 +334,7 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 			// Carried under a replaced path's claim, as the sparse builder
 			// does for a row whose id names a claimed file.
 			out.Nodes = append(out.Nodes, cloneDeltaNode(n))
+			out.Rows.OwnNodes++
 			continue
 		}
 		belowNode := dw.below.GetNode(n.ID)
@@ -301,8 +351,10 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 			continue
 		}
 		out.Nodes = append(out.Nodes, cloneDeltaNode(n))
+		out.Rows.DetachedNodes++
 		tombstoned[n.ID] = struct{}{}
 	}
+	step("detached")
 	for _, id := range removed {
 		tombstoned[id] = struct{}{}
 	}
@@ -328,6 +380,7 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 	for _, id := range dw.unreferencedBuiltins() {
 		tombstoned[id] = struct{}{}
 	}
+	step("orphans")
 
 	// Edge-claimed sources: nothing where the claimed rows ended equal to the
 	// rows they hid, a whole claim (and so the marker rule below) otherwise.
@@ -335,6 +388,7 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 		claimed = append(claimed, promoted...)
 		sort.Strings(claimed)
 	}
+	step("settle_edge_claims")
 
 	// Claimed sources: a marker exactly where the final outgoing set, outside
 	// the replaced paths, differs from what the layer below shows there. A
@@ -394,6 +448,7 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 			}
 		}
 	}
+	step("claimed_sources")
 	for id := range tombstoned {
 		out.Tombstones = append(out.Tombstones, id)
 	}

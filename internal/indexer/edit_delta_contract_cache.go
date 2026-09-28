@@ -1,6 +1,8 @@
 package indexer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -349,4 +351,13 @@ func storeEditDeltaContractRegistry(key string, list []contracts.Contract) {
 	if over := len(editDeltaContractCache.entries) - editDeltaContractCacheEntries; over > 0 {
 		editDeltaContractCache.entries = append([]editDeltaContractCacheEntry(nil), editDeltaContractCache.entries[over:]...)
 	}
+}
+
+// editDeltaKeyDigest is a short stable digest of a per-stack key for logs.
+func editDeltaKeyDigest(key string) string {
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:6])
 }

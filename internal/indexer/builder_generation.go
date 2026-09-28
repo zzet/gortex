@@ -312,6 +312,10 @@ type EnrichmentOutcome struct {
 type BuildReport struct {
 	GenerationID int64
 
+	// PrepublishIO is the pre-publish check's CPU, major faults and store
+	// reads and writes (storeWaitMillis), for the build's log line.
+	PrepublishIO map[string]float64
+
 	// Coalesced reports that this call reused another caller's physical build
 	// or a generation that became ready before it joined. Only reports with
 	// Coalesced false represent physical payload work for metrics accounting.
@@ -743,7 +747,9 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		}
 		report.Work.mark("separate_masks_producers")
 		if req.PrePublish != nil {
-			if err := req.PrePublish(withBuildReadSet(ctx, plan.indexed, plan.context, plan.deleted), generationID); err != nil {
+			if err := b.measurePrepublish(&report, func() error {
+				return req.PrePublish(withBuildReadSet(ctx, plan.indexed, plan.context, plan.deleted), generationID)
+			}); err != nil {
 				return err
 			}
 		}
@@ -2912,4 +2918,25 @@ func (s *fileSetSource) Walk(ctx context.Context, fn func(source.FileMeta) error
 		}
 	}
 	return nil
+}
+
+// measurePrepublish runs a build's pre-publish check and records its CPU,
+// major faults and store I/O on the report (the build-phases line's
+// prepublish_store_io), for the sparse builder and the edit delta alike.
+func (b *SparseGenerationBuilder) measurePrepublish(report *BuildReport, check func() error) error {
+	cpu, io, store := processCPUTime(), editDeltaProcessIO(), b.storeWaitMark()
+	err := check()
+	report.PrepublishIO = storeWaitMillis(b.storeWaitMark().Split(store))
+	report.PrepublishIO["cpu_ms"] = float64((processCPUTime() - cpu).Microseconds()) / 1000
+	report.PrepublishIO["major_faults"] = float64(editDeltaProcessIO().since(io).majorFaults)
+	return err
+}
+
+// storeWaitMark is the store's cumulative wait and VFS counters, zero without
+// a store.
+func (b *SparseGenerationBuilder) storeWaitMark() store_sqlite.ReaderWaitMark {
+	if b == nil || b.Store == nil {
+		return store_sqlite.ReaderWaitMark{}
+	}
+	return b.Store.ReaderWaitMark()
 }

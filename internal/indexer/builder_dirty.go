@@ -725,6 +725,7 @@ func (b *SparseGenerationBuilder) logWorkingTreeBuild(req DirtyLayerRequest, gen
 		return
 	}
 	fields := []zap.Field{
+		zap.Any("prepublish_store_io", report.PrepublishIO),
 		zap.String("checkout", req.Identity.CheckoutID),
 		zap.Int64("generation", generationID),
 		zap.Int64("parent", req.parent),

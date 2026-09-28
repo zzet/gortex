@@ -617,6 +617,11 @@ type Indexer struct {
 	contractRegistryLoad time.Duration
 	// applyLaps times one structural graph apply (incremental_apply_laps.go).
 	applyLaps *applyLaps
+	// storeWaits, when set, reads the store's cumulative waits
+	// (store_sqlite.ReaderWaitMark: the read gate and pools, SQLite's own
+	// busy and WAL-retry sleeps, read-transaction time) for the apply steps'
+	// split.
+	storeWaits func() store_sqlite.ReaderWaitMark
 }
 
 // contractCacheEntry is a cached contract-extraction result for one file.
