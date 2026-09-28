@@ -17,6 +17,9 @@ type sqliteMutationReceiptState struct {
 }
 
 type sqliteMutationReceiptAccumulator struct {
+	// viewGen is the generation of the handle that opened the window: it
+	// observes writes through handles of that generation only.
+	viewGen            int64
 	complete           bool
 	incompleteReason   string
 	resolutionRelevant bool
@@ -162,6 +165,7 @@ func (s *Store) beginMutationReceiptLocked(ownsFanout bool) graph.MutationReceip
 	token := s.mutationReceipts.next
 	acc := newSQLiteMutationReceiptAccumulator()
 	acc.fanoutOwned = ownsFanout
+	acc.viewGen = s.viewGen
 	s.mutationReceipts.active[token] = acc
 	return token
 }
@@ -242,25 +246,47 @@ func (s *Store) RecordMutationFanoutTruncationIn(
 	acc.fanoutTruncations = graph.MergeReceiptFanoutTruncation(acc.fanoutTruncations, fact)
 }
 
+// A mutation receipt observes the generation of the handle that opened it.
+// Every handle of an open database shares the store core and so the open
+// windows, but a write through a handle of another generation is not that
+// window's mutation: a working-tree edit delta writing its generation while a
+// watcher's window on the base is open must neither void the base window's
+// receipt (which would send the watcher to a whole-repository resolve) nor
+// widen its frontier. A window opened on a generation handle still observes
+// that generation's own writes.
+func (s *Store) observesMutationReceiptsLocked() bool {
+	for _, acc := range s.mutationReceipts.active {
+		if acc.viewGen == s.viewGen {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) hasActiveMutationReceiptsLocked() bool {
-	return len(s.mutationReceipts.active) != 0
+	return s.observesMutationReceiptsLocked()
 }
 
 func (s *Store) markMutationReceiptsIncompleteLocked() {
-	if len(s.mutationReceipts.active) == 0 {
+	if !s.observesMutationReceiptsLocked() {
 		return
 	}
 	reason := graph.ReceiptIncompleteCallerReason()
 	for _, acc := range s.mutationReceipts.active {
-		acc.noteIncomplete(reason)
+		if acc.viewGen == s.viewGen {
+			acc.noteIncomplete(reason)
+		}
 	}
 }
 
 func (s *Store) mergeMutationReceiptLocked(delta *sqliteMutationReceiptAccumulator) {
-	if delta == nil {
+	if delta == nil || !s.observesMutationReceiptsLocked() {
 		return
 	}
 	for _, acc := range s.mutationReceipts.active {
+		if acc.viewGen != s.viewGen {
+			continue
+		}
 		if !delta.complete {
 			reason := delta.incompleteReason
 			if reason == "" {
