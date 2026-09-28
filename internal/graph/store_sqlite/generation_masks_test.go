@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -356,4 +357,228 @@ func TestValidateGenerationMasksProbesEdgesAndContent(t *testing.T) {
 	if err := content.ValidateGenerationMasks(); !errors.Is(err, ErrGenerationMaskIntegrity) {
 		t.Fatalf("replace mask backed only by a document = %v, want ErrGenerationMaskIntegrity", err)
 	}
+}
+
+func TestValidateGenerationMasksUsesFileIndexForEdgeEmptiness(t *testing.T) {
+	store := openMaskStore(t)
+	current := store.AtGeneration(11)
+
+	// Make the generation-leading edge indexes unattractive for a context path:
+	// all current-generation edges are elsewhere. The validator must still make
+	// the context-path emptiness check through the file-leading index.
+	noise := make([]*graph.Edge, 0, 512)
+	for i := 0; i < cap(noise); i++ {
+		noise = append(noise, &graph.Edge{
+			From: fmt.Sprintf("repo/hot.go::From%04d", i),
+			To:   fmt.Sprintf("repo/hot.go::To%04d", i),
+			Kind: graph.EdgeCalls, FilePath: fmt.Sprintf("repo/hot-%02d.go", i%8), Line: i + 1,
+		})
+	}
+	current.AddBatch(nil, noise)
+	if err := current.SetFileMetas(maskTestRepo, []graph.FileMetaRow{{
+		FilePath: "repo/owned.go", ContentHash: "owned", Size: 1, NodeCount: 0,
+	}}); err != nil {
+		t.Fatalf("SetFileMetas: %v", err)
+	}
+	if err := current.SetFileMasks([]FileMask{
+		// One target exists in a retained generation; the other is absent from
+		// every generation. Both context claims must stay valid here.
+		{RepoPrefix: maskTestRepo, FilePath: "repo/context.go", Mode: OwnershipContext},
+		{RepoPrefix: maskTestRepo, FilePath: "repo/missing-context.go", Mode: OwnershipContext},
+		{RepoPrefix: maskTestRepo, FilePath: "repo/owned.go", Mode: OwnershipReplace},
+	}); err != nil {
+		t.Fatalf("SetFileMasks(valid): %v", err)
+	}
+
+	// Retained generations carry a few same-path rows each. This makes the
+	// file-leading range slightly costlier than the current generation's 512
+	// rows: the pre-fix statement therefore chooses generation-leading access,
+	// while the unary candidate must choose the file-leading probe. None of
+	// these rows belongs to the context mask's generation.
+	for generation := int64(12); generation < 140; generation++ {
+		retained := store.AtGeneration(generation)
+		edges := make([]*graph.Edge, 0, 8)
+		for i := 0; i < 8; i++ {
+			edges = append(edges, &graph.Edge{
+				From: fmt.Sprintf("repo/context.go::RetainedFrom%03d_%d", generation, i),
+				To:   fmt.Sprintf("repo/context.go::RetainedTo%03d_%d", generation, i),
+				Kind: graph.EdgeCalls, FilePath: "repo/context.go", Line: i + 1,
+			})
+		}
+		retained.AddBatch(nil, edges)
+	}
+	analyzeMaskStore(t, store)
+	retainGenerationOnlyEdgeStats(t, store)
+	if err := current.ValidateGenerationMasks(); err != nil {
+		t.Fatalf("valid context and replace masks = %v", err)
+	}
+
+	plan := explainValidateGenerationMasks(t, store, current.ViewGeneration())
+	if !strings.Contains(plan, "SEARCH e USING INDEX edges_by_file (file_path=?)") {
+		t.Fatalf("edge emptiness plan =\n%s\nwant file-leading index", plan)
+	}
+	for _, forbidden := range []string{"edges_by_to", "edges_by_generation", "SCAN e"} {
+		if strings.Contains(plan, forbidden) {
+			t.Fatalf("edge emptiness plan =\n%s\ncontains forbidden %q", plan, forbidden)
+		}
+	}
+
+	// BeginBulkLoad drops edges_by_file. The public validator remains valid in
+	// that legitimate cold-window state: the unary predicate constrains planning
+	// but does not require the optional index at statement preparation.
+	cold := openMaskStore(t)
+	cold.BeginBulkLoad()
+	defer func() {
+		if err := cold.FlushBulk(); err != nil {
+			t.Errorf("FlushBulk: %v", err)
+		}
+	}()
+	// Payload at the same path but another generation is still harmless while
+	// the optional index is absent.
+	coldOther := cold.AtGeneration(2)
+	coldOther.AddBatch(nil, []*graph.Edge{{
+		From: "repo/cold-context.go::From", To: "repo/cold-context.go::To",
+		Kind: graph.EdgeCalls, FilePath: "repo/cold-context.go", Line: 1,
+	}})
+	coldContext := cold.AtGeneration(1)
+	if err := coldContext.SetFileMasks([]FileMask{{
+		RepoPrefix: maskTestRepo, FilePath: "repo/cold-context.go", Mode: OwnershipContext,
+	}}); err != nil {
+		t.Fatalf("SetFileMasks(cold context): %v", err)
+	}
+	if err := coldContext.ValidateGenerationMasks(); err != nil {
+		t.Fatalf("context mask with retained-generation edge during bulk deferral = %v", err)
+	}
+	coldBad := cold.AtGeneration(3)
+	coldBad.AddBatch(nil, []*graph.Edge{{
+		From: "repo/cold-bad.go::From", To: "repo/cold-bad.go::To",
+		Kind: graph.EdgeCalls, FilePath: "repo/cold-bad.go", Line: 1,
+	}})
+	if err := coldBad.SetFileMasks([]FileMask{{
+		RepoPrefix: maskTestRepo, FilePath: "repo/cold-bad.go", Mode: OwnershipContext,
+	}}); err != nil {
+		t.Fatalf("SetFileMasks(cold bad): %v", err)
+	}
+	if err := coldBad.ValidateGenerationMasks(); !errors.Is(err, ErrGenerationMaskIntegrity) {
+		t.Fatalf("context mask over same-generation edge during bulk deferral = %v, want ErrGenerationMaskIntegrity", err)
+	}
+
+	// Context and delete retain the same rejection rule when this generation
+	// actually carries an edge at the masked path.
+	for _, mode := range []OwnershipMode{OwnershipContext, OwnershipDelete} {
+		derived := store.AtGeneration(int64(20 + len(mode)))
+		file := "repo/bad-" + string(mode) + ".go"
+		derived.AddBatch(nil, []*graph.Edge{{
+			From: file + "::From", To: file + "::To", Kind: graph.EdgeCalls,
+			FilePath: file, Line: 1,
+		}})
+		if err := derived.SetFileMasks([]FileMask{{RepoPrefix: maskTestRepo, FilePath: file, Mode: mode}}); err != nil {
+			t.Fatalf("SetFileMasks(%s): %v", mode, err)
+		}
+		if err := derived.ValidateGenerationMasks(); !errors.Is(err, ErrGenerationMaskIntegrity) {
+			t.Fatalf("%s mask over carried edge = %v, want ErrGenerationMaskIntegrity", mode, err)
+		}
+	}
+
+	// The capped error remains deterministic by the query's repo/path order.
+	limited := store.AtGeneration(30)
+	masks := make([]FileMask, 0, generationMaskViolationLimit+2)
+	edges := make([]*graph.Edge, 0, generationMaskViolationLimit+2)
+	for i := 0; i < generationMaskViolationLimit+2; i++ {
+		file := fmt.Sprintf("repo/limit-%02d.go", i)
+		masks = append(masks, FileMask{RepoPrefix: maskTestRepo, FilePath: file, Mode: OwnershipDelete})
+		edges = append(edges, &graph.Edge{From: file + "::From", To: file + "::To", Kind: graph.EdgeCalls, FilePath: file, Line: 1})
+	}
+	limited.AddBatch(nil, edges)
+	if err := limited.SetFileMasks(masks); err != nil {
+		t.Fatalf("SetFileMasks(limit): %v", err)
+	}
+	err := limited.ValidateGenerationMasks()
+	if !errors.Is(err, ErrGenerationMaskIntegrity) {
+		t.Fatalf("limited violations = %v, want ErrGenerationMaskIntegrity", err)
+	}
+	for i := 0; i < generationMaskViolationLimit; i++ {
+		if !strings.Contains(err.Error(), fmt.Sprintf("repo/limit-%02d.go", i)) {
+			t.Fatalf("limited violations missing ordered path %d: %v", i, err)
+		}
+	}
+	if strings.Contains(err.Error(), fmt.Sprintf("repo/limit-%02d.go", generationMaskViolationLimit)) {
+		t.Fatalf("limited violations exceeded cap %d: %v", generationMaskViolationLimit, err)
+	}
+}
+
+func analyzeMaskStore(t *testing.T, store *Store) {
+	t.Helper()
+	store.writeMu.Lock()
+	defer store.writeMu.Unlock()
+	tx, err := store.beginWrite()
+	if err != nil {
+		t.Fatalf("begin ANALYZE transaction: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	if _, err := tx.Exec(`ANALYZE`); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit ANALYZE: %v", err)
+	}
+}
+
+// retainGenerationOnlyEdgeStats reproduces a planner condition observed on a
+// live store: sqlite_stat1 retained edges_by_generation but had no entries
+// for the bulk-rebuilt optional edge indexes. This is a private plan fixture,
+// not production behavior.
+func retainGenerationOnlyEdgeStats(t *testing.T, store *Store) {
+	t.Helper()
+	store.writeMu.Lock()
+	defer store.writeMu.Unlock()
+	tx, err := store.beginWrite()
+	if err != nil {
+		t.Fatalf("begin sqlite_stat1 fixture transaction: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	if _, err := tx.Exec(`DELETE FROM sqlite_stat1 WHERE tbl = 'edges' AND idx IN ('edges_by_file', 'edges_by_to')`); err != nil {
+		t.Fatalf("delete optional edge stats: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit sqlite_stat1 fixture transaction: %v", err)
+	}
+	// This is SQLite's documented stats reload target; it does not rebuild the
+	// deleted index statistics.
+	tx, err = store.beginWrite()
+	if err != nil {
+		t.Fatalf("begin sqlite_schema reload transaction: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	if _, err := tx.Exec(`ANALYZE sqlite_schema`); err != nil {
+		t.Fatalf("reload sqlite_stat1: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit sqlite_schema reload: %v", err)
+	}
+}
+
+func explainValidateGenerationMasks(t *testing.T, store *Store, generation int64) string {
+	t.Helper()
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN `+validateGenerationMasksSQL,
+		generation, string(OwnershipReplace), string(OwnershipDelete), string(OwnershipContext),
+		generation, generation,
+		string(OwnershipReplace), string(OwnershipDelete), string(OwnershipContext), generationMaskViolationLimit)
+	if err != nil {
+		t.Fatalf("EXPLAIN ValidateGenerationMasks: %v", err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan EXPLAIN: %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("EXPLAIN rows: %v", err)
+	}
+	return strings.Join(details, "\n")
 }

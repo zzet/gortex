@@ -531,28 +531,7 @@ func (s *Store) ValidateGenerationMasks() error {
 	if err := s.validateContextMaskClaims(); err != nil {
 		return err
 	}
-	rows, err := s.db.Query(`
-WITH masked(repo_prefix, file_path, ownership_mode, covered) AS (
-    SELECT m.repo_prefix, m.file_path, m.ownership_mode,
-           EXISTS (SELECT 1 FROM files AS f
-                    WHERE f.view_gen = m.view_gen
-                      AND f.repo_prefix = m.repo_prefix
-                      AND f.file_path = m.file_path)
-        OR EXISTS (SELECT 1 FROM nodes AS n
-                    WHERE n.file_path = m.file_path AND n.view_gen = m.view_gen)
-      FROM generation_file_masks AS m
-     WHERE m.view_gen = ?
-)
-SELECT repo_prefix, file_path, ownership_mode FROM masked
- WHERE (ownership_mode = ? AND covered = 0)
-    OR (ownership_mode IN (?, ?) AND (covered = 1
-        OR EXISTS (SELECT 1 FROM edges AS e
-                    WHERE e.file_path = masked.file_path AND e.view_gen = ?)
-        OR EXISTS (SELECT 1 FROM content_fts_rowid AS c
-                    WHERE c.view_gen = ? AND c.file_path = masked.file_path)))
-    OR ownership_mode NOT IN (?, ?, ?)
- ORDER BY repo_prefix, file_path
- LIMIT ?`,
+	rows, err := s.db.Query(validateGenerationMasksSQL,
 		s.viewGen, string(OwnershipReplace), string(OwnershipDelete), string(OwnershipContext),
 		s.viewGen, s.viewGen,
 		string(OwnershipReplace), string(OwnershipDelete), string(OwnershipContext),
@@ -587,3 +566,30 @@ SELECT repo_prefix, file_path, ownership_mode FROM masked
 	}
 	return fmt.Errorf("%w: generation %d: %s", ErrGenerationMaskIntegrity, s.viewGen, strings.Join(violations, "; "))
 }
+
+// validateGenerationMasksSQL is shared with its plan guard. The edge probe
+// deliberately uses a non-sargable generation operand: delete/context
+// masks ask whether one path has any same-generation edge, and this rules out
+// a generation-leading index while leaving the optional file-leading index usable.
+const validateGenerationMasksSQL = `
+WITH masked(repo_prefix, file_path, ownership_mode, covered) AS (
+    SELECT m.repo_prefix, m.file_path, m.ownership_mode,
+           EXISTS (SELECT 1 FROM files AS f
+                    WHERE f.view_gen = m.view_gen
+                      AND f.repo_prefix = m.repo_prefix
+                      AND f.file_path = m.file_path)
+        OR EXISTS (SELECT 1 FROM nodes AS n
+                    WHERE n.file_path = m.file_path AND n.view_gen = m.view_gen)
+      FROM generation_file_masks AS m
+     WHERE m.view_gen = ?
+)
+SELECT repo_prefix, file_path, ownership_mode FROM masked
+ WHERE (ownership_mode = ? AND covered = 0)
+    OR (ownership_mode IN (?, ?) AND (covered = 1
+        OR EXISTS (SELECT 1 FROM edges AS e
+                    WHERE e.file_path = masked.file_path AND +e.view_gen = ?)
+        OR EXISTS (SELECT 1 FROM content_fts_rowid AS c
+                    WHERE c.view_gen = ? AND c.file_path = masked.file_path)))
+    OR ownership_mode NOT IN (?, ?, ?)
+ ORDER BY repo_prefix, file_path
+ LIMIT ?`
