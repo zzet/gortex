@@ -151,6 +151,21 @@ func (s *Store) EnsureRowCounters(ctx context.Context) error {
 	}
 	s.rowCountersInstall.Lock()
 	defer s.rowCountersInstall.Unlock()
+	// Background work: it never starts while an edit cycle holds the build
+	// lane, and its seed count (seconds of reads on a large store) is
+	// cancelled when one starts; the lazy loop retries at its next poll.
+	if s.cycleYieldEnabled() && s.buildLaneBusy() {
+		return errRowCountersEditCycle
+	}
+	ctx, cancelOnCycle := context.WithCancel(ctx)
+	defer cancelOnCycle()
+	stopWatch, yielded := s.cancelOnEditCycle(cancelOnCycle)
+	defer stopWatch()
+	defer func() {
+		if yielded.Load() {
+			s.walReclaim.cycle.yields.Add(1)
+		}
+	}()
 	ok, err := s.rowCountersInstalled(ctx)
 	if err != nil {
 		return err
@@ -339,6 +354,10 @@ func (s *Store) beginMaintenanceWriteLockedWithin(ctx context.Context, wait time
 // errRowCountersBulkWindow defers the counters' install while a generation
 // bulk window is open; the next poll installs them again from scratch.
 var errRowCountersBulkWindow = errors.New("row counters: a bulk window is open")
+
+// errRowCountersEditCycle defers the install while an edit cycle holds the
+// build lane.
+var errRowCountersEditCycle = errors.New("row counters: an edit cycle holds the build lane")
 
 // rowCountersAfterPinHook runs right after the seed snapshot is pinned and
 // the writer released (a seam for the case that commits a write there).

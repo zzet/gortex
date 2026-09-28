@@ -263,6 +263,9 @@ func TestHardCapAttemptIgnoresTheCopyStartGuard(t *testing.T) {
 	walCopyStartMinTokens.Store(16 << 20)
 	s.walCopy.take(time.Now(), 1<<30, float64(walCopyBudget())/60) // the bucket is empty
 	require.False(t, s.copyStartAllowed(time.Now()), "precondition: the guard refuses an ordinary pass")
+	prevSpacing := walReclaimHardCapSpacing
+	walReclaimHardCapSpacing = 0
+	t.Cleanup(func() { walReclaimHardCapSpacing = prevSpacing })
 	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
 	require.NoError(t, err)
 	defer func() { _ = ckpt.Close() }()
@@ -288,6 +291,9 @@ func TestHardCapAttemptIsNeitherPausedNorPaced(t *testing.T) {
 	lane.install(s)
 	lane.held.Store(true)
 	slowCopy(t, s, 60<<20) // 1 MiB/s while editing: ~6 s for this log if paced
+	prevSpacing := walReclaimHardCapSpacing
+	walReclaimHardCapSpacing = 0
+	t.Cleanup(func() { walReclaimHardCapSpacing = prevSpacing })
 	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
 	require.NoError(t, err)
 	defer func() { _ = ckpt.Close() }()

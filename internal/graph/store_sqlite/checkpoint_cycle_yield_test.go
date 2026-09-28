@@ -3,7 +3,6 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -160,11 +159,11 @@ func TestBackgroundCheckpointInFlightYieldsWhenACycleTakesTheLane(t *testing.T) 
 	require.True(t, complete, "the forced PASSIVE was cancelled by the lane")
 }
 
-// The PASSIVE schedule defers a due attempt while the lane is held, without
-// backoff; past the deferral bound with the WAL above its threshold it runs
-// exactly one forced attempt and starts a new episode; below the threshold it
-// keeps deferring; released, the attempt runs unforced.
-func TestPassiveCheckpointDeferralIsBounded(t *testing.T) {
+// The PASSIVE schedule defers a due attempt for as long as the lane is held,
+// without backoff and without ever forcing one (its CPU would come out of the
+// edit; a lane that never idles is bounded by the reclaim's hard cap instead);
+// released, the attempt runs unforced.
+func TestPassiveCheckpointNeverRunsWhileTheLaneIsHeld(t *testing.T) {
 	s, path := openWALReclaimStore(t)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
@@ -192,60 +191,42 @@ func TestPassiveCheckpointDeferralIsBounded(t *testing.T) {
 		}
 	}
 	sched := newWALCheckpointSchedule(now, time.Hour, 64) // WAL above threshold: due every poll
-	for at := time.Duration(0); at < bound; at += time.Second {
+	for at := time.Duration(0); at < 5*bound; at += time.Second {
 		require.False(t, sched.attemptYielding(now.Add(at), walPath, view, checkpointAt(at)), "a lane deferral must not back off")
 	}
-	require.Empty(t, calls, "an attempt started while the lane was held")
-	sched.attemptYielding(now.Add(bound), walPath, view, checkpointAt(bound))
-	require.Equal(t, []call{{at: bound, forced: true}}, calls, "one forced PASSIVE past the bound")
-	for at := bound + time.Second; at < 2*bound; at += time.Second {
-		sched.attemptYielding(now.Add(at), walPath, view, checkpointAt(at))
-	}
-	require.Len(t, calls, 1, "the forced attempt starts a new deferral episode")
-	sched.attemptYielding(now.Add(2*bound+time.Second), walPath, view, checkpointAt(2*bound+time.Second))
-	require.Len(t, calls, 2)
-	require.True(t, calls[1].forced)
-
-	// Below the threshold the bound never forces: nothing to backfill for.
-	quiet := newWALCheckpointSchedule(now, time.Second, 1<<40) // periodic due, WAL under threshold
-	for at := 2 * time.Second; at < 5*bound; at += time.Second {
-		quiet.attemptYielding(now.Add(at), walPath, view, checkpointAt(-at))
-	}
-	require.Len(t, calls, 2, "a forced attempt ran with the WAL under its threshold")
+	require.Empty(t, calls, "an attempt ran while the lane was held")
 
 	// Released: the due attempt runs, unforced.
 	lane.held.Store(false)
-	sched.attemptYielding(now.Add(3*bound), walPath, view, checkpointAt(3*bound))
-	require.Len(t, calls, 3)
-	require.False(t, calls[2].forced)
+	sched.attemptYielding(now.Add(6*bound), walPath, view, checkpointAt(6*bound))
+	require.Len(t, calls, 1)
+	require.False(t, calls[0].forced)
 
 	st := s.WALReclaimStats()
-	require.Equal(t, int64(2), st.CycleForced)
+	require.Zero(t, st.CycleForced)
 	require.Positive(t, st.CycleDeferrals)
 	out := logs.String()
 	require.Contains(t, out, "wal checkpoint deferred mode=PASSIVE reason=build_lane_busy")
-	require.Contains(t, out, "wal checkpoint forced mode=PASSIVE reason=cycle_deferral_bound")
-	require.Equal(t, 3, strings.Count(out, "reason=build_lane_busy"), "one deferral line per episode (two forced-bounded episodes, one below the threshold)")
+	require.NotContains(t, out, "wal checkpoint forced")
 
 	// Without a predicate (or with the yield disabled) nothing defers.
 	s.SetBuildLaneBusy(nil)
 	lane.held.Store(true)
 	plain := newWALCheckpointSchedule(now, time.Hour, 64)
 	plain.attemptYielding(now, walPath, s.cycleLane(), checkpointAt(0))
-	require.Len(t, calls, 4)
+	require.Len(t, calls, 2)
 }
 
-// Over the WAL ceiling the reclaim runs despite a held lane: under continuous
-// writes, rotating readers and a lane that never goes idle, the log is reset
-// and stays near the ceiling instead of growing without bound. Below the
-// ceiling a held lane still refuses it (the "does not start" case above runs
-// with the production floor, 1 GiB).
-func TestWALReclaimRunsDespiteTheLaneOverTheWALCeiling(t *testing.T) {
+// Under a lane that never goes idle the log passes its ceiling (the reclaim
+// waits for gaps between edit cycles), and over the hard cap (4x the ceiling)
+// one bounded attempt runs despite the lane, spaced and logged, so the log
+// still cannot grow without bound.
+func TestWALReclaimRunsDespiteTheLaneOnlyOverTheHardCap(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "4")
-	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_CEILING_MB", "24")
-	prevFloor := walReclaimCeilingFloor
-	walReclaimCeilingFloor = 0
-	t.Cleanup(func() { walReclaimCeilingFloor = prevFloor })
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_CEILING_MB", "12")
+	prevFloor, prevSpacing := walReclaimCeilingFloor, walReclaimHardCapSpacing
+	walReclaimCeilingFloor, walReclaimHardCapSpacing = 0, time.Second
+	t.Cleanup(func() { walReclaimCeilingFloor, walReclaimHardCapSpacing = prevFloor, prevSpacing })
 	setWALReclaimCadence(t, 50*time.Millisecond, 50*time.Millisecond, 400*time.Millisecond)
 	logs := captureReclaimLog(t)
 	s, path := openWALReclaimStore(t)
@@ -256,19 +237,22 @@ func TestWALReclaimRunsDespiteTheLaneOverTheWALCeiling(t *testing.T) {
 	lane.held.Store(true) // a cycle that never ends
 
 	churn := startWALChurn(t, s, path, 4, 150*time.Millisecond, 300*time.Millisecond)
-	churn.runUntil(t, 110, 90*time.Second)
+	churn.runUntil(t, 160, 120*time.Second)
 	churn.halt(t)
 
-	const ceiling = 24 << 20
+	const ceiling, hardCap = 12 << 20, 4 * (12 << 20)
 	stats := s.WALReclaimStats()
-	t.Logf("held lane: writes=%d wal_max=%.1fMiB ceiling=%.0fMiB ceiling_runs=%d resets=%d refusals=%d yields=%d writer_hold_max=%s",
+	t.Logf("held lane: writes=%d wal_max=%.1fMiB ceiling=%.0fMiB hard_cap_runs=%d resets=%d refusals=%d writer_hold_max=%s",
 		churn.writes.Load(), float64(churn.maxWAL.Load())/(1<<20), float64(stats.CeilingBytes)/(1<<20),
-		stats.CycleCeilingRuns, stats.Resets, stats.CycleRefusals, stats.CycleYields, stats.WriterHoldMax)
+		stats.CycleCeilingRuns, stats.Resets, stats.CycleRefusals, stats.WriterHoldMax)
 	require.Equal(t, int64(ceiling), stats.CeilingBytes)
-	require.Positive(t, stats.CycleCeilingRuns, "no reclaim ran over the ceiling")
-	require.Positive(t, stats.Resets, "the ceiling runs must reset the log")
-	require.Positive(t, stats.CycleRefusals, "below the ceiling the held lane must still refuse the reclaim")
-	require.LessOrEqual(t, churn.maxWAL.Load(), int64(2*ceiling), "the WAL grew past twice its ceiling under a held lane")
-	require.LessOrEqual(t, stats.WriterHoldMax, walReclaimMaxWriterHold+250*time.Millisecond, "the writer-hold cap bounds a ceiling run")
-	require.Contains(t, logs.String(), "reason=wal_ceiling")
+	require.Greater(t, churn.maxWAL.Load(), int64(ceiling), "precondition: the log passed its ceiling under the held lane")
+	require.Positive(t, stats.CycleCeilingRuns, "no reclaim ran over the hard cap")
+	require.Positive(t, stats.Resets, "the hard-cap runs must reset the log")
+	require.Positive(t, stats.CycleRefusals, "below the hard cap the held lane must refuse the reclaim")
+	require.LessOrEqual(t, churn.maxWAL.Load(), int64(2*hardCap), "the WAL grew past twice its hard cap under a held lane")
+	require.LessOrEqual(t, stats.WriterHoldMax, walReclaimMaxWriterHold+250*time.Millisecond, "the writer-hold cap bounds a hard-cap run")
+	out := logs.String()
+	require.Contains(t, out, "reason=wal_hard_cap")
+	require.NotContains(t, out, "reason=wal_ceiling wal_bytes", "a ceiling run started during the edit cycle")
 }

@@ -291,7 +291,9 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 		if err := ctx.Err(); err != nil {
 			return slices, shrunk, err
 		}
-		for s.writeWanted() {
+		// A slice is an ftruncate under the writer: it waits for a queued
+		// write and for the gaps between edit cycles.
+		for s.writeWanted() || (s.cycleYieldEnabled() && s.buildLaneBusy()) {
 			select {
 			case <-ctx.Done():
 				return slices, shrunk, ctx.Err()

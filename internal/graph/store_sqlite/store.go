@@ -145,6 +145,10 @@ type storeCore struct {
 	walReclaimNudged atomic.Bool
 	// writeIntents counts mutations announced through AnnounceWrite.
 	writeIntents atomic.Int32
+	// intentsSince is when writeIntents last rose from zero (unix nanos, 0
+	// while none); intentLeakLogged marks the episode's leak line.
+	intentsSince     atomic.Int64
+	intentLeakLogged atomic.Bool
 	// walDrainHandoffs counts residue drains handed to the reclaim.
 	walDrainHandoffs atomic.Int64
 	lazyIndex        lazyIndexCounters
@@ -1022,8 +1026,8 @@ var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generati
 // cancelled with that cause when a cycle takes the lane (see
 // checkpoint_cycle_yield.go).
 func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (*backgroundCheckpointAttempt, error) {
-	yields := policy == checkpointYieldsToCycle && s.cycleYieldEnabled()
-	overridesLease := policy == checkpointOverridesLease
+	yields := (policy == checkpointYieldsToCycle || policy == checkpointOverridesLease) && s.cycleYieldEnabled()
+	overridesLease := policy == checkpointOverridesLease || policy == checkpointOverridesLeaseAndCycle
 	if yields && s.buildLaneBusy() {
 		return nil, errWALCheckpointYieldedToCycle
 	}
@@ -1651,7 +1655,24 @@ func (s *Store) checkpointWALOnce(ctx context.Context, mode string) (walCheckpoi
 	return checkpointWALOnceOn(ctx, s.writerDB, mode)
 }
 
+// walCheckpointCallObserver, when set by a test, is told every checkpoint
+// PRAGMA this package runs: its mode, start and duration. nil in production.
+var walCheckpointCallObserver func(mode string, start time.Time, took time.Duration)
+
 func checkpointWALOnceOn(ctx context.Context, q walCheckpointQueryer, mode string) (walCheckpointResult, error) {
+	if observe := walCheckpointCallObserver; observe != nil {
+		start := time.Now()
+		defer func() { observe(mode, start, time.Since(start)) }()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		start := time.Now()
+		defer func() {
+			if over := time.Since(deadline); over > 50*time.Millisecond {
+				log.Printf("store_sqlite: wal checkpoint overran its deadline mode=%s overrun=%s elapsed=%s (the WAL and database syncs cannot be interrupted)",
+					mode, over.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+			}
+		}()
+	}
 	var result walCheckpointResult
 	err := q.QueryRowContext(ctx, "PRAGMA wal_checkpoint("+mode+")").Scan(
 		&result.Busy,

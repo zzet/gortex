@@ -80,6 +80,9 @@ const (
 	// and the lane (never another attempt in flight), runs under the
 	// writer-hold cap, and is rate-limited (walReclaimLeaseOverrideSpacing).
 	checkpointOverridesLease
+	// checkpointOverridesLeaseAndCycle: the lease override over the WAL hard
+	// cap, which also ignores the lane (see reclaimWALAttempt).
+	checkpointOverridesLeaseAndCycle
 )
 
 // checkpointCycleYield is the build-lane predicate and its counters. It lives
@@ -91,7 +94,9 @@ type checkpointCycleYield struct {
 	yields    atomic.Int64 // attempts (PASSIVE or reclaim) cancelled by a cycle
 	forced    atomic.Int64 // PASSIVE attempts run past the deferral bound
 	refusals  atomic.Int64 // reclaim attempts not started: lane held
-	ceiling   atomic.Int64 // reclaim attempts run despite the lane: WAL over the ceiling
+	ceiling   atomic.Int64 // reclaim attempts run despite the lane: WAL over the hard cap
+	// lastHardCap is the unix nanos of the last of those.
+	lastHardCap atomic.Int64
 
 	// loopThreshold is the running reclaim loop's threshold (0 when no loop
 	// runs): over it the periodic PASSIVE stands aside.
@@ -131,7 +136,9 @@ func (s *Store) buildLaneBusy() bool {
 		return false
 	}
 	p := s.walReclaim.cycle.busy.Load()
-	busy := p != nil && (*p)()
+	// An announced mutation (edit or undo, admission to route flip) counts
+	// as a held lane: background work stands down for all of it.
+	busy := p != nil && ((*p)() || s.editIntentActive())
 	if busy {
 		s.walCopy.sawBusy(time.Now())
 	}
@@ -199,6 +206,9 @@ type cycleDeferral struct {
 // decide reports whether the loop's due attempt may run now and, if so,
 // whether it is the forced one. overThreshold is consulted only once the bound
 // has passed.
+// While a cycle holds the lane nothing runs, however long the deferral: a
+// background PASSIVE's CPU would come out of the edit. A lane that never goes
+// idle is bounded by the reclaim's hard cap instead (wal_reclaim.go).
 func (d *cycleDeferral) decide(now time.Time, busy bool, maxDeferral time.Duration, overThreshold func() bool) (run, forced bool) {
 	if !busy {
 		return true, false
@@ -206,9 +216,7 @@ func (d *cycleDeferral) decide(now time.Time, busy bool, maxDeferral time.Durati
 	if d.since.IsZero() {
 		d.since = now
 	}
-	if now.Sub(d.since) >= maxDeferral && overThreshold() {
-		return true, true
-	}
+	_, _ = maxDeferral, overThreshold
 	return false, false
 }
 

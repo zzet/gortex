@@ -116,6 +116,15 @@ const (
 	walReclaimHardCapFactor = 4
 )
 
+// walReclaimHardCapSpacing spaces the attempts the hard cap lets run during
+// edit cycles. A var only so the in-package cases can shorten it.
+var walReclaimHardCapSpacing = 30 * time.Second
+
+func (s *Store) hardCapDue(now time.Time) bool {
+	last := s.walReclaim.cycle.lastHardCap.Load()
+	return last == 0 || now.Sub(time.Unix(0, last)) >= walReclaimHardCapSpacing
+}
+
 // walReclaimCeilingFloor is the lowest the WAL ceiling may be, so a low
 // threshold cannot make the lane override fire on small logs. A var only so
 // the in-package cases can lower it; production never assigns it.
@@ -512,16 +521,22 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// reclaim's reset takes the writer and a TRUNCATE, so it has no forced
 	// variant — it waits for an idle window.
 	//
-	// The exception is a log over the WAL ceiling: then the attempt runs
-	// despite the lane, bounded by the writer-hold cap instead.
+	// Over the WAL ceiling it still waits for the gaps between edit cycles
+	// (and yields within walCheckpointCycleYieldPoll when one starts): the
+	// log may pass the ceiling during a burst of edits rather than take the
+	// core from them. Only over the hard cap (walReclaimHardCapFactor × the
+	// ceiling) does one attempt run despite the lane, bounded by the
+	// writer-hold cap, at most once per walReclaimHardCapSpacing, logged.
 	policy := checkpointYieldsToCycle
+	laneBusy := s.cycleYieldEnabled() && s.buildLaneBusy()
 	hardCap, pressure := false, false
-	if cfg.ceilingBytes > 0 && s.cycleYieldEnabled() && s.buildLaneBusy() {
+	if laneBusy && cfg.ceilingBytes > 0 {
 		size := walFileSize(walPath)
-		if size >= cfg.ceilingBytes {
+		if size >= walReclaimHardCapFactor*cfg.ceilingBytes && s.hardCapDue(time.Now()) {
 			policy, hardCap = checkpointIgnoresCycle, true
 			s.walReclaim.cycle.ceiling.Add(1)
-			log.Printf("store_sqlite: wal reclaim running despite the build lane reason=wal_ceiling wal_bytes=%d ceiling=%d", size, cfg.ceilingBytes)
+			s.walReclaim.cycle.lastHardCap.Store(time.Now().UnixNano())
+			log.Printf("store_sqlite: wal reclaim running despite the build lane reason=wal_hard_cap wal_bytes=%d hard_cap=%d", size, walReclaimHardCapFactor*cfg.ceilingBytes)
 		} else if mark := walPressureMark(cfg); mark > 0 && !walPressureOff && (size >= mark || s.walReclaimRequested(time.Now(), size, cfg)) {
 			// Over the pressure mark a sustained burst of edits would keep the
 			// lane busy past every pass: the copy runs through the edits
@@ -550,7 +565,15 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		if cfg.ceilingBytes <= 0 || size < cfg.ceilingBytes || !s.leaseOverrideDue(time.Now()) {
 			return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_lease"}
 		}
-		attempt, berr = s.beginBackgroundCheckpointAttempt(checkpointOverridesLease)
+		leasePolicy := checkpointOverridesLease // yields to edit cycles
+		if hardCap {
+			leasePolicy = checkpointOverridesLeaseAndCycle
+		}
+		attempt, berr = s.beginBackgroundCheckpointAttempt(leasePolicy)
+		if errors.Is(berr, errWALCheckpointYieldedToCycle) {
+			s.walReclaim.cycle.refusals.Add(1)
+			return walReclaimResult{outcome: walReclaimSkipped, reason: "build_lane_busy"}
+		}
 		if berr != nil {
 			return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_in_flight"}
 		}
@@ -996,9 +1019,44 @@ func (s *Store) AnnounceWrite() (release func()) {
 		return func() {}
 	}
 	s.walCopy.sawBusy(time.Now())
-	s.writeIntents.Add(1)
+	if s.writeIntents.Add(1) == 1 {
+		s.intentsSince.Store(time.Now().UnixNano())
+		s.intentLeakLogged.Store(false)
+	}
 	var once sync.Once
-	return func() { once.Do(func() { s.writeIntents.Add(-1) }) }
+	return func() {
+		once.Do(func() {
+			if s.writeIntents.Add(-1) == 0 {
+				s.intentsSince.Store(0)
+			}
+		})
+	}
+}
+
+// editIntentStandDownMax bounds how long announced mutations stand background
+// work down: a release that never comes must not stop the WAL reclaim for
+// good. A var only so the in-package cases can shorten it.
+var editIntentStandDownMax = 2 * time.Minute
+
+// editIntentActive reports an announced mutation between its admission and
+// its release (after the route flip), unless the announcements have been held
+// continuously past editIntentStandDownMax.
+func (s *Store) editIntentActive() bool {
+	if s.writeIntents.Load() <= 0 {
+		return false
+	}
+	since := s.intentsSince.Load()
+	if since == 0 {
+		return true
+	}
+	if age := time.Since(time.Unix(0, since)); age > editIntentStandDownMax {
+		if s.intentLeakLogged.CompareAndSwap(false, true) {
+			log.Printf("store_sqlite: WARN write announcements held for %s (count=%d); background store work resumes despite them",
+				age.Round(time.Second), s.writeIntents.Load())
+		}
+		return false
+	}
+	return true
 }
 
 func walFileSize(path string) int64 {
