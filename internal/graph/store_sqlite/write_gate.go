@@ -19,6 +19,8 @@ type sqliteWriteGate struct {
 	// A holder that can give the gate up early (the WAL reclaim's open-gate
 	// stage) watches it and yields as soon as a writer queues.
 	waiters atomic.Int32
+	// holder is the current hold, recorded only while the hold watchdog runs.
+	holder atomic.Pointer[holdRecord]
 	// onRelease runs at every Unlock while the gate is still held (the
 	// writer connection's page-cache counters; writer_cache_counters.go).
 	onRelease atomic.Pointer[func()]
@@ -55,6 +57,7 @@ func (g *sqliteWriteGate) LockContext(ctx context.Context) error {
 	}
 	select {
 	case <-g.token:
+		g.holder.Store(newHoldRecord())
 		return nil
 	default:
 	}
@@ -68,6 +71,7 @@ func (g *sqliteWriteGate) LockContext(ctx context.Context) error {
 			g.token <- struct{}{}
 			return err
 		}
+		g.holder.Store(newHoldRecord())
 		return nil
 	}
 }
@@ -76,6 +80,7 @@ func (g *sqliteWriteGate) TryLock() bool {
 	g.init()
 	select {
 	case <-g.token:
+		g.holder.Store(newHoldRecord())
 		return true
 	default:
 		return false
@@ -87,6 +92,7 @@ func (g *sqliteWriteGate) Unlock() {
 	if f := g.onRelease.Load(); f != nil {
 		(*f)()
 	}
+	endHold(g.holder.Swap(nil), "write gate")
 	select {
 	case g.token <- struct{}{}:
 	default:

@@ -924,6 +924,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// inert (every lookup a miss) until the daemon supplies fingerprints.
 	s.bundles = newBundleCache()
 	s.installWriterCacheCounters()
+	watchHolds(s.storeCore)
 	if err := s.initAnalysisGenerationState(); err != nil {
 		_ = closeSQLitePools(readDB, db)
 		return nil, fmt.Errorf("sqlite analysis generation state: %w", err)
@@ -1717,6 +1718,7 @@ func (s *Store) Close() error {
 	if !s.ownsCore {
 		return nil
 	}
+	unwatchHolds(s.storeCore)
 	s.stopCheckpointLoop()
 	// Join the maintenance lane before anything is torn down: a pass in flight
 	// writes through the same pools this method is about to close, and it runs

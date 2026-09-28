@@ -363,6 +363,9 @@ type gatedConn struct {
 	// logs for a reader that outlives its attempts.
 	since atomic.Int64
 	label atomic.Value // string
+	// hold is the current active interval, recorded only while the hold
+	// watchdog runs (hold_watchdog.go).
+	hold atomic.Pointer[holdRecord]
 }
 
 // noteStatement records the statement a connection is running.
@@ -400,6 +403,7 @@ func (c *gatedConn) enter(ctx context.Context) error {
 	}
 	c.epoch = epoch
 	c.since.Store(time.Now().UnixNano())
+	c.hold.Store(newHoldRecord())
 	c.gate.track(c)
 	c.entered.Store(true)
 	return nil
@@ -412,6 +416,7 @@ func (c *gatedConn) release() {
 			c.gate.readNanos.Add(time.Now().UnixNano() - since)
 		}
 		c.gate.collectCacheCounters(c.inner)
+		endHold(c.hold.Swap(nil), "read transaction")
 		c.gate.untrack(c)
 		c.gate.leaveEpoch(c.epoch)
 	}
