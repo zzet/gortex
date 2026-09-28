@@ -111,7 +111,51 @@ func TestPrivateEdgeCandidatesEndpointGenerationQualifierPreservesRowsAndMetadat
 			if got, want := privateCanonicalEdges(candidate), privateCanonicalEdges(current); !reflect.DeepEqual(got, want) {
 				t.Fatalf("candidate rows differ from current rows\n candidate=%#v\n current=%#v", got, want)
 			}
+			if got, want := privateEndpointSequences(candidate), privateEndpointSequences(current); !reflect.DeepEqual(got, want) {
+				t.Fatalf("candidate within-endpoint order differs from current order\n candidate=%#v\n current=%#v", got, want)
+			}
 		})
+	}
+}
+
+func TestPrivateGetEdgeCandidatesPreservesFirstMatchAndSitePointer(t *testing.T) {
+	store, _ := openTempStore(t)
+	const generation int64 = (1 << 40) + 7
+	first := privateEndpointEdge("order-source", "order-target", graph.EdgeCalls, "zzz.go", 90, "order-first")
+	second := privateEndpointEdge("order-source", "order-target", graph.EdgeCalls, "aaa.go", 10, "order-second")
+	otherKind := privateEndpointEdge("order-source", "order-target", graph.EdgeReferences, "ref.go", 50, "order-reference")
+	if err := store.AtGeneration(generation).AddBatchChecked(nil, []*graph.Edge{first, second, otherKind}); err != nil {
+		t.Fatalf("add ordered candidates: %v", err)
+	}
+
+	pair := []privateEdgeEndpoint{{from: first.From, to: first.To}}
+	baseline, err := store.queryEdgeCandidatesSQL(privateBaselineEdgeCandidatesEndpointQuery(1), privateEdgeEndpointArgs(pair, generation)...)
+	if err != nil {
+		t.Fatalf("query baseline candidates: %v", err)
+	}
+	if len(baseline) != 3 || baseline[0].FilePath != first.FilePath {
+		t.Fatalf("baseline first-match order = %#v, want inserted calls edge first", privateEndpointSequences(baseline))
+	}
+
+	view := store.AtGeneration(generation)
+	set := view.GetEdgeCandidates(
+		[]graph.EdgeEndpoint{{From: first.From, To: first.To}},
+		[]graph.EdgeSite{{From: first.From, Line: first.Line, Kind: first.Kind}},
+	)
+	gotEndpoint := set.Endpoint(first.From, first.To)
+	gotKind := set.EndpointKind(first.From, first.To, first.Kind)
+	if privateEdgeIdentity(gotEndpoint) != privateEdgeIdentity(baseline[0]) {
+		t.Fatalf("Endpoint first = %s, baseline first = %s", privateEdgeIdentity(gotEndpoint), privateEdgeIdentity(baseline[0]))
+	}
+	if privateEdgeIdentity(gotKind) != privateEdgeIdentity(baseline[0]) {
+		t.Fatalf("EndpointKind first = %s, baseline first = %s", privateEdgeIdentity(gotKind), privateEdgeIdentity(baseline[0]))
+	}
+	site := set.Site(first.From, first.Line, first.Kind)
+	if len(site) != 1 || site[0] != gotKind {
+		t.Fatalf("site bucket = %#v; want one canonical pointer shared with endpoint bucket", privateCanonicalEdges(site))
+	}
+	if got := set.Endpoint("missing", "missing"); got != nil {
+		t.Fatalf("missing endpoint = %#v, want nil", got)
 	}
 }
 
@@ -227,7 +271,27 @@ func privateEndpointEdge(from, to string, kind graph.EdgeKind, file string, line
 	}
 }
 
-// Compare the complete rows as a sorted multiset.
+func privateEdgeIdentity(edge *graph.Edge) string {
+	if edge == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%s|%s|%s|%s|%d", edge.From, edge.To, edge.Kind, edge.FilePath, edge.Line)
+}
+
+func privateEndpointSequences(edges []*graph.Edge) map[privateEdgeEndpoint][]string {
+	out := make(map[privateEdgeEndpoint][]string)
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		key := privateEdgeEndpoint{from: edge.From, to: edge.To}
+		out[key] = append(out[key], privateEdgeIdentity(edge))
+	}
+	return out
+}
+
+// Compare the complete rows as a sorted multiset, while the separate sequence
+// assertion covers the within-endpoint first-match contract.
 func privateCanonicalEdges(edges []*graph.Edge) []string {
 	out := make([]string, 0, len(edges))
 	for _, edge := range edges {

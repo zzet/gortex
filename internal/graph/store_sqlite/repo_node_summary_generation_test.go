@@ -135,8 +135,11 @@ func TestNodeSummaryPositivePredicateMakesGenerationIndexEligible(t *testing.T) 
 			t.Fatal(err)
 		}
 		plan := strings.Join(details, "\n")
-		if !strings.Contains(plan, "nodes_by_generation") {
-			t.Fatalf("analyzed=%v: positive generation is not bounded by its index:\n%s", analyzed, plan)
+		if !strings.Contains(plan, "SEARCH nodes USING INDEX nodes_by_repo (repo_prefix=? AND view_gen=?)") {
+			t.Fatalf("analyzed=%v: summary lookup is not bounded by repository and generation:\n%s", analyzed, plan)
+		}
+		if strings.Contains(plan, "SCAN nodes") || strings.Contains(plan, "USE TEMP B-TREE") {
+			t.Fatalf("analyzed=%v: summary lookup is not a bounded repository-generation seek:\n%s", analyzed, plan)
 		}
 	}
 }

@@ -620,13 +620,12 @@ func TestSchemaV24StoreOpensForwardOntoTheAnalysisViewAxis(t *testing.T) {
 }
 
 // TestSchemaV25StoreIsRefusedByThePreviousOpener is the newer-schema refusal
-// half of the additive-migration contract: a store this build stamps at v25
-// must be refused — not rebuilt, not silently opened — by a binary whose
-// currentSchemaVersion is still 24.
+// half of the additive-migration contract: an explicit v25 fixture must be
+// refused — not rebuilt, not silently opened — by a binary whose supported
+// schema version is still 24. The current opener may have later migrations;
+// this test deliberately preserves the historical v24 -> v25 boundary.
 func TestSchemaV25StoreIsRefusedByThePreviousOpener(t *testing.T) {
-	if currentSchemaVersion != 25 {
-		t.Fatalf("currentSchemaVersion = %d; this case pins the v24 -> v25 boundary", currentSchemaVersion)
-	}
+	const v25FixtureVersion = 25
 	previous := make([]schemaMigration, 0, len(schemaMigrations))
 	for _, migration := range schemaMigrations {
 		if migration.version <= 24 {
@@ -636,7 +635,7 @@ func TestSchemaV25StoreIsRefusedByThePreviousOpener(t *testing.T) {
 	if err := validateSchemaMigrations(24, previous); err != nil {
 		t.Fatalf("the reconstructed v24 registry is not well formed: %v", err)
 	}
-	plan := planSchemaMigrationWith(currentSchemaVersion, 24, previous)
+	plan := planSchemaMigrationWith(v25FixtureVersion, 24, previous)
 	if plan.err == nil {
 		t.Fatal("a v25 store was accepted by the v24 opener")
 	}

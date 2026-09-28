@@ -67,14 +67,13 @@ const coldFTSMergePages = 64
 // them by name, and the first deterministic seal recreates them from the exact
 // same DDL.
 //
-// None of these keys names view_gen. Only the two identity keys — the nodes
-// primary key and the edges UNIQUE constraint — are taken per payload view
-// generation, because only they decide whether a write collides with an
-// existing row. These secondary keys serve generation-blind reads, and putting
-// view_gen in front of them would leave every such read unable to seek any
-// prefix. A WITHOUT ROWID secondary index entry carries the primary key, so
-// each nodes entry ends in (id, view_gen) regardless — which is why the
-// ID-projecting reads below stay index-only and their ORDER BY id stays free.
+// Generation-scoped hot lookups keep their established lookup columns first
+// and append view_gen before any trailing filter/order column. A scoped Reader
+// can therefore constrain one payload generation without losing the leading
+// lookup seek, while generation-blind diagnostics can still seek the same
+// leading prefix. A WITHOUT ROWID nodes index also carries the (id, view_gen)
+// primary key suffix, so ID projections remain index-only and scoped ORDER BY
+// id stays free.
 //
 // These are exactly the standalone, NON-UNIQUE CREATE INDEX statements over
 // the large nodes / edges tables. Maintaining them per-row across a
@@ -91,24 +90,28 @@ const coldFTSMergePages = 64
 //   - edges_external (partial): a tiny index over external-call terminals,
 //     created from a shared predicate const; not worth dropping.
 //
-// Dropping/recreating these is a runtime operation on identical DDL — it is
-// NOT a schema change, so it does not touch the persisted schema version.
+// Dropping/recreating these is a runtime operation on identical DDL. Changing
+// their DDL is a schema change and requires a schemaMigrations entry so a warm
+// store does not retain the prior key shape.
 const (
-	edgesByFromLineIndexDDL     = `CREATE INDEX IF NOT EXISTS edges_by_from_line ON edges(from_id, line)`
-	edgesByFromLineKindIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_from_line_kind ON edges(from_id, line, kind)`
+	edgesByFromLineIndexDDL     = `CREATE INDEX IF NOT EXISTS edges_by_from_line ON edges(view_gen, from_id, line)`
+	edgesByFromLineKindIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_from_line_kind ON edges(view_gen, from_id, line, kind)`
 )
 
 var bulkDroppableIndexes = []bulkDroppableIndex{
-	{"nodes_by_name", `CREATE INDEX IF NOT EXISTS nodes_by_name ON nodes(name)`},
-	{"nodes_by_kind", `CREATE INDEX IF NOT EXISTS nodes_by_kind ON nodes(kind)`},
-	{"nodes_by_file", `CREATE INDEX IF NOT EXISTS nodes_by_file ON nodes(file_path)`},
-	{"nodes_by_repo", `CREATE INDEX IF NOT EXISTS nodes_by_repo ON nodes(repo_prefix) WHERE repo_prefix <> ''`},
+	{"nodes_by_name", `CREATE INDEX IF NOT EXISTS nodes_by_name ON nodes(name, view_gen)`},
+	{"nodes_by_kind", `CREATE INDEX IF NOT EXISTS nodes_by_kind ON nodes(kind, view_gen)`},
+	{"nodes_by_file", `CREATE INDEX IF NOT EXISTS nodes_by_file ON nodes(file_path, view_gen)`},
+	// Keep this dense. Repository projection queries discover their prefixes
+	// through json_each joins, which cannot imply a repo_prefix <> '' partial
+	// predicate, and empty-prefix rows remain part of the Store query contract.
+	{"nodes_by_repo", `CREATE INDEX IF NOT EXISTS nodes_by_repo ON nodes(repo_prefix, view_gen)`},
 	// Resolver warmup selects definitions by exact repository, compatible
 	// language family, and a bounded page of names. Keep the key minimal: kind
 	// is not a query predicate and WITHOUT ROWID secondary indexes already
 	// carry the primary-key id. The partial predicate excludes nameless nodes.
-	{"nodes_by_repo_language_name", `CREATE INDEX IF NOT EXISTS nodes_by_repo_language_name ON nodes(repo_prefix, language, name) WHERE name <> ''`},
-	{"edges_by_from", `CREATE INDEX IF NOT EXISTS edges_by_from ON edges(from_id, kind)`},
+	{"nodes_by_repo_language_name", `CREATE INDEX IF NOT EXISTS nodes_by_repo_language_name ON nodes(repo_prefix, language, name, view_gen) WHERE name <> ''`},
+	{"edges_by_from", `CREATE INDEX IF NOT EXISTS edges_by_from ON edges(view_gen, from_id, kind)`},
 	// Site-shaped candidate probes (guard rehydration, resolve-job liveness,
 	// edge identity lookups) constrain (from_id, line). Without a line-bearing
 	// index the planner satisfies them through the covering WITHOUT-ROWID
@@ -124,37 +127,32 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// predicate-shaped index separate so it cannot perturb the legacy ordered
 	// outgoing plan; both participate in the same bulk drop/rebuild lifecycle.
 	{"edges_by_from_line_kind", edgesByFromLineKindIndexDDL},
-	{"edges_by_to", `CREATE INDEX IF NOT EXISTS edges_by_to ON edges(to_id, kind)`},
+	{"edges_by_to", `CREATE INDEX IF NOT EXISTS edges_by_to ON edges(view_gen, to_id, kind)`},
 	{"edges_by_kind", `CREATE INDEX IF NOT EXISTS edges_by_kind ON edges(kind)`},
 	// Exact changed-file frontiers (watcher and partial indexing) must not
 	// scan every edge merely to find source sites owned by one file.
 	{"edges_by_file", `CREATE INDEX IF NOT EXISTS edges_by_file ON edges(file_path, kind)`},
 }
 
-// nodes_by_generation / edges_by_generation serve sparse-generation
-// enumeration and garbage collection: "which rows belong to generation g" and
-// "drop every row of generation g". Every other read binds its generation as a
-// residual conjunct on an existing access path, so these two are the only keys
-// in the package that lead with view_gen.
-//
-// The WHERE view_gen > 0 predicate is what makes them affordable. A store that
-// has only ever been plainly indexed holds nothing but generation-0 rows, so
-// both indexes stay empty and cost nothing to maintain; a sparse derived
-// generation gets a full leading seek. A reader must restate the predicate
-// literally — SQLite cannot prove a bound parameter is greater than zero — so
-// an ordinary `view_gen = ?` read keeps the plan it already had.
+// nodes_by_generation / edges_by_generation serve payload enumeration,
+// garbage collection, and every generation-only graph read. They are dense:
+// SQLite cannot infer a partial `view_gen > 0` predicate from `view_gen = ?`,
+// even for a positive bound value, so the former partial indexes left ordinary
+// generation-0 and derived-generation equality reads scanning the whole table.
+// Leading with view_gen gives both populations the same bounded seek while id
+// preserves stable enumeration order.
 const (
 	nodesByGenerationIndexName = "nodes_by_generation"
 	edgesByGenerationIndexName = "edges_by_generation"
 
-	nodesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS nodes_by_generation ON nodes(view_gen, id) WHERE view_gen > 0`
-	edgesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_generation ON edges(view_gen, id) WHERE view_gen > 0`
+	nodesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS nodes_by_generation ON nodes(view_gen, id)`
+	edgesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_generation ON edges(view_gen, id)`
 )
 
 // bulkAlwaysLiveIndexes preserve bounded maintenance and resolver/repository
-// projections as soon as the first repository publishes. Most are sparse
-// partial indexes; the dense repo-leading index also stays live so per-repo
-// emptiness checks and exact recounts never scan the growing cold corpus.
+// projections as soon as the first repository publishes. The repository and
+// generation lookup indexes are dense; the remaining partial indexes stay
+// live so their narrow frontiers remain queryable throughout bulk loading.
 var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
 	// Repo-first (repo_prefix, kind) probes for the repository projections:
 	// the flat kind index invites whole-kind-range scans that a repo filter
@@ -172,7 +170,7 @@ var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
 	{edgesByGenerationIndexName, edgesByGenerationIndexDDL},
 	{"nodes_repo_files", `CREATE INDEX IF NOT EXISTS nodes_repo_files ON nodes(repo_prefix, workspace_id, language, file_path, id) WHERE kind = 'file'`},
 	{"edges_by_unresolved", `CREATE INDEX IF NOT EXISTS edges_by_unresolved ON edges(is_unresolved) WHERE is_unresolved = 1`},
-	{"edges_fnvalue_prefixed", `CREATE INDEX IF NOT EXISTS edges_fnvalue_prefixed ON edges(to_id) WHERE to_id LIKE '%::unresolved::fnvalue::%'`},
+	{"edges_fnvalue_prefixed", `CREATE INDEX IF NOT EXISTS edges_fnvalue_prefixed ON edges(view_gen, to_id) WHERE to_id LIKE '%::unresolved::fnvalue::%'`},
 	{"nodes_go_receiver_type", `CREATE INDEX IF NOT EXISTS nodes_go_receiver_type ON nodes(repo_prefix, file_dir, name, id) WHERE language = 'go' AND kind IN ('type', 'interface') AND name <> '' AND file_path <> ''`},
 }
 

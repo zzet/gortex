@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 25
+const currentSchemaVersion = 28
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -122,6 +122,198 @@ var schemaMigrations = []schemaMigration{
 	{version: 23, name: "persist derived dependency revision", inPlace: addDependencyRevisionColumns},
 	{version: 24, name: "separate node identity-only ownership masks", inPlace: addNodeIdentityMaskKinds},
 	{version: 25, name: "key analysis generations by view generation", inPlace: addAnalysisViewGenerationKeys},
+	{version: 26, name: "scope hot graph indexes by view generation", inPlace: scopeHotGraphIndexesByViewGeneration},
+	{version: 27, name: "scope kind and fn-value indexes by view generation", inPlace: scopeKindAndFnValueIndexesByViewGeneration},
+	{version: 28, name: "lead edge candidate indexes with view generation", inPlace: scopeEdgeCandidateIndexesByViewGeneration},
+}
+
+// generationFirstEdgeCandidateIndexNames covers precisely the indexes used by
+// endpoint and site candidate reads. The v26 step already rebuilt the endpoint
+// pair with their current registry DDL, so v28 compares every individual
+// column sequence and skips each already-correct index.
+var generationFirstEdgeCandidateIndexNames = [...]string{
+	"edges_by_from",
+	"edges_by_to",
+	"edges_by_from_line",
+	"edges_by_from_line_kind",
+}
+
+func scopeEdgeCandidateIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationFirstEdgeCandidateIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationFirstEdgeCandidateIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-first edge candidate index %q missing from registry", name)
+		}
+	}
+	mismatched := make([]bulkDroppableIndex, 0, len(indexes))
+	for _, idx := range indexes {
+		matched, err := edgeCandidateIndexMatchesGenerationFirst(tx, idx.name)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			mismatched = append(mismatched, idx)
+		}
+	}
+	for _, idx := range mismatched {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range mismatched {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+func edgeCandidateIndexMatchesGenerationFirst(tx *sql.Tx, name string) (bool, error) {
+	want := map[string][]string{
+		"edges_by_from":           {"view_gen", "from_id", "kind"},
+		"edges_by_to":             {"view_gen", "to_id", "kind"},
+		"edges_by_from_line":      {"view_gen", "from_id", "line"},
+		"edges_by_from_line_kind": {"view_gen", "from_id", "line", "kind"},
+	}
+	columns, ok := want[name]
+	if !ok {
+		return false, fmt.Errorf("generation-first edge candidate index %q has no expected shape", name)
+	}
+	rows, err := tx.Query(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`, name)
+	if err != nil {
+		return false, fmt.Errorf("read %s shape: %w", name, err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return false, fmt.Errorf("scan %s shape: %w", name, err)
+		}
+		got = append(got, column)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read %s shape: %w", name, err)
+	}
+	if len(got) != len(columns) {
+		return false, nil
+	}
+	for i := range got {
+		if got[i] != columns[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// generationSelectiveGraphIndexNames is the bounded v27 migration whitelist.
+// Resolve both canonical definitions before dropping either index so a registry
+// drift fails without disturbing a warm store's installed legacy shapes.
+var generationSelectiveGraphIndexNames = [...]string{
+	"nodes_by_kind",
+	"edges_fnvalue_prefixed",
+}
+
+func scopeKindAndFnValueIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationSelectiveGraphIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationSelectiveGraphIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-selective graph index %q missing from registry", name)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+// generationScopedGraphIndexNames is the bounded v26 migration whitelist.
+// Each name resolves back to the same registry DDL used by fresh stores and
+// bulk-index sealing, so initial creation and migration cannot drift.
+var generationScopedGraphIndexNames = [...]string{
+	"nodes_by_name",
+	"nodes_by_file",
+	"nodes_by_repo",
+	"nodes_by_repo_language_name",
+	"edges_by_from",
+	"edges_by_to",
+	nodesByGenerationIndexName,
+	edgesByGenerationIndexName,
+}
+
+// scopeHotGraphIndexesByViewGeneration replaces the eight legacy lookup shapes
+// transactionally. Resolve every definition before the first DROP: a renamed
+// or removed registry entry fails without disturbing any installed index.
+func scopeHotGraphIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationScopedGraphIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationScopedGraphIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-scoped graph index %q missing from registry", name)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
 }
 
 // addAnalysisViewGenerationKeys gives the whole-graph analysis cache a real

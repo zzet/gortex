@@ -255,6 +255,13 @@ func scopedNodeProjectionQuery(
 	if !haveRepos && !haveFiles {
 		return "", nil, false
 	}
+	if haveRepos && !haveFiles && kind != "" && len(repoPrefixes) == 1 && repoPrefixes[0] != "" {
+		query := `SELECT ` + qualifiedNodeColumns("n", columns) +
+			` FROM nodes AS n` +
+			` WHERE n.repo_prefix = ? AND n.kind = ? AND n.view_gen = ?` +
+			` AND n.id > ? ORDER BY n.id LIMIT ?`
+		return query, []any{repoPrefixes[0], kind, viewGen}, true
+	}
 	ctes := make([]string, 0, 2)
 	joins := make([]string, 0, 2)
 	args := make([]any, 0, 3)

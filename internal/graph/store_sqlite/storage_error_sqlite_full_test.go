@@ -284,10 +284,12 @@ func BenchmarkPrivateSQLiteFullEmission(b *testing.B) {
 
 // PrivateSQLiteFullWriterState exists only in the Store test binary.
 type PrivateSQLiteFullWriterState struct {
-	MaxPageCount int64
-	PageCount    int64
-	PageSize     int64
-	FreePages    int64
+	MaxPageCount   int64
+	PageCount      int64
+	PageSize       int64
+	FreePages      int64
+	BulkWriter     bool
+	BulkGeneration int64
 }
 
 // PrivateSQLiteFullWriterStateForTest changes only the fixture writer's ceiling.
@@ -297,12 +299,15 @@ func PrivateSQLiteFullWriterStateForTest(ctx context.Context, s *Store, limit in
 		return state, err
 	}
 	defer s.writeMu.Unlock()
-	if s.bulkConn != nil {
-		return state, fmt.Errorf("private SQLITE_FULL fixture requires non-bulk writer")
-	}
-	conn, release, err := s.activeWriteConnLocked(ctx)
-	if err != nil {
-		return state, err
+	state.BulkWriter = s.bulkConn != nil
+	state.BulkGeneration = s.generationBulkLoad
+	conn := s.bulkConn
+	release := func() {}
+	if conn == nil {
+		conn, release, err = s.activeWriteConnLocked(ctx)
+		if err != nil {
+			return state, err
+		}
 	}
 	defer release()
 	statement := "PRAGMA max_page_count"

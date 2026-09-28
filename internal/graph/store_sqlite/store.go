@@ -1207,6 +1207,10 @@ func (s *Store) Close() error {
 }
 
 const (
+	baseAllEdgesSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen = ?
+ORDER BY id`
 	generationAllNodesSQL = `SELECT ` + lookupNodeCols + `
 FROM nodes INDEXED BY nodes_by_generation
 WHERE view_gen > 0 AND view_gen = ?
@@ -1326,11 +1330,16 @@ func (s *Store) prepare() error {
 		 GROUP BY n.repo_prefix`)
 	prep(&s.stmtRepoNodeCount,
 		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND view_gen = ?`)
+	// Select the repository's source IDs before counting edges. A flat join
+	// can scan every edge in the generation for each small repository. The
+	// explicit outer generation predicate also bounds the bulk-load fallback
+	// while the adjacency index is absent. Numbered parameters keep the same
+	// (repo prefix, generation) binding contract as the node count above.
 	prep(&s.stmtRepoEdgeCount,
-		`SELECT COUNT(*)
-		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
-		 WHERE n.repo_prefix = ? AND e.view_gen = ?`)
+		`SELECT COUNT(*) FROM edges
+		 WHERE view_gen = ?2 AND from_id IN (
+		     SELECT id FROM nodes WHERE repo_prefix = ?1 AND view_gen = ?2
+		 )`)
 	prep(&s.stmtAllRepoCountsNodes,
 		`SELECT repo_prefix, COUNT(*) FROM nodes WHERE repo_prefix <> '' AND view_gen = ? GROUP BY repo_prefix`)
 	prep(&s.stmtAllRepoCountsEdges,
@@ -1379,10 +1388,9 @@ func (s *Store) prepare() error {
 		   FROM edges e
 		   JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
 		  WHERE n.repo_prefix = ? AND e.view_gen = ?`)
-	// id is the rowid alias, so the full scan already yields insertion order
-	// and the clause adds no sorter — same reasoning as stmtAllNodes above.
-	prep(&s.stmtAllEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE view_gen = ? ORDER BY id`)
+	// The dense, always-live generation index yields insertion order within
+	// generation zero. Pin it so adjacency indexes cannot add an export sort.
+	prep(&s.stmtAllEdges, baseAllEdgesSQL)
 	prep(&s.stmtGenerationAllEdges, generationAllEdgesSQL)
 	prep(&s.stmtEdgeCount,
 		`SELECT COUNT(*) FROM edges WHERE view_gen = ?`)
@@ -3006,12 +3014,7 @@ FROM edges WHERE kind = ? AND view_gen = ?`
 func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
 		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind = ? AND view_gen = ?`
-		args := []any{string(kind), s.viewGen}
-		if s.viewGen > baseViewGeneration {
-			query = generationNodesByKindSQL
-			args = []any{s.viewGen, string(kind)}
-		}
-		out := s.queryNodesSQL(query, args...)
+		out := s.queryNodesSQL(query, string(kind), s.viewGen)
 		for _, n := range out {
 			if !yield(n) {
 				return

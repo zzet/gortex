@@ -33,8 +33,10 @@ const plannerStatsIndexQuery = `
 WITH critical(name) AS (VALUES
   ('edges_by_from_line'),
   ('edges_by_from_line_kind'),
+  ('edges_by_generation'),
   ('edges_by_kind'),
   ('nodes_by_file'),
+  ('nodes_by_generation'),
   ('nodes_by_kind'),
   ('nodes_by_name'),
   ('nodes_by_repo'),
@@ -124,19 +126,17 @@ var plannerStatsIndexProbes = map[string]plannerStatsIndexProbe{
 	// Non-partial edge indexes.
 	"edges_by_from_line":      {table: "edges"},
 	"edges_by_from_line_kind": {table: "edges"},
+	"edges_by_generation":     {table: "edges"},
 	"edges_by_kind":           {table: "edges"},
 	// Non-partial node indexes.
-	"nodes_by_file":      {table: "nodes"},
-	"nodes_by_kind":      {table: "nodes"},
-	"nodes_by_name":      {table: "nodes"},
-	"nodes_by_repo_kind": {table: "nodes"},
+	"nodes_by_file":       {table: "nodes"},
+	"nodes_by_generation": {table: "nodes"},
+	"nodes_by_kind":       {table: "nodes"},
+	"nodes_by_name":       {table: "nodes"},
+	"nodes_by_repo":       {table: "nodes"},
+	"nodes_by_repo_kind":  {table: "nodes"},
 	// Partial node indexes: every question is asked through the index with
 	// its own predicate.
-	"nodes_by_repo": {
-		table:     "nodes",
-		predicate: `repo_prefix <> ''`,
-		partial:   true,
-	},
 	"nodes_by_repo_language_name": {
 		table:     "nodes",
 		predicate: `name <> ''`,
@@ -435,32 +435,41 @@ func plannerStatsRepairReason(ctx context.Context, db *sql.DB) (string, bool) {
 		}
 	}
 
-	// R2: a partial critical index whose stat row believes a handful of
-	// entries while the index holds materially more. The bounded count reads
-	// at most believed*2+1 entries, so the literal zero row costs a single
-	// probe and the largest suspect row costs a couple of hundred.
+	// R2: any critical index whose stat row believes a handful of entries
+	// while the index holds materially more. The bounded count reads at most
+	// believed*2+1 entries, so a literal zero row costs one index entry and the
+	// largest suspect row costs only a couple of hundred. The parser clamps a
+	// missing, malformed, or negative leading token to zero, so LIMIT is always
+	// positive and can never take SQLite's unbounded -1 meaning.
 	for _, name := range indexes {
 		spec, known := plannerStatsIndexProbes[name]
-		if !known || !spec.partial || !statPresent[name] {
+		if !known || !statPresent[name] {
 			continue
 		}
 		believed := plannerStatsBelievedRows(ctx, db, name)
 		if believed > plannerStatsSuspectRows {
 			continue
 		}
-		// R3: the row describes an index that holds nothing. The bounded
-		// count below could not tell this apart from a truthful small row,
-		// because both report actual <= believed*2.
-		var hasRows bool
-		if err := db.QueryRowContext(ctx, spec.existsQuery(name)).Scan(&hasRows); err != nil {
-			return "", false
-		}
-		if !hasRows {
-			return "stale_stat:" + name, true
+		// R3 remains partial-only: absence is preferable to a stat row for
+		// an empty partial index. A dense index can legitimately describe an
+		// empty table, so its zero row must remain stable rather than churn.
+		if spec.partial {
+			var hasRows bool
+			if err := db.QueryRowContext(ctx, spec.existsQuery(name)).Scan(&hasRows); err != nil {
+				return "", false
+			}
+			if !hasRows {
+				return "stale_stat:" + name, true
+			}
 		}
 		limit := believed*2 + 1
+		countQuery := spec.countQuery(name)
+		if !spec.partial {
+			countQuery = `SELECT count(*) FROM (SELECT 1 FROM ` + spec.table +
+				` INDEXED BY ` + quoteSQLiteIdentifier(name) + ` LIMIT ?)`
+		}
 		var actual int64
-		if err := db.QueryRowContext(ctx, spec.countQuery(name), limit).Scan(&actual); err != nil {
+		if err := db.QueryRowContext(ctx, countQuery, limit).Scan(&actual); err != nil {
 			return "", false
 		}
 		if actual > 0 && believed*2 < actual {

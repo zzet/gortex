@@ -161,7 +161,7 @@ func (s *Store) FindFileNodesBounded(
 		pageArgs := append(append([]any(nil), args...), s.viewGen, lastID, rawPageSize)
 		rows, queryErr := tx.QueryContext(
 			ctx,
-			`SELECT `+columns+` FROM nodes WHERE `+predicate+` AND view_gen = ? AND id > ? ORDER BY id LIMIT ?`,
+			`SELECT `+columns+` FROM nodes INDEXED BY nodes_by_file WHERE `+predicate+` AND view_gen = ? AND id > ? ORDER BY id LIMIT ?`,
 			pageArgs...,
 		)
 		if queryErr != nil {

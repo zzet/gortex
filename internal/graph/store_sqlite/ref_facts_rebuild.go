@@ -151,7 +151,7 @@ const refFactFileProjection = `WITH selected AS (
     FROM json_each(?) AS requested
     CROSS JOIN nodes AS n
       ON n.repo_prefix = ? AND n.file_path = CAST(requested.value AS TEXT)
-    JOIN edges AS e INDEXED BY edges_by_from
+    CROSS JOIN edges AS e INDEXED BY edges_by_from
       ON e.from_id = n.id AND e.view_gen = n.view_gen
     LEFT JOIN nodes AS t ON t.id = e.to_id AND t.view_gen = e.view_gen
     WHERE ` + refFactEligiblePredicate + ` AND n.view_gen = ?

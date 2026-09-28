@@ -377,3 +377,150 @@ func TestScopedEdgeProjectionFallsBackForMalformedFileProvenance(t *testing.T) {
 		t.Fatalf("scoped targets = %v, want canonical and malformed", got)
 	}
 }
+
+func TestScopedNodeProjectionSingleRepoKindUsesSelectiveKeyset(t *testing.T) {
+	store := openScopedProjectionTestStore(t)
+	current := store.AtGeneration(41)
+	stale := store.AtGeneration(40)
+	currentNodes := make([]*graph.Node, 0, 18)
+	staleNodes := make([]*graph.Node, 0, 36)
+	wantIDs := make([]string, 0, 18)
+	for i := 0; i < 36; i++ {
+		id := fmt.Sprintf("repo::row-%03d", i)
+		staleNodes = append(staleNodes, &graph.Node{ID: id, Kind: graph.KindContract, Name: "stale", RepoPrefix: "repo"})
+		if i%2 == 0 {
+			currentNodes = append(currentNodes, &graph.Node{ID: id, Kind: graph.KindContract, Name: "current", RepoPrefix: "repo", Meta: map[string]any{"generation": 41}})
+			wantIDs = append(wantIDs, id)
+		}
+	}
+	if err := stale.AddBatchChecked(staleNodes, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := current.AddBatchChecked(currentNodes, nil); err != nil {
+		t.Fatal(err)
+	}
+	query, baseArgs, ok := scopedNodeProjectionQuery([]string{"repo"}, nil, string(graph.KindContract), "id", 41)
+	if !ok {
+		t.Fatal("single-repository node query was not built")
+	}
+	if len(baseArgs) != 3 || baseArgs[0] != "repo" || baseArgs[1] != string(graph.KindContract) || baseArgs[2] != int64(41) {
+		t.Fatalf("single-repository arguments = %#v", baseArgs)
+	}
+	plan := scopedProjectionPlan(t, store, query, append(append([]any(nil), baseArgs...), "", 7)...)
+	if !strings.Contains(plan, "nodes_by_repo_kind") || !strings.Contains(plan, "repo_prefix=?") || !strings.Contains(plan, "kind=?") || !strings.Contains(plan, "id>?") {
+		t.Fatalf("single-repository query is not a selective keyset seek:\n%s", plan)
+	}
+	if strings.Contains(plan, "nodes_by_generation") || strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("single-repository query uses the broad or sorting plan:\n%s", plan)
+	}
+	equalIDs := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+	pagedIDs := func() []string {
+		t.Helper()
+		afterID := ""
+		var got []string
+		for {
+			args := append(append([]any(nil), baseArgs...), afterID, 7)
+			rows, err := store.db.Query(query, args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var page []string
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					t.Fatal(err)
+				}
+				page = append(page, id)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			rows.Close()
+			got = append(got, page...)
+			if len(page) < 7 {
+				return got
+			}
+			afterID = page[len(page)-1]
+		}
+	}
+	if got := pagedIDs(); !equalIDs(got, wantIDs) {
+		t.Fatalf("paged generation rows = %v, want %v", got, wantIDs)
+	}
+	fullCount := 0
+	for node := range current.NodesInScopeSeq([]string{"repo"}, nil, graph.KindContract) {
+		if node.Meta == nil || node.Name != "current" {
+			t.Fatalf("full projection returned wrong generation: %#v", node)
+		}
+		fullCount++
+	}
+	if fullCount != len(wantIDs) {
+		t.Fatalf("full projection rows = %d, want %d", fullCount, len(wantIDs))
+	}
+	lightCount := 0
+	for node := range current.NodesLightInScopeSeq([]string{"repo"}, nil) {
+		if node.Meta != nil || node.Name != "current" {
+			t.Fatalf("light projection returned wrong generation: %#v", node)
+		}
+		lightCount++
+	}
+	if lightCount != len(wantIDs) {
+		t.Fatalf("light projection rows = %d, want %d", lightCount, len(wantIDs))
+	}
+	if _, err := store.writerDB.Exec(`DROP INDEX nodes_by_repo_kind`); err != nil {
+		t.Fatal(err)
+	}
+	fallbackPlan := scopedProjectionPlan(t, store, query, append(append([]any(nil), baseArgs...), "", 7)...)
+	if strings.Contains(fallbackPlan, "TEMP B-TREE") {
+		t.Fatalf("index-absent fallback sorts the keyset:\n%s", fallbackPlan)
+	}
+	if got := pagedIDs(); !equalIDs(got, wantIDs) {
+		t.Fatalf("index-absent generation rows = %v, want %v", got, wantIDs)
+	}
+}
+
+func TestScopedNodeProjectionSelectiveFastPathKeepsBroadFallbacks(t *testing.T) {
+	store := openScopedProjectionTestStore(t)
+	cases := []struct {
+		name          string
+		repos, files  []string
+		kind          string
+		wantFragments []string
+	}{
+		{"empty repository", []string{""}, nil, string(graph.KindContract), []string{"json_each", "+n.repo_prefix"}},
+		{"multiple repositories", []string{"a", "b"}, nil, string(graph.KindContract), []string{"json_each", "+n.repo_prefix"}},
+		{"file intersection", []string{"a"}, []string{"a/file.go"}, string(graph.KindContract), []string{"requested_files", "json_each", "+n.repo_prefix"}},
+		{"empty kind", []string{"a"}, nil, "", []string{"json_each", "+n.repo_prefix"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			query, args, ok := scopedNodeProjectionQuery(tc.repos, tc.files, tc.kind, "id", baseViewGeneration)
+			if !ok {
+				t.Fatal("fallback query was not built")
+			}
+			for _, fragment := range tc.wantFragments {
+				if !strings.Contains(query, fragment) {
+					t.Fatalf("fallback query missing %q:\n%s", fragment, query)
+				}
+			}
+			plan := scopedProjectionPlan(t, store, query, append(append([]any(nil), args...), "", 7)...)
+			if strings.Contains(plan, "TEMP B-TREE") {
+				t.Fatalf("fallback query uses a temp b-tree:\n%s", plan)
+			}
+		})
+	}
+	if _, _, ok := scopedNodeProjectionQuery(nil, nil, string(graph.KindContract), "id", baseViewGeneration); ok {
+		t.Fatal("unscoped query was built")
+	}
+}

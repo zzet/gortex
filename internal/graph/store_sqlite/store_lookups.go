@@ -589,7 +589,7 @@ func edgeCandidatesExactSiteQuery(triples int) string {
 	return `WITH wanted(from_id, line, kind) AS (VALUES ` + edgeCandidatesValues(triples, "(?, ?, ?)") + `)
 	      SELECT DISTINCT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.kind = w.kind AND e.line = w.line
+	        CROSS JOIN edges AS e ON e.from_id = w.from_id AND e.kind = w.kind AND e.line = w.line
 	       WHERE e.view_gen = ?`
 }
 
@@ -597,7 +597,7 @@ func edgeCandidatesAnySiteQuery(pairs int) string {
 	return `WITH wanted(from_id, line) AS (VALUES ` + edgeCandidatesValues(pairs, "(?, ?)") + `)
 	      SELECT DISTINCT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.line = w.line
+	        CROSS JOIN edges AS e ON e.from_id = w.from_id AND e.line = w.line
 	       WHERE e.view_gen = ?`
 }
 
