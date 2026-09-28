@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,7 +24,11 @@ import (
 // sample overlaps it) and does not start while an edit's sample waits; a
 // locked index is left to the next activation.
 func (c *CheckoutCoordinator) healRacyIndex(ctx context.Context) {
-	if c == nil || c.sampler == nil {
+	if c == nil {
+		return
+	}
+	defer c.racyHeal.finish()
+	if c.sampler == nil {
 		return
 	}
 	// A coordinator activated by an edit starts while that edit is being
@@ -31,8 +36,16 @@ func (c *CheckoutCoordinator) healRacyIndex(ctx context.Context) {
 	if !c.awaitNoEdit(ctx, racyIndexEditWait) {
 		return
 	}
+	// Never while the lifecycle's own git work runs: the refresh takes the
+	// index lock, and a git command of the lifecycle's (or one it waits on)
+	// would fail on it.
+	release, ok := c.racyHeal.gitWork.refresh(ctx, racyIndexEditWait)
+	if !ok {
+		return
+	}
+	defer release()
 	started := time.Now()
-	before, after, ran, err := c.sampler.RefreshRacyIndex(ctx)
+	before, after, ran, err := racyIndexRefresh(ctx, c.sampler)
 	if c.logger == nil || (!ran && err == nil) {
 		return
 	}
@@ -106,8 +119,13 @@ func (l *CheckoutLifecycle) healFamilyRacyIndexes(ctx context.Context, familyID 
 		if err != nil {
 			continue
 		}
+		release, ok := l.gitWork.refresh(ctx, racyIndexEditWait)
+		if !ok {
+			continue
+		}
 		started := time.Now()
-		before, after, ran, err := sampler.RefreshRacyIndex(ctx)
+		before, after, ran, err := racyIndexRefresh(ctx, sampler)
+		release()
 		if l.logger == nil || (!ran && err == nil) {
 			continue
 		}
@@ -122,5 +140,123 @@ func (l *CheckoutLifecycle) healFamilyRacyIndexes(ctx context.Context, familyID 
 			continue
 		}
 		l.logger.Info("checkout lifecycle: racily clean index refreshed at start", fields...)
+	}
+}
+
+// racyIndexRefresh runs one refresh; a test seam.
+var racyIndexRefresh = func(ctx context.Context, s *gitstate.DirtySampler) (gitstate.RacyIndexReport, gitstate.RacyIndexReport, bool, error) {
+	return s.RefreshRacyIndex(ctx)
+}
+
+// checkoutGitWork serialises the racily clean index refreshes (which take a
+// checkout's index lock) against the lifecycle's own git work: a refresh
+// never starts while that work runs, and the work waits for a refresh in
+// flight to finish before it starts.
+type checkoutGitWork struct {
+	mu        sync.Mutex
+	cond      *sync.Cond
+	holders   int
+	refreshes int
+}
+
+func (w *checkoutGitWork) init() {
+	if w.cond == nil {
+		w.cond = sync.NewCond(&w.mu)
+	}
+}
+
+// hold marks the lifecycle's git work in flight, after any refresh already
+// running finishes; release ends it.
+func (w *checkoutGitWork) hold() (release func()) {
+	if w == nil {
+		return func() {}
+	}
+	w.mu.Lock()
+	w.init()
+	w.holders++
+	for w.refreshes > 0 {
+		w.cond.Wait()
+	}
+	w.mu.Unlock()
+	return func() {
+		w.mu.Lock()
+		w.holders--
+		w.cond.Broadcast()
+		w.mu.Unlock()
+	}
+}
+
+// refresh admits one refresh once no git work of the lifecycle is in flight,
+// waiting at most bound; ok is false when it could not be admitted (the next
+// activation refreshes instead).
+func (w *checkoutGitWork) refresh(ctx context.Context, bound time.Duration) (release func(), ok bool) {
+	if w == nil {
+		return func() {}, true
+	}
+	deadline := time.Now().Add(bound)
+	for {
+		w.mu.Lock()
+		w.init()
+		if w.holders == 0 {
+			w.refreshes++
+			w.mu.Unlock()
+			return func() {
+				w.mu.Lock()
+				w.refreshes--
+				w.cond.Broadcast()
+				w.mu.Unlock()
+			}, true
+		}
+		w.mu.Unlock()
+		if time.Now().After(deadline) {
+			return nil, false
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, false
+		case <-timer.C:
+		}
+	}
+}
+
+// busy reports whether git work of the lifecycle is in flight; a test seam.
+func (w *checkoutGitWork) busy() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.holders > 0
+}
+
+// racyHealState is a coordinator's start-time refresh: done is closed once it
+// finished (or never started).
+type racyHealState struct {
+	gitWork *checkoutGitWork
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (r *racyHealState) begin(work *checkoutGitWork) {
+	r.gitWork = work
+	r.done = make(chan struct{})
+}
+
+func (r *racyHealState) finish() {
+	if r.done != nil {
+		r.once.Do(func() { close(r.done) })
+	}
+}
+
+// awaitRacyIndexHeal waits (bounded) for the coordinator's start-time
+// refresh to finish; it reports whether it did.
+func (c *CheckoutCoordinator) awaitRacyIndexHeal(bound time.Duration) bool {
+	if c == nil || c.racyHeal.done == nil {
+		return true
+	}
+	select {
+	case <-c.racyHeal.done:
+		return true
+	case <-time.After(bound):
+		return false
 	}
 }

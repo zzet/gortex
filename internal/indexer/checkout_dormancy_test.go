@@ -48,6 +48,14 @@ func (f *lifecycleFixture) activateAndWait(checkoutID string) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	// The activation's start-time racily clean index refresh takes the
+	// checkout's index lock; the test's own git commands come after it.
+	f.lc.coordMu.Lock()
+	coordinator := f.lc.coordinators[checkoutID]
+	f.lc.coordMu.Unlock()
+	if !coordinator.awaitRacyIndexHeal(30 * time.Second) {
+		f.t.Fatalf("the racily clean index refresh of %s never finished", checkoutID)
+	}
 }
 
 // automaticCheckoutID returns the family's checkout administered under one

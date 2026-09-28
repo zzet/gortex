@@ -696,6 +696,7 @@ func (l *CheckoutLifecycle) reconcileFamily(
 		return reconcile.FamilyReport{}, fmt.Errorf("%w: no family given", ErrCheckoutNotTracked)
 	}
 	defer l.beginBatch()()
+	baseline := l.repoSetFingerprint()
 	report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, ""))
 	if err != nil {
 		return reconcile.FamilyReport{}, err
@@ -707,7 +708,7 @@ func (l *CheckoutLifecycle) reconcileFamily(
 	}
 	if familyReportRemoved(report) {
 		l.saveConfig("reconcile")
-		l.notifyTrackedSetChanged()
+		l.notifyFamilyChanged(baseline)
 	}
 	return report, nil
 }

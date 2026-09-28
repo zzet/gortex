@@ -662,9 +662,12 @@ func TestCheckoutLifecycleTrackSurfaceParity(t *testing.T) {
 	assert.True(t, f.familyOf(cli.Prefix).IsPrimaryBase)
 	assert.True(t, f.familyOf(mcp.Prefix).IsPrimaryBase)
 
+	// The analysis runs on the lifecycle's maintenance lane, coalesced: the
+	// two tracks rerun it at least once, after both, never on the caller.
+	require.True(t, f.lc.waitAnalysisIdle(30*time.Second), "the analysis lane did not settle")
 	invalidated, analysed := f.notify.counts()
 	assert.Equal(t, 2, invalidated, "each track invalidates the session scopes")
-	assert.Equal(t, 2, analysed, "each track reruns the analysis")
+	assert.GreaterOrEqual(t, analysed, 1, "the tracks rerun the analysis")
 
 	// Re-registering is idempotent: the identity is reused, not minted again.
 	again, err := f.lc.Register(ctx, config.RepoEntry{Path: cliRoot}, TrackSourceCLI)

@@ -319,6 +319,16 @@ type CheckoutLifecycle struct {
 	// the same answer the last one gives.
 	batchDepth   int
 	batchPending bool
+	// batchRequest is the analysis scope the pending fan-out carries.
+	batchRequest analysisRequest
+	// analysis is the low-priority lane the tracked-set analysis runs on
+	// (checkout_lifecycle_analysis.go); analysisEditCycle replaces its
+	// edit-cycle predicate in tests.
+	analysis          *lifecycleAnalysisLane
+	analysisEditCycle func() bool
+	// gitWork serialises the racily clean index refreshes behind the
+	// lifecycle's own git work (checkout_racy_index.go).
+	gitWork checkoutGitWork
 
 	// baseAdoptionRelease unregisters this lifecycle's committed-base adoption
 	// observer, installed in the constructor and dropped by Close. It is the
@@ -356,6 +366,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	}
 	transitionCtx, cancelTransitions := context.WithCancel(context.Background())
 	l := &CheckoutLifecycle{
+		analysis:               newLifecycleAnalysisLane(),
 		mi:                     cfg.MultiIndexer,
 		cfgMgr:                 cfg.ConfigManager,
 		logger:                 logger,
@@ -1780,6 +1791,7 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 	if l == nil || l.rec == nil || familyID == "" {
 		return
 	}
+	baseline := l.repoSetFingerprint()
 	report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, fallbackDir))
 	if err != nil {
 		l.logger.Debug("checkout lifecycle: could not reconcile the family",
@@ -1790,7 +1802,7 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 	l.scheduleFamilyRetry(report)
 	if familyReportRemoved(report) {
 		l.saveConfig("reconcile")
-		l.notifyTrackedSetChanged()
+		l.notifyFamilyChanged(baseline)
 	}
 }
 
@@ -2323,8 +2335,11 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		// language servers are admitted against the same global cap
 		// rather than one cap per coordinator.
 		Semantic: l.mi.semanticMgr,
+		// The stack pre-warm gives way to the whole edit cycle.
+		EditCycleActive: l.editCycleHoldsBuildLane,
 	}
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
+		GitWork:        &l.gitWork,
 		PrewarmRoute:   l.routePrewarm.call,
 		CheckoutID:     checkout.CheckoutID,
 		CheckoutRoot:   checkout.RootPath,
@@ -2958,6 +2973,7 @@ func (l *CheckoutLifecycle) Close() error {
 	if l.baseAdoptionRelease != nil {
 		l.baseAdoptionRelease()
 	}
+	l.closeAnalysisLane()
 	readersDrained := l.stopRepositoryAdmissions()
 	publishersDrained := l.stopRepositoryPublishers()
 	l.closeRepositoryCleanup()
@@ -3880,6 +3896,7 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	for familyID, probeDir := range seeded {
 		familyStarted := stageStarted("reconcile_family", zap.String("family", familyID))
 		reconcileStarted := stageStarted("reconcile_family_catalog", zap.String("family", familyID))
+		baseline := l.repoSetFingerprint()
 		report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, probeDir))
 		stageCompleted("reconcile_family_catalog", reconcileStarted, err, zap.String("family", familyID))
 		if err != nil {
@@ -3894,7 +3911,7 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 		l.scheduleFamilyRetry(report)
 		if familyReportRemoved(report) {
 			l.saveConfig("reconcile")
-			l.notifyTrackedSetChanged()
+			l.notifyFamilyChanged(baseline)
 		}
 		stageCompleted("reconcile_family", familyStarted, nil, zap.String("family", familyID))
 	}
@@ -4133,10 +4150,23 @@ func (l *CheckoutLifecycle) saveConfig(reason string) {
 // notifyTrackedSetChanged tells the query surface that the tracked set moved,
 // or records that it will have to be told once the running batch ends.
 func (l *CheckoutLifecycle) notifyTrackedSetChanged() {
+	l.notifyAnalysisScope(analysisRequest{unconditional: true})
+}
+
+// notifyFamilyChanged is notifyTrackedSetChanged for a family reconcile that
+// removed a checkout: the session scopes are invalidated at once, and the
+// graph-wide analysis reruns only if the tracked repository set moved since
+// baseline, the fingerprint taken before the reconcile.
+func (l *CheckoutLifecycle) notifyFamilyChanged(baseline string) {
+	l.notifyAnalysisScope(analysisRequest{baselines: map[string]struct{}{baseline: {}}})
+}
+
+func (l *CheckoutLifecycle) notifyAnalysisScope(req analysisRequest) {
 	l.mu.Lock()
 	notifier := l.notifier
 	if l.batchDepth > 0 {
 		l.batchPending = true
+		l.batchRequest.merge(req)
 		l.mu.Unlock()
 		return
 	}
@@ -4145,7 +4175,7 @@ func (l *CheckoutLifecycle) notifyTrackedSetChanged() {
 		return
 	}
 	notifier.InvalidateSessionScopes()
-	notifier.RunAnalysis()
+	l.requestAnalysis(req)
 }
 
 // beginBatch coalesces every fan-out until the returned function runs.
@@ -4157,12 +4187,14 @@ func (l *CheckoutLifecycle) beginBatch() func() {
 		l.mu.Lock()
 		l.batchDepth--
 		fire := l.batchDepth == 0 && l.batchPending
+		var req analysisRequest
 		if fire {
 			l.batchPending = false
+			req, l.batchRequest = l.batchRequest, analysisRequest{}
 		}
 		l.mu.Unlock()
 		if fire {
-			l.notifyTrackedSetChanged()
+			l.notifyAnalysisScope(req)
 		}
 	}
 }

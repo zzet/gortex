@@ -195,6 +195,10 @@ type CheckoutCoordinatorConfig struct {
 	// CheckoutID is the catalog identity of the checkout, and the key its
 	// route row is stored under.
 	CheckoutID string
+	// GitWork serialises the start-time racily clean index refresh behind the
+	// lifecycle's own git work (checkout_racy_index.go); nil runs it
+	// unserialised.
+	GitWork *checkoutGitWork
 	// PrewarmRoute, when set, is called with the generations a route flip is
 	// about to name (commit generation first, then the working-tree layer),
 	// before the flip: the view reader loads their layer masks then, so the
@@ -439,6 +443,8 @@ type CheckoutCycle struct {
 // reconciliation reports an accessible automatic checkout, and closed when
 // that checkout leaves.
 type CheckoutCoordinator struct {
+	// racyHeal tracks the start-time index refresh (checkout_racy_index.go).
+	racyHeal racyHealState
 	// prewarmCommitGeneration is the commit generation whose stack was last
 	// pre-warmed (RewarmEditDeltaStacks warms it again when its key moved).
 	prewarmCommitGeneration atomic.Int64
@@ -900,6 +906,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	// empty revision, which is the one value the reuse guards read as "matches
 	// anything".
 	c.describeDependencyCohort(lifetime)
+	c.racyHeal.begin(cfg.GitWork)
 	go c.healRacyIndex(lifetime)
 	go c.run()
 	return c, nil
