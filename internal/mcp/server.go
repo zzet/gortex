@@ -253,6 +253,30 @@ type Server struct {
 	backgroundMaintenanceDrained bool
 	analysisMaterializeMu        sync.Mutex
 	analysisMu                   sync.RWMutex
+	// answerAnalysis is the analysis receipt the answer path last observed
+	// with analysisMu free, and answerAnalysisValues the per-generation values
+	// it memoizes; see analysis_answer.go. The answer path never waits for a
+	// running analysis pass.
+	// analysisRunMu serializes analysis passes (and the clusters tool's
+	// recompute, which shares the Leiden cache); analysisPassActive reports a
+	// pass in flight now that a pass no longer holds analysisMu. See
+	// analysis_pass.go.
+	analysisRunMu      sync.Mutex
+	analysisPassActive atomic.Bool
+	analysisPassSkips  atomic.Int64
+	// analysisScopedHandle memoizes the view-scoped analysis handle
+	// (analysis_generation.go).
+	analysisScopedHandle atomic.Pointer[analysisScopedHandleMemo]
+	// analysisYield, when set, reports that an edit cycle holds the build
+	// lane; a background pass waits it out between sub-analyses.
+	analysisYield        func() bool
+	answerAnalysis       atomic.Pointer[answerAnalysisSnapshot]
+	answerAnalysisValues answerAnalysisCache
+	answerToken          atomic.Pointer[answerTokenMemo]
+	// stackAdjacency memoizes the rerank's bounded-centrality reads per
+	// composed level of a routed stack; see centrality_stack_memo.go.
+	stackAdjacency     *stackAdjacencyMemo
+	stackAdjacencyOnce sync.Once
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -2888,7 +2912,34 @@ func (s *Server) currentCommunityToken() communityCacheToken {
 // the current graph, then pushes a `notifications/resources/updated`
 // for every bootstrap resource so subscribed clients can refresh
 // without polling.
-func (s *Server) RunAnalysis() {
+func (s *Server) RunAnalysis() { s.runAnalysis(true) }
+
+// runAnalysis is RunAnalysis. A background pass (the lifecycle's lane, the
+// on-demand starter) yields between its sub-analyses to edit cycles and to
+// tool calls in flight; a pass a tool call runs itself (index_repository,
+// reindex) does not, since it would only be waiting for itself.
+//
+// The pass never holds analysisMu while it computes: every reader keeps
+// answering from the installed snapshot (or without analysis signals once
+// that snapshot no longer matches the graph) and only the install itself
+// takes the lock. Passes are serialized by analysisRunMu, and a graph whose
+// installed snapshot still matches makes the pass a no-op.
+func (s *Server) runAnalysis(background bool) {
+	s.analysisRunMu.Lock()
+	defer s.analysisRunMu.Unlock()
+	s.analysisPassActive.Store(true)
+	defer s.analysisPassActive.Store(false)
+	if s.analysisSnapshotStillCurrent() {
+		s.analysisPassSkips.Add(1)
+		if s.logger != nil {
+			s.logger.Info("mcp: analysis pass skipped: the installed snapshot matches the graph")
+		}
+		// Subscribers are still told, as after every pass: the call is the
+		// "rollups are settled" signal they wait for. Nothing was rebuilt, so
+		// the graph-invalidated broadcast and the per-graph resets stay out.
+		s.notifyBootstrapResourcesUpdated()
+		return
+	}
 	runtimeactivity.Begin("analysis")
 	analysisStarted := time.Now()
 	var memoryBefore runtime.MemStats
@@ -2901,9 +2952,7 @@ func (s *Server) RunAnalysis() {
 		scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
 	}()
 
-	s.analysisMu.Lock()
-	analysisMetrics := s.populateAnalysisLocked()
-	s.analysisMu.Unlock()
+	analysisMetrics := s.populateAnalysis(true, background)
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
 	// IDs whose incoming refs were confirmed against the *previous* graph
@@ -2948,6 +2997,14 @@ func (s *Server) RunAnalysis() {
 			zap.Duration("adjacency", analysisMetrics.adjacency),
 			zap.Duration("auto_concepts", analysisMetrics.autoConcepts),
 			zap.Duration("hits", analysisMetrics.hits),
+			zap.Int("attempts", analysisMetrics.attempts),
+			zap.Int("superseded", analysisMetrics.superseded),
+			zap.String("superseded_at", analysisMetrics.supersededAt),
+			zap.Int("yields", analysisMetrics.yields),
+			zap.Int("pace_parks", analysisMetrics.paceParks),
+			zap.Duration("pace_parked", analysisMetrics.paceParked),
+			zap.Int("projection_edge_scans", analysisMetrics.projectionEdgeScans),
+			zap.Duration("yielded", analysisMetrics.yielded),
 			zap.Duration("total", time.Since(analysisStarted)),
 			zap.Uint64("heap_alloc_before_bytes", memoryBefore.HeapAlloc),
 			zap.Uint64("heap_alloc_after_bytes", memoryAfter.HeapAlloc),
@@ -3045,9 +3102,59 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
 	_ = s.ensureCommunitiesMaterialized()
 	_ = s.ensureLeidenMaterialized()
+	// The fast path reads under the read lock; the recompute runs outside
+	// analysisMu, serialized with the analysis pass by analysisRunMu, and
+	// only its install takes the lock — a reader never waits for a Leiden
+	// run (analysis_pass.go).
+	if result, stats, ok := s.cachedIncrementalCommunities(); ok {
+		return result, stats
+	}
+	s.analysisRunMu.Lock()
+	defer s.analysisRunMu.Unlock()
+	if result, stats, ok := s.cachedIncrementalCommunities(); ok {
+		return result, stats
+	}
+	s.analysisMu.RLock()
+	cur := s.currentCommunityToken()
+	communitiesNil, cachedToken, leidenInput := s.communities == nil, s.communitiesToken, s.leidenCache
+	s.analysisMu.RUnlock()
+	if s.logger != nil {
+		s.logger.Info("incrementalCommunities cache miss",
+			zap.Bool("communities_nil", communitiesNil),
+			zap.Int("cached_nodes", cachedToken.nodeCount),
+			zap.Int("cur_nodes", cur.nodeCount),
+			zap.Int("cached_edges", cachedToken.edgeCount),
+			zap.Int("cur_edges", cur.edgeCount),
+			zap.Int("cached_edge_rev", cachedToken.edgeIdentity),
+			zap.Int("cur_edge_rev", cur.edgeIdentity))
+	}
+	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, leidenInput)
+	// Capture the token AFTER the algo finishes — if the graph mutated
+	// during the (potentially slow) detector run, the token reflects
+	// the state the result was actually computed against, and the next
+	// call's token comparison stays meaningful.
+	token := s.currentCommunityToken()
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
+	s.communities = result
+	s.leidenCache = cache
+	s.communitiesToken = token
+	// A cache miss ran a real community recompute. Invalidate the dependent
+	// hotspot ranking and advance its epoch while holding analysisMu: an
+	// in-flight getHotspots build that captured the old communities will see
+	// the epoch change, discard its result, and rebuild before publishing.
+	s.hotspots = nil
+	s.hotspotsReady = false
+	s.analysisEpoch++
+	return result, stats
+}
+
+// cachedIncrementalCommunities is incrementalCommunities' cache hit: the
+// communities installed for the graph as it is now.
+func (s *Server) cachedIncrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats, bool) {
 	cur := s.currentCommunityToken()
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
 	if s.communities != nil && s.communitiesToken == cur {
 		stats := analysis.IncrementalCommunityStats{
 			Incremental: true,
@@ -3061,40 +3168,9 @@ func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.I
 				zap.Int("edges", cur.edgeCount),
 				zap.Int("edge_identity_rev", cur.edgeIdentity))
 		}
-		return s.communities, stats
+		return s.communities, stats, true
 	}
-	if s.logger != nil {
-		// INFO-level on the miss path so a regression that re-introduces
-		// a steady-state cache miss is visible without flipping the
-		// daemon to debug. The full token diff is here precisely to
-		// catch background-mutation regressions (some pass keeps drifting
-		// the edge count under the cache and the Leiden walk runs every
-		// call). A real first-call miss is a single line in the log.
-		s.logger.Info("incrementalCommunities cache miss",
-			zap.Bool("communities_nil", s.communities == nil),
-			zap.Int("cached_nodes", s.communitiesToken.nodeCount),
-			zap.Int("cur_nodes", cur.nodeCount),
-			zap.Int("cached_edges", s.communitiesToken.edgeCount),
-			zap.Int("cur_edges", cur.edgeCount),
-			zap.Int("cached_edge_rev", s.communitiesToken.edgeIdentity),
-			zap.Int("cur_edge_rev", cur.edgeIdentity))
-	}
-	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
-	s.communities = result
-	s.leidenCache = cache
-	// Capture the token AFTER the algo finishes — if the graph mutated
-	// during the (potentially slow) detector run, the token reflects
-	// the state the result was actually computed against, and the next
-	// call's token comparison stays meaningful.
-	s.communitiesToken = s.currentCommunityToken()
-	// A cache miss ran a real community recompute. Invalidate the dependent
-	// hotspot ranking and advance its epoch while holding analysisMu: an
-	// in-flight getHotspots build that captured the old communities will see
-	// the epoch change, discard its result, and rebuild before publishing.
-	s.hotspots = nil
-	s.hotspotsReady = false
-	s.analysisEpoch++
-	return result, stats
+	return nil, analysis.IncrementalCommunityStats{}, false
 }
 
 func (s *Server) getProcesses() *analysis.ProcessResult {

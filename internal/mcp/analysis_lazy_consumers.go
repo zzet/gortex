@@ -176,13 +176,17 @@ func (s *Server) rerankBoundedCentrality(ctx context.Context, seeds, candidateID
 
 // rerankAnalysisMetrics returns exactly the requested candidates and global
 // normalization maxima. The callback is invoked once from rerank.Context.Prepare.
+//
+// It reads through the answer-path receipt (analysis_answer.go), so a symbol
+// search never waits for a running analysis pass, and the two maxima are read
+// once per analysis generation rather than once per search.
 func (s *Server) rerankAnalysisMetrics(nodeIDs []string) map[string]rerank.AnalysisMetric {
-	rows, err := s.analysisNodeMetricsBatched(nodeIDs)
-	if err != nil || len(rows) == 0 {
+	rows, header, ok := s.answerAnalysisNodeMetricsBatched(nodeIDs)
+	if !ok || len(rows) == 0 {
 		return nil
 	}
-	maxAuthority := s.topAnalysisMetricValue(graph.AnalysisMetricAuthority)
-	maxHub := s.topAnalysisMetricValue(graph.AnalysisMetricHub)
+	maxAuthority := s.answerTopAnalysisMetricValue(header, graph.AnalysisMetricAuthority)
+	maxHub := s.answerTopAnalysisMetricValue(header, graph.AnalysisMetricHub)
 	metrics := make(map[string]rerank.AnalysisMetric, len(rows))
 	for _, row := range rows {
 		metric := rerank.AnalysisMetric{CommunityID: row.CommunityID}

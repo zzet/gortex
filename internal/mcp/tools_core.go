@@ -1460,7 +1460,7 @@ func (s *Server) handleIndexRepository(ctx context.Context, req mcp.CallToolRequ
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		s.RunAnalysis()
+		s.startBackgroundAnalysis("index")
 		s.recordIndexTelemetry(result.FileCount)
 		return s.respondJSONOrTOON(ctx, req, result)
 	}
@@ -1469,7 +1469,7 @@ func (s *Server) handleIndexRepository(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	s.RunAnalysis()
+	s.startBackgroundAnalysis("index")
 	s.recordIndexTelemetry(result.FileCount)
 	return s.respondJSONOrTOON(ctx, req, result)
 }
@@ -1619,7 +1619,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		s.resolveReindexedPathReceipts(resolved, eligible)
 	}
 
-	s.RunAnalysis()
+	s.startBackgroundAnalysis("reindex")
 
 	scope := "repository"
 	if len(paths) > 0 {

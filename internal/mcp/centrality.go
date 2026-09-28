@@ -204,8 +204,17 @@ func (s *Server) boundedCentralityForRequest(ctx context.Context, seeds, candida
 	// symbol search kept reading adjacency for minutes after its caller had
 	// gone, on the reader connection and the single scheduler slot the next
 	// requests needed.
+	//
+	// On a routed stack the build reads through the stacked adjacency memo
+	// (centrality_stack_memo.go): every level below the newest generation
+	// answers from memory, so a search after a publication reads only the
+	// new generation, and a repeated search reads nothing.
+	reader := s.stackedAdjacencyReader(ctx)
+	if reader == nil {
+		reader = s.readerFor(ctx)
+	}
 	snapshot, stats := analysis.BuildBoundedAdjacencySnapshot(
-		requestBoundReader(ctx, s.readerFor(ctx)), candidateIDs, proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges)
+		requestBoundReader(ctx, reader), candidateIDs, proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges)
 	if ctx != nil && ctx.Err() != nil {
 		// A snapshot cut short by the request's end is partial. Nobody reads
 		// the answer, and a walk over it must not reach the shared walk cache.

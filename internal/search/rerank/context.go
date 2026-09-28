@@ -40,6 +40,17 @@ type Context struct {
 	// the overlay's shadow graph just like base.
 	Graph graph.Reader
 
+	// EdgeBatches, when set, answers prepare's two batched candidate edge
+	// reads in place of Graph. It must serve exactly the content Graph
+	// serves: the answer path sets it to a memoized reader over the same
+	// immutable routed stack, so a candidate's edges are read once per
+	// published generation rather than once per search. Every other read
+	// still goes to Graph.
+	EdgeBatches interface {
+		GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
+		GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
+	}
+
 	// QueryClass is the detected shape of the query (symbol / concept
 	// / path / signature). It scales the bm25 and semantic signal
 	// weights inside Pipeline.Rerank. The zero value QueryClassUnknown
@@ -341,6 +352,9 @@ func (c *Context) InheritEdgeCacheFrom(src *Context) {
 	c.outEdgeCache = src.outEdgeCache
 	c.inEdgeCache = src.inEdgeCache
 	c.cachePreSeeded = src.cachePreSeeded
+	if c.EdgeBatches == nil {
+		c.EdgeBatches = src.EdgeBatches
+	}
 }
 
 // EdgeCacheHitRate reports the fraction of nodeIDs that have an entry
@@ -497,8 +511,15 @@ func (c *Context) prepare(cands []*Candidate) {
 		missingIn := missingEdgeIDs(ids, c.inEdgeCache)
 		// Backfill — when the cache already covers everything, both
 		// missing slices are empty and no cgo round-trip fires.
+		var batches interface {
+			GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
+			GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
+		} = c.Graph
+		if c.EdgeBatches != nil {
+			batches = c.EdgeBatches
+		}
 		if len(missingOut) > 0 {
-			fetched := c.Graph.GetOutEdgesByNodeIDs(missingOut)
+			fetched := batches.GetOutEdgesByNodeIDs(missingOut)
 			if c.outEdgeCache == nil {
 				c.outEdgeCache = make(map[string][]*graph.Edge, len(fetched))
 			}
@@ -507,7 +528,7 @@ func (c *Context) prepare(cands []*Candidate) {
 			}
 		}
 		if len(missingIn) > 0 {
-			fetched := c.Graph.GetInEdgesByNodeIDs(missingIn)
+			fetched := batches.GetInEdgesByNodeIDs(missingIn)
 			if c.inEdgeCache == nil {
 				c.inEdgeCache = make(map[string][]*graph.Edge, len(fetched))
 			}

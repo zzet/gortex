@@ -255,7 +255,7 @@ func expandSearchTerms(ctx context.Context, s *Server, query string, vocabAnchor
 	}
 	terms := res.Terms
 	if vocabAnchored {
-		terms = anchorTermsToVocabulary(terms, s.getAutoConcepts())
+		terms = anchorTermsToVocabulary(terms, s.autoConceptsForAnswer())
 	}
 	return terms
 }

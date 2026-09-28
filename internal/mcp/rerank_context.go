@@ -29,6 +29,12 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 			return s.rerankBoundedCentrality(ctx, seeds, candidateIDs)
 		},
 	}
+	// On a routed stack the candidates' fan-in / fan-out batch reads through
+	// the stacked memo (centrality_stack_memo.go): a candidate's edges are
+	// read once per published generation, not once per search.
+	if edges := s.stackedEdgeBatches(ctx); edges != nil {
+		rctx.EdgeBatches = edges
+	}
 
 	if s.combo != nil {
 		// The combo boost fuses two stores: the exact whole-query

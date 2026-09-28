@@ -73,14 +73,33 @@ func (s *Server) analysisGenerationStore() graph.Store {
 	if !ok {
 		return backend
 	}
-	viewGen := s.analysisViewGeneration()
-	if viewGen == scoped.ViewGeneration() {
-		return backend
+	target := scoped
+	if viewGen := s.analysisViewGeneration(); viewGen != scoped.ViewGeneration() {
+		if pinned := scoped.AtGeneration(viewGen); pinned != nil {
+			target = pinned
+		}
 	}
-	if pinned := scoped.AtGeneration(viewGen); pinned != nil {
-		return pinned
+	return s.viewScopedAnalysisHandle(target)
+}
+
+// viewScopedAnalysisHandle is target's view-scoped analysis handle
+// (store_sqlite.ViewScopedAnalysis): its analysis revision, the gate every
+// publication and the no-op rule check, moves only on writes to the analysed
+// view and to the base it composes over. A worktree edit writes its own
+// derived generation, so it neither stales the installed snapshot nor
+// supersedes a pass in flight. The handle is kept for the last target, so the
+// per-request answer path does not copy the store handle each time.
+func (s *Server) viewScopedAnalysisHandle(target *store_sqlite.Store) *store_sqlite.Store {
+	if memo := s.analysisScopedHandle.Load(); memo != nil && memo.source == target {
+		return memo.scoped
 	}
-	return backend
+	scoped := target.ViewScopedAnalysis()
+	s.analysisScopedHandle.Store(&analysisScopedHandleMemo{source: target, scoped: scoped})
+	return scoped
+}
+
+type analysisScopedHandleMemo struct {
+	source, scoped *store_sqlite.Store
 }
 
 func (s *Server) analysisGenerationBackends() (graph.AnalysisGenerationStore, graph.AnalysisQueryStore) {
@@ -412,11 +431,21 @@ func (s *Server) scheduleAnalysisGenerationPrune(writer graph.AnalysisGeneration
 	go func() {
 		defer s.backgroundMaintenance.Done()
 		defer s.analysisPruneScheduled.Store(false)
+		// Maintenance stands down while an edit cycle holds the build lane:
+		// it waits (bounded) for the lane, skips this round when the lane
+		// stays busy (the next pass prunes), and stops between chunks when
+		// an edit cycle starts under it.
+		if !s.waitForQuietEditLane(analysisPruneLaneWait) {
+			analysisPruneStoodDown.Add(1)
+			return
+		}
 		runtimeactivity.Begin("analysis_generation_gc")
 		defer runtimeactivity.End("analysis_generation_gc")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := writer.PruneAnalysisGenerations(ctx, analysisGenerationPruneKeep, analysisGenerationPruneBatch); err != nil && s.logger != nil {
+		stop := s.cancelWhenEditCycleStarts(cancel)
+		defer stop()
+		if err := writer.PruneAnalysisGenerations(ctx, analysisGenerationPruneKeep, analysisGenerationPruneBatch); err != nil && s.logger != nil && ctx.Err() == nil {
 			s.logger.Warn("mcp: analysis generation prune failed", zap.Error(err))
 		}
 	}()
