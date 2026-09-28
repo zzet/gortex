@@ -11,32 +11,36 @@ import (
 // A retirement sweep commits one bounded chunk after another with no pause
 // between them. Each chunk is small, but back to back they leave the WAL
 // reclaim no writer-idle moment: its capped backfill runs out of time, it
-// defers and backs off, and the log grows (the 2026-09-25 crash window: 8 KB
-// to 2.6 GB in seven minutes of warm-up rebuilds plus retirement). So before
-// each chunk, while the -wal file is over the reclaim's ceiling, the sweep
-// nudges the reclaim and waits — holding nothing — for the log to come back
-// under the ceiling, up to retirementWALWaitMax. Then it proceeds regardless:
-// retirement must always finish, so the wait delays a chunk and never refuses
-// it.
+// defers and backs off, and the log grows (once from 8 KB to 2.6 GB in seven
+// minutes of warm-up rebuilds plus retirement). So before each chunk, while
+// the log is over the retirement mark, the sweep asks for the reclaim and
+// waits — holding nothing — for the log to come back under the mark, up to
+// retirementWALWaitMax (retirementWALWaitEditingMax while a checkout is being
+// edited). Then it proceeds regardless: retirement must always finish, so
+// the wait delays a chunk and never refuses it.
 
 // Vars, not consts, only so the in-package cases can shorten them;
 // production never assigns them.
 var (
 	retirementWALWaitMax  = 30 * time.Second
 	retirementWALWaitPoll = 100 * time.Millisecond
-	// retirementWALMarkFactor: the sweep waits once the log reaches this
-	// multiple of the reclaim threshold (1 GiB at the default 256 MiB), or the
-	// ceiling if that is lower. The ceiling alone (2 GiB) let one sweep write
-	// 2.1 GB of log in the first three minutes of an edit session, which every
-	// read and write of those edits then paid for.
-	retirementWALMarkFactor int64 = 4
+	// retirementWALWaitEditingMax: while a checkout is being edited the sweep
+	// waits this long for the log to come under its mark, not
+	// retirementWALWaitMax: the edits' own writes keep the log over the mark
+	// for the whole burst, and every chunk the sweep adds then is log the
+	// edits' reads pay for and a reset has to copy. Retirement can wait for a
+	// burst; it must still finish, so the wait ends here too.
+	retirementWALWaitEditingMax = 10 * time.Minute
 )
 
 // retirementWALMark is the log size at which a retirement chunk waits for the
-// reclaim.
+// reclaim: the reclaim threshold (256 MiB by default), or the ceiling if that
+// is lower. It was four times the threshold (1 GiB): a startup sweep slice
+// wrote 772 MB of log in 15 s just before an edit burst, and the burst's
+// folds were then refused for minutes over their mark.
 func retirementWALMark(threshold, ceiling int64) int64 {
 	if threshold > 0 && ceiling > 0 {
-		return min(ceiling, retirementWALMarkFactor*threshold)
+		return min(ceiling, threshold)
 	}
 	return ceiling
 }
@@ -71,8 +75,7 @@ func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, ep
 	if ceiling <= 0 || s.dbPath == "" {
 		return
 	}
-	walPath := s.dbPath + "-wal"
-	size := walFileSize(walPath)
+	size := s.retirementLogBytes()
 	if size < ceiling {
 		if episode.active {
 			log.Printf("store_sqlite: retirement resumed generation=%d wal_bytes=%d ceiling=%d episode=%s",
@@ -88,7 +91,11 @@ func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, ep
 	}
 	s.walReclaim.cycle.retirementWaits.Add(1)
 	s.RequestWALReclaim()
-	deadline := time.NewTimer(retirementWALWaitMax)
+	waitMax := retirementWALWaitMax
+	if s.buildLaneBusy() || s.walCopy.editing(time.Now()) {
+		waitMax = retirementWALWaitEditingMax
+	}
+	deadline := time.NewTimer(waitMax)
 	defer deadline.Stop()
 	poll := time.NewTicker(retirementWALWaitPoll)
 	defer poll.Stop()
@@ -100,12 +107,23 @@ func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, ep
 			s.walReclaim.cycle.retirementTimeouts.Add(1)
 			return
 		case <-poll.C:
-			if walFileSize(walPath) < ceiling {
+			if s.retirementLogBytes() < ceiling {
 				return
 			}
-			s.walReclaimNudged.Store(true)
+			s.RequestWALReclaim()
 		}
 	}
+}
+
+// retirementLogBytes is the log as the reclaim measures it: its frames since
+// the last reset (a log reset in place keeps its file's size until it is
+// shrunk, which the file's size would read as over the mark).
+func (s *Store) retirementLogBytes() int64 {
+	mark := s.WALWriteMark()
+	if !mark.Valid {
+		return walFileSize(s.dbPath + "-wal")
+	}
+	return int64(mark.MxFrame) * (int64(mark.PageSize) + walFrameHeaderBytes)
 }
 
 // Retirement yields the write gate to the edit path.

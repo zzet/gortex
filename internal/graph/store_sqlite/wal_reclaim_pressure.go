@@ -17,8 +17,8 @@ import (
 // gap: in one measured run the log grew from 0.7 to 6.3 GB over fifteen minutes
 // of back-to-back edits and folds, and reset only when they stopped.
 //
-// Over the pressure mark (walPressureMark: the retirement mark, 1 GiB by
-// default) with the lane busy, an attempt therefore runs anyway:
+// Over the pressure mark (walPressureMark: four times the reclaim threshold,
+// 1 GiB by default) with the lane busy, an attempt therefore runs anyway:
 //
 //   - its copy is not paused by edits but still paced by the copy budget
 //     (512 MiB per minute while editing), so its cost to an edit is the
@@ -62,15 +62,14 @@ var (
 
 // A writer refused on the log's size asks for the reclaim.
 //
-// The chain fold stops stepping while the log is over 256 MiB and a checkout
-// is being edited, the sweep waits over its marks, and the reclaim itself
-// ran through a busy lane only over the pressure mark (1 GiB): between those
-// marks nothing could bring the log down during a burst, and the fold made no
-// step for minutes. So a writer refused on the log's size requests the
-// reclaim (RequestWALReclaim), and for walReclaimRequestWindow after a
-// request, a log over the reclaim threshold is reclaimed in a busy lane as it
-// is over the pressure mark: the copy paced by the budget and the reset under
-// walReclaimPressureHold.
+// The chain fold stops stepping while the log is over its mark, the sweep
+// waits over its mark, and the reclaim itself ran through a busy lane only
+// over the pressure mark (1 GiB): between those marks nothing could bring the
+// log down during a burst, and the fold made no step for minutes. So a writer
+// refused on the log's size requests the reclaim (RequestWALReclaim), and for
+// walReclaimRequestWindow after a request, a log over the reclaim threshold is
+// reclaimed in a busy lane as it is over the pressure mark: the copy paced by
+// the budget and the reset under walReclaimPressureHold.
 
 // walReclaimRequestWindow is how long a request keeps the pressure mode open.
 var walReclaimRequestWindow = 30 * time.Second
@@ -108,10 +107,17 @@ func (s *Store) walReclaimRequestPending(now time.Time) bool {
 }
 
 // walPressureMark is the log size over which the reclaim runs through a busy
-// lane: the retirement mark (4 x the threshold, capped at the ceiling).
+// lane: walPressureMarkFactor x the threshold, capped at the ceiling.
 func walPressureMark(cfg walReclaimConfig) int64 {
-	return retirementWALMark(cfg.thresholdBytes, cfg.ceilingBytes)
+	if cfg.thresholdBytes > 0 && cfg.ceilingBytes > 0 {
+		return min(cfg.ceilingBytes, walPressureMarkFactor*cfg.thresholdBytes)
+	}
+	return cfg.ceilingBytes
 }
+
+// walPressureMarkFactor: the pressure mark is this multiple of the reclaim
+// threshold (1 GiB at the default 256 MiB), or the ceiling if that is lower.
+const walPressureMarkFactor int64 = 4
 
 var errWALPressureHold = errors.New("store_sqlite: wal reclaim: the reset did not fit its hold inside a busy lane")
 

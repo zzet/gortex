@@ -269,9 +269,9 @@ func TestChainFoldStepsAreSizedByTime(t *testing.T) {
 	require.Less(t, late[len(late)/2], limit, "steps are not sized to the target hold")
 }
 
-// A step does not start over the log's mark while a checkout is being
-// edited; idle, the same log is under the always mark and the step runs.
-func TestChainFoldStepRespectsTheWALMarks(t *testing.T) {
+// A step does not start over the fold's own mark (chainFoldWALMark), edited
+// or idle; under it the step runs, edited or idle.
+func TestChainFoldStepRespectsItsWALMark(t *testing.T) {
 	store := openCatalogStore(t)
 	ctx := context.Background()
 	chain := foldChain(t, store, 200)
@@ -279,16 +279,20 @@ func TestChainFoldStepRespectsTheWALMarks(t *testing.T) {
 	fold, err := store.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
 	require.NoError(t, err)
 	defer func() { _ = fold.Release(ctx) }()
-	prev := chainFoldWALMarkEditing
-	chainFoldWALMarkEditing = 1
-	t.Cleanup(func() { chainFoldWALMarkEditing = prev })
+	prev := chainFoldWALMark
+	chainFoldWALMark = 1
+	t.Cleanup(func() { chainFoldWALMark = prev })
 	require.True(t, store.WALWriteMark().Valid && store.WALWriteMark().MxFrame > 0, "precondition: the log holds frames")
 
 	store.walCopy.sawBusy(time.Now()) // being edited
 	_, err = fold.Step(ctx)
 	require.ErrorIs(t, err, ErrChainFoldWALMark)
-
 	store.walCopy.lastBusy.Store(time.Now().Add(-2 * walCopyEditSession).UnixNano()) // idle
+	_, err = fold.Step(ctx)
+	require.ErrorIs(t, err, ErrChainFoldWALMark)
+
+	chainFoldWALMark = prev // the log is far under 1 GiB
+	store.walCopy.sawBusy(time.Now())
 	_, err = fold.Step(ctx)
 	require.NoError(t, err)
 }

@@ -69,16 +69,16 @@ func stepFoldAgainstABusyLane(t *testing.T, s *Store, lane *fakeBuildLane, fold 
 	return false, refusals
 }
 
-// Scaled: the fold's mark while editing is 4 MiB (production 256 MiB), the
-// reclaim threshold 4 MiB and the pressure mark 16 MiB (production 256 MiB and
-// 1 GiB), the reclaim polls every 25 ms (production 5 s). The log sits at 8
-// MiB, between the marks, and the lane never goes idle. A refused step asks
-// for the reclaim, the reclaim resets the log inside the busy lane, and the
-// fold finishes.
+// Scaled: the fold's mark is 4 MiB (production 1 GiB), the reclaim threshold
+// 4 MiB and the pressure mark 16 MiB (production 256 MiB and 1 GiB), the
+// reclaim polls every 25 ms (production 5 s). The log sits at 8 MiB, over the
+// fold's mark, and the lane never goes idle. A refused step asks for the
+// reclaim, the reclaim resets the log inside the busy lane, and the fold
+// finishes.
 func TestARefusedFoldGetsTheReclaimInsideABusyLane(t *testing.T) {
-	prevMark := chainFoldWALMarkEditing
-	chainFoldWALMarkEditing = 4 << 20
-	t.Cleanup(func() { chainFoldWALMarkEditing = prevMark })
+	prevMark := chainFoldWALMark
+	chainFoldWALMark = 4 << 20
+	t.Cleanup(func() { chainFoldWALMark = prevMark })
 	s, path, lane := pressureStore(t, 0)
 	fold := beginTestFold(t, s)
 	lane.held.Store(true) // an edit burst from here on: nothing reclaims the log in a gap
@@ -114,9 +114,9 @@ func TestARefusedFoldGetsTheReclaimInsideABusyLane(t *testing.T) {
 // Scaled as the test above; the log sits between the fold's mark and the
 // pressure mark, where only a request lets the reclaim through the lane.
 func TestARequestEndsAPausedCopy(t *testing.T) {
-	prevMark := chainFoldWALMarkEditing
-	chainFoldWALMarkEditing = 4 << 20
-	t.Cleanup(func() { chainFoldWALMarkEditing = prevMark })
+	prevMark := chainFoldWALMark
+	chainFoldWALMark = 4 << 20
+	t.Cleanup(func() { chainFoldWALMark = prevMark })
 	s, _, lane := pressureStore(t, 0)
 	fold := beginTestFold(t, s)
 	logBytes := func() int64 {
@@ -163,9 +163,9 @@ func TestARequestEndsAPausedCopy(t *testing.T) {
 // runs the pressure attempt that resets the log inside the busy lane. Scaled
 // as the tests above.
 func TestARequestEndsAnAttemptWaitingForAGap(t *testing.T) {
-	prevMark := chainFoldWALMarkEditing
-	chainFoldWALMarkEditing = 4 << 20
-	t.Cleanup(func() { chainFoldWALMarkEditing = prevMark })
+	prevMark := chainFoldWALMark
+	chainFoldWALMark = 4 << 20
+	t.Cleanup(func() { chainFoldWALMark = prevMark })
 	// Every PASSIVE is counted; an armed observer installs the lane's
 	// predicate at the next one, so the attempt that ran it began without
 	// it and is inside an edit from then on.
@@ -224,11 +224,13 @@ func TestARequestEndsAnAttemptWaitingForAGap(t *testing.T) {
 	require.Positive(t, after.PressureResets-before.PressureResets)
 }
 
-// The same with the daemon's defaults: no environment override, the
-// production marks (256 MiB for the fold while editing, 256 MiB reclaim
-// threshold, 1 GiB pressure mark), budget and 5 s poll. Only the lane and the
-// log's size are the test's: a log of ~300 MiB under a lane held throughout.
-func TestARefusedFoldGetsTheReclaimWithTheDaemonDefaults(t *testing.T) {
+// With the daemon's defaults (no environment override: the fold's mark 1 GiB,
+// the reclaim threshold 256 MiB, the pressure mark 1 GiB, the budget and the
+// 5 s poll), a fold steps through a busy lane with the log between the
+// reclaim threshold and the fold's mark: ~300 MiB, which a burst's own writes
+// reach. It is never refused and finishes. (Under the former rule it was
+// refused over 256 MiB for as long as the edits went on.)
+func TestAFoldStepsBetweenTheThresholdAndItsMarkWithTheDaemonDefaults(t *testing.T) {
 	if testing.Short() {
 		t.Skip("writes a 300 MiB log")
 	}
@@ -240,12 +242,86 @@ func TestARefusedFoldGetsTheReclaimWithTheDaemonDefaults(t *testing.T) {
 	lane.held.Store(true) // hold the lane while the log grows: nothing reclaims it
 	growWAL(t, s, 300)
 	size := walFileSize(path + "-wal")
-	require.Greater(t, size, int64(256<<20), "precondition: over the fold's default mark")
-	require.Less(t, size, int64(1<<30), "precondition: under the default pressure mark")
+	require.Greater(t, size, int64(256<<20), "precondition: over the reclaim threshold")
+	require.Less(t, size, chainFoldWALMark, "precondition: under the fold's mark")
 	done, refusals := foldAgainstABusyLane(t, s, lane, 60*time.Second)
-	t.Logf("fold done=%t refusals=%d pressure_resets=%d", done, refusals, s.WALCopyStats().PressureResets)
-	require.True(t, done, "the fold never got under its mark with the daemon's defaults")
-	require.Positive(t, refusals)
+	t.Logf("fold done=%t refusals=%d log=%.0fMiB", done, refusals, float64(size)/(1<<20))
+	require.True(t, done, "the fold did not finish between the threshold and its mark")
+	require.Zero(t, refusals, "a step was refused under the fold's mark")
+}
+
+// Over the fold's mark with the daemon's defaults: the fold's first refusal
+// asks for the reclaim, and the time from that request to the reset is
+// bounded, although edits keep writing (a writer adds ~7 MiB/s under a lane
+// busy throughout). The loop wakes at the request (not at its next poll), the
+// pressure step queues for the writer (up to walReclaimPressureWriterWait),
+// and while the log is over the fold's mark the copy is not paced by the
+// budget. It writes more than 1 GiB of log, so it runs only with
+// GORTEX_STORE_DEFAULTS_FOLD_MARK=1.
+func TestARefusedFoldGetsItsResetInBoundedTimeWithTheDaemonDefaults(t *testing.T) {
+	if os.Getenv("GORTEX_STORE_DEFAULTS_FOLD_MARK") != "1" {
+		t.Skip("set GORTEX_STORE_DEFAULTS_FOLD_MARK=1 (writes a >1 GiB log)")
+	}
+	s, _ := openWALReclaimStore(t)
+	defer func() { _ = s.Close() }()
+	seedWALChurnTable(t, s)
+	lane := &fakeBuildLane{}
+	lane.install(s)
+	lane.held.Store(true)
+	logBytes := func() int64 {
+		m := s.WALWriteMark()
+		return int64(m.MxFrame) * (int64(m.PageSize) + walFrameHeaderBytes)
+	}
+	for k := 0; logBytes() <= chainFoldWALMark+(64<<20); k++ {
+		require.NoError(t, churnWriteOnce(s, k))
+	}
+	ctx := context.Background()
+	chain := foldChain(t, s, 200)
+	to := reservedGeneration(t, s, "folded")
+	fold, err := s.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
+	require.NoError(t, err)
+	defer func() { _ = fold.Release(ctx) }()
+
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() { // the edits' writes: ~1 MiB every 150 ms
+		defer close(writerDone)
+		for k := 0; ; k++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(150 * time.Millisecond):
+			}
+			_ = churnWriteOnce(s, k)
+		}
+	}()
+	resets := s.WALReclaimStats().Resets
+	var requested time.Time
+	var reset time.Duration
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		_, err := fold.Step(ctx)
+		if errors.Is(err, ErrChainFoldWALMark) {
+			if requested.IsZero() {
+				requested = time.Now()
+			}
+		} else if err != nil && !errors.Is(err, ErrChainFoldYielded) {
+			require.NoError(t, err)
+		}
+		if !requested.IsZero() && s.WALReclaimStats().Resets > resets {
+			reset = time.Since(requested)
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	close(stop)
+	<-writerDone
+	cp := s.WALCopyStats()
+	t.Logf("fold refused at log=%.0fMiB; reset %s after the request; pressure_runs=%d lane_resets=%d give_ups=%d",
+		float64(chainFoldWALMark+(64<<20))/(1<<20), reset.Round(time.Millisecond), cp.PressureRuns, cp.PressureLaneResets, cp.PressureGiveUps)
+	require.False(t, requested.IsZero(), "precondition: the fold was refused over its mark")
+	require.NotZero(t, reset, "no reset within 5 minutes of the request")
+	require.Less(t, reset, 60*time.Second, "the reset came later than the bound")
 }
 
 // The burst test with the daemon's defaults (threshold 256 MiB, pressure mark

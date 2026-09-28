@@ -29,8 +29,7 @@ import (
 //     parked on the gate, the step in flight is interrupted and rolled back
 //     (ErrChainFoldYielded, cursor unchanged) and the caller steps again later.
 //   - A step does not start while the log is over its mark
-//     (ErrChainFoldWALMark): chainFoldWALMarkEditing while a checkout is being
-//     edited, the retirement mark (1 GiB by default) always.
+//     (ErrChainFoldWALMark): chainFoldWALMark (1 GiB), edited or not.
 //   - Step never sleeps; waiting is the caller's.
 //   - Readers see nothing new between steps: `to` is building, which no view
 //     serves, and the members are held (retirement refuses them) until
@@ -67,9 +66,14 @@ var (
 	chainFoldMaxRows   = 20000
 	// chainFoldYieldPoll is how often a step in flight checks for an edit.
 	chainFoldYieldPoll = time.Millisecond
-	// chainFoldWALMarkEditing: while a checkout is being edited, no step
-	// starts with more log than this since its last reset.
-	chainFoldWALMarkEditing int64 = 256 << 20
+	// chainFoldWALMark: no step starts with more log than this since its
+	// last reset, edited or not. Provisional: it stays at 1 GiB unless a
+	// measurement of what a log of that size costs a read and an edit says
+	// otherwise. It is the fold's own and not the pressure mark, although
+	// both are 1 GiB today. (It was 256 MiB while a checkout was edited: in
+	// a burst the edits' own writes kept the log over that, and a fold was
+	// refused for minutes while the resets it waited for were impossible.)
+	chainFoldWALMark int64 = 1 << 30
 	// chainFoldInjectFailure, when a test sets it, can fail a step before
 	// its n-th phase (a failed commit, a lost connection). nil in production.
 	chainFoldInjectFailure func(phase int) error
@@ -328,15 +332,8 @@ func (s *Store) walOverFoldMark(now time.Time) bool {
 	if !mark.Valid {
 		return false
 	}
-	logBytes := int64(mark.MxFrame) * (int64(mark.PageSize) + walFrameHeaderBytes)
-	if (s.buildLaneBusy() || s.walCopy.editing(now)) && logBytes > chainFoldWALMarkEditing {
-		return true
-	}
-	threshold, ceiling := s.walReclaimBounds()
-	if always := retirementWALMark(threshold, ceiling); always > 0 && logBytes > always {
-		return true
-	}
-	return false
+	_ = now
+	return int64(mark.MxFrame)*(int64(mark.PageSize)+walFrameHeaderBytes) > chainFoldWALMark
 }
 
 // stepRows is the row budget of the next step.

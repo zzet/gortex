@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -168,12 +169,11 @@ func TestRetirementWaitProceedsWhenTheReclaimCannotReset(t *testing.T) {
 	require.GreaterOrEqual(t, time.Since(started), 4*50*time.Millisecond)
 }
 
-// The sweep waits at four times the reclaim threshold, not only at the
-// ceiling: a 16 MiB mark under a 32 MiB ceiling holds a chunk once the log is
-// at 20 MiB.
-func TestRetirementWaitsAtFourTimesTheReclaimThreshold(t *testing.T) {
-	require.Equal(t, int64(1<<30), retirementWALMark(256<<20, 2<<30))
-	require.Equal(t, int64(6<<20), retirementWALMark(4<<20, 6<<20), "the ceiling when it is lower")
+// The sweep waits at the reclaim threshold, not at four times it: a 4 MiB
+// mark under a 32 MiB ceiling holds a chunk once the log is at 20 MiB.
+func TestRetirementWaitsAtTheReclaimThreshold(t *testing.T) {
+	require.Equal(t, int64(256<<20), retirementWALMark(256<<20, 2<<30))
+	require.Equal(t, int64(3<<20), retirementWALMark(4<<20, 3<<20), "the ceiling when it is lower")
 	require.Equal(t, int64(2<<30), retirementWALMark(0, 2<<30), "no threshold: the ceiling")
 
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0") // no reclaim to bring the log down
@@ -195,4 +195,70 @@ func TestRetirementWaitsAtFourTimesTheReclaimThreshold(t *testing.T) {
 	require.GreaterOrEqual(t, time.Since(started), 150*time.Millisecond, "the chunk did not wait")
 	require.Equal(t, int64(1), s.WALReclaimStats().RetirementWaits)
 	require.True(t, episode.active)
+}
+
+// With the daemon's marks (threshold 256 MiB, ceiling 2 GiB): a sweep that is
+// running when the log passes 256 MiB stops at its next chunk, so the log it
+// leaves is the mark plus at most one chunk; the sweep then waits and still
+// finishes. The reclaim loop is off (named override), so nothing resets the
+// log underneath, and the wait is shortened (named override: 100 ms, 30 s in
+// production) so the test does not sit in it.
+func TestARunningRetirementStopsAtTheMarkWithTheDaemonDefaults(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	logs := captureReclaimLog(t)
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+	seedPayloadControlPlane(t, store)
+	generationID := publishedPayloadGeneration(t, store)
+	mustExec(t, store, `CREATE TABLE retire_churn(id INTEGER PRIMARY KEY, payload BLOB)`)
+	mustExec(t, store, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 2000)
+		INSERT INTO retire_churn(id, payload) SELECT i, randomblob(1024) FROM n`)
+	_, err := store.writerDB.Exec(`UPDATE view_generations SET state = ? WHERE generation_id = ?`, string(ViewGenerationRetiring), generationID)
+	require.NoError(t, err)
+	// The daemon's defaults, installed by hand: the loop is off (above) so
+	// that no reset ends a wait under the test, and a disabled reclaim
+	// resolves to no threshold and no ceiling (under which retirement does
+	// not wait: no reclaim would come).
+	cfg := walReclaimConfig{thresholdBytes: defaultWALReclaimThresholdBytes, ceilingBytes: walReclaimCeiling(defaultWALReclaimThresholdBytes, 0)}
+	store.walReclaim.update(func(st *WALReclaimStats) { st.ThresholdBytes, st.CeilingBytes = cfg.thresholdBytes, cfg.ceilingBytes })
+	mark := retirementWALMark(cfg.thresholdBytes, cfg.ceilingBytes)
+	require.Equal(t, int64(256<<20), mark)
+	prevMax := retirementWALWaitMax
+	retirementWALWaitMax = 100 * time.Millisecond
+	t.Cleanup(func() { retirementWALWaitMax = prevMax })
+
+	// The log to just under the mark, then a sweep whose chunks each add
+	// about 0.5 MiB: it crosses the mark in its middle.
+	for i := 0; store.retirementLogBytes() < mark-8<<20; i++ {
+		mustExec(t, store, `UPDATE retire_churn SET payload = randomblob(1024) WHERE id % 2 = `+strconv.Itoa(i%2))
+	}
+	var firstWaitAt int64
+	chunks, perChunk, prevBefore := 0, int64(0), int64(0)
+	chunk := func(ctx context.Context, tx *sql.Tx) (int64, error) {
+		if chunks >= 40 {
+			return 0, nil
+		}
+		// A chunk's frames reach the log at its commit, after this callback:
+		// the log a chunk adds is the growth from one chunk's start to the
+		// next's (nothing resets it: the loop is off).
+		before := store.retirementLogBytes()
+		if chunks > 0 {
+			perChunk = max(perChunk, before-prevBefore)
+		}
+		prevBefore = before
+		if firstWaitAt == 0 && store.WALReclaimStats().RetirementWaits > 0 {
+			firstWaitAt = before
+		}
+		chunks++
+		_, err := tx.ExecContext(ctx, `UPDATE retire_churn SET payload = randomblob(1024) WHERE id % 4 = ?`, chunks%4)
+		return 1, err
+	}
+	require.NoError(t, store.deletePayloadChunks(context.Background(), generationID, chunk, nil))
+	st := store.WALReclaimStats()
+	t.Logf("sweep: chunks=%d waits=%d log_at_first_wait=%.1fMiB mark=%dMiB largest_chunk=%.2fMiB",
+		chunks, st.RetirementWaits, float64(firstWaitAt)/(1<<20), mark>>20, float64(perChunk)/(1<<20))
+	require.Equal(t, 40, chunks, "retirement must always finish")
+	require.Positive(t, st.RetirementWaits, "the sweep never stopped at the mark")
+	require.Contains(t, logs.String(), "retirement waiting for the wal reclaim")
+	require.LessOrEqual(t, firstWaitAt, mark+2*perChunk+(1<<20), "the sweep ran past the mark by more than a chunk")
 }

@@ -188,7 +188,17 @@ type walCopyPacer struct {
 	walPath      string
 	// noPause: a pressure attempt's pass is paced by the budget, never paused.
 	noPause bool
+	// overFoldMark: the log is over the fold's mark (chainFoldWALMark), read
+	// every walCopyMarkCheckPages pages. There the pass is not paced by the
+	// budget: a fold waits for this reset, and a paced copy (8.5 MiB/s)
+	// chasing an edit burst's writes took 30 s to converge.
+	overFoldMark bool
+	pages        int
 }
+
+// walCopyMarkCheckPages: how often (in pages written) a pass reads the log's
+// size against the fold's mark.
+const walCopyMarkCheckPages = 256
 
 func (p *walCopyPacer) stopped() bool {
 	if p.ctx.Err() != nil {
@@ -259,7 +269,13 @@ func (p *walCopyPacer) beforeWrite(n int64) {
 		st.walCopy.sawBusy(now)
 		st.walCopy.whileBusy.Add(n)
 	}
-	if p.rate > 0 && st.walCopy.editing(now) && !p.stopped() {
+	if p.pages%walCopyMarkCheckPages == 0 {
+		if mark := st.WALWriteMark(); mark.Valid {
+			p.overFoldMark = int64(mark.MxFrame)*(int64(mark.PageSize)+walFrameHeaderBytes) > chainFoldWALMark
+		}
+	}
+	p.pages++
+	if p.rate > 0 && !p.overFoldMark && st.walCopy.editing(now) && !p.stopped() {
 		if wait := st.walCopy.take(now, n, p.rate); wait > 0 {
 			deadline := now.Add(wait)
 			for time.Now().Before(deadline) && !p.stopped() {
