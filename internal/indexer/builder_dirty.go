@@ -394,7 +394,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 // dirtyChainLanguageCensus is the per-file language census of a working-tree
 // chain, top first: each generation's own node counts (a generation-scoped
 // grouped projection, no node decoding), the newest generation winning per
-// file. It walks at most maxDirtyChainDepth working-tree generations and stops
+// file. It walks at most maxChainWalkDepth working-tree generations and stops
 // at the first row that is not one.
 func dirtyChainLanguageCensus(ctx context.Context, store *store_sqlite.Store, top int64, repoPrefix string) map[string]map[string]int {
 	census := map[string]map[string]int{}
@@ -403,7 +403,7 @@ func dirtyChainLanguageCensus(ctx context.Context, store *store_sqlite.Store, to
 	}
 	catalog := store.Catalog()
 	id := top
-	for depth := 0; id > 0 && depth < maxDirtyChainDepth; depth++ {
+	for depth := 0; id > 0 && depth < maxChainWalkDepth; depth++ {
 		row, found, err := catalog.GetViewGeneration(ctx, id)
 		if err != nil || !found || row.GenerationKind != DirtyLayerGenerationKind {
 			break

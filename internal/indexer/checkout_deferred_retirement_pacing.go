@@ -94,6 +94,11 @@ func (l *CheckoutLifecycle) retirementPacedStandDown(starved bool) string {
 	if pace.busy != "" {
 		return "foreground_" + pace.busy
 	}
+	// A chain fold's copy is the write that matters in its gap; the sweep's
+	// chunks would only take turns with it on the writer.
+	if l.chainFoldInFlight() {
+		return "chain_fold"
+	}
 	idle := deferredRetirementEditIdle
 	if starved {
 		idle = deferredRetirementStarvedIdle
@@ -169,4 +174,18 @@ func (l *CheckoutLifecycle) generationStorageBytes(ctx context.Context) func(int
 		}
 		return row.StorageBytes
 	}
+}
+
+// chainFoldInFlight reports a chain fold of any checkout holding the build
+// lane now.
+func (l *CheckoutLifecycle) chainFoldInFlight() bool {
+	if l.foldInFlight != nil {
+		return l.foldInFlight()
+	}
+	for _, c := range l.registeredCoordinators() {
+		if c.compactionInFlight() {
+			return true
+		}
+	}
+	return false
 }

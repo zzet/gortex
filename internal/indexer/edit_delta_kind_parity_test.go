@@ -459,6 +459,48 @@ func TestKindParityChain(t *testing.T) {
 	}
 }
 
+// The same fixture through the checkout's MCP edits, with the stepped fold:
+// four edits, a fold of them held before its first step, two edits above it,
+// the landing (a re-base of the lowest layer above), and two edits after it.
+// The served view is compared by kind after every edit and after the landing.
+func TestKindParityFoldAndRebase(t *testing.T) {
+	f, c, l := mcpChainFixture(t, kindParityTree(), false)
+	edits := kindParityEdits()
+	primary := newKindParityPrimary(t, f.worktree)
+	check := func(label string) {
+		t.Helper()
+		view := chainMaterialize(t, f)
+		defer view.Close()
+		kindParityCheckWith(t, label, f.worktree, view.Reader, nil, func() graph.Reader { return primary.store })
+	}
+	var trigger CheckoutCycle
+	for i := 0; i < 4; i++ {
+		trigger = mcpEdit(t, l, f, func() { applyKindParityEdit(t, f.worktree, edits[i]) })
+		primary.save(edits[i].paths())
+		check(fmt.Sprintf("mcp depth %d/%s", trigger.DirtyChainDepth, edits[i].name))
+	}
+	if !trigger.CompactionScheduled {
+		t.Fatalf("the fourth edit scheduled no fold (depth %d)", trigger.DirtyChainDepth)
+	}
+	proceed, result := startSteppedFold(t, c, trigger)
+	for i := 4; i < 6; i++ {
+		out := mcpEdit(t, l, f, func() { applyKindParityEdit(t, f.worktree, edits[i]) })
+		primary.save(edits[i].paths())
+		check(fmt.Sprintf("mcp over the running fold depth %d/%s", out.DirtyChainDepth, edits[i].name))
+	}
+	proceed()
+	report := <-result
+	if report.Outcome != dirtyChainCompactionFlipped {
+		t.Fatalf("the fold did not land: %s (%v)", report.Outcome, report.Err)
+	}
+	check("after the landing (" + report.Landing + ")")
+	for i := 6; i < 8; i++ {
+		out := mcpEdit(t, l, f, func() { applyKindParityEdit(t, f.worktree, edits[i]) })
+		primary.save(edits[i].paths())
+		check(fmt.Sprintf("mcp after the landing depth %d/%s", out.DirtyChainDepth, edits[i].name))
+	}
+}
+
 // A reproduction: six chained MCP edits of the builder fixture; the view
 // differed from a clean index at depth 6 (clone_sig meta and 2 edges).
 func TestKindParityBuilderFixtureSixEdits(t *testing.T) {

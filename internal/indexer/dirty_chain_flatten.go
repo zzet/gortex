@@ -45,15 +45,50 @@ var errFlattenRefused = errors.New("indexer: working-tree chain not folded")
 func (c *CheckoutCoordinator) flattenDirtyChain(
 	ctx context.Context, commit store_sqlite.ViewGeneration, top int64,
 ) (dirtyLayerBuild, error) {
+	return c.flattenDirtyChainOver(ctx, commit, commit, top, c.copyChainAtOnce)
+}
+
+// chainCopier copies a chain (oldest first) into the empty building
+// generation to. finish runs once the fold is published (ok) or abandoned.
+type chainCopier func(ctx context.Context, oldestFirst []int64, to int64) (counts store_sqlite.GenerationCopyCounts, finish func(ctx context.Context, ok bool), err error)
+
+// copyChainAtOnce is the one-shot copy (one transaction per member).
+func (c *CheckoutCoordinator) copyChainAtOnce(ctx context.Context, oldestFirst []int64, to int64) (store_sqlite.GenerationCopyCounts, func(context.Context, bool), error) {
+	counts, err := c.store.FlattenGenerationChain(ctx, oldestFirst, to)
+	return counts, func(context.Context, bool) {}, err
+}
+
+// flattenDirtyChainOver folds the part of the chain topped by top that
+// stands on root into one generation over root, with copy, verifies and
+// publishes it. root is the commit generation for a whole-chain fold, or a
+// working-tree generation of the chain for the fold of the layers above it
+// (the fold above a running fold). The folded generation carries the whole
+// chain's manifest, since it describes the whole working tree.
+func (c *CheckoutCoordinator) flattenDirtyChainOver(
+	ctx context.Context, commit, root store_sqlite.ViewGeneration, top int64, copy chainCopier,
+) (dirtyLayerBuild, error) {
 	started := time.Now()
-	chain, ok, reason, err := c.dirtyChainRoot(ctx, top, commit, maxDirtyChainDepth)
+	whole, ok, reason, err := c.dirtyChainRoot(ctx, top, commit, maxChainWalkDepth)
 	if err != nil {
 		return dirtyLayerBuild{}, err
 	}
-	if !ok || len(chain) == 0 {
+	if !ok || len(whole) == 0 {
 		return dirtyLayerBuild{}, fmt.Errorf("%w: %s", errFlattenRefused, reason)
 	}
-	if len(chain) == 1 {
+	chain := whole
+	if root.GenerationID != commit.GenerationID {
+		chain = nil
+		for _, row := range whole {
+			if row.GenerationID == root.GenerationID {
+				break
+			}
+			chain = append(chain, row)
+		}
+		if len(chain) == len(whole) {
+			return dirtyLayerBuild{}, fmt.Errorf("%w: generation %d is not in the chain", errFlattenRefused, root.GenerationID)
+		}
+	}
+	if len(chain) <= 1 {
 		return dirtyLayerBuild{}, fmt.Errorf("%w: the chain is one generation deep", errFlattenRefused)
 	}
 	head := chain[0]
@@ -61,7 +96,11 @@ func (c *CheckoutCoordinator) flattenDirtyChain(
 	for i, row := range chain {
 		oldestFirst[len(chain)-1-i] = row.GenerationID
 	}
-	manifest, why := loadDirtyChainManifest(ctx, c.store, oldestFirst)
+	wholeOldestFirst := make([]int64, len(whole))
+	for i, row := range whole {
+		wholeOldestFirst[len(whole)-1-i] = row.GenerationID
+	}
+	manifest, why := loadDirtyChainManifest(ctx, c.store, wholeOldestFirst)
 	if why != "" {
 		return dirtyLayerBuild{}, fmt.Errorf("%w: %s", errFlattenRefused, why)
 	}
@@ -69,7 +108,7 @@ func (c *CheckoutCoordinator) flattenDirtyChain(
 	generationID, handle, adopted, err := c.store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
 		OwnerKind: head.OwnerKind, GraphID: head.GraphID, LayerID: head.LayerID,
 		CheckoutID: head.CheckoutID, GenerationKind: head.GenerationKind,
-		BaseGenerationID:     commit.GenerationID,
+		BaseGenerationID:     root.GenerationID,
 		LowerViewFingerprint: head.LowerViewFingerprint, TreeOID: head.TreeOID,
 		ProvenanceCommitOID: head.ProvenanceCommitOID, ConfigHash: head.ConfigHash,
 		ExtractorVersions: head.ExtractorVersions, ResolverVersion: head.ResolverVersion,
@@ -81,8 +120,13 @@ func (c *CheckoutCoordinator) flattenDirtyChain(
 	if adopted {
 		return dirtyLayerBuild{}, fmt.Errorf("%w: generation %d is being built by another writer", errFlattenRefused, generationID)
 	}
-	abandon := func() { c.abandonCopiedGeneration(context.WithoutCancel(ctx), generationID) }
-	counts, err := c.store.FlattenGenerationChain(ctx, oldestFirst, generationID)
+	counts, finish, err := copy(ctx, oldestFirst, generationID)
+	abandon := func() {
+		if finish != nil {
+			finish(context.WithoutCancel(ctx), false)
+		}
+		c.abandonCopiedGeneration(context.WithoutCancel(ctx), generationID)
+	}
 	if err != nil {
 		abandon()
 		return dirtyLayerBuild{}, fmt.Errorf("indexer: fold working-tree chain %v: %w", oldestFirst, err)
@@ -102,14 +146,19 @@ func (c *CheckoutCoordinator) flattenDirtyChain(
 		abandon()
 		return dirtyLayerBuild{}, fmt.Errorf("indexer: write the folded manifest: %w", err)
 	}
-	if err := c.verifyFlattenedChain(ctx, commit.GenerationID, oldestFirst, generationID); err != nil {
+	if err := c.verifyFlattenedChain(ctx, root.GenerationID, oldestFirst, generationID); err != nil {
 		abandon()
 		return dirtyLayerBuild{}, fmt.Errorf("%w: %v", errFlattenRefused, err)
+	}
+	if err := stampFoldedGeneration(ctx, c.store, oldestFirst, handle); err != nil {
+		abandon()
+		return dirtyLayerBuild{}, err
 	}
 	if err := c.store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 		abandon()
 		return dirtyLayerBuild{}, fmt.Errorf("indexer: publish the folded working-tree generation %d: %w", generationID, err)
 	}
+	finish(context.WithoutCancel(ctx), true)
 	markPublicationPhase(ctx, PublicationPublished)
 	row, found, err := c.catalog.GetViewGeneration(ctx, generationID)
 	if err != nil || !found {

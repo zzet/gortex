@@ -286,6 +286,8 @@ type CheckoutLifecycle struct {
 	// the WAL the log holds since its last reset.
 	foregroundWork func() (string, time.Time)
 	walBytes       func() int64
+	// foldInFlight is a test seam for chainFoldInFlight.
+	foldInFlight func() bool
 	// retirementParked holds, per generation a retirement found still
 	// referenced, the reference-release hint it was parked at
 	// (checkout_deferred_retirement_parked.go). Guarded by coordMu.

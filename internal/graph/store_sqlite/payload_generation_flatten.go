@@ -360,11 +360,21 @@ DELETE FROM generation_node_tombstones
 
 // flattenExclusion is what hides a member's rows during a flatten.
 type flattenExclusion struct {
+	// scratch prefixes the temp tables the exclusion is loaded into
+	// ("flatten" when empty); the stepped fold uses its own.
+	scratch   string
 	paths     map[string]struct{} // claimed by a member above
 	context   map[string]struct{} // this member's read-only context paths
 	ids       map[string]struct{} // identities a member above masks or re-emits
 	sources   map[string]struct{} // sources whose outgoing edges a member above replaces
 	endpoints map[string]struct{} // identities a member above speaks for without carrying them
+}
+
+func (e *flattenExclusion) scratchName() string {
+	if e == nil || e.scratch == "" {
+		return "flatten"
+	}
+	return e.scratch
 }
 
 // flattenSpeaker is what one member already carried speaks for: the paths it
@@ -518,15 +528,16 @@ func idInPaths(id string, paths map[string]string) bool {
 // statements join against. They are connection-local temp tables, created on
 // first use and emptied per member.
 func flattenScratch(ctx context.Context, tx *sql.Tx, exclude *flattenExclusion) error {
+	x := exclude.scratchName()
 	for _, ddl := range []string{
-		`CREATE TEMP TABLE IF NOT EXISTS flatten_hidden_paths (p TEXT PRIMARY KEY) WITHOUT ROWID`,
-		`CREATE TEMP TABLE IF NOT EXISTS flatten_hidden_ids (id TEXT PRIMARY KEY) WITHOUT ROWID`,
-		`CREATE TEMP TABLE IF NOT EXISTS flatten_hidden_sources (id TEXT PRIMARY KEY) WITHOUT ROWID`,
-		`CREATE TEMP TABLE IF NOT EXISTS flatten_hidden_endpoints (id TEXT PRIMARY KEY) WITHOUT ROWID`,
-		`DELETE FROM flatten_hidden_paths`,
-		`DELETE FROM flatten_hidden_ids`,
-		`DELETE FROM flatten_hidden_sources`,
-		`DELETE FROM flatten_hidden_endpoints`,
+		`CREATE TEMP TABLE IF NOT EXISTS ` + x + `_hidden_paths (p TEXT PRIMARY KEY) WITHOUT ROWID`,
+		`CREATE TEMP TABLE IF NOT EXISTS ` + x + `_hidden_ids (id TEXT PRIMARY KEY) WITHOUT ROWID`,
+		`CREATE TEMP TABLE IF NOT EXISTS ` + x + `_hidden_sources (id TEXT PRIMARY KEY) WITHOUT ROWID`,
+		`CREATE TEMP TABLE IF NOT EXISTS ` + x + `_hidden_endpoints (id TEXT PRIMARY KEY) WITHOUT ROWID`,
+		`DELETE FROM ` + x + `_hidden_paths`,
+		`DELETE FROM ` + x + `_hidden_ids`,
+		`DELETE FROM ` + x + `_hidden_sources`,
+		`DELETE FROM ` + x + `_hidden_endpoints`,
 	} {
 		if _, err := tx.ExecContext(ctx, ddl); err != nil {
 			return err
@@ -548,19 +559,19 @@ func flattenScratch(ctx context.Context, tx *sql.Tx, exclude *flattenExclusion) 
 		}
 		return nil
 	}
-	if err := fill("flatten_hidden_paths", "p", exclude.paths); err != nil {
+	if err := fill(x+"_hidden_paths", "p", exclude.paths); err != nil {
 		return err
 	}
-	if err := fill("flatten_hidden_paths", "p", exclude.context); err != nil {
+	if err := fill(x+"_hidden_paths", "p", exclude.context); err != nil {
 		return err
 	}
-	if err := fill("flatten_hidden_ids", "id", exclude.ids); err != nil {
+	if err := fill(x+"_hidden_ids", "id", exclude.ids); err != nil {
 		return err
 	}
-	if err := fill("flatten_hidden_sources", "id", exclude.sources); err != nil {
+	if err := fill(x+"_hidden_sources", "id", exclude.sources); err != nil {
 		return err
 	}
-	return fill("flatten_hidden_endpoints", "id", exclude.endpoints)
+	return fill(x+"_hidden_endpoints", "id", exclude.endpoints)
 }
 
 // insertGenerationRowsTx copies one table's rows of generation from into to.
@@ -571,6 +582,15 @@ func flattenScratch(ctx context.Context, tx *sql.Tx, exclude *flattenExclusion) 
 func insertGenerationRowsTx(
 	ctx context.Context, tx *sql.Tx, shape payloadTableShape, from, to int64,
 	exclude *flattenExclusion, flatten bool,
+) (int64, error) {
+	return insertGenerationRowsBoundedTx(ctx, tx, shape, from, to, exclude, flatten, nil, nil)
+}
+
+// insertGenerationRowsBoundedTx is insertGenerationRowsTx with extra
+// predicates over the source rows (alias t), for a page of them.
+func insertGenerationRowsBoundedTx(
+	ctx context.Context, tx *sql.Tx, shape payloadTableShape, from, to int64,
+	exclude *flattenExclusion, flatten bool, bounds []string, boundArgs []any,
 ) (int64, error) {
 	projection := make([]string, 0, len(shape.columns))
 	args := []any{}
@@ -586,28 +606,31 @@ func insertGenerationRowsTx(
 	args = append(args, from)
 	if exclude != nil {
 		// The exclusion tables were filled for this member by the caller.
+		x := exclude.scratchName()
 		if shape.file {
-			where = append(where, "t.file_path NOT IN (SELECT p FROM flatten_hidden_paths)")
+			where = append(where, "t.file_path NOT IN (SELECT p FROM "+x+"_hidden_paths)")
 		}
 		switch {
 		case shape.table == "nodes":
-			where = append(where, "t.id NOT IN (SELECT id FROM flatten_hidden_ids)")
+			where = append(where, "t.id NOT IN (SELECT id FROM "+x+"_hidden_ids)")
 		case shape.node:
 			// A node's sidecar follows the node: carried when the member
 			// carries the node itself, or describes a node it does not
 			// carry that nothing above hides.
-			where = append(where, `t.node_id NOT IN (SELECT id FROM flatten_hidden_ids)`,
+			where = append(where, `t.node_id NOT IN (SELECT id FROM `+x+`_hidden_ids)`,
 				`NOT EXISTS (SELECT 1 FROM nodes n WHERE n.view_gen = t.view_gen AND n.id = t.node_id
-				   AND n.file_path IN (SELECT p FROM flatten_hidden_paths))`)
+				   AND n.file_path IN (SELECT p FROM `+x+`_hidden_paths))`)
 		}
 		if shape.from {
-			where = append(where, "t.from_id NOT IN (SELECT id FROM flatten_hidden_sources)",
-				"t.from_id NOT IN (SELECT id FROM flatten_hidden_endpoints)")
+			where = append(where, "t.from_id NOT IN (SELECT id FROM "+x+"_hidden_sources)",
+				"t.from_id NOT IN (SELECT id FROM "+x+"_hidden_endpoints)")
 		}
 		if shape.to {
-			where = append(where, "t.to_id NOT IN (SELECT id FROM flatten_hidden_endpoints)")
+			where = append(where, "t.to_id NOT IN (SELECT id FROM "+x+"_hidden_endpoints)")
 		}
 	}
+	where = append(where, bounds...)
+	args = append(args, boundArgs...)
 	verb := "INSERT INTO "
 	if flatten && shape.table != "nodes" {
 		// The member above was carried first, so a key both hold keeps the
@@ -693,21 +716,10 @@ ON CONFLICT(view_gen, producer) DO UPDATE SET
 
 // flattenFTSTx carries one member's FTS documents: symbol documents follow
 // their node, content documents their path.
-func flattenFTSTx(ctx context.Context, tx *sql.Tx, member, to int64, _ *flattenExclusion) (int64, error) {
+func flattenFTSTx(ctx context.Context, tx *sql.Tx, member, to int64, exclude *flattenExclusion) (int64, error) {
 	var moved int64
 	for _, docidMap := range generationFTSDocidMaps {
-		filter := ""
-		var args []any
-		switch docidMap.ids {
-		case "symbol_fts_rowid":
-			filter = ` AND node_id NOT IN (SELECT id FROM flatten_hidden_ids)
- AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.view_gen = ? AND n.id = node_id
-   AND n.file_path IN (SELECT p FROM flatten_hidden_paths))
- AND NOT EXISTS (SELECT 1 FROM symbol_fts_rowid d WHERE d.view_gen = ? AND d.node_id = symbol_fts_rowid.node_id)`
-			args = []any{member, to}
-		case "content_fts_rowid":
-			filter = ` AND file_path NOT IN (SELECT p FROM flatten_hidden_paths)`
-		}
+		filter, args := flattenFTSFilter(docidMap, member, to, exclude)
 		n, err := copyFTSRowsFilteredTx(ctx, tx, docidMap, member, to, filter, args...)
 		if err != nil {
 			return moved, err

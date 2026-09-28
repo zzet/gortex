@@ -107,6 +107,9 @@ type storeCore struct {
 	// walReclaimRequestedAt: when a writer refused on the log's size last
 	// asked for the reclaim (wal_reclaim_pressure.go), unix nanos.
 	walReclaimRequestedAt atomic.Int64
+	// chainFold is the store's one stepped fold and the members it holds
+	// (chain_fold.go).
+	chainFold chainFoldHeld
 
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise

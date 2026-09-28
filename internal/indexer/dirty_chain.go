@@ -18,7 +18,7 @@ import (
 // published dirty generation of the same checkout instead, and the route's
 // commit generation stays the one LOGICAL base: walking BaseGenerationID from
 // any servable dirty generation of a checkout must end at the route's commit
-// generation within maxDirtyChainDepth hops, through rows that all describe the
+// generation within maxChainWalkDepth hops, through rows that all describe the
 // same checkout, layer, graph, tree and build policy. That walk is the
 // ancestry-root predicate, and every guard that used to require
 // "dirty.BaseGenerationID == commit" asks it instead. The guards keep their
@@ -26,11 +26,19 @@ import (
 // whole-checkout fingerprint the generation was built from, whatever its
 // parent.
 
-// maxDirtyChainDepth bounds how many working-tree generations may stand between
-// a routed top and the commit generation it is rooted at, the top included. It
-// IS the materializer's bound: a chain the coordinator accepts and the
-// materializer refuses would be a route no reader can serve.
-const maxDirtyChainDepth = graphview.MaxDirtyChainDepth
+// maxDirtyChainDepth bounds how many working-tree generations a checkout
+// chains before the next edit must fold: the EFFECTIVE depth, which counts the
+// layers a running fold is replacing as one. Parent selection and the
+// compactor's bound use it.
+const maxDirtyChainDepth = 8
+
+// maxChainWalkDepth bounds every walk that validates, serves or lists an
+// existing chain: the PHYSICAL depth, which a fold in flight lets grow past
+// maxDirtyChainDepth (edits keep chaining over the layers being folded). It
+// never exceeds the materializer's bound, so a chain the coordinator accepts
+// is always one a reader can compose; until the materializer allows more,
+// both depths are the same.
+const maxChainWalkDepth = min(maxPhysicalChainDepth, graphview.MaxDirtyChainDepth)
 
 // dirtyChainRoot walks a routed or candidate working-tree generation down its
 // BaseGenerationID and reports whether it is rooted at commit: every hop is
@@ -64,7 +72,7 @@ func (c *CheckoutCoordinator) dirtyChainRootFrom(
 	ctx context.Context, top store_sqlite.ViewGeneration, commit store_sqlite.ViewGeneration, maxDepth int,
 ) (chain []store_sqlite.ViewGeneration, ok bool, reason string, err error) {
 	if maxDepth <= 0 {
-		maxDepth = maxDirtyChainDepth
+		maxDepth = maxChainWalkDepth
 	}
 	// The top must be this checkout's own working-tree layer (the commit
 	// generation's checkout used to guarantee it; an adopted commit layer
@@ -155,7 +163,7 @@ func (c *CheckoutCoordinator) dirtyRootedAtCommit(ctx context.Context, dirty, co
 	if dirty.BaseGenerationID == commit.GenerationID {
 		return true, nil
 	}
-	_, ok, _, err := c.dirtyChainRootFrom(ctx, dirty, commit, maxDirtyChainDepth)
+	_, ok, _, err := c.dirtyChainRootFrom(ctx, dirty, commit, maxChainWalkDepth)
 	return ok, err
 }
 
@@ -204,7 +212,7 @@ func (c *CheckoutCoordinator) dirtyChainTerminal(ctx context.Context, row store_
 	probe := store_sqlite.ViewGeneration{CheckoutID: row.CheckoutID, GraphID: row.GraphID, TreeOID: row.TreeOID}
 	current := parent
 	seen := map[int64]struct{}{row.GenerationID: {}}
-	for depth := 2; depth <= maxDirtyChainDepth; depth++ {
+	for depth := 2; depth <= maxChainWalkDepth; depth++ {
 		if _, loop := seen[current.GenerationID]; loop || !dirtyChainHopMatches(current, row, probe) {
 			return 0, false
 		}
@@ -358,7 +366,7 @@ func (c *CheckoutCoordinator) reportDirtyParent(
 	selection := dirtyParentSelection{Reason: dirtyChainFallbackNoParent}
 	commit, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
 	if err == nil && found {
-		selection = c.selectDirtyParentDetail(ctx, route, commit, sample, maxDirtyChainDepth)
+		selection = c.selectDirtyParentDetail(ctx, route, commit, sample, c.parentChainBound(ctx, route))
 	}
 	out.DirtyParentCandidate, out.DirtyChainReason = selection.Parent, selection.Reason
 	c.logger.Debug("checkout coordinator: working-tree parent selection",
@@ -475,7 +483,7 @@ func (c *CheckoutCoordinator) dirtyChainMembers(ctx context.Context, top int64) 
 	if err != nil || !found || row.GenerationKind != DirtyLayerGenerationKind {
 		return members
 	}
-	for len(members) <= maxDirtyChainDepth && row.BaseGenerationID > 0 {
+	for len(members) <= maxChainWalkDepth && row.BaseGenerationID > 0 {
 		next, found, err := c.catalog.GetViewGeneration(ctx, row.BaseGenerationID)
 		if err != nil || !found || next.GenerationKind != DirtyLayerGenerationKind ||
 			next.CheckoutID != row.CheckoutID || next.LayerID != row.LayerID {

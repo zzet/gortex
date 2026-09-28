@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -187,7 +186,11 @@ func TestDirtyChainCompactsInBackground(t *testing.T) {
 	}
 }
 
+// Override: the one-shot fold (steppedChainFoldEnabled off). A foreground edit
+// cancels only the one-shot compaction; the stepped fold it replaces is covered
+// with the daemon's defaults by TestSteppedFoldRunsDuringABurstWithTheDaemonsDefaults.
 func TestDirtyChainCompactionCanceledByForegroundEdit(t *testing.T) {
+	oneShotChainFold(t)
 	f, c, l, _ := runningChainFixture(t, CheckoutCoordinatorConfig{})
 	reports := observeCompactions(c)
 
@@ -266,7 +269,11 @@ func TestDirtyChainCompactionCanceledByForegroundEdit(t *testing.T) {
 	}
 }
 
+// Override: the one-shot fold (steppedChainFoldEnabled off). Only the one-shot
+// copy yields the lane to an interactive build; the stepped fold yields between
+// steps (TestSteppedFoldRunsDuringABurstWithTheDaemonsDefaults, no override).
 func TestDirtyChainCompactionYieldsTheLaneToAnInteractiveBuild(t *testing.T) {
+	oneShotChainFold(t)
 	f, c, l, gate := runningChainFixture(t, CheckoutCoordinatorConfig{})
 	reports := observeCompactions(c)
 	entered := make(chan struct{})
@@ -306,54 +313,48 @@ func TestDirtyChainCompactionYieldsTheLaneToAnInteractiveBuild(t *testing.T) {
 		waited, report.YieldedTo, report.Attempts)
 }
 
-func TestDirtyChainCompactionWaitsForAQuietCheckout(t *testing.T) {
+// A reader of the served view does not hold a fold back: the fold reads the
+// chain's immutable layers, writes its own generation and flips the slot with
+// a compare-and-set, and the reader's lease keeps what it reads. (Waiting for
+// readers starved the fold under ordinary use: an agent searches after every
+// edit.)
+func TestDirtyChainCompactionRunsWhileAReaderHoldsTheView(t *testing.T) {
 	f, c, l, _ := runningChainFixture(t, CheckoutCoordinatorConfig{})
 	reports := observeCompactions(c)
 	c.compaction.mu.Lock()
-	c.compaction.quiet = 300 * time.Millisecond
+	c.compaction.quiet = 50 * time.Millisecond
 	c.compaction.mu.Unlock()
 	for k := 1; k <= dirtyChainCompactionDepth; k++ {
 		chainTicketEdit(t, f, l, k)
 	}
-	// A reader holds the served view the moment the edit that owes the
-	// compaction is published.
 	reader := chainMaterialize(t, f)
-	held := time.Now()
-	select {
-	case r := <-reports:
-		reader.Close()
-		t.Fatalf("a compaction ran while a reader held the served view: %+v", r)
-	case <-time.After(time.Second):
-	}
-	reader.Close()
-	released := time.Now()
+	defer reader.Close()
 	report := awaitCompaction(t, reports)
-	if report.Outcome != dirtyChainCompactionFlipped || report.Attempts != 1 {
-		t.Fatalf("the compaction after the reader left = %+v, want one attempt that flipped", report)
+	if report.Outcome != dirtyChainCompactionFlipped || slices.Contains(report.YieldedTo, "reader") {
+		t.Fatalf("the compaction with a reader on the served view = %+v, want it to flip without yielding", report)
 	}
-	if report.QuietWait < time.Second {
-		t.Fatalf("the compaction waited %v for quiet, want at least the second the reader held the view", report.QuietWait)
+	if nodes := reader.Reader.FindNodesByName("Island"); len(nodes) != 1 {
+		t.Fatalf("the reader found %d Island nodes after the fold, want 1", len(nodes))
 	}
-	t.Logf("reader held %v; the compaction started %v after it left and took %v",
-		released.Sub(held), report.QuietWait-released.Sub(held), report.Duration)
 }
 
-func TestDirtyChainCompactionYieldsToAReader(t *testing.T) {
-	// The daemon's shape: one P, so a compaction that kept running would take
-	// the CPU a query needs.
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+// A query that arrives while a fold holds the lane is answered from the view
+// it materialized, and the fold runs to its flip instead of starting over.
+func TestDirtyChainCompactionDoesNotYieldToAReader(t *testing.T) {
 	f, c, l, _ := runningChainFixture(t, CheckoutCoordinatorConfig{})
 	reports := observeCompactions(c)
 	entered := make(chan struct{})
-	yielded := make(chan time.Time, 1)
+	proceed := make(chan struct{})
 	var once atomic.Bool
 	c.compaction.mu.Lock()
 	c.compaction.quiet = 20 * time.Millisecond
 	c.compaction.barrier = func(ctx context.Context) {
 		if once.CompareAndSwap(false, true) {
 			close(entered)
-			<-ctx.Done()
-			yielded <- time.Now()
+			select {
+			case <-proceed:
+			case <-ctx.Done():
+			}
 		}
 	}
 	c.compaction.mu.Unlock()
@@ -365,35 +366,27 @@ func TestDirtyChainCompactionYieldsToAReader(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the compaction never started")
 	}
-	// A query arrives while the compaction holds the lane.
-	arrived := time.Now()
 	reader := chainMaterialize(t, f)
-	var gaveWay time.Time
-	select {
-	case gaveWay = <-yielded:
-	case <-time.After(5 * time.Second):
-		reader.Close()
-		t.Fatal("the compaction did not yield to the reader")
-	}
-	queryStarted := time.Now()
+	time.Sleep(5 * dirtyChainCompactionYieldPoll)
+	close(proceed)
 	nodes := reader.Reader.FindNodesByName("Island")
-	query := time.Since(queryStarted)
+	report := awaitCompaction(t, reports)
 	reader.Close()
 	if len(nodes) != 1 {
 		t.Fatalf("the reader found %d Island nodes, want 1", len(nodes))
 	}
-	if lag := gaveWay.Sub(arrived); lag > 500*time.Millisecond {
-		t.Fatalf("the compaction yielded %v after the reader arrived", lag)
+	if slices.Contains(report.YieldedTo, "reader") || report.Attempts != 1 || report.Outcome != dirtyChainCompactionFlipped {
+		t.Fatalf("the compaction = %+v, want one attempt that flipped without yielding to the reader", report)
 	}
-	report := awaitCompaction(t, reports)
-	if !slices.Contains(report.YieldedTo, "reader") || report.Outcome != dirtyChainCompactionFlipped {
-		t.Fatalf("the compaction = %+v, want it to yield to the reader, then flip once the reader left", report)
-	}
-	t.Logf("the compaction yielded %v after the reader arrived; the query took %v; the compaction flipped on attempt %d",
-		gaveWay.Sub(arrived), query, report.Attempts)
 }
 
 func TestDirtyChainExhaustionBuildsTheStateDirect(t *testing.T) {
+	// The fallback when the fold at the bound is refused: with it off, the
+	// edit that meets the bound builds direct as before
+	// (TestEditAtTheChainBoundFoldsInsteadOfBuildingDirect covers the fold).
+	saved := foldChainAtBoundEnabled
+	foldChainAtBoundEnabled = false
+	defer func() { foldChainAtBoundEnabled = saved }()
 	// No loop, so no compaction runs: the chain grows to the hard bound.
 	f, c := chainCoordinator(t, CheckoutCoordinatorConfig{})
 	var last CheckoutCycle
@@ -622,4 +615,13 @@ func TestRequestCheckoutRefreshFromSampleAdmitsTheGivenSample(t *testing.T) {
 	if result := awaitCheckoutRefresh(t, ticket); !errors.Is(result.Err, ErrCheckoutRefreshSuperseded) {
 		t.Fatalf("a ticket admitted against a left state = %+v, want superseded", result)
 	}
+}
+
+// oneShotChainFold turns the stepped fold off for one test: a production
+// default override, named in the header of every test that calls it.
+func oneShotChainFold(t *testing.T) {
+	t.Helper()
+	was := steppedChainFoldEnabled
+	steppedChainFoldEnabled = false
+	t.Cleanup(func() { steppedChainFoldEnabled = was })
 }

@@ -92,6 +92,9 @@ const (
 
 // DirtyChainCompaction is what one background compaction did.
 type DirtyChainCompaction struct {
+	// Landing is how a stepped fold entered the route (flip, rebase, moved),
+	// empty for a fold copied at once.
+	Landing string
 	// Top, Commit and ChainDepthBefore describe the chain the triggering
 	// cycle published.
 	Top              int64
@@ -155,6 +158,26 @@ type dirtyChainCompactor struct {
 
 	// lastForeground is when this checkout's latest foreground cycle ended.
 	lastForeground time.Time
+	// folding is set while an attempt holds the build lane and folds; the
+	// deferred retirement sweep stands down for it (it is this checkout's
+	// write that matters in that gap).
+	folding atomic.Bool
+	// stepping is set while a stepped fold runs its steps and lands: the edit
+	// cycle does not cancel it and a new schedule does not replace it.
+	stepping atomic.Bool
+	// foldingChain is the chain (oldest first) the stepped fold is folding.
+	foldingChain []int64
+	// backend is a test seam: the fold backend (nil: the store).
+	backend chainFoldBackend
+	// stepHook is a test seam: it runs before the first step (0) and after
+	// every step of a stepped fold.
+	stepHook func(ctx context.Context, step int)
+}
+
+// CompactionInFlight reports whether a chain fold of this checkout holds the
+// build lane now.
+func (c *CheckoutCoordinator) compactionInFlight() bool {
+	return c != nil && c.compaction.folding.Load()
 }
 
 // noteForegroundCycle records the end of one foreground cycle of this
@@ -179,6 +202,35 @@ func (c *CheckoutCoordinator) dirtyChainCompactionDue(out CheckoutCycle) bool {
 		out.DirtyChainDepth >= dirtyChainCompactionDepth
 }
 
+// compactionOwed reports whether the compaction a schedule started is still
+// queued or running (its done channel not yet closed).
+func compactionOwed(running chan struct{}) bool {
+	if running == nil {
+		return false
+	}
+	select {
+	case <-running:
+		return false
+	default:
+		return true
+	}
+}
+
+// compactionQuietFor is the quiet interval a compaction attempt waits for
+// before it starts: none for a stepped fold, whose steps give way to an
+// edit's writes (a burst never leaves a quiet interval, so waiting for one
+// kept every fold from starting); the configured one (0: the default)
+// otherwise.
+func compactionQuietFor(configured time.Duration) time.Duration {
+	if steppedChainFoldEnabled {
+		return -1
+	}
+	if configured == 0 {
+		return dirtyChainCompactionQuiet
+	}
+	return configured
+}
+
 // scheduleDirtyChainCompaction starts a background compaction for the chain
 // trigger published. A compaction still owed from an earlier trigger is
 // canceled; the new one starts once it has finished. A closed coordinator
@@ -191,6 +243,15 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 	lifetime := c.lifetimeContext()
 	k.mu.Lock()
 	if k.closed || lifetime.Err() != nil {
+		k.mu.Unlock()
+		return false
+	}
+	if k.stepping.Load() || (steppedChainFoldEnabled && compactionOwed(k.running)) {
+		// A stepped fold is running, or a compaction is queued: it folds
+		// the chain the route holds when it starts, and lands on whatever
+		// was published above it. Replacing a queued one with a newer
+		// trigger only restarts its wait, so a burst would keep every fold
+		// from ever starting.
 		k.mu.Unlock()
 		return false
 	}
@@ -231,6 +292,14 @@ func (c *CheckoutCoordinator) cancelDirtyChainCompaction(why string) bool {
 		return false
 	}
 	k := &c.compaction
+	if compactionYieldsToEdits[why] && (steppedChainFoldEnabled || k.stepping.Load()) {
+		// A stepped fold does not yield to an edit: it holds the build lane
+		// only for its checks, the store hands its steps back to the edit's
+		// writes, and it lands on what the edit publishes. Cancelling it on
+		// every cycle, the checkout's own follow-up cycles that build nothing
+		// included, kept most folds from ever starting.
+		return false
+	}
 	k.mu.Lock()
 	cancel := k.cancel
 	k.cancel = nil
@@ -320,16 +389,79 @@ func (c *CheckoutCoordinator) selectDirtyParentForSlot(
 	sample gitstate.DirtySnapshot,
 	out *CheckoutCycle,
 ) dirtyParentSelection {
+	atBound := route
 	if preferred := c.takePreferredDirtyParent(); preferred > 0 && preferred != route.DirtyGenerationID {
 		alternative := route
 		alternative.DirtyGenerationID = preferred
-		if selection := c.reportDirtyParent(ctx, alternative, commitGeneration, sample, out); selection.Parent > 0 {
+		selection := c.reportDirtyParent(ctx, alternative, commitGeneration, sample, out)
+		if selection.Parent > 0 {
 			out.DirtyParentPreferred = true
 			return selection
 		}
+		if selection.Reason == dirtyChainFallbackChainDepthExhausted {
+			// A checkout mutation withdrew the routed top (the route's dirty
+			// slot is empty while it writes), so the chain at the bound is the
+			// preferred one: it is the one to fold, not the empty route.
+			atBound = alternative
+		}
 	}
-	return c.reportDirtyParent(ctx, route, commitGeneration, sample, out)
+	selection := c.reportDirtyParent(ctx, route, commitGeneration, sample, out)
+	if selection.Parent == 0 && atBound.DirtyGenerationID != route.DirtyGenerationID {
+		selection = dirtyParentSelection{Reason: dirtyChainFallbackChainDepthExhausted}
+	}
+	if selection.Parent == 0 && selection.Reason == dirtyChainFallbackChainDepthExhausted && atBound.DirtyGenerationID > 0 {
+		// The chain is at its bound and no fold landed. Folding it here —
+		// a copy of the chain's rows, no file parsed — costs a fraction of
+		// the direct build the edit would otherwise pay over the whole
+		// accumulated dirty set, and the edit then chains on the fold.
+		folded := c.foldAtBoundAroundFold(ctx, atBound, commitGeneration)
+		if folded == 0 {
+			folded = c.foldChainAtBound(ctx, atBound, commitGeneration)
+		}
+		if folded > 0 {
+			alternative := route
+			alternative.DirtyGenerationID = folded
+			if refold := c.reportDirtyParent(ctx, alternative, commitGeneration, sample, out); refold.Parent > 0 {
+				out.DirtyParentPreferred = true
+				return refold
+			}
+		}
+		out.DirtyParentCandidate, out.DirtyChainReason = selection.Parent, selection.Reason
+	}
+	return selection
 }
+
+// foldChainAtBound folds the routed chain in the cycle that met the bound and
+// returns the folded generation (0 when the fold was refused or failed; the
+// edit then builds direct as before). The fold is filed in the reuse cache so
+// it owes no retirement while the edit stands on it; the edit's route flip
+// then releases the old chain to the sweep.
+func (c *CheckoutCoordinator) foldChainAtBound(ctx context.Context, route store_sqlite.CheckoutRoute, commitGeneration int64) int64 {
+	if !foldChainAtBoundEnabled {
+		return 0
+	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
+	if err != nil || !found {
+		return 0
+	}
+	started := time.Now()
+	built, err := c.flattenDirtyChain(ctx, commit, route.DirtyGenerationID)
+	if err != nil {
+		c.logger.Info("checkout coordinator: chain fold at the bound refused; building direct",
+			zap.String("checkout", c.checkoutID), zap.Int64("chain_top", route.DirtyGenerationID),
+			zap.Duration("elapsed", time.Since(started)), zap.Error(err))
+		return 0
+	}
+	c.retainDirty(ctx, built.Key, built.GenerationID)
+	c.logger.Info("checkout coordinator: chain folded at the bound",
+		zap.String("checkout", c.checkoutID), zap.Int64("chain_top", route.DirtyGenerationID),
+		zap.Int64("folded_generation", built.GenerationID), zap.Duration("elapsed", time.Since(started)))
+	return built.GenerationID
+}
+
+// foldChainAtBoundEnabled is a test seam (the fallback it replaces is what a
+// test compares against).
+var foldChainAtBoundEnabled = true
 
 // holdWithdrawnDirty files the routed working-tree generation an edit lease is
 // about to withdraw in the reuse cache under its logical key and returns it,
@@ -372,12 +504,17 @@ func (c *CheckoutCoordinator) deferFailedGeneration(ctx context.Context, generat
 
 // checkoutForegroundActivity names the foreground work a compaction must not
 // compete with, empty when there is none: an interactive build queued on the
-// shared lane (any checkout's), a refresh ticket or a demand wake waiting on
-// this coordinator, or a reader holding the served view of this checkout (a
-// query's materialized view leases the routed working-tree generation for as
-// long as it runs). The compaction's own build leases only the commit
-// generation and what lies beneath it, never the routed top, so it does not
-// see itself.
+// shared lane (any checkout's), or a refresh ticket or a demand wake waiting
+// on this coordinator.
+//
+// A reader of the served view is not on the list. A query's materialized view
+// leases the routed working-tree generation for as long as it runs, and the
+// fold shares nothing with it: it reads the chain's immutable layers, writes a
+// generation of its own, and flips the dirty slot with the route epoch's
+// compare-and-set; the reader's lease keeps the generations it reads from
+// retirement whatever the route then names. Yielding to readers starved the
+// fold under ordinary use — an agent searches after every edit — until the
+// chain reached its bound and the next edit built direct.
 func (c *CheckoutCoordinator) checkoutForegroundActivity() string {
 	if c.gate != nil && c.gate.Stats().InteractiveQueued > 0 {
 		return "interactive_build"
@@ -387,12 +524,6 @@ func (c *CheckoutCoordinator) checkoutForegroundActivity() string {
 	}
 	if len(c.demand) > 0 {
 		return "demand"
-	}
-	c.mu.Lock()
-	routed := c.routedDirty
-	c.mu.Unlock()
-	if c.leases != nil && routed > 0 && c.leases.InUse(routed) {
-		return "reader"
 	}
 	return ""
 }
@@ -476,9 +607,7 @@ func (c *CheckoutCoordinator) compactDirtyChain(ctx context.Context, trigger Che
 	c.compaction.mu.Lock()
 	quiet := c.compaction.quiet
 	c.compaction.mu.Unlock()
-	if quiet == 0 {
-		quiet = dirtyChainCompactionQuiet
-	}
+	quiet = compactionQuietFor(quiet)
 	for attempt := 1; ; attempt++ {
 		// Start only in a quiet interval: no reader on the served view, no
 		// ticket or demand, no interactive build queued.
@@ -536,7 +665,13 @@ func (c *CheckoutCoordinator) compactDirtyChainOnce(parent context.Context, trig
 		report.Outcome, report.Err = dirtyChainCompactionFailed, err
 		return ""
 	}
-	defer release()
+	releaseLane := sync.OnceFunc(release)
+	defer releaseLane()
+	c.compaction.folding.Store(true)
+	defer c.compaction.folding.Store(false)
+	c.logger.Info("checkout coordinator: chain fold started",
+		zap.String("checkout", c.checkoutID), zap.Int64("chain_top", trigger.DirtyGenerationID),
+		zap.Int("chain_depth", trigger.DirtyChainDepth))
 	defer c.gate.NoteHolder(ViewBuildLaneHolder{
 		Kind: "dirty_chain_compaction", CheckoutID: c.checkoutID,
 		Priority: viewBuildPriorityLabel(ViewBuildBackground), Generation: trigger.DirtyGenerationID,
@@ -546,7 +681,13 @@ func (c *CheckoutCoordinator) compactDirtyChainOnce(parent context.Context, trig
 	c.compaction.mu.Unlock()
 	markPublicationPhase(ctx, PublicationAdmitted)
 	var stop func()
-	stop, yielded = c.yieldToForeground(ctx, cancel)
+	if steppedChainFoldEnabled {
+		// A stepped fold holds the lane only for its checks, and its steps
+		// give way to an edit's writes: it does not yield to foreground work.
+		stop, yielded = func() {}, &atomic.Value{}
+	} else {
+		stop, yielded = c.yieldToForeground(ctx, cancel)
+	}
 	defer stop()
 	c.compaction.mu.Lock()
 	barrier := c.compaction.barrier
@@ -610,6 +751,9 @@ func (c *CheckoutCoordinator) compactDirtyChainOnce(parent context.Context, trig
 		// cycle; there is no chain state to compact.
 		report.Outcome = dirtyChainCompactionNotNeeded
 		return ""
+	}
+	if steppedChainFoldEnabled {
+		return c.compactDirtyChainStepped(ctx, trigger, commit, route, report, stop, releaseLane)
 	}
 	// The chain is folded by copy: no working-tree file is parsed, so the size
 	// of the dirty set does not matter. A fold that does not reproduce the
@@ -703,7 +847,10 @@ func (c *CheckoutCoordinator) recordDirtyChainCompaction(report DirtyChainCompac
 	k.stats.Duration += report.Duration
 	done := k.done
 	k.mu.Unlock()
-	c.logger.Debug("checkout coordinator: background chain compaction",
+	// Info, not Debug: how often the chain is folded, and whether the folds
+	// keep up with the edits, is read off this line (each delta logs the
+	// chain_depth it composed over).
+	c.logger.Info("checkout coordinator: background chain compaction",
 		zap.String("checkout", c.checkoutID),
 		zap.String("outcome", report.Outcome),
 		zap.Int64("chain_top", report.Top),

@@ -31,6 +31,7 @@ import (
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"anonymous{Counts}":                           "asserted by the chain fold on the store's stepped fold (its copy counts), never on a store or a delta",
 	"graph.GenerationLayerIdentity":               "a capability of the published chain layers a delta composes over (their generation id keys the kept rows), asserted on those layers, never on the delta",
 	"graph.OverlayDetachedSummaryReader":          "a capability of the immutable overlay layers a delta composes over, asserted on the layers below, never on the delta",
 	"graph.RefFactsChainSplitter":                 "asserted by a delta on the view below it (its base) to split the chain's facts from the kept stack, never on the delta itself",

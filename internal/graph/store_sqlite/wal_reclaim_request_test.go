@@ -1,12 +1,105 @@
 package store_sqlite
 
 import (
+	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+// foldAgainstABusyLane begins a fold over a small chain on s and steps it
+// while the lane stays busy (an edit burst that never pauses), with the log
+// held between the fold's mark and the pressure mark by churn writes. It
+// reports whether the fold finished within limit, and its refusals.
+// The limit is a stall limit, not a deadline: it restarts whenever the fold
+// commits a step or the reclaim resets the log, so a slow host only makes the
+// test longer.
+func foldAgainstABusyLane(t *testing.T, s *Store, lane *fakeBuildLane, limit time.Duration) (done bool, refusals int) {
+	t.Helper()
+	ctx := context.Background()
+	lane.held.Store(true)
+	defer lane.held.Store(false)
+	chain := foldChain(t, s, 200)
+	to := reservedGeneration(t, s, "folded")
+	fold, err := s.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
+	require.NoError(t, err)
+	defer func() { _ = fold.Release(ctx) }()
+	deadline := time.Now().Add(limit)
+	lastResets := s.WALReclaimStats().Resets
+	for time.Now().Before(deadline) {
+		if r := s.WALReclaimStats().Resets; r != lastResets {
+			lastResets, deadline = r, time.Now().Add(limit)
+		}
+		finished, err := fold.Step(ctx)
+		switch {
+		case errors.Is(err, ErrChainFoldWALMark):
+			refusals++
+			time.Sleep(20 * time.Millisecond)
+			continue
+		case errors.Is(err, ErrChainFoldYielded):
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		require.NoError(t, err)
+		deadline = time.Now().Add(limit) // a committed step is progress
+		if finished {
+			return true, refusals
+		}
+	}
+	return false, refusals
+}
+
+// Scaled: the fold's mark while editing is 4 MiB (production 256 MiB), the
+// reclaim threshold 4 MiB and the pressure mark 16 MiB (production 256 MiB and
+// 1 GiB), the reclaim polls every 25 ms (production 5 s). The log sits at 8
+// MiB, between the marks, and the lane never goes idle. A refused step asks
+// for the reclaim, the reclaim resets the log inside the busy lane, and the
+// fold finishes.
+func TestARefusedFoldGetsTheReclaimInsideABusyLane(t *testing.T) {
+	prevMark := chainFoldWALMarkEditing
+	chainFoldWALMarkEditing = 4 << 20
+	t.Cleanup(func() { chainFoldWALMarkEditing = prevMark })
+	s, path, lane := pressureStore(t, 0)
+	lane.held.Store(true) // an edit burst from here on: nothing reclaims the log in a gap
+	growWAL(t, s, 8)
+	size := walFileSize(path + "-wal")
+	require.Greater(t, size, int64(4<<20), "precondition: over the fold's mark")
+	require.Less(t, size, int64(16<<20), "precondition: under the pressure mark")
+	before := s.WALCopyStats()
+	done, refusals := foldAgainstABusyLane(t, s, lane, 20*time.Second)
+	after := s.WALCopyStats()
+	t.Logf("fold done=%t refusals=%d pressure_runs=%d pressure_resets=%d", done, refusals, after.PressureRuns-before.PressureRuns, after.PressureResets-before.PressureResets)
+	require.True(t, done, "the fold never got under its mark inside the busy lane")
+	require.Positive(t, refusals, "precondition: the fold was refused at first")
+	require.Positive(t, after.PressureResets-before.PressureResets)
+}
+
+// The same with the daemon's defaults: no environment override, the
+// production marks (256 MiB for the fold while editing, 256 MiB reclaim
+// threshold, 1 GiB pressure mark), budget and 5 s poll. Only the lane and the
+// log's size are the test's: a log of ~300 MiB under a lane held throughout.
+func TestARefusedFoldGetsTheReclaimWithTheDaemonDefaults(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes a 300 MiB log")
+	}
+	s, path := openWALReclaimStore(t)
+	defer func() { _ = s.Close() }()
+	seedWALChurnTable(t, s)
+	lane := &fakeBuildLane{}
+	lane.install(s)
+	lane.held.Store(true) // hold the lane while the log grows: nothing reclaims it
+	growWAL(t, s, 300)
+	size := walFileSize(path + "-wal")
+	require.Greater(t, size, int64(256<<20), "precondition: over the fold's default mark")
+	require.Less(t, size, int64(1<<30), "precondition: under the default pressure mark")
+	done, refusals := foldAgainstABusyLane(t, s, lane, 60*time.Second)
+	t.Logf("fold done=%t refusals=%d pressure_resets=%d", done, refusals, s.WALCopyStats().PressureResets)
+	require.True(t, done, "the fold never got under its mark with the daemon's defaults")
+	require.Positive(t, refusals)
+}
 
 // The burst test with the daemon's defaults (threshold 256 MiB, pressure mark
 // 1 GiB, 5 s poll, 512 MiB/min copy budget): a log over 1 GiB under a lane

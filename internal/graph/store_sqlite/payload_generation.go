@@ -938,7 +938,7 @@ func (s *Store) retirePayloadGeneration(
 		return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
 	}
 	inUseNow := func() bool {
-		return s.PayloadBuildFlightActive(generationID) || (inUse != nil && inUse(generationID))
+		return s.PayloadBuildFlightActive(generationID) || s.chainFoldHolds(generationID) || (inUse != nil && inUse(generationID))
 	}
 	if inUseNow() {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)

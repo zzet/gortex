@@ -364,7 +364,7 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	if err := m.validateCheckout(ctx); err != nil {
 		return CheckoutCycle{}, err
 	}
-	m.coordinator.cancelDirtyChainCompaction("synchronous checkout mutation")
+	m.coordinator.cancelDirtyChainCompaction(compactionYieldCheckoutMutation)
 	laneQueued := time.Now()
 	laneBefore := m.coordinator.gate.Stats()
 	releaseLane, err := m.coordinator.gate.Acquire(ctx, ViewBuildInteractive)
