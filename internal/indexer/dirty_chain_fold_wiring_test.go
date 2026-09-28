@@ -262,10 +262,13 @@ func TestSteppedFoldCanceledHalfWayIsSweptAndTheNextFoldStartsClean(t *testing.T
 	chainAssertFlat(t, f, "stepped-fold-after-cancel")
 }
 
-// 5. A fold over a large chain obeys the WAL mark: with the reclaim threshold
-// scaled to 1 MiB (the always-mark is 4x the threshold: 4 MiB), no step
-// commits over the mark, a step refused over it is retried, and the fold
-// lands. Scale: 4 edits of 50 files each (the accumulated fixture's 200 units, one package per file).
+// 5. A fold over a large chain keeps its own WAL mark (1 GiB), which does not
+// follow the reclaim threshold: with the threshold scaled to 1 MiB (override,
+// named), the sweep's and the pressure mark shrink but the fold steps on, is
+// refused nothing, commits no step over its mark, and lands. The fold's
+// refusal over its own mark is the store's test
+// (TestChainFoldStepRespectsItsWALMark). Scale: 4 edits of 50 files each (the
+// accumulated fixture's 200 units, one package per file).
 func TestSteppedFoldOverALargeChainObeysTheWALMark(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "1")
 	const perEdit = accumulatedDirtyUnits / 4
@@ -281,7 +284,7 @@ func TestSteppedFoldOverALargeChainObeysTheWALMark(t *testing.T) {
 	if trigger.DirtyChainDepth != 4 {
 		t.Fatalf("depth %d after four edits (%s)", trigger.DirtyChainDepth, trigger.DirtyChainReason)
 	}
-	const mark = 4 << 20
+	const mark = 1 << 30
 	probe := &walMarkProbe{inner: storeChainFoldBackend{store: f.store}, store: f.store, mark: mark}
 	c.compaction.backend = probe
 	report := c.compactDirtyChain(context.Background(), trigger)
@@ -293,8 +296,8 @@ func TestSteppedFoldOverALargeChainObeysTheWALMark(t *testing.T) {
 	if probe.overCommitted > 0 {
 		t.Fatalf("%d steps committed with the log over the mark", probe.overCommitted)
 	}
-	if probe.refused == 0 {
-		t.Fatal("no step met the mark: the fixture is too small to test it")
+	if probe.refused > 0 {
+		t.Fatalf("%d steps refused over a mark with the log under the fold's own mark", probe.refused)
 	}
 	chainAssertFlat(t, f, "stepped-fold-wal-mark")
 }
