@@ -571,23 +571,49 @@ func (r *Resolver) buildImportClosureForCallerFiles(files []string) map[string]m
 		return closure
 	}
 	sort.Strings(wanted)
-	for node := range graph.NodesInScopeSeq(r.graph, nil, wanted, graph.KindFile) {
-		if node == nil || node.FilePath == "" {
-			continue
-		}
-		if _, ok := callers[node.FilePath]; !ok {
-			continue
-		}
-		dir := filePathDir(node.FilePath)
+	seed := func(filePath string) {
+		dir := filePathDir(filePath)
 		if dir == "" {
-			continue
+			return
 		}
-		set := closure[node.FilePath]
+		set := closure[filePath]
 		if set == nil {
 			set = make(map[string]struct{})
-			closure[node.FilePath] = set
+			closure[filePath] = set
 		}
 		set[dir] = struct{}{}
+	}
+	// A caller file the pass's directory index lists is a file node already
+	// read; only the others are read here (a file-scoped projection composed
+	// through a delta's layers costs seconds per call).
+	unknown := wanted
+	if r.dirIndex != nil {
+		unknown = nil
+		for _, file := range wanted {
+			listed := false
+			for _, identity := range r.dirIndex[filePathDir(file)] {
+				if identity.FilePath == file {
+					listed = true
+					break
+				}
+			}
+			if listed {
+				seed(file)
+			} else {
+				unknown = append(unknown, file)
+			}
+		}
+	}
+	if len(unknown) > 0 {
+		for node := range graph.NodesInScopeSeq(r.graph, nil, unknown, graph.KindFile) {
+			if node == nil || node.FilePath == "" {
+				continue
+			}
+			if _, ok := callers[node.FilePath]; !ok {
+				continue
+			}
+			seed(node.FilePath)
+		}
 	}
 	var imports, reexports []*graph.Edge
 	ids := make(map[string]struct{})
@@ -600,15 +626,32 @@ func (r *Resolver) buildImportClosureForCallerFiles(files []string) map[string]m
 		}
 	}
 	targets := make(map[string]struct{})
-	for row := range graph.EdgesInScopeSeq(r.graph, nil, wanted, graph.EdgeImports) {
-		e := row.Edge
+	addImport := func(e *graph.Edge) {
 		if e == nil || importClosureSkipsTarget(e.To) {
-			continue
+			return
 		}
 		imports = append(imports, e)
 		collect(e)
 		if e.To != "" {
 			targets[e.To] = struct{}{}
+		}
+	}
+	// The import projection answers a caller file's direct import targets
+	// (the same rows, from the file's nodes) and is kept per stack by a
+	// delta; the file-scoped edge projection is the fallback.
+	projected, complete := map[string][]string(nil), false
+	if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
+		projected, complete = projector.ProjectImportAdjacency(wanted)
+	}
+	if complete {
+		for _, file := range wanted {
+			for _, to := range projected[file] {
+				addImport(&graph.Edge{From: file, To: to, Kind: graph.EdgeImports, FilePath: file})
+			}
+		}
+	} else {
+		for row := range graph.EdgesInScopeSeq(r.graph, nil, wanted, graph.EdgeImports) {
+			addImport(row.Edge)
 		}
 	}
 	if len(imports) == 0 {
@@ -623,7 +666,7 @@ func (r *Resolver) buildImportClosureForCallerFiles(files []string) map[string]m
 		}
 		var out []string
 		for _, placement := range graph.NodePlacementsByIDs(r.graph, list) {
-			if placement.FilePath == "" {
+			if placement.FilePath == "" || !mayCarryReExports(placement.FilePath) {
 				continue
 			}
 			if _, seen := visited[placement.FilePath]; seen {
@@ -745,4 +788,25 @@ func (r *Resolver) assembleImportClosure(
 		}
 	}
 	return closure
+}
+
+// reExportFreeExtensions are source extensions whose extractors never emit a
+// re-export edge (only the JavaScript / TypeScript extractors and the formats
+// that embed them do). A file with one of them is never a barrel, so the
+// re-export walk does not read its edges.
+var reExportFreeExtensions = map[string]struct{}{
+	".go": {}, ".py": {}, ".java": {}, ".kt": {}, ".kts": {}, ".scala": {},
+	".rs": {}, ".rb": {}, ".php": {}, ".cs": {}, ".swift": {}, ".dart": {},
+	".c": {}, ".h": {}, ".cc": {}, ".cpp": {}, ".cxx": {}, ".hpp": {}, ".hh": {},
+	".m": {}, ".mm": {}, ".ex": {}, ".exs": {}, ".erl": {}, ".hs": {}, ".lua": {},
+	".sh": {}, ".bash": {}, ".sql": {}, ".proto": {}, ".md": {}, ".yaml": {}, ".yml": {},
+	".json": {}, ".toml": {},
+}
+
+// mayCarryReExports reports whether filePath can hold re-export edges: any
+// file except one whose extension belongs to a language that never emits them
+// (an unknown or missing extension may be a content-detected script).
+func mayCarryReExports(filePath string) bool {
+	_, free := reExportFreeExtensions[jsTSExt(filePath)]
+	return !free
 }

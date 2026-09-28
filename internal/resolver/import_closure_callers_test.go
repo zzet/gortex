@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"fmt"
+	"iter"
 	"math/rand"
 	"path/filepath"
 	"reflect"
@@ -102,6 +103,15 @@ func TestImportClosureForCallerFilesMatchesTheWholeGraphEntries(t *testing.T) {
 				callers = append([]string(nil), files...)
 			}
 			scoped := r.buildImportClosureForCallerFiles(callers)
+			// With the pass's directory index built, the caller files it
+			// lists are seeded from it: the same entries.
+			r.buildDirIndexes()
+			indexed := r.buildImportClosureForCallerFiles(callers)
+			r.clearDirIndexes()
+			if !reflect.DeepEqual(normalizeClosure(indexed), normalizeClosure(scoped)) {
+				t.Fatalf("seed %d trial %d: the directory-index seed differs\nindexed: %v\nscoped:  %v",
+					seed, trial, normalizeClosure(indexed), normalizeClosure(scoped))
+			}
 			want := map[string]map[string]struct{}{}
 			for _, file := range callers {
 				if entry, ok := whole[file]; ok {
@@ -157,5 +167,56 @@ func TestImportClosureForCallerFilesAttributesBySourceNode(t *testing.T) {
 	}
 	if _, leaked := scoped["repo/a/a.ts"]["repo/y"]; leaked {
 		t.Fatal("b.ts's import was attributed to a.ts by its provenance")
+	}
+}
+
+// scopedEdgeCountingStore counts the file-scoped import edge reads.
+type scopedEdgeCountingStore struct {
+	*store_sqlite.Store
+	importReads int
+}
+
+func (s *scopedEdgeCountingStore) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph.EdgeKind) iter.Seq[graph.ScopedEdgeRow] {
+	for _, k := range kinds {
+		if k == graph.EdgeImports {
+			s.importReads++
+		}
+	}
+	return s.Store.EdgesInScopeSeq(repoPrefixes, filePaths, kinds...)
+}
+
+// A store that projects import adjacency answers the closure's direct imports
+// from that projection (kept per stack by a delta), never from the
+// file-scoped edge read.
+func TestImportClosureForCallerFilesReadsTheImportProjection(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "projection.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var files []string
+	var edges []*graph.Edge
+	for i := 0; i < 12; i++ {
+		path := fmt.Sprintf("repo/d%d/f%d.go", i%4, i)
+		files = append(files, path)
+		store.AddNode(&graph.Node{ID: path, Kind: graph.KindFile, Name: path, FilePath: path, RepoPrefix: "repo"})
+	}
+	for i := 0; i < 12; i++ {
+		edges = append(edges, &graph.Edge{From: files[i], To: files[(i*5+3)%12], Kind: graph.EdgeImports, FilePath: files[i], Line: 1})
+	}
+	store.AddBatch(nil, edges)
+	if _, complete := store.ProjectImportAdjacency(files); !complete {
+		t.Fatal("fixture precondition: the store does not project this fixture")
+	}
+	counting := &scopedEdgeCountingStore{Store: store}
+	r := New(counting)
+	whole := r.buildImportClosure()
+	counting.importReads = 0
+	scoped := r.buildImportClosureForCallerFiles(files)
+	if counting.importReads != 0 {
+		t.Fatalf("the closure read file-scoped import edges %d times", counting.importReads)
+	}
+	if !reflect.DeepEqual(normalizeClosure(scoped), normalizeClosure(whole)) {
+		t.Fatalf("closure differs\nscoped: %v\nwhole:  %v", normalizeClosure(scoped), normalizeClosure(whole))
 	}
 }

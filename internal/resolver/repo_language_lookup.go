@@ -306,8 +306,53 @@ func (r *Resolver) cachedFindNodesByNameInRepoForEdge(name, repo string, edge *g
 			}
 		}
 	}
-	return genericInstantiationOnly(edge, withoutAttributedTerminals(
-		graph.FindNodesByNamesInRepoLanguages(r.graph, []string{name}, scope.repo, languages)[name]))
+	return genericInstantiationOnly(edge, withoutAttributedTerminals(r.namesInScopeMiss(scope, languages, name)))
+}
+
+// namesInScopeMiss answers a name the warm-up did not read, through the
+// store's scoped name finder when it has one (a per-file delta keeps those
+// answers per stack), and keeps the answer for the rest of the pass.
+//
+// It runs inside ResolveAllContext's parallel workers. The warmed page cache
+// (nodesByRepoLanguageName) is installed whole before the workers start and
+// only read by them, so the answers kept here go to a map of their own under
+// namesMissMu; writing them into the page cache raced every worker's read of
+// it (fatal "concurrent map read and map write").
+func (r *Resolver) namesInScopeMiss(scope resolverNameLookupScope, languages []string, name string) []*graph.Node {
+	finder, ok := r.graph.(graph.ResolverNameScopeFinder)
+	if !ok {
+		return graph.FindNodesByNamesInRepoLanguages(r.graph, []string{name}, scope.repo, languages)[name]
+	}
+	r.namesMissMu.RLock()
+	hits, kept := r.namesMiss[scope][name]
+	r.namesMissMu.RUnlock()
+	if kept {
+		return hits
+	}
+	results, err := finder.FindNodesByResolverNameScopes([]graph.ResolverNameScope{{
+		RepoPrefix: scope.repo, Languages: append([]string(nil), languages...), Names: []string{name},
+	}})
+	if err != nil || len(results) != 1 {
+		return graph.FindNodesByNamesInRepoLanguages(r.graph, []string{name}, scope.repo, languages)[name]
+	}
+	hits = results[0][name]
+	if r.nodesByRepoLanguageName == nil {
+		// No page is warmed (a single-file resolve): nothing to keep it for,
+		// and nothing would clear it before the graph changes.
+		return hits
+	}
+	r.namesMissMu.Lock()
+	if r.namesMiss == nil {
+		r.namesMiss = make(map[resolverNameLookupScope]map[string][]*graph.Node)
+	}
+	byName := r.namesMiss[scope]
+	if byName == nil {
+		byName = make(map[string][]*graph.Node)
+		r.namesMiss[scope] = byName
+	}
+	byName[name] = hits
+	r.namesMissMu.Unlock()
+	return hits
 }
 
 // genericInstantiationOnly narrows a call edge's candidates when the

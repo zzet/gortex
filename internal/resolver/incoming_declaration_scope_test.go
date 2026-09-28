@@ -299,3 +299,45 @@ func TestPendingRepoPrefixesListsRepositoriesOnlyForUnhydratedSources(t *testing
 	assert.Equal(t, []string{"a"}, prefixes)
 	assert.Equal(t, 1, store.listings, "a guess a hydrated source confirms must not pay the listing")
 }
+
+// fullRowCountingStore counts the full in-edge reads by stub key.
+type fullRowCountingStore struct {
+	*graph.Graph
+	fullReads map[string]int
+}
+
+func (s *fullRowCountingStore) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	for _, id := range ids {
+		s.fullReads[id]++
+	}
+	return s.Graph.GetInEdgesByNodeIDs(ids)
+}
+
+// With a carry, the incoming leg reads the stub keys' identities first and
+// the full rows only of the keys that park an unresolved reference: a stub key
+// with nothing parked on it is never read in full, neither when the frontier
+// is collected nor when the incoming leg resolves. The admitted references are
+// still resolved.
+func TestIncomingLegReadsFullRowsOnlyForParkedKeys(t *testing.T) {
+	g, parked := declarationFixture(t, nil)
+	prior := priorOf(g.GetFileNodes("pkg/changed.go")...)
+	// The declaration is unchanged (its keys are carried) and the re-parse
+	// restubbed a reference that was bound before: it is admitted.
+	parked.To = "pkg/changed.go::Target"
+	graph.StashRestubProvenance(parked)
+	parked.To = "unresolved::Target"
+	store := &fullRowCountingStore{Graph: g, fullReads: map[string]int{}}
+	r := scopedResolver(t, store)
+	r.SetPriorDeclarations(prior)
+	r.ResolveFilesAndIncoming([]string{"pkg/changed.go"})
+	r.SetPriorDeclarations(nil)
+	assert.Equal(t, "pkg/changed.go::Target", parked.To, "the admitted parked reference is resolved")
+	for key, reads := range store.fullReads {
+		if key != "unresolved::Target" && reads > 0 {
+			t.Errorf("stub key %s parks nothing but was read in full %d time(s)", key, reads)
+		}
+	}
+	if store.fullReads["unresolved::Target"] == 0 {
+		t.Error("the parked key was never read in full")
+	}
+}

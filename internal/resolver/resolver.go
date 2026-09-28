@@ -482,6 +482,11 @@ type Resolver struct {
 	// Python, and other definitions from leaking into one another while retaining
 	// language-neutral candidates.
 	nodesByExternLanguageName map[string]map[string][]*graph.Node
+	// namesMiss keeps, for the rest of a page, the answers namesInScopeMiss
+	// read for names the warm-up did not: written by the parallel resolve
+	// workers, so namesMissMu guards it. Cleared with the page caches.
+	namesMiss   map[resolverNameLookupScope]map[string][]*graph.Node
+	namesMissMu sync.RWMutex
 
 	// importFilesByCaller memoises, per caller file, the set of file
 	// paths that file imports (direct EdgeImports targets plus files
@@ -2230,12 +2235,14 @@ func (r *Resolver) warmLookupCacheWithSources(ctx context.Context, pending []*gr
 		r.missingNodeByID = nil
 	}
 	idElapsed := time.Since(idStart)
+	ownershipStart, ownershipFaults := time.Now(), processMajorFaults()
 	if err := r.prepareGoPackageOwnership(ctx, pending, r.nodeByID); err != nil {
 		return err
 	}
-	nameStart := time.Now()
+	ownershipElapsed, ownershipFaults := time.Since(ownershipStart), processMajorFaults()-ownershipFaults
+	nameStart, nameFaults := time.Now(), processMajorFaults()
 	nameGroups, names, nameErr := r.warmRepoLanguageNameCache(pending)
-	nameElapsed := time.Since(nameStart)
+	nameElapsed, nameFaults := time.Since(nameStart), processMajorFaults()-nameFaults
 	foldStart := time.Now()
 	// Fold every candidate node returned by the name lookup into the
 	// id cache too: when a worker picks a candidate and the
@@ -2304,7 +2311,10 @@ func (r *Resolver) warmLookupCacheWithSources(ctx context.Context, pending []*gr
 		zap.Error(nameErr),
 		zap.Int("qual_names", len(qualNameSet)),
 		zap.Duration("id_lookup", idElapsed),
+		zap.Duration("go_ownership", ownershipElapsed),
+		zap.Int64("go_ownership_faults", ownershipFaults),
 		zap.Duration("name_lookup", nameElapsed),
+		zap.Int64("name_lookup_faults", nameFaults),
 		zap.Duration("candidate_fold", foldElapsed),
 		zap.Duration("qual_lookup", qualElapsed),
 		zap.Duration("elapsed", time.Since(warmStart)))
@@ -2414,6 +2424,9 @@ func (r *Resolver) clearLookupCache() {
 	r.nodesByRepoLanguageName = nil
 	r.nodesByRepoName = nil
 	r.nodesByExternLanguageName = nil
+	r.namesMissMu.Lock()
+	r.namesMiss = nil
+	r.namesMissMu.Unlock()
 	r.importFilesMu.Lock()
 	r.importFilesByCaller = nil
 	r.importFilesMu.Unlock()
@@ -2748,6 +2761,11 @@ type incrementalFileFrontier struct {
 	outgoingPending int
 	outgoingCollect time.Duration
 	incomingCollect time.Duration
+	// The carry path's laps: the declaration evidence (carryFor), the
+	// identity-only admission read, and the full-row read of parked keys.
+	carryCollect time.Duration
+	incomingIDs  time.Duration
+	incomingRows time.Duration
 	// incomingAdmission is the completeness fact of the bounded incoming-stub
 	// admission and incomingRefusal the typed limit error when the shared
 	// ceiling fired. A refused admission contributes ZERO incoming entries to
@@ -2762,6 +2780,18 @@ type incrementalFileFrontier struct {
 	carry           *incomingCarry
 	carriedSkipped  int
 	carriedAdmitted int
+	// parkedKeys, when non-nil, is the subset of stubKeys that parked an
+	// unresolved reference when the frontier was collected: the incoming leg
+	// re-reads only those.
+	parkedKeys []string
+}
+
+// incomingKeys is the stub keys the incoming leg re-reads.
+func (f incrementalFileFrontier) incomingKeys() []string {
+	if f.parkedKeys != nil {
+		return f.parkedKeys
+	}
+	return f.stubKeys
 }
 
 // collectIncrementalFileFrontier performs the complete read side of a
@@ -2902,7 +2932,9 @@ func collectIncrementalFileFrontierKeys(
 	frontier.outgoingPending = len(frontier.pending)
 	frontier.outgoingCollect = time.Since(outgoingStarted)
 	if carryFor != nil {
+		carryStarted := time.Now()
 		frontier.carry = carryFor(frontier.paths, frontier.nodesByFile)
+		frontier.carryCollect = time.Since(carryStarted)
 	}
 	incomingStarted := time.Now()
 	// The unresolved target string is the incoming-edge bucket key even when
@@ -2918,13 +2950,37 @@ func collectIncrementalFileFrontierKeys(
 	// truncation. It neither widens nor splits the read: the same keys in the
 	// same single batched call, the same rows.
 	if frontier.carry != nil {
-		// A carried key admits only restubbed references, and the restub
-		// mark rides the edge Meta, which the identity projection omits:
-		// read the full rows. Same keys, same single bounded call, same rows.
-		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
-			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		// Identities first: the admission is charged on them (the same keys,
+		// the same single bounded call, the same physical rows), and most stub
+		// keys park no unresolved reference at all. Only the keys that do are
+		// read in full: a carried key admits only restubbed references, and
+		// the restub mark rides the edge Meta, which the identity projection
+		// omits.
+		idsByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(),
+			func(keys []string) map[string][]graph.EdgeIdentity {
+				return graph.InEdgeIdentitiesByNodeIDs(g, keys)
+			},
+			frontier.stubKeys, nil)
 		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		frontier.incomingIDs = time.Since(incomingStarted)
+		parked := make([]string, 0)
 		for _, key := range frontier.stubKeys {
+			for _, identity := range idsByStub[key] {
+				if graph.IsUnresolvedTarget(identity.To) {
+					parked = append(parked, key)
+					break
+				}
+			}
+		}
+		frontier.parkedKeys = parked
+		inByStub := map[string][]*graph.Edge{}
+		if err == nil && len(parked) > 0 {
+			rowsStarted := time.Now()
+			inByStub = g.GetInEdgesByNodeIDs(parked)
+			frontier.incomingRows = time.Since(rowsStarted)
+		}
+		for _, key := range parked {
 			carried := frontier.carry.carried(key)
 			for _, edge := range inByStub[key] {
 				if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
@@ -3049,7 +3105,11 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 		zap.Int("carried_skipped", frontier.carriedSkipped),
 		zap.Int("carried_admitted", frontier.carriedAdmitted),
 		zap.Duration("outgoing_collect", frontier.outgoingCollect),
-		zap.Duration("incoming_collect", frontier.incomingCollect))
+		zap.Duration("incoming_collect", frontier.incomingCollect),
+		zap.Duration("carry_collect", frontier.carryCollect),
+		zap.Duration("incoming_identities", frontier.incomingIDs),
+		zap.Duration("incoming_rows", frontier.incomingRows),
+		zap.Int("parked_keys", len(frontier.parkedKeys)))
 	// The preparation leg's bound is a fact about this batch, not a log line:
 	// the incoming leg admitted nothing and the parked edges stay unresolved.
 	recordFrontierIncomingAdmission(logger, stats, frontier, "preparation")
@@ -3106,7 +3166,7 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
 	beforeIncoming := *stats
 	finish = startIncrementalPhase(logger, "resolve_incoming")
-	r.resolveIncomingStubKeysLocked(frontier.stubKeys, stats)
+	r.resolveIncomingStubKeysLocked(frontier.incomingKeys(), stats)
 	incomingDuration = finish(
 		zap.Int("resolved", stats.Resolved-beforeIncoming.Resolved),
 		zap.Int("unresolved", stats.Unresolved-beforeIncoming.Unresolved),
@@ -3527,22 +3587,22 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 		logIncomingAdmissionRefusal(r.logger, "names_probe", len(stubKeys), fact, err)
 		return stats
 	}
-	pending := false
+	var pending []*graph.Edge
 	for _, edges := range inByStub {
 		for _, edge := range edges {
 			if edge != nil && graph.IsUnresolvedTarget(edge.To) {
-				pending = true
-				break
+				pending = append(pending, edge)
 			}
 		}
-		if pending {
-			break
-		}
 	}
-	if !pending {
+	if len(pending) == 0 {
 		return stats
 	}
-	clear := r.buildPassIndexes()
+	// The pass indexes for exactly these references (their repositories and
+	// caller files), not graph-wide ones: the whole-graph build scales with
+	// the store and cost tens of seconds per renamed declaration on a large
+	// one.
+	clear := r.buildPassIndexesForPending(pending)
 	defer clear()
 	r.resolveIncomingStubEdgesLocked(stubKeys, inByStub, stats)
 	return stats
