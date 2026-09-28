@@ -3,7 +3,9 @@ package graphview
 import (
 	"context"
 	"sort"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -214,13 +216,16 @@ func (c *generationLayerCache) preloadRows(ctx context.Context, generation int64
 	if entry == nil || entry.masks.rowsRef == nil || entry.masks.rowsRef.load() != nil {
 		return false
 	}
+	started := time.Now()
 	rows := loadGenerationRows(ctx, handle)
 	if rows == nil {
+		recordRowsPreload(generation, 0, time.Since(started), false)
 		return false
 	}
 	if !entry.masks.rowsRef.rows.CompareAndSwap(nil, rows) {
 		return false
 	}
+	recordRowsPreload(generation, rows.weight, time.Since(started), true)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries[entry.key] == entry {
@@ -229,4 +234,49 @@ func (c *generationLayerCache) preloadRows(ctx context.Context, generation int64
 		c.evictLocked()
 	}
 	return true
+}
+
+// RowsPreloadRecord is one preload attempt that read a generation's rows:
+// installed, or declined as too large (or failed).
+type RowsPreloadRecord struct {
+	Generation int64     `json:"generation"`
+	Installed  bool      `json:"installed"`
+	Weight     int       `json:"weight"`
+	LoadMs     float64   `json:"load_ms"`
+	At         time.Time `json:"at"`
+}
+
+var rowsPreloadLog struct {
+	mu        sync.Mutex
+	installed int64
+	declined  int64
+	recent    []RowsPreloadRecord
+}
+
+const rowsPreloadRecent = 64
+
+func recordRowsPreload(generation int64, weight int, took time.Duration, installed bool) {
+	rowsPreloadLog.mu.Lock()
+	defer rowsPreloadLog.mu.Unlock()
+	if installed {
+		rowsPreloadLog.installed++
+	} else {
+		rowsPreloadLog.declined++
+	}
+	rowsPreloadLog.recent = append(rowsPreloadLog.recent, RowsPreloadRecord{
+		Generation: generation, Installed: installed, Weight: weight,
+		LoadMs: float64(took.Microseconds()) / 1000, At: time.Now().UTC(),
+	})
+	if n := len(rowsPreloadLog.recent); n > rowsPreloadRecent {
+		rowsPreloadLog.recent = append([]RowsPreloadRecord(nil), rowsPreloadLog.recent[n-rowsPreloadRecent:]...)
+	}
+}
+
+// RowsPreloadDiagnostics reports the generation-row preloads so far: how many
+// were installed, how many were declined, and the most recent attempts
+// (diagnostics).
+func RowsPreloadDiagnostics() (installed, declined int64, recent []RowsPreloadRecord) {
+	rowsPreloadLog.mu.Lock()
+	defer rowsPreloadLog.mu.Unlock()
+	return rowsPreloadLog.installed, rowsPreloadLog.declined, append([]RowsPreloadRecord(nil), rowsPreloadLog.recent...)
 }

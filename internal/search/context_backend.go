@@ -3,6 +3,8 @@ package search
 import (
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -129,7 +131,7 @@ func (b *SymbolSearcherBackend) SearchViewBatchContext(ctx context.Context, quer
 	if strings.TrimSpace(query) == "" || limit <= 0 || ctx.Err() != nil {
 		return empty, true
 	}
-	hitsByGeneration, err := batcher.SearchSymbolsViewGenerationsRepoScopedContext(ctx, query, nil, viewGens, limit)
+	hitsByGeneration, err := searchViewGenerations(ctx, batcher, query, viewGens, limit)
 	if err != nil || ctx.Err() != nil {
 		return empty, true
 	}
@@ -463,3 +465,133 @@ var (
 	_ ContextSymbolBundleSearcherBackend       = (*Swappable)(nil)
 	_ ScopedContextSymbolBundleSearcherBackend = (*Swappable)(nil)
 )
+
+// ViewFTSRankSource is a store that splits its per-generation symbol search
+// into the exact-name tier and the full-text tier and serves the reads the
+// in-memory full-text ranker needs (fts_rank.go). Stores that do not are
+// searched as before.
+type ViewFTSRankSource interface {
+	FTSRankSource
+	// SymbolExactHitsViewGenerations answers the exact-name tier for each
+	// generation and returns the generations it left for full-text ranking,
+	// in request order.
+	SymbolExactHitsViewGenerations(ctx context.Context, query string, repoPrefixes []string, viewGens []int64, limit int) (map[int64][]graph.SymbolHit, []int64, error)
+}
+
+// ftsRankers keeps one ranker per store core, so an immutable generation's
+// match lists outlive a request.
+var ftsRankers sync.Map // store core identity (any comparable) -> *FTSRanker
+
+type symbolSearchCoreKeyer interface {
+	SymbolSearchCoreKey() any
+}
+
+// ftsRankAdapter, when installed (SetFTSRankSourceAdapter), turns a store the
+// search package cannot name into a ViewFTSRankSource: the store's package
+// imports this one, so the adapter lives with a package that imports both.
+var ftsRankAdapter atomic.Pointer[func(searcher any) (ViewFTSRankSource, bool)]
+
+// ftsRankedGenerations counts the generations ranked in memory
+// (FTSRankedGenerations).
+var ftsRankedGenerations atomic.Int64
+
+// FTSRankedGenerations reports how many generation rankings the in-memory
+// ranker has served (diagnostics and tests).
+func FTSRankedGenerations() int64 { return ftsRankedGenerations.Load() }
+
+// ftsRankOff routes every view search through the store's own FTS5 query.
+// Tests only (DisableFTSRankForTest).
+var ftsRankOff atomic.Bool
+
+// SetFTSRankSourceAdapter installs the adapter that lets a store serve the
+// in-memory ranker. A nil adapter removes it.
+func SetFTSRankSourceAdapter(adapt func(searcher any) (ViewFTSRankSource, bool)) {
+	if adapt == nil {
+		ftsRankAdapter.Store(nil)
+		return
+	}
+	ftsRankAdapter.Store(&adapt)
+}
+
+// DisableFTSRankForTest makes every view search use the store's FTS5 query
+// until restore runs, so a test can compare the two paths. Tests only.
+func DisableFTSRankForTest() (restore func()) {
+	ftsRankOff.Store(true)
+	return func() { ftsRankOff.Store(false) }
+}
+
+// ftsRankSourceOf returns searcher as a ranker source: directly, or through
+// the installed adapter.
+func ftsRankSourceOf(searcher any) (ViewFTSRankSource, bool) {
+	if ftsRankOff.Load() {
+		return nil, false
+	}
+	if src, ok := searcher.(ViewFTSRankSource); ok {
+		return src, true
+	}
+	if adapt := ftsRankAdapter.Load(); adapt != nil {
+		return (*adapt)(searcher)
+	}
+	return nil, false
+}
+
+func ftsRankerFor(src ViewFTSRankSource) *FTSRanker {
+	keyer, ok := src.(symbolSearchCoreKeyer)
+	if !ok {
+		return nil
+	}
+	key := keyer.SymbolSearchCoreKey()
+	if r, ok := ftsRankers.Load(key); ok {
+		return r.(*FTSRanker)
+	}
+	r, _ := ftsRankers.LoadOrStore(key, NewFTSRanker(src))
+	return r.(*FTSRanker)
+}
+
+// searchViewGenerations ranks the view's generations. On a store that serves
+// the ranker's reads, the exact-name tier is the store's; each remaining
+// generation is ranked in memory — its match list kept across publications,
+// only the table statistics re-read — and the store's FTS5 query answers only
+// the generations the ranker declines. The per-generation hits are the
+// store's, score bits and order included (TestFTSRankerRanksLikeFTS5), so the
+// composition downstream is unchanged.
+func searchViewGenerations(ctx context.Context, batcher contextViewGenerationSymbolSearcher, query string, viewGens []int64, limit int) (map[int64][]graph.SymbolHit, error) {
+	src, ok := ftsRankSourceOf(batcher)
+	if !ok {
+		return batcher.SearchSymbolsViewGenerationsRepoScopedContext(ctx, query, nil, viewGens, limit)
+	}
+	ranker := ftsRankerFor(src)
+	if ranker == nil {
+		return batcher.SearchSymbolsViewGenerationsRepoScopedContext(ctx, query, nil, viewGens, limit)
+	}
+	hits, rest, err := src.SymbolExactHitsViewGenerations(ctx, query, nil, viewGens, limit)
+	if err != nil {
+		return nil, err
+	}
+	if hits == nil {
+		hits = make(map[int64][]graph.SymbolHit, len(viewGens))
+	}
+	ranked, declined, err := ranker.RankGenerations(ctx, rest, query, nil, limit)
+	if err != nil {
+		return nil, err
+	}
+	for generation, generationHits := range ranked {
+		ftsRankedGenerations.Add(1)
+		hits[generation] = generationHits
+	}
+	if len(declined) > 0 {
+		fallback, err := batcher.SearchSymbolsViewGenerationsRepoScopedContext(ctx, query, nil, declined, limit)
+		if err != nil {
+			return nil, err
+		}
+		for _, generation := range declined {
+			hits[generation] = fallback[generation]
+		}
+	}
+	for _, generation := range viewGens {
+		if _, ok := hits[generation]; !ok {
+			hits[generation] = nil
+		}
+	}
+	return hits, nil
+}

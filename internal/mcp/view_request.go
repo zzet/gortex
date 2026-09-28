@@ -22,6 +22,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/reconcile"
+	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -295,6 +296,15 @@ func (s *Server) wireRoutePrewarm() {
 				zap.Int64s("generations", generations), zap.Int("mask_sets_loaded", loaded),
 				zap.Duration("elapsed", time.Since(started)), zap.Error(err))
 		}
+		if err == nil {
+			// No store read for the ranker here, inside the publication: the
+			// route is queued for a background worker to warm its
+			// generations.
+			s.queueRouteFTSWarm(materializer, generations)
+		}
+	})
+	materializer.OnForgetGeneration(func(generation int64) {
+		search.ForgetFTSGeneration(materializer.Store, generation)
 	})
 }
 
@@ -2484,4 +2494,111 @@ func withDeferredMaterialization(ctx context.Context) context.Context {
 func deferredMaterialization(ctx context.Context) bool {
 	deferred, _ := ctx.Value(deferredMaterializationKey{}).(bool)
 	return deferred
+}
+
+// routeFTSWarmQueue holds the routes waiting for their base generations to
+// be read for the full-text ranker, and whether the worker runs.
+type routeFTSWarmQueue struct {
+	mu      sync.Mutex
+	pending [][]int64
+	running bool
+}
+
+// routeFTSWarmLaneWait bounds how long the worker waits for an edit cycle to
+// release the build lane before it drops the routes it holds (a later route
+// queues them again; a search reads what it needs meanwhile).
+var routeFTSWarmLaneWait = 10 * time.Minute
+
+// routeFTSWarmHook, when set, runs after each worker pass;
+// routeFTSWarmGateForTest, when set, runs before each pass and may hold it.
+// Tests only.
+var (
+	routeFTSWarmHook        func(read int)
+	routeFTSWarmGateForTest func()
+)
+
+// queueRouteFTSWarm queues a route for the background warm and starts the
+// worker if it is not running. It reads nothing: it is called inside the
+// publication, between published and the flip.
+func (s *Server) queueRouteFTSWarm(materializer *graphview.Materializer, generations []int64) {
+	if s == nil || materializer == nil || materializer.Store == nil || len(generations) == 0 {
+		return
+	}
+	q := &s.routeFTSWarm
+	q.mu.Lock()
+	q.pending = append(q.pending, append([]int64(nil), generations...))
+	if q.running {
+		q.mu.Unlock()
+		return
+	}
+	q.running = true
+	q.mu.Unlock()
+	go s.runRouteFTSWarm(materializer)
+}
+
+// runRouteFTSWarm is the warm's worker. For each queued route it reads, for
+// the ranker, the documents of every generation of the route's catalog
+// ancestry below the route's newest (base, dedicated root, commit, and an
+// earlier working-tree generation of the chain): once per generation per
+// daemon, since the ranker keeps them. The route's newest generation is left to
+// the first search. Before every generation it stands down while an edit cycle
+// holds the build lane — the predicate the analysis pass and the prune yield
+// to, the edit-cycle predicate — so no read competes with an edit.
+func (s *Server) runRouteFTSWarm(materializer *graphview.Materializer) {
+	q := &s.routeFTSWarm
+	for {
+		q.mu.Lock()
+		routes := q.pending
+		q.pending = nil
+		if len(routes) == 0 {
+			q.running = false
+			q.mu.Unlock()
+			return
+		}
+		q.mu.Unlock()
+		if gate := routeFTSWarmGateForTest; gate != nil {
+			gate()
+		}
+		read := 0
+		for _, generations := range routes {
+			read += s.warmRouteFTS(materializer, generations)
+		}
+		if hook := routeFTSWarmHook; hook != nil {
+			hook(read)
+		}
+	}
+}
+
+// warmRouteFTS warms one route, standing down for edits; it reports how many
+// generations it read.
+func (s *Server) warmRouteFTS(materializer *graphview.Materializer, generations []int64) int {
+	if !s.waitForQuietEditLane(routeFTSWarmLaneWait) {
+		return 0
+	}
+	ctx := context.Background()
+	ancestry, err := materializer.RouteAncestry(ctx, generations...)
+	if err != nil {
+		return 0
+	}
+	top := generations[len(generations)-1]
+	started := time.Now()
+	read := 0
+	for _, generation := range ancestry {
+		if generation == top {
+			continue
+		}
+		if !s.waitForQuietEditLane(routeFTSWarmLaneWait) {
+			break
+		}
+		n, err := search.WarmFTSGenerations(ctx, materializer.Store, []int64{generation})
+		if err != nil {
+			break
+		}
+		read += n
+	}
+	if s.logger != nil && read > 0 {
+		s.logger.Info("search: route base generations read for the full-text ranker",
+			zap.Int64s("route", generations), zap.Int("read", read), zap.Duration("elapsed", time.Since(started)))
+	}
+	return read
 }

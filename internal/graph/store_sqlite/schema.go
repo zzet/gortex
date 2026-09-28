@@ -1482,6 +1482,10 @@ last_author, last_commit_at, head_sha, branch, computed_at`,
     ON symbol_fts_rowid(fts_rowid)`,
 			`CREATE INDEX IF NOT EXISTS symbol_fts_rowid_by_repo
     ON symbol_fts_rowid(view_gen, repo_prefix, fts_rowid)`,
+			// A generation's documents in rowid order, for the no-MATCH read
+			// (store_fts_stats.go SymbolFTSGenerationRows).
+			`CREATE INDEX IF NOT EXISTS symbol_fts_rowid_by_generation
+    ON symbol_fts_rowid(view_gen, fts_rowid)`,
 		},
 	},
 	// content_fts_rowid is the ownership index for content FTS docids. A content

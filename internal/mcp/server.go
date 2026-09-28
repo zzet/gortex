@@ -269,7 +269,11 @@ type Server struct {
 	analysisScopedHandle atomic.Pointer[analysisScopedHandleMemo]
 	// analysisYield, when set, reports that an edit cycle holds the build
 	// lane; a background pass waits it out between sub-analyses.
-	analysisYield        func() bool
+	analysisYield func() bool
+	// routeFTSWarm is the background warm of routes' base generations for
+	// the full-text ranker (warmRouteFTS): the route pre-warm only queues a
+	// route here, and one worker reads, outside every publication.
+	routeFTSWarm         routeFTSWarmQueue
 	answerAnalysis       atomic.Pointer[answerAnalysisSnapshot]
 	answerAnalysisValues answerAnalysisCache
 	answerToken          atomic.Pointer[answerTokenMemo]
