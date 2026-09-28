@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -773,6 +774,75 @@ func (s *Store) MarkPayloadGenerationSuperseded(ctx context.Context, generationI
 // no chunk holds the mutation gate for an unbounded time.
 const payloadGenerationSweepBatch = 1000
 
+// Retirement chunks are sized by time, not by a fixed row count: on the
+// live-sized store a 1,000-row delete of a generation's edges held the write
+// gate 2 s and once 29 s (every deleted row updates a dozen indexes whose
+// identity-leading keys sit on scattered, cold pages). Each chunk's rows are
+// scaled from the last chunk's measured time toward payloadSweepChunkTarget,
+// between payloadSweepMinBatch and payloadGenerationSweepBatch, changing by at
+// most 4x per chunk, and the size is kept per store for the next sweep.
+const (
+	payloadSweepChunkTarget  = 100 * time.Millisecond
+	payloadSweepMinBatch     = 16
+	payloadSweepInitialBatch = 128
+)
+
+type sweepBatchKey struct{}
+
+// sweepBatchFrom is the row limit the running chunk may delete.
+func sweepBatchFrom(ctx context.Context) int {
+	if v, ok := ctx.Value(sweepBatchKey{}).(int); ok && v > 0 {
+		return v
+	}
+	return payloadGenerationSweepBatch
+}
+
+// Retirement chunks are also sized by the log they write: every deleted row
+// rewrites pages of a dozen indexes (1.3–1.5 KB of WAL per row measured on a
+// warm store, more on a cold one), and a sweep bounded only by time wrote
+// 2.1 GB of log in three minutes. The WAL bytes per row are learned from each
+// chunk's log growth, and a chunk deletes at most payloadSweepChunkWALBudget
+// of log.
+var payloadSweepChunkWALBudget int64 = 2 << 20
+
+// learnSweepWALPerRow folds one chunk's log growth into the learned bytes per
+// row (an even blend with the last value) and returns the rows the WAL budget
+// allows at the new rate (0 when nothing is known yet).
+func (s *Store) learnSweepWALPerRow(before, after WALWriteMark, removed int64) int {
+	if d := WALWrittenBetween(before, after); d.Valid && !d.Reset && removed > 0 && d.Bytes > 0 {
+		perRow := float64(d.Bytes) / float64(removed)
+		if prev := math.Float64frombits(s.sweepWALPerRow.Load()); prev > 0 {
+			perRow = (perRow + prev) / 2
+		}
+		s.sweepWALPerRow.Store(math.Float64bits(perRow))
+	}
+	perRow := math.Float64frombits(s.sweepWALPerRow.Load())
+	if perRow <= 0 || payloadSweepChunkWALBudget <= 0 {
+		return 0
+	}
+	return max(payloadSweepMinBatch, int(float64(payloadSweepChunkWALBudget)/perRow))
+}
+
+// nextSweepBatch scales limit toward the target from one chunk's time.
+func nextSweepBatch(limit int, removed int64, elapsed time.Duration) int {
+	if removed < int64(limit) || elapsed <= 0 {
+		// A short chunk (the table's tail) says nothing about the rate.
+		if elapsed > payloadSweepChunkTarget {
+			return max(payloadSweepMinBatch, limit/2)
+		}
+		return limit
+	}
+	next := int(float64(limit) * float64(payloadSweepChunkTarget) / float64(elapsed))
+	next = min(max(next, limit/4), limit*4)
+	return min(max(next, payloadSweepMinBatch), payloadGenerationSweepBatch)
+}
+
+// WriteWanted reports whether a write wants the store's writer: a caller
+// parked on the write gate or an announced mutation (AnnounceWrite).
+func (s *Store) WriteWanted() bool {
+	return !s.coreless() && s.writeWanted()
+}
+
 // Chunked deletes for the two core tables. The generation predicate is
 // restated as a literal `view_gen > 0` alongside the bound equality because
 // SQLite only uses a partial index when the query's WHERE matches the index's
@@ -1016,7 +1086,7 @@ type payloadSweepChunk func(ctx context.Context, tx *sql.Tx) (int64, error)
 // which reads the very table the delete shrinks.
 func deleteGenerationRowsChunk(query string, generationID int64) payloadSweepChunk {
 	return func(ctx context.Context, tx *sql.Tx) (int64, error) {
-		result, err := tx.ExecContext(ctx, query, generationID, generationID, payloadGenerationSweepBatch)
+		result, err := tx.ExecContext(ctx, query, generationID, generationID, sweepBatchFrom(ctx))
 		if err != nil {
 			return 0, err
 		}
@@ -1051,12 +1121,12 @@ func deleteFTSDocidChunk(docidMap ftsDocidMap, generationID int64) payloadSweepC
 func generationFTSDocids(ctx context.Context, tx *sql.Tx, table string, generationID int64) ([]int64, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT fts_rowid FROM `+table+` WHERE view_gen = ? LIMIT ?`,
-		generationID, payloadGenerationSweepBatch)
+		generationID, sweepBatchFrom(ctx))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	docids := make([]int64, 0, payloadGenerationSweepBatch)
+	docids := make([]int64, 0, sweepBatchFrom(ctx))
 	for rows.Next() {
 		var docid int64
 		if err := rows.Scan(&docid); err != nil {
@@ -1095,6 +1165,8 @@ func (s *Store) deletePayloadChunks(
 	ctx context.Context, generationID int64, chunk payloadSweepChunk, pass *payloadSweepPass,
 ) error {
 	var walEpisode retirementWALEpisode
+	var swept, sweptWAL int64
+	started := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1111,7 +1183,22 @@ func (s *Store) deletePayloadChunks(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		removed, retiring, err := s.deletePayloadChunk(ctx, generationID, chunk)
+		limit := int(s.sweepBatch.Load())
+		if limit <= 0 {
+			limit = payloadSweepInitialBatch
+		}
+		chunkStart := time.Now()
+		markBefore := readWALWriteMark(s.dbPath)
+		removed, retiring, err := s.deletePayloadChunk(context.WithValue(ctx, sweepBatchKey{}, limit), generationID, chunk)
+		if d := WALWrittenBetween(markBefore, readWALWriteMark(s.dbPath)); d.Valid && !d.Reset {
+			sweptWAL += d.Bytes
+		}
+		swept += removed
+		next := nextSweepBatch(limit, removed, time.Since(chunkStart))
+		if byWAL := s.learnSweepWALPerRow(markBefore, readWALWriteMark(s.dbPath), removed); byWAL > 0 {
+			next = min(next, byWAL)
+		}
+		s.sweepBatch.Store(int64(next))
 		if err != nil {
 			return fmt.Errorf("payload generation gc: generation %d: %w", generationID, err)
 		}
@@ -1120,6 +1207,10 @@ func (s *Store) deletePayloadChunks(
 		}
 		pass.spend(removed)
 		if removed == 0 {
+			if swept > 0 {
+				log.Printf("store_sqlite: retirement swept generation=%d rows=%d wal_bytes=%d elapsed=%s",
+					generationID, swept, sweptWAL, time.Since(started).Round(time.Millisecond))
+			}
 			return nil
 		}
 	}

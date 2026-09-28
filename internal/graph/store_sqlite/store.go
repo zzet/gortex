@@ -77,6 +77,11 @@ type storeCore struct {
 	// rowCountersInstall serialises EnsureRowCounters (the lazy loop and a
 	// direct caller must not install over each other).
 	rowCountersInstall sync.Mutex
+	// sweepBatch is the retirement chunk size learned from the last chunk's
+	// time (payload_generation.go, nextSweepBatch); 0 before the first.
+	sweepBatch atomic.Int64
+	// sweepWALPerRow is the learned WAL bytes per retired row (float64 bits).
+	sweepWALPerRow atomic.Uint64
 	// backgroundCheckpoint coordinates the periodic PASSIVE worker with the
 	// generation-scoped bulk owner before either touches the physical writer.
 	// It lives on the shared core so every AtGeneration handle sees one token.

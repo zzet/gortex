@@ -65,7 +65,7 @@ import (
 // states that dependency where someone lowering these numbers will read it.
 const (
 	payloadSweepMaxRows    = 64_000_000
-	payloadSweepMaxChunks  = 64_000
+	payloadSweepMaxChunks  = 4_000_000 // chunks are time-sized, down to payloadSweepMinBatch rows
 	payloadSweepMaxElapsed = 10 * time.Minute
 )
 
