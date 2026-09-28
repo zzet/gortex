@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"math"
@@ -819,7 +820,21 @@ func (s *Store) AbortAnalysisGeneration(generationID int64) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.writerDB.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ? AND view_gen = ? AND state = ?`, analysisGenerationStale, generationID, s.viewGen, analysisGenerationBuilding)
+	// The writer pool holds exactly one connection, and an open bulk window
+	// (a generation build's, or a cold load's) keeps it pinned as bulkConn
+	// until the window's owner takes writeMu again to drain and close it.
+	// Checking a connection out of writerDB here, under writeMu, would wait
+	// for a connection only that owner can return while holding the gate the
+	// owner needs: the analysis-abort-versus-build-drain deadlock. Every
+	// other analysis write already reuses the pinned connection through
+	// beginAnalysisWrite; the abort must do the same.
+	ctx := context.Background()
+	conn, release, err := s.activeWriteConnLocked(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	result, err := conn.ExecContext(ctx, `UPDATE analysis_generations SET state = ? WHERE generation_id = ? AND view_gen = ? AND state = ?`, analysisGenerationStale, generationID, s.viewGen, analysisGenerationBuilding)
 	if err != nil {
 		return err
 	}
@@ -829,7 +844,7 @@ func (s *Store) AbortAnalysisGeneration(generationID int64) error {
 	}
 	if changed == 0 {
 		var state int
-		if err := s.writerDB.QueryRow(`SELECT state FROM analysis_generations WHERE generation_id = ? AND view_gen = ?`, generationID, s.viewGen).Scan(&state); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT state FROM analysis_generations WHERE generation_id = ? AND view_gen = ?`, generationID, s.viewGen).Scan(&state); err != nil {
 			if err == sql.ErrNoRows {
 				return fmt.Errorf("analysis generation: generation %d does not exist", generationID)
 			}
