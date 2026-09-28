@@ -292,7 +292,12 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 	if n == nil {
 		return true
 	}
-	if o.WorkspaceID != "" {
+	// A synthetic global external (the type checker's `ext::go:fmt::Errorf`
+	// at `external::go:fmt`: no repository, no workspace, a path that is no
+	// repository source) is visible from every scope by construction, as the
+	// repo narrow below already treats it. An unowned node at a source path
+	// stays subject to the workspace check.
+	if o.WorkspaceID != "" && !isGlobalExternal(n) {
 		ws := n.WorkspaceID
 		if ws == "" {
 			ws = n.RepoPrefix
@@ -780,4 +785,11 @@ type WalkOptions struct {
 // same boundary without duplicating the fallback rules.
 func (o WalkOptions) scopeAllows(n *graph.Node) bool {
 	return QueryOptions{WorkspaceID: o.WorkspaceID, ProjectID: o.ProjectID, RepoAllow: o.RepoAllow}.ScopeAllows(n)
+}
+
+// isGlobalExternal reports whether n is a synthetic global external: owned by
+// no repository and no workspace, at a path that names no repository source.
+func isGlobalExternal(n *graph.Node) bool {
+	return n.RepoPrefix == "" && n.WorkspaceID == "" && n.FilePath != "" &&
+		!graph.IsAuditableRepoSourcePath(n.FilePath)
 }
