@@ -561,7 +561,7 @@ func (c *CheckoutCoordinator) checkRoutedSnapshot(ctx context.Context, route sto
 	if err != nil {
 		return err
 	}
-	if generationRowKey(layers.commit) != generationIdentityKey(c.commitIdentity(layers.base, sample.HeadTree)) {
+	if !c.routedCommitLayerFor(layers.commit, layers.base, sample.HeadTree) {
 		return fmt.Errorf("%w: checkout HEAD or primary base changed", ErrCheckoutMutationStale)
 	}
 	if layers.dirty.LowerViewFingerprint != sample.Fingerprint {
@@ -604,7 +604,7 @@ func (c *CheckoutCoordinator) checkRouteLayers(ctx context.Context, route store_
 	// The commit layer must be the one this base builds for the tree it
 	// names; whether that tree is still HEAD's is the sample's question.
 	if !found || !servableGeneration(commit.State) || route.GraphID != base.graphID ||
-		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, commit.TreeOID)) {
+		!c.routedCommitLayerFor(commit, base, commit.TreeOID) {
 		return layers, fmt.Errorf("%w: checkout HEAD or primary base changed", ErrCheckoutMutationStale)
 	}
 	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
@@ -721,4 +721,24 @@ func (c *CheckoutCoordinator) waitSourceMutations(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// routedCommitLayerFor reports whether commit is a commit layer this checkout
+// may route for tree over base: the one it builds itself, or one another
+// checkout of the graph built from the same inputs, which the coordinator
+// adopts instead of indexing the tree again (sharedCommit). The layer's
+// builder is not part of what it describes.
+func (c *CheckoutCoordinator) routedCommitLayerFor(commit store_sqlite.ViewGeneration, base primaryBase, tree string) bool {
+	return commitLayerMatches(commit, c.commitIdentity(base, tree))
+}
+
+// commitLayerMatches reports whether commit is the commit layer identity
+// names: exactly (the checkout's own), or another checkout's layer of the same
+// kind built from the same inputs, which a coordinator adopts (sharedCommit).
+func commitLayerMatches(commit store_sqlite.ViewGeneration, identity GenerationIdentity) bool {
+	if generationRowKey(commit) == generationIdentityKey(identity) {
+		return true
+	}
+	return commit.CheckoutID != identity.CheckoutID && commit.OwnerKind == identity.OwnerKind &&
+		commit.GenerationKind == identity.GenerationKind && sameCommitLayerInputs(commit, identity)
 }

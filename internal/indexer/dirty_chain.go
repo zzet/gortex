@@ -66,7 +66,10 @@ func (c *CheckoutCoordinator) dirtyChainRootFrom(
 	if maxDepth <= 0 {
 		maxDepth = maxDirtyChainDepth
 	}
-	if !dirtyChainHopMatches(top, top, commit) {
+	// The top must be this checkout's own working-tree layer (the commit
+	// generation's checkout used to guarantee it; an adopted commit layer
+	// names another checkout).
+	if !dirtyChainHopMatches(top, top, commit) || (c.checkoutID != "" && top.CheckoutID != c.checkoutID) {
 		return nil, false, dirtyChainFallbackNoParent, nil
 	}
 	seen := map[int64]struct{}{}
@@ -106,12 +109,16 @@ func (c *CheckoutCoordinator) dirtyChainRootFrom(
 	}
 }
 
-// dirtyChainHopMatches is the per-hop half of the ancestry-root predicate.
+// dirtyChainHopMatches is the per-hop half of the ancestry-root predicate. A
+// chain is one checkout's working-tree layer: every hop carries the top's
+// checkout and layer. The commit generation contributes only its graph and
+// tree — it may be another checkout's layer the coordinator adopted
+// (sharedCommit), so its checkout says nothing about the chain's.
 func dirtyChainHopMatches(hop, top, commit store_sqlite.ViewGeneration) bool {
 	return servableGeneration(hop.State) &&
 		hop.GenerationKind == DirtyLayerGenerationKind &&
-		hop.CheckoutID == commit.CheckoutID &&
-		hop.LayerID == dirtyLayerID(commit.CheckoutID) &&
+		hop.CheckoutID == top.CheckoutID &&
+		hop.LayerID == dirtyLayerID(top.CheckoutID) &&
 		hop.GraphID == commit.GraphID &&
 		hop.TreeOID == commit.TreeOID &&
 		hop.ConfigHash == top.ConfigHash &&

@@ -83,6 +83,9 @@ const (
 	// what keeps a pathological store from turning one cache miss into an
 	// unbounded read.
 	maxStoredCommitLayerCandidates = 16
+	// maxSharedCommitLayerCandidates bounds the scan of a graph's layer
+	// generations for another checkout's commit layer (sharedCommit).
+	maxSharedCommitLayerCandidates = 256
 
 	// checkoutLayerOwnerKind names who owns the generations a coordinator
 	// builds: the family's primary dedicated graph, whose corpus they compose
@@ -1516,7 +1519,7 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	out.BasePinned = pinned
 	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
 	if err != nil || !found || !servableGeneration(commit.State) ||
-		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, sample.HeadTree)) {
+		!c.routedCommitLayerFor(commit, base, sample.HeadTree) {
 		return out, false
 	}
 	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
@@ -2001,7 +2004,8 @@ func (c *CheckoutCoordinator) recomposableStack(
 	if !found || !servableGeneration(commitRow.State) ||
 		commitRow.OwnerKind != checkoutLayerOwnerKind ||
 		commitRow.GenerationKind != CommitLayerGenerationKind ||
-		commitRow.CheckoutID != c.checkoutID ||
+		// The routed layer may be another checkout's the coordinator adopted
+		// (sharedCommit): the identity comparisons below accept it by inputs.
 		commitRow.GraphID != base.graphID ||
 		// Defence in depth, and knowingly redundant: TreeOID is part of the
 		// commit identity, so the substituted-identity comparison below
@@ -2015,8 +2019,7 @@ func (c *CheckoutCoordinator) recomposableStack(
 		return commitRow, dirtyRow, false, nil
 	}
 	current := c.commitIdentity(base, head.HeadTree)
-	routedKey := generationRowKey(commitRow)
-	if generationIdentityKey(current) == routedKey {
+	if commitLayerMatches(commitRow, current) {
 		// Nothing moved at all. The ordinary path recognises this in one read
 		// and keeps the route exactly as it is.
 		return commitRow, dirtyRow, false, nil
@@ -2024,7 +2027,7 @@ func (c *CheckoutCoordinator) recomposableStack(
 	pinned := current
 	pinned.BaseGenerationID = commitRow.BaseGenerationID
 	pinned.LowerViewFingerprint = commitRow.LowerViewFingerprint
-	if generationIdentityKey(pinned) != routedKey {
+	if !commitLayerMatches(commitRow, pinned) {
 		return commitRow, dirtyRow, false, nil
 	}
 	dirtyRow, found, err = c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
@@ -2499,7 +2502,6 @@ func (c *CheckoutCoordinator) validatedPinnedCommitBaseFor(
 	if !found || !servableGeneration(commitRow.State) ||
 		commitRow.OwnerKind != checkoutLayerOwnerKind ||
 		commitRow.GenerationKind != CommitLayerGenerationKind ||
-		commitRow.CheckoutID != c.checkoutID ||
 		commitRow.GraphID != base.graphID ||
 		commitRow.BaseGenerationID <= 0 ||
 		commitRow.BaseGenerationID == base.generationID {
@@ -2511,7 +2513,7 @@ func (c *CheckoutCoordinator) validatedPinnedCommitBaseFor(
 	probe := c.commitIdentity(base, commitRow.TreeOID)
 	probe.BaseGenerationID = commitRow.BaseGenerationID
 	probe.LowerViewFingerprint = commitRow.LowerViewFingerprint
-	if generationIdentityKey(probe) != generationRowKey(commitRow) {
+	if !commitLayerMatches(commitRow, probe) {
 		return out, false, nil
 	}
 	baseRow, found, err := c.catalog.GetViewGeneration(ctx, commitRow.BaseGenerationID)
@@ -2678,6 +2680,11 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 			// back. Retaining by the row's own identity also handles a canonical
 			// generation adopted from another checkout.
 			rowKey := generationRowKey(row)
+			if rowKey != key && c.adoptedCommitRowFor(row, key) {
+				// Another checkout's layer this checkout adopted for exactly
+				// this state (sharedCommit): filed under this checkout's key.
+				rowKey = key
+			}
 			c.retainCommit(ctx, rowKey, row.GenerationID)
 			if rowKey == key {
 				return row.GenerationID, nil
@@ -3405,11 +3412,24 @@ func (c *CheckoutCoordinator) cachedCommit(ctx context.Context, key string) (int
 		return 0, false
 	}
 	row, found, err := c.catalog.GetViewGeneration(ctx, generationID)
-	if err != nil || !found || !servableGeneration(row.State) || generationRowKey(row) != key {
+	if err != nil || !found || !servableGeneration(row.State) || generationRowKey(row) != key && !c.adoptedCommitRowFor(row, key) {
 		c.forgetRetained(generationID)
 		return 0, false
 	}
 	return generationID, true
+}
+
+// adoptedCommitRowFor reports whether row is a commit layer another checkout
+// built from the inputs key names (sharedCommit): it is filed under this
+// checkout's key while its own row names its builder. Renamed to this
+// checkout, its identity renders key exactly.
+func (c *CheckoutCoordinator) adoptedCommitRowFor(row store_sqlite.ViewGeneration, key string) bool {
+	if row.GenerationKind != CommitLayerGenerationKind || row.CheckoutID == c.checkoutID {
+		return false
+	}
+	own := row
+	own.CheckoutID, own.LayerID = c.checkoutID, commitLayerID(c.checkoutID)
+	return generationRowKey(own) == key
 }
 
 // storedCommit is the durable half of the reuse cache: the catalog's own
@@ -3468,10 +3488,72 @@ func (c *CheckoutCoordinator) storedCommit(ctx context.Context, identity Generat
 	}
 	generationID, ok := selectReusableCommitGeneration(rows, key)
 	if !ok {
-		return 0, false
+		if generationID, ok = c.sharedCommit(ctx, identity); !ok {
+			return 0, false
+		}
 	}
 	c.retainCommit(ctx, key, generationID)
 	return generationID, true
+}
+
+// sharedCommit adopts a commit layer another checkout of the graph built for
+// the same state: same base generation and base tree, same target tree, same
+// configuration, extractor, resolver and dependency identity. A commit layer
+// is a function of exactly those inputs — the checkout only names who built
+// it — so a new checkout at a tree another checkout already routes (a fresh
+// worktree of a branch, a restart that minted a new identity) serves that
+// layer instead of indexing the tree again. Retirement is safe to share: a
+// generation any route, ref view or dependent generation references is never
+// retired (the catalog's reference guard), whichever checkout offers it.
+func (c *CheckoutCoordinator) sharedCommit(ctx context.Context, identity GenerationIdentity) (int64, bool) {
+	sharedCommitLookups.Add(1)
+	rows, err := c.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		GraphID:   identity.GraphID,
+		OwnerKind: identity.OwnerKind,
+		States:    []store_sqlite.ViewGenerationState{store_sqlite.ViewGenerationReady, store_sqlite.ViewGenerationSuperseded},
+		Limit:     maxSharedCommitLayerCandidates,
+	})
+	if err != nil {
+		c.logger.Debug("checkout coordinator: shared commit layer lookup failed",
+			zap.String("checkout", c.checkoutID), zap.Error(err))
+		return 0, false
+	}
+	var best int64
+	for _, row := range rows {
+		if row.GenerationKind != identity.GenerationKind || row.CheckoutID == identity.CheckoutID {
+			continue
+		}
+		if !servableGeneration(row.State) || !sameCommitLayerInputs(row, identity) {
+			continue
+		}
+		if row.GenerationID > best {
+			best = row.GenerationID
+		}
+	}
+	if best == 0 {
+		return 0, false
+	}
+	c.logger.Info("checkout coordinator: adopted another checkout's commit layer",
+		zap.String("checkout", c.checkoutID), zap.Int64("generation", best),
+		zap.String("tree", identity.TreeOID))
+	return best, true
+}
+
+// sharedCommitLookups counts the catalog scans sharedCommit made (tests).
+var sharedCommitLookups atomic.Int64
+
+// sameCommitLayerInputs reports whether a stored generation was built from
+// the same inputs as identity, whoever built it.
+func sameCommitLayerInputs(row store_sqlite.ViewGeneration, identity GenerationIdentity) bool {
+	return row.GraphID == identity.GraphID &&
+		row.BaseGenerationID == identity.BaseGenerationID &&
+		row.LowerViewFingerprint == identity.LowerViewFingerprint &&
+		row.TreeOID == identity.TreeOID &&
+		row.ProvenanceCommitOID == identity.ProvenanceCommitOID &&
+		row.ConfigHash == identity.ConfigHash &&
+		row.ExtractorVersions == identity.ExtractorVersions &&
+		row.ResolverVersion == identity.ResolverVersion &&
+		row.DependencyRevision == identity.DependencyRevision
 }
 
 // selectReusableCommitGeneration is the Go half of the identity check: of the
