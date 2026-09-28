@@ -121,6 +121,10 @@ const (
 	// defaultWarmupPoll is how often a waiting warm-up re-checks its turn and
 	// a running one looks for foreground work.
 	defaultWarmupPoll = 250 * time.Millisecond
+	// defaultWarmupStall is how long one module batch's listing may run at
+	// background priority before it is retried at normal priority. A batch
+	// lists in well under a minute on an idle host.
+	defaultWarmupStall = 2 * time.Minute
 )
 
 // CheckoutWarmupStatus is one checkout's background warm-up.
@@ -149,6 +153,14 @@ type CheckoutWarmupStatus struct {
 	// the foreground work that preempted it last.
 	Touched    bool
 	DeferredBy string
+	// Pauses counts the times a module batch's listing or merge waited for
+	// answer-path work (an edit cycle, a tool call) and PausedMs how long
+	// those waits took in all (see pauseForAnswerPath).
+	Pauses   int
+	PausedMs int64
+	// Escalations counts the background listings that stalled past the
+	// deadline and were retried at normal priority.
+	Escalations int
 }
 
 // checkoutWarmup is the bookkeeping of one checkout's warm-up, guarded by
@@ -196,6 +208,9 @@ type checkoutWarmup struct {
 	// forced is set once it waited longer than the maximum deferral.
 	deferredSince time.Time
 	forced        bool
+	// escalate lists the next module batch at normal priority: the last
+	// background listing stalled (backgroundListingDeadline).
+	escalate bool
 }
 
 // warmupRegistry tracks the provider's warm-ups and its interactive
@@ -239,6 +254,12 @@ type warmupRegistry struct {
 	// warmupBatchPackages (tests).
 	maxDeferral time.Duration
 	batchSize   int
+	// toolCalls overrides the count of tool calls in flight and maxPause
+	// the bound of one answer-path pause (tests).
+	toolCalls func() int64
+	maxPause  time.Duration
+	// stall overrides defaultWarmupStall (tests).
+	stall time.Duration
 	// recent is, per module directory, the handle-root directories of the
 	// latest passes, newest first. It is persisted per module directory
 	// under rootsDir (typecheck_roots_persist.go) and read back on first
@@ -817,6 +838,12 @@ func (p *Provider) runWarmup(e *checkoutWarmup) {
 		if exhausted {
 			return
 		}
+		if e.planned && !p.nextBatchTargeted(e) && !p.pauseForAnswerPath(e, "listing") {
+			r.mu.Lock()
+			e.status.State = warmupCancelled
+			r.mu.Unlock()
+			return
+		}
 		ctx, cancel := p.waitWarmupTurn(e)
 		if ctx == nil {
 			r.mu.Lock()
@@ -914,7 +941,10 @@ func (p *Provider) runWarmup(e *checkoutWarmup) {
 				zap.Duration("since_request", time.Since(status.Started)))
 		}
 		flags := warmupBuildFlags()
-		if targetedBatch {
+		r.mu.Lock()
+		escalated := e.escalate
+		r.mu.Unlock()
+		if targetedBatch || escalated {
 			flags = targetedWarmupBuildFlags()
 		}
 		if targetedBatch {
@@ -926,9 +956,34 @@ func (p *Provider) runWarmup(e *checkoutWarmup) {
 			r.notifyLocked()
 			r.mu.Unlock()
 		}
-		listing, err := p.runListing(ctx, e.loadDir, batch, flags)
+		listCtx, stalled := p.backgroundListingDeadline(ctx, !targetedBatch && !escalated)
+		listing, err := p.runListing(listCtx, e.loadDir, batch, flags)
 		preempted := ctx.Err() != nil
+		stall := stalled() && !preempted
 		cancel()
+		if stall {
+			// A background listing that has not finished within the stall
+			// deadline is retried at normal priority: under sustained load the
+			// lowest QoS can starve a compile indefinitely (live: one compile
+			// at 0.7 % CPU for 56 minutes). The go build cache keeps what it
+			// compiled, and the batch stays queued.
+			r.releaseWarmupSlot(e)
+			if p.warmupClosed(e) {
+				return
+			}
+			r.mu.Lock()
+			e.escalate = true
+			e.status.Escalations++
+			r.notifyLocked()
+			r.mu.Unlock()
+			if p.logger != nil {
+				p.logger.Info("go-types: checkout warm-up listing stalled at background priority; retrying at normal priority",
+					zap.String("module_dir", e.loadDir),
+					zap.Int("batch", len(batch)),
+					zap.Duration("deadline", r.stallPeriod()))
+			}
+			continue
+		}
 		if preempted || err != nil {
 			// Passes adopting this listing list themselves now.
 			r.mu.Lock()
@@ -951,6 +1006,14 @@ func (p *Provider) runWarmup(e *checkoutWarmup) {
 			}
 			continue
 		}
+		// A module batch's merge waits out answer-path work too; the
+		// manifest check below then sees the files as they are after it.
+		if !targetedBatch && !p.pauseForAnswerPath(e, "merge") {
+			r.mu.Lock()
+			e.status.State = warmupCancelled
+			r.mu.Unlock()
+			return
+		}
 		if now := goManifestDigest(e.loadDir); now != digest {
 			r.mu.Lock()
 			e.want = now
@@ -963,6 +1026,13 @@ func (p *Provider) runWarmup(e *checkoutWarmup) {
 			continue
 		}
 		listing.warmup = true
+		if escalated {
+			// The stalled batch listed at normal priority; the rest of the
+			// module goes back to the background.
+			r.mu.Lock()
+			e.escalate = false
+			r.mu.Unlock()
+		}
 		st.mu.Lock()
 		taken := st.mergeListing(listing)
 		st.mu.Unlock()
