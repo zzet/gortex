@@ -460,6 +460,13 @@ func (c *CheckoutCoordinator) checkRoutedSnapshot(ctx context.Context, route sto
 	if err != nil {
 		return err
 	}
+	routedBase, pinned, err := c.pinnedBaseFor(ctx, base, route)
+	if err != nil {
+		return err
+	}
+	if pinned {
+		base = routedBase
+	}
 	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
 	if err != nil {
 		return err

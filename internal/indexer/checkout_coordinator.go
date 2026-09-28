@@ -1903,7 +1903,7 @@ func graphBase(
 func (c *CheckoutCoordinator) pinRoutedBase(
 	ctx context.Context, base primaryBase, route store_sqlite.CheckoutRoute,
 ) (primaryBase, bool) {
-	pinned, ok, err := c.pinnedBaseFor(ctx, base, route)
+	pinned, ok, err := c.reconcilePinnedBaseFor(ctx, base, route)
 	if err != nil {
 		c.logger.Debug("checkout coordinator: could not resolve the routed base pin",
 			zap.String("checkout", c.checkoutID), zap.Error(err))
@@ -1916,10 +1916,44 @@ func (c *CheckoutCoordinator) pinRoutedBase(
 	return pinned, true
 }
 
-// pinnedBaseFor is pinRoutedBase's decision, kept apart from its bookkeeping so
-// every clause is one refusal and the whole predicate reads as a list.
+// pinnedBaseFor is the strict routed-view decision used by mutation admission.
+// A writable snapshot must still name a complete active pair; pending routes
+// are considered only by reconcilePinnedBaseFor after admission withdraws DIRTY.
 func (c *CheckoutCoordinator) pinnedBaseFor(
 	ctx context.Context, base primaryBase, route store_sqlite.CheckoutRoute,
+) (primaryBase, bool, error) {
+	var out primaryBase
+	if route.State != store_sqlite.RouteActive || route.GraphID != base.graphID ||
+		route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return out, false, nil
+	}
+	return c.validatedPinnedCommitBaseFor(ctx, base, route.CommitGenerationID)
+}
+
+// reconcilePinnedBaseFor also recognizes the exact route shape Prepare leaves
+// while a source mutation is pending: COMMIT is retained, DIRTY is withdrawn,
+// and no incomplete route is active or servable. The shared validation below
+// still proves that the retained COMMIT was built against a live pinned base.
+func (c *CheckoutCoordinator) reconcilePinnedBaseFor(
+	ctx context.Context, base primaryBase, route store_sqlite.CheckoutRoute,
+) (primaryBase, bool, error) {
+	if route.State == store_sqlite.RouteActive {
+		return c.pinnedBaseFor(ctx, base, route)
+	}
+	var out primaryBase
+	if route.State != store_sqlite.RoutePending || route.GraphID != base.graphID ||
+		route.CommitGenerationID <= 0 || route.DirtyGenerationID != 0 {
+		return out, false, nil
+	}
+	return c.validatedPinnedCommitBaseFor(ctx, base, route.CommitGenerationID)
+}
+
+// validatedPinnedCommitBaseFor proves that one routed COMMIT still names an
+// independently servable dedicated base with the exact identity it was built
+// against. Both mutation admission and reconcile use this authority; only the
+// accepted route shapes differ between their callers.
+func (c *CheckoutCoordinator) validatedPinnedCommitBaseFor(
+	ctx context.Context, base primaryBase, commitGenerationID int64,
 ) (primaryBase, bool, error) {
 	var out primaryBase
 	if base.generationID <= 0 || base.pinned {
@@ -1927,11 +1961,7 @@ func (c *CheckoutCoordinator) pinnedBaseFor(
 		// that is already a pin is not re-pinned.
 		return out, false, nil
 	}
-	if route.State != store_sqlite.RouteActive || route.GraphID != base.graphID ||
-		route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
-		return out, false, nil
-	}
-	commitRow, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	commitRow, found, err := c.catalog.GetViewGeneration(ctx, commitGenerationID)
 	if err != nil {
 		return out, false, err
 	}

@@ -457,12 +457,23 @@ type generationBulkWindow struct {
 // open takes the window for this build's generation, or reports why the build
 // must stop. A refusal that is not a contradiction leaves opened false and the
 // ordinary unbracketed write path in place.
+type generationBulkCloserByID interface {
+	EndGenerationBulkLoadFor(generationID int64) error
+}
+
 func (w *generationBulkWindow) open() error {
 	if w == nil || w.loader == nil || w.opened {
 		return nil
 	}
 	opened, err := w.loader.BeginGenerationBulkLoad(w.generationID)
 	if err != nil {
+		// A periodic PASSIVE checkpoint that did not yield inside its bound is
+		// not an optional bulk-shape refusal: falling back would run the same
+		// writes beside that checkpoint. Abort this physical attempt so the
+		// coordinator's next poll can retry after the checkpoint has settled.
+		if errors.Is(err, store_sqlite.ErrGenerationBulkCheckpointBusy) {
+			return fmt.Errorf("indexer: generation bulk checkpoint coordination: %w", err)
+		}
 		if w.wholeGeneration && errors.Is(err, store_sqlite.ErrGenerationBulkLoadPopulated) {
 			return fmt.Errorf("indexer: refuse to copy into generation %d over existing payload: %w",
 				w.generationID, err)
@@ -484,7 +495,13 @@ func (w *generationBulkWindow) close() error {
 		return nil
 	}
 	w.opened = false
-	if err := w.loader.EndGenerationBulkLoad(); err != nil {
+	var err error
+	if closer, ok := w.loader.(generationBulkCloserByID); ok {
+		err = closer.EndGenerationBulkLoadFor(w.generationID)
+	} else {
+		err = w.loader.EndGenerationBulkLoad()
+	}
+	if err != nil {
 		return fmt.Errorf("indexer: close generation %d bulk load: %w", w.generationID, err)
 	}
 	return nil
