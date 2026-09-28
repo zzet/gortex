@@ -528,6 +528,24 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 				}
 			}
 		}()
+		window := &generationBulkWindow{
+			loader: handle, generationID: generationID, logger: b.Logger,
+		}
+		defer func() {
+			closeErr := window.close()
+			if closeErr == nil {
+				return
+			}
+			if physicalErr != nil {
+				b.Logger.Warn("close generation bulk load after a failed sparse build",
+					zap.Int64("generation", generationID), zap.Error(closeErr))
+				return
+			}
+			physicalErr = closeErr
+		}()
+		if err := window.open(); err != nil {
+			return err
+		}
 		if prepare != nil {
 			target, preparedPlan, preparedReport, err := prepare(ctx)
 			if target != nil {
@@ -580,6 +598,9 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 			if err := req.PrePublish(ctx, generationID); err != nil {
 				return err
 			}
+		}
+		if err := window.close(); err != nil {
+			return err
 		}
 		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)

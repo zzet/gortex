@@ -256,14 +256,17 @@ func TestPrivatePublicBuilderSQLiteFull(t *testing.T) {
 				t.Fatal(err)
 			}
 			oldLimit = before.MaxPageCount
+			if !before.BulkWriter || before.BulkGeneration != id {
+				t.Fatalf("page-limit helper missed active public bulk writer: state=%+v generation=%d", before, id)
+			}
 			if before.PageCount <= 0 || before.PageSize <= 0 || before.FreePages < 0 ||
 				before.PageCount*before.PageSize > 16*1024*1024 || before.FreePages*before.PageSize > int64(body.Len()) {
 				t.Fatalf("private FULL sizing precondition: %+v corpus=%d", before, body.Len())
 			}
 			if mode == "sqlite_full" {
 				capped, err := store_sqlite.PrivateSQLiteFullWriterStateForTest(ctx, store, before.PageCount)
-				if err != nil || capped.MaxPageCount != before.PageCount {
-					t.Fatalf("real writer page ceiling: %+v err=%v", capped, err)
+				if err != nil || capped.MaxPageCount != before.PageCount || !capped.BulkWriter || capped.BulkGeneration != id {
+					t.Fatalf("real bulk writer page ceiling: state=%+v generation=%d err=%v", capped, id, err)
 				}
 			}
 			unblock()
@@ -282,8 +285,9 @@ func TestPrivatePublicBuilderSQLiteFull(t *testing.T) {
 			row, found, stateErr := catalog.GetViewGeneration(ctx, id)
 			t.Logf("mode=%s id=%d corpus_bytes=%d before=%+v leader_id=%d leader_err_type=%T leader_err=%v panic_type=%T panic=%v state_before_restore_found=%v state=%s state_err=%v planning_opens=%d physical_opens=%d",
 				mode, id, body.Len(), before, leader.id, leader.err, leader.err, leader.panic, leader.panic, found, row.State, stateErr, wrapped.planningOpen.Load(), wrapped.flightOpens.Load())
-			if err := restore(); err != nil {
-				t.Fatal(err)
+			restored, err := store_sqlite.PrivateSQLiteFullWriterStateForTest(ctx, store, oldLimit)
+			if err != nil || restored.MaxPageCount != oldLimit || restored.BulkWriter {
+				t.Fatalf("post-drain current writer ceiling: state=%+v want=%d err=%v", restored, oldLimit, err)
 			}
 			firstID := repoPrefix + "/base.go::" + firstName
 			if mode == "healthy" {

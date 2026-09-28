@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -605,14 +607,18 @@ type copyArmMeasurement struct {
 	walFrames int
 	nodes     int
 	edges     int
+	// pressureDrains / pressureDeferred count the WAL pressure-line attempts
+	// the arm's writes provoked that completed and that were refused.
+	pressureDrains   int
+	pressureDeferred int
 }
 
 // The three shapes a first committed base can be written in, measured on the
 // same payload in the same store.
 //
 //   - incremental: the shape before the generation bulk window existed — rows
-//     written row-by-row through the ordinary path, with automatic checkpoints
-//     draining the log every time it crosses the line.
+//     written row-by-row through the ordinary path, with the WAL pressure line
+//     draining the log every time it is crossed.
 //   - re-parse in the window: the same row-by-row write with the window's
 //     shape, which is what the re-parse route now gets.
 //   - copy in the window: the rows moved by INSERT … SELECT inside the window,
@@ -621,6 +627,13 @@ type copyArmMeasurement struct {
 // The numbers are WAL bytes and frames, which is what the daemon actually
 // carries; the assertions are relations between the arms rather than absolute
 // figures, because the absolute figures are a property of this fixture's size.
+//
+// Writer connections carry wal_autocheckpoint=0: the pressure line is serviced
+// by the store's background checkpoint loop, not by the commit that crosses it.
+// That loop polls on a multi-second cadence, so each arm services the line
+// itself after every batch through the loop's own gate and attempt path (see
+// measureCopyArm). What is being compared is therefore exactly what the loop
+// would do, minus its polling latency.
 func TestCopyPayloadGenerationWriteShapeAgainstTheTwoWriteRoutes(t *testing.T) {
 	const line = 100
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", strconv.Itoa(line))
@@ -641,8 +654,8 @@ func TestCopyPayloadGenerationWriteShapeAgainstTheTwoWriteRoutes(t *testing.T) {
 		measureCopyArm(t, seed, "copy_in_window", nodes, edges, true, true),
 	}
 	for _, arm := range arms {
-		t.Logf("generation write shape: arm=%s wal_bytes=%d wal_frames=%d nodes=%d edges=%d",
-			arm.name, arm.walBytes, arm.walFrames, arm.nodes, arm.edges)
+		t.Logf("generation write shape: arm=%s wal_bytes=%d wal_frames=%d nodes=%d edges=%d pressure_drains=%d pressure_deferred=%d",
+			arm.name, arm.walBytes, arm.walFrames, arm.nodes, arm.edges, arm.pressureDrains, arm.pressureDeferred)
 	}
 	incremental, reparse, copied := arms[0], arms[1], arms[2]
 
@@ -659,12 +672,22 @@ func TestCopyPayloadGenerationWriteShapeAgainstTheTwoWriteRoutes(t *testing.T) {
 		copied.walBytes, reparse.walBytes, float64(copied.walBytes)/float64(reparse.walBytes),
 		reparse.walFrames, incremental.walFrames, float64(reparse.walFrames)/float64(incremental.walFrames))
 
+	// The incremental arm crosses the line inside the payload and the pressure
+	// attempt drains it; the window arms cross it just the same, and every
+	// attempt must be refused while the window holds the checkpoint lease.
+	if incremental.pressureDrains == 0 {
+		t.Fatalf("the incremental arm crossed the %d-page line without a completed pressure drain "+
+			"(deferred=%d), so it is not the drained baseline", line, incremental.pressureDeferred)
+	}
+	for _, arm := range []copyArmMeasurement{reparse, copied} {
+		if arm.pressureDrains != 0 || arm.pressureDeferred == 0 {
+			t.Fatalf("arm %s: pressure drains=%d deferred=%d inside the window, want every attempt deferred",
+				arm.name, arm.pressureDrains, arm.pressureDeferred)
+		}
+	}
 	// The window arms accumulate their whole payload; the incremental arm is
 	// drained every time it crosses the line, so the log it is left holding is
-	// a fraction of what it actually wrote. (That the incremental arm really
-	// is being drained mid-payload is pinned separately and directly by
-	// TestGenerationBulkLoadDefersTheAutomaticDrainToOneAtItsEnd; here it is
-	// the baseline the two window arms are read against.)
+	// a fraction of what it actually wrote.
 	if reparse.walFrames <= incremental.walFrames {
 		t.Fatalf("the re-parse arm's log high-water is %d against the incremental arm's %d: its payload "+
 			"was drained mid-flight, so the window is not covering it", reparse.walFrames, incremental.walFrames)
@@ -736,6 +759,35 @@ func measureCopyArm(t *testing.T, seed, name string, nNodes, nEdges int, window,
 		t.Fatalf("drain the reservation's WAL: %v", err)
 	}
 
+	// The background checkpoint loop's pressure path, run synchronously: its
+	// gate decides whether the line is crossed, and its attempt runs PASSIVE on
+	// a dedicated checkpoint pool unless a generation bulk window holds the
+	// checkpoint lease.
+	walPath, pressureBytes := sqliteWALPressureTarget(store.db, path, sqliteWALAutoCheckpointPages())
+	checkpointDB, err := sql.Open("sqlite", sqliteCheckpointDSN(path))
+	if err != nil {
+		t.Fatalf("open arm %s's checkpoint pool: %v", name, err)
+	}
+	configureWriterPool(checkpointDB)
+	defer func() { _ = checkpointDB.Close() }()
+	gate := walPressureGate{thresholdBytes: pressureBytes}
+	var drains, deferred int
+	servicePressure := func() {
+		now := time.Now()
+		if !gate.due(now, walPath) {
+			return
+		}
+		complete, _ := store.runBackgroundCheckpointAttempt(func(ctx context.Context) (bool, bool) {
+			return store.checkpointWALPassiveBackgroundOutcomeContext(ctx, checkpointDB)
+		})
+		if complete {
+			drains++
+			gate.markComplete(now, walPath)
+		} else {
+			deferred++
+		}
+	}
+
 	if window {
 		opened, err := store.BeginGenerationBulkLoad(destination)
 		if err != nil {
@@ -744,11 +796,15 @@ func measureCopyArm(t *testing.T, seed, name string, nNodes, nEdges int, window,
 		if !opened {
 			t.Fatalf("arm %s was refused a window over an empty reserved generation", name)
 		}
+		if generation, held := store.InGenerationBulkLoad(); !held || generation != destination {
+			t.Fatalf("arm %s holds window %d (held=%v), want %d", name, generation, held, destination)
+		}
 	}
 	if copyRoute {
 		if _, err := store.CopyPayloadGeneration(context.Background(), baseViewGeneration, destination, copyFixtureRepo); err != nil {
 			t.Fatalf("copy in arm %s: %v", name, err)
 		}
+		servicePressure()
 	} else {
 		handle, err := store.AtManagedGeneration(destination)
 		if err != nil {
@@ -773,13 +829,16 @@ func measureCopyArm(t *testing.T, seed, name string, nNodes, nEdges int, window,
 			if err := handle.AddBatchChecked(nodes[i:nodeEnd], edges[edgeStart:edgeEnd]); err != nil {
 				t.Fatalf("AddBatchChecked in arm %s: %v", name, err)
 			}
+			servicePressure()
 		}
 	}
 
 	arm := copyArmMeasurement{
-		name:      name,
-		walBytes:  walFileBytes(t, path),
-		walFrames: walFileFrames(t, path, pageSize),
+		name:             name,
+		walBytes:         walFileBytes(t, path),
+		walFrames:        walFileFrames(t, path, pageSize),
+		pressureDrains:   drains,
+		pressureDeferred: deferred,
 	}
 	if window {
 		if err := store.EndGenerationBulkLoad(); err != nil {

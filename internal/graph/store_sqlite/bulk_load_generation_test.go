@@ -17,38 +17,15 @@ import (
 // The generation-scoped bulk write shape, and the deterministic drain of what a
 // cold load leaves in the WAL.
 //
-// Two defects are pinned here, and they meet at the same place — the shape of
-// the bytes a generation payload costs.
-//
-//   - A committed generation's payload is written through the ordinary
-//     incremental path, because the bulk fast path is gated on the whole STORE
-//     being empty and generation 0 consumed it. BeginGenerationBulkLoad gives
-//     that payload the two parts of the bulk shape a window over a LIVE store
-//     may take — the enlarged page cache and the suspended automatic
-//     checkpoint — and leaves alone the two the cold path may take only because
-//     nothing can read it: the dense secondary indexes and durability.
-//
-//     Of those two, only the suspended automatic checkpoint is measurable at
-//     unit scale, and that is what the comparison below pins. The page cache's
-//     share is real in production (the payload replayed against the measured
-//     store cost 841,300,936 logical writes at a 2 MB cache and 258,812,948 at
-//     256 MiB) but does not reproduce on WAL-byte accounting at a fixture's
-//     size: the same 120k-row payload wrote a byte-identical WAL at -64 KiB,
-//     -2 MB, -32 MiB and -256 MiB of cache. The cache PRAGMA is therefore
-//     asserted directly, on the pinned connection, rather than inferred from a
-//     byte count a unit fixture cannot move.
-//   - A cold load's finalize ends on ONE bounded PASSIVE checkpoint that
-//     explicitly does not wait for readers, so what a daemon carries out of a
-//     cold index is whatever the readers of the moment allowed: 3,636 frames in
-//     one arm of the same workload and 15,573 in another. Whichever arm later
-//     crosses the auto-checkpoint line pays the whole accumulated log inside
-//     whatever phase happens to be running. The residue gate turns that lottery
-//     into one scheduled, bounded TRUNCATE on the maintenance lane.
+// A committed generation's payload is written through the ordinary incremental
+// path, because the cold fast path is gated on the whole STORE being empty and
+// generation 0 consumed it. BeginGenerationBulkLoad gives that payload the
+// enlarged page cache while leaving dense indexes and durability alone: the
+// generation-0 graph remains live underneath it. SQLite's commit hook stays
+// disabled on every writer connection; the application-owned pressure line is
+// serviced by the bounded checkpoint loop, and a bulk end schedules one bounded
+// TRUNCATE when its PASSIVE finalization leaves residue above that line.
 
-// walFileBytes is the -wal file's size. With automatic checkpoints suspended
-// the WAL only grows, so between two drains its size is the log the store is
-// carrying — the number the residue gate and the auto-checkpoint line are both
-// about.
 func walFileBytes(t *testing.T, path string) int64 {
 	t.Helper()
 	info, err := os.Stat(path + "-wal")
@@ -61,8 +38,6 @@ func walFileBytes(t *testing.T, path string) int64 {
 	return info.Size()
 }
 
-// walFileFrames converts that size into frames. The WAL header is 32 bytes and
-// each frame is a 24-byte header plus one page.
 func walFileFrames(t *testing.T, path string, pageSize int64) int {
 	t.Helper()
 	size := walFileBytes(t, path)
@@ -72,10 +47,6 @@ func walFileFrames(t *testing.T, path string, pageSize int64) int {
 	return int((size - 32) / (pageSize + 24))
 }
 
-// holdAReadSnapshot opens a real read transaction and materialises it, which is
-// what pins a WAL read mark. Starving the read POOL (holdTheOnlyReadConnection)
-// does not: an idle connection holds no snapshot, and the WAL a checkpoint can
-// copy is bounded by the oldest snapshot, not by the pool.
 func holdAReadSnapshot(t *testing.T, store *Store) (release func()) {
 	t.Helper()
 	ctx := context.Background()
@@ -95,12 +66,7 @@ func holdAReadSnapshot(t *testing.T, store *Store) (release func()) {
 		t.Fatalf("materialise the read snapshot: %v", err)
 	}
 	var once sync.Once
-	release = func() {
-		once.Do(func() {
-			_ = tx.Rollback()
-			_ = conn.Close()
-		})
-	}
+	release = func() { once.Do(func() { _ = tx.Rollback(); _ = conn.Close() }) }
 	t.Cleanup(release)
 	return release
 }
@@ -116,21 +82,9 @@ func generationRowCounts(t *testing.T, store *Store, generationID int64) (nodes,
 	return nodes, edges
 }
 
-type generationArm struct {
-	payloadFrames int
-	finalFrames   int
-	payloadBytes  int64
-	nodeRows      int64
-	edgeRows      int64
-}
-
-// writeGenerationPayload runs one arm of the write-shape comparison: the same
-// payload into the same empty generation of an equally seeded store, once
-// through the ordinary incremental path and once inside a generation bulk
-// window. It reports the WAL the payload itself left (measured before either
-// arm finalizes anything) and the WAL the arm ends on.
-func writeGenerationPayload(t *testing.T, bulk bool, line, nNodes, nEdges int) generationArm {
-	t.Helper()
+func TestGenerationBulkLoadDefersTheAutomaticDrainToOneAtItsEnd(t *testing.T) {
+	const line = 100
+	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", strconv.Itoa(line))
 	const generationID = int64(1)
 	path := filepath.Join(t.TempDir(), "generation.sqlite")
 	store, err := openPristine(t, path)
@@ -139,31 +93,26 @@ func writeGenerationPayload(t *testing.T, bulk bool, line, nNodes, nEdges int) g
 	}
 	defer func() { _ = store.Close() }()
 	pageSize := pragmaIntDB(t, store.db, "page_size")
-
-	// Generation 0 has to exist, or the cold fast path would engage on the
-	// payload below and the two arms would not be the same measurement.
 	baseNodes, baseEdges := bulkFixture(512, 1024)
 	store.AddBatch(baseNodes, baseEdges)
 	if err := store.CheckpointWAL(); err != nil {
 		t.Fatalf("drain the seed WAL: %v", err)
 	}
-	if got := walFileBytes(t, path); got != 0 {
-		t.Fatalf("the arm starts with a %d-byte WAL, so its growth is not its own", got)
+	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != 0 {
+		t.Fatalf("writer starts at wal_autocheckpoint=%d, want 0", got)
 	}
-
-	if bulk {
-		engaged, err := store.BeginGenerationBulkLoad(generationID)
-		if err != nil {
-			t.Fatalf("BeginGenerationBulkLoad: %v", err)
-		}
-		if !engaged {
-			t.Fatal("BeginGenerationBulkLoad declined an empty generation on a disk store")
-		}
+	engaged, err := store.BeginGenerationBulkLoad(generationID)
+	if err != nil || !engaged {
+		t.Fatalf("BeginGenerationBulkLoad = (%v, %v), want engaged", engaged, err)
 	}
-
-	handle := store.AtGeneration(generationID)
-	nodes, edges := bulkFixture(nNodes, nEdges)
+	defer func() { _ = store.EndGenerationBulkLoad() }()
+	if got, err := pragmaInt(context.Background(), store.bulkConn, "wal_autocheckpoint"); err != nil || got != 0 {
+		t.Fatalf("bulk writer wal_autocheckpoint = %d (err %v), want 0", got, err)
+	}
+	const nodeCount, edgeCount = 1200, 2400
+	nodes, edges := bulkFixture(nodeCount, edgeCount)
 	const nodeChunk, edgeChunk = 200, 400
+	handle := store.AtGeneration(generationID)
 	for i := 0; i < len(nodes); i += nodeChunk {
 		nodeEnd := min(i+nodeChunk, len(nodes))
 		edgeStart := min(i/nodeChunk*edgeChunk, len(edges))
@@ -172,481 +121,487 @@ func writeGenerationPayload(t *testing.T, bulk bool, line, nNodes, nEdges int) g
 			t.Fatalf("AddBatchChecked: %v", err)
 		}
 	}
-
-	arm := generationArm{
-		payloadFrames: walFileFrames(t, path, pageSize),
-		payloadBytes:  walFileBytes(t, path),
+	if frames := walFileFrames(t, path, pageSize); frames <= 5*line {
+		t.Fatalf("payload left only %d frames against %d-page line", frames, line)
 	}
-	if bulk {
-		if err := store.EndGenerationBulkLoad(); err != nil {
-			t.Fatalf("EndGenerationBulkLoad: %v", err)
-		}
-		waitForCondition(t, "the window's scheduled drain to take the WAL under the line", func() bool {
-			return walFileFrames(t, path, pageSize) <= line
-		})
+	requestsBefore := store.walDrainRequests.Load()
+	if err := store.EndGenerationBulkLoad(); err != nil {
+		t.Fatalf("EndGenerationBulkLoad: %v", err)
 	}
-	arm.finalFrames = walFileFrames(t, path, pageSize)
-	arm.nodeRows, arm.edgeRows = generationRowCounts(t, store, generationID)
-	return arm
-}
-
-// A generation payload written inside the window pays no automatic checkpoint
-// at all, and pays one bounded drain at the end instead.
-//
-// This is the half of the bulk shape that a window over a LIVE store can take,
-// and it is what the incremental path cannot do: with automatic checkpoints at
-// the production line, a payload larger than the line is interrupted by a full
-// log drain every time it crosses one — the same db pages copied out again and
-// again, mid-payload, charged to whoever happened to be writing. Inside the
-// window the log accumulates once and is drained once, by the lane, after the
-// payload is done.
-//
-// Revert-red, both directions: drop `PRAGMA wal_autocheckpoint = 0` from
-// BeginGenerationBulkLoad and the window's payload is drained mid-flight like
-// the incremental arm's; drop the residue gate from EndGenerationBulkLoad and
-// the accumulated log is never paid off at all.
-func TestGenerationBulkLoadDefersTheAutomaticDrainToOneAtItsEnd(t *testing.T) {
-	// The line, the batch and the payload are one shape, not three numbers: a
-	// batch has to be several times the line for the incremental arm to be
-	// drained inside it at all, and the payload has to be several batches for
-	// the window's accumulated log to clear the same 5x bar the incremental
-	// arm's single batch must stay under. They are scaled down together from
-	// the corpus's measured ~4 symbols and ~8 edges per file — the ratios that
-	// make the comparison, and every count below, are the same as at 30x this
-	// size, which costs half a minute of race-detector time to write.
-	const line = 100
-	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", strconv.Itoa(line))
-
-	const nodes, edges = 1200, 2400
-	incremental := writeGenerationPayload(t, false, line, nodes, edges)
-	bulked := writeGenerationPayload(t, true, line, nodes, edges)
-
-	t.Logf("generation payload WAL frames: incremental=%d (%d B) bulk=%d (%d B); final frames incremental=%d bulk=%d",
-		incremental.payloadFrames, incremental.payloadBytes,
-		bulked.payloadFrames, bulked.payloadBytes,
-		incremental.finalFrames, bulked.finalFrames)
-
-	if incremental.nodeRows != nodes || incremental.edgeRows == 0 {
-		t.Fatalf("incremental arm: generation 1 holds %d nodes / %d edges, want %d nodes and some edges", incremental.nodeRows, incremental.edgeRows, nodes)
+	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != 0 {
+		t.Fatalf("bulk end restored wal_autocheckpoint=%d, want 0", got)
 	}
-	if bulked.nodeRows != incremental.nodeRows || bulked.edgeRows != incremental.edgeRows {
-		t.Fatalf("the two shapes produced different payloads: bulk %d/%d, incremental %d/%d",
-			bulked.nodeRows, bulked.edgeRows, incremental.nodeRows, incremental.edgeRows)
+	if got := store.walDrainRequests.Load(); got != requestsBefore+1 {
+		t.Fatalf("bulk end posted %d drains, want one", got-requestsBefore)
 	}
-	// The incremental arm is SQLite's own behaviour and the control: a payload
-	// of thousands of frames never gets to hold more than a few times the line,
-	// because it is drained every time it crosses one.
-	if incremental.payloadFrames > 5*line {
-		t.Fatalf("fixture problem: the incremental arm held %d frames, so the %d-page line was not being enforced inside the payload", incremental.payloadFrames, line)
-	}
-	if bulked.payloadFrames <= 5*line {
-		t.Fatalf("the window held only %d frames against the incremental path's %d: its payload was drained mid-flight, which is the cost it exists to defer", bulked.payloadFrames, incremental.payloadFrames)
-	}
-	if bulked.finalFrames > line {
-		t.Fatalf("the window deferred its drain and then never paid it: %d frames left, line %d", bulked.finalFrames, line)
+	waitForCondition(t, "scheduled drain under line", func() bool { return store.walDrains.Load() > 0 && walFileFrames(t, path, pageSize) <= line })
+	nodeRows, edgeRows := generationRowCounts(t, store, generationID)
+	if nodeRows != nodeCount || edgeRows == 0 {
+		t.Fatalf("generation holds %d nodes/%d edges", nodeRows, edgeRows)
 	}
 }
 
-// The window's preconditions are refusals, not silent no-ops: a caller that
-// opened one over a populated or sealed generation would be writing a second
-// copy into rows somebody may already be reading.
 func TestGenerationBulkLoadRefusesWhatItCannotProveEmpty(t *testing.T) {
 	t.Run("generation zero", func(t *testing.T) {
 		store, _ := openTempStore(t)
 		engaged, err := store.BeginGenerationBulkLoad(baseViewGeneration)
 		if engaged || !errors.Is(err, ErrCatalogInvalidValue) {
-			t.Fatalf("BeginGenerationBulkLoad(0) = (%v, %v), want a refusal: generation 0 is the cold path's", engaged, err)
+			t.Fatalf("got (%v,%v)", engaged, err)
 		}
 	})
-
-	t.Run("a generation that already holds rows", func(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
 		store, _ := openTempStore(t)
 		nodes, edges := bulkFixture(64, 64)
 		store.AddBatch(nodes, edges)
 		store.AtGeneration(7).AddBatch(nodes, edges)
-
 		engaged, err := store.BeginGenerationBulkLoad(7)
 		if engaged || !errors.Is(err, ErrGenerationBulkLoadPopulated) {
-			t.Fatalf("BeginGenerationBulkLoad over a populated generation = (%v, %v), want ErrGenerationBulkLoadPopulated", engaged, err)
+			t.Fatalf("got (%v,%v)", engaged, err)
 		}
 		if store.bulkConn != nil {
-			t.Fatal("a refused window left the writer connection pinned")
+			t.Fatal("refused window pinned writer")
 		}
-		// An empty sibling generation is still admitted, so the refusal is
-		// scoped to the generation and not to the store having any rows at all.
 		engaged, err = store.BeginGenerationBulkLoad(8)
 		if err != nil || !engaged {
-			t.Fatalf("BeginGenerationBulkLoad over an empty sibling = (%v, %v), want it engaged", engaged, err)
+			t.Fatalf("sibling got (%v,%v)", engaged, err)
 		}
 		if err := store.EndGenerationBulkLoad(); err != nil {
-			t.Fatalf("EndGenerationBulkLoad: %v", err)
+			t.Fatal(err)
 		}
 	})
-
-	t.Run("a published generation", func(t *testing.T) {
+	t.Run("published", func(t *testing.T) {
 		store := openCatalogStore(t)
 		ctx := context.Background()
-		generationID, handle, err := store.BeginPayloadGeneration(ctx, PayloadGenerationRequest{
-			OwnerKind: "ref_view", GraphID: "graph-bulk", LayerID: "layer-bulk",
-			GenerationKind: "commit", TreeOID: "tree-bulk", CreatedAt: 10,
-		})
+		id, handle, err := store.BeginPayloadGeneration(ctx, PayloadGenerationRequest{OwnerKind: "ref_view", GraphID: "graph-bulk", LayerID: "layer-bulk", GenerationKind: "commit", TreeOID: "tree-bulk", CreatedAt: 10})
 		if err != nil {
-			t.Fatalf("BeginPayloadGeneration: %v", err)
+			t.Fatal(err)
 		}
-		for _, row := range []ProducerCompleteness{
-			{Producer: "source.snapshot", State: ProducerStateComplete},
-			{Producer: "graph.syntax", State: ProducerStateComplete},
-		} {
+		for _, row := range []ProducerCompleteness{{Producer: "source.snapshot", State: ProducerStateComplete}, {Producer: "graph.syntax", State: ProducerStateComplete}} {
 			if err := handle.SetProducerState(row); err != nil {
-				t.Fatalf("SetProducerState %s: %v", row.Producer, err)
+				t.Fatal(err)
 			}
 		}
-		if err := store.PublishPayloadGeneration(ctx, generationID, 20); err != nil {
-			t.Fatalf("PublishPayloadGeneration: %v", err)
+		if err := store.PublishPayloadGeneration(ctx, id, 20); err != nil {
+			t.Fatal(err)
 		}
-
-		engaged, err := store.BeginGenerationBulkLoad(generationID)
+		engaged, err := store.BeginGenerationBulkLoad(id)
 		if engaged || !errors.Is(err, ErrPayloadGenerationSealed) {
-			t.Fatalf("BeginGenerationBulkLoad over a published generation = (%v, %v), want ErrPayloadGenerationSealed", engaged, err)
+			t.Fatalf("got (%v,%v)", engaged, err)
 		}
 	})
-
-	t.Run("while another bulk window owns the connection", func(t *testing.T) {
+	t.Run("outer owner", func(t *testing.T) {
 		store, _ := openTempStore(t)
 		if !store.BeginCoordinatedBulkLoad() {
-			t.Fatal("the coordinated cold window did not engage on a fresh store")
+			t.Fatal("cold window declined")
 		}
 		engaged, err := store.BeginGenerationBulkLoad(3)
 		if engaged || err != nil {
-			t.Fatalf("BeginGenerationBulkLoad inside a cold window = (%v, %v), want it declined without an error", engaged, err)
+			t.Fatalf("got (%v,%v)", engaged, err)
 		}
 		if !store.coordinatedBulkLoad || store.bulkConn == nil {
-			t.Fatal("the declined window disturbed the cold load it declined to join")
+			t.Fatal("disturbed outer")
 		}
 		if err := store.EndCoordinatedBulkLoad(); err != nil {
-			t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+			t.Fatal(err)
 		}
 	})
 }
 
-// What the window must NOT do is what the cold path does: generation 0's
-// readers are live underneath it, so the dense secondary indexes stay in the
-// schema, durability stays where it was, and reads keep being served for the
-// whole window.
 func TestGenerationBulkLoadLeavesBaseReadersAndIndexesAlone(t *testing.T) {
 	store, _ := openTempStore(t)
 	baseNodes, baseEdges := bulkFixture(256, 512)
 	store.AddBatch(baseNodes, baseEdges)
 	probe := baseNodes[7].ID
-
 	before := indexNames(t, store.db)
 	syncBefore := pragmaIntDB(t, store.writerDB, "synchronous")
 	cacheBefore := pragmaIntDB(t, store.writerDB, "cache_size")
 	autoBefore := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint")
-
 	engaged, err := store.BeginGenerationBulkLoad(4)
 	if err != nil || !engaged {
-		t.Fatalf("BeginGenerationBulkLoad = (%v, %v), want it engaged", engaged, err)
+		t.Fatalf("got (%v,%v)", engaged, err)
 	}
-
 	for _, idx := range bulkDroppableIndexes {
 		if !before[idx.name] {
-			t.Fatalf("fixture problem: %s was not in the schema before the window", idx.name)
+			t.Fatalf("missing %s", idx.name)
 		}
 	}
 	during := indexNames(t, store.db)
 	for _, idx := range bulkDroppableIndexes {
 		if !during[idx.name] {
-			t.Fatalf("the generation window dropped %s, blinding every generation-0 reader for its length", idx.name)
+			t.Fatalf("dropped %s", idx.name)
 		}
 	}
-	// Probed on the pinned connection itself: the pooled writer has exactly
-	// one physical connection and the window holds it, so asking the pool
-	// would deadlock rather than answer.
 	ctx := context.Background()
 	if got, err := pragmaInt(ctx, store.bulkConn, "synchronous"); err != nil || got != syncBefore {
-		t.Fatalf("the pinned connection runs at synchronous=%d (err %v), want the store's %d: a window over a populated store may not trade durability", got, err, syncBefore)
+		t.Fatalf("sync=%d err=%v want%d", got, err, syncBefore)
 	}
 	if got, err := pragmaInt(ctx, store.bulkConn, "cache_size"); err != nil || got != bulkCacheSizeKiB {
-		t.Fatalf("the pinned connection runs at cache_size=%d (err %v), want %d: the cache is the whole win", got, err, bulkCacheSizeKiB)
+		t.Fatalf("cache=%d err=%v", got, err)
 	}
-
-	// Generation 0 keeps being served while the window writes generation 4.
-	if node := store.GetNode(probe); node == nil {
-		t.Fatalf("a generation-0 read returned nothing while the window was open: %s", probe)
+	if store.GetNode(probe) == nil {
+		t.Fatal("base read failed")
 	}
-	const payloadNodeCount, payloadEdgeCount = 512, 1024
-	payloadNodes, payloadEdges := bulkFixture(payloadNodeCount, payloadEdgeCount)
+	payloadNodes, payloadEdges := bulkFixture(512, 1024)
 	if err := store.AtGeneration(4).AddBatchChecked(payloadNodes, payloadEdges); err != nil {
-		t.Fatalf("AddBatchChecked inside the window: %v", err)
+		t.Fatal(err)
 	}
-	if node := store.GetNode(probe); node == nil {
-		t.Fatalf("a generation-0 read returned nothing after the window wrote its payload: %s", probe)
+	if store.GetNode(probe) == nil {
+		t.Fatal("base read failed after write")
 	}
-
 	if err := store.EndGenerationBulkLoad(); err != nil {
-		t.Fatalf("EndGenerationBulkLoad: %v", err)
+		t.Fatal(err)
 	}
 	if store.bulkConn != nil || store.generationBulkLoad != 0 {
-		t.Fatal("the window stayed open past its end")
+		t.Fatal("window stayed open")
 	}
 	if got := pragmaIntDB(t, store.writerDB, "synchronous"); got != syncBefore {
-		t.Fatalf("synchronous = %d after the window, want %d", got, syncBefore)
+		t.Fatalf("sync=%d", got)
 	}
 	if got := pragmaIntDB(t, store.writerDB, "cache_size"); got != cacheBefore {
-		t.Fatalf("cache_size = %d after the window, want %d", got, cacheBefore)
+		t.Fatalf("cache=%d", got)
 	}
 	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != autoBefore {
-		t.Fatalf("wal_autocheckpoint = %d after the window, want %d", got, autoBefore)
+		t.Fatalf("auto=%d", got)
 	}
 	after := indexNames(t, store.db)
 	for name := range before {
 		if !after[name] {
-			t.Fatalf("index %s did not survive the window", name)
+			t.Fatalf("lost %s", name)
 		}
 	}
 	nodes, edges := generationRowCounts(t, store, 4)
-	if nodes != payloadNodeCount || edges == 0 {
-		t.Fatalf("generation 4 holds %d nodes / %d edges after the window", nodes, edges)
-	}
-	if node := store.GetNode(probe); node == nil {
-		t.Fatalf("a generation-0 read returned nothing after the window closed: %s", probe)
+	if nodes != 512 || edges == 0 {
+		t.Fatalf("rows %d/%d", nodes, edges)
 	}
 	integrityOK(t, store.db)
 }
 
-// The window is idempotent at its end and inert when it never opened, so a
-// deferred EndGenerationBulkLoad is always safe.
 func TestEndGenerationBulkLoadIsInertWithoutAWindow(t *testing.T) {
 	store, _ := openTempStore(t)
 	if err := store.EndGenerationBulkLoad(); err != nil {
-		t.Fatalf("EndGenerationBulkLoad with no window: %v", err)
+		t.Fatal(err)
 	}
 	engaged, err := store.BeginGenerationBulkLoad(2)
 	if err != nil || !engaged {
-		t.Fatalf("BeginGenerationBulkLoad = (%v, %v), want it engaged", engaged, err)
+		t.Fatalf("got(%v,%v)", engaged, err)
 	}
 	if err := store.EndGenerationBulkLoad(); err != nil {
-		t.Fatalf("EndGenerationBulkLoad: %v", err)
+		t.Fatal(err)
 	}
 	if err := store.EndGenerationBulkLoad(); err != nil {
-		t.Fatalf("a second EndGenerationBulkLoad: %v", err)
+		t.Fatal(err)
 	}
 }
 
-// GenerationBulkLoadShape is evidence, not a restatement.
-//
-// It is the only door a caller a package away has onto "the write is in the
-// bulk shape", as distinct from "a window is open" — the startup wiring test in
-// internal/indexer asserts the production build's PRAGMAs entirely through it.
-// Those assertions are worth exactly as much as this property: a getter that
-// echoed what BeginGenerationBulkLoad ASKED for would satisfy them while the
-// pinned connection sat in any shape at all.
-//
-// So the test puts the shape back the way a foreign caller would, on the
-// store's own pinned connection, and requires the getter to report the new
-// values. It also requires the closed-window answer to be a decline rather than
-// a zero pair, because a caller cannot tell those apart from the values alone.
 func TestGenerationBulkLoadShapeReadsTheConnectionBack(t *testing.T) {
 	store, _ := openTempStore(t)
 	ctx := context.Background()
-
-	if cacheSize, autoCheckpoint, ok := store.GenerationBulkLoadShape(); ok {
-		t.Fatalf("GenerationBulkLoadShape = (%d, %d, true) with no window open, want a decline", cacheSize, autoCheckpoint)
+	if _, _, ok := store.GenerationBulkLoadShape(); ok {
+		t.Fatal("shape active")
 	}
-
 	engaged, err := store.BeginGenerationBulkLoad(3)
 	if err != nil || !engaged {
-		t.Fatalf("BeginGenerationBulkLoad = (%v, %v), want it engaged", engaged, err)
+		t.Fatal(err)
 	}
 	defer func() { _ = store.EndGenerationBulkLoad() }()
-
-	cacheSize, autoCheckpoint, ok := store.GenerationBulkLoadShape()
-	if !ok || cacheSize != bulkCacheSizeKiB || autoCheckpoint != 0 {
-		t.Fatalf("a fresh window reports (%d, %d, %v), want (%d, 0, true)", cacheSize, autoCheckpoint, ok, bulkCacheSizeKiB)
+	cacheSize, auto, ok := store.GenerationBulkLoadShape()
+	if !ok || cacheSize != bulkCacheSizeKiB || auto != 0 {
+		t.Fatalf("shape %d/%d/%v", cacheSize, auto, ok)
 	}
-
-	// A foreign caller puts the shape back on the very connection the window
-	// pinned. Neither value is one BeginGenerationBulkLoad ever asks for, so an
-	// echoing getter cannot answer with them by accident.
-	const foreignCacheSize = -2048
-	const foreignAutoCheckpoint = 977
 	store.writeMu.Lock()
 	conn := store.bulkConn
 	if conn == nil {
 		store.writeMu.Unlock()
-		t.Fatal("the window engaged without pinning a connection")
+		t.Fatal("no conn")
 	}
-	_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", foreignCacheSize))
-	_, checkpointErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", foreignAutoCheckpoint))
+	_, e1 := conn.ExecContext(ctx, "PRAGMA cache_size=-2048")
+	_, e2 := conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint=977")
 	store.writeMu.Unlock()
-	if cacheErr != nil || checkpointErr != nil {
-		t.Fatalf("put the shape back: cache_size=%v wal_autocheckpoint=%v", cacheErr, checkpointErr)
+	if e1 != nil || e2 != nil {
+		t.Fatalf("%v/%v", e1, e2)
 	}
-
-	cacheSize, autoCheckpoint, ok = store.GenerationBulkLoadShape()
-	if !ok {
-		t.Fatal("GenerationBulkLoadShape declined while the window is still open")
+	cacheSize, auto, ok = store.GenerationBulkLoadShape()
+	if !ok || cacheSize != -2048 || auto != 977 {
+		t.Fatalf("shape %d/%d/%v", cacheSize, auto, ok)
 	}
-	if cacheSize != foreignCacheSize || autoCheckpoint != foreignAutoCheckpoint {
-		t.Fatalf("GenerationBulkLoadShape = (%d, %d), want the connection's own (%d, %d): the getter must read "+
-			"the PRAGMAs back off the pinned writer rather than echo what BeginGenerationBulkLoad asked for — "+
-			"otherwise every PRAGMA assertion made through it, including the production startup wiring test's, "+
-			"is asserting a constant",
-			cacheSize, autoCheckpoint, foreignCacheSize, foreignAutoCheckpoint)
-	}
-
 	if err := store.EndGenerationBulkLoad(); err != nil {
-		t.Fatalf("EndGenerationBulkLoad: %v", err)
+		t.Fatal(err)
 	}
-	if cacheSize, autoCheckpoint, ok := store.GenerationBulkLoadShape(); ok {
-		t.Fatalf("GenerationBulkLoadShape = (%d, %d, true) after the window closed, want a decline", cacheSize, autoCheckpoint)
+	if _, _, ok := store.GenerationBulkLoadShape(); ok {
+		t.Fatal("shape active after end")
 	}
 }
 
-// An in-memory store has no WAL and no on-disk B-tree pressure to spare, so the
-// window declines rather than pinning a connection it cannot help.
 func TestGenerationBulkLoadInMemoryIsNoOp(t *testing.T) {
 	store, err := Open(":memory:")
 	if err != nil {
-		t.Fatalf("open in-memory: %v", err)
+		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
 	engaged, err := store.BeginGenerationBulkLoad(1)
 	if engaged || err != nil {
-		t.Fatalf("BeginGenerationBulkLoad on an in-memory store = (%v, %v), want a quiet decline", engaged, err)
+		t.Fatalf("got(%v,%v)", engaged, err)
 	}
 }
 
-// The auto-checkpoint line is one number in two places — the writer DSN's
-// PRAGMA and the residue gate's threshold — and an override has to move both,
-// or a measurement that toggles the class would only toggle half of it.
 func TestWALAutoCheckpointPagesIsOperatorTunable(t *testing.T) {
 	if got := sqliteWALAutoCheckpointPages(); got != defaultSQLiteWALAutoCheckpointPages {
-		t.Fatalf("unset = %d, want the %d default", got, defaultSQLiteWALAutoCheckpointPages)
+		t.Fatalf("default = %d, want %d", got, defaultSQLiteWALAutoCheckpointPages)
 	}
 	for _, bad := range []string{"not-a-number", "-4", "  "} {
 		t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", bad)
 		if got := sqliteWALAutoCheckpointPages(); got != defaultSQLiteWALAutoCheckpointPages {
-			t.Fatalf("%q = %d, want the default: bad input must fail open", bad, got)
+			t.Fatalf("bad %q = %d, want default", bad, got)
 		}
 	}
-
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "128")
 	if got := sqliteWALAutoCheckpointPages(); got != 128 {
 		t.Fatalf("override = %d, want 128", got)
 	}
-	if dsn := sqliteWriterDSN("/tmp/x.sqlite"); !strings.Contains(dsn, "wal_autocheckpoint(128)") {
-		t.Fatalf("the writer DSN did not carry the override: %s", dsn)
+	if dsn := sqliteWriterDSN("/tmp/x.sqlite"); !strings.Contains(dsn, "wal_autocheckpoint(0)") || strings.Contains(dsn, "wal_autocheckpoint(128)") {
+		t.Fatalf("writer DSN did not keep SQLite commit hook disabled: %s", dsn)
 	}
-	store, _ := openTempStore(t)
-	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != 128 {
-		t.Fatalf("a store opened under the override runs at wal_autocheckpoint=%d, want 128", got)
+	store, path := openTempStore(t)
+	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != 0 {
+		t.Fatalf("writer wal_autocheckpoint = %d, want 0", got)
 	}
-
+	pageSize := int64(pragmaIntDB(t, store.db, "page_size"))
+	walPath, threshold := sqliteWALPressureTarget(store.db, path, 128)
+	resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("resolve store directory: %v", err)
+	}
+	wantWALPath := filepath.Join(resolvedDir, filepath.Base(path)) + "-wal"
+	if walPath != wantWALPath {
+		t.Fatalf("pressure WAL path = %q, want resolved path %q", walPath, wantWALPath)
+	}
+	if want := int64(32) + 128*(pageSize+24); threshold != want {
+		t.Fatalf("pressure threshold = %d, want %d", threshold, want)
+	}
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "0")
 	if got := sqliteWALAutoCheckpointPages(); got != 0 {
-		t.Fatalf("explicit 0 = %d: disabling automatic checkpoints is a legitimate mode", got)
+		t.Fatalf("explicit zero = %d, want 0", got)
+	}
+	if _, threshold := sqliteWALPressureTarget(store.db, path, 0); threshold != 0 {
+		t.Fatalf("disabled pressure threshold = %d, want 0", threshold)
 	}
 }
 
-// coldLoadOverAHeldSnapshot runs a cold coordinated load whose finalize cannot
-// drain, because a read snapshot older than every frame is held for the whole
-// window. That is the production shape the residue measurement came from: the
-// finalize's PASSIVE explicitly does not wait for readers, and a queryable
-// daemon has them.
+func TestSQLiteWALFallbackPathSupportsFileURIs(t *testing.T) {
+	plain := filepath.Join(t.TempDir(), "plain.sqlite")
+	absolute := filepath.Join(t.TempDir(), "space # question ?.sqlite")
+	absoluteURI := sqliteDSN(absolute, "mode=rwc")
+	localhostURI := strings.Replace(absoluteURI, "file://", "file://localhost", 1)
+	cases := []struct{ name, input, want string }{{"plain", plain, plain}, {"absolute escaped", absoluteURI, absolute}, {"relative opaque", "file:relative%20store.sqlite?mode=rwc", filepath.FromSlash("relative store.sqlite")}, {"localhost", localhostURI, absolute}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sqliteWALFallbackPath(tc.input); got != tc.want {
+				t.Fatalf("got%q want%q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWALCheckpointSchedulePressureAndRetryPolicy(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "store.sqlite-wal")
+	if err := os.WriteFile(walPath, make([]byte, 256), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(100, 0)
+	t.Run("incomplete", func(t *testing.T) {
+		s := newWALCheckpointSchedule(now, time.Hour, 64)
+		calls := 0
+		if retry := s.attempt(now, walPath, func() (bool, bool) { calls++; return false, true }); !retry {
+			t.Fatal("no retry")
+		}
+		completed := now.Add(time.Second)
+		if retry := s.attempt(completed, walPath, func() (bool, bool) { calls++; return true, false }); retry {
+			t.Fatal("retry complete")
+		}
+		s.attempt(completed.Add(5*time.Second), walPath, func() (bool, bool) { calls++; return true, false })
+		if calls != 2 {
+			t.Fatalf("early calls%d", calls)
+		}
+		s.attempt(completed.Add(walPressureUnchangedRecheck), walPath, func() (bool, bool) { calls++; return true, false })
+		if calls != 3 {
+			t.Fatalf("aged calls%d", calls)
+		}
+	})
+	t.Run("permanent", func(t *testing.T) {
+		s := newWALCheckpointSchedule(now, time.Minute, 64)
+		calls := 0
+		s.attempt(now, walPath, func() (bool, bool) { calls++; return false, false })
+		if err := os.WriteFile(walPath, make([]byte, 512), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s.attempt(now.Add(5*time.Second), walPath, func() (bool, bool) { calls++; return true, false })
+		if calls != 1 {
+			t.Fatalf("early%d", calls)
+		}
+		s.attempt(now.Add(time.Minute), walPath, func() (bool, bool) { calls++; return true, false })
+		if calls != 2 {
+			t.Fatalf("late%d", calls)
+		}
+	})
+	t.Run("periodic below line", func(t *testing.T) {
+		s := newWALCheckpointSchedule(now, 10*time.Second, 1024)
+		calls := 0
+		if retry := s.attempt(now.Add(10*time.Second), walPath, func() (bool, bool) { calls++; return false, true }); !retry {
+			t.Fatal("no retry")
+		}
+		s.attempt(now.Add(11*time.Second), walPath, func() (bool, bool) { calls++; return true, false })
+		if calls != 2 {
+			t.Fatalf("calls%d", calls)
+		}
+	})
+}
+
+func TestPassiveCheckpointRetriesWALPinnedByReader(t *testing.T) {
+	store, path := openTempStore(t)
+	base, _ := bulkFixture(128, 0)
+	store.AddBatch(base, nil)
+	if err := store.CheckpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	release := holdAReadSnapshot(t, store)
+	payload, _ := bulkFixture(2048, 0)
+	if err := store.AtGeneration(1).AddBatchChecked(payload, nil); err != nil {
+		t.Fatal(err)
+	}
+	if walFileBytes(t, path) == 0 {
+		t.Fatal("no WAL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := store.writerDB.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, checkpointErr := checkpointWALOnceOn(ctx, conn, "PASSIVE")
+	_ = conn.Close()
+	if result.Busy != 0 || result.CheckpointedFrames >= result.WALFrames || !errors.Is(checkpointErr, errSQLiteCheckpointIncomplete) {
+		t.Fatalf("result%+v err%v", result, checkpointErr)
+	}
+	if complete, retry := store.checkpointWALPassiveOutcome(); complete || !retry {
+		t.Fatalf("pinned %v/%v", complete, retry)
+	}
+	release()
+	if complete, retry := store.checkpointWALPassiveOutcome(); !complete || retry {
+		t.Fatalf("released %v/%v", complete, retry)
+	}
+}
+
+func TestCheckpointLoopStartupProbeCannotBlockClose(t *testing.T) {
+	physical := filepath.Join(t.TempDir(), "startup space # question ?.sqlite")
+	uri := sqliteDSN(physical, "mode=rwc")
+	store, err := Open(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.stopCheckpointLoop()
+	ctx := context.Background()
+	connections := make([]*sql.Conn, 0, sqliteMaxOpenConns)
+	for range sqliteMaxOpenConns {
+		conn, err := store.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, conn)
+	}
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			for _, conn := range connections {
+				_ = conn.Close()
+			}
+		})
+	}
+	defer release()
+	store.stopOnce = sync.Once{}
+	store.stopCheckpoint = make(chan struct{})
+	store.checkpointDone = make(chan struct{})
+	waits := store.db.Stats().WaitCount
+	go store.runCheckpointLoop(time.Hour)
+	waitForCondition(t, "startup probe wait", func() bool { return store.db.Stats().WaitCount > waits })
+	closed := make(chan error, 1)
+	started := time.Now()
+	go func() { closed <- store.Close() }()
+	deadline := walPassiveCheckpointTimeout + walPassiveCheckpointTimeout/2
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+		if elapsed := time.Since(started); elapsed >= deadline {
+			t.Fatalf("elapsed%v", elapsed)
+		}
+	case <-time.After(deadline):
+		release()
+		select {
+		case <-closed:
+		case <-time.After(2 * walPassiveCheckpointTimeout):
+		}
+		t.Fatalf("Close exceeded%v", deadline)
+	}
+}
+
 func coldLoadOverAHeldSnapshot(t *testing.T, store *Store, path string, pageSize int64) (release func(), frames int) {
 	t.Helper()
-	// The snapshot is taken before the load, which is what makes it older than
-	// every frame the load writes: a reader on the WAL's first read mark holds
-	// the lock backfill needs, so the finalize's PASSIVE copies nothing.
 	release = holdAReadSnapshot(t, store)
-
 	if !store.BeginCoordinatedBulkLoad() {
-		t.Fatal("the coordinated cold window did not engage on a fresh store")
+		t.Fatal("declined")
 	}
-	// Several batches, each several times the 64-page line this case runs at,
-	// so the load leaves a log far above it while the held snapshot keeps the
-	// finalize's PASSIVE from copying any of it back.
 	nodes, edges := bulkFixture(1200, 2400)
-	const chunk = 200
-	for i := 0; i < len(nodes); i += chunk {
-		end := min(i+chunk, len(nodes))
+	for i := 0; i < len(nodes); i += 200 {
+		end := min(i+200, len(nodes))
 		if err := store.AddBatchChecked(nodes[i:end], nil); err != nil {
-			t.Fatalf("AddBatchChecked: %v", err)
+			t.Fatal(err)
 		}
 	}
 	if err := store.AddBatchChecked(nil, edges); err != nil {
-		t.Fatalf("AddBatchChecked(edges): %v", err)
+		t.Fatal(err)
 	}
 	if err := store.EndCoordinatedBulkLoad(); err != nil {
-		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+		t.Fatal(err)
 	}
 	return release, walFileFrames(t, path, pageSize)
 }
 
-// After a cold load the daemon must not be carrying a log above the line its
-// own automatic checkpoint fires at. The finalize measures what its bounded
-// PASSIVE left behind and owes the maintenance lane one bounded TRUNCATE; the
-// lane runs it once the readers that made the PASSIVE incomplete have left.
-//
-// Revert-red: drop scheduleWALDrainAboveLine from the finalize and the frames
-// stay where the finalize left them — nothing else in an idle store drains
-// them, which is exactly the residue the next phase inherits.
 func TestColdLoadFinalizeDrainsTheWALResidue(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "64")
 	store, path := openTempStore(t)
 	pageSize := pragmaIntDB(t, store.db, "page_size")
-
 	release, frames := coldLoadOverAHeldSnapshot(t, store, path, pageSize)
 	if frames <= 64 {
-		t.Fatalf("the cold load left %d frames, which is not above the %d-page line this case is about", frames, 64)
+		t.Fatalf("frames%d", frames)
 	}
-	if got := store.walDrainRequests.Load(); got == 0 {
-		t.Fatal("the finalize measured a residue above the line and owed no drain")
+	if store.walDrainRequests.Load() == 0 {
+		t.Fatal("no request")
 	}
-
-	// The readers leave; the drain the finalize scheduled takes the WAL back
-	// under the line without anybody writing again.
 	release()
-	// Both halves in one wait: the file is truncated inside the drain's PRAGMA
-	// and the counter is incremented after the job returns, so polling the two
-	// separately would race the gap between them rather than the drain.
-	waitForCondition(t, "the scheduled drain to complete and take the WAL under the auto-checkpoint line", func() bool {
-		return store.walDrains.Load() > 0 && walFileFrames(t, path, pageSize) <= 64
-	})
-	if got := walFileFrames(t, path, pageSize); got > 64 {
-		t.Fatalf("the drain completed and left %d frames, above the %d-page line", got, 64)
-	}
+	waitForCondition(t, "drain", func() bool { return store.walDrains.Load() > 0 && walFileFrames(t, path, pageSize) <= 64 })
 }
-
-// Below the line there is nothing to fix, and the gate says so: a finalize that
-// ends on a small log owes no follow-up drain at all. A gate that fired on every
-// finalize would put a whole-file TRUNCATE — and the pre-emption of the
-// statistics pass that comes with it — behind every cold load, however small.
 func TestFinalizeBelowTheLineOwesNoDrain(t *testing.T) {
 	store, path := openTempStore(t)
 	pageSize := pragmaIntDB(t, store.db, "page_size")
 	if !store.BeginCoordinatedBulkLoad() {
-		t.Fatal("the coordinated cold window did not engage on a fresh store")
+		t.Fatal("declined")
 	}
 	nodes, edges := bulkFixture(64, 64)
 	if err := store.AddBatchChecked(nodes, edges); err != nil {
-		t.Fatalf("AddBatchChecked: %v", err)
+		t.Fatal(err)
 	}
 	if err := store.EndCoordinatedBulkLoad(); err != nil {
-		t.Fatalf("EndCoordinatedBulkLoad: %v", err)
+		t.Fatal(err)
 	}
 	if frames := walFileFrames(t, path, pageSize); frames > defaultSQLiteWALAutoCheckpointPages {
-		t.Fatalf("fixture problem: a 64-row cold load left %d frames, which is above the line", frames)
+		t.Fatalf("frames%d", frames)
 	}
 	if got := store.walDrainRequests.Load(); got != 0 {
-		t.Fatalf("a finalize below the auto-checkpoint line owed %d drains, want none", got)
+		t.Fatalf("requests%d", got)
 	}
 }
 
-// The drain is scheduled rather than run inline precisely so it costs a reader
-// nothing: it holds the write gate and the lane token, never the read pool.
 func TestScheduledWALDrainNeverBlocksAReader(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "64")
 	store, path := openTempStore(t)
@@ -654,97 +609,81 @@ func TestScheduledWALDrainNeverBlocksAReader(t *testing.T) {
 	nodes, _ := bulkFixture(2048, 0)
 	store.AddBatch(nodes, nil)
 	probe := nodes[11].ID
-
 	stop := make(chan struct{})
+	ready := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
 		reads := 0
 		for {
 			select {
 			case <-stop:
-				if reads == 0 {
-					done <- errors.New("the reader never ran")
-					return
-				}
 				done <- nil
 				return
 			default:
 			}
-			if node := store.GetNode(probe); node == nil {
-				done <- fmt.Errorf("a read was refused during the drain after %d reads", reads)
+			if store.GetNode(probe) == nil {
+				done <- fmt.Errorf("read failed after%d", reads)
 				return
 			}
 			reads++
+			if reads == 1 {
+				close(ready)
+			}
 		}
 	}()
-
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatal(err)
+	}
 	store.scheduleWALDrain("test")
-	waitForCondition(t, "the scheduled drain to complete", func() bool {
-		return store.walDrains.Load() > 0
-	})
+	waitForCondition(t, "drain", func() bool { return store.walDrains.Load() > 0 })
 	close(stop)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 	if got := walFileFrames(t, path, pageSize); got > 64 {
-		t.Fatalf("the drain completed but left %d frames", got)
+		t.Fatalf("frames%d", got)
 	}
-	// The worker parks on one slot that two different requests post to, so a
-	// wakeup carrying only a drain must not also spend an ANALYZE nobody asked
-	// for.
 	if got := store.maintenancePasses.Load(); got != 0 {
-		t.Fatalf("a drain-only wakeup started %d planner-statistics passes", got)
+		t.Fatalf("passes%d", got)
 	}
 }
 
-// A drain that cannot get past a reader inside its bounded attempts is a
-// deferral, not a loss: the store is untouched, the counters record the
-// difference between what was requested and what ran, and the next finalize
-// asks again.
 func TestScheduledWALDrainDefersRatherThanWaitingForever(t *testing.T) {
 	oldAttempts, oldDelay := walDrainAttempts, walDrainRetryDelay
 	walDrainAttempts, walDrainRetryDelay = 2, time.Millisecond
 	t.Cleanup(func() { walDrainAttempts, walDrainRetryDelay = oldAttempts, oldDelay })
 	shortenMaintenanceBudget(t, 50*time.Millisecond)
-
 	store, _ := openTempStore(t)
 	nodes, _ := bulkFixture(64, 0)
 	store.AddBatch(nodes, nil)
-
-	// Hold the lane against the drain, so every attempt it makes is refused
-	// inside a bounded budget instead of parking on the token.
 	if err := store.maintenanceGate.LockContext(context.Background()); err != nil {
-		t.Fatalf("hold the lane: %v", err)
+		t.Fatal(err)
 	}
 	store.scheduleWALDrain("test")
-	waitForCondition(t, "the drain to give up its attempts", func() bool {
+	waitForCondition(t, "defer", func() bool {
 		store.maintenanceSched.Lock()
 		defer store.maintenanceSched.Unlock()
 		return !store.maintenanceDrainRunning && !store.maintenanceDrainOwed
 	})
 	store.maintenanceGate.Unlock()
-
-	if got := store.walDrains.Load(); got != 0 {
-		t.Fatalf("a drain that never got the lane counted %d completions", got)
+	if store.walDrains.Load() != 0 {
+		t.Fatal("drained")
 	}
-	if got := store.walDrainRequests.Load(); got != 1 {
-		t.Fatalf("walDrainRequests = %d, want the one request that deferred", got)
+	if store.walDrainRequests.Load() != 1 {
+		t.Fatal("requests")
 	}
-	if got := store.maintenanceDeferrals.Load(); got == 0 {
-		t.Fatal("a drain that could not enter the lane was not counted as a deferral")
+	if store.maintenanceDeferrals.Load() == 0 {
+		t.Fatal("no deferral")
 	}
 }
 
-// The lane's three occupants — the statistics pass, a TRUNCATE checkpoint and a
-// bulk window — are selected against each other by one token and one write
-// gate. Run them together under -race: the properties being pinned are that
-// nothing deadlocks, no state is torn, and every window that opened closed.
 func TestMaintenanceCheckpointAndBulkWindowsRaceSelection(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "64")
 	store, _ := openTempStore(t)
 	nodes, edges := bulkFixture(512, 512)
 	store.AddBatch(nodes, edges)
-
 	var wg sync.WaitGroup
 	const rounds = 12
 	wg.Add(4)
@@ -758,15 +697,15 @@ func TestMaintenanceCheckpointAndBulkWindowsRaceSelection(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := range rounds {
-			generationID := int64(200 + i)
-			engaged, err := store.BeginGenerationBulkLoad(generationID)
+			id := int64(200 + i)
+			engaged, err := store.BeginGenerationBulkLoad(id)
 			if err != nil || !engaged {
 				continue
 			}
 			payload, payloadEdges := bulkFixture(128, 128)
-			_ = store.AtGeneration(generationID).AddBatchChecked(payload, payloadEdges)
+			_ = store.AtGeneration(id).AddBatchChecked(payload, payloadEdges)
 			if err := store.EndGenerationBulkLoad(); err != nil {
-				t.Errorf("EndGenerationBulkLoad: %v", err)
+				t.Errorf("end:%v", err)
 				return
 			}
 		}
@@ -774,9 +713,8 @@ func TestMaintenanceCheckpointAndBulkWindowsRaceSelection(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range rounds {
-			if err := store.CheckpointWAL(); err != nil && !errors.Is(err, ErrMaintenanceBusy) &&
-				!errors.Is(err, errWALCheckpointDeferredBulk) && !errors.Is(err, errSQLiteCheckpointIncomplete) {
-				t.Errorf("CheckpointWAL: %v", err)
+			if err := store.CheckpointWAL(); err != nil && !errors.Is(err, ErrMaintenanceBusy) && !errors.Is(err, errWALCheckpointDeferredBulk) && !errors.Is(err, errSQLiteCheckpointIncomplete) {
+				t.Errorf("checkpoint:%v", err)
 				return
 			}
 		}
@@ -789,17 +727,182 @@ func TestMaintenanceCheckpointAndBulkWindowsRaceSelection(t *testing.T) {
 		}
 	}()
 	wg.Wait()
-
 	settleMaintenanceLane(t, store)
 	if store.bulkConn != nil || store.generationBulkLoad != 0 {
-		t.Fatal("a bulk window survived the run")
+		t.Fatal("window survived")
 	}
 	integrityOK(t, store.db)
 	var stray int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE view_gen = 0`).Scan(&stray); err != nil {
-		t.Fatalf("count base nodes: %v", err)
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE view_gen=0`).Scan(&stray); err != nil {
+		t.Fatal(err)
 	}
 	if stray != len(nodes) {
-		t.Fatalf("generation 0 holds %d nodes, want the %d it started with: a generation window wrote through the base", stray, len(nodes))
+		t.Fatalf("stray%d", stray)
+	}
+}
+
+func TestBackgroundWALCheckpointRunsOutsideWriterGate(t *testing.T) {
+	store, path := openTempStore(t)
+	nodes, _ := bulkFixture(1024, 0)
+	store.AddBatch(nodes, nil)
+	if walFileBytes(t, path) == 0 {
+		t.Fatal("fixture did not create WAL residue")
+	}
+
+	checkpointDB, err := sql.Open("sqlite", sqliteCheckpointDSN(path))
+	if err != nil {
+		t.Fatalf("open checkpoint pool: %v", err)
+	}
+	configureWriterPool(checkpointDB)
+	defer func() { _ = checkpointDB.Close() }()
+	if got := pragmaIntDB(t, checkpointDB, "wal_autocheckpoint"); got != 0 {
+		t.Fatalf("background checkpoint wal_autocheckpoint = %d, want 0", got)
+	}
+
+	type outcome struct {
+		complete bool
+		retry    bool
+	}
+	store.writeMu.Lock()
+	done := make(chan outcome, 1)
+	go func() {
+		complete, retry := store.checkpointWALPassiveBackgroundOutcome(checkpointDB)
+		done <- outcome{complete: complete, retry: retry}
+	}()
+	select {
+	case got := <-done:
+		store.writeMu.Unlock()
+		if !got.complete || got.retry {
+			t.Fatalf("checkpoint while writer gate held = %+v, want complete", got)
+		}
+	case <-time.After(2 * time.Second):
+		store.writeMu.Unlock()
+		t.Fatal("background checkpoint waited for the application writer gate")
+	}
+}
+
+func TestCheckpointLoopCleanupPrecedesDone(t *testing.T) {
+	store := &Store{storeCore: &storeCore{
+		stopCheckpoint: make(chan struct{}),
+		checkpointDone: make(chan struct{}),
+	}}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	cleaned := make(chan struct{})
+	var enteredOnce sync.Once
+	var stopOnce sync.Once
+	var releaseOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(store.stopCheckpoint) }) }
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		stop()
+		unblock()
+	})
+
+	go store.runCheckpointLoopWithAttemptAndCleanup(
+		time.Millisecond,
+		time.Millisecond,
+		time.Millisecond,
+		func() bool {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+			return false
+		},
+		func() { close(cleaned) },
+	)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint attempt did not start")
+	}
+	stop()
+	unblock()
+	select {
+	case <-store.checkpointDone:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint loop did not stop")
+	}
+	select {
+	case <-cleaned:
+	default:
+		t.Fatal("checkpointDone closed before the dedicated pool cleanup")
+	}
+}
+
+func TestBackgroundWALCheckpointFirstConnectHonorsShutdown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "first-connect.sqlite")
+	blocker, err := sql.Open("sqlite", sqliteWriterDSN(path))
+	if err != nil {
+		t.Fatalf("open blocker: %v", err)
+	}
+	configureWriterPool(blocker)
+	ctx := context.Background()
+	conn, err := blocker.Conn(ctx)
+	if err != nil {
+		_ = blocker.Close()
+		t.Fatalf("blocker connection: %v", err)
+	}
+	var released sync.Once
+	release := func() {
+		released.Do(func() {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			_ = conn.Close()
+			_ = blocker.Close()
+		})
+	}
+	t.Cleanup(release)
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS checkpoint_probe (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatalf("create blocker fixture: %v", err)
+	}
+	var lockingMode string
+	if err := conn.QueryRowContext(ctx, "PRAGMA locking_mode=EXCLUSIVE").Scan(&lockingMode); err != nil {
+		t.Fatalf("set exclusive locking mode: %v", err)
+	}
+	if lockingMode != "exclusive" {
+		t.Fatalf("locking mode = %q, want exclusive", lockingMode)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatalf("begin exclusive blocker: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "INSERT INTO checkpoint_probe DEFAULT VALUES"); err != nil {
+		t.Fatalf("write blocker fixture: %v", err)
+	}
+
+	checkpointDB, err := sql.Open("sqlite", sqliteCheckpointDSN(path))
+	if err != nil {
+		t.Fatalf("open lazy checkpoint pool: %v", err)
+	}
+	configureWriterPool(checkpointDB)
+	t.Cleanup(func() { _ = checkpointDB.Close() })
+	store := &Store{storeCore: &storeCore{stopCheckpoint: make(chan struct{})}}
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(store.stopCheckpoint) }) }
+	t.Cleanup(stop)
+
+	done := make(chan struct{}, 1)
+	go func() {
+		store.checkpointWALPassiveBackgroundOutcome(checkpointDB)
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+		t.Skip("supported SQLite DSN did not block first connection under the exclusive fixture")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	started := time.Now()
+	stop()
+	select {
+	case <-done:
+		if elapsed := time.Since(started); elapsed > walPassiveCheckpointTimeout {
+			t.Fatalf("first-connect cancellation took %v, want at most %v", elapsed, walPassiveCheckpointTimeout)
+		}
+	case <-time.After(walPassiveCheckpointTimeout):
+		release()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("shutdown did not cancel the checkpoint pool's first connection")
 	}
 }

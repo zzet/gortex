@@ -43,7 +43,29 @@ import (
 // mutation state of one open SQLite database. Exactly one storeCore exists
 // per Open; every Store handle over that database points at it, so they all
 // share the same pools, locks and caches.
+type generationBulkCheckpointLease uint64
+
+type backgroundCheckpointAttempt struct {
+	ctx           context.Context
+	cancel        context.CancelCauseFunc
+	timeoutCancel context.CancelFunc
+	done          chan struct{}
+	finishOnce    sync.Once
+}
+
+type backgroundCheckpointCoordination struct {
+	mu              sync.Mutex
+	nextLease       uint64
+	generationLease generationBulkCheckpointLease
+	boundGeneration int64
+	active          *backgroundCheckpointAttempt
+}
+
 type storeCore struct {
+	// backgroundCheckpoint coordinates the periodic PASSIVE worker with the
+	// generation-scoped bulk owner before either touches the physical writer.
+	// It lives on the shared core so every AtGeneration handle sees one token.
+	backgroundCheckpoint backgroundCheckpointCoordination
 	// db is the bounded, logically read-dedicated pool for on-disk stores.
 	// writerDB is a separate read-write pool capped at one physical connection. In-memory
 	// stores use the same max-one handle for both because independent
@@ -879,24 +901,369 @@ func (r walCheckpointResult) incomplete() bool {
 	return r.Busy != 0 || r.CheckpointedFrames < r.WALFrames
 }
 
+const sqliteCheckpointBusyTimeoutMillis = 100
+
+func sqliteCheckpointDSN(path string) string {
+	params := fmt.Sprintf("_pragma=busy_timeout(%d)&", sqliteCheckpointBusyTimeoutMillis) +
+		sqlitePerConnectionPragmas() +
+		"&_pragma=journal_size_limit(67108864)&_pragma=wal_autocheckpoint(0)"
+	return sqliteDSN(path, params)
+}
+
 // runCheckpointLoop attempts one non-blocking PASSIVE checkpoint per interval.
 // Transient deferrals retry on a bounded 1s..30s exponential cadence rather
 // than disappearing until the next five-minute tick. One reusable timer and
 // goroutine-local state prevent retry goroutine/timer storms.
+var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generation bulk checkpoint coordination")
+
+func (s *Store) beginBackgroundCheckpointAttempt() (*backgroundCheckpointAttempt, bool) {
+	// Let background PASSIVE finish so SQLite can record WAL backfill progress.
+	// Shutdown and generation bulk admission cancel the attempt explicitly.
+	base, timeoutCancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(base)
+	attempt := &backgroundCheckpointAttempt{
+		ctx:           ctx,
+		cancel:        cancel,
+		timeoutCancel: timeoutCancel,
+		done:          make(chan struct{}),
+	}
+
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	if coordination.generationLease != 0 || coordination.active != nil {
+		coordination.mu.Unlock()
+		cancel(errWALCheckpointDeferredBulk)
+		timeoutCancel()
+		return nil, false
+	}
+	coordination.active = attempt
+	coordination.mu.Unlock()
+
+	go func() {
+		select {
+		case <-s.stopCheckpoint:
+			cancel(context.Canceled)
+		case <-attempt.done:
+		}
+	}()
+	return attempt, true
+}
+
+func (s *Store) finishBackgroundCheckpointAttempt(attempt *backgroundCheckpointAttempt) {
+	if attempt == nil {
+		return
+	}
+	attempt.finishOnce.Do(func() {
+		attempt.timeoutCancel()
+		attempt.cancel(context.Canceled)
+
+		coordination := &s.backgroundCheckpoint
+		coordination.mu.Lock()
+		if coordination.active == attempt {
+			coordination.active = nil
+		}
+		coordination.mu.Unlock()
+		close(attempt.done)
+	})
+}
+
+func (s *Store) runBackgroundCheckpointAttempt(run func(context.Context) (complete, retry bool)) (complete, retry bool) {
+	attempt, ok := s.beginBackgroundCheckpointAttempt()
+	if !ok {
+		return false, true
+	}
+	defer s.finishBackgroundCheckpointAttempt(attempt)
+
+	complete, retry = run(attempt.ctx)
+	if errors.Is(context.Cause(attempt.ctx), errWALCheckpointDeferredBulk) {
+		return false, true
+	}
+	return complete, retry
+}
+
+func (s *Store) acquireGenerationBulkCheckpointLease() (generationBulkCheckpointLease, error) {
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	if coordination.generationLease != 0 {
+		coordination.mu.Unlock()
+		return 0, errGenerationBulkCheckpointCoordination
+	}
+	coordination.nextLease++
+	if coordination.nextLease == 0 {
+		coordination.nextLease++
+	}
+	lease := generationBulkCheckpointLease(coordination.nextLease)
+	coordination.generationLease = lease
+	attempt := coordination.active
+	if attempt != nil {
+		attempt.cancel(errWALCheckpointDeferredBulk)
+	}
+	coordination.mu.Unlock()
+
+	if attempt == nil {
+		return lease, nil
+	}
+	wait := s.passiveCheckpointWindow()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-attempt.done:
+		return lease, nil
+	case <-timer.C:
+		s.releaseGenerationBulkCheckpointLease(lease)
+		return 0, fmt.Errorf("%w: background PASSIVE did not stop within %s", errGenerationBulkCheckpointCoordination, wait)
+	}
+}
+
+func (s *Store) bindGenerationBulkCheckpointLease(lease generationBulkCheckpointLease, generationID int64) bool {
+	if lease == 0 || generationID <= 0 {
+		return false
+	}
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	if coordination.generationLease != lease || coordination.boundGeneration != 0 {
+		return false
+	}
+	coordination.boundGeneration = generationID
+	return true
+}
+
+func (s *Store) takeGenerationBulkCheckpointLease(generationID int64) generationBulkCheckpointLease {
+	if generationID <= 0 {
+		return 0
+	}
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	if coordination.boundGeneration != generationID {
+		return 0
+	}
+	lease := coordination.generationLease
+	coordination.boundGeneration = 0
+	return lease
+}
+
+func (s *Store) takeBoundGenerationBulkCheckpointLease() generationBulkCheckpointLease {
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	lease := coordination.generationLease
+	coordination.boundGeneration = 0
+	return lease
+}
+
+func (s *Store) releaseGenerationBulkCheckpointLease(lease generationBulkCheckpointLease) bool {
+	if lease == 0 {
+		return false
+	}
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	if coordination.generationLease != lease || coordination.boundGeneration != 0 {
+		return false
+	}
+	coordination.generationLease = 0
+	return true
+}
+
+func (s *Store) checkpointWALPassiveBackgroundOutcomeContext(ctx context.Context, db *sql.DB) (complete, retry bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := checkpointWALOnceOn(ctx, db, "PASSIVE")
+	ctxErr := ctx.Err()
+	if errors.Is(context.Cause(ctx), errWALCheckpointDeferredBulk) {
+		return false, true
+	}
+	if err == nil {
+		return true, false
+	}
+	select {
+	case <-s.stopCheckpoint:
+		return false, false
+	default:
+	}
+	log.Print(passiveCheckpointReport(result, err, ctxErr))
+	return false, shouldRetryPassiveCheckpoint(err, ctxErr)
+}
+
 func (s *Store) runCheckpointLoop(interval time.Duration) {
-	s.runCheckpointLoopWithAttempt(
-		interval,
+	walPath, pressureBytes := sqliteWALPressureTarget(s.db, s.dbPath, sqliteWALAutoCheckpointPages())
+	schedule := newWALCheckpointSchedule(time.Now(), interval, pressureBytes)
+	var checkpointDB *sql.DB
+	closeCheckpointDB := func() {
+		if checkpointDB == nil {
+			return
+		}
+		if err := checkpointDB.Close(); err != nil {
+			log.Printf("store_sqlite: close background WAL checkpoint pool: %v", err)
+		}
+	}
+	checkpoint := func() (complete, retry bool) {
+		return s.runBackgroundCheckpointAttempt(func(ctx context.Context) (bool, bool) {
+			if ctx.Err() != nil {
+				return false, true
+			}
+			if checkpointDB == nil {
+				db, err := sql.Open("sqlite", sqliteCheckpointDSN(s.dbPath))
+				if err != nil {
+					if ctx.Err() == nil {
+						log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=open error=%q", err)
+					}
+					return false, ctx.Err() != nil
+				}
+				configureWriterPool(db)
+				checkpointDB = db
+			}
+			return s.checkpointWALPassiveBackgroundOutcomeContext(ctx, checkpointDB)
+		})
+	}
+	s.runCheckpointLoopWithAttemptAndCleanup(
+		walPressurePollInterval,
 		walCheckpointRetryInitial,
 		walCheckpointRetryMax,
-		s.checkpointWALPassive,
+		func() bool {
+			return schedule.attempt(time.Now(), walPath, checkpoint)
+		},
+		closeCheckpointDB,
 	)
+}
+
+// checkpointWALPassiveBackgroundOutcome runs a periodic checkpoint on its own
+// connection pool. It deliberately does not take writeMu: PASSIVE may copy a
+// finite committed WAL snapshot while a writer appends later frames, and a
+// large copy must not hold the application's sole writer or write gate.
+// Shutdown is the only cancellation boundary so SQLite can durably advance
+// nBackfill instead of repeatedly abandoning the same copied prefix.
+func (s *Store) checkpointWALPassiveBackgroundOutcome(db *sql.DB) (complete, retry bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	queryDone := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-s.stopCheckpoint:
+			cancel()
+		case <-queryDone:
+		}
+	}()
+
+	result, err := checkpointWALOnceOn(ctx, db, "PASSIVE")
+	ctxErr := ctx.Err()
+	close(queryDone)
+	cancel()
+	<-watchDone
+	if err == nil {
+		return true, false
+	}
+	select {
+	case <-s.stopCheckpoint:
+		return false, false
+	default:
+	}
+	log.Print(passiveCheckpointReport(result, err, ctxErr))
+	return false, shouldRetryPassiveCheckpoint(err, ctxErr)
+}
+
+const (
+	walPressurePollInterval     = 5 * time.Second
+	walPressureUnchangedRecheck = 30 * time.Second
+)
+
+type walPressureGate struct {
+	thresholdBytes int64
+	last           sqliteWALFileState
+	lastValid      bool
+	lastComplete   time.Time
+	deferUntil     time.Time
+}
+
+func (g *walPressureGate) due(now time.Time, walPath string) bool {
+	if g.thresholdBytes <= 0 || now.Before(g.deferUntil) {
+		return false
+	}
+	state, found, err := readSQLiteWALFileState(walPath)
+	if err != nil {
+		// A stat failure must not turn pressure control off. The SQL attempt is
+		// context-bounded and its own result chooses prompt versus ordinary retry.
+		return true
+	}
+	if !found || state.size <= g.thresholdBytes {
+		g.last, g.lastValid = state, found
+		return false
+	}
+	return !g.lastValid || state != g.last || g.lastComplete.IsZero() || now.Sub(g.lastComplete) >= walPressureUnchangedRecheck
+}
+
+func (g *walPressureGate) markComplete(now time.Time, walPath string) {
+	state, found, err := readSQLiteWALFileState(walPath)
+	if err != nil {
+		g.lastValid = false
+	} else {
+		g.last, g.lastValid = state, found
+	}
+	g.lastComplete = now
+	g.deferUntil = time.Time{}
+}
+
+type walCheckpointSchedule struct {
+	gate         walPressureGate
+	interval     time.Duration
+	nextPeriodic time.Time
+}
+
+func newWALCheckpointSchedule(now time.Time, interval time.Duration, thresholdBytes int64) walCheckpointSchedule {
+	return walCheckpointSchedule{
+		gate:         walPressureGate{thresholdBytes: thresholdBytes},
+		interval:     interval,
+		nextPeriodic: now.Add(interval),
+	}
+}
+
+// attempt runs a checkpoint only at an ordinary periodic boundary or after the
+// WAL crosses its pressure line. An incomplete attempt never marks the file
+// snapshot, so a pinned reader gets the existing prompt exponential retry even
+// when the WAL's size and mtime do not change.
+func (s *walCheckpointSchedule) attempt(now time.Time, walPath string, checkpoint func() (complete, retry bool)) bool {
+	if now.Before(s.nextPeriodic) && !s.gate.due(now, walPath) {
+		return false
+	}
+	complete, retry := checkpoint()
+	if complete {
+		s.gate.markComplete(now, walPath)
+		s.nextPeriodic = now.Add(s.interval)
+		return false
+	}
+	if retry {
+		return true
+	}
+	// Permanent driver/I/O errors retain the historical ordinary interval;
+	// they neither mark an incomplete WAL as drained nor spin every poll.
+	next := now.Add(s.interval)
+	s.gate.deferUntil = next
+	s.nextPeriodic = next
+	return false
 }
 
 func (s *Store) runCheckpointLoopWithAttempt(
 	interval, retryInitial, retryMax time.Duration,
 	attempt func() bool,
 ) {
+	s.runCheckpointLoopWithAttemptAndCleanup(interval, retryInitial, retryMax, attempt, nil)
+}
+
+func (s *Store) runCheckpointLoopWithAttemptAndCleanup(
+	interval, retryInitial, retryMax time.Duration,
+	attempt func() bool,
+	cleanup func(),
+) {
 	defer close(s.checkpointDone)
+	if cleanup != nil {
+		// Registered after checkpointDone so LIFO defer order closes the
+		// checkpoint pool before Close may tear down the main pools.
+		defer cleanup()
+	}
 	if retryInitial <= 0 {
 		retryInitial = walCheckpointRetryInitial
 	}
@@ -912,7 +1279,7 @@ func (s *Store) runCheckpointLoopWithAttempt(
 			return
 		case <-timer.C:
 			// If shutdown and the timer become ready together, prefer shutdown
-			// before starting another bounded SQLite call.
+			// before starting another SQLite call.
 			select {
 			case <-s.stopCheckpoint:
 				return
@@ -952,14 +1319,21 @@ func (s *Store) passiveCheckpointWindow() time.Duration {
 // ordinary interval; contention, deadlines and measured incomplete drains do
 // not silently wait five minutes.
 func (s *Store) checkpointWALPassive() bool {
+	_, retry := s.checkpointWALPassiveOutcome()
+	return retry
+}
+
+// checkpointWALPassiveOutcome separates a complete drain from retry policy so
+// the pressure gate never treats a partial busy=0 checkpoint as serviced.
+func (s *Store) checkpointWALPassiveOutcome() (complete, retry bool) {
 	if !s.writeMu.TryLock() {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_gate")
-		return true
+		return false, true
 	}
 	defer s.writeMu.Unlock()
 	if s.bulkConn != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=bulk_writer")
-		return true
+		return false, true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
@@ -973,16 +1347,16 @@ func (s *Store) checkpointWALPassive() bool {
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy error=%q", err)
-		return shouldRetryPassiveCheckpoint(err, ctx.Err())
+		return false, shouldRetryPassiveCheckpoint(err, ctx.Err())
 	}
 	defer func() { _ = conn.Close() }()
 
 	result, err := checkpointWALOnceOn(ctx, conn, "PASSIVE")
 	if err == nil {
-		return false
+		return true, false
 	}
 	log.Print(passiveCheckpointReport(result, err, ctx.Err()))
-	return shouldRetryPassiveCheckpoint(err, ctx.Err())
+	return false, shouldRetryPassiveCheckpoint(err, ctx.Err())
 }
 
 func shouldRetryPassiveCheckpoint(err, ctxErr error) bool {
@@ -1166,7 +1540,12 @@ func (s *Store) Close() error {
 		sealErr := s.sealBulkIndexesLocked("close")
 		bulkErr = errors.Join(sealErr, s.closeBulkConnectionLocked())
 	}
+	// The periodic loop is already joined. Clear any bound or in-flight
+	// generation lease while writeMu still protects the physical bulk owner,
+	// then release its exact token outside the write gate.
+	generationLease := s.takeBoundGenerationBulkCheckpointLease()
 	s.writeMu.Unlock()
+	s.releaseGenerationBulkCheckpointLease(generationLease)
 
 	var checkpointErr error
 	if s.checkpointDone != nil { // on-disk store: drain the WAL one last time

@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -9,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -744,6 +747,417 @@ func privateSiteCrossJoinCandidateDigest(tb testing.TB, set graph.EdgeCandidateS
 	return privateEdgeSliceDigest(tb, []*graph.Edge{endpoint, endpointKind, exact[0], exact[1], anyKind[0]})
 }
 
+func TestPrivateGenerationFirstEdgeIndexBulkFixtureUsesProductionWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edge-index-bulk-window.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	timing := privateInsertGeneratedEdgesBulk(t, store, 101, 0, 8, 4)
+	if timing.Settings.ActiveAutoCheckpoint != 0 {
+		t.Fatalf("active wal_autocheckpoint=%d, want 0", timing.Settings.ActiveAutoCheckpoint)
+	}
+	if timing.Settings.ActiveCacheBytes != 256<<20 {
+		t.Fatalf("active cache bytes=%d, want %d", timing.Settings.ActiveCacheBytes, 256<<20)
+	}
+	var rows int
+	if err := store.db.QueryRow(`SELECT count(*) FROM edges WHERE view_gen = ?`, 101).Scan(&rows); err != nil {
+		t.Fatalf("count bulk rows: %v", err)
+	}
+	if rows != 8 {
+		t.Fatalf("bulk row count=%d, want 8", rows)
+	}
+}
+
+func TestPrivateGenerationFirstEdgeIndexQuiescesScheduledDrain(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "1")
+	path := filepath.Join(t.TempDir(), "edge-index-quiescence.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	store.passiveCheckpointTimeout = time.Nanosecond
+
+	beforeRequests := store.walDrainRequests.Load()
+	privateInsertGeneratedEdgesBulk(t, store, 201, 0, 25_000, 8_192)
+	if requests := store.walDrainRequests.Load(); requests != beforeRequests {
+		_ = store.Close()
+		t.Fatalf("a timed-out End unexpectedly scheduled a result-based drain: before=%d after=%d", beforeRequests, requests)
+	}
+	walInfo, err := os.Stat(path + "-wal")
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("stat timed-out End residue: %v", err)
+	}
+	if walInfo.Size() <= 32 {
+		_ = store.Close()
+		t.Fatalf("timed-out End left no meaningful WAL residue: bytes=%d", walInfo.Size())
+	}
+	var pageSize int64
+	if err := store.db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		_ = store.Close()
+		t.Fatalf("read residue page size: %v", err)
+	}
+	residueFrames := (walInfo.Size() - 32) / (pageSize + 24)
+	t.Logf("forced residue before Close: wal_bytes=%d wal_frames=%d pressure_pages=%d drain_requests=%d",
+		walInfo.Size(), residueFrames, sqliteWALAutoCheckpointPages(), store.walDrainRequests.Load())
+	observed := privateCloseAndVerifyWAL(t, "forced-residue", path, store)
+	t.Logf("forced residue after Close: wal_bytes=%d mx_frame=%d n_backfill=%d drain_requests=%d drains=%d",
+		observed.WALBytes, observed.MXFrame, observed.NBackfill, observed.DrainRequests, observed.Drains)
+	if observed.MXFrame != observed.NBackfill || observed.Busy != 0 || observed.BackgroundActive ||
+		observed.BackgroundLeasePresent || !observed.WriterIdle || !observed.CheckpointLoopStopped {
+		t.Fatalf("store did not quiesce: %+v", observed)
+	}
+}
+
+// BenchmarkPrivateGenerationFirstEdgeIndexWriteLocality is intentionally
+// opt-in. It uses the production generation bulk window for prefill and target
+// writes. The fixture grows until the four affected indexes together exceed
+// the active writer cache; total database size alone is not used as evidence
+// of cache pressure. Target rounds run in opposite order to expose run-order
+// bias, and bulk-window finalization is timed separately from row insertion.
+func BenchmarkPrivateGenerationFirstEdgeIndexWriteLocality(b *testing.B) {
+	if os.Getenv("GORTEX_RUN_EDGE_INDEX_LOCALITY") != "1" {
+		b.Skip("set GORTEX_RUN_EDGE_INDEX_LOCALITY=1 during an approved quiet window")
+	}
+	b.StopTimer()
+	const (
+		minimumRelevantIndexBytes = int64(320 << 20)
+		maximumTempBytes          = int64(6 << 30)
+		minimumFreeBytes          = int64(8 << 30)
+		maximumPrefillRows        = 2_400_000
+		minimumProjectionRows     = 300_000
+		rowsPerGeneration         = 100_000
+		targetRows                = 150_000
+		targetPermutationSeed     = uint64(0x6a09e667f3bcc909)
+		chunkRows                 = 8_192
+	)
+
+	dir := b.TempDir()
+	privateRequireFreeBytes(b, dir, minimumFreeBytes)
+	baselinePath := filepath.Join(dir, "baseline.db")
+	candidatePath := filepath.Join(dir, "generation-first.db")
+	baseline, err := Open(baselinePath)
+	if err != nil {
+		b.Fatalf("open baseline: %v", err)
+	}
+	defer func() {
+		if baseline != nil {
+			_ = baseline.Close()
+		}
+	}()
+	candidate, err := Open(candidatePath)
+	if err != nil {
+		b.Fatalf("open candidate: %v", err)
+	}
+	defer func() {
+		if candidate != nil {
+			_ = candidate.Close()
+		}
+	}()
+	privateApplyEdgeIndexLayoutTB(b, candidate, privateGenerationFirstEdgeIndexes)
+	privateBenchmarkProgress(b, "setup", map[string]any{"baseline_path": baselinePath, "candidate_path": candidatePath})
+
+	type sizingSample struct {
+		Rows                        int              `json:"rows"`
+		BaselineRelevantBytes       int64            `json:"baseline_relevant_bytes"`
+		CandidateRelevantBytes      int64            `json:"candidate_relevant_bytes"`
+		BaselineProjectedRows       int              `json:"baseline_projected_rows"`
+		CandidateProjectedRows      int              `json:"candidate_projected_rows"`
+		BaselineDatabaseBytes       int64            `json:"baseline_database_bytes"`
+		CandidateDatabaseBytes      int64            `json:"candidate_database_bytes"`
+		BaselineAffectedIndexBytes  map[string]int64 `json:"baseline_affected_index_bytes"`
+		CandidateAffectedIndexBytes map[string]int64 `json:"candidate_affected_index_bytes"`
+	}
+	prefillRows := 0
+	var baselineSizes, candidateSizes map[string]int64
+	var sizingSamples []sizingSample
+	for generation := int64(1); prefillRows < maximumPrefillRows; generation++ {
+		privateInsertGeneratedEdgesBulk(b, baseline, generation, prefillRows, rowsPerGeneration, chunkRows)
+		privateInsertGeneratedEdgesBulk(b, candidate, generation, prefillRows, rowsPerGeneration, chunkRows)
+		prefillRows += rowsPerGeneration
+		privateRequireTempCap(b, maximumTempBytes, baselinePath, candidatePath)
+		baselineSizes = privateEdgeDBStatSizes(b, baseline)
+		candidateSizes = privateEdgeDBStatSizes(b, candidate)
+		baselineRelevant := privateRelevantEdgeIndexBytes(baselineSizes)
+		candidateRelevant := privateRelevantEdgeIndexBytes(candidateSizes)
+		sample := sizingSample{
+			Rows:                        prefillRows,
+			BaselineRelevantBytes:       baselineRelevant,
+			CandidateRelevantBytes:      candidateRelevant,
+			BaselineProjectedRows:       privateProjectedRows(minimumRelevantIndexBytes, baselineRelevant, prefillRows),
+			CandidateProjectedRows:      privateProjectedRows(minimumRelevantIndexBytes, candidateRelevant, prefillRows),
+			BaselineDatabaseBytes:       privateSQLiteWorkingSetBytes(b, baseline),
+			CandidateDatabaseBytes:      privateSQLiteWorkingSetBytes(b, candidate),
+			BaselineAffectedIndexBytes:  privateAffectedEdgeIndexSizes(baselineSizes),
+			CandidateAffectedIndexBytes: privateAffectedEdgeIndexSizes(candidateSizes),
+		}
+		sizingSamples = append(sizingSamples, sample)
+		privateBenchmarkProgress(b, "sizing_sample", sample)
+		b.Logf("edge-index sizing sample=%s", privateJSON(b, sample))
+		if baselineRelevant >= minimumRelevantIndexBytes && candidateRelevant >= minimumRelevantIndexBytes {
+			break
+		}
+		if prefillRows >= minimumProjectionRows &&
+			(sample.BaselineProjectedRows > maximumPrefillRows || sample.CandidateProjectedRows > maximumPrefillRows) {
+			b.Fatalf("measured affected-index growth projects beyond %d-row bound: samples=%s", maximumPrefillRows, privateJSON(b, sizingSamples))
+		}
+	}
+	if privateRelevantEdgeIndexBytes(baselineSizes) < minimumRelevantIndexBytes ||
+		privateRelevantEdgeIndexBytes(candidateSizes) < minimumRelevantIndexBytes {
+		b.Fatalf("fixture did not establish %d relevant-index bytes per store by %d rows: baseline=%s candidate=%s",
+			minimumRelevantIndexBytes, prefillRows, privateJSON(b, baselineSizes), privateJSON(b, candidateSizes))
+	}
+	if got, want := privateEdgeRowsDigestTB(b, candidate), privateEdgeRowsDigestTB(b, baseline); got != want {
+		b.Fatalf("prefill digest differs: candidate=%s baseline=%s", got, want)
+	}
+
+	type measurement struct {
+		Round      int                        `json:"round"`
+		Variant    string                     `json:"variant"`
+		Generation int64                      `json:"generation"`
+		Timing     privateBulkTiming          `json:"timing"`
+		Quiescence privateWALCloseObservation `json:"quiescence"`
+	}
+	prefillQuiescence := []privateWALCloseObservation{
+		privateCloseAndVerifyWAL(b, "prefill/baseline", baselinePath, baseline),
+		privateCloseAndVerifyWAL(b, "prefill/candidate", candidatePath, candidate),
+	}
+	baseline = nil
+	candidate = nil
+	privateBenchmarkProgress(b, "prefill_quiescent", prefillQuiescence)
+
+	var results []measurement
+	run := func(round int, variant, path string, generation int64, start int) {
+		privateBenchmarkProgress(b, "target_start", map[string]any{"round": round, "variant": variant, "generation": generation, "permutation_seed": targetPermutationSeed})
+		store, err := Open(path)
+		if err != nil {
+			b.Fatalf("round %d open %s: %v", round, variant, err)
+		}
+		timing := privateInsertGeneratedEdgesBulkPermuted(b, store, generation, start, targetRows, chunkRows, targetPermutationSeed)
+		result := measurement{Round: round, Variant: variant, Generation: generation, Timing: timing}
+		privateBenchmarkProgress(b, "target_write_complete", result)
+		result.Quiescence = privateCloseAndVerifyWAL(b, fmt.Sprintf("round-%d-%s", round, variant), path, store)
+		results = append(results, result)
+		privateRequireTempCap(b, maximumTempBytes, baselinePath, candidatePath)
+		privateBenchmarkProgress(b, "target_complete", result)
+	}
+
+	// Counterbalanced order. Each target store is closed, its checkpoint loop is
+	// joined, and its WAL is proven backfilled before the next store is opened.
+	run(1, "baseline", baselinePath, 10_000, prefillRows)
+	run(1, "generation-first", candidatePath, 10_000, prefillRows)
+	if got, want := privateClosedStoreDigest(b, candidatePath), privateClosedStoreDigest(b, baselinePath); got != want {
+		b.Fatalf("round-one digest differs: candidate=%s baseline=%s", got, want)
+	} else {
+		privateBenchmarkProgress(b, "digest", map[string]any{"round": 1, "sha256": got})
+	}
+	run(2, "generation-first", candidatePath, 10_001, prefillRows+targetRows)
+	run(2, "baseline", baselinePath, 10_001, prefillRows+targetRows)
+	if got, want := privateClosedStoreDigest(b, candidatePath), privateClosedStoreDigest(b, baselinePath); got != want {
+		b.Fatalf("round-two digest differs: candidate=%s baseline=%s", got, want)
+	} else {
+		privateBenchmarkProgress(b, "digest", map[string]any{"round": 2, "sha256": got})
+	}
+
+	const readProbeRows = 5_000
+	readProbeStart := prefillRows + targetRows
+	readResults := []privateEdgeReadObservation{
+		privateMeasureEdgeCandidateReads(b, "read-round-1-baseline", baselinePath, 10_001, readProbeStart, readProbeRows),
+		privateMeasureEdgeCandidateReads(b, "read-round-1-generation-first", candidatePath, 10_001, readProbeStart, readProbeRows),
+		privateMeasureEdgeCandidateReads(b, "read-round-2-generation-first", candidatePath, 10_001, readProbeStart, readProbeRows),
+		privateMeasureEdgeCandidateReads(b, "read-round-2-baseline", baselinePath, 10_001, readProbeStart, readProbeRows),
+	}
+	for i := 1; i < len(readResults); i++ {
+		if readResults[i].FreshDigest != readResults[0].FreshDigest || readResults[i].WarmDigest != readResults[0].WarmDigest {
+			b.Fatalf("read-arm result digest differs: first=%+v current=%+v", readResults[0], readResults[i])
+		}
+	}
+	privateBenchmarkProgress(b, "read_arm_complete", readResults)
+
+	baselineSizes, baselineDBBytes := privateClosedStoreSizes(b, baselinePath)
+	candidateSizes, candidateDBBytes := privateClosedStoreSizes(b, candidatePath)
+	b.Logf("generation-first edge-index diagnostic prefill_rows=%d target_rows=%d baseline_db_bytes=%d candidate_db_bytes=%d baseline_dbstat=%s candidate_dbstat=%s write_results=%s read_results=%s",
+		prefillRows, targetRows, baselineDBBytes, candidateDBBytes,
+		privateJSON(b, baselineSizes), privateJSON(b, candidateSizes), privateJSON(b, results), privateJSON(b, readResults))
+	b.Logf("generation-first edge-index sizing_samples=%s", privateJSON(b, sizingSamples))
+	privateBenchmarkProgress(b, "complete", map[string]any{
+		"prefill_rows": prefillRows, "target_rows": targetRows, "baseline_dbstat": baselineSizes,
+		"candidate_dbstat": candidateSizes, "write_results": results, "read_results": readResults,
+		"target_permutation_seed": targetPermutationSeed,
+	})
+}
+
+type privateEdgeReadObservation struct {
+	Label             string                     `json:"label"`
+	Generation        int64                      `json:"generation"`
+	ProbeRows         int                        `json:"probe_rows"`
+	ProductionPlans   map[string]string          `json:"production_plans"`
+	DiagnosticPlans   map[string]string          `json:"diagnostic_plans"`
+	FreshElapsedNanos int64                      `json:"fresh_elapsed_ns"`
+	WarmElapsedNanos  int64                      `json:"warm_elapsed_ns"`
+	FreshDigest       string                     `json:"fresh_digest"`
+	WarmDigest        string                     `json:"warm_digest"`
+	Quiescence        privateWALCloseObservation `json:"quiescence"`
+}
+
+func privateMeasureEdgeCandidateReads(tb testing.TB, label, path string, generation int64, start, count int) privateEdgeReadObservation {
+	tb.Helper()
+	store, err := Open(path)
+	if err != nil {
+		tb.Fatalf("%s open read-arm store: %v", label, err)
+	}
+	endpoints, sites, expected := privateGeneratedEdgeReadProbe(start, count, generation)
+	endpointArgs := make([]any, 0, len(endpoints)*2+1)
+	for _, key := range endpoints {
+		endpointArgs = append(endpointArgs, key.From, key.To)
+	}
+	endpointArgs = append(endpointArgs, generation)
+	exactArgs := make([]any, 0, count*3+1)
+	anyArgs := make([]any, 0, count*2+1)
+	for i := 0; i < len(sites); i += 2 {
+		exactArgs = append(exactArgs, sites[i].From, sites[i].Line, string(sites[i].Kind))
+		anyArgs = append(anyArgs, sites[i+1].From, sites[i+1].Line)
+	}
+	exactArgs = append(exactArgs, generation)
+	anyArgs = append(anyArgs, generation)
+	observation := privateEdgeReadObservation{
+		Label: label, Generation: generation, ProbeRows: count,
+		ProductionPlans: map[string]string{
+			"endpoint_unary_generation": privateEdgeIndexPlanTB(tb, store.db, edgeCandidatesEndpointQuery(len(endpoints)), endpointArgs...),
+			"exact_site":                privateEdgeIndexPlanTB(tb, store.db, edgeCandidatesExactSiteQuery(count), exactArgs...),
+			"any_site":                  privateEdgeIndexPlanTB(tb, store.db, edgeCandidatesAnySiteQuery(count), anyArgs...),
+		},
+		DiagnosticPlans: map[string]string{
+			"endpoint_no_unary":              privateEdgeIndexPlanTB(tb, store.db, privateEndpointQueryWithoutUnaryGeneration(len(endpoints)), endpointArgs...),
+			"endpoint_generation_index_hint": privateEdgeIndexPlanTB(tb, store.db, privateEndpointQueryWithGenerationIndexHint(len(endpoints)), endpointArgs...),
+		},
+	}
+	privateAssertReadArmPlanShape(tb, label, observation.ProductionPlans)
+	for name, plan := range observation.ProductionPlans {
+		if privatePlanScansEdges(plan) {
+			_ = store.Close()
+			tb.Fatalf("%s production %s plan scans edges: %s", label, name, plan)
+		}
+	}
+	view := store.AtGeneration(generation)
+	started := time.Now()
+	fresh := view.GetEdgeCandidates(endpoints, sites)
+	observation.FreshElapsedNanos = time.Since(started).Nanoseconds()
+	observation.FreshDigest = privateEdgeCandidateSetDigest(tb, fresh, expected)
+	started = time.Now()
+	warm := view.GetEdgeCandidates(endpoints, sites)
+	observation.WarmElapsedNanos = time.Since(started).Nanoseconds()
+	observation.WarmDigest = privateEdgeCandidateSetDigest(tb, warm, expected)
+	if observation.FreshDigest != observation.WarmDigest {
+		_ = store.Close()
+		tb.Fatalf("%s fresh/warm candidate digest differs: fresh=%s warm=%s", label, observation.FreshDigest, observation.WarmDigest)
+	}
+	observation.Quiescence = privateCloseAndVerifyWAL(tb, label, path, store)
+	privateBenchmarkProgress(tb, "read_arm_variant", observation)
+	return observation
+}
+
+func privateAssertReadArmPlanShape(tb testing.TB, label string, plans map[string]string) {
+	tb.Helper()
+	for _, name := range []string{"exact_site", "any_site"} {
+		plan := plans[name]
+		if !strings.Contains(plan, "SCAN w") || !strings.Contains(plan, "SEARCH e USING INDEX") {
+			tb.Fatalf("%s production %s must probe edges once per wanted key: %s", label, name, plan)
+		}
+	}
+	if !strings.Contains(plans["exact_site"], "edges_by_from_line_kind") {
+		tb.Fatalf("%s production exact-site did not use kind index: %s", label, plans["exact_site"])
+	}
+	if !strings.Contains(plans["any_site"], "edges_by_from_line") {
+		tb.Fatalf("%s production any-site did not use line index: %s", label, plans["any_site"])
+	}
+}
+
+func privateGeneratedEdgeReadProbe(start, count int, generation int64) ([]graph.EdgeEndpoint, []graph.EdgeSite, []*graph.Edge) {
+	endpoints := make([]graph.EdgeEndpoint, 0, count)
+	sites := make([]graph.EdgeSite, 0, count*2)
+	expected := make([]*graph.Edge, 0, count)
+	payload := strings.Repeat("x", 192)
+	for i := 0; i < count; i++ {
+		edge := privateGeneratedEdge(start+i, generation, payload)
+		expected = append(expected, edge)
+		endpoints = append(endpoints, graph.EdgeEndpoint{From: edge.From, To: edge.To})
+		sites = append(sites,
+			graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: edge.Kind},
+			graph.EdgeSite{From: edge.From, Line: edge.Line},
+		)
+	}
+	return endpoints, sites, expected
+}
+
+func privateEdgeCandidateSetDigest(tb testing.TB, set graph.EdgeCandidateSet, expected []*graph.Edge) string {
+	tb.Helper()
+	h := sha256.New()
+	for _, want := range expected {
+		endpoint := set.Endpoint(want.From, want.To)
+		endpointKind := set.EndpointKind(want.From, want.To, want.Kind)
+		site := set.Site(want.From, want.Line, want.Kind)
+		if endpoint == nil || endpointKind == nil || len(site) != 1 {
+			tb.Fatalf("candidate set missing expected edge %s->%s kind=%s line=%d: endpoint=%v endpointKind=%v site=%d",
+				want.From, want.To, want.Kind, want.Line, endpoint != nil, endpointKind != nil, len(site))
+		}
+		if endpoint != endpointKind || endpoint != site[0] {
+			tb.Fatalf("candidate set did not canonicalize pointers for %s->%s kind=%s line=%d", want.From, want.To, want.Kind, want.Line)
+		}
+		_, _ = fmt.Fprintln(h, privateEdgeSliceDigest(tb, []*graph.Edge{endpoint}))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func privateEdgeIndexPlanTB(tb testing.TB, db *sql.DB, query string, args ...any) string {
+	tb.Helper()
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+query, args...)
+	if err != nil {
+		tb.Fatalf("explain read-arm query: %v", err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			tb.Fatalf("scan read-arm plan: %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatalf("read read-arm plan: %v", err)
+	}
+	return strings.Join(details, " | ")
+}
+
+func privateBenchmarkProgress(tb testing.TB, event string, payload any) {
+	tb.Helper()
+	path := os.Getenv("GORTEX_EDGE_INDEX_PROGRESS_PATH")
+	if path == "" {
+		return
+	}
+	record := map[string]any{"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "event": event, "payload": payload}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		tb.Fatalf("encode benchmark progress: %v", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		tb.Fatalf("open benchmark progress: %v", err)
+	}
+	if _, err := file.Write(append(encoded, '\n')); err != nil {
+		_ = file.Close()
+		tb.Fatalf("write benchmark progress: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		tb.Fatalf("close benchmark progress: %v", err)
+	}
+}
+
 func privateSeedEdgeIndexSemantics(t *testing.T, store *Store) {
 	t.Helper()
 	for _, generation := range []int64{0, 7, 64} {
@@ -1020,4 +1434,437 @@ func privateEdgeRowsDigestTB(tb testing.TB, store *Store) string {
 		tb.Fatalf("read ordered edge rows: %v", err)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func privateInsertGeneratedEdges(tb testing.TB, store *Store, generation int64, start, count, chunk int) {
+	tb.Helper()
+	for offset := 0; offset < count; offset += chunk {
+		n := chunk
+		if remaining := count - offset; remaining < n {
+			n = remaining
+		}
+		edges := privateGeneratedEdges(start+offset, n, generation)
+		if err := store.AtGeneration(generation).AddBatchChecked(nil, edges); err != nil {
+			tb.Fatalf("insert generation %d rows [%d,%d): %v", generation, start+offset, start+offset+n, err)
+		}
+	}
+}
+
+func privateInsertGeneratedEdgesPermuted(tb testing.TB, store *Store, generation int64, start, count, chunk int, seed uint64) {
+	tb.Helper()
+	order := privateDeterministicPermutation(count, seed)
+	payload := strings.Repeat("x", 192)
+	for offset := 0; offset < count; offset += chunk {
+		end := min(offset+chunk, count)
+		edges := make([]*graph.Edge, end-offset)
+		for i, position := range order[offset:end] {
+			edges[i] = privateGeneratedEdge(start+position, generation, payload)
+		}
+		if err := store.AtGeneration(generation).AddBatchChecked(nil, edges); err != nil {
+			tb.Fatalf("insert permuted generation %d rows [%d,%d): %v", generation, offset, end, err)
+		}
+	}
+}
+
+func privateDeterministicPermutation(count int, seed uint64) []int {
+	order := make([]int, count)
+	for i := range order {
+		order[i] = i
+	}
+	state := seed
+	next := func() uint64 {
+		state += 0x9e3779b97f4a7c15
+		z := state
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+		return z ^ (z >> 31)
+	}
+	for i := len(order) - 1; i > 0; i-- {
+		j := int(next() % uint64(i+1))
+		order[i], order[j] = order[j], order[i]
+	}
+	return order
+}
+
+type privateWALCloseObservation struct {
+	Label                  string `json:"label"`
+	CloseElapsedNanos      int64  `json:"close_elapsed_ns"`
+	Busy                   int64  `json:"busy"`
+	MXFrame                int64  `json:"mx_frame"`
+	NBackfill              int64  `json:"n_backfill"`
+	WALBytes               int64  `json:"wal_bytes"`
+	DrainRequests          int64  `json:"drain_requests"`
+	Drains                 int64  `json:"drains"`
+	BackgroundActive       bool   `json:"background_active"`
+	BackgroundLeasePresent bool   `json:"background_lease_present"`
+	WriterIdle             bool   `json:"writer_idle"`
+	CheckpointLoopStopped  bool   `json:"checkpoint_loop_stopped"`
+}
+
+func privateCloseAndVerifyWAL(tb testing.TB, label, path string, store *Store) privateWALCloseObservation {
+	tb.Helper()
+	observed := privateWALCloseObservation{Label: label}
+	started := time.Now()
+	if err := store.Close(); err != nil {
+		tb.Fatalf("%s close store: %v", label, err)
+	}
+	observed.CloseElapsedNanos = time.Since(started).Nanoseconds()
+	observed.DrainRequests = store.walDrainRequests.Load()
+	observed.Drains = store.walDrains.Load()
+	coordination := &store.backgroundCheckpoint
+	coordination.mu.Lock()
+	observed.BackgroundActive = coordination.active != nil
+	observed.BackgroundLeasePresent = coordination.generationLease != 0
+	coordination.mu.Unlock()
+	store.writeMu.Lock()
+	observed.WriterIdle = store.generationBulkLoad == 0 && store.bulkConn == nil
+	store.writeMu.Unlock()
+	select {
+	case <-store.checkpointDone:
+		observed.CheckpointLoopStopped = true
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	checkpointDB, err := sql.Open("sqlite", sqliteCheckpointDSN(path))
+	if err != nil {
+		tb.Fatalf("%s open post-close checkpoint connection: %v", label, err)
+	}
+	configureWriterPool(checkpointDB)
+	if err := checkpointDB.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`).Scan(&observed.Busy, &observed.MXFrame, &observed.NBackfill); err != nil {
+		_ = checkpointDB.Close()
+		tb.Fatalf("%s inspect post-close WAL: %v", label, err)
+	}
+	if err := checkpointDB.Close(); err != nil {
+		tb.Fatalf("%s close post-close checkpoint connection: %v", label, err)
+	}
+	if info, err := os.Stat(path + "-wal"); err == nil {
+		observed.WALBytes = info.Size()
+	} else if !os.IsNotExist(err) {
+		tb.Fatalf("%s stat post-close WAL: %v", label, err)
+	}
+	if observed.Busy != 0 || observed.MXFrame != observed.NBackfill || observed.BackgroundActive ||
+		observed.BackgroundLeasePresent || !observed.WriterIdle || !observed.CheckpointLoopStopped {
+		tb.Fatalf("%s did not reach quiescence: %+v", label, observed)
+	}
+	privateBenchmarkProgress(tb, "wal_quiescent", observed)
+	return observed
+}
+
+func privateClosedStoreDigest(tb testing.TB, path string) string {
+	tb.Helper()
+	store, err := Open(path)
+	if err != nil {
+		tb.Fatalf("open closed store for digest: %v", err)
+	}
+	digest := privateEdgeRowsDigestTB(tb, store)
+	privateCloseAndVerifyWAL(tb, "digest", path, store)
+	return digest
+}
+
+func privateClosedStoreSizes(tb testing.TB, path string) (map[string]int64, int64) {
+	tb.Helper()
+	store, err := Open(path)
+	if err != nil {
+		tb.Fatalf("open closed store for dbstat: %v", err)
+	}
+	sizes := privateEdgeDBStatSizes(tb, store)
+	databaseBytes := privateSQLiteWorkingSetBytes(tb, store)
+	privateCloseAndVerifyWAL(tb, "dbstat", path, store)
+	return sizes, databaseBytes
+}
+
+type privateBulkSettings struct {
+	ActiveCacheSetting     int64 `json:"active_cache_setting"`
+	ActiveCacheBytes       int64 `json:"active_cache_bytes"`
+	ActiveAutoCheckpoint   int64 `json:"active_wal_autocheckpoint"`
+	PreviousCacheSetting   int64 `json:"previous_cache_setting"`
+	PreviousAutoCheckpoint int64 `json:"previous_wal_autocheckpoint"`
+	RestoredCacheSetting   int64 `json:"restored_cache_setting"`
+	RestoredAutoCheckpoint int64 `json:"restored_wal_autocheckpoint"`
+}
+
+type privateBulkTiming struct {
+	BeginNanos  int64               `json:"begin_ns"`
+	InsertNanos int64               `json:"insert_ns"`
+	EndNanos    int64               `json:"end_ns"`
+	TotalNanos  int64               `json:"total_ns"`
+	Settings    privateBulkSettings `json:"settings"`
+}
+
+func privateInsertGeneratedEdgesBulk(tb testing.TB, store *Store, generation int64, start, count, chunk int) privateBulkTiming {
+	tb.Helper()
+	totalStarted := time.Now()
+	beginStarted := time.Now()
+	opened, err := store.BeginGenerationBulkLoad(generation)
+	beginElapsed := time.Since(beginStarted)
+	if err != nil {
+		tb.Fatalf("begin generation %d bulk load: %v", generation, err)
+	}
+	if !opened {
+		tb.Fatalf("generation %d did not acquire a physical bulk window", generation)
+	}
+	ended := false
+	defer func() {
+		if !ended {
+			_ = store.EndGenerationBulkLoadFor(generation)
+		}
+	}()
+
+	settings := privateActiveBulkSettings(tb, store, generation)
+	if settings.ActiveCacheSetting != int64(bulkCacheSizeKiB) {
+		tb.Fatalf("generation %d active cache_size=%d, want bulk setting %d", generation, settings.ActiveCacheSetting, bulkCacheSizeKiB)
+	}
+	if settings.ActiveAutoCheckpoint != 0 {
+		tb.Fatalf("generation %d active wal_autocheckpoint=%d, want 0", generation, settings.ActiveAutoCheckpoint)
+	}
+
+	insertStarted := time.Now()
+	privateInsertGeneratedEdges(tb, store, generation, start, count, chunk)
+	insertElapsed := time.Since(insertStarted)
+	endStarted := time.Now()
+	if err := store.EndGenerationBulkLoadFor(generation); err != nil {
+		tb.Fatalf("end generation %d bulk load: %v", generation, err)
+	}
+	endElapsed := time.Since(endStarted)
+	ended = true
+
+	settings.RestoredCacheSetting, settings.RestoredAutoCheckpoint = privateWriterPragmas(tb, store)
+	if settings.RestoredCacheSetting != settings.PreviousCacheSetting {
+		tb.Fatalf("generation %d restored cache_size=%d, want %d", generation, settings.RestoredCacheSetting, settings.PreviousCacheSetting)
+	}
+	if settings.RestoredAutoCheckpoint != settings.PreviousAutoCheckpoint {
+		tb.Fatalf("generation %d restored wal_autocheckpoint=%d, want %d", generation, settings.RestoredAutoCheckpoint, settings.PreviousAutoCheckpoint)
+	}
+	return privateBulkTiming{
+		BeginNanos: beginElapsed.Nanoseconds(), InsertNanos: insertElapsed.Nanoseconds(), EndNanos: endElapsed.Nanoseconds(),
+		TotalNanos: time.Since(totalStarted).Nanoseconds(), Settings: settings,
+	}
+}
+
+func privateInsertGeneratedEdgesBulkPermuted(tb testing.TB, store *Store, generation int64, start, count, chunk int, seed uint64) privateBulkTiming {
+	tb.Helper()
+	totalStarted := time.Now()
+	beginStarted := time.Now()
+	opened, err := store.BeginGenerationBulkLoad(generation)
+	beginElapsed := time.Since(beginStarted)
+	if err != nil {
+		tb.Fatalf("begin generation %d permuted bulk load: %v", generation, err)
+	}
+	if !opened {
+		tb.Fatalf("generation %d did not acquire a physical bulk window", generation)
+	}
+	ended := false
+	defer func() {
+		if !ended {
+			_ = store.EndGenerationBulkLoadFor(generation)
+		}
+	}()
+	settings := privateActiveBulkSettings(tb, store, generation)
+	if settings.ActiveCacheSetting != int64(bulkCacheSizeKiB) || settings.ActiveAutoCheckpoint != 0 {
+		tb.Fatalf("generation %d unexpected active bulk settings: %+v", generation, settings)
+	}
+
+	insertStarted := time.Now()
+	privateInsertGeneratedEdgesPermuted(tb, store, generation, start, count, chunk, seed)
+	insertElapsed := time.Since(insertStarted)
+	endStarted := time.Now()
+	if err := store.EndGenerationBulkLoadFor(generation); err != nil {
+		tb.Fatalf("end generation %d permuted bulk load: %v", generation, err)
+	}
+	endElapsed := time.Since(endStarted)
+	ended = true
+	settings.RestoredCacheSetting, settings.RestoredAutoCheckpoint = privateWriterPragmas(tb, store)
+	if settings.RestoredCacheSetting != settings.PreviousCacheSetting || settings.RestoredAutoCheckpoint != settings.PreviousAutoCheckpoint {
+		tb.Fatalf("generation %d did not restore bulk settings: %+v", generation, settings)
+	}
+	return privateBulkTiming{
+		BeginNanos: beginElapsed.Nanoseconds(), InsertNanos: insertElapsed.Nanoseconds(), EndNanos: endElapsed.Nanoseconds(),
+		TotalNanos: time.Since(totalStarted).Nanoseconds(), Settings: settings,
+	}
+}
+
+func privateActiveBulkSettings(tb testing.TB, store *Store, generation int64) privateBulkSettings {
+	tb.Helper()
+	store.writeMu.Lock()
+	defer store.writeMu.Unlock()
+	if store.generationBulkLoad != generation || store.bulkConn == nil {
+		tb.Fatalf("generation %d bulk window is not active", generation)
+	}
+	ctx := context.Background()
+	cache, err := pragmaInt(ctx, store.bulkConn, "cache_size")
+	if err != nil {
+		tb.Fatalf("read active bulk cache_size: %v", err)
+	}
+	auto, err := pragmaInt(ctx, store.bulkConn, "wal_autocheckpoint")
+	if err != nil {
+		tb.Fatalf("read active bulk wal_autocheckpoint: %v", err)
+	}
+	pageSize, err := pragmaInt(ctx, store.bulkConn, "page_size")
+	if err != nil {
+		tb.Fatalf("read active bulk page_size: %v", err)
+	}
+	return privateBulkSettings{
+		ActiveCacheSetting:     cache,
+		ActiveCacheBytes:       privateSQLiteCacheBytes(cache, pageSize),
+		ActiveAutoCheckpoint:   auto,
+		PreviousCacheSetting:   store.bulkPrevCacheSize,
+		PreviousAutoCheckpoint: store.bulkPrevAutoCheckpoint,
+	}
+}
+
+func privateWriterPragmas(tb testing.TB, store *Store) (int64, int64) {
+	tb.Helper()
+	ctx := context.Background()
+	conn, err := store.writerDB.Conn(ctx)
+	if err != nil {
+		tb.Fatalf("borrow writer connection: %v", err)
+	}
+	defer conn.Close()
+	cache, err := pragmaInt(ctx, conn, "cache_size")
+	if err != nil {
+		tb.Fatalf("read restored cache_size: %v", err)
+	}
+	auto, err := pragmaInt(ctx, conn, "wal_autocheckpoint")
+	if err != nil {
+		tb.Fatalf("read restored wal_autocheckpoint: %v", err)
+	}
+	return cache, auto
+}
+
+func privateSQLiteCacheBytes(setting, pageSize int64) int64 {
+	if setting < 0 {
+		return -setting * 1024
+	}
+	return setting * pageSize
+}
+
+func privateGeneratedEdges(start, count int, generation int64) []*graph.Edge {
+	edges := make([]*graph.Edge, count)
+	payload := strings.Repeat("x", 192)
+	for i := range edges {
+		edges[i] = privateGeneratedEdge(start+i, generation, payload)
+	}
+	return edges
+}
+
+func privateGeneratedEdge(n int, generation int64, payload string) *graph.Edge {
+	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeImports, graph.EdgeImplements, graph.EdgeProvides, graph.EdgeConsumes, graph.EdgeReads, graph.EdgeWrites}
+	return &graph.Edge{
+		From:            fmt.Sprintf("repo/github.com/fixture/very-long-x/source-%07d", n%180_000),
+		To:              fmt.Sprintf("repo/github.com/fixture/target-symbol%06d", (n*7919+17)%90_000),
+		Kind:            kinds[n%len(kinds)],
+		FilePath:        fmt.Sprintf("repo/pkg-%04d/fixture-%07d.go", n%4096, n),
+		Line:            n%20_000 + 1,
+		Confidence:      0.5,
+		ConfidenceLabel: "medium",
+		Origin:          "generation-first-locality",
+		Tier:            "exact",
+		CrossRepo:       n%17 == 0,
+		Meta: map[string]any{
+			"generation": fmt.Sprintf("%d", generation),
+			"payload":    payload,
+		},
+	}
+}
+
+func privateEdgeDBStatSizes(tb testing.TB, store *Store) map[string]int64 {
+	tb.Helper()
+	rows, err := store.db.Query(`SELECT name, COALESCE(sum(pgsize), 0) FROM dbstat WHERE name = 'edges' OR name = 'sqlite_autoindex_edges_1' OR name LIKE 'edges_%' GROUP BY name ORDER BY name`)
+	if err != nil {
+		tb.Fatalf("read edge dbstat sizes: %v", err)
+	}
+	defer rows.Close()
+	sizes := make(map[string]int64)
+	for rows.Next() {
+		var name string
+		var size int64
+		if err := rows.Scan(&name, &size); err != nil {
+			tb.Fatalf("scan edge dbstat size: %v", err)
+		}
+		sizes[name] = size
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatalf("iterate edge dbstat sizes: %v", err)
+	}
+	for _, name := range privateEdgeIndexNames {
+		if sizes[name] == 0 {
+			tb.Fatalf("dbstat did not report affected index %q: %s", name, privateJSON(tb, sizes))
+		}
+	}
+	return sizes
+}
+
+func privateAffectedEdgeIndexSizes(sizes map[string]int64) map[string]int64 {
+	affected := make(map[string]int64, len(privateEdgeIndexNames))
+	for _, name := range privateEdgeIndexNames {
+		affected[name] = sizes[name]
+	}
+	return affected
+}
+
+func privateProjectedRows(targetBytes, observedBytes int64, observedRows int) int {
+	if observedBytes <= 0 || observedRows <= 0 {
+		return int(^uint(0) >> 1)
+	}
+	return int((targetBytes*int64(observedRows) + observedBytes - 1) / observedBytes)
+}
+
+func privateRelevantEdgeIndexBytes(sizes map[string]int64) int64 {
+	var total int64
+	for _, name := range privateEdgeIndexNames {
+		total += sizes[name]
+	}
+	return total
+}
+
+func privateJSON(tb testing.TB, value any) string {
+	tb.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		tb.Fatalf("encode private fixture evidence: %v", err)
+	}
+	return string(encoded)
+}
+
+func privateSQLiteWorkingSetBytes(tb testing.TB, store *Store) int64 {
+	tb.Helper()
+	var pageCount, pageSize int64
+	if err := store.db.QueryRow(`PRAGMA page_count`).Scan(&pageCount); err != nil {
+		tb.Fatalf("read page_count: %v", err)
+	}
+	if err := store.db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		tb.Fatalf("read page_size: %v", err)
+	}
+	return pageCount * pageSize
+}
+
+func privateRequireTempCap(tb testing.TB, limit int64, paths ...string) {
+	tb.Helper()
+	var total int64
+	for _, path := range paths {
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			if info, err := os.Stat(path + suffix); err == nil {
+				total += info.Size()
+			} else if !os.IsNotExist(err) {
+				tb.Fatalf("stat %s: %v", path+suffix, err)
+			}
+		}
+	}
+	if total > limit {
+		tb.Fatalf("private fixture uses %d bytes, cap %d", total, limit)
+	}
+}
+
+func privateRequireFreeBytes(tb testing.TB, path string, want int64) {
+	tb.Helper()
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		tb.Fatalf("statfs %s: %v", path, err)
+	}
+	free := int64(stat.Bavail) * int64(stat.Bsize)
+	if free < want {
+		tb.Skipf("need %d free bytes for bounded fixture, have %d", want, free)
+	}
 }

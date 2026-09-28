@@ -495,8 +495,33 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 		return false, err
 	}
 
+	// Preserve the legacy false,nil result only for a physical bulk owner that
+	// is already installed. A lease without an installed owner is a competing
+	// Begin and must fail so callers cannot fall back beside a checkpoint.
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	if s.bulkConn != nil || s.coordinatedBulkLoad {
+		s.writeMu.Unlock()
+		return false, nil
+	}
+	s.writeMu.Unlock()
+
+	lease, err := s.acquireGenerationBulkCheckpointLease()
+	if err != nil {
+		return false, fmt.Errorf("%w: %v", ErrGenerationBulkCheckpointBusy, err)
+	}
+	leaseBound := false
+	opened := false
+	s.writeMu.Lock()
+	defer func() {
+		release := lease
+		if leaseBound && !opened {
+			release = s.takeGenerationBulkCheckpointLease(generationID)
+		}
+		s.writeMu.Unlock()
+		if !opened {
+			s.releaseGenerationBulkCheckpointLease(release)
+		}
+	}()
 	if s.bulkConn != nil || s.coordinatedBulkLoad {
 		return false, nil
 	}
@@ -516,9 +541,6 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 		return false, fmt.Errorf("%w: generation %d", ErrGenerationBulkLoadPopulated, generationID)
 	}
 
-	// Capture what has to be restored before changing anything, and decline
-	// the window rather than leave a pooled connection in a shape nobody can
-	// put back.
 	prevSync, err := pragmaInt(ctx, conn, "synchronous")
 	if err != nil {
 		_ = conn.Close()
@@ -544,20 +566,29 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 		return false, err
 	}
 
+	// Binding is the final fallible transition. Everything below installs the
+	// physical owner using assignments only, so a losing Begin cannot observe a
+	// lease that has no recoverable owner.
+	if !s.bindGenerationBulkCheckpointLease(lease, generationID) {
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", prevAutoCheckpoint))
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
+		_ = conn.Close()
+		return false, fmt.Errorf("%w: lease changed before generation %d became active", ErrGenerationBulkCheckpointBusy, generationID)
+	}
+	leaseBound = true
 	s.bulkConn = conn
 	s.generationBulkLoad = generationID
 	s.syncBulkWindowLocked()
 	s.bulkPrevSync = prevSync
 	s.bulkPrevCacheSize = prevCache
 	s.bulkPrevAutoCheckpoint = prevAutoCheckpoint
-	// The dense indexes stay live, so nothing is deferred and no seal is owed;
-	// the row cadence below still bounds WAL growth inside a large payload.
 	s.bulkIndexesDeferred = false
 	s.bulkDeferredNodeRows = 0
 	s.bulkDeferredEdgeRows = 0
 	s.bulkCheckpointNodeRows = 0
 	s.bulkCheckpointEdgeRows = 0
 	s.bulkRowCheckpointBackoff = false
+	opened = true
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "generation_bulk_begin", Name: strconv.FormatInt(generationID, 10)})
 	return true, nil
 }
@@ -576,6 +607,21 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 // Idempotent and inert when no generation window is open, so a deferred call
 // is always safe.
 func (s *Store) EndGenerationBulkLoad() error {
+	return s.endGenerationBulkLoad(0)
+}
+
+// EndGenerationBulkLoadFor closes only the physical generation owner named by
+// generationID. It gives an owner that retains its generation identity a
+// stale-safe finish operation; the legacy parameterless method remains an
+// idempotent compatibility delegate for callers that do not retain identity.
+func (s *Store) EndGenerationBulkLoadFor(generationID int64) error {
+	if generationID <= baseViewGeneration {
+		return fmt.Errorf("%w: generation bulk load needs a positive generation, got %d", ErrCatalogInvalidValue, generationID)
+	}
+	return s.endGenerationBulkLoad(generationID)
+}
+
+func (s *Store) endGenerationBulkLoad(expectedGeneration int64) error {
 	if s.coreless() {
 		return nil
 	}
@@ -585,14 +631,27 @@ func (s *Store) EndGenerationBulkLoad() error {
 		return nil
 	}
 	generationID := s.generationBulkLoad
+	if expectedGeneration > baseViewGeneration && expectedGeneration != generationID {
+		s.writeMu.Unlock()
+		return nil
+	}
 	result, _ := s.checkpointBulkWALPassiveResultLockedWithin("generation_bulk_end", s.passiveCheckpointWindow())
 	closeErr := s.closeBulkConnectionLocked()
 	s.jsonbIngestBuffers.release()
+	// Clear the matching bound generation while writeMu still protects the
+	// physical owner; release the exact token only after unlocking.
+	lease := s.takeGenerationBulkCheckpointLease(generationID)
 	s.writeMu.Unlock()
+	s.releaseGenerationBulkCheckpointLease(lease)
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "generation_bulk_end", Name: strconv.FormatInt(generationID, 10), WALFrames: result.WALFrames, CheckpointedFrames: result.CheckpointedFrames})
 	s.scheduleWALDrainAboveLine(result, "generation_bulk_load")
 	return closeErr
 }
+
+// ErrGenerationBulkCheckpointBusy reports that a periodic checkpoint still
+// owns the physical checkpoint path, so a generation build must retry instead
+// of falling back to writes that compete with that checkpoint.
+var ErrGenerationBulkCheckpointBusy = errors.New("store_sqlite: generation bulk checkpoint is still active")
 
 // InGenerationBulkLoad reports the generation whose bulk window this store is
 // currently holding, and whether it holds one at all.
