@@ -170,7 +170,7 @@ func indirectMutationEdgesForRoots(
 		}
 	}
 	writeTargets := g.GetNodesByIDs(writeTargetIDs)
-	fieldsByName := g.FindNodesByNames(fieldNames)
+	fieldsByName := receiverFieldsByName(g, analysisMethods, fieldNames)
 	// ownerOf is the receiver type a method or field belongs to, qualified by
 	// its package directory (receiverOwnerKey) exactly as the whole-graph
 	// fixpoint keys it, so a per-save re-derivation binds the field a whole
@@ -318,4 +318,33 @@ func indirectMutationEdgesForRoots(
 		}
 	}
 	return out, impacted
+}
+
+// receiverFieldsByName reads the fields named by receiver calls. A field
+// binds only to a method of the same receiver in the same package directory
+// (receiverOwnerKey), so when every method evaluated lives in one repository
+// the read is scoped to it: on a store of many repositories the global name
+// read of names like store, mu or logger returned thousands of rows (one
+// capability pass measured 4.4 s in that read), and a delta answers the
+// repository-scoped read from its stack's cache.
+func receiverFieldsByName(g graph.Store, methods map[string]*graph.Node, names []string) map[string][]*graph.Node {
+	if len(names) == 0 {
+		return nil
+	}
+	repo, single := "", true
+	for _, method := range methods {
+		if method == nil {
+			continue
+		}
+		if repo == "" {
+			repo = method.RepoPrefix
+		} else if method.RepoPrefix != repo {
+			single = false
+			break
+		}
+	}
+	if finder, ok := g.(graph.RepoNamesNodeFinder); ok && single && repo != "" {
+		return finder.FindNodesByNamesInRepo(names, repo)
+	}
+	return g.FindNodesByNames(names)
 }

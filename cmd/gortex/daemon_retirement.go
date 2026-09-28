@@ -26,6 +26,19 @@ type deferredRetirementWorker struct {
 	done                  chan struct{}
 	trackedActivityActive func() bool
 	idlePause             time.Duration
+	// afterReady runs once, on the worker's goroutine, when the daemon is
+	// ready and before the first sweep: the one-time correction of
+	// generations an older derivation wrote (SetAfterReady).
+	afterReady func(context.Context)
+}
+
+// SetAfterReady installs work the worker runs once after MarkReady, before
+// its first sweep. It must be called before MarkReady.
+func (w *deferredRetirementWorker) SetAfterReady(fn func(context.Context)) {
+	if w == nil {
+		return
+	}
+	w.afterReady = fn
 }
 
 func startDeferredRetirementWorker(sweep deferredRetirementSweep, logger *zap.Logger) *deferredRetirementWorker {
@@ -76,6 +89,9 @@ func (w *deferredRetirementWorker) run(ctx context.Context, sweep deferredRetire
 	case <-ctx.Done():
 		return
 	case <-w.ready:
+	}
+	if w.afterReady != nil {
+		w.afterReady(ctx)
 	}
 	if sweep == nil {
 		return

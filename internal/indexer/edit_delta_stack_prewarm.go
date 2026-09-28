@@ -967,6 +967,7 @@ func (l *CheckoutLifecycle) RewarmEditDeltaStacks() {
 	if l == nil {
 		return
 	}
+	l.prewarmDeferral.end()
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
 	for _, c := range l.coordinators {
@@ -978,4 +979,67 @@ func (l *CheckoutLifecycle) RewarmEditDeltaStacks() {
 			c.prewarmEditDeltaStackOnce(g)
 		}
 	}
+}
+
+// prewarmDeferral holds back the first pre-warm of a stack the pending
+// startup correction will change (a generation with a stale derivation
+// stamp). The daemon starts it before the correction (DeferPrewarmsUntil-
+// Corrected) and RewarmEditDeltaStacks ends it; nothing is deferred while it
+// is not active, so a caller that never runs the correction never waits.
+type prewarmDeferral struct {
+	mu     sync.Mutex
+	active bool
+	stale  map[int64]struct{}
+}
+
+func (d *prewarmDeferral) defers(stack []int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.active {
+		return false
+	}
+	for _, gen := range stack {
+		if _, ok := d.stale[gen]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *prewarmDeferral) end() {
+	d.mu.Lock()
+	d.active, d.stale = false, nil
+	d.mu.Unlock()
+}
+
+// DeferPrewarmsUntilCorrected holds back, until RewarmEditDeltaStacks, the
+// first pre-warm of every stack holding a generation the startup correction
+// will re-derive: those caches would be orphaned when the correction moves
+// the stack's key.
+func (l *CheckoutLifecycle) DeferPrewarmsUntilCorrected(ctx context.Context) {
+	if l == nil || l.store == nil {
+		return
+	}
+	stale := make(map[int64]struct{})
+	for _, pass := range []struct {
+		name    string
+		version int
+	}{
+		{derivationPassFileFingerprints, fileFingerprintDerivationVersion},
+		{derivationPassCapability, capabilityDerivationVersion},
+	} {
+		gens, err := l.store.GenerationsWithStaleDerivation(ctx, pass.name, pass.version)
+		if err != nil {
+			return
+		}
+		for _, g := range gens {
+			stale[g.GenerationID] = struct{}{}
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	l.prewarmDeferral.mu.Lock()
+	l.prewarmDeferral.active, l.prewarmDeferral.stale = true, stale
+	l.prewarmDeferral.mu.Unlock()
 }

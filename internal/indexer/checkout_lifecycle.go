@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"uuid"
 
@@ -198,6 +199,10 @@ type CheckoutLifecycle struct {
 	// It is a deterministic shutdown test seam; nil in production.
 	familyRetryBarrier func()
 
+	// prewarmDeferral holds back first pre-warms while the startup
+	// correction is pending (edit_delta_stack_prewarm.go).
+	prewarmDeferral prewarmDeferral
+
 	// coordMu guards the coordinator registry alone. It is separate from mu
 	// because dropping a coordinator waits for its in-flight build, and
 	// holding the collaborator lock across that wait would block every
@@ -262,6 +267,14 @@ type CheckoutLifecycle struct {
 	deferSeedRetirements     bool
 	retirementSweepMu        sync.Mutex
 	deferredRetirementCursor int64 // guarded by coordMu
+	// interactiveDemand is a test seam: the interactive write predicate.
+	interactiveDemand func() bool
+	// derivationEnvHook replaces derivationEnvFor (tests): the environment
+	// the startup correction re-derives a generation in.
+	derivationEnvHook func(row store_sqlite.ViewGeneration) (derivationEnv, bool)
+	// derivedCorrectionPreempted counts the startup correction's runs given
+	// up to interactive work.
+	derivedCorrectionPreempted atomic.Int64
 	// supersededChainRetention is how many replaced dedicated base chains this
 	// daemon keeps per graph before the sweep offers them. A small window is
 	// what makes a revert cheap: the reuse lookup accepts a superseded
@@ -2337,6 +2350,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		Semantic: l.mi.semanticMgr,
 		// The stack pre-warm gives way to the whole edit cycle.
 		EditCycleActive: l.editCycleHoldsBuildLane,
+		PrewarmDeferred: l.prewarmDeferral.defers,
 	}
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
 		GitWork:        &l.gitWork,

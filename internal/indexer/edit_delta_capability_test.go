@@ -173,6 +173,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"indexer.contextRepoWatcher":                  "watcher registration of the multi-repository indexer, not a store",
 	"indexer.generationBulkCloserByID":            "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
 	"anonymous{GenerationCorrectionEpoch}":        "asserted on the daemon's store to key the per-stack caches of a corrected generation, never on a delta",
+	"indexer.writeDemandReporter":                 "asserted by the lifecycle's background retirement on the daemon's shared store (write-gate demand), never on a delta",
 	"indexer.mutationFanoutOwningReceiptStore":    "owning-window receipts separate sibling repositories sharing one store; a delta's working graph serves one repository and the plain receipt window is exact",
 	"indexer.refFactsByTargetsContextReader":      "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"indexer.repoSemanticStateReleaser":           "semantic (go/types) state: the enrichment stage runs over the generation handle after the delta (runEnrichment), not over the DeltaWriter",

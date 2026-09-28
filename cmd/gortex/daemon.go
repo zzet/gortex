@@ -314,6 +314,18 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if state.lifecycle != nil {
 		retirementWorker = startDeferredRetirementWorker(
 			state.lifecycle.SweepDeferredRetirements, logger)
+		lifecycle := state.lifecycle
+		// Stacks the startup correction will change are warmed after it,
+		// not before (their caches would be orphaned).
+		lifecycle.DeferPrewarmsUntilCorrected(context.Background())
+		retirementWorker.SetAfterReady(func(ctx context.Context) {
+			if _, err := lifecycle.CorrectStaleDerivations(ctx); err != nil && ctx.Err() == nil {
+				logger.Warn("daemon: stale derivation correction stopped", zap.Error(err))
+			}
+			// A corrected generation moved the cache key of every stack over
+			// it: warm those stacks again before an edit finds them cold.
+			lifecycle.RewarmEditDeltaStacks()
+		})
 	}
 	defer retirementWorker.Stop()
 	stopBackground := func() {

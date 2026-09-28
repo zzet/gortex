@@ -104,7 +104,15 @@ func TestRealRepoEditDelta(t *testing.T) {
 		t.Fatalf("load the clone's configuration: %v", err)
 	}
 	logger := editDeltaRealLogger(t)
-	if _, err := os.Stat(storePath); errors.Is(err, os.ErrNotExist) {
+	// GX_DELTA_REAL_BASE=dedicated measures in the production shape: the corpus
+	// is a published dedicated base generation in GX_DELTA_REAL_STORE (built on
+	// first use), and every build stands on a materialized view of it, so the
+	// per-stack caches are on. Otherwise the corpus is generation zero and
+	// they are off.
+	var dedicatedBase int64
+	if os.Getenv("GX_DELTA_REAL_BASE") == "dedicated" {
+		dedicatedBase = editDeltaRealDedicatedBase(t, tree, storePath, cfg.Index, logger)
+	} else if _, err := os.Stat(storePath); errors.Is(err, os.ErrNotExist) {
 		started := time.Now()
 		base := builderOpenStoreAt(t, storePath)
 		idx := New(base, builderRegistry(), cfg.Index, logger)
@@ -145,14 +153,14 @@ func TestRealRepoEditDelta(t *testing.T) {
 	for _, rel := range files {
 		rel := strings.TrimSpace(rel)
 		t.Run(strings.ReplaceAll(rel, "/", "_"), func(t *testing.T) {
-			editDeltaRealFile(t, tree, storePath, rel, editCfg, logger, mgr, edits)
+			editDeltaRealFile(t, tree, storePath, rel, editCfg, logger, mgr, edits, dedicatedBase)
 		})
 	}
 }
 
 func editDeltaRealFile(
 	t *testing.T, tree, storePath, rel string, cfg config.IndexConfig,
-	logger *zap.Logger, mgr *semantic.Manager, edits int,
+	logger *zap.Logger, mgr *semantic.Manager, edits int, dedicatedBase int64,
 ) {
 	full := filepath.Join(tree, filepath.FromSlash(rel))
 	original, err := os.ReadFile(full)
@@ -189,12 +197,16 @@ func editDeltaRealFile(
 		t.Fatalf("open the checkout's sampler: %v", err)
 	}
 	chains.sampler = sampler
+	if dedicatedBase > 0 {
+		chains.useDedicatedBase(dedicatedBase)
+	}
 	if n, _ := strconv.Atoi(os.Getenv("GX_DELTA_REAL_LAYER")); n > 0 {
 		editDeltaRealLayerBelow(t, tree, rel, n, chains)
 	}
 	var records []editDeltaRealRecord
 	retire := os.Getenv("GX_DELTA_REAL_RETIRE") != "0"
 	var published []int64
+	prevKey := ""
 	if prof := os.Getenv("GX_DELTA_REAL_PROF"); prof != "" {
 		file, err := os.Create(strings.TrimSuffix(prof, ".pprof") + "-" + strings.ReplaceAll(rel, "/", "_") + ".pprof")
 		if err != nil {
@@ -226,12 +238,15 @@ func editDeltaRealFile(
 		recordLastEditDelta(nil)
 		started := time.Now()
 		cpuStarted := editDeltaProcessCPU()
-		id, report, _ := chains.build()
+		id, report, chain := chains.build()
 		wall := time.Since(started)
 		cpu := editDeltaProcessCPU() - cpuStarted
+		// The edit's own delta, read before settle: a compaction there builds
+		// again and would overwrite it.
+		delta := LastEditDeltaReport()
 		chains.settle()
 		rec := editDeltaRealRecord{
-			File: rel, Edit: i, Gen: id, WallMS: ms(wall), CPUMS: ms(cpu), Delta: LastEditDeltaReport(),
+			File: rel, Edit: i, Gen: id, WallMS: ms(wall), CPUMS: ms(cpu), Delta: delta,
 			PassSteps: report.PassSteps, Plan: report.PlanSteps,
 			Nodes: report.NodeCount, Edges: report.EdgeCount,
 			WALValid: report.WAL.Valid, WALFrames: report.WAL.Frames, WALBytes: report.WAL.Bytes, WALReset: report.WAL.Reset,
@@ -270,6 +285,9 @@ func editDeltaRealFile(
 		}
 		if !slices.Contains(published, id) {
 			published = append(published, id)
+		}
+		if dedicatedBase > 0 {
+			prevKey = editDeltaRealCheckStackKey(t, rel, i, rec.Delta, chain, prevKey)
 		}
 		records = append(records, rec)
 		t.Logf("%s edit %d: gen=%d wall=%.1fms cpu=%.1fms delta=%v wal=%d bytes (%d frames, valid=%t reset=%t) retired=%d (%d bytes) phases=%s pass=%s",

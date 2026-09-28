@@ -96,6 +96,45 @@ func correctOneRow(t *testing.T, store *store_sqlite.Store, generation int64) {
 	}
 }
 
+// The pre-warm runs once per stack as the stack's caches are keyed, and a
+// repeated call on an unchanged stack costs nothing: no goroutine, no open of
+// the stack. After a correction moves one of the stack's epochs, one call
+// opens the stack and warms it again under the new key.
+func TestPrewarmRunsAgainOnlyWhenTheStackKeyMoves(t *testing.T) {
+	resetPrewarmTestState(t)
+	o := observePrewarms(t)
+	f := newCoordinatorFixtureWithTree(t, sharedRowsTree())
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	keyedPrewarmStack(t, f)
+	// The coordinator's cycle (not reconcile, which the test drives) calls
+	// the pre-warm after each cycle; the test calls it as the cycle does.
+	commit := coordinatorReconcile(t, c).CommitGenerationID
+	if commit <= 0 {
+		t.Fatal("no routed commit generation")
+	}
+	c.prewarmEditDeltaStackOnce(commit)
+	first := o.wait(t, "the routed stack")
+	opens := o.opens.Load()
+
+	for range 20 {
+		c.prewarmEditDeltaStackOnce(commit)
+	}
+	o.none(t, "the same stack")
+	if got := o.opens.Load(); got != opens {
+		t.Fatalf("repeated calls on an unchanged stack opened it %d more times", got-opens)
+	}
+
+	correctOneRow(t, f.store, commit)
+	c.prewarmEditDeltaStackOnce(commit)
+	second := o.wait(t, "the corrected stack")
+	if second == first {
+		t.Fatalf("the stack was warmed again under the same key %q", first)
+	}
+	if got := o.opens.Load(); got != opens+1 {
+		t.Fatalf("the moved stack was opened %d times, want once", got-opens)
+	}
+}
+
 // The pre-warm gives way to the whole edit cycle, not only to a running
 // delta: while the builder's edit-cycle predicate holds, the decision does
 // not even open the stack to compute its key, and the warm makes no step; it
@@ -186,6 +225,26 @@ func TestPrewarmIsDeferredForAStackThePendingCorrectionWillChange(t *testing.T) 
 	pending.Store(false)
 	c.prewarmEditDeltaStackOnce(commit)
 	o.wait(t, "after the deferral ended")
+}
+
+// The deferral holds back only a stack holding a generation with a stale
+// stamp, only while it is active; ended, it holds back nothing.
+func TestPrewarmDeferralHoldsBackOnlyStacksWithAStaleGeneration(t *testing.T) {
+	var d prewarmDeferral
+	if d.defers([]int64{1, 2}) {
+		t.Fatal("an inactive deferral held a stack back")
+	}
+	d.active, d.stale = true, map[int64]struct{}{7: {}}
+	if !d.defers([]int64{3, 7}) {
+		t.Fatal("a stack with a stale generation was not held back")
+	}
+	if d.defers([]int64{3, 8}) {
+		t.Fatal("a stack with no stale generation was held back")
+	}
+	d.end()
+	if d.defers([]int64{3, 7}) {
+		t.Fatal("an ended deferral still held a stack back")
+	}
 }
 
 // A call that arrives while a pre-warm is in flight is not lost: when the

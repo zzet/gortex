@@ -351,6 +351,9 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := stampBuiltGeneration(ctx, handle); err != nil {
+			return err
+		}
 		markPublicationPhase(ctx, PublicationPayloadFlushed)
 		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)

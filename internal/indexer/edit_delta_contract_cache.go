@@ -56,6 +56,12 @@ func editDeltaContractCacheKey(base graph.Reader, store any, repoPrefix, workspa
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%p\x00%s\x00%s\x00%s", store, repoPrefix, workspaceID, projectID)
+	// A generation's rows change after publication only through a derived-row
+	// correction, which advances its correction epoch: every per-stack cache
+	// keyed here (the base projection cache, the below rows, the contract
+	// registry, the prior fingerprints) is a new entry once one of its
+	// generations was corrected.
+	epochs, _ := store.(interface{ GenerationCorrectionEpoch(int64) uint64 })
 	// Over a dirty chain the key is the stack below the chain: a delta
 	// composes the chain's layers over the kept answers per read, so every
 	// consecutive edit on one commit shares them.
@@ -68,6 +74,11 @@ func editDeltaContractCacheKey(base graph.Reader, store any, repoPrefix, workspa
 			return "", false
 		}
 		fmt.Fprintf(&b, "\x00%d", gen)
+		if epochs != nil {
+			if epoch := epochs.GenerationCorrectionEpoch(gen); epoch > 0 {
+				fmt.Fprintf(&b, ".%d", epoch)
+			}
+		}
 	}
 	return b.String(), true
 }
