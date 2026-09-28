@@ -197,6 +197,9 @@ type EditDeltaReport struct {
 	// WholeLayerLoads / WholeLayerRows: layers below read wholesale
 	// (graph.DeltaWriterStats).
 	WholeLayerLoads int
+	// DeclarationDiff is the declaration-level diff of the changed files and
+	// whether the save would qualify for a row-level form.
+	DeclarationDiff editDeltaDeclarationDiff
 	// StackPathNodeHits / StackPathNodeMisses are this delta's per-path
 	// file-node reads served from, and loaded into, the stack's cache.
 	StackPathNodeHits   int
@@ -709,6 +712,17 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		handle.AddBatch(payload.Nodes, payload.Edges)
 	}
 	lap("write_rows")
+	// Measurement only, opt-in: what a declaration-granular form would have
+	// written (edit_delta_declaration_diff.go). It runs inside the delta, so
+	// it is off unless asked for.
+	if editDeltaMeasureDeclarations {
+		fixedPaths := make([]string, 0, len(fixed))
+		for p := range fixed {
+			fixedPaths = append(fixedPaths, p)
+		}
+		out.DeclarationDiff = measureDeclarationDiff(dw, fixedPaths)
+		lap("declaration_diff")
+	}
 	extracted := make(map[string]struct{}, len(fixed)+len(out.SharedRowEmitters))
 	for p := range fixed {
 		extracted[p] = struct{}{}
@@ -865,6 +879,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Int("edge_sources", out.EdgeSources),
 			zap.Int("tombstones", out.Tombstones),
 			zap.Int("restated_nodes", out.RestatedNodes),
+			zap.Any("declaration_diff", out.DeclarationDiff),
 			zap.Int("restated_edges", out.RestatedEdges),
 			zap.Any("slow_reads", out.SlowReads),
 			zap.Int("whole_layer_loads", out.WholeLayerLoads),
