@@ -1699,6 +1699,10 @@ const generationInputManifestMetaTableBody = ` (
 var generationInputManifestTables = []generationMaskTable{
 	{table: "generation_input_manifest", body: generationInputManifestTableBody},
 	{table: "generation_input_manifest_meta", body: generationInputManifestMetaTableBody},
+	// The per-pass derivation stamps (derivation_stamps.go) ride this
+	// registry: created by the idempotent DDL on every Open (no version
+	// bump), swept on retirement and carried by a whole-generation copy.
+	{table: "generation_derivation_stamps", body: generationDerivationStampsTableBody},
 }
 
 // generationInputManifestSchemaSQL is the fresh-store CREATE TABLE DDL for the

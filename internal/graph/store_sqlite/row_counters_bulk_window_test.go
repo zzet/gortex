@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // returnsWithin runs fn and fails when it does not return within d: the
@@ -58,4 +60,41 @@ func TestRowCountersSeedDoesNotDeadlockWithABulkWindow(t *testing.T) {
 	}))
 	require.NoError(t, s.EnsureRowCounters(ctx))
 	requireCountersExact(t, s, 0, generation)
+}
+
+// The counters' repair and a derived correction's chunk and Finish, called
+// while a bulk window is open, write through the window's connection instead
+// of waiting for the pinned one.
+func TestMaintenanceWritesUseTheBulkWindowConnection(t *testing.T) {
+	ctx := context.Background()
+	store, generationID := publishedStampGeneration(t)
+	require.NoError(t, store.EnsureRowCounters(ctx))
+	store.writeMu.Lock()
+	_, err := store.writerDB.Exec(`UPDATE generation_row_counts SET nodes = nodes + 3 WHERE view_gen = 0`)
+	store.writeMu.Unlock()
+	require.NoError(t, err)
+	const window = int64(99)
+	engaged, err := store.BeginGenerationBulkLoad(window)
+	require.NoError(t, err)
+	require.True(t, engaged)
+	check, err := func() (RowCounterCheck, error) {
+		var out RowCounterCheck
+		err := returnsWithin(t, 3*time.Second, "CheckRowCounters(repair)", func() error {
+			var e error
+			out, e = store.CheckRowCounters(ctx, true)
+			return e
+		})
+		return out, err
+	}()
+	require.NoError(t, err)
+	require.True(t, check.Repaired)
+	c, err := store.BeginDerivedCorrection(ctx, DerivedCorrectionRequest{GenerationID: generationID, Pass: "capability", FromVersion: 1, ToVersion: 2,
+		EdgeKinds: []graph.EdgeKind{graph.EdgeAccessesField}})
+	require.NoError(t, err)
+	require.NoError(t, returnsWithin(t, 3*time.Second, "DerivedCorrection.Finish", func() error {
+		_, e := c.Finish(ctx)
+		return e
+	}))
+	require.NoError(t, store.EndGenerationBulkLoadFor(window))
+	requireCountersExact(t, store, 0)
 }

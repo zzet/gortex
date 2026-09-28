@@ -62,6 +62,9 @@ type backgroundCheckpointCoordination struct {
 }
 
 type storeCore struct {
+	// derivedCorrectionEpochs counts finished derived-row corrections per
+	// generation (generation id → *atomic.Uint64); see derivation_stamps.go.
+	derivedCorrectionEpochs sync.Map
 	// rowCountersReady: generation_row_counts is installed and seeded, so
 	// NodeCount / EdgeCount read it (row_counters.go).
 	rowCountersReady atomic.Bool
